@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, code, name, zone, location, is_active, display_order, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_shelf\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "zone",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "location",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "display_order",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "deleted_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "a74041d1e42c5248c76ac882e92a9be4190f80ce1f00880b7614791cd4fd9ff1"
+}

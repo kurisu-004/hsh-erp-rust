@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT ur.id            AS \"id!\",\n                   ur.user_id       AS \"user_id!\",\n                   ur.role          AS \"role!\",\n                   ur.scope_type    AS \"scope_type?\",\n                   ur.scope_id      AS \"scope_id?\",\n                   ur.version       AS \"version!\",\n                   ur.created_at    AS \"created_at!\",\n                   ur.created_by    AS \"created_by?\",\n                   ur.updated_at    AS \"updated_at!\",\n                   ur.updated_by    AS \"updated_by?\",\n                   ur.deleted_at    AS \"deleted_at?\",\n                   s.code           AS \"shelf_code?\",\n                   s.name           AS \"shelf_name?\"\n            FROM t_user_role ur\n            LEFT JOIN t_shelf s\n                   ON ur.scope_type = 'shelf'\n                  AND ur.scope_id = s.id\n                  AND s.deleted_at IS NULL\n            WHERE ur.user_id = $1 AND ur.deleted_at IS NULL\n            ORDER BY ur.created_at, ur.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "role!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "scope_type?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "scope_id?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "version!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at!",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at!",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_by?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "deleted_at?",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 11,
+        "name": "shelf_code?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "shelf_name?",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "02c7c4ce5b67d422845d0f119f8cfb069fb61cffce7cb6a56e12431ba6c4127a"
+}

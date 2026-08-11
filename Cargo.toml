@@ -1,0 +1,68 @@
+[package]
+name = "hsh-erp-rust"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "hsh_erp_rust"
+path = "src/lib.rs"
+
+# ---------------------------------------------------------------------------------
+# 后续业务实现阶段会按需追加（文档见 docs/architecture.md）：
+#   rust_decimal / bigdecimal    —— 金额、数量（Numeric 列）
+#   reqwest + HMAC-SHA1 签名      —— 腾讯云 COS XML API
+#   umya-spreadsheet 或 calamine —— 送货单 Excel 模板填充
+#   printpdf / lopdf              —— PDF 拆分与渲染
+#   barcoders                     —— Code128 条码
+#   testcontainers-rs            —— 集成测试独立 PG
+#   rmcp                          —— MCP Streamable HTTP（远期）
+# ---------------------------------------------------------------------------------
+
+[dependencies]
+# Web 框架
+axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "limit", "timeout"] }
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"                                                # CancellationToken
+
+# 数据库
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "chrono",
+    "migrate",
+] }
+
+# 序列化与时间
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# 错误处理
+thiserror = "2"
+anyhow = "1"                                                      # 仅 main 启动流程
+
+# 日志追踪
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 认证与安全
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }     # 双 token（access + refresh 轮转）
+bcrypt = "0.17"
+
+# 配置加载
+dotenvy = "0.15"
+
+# 异步与并发工具
+async-trait = "0.1"                                               # CosClient dyn 兼容
+futures-util = "0.3"                                              # ws StreamExt/SinkExt
+dashmap = "6"                                                     # ws 连接注册表
+
+[dev-dependencies]
+# 集成测试用 tower::ServiceExt::oneshot 直接驱动 Router。
+# 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE t_user SET last_login_at = $2 WHERE id = $1 AND deleted_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bc26d9eeae52466a39e77951a0a0f6b04bf7d8d0051a9dd8e329b2834f9ade51"
+}

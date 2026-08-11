@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_user\n            SET full_name     = COALESCE($3::varchar, full_name),\n                phone         = CASE WHEN $4::bool THEN $5::varchar ELSE phone END,\n                password_hash = COALESCE($6::varchar, password_hash),\n                is_active     = COALESCE($7::bool, is_active),\n                version       = version + 1,\n                updated_at    = $8,\n                updated_by    = $9\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Bool",
+        "Varchar",
+        "Varchar",
+        "Bool",
+        "Timestamp",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b72b200f5dd18e4e8521e436ee2de1e65f737bd80bba394a8ab2e908014ac793"
+}

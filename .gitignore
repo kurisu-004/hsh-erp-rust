@@ -1,0 +1,13 @@
+/target
+/.env
+**/*.rs.bk
+.DS_Store
+
+# .sqlx 离线元数据（cargo sqlx prepare 生成，须入版本库；CI 用 SQLX_OFFLINE=true 构建）
+/.sqlx/*
+!/.sqlx/.gitkeep
+!/.sqlx/query-*.json
+
+# IDE
+.idea/
+.vscode/

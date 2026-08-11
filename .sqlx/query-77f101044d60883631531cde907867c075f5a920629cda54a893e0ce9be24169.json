@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT\n                   m.id, m.parent_id, m.code, m.title, m.path, m.icon,\n                   m.sort_order, m.is_active, m.version,\n                   m.created_at, m.created_by, m.updated_at, m.updated_by, m.deleted_at\n            FROM t_menu m\n            JOIN t_role_menu rm ON rm.menu_id = m.id\n            WHERE rm.role = ANY($1)\n              AND m.is_active = TRUE\n              AND m.deleted_at IS NULL\n              AND rm.deleted_at IS NULL\n            ORDER BY m.sort_order, m.code\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "parent_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "code",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "title",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "path",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "icon",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "sort_order",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "is_active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "updated_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 12,
+        "name": "updated_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "deleted_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "77f101044d60883631531cde907867c075f5a920629cda54a893e0ce9be24169"
+}

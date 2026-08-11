@@ -1,0 +1,31 @@
+# hsh-erp-rust 本地开发用编排
+#
+# 端口选择：
+#   - 5433：开发库（与 myERP Python 项目共享默认端口，避开测试库 5434）
+#
+# 启动：
+#   docker compose up -d postgres
+#   ./scripts/dev_db.sh
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: hsh-erp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: erp
+      POSTGRES_PASSWORD: erp
+      POSTGRES_DB: hsh_erp
+      TZ: Asia/Shanghai
+    ports:
+      - "5433:5432"
+    volumes:
+      - hsh-pdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erp -d hsh_erp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  hsh-pdata:
