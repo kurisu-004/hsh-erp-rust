@@ -53,12 +53,12 @@ pub struct AutoCompleteConfig {
 }
 
 impl AppConfig {
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env(env_file: &str) -> Result<Self> {
         // 加载 .env（不存在不报错）
-        let _ = dotenvy::dotenv();
+        let _ = dotenvy::from_filename(env_file);
 
         Ok(Self {
-            database_url: env_required("DATABASE_URL")?,
+            database_url: build_database_url()?,
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3000"),
             max_request_body_size: env_parse("MAX_REQUEST_BODY_SIZE", 300 * 1024 * 1024)?,
 
@@ -81,9 +81,9 @@ impl AppConfig {
             },
 
             snowflake: SnowflakeConfig {
-                instance: env_parse("SNOWFLAKE_INSTANCE", 1)?,
-                seq: env_parse("SNOWFLAKE_SEQ", 1)?,
-                epoch_ms: env_parse("SNOWFLAKE_EPOCH", 1_577_836_800_000u64)?, // 2020-01-01 UTC
+                instance: env_parse("SNOWFLAKE_INSTANCE", 0)?,
+                seq: env_parse("SNOWFLAKE_SEQ", 0)?,
+                epoch_ms: env_parse("SNOWFLAKE_EPOCH", 1_735_689_600_000u64)?, // 2020-01-01 UTC
             },
 
             auto_complete: AutoCompleteConfig {
@@ -92,6 +92,40 @@ impl AppConfig {
             },
         })
     }
+}
+
+/// 从环境变量构建 PostgreSQL 连接 URL（开发库）
+fn build_database_url() -> Result<String> {
+    // 优先使用完整的 DATABASE_URL（兼容旧方式）
+    if let Ok(url) = env::var("DATABASE_URL") {
+        return Ok(url);
+    }
+
+    // 否则从拆分变量构建
+    let host = env_or("POSTGRES_HOST", "localhost");
+    let port = env_or("POSTGRES_PORT", "5432");
+    let user = env_required("POSTGRES_USER")?;
+    let password = env_required("POSTGRES_PASSWORD")?;
+    let db = env_required("POSTGRES_DB")?;
+
+    Ok(format!("postgresql://{user}:{password}@{host}:{port}/{db}"))
+}
+
+/// 从环境变量构建 PostgreSQL 连接 URL（测试库）
+pub fn build_test_database_url() -> Result<String> {
+    // 优先使用完整的 DATABASE_TEST_URL（兼容完整 URL 方式）
+    if let Ok(url) = env::var("DATABASE_TEST_URL") {
+        return Ok(url);
+    }
+
+    // 否则从测试库拆分变量构建
+    let host = env_or("POSTGRES_TEST_HOST", "localhost");
+    let port = env_or("POSTGRES_TEST_PORT", "5429");
+    let user = env_required("POSTGRES_TEST_USER")?;
+    let password = env_required("POSTGRES_TEST_PASSWORD")?;
+    let db = env_required("POSTGRES_TEST_DB")?;
+
+    Ok(format!("postgresql://{user}:{password}@{host}:{port}/{db}"))
 }
 
 fn env_or(key: &str, default: &str) -> String {

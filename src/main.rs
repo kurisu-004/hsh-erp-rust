@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // 2. 加载配置
-    let config = AppConfig::from_env().context("加载配置失败")?;
+    let config = AppConfig::from_env(".env").context("加载配置失败")?;
     info!(listen = %config.listen_addr, "配置加载完成");
 
     // 3. 数据库连接池

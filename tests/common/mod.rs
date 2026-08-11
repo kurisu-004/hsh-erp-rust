@@ -1,8 +1,9 @@
 //! 集成测试共享基建
 //!
-//! 用户提供的固定测试基础设施：容器 `postgres-rust` 已在端口 5430 跑起来，
-//! 首次跑测试时会自动在容器内建 `postgres_rust_test` 库（已存在则跳过），
-//! 并在连接后跑 `sqlx::migrate!` 把 10 个迁移 apply 上。
+//! 测试库由 docker-compose 的 `postgres-test` 服务提供（localhost:5429，
+//! 账号 `hsh_test`）。首次跑测试时 `ensure_database_exists()` 自动建
+//! `postgres_rust_test` 库（已存在则跳过），`test_pool()` 连接后跑
+//! `sqlx::migrate!` apply 全部迁移。
 //!
 //! 每个集成测试用例在开头三步：
 //! ```ignore
@@ -26,16 +27,11 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::state::AppState;
 
-/// 测试 DB URL：与 `postgres-rust` 容器（端口 5430）+ 新建的 `postgres_rust_test` 库配对。
-///
-/// 集成测试也走 `sqlx::query!` 编译期校验，所以 `cargo test` 时
-/// `DATABASE_URL` 环境变量必须指向**已迁移**的库。本测试基建默认假设 dev DB
-/// `postgres_rust`（同样在 5430）已迁移；test DB 在第一次连接前由
-/// `ensure_database_exists()` + `test_pool()` 内的 `migrate!` 完成。
-pub const TEST_DATABASE_URL: &str = "postgres://hsh:6065161@localhost:5430/postgres_rust_test";
+/// 测试 DB URL：与 `postgres-test` 容器（端口5429）+ `postgres_rust_test` 库配对。
+const TEST_DATABASE_URL: &str = "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test";
 
-/// 连接 admin 库，建测试库用
-const ADMIN_DATABASE_URL: &str = "postgres://hsh:6065161@localhost:5430/postgres";
+/// Admin DB URL：用于在测试前创建 `postgres_rust_test` 库。
+const ADMIN_DATABASE_URL: &str = "postgres://hsh_test:6065161test@localhost:5429/postgres";
 
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
 const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
@@ -44,7 +40,7 @@ const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
 pub async fn ensure_database_exists() {
     let admin = PgPool::connect(ADMIN_DATABASE_URL)
         .await
-        .expect("connect admin db (postgres) — 确认 postgres-rust 容器在 5430");
+        .expect("connect admin db (postgres) — 确认 postgres-test 容器在 5429");
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname='postgres_rust_test')",
     )

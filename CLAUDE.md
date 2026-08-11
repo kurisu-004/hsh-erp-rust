@@ -11,12 +11,14 @@ Python FastAPI ERP（`/Users/ren/Code/myERP`）的 Rust 重构版。**当前为�
 ## 常用命令
 
 ```bash
-cargo check                 # 骨架阶段不依赖 DB（无 query! 宏）
-cargo clippy --all-targets
-cargo test                  # 含 snowflake 单测；跑单个测试：cargo test <name>
-cargo run                   # 需先 cp .env.example .env 并起开发库
+docker compose up -d postgres-dev    # 开发库（localhost:5430，库 hsh）：cargo run 与 query! 编译期校验依赖
+docker compose up -d postgres-test   # 测试库（localhost:5429，库 postgres_rust_test）：集成测试依赖，首次自动建库+迁移
 
-./scripts/dev_db.sh         # 启动本地 PG（docker compose，端口 5433）
+cargo check                 # 已有 query! 宏：编译期经 .env 的 DATABASE_URL 连开发库校验；无库时用 SQLX_OFFLINE=true（.sqlx 已提交）
+cargo clippy --all-targets
+cargo test                  # 需先起 postgres-test；跑单个测试：cargo test <name>
+cargo run                   # 需先 cp .env.example .env 并起 postgres-dev
+
 ./scripts/sqlx_prepare.sh   # 每次 query! 宏改动后必须重跑，生成 .sqlx/query-*.json 并提交
 SQLX_OFFLINE=true cargo build --release   # CI/Docker 用离线元数据构建
 ```
@@ -57,5 +59,6 @@ SQLX_OFFLINE=true cargo build --release   # CI/Docker 用离线元数据构建
 
 ## 环境要点
 
-- 开发库 PG 在 **5433**（测试库预留 5434，二者均避开其他项目）；配置全部走 `.env`（`infra/config.rs`）
+- 双 PG 容器（docker compose 分服务启动）：开发库 `postgres-dev` 在 **5430**（库 `hsh`），测试库 `postgres-test` 在 **5429**（库 `postgres_rust_test`）
+- 配置全部走 `.env`（`infra/config.rs`）：`DATABASE_URL` 优先，缺省回退 `POSTGRES_*` 拆分变量拼接；测试库 URL 由 `build_test_database_url()` 构建（`DATABASE_TEST_URL` / `POSTGRES_TEST_*`）
 - 优雅退出：`AppState.shutdown`（CancellationToken）同时通知 axum serve 与 `task/auto_complete` 后台循环
