@@ -25,8 +25,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use thiserror::Error;
 
-use crate::shared::response::R;
-
 /// 错误码常量（沿用 Python 数字契约）
 pub mod code {
     pub const SUCCESS: i32 = 0;
@@ -201,6 +199,24 @@ pub enum AppError {
         http: StatusCode,
     },
 
+    /// 业务错误（带失败明细列表，用于装配件整套拒绝 21418 等）。
+    ///
+    /// `IntoResponse` 会把 `failures` 序列化进 `R::err.data` 字段，结构：
+    /// ```jsonc
+    /// { "failures": [ {"serial_no": "...", "name": "...", "reason": "..."}, ... ] }
+    /// ```
+    /// `message` 仍按既有约定继续携带人读文案（设计 §5：「message 含全部失败子件」）。
+    ///
+    /// `failures` 用 `serde_json::Value` 而非具体 DTO 是为了**避免** `shared::error`
+    /// 反向依赖具体业务域的 DTO 类型。
+    #[error("[{code}] {message}")]
+    BizWithFailures {
+        code: i32,
+        message: String,
+        http: StatusCode,
+        failures: Vec<serde_json::Value>,
+    },
+
     /// 校验失败（40001，HTTP 422）
     #[error("校验失败: {0}")]
     Validation(String),
@@ -269,7 +285,7 @@ impl AppError {
 
     pub fn code(&self) -> i32 {
         match self {
-            Self::Biz { code, .. } => *code,
+            Self::Biz { code, .. } | Self::BizWithFailures { code, .. } => *code,
             Self::Validation(_) => code::VALIDATION_ERROR,
             Self::Unauthorized(_) => code::UNAUTHORIZED,
             Self::Forbidden => code::FORBIDDEN,
@@ -281,7 +297,7 @@ impl AppError {
 
     pub fn http_status(&self) -> StatusCode {
         match self {
-            Self::Biz { http, .. } => *http,
+            Self::Biz { http, .. } | Self::BizWithFailures { http, .. } => *http,
             Self::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Unauthorized(_) | Self::Jwt(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
@@ -388,10 +404,21 @@ impl IntoResponse for AppError {
             }
             other => other.to_string(),
         };
-        let body = R::<()> {
-            code: self.code(),
-            message,
-            data: None,
+        // 直接拼装 JSON body（不走泛型 `R<T>`，因为 BizWithFailures 需要序列化
+        // 非 `()` 的 `data`；这里手动构造，与 `R<T>` 序列化后的字段约定一致）。
+        let body: serde_json::Value = match &self {
+            AppError::BizWithFailures {
+                code, failures, ..
+            } => serde_json::json!({
+                "code": code,
+                "message": &message,
+                "data": serde_json::json!({ "failures": failures }),
+            }),
+            other => serde_json::json!({
+                "code": other.code(),
+                "message": &message,
+                "data": serde_json::Value::Null,
+            }),
         };
         (status, Json(body)).into_response()
     }
@@ -832,5 +859,23 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("20109"), "Display 必须包含 code: {s}");
         assert!(s.contains("missing batch"), "Display 必须包含 message: {s}");
+    }
+
+    #[test]
+    fn biz_with_failures_carries_failures_into_envelope() {
+        let err = AppError::BizWithFailures {
+            code: code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY,
+            message: "整套拒绝".to_string(),
+            http: StatusCode::BAD_REQUEST,
+            failures: vec![
+                serde_json::json!({"serial_no": "B01", "name": "fala-A", "reason": "status=IN_PROCESS"}),
+                serde_json::json!({"serial_no": "B02", "name": "fala-B", "reason": "on note DN-20260821-0001"}),
+            ],
+        };
+        assert_eq!(err.code(), code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY);
+        assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
+        let s = err.to_string();
+        assert!(s.contains("21418"));
+        assert!(s.contains("整套拒绝"));
     }
 }

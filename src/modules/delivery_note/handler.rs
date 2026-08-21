@@ -11,6 +11,7 @@
 //!
 //! ## Phase 路由（设计 §6 + §6.2）
 //! 业务端点统一 `/api/v2/delivery-notes/*`：
+//! - `POST   /scan`                           ← Phase P3 扫码建单（设计 §5）
 //! - `GET    /candidate-parts?customer_id=...`
 //! - `GET    /pickup-pending?customer_id=...`
 //! - `GET    /`
@@ -26,7 +27,7 @@
 //! - `POST   /{id}/pickup`
 //! - `POST   /{id}/soft-delete`
 //!
-//! 打印 `/print` / `/print-labels` 与扫码建单 `/scan` 留到 P3/P4，本期不注册。
+//! 打印 `/print` / `/print-labels` 留到 P4，本期不注册。
 
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ use axum::{Json, Router};
 
 use serde::Deserialize;
 
-use crate::auth::rbac::CurrentUser;
+use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::delivery_note::model::DeliveryNoteSortKey;
 use crate::modules::delivery_note::repo::SortDir;
 use crate::modules::delivery_note::service::DeliveryNoteService;
@@ -49,6 +50,7 @@ use super::dto::{
     DeliveryNoteCreateRequest, DeliveryNoteListQuery, DeliveryNotePickupPendingQuery,
     DeliveryNotePickupRequest, DeliveryNotePickupScanOut, DeliveryNotePickupScanRequest,
     DeliveryNoteRemovePartsRequest, DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest,
+    ScanDeliveryOut, ScanDeliveryRequest,
 };
 
 // ===========================================================================
@@ -335,17 +337,58 @@ pub async fn soft_delete_delivery_note(
     Ok(Json(R::ok_empty()))
 }
 
+/// POST /api/v2/delivery-notes/scan  （设计 §5；P3）
+///
+/// 扫码入单：trim → 解析（part → assembly）→ 分类 → find-or-create 草稿 → 批次
+/// 评估 → 写 `delivery_note_id`（整个流程在事务内）。commit 后广播一次大屏事件
+/// `DELIVERY_NOTE_SCAN_ADD`（轻量级 high-frequency）。
+///
+/// 角色：M / C / I（与 Python `pickup_scan` 对应，但 Python 仅 I；这里放宽允许
+/// MANAGER/CLERK 调试用，与 `create_draft` 一致）。
+pub async fn scan_delivery_note(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<ScanDeliveryRequest>,
+) -> Result<Json<R<ScanDeliveryOut>>, AppError> {
+    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+    let mut tx = state.pool.begin().await?;
+    let out =
+        DeliveryNoteService::scan_add(&mut tx, &state.snowflake, &req.code, &current).await?;
+    tx.commit().await?;
+
+    let added_count = out.added_batches.len();
+    let note_id = out.note.id;
+    let note_no = out.note.delivery_note_no.clone();
+    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+        kind: "DELIVERY_NOTE_SCAN_ADD".to_string(),
+        payload: serde_json::json!({
+            "delivery_note_id": note_id,
+            "delivery_note_no": note_no,
+            "added_count": added_count,
+            "line_count": out.note.line_count,
+            "resolved_kind": out.resolved.kind,
+            "outcome": match out.outcome {
+                super::dto::ScanOutcomeDto::Added => "ADDED",
+                super::dto::ScanOutcomeDto::AlreadyPresent => "ALREADY_PRESENT",
+            },
+        }),
+    });
+
+    Ok(Json(R::ok(out)))
+}
+
 // ===========================================================================
 //  路由表
 // ===========================================================================
 
 /// 本域路由表（设计 §6 + §6.2：delivery-notes）。
 ///
-/// axum 静态段优先于参数段；`/candidate-parts`、`/pickup-pending` 必须
+/// axum 静态段优先于参数段；`/scan`、`/candidate-parts`、`/pickup-pending` 必须
 /// 在 `/{id}` 之前注册。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ---- delivery-notes/* ----
+        .route("/scan", post(scan_delivery_note))
         .route(
             "/candidate-parts",
             get(list_candidate_parts),

@@ -231,7 +231,7 @@ impl ScanOutcome {
 /// 送货单范围（D1：每单一范围；D4：L1 全域 = L1Wide；D5：同范围 DRAFT 共享）
 ///
 /// 内部枚举，P2 / P3 业务实装时由 `classify()` 产出；P1 阶段仅放类型。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum NoteScope {
     /// L1 全域：两列都 NULL（遗留行为）

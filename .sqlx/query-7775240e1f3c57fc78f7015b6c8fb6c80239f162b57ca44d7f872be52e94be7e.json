@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_delivery_note\n            SET status           = $2,\n                submitted_at     = $3,\n                picked_up_at     = $4,\n                submitted_by     = $5,\n                picked_up_by     = $6,\n                driver_worker_id = $7,\n                note             = $8,\n                delivery_date    = $9,\n                version          = $10,\n                updated_at       = $11,\n                updated_by       = $12\n            WHERE id = $1 AND version = $13 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Timestamp",
+        "Timestamp",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Date",
+        "Int4",
+        "Timestamp",
+        "Int8",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7775240e1f3c57fc78f7015b6c8fb6c80239f162b57ca44d7f872be52e94be7e"
+}

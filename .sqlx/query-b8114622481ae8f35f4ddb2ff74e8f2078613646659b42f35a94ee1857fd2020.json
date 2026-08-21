@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE t_part_batch\n                SET delivery_note_id = NULL,\n                    version          = version + 1,\n                    updated_at       = $2,\n                    updated_by       = $3\n                WHERE id = $1 AND delivery_note_id = $4 AND deleted_at IS NULL\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Timestamp",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b8114622481ae8f35f4ddb2ff74e8f2078613646659b42f35a94ee1857fd2020"
+}

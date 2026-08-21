@@ -8,6 +8,7 @@
 //! ## Phase 范围
 //! - **P1**：送货分组（§6.1）
 //! - **P2**：送货单生命周期 + 候选入单（不含扫码 P3 / 打印 P4）
+//! - **P3**：扫码入单（§5）—— Scan* DTO
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
@@ -380,4 +381,97 @@ pub struct DeliveryNoteCandidatePartsQuery {
 pub struct DeliveryNotePath {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
     pub id: i64,
+}
+
+// ===========================================================================
+//  P3：扫码入单 DTO（设计 §5，POST /delivery-notes/scan）
+// ===========================================================================
+
+/// 扫码入单请求体。
+///
+/// `code` 是 trim 后的扫码载荷，长度要求 1..=64 字符；空白 / 空 → 400
+/// `BIZ_INVALID_VALUE`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScanDeliveryRequest {
+    pub code: String,
+}
+
+/// 扫码入单结果（200 OK 路径）。
+///
+/// - `ADDED`：本次成功挂载 ≥1 个批次
+/// - `ALREADY_PRESENT`：已全部在本单（不报错，幂等）
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ScanOutcomeDto {
+    Added,
+    AlreadyPresent,
+}
+
+/// 解析结果（识别出来的实体）。
+///
+/// - `kind = "PART"`：单工单（可能隶属于某个装配件的子件）；`id` = part.id
+/// - `kind = "ASSEMBLY"`：扫的是装配件总图，`id` = assembly.id, `child_count` 必填
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedEntityDto {
+    /// "PART" | "ASSEMBLY"
+    pub kind: &'static str,
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub id: i64,
+    pub serial_no: String,
+    pub drawing_no: String,
+    pub name: String,
+    #[serde(
+        serialize_with = "crate::shared::types::serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub assembly_id: Option<i64>,
+    pub child_count: Option<usize>,
+}
+
+/// 扫码命中的送货单概要（响应里的 `note` 字段）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanDeliveryNoteSummaryDto {
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub id: i64,
+    pub delivery_note_no: String,
+    pub version: i32,
+    pub status: String,
+    pub scope_label: String,
+    pub customer_path: String,
+    pub line_count: usize,
+}
+
+/// 命中的批次（含 added / already_present 列表用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanBatchDto {
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub batch_id: i64,
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub part_id: i64,
+    pub serial_no: String,
+    pub quantity: i32,
+}
+
+/// 扫码入单失败子件明细（用于 21418 装配件整套拒绝响应）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanFailureDto {
+    pub serial_no: String,
+    pub name: String,
+    pub reason: String,
+}
+
+/// `POST /delivery-notes/scan` 出参（200 OK）。
+///
+/// 备注：
+/// - `skipped` 在 200 路径上始终为空；装配件整套拒绝（21418）由 handler 通过
+///   `AppError::BizWithFailures` 序列化到 `data.failures`。
+/// - `added_batches` + `already_present` 是当前 note 本次扫码后**实际**的入单 / 重复集合。
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanDeliveryOut {
+    pub outcome: ScanOutcomeDto,
+    pub resolved: ResolvedEntityDto,
+    pub note: ScanDeliveryNoteSummaryDto,
+    pub added_batches: Vec<ScanBatchDto>,
+    pub already_present: Vec<ScanBatchDto>,
+    pub skipped: Vec<ScanFailureDto>,
 }
