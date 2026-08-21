@@ -427,6 +427,16 @@ pub async fn print_delivery_note(
         .header(CACHE_CONTROL, "no-store")
         .body(axum::body::Body::from(bytes))
         .map_err(|e| AppError::internal(format!("build print response: {e}")))?;
+
+    // 渲染成功后广播（轻量：只推单据级事件，不按行推送）
+    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+        kind: "DELIVERY_NOTE_PRINTED".to_string(),
+        payload: serde_json::json!({
+            "delivery_note_id": path.id,
+            "kind": "note",
+        }),
+    });
+
     Ok(resp)
 }
 
@@ -475,6 +485,16 @@ pub async fn print_labels(
         .header(CACHE_CONTROL, "no-store")
         .body(axum::body::Body::from(bytes))
         .map_err(|e| AppError::internal(format!("build labels response: {e}")))?;
+
+    // 渲染成功后广播（轻量：只推单据级事件，不按行推送）
+    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+        kind: "DELIVERY_NOTE_PRINTED".to_string(),
+        payload: serde_json::json!({
+            "delivery_note_id": path.id,
+            "kind": "label",
+        }),
+    });
+
     Ok(resp)
 }
 
