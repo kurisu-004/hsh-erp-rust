@@ -19,9 +19,35 @@ pub fn serialize_i64<S: Serializer>(v: &i64, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&v.to_string())
 }
 
+/// `Option<i64>` 序列化为 JSON 字符串；None 序列化为 `null`（除非 caller
+/// 加 `skip_serializing_if = "Option::is_none"`）。
+pub fn serialize_i64_opt<S: Serializer>(
+    v: &Option<i64>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(n) => s.serialize_str(&n.to_string()),
+        None => s.serialize_none(),
+    }
+}
+
 pub fn deserialize_i64<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
     let s = String::deserialize(d)?;
     s.parse::<i64>().map_err(serde::de::Error::custom)
+}
+
+/// `Option<i64>` 反序列化：None 表示字段缺省；Some(str) → parse 为 i64。
+///
+/// 用于 query string / body 里可选的雪花 id 字段（`customer_id=L1` 时 str，
+/// 没传则 None）。常配 `#[serde(default)]` 兜底。
+pub fn deserialize_i64_opt<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<i64>, D::Error> {
+    let opt: Option<String> = Option::deserialize(d)?;
+    match opt {
+        None => Ok(None),
+        Some(s) => s.parse::<i64>().map(Some).map_err(serde::de::Error::custom),
+    }
 }
 
 /// 把 JSON 字符串数组反序列化为 `Vec<i64>`（与 `serialize_i64` 对称）
