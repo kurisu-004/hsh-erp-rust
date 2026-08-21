@@ -63,8 +63,6 @@ const PLACEHOLDER_ERR_CODE: i32 = code::INTERNAL;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// `t_delivery_note_counter` 当日计数器连续调用两次应当产出 `0001` 与 `0002`，
     /// 并共享同一 DN- 前缀。
     ///
