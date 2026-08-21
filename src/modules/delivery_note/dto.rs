@@ -88,7 +88,7 @@ pub struct UpdateDeliveryGroupRequest {
     pub version: i32,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_i64_vec_opt")]
     pub member_customer_ids: Option<Vec<i64>>,
 }
 

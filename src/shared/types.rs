@@ -42,3 +42,22 @@ pub fn deserialize_i64_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<i64>, 
         .map(|s| s.parse::<i64>().map_err(serde::de::Error::custom))
         .collect()
 }
+
+/// `Option<Vec<i64>>` 版本：None 表示字段缺省（`#[serde(default)]` 也会兜底）；
+/// Some(vec) 走 `deserialize_i64_vec` 同样的逐元素字符串→i64 解析。
+///
+/// 用于 update 请求里可选的全量替换字段（`UpdateDeliveryGroupRequest`）。
+pub fn deserialize_i64_vec_opt<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Vec<i64>>, D::Error> {
+    // 直接反序列化 Option<Vec<String>>，再 map parse
+    let opt: Option<Vec<String>> = Option::deserialize(d)?;
+    match opt {
+        None => Ok(None),
+        Some(v) => v
+            .into_iter()
+            .map(|s| s.parse::<i64>().map_err(serde::de::Error::custom))
+            .collect::<Result<Vec<i64>, _>>()
+            .map(Some),
+    }
+}
