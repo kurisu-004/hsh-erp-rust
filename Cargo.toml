@@ -62,7 +62,28 @@ async-trait = "0.1"                                               # CosClient dy
 futures-util = "0.3"                                              # ws StreamExt/SinkExt
 dashmap = "6"                                                     # ws 连接注册表
 
+# Excel 模板（送货单打印，P0 spike）
+# 任务说明强制指定 umya-spreadsheet = "2"；最新 3.x 已移除 get_* 弃用方法，
+# 需重写代码。这里先用 "2" 走通 spike，P4 再统一升级 + 评估。
+umya-spreadsheet = "2"
+
+# P0 spike 用 calamine 回读生成的 xlsx 做关键单元格 + 打印区/页面设置的验证。
+# 任务说明把 calamine 放在 [dev-dependencies]，但 [[bin]] target 不接受
+# dev-deps（Cargo 限制；dev-deps 仅 tests / examples / benchmarks 可见），所以
+# 这里放到 [dependencies]。仅 spike bin 使用，P4 print.rs 上线后整个 bin 删除，
+# calamine 也会随 spike 一起移除——不会污染发布构建。
+calamine = "0.26"
+
 [dev-dependencies]
 # 集成测试用 tower::ServiceExt::oneshot 直接驱动 Router。
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。
 tower = { version = "0.5", features = ["util"] }
+
+# ---------------------------------------------------------------------------------
+# P0 spike：送货单模板 umya-spreadsheet 可行性验证 bin。
+# 复制完模板 + 填数据 + 设置页面后写出，calamine 回读验真。P4 实施 print.rs 时
+# 会替换掉，bin 路径仅用于 spike 期间的开发调试。
+# ---------------------------------------------------------------------------------
+[[bin]]
+name = "umya_spike"
+path = "tools/umya_spike/src/main.rs"
