@@ -2,6 +2,7 @@
 //! 对应 Python myERP/core/config.py
 
 use std::env;
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 
@@ -14,6 +15,9 @@ pub struct AppConfig {
     pub snowflake: SnowflakeConfig,
     pub max_request_body_size: usize,
     pub auto_complete: AutoCompleteConfig,
+    /// 送货单 Excel 模板目录（P4 打印：默认 `./template`，环境变量
+    /// `DELIVERY_NOTE_TEMPLATE_DIR` 覆盖；路径解析用 `PathBuf` 以容忍相对/绝对路径）。
+    pub delivery_note_template_dir: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +94,8 @@ impl AppConfig {
                 threshold_days: env_parse("AUTO_COMPLETE_THRESHOLD_DAYS", 7)?,
                 interval_hours: env_parse("AUTO_COMPLETE_INTERVAL_HOURS", 24)?,
             },
+
+            delivery_note_template_dir: PathBuf::from(env_or("DELIVERY_NOTE_TEMPLATE_DIR", "template")),
         })
     }
 }
