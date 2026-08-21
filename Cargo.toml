@@ -62,28 +62,33 @@ async-trait = "0.1"                                               # CosClient dy
 futures-util = "0.3"                                              # ws StreamExt/SinkExt
 dashmap = "6"                                                     # ws 连接注册表
 
-# Excel 模板（送货单打印，P0 spike）
+# Excel 模板（送货单打印，P4）
 # 任务说明强制指定 umya-spreadsheet = "2"；最新 3.x 已移除 get_* 弃用方法，
-# 需重写代码。这里先用 "2" 走通 spike，P4 再统一升级 + 评估。
+# 需重写代码。这里先用 "2" 走通后续 P4 实施；后续可统一升级 + 评估。
 umya-spreadsheet = "2"
 
-# P0 spike 用 calamine 回读生成的 xlsx 做关键单元格 + 打印区/页面设置的验证。
-# 任务说明把 calamine 放在 [dev-dependencies]，但 [[bin]] target 不接受
-# dev-deps（Cargo 限制；dev-deps 仅 tests / examples / benchmarks 可见），所以
-# 这里放到 [dependencies]。仅 spike bin 使用，P4 print.rs 上线后整个 bin 删除，
-# calamine 也会随 spike 一起移除——不会污染发布构建。
-calamine = "0.26"
+# P4 print_xml_patch 用 zip crate 直接读写 xlsx 内部 entry（绕过 umya 的
+# _xlnm.Print_Aria 重复 + pageSetUpPr + shrinkToFit 缺口）。这是 umya-spreadsheet
+# 的传递依赖（v2.4.2），但我们直接声明以避开「传递依赖隐性升级」风险。
+zip = "2"
+# 同样来自 umya-spreadsheet 的传递依赖（v0.37.5），用于 styles.xml 内
+# cellXfs 段插入新的 xf（P4 shrinkToFit patch 用）。
+quick-xml = "0.37"
+# 渲染走 spawn_blocking；响应按 bytes 直接返 Body（Python 64KB chunk 不复刻，
+# 前端 onDownloadProgress 由浏览器原生 a.download 兜住）。
+tokio-stream = "0.1"
 
 [dev-dependencies]
 # 集成测试用 tower::ServiceExt::oneshot 直接驱动 Router。
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。
 tower = { version = "0.5", features = ["util"] }
 
+# calamine 现在的角色：P4 集成测试（tests/delivery_print_api.rs）回读生成的
+# xlsx 断言关键单元格。它是 umya-spreadsheet 的传递依赖，但这里**显式声明**
+# 让 dev-only 限制在测试范围内（P0 spike 时期它在主依赖里是因为 [[bin]] 不接受
+# dev-deps；spike 已废弃，移除 bin 后即可下放到 dev-deps）。
+calamine = "0.26"
+
 # ---------------------------------------------------------------------------------
-# P0 spike：送货单模板 umya-spreadsheet 可行性验证 bin。
-# 复制完模板 + 填数据 + 设置页面后写出，calamine 回读验真。P4 实施 print.rs 时
-# 会替换掉，bin 路径仅用于 spike 期间的开发调试。
+# P0 spike bin 已删除（迁移到 src/modules/delivery_note/print.rs）。
 # ---------------------------------------------------------------------------------
-[[bin]]
-name = "umya_spike"
-path = "tools/umya_spike/src/main.rs"
