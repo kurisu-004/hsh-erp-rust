@@ -29,6 +29,7 @@
 //!
 //! 打印 `/print` / `/print-labels` 留到 P4，本期不注册。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -50,7 +51,7 @@ use super::dto::{
     DeliveryNoteCreateRequest, DeliveryNoteListQuery, DeliveryNotePickupPendingQuery,
     DeliveryNotePickupRequest, DeliveryNotePickupScanOut, DeliveryNotePickupScanRequest,
     DeliveryNoteRemovePartsRequest, DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest,
-    ScanDeliveryOut, ScanDeliveryRequest,
+    PrintDeliveryNoteRequest, PrintLabelsRequest, ScanDeliveryOut, ScanDeliveryRequest,
 };
 
 // ===========================================================================
@@ -378,13 +379,155 @@ pub async fn scan_delivery_note(
 }
 
 // ===========================================================================
+//  P4 打印端点（设计 §6.2 + §8）
+// ===========================================================================
+
+/// POST /api/v2/delivery-notes/{id}/print  （设计 §8，P4）
+///
+/// 渲染送货单 → xlsx bytes；CPU 密集 umya 渲染走 `tokio::task::spawn_blocking`。
+/// 角色：M / C / I（与 Python `print_note` 对齐）。
+pub async fn print_delivery_note(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(path): Path<DeliveryNotePath>,
+    Json(req): Json<PrintDeliveryNoteRequest>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, CACHE_CONTROL};
+    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+
+    let custom_order = parse_i64_opt(req.custom_order.as_ref(), "custom_order")?;
+    let merge_quantities = parse_i64_map_opt(req.merge_quantities.as_ref(), "merge_quantities")?;
+
+    let bytes_prefix = DeliveryNoteService::print_xlsx(
+        &state.pool,
+        path.id,
+        custom_order,
+        req.merge_assemblies.unwrap_or(false),
+        merge_quantities,
+        None,
+        &state.config.delivery_note_template_dir,
+        &current,
+    )
+    .await?;
+    let (bytes, _prefix) = bytes_prefix;
+
+    let filename = format!(
+        "F-{}-note.xlsx",
+        chrono::Local::now().format("%Y-%m-%d")
+    );
+    let len = bytes.len();
+    let resp = axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        .header(
+            CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .header(CONTENT_LENGTH, len.to_string())
+        .header(CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| AppError::internal(format!("build print response: {e}")))?;
+    Ok(resp)
+}
+
+/// POST /api/v2/delivery-notes/{id}/print-labels  （设计 §8，P4）
+///
+/// 标签渲染（不走模板，直接 `openpyxl.Workbook` 等价）
+pub async fn print_labels(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(path): Path<DeliveryNotePath>,
+    Json(req): Json<PrintLabelsRequest>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, CACHE_CONTROL};
+    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+
+    let custom_order = parse_i64_opt(req.custom_order.as_ref(), "custom_order")?;
+    let merge_quantities = parse_i64_map_opt(req.merge_quantities.as_ref(), "merge_quantities")?;
+    let line_item_ids = parse_i64_opt(req.line_item_ids.as_ref(), "line_item_ids")?;
+
+    let bytes_prefix = DeliveryNoteService::print_xlsx(
+        &state.pool,
+        path.id,
+        custom_order,
+        req.merge_assemblies.unwrap_or(true), // labels 默认 true（与 Python 一致）
+        merge_quantities,
+        line_item_ids,
+        &state.config.delivery_note_template_dir,
+        &current,
+    )
+    .await?;
+    let (bytes, _prefix) = bytes_prefix;
+
+    let filename = format!(
+        "F-{}-labels.xlsx",
+        chrono::Local::now().format("%Y-%m-%d")
+    );
+    let len = bytes.len();
+    let resp = axum::response::Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        .header(
+            CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .header(CONTENT_LENGTH, len.to_string())
+        .header(CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(bytes))
+        .map_err(|e| AppError::internal(format!("build labels response: {e}")))?;
+    Ok(resp)
+}
+
+// 解析 JSON 字符串键的 i64 / HashMap
+fn parse_i64_opt(field: Option<&Vec<String>>, name: &str) -> Result<Option<Vec<i64>>, AppError> {
+    match field {
+        None => Ok(None),
+        Some(v) => {
+            let mut out = Vec::with_capacity(v.len());
+            for s in v {
+                let n: i64 = s.parse().map_err(|_| {
+                    AppError::biz(
+                        crate::shared::error::code::BIZ_INVALID_VALUE,
+                        format!("{name} contains non-integer id: {s:?}"),
+                    )
+                })?;
+                out.push(n);
+            }
+            Ok(Some(out))
+        }
+    }
+}
+
+fn parse_i64_map_opt(
+    field: Option<&HashMap<String, i32>>,
+    name: &str,
+) -> Result<HashMap<i64, i32>, AppError> {
+    match field {
+        None => Ok(HashMap::new()),
+        Some(m) => {
+            let mut out = HashMap::with_capacity(m.len());
+            for (k, v) in m {
+                let n: i64 = k.parse().map_err(|_| {
+                    AppError::biz(
+                        crate::shared::error::code::BIZ_INVALID_VALUE,
+                        format!("{name} contains non-integer key: {k:?}"),
+                    )
+                })?;
+                out.insert(n, *v);
+            }
+            Ok(out)
+        }
+    }
+}
+
+// ===========================================================================
 //  路由表
 // ===========================================================================
 
 /// 本域路由表（设计 §6 + §6.2：delivery-notes）。
 ///
 /// axum 静态段优先于参数段；`/scan`、`/candidate-parts`、`/pickup-pending` 必须
-/// 在 `/{id}` 之前注册。
+/// 在 `/{id}` 之前注册。`/print[/-labels]` 注册在 `/{id}/...` 段里，路径不冲突。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ---- delivery-notes/* ----
@@ -407,6 +550,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/pickup-scan", post(pickup_scan))
         .route("/{id}/pickup", post(pickup_delivery_note))
         .route("/{id}/soft-delete", post(soft_delete_delivery_note))
+        .route("/{id}/print", post(print_delivery_note))
+        .route("/{id}/print-labels", post(print_labels))
         .route("/{id}", get(get_delivery_note))
 }
 

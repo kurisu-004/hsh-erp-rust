@@ -10,6 +10,8 @@
 //! - **P2**：送货单生命周期 + 候选入单（不含扫码 P3 / 打印 P4）
 //! - **P3**：扫码入单（§5）—— Scan* DTO
 
+use std::collections::HashMap;
+
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
@@ -381,6 +383,45 @@ pub struct DeliveryNoteCandidatePartsQuery {
 pub struct DeliveryNotePath {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
     pub id: i64,
+}
+
+// ===========================================================================
+//  P4：打印入参 DTO（设计 §8，POST /delivery-notes/{id}/print[/-labels]）
+// ===========================================================================
+
+/// 送货单打印入参（POST /delivery-notes/{id}/print）。
+///
+/// - `custom_order`: 代表 batch id 序列；与 `note.line_items[*].id` 一一对应；
+///   非法（含不在本单 id / 漏行）→ 422 `BIZ_DELIVERY_PRINT_BAD_ORDER`。
+/// - `merge_assemblies`: true → 同装配件子件合并一行（默认 false，沿用 Python
+///   送货单默认；labels 路径强制 true）。
+/// - `merge_quantities`: 按装配件 id 覆盖合并行数量（默认 1 套）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PrintDeliveryNoteRequest {
+    #[serde(default)]
+    pub custom_order: Option<Vec<String>>,
+    #[serde(default)]
+    pub merge_assemblies: Option<bool>,
+    #[serde(default)]
+    pub merge_quantities: Option<HashMap<String, i32>>,
+}
+
+/// 标签打印入参（POST /delivery-notes/{id}/print-labels）。
+///
+/// 字段语义同 [`PrintDeliveryNoteRequest`]，增 `line_item_ids`：
+/// - `None` / 缺省 → 全部数据行
+/// - `Some([])` → 400 `BIZ_INVALID_VALUE`
+/// - 未知 batch id → 422 `BIZ_DELIVERY_PRINT_BAD_ORDER`
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PrintLabelsRequest {
+    #[serde(default)]
+    pub custom_order: Option<Vec<String>>,
+    #[serde(default)]
+    pub merge_assemblies: Option<bool>,
+    #[serde(default)]
+    pub merge_quantities: Option<HashMap<String, i32>>,
+    #[serde(default)]
+    pub line_item_ids: Option<Vec<String>>,
 }
 
 // ===========================================================================
