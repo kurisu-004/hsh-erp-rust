@@ -136,6 +136,7 @@ pub fn test_state(pool: PgPool) -> Arc<AppState> {
             threshold_days: 7,
             interval_hours: 24,
         },
+        delivery_note_template_dir: std::path::PathBuf::from("template"),
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
