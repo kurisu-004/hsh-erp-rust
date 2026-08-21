@@ -416,41 +416,23 @@ impl PartBatchRepo {
         if customer_ids.is_empty() || statuses.is_empty() {
             return Ok(Vec::new());
         }
-        let sql = format!(
-            r#"
+        // 用 sqlx::query_as + FromRow 风格：先把单行 decode 成 (TPartBatch, TPart)。
+        // SQL 静态（不带 format!），用 query_as! 与任意 ANY 绑定需要 `text[]` / `bigint[]`。
+        // 这里 owner 表用 status ANY($1) + customer_id ANY($2)，传入 `&[&str]` / `&[i64]`
+        // 由 sqlx 编码为 text[] / bigint[]。
+        let sql = r#"
             SELECT
-                pb.id            AS "pb_id!",
-                pb.part_id       AS "pb_part_id!",
-                pb.batch_no      AS "pb_batch_no!",
-                pb.quantity      AS "pb_quantity!",
-                pb.status        AS "pb_status!",
-                pb.location      AS "pb_location?",
-                pb.current_holder_id AS "pb_current_holder_id?",
-                pb.next_process_id AS "pb_next_process_id?",
-                pb.placed_at     AS "pb_placed_at?",
-                pb.delivery_note_id AS "pb_delivery_note_id?",
-                pb.parent_batch_id AS "pb_parent_batch_id?",
-                pb.has_been_repaired AS "pb_has_been_repaired!",
-                pb.version       AS "pb_version!",
-                pb.created_at    AS "pb_created_at!",
-                pb.created_by    AS "pb_created_by?",
-                pb.updated_at    AS "pb_updated_at!",
-                pb.updated_by    AS "pb_updated_by?",
-                pb.deleted_at    AS "pb_deleted_at?",
-                p.id             AS "p_id!",
-                p.serial_no      AS "p_serial_no?",
-                p.name           AS "p_name!",
-                p.drawing_no     AS "p_drawing_no!",
-                p.customer_id    AS "p_customer_id!",
-                p.assembly_id    AS "p_assembly_id?",
-                p.status         AS "p_status!",
-                p.version        AS "p_version!",
-                p.created_at     AS "p_created_at!",
-                p.created_by     AS "p_created_by?",
-                p.updated_at     AS "p_updated_at!",
-                p.updated_by     AS "p_updated_by?",
-                p.deleted_at     AS "p_deleted_at?",
-                p.delivery_note_id AS "p_delivery_note_id?"
+                pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.status, pb.location,
+                pb.current_holder_id, pb.next_process_id, pb.placed_at,
+                pb.delivery_note_id, pb.parent_batch_id, pb.has_been_repaired,
+                pb.version, pb.created_at, pb.created_by, pb.updated_at, pb.updated_by, pb.deleted_at,
+                p.id AS "p_id", p.serial_no AS "p_serial_no", p.name AS "p_name",
+                p.drawing_no AS "p_drawing_no", p.customer_id AS "p_customer_id",
+                p.assembly_id AS "p_assembly_id", p.status AS "p_status",
+                p.version AS "p_version", p.created_at AS "p_created_at",
+                p.created_by AS "p_created_by", p.updated_at AS "p_updated_at",
+                p.updated_by AS "p_updated_by", p.deleted_at AS "p_deleted_at",
+                p.delivery_note_id AS "p_delivery_note_id"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
             WHERE pb.deleted_at IS NULL
@@ -459,9 +441,9 @@ impl PartBatchRepo {
               AND p.customer_id = ANY($2)
             ORDER BY p.serial_no ASC NULLS LAST, pb.id ASC
             LIMIT $3
-            "#,
-        );
-        let rows = sqlx::query(&sql)
+        "#;
+
+        let rows: Vec<sqlx::postgres::PgRow> = sqlx::query(sql)
             .bind(statuses)
             .bind(customer_ids)
             .bind(limit)
@@ -471,44 +453,43 @@ impl PartBatchRepo {
         use sqlx::Row;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            out.push((
-                TPartBatch {
-                    id: r.try_get("pb_id")?,
-                    part_id: r.try_get("pb_part_id")?,
-                    batch_no: r.try_get("pb_batch_no")?,
-                    quantity: r.try_get("pb_quantity")?,
-                    status: r.try_get("pb_status")?,
-                    location: r.try_get("pb_location")?,
-                    current_holder_id: r.try_get("pb_current_holder_id")?,
-                    next_process_id: r.try_get("pb_next_process_id")?,
-                    placed_at: r.try_get("pb_placed_at")?,
-                    delivery_note_id: r.try_get("pb_delivery_note_id")?,
-                    parent_batch_id: r.try_get("pb_parent_batch_id")?,
-                    has_been_repaired: r.try_get("pb_has_been_repaired")?,
-                    version: r.try_get("pb_version")?,
-                    created_at: r.try_get("pb_created_at")?,
-                    created_by: r.try_get("pb_created_by")?,
-                    updated_at: r.try_get("pb_updated_at")?,
-                    updated_by: r.try_get("pb_updated_by")?,
-                    deleted_at: r.try_get("pb_deleted_at")?,
-                },
-                TPart {
-                    id: r.try_get("p_id")?,
-                    serial_no: r.try_get("p_serial_no")?,
-                    name: r.try_get("p_name")?,
-                    drawing_no: r.try_get("p_drawing_no")?,
-                    customer_id: r.try_get("p_customer_id")?,
-                    assembly_id: r.try_get("p_assembly_id")?,
-                    status: r.try_get("p_status")?,
-                    version: r.try_get("p_version")?,
-                    created_at: r.try_get("p_created_at")?,
-                    created_by: r.try_get("p_created_by")?,
-                    updated_at: r.try_get("p_updated_at")?,
-                    updated_by: r.try_get("p_updated_by")?,
-                    deleted_at: r.try_get("p_deleted_at")?,
-                    delivery_note_id: r.try_get("p_delivery_note_id")?,
-                },
-            ));
+            let pb = TPartBatch {
+                id: r.try_get("id")?,
+                part_id: r.try_get("part_id")?,
+                batch_no: r.try_get("batch_no")?,
+                quantity: r.try_get("quantity")?,
+                status: r.try_get("status")?,
+                location: r.try_get("location")?,
+                current_holder_id: r.try_get("current_holder_id")?,
+                next_process_id: r.try_get("next_process_id")?,
+                placed_at: r.try_get("placed_at")?,
+                delivery_note_id: r.try_get("delivery_note_id")?,
+                parent_batch_id: r.try_get("parent_batch_id")?,
+                has_been_repaired: r.try_get("has_been_repaired")?,
+                version: r.try_get("version")?,
+                created_at: r.try_get("created_at")?,
+                created_by: r.try_get("created_by")?,
+                updated_at: r.try_get("updated_at")?,
+                updated_by: r.try_get("updated_by")?,
+                deleted_at: r.try_get("deleted_at")?,
+            };
+            let p = TPart {
+                id: r.try_get("p_id")?,
+                serial_no: r.try_get("p_serial_no")?,
+                name: r.try_get("p_name")?,
+                drawing_no: r.try_get("p_drawing_no")?,
+                customer_id: r.try_get("p_customer_id")?,
+                assembly_id: r.try_get("p_assembly_id")?,
+                status: r.try_get("p_status")?,
+                version: r.try_get("p_version")?,
+                created_at: r.try_get("p_created_at")?,
+                created_by: r.try_get("p_created_by")?,
+                updated_at: r.try_get("p_updated_at")?,
+                updated_by: r.try_get("p_updated_by")?,
+                deleted_at: r.try_get("p_deleted_at")?,
+                delivery_note_id: r.try_get("p_delivery_note_id")?,
+            };
+            out.push((pb, p));
         }
         Ok(out)
     }

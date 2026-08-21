@@ -94,9 +94,15 @@ pub async fn list_delivery_notes(
 ) -> Result<Json<R<super::dto::DeliveryNoteListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
 
-    // 解析 statuses / sort_by / sort_dir
-    let empty: Vec<String> = Vec::new();
-    let status_vec: Vec<&str> = q.statuses.as_ref().unwrap_or(&empty).iter().map(|s| s.as_str()).collect();
+    // 解析 statuses：query string `?statuses=A,B` → vec!["A","B"]
+    let status_vec: Vec<String> = match q.statuses.as_deref() {
+        Some(s) => s
+            .split(|c: char| c == ',')
+            .map(|x: &str| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        None => Vec::new(),
+    };
     let sort_by = match q.sort_by.as_deref() {
         Some("SUBMITTED_AT") => DeliveryNoteSortKey::SubmittedAt,
         Some("PICKED_UP_AT") => DeliveryNoteSortKey::PickedUpAt,
@@ -109,9 +115,10 @@ pub async fn list_delivery_notes(
     };
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
+    let status_strs: Vec<&str> = status_vec.iter().map(|s| s.as_str()).collect();
     let out = DeliveryNoteService::list_with_filters(
         &mut tx,
-        &status_vec,
+        &status_strs,
         q.customer_id,
         q.keyword.as_deref(),
         sort_by,
@@ -332,7 +339,7 @@ pub async fn soft_delete_delivery_note(
 //  路由表
 // ===========================================================================
 
-/// 本域路由表（设计 §6 + §6.2：delivery-notes + delivery-groups）。
+/// 本域路由表（设计 §6 + §6.2：delivery-notes）。
 ///
 /// axum 静态段优先于参数段；`/candidate-parts`、`/pickup-pending` 必须
 /// 在 `/{id}` 之前注册。
@@ -358,8 +365,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/pickup", post(pickup_delivery_note))
         .route("/{id}/soft-delete", post(soft_delete_delivery_note))
         .route("/{id}", get(get_delivery_note))
-        // ---- delivery-groups/* (P1) —— nest P1 子路由 ----
-        .nest("/delivery-groups", p1_group_router())
+}
+
+/// P1 送货分组路由表（独立挂在 `/api/v2/delivery-groups`）。
+pub fn p1_router() -> Router<Arc<AppState>> {
+    p1_group_router()
 }
 
 // ===========================================================================

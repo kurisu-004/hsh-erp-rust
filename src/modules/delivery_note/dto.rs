@@ -346,9 +346,12 @@ pub struct DeliveryNoteCandidatePartsOut {
 // ---------------------------------------------------------------------------
 
 /// GET /delivery-notes 查询参数。
+///
+/// `statuses` 是逗号分隔字符串（axum 默认 Query 不支持重复 key）：
+/// `?statuses=DRAFT,SUBMITTED`。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNoteListQuery {
-    pub statuses: Option<Vec<String>>,
+    pub statuses: Option<String>,
     #[serde(default, deserialize_with = "crate::shared::types::deserialize_i64_opt")]
     pub customer_id: Option<i64>,
     pub keyword: Option<String>,
