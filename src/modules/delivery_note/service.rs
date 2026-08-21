@@ -62,41 +62,6 @@ impl NoteScope {
     }
 }
 
-#[cfg(test)]
-mod classify_tests {
-    use super::*;
-
-    fn g(id: i64, members: &[i64]) -> GroupWithMemberIds {
-        GroupWithMemberIds {
-            group_id: id,
-            member_ids: members.to_vec(),
-        }
-    }
-
-    #[test]
-    fn classify_no_groups_returns_l1wide() {
-        assert_eq!(NoteScope::classify(101, &[]), NoteScope::L1Wide);
-    }
-
-    #[test]
-    fn classify_member_returns_group() {
-        let groups = vec![g(10, &[101, 102, 103])];
-        assert_eq!(NoteScope::classify(102, &groups), NoteScope::Group(10));
-    }
-
-    #[test]
-    fn classify_non_member_returns_leaf() {
-        let groups = vec![g(10, &[101, 102, 103])];
-        assert_eq!(NoteScope::classify(104, &groups), NoteScope::Leaf(104));
-    }
-
-    #[test]
-    fn classify_with_l1_self_returns_leaf_l1_id() {
-        let groups = vec![g(10, &[101, 102, 103])];
-        assert_eq!(NoteScope::classify(100, &groups), NoteScope::Leaf(100));
-    }
-}
-
 // ---------------------------------------------------------------------------
 //  DeliveryGroupService  (P1，已实现)
 // ---------------------------------------------------------------------------
@@ -411,6 +376,7 @@ pub struct DeliveryNoteService;
 impl DeliveryNoteService {
     // ---------- list ----------
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_with_filters(
         conn: &mut PgConnection,
         statuses: &[&str],
@@ -570,11 +536,11 @@ impl DeliveryNoteService {
 
         let now = now_naive();
         let mut changed = false;
-        if let Some(d) = req.delivery_date {
-            if Some(d) != obj.delivery_date {
-                obj.delivery_date = Some(d);
-                changed = true;
-            }
+        if let Some(d) = req.delivery_date
+            && Some(d) != obj.delivery_date
+        {
+            obj.delivery_date = Some(d);
+            changed = true;
         }
         if let Some(ref n) = req.note {
             // trim 后空字符串存 NULL，否则存 trim 结果
@@ -1148,10 +1114,10 @@ impl DeliveryNoteService {
 
         let mut result = Vec::with_capacity(rows.len());
         for (b, p) in rows {
-            if let Some(dnid) = b.delivery_note_id {
-                if active_note_ids.contains(&dnid) {
-                    continue;
-                }
+            if let Some(dnid) = b.delivery_note_id
+                && active_note_ids.contains(&dnid)
+            {
+                continue;
             }
             let leaf_name = name_by_id.get(&p.customer_id).cloned();
             let path = match (&root_name, &leaf_name) {
@@ -1567,20 +1533,18 @@ async fn add_parts_inner(
         check_scope(conn, &obj, part.customer_id).await?;
 
         // 批次挂单冲突
-        if let Some(other_id) = batch.delivery_note_id {
-            if other_id != note_id {
-                if let Some(other) = DeliveryNoteRepo::get_by_id(&mut *conn, other_id, false).await? {
-                    if other.status == STATUS_DRAFT || other.status == STATUS_SUBMITTED {
-                        return Err(AppError::biz(
-                            code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED,
-                            format!(
-                                "part {} 批次 {} already on active delivery note {}",
-                                part.id, batch.batch_no, other_id
-                            ),
-                        ));
-                    }
-                }
-            }
+        if let Some(other_id) = batch.delivery_note_id
+            && other_id != note_id
+            && let Some(other) = DeliveryNoteRepo::get_by_id(&mut *conn, other_id, false).await?
+            && (other.status == STATUS_DRAFT || other.status == STATUS_SUBMITTED)
+        {
+            return Err(AppError::biz(
+                code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED,
+                format!(
+                    "part {} 批次 {} already on active delivery note {}",
+                    part.id, batch.batch_no, other_id
+                ),
+            ));
         }
 
         // 部分量 → 拆
@@ -1652,6 +1616,7 @@ async fn add_parts_inner(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_event(
     conn: &mut PgConnection,
     snowflake: &SnowflakeIdGenerator,
@@ -1767,3 +1732,41 @@ async fn l1_children_lookup(conn: &mut PgConnection, l2_id: i64) -> Result<Strin
 // _TCustomer 用：保留 TCustomer 字段被读到的副作用
 #[allow(dead_code)]
 fn _ensure_tcustomer_used(_: &TCustomer) {}
+
+// classify 单元测试放在文件末尾，避免 `items after a test module` 警告
+// （rust 2018+ 规定 #[cfg(test)] mod 之后只能再放 #[cfg(test)] 项）。
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    fn g(id: i64, members: &[i64]) -> GroupWithMemberIds {
+        GroupWithMemberIds {
+            group_id: id,
+            member_ids: members.to_vec(),
+        }
+    }
+
+    #[test]
+    fn classify_no_groups_returns_l1wide() {
+        assert_eq!(NoteScope::classify(101, &[]), NoteScope::L1Wide);
+    }
+
+    #[test]
+    fn classify_member_returns_group() {
+        let groups = vec![g(10, &[101, 102, 103])];
+        assert_eq!(NoteScope::classify(102, &groups), NoteScope::Group(10));
+    }
+
+    #[test]
+    fn classify_non_member_returns_leaf() {
+        let groups = vec![g(10, &[101, 102, 103])];
+        assert_eq!(NoteScope::classify(104, &groups), NoteScope::Leaf(104));
+    }
+
+    #[test]
+    fn classify_with_l1_self_returns_leaf_l1_id() {
+        let groups = vec![g(10, &[101, 102, 103])];
+        assert_eq!(NoteScope::classify(100, &groups), NoteScope::Leaf(100));
+    }
+}

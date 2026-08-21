@@ -547,6 +547,7 @@ impl DeliveryNoteRepo {
     /// - `NoteScope::Group(gid)`：customer_id + delivery_group_id = gid
     /// - `NoteScope::Leaf(cid)`：customer_id + leaf_customer_id = cid
     /// - `NoteScope::L1Wide`：customer_id + 两列均 NULL → 取最早 (`ORDER BY id ASC LIMIT 1`)
+    ///
     /// `other_than` 排除指定 id（recall 时排除自己）。
     pub async fn find_open_draft_by_scope<'e, E: PgExecutor<'e>>(
         executor: E,

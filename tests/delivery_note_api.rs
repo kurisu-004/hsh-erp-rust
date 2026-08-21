@@ -311,7 +311,7 @@ async fn create_draft_for_l1_succeeds_and_for_l2_returns_400_21407() {
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (app, token, _pool) = login_manager(pool, "admin").await;
 
     // L1 草稿 → 200
     let (s1, env1) = send(
@@ -350,7 +350,7 @@ async fn create_draft_for_l1_succeeds_and_for_l2_returns_400_21407() {
 async fn list_with_filters_status_and_pagination() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
-    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (app, token, _pool) = login_manager(pool, "admin").await;
 
     // 建 3 张草稿
     for i in 0..3 {
@@ -405,7 +405,7 @@ async fn get_with_parts_with_assembly_fields() {
     let part_id = insert_part(&pool, "零件 A", l2, Some("A001")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 5, "INSPECTION").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (app, token, _pool) = login_manager(pool, "admin").await;
     let (cs, env) = send(
         app.clone(),
         json_request(
@@ -455,7 +455,7 @@ async fn add_parts_same_l1_ok_different_l1_returns_400_21407() {
     let part_id = insert_part(&pool, "X", l2_b, Some("X001")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 3, "INSPECTION").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (app, token, _pool) = login_manager(pool, "admin").await;
     // l1_a 单
     let (s1, env1) = send(
         app.clone(),
@@ -497,7 +497,7 @@ async fn add_parts_already_assigned_returns_409_21406() {
     let part_id = insert_part(&pool, "X", l2, Some("X002")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 3, "INSPECTION").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (app, token, _pool) = login_manager(pool, "admin").await;
     // 第一张单
     let (s1, env1) = send(
         app.clone(),
@@ -558,7 +558,7 @@ async fn add_parts_invalid_status_returns_400_21405() {
     // 批次在 PROCESSING 状态（不允许 INSPECTION/READY_TO_SHIP 以外）
     let batch_id = insert_batch(&pool, part_id, 1, 3, "PROCESSING").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (app, token, _pool) = login_manager(pool, "admin").await;
     let (cs, cenv) = send(
         app.clone(),
         json_request(
@@ -980,7 +980,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
     assert_eq!(env1["code"], 21409);
 
     // 订阅 ws hub
-    let mut rx = hsh_erp_rust::infra::ws_hub::WsHub::default().subscribe();
+    let rx = hsh_erp_rust::infra::ws_hub::WsHub::default().subscribe();
     let _ = rx; // unused
 
     // driver → PICKED_UP
@@ -1095,7 +1095,7 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
 async fn version_conflict_on_write_returns_409_40901() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
-    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (app, token, _pool) = login_manager(pool, "admin").await;
 
     let (cs, cenv) = send(
         app.clone(),
@@ -1133,7 +1133,7 @@ async fn list_candidate_parts_l1_returns_fixtures_non_l1_returns_400() {
     let part_id = insert_part(&pool, "X", l2, Some("X010")).await;
     let _batch = insert_batch(&pool, part_id, 1, 2, "INSPECTION").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (app, token, _pool) = login_manager(pool, "admin").await;
 
     // L1 → 200 + 至少 1 条
     let (s, env) = send(
@@ -1147,7 +1147,7 @@ async fn list_candidate_parts_l1_returns_fixtures_non_l1_returns_400() {
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert!(env["data"]["items"].as_array().unwrap().len() >= 1);
+    assert!(!env["data"]["items"].as_array().unwrap().is_empty());
 
     // L2 → 400
     let (s2, env2) = send(

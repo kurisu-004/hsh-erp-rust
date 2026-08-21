@@ -97,7 +97,7 @@ pub async fn list_delivery_notes(
     // 解析 statuses：query string `?statuses=A,B` → vec!["A","B"]
     let status_vec: Vec<String> = match q.statuses.as_deref() {
         Some(s) => s
-            .split(|c: char| c == ',')
+            .split(',')
             .map(|x: &str| x.trim().to_string())
             .filter(|x| !x.is_empty())
             .collect(),
