@@ -23,3 +23,22 @@ pub fn deserialize_i64<'de, D: Deserializer<'de>>(d: D) -> Result<i64, D::Error>
     let s = String::deserialize(d)?;
     s.parse::<i64>().map_err(serde::de::Error::custom)
 }
+
+/// 把 JSON 字符串数组反序列化为 `Vec<i64>`（与 `serialize_i64` 对称）
+///
+/// 用于 DTO 字段如 `member_customer_ids: Vec<i64>`：
+/// ```ignore
+/// #[derive(Deserialize)]
+/// pub struct CreateGroupReq {
+///     #[serde(deserialize_with = "crate::shared::types::deserialize_i64_vec")]
+///     pub member_customer_ids: Vec<i64>,
+/// }
+/// ```
+///
+/// 空数组 → 空 Vec；含非法字符串 → `serde::de::Error::custom`。
+pub fn deserialize_i64_vec<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<i64>, D::Error> {
+    let v: Vec<String> = Vec::deserialize(d)?;
+    v.into_iter()
+        .map(|s| s.parse::<i64>().map_err(serde::de::Error::custom))
+        .collect()
+}

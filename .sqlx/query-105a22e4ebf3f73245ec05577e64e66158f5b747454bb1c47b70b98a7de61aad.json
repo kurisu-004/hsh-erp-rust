@@ -1,0 +1,208 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                pb.id            AS \"pb_id!\",\n                pb.part_id       AS \"pb_part_id!\",\n                pb.batch_no      AS \"pb_batch_no!\",\n                pb.quantity      AS \"pb_quantity!\",\n                pb.status        AS \"pb_status!\",\n                pb.location      AS \"pb_location?\",\n                pb.current_holder_id AS \"pb_current_holder_id?\",\n                pb.next_process_id AS \"pb_next_process_id?\",\n                pb.placed_at     AS \"pb_placed_at?\",\n                pb.delivery_note_id AS \"pb_delivery_note_id?\",\n                pb.parent_batch_id AS \"pb_parent_batch_id?\",\n                pb.has_been_repaired AS \"pb_has_been_repaired!\",\n                pb.version       AS \"pb_version!\",\n                pb.created_at    AS \"pb_created_at!\",\n                pb.created_by    AS \"pb_created_by?\",\n                pb.updated_at    AS \"pb_updated_at!\",\n                pb.updated_by    AS \"pb_updated_by?\",\n                pb.deleted_at    AS \"pb_deleted_at?\",\n                p.id             AS \"p_id!\",\n                p.serial_no      AS \"p_serial_no?\",\n                p.name           AS \"p_name!\",\n                p.drawing_no     AS \"p_drawing_no!\",\n                p.customer_id    AS \"p_customer_id!\",\n                p.assembly_id    AS \"p_assembly_id?\",\n                p.status         AS \"p_status!\",\n                p.version        AS \"p_version!\",\n                p.created_at     AS \"p_created_at!\",\n                p.created_by     AS \"p_created_by?\",\n                p.updated_at     AS \"p_updated_at!\",\n                p.updated_by     AS \"p_updated_by?\",\n                p.deleted_at     AS \"p_deleted_at?\",\n                p.delivery_note_id AS \"p_delivery_note_id?\"\n            FROM t_part_batch pb\n            JOIN t_part p ON p.id = pb.part_id\n            WHERE pb.delivery_note_id = $1\n              AND pb.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n            ORDER BY pb.id ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pb_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "pb_part_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "pb_batch_no!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 3,
+        "name": "pb_quantity!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "pb_status!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "pb_location?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "pb_current_holder_id?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "pb_next_process_id?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "pb_placed_at?",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 9,
+        "name": "pb_delivery_note_id?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "pb_parent_batch_id?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "pb_has_been_repaired!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 12,
+        "name": "pb_version!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 13,
+        "name": "pb_created_at!",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 14,
+        "name": "pb_created_by?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 15,
+        "name": "pb_updated_at!",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 16,
+        "name": "pb_updated_by?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 17,
+        "name": "pb_deleted_at?",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 18,
+        "name": "p_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 19,
+        "name": "p_serial_no?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 20,
+        "name": "p_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 21,
+        "name": "p_drawing_no!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 22,
+        "name": "p_customer_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 23,
+        "name": "p_assembly_id?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 24,
+        "name": "p_status!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 25,
+        "name": "p_version!",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 26,
+        "name": "p_created_at!",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 27,
+        "name": "p_created_by?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 28,
+        "name": "p_updated_at!",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 29,
+        "name": "p_updated_by?",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 30,
+        "name": "p_deleted_at?",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 31,
+        "name": "p_delivery_note_id?",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "105a22e4ebf3f73245ec05577e64e66158f5b747454bb1c47b70b98a7de61aad"
+}

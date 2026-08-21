@@ -63,6 +63,7 @@ pub fn v2_router() -> Router<Arc<AppState>> {
         .nest("/part-files", part_file::router())
         .nest("/outsource", outsource::router())
         .nest("/delivery-notes", delivery_note::router())
+        .nest("/delivery-groups", delivery_note::router())
         .nest("/statistics", statistics::router())
 }
 
