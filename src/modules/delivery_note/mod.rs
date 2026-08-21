@@ -7,15 +7,18 @@
 //! - model/delivery_note.py         → `model.rs`
 //! - schema/delivery_note.py        → `dto.rs`
 //! - statemachines/delivery_note.py → `statemachine.rs`
+//! - service/delivery_note_print.py → `print.rs`（P4 新增；umya-spreadsheet 实现）
+//! - patch helper                   → `print_xml_patch.rs`（P4 新增；绕 umya 缺口）
 //!
-//! Phase P1 实装「送货分组」（model / dto / repo / service / handler / statemachine）；
-//! 送货单生命周期 + 扫码入单 + 打印留到 P2–P4。
+//! Phase P1 实装「送货分组」；P2 送货单生命周期；P3 扫码入单；P4 打印移植。
 //!
-//! 路由挂载：当前 `handler::router()` 仅暴露 `/delivery-groups/*` 一组端点（设计 §6.1）。
+//! 路由挂载：`handler::router()` 暴露 `/delivery-groups/*` 与 `/delivery-notes/*`。
 ////
 pub mod dto;
 pub mod handler;
 pub mod model;
+pub mod print;
+pub mod print_xml_patch;
 pub mod repo;
 pub mod service;
 pub mod statemachine;
