@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO t_part_batch\n                (id, part_id, batch_no, quantity, status, location,\n                 current_holder_id, next_process_id, placed_at,\n                 delivery_note_id, parent_batch_id, has_been_repaired,\n                 version, created_at, created_by, updated_at, updated_by)\n            VALUES ($1, $2, $3, $4, $5, $6,\n                    $7, $8, $9,\n                    NULL, $10, FALSE,\n                    0, $11, $12, $11, $13)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int4",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Int8",
+        "Timestamp",
+        "Int8",
+        "Timestamp",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0b9264611df299711aeec1f5a34d4f9378cd30bffce601b3bd4884fb318cbf3a"
+}

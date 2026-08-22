@@ -73,6 +73,9 @@ pub async fn test_pool() -> PgPool {
 
 /// 清表（auth 链路涉及的最小集）：用户/角色/菜单/角色-菜单/货架。
 /// `schema_migrations`（sqlx 自动维护）不动。
+///
+/// 该函数**只**清理 auth 域相关表，**不**触碰业务域表（delivery / part / customer
+/// 等），保证后续要追加业务域集成测试时可按需调用 `clean_business_db` 而不互相干扰。
 pub async fn clean_db(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE t_user, t_user_role, t_menu, t_role_menu, t_shelf RESTART IDENTITY CASCADE",
@@ -80,6 +83,26 @@ pub async fn clean_db(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("truncate auth-related tables");
+}
+
+/// 清表（业务域全集）：配送分组 / 配送单 / 批次 / 工单 / 装配体 / 客户 / 申请人 / 工种 / 工人。
+///
+/// 与 `clean_db` 互补 —— 后者只清 auth 表，本函数负责 P1+ 业务域测试需要的「干净世界」。
+/// 顺序按 FK 依赖自顶向下；CASCADE 兜底防止漏列。
+pub async fn clean_business_db(pool: &PgPool) {
+    sqlx::query(
+        "TRUNCATE \
+            t_delivery_group_member, t_delivery_group, \
+            t_delivery_note_event, t_delivery_note_counter, t_delivery_note, \
+            t_part_batch, t_part_event, t_part, \
+            t_assembly, \
+            t_customer, t_applicant, \
+            t_work_type, t_worker \
+         RESTART IDENTITY CASCADE",
+    )
+    .execute(pool)
+    .await
+    .expect("truncate business tables");
 }
 
 /// 构造测试用 AppState：与 main.rs 同形，差别仅在 secret / 数据库 URL。
@@ -113,6 +136,7 @@ pub fn test_state(pool: PgPool) -> Arc<AppState> {
             threshold_days: 7,
             interval_hours: 24,
         },
+        delivery_note_template_dir: std::path::PathBuf::from("template"),
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,

@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, group_id, customer_id,\n                   created_at, created_by, deleted_at\n            FROM t_delivery_group_member\n            WHERE group_id = ANY($1)\n              AND deleted_at IS NULL\n            ORDER BY group_id ASC, customer_id ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "group_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "customer_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "deleted_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "b947d7d9a733b9f390fcf2376141b135145861c893ab7d6f1acd1408eb768590"
+}

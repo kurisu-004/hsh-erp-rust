@@ -1,0 +1,131 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id, delivery_note_no, customer_id, status,\n                       submitted_at, picked_up_at, submitted_by, picked_up_by,\n                       driver_worker_id, note, delivery_date,\n                       delivery_group_id, leaf_customer_id,\n                       version, created_at, created_by, updated_at, updated_by, deleted_at\n                FROM t_delivery_note\n                WHERE customer_id          = $1\n                  AND delivery_group_id IS NULL\n                  AND leaf_customer_id  IS NULL\n                  AND status               = 'DRAFT'\n                  AND deleted_at IS NULL\n                  AND ($2::bigint IS NULL OR id <> $2)\n                ORDER BY id ASC\n                LIMIT 1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "delivery_note_no",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "customer_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "submitted_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 5,
+        "name": "picked_up_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 6,
+        "name": "submitted_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "picked_up_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "driver_worker_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "note",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "delivery_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 11,
+        "name": "delivery_group_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "leaf_customer_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "version",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 14,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 15,
+        "name": "created_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 16,
+        "name": "updated_at",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 17,
+        "name": "updated_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 18,
+        "name": "deleted_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "c6c449f1a13f0758a9295202f38ed434a366718ed3aef75ab65ff5f6dbfab66e"
+}

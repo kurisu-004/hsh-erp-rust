@@ -25,8 +25,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use thiserror::Error;
 
-use crate::shared::response::R;
-
 /// 错误码常量（沿用 Python 数字契约）
 pub mod code {
     pub const SUCCESS: i32 = 0;
@@ -175,6 +173,13 @@ pub mod code {
     pub const BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE: i32 = 21410;       // pickup 时还没扫齐
     pub const BIZ_DELIVERY_NOTE_INVALID_VALUE: i32 = 21411;         // 空单 / 等其他非法入参
     pub const BIZ_DELIVERY_NOTE_PARTS_LOCKED: i32 = 21412;          // SUBMITTED/PICKED_UP 后禁止 add_parts / remove_parts
+    pub const BIZ_DELIVERY_GROUP_NOT_FOUND: i32 = 21413;            // 找不到指定的送货分组 / 已软删
+    pub const BIZ_DELIVERY_GROUP_DUPLICATE_NAME: i32 = 21414;       // 同 L1 下分组重名
+    pub const BIZ_DELIVERY_GROUP_MEMBER_CONFLICT: i32 = 21415;      // L2 已属于其他活跃分组
+    pub const BIZ_DELIVERY_NOTE_SCOPE_MISMATCH: i32 = 21416;        // 零件分类与送货单范围不符（add_parts 校验）
+    pub const BIZ_DELIVERY_SCAN_UNKNOWN_CODE: i32 = 21417;          // 扫码的 serial_no 无法识别
+    pub const BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY: i32 = 21418;   // 装配件整套拒绝：含不可入单子件（message 附明细）
+    pub const BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT: i32 = 21419;  // recall 时同范围已存在 DRAFT
 
     // 215xx 外协发货（t_outsource_shipment）
     pub const BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND: i32 = 21501;
@@ -192,6 +197,24 @@ pub enum AppError {
         code: i32,
         message: String,
         http: StatusCode,
+    },
+
+    /// 业务错误（带失败明细列表，用于装配件整套拒绝 21418 等）。
+    ///
+    /// `IntoResponse` 会把 `failures` 序列化进 `R::err.data` 字段，结构：
+    /// ```jsonc
+    /// { "failures": [ {"serial_no": "...", "name": "...", "reason": "..."}, ... ] }
+    /// ```
+    /// `message` 仍按既有约定继续携带人读文案（设计 §5：「message 含全部失败子件」）。
+    ///
+    /// `failures` 用 `serde_json::Value` 而非具体 DTO 是为了**避免** `shared::error`
+    /// 反向依赖具体业务域的 DTO 类型。
+    #[error("[{code}] {message}")]
+    BizWithFailures {
+        code: i32,
+        message: String,
+        http: StatusCode,
+        failures: Vec<serde_json::Value>,
     },
 
     /// 校验失败（40001，HTTP 422）
@@ -262,7 +285,7 @@ impl AppError {
 
     pub fn code(&self) -> i32 {
         match self {
-            Self::Biz { code, .. } => *code,
+            Self::Biz { code, .. } | Self::BizWithFailures { code, .. } => *code,
             Self::Validation(_) => code::VALIDATION_ERROR,
             Self::Unauthorized(_) => code::UNAUTHORIZED,
             Self::Forbidden => code::FORBIDDEN,
@@ -274,7 +297,7 @@ impl AppError {
 
     pub fn http_status(&self) -> StatusCode {
         match self {
-            Self::Biz { http, .. } => *http,
+            Self::Biz { http, .. } | Self::BizWithFailures { http, .. } => *http,
             Self::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Unauthorized(_) | Self::Jwt(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
@@ -324,6 +347,8 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_OUTSOURCE_COMPANY_NOT_FOUND
             || c == code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND
             || c == code::BIZ_DELIVERY_NOTE_NOT_FOUND
+            || c == code::BIZ_DELIVERY_GROUP_NOT_FOUND
+            || c == code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE
             || c == code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND => StatusCode::NOT_FOUND,
 
         // ---- 2xxxx 业务码：409 (状态冲突 / 重复 / 占用 / 锁) ----
@@ -348,10 +373,17 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_OUTSOURCE_COMPANY_IN_USE
             || c == code::BIZ_OUTSOURCE_QUOTE_DUPLICATE
             || c == code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED
-            || c == code::BIZ_DELIVERY_NOTE_PARTS_LOCKED => StatusCode::CONFLICT,
+            || c == code::BIZ_DELIVERY_NOTE_PARTS_LOCKED
+            || c == code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME
+            || c == code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT
+            || c == code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT => StatusCode::CONFLICT,
 
         // ---- 2xxxx 业务码：422 (校验类，Python 显式声明 21113 → 422) ----
         c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER => StatusCode::UNPROCESSABLE_ENTITY,
+
+        // ---- 2xxxx 兜底：Python BizError 默认 400 ----
+        c if c == code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH
+            || c == code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY => StatusCode::BAD_REQUEST,
 
         // ---- 2xxxx 兜底：Python BizError 默认 400 ----
         c if (20000..30000).contains(&c) => StatusCode::BAD_REQUEST,
@@ -372,10 +404,21 @@ impl IntoResponse for AppError {
             }
             other => other.to_string(),
         };
-        let body = R::<()> {
-            code: self.code(),
-            message,
-            data: None,
+        // 直接拼装 JSON body（不走泛型 `R<T>`，因为 BizWithFailures 需要序列化
+        // 非 `()` 的 `data`；这里手动构造，与 `R<T>` 序列化后的字段约定一致）。
+        let body: serde_json::Value = match &self {
+            AppError::BizWithFailures {
+                code, failures, ..
+            } => serde_json::json!({
+                "code": code,
+                "message": &message,
+                "data": serde_json::json!({ "failures": failures }),
+            }),
+            other => serde_json::json!({
+                "code": other.code(),
+                "message": &message,
+                "data": serde_json::Value::Null,
+            }),
         };
         (status, Json(body)).into_response()
     }
@@ -506,6 +549,13 @@ mod tests {
         (code::BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE, "BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE"),
         (code::BIZ_DELIVERY_NOTE_INVALID_VALUE, "BIZ_DELIVERY_NOTE_INVALID_VALUE"),
         (code::BIZ_DELIVERY_NOTE_PARTS_LOCKED, "BIZ_DELIVERY_NOTE_PARTS_LOCKED"),
+        (code::BIZ_DELIVERY_GROUP_NOT_FOUND, "BIZ_DELIVERY_GROUP_NOT_FOUND"),
+        (code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME, "BIZ_DELIVERY_GROUP_DUPLICATE_NAME"),
+        (code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT, "BIZ_DELIVERY_GROUP_MEMBER_CONFLICT"),
+        (code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH, "BIZ_DELIVERY_NOTE_SCOPE_MISMATCH"),
+        (code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE, "BIZ_DELIVERY_SCAN_UNKNOWN_CODE"),
+        (code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY, "BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY"),
+        (code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT, "BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT"),
         // 215xx
         (code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND"),
     ];
@@ -655,6 +705,13 @@ mod tests {
         assert_eq!(code::BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE, 21410);
         assert_eq!(code::BIZ_DELIVERY_NOTE_INVALID_VALUE, 21411);
         assert_eq!(code::BIZ_DELIVERY_NOTE_PARTS_LOCKED, 21412);
+        assert_eq!(code::BIZ_DELIVERY_GROUP_NOT_FOUND, 21413);
+        assert_eq!(code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME, 21414);
+        assert_eq!(code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT, 21415);
+        assert_eq!(code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH, 21416);
+        assert_eq!(code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE, 21417);
+        assert_eq!(code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY, 21418);
+        assert_eq!(code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT, 21419);
 
         // 215xx
         assert_eq!(code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, 21501);
@@ -700,6 +757,8 @@ mod tests {
         (code::BIZ_OUTSOURCE_COMPANY_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_OUTSOURCE_COMPANY_NOT_FOUND"),
         (code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_OUTSOURCE_QUOTE_NOT_FOUND"),
         (code::BIZ_DELIVERY_NOTE_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_DELIVERY_NOTE_NOT_FOUND"),
+        (code::BIZ_DELIVERY_GROUP_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_DELIVERY_GROUP_NOT_FOUND"),
+        (code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE, StatusCode::NOT_FOUND, "BIZ_DELIVERY_SCAN_UNKNOWN_CODE"),
         (code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND"),
         // 2xxxx 显式 409
         (code::BIZ_USER_DUPLICATE, StatusCode::CONFLICT, "BIZ_USER_DUPLICATE"),
@@ -724,12 +783,17 @@ mod tests {
         (code::BIZ_OUTSOURCE_QUOTE_DUPLICATE, StatusCode::CONFLICT, "BIZ_OUTSOURCE_QUOTE_DUPLICATE"),
         (code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED"),
         (code::BIZ_DELIVERY_NOTE_PARTS_LOCKED, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_PARTS_LOCKED"),
+        (code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME, StatusCode::CONFLICT, "BIZ_DELIVERY_GROUP_DUPLICATE_NAME"),
+        (code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT, StatusCode::CONFLICT, "BIZ_DELIVERY_GROUP_MEMBER_CONFLICT"),
+        (code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT"),
         // 2xxxx 显式 422
         (code::BIZ_DELIVERY_PRINT_BAD_ORDER, StatusCode::UNPROCESSABLE_ENTITY, "BIZ_DELIVERY_PRINT_BAD_ORDER"),
         // 2xxxx 默认 400 兜底
         (code::BIZ_INVALID_TRANSITION, StatusCode::BAD_REQUEST, "BIZ_INVALID_TRANSITION"),
         (code::BIZ_INVALID_VALUE, StatusCode::BAD_REQUEST, "BIZ_INVALID_VALUE"),
         (code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED, StatusCode::BAD_REQUEST, "BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED"),
+        (code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH, StatusCode::BAD_REQUEST, "BIZ_DELIVERY_NOTE_SCOPE_MISMATCH"),
+        (code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY, StatusCode::BAD_REQUEST, "BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY"),
     ];
 
     #[test]
@@ -795,5 +859,23 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("20109"), "Display 必须包含 code: {s}");
         assert!(s.contains("missing batch"), "Display 必须包含 message: {s}");
+    }
+
+    #[test]
+    fn biz_with_failures_carries_failures_into_envelope() {
+        let err = AppError::BizWithFailures {
+            code: code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY,
+            message: "整套拒绝".to_string(),
+            http: StatusCode::BAD_REQUEST,
+            failures: vec![
+                serde_json::json!({"serial_no": "B01", "name": "fala-A", "reason": "status=IN_PROCESS"}),
+                serde_json::json!({"serial_no": "B02", "name": "fala-B", "reason": "on note DN-20260821-0001"}),
+            ],
+        };
+        assert_eq!(err.code(), code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY);
+        assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
+        let s = err.to_string();
+        assert!(s.contains("21418"));
+        assert!(s.contains("整套拒绝"));
     }
 }

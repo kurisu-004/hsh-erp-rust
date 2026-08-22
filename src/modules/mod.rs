@@ -63,10 +63,16 @@ pub fn v2_router() -> Router<Arc<AppState>> {
         .nest("/part-files", part_file::router())
         .nest("/outsource", outsource::router())
         .nest("/delivery-notes", delivery_note::router())
+        .nest("/delivery-groups", p1_router())
         .nest("/statistics", statistics::router())
 }
 
 /// `/ws/*` WebSocket 入口（当前仅 dashboard 大屏）
 pub fn ws_router() -> Router<Arc<AppState>> {
     dashboard::router()
+}
+
+/// P1 送货分组 router re-export（供 `/api/v2/delivery-groups` nest 使用）
+pub fn p1_router() -> Router<Arc<AppState>> {
+    delivery_note::handler::p1_router()
 }

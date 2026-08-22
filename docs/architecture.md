@@ -329,6 +329,9 @@ SQLX_OFFLINE=true cargo build --release
 4. **装配体、送货单、外协**
    - `modules/assembly/`（含 rollup）
    - `modules/delivery_note/`（含打印）
+
+   > 送货单域的扫码建单 / 规则分类 / 勾选打印标签的完整设计见 `docs/delivery-note-redesign.md`。
+
    - `modules/outsource/`（company/quote/shipment）
 5. **文件、CNC、统计**
    - `modules/part_file/` + COS trait 实现（`infra/cos.rs`）

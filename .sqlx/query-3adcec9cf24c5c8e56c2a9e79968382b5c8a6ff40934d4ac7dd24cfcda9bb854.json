@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO t_delivery_note\n                (id, delivery_note_no, customer_id, status,\n                 submitted_at, picked_up_at, submitted_by, picked_up_by,\n                 driver_worker_id, note, delivery_date,\n                 delivery_group_id, leaf_customer_id,\n                 version, created_at, created_by, updated_at, updated_by)\n            VALUES ($1, $2, $3, $4,\n                    $5, $6, $7, $8,\n                    $9, $10, $11,\n                    $12, $13,\n                    $14, $15, $16, $15, $17)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Int8",
+        "Varchar",
+        "Timestamp",
+        "Timestamp",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Date",
+        "Int8",
+        "Int8",
+        "Int4",
+        "Timestamp",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3adcec9cf24c5c8e56c2a9e79968382b5c8a6ff40934d4ac7dd24cfcda9bb854"
+}

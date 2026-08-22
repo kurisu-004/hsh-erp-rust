@@ -4,9 +4,12 @@
 //! - sqlx `FromRow` 行结构（含 version 乐观锁、deleted_at 软删、created/updated 审计字段）
 //!
 //! Phase P1（送货分组）只需 FromRow 行结构以承载 sqlx 反序列化；
-//! 金额列（unit_price / total_price NUMERIC(12,2) / NUMERIC(14,2)）留到 part
-//! 域业务实施阶段再补，避免在当前 `Cargo.toml` 还未挂 `rust_decimal` feature
-//! 的情况下引入编译期拒收。其它完整字段同样在 part 域实施阶段扩展。
+//! 域枚举（PartStatus / PartLocation / PartEventType 等）的 Rust enum 等到
+//! part 域业务实现阶段再补，避免越权改动本域。
+//!
+//! 完整列（含金额 / 数量 / holder / 日期 / note / has_been_repaired 等）待
+//! part 域业务实施时再补全 —— 当前 `Cargo.toml` 还未挂 `rust_decimal` feature，
+//! 而 `unit_price` / `total_price` 是 NUMERIC，缺 feature 时 sqlx 编译期拒收。
 
 use chrono::NaiveDateTime;
 
@@ -14,8 +17,6 @@ use chrono::NaiveDateTime;
 ///
 /// 仅含 delivery_note / delivery_group 当前会用到的列：
 /// 标识 + 序列号 + 客户 + 装配件 + 状态 + 送货单 + 乐观锁 + 软删。
-/// Python `model/part.py::TPart` 的其他字段（金额 / 数量 / holder / 时间等）
-/// 待 part 域实施阶段补全。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPart {
     pub id: i64,

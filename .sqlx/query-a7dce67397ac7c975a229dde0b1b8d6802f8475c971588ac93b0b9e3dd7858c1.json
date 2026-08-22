@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO t_delivery_note_counter (date_ymd, last_value)\n        VALUES ($1, 1)\n        ON CONFLICT (date_ymd)\n        DO UPDATE SET last_value   = t_delivery_note_counter.last_value + 1,\n                      updated_at  = now()\n        RETURNING last_value\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_value",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a7dce67397ac7c975a229dde0b1b8d6802f8475c971588ac93b0b9e3dd7858c1"
+}

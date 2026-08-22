@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, delivery_note_id, event_type,\n                   from_status, to_status, note, created_by, created_at\n            FROM t_delivery_note_event\n            WHERE delivery_note_id = $1\n            ORDER BY created_at ASC, id ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "delivery_note_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "event_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "from_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "to_status",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "note",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_by",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamp"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "28668ed7681deba1793f1ee0f97f4e202b7ea12dfca46638331e48ab0e6c3a88"
+}
