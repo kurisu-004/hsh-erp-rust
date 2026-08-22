@@ -64,7 +64,7 @@ impl AppConfig {
 
             jwt: JwtConfig {
                 secret: env_required("JWT_SECRET")?,
-                issuer: env_or("JWT_ISSUER", "hsh-erp"),
+                issuer: env_or("JWT_ISSUER", "myerp"),
                 access_ttl_hours: env_parse("JWT_ACCESS_TOKEN_EXPIRE_HOURS", 12)?,
                 refresh_ttl_days: env_parse("JWT_REFRESH_TOKEN_EXPIRE_DAYS", 7)?,
             },

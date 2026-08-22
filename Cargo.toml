@@ -29,7 +29,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"                                                # CancellationToken
 
 # 数据库
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.9", features = [
     "runtime-tokio",
     "postgres",
     "macros",

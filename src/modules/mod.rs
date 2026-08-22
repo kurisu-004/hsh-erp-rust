@@ -21,6 +21,7 @@ pub mod dashboard;
 pub mod delivery_note;
 pub mod outsource;
 pub mod part;
+pub mod part_batch;
 pub mod part_file;
 pub mod process;
 pub mod shelf;
