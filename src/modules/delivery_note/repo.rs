@@ -425,6 +425,10 @@ impl DeliveryNoteRepo {
     }
 
     /// 过滤 + 分页 + 排序（list_with_filters）。keyword 仅在 delivery_note_no 上 ILIKE。
+    ///
+    /// sqlx 0.9 起 `query_as(&String)` 不再自动通过 `SqlSafeStr` 检查（要求
+    /// 字面量 SQL），改用 `QueryBuilder` 把所有动态部分（status 过滤 + ORDER BY）
+    /// 安全地 push 进去。所有用户/外部数据走 `push_bind`（自动 bind）。
     #[allow(clippy::too_many_arguments)]
     pub async fn list_with_filters<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -436,8 +440,6 @@ impl DeliveryNoteRepo {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<DeliveryNote>, sqlx::Error> {
-        let (status_clause, status_params) = build_status_clause(statuses);
-        let kw_pat = keyword.map(|k| format!("%{}%", k.trim()));
         let order_col = match sort_by {
             DeliveryNoteSortKey::CreatedAt => "created_at",
             DeliveryNoteSortKey::SubmittedAt => "submitted_at",
@@ -448,42 +450,34 @@ impl DeliveryNoteRepo {
             SortDir::Asc => "ASC",
             SortDir::Desc => "DESC",
         };
-        let id_dir = match sort_dir {
-            SortDir::Asc => "ASC",
-            SortDir::Desc => "DESC",
-        };
 
-        // 动态计算 limit / offset 的 placeholder 编号，避免 status 数量变化时的 gap
-        let n_status = status_params.len();
-        let limit_ph = 3 + n_status;
-        let offset_ph = limit_ph + 1;
-
-        let sql = format!(
-            r#"
-            SELECT id, delivery_note_no, customer_id, status,
-                   submitted_at, picked_up_at, submitted_by, picked_up_by,
-                   driver_worker_id, note, delivery_date,
-                   delivery_group_id, leaf_customer_id,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
-            FROM t_delivery_note
-            WHERE deleted_at IS NULL
-              AND ($1::bigint IS NULL OR customer_id = $1)
-              AND ($2::text IS NULL OR delivery_note_no ILIKE $2)
-              {status_clause}
-            ORDER BY {order_col} {order_dir} NULLS LAST, id {id_dir}
-            LIMIT ${limit_ph}::bigint OFFSET ${offset_ph}::bigint
-            "#,
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT id, delivery_note_no, customer_id, status, \
+             submitted_at, picked_up_at, submitted_by, picked_up_by, \
+             driver_worker_id, note, delivery_date, \
+             delivery_group_id, leaf_customer_id, \
+             version, created_at, created_by, updated_at, updated_by, deleted_at \
+             FROM t_delivery_note \
+             WHERE deleted_at IS NULL",
         );
-
-        // 绑定顺序：$1=customer_id, $2=kw_pat, $3..$3+N=status, {limit}, {offset}
-        let mut q = sqlx::query_as::<_, DeliveryNote>(&sql)
-            .bind(customer_id)
-            .bind(kw_pat);
-        for p in status_params {
-            q = q.bind(p);
+        if let Some(c) = customer_id {
+            qb.push(" AND customer_id = ").push_bind(c);
         }
-        q = q.bind(limit).bind(offset);
-        q.fetch_all(executor).await
+        if let Some(kw) = keyword {
+            let pat = format!("%{}%", kw.trim());
+            qb.push(" AND delivery_note_no ILIKE ").push_bind(pat);
+        }
+        push_status_filter(&mut qb, statuses);
+        qb.push(format!(
+            " ORDER BY {} {} NULLS LAST, id {}",
+            order_col, order_dir, order_dir
+        ));
+        qb.push(" LIMIT ").push_bind(limit);
+        qb.push(" OFFSET ").push_bind(offset);
+
+        qb.build_query_as::<DeliveryNote>()
+            .fetch_all(executor)
+            .await
     }
 
     /// 同 list_with_filters 的 WHERE 子句，但只 SELECT COUNT(*)。
@@ -493,25 +487,19 @@ impl DeliveryNoteRepo {
         customer_id: Option<i64>,
         keyword: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
-        let (status_clause, status_params) = build_status_clause(statuses);
-        let kw_pat = keyword.map(|k| format!("%{}%", k.trim()));
-        let sql = format!(
-            r#"
-            SELECT COUNT(*)::bigint AS "count!"
-            FROM t_delivery_note
-            WHERE deleted_at IS NULL
-              AND ($1::bigint IS NULL OR customer_id = $1)
-              AND ($2::text IS NULL OR delivery_note_no ILIKE $2)
-              {status_clause}
-            "#,
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "SELECT COUNT(*)::bigint FROM t_delivery_note WHERE deleted_at IS NULL",
         );
-        let mut q = sqlx::query_scalar::<_, i64>(&sql)
-            .bind(customer_id)
-            .bind(kw_pat);
-        for p in status_params {
-            q = q.bind(p);
+        if let Some(c) = customer_id {
+            qb.push(" AND customer_id = ").push_bind(c);
         }
-        q.fetch_one(executor).await
+        if let Some(kw) = keyword {
+            let pat = format!("%{}%", kw.trim());
+            qb.push(" AND delivery_note_no ILIKE ").push_bind(pat);
+        }
+        push_status_filter(&mut qb, statuses);
+
+        qb.build_query_scalar::<i64>().fetch_one(executor).await
     }
 
     /// 待司机领取一览：SUBMITTED、非软删，按 `submitted_at DESC` 排。
@@ -699,29 +687,23 @@ pub enum SortDir {
     Desc,
 }
 
-/// 按 `statuses` 切片生成 SQL 过滤子句（含 placeholder + 实际绑定值）。
+/// 向 QueryBuilder 追加 `statuses` 过滤子句。
 ///
-/// 返回 (sql_clause, status_values_for_in_clause).
-/// 设计：placeholder **始终** 用 `$3`（list 4、count 用 3）；空状态时
-/// 子句为 `AND TRUE`，绑定值 vec 为空——caller 在最后一次性把 status 跳过。
+/// - 空切片：什么都不追加
+/// - 单元素：`AND status = $N`，绑定该值
+/// - 多元素：`AND status = ANY($N::text[])`，绑定 Vec<String>
 ///
-/// - 空切片：`AND TRUE`，无 status 绑定
-/// - 单元素：`AND status = $3::text`，绑定 1 个 status 值
-/// - 多元素：`AND status = ANY($3::text[])`，绑定 N 个 status 值
-///
-/// caller 必须按 `$1 / $2 / $3..$3+N / $4 / $5`（list）或
-/// `$1 / $2 / $3..$3+N`（count）顺序 bind。
-fn build_status_clause(statuses: &[&str]) -> (String, Vec<String>) {
+/// 所有值通过 `push_bind` 进入，调用方无需关心 placeholder 编号。
+fn push_status_filter(qb: &mut sqlx::QueryBuilder<sqlx::Postgres>, statuses: &[&str]) {
     if statuses.is_empty() {
-        return ("AND TRUE".to_string(), Vec::new());
+        return;
     }
     if statuses.len() == 1 {
-        return ("AND status = $3::text".to_string(), vec![statuses[0].to_string()]);
+        qb.push(" AND status = ").push_bind(statuses[0].to_string());
+    } else {
+        let arr: Vec<String> = statuses.iter().map(|s| s.to_string()).collect();
+        qb.push(" AND status = ANY(").push_bind(arr).push(")");
     }
-    (
-        "AND status = ANY($3::text[])".to_string(),
-        statuses.iter().map(|s| s.to_string()).collect(),
-    )
 }
 
 // ---------------------------------------------------------------------------
