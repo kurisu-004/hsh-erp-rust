@@ -11,3 +11,6 @@
 # IDE
 .idea/
 .vscode/
+
+# Claude Code 本地 worktree（不入版本库）
+.claude/
