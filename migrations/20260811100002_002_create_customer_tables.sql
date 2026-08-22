@@ -2,78 +2,89 @@
 -- Notes:
 --   * t_customer has a 1-letter upper-case `serial_prefix` (CHECK ~ '^[A-Z]$').
 --   * t_serial_counter uses `prefix varchar(1)` as the business PK (snowflake id NOT used here).
+--   * Phase E rewrite: aligned 1:1 with /Users/ren/Code/schema_ddl.sql (column order, COMMENT,
+--     CREATE SEQUENCE ... OWNED BY, ALTER TABLE ... SET DEFAULT nextval).
 
 ------------------------------------------------------------------------
 -- t_customer
 ------------------------------------------------------------------------
-CREATE TABLE t_customer (
-    id             BIGINT       PRIMARY KEY,
-    name           VARCHAR(100) NOT NULL,
-    parent_id      BIGINT,
-    serial_prefix  VARCHAR(1),
-    version        INT          NOT NULL DEFAULT 0,
-    created_at     timestamp    NOT NULL DEFAULT now(),
-    created_by     BIGINT,
-    updated_at     timestamp    NOT NULL DEFAULT now(),
-    updated_by     BIGINT,
-    deleted_at     timestamp,
-    CONSTRAINT ck_t_customer_no_self_parent    CHECK (parent_id IS NULL OR parent_id <> id),
-    CONSTRAINT ck_t_customer_serial_prefix_uppercase CHECK (serial_prefix IS NULL OR serial_prefix ~ '^[A-Z]$')
+CREATE TABLE public.t_customer (
+    id            bigint NOT NULL,
+    name          character varying(100) NOT NULL,
+    parent_id     bigint,
+    version       integer DEFAULT 0 NOT NULL,
+    created_at    timestamp without time zone DEFAULT now() NOT NULL,
+    created_by    bigint,
+    updated_at    timestamp without time zone DEFAULT now() NOT NULL,
+    updated_by    bigint,
+    deleted_at    timestamp without time zone,
+    serial_prefix character varying(1),
+    CONSTRAINT ck_t_customer_no_self_parent CHECK (((parent_id IS NULL) OR (parent_id <> id))),
+    CONSTRAINT ck_t_customer_serial_prefix_uppercase CHECK (((serial_prefix IS NULL) OR ((serial_prefix)::text ~ '^[A-Z]$'::text)))
 );
 
-CREATE INDEX ix_t_customer_name
-    ON t_customer (name);
+COMMENT ON COLUMN public.t_customer.version IS '乐观锁版本号；每次 UPDATE 自增；冲突抛 BIZ_VERSION_CONFLICT 409';
+COMMENT ON COLUMN public.t_customer.serial_prefix IS '一级客户序列号前缀（A-Z）；叶子客户 NULL';
 
-CREATE INDEX ix_t_customer_parent_id
-    ON t_customer (parent_id);
+ALTER TABLE ONLY public.t_customer ADD CONSTRAINT t_customer_pkey PRIMARY KEY (id);
 
-CREATE INDEX ix_t_customer_deleted_at
-    ON t_customer (deleted_at);
-
-CREATE UNIQUE INDEX uq_t_customer_root_prefix
-    ON t_customer (serial_prefix)
-    WHERE deleted_at IS NULL
-      AND parent_id IS NULL
-      AND serial_prefix IS NOT NULL;
+CREATE INDEX ix_t_customer_name ON public.t_customer USING btree (name);
+CREATE INDEX ix_t_customer_parent_id ON public.t_customer USING btree (parent_id);
+CREATE INDEX ix_t_customer_deleted_at ON public.t_customer USING btree (deleted_at);
+CREATE UNIQUE INDEX uq_t_customer_root_prefix ON public.t_customer USING btree (serial_prefix)
+    WHERE ((deleted_at IS NULL) AND (parent_id IS NULL) AND (serial_prefix IS NOT NULL));
 
 ------------------------------------------------------------------------
 -- t_applicant
 ------------------------------------------------------------------------
-CREATE TABLE t_applicant (
-    id          BIGINT       PRIMARY KEY,
-    name        VARCHAR(50)  NOT NULL,
-    customer_id BIGINT       NOT NULL,
-    version     INT          NOT NULL DEFAULT 0,
-    created_at  timestamp    NOT NULL DEFAULT now(),
-    created_by  BIGINT,
-    updated_at  timestamp    NOT NULL DEFAULT now(),
-    updated_by  BIGINT,
-    deleted_at  timestamp
+CREATE TABLE public.t_applicant (
+    id          bigint NOT NULL,
+    name        character varying(50) NOT NULL,
+    customer_id bigint NOT NULL,
+    version     integer DEFAULT 0 NOT NULL,
+    created_at  timestamp without time zone DEFAULT now() NOT NULL,
+    created_by  bigint,
+    updated_at  timestamp without time zone DEFAULT now() NOT NULL,
+    updated_by  bigint,
+    deleted_at  timestamp without time zone
 );
 
-CREATE INDEX ix_t_applicant_customer_id
-    ON t_applicant (customer_id);
+COMMENT ON COLUMN public.t_applicant.name IS '申请人姓名';
+COMMENT ON COLUMN public.t_applicant.customer_id IS '逻辑外键 → t_customer.id（一级客户）';
+COMMENT ON COLUMN public.t_applicant.version IS '乐观锁版本号；每次 UPDATE 自增；冲突抛 BIZ_VERSION_CONFLICT 409';
 
-CREATE INDEX ix_t_applicant_name
-    ON t_applicant (name);
+CREATE SEQUENCE public.t_applicant_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
 
-CREATE INDEX ix_t_applicant_deleted_at
-    ON t_applicant (deleted_at);
+ALTER SEQUENCE public.t_applicant_id_seq OWNED BY public.t_applicant.id;
 
-CREATE UNIQUE INDEX uq_t_applicant_name_customer_active
-    ON t_applicant (name, customer_id)
-    WHERE deleted_at IS NULL;
+ALTER TABLE ONLY public.t_applicant ALTER COLUMN id SET DEFAULT nextval('public.t_applicant_id_seq'::regclass);
+ALTER TABLE ONLY public.t_applicant ADD CONSTRAINT t_applicant_pkey PRIMARY KEY (id);
+
+CREATE INDEX ix_t_applicant_customer_id ON public.t_applicant USING btree (customer_id);
+CREATE INDEX ix_t_applicant_name ON public.t_applicant USING btree (name);
+CREATE INDEX ix_t_applicant_deleted_at ON public.t_applicant USING btree (deleted_at);
+CREATE UNIQUE INDEX uq_t_applicant_name_customer_active ON public.t_applicant USING btree (name, customer_id)
+    WHERE (deleted_at IS NULL);
 
 ------------------------------------------------------------------------
 -- t_serial_counter  (PK is `prefix varchar(1)` — business key, NOT snowflake)
 ------------------------------------------------------------------------
-CREATE TABLE t_serial_counter (
-    prefix      VARCHAR(1) PRIMARY KEY,
-    counter     BIGINT      NOT NULL DEFAULT 0,
-    version     INT         NOT NULL DEFAULT 0,
-    created_at  timestamp   NOT NULL DEFAULT now(),
-    created_by  BIGINT,
-    updated_at  timestamp   NOT NULL DEFAULT now(),
-    updated_by  BIGINT,
-    deleted_at  timestamp
+CREATE TABLE public.t_serial_counter (
+    prefix      character varying(1) NOT NULL,
+    counter     bigint DEFAULT 0 NOT NULL,
+    version     integer DEFAULT 0 NOT NULL,
+    created_at  timestamp without time zone DEFAULT now() NOT NULL,
+    created_by  bigint,
+    updated_at  timestamp without time zone DEFAULT now() NOT NULL,
+    updated_by  bigint,
+    deleted_at  timestamp without time zone
 );
+
+COMMENT ON COLUMN public.t_serial_counter.version IS '乐观锁版本号；每次 UPDATE 自增；冲突抛 BIZ_VERSION_CONFLICT 409';
+
+ALTER TABLE ONLY public.t_serial_counter ADD CONSTRAINT t_serial_counter_pkey PRIMARY KEY (prefix);
