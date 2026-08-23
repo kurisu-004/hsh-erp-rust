@@ -1,0 +1,89 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                b.id           AS \"b_id!\",\n                b.part_id      AS \"b_part_id!\",\n                p.serial_no    AS \"p_serial_no?\",\n                p.drawing_no   AS \"p_drawing_no!\",\n                p.name         AS \"p_name!\",\n                p.order_no     AS \"p_order_no?\"\n            FROM t_part_batch b\n            JOIN t_part p ON p.id = b.part_id\n            WHERE b.delivery_note_id = $1\n              AND b.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n            ORDER BY b.id DESC\n            LIMIT $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "b_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "b_part_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "part_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "p_serial_no?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "serial_no"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "p_drawing_no!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "drawing_no"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "p_name!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "p_order_no?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "order_no"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "c65000aa0327eff59fa71f2422ff3670c97225a51ea7db1fb208cca0e80d7294"
+}
