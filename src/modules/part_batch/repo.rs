@@ -14,7 +14,7 @@
 
 use sqlx::PgExecutor;
 
-use super::model::TPartBatch;
+use super::model::{RecentBatchRow, TPartBatch};
 use crate::modules::part::model::TPart;
 
 pub struct PartBatchRepo;
@@ -492,5 +492,57 @@ impl PartBatchRepo {
             out.push((pb, p));
         }
         Ok(out)
+    }
+
+    /// 草稿卡片「最近加入批次」展示数据。
+    ///
+    /// 2026-08-22 新增：配合 `ScanDeliveryNoteSummaryDto::recent_items`。
+    /// JOIN `t_part` 拿 `serial_no` / `drawing_no` / `name` / `order_no` 展示列，
+    /// 按 batch id DESC 取最近 `limit` 条（业务约定 limit=8）。
+    ///
+    /// 注：原 plan 草稿 SQL 里 `b.serial_no` 是错的 —— `t_part_batch` 没有
+    /// `serial_no` 列，那列在 `t_part` 上。这里修正为 `p.serial_no`。
+    pub async fn list_recent_by_note<'e, E: PgExecutor<'e>>(
+        executor: E,
+        note_id: i64,
+        limit: i64,
+    ) -> Result<Vec<RecentBatchRow>, sqlx::Error> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                b.id           AS "b_id!",
+                b.part_id      AS "b_part_id!",
+                p.serial_no    AS "p_serial_no?",
+                p.drawing_no   AS "p_drawing_no!",
+                p.name         AS "p_name!",
+                p.order_no     AS "p_order_no?"
+            FROM t_part_batch b
+            JOIN t_part p ON p.id = b.part_id
+            WHERE b.delivery_note_id = $1
+              AND b.deleted_at IS NULL
+              AND p.deleted_at IS NULL
+            ORDER BY b.id DESC
+            LIMIT $2
+            "#,
+            note_id,
+            limit,
+        )
+        .fetch_all(executor)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| RecentBatchRow {
+                batch_id: r.b_id,
+                part_id: r.b_part_id,
+                serial_no: r.p_serial_no,
+                drawing_no: r.p_drawing_no,
+                name: r.p_name,
+                order_no: r.p_order_no,
+            })
+            .collect())
     }
 }

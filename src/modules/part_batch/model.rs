@@ -32,3 +32,20 @@ pub struct TPartBatch {
     pub updated_by: Option<i64>,
     pub deleted_at: Option<NaiveDateTime>,
 }
+
+/// 草稿卡片「最近批次」展示行（`t_part_batch JOIN t_part` 投影）。
+///
+/// 2026-08-22 新增：配合 `ScanDeliveryNoteSummaryDto::recent_items` 返回。
+/// 只投影卡片展示所需的 6 列（batch_id / part_id / serial_no / drawing_no /
+/// name / order_no），比 `TPartBatch + TPart` 轻量。
+#[derive(Debug, Clone)]
+pub struct RecentBatchRow {
+    pub batch_id: i64,
+    pub part_id: i64,
+    /// `t_part.serial_no` 是 nullable（手工工单可没序列号）。
+    pub serial_no: Option<String>,
+    pub drawing_no: String,
+    pub name: String,
+    /// `t_part.order_no` 是 nullable。
+    pub order_no: Option<String>,
+}

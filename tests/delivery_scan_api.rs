@@ -732,3 +732,182 @@ async fn scan_no_groups_for_l1_collapses_to_one_l1wide_note() {
     assert!(row.leaf_customer_id.is_none());
     assert_eq!(env2["data"]["note"]["line_count"], 2);
 }
+
+/// 2026-08-22：草稿卡片 `recent_items` 形状 + 长度上限回归。
+///
+/// 场景：1 个 part 上建 10 个不同 batch_no 的批次（status=READY_TO_SHIP），
+/// 扫该 part 的 serial_no 一次 → 全部 10 批一次性落到同一 DRAFT。
+///
+/// 断言：
+/// - `note.line_count == 10`（所有 10 个批次都挂上了）
+/// - `note.recent_items.len() == 8`（服务端 LIMIT 8 截断）
+/// - 每条都有 batch_id / part_id / serial_no / drawing_no / name 字段
+/// - `order_no` 是 JSON 字符串或 null（Option<String> 兼容）
+/// - 第一条 `batch_id` 是 10 个批次中 id 最大的（ORDER BY id DESC）
+#[tokio::test]
+async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    // 1 个 part，带订单号（验证 order_no 字段透传）
+    let pid = insert_part(&pool, "RecentItemPart", l2, Some("REC00001"), None).await;
+    sqlx::query!(
+        "UPDATE t_part SET order_no = $1 WHERE id = $2",
+        "ORDER-RECENT",
+        pid,
+    )
+    .execute(&pool)
+    .await
+    .expect("set part order_no");
+    // 10 个不同 batch_no 的批次（status=READY_TO_SHIP 即可入单）
+    //
+    // 注：测试 helper `insert_batch` 内部每次都新建一个 `SnowflakeIdGenerator`，
+    // 在 10 次连续 await 中如果落在同一毫秒，会撞 `t_part_batch_pkey`。
+    // 这里直接走单条多行 INSERT + 一次性生成 10 个雪花 ID 来规避。
+    use hsh_erp_rust::infra::clock::now_naive;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let now = now_naive();
+    let mut created_batch_ids: Vec<i64> = Vec::with_capacity(10);
+    for _ in 0..10 {
+        created_batch_ids.push(snowflake.next_id());
+    }
+    let max_batch_id = *created_batch_ids.iter().max().unwrap();
+    sqlx::query!(
+        r#"
+        INSERT INTO t_part_batch
+            (id, part_id, batch_no, quantity, status, has_been_repaired,
+             version, created_at, created_by, updated_at, updated_by)
+        VALUES
+            ($1, $11, 1, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
+            ($2, $11, 2, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
+            ($3, $11, 3, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
+            ($4, $11, 4, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
+            ($5, $11, 5, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
+            ($6, $11, 6, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
+            ($7, $11, 7, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
+            ($8, $11, 8, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
+            ($9, $11, 9, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
+            ($10, $11, 10, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL)
+        "#,
+        created_batch_ids[0],
+        created_batch_ids[1],
+        created_batch_ids[2],
+        created_batch_ids[3],
+        created_batch_ids[4],
+        created_batch_ids[5],
+        created_batch_ids[6],
+        created_batch_ids[7],
+        created_batch_ids[8],
+        created_batch_ids[9],
+        pid,
+        now,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert 10 batches");
+    assert_eq!(created_batch_ids.len(), 10);
+
+    let (app, token, _) = login_manager(pool, "admin").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/delivery-notes/scan",
+            Some(json!({"code": "REC00001"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "scan: {env}");
+    assert_eq!(env["data"]["outcome"], "ADDED");
+    // 全部 10 个批次挂上了（line_count 与 added_batches 都应是 10）
+    assert_eq!(env["data"]["note"]["line_count"], 10);
+    assert_eq!(
+        env["data"]["added_batches"].as_array().unwrap().len(),
+        10
+    );
+
+    // ===== 断言 recent_items 形状 + 长度 =====
+    let recent = env["data"]["note"]["recent_items"]
+        .as_array()
+        .expect("note.recent_items array");
+    assert_eq!(
+        recent.len(),
+        8,
+        "recent_items 应被 LIMIT 8 截断；got {} items",
+        recent.len()
+    );
+
+    // 第一条应该是 id 最大的批次（ORDER BY b.id DESC LIMIT 8）
+    let first_batch_id: i64 = recent[0]["batch_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .expect("batch_id 是字符串雪花 ID");
+    assert_eq!(
+        first_batch_id, max_batch_id,
+        "第一条 batch_id 应该是 10 个批次中 id 最大的"
+    );
+
+    // 校验每个 item 都有必需字段 + 字段类型合理
+    for (idx, item) in recent.iter().enumerate() {
+        // batch_id / part_id：字符串雪花 id
+        let bid_str = item["batch_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("recent[{idx}].batch_id 应该是字符串"));
+        let _: i64 = bid_str.parse().expect("batch_id 可解析为 i64");
+        let pid_str = item["part_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("recent[{idx}].part_id 应该是字符串"));
+        let parsed_pid: i64 = pid_str.parse().expect("part_id 可解析为 i64");
+        assert_eq!(
+            parsed_pid, pid,
+            "recent[{idx}].part_id 应等于该 part 的 id"
+        );
+
+        // serial_no / drawing_no / name：字符串（serial_no 可 null —— t_part.serial_no 是 nullable）
+        assert!(
+            item["serial_no"].is_string() || item["serial_no"].is_null(),
+            "recent[{idx}].serial_no 应为 string 或 null"
+        );
+        assert_eq!(
+            item["serial_no"].as_str().unwrap_or(""),
+            "REC00001",
+            "recent[{idx}].serial_no 透传自 part.serial_no"
+        );
+        assert!(
+            item["drawing_no"].is_string(),
+            "recent[{idx}].drawing_no 应为 string"
+        );
+        assert!(
+            item["name"].is_string(),
+            "recent[{idx}].name 应为 string"
+        );
+
+        // order_no：JSON null 或 string 都接受（DB 列 nullable）
+        let on = &item["order_no"];
+        assert!(
+            on.is_null() || on.is_string(),
+            "recent[{idx}].order_no 应为 null 或 string；got {on}"
+        );
+        assert_eq!(
+            on.as_str().unwrap_or(""),
+            "ORDER-RECENT",
+            "recent[{idx}].order_no 透传自 part.order_no"
+        );
+    }
+
+    // 额外断言：连续两条 batch_id 严格递减（ORDER BY id DESC 语义）
+    let ids: Vec<i64> = recent
+        .iter()
+        .map(|it| it["batch_id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    for w in ids.windows(2) {
+        assert!(
+            w[0] > w[1],
+            "recent_items 应按 batch_id DESC；got {} then {}",
+            w[0],
+            w[1]
+        );
+    }
+}

@@ -37,8 +37,9 @@ use crate::shared::error::{code, AppError};
 use super::dto::{
     DeliveryNoteAddItem, DeliveryNoteCandidatePart, DeliveryNoteCreateRequest,
     DeliveryNoteDetailOut, DeliveryNoteEventOut, DeliveryNoteLineItem, DeliveryNoteListOut,
-    DeliveryNoteOut, DeliveryNotePickupScanOut, DeliveryNoteUpdateRequest, ResolvedEntityDto,
-    ScanBatchDto, ScanDeliveryNoteSummaryDto, ScanDeliveryOut, ScanFailureDto, ScanOutcomeDto,
+    DeliveryNoteOut, DeliveryNotePickupScanOut, DeliveryNoteUpdateRequest, RecentItemDto,
+    ResolvedEntityDto, ScanBatchDto, ScanDeliveryNoteSummaryDto, ScanDeliveryOut,
+    ScanFailureDto, ScanOutcomeDto,
 };
 use super::model::{
     DeliveryGroup, DeliveryGroupMember, DeliveryNote, DeliveryNoteEvent,
@@ -1648,6 +1649,23 @@ impl DeliveryNoteService {
             ScanOutcomeDto::Added
         };
 
+        // 最近批次（卡片直接展示用）。limit=8 是设计 §5 + 前端约定的常量；
+        // 后续如果前端要变多 / 变少，集中改这里。
+        const RECENT_ITEMS_LIMIT: i64 = 8;
+        let recent_items: Vec<RecentItemDto> =
+            PartBatchRepo::list_recent_by_note(&mut *conn, fresh_note.id, RECENT_ITEMS_LIMIT)
+                .await?
+                .into_iter()
+                .map(|r| RecentItemDto {
+                    batch_id: r.batch_id,
+                    part_id: r.part_id,
+                    serial_no: r.serial_no,
+                    drawing_no: r.drawing_no,
+                    name: r.name,
+                    order_no: r.order_no,
+                })
+                .collect();
+
         Ok(ScanDeliveryOut {
             outcome,
             resolved,
@@ -1659,6 +1677,7 @@ impl DeliveryNoteService {
                 scope_label,
                 customer_path,
                 line_count,
+                recent_items,
             },
             added_batches,
             already_present,

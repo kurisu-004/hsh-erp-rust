@@ -480,6 +480,33 @@ pub struct ScanDeliveryNoteSummaryDto {
     pub scope_label: String,
     pub customer_path: String,
     pub line_count: usize,
+    /// 最近加入该草稿的批次条目（按 batch id DESC 最多 8 条；空单 = 空 Vec）。
+    ///
+    /// 2026-08-22 新增：原只有 `line_count` 总数，前端草稿卡片要直接展示
+    /// 「最近加入序列号/名称/订单号」又不想 N 次额外 GET，于是 DTO 一次性
+    /// 把这些字段塞过来。`order_no` 是 Option（工单可能没填）。
+    pub recent_items: Vec<RecentItemDto>,
+}
+
+/// 草稿卡片里要展示的最近批次条目。
+///
+/// 2026-08-22：原 `ScanBatchDto` 没有 drawing_no/name/order_no，前端卡片
+/// 需要这些字段直接展示（序列号 + 名称 + 订单号），避免每次 N 次 GET /notes/{id}。
+/// 这里独立成一个 DTO，与 added_batches 用 `ScanBatchDto`（极简）解耦。
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentItemDto {
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub batch_id: i64,
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub part_id: i64,
+    /// 工单序列号；t_part.serial_no 是 nullable → 落 Some/None。
+    /// 序列化永远给字符串（None → null），与 ScanDeliveryNoteSummaryDto 内
+    /// 其它字段对齐。
+    pub serial_no: Option<String>,
+    pub drawing_no: String,
+    pub name: String,
+    /// 工单订单号；nullable → Some/None。
+    pub order_no: Option<String>,
 }
 
 /// 命中的批次（含 added / already_present 列表用）。
