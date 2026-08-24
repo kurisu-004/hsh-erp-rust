@@ -240,16 +240,10 @@ impl PartRepo {
     /// - 0 行 → 版本冲突 / 状态非 INSPECTION / 已软删 —— 由 service 层映射为 `40901`。
     /// - 成功 → `status = 'READY_TO_SHIP'`，`version += 1`，`updated_at = now()`。
     ///
-    /// **未触碰 `t_part` 行**：`t_part.status` / `t_part.actual_delivery_date` 由后续 PR
-    /// 触发器或 service 显式 UPDATE 同步（不在本 PR 范围内）。当前阶段，
-    /// `t_part_batch.status` 是 pass_inspection 流程的 source of truth。
-    ///
-    /// // TODO(Task 2): also flip `t_part.status = 'READY_TO_SHIP'` here (or from
-    /// service layer) so `PartOut.status` reflects current state. Service layer
-    /// must replicate Python's `_rollup_part_status` semantics: re-read the
-    /// part then UPDATE its status, location, current_holder_id, and
-    /// next_process_id after this batch UPDATE. Without it, `t_part.status`
-    /// stays stale and the API contract is broken.
+    /// **未触碰 `t_part` 行**：工单（`t_part`）的状态翻转由 service 层在事务内
+    /// 紧接着调用 [`Self::mark_part_passed_inspection`] 完成 —— 这样
+    /// `PartOut.status` 在接口响应时就能反映最新状态（避免上层读到的 status
+    /// 还是 `INSPECTION`）。
     ///
     /// 注：`t_part_batch` 没有 `actual_delivery_date` 列（migration 006 校验过）；
     /// 该列只存在于 `t_part` / `t_assembly`。
@@ -268,6 +262,42 @@ impl PartRepo {
               AND deleted_at IS NULL
             "#,
             batch_id,
+            expected_version,
+        )
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// pass_inspection 后同步工单状态（OCC UPDATE `t_part.status`）。
+    ///
+    /// - 0 行 → 工单已被并发修改（version 不匹配）/ 状态非 INSPECTION /
+    ///   已软删 —— 由 service 层映射为 `40901 / VERSION_CONFLICT`。
+    /// - 成功 → `status = 'READY_TO_SHIP'`，`version += 1`，`updated_at = now()`。
+    ///
+    /// **必须与 [`Self::mark_batch_passed_inspection`] 在同一事务内调用**，否则
+    /// 可能出现 batch 已翻 READY_TO_SHIP 但工单仍 INSPECTION 的不一致窗口。
+    ///
+    /// 设计取舍：本方法只翻 `status` + `version`，不更新 `location` /
+    /// `current_holder_id` / `next_process_id`。Python `service/_pass_inspection.py`
+    /// 的 `_rollup_part_status` 会做更完整的字段同步，但本次 PR 仅对齐状态字段
+    /// （满足 `PartOut.status` 不陈旧的契约）。location / holder 同步留待
+    /// 后续 PR（Task 2 之后）单独实施，避免越界改动既有 pass_inspection 流。
+    pub async fn mark_part_passed_inspection<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        expected_version: i32,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE t_part
+            SET status     = 'READY_TO_SHIP',
+                version    = version + 1,
+                updated_at = now()
+            WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
+              AND deleted_at IS NULL
+            "#,
+            part_id,
             expected_version,
         )
         .execute(executor)
