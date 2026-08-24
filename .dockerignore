@@ -16,7 +16,8 @@
 !.env.example
 
 docs/
-template/
+# template/ 不忽略：送货单 Excel 模板需经 builder 阶段 COPY 进运行时镜像
+# （见 Dockerfile stage 2：DELIVERY_NOTE_TEMPLATE_DIR=/app/template）
 tests/
 scripts/
 
