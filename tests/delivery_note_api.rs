@@ -45,11 +45,18 @@ static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
     let status = response.status();
+    let headers = response.headers().clone();
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body)));
+    let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
+        panic!(
+            "parse JSON: {e}; status={status}; content-type={:?}; raw = {}; headers={:?}",
+            headers.get("content-type").map(|v| v.to_str().unwrap_or("?")),
+            String::from_utf8_lossy(&body),
+            headers
+        )
+    });
     (status, envelope)
 }
 
@@ -1162,4 +1169,78 @@ async fn list_candidate_parts_l1_returns_fixtures_non_l1_returns_400() {
     .await;
     assert_eq!(s2, StatusCode::BAD_REQUEST);
     assert_eq!(env2["code"], 20104);
+}
+
+#[tokio::test]
+async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
+    let (_guard, pool) = setup().await;
+    let (app, token, pool) = login_manager(pool, "admin").await;
+
+    // 3 张 DRAFT 送货单（最小列插入）
+    let note_ids: Vec<i64> = {
+        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let id = snowflake.next_id();
+            // delivery_note_no 是 varchar(16)；雪花 id 17+ 位拼前缀会超 16 字符，
+            // 这里手写 14-char 测试单号（DN-TEST-NNNN + i 适配）。
+            let no = format!("DN-TEST-{i:04}");
+            sqlx::query!(
+                "INSERT INTO t_delivery_note \
+                 (id, delivery_note_no, customer_id, status, version, created_at, updated_at) \
+                 VALUES ($1, $2, 1, 'DRAFT', 0, now(), now())",
+                id,
+                no,
+            )
+            .execute(&pool)
+            .await
+            .expect("insert delivery note");
+            ids.push(id);
+        }
+        ids
+    };
+
+    // 1) 全部存在 → 200, items.len() == 3, 顺序同入参
+    let uri = format!(
+        "/delivery-notes/batch-detail?ids={},{},{}",
+        note_ids[0], note_ids[1], note_ids[2]
+    );
+    let (status, body) = send(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["code"], 0);
+    assert_eq!(body["data"]["items"].as_array().unwrap().len(), 3);
+    let r0 = body["data"]["items"][0]["id"].as_str().unwrap().to_string();
+    let r1 = body["data"]["items"][1]["id"].as_str().unwrap().to_string();
+    let r2 = body["data"]["items"][2]["id"].as_str().unwrap().to_string();
+    assert_eq!(r0, note_ids[0].to_string());
+    assert_eq!(r1, note_ids[1].to_string());
+    assert_eq!(r2, note_ids[2].to_string());
+
+    // 2) 中间缺失 → 200, items.len() == 2, 顺序 [a, c]
+    let uri = format!(
+        "/delivery-notes/batch-detail?ids={},99999999,{}",
+        note_ids[0], note_ids[2]
+    );
+    let (status, body) = send(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(status, StatusCode::OK);
+    let items = body["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"].as_str().unwrap(), note_ids[0].to_string());
+    assert_eq!(items[1]["id"].as_str().unwrap(), note_ids[2].to_string());
+
+    // 3) 缺 ids → 400 BIZ_INVALID_VALUE (20104)
+    let (status, body) = send(
+        app.clone(),
+        json_request("GET", "/delivery-notes/batch-detail", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], 20104);
+
+    // 4) 201 项 → 400 BIZ_INVALID_VALUE
+    let too_many: String = (1..=201).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let uri = format!("/delivery-notes/batch-detail?ids={too_many}");
+    let (status, body) = send(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], 20104);
 }

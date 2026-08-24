@@ -6,67 +6,145 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "drawing_no",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "drawing_no"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "name",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "name"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "customer_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "customer_id"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "status",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "status"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "serial_no",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "serial_no"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "version",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "created_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "created_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "created_by"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "updated_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "updated_at"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "updated_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "updated_by"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "deleted_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "deleted_at"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "order_no",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "order_no"
+          }
+        }
       }
     ],
     "parameters": {

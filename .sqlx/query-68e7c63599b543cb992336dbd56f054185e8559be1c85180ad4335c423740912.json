@@ -6,97 +6,211 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "delivery_note_no",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "delivery_note_no"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "customer_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "customer_id"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "status",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "status"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "submitted_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "submitted_at"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "picked_up_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "picked_up_at"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "submitted_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "submitted_by"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "picked_up_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "picked_up_by"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "driver_worker_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "driver_worker_id"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "note",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "note"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "delivery_date",
-        "type_info": "Date"
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "delivery_date"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "delivery_group_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "delivery_group_id"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "leaf_customer_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "leaf_customer_id"
+          }
+        }
       },
       {
         "ordinal": 13,
         "name": "version",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 14,
         "name": "created_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 15,
         "name": "created_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "created_by"
+          }
+        }
       },
       {
         "ordinal": 16,
         "name": "updated_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "updated_at"
+          }
+        }
       },
       {
         "ordinal": 17,
         "name": "updated_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "updated_by"
+          }
+        }
       },
       {
         "ordinal": 18,
         "name": "deleted_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "deleted_at"
+          }
+        }
       }
     ],
     "parameters": {

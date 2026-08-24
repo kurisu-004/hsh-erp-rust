@@ -194,6 +194,25 @@ pub struct DeliveryNoteDetailOut {
     pub scanned_serials: Vec<String>,
 }
 
+/// `GET /delivery-notes/batch-detail?ids=...` 响应载体。
+///
+/// 仅作为 `items: [DeliveryNoteDetailOut]` 的轻量封装，避免 schema 顶层直接
+/// 给出数组（信封 `data` 不能是裸数组）。`DeliveryNoteDetailOut` 自身已
+/// `#[serde(flatten)] head: DeliveryNoteOut`，因此每个 item 在 wire 上仍是
+/// head + `line_items` + `scanned_serials` 的扁平结构。
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchDeliveryDetailData {
+    pub items: Vec<DeliveryNoteDetailOut>,
+}
+
+/// `GET /delivery-notes/batch-detail?ids=1,2,3` 查询参数。
+/// `ids` 为可选；handler 内部做 split/trim/filter/dedupe/parse i64 + 1..=200
+/// 校验。这里只声明 query 形状。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeliveryNoteBatchDetailQuery {
+    pub ids: Option<String>,
+}
+
 /// 送货单事件条目（时间线）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeliveryNoteEventOut {

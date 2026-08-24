@@ -559,6 +559,144 @@ impl DeliveryNoteService {
         get_with_parts(conn, note_id).await
     }
 
+    // ---------- get_many_with_parts (PR3 batch-detail) ----------
+
+    /// 批查 N 个送货单详情（PR3 batch-detail 专用）。固定 6 次 Postgres 往返：
+    /// 1) `DeliveryNoteRepo::list_by_ids` 头
+    /// 2) `PartBatchRepo::list_with_part_by_delivery_note_ids` 批次+工单
+    /// 3) `CustomerRepo::list_by_ids` (leaf) L2
+    /// 4) `CustomerRepo::list_by_ids` (parent) L1
+    /// 5) `AssemblyRepo::list_by_ids` 装配件
+    /// 6) `build_note_outs(&heads)` head → DeliveryNoteOut（内部已批 driver / group）
+    ///
+    /// 输出按入参 `ids` 顺序排列；缺失 id 静默跳过；入参应已 dedupe（caller 责任）。
+    #[allow(clippy::too_many_lines)]
+    pub async fn get_many_with_parts(
+        conn: &mut PgConnection,
+        ids: &[i64],
+    ) -> Result<Vec<DeliveryNoteDetailOut>, AppError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let heads = DeliveryNoteRepo::list_by_ids(&mut *conn, ids, false).await?;
+        if heads.is_empty() {
+            return Ok(Vec::new());
+        }
+        let head_ids: Vec<i64> = heads.iter().map(|n| n.id).collect();
+
+        let rows = PartBatchRepo::list_with_part_by_delivery_note_ids(&mut *conn, &head_ids).await?;
+
+        let leaf_ids: HashSet<i64> = rows.iter().map(|(_b, p)| p.customer_id).collect();
+        let leaf_list = CustomerRepo::list_by_ids(
+            &mut *conn,
+            &leaf_ids.iter().copied().collect::<Vec<_>>(),
+            false,
+        )
+        .await?;
+        let leaf_map: HashMap<i64, TCustomer> =
+            leaf_list.into_iter().map(|c| (c.id, c)).collect();
+
+        let parent_ids: HashSet<i64> =
+            leaf_map.values().filter_map(|c| c.parent_id).collect();
+        let parent_list = if parent_ids.is_empty() {
+            Vec::new()
+        } else {
+            CustomerRepo::list_by_ids(
+                &mut *conn,
+                &parent_ids.iter().copied().collect::<Vec<_>>(),
+                false,
+            )
+            .await?
+        };
+        let parent_map: HashMap<i64, TCustomer> =
+            parent_list.into_iter().map(|c| (c.id, c)).collect();
+
+        let asm_ids: Vec<i64> = rows
+            .iter()
+            .filter_map(|(_b, p)| p.assembly_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut assembly_map: HashMap<i64, TAssembly> = HashMap::new();
+        if !asm_ids.is_empty() {
+            let asms = AssemblyRepo::list_by_ids(&mut *conn, &asm_ids, false).await?;
+            for a in asms {
+                assembly_map.insert(a.id, a);
+            }
+        }
+
+        let head_outs = build_note_outs(conn, &heads).await?;
+        let head_out_map: HashMap<i64, DeliveryNoteOut> =
+            head_outs.into_iter().map(|h| (h.id, h)).collect();
+
+        // 按 b.delivery_note_id 分桶
+        let mut by_note: HashMap<i64, Vec<(TPartBatch, TPart)>> = HashMap::new();
+        for r in rows {
+            if let Some(nid) = r.0.delivery_note_id {
+                by_note.entry(nid).or_default().push(r);
+            }
+        }
+
+        // 按入参 ids 顺序装配
+        let mut out = Vec::with_capacity(heads.len());
+        for nid in &head_ids {
+            let Some(head) = head_out_map.get(nid) else { continue };
+            let items_rows = by_note.remove(nid).unwrap_or_default();
+            let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(items_rows.len());
+            for (b, p) in items_rows {
+                let leaf = leaf_map.get(&p.customer_id);
+                let parent = leaf
+                    .and_then(|l| l.parent_id)
+                    .and_then(|pid| parent_map.get(&pid));
+                let leaf_name = leaf.map(|c| c.name.clone());
+                let parent_name = parent.map(|c| c.name.clone()).or_else(|| leaf_name.clone());
+                let path = match (&parent_name, &leaf_name) {
+                    (Some(p), Some(l)) if p != l => Some(format!("{p} / {l}")),
+                    _ => leaf_name.clone(),
+                };
+                let asm = p.assembly_id.and_then(|id| assembly_map.get(&id));
+                let batch_label = match &p.serial_no {
+                    Some(s) => format!("{s}B{:02}", b.batch_no),
+                    None => format!("批次{}", b.batch_no),
+                };
+                items.push(DeliveryNoteLineItem {
+                    id: b.id,
+                    part_id: p.id,
+                    batch_no: b.batch_no,
+                    batch_label,
+                    serial_no: p.serial_no.clone().unwrap_or_default(),
+                    drawing_no: p.drawing_no.clone(),
+                    name: p.name.clone(),
+                    quantity: b.quantity,
+                    is_urgent: false,
+                    status: b.status.clone(),
+                    applicant_name: None,
+                    request_date: None,
+                    planned_delivery_date: None,
+                    system_delivery_date: None,
+                    order_no: None,
+                    note: None,
+                    customer_name: leaf_name,
+                    parent_customer_name: parent_name,
+                    customer_path: path,
+                    is_scanned: false,
+                    scanned: false,
+                    assembly_id: asm.map(|a| a.id),
+                    assembly_serial_no: asm.and_then(|a| a.serial_no.clone()),
+                    assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),
+                    assembly_name: asm.map(|a| a.name.clone()),
+                    assembly_order_no: asm.and_then(|a| a.order_no.clone()),
+                });
+            }
+            out.push(DeliveryNoteDetailOut {
+                head: head.clone(),
+                line_items: items,
+                scanned_serials: vec![],
+            });
+        }
+        Ok(out)
+    }
+
     // ---------- update (partial) ----------
 
     pub async fn update(

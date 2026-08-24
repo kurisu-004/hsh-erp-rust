@@ -6,42 +6,90 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note_event",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "delivery_note_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note_event",
+            "name": "delivery_note_id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "event_type",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note_event",
+            "name": "event_type"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "from_status",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note_event",
+            "name": "from_status"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "to_status",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note_event",
+            "name": "to_status"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "note",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note_event",
+            "name": "note"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "created_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note_event",
+            "name": "created_by"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "created_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note_event",
+            "name": "created_at"
+          }
+        }
       }
     ],
     "parameters": {

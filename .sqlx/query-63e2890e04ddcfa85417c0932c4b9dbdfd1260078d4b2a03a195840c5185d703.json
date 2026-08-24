@@ -6,52 +6,112 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "code",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "code"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "name",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "name"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "max_held_batches",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "max_held_batches"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "version",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "created_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "created_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "created_by"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "updated_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "updated_at"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "updated_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "updated_by"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "deleted_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "deleted_at"
+          }
+        }
       }
     ],
     "parameters": {

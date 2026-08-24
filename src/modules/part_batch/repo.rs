@@ -166,6 +166,107 @@ impl PartBatchRepo {
             .collect())
     }
 
+    /// 多送货单的「批次 + 工单展示字段」批查（PR3 batch-detail 专用）。
+    ///
+    /// 与 `list_with_part_by_delivery_note` 同投影；改用 `WHERE pb.delivery_note_id = ANY($1)`，
+    /// 由 caller 按 `b.delivery_note_id` 分桶后组装 N 个 `DeliveryNoteDetailOut`。
+    /// 空输入短路（避免 `ANY($1::bigint[])` 抛 sqlx 类型推断错）。
+    pub async fn list_with_part_by_delivery_note_ids<'e, E: PgExecutor<'e>>(
+        executor: E,
+        note_ids: &[i64],
+    ) -> Result<Vec<(TPartBatch, TPart)>, sqlx::Error> {
+        if note_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                pb.id            AS "pb_id!",
+                pb.part_id       AS "pb_part_id!",
+                pb.batch_no      AS "pb_batch_no!",
+                pb.quantity      AS "pb_quantity!",
+                pb.status        AS "pb_status!",
+                pb.location      AS "pb_location?",
+                pb.current_holder_id AS "pb_current_holder_id?",
+                pb.next_process_id AS "pb_next_process_id?",
+                pb.placed_at     AS "pb_placed_at?",
+                pb.delivery_note_id AS "pb_delivery_note_id?",
+                pb.parent_batch_id AS "pb_parent_batch_id?",
+                pb.has_been_repaired AS "pb_has_been_repaired!",
+                pb.version       AS "pb_version!",
+                pb.created_at    AS "pb_created_at!",
+                pb.created_by    AS "pb_created_by?",
+                pb.updated_at    AS "pb_updated_at!",
+                pb.updated_by    AS "pb_updated_by?",
+                pb.deleted_at    AS "pb_deleted_at?",
+                p.id             AS "p_id!",
+                p.serial_no      AS "p_serial_no?",
+                p.name           AS "p_name!",
+                p.drawing_no     AS "p_drawing_no!",
+                p.customer_id    AS "p_customer_id!",
+                p.assembly_id    AS "p_assembly_id?",
+                p.status         AS "p_status!",
+                p.version        AS "p_version!",
+                p.created_at     AS "p_created_at!",
+                p.created_by     AS "p_created_by?",
+                p.updated_at     AS "p_updated_at!",
+                p.updated_by     AS "p_updated_by?",
+                p.deleted_at     AS "p_deleted_at?",
+                p.delivery_note_id AS "p_delivery_note_id?"
+            FROM t_part_batch pb
+            JOIN t_part p ON p.id = pb.part_id
+            WHERE pb.delivery_note_id = ANY($1)
+              AND pb.deleted_at IS NULL
+              AND p.deleted_at IS NULL
+            ORDER BY pb.id ASC
+            "#,
+            note_ids,
+        )
+        .fetch_all(executor)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| {
+            (
+                TPartBatch {
+                    id: r.pb_id,
+                    part_id: r.pb_part_id,
+                    batch_no: r.pb_batch_no,
+                    quantity: r.pb_quantity,
+                    status: r.pb_status,
+                    location: r.pb_location,
+                    current_holder_id: r.pb_current_holder_id,
+                    next_process_id: r.pb_next_process_id,
+                    placed_at: r.pb_placed_at,
+                    delivery_note_id: r.pb_delivery_note_id,
+                    parent_batch_id: r.pb_parent_batch_id,
+                    has_been_repaired: r.pb_has_been_repaired,
+                    version: r.pb_version,
+                    created_at: r.pb_created_at,
+                    created_by: r.pb_created_by,
+                    updated_at: r.pb_updated_at,
+                    updated_by: r.pb_updated_by,
+                    deleted_at: r.pb_deleted_at,
+                },
+                TPart {
+                    id: r.p_id,
+                    serial_no: r.p_serial_no,
+                    name: r.p_name,
+                    drawing_no: r.p_drawing_no,
+                    customer_id: r.p_customer_id,
+                    assembly_id: r.p_assembly_id,
+                    status: r.p_status,
+                    version: r.p_version,
+                    created_at: r.p_created_at,
+                    created_by: r.p_created_by,
+                    updated_at: r.p_updated_at,
+                    updated_by: r.p_updated_by,
+                    deleted_at: r.p_deleted_at,
+                    delivery_note_id: r.p_delivery_note_id,
+                },
+            )
+        }).collect())
+    }
+
     /// 多工单的未删批次批查（Phase P3 装配件整套入单时按子件 part_ids 一次拿齐）。
     pub async fn list_by_part_ids<'e, E: PgExecutor<'e>>(
         executor: E,

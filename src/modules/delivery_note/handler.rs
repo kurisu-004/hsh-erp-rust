@@ -47,11 +47,12 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::dto::{
-    DeliveryNoteAddPartsRequest, DeliveryNoteCandidatePartsOut, DeliveryNoteCandidatePartsQuery,
-    DeliveryNoteCreateRequest, DeliveryNoteListQuery, DeliveryNotePickupPendingQuery,
-    DeliveryNotePickupRequest, DeliveryNotePickupScanOut, DeliveryNotePickupScanRequest,
-    DeliveryNoteRemovePartsRequest, DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest,
-    PrintDeliveryNoteRequest, PrintLabelsRequest, ScanDeliveryOut, ScanDeliveryRequest,
+    BatchDeliveryDetailData, DeliveryNoteAddPartsRequest, DeliveryNoteBatchDetailQuery,
+    DeliveryNoteCandidatePartsOut, DeliveryNoteCandidatePartsQuery, DeliveryNoteCreateRequest,
+    DeliveryNoteListQuery, DeliveryNotePickupPendingQuery, DeliveryNotePickupRequest,
+    DeliveryNotePickupScanOut, DeliveryNotePickupScanRequest, DeliveryNoteRemovePartsRequest,
+    DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest, PrintDeliveryNoteRequest,
+    PrintLabelsRequest, ScanDeliveryOut, ScanDeliveryRequest,
 };
 
 // ===========================================================================
@@ -62,6 +63,56 @@ use super::dto::{
 pub struct DeliveryNotePath {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
     pub id: i64,
+}
+
+const BATCH_DETAIL_MAX_IDS: usize = 200;
+
+/// `GET /api/v2/delivery-notes/batch-detail?ids=1,2,3`
+///
+/// 入参 `ids` 是逗号分隔字符串；空 / 越界 / 重复（保留首次出现顺序）/ 非 i64
+/// 都会被规范化或拒为 `BIZ_INVALID_VALUE`（20104）。缺失的 id 静默跳过（按
+/// 入参顺序返回存在的那部分）。
+pub async fn batch_get_delivery_notes(
+    State(state): State<Arc<AppState>>,
+    _current: CurrentUser,
+    Query(q): Query<DeliveryNoteBatchDetailQuery>,
+) -> Result<Json<R<BatchDeliveryDetailData>>, AppError> {
+    // 解析：split + trim + filter empty + 保留首次出现顺序 dedupe
+    let raw = q.ids.as_deref().unwrap_or("");
+    let mut seen = std::collections::HashSet::new();
+    let mut ids: Vec<i64> = Vec::new();
+    for tok in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let n: i64 = tok.parse().map_err(|_| {
+            AppError::biz(
+                crate::shared::error::code::BIZ_INVALID_VALUE,
+                "ids contains non-integer token",
+            )
+        })?;
+        if seen.insert(n) {
+            ids.push(n);
+        }
+    }
+    if ids.is_empty() {
+        return Err(AppError::biz(
+            crate::shared::error::code::BIZ_INVALID_VALUE,
+            "ids must contain 1..=200 items",
+        ));
+    }
+    if ids.len() > BATCH_DETAIL_MAX_IDS {
+        return Err(AppError::biz(
+            crate::shared::error::code::BIZ_INVALID_VALUE,
+            format!(
+                "ids length exceeds {} (got {})",
+                BATCH_DETAIL_MAX_IDS,
+                ids.len()
+            ),
+        ));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let items = DeliveryNoteService::get_many_with_parts(&mut tx, &ids).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(BatchDeliveryDetailData { items })))
 }
 
 /// GET /api/v2/delivery-notes/candidate-parts?customer_id=...
@@ -551,6 +602,7 @@ fn parse_i64_map_opt(
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ---- delivery-notes/* ----
+        .route("/batch-detail", get(batch_get_delivery_notes)) // ★静态段必须早于 /{id}
         .route("/scan", post(scan_delivery_note))
         .route(
             "/candidate-parts",

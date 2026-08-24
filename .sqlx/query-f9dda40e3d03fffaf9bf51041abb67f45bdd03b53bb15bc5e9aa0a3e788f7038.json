@@ -6,92 +6,200 @@
       {
         "ordinal": 0,
         "name": "id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
       },
       {
         "ordinal": 1,
         "name": "part_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "part_id"
+          }
+        }
       },
       {
         "ordinal": 2,
         "name": "batch_no",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "batch_no"
+          }
+        }
       },
       {
         "ordinal": 3,
         "name": "quantity",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "quantity"
+          }
+        }
       },
       {
         "ordinal": 4,
         "name": "status",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "status"
+          }
+        }
       },
       {
         "ordinal": 5,
         "name": "location",
-        "type_info": "Varchar"
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "location"
+          }
+        }
       },
       {
         "ordinal": 6,
         "name": "current_holder_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "current_holder_id"
+          }
+        }
       },
       {
         "ordinal": 7,
         "name": "next_process_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "next_process_id"
+          }
+        }
       },
       {
         "ordinal": 8,
         "name": "placed_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "placed_at"
+          }
+        }
       },
       {
         "ordinal": 9,
         "name": "delivery_note_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "delivery_note_id"
+          }
+        }
       },
       {
         "ordinal": 10,
         "name": "parent_batch_id",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "parent_batch_id"
+          }
+        }
       },
       {
         "ordinal": 11,
         "name": "has_been_repaired",
-        "type_info": "Bool"
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "has_been_repaired"
+          }
+        }
       },
       {
         "ordinal": 12,
         "name": "version",
-        "type_info": "Int4"
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "version"
+          }
+        }
       },
       {
         "ordinal": 13,
         "name": "created_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "created_at"
+          }
+        }
       },
       {
         "ordinal": 14,
         "name": "created_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "created_by"
+          }
+        }
       },
       {
         "ordinal": 15,
         "name": "updated_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "updated_at"
+          }
+        }
       },
       {
         "ordinal": 16,
         "name": "updated_by",
-        "type_info": "Int8"
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "updated_by"
+          }
+        }
       },
       {
         "ordinal": 17,
         "name": "deleted_at",
-        "type_info": "Timestamp"
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "deleted_at"
+          }
+        }
       }
     ],
     "parameters": {
