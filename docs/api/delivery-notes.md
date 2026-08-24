@@ -101,9 +101,15 @@ Response 200 `data`：`ScanDeliveryOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `serial_no` | string | |
-| `name` | string | |
-| `reason` | string | |
+| `serial_no` | string | 失败子件序列号 |
+| `name` | string | 失败子件名称 |
+| `reason` | string | 失败原因说明 |
+| `part_id` | string (i64)? | 工单 ID；21405 场景下为 `"0"`（无具体 part） |
+| `batch_id` | string (i64)? | 批次 ID；21405 场景下为 `null` |
+| `drawing_no` | string? | 图号；21405 场景下为 `null` |
+| `status` | string? | 工单当前 status（如 `IN_PROCESS` / `READY_TO_SHIP` 等）；21405 场景下为 `null` |
+
+> 21405 场景（零件状态非 READY_TO_SHIP）：`part_id="0"`、其余三字段为 `null`，由前端按 `reason` 文案兜底展示。21418 场景（装配件整套拒绝）：`part_id` 为真实工单 ID，可直接用其构造批量送检请求（见下文 21418 错误码）。
 
 错误码：
 
@@ -111,7 +117,7 @@ Response 200 `data`：`ScanDeliveryOut`
 - 21407 BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS — 单内混客户
 - 21416 BIZ_DELIVERY_NOTE_SCOPE_MISMATCH — 零件分类与送货单范围不符
 - 21417 BIZ_DELIVERY_SCAN_UNKNOWN_CODE — 扫码无法识别
-- 21418 BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY — 装配件整套拒绝（**BizWithFailures**，data.failures 含跳过明细）
+- 21418 BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY — 装配件整套拒绝（**BizWithFailures**，data.failures 含跳过明细）。前端可基于 `data.failures[].part_id` 构造对 `POST /api/v2/parts/batch-pass-inspection` 的批量送检请求，免去多次 round-trip
 - 40300 FORBIDDEN — 角色不符
 - 40001 VALIDATION_ERROR — 角色不足
 

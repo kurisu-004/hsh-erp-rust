@@ -5,6 +5,7 @@
 > 后端代码变更（**新增 / 修改 / 删除端点**，或**修改 DTO 字段 / 错误码**）后，必须**立即**更新对应模块文件：
 > - [`./auth.md`](./auth.md) — auth 域
 > - [`./users.md`](./users.md) — users 域
+> - [`./parts.md`](./parts.md) — part 域（part-pass-inspection 批量+单件）
 > - [`./delivery-notes.md`](./delivery-notes.md) — delivery_notes 域
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
 > - [`./websocket.md`](./websocket.md) — WebSocket
@@ -134,10 +135,11 @@ HTTP 状态码：
 |---|---|---|---|
 | auth | [`./auth.md`](./auth.md) | 5 | ✅ 完全上线 |
 | users | [`./users.md`](./users.md) | 9 | ✅ 完全上线 |
+| part | [`./parts.md`](./parts.md) | 2 | 🟡 单件+批量通过品检（2026-08-25） |
 | delivery-notes | [`./delivery-notes.md`](./delivery-notes.md) | 17 | ✅ 完全上线（P1–P4） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub |
-| 其他 12 域 | — | 0 | ⚪ 仅占位（见下） |
+| 其他 11 域 | — | 0 | ⚪ 仅占位（见下） |
 
 ---
 
@@ -151,7 +153,6 @@ HTTP 状态码：
 | `work_type` | `/api/v2/work-types` | 同上 |
 | `process` | `/api/v2/processes` | 同上 |
 | `shelf` | `/api/v2/shelves` | 同上 |
-| `part` | `/api/v2/parts` | 同上 |
 | `assembly` | `/api/v2/assemblies` | 同上 |
 | `cnc_program` | `/api/v2/cnc-programs` | 同上 |
 | `part_file` | `/api/v2/part-files` | 同上 |
