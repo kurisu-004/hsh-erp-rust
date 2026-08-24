@@ -44,7 +44,7 @@ SQLX_OFFLINE=true cargo build --release   # CI/Docker 用离线元数据构建
 1. **事务边界在 handler**：handler 里 `state.pool.begin()` → 传 `&mut tx` 给 service → 显式 `tx.commit()`；Drop 自动回滚。repo 用 `impl PgExecutor<'_>` 以同时接受 pool/conn/tx。
 2. **统一响应信封**：handler 返回 `Result<Json<R<T>>, AppError>`。`R { code: 0, message: "ok", data }`；错误由 `AppError::into_response()` 装入同一信封。不做 middleware 后置包装。
 3. **错误码分段契约**（`src/shared/error.rs::code`，与 Python 前端对齐）：0 成功、4xxxx HTTP 语义、5xxxx 系统、2xxxx 业务域（每域一个段，如 201xx 零件/客户、214xx 送货单，新增域错误码先入对应段）。
-4. **权限在服务层**：`CurrentUser` 经 `FromRequestParts` 从 Bearer JWT 解析；service 调 `user.require_role(Role::Manager)?` 守卫。五角色见 `src/auth/rbac.rs`；`ShelfAccount` 用 `can_access_shelf(id)` 校验货架范围。
+4. **权限在服务层**：`CurrentUser` 经 `FromRequestParts` 从 Bearer JWT 解析；JWT 验签后额外查 Redis（`session:tok:<sha256_hex>`）确认 session 仍有效，查不到 → 40105 SESSION_REVOKED。service 调 `user.require_role(Role::Manager)?` 守卫。五角色见 `src/auth/rbac.rs`；`ShelfAccount` 用 `can_access_shelf(id)` 校验货架范围；如需 token 哈希（如 logout），注入 `AuthTokenHash` extractor。
 5. **状态机不写 DB**：`statemachine.rs` 只做内存 enum + `can_transition_to` 迁移表；事件日志由 service 在事务内统一插入。
 6. **WS 广播在 commit 之后**（对齐 Python 延迟广播模式），用 `state.ws_hub.broadcast(...)`。
 7. **路由挂载**：业务 REST 统一 `/api/v2`（与 Python `/api/v1` 并行），WS 在 `/ws/dashboard`。`/api/mcp` 不在本仓库。

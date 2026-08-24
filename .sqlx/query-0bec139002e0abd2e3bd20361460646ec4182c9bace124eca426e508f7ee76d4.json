@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO t_part_batch\n            (id, part_id, batch_no, quantity, status, has_been_repaired,\n             version, created_at, created_by, updated_at, updated_by)\n        VALUES\n            ($1, $11, 1, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),\n            ($2, $11, 2, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),\n            ($3, $11, 3, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),\n            ($4, $11, 4, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),\n            ($5, $11, 5, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),\n            ($6, $11, 6, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),\n            ($7, $11, 7, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),\n            ($8, $11, 8, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),\n            ($9, $11, 9, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),\n            ($10, $11, 10, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0bec139002e0abd2e3bd20361460646ec4182c9bace124eca426e508f7ee76d4"
+}

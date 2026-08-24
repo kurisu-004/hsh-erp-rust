@@ -10,6 +10,7 @@
 //! ensure_database_exists().await;
 //! let pool = test_pool().await;
 //! clean_db(&pool).await;
+//! clean_redis(&redis_pool).await;  // 如需
 //! ```
 //!
 //! 这之后所有表都处于「干净 + 已迁移」状态，可以放心 insert。
@@ -19,8 +20,13 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
+use deadpool_redis::redis::AsyncCommands;
+use deadpool_redis::{Config as RedisConfig, Pool as RedisPool, Runtime as RedisRuntime};
+
+use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
-    AppConfig, AutoCompleteConfig, CosConfig, JwtConfig, SnowflakeConfig,
+    AppConfig, AutoCompleteConfig, CosConfig, JwtConfig, RedisConfig as AppRedisConfig,
+    SnowflakeConfig,
 };
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
@@ -35,6 +41,9 @@ const ADMIN_DATABASE_URL: &str = "postgres://hsh_test:6065161test@localhost:5429
 
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
 const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
+
+/// 测试用 Redis URL：连 `redis-test` 容器（端口6380），db index 15 与 dev 默认 0 隔离。
+const TEST_REDIS_URL: &str = "redis://localhost:6380/15";
 
 /// 第一次跑测试时建 `postgres_rust_test`（已存在则忽略）。
 pub async fn ensure_database_exists() {
@@ -71,6 +80,27 @@ pub async fn test_pool() -> PgPool {
     pool
 }
 
+/// 建测试用 Redis 连接池（db 15，与 dev 默认 db 0 隔离）。
+pub async fn test_redis_pool() -> RedisPool {
+    let cfg = RedisConfig::from_url(TEST_REDIS_URL);
+    cfg.create_pool(Some(RedisRuntime::Tokio1))
+        .expect("create test redis pool — 确认 redis-test 容器在 6380")
+}
+
+/// 清空测试 Redis db（FLUSHDB；与 `clean_db` 配套保证 DB + Redis 状态都干净）。
+///
+/// 仅部分集成测试（如 auth_api）需要；其它测试不引用本函数 —— 故 `dead_code` 抑制。
+#[allow(dead_code)]
+pub async fn clean_redis(pool: &RedisPool) {
+    let mut conn = pool
+        .get()
+        .await
+        .expect("get redis conn from test pool");
+    let _: () = AsyncCommands::flushdb::<()>(&mut conn)
+        .await
+        .expect("flushdb test redis");
+}
+
 /// 清表（auth 链路涉及的最小集）：用户/角色/菜单/角色-菜单/货架。
 /// `schema_migrations`（sqlx 自动维护）不动。
 ///
@@ -89,6 +119,9 @@ pub async fn clean_db(pool: &PgPool) {
 ///
 /// 与 `clean_db` 互补 —— 后者只清 auth 表，本函数负责 P1+ 业务域测试需要的「干净世界」。
 /// 顺序按 FK 依赖自顶向下；CASCADE 兜底防止漏列。
+///
+/// 仅部分集成测试（如 delivery_*）需要；其它测试不引用本函数 —— 故 `dead_code` 抑制。
+#[allow(dead_code)]
 pub async fn clean_business_db(pool: &PgPool) {
     sqlx::query(
         "TRUNCATE \
@@ -105,8 +138,10 @@ pub async fn clean_business_db(pool: &PgPool) {
     .expect("truncate business tables");
 }
 
-/// 构造测试用 AppState：与 main.rs 同形，差别仅在 secret / 数据库 URL。
-pub fn test_state(pool: PgPool) -> Arc<AppState> {
+/// 构造测试用 AppState：与 main.rs 同形，差别仅在 secret / 数据库 / Redis URL。
+///
+/// `redis_pool` 必须事先建立并 `FLUSHDB`；返回的 `Arc<AppState>` 在每个用例内独占。
+pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppState> {
     let config = Arc::new(AppConfig {
         database_url: TEST_DATABASE_URL.to_string(),
         listen_addr: "0.0.0.0:3000".to_string(),
@@ -131,6 +166,11 @@ pub fn test_state(pool: PgPool) -> Arc<AppState> {
             instance: 1,
             seq: 1,
         },
+        redis: AppRedisConfig {
+            url: TEST_REDIS_URL.to_string(),
+            session_ttl_seconds: 3600,
+            pool_max_size: 5,
+        },
         max_request_body_size: 314_572_800,
         auto_complete: AutoCompleteConfig {
             threshold_days: 7,
@@ -146,9 +186,16 @@ pub fn test_state(pool: PgPool) -> Arc<AppState> {
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
     let shutdown = CancellationToken::new();
+    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool));
     Arc::new(AppState::new(
-        pool, config, snowflake, ws_hub, cos, shutdown,
+        pool, config, snowflake, ws_hub, cos, shutdown, session,
     ))
+}
+
+/// 测试便捷入口：只传 PgPool，自动建 Redis 池（db 15，与 dev 隔离）。
+pub async fn test_state(pool: PgPool) -> Arc<AppState> {
+    let redis_pool = test_redis_pool().await;
+    test_state_with_redis(pool, redis_pool)
 }
 
 /// axum Router：与 main.rs 中的 `/api/v2` nest 同形。
@@ -189,6 +236,7 @@ pub async fn insert_user_with_password(
 }
 
 /// 插一个 is_active=false 的用户（用于测试「已停用账号」拒绝登录）
+#[allow(dead_code)]
 pub async fn insert_inactive_user(
     pool: &PgPool,
     username: &str,
@@ -246,6 +294,7 @@ pub async fn add_role(
     id
 }
 
+#[allow(dead_code)]
 pub async fn insert_menu(
     pool: &PgPool,
     code: &str,
@@ -275,6 +324,7 @@ pub async fn insert_menu(
     id
 }
 
+#[allow(dead_code)]
 pub async fn add_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -294,6 +344,7 @@ pub async fn add_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
     .expect("insert t_role_menu");
 }
 
+#[allow(dead_code)]
 pub async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -317,6 +368,7 @@ pub async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> 
 }
 
 /// 取 user 当前 `refresh_token_version`
+#[allow(dead_code)]
 pub async fn get_refresh_token_version(pool: &PgPool, user_id: i64) -> i32 {
     let row = sqlx::query!(
         "SELECT refresh_token_version AS \"ver!\" FROM t_user WHERE id = $1",

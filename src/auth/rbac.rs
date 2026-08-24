@@ -23,6 +23,23 @@ use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 
 use crate::shared::error::{code, AppError};
 
+/// 把 DB / Redis 缓存里的大写 role 字符串转回 `Role` 枚举。
+///
+/// 仅识别 5 种已知值；未知值打 `tracing::warn!` 并返回 `None`，调用方自行决定是否跳过。
+pub fn parse_role_str_or_warn(s: &str) -> Option<Role> {
+    Some(match s {
+        "MANAGER" => Role::Manager,
+        "CLERK" => Role::Clerk,
+        "INSPECTOR" => Role::Inspector,
+        "CNC_PROGRAMMER" => Role::CncProgrammer,
+        "SHELF_ACCOUNT" => Role::ShelfAccount,
+        _ => {
+            tracing::warn!(role = %s, "未知 role 字符串，跳过");
+            return None;
+        }
+    })
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Role {
     #[serde(rename = "MANAGER")]
@@ -66,6 +83,7 @@ fn default_access_type() -> String {
 /// `Claims.sub` 反序列化 helper：
 /// - Rust 自签：`"sub": 123`（i64）
 /// - Python v1：`"sub": "123"`（数字串）
+///
 /// 两种都解析为 `i64`。
 fn deserialize_sub_or_int<'de, D>(deserializer: D) -> Result<i64, D::Error>
 where

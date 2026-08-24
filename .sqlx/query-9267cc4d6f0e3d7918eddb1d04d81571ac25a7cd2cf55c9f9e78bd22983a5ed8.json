@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9267cc4d6f0e3d7918eddb1d04d81571ac25a7cd2cf55c9f9e78bd22983a5ed8"
+}

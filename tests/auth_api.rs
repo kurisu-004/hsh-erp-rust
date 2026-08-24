@@ -23,9 +23,9 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use common::{
-    add_role, add_role_menu, clean_db, ensure_database_exists, get_refresh_token_version,
-    insert_inactive_user, insert_menu, insert_shelf, insert_user_with_password, test_app,
-    test_pool, test_state,
+    add_role, add_role_menu, clean_db, clean_redis, ensure_database_exists,
+    get_refresh_token_version, insert_inactive_user, insert_menu, insert_shelf,
+    insert_user_with_password, test_app, test_pool, test_redis_pool, test_state,
 };
 
 // ===========================================================================
@@ -111,7 +111,7 @@ async fn login_success_returns_token_pair_and_stamps_last_login() {
     let uid = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
 
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state);
 
     let (status, env) = login_admin(app, "admin", "changeme").await;
@@ -143,7 +143,7 @@ async fn login_unknown_user_returns_40101() {
     let (_guard, pool) = setup().await;
     let _ = pool;
 
-    let state = test_state(pool);
+    let state = test_state(pool).await;
     let app = test_app(state);
 
     let (status, env) = login_admin(app, "ghost", "whatever").await;
@@ -157,7 +157,7 @@ async fn login_wrong_password_returns_40101() {
 
     insert_user_with_password(&pool, "admin", "changeme").await;
 
-    let state = test_state(pool);
+    let state = test_state(pool).await;
     let app = test_app(state);
 
     let (status, env) = login_admin(app, "admin", "wrong").await;
@@ -171,7 +171,7 @@ async fn login_inactive_user_returns_40101() {
 
     insert_inactive_user(&pool, "admin", "changeme").await;
 
-    let state = test_state(pool);
+    let state = test_state(pool).await;
     let app = test_app(state);
 
     let (status, env) = login_admin(app, "admin", "changeme").await;
@@ -186,7 +186,7 @@ async fn login_user_with_no_roles_returns_403_20606() {
     insert_user_with_password(&pool, "lonely", "changeme").await;
     // 不插角色
 
-    let state = test_state(pool);
+    let state = test_state(pool).await;
     let app = test_app(state);
 
     let (status, env) = login_admin(app, "lonely", "changeme").await;
@@ -201,7 +201,7 @@ async fn me_success_returns_full_user_view() {
     let uid = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
 
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
 
     let (_, login_env) = login_admin(app, "admin", "changeme").await;
@@ -228,7 +228,7 @@ async fn me_without_authorization_returns_401() {
     let (_guard, pool) = setup().await;
     let _ = pool;
 
-    let state = test_state(pool);
+    let state = test_state(pool).await;
     let app = test_app(state);
 
     let (status, env) = send(app, json_request("GET", "/auth/me", None, None)).await;
@@ -243,7 +243,7 @@ async fn refresh_rotates_token_and_bumps_version() {
     let uid = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
 
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
 
     let (_, login_env) = login_admin(app, "admin", "changeme").await;
@@ -278,7 +278,7 @@ async fn refresh_reusing_old_token_returns_40103() {
     let uid = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
 
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
 
     let (_, login_env) = login_admin(app, "admin", "changeme").await;
@@ -322,7 +322,7 @@ async fn change_password_invalidates_old_refresh_token() {
     let uid = get_user_id(&pool, "admin").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
 
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
 
     let (_, login_env) = login_admin(app, "admin", "changeme").await;
@@ -367,7 +367,7 @@ async fn change_password_wrong_old_password_returns_40104() {
     let uid = get_user_id(&pool, "admin").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
 
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, login_env) = login_admin(app, "admin", "changeme").await;
     let token = login_env["data"]["token"].as_str().unwrap().to_string();
@@ -397,7 +397,7 @@ async fn list_users_without_manager_role_returns_403() {
     let clerk_id = insert_user_with_password(&pool, "clerk", "changeme").await;
     add_role(&pool, clerk_id, "CLERK", None, None).await;
 
-    let state = test_state(pool);
+    let state = test_state(pool).await;
     let app = test_app(state.clone());
     let (_, login_env) = login_admin(app, "clerk", "changeme").await;
     let clerk_token = login_env["data"]["token"].as_str().unwrap().to_string();
@@ -417,7 +417,7 @@ async fn add_shelf_account_role_succeeds_for_manager() {
     let target_id = insert_user_with_password(&pool, "shelfie", "changeme").await;
     let shelf_id = insert_shelf(&pool, "SH-A1", "A1 货架", "PRODUCTION").await;
 
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, login_env) = login_admin(app, "admin", "changeme").await;
     let admin_token = login_env["data"]["token"].as_str().unwrap().to_string();
@@ -453,7 +453,7 @@ async fn add_duplicate_role_returns_409() {
     let target_id = insert_user_with_password(&pool, "shelfie", "changeme").await;
     let shelf_id = insert_shelf(&pool, "SH-B1", "B1 货架", "INSPECTION").await;
 
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, login_env) = login_admin(app, "admin", "changeme").await;
     let admin_token = login_env["data"]["token"].as_str().unwrap().to_string();
@@ -483,6 +483,175 @@ async fn add_duplicate_role_returns_409() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(env["code"], 20604);
+}
+
+// ===========================================================================
+// Redis session 集成测试（方案：redis-session-deadpool-redis-0-23）
+//
+// 3 个 case 共享 setup 形态：ensure_db → 池 + 迁移 → clean_db → clean_redis → test_state。
+// TEST_LOCK 串行避免 fixture 冲突（与既有测试同模式）。
+// ===========================================================================
+
+/// 扩展 setup：除 DB 外再 FLUSHDB 测试 Redis db 15，保证 session 状态干净。
+async fn setup_with_redis<'a>()
+-> (tokio::sync::MutexGuard<'a, ()>, sqlx::PgPool, deadpool_redis::Pool) {
+    let guard = TEST_LOCK.lock().await;
+    ensure_database_exists().await;
+    let pg_pool = test_pool().await;
+    clean_db(&pg_pool).await;
+    let redis_pool = test_redis_pool().await;
+    clean_redis(&redis_pool).await;
+    (guard, pg_pool, redis_pool)
+}
+
+#[tokio::test]
+async fn logout_kills_current_session() {
+    let (_guard, pool, redis_pool) = setup_with_redis().await;
+
+    insert_user_with_password(&pool, "admin", "changeme").await;
+    let uid = get_user_id(&pool, "admin").await;
+    add_role(&pool, uid, "MANAGER", None, None).await;
+
+    let state = common::test_state_with_redis(pool.clone(), redis_pool);
+    let app = test_app(state.clone());
+
+    // 1) login → token A
+    let (_, login_env) = login_admin(app, "admin", "changeme").await;
+    let token_a = login_env["data"]["token"].as_str().unwrap().to_string();
+
+    // 2) /me(A) 200
+    let app2 = test_app(state.clone());
+    let (s, _) = send(app2, json_request("GET", "/auth/me", None, Some(&token_a))).await;
+    assert_eq!(s, StatusCode::OK, "login 后 /me 必须 200");
+
+    // 3) logout(A) 200
+    let app3 = test_app(state.clone());
+    let (lo_status, lo_env) = send(app3, json_request("POST", "/auth/logout", None, Some(&token_a))).await;
+    assert_eq!(lo_status, StatusCode::OK, "logout 200: {lo_env}");
+
+    // 4) /me(A) → 40105（SESSION_REVOKED）
+    let app4 = test_app(state);
+    let (status, env) = send(app4, json_request("GET", "/auth/me", None, Some(&token_a))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "logout 后 /me 必须 401: {env}");
+    assert_eq!(env["code"], 40105, "必须是 SESSION_REVOKED: {env}");
+}
+
+#[tokio::test]
+async fn change_password_kills_all_sessions() {
+    let (_guard, pool, redis_pool) = setup_with_redis().await;
+
+    insert_user_with_password(&pool, "admin", "changeme").await;
+    let uid = get_user_id(&pool, "admin").await;
+    add_role(&pool, uid, "MANAGER", None, None).await;
+
+    let state = common::test_state_with_redis(pool.clone(), redis_pool);
+    let app = test_app(state.clone());
+
+    // 1) 同账号两次登录拿 token A、B
+    let (_, login_a) = login_admin(app, "admin", "changeme").await;
+    let token_a = login_a["data"]["token"].as_str().unwrap().to_string();
+    let app2 = test_app(state.clone());
+    let (_, login_b) = login_admin(app2, "admin", "changeme").await;
+    let token_b = login_b["data"]["token"].as_str().unwrap().to_string();
+    assert_ne!(token_a, token_b, "两次登录应生成不同 token");
+
+    // 2) /me(A) 200、/me(B) 200
+    let app3 = test_app(state.clone());
+    let (s_a, _) = send(app3, json_request("GET", "/auth/me", None, Some(&token_a))).await;
+    assert_eq!(s_a, StatusCode::OK);
+    let app4 = test_app(state.clone());
+    let (s_b, _) = send(app4, json_request("GET", "/auth/me", None, Some(&token_b))).await;
+    assert_eq!(s_b, StatusCode::OK);
+
+    // 3) 用 A 改密
+    let app5 = test_app(state.clone());
+    let (cp_status, cp_env) = send(
+        app5,
+        json_request(
+            "POST",
+            "/auth/change-password",
+            Some(json!({"old_password": "changeme", "new_password": "newpass"})),
+            Some(&token_a),
+        ),
+    )
+    .await;
+    assert_eq!(cp_status, StatusCode::OK, "change-password: {cp_env}");
+
+    // 4) /me(A) → 40105、/me(B) → 40105（双 session 全清）
+    let app6 = test_app(state.clone());
+    let (s1, e1) = send(app6, json_request("GET", "/auth/me", None, Some(&token_a))).await;
+    assert_eq!(s1, StatusCode::UNAUTHORIZED);
+    assert_eq!(e1["code"], 40105, "A 应被吊销: {e1}");
+
+    let app7 = test_app(state);
+    let (s2, e2) = send(app7, json_request("GET", "/auth/me", None, Some(&token_b))).await;
+    assert_eq!(s2, StatusCode::UNAUTHORIZED);
+    assert_eq!(e2["code"], 40105, "B 应被吊销: {e2}");
+}
+
+#[tokio::test]
+async fn refresh_transitions_old_session_to_new() {
+    let (_guard, pool, redis_pool) = setup_with_redis().await;
+
+    insert_user_with_password(&pool, "admin", "changeme").await;
+    let uid = get_user_id(&pool, "admin").await;
+    add_role(&pool, uid, "MANAGER", None, None).await;
+
+    let state = common::test_state_with_redis(pool.clone(), redis_pool);
+    let app = test_app(state.clone());
+
+    // 1) login → A (access) + R (refresh)
+    let (_, login_env) = login_admin(app, "admin", "changeme").await;
+    let token_a = login_env["data"]["token"].as_str().unwrap().to_string();
+    let refresh_r = login_env["data"]["refresh_token"].as_str().unwrap().to_string();
+
+    // 2) /me(A) 200
+    let app2 = test_app(state.clone());
+    let (s, _) = send(app2, json_request("GET", "/auth/me", None, Some(&token_a))).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // 3) refresh(R) → 新 pair (A2, R2)
+    let app3 = test_app(state.clone());
+    let (ref_status, ref_env) = send(
+        app3,
+        json_request(
+            "POST",
+            "/auth/refresh",
+            Some(json!({"refresh_token": refresh_r.clone()})),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(ref_status, StatusCode::OK, "refresh 成功: {ref_env}");
+    let token_a2 = ref_env["data"]["token"].as_str().unwrap().to_string();
+    let refresh_r2 = ref_env["data"]["refresh_token"].as_str().unwrap().to_string();
+    assert_ne!(token_a2, token_a);
+    assert_ne!(refresh_r2, refresh_r);
+
+    // 4) /me(A2) 200（新 access 立即可用）
+    let app4 = test_app(state.clone());
+    let (s2, _) = send(app4, json_request("GET", "/auth/me", None, Some(&token_a2))).await;
+    assert_eq!(s2, StatusCode::OK, "新 access token 必须立即可用");
+
+    // 5) 旧 refresh(R) 再用 → 40103（已被 Redis 删，且 DB version 也轮转了）
+    let app5 = test_app(state.clone());
+    let (s_old_ref, env_old_ref) = send(
+        app5,
+        json_request(
+            "POST",
+            "/auth/refresh",
+            Some(json!({"refresh_token": refresh_r})),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(s_old_ref, StatusCode::UNAUTHORIZED, "旧 refresh 必失效");
+    assert_eq!(env_old_ref["code"], 40103, "旧 refresh → 40103: {env_old_ref}");
+
+    // 6) 旧 access(A) 仍有效（refresh 只删 refresh 条目；access 走自然过期）
+    let app6 = test_app(state);
+    let (s_old_a, env_old_a) = send(app6, json_request("GET", "/auth/me", None, Some(&token_a))).await;
+    assert_eq!(s_old_a, StatusCode::OK, "旧 access 在自然到期前仍可用: {env_old_a}");
 }
 
 // ===========================================================================

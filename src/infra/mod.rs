@@ -8,11 +8,13 @@
 //! - `clock`：Asia/Shanghai 时区工具
 //! - `serial`：业务单号/序列号计数（占位）
 //! - `ws_hub`：WebSocket 广播中枢
+//! - `redis`：Redis 连接池构建（deadpool-redis 0.23，session store 用）
 
 pub mod clock;
 pub mod config;
 pub mod cos;
 pub mod db;
+pub mod redis;
 pub mod serial;
 pub mod snowflake;
 pub mod ws_hub;

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
+use crate::auth::session::SessionStore;
 use crate::infra::config::AppConfig;
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
@@ -20,6 +21,8 @@ pub struct AppState {
     pub ws_hub: Arc<WsHub>,
     pub cos: Arc<dyn CosClient>,
     pub shutdown: CancellationToken,
+    /// Redis 服务端 session 真相源（access/refresh token 吊销）
+    pub session: Arc<dyn SessionStore>,
 }
 
 impl AppState {
@@ -31,6 +34,7 @@ impl AppState {
         ws_hub: Arc<WsHub>,
         cos: Arc<dyn CosClient>,
         shutdown: CancellationToken,
+        session: Arc<dyn SessionStore>,
     ) -> Self {
         Self {
             pool,
@@ -39,6 +43,7 @@ impl AppState {
             ws_hub,
             cos,
             shutdown,
+            session,
         }
     }
 }

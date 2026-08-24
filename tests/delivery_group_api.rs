@@ -77,7 +77,7 @@ async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env) = send(
         app,

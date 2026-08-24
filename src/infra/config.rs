@@ -15,10 +15,22 @@ pub struct AppConfig {
     pub snowflake: SnowflakeConfig,
     pub max_request_body_size: usize,
     pub auto_complete: AutoCompleteConfig,
+/// Redis 会话存储（服务端 session 真相源；access token 吊销依赖）
+    pub redis: RedisConfig,
     /// 送货单 Excel 模板目录（P4 打印）。环境变量 `DELIVERY_NOTE_TEMPLATE_DIR`
     /// 优先；缺省回退到编译期绝对路径 `<CARGO_MANIFEST_DIR>/template`，
     /// 因此本地 `cargo run` 不依赖 cwd。
     pub delivery_note_template_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct RedisConfig {
+    /// 完整 Redis URL（优先 `REDIS_URL`，否则从 `REDIS_HOST/PORT/DB/PASSWORD` 拼接）
+    pub url: String,
+    /// session 条目 TTL（秒），对应 JWT `access_ttl_hours` 的预期寿命；滑动窗口
+    pub session_ttl_seconds: u64,
+    /// 连接池上限
+    pub pool_max_size: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +108,13 @@ impl AppConfig {
                 interval_hours: env_parse("AUTO_COMPLETE_INTERVAL_HOURS", 24)?,
             },
 
+redis: RedisConfig {
+                url: build_redis_url(),
+                // 默认 12h，对齐 JWT_ACCESS_TOKEN_EXPIRE_HOURS=24 的常见一半；
+                // Redis 滑动 TTL 在 extractor 中 EXPIRE 续期
+                session_ttl_seconds: env_parse("REDIS_SESSION_TTL_SECONDS", 43_200u64)?,
+                pool_max_size: env_parse("REDIS_POOL_MAX_SIZE", 10usize)?,
+            },
             delivery_note_template_dir: PathBuf::from(env_or(
                 "DELIVERY_NOTE_TEMPLATE_DIR",
                 concat!(env!("CARGO_MANIFEST_DIR"), "/template"),
@@ -136,6 +155,27 @@ pub fn build_test_database_url() -> Result<String> {
     let db = env_required("POSTGRES_TEST_DB")?;
 
     Ok(format!("postgresql://{user}:{password}@{host}:{port}/{db}"))
+}
+
+/// 从环境变量构建 Redis 连接 URL（session store）
+///
+/// 两层回退：优先 `REDIS_URL`（含密码 / db index），否则按 `REDIS_HOST/PORT/DB/PASSWORD`
+ /// 拼接（dev/test 默认即可）。注意测试容器走 `redis://localhost:6380/15`（与
+ /// dev 的 db 0 隔离）。
+pub fn build_redis_url() -> String {
+    if let Ok(url) = env::var("REDIS_URL") {
+        return url;
+    }
+
+    let host = env_or("REDIS_HOST", "localhost");
+    let port = env_or("REDIS_PORT", "6379");
+    let db = env_or("REDIS_DB", "0");
+    let password = env::var("REDIS_PASSWORD").ok();
+
+    match password.as_deref() {
+        Some(pw) if !pw.is_empty() => format!("redis://:{pw}@{host}:{port}/{db}"),
+        _ => format!("redis://{host}:{port}/{db}"),
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {

@@ -87,7 +87,7 @@ async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env) = send(
         app,
@@ -991,6 +991,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
     let _ = rx; // unused
 
     // driver → PICKED_UP
+    let redis_pool = common::test_redis_pool().await;
     let state = hsh_erp_rust::state::AppState::new(
         pool.clone(),
         std::sync::Arc::new(hsh_erp_rust::infra::config::AppConfig::from_env(".env").unwrap()),
@@ -998,6 +999,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
         std::sync::Arc::new(hsh_erp_rust::infra::ws_hub::WsHub::default()),
         std::sync::Arc::new(hsh_erp_rust::infra::cos::NoopCos),
         tokio_util::sync::CancellationToken::new(),
+        std::sync::Arc::new(hsh_erp_rust::auth::session::RedisSessionStore::new(redis_pool)),
     );
     let _ = state; // unused — pickup 测试通过 app 走
 

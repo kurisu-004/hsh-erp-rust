@@ -13,6 +13,7 @@
 //! 待 205xx / 201xx 段补齐后可无损替换。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use sqlx::PgConnection;
 
@@ -21,6 +22,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::shared::error::{code, AppError};
+use crate::state::AppState;
 
 use super::dto::{
     CurrentUserOut, MenuNodeOut, UserAddRoleRequest, UserCreateRequest, UserListOut, UserListQuery,
@@ -280,12 +282,14 @@ impl UserService {
     /// 自助改密：校验旧密码，写新哈希并轮转 refresh token（同一条 UPDATE，原子）。
     ///
     /// 允许本人或 MANAGER 调用。注意与 `update_user` 的区别：这里**会**踢下线。
+    /// `state` 用于 DB 提交后 best-effort 清该用户的 Redis session（双保险）。
     pub async fn change_own_password(
         conn: &mut PgConnection,
         user_id: i64,
         old_password: &str,
         new_password: &str,
         current: &CurrentUser,
+        state: &Arc<AppState>,
     ) -> Result<(), AppError> {
         if user_id != current.id && !current.has_role(Role::Manager) {
             return Err(AppError::biz(code::FORBIDDEN, "只能修改本人密码"));
@@ -321,14 +325,20 @@ impl UserService {
         if affected == 0 {
             return Err(version_conflict());
         }
+        // DB 提交后清该用户的 Redis session（best-effort；DB 的 refresh_token_version 轮转是兜底）
+        if let Err(e) = state.session.delete_all_user_sessions(user_id).await {
+            tracing::warn!(error = %e, user_id, "change_own_password: 清 session 失败");
+        }
         Ok(())
     }
 
     /// 管理员重置密码为默认口令 `changeme`，并轮转 refresh token（踢下线）。
+    /// `state` 用于 DB 提交后 best-effort 清该用户的 Redis session。
     pub async fn admin_reset_password(
         conn: &mut PgConnection,
         user_id: i64,
         current: &CurrentUser,
+        state: &Arc<AppState>,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
 
@@ -352,7 +362,12 @@ impl UserService {
         let updated = UserRepo::get_by_id(&mut *conn, user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
-        Self::to_user_out(conn, updated).await
+        let out = Self::to_user_out(conn, updated).await?;
+        // DB 提交后清该用户的 Redis session（best-effort）
+        if let Err(e) = state.session.delete_all_user_sessions(user_id).await {
+            tracing::warn!(error = %e, user_id, "admin_reset_password: 清 session 失败");
+        }
+        Ok(out)
     }
 
     // =======================================================================
