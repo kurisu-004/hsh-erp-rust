@@ -152,40 +152,11 @@ impl PartService {
             ));
         }
 
-        // 多轮 rollup 守卫：仅当无其它 INSPECTION 批次时才翻 `t_part.status`。
-        // 否则其它批次仍在 INSPECTION 状态，工单必须保留 INSPECTION
-        // （对齐 Python `_rollup_part_status` 的 `least(batches.status)` 语义）。
-        let other_inprocess =
-            PartRepo::count_other_inprocess_batches(&mut *conn, part_id).await?;
-        if other_inprocess > 0 {
-            // 还有别的 INSPECTION 批次存在，跳过 part.status 翻转；
-            // 批次状态由 `t_part_batch` 自身记录（含 updated_by），
-            // 工单保留 INSPECTION 即可。返回读到的旧 `PartOut`。
-            let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished"))
-                })?;
-            return Ok(PartOut::from(fresh));
-        }
-
-        // 6. UPDATE t_part: 同步工单状态（OCC + 写 updated_by）。这一步解决
-        //    `PartOut.status` 在响应中仍为旧值 INSPECTION 的契约漏洞。
-        let n = PartRepo::mark_part_passed_inspection(
-            &mut *conn,
-            part_id,
-            part.version,
-            Some(current.id),
-        )
-        .await?;
-        if n == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("part {part_id} 版本冲突"),
-            ));
-        }
-
-        // 7. 写 t_part_event 事件日志。事件 id 走雪花生成（App 侧生成，DB 默认列对齐）。
+        // 6. 写 t_part_event 事件日志（无条件）。事件 id 走雪花生成（App 侧生成，
+        //    DB 默认列对齐）。这一步**必须在多轮 rollup 守卫之前**：即便工单因其它
+        //    INSPECTION 批次残留而保留 INSPECTION 状态，本次批次通过的事实仍要
+        //    留痕（与 batch 自身的 status 翻转同步落库），否则审计日志会丢失
+        //    multi-batch 场景下的 batch-pass 事件。
         let event_id = _snowflake.next_id();
         PartRepo::insert_part_event(
             &mut *conn,
@@ -204,6 +175,39 @@ impl PartService {
             },
         )
         .await?;
+
+        // 多轮 rollup 守卫：仅当无其它 INSPECTION 批次时才翻 `t_part.status`。
+        // 否则其它批次仍在 INSPECTION 状态，工单必须保留 INSPECTION
+        // （对齐 Python `_rollup_part_status` 的 `least(batches.status)` 语义）。
+        let other_inprocess =
+            PartRepo::count_other_inprocess_batches(&mut *conn, part_id).await?;
+        if other_inprocess > 0 {
+            // 还有别的 INSPECTION 批次存在，跳过 part.status 翻转；
+            // 批次状态由 `t_part_batch` 自身记录（含 updated_by），事件日志
+            // 已在上一步无条件写入。工单保留 INSPECTION，返回读到的旧 `PartOut`。
+            let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished"))
+                })?;
+            return Ok(PartOut::from(fresh));
+        }
+
+        // 7. UPDATE t_part: 同步工单状态（OCC + 写 updated_by）。这一步解决
+        //    `PartOut.status` 在响应中仍为旧值 INSPECTION 的契约漏洞。
+        let n = PartRepo::mark_part_passed_inspection(
+            &mut *conn,
+            part_id,
+            part.version,
+            Some(current.id),
+        )
+        .await?;
+        if n == 0 {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                format!("part {part_id} 版本冲突"),
+            ));
+        }
 
         // 8. 重新读最新 part 状态返回（t_part.version+1，status=READY_TO_SHIP）。
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
