@@ -560,6 +560,37 @@ async fn scan_assembly_atomic_reject_with_failures() {
         .any(|f| f["serial_no"] == "Z0001" && f["reason"].as_str().unwrap_or("").contains("IN_PROCESS"));
     assert!(any_bad, "failures 应含 Z0001+IN_PROCESS; got: {failures:?}");
 
+    // ScanFailureDto 4 字段断言：part_id / batch_id / drawing_no / status
+    // (Task 4 扩字段；Task 6 跟进端到端契约验证)
+    let bad = failures
+        .iter()
+        .find(|f| f["serial_no"] == "Z0001")
+        .expect("Z0001 in failures");
+    // part_id 走 serialize_i64 → JSON string
+    assert!(
+        bad["part_id"].is_string(),
+        "part_id 应为 string: {bad}"
+    );
+    let bad_pid: i64 = bad["part_id"]
+        .as_str()
+        .expect("part_id string")
+        .parse()
+        .expect("parse part_id");
+    assert!(bad_pid > 0, "part_id 应 > 0; got {bad_pid}");
+    // batch_id 与 drawing_no / status 在 not-ready 分支填全
+    assert!(
+        bad["batch_id"].is_string(),
+        "batch_id 应为 string: {bad}"
+    );
+    let bad_bid: i64 = bad["batch_id"]
+        .as_str()
+        .expect("batch_id string")
+        .parse()
+        .expect("parse batch_id");
+    assert!(bad_bid > 0, "batch_id 应 > 0; got {bad_bid}");
+    assert_eq!(bad["drawing_no"], "D-001");
+    assert_eq!(bad["status"], "IN_PROCESS");
+
     // 整单回滚：no batch attached
     let count: i64 = sqlx::query_scalar!(
         "SELECT COUNT(*) AS \"c!\" FROM t_part_batch \
