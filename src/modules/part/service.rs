@@ -137,11 +137,12 @@ impl PartService {
             ));
         }
 
-        // 5. UPDATE t_part_batch: INSPECTION → READY_TO_SHIP（OCC）。
+        // 5. UPDATE t_part_batch: INSPECTION → READY_TO_SHIP（OCC + 写 updated_by）。
         let n = PartRepo::mark_batch_passed_inspection(
             &mut *conn,
             target.id,
             target.version,
+            Some(current.id),
         )
         .await?;
         if n == 0 {
@@ -151,10 +152,32 @@ impl PartService {
             ));
         }
 
-        // 6. UPDATE t_part: 同步工单状态（OCC）。这一步解决 `PartOut.status`
-        //    在响应中仍为旧值 INSPECTION 的契约漏洞。
-        let n = PartRepo::mark_part_passed_inspection(&mut *conn, part_id, part.version)
-            .await?;
+        // 多轮 rollup 守卫：仅当无其它 INSPECTION 批次时才翻 `t_part.status`。
+        // 否则其它批次仍在 INSPECTION 状态，工单必须保留 INSPECTION
+        // （对齐 Python `_rollup_part_status` 的 `least(batches.status)` 语义）。
+        let other_inprocess =
+            PartRepo::count_other_inprocess_batches(&mut *conn, part_id).await?;
+        if other_inprocess > 0 {
+            // 还有别的 INSPECTION 批次存在，跳过 part.status 翻转；
+            // 批次状态由 `t_part_batch` 自身记录（含 updated_by），
+            // 工单保留 INSPECTION 即可。返回读到的旧 `PartOut`。
+            let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished"))
+                })?;
+            return Ok(PartOut::from(fresh));
+        }
+
+        // 6. UPDATE t_part: 同步工单状态（OCC + 写 updated_by）。这一步解决
+        //    `PartOut.status` 在响应中仍为旧值 INSPECTION 的契约漏洞。
+        let n = PartRepo::mark_part_passed_inspection(
+            &mut *conn,
+            part_id,
+            part.version,
+            Some(current.id),
+        )
+        .await?;
         if n == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,

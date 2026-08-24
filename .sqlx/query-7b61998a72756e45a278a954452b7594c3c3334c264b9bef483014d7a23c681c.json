@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part_batch\n            SET status     = 'READY_TO_SHIP',\n                version    = version + 1,\n                updated_at = now(),\n                updated_by = $3\n            WHERE id = $1 AND version = $2 AND status = 'INSPECTION'\n              AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7b61998a72756e45a278a954452b7594c3c3334c264b9bef483014d7a23c681c"
+}

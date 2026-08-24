@@ -12,6 +12,8 @@
 //! - `get_part_inspected` —— pass_inspection 专用最小投影（含 status/version/quantity 等）
 //! - `find_inprocess_batch_for_part` —— 定位 INSPECTION 批次（支持 owner 校验）
 //! - `mark_batch_passed_inspection` —— 批量通过（status INSPECTION → READY_TO_SHIP）
+//! - `mark_part_passed_inspection` —— pass_inspection 后同步工单状态（OCC UPDATE `t_part.status`）
+//! - `count_other_inprocess_batches` —— 多轮 rollup 守卫（>0 时不翻 `t_part.status`）
 //! - `split_batch_for_partial_pass` —— 部分通过：拆 INSPECTION 批次
 //! - `insert_part_event` —— 写 `t_part_event` 事件日志
 //!
@@ -238,7 +240,11 @@ impl PartRepo {
     /// 批量通过（OCC UPDATE）。
     ///
     /// - 0 行 → 版本冲突 / 状态非 INSPECTION / 已软删 —— 由 service 层映射为 `40901`。
-    /// - 成功 → `status = 'READY_TO_SHIP'`，`version += 1`，`updated_at = now()`。
+    /// - 成功 → `status = 'READY_TO_SHIP'`，`version += 1`，`updated_at = now()`，
+    ///   `updated_by = current_user_id`。
+    ///
+    /// `current_user_id` 写入审计列 `t_part_batch.updated_by`（与 split 等
+    /// 其它写入路径保持一致；nullable 以兼容 caller 不持有的场景）。
     ///
     /// **未触碰 `t_part` 行**：工单（`t_part`）的状态翻转由 service 层在事务内
     /// 紧接着调用 [`Self::mark_part_passed_inspection`] 完成 —— 这样
@@ -251,18 +257,21 @@ impl PartRepo {
         executor: E,
         batch_id: i64,
         expected_version: i32,
+        current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query!(
             r#"
             UPDATE t_part_batch
             SET status     = 'READY_TO_SHIP',
                 version    = version + 1,
-                updated_at = now()
+                updated_at = now(),
+                updated_by = $3
             WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
               AND deleted_at IS NULL
             "#,
             batch_id,
             expected_version,
+            current_user_id,
         )
         .execute(executor)
         .await?;
@@ -273,10 +282,20 @@ impl PartRepo {
     ///
     /// - 0 行 → 工单已被并发修改（version 不匹配）/ 状态非 INSPECTION /
     ///   已软删 —— 由 service 层映射为 `40901 / VERSION_CONFLICT`。
-    /// - 成功 → `status = 'READY_TO_SHIP'`，`version += 1`，`updated_at = now()`。
+    /// - 成功 → `status = 'READY_TO_SHIP'`，`version += 1`，`updated_at = now()`，
+    ///   `updated_by = current_user_id`。
+    ///
+    /// `current_user_id` 写入审计列 `t_part.updated_by`，与 split 等其它
+    /// 写入路径保持一致（nullable 兼容 caller 不持有的场景）。
     ///
     /// **必须与 [`Self::mark_batch_passed_inspection`] 在同一事务内调用**，否则
     /// 可能出现 batch 已翻 READY_TO_SHIP 但工单仍 INSPECTION 的不一致窗口。
+    ///
+    /// **多轮部分送检 rollup**：本方法只在 `service::pass_inspection_core`
+    /// 确认 `count_other_inprocess_batches == 0` 后才调用 —— 否则部分批次
+    /// 送检通过会把工单错误地翻成 `READY_TO_SHIP`，而其它 INSPECTION 批次
+    /// 仍存在（对齐 Python `_rollup_part_status` 的 `least(batches.status)`
+    /// 语义）。
     ///
     /// 设计取舍：本方法只翻 `status` + `version`，不更新 `location` /
     /// `current_holder_id` / `next_process_id`。Python `service/_pass_inspection.py`
@@ -287,22 +306,52 @@ impl PartRepo {
         executor: E,
         part_id: i64,
         expected_version: i32,
+        current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query!(
             r#"
             UPDATE t_part
             SET status     = 'READY_TO_SHIP',
                 version    = version + 1,
-                updated_at = now()
+                updated_at = now(),
+                updated_by = $3
             WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
               AND deleted_at IS NULL
             "#,
             part_id,
             expected_version,
+            current_user_id,
         )
         .execute(executor)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// 统计 part 仍处于 INSPECTION 状态的非软删批次数量。
+    ///
+    /// 用于 `pass_inspection_core` 多轮 rollup 守卫：每次送检一批通过后，
+    /// 在翻 `t_part.status` 前调用本方法，若结果 > 0 则说明还有其它 INSPECTION
+    /// 批次存在，工单必须保留 `INSPECTION` 状态（与 Python `_rollup_part_status`
+    /// `least(batches.status)` 语义对齐）。返回 `i64`（而非 `bool`）便于
+    /// caller 后续做更复杂的 rollup（如记录 metric）。
+    ///
+    /// 注：本方法只计 INSPECTION，不包含其它在途状态（如已被并发翻成 READY_TO_SHIP
+    /// 的批次的回归检测）。若需要全部在途状态计数，迁移 schema 时再加。
+    pub async fn count_other_inprocess_batches<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+    ) -> Result<i64, sqlx::Error> {
+        let count: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) AS "n!"
+            FROM t_part_batch
+            WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL
+            "#,
+            part_id,
+        )
+        .fetch_one(executor)
+        .await?;
+        Ok(count)
     }
 
     /// 部分通过：拆出 INSPECTION 批次。
