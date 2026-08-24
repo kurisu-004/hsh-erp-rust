@@ -15,8 +15,9 @@ pub struct AppConfig {
     pub snowflake: SnowflakeConfig,
     pub max_request_body_size: usize,
     pub auto_complete: AutoCompleteConfig,
-    /// 送货单 Excel 模板目录（P4 打印：默认 `./template`，环境变量
-    /// `DELIVERY_NOTE_TEMPLATE_DIR` 覆盖；路径解析用 `PathBuf` 以容忍相对/绝对路径）。
+    /// 送货单 Excel 模板目录（P4 打印）。环境变量 `DELIVERY_NOTE_TEMPLATE_DIR`
+    /// 优先；缺省回退到编译期绝对路径 `<CARGO_MANIFEST_DIR>/template`，
+    /// 因此本地 `cargo run` 不依赖 cwd。
     pub delivery_note_template_dir: PathBuf,
 }
 
@@ -95,7 +96,10 @@ impl AppConfig {
                 interval_hours: env_parse("AUTO_COMPLETE_INTERVAL_HOURS", 24)?,
             },
 
-            delivery_note_template_dir: PathBuf::from(env_or("DELIVERY_NOTE_TEMPLATE_DIR", "template")),
+            delivery_note_template_dir: PathBuf::from(env_or(
+                "DELIVERY_NOTE_TEMPLATE_DIR",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/template"),
+            )),
         })
     }
 }
