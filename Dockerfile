@@ -43,6 +43,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --release --locked --bin hsh-erp-rust
 
+# 送货单 Excel 模板（不进编译、在 cargo build 之后 COPY 以避开构建缓存失效）
+COPY template ./template
+
 # ---------- 阶段 2：运行时 ----------
 FROM alpine:${ALPINE_VERSION} AS runtime
 
@@ -58,6 +61,12 @@ RUN addgroup -g 1000 -S app \
 
 WORKDIR /app
 COPY --from=builder --chown=app:app /build/target/release/hsh-erp-rust /app/hsh-erp-rust
+
+# 送货单 Excel 模板（与二进制同目录，运行时通过 DELIVERY_NOTE_TEMPLATE_DIR
+# 指向 /app/template；详见 src/modules/delivery_note/print.rs::template_path）
+COPY --from=builder --chown=app:app /build/template /app/template
+ENV DELIVERY_NOTE_TEMPLATE_DIR=/app/template
+
 USER app
 
 EXPOSE 3000
