@@ -151,14 +151,24 @@ impl PartRepo {
 
     /// 定位 part 的 INSPECTION 状态批次。
     ///
-    /// - `expected_batch_id = None`：按 `(part_id, status = 'INSPECTION')` 唯一解析，
-    ///   取 id 最小者（与既有按 batch 序号的语义一致）。
+    /// - `expected_batch_id = None`：按 `(part_id, status = 'INSPECTION')` 唯一解析。
+    ///   先 `COUNT(*)` 校验唯一性（≥2 → 歧义，返回 `Err(sqlx::Error::RowNotFound)`，
+    ///   service 层映射为 `20109 / BIZ_PART_BATCH_NOT_FOUND`）；== 0 → `Ok(None)`；
+    ///   == 1 → 取 id 最小者（与既有按 batch 序号的语义一致）。
+    ///   唯一性守卫原因：`split_batch_for_partial_pass` 可能产生多个 INSPECTION
+    ///   子批次；没有 caller 给 `expected_batch_id` 时，旧实现 `ORDER BY id LIMIT 1`
+    ///   会静默选最低 id，可能送检错误批次。
     /// - `expected_batch_id = Some(bid)`：按 id 校验 ownership（防止 caller 误传
     ///   其它 part 的 batch id）。
     ///
     /// 两路径均要求 `deleted_at IS NULL`。
-    pub async fn find_inprocess_batch_for_part<'e, E: PgExecutor<'e>>(
-        executor: E,
+    ///
+    /// 签名收 `&mut PgConnection`：方法在 `None` 分支需在同一事务内连发两条 SQL
+    /// （COUNT + SELECT），与 `split_batch_for_partial_pass` 同形 —— sqlx 0.9 没有
+    /// `Executor` 的 `&T where T: Executor` blanket impl，generic `E: PgExecutor<'e>`
+    /// 不能 move 两次。
+    pub async fn find_inprocess_batch_for_part(
+        conn: &mut PgConnection,
         part_id: i64,
         expected_batch_id: Option<i64>,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
@@ -178,25 +188,50 @@ impl PartRepo {
                 bid,
                 part_id,
             )
-            .fetch_optional(executor)
+            .fetch_optional(&mut *conn)
             .await,
-            None => sqlx::query_as!(
-                TPartBatch,
-                r#"
-                SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, next_process_id, placed_at,
-                       delivery_note_id, parent_batch_id, has_been_repaired,
-                       version, created_at, created_by, updated_at, updated_by,
-                       deleted_at
-                FROM t_part_batch
-                WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL
-                ORDER BY id ASC
-                LIMIT 1
-                "#,
-                part_id,
-            )
-            .fetch_optional(executor)
-            .await,
+            None => {
+                // 1. 唯一性守卫：COUNT(*) 检查 INSPECTION 批次数量。
+                let count: i64 = sqlx::query_scalar!(
+                    r#"
+                    SELECT COUNT(*) AS "n!"
+                    FROM t_part_batch
+                    WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL
+                    "#,
+                    part_id,
+                )
+                .fetch_one(&mut *conn)
+                .await?;
+                match count {
+                    0 => Ok(None),
+                    1 => {
+                        // 2. 唯一命中：取 id 最小者。
+                        sqlx::query_as!(
+                            TPartBatch,
+                            r#"
+                            SELECT id, part_id, batch_no, quantity, status, location,
+                                   current_holder_id, next_process_id, placed_at,
+                                   delivery_note_id, parent_batch_id, has_been_repaired,
+                                   version, created_at, created_by, updated_at, updated_by,
+                                   deleted_at
+                            FROM t_part_batch
+                            WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL
+                            ORDER BY id ASC
+                            LIMIT 1
+                            "#,
+                            part_id,
+                        )
+                        .fetch_optional(&mut *conn)
+                        .await
+                    }
+                    _ => {
+                        // ≥2 个 INSPECTION 批次：歧义。Service 层负责把
+                        // `sqlx::Error::RowNotFound` 翻译成 `AppError::Biz` /
+                        // `20109 / BIZ_PART_BATCH_NOT_FOUND`。
+                        Err(sqlx::Error::RowNotFound)
+                    }
+                }
+            }
         }
     }
 
@@ -208,6 +243,13 @@ impl PartRepo {
     /// **未触碰 `t_part` 行**：`t_part.status` / `t_part.actual_delivery_date` 由后续 PR
     /// 触发器或 service 显式 UPDATE 同步（不在本 PR 范围内）。当前阶段，
     /// `t_part_batch.status` 是 pass_inspection 流程的 source of truth。
+    ///
+    /// // TODO(Task 2): also flip `t_part.status = 'READY_TO_SHIP'` here (or from
+    /// service layer) so `PartOut.status` reflects current state. Service layer
+    /// must replicate Python's `_rollup_part_status` semantics: re-read the
+    /// part then UPDATE its status, location, current_holder_id, and
+    /// next_process_id after this batch UPDATE. Without it, `t_part.status`
+    /// stays stale and the API contract is broken.
     ///
     /// 注：`t_part_batch` 没有 `actual_delivery_date` 列（migration 006 校验过）；
     /// 该列只存在于 `t_part` / `t_assembly`。
