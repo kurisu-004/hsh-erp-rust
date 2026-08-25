@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT location AS \"loc!\" FROM t_part WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "loc!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "location"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "66c9439035aa66091d43bef47f62f2d0f9fda2eba52827aed4ea148de44b835e"
+}

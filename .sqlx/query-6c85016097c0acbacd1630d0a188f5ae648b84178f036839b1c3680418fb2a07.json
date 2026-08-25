@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT process_id AS \"process_id!\"\n            FROM t_work_type_process\n            WHERE work_type_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "process_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_work_type_process",
+            "name": "process_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6c85016097c0acbacd1630d0a188f5ae648b84178f036839b1c3680418fb2a07"
+}

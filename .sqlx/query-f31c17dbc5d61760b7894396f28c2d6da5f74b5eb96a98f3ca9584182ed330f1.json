@@ -1,0 +1,139 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH\n            held AS (\n                SELECT COUNT(*)::int AS n FROM t_part_batch\n                WHERE current_holder_id = $1\n                  AND location = 'WORKER' AND deleted_at IS NULL\n            ),\n            max_batches AS (\n                SELECT COALESCE(wt.max_held_batches, 0) AS max_held\n                FROM t_worker w LEFT JOIN t_work_type wt ON wt.id = w.work_type_id\n                WHERE w.id = $1\n            ),\n            candidate AS (\n                SELECT pb.id, pb.version, pb.part_id\n                FROM t_part_batch pb\n                JOIN t_part p ON p.id = pb.part_id\n                WHERE pb.status = 'IN_PROCESS'\n                  AND pb.location = 'PRODUCTION_SHELF'\n                  AND pb.current_holder_id = $2\n                  AND pb.next_process_id = ANY($3)\n                  AND pb.deleted_at IS NULL\n                  AND p.deleted_at IS NULL\n                  AND (SELECT n FROM held) < (SELECT max_held FROM max_batches)\n                ORDER BY\n                    p.system_delivery_date ASC NULLS LAST,\n                    p.planned_delivery_date ASC NULLS LAST,\n                    p.is_urgent DESC,\n                    pb.id ASC\n                LIMIT 1\n                FOR UPDATE OF pb SKIP LOCKED\n            ),\n            upd_batch AS (\n                UPDATE t_part_batch pb\n                SET current_holder_id = $1, location = 'WORKER',\n                    version = pb.version + 1,\n                    updated_at = NOW(), updated_by = $4\n                FROM candidate\n                WHERE pb.id = candidate.id\n                  AND pb.version = candidate.version\n                RETURNING pb.id AS batch_id, pb.part_id, pb.batch_no, pb.quantity, pb.version\n            ),\n            upd_part AS (\n                UPDATE t_part p\n                SET current_holder_id = $1, location = 'WORKER',\n                    version = p.version + 1,\n                    updated_at = NOW(), updated_by = $4\n                FROM upd_batch ub\n                WHERE p.id = ub.part_id\n                RETURNING p.id, p.serial_no, p.drawing_no,\n                          p.system_delivery_date, p.planned_delivery_date, p.is_urgent\n            )\n            SELECT ub.batch_id, ub.part_id, ub.batch_no, ub.quantity,\n                   up.serial_no, up.drawing_no,\n                   up.system_delivery_date, up.planned_delivery_date,\n                   up.is_urgent, ub.version\n            FROM upd_batch ub JOIN upd_part up ON up.id = ub.part_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "part_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "part_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "batch_no",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "batch_no"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "quantity",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "serial_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "serial_no"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "drawing_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "drawing_no"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "system_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "system_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "planned_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "planned_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "is_urgent",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "is_urgent"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8Array",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f31c17dbc5d61760b7894396f28c2d6da5f74b5eb96a98f3ca9584182ed330f1"
+}

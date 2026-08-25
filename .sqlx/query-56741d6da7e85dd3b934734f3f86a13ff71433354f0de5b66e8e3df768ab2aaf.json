@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(\n                        SELECT 1 FROM t_shelf_process\n                        WHERE shelf_id = $1 AND process_id = $2\n                    ) AS \"exists!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "56741d6da7e85dd3b934734f3f86a13ff71433354f0de5b66e8e3df768ab2aaf"
+}

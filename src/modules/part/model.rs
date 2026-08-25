@@ -15,8 +15,14 @@ use chrono::{NaiveDate, NaiveDateTime};
 
 /// `t_part` 行（Phase P1 投影）
 ///
-/// 仅含 delivery_note / delivery_group 当前会用到的列：
+/// Phase P1：delivery_note / delivery_group 当前会用到的列：
 /// 标识 + 序列号 + 客户 + 装配件 + 状态 + 送货单 + 乐观锁 + 软删。
+///
+/// Phase worker-pool-take：补 `location` / `next_process_id` /
+/// `planned_delivery_date` / `system_delivery_date` / `is_urgent` 5 字段，
+/// 给 `worker_pool::take_one` CTE 复用。**不**补 `current_holder_id`——
+/// `TPartInspected` 已含该字段，worker-pool SQL 走专用最小投影
+/// (`TPartPoolItem`，Task 6) 复用，而非 `TPart`。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPart {
     pub id: i64,
@@ -33,6 +39,11 @@ pub struct TPart {
     pub updated_by: Option<i64>,
     pub deleted_at: Option<NaiveDateTime>,
     pub delivery_note_id: Option<i64>,
+    pub location: Option<String>,
+    pub next_process_id: Option<i64>,
+    pub planned_delivery_date: Option<NaiveDate>,
+    pub system_delivery_date: Option<NaiveDate>,
+    pub is_urgent: bool,
 }
 
 /// `t_part` 行（pass_inspection 流专用最小投影）

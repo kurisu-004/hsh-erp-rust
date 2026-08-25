@@ -268,7 +268,7 @@ impl DeliveryNoteService {
             ));
         }
         if let Some(wt_id) = driver.work_type_id {
-            let wt = WorkTypeRepo::get_by_id(&mut *conn, wt_id, false)
+            let wt = WorkTypeRepo::get_by_id(&mut *conn, wt_id)
                 .await?
                 .ok_or_else(|| AppError::biz(
                     code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,

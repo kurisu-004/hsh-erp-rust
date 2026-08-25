@@ -39,7 +39,8 @@ impl PartRepo {
             r#"
             SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
                    version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id
+                   delivery_note_id, location, next_process_id,
+                   planned_delivery_date, system_delivery_date, is_urgent
             FROM t_part
             WHERE id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -64,7 +65,8 @@ impl PartRepo {
             r#"
             SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
                    version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id
+                   delivery_note_id, location, next_process_id,
+                   planned_delivery_date, system_delivery_date, is_urgent
             FROM t_part
             WHERE id = ANY($1)
               AND ($2::bool OR deleted_at IS NULL)
@@ -90,7 +92,8 @@ impl PartRepo {
             r#"
             SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
                    version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id
+                   delivery_note_id, location, next_process_id,
+                   planned_delivery_date, system_delivery_date, is_urgent
             FROM t_part
             WHERE serial_no = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -113,7 +116,8 @@ impl PartRepo {
             r#"
             SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
                    version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id
+                   delivery_note_id, location, next_process_id,
+                   planned_delivery_date, system_delivery_date, is_urgent
             FROM t_part
             WHERE assembly_id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -751,5 +755,197 @@ impl PartRepo {
         .execute(executor)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// worker-pool admin_remove 用：按 `id + current_holder_id` 定位 IN_PROCESS+WORKER 批次。
+    ///
+    /// 必须满足：`status='IN_PROCESS'` + `location='WORKER'` + `current_holder_id = holder_id`，
+    /// 且 `deleted_at IS NULL`。
+    /// 0 行 / 不命中 → `Ok(None)`，由 service 层映射 `20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER`。
+    ///
+    /// 签名收 `&mut PgConnection`（同 `find_inprocess_batch_for_part`）。
+    pub async fn find_inprocess_batch_by_id_and_holder(
+        conn: &mut PgConnection,
+        batch_id: i64,
+        holder_id: i64,
+    ) -> Result<Option<TPartBatch>, sqlx::Error> {
+        sqlx::query_as!(
+            TPartBatch,
+            r#"
+            SELECT id, part_id, batch_no, quantity, status, location,
+                   current_holder_id, next_process_id, placed_at,
+                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at
+            FROM t_part_batch
+            WHERE id = $1 AND current_holder_id = $2
+              AND status = 'IN_PROCESS' AND location = 'WORKER'
+              AND deleted_at IS NULL
+            "#,
+            batch_id,
+            holder_id,
+        )
+        .fetch_optional(&mut *conn)
+        .await
+    }
+
+    /// worker-pool admin_remove / worker-scan RETURNED 用：批次 holder worker → shelf（OCC）。
+    ///
+    /// 0 行 → 40901 VERSION_CONFLICT / 状态非 IN_PROCESS / location 非 WORKER / 已软删
+    ///   —— 由 service 层映射。
+    /// 成功 → `current_holder_id = shelf_id`，`location = 'PRODUCTION_SHELF'`，
+    ///   `next_process_id = $4`，`version += 1`。
+    ///
+    /// `current_user_id` 写入 `updated_by`（nullable 与既有路径一致）。
+    pub async fn mark_batch_returned<'e, E: PgExecutor<'e>>(
+        executor: E,
+        batch_id: i64,
+        expected_version: i32,
+        shelf_id: i64,
+        next_process_id: i64,
+        current_user_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE t_part_batch
+            SET current_holder_id = $3,
+                location          = 'PRODUCTION_SHELF',
+                next_process_id   = $4,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $5
+            WHERE id = $1 AND version = $2
+              AND status = 'IN_PROCESS' AND location = 'WORKER'
+              AND deleted_at IS NULL
+            "#,
+            batch_id,
+            expected_version,
+            shelf_id,
+            next_process_id,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// worker-pool admin_remove / worker-scan RETURNED 用：工单 holder worker → shelf（OCC）。
+    ///
+    /// 与 `mark_batch_returned` 同事务调用。
+    /// 0 行 → 40901 VERSION_CONFLICT / 工单已软删 —— 由 service 层映射。
+    /// 成功 → `current_holder_id = shelf_id`，`location = 'PRODUCTION_SHELF'`，
+    ///   `next_process_id = $4`，`version += 1`。
+    pub async fn mark_part_returned<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        expected_version: i32,
+        shelf_id: i64,
+        next_process_id: i64,
+        current_user_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE t_part
+            SET current_holder_id = $3,
+                location          = 'PRODUCTION_SHELF',
+                next_process_id   = $4,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $5
+            WHERE id = $1 AND version = $2 AND deleted_at IS NULL
+            "#,
+            part_id,
+            expected_version,
+            shelf_id,
+            next_process_id,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 定位 worker 持有的 IN_PROCESS 批次（worker-scan 用）。
+    ///
+    /// 与 `find_inprocess_batch_for_part` 同形：
+    /// - `expected_batch_id = Some(bid)`：按 id 校验 ownership
+    ///   （part_id + current_holder_id + status='IN_PROCESS' + location='WORKER'）。
+    /// - `expected_batch_id = None`：先 COUNT 校验唯一性
+    ///   （≥2 → `RowNotFound`；== 0 → `Ok(None)`；== 1 → 取 id 最小者）。
+    ///
+    /// 唯一性守卫原因：worker 持有多个同 part_id 的 IN_PROCESS+WORKER 批次时，
+    /// `ORDER BY id LIMIT 1` 静默取最小 id 可能选错批次。
+    ///
+    /// 签名收 `&mut PgConnection`：方法在 `None` 分支需在同一事务内连发两条 SQL
+    /// （COUNT + SELECT），与 `find_inprocess_batch_for_part` 同形。
+    pub async fn find_worker_held_batch_for_part(
+        conn: &mut PgConnection,
+        part_id: i64,
+        worker_id: i64,
+        expected_batch_id: Option<i64>,
+    ) -> Result<Option<TPartBatch>, sqlx::Error> {
+        match expected_batch_id {
+            Some(bid) => sqlx::query_as!(
+                TPartBatch,
+                r#"
+                SELECT id, part_id, batch_no, quantity, status, location,
+                       current_holder_id, next_process_id, placed_at,
+                       delivery_note_id, parent_batch_id, has_been_repaired,
+                       version, created_at, created_by, updated_at, updated_by,
+                       deleted_at
+                FROM t_part_batch
+                WHERE id = $1 AND part_id = $2 AND current_holder_id = $3
+                  AND status = 'IN_PROCESS' AND location = 'WORKER'
+                  AND deleted_at IS NULL
+                "#,
+                bid,
+                part_id,
+                worker_id,
+            )
+            .fetch_optional(&mut *conn)
+            .await,
+            None => {
+                let count: i64 = sqlx::query_scalar!(
+                    r#"
+                    SELECT COUNT(*) AS "n!"
+                    FROM t_part_batch
+                    WHERE part_id = $1 AND current_holder_id = $2
+                      AND status = 'IN_PROCESS' AND location = 'WORKER'
+                      AND deleted_at IS NULL
+                    "#,
+                    part_id,
+                    worker_id,
+                )
+                .fetch_one(&mut *conn)
+                .await?;
+                match count {
+                    0 => Ok(None),
+                    1 => sqlx::query_as!(
+                        TPartBatch,
+                        r#"
+                        SELECT id, part_id, batch_no, quantity, status, location,
+                               current_holder_id, next_process_id, placed_at,
+                               delivery_note_id, parent_batch_id, has_been_repaired,
+                               version, created_at, created_by, updated_at, updated_by,
+                               deleted_at
+                        FROM t_part_batch
+                        WHERE part_id = $1 AND current_holder_id = $2
+                          AND status = 'IN_PROCESS' AND location = 'WORKER'
+                          AND deleted_at IS NULL
+                        ORDER BY id ASC
+                        LIMIT 1
+                        "#,
+                        part_id,
+                        worker_id,
+                    )
+                    .fetch_optional(&mut *conn)
+                    .await,
+                    // ≥2 个 IN_PROCESS+WORKER 批次：歧义。Service 层负责把
+                    // `sqlx::Error::RowNotFound` 翻译为 `AppError::Biz` /
+                    // `20114 / BIZ_PART_BATCH_NOT_HELD_BY_WORKER`。
+                    _ => Err(sqlx::Error::RowNotFound),
+                }
+            }
+        }
     }
 }

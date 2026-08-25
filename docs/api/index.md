@@ -5,10 +5,11 @@
 > 后端代码变更（**新增 / 修改 / 删除端点**，或**修改 DTO 字段 / 错误码**）后，必须**立即**更新对应模块文件：
 > - [`./auth.md`](./auth.md) — auth 域
 > - [`./users.md`](./users.md) — users 域
-> - [`./parts.md`](./parts.md) — part 域（part-pass-inspection 批量+单件）
+> - [`./parts.md`](./parts.md) — part 域（part-pass-inspection 批量+单件 / scan-inspect / fail-inspection / **worker-scan**）
+> - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove**）
 > - [`./delivery-notes.md`](./delivery-notes.md) — delivery_notes 域
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
-> - [`./websocket.md`](./websocket.md) — WebSocket
+> - [`./websocket.md`](./websocket.md) — WebSocket（含 **WORKER_SCAN_* / WORKER_POOL_***）
 >
 > **同步流程**：
 > 1. 修改 `src/modules/<mod>/{handler.rs,dto.rs,service.rs}`
@@ -140,11 +141,12 @@ HTTP 状态码：
 |---|---|---|---|
 | auth | [`./auth.md`](./auth.md) | 5 | ✅ 完全上线 |
 | users | [`./users.md`](./users.md) | 9 | ✅ 完全上线 |
-| part | [`./parts.md`](./parts.md) | 5 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回（2026-08-25） |
+| part | [`./parts.md`](./parts.md) | 6 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回、worker-scan（2026-08-25） |
+| worker_pool | [`./worker-pool.md`](./worker-pool.md) | 3 | 🟢 state + admin refill/remove + worker-scan 联动（2026-08-25） |
 | delivery-notes | [`./delivery-notes.md`](./delivery-notes.md) | 17 | ✅ 完全上线（P1–P4） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
-| websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub |
-| 其他 12 域 | — | 0 | ⚪ 仅占位（见下） |
+| websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub（worker-pool WS 事件已注册，待 hub 真实握手） |
+| 其他 10 域 | — | 0 | ⚪ 仅占位（见下） |
 
 ---
 
@@ -205,14 +207,14 @@ HTTP 状态码：
 | 段 | 域 |
 |---|---|
 | 200xx | 用户/订单（USER_NOT_FOUND 20001 / USER_DUPLICATE 20002 / ORDER_NOT_FOUND 20003） |
-| 201xx | 零件/客户/序列号（PART_NOT_FOUND 20101 / CUSTOMER_NOT_FOUND 20102 / INVALID_TRANSITION 20103 / INVALID_VALUE 20104 / ... / PART_BATCH_NOT_FOUND 20109 / CUSTOMER_IN_USE 20113） |
-| 202xx | 工人（WORKER_NOT_FOUND 20201 / WORKER_INACTIVE 20202 / WORKER_IN_USE 20203 / WORKER_HOLD_LIMIT_EXCEEDED 20204） |
+| 201xx | 零件/客户/序列号（PART_NOT_FOUND 20101 / CUSTOMER_NOT_FOUND 20102 / INVALID_TRANSITION 20103 / INVALID_VALUE 20104 / ... / PART_BATCH_NOT_FOUND 20109 / CUSTOMER_IN_USE 20113 / **PART_BATCH_NOT_HELD_BY_WORKER 20114**） |
+| 202xx | 工人（WORKER_NOT_FOUND 20201 / WORKER_INACTIVE 20202 / WORKER_IN_USE 20203 / WORKER_HOLD_LIMIT_EXCEEDED 20204 / **WORKER_POOL_EMPTY 20205 / NO_WORK_TYPE 20206**） |
 | 203xx | 装配体（ASSEMBLY_NOT_FOUND 20301 / BAD_CUSTOMER 20302 / TOO_MANY_CHILDREN 20303） |
 | 204xx | 图纸文件（DRAWING_FILE_NOT_FOUND 20401 / BAD_TYPE 20402 / TOO_LARGE 20403 / UPLOAD_FAILED 20404） |
 | 205xx | 货架（SHELF_NOT_FOUND 20501 / DUPLICATE_CODE 20502 / IN_USE 20503 / ... / PROCESS_NOT_MAPPED 20507 / NOT_INSPECTION_ZONE 20511 / INACTIVE 20512） |
 | 206xx | 账号（USER_ACCOUNT_NOT_FOUND 20601 / DUPLICATE_USERNAME 20602 / INACTIVE 20603 / ROLE_DUPLICATE 20604 / ROLE_NOT_FOUND 20605 / NO_ROLE 20606） |
 | 208xx | 工序（PROCESS_NOT_FOUND 20801 / DUPLICATE_CODE 20802 / IN_USE 20803） |
-| 209xx | 工种（WORK_TYPE_NOT_FOUND 20901 / DUPLICATE_CODE 20902 / IN_USE 20903） |
+| 209xx | 工种（WORK_TYPE_NOT_FOUND 20901 / DUPLICATE_CODE 20902 / IN_USE 20903 / **MAX_HELD_NOT_SET 20904 / NO_PROCESS_MAPPING 20905**） |
 | 210xx | 申请人（APPLICANT_NOT_FOUND 21001 / DUPLICATE_NAME 21002 / BAD_CUSTOMER 21003 / IN_USE 21004） |
 | 211xx | 零件文件 / 模板（PART_FILE_NOT_FOUND 21101 / BAD_TYPE 21102 / TOO_LARGE 21103 / UPLOAD_FAILED 21104 / OWNER_NOT_FOUND 21105 / DUPLICATE 21108 / DELIVERY_TEMPLATE_NOT_CONFIGURED 21109 / DELIVERY_PART_STATUS_INVALID 21111 / TEMPLATE_TOO_MANY_PARTS 21112 / PRINT_BAD_ORDER 21113）⚠️ 21110 已 deprecated 别名 = 21407 |
 | 212xx | 外协公司（OUTSOURCE_COMPANY_NOT_FOUND 21201 / DUPLICATE 21202 / BAD_PROCESS 21203 / PROCESS_NOT_MAPPED 21204 / IN_USE 21205 / ...） |

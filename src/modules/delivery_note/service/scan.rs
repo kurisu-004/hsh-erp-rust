@@ -735,6 +735,11 @@ mod scan_resolve_tests {
             updated_by: None,
             deleted_at: None,
             delivery_note_id: None,
+            location: None,
+            next_process_id: None,
+            planned_delivery_date: None,
+            system_delivery_date: None,
+            is_urgent: false,
         }
     }
 
