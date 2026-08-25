@@ -30,6 +30,12 @@ pub fn router() -> Router<Arc<AppState>> {
             "/batch-scan-inspect",
             post(handler::batch_scan_inspect),
         )
+        // worker-scan 静态段也必须在 /{part_id}/... 之前注册，
+        // 否则 axum 会把 `worker-scan` 解析成 part_id=... 的 catch-all。
+        .route(
+            "/worker-scan",
+            post(handler::worker_scan),
+        )
         .route(
             "/{part_id}/pass-inspection",
             post(handler::pass_inspection),

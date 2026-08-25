@@ -19,16 +19,17 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::Json;
+use axum::{Extension, Json};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::dto::{
     BatchPassInspectionOut, BatchPassInspectionRequest, BatchScanInspectOut,
     BatchScanInspectRequest, FailInspectionRequest, PartOut, PassInspectionRequest,
-    ScanInspectRequest,
+    ScanInspectRequest, WorkerScanOut, WorkerScanRequest,
 };
 use crate::modules::part::service::{PartService, BATCH_PASS_INSPECTION_MAX_ITEMS};
+use crate::modules::worker_pool::service::WorkerPoolService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -192,4 +193,98 @@ pub async fn fail_inspection(
     tx.commit().await?;
     ws_broadcast_inspection_failed(&state, part_id);
     Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/worker-scan
+///
+/// 工人扫码台主入口：RETURNED / INSPECTED 二合一。**同事务**调 scan →
+/// refill_for_worker（OM-6 决议：scan 与 refill 必须原子，否则扫描放回 →
+/// refill 抢批中间会被并发抢走同批）。
+///
+/// 行为：
+/// - 权限：`Manager` 或 `ShelfAccount`（不是 Inspector——工人持有件自有工人操作）
+/// - 入参：`WorkerScanRequest { serial_no, badge_code, event_type, shelf_id, ... }`
+/// - 业务流转：
+///   - `RETURNED`：worker 把 IN_PROCESS+WORKER 批次放回生产架（next_process_id 必填，
+///     shelf ↔ process 必须有映射）；
+///   - `INSPECTED`：worker 把持有件直接送检（target_inspection_shelf_id 必填，
+///     target shelf ∈ INSPECTION 区）；
+///   - 任一成功后同事务 `WorkerPoolService::refill_for_worker`。
+/// - WS 广播：commit 后
+///   - `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（依 event_type）；
+///   - `WORKER_POOL_REFILL_DONE`（refill 抢到一批）或
+///   - `WORKER_POOL_EMPTY`（refill 池空）。
+///
+/// `Extension(current)` 而非 `current: CurrentUser` 参数：与 worker_pool 既有
+/// handler 风格一致（jwt_auth_layer 在 Extension 注入）。
+pub async fn worker_scan(
+    State(state): State<Arc<AppState>>,
+    Extension(current): Extension<CurrentUser>,
+    Json(req): Json<WorkerScanRequest>,
+) -> Result<Json<R<WorkerScanOut>>, AppError> {
+    current.require_any_role(&[Role::Manager, Role::ShelfAccount])?;
+    // 防御性：shelf_ids 是手填白名单，manager 因 wildcard=true 自动通过
+    if !current.can_access_shelf(req.shelf_id) {
+        return Err(AppError::biz(
+            crate::shared::error::code::SHELF_MISMATCH,
+            format!("无权限访问 shelf {}", req.shelf_id),
+        ));
+    }
+    // INSPECTED 时 target_inspection_shelf_id 也必须校验（防御性，避免 SHELF_ACCOUNT
+    // 用户手填两个不在 scope 内的 shelf_id）
+    if let Some(tid) = req
+        .target_inspection_shelf_id
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        if !current.can_access_shelf(tid) {
+            return Err(AppError::biz(
+                crate::shared::error::code::SHELF_MISMATCH,
+                format!("无权限访问 shelf {}", tid),
+            ));
+        }
+    }
+    let mut tx = state.pool.begin().await?;
+    // scan（状态翻转 + 写事件日志）
+    let scan_out = PartService::worker_scan_event(
+        &mut tx,
+        &state.snowflake,
+        req.clone(),
+        &current,
+    )
+    .await?;
+    // refill（同事务；WorkerPoolService::refill_for_worker 内部对 work_type / process
+    // 映射校验失败会抛业务错——事务自动回滚 scan 写入，保持原子语义）
+    let refill_out = WorkerPoolService::refill_for_worker(
+        &mut tx,
+        &state.snowflake,
+        scan_out.worker_id,
+        req.shelf_id,
+        current.id,
+    )
+    .await?;
+    tx.commit().await?;
+    // commit 之后广播（对齐 Python 延迟广播模式）
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: scan_out.event_type.clone(),
+        payload: serde_json::to_value(&scan_out).unwrap_or_default(),
+    });
+    if !refill_out.taken.is_empty() {
+        state.ws_hub.broadcast(WsEvent::DashboardEvent {
+            kind: "WORKER_POOL_REFILL_DONE".into(),
+            payload: serde_json::to_value(&refill_out).unwrap_or_default(),
+        });
+    } else if refill_out.pool_empty {
+        state.ws_hub.broadcast(WsEvent::DashboardEvent {
+            kind: "WORKER_POOL_EMPTY".into(),
+            payload: serde_json::json!({
+                "worker_id": scan_out.worker_id.to_string(),
+                "shelf_id": req.shelf_id.to_string(),
+            }),
+        });
+    }
+    Ok(Json(R::ok(WorkerScanOut {
+        scan: scan_out,
+        refill: refill_out,
+    })))
 }

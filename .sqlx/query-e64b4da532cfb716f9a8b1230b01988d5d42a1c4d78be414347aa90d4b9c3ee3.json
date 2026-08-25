@@ -1,0 +1,234 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id, part_id, batch_no, quantity, status, location,\n                       current_holder_id, next_process_id, placed_at,\n                       delivery_note_id, parent_batch_id, has_been_repaired,\n                       version, created_at, created_by, updated_at, updated_by,\n                       deleted_at\n                FROM t_part_batch\n                WHERE id = $1 AND part_id = $2 AND current_holder_id = $3\n                  AND status = 'IN_PROCESS' AND location = 'WORKER'\n                  AND deleted_at IS NULL\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "part_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "part_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "batch_no",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "batch_no"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "quantity",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "location",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "current_holder_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "current_holder_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "next_process_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "next_process_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "placed_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "placed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "delivery_note_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "delivery_note_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "parent_batch_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "parent_batch_id"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "has_been_repaired",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "has_been_repaired"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "updated_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "deleted_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "e64b4da532cfb716f9a8b1230b01988d5d42a1c4d78be414347aa90d4b9c3ee3"
+}
