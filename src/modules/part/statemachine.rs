@@ -84,7 +84,7 @@ impl PartStatus {
     /// 迁移白名单。
     ///
     /// 本 PR（scan-inspect 一键送检）放行：
-        /// - `INSPECTION → READY_TO_SHIP`：pass_inspection / scan_inspect (PASS) 路径
+    /// - `INSPECTION → READY_TO_SHIP`：pass_inspection / scan_inspect (PASS) 路径
     /// - `INSPECTION → IN_PROCESS`：fail_inspection 路径（推荐需求 3）
     /// - `PROGRAMMING → INSPECTION`：scan_inspect (PROGRAMMING → INSPECTION)
     /// - `PENDING → INSPECTION`：scan_inspect (PENDING → INSPECTION)

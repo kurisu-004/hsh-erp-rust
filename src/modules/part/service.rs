@@ -639,13 +639,11 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
         // 0. FAIL 必填校验（早期失败）
-        if decision == ScanDecision::FAIL {
-            if shelf_id.is_none() || next_process_id.is_none() {
-                return Err(AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    "FAIL 决策必须填齐 shelf_id 和 next_process_id",
-                ));
-            }
+        if decision == ScanDecision::FAIL && (shelf_id.is_none() || next_process_id.is_none()) {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                "FAIL 决策必须填齐 shelf_id 和 next_process_id",
+            ));
         }
         // 1. 校验品检架（target_inspection_shelf）
         let target_shelf = Self::_validate_inspection_shelf(&mut *conn, target_inspection_shelf_id).await?;
@@ -673,25 +671,25 @@ impl PartService {
         // 「shelf 持有」两种语义；区分方式是看该 id 是否能命中 `t_shelf`：
         // - ShelfRepo::get_by_id 返回 Some → 是 shelf
         // - 返回 None → 是 worker（v1 myERP 也是用此启发式区分）
-        if from == PartStatus::IN_PROCESS {
-            if let Some(holder_id) = part.current_holder_id {
-                match ShelfRepo::get_by_id(&mut *conn, holder_id).await? {
-                    None => {
-                        // holder 不在 t_shelf → 视为 worker 持有
-                        return Err(AppError::biz(
-                            code::BIZ_INVALID_TRANSITION,
-                            "工人持有件请先归还或送检".to_string(),
-                        ));
-                    }
-                    Some(holder_shelf) if holder_shelf.zone != "PRODUCTION" => {
-                        // holder 是 shelf 但不是生产架 → 拒绝
-                        return Err(AppError::biz(
-                            code::BIZ_INVALID_TRANSITION,
-                            "不在生产架上，无法快捷品检".to_string(),
-                        ));
-                    }
-                    Some(_) => { /* holder 是 PRODUCTION 区货架 → 放行 */ }
+        if from == PartStatus::IN_PROCESS
+            && let Some(holder_id) = part.current_holder_id
+        {
+            match ShelfRepo::get_by_id(&mut *conn, holder_id).await? {
+                None => {
+                    // holder 不在 t_shelf → 视为 worker 持有
+                    return Err(AppError::biz(
+                        code::BIZ_INVALID_TRANSITION,
+                        "工人持有件请先归还或送检".to_string(),
+                    ));
                 }
+                Some(holder_shelf) if holder_shelf.zone != "PRODUCTION" => {
+                    // holder 是 shelf 但不是生产架 → 拒绝
+                    return Err(AppError::biz(
+                        code::BIZ_INVALID_TRANSITION,
+                        "不在生产架上，无法快捷品检".to_string(),
+                    ));
+                }
+                Some(_) => { /* holder 是 PRODUCTION 区货架 → 放行 */ }
             }
         }
         // 5. 定位目标批次
@@ -699,6 +697,9 @@ impl PartService {
         // 6. 拆批（如需要）
         let target = Self::_split_batch_if_needed(&mut *conn, snowflake, target, quantity, current).await?;
         // 7. 第一步：搬到 INSPECTION
+        // 隐式多批次 rollup：本步不显式调用 `count_other_inprocess_batches`，
+        // 因为前置状态守卫（step 3）已限定 from ∈ {PENDING, PROGRAMMING, IN_PROCESS}，
+        // 该状态下不可能存在 INSPECTION 批次，翻转 `t_part.status` 安全。
         // 7a. UPDATE t_part
         let n = PartRepo::mark_part_inspected(
             &mut *conn, part_id, part.version, target_shelf.id, Some(current.id),

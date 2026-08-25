@@ -28,9 +28,7 @@ use crate::modules::part::dto::{
     BatchScanInspectRequest, FailInspectionRequest, PartOut, PassInspectionRequest,
     ScanInspectRequest,
 };
-use crate::modules::part::service::{
-    PartService, BATCH_PASS_INSPECTION_MAX_ITEMS, BATCH_SCAN_INSPECT_MAX_ITEMS,
-};
+use crate::modules::part::service::{PartService, BATCH_PASS_INSPECTION_MAX_ITEMS};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
