@@ -111,6 +111,10 @@ Response 200 `data`：`ScanDeliveryOut`
 
 > 21405 场景（零件状态非 READY_TO_SHIP）：`part_id="0"`、其余三字段为 `null`，由前端按 `reason` 文案兜底展示。21418 场景（装配件整套拒绝）：`part_id` 为真实工单 ID，可直接用其构造批量送检请求（见下文 21418 错误码）。
 
+> 前端可基于 `data.failures[].status` 区分触发端点：
+> - `status ∈ {PENDING, PROGRAMMING, IN_PROCESS}` → 触发 `POST /parts/batch-scan-inspect`（一键送检）
+> - `status === 'INSPECTION'` → 触发 `POST /parts/batch-pass-inspection`（一键过检）
+
 错误码：
 
 - 20104 BIZ_INVALID_VALUE — code 空白/空

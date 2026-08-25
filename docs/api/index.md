@@ -135,7 +135,7 @@ HTTP 状态码：
 |---|---|---|---|
 | auth | [`./auth.md`](./auth.md) | 5 | ✅ 完全上线 |
 | users | [`./users.md`](./users.md) | 9 | ✅ 完全上线 |
-| part | [`./parts.md`](./parts.md) | 2 | 🟡 单件+批量通过品检（2026-08-25） |
+| part | [`./parts.md`](./parts.md) | 5 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回（2026-08-25） |
 | delivery-notes | [`./delivery-notes.md`](./delivery-notes.md) | 17 | ✅ 完全上线（P1–P4） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub |

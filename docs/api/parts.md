@@ -11,6 +11,9 @@
 |---|---|---|---|
 | POST | `/api/v2/parts/batch-pass-inspection` | **Manager** / **Inspector** | 批量通过品检（INSPECTION → READY_TO_SHIP），per-item 独立处理 |
 | POST | `/api/v2/parts/{part_id}/pass-inspection` | **Manager** / **Inspector** | 单件通过品检（INSPECTION → READY_TO_SHIP），payload 可空 |
+| `POST` | `/{part_id}/scan-inspect` | Manager / Inspector | 单件一键送检（PENDING/PROGRAMMING/IN_PROCESS → INSPECTION → PASS/FAIL） |
+| `POST` | `/batch-scan-inspect` | Manager / Inspector | 批量一键送检（共享品检架 + per-item decision，N≤200） |
+| `POST` | `/{part_id}/fail-inspection` | Manager / Inspector | 单件品检打回（INSPECTION → IN_PROCESS，依赖 shelf+next_process） |
 
 > 路由顺序：`/batch-pass-inspection` 必须在 `/{part_id}/pass-inspection` **之前**注册（axum 防止把 `batch-pass-inspection` 当作 `part_id` 解析）。
 
@@ -134,6 +137,58 @@ Response 200 `data`：[`PartOut`](#partout-字段) — 流转后的工单最新�
 | `passed` | [PartOut](#partout-字段) | 成功送检的件 |
 | `failed` | [BatchPassFailure](#batchpassfailure-字段) | 失败的件（`passed` ∩ `failed` = ∅） |
 
+### Phase F2（scan-inspect）
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ScanDecision { PASS, FAIL }
+
+pub struct ScanInspectRequest {
+    pub target_inspection_shelf_id: String,  // 雪花 ID（i64 字符串）
+    pub decision: ScanDecision,
+    pub shelf_id: Option<String>,            // FAIL 必填
+    pub next_process_id: Option<String>,     // FAIL 必填
+    pub note: Option<String>,                // ≤ 500 字符
+    pub batch_id: Option<String>,            // 多批次歧义时必填
+    pub quantity: Option<i32>,               // 缺省=整批
+}
+
+pub struct BatchScanInspectItem {
+    pub part_id: i64,                        // 雪花 ID
+    pub decision: Option<ScanDecision>,      // 缺省=PASS
+    pub shelf_id: Option<String>,
+    pub next_process_id: Option<String>,
+    pub note: Option<String>,
+    pub batch_id: Option<String>,
+    pub quantity: Option<i32>,
+}
+
+pub struct BatchScanInspectRequest {
+    pub target_inspection_shelf_id: String,
+    pub items: Vec<BatchScanInspectItem>,    // 1..=200
+}
+
+pub struct BatchScanInspectFailure {
+    pub part_id: i64,
+    pub code: i32,                           // 业务错误码
+    pub message: String,                     // 错误 message
+}
+
+pub struct BatchScanInspectOut {
+    pub submitted: Vec<PartOut>,
+    pub failed: Vec<BatchScanInspectFailure>,
+}
+
+pub struct FailInspectionRequest {
+    pub shelf_id: String,                    // 必填（PRODUCTION 区 active）
+    pub next_process_id: String,             // 必填
+    pub note: Option<String>,
+    pub batch_id: Option<String>,
+    pub quantity: Option<i32>,
+}
+```
+
 ---
 
 ## 端点约束（与 Python 一致）
@@ -141,8 +196,28 @@ Response 200 `data`：[`PartOut`](#partout-字段) — 流转后的工单最新�
 - **i64 雪花 ID**：JSON 序列化为 `string`，避免 JS `Number.MAX_SAFE_INTEGER` 精度截断（详见 `shared::types`）
 - **乐观锁（OCC）**：表行 `version` 列；UPDATE 带 `WHERE id=$1 AND version=$2`，命中 0 行 → `40901 VERSION_CONFLICT`
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → `20101`
-- **状态机**：`INSPECTION → READY_TO_SHIP` 是当前唯一允许的迁移；其它 source / target 组合返回 `20103 BIZ_INVALID_TRANSITION`（迁移表见 `src/modules/part/statemachine.rs`）
-- **事件日志**：状态迁移在 service 内事务内统一插入 `pass_inspection` 事件，service 提交后由 WS 中枢广播
+- **状态机**：详见 [状态机（can_transition_to 白名单）](#状态机can_transition_to-白名单)；不在白名单内的 source / target 组合返回 `20103 BIZ_INVALID_TRANSITION`（迁移表见 `src/modules/part/statemachine.rs`）
+- **事件日志**：状态迁移在 service 内事务内统一插入对应事件，service 提交后由 WS 中枢广播
+
+## 状态机（can_transition_to 白名单）
+
+| from | to | 触发场景 |
+|---|---|---|
+| INSPECTION | READY_TO_SHIP | `pass_inspection` 单/批；`scan-inspect` PASS 分支 |
+| PROGRAMMING | INSPECTION | `scan-inspect`（PROGRAMMING 工件） |
+| PENDING | INSPECTION | `scan-inspect`（待下发工单） |
+| IN_PROCESS | INSPECTION | `scan-inspect`（生产架工件，**必须 IN_PROCESS+PRODUCTION_SHELF**；service 层组合校验） |
+
+INSPECTION → IN_PROCESS 由 `fail_inspection`（推荐需求 3）走 service 流程：
+- INSPECTION 状态 + `location='PRODUCTION_SHELF'` + `current_holder_id=shelf.id` + `next_process_id=...`
+- 事件日志：`event_type='INSPECTION_FAILED'`
+
+### 货架错误码（20511 / 20512 — scan-inspect / fail-inspection 专用）
+
+| code | 名称 | 触发场景 |
+|---|---|---|
+| 20511 | BIZ_SHELF_NOT_INSPECTION_ZONE | `target_inspection_shelf.zone ≠ 'INSPECTION'` |
+| 20512 | BIZ_SHELF_INACTIVE | `target_inspection_shelf.is_active = false` |
 
 ## 未上线端点（前端勿调用）
 
