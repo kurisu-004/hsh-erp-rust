@@ -11,9 +11,9 @@
 |---|---|---|---|
 | POST | `/api/v2/parts/batch-pass-inspection` | **Manager** / **Inspector** | 批量通过品检（INSPECTION → READY_TO_SHIP），per-item 独立处理 |
 | POST | `/api/v2/parts/{part_id}/pass-inspection` | **Manager** / **Inspector** | 单件通过品检（INSPECTION → READY_TO_SHIP），payload 可空 |
-| `POST` | `/{part_id}/scan-inspect` | Manager / Inspector | 单件一键送检（PENDING/PROGRAMMING/IN_PROCESS → INSPECTION → PASS/FAIL） |
-| `POST` | `/batch-scan-inspect` | Manager / Inspector | 批量一键送检（共享品检架 + per-item decision，N≤200） |
-| `POST` | `/{part_id}/fail-inspection` | Manager / Inspector | 单件品检打回（INSPECTION → IN_PROCESS，依赖 shelf+next_process） |
+| POST | `/api/v2/parts/batch-scan-inspect` | **Manager** / **Inspector** | 批量一键送检（共享品检架 + per-item decision，N≤200） |
+| POST | `/api/v2/parts/{part_id}/scan-inspect` | **Manager** / **Inspector** | 单件一键送检（PENDING/PROGRAMMING/IN_PROCESS → INSPECTION → PASS/FAIL） |
+| POST | `/api/v2/parts/{part_id}/fail-inspection` | **Manager** / **Inspector** | 单件品检打回（INSPECTION → IN_PROCESS，依赖 shelf+next_process） |
 
 > 路由顺序：`/batch-pass-inspection` 必须在 `/{part_id}/pass-inspection` **之前**注册（axum 防止把 `batch-pass-inspection` 当作 `part_id` 解析）。
 
