@@ -11,6 +11,10 @@
 //! - `update` —— 扫码入单 / 手工 add-parts 写 delivery_note_id + status；带乐观锁
 //!
 //! Phase P3 还需要 `split_batch`（手工部分量），到 part_batch 域实施阶段再加。
+//!
+//! worker-pool 域新增：
+//! - `count_held_by_worker` —— worker 当前持有批次数（state 端点 + max_held_batches 校验）
+//! - `list_held_by_worker` —— worker 当前持有批次详情（state 端点 DTO）
 
 use sqlx::PgExecutor;
 
@@ -675,5 +679,52 @@ impl PartBatchRepo {
                 order_no: r.p_order_no,
             })
             .collect())
+    }
+
+    /// 工人当前持有批次数（worker-pool used/max 校验）。
+    /// 复用 `ix_t_part_batch_holder_location`（Task 1 已建）覆盖
+    /// `(current_holder_id, location)` 谓词。
+    pub async fn count_held_by_worker<'e, E: PgExecutor<'e>>(
+        executor: E,
+        worker_id: i64,
+    ) -> Result<i64, sqlx::Error> {
+        let n: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) AS "n!"
+            FROM t_part_batch
+            WHERE current_holder_id = $1
+              AND location = 'WORKER'
+              AND deleted_at IS NULL
+            "#,
+            worker_id,
+        )
+        .fetch_one(executor)
+        .await?;
+        Ok(n)
+    }
+
+    /// 工人当前持有批次列表（worker-pool state 端点用）。
+    /// 同样命中 `ix_t_part_batch_holder_location`。
+    pub async fn list_held_by_worker<'e, E: PgExecutor<'e>>(
+        executor: E,
+        worker_id: i64,
+    ) -> Result<Vec<TPartBatch>, sqlx::Error> {
+        sqlx::query_as!(
+            TPartBatch,
+            r#"
+            SELECT id, part_id, batch_no, quantity, status, location,
+                   current_holder_id, next_process_id, placed_at,
+                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   version, created_at, created_by, updated_at, updated_by, deleted_at
+            FROM t_part_batch
+            WHERE current_holder_id = $1
+              AND location = 'WORKER'
+              AND deleted_at IS NULL
+            ORDER BY id ASC
+            "#,
+            worker_id,
+        )
+        .fetch_all(executor)
+        .await
     }
 }
