@@ -665,6 +665,74 @@ async fn batch_create_parts_partial_failure() {
     assert_eq!(failed[0]["item_index"], 1);
 }
 
+/// POST /parts/batch —— `[bad, ok, ok]` 三件：第 1 件失败，后续 2 件仍能成功。
+///
+/// 这是 peer-review 找出的 savepoint bug 的回归测试。原代码把整批
+/// INSERT 包在同一事务里但没用 SAVEPOINT；一旦第 1 件触发 22001 整个事务
+/// 状态变 aborted，后续 INSERT 全都返回 `25P02 current transaction is
+/// aborted`，全部被映射成 50001 DATABASE。修复后：每件 INSERT 前后
+/// `SAVEPOINT batch_item_{idx}` / `RELEASE` / `ROLLBACK TO`，让外层事务
+/// 保持可写。
+#[tokio::test]
+async fn batch_create_parts_savepoint_recovers_after_failure() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr").await;
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .date_naive();
+    let long_name = "甲".repeat(60); // >50 触发 22001
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/parts/batch",
+            Some(json!({
+                "customer_id": l2.to_string(),
+                "items": [
+                    {
+                        "name": "bad-item",
+                        "drawing_no": "D-BAD",
+                        "applicant_name": long_name,
+                        "quantity": 1,
+                        "request_date": today,
+                        "planned_delivery_date": today,
+                    },
+                    {
+                        "name": "ok-item-A",
+                        "drawing_no": "D-OK-A",
+                        "applicant_name": "甲",
+                        "quantity": 1,
+                        "request_date": today,
+                        "planned_delivery_date": today,
+                    },
+                    {
+                        "name": "ok-item-B",
+                        "drawing_no": "D-OK-B",
+                        "applicant_name": "乙",
+                        "quantity": 1,
+                        "request_date": today,
+                        "planned_delivery_date": today,
+                    },
+                ],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "batch [bad, ok, ok]: {env}");
+    assert_eq!(env["code"], 0);
+    let created = env["data"]["created"].as_array().unwrap();
+    let failed = env["data"]["failed"].as_array().unwrap();
+    assert_eq!(created.len(), 2, "应 created=2: {env}");
+    assert_eq!(failed.len(), 1, "应 failed=1: {env}");
+    // failed[0] = item_index=0（bad-item，applicant_name 超长）
+    assert_eq!(failed[0]["item_index"], 0, "失败项应位于 idx=0: {env}");
+    assert_eq!(failed[0]["code"], 50001, "DATABASE 兜底码（22001）: {env}");
+}
+
 // ===========================================================================
 //  Tests — Part 3: update / soft-delete
 // ===========================================================================
@@ -819,12 +887,12 @@ async fn soft_delete_part_403_clerk() {
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
 }
 
-/// POST /parts/{id}/soft-delete —— 重复软删同一件 → 21420 BIZ_DELIVERY_NOTE_LOCKED_PART。
+/// POST /parts/{id}/soft-delete —— 重复软删同一件（已软删 + 现版本）→ 20101 BIZ_PART_NOT_FOUND (404)。
 ///
 /// service 内：soft_delete SQL 返回 0 行 → get_by_id(include_deleted=true) → Some(p)
-/// → 21420。HTTP=409。
+/// → 分支 `p.deleted_at.is_some()` → 20101, "已软删"。HTTP=404。
 #[tokio::test]
-async fn soft_delete_part_404_already_deleted() {
+async fn soft_delete_part_404_soft_deleted() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
@@ -840,7 +908,7 @@ async fn soft_delete_part_404_already_deleted() {
     .unwrap();
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
-    // 第二次用现版本（version=1）+ soft-delete 端点 — 返回 0 行 → 21420
+    // 第二次用现版本（version=1）+ soft-delete 端点 — 返回 0 行 → 20101
     let (s, env) = send(
         app,
         json_request(
@@ -851,10 +919,72 @@ async fn soft_delete_part_404_already_deleted() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::CONFLICT, "already deleted: {env}");
+    assert_eq!(s, StatusCode::NOT_FOUND, "already deleted: {env}");
+    assert_eq!(env["code"], 20101, "BIZ_PART_NOT_FOUND (已软删): {env}");
+}
+
+/// POST /parts/{id}/soft-delete —— PENDING + version 不匹配 → 40901 VERSION_CONFLICT (409)。
+///
+/// service 内：soft_delete SQL 返回 0 行 → get_by_id(include_deleted=true) → Some(p)
+/// → 分支 `p.version != expected_version` → 40901。
+#[tokio::test]
+async fn soft_delete_part_409_version_conflict() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    // 初始 version=0；客户端传 99 触发不匹配。
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/soft-delete"),
+            Some(json!({ "version": 99 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "version conflict: {env}");
+    assert_eq!(env["code"], 40901, "VERSION_CONFLICT: {env}");
+}
+
+/// POST /parts/{id}/soft-delete —— DELIVERED 终态 → 20120 BIZ_PART_NOT_DELETABLE (409)。
+///
+/// service 内：soft_delete SQL 返回 0 行（DELIVERED 命中守卫）→
+/// get_by_id(include_deleted=true) → Some(p) → 分支 `status IN ('DELIVERED','COMPLETED')`
+/// → 20120。
+#[tokio::test]
+async fn soft_delete_part_409_terminal_status() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part_with_status(
+        &pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "DELIVERED",
+    )
+    .await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/soft-delete"),
+            Some(json!({ "version": 0 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "terminal status: {env}");
     assert_eq!(
-        env["code"], 21420,
-        "BIZ_DELIVERY_NOTE_LOCKED_PART (兜底码): {env}"
+        env["code"], 20120,
+        "BIZ_PART_NOT_DELETABLE (终态禁删): {env}"
     );
 }
 
@@ -1153,6 +1283,41 @@ async fn start_repair_wrong_state_400() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "start-repair wrong state: {env}");
     assert_eq!(env["code"], 20117, "BIZ_PART_REPAIR_NOT_TRIGGERED: {env}");
+}
+
+/// POST /parts/{id}/deliver —— CANCELLED 状态 → 20114 BIZ_PART_ALREADY_CANCELLED (409)。
+///
+/// service 内新增 status guard：`from == CANCELLED` 一律 20114，
+/// 走在 wrong-state 检查（20116 BIZ_PART_NOT_READY_TO_SHIP）之前。
+/// 同样的 guard 也加在 `complete` / `start_repair`，这里只验 deliver。
+#[tokio::test]
+async fn deliver_cancelled_409() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part_with_status(
+        &pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "CANCELLED",
+    )
+    .await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/deliver"),
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "deliver cancelled: {env}");
+    assert_eq!(env["code"], 20114, "BIZ_PART_ALREADY_CANCELLED: {env}");
 }
 
 // ===========================================================================

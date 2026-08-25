@@ -187,9 +187,14 @@ pub struct PartDetailOut {
 }
 
 impl PartDetailOut {
-    /// 由完整 `TPart` + 客户冗余字段构造。
+    /// 由完整 `TPart` + 客户冗余字段 + 当前 INSPECTION 批次 id 构造。
+    ///
+    /// `current_batch_id` 由 service 层调用
+    /// [`crate::modules::part::repo::PartRepo::find_current_inspection_batch_id`]
+    /// 取值；`None` 表示当前不在 INSPECTION。
     pub fn from_with_customer_extra(
         part: TPart,
+        current_batch_id: Option<i64>,
         customer_name: Option<String>,
         l1_customer_name: Option<String>,
     ) -> Self {
@@ -197,7 +202,7 @@ impl PartDetailOut {
             part,
             customer_name,
             l1_customer_name,
-            current_batch_id: None,
+            current_batch_id,
         }
     }
 }

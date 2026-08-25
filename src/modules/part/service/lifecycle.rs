@@ -49,6 +49,12 @@ impl PartService {
                 format!("status 非法: {}", part.status),
             )
         })?;
+        if from == PartStatus::CANCELLED {
+            return Err(AppError::biz(
+                code::BIZ_PART_ALREADY_CANCELLED,
+                "工单已 CANCELLED",
+            ));
+        }
         if !from.can_transition_to(PartStatus::DELIVERED) {
             return Err(AppError::biz(
                 code::BIZ_PART_NOT_READY_TO_SHIP,
@@ -175,6 +181,12 @@ impl PartService {
                 format!("status 非法: {}", part.status),
             )
         })?;
+        if from == PartStatus::CANCELLED {
+            return Err(AppError::biz(
+                code::BIZ_PART_ALREADY_CANCELLED,
+                "工单已 CANCELLED",
+            ));
+        }
         if from != PartStatus::DELIVERED {
             return Err(AppError::biz(
                 code::BIZ_PART_NOT_DELIVERED,
@@ -235,6 +247,12 @@ impl PartService {
                 format!("status 非法: {}", part.status),
             )
         })?;
+        if from == PartStatus::CANCELLED {
+            return Err(AppError::biz(
+                code::BIZ_PART_ALREADY_CANCELLED,
+                "工单已 CANCELLED",
+            ));
+        }
         if from != PartStatus::IN_PROCESS {
             return Err(AppError::biz(
                 code::BIZ_PART_REPAIR_NOT_TRIGGERED,

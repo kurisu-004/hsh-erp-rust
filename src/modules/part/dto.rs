@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::modules::worker_pool::dto::WorkerScanEvent;
 use crate::modules::worker_pool::model::RefillResult;
-use crate::shared::types::{deserialize_i64, serialize_i64};
+use crate::shared::types::{deserialize_i64, serialize_i64, serialize_i64_opt};
 
 /// 工单详情投影（pass_inspection 出参；其它端点复用做最小投影）。
 ///
@@ -42,6 +42,7 @@ pub struct PartOut {
     pub order_no: Option<String>,
     pub actual_delivery_date: Option<chrono::NaiveDate>,
     pub updated_at: chrono::NaiveDateTime,
+    #[serde(serialize_with = "serialize_i64_opt")]
     pub updated_by: Option<i64>,
 }
 

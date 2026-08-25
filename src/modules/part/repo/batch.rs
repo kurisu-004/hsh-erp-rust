@@ -209,6 +209,20 @@ impl PartRepo {
         }
     }
 
+    /// 取 part 当前活跃 INSPECTION 批次的 id（前端轮询用）。
+    ///
+    /// 复用 [`find_inprocess_batch_for_part`] 的 None 路径（自动 COUNT
+    /// 校验唯一性）；仅当恰好 1 条 INSPECTION 批次时返回 Some(id)，其它
+    /// 情形（含 0 条 / ≥2 条歧义）返回 None —— 前端轮询接口对此宽容即可。
+    pub async fn find_current_inspection_batch_id(
+        conn: &mut PgConnection,
+        part_id: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        Ok(Self::find_inprocess_batch_for_part(conn, part_id, None)
+            .await?
+            .map(|b| b.id))
+    }
+
     /// 统计 part 仍处于 INSPECTION 状态的非软删批次数量。
     pub async fn count_other_inprocess_batches<'e, E: PgExecutor<'e>>(
         executor: E,

@@ -82,7 +82,14 @@ impl PartService {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, "新建 part 查不到")
             })?;
         let (cn, l1cn) = lookup_customer_names(conn, part.customer_id).await?;
-        Ok(PartDetailOut::from_with_customer_extra(part, cn, l1cn))
+        let current_batch_id =
+            PartRepo::find_current_inspection_batch_id(conn, part.id).await?;
+        Ok(PartDetailOut::from_with_customer_extra(
+            part,
+            current_batch_id,
+            cn,
+            l1cn,
+        ))
     }
 
     pub async fn batch_create_parts(
@@ -135,20 +142,46 @@ impl PartService {
                 note: item.note.as_deref(),
                 created_by: current.id,
             };
+            // per-item savepoint：让一个 item 失败（DB 22001/23505/23503 等）后
+            // 后续 item 仍能在同一外层事务内继续，避免「一处失败拖垮整批」。
+            // `sp_name` 由 usize `idx` 拼出（不是用户输入），用
+            // `AssertSqlSafe` 跳过 sqlx 的动态字符串审计。
+            use sqlx::AssertSqlSafe;
+            let sp_name = format!("batch_item_{idx}");
+            sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
+                .execute(&mut *conn)
+                .await?;
             match PartRepo::create_part(&mut *conn, new).await {
-                Ok(_) => match PartRepo::get_part_detail(&mut *conn, new_id).await {
-                    Ok(Some(p)) => {
-                        let (cn, l1cn) = lookup_customer_names(conn, p.customer_id).await?;
-                        created.push(PartDetailOut::from_with_customer_extra(p, cn, l1cn));
+                Ok(_) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    match PartRepo::get_part_detail(&mut *conn, new_id).await {
+                        Ok(Some(p)) => {
+                            let (cn, l1cn) = lookup_customer_names(conn, p.customer_id).await?;
+                            let current_batch_id =
+                                PartRepo::find_current_inspection_batch_id(conn, p.id).await?;
+                            created.push(PartDetailOut::from_with_customer_extra(
+                                p,
+                                current_batch_id,
+                                cn,
+                                l1cn,
+                            ));
+                        }
+                        _ => {
+                            failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
+                                part_id: Some(new_id),
+                                code: code::BIZ_PART_NOT_FOUND,
+                                message: "inserted but detail lookup failed".into(),
+                                item_index: idx,
+                            });
+                        }
                     }
-                    _ => failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
-                        part_id: Some(new_id),
-                        code: code::BIZ_PART_NOT_FOUND,
-                        message: "inserted but detail lookup failed".into(),
-                        item_index: idx,
-                    }),
-                },
+                }
                 Err(e) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
                     let mapped = map_create_error(e);
                     failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
                         part_id: None,
@@ -269,7 +302,14 @@ impl PartService {
                 )
             })?;
         let (cn, l1cn) = lookup_customer_names(conn, part.customer_id).await?;
-        Ok(PartDetailOut::from_with_customer_extra(part, cn, l1cn))
+        let current_batch_id =
+            PartRepo::find_current_inspection_batch_id(conn, part.id).await?;
+        Ok(PartDetailOut::from_with_customer_extra(
+            part,
+            current_batch_id,
+            cn,
+            l1cn,
+        ))
     }
 
     pub async fn get_part_by_serial(
@@ -360,21 +400,44 @@ impl PartService {
                 Ok(())
             }
             _ => {
-                // 区分 BIZ_DELIVERY_NOTE_LOCKED_PART / BIZ_PART_NOT_FOUND：
-                // soft_delete SQL 0 行可能由三种情形触发：
-                // 1) `part_id` 不存在（get_by_id 返回 None）→ 20101
-                // 2) `version` 不匹配 / 已软删 / 已 DELIVERED+COMPLETED /
-                //    已绑 delivery_note_id（get_by_id 返回 Some）→ 21420
+                // soft_delete SQL 0 行可能由 4 类原因触发，分支映射到不同错误码：
+                // 1) part_id 不存在                  → 20101 BIZ_PART_NOT_FOUND (404)
+                // 2) 已软删                          → 20101 BIZ_PART_NOT_FOUND (404, "已软删")
+                // 3) version 不匹配                  → 40901 VERSION_CONFLICT (409)
+                // 4) 已挂送货单 (delivery_note_id)   → 21420 BIZ_DELIVERY_NOTE_LOCKED_PART (409)
+                // 5) 终态 (DELIVERED/COMPLETED)       → 20120 BIZ_PART_NOT_DELETABLE (409)
                 let p = PartRepo::get_by_id(&mut *conn, part_id, true).await?;
                 match p {
                     None => Err(AppError::biz(
                         code::BIZ_PART_NOT_FOUND,
                         format!("part {part_id} 不存在"),
                     )),
-                    Some(_) => Err(AppError::biz(
-                        code::BIZ_DELIVERY_NOTE_LOCKED_PART,
-                        format!("part {part_id} 已挂送货单 / 终态禁删 / 版本不匹配"),
+                    Some(p) if p.deleted_at.is_some() => Err(AppError::biz(
+                        code::BIZ_PART_NOT_FOUND,
+                        format!("part {part_id} 已软删"),
                     )),
+                    Some(p) if p.version != expected_version => Err(AppError::biz(
+                        code::VERSION_CONFLICT,
+                        format!("part {part_id} 版本冲突（期望 {expected_version}，实际 {}）", p.version),
+                    )),
+                    Some(p) if p.delivery_note_id.is_some() => Err(AppError::biz(
+                        code::BIZ_DELIVERY_NOTE_LOCKED_PART,
+                        format!("part {part_id} 已挂送货单，禁 soft-delete"),
+                    )),
+                    Some(p) if matches!(p.status.as_str(), "DELIVERED" | "COMPLETED") => {
+                        Err(AppError::biz(
+                            code::BIZ_PART_NOT_DELETABLE,
+                            format!("part {part_id} 状态 {} 终态禁删", p.status),
+                        ))
+                    }
+                    Some(p) => {
+                        // 兜底：理论上 soft_delete SQL 已包含 `deleted_at IS NULL`
+                        // 守卫，此分支不可达。映射成 50000 让上游看到错误模式。
+                        Err(AppError::internal(format!(
+                            "soft_delete_part 兜底：part {part_id} status={} 触发未识别条件",
+                            p.status
+                        )))
+                    }
                 }
             }
         }
@@ -469,7 +532,9 @@ impl PartService {
 // ===== helpers =====
 
 /// `create_part` 的 sqlx 错误码映射：唯一索引冲突（`23505`） → 业务语义
-/// `BIZ_PART_NOT_FOUND`（推测：serial_no 重复 / 软删旧件占号）。
+/// `BIZ_PART_NOT_FOUND`（serial_no 已被使用；可能是软删旧件占号导致
+/// `uk_t_part_serial_no` 触发。当前 INSERT 路径 serial_no 写 NULL，partial
+/// unique 不生效；此分支为预留，等 serial_no 变成可写时启用）。
 ///
 /// `pub(super)`：暴露给 `lifecycle.rs`（如需要）。
 pub(super) fn map_create_error(e: sqlx::Error) -> AppError {
@@ -478,7 +543,7 @@ pub(super) fn map_create_error(e: sqlx::Error) -> AppError {
     {
         return AppError::biz(
             code::BIZ_PART_NOT_FOUND,
-            "零件冲突（推测：serial_no 重复或软删旧件占号）",
+            "serial_no 已被使用（可能软删旧件占号）",
         );
     }
     AppError::from(e)
