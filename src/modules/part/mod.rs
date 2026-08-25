@@ -21,13 +21,25 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ★ 静态段必须在 /{part_id}/... catch-all 之前注册，
-        //   否则 axum 会把 `batch-pass-inspection` 解析成 part_id。
+        //   否则 axum 会把 `batch-*-inspection` 解析成 part_id。
         .route(
             "/batch-pass-inspection",
             post(handler::batch_pass_inspection),
         )
         .route(
+            "/batch-scan-inspect",
+            post(handler::batch_scan_inspect),
+        )
+        .route(
             "/{part_id}/pass-inspection",
             post(handler::pass_inspection),
+        )
+        .route(
+            "/{part_id}/scan-inspect",
+            post(handler::scan_inspect),
+        )
+        .route(
+            "/{part_id}/fail-inspection",
+            post(handler::fail_inspection),
         )
 }

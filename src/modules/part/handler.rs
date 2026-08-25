@@ -22,16 +22,40 @@ use axum::extract::{Path, State};
 use axum::Json;
 
 use crate::auth::rbac::{CurrentUser, Role};
+use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::dto::{
-    BatchPassInspectionOut, BatchPassInspectionRequest, PartOut, PassInspectionRequest,
+    BatchPassInspectionOut, BatchPassInspectionRequest, BatchScanInspectOut,
+    BatchScanInspectRequest, FailInspectionRequest, PartOut, PassInspectionRequest,
+    ScanInspectRequest,
 };
-use crate::modules::part::service::{PartService, BATCH_PASS_INSPECTION_MAX_ITEMS};
+use crate::modules::part::service::{
+    PartService, BATCH_PASS_INSPECTION_MAX_ITEMS, BATCH_SCAN_INSPECT_MAX_ITEMS,
+};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
 /// 单件 / 批量送检均允许的角色：Manager 或 Inspector。
 const PASS_INSPECTION_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
+
+/// scan-inspect 第一步 WS 广播事件（commit 后调用）。
+fn ws_broadcast_inspected(state: &AppState, part_id: i64, shelf_code: &str) {
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "INSPECTED".into(),
+        payload: serde_json::json!({
+            "part_id": part_id.to_string(),
+            "shelf_code": shelf_code,
+        }),
+    });
+}
+
+/// fail-inspection WS 广播事件。
+fn ws_broadcast_inspection_failed(state: &AppState, part_id: i64) {
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "INSPECTION_FAILED".into(),
+        payload: serde_json::json!({ "part_id": part_id.to_string() }),
+    });
+}
 
 /// POST /api/v2/parts/{part_id}/pass-inspection
 ///
@@ -95,5 +119,79 @@ pub async fn batch_pass_inspection(
     let mut tx = state.pool.begin().await?;
     let out = PartService::batch_pass_inspection(&mut tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/scan-inspect
+///
+/// 单件一键送检（`PENDING / PROGRAMMING / IN_PROCESS` → `INSPECTION` → PASS/FAIL）。
+///
+/// 行为：
+/// - 权限：`Manager` 或 `Inspector`
+/// - 入参：path `part_id` + body `ScanInspectRequest`
+/// - 业务流转：见 service `scan_inspect_core`
+/// - WS 广播：commit 后 `INSPECTED` 事件
+/// - 响应：`PartOut`
+pub async fn scan_inspect(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<ScanInspectRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    current.require_any_role(PASS_INSPECTION_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::scan_inspect(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    ws_broadcast_inspected(&state, part_id, "scan-inspect");
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/batch-scan-inspect
+///
+/// 批量一键送检（共享品检架 + per-item decision）。
+///
+/// 行为：
+/// - 权限：`Manager` 或 `Inspector`
+/// - 入参：`{ target_inspection_shelf_id, items: [...] }`
+/// - 业务流转：service `batch_scan_inspect`（共享外层事务 + per-item 独立 core）
+/// - 响应：`{ submitted, failed }`
+pub async fn batch_scan_inspect(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<BatchScanInspectRequest>,
+) -> Result<Json<R<BatchScanInspectOut>>, AppError> {
+    current.require_any_role(PASS_INSPECTION_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::batch_scan_inspect(&mut tx, &state.snowflake, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "BATCH_INSPECTED".into(),
+        payload: serde_json::json!({
+            "submitted": out.submitted.len(),
+            "failed": out.failed.len(),
+        }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/fail-inspection
+///
+/// 单件品检打回（`INSPECTION` → `IN_PROCESS`，推荐需求 3）。
+///
+/// 行为：
+/// - 权限：`Manager` 或 `Inspector`
+/// - 业务流转：见 service `fail_inspection_core`
+/// - WS 广播：commit 后 `INSPECTION_FAILED`
+pub async fn fail_inspection(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<FailInspectionRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    current.require_any_role(PASS_INSPECTION_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::fail_inspection(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    ws_broadcast_inspection_failed(&state, part_id);
     Ok(Json(R::ok(out)))
 }
