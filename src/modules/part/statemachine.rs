@@ -90,17 +90,34 @@ impl PartStatus {
     /// - `PENDING → INSPECTION`：scan_inspect (PENDING → INSPECTION)
     /// - `IN_PROCESS → INSPECTION`：scan_inspect (IN_PROCESS → INSPECTION)
     ///
+    /// PR-CRUD 新增：
+    /// - `READY_TO_SHIP → DELIVERED` (deliver)
+    /// - `DELIVERED → COMPLETED` (complete)
+    /// - `PENDING/PROGRAMMING/INSPECTION/READY_TO_SHIP/DELIVERED → CANCELLED` (cancel)
+    /// - `IN_PROCESS → REPAIRING` (start-repair)
+    ///
     /// IN_PROCESS+WORKER 拒绝 / IN_PROCESS+非 PRODUCTION_SHELF 拒绝走
     /// service 层组合校验（仿 myERP `service/part.py:4140-4164`），不污染
     /// 状态机白名单。
     pub fn can_transition_to(self, to: Self) -> bool {
+        use PartStatus::*;
         matches!(
             (self, to),
-            (Self::INSPECTION,    Self::READY_TO_SHIP)
-                | (Self::INSPECTION,    Self::IN_PROCESS)
-                | (Self::PROGRAMMING, Self::INSPECTION)
-                | (Self::PENDING,     Self::INSPECTION)
-                | (Self::IN_PROCESS,  Self::INSPECTION)
+            // 既有（保留）
+            (INSPECTION, READY_TO_SHIP)
+                | (INSPECTION, IN_PROCESS)
+                | (PROGRAMMING, INSPECTION)
+                | (PENDING, INSPECTION)
+                | (IN_PROCESS, INSPECTION)
+            // PR-CRUD 新增
+                | (READY_TO_SHIP, DELIVERED)        // deliver
+                | (DELIVERED, COMPLETED)            // complete
+                | (PENDING, CANCELLED)              // cancel
+                | (PROGRAMMING, CANCELLED)
+                | (INSPECTION, CANCELLED)
+                | (READY_TO_SHIP, CANCELLED)
+                | (DELIVERED, CANCELLED)
+                | (IN_PROCESS, REPAIRING)           // start-repair
         )
     }
 }
@@ -144,7 +161,6 @@ mod tests {
     #[test]
     fn disallowed_transitions_default_false() {
         assert!(!PartStatus::PENDING.can_transition_to(PartStatus::READY_TO_SHIP));
-        assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::CANCELLED));
         assert!(!PartStatus::DELIVERED.can_transition_to(PartStatus::INSPECTION));
         assert!(!PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::INSPECTION));
     }
@@ -169,5 +185,33 @@ mod tests {
         // 跨度过大
         assert!(!PartStatus::PENDING.can_transition_to(PartStatus::READY_TO_SHIP));
         assert!(!PartStatus::IN_PROCESS.can_transition_to(PartStatus::READY_TO_SHIP));
+    }
+
+    #[test]
+    fn allowed_transitions_lifecycle() {
+        assert!(PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::DELIVERED));
+        assert!(PartStatus::DELIVERED.can_transition_to(PartStatus::COMPLETED));
+        for s in [
+            PartStatus::PENDING,
+            PartStatus::PROGRAMMING,
+            PartStatus::INSPECTION,
+            PartStatus::READY_TO_SHIP,
+            PartStatus::DELIVERED,
+        ] {
+            assert!(s.can_transition_to(PartStatus::CANCELLED), "from {s:?} should be cancellable");
+        }
+        assert!(PartStatus::IN_PROCESS.can_transition_to(PartStatus::REPAIRING));
+    }
+
+    #[test]
+    fn disallowed_transitions_lifecycle_rejects() {
+        assert!(!PartStatus::DELIVERED.can_transition_to(PartStatus::DELIVERED));
+        assert!(!PartStatus::COMPLETED.can_transition_to(PartStatus::CANCELLED));
+        assert!(!PartStatus::COMPLETED.can_transition_to(PartStatus::DELIVERED));
+        assert!(!PartStatus::CANCELLED.can_transition_to(PartStatus::PENDING));
+        assert!(!PartStatus::PENDING.can_transition_to(PartStatus::REPAIRING));
+        assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::REPAIRING));
+        assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::DELIVERED));
+        assert!(!PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::COMPLETED));
     }
 }
