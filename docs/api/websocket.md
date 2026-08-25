@@ -26,16 +26,28 @@ Request：
 
 来自 `src/infra/ws_hub.rs::WsEvent`（**实施后才会下发**）：
 
-| kind | 含义 |
-|---|---|
-| `DashboardSnapshot` | 大屏初始快照 |
-| `DashboardEvent` | 业务事件，payload 含 `kind` 子类型： |
-| ↳ `DELIVERY_NOTE_CREATED` | 送货单创建 |
-| ↳ `DELIVERY_NOTE_PARTS_ADDED` | 送货单加件 |
-| ↳ `DELIVERY_NOTE_SCAN_ADD` | 扫码入单（高频） |
-| ↳ `DELIVERY_NOTE_SUBMITTED` | 提交 |
-| ↳ `DELIVERY_NOTE_PICKED_UP` | 司机领取 |
-| ↳ `DELIVERY_NOTE_PRINTED` | 打印（kind=`note` 或 `label`） |
-| `Notification` | 通知 |
-| `Heartbeat` | 心跳 |
+| kind | 含义 | payload 关键字段 |
+|---|---|---|
+| `DashboardSnapshot` | 大屏初始快照 | （snapshot shape 由 dashboard 域定义） |
+| `DashboardEvent` | 业务事件，payload 含 `kind` 子类型： | |
+| ↳ `DELIVERY_NOTE_CREATED` | 送货单创建 | `note_id` |
+| ↳ `DELIVERY_NOTE_PARTS_ADDED` | 送货单加件 | `note_id`, `added_part_ids` |
+| ↳ `DELIVERY_NOTE_SCAN_ADD` | 扫码入单（高频） | `note_id`, `part_id`, `batch_id` |
+| ↳ `DELIVERY_NOTE_SUBMITTED` | 提交 | `note_id` |
+| ↳ `DELIVERY_NOTE_PICKED_UP` | 司机领取 | `note_id`, `driver_user_id` |
+| ↳ `DELIVERY_NOTE_PRINTED` | 打印（kind=`note` 或 `label`） | `note_id`, `kind` |
+| ↳ `INSPECTED` | scan-inspect / pass-inspection 成功后 | `part_id`, `shelf_code` |
+| ↳ `BATCH_INSPECTED` | batch-scan-inspect 完成后 | `submitted`, `failed` |
+| ↳ `INSPECTION_FAILED` | fail-inspection 完成后 | `part_id` |
+| ↳ `WORKER_SCAN_RETURNED` | parts worker-scan RETURNED 成功后 | `worker_id`, `part_id`, `batch_id`, `event_type` |
+| ↳ `WORKER_SCAN_INSPECTED` | parts worker-scan INSPECTED 成功后 | `worker_id`, `part_id`, `batch_id`, `event_type`, `target_inspection_shelf_id` |
+| ↳ `WORKER_POOL_REFILL_DONE` | worker-scan / admin-refill 完成后（refill 抢到一批） | `worker_id`, `shelf_id`, `taken: [TakenItem]`, `pool_empty` |
+| ↳ `WORKER_POOL_EMPTY` | refill 池空（refill 没抢到任何一批） | `worker_id`, `shelf_id` |
+| ↳ `WORKER_POOL_ADMIN_REMOVED` | admin remove 完成后 | `batch_id`, `part_id`, `batch_no`, `quantity`, `serial_no`, `drawing_no`, `system_delivery_date`, `planned_delivery_date`, `is_urgent`, `version`, `worker_id`, `shelf_id`, `next_process_id` |
+| `Notification` | 通知 | `user_id`, `content` |
+| `Heartbeat` | 心跳 | `ts` |
+
+> **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts.md#worker-scan`](./parts.md#post-apiv2partsworker-scan) 与 [`./worker-pool.md`](./worker-pool.md)。
+>
+> i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
 

@@ -167,7 +167,9 @@ handler 返回 `Result<Json<R<T>>, AppError>`：
 | 0 | SUCCESS | `code::SUCCESS = 0` |
 | 40000~41xxx | HTTP 语义 | `BAD_REQUEST=40000`、`VALIDATION_ERROR=40001`、`UNAUTHORIZED=40100`、`FORBIDDEN=40300`、`NOT_FOUND=40400`、`VERSION_CONFLICT=40901`、`REQUEST_TOO_LARGE=41301` |
 | 50000~ | 系统 | `INTERNAL=50000`、`DATABASE=50001` |
-| 200xx~ | 业务域 | 200xx 用户、201xx 零件/客户、202xx 工人、203xx 装配体、204xx/211xx 文件、205xx 货架、206xx 账号、208xx 工序、209xx 工种、210xx 申请人、212xx 外协公司、213xx 外协报价、214xx 送货单、215xx 外协发货 |
+| 200xx~ | 业务域 | 200xx 用户、201xx 零件/客户（**20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER** worker-pool-take 新增）、202xx 工人（**20205 BIZ_WORKER_POOL_EMPTY / 20206 BIZ_WORKER_NO_WORK_TYPE** worker-pool-take 新增）、203xx 装配体、204xx/211xx 文件、205xx 货架、206xx 账号、208xx 工序、209xx 工种（**20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET / 20905 BIZ_WORK_TYPE_NO_PROCESS_MAPPING** worker-pool-take 新增）、210xx 申请人、212xx 外协公司、213xx 外协报价、214xx 送货单、215xx 外协发货 |
+
+> 20113 BIZ_CUSTOMER_IN_USE 原与 20109 同号；worker-pool-take 阶段确认 20109 = BIZ_PART_BATCH_NOT_FOUND 后，20113 单作 BIZ_CUSTOMER_IN_USE 使用，20114 留给 BIZ_PART_BATCH_NOT_HELD_BY_WORKER。
 
 业务域 2xxxx 段由各域实现阶段自行定义，**前置要求是给前端契约兼容**。
 
@@ -326,20 +328,21 @@ SQLX_OFFLINE=true cargo build --release
 3. **零件工单核心**
    - `modules/part/`（包括 `part_batch` / `part_event` / `pickup_skip_event` / `serial_counter`）
    - 同步实施 `modules/customer/` `modules/shelf/` `modules/worker/` `modules/process/` `modules/work_type/`（part 强依赖）
-4. **装配体、送货单、外协**
+4. **装配体、送货单、外协、worker-pool**
    - `modules/assembly/`（含 rollup）
    - `modules/delivery_note/`（含打印）
 
    > 送货单域的扫码建单 / 规则分类 / 勾选打印标签的完整设计见 `docs/delivery-note-redesign.md`。
 
    - `modules/outsource/`（company/quote/shipment）
+   - **`modules/worker_pool/`**（✅ **worker-pool-take 已完成**：`POST /parts/worker-scan` 同事务联动 `refill_for_worker`、`POST /admin/worker-pool/refill`、`POST /admin/worker-pool/remove`、`GET /worker-pool/state`；错误码 20114/20205/20206/20904/20905；WS 5 类 `WORKER_*` 事件已注册）。详细文档见 [`docs/api/worker-pool.md`](api/worker-pool.md) + [`docs/api/parts.md`](api/parts.md#post-apiv2partsworker-scan)。
 5. **文件、CNC、统计**
    - `modules/part_file/` + COS trait 实现（`infra/cos.rs`）
    - `modules/cnc_program/`
    - `modules/statistics/`
 6. **横切补完**
    - `task/auto_complete.rs` 业务查询
-   - `modules/dashboard/` WebSocket 完整实现
+   - `modules/dashboard/` WebSocket 完整实现（worker-pool WS 事件已注册，待 hub 真实握手后即可下发）
    - `modules/mcp/` MCP tool 暴露**（本骨架不含——MCP 由独立服务器承载）**
    - 集成测试 `tests/common/mod.rs` + 各域场景
 7. **运维**
