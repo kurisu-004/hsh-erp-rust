@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part\n            SET status            = 'INSPECTION',\n                location          = 'INSPECTION_SHELF',\n                current_holder_id = $3,\n                version           = version + 1,\n                updated_at        = now(),\n                updated_by        = $4\n            WHERE id = $1 AND version = $2\n              AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')\n              AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9a3f6634ee99c4ad9be3467f70f68e2bc591374e84472b2e49d74f5bc80437a7"
+}

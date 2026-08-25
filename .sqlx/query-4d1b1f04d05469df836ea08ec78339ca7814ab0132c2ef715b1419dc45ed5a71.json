@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT COUNT(*) AS \"n!\"\n                    FROM t_part_batch\n                    WHERE part_id = $1\n                      AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')\n                      AND deleted_at IS NULL\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4d1b1f04d05469df836ea08ec78339ca7814ab0132c2ef715b1419dc45ed5a71"
+}

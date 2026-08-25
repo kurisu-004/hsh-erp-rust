@@ -478,4 +478,277 @@ impl PartRepo {
         .await?;
         Ok(())
     }
+
+    /// 定位 scan-inspect 的目标批次（白名单 `{PENDING, PROGRAMMING, IN_PROCESS}`）。
+    ///
+    /// 与 `find_inprocess_batch_for_part` 同形：
+    /// - `expected_batch_id = None`：先 COUNT 校验唯一性（≥2 → `RowNotFound`）；
+    ///   == 0 → `Ok(None)`；== 1 → 取 id 最小者。
+    /// - `expected_batch_id = Some(bid)`：按 id 校验 ownership + status in 白名单。
+    ///
+    /// 签名收 `&mut PgConnection`（与既有同形）。
+    pub async fn find_scan_target_batch(
+        conn: &mut PgConnection,
+        part_id: i64,
+        expected_batch_id: Option<i64>,
+    ) -> Result<Option<TPartBatch>, sqlx::Error> {
+        match expected_batch_id {
+            Some(bid) => sqlx::query_as!(
+                TPartBatch,
+                r#"
+                SELECT id, part_id, batch_no, quantity, status, location,
+                       current_holder_id, next_process_id, placed_at,
+                       delivery_note_id, parent_batch_id, has_been_repaired,
+                       version, created_at, created_by, updated_at, updated_by,
+                       deleted_at
+                FROM t_part_batch
+                WHERE id = $1 AND part_id = $2
+                  AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')
+                  AND deleted_at IS NULL
+                "#,
+                bid,
+                part_id,
+            )
+            .fetch_optional(&mut *conn)
+            .await,
+            None => {
+                let count: i64 = sqlx::query_scalar!(
+                    r#"
+                    SELECT COUNT(*) AS "n!"
+                    FROM t_part_batch
+                    WHERE part_id = $1
+                      AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')
+                      AND deleted_at IS NULL
+                    "#,
+                    part_id,
+                )
+                .fetch_one(&mut *conn)
+                .await?;
+                match count {
+                    0 => Ok(None),
+                    1 => sqlx::query_as!(
+                        TPartBatch,
+                        r#"
+                        SELECT id, part_id, batch_no, quantity, status, location,
+                               current_holder_id, next_process_id, placed_at,
+                               delivery_note_id, parent_batch_id, has_been_repaired,
+                               version, created_at, created_by, updated_at, updated_by,
+                               deleted_at
+                        FROM t_part_batch
+                        WHERE part_id = $1
+                          AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')
+                          AND deleted_at IS NULL
+                        ORDER BY id ASC
+                        LIMIT 1
+                        "#,
+                        part_id,
+                    )
+                    .fetch_optional(&mut *conn)
+                    .await,
+                    _ => Err(sqlx::Error::RowNotFound),
+                }
+            }
+        }
+    }
+
+    /// 定位 fail-inspection 的目标 INSPECTION 批次。
+    ///
+    /// 与 `find_inprocess_batch_for_part` 同形（白名单仅 `{INSPECTION}`）。
+    pub async fn find_inspection_batch_for_fail(
+        conn: &mut PgConnection,
+        part_id: i64,
+        expected_batch_id: Option<i64>,
+    ) -> Result<Option<TPartBatch>, sqlx::Error> {
+        match expected_batch_id {
+            Some(bid) => sqlx::query_as!(
+                TPartBatch,
+                r#"
+                SELECT id, part_id, batch_no, quantity, status, location,
+                       current_holder_id, next_process_id, placed_at,
+                       delivery_note_id, parent_batch_id, has_been_repaired,
+                       version, created_at, created_by, updated_at, updated_by,
+                       deleted_at
+                FROM t_part_batch
+                WHERE id = $1 AND part_id = $2 AND status = 'INSPECTION'
+                  AND deleted_at IS NULL
+                "#,
+                bid,
+                part_id,
+            )
+            .fetch_optional(&mut *conn)
+            .await,
+            None => {
+                let count: i64 = sqlx::query_scalar!(
+                    r#"
+                    SELECT COUNT(*) AS "n!"
+                    FROM t_part_batch
+                    WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL
+                    "#,
+                    part_id,
+                )
+                .fetch_one(&mut *conn)
+                .await?;
+                match count {
+                    0 => Ok(None),
+                    1 => sqlx::query_as!(
+                        TPartBatch,
+                        r#"
+                        SELECT id, part_id, batch_no, quantity, status, location,
+                               current_holder_id, next_process_id, placed_at,
+                               delivery_note_id, parent_batch_id, has_been_repaired,
+                               version, created_at, created_by, updated_at, updated_by,
+                               deleted_at
+                        FROM t_part_batch
+                        WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL
+                        ORDER BY id ASC
+                        LIMIT 1
+                        "#,
+                        part_id,
+                    )
+                    .fetch_optional(&mut *conn)
+                    .await,
+                    _ => Err(sqlx::Error::RowNotFound),
+                }
+            }
+        }
+    }
+
+    /// scan-inspect 第一步：工单搬到品检架（OCC UPDATE t_part）。
+    ///
+    /// 0 行 → 版本冲突 / 状态不在 scan 白名单 → 40901 VERSION_CONFLICT。
+    /// 成功 → status='INSPECTION', location='INSPECTION_SHELF', current_holder_id=shelf_id,
+    /// version += 1。
+    pub async fn mark_part_inspected<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        expected_version: i32,
+        shelf_id: i64,
+        current_user_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE t_part
+            SET status            = 'INSPECTION',
+                location          = 'INSPECTION_SHELF',
+                current_holder_id = $3,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $4
+            WHERE id = $1 AND version = $2
+              AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')
+              AND deleted_at IS NULL
+            "#,
+            part_id,
+            expected_version,
+            shelf_id,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// scan-inspect 第一步：批次状态同步（OCC UPDATE t_part_batch）。
+    ///
+    /// 与 `mark_part_inspected` 同事务调用；t_part_batch 已有 `location` /
+    /// `current_holder_id` 字段。
+    pub async fn mark_batch_inspected<'e, E: PgExecutor<'e>>(
+        executor: E,
+        batch_id: i64,
+        expected_version: i32,
+        shelf_id: i64,
+        current_user_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE t_part_batch
+            SET status            = 'INSPECTION',
+                location          = 'INSPECTION_SHELF',
+                current_holder_id = $3,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $4
+            WHERE id = $1 AND version = $2
+              AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')
+              AND deleted_at IS NULL
+            "#,
+            batch_id,
+            expected_version,
+            shelf_id,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// fail-inspection：批次打回生产架（OCC UPDATE t_part_batch）。
+    ///
+    /// 0 行 → 40901 VERSION_CONFLICT。
+    pub async fn mark_batch_failed_inspection<'e, E: PgExecutor<'e>>(
+        executor: E,
+        batch_id: i64,
+        expected_version: i32,
+        shelf_id: i64,
+        next_process_id: i64,
+        current_user_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE t_part_batch
+            SET status            = 'IN_PROCESS',
+                location          = 'PRODUCTION_SHELF',
+                current_holder_id = $3,
+                next_process_id   = $4,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $5
+            WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
+              AND deleted_at IS NULL
+            "#,
+            batch_id,
+            expected_version,
+            shelf_id,
+            next_process_id,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// fail-inspection：工单状态同步（OCC UPDATE t_part）。
+    ///
+    /// 与 `mark_batch_failed_inspection` 同事务调用。
+    pub async fn mark_part_failed_inspection<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        expected_version: i32,
+        shelf_id: i64,
+        next_process_id: i64,
+        current_user_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE t_part
+            SET status            = 'IN_PROCESS',
+                location          = 'PRODUCTION_SHELF',
+                current_holder_id = $3,
+                next_process_id   = $4,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $5
+            WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
+              AND deleted_at IS NULL
+            "#,
+            part_id,
+            expected_version,
+            shelf_id,
+            next_process_id,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
