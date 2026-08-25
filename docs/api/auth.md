@@ -9,7 +9,7 @@
 |---|---|---|---|
 | POST | `/api/v2/auth/login` | 公开 | 用户名密码登录，返回 access+refresh token |
 | GET | `/api/v2/auth/me` | 已登录 | 当前用户信息 + 菜单树 |
-| POST | `/api/v2/auth/logout` | 已登录 | no-op，返回 `{ ok: true }` |
+| POST | `/api/v2/auth/logout` | 已登录 | 删除当前 token 的 Redis session，立即生效；后续 `/me` 返回 40105 |
 | POST | `/api/v2/auth/change-password` | 已登录 | 改自己密码 |
 | POST | `/api/v2/auth/refresh` | 公开 | refresh token 换新 access+refresh pair |
 
@@ -78,9 +78,11 @@ Response 200 `data`：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `ok` | bool | 始终 `true`（no-op） |
+| `ok` | bool | 始终 `true` |
 
-> 服务端无法强制吊销短期 access token。"登出"由前端清除本地 token 实现；后端通过 refresh 版本号轮转实现"实质登出"。
+> 后端从 Bearer token 解析 sha256，删除 Redis 中 `session:tok:<hash>` 条目与
+> 用户 Set 索引中的对应成员；当前 token 立即失效，后续 `/me` 返回 40105 SESSION_REVOKED。
+> 其他 token（同一用户的其他设备）不受影响。
 
 ### `POST /api/v2/auth/change-password`
 
@@ -114,3 +116,7 @@ Response 200 `data`：同 [`/auth/login`](#post-apiv2authlogin)
 错误码：
 
 - 40103 REFRESH_INVALID — refresh 失效 / 版本不匹配 / 用户已停用
+
+### Auth 域错误码补充
+
+- 40105 SESSION_REVOKED — 会话已被吊销（Redis 中不存在 / 已失效）。前端应清除本地 token 并跳回登录页。

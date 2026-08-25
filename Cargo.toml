@@ -54,6 +54,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }     # 双 token（access + refresh 轮转）
 bcrypt = "0.17"
 
+# Redis（用户会话存储，服务端 session 真相源；吊销 access token 用）
+# - redis 1.x：deadpool-redis 0.23 透传；显式 pin + 关闭默认 features，避免拖入多余 runtime
+# - deadpool-redis 0.23：连接池，默认 feature rt_tokio_1 拉 `redis/tokio-comp`
+# - sha2 0.10：sha256(token) 作为 Redis key，避免直接用明文 token 当 key
+redis = { version = "1", default-features = false, features = ["tokio-comp"] }
+deadpool-redis = "0.23"
+sha2 = "0.10"
+
 # 配置加载
 dotenvy = "0.15"
 

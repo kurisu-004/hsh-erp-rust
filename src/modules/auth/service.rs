@@ -17,6 +17,7 @@ use sqlx::PgConnection;
 use crate::auth::jwt::{decode_refresh, issue_token_pair};
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::session::{hash_token, CachedCurrentUser, TokenKind};
 use crate::infra::clock::now_naive;
 use crate::modules::user::dto::{ChangePasswordRequest, CurrentUserOut};
 use crate::modules::user::repo::{ShelfRepo, UserRepo, UserRoleRepo, UserRoleRow};
@@ -107,7 +108,39 @@ impl AuthService {
         // 7. 戳一下 last_login_at（不动 version，避开与并发业务更新冲突）
         UserRepo::touch_login(&mut *conn, u.id, now_naive()).await?;
 
-        // 8. 组装 CurrentUserOut（直接拼，不绕 user helper，避免 jwt 里 stale 数据回流到 /me）
+        // 8. 服务端 session 入库（Redis）：
+        //    tx 已 commit（handler 端），此处为 tx 外。失败应直接抛错让登录失败，
+        //    否则用户拿 token 但下次 `/me` 立刻 40105 —— 比显式报错更迷惑。
+        let cached = CachedCurrentUser {
+            id: u.id,
+            username: u.username.clone(),
+            roles: roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
+            shelf_ids: shelf_ids.clone(),
+            shelf_wildcard,
+        };
+        let ttl = state.config.redis.session_ttl_seconds;
+        state
+            .session
+            .create_session(
+                &hash_token(&pair.access_token),
+                u.id,
+                TokenKind::Access,
+                ttl,
+                &cached,
+            )
+            .await?;
+        state
+            .session
+            .create_session(
+                &hash_token(&pair.refresh_token),
+                u.id,
+                TokenKind::Refresh,
+                ttl,
+                &cached,
+            )
+            .await?;
+
+        // 9. 组装 CurrentUserOut（直接拼，不绕 user helper，避免 jwt 里 stale 数据回流到 /me）
         let user_out = build_current_user_out(&u, &roles, &shelf_ids, menus);
 
         Ok(LoginResponse {
@@ -186,6 +219,40 @@ impl AuthService {
             state.config.jwt.refresh_ttl_days,
         )?;
 
+        // 6. 旧 refresh 的 Redis session 删除（best-effort）+ 新一对 token 写 session
+        let old_refresh_hash = hash_token(&req.refresh_token);
+        if let Err(e) = state.session.delete_session(&old_refresh_hash).await {
+            tracing::warn!(error = %e, user_id = u.id, "refresh: 删旧 refresh session 失败");
+        }
+        let cached = CachedCurrentUser {
+            id: u.id,
+            username: u.username.clone(),
+            roles: roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
+            shelf_ids: shelf_ids.clone(),
+            shelf_wildcard,
+        };
+        let ttl = state.config.redis.session_ttl_seconds;
+        state
+            .session
+            .create_session(
+                &hash_token(&pair.access_token),
+                u.id,
+                TokenKind::Access,
+                ttl,
+                &cached,
+            )
+            .await?;
+        state
+            .session
+            .create_session(
+                &hash_token(&pair.refresh_token),
+                u.id,
+                TokenKind::Refresh,
+                ttl,
+                &cached,
+            )
+            .await?;
+
         let user_out = build_current_user_out(&u, &roles, &shelf_ids, menus);
 
         Ok(LoginResponse {
@@ -222,6 +289,7 @@ impl AuthService {
         user_id: i64,
         req: ChangePasswordRequest,
         current: &CurrentUser,
+        state: &Arc<AppState>,
     ) -> Result<(), AppError> {
         // 权限：本人或 MANAGER；与 user_service.change_own_password 内部校验重复，
         // 显式提一处以便在 service 入口给出明确语义。
@@ -234,8 +302,15 @@ impl AuthService {
             &req.old_password,
             &req.new_password,
             current,
+            state,
         )
         .await
+    }
+
+    /// 登出当前 token：删 Redis session 条目，使后续 `/me` 立即返回 40105。
+    /// 注意 — 此函数不依赖 tx，service 入口在 handler 处负责提交（此处没有 DB 写）。
+    pub async fn logout(state: &Arc<AppState>, token_hash: &str) -> Result<(), AppError> {
+        state.session.delete_session(token_hash).await
     }
 }
 

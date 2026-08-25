@@ -86,7 +86,7 @@ pub async fn admin_reset_password(
     Path(id): Path<i64>,
 ) -> Result<Json<R<UserOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = UserService::admin_reset_password(&mut tx, id, &current).await?;
+    let out = UserService::admin_reset_password(&mut tx, id, &current, &state).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }

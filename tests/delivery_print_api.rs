@@ -60,7 +60,7 @@ async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
 async fn login(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = common::test_state(pool.clone());
+    let state = common::test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env_bytes) = send(
         app,
@@ -81,7 +81,7 @@ async fn login(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
 #[tokio::test]
 async fn print_endpoint_requires_auth() {
     let (_guard, pool) = setup().await;
-    let state = common::test_state(pool.clone());
+    let state = common::test_state(pool.clone()).await;
     let app = test_app(state);
     let req = json_request("POST", "/delivery-notes/1/print", Some(json!({})), None);
     let (status, _body) = send(app, req).await;

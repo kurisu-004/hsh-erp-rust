@@ -6,8 +6,7 @@
 //! - 写接口（login / refresh / change-password）在 handler 开 tx 并显式 commit。
 //! - 只读（me）直接 acquire 一个连接，无需事务。
 //! - 公开端点（login / refresh）不注入 `CurrentUser` extractor；其余端点都需 Bearer JWT。
-//! - logout 是 no-op：服务端无法强制吊销 access token（短期有效），由 `refresh` 轮转版本号
-//!   实现「实质登出」；本接口返回 `{ ok: true }` 让前端走完流程。
+//! - logout 现在真删 Redis session 条目（`delete_session(token_hash)`），后续 `/me` 立即 40105。
 
 use std::sync::Arc;
 
@@ -15,6 +14,7 @@ use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
+use crate::auth::extractor::AuthTokenHash;
 use crate::auth::rbac::CurrentUser;
 use crate::modules::user::dto::{ChangePasswordRequest, CurrentUserOut};
 use crate::shared::error::AppError;
@@ -45,9 +45,14 @@ pub async fn me(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/auth/logout —— no-op；返回 `{ ok: true }`
-pub async fn logout() -> Json<R<LogoutResponse>> {
-    Json(R::ok(LogoutResponse { ok: true }))
+/// POST /api/v2/auth/logout —— 删当前 token 的 Redis session，使后续 `/me` 立即 40105。
+pub async fn logout(
+    State(state): State<Arc<AppState>>,
+    _user: CurrentUser,
+    AuthTokenHash(token_hash): AuthTokenHash,
+) -> Result<Json<R<LogoutResponse>>, AppError> {
+    AuthService::logout(&state, &token_hash).await?;
+    Ok(Json(R::ok(LogoutResponse { ok: true })))
 }
 
 /// POST /api/v2/auth/change-password
@@ -56,9 +61,12 @@ pub async fn change_password(
     user: CurrentUser,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<R<()>>, AppError> {
+    let user_id = user.id;
     let mut tx = state.pool.begin().await?;
-    AuthService::change_password(&mut tx, user.id, req, &user).await?;
+    AuthService::change_password(&mut tx, user_id, req, &user, &state).await?;
     tx.commit().await?;
+    // `UserService::change_own_password` 内部已经做过 best-effort 清 session；
+    // 这里无需再清——单点入口收敛到 service 层。
     Ok(Json(R::ok_empty()))
 }
 

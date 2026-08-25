@@ -39,6 +39,7 @@ pub mod code {
     pub const TOKEN_EXPIRED: i32 = 40102;
     pub const REFRESH_INVALID: i32 = 40103;         // refresh token 失效/版本不匹配/用户停用
     pub const OLD_PASSWORD_MISMATCH: i32 = 40104;   // 修改密码时旧密码错误
+    pub const SESSION_REVOKED: i32 = 40105;         // 服务端 Redis session 不存在（已 logout/改密/吊销）
 
     pub const FORBIDDEN: i32 = 40300;
 
@@ -319,7 +320,8 @@ fn status_from_code(c: i32) -> StatusCode {
         c if c == code::TOKEN_EXPIRED => StatusCode::UNAUTHORIZED,
         c if c == code::BIZ_AUTH_INVALID
             || c == code::REFRESH_INVALID
-            || c == code::OLD_PASSWORD_MISMATCH => StatusCode::UNAUTHORIZED,
+            || c == code::OLD_PASSWORD_MISMATCH
+            || c == code::SESSION_REVOKED => StatusCode::UNAUTHORIZED,
         c if c == code::SHELF_MISMATCH => StatusCode::FORBIDDEN,
         c if c == code::USER_NOT_FOUND || c == code::ROLE_NOT_FOUND => StatusCode::NOT_FOUND,
         c if c == code::DUPLICATE_USERNAME || c == code::ROLE_DUPLICATE => StatusCode::CONFLICT,
@@ -448,6 +450,7 @@ mod tests {
         (code::TOKEN_EXPIRED, "TOKEN_EXPIRED"),
         (code::REFRESH_INVALID, "REFRESH_INVALID"),
         (code::OLD_PASSWORD_MISMATCH, "OLD_PASSWORD_MISMATCH"),
+        (code::SESSION_REVOKED, "SESSION_REVOKED"),
         (code::FORBIDDEN, "FORBIDDEN"),
         (code::SHELF_MISMATCH, "SHELF_MISMATCH"),
         (code::NOT_FOUND, "NOT_FOUND"),
@@ -735,6 +738,7 @@ mod tests {
         (code::TOKEN_EXPIRED, StatusCode::UNAUTHORIZED, "TOKEN_EXPIRED"),
         (code::REFRESH_INVALID, StatusCode::UNAUTHORIZED, "REFRESH_INVALID"),
         (code::OLD_PASSWORD_MISMATCH, StatusCode::UNAUTHORIZED, "OLD_PASSWORD_MISMATCH"),
+        (code::SESSION_REVOKED, StatusCode::UNAUTHORIZED, "SESSION_REVOKED"),
         (code::FORBIDDEN, StatusCode::FORBIDDEN, "FORBIDDEN"),
         (code::SHELF_MISMATCH, StatusCode::FORBIDDEN, "SHELF_MISMATCH"),
         (code::NO_ROLE, StatusCode::FORBIDDEN, "NO_ROLE"),

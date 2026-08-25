@@ -14,6 +14,7 @@
 | 序列化 | **serde + serde_json** | 标准选择 |
 | 时间 | **chrono (FixedOffset)** | 业务统一 Asia/Shanghai（无 chrono-tz 依赖） |
 | 认证 | **jsonwebtoken (HS256) + bcrypt** | Python 端 `pyjwt + bcrypt`，直接对应 |
+| 会话存储 | **deadpool-redis 0.23 + redis 1** | 服务端 session 真相源；access token 吊销依赖；`session:tok:<sha256_hex>` 主条目 + `sessions:user:<id>` Set 索引 |
 | 配置 | **dotenvy + std::env** | 透明、无框架魔法；如未来需要可换 `config` crate |
 | 并发集合 | **dashmap** | WebSocket 连接注册表 |
 | 优雅退出 | **tokio_util::CancellationToken** | 后台任务 + axum serve 同步退出 |
@@ -47,11 +48,13 @@ hsh-erp-rust/
     │   ├── jwt.rs                 # access/refresh 双 token 编解码
     │   ├── password.rs            # bcrypt 散列/校验
     │   ├── rbac.rs                # Role 五角色 + CurrentUser + Claims
-    │   └── extractor.rs           # FromRequestParts<Arc<AppState>> for CurrentUser
+    │   ├── session.rs             # SessionStore trait + RedisSessionStore 实现（CachedSession / hash_token）
+    │   └── extractor.rs           # FromRequestParts<Arc<AppState>> for CurrentUser + AuthTokenHash
     │
     ├── infra/                     # 外部资源封装（含配置）
-    │   ├── config.rs              # AppConfig（含 JwtConfig / CosConfig / SnowflakeConfig / AutoCompleteConfig）
+    │   ├── config.rs              # AppConfig（含 JwtConfig / CosConfig / SnowflakeConfig / AutoCompleteConfig / RedisConfig）
     │   ├── db.rs                  # sqlx PgPool 构建
+    │   ├── redis.rs               # deadpool-redis 连接池构建
     │   ├── cos.rs                 # CosClient trait + NoopCos 占位
     │   ├── snowflake.rs           # 雪花 ID 生成器
     │   ├── serial.rs              # 业务单号/序列号（占位）
@@ -173,8 +176,9 @@ handler 返回 `Result<Json<R<T>>, AppError>`：
 
 ### 3.4 DI 与权限
 
-- `Arc<AppState>` 作为 axum Router 的 state。
-- `CurrentUser` 实现 `FromRequestParts<Arc<AppState>>`：从 `Authorization` 头解析 Bearer JWT → 解码 Claims → 构造 CurrentUser。
+- `Arc<AppState>` 作为 axum Router 的 state，含 `pool / config / snowflake / ws_hub / cos / session / shutdown` 七个字段。
+- `CurrentUser` 实现 `FromRequestParts<Arc<AppState>>`：从 `Authorization` 头解析 Bearer JWT → 解码 Claims → sha256(token) 查 Redis（`session:tok:<hash>`）→ 用 `CachedCurrentUser` 构造 CurrentUser → EXPIRE 续期。查不到返回 40105 SESSION_REVOKED。
+- `AuthTokenHash`（同 impl）给需要原始 token 哈希的端点（如 logout）使用。
 - **角色守卫**：服务层调用 `user.require_role(Role::Manager)?`（Command 守卫）。
 
 ```rust
@@ -260,7 +264,7 @@ async move {
 | `main.py` | `src/main.rs` + `lib.rs` |
 | `core/config.py` / `database.py` | `src/infra/config.rs` / `src/infra/db.rs` |
 | `core/response.py` / `exception*.py` / `error_code.py` | `src/shared/response.rs` / `src/shared/error.rs` |
-| `core/security.py` + `permission.py` | `src/auth/{jwt,password,rbac,extractor}.rs` |
+| `core/security.py` + `permission.py` | `src/auth/{jwt,password,rbac,session,extractor}.rs` |
 | `core/cos.py` / `serial.py` / `time.py` | `src/infra/{cos,serial,clock}.rs` + `snowflake.rs` |
 | `state` 聚合 | `src/state/mod.rs`（AppState kernel） |
 | `api/deps.py` | `src/auth/extractor.rs` + `Arc<AppState>` |

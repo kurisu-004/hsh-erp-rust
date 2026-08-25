@@ -79,6 +79,11 @@ HTTP 状态码：
 - 各端点小节里**标注"权限: 公开"**的端点无需登录；其余均需 Bearer JWT
 - access token 默认 12h 过期；refresh token 默认 7d
 - JWT 载荷含：`sub`（用户 i64）/ `roles`（[Role]）/ `shelf_ids`（[i64]）/ `shelf_wildcard`（bool）/ `ver`（用户版本号，用于 refresh 校验）
+- **服务端 session**：每个 access / refresh token 必须对应 Redis 一条 `session:tok:<sha256_hex>`
+  条目才视为有效。`CurrentUser` extractor 在 JWT 验签后额外查 Redis；
+  查不到 → 40105 SESSION_REVOKED。登出（删当前 token 条目）、改密 / 管理员停用
+  （清整个用户 Set `sessions:user:<id>`）都会触发吊销。前端拿到 40105 应清本地
+  token 并跳回登录页。session 条目默认 TTL 12h，每次成功访问会 EXPIRE 续期（滑动窗口）。
 
 ### 五角色 RBAC
 
@@ -139,7 +144,7 @@ HTTP 状态码：
 | delivery-notes | [`./delivery-notes.md`](./delivery-notes.md) | 17 | ✅ 完全上线（P1–P4） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub |
-| 其他 11 域 | — | 0 | ⚪ 仅占位（见下） |
+| 其他 12 域 | — | 0 | ⚪ 仅占位（见下） |
 
 ---
 
@@ -153,6 +158,7 @@ HTTP 状态码：
 | `work_type` | `/api/v2/work-types` | 同上 |
 | `process` | `/api/v2/processes` | 同上 |
 | `shelf` | `/api/v2/shelves` | 同上 |
+| `part` | `/api/v2/parts` | 同上 |
 | `assembly` | `/api/v2/assemblies` | 同上 |
 | `cnc_program` | `/api/v2/cnc-programs` | 同上 |
 | `part_file` | `/api/v2/part-files` | 同上 |
@@ -192,6 +198,7 @@ HTTP 状态码：
 | 40102 | TOKEN_EXPIRED | 401 |
 | 40103 | REFRESH_INVALID（refresh 失效/版本不匹配/用户停用） | 401 |
 | 40104 | OLD_PASSWORD_MISMATCH | 401 |
+| 40105 | SESSION_REVOKED（Redis 中 session 不存在 / 已失效） | 401 |
 
 ### 业务域（2xxxx）
 

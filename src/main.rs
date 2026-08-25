@@ -17,9 +17,11 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::AppConfig;
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos};
 use hsh_erp_rust::infra::db;
+use hsh_erp_rust::infra::redis;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::modules;
@@ -63,6 +65,11 @@ async fn main() -> anyhow::Result<()> {
     // 6. COS 客户端（骨架阶段占位）
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
 
+    // 6.5 Redis 连接池 + 服务端 session 存储
+    let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
+    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool));
+    info!("Redis session 存储已就绪");
+
     // 7. 优雅退出令牌
     let shutdown = CancellationToken::new();
 
@@ -75,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         ws_hub.clone(),
         cos,
         shutdown.clone(),
+        session,
     ));
 
     // 9. 启动后台任务

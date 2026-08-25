@@ -72,7 +72,7 @@ async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env) = send(
         app,
@@ -92,7 +92,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, P
 async fn login_inspector(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     add_role(&pool, uid, "INSPECTOR", None, None).await;
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env) = send(
         app,
@@ -112,7 +112,7 @@ async fn login_inspector(pool: PgPool, username: &str) -> (axum::Router, String,
 async fn login_clerk(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     add_role(&pool, uid, "CLERK", None, None).await;
-    let state = test_state(pool.clone());
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env) = send(
         app,

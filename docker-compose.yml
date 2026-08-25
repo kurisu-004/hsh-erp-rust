@@ -3,6 +3,8 @@
 # 端口选择：
 #   - 5430：开发库 PG（`hsh`）；
 #   - 5429：测试库 PG（`postgres_rust_test`）；
+#   - 6379：开发库 Redis（session store）；
+#   - 6380：测试库 Redis（session store；测试用 FLUSHDB，不挂卷）
 
 
 services:
@@ -41,5 +43,33 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  redis-dev:
+    image: redis:7-alpine
+    container_name: redis-dev
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-pdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-test:
+    image: redis:7-alpine
+    container_name: redis-test
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   hsh-pdata:
+  redis-pdata:

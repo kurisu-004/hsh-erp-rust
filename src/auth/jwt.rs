@@ -106,6 +106,7 @@ pub fn decode_refresh(
 }
 
 /// 业务层调用此函数完成一次登录或 refresh：返回 access+refresh 配对
+#[allow(clippy::too_many_arguments)]
 pub fn issue_token_pair(
     sub: i64,
     username: &str,
