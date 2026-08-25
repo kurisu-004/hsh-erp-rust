@@ -37,10 +37,13 @@ impl PartRepo {
         sqlx::query_as!(
             TPart,
             r#"
-            SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id, location, next_process_id,
-                   planned_delivery_date, system_delivery_date, is_urgent
+SELECT id, serial_no, name, drawing_no, applicant_name, quantity,
+                   request_date, planned_delivery_date, actual_delivery_date,
+                   customer_id, assembly_id, status, location,
+                   is_urgent, current_holder_id, placed_at, next_process_id,
+                   order_no, system_delivery_date, note, has_been_repaired,
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at, delivery_note_id
             FROM t_part
             WHERE id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -63,10 +66,13 @@ impl PartRepo {
         sqlx::query_as!(
             TPart,
             r#"
-            SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id, location, next_process_id,
-                   planned_delivery_date, system_delivery_date, is_urgent
+            SELECT id, serial_no, name, drawing_no, applicant_name, quantity,
+                   request_date, planned_delivery_date, actual_delivery_date,
+                   customer_id, assembly_id, status, location,
+                   is_urgent, current_holder_id, placed_at, next_process_id,
+                   order_no, system_delivery_date, note, has_been_repaired,
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at, delivery_note_id
             FROM t_part
             WHERE id = ANY($1)
               AND ($2::bool OR deleted_at IS NULL)
@@ -90,10 +96,13 @@ impl PartRepo {
         sqlx::query_as!(
             TPart,
             r#"
-            SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id, location, next_process_id,
-                   planned_delivery_date, system_delivery_date, is_urgent
+            SELECT id, serial_no, name, drawing_no, applicant_name, quantity,
+                   request_date, planned_delivery_date, actual_delivery_date,
+                   customer_id, assembly_id, status, location,
+                   is_urgent, current_holder_id, placed_at, next_process_id,
+                   order_no, system_delivery_date, note, has_been_repaired,
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at, delivery_note_id
             FROM t_part
             WHERE serial_no = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -114,10 +123,13 @@ impl PartRepo {
         sqlx::query_as!(
             TPart,
             r#"
-            SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id, location, next_process_id,
-                   planned_delivery_date, system_delivery_date, is_urgent
+            SELECT id, serial_no, name, drawing_no, applicant_name, quantity,
+                   request_date, planned_delivery_date, actual_delivery_date,
+                   customer_id, assembly_id, status, location,
+                   is_urgent, current_holder_id, placed_at, next_process_id,
+                   order_no, system_delivery_date, note, has_been_repaired,
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at, delivery_note_id
             FROM t_part
             WHERE assembly_id = $1
               AND ($2::bool OR deleted_at IS NULL)

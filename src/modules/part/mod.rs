@@ -7,6 +7,7 @@
 //! - model/part.py
 //! - schema/part.py
 pub mod dto;
+pub mod dto_crud;
 pub mod handler;
 pub mod model;
 pub mod repo;
