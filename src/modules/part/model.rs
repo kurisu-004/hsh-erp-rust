@@ -16,6 +16,7 @@
 //! 而 `unit_price` / `total_price` 是 NUMERIC，缺 feature 时 sqlx 编译期拒收。
 
 use chrono::{NaiveDate, NaiveDateTime};
+use serde::Serialize;
 
 /// `t_part` 完整行投影（Phase PR-CRUD 2026-08-25）
 ///
@@ -26,7 +27,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 /// - PR-CRUD added the rest (`applicant_name`, `quantity`, `request_date`, `actual_delivery_date`,
 ///   `current_holder_id`, `placed_at`, `order_no`, `note`, `has_been_repaired`) so this single
 ///   28-col projection serves all current call sites including worker-pool's `take_one` CTE.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct TPart {
     pub id: i64,
     pub serial_no: Option<String>,

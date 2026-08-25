@@ -1,6 +1,7 @@
-//! part 域业务逻辑
+//! part 域 inspection 流业务逻辑（pass / fail / scan 流）。
 //!
-//! 对应 Python myERP/service/part_service.py（及 _<d>_*.py helper）。
+//! 对应 Python myERP/service/part_service.py（及 _<d>_*.py helper）中
+//! pass_inspection / fail_inspection / scan_inspect 三个流的实现。
 //! 实施约定：方法签名接收 `&mut PgConnection`，由 handler 开 tx 并 commit。
 //!
 //! ## Phase F（pass_inspection 批量送检）
@@ -43,19 +44,18 @@ use crate::modules::worker::repo::WorkerRepo;
 use crate::modules::worker_pool::dto::WorkerScanEvent;
 use crate::shared::error::{code, AppError};
 
-use super::dto::{
+use super::super::dto::{
     BatchPassFailure, BatchPassInspectionOut, BatchPassInspectionRequest, BatchScanInspectFailure,
     BatchScanInspectOut, BatchScanInspectRequest, FailInspectionRequest, PartOut, ScanDecision,
     ScanInspectRequest, WorkerScanCoreOut, WorkerScanRequest,
 };
+use super::PartService;
 
 /// 批量端点单次请求最大 item 数（handler/service 双层校验）。
 pub const BATCH_PASS_INSPECTION_MAX_ITEMS: usize = 200;
 
 /// 批量 scan-inspect 单次请求最大 item 数（与 batch-pass-inspection 对齐）。
 pub const BATCH_SCAN_INSPECT_MAX_ITEMS: usize = 200;
-
-pub struct PartService;
 
 impl PartService {
     /// 单件共享核心：被单件 / batch 端点共用。
