@@ -213,6 +213,18 @@ async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, stat
     id
 }
 
+/// scan-inspect / fail-inspection 测试用：插一个 INSPECTION 货架 + 一个 PRODUCTION 货架。
+///
+/// `next_process_id` 是 fail-inspection 需要的占位（service 仅透传，不校验存在性——
+/// shelf 域 `t_shelf_process` 映射校验留待后续 shelf 域 PR）。
+async fn setup_inspection_and_production_shelves(pool: &PgPool) -> (i64, i64, i64) {
+    use common::insert_shelf;
+    let inspection_shelf = insert_shelf(pool, "INSP-001", "品检架A", "INSPECTION").await;
+    let production_shelf = insert_shelf(pool, "PROD-001", "生产架A", "PRODUCTION").await;
+    let next_process_id = 999_999_i64;
+    (inspection_shelf, production_shelf, next_process_id)
+}
+
 // ===========================================================================
 //  Tests
 // ===========================================================================
@@ -502,4 +514,598 @@ async fn single_pass_inspection_retry_returns_20103() {
         env2["code"], 20103,
         "second call should be 20103 BIZ_INVALID_TRANSITION (READY_TO_SHIP → READY_TO_SHIP), got: {env2}"
     );
+}
+
+// ===========================================================================
+//  Phase F2 集成测试 —— scan-inspect / batch-scan-inspect / fail-inspection
+//
+//  覆盖：
+//   - scan-inspect：happy path ×3（PENDING / PROGRAMMING / IN_PROCESS+PRODUCTION_SHELF）
+//   - scan-inspect：IN_PROCESS+WORKER / IN_PROCESS+非 PRODUCTION_SHELF holder 拒绝
+//   - scan-inspect：FAIL 缺 shelf_id / next_process_id 拒绝
+//   - scan-inspect：target shelf zone≠INSPECTION / is_active=false 拒绝
+//   - batch-scan-inspect：items 空 / 超 200 / 3 件混合 / CLERK 越权
+//   - fail-inspection：INSPECTION happy path / 非 INSPECTION 状态拒绝
+// ===========================================================================
+
+/// scan-inspect happy path：PENDING + PASS → READY_TO_SHIP。
+#[tokio::test]
+async fn scan_inspect_pending_pass_succeeds() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "PENDING",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/scan-inspect"),
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "decision": "PASS",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["code"], 0);
+    assert_eq!(body["data"]["status"], "READY_TO_SHIP");
+    assert_eq!(body["data"]["id"], part_id.to_string());
+}
+
+/// scan-inspect happy path：PROGRAMMING + PASS → READY_TO_SHIP。
+#[tokio::test]
+async fn scan_inspect_programming_pass_succeeds() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "PROGRAMMING",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "PROGRAMMING").await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/scan-inspect"),
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "decision": "PASS",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["data"]["status"], "READY_TO_SHIP");
+}
+
+/// scan-inspect happy path：IN_PROCESS + PRODUCTION_SHELF holder + PASS → READY_TO_SHIP。
+///
+/// service 层组合校验：IN_PROCESS + 当前 holder 是 PRODUCTION 货架才放行。
+#[tokio::test]
+async fn scan_inspect_in_process_production_shelf_pass_succeeds() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "IN_PROCESS",
+    )
+    .await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
+    // 把 part.current_holder_id 设为 prod_shelf（让 IN_PROCESS 路径通过组合校验）
+    sqlx::query!(
+        "UPDATE t_part SET current_holder_id = $1 WHERE id = $2",
+        prod_shelf,
+        part_id
+    )
+    .execute(&_pool)
+    .await
+    .unwrap();
+    sqlx::query!(
+        "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
+        prod_shelf,
+        batch_id
+    )
+    .execute(&_pool)
+    .await
+    .unwrap();
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/scan-inspect"),
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "decision": "PASS",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["data"]["status"], "READY_TO_SHIP");
+}
+
+/// scan-inspect 拒绝：IN_PROCESS + WORKER holder → 20103。
+///
+/// service 用 `ShelfRepo::get_by_id(current_holder_id)` 返回 None 启发式识别 worker 持有。
+#[tokio::test]
+async fn scan_inspect_in_process_worker_rejected() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "IN_PROCESS",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
+    // current_holder_id 指向一个不存在的 id（模拟 worker 持有）
+    let fake_holder: i64 = 999_999_999;
+    sqlx::query!(
+        "UPDATE t_part SET current_holder_id = $1 WHERE id = $2",
+        fake_holder,
+        part_id
+    )
+    .execute(&_pool)
+    .await
+    .unwrap();
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/scan-inspect"),
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "decision": "PASS",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "body={body}");
+    assert_eq!(body["code"], 20103);
+    assert!(body["message"].as_str().unwrap().contains("工人持有"));
+}
+
+/// scan-inspect 拒绝：IN_PROCESS + 非 PRODUCTION_SHELF holder → 20103。
+///
+/// holder 是 INSPECTION 货架 → service 拒绝「不在生产架上」。
+#[tokio::test]
+async fn scan_inspect_in_process_non_production_shelf_rejected() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    // 第二个 INSPECTION 货架当 holder（让 part 持有一个非 PRODUCTION 的 shelf）
+    let holder_shelf = common::insert_shelf(&_pool, "INSP-002", "品检架B", "INSPECTION").await;
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "IN_PROCESS",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
+    sqlx::query!(
+        "UPDATE t_part SET current_holder_id = $1 WHERE id = $2",
+        holder_shelf,
+        part_id
+    )
+    .execute(&_pool)
+    .await
+    .unwrap();
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/scan-inspect"),
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "decision": "PASS",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "body={body}");
+    assert_eq!(body["code"], 20103);
+    assert!(body["message"].as_str().unwrap().contains("不在生产架上"));
+}
+
+/// scan-inspect 拒绝：FAIL 缺 shelf_id → 20104 BIZ_INVALID_VALUE。
+#[tokio::test]
+async fn scan_inspect_fail_missing_shelf_id_rejected() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "PENDING",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/scan-inspect"),
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "decision": "FAIL",
+                // shelf_id 故意省略
+                "next_process_id": "1",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "body={body}");
+    assert_eq!(body["code"], 20104);
+}
+
+/// scan-inspect 拒绝：FAIL 缺 next_process_id → 20104 BIZ_INVALID_VALUE。
+#[tokio::test]
+async fn scan_inspect_fail_missing_next_process_rejected() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "PENDING",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/scan-inspect"),
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "decision": "FAIL",
+                "shelf_id": prod_shelf.to_string(),
+                // next_process_id 故意省略
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "body={body}");
+    assert_eq!(body["code"], 20104);
+}
+
+/// scan-inspect 拒绝：target_inspection_shelf.zone = PRODUCTION → 20511。
+#[tokio::test]
+async fn scan_inspect_target_shelf_wrong_zone_rejected() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (_insp_shelf, prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "PENDING",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/scan-inspect"),
+            Some(json!({
+                "target_inspection_shelf_id": prod_shelf.to_string(),  // 故意用 PRODUCTION 架
+                "decision": "PASS",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "body={body}");
+    assert_eq!(body["code"], 20511);
+}
+
+/// scan-inspect 拒绝：target_inspection_shelf.is_active = false → 20512。
+#[tokio::test]
+async fn scan_inspect_target_shelf_inactive_rejected() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    // 把品检架置为 inactive
+    sqlx::query!("UPDATE t_shelf SET is_active = false WHERE id = $1", insp_shelf)
+        .execute(&_pool)
+        .await
+        .unwrap();
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "PENDING",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/scan-inspect"),
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "decision": "PASS",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "body={body}");
+    assert_eq!(body["code"], 20512);
+}
+
+/// batch-scan-inspect 拒绝：items 为空 → 422 / 40001 VALIDATION_ERROR。
+#[tokio::test]
+async fn batch_scan_inspect_empty_items_rejected() {
+    let (_guard, pool) = setup().await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            "/parts/batch-scan-inspect",
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "items": [],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 422, "body={body}");
+    assert_eq!(body["code"], 40001);
+}
+
+/// batch-scan-inspect 拒绝：items 数量 > 200 → 422 / 40001 VALIDATION_ERROR。
+#[tokio::test]
+async fn batch_scan_inspect_too_many_items_rejected() {
+    let (_guard, pool) = setup().await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let items: Vec<i64> = (1..=201).collect();
+    let item_payloads: Vec<Value> = items
+        .iter()
+        .map(|id| json!({ "part_id": id.to_string() }))
+        .collect();
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            "/parts/batch-scan-inspect",
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "items": item_payloads,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 422, "body={body}");
+    assert_eq!(body["code"], 40001);
+}
+
+/// batch-scan-inspect 部分成功：3 件混合 → 2 submitted + 1 failed (20103)。
+///
+/// 测点：IN_PROCESS+fake_holder item 在 per-item 独立 core 中被 holder 守卫拒绝；
+/// PENDING / PROGRAMMING item 走完 PASS 路径。
+#[tokio::test]
+async fn batch_scan_inspect_mixed_partial_success() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+
+    // 第 1 件：PENDING → 应成功（status=READY_TO_SHIP）
+    let p1 = insert_part_with_status(&_pool, "P1", l2, Some("P001"), None, "PENDING").await;
+    insert_batch(&_pool, p1, 1, 5, "PENDING").await;
+    // 第 2 件：PROGRAMMING → 应成功
+    let p2 = insert_part_with_status(&_pool, "P2", l2, Some("P002"), None, "PROGRAMMING").await;
+    insert_batch(&_pool, p2, 1, 5, "PROGRAMMING").await;
+    // 第 3 件：IN_PROCESS + fake holder → 应失败 (20103)
+    let p3 = insert_part_with_status(&_pool, "P3", l2, Some("P003"), None, "IN_PROCESS").await;
+    insert_batch(&_pool, p3, 1, 5, "IN_PROCESS").await;
+    sqlx::query!("UPDATE t_part SET current_holder_id = 999999999 WHERE id = $1", p3)
+        .execute(&_pool)
+        .await
+        .unwrap();
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            "/parts/batch-scan-inspect",
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "items": [
+                    { "part_id": p1.to_string() },
+                    { "part_id": p2.to_string() },
+                    { "part_id": p3.to_string() },
+                ],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["code"], 0);
+    assert_eq!(body["data"]["submitted"].as_array().unwrap().len(), 2);
+    assert_eq!(body["data"]["failed"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"]["failed"][0]["code"], 20103);
+    assert_eq!(body["data"]["failed"][0]["part_id"], p3.to_string());
+}
+
+/// batch-scan-inspect 权限：CLERK 越权 → 403 / 40300 FORBIDDEN。
+#[tokio::test]
+async fn batch_scan_inspect_clerk_forbidden() {
+    let (_guard, pool) = setup().await;
+    let (app, token, _pool) = login_clerk(pool, "clerk1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            "/parts/batch-scan-inspect",
+            Some(json!({
+                "target_inspection_shelf_id": insp_shelf.to_string(),
+                "items": [{ "part_id": "1" }],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 403, "body={body}");
+    assert_eq!(body["code"], 40300);
+}
+
+/// fail-inspection happy path：INSPECTION → IN_PROCESS（推荐需求 3）。
+#[tokio::test]
+async fn fail_inspection_happy_path() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (_insp, prod_shelf, next_proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "INSPECTION",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/fail-inspection"),
+            Some(json!({
+                "shelf_id": prod_shelf.to_string(),
+                "next_process_id": next_proc.to_string(),
+                "note": "test fail",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 200, "body={body}");
+    assert_eq!(body["data"]["status"], "IN_PROCESS");
+}
+
+/// fail-inspection 拒绝：非 INSPECTION 状态（PENDING） → 400 / 20103。
+#[tokio::test]
+async fn fail_inspection_wrong_state_rejected() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (_insp, prod_shelf, next_proc) = setup_inspection_and_production_shelves(&_pool).await;
+    // setup: PENDING part（非 INSPECTION）
+    let part_id = insert_part_with_status(
+        &_pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "PENDING",
+    )
+    .await;
+    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/fail-inspection"),
+            Some(json!({
+                "shelf_id": prod_shelf.to_string(),
+                "next_process_id": next_proc.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, 400, "body={body}");
+    assert_eq!(body["code"], 20103);
 }

@@ -85,6 +85,7 @@ impl PartStatus {
     ///
     /// 本 PR（scan-inspect 一键送检）放行：
         /// - `INSPECTION → READY_TO_SHIP`：pass_inspection / scan_inspect (PASS) 路径
+    /// - `INSPECTION → IN_PROCESS`：fail_inspection 路径（推荐需求 3）
     /// - `PROGRAMMING → INSPECTION`：scan_inspect (PROGRAMMING → INSPECTION)
     /// - `PENDING → INSPECTION`：scan_inspect (PENDING → INSPECTION)
     /// - `IN_PROCESS → INSPECTION`：scan_inspect (IN_PROCESS → INSPECTION)
@@ -96,6 +97,7 @@ impl PartStatus {
         matches!(
             (self, to),
             (Self::INSPECTION,    Self::READY_TO_SHIP)
+                | (Self::INSPECTION,    Self::IN_PROCESS)
                 | (Self::PROGRAMMING, Self::INSPECTION)
                 | (Self::PENDING,     Self::INSPECTION)
                 | (Self::IN_PROCESS,  Self::INSPECTION)
@@ -154,6 +156,8 @@ mod tests {
         // scan-inspect 新增
         assert!(PartStatus::PENDING.can_transition_to(PartStatus::INSPECTION));
         assert!(PartStatus::IN_PROCESS.can_transition_to(PartStatus::INSPECTION));
+        // fail-inspection 新增（推荐需求 3）
+        assert!(PartStatus::INSPECTION.can_transition_to(PartStatus::IN_PROCESS));
     }
 
     #[test]
