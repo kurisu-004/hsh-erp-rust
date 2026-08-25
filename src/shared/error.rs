@@ -68,7 +68,7 @@ pub mod code {
     pub const BIZ_PART_BATCH_INVALID_QUANTITY: i32 = 20111;      // 拆分/部分流转数量非法（≤0 或超过批次量）
     pub const BIZ_PART_QUANTITY_LOCKED: i32 = 20112;             // 已拆分或已流转的工单禁止改总量
     pub const BIZ_CUSTOMER_IN_USE: i32 = 20113;                  // 客户仍被 part/assembly 引用 → 拒软删（Python 原 20109，新槽位独占）
-    pub const BIZ_PART_BATCH_NOT_HELD_BY_WORKER: i32 = 20113;   // worker-scan 找不到当前 worker 持有的批次
+    pub const BIZ_PART_BATCH_NOT_HELD_BY_WORKER: i32 = 20114;   // worker-scan 找不到当前 worker 持有的批次
 
     // 202xx 工人
     pub const BIZ_WORKER_NOT_FOUND: i32 = 20201;
