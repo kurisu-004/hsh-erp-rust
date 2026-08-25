@@ -28,6 +28,7 @@ pub mod shelf;
 pub mod statistics;
 pub mod user;
 pub mod worker;
+pub mod worker_pool;
 pub mod work_type;
 
 #[derive(Serialize)]
