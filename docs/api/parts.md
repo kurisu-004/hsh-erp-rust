@@ -33,7 +33,7 @@ Response 200 `data`：`BatchPassInspectionOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `passed` | [PartOut](#partout-字段) | 成功送检的件；与 `items` 一一对应，`passed[i]` 顺序不保证 |
+| `passed` | [PartOut](#partout-字段) | 成功送检的件；与 `items` 顺序一一对应（`passed[i]` 对应 `items[i]`） |
 | `failed` | [BatchPassFailure](#batchpassfailure-字段) | 失败的 item；单 item 不会同时出现在 `passed` 与 `failed` |
 
 > 整体响应**始终为 200**。item 级别的失败通过 `data.failed[]` 体现（每个 item 含 `code` + `message`，调用方可按 `code` 分支处理）。

@@ -61,7 +61,7 @@ impl PartService {
     /// - `40901` `VERSION_CONFLICT` —— 乐观锁失败（t_part 或 t_part_batch）
     pub async fn pass_inspection_core(
         conn: &mut PgConnection,
-        _snowflake: &SnowflakeIdGenerator,
+        snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         batch_id: Option<i64>,
         quantity: Option<i32>,
@@ -157,7 +157,7 @@ impl PartService {
         //    INSPECTION 批次残留而保留 INSPECTION 状态，本次批次通过的事实仍要
         //    留痕（与 batch 自身的 status 翻转同步落库），否则审计日志会丢失
         //    multi-batch 场景下的 batch-pass 事件。
-        let event_id = _snowflake.next_id();
+        let event_id = snowflake.next_id();
         PartRepo::insert_part_event(
             &mut *conn,
             NewPartEvent {
@@ -262,7 +262,23 @@ impl PartService {
         let mut passed: Vec<PartOut> = Vec::new();
         let mut failed: Vec<BatchPassFailure> = Vec::new();
         for item in req.items {
-            let bid = item.batch_id.as_deref().and_then(|s| s.parse().ok());
+            // 解析 batch_id：None 跳过；非数字字符串直接以 `40001 VALIDATION_ERROR`
+            // 计入 `failed`（不让 `pass_inspection_core` 把歧义
+            // BIZ_PART_BATCH_NOT_FOUND 当成"找不到 INSPECTION 批次"上报）。
+            let bid = match item.batch_id.as_deref() {
+                None => None,
+                Some(s) => match s.parse::<i64>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        failed.push(BatchPassFailure {
+                            part_id: item.part_id,
+                            code: code::VALIDATION_ERROR,
+                            message: format!("batch_id '{s}' is not a numeric id"),
+                        });
+                        continue;
+                    }
+                },
+            };
             match Self::pass_inspection_core(
                 conn, snowflake, item.part_id, bid, item.quantity, current,
             )

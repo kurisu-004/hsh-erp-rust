@@ -337,6 +337,56 @@ async fn batch_pass_inspection_empty_items_40001() {
     assert_eq!(env["code"], 40001);
 }
 
+/// 批量送检 item.batch_id 非数字 → 200 / passed=0 / failed=1 (code=40001)。
+///
+/// 任务 4 review（Fix #3）：旧行为是把 `"abc"` 静默吞掉成 `None`，下游
+/// `pass_inspection_core` 落到"找不到 INSPECTION 批次"分支报 `20109`，
+/// 信息误导。新行为：service 在解析 batch_id 时就 push `40001 VALIDATION_ERROR`。
+#[tokio::test]
+async fn batch_pass_inspection_non_numeric_batch_id_40001() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part_with_status(
+        &pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "INSPECTION",
+    )
+    .await;
+    let _ = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
+
+    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/parts/batch-pass-inspection",
+            Some(json!({
+                "items": [{"part_id": pid.to_string(), "batch_id": "abc"}]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "non-numeric batch_id: {env}");
+    assert_eq!(env["code"], 0);
+    let passed = env["data"]["passed"].as_array().expect("data.passed");
+    let failed = env["data"]["failed"].as_array().expect("data.failed");
+    assert_eq!(passed.len(), 0, "应 passed=0: {env}");
+    assert_eq!(failed.len(), 1, "应 failed=1: {env}");
+    assert_eq!(
+        failed[0]["code"], 40001,
+        "non-numeric batch_id 应报 40001 VALIDATION_ERROR，而非 20109 BIZ_PART_BATCH_NOT_FOUND: {env}"
+    );
+    let msg = failed[0]["message"].as_str().expect("failed.message");
+    assert!(msg.contains("abc"), "message 应含原值 'abc': {msg}");
+    let failed_pid = failed[0]["part_id"].as_str().expect("failed.part_id is string");
+    assert_eq!(failed_pid, pid.to_string());
+}
+
 /// 批量送检 CLERK 越权 → 403 / 40300 FORBIDDEN。
 #[tokio::test]
 async fn batch_pass_inspection_clerk_forbidden() {

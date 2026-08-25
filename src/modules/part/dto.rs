@@ -9,7 +9,7 @@
 //! ## Phase F（pass_inspection 批量送检）
 //! - `PartOut`：单件详情投影（pass_inspection 单/批端点的出参；其它端点复用做最小投影）
 //! - `PassInspectionRequest`：单件入参（`POST /parts/{id}/pass-inspection`）
-//! - `BatchPassItem` / `BatchPassInspectionRequest`：批量入参（`POST /parts/pass-inspection-batch`）
+//! - `BatchPassItem` / `BatchPassInspectionRequest`：批量入参（`POST /parts/batch-pass-inspection`）
 //! - `BatchPassFailure` / `BatchPassInspectionOut`：批量出参（含 per-item 失败明细）
 
 use serde::{Deserialize, Serialize};
@@ -69,7 +69,7 @@ pub struct PassInspectionRequest {
     pub quantity: Option<i32>,
 }
 
-/// 批量 item（`POST /parts/pass-inspection-batch`）。
+/// 批量 item（`POST /parts/batch-pass-inspection`）。
 ///
 /// `part_id` 从 JSON 字符串反序列化（与 `serialize_i64` 对称）。`batch_id` /
 /// `quantity` 语义同 [`PassInspectionRequest`]。
