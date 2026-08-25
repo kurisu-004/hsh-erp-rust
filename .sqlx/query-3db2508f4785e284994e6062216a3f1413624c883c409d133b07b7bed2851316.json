@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, serial_no, name, drawing_no, status, version, quantity,\n                   order_no, actual_delivery_date, updated_at, updated_by\n            FROM t_part\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
+  "query": "\n            SELECT id, serial_no, name, drawing_no, status, version, quantity,\n                   order_no, actual_delivery_date, current_holder_id,\n                   updated_at, updated_by\n            FROM t_part\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -104,6 +104,17 @@
       },
       {
         "ordinal": 9,
+        "name": "current_holder_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "current_holder_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -140,9 +151,10 @@
       false,
       true,
       true,
+      true,
       false,
       true
     ]
   },
-  "hash": "d69a7013bcdd96fb959ca8a3c431c21c403a9aedf8aff0e240e2c9c7305c81ed"
+  "hash": "3db2508f4785e284994e6062216a3f1413624c883c409d133b07b7bed2851316"
 }

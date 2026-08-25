@@ -141,7 +141,8 @@ impl PartRepo {
             TPartInspected,
             r#"
             SELECT id, serial_no, name, drawing_no, status, version, quantity,
-                   order_no, actual_delivery_date, updated_at, updated_by
+                   order_no, actual_delivery_date, current_holder_id,
+                   updated_at, updated_by
             FROM t_part
             WHERE id = $1 AND deleted_at IS NULL
             "#,

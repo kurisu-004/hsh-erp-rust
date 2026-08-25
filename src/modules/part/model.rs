@@ -43,7 +43,10 @@ pub struct TPart {
 ///
 /// 与 `TPart`（Phase P1 投影）字段集不同：本结构服务于批量送检接口，
 /// 重点暴露 `status` / `version` / `quantity` / `actual_delivery_date` /
-/// `order_no` 等本流程必需字段。
+/// `order_no` / `current_holder_id` 等本流程必需字段。
+///
+/// Phase F2（scan-inspect）：`current_holder_id` 用于「IN_PROCESS 组合校验」
+/// 启发式（命中 `t_shelf` → shelf；否则 → worker）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPartInspected {
     pub id: i64,
@@ -55,6 +58,7 @@ pub struct TPartInspected {
     pub quantity: i32,
     pub order_no: Option<String>,
     pub actual_delivery_date: Option<NaiveDate>,
+    pub current_holder_id: Option<i64>,
     pub updated_at: NaiveDateTime,
     pub updated_by: Option<i64>,
 }
