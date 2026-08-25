@@ -71,6 +71,39 @@ impl WorkerPoolService {
             )
         })?;
 
+        Self::refill_for_worker_with_work_type(
+            conn,
+            snowflake,
+            worker_id,
+            work_type_id,
+            shelf_id,
+            &worker.badge_code,
+            operator_user_id,
+        )
+        .await
+    }
+
+    /// 内部 helper：caller 已 fetch worker（并已校验 is_active / work_type_id），
+    /// 直接接受 `work_type_id` + `badge_code`，跳过 `WorkerRepo::get_by_id` 重复查询。
+    ///
+    /// 调用方必须保证：
+    /// - `worker_id` 已存在
+    /// - `worker.is_active == true`
+    /// - `worker.work_type_id == Some(work_type_id)`
+    ///
+    /// 由 [`refill_for_worker`]（admin 路径：自己 fetch）与
+    /// [`crate::modules::part::service::PartService::worker_scan_event`]
+    /// （worker-scan 路径：service 已在 scan 步骤 fetch 过 worker）共用。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn refill_for_worker_with_work_type(
+        conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
+        worker_id: i64,
+        work_type_id: i64,
+        shelf_id: i64,
+        badge_code: &str,
+        operator_user_id: i64,
+    ) -> Result<RefillResult, AppError> {
         let work_type = WorkTypeRepo::get_by_id(&mut *conn, work_type_id)
             .await?
             .ok_or_else(|| {
@@ -79,7 +112,8 @@ impl WorkerPoolService {
                     format!("work_type {work_type_id} 不存在"),
                 )
             })?;
-        let _max_held = work_type.max_held_batches.ok_or_else(|| {
+        // 存在性校验：NULL → 业务错（cap 由 SQL CTE 强制，不在 Rust 端使用）
+        let _ = work_type.max_held_batches.ok_or_else(|| {
             AppError::biz(
                 code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
                 format!("work_type {work_type_id} max_held_batches 未设置"),
@@ -115,7 +149,7 @@ impl WorkerPoolService {
                     batch_id: Some(t.batch_id),
                     quantity: Some(t.quantity),
                     drawing_code: Some(&t.drawing_no),
-                    badge_code: Some(&worker.badge_code),
+                    badge_code: Some(badge_code),
                     note: None,
                     created_by: Some(operator_user_id),
                 },

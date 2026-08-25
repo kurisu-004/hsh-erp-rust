@@ -344,6 +344,7 @@ pub async fn get_refresh_token_version(pool: &PgPool, user_id: i64) -> i32 {
 // ===========================================================================
 
 /// 插一个 INHOUSE 类别 `t_process` 工序（worker-pool 用：INHOUSE 自产）。
+#[allow(dead_code)]
 pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -366,6 +367,7 @@ pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 }
 
 /// `t_work_type_process` 映射（无业务软删：`deleted_at` 留默认 NULL）。
+#[allow(dead_code)]
 pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -387,6 +389,7 @@ pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
 }
 
 /// `t_shelf_process` 映射（无业务软删）。
+#[allow(dead_code)]
 pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 

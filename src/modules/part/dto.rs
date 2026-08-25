@@ -250,6 +250,11 @@ pub struct WorkerScanRequest {
 /// handler 会把 `scan + refill` 一起装到 [`WorkerScanOut`] 返回；
 /// `WorkerScanCoreOut` 是 service 层直接产出的最小投影（与 worker-pool
 /// `RefillResult` 解耦，便于 service 层单测）。
+///
+/// `work_type_id` 与 `badge_code` 是**内部管道字段**：handler 用它把
+/// `worker_scan_event` 已经 fetch 过的 worker 信息透传给同事务的
+/// `WorkerPoolService::refill_for_worker_with_work_type`，避免重复
+/// `WorkerRepo::get_by_id` 查询。不暴露到 JSON 响应里。
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerScanCoreOut {
     #[serde(serialize_with = "serialize_i64")]
@@ -259,6 +264,12 @@ pub struct WorkerScanCoreOut {
     #[serde(serialize_with = "serialize_i64")]
     pub batch_id: i64,
     pub event_type: String,
+    /// 内部：透传给 refill，refill 不再 fetch worker。
+    #[serde(skip)]
+    pub work_type_id: i64,
+    /// 内部：refill 写 `TAKEN_FROM_POOL` 事件日志需要 badge_code。
+    #[serde(skip)]
+    pub badge_code: String,
 }
 
 /// worker-scan 端点出参：`scan` + 同事务 refill 结果。

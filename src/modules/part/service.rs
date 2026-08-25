@@ -934,8 +934,8 @@ impl PartService {
         req: WorkerScanRequest,
         current: &CurrentUser,
     ) -> Result<WorkerScanCoreOut, AppError> {
-        // 1. shelf 校验（worker-scan shelf 必须 PRODUCTION 区 active）
-        let shelf = ShelfRepo::get_by_id_zone(&mut *conn, req.shelf_id, "PRODUCTION")
+        // 1. shelf 校验（worker-scan shelf 必须 PRODUCTION 区 active；存在性 + zone 守卫）
+        let _shelf = ShelfRepo::get_by_id_zone(&mut *conn, req.shelf_id, "PRODUCTION")
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -993,7 +993,7 @@ impl PartService {
             Err(sqlx::Error::RowNotFound) => {
                 return Err(AppError::biz(
                     code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
-                    "multiple IN_PROCESS batches held by this worker; specify batch_id"
+                    "multiple IN_PROCESS batches held by this worker; specify batch_id in request body (see docs/api/parts.md#worker-scan)"
                         .to_string(),
                 ));
             }
@@ -1157,13 +1157,13 @@ impl PartService {
                 event_type_str = "WORKER_SCAN_INSPECTED";
             }
         }
-        let _ = work_type_id; // 暂未直接使用，避免编译警告（refill 在 handler 下一步）
-        let _ = shelf; // 仅用于 zone 校验，存根避免未用告警
         Ok(WorkerScanCoreOut {
             worker_id: worker.id,
             part_id: part.id,
             batch_id: batch.id,
             event_type: event_type_str.to_string(),
+            work_type_id,
+            badge_code: worker.badge_code.clone(),
         })
     }
 }

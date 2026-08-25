@@ -254,13 +254,17 @@ pub async fn worker_scan(
         &current,
     )
     .await?;
-    // refill（同事务；WorkerPoolService::refill_for_worker 内部对 work_type / process
-    // 映射校验失败会抛业务错——事务自动回滚 scan 写入，保持原子语义）
-    let refill_out = WorkerPoolService::refill_for_worker(
+    // refill（同事务；WorkerPoolService::refill_for_worker_with_work_type 内部对 work_type / process
+    // 映射校验失败会抛业务错——事务自动回滚 scan 写入，保持原子语义）。
+    // 复用 worker_scan_event 已经 fetch 过的 work_type_id + badge_code，
+    // 跳过 worker_pool service 内的 WorkerRepo::get_by_id 重复查询。
+    let refill_out = WorkerPoolService::refill_for_worker_with_work_type(
         &mut tx,
         &state.snowflake,
         scan_out.worker_id,
+        scan_out.work_type_id,
         req.shelf_id,
+        &scan_out.badge_code,
         current.id,
     )
     .await?;
@@ -281,6 +285,7 @@ pub async fn worker_scan(
             payload: serde_json::json!({
                 "worker_id": scan_out.worker_id.to_string(),
                 "shelf_id": req.shelf_id.to_string(),
+                "pool_empty": true,
             }),
         });
     }

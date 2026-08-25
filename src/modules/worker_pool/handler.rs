@@ -83,6 +83,7 @@ pub async fn admin_refill(
             payload: serde_json::json!({
                 "worker_id": req.worker_id.to_string(),
                 "shelf_id": req.shelf_id.to_string(),
+                "pool_empty": true,
             }),
         });
     }
