@@ -100,6 +100,8 @@ pub mod code {
     // scan-inspect 一键送检新增
     pub const BIZ_SHELF_NOT_INSPECTION_ZONE: i32 = 20511;        // target_inspection_shelf.zone ≠ 'INSPECTION'
     pub const BIZ_SHELF_INACTIVE: i32 = 20512;                   // target_inspection_shelf.is_active = false
+    // worker-pool admin_remove 新增（Task 7）
+    pub const BIZ_SHELF_PROCESS_MISMATCH: i32 = 20513;           // shelf 与 next_process 不匹配（worker-pool admin_remove 校验）
 
     // 206xx 账号（t_user / t_user_role）—— Python 命名 BIZ_* 长名为正典
     pub const BIZ_USER_ACCOUNT_NOT_FOUND: i32 = 20601;
@@ -125,6 +127,8 @@ pub mod code {
     pub const BIZ_WORK_TYPE_DUPLICATE_CODE: i32 = 20902;
     pub const BIZ_WORK_TYPE_IN_USE: i32 = 20903;                 // 仍有 worker.work_type_id 或 mapping 引用时拒软删
     pub const BIZ_WORK_TYPE_MAX_HELD_NOT_SET: i32 = 20904;       // work_type.max_held_batches IS NULL
+    // worker-pool refill_for_worker 新增（Task 7）
+    pub const BIZ_WORK_TYPE_NO_PROCESS_MAPPING: i32 = 20905;    // work_type_id 在 t_work_type_process 没工序映射
 
     // 210xx 申请人（t_applicant）
     pub const BIZ_APPLICANT_NOT_FOUND: i32 = 21001;

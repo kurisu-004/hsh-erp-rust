@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part\n            SET current_holder_id = $3,\n                location          = 'PRODUCTION_SHELF',\n                next_process_id   = $4,\n                version           = version + 1,\n                updated_at        = now(),\n                updated_by        = $5\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e9d7b6a7719e19752a5fe5fba68509efb3424a4145176636f445270a4a503fd3"
+}

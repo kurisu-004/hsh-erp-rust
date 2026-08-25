@@ -66,6 +66,8 @@ pub fn v2_router() -> Router<Arc<AppState>> {
         .nest("/delivery-notes", delivery_note::router())
         .nest("/delivery-groups", p1_router())
         .nest("/statistics", statistics::router())
+        .nest("/worker-pool", worker_pool::router())
+        .nest("/admin/worker-pool", worker_pool::admin_router())
 }
 
 /// `/ws/*` WebSocket 入口（当前仅 dashboard 大屏）

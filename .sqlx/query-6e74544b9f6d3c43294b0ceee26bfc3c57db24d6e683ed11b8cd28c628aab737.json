@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COUNT(*) AS \"n!\" FROM t_part_batch pb\n                WHERE pb.status = 'IN_PROCESS'\n                  AND pb.location = 'PRODUCTION_SHELF'\n                  AND pb.current_holder_id = $1\n                  AND pb.next_process_id = $2\n                  AND pb.deleted_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6e74544b9f6d3c43294b0ceee26bfc3c57db24d6e683ed11b8cd28c628aab737"
+}
