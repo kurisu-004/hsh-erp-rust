@@ -14,8 +14,9 @@
 | POST | `/api/v2/parts/batch-scan-inspect` | **Manager** / **Inspector** | 批量一键送检（共享品检架 + per-item decision，N≤200） |
 | POST | `/api/v2/parts/{part_id}/scan-inspect` | **Manager** / **Inspector** | 单件一键送检（PENDING/PROGRAMMING/IN_PROCESS → INSPECTION → PASS/FAIL） |
 | POST | `/api/v2/parts/{part_id}/fail-inspection` | **Manager** / **Inspector** | 单件品检打回（INSPECTION → IN_PROCESS，依赖 shelf+next_process） |
+| POST | `/api/v2/parts/worker-scan` | **Manager** / **ShelfAccount** | 工人扫码归还 / 送检（SHELF_ACCOUNT @ 该 shelf）；成功后同事务触发 worker-pool refill |
 
-> 路由顺序：`/batch-pass-inspection` 必须在 `/{part_id}/pass-inspection` **之前**注册（axum 防止把 `batch-pass-inspection` 当作 `part_id` 解析）。
+> 路由顺序：`/batch-pass-inspection` 必须在 `/{part_id}/pass-inspection` **之前**注册（axum 防止把 `batch-pass-inspection` 当作 `part_id` 解析）。`/worker-scan` 同理为静态段，须在 `/{part_id}/...` 之前注册。
 
 ---
 
@@ -78,6 +79,73 @@ Response 200 `data`：[`PartOut`](#partout-字段) — 流转后的工单最新�
 - 40901 VERSION_CONFLICT — 并发写，乐观锁失败
 - 40001 VALIDATION_ERROR — payload shape 错误
 - 40300 FORBIDDEN — 非 Manager / 非 Inspector
+
+### `POST /api/v2/parts/worker-scan`
+
+权限: **Manager** / **ShelfAccount**（**scope 校验**：`shelf_id` 与 `target_inspection_shelf_id` 必须在 `current.shelf_ids` 内或 `current.shelf_wildcard=true`；否则 `40301 SHELF_MISMATCH`）
+
+Request：`WorkerScanRequest`
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `serial_no` | string | ✓ | 扫码得到的序列号（service 反查 part） |
+| `badge_code` | string | ✓ | 工人 badge_code（service 反查 worker） |
+| `event_type` | string | ✓ | `"RETURNED"` / `"INSPECTED"`（`WorkerScanEvent` 枚举） |
+| `shelf_id` | string (i64) | ✓ | RETURNED 时是 worker-scan 货架（PRODUCTION 区）；INSPECTED 时是工人触发扫码的货架（可为任意 INSPECTION 区货架） |
+| `next_process_id` | string (i64)? | — | **仅 RETURNED 必填**；缺 / 非法 → `40001` |
+| `target_inspection_shelf_id` | string (i64)? | — | **仅 INSPECTED 必填**；缺 / 非法 → `40001`；service 校验 `zone='INSPECTION'` 且 `is_active=true` |
+| `batch_id` | string (i64)? | — | 多批次歧义时 caller 显式指定以消除歧义 |
+
+业务流转：
+
+- **RETURNED**：worker 把 IN_PROCESS+WORKER 批次放回生产架
+  - `shelf_id` 必须映射 `next_process_id`（service 校验）→ 不匹配 `20507 BIZ_SHELF_PROCESS_NOT_MAPPED`
+  - `part_batch` 与 `part` 状态切回 IN_PROCESS+PRODUCTION_SHELF+holder=shelf（OCC）
+  - 写 `RETURNED_BY_WORKER` 事件日志
+- **INSPECTED**：worker 把持有件直接送检
+  - `target_inspection_shelf_id` 必须属于 INSPECTION 区且 active
+  - 不符合 → `20511 BIZ_SHELF_NOT_INSPECTION_ZONE` / `20512 BIZ_SHELF_INACTIVE`
+  - part 流转到 INSPECTION 状态
+- **任一成功后**同事务调用 `WorkerPoolService::refill_for_worker`：
+  - 工人当前工种可加工工序池有候选 → 自动抢满 `work_type.max_held_batches`（或池空为止）
+  - 池空 → 业务侧返回 `data.refill.pool_empty=true`，不报错
+  - refill 失败（如工种未映射工序）→ 业务错（如 `20905 BIZ_WORK_TYPE_NO_PROCESS_MAPPING`），事务回滚 scan 写入
+
+> **OM-6 决议**：scan 与 refill 必须**同事务**——若 scan 成功后再调 refill，期间并发 worker 可能把同一批抢走，破坏「放回 → 抢下一批」原子语义。当前实现已合并到单事务。
+
+Response 200 `data`：`WorkerScanOut`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `scan` | [`WorkerScanCoreOut`](#workerscancoreout-字段) | 扫码事件最小投影 |
+| `refill` | [`RefillResult`](./worker-pool.md#refillresult-字段) | 同事务 refill 结果 |
+
+错误码：
+
+- 20101 BIZ_PART_NOT_FOUND — `serial_no` 无法解析为 part
+- 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不属于该工单 / 已划掉
+- 20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER — `(worker, batch)` 不在 IN_PROCESS+WORKER 持有中（worker 不是该批次当前持有人）
+- 20201 BIZ_WORKER_NOT_FOUND — `badge_code` 无法解析为 worker
+- 20202 BIZ_WORKER_INACTIVE — worker 已停用
+- 20206 BIZ_WORKER_NO_WORK_TYPE — worker.work_type_id IS NULL
+- 20901 BIZ_WORK_TYPE_NOT_FOUND — worker.work_type_id 指向不存在的工种（防御性）
+- 20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET — work_type.max_held_batches IS NULL
+- 20905 BIZ_WORK_TYPE_NO_PROCESS_MAPPING — work_type 未映射工序（refill 触发）
+- 20507 BIZ_SHELF_PROCESS_NOT_MAPPED — `shelf_id` 未映射 `next_process_id`（RETURNED 路径）
+- 20511 BIZ_SHELF_NOT_INSPECTION_ZONE — `target_inspection_shelf.zone ≠ 'INSPECTION'`（INSPECTED 路径）
+- 20512 BIZ_SHELF_INACTIVE — `target_inspection_shelf.is_active = false`（INSPECTED 路径）
+- 40301 SHELF_MISMATCH — `shelf_id` / `target_inspection_shelf_id` 不在 `current.shelf_ids` 内且非 wildcard
+- 40300 FORBIDDEN — 非 Manager / 非 ShelfAccount
+- 40001 VALIDATION_ERROR — payload shape / 必填字段缺失
+- 40901 VERSION_CONFLICT — 并发写，乐观锁失败
+
+WS 广播（commit 后下发）：
+
+- `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（依 `event_type`）—— payload = `WorkerScanCoreOut`
+- 若 `refill.taken.len() > 0` → `WORKER_POOL_REFILL_DONE` —— payload = `RefillResult`
+- 若 `refill.pool_empty=true` 且 `taken` 为空 → `WORKER_POOL_EMPTY` —— payload `{ worker_id, shelf_id }`
+
+详见 [`./websocket.md`](./websocket.md) 与 [`./worker-pool.md`](./worker-pool.md)。
 
 ---
 
@@ -189,6 +257,38 @@ pub struct FailInspectionRequest {
 }
 ```
 
+### Phase W（worker-scan + worker-pool 联动）
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum WorkerScanEvent { RETURNED, INSPECTED }
+
+pub struct WorkerScanRequest {
+    pub serial_no: String,                   // 扫码：序列号
+    pub badge_code: String,                  // 扫码：工人 badge_code
+    pub event_type: WorkerScanEvent,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub shelf_id: i64,                       // worker-scan 货架
+    #[serde(default)]
+    pub next_process_id: Option<String>,     // 仅 RETURNED 必填
+    #[serde(default)]
+    pub target_inspection_shelf_id: Option<String>,  // 仅 INSPECTED 必填
+    #[serde(default)]
+    pub batch_id: Option<String>,
+}
+
+pub struct WorkerScanCoreOut {
+    pub worker_id: i64,
+    pub part_id: i64,
+    pub batch_id: i64,
+    pub event_type: String,                  // "RETURNED" / "INSPECTED"
+}
+
+// WorkerScanOut = { scan: WorkerScanCoreOut, refill: RefillResult }
+// （RefillResult 定义在 worker_pool/model.rs，详见 ./worker-pool.md）
+```
+
 ---
 
 ## 端点约束（与 Python 一致）
@@ -236,4 +336,5 @@ INSPECTION → IN_PROCESS 由 `fail_inspection`（推荐需求 3）走 service �
 - 集成测试：`tests/part_api.rs`（创建→通过品检→展示 READY_TO_SHIP 全链路）
 - 仓库分层：`src/modules/part/handler.rs` (axum) → `service.rs` (业务) → `repo.rs` (SQL)
 - 状态机：`src/modules/part/statemachine.rs`
-- 错误码：`src/shared/error.rs::code`（20101 / 20103 / 20104 / 20109 / 20111 / 40001 / 40300 / 40901）
+- 错误码：`src/shared/error.rs::code`（20101 / 20103 / 20104 / 20109 / 20111 / 20114 / 20201 / 20202 / 20206 / 20507 / 20511 / 20512 / 20901 / 20904 / 20905 / 40001 / 40300 / 40301 / 40901）
+- worker-scan 联动：详见 [`./worker-pool.md`](./worker-pool.md)

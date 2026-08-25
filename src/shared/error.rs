@@ -69,12 +69,15 @@ pub mod code {
     pub const BIZ_PART_BATCH_INVALID_QUANTITY: i32 = 20111;      // 拆分/部分流转数量非法（≤0 或超过批次量）
     pub const BIZ_PART_QUANTITY_LOCKED: i32 = 20112;             // 已拆分或已流转的工单禁止改总量
     pub const BIZ_CUSTOMER_IN_USE: i32 = 20113;                  // 客户仍被 part/assembly 引用 → 拒软删（Python 原 20109，新槽位独占）
+    pub const BIZ_PART_BATCH_NOT_HELD_BY_WORKER: i32 = 20114;   // worker-scan 找不到当前 worker 持有的批次
 
     // 202xx 工人
     pub const BIZ_WORKER_NOT_FOUND: i32 = 20201;
     pub const BIZ_WORKER_INACTIVE: i32 = 20202;
     pub const BIZ_WORKER_IN_USE: i32 = 20203;                    // 还有 part.current_holder_id 指向 → 拒停用
     pub const BIZ_WORKER_HOLD_LIMIT_EXCEEDED: i32 = 20204;       // 工种 max_held_batches 上限触顶 → 拒领取
+    pub const BIZ_WORKER_POOL_EMPTY: i32 = 20205;                // refill 时工序池无候选
+    pub const BIZ_WORKER_NO_WORK_TYPE: i32 = 20206;              // worker.work_type_id IS NULL
 
     // 203xx 装配体
     pub const BIZ_ASSEMBLY_NOT_FOUND: i32 = 20301;
@@ -98,6 +101,7 @@ pub mod code {
     // scan-inspect 一键送检新增
     pub const BIZ_SHELF_NOT_INSPECTION_ZONE: i32 = 20511;        // target_inspection_shelf.zone ≠ 'INSPECTION'
     pub const BIZ_SHELF_INACTIVE: i32 = 20512;                   // target_inspection_shelf.is_active = false
+    // 20507 BIZ_SHELF_PROCESS_NOT_MAPPED（货架未映射该工序）已存在，worker-pool admin_remove 校验沿用此码，勿新增
 
     // 206xx 账号（t_user / t_user_role）—— Python 命名 BIZ_* 长名为正典
     pub const BIZ_USER_ACCOUNT_NOT_FOUND: i32 = 20601;
@@ -122,6 +126,9 @@ pub mod code {
     pub const BIZ_WORK_TYPE_NOT_FOUND: i32 = 20901;
     pub const BIZ_WORK_TYPE_DUPLICATE_CODE: i32 = 20902;
     pub const BIZ_WORK_TYPE_IN_USE: i32 = 20903;                 // 仍有 worker.work_type_id 或 mapping 引用时拒软删
+    pub const BIZ_WORK_TYPE_MAX_HELD_NOT_SET: i32 = 20904;       // work_type.max_held_batches IS NULL
+    // worker-pool refill_for_worker 新增（Task 7）
+    pub const BIZ_WORK_TYPE_NO_PROCESS_MAPPING: i32 = 20905;    // work_type_id 在 t_work_type_process 没工序映射
 
     // 210xx 申请人（t_applicant）
     pub const BIZ_APPLICANT_NOT_FOUND: i32 = 21001;

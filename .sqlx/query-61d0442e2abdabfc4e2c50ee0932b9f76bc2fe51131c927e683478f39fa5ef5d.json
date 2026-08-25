@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at,\n                   delivery_note_id\n            FROM t_part\n            WHERE serial_no = $1\n              AND ($2::bool OR deleted_at IS NULL)\n            ",
+  "query": "\n            SELECT id, code, name, zone, is_active, display_order,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_shelf\n            WHERE id = $1 AND zone = $2 AND is_active = true AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -9,19 +9,19 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_part",
+            "table": "t_shelf",
             "name": "id"
           }
         }
       },
       {
         "ordinal": 1,
-        "name": "serial_no",
+        "name": "code",
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_part",
-            "name": "serial_no"
+            "table": "t_shelf",
+            "name": "code"
           }
         }
       },
@@ -31,155 +31,131 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_part",
+            "table": "t_shelf",
             "name": "name"
           }
         }
       },
       {
         "ordinal": 3,
-        "name": "drawing_no",
+        "name": "zone",
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_part",
-            "name": "drawing_no"
+            "table": "t_shelf",
+            "name": "zone"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "customer_id",
-        "type_info": "Int8",
+        "name": "is_active",
+        "type_info": "Bool",
         "origin": {
           "Table": {
-            "table": "t_part",
-            "name": "customer_id"
+            "table": "t_shelf",
+            "name": "is_active"
           }
         }
       },
       {
         "ordinal": 5,
-        "name": "assembly_id",
-        "type_info": "Int8",
+        "name": "display_order",
+        "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_part",
-            "name": "assembly_id"
+            "table": "t_shelf",
+            "name": "display_order"
           }
         }
       },
       {
         "ordinal": 6,
-        "name": "status",
-        "type_info": "Varchar",
-        "origin": {
-          "Table": {
-            "table": "t_part",
-            "name": "status"
-          }
-        }
-      },
-      {
-        "ordinal": 7,
         "name": "version",
         "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_part",
+            "table": "t_shelf",
             "name": "version"
           }
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_part",
+            "table": "t_shelf",
             "name": "created_at"
           }
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_part",
+            "table": "t_shelf",
             "name": "created_by"
           }
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_part",
+            "table": "t_shelf",
             "name": "updated_at"
           }
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_part",
+            "table": "t_shelf",
             "name": "updated_by"
           }
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 11,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_part",
+            "table": "t_shelf",
             "name": "deleted_at"
-          }
-        }
-      },
-      {
-        "ordinal": 13,
-        "name": "delivery_note_id",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "t_part",
-            "name": "delivery_note_id"
           }
         }
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Bool"
+        "Int8",
+        "Text"
       ]
     },
     "nullable": [
       false,
-      true,
       false,
       false,
       false,
-      true,
       false,
       false,
       false,
-      true,
       false,
       true,
+      false,
       true,
       true
     ]
   },
-  "hash": "a6ded4e4a8d889c42368861fa4f2b19fc0f5b8aebe26ef042d34c8d87c070908"
+  "hash": "61d0442e2abdabfc4e2c50ee0932b9f76bc2fe51131c927e683478f39fa5ef5d"
 }

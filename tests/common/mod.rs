@@ -130,7 +130,8 @@ pub async fn clean_business_db(pool: &PgPool) {
             t_part_batch, t_part_event, t_part, \
             t_assembly, \
             t_customer, t_applicant, \
-            t_work_type, t_worker \
+            t_work_type, t_worker, \
+            t_shelf_process, t_work_type_process, t_process \
          RESTART IDENTITY CASCADE",
     )
     .execute(pool)
@@ -199,6 +200,10 @@ pub async fn test_state(pool: PgPool) -> Arc<AppState> {
 }
 
 /// axum Router：与 main.rs 中的 `/api/v2` nest 同形。
+///
+/// 不再装 `inject_current_user_layer`：handler 现在用 `current: CurrentUser`
+/// 直接参数（依赖 `CurrentUser` 的 `FromRequestParts<Arc<AppState>>` impl 自动
+/// 从 Bearer JWT 解析），与生产路径一致。
 pub fn test_app(state: Arc<AppState>) -> axum::Router {
     hsh_erp_rust::modules::v2_router().with_state(state)
 }
@@ -378,4 +383,81 @@ pub async fn get_refresh_token_version(pool: &PgPool, user_id: i64) -> i32 {
     .await
     .expect("query refresh_token_version");
     row.ver
+}
+
+// ===========================================================================
+// worker-pool 域 fixture helpers（Task 10 e2e 测试用）：
+//   - seed_process: 插一个 t_process 工序（INHOUSE 类别）
+//   - link_work_type_to_process: t_work_type_process 映射
+//   - link_shelf_to_process: t_shelf_process 映射
+//
+// 命名风格：与 part_api.rs 的 insert_part / insert_batch 同形（prefix=动词 + 名词）。
+// 雪花 ID：复用同一 epoch/instance/seq（1_577_836_800_000 / 1 / 1），与其它 fixture 一致。
+// ===========================================================================
+
+/// 插一个 INHOUSE 类别 `t_process` 工序（worker-pool 用：INHOUSE 自产）。
+#[allow(dead_code)]
+pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query!(
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
+        id,
+        code,
+        name,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert t_process");
+    id
+}
+
+/// `t_work_type_process` 映射（无业务软删：`deleted_at` 留默认 NULL）。
+#[allow(dead_code)]
+pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query!(
+        "INSERT INTO t_work_type_process (id, work_type_id, process_id, sort_order, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, 0, $4, $4)",
+        id,
+        wt_id,
+        p_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert t_work_type_process");
+}
+
+/// `t_shelf_process` 映射（无业务软删）。
+#[allow(dead_code)]
+pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query!(
+        "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, 0, $4, $4)",
+        id,
+        s_id,
+        p_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert t_shelf_process");
 }

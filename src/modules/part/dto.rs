@@ -20,6 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::modules::worker_pool::dto::WorkerScanEvent;
+use crate::modules::worker_pool::model::RefillResult;
 use crate::shared::types::{deserialize_i64, serialize_i64};
 
 /// 工单详情投影（pass_inspection 出参；其它端点复用做最小投影）。
@@ -217,4 +219,62 @@ pub struct FailInspectionRequest {
     pub batch_id: Option<String>,
     #[serde(default)]
     pub quantity: Option<i32>,
+}
+
+/// worker-scan 入参（`POST /parts/worker-scan`，Task 8）。
+///
+/// `serial_no` / `badge_code`：扫码原始字符串（service 层反查）。
+/// `event_type`：`WorkerScanEvent::RETURNED` / `INSPECTED`。
+/// `shelf_id`：必填；RETURNED 时是 worker-scan 货架（PRODUCTION 区），INSPECTED
+///   时是 worker-scan 货架（INSPECTION 区也会校验，按 event_type 分支走）。
+/// `next_process_id`：仅 RETURNED 必填；缺 / 非法 → 40001。
+/// `target_inspection_shelf_id`：仅 INSPECTED 必填；缺 / 非法 → 40001。
+/// `batch_id`：可选；多批次歧义时 caller 显式指定以消除歧义。
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkerScanRequest {
+    pub serial_no: String,
+    pub badge_code: String,
+    pub event_type: WorkerScanEvent,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub shelf_id: i64,
+    #[serde(default)]
+    pub next_process_id: Option<String>,
+    #[serde(default)]
+    pub target_inspection_shelf_id: Option<String>,
+    #[serde(default)]
+    pub batch_id: Option<String>,
+}
+
+/// worker-scan 核心出参（不含 refill）。
+///
+/// handler 会把 `scan + refill` 一起装到 [`WorkerScanOut`] 返回；
+/// `WorkerScanCoreOut` 是 service 层直接产出的最小投影（与 worker-pool
+/// `RefillResult` 解耦，便于 service 层单测）。
+///
+/// `work_type_id` 与 `badge_code` 是**内部管道字段**：handler 用它把
+/// `worker_scan_event` 已经 fetch 过的 worker 信息透传给同事务的
+/// `WorkerPoolService::refill_for_worker_with_work_type`，避免重复
+/// `WorkerRepo::get_by_id` 查询。不暴露到 JSON 响应里。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerScanCoreOut {
+    #[serde(serialize_with = "serialize_i64")]
+    pub worker_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    pub event_type: String,
+    /// 内部：透传给 refill，refill 不再 fetch worker。
+    #[serde(skip)]
+    pub work_type_id: i64,
+    /// 内部：refill 写 `TAKEN_FROM_POOL` 事件日志需要 badge_code。
+    #[serde(skip)]
+    pub badge_code: String,
+}
+
+/// worker-scan 端点出参：`scan` + 同事务 refill 结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerScanOut {
+    pub scan: WorkerScanCoreOut,
+    pub refill: RefillResult,
 }
