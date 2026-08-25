@@ -81,15 +81,24 @@ impl PartStatus {
         }
     }
 
-    /// 迁移白名单。本 PR 仅放行 pass_inspection 路径。
+    /// 迁移白名单。
     ///
-    /// 注：`PROGRAMMING → INSPECTION` 列入白名单仅为对称；当前 service 不暴露
-    /// 该路径（由其它 PR 实施）。
+    /// 本 PR（scan-inspect 一键送检）放行：
+        /// - `INSPECTION → READY_TO_SHIP`：pass_inspection / scan_inspect (PASS) 路径
+    /// - `PROGRAMMING → INSPECTION`：scan_inspect (PROGRAMMING → INSPECTION)
+    /// - `PENDING → INSPECTION`：scan_inspect (PENDING → INSPECTION)
+    /// - `IN_PROCESS → INSPECTION`：scan_inspect (IN_PROCESS → INSPECTION)
+    ///
+    /// IN_PROCESS+WORKER 拒绝 / IN_PROCESS+非 PRODUCTION_SHELF 拒绝走
+    /// service 层组合校验（仿 myERP `service/part.py:4140-4164`），不污染
+    /// 状态机白名单。
     pub fn can_transition_to(self, to: Self) -> bool {
         matches!(
             (self, to),
-            (Self::INSPECTION, Self::READY_TO_SHIP)
+            (Self::INSPECTION,    Self::READY_TO_SHIP)
                 | (Self::PROGRAMMING, Self::INSPECTION)
+                | (Self::PENDING,     Self::INSPECTION)
+                | (Self::IN_PROCESS,  Self::INSPECTION)
         )
     }
 }
@@ -136,5 +145,25 @@ mod tests {
         assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::CANCELLED));
         assert!(!PartStatus::DELIVERED.can_transition_to(PartStatus::INSPECTION));
         assert!(!PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::INSPECTION));
+    }
+
+    #[test]
+    fn allowed_transitions_scan_inspect() {
+        assert!(PartStatus::INSPECTION.can_transition_to(PartStatus::READY_TO_SHIP));
+        assert!(PartStatus::PROGRAMMING.can_transition_to(PartStatus::INSPECTION));
+        // scan-inspect 新增
+        assert!(PartStatus::PENDING.can_transition_to(PartStatus::INSPECTION));
+        assert!(PartStatus::IN_PROCESS.can_transition_to(PartStatus::INSPECTION));
+    }
+
+    #[test]
+    fn disallowed_transitions_scan_inspect_rejects() {
+        // 自环非法
+        assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::INSPECTION));
+        // 反向非法
+        assert!(!PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::INSPECTION));
+        // 跨度过大
+        assert!(!PartStatus::PENDING.can_transition_to(PartStatus::READY_TO_SHIP));
+        assert!(!PartStatus::IN_PROCESS.can_transition_to(PartStatus::READY_TO_SHIP));
     }
 }

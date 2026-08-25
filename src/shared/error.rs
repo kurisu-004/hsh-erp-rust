@@ -94,6 +94,9 @@ pub mod code {
     pub const BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND: i32 = 20505;  // 工序不存在
     pub const BIZ_SHELF_NO_MATCH_FOR_PROCESS: i32 = 20506;       // 没有 active 货架映射指定 process
     pub const BIZ_SHELF_PROCESS_NOT_MAPPED: i32 = 20507;         // 货架未映射该工序
+    // scan-inspect 一键送检新增
+    pub const BIZ_SHELF_NOT_INSPECTION_ZONE: i32 = 20511;        // target_inspection_shelf.zone ≠ 'INSPECTION'
+    pub const BIZ_SHELF_INACTIVE: i32 = 20512;                   // target_inspection_shelf.is_active = false
 
     // 206xx 账号（t_user / t_user_role）—— Python 命名 BIZ_* 长名为正典
     pub const BIZ_USER_ACCOUNT_NOT_FOUND: i32 = 20601;
@@ -498,6 +501,8 @@ mod tests {
         (code::BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND, "BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND"),
         (code::BIZ_SHELF_NO_MATCH_FOR_PROCESS, "BIZ_SHELF_NO_MATCH_FOR_PROCESS"),
         (code::BIZ_SHELF_PROCESS_NOT_MAPPED, "BIZ_SHELF_PROCESS_NOT_MAPPED"),
+        (code::BIZ_SHELF_NOT_INSPECTION_ZONE, "BIZ_SHELF_NOT_INSPECTION_ZONE"),
+        (code::BIZ_SHELF_INACTIVE, "BIZ_SHELF_INACTIVE"),
         // 208xx
         (code::BIZ_PROCESS_NOT_FOUND, "BIZ_PROCESS_NOT_FOUND"),
         (code::BIZ_PROCESS_DUPLICATE_CODE, "BIZ_PROCESS_DUPLICATE_CODE"),
@@ -633,6 +638,8 @@ mod tests {
         assert_eq!(code::BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND, 20505);
         assert_eq!(code::BIZ_SHELF_NO_MATCH_FOR_PROCESS, 20506);
         assert_eq!(code::BIZ_SHELF_PROCESS_NOT_MAPPED, 20507);
+        assert_eq!(code::BIZ_SHELF_NOT_INSPECTION_ZONE, 20511);
+        assert_eq!(code::BIZ_SHELF_INACTIVE, 20512);
 
         // 206xx + 短别名
         assert_eq!(code::BIZ_USER_ACCOUNT_NOT_FOUND, 20601);
