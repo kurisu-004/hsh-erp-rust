@@ -34,10 +34,22 @@ use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::state::AppState;
 
 /// 测试 DB URL：与 `postgres-test` 容器（端口5429）+ `postgres_rust_test` 库配对。
-const TEST_DATABASE_URL: &str = "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test";
+fn test_database_url() -> String {
+    std::env::var("TEST_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test".to_string())
+}
+
+#[allow(dead_code)]
+const TEST_DATABASE_URL_DEFAULT: &str = "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test";
 
 /// Admin DB URL：用于在测试前创建 `postgres_rust_test` 库。
-const ADMIN_DATABASE_URL: &str = "postgres://hsh_test:6065161test@localhost:5429/postgres";
+fn admin_database_url() -> String {
+    std::env::var("ADMIN_DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://hsh_test:6065161test@localhost:5429/postgres".to_string())
+}
+
+#[allow(dead_code)]
+const ADMIN_DATABASE_URL_DEFAULT: &str = "postgres://hsh_test:6065161test@localhost:5429/postgres";
 
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
 const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
@@ -47,7 +59,7 @@ const TEST_REDIS_URL: &str = "redis://localhost:6380/15";
 
 /// 第一次跑测试时建 `postgres_rust_test`（已存在则忽略）。
 pub async fn ensure_database_exists() {
-    let admin = PgPool::connect(ADMIN_DATABASE_URL)
+    let admin = PgPool::connect(&admin_database_url())
         .await
         .expect("connect admin db (postgres) — 确认 postgres-test 容器在 5429");
     let exists: bool = sqlx::query_scalar(
@@ -70,7 +82,7 @@ pub async fn ensure_database_exists() {
 
 /// 建测试连接池 + 跑迁移。已迁移过则 `migrate!` 是 no-op。
 pub async fn test_pool() -> PgPool {
-    let pool = PgPool::connect(TEST_DATABASE_URL)
+    let pool = PgPool::connect(&test_database_url())
         .await
         .expect("connect test db postgres_rust_test");
     sqlx::migrate!("./migrations")
@@ -143,7 +155,7 @@ pub async fn clean_business_db(pool: &PgPool) {
 /// `redis_pool` 必须事先建立并 `FLUSHDB`；返回的 `Arc<AppState>` 在每个用例内独占。
 pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppState> {
     let config = Arc::new(AppConfig {
-        database_url: TEST_DATABASE_URL.to_string(),
+        database_url: test_database_url(),
         listen_addr: "0.0.0.0:3000".to_string(),
         jwt: JwtConfig {
             secret: TEST_JWT_SECRET.to_string(),
