@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE t_part SET delivery_note_id = 88888888 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "56e58c450f3e08887bc8fdb6befcd0daef09dec1e3e7669991eef6963bedb3e3"
+}

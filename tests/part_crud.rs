@@ -1321,6 +1321,206 @@ async fn deliver_cancelled_409() {
 }
 
 // ===========================================================================
+//  Tests — Part 7 (Fix Batch 2): lifecycle↔batch sync (Finding A)
+//                       + cancel delivery_note lock (Finding D)
+// ===========================================================================
+
+/// 取 part 的某状态批次的 status 字符串 + version（验证 batch 同步用）。
+async fn batch_status_and_version(pool: &PgPool, part_id: i64, status: &str) -> Option<(String, i32)> {
+    let row: Option<(String, i32)> = sqlx::query_as(
+        "SELECT status, version FROM t_part_batch \
+         WHERE part_id = $1 AND status = $2 AND deleted_at IS NULL \
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(part_id)
+    .bind(status)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row
+}
+
+/// POST /parts/{id}/deliver —— READY_TO_SHIP → DELIVERED 应同时翻转
+/// 最近一条 READY_TO_SHIP 批次到 DELIVERED（同事务）。
+///
+/// Fix Batch 2 Finding A 回归测试：t_part_batch 不再 stale。
+#[tokio::test]
+async fn deliver_also_updates_batch() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part_with_status(
+        &pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "READY_TO_SHIP",
+    )
+    .await;
+    // 同 part 配一条 READY_TO_SHIP 批次
+    let _bid = insert_batch(&pool, pid, 1, 1, "READY_TO_SHIP").await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/deliver"),
+            Some(json!({ "note": "发货" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "deliver 200: {env}");
+    assert_eq!(env["data"]["status"], "DELIVERED");
+
+    // 批次也应被翻到 DELIVERED
+    let (batch_status, _) =
+        batch_status_and_version(&_pool, pid, "DELIVERED")
+            .await
+            .expect("批次应存在并已被翻为 DELIVERED");
+    assert_eq!(batch_status, "DELIVERED", "batch.status 应同步翻为 DELIVERED");
+}
+
+/// POST /parts/{id}/cancel —— PENDING → CANCELLED 应同时翻转最近一条
+/// PENDING 批次到 CANCELLED（同事务）。
+///
+/// Fix Batch 2 Finding A 回归测试：cancel 流同样需 batch 同步。
+#[tokio::test]
+async fn cancel_also_updates_batch() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part_with_status(
+        &pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "PENDING",
+    )
+    .await;
+    let _bid = insert_batch(&pool, pid, 1, 1, "PENDING").await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/cancel"),
+            Some(json!({ "reason": "客户取消" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "cancel 200: {env}");
+    assert_eq!(env["data"]["status"], "CANCELLED");
+
+    let (batch_status, _) =
+        batch_status_and_version(&_pool, pid, "CANCELLED")
+            .await
+            .expect("批次应存在并已被翻为 CANCELLED");
+    assert_eq!(batch_status, "CANCELLED", "batch.status 应同步翻为 CANCELLED");
+}
+
+/// POST /parts/{id}/deliver —— 工单无对应 source-status 批次时仍应成功
+/// （t_part 单独翻转合法）。
+///
+/// Fix Batch 2 Finding A 边界测试：`find_most_recent_batch_for_part` 返回
+/// `None` 时跳过 `mark_batch_*`，不报错。
+#[tokio::test]
+async fn deliver_without_source_batch_ok() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part_with_status(
+        &pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "READY_TO_SHIP",
+    )
+    .await;
+    // 故意不插 batch
+
+    let (app, token, _pool) = login_manager(pool, "mgr").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/deliver"),
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "deliver w/o batch: {env}");
+    assert_eq!(env["data"]["status"], "DELIVERED");
+}
+
+/// POST /parts/{id}/cancel —— part 已挂送货单 → 21420 BIZ_DELIVERY_NOTE_LOCKED_PART (HTTP 409)。
+///
+/// Fix Batch 2 Finding D 回归测试：cancel 流增加 delivery_note_id 守卫。
+/// service 内通过 `PartRepo::get_part_detail` 取完整 TPart（含 delivery_note_id），
+/// 锁定时返回 21420。
+#[tokio::test]
+async fn cancel_delivery_note_locked_409() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part_with_status(
+        &pool,
+        "P0",
+        l2,
+        Some("P000"),
+        None,
+        "PENDING",
+    )
+    .await;
+
+    // 直接 SQL 模拟「part 已挂送货单」：随便写一个 delivery_note_id。
+    // 21420 不要求送货单实际存在 —— service 层只看 part.delivery_note_id 是否非 NULL。
+    sqlx::query!(
+        "UPDATE t_part SET delivery_note_id = 88888888 WHERE id = $1",
+        pid
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (app, token, pool2) = login_manager(pool, "mgr").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/cancel"),
+            Some(json!({ "reason": "测试锁定" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "delivery_note 锁 cancel: {env}"
+    );
+    assert_eq!(
+        env["code"], 21420,
+        "BIZ_DELIVERY_NOTE_LOCKED_PART: {env}"
+    );
+
+    // 确认 part.status 没被翻（事务回滚）
+    let row: (String,) = sqlx::query_as("SELECT status FROM t_part WHERE id = $1")
+        .bind(pid)
+        .fetch_one(&pool2)
+        .await
+        .unwrap();
+    assert_eq!(row.0, "PENDING", "锁定 part 不应被 cancel");
+}
+
+// ===========================================================================
 //  Tests — Part 6: upload-drawing (multipart, #[ignore] for this round)
 // ===========================================================================
 

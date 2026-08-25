@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, applicant_name, request_date, planned_delivery_date, quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, assembly_id) VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, $7)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Timestamp",
+        "Date",
+        "Int8",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "95e642fc1858892221a214e8f54441734c60f4b40ad74079b0840064f15a0ebb"
+}

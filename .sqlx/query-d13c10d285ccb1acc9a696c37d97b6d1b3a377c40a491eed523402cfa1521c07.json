@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_menu (id, parent_id, code, title, path, sort_order, is_active, version, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 0, true, 0, $6, $6)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d13c10d285ccb1acc9a696c37d97b6d1b3a377c40a491eed523402cfa1521c07"
+}

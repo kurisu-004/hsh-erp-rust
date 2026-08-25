@@ -30,7 +30,7 @@ use crate::modules::part::dto::{
 };
 use crate::modules::part::service::{PartService, BATCH_PASS_INSPECTION_MAX_ITEMS};
 use crate::modules::worker_pool::service::WorkerPoolService;
-use crate::shared::error::AppError;
+use crate::shared::error::{code, AppError};
 use crate::shared::response::R;
 use crate::state::AppState;
 
@@ -435,15 +435,23 @@ pub async fn soft_delete_part(
 
 /// POST /api/v2/parts/{part_id}/upload-drawing
 ///
-/// Multipart 仅含 `file` 字段（service 内校验 content_type=application/pdf，
-/// size ≤ 50MB）。返回最新 `TPartFile` 行。
+/// Multipart 严格校验（Finding F）：
+/// - 必须恰好含一个 `file` 字段；缺字段 / 多 `file` / 未知字段名一律 40001
+/// - 不为 `file` 默认 MIME —— service 层做严格 `application/pdf` 守卫，
+///   客户端忘记设头会得到 21102 `BIZ_PART_FILE_BAD_TYPE`
+///
+/// 权限（Finding B）：先 `require_any_role` 再读 multipart，避免非授权请求
+/// 触发 50 MB 内存分配。
 pub async fn upload_drawing(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(part_id): Path<i64>,
     mut multipart: Multipart,
 ) -> Result<Json<R<TPartFile>>, AppError> {
-    let mut bytes: Option<(Vec<u8>, String, String)> = None;
+    // Finding B：权限守卫先于 multipart 解析 —— 拒绝未授权请求的内存分配。
+    current.require_any_role(CRUD_PART_ROLES)?;
+    let mut bytes: Option<(Vec<u8>, String, Option<String>)> = None;
+    let mut file_seen = false;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -451,21 +459,35 @@ pub async fn upload_drawing(
     {
         let name = field.name().unwrap_or("").to_string();
         if name == "file" {
+            // Finding F：拒绝第二个 `file` 字段（40001）。
+            if file_seen {
+                return Err(AppError::validation(
+                    "multipart 包含多个 'file' 字段（仅允许 1 个）",
+                ));
+            }
+            file_seen = true;
             let fname = field.file_name().unwrap_or("upload.pdf").to_string();
-            let ct = field
-                .content_type()
-                .unwrap_or("application/pdf")
-                .to_string();
+            // Finding F：不再 `unwrap_or("application/pdf")` 默认 MIME；
+            // 保留客户端提供的原始 content_type（或 None），交给 service 层
+            // 严格比对 `application/pdf`，非 PDF 直接 21102。
+            let ct = field.content_type().map(|m| m.to_string());
             let data = field
                 .bytes()
                 .await
                 .map_err(|e| AppError::validation(format!("file 读取失败: {e}")))?
                 .to_vec();
             bytes = Some((data, fname, ct));
+        } else {
+            // Finding F：未知字段名一律 40001（避免静默接受错位数据）。
+            return Err(AppError::validation(format!(
+                "multipart 未知字段: '{name}'（仅接受 'file'）"
+            )));
         }
     }
     let (data, fname, ct) = bytes
         .ok_or_else(|| AppError::validation("multipart 缺少 'file' 字段"))?;
+    let ct = ct
+        .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "file 缺少 content_type"))?;
     let mut tx = state.pool.begin().await?;
     let pf = PartService::upload_drawing(
         &mut tx, &state.snowflake, &state, part_id, &data, &fname, &ct, &current,

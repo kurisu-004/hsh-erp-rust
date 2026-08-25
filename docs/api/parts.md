@@ -3,22 +3,244 @@
 > 本文件须与 `src/modules/part/{handler.rs,dto.rs,service.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
-> 当前 PR 只上线 pass_inspection 两条端点（单件 + 批量）。part 域其余 CRUD（创建工单 / 修改工单 / 列表查询等）尚未实施，会得到 `404 Not Found`。
+> 域覆盖：CRUD（list / detail / create / batch-create / update / soft-delete）、
+> by-serial 查询、upload-drawing（multipart PDF）、lifecycle 状态机
+> （deliver / cancel / complete / start-repair）、inspection 流（pass / scan / fail）。
+> 所有路径前缀 `/api/v2`。
 
 ## 端点列表
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| POST | `/api/v2/parts/batch-pass-inspection` | **Manager** / **Inspector** | 批量通过品检（INSPECTION → READY_TO_SHIP），per-item 独立处理 |
-| POST | `/api/v2/parts/{part_id}/pass-inspection` | **Manager** / **Inspector** | 单件通过品检（INSPECTION → READY_TO_SHIP），payload 可空 |
-| POST | `/api/v2/parts/batch-scan-inspect` | **Manager** / **Inspector** | 批量一键送检（共享品检架 + per-item decision，N≤200） |
-| POST | `/api/v2/parts/{part_id}/scan-inspect` | **Manager** / **Inspector** | 单件一键送检（PENDING/PROGRAMMING/IN_PROCESS → INSPECTION → PASS/FAIL） |
-| POST | `/api/v2/parts/{part_id}/fail-inspection` | **Manager** / **Inspector** | 单件品检打回（INSPECTION → IN_PROCESS，依赖 shelf+next_process） |
+| GET | `/api/v2/parts` | Manager / Clerk / Inspector / CncProgrammer | 列表查询 + 分页 + 多字段过滤 |
+| POST | `/api/v2/parts` | Manager / Clerk | 单件创建工单（status=PENDING） |
+| POST | `/api/v2/parts/batch` | Manager / Clerk | 批量创建（共享 customer_id；N≤200；per-item savepoint） |
+| GET | `/api/v2/parts/{part_id}` | Manager / Clerk / Inspector / CncProgrammer | 工单详情（含 customer_name / current_batch_id 冗余） |
+| GET | `/api/v2/parts/by-serial/{serial_no}` | Manager / Clerk / Inspector / CncProgrammer | 通过序列号查详情 |
+| POST | `/api/v2/parts/{part_id}/update` | Manager / Clerk | 字段可选 UPDATE（OCC + 软删守卫） |
+| POST | `/api/v2/parts/{part_id}/soft-delete` | **Manager** | 软删（OCC + 终态禁 + delivery_note 锁禁） |
+| POST | `/api/v2/parts/{part_id}/upload-drawing` | Manager / Clerk | Multipart PDF 上传到 COS + 落 `t_part_file` |
+| POST | `/api/v2/parts/{part_id}/deliver` | Manager / Clerk | READY_TO_SHIP → DELIVERED |
+| POST | `/api/v2/parts/{part_id}/cancel` | Manager / Clerk | 5 状态白名单 → CANCELLED（拒 delivery_note 锁） |
+| POST | `/api/v2/parts/{part_id}/complete` | Manager / Clerk | DELIVERED → COMPLETED（清空 serial_no） |
+| POST | `/api/v2/parts/{part_id}/start-repair` | Manager / Clerk / Inspector | IN_PROCESS → REPAIRING |
+| POST | `/api/v2/parts/batch-pass-inspection` | Manager / Inspector | 批量通过品检（INSPECTION → READY_TO_SHIP），per-item 独立处理 |
+| POST | `/api/v2/parts/{part_id}/pass-inspection` | Manager / Inspector | 单件通过品检（INSPECTION → READY_TO_SHIP），payload 可空 |
+| POST | `/api/v2/parts/batch-scan-inspect` | Manager / Inspector | 批量一键送检（共享品检架 + per-item decision，N≤200） |
+| POST | `/api/v2/parts/{part_id}/scan-inspect` | Manager / Inspector | 单件一键送检（PENDING/PROGRAMMING/IN_PROCESS → INSPECTION → PASS/FAIL） |
+| POST | `/api/v2/parts/{part_id}/fail-inspection` | Manager / Inspector | 单件品检打回（INSPECTION → IN_PROCESS，依赖 shelf+next_process） |
 | POST | `/api/v2/parts/worker-scan` | **Manager** / **ShelfAccount** | 工人扫码归还 / 送检（SHELF_ACCOUNT @ 该 shelf）；成功后同事务触发 worker-pool refill |
 
-> 路由顺序：`/batch-pass-inspection` 必须在 `/{part_id}/pass-inspection` **之前**注册（axum 防止把 `batch-pass-inspection` 当作 `part_id` 解析）。`/worker-scan` 同理为静态段，须在 `/{part_id}/...` 之前注册。
+> 路由顺序：`/batch-pass-inspection` 与 `/batch-scan-inspect` 必须在 `/{part_id}/...` 之前注册（axum 防止把静态段解析成 `part_id`）；`/batch`、`/by-serial/{serial_no}`、`/worker-scan` 同理。
 
 ---
+
+### `GET /api/v2/parts`
+
+权限: **Manager / Clerk / Inspector / CncProgrammer**
+
+Query：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `customer_id` | string (i64)? | L1 → 自身 + L2 ids；L2 → 自身 + 同 L1 兄弟 ids |
+| `status` | string? | 单状态过滤（PENDING / INSPECTION / READY_TO_SHIP / DELIVERED / COMPLETED / CANCELLED / 等） |
+| `statuses` | string? | 多状态过滤，逗号分隔（如 `PENDING,READY_TO_SHIP`） |
+| `is_urgent` | bool? | 紧急标记过滤 |
+| `keyword` | string? | 模糊匹配 `name` / `drawing_no` / `serial_no` |
+| `sort_by` | string? | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它退化为 `CREATED_AT` |
+| `sort_dir` | string? | `ASC` / `DESC`（缺省 `DESC`） |
+| `limit` | int? | 1..=200（缺省 50） |
+| `offset` | int? | ≥ 0（缺省 0） |
+
+Response 200 `data`：`PartListOut`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `items` | [PartListItem](#partlistitem-字段)[] | 含 TPart 完整列 + `customer_name` / `l1_customer_name` 冗余 |
+| `total` | string (i64) | 满足过滤的总数（与 `items` 解耦，便于前端独立显示） |
+| `limit` | string (i64) | 实际生效的 limit |
+| `offset` | string (i64) | 实际生效的 offset |
+
+错误码：40001（limit/offset 越界）、40300（角色不符）、50001（DB）。
+
+### `POST /api/v2/parts`
+
+权限: **Manager / Clerk**
+
+Request：`PartCreateRequest`
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | ✓ | 工单名 |
+| `drawing_no` | string | ✓ | 图号 |
+| `applicant_name` | string | ✓ | 申请人 |
+| `quantity` | i32 | ✓ | > 0 |
+| `request_date` | date | ✓ | 客户请求日 |
+| `planned_delivery_date` | date | ✓ | 计划交付日 |
+| `is_urgent` | bool | — | 缺省 `false` |
+| `customer_id` | string (i64) | ✓ | 二级客户 id（雪花字符串） |
+| `assembly_id` | string (i64)? | — | 父装配体（可选） |
+| `order_no` | string? | — | 订单号 |
+| `system_delivery_date` | date? | — | 系统派工日 |
+| `note` | string? | — | 备注 |
+
+Response 201 `data`：[`PartDetailOut`](#partdetailout-字段) — 含 TPart 完整列 + 客户冗余 + `current_batch_id`。
+
+错误码：40001（字段空 / quantity≤0）、40300（角色不符）、20105（customer 不存在）。
+
+### `POST /api/v2/parts/batch`
+
+权限: **Manager / Clerk**
+
+Request：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `customer_id` | string (i64) | ✓ | 批量共享的二级客户 id |
+| `items` | [PartBatchCreateItem](#partbatchcreateitem-字段)[] | ✓ | 1..=200；每件独立校验 |
+
+Response 200 `data`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `created` | [PartDetailOut](#partdetailout-字段)[] | 成功插入并读取详情的件 |
+| `failed` | [PartBatchCreateFailure](#partbatchcreatefailure-字段)[] | 单件失败明细（含 item_index）；成功与失败互斥 |
+
+错误码：40001（items 空 / 超过 200）、40300；item-level（`failed[].code`）：50001 / 20101 等。
+
+### `GET /api/v2/parts/{part_id}`
+
+权限: **Manager / Clerk / Inspector / CncProgrammer**
+
+Response 200 `data`：[`PartDetailOut`](#partdetailout-字段)。
+
+错误码：20101（不存在 / 已软删）、40300。
+
+### `GET /api/v2/parts/by-serial/{serial_no}`
+
+权限: **Manager / Clerk / Inspector / CncProgrammer**
+
+Response 同 [`GET /parts/{id}`](#get-apiv2partspart_id)；通过 `t_part.serial_no` partial unique 索引定位。
+
+错误码：20101（不存在）、40300。
+
+### `POST /api/v2/parts/{part_id}/update`
+
+权限: **Manager / Clerk**
+
+Request：`PartUpdateRequest` — 字段全部可选（缺省 = DB 不动）；`version` 必填（OCC）。
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `version` | i32 | ✓ | 乐观锁；与 DB 不匹配 → 40901 |
+| `name` | string? | — | |
+| `drawing_no` | string? | — | |
+| `applicant_name` | string? | — | |
+| `quantity` | i32? | — | > 0 |
+| `order_no` | string? | — | |
+| `system_delivery_date` | date? | — | |
+| `planned_delivery_date` | date? | — | |
+| `actual_delivery_date` | date? | — | |
+| `note` | string? | — | |
+| `is_urgent` | bool? | — | |
+
+Response 200 `data`：[`PartDetailOut`](#partdetailout-字段)。
+
+错误码：40901（版本冲突 / 已软删）、40300、20112（已流转禁改总量，留待后续 PR 启用）。
+
+### `POST /api/v2/parts/{part_id}/soft-delete`
+
+权限: **Manager**
+
+Request：`{ "version": i32 }`
+
+Response 200 `data: null`（软删成功；commit 后 WS 广播 `PART_SOFT_DELETED`）。
+
+错误码：
+
+- 20101 — part 不存在 / 已软删（HTTP 404）
+- 40901 — version 不匹配（HTTP 409）
+- 21420 — part 已挂送货单（HTTP 409）
+- 20120 — 终态 DELIVERED/COMPLETED 禁删（HTTP 409）
+- 40300 — 非 Manager
+
+### `POST /api/v2/parts/{part_id}/upload-drawing`
+
+权限: **Manager / Clerk**（**RBAC 在 handler 第一步守卫**，避免未授权请求触发 50 MB 内存分配）
+
+Multipart 严格校验：
+
+- 必须恰好含一个 `file` 字段；缺字段 / 多 `file` / 未知字段名一律 40001
+- `file.content_type` 必须为 `application/pdf`（不默认可选 MIME，缺失 → 21102）
+- `file` ≤ 50 MB → 21103
+
+Response 200 `data`：最新 `TPartFile` 行（含 `content_type` / `file_size` / `content_sha256`）。
+
+错误码：40001（multipart 字段错）、40300（角色不符）、21102（MIME 错）、21103（size 错）、21104（COS 失败）、21105（part 不存在）、21108（同 part+kind+sha256 撞唯一索引）。
+
+### `POST /api/v2/parts/{part_id}/deliver`
+
+权限: **Manager / Clerk**
+
+Request：`{ "note"?: string }`（可空）
+
+Response 200 `data`：[`PartOut`](#partout-字段) — 流转后工单。同步翻转最近一条 `READY_TO_SHIP` 批次（同事务）。
+
+错误码：
+
+- 20101 — part 不存在 / 软删
+- 20104 — status 字符串非法
+- 20114 — part 已 CANCELLED
+- 20116 — 当前状态非 READY_TO_SHIP（状态机白名单拒绝）
+- 40901 — 乐观锁失败（part 或 batch）
+
+### `POST /api/v2/parts/{part_id}/cancel`
+
+权限: **Manager / Clerk**
+
+Request：`{ "reason"?: string, "note"?: string }`（`reason` 优先作为事件 note）
+
+Response 200 `data`：[`PartOut`](#partout-字段)。同步翻转最近一条 source-status 批次（同事务）。
+
+错误码：
+
+- 20101 — part 不存在 / 软删
+- 20103 — 当前状态不在 cancel 白名单（COMPLETED / REPAIRING / OUTSOURCE 等）
+- 20104 — status 字符串非法
+- 20114 — part 已 CANCELLED
+- 21420 — part 已挂送货单，禁 cancel
+- 40901 — 乐观锁失败
+
+### `POST /api/v2/parts/{part_id}/complete`
+
+权限: **Manager / Clerk**
+
+Request：`{ "note"?: string }`（可空）
+
+Response 200 `data`：[`PartOut`](#partout-字段)。**`t_part.serial_no` 被清空**（序列号已转交送货单）。同步翻转最近一条 DELIVERED 批次（同事务）。
+
+错误码：
+
+- 20101 — part 不存在 / 软删
+- 20114 — part 已 CANCELLED
+- 20115 — 当前状态非 DELIVERED（状态机白名单拒绝）
+- 40901 — 乐观锁失败
+
+### `POST /api/v2/parts/{part_id}/start-repair`
+
+权限: **Manager / Clerk / Inspector**
+
+Request：`{ "reason"?: string, "note"?: string }`（`reason` 优先作为事件 note）
+
+Response 200 `data`：[`PartOut`](#partout-字段)。`t_part.has_been_repaired` 置 `true`；同步翻转最近一条 IN_PROCESS 批次（同事务）。
+
+错误码：
+
+- 20101 — part 不存在 / 软删
+- 20114 — part 已 CANCELLED
+- 20117 — 当前状态非 IN_PROCESS（状态机白名单拒绝）
+- 40901 — 乐观锁失败
 
 ### `POST /api/v2/parts/batch-pass-inspection`
 
@@ -299,6 +521,51 @@ WS 广播（commit 后下发）：
 | `updated_at` | naive datetime | |
 | `updated_by` | string (i64)? | |
 
+### PartListItem 字段
+
+`TPart` 完整 28 列 + `customer_name` / `l1_customer_name` 冗余字段；见 [`./auth.md`](./auth.md) 关于 i64 字段序列化为 string 的约定。
+
+### PartListOut 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `items` | [PartListItem](#partlistitem-字段)[] | |
+| `total` | string (i64) | 满足过滤的总数 |
+| `limit` | string (i64) | 实际生效 |
+| `offset` | string (i64) | 实际生效 |
+
+### PartDetailOut 字段
+
+`TPart` 完整 28 列 + `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
+
+### PartCreateRequest / PartBatchCreateItem 字段
+
+见上文 [`POST /parts`](#post-apiv2parts) / [`POST /parts/batch`](#post-apiv2partsbatch) 字段表。`PartBatchCreateItem` 不含 `customer_id`（提到 batch 级共享）。
+
+### PartBatchCreateFailure 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part_id` | string (i64)? | `Some(id)` = INSERT 成功但 detail lookup 失败；`None` = INSERT 失败 |
+| `code` | i32 | item-level 错误码 |
+| `message` | string | 失败原因（中文） |
+| `item_index` | usize | 在原 `items[]` 中的位置 |
+
+### PartBatchCreateOut 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `created` | [PartDetailOut](#partdetailout-字段)[] | 成功创建的件 |
+| `failed` | [PartBatchCreateFailure](#partbatchcreatefailure-字段)[] | 失败的件（`created` ∩ `failed` = ∅） |
+
+### PartUpdateRequest 字段
+
+见上文 [`POST /parts/{id}/update`](#post-apiv2partspart_idupdate) 字段表。
+
+### DeliverRequest / CancelRequest / CompleteRequest / StartRepairRequest 字段
+
+均仅含可选 `note` / `reason`（≤ 500 字符建议）；事件日志透传 `note`，cancel 与 start-repair 优先取 `reason` 作为事件 note。
+
 ### PassInspectionRequest 字段
 
 | 字段 | 类型 | 必填 | 说明 |
@@ -306,7 +573,7 @@ WS 广播（commit 后下发）：
 | `batch_id` | string (i64)? | — | 见端点小节 |
 | `quantity` | i32? | — | 见端点小节 |
 
-> 整个 body 可省略，等价于全部字段 `None`。
+> 整个 body 可省略，等价于全部字段全部 `None`。
 
 ### BatchPassItem 字段
 
@@ -486,6 +753,7 @@ pub struct WorkerScanCoreOut {
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → `20101`
 - **状态机**：详见 [状态机（can_transition_to 白名单）](#状态机can_transition_to-白名单)；不在白名单内的 source / target 组合返回 `20103 BIZ_INVALID_TRANSITION`（迁移表见 `src/modules/part/statemachine.rs`）
 - **事件日志**：状态迁移在 service 内事务内统一插入对应事件，service 提交后由 WS 中枢广播
+- **part↔batch 同步**：lifecycle 终态 / 翻转（deliver / cancel / complete / start-repair）同事务内除翻 `t_part` 外还需翻最近一条 source-status 批次（`PartRepo::find_most_recent_batch_for_part`），保证候选批次不被 stale 状态污染
 
 ## 状态机（can_transition_to 白名单）
 
@@ -495,10 +763,33 @@ pub struct WorkerScanCoreOut {
 | PROGRAMMING | INSPECTION | `scan-inspect`（PROGRAMMING 工件） |
 | PENDING | INSPECTION | `scan-inspect`（待下发工单） |
 | IN_PROCESS | INSPECTION | `scan-inspect`（生产架工件，**必须 IN_PROCESS+PRODUCTION_SHELF**；service 层组合校验） |
+| READY_TO_SHIP | DELIVERED | `deliver`（同事务翻最近一条 source-status 批次） |
+| DELIVERED | COMPLETED | `complete`（同事务；清空 `serial_no`） |
+| IN_PROCESS | REPAIRING | `start-repair`（同事务翻最近一条 IN_PROCESS 批次；置 `has_been_repaired=true`） |
+| PENDING / PROGRAMMING / INSPECTION / READY_TO_SHIP / DELIVERED | CANCELLED | `cancel`（同事务翻最近一条 source-status 批次；delivery_note 锁禁） |
 
 INSPECTION → IN_PROCESS 由 `fail_inspection`（推荐需求 3）走 service 流程：
+
 - INSPECTION 状态 + `location='PRODUCTION_SHELF'` + `current_holder_id=shelf.id` + `next_process_id=...`
 - 事件日志：`event_type='INSPECTION_FAILED'`
+
+## 错误码参考（part / lifecycle）
+
+| code | 名称 | HTTP | 触发场景 |
+|---|---|---|---|
+| 20101 | BIZ_PART_NOT_FOUND | 404 | 工单不存在 / 已软删 |
+| 20103 | BIZ_INVALID_TRANSITION | 400 | 状态机白名单拒绝（cancel 时 COMPLETED/REPAIRING 等） |
+| 20104 | BIZ_INVALID_VALUE | 400 | DB status 字符串不在 enum 白名单 |
+| 20109 | BIZ_PART_BATCH_NOT_FOUND | 404 | inspection 流找不到 INSPECTION 批次 / 多批次歧义 |
+| 20111 | BIZ_PART_BATCH_INVALID_QUANTITY | 400 | quantity ≤ 0 或超过批次剩余量 |
+| 20114 | BIZ_PART_ALREADY_CANCELLED | 409 | cancel/deliver/complete/start-repair 遇到 CANCELLED 状态 |
+| 20115 | BIZ_PART_NOT_DELIVERED | 400 | complete 要求 DELIVERED |
+| 20116 | BIZ_PART_NOT_READY_TO_SHIP | 400 | deliver 要求 READY_TO_SHIP |
+| 20117 | BIZ_PART_REPAIR_NOT_TRIGGERED | 400 | start-repair 要求 IN_PROCESS |
+| 20120 | BIZ_PART_NOT_DELETABLE | 409 | soft-delete 终态禁 |
+| 21420 | BIZ_DELIVERY_NOTE_LOCKED_PART | 409 | cancel / soft-delete 遇 part 已挂送货单 |
+| 40001 | VALIDATION_ERROR | 422 | 入参 shape 错 / multipart 字段错 |
+| 40300 | FORBIDDEN | 403 | 角色不符 |
 
 ### 货架错误码（20511 / 20512 — scan-inspect / fail-inspection 专用）
 
@@ -507,22 +798,10 @@ INSPECTION → IN_PROCESS 由 `fail_inspection`（推荐需求 3）走 service �
 | 20511 | BIZ_SHELF_NOT_INSPECTION_ZONE | `target_inspection_shelf.zone ≠ 'INSPECTION'` |
 | 20512 | BIZ_SHELF_INACTIVE | `target_inspection_shelf.is_active = false` |
 
-## 未上线端点（前端勿调用）
-
-| Method | Path | 说明 |
-|---|---|---|
-| POST | `/api/v2/parts` | 创建工单 — 尚未实施 |
-| GET | `/api/v2/parts` | 工单列表 — 尚未实施 |
-| GET | `/api/v2/parts/{id}` | 工单详情 — 尚未实施 |
-| POST | `/api/v2/parts/{id}/update` | 工单修改（OCC） — 尚未实施 |
-| POST | `/api/v2/parts/{id}/soft-delete` | 软删 — 尚未实施 |
-
-> 实施后在本节删除并迁移到上文 `端点列表`。
-
 ## 参考
 
-- 集成测试：`tests/part_api.rs`（创建→通过品检→展示 READY_TO_SHIP 全链路）
-- 仓库分层：`src/modules/part/handler.rs` (axum) → `service.rs` (业务) → `repo.rs` (SQL)
+- 集成测试：`tests/part_api.rs`（inspection 流全链路）+ `tests/part_crud.rs`（CRUD + lifecycle 27 用例）
+- 仓库分层：`src/modules/part/handler.rs` (axum) → `service/{crud,inspection,lifecycle}.rs` (业务) → `repo/{part,batch,event}.rs` (SQL)
 - 状态机：`src/modules/part/statemachine.rs`
-- 错误码：`src/shared/error.rs::code`（20101 / 20103 / 20104 / 20109 / 20111 / 20114 / 20201 / 20202 / 20206 / 20507 / 20511 / 20512 / 20901 / 20904 / 20905 / 40001 / 40300 / 40301 / 40901）
+- 错误码：`src/shared/error.rs::code`（20101 / 20103 / 20104 / 20109 / 20111 / 20114 / 20115 / 20116 / 20117 / 20118 / 20119 / 21420 / 40001 / 40300 / 40901）
 - worker-scan 联动：详见 [`./worker-pool.md`](./worker-pool.md)

@@ -696,6 +696,40 @@ impl PartRepo {
 
     // ===== Phase PR-CRUD 新增：8 个 lifecycle mark_* =====
 
+    /// 定位 part 当前 source-status 的最新批次（id DESC）。
+    ///
+    /// lifecycle 终结 / 翻转专用 —— 与 inspection 流 (`find_inprocess_batch_for_part`
+    /// / `find_scan_target_batch` / `find_inspection_batch_for_fail`) 不同：
+    /// lifecycle 无 `expected_batch_id` hint，且允许多个 source-status 批次存在时
+    /// 按 id DESC 取最末一条（最新创建 / 最新修改；与 python myERP 的隐式语义对齐）。
+    ///
+    /// 无匹配批次时返回 `Ok(None)`：service 层据此跳过 `mark_batch_*`，让 t_part
+    /// 单独翻转也合法（新建工单未拆批的场景）。
+    pub async fn find_most_recent_batch_for_part(
+        conn: &mut PgConnection,
+        part_id: i64,
+        status: &str,
+    ) -> Result<Option<TPartBatch>, sqlx::Error> {
+        sqlx::query_as!(
+            TPartBatch,
+            r#"
+            SELECT id, part_id, batch_no, quantity, status, location,
+                   current_holder_id, next_process_id, placed_at,
+                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at
+            FROM t_part_batch
+            WHERE part_id = $1 AND status = $2 AND deleted_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+            part_id,
+            status,
+        )
+        .fetch_optional(&mut *conn)
+        .await
+    }
+
     /// 工单 READY_TO_SHIP → DELIVERED（OCC UPDATE t_part）。
     pub async fn mark_part_delivered<'e, E: PgExecutor<'e>>(
         executor: E,

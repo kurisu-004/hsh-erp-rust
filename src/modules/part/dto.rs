@@ -64,6 +64,27 @@ impl From<crate::modules::part::model::TPartInspected> for PartOut {
     }
 }
 
+/// 从完整 `TPart` 投影到 `PartOut`：cancel 流需要 `delivery_note_id` 守卫，
+/// 故 read 时用 `PartRepo::get_part_detail` 取完整行（含 delivery_note_id），
+/// 直接转 PartOut 响应。
+impl From<crate::modules::part::model::TPart> for PartOut {
+    fn from(p: crate::modules::part::model::TPart) -> Self {
+        Self {
+            id: p.id,
+            serial_no: p.serial_no,
+            name: p.name,
+            drawing_no: p.drawing_no,
+            status: p.status,
+            version: p.version,
+            quantity: p.quantity,
+            order_no: p.order_no,
+            actual_delivery_date: p.actual_delivery_date,
+            updated_at: p.updated_at,
+            updated_by: p.updated_by,
+        }
+    }
+}
+
 /// 单件 pass_inspection 入参（payload 可空）。
 ///
 /// `batch_id`：当 part 下存在多个 INSPECTION 批次（由历史部分通过产生）时，
