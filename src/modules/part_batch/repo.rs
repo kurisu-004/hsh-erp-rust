@@ -108,7 +108,12 @@ impl PartBatchRepo {
                 p.updated_at     AS "p_updated_at!",
                 p.updated_by     AS "p_updated_by?",
                 p.deleted_at     AS "p_deleted_at?",
-                p.delivery_note_id AS "p_delivery_note_id?"
+                p.delivery_note_id AS "p_delivery_note_id?",
+                p.location       AS "p_location?",
+                p.next_process_id AS "p_next_process_id?",
+                p.planned_delivery_date AS "p_planned_delivery_date?",
+                p.system_delivery_date AS "p_system_delivery_date?",
+                p.is_urgent      AS "p_is_urgent!"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
             WHERE pb.delivery_note_id = $1
@@ -160,6 +165,11 @@ impl PartBatchRepo {
                         updated_by: r.p_updated_by,
                         deleted_at: r.p_deleted_at,
                         delivery_note_id: r.p_delivery_note_id,
+                        location: r.p_location,
+                        next_process_id: r.p_next_process_id,
+                        planned_delivery_date: r.p_planned_delivery_date,
+                        system_delivery_date: r.p_system_delivery_date,
+                        is_urgent: r.p_is_urgent,
                     },
                 )
             })
@@ -212,7 +222,12 @@ impl PartBatchRepo {
                 p.updated_at     AS "p_updated_at!",
                 p.updated_by     AS "p_updated_by?",
                 p.deleted_at     AS "p_deleted_at?",
-                p.delivery_note_id AS "p_delivery_note_id?"
+                p.delivery_note_id AS "p_delivery_note_id?",
+                p.location       AS "p_location?",
+                p.next_process_id AS "p_next_process_id?",
+                p.planned_delivery_date AS "p_planned_delivery_date?",
+                p.system_delivery_date AS "p_system_delivery_date?",
+                p.is_urgent      AS "p_is_urgent!"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
             WHERE pb.delivery_note_id = ANY($1)
@@ -262,6 +277,11 @@ impl PartBatchRepo {
                     updated_by: r.p_updated_by,
                     deleted_at: r.p_deleted_at,
                     delivery_note_id: r.p_delivery_note_id,
+                    location: r.p_location,
+                    next_process_id: r.p_next_process_id,
+                    planned_delivery_date: r.p_planned_delivery_date,
+                    system_delivery_date: r.p_system_delivery_date,
+                    is_urgent: r.p_is_urgent,
                 },
             )
         }).collect())
@@ -533,7 +553,12 @@ impl PartBatchRepo {
                 p.version AS "p_version", p.created_at AS "p_created_at",
                 p.created_by AS "p_created_by", p.updated_at AS "p_updated_at",
                 p.updated_by AS "p_updated_by", p.deleted_at AS "p_deleted_at",
-                p.delivery_note_id AS "p_delivery_note_id"
+                p.delivery_note_id AS "p_delivery_note_id",
+                p.location AS "p_location",
+                p.next_process_id AS "p_next_process_id",
+                p.planned_delivery_date AS "p_planned_delivery_date",
+                p.system_delivery_date AS "p_system_delivery_date",
+                p.is_urgent AS "p_is_urgent"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
             WHERE pb.deleted_at IS NULL
@@ -589,6 +614,11 @@ impl PartBatchRepo {
                 updated_by: r.try_get("p_updated_by")?,
                 deleted_at: r.try_get("p_deleted_at")?,
                 delivery_note_id: r.try_get("p_delivery_note_id")?,
+                location: r.try_get("p_location")?,
+                next_process_id: r.try_get("p_next_process_id")?,
+                planned_delivery_date: r.try_get("p_planned_delivery_date")?,
+                system_delivery_date: r.try_get("p_system_delivery_date")?,
+                is_urgent: r.try_get("p_is_urgent")?,
             };
             out.push((pb, p));
         }

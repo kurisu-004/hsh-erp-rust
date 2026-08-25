@@ -39,7 +39,8 @@ impl PartRepo {
             r#"
             SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
                    version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id
+                   delivery_note_id, location, next_process_id,
+                   planned_delivery_date, system_delivery_date, is_urgent
             FROM t_part
             WHERE id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -64,7 +65,8 @@ impl PartRepo {
             r#"
             SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
                    version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id
+                   delivery_note_id, location, next_process_id,
+                   planned_delivery_date, system_delivery_date, is_urgent
             FROM t_part
             WHERE id = ANY($1)
               AND ($2::bool OR deleted_at IS NULL)
@@ -90,7 +92,8 @@ impl PartRepo {
             r#"
             SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
                    version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id
+                   delivery_note_id, location, next_process_id,
+                   planned_delivery_date, system_delivery_date, is_urgent
             FROM t_part
             WHERE serial_no = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -113,7 +116,8 @@ impl PartRepo {
             r#"
             SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,
                    version, created_at, created_by, updated_at, updated_by, deleted_at,
-                   delivery_note_id
+                   delivery_note_id, location, next_process_id,
+                   planned_delivery_date, system_delivery_date, is_urgent
             FROM t_part
             WHERE assembly_id = $1
               AND ($2::bool OR deleted_at IS NULL)

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at,\n                   delivery_note_id\n            FROM t_part\n            WHERE serial_no = $1\n              AND ($2::bool OR deleted_at IS NULL)\n            ",
+  "query": "\n            SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at,\n                   delivery_note_id, location, next_process_id,\n                   planned_delivery_date, system_delivery_date, is_urgent\n            FROM t_part\n            WHERE assembly_id = $1\n              AND ($2::bool OR deleted_at IS NULL)\n            ORDER BY id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -156,11 +156,66 @@
             "name": "delivery_note_id"
           }
         }
+      },
+      {
+        "ordinal": 14,
+        "name": "location",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "next_process_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "next_process_id"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "planned_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "planned_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "system_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "system_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "is_urgent",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "is_urgent"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Text",
+        "Int8",
         "Bool"
       ]
     },
@@ -178,8 +233,13 @@
       false,
       true,
       true,
-      true
+      true,
+      true,
+      true,
+      false,
+      true,
+      false
     ]
   },
-  "hash": "a6ded4e4a8d889c42368861fa4f2b19fc0f5b8aebe26ef042d34c8d87c070908"
+  "hash": "e2b7e524a251733786a5e4fa9cf8a27b9d99f5cc5de47822ec4f82d338f1337a"
 }

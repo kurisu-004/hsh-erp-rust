@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                pb.id            AS \"pb_id!\",\n                pb.part_id       AS \"pb_part_id!\",\n                pb.batch_no      AS \"pb_batch_no!\",\n                pb.quantity      AS \"pb_quantity!\",\n                pb.status        AS \"pb_status!\",\n                pb.location      AS \"pb_location?\",\n                pb.current_holder_id AS \"pb_current_holder_id?\",\n                pb.next_process_id AS \"pb_next_process_id?\",\n                pb.placed_at     AS \"pb_placed_at?\",\n                pb.delivery_note_id AS \"pb_delivery_note_id?\",\n                pb.parent_batch_id AS \"pb_parent_batch_id?\",\n                pb.has_been_repaired AS \"pb_has_been_repaired!\",\n                pb.version       AS \"pb_version!\",\n                pb.created_at    AS \"pb_created_at!\",\n                pb.created_by    AS \"pb_created_by?\",\n                pb.updated_at    AS \"pb_updated_at!\",\n                pb.updated_by    AS \"pb_updated_by?\",\n                pb.deleted_at    AS \"pb_deleted_at?\",\n                p.id             AS \"p_id!\",\n                p.serial_no      AS \"p_serial_no?\",\n                p.name           AS \"p_name!\",\n                p.drawing_no     AS \"p_drawing_no!\",\n                p.customer_id    AS \"p_customer_id!\",\n                p.assembly_id    AS \"p_assembly_id?\",\n                p.status         AS \"p_status!\",\n                p.version        AS \"p_version!\",\n                p.created_at     AS \"p_created_at!\",\n                p.created_by     AS \"p_created_by?\",\n                p.updated_at     AS \"p_updated_at!\",\n                p.updated_by     AS \"p_updated_by?\",\n                p.deleted_at     AS \"p_deleted_at?\",\n                p.delivery_note_id AS \"p_delivery_note_id?\"\n            FROM t_part_batch pb\n            JOIN t_part p ON p.id = pb.part_id\n            WHERE pb.delivery_note_id = $1\n              AND pb.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n            ORDER BY pb.id ASC\n            ",
+  "query": "\n            SELECT\n                pb.id            AS \"pb_id!\",\n                pb.part_id       AS \"pb_part_id!\",\n                pb.batch_no      AS \"pb_batch_no!\",\n                pb.quantity      AS \"pb_quantity!\",\n                pb.status        AS \"pb_status!\",\n                pb.location      AS \"pb_location?\",\n                pb.current_holder_id AS \"pb_current_holder_id?\",\n                pb.next_process_id AS \"pb_next_process_id?\",\n                pb.placed_at     AS \"pb_placed_at?\",\n                pb.delivery_note_id AS \"pb_delivery_note_id?\",\n                pb.parent_batch_id AS \"pb_parent_batch_id?\",\n                pb.has_been_repaired AS \"pb_has_been_repaired!\",\n                pb.version       AS \"pb_version!\",\n                pb.created_at    AS \"pb_created_at!\",\n                pb.created_by    AS \"pb_created_by?\",\n                pb.updated_at    AS \"pb_updated_at!\",\n                pb.updated_by    AS \"pb_updated_by?\",\n                pb.deleted_at    AS \"pb_deleted_at?\",\n                p.id             AS \"p_id!\",\n                p.serial_no      AS \"p_serial_no?\",\n                p.name           AS \"p_name!\",\n                p.drawing_no     AS \"p_drawing_no!\",\n                p.customer_id    AS \"p_customer_id!\",\n                p.assembly_id    AS \"p_assembly_id?\",\n                p.status         AS \"p_status!\",\n                p.version        AS \"p_version!\",\n                p.created_at     AS \"p_created_at!\",\n                p.created_by     AS \"p_created_by?\",\n                p.updated_at     AS \"p_updated_at!\",\n                p.updated_by     AS \"p_updated_by?\",\n                p.deleted_at     AS \"p_deleted_at?\",\n                p.delivery_note_id AS \"p_delivery_note_id?\",\n                p.location       AS \"p_location?\",\n                p.next_process_id AS \"p_next_process_id?\",\n                p.planned_delivery_date AS \"p_planned_delivery_date?\",\n                p.system_delivery_date AS \"p_system_delivery_date?\",\n                p.is_urgent      AS \"p_is_urgent!\"\n            FROM t_part_batch pb\n            JOIN t_part p ON p.id = pb.part_id\n            WHERE pb.delivery_note_id = $1\n              AND pb.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n            ORDER BY pb.id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -354,6 +354,61 @@
             "name": "delivery_note_id"
           }
         }
+      },
+      {
+        "ordinal": 32,
+        "name": "p_location?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 33,
+        "name": "p_next_process_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "next_process_id"
+          }
+        }
+      },
+      {
+        "ordinal": 34,
+        "name": "p_planned_delivery_date?",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "planned_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 35,
+        "name": "p_system_delivery_date?",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "system_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 36,
+        "name": "p_is_urgent!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "is_urgent"
+          }
+        }
       }
     ],
     "parameters": {
@@ -393,8 +448,13 @@
       false,
       true,
       true,
-      true
+      true,
+      true,
+      true,
+      false,
+      true,
+      false
     ]
   },
-  "hash": "105a22e4ebf3f73245ec05577e64e66158f5b747454bb1c47b70b98a7de61aad"
+  "hash": "4bc7c6d1d07c752d43a5bb6b0400332a07a097795c0c25c271a008075303a228"
 }
