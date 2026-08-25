@@ -28,7 +28,7 @@ pub fn router() -> Router<Arc<AppState>> {
 //   否则 axum 会把静态段（如 `batch`、`by-serial`、`worker-scan`、`batch-*-inspection`）
 //   解析成 part_id。
         // ---- 列表 / 静态段 ----
-        .route("/", get(handler::list_parts))
+        .route("/", get(handler::list_parts).post(handler::create_part))
         .route("/batch", post(handler::batch_create_parts))
         .route("/by-serial/{serial_no}", get(handler::get_by_serial))
         .route("/batch-pass-inspection", post(handler::batch_pass_inspection))
