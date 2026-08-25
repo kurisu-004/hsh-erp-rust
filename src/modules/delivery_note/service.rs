@@ -1557,6 +1557,10 @@ impl DeliveryNoteService {
                         first_not_ready_status = Some(b.status.clone());
                     }
                     part_failures.push(ScanFailureDto {
+                        part_id: target.id,
+                        batch_id: Some(b.id),
+                        drawing_no: Some(target.drawing_no.clone()),
+                        status: Some(b.status.clone()),
                         serial_no: serial,
                         name,
                         reason: format!("status={}", b.status),
@@ -1596,6 +1600,10 @@ impl DeliveryNoteService {
                                 first_conflict_no = Some(other_no.clone());
                             }
                             part_failures.push(ScanFailureDto {
+                                part_id: target.id,
+                                batch_id: Some(b.id),
+                                drawing_no: Some(target.drawing_no.clone()),
+                                status: Some(b.status.clone()),
                                 serial_no: serial,
                                 name,
                                 reason: format!("on note DN-{other_no}"),
@@ -1658,6 +1666,10 @@ impl DeliveryNoteService {
                         .into_iter()
                         .map(|f| {
                             serde_json::json!({
+                                "part_id": f.part_id.to_string(),
+                                "batch_id": f.batch_id.map(|n| n.to_string()),
+                                "drawing_no": f.drawing_no,
+                                "status": f.status,
                                 "serial_no": f.serial_no,
                                 "name": f.name,
                                 "reason": f.reason,

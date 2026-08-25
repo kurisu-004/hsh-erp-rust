@@ -868,8 +868,24 @@ mod tests {
             message: "整套拒绝".to_string(),
             http: StatusCode::BAD_REQUEST,
             failures: vec![
-                serde_json::json!({"serial_no": "B01", "name": "fala-A", "reason": "status=IN_PROCESS"}),
-                serde_json::json!({"serial_no": "B02", "name": "fala-B", "reason": "on note DN-20260821-0001"}),
+                serde_json::json!({
+                    "part_id": "1001",
+                    "batch_id": "2001",
+                    "drawing_no": "DWG-001",
+                    "status": "IN_PROCESS",
+                    "serial_no": "B01",
+                    "name": "fala-A",
+                    "reason": "status=IN_PROCESS",
+                }),
+                serde_json::json!({
+                    "part_id": "1002",
+                    "batch_id": "2002",
+                    "drawing_no": "DWG-002",
+                    "status": "INSPECTION",
+                    "serial_no": "B02",
+                    "name": "fala-B",
+                    "reason": "on note DN-20260821-0001",
+                }),
             ],
         };
         assert_eq!(err.code(), code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY);
@@ -877,5 +893,15 @@ mod tests {
         let s = err.to_string();
         assert!(s.contains("21418"));
         assert!(s.contains("整套拒绝"));
+        if let AppError::BizWithFailures { failures, .. } = &err {
+            assert_eq!(failures.len(), 2);
+            assert_eq!(failures[0]["part_id"], "1001");
+            assert_eq!(failures[0]["batch_id"], "2001");
+            assert_eq!(failures[0]["drawing_no"], "DWG-001");
+            assert_eq!(failures[0]["status"], "IN_PROCESS");
+            assert_eq!(failures[1]["part_id"], "1002");
+        } else {
+            panic!("expected BizWithFailures variant");
+        }
     }
 }
