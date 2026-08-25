@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
+use axum::Json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
@@ -215,11 +215,12 @@ pub async fn fail_inspection(
 ///   - `WORKER_POOL_REFILL_DONE`（refill 抢到一批）或
 ///   - `WORKER_POOL_EMPTY`（refill 池空）。
 ///
-/// `Extension(current)` 而非 `current: CurrentUser` 参数：与 worker_pool 既有
-/// handler 风格一致（jwt_auth_layer 在 Extension 注入）。
+/// `current: CurrentUser` 直接参数：依赖 `CurrentUser` 的
+/// `FromRequestParts<Arc<AppState>>` impl 从 Bearer JWT 解析（与
+/// `part/handler.rs::pass_inspection` / `worker_pool/handler.rs` 同形）。
 pub async fn worker_scan(
     State(state): State<Arc<AppState>>,
-    Extension(current): Extension<CurrentUser>,
+    current: CurrentUser,
     Json(req): Json<WorkerScanRequest>,
 ) -> Result<Json<R<WorkerScanOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::ShelfAccount])?;

@@ -18,7 +18,6 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::Extension;
 use axum::Json;
 use serde::Deserialize;
 
@@ -59,7 +58,7 @@ pub async fn state(
 /// - `pool_empty`（没抢到任何一批） → 广播 `WORKER_POOL_EMPTY`
 pub async fn admin_refill(
     State(state): State<Arc<AppState>>,
-    Extension(current): Extension<CurrentUser>,
+    current: CurrentUser,
     Json(req): Json<AdminRefillRequest>,
 ) -> Result<Json<R<RefillResult>>, AppError> {
     current.require_role(Role::Manager)?;
@@ -96,7 +95,7 @@ pub async fn admin_refill(
 /// Commit 后广播 `WORKER_POOL_ADMIN_REMOVED`。
 pub async fn admin_remove(
     State(state): State<Arc<AppState>>,
-    Extension(current): Extension<CurrentUser>,
+    current: CurrentUser,
     Json(req): Json<AdminRemoveRequest>,
 ) -> Result<Json<R<super::model::TakenItem>>, AppError> {
     current.require_role(Role::Manager)?;

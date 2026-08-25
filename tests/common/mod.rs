@@ -16,15 +16,9 @@
 
 use std::sync::Arc;
 
-use axum::extract::Request;
-use axum::http::header::AUTHORIZATION;
-use axum::middleware::Next;
-use axum::response::Response;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
-use hsh_erp_rust::auth::jwt::decode_access;
-use hsh_erp_rust::auth::rbac::CurrentUser;
 use hsh_erp_rust::infra::config::{
     AppConfig, AutoCompleteConfig, CosConfig, JwtConfig, SnowflakeConfig,
 };
@@ -160,64 +154,11 @@ pub fn test_state(pool: PgPool) -> Arc<AppState> {
 
 /// axum Router：与 main.rs 中的 `/api/v2` nest 同形。
 ///
-/// 额外装一层 `inject_current_user_layer`：从 `Authorization: Bearer` 解析
-/// JWT 并把 `CurrentUser` 注入请求 extensions —— 与 worker-scan / admin_*
-/// 这类用 `Extension(current)` 的 handler 对齐（生产 main.rs 暂未装该
-/// layer，留待后续 PR 修；测试环境提前注入以验证 handler 逻辑）。
+/// 不再装 `inject_current_user_layer`：handler 现在用 `current: CurrentUser`
+/// 直接参数（依赖 `CurrentUser` 的 `FromRequestParts<Arc<AppState>>` impl 自动
+/// 从 Bearer JWT 解析），与生产路径一致。
 pub fn test_app(state: Arc<AppState>) -> axum::Router {
-    use axum::middleware;
-    let secret = state.config.jwt.secret.clone();
-    let issuer = state.config.jwt.issuer.clone();
-    hsh_erp_rust::modules::v2_router()
-        .layer(middleware::from_fn(move |req, next| {
-            inject_current_user(req, next, secret.clone(), issuer.clone())
-        }))
-        .with_state(state)
-}
-
-/// JWT → `Extension<CurrentUser>` 注入中间件。无 / 无效 Bearer → 401。
-async fn inject_current_user(
-    mut req: Request,
-    next: Next,
-    secret: String,
-    issuer: String,
-) -> Result<Response, Response> {
-    use axum::Json;
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    let token_opt = req
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.to_string());
-    let Some(token) = token_opt else {
-        // 没 token：让下游 handler 自己处理（部分端点免鉴权，如 /auth/login）
-        return Ok(next.run(req).await);
-    };
-    let claims = match decode_access(&token, &secret, &issuer) {
-        Ok(c) => c,
-        Err(_) => {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "code": 40100,
-                    "message": "[40100] jwt invalid",
-                    "data": null,
-                })),
-            )
-                .into_response());
-        }
-    };
-    let user = CurrentUser {
-        id: claims.sub,
-        username: claims.username,
-        roles: claims.roles,
-        shelf_ids: claims.shelf_ids,
-        shelf_wildcard: claims.shelf_wildcard,
-    };
-    req.extensions_mut().insert(user);
-    Ok(next.run(req).await)
+    hsh_erp_rust::modules::v2_router().with_state(state)
 }
 
 // ===========================================================================
