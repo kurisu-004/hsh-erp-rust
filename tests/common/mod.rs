@@ -16,9 +16,15 @@
 
 use std::sync::Arc;
 
+use axum::extract::Request;
+use axum::http::header::AUTHORIZATION;
+use axum::middleware::Next;
+use axum::response::Response;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
+use hsh_erp_rust::auth::jwt::decode_access;
+use hsh_erp_rust::auth::rbac::CurrentUser;
 use hsh_erp_rust::infra::config::{
     AppConfig, AutoCompleteConfig, CosConfig, JwtConfig, SnowflakeConfig,
 };
@@ -97,7 +103,8 @@ pub async fn clean_business_db(pool: &PgPool) {
             t_part_batch, t_part_event, t_part, \
             t_assembly, \
             t_customer, t_applicant, \
-            t_work_type, t_worker \
+            t_work_type, t_worker, \
+            t_shelf_process, t_work_type_process, t_process \
          RESTART IDENTITY CASCADE",
     )
     .execute(pool)
@@ -152,8 +159,65 @@ pub fn test_state(pool: PgPool) -> Arc<AppState> {
 }
 
 /// axum Router：与 main.rs 中的 `/api/v2` nest 同形。
+///
+/// 额外装一层 `inject_current_user_layer`：从 `Authorization: Bearer` 解析
+/// JWT 并把 `CurrentUser` 注入请求 extensions —— 与 worker-scan / admin_*
+/// 这类用 `Extension(current)` 的 handler 对齐（生产 main.rs 暂未装该
+/// layer，留待后续 PR 修；测试环境提前注入以验证 handler 逻辑）。
 pub fn test_app(state: Arc<AppState>) -> axum::Router {
-    hsh_erp_rust::modules::v2_router().with_state(state)
+    use axum::middleware;
+    let secret = state.config.jwt.secret.clone();
+    let issuer = state.config.jwt.issuer.clone();
+    hsh_erp_rust::modules::v2_router()
+        .layer(middleware::from_fn(move |req, next| {
+            inject_current_user(req, next, secret.clone(), issuer.clone())
+        }))
+        .with_state(state)
+}
+
+/// JWT → `Extension<CurrentUser>` 注入中间件。无 / 无效 Bearer → 401。
+async fn inject_current_user(
+    mut req: Request,
+    next: Next,
+    secret: String,
+    issuer: String,
+) -> Result<Response, Response> {
+    use axum::Json;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let token_opt = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+    let Some(token) = token_opt else {
+        // 没 token：让下游 handler 自己处理（部分端点免鉴权，如 /auth/login）
+        return Ok(next.run(req).await);
+    };
+    let claims = match decode_access(&token, &secret, &issuer) {
+        Ok(c) => c,
+        Err(_) => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "code": 40100,
+                    "message": "[40100] jwt invalid",
+                    "data": null,
+                })),
+            )
+                .into_response());
+        }
+    };
+    let user = CurrentUser {
+        id: claims.sub,
+        username: claims.username,
+        roles: claims.roles,
+        shelf_ids: claims.shelf_ids,
+        shelf_wildcard: claims.shelf_wildcard,
+    };
+    req.extensions_mut().insert(user);
+    Ok(next.run(req).await)
 }
 
 // ===========================================================================
@@ -326,4 +390,78 @@ pub async fn get_refresh_token_version(pool: &PgPool, user_id: i64) -> i32 {
     .await
     .expect("query refresh_token_version");
     row.ver
+}
+
+// ===========================================================================
+// worker-pool 域 fixture helpers（Task 10 e2e 测试用）：
+//   - seed_process: 插一个 t_process 工序（INHOUSE 类别）
+//   - link_work_type_to_process: t_work_type_process 映射
+//   - link_shelf_to_process: t_shelf_process 映射
+//
+// 命名风格：与 part_api.rs 的 insert_part / insert_batch 同形（prefix=动词 + 名词）。
+// 雪花 ID：复用同一 epoch/instance/seq（1_577_836_800_000 / 1 / 1），与其它 fixture 一致。
+// ===========================================================================
+
+/// 插一个 INHOUSE 类别 `t_process` 工序（worker-pool 用：INHOUSE 自产）。
+pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query!(
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
+        id,
+        code,
+        name,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert t_process");
+    id
+}
+
+/// `t_work_type_process` 映射（无业务软删：`deleted_at` 留默认 NULL）。
+pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query!(
+        "INSERT INTO t_work_type_process (id, work_type_id, process_id, sort_order, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, 0, $4, $4)",
+        id,
+        wt_id,
+        p_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert t_work_type_process");
+}
+
+/// `t_shelf_process` 映射（无业务软删）。
+pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query!(
+        "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, 0, $4, $4)",
+        id,
+        s_id,
+        p_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert t_shelf_process");
 }
