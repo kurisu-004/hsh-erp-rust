@@ -18,17 +18,25 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
+use crate::shared::types::{serialize_i64, serialize_i64_opt};
+
 /// `t_part` 完整行投影（Phase PR-CRUD 2026-08-25）
 ///
 /// 28 列；不含 `unit_price` / `total_price`（NUMERIC，待 `rust_decimal` feature 上线）。
+///
 ///
 /// PR-CRUD superset of master P1 + worker-pool 5-field addition:
 /// - master added: `location`, `next_process_id`, `planned_delivery_date`, `system_delivery_date`, `is_urgent`
 /// - PR-CRUD added the rest (`applicant_name`, `quantity`, `request_date`, `actual_delivery_date`,
 ///   `current_holder_id`, `placed_at`, `order_no`, `note`, `has_been_repaired`) so this single
 ///   28-col projection serves all current call sites including worker-pool's `take_one` CTE.
+///
+/// PR-CRUD 增量备注（2026-08-25）：
+/// - TPart::Serialize 用 `shared::types::serialize_i64{,_opt}` 标 8 个 i64 字段，
+///   与 Global Constraint #3（i64 主键 → JSON 字符串）一致。
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct TPart {
+    #[serde(serialize_with = "serialize_i64")]
     pub id: i64,
     pub serial_no: Option<String>,
     pub name: String,
@@ -38,13 +46,17 @@ pub struct TPart {
     pub request_date: chrono::NaiveDate,                                // +3
     pub planned_delivery_date: chrono::NaiveDate,                       // +4
     pub actual_delivery_date: Option<chrono::NaiveDate>,
+    #[serde(serialize_with = "serialize_i64")]
     pub customer_id: i64,
+    #[serde(serialize_with = "serialize_i64_opt")]
     pub assembly_id: Option<i64>,
     pub status: String,
     pub location: Option<String>,                                       // +5
     pub is_urgent: bool,                                                // +6
+    #[serde(serialize_with = "serialize_i64_opt")]
     pub current_holder_id: Option<i64>,
     pub placed_at: Option<chrono::NaiveDateTime>,                       // +7
+    #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
     pub order_no: Option<String>,                                       // +8
     pub system_delivery_date: Option<chrono::NaiveDate>,                // +9
@@ -52,10 +64,13 @@ pub struct TPart {
     pub has_been_repaired: bool,                                        // +11
     pub version: i32,
     pub created_at: chrono::NaiveDateTime,
+    #[serde(serialize_with = "serialize_i64_opt")]
     pub created_by: Option<i64>,
     pub updated_at: chrono::NaiveDateTime,
+    #[serde(serialize_with = "serialize_i64_opt")]
     pub updated_by: Option<i64>,
     pub deleted_at: Option<chrono::NaiveDateTime>,
+    #[serde(serialize_with = "serialize_i64_opt")]
     pub delivery_note_id: Option<i64>,
 }
 
