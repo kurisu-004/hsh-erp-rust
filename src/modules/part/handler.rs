@@ -237,13 +237,12 @@ pub async fn worker_scan(
         .target_inspection_shelf_id
         .as_deref()
         .and_then(|s| s.parse::<i64>().ok())
+        && !current.can_access_shelf(tid)
     {
-        if !current.can_access_shelf(tid) {
-            return Err(AppError::biz(
-                crate::shared::error::code::SHELF_MISMATCH,
-                format!("无权限访问 shelf {}", tid),
-            ));
-        }
+        return Err(AppError::biz(
+            crate::shared::error::code::SHELF_MISMATCH,
+            format!("无权限访问 shelf {}", tid),
+        ));
     }
     let mut tx = state.pool.begin().await?;
     // scan（状态翻转 + 写事件日志）

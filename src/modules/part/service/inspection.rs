@@ -894,10 +894,10 @@ impl PartService {
     /// worker-scan 共享核心（被单件端点 `POST /parts/worker-scan` 调用，Task 8）。
     ///
     /// 两分支：
-    /// - `RETURNED`：worker 把持有件放回生产架（同 admin_remove 语义，但走扫码台
-    ///   + worker 自查路径）；要求 shelf ∈ PRODUCTION 区 + active；shelf ↔
-    ///   next_process_id 在 `t_shelf_process` 必须有映射（20507 NOT_MAPPED）；
-    ///   切 holder worker → shelf（OCC）+ 写 `RETURNED_TO_SHELF` 事件。
+    /// - `RETURNED`：worker 把持有件放回生产架（同 admin_remove 语义，但走扫码台 +
+    ///   worker 自查路径）；要求 shelf ∈ PRODUCTION 区 + active；shelf ↔
+    ///   next_process_id 在 `t_shelf_process` 必须有映射（20507 NOT_MAPPED）；切
+    ///   holder worker → shelf（OCC）+ 写 `RETURNED_TO_SHELF` 事件。
     /// - `INSPECTED`：worker 把持有件直接送检（INSPECTION → INSPECTION + 状态机
     ///   IN_PROCESS → INSPECTION）；要求 target shelf ∈ INSPECTION 区 + active；
     ///   状态机校验 → mark_*_inspected（OCC）+ 写 `SENT_TO_INSPECTION` 事件。
