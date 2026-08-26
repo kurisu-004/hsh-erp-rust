@@ -6,6 +6,7 @@
 > - [`./auth.md`](./auth.md) — auth 域
 > - [`./users.md`](./users.md) — users 域
 > - [`./customers.md`](./customers.md) — customers 域（L1/L2 CRUD）
+> - [`./processes.md`](./processes.md) — processes 域（INHOUSE/OUTSOURCE CRUD）
 > - [`./parts.md`](./parts.md) — part 域（part-pass-inspection 批量+单件 / scan-inspect / fail-inspection / **worker-scan**）
 > - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove**）
 > - [`./delivery-notes.md`](./delivery-notes.md) — delivery_notes 域
@@ -146,12 +147,14 @@ HTTP 状态码：
 |---|---|---|---|
 | auth | [`./auth.md`](./auth.md) | 5 | ✅ 完全上线 |
 | users | [`./users.md`](./users.md) | 9 | ✅ 完全上线 |
+| customers | [`./customers.md`](./customers.md) | 5 | ✅ 完全上线（CRUD + L1/L2 + OCC，2026-08-26） |
+| processes | [`./processes.md`](./processes.md) | 5 | ✅ 完全上线（CRUD + INHOUSE no-approval + 引用校验，2026-08-26） |
 | part | [`./parts.md`](./parts.md) | 6 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回、worker-scan（2026-08-25） |
 | worker_pool | [`./worker-pool.md`](./worker-pool.md) | 3 | 🟢 state + admin refill/remove + worker-scan 联动（2026-08-25） |
 | delivery-notes | [`./delivery-notes.md`](./delivery-notes.md) | 18 | ✅ 完全上线（P1–P4） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub（worker-pool WS 事件已注册，待 hub 真实握手） |
-| 其他 10 域 | — | 0 | ⚪ 仅占位（见下） |
+| 其他 9 域 | — | 0 | ⚪ 仅占位（见下） |
 
 ---
 
@@ -159,11 +162,9 @@ HTTP 状态码：
 
 | 域 | 路由前缀 | 状态 |
 |---|---|---|
-| `customer` | `/api/v2/customers` | 路由已 nest 但 handler 空 → 全部 404 |
-| `applicant` | `/api/v2/applicants` | 同上 |
+| `applicant` | `/api/v2/applicants` | 路由已 nest 但 handler 空 → 全部 404 |
 | `worker` | `/api/v2/workers` | 同上 |
 | `work_type` | `/api/v2/work-types` | 同上 |
-| `process` | `/api/v2/processes` | 同上 |
 | `shelf` | `/api/v2/shelves` | 同上 |
 | `part` | `/api/v2/parts` | 同上 |
 | `assembly` | `/api/v2/assemblies` | 同上 |
