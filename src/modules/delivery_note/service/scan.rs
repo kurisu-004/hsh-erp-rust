@@ -719,9 +719,23 @@ mod scan_resolve_tests {
             serial_no: Some(format!("F{id:04}")),
             name: format!("Part {id}"),
             drawing_no: format!("D-{id:03}"),
+            applicant_name: format!("Applicant {id}"),
+            quantity: 1,
+            request_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
+            planned_delivery_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
+            actual_delivery_date: None,
             customer_id: 100 + id,
             assembly_id,
             status: "INSPECTION".to_string(),
+            location: None,
+            is_urgent: false,
+            current_holder_id: None,
+            placed_at: None,
+            next_process_id: None,
+            order_no: None,
+            system_delivery_date: None,
+            note: None,
+            has_been_repaired: false,
             version: 0,
             created_at: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
                 .unwrap()
@@ -735,11 +749,6 @@ mod scan_resolve_tests {
             updated_by: None,
             deleted_at: None,
             delivery_note_id: None,
-            location: None,
-            next_process_id: None,
-            planned_delivery_date: None,
-            system_delivery_date: None,
-            is_urgent: false,
         }
     }
 

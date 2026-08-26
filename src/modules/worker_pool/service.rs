@@ -325,7 +325,7 @@ impl WorkerPoolService {
             serial_no: part.serial_no,
             drawing_no: part.drawing_no,
             system_delivery_date: part.system_delivery_date,
-            planned_delivery_date: part.planned_delivery_date,
+            planned_delivery_date: Some(part.planned_delivery_date),
             is_urgent: part.is_urgent,
             version: batch.version + 1,
         })
