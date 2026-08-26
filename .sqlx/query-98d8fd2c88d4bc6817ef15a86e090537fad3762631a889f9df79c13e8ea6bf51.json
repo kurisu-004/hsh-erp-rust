@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, code, name, category, sort_order, description, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   requires_approval\n            FROM t_process\n            WHERE id = ANY($1) AND deleted_at IS NULL\n            ",
+  "query": "\n            SELECT s.id, s.code, s.name, s.zone, s.location, s.is_active, s.display_order,\n                   s.version, s.created_at, s.created_by, s.updated_at, s.updated_by, s.deleted_at,\n                   COALESCE(load.cnt, 0)::bigint AS \"current_load!\"\n            FROM t_shelf s\n            LEFT JOIN (\n                SELECT current_holder_id AS shelf_id,\n                       SUM(quantity)::bigint AS cnt\n                FROM t_part_batch\n                WHERE status IN ('PENDING', 'IN_PROCESS', 'INSPECTION', 'REPAIRING', 'OUTSOURCE')\n                GROUP BY current_holder_id\n            ) load ON load.shelf_id = s.id\n            WHERE s.zone = 'PRODUCTION'\n              AND s.is_active = true\n              AND s.deleted_at IS NULL\n            ORDER BY load.cnt ASC NULLS FIRST, s.display_order ASC, s.id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -9,7 +9,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_process",
+            "table": "t_shelf",
             "name": "id"
           }
         }
@@ -20,7 +20,7 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_process",
+            "table": "t_shelf",
             "name": "code"
           }
         }
@@ -31,142 +31,147 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_process",
+            "table": "t_shelf",
             "name": "name"
           }
         }
       },
       {
         "ordinal": 3,
-        "name": "category",
+        "name": "zone",
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "category"
+            "table": "t_shelf",
+            "name": "zone"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "sort_order",
-        "type_info": "Int4",
+        "name": "location",
+        "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "sort_order"
+            "table": "t_shelf",
+            "name": "location"
           }
         }
       },
       {
         "ordinal": 5,
-        "name": "description",
-        "type_info": "Varchar",
+        "name": "is_active",
+        "type_info": "Bool",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "description"
+            "table": "t_shelf",
+            "name": "is_active"
           }
         }
       },
       {
         "ordinal": 6,
-        "name": "version",
+        "name": "display_order",
         "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "version"
+            "table": "t_shelf",
+            "name": "display_order"
           }
         }
       },
       {
         "ordinal": 7,
-        "name": "created_at",
-        "type_info": "Timestamp",
+        "name": "version",
+        "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "created_at"
+            "table": "t_shelf",
+            "name": "version"
           }
         }
       },
       {
         "ordinal": 8,
-        "name": "created_by",
-        "type_info": "Int8",
+        "name": "created_at",
+        "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "created_by"
+            "table": "t_shelf",
+            "name": "created_at"
           }
         }
       },
       {
         "ordinal": 9,
-        "name": "updated_at",
-        "type_info": "Timestamp",
+        "name": "created_by",
+        "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "updated_at"
+            "table": "t_shelf",
+            "name": "created_by"
           }
         }
       },
       {
         "ordinal": 10,
-        "name": "updated_by",
-        "type_info": "Int8",
+        "name": "updated_at",
+        "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "updated_by"
+            "table": "t_shelf",
+            "name": "updated_at"
           }
         }
       },
       {
         "ordinal": 11,
-        "name": "deleted_at",
-        "type_info": "Timestamp",
+        "name": "updated_by",
+        "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "deleted_at"
+            "table": "t_shelf",
+            "name": "updated_by"
           }
         }
       },
       {
         "ordinal": 12,
-        "name": "requires_approval",
-        "type_info": "Bool",
+        "name": "deleted_at",
+        "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_process",
-            "name": "requires_approval"
+            "table": "t_shelf",
+            "name": "deleted_at"
           }
         }
+      },
+      {
+        "ordinal": 13,
+        "name": "current_load!",
+        "type_info": "Int8",
+        "origin": "Expression"
       }
     ],
     "parameters": {
-      "Left": [
-        "Int8Array"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
       false,
       false,
       false,
-      false,
       true,
       false,
       false,
+      false,
+      false,
       true,
       false,
       true,
       true,
-      false
+      null
     ]
   },
-  "hash": "41ec6e7d0588f359729bbef0981c7addb5b827c52243320e5d8ed354b2b043d0"
+  "hash": "98d8fd2c88d4bc6817ef15a86e090537fad3762631a889f9df79c13e8ea6bf51"
 }

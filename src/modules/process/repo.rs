@@ -63,6 +63,34 @@ impl ProcessRepo {
         .await
     }
 
+    /// 批量按 id 查（活跃行）。空切片短路返回空 Vec。
+    ///
+    /// 用于 `ShelfProcessService::set_shelf_processes` 校验 items 里的所有
+    /// process_id 都存在；走 `WHERE id = ANY($1)` 单次往返（防 N+1）。
+    pub async fn list_by_ids<'e, E: PgExecutor<'e>>(
+        executor: E,
+        ids: &[i64],
+    ) -> Result<Vec<TProcess>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as!(
+            TProcess,
+            r#"
+            SELECT id, code, name, category, sort_order, description, version,
+                   created_at, created_by, updated_at, updated_by, deleted_at,
+                   requires_approval
+            FROM t_process
+            WHERE id = ANY($1)
+              AND deleted_at IS NULL
+            ORDER BY id ASC
+            "#,
+            ids,
+        )
+        .fetch_all(executor)
+        .await
+    }
+
     /// 过滤+分页：用 `QueryBuilder` 动态拼 `code_like` / `category` 二态过滤。
     /// 一次往返即可拿全表行，避免 N+1。
     #[allow(clippy::too_many_arguments)]

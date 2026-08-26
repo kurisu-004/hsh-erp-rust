@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, code, name, zone, is_active, display_order,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_shelf\n            WHERE id = $1 AND is_active = true AND deleted_at IS NULL\n            ",
+  "query": "\n            INSERT INTO t_shelf (id, code, name, zone, location, is_active, display_order,\n                                 created_by, updated_by)\n            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $7)\n            RETURNING id, code, name, zone, location, is_active, display_order,\n                      version, created_at, created_by, updated_at, updated_by, deleted_at\n            ",
   "describe": {
     "columns": [
       {
@@ -49,6 +49,17 @@
       },
       {
         "ordinal": 4,
+        "name": "location",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_shelf",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "is_active",
         "type_info": "Bool",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "display_order",
         "type_info": "Int4",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "version",
         "type_info": "Int4",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -125,7 +136,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
@@ -138,6 +149,12 @@
     ],
     "parameters": {
       "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
         "Int8"
       ]
     },
@@ -146,6 +163,7 @@
       false,
       false,
       false,
+      true,
       false,
       false,
       false,
@@ -156,5 +174,5 @@
       true
     ]
   },
-  "hash": "f2391efb3f0afee5cf68e79748d4ddde870ea2ec0a0a2038f2681fc168c59de0"
+  "hash": "957ab8e7adcb2948b76b5f9359391631edbb31b097db5813def8a84988f54385"
 }
