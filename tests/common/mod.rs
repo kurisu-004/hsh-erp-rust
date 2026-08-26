@@ -204,6 +204,67 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     ))
 }
 
+/// 构造测试用 AppState：session check **关闭**，**不**建 Redis 池。
+///
+/// 用途：验证 `REDIS_SESSION_CHECK_ENABLED=false` 时，extractor 直接用 JWT Claims
+/// 构造 CurrentUser，不依赖 Redis 进程存在。
+///
+/// 仅 `tests/auth_api.rs` 调用；其它 integration test 不引用 —— 故 `dead_code` 抑制。
+#[allow(dead_code)]
+pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
+    let config = Arc::new(AppConfig {
+        database_url: test_database_url(),
+        listen_addr: "0.0.0.0:3000".to_string(),
+        jwt: JwtConfig {
+            secret: TEST_JWT_SECRET.to_string(),
+            issuer: "hsh-erp-test".to_string(),
+            access_ttl_hours: 12,
+            refresh_ttl_days: 7,
+        },
+        cos: CosConfig {
+            region: "ap-shanghai".into(),
+            bucket: "test".into(),
+            secret_id: "test".into(),
+            secret_key: "test".into(),
+            scheme: "https".into(),
+            upload_prefix: "uploads".into(),
+            presign_expire_seconds: 3600,
+            max_file_size: 314_572_800,
+        },
+        snowflake: SnowflakeConfig {
+            epoch_ms: 1_577_836_800_000,
+            instance: 1,
+            seq: 1,
+        },
+        redis: AppRedisConfig {
+            url: TEST_REDIS_URL.to_string(),
+            session_ttl_seconds: 3600,
+            pool_max_size: 5,
+            session_check_enabled: false,
+        },
+        max_request_body_size: 314_572_800,
+        auto_complete: AutoCompleteConfig {
+            threshold_days: 7,
+            interval_hours: 24,
+        },
+        delivery_note_template_dir: std::path::PathBuf::from("template"),
+    });
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(
+        config.snowflake.epoch_ms,
+        config.snowflake.instance,
+        config.snowflake.seq,
+    ));
+    let ws_hub = Arc::new(WsHub::new());
+    let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
+    let shutdown = CancellationToken::new();
+    // 注意：NoopSessionStore 不需要 Redis 池
+    use hsh_erp_rust::auth::session::NoopSessionStore;
+    let session: Arc<dyn SessionStore> = Arc::new(NoopSessionStore::new());
+    Arc::new(AppState::new(
+        pool, config, snowflake, ws_hub, cos, shutdown, session,
+    ))
+}
+
 /// 测试便捷入口：只传 PgPool，自动建 Redis 池（db 15，与 dev 隔离）。
 pub async fn test_state(pool: PgPool) -> Arc<AppState> {
     let redis_pool = test_redis_pool().await;

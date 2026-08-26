@@ -120,3 +120,13 @@ Response 200 `data`：同 [`/auth/login`](#post-apiv2authlogin)
 ### Auth 域错误码补充
 
 - 40105 SESSION_REVOKED — 会话已被吊销（Redis 中不存在 / 已失效）。前端应清除本地 token 并跳回登录页。
+
+### 服务端 session 校验开关
+
+环境变量 `REDIS_SESSION_CHECK_ENABLED`（默认 `true`）控制 Rust 后端是否在每次请求中校验 Redis 服务端 session：
+
+- `true`（默认）：登录/refresh 时把 token hash 写入 Redis；每次请求查 Redis 校验；
+  logout/change_password 删 Redis 条目强制吊销。40105 SESSION_REVOKED 仍会触发。
+- `false`：不建 Redis 连接池；所有 session 写入走 NoopSessionStore（silent 成功但不持久化）；
+  extractor 直接从 JWT Claims 构造 CurrentUser，**不再返回 40105**。
+  仅当 Rust 后端在借 Python 后端签发的 JWT 时使用——切回 `true` 后所有已发 token 必须重新登录。

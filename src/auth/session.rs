@@ -256,6 +256,19 @@ impl SessionStore for RedisSessionStore {
 /// 实现，但 trait 仍要求实现以保持 `Arc<dyn SessionStore>` 类型一致。
 pub struct NoopSessionStore;
 
+impl NoopSessionStore {
+    /// 单元构造：保持与 `RedisSessionStore::new(pool)` 同形调用风格。
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for NoopSessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl SessionStore for NoopSessionStore {
     async fn create_session(

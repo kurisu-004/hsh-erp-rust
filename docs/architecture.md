@@ -179,7 +179,7 @@ handler 返回 `Result<Json<R<T>>, AppError>`：
 ### 3.4 DI 与权限
 
 - `Arc<AppState>` 作为 axum Router 的 state，含 `pool / config / snowflake / ws_hub / cos / session / shutdown` 七个字段。
-- `CurrentUser` 实现 `FromRequestParts<Arc<AppState>>`：从 `Authorization` 头解析 Bearer JWT → 解码 Claims → sha256(token) 查 Redis（`session:tok:<hash>`）→ 用 `CachedCurrentUser` 构造 CurrentUser → EXPIRE 续期。查不到返回 40105 SESSION_REVOKED。
+- `CurrentUser` 实现 `FromRequestParts<Arc<AppState>>`：从 `Authorization` 头解析 Bearer JWT → 解码 Claims → 当 `REDIS_SESSION_CHECK_ENABLED=true`（默认）时用 sha256(token) 查 Redis（`session:tok:<hash>`）→ 用 `CachedCurrentUser` 构造 CurrentUser → EXPIRE 续期。查不到返回 40105 SESSION_REVOKED。当该开关关闭时跳过整段 Redis 查询，直接从 Claims 构造 CurrentUser——适用于借 Python 后端 JWT 的迁移过渡期（详见 `.env.example` 与 `docs/api/auth.md`）。
 - `AuthTokenHash`（同 impl）给需要原始 token 哈希的端点（如 logout）使用。
 - **角色守卫**：服务层调用 `user.require_role(Role::Manager)?`（Command 守卫）。
 

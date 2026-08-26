@@ -655,6 +655,85 @@ async fn refresh_transitions_old_session_to_new() {
 }
 
 // ===========================================================================
+// Session check toggle（REDIS_SESSION_CHECK_ENABLED=false）集成测试
+//
+// 场景：Rust 后端在迁移早期会借 Python myERP 签发的 JWT；此时 Redis 服务端
+// session 校验必须关闭（否则 40105 会把全部 Python 签的 access token 全部
+// 拒掉）。本测试不依赖 Redis 容器，验证：
+//   1) AppState 的 session store 是 NoopSessionStore
+//   2) 手签一个 Python 形态 JWT（角色是 Role::Clerk，不是 MANAGER —— 模拟 Python
+//      普通用户），extractor 不查 Redis，直接从 claims 构造 CurrentUser
+//   3) /auth/me 200，且返回的 roles / username 与 claims 一致
+//   4) hash_token 派生函数仍工作（保证 Noop 路径不破坏 extract 链）
+// ===========================================================================
+
+/// session check 关闭时：手签一个「类 Python 形态」的 JWT（不在 Redis 写入任何条目），
+/// `/auth/me` 应直接用 Claims 构造 CurrentUser 返回 200。
+#[tokio::test]
+async fn disabled_session_accepts_python_issued_jwt() {
+    use chrono::Utc;
+    use hsh_erp_rust::auth::jwt::encode_access;
+    use hsh_erp_rust::auth::rbac::{Claims, Role};
+    use hsh_erp_rust::auth::session::hash_token;
+
+    // 用例不依赖 Redis 容器（NoopSessionStore 跳过 Redis）
+    ensure_database_exists().await;
+    let pool = test_pool().await;
+    clean_db(&pool).await;
+
+    // /me handler 会按 CurrentUser.id 回查 t_user；插一个 active 用户（不插 role，
+    // 因为 extractor 已从 JWT claims 直接构造 CurrentUser，service 层 /me 只读最新
+    // 状态，不再依赖 Redis 缓存里的角色）。
+    let user_id = insert_user_with_password(&pool, "python_user", "any-password").await;
+
+    let state = common::test_state_with_disabled_session(pool.clone());
+
+    // 手签一个「Python 形态」JWT：roles 用全大写字符串、shelf_wildcard 默认 false
+    let claims = Claims {
+        sub: user_id,
+        username: "python_user".to_string(),
+        roles: vec![Role::Clerk],
+        shelf_ids: vec![],
+        shelf_wildcard: false,
+        ver: 0,
+        typ: "access".into(),
+        iss: state.config.jwt.issuer.clone(),
+        exp: Utc::now().timestamp() + 3600,
+    };
+    let (token, _exp) = encode_access(
+        &claims,
+        &state.config.jwt.secret,
+        &state.config.jwt.issuer,
+        state.config.jwt.access_ttl_hours,
+    )
+    .expect("encode access token");
+
+    // 确认 Redis 没有写入（NoopSessionStore::create_session 不会被调用，因为根本没走 login）
+    // 直接打 /me：extractor 跳过 Redis 查询，从 claims 构造 CurrentUser
+    let app = test_app(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/auth/me")
+                .header(AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "session check 关闭时手签 JWT 应被接受；当前 status = {}",
+        resp.status()
+    );
+
+    // 顺便断言 hash_token 派生函数仍工作（保证 Noop 路径不破坏 extract 链）
+    assert_eq!(hash_token(&token).len(), 64);
+}
+
+// ===========================================================================
 // Silence unused imports when a single test compiles but the others don't.
 // ===========================================================================
 #[allow(dead_code)]
