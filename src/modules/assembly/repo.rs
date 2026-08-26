@@ -316,6 +316,7 @@ impl AssemblyRepo {
             UPDATE t_assembly
             SET version = version + 1, deleted_at = NOW(), updated_at = NOW(), updated_by = $3
             WHERE id = $1 AND version = $2 AND deleted_at IS NULL
+              AND status NOT IN ('COMPLETED', 'CANCELLED')
             "#,
         )
         .bind(id)
