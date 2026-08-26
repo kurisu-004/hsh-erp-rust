@@ -757,9 +757,13 @@ mod scan_resolve_tests {
             id,
             drawing_no: format!("A-{id:03}"),
             name: format!("Asm {id}"),
+            applicant_name: None,
             customer_id: 900 + id,
+            request_date: None,
+            planned_delivery_date: None,
+            actual_delivery_date: None,
+            is_urgent: false,
             status: "ACTIVE".to_string(),
-            serial_no: Some(format!("ASMR{id:04}")),
             version: 0,
             created_at: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
                 .unwrap()
@@ -772,7 +776,13 @@ mod scan_resolve_tests {
                 .unwrap(),
             updated_by: None,
             deleted_at: None,
+            serial_no: Some(format!("ASMR{id:04}")),
+            quantity: 1,
+            unit_price: None,
+            total_price: None,
             order_no: None,
+            system_delivery_date: None,
+            note: None,
         }
     }
 
