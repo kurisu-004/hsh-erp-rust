@@ -5,6 +5,7 @@
 > 后端代码变更（**新增 / 修改 / 删除端点**，或**修改 DTO 字段 / 错误码**）后，必须**立即**更新对应模块文件：
 > - [`./auth.md`](./auth.md) — auth 域
 > - [`./users.md`](./users.md) — users 域
+> - [`./customers.md`](./customers.md) — customers 域（L1/L2 CRUD）
 > - [`./parts.md`](./parts.md) — part 域（part-pass-inspection 批量+单件 / scan-inspect / fail-inspection / **worker-scan**）
 > - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove**）
 > - [`./delivery-notes.md`](./delivery-notes.md) — delivery_notes 域
