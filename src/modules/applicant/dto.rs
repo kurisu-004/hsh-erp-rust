@@ -1,7 +1,62 @@
-//! applicant 域 DTO 占位
+//! applicant 域 DTO
 //!
-// 对应 Python myERP/schema/applicant.py。命名约定：
-// - `CreateXxxRequest` / `UpdateXxxRequest`：写操作入参
-// - `XxxOut`：单条详情出参（id 字段用 #[serde(serialize_with = shared::types::serialize_i64)]）
-// - `XxxListItem` / `XxxListOut`：列表分页
-// - `XxxListQuery`：列表查询参数（继承/字段对应 PageQuery）
+//! 对应 Python myERP/schema/applicant.py。
+//!
+//! ## id 序列化约定
+//! i64 字段 `id` / `customer_id` 用 `serialize_i64`；Option<i64> 不存在（applicant 表无）。
+
+use chrono::NaiveDateTime;
+use serde::{Deserialize, Serialize};
+
+use crate::shared::types::serialize_i64;
+
+// ---- 出参 ----
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplicantOut {
+    #[serde(serialize_with = "serialize_i64")]
+    pub id: i64,
+    pub name: String,
+    #[serde(serialize_with = "serialize_i64")]
+    pub customer_id: i64,
+    pub customer_name: Option<String>,  // 由 service 连 t_customer 补
+    pub version: i32,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplicantListOut {
+    pub items: Vec<ApplicantOut>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+// ---- 入参 ----
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ApplicantListQuery {
+    #[serde(default)]
+    pub customer_id: Option<String>,
+    #[serde(default)]
+    pub name_like: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApplicantCreateRequest {
+    pub name: String,
+    pub customer_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ApplicantUpdateRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub customer_id: Option<String>,
+}

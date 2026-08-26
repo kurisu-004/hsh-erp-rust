@@ -1,22 +1,21 @@
 //! applicant 域
 //!
-// 对应 Python myERP：
-//! - api/v1/applicant.py
-//! - service/applicant_service.py
-//! - repository/applicant_repository.py
-//! - model/applicant.py
-//! - schema/applicant.py
+//! 对应 Python myERP/api/v1/applicant.py。
+//! 路由前缀 `/api/v2/applicants`。本域无状态机。
+
+use std::sync::Arc;
+
+use axum::Router;
+
+use crate::state::AppState;
+
 pub mod dto;
 pub mod handler;
 pub mod model;
 pub mod repo;
 pub mod service;
 
-
-use std::sync::Arc;
-use axum::Router;
-use crate::state::AppState;
-
 pub fn router() -> Router<Arc<AppState>> {
+    // handler::router() 尚未实装（Task 2 会补），先用空 router 占位。
     Router::new()
 }
