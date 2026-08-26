@@ -234,7 +234,6 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
             instance: 1,
-            seq: 1,
         },
         redis: AppRedisConfig {
             url: TEST_REDIS_URL.to_string(),
@@ -252,7 +251,6 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
         config.snowflake.instance,
-        config.snowflake.seq,
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
