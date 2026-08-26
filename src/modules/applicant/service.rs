@@ -90,7 +90,7 @@ impl ApplicantService {
         };
         let items = rows
             .into_iter()
-            .zip(names.into_iter())
+            .zip(names)
             .map(|(a, n)| to_applicant_out(a, n))
             .collect();
 
@@ -181,10 +181,10 @@ impl ApplicantService {
             Some(s) => Some(s.parse::<i64>().map_err(|_| bad_customer())?),
             None => None,
         };
-        if let Some(cid) = new_customer_id {
-            if !ApplicantRepo::l1_customer_exists(&mut *conn, cid).await? {
-                return Err(bad_customer());
-            }
+        if let Some(cid) = new_customer_id
+            && !ApplicantRepo::l1_customer_exists(&mut *conn, cid).await?
+        {
+            return Err(bad_customer());
         }
 
         let affected = ApplicantRepo::update(
