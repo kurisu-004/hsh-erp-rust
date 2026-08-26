@@ -53,4 +53,31 @@ impl WorkTypeRepo {
         .await?;
         Ok(rows)
     }
+
+    /// 批量按 id 查（活跃行）。空切片短路返回空 Vec。
+    ///
+    /// 用途：`WorkerService::list_workers` 取所有 worker 的 work_type_id 后，
+    /// 一次性 `list_by_ids` 拿齐 `work_type.name`，防 N+1。
+    pub async fn list_by_ids<'e, E: PgExecutor<'e>>(
+        executor: E,
+        ids: &[i64],
+    ) -> Result<Vec<TWorkType>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as!(
+            TWorkType,
+            r#"
+            SELECT id, code, name, version,
+                   created_at, created_by, updated_at, updated_by, deleted_at,
+                   max_held_batches
+            FROM t_work_type
+            WHERE id = ANY($1) AND deleted_at IS NULL
+            ORDER BY id ASC
+            "#,
+            ids,
+        )
+        .fetch_all(executor)
+        .await
+    }
 }

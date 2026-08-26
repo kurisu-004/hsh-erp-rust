@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT current_holder_id FROM t_part WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "current_holder_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "current_holder_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "65fbd181def188a5cb34b6f2fb935027efa00d65036e6b0f4bef84dc39d97662"
+}

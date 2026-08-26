@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT placed_at FROM t_part WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "placed_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "placed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "5a40f421e32ded86ee2ce5e9ecbae940f6c71ce2653c447cb5ba4d9aece8b484"
+}
