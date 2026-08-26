@@ -663,12 +663,15 @@ async fn refresh_transitions_old_session_to_new() {
 //   1) AppState 的 session store 是 NoopSessionStore
 //   2) 手签一个 Python 形态 JWT（角色是 Role::Clerk，不是 MANAGER —— 模拟 Python
 //      普通用户），extractor 不查 Redis，直接从 claims 构造 CurrentUser
-//   3) /auth/me 200，且返回的 roles / username 与 claims 一致
+//   3) /auth/me 200，证明 extractor 跳过了 Redis 查询（走 claims 路径）
 //   4) hash_token 派生函数仍工作（保证 Noop 路径不破坏 extract 链）
 // ===========================================================================
 
 /// session check 关闭时：手签一个「类 Python 形态」的 JWT（不在 Redis 写入任何条目），
-/// `/auth/me` 应直接用 Claims 构造 CurrentUser 返回 200。
+/// `/auth/me` 应返回 200，证明 extractor 跳过了 Redis 查询（直接走 claims 路径）。
+/// 注意：`me` handler 会重读 DB 取完整用户信息，所以此测试只断言 200 status，
+/// 不验证 JWT claims 中的 roles/shelf_ids —— 那些字段的精确路径
+/// 由 unit test 直接构造 CurrentUser 验证（不在本集成测试范围）。
 #[tokio::test]
 async fn disabled_session_accepts_python_issued_jwt() {
     use chrono::Utc;
@@ -676,10 +679,9 @@ async fn disabled_session_accepts_python_issued_jwt() {
     use hsh_erp_rust::auth::rbac::{Claims, Role};
     use hsh_erp_rust::auth::session::hash_token;
 
-    // 用例不依赖 Redis 容器（NoopSessionStore 跳过 Redis）
-    ensure_database_exists().await;
-    let pool = test_pool().await;
-    clean_db(&pool).await;
+    // 用例不依赖 Redis 容器（NoopSessionStore 跳过 Redis）；
+    // 仍走标准 setup()，与其他测试一样持有 TEST_LOCK，避免并发清表。
+    let (_guard, pool) = setup().await;
 
     // /me handler 会按 CurrentUser.id 回查 t_user；插一个 active 用户（不插 role，
     // 因为 extractor 已从 JWT claims 直接构造 CurrentUser，service 层 /me 只读最新
