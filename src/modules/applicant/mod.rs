@@ -16,6 +16,5 @@ pub mod repo;
 pub mod service;
 
 pub fn router() -> Router<Arc<AppState>> {
-    // handler::router() 尚未实装（Task 2 会补），先用空 router 占位。
-    Router::new()
+    handler::router()
 }
