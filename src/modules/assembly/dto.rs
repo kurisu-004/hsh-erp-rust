@@ -15,7 +15,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::shared::types::{deserialize_i64_opt, serialize_i64, serialize_i64_opt};
+use crate::shared::types::serialize_i64;
 
 // ---------- 出参 ----------
 
