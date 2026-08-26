@@ -950,11 +950,11 @@ async fn soft_delete_part_409_version_conflict() {
     assert_eq!(env["code"], 40901, "VERSION_CONFLICT: {env}");
 }
 
-/// POST /parts/{id}/soft-delete —— DELIVERED 终态 → 20120 BIZ_PART_NOT_DELETABLE (409)。
+/// POST /parts/{id}/soft-delete —— DELIVERED 终态 → 20119 BIZ_PART_NOT_DELETABLE (409)。
 ///
 /// service 内：soft_delete SQL 返回 0 行（DELIVERED 命中守卫）→
 /// get_by_id(include_deleted=true) → Some(p) → 分支 `status IN ('DELIVERED','COMPLETED')`
-/// → 20120。
+/// → 20119。
 #[tokio::test]
 async fn soft_delete_part_409_terminal_status() {
     let (_guard, pool) = setup().await;
@@ -983,7 +983,7 @@ async fn soft_delete_part_409_terminal_status() {
     .await;
     assert_eq!(s, StatusCode::CONFLICT, "terminal status: {env}");
     assert_eq!(
-        env["code"], 20120,
+        env["code"], 20119,
         "BIZ_PART_NOT_DELETABLE (终态禁删): {env}"
     );
 }
@@ -1079,7 +1079,7 @@ async fn deliver_ready_to_ship_200() {
     assert_eq!(env["data"]["status"], "DELIVERED");
 }
 
-/// POST /parts/{id}/deliver —— INSPECTION → 20116 BIZ_PART_NOT_READY_TO_SHIP (HTTP 400)。
+/// POST /parts/{id}/deliver —— INSPECTION → 20117 BIZ_PART_NOT_READY_TO_SHIP (HTTP 400)。
 #[tokio::test]
 async fn deliver_wrong_state_400() {
     let (_guard, pool) = setup().await;
@@ -1107,7 +1107,7 @@ async fn deliver_wrong_state_400() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "deliver wrong state: {env}");
-    assert_eq!(env["code"], 20116, "BIZ_PART_NOT_READY_TO_SHIP: {env}");
+    assert_eq!(env["code"], 20117, "BIZ_PART_NOT_READY_TO_SHIP: {env}");
 }
 
 /// POST /parts/{id}/cancel —— PENDING → CANCELLED (200 + status)。
@@ -1205,7 +1205,7 @@ async fn complete_delivered_200() {
     );
 }
 
-/// POST /parts/{id}/complete —— INSPECTION 状态 → 20115 BIZ_PART_NOT_DELIVERED。
+/// POST /parts/{id}/complete —— INSPECTION 状态 → 20116 BIZ_PART_NOT_DELIVERED。
 #[tokio::test]
 async fn complete_wrong_state_400() {
     let (_guard, pool) = setup().await;
@@ -1225,7 +1225,7 @@ async fn complete_wrong_state_400() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "complete wrong state: {env}");
-    assert_eq!(env["code"], 20115, "BIZ_PART_NOT_DELIVERED: {env}");
+    assert_eq!(env["code"], 20116, "BIZ_PART_NOT_DELIVERED: {env}");
 }
 
 /// POST /parts/{id}/start-repair —— IN_PROCESS → REPAIRING (200 + status)。
@@ -1262,7 +1262,7 @@ async fn start_repair_in_process_200() {
     assert_eq!(env["data"]["status"], "REPAIRING");
 }
 
-/// POST /parts/{id}/start-repair —— PENDING 状态 → 20117 BIZ_PART_REPAIR_NOT_TRIGGERED。
+/// POST /parts/{id}/start-repair —— PENDING 状态 → 20118 BIZ_PART_REPAIR_NOT_TRIGGERED。
 #[tokio::test]
 async fn start_repair_wrong_state_400() {
     let (_guard, pool) = setup().await;
@@ -1285,10 +1285,10 @@ async fn start_repair_wrong_state_400() {
     assert_eq!(env["code"], 20117, "BIZ_PART_REPAIR_NOT_TRIGGERED: {env}");
 }
 
-/// POST /parts/{id}/deliver —— CANCELLED 状态 → 20114 BIZ_PART_ALREADY_CANCELLED (409)。
+/// POST /parts/{id}/deliver —— CANCELLED 状态 → 20115 BIZ_PART_ALREADY_CANCELLED (409)。
 ///
-/// service 内新增 status guard：`from == CANCELLED` 一律 20114，
-/// 走在 wrong-state 检查（20116 BIZ_PART_NOT_READY_TO_SHIP）之前。
+/// service 内新增 status guard：`from == CANCELLED` 一律 20115，
+/// 走在 wrong-state 检查（20117 BIZ_PART_NOT_READY_TO_SHIP）之前。
 /// 同样的 guard 也加在 `complete` / `start_repair`，这里只验 deliver。
 #[tokio::test]
 async fn deliver_cancelled_409() {
@@ -1317,7 +1317,7 @@ async fn deliver_cancelled_409() {
     )
     .await;
     assert_eq!(s, StatusCode::CONFLICT, "deliver cancelled: {env}");
-    assert_eq!(env["code"], 20114, "BIZ_PART_ALREADY_CANCELLED: {env}");
+    assert_eq!(env["code"], 20115, "BIZ_PART_ALREADY_CANCELLED: {env}");
 }
 
 // ===========================================================================

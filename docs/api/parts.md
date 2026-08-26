@@ -162,7 +162,7 @@ Response 200 `data: null`（软删成功；commit 后 WS 广播 `PART_SOFT_DELET
 - 20101 — part 不存在 / 已软删（HTTP 404）
 - 40901 — version 不匹配（HTTP 409）
 - 21420 — part 已挂送货单（HTTP 409）
-- 20120 — 终态 DELIVERED/COMPLETED 禁删（HTTP 409）
+- 20119 — 终态 DELIVERED/COMPLETED 禁删（HTTP 409）
 - 40300 — 非 Manager
 
 ### `POST /api/v2/parts/{part_id}/upload-drawing`
@@ -191,8 +191,8 @@ Response 200 `data`：[`PartOut`](#partout-字段) — 流转后工单。同步�
 
 - 20101 — part 不存在 / 软删
 - 20104 — status 字符串非法
-- 20114 — part 已 CANCELLED
-- 20116 — 当前状态非 READY_TO_SHIP（状态机白名单拒绝）
+- 20115 — part 已 CANCELLED
+- 20117 — 当前状态非 READY_TO_SHIP（状态机白名单拒绝）
 - 40901 — 乐观锁失败（part 或 batch）
 
 ### `POST /api/v2/parts/{part_id}/cancel`
@@ -208,7 +208,7 @@ Response 200 `data`：[`PartOut`](#partout-字段)。同步翻转最近一条 so
 - 20101 — part 不存在 / 软删
 - 20103 — 当前状态不在 cancel 白名单（COMPLETED / REPAIRING / OUTSOURCE 等）
 - 20104 — status 字符串非法
-- 20114 — part 已 CANCELLED
+- 20115 — part 已 CANCELLED
 - 21420 — part 已挂送货单，禁 cancel
 - 40901 — 乐观锁失败
 
@@ -223,8 +223,8 @@ Response 200 `data`：[`PartOut`](#partout-字段)。**`t_part.serial_no` 被清
 错误码：
 
 - 20101 — part 不存在 / 软删
-- 20114 — part 已 CANCELLED
-- 20115 — 当前状态非 DELIVERED（状态机白名单拒绝）
+- 20115 — part 已 CANCELLED
+- 20116 — 当前状态非 DELIVERED（状态机白名单拒绝）
 - 40901 — 乐观锁失败
 
 ### `POST /api/v2/parts/{part_id}/start-repair`
@@ -238,8 +238,8 @@ Response 200 `data`：[`PartOut`](#partout-字段)。`t_part.has_been_repaired` 
 错误码：
 
 - 20101 — part 不存在 / 软删
-- 20114 — part 已 CANCELLED
-- 20117 — 当前状态非 IN_PROCESS（状态机白名单拒绝）
+- 20115 — part 已 CANCELLED
+- 20118 — 当前状态非 IN_PROCESS（状态机白名单拒绝）
 - 40901 — 乐观锁失败
 
 ### `POST /api/v2/parts/batch-pass-inspection`
@@ -782,11 +782,11 @@ INSPECTION → IN_PROCESS 由 `fail_inspection`（推荐需求 3）走 service �
 | 20104 | BIZ_INVALID_VALUE | 400 | DB status 字符串不在 enum 白名单 |
 | 20109 | BIZ_PART_BATCH_NOT_FOUND | 404 | inspection 流找不到 INSPECTION 批次 / 多批次歧义 |
 | 20111 | BIZ_PART_BATCH_INVALID_QUANTITY | 400 | quantity ≤ 0 或超过批次剩余量 |
-| 20114 | BIZ_PART_ALREADY_CANCELLED | 409 | cancel/deliver/complete/start-repair 遇到 CANCELLED 状态 |
-| 20115 | BIZ_PART_NOT_DELIVERED | 400 | complete 要求 DELIVERED |
-| 20116 | BIZ_PART_NOT_READY_TO_SHIP | 400 | deliver 要求 READY_TO_SHIP |
-| 20117 | BIZ_PART_REPAIR_NOT_TRIGGERED | 400 | start-repair 要求 IN_PROCESS |
-| 20120 | BIZ_PART_NOT_DELETABLE | 409 | soft-delete 终态禁 |
+| 20115 | BIZ_PART_ALREADY_CANCELLED | 409 | cancel/deliver/complete/start-repair 遇到 CANCELLED 状态 |
+| 20116 | BIZ_PART_NOT_DELIVERED | 400 | complete 要求 DELIVERED |
+| 20117 | BIZ_PART_NOT_READY_TO_SHIP | 400 | deliver 要求 READY_TO_SHIP |
+| 20118 | BIZ_PART_REPAIR_NOT_TRIGGERED | 400 | start-repair 要求 IN_PROCESS |
+| 20119 | BIZ_PART_NOT_DELETABLE | 409 | soft-delete 终态禁 |
 | 21420 | BIZ_DELIVERY_NOTE_LOCKED_PART | 409 | cancel / soft-delete 遇 part 已挂送货单 |
 | 40001 | VALIDATION_ERROR | 422 | 入参 shape 错 / multipart 字段错 |
 | 40300 | FORBIDDEN | 403 | 角色不符 |
@@ -803,5 +803,5 @@ INSPECTION → IN_PROCESS 由 `fail_inspection`（推荐需求 3）走 service �
 - 集成测试：`tests/part_api.rs`（inspection 流全链路）+ `tests/part_crud.rs`（CRUD + lifecycle 27 用例）
 - 仓库分层：`src/modules/part/handler.rs` (axum) → `service/{crud,inspection,lifecycle}.rs` (业务) → `repo/{part,batch,event}.rs` (SQL)
 - 状态机：`src/modules/part/statemachine.rs`
-- 错误码：`src/shared/error.rs::code`（20101 / 20103 / 20104 / 20109 / 20111 / 20114 / 20115 / 20116 / 20117 / 20118 / 20119 / 21420 / 40001 / 40300 / 40901）
+- 错误码：`src/shared/error.rs::code`（20101 / 20103 / 20104 / 20109 / 20111 / 20115 / 20116 / 20117 / 20118 / 20118 / 20119 / 21420 / 40001 / 40300 / 40901）
 - worker-scan 联动：详见 [`./worker-pool.md`](./worker-pool.md)

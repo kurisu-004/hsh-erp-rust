@@ -12,7 +12,7 @@
 --     （uq_t_delivery_group_member_customer_active），一个 L2 最多属于一个活跃分组。
 --   * 初始数据（法拉电子「二五六厂」={二厂，五厂，六厂}）不入迁移文件，上线后
 --     文员通过 UI 录入（与 Python 一致）。
---   * Phase P1（送货分组）实施。
+--   * Phase P1（送货分组）实施；DDL 与 docs/delivery-note-redesign.md §4 对齐。
 
 ------------------------------------------------------------------------
 -- t_delivery_group

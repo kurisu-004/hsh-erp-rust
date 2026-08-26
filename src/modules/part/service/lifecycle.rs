@@ -14,11 +14,11 @@
 //! - 20101 `BIZ_PART_NOT_FOUND` —— part 不存在 / 软删
 //! - 20104 `BIZ_INVALID_VALUE` —— DB 中 status 字符串不在 enum 白名单
 //! - 20103 `BIZ_INVALID_TRANSITION` —— 状态机白名单拒绝（cancel 时 COMPLETED/REPAIRING 等）
-//! - 20114 `BIZ_PART_ALREADY_CANCELLED` —— 工单已 CANCELLED
-//! - 20115 `BIZ_PART_NOT_DELIVERED` —— complete 要求 DELIVERED
-//! - 20116 `BIZ_PART_NOT_READY_TO_SHIP` —— deliver 要求 READY_TO_SHIP
-//! - 20117 `BIZ_PART_REPAIR_NOT_TRIGGERED` —— start_repair 要求 IN_PROCESS
-//! - 20120 `BIZ_PART_NOT_DELETABLE` —— soft_delete 终态禁删（lifecycle 不直接用）
+//! - 20115 `BIZ_PART_ALREADY_CANCELLED` —— 工单已 CANCELLED
+//! - 20116 `BIZ_PART_NOT_DELIVERED` —— complete 要求 DELIVERED
+//! - 20117 `BIZ_PART_NOT_READY_TO_SHIP` —— deliver 要求 READY_TO_SHIP
+//! - 20118 `BIZ_PART_REPAIR_NOT_TRIGGERED` —— start_repair 要求 IN_PROCESS
+//! - 20119 `BIZ_PART_NOT_DELETABLE` —— soft_delete 终态禁删（lifecycle 不直接用）
 //! - 21420 `BIZ_DELIVERY_NOTE_LOCKED_PART` —— cancel 时 part 已挂送货单
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败
 
@@ -119,7 +119,7 @@ impl PartService {
     /// 守卫顺序（早 fail）：
     /// 1. part 不存在 / 已软删 → 20101
     /// 2. status 字符串非法 → 20104
-    /// 3. status == CANCELLED → 20114
+    /// 3. status == CANCELLED → 20115
     /// 4. delivery_note_id 锁定 → 21420（**Finding D**）
     /// 5. status 不在 cancel 白名单 → 20103
     /// 6. part 翻转 → 同事务同步最近一条 source-status 批次

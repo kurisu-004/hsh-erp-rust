@@ -405,7 +405,7 @@ impl PartService {
                 // 2) 已软删                          → 20101 BIZ_PART_NOT_FOUND (404, "已软删")
                 // 3) version 不匹配                  → 40901 VERSION_CONFLICT (409)
                 // 4) 已挂送货单 (delivery_note_id)   → 21420 BIZ_DELIVERY_NOTE_LOCKED_PART (409)
-                // 5) 终态 (DELIVERED/COMPLETED)       → 20120 BIZ_PART_NOT_DELETABLE (409)
+                // 5) 终态 (DELIVERED/COMPLETED)       → 20119 BIZ_PART_NOT_DELETABLE (409)
                 let p = PartRepo::get_by_id(&mut *conn, part_id, true).await?;
                 match p {
                     None => Err(AppError::biz(
