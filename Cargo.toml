@@ -19,6 +19,10 @@ path = "src/lib.rs"
 # ---------------------------------------------------------------------------------
 
 [dependencies]
+# 数值与 PDF
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+lopdf = { version = "0.44", default-features = false }
+
 # Web 框架
 axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
 tower = "0.5"
