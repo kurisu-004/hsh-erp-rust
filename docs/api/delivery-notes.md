@@ -11,6 +11,7 @@
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
+| GET | `/api/v2/delivery-notes/batch-detail` | 已登录 | 批量详情（按 id 列表，复用 `DeliveryNoteDetail`） |
 | POST | `/api/v2/delivery-notes/scan` | Manager / Clerk / Inspector | P3 扫码建单（find-or-create 草稿） |
 | GET | `/api/v2/delivery-notes/candidate-parts` | 已登录 | 候选入单零件（INSPECTION/READY_TO_SHIP） |
 | GET | `/api/v2/delivery-notes/pickup-pending` | 已登录 | 待司机领取一览 |
@@ -30,6 +31,32 @@
 | POST | `/api/v2/delivery-notes/{id}/print-labels` | Manager / Clerk / Inspector | P4 打印标签 xlsx |
 
 ---
+
+### `GET /api/v2/delivery-notes/batch-detail`
+
+权限: 已登录
+
+Query：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `ids` | string | ✓ | 逗号分隔 i64 列表；1..=200 个；服务端 trim 后解析并去重（保留首次出现顺序） |
+
+校验（按顺序触发，先匹配先返回）：
+
+- `ids` 缺失 / 全空白 → 20104 BIZ_INVALID_VALUE
+- 任一 token 解析为非整数 → 20104 BIZ_INVALID_VALUE
+- 去重后超过 200 个 → 20104 BIZ_INVALID_VALUE
+
+Response 200 `data`：`{ items: [DeliveryNoteDetail] }`
+
+> 复用 [`DeliveryNoteDetail`](#deliverynotedetail-字段) DTO。`items` 长度可能小于请求 id 数：不存在 / 已软删的 id 静默跳过，不报错。
+
+只读端点，不广播 WS 事件。静态段 `/batch-detail` 必须先于 `/{id}` 注册（axum 路由顺序约束，否则会被 `{id}` 捕获）。
+
+错误码：
+
+- 20104 BIZ_INVALID_VALUE
 
 ### `POST /api/v2/delivery-notes/scan`  （P3 扫码建单）
 

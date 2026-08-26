@@ -1,7 +1,7 @@
 # hsh-erp-rust 架构设计
 
 > 本仓库为 Python FastAPI ERP 系统 `/Users/ren/Code/myERP` 的 Rust 重构版。
-> **当前为骨架阶段**——目录结构已搭好、框架级类型已实现，业务模块留待实施。
+> **项目阶段**：基础设施（axum 路由 / 错误信封 / JWT+RBAC+session / 雪花 ID / WS 中枢 / DB 迁移）已就绪，5 个核心域（auth / users / delivery-note / part / worker-pool）已完成业务 handler；其余 11 域待逐域实施。详见 §7 当前进度。
 > 本文档是骨架的"自述手册"，回答**目录为什么这样组织、各模块做什么、关键模式是什么**。
 
 ## 1. 技术栈
@@ -318,40 +318,46 @@ DATABASE_URL=... ./scripts/sqlx_prepare.sh
 SQLX_OFFLINE=true cargo build --release
 ```
 
-骨架阶段无 `query!` 宏调用，`cargo check` 不依赖数据库。
+开发库就绪后，`cargo check` 经 `query!` 宏在编译期连库校验 SQL；本地无库时设 `SQLX_OFFLINE=true` 用 `.sqlx/` 元数据构建。
 
-## 7. 实施路线图（建议）
+## 7. 当前进度（2026-08-26）
 
-按"先核心后外圈"的顺序：
+> 阶段说明：✅ 已上线业务 handler；⏳ 占位待实装。
 
-1. **数据层**
-   - sqlx migrate 初始化（squash myERP alembic 31 个迁移为 ~10 个 Rust SQL）
-   - 21 张表 + `query!`/`FromRow` 模型到 `modules/part/model.rs` 试水
-2. **认证域**
-   - `modules/user/` + `modules/auth/`（最高 ROI：解耦前能并行开发其他域）
-3. **零件工单核心**
-   - `modules/part/`（包括 `part_batch` / `part_event` / `pickup_skip_event` / `serial_counter`）
-   - 同步实施 `modules/customer/` `modules/shelf/` `modules/worker/` `modules/process/` `modules/work_type/`（part 强依赖）
-4. **装配体、送货单、外协、worker-pool**
-   - `modules/assembly/`（含 rollup）
-   - `modules/delivery_note/`（含打印）
+### 已上线（5 域 45 端点）
 
-   > 送货单域的扫码建单 / 规则分类 / 勾选打印标签的完整设计见 `docs/delivery-note-redesign.md`。
+- **数据层**：21 张表 + sqlx migrate + 所有 200xx–215xx 业务错误码常量（含 `status_from_code` 自动推导 + HTTP 表覆盖单测，见 `src/shared/error.rs`）。
+- **认证域（auth + users）**：14 端点 + Redis session（`session:tok:<sha256>` 主条目 + `sessions:user:<id>` Set 索引）。
+- **零件核心（part）**：6 端点（pass-inspection 单/批、scan-inspect 单/批、fail-inspection、worker-scan）+ state machine（`statemachine.rs`）+ WS 联动 worker-pool refill。
+- **worker-pool**：3 端点（state / admin refill / admin remove）+ `take_one_from_pool` CTE（FOR UPDATE SKIP LOCKED）。
+- **送货单域（delivery_note + delivery_groups）**：18 端点（business 17 + batch-detail 1）+ P3 扫码建单 + P4 xlsx 打印/标签 + 送货分组。
 
-   - `modules/outsource/`（company/quote/shipment）
-   - **`modules/worker_pool/`**（✅ **worker-pool-take 已完成**：`POST /parts/worker-scan` 同事务联动 `refill_for_worker`、`POST /admin/worker-pool/refill`、`POST /admin/worker-pool/remove`、`GET /worker-pool/state`；错误码 20114/20205/20206/20904/20905；WS 5 类 `WORKER_*` 事件已注册）。详细文档见 [`docs/api/worker-pool.md`](api/worker-pool.md) + [`docs/api/parts.md`](api/parts.md#post-apiv2partsworker-scan)。
-5. **文件、CNC、统计**
-   - `modules/part_file/` + COS trait 实现（`infra/cos.rs`）
-   - `modules/cnc_program/`
-   - `modules/statistics/`
-6. **横切补完**
-   - `task/auto_complete.rs` 业务查询
-   - `modules/dashboard/` WebSocket 完整实现（worker-pool WS 事件已注册，待 hub 真实握手后即可下发）
-   - `modules/mcp/` MCP tool 暴露**（本骨架不含——MCP 由独立服务器承载）**
-   - 集成测试 `tests/common/mod.rs` + 各域场景
-7. **运维**
-   - `infra/serial.rs` 业务单号
-   - 文档、CI、监控
+### 未完成（11 域）
+
+handler 当前为 3 行占位：
+
+| 域 | 路由前缀 | 备注 |
+|---|---|---|
+| `customer` | `/api/v2/customers` | L1/L2 客户树 |
+| `applicant` | `/api/v2/applicants` | 申请人 |
+| `worker` | `/api/v2/workers` | 工人 CRUD（仅 worker-pool 内部复用 worker repo） |
+| `work_type` | `/api/v2/work-types` | 工种 + 工序映射 |
+| `process` | `/api/v2/processes` | 工序 |
+| `shelf` | `/api/v2/shelves` | 货架 + 货架-工序映射 |
+| `part` | `/api/v2/parts` | 工单 CRUD（当前仅品检 6 端点） |
+| `assembly` | `/api/v2/assemblies` | 装配体（含 statemachine + 子件 rollup） |
+| `cnc_program` | `/api/v2/cnc-programs` | CNC 程序 |
+| `part_file` | `/api/v2/part-files` | 图纸/零件文件 + COS 上传 |
+| `outsource` | `/api/v2/outsource` | 外协公司/外协报价/外协发货（含 statemachine） |
+| `statistics` | `/api/v2/statistics` | 生产统计（聚合读，无 model.rs） |
+
+### 横切未完成
+
+- **WebSocket 真实握手**：`src/modules/dashboard/handler.rs` 仍为 stub（7 行注释）；WS 事件已通过 `WsHub::broadcast` 全部注册（DELIVERY_NOTE_*/INSPECTED*/WORKER_*），待 hub 真实握手后即可下发。
+- **auto_complete 后台任务**：`src/task/auto_complete.rs` 占位；DELIVERED→COMPLETED 定时循环未接业务查询。
+- **MCP 服务**：不在本仓库（用户决策：独立 MCP 服务器承载）。
+- **集成测试**：`tests/common/mod.rs` 已搭基建；按域补场景（当前有 worker_pool / part_worker_scan 等）。
+- **CI / 监控 / 文档站点**：骨架阶段未涉及。
 
 ## 8. 验证
 

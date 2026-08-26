@@ -37,7 +37,7 @@ Request：
 | ↳ `DELIVERY_NOTE_PICKED_UP` | 司机领取 | `note_id`, `driver_user_id` |
 | ↳ `DELIVERY_NOTE_PRINTED` | 打印（kind=`note` 或 `label`） | `note_id`, `kind` |
 | ↳ `INSPECTED` | scan-inspect / pass-inspection 成功后 | `part_id`, `shelf_code` |
-| ↳ `BATCH_INSPECTED` | batch-scan-inspect 完成后 | `submitted`, `failed` |
+| ↳ `BATCH_INSPECTED` | batch-scan-inspect 完成后 | `{ submitted: i64, failed: i64 }`（仅计数，非完整数组；前端若需明细直接调 `GET /api/v2/parts/{id}`） |
 | ↳ `INSPECTION_FAILED` | fail-inspection 完成后 | `part_id` |
 | ↳ `WORKER_SCAN_RETURNED` | parts worker-scan RETURNED 成功后 | `worker_id`, `part_id`, `batch_id`, `event_type` |
 | ↳ `WORKER_SCAN_INSPECTED` | parts worker-scan INSPECTED 成功后 | `worker_id`, `part_id`, `batch_id`, `event_type`, `target_inspection_shelf_id` |
