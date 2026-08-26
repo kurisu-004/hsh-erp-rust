@@ -93,6 +93,7 @@ pub async fn test_pool() -> PgPool {
 }
 
 /// 建测试用 Redis 连接池（db 15，与 dev 默认 db 0 隔离）。
+#[allow(dead_code)]
 pub async fn test_redis_pool() -> RedisPool {
     let cfg = RedisConfig::from_url(TEST_REDIS_URL);
     cfg.create_pool(Some(RedisRuntime::Tokio1))
@@ -154,6 +155,7 @@ pub async fn clean_business_db(pool: &PgPool) {
 /// 构造测试用 AppState：与 main.rs 同形，差别仅在 secret / 数据库 / Redis URL。
 ///
 /// `redis_pool` 必须事先建立并 `FLUSHDB`；返回的 `Arc<AppState>` 在每个用例内独占。
+#[allow(dead_code)]
 pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppState> {
     let config = Arc::new(AppConfig {
         database_url: test_database_url(),
@@ -264,6 +266,7 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
 }
 
 /// 测试便捷入口：只传 PgPool，自动建 Redis 池（db 15，与 dev 隔离）。
+#[allow(dead_code)]
 pub async fn test_state(pool: PgPool) -> Arc<AppState> {
     let redis_pool = test_redis_pool().await;
     test_state_with_redis(pool, redis_pool)
@@ -274,6 +277,7 @@ pub async fn test_state(pool: PgPool) -> Arc<AppState> {
 /// 不再装 `inject_current_user_layer`：handler 现在用 `current: CurrentUser`
 /// 直接参数（依赖 `CurrentUser` 的 `FromRequestParts<Arc<AppState>>` impl 自动
 /// 从 Bearer JWT 解析），与生产路径一致。
+#[allow(dead_code)]
 pub fn test_app(state: Arc<AppState>) -> axum::Router {
     hsh_erp_rust::modules::v2_router().with_state(state)
 }
@@ -282,6 +286,7 @@ pub fn test_app(state: Arc<AppState>) -> axum::Router {
 // Fixture helpers：建最小化的「admin / MANAGER / 一组货架 / 菜单」世界。
 // ===========================================================================
 
+#[allow(dead_code)]
 pub async fn insert_user_with_password(
     pool: &PgPool,
     username: &str,
@@ -340,6 +345,7 @@ pub async fn insert_inactive_user(
     id
 }
 
+#[allow(dead_code)]
 pub async fn add_role(
     pool: &PgPool,
     user_id: i64,
