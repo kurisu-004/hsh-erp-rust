@@ -133,7 +133,7 @@ async fn login_clerk(pool: PgPool, username: &str) -> (axum::Router, String, PgP
 
 async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -150,7 +150,7 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 
 async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -178,7 +178,7 @@ async fn insert_part_with_status(
     status: &str,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
@@ -198,7 +198,7 @@ async fn insert_part_with_status(
 
 async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, status: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(

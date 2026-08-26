@@ -96,7 +96,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, P
 
 async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -113,7 +113,7 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 
 async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -136,7 +136,7 @@ async fn insert_part(
     assembly_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
@@ -156,7 +156,7 @@ async fn insert_part(
 
 async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, status: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -179,7 +179,7 @@ async fn insert_assembly(
     name: &str,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
@@ -198,7 +198,7 @@ async fn insert_assembly(
 
 async fn insert_group(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -215,7 +215,7 @@ async fn insert_group(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
 
 async fn insert_group_member(pool: &PgPool, group_id: i64, l2_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -796,7 +796,7 @@ async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
     // 在 10 次连续 await 中如果落在同一毫秒，会撞 `t_part_batch_pkey`。
     // 这里直接走单条多行 INSERT + 一次性生成 10 个雪花 ID 来规避。
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let mut created_batch_ids: Vec<i64> = Vec::with_capacity(10);
     for _ in 0..10 {

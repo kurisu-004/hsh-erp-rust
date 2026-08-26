@@ -177,7 +177,6 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
             instance: 1,
-            seq: 1,
         },
         redis: AppRedisConfig {
             url: TEST_REDIS_URL.to_string(),
@@ -194,7 +193,6 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
         config.snowflake.instance,
-        config.snowflake.seq,
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
@@ -233,7 +231,7 @@ pub async fn insert_user_with_password(
     use hsh_erp_rust::infra::clock::now_naive;
 
     let hash = password::hash(plain_password).expect("bcrypt hash");
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -263,7 +261,7 @@ pub async fn insert_inactive_user(
     use hsh_erp_rust::infra::clock::now_naive;
 
     let hash = password::hash(plain_password).expect("bcrypt hash");
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -291,7 +289,7 @@ pub async fn add_role(
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -321,7 +319,7 @@ pub async fn insert_menu(
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -345,7 +343,7 @@ pub async fn insert_menu(
 pub async fn add_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -365,7 +363,7 @@ pub async fn add_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
 pub async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -412,7 +410,7 @@ pub async fn get_refresh_token_version(pool: &PgPool, user_id: i64) -> i32 {
 pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -435,7 +433,7 @@ pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -457,7 +455,7 @@ pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
 pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(

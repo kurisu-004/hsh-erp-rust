@@ -138,7 +138,7 @@ async fn login_shelf_account(
 
 async fn insert_work_type(pool: &PgPool, code: &str, name: &str, max_held: Option<i32>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -164,7 +164,7 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -185,7 +185,7 @@ async fn insert_worker(
 
 async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let l1_id = snowflake.next_id();
     let now = now_naive();
     // serial_prefix is varchar(1) + regex ^[A-Z]$ — pick first char uppercased
@@ -216,7 +216,7 @@ async fn insert_pool_part(
     quantity: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let today = now.date();
     let part_id = snowflake.next_id();
@@ -275,7 +275,7 @@ async fn insert_worker_held_part(
     quantity: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let today = now.date();
     let part_id = snowflake.next_id();

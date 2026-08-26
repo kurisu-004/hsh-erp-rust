@@ -107,7 +107,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, P
 /// 直插 L1 客户
 async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -128,7 +128,7 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 /// 直插 L2 客户（parent_id = l1_id）
 async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -154,7 +154,7 @@ async fn insert_part(
     serial_no: Option<&str>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
@@ -185,7 +185,7 @@ async fn insert_batch(
     status: &str,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -208,7 +208,7 @@ async fn insert_batch(
 /// 直插送货分组
 async fn insert_group(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -229,7 +229,7 @@ async fn insert_group(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
 /// 直插分组成员
 async fn insert_group_member(pool: &PgPool, group_id: i64, l2_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -249,7 +249,7 @@ async fn insert_group_member(pool: &PgPool, group_id: i64, l2_id: i64) -> i64 {
 /// 直插工种 + 工人
 async fn insert_worker(pool: &PgPool, badge: &str, name: &str, is_active: bool, work_type_code: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     // 找或插工种
     let wt_id: i64 = sqlx::query_scalar!(
         "SELECT id FROM t_work_type WHERE code = $1 LIMIT 1",
@@ -919,7 +919,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
     sqlx::query!(
         "INSERT INTO t_work_type (id, code, name, version, created_at, updated_at) \
          VALUES ($1, $2, $3, 0, now(), now())",
-        SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1).next_id(),
+        SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id(),
         "送货司机",
         "送货司机",
     )
@@ -929,7 +929,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
     sqlx::query!(
         "INSERT INTO t_work_type (id, code, name, version, created_at, updated_at) \
          VALUES ($1, $2, $3, 0, now(), now())",
-        SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1).next_id(),
+        SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id(),
         "其他工种",
         "其他工种",
     )
@@ -995,7 +995,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
     let state = hsh_erp_rust::state::AppState::new(
         pool.clone(),
         std::sync::Arc::new(hsh_erp_rust::infra::config::AppConfig::from_env(".env").unwrap()),
-        std::sync::Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1)),
+        std::sync::Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1)),
         std::sync::Arc::new(hsh_erp_rust::infra::ws_hub::WsHub::default()),
         std::sync::Arc::new(hsh_erp_rust::infra::cos::NoopCos),
         tokio_util::sync::CancellationToken::new(),
@@ -1180,7 +1180,7 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
 
     // 3 张 DRAFT 送货单（最小列插入）
     let note_ids: Vec<i64> = {
-        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1, 1);
+        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
         let mut ids = Vec::new();
         for i in 0..3 {
             let id = snowflake.next_id();

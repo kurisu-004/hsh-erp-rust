@@ -56,7 +56,7 @@ hsh-erp-rust/
     │   ├── db.rs                  # sqlx PgPool 构建
     │   ├── redis.rs               # deadpool-redis 连接池构建
     │   ├── cos.rs                 # CosClient trait + NoopCos 占位
-    │   ├── snowflake.rs           # 雪花 ID 生成器
+    │   ├── snowflake.rs           # 雪花 ID 生成器（位布局对齐 myERP Python `snowflake-id` 包：41+10+12）
     │   ├── serial.rs              # 业务单号/序列号（占位）
     │   ├── clock.rs               # Asia/Shanghai 时间
     │   └── ws_hub.rs              # WebSocket 广播中枢
@@ -267,7 +267,9 @@ async move {
 | `core/config.py` / `database.py` | `src/infra/config.rs` / `src/infra/db.rs` |
 | `core/response.py` / `exception*.py` / `error_code.py` | `src/shared/response.rs` / `src/shared/error.rs` |
 | `core/security.py` + `permission.py` | `src/auth/{jwt,password,rbac,session,extractor}.rs` |
-| `core/cos.py` / `serial.py` / `time.py` | `src/infra/{cos,serial,clock}.rs` + `snowflake.rs` |
+| `core/cos.py` / `time.py` | `src/infra/{cos,clock}.rs` |
+| `core/serial.py` | `src/infra/serial.rs`（业务单号 F1000/L1234） |
+| `utils/id_gen.py`（→ `snowflake-id` PyPI 包 v1.0.2） | `src/infra/snowflake.rs`（位布局 `ts<<22 \| instance<<12 \| seq`，跨语言 ID 互解） |
 | `state` 聚合 | `src/state/mod.rs`（AppState kernel） |
 | `api/deps.py` | `src/auth/extractor.rs` + `Arc<AppState>` |
 | `api/v1/<mod>.py`（19 个，drawing→part_file、ws→dashboard、print 并入 delivery_note） | `src/modules/<域>/handler.rs`（**路由暴露在 `/api/v2`**，与 v1 并行） |

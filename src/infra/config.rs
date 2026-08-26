@@ -53,13 +53,13 @@ pub struct CosConfig {
     pub max_file_size: usize,
 }
 
+/// 雪花 ID 配置（位布局对齐 myERP Python `snowflake-id` 包）：
+/// `ts << 22 | instance << 12 | seq`。instance 占 10 位（0..=1023）。
 #[derive(Copy, Clone, Debug)]
 pub struct SnowflakeConfig {
-    /// 数据中心 ID（原 SNOWFLAKE_INSTANCE）
+    /// 节点实例号（环境变量 `SNOWFLAKE_INSTANCE`，0..=1023）。
     pub instance: u16,
-    /// 工作机器 ID（原 SNOWFLAKE_SEQ）
-    pub seq: u16,
-    /// 自定义纪元（毫秒），原 SNOWFLAKE_EPOCH
+    /// 自定义纪元（毫秒），环境变量 `SNOWFLAKE_EPOCH`。
     pub epoch_ms: u64,
 }
 
@@ -99,8 +99,7 @@ impl AppConfig {
 
             snowflake: SnowflakeConfig {
                 instance: env_parse("SNOWFLAKE_INSTANCE", 0)?,
-                seq: env_parse("SNOWFLAKE_SEQ", 0)?,
-                epoch_ms: env_parse("SNOWFLAKE_EPOCH", 1_735_689_600_000u64)?, // 2020-01-01 UTC
+                epoch_ms: env_parse("SNOWFLAKE_EPOCH", 1_735_689_600_000u64)?, // 2025-01-01 UTC（与 Python 配置默认一致）
             },
 
             auto_complete: AutoCompleteConfig {

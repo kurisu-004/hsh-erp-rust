@@ -52,11 +52,10 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("执行数据库迁移失败")?;
 
-    // 4. 雪花 ID 生成器
+    // 4. 雪花 ID 生成器（位布局对齐 myERP Python，跨语言 ID 互解）
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
         config.snowflake.instance,
-        config.snowflake.seq,
     ));
 
     // 5. WebSocket 广播中枢
