@@ -7,14 +7,14 @@
 > - [`./users.md`](./users.md) — users 域
 > - [`./parts.md`](./parts.md) — part 域（part-pass-inspection 批量+单件 / scan-inspect / fail-inspection / **worker-scan**）
 > - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove**）
-> - [`./delivery-notes.md`](./delivery-notes.md) — delivery_notes 域
+> - [`./delivery-notes/index.md`](./delivery-notes/index.md) — delivery_notes 域（已拆为子目录：[queries](./delivery-notes/queries.md) / [drafts](./delivery-notes/drafts.md) / [workflow](./delivery-notes/workflow.md) / [print](./delivery-notes/print.md)）
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
 > - [`./websocket.md`](./websocket.md) — WebSocket（含 **WORKER_SCAN_* / WORKER_POOL_***）
 >
 > **同步流程**：
 > 1. 修改 `src/modules/<mod>/{handler.rs,dto.rs,service.rs}`
 > 2. 在 `src/shared/error.rs::code` 加新错误码（如适用）
-> 3. **同步更新 `docs/api/<mod>.md`** 对应小节
+> 3. **同步更新 `docs/api/<mod>.md`**（或拆分后的 `docs/api/<mod>/index.md`）对应小节
 > 4. 在 PR 描述里点出 `docs/api/<mod>.md` 有变更
 
 ## 目录
@@ -147,7 +147,7 @@ HTTP 状态码：
 | users | [`./users.md`](./users.md) | 9 | ✅ 完全上线 |
 | part | [`./parts.md`](./parts.md) | 6 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回、worker-scan（2026-08-25） |
 | worker_pool | [`./worker-pool.md`](./worker-pool.md) | 3 | 🟢 state + admin refill/remove + worker-scan 联动（2026-08-25） |
-| delivery-notes | [`./delivery-notes.md`](./delivery-notes.md) | 18 | ✅ 完全上线（P1–P4） |
+| delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub（worker-pool WS 事件已注册，待 hub 真实握手） |
 | 其他 10 域 | — | 0 | ⚪ 仅占位（见下） |
@@ -232,6 +232,11 @@ HTTP 状态码：
 
 1. **每次修改 handler / dto / service 都要同步本目录对应文件**。在 PR 描述里点出 `docs/api/<mod>.md` 有变更。
 2. **新增业务错误码**时，先在 `src/shared/error.rs::code` 注册（含 HTTP 状态推导），再在本文件 [跨域错误码速查](#跨域错误码速查) 追加。
-3. **新增域**时：在 `src/modules/mod.rs` 注册路由 → 在本目录下新建 `<module>.md`（参照现有模板）→ 在本文件"未上线域"表格里删除该行 / 在"模块 API"表格里新增一行。
+3. **新增域**时：在 `src/modules/mod.rs` 注册路由 → 在本目录下新建 `<module>.md`（参照现有模板；如预估端点 ≥15 或文件预估 ≥600 行，直接以 `<module>/index.md` 子目录形式建立，模板见 `docs/api/delivery-notes/`）→ 在本文件"未上线域"表格里删除该行 / 在"模块 API"表格里新增一行。
 4. **BizWithFailures**（如 21418）走 `R.data.failures`；前端要按 `code` 判断是否解析 `data.failures`。
 5. **通用约定不要在模块文件里重复**（认证、响应信封、错误码分段都只在 index.md）。模块文件只写自己的端点和共享 DTO。
+6. **模块拆分约定**：当 `<module>.md` 超过 ~15 端点或 ~600 行时，应当拆为 `<module>/` 子目录，结构如下：
+   - `<module>/index.md` — 入口（同步声明 + 范围说明 + 子文件导航 + 端点总览表 + 共享 DTO）
+   - `<module>/queries.md` / `<module>/drafts.md` / `<module>/workflow.md` / `<module>/print.md` — 按访问语义分组（视域而定；查询、草稿变更、状态流转、打印是最常见的四类）
+
+   子文件顶部须有 sibling-nav 链回入口与同级文件；共享 DTO 锚点统一指向 `./index.md#<dto>-字段`。实施示例：`docs/api/delivery-notes/`。

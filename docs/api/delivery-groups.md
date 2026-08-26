@@ -3,7 +3,7 @@
 > 本文件须与 `src/modules/delivery_note/{handler.rs,dto.rs,service.rs}` 保持同步（`delivery-groups` 与 `delivery-notes` 共享同一 `delivery_note` 模块）
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
-> `delivery-notes` 域见 [`./delivery-notes.md`](./delivery-notes.md)
+> `delivery-notes` 域见 [`./delivery-notes/index.md`](./delivery-notes/index.md)
 >
 > **前置依赖**：L1 客户与 L2 客户必须先建好。分组仅在 L1 客户下创建，成员为该 L1 下的 L2 客户。
 
