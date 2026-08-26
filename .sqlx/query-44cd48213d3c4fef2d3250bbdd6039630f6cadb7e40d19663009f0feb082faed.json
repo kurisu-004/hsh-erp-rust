@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, code, name, zone, is_active, display_order,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_shelf\n            WHERE id = $1 AND is_active = true AND deleted_at IS NULL\n            ",
+  "query": "\n            SELECT id, code, name, description, sort_order, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   max_held_batches\n            FROM t_work_type\n            WHERE code = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -9,7 +9,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_work_type",
             "name": "id"
           }
         }
@@ -20,7 +20,7 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_work_type",
             "name": "code"
           }
         }
@@ -31,130 +31,130 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_work_type",
             "name": "name"
           }
         }
       },
       {
         "ordinal": 3,
-        "name": "zone",
+        "name": "description",
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_shelf",
-            "name": "zone"
+            "table": "t_work_type",
+            "name": "description"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "is_active",
-        "type_info": "Bool",
+        "name": "sort_order",
+        "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_shelf",
-            "name": "is_active"
+            "table": "t_work_type",
+            "name": "sort_order"
           }
         }
       },
       {
         "ordinal": 5,
-        "name": "display_order",
-        "type_info": "Int4",
-        "origin": {
-          "Table": {
-            "table": "t_shelf",
-            "name": "display_order"
-          }
-        }
-      },
-      {
-        "ordinal": 6,
         "name": "version",
         "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_work_type",
             "name": "version"
           }
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_work_type",
             "name": "created_at"
           }
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 7,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_work_type",
             "name": "created_by"
           }
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_work_type",
             "name": "updated_at"
           }
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_work_type",
             "name": "updated_by"
           }
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_work_type",
             "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "max_held_batches",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "max_held_batches"
           }
         }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Text"
       ]
     },
     "nullable": [
       false,
       false,
       false,
-      false,
-      false,
+      true,
       false,
       false,
       false,
       true,
       false,
+      true,
       true,
       true
     ]
   },
-  "hash": "f2391efb3f0afee5cf68e79748d4ddde870ea2ec0a0a2038f2681fc168c59de0"
+  "hash": "44cd48213d3c4fef2d3250bbdd6039630f6cadb7e40d19663009f0feb082faed"
 }

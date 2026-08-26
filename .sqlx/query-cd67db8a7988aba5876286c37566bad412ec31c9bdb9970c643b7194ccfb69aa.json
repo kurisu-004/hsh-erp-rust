@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, badge_code, name, is_active,\n                   work_type_id, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_worker\n            WHERE id = $1\n              AND ($2::bool OR deleted_at IS NULL)\n            ",
+  "query": "\n            SELECT id, code, name, description, sort_order, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   max_held_batches\n            FROM t_work_type\n            WHERE id = ANY($1) AND deleted_at IS NULL\n            ORDER BY id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -9,19 +9,19 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_worker",
+            "table": "t_work_type",
             "name": "id"
           }
         }
       },
       {
         "ordinal": 1,
-        "name": "badge_code",
+        "name": "code",
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_worker",
-            "name": "badge_code"
+            "table": "t_work_type",
+            "name": "code"
           }
         }
       },
@@ -31,30 +31,30 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_worker",
+            "table": "t_work_type",
             "name": "name"
           }
         }
       },
       {
         "ordinal": 3,
-        "name": "is_active",
-        "type_info": "Bool",
+        "name": "description",
+        "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_worker",
-            "name": "is_active"
+            "table": "t_work_type",
+            "name": "description"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "work_type_id",
-        "type_info": "Int8",
+        "name": "sort_order",
+        "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_worker",
-            "name": "work_type_id"
+            "table": "t_work_type",
+            "name": "sort_order"
           }
         }
       },
@@ -64,7 +64,7 @@
         "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_worker",
+            "table": "t_work_type",
             "name": "version"
           }
         }
@@ -75,7 +75,7 @@
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_worker",
+            "table": "t_work_type",
             "name": "created_at"
           }
         }
@@ -86,7 +86,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_worker",
+            "table": "t_work_type",
             "name": "created_by"
           }
         }
@@ -97,7 +97,7 @@
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_worker",
+            "table": "t_work_type",
             "name": "updated_at"
           }
         }
@@ -108,7 +108,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_worker",
+            "table": "t_work_type",
             "name": "updated_by"
           }
         }
@@ -119,31 +119,42 @@
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_worker",
+            "table": "t_work_type",
             "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "max_held_batches",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "max_held_batches"
           }
         }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Bool"
+        "Int8Array"
       ]
     },
     "nullable": [
       false,
       false,
       false,
-      false,
       true,
       false,
       false,
+      false,
       true,
       false,
+      true,
       true,
       true
     ]
   },
-  "hash": "8ea14d71c87217d7a4b090ee37df3bd3662fa0f499f99b128922199d5317a26d"
+  "hash": "cd67db8a7988aba5876286c37566bad412ec31c9bdb9970c643b7194ccfb69aa"
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, badge_code, name, is_active,\n                   work_type_id, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_worker\n            WHERE badge_code = $1\n              AND ($2::bool OR deleted_at IS NULL)\n            ",
+  "query": "\n            INSERT INTO t_worker (id, badge_code, name, id_card_no, phone, is_active,\n                                   work_type_id, created_by, updated_by)\n            VALUES ($1, $2, $3, $4, $5, true, $6, $7, $7)\n            RETURNING id, badge_code, name, id_card_no, phone, is_active,\n                      work_type_id, version,\n                      created_at, created_by, updated_at, updated_by, deleted_at\n            ",
   "describe": {
     "columns": [
       {
@@ -38,6 +38,28 @@
       },
       {
         "ordinal": 3,
+        "name": "id_card_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "id_card_no"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "phone",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_worker",
+            "name": "phone"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "is_active",
         "type_info": "Bool",
         "origin": {
@@ -48,7 +70,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 6,
         "name": "work_type_id",
         "type_info": "Int8",
         "origin": {
@@ -59,7 +81,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 7,
         "name": "version",
         "type_info": "Int4",
         "origin": {
@@ -70,7 +92,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 8,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -81,7 +103,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 9,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -92,7 +114,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 10,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -103,7 +125,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -114,7 +136,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 12,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
@@ -127,14 +149,21 @@
     ],
     "parameters": {
       "Left": [
-        "Text",
-        "Bool"
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Int8"
       ]
     },
     "nullable": [
       false,
       false,
       false,
+      true,
+      true,
       false,
       true,
       false,
@@ -145,5 +174,5 @@
       true
     ]
   },
-  "hash": "e66f417637ac1987e3d9f8e38b1ef29b97c58d87b89fab367baac4311aa878b0"
+  "hash": "339f610f0798b04b7ce8080a6b8d5fb24c9980b472a6663c25dfcc97741c0bd1"
 }

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_work_type\n            SET name            = COALESCE($3::varchar, name),\n                description     = CASE WHEN $4::bool THEN $5::varchar ELSE description END,\n                sort_order      = COALESCE($6::integer, sort_order),\n                max_held_batches = CASE WHEN $7::bool THEN $8::integer ELSE max_held_batches END,\n                version         = version + 1,\n                updated_at      = now(),\n                updated_by      = $9\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Bool",
+        "Varchar",
+        "Int4",
+        "Bool",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f79e77efcd0ec9336f203cfb74958413648ccb9a42a27a30c3b533d33c4170b4"
+}

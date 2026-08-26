@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_process\n            SET deleted_at = now(),\n                version    = version + 1,\n                updated_at = now(),\n                updated_by = $3\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4d5ef482f731fa127b44dc0a03294bae3e4047a36fba6fa9676eb25e99d3ace8"
+}

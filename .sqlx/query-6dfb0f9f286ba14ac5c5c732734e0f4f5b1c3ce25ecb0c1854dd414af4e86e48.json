@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, code, name, zone, is_active, display_order,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_shelf\n            WHERE id = $1 AND zone = $2 AND is_active = true AND deleted_at IS NULL\n            ",
+  "query": "\n            SELECT id, code, name, category, sort_order, description, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   requires_approval\n            FROM t_process\n            WHERE id = ANY($1)\n              AND deleted_at IS NULL\n            ORDER BY id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -9,7 +9,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_process",
             "name": "id"
           }
         }
@@ -20,7 +20,7 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_process",
             "name": "code"
           }
         }
@@ -31,41 +31,41 @@
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_process",
             "name": "name"
           }
         }
       },
       {
         "ordinal": 3,
-        "name": "zone",
+        "name": "category",
         "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_shelf",
-            "name": "zone"
+            "table": "t_process",
+            "name": "category"
           }
         }
       },
       {
         "ordinal": 4,
-        "name": "is_active",
-        "type_info": "Bool",
+        "name": "sort_order",
+        "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_shelf",
-            "name": "is_active"
+            "table": "t_process",
+            "name": "sort_order"
           }
         }
       },
       {
         "ordinal": 5,
-        "name": "display_order",
-        "type_info": "Int4",
+        "name": "description",
+        "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_shelf",
-            "name": "display_order"
+            "table": "t_process",
+            "name": "description"
           }
         }
       },
@@ -75,7 +75,7 @@
         "type_info": "Int4",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_process",
             "name": "version"
           }
         }
@@ -86,7 +86,7 @@
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_process",
             "name": "created_at"
           }
         }
@@ -97,7 +97,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_process",
             "name": "created_by"
           }
         }
@@ -108,7 +108,7 @@
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_process",
             "name": "updated_at"
           }
         }
@@ -119,7 +119,7 @@
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_process",
             "name": "updated_by"
           }
         }
@@ -130,16 +130,26 @@
         "type_info": "Timestamp",
         "origin": {
           "Table": {
-            "table": "t_shelf",
+            "table": "t_process",
             "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "requires_approval",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "requires_approval"
           }
         }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8",
-        "Text"
+        "Int8Array"
       ]
     },
     "nullable": [
@@ -148,14 +158,15 @@
       false,
       false,
       false,
-      false,
+      true,
       false,
       false,
       true,
       false,
       true,
-      true
+      true,
+      false
     ]
   },
-  "hash": "61d0442e2abdabfc4e2c50ee0932b9f76bc2fe51131c927e683478f39fa5ef5d"
+  "hash": "6dfb0f9f286ba14ac5c5c732734e0f4f5b1c3ce25ecb0c1854dd414af4e86e48"
 }

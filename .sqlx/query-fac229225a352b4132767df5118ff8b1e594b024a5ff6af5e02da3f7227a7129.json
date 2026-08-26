@@ -1,0 +1,179 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO t_process (id, code, name, category, sort_order, description,\n                                   requires_approval, created_by, updated_by)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)\n            RETURNING id, code, name, category, sort_order, description, version,\n                      created_at, created_by, updated_at, updated_by, deleted_at,\n                      requires_approval\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "code",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "code"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "category",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "category"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "sort_order",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "sort_order"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "deleted_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "requires_approval",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "requires_approval"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Bool",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "fac229225a352b4132767df5118ff8b1e594b024a5ff6af5e02da3f7227a7129"
+}

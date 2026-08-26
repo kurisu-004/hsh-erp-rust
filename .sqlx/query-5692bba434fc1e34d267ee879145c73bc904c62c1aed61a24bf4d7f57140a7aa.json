@@ -1,0 +1,166 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO t_work_type (id, code, name, description, sort_order,\n                                     max_held_batches, created_by, updated_by)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)\n            RETURNING id, code, name, description, sort_order, version,\n                      created_at, created_by, updated_at, updated_by, deleted_at,\n                      max_held_batches\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "code",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "code"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "description",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "sort_order",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "sort_order"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "deleted_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "max_held_batches",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "max_held_batches"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "5692bba434fc1e34d267ee879145c73bc904c62c1aed61a24bf4d7f57140a7aa"
+}
