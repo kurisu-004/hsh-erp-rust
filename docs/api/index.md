@@ -9,6 +9,7 @@
 > - [`./processes.md`](./processes.md) — processes 域（INHOUSE/OUTSOURCE CRUD）
 > - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker + mapping）
 > - [`./workers.md`](./workers.md) — workers 域（CRUD + verify-badge + deactivate/reactivate）
+> - [`./work-types.md`](./work-types.md) — work_types 域（CRUD + process mapping + 三态更新，2026-08-26）
 > - [`./parts.md`](./parts.md) — part 域（part-pass-inspection 批量+单件 / scan-inspect / fail-inspection / **worker-scan**）
 > - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove**）
 > - [`./delivery-notes.md`](./delivery-notes.md) — delivery_notes 域
@@ -153,6 +154,7 @@ HTTP 状态码：
 | processes | [`./processes.md`](./processes.md) | 5 | ✅ 完全上线（CRUD + INHOUSE no-approval + 引用校验，2026-08-26） |
 | shelves | [`./shelves.md`](./shelves.md) | 11 | ✅ 完全上线（CRUD + picker + mapping，2026-08-26） |
 | workers | [`./workers.md`](./workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26） |
+| work-types | [`./work-types.md`](./work-types.md) | 7 | ✅ 完全上线（CRUD + process mapping + 三态更新 + 引用校验，2026-08-26） |
 | part | [`./parts.md`](./parts.md) | 6 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回、worker-scan（2026-08-25） |
 | worker_pool | [`./worker-pool.md`](./worker-pool.md) | 3 | 🟢 state + admin refill/remove + worker-scan 联动（2026-08-25） |
 | delivery-notes | [`./delivery-notes.md`](./delivery-notes.md) | 18 | ✅ 完全上线（P1–P4） |
@@ -167,7 +169,6 @@ HTTP 状态码：
 | 域 | 路由前缀 | 状态 |
 |---|---|---|
 | `applicant` | `/api/v2/applicants` | 路由已 nest 但 handler 空 → 全部 404 |
-| `work_type` | `/api/v2/work-types` | 同上 |
 | `part` | `/api/v2/parts` | 同上 |
 | `assembly` | `/api/v2/assemblies` | 同上 |
 | `cnc_program` | `/api/v2/cnc-programs` | 同上 |

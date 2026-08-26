@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, code, name, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   max_held_batches\n            FROM t_work_type\n            WHERE id = ANY($1) AND deleted_at IS NULL\n            ORDER BY id ASC\n            ",
+  "query": "\n            SELECT id, code, name, description, sort_order, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   max_held_batches\n            FROM t_work_type\n            WHERE code = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -38,6 +38,28 @@
       },
       {
         "ordinal": 3,
+        "name": "description",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "description"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "sort_order",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_work_type",
+            "name": "sort_order"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "version",
         "type_info": "Int4",
         "origin": {
@@ -48,7 +70,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -59,7 +81,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 7,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -70,7 +92,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 8,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -81,7 +103,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 9,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -92,7 +114,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 10,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
@@ -103,7 +125,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 11,
         "name": "max_held_batches",
         "type_info": "Int4",
         "origin": {
@@ -116,12 +138,14 @@
     ],
     "parameters": {
       "Left": [
-        "Int8Array"
+        "Text"
       ]
     },
     "nullable": [
       false,
       false,
+      false,
+      true,
       false,
       false,
       false,
@@ -132,5 +156,5 @@
       true
     ]
   },
-  "hash": "8ea78c8233a416743e766739a16f3efb19dc7ba5896c139ae9eb7b13cd687be1"
+  "hash": "44cd48213d3c4fef2d3250bbdd6039630f6cadb7e40d19663009f0feb082faed"
 }
