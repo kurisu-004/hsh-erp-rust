@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO t_part (\n                id, name, drawing_no, applicant_name, quantity,\n                request_date, planned_delivery_date,\n                status, is_urgent, customer_id, assembly_id,\n                order_no, system_delivery_date, note,\n                created_at, created_by, updated_at, updated_by\n            ) VALUES (\n                $1, $2, $3, $4, $5,\n                $6, $7,\n                'PENDING', $8, $9, $10,\n                $11, $12, $13,\n                now(), $14, now(), $14\n            )\n            RETURNING id AS \"id!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Date",
+        "Date",
+        "Bool",
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Date",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "597bd90584c792e60363306759c49c1eed2dec54945d875a27f7437a03350ded"
+}

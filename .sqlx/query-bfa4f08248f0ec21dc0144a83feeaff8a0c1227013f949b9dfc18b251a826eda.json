@@ -1,0 +1,289 @@
+{
+  "db_name": "PostgreSQL",
+<<<<<<<< HEAD:.sqlx/query-ea71227107c9432123316db0a80bb11adae6294c0c176f43c161aa655505a531.json
+  "query": "\n            SELECT id, serial_no, name, drawing_no, customer_id, assembly_id, status,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at,\n                   delivery_note_id, location, next_process_id,\n                   planned_delivery_date, system_delivery_date, is_urgent\n            FROM t_part\n            WHERE id = $1\n              AND ($2::bool OR deleted_at IS NULL)\n            ",
+========
+  "query": "\n            SELECT id, part_id, kind, file_type, object_key, original_filename,\n                   file_size, content_type, upload_status, content_sha256,\n                   version, created_at, created_by, updated_at, updated_by,\n                   deleted_at, paired_file_id\n            FROM t_part_file\n            WHERE part_id = $1 AND kind = $2 AND deleted_at IS NULL\n            ORDER BY created_at DESC\n            LIMIT 1\n            ",
+>>>>>>>> af574eb (chore(sqlx): refresh offline cache for part-crud):.sqlx/query-bfa4f08248f0ec21dc0144a83feeaff8a0c1227013f949b9dfc18b251a826eda.json
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "part_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "part_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "file_type",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "file_type"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "object_key",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "object_key"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "original_filename",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "original_filename"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "file_size",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "file_size"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "content_type",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "content_type"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "upload_status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "upload_status"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "content_sha256",
+        "type_info": "Bpchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "content_sha256"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "updated_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "deleted_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "paired_file_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_file",
+            "name": "paired_file_id"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "location",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "next_process_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "next_process_id"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "planned_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "planned_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "system_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "system_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "is_urgent",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "is_urgent"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+<<<<<<<< HEAD:.sqlx/query-ea71227107c9432123316db0a80bb11adae6294c0c176f43c161aa655505a531.json
+  "hash": "ea71227107c9432123316db0a80bb11adae6294c0c176f43c161aa655505a531"
+========
+  "hash": "bfa4f08248f0ec21dc0144a83feeaff8a0c1227013f949b9dfc18b251a826eda"
+>>>>>>>> af574eb (chore(sqlx): refresh offline cache for part-crud):.sqlx/query-bfa4f08248f0ec21dc0144a83feeaff8a0c1227013f949b9dfc18b251a826eda.json
+}

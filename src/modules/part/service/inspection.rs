@@ -1,6 +1,7 @@
-//! part 域业务逻辑
+//! part 域 inspection 流业务逻辑（pass / fail / scan 流）。
 //!
-//! 对应 Python myERP/service/part_service.py（及 _<d>_*.py helper）。
+//! 对应 Python myERP/service/part_service.py（及 _<d>_*.py helper）中
+//! pass_inspection / fail_inspection / scan_inspect 三个流的实现。
 //! 实施约定：方法签名接收 `&mut PgConnection`，由 handler 开 tx 并 commit。
 //!
 //! ## Phase F（pass_inspection 批量送检）
@@ -43,19 +44,18 @@ use crate::modules::worker::repo::WorkerRepo;
 use crate::modules::worker_pool::dto::WorkerScanEvent;
 use crate::shared::error::{code, AppError};
 
-use super::dto::{
+use super::super::dto::{
     BatchPassFailure, BatchPassInspectionOut, BatchPassInspectionRequest, BatchScanInspectFailure,
     BatchScanInspectOut, BatchScanInspectRequest, FailInspectionRequest, PartOut, ScanDecision,
     ScanInspectRequest, WorkerScanCoreOut, WorkerScanRequest,
 };
+use super::PartService;
 
 /// 批量端点单次请求最大 item 数（handler/service 双层校验）。
 pub const BATCH_PASS_INSPECTION_MAX_ITEMS: usize = 200;
 
 /// 批量 scan-inspect 单次请求最大 item 数（与 batch-pass-inspection 对齐）。
 pub const BATCH_SCAN_INSPECT_MAX_ITEMS: usize = 200;
-
-pub struct PartService;
 
 impl PartService {
     /// 单件共享核心：被单件 / batch 端点共用。
@@ -894,10 +894,10 @@ impl PartService {
     /// worker-scan 共享核心（被单件端点 `POST /parts/worker-scan` 调用，Task 8）。
     ///
     /// 两分支：
-    /// - `RETURNED`：worker 把持有件放回生产架（同 admin_remove 语义，但走扫码台
-    ///   + worker 自查路径）；要求 shelf ∈ PRODUCTION 区 + active；shelf ↔
-    ///   next_process_id 在 `t_shelf_process` 必须有映射（20507 NOT_MAPPED）；
-    ///   切 holder worker → shelf（OCC）+ 写 `RETURNED_TO_SHELF` 事件。
+    /// - `RETURNED`：worker 把持有件放回生产架（同 admin_remove 语义，但走扫码台 +
+    ///   worker 自查路径）；要求 shelf ∈ PRODUCTION 区 + active；shelf ↔
+    ///   next_process_id 在 `t_shelf_process` 必须有映射（20507 NOT_MAPPED）；切
+    ///   holder worker → shelf（OCC）+ 写 `RETURNED_TO_SHELF` 事件。
     /// - `INSPECTED`：worker 把持有件直接送检（INSPECTION → INSPECTION + 状态机
     ///   IN_PROCESS → INSPECTION）；要求 target shelf ∈ INSPECTION 区 + active；
     ///   状态机校验 → mark_*_inspected（OCC）+ 写 `SENT_TO_INSPECTION` 事件。

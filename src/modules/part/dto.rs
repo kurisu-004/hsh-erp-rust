@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::modules::worker_pool::dto::WorkerScanEvent;
 use crate::modules::worker_pool::model::RefillResult;
-use crate::shared::types::{deserialize_i64, serialize_i64};
+use crate::shared::types::{deserialize_i64, serialize_i64, serialize_i64_opt};
 
 /// 工单详情投影（pass_inspection 出参；其它端点复用做最小投影）。
 ///
@@ -42,11 +42,33 @@ pub struct PartOut {
     pub order_no: Option<String>,
     pub actual_delivery_date: Option<chrono::NaiveDate>,
     pub updated_at: chrono::NaiveDateTime,
+    #[serde(serialize_with = "serialize_i64_opt")]
     pub updated_by: Option<i64>,
 }
 
 impl From<crate::modules::part::model::TPartInspected> for PartOut {
     fn from(p: crate::modules::part::model::TPartInspected) -> Self {
+        Self {
+            id: p.id,
+            serial_no: p.serial_no,
+            name: p.name,
+            drawing_no: p.drawing_no,
+            status: p.status,
+            version: p.version,
+            quantity: p.quantity,
+            order_no: p.order_no,
+            actual_delivery_date: p.actual_delivery_date,
+            updated_at: p.updated_at,
+            updated_by: p.updated_by,
+        }
+    }
+}
+
+/// 从完整 `TPart` 投影到 `PartOut`：cancel 流需要 `delivery_note_id` 守卫，
+/// 故 read 时用 `PartRepo::get_part_detail` 取完整行（含 delivery_note_id），
+/// 直接转 PartOut 响应。
+impl From<crate::modules::part::model::TPart> for PartOut {
+    fn from(p: crate::modules::part::model::TPart) -> Self {
         Self {
             id: p.id,
             serial_no: p.serial_no,

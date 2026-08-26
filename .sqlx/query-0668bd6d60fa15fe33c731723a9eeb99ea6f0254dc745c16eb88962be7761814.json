@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part\n            SET deleted_at = now(),\n                version    = version + 1,\n                updated_at = now(),\n                updated_by = $3\n            WHERE id = $1 AND version = $2\n              AND status NOT IN ('DELIVERED', 'COMPLETED')\n              AND delivery_note_id IS NULL\n              AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0668bd6d60fa15fe33c731723a9eeb99ea6f0254dc745c16eb88962be7761814"
+}

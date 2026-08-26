@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "TRUNCATE t_delivery_note_counter",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "0dcec18cab60fa55657b5d4260553313bbc1c6562b959ac3caa07f3f011512f7"
+}

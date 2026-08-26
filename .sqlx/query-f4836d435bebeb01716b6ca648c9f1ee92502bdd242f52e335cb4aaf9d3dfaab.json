@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE t_part SET status='COMPLETED', version=version+1,\n                updated_at=now(), updated_by=$3, serial_no=NULL\n               WHERE id=$1 AND version=$2 AND status='DELIVERED' AND deleted_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f4836d435bebeb01716b6ca648c9f1ee92502bdd242f52e335cb4aaf9d3dfaab"
+}

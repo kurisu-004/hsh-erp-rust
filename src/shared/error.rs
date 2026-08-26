@@ -70,6 +70,11 @@ pub mod code {
     pub const BIZ_PART_QUANTITY_LOCKED: i32 = 20112;             // 已拆分或已流转的工单禁止改总量
     pub const BIZ_CUSTOMER_IN_USE: i32 = 20113;                  // 客户仍被 part/assembly 引用 → 拒软删（Python 原 20109，新槽位独占）
     pub const BIZ_PART_BATCH_NOT_HELD_BY_WORKER: i32 = 20114;   // worker-scan 找不到当前 worker 持有的批次
+    pub const BIZ_PART_ALREADY_CANCELLED: i32 = 20115;           // 零件已 CANCELLED，cancel/deliver/complete/start-repair 一律返回此码（status guard）
+    pub const BIZ_PART_NOT_DELIVERED: i32 = 20116;               // complete 操作要求零件当前为 DELIVERED
+    pub const BIZ_PART_NOT_READY_TO_SHIP: i32 = 20117;           // deliver 操作要求零件当前为 READY_TO_SHIP
+    pub const BIZ_PART_REPAIR_NOT_TRIGGERED: i32 = 20118;         // start-repair 操作要求零件当前为 IN_PROCESS
+    pub const BIZ_PART_NOT_DELETABLE: i32 = 20119;                // 零件处于终态 (DELIVERED/COMPLETED) 或已挂送货单，禁 soft-delete
 
     // 202xx 工人
     pub const BIZ_WORKER_NOT_FOUND: i32 = 20201;
@@ -191,6 +196,7 @@ pub mod code {
     pub const BIZ_DELIVERY_SCAN_UNKNOWN_CODE: i32 = 21417;          // 扫码的 serial_no 无法识别
     pub const BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY: i32 = 21418;   // 装配件整套拒绝：含不可入单子件（message 附明细）
     pub const BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT: i32 = 21419;  // recall 时同范围已存在 DRAFT
+    pub const BIZ_DELIVERY_NOTE_LOCKED_PART: i32 = 21420;          // 零件已锁定在另一张非 DRAFT 的送货单上 → 拒 cancel
 
     // 215xx 外协发货（t_outsource_shipment）
     pub const BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND: i32 = 21501;
@@ -388,14 +394,20 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_DELIVERY_NOTE_PARTS_LOCKED
             || c == code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME
             || c == code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT
-            || c == code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT => StatusCode::CONFLICT,
+            || c == code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT
+            || c == code::BIZ_PART_ALREADY_CANCELLED
+            || c == code::BIZ_DELIVERY_NOTE_LOCKED_PART
+            || c == code::BIZ_PART_NOT_DELETABLE => StatusCode::CONFLICT,
 
         // ---- 2xxxx 业务码：422 (校验类，Python 显式声明 21113 → 422) ----
         c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER => StatusCode::UNPROCESSABLE_ENTITY,
 
         // ---- 2xxxx 兜底：Python BizError 默认 400 ----
         c if c == code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH
-            || c == code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY => StatusCode::BAD_REQUEST,
+            || c == code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY
+            || c == code::BIZ_PART_NOT_DELIVERED
+            || c == code::BIZ_PART_NOT_READY_TO_SHIP
+            || c == code::BIZ_PART_REPAIR_NOT_TRIGGERED => StatusCode::BAD_REQUEST,
 
         // ---- 2xxxx 兜底：Python BizError 默认 400 ----
         c if (20000..30000).contains(&c) => StatusCode::BAD_REQUEST,
@@ -489,6 +501,12 @@ mod tests {
         (code::BIZ_PART_BATCH_INVALID_QUANTITY, "BIZ_PART_BATCH_INVALID_QUANTITY"),
         (code::BIZ_PART_QUANTITY_LOCKED, "BIZ_PART_QUANTITY_LOCKED"),
         (code::BIZ_CUSTOMER_IN_USE, "BIZ_CUSTOMER_IN_USE"),
+        (code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER, "BIZ_PART_BATCH_NOT_HELD_BY_WORKER"),
+        (code::BIZ_PART_ALREADY_CANCELLED, "BIZ_PART_ALREADY_CANCELLED"),
+        (code::BIZ_PART_NOT_DELIVERED, "BIZ_PART_NOT_DELIVERED"),
+        (code::BIZ_PART_NOT_READY_TO_SHIP, "BIZ_PART_NOT_READY_TO_SHIP"),
+        (code::BIZ_PART_REPAIR_NOT_TRIGGERED, "BIZ_PART_REPAIR_NOT_TRIGGERED"),
+        (code::BIZ_PART_NOT_DELETABLE, "BIZ_PART_NOT_DELETABLE"),
         // 202xx
         (code::BIZ_WORKER_NOT_FOUND, "BIZ_WORKER_NOT_FOUND"),
         (code::BIZ_WORKER_INACTIVE, "BIZ_WORKER_INACTIVE"),
@@ -571,6 +589,7 @@ mod tests {
         (code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE, "BIZ_DELIVERY_SCAN_UNKNOWN_CODE"),
         (code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY, "BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY"),
         (code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT, "BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT"),
+        (code::BIZ_DELIVERY_NOTE_LOCKED_PART, "BIZ_DELIVERY_NOTE_LOCKED_PART"),
         // 215xx
         (code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND"),
     ];
@@ -622,6 +641,12 @@ mod tests {
         assert_eq!(code::BIZ_PART_BATCH_INVALID_QUANTITY, 20111);
         assert_eq!(code::BIZ_PART_QUANTITY_LOCKED, 20112);
         assert_eq!(code::BIZ_CUSTOMER_IN_USE, 20113);
+        assert_eq!(code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER, 20114);
+        assert_eq!(code::BIZ_PART_ALREADY_CANCELLED, 20115);
+        assert_eq!(code::BIZ_PART_NOT_DELIVERED, 20116);
+        assert_eq!(code::BIZ_PART_NOT_READY_TO_SHIP, 20117);
+        assert_eq!(code::BIZ_PART_REPAIR_NOT_TRIGGERED, 20118);
+        assert_eq!(code::BIZ_PART_NOT_DELETABLE, 20119);
 
         // 202xx
         assert_eq!(code::BIZ_WORKER_NOT_FOUND, 20201);
@@ -729,6 +754,7 @@ mod tests {
         assert_eq!(code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE, 21417);
         assert_eq!(code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY, 21418);
         assert_eq!(code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT, 21419);
+        assert_eq!(code::BIZ_DELIVERY_NOTE_LOCKED_PART, 21420);
 
         // 215xx
         assert_eq!(code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, 21501);
@@ -787,6 +813,7 @@ mod tests {
         (code::BIZ_CUSTOMER_IN_USE, StatusCode::CONFLICT, "BIZ_CUSTOMER_IN_USE"),
         (code::BIZ_WORKER_IN_USE, StatusCode::CONFLICT, "BIZ_WORKER_IN_USE"),
         (code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED, StatusCode::CONFLICT, "BIZ_WORKER_HOLD_LIMIT_EXCEEDED"),
+        (code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER, StatusCode::CONFLICT, "BIZ_PART_BATCH_NOT_HELD_BY_WORKER"),
         (code::BIZ_SHELF_DUPLICATE_CODE, StatusCode::CONFLICT, "BIZ_SHELF_DUPLICATE_CODE"),
         (code::BIZ_SHELF_IN_USE, StatusCode::CONFLICT, "BIZ_SHELF_IN_USE"),
         (code::BIZ_PROCESS_DUPLICATE_CODE, StatusCode::CONFLICT, "BIZ_PROCESS_DUPLICATE_CODE"),
@@ -804,6 +831,8 @@ mod tests {
         (code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME, StatusCode::CONFLICT, "BIZ_DELIVERY_GROUP_DUPLICATE_NAME"),
         (code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT, StatusCode::CONFLICT, "BIZ_DELIVERY_GROUP_MEMBER_CONFLICT"),
         (code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT"),
+        (code::BIZ_PART_ALREADY_CANCELLED, StatusCode::CONFLICT, "BIZ_PART_ALREADY_CANCELLED"),
+        (code::BIZ_DELIVERY_NOTE_LOCKED_PART, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_LOCKED_PART"),
         // 2xxxx 显式 422
         (code::BIZ_DELIVERY_PRINT_BAD_ORDER, StatusCode::UNPROCESSABLE_ENTITY, "BIZ_DELIVERY_PRINT_BAD_ORDER"),
         // 2xxxx 默认 400 兜底
@@ -812,6 +841,10 @@ mod tests {
         (code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED, StatusCode::BAD_REQUEST, "BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED"),
         (code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH, StatusCode::BAD_REQUEST, "BIZ_DELIVERY_NOTE_SCOPE_MISMATCH"),
         (code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY, StatusCode::BAD_REQUEST, "BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY"),
+        (code::BIZ_PART_NOT_DELIVERED, StatusCode::BAD_REQUEST, "BIZ_PART_NOT_DELIVERED"),
+        (code::BIZ_PART_NOT_READY_TO_SHIP, StatusCode::BAD_REQUEST, "BIZ_PART_NOT_READY_TO_SHIP"),
+        (code::BIZ_PART_REPAIR_NOT_TRIGGERED, StatusCode::BAD_REQUEST, "BIZ_PART_REPAIR_NOT_TRIGGERED"),
+        (code::BIZ_PART_NOT_DELETABLE, StatusCode::CONFLICT, "BIZ_PART_NOT_DELETABLE"),
     ];
 
     #[test]

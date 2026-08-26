@@ -30,7 +30,7 @@ use crate::modules::part::dto::{
 };
 use crate::modules::part::service::{PartService, BATCH_PASS_INSPECTION_MAX_ITEMS};
 use crate::modules::worker_pool::service::WorkerPoolService;
-use crate::shared::error::AppError;
+use crate::shared::error::{code, AppError};
 use crate::shared::response::R;
 use crate::state::AppState;
 
@@ -237,13 +237,12 @@ pub async fn worker_scan(
         .target_inspection_shelf_id
         .as_deref()
         .and_then(|s| s.parse::<i64>().ok())
+        && !current.can_access_shelf(tid)
     {
-        if !current.can_access_shelf(tid) {
-            return Err(AppError::biz(
-                crate::shared::error::code::SHELF_MISMATCH,
-                format!("无权限访问 shelf {}", tid),
-            ));
-        }
+        return Err(AppError::biz(
+            crate::shared::error::code::SHELF_MISMATCH,
+            format!("无权限访问 shelf {}", tid),
+        ));
     }
     let mut tx = state.pool.begin().await?;
     // scan（状态翻转 + 写事件日志）
@@ -293,4 +292,286 @@ pub async fn worker_scan(
         scan: scan_out,
         refill: refill_out,
     })))
+}
+
+// ===== Phase PR-CRUD =====
+
+use axum::extract::{Multipart, Query};
+use axum::http::StatusCode;
+use serde_json::json;
+
+use crate::modules::part::dto_crud::{
+    CancelRequest, CompleteRequest, DeliverRequest, PartBatchCreateRequest,
+    PartBatchCreateOut, PartCreateRequest, PartDetailOut, PartListOut,
+    PartListQuery, PartSoftDeleteRequest, PartUpdateRequest, StartRepairRequest,
+};
+use crate::modules::part_file::model::TPartFile;
+
+/// 列表 / 详情 / by-serial 允许角色：4 角色全开放。
+const LIST_PART_ROLES: &[Role] =
+    &[Role::Manager, Role::Clerk, Role::Inspector, Role::CncProgrammer];
+/// CRUD（create / batch-create / update）允许角色：Manager + Clerk。
+const CRUD_PART_ROLES: &[Role] = &[Role::Manager, Role::Clerk];
+
+/// GET /api/v2/parts
+///
+/// 列表查询 + 分页（service 内已校验角色）。
+pub async fn list_parts(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<PartListQuery>,
+) -> Result<Json<R<PartListOut>>, AppError> {
+    current.require_any_role(LIST_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_parts(&mut tx, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/{part_id}
+///
+/// 单件详情。`path` 段 `part_id` 是 i64；service 内 OCC 已用 version 守。
+pub async fn get_part_detail(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+) -> Result<Json<R<PartDetailOut>>, AppError> {
+    current.require_any_role(LIST_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::get_part(&mut tx, part_id, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/by-serial/{serial_no}
+///
+/// 通过序列号查详情（`part.serial_no` 唯一索引）。
+pub async fn get_by_serial(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(serial_no): Path<String>,
+) -> Result<Json<R<PartDetailOut>>, AppError> {
+    current.require_any_role(LIST_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::get_part_by_serial(&mut tx, &serial_no, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts → 201 Created
+///
+/// 单件创建工单。响应只含 `PartDetailOut`（无 `PartCreateResult`，upload
+/// drawing 由独立端点 `/upload-drawing` 处理）。
+pub async fn create_part(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<PartCreateRequest>,
+) -> Result<(StatusCode, Json<R<PartDetailOut>>), AppError> {
+    current.require_any_role(CRUD_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::create_part(&mut tx, &state.snowflake, &req, &current).await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(R::ok(out))))
+}
+
+/// POST /api/v2/parts/batch
+///
+/// 批量创建（共享 `customer_id`）；per-item 失败不中断整体。
+pub async fn batch_create_parts(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<PartBatchCreateRequest>,
+) -> Result<Json<R<PartBatchCreateOut>>, AppError> {
+    current.require_any_role(CRUD_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::batch_create_parts(&mut tx, &state.snowflake, &req, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/update
+///
+/// 字段可选 UPDATE；OCC 通过 `req.version` 守。
+pub async fn update_part(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<PartUpdateRequest>,
+) -> Result<Json<R<PartDetailOut>>, AppError> {
+    current.require_any_role(CRUD_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::update_part(&mut tx, part_id, &req, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/soft-delete
+///
+/// Manager 专属软删；OCC 守；commit 后广播 `PART_SOFT_DELETED`。
+pub async fn soft_delete_part(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<PartSoftDeleteRequest>,
+) -> Result<Json<R<()>>, AppError> {
+    current.require_role(Role::Manager)?;
+    let mut tx = state.pool.begin().await?;
+    PartService::soft_delete_part(
+        &mut tx,
+        &state.snowflake,
+        part_id,
+        req.version,
+        &current,
+    )
+    .await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_SOFT_DELETED".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok_empty()))
+}
+
+/// POST /api/v2/parts/{part_id}/upload-drawing
+///
+/// Multipart 严格校验（Finding F）：
+/// - 必须恰好含一个 `file` 字段；缺字段 / 多 `file` / 未知字段名一律 40001
+/// - 不为 `file` 默认 MIME —— service 层做严格 `application/pdf` 守卫，
+///   客户端忘记设头会得到 21102 `BIZ_PART_FILE_BAD_TYPE`
+///
+/// 权限（Finding B）：先 `require_any_role` 再读 multipart，避免非授权请求
+/// 触发 50 MB 内存分配。
+pub async fn upload_drawing(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    mut multipart: Multipart,
+) -> Result<Json<R<TPartFile>>, AppError> {
+    // Finding B：权限守卫先于 multipart 解析 —— 拒绝未授权请求的内存分配。
+    current.require_any_role(CRUD_PART_ROLES)?;
+    let mut bytes: Option<(Vec<u8>, String, Option<String>)> = None;
+    let mut file_seen = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            // Finding F：拒绝第二个 `file` 字段（40001）。
+            if file_seen {
+                return Err(AppError::validation(
+                    "multipart 包含多个 'file' 字段（仅允许 1 个）",
+                ));
+            }
+            file_seen = true;
+            let fname = field.file_name().unwrap_or("upload.pdf").to_string();
+            // Finding F：不再 `unwrap_or("application/pdf")` 默认 MIME；
+            // 保留客户端提供的原始 content_type（或 None），交给 service 层
+            // 严格比对 `application/pdf`，非 PDF 直接 21102。
+            let ct = field.content_type().map(|m| m.to_string());
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::validation(format!("file 读取失败: {e}")))?
+                .to_vec();
+            bytes = Some((data, fname, ct));
+        } else {
+            // Finding F：未知字段名一律 40001（避免静默接受错位数据）。
+            return Err(AppError::validation(format!(
+                "multipart 未知字段: '{name}'（仅接受 'file'）"
+            )));
+        }
+    }
+    let (data, fname, ct) = bytes
+        .ok_or_else(|| AppError::validation("multipart 缺少 'file' 字段"))?;
+    let ct = ct
+        .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "file 缺少 content_type"))?;
+    let mut tx = state.pool.begin().await?;
+    let pf = PartService::upload_drawing(
+        &mut tx, &state.snowflake, &state, part_id, &data, &fname, &ct, &current,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(pf)))
+}
+
+/// POST /api/v2/parts/{part_id}/deliver
+///
+/// READY_TO_SHIP → DELIVERED；commit 后广播 `PART_DELIVERED`。
+pub async fn deliver(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<DeliverRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    current.require_any_role(CRUD_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::deliver(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_DELIVERED".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/cancel
+///
+/// 5 状态白名单 → CANCELLED；commit 后广播 `PART_CANCELLED`。
+pub async fn cancel(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<CancelRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    current.require_any_role(CRUD_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::cancel(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_CANCELLED".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/complete
+///
+/// DELIVERED → COMPLETED；commit 后广播 `PART_COMPLETED`。
+pub async fn complete(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<CompleteRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    current.require_any_role(CRUD_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::complete(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_COMPLETED".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/start-repair
+///
+/// IN_PROCESS → REPAIRING；commit 后广播 `PART_REPAIR_STARTED`。
+pub async fn start_repair(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<StartRepairRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::start_repair(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_REPAIR_STARTED".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
 }

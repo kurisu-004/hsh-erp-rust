@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_delivery_note (id, delivery_note_no, customer_id, status, version, created_at, updated_at) VALUES ($1, $2, 1, 'DRAFT', 0, now(), now())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2118ac94153ddf31a3f1704e778af169920ee647284d9c1980bc90a113a24d5a"
+}
