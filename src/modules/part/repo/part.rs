@@ -466,14 +466,10 @@ impl PartRepo {
             .await
     }
 
-    /// 在装配体创建事务里同步插入子件。
-    ///
-    /// 与 `create_part` 的差异：
-    /// - 不要求 `request_date`（子件从父装配继承节奏，子件层不强约束）
-    /// - `customer_id` 复用父装配的 customer_id（L2 叶子，由 service 层校验）
-    /// - `unit_price`/`total_price` 默认 0（父装配若有总价，子件价格被锁定，参见
-    ///   `BIZ_ASSEMBLY_CHILD_PRICE_LOCKED` 预留错误码）
-    /// - `status='PENDING'`、`location='OFFICE'`、`version=0`（DB 默认）
+    /// 子件随装配体一起建档；10 个参数都是必填的（id/asm_id/serial 是 3 个主键字段，
+    /// name/quantity/drawing_no/planned_delivery_date/customer_id 是 5 个属性，created_by 是审计字段），
+    /// 没有聚合语义，builder 包装反而是噪音。直接放宽即可。
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_child_for_assembly<'e, E: PgExecutor<'e>>(
         executor: E,
         id: i64,
