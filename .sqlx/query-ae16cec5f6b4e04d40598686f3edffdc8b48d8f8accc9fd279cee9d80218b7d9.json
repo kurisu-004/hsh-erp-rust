@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT quantity AS \"qty!\" FROM t_part_batch WHERE id = $1",
+  "query": "SELECT name FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "qty!",
-        "type_info": "Int4",
+        "name": "name",
+        "type_info": "Varchar",
         "origin": {
           "Table": {
-            "table": "t_part_batch",
-            "name": "quantity"
+            "table": "t_customer",
+            "name": "name"
           }
         }
       }
@@ -24,5 +24,5 @@
       false
     ]
   },
-  "hash": "8d02bde156b72c8cfa5ae547f5282e4d127d76551d1e31f595b042cc05e7a477"
+  "hash": "ae16cec5f6b4e04d40598686f3edffdc8b48d8f8accc9fd279cee9d80218b7d9"
 }
