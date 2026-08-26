@@ -407,11 +407,18 @@ impl WorkerService {
 
         let affected = WorkerRepo::reactivate(&mut *conn, id, current.version, user.id).await?;
         if affected == 0 {
-            // 已激活（deleted_at IS NULL）⇒ 无变化
-            return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                "工人已是激活状态，无需重启",
-            ));
+            // `reactivate` SQL `WHERE version = $2 AND deleted_at IS NOT NULL`：
+            //   - 行已激活（deleted_at IS NULL 且 is_active=true）→ 0 行 = 业务无变化
+            //   - version 在 service 外被并发改写               → 0 行 = OCC 冲突
+            // 用 `include_deleted=true` 重新读一次，按 (is_active, deleted_at) 区分：
+            return if current.is_active && current.deleted_at.is_none() {
+                Err(AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    "工人已是激活状态，无需重启",
+                ))
+            } else {
+                Err(version_conflict())
+            };
         }
 
         Self::get_worker(conn, id, user).await

@@ -4,7 +4,7 @@
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
 //!
 //! Phase P4 worker CRUD 暴露给 service 的能力：
-//! - 读：`get_by_id` / `get_by_badge_code` / `list_by_ids` / `list_with_filters` /
+//! - 读：`get_by_id` / `get_by_badge_code` / `list_with_filters` /
 //!   `count_with_filters` / `count_in_use_parts`
 //! - 写：`create` / `update` / `deactivate` / `reactivate`
 //!
@@ -64,36 +64,6 @@ impl WorkerRepo {
             include_deleted,
         )
         .fetch_optional(executor)
-        .await
-    }
-
-    /// 批量按 id 查（活跃行）。空切片短路返回空 Vec。
-    ///
-    /// 用途：worker.service.list_workers 取所有 work_type_id 后，一次性
-    /// `get_by_id` 拿齐 `work_type.name`，防 N+1。
-    pub async fn list_by_ids<'e, E: PgExecutor<'e>>(
-        executor: E,
-        ids: &[i64],
-        include_deleted: bool,
-    ) -> Result<Vec<TWorker>, sqlx::Error> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        sqlx::query_as!(
-            TWorker,
-            r#"
-            SELECT id, badge_code, name, id_card_no, phone, is_active,
-                   work_type_id, version,
-                   created_at, created_by, updated_at, updated_by, deleted_at
-            FROM t_worker
-            WHERE id = ANY($1)
-              AND ($2::bool OR deleted_at IS NULL)
-            ORDER BY id ASC
-            "#,
-            ids,
-            include_deleted,
-        )
-        .fetch_all(executor)
         .await
     }
 
@@ -191,14 +161,14 @@ impl WorkerRepo {
     /// 部分更新（OCC）：带乐观锁。
     ///
     /// 三态编码：
-    /// - `name` / `id_card_no` / `phone` / `badge_code`：None ⇒ 不修改
-    /// - `work_type_id` 三态编码 `Option<Option<i64>>`：
+    /// - `name` / `badge_code`：二态 `Option<&str>`，None ⇒ 不修改（`COALESCE` 短路），Some ⇒ 改值
+    /// - `id_card_no` / `phone` / `work_type_id`：三态 `Option<Option<T>>`：
     ///   - `None` ⇒ 字段缺省，不修改
     ///   - `Some(None)` ⇒ 显式清空（SET NULL）
     ///   - `Some(Some(v))` ⇒ 改值
     ///
-    /// 注：`badge_code` 三态用 `Option<&str>`（与 name 一致），service 层校验是否撞
-    /// 唯一索引（`uk_t_worker_badge_code`）。
+    /// 注：`badge_code` 为二态（无显式清空语义）；service 层校验是否撞唯一索引
+    /// （`uk_t_worker_badge_code`）。
     #[allow(clippy::too_many_arguments)]
     pub async fn update<'e, E: PgExecutor<'e>>(
         executor: E,
