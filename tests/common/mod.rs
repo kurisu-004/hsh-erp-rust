@@ -182,6 +182,7 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             url: TEST_REDIS_URL.to_string(),
             session_ttl_seconds: 3600,
             pool_max_size: 5,
+            session_check_enabled: true,
         },
         max_request_body_size: 314_572_800,
         auto_complete: AutoCompleteConfig {
