@@ -39,6 +39,7 @@ sqlx = { version = "0.9", features = [
     "macros",
     "chrono",
     "migrate",
+    "rust_decimal",
 ] }
 
 # 序列化与时间
