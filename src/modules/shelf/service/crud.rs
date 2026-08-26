@@ -1,7 +1,6 @@
-//! shelf 域业务逻辑
+//! shelf 域 CRUD service
 //!
-//! 对应 Python myERP/service/shelf_service.py。实施约定：方法签名接收
-//! `&mut PgConnection`，由 handler 开 tx 并 commit。
+//! 列表 / 详情 / 创建 / 更新 / 软删（deactivate）—— 共 5 个端点。
 //!
 //! ## 业务约束（service 层 enforce）
 //! - `zone` ∈ {PRODUCTION, INSPECTION}
@@ -9,31 +8,23 @@
 //! - `deactivate` 等价于 soft-delete：同时 `is_active = false` + `deleted_at = now()`
 //! - `deactivate` 前查 `t_part.current_holder_id = shelf_id` 且
 //!   `status IN ('IN_PROCESS','INSPECTION','REPAIRING')` 引用，>0 ⇒ 20503 拒
-//! - `list_for_return` SHELF_ACCOUNT scope：用 `user.can_access_shelf` 限制可见
-//!   货架集；最低 current_load 标 `is_recommended`
+//!
+//! ## picker 端点
+//! 见同级 `service::picker`（for-return / for-inspection / 全集 process 映射）。
 //!
 //! ## mapping 端点
-//! `set_shelf_processes` / `list_shelf_processes` / `list_all_process_mappings` /
-//! `list_for_return` 中 process_id 映射的子模块职责抽到
-//! `crate::modules::shelf::process_mapping`，避免本文件超 1000 行硬上限。
+//! 见 `crate::modules::shelf::process_mapping`（per-shelf set/list）。
 
 use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::process::repo::ProcessRepo;
 use crate::shared::error::{code, AppError};
 
-use super::dto::*;
-use super::model::TShelf;
-use super::process_mapping::ShelfProcessRepo;
-use super::repo::{ShelfRepo, TShelfWithLoad};
-
-const DEFAULT_LIMIT: i64 = 50;
-const MAX_LIMIT: i64 = 500;
-
-const ZONE_PRODUCTION: &str = "PRODUCTION";
-const ZONE_INSPECTION: &str = "INSPECTION";
+use super::super::dto::*;
+use super::super::model::TShelf;
+use super::super::repo::ShelfRepo;
+use super::{DEFAULT_LIMIT, MAX_LIMIT, ZONE_INSPECTION, ZONE_PRODUCTION};
 
 fn shelf_not_found() -> AppError {
     AppError::biz(code::BIZ_SHELF_NOT_FOUND, "货架不存在")
@@ -305,169 +296,5 @@ impl ShelfService {
             return Err(version_conflict());
         }
         Ok(())
-    }
-
-    // =======================================================================
-    // Picker 端点
-    // =======================================================================
-
-    /// `GET /shelves/for-return?next_process_id=`：PRODUCTION 区活跃货架按
-    /// `current_load` 升序，SHELF_ACCOUNT scope 仅看到 user.shelf_ids 绑定的
-    /// 货架（用 `can_access_shelf`），Manager 见全集；最空货架标 `is_recommended`。
-    ///
-    /// `next_process_id` 仅占位校验：service 校验 process 存在即可（不强制该货架
-    /// 必映射此 process —— picker 前端会把 next_process_id 与候选 shelf 一并
-    /// 提交给 worker-scan，由 worker-scan 在后端强校验）。
-    pub async fn list_for_return(
-        conn: &mut PgConnection,
-        query: &ShelfForReturnQuery,
-        current: &CurrentUser,
-    ) -> Result<ShelfForReturnOut, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::ShelfAccount,
-            Role::CncProgrammer,
-        ])?;
-
-        // 校验 next_process_id 存在（若有）
-        let next_pid_opt = match query.next_process_id.as_deref().map(str::trim) {
-            Some(s) if !s.is_empty() => {
-                let pid = s.parse::<i64>().map_err(|_| {
-                    AppError::biz(
-                        code::BIZ_INVALID_VALUE,
-                        "next_process_id 必须为雪花 ID 字符串",
-                    )
-                })?;
-                if ProcessRepo::get_by_id(&mut *conn, pid, false).await?.is_none() {
-                    return Err(AppError::biz(
-                        code::BIZ_PROCESS_NOT_FOUND,
-                        format!("process {pid} 不存在"),
-                    ));
-                }
-                Some(pid)
-            }
-            _ => None,
-        };
-        let _ = next_pid_opt; // 占位校验（service 契约）
-
-        // SHELF_ACCOUNT scope：先按 user.shelf_ids 收窄。
-        // 策略：拉全集 → 过滤 → 按 current_load 排序（统一一次拉取，避免 ORDER BY
-        // 在 PG 与 filter 在 app 不同步；量小，几十条以内）。
-        let all = ShelfRepo::list_active_production_ordered(&mut *conn).await?;
-        let scoped: Vec<TShelfWithLoad> = if current.shelf_wildcard || current.has_role(Role::Manager)
-        {
-            all
-        } else {
-            all.into_iter()
-                .filter(|s| current.can_access_shelf(s.id))
-                .collect()
-        };
-
-        let mut items: Vec<ShelfForReturnItem> = scoped
-            .into_iter()
-            .map(|s| ShelfForReturnItem {
-                id: s.id,
-                code: s.code,
-                name: s.name,
-                zone: s.zone,
-                location: s.location,
-                current_load: s.current_load,
-                is_recommended: false, // 后面再标
-            })
-            .collect();
-
-        // 第一条 = 最低 current_load ⇒ is_recommended
-        if let Some(first) = items.first_mut() {
-            first.is_recommended = true;
-        }
-
-        Ok(ShelfForReturnOut { items })
-    }
-
-    /// `GET /shelves/for-inspection`：仅 `zone='INSPECTION' AND is_active=true`。
-    /// 不过滤 SHELF_ACCOUNT scope（品检架通常由全员可见）。
-    pub async fn list_for_inspection(
-        conn: &mut PgConnection,
-        current: &CurrentUser,
-    ) -> Result<ShelfForInspectionOut, AppError> {
-        // 任意已登录
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::ShelfAccount,
-            Role::Inspector,
-        ])?;
-
-        // 直接复用 list_with_filters，zone='INSPECTION' AND is_active=true
-        let shelves = ShelfRepo::list_with_filters(
-            &mut *conn,
-            None,
-            Some(ZONE_INSPECTION),
-            Some(true),
-            MAX_LIMIT,
-            0,
-        )
-        .await?;
-        let items = shelves
-            .into_iter()
-            .map(|s| ShelfForInspectionItem {
-                id: s.id,
-                code: s.code,
-                name: s.name,
-                zone: s.zone,
-                location: s.location,
-                is_active: s.is_active,
-            })
-            .collect();
-        Ok(ShelfForInspectionOut { items })
-    }
-
-    // =======================================================================
-    // mapping 端点（per-shelf + 全集）
-    // =======================================================================
-
-    /// `GET /shelves/processes`：所有 active shelf 的全部 mapping，单条 SQL
-    /// JOIN（防 N+1）。任意已登录可调。
-    pub async fn list_all_process_mappings(
-        conn: &mut PgConnection,
-        current: &CurrentUser,
-    ) -> Result<AllShelfProcessMappingOut, AppError> {
-        current.require_any_role(&[
-            Role::Manager,
-            Role::Clerk,
-            Role::CncProgrammer,
-            Role::ShelfAccount,
-            Role::Inspector,
-        ])?;
-
-        let rows = ShelfProcessRepo::list_all_active_mappings(&mut *conn).await?;
-
-        // SHELF_ACCOUNT scope：仅保留 user.shelf_ids 命中的映射
-        let items: Vec<AllShelfProcessMappingItem> = if current.shelf_wildcard
-            || current.has_role(Role::Manager)
-        {
-            rows.into_iter()
-                .map(|(sid, pid, sc, pc)| AllShelfProcessMappingItem {
-                    shelf_id: sid,
-                    shelf_code: sc,
-                    process_id: pid,
-                    process_code: pc,
-                })
-                .collect()
-        } else {
-            rows.into_iter()
-                .filter(|(sid, _, _, _)| current.can_access_shelf(*sid))
-                .map(|(sid, pid, sc, pc)| AllShelfProcessMappingItem {
-                    shelf_id: sid,
-                    shelf_code: sc,
-                    process_id: pid,
-                    process_code: pc,
-                })
-                .collect()
-        };
-
-        Ok(AllShelfProcessMappingOut { items })
     }
 }
