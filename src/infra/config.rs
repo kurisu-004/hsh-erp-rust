@@ -112,7 +112,7 @@ impl AppConfig {
                 interval_hours: env_parse("AUTO_COMPLETE_INTERVAL_HOURS", 24)?,
             },
 
-redis: RedisConfig {
+            redis: RedisConfig {
                 url: build_redis_url(),
                 // 默认 12h，对齐 JWT_ACCESS_TOKEN_EXPIRE_HOURS=24 的常见一半；
                 // Redis 滑动 TTL 在 extractor 中 EXPIRE 续期

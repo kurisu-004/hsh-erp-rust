@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(RedisSessionStore::new(redis_pool))
     } else {
         info!("REDIS_SESSION_CHECK_ENABLED=false，跳过 Redis 连接，使用 NoopSessionStore");
-        Arc::new(NoopSessionStore)
+        Arc::new(NoopSessionStore::new())
     };
 
     // 7. 优雅退出令牌

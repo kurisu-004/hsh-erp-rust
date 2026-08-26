@@ -14,7 +14,7 @@
 //!
 //! Router 的 state 类型必须是 `Arc<AppState>`（main.rs 已设置）。
 //!
-//! ## 服务端 session 校验
+//! ## 服务端 session 校验（可关闭）
 //! 每次解析都查 Redis `session:tok:<sha256(token)>`：
 //! - 不存在 → `SESSION_REVOKED`（40105），强制重新登录
 //! - 存在但 `user_id` 与 JWT claims 不一致 → `SESSION_REVOKED`
