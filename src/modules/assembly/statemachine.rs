@@ -22,6 +22,9 @@ pub enum AssemblyStatus {
 }
 
 impl AssemblyStatus {
+    /// Domain-specific parser: returns `None` for unknown labels (vs. `FromStr`'s `Result<Self, Infallible>`).
+    /// Different from std `str::parse::<Self>()` — not a public API surface.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "PENDING" => Some(Self::PENDING),
