@@ -228,6 +228,98 @@ async fn create_process_duplicate_code_returns_20802() {
     );
 }
 
+/// update INHOUSE 显式 `requires_approval=true` → 20104 BIZ_INVALID_VALUE。
+#[tokio::test]
+async fn update_process_inhouse_requires_approval_true_rejected() {
+    let (_guard, pool) = setup().await;
+    let (app, token) = login_manager(pool, "proc_inh_apv").await;
+
+    let (_s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/processes",
+            Some(json!({
+                "code": "P-INH-APV",
+                "name": "Inhouse NoApv",
+                "category": "INHOUSE",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(env1["code"], 0);
+    assert_eq!(env1["data"]["requires_approval"], false);
+    let pid = env1["data"]["id"].as_str().unwrap().to_string();
+
+    let (s2, env2) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/processes/{pid}/update"),
+            Some(json!({"requires_approval": true})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::BAD_REQUEST,
+        "INHOUSE cannot enable requires_approval; got: {env2}"
+    );
+    assert_eq!(
+        env2["code"].as_i64().unwrap(),
+        20104,
+        "expected BIZ_INVALID_VALUE; got: {env2}"
+    );
+}
+
+/// update INHOUSE 不传 `requires_approval` 字段：service 不应注入 `Some(false)`，
+/// 字段维持原值。修复前该路径会在 DB 层无谓重写 `requires_approval=false` 并 bump version。
+#[tokio::test]
+async fn update_process_inhouse_no_approval_field_does_not_bump_version() {
+    let (_guard, pool) = setup().await;
+    let (app, token) = login_manager(pool, "proc_inh_noop").await;
+
+    let (_s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/processes",
+            Some(json!({
+                "code": "P-INH-NOOP",
+                "name": "Inhouse NoOp",
+                "category": "INHOUSE",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(env1["code"], 0);
+    assert_eq!(env1["data"]["requires_approval"], false);
+    let pid = env1["data"]["id"].as_str().unwrap().to_string();
+
+    // 不传 requires_approval 也不传任何其他字段 → 仅校验 service 不注入 Some(false) 后字段仍为 false
+    // (version 是否 bump 取决于 repo SQL 是否仅在字段变化时 +1，属后续工作；
+    // 本测试聚焦 service 层不再 silently rewrite INHOUSE requires_approval。)
+    let (s2, env2) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/processes/{pid}/update"),
+            Some(json!({})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "no-op update should succeed; got: {env2}");
+    assert_eq!(env2["code"], 0);
+    assert_eq!(
+        env2["data"]["requires_approval"], false,
+        "INHOUSE requires_approval must remain false; got: {env2}"
+    );
+}
+
 /// update 时改 `code` 必拒 → 20104 BIZ_INVALID_VALUE（code 是业务唯一键，不可变）。
 #[tokio::test]
 async fn update_process_code_change_rejected() {

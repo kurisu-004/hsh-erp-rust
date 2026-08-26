@@ -4,7 +4,7 @@
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
 //!
 //! Phase P2 process CRUD 暴露给 service 的能力：
-//! - 读：`get_by_id` / `get_by_code` / `list_by_ids`
+//! - 读：`get_by_id` / `get_by_code`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder，防 N+1）
 //! - 写：`create` / `update` / `soft_delete`
 //! - 引用计数：`count_process_references`（软删前查引用，best-effort）
@@ -60,28 +60,6 @@ impl ProcessRepo {
             code,
         )
         .fetch_optional(executor)
-        .await
-    }
-
-    pub async fn list_by_ids<'e, E: PgExecutor<'e>>(
-        executor: E,
-        ids: &[i64],
-    ) -> Result<Vec<TProcess>, sqlx::Error> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        sqlx::query_as!(
-            TProcess,
-            r#"
-            SELECT id, code, name, category, sort_order, description, version,
-                   created_at, created_by, updated_at, updated_by, deleted_at,
-                   requires_approval
-            FROM t_process
-            WHERE id = ANY($1) AND deleted_at IS NULL
-            "#,
-            ids,
-        )
-        .fetch_all(executor)
         .await
     }
 

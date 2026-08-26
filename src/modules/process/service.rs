@@ -4,7 +4,8 @@
 //! `&mut PgConnection`，由 handler 开 tx 并 commit。
 //!
 //! ## 业务约束（service 层 enforce）
-//! - INHOUSE 强制 `requires_approval = false`（与 Python `_assert_inhouse_no_approval` 对齐）
+//! - INHOUSE：create 强制 `requires_approval = false`（与 Python `_assert_inhouse_no_approval` 对齐）；
+//!   update 禁止显式置 true（20104），允许显式置 false，缺省（None）不动
 //! - OUTSOURCE 保留请求值（默认 `true`）
 //! - `code` 业务唯一键，update 不允许改
 //! - 软删前查 `t_work_type_process` + `t_outsource_company_process` +
@@ -238,12 +239,15 @@ impl ProcessService {
             }
         };
 
-        // requires_approval：INHOUSE 强制 false；其他情况尊重请求值（None 不改）
-        let requires_approval_update: Option<bool> = if current.category == CATEGORY_INHOUSE {
-            Some(false)
-        } else {
-            req.requires_approval
-        };
+        // requires_approval：INHOUSE 禁止开启（Some(true) ⇒ 拒），允许显式确认 false；
+        // 其他情况（含 OUTSOURCE）尊重请求值；None ⇒ 不改（避免与 INHOUSE 当前值无谓重写）。
+        if current.category == CATEGORY_INHOUSE && req.requires_approval == Some(true) {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                "INHOUSE 工序不允许开启 requires_approval",
+            ));
+        }
+        let requires_approval_update: Option<bool> = req.requires_approval;
 
         let affected = ProcessRepo::update(
             &mut *conn,
