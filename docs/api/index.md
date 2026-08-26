@@ -5,6 +5,7 @@
 > 后端代码变更（**新增 / 修改 / 删除端点**，或**修改 DTO 字段 / 错误码**）后，必须**立即**更新对应模块文件：
 > - [`./auth.md`](./auth.md) — auth 域
 > - [`./users.md`](./users.md) — users 域
+> - [`./applicants.md`](./applicants.md) — applicant 域（申请人 CRUD）
 > - [`./parts.md`](./parts.md) — part 域（part-pass-inspection 批量+单件 / scan-inspect / fail-inspection / **worker-scan**）
 > - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove**）
 > - [`./delivery-notes.md`](./delivery-notes.md) — delivery_notes 域
@@ -145,6 +146,7 @@ HTTP 状态码：
 |---|---|---|---|
 | auth | [`./auth.md`](./auth.md) | 5 | ✅ 完全上线 |
 | users | [`./users.md`](./users.md) | 9 | ✅ 完全上线 |
+| applicant | [`./applicants.md`](./applicants.md) | 5 | ✅ 完全上线（2026-08-26） |
 | part | [`./parts.md`](./parts.md) | 6 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回、worker-scan（2026-08-25） |
 | worker_pool | [`./worker-pool.md`](./worker-pool.md) | 3 | 🟢 state + admin refill/remove + worker-scan 联动（2026-08-25） |
 | delivery-notes | [`./delivery-notes.md`](./delivery-notes.md) | 18 | ✅ 完全上线（P1–P4） |
@@ -159,7 +161,6 @@ HTTP 状态码：
 | 域 | 路由前缀 | 状态 |
 |---|---|---|
 | `customer` | `/api/v2/customers` | 路由已 nest 但 handler 空 → 全部 404 |
-| `applicant` | `/api/v2/applicants` | 同上 |
 | `worker` | `/api/v2/workers` | 同上 |
 | `work_type` | `/api/v2/work-types` | 同上 |
 | `process` | `/api/v2/processes` | 同上 |
