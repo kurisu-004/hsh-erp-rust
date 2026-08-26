@@ -297,7 +297,14 @@ impl CustomerService {
             prefix_update,
             user.id,
         )
-        .await?;
+        .await
+        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+            // uq_t_customer_root_prefix：把 L1 的 prefix 改成另一个 L1 已占用的值
+            Some("23505") => {
+                AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 已存在")
+            }
+            _ => AppError::from(e),
+        })?;
         if affected == 0 {
             return Err(version_conflict());
         }

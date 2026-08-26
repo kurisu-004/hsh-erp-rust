@@ -182,3 +182,64 @@ async fn create_customer_root_then_l2_then_soft_delete_in_use() {
         "expected BIZ_CUSTOMER_IN_USE; got envelope: {env3}"
     );
 }
+
+#[tokio::test]
+async fn update_customer_serial_prefix_collision_returns_20104() {
+    let (_guard, pool) = setup().await;
+    let (app, token) = login_manager(pool.clone(), "cust_prefix").await;
+
+    // Create two L1 customers with distinct serial_prefix values.
+    let (_s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/customers",
+            Some(json!({"name": "Alpha", "serial_prefix": "A"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(env1["code"], 0);
+    let l1_a_id = env1["data"]["id"].as_str().unwrap().to_string();
+
+    let (_s2, env2) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/customers",
+            Some(json!({"name": "Bravo", "serial_prefix": "B"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(env2["code"], 0);
+
+    // Try to rename A → "B". uq_t_customer_root_prefix fires → 23505 → 20104.
+    let (s3, env3) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/customers/{l1_a_id}/update"),
+            Some(json!({"serial_prefix": "B"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s3,
+        StatusCode::BAD_REQUEST,
+        "duplicate-prefix update should return 400 BIZ_INVALID_VALUE; got {env3}"
+    );
+    assert_eq!(
+        env3["code"].as_i64().unwrap(),
+        20104,
+        "expected BIZ_INVALID_VALUE (20104); got envelope: {env3}"
+    );
+    assert!(
+        env3["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("serial_prefix 已存在"),
+        "expected message to contain 'serial_prefix 已存在'; got: {env3}"
+    );
+}
