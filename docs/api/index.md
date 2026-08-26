@@ -86,6 +86,10 @@ HTTP 状态码：
   （清整个用户 Set `sessions:user:<id>`）都会触发吊销。前端拿到 40105 应清本地
   token 并跳回登录页。session 条目默认 TTL 12h，每次成功访问会 EXPIRE 续期（滑动窗口）。
 
+> ⚠️ 当 `REDIS_SESSION_CHECK_ENABLED=false` 时（迁移过渡期），extractor 不查 Redis，
+> 40105 SESSION_REVOKED 不会再触发；session 写入也走 no-op store。
+> 见 `docs/api/auth.md` 末段。
+
 ### 五角色 RBAC
 
 来源：`src/auth/rbac.rs::Role`

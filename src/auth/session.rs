@@ -248,3 +248,62 @@ impl SessionStore for RedisSessionStore {
         Ok(updated)
     }
 }
+
+/// No-op 实现：用 Rust 自签 JWT 但借用 Python myERP 用户库的过渡期可关
+/// 闭服务端的 session 真相源（迁移早期，access token 的吊销完全依赖 JWT
+/// 短 TTL + refresh token）。所有写入和读取都是 no-op；extractor 中通过
+/// `state.config.redis.session_check_enabled` gate，**完全不会调到**这些
+/// 实现，但 trait 仍要求实现以保持 `Arc<dyn SessionStore>` 类型一致。
+pub struct NoopSessionStore;
+
+impl NoopSessionStore {
+    /// 单元构造：保持与 `RedisSessionStore::new(pool)` 同形调用风格。
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for NoopSessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl SessionStore for NoopSessionStore {
+    async fn create_session(
+        &self,
+        _token_hash: &str,
+        _user_id: i64,
+        _kind: TokenKind,
+        _ttl_seconds: u64,
+        _cached: &CachedCurrentUser,
+    ) -> Result<(), AppError> {
+        // 借用 Python JWT 时不该有写入；打 warn 以便误用时可见
+        tracing::warn!("NoopSessionStore::create_session 被调用（REDIS_SESSION_CHECK_ENABLED=false）");
+        Ok(())
+    }
+
+    async fn get_session(
+        &self,
+        _token_hash: &str,
+    ) -> Result<Option<CachedSession>, AppError> {
+        Ok(None)
+    }
+
+    async fn delete_session(&self, _token_hash: &str) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn delete_all_user_sessions(&self, _user_id: i64) -> Result<(), AppError> {
+        Ok(())
+    }
+
+    async fn touch_session(
+        &self,
+        _token_hash: &str,
+        _ttl_seconds: u64,
+    ) -> Result<bool, AppError> {
+        Ok(false)
+    }
+}

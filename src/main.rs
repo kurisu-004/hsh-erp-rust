@@ -17,7 +17,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
+use hsh_erp_rust::auth::session::{NoopSessionStore, RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::AppConfig;
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos};
 use hsh_erp_rust::infra::db;
@@ -65,9 +65,15 @@ async fn main() -> anyhow::Result<()> {
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
 
     // 6.5 Redis 连接池 + 服务端 session 存储
-    let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
-    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool));
-    info!("Redis session 存储已就绪");
+    // 关掉后使用 NoopSessionStore（不连 Redis）；适用于 Rust 借 Python JWT 的迁移过渡期
+    let session: Arc<dyn SessionStore> = if config.redis.session_check_enabled {
+        let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
+        info!("Redis session 存储已就绪");
+        Arc::new(RedisSessionStore::new(redis_pool))
+    } else {
+        info!("REDIS_SESSION_CHECK_ENABLED=false，跳过 Redis 连接，使用 NoopSessionStore");
+        Arc::new(NoopSessionStore::new())
+    };
 
     // 7. 优雅退出令牌
     let shutdown = CancellationToken::new();

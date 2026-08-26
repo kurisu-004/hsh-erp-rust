@@ -31,6 +31,11 @@ pub struct RedisConfig {
     pub session_ttl_seconds: u64,
     /// 连接池上限
     pub pool_max_size: usize,
+    /// 是否在 extractor 中校验 Redis 服务端 session。
+    /// 关掉后，main.rs 不建连接池；所有 session 写入走 no-op store；
+    /// 适用于 Rust 借 Python JWT 的迁移过渡期。
+    /// 环境变量 `REDIS_SESSION_CHECK_ENABLED`，缺省 `true`。
+    pub session_check_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -107,12 +112,13 @@ impl AppConfig {
                 interval_hours: env_parse("AUTO_COMPLETE_INTERVAL_HOURS", 24)?,
             },
 
-redis: RedisConfig {
+            redis: RedisConfig {
                 url: build_redis_url(),
                 // 默认 12h，对齐 JWT_ACCESS_TOKEN_EXPIRE_HOURS=24 的常见一半；
                 // Redis 滑动 TTL 在 extractor 中 EXPIRE 续期
                 session_ttl_seconds: env_parse("REDIS_SESSION_TTL_SECONDS", 43_200u64)?,
                 pool_max_size: env_parse("REDIS_POOL_MAX_SIZE", 10usize)?,
+                session_check_enabled: env_bool("REDIS_SESSION_CHECK_ENABLED", true)?,
             },
             delivery_note_template_dir: PathBuf::from(env_or(
                 "DELIVERY_NOTE_TEMPLATE_DIR",
@@ -190,6 +196,19 @@ fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
         Ok(s) => s
             .parse()
             .map_err(|_| anyhow!("环境变量 {key} 解析失败：{s}")),
+        Err(_) => Ok(default),
+    }
+}
+
+/// 从环境变量读 bool。接受 "true"/"false"/"1"/"0"（大小写不敏感）；
+/// 缺省返回 `default`；其余值 → anyhow 错误。
+fn env_bool(key: &str, default: bool) -> Result<bool> {
+    match env::var(key) {
+        Ok(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            other => Err(anyhow!("环境变量 {key} 无法解析为 bool: {other:?}")),
+        },
         Err(_) => Ok(default),
     }
 }
