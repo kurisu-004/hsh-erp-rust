@@ -15,26 +15,26 @@
 
 ## 端点列表
 
-| Method | Path | 权限 | 说明 |
-|---|---|---|---|
-| GET | `/api/v2/delivery-notes/batch-detail` | 已登录 | 批量详情（按 id 列表，复用 `DeliveryNoteDetail`） |
-| POST | `/api/v2/delivery-notes/scan` | Manager / Clerk / Inspector | P3 扫码建单（find-or-create 草稿） |
-| GET | `/api/v2/delivery-notes/candidate-parts` | 已登录 | 候选入单零件（INSPECTION/READY_TO_SHIP） |
-| GET | `/api/v2/delivery-notes/pickup-pending` | 已登录 | 待司机领取一览 |
-| GET | `/api/v2/delivery-notes` | 已登录 | 列表（带过滤分页） |
-| POST | `/api/v2/delivery-notes` | 已登录 | 创建草稿（可同时入件） |
-| GET | `/api/v2/delivery-notes/{id}` | 已登录 | 详情（head + line_items + scanned_serials） |
-| GET | `/api/v2/delivery-notes/{id}/events` | 已登录 | 事件时间线 |
-| POST | `/api/v2/delivery-notes/{id}/update` | 已登录（DRAFT/SUBMITTED） | partial update（OCC） |
-| POST | `/api/v2/delivery-notes/{id}/add-parts` | 已登录（DRAFT） | 加件（OCC） |
-| POST | `/api/v2/delivery-notes/{id}/remove-parts` | 已登录（DRAFT） | 移除件（OCC） |
-| POST | `/api/v2/delivery-notes/{id}/submit` | 已登录 | DRAFT → SUBMITTED（OCC） |
-| POST | `/api/v2/delivery-notes/{id}/recall` | 已登录 | SUBMITTED → DRAFT（OCC） |
-| POST | `/api/v2/delivery-notes/{id}/pickup-scan` | 已登录 | 拣货扫描（验证 part_serial 在本单） |
-| POST | `/api/v2/delivery-notes/{id}/pickup` | 已登录 | SUBMITTED → PICKED_UP（OCC + 司机） |
-| POST | `/api/v2/delivery-notes/{id}/soft-delete` | 已登录（仅 DRAFT） | 软删（OCC） |
-| POST | `/api/v2/delivery-notes/{id}/print` | Manager / Clerk / Inspector | P4 打印送货单 xlsx |
-| POST | `/api/v2/delivery-notes/{id}/print-labels` | Manager / Clerk / Inspector | P4 打印标签 xlsx |
+| Method | Path | 权限 | 说明 | 详情 |
+|---|---|---|---|---|
+| GET | `/api/v2/delivery-notes/batch-detail` | 已登录 | 批量详情（按 id 列表，复用 `DeliveryNoteDetail`） | [`queries.md`](./queries.md#get-apiv2delivery-notesbatch-detail) |
+| POST | `/api/v2/delivery-notes/scan` | Manager / Clerk / Inspector | P3 扫码建单（find-or-create 草稿） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesscan--p3-扫码建单) |
+| GET | `/api/v2/delivery-notes/candidate-parts` | 已登录 | 候选入单零件（INSPECTION/READY_TO_SHIP） | [`queries.md`](./queries.md#get-apiv2delivery-notescandidate-parts) |
+| GET | `/api/v2/delivery-notes/pickup-pending` | 已登录 | 待司机领取一览 | [`queries.md`](./queries.md#get-apiv2delivery-notespickup-pending) |
+| GET | `/api/v2/delivery-notes` | 已登录 | 列表（带过滤分页） | [`queries.md`](./queries.md#get-apiv2delivery-notes) |
+| POST | `/api/v2/delivery-notes` | 已登录 | 创建草稿（可同时入件） | [`drafts.md`](./drafts.md#post-apiv2delivery-notes) |
+| GET | `/api/v2/delivery-notes/{id}` | 已登录 | 详情（head + line_items + scanned_serials） | [`queries.md`](./queries.md#get-apiv2delivery-notesid) |
+| GET | `/api/v2/delivery-notes/{id}/events` | 已登录 | 事件时间线 | [`queries.md`](./queries.md#get-apiv2delivery-notesidevents) |
+| POST | `/api/v2/delivery-notes/{id}/update` | 已登录（DRAFT/SUBMITTED） | partial update（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidupdate) |
+| POST | `/api/v2/delivery-notes/{id}/add-parts` | 已登录（DRAFT） | 加件（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidadd-parts) |
+| POST | `/api/v2/delivery-notes/{id}/remove-parts` | 已登录（DRAFT） | 移除件（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidremove-parts) |
+| POST | `/api/v2/delivery-notes/{id}/submit` | 已登录 | DRAFT → SUBMITTED（OCC） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidsubmit) |
+| POST | `/api/v2/delivery-notes/{id}/recall` | 已登录 | SUBMITTED → DRAFT（OCC） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidrecall) |
+| POST | `/api/v2/delivery-notes/{id}/pickup-scan` | 已登录 | 拣货扫描（验证 part_serial 在本单） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidpickup-scan) |
+| POST | `/api/v2/delivery-notes/{id}/pickup` | 已登录 | SUBMITTED → PICKED_UP（OCC + 司机） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidpickup) |
+| POST | `/api/v2/delivery-notes/{id}/soft-delete` | 已登录（仅 DRAFT） | 软删（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidsoft-delete) |
+| POST | `/api/v2/delivery-notes/{id}/print` | Manager / Clerk / Inspector | P4 打印送货单 xlsx | [`print.md`](./print.md#post-apiv2delivery-notesidprint--p4-打印) |
+| POST | `/api/v2/delivery-notes/{id}/print-labels` | Manager / Clerk / Inspector | P4 打印标签 xlsx | [`print.md`](./print.md#post-apiv2delivery-notesidprint-labels--p4-标签打印) |
 
 ---
 

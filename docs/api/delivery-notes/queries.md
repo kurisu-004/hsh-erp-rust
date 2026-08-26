@@ -5,6 +5,15 @@
 >
 > **导航**：[`index.md`](./index.md) · **`queries.md`** · [`drafts.md`](./drafts.md) · [`workflow.md`](./workflow.md) · [`print.md`](./print.md)
 
+## 本文件目录
+
+1. [GET /api/v2/delivery-notes/batch-detail](#get-apiv2delivery-notesbatch-detail)
+2. [GET /api/v2/delivery-notes/candidate-parts](#get-apiv2delivery-notescandidate-parts)
+3. [GET /api/v2/delivery-notes/pickup-pending](#get-apiv2delivery-notespickup-pending)
+4. [GET /api/v2/delivery-notes](#get-apiv2delivery-notes)
+5. [GET /api/v2/delivery-notes/{id}](#get-apiv2delivery-notesid)
+6. [GET /api/v2/delivery-notes/{id}/events](#get-apiv2delivery-notesidevents)
+
 ---
 
 ### `GET /api/v2/delivery-notes/batch-detail`

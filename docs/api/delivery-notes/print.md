@@ -5,6 +5,11 @@
 >
 > **导航**：[`index.md`](./index.md) · [`queries.md`](./queries.md) · [`drafts.md`](./drafts.md) · [`workflow.md`](./workflow.md) · **`print.md`**
 
+## 本文件目录
+
+1. [POST /api/v2/delivery-notes/{id}/print (P4 打印)](#post-apiv2delivery-notesidprint--p4-打印)
+2. [POST /api/v2/delivery-notes/{id}/print-labels (P4 标签打印)](#post-apiv2delivery-notesidprint-labels--p4-标签打印)
+
 ---
 
 ### `POST /api/v2/delivery-notes/{id}/print`  （P4 打印）

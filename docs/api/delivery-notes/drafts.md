@@ -5,6 +5,15 @@
 >
 > **导航**：[`index.md`](./index.md) · [`queries.md`](./queries.md) · **`drafts.md`** · [`workflow.md`](./workflow.md) · [`print.md`](./print.md)
 
+## 本文件目录
+
+1. [POST /api/v2/delivery-notes/scan (P3 扫码建单)](#post-apiv2delivery-notesscan--p3-扫码建单)
+2. [POST /api/v2/delivery-notes](#post-apiv2delivery-notes)
+3. [POST /api/v2/delivery-notes/{id}/update](#post-apiv2delivery-notesidupdate)
+4. [POST /api/v2/delivery-notes/{id}/add-parts](#post-apiv2delivery-notesidadd-parts)
+5. [POST /api/v2/delivery-notes/{id}/remove-parts](#post-apiv2delivery-notesidremove-parts)
+6. [POST /api/v2/delivery-notes/{id}/soft-delete](#post-apiv2delivery-notesidsoft-delete)
+
 ---
 
 ### `POST /api/v2/delivery-notes/scan`  （P3 扫码建单）
