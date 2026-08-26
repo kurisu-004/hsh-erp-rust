@@ -5,10 +5,11 @@
 > 后端代码变更（**新增 / 修改 / 删除端点**，或**修改 DTO 字段 / 错误码**）后，必须**立即**更新对应模块文件：
 > - [`./auth.md`](./auth.md) — auth 域
 > - [`./users.md`](./users.md) — users 域
-> - [`./customers.md`](./customers.md) — customers 域（L1/L2 CRUD）
-> - [`./processes.md`](./processes.md) — processes 域（INHOUSE/OUTSOURCE CRUD）
-> - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker + mapping）
-> - [`./workers.md`](./workers.md) — workers 域（CRUD + verify-badge + deactivate/reactivate）
+> - [`./applicants.md`](./applicants.md) — applicant 域（申请人 CRUD，2026-08-26）
+> - [`./customers.md`](./customers.md) — customers 域（L1/L2 CRUD，2026-08-26）
+> - [`./processes.md`](./processes.md) — processes 域（INHOUSE/OUTSOURCE CRUD，2026-08-26）
+> - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker + mapping，2026-08-26）
+> - [`./workers.md`](./workers.md) — workers 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26）
 > - [`./work-types.md`](./work-types.md) — work_types 域（CRUD + process mapping + 三态更新，2026-08-26）
 > - [`./parts.md`](./parts.md) — part 域（part-pass-inspection 批量+单件 / scan-inspect / fail-inspection / **worker-scan**）
 > - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove**）
@@ -150,6 +151,7 @@ HTTP 状态码：
 |---|---|---|---|
 | auth | [`./auth.md`](./auth.md) | 5 | ✅ 完全上线 |
 | users | [`./users.md`](./users.md) | 9 | ✅ 完全上线 |
+| applicants | [`./applicants.md`](./applicants.md) | 5 | ✅ 完全上线（CRUD + L1 customer 校验 + OCC，2026-08-26） |
 | customers | [`./customers.md`](./customers.md) | 5 | ✅ 完全上线（CRUD + L1/L2 + OCC，2026-08-26） |
 | processes | [`./processes.md`](./processes.md) | 5 | ✅ 完全上线（CRUD + INHOUSE no-approval + 引用校验，2026-08-26） |
 | shelves | [`./shelves.md`](./shelves.md) | 11 | ✅ 完全上线（CRUD + picker + mapping，2026-08-26） |
@@ -168,7 +170,6 @@ HTTP 状态码：
 
 | 域 | 路由前缀 | 状态 |
 |---|---|---|
-| `applicant` | `/api/v2/applicants` | 路由已 nest 但 handler 空 → 全部 404 |
 | `part` | `/api/v2/parts` | 同上 |
 | `assembly` | `/api/v2/assemblies` | 同上 |
 | `cnc_program` | `/api/v2/cnc-programs` | 同上 |

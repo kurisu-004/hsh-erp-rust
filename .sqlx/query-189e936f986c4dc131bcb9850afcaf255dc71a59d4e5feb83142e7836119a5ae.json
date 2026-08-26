@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_applicant\n                 (id, name, customer_id, version, created_at, created_by, updated_at, updated_by)\n               VALUES ($1, $2, $3, 0, now(), $4, now(), $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "189e936f986c4dc131bcb9850afcaf255dc71a59d4e5feb83142e7836119a5ae"
+}
