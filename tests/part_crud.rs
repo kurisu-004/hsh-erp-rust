@@ -1281,7 +1281,7 @@ async fn start_repair_wrong_state_400() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "start-repair wrong state: {env}");
-    assert_eq!(env["code"], 20117, "BIZ_PART_REPAIR_NOT_TRIGGERED: {env}");
+    assert_eq!(env["code"], 20118, "BIZ_PART_REPAIR_NOT_TRIGGERED: {env}");
 }
 
 /// POST /parts/{id}/deliver —— CANCELLED 状态 → 20115 BIZ_PART_ALREADY_CANCELLED (409)。
