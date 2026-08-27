@@ -8,7 +8,7 @@
 > - `POST /admin/.../refill` —— Manager 主动触发「为某 worker 抢满 max_held」
 > - `POST /admin/.../remove` —— Manager 把 worker 持有批次按 RETURNED 语义放回池
 >
-> worker-scan 主入口 `POST /api/v2/parts/worker-scan` 见 [`./parts.md`](./parts.md)；worker-scan 成功后**同事务**触发 `refill_for_worker`，见 §WS 广播。
+> worker-scan 主入口 `POST /api/v2/parts/worker-scan` 见 [`./parts/index.md`](./parts/index.md)；worker-scan 成功后**同事务**触发 `refill_for_worker`，见 §WS 广播。
 
 ## 端点列表
 

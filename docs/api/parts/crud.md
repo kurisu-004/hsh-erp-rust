@@ -42,7 +42,7 @@ Response 200 `data`：`PartListOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `items` | [PartListItem](#partlistitem-字段)[] | 含 TPart 完整列 + `customer_name` / `l1_customer_name` 冗余 |
+| `items` | [PartListItem](./index.md#partlistitem-字段)[] | 含 TPart 完整列 + `customer_name` / `l1_customer_name` 冗余 |
 | `total` | string (i64) | 满足过滤的总数（与 `items` 解耦，便于前端独立显示） |
 | `limit` | string (i64) | 实际生效的 limit |
 | `offset` | string (i64) | 实际生效的 offset |
@@ -70,7 +70,7 @@ Request：`PartCreateRequest`
 | `system_delivery_date` | date? | — | 系统派工日 |
 | `note` | string? | — | 备注 |
 
-Response 201 `data`：[`PartDetailOut`](#partdetailout-字段) — 含 TPart 完整列 + 客户冗余 + `current_batch_id`。
+Response 201 `data`：[`PartDetailOut`](./index.md#partdetailout-字段) — 含 TPart 完整列 + 客户冗余 + `current_batch_id`。
 
 错误码：40001（字段空 / quantity≤0）、40300（角色不符）、20105（customer 不存在）。
 
@@ -83,14 +83,14 @@ Request：
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `customer_id` | string (i64) | ✓ | 批量共享的二级客户 id |
-| `items` | [PartBatchCreateItem](#partbatchcreateitem-字段)[] | ✓ | 1..=200；每件独立校验 |
+| `items` | `PartBatchCreateItem`[] | ✓ | 1..=200；每件独立校验 |
 
 Response 200 `data`：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `created` | [PartDetailOut](#partdetailout-字段)[] | 成功插入并读取详情的件 |
-| `failed` | [PartBatchCreateFailure](#partbatchcreatefailure-字段)[] | 单件失败明细（含 item_index）；成功与失败互斥 |
+| `created` | [PartDetailOut](./index.md#partdetailout-字段)[] | 成功插入并读取详情的件 |
+| `failed` | `PartBatchCreateFailure`[] | 单件失败明细（含 item_index）；成功与失败互斥 |
 
 错误码：40001（items 空 / 超过 200）、40300；item-level（`failed[].code`）：50001 / 20101 等。
 
@@ -98,7 +98,7 @@ Response 200 `data`：
 
 权限: **Manager / Clerk / Inspector / CncProgrammer**
 
-Response 200 `data`：[`PartDetailOut`](#partdetailout-字段)。
+Response 200 `data`：[`PartDetailOut`](./index.md#partdetailout-字段)。
 
 错误码：20101（不存在 / 已软删）、40300。
 
@@ -130,7 +130,7 @@ Request：`PartUpdateRequest` — 字段全部可选（缺省 = DB 不动）；`
 | `note` | string? | — | |
 | `is_urgent` | bool? | — | |
 
-Response 200 `data`：[`PartDetailOut`](#partdetailout-字段)。
+Response 200 `data`：[`PartDetailOut`](./index.md#partdetailout-字段)。
 
 错误码：40901（版本冲突 / 已软删）、40300、20112（已流转禁改总量，留待后续 PR 启用）。
 
@@ -185,8 +185,8 @@ Response 200 `data`：最新 `TPartFile` 行（含 `content_type` / `file_size` 
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `created` | [PartDetailOut](#partdetailout-字段)[] | 成功创建的件 |
-| `failed` | [PartBatchCreateFailure](#partbatchcreatefailure-字段)[] | 失败的件（`created` ∩ `failed` = ∅） |
+| `created` | [PartDetailOut](./index.md#partdetailout-字段)[] | 成功创建的件 |
+| `failed` | `PartBatchCreateFailure`[] | 失败的件（`created` ∩ `failed` = ∅） |
 
 ### PartUpdateRequest 字段
 

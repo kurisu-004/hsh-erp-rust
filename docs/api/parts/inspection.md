@@ -26,7 +26,7 @@ Request：
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `items` | [BatchPassItem](#batchpassitem-字段) | ✓ | 1..=200 个；空数组 / 超出上限 → `40001` |
+| `items` | `BatchPassItem` | ✓ | 1..=200 个；空数组 / 超出上限 → `40001` |
 | `items[].part_id` | string (i64) | ✓ | 工单雪花 ID（字符串避免 JS 精度截断） |
 | `items[].batch_id` | string (i64)? | — | 指定批次；当 part 下存在多个 INSPECTION 批次时用于消歧，缺省按 part_id 唯一匹配 |
 | `items[].quantity` | i32? | — | 本次送检数量；当前仅支持整批送检，`quantity ≤ 0` 或 `quantity > 批次剩余量` → `20111` |
@@ -35,8 +35,8 @@ Response 200 `data`：`BatchPassInspectionOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `passed` | [PartOut](#partout-字段) | 成功送检的件；与 `items` 顺序一一对应（`passed[i]` 对应 `items[i]`） |
-| `failed` | [BatchPassFailure](#batchpassfailure-字段) | 失败的 item；单 item 不会同时出现在 `passed` 与 `failed` |
+| `passed` | [PartOut](./index.md#partout-字段) | 成功送检的件；与 `items` 顺序一一对应（`passed[i]` 对应 `items[i]`） |
+| `failed` | `BatchPassFailure` | 失败的 item；单 item 不会同时出现在 `passed` 与 `failed` |
 
 > 整体响应**始终为 200**。item 级别的失败通过 `data.failed[]` 体现（每个 item 含 `code` + `message`，调用方可按 `code` 分支处理）。
 > `20111` 仅在 item-level 报出，不影响整批响应状态。
@@ -66,7 +66,7 @@ Request：可选 body `PassInspectionRequest`
 
 > 当 body 完全省略（`Content-Length: 0`）时，按空对象处理。
 
-Response 200 `data`：[`PartOut`](#partout-字段) — 流转后的工单最新投影
+Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后的工单最新投影
 
 错误码：
 
@@ -108,9 +108,9 @@ Request：`ScanInspectRequest`
 
 WS 广播（commit 后下发）：
 
-- `INSPECTED` —— payload `{ part_id, shelf_code: "scan-inspect" }`（详见 [`./websocket.md`](./websocket.md)）
+- `INSPECTED` —— payload `{ part_id, shelf_code: "scan-inspect" }`（详见 [`../websocket.md`](../websocket.md)）
 
-Response 200 `data`：[`PartOut`](#partout-字段) — 流转后的工单最新投影
+Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后的工单最新投影
 
 错误码：
 
@@ -133,7 +133,7 @@ Request：`BatchScanInspectRequest`
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `target_inspection_shelf_id` | string (i64) | ✓ | 批量共享品检架；service 校验 `zone='INSPECTION'` 且 `is_active=true`（违反 → 整批失败 `20511` / `20512`） |
-| `items` | [BatchScanInspectItem](#batchscaninspectitem-字段) | ✓ | 1..=200 个；空数组 / 超出上限 → `40001` |
+| `items` | `BatchScanInspectItem` | ✓ | 1..=200 个；空数组 / 超出上限 → `40001` |
 | `items[].part_id` | string (i64) | ✓ | 工单雪花 ID |
 | `items[].decision` | string? | — | `"PASS"` / `"FAIL"`；缺省 = `"PASS"`（高频场景：整组送检全 PASS） |
 | `items[].shelf_id` | string (i64)? | — | **仅 `decision=FAIL` 必填**；目标生产货架 |
@@ -151,8 +151,8 @@ Response 200 `data`：`BatchScanInspectOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `submitted` | [PartOut](#partout-字段) | 成功并完成 PASS/FAIL 流转的件；与 `items` 顺序一一对应（`submitted[i]` 对应 `items[i]`） |
-| `failed` | [BatchScanInspectFailure](#batchscaninspectfailure-字段) | 失败的 item；单 item 不会同时出现在 `submitted` 与 `failed` |
+| `submitted` | [PartOut](./index.md#partout-字段) | 成功并完成 PASS/FAIL 流转的件；与 `items` 顺序一一对应（`submitted[i]` 对应 `items[i]`） |
+| `failed` | `BatchScanInspectFailure` | 失败的 item；单 item 不会同时出现在 `submitted` 与 `failed` |
 
 > 整体响应**始终为 200**。item 级别失败通过 `data.failed[]` 体现（每个 item 含 `code` + `message`）。`target_inspection_shelf_id` 不属于 INSPECTION 区 / 不 active 这种**外层校验错误**会立即终止整批并以顶层错误码返回（`20511` / `20512`）。
 
@@ -197,7 +197,7 @@ WS 广播（commit 后下发）：
 
 - `INSPECTION_FAILED` —— payload `{ part_id }`
 
-Response 200 `data`：[`PartOut`](#partout-字段) — 流转后的工单最新投影
+Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后的工单最新投影
 
 错误码：
 
@@ -247,8 +247,8 @@ Response 200 `data`：`WorkerScanOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `scan` | [`WorkerScanCoreOut`](#workerscancoreout-字段) | 扫码事件最小投影 |
-| `refill` | [`RefillResult`](./worker-pool.md#refillresult-字段) | 同事务 refill 结果 |
+| `scan` | `WorkerScanCoreOut` | 扫码事件最小投影 |
+| `refill` | [`RefillResult`](../worker-pool.md#refillresult-字段) | 同事务 refill 结果 |
 
 错误码：
 
@@ -275,7 +275,7 @@ WS 广播（commit 后下发）：
 - 若 `refill.taken.len() > 0` → `WORKER_POOL_REFILL_DONE` —— payload = `RefillResult`
 - 若 `refill.pool_empty=true` 且 `taken` 为空 → `WORKER_POOL_EMPTY` —— payload `{ worker_id, shelf_id }`
 
-详见 [`./websocket.md`](./websocket.md) 与 [`./worker-pool.md`](./worker-pool.md)。
+详见 [`../websocket.md`](../websocket.md) 与 [`../worker-pool.md`](../worker-pool.md)。
 
 ---
 
@@ -302,7 +302,7 @@ WS 广播（commit 后下发）：
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `items` | [BatchPassItem](#batchpassitem-字段) | ✓ | 1..=`BATCH_PASS_INSPECTION_MAX_ITEMS`（200） |
+| `items` | `BatchPassItem` | ✓ | 1..=`BATCH_PASS_INSPECTION_MAX_ITEMS`（200） |
 
 ### BatchPassFailure 字段
 
@@ -316,8 +316,8 @@ WS 广播（commit 后下发）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `passed` | [PartOut](#partout-字段) | 成功送检的件 |
-| `failed` | [BatchPassFailure](#batchpassfailure-字段) | 失败的件（`passed` ∩ `failed` = ∅） |
+| `passed` | [PartOut](./index.md#partout-字段) | 成功送检的件 |
+| `failed` | `BatchPassFailure` | 失败的件（`passed` ∩ `failed` = ∅） |
 
 ### ScanInspectRequest 字段
 
@@ -348,7 +348,7 @@ WS 广播（commit 后下发）：
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `target_inspection_shelf_id` | string (i64) | ✓ | 批量共享品检架 |
-| `items` | [BatchScanInspectItem](#batchscaninspectitem-字段) | ✓ | 1..=`BATCH_SCAN_INSPECT_MAX_ITEMS`（200） |
+| `items` | `BatchScanInspectItem` | ✓ | 1..=`BATCH_SCAN_INSPECT_MAX_ITEMS`（200） |
 
 ### BatchScanInspectFailure 字段
 
@@ -362,8 +362,8 @@ WS 广播（commit 后下发）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `submitted` | [PartOut](#partout-字段) | 成功流转的件 |
-| `failed` | [BatchScanInspectFailure](#batchscaninspectfailure-字段) | 失败的件（`submitted` ∩ `failed` = ∅） |
+| `submitted` | [PartOut](./index.md#partout-字段) | 成功流转的件 |
+| `failed` | `BatchScanInspectFailure` | 失败的件（`submitted` ∩ `failed` = ∅） |
 
 ### FailInspectionRequest 字段
 
@@ -374,8 +374,6 @@ WS 广播（commit 后下发）：
 | `note` | string? | — | ≤ 500 字符 |
 | `batch_id` | string (i64)? | — | 多批次歧义时必填 |
 | `quantity` | i32? | — | 缺省 = 整批 |
-
-## Phase F2（scan-inspect）
 
 ### Phase F2（scan-inspect）
 
@@ -427,9 +425,6 @@ pub struct FailInspectionRequest {
     pub batch_id: Option<String>,
     pub quantity: Option<i32>,
 }
-
-## Phase W（worker-scan + worker-pool 联动）
-
 
 ### Phase W（worker-scan + worker-pool 联动）
 

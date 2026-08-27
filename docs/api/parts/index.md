@@ -57,7 +57,7 @@
 
 ### PartListItem 字段
 
-`TPart` 完整 28 列 + `customer_name` / `l1_customer_name` 冗余字段；见 [`./auth.md`](./auth.md) 关于 i64 字段序列化为 string 的约定。
+`TPart` 完整 28 列 + `customer_name` / `l1_customer_name` 冗余字段；见 [`../auth.md`](../auth.md) 关于 i64 字段序列化为 string 的约定。
 
 ### PartListOut 字段
 
@@ -72,13 +72,12 @@
 
 `TPart` 完整 28 列 + `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
 
-
 ## 端点约束（与 Python 一致）
 
 - **i64 雪花 ID**：JSON 序列化为 `string`，避免 JS `Number.MAX_SAFE_INTEGER` 精度截断（详见 `shared::types`）
 - **乐观锁（OCC）**：表行 `version` 列；UPDATE 带 `WHERE id=$1 AND version=$2`，命中 0 行 → `40901 VERSION_CONFLICT`
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → `20101`
-- **状态机**：详见 [状态机（can_transition_to 白名单）](#状态机can_transition_to-白名单)；不在白名单内的 source / target 组合返回 `20103 BIZ_INVALID_TRANSITION`（迁移表见 `src/modules/part/statemachine.rs`）
+- **状态机**：详见 [状态机（can_transition_to 白名单）](./inspection.md#状态机can_transition_to-白名单)；不在白名单内的 source / target 组合返回 `20103 BIZ_INVALID_TRANSITION`（迁移表见 `src/modules/part/statemachine.rs`）
 - **事件日志**：状态迁移在 service 内事务内统一插入对应事件，service 提交后由 WS 中枢广播
 - **part↔batch 同步**：lifecycle 终态 / 翻转（deliver / cancel / complete / start-repair）同事务内除翻 `t_part` 外还需翻最近一条 source-status 批次（`PartRepo::find_most_recent_batch_for_part`），保证候选批次不被 stale 状态污染
 ---
@@ -89,9 +88,9 @@
 
 ## 错误码参考
 
-part / lifecycle 错误码（20101 / 20103 / 20104 / 20109 / 20111 / 20115 / 20116 / 20117 / 20118 / 20119 / 21420 / 40001 / 40300 / 40901）见 [`./inspection.md`](./inspection.md#错误码参考part--lifecycle)。
+part / lifecycle 错误码（20101 / 20103 / 20104 / 20109 / 20111 / 20115 / 20116 / 20117 / 20118 / 20119 / 21420 / 40001 / 40300 / 40901）见 [`./inspection.md`](./inspection.md#错误码参考part-lifecycle)。
 
-货架错误码（20511 / 20512 — scan-inspect / fail-inspection 专用）见 [`./inspection.md`](./inspection.md#货架错误码20511--20512--scan-inspect--fail-inspection-专用)。
+货架错误码（20511 / 20512 — scan-inspect / fail-inspection 专用）见 [`./inspection.md`](./inspection.md#货架错误码20511-20512-scan-inspect-fail-inspection-专用)。
 
 ## 参考
 

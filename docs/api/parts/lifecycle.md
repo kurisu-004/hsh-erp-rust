@@ -23,7 +23,7 @@
 
 Request：`{ "note"?: string }`（可空）
 
-Response 200 `data`：[`PartOut`](#partout-字段) — 流转后工单。同步翻转最近一条 `READY_TO_SHIP` 批次（同事务）。
+Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后工单。同步翻转最近一条 `READY_TO_SHIP` 批次（同事务）。
 
 错误码：
 
@@ -39,7 +39,7 @@ Response 200 `data`：[`PartOut`](#partout-字段) — 流转后工单。同步�
 
 Request：`{ "reason"?: string, "note"?: string }`（`reason` 优先作为事件 note）
 
-Response 200 `data`：[`PartOut`](#partout-字段)。同步翻转最近一条 source-status 批次（同事务）。
+Response 200 `data`：[`PartOut`](./index.md#partout-字段)。同步翻转最近一条 source-status 批次（同事务）。
 
 错误码：
 
@@ -56,7 +56,7 @@ Response 200 `data`：[`PartOut`](#partout-字段)。同步翻转最近一条 so
 
 Request：`{ "note"?: string }`（可空）
 
-Response 200 `data`：[`PartOut`](#partout-字段)。**`t_part.serial_no` 被清空**（序列号已转交送货单）。同步翻转最近一条 DELIVERED 批次（同事务）。
+Response 200 `data`：[`PartOut`](./index.md#partout-字段)。**`t_part.serial_no` 被清空**（序列号已转交送货单）。同步翻转最近一条 DELIVERED 批次（同事务）。
 
 错误码：
 
@@ -71,7 +71,7 @@ Response 200 `data`：[`PartOut`](#partout-字段)。**`t_part.serial_no` 被清
 
 Request：`{ "reason"?: string, "note"?: string }`（`reason` 优先作为事件 note）
 
-Response 200 `data`：[`PartOut`](#partout-字段)。`t_part.has_been_repaired` 置 `true`；同步翻转最近一条 IN_PROCESS 批次（同事务）。
+Response 200 `data`：[`PartOut`](./index.md#partout-字段)。`t_part.has_been_repaired` 置 `true`；同步翻转最近一条 IN_PROCESS 批次（同事务）。
 
 错误码：
 

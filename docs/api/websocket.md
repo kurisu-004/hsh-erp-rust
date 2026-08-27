@@ -47,7 +47,7 @@ Request：
 | `Notification` | 通知 | `user_id`, `content` |
 | `Heartbeat` | 心跳 | `ts` |
 
-> **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts.md#worker-scan`](./parts.md#post-apiv2partsworker-scan) 与 [`./worker-pool.md`](./worker-pool.md)。
+> **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts/inspection.md#post-apiv2partsworker-scan`](./parts/inspection.md#post-apiv2partsworker-scan) 与 [`./worker-pool.md`](./worker-pool.md)。
 >
 > i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
 
