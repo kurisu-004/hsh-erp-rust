@@ -81,7 +81,7 @@ impl PartStatus {
         }
     }
 
-    /// 迁移白名单。
+    /// 迁移白名单（共 11 个合法迁移）。
     ///
     /// 本 PR（scan-inspect 一键送检）放行：
     /// - `INSPECTION → READY_TO_SHIP`：pass_inspection / scan_inspect (PASS) 路径
@@ -95,6 +95,9 @@ impl PartStatus {
     /// - `DELIVERED → COMPLETED` (complete)
     /// - `PENDING/PROGRAMMING/INSPECTION/READY_TO_SHIP/DELIVERED → CANCELLED` (cancel)
     /// - `IN_PROCESS → REPAIRING` (start-repair)
+    ///
+    /// 扫描返修新增（scan-route B 组 to-inspection）：
+    /// - `REPAIRING → INSPECTION` (to-inspection：返修完成 → 重新送检)
     ///
     /// IN_PROCESS+WORKER 拒绝 / IN_PROCESS+非 PRODUCTION_SHELF 拒绝走
     /// service 层组合校验（仿 myERP `service/part.py:4140-4164`），不污染
@@ -118,6 +121,8 @@ impl PartStatus {
                 | (READY_TO_SHIP, CANCELLED)
                 | (DELIVERED, CANCELLED)
                 | (IN_PROCESS, REPAIRING)           // start-repair
+            // 扫描返修新增（scan-route B 组走 to-inspection）
+                | (REPAIRING, INSPECTION)            // 返修完成 → 重新送检（B 组走 to-inspection）
         )
     }
 }
@@ -185,6 +190,18 @@ mod tests {
         // 跨度过大
         assert!(!PartStatus::PENDING.can_transition_to(PartStatus::READY_TO_SHIP));
         assert!(!PartStatus::IN_PROCESS.can_transition_to(PartStatus::READY_TO_SHIP));
+    }
+
+    #[test]
+    fn allowed_transitions_repairing_to_inspection() {
+        assert!(PartStatus::REPAIRING.can_transition_to(PartStatus::INSPECTION));
+    }
+
+    #[test]
+    fn disallowed_transitions_repairing_rejects() {
+        assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::READY_TO_SHIP));
+        assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::COMPLETED));
+        assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::IN_PROCESS));
     }
 
     #[test]
