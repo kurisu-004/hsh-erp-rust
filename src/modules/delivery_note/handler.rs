@@ -411,17 +411,24 @@ pub async fn scan_delivery_note(
     let added_count = out.added_batches.len();
     let note_id = out.note.id;
     let note_no = out.note.delivery_note_no.clone();
+    let unresolved_count = out.unresolved_targets.as_ref().map(|v| v.len()).unwrap_or(0);
     state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
         kind: "DELIVERY_NOTE_SCAN_ADD".to_string(),
         payload: serde_json::json!({
             "delivery_note_id": note_id,
             "delivery_note_no": note_no,
             "added_count": added_count,
+            "unresolved_count": unresolved_count,
             "line_count": out.note.line_count,
-            "resolved_kind": out.resolved.kind,
+            "resolved_kind": match out.resolved.kind {
+                super::dto::ResolvedKindDto::Part => "PART",
+                super::dto::ResolvedKindDto::Assembly => "ASSEMBLY",
+            },
             "outcome": match out.outcome {
                 super::dto::ScanOutcomeDto::Added => "ADDED",
                 super::dto::ScanOutcomeDto::AlreadyPresent => "ALREADY_PRESENT",
+                super::dto::ScanOutcomeDto::CandidatesAvailable => "CANDIDATES_AVAILABLE",
+                super::dto::ScanOutcomeDto::PartialAdded => "PARTIAL_ADDED",
             },
         }),
     });

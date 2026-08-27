@@ -462,7 +462,7 @@ pub struct ScanDeliveryRequest {
 /// - `ALREADY_PRESENT`：A 组覆盖所有 target，但都已在本单（幂等）
 /// - `CANDIDATES_AVAILABLE`：散件仅 B 组 → unresolved_targets 单元素
 /// - `PARTIAL_ADDED`：装配件 A+B 混合 → unresolved_targets 多元素
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ScanOutcomeDto {
     Added,
