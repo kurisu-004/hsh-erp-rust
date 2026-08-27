@@ -490,8 +490,8 @@ impl PartRepo {
                 order_no, system_delivery_date, note, status, location,
                 unit_price, total_price, serial_no, version, created_by
             ) VALUES (
-                $1, $2, $3, '', $4, NULL,
-                $5, FALSE, $6, $7,
+                $1, $2, $3, '', $4, CURRENT_DATE,
+                COALESCE($5, CURRENT_DATE), FALSE, $6, $7,
                 NULL, NULL, NULL, 'PENDING', 'OFFICE',
                 0, 0, $8, 0, $9
             )
