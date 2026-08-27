@@ -54,8 +54,12 @@ const ADMIN_DATABASE_URL_DEFAULT: &str = "postgres://hsh_test:6065161test@localh
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
 const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
 
-/// 测试用 Redis URL：连 `redis-test` 容器（端口6380），db index 15 与 dev 默认 0 隔离。
-const TEST_REDIS_URL: &str = "redis://localhost:6380/15";
+/// 测试用 Redis URL：默认连 `redis-test` 容器（端口6380），db index 15 与 dev 默认 0 隔离。
+/// 可由 `TEST_REDIS_URL` 环境变量覆盖（跨 worktree 隔离用）。
+pub fn test_redis_url() -> String {
+    std::env::var("TEST_REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6380/15".to_string())
+}
 
 /// 第一次跑测试时建 `postgres_rust_test`（已存在则忽略）。
 pub async fn ensure_database_exists() {
@@ -95,7 +99,7 @@ pub async fn test_pool() -> PgPool {
 /// 建测试用 Redis 连接池（db 15，与 dev 默认 db 0 隔离）。
 #[allow(dead_code)]
 pub async fn test_redis_pool() -> RedisPool {
-    let cfg = RedisConfig::from_url(TEST_REDIS_URL);
+    let cfg = RedisConfig::from_url(test_redis_url());
     cfg.create_pool(Some(RedisRuntime::Tokio1))
         .expect("create test redis pool — 确认 redis-test 容器在 6380")
 }
@@ -181,7 +185,7 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             instance: 1,
         },
         redis: AppRedisConfig {
-            url: TEST_REDIS_URL.to_string(),
+            url: test_redis_url(),
             session_ttl_seconds: 3600,
             pool_max_size: 5,
             session_check_enabled: true,
@@ -238,7 +242,7 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             instance: 1,
         },
         redis: AppRedisConfig {
-            url: TEST_REDIS_URL.to_string(),
+            url: test_redis_url(),
             session_ttl_seconds: 3600,
             pool_max_size: 5,
             session_check_enabled: false,

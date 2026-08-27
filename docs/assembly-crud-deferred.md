@@ -31,7 +31,7 @@
 | 11 | **`.sqlx/` 离线缓存未刷新** | master 上有 3 个预先坏掉的 `query!` 站点（`part_batch/repo.rs` / `part_file/repo.rs`），重跑 `sqlx_prepare.sh` 会从 25 错误恶化到 31 错误 | 单独 PR 修 master 的 3 个 pre-existing 坏站点，再重跑 `sqlx_prepare.sh` |
 | 12 | **3 个 untracked `.sqlx/query-*.json`** | 本 PR 用 `sqlx::query()`（runtime）而非 `query!` 宏，不需 `.sqlx` 缓存 | CI 离线构建如需严格可手动重跑 `sqlx_prepare.sh` 后提交 |
 | 13 | **HTTP 层集成测试未覆盖**（本 PR 6 个测试全走 service 直调） | 为避免 JWT/Redis 开销，并匹配 `applicant_api.rs` 现有惯例 | 后续 PR 加 HTTP 层 happy-path / 401 / 403 集成测试 |
-| 14 | **跨 worktree 集成测试隔离** | 多个 worktree 同时跑集成测试会撞 5429 / 6380 端口（worktree skill §3.5 已记录） | 改 `tests/common/mod.rs` 接受 `TEST_DATABASE_URL` env 覆盖（master 已部分支持） |
+| 14 | **跨 worktree 集成测试隔离** | 多个 worktree 同时跑集成测试会撞 5429 / 6380 端口（worktree skill §3.5 已记录） | 改 `tests/common/mod.rs` 接受 `TEST_DATABASE_URL` env 覆盖（master 已部分支持） ✅ DONE |
 
 ## 4. 文档 / 维护
 
