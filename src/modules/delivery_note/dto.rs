@@ -458,34 +458,75 @@ pub struct ScanDeliveryRequest {
 
 /// 扫码入单结果（200 OK 路径）。
 ///
-/// - `ADDED`：本次成功挂载 ≥1 个批次
-/// - `ALREADY_PRESENT`：已全部在本单（不报错，幂等）
+/// - `ADDED`：A 组覆盖所有 target，本次成功挂载 ≥1 个
+/// - `ALREADY_PRESENT`：A 组覆盖所有 target，但都已在本单（幂等）
+/// - `CANDIDATES_AVAILABLE`：散件仅 B 组 → unresolved_targets 单元素
+/// - `PARTIAL_ADDED`：装配件 A+B 混合 → unresolved_targets 多元素
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ScanOutcomeDto {
     Added,
     AlreadyPresent,
+    CandidatesAvailable,
+    PartialAdded,
+}
+
+/// `t_part_batch.status` 强类型投影。序列化沿用 DB 列值（SCREAMING_SNAKE_CASE）。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BatchStatusDto {
+    Pending,
+    Programming,
+    InProcess,
+    Inspection,
+    ReadyToShip,
+    Delivered,
+    Repairing,
+    Outsource,
+    Completed,
+    Cancelled,
+}
+
+impl BatchStatusDto {
+    /// 由 DB 字符串反序列化为枚举；未知值返回 `None`。
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_db(s: &str) -> Option<Self> {
+        Some(match s {
+            "PENDING" => Self::Pending,
+            "PROGRAMMING" => Self::Programming,
+            "IN_PROCESS" => Self::InProcess,
+            "INSPECTION" => Self::Inspection,
+            "READY_TO_SHIP" => Self::ReadyToShip,
+            "DELIVERED" => Self::Delivered,
+            "REPAIRING" => Self::Repairing,
+            "OUTSOURCE" => Self::Outsource,
+            "COMPLETED" => Self::Completed,
+            "CANCELLED" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+}
+
+/// 解析结果类别（驱动前端"是装配件还是散件"决策）。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ResolvedKindDto {
+    Part,
+    Assembly,
 }
 
 /// 解析结果（识别出来的实体）。
 ///
-/// - `kind = "PART"`：单工单（可能隶属于某个装配件的子件）；`id` = part.id
-/// - `kind = "ASSEMBLY"`：扫的是装配件总图，`id` = assembly.id, `child_count` 必填
+/// - `kind = Part`：单工单（可能隶属于某个装配件的子件）；`id` = part.id
+/// - `kind = Assembly`：扫的是装配件总图，`id` = assembly.id
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedEntityDto {
-    /// "PART" | "ASSEMBLY"
-    pub kind: &'static str,
+    pub kind: ResolvedKindDto,
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub id: i64,
     pub serial_no: String,
     pub drawing_no: String,
     pub name: String,
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub assembly_id: Option<i64>,
-    pub child_count: Option<usize>,
 }
 
 /// 扫码命中的送货单概要（响应里的 `note` 字段）。
@@ -509,9 +550,10 @@ pub struct ScanDeliveryNoteSummaryDto {
 
 /// 草稿卡片里要展示的最近批次条目。
 ///
-/// 2026-08-22：原 `ScanBatchDto` 没有 drawing_no/name/order_no，前端卡片
-/// 需要这些字段直接展示（序列号 + 名称 + 订单号），避免每次 N 次 GET /notes/{id}。
-/// 这里独立成一个 DTO，与 added_batches 用 `ScanBatchDto`（极简）解耦。
+/// 2026-08-22：原 `AddedBatchDto` 没有 drawing_no/name/order_no，前端卡片
+/// 需要这些字段直接展示（序列号 + 名称 + 订单号），避免每次 N 次
+/// GET /notes/{id}。这里独立成一个 DTO，与 added_batches 用 `AddedBatchDto`
+/// （极简）解耦。
 #[derive(Debug, Clone, Serialize)]
 pub struct RecentItemDto {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
@@ -528,9 +570,9 @@ pub struct RecentItemDto {
     pub order_no: Option<String>,
 }
 
-/// 命中的批次（含 added / already_present 列表用）。
+/// 已挂载批次（`added_batches[]`）；跨子件场景 part_id/serial_no 必填。
 #[derive(Debug, Clone, Serialize)]
-pub struct ScanBatchDto {
+pub struct AddedBatchDto {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub batch_id: i64,
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
@@ -539,41 +581,45 @@ pub struct ScanBatchDto {
     pub quantity: i32,
 }
 
-/// 扫码入单失败子件明细（用于 21418 装配件整套拒绝响应）。
-///
-/// `part_id` 是关键：前端「一键通过品检」按钮依赖它把 failures
-/// 喂给 `POST /parts/batch-pass-inspection`。21405 散件失败无
-/// part_id 时填 0，前端会 guard 跳过。
+/// 未就绪 part + 其 B 组候选批次（`unresolved_targets[]`）。
+/// 散件场景：单元素；装配件场景：每个未就绪子件一个元素。
 #[derive(Debug, Clone, Serialize)]
-pub struct ScanFailureDto {
+pub struct UnresolvedTargetDto {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub part_id: i64,
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub batch_id: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub drawing_no: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
     pub serial_no: String,
+    pub drawing_no: String,
     pub name: String,
-    pub reason: String,
+    pub available_batches: Vec<AvailableBatchDto>,
+}
+
+/// B 组候选批次（`unresolved_targets[i].available_batches[]`）。
+/// part 级信息（serial_no/drawing_no/name）在 `UnresolvedTargetDto` 外层，不重复。
+#[derive(Debug, Clone, Serialize)]
+pub struct AvailableBatchDto {
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub batch_id: i64,
+    pub quantity: i32,
+    pub status: BatchStatusDto,
 }
 
 /// `POST /delivery-notes/scan` 出参（200 OK）。
 ///
-/// 备注：
-/// - `skipped` 在 200 路径上始终为空；装配件整套拒绝（21418）由 handler 通过
-///   `AppError::BizWithFailures` 序列化到 `data.failures`。
-/// - `added_batches` + `already_present` 是当前 note 本次扫码后**实际**的入单 / 重复集合。
+/// 场景 → outcome 映射：
+/// - `ADDED`：A 组覆盖所有 target，本次挂载 ≥1 个；`added_batches` 非空，`unresolved_targets = None`
+/// - `ALREADY_PRESENT`：A 组覆盖所有 target，但都已在本单（幂等）；二者均空 / None
+/// - `CANDIDATES_AVAILABLE`：散件仅 B 组；`unresolved_targets` 单元素
+/// - `PARTIAL_ADDED`：装配件 A+B 混合；`added_batches` 是 A 组已挂部分，`unresolved_targets` 是 B 组子件
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanDeliveryOut {
     pub outcome: ScanOutcomeDto,
     pub resolved: ResolvedEntityDto,
     pub note: ScanDeliveryNoteSummaryDto,
-    pub added_batches: Vec<ScanBatchDto>,
-    pub already_present: Vec<ScanBatchDto>,
-    pub skipped: Vec<ScanFailureDto>,
+
+    /// 场景 ①、③、④-已挂载部分；其余场景为 `[]`
+    pub added_batches: Vec<AddedBatchDto>,
+
+    /// 场景 ②（单元素）、④（多元素）；其余场景为 `None`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unresolved_targets: Option<Vec<UnresolvedTargetDto>>,
 }
