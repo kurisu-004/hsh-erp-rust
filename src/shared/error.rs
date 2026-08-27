@@ -401,6 +401,7 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT
             || c == code::BIZ_PART_ALREADY_CANCELLED
             || c == code::BIZ_DELIVERY_NOTE_LOCKED_PART
+            || c == code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER
             || c == code::BIZ_PART_NOT_DELETABLE => StatusCode::CONFLICT,
 
         // ---- 2xxxx 业务码：422 (校验类，Python 显式声明 21113 → 422) ----
