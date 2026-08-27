@@ -45,3 +45,32 @@ Python 项目原有 alembic `schema` + `prod_data` 双分支。Rust 端如需：
 - `seeds/` 放初始种子数据（不在 `sqlx::migrate!` 扫描范围内，由独立命令加载）
 
 实施阶段根据需要细化。
+
+## 修改已迁移文件
+
+`sqlx::migrate!()` 在运行时/编译期都校验 `_sqlx_migrations.checksum` 与迁移文件内容 SHA384 的一致性。
+**任何对已迁移文件的修改**（包括注释、空行、空白）都会改变 SHA384，导致 `VersionMismatch(<version>)` panic。
+
+### 同步 DB checksum
+
+修改已迁移文件后，必须同步更新对应 DB 行的 checksum（仅测试 DB；dev DB 通过 `cargo run` 启动时 sqlx 自动 migrate 不需手动改）：
+
+```bash
+# 1. 算新文件的 SHA384
+sha384sum migrations/<timestamp>_<seq>_<desc>.sql
+
+# 2. 在测试 DB 上 UPDATE 单行（单 row 单 column，严格 scope）
+docker exec test psql -U hsh_test -d postgres_rust_test -c "UPDATE _sqlx_migrations SET checksum = decode('<sha384_hex>', 'hex') WHERE version = <timestamp>"
+# 例：UPDATE 1
+```
+
+### 替代方案：drop + 重建测试 DB
+
+若改动影响多个迁移文件或不确定：
+
+```bash
+docker exec test psql -U hsh_test -d postgres -c 'DROP DATABASE postgres_rust_test'
+# 下次 cargo test 会自动重建
+```
+
+**警告**：drop 会破坏其它 worktree 共享 DB 状态；多 worktree 跑测试时改用方案 1（单行 UPDATE）。
