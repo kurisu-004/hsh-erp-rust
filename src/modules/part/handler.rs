@@ -26,6 +26,7 @@ use axum::Json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
+#[allow(unused_imports)] // BatchOpFailure mandated by brief; accessed transitively via BatchToXxxOut field pattern matching.
 use crate::modules::part::dto::{
     BatchOpFailure, BatchToInspectionRequest, BatchToShipRequest, BatchToXxxOut, PartOut,
     ToInspectionRequest, ToProcessRequest, ToShipRequest, ToXxxOut, WorkerScanOut,
