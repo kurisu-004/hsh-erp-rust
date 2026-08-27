@@ -1,0 +1,293 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, drawing_no, name, applicant_name, customer_id,\n                   request_date, planned_delivery_date, actual_delivery_date,\n                   is_urgent, status, version, created_at, created_by,\n                   updated_at, updated_by, deleted_at, serial_no, quantity,\n                   unit_price, total_price, order_no, system_delivery_date, note\n            FROM t_assembly\n            WHERE id = $1\n              AND ($2::bool OR deleted_at IS NULL)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "drawing_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "drawing_no"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "applicant_name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "applicant_name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "customer_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "customer_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "request_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "request_date"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "planned_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "planned_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "actual_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "actual_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "is_urgent",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "is_urgent"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "updated_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "deleted_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "serial_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "serial_no"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "quantity",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "unit_price",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "unit_price"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "total_price",
+        "type_info": "Numeric",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "total_price"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "order_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "order_no"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "system_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "system_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "note",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_assembly",
+            "name": "note"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "5f845a78d167e57adc7c3de88c3777ff9c7ba18f5fd47ed0d43a78126d23f9a5"
+}

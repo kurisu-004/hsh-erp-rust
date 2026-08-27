@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE t_assembly SET status = 'COMPLETED' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "73c399b548d765cf7781fe58aafa0899844a61e8232e266628fd4eb73a8d1a84"
+}

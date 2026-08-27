@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_work_type_process (id, work_type_id, process_id, sort_order, version, created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "be22946209784013cbd6c996546dd991c3cef62d63895b5ebc1a952dc2d8efb5"
+}
