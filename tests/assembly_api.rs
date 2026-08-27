@@ -774,7 +774,8 @@ async fn create_assembly_default_not_null_columns() {
     tx.commit().await.unwrap();
 
     // 拉原始行验证默认值
-    let row: (
+    // type alias 化简 11-元组避免 `clippy::type_complexity` warning（11 个元素超过阈值）
+    type AssemblyDefaultsRow = (
         i32,                                       // version
         String,                                    // status
         chrono::NaiveDateTime,                     // created_at NOT NULL
@@ -786,7 +787,8 @@ async fn create_assembly_default_not_null_columns() {
         chrono::NaiveDate,                         // planned_delivery_date NOT NULL
         bool,                                      // is_urgent NOT NULL
         i32,                                       // quantity NOT NULL
-    ) = sqlx::query_as(
+    );
+    let row: AssemblyDefaultsRow = sqlx::query_as(
         "SELECT version, status, created_at, updated_at, created_by, updated_by, \
                 serial_no, request_date, planned_delivery_date, is_urgent, quantity \
          FROM t_assembly WHERE id = $1",
