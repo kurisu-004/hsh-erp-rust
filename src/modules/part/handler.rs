@@ -1,6 +1,6 @@
 //! part 域 HTTP handler
 //!
-//! 对应 Python myERP/api/v1/part.py（设计 §6 + §6.2 — pass_inspection）。
+//! 对应 Python myERP/api/v1/part.py（设计 §6 + §6.2 — to_ship / to_inspection / to_process）。
 //!
 //! ## 约定
 //! - 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
@@ -9,12 +9,15 @@
 //! - 权限在 handler（`current.require_any_role(...)`）；业务层 service 也会
 //!   再校验一次（双层守卫，与现有其他域保持一致）。
 //!
-//! ## Phase F 路由（挂在 `/parts`）
-//! - `POST /batch-pass-inspection`         —— 批量送检（per-item 独立事务边界外的循环）
-//! - `POST /{part_id}/pass-inspection`     —— 单件送检（payload 可空 `Option<Json<…>>`）
+//! ## to-XXX 路由（挂在 `/parts`）
+//! - `POST /batch-to-ship`            —— 批量通过品检（per-item 独立事务边界外的循环）
+//! - `POST /{part_id}/to-ship`        —— 单件通过品检（payload 可空 `Option<Json<…>>`）
+//! - `POST /batch-to-inspection`      —— 批量送检
+//! - `POST /{part_id}/to-inspection`  —— 单件送检
+//! - `POST /{part_id}/to-process`     —— 单件品检打回（推荐需求 3）
 //!
-//! 路由顺序敏感：`/batch-pass-inspection` 必须在 `/{part_id}/pass-inspection` 之前
-//! 注册，否则 axum 会把 `batch-pass-inspection` 解析成 `part_id`。
+//! 路由顺序敏感：`/batch-to-*` 静态段必须在 `/{part_id}/to-*` 之前
+//! 注册，否则 axum 会把 `batch-to-*` 解析成 `part_id`。
 
 use std::sync::Arc;
 
@@ -24,23 +27,31 @@ use axum::Json;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::dto::{
-    BatchPassInspectionOut, BatchPassInspectionRequest, BatchScanInspectOut,
-    BatchScanInspectRequest, FailInspectionRequest, PartOut, PassInspectionRequest,
-    ScanInspectRequest, WorkerScanOut, WorkerScanRequest,
+    BatchOpFailure, BatchToInspectionRequest, BatchToShipRequest, BatchToXxxOut, PartOut,
+    ToInspectionRequest, ToProcessRequest, ToShipRequest, ToXxxOut, WorkerScanOut,
+    WorkerScanRequest,
 };
-use crate::modules::part::service::{PartService, BATCH_PASS_INSPECTION_MAX_ITEMS};
+use crate::modules::part::service::{PartService, BATCH_TO_SHIP_MAX_ITEMS};
 use crate::modules::worker_pool::service::WorkerPoolService;
 use crate::shared::error::{code, AppError};
 use crate::shared::response::R;
 use crate::state::AppState;
 
-/// 单件 / 批量送检均允许的角色：Manager 或 Inspector。
-const PASS_INSPECTION_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
+/// to-XXX 流均允许的角色：Manager 或 Inspector。
+const TO_XXX_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
 
-/// scan-inspect 第一步 WS 广播事件（commit 后调用）。
-fn ws_broadcast_inspected(state: &AppState, part_id: i64, shelf_code: &str) {
+/// to-ship WS 广播事件（commit 后调用）。
+fn ws_broadcast_to_ship(state: &AppState, part_id: i64) {
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
-        kind: "INSPECTED".into(),
+        kind: "PART_TO_SHIP".into(),
+        payload: serde_json::json!({ "part_id": part_id.to_string() }),
+    });
+}
+
+/// to-inspection WS 广播事件（commit 后调用）。
+fn ws_broadcast_to_inspection(state: &AppState, part_id: i64, shelf_code: &str) {
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_TO_INSPECTION".into(),
         payload: serde_json::json!({
             "part_id": part_id.to_string(),
             "shelf_code": shelf_code,
@@ -48,123 +59,80 @@ fn ws_broadcast_inspected(state: &AppState, part_id: i64, shelf_code: &str) {
     });
 }
 
-/// fail-inspection WS 广播事件。
-fn ws_broadcast_inspection_failed(state: &AppState, part_id: i64) {
+/// to-process WS 广播事件（commit 后调用）。
+fn ws_broadcast_to_process(state: &AppState, part_id: i64) {
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
-        kind: "INSPECTION_FAILED".into(),
+        kind: "PART_TO_PROCESS".into(),
         payload: serde_json::json!({ "part_id": part_id.to_string() }),
     });
 }
 
-/// POST /api/v2/parts/{part_id}/pass-inspection
+/// POST /api/v2/parts/{part_id}/to-ship
 ///
-/// payload 可空（`Option<Json<PassInspectionRequest>>` —— axum 0.8 中 `Json<T>`
+/// payload 可空（`Option<Json<ToShipRequest>>` —— axum 0.8 中 `Json<T>`
 /// 已实现 `OptionalFromRequest`，无需 `Optional<T>` 包装）。
 ///
 /// 行为：
 /// - 权限：`Manager` 或 `Inspector`
-/// - 入参：path `part_id` + 可选 body `{ batch_id?, quantity? }`
+/// - 入参：path `part_id` + 可选 body `{ batch_id?, quantity?, note? }`
 /// - 业务流转：`INSPECTION` → `READY_TO_SHIP`（含多批次 rollup 守卫 + OCC）
-/// - 响应：单条 `PartOut`
-pub async fn pass_inspection(
+/// - WS 广播：commit 后 `PART_TO_SHIP`
+/// - 响应：`ToXxxOut { part, new_batch_id }`
+pub async fn to_ship(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(part_id): Path<i64>,
-    payload: Option<Json<PassInspectionRequest>>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    current.require_any_role(PASS_INSPECTION_ROLES)?;
+    payload: Option<Json<ToShipRequest>>,
+) -> Result<Json<R<ToXxxOut>>, AppError> {
+    current.require_any_role(TO_XXX_ROLES)?;
     let req = payload.map(|j| j.0).unwrap_or_default();
     let mut tx = state.pool.begin().await?;
-    let out = PartService::pass_inspection(
+    let out = PartService::to_ship(
         &mut tx,
         &state.snowflake,
         part_id,
-        req.batch_id.as_deref().and_then(|s| s.parse().ok()),
-        req.quantity,
+        req,
         &current,
     )
     .await?;
     tx.commit().await?;
+    ws_broadcast_to_ship(&state, part_id);
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/parts/batch-pass-inspection
+/// POST /api/v2/parts/batch-to-ship
 ///
-/// 批量送检：每个 item 在 handler 共享的外层事务内执行；失败 item 不中断
+/// 批量通过品检：每个 item 在 handler 共享的外层事务内执行；失败 item 不中断
 /// 后续 item，失败原因收集到 `failed` Vec（与 service 内契约一致）。
 ///
 /// 行为：
 /// - 权限：`Manager` 或 `Inspector`
-/// - 入参：`{ items: [{ part_id, batch_id?, quantity? }, ...] }`
+/// - 入参：`{ items: [{ batch_id, quantity? }, ...] }`
 /// - 入参 shape 校验：handler 先做一次（兜底），service 再做一次（防御性双校验）
-/// - 业务流转：per-item 独立 `pass_inspection_core`（共享事务）
-/// - 响应：`{ passed: [PartOut, ...], failed: [{ part_id, code, message }, ...] }`
-pub async fn batch_pass_inspection(
+/// - 业务流转：per-item 独立 `to_ship_core`（共享事务）
+/// - WS 广播：commit 后 `BATCH_TO_SHIP`
+/// - 响应：`{ submitted: [ToXxxOut, ...], failed: [{ batch_id, code, message }, ...] }`
+pub async fn batch_to_ship(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
-    Json(req): Json<BatchPassInspectionRequest>,
-) -> Result<Json<R<BatchPassInspectionOut>>, AppError> {
-    current.require_any_role(PASS_INSPECTION_ROLES)?;
+    Json(req): Json<BatchToShipRequest>,
+) -> Result<Json<R<BatchToXxxOut>>, AppError> {
+    current.require_any_role(TO_XXX_ROLES)?;
     if req.items.is_empty() {
         return Err(AppError::validation("items 不能为空"));
     }
-    if req.items.len() > BATCH_PASS_INSPECTION_MAX_ITEMS {
+    if req.items.len() > BATCH_TO_SHIP_MAX_ITEMS {
         return Err(AppError::validation(format!(
             "items 数量 {} 超过上限 {}",
             req.items.len(),
-            BATCH_PASS_INSPECTION_MAX_ITEMS,
+            BATCH_TO_SHIP_MAX_ITEMS,
         )));
     }
     let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_pass_inspection(&mut tx, &state.snowflake, req, &current).await?;
-    tx.commit().await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// POST /api/v2/parts/{part_id}/scan-inspect
-///
-/// 单件一键送检（`PENDING / PROGRAMMING / IN_PROCESS` → `INSPECTION` → PASS/FAIL）。
-///
-/// 行为：
-/// - 权限：`Manager` 或 `Inspector`
-/// - 入参：path `part_id` + body `ScanInspectRequest`
-/// - 业务流转：见 service `scan_inspect_core`
-/// - WS 广播：commit 后 `INSPECTED` 事件
-/// - 响应：`PartOut`
-pub async fn scan_inspect(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<ScanInspectRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    current.require_any_role(PASS_INSPECTION_ROLES)?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::scan_inspect(&mut tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast_inspected(&state, part_id, "scan-inspect");
-    Ok(Json(R::ok(out)))
-}
-
-/// POST /api/v2/parts/batch-scan-inspect
-///
-/// 批量一键送检（共享品检架 + per-item decision）。
-///
-/// 行为：
-/// - 权限：`Manager` 或 `Inspector`
-/// - 入参：`{ target_inspection_shelf_id, items: [...] }`
-/// - 业务流转：service `batch_scan_inspect`（共享外层事务 + per-item 独立 core）
-/// - 响应：`{ submitted, failed }`
-pub async fn batch_scan_inspect(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Json(req): Json<BatchScanInspectRequest>,
-) -> Result<Json<R<BatchScanInspectOut>>, AppError> {
-    current.require_any_role(PASS_INSPECTION_ROLES)?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_scan_inspect(&mut tx, &state.snowflake, req, &current).await?;
+    let out = PartService::batch_to_ship(&mut tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
-        kind: "BATCH_INSPECTED".into(),
+        kind: "BATCH_TO_SHIP".into(),
         payload: serde_json::json!({
             "submitted": out.submitted.len(),
             "failed": out.failed.len(),
@@ -173,25 +141,80 @@ pub async fn batch_scan_inspect(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/parts/{part_id}/fail-inspection
+/// POST /api/v2/parts/{part_id}/to-inspection
+///
+/// 单件送检（`PENDING / PROGRAMMING / IN_PROCESS` → `INSPECTION`）。
+///
+/// 行为：
+/// - 权限：`Manager` 或 `Inspector`
+/// - 入参：path `part_id` + body `ToInspectionRequest`
+/// - 业务流转：见 service `to_inspection_core`
+/// - WS 广播：commit 后 `PART_TO_INSPECTION`
+/// - 响应：`ToXxxOut { part, new_batch_id }`
+pub async fn to_inspection(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<ToInspectionRequest>,
+) -> Result<Json<R<ToXxxOut>>, AppError> {
+    current.require_any_role(TO_XXX_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::to_inspection(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    ws_broadcast_to_inspection(&state, part_id, "to-inspection");
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/batch-to-inspection
+///
+/// 批量送检（共享品检架 + per-item to_inspection_core）。
+///
+/// 行为：
+/// - 权限：`Manager` 或 `Inspector`
+/// - 入参：`{ target_inspection_shelf_id, items: [...] }`
+/// - 业务流转：service `batch_to_inspection`（共享外层事务 + per-item 独立 core）
+/// - WS 广播：commit 后 `BATCH_TO_INSPECTION`
+/// - 响应：`{ submitted, failed }`
+pub async fn batch_to_inspection(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<BatchToInspectionRequest>,
+) -> Result<Json<R<BatchToXxxOut>>, AppError> {
+    current.require_any_role(TO_XXX_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::batch_to_inspection(&mut tx, &state.snowflake, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "BATCH_TO_INSPECTION".into(),
+        payload: serde_json::json!({
+            "submitted": out.submitted.len(),
+            "failed": out.failed.len(),
+        }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/to-process
 ///
 /// 单件品检打回（`INSPECTION` → `IN_PROCESS`，推荐需求 3）。
 ///
 /// 行为：
 /// - 权限：`Manager` 或 `Inspector`
-/// - 业务流转：见 service `fail_inspection_core`
-/// - WS 广播：commit 后 `INSPECTION_FAILED`
-pub async fn fail_inspection(
+/// - 入参：path `part_id` + body `ToProcessRequest`
+/// - 业务流转：见 service `to_process_core`
+/// - WS 广播：commit 后 `PART_TO_PROCESS`
+/// - 响应：`ToXxxOut { part, new_batch_id }`
+pub async fn to_process(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(part_id): Path<i64>,
-    Json(req): Json<FailInspectionRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    current.require_any_role(PASS_INSPECTION_ROLES)?;
+    Json(req): Json<ToProcessRequest>,
+) -> Result<Json<R<ToXxxOut>>, AppError> {
+    current.require_any_role(TO_XXX_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::fail_inspection(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::to_process(&mut tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
-    ws_broadcast_inspection_failed(&state, part_id);
+    ws_broadcast_to_process(&state, part_id);
     Ok(Json(R::ok(out)))
 }
 
@@ -217,7 +240,7 @@ pub async fn fail_inspection(
 ///
 /// `current: CurrentUser` 直接参数：依赖 `CurrentUser` 的
 /// `FromRequestParts<Arc<AppState>>` impl 从 Bearer JWT 解析（与
-/// `part/handler.rs::pass_inspection` / `worker_pool/handler.rs` 同形）。
+/// `part/handler.rs::to_ship` / `worker_pool/handler.rs` 同形）。
 pub async fn worker_scan(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
