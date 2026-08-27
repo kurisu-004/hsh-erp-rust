@@ -22,5 +22,5 @@ if [ -z "${DATABASE_URL:-}" ]; then
 fi
 
 echo "→ cargo sqlx prepare -- --lib"
-cargo sqlx prepare -- --lib
+cargo sqlx prepare -- --lib --tests
 echo "✓ .sqlx/query-*.json 已生成"
