@@ -88,6 +88,10 @@ pub mod code {
     pub const BIZ_ASSEMBLY_NOT_FOUND: i32 = 20301;
     pub const BIZ_ASSEMBLY_BAD_CUSTOMER: i32 = 20302;            // 客户节点不允许（一级集团 / 不存在）
     pub const BIZ_ASSEMBLY_TOO_MANY_CHILDREN: i32 = 20303;       // 子件 > 99，序列号 {serial}-{i:02d} 派生失败
+    pub const BIZ_ASSEMBLY_PDF_INVALID: i32 = 20305;             // multipart PDF 页数与 children.len()+1 不匹配 / lopdf 解析失败
+    pub const BIZ_ASSEMBLY_CHILD_PRICE_LOCKED: i32 = 20306;      // 父装配体已设总价时禁止子件改价（预留）
+    pub const BIZ_ASSEMBLY_HAS_SHIPMENT: i32 = 20307;            // 装配体已挂送货单，禁止 soft_delete（预留）
+    pub const BIZ_CUSTOMER_NO_SERIAL_PREFIX: i32 = 20308;        // L1 客户的 serial_prefix 为空（无法派发序列号）
 
     // 204xx 图纸文件（t_drawing_file + COS）
     pub const BIZ_DRAWING_FILE_NOT_FOUND: i32 = 20401;
@@ -516,6 +520,10 @@ mod tests {
         (code::BIZ_ASSEMBLY_NOT_FOUND, "BIZ_ASSEMBLY_NOT_FOUND"),
         (code::BIZ_ASSEMBLY_BAD_CUSTOMER, "BIZ_ASSEMBLY_BAD_CUSTOMER"),
         (code::BIZ_ASSEMBLY_TOO_MANY_CHILDREN, "BIZ_ASSEMBLY_TOO_MANY_CHILDREN"),
+        (code::BIZ_ASSEMBLY_PDF_INVALID, "BIZ_ASSEMBLY_PDF_INVALID"),
+        (code::BIZ_ASSEMBLY_CHILD_PRICE_LOCKED, "BIZ_ASSEMBLY_CHILD_PRICE_LOCKED"),
+        (code::BIZ_ASSEMBLY_HAS_SHIPMENT, "BIZ_ASSEMBLY_HAS_SHIPMENT"),
+        (code::BIZ_CUSTOMER_NO_SERIAL_PREFIX, "BIZ_CUSTOMER_NO_SERIAL_PREFIX"),
         // 204xx
         (code::BIZ_DRAWING_FILE_NOT_FOUND, "BIZ_DRAWING_FILE_NOT_FOUND"),
         (code::BIZ_DRAWING_FILE_BAD_TYPE, "BIZ_DRAWING_FILE_BAD_TYPE"),
@@ -658,6 +666,10 @@ mod tests {
         assert_eq!(code::BIZ_ASSEMBLY_NOT_FOUND, 20301);
         assert_eq!(code::BIZ_ASSEMBLY_BAD_CUSTOMER, 20302);
         assert_eq!(code::BIZ_ASSEMBLY_TOO_MANY_CHILDREN, 20303);
+        assert_eq!(code::BIZ_ASSEMBLY_PDF_INVALID, 20305);
+        assert_eq!(code::BIZ_ASSEMBLY_CHILD_PRICE_LOCKED, 20306);
+        assert_eq!(code::BIZ_ASSEMBLY_HAS_SHIPMENT, 20307);
+        assert_eq!(code::BIZ_CUSTOMER_NO_SERIAL_PREFIX, 20308);
 
         // 204xx
         assert_eq!(code::BIZ_DRAWING_FILE_NOT_FOUND, 20401);

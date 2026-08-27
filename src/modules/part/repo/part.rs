@@ -428,4 +428,86 @@ impl PartRepo {
         let row: (i64,) = qb.build_query_as().fetch_one(executor).await?;
         Ok(row.0)
     }
+
+    /// 装配件的子件列表（service `get_assembly` 详情接口用）。
+    ///
+    /// 与既有 `list_children` 语义相同，但**不**走 sqlx 宏（避免 SELECT * 与 TPart
+    /// 字段顺序耦合），用 `query_as` + 显式列清单；`include_deleted=false` 时过滤软删。
+    /// `serial_no` 升序以稳定 children 顺序（与服务端 `{asm_serial}-{i:02d}` 一致）。
+    pub async fn list_by_assembly_id<'e, E: PgExecutor<'e>>(
+        executor: E,
+        assembly_id: i64,
+        include_deleted: bool,
+    ) -> Result<Vec<TPart>, sqlx::Error> {
+        let sql = if include_deleted {
+            "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
+             request_date, planned_delivery_date, actual_delivery_date, \
+             customer_id, assembly_id, status, location, is_urgent, \
+             current_holder_id, placed_at, next_process_id, \
+             order_no, system_delivery_date, note, has_been_repaired, \
+             version, created_at, created_by, updated_at, updated_by, \
+             deleted_at, delivery_note_id \
+             FROM t_part WHERE assembly_id = $1 \
+             ORDER BY serial_no ASC NULLS LAST, id ASC"
+        } else {
+            "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
+             request_date, planned_delivery_date, actual_delivery_date, \
+             customer_id, assembly_id, status, location, is_urgent, \
+             current_holder_id, placed_at, next_process_id, \
+             order_no, system_delivery_date, note, has_been_repaired, \
+             version, created_at, created_by, updated_at, updated_by, \
+             deleted_at, delivery_note_id \
+             FROM t_part WHERE assembly_id = $1 AND deleted_at IS NULL \
+             ORDER BY serial_no ASC NULLS LAST, id ASC"
+        };
+        sqlx::query_as::<_, TPart>(sql)
+            .bind(assembly_id)
+            .fetch_all(executor)
+            .await
+    }
+
+    /// 子件随装配体一起建档；10 个参数都是必填的（id/asm_id/serial 是 3 个主键字段，
+    /// name/quantity/drawing_no/planned_delivery_date/customer_id 是 5 个属性，created_by 是审计字段），
+    /// 没有聚合语义，builder 包装反而是噪音。直接放宽即可。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_child_for_assembly<'e, E: PgExecutor<'e>>(
+        executor: E,
+        id: i64,
+        customer_id: i64,
+        assembly_id: i64,
+        serial_no: &str,
+        name: &str,
+        drawing_no: Option<&str>,
+        quantity: i32,
+        planned_delivery_date: Option<chrono::NaiveDate>,
+        current_user_id: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO t_part (
+                id, name, drawing_no, applicant_name, quantity, request_date,
+                planned_delivery_date, is_urgent, customer_id, assembly_id,
+                order_no, system_delivery_date, note, status, location,
+                unit_price, total_price, serial_no, version, created_by
+            ) VALUES (
+                $1, $2, $3, '', $4, CURRENT_DATE,
+                COALESCE($5, CURRENT_DATE), FALSE, $6, $7,
+                NULL, NULL, NULL, 'PENDING', 'OFFICE',
+                0, 0, $8, 0, $9
+            )
+            "#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(drawing_no)
+        .bind(quantity)
+        .bind(planned_delivery_date)
+        .bind(customer_id)
+        .bind(assembly_id)
+        .bind(serial_no)
+        .bind(current_user_id)
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
 }
