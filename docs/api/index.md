@@ -170,7 +170,7 @@ HTTP 状态码：
 
 ## 未上线域（前端勿调用）
 
-> 📋 Rust vs Python myERP 接口差距清单：[`./inconsistencies.md`](./inconsistencies.md)（4 域整域缺失 + 28 个 part 端点缺失 + WS 路径不一致）
+> 📋 Rust vs Python myERP 接口差距清单：[`./inconsistencies.md`](./inconsistencies.md)（4 域整域缺失 + 32 个 part 端点缺失 + WS 路径不一致）
 
 | 域 | 路由前缀 | 状态 |
 |---|---|---|

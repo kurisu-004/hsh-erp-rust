@@ -2,7 +2,7 @@
 
 > 本文件由 plan `2026-08-27-split-api-docs-and-find-gaps.md` 自动生成（手动维护）。
 > 权威源：Rust 后端 `src/modules/**/handler.rs` vs Python myERP `api/v1/*.py`。
-> 端点数：Rust **~86**（12 域已实现 + 4 域占位 + 1 WS stub）/ Python **~169**（19 域 + 1 WS + 1 MCP）。
+> 端点数：Rust **~104**（12 域已实现 + 4 域占位 + 1 WS stub）/ Python **~169**（19 域 + 1 WS + 1 MCP）。
 >
 > 🔧 **本文件仅作差距清单**，不对应已落地的 Rust 实现；Rust 代码补齐由后续 plan 实施。
 
@@ -11,9 +11,9 @@
 | 维度 | 数量 | 说明 |
 |---|---:|---|
 | 整域缺失（Python 有 Rust 无） | 4 域 | cnc_program / outsource / statistics / part_file 扩展 |
-| 部分缺失（part 域） | ~28 端点 | Python 46 vs Rust 18 |
-| 部分缺失（其他域） | ~5 端点 | applicants 7 vs 5；assemblies 9 vs 6 |
-| Rust-only | ~7 端点 | delivery-notes 新增 P3 scan + batch-detail；worker-pool；delivery-groups |
+| 部分缺失（part 域） | ~32 端点 | Python 46 vs Rust 18（其中 4 个为 Rust-only） |
+| 部分缺失（其他域） | ~6 端点 | applicants 7 vs 5；assemblies 9 vs 5 |
+| Rust-only | ~9 端点 | delivery-notes 新增 P3 scan + batch-detail；worker-pool；delivery-groups；part 域 batch-pass-inspection + batch-scan-inspect |
 | 占位模块（路由挂载但 Router 空） | 4 域 | cnc_program / outsource / part_file / statistics |
 | WS stub（路径不一致） | 1 | Rust `/ws/dashboard` vs Python `/api/v1/ws/dashboard` |
 
@@ -48,7 +48,7 @@
 
 **Rust 状态**：`src/modules/outsource/` 三件套全为占位；空 Router。
 
-**🔧 待实施**：完整外协域（公司 / 报价 / 发货 三子域），涉及新错误码段 212xx / 213xx / 215xx。
+**🔧 待实施**：完整外协域（公司 / 报价 / 发货 三子域），复用已预留的错误码段 212xx / 213xx / 215xx（见 `src/shared/error.rs:168,178,206`），按需补充新码。
 
 ---
 
@@ -90,12 +90,12 @@
 
 ---
 
-## 2. part 域部分缺失 — Python 46 端点 / Rust 18 端点（差 28）
+## 2. part 域部分缺失 — Python 46 端点 / Rust 18 端点（差 32，Rust 18 中 4 个为 Rust-only）
 
 **Python 参考**：`/Users/ren/Code/myERP/api/v1/part.py`（46 端点）
-**Rust 当前**：`docs/api/parts/index.md`（18 端点）
+**Rust 当前**：[`./parts/index.md`](./parts/index.md)（18 端点）
 
-### 2.1 列表/筛选（缺 ~10 端点）
+### 2.1 列表/筛选（缺 7 端点）
 
 | Method | Path | Python handler | 用途 |
 |---|---|---|---|
@@ -115,7 +115,7 @@
 | POST | `/api/v1/parts/{id}/batches/split` | 拆分批次 |
 | POST | `/api/v1/parts/{id}/batches/{batch_id}/cancel` | 取消批次 |
 
-### 2.3 状态机扩展（缺 11 端点）
+### 2.3 状态机扩展（缺 10 端点）
 
 | Method | Path | 触发流转 |
 |---|---|---|
@@ -146,10 +146,10 @@
 
 | Method | Path | 用途 |
 |---|---|---|
-| POST | `/api/v1/parts/{id}/print-drawing` | 打印单件图纸 |
+| GET | `/api/v1/parts/{id}/print-drawing` | 打印单件图纸 |
 | POST | `/api/v1/parts/print-drawing-batch` | 批量打印图纸 |
 
-### 2.6 流程辅助（缺 3 端点）
+### 2.6 流程辅助（缺 4 端点）
 
 | Method | Path | 用途 |
 |---|---|---|
@@ -158,7 +158,7 @@
 | GET | `/api/v1/parts/{id}/events` | 工单事件时间线（Rust delivery-note 已有 events，part 域缺失） |
 | POST | `/api/v1/parts/batch-with-pdfs` | 多页 PDF 树形创建（assembly 派单场景） |
 
-> **🔧 待实施**：part 域 28 个端点补齐涉及状态机大幅扩展 + new error codes (e.g. 20120+ PROGRAMMING_NOT_READY)。
+> **🔧 待实施**：part 域 32 个端点补齐涉及状态机大幅扩展 + new error codes (e.g. 20120+ PROGRAMMING_NOT_READY)。
 
 ---
 
@@ -173,13 +173,13 @@
 
 > **🔧 待实施**：补 2 端点。Rust applicants 域仅 CRUD，未含搜索 / 批量 upsert。
 
-### 3.2 assemblies — Python 9 端点 / Rust 6 端点（差 3）
+### 3.2 assemblies — Python 9 端点 / Rust 6 端点（差 4）
 
 | Method | Path | 用途 |
 |---|---|---|
 | POST | `/api/v1/assemblies/{id}/upload-pdf` | 上传 PDF（与 create-multipart 解耦，独立端点） |
 | POST | `/api/v1/assemblies/{id}/cancel` | ✅ 已实现为 `/api/v2/assemblies/{assembly_id}/cancel` |
-| GET | `/api/v1/assemblies/{id}/children` | 列出子件（Rust 在 detail 中已返回 children） |
+| POST | `/api/v1/assemblies/{id}/children` | 详情页添加单个子件（写操作；Rust 缺失） |
 | GET | `/api/v1/parts/{part_id}/assembly` | **子件反查父装配件**（Rust 缺失） |
 | GET | `/api/v1/assemblies/{id}/files` | 列出 PDF 文件（Rust 缺失，`files` 字段恒为空） |
 
@@ -193,6 +193,8 @@
 |---|---|---|---|
 | POST | `/api/v2/delivery-notes/scan` | delivery_notes | P3 扫码建单（find-or-create 草稿） |
 | GET | `/api/v2/delivery-notes/batch-detail` | delivery_notes | 批量详情（按 id 列表） |
+| POST | `/api/v2/parts/batch-pass-inspection` | part | 批量通过品检（Python 仅单件 `/parts/{id}/pass-inspection`） |
+| POST | `/api/v2/parts/batch-scan-inspect` | part | 批量一键送检（Python 仅单件 `/parts/{id}/scan-inspect`） |
 | GET / POST | `/api/v2/delivery-groups` | delivery_groups | 送货分组（Rust 新增域） |
 | POST | `/api/v2/delivery-groups/{id}/update` / `soft-delete` | delivery_groups | 同上 |
 | GET | `/api/v2/worker-pool/state` | worker_pool | 工人池状态查询（Rust 新增域） |
@@ -246,4 +248,4 @@
 1. **新增端点时**：Rust handler 实施完 → 同步 `docs/api/<mod>.md` 或 `docs/api/<mod>/index.md` + 子文件 → 在 PR 描述点出 `docs/api/` 有变更。
 2. **本文件** `inconsistencies.md` 应**每两周**（或重大端点新增后）刷新一次；删除已补齐端点，添加新发现差异。
 3. **Rust-only 端点**（第 4 节）不可删除；如有调整需同步 Python（如果 Python 后续追齐）。
-4. **WS 路径决策**：第 6 节列出两条路径任选其一，决定后修改 `src/modules/dashboard/handler.rs` 的 `Router::route("/ws/dashboard", ...)` 与 `src/main.rs::nest("/ws", ...)`，并同步更新 `docs/api/websocket.md`。
+4. **WS 路径决策**：第 6 节列出两条路径任选其一，决定后修改 `src/modules/dashboard/mod.rs:16` 的 `.route("/dashboard", ...)` 与 `src/main.rs:104` 的 `.nest("/ws", ...)`，并同步更新 `docs/api/websocket.md`。

@@ -199,4 +199,4 @@ assembly 域（203xx）见下方表格；共享错误码（40001 / 40300 / 40901
 - WS 事件：`ASSEMBLY_CREATED` / `ASSEMBLY_UPDATED` / `ASSEMBLY_DELETED` / `ASSEMBLY_CANCELLED`，详见 [`../websocket.md`](../websocket.md)
 - L1 / L2 客户约束：`src/modules/customer/`，详见 [`../customers.md`](../customers.md)
 - 序列号派发：`t_serial_counter`（part 域共用），详见 [`../parts/index.md`](../parts/index.md)
-- Python myERP 参考：`/Users/ren/Code/myERP/api/v1/assembly.py`（9 个端点；本目录 6 个端点之外的 3 个 Python 独有端点见 [`../inconsistencies.md`](../inconsistencies.md)）
+- Python myERP 参考：`/Users/ren/Code/myERP/api/v1/assembly.py`（9 个端点；本目录 6 个端点之外的 4 个 Python 独有端点见 [`../inconsistencies.md`](../inconsistencies.md)）
