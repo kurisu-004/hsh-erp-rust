@@ -25,14 +25,14 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ★ 静态段必须在 /{part_id}/... catch-all 之前注册，
-//   否则 axum 会把静态段（如 `batch`、`by-serial`、`worker-scan`、`batch-*-inspection`）
-//   解析成 part_id。
+        //   否则 axum 会把静态段（如 `batch`、`by-serial`、`worker-scan`、`batch-to-*`）
+        //   解析成 part_id。
         // ---- 列表 / 静态段 ----
         .route("/", get(handler::list_parts).post(handler::create_part))
         .route("/batch", post(handler::batch_create_parts))
         .route("/by-serial/{serial_no}", get(handler::get_by_serial))
-        .route("/batch-pass-inspection", post(handler::batch_pass_inspection))
-        .route("/batch-scan-inspect", post(handler::batch_scan_inspect))
+        .route("/batch-to-ship", post(handler::batch_to_ship))
+        .route("/batch-to-inspection", post(handler::batch_to_inspection))
         // worker-scan 静态段也必须在 /{part_id}/... 之前注册，
         // 否则 axum 会把 `worker-scan` 解析成 part_id=... 的 catch-all。
         .route("/worker-scan", post(handler::worker_scan))
@@ -45,8 +45,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/cancel", post(handler::cancel))
         .route("/{part_id}/complete", post(handler::complete))
         .route("/{part_id}/start-repair", post(handler::start_repair))
-        // ---- 既有 Phase F / F2 inspection 流 ----
-        .route("/{part_id}/pass-inspection", post(handler::pass_inspection))
-        .route("/{part_id}/scan-inspect", post(handler::scan_inspect))
-        .route("/{part_id}/fail-inspection", post(handler::fail_inspection))
+        // ---- to-XXX 流（替换 Phase F / F2 inspection）----
+        .route("/{part_id}/to-ship", post(handler::to_ship))
+        .route("/{part_id}/to-inspection", post(handler::to_inspection))
+        .route("/{part_id}/to-process", post(handler::to_process))
 }
