@@ -223,6 +223,36 @@ impl PartRepo {
             .map(|b| b.id))
     }
 
+    /// 按 id + 未软删定位 `t_part_batch` 行。
+    ///
+    /// 与 `find_inprocess_batch_for_part` / `find_scan_target_batch` 等的差异：
+    /// 本方法不限制 `status` / `part_id`，caller 拿到 `TPartBatch` 后用
+    /// `part_id` / `status` 字段自行派发。常用于批量端点的 item 反查
+    /// （按 batch_id 拿 part_id，再调对应的 `to_*_core`）。
+    ///
+    /// 不存在或已软删 → `Ok(None)`，由 service 层映射
+    /// `20109 BIZ_PART_BATCH_NOT_FOUND`。
+    pub async fn find_batch_by_id<'e, E: PgExecutor<'e>>(
+        executor: E,
+        batch_id: i64,
+    ) -> Result<Option<TPartBatch>, sqlx::Error> {
+        sqlx::query_as!(
+            TPartBatch,
+            r#"
+            SELECT id, part_id, batch_no, quantity, status, location,
+                   current_holder_id, next_process_id, placed_at,
+                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at
+            FROM t_part_batch
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+            batch_id,
+        )
+        .fetch_optional(executor)
+        .await
+    }
+
     /// 统计 part 仍处于 INSPECTION 状态的非软删批次数量。
     pub async fn count_other_inprocess_batches<'e, E: PgExecutor<'e>>(
         executor: E,

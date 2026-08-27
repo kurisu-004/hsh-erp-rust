@@ -168,36 +168,24 @@ impl PartService {
 
     /// 按 `id` 反查 `t_part_batch` 行（用于批量端点 item 反查 part_id）。
     ///
-    /// 与 `PartRepo::*_batch_for_part` 的差异：本方法只按 `id` + 未软删定位，
+    /// 与 `PartRepo::*_batch_for_part` 的差异：本方法只按 `id` + 未软删定位,
     /// 不限制 status / part_id —— caller 拿到 `TPartBatch` 后用 `part_id` /
     /// `status` 字段自行派发到对应的 `to_*_core`。
     ///
-    /// 故意走 `sqlx::query_as`（运行时校验）而非 `sqlx::query_as!`（编译期）：
-    /// repo/batch.rs 在本 PR 内冻结不修改，新增 repo 方法会破坏冻结契约；该
-    /// 查询只用于批量端点循环（O(n_items)），未进入 hot path，可接受运行时
-    /// 校验的轻微开销。后续若需要可加 `PartRepo::find_batch_by_id` 并切回
-    /// 编译期查询。
+    /// 委托给 [`PartRepo::find_batch_by_id`]（编译期 `sqlx::query_as!`）,
+    /// 走 repo 层统一约定,避免 service 内联 SQL。
     async fn _lookup_batch_by_id(
         conn: &mut PgConnection,
         batch_id: i64,
     ) -> Result<TPartBatch, AppError> {
-        sqlx::query_as::<_, TPartBatch>(
-            "SELECT id, part_id, batch_no, quantity, status, location, \
-             current_holder_id, next_process_id, placed_at, \
-             delivery_note_id, parent_batch_id, has_been_repaired, \
-             version, created_at, created_by, updated_at, updated_by, \
-             deleted_at \
-             FROM t_part_batch WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(batch_id)
-        .fetch_optional(&mut *conn)
-        .await?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("batch {batch_id} 不存在"),
-            )
-        })
+        PartRepo::find_batch_by_id(&mut *conn, batch_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_BATCH_NOT_FOUND,
+                    format!("batch {batch_id} 不存在"),
+                )
+            })
     }
 
     /// 部分通过拆批（to_ship / to_inspection / to_process 共享）。
