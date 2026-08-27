@@ -7,9 +7,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use rust_decimal::Decimal;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
 
 use crate::auth::rbac::{CurrentUser, Role};
+use crate::infra::clock;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::dto::{
     AssemblyChildOut, AssemblyCreateRequest, AssemblyCreateResult, AssemblyDetail,
@@ -342,22 +344,28 @@ impl AssemblyService {
         };
 
         // 5. INSERT t_assembly
+        //
+        // 注意：DB 端 `request_date` / `planned_delivery_date` / `unit_price` / `total_price`
+        // 均为 NOT NULL（见 migrations/20260811100005_005_create_part_tables.sql）。
+        // DTO 这 4 个字段是 `Option<>`，必须在 service 层填默认值，
+        // 否则 INSERT 会触发 23502 NOT NULL violation。
         let asm_id = snowflake.next_id();
+        let today = clock::now_naive().date();
         let new = NewAssembly {
             id: asm_id,
             drawing_no: &req.drawing_no,
             name: &req.name,
             applicant_name: req.applicant_name.as_deref(),
             customer_id,
-            request_date: req.request_date,
-            planned_delivery_date: req.planned_delivery_date,
+            request_date: Some(req.request_date.unwrap_or(today)),
+            planned_delivery_date: Some(req.planned_delivery_date.unwrap_or(today)),
             is_urgent: req.is_urgent.unwrap_or(false),
             status: "PENDING",
             version: 0,
             serial_no: serial_no.as_deref(),
             quantity: req.quantity.unwrap_or(1),
-            unit_price: req.unit_price,
-            total_price: req.total_price,
+            unit_price: req.unit_price.or(Some(Decimal::ZERO)),
+            total_price: req.total_price.or(Some(Decimal::ZERO)),
             order_no: req.order_no.as_deref(),
             system_delivery_date: req.system_delivery_date,
             note: req.note.as_deref(),
