@@ -12,7 +12,7 @@
 > - [`./workers.md`](./workers.md) — workers 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26）
 > - [`./work-types.md`](./work-types.md) — work_types 域（CRUD + process mapping + 三态更新，2026-08-26）
 > - [`./parts/index.md`](./parts/index.md) — part 域（part-pass-inspection 批量+单件 / scan-inspect / fail-inspection / **worker-scan**）
-> - [`./assemblies.md`](./assemblies.md) — assembly 域（装配体 CRUD + multipart PDF + 子件自动生成，2026-08-27）
+> - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（装配体 CRUD + multipart PDF + 子件自动生成，2026-08-27）
 > - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove**）
 > - [`./delivery-notes/index.md`](./delivery-notes/index.md) — delivery_notes 域（已拆为子目录：[queries](./delivery-notes/queries.md) / [drafts](./delivery-notes/drafts.md) / [workflow](./delivery-notes/workflow.md) / [print](./delivery-notes/print.md)）
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
@@ -159,7 +159,7 @@ HTTP 状态码：
 | workers | [`./workers.md`](./workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26） |
 | work-types | [`./work-types.md`](./work-types.md) | 7 | ✅ 完全上线（CRUD + process mapping + 三态更新 + 引用校验，2026-08-26） |
 | part | [`./parts/index.md`](./parts/index.md) | 6 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回、worker-scan（2026-08-25） |
-| assembly | [`./assemblies.md`](./assemblies.md) | 6 | 🟢 CRUD + multipart PDF + 子件自动生成 + L1→L2 展开（2026-08-27） |
+| assembly | [`./assemblies/index.md`](./assemblies/index.md) | 6 | 🟢 CRUD + multipart PDF + 子件自动生成 + L1→L2 展开（2026-08-27） |
 | worker_pool | [`./worker-pool.md`](./worker-pool.md) | 3 | 🟢 state + admin refill/remove + worker-scan 联动（2026-08-25） |
 | delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
