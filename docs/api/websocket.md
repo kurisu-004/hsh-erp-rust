@@ -46,10 +46,21 @@ Request：
 | ↳ `WORKER_POOL_REFILL_DONE` | worker-scan / admin-refill 完成后（refill 抢到一批） | `worker_id`, `shelf_id`, `taken: [TakenItem]`, `pool_empty` |
 | ↳ `WORKER_POOL_EMPTY` | refill 池空（refill 没抢到任何一批） | `worker_id`, `shelf_id` |
 | ↳ `WORKER_POOL_ADMIN_REMOVED` | admin remove 完成后 | `batch_id`, `part_id`, `batch_no`, `quantity`, `serial_no`, `drawing_no`, `system_delivery_date`, `planned_delivery_date`, `is_urgent`, `version`, `worker_id`, `shelf_id`, `next_process_id` |
+| ↳ `ASSEMBLY_UPDATED` | 父装配件 status 更新（前端主动改字段 / inspection 流 auto-rollup） | `assembly_id` |
 | `Notification` | 通知 | `user_id`, `content` |
 | `Heartbeat` | 心跳 | `ts` |
 
 > **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts/inspection.md#post-apiv2partsworker-scan`](./parts/inspection.md#post-apiv2partsworker-scan) 与 [`./worker-pool.md`](./worker-pool.md)。
 >
 > i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
+
+### `ASSEMBLY_UPDATED`
+
+- **Payload**: `{ "assembly_id": "<stringified i64>" }`
+- **触发端点**:
+ - `POST /api/v2/assemblies/{id}/update`（前端主动改字段）
+ - `POST /api/v2/parts/{id}/to-inspection` / `to-ship` / `to-process`
+ - `POST /api/v2/parts/batch-to-inspection` / `batch-to-ship`
+ - `POST /api/v2/parts/worker-scan`（仅 `INSPECTED` 分支，**实际翻状态时**才下发；dedup by assembly_id）
+- **频率**：每个 inspection 调用最多 1 次（per unique parent assembly）。
 

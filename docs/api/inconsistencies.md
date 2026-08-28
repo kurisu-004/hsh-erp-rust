@@ -249,3 +249,7 @@
 2. **本文件** `inconsistencies.md` 应**每两周**（或重大端点新增后）刷新一次；删除已补齐端点，添加新发现差异。
 3. **Rust-only 端点**（第 4 节）不可删除；如有调整需同步 Python（如果 Python 后续追齐）。
 4. **WS 路径决策**：第 6 节列出两条路径任选其一，决定后修改 `src/modules/dashboard/mod.rs:16` 的 `.route("/dashboard", ...)` 与 `src/main.rs:104` 的 `.nest("/ws", ...)`，并同步更新 `docs/api/websocket.md`。
+
+---
+
+> ✅ 2026-08-28: 子件状态聚合已实现 — assembly auto-sync via inspection flow
