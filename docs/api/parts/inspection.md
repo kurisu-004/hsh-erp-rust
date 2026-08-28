@@ -4,42 +4,175 @@
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 > 共享 DTO（PartOut / 端点约束）见 [`./index.md`](./index.md)
 >
-> 范围：本文件覆盖 6 个 inspection 端点（pass-inspection / batch-pass-inspection / scan-inspect / batch-scan-inspect / fail-inspection / worker-scan）。CRUD / lifecycle 见 [`./crud.md`](./crud.md) / [`./lifecycle.md`](./lifecycle.md)。
+> 范围：本文件覆盖 6 个 inspection 端点（`to-inspection` / `batch-to-inspection` / `to-ship` / `batch-to-ship` / `to-process` / `worker-scan`）。CRUD / lifecycle / by-serial / upload-drawing 见 [`./crud.md`](./crud.md) / [`./lifecycle.md`](./lifecycle.md)。
 
 ## 本文件目录
 
-
-- [POST /api/v2/parts/batch-pass-inspection](#post-apiv2partsbatch-pass-inspection)
-- [POST /api/v2/parts/{part_id}/pass-inspection](#post-apiv2partspart_idpass-inspection)
-- [POST /api/v2/parts/{part_id}/scan-inspect](#post-apiv2partspart_idscan-inspect)
-- [POST /api/v2/parts/batch-scan-inspect](#post-apiv2partsbatch-scan-inspect)
-- [POST /api/v2/parts/{part_id}/fail-inspection](#post-apiv2partspart_idfail-inspection)
+- [POST /api/v2/parts/batch-to-inspection](#post-apiv2partsbatch-to-inspection)
+- [POST /api/v2/parts/{part_id}/to-inspection](#post-apiv2partspart_idto-inspection)
+- [POST /api/v2/parts/batch-to-ship](#post-apiv2partsbatch-to-ship)
+- [POST /api/v2/parts/{part_id}/to-ship](#post-apiv2partspart_idto-ship)
+- [POST /api/v2/parts/{part_id}/to-process](#post-apiv2partspart_idto-process)
 - [POST /api/v2/parts/worker-scan](#post-apiv2partsworker-scan)
 
 ---
 
-### `POST /api/v2/parts/batch-pass-inspection`
+### `POST /api/v2/parts/batch-to-inspection`
 
 权限: **Manager / Inspector**
 
-Request：
+Request：`BatchToInspectionRequest`
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `items` | `BatchPassItem` | ✓ | 1..=200 个；空数组 / 超出上限 → `40001` |
-| `items[].part_id` | string (i64) | ✓ | 工单雪花 ID（字符串避免 JS 精度截断） |
-| `items[].batch_id` | string (i64)? | — | 指定批次；当 part 下存在多个 INSPECTION 批次时用于消歧，缺省按 part_id 唯一匹配 |
-| `items[].quantity` | i32? | — | 本次送检数量；当前仅支持整批送检，`quantity ≤ 0` 或 `quantity > 批次剩余量` → `20111` |
+| `target_inspection_shelf_id` | string (i64) | ✓ | 批量共享品检架；service 一次性校验 `zone='INSPECTION'` + `is_active=true`；**整批失败**返回顶层 `20511` / `20512` |
+| `items` | `BatchOpItem[]` | ✓ | 1..=`BATCH_TO_INSPECTION_MAX_ITEMS`（200）；空数组 / 超出上限 → `40001` |
 
-Response 200 `data`：`BatchPassInspectionOut`
+公共字段（`items[]`）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `batch_id` | string (i64) | ✓ | **必填**；service 按 `id` 反查 `t_part_batch` 拿 part_id（不再要求 caller 在 item 内填 part_id）；找不到批次 → `20109 BIZ_PART_BATCH_NOT_FOUND` |
+| `quantity` | i32? | — | 缺省 = 整批；详见 [自动拆批（auto-split）](#自动拆批auto-split) |
+
+> 与单件端点的关键差异：`items[]` **不带** `part_id` —— DTO 更精简、单 / 批 item shape 统一靠 `batch_id` 反查 part_id。
+>
+> 起始状态：item.batch 必须在 `{PENDING, PROGRAMMING, IN_PROCESS}` 之一（IN_PROCESS 还须 `location='PRODUCTION_SHELF'` + holder 是 shelf 而非 worker）。
+
+Response 200 `data`：`BatchToXxxOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `passed` | [PartOut](./index.md#partout-字段) | 成功送检的件；与 `items` 顺序一一对应（`passed[i]` 对应 `items[i]`） |
-| `failed` | `BatchPassFailure` | 失败的 item；单 item 不会同时出现在 `passed` 与 `failed` |
+| `submitted` | `ToXxxOut[]` | 成功并完成送检的 item；与 `items` 顺序一一对应（`submitted[i]` 对应 `items[i]`） |
+| `failed` | `BatchOpFailure[]` | 失败的 item；按 `batch_id` 定位失败项；单 item 不会同时出现在 `submitted` 与 `failed` |
 
-> 整体响应**始终为 200**。item 级别的失败通过 `data.failed[]` 体现（每个 item 含 `code` + `message`，调用方可按 `code` 分支处理）。
-> `20111` 仅在 item-level 报出，不影响整批响应状态。
+每条 `ToXxxOut` 形状：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part` | [`PartOut`](./index.md#partout-字段) | 送检后 part 的最新投影（含 OCC 更新后的 `version`） |
+| `new_batch_id` | string (i64)? | 仅当 `quantity < batch.quantity` 走拆批分支时为 `Some(remainder_id)`；整批操作时为 `null` |
+
+每条 `BatchOpFailure` 形状：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string (i64) | 失败的批次 ID |
+| `code` | i32 | item-level 错误码（参见 `错误码` 节） |
+| `message` | string | 失败原因（中文） |
+
+业务流转：
+
+- 起点状态：item.batch ∈ `{PENDING, PROGRAMMING, IN_PROCESS}`（部分通过拆批后 remainder 留在源状态；详见 [自动拆批](#自动拆批auto-split)）
+- 终点状态：`INSPECTION`；事件日志：`event_type='INSPECTED'`
+
+WS 广播（commit 后下发）：
+
+- `BATCH_TO_INSPECTION` —— payload `{ submitted: <count>, failed: <count> }`（仅计数，不含数组）
+
+错误码：
+
+- 40001 VALIDATION_ERROR — `items` 缺失 / 空数组 / 超过 200
+- 40300 FORBIDDEN — 非 Manager / 非 Inspector
+- 外层校验错误（顶层）：20511 / 20512（共享品检架不合法 → 整批失败）
+- item-level（出现在 `failed[].code`）：20101 / 20103 / 20104 / 20109 / 20111 / 40901
+
+---
+
+### `POST /api/v2/parts/{part_id}/to-inspection`
+
+权限: **Manager / Inspector**
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `part_id` | string (i64) | 工单雪花 ID |
+
+Request：`ToInspectionRequest`
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `target_inspection_shelf_id` | string (i64) | ✓ | 目标品检架；service 校验 `zone='INSPECTION'` + `is_active=true`（违反 → `20511` / `20512` / `20501`） |
+| `note` | string? | — | 送检备注；`≤ 500` 字符 |
+| `batch_id` | string (i64)? | — | 多批次歧义时 caller 显式指定以消除歧义；缺省按状态唯一匹配 `{PENDING, PROGRAMMING, IN_PROCESS}` 批次（多批 → `20109`） |
+| `quantity` | i32? | — | 本次送检数量；缺省 = 整批；详见 [自动拆批（auto-split）](#自动拆批auto-split) |
+
+业务流转：
+
+- 起点状态：`PENDING` / `PROGRAMMING` / `IN_PROCESS`
+  - `IN_PROCESS` 必须 `location='PRODUCTION_SHELF'` + `current_holder_id` 命中 `t_shelf`（service 启发式区分 worker 持有 vs shelf 持有；worker 持有 → 20103 / "工人持有件请先归还或送检"）
+- 终点状态：`INSPECTION`（`location='INSPECTION_SHELF'` + `current_holder_id=target_shelf.id`）
+- 事件日志：`event_type='INSPECTED'`
+
+WS 广播（commit 后下发）：
+
+- `PART_TO_INSPECTION` —— payload `{ part_id, shelf_code }`
+
+Response 200 `data`：`ToXxxOut`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part` | [`PartOut`](./index.md#partout-字段) | 流转后的 part 投影 |
+| `new_batch_id` | string (i64)? | 仅拆批时为 `Some(remainder_id)`；整批操作时为 `null` |
+
+错误码：
+
+- 20101 BIZ_PART_NOT_FOUND — 工单不存在 / 已软删
+- 20103 BIZ_INVALID_TRANSITION — part 当前 status 不在 `{PENDING, PROGRAMMING, IN_PROCESS}` 白名单；或 `IN_PROCESS` 但 holder 是 worker；或 `IN_PROCESS` 但 holder 是非 PRODUCTION 区货架
+- 20104 BIZ_INVALID_VALUE — part 状态字段不在 enum 白名单
+- 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不属于该工单 / 已划掉；或缺省匹配下 `{PENDING, PROGRAMMING, IN_PROCESS}` 多于一个
+- 20111 BIZ_PART_BATCH_INVALID_QUANTITY — `quantity ≤ 0`
+- 20501 BIZ_SHELF_NOT_FOUND — `target_inspection_shelf_id` 不存在
+- 20511 BIZ_SHELF_NOT_INSPECTION_ZONE — `target_inspection_shelf.zone ≠ 'INSPECTION'`
+- 20512 BIZ_SHELF_INACTIVE — `target_inspection_shelf.is_active = false`
+- 40901 VERSION_CONFLICT — 并发写，乐观锁失败
+- 40001 VALIDATION_ERROR — payload shape 错误（如缺 `target_inspection_shelf_id`）
+- 40300 FORBIDDEN — 非 Manager / 非 Inspector
+
+---
+
+### `POST /api/v2/parts/batch-to-ship`
+
+权限: **Manager / Inspector**
+
+Request：`BatchToShipRequest`
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `items` | `BatchOpItem[]` | ✓ | 1..=`BATCH_TO_SHIP_MAX_ITEMS`（200）；空数组 / 超出上限 → `40001` |
+
+公共字段（`items[]`）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `batch_id` | string (i64) | ✓ | **必填**；service 按 `id` 反查 `t_part_batch` 拿 part_id；找不到 → `20109 BIZ_PART_BATCH_NOT_FOUND` |
+| `quantity` | i32? | — | 缺省 = 整批；详见 [自动拆批（auto-split）](#自动拆批auto-split) |
+
+> 与 `batch-to-inspection` 同形；差异：
+>
+> - 不需要 `target_inspection_shelf_id`（to-ship 状态机终态是 `READY_TO_SHIP`，与品检货架无关）
+> - 起点状态：item.batch 必须是 `INSPECTION`；非 INSPECTION → `20103`
+
+Response 200 `data`：`BatchToXxxOut`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `submitted` | `ToXxxOut[]` | 成功通过品检的 item；与 `items` 顺序一一对应 |
+| `failed` | `BatchOpFailure[]` | 失败的 item（按 `batch_id` 定位） |
+
+`ToXxxOut` / `BatchOpFailure` 形状同 `batch-to-inspection`。
+
+业务流转：
+
+- 起点状态：`INSPECTION`（item.batch.status 必须为 `INSPECTION`，否则 20103）
+- 终点状态：`READY_TO_SHIP`
+- 多轮 rollup：service 检查 part 下是否还有其它 INSPECTION 批次；若有，**part.status 保持 `INSPECTION`**（仅 operated 批次翻状态）；若无，part.status 同步翻 `READY_TO_SHIP`
+- 事件日志：`event_type='STATUS_CHANGED'`（from=`INSPECTION` → to=`READY_TO_SHIP`）
+
+WS 广播（commit 后下发）：
+
+- `BATCH_TO_SHIP` —— payload `{ submitted: <count>, failed: <count> }`
 
 错误码：
 
@@ -47,7 +180,9 @@ Response 200 `data`：`BatchPassInspectionOut`
 - 40300 FORBIDDEN — 非 Manager / 非 Inspector
 - item-level（出现在 `failed[].code`）：20101 / 20103 / 20104 / 20109 / 20111 / 40901
 
-### `POST /api/v2/parts/{part_id}/pass-inspection`
+---
+
+### `POST /api/v2/parts/{part_id}/to-ship`
 
 权限: **Manager / Inspector**
 
@@ -57,28 +192,46 @@ Path：
 |---|---|---|
 | `part_id` | string (i64) | 工单雪花 ID |
 
-Request：可选 body `PassInspectionRequest`
+Request：`ToShipRequest`（**整个 body 可省略**，等价于全部字段全部 `None`；`Content-Length: 0` 按空对象处理）
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `batch_id` | string (i64)? | — | 缺省按 part_id 唯一匹配；多 INSPECTION 批次时必填 |
-| `quantity` | i32? | — | 整批送检；`quantity ≤ 0` 或 `quantity > 批次剩余量` → `20111` |
+| `batch_id` | string (i64)? | — | 多 INSPECTION 批次歧义时必填；缺省按 part_id 唯一匹配 |
+| `quantity` | i32? | — | 本次通过品检数量；缺省 = 整批；详见 [自动拆批](#自动拆批auto-split) |
+| `note` | string? | — | ≤ 500 字符 |
 
-> 当 body 完全省略（`Content-Length: 0`）时，按空对象处理。
+业务流转：
 
-Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后的工单最新投影
+- 起点状态：`INSPECTION`
+- 终点状态：`READY_TO_SHIP`
+- 多轮 rollup 守卫：service 检查 part 下其它 INSPECTION 批次；同 `batch-to-ship`
+- 事件日志：`event_type='STATUS_CHANGED'`
+
+WS 广播（commit 后下发）：
+
+- `PART_TO_SHIP` —— payload `{ part_id }`
+
+Response 200 `data`：`ToXxxOut`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part` | [`PartOut`](./index.md#partout-字段) | 通过品检后的 part 投影 |
+| `new_batch_id` | string (i64)? | 仅拆批时为 `Some(remainder_id)`；整批操作时为 `null` |
 
 错误码：
 
 - 20101 BIZ_PART_NOT_FOUND — 工单不存在 / 已软删
 - 20103 BIZ_INVALID_TRANSITION — part 当前 status 不是 `INSPECTION`（状态机迁移失败）
-- 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不属于该工单 / 已划掉
-- 20111 BIZ_PART_BATCH_INVALID_QUANTITY — `quantity ≤ 0` 或超过批次剩余量
+- 20104 BIZ_INVALID_VALUE — part 状态字段不在 enum 白名单
+- 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不属于该工单 / 已划掉；或多 INSPECTION 批次歧义
+- 20111 BIZ_PART_BATCH_INVALID_QUANTITY — `quantity ≤ 0`
 - 40901 VERSION_CONFLICT — 并发写，乐观锁失败
 - 40001 VALIDATION_ERROR — payload shape 错误
 - 40300 FORBIDDEN — 非 Manager / 非 Inspector
 
-### `POST /api/v2/parts/{part_id}/scan-inspect`
+---
+
+### `POST /api/v2/parts/{part_id}/to-process`
 
 权限: **Manager / Inspector**
 
@@ -88,127 +241,49 @@ Path：
 |---|---|---|
 | `part_id` | string (i64) | 工单雪花 ID |
 
-Request：`ScanInspectRequest`
+Request：`ToProcessRequest`
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `target_inspection_shelf_id` | string (i64) | ✓ | 品检架；service 校验 `zone='INSPECTION'` 且 `is_active=true`（违反 → `20511` / `20512`） |
-| `decision` | string | ✓ | `"PASS"` / `"FAIL"`（`ScanDecision` 枚举） |
-| `shelf_id` | string (i64)? | — | **仅 `decision=FAIL` 必填**；目标生产货架（`zone='PRODUCTION'` 且 `is_active=true`） |
-| `next_process_id` | string (i64)? | — | **仅 `decision=FAIL` 必填**；下一道工序 id（须与 `shelf_id` 映射 → 违反 → `20507`） |
-| `note` | string? | — | 品检备注；`≤ 500` 字符 |
-| `batch_id` | string (i64)? | — | 多批次歧义时 caller 显式指定以消除歧义；缺省按状态唯一匹配 `{PENDING, PROGRAMMING, IN_PROCESS}` 批次（多批 → `20109`） |
-| `quantity` | i32? | — | 本次送检数量；缺省 = 整批 |
+| `shelf_id` | string (i64) | ✓ | 目标生产货架（`zone='PRODUCTION'` 且 `is_active=true`）；违反 → `20501` / `20512` |
+| `next_process_id` | string (i64) | ✓ | 下一道工序 id（须与 `shelf_id` 在 `t_shelf_process` 存在映射 —— **当前实现仅校验 shelf 存在 / zone / active**；跨 shelf ↔ process 强校验留待 shelf 域 PR） |
+| `note` | string? | — | ≤ 500 字符 |
+| `batch_id` | string (i64)? | — | 多 INSPECTION 批次歧义时 caller 显式指定；缺省按状态唯一匹配 |
+| `quantity` | i32? | — | 本次打回数量；缺省 = 整批；详见 [自动拆批](#自动拆批auto-split) |
 
 业务流转：
 
-- 起始状态：`PENDING` / `PROGRAMMING` / `IN_PROCESS`（`IN_PROCESS` 须 `location='PRODUCTION_SHELF'` + `current_holder_id=shelf.id`，service 组合校验）
-- **PASS**：`part` + `part_batch` → `INSPECTION` → `READY_TO_SHIP`（commit 前一次性走完，事件日志 `INSPECTED`）
-- **FAIL**：`part` + `part_batch` → `INSPECTION` → `IN_PROCESS`（须填齐 `shelf_id` + `next_process_id`，事件日志 `INSPECTION_FAILED`）
-
-WS 广播（commit 后下发）：
-
-- `INSPECTED` —— payload `{ part_id, shelf_code: "scan-inspect" }`（详见 [`../websocket.md`](../websocket.md)）
-
-Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后的工单最新投影
-
-错误码：
-
-- 20101 BIZ_PART_NOT_FOUND — 工单不存在 / 已软删
-- 20103 BIZ_INVALID_TRANSITION — 当前 status 不在 `{PENDING, PROGRAMMING, IN_PROCESS}` 白名单（状态机迁移失败）
-- 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不属于该工单 / 已划掉；或缺省匹配下 `{PENDING, PROGRAMMING, IN_PROCESS}` 多于一个
-- 20507 BIZ_SHELF_PROCESS_NOT_MAPPED — `decision=FAIL` 时 `shelf_id` 未映射 `next_process_id`
-- 20511 BIZ_SHELF_NOT_INSPECTION_ZONE — `target_inspection_shelf.zone ≠ 'INSPECTION'`
-- 20512 BIZ_SHELF_INACTIVE — `target_inspection_shelf.is_active = false`
-- 40901 VERSION_CONFLICT — 并发写，乐观锁失败
-- 40001 VALIDATION_ERROR — payload shape / 必填字段缺失（如 `decision=FAIL` 时缺 `shelf_id` / `next_process_id`）
-- 40300 FORBIDDEN — 非 Manager / 非 Inspector
-
-### `POST /api/v2/parts/batch-scan-inspect`
-
-权限: **Manager / Inspector**
-
-Request：`BatchScanInspectRequest`
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `target_inspection_shelf_id` | string (i64) | ✓ | 批量共享品检架；service 校验 `zone='INSPECTION'` 且 `is_active=true`（违反 → 整批失败 `20511` / `20512`） |
-| `items` | `BatchScanInspectItem` | ✓ | 1..=200 个；空数组 / 超出上限 → `40001` |
-| `items[].part_id` | string (i64) | ✓ | 工单雪花 ID |
-| `items[].decision` | string? | — | `"PASS"` / `"FAIL"`；缺省 = `"PASS"`（高频场景：整组送检全 PASS） |
-| `items[].shelf_id` | string (i64)? | — | **仅 `decision=FAIL` 必填**；目标生产货架 |
-| `items[].next_process_id` | string (i64)? | — | **仅 `decision=FAIL` 必填**；下一道工序 id |
-| `items[].note` | string? | — | 品检备注；`≤ 500` 字符 |
-| `items[].batch_id` | string (i64)? | — | 多批次歧义时显式指定 |
-| `items[].quantity` | i32? | — | 本次送检数量；缺省 = 整批 |
-
-业务流转：
-
-- `target_inspection_shelf_id` 共享：批量内所有 item 走同一品检架
-- per-item `decision`：缺省 `PASS`；`FAIL` 路径独立走 `fail_inspection_core`（须填齐 `shelf_id` + `next_process_id`）
-
-Response 200 `data`：`BatchScanInspectOut`
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `submitted` | [PartOut](./index.md#partout-字段) | 成功并完成 PASS/FAIL 流转的件；与 `items` 顺序一一对应（`submitted[i]` 对应 `items[i]`） |
-| `failed` | `BatchScanInspectFailure` | 失败的 item；单 item 不会同时出现在 `submitted` 与 `failed` |
-
-> 整体响应**始终为 200**。item 级别失败通过 `data.failed[]` 体现（每个 item 含 `code` + `message`）。`target_inspection_shelf_id` 不属于 INSPECTION 区 / 不 active 这种**外层校验错误**会立即终止整批并以顶层错误码返回（`20511` / `20512`）。
-
-WS 广播（commit 后下发）：
-
-- `BATCH_INSPECTED` —— payload `{ submitted: <count>, failed: <count> }`（仅计数，不含数组）
-
-错误码：
-
-- 40001 VALIDATION_ERROR — `items` 缺失 / 空数组 / 超过 200
-- 40300 FORBIDDEN — 非 Manager / 非 Inspector
-- 外层校验错误（顶层）：20511 / 20512
-- item-level（出现在 `failed[].code`）：20101 / 20103 / 20104 / 20109 / 20111 / 20507 / 40901
-
-### `POST /api/v2/parts/{part_id}/fail-inspection`
-
-权限: **Manager / Inspector**
-
-Path：
-
-| 参数 | 类型 | 说明 |
-|---|---|---|
-| `part_id` | string (i64) | 工单雪花 ID |
-
-Request：`FailInspectionRequest`
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `shelf_id` | string (i64) | ✓ | 目标生产货架（`zone='PRODUCTION'` 且 `is_active=true`） |
-| `next_process_id` | string (i64) | ✓ | 下一道工序 id（须与 `shelf_id` 映射 → 违反 → `20507`） |
-| `note` | string? | — | 品检备注；`≤ 500` 字符 |
-| `batch_id` | string (i64)? | — | 多 INSPECTION 批次歧义时 caller 显式指定以消除歧义；缺省按状态唯一匹配 |
-| `quantity` | i32? | — | 本次打回数量；缺省 = 整批；`quantity ≤ 0` 或超过批次剩余量 → `20111` |
-
-业务流转：
-
-- 起始状态：`INSPECTION`
-- 终止状态：`IN_PROCESS`（`location='PRODUCTION_SHELF'` + `current_holder_id=shelf.id` + `next_process_id`）
+- 起点状态：`INSPECTION`
+- 终点状态：`IN_PROCESS`（`location='PRODUCTION_SHELF'` + `current_holder_id=shelf.id` + `next_process_id`）
+- 多轮 rollup 守卫：同 `to-ship` —— 若 part 下还有其它 INSPECTION 批次，**part.status 保持 `INSPECTION`**
 - 事件日志：`event_type='INSPECTION_FAILED'`
 
 WS 广播（commit 后下发）：
 
-- `INSPECTION_FAILED` —— payload `{ part_id }`
+- `PART_TO_PROCESS` —— payload `{ part_id }`
 
-Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后的工单最新投影
+Response 200 `data`：`ToXxxOut`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part` | [`PartOut`](./index.md#partout-字段) | 打回后的 part 投影 |
+| `new_batch_id` | string (i64)? | 仅拆批时为 `Some(remainder_id)`；整批操作时为 `null` |
 
 错误码：
 
 - 20101 BIZ_PART_NOT_FOUND — 工单不存在 / 已软删
 - 20103 BIZ_INVALID_TRANSITION — part 当前 status 不是 `INSPECTION`（状态机迁移失败）
-- 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不属于该工单 / 已划掉
-- 20111 BIZ_PART_BATCH_INVALID_QUANTITY — `quantity ≤ 0` 或超过批次剩余量
-- 20507 BIZ_SHELF_PROCESS_NOT_MAPPED — `shelf_id` 未映射 `next_process_id`
+- 20104 BIZ_INVALID_VALUE — part 状态字段不在 enum 白名单；或 shelf 不在 PRODUCTION 区
+- 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不属于该工单 / 已划掉；或多 INSPECTION 批次歧义
+- 20111 BIZ_PART_BATCH_INVALID_QUANTITY — `quantity ≤ 0`
+- 20501 BIZ_SHELF_NOT_FOUND — `shelf_id` 不存在
+- 20507 BIZ_SHELF_PROCESS_NOT_MAPPED — `shelf_id` ↔ `next_process_id` 未映射（**待 shelf 域 PR 启用**，当前不报）
+- 20512 BIZ_SHELF_INACTIVE — `shelf.is_active = false`
 - 40901 VERSION_CONFLICT — 并发写，乐观锁失败
 - 40001 VALIDATION_ERROR — payload shape / 必填字段缺失
 - 40300 FORBIDDEN — 非 Manager / 非 Inspector
+
+---
 
 ### `POST /api/v2/parts/worker-scan`
 
@@ -221,7 +296,7 @@ Request：`WorkerScanRequest`
 | `serial_no` | string | ✓ | 扫码得到的序列号（service 反查 part） |
 | `badge_code` | string | ✓ | 工人 badge_code（service 反查 worker） |
 | `event_type` | string | ✓ | `"RETURNED"` / `"INSPECTED"`（`WorkerScanEvent` 枚举） |
-| `shelf_id` | string (i64) | ✓ | RETURNED 时是 worker-scan 货架（PRODUCTION 区）；INSPECTED 时是工人触发扫码的货架（可为任意 INSPECTION 区货架） |
+| `shelf_id` | string (i64) | ✓ | RETURNED 时是 worker-scan 货架（PRODUCTION 区）；INSPECTED 时是工人触发扫码的货架（PRODUCTION 区校验） |
 | `next_process_id` | string (i64)? | — | **仅 RETURNED 必填**；缺 / 非法 → `40001` |
 | `target_inspection_shelf_id` | string (i64)? | — | **仅 INSPECTED 必填**；缺 / 非法 → `40001`；service 校验 `zone='INSPECTION'` 且 `is_active=true` |
 | `batch_id` | string (i64)? | — | 多批次歧义时 caller 显式指定以消除歧义 |
@@ -229,13 +304,14 @@ Request：`WorkerScanRequest`
 业务流转：
 
 - **RETURNED**：worker 把 IN_PROCESS+WORKER 批次放回生产架
-  - `shelf_id` 必须映射 `next_process_id`（service 校验）→ 不匹配 `20507 BIZ_SHELF_PROCESS_NOT_MAPPED`
+  - `shelf_id` 必须映射 `next_process_id`（service 校验 `t_shelf_process`）→ 不匹配 `20507 BIZ_SHELF_PROCESS_NOT_MAPPED`
   - `part_batch` 与 `part` 状态切回 IN_PROCESS+PRODUCTION_SHELF+holder=shelf（OCC）
-  - 写 `RETURNED_BY_WORKER` 事件日志
+  - 写 `RETURNED_TO_SHELF` 事件日志
 - **INSPECTED**：worker 把持有件直接送检
   - `target_inspection_shelf_id` 必须属于 INSPECTION 区且 active
   - 不符合 → `20511 BIZ_SHELF_NOT_INSPECTION_ZONE` / `20512 BIZ_SHELF_INACTIVE`
-  - part 流转到 INSPECTION 状态
+  - 内部走 `to_inspection_core`：状态机 `IN_PROCESS → INSPECTION` + holder worker → target_shelf + 写 `SENT_TO_INSPECTION` 事件日志
+  - 不带 quantity 拆批（worker-scan 是单件持有件流转，不涉及批次拆分）
 - **任一成功后**同事务调用 `WorkerPoolService::refill_for_worker`：
   - 工人当前工种可加工工序池有候选 → 自动抢满 `work_type.max_held_batches`（或池空为止）
   - 池空 → 业务侧返回 `data.refill.pool_empty=true`，不报错
@@ -253,14 +329,16 @@ Response 200 `data`：`WorkerScanOut`
 错误码：
 
 - 20101 BIZ_PART_NOT_FOUND — `serial_no` 无法解析为 part
+- 20103 BIZ_INVALID_TRANSITION — part 当前状态不允许（INSPECTED 分支）
 - 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不属于该工单 / 已划掉
-- 20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER — `(worker, batch)` 不在 IN_PROCESS+WORKER 持有中（worker 不是该批次当前持有人）
+- 20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER — `(worker, batch)` 不在 IN_PROCESS+WORKER 持有中（worker 不是该批次当前持有人）；或多批次歧义
 - 20201 BIZ_WORKER_NOT_FOUND — `badge_code` 无法解析为 worker
 - 20202 BIZ_WORKER_INACTIVE — worker 已停用
 - 20206 BIZ_WORKER_NO_WORK_TYPE — worker.work_type_id IS NULL
 - 20901 BIZ_WORK_TYPE_NOT_FOUND — worker.work_type_id 指向不存在的工种（防御性）
 - 20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET — work_type.max_held_batches IS NULL
 - 20905 BIZ_WORK_TYPE_NO_PROCESS_MAPPING — work_type 未映射工序（refill 触发）
+- 20501 BIZ_SHELF_NOT_FOUND — `shelf_id` 不存在 / 非 PRODUCTION / target 非 INSPECTION
 - 20507 BIZ_SHELF_PROCESS_NOT_MAPPED — `shelf_id` 未映射 `next_process_id`（RETURNED 路径）
 - 20511 BIZ_SHELF_NOT_INSPECTION_ZONE — `target_inspection_shelf.zone ≠ 'INSPECTION'`（INSPECTED 路径）
 - 20512 BIZ_SHELF_INACTIVE — `target_inspection_shelf.is_active = false`（INSPECTED 路径）
@@ -279,154 +357,212 @@ WS 广播（commit 后下发）：
 
 ---
 
+## 自动拆批（auto-split）
+
+to-XXX 流共用的部分通过拆批语义。**所有 5 个单 / 批端点行为一致**：
+
+| `quantity` 取值 | 行为 |
+|---|---|
+| **缺省**（`None`） | 整批操作（`op_qty = batch.quantity`），**不拆批** |
+| `quantity == batch.quantity` | 整批操作，**不拆批** |
+| `quantity < batch.quantity`（且 > 0） | **拆批**：operated 部分（拆出的新批次，quantity = op_qty）走状态翻转；remainder 部分（原批次 quantity 减少）留在源状态待后续操作 |
+| `quantity ≤ 0` | `20111 BIZ_PART_BATCH_INVALID_QUANTITY` |
+
+> 注：`quantity > batch.quantity` 在新实现下**不会**触发 20111 —— service 直接走整批分支（`op_qty ≥ batch.quantity` 时不拆批），请求等价于 `quantity == batch.quantity`。
+
+拆批响应语义（`ToXxxOut.new_batch_id`）：
+
+| 操作类型 | `new_batch_id` | 部分说明 |
+|---|---|---|
+| 整批操作（缺省 / `quantity == batch.quantity`） | `null` | operated = 原批次，part.status 同步翻目标状态（若有 rollup 守卫则可能保留源状态） |
+| 部分通过（`quantity < batch.quantity`） | `Some(remainder_id)` | operated = 拆出的新批次；part.status 由 rollup 守卫判定：若还有其它源状态批次则保留源状态，否则同步翻目标状态 |
+
+**前端的拆批后处理**：
+
+- 拿到非 null `new_batch_id` → 刷新批次列表（出现一行新批次 quantity = `batch.quantity - op_qty`）
+- 拿到 null → 不需要刷新批次列表（仅 part.status 翻状态）
+
+**回滚语义**：拆批写入与 operated 批次状态翻转在同一事务；事务失败时拆出的新批次与状态翻转一并回滚，不会出现「拆了批但没翻转」的中间态。
+
+---
+
 ## Inspection 专属 DTO
 
-### PassInspectionRequest 字段
+### `BatchOpItem` 字段（`POST /batch-to-ship` / `POST /batch-to-inspection` 共用 item shape）
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `batch_id` | string (i64)? | — | 见端点小节 |
-| `quantity` | i32? | — | 见端点小节 |
+| `batch_id` | string (i64) | ✓ | **必填**；service 按 `id` 反查 `t_part_batch` 拿 `part_id` + `status`，DTO 不带 `part_id` |
+| `quantity` | i32? | — | 缺省 = 整批；详见 [自动拆批](#自动拆批auto-split) |
+
+> 重要：`batch_id` 是 `String`（非 `Option`）—— `#[serde(default)]` 不会被触发；缺字段直接 `40001 VALIDATION_ERROR`。
+
+### `ToInspectionRequest` 字段（`{part_id}/to-inspection` 入参）
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `target_inspection_shelf_id` | string (i64) | ✓ | service 校验 `zone='INSPECTION'` + `is_active=true` |
+| `note` | string? | — | ≤ 500 字符 |
+| `batch_id` | string (i64)? | — | 多批次歧义时必填 |
+| `quantity` | i32? | — | 缺省 = 整批 |
+
+### `ToShipRequest` 字段（`{part_id}/to-ship` 入参）
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `batch_id` | string (i64)? | — | 多 INSPECTION 批次歧义时必填 |
+| `quantity` | i32? | — | 缺省 = 整批 |
+| `note` | string? | — | ≤ 500 字符 |
 
 > 整个 body 可省略，等价于全部字段全部 `None`。
 
-### BatchPassItem 字段
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `part_id` | string (i64) | ✓ | `deserialize_i64` 反序列化 |
-| `batch_id` | string (i64)? | — | 同 `PassInspectionRequest.batch_id` |
-| `quantity` | i32? | — | 同 `PassInspectionRequest.quantity` |
-
-### BatchPassInspectionRequest 字段
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `items` | `BatchPassItem` | ✓ | 1..=`BATCH_PASS_INSPECTION_MAX_ITEMS`（200） |
-
-### BatchPassFailure 字段
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `part_id` | string (i64) | 失败的工单 ID |
-| `code` | i32 | item-level 错误码（参见 endpoint `错误码` 节） |
-| `message` | string | 失败原因（中文） |
-
-### BatchPassInspectionOut 字段
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `passed` | [PartOut](./index.md#partout-字段) | 成功送检的件 |
-| `failed` | `BatchPassFailure` | 失败的件（`passed` ∩ `failed` = ∅） |
-
-### ScanInspectRequest 字段
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `target_inspection_shelf_id` | string (i64) | ✓ | 见 `scan-inspect` 端点 |
-| `decision` | string | ✓ | `"PASS"` / `"FAIL"`（`ScanDecision` 枚举） |
-| `shelf_id` | string (i64)? | — | 仅 FAIL 必填 |
-| `next_process_id` | string (i64)? | — | 仅 FAIL 必填 |
-| `note` | string? | — | ≤ 500 字符 |
-| `batch_id` | string (i64)? | — | 多批次歧义时必填 |
-| `quantity` | i32? | — | 缺省 = 整批 |
-
-### BatchScanInspectItem 字段
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `part_id` | string (i64) | ✓ | `deserialize_i64` 反序列化 |
-| `decision` | string? | — | 缺省 = `"PASS"` |
-| `shelf_id` | string (i64)? | — | 仅 FAIL 必填 |
-| `next_process_id` | string (i64)? | — | 仅 FAIL 必填 |
-| `note` | string? | — | ≤ 500 字符 |
-| `batch_id` | string (i64)? | — | 多批次歧义时必填 |
-| `quantity` | i32? | — | 缺省 = 整批 |
-
-### BatchScanInspectRequest 字段
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `target_inspection_shelf_id` | string (i64) | ✓ | 批量共享品检架 |
-| `items` | `BatchScanInspectItem` | ✓ | 1..=`BATCH_SCAN_INSPECT_MAX_ITEMS`（200） |
-
-### BatchScanInspectFailure 字段
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `part_id` | string (i64) | 失败的工单 ID |
-| `code` | i32 | item-level 错误码（参见 `batch-scan-inspect` 端点 `错误码` 节） |
-| `message` | string | 失败原因（中文） |
-
-### BatchScanInspectOut 字段
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `submitted` | [PartOut](./index.md#partout-字段) | 成功流转的件 |
-| `failed` | `BatchScanInspectFailure` | 失败的件（`submitted` ∩ `failed` = ∅） |
-
-### FailInspectionRequest 字段
+### `ToProcessRequest` 字段（`{part_id}/to-process` 入参）
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `shelf_id` | string (i64) | ✓ | 目标生产货架（PRODUCTION 区 active） |
-| `next_process_id` | string (i64) | ✓ | 下一道工序 id |
+| `next_process_id` | string (i64) | ✓ | 下一道工序 id（与 shelf 映射 —— 当前仅校验 shelf 存在 / zone / active） |
 | `note` | string? | — | ≤ 500 字符 |
-| `batch_id` | string (i64)? | — | 多批次歧义时必填 |
+| `batch_id` | string (i64)? | — | 多 INSPECTION 批次歧义时必填 |
 | `quantity` | i32? | — | 缺省 = 整批 |
 
-### Phase F2（scan-inspect）
+### `ToXxxOut` 字段（单件 / 批量 to-XXX 端点共用出参）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part` | [`PartOut`](./index.md#partout-字段) | 操作后 part 的最新投影（含 OCC 更新后的 `version`） |
+| `new_batch_id` | string (i64)? | 仅 `quantity < target.quantity` 走拆批分支时为 `Some(remainder_id)`（拆批后**剩余批次**的 id，留在源状态待后续操作）；整批操作时为 `null`（序列化为 JSON `null`）。前端拿到非 null 时应刷新批次列表 |
+
+### `BatchToInspectionRequest` 字段（`POST /batch-to-inspection` 入参）
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `target_inspection_shelf_id` | string (i64) | ✓ | 批量共享品检架（与单件入参同形校验） |
+| `items` | `BatchOpItem[]` | ✓ | 1..=`BATCH_TO_INSPECTION_MAX_ITEMS`（200） |
+
+### `BatchToShipRequest` 字段（`POST /batch-to-ship` 入参）
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `items` | `BatchOpItem[]` | ✓ | 1..=`BATCH_TO_SHIP_MAX_ITEMS`（200） |
+
+> 不需要 `target_inspection_shelf_id`（to-ship 状态机终态是 `READY_TO_SHIP`，与品检货架无关）。
+
+### `BatchOpFailure` 字段（per-item 失败明细）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string (i64) | 失败的批次 ID（`i64` 是 service 已 parse 过，用 `serialize_i64` 序列化为 JSON 字符串与前端 batch_id 字段类型对称）；解析失败时填 `0` sentinel |
+| `code` | i32 | item-level 错误码（透传 service 层：20101 / 20103 / 20104 / 20109 / 20111 / 20511 / 20512 / 40901） |
+| `message` | string | 失败原因（中文，透传 service 层文案） |
+
+### `BatchToXxxOut` 字段（`POST /batch-to-ship` / `POST /batch-to-inspection` 共用出参）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `submitted` | `ToXxxOut[]` | 成功并完成状态流转的 item（含 `PartOut` 最小投影 + 拆批后的 `new_batch_id`） |
+| `failed` | `BatchOpFailure[]` | item 级别错误（按 `batch_id` 定位） |
+
+> `submitted` 与 `failed` 互斥，单 item 不会同时出现在两侧。
+
+---
+
+## Phase F2 Rust 代码示例（to-XXX DTOs）
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum ScanDecision { PASS, FAIL }
+use serde::{Deserialize, Serialize};
+use crate::shared::types::{deserialize_i64, serialize_i64, serialize_i64_opt};
 
-pub struct ScanInspectRequest {
-    pub target_inspection_shelf_id: String,  // 雪花 ID（i64 字符串）
-    pub decision: ScanDecision,
-    pub shelf_id: Option<String>,            // FAIL 必填
-    pub next_process_id: Option<String>,     // FAIL 必填
-    pub note: Option<String>,                // ≤ 500 字符
-    pub batch_id: Option<String>,            // 多批次歧义时必填
-    pub quantity: Option<i32>,               // 缺省=整批
+/// 批量端点 item 公共结构（无 part_id；service 从 batch_id 反查）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchOpItem {
+    pub batch_id: String,                    // 必填；非 Option
+    #[serde(default)]
+    pub quantity: Option<i32>,               // 缺省 = 整批
 }
 
-pub struct BatchScanInspectItem {
-    pub part_id: i64,                        // 雪花 ID
-    pub decision: Option<ScanDecision>,      // 缺省=PASS
-    pub shelf_id: Option<String>,
-    pub next_process_id: Option<String>,
-    pub note: Option<String>,
+/// 单件 to-inspection 入参（`POST /parts/{id}/to-inspection`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToInspectionRequest {
+    pub target_inspection_shelf_id: String,  // 必填（雪花 ID 字符串）
+    #[serde(default)]
+    pub note: Option<String>,                // ≤ 500 字符
+    #[serde(default)]
+    pub batch_id: Option<String>,            // 多批次歧义时必填
+    #[serde(default)]
+    pub quantity: Option<i32>,               // 缺省 = 整批
+}
+
+/// 单件 to-ship 入参（`POST /parts/{id}/to-ship`）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToShipRequest {
+    #[serde(default)]
     pub batch_id: Option<String>,
+    #[serde(default)]
+    pub quantity: Option<i32>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// 单件 to-process 入参（`POST /parts/{id}/to-process`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToProcessRequest {
+    pub shelf_id: String,                    // 必填（PRODUCTION 区 active）
+    pub next_process_id: String,             // 必填
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub batch_id: Option<String>,
+    #[serde(default)]
     pub quantity: Option<i32>,
 }
 
-pub struct BatchScanInspectRequest {
-    pub target_inspection_shelf_id: String,
-    pub items: Vec<BatchScanInspectItem>,    // 1..=200
+/// 单件 / 批量 to-XXX 端点的统一出参 shape。
+#[derive(Debug, Clone, Serialize)]
+pub struct ToXxxOut {
+    pub part: PartOut,                       // 操作后的 part 投影
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub new_batch_id: Option<i64>,           // 拆批 remainder id；整批为 None
 }
 
-pub struct BatchScanInspectFailure {
-    pub part_id: i64,
+/// 批量入参（`POST /parts/batch-to-inspection`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchToInspectionRequest {
+    pub target_inspection_shelf_id: String,  // 批量共享品检架
+    pub items: Vec<BatchOpItem>,             // 1..=200
+}
+
+/// 批量入参（`POST /parts/batch-to-ship`）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchToShipRequest {
+    pub items: Vec<BatchOpItem>,             // 1..=200
+}
+
+/// Per-item 失败明细。
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchOpFailure {
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,                       // 解析失败时为 0 sentinel
     pub code: i32,                           // 业务错误码
     pub message: String,                     // 错误 message
 }
 
-pub struct BatchScanInspectOut {
-    pub submitted: Vec<PartOut>,
-    pub failed: Vec<BatchScanInspectFailure>,
+/// 批量端点统一出参（`batch-to-ship` / `batch-to-inspection` 共用）。
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchToXxxOut {
+    pub submitted: Vec<ToXxxOut>,            // 成功 item（含 part + new_batch_id）
+    pub failed: Vec<BatchOpFailure>,         // 失败 item
 }
 
-pub struct FailInspectionRequest {
-    pub shelf_id: String,                    // 必填（PRODUCTION 区 active）
-    pub next_process_id: String,             // 必填
-    pub note: Option<String>,
-    pub batch_id: Option<String>,
-    pub quantity: Option<i32>,
-}
+// `PartOut` 字段集与 `model::TPartInspected` 完全对齐：
+// id (i64 string) / serial_no / name / drawing_no / status / version /
+// quantity / order_no / actual_delivery_date / updated_at / updated_by
+// （详见 [`./index.md`](./index.md#partout-字段)）
+```
 
-### Phase W（worker-scan + worker-pool 联动）
+---
+
+## Phase W（worker-scan 不变）
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -438,7 +574,7 @@ pub struct WorkerScanRequest {
     pub badge_code: String,                  // 扫码：工人 badge_code
     pub event_type: WorkerScanEvent,
     #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,                       // worker-scan 货架
+    pub shelf_id: i64,                       // worker-scan 货架（PRODUCTION 区 active）
     #[serde(default)]
     pub next_process_id: Option<String>,     // 仅 RETURNED 必填
     #[serde(default)]
@@ -456,6 +592,7 @@ pub struct WorkerScanCoreOut {
 
 // WorkerScanOut = { scan: WorkerScanCoreOut, refill: RefillResult }
 // （RefillResult 定义在 worker_pool/model.rs，详见 ./worker-pool.md）
+```
 
 ---
 
@@ -463,16 +600,18 @@ pub struct WorkerScanCoreOut {
 
 | from | to | 触发场景 |
 |---|---|---|
-| INSPECTION | READY_TO_SHIP | `pass_inspection` 单/批；`scan-inspect` PASS 分支 |
-| PROGRAMMING | INSPECTION | `scan-inspect`（PROGRAMMING 工件） |
-| PENDING | INSPECTION | `scan-inspect`（待下发工单） |
-| IN_PROCESS | INSPECTION | `scan-inspect`（生产架工件，**必须 IN_PROCESS+PRODUCTION_SHELF**；service 层组合校验） |
+| INSPECTION | READY_TO_SHIP | `POST /parts/{id}/to-ship`（单件）或 `POST /parts/batch-to-ship`（批量） |
+| PROGRAMMING | INSPECTION | `POST /parts/{id}/to-inspection`（PROGRAMMING 工件）；`POST /parts/batch-to-inspection`；worker-scan INSPECTED |
+| PENDING | INSPECTION | `POST /parts/{id}/to-inspection`（待下发工单）；`POST /parts/batch-to-inspection` |
+| IN_PROCESS | INSPECTION | `POST /parts/{id}/to-inspection`（生产架工件，**必须 IN_PROCESS+PRODUCTION_SHELF**；service 层组合校验）；`POST /parts/batch-to-inspection`；worker-scan INSPECTED |
+| INSPECTION | IN_PROCESS | `POST /parts/{id}/to-process`（品检打回 / 选下一工序） |
+| IN_PROCESS | IN_PROCESS | worker-scan RETURNED（holder worker → shelf，状态不变） |
 | READY_TO_SHIP | DELIVERED | `deliver`（同事务翻最近一条 source-status 批次） |
 | DELIVERED | COMPLETED | `complete`（同事务；清空 `serial_no`） |
 | IN_PROCESS | REPAIRING | `start-repair`（同事务翻最近一条 IN_PROCESS 批次；置 `has_been_repaired=true`） |
 | PENDING / PROGRAMMING / INSPECTION / READY_TO_SHIP / DELIVERED | CANCELLED | `cancel`（同事务翻最近一条 source-status 批次；delivery_note 锁禁） |
 
-INSPECTION → IN_PROCESS 由 `fail_inspection`（推荐需求 3）走 service 流程：
+INSPECTION → IN_PROCESS 由 `POST /parts/{id}/to-process`（to_process 流）走 service 流程：
 
 - INSPECTION 状态 + `location='PRODUCTION_SHELF'` + `current_holder_id=shelf.id` + `next_process_id=...`
 - 事件日志：`event_type='INSPECTION_FAILED'`
@@ -484,22 +623,25 @@ INSPECTION → IN_PROCESS 由 `fail_inspection`（推荐需求 3）走 service �
 | code | 名称 | HTTP | 触发场景 |
 |---|---|---|---|
 | 20101 | BIZ_PART_NOT_FOUND | 404 | 工单不存在 / 已软删 |
-| 20103 | BIZ_INVALID_TRANSITION | 400 | 状态机白名单拒绝（cancel 时 COMPLETED/REPAIRING 等） |
-| 20104 | BIZ_INVALID_VALUE | 400 | DB status 字符串不在 enum 白名单 |
-| 20109 | BIZ_PART_BATCH_NOT_FOUND | 404 | inspection 流找不到 INSPECTION 批次 / 多批次歧义 |
-| 20111 | BIZ_PART_BATCH_INVALID_QUANTITY | 400 | quantity ≤ 0 或超过批次剩余量 |
+| 20103 | BIZ_INVALID_TRANSITION | 400 | 状态机白名单拒绝（cancel 时 COMPLETED/REPAIRING 等；to-XXX 时起点状态不匹配；IN_PROCESS 但 holder 是 worker） |
+| 20104 | BIZ_INVALID_VALUE | 400 | DB status 字符串不在 enum 白名单；或 shelf 不在 PRODUCTION 区 |
+| 20109 | BIZ_PART_BATCH_NOT_FOUND | 404 | inspection 流找不到目标批次 / 多批次歧义；批量端点 batch_id 反查失败 |
+| 20111 | BIZ_PART_BATCH_INVALID_QUANTITY | 400 | **`quantity ≤ 0`**（拆批语义收紧：`quantity > batch.quantity` 不再报 20111，等价于整批操作） |
+| 20114 | BIZ_PART_BATCH_NOT_HELD_BY_WORKER | 400 | worker-scan：worker 未持有该 part 活跃批次 / 多批次歧义 |
 | 20115 | BIZ_PART_ALREADY_CANCELLED | 409 | cancel/deliver/complete/start-repair 遇到 CANCELLED 状态 |
 | 20116 | BIZ_PART_NOT_DELIVERED | 400 | complete 要求 DELIVERED |
 | 20117 | BIZ_PART_NOT_READY_TO_SHIP | 400 | deliver 要求 READY_TO_SHIP |
 | 20118 | BIZ_PART_REPAIR_NOT_TRIGGERED | 400 | start-repair 要求 IN_PROCESS |
 | 20119 | BIZ_PART_NOT_DELETABLE | 409 | soft-delete 终态禁 |
 | 21420 | BIZ_DELIVERY_NOTE_LOCKED_PART | 409 | cancel / soft-delete 遇 part 已挂送货单 |
-| 40001 | VALIDATION_ERROR | 422 | 入参 shape 错 / multipart 字段错 |
+| 40001 | VALIDATION_ERROR | 422 | 入参 shape 错 / multipart 字段错 / 必填字段缺失 |
 | 40300 | FORBIDDEN | 403 | 角色不符 |
 
-### 货架错误码（20511 / 20512 — scan-inspect / fail-inspection 专用）
+### 货架错误码（205xx — to-XXX / worker-scan 触发）
 
 | code | 名称 | 触发场景 |
 |---|---|---|
+| 20501 | BIZ_SHELF_NOT_FOUND | shelf 不存在 / 已软删；worker-scan 时 shelf 不在 PRODUCTION 区 / target 非 INSPECTION 区 |
+| 20507 | BIZ_SHELF_PROCESS_NOT_MAPPED | worker-scan RETURNED：`shelf_id` ↔ `next_process_id` 在 `t_shelf_process` 未映射；to-process 待 shelf 域 PR 启用 |
 | 20511 | BIZ_SHELF_NOT_INSPECTION_ZONE | `target_inspection_shelf.zone ≠ 'INSPECTION'` |
-| 20512 | BIZ_SHELF_INACTIVE | `target_inspection_shelf.is_active = false` |
+| 20512 | BIZ_SHELF_INACTIVE | `shelf.is_active = false` |

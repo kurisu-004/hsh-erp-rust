@@ -84,7 +84,7 @@ impl PartRepo {
         }
     }
 
-    /// 定位 scan-inspect 的目标批次（白名单 `{PENDING, PROGRAMMING, IN_PROCESS}`）。
+    /// 定位 to-inspection 的目标批次（白名单 `{PENDING, PROGRAMMING, IN_PROCESS}`）。
     pub async fn find_scan_target_batch(
         conn: &mut PgConnection,
         part_id: i64,
@@ -149,7 +149,7 @@ impl PartRepo {
         }
     }
 
-    /// 定位 fail-inspection 的目标 INSPECTION 批次。
+    /// 定位 to-process 的目标 INSPECTION 批次。
     pub async fn find_inspection_batch_for_fail(
         conn: &mut PgConnection,
         part_id: i64,
@@ -223,6 +223,36 @@ impl PartRepo {
             .map(|b| b.id))
     }
 
+    /// 按 id + 未软删定位 `t_part_batch` 行。
+    ///
+    /// 与 `find_inprocess_batch_for_part` / `find_scan_target_batch` 等的差异：
+    /// 本方法不限制 `status` / `part_id`，caller 拿到 `TPartBatch` 后用
+    /// `part_id` / `status` 字段自行派发。常用于批量端点的 item 反查
+    /// （按 batch_id 拿 part_id，再调对应的 `to_*_core`）。
+    ///
+    /// 不存在或已软删 → `Ok(None)`，由 service 层映射
+    /// `20109 BIZ_PART_BATCH_NOT_FOUND`。
+    pub async fn find_batch_by_id<'e, E: PgExecutor<'e>>(
+        executor: E,
+        batch_id: i64,
+    ) -> Result<Option<TPartBatch>, sqlx::Error> {
+        sqlx::query_as!(
+            TPartBatch,
+            r#"
+            SELECT id, part_id, batch_no, quantity, status, location,
+                   current_holder_id, next_process_id, placed_at,
+                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at
+            FROM t_part_batch
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+            batch_id,
+        )
+        .fetch_optional(executor)
+        .await
+    }
+
     /// 统计 part 仍处于 INSPECTION 状态的非软删批次数量。
     pub async fn count_other_inprocess_batches<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -267,7 +297,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// pass_inspection 后同步工单状态（OCC UPDATE `t_part.status`）。
+    /// to_ship 后同步工单状态（OCC UPDATE `t_part.status`）。
     ///
     /// **必须与 `mark_batch_passed_inspection` 在同一事务内调用**。
     pub async fn mark_part_passed_inspection<'e, E: PgExecutor<'e>>(
@@ -295,7 +325,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// scan-inspect 第一步：工单搬到品检架（OCC UPDATE t_part）。
+    /// to-inspection 第一步：工单搬到品检架（OCC UPDATE t_part）。
     pub async fn mark_part_inspected<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -326,7 +356,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// scan-inspect 第一步：批次状态同步（OCC UPDATE t_part_batch）。
+    /// to-inspection 第一步：批次状态同步（OCC UPDATE t_part_batch）。
     pub async fn mark_batch_inspected<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -357,7 +387,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// fail-inspection：批次打回生产架（OCC UPDATE t_part_batch）。
+    /// to-process：批次打回生产架（OCC UPDATE t_part_batch）。
     pub async fn mark_batch_failed_inspection<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -390,7 +420,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// fail-inspection：工单状态同步（OCC UPDATE t_part）。
+    /// to-process：工单状态同步（OCC UPDATE t_part）。
     pub async fn mark_part_failed_inspection<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -615,12 +645,17 @@ impl PartRepo {
         }
     }
 
-    /// 部分通过：拆出 INSPECTION 批次。
+    /// 部分通过：拆出新批次（status 由 `new_batch_status` 指定）。
     ///
     /// 原子化三步（共享事务）：
     /// 1. 算同 part_id 下下一个 `batch_no`（max + 1）
-    /// 2. INSERT 新 INSPECTION 批次（quantity = split_quantity）
+    /// 2. INSERT 新批次（quantity = split_quantity，status = `new_batch_status`）
     /// 3. UPDATE 源批次 `quantity -= split_quantity`（OCC + 数量守卫）
+    ///
+    /// `new_batch_status` 通常传源批次 status：
+    /// - `to_ship` / `to_process`：源 = `INSPECTION`，新 = `INSPECTION`
+    /// - `to_inspection`：源 ∈ `{PENDING, PROGRAMMING, IN_PROCESS}`，新 = 源 status
+    ///   （确保 `mark_batch_inspected` 的 WHERE 守卫能匹配新批次）
     #[allow(clippy::too_many_arguments)]
     pub async fn split_batch_for_partial_pass(
         conn: &mut PgConnection,
@@ -629,6 +664,7 @@ impl PartRepo {
         src_version: i32,
         part_id: i64,
         split_quantity: i32,
+        new_batch_status: &str,
         current_user_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
         // 1. 算 next batch_no
@@ -643,7 +679,7 @@ impl PartRepo {
         .fetch_one(&mut *conn)
         .await?;
 
-        // 2. INSERT 新 INSPECTION 批次（quantity = split_quantity）
+        // 2. INSERT 新批次（quantity = split_quantity，status = new_batch_status）
         sqlx::query!(
             r#"
             INSERT INTO t_part_batch (
@@ -652,7 +688,7 @@ impl PartRepo {
                 delivery_note_id, parent_batch_id, has_been_repaired,
                 version, created_at, created_by, updated_at, updated_by
             )
-            SELECT $1, part_id, $2, $3, 'INSPECTION', location,
+            SELECT $1, part_id, $2, $3, $7, location,
                    current_holder_id, next_process_id, placed_at,
                    NULL, $4, has_been_repaired,
                    0, now(), $5, now(), $5
@@ -665,6 +701,7 @@ impl PartRepo {
             src_batch_id,
             current_user_id,
             src_batch_id,
+            new_batch_status,
         )
         .execute(&mut *conn)
         .await?;

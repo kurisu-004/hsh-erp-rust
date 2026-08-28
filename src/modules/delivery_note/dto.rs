@@ -542,7 +542,7 @@ pub struct ScanBatchDto {
 /// 扫码入单失败子件明细（用于 21418 装配件整套拒绝响应）。
 ///
 /// `part_id` 是关键：前端「一键通过品检」按钮依赖它把 failures
-/// 喂给 `POST /parts/batch-pass-inspection`。21405 散件失败无
+/// 喂给 `POST /parts/batch-to-ship`。21405 散件失败无
 /// part_id 时填 0，前端会 guard 跳过。
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanFailureDto {

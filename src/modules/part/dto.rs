@@ -6,17 +6,18 @@
 //! - `XxxListItem` / `XxxListOut`：列表分页
 //! - `XxxListQuery`：列表查询参数（继承/字段对应 PageQuery）
 //!
-//! ## Phase F（pass_inspection 批量送检）
-//! - `PartOut`：单件详情投影（pass_inspection 单/批端点的出参；其它端点复用做最小投影）
-//! - `PassInspectionRequest`：单件入参（`POST /parts/{id}/pass-inspection`）
-//! - `BatchPassItem` / `BatchPassInspectionRequest`：批量入参（`POST /parts/batch-pass-inspection`）
-//! - `BatchPassFailure` / `BatchPassInspectionOut`：批量出参（含 per-item 失败明细）
+//! ## Phase F（to-ship 批量通过品检）
+//! - `PartOut`：单件详情投影（to-ship / to-inspection / to-process 单/批端点的出参；其它端点复用做最小投影）
+//! - `ToShipRequest`：单件入参（`POST /parts/{id}/to-ship`）
+//! - `BatchOpItem` / `BatchToShipRequest`：批量入参（`POST /parts/batch-to-ship`）
+//! - `BatchOpFailure` / `BatchToXxxOut`：批量出参（含 per-item 失败明细）
 //!
-//! ## Phase F2（scan-inspect 一键送检 + fail-inspection 打回）
-//! - `ScanDecision`：单件/批量共享的 PASS/FAIL 决策枚举
-//! - `ScanInspectRequest`：`POST /parts/{id}/scan-inspect` 入参
-//! - `BatchScanInspectItem` / `BatchScanInspectRequest` / `BatchScanInspectFailure` / `BatchScanInspectOut`：`POST /parts/batch-scan-inspect` 全套
-//! - `FailInspectionRequest`：`POST /parts/{id}/fail-inspection` 入参（推荐需求 3）
+//! ## Phase F2（to-inspection 送检 / to-process 指定下一工序）
+//! - `ToInspectionRequest`：单件入参（`POST /parts/{id}/to-inspection`）
+//! - `BatchToInspectionRequest`：`POST /parts/batch-to-inspection` 批量入参（共享 `BatchToXxxOut` 出参）
+//! - `ToProcessRequest`：单件入参（`POST /parts/{id}/to-process`，推荐需求 3）
+//! - `ToXxxOut`：单件 / 批量 to-XXX 端点共用的出参 shape（`{ part, new_batch_id }`）
+//! - `BatchOpFailure`：单 / 批共享 per-item 失败 DTO（按 `batch_id` 定位失败 item）
 
 use serde::{Deserialize, Serialize};
 
@@ -24,9 +25,9 @@ use crate::modules::worker_pool::dto::WorkerScanEvent;
 use crate::modules::worker_pool::model::RefillResult;
 use crate::shared::types::{deserialize_i64, serialize_i64, serialize_i64_opt};
 
-/// 工单详情投影（pass_inspection 出参；其它端点复用做最小投影）。
+/// 工单详情投影（to-ship / to-inspection / to-process 出参；其它端点复用做最小投影）。
 ///
-/// 字段集与 `model::TPartInspected` 完全对齐：仅含 pass_inspection 流程与最小
+/// 字段集与 `model::TPartInspected` 完全对齐：仅含 to-XXX 流程与最小
 /// `PartOut` 响应必需列。完整业务字段（`applicant_name` / `unit_price` 等）待
 /// part 域业务实施时再补全。
 #[derive(Debug, Clone, Serialize)]
@@ -85,84 +86,36 @@ impl From<crate::modules::part::model::TPart> for PartOut {
     }
 }
 
-/// 单件 pass_inspection 入参（payload 可空）。
+/// 单件 to-ship 入参（`POST /parts/{id}/to-ship`）。
 ///
+/// 状态机迁移：`INSPECTION` → `READY_TO_SHIP`（含多批次 rollup 守卫 + OCC）。
 /// `batch_id`：当 part 下存在多个 INSPECTION 批次（由历史部分通过产生）时，
 /// caller 显式指定以消除歧义；缺省时按 part_id 唯一匹配。
-/// `quantity`：本次送检数量；当前 PR 仅支持整批送检（partial-pass 拆分
-/// 留待后续 PR），`quantity < target.quantity` 时返回 20111。
+/// `quantity`：缺省 = 整批；`quantity < target.quantity` → service 拆批并返回
+/// 拆批后剩余批次 id（见 [`ToXxxOut::new_batch_id`]）；`quantity ≤ 0` → 20111。
+/// `note`：≤ 500 字符；品检备注透传事件日志。
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct PassInspectionRequest {
+pub struct ToShipRequest {
     #[serde(default)]
     pub batch_id: Option<String>,
     #[serde(default)]
     pub quantity: Option<i32>,
-}
-
-/// 批量 item（`POST /parts/batch-pass-inspection`）。
-///
-/// `part_id` 从 JSON 字符串反序列化（与 `serialize_i64` 对称）。`batch_id` /
-/// `quantity` 语义同 [`PassInspectionRequest`]。
-#[derive(Debug, Clone, Deserialize)]
-pub struct BatchPassItem {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub part_id: i64,
     #[serde(default)]
-    pub batch_id: Option<String>,
-    #[serde(default)]
-    pub quantity: Option<i32>,
+    pub note: Option<String>,
 }
 
-/// 批量入参。`items.len()` 限制由 service 校验（[`BATCH_PASS_INSPECTION_MAX_ITEMS`]）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct BatchPassInspectionRequest {
-    pub items: Vec<BatchPassItem>,
-}
-
-/// Per-item 失败明细（item 级别错误，非整批失败）。
-#[derive(Debug, Clone, Serialize)]
-pub struct BatchPassFailure {
-    #[serde(serialize_with = "serialize_i64")]
-    pub part_id: i64,
-    pub code: i32,
-    pub message: String,
-}
-
-/// 批量端点出参：`passed` 与 `failed` 互斥，单 item 不会同时出现在两侧。
-#[derive(Debug, Clone, Serialize)]
-pub struct BatchPassInspectionOut {
-    pub passed: Vec<PartOut>,
-    pub failed: Vec<BatchPassFailure>,
-}
-
-/// scan-inspect 第二步动作（搬到 INSPECTION 后分流）。
+/// 单件 to-inspection 入参（`POST /parts/{id}/to-inspection`）。
 ///
-/// `PASS` → `pass_inspection_core(part_id, batch_id)`（直接复用）
-/// `FAIL` → `fail_inspection_core(part_id, shelf_id, next_process_id, note, batch_id)`（推荐需求 3）
-///
-/// serde rename_all = "UPPERCASE"：JSON `"PASS"` / `"FAIL"` 字符串。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum ScanDecision {
-    PASS,
-    FAIL,
-}
-
-/// 单件 scan-inspect 入参（`POST /parts/{id}/scan-inspect`）。
-///
-/// `target_inspection_shelf_id`：必填；service 校验 `zone='INSPECTION'` 且 `is_active=true`。
-/// `decision`：必填；FAIL 时 `shelf_id` / `next_process_id` 必填（service 校验）。
-/// `batch_id`：缺省按状态唯一匹配 `{PENDING, PROGRAMMING, IN_PROCESS}` 批次；多批次歧义 → 20109。
+/// 状态机迁移：`{PENDING, PROGRAMMING, IN_PROCESS}` → `INSPECTION`。
+/// `target_inspection_shelf_id`：必填；service 校验 `zone='INSPECTION'` 且
+///   `is_active=true`（20511 / 20512）。
+/// `batch_id`：缺省按状态唯一匹配 `{PENDING, PROGRAMMING, IN_PROCESS}` 批次；
+///   多批次歧义 → 20109。
 /// `quantity`：缺省 = 整批；`quantity < target.quantity` → service 拆批（详见 service 层）。
-/// `note`：≤ 500 字符；FAIL 时品检备注透传事件日志。
+/// `note`：≤ 500 字符；品检备注透传事件日志。
 #[derive(Debug, Clone, Deserialize)]
-pub struct ScanInspectRequest {
+pub struct ToInspectionRequest {
     pub target_inspection_shelf_id: String,
-    pub decision: ScanDecision,
-    #[serde(default)]
-    pub shelf_id: Option<String>,
-    #[serde(default)]
-    pub next_process_id: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]
@@ -171,68 +124,16 @@ pub struct ScanInspectRequest {
     pub quantity: Option<i32>,
 }
 
-/// 批量 scan-inspect item（`POST /parts/batch-scan-inspect`）。
+/// 单件 to-process 入参（`POST /parts/{id}/to-process`，推荐需求 3）。
 ///
-/// `decision` 缺省 = `PASS`（高频场景：装配件整组送检全 PASS）；
-/// per-item `decision=FAIL` 处理"整组里特定子件需打回"边缘场景。
-/// FAIL 路径要求 `shelf_id` / `next_process_id` 同时填齐。
-#[derive(Debug, Clone, Deserialize)]
-pub struct BatchScanInspectItem {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub part_id: i64,
-    #[serde(default)]
-    pub decision: Option<ScanDecision>,
-    #[serde(default)]
-    pub shelf_id: Option<String>,
-    #[serde(default)]
-    pub next_process_id: Option<String>,
-    #[serde(default)]
-    pub note: Option<String>,
-    #[serde(default)]
-    pub batch_id: Option<String>,
-    #[serde(default)]
-    pub quantity: Option<i32>,
-}
-
-/// 批量入参。`items.len()` 限制由 service 校验（`BATCH_SCAN_INSPECT_MAX_ITEMS = 200`）。
-///
-/// `target_inspection_shelf_id`：批量共享一个品检架（与单件入参同形校验）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct BatchScanInspectRequest {
-    pub target_inspection_shelf_id: String,
-    pub items: Vec<BatchScanInspectItem>,
-}
-
-/// Per-item 失败明细（item 级别错误，非整批失败）。
-///
-/// `code` 透传 service 层错误码（20103/20104/20109/20111/20511/20512/40901）；
-/// `message` 透传 service 层错误文案（前端可作 toast）。
-#[derive(Debug, Clone, Serialize)]
-pub struct BatchScanInspectFailure {
-    #[serde(serialize_with = "serialize_i64")]
-    pub part_id: i64,
-    pub code: i32,
-    pub message: String,
-}
-
-/// 批量端点出参：`submitted` 与 `failed` 互斥。
-///
-/// `submitted`：成功并完成 PASS/FAIL 流转的件（含 `PartOut` 最小投影）。
-#[derive(Debug, Clone, Serialize)]
-pub struct BatchScanInspectOut {
-    pub submitted: Vec<PartOut>,
-    pub failed: Vec<BatchScanInspectFailure>,
-}
-
-/// 单件 fail-inspection 入参（`POST /parts/{id}/fail-inspection`，推荐需求 3）。
-///
+/// 状态机迁移：`INSPECTION` → `IN_PROCESS`，同时写入目标 production shelf。
 /// `shelf_id`：必填；目标生产货架 id（`zone='PRODUCTION'` 且 `is_active=true`）。
 /// `next_process_id`：必填；下一道工序 id（与 shelf 映射）。
 /// `batch_id`：缺省按状态唯一 INSPECTION 批次解析；多批次歧义 → 20109。
 /// `quantity`：缺省 = 整批；部分通过走 service 拆批（`split_batch_for_partial_pass`）。
 /// `note`：≤ 500 字符；品检备注透传事件日志。
 #[derive(Debug, Clone, Deserialize)]
-pub struct FailInspectionRequest {
+pub struct ToProcessRequest {
     pub shelf_id: String,
     pub next_process_id: String,
     #[serde(default)]
@@ -241,6 +142,86 @@ pub struct FailInspectionRequest {
     pub batch_id: Option<String>,
     #[serde(default)]
     pub quantity: Option<i32>,
+}
+
+/// 单件 / 批量 to-XXX 端点的统一出参 shape。
+///
+/// `part`：操作后 part 的最新 [`PartOut`] 投影（含 OCC 更新后的 `version`）。
+/// `new_batch_id`：仅当 `quantity < target.quantity` 走拆批分支时为
+///   `Some(remainder_id)`（拆批后**剩余批次**的 id，留在源状态待后续操作）；
+///   整批操作时为 `None`（序列化为 JSON `null`），前端拿到非 null 时应刷新批次列表。
+///   用 `serialize_i64_opt` 把 Some 序列化为 JSON 字符串、None 序列化为 `null`，
+///   跟 [`PartOut`] 的雪花 id 序列化契约对齐。
+#[derive(Debug, Clone, Serialize)]
+pub struct ToXxxOut {
+    pub part: PartOut,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub new_batch_id: Option<i64>,
+}
+
+/// 批量端点 item 公共结构（`POST /parts/batch-to-ship` / `batch-to-inspection`）。
+///
+/// 无 `part_id`：service 从 `batch_id` 反查 part_id 与 part 当前状态，DTO 更精简，
+/// 单件 / 批量端点共享同一 item shape。
+///
+/// `batch_id`：必填；DB `bigint` 序列化为 JSON 字符串（与 `serialize_i64` 对称）；
+///   缺字段 → 40001 VALIDATION_ERROR；找不到批次 → 20109 BIZ_PART_BATCH_NOT_FOUND。
+///   注意 `batch_id` 不是 `Option<String>`——service 把它作为反查 part 的唯一键，
+///   必须存在。
+/// `quantity`：缺省 = 整批（`#[serde(default)]`）；`quantity < target.quantity` →
+///   service 拆批；`quantity ≤ 0` → 20111 BIZ_PART_BATCH_INVALID_QUANTITY。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchOpItem {
+    pub batch_id: String,
+    #[serde(default)]
+    pub quantity: Option<i32>,
+}
+
+/// 批量入参（`POST /parts/batch-to-inspection`）。
+///
+/// `target_inspection_shelf_id`：批量共享一个品检架（与单件入参同形校验）。
+/// `items.len()` 限制由 service 校验（`BATCH_TO_INSPECTION_MAX_ITEMS`，见 service 层）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchToInspectionRequest {
+    pub target_inspection_shelf_id: String,
+    pub items: Vec<BatchOpItem>,
+}
+
+/// 批量入参（`POST /parts/batch-to-ship`）。
+///
+/// `items.len()` 限制由 service 校验（`BATCH_TO_SHIP_MAX_ITEMS`，见 service 层）。
+/// 不需要 `target_inspection_shelf_id`（to-ship 状态机终态是
+/// `READY_TO_SHIP`，与品检货架无关）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchToShipRequest {
+    pub items: Vec<BatchOpItem>,
+}
+
+/// Per-item 失败明细（item 级别错误，非整批失败）。
+///
+/// `batch_id`：按 batch 定位失败 item（批量 item 不含 `part_id`，服务从
+///   `BatchOpItem::batch_id` 反查后回填；无法 parse 的串落到 `40001` 失败，
+///   不进入本结构）。`i64` 而非 `String` 是因为 service 已 parse 过一次，
+///   用 `serialize_i64` 序列化为 JSON 字符串与前端 batch_id 字段类型对称。
+/// `code` 透传 service 层错误码（20103 / 20104 / 20109 / 20111 / 20511 / 20512 / 40901）；
+/// `message` 透传 service 层错误文案（前端可作 toast）。
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchOpFailure {
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    pub code: i32,
+    pub message: String,
+}
+
+/// 批量端点统一出参（`batch-to-ship` / `batch-to-inspection` 共用）。
+///
+/// `submitted`：成功并完成状态流转的 item（含 `PartOut` 最小投影 + 拆批后的
+///   `new_batch_id`）；`failed`：item 级别错误（共享 [`BatchOpFailure`]）。
+/// `submitted` 与 `failed` 互斥，单 item 不会同时出现在两侧。
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchToXxxOut {
+    pub submitted: Vec<ToXxxOut>,
+    pub failed: Vec<BatchOpFailure>,
 }
 
 /// worker-scan 入参（`POST /parts/worker-scan`，Task 8）。

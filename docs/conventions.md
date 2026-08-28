@@ -340,11 +340,12 @@ let seq = g.sequence.wrapping_add(1) & MAX_SEQUENCE;
 //! - 统一响应信封：...
 //! - 权限在 handler...
 //!
-//! ## Phase F 路由（挂在 `/parts`）
-//! - `POST /batch-pass-inspection`         —— ...
+//! ## to-XXX 路由（挂在 `/parts`）
+//! - `POST /batch-to-inspection` / `POST /batch-to-ship` / `POST /worker-scan` —— 静态段
+//! - `POST /{part_id}/to-inspection` / `to-ship` / `to-process` —— catch-all 段
 //!
-//! 路由顺序敏感：`/batch-pass-inspection` 必须在 `/{part_id}/pass-inspection` 之前
-//! 注册，否则 axum 会把 `batch-pass-inspection` 解析成 `part_id`。
+//! 路由顺序敏感：`/batch-to-inspection`、`/batch-to-ship`、`/worker-scan` 必须在
+//! `/{part_id}/...` 之前注册，否则 axum 会把静态段解析成 `part_id`。
 ```
 
 ---

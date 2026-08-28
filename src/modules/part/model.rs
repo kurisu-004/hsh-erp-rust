@@ -74,9 +74,9 @@ pub struct TPart {
     pub delivery_note_id: Option<i64>,
 }
 
-/// `t_part` 行（pass_inspection 流专用最小投影）
+/// `t_part` 行（to_ship 流专用最小投影）
 ///
-/// 仅含 pass_inspection 路径与 `PartOut` 响应必需列。完整业务字段
+/// 仅含 to_ship 路径与 `PartOut` 响应必需列。完整业务字段
 ///（`applicant_name` / `unit_price` / `total_price` 等）待
 /// `rust_decimal` 上线、part 域业务实施时再补全。
 ///
@@ -84,7 +84,7 @@ pub struct TPart {
 /// 重点暴露 `status` / `version` / `quantity` / `actual_delivery_date` /
 /// `order_no` / `current_holder_id` 等本流程必需字段。
 ///
-/// Phase F2（scan-inspect）：`current_holder_id` 用于「IN_PROCESS 组合校验」
+/// Phase F2（to-inspection）：`current_holder_id` 用于「IN_PROCESS 组合校验」
 /// 启发式（命中 `t_shelf` → shelf；否则 → worker）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPartInspected {

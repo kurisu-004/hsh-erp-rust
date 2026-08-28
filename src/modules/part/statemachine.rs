@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// `t_part.status` 取值（与 migration 005 字段语义对齐）。
 ///
-/// Phase F（pass_inspection 批量送检）只放行 `INSPECTION → READY_TO_SHIP`；
+/// to-XXX 流（to_inspection / to_ship / to_process）按状态机白名单放行；
 /// 其它合法迁移留到后续 PR 补齐。当前 `can_transition_to` 严格按白名单放行。
 ///
 /// `allow(non_camel_case_types)`：变体名沿用 DB 列值（`IN_PROCESS` /
@@ -83,12 +83,10 @@ impl PartStatus {
 
     /// 迁移白名单。
     ///
-    /// 本 PR（scan-inspect 一键送检）放行：
-    /// - `INSPECTION → READY_TO_SHIP`：pass_inspection / scan_inspect (PASS) 路径
-    /// - `INSPECTION → IN_PROCESS`：fail_inspection 路径（推荐需求 3）
-    /// - `PROGRAMMING → INSPECTION`：scan_inspect (PROGRAMMING → INSPECTION)
-    /// - `PENDING → INSPECTION`：scan_inspect (PENDING → INSPECTION)
-    /// - `IN_PROCESS → INSPECTION`：scan_inspect (IN_PROCESS → INSPECTION)
+    /// to-XXX 流放行：
+    /// - `INSPECTION → READY_TO_SHIP`：to_ship 路径
+    /// - `INSPECTION → IN_PROCESS`：to_process 路径
+    /// - `PROGRAMMING / PENDING / IN_PROCESS → INSPECTION`：to_inspection 路径（任意源状态）
     ///
     /// PR-CRUD 新增：
     /// - `READY_TO_SHIP → DELIVERED` (deliver)
@@ -166,18 +164,18 @@ mod tests {
     }
 
     #[test]
-    fn allowed_transitions_scan_inspect() {
+    fn allowed_transitions_to_inspection() {
         assert!(PartStatus::INSPECTION.can_transition_to(PartStatus::READY_TO_SHIP));
         assert!(PartStatus::PROGRAMMING.can_transition_to(PartStatus::INSPECTION));
-        // scan-inspect 新增
+        // to_inspection 流新增
         assert!(PartStatus::PENDING.can_transition_to(PartStatus::INSPECTION));
         assert!(PartStatus::IN_PROCESS.can_transition_to(PartStatus::INSPECTION));
-        // fail-inspection 新增（推荐需求 3）
+        // to_process 流新增
         assert!(PartStatus::INSPECTION.can_transition_to(PartStatus::IN_PROCESS));
     }
 
     #[test]
-    fn disallowed_transitions_scan_inspect_rejects() {
+    fn disallowed_transitions_to_inspection_rejects() {
         // 自环非法
         assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::INSPECTION));
         // 反向非法

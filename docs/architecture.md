@@ -330,7 +330,7 @@ SQLX_OFFLINE=true cargo build --release
 
 - **数据层**：21 张表 + sqlx migrate + 所有 200xx–215xx 业务错误码常量（含 `status_from_code` 自动推导 + HTTP 表覆盖单测，见 `src/shared/error.rs`）。
 - **认证域（auth + users）**：14 端点 + Redis session（`session:tok:<sha256>` 主条目 + `sessions:user:<id>` Set 索引）。
-- **零件核心（part）**：6 端点（pass-inspection 单/批、scan-inspect 单/批、fail-inspection、worker-scan）+ state machine（`statemachine.rs`）+ WS 联动 worker-pool refill。
+- **零件核心（part）**：6 端点（to-inspection 单/批、to-ship 单/批、to-process、worker-scan）+ state machine（`statemachine.rs`）+ WS 联动 worker-pool refill。
 - **worker-pool**：3 端点（state / admin refill / admin remove）+ `take_one_from_pool` CTE（FOR UPDATE SKIP LOCKED）。
 - **送货单域（delivery_note + delivery_groups）**：18 端点（business 17 + batch-detail 1）+ P3 扫码建单 + P4 xlsx 打印/标签 + 送货分组。
 
@@ -355,7 +355,7 @@ handler 当前为 3 行占位：
 
 ### 横切未完成
 
-- **WebSocket 真实握手**：`src/modules/dashboard/handler.rs` 仍为 stub（7 行注释）；WS 事件已通过 `WsHub::broadcast` 全部注册（DELIVERY_NOTE_*/INSPECTED*/WORKER_*），待 hub 真实握手后即可下发。
+- **WebSocket 真实握手**：`src/modules/dashboard/handler.rs` 仍为 stub（7 行注释）；WS 事件已通过 `WsHub::broadcast` 全部注册（DELIVERY_NOTE_*/PART_TO_*/BATCH_TO_*/WORKER_*），待 hub 真实握手后即可下发。
 - **auto_complete 后台任务**：`src/task/auto_complete.rs` 占位；DELIVERED→COMPLETED 定时循环未接业务查询。
 - **MCP 服务**：不在本仓库（用户决策：独立 MCP 服务器承载）。
 - **集成测试**：`tests/common/mod.rs` 已搭基建；按域补场景（当前有 worker_pool / part_worker_scan 等）。
