@@ -1,7 +1,7 @@
 //! part 域 to-XXX 流业务逻辑（to_ship / to_inspection / to_process 流）。
 //!
-//! 对应 Python myERP/service/part_service.py 中 pass_inspection / fail_inspection /
-//! scan_inspect 三个流的实现（已统一为 to_ship / to_inspection / to_process 模型）。
+//! 对应 Python myERP/service/part_service.py 中三个 inspection 流的实现（已统一为
+//! to_ship / to_inspection / to_process 模型）。
 //! 实施约定：方法签名接收 `&mut PgConnection`，由 handler 开 tx 并 commit。
 //!
 //! ## to_ship 流（part 通过品检 / 部分通过拆批）
@@ -662,7 +662,7 @@ impl PartService {
     /// 单步流程：`{PENDING, PROGRAMMING, IN_PROCESS}` → `INSPECTION`。
     /// **不再带 PASS/FAIL 分支**：通过品检由 client 另调 `to_ship_core`；打回
     /// 由 client 另调 `to_process_core`。两条路径各自独立事务 + 各自 OCC +
-    /// 各自事件日志（PASS/FAIL 在原 scan_inspect 同事务内的合并语义被显式拆开）。
+    /// 各自事件日志（to-XXX 模型把原 scan_inspect 同事务内的合并语义显式拆开）。
     ///
     /// 流转：
     /// 1. `t_part.status` & `t_part_batch.status` → `INSPECTION`，同步 `location =

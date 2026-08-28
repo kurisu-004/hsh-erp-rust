@@ -11,7 +11,7 @@
 
 use sqlx::FromRow;
 
-/// `t_shelf` 行结构（CRUD / picker / scan-inspect / fail-inspection 全投影）。
+/// `t_shelf` 行结构（CRUD / picker / to-inspection / to-process 全投影）。
 ///
 /// `zone`: `'PRODUCTION'` | `'INSPECTION'`（DB varchar，无 enum 约束；
 /// 应用层校验）。

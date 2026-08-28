@@ -191,9 +191,9 @@ impl PartRepo {
         .await
     }
 
-    /// pass_inspection 流专用最小投影（Phase F）。
+    /// to_ship 流专用最小投影（to-XXX 重命名后的 PartOut 必需列）。
     ///
-    /// `include_deleted = false`（pass_inspection 不应对软删件操作）。
+    /// `include_deleted = false`（to_ship 不应对软删件操作）。
     pub async fn get_part_inspected<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,

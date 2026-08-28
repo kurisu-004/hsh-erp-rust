@@ -538,7 +538,7 @@ async fn single_to_ship_retry_returns_20103() {
 
 /// to-inspection happy path：PENDING → INSPECTION（无 PASS/FAIL 分支）。
 ///
-/// to-XXX 重命名：scan-inspect 一键送检（带 PASS/FAIL）已拆分为 to-inspection +
+/// to-XXX 重命名：原一键送检（带 PASS/FAIL 分支）已拆分为 to-inspection +
 /// to-ship + to-process 三步；此用例只验证送检（to-inspection）单步。
 #[tokio::test]
 async fn to_inspection_from_pending_succeeds() {
@@ -764,7 +764,7 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
 
 /// to-process 拒绝：shelf_id 非数字 → 20104 BIZ_INVALID_VALUE。
 ///
-/// to-XXX 重命名：原 scan-inspect FAIL 分支的 `shelf_id` / `next_process_id` 在
+/// to-XXX 重命名：原一键送检的 FAIL 分支 `shelf_id` / `next_process_id` 在
 /// `to-process` 成为必填字段（`ToProcessRequest.shelf_id: String`）。缺字段走
 /// axum Json 提取 → 422 不在信封内（已退化为非 envelope plain text），故改用
 /// 「非数字」值（"abc"）保留 service 层 20104 校验路径的覆盖。

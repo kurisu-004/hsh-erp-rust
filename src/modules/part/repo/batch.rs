@@ -84,7 +84,7 @@ impl PartRepo {
         }
     }
 
-    /// 定位 scan-inspect 的目标批次（白名单 `{PENDING, PROGRAMMING, IN_PROCESS}`）。
+    /// 定位 to-inspection 的目标批次（白名单 `{PENDING, PROGRAMMING, IN_PROCESS}`）。
     pub async fn find_scan_target_batch(
         conn: &mut PgConnection,
         part_id: i64,
@@ -149,7 +149,7 @@ impl PartRepo {
         }
     }
 
-    /// 定位 fail-inspection 的目标 INSPECTION 批次。
+    /// 定位 to-process 的目标 INSPECTION 批次。
     pub async fn find_inspection_batch_for_fail(
         conn: &mut PgConnection,
         part_id: i64,
@@ -297,7 +297,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// pass_inspection 后同步工单状态（OCC UPDATE `t_part.status`）。
+    /// to_ship 后同步工单状态（OCC UPDATE `t_part.status`）。
     ///
     /// **必须与 `mark_batch_passed_inspection` 在同一事务内调用**。
     pub async fn mark_part_passed_inspection<'e, E: PgExecutor<'e>>(
@@ -325,7 +325,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// scan-inspect 第一步：工单搬到品检架（OCC UPDATE t_part）。
+    /// to-inspection 第一步：工单搬到品检架（OCC UPDATE t_part）。
     pub async fn mark_part_inspected<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -356,7 +356,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// scan-inspect 第一步：批次状态同步（OCC UPDATE t_part_batch）。
+    /// to-inspection 第一步：批次状态同步（OCC UPDATE t_part_batch）。
     pub async fn mark_batch_inspected<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -387,7 +387,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// fail-inspection：批次打回生产架（OCC UPDATE t_part_batch）。
+    /// to-process：批次打回生产架（OCC UPDATE t_part_batch）。
     pub async fn mark_batch_failed_inspection<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -420,7 +420,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// fail-inspection：工单状态同步（OCC UPDATE t_part）。
+    /// to-process：工单状态同步（OCC UPDATE t_part）。
     pub async fn mark_part_failed_inspection<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
