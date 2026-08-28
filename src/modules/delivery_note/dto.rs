@@ -519,6 +519,10 @@ pub enum ResolvedKindDto {
 ///
 /// - `kind = Part`：单工单（可能隶属于某个装配件的子件）；`id` = part.id
 /// - `kind = Assembly`：扫的是装配件总图，`id` = assembly.id
+///
+/// **路线 B 重构（2026-08-27）移除字段**：
+/// - `assembly_id`：scan 路径不会扫到子件；如需查父装配体走 `GET /api/v2/assemblies/{id}`
+/// - `child_count`：候选列表响应里前端不需要"装配体有几个子件"；要查子件清单走 `GET /api/v2/assemblies/{id}/children`
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedEntityDto {
     pub kind: ResolvedKindDto,
