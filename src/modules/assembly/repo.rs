@@ -465,3 +465,52 @@ impl AssemblyRepo {
         Ok(row.0)
     }
 }
+
+// ---------- sync hook helpers (assembly-status-auto-sync Task 1) ----------
+
+impl AssemblyRepo {
+    /// 拉取指定 assembly 下所有未软删子件的 status 字符串。
+    /// 返回 `Vec<String>`（每条一条 status），供 service 端跑 `compute_assembly_target`。
+    /// 单条 SQL（防 N+1）；命中 `ix_t_part_assembly_id_status` 索引。
+    pub async fn aggregate_children_status<'e, E: PgExecutor<'e>>(
+        executor: E,
+        assembly_id: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT status FROM t_part \
+             WHERE assembly_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(assembly_id)
+        .fetch_all(executor)
+        .await?;
+        Ok(rows.into_iter().map(|(s,)| s).collect())
+    }
+
+    /// 带 OCC + 终态守卫的 status 翻转；返回受影响行数（0 = 版本不匹配 / 终态 / 已软删）。
+    /// 失败时 service 层据此返回 VERSION_CONFLICT；同步钩子调用方需决定是否升级为错误。
+    pub async fn update_status_if_not_terminal<'e, E: PgExecutor<'e>>(
+        executor: E,
+        id: i64,
+        expected_version: i32,
+        new_status: &str,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            UPDATE t_assembly
+            SET status = $3, version = version + 1, updated_at = NOW(), updated_by = $4
+            WHERE id = $1
+              AND version = $2
+              AND deleted_at IS NULL
+              AND status NOT IN ('COMPLETED', 'CANCELLED')
+            "#,
+        )
+        .bind(id)
+        .bind(expected_version)
+        .bind(new_status)
+        .bind(updated_by)
+        .execute(executor)
+        .await?;
+        Ok(res.rows_affected())
+    }
+}

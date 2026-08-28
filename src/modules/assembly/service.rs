@@ -19,6 +19,9 @@ use crate::modules::assembly::dto::{
 };
 use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::{AssemblyListFilters, AssemblyRepo, AssemblyUpdate, NewAssembly};
+use crate::modules::assembly::statemachine::{
+    compute_assembly_target, AssemblyStatus,
+};
 use crate::modules::part::repo::PartRepo;
 use crate::shared::error::{code, AppError};
 
@@ -525,5 +528,123 @@ impl AssemblyService {
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
         Ok(render_assembly_out(asm))
+    }
+}
+
+// ---------- sync hook (assembly-status-auto-sync Task 1) ----------
+
+/// Sync hook result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// 父装配件已为终态 / 无子件 / 目标 == 当前 → 不写库
+    NoChange,
+    /// 实际更新了 t_assembly.status；handler 据此发 ASSEMBLY_UPDATED
+    Changed(i64),
+}
+
+impl AssemblyService {
+    /// 从单个 part 的状态变更回流到父装配件（同事务调用）。
+    /// 1. 反查 `part.assembly_id`（None → NoChange）
+    /// 2. 父已是 COMPLETED/CANCELLED → NoChange（Python 短路 L92）
+    /// 3. 拉子件 status → `compute_assembly_target` → Some(target)
+    /// 4. 取父当前 version + status；target == 当前 → NoChange
+    /// 5. `update_status_if_not_terminal`；0 行 → VERSION_CONFLICT（事务回滚）
+    /// 6. 返回 `Changed(assembly_id)`
+    pub async fn sync_from_part_change(
+        conn: &mut PgConnection,
+        part_id: i64,
+        current: &CurrentUser,
+    ) -> Result<SyncOutcome, AppError> {
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
+            "SELECT assembly_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(part_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(AppError::from)?;
+        let Some((Some(assembly_id),)) = row else {
+            return Ok(SyncOutcome::NoChange);
+        };
+        Self::sync_assembly_status(conn, assembly_id, current).await
+    }
+
+    /// 批量版本：传入本次批量成功的 part_id 列表；
+    /// 用单条 SQL `SELECT DISTINCT assembly_id` 去重，再逐个 sync。
+    pub async fn sync_from_part_changes(
+        conn: &mut PgConnection,
+        part_ids: &[i64],
+        current: &CurrentUser,
+    ) -> Result<Vec<SyncOutcome>, AppError> {
+        if part_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<(Option<i64>,)> = sqlx::query_as(
+            "SELECT DISTINCT assembly_id FROM t_part \
+             WHERE id = ANY($1) AND assembly_id IS NOT NULL \
+               AND deleted_at IS NULL",
+        )
+        .bind(part_ids)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(AppError::from)?;
+        let assembly_ids: Vec<i64> = rows.into_iter().filter_map(|(a,)| a).collect();
+        let mut out = Vec::with_capacity(assembly_ids.len());
+        for aid in assembly_ids {
+            out.push(Self::sync_assembly_status(conn, aid, current).await?);
+        }
+        Ok(out)
+    }
+
+    /// 实际聚合 + 翻转的核心；`sync_from_part_change` / `sync_from_part_changes` 共用。
+    async fn sync_assembly_status(
+        conn: &mut PgConnection,
+        assembly_id: i64,
+        current: &CurrentUser,
+    ) -> Result<SyncOutcome, AppError> {
+        // 父存在性 + 终态短路
+        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| {
+                AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, format!("assembly {assembly_id} 不存在"))
+            })?;
+        let current_status = AssemblyStatus::from_str(&asm.status).ok_or_else(|| {
+            AppError::biz(code::BIZ_INVALID_VALUE, format!("未知 assembly status: {}", asm.status))
+        })?;
+        if matches!(current_status, AssemblyStatus::COMPLETED | AssemblyStatus::CANCELLED) {
+            return Ok(SyncOutcome::NoChange);
+        }
+
+        // 聚合子件
+        let children_statuses =
+            AssemblyRepo::aggregate_children_status(&mut *conn, assembly_id)
+                .await
+                .map_err(AppError::from)?;
+        let Some(target) = compute_assembly_target(children_statuses.iter().map(|s| s.as_str())) else {
+            return Ok(SyncOutcome::NoChange);
+        };
+
+        // target == current → NoChange
+        if target == current_status {
+            return Ok(SyncOutcome::NoChange);
+        }
+
+        // OCC 翻转
+        let affected = AssemblyRepo::update_status_if_not_terminal(
+            &mut *conn,
+            assembly_id,
+            asm.version,
+            target.as_str(),
+            current.id,
+        )
+        .await
+        .map_err(AppError::from)?;
+        if affected == 0 {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                format!("assembly {assembly_id} version {} 已变化或已终态", asm.version),
+            ));
+        }
+        Ok(SyncOutcome::Changed(assembly_id))
     }
 }
