@@ -69,7 +69,7 @@ Response 200 `data`：`BatchToXxxOut`
 WS 广播（commit 后下发）：
 
 - `BATCH_TO_INSPECTION` —— payload `{ submitted: <count>, failed: <count> }`（仅计数，不含数组）
-- **父装配件自动同步**：若 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。实际翻转时响应 `data.synced_assembly_id = Some(<id>)`；不翻转时为 `null`。
+- **父装配件自动同步**：若某 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。**响应字段位置**：实际翻转时，在该 item 对应 `data.submitted[i].synced_assembly_id = Some(<id>)`；不翻转时为 `null`（同 part 全无 assembly_id 时，整个字段缺省为 `null`）。
 
 错误码：
 
@@ -175,7 +175,7 @@ Response 200 `data`：`BatchToXxxOut`
 WS 广播（commit 后下发）：
 
 - `BATCH_TO_SHIP` —— payload `{ submitted: <count>, failed: <count> }`
-- **父装配件自动同步**：若 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。实际翻转时响应 `data.synced_assembly_id = Some(<id>)`；不翻转时为 `null`。
+- **父装配件自动同步**：若某 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。**响应字段位置**：实际翻转时，在该 item 对应 `data.submitted[i].synced_assembly_id = Some(<id>)`；不翻转时为 `null`（同 part 全无 assembly_id 时，整个字段缺省为 `null`）。
 
 错误码：
 
@@ -355,9 +355,9 @@ Response 200 `data`：`WorkerScanOut`
 WS 广播（commit 后下发）：
 
 - `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（依 `event_type`）—— payload = `WorkerScanCoreOut`
+- **父装配件自动同步**（仅 `INSPECTED` 分支）：若 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。**响应字段位置**：实际翻转时 `data.scan.synced_assembly_id = Some(<id>)`；不翻转时为 `null`。`RETURNED` 分支不参与（part.status 不变，无副作用）。
 - 若 `refill.taken.len() > 0` → `WORKER_POOL_REFILL_DONE` —— payload = `RefillResult`
 - 若 `refill.pool_empty=true` 且 `taken` 为空 → `WORKER_POOL_EMPTY` —— payload `{ worker_id, shelf_id }`
-- **父装配件自动同步**（仅 `INSPECTED` 分支）：若 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。实际翻转时响应 `data.synced_assembly_id = Some(<id>)`；不翻转时为 `null`。`RETURNED` 分支不参与（part.status 不变，无副作用）
 
 详见 [`../websocket.md`](../websocket.md) 与 [`../worker-pool.md`](../worker-pool.md)。
 
@@ -640,7 +640,6 @@ INSPECTION → IN_PROCESS 由 `POST /parts/{id}/to-process`（to_process 流）�
 | 20118 | BIZ_PART_REPAIR_NOT_TRIGGERED | 400 | start-repair 要求 IN_PROCESS |
 | 20119 | BIZ_PART_NOT_DELETABLE | 409 | soft-delete 终态禁 |
 | 21420 | BIZ_DELIVERY_NOTE_LOCKED_PART | 409 | cancel / soft-delete 遇 part 已挂送货单 |
-| 20309 | BIZ_ASSEMBLY_STATUS_SYNC_FAILED | 409 | 父装配件 status 同步时 version 冲突（事务回滚整个 part endpoint） |
 | 40001 | VALIDATION_ERROR | 422 | 入参 shape 错 / multipart 字段错 / 必填字段缺失 |
 | 40300 | FORBIDDEN | 403 | 角色不符 |
 

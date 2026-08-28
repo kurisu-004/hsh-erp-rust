@@ -163,21 +163,21 @@
 
 1. 父已是 `COMPLETED` 或 `CANCELLED` → **短路**：不更新。
 2. 该 assembly 下所有未软删子件 `status` 集合：
- - 空集 → noop
- - 全部 `CANCELLED` → 父 → `CANCELLED`
- - 全部非 `CANCELLED` 子件都是 `COMPLETED` → 父 → `COMPLETED`
- - 其它 → 取非终态、非 `CANCELLED` 子件的最小 `progress`，对应映射（Rust 4 态压缩版）：
+  - 空集 → noop
+  - 全部 `CANCELLED` → 父 → `CANCELLED`
+  - 全部非 `CANCELLED` 子件都是 `COMPLETED` → 父 → `COMPLETED`
+  - 其它 → 取非终态、非 `CANCELLED` 子件的最小 `progress`，对应映射（Rust 4 态压缩版）：
 
- | part status | progress |
- |---|---|
- | `PENDING` | 0 |
- | `PROGRAMMING` | 1 |
- | `IN_PROCESS` / `REPAIRING` | 2 |
- | `OUTSOURCE` | 3 |
- | `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` | 4..6（均压成 `IN_PROCESS`） |
+  | part status | progress |
+  |---|---|
+  | `PENDING` | 0 |
+  | `PROGRAMMING` | 1 |
+  | `IN_PROCESS` / `REPAIRING` | 2 |
+  | `OUTSOURCE` | 3 |
+  | `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` | 4..6（均压成 `IN_PROCESS`） |
 
- - `min_progress == 0` → 父 → `PENDING`
- - 否则 → `IN_PROCESS`
+  - `min_progress == 0` → 父 → `PENDING`
+  - 否则 → `IN_PROCESS`
 
 3. 目标 == 当前 → noop；否则 `UPDATE t_assembly SET status = $target, version = version + 1`，带 OCC + 终态守卫，0 行 → `40901 VERSION_CONFLICT`（事务回滚）。
 
