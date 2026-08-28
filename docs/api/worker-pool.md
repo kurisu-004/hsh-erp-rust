@@ -15,6 +15,7 @@
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
 | GET | `/api/v2/worker-pool/state` | 已登录（无 role guard） | worker 当前持有 + 工序池候选数（按工序分组） |
+| GET | `/api/v2/worker-pool/{process_id}` | **Manager+Clerk+Inspector** | 按工序返回候选池详情（workers + work_types + 跨货架批次列表） |
 | POST | `/api/v2/admin/worker-pool/refill` | **Manager** | 为指定 worker 抢满 `max_held_batches`（同事务） |
 | POST | `/api/v2/admin/worker-pool/remove` | **Manager** | 把 worker 持有批次按 RETURNED 语义放回候选池 |
 
@@ -116,6 +117,31 @@ WS 广播（commit 后下发）：
 
 - `WORKER_POOL_ADMIN_REMOVED`（payload = `TakenItem`）
 
+### `GET /api/v2/worker-pool/{process_id}`
+
+权限：**Manager + Clerk + Inspector**（`current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])` —— admin 视角但不止 Manager；不指定 shelf_id，返回所有货架）。
+
+Path：
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `process_id` | i64 (snowflake) | ✓ | 工序雪花 ID |
+
+业务流转（service `pool_by_process`）：
+
+1. 取 process 元数据（`code / name`）；不存在 → `20801 BIZ_PROCESS_NOT_FOUND`
+2. 取该 process 映射的所有 work_type（`WorkTypeRepo::list_by_process_id`）：返回 `Vec<WorkTypeMaxHeld>`
+3. 取该 process 可执行的所有 worker（DISTINCT worker）：返回 `Vec<WorkerBrief>`
+4. 取所有货架上的候选批次（`WorkerPoolRepo::list_candidates_by_process_all_shelves`）：JOIN t_part_batch + t_part + t_customer L2 + t_customer L1 + t_shelf，单 SQL，排序 `system_delivery_date ASC NULLS LAST → is_urgent DESC → id ASC`，无 LIMIT（admin 视图）
+5. 装 `ProcessPoolDetail` 返回
+
+Response 200 `data`：[`ProcessPoolDetail`](#processpooldetail-字段)
+
+错误码：
+
+- 20801 BIZ_PROCESS_NOT_FOUND — process_id 不存在 / 已软删
+- 40300 FORBIDDEN — 角色不在 Manager+Clerk+Inspector 集合内
+
 ---
 
 ## 共享 DTO
@@ -182,6 +208,61 @@ WS 广播（commit 后下发）：
 | `current_held` | i64 | worker 当前持有批次数（`t_part_batch` 中 `status='IN_PROCESS' AND location='WORKER' AND current_holder_id = worker_id`） |
 | `capacity_remaining` | i32 | `max(0, max_held - current_held)` |
 | `pool_count_by_process` | [ProcessPoolCount](#processpoolcount-字段) | 各工序候选池计数（仅含 work_type 映射到的工序） |
+
+### PoolBatchItem 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string (i64) | 批次雪花 ID |
+| `part_id` | string (i64) | 工单雪花 ID |
+| `batch_no` | i32 | 批次序号（同一 part 下从 1 开始） |
+| `quantity` | i32 | 批次数量 |
+| `serial_no` | string? | 工单序列号（手工工单可空） |
+| `name` | string | 工单 / 零件名称（源自 t_part） |
+| `drawing_no` | string | 图号 |
+| `system_delivery_date` | date? | 系统交付日期 |
+| `customer_name` | string? | L2 客户名（叶子） |
+| `parent_customer_name` | string? | L1 客户名（一级集团），L2.parent_id 为空时为 None |
+| `customer_path` | string? | `"L1 / L2"` 路径；L1 自指仅给 leaf 名 |
+| `applicant_name` | string? | 申请人字符串列（t_part.applicant_name，非 FK） |
+| `location` | string | 候选池当前货架 raw enum（如 `"PRODUCTION_SHELF"`） |
+| `shelf_id` | string (i64) | 当前货架 id（t_part_batch.current_holder_id） |
+| `shelf_code` | string | 当前货架代号 |
+| `shelf_name` | string | 当前货架名 |
+| `is_urgent` | bool | 是否加急（取自 t_part.is_urgent） |
+| `note` | string? | 工单级备注（t_part.note，DB 无 batch 级 remark 字段；复用） |
+| `placed_at` | datetime | 批次上架时间（t_part_batch.placed_at）—— 用于前端展示「积压多久」 |
+| `version` | i32 | 乐观锁 |
+
+### WorkerBrief 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `worker_id` | string (i64) | 工人雪花 ID |
+| `name` | string | 工人姓名 |
+| `work_type_id` | string (i64) | 工种雪花 ID |
+| `work_type_code` | string | 工种代号 |
+
+### WorkTypeMaxHeld 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `work_type_id` | string (i64) | 工种雪花 ID |
+| `work_type_code` | string | 工种代号 |
+| `work_type_name` | string | 工种名 |
+| `max_held_batches` | i32? | 工种最大持有批次数；None = 未设置（与既有 20904 `BIZ_WORK_TYPE_MAX_HELD_NOT_SET` 同语义，但不在此处报错） |
+
+### ProcessPoolDetail 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `process_id` | string (i64) | 工序雪花 ID |
+| `process_code` | string | 工序代号 |
+| `process_name` | string | 工序名 |
+| `workers` | [WorkerBrief](#workerbrief-字段) | 可执行该工序的工人列表（同一工人可能因所属工种映射该工序而出现多次） |
+| `work_types` | [WorkTypeMaxHeld](#worktypemaxheld-字段) | 该工序映射到的工种 + max_held（按 work_type 分组） |
+| `total` | i64 | 候选批次总数（与 items.len() 一致，不分页；admin 视角全量） |
+| `items` | [PoolBatchItem](#poolbatchitem-字段) | 跨货架候选批次列表，排序 `system_delivery_date ASC NULLS LAST → is_urgent DESC → id ASC` |
 
 ---
 
