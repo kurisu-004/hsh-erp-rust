@@ -35,6 +35,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
 use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
@@ -368,6 +369,7 @@ impl PartService {
             return Ok(ToXxxOut {
                 part: PartOut::from(fresh),
                 new_batch_id: new_batch_id_out,
+                synced_assembly_id: None,
             });
         }
 
@@ -385,6 +387,14 @@ impl PartService {
                 format!("part {part_id} 版本冲突"),
             ));
         }
+        // —— 父装配件自动同步：part.status 翻 READY_TO_SHIP 后回流父 assembly ——
+        // 仅当 mark_part_passed_inspection 真正执行（即无其它 INSPECTION 批次）才触发；
+        // rollup guard 早返回路径跳过同步。
+        let synced = AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await?;
+        let synced_assembly_id = match synced {
+            SyncOutcome::Changed(aid) => Some(aid),
+            SyncOutcome::NoChange => None,
+        };
 
         // 9. 重读返回
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
@@ -395,6 +405,7 @@ impl PartService {
         Ok(ToXxxOut {
             part: PartOut::from(fresh),
             new_batch_id: new_batch_id_out,
+            synced_assembly_id,
         })
     }
 
@@ -493,6 +504,19 @@ impl PartService {
                     code: e.code(),
                     message: format!("{e}"),
                 }),
+            }
+        }
+        // —— 父装配件批量同步：成功 item 收集 part_id 后单次 sync_from_part_changes ——
+        let successful_part_ids: Vec<i64> = submitted.iter().map(|s| s.part.id).collect();
+        let sync_outcomes =
+            AssemblyService::sync_from_part_changes(&mut *conn, &successful_part_ids, current).await?;
+        // 把每个 Changed(aid) 分发到第一个 None 槽位（DISTINCT 保证每个 aid 仅出现一次；
+        // PartOut 不携带 assembly_id，因此用"首个未占用 slot"近似映射；前端按 assembly_id 去重）。
+        for outcome in sync_outcomes {
+            if let SyncOutcome::Changed(aid) = outcome
+                && let Some(slot) = submitted.iter_mut().find(|s| s.synced_assembly_id.is_none())
+            {
+                slot.synced_assembly_id = Some(aid);
             }
         }
         Ok(BatchToXxxOut { submitted, failed })
@@ -616,6 +640,7 @@ impl PartService {
             return Ok(ToXxxOut {
                 part: PartOut::from(fresh),
                 new_batch_id: new_batch_id_out,
+                synced_assembly_id: None,
             });
         }
         // 9. UPDATE t_part: 同步工单状态
@@ -625,12 +650,21 @@ impl PartService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, format!("part {part_id} 版本冲突")));
         }
+        // —— 父装配件自动同步：part.status 翻 IN_PROCESS 后回流父 assembly ——
+        // 仅当 mark_part_failed_inspection 真正执行（即无其它 INSPECTION 批次）才触发；
+        // rollup guard 早返回路径跳过同步。
+        let synced = AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await?;
+        let synced_assembly_id = match synced {
+            SyncOutcome::Changed(aid) => Some(aid),
+            SyncOutcome::NoChange => None,
+        };
         // 10. 重读返回
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id).await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished")))?;
         Ok(ToXxxOut {
             part: PartOut::from(fresh),
             new_batch_id: new_batch_id_out,
+            synced_assembly_id,
         })
     }
 
@@ -774,6 +808,12 @@ impl PartService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, format!("part {part_id} 版本冲突")));
         }
+        // —— 父装配件自动同步：part.status 翻 INSPECTION 后回流父 assembly ——
+        let synced = AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await?;
+        let synced_assembly_id = match synced {
+            SyncOutcome::Changed(aid) => Some(aid),
+            SyncOutcome::NoChange => None,
+        };
         // 9. 写 INSPECTED 事件日志
         let event_id = snowflake.next_id();
         let note_text = match from {
@@ -817,6 +857,7 @@ impl PartService {
         Ok(ToXxxOut {
             part: PartOut::from(fresh),
             new_batch_id: new_batch_id_out,
+            synced_assembly_id,
         })
     }
 
@@ -924,6 +965,19 @@ impl PartService {
                     code: e.code(),
                     message: format!("{e}"),
                 }),
+            }
+        }
+        // —— 父装配件批量同步：成功 item 收集 part_id 后单次 sync_from_part_changes ——
+        let successful_part_ids: Vec<i64> = submitted.iter().map(|s| s.part.id).collect();
+        let sync_outcomes =
+            AssemblyService::sync_from_part_changes(&mut *conn, &successful_part_ids, current).await?;
+        // 把每个 Changed(aid) 分发到第一个 None 槽位（DISTINCT 保证每个 aid 仅出现一次；
+        // PartOut 不携带 assembly_id，因此用"首个未占用 slot"近似映射；前端按 assembly_id 去重）。
+        for outcome in sync_outcomes {
+            if let SyncOutcome::Changed(aid) = outcome
+                && let Some(slot) = submitted.iter_mut().find(|s| s.synced_assembly_id.is_none())
+            {
+                slot.synced_assembly_id = Some(aid);
             }
         }
         Ok(BatchToXxxOut { submitted, failed })
