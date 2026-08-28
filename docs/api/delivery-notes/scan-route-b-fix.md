@@ -33,7 +33,7 @@
 
 **分组边界条件**：
 
-- `IN_PROCESS` 是否"被工人持有"——以 `t_part_batch.current_holder_id IS NOT NULL` 为主（前端无需关心具体 holder 类型）
+- `IN_PROCESS` 是否"被工人持有"——以 `t_part_batch.location = 'WORKER'` 判定（2026-08-28 修正；`current_holder_id` 是多态列：放货架时存 `t_shelf.id`、工人取件时才存 worker id，不能用作判据）
 - B 组送检需通过状态机白名单：当前 `REPAIRING → INSPECTION` 不在白名单，**本次需新增**（详见 B.5）
 
 ---
@@ -366,23 +366,24 @@ fn is_attachable_state(status: &str) -> bool {
     matches!(status, "READY_TO_SHIP" | "INSPECTION")
 }
 
-/// B 组：可送检。`IN_PROCESS` 需未被工人持有（`current_holder_id IS NULL`）。
+/// B 组：可送检。`IN_PROCESS` 需未被工人持有（`location != 'WORKER'`；
+/// `current_holder_id` 多态，货架持有时指向 t_shelf.id，不能用作判据）。
 fn is_inspectable_state(b: &TPartBatch) -> bool {
     match b.status.as_str() {
         "PENDING" | "PROGRAMMING" | "REPAIRING" => true,
-        "IN_PROCESS" => b.current_holder_id.is_none(),
+        "IN_PROCESS" => b.location.as_deref() != Some("WORKER"),
         _ => false,
     }
 }
 
-/// C 组：直接报错的非法状态。`IN_PROCESS` 被工人持有归此类。
+/// C 组：直接报错的非法状态。`IN_PROCESS` 被工人持有（`location = 'WORKER'`）归此类。
 fn classify_invalid_state(b: &TPartBatch) -> Option<&'static str> {
     match b.status.as_str() {
         "DELIVERED" => Some("DELIVERED"),
         "OUTSOURCE" => Some("OUTSOURCE"),
         "COMPLETED" => Some("COMPLETED"),
         "CANCELLED" => Some("CANCELLED"),
-        "IN_PROCESS" if b.current_holder_id.is_some() => Some("IN_PROCESS_HELD_BY_WORKER"),
+        "IN_PROCESS" if b.location.as_deref() == Some("WORKER") => Some("IN_PROCESS_HELD_BY_WORKER"),
         _ => None,
     }
 }
@@ -440,19 +441,21 @@ mod classify_5groups_tests {
     }
 
     #[test]
-    fn is_inspectable_in_process_requires_no_holder() {
-        let mut b = fixture_batch("IN_PROCESS", None);
-        assert!(is_inspectable_state(&b));           // 无 holder → B 组
-        b.current_holder_id = Some(42);
-        assert!(!is_inspectable_state(&b));           // 有 holder → 非 B 组（被 C 组捕获）
+    fn is_inspectable_in_process_requires_not_worker_held() {
+        let b = fixture_batch("IN_PROCESS", None, None);
+        assert!(is_inspectable_state(&b));                          // 无 holder → B 组
+        let b = fixture_batch("IN_PROCESS", Some(42), Some("PRODUCTION_SHELF"));
+        assert!(is_inspectable_state(&b));                          // 货架持有 → 仍 B 组
+        let b = fixture_batch("IN_PROCESS", Some(42), Some("WORKER"));
+        assert!(!is_inspectable_state(&b));                         // 工人持有 → 非 B 组（被 C 组捕获）
     }
 
     #[test]
-    fn classify_invalid_catches_held_in_process() {
-        let mut b = fixture_batch("IN_PROCESS", Some(42));
+    fn classify_invalid_catches_worker_held_in_process() {
+        let b = fixture_batch("IN_PROCESS", Some(42), Some("WORKER"));
         assert_eq!(classify_invalid_state(&b), Some("IN_PROCESS_HELD_BY_WORKER"));
-        b.current_holder_id = None;
-        assert_eq!(classify_invalid_state(&b), None);
+        let b = fixture_batch("IN_PROCESS", Some(42), Some("PRODUCTION_SHELF"));
+        assert_eq!(classify_invalid_state(&b), None);               // 货架持有不短路
     }
 }
 

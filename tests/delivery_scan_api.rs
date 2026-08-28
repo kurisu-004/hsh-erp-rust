@@ -184,21 +184,23 @@ async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, stat
 /// 与 `insert_batch` 的差异：
 /// - 走 `t_part_batch_id_seq`（非雪花 ID），让测试断言不依赖雪花规则
 /// - `version = 1`（与 `attach_to_note` 的乐观锁语义对齐：默认 0 也能过，但显式 1 表达更清晰）
-/// - 必传 `current_holder_id`（B/C 组边界场景必须）
+/// - 必传 `current_holder_id` + `location`（B/C 组边界场景必须；工人持有 = `Some("WORKER")`）
 /// - 不写 `created_at` / `updated_at` / `created_by` 等审计字段（DB DEFAULT 即可）
 async fn create_test_batch(
     pool: &sqlx::PgPool,
     part_id: i64,
     status: &str,
     holder_id: Option<i64>,
+    location: Option<&str>,
 ) -> i64 {
     let id: i64 = sqlx::query_scalar(
-        "INSERT INTO t_part_batch (part_id, batch_no, quantity, status, current_holder_id, version) \
-         VALUES ($1, 1, 10, $2, $3, 1) RETURNING id",
+        "INSERT INTO t_part_batch (part_id, batch_no, quantity, status, current_holder_id, location, version) \
+         VALUES ($1, 1, 10, $2, $3, $4, 1) RETURNING id",
     )
     .bind(part_id)
     .bind(status)
     .bind(holder_id)
+    .bind(location)
     .fetch_one(pool)
     .await
     .unwrap();
@@ -416,13 +418,14 @@ async fn scan_rescan_same_part_idempotent_already_present() {
 #[tokio::test]
 async fn scan_part_in_process_returns_400_21405() {
     // 注：测试名仍叫 `returns_400_21405`，但在新设计下 `IN_PROCESS` + 无 holder 归 B 组
-    // （返回 200 + CANDIDATES_AVAILABLE），不是 400/21405；要触发 C 组短路需带 holder。
-    // 这里给批次加上 Some(99) holder → C 组短路 → 400/21421。
+    // （返回 200 + CANDIDATES_AVAILABLE），不是 400/21405；要触发 C 组短路需带 holder
+    // 且 `location='WORKER'`（仅 holder 不再够，因为 holder 多态，可能是货架）。
+    // 这里给批次加上 Some(99) holder + Some("WORKER") → C 组短路 → 400/21421。
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("P003"), None).await;
-    let bid = create_test_batch(&pool, pid, "IN_PROCESS", Some(99)).await;
+    let bid = create_test_batch(&pool, pid, "IN_PROCESS", Some(99), Some("WORKER")).await;
 
     let (app, token, _pool) = login_manager(pool, "admin").await;
     let (s, env) = send(
@@ -446,6 +449,89 @@ async fn scan_part_in_process_returns_400_21405() {
         "message 应含 IN_PROCESS + batch id：{msg}"
     );
     let _ = l1;
+}
+
+/// 回归：`IN_PROCESS` + `location='PRODUCTION_SHELF'` + `current_holder_id=Some(shelf_id)`
+///（多态 holder 指货架）应归 B 组而非 C 组短路。
+///
+/// 真实事故：工件 F1000 躺生产货架 A1 上，holder 存的是货架 id，
+/// 旧判据 `current_holder_id IS NOT NULL` 直接判为 C 组 → 21421；
+/// 新判据需 `location='WORKER'` 才走 C 组短路，
+/// `PRODUCTION_SHELF` 应继续走 B 组 candidates 列表。
+#[tokio::test]
+async fn scan_part_in_process_on_production_shelf_returns_candidates() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part(&pool, "P1", l2, Some("PE0002"), None).await;
+    let bid = create_test_batch(
+        &pool,
+        pid,
+        "IN_PROCESS",
+        Some(88),
+        Some("PRODUCTION_SHELF"),
+    )
+    .await;
+
+    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/delivery-notes/scan",
+            Some(json!({"code": "PE0002"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "IN_PROCESS + PRODUCTION_SHELF 应归 B 组: {env}"
+    );
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["outcome"],
+        "CANDIDATES_AVAILABLE",
+        "B 组应返回 CANDIDATES_AVAILABLE"
+    );
+    assert_eq!(
+        env["data"]["added_batches"].as_array().unwrap().len(),
+        0,
+        "B 组不挂单"
+    );
+
+    let unresolved = env["data"]["unresolved_targets"]
+        .as_array()
+        .expect("unresolved_targets 应为数组");
+    assert_eq!(unresolved.len(), 1, "散件 + 仅 B 组 → 单元素");
+    let target = &unresolved[0];
+    let target_pid: i64 = target["part_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(target_pid, pid);
+    assert_eq!(target["serial_no"], "PE0002");
+
+    let avail = target["available_batches"].as_array().expect("available_batches");
+    assert_eq!(avail.len(), 1);
+    assert_eq!(
+        avail[0]["batch_id"].as_str().unwrap(),
+        bid.to_string(),
+        "available_batches[0].batch_id 应等于 B 组批次"
+    );
+    assert_eq!(avail[0]["status"], "IN_PROCESS");
+    assert_eq!(avail[0]["quantity"], 10);
+
+    // batch 不应挂单
+    let dn_id: Option<i64> =
+        sqlx::query_scalar("SELECT delivery_note_id FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(dn_id.is_none(), "B 组批次不应挂单");
+
+    // 草稿应已建立（line_count=0，本单未挂批次）
+    assert_eq!(env["data"]["note"]["status"], "DRAFT");
+    assert_eq!(env["data"]["note"]["line_count"], 0);
 }
 
 #[tokio::test]
@@ -600,10 +686,10 @@ async fn scan_assembly_atomic_reject_with_failures() {
         all_pids.push(p);
         if i == 1 {
             // Z0001：C 组（带 holder 的 IN_PROCESS）
-            let _ = create_test_batch(&pool, p, "IN_PROCESS", Some(99)).await;
+            let _ = create_test_batch(&pool, p, "IN_PROCESS", Some(99), Some("WORKER")).await;
         } else {
             // Z0000 / Z0002：A 组 INSPECTION
-            let _ = create_test_batch(&pool, p, "INSPECTION", None).await;
+            let _ = create_test_batch(&pool, p, "INSPECTION", None, None).await;
         }
     }
 
@@ -1024,7 +1110,7 @@ async fn scan_standalone_part_with_ready_batch_returns_added() {
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("RB0001"), None).await;
-    let bid = create_test_batch(&pool, pid, "READY_TO_SHIP", None).await;
+    let bid = create_test_batch(&pool, pid, "READY_TO_SHIP", None, None).await;
 
     let (app, token, pool) = login_manager(pool, "admin").await;
     let (s, env) = send(
@@ -1084,7 +1170,7 @@ async fn scan_standalone_part_with_inspection_batch_returns_added() {
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("IB0001"), None).await;
-    let _ = create_test_batch(&pool, pid, "INSPECTION", None).await;
+    let _ = create_test_batch(&pool, pid, "INSPECTION", None, None).await;
 
     let (app, token, _) = login_manager(pool, "admin").await;
     let (s, env) = send(
@@ -1120,7 +1206,7 @@ async fn scan_standalone_part_with_only_pending_returns_candidates() {
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("PE0001"), None).await;
-    let bid = create_test_batch(&pool, pid, "PENDING", None).await;
+    let bid = create_test_batch(&pool, pid, "PENDING", None, None).await;
 
     let (app, token, pool) = login_manager(pool, "admin").await;
     let (s, env) = send(
@@ -1195,7 +1281,7 @@ async fn scan_assembly_with_all_ready_returns_added() {
             Some(asm_id),
         )
         .await;
-        let b = create_test_batch(&pool, p, "READY_TO_SHIP", None).await;
+        let b = create_test_batch(&pool, p, "READY_TO_SHIP", None, None).await;
         sub_pids.push(p);
         sub_bids.push(b);
     }
@@ -1277,11 +1363,11 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
         .await;
         if i < 2 {
             // A 组
-            create_test_batch(&pool, p, "READY_TO_SHIP", None).await;
+            create_test_batch(&pool, p, "READY_TO_SHIP", None, None).await;
             a_pids.push(p);
         } else {
             // B 组
-            let b = create_test_batch(&pool, p, "PENDING", None).await;
+            let b = create_test_batch(&pool, p, "PENDING", None, None).await;
             b_pid = p;
             b_bid = b;
         }
@@ -1363,7 +1449,7 @@ async fn scan_with_delivered_batch_returns_21421() {
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("DV0001"), None).await;
-    let bid = create_test_batch(&pool, pid, "DELIVERED", None).await;
+    let bid = create_test_batch(&pool, pid, "DELIVERED", None, None).await;
 
     let (app, token, pool) = login_manager(pool, "admin").await;
     let (s, env) = send(
@@ -1412,7 +1498,7 @@ async fn scan_twice_same_code_is_idempotent() {
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("ID0001"), None).await;
-    let _ = create_test_batch(&pool, pid, "INSPECTION", None).await;
+    let _ = create_test_batch(&pool, pid, "INSPECTION", None, None).await;
 
     let (app, token, _) = login_manager(pool, "admin").await;
 

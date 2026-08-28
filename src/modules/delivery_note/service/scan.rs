@@ -42,23 +42,28 @@ fn is_attachable_state(status: &str) -> bool {
     matches!(status, "READY_TO_SHIP" | "INSPECTION")
 }
 
-/// B 组：可送检。`IN_PROCESS` 需未被工人持有（`current_holder_id IS NULL`）。
+/// B 组：可送检。`IN_PROCESS` 需未被工人持有。
+///
+/// 「工人持有」以 `location = 'WORKER'` 判定（与 worker_pool / part repo 的
+/// 全部查询一致）。**不能用 `current_holder_id`**：该列多态——批次放货架时
+/// 存 `t_shelf.id`（`location = 'PRODUCTION_SHELF' / 'INSPECTION_SHELF'`），
+/// 只有工人取件时才存 worker id（`location = 'WORKER'`）。
 fn is_inspectable_state(b: &TPartBatch) -> bool {
     match b.status.as_str() {
         "PENDING" | "PROGRAMMING" | "REPAIRING" => true,
-        "IN_PROCESS" => b.current_holder_id.is_none(),
+        "IN_PROCESS" => b.location.as_deref() != Some("WORKER"),
         _ => false,
     }
 }
 
-/// C 组：直接报错的非法状态。`IN_PROCESS` 被工人持有归此类。
+/// C 组：直接报错的非法状态。`IN_PROCESS` 被工人持有（`location = 'WORKER'`）归此类。
 fn classify_invalid_state(b: &TPartBatch) -> Option<&'static str> {
     match b.status.as_str() {
         "DELIVERED" => Some("DELIVERED"),
         "OUTSOURCE" => Some("OUTSOURCE"),
         "COMPLETED" => Some("COMPLETED"),
         "CANCELLED" => Some("CANCELLED"),
-        "IN_PROCESS" if b.current_holder_id.is_some() => Some("IN_PROCESS_HELD_BY_WORKER"),
+        "IN_PROCESS" if b.location.as_deref() == Some("WORKER") => Some("IN_PROCESS_HELD_BY_WORKER"),
         _ => None,
     }
 }
@@ -784,14 +789,14 @@ mod scan_resolve_tests {
 mod classify_5groups_tests {
     use super::*;
 
-    fn b(status: &str, holder: Option<i64>) -> TPartBatch {
+    fn b(status: &str, holder: Option<i64>, location: Option<&str>) -> TPartBatch {
         TPartBatch {
             id: 0,
             part_id: 1,
             batch_no: 1,
             quantity: 1,
             status: status.to_string(),
-            location: None,
+            location: location.map(str::to_string),
             current_holder_id: holder,
             next_process_id: None,
             placed_at: None,
@@ -809,19 +814,25 @@ mod classify_5groups_tests {
 
     #[test]
     fn c_group_delivered_short_circuits() {
-        assert_eq!(classify_invalid_state(&b("DELIVERED", None)), Some("DELIVERED"));
-        assert_eq!(classify_invalid_state(&b("OUTSOURCE", None)), Some("OUTSOURCE"));
-        assert_eq!(classify_invalid_state(&b("COMPLETED", None)), Some("COMPLETED"));
-        assert_eq!(classify_invalid_state(&b("CANCELLED", None)), Some("CANCELLED"));
+        assert_eq!(classify_invalid_state(&b("DELIVERED", None, None)), Some("DELIVERED"));
+        assert_eq!(classify_invalid_state(&b("OUTSOURCE", None, None)), Some("OUTSOURCE"));
+        assert_eq!(classify_invalid_state(&b("COMPLETED", None, None)), Some("COMPLETED"));
+        assert_eq!(classify_invalid_state(&b("CANCELLED", None, None)), Some("CANCELLED"));
     }
 
     #[test]
     fn c_group_in_process_held_is_invalid() {
+        // 工人持有（location='WORKER'）→ C 组
         assert_eq!(
-            classify_invalid_state(&b("IN_PROCESS", Some(42))),
+            classify_invalid_state(&b("IN_PROCESS", Some(42), Some("WORKER"))),
             Some("IN_PROCESS_HELD_BY_WORKER")
         );
-        assert_eq!(classify_invalid_state(&b("IN_PROCESS", None)), None);
+        // 货架持有（holder = shelf id，location='PRODUCTION_SHELF'）→ 非 C 组（回归：多态 holder 误判）
+        assert_eq!(
+            classify_invalid_state(&b("IN_PROCESS", Some(42), Some("PRODUCTION_SHELF"))),
+            None
+        );
+        assert_eq!(classify_invalid_state(&b("IN_PROCESS", None, None)), None);
     }
 
     #[test]
@@ -833,11 +844,14 @@ mod classify_5groups_tests {
 
     #[test]
     fn b_group_inspectable_includes_idle_in_process() {
-        assert!(is_inspectable_state(&b("PENDING", None)));
-        assert!(is_inspectable_state(&b("PROGRAMMING", None)));
-        assert!(is_inspectable_state(&b("REPAIRING", None)));
-        assert!(is_inspectable_state(&b("IN_PROCESS", None)));
-        assert!(!is_inspectable_state(&b("IN_PROCESS", Some(7))));
+        assert!(is_inspectable_state(&b("PENDING", None, None)));
+        assert!(is_inspectable_state(&b("PROGRAMMING", None, None)));
+        assert!(is_inspectable_state(&b("REPAIRING", None, None)));
+        assert!(is_inspectable_state(&b("IN_PROCESS", None, None)));
+        // 货架持有的 IN_PROCESS 也可送检（回归：多态 holder 误判）
+        assert!(is_inspectable_state(&b("IN_PROCESS", Some(7), Some("PRODUCTION_SHELF"))));
+        // 仅工人持有（location='WORKER'）不可
+        assert!(!is_inspectable_state(&b("IN_PROCESS", Some(7), Some("WORKER"))));
     }
 }
 

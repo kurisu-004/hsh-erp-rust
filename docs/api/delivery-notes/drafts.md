@@ -35,6 +35,8 @@ Response 200 `data`：`ScanDeliveryOut`
 > | **A 直接入单** | `READY_TO_SHIP` / `INSPECTION`（且 `delivery_note_id IS NULL`） | 进 `added_batches[]` |
 > | **B 候选→一键送检** | `PENDING` / `PROGRAMMING` / `IN_PROCESS`（未被工人持有）/ `REPAIRING` | 进 `unresolved_targets[i].available_batches[]`，前端调 `to-inspection` 后 re-scan |
 > | **C 直接报错** | `DELIVERED` / `OUTSOURCE` / `IN_PROCESS`（工人持有）/ `COMPLETED` / `CANCELLED` | 短路报错 `21421` |
+>
+> 「工人持有」指 `t_part_batch.location = 'WORKER'`（2026-08-28 修正：原按 `current_holder_id IS NOT NULL` 判定，但该列多态——放货架时存 `t_shelf.id`，会把货架上的工件误判为工人持有）。
 
 ```jsonc
 {
