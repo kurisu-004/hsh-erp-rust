@@ -976,3 +976,189 @@ async fn worker_no_work_type_returns_error() {
     assert_eq!(s, StatusCode::BAD_REQUEST, "无 work_type 应 400: {env}");
     assert_eq!(env["code"], 20206, "BIZ_WORKER_NO_WORK_TYPE: {env}");
 }
+
+// ===========================================================================
+//  GET /api/v2/worker-pool/{process_id} —— by-process 候选池详情（Task 5）
+//
+//  生产路径 `/api/v2/worker-pool/{id}`（main.rs nest("/api/v2", v2_router())）；
+//  集成测试 harness `tests/common::test_app` 直接用 `v2_router()` 不带
+//  `/api/v2` nest，故测试 URI 是 `/worker-pool/{id}`。
+// ===========================================================================
+
+/// 插一个 L2 叶子客户（parent_id=L1.id）用于 customer_path 拼接测试。
+///
+/// 用 `sqlx::query`（runtime）而非 `query!`：避免每加一个 fixture 就跑
+/// `cargo sqlx prepare` 重写 `.sqlx` 元数据（会清掉同 worktree 内其它测试文件
+/// 仍在用的 cache，对其它 worktree 也有干扰）。
+async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, NULL, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(l1_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert L2 t_customer");
+    id
+}
+
+/// 场景 H1: happy path —— 返回 process 元数据 + workers + work_types(含 max_held) +
+/// 跨货架候选批次列表。排序：system_delivery_date ASC NULLS LAST → is_urgent DESC → id ASC。
+#[tokio::test]
+async fn pool_by_process_happy() {
+    let (_guard, pool) = setup().await;
+    // L1 + L2 客户（L2.parent_id = L1.id → 触发 "L1 / L2" 路径）
+    let l1 = insert_customer_l2(&pool, "L1-NAME").await;
+    let l2 = insert_l2_customer(&pool, "L2-NAME", l1).await;
+
+    let proc = seed_process(&pool, "PROC-PBP", "工序PBP").await;
+    let wt_a = insert_work_type(&pool, "WT-PBP-A", "工种A", Some(3)).await;
+    let wt_b = insert_work_type(&pool, "WT-PBP-B", "工种B", None).await;
+    link_work_type_to_process(&pool, wt_a, proc).await;
+    link_work_type_to_process(&pool, wt_b, proc).await;
+    let prod_shelf = common::insert_shelf(&pool, "PROD-PBP", "PROD-PBP", "PRODUCTION").await;
+
+    let _w_a = insert_worker(&pool, "BC-PBP-A", "工A", Some(wt_a)).await;
+    let _w_b = insert_worker(&pool, "BC-PBP-B", "工B", Some(wt_b)).await;
+
+    // 2 批次：urgent 在前（同 system_delivery_date 时 is_urgent DESC 排序在前）。
+    // `insert_pool_part` 把 is_urgent 硬编码为 false —— 加急单用 UPDATE 翻成 true。
+    // 用 `sqlx::query`（runtime）而非 `query!` 避免动 `.sqlx` cache（会清掉
+    // 同 worktree 其它测试文件仍在用的离线 metadata）。
+    let (p_urgent, _b_urgent) =
+        insert_pool_part(&pool, l2, "U-001", prod_shelf, proc, 2).await;
+    let (_p_normal, _b_normal) =
+        insert_pool_part(&pool, l2, "N-001", prod_shelf, proc, 5).await;
+    sqlx::query("UPDATE t_part SET is_urgent = true WHERE id = $1")
+        .bind(p_urgent)
+        .execute(&pool)
+        .await
+        .expect("mark U-001 urgent");
+
+    let (app, token, _pool) = login_manager(pool.clone(), "admin_pbp").await;
+    // 注意：`tests/common::test_app` 用 `v2_router()`（不带 `/api/v2` nest，
+    // 与 main.rs `nest("/api/v2", v2_router())` 不一样），所以测试 URI
+    // 是 `/worker-pool/{id}` 而不是 `/api/v2/worker-pool/{id}`。
+    let uri = format!("/worker-pool/{proc}");
+    let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(s, StatusCode::OK, "pool_by_process happy: {env}");
+    assert_eq!(env["code"], 0, "code 应 0: {env}");
+
+    let data = &env["data"];
+    assert_eq!(data["process_id"], proc.to_string());
+    assert_eq!(data["process_code"], "PROC-PBP");
+    assert_eq!(data["process_name"], "工序PBP");
+
+    let workers = data["workers"].as_array().expect("workers array");
+    assert_eq!(workers.len(), 2, "workers 应 2 个: {env}");
+
+    let work_types = data["work_types"].as_array().expect("work_types array");
+    assert_eq!(work_types.len(), 2, "work_types 应 2 个: {env}");
+    // 找到 max_held_batches = Some(3) 与 None 的两条
+    let has_three = work_types
+        .iter()
+        .any(|w| w["max_held_batches"] == 3);
+    let has_null = work_types
+        .iter()
+        .any(|w| w["max_held_batches"].is_null());
+    assert!(has_three && has_null, "max_held 应含 Some(3) + None: {env}");
+
+    assert_eq!(data["total"], 2, "total 应 2: {env}");
+    let items = data["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2, "items 应 2 个: {env}");
+    // items[0] 应为加急单
+    assert_eq!(items[0]["is_urgent"], true, "items[0] 应 is_urgent=true: {env}");
+    assert_eq!(items[0]["serial_no"], "U-001");
+    // items[1] 应为非加急单
+    assert_eq!(items[1]["is_urgent"], false, "items[1] 应 is_urgent=false: {env}");
+    assert_eq!(items[1]["serial_no"], "N-001");
+    // customer_path 应为 "L1-NAME / L2-NAME"
+    assert_eq!(
+        items[0]["customer_path"], "L1-NAME / L2-NAME",
+        "customer_path 应拼成 L1 / L2: {env}"
+    );
+    // shelf 元数据存在
+    assert_eq!(items[0]["shelf_id"], prod_shelf.to_string());
+    assert_eq!(items[0]["shelf_code"], "PROD-PBP");
+    assert_eq!(items[0]["shelf_name"], "PROD-PBP");
+}
+
+/// 场景 H2: 不存在的 process_id → 20801 BIZ_PROCESS_NOT_FOUND + 404
+#[tokio::test]
+async fn pool_by_process_process_not_found() {
+    let (_guard, pool) = setup().await;
+    let proc = seed_process(&pool, "PROC-NF", "工序NF").await;
+    let _wt = insert_work_type(&pool, "WT-NF", "工种NF", Some(3)).await;
+    link_work_type_to_process(&pool, _wt, proc).await;
+    // 一个不存在的 snowflake-style id（远大于实际生成）
+    let nonexistent_id: i64 = 9_999_999_999_999;
+
+    let (app, token, _pool) = login_manager(pool.clone(), "admin_nf").await;
+    let uri = format!("/worker-pool/{nonexistent_id}");
+    let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "不存在 process 应 404: {env}"
+    );
+    assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
+}
+
+/// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（service 守卫：Manager/Clerk/Inspector only）
+#[tokio::test]
+async fn pool_by_process_forbidden_for_shelf_account() {
+    let (_guard, pool) = setup().await;
+    let proc = seed_process(&pool, "PROC-FB", "工序FB").await;
+    let wt = insert_work_type(&pool, "WT-FB", "工种FB", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = common::insert_shelf(&pool, "PROD-FB", "PROD-FB", "PRODUCTION").await;
+
+    // ShelfAccount 绑一个 shelf（scope 必须给才能登录；调用端点时仍会被 service 拒绝）
+    let (app, token, _pool) = login_shelf_account(pool.clone(), "shelf_user_fb", &[prod_shelf]).await;
+    let uri = format!("/worker-pool/{proc}");
+    let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "ShelfAccount 应 403: {env}"
+    );
+    assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
+}
+
+/// 场景 H4: process 存在但无候选批次 → total=0, items=[]，元数据正常返回
+#[tokio::test]
+async fn pool_by_process_no_candidates_when_no_batch() {
+    let (_guard, pool) = setup().await;
+    let proc = seed_process(&pool, "PROC-EMPTY", "空工序").await;
+    let wt = insert_work_type(&pool, "WT-EMPTY", "空工种", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let _w = insert_worker(&pool, "BC-EMPTY", "空工人", Some(wt)).await;
+
+    let (app, token, _pool) = login_manager(pool.clone(), "admin_empty").await;
+    let uri = format!("/worker-pool/{proc}");
+    let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(s, StatusCode::OK, "无 batch 应 200: {env}");
+    assert_eq!(env["code"], 0, "code 应 0: {env}");
+
+    let data = &env["data"];
+    assert_eq!(data["process_id"], proc.to_string());
+    assert_eq!(data["process_code"], "PROC-EMPTY");
+    assert_eq!(data["process_name"], "空工序");
+    assert_eq!(data["total"], 0, "total 应 0: {env}");
+    let items = data["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 0, "items 应 []: {env}");
+    // workers / work_types 字段应正常返回
+    let workers = data["workers"].as_array().expect("workers array");
+    assert_eq!(workers.len(), 1, "workers 应 1 个: {env}");
+    let work_types = data["work_types"].as_array().expect("work_types array");
+    assert_eq!(work_types.len(), 1, "work_types 应 1 个: {env}");
+    assert_eq!(work_types[0]["max_held_batches"], 3);
+}
