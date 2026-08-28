@@ -273,6 +273,9 @@ pub struct WorkerScanCoreOut {
     #[serde(serialize_with = "serialize_i64")]
     pub batch_id: i64,
     pub event_type: String,
+    /// 父装配件 id（仅当 INSPECTED 分支触发父 status 变更时 Some）
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub synced_assembly_id: Option<i64>,
     /// 内部：透传给 refill，refill 不再 fetch worker。
     #[serde(skip)]
     pub work_type_id: i64,
