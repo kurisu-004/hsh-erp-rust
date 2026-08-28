@@ -28,14 +28,41 @@ Request：
 
 Response 200 `data`：`ScanDeliveryOut`
 
+> **批次状态 3 分组（路线 B，2026-08-27）**——扫码时按 `t_part_batch.status` 把命中的批次分成三组：
+>
+> | 组 | 状态 | 行为 |
+> |---|---|---|
+> | **A 直接入单** | `READY_TO_SHIP` / `INSPECTION`（且 `delivery_note_id IS NULL`） | 进 `added_batches[]` |
+> | **B 候选→一键送检** | `PENDING` / `PROGRAMMING` / `IN_PROCESS`（未被工人持有）/ `REPAIRING` | 进 `unresolved_targets[i].available_batches[]`，前端调 `to-inspection` 后 re-scan |
+> | **C 直接报错** | `DELIVERED` / `OUTSOURCE` / `IN_PROCESS`（工人持有）/ `COMPLETED` / `CANCELLED` | 短路报错 `21421` |
+
+```jsonc
+{
+  "outcome": "ADDED" | "ALREADY_PRESENT" | "CANDIDATES_AVAILABLE" | "PARTIAL_ADDED",
+  "resolved": { "kind": "PART", "id": "…", "serial_no": "…", "drawing_no": "…", "name": "…" },
+  "note": { /* ScanDeliveryNoteSummaryDto */ },
+  "added_batches": [ /* AddedBatchDto */ ],
+  "unresolved_targets": [ /* UnresolvedTargetDto */ ]   // 字段缺省即表示无（serde skip_none）
+}
+```
+
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `outcome` | string | `ADDED` / `ALREADY_PRESENT` |
+| `outcome` | string | `ADDED` / `ALREADY_PRESENT` / `CANDIDATES_AVAILABLE` / `PARTIAL_ADDED` |
 | `resolved` | object | 解析结果，见下 |
 | `note` | object | 命中/新建的送货单概要，见下 |
-| `added_batches` | [object] | 本次新加入的批次 |
-| `already_present` | [object] | 已在本单的批次 |
-| `skipped` | [object] | 失败明细（200 路径下始终为空数组） |
+| `added_batches` | [object] | 本次新加入的批次（A 组）；无则为 `[]` |
+| `unresolved_targets` | [object]? | B 组候选清单；无则**字段不出现**（`skip_serializing_if`） |
+
+4 场景 → outcome 映射：
+
+| 场景 | outcome | `added_batches` | `unresolved_targets` |
+|---|---|---|---|
+| ① 散件全 A 组 | `ADDED` | ✓ | — |
+| ② 散件仅 B 组 | `CANDIDATES_AVAILABLE` | `[]` | ✓（1 个元素） |
+| ③ 装配件全 A 组 | `ADDED` | ✓ | — |
+| ④ 装配件 A+B 混合 | `PARTIAL_ADDED` | ✓（A 组已挂载部分） | ✓（每个 B 组子件 1 个元素） |
+| 全部批次已挂本单 | `ALREADY_PRESENT` | `[]` | — |
 
 `resolved`：
 
@@ -46,8 +73,6 @@ Response 200 `data`：`ScanDeliveryOut`
 | `serial_no` | string | |
 | `drawing_no` | string | |
 | `name` | string | |
-| `assembly_id` | string (i64)? | 子件所属装配体（`kind=PART` 且属于装配时） |
-| `child_count` | usize? | `kind=ASSEMBLY` 时的子件数 |
 
 `note`：
 
@@ -73,42 +98,56 @@ Response 200 `data`：`ScanDeliveryOut`
 | `name` | string | |
 | `order_no` | string? | |
 
-`added_batches[]` / `already_present[]`：
+`added_batches[]`（`AddedBatchDto`）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `batch_id` | string (i64) | |
-| `part_id` | string (i64) | |
-| `serial_no` | string | |
+| `part_id` | string (i64) | 跨子件场景需保留（装配件一次挂多个 part 的批次） |
+| `serial_no` | string | 来自 `part.serial_no` |
 | `quantity` | i32 | |
 
-`skipped[]`（仅 21418 失败路径下填充）：
+`unresolved_targets[]`（`UnresolvedTargetDto`）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `serial_no` | string | 失败子件序列号 |
-| `name` | string | 失败子件名称 |
-| `reason` | string | 失败原因说明 |
-| `part_id` | string (i64)? | 工单 ID；21405 场景下为 `"0"`（无具体 part） |
-| `batch_id` | string (i64)? | 批次 ID；21405 场景下为 `null` |
-| `drawing_no` | string? | 图号；21405 场景下为 `null` |
-| `status` | string? | 工单当前 status（如 `IN_PROCESS` / `READY_TO_SHIP` 等）；21405 场景下为 `null` |
+| `part_id` | string (i64) | 未就绪工单 ID |
+| `serial_no` | string | |
+| `drawing_no` | string | |
+| `name` | string | |
+| `available_batches` | [object] | 该工单的 B 组候选批次，见下 |
 
-> 21405 场景（零件状态非 READY_TO_SHIP）：`part_id="0"`、其余三字段为 `null`，由前端按 `reason` 文案兜底展示。21418 场景（装配件整套拒绝）：`part_id` 为真实工单 ID，可直接用其构造批量送检请求（见下文 21418 错误码）。
+`unresolved_targets[i].available_batches[]`（`AvailableBatchDto`）：
 
-> 前端可基于 `data.failures[].status` 区分触发端点：
-> - `status ∈ {PENDING, PROGRAMMING, IN_PROCESS}` → 触发 `POST /parts/batch-scan-inspect`（一键送检）
-> - `status === 'INSPECTION'` → 触发 `POST /parts/batch-pass-inspection`（一键过检）
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string (i64) | |
+| `quantity` | i32 | |
+| `status` | string | `BatchStatusDto` 枚举，见下 |
+
+> part 级信息（`serial_no` / `drawing_no` / `name`）只在外层 `UnresolvedTargetDto` 上，`available_batches[]` 内不重复。
+
+`BatchStatusDto`（`t_part_batch.status` 强类型投影，序列化沿用 DB 列值）：
+
+`PENDING` / `PROGRAMMING` / `IN_PROCESS` / `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` / `REPAIRING` / `OUTSOURCE` / `COMPLETED` / `CANCELLED`
+
+> 前端可基于 `unresolved_targets[i].available_batches[].status` 区分触发端点：
+> - `status ∈ {PENDING, PROGRAMMING, IN_PROCESS, REPAIRING}` → 触发一键送检（`to-inspection` / `POST /parts/batch-scan-inspect`），成功后 re-scan 同一 code 完成入单
 
 错误码：
 
-- 20104 BIZ_INVALID_VALUE — code 空白/空
-- 21407 BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS — 单内混客户
-- 21416 BIZ_DELIVERY_NOTE_SCOPE_MISMATCH — 零件分类与送货单范围不符
-- 21417 BIZ_DELIVERY_SCAN_UNKNOWN_CODE — 扫码无法识别
-- 21418 BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY — 装配件整套拒绝（**BizWithFailures**，data.failures 含跳过明细）。前端可基于 `data.failures[].part_id` 构造对 `POST /api/v2/parts/batch-pass-inspection` 的批量送检请求，免去多次 round-trip
-- 40300 FORBIDDEN — 角色不符
-- 40001 VALIDATION_ERROR — 角色不足
+| 错误码 | 常量 | 说明 |
+|---|---|---|
+| `20104` | `BIZ_INVALID_VALUE` | code 空白/空，或 trim 后长度不在 1..=64 |
+| `21407` | `BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS` | 单内混客户 |
+| `21416` | `BIZ_DELIVERY_NOTE_SCOPE_MISMATCH` | 零件分类与送货单范围不符 |
+| `21417` | `BIZ_DELIVERY_SCAN_UNKNOWN_CODE` | 扫码无法识别（既非 part 也非 assembly 序列号） |
+| `21406` | `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` | 所有目标批次都已挂在其它 active 单上（无可选 → 硬错误） |
+| `21421` | `BIZ_DELIVERY_BATCH_STATE_INVALID` | scan 路径 C 组短路（DELIVERED / OUTSOURCE / IN_PROCESS 工人持有 / COMPLETED / CANCELLED） |
+| `21405` | `BIZ_DELIVERY_NOTE_PART_NOT_READY` | **已不再由 scan 触发**；保留给 `add-parts` 等端点 |
+| `21418` | `BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY` | **已不再由 scan 触发**（场景 ④ 改走 200 `PARTIAL_ADDED`）；保留给 `add-parts` 等端点 |
+| `40300` | `FORBIDDEN` | 角色不符 |
+| `40001` | `VALIDATION_ERROR` | 角色不足 |
 
 ### `POST /api/v2/delivery-notes`
 
