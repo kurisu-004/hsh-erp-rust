@@ -81,7 +81,7 @@ impl PartStatus {
         }
     }
 
-    /// 迁移白名单（共 11 个合法迁移）。
+    /// 迁移白名单（共 14 个合法迁移）。
     ///
     /// 本 PR（scan-inspect 一键送检）放行：
     /// - `INSPECTION → READY_TO_SHIP`：pass_inspection / scan_inspect (PASS) 路径
