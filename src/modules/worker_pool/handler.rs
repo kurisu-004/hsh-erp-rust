@@ -5,6 +5,9 @@
 //! ## 端点
 //! - `GET  /api/v2/worker-pool/state?worker_id=&shelf_id=`  —— worker 当前持有 +
 //!   池候选数（按工序分组）。无 role guard（worker 自查 + admin 监控共用）。
+//! - `GET  /api/v2/worker-pool/{process_id}`        —— 按工序返回候选池详情
+//!   （process 元数据 + workers + work_types.max_held + 跨货架候选批次）。
+//!   Manager+Clerk+Inspector 可调；service 内守卫。
 //! - `POST /api/v2/admin/worker-pool/refill`                —— admin 触发
 //!   `refill_for_worker`。Manager role 守卫。
 //! - `POST /api/v2/admin/worker-pool/remove`                —— admin 把 worker
@@ -27,7 +30,7 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use super::dto::{AdminRefillRequest, AdminRemoveRequest};
+use super::dto::{AdminRefillRequest, AdminRemoveRequest, ProcessPoolDetail};
 use super::model::RefillResult;
 use super::model::WorkerPoolState;
 use super::service::WorkerPoolService;
@@ -109,4 +112,22 @@ pub async fn admin_remove(
         payload: serde_json::to_value(&t).unwrap_or_default(),
     });
     Ok(Json(R::ok(t)))
+}
+
+/// GET /api/v2/worker-pool/{process_id}
+///
+/// Manager + Clerk + Inspector。返回 process 元数据 + 可执行该工序的工人 +
+/// 映射工种的 max_held + 跨生产货架的候选批次全量列表。
+///
+/// 角色守卫下沉到 service（`pool_by_process` 内部 `require_any_role`），handler
+/// 不重复校验（与 work_type/assembly 域惯例一致）。
+pub async fn pool_by_process(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    axum::extract::Path(process_id): axum::extract::Path<i64>,
+) -> Result<Json<R<ProcessPoolDetail>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let detail = WorkerPoolService::pool_by_process(&mut tx, &current, process_id).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(detail)))
 }
