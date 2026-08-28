@@ -12,6 +12,7 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/state", get(handler::state))
+        .route("/{process_id}", get(handler::pool_by_process))
 }
 
 pub fn admin_router() -> Router<Arc<AppState>> {

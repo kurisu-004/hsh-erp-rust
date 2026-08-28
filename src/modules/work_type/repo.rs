@@ -17,6 +17,8 @@
 
 use sqlx::{PgExecutor, QueryBuilder};
 
+use crate::shared::error::AppError;
+
 use super::model::TWorkType;
 
 pub struct WorkTypeRepo;
@@ -294,5 +296,31 @@ impl WorkTypeRepo {
         .fetch_one(executor)
         .await?;
         Ok(row.0)
+    }
+
+    /// 列出映射该 process 的所有 work_type（DISTINCT 自然语义：t_work_type_process 是单表）。SQL：
+    /// SELECT wt.id, wt.code, wt.name, wt.max_held_batches
+    ///   FROM t_work_type wt
+    ///   JOIN t_work_type_process wtp ON wtp.work_type_id = wt.id
+    ///  WHERE wtp.process_id = $1 AND wt.deleted_at IS NULL
+    ///  ORDER BY wt.sort_order ASC, wt.id ASC
+    ///
+    /// 返回元组，service 层负责构造 DTO。
+    pub async fn list_work_types_by_process_id<'e, E: PgExecutor<'e>>(
+        executor: E,
+        process_id: i64,
+    ) -> Result<Vec<(i64, String, String, Option<i32>)>, AppError> {
+        let rows: Vec<(i64, String, String, Option<i32>)> = sqlx::query_as(
+            r#"SELECT wt.id, wt.code, wt.name, wt.max_held_batches
+               FROM t_work_type wt
+               JOIN t_work_type_process wtp ON wtp.work_type_id = wt.id
+               WHERE wtp.process_id = $1 AND wt.deleted_at IS NULL
+               ORDER BY wt.sort_order ASC, wt.id ASC"#,
+        )
+        .bind(process_id)
+        .fetch_all(executor)
+        .await
+        .map_err(AppError::from)?;
+        Ok(rows)
     }
 }

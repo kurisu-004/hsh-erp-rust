@@ -9,6 +9,10 @@
 //! - `compute_state` —— worker 当前持有数 + 池候选数（按工序分组）；用于 state 端点。
 //! - `admin_remove_held_batch` —— admin 主动把 worker 持有的某批次按 RETURNED 语义放回
 //!   候选池；调 `PartRepo::mark_batch_returned` + `mark_part_returned` + 写事件日志。
+//!
+//! ## 阶段 worker-pool-by-process（Task 3）
+//! - `pool_by_process` —— admin 按工序查看候选池：process 元数据 + 映射工种 + 可执行工人 +
+//!   所有货架候选批次（4 子查询合一，纯读，4 路 `&mut *conn` 复用同一事务）。
 
 use sqlx::PgConnection;
 
@@ -21,7 +25,7 @@ use crate::modules::work_type::repo::WorkTypeRepo;
 use crate::modules::worker::repo::WorkerRepo;
 use crate::shared::error::{code, AppError};
 
-use super::dto::AdminRemoveRequest;
+use super::dto::{AdminRemoveRequest, PoolBatchItem, ProcessPoolDetail, WorkerBrief, WorkTypeMaxHeld};
 use super::model::{ProcessPoolCount, RefillResult, TakenItem, WorkerPoolState};
 use super::repo::WorkerPoolRepo;
 
@@ -328,6 +332,77 @@ impl WorkerPoolService {
             planned_delivery_date: Some(part.planned_delivery_date),
             is_urgent: part.is_urgent,
             version: batch.version + 1,
+        })
+    }
+
+    /// `GET /api/v2/worker-pool/{process_id}` 业务逻辑。
+    ///
+    /// 流程：
+    /// 1. 角色守卫：`Manager + Clerk + Inspector`（admin 视角但不止 Manager）；
+    /// 2. 取 process 元数据（code + name），不存在 → `20801 BIZ_PROCESS_NOT_FOUND`；
+    /// 3. 取该 process 映射的 work_type 列表（含 max_held_batches）；
+    /// 4. 取可执行该 process 的 active worker 列表（含 work_type_code）；
+    /// 5. 取该 process 在所有生产货架上的候选批次（JOIN 5 表）；
+    /// 6. 装 `ProcessPoolDetail` 返回。
+    ///
+    /// 全部读操作，单事务只读，无 WS 广播，无 commit 副作用。
+    pub async fn pool_by_process(
+        conn: &mut PgConnection,
+        current: &CurrentUser,
+        process_id: i64,
+    ) -> Result<ProcessPoolDetail, AppError> {
+        use crate::auth::rbac::Role;
+        use crate::modules::process::repo::ProcessRepo;
+
+        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+
+        // 1. process 元数据
+        let process = ProcessRepo::get_by_id(&mut *conn, process_id, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PROCESS_NOT_FOUND,
+                    format!("process {process_id} 不存在"),
+                )
+            })?;
+
+        // 2. work_types
+        let work_types = WorkTypeRepo::list_work_types_by_process_id(&mut *conn, process_id).await?;
+        let work_types = work_types
+            .into_iter()
+            .map(|(id, code, name, max_held_batches)| WorkTypeMaxHeld {
+                work_type_id: id,
+                work_type_code: code,
+                work_type_name: name,
+                max_held_batches,
+            })
+            .collect();
+
+        // 3. workers
+        let worker_rows = WorkerRepo::list_active_by_process_id(&mut *conn, process_id).await?;
+        let workers = worker_rows
+            .into_iter()
+            .map(|(worker_id, name, work_type_id, work_type_code)| WorkerBrief {
+                worker_id,
+                name,
+                work_type_id,
+                work_type_code,
+            })
+            .collect();
+
+        // 4. candidates
+        let items: Vec<PoolBatchItem> =
+            WorkerPoolRepo::list_candidates_by_process_all_shelves(&mut *conn, process_id).await?;
+        let total = items.len() as i64;
+
+        Ok(ProcessPoolDetail {
+            process_id,
+            process_code: process.code,
+            process_name: process.name,
+            workers,
+            work_types,
+            total,
+            items,
         })
     }
 }
