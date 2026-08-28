@@ -405,22 +405,26 @@ async fn scan_rescan_same_part_idempotent_already_present() {
     assert_eq!(s2, StatusCode::OK, "rescan: {env2}");
     assert_eq!(env2["data"]["outcome"], "ALREADY_PRESENT");
     assert_eq!(env2["data"]["note"]["id"].as_str().unwrap(), note_id);
-    assert_eq!(env2["data"]["added_batches"].as_array().unwrap().len(), 0);
-    assert_eq!(
-        env2["data"]["already_present"].as_array().unwrap().len(),
-        1
+    // `already_present` 字段在 Task 3 DTO 精简中已移除；outcome=ALREADY_PRESENT
+    // 与 note.id 不变即足以证明幂等性。
+    assert!(
+        env2["data"].get("already_present").is_none(),
+        "新 DTO 无 already_present 字段"
     );
 }
 
 #[tokio::test]
 async fn scan_part_in_process_returns_400_21405() {
+    // 注：测试名仍叫 `returns_400_21405`，但在新设计下 `IN_PROCESS` + 无 holder 归 B 组
+    // （返回 200 + CANDIDATES_AVAILABLE），不是 400/21405；要触发 C 组短路需带 holder。
+    // 这里给批次加上 Some(99) holder → C 组短路 → 400/21421。
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("P003"), None).await;
-    let _ = insert_batch(&pool, pid, 1, 1, "IN_PROCESS").await;
+    let bid = create_test_batch(&pool, pid, "IN_PROCESS", Some(99)).await;
 
-    let (app, token, _) = login_manager(pool, "admin").await;
+    let (app, token, _pool) = login_manager(pool, "admin").await;
     let (s, env) = send(
         app,
         json_request(
@@ -431,13 +435,17 @@ async fn scan_part_in_process_returns_400_21405() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert_eq!(env["code"], 21405);
+    assert_eq!(s, StatusCode::BAD_REQUEST, "C 组短路: {env}");
+    assert_eq!(
+        env["code"], 21421,
+        "worker-held IN_PROCESS 走 classify_invalid_state → 21421；got: {env}"
+    );
     let msg = env["message"].as_str().unwrap_or("");
     assert!(
-        msg.contains("IN_PROCESS") || msg.contains("status"),
-        "message 应含 status: {msg}"
+        msg.contains("IN_PROCESS") && msg.contains(&bid.to_string()),
+        "message 应含 IN_PROCESS + batch id：{msg}"
     );
+    let _ = l1;
 }
 
 #[tokio::test]
@@ -503,9 +511,12 @@ async fn scan_part_on_other_active_note_returns_409_21406() {
     assert_eq!(s, StatusCode::CONFLICT, "scan conflict: {env}");
     assert_eq!(env["code"], 21406);
     let msg = env["message"].as_str().unwrap_or("");
+    // 新设计下其它单号不在 message 里；以 code 前缀 [21406] + 409 即可证明冲突语义。
+    // 保留 other_no 用于回归人读友好（被 _ 前缀抑制）。
+    let _ = other_no;
     assert!(
-        msg.contains(&other_no),
-        "message 应含其它单号 {other_no}, got: {msg}"
+        msg.starts_with("[21406]"),
+        "message 应以 [21406] 开头：{msg}"
     );
 }
 
@@ -539,7 +550,11 @@ async fn scan_assembly_full_all_subparts_ready_added() {
     assert_eq!(env["data"]["outcome"], "ADDED");
     assert_eq!(env["data"]["resolved"]["kind"], "ASSEMBLY");
     assert_eq!(env["data"]["resolved"]["id"].as_str().unwrap(), asm_id.to_string());
-    assert_eq!(env["data"]["resolved"]["child_count"], 3);
+    // ResolvedEntityDto 不再有 child_count 字段（Task 3 DTO 精简移除）
+    assert!(
+        env["data"]["resolved"].get("child_count").is_none(),
+        "新 DTO 应无 child_count 字段"
+    );
     assert_eq!(
         env["data"]["added_batches"].as_array().unwrap().len(),
         3,
@@ -561,22 +576,40 @@ async fn scan_assembly_full_all_subparts_ready_added() {
 
 #[tokio::test]
 async fn scan_assembly_atomic_reject_with_failures() {
+    // 注：原断言 400/21418 + failures 列表是 pre-route-b 原子拒绝语义；新设计下：
+    //   - 任一子件 C 组 → 整单 400/21421（C 组短路）
+    //   - A 组子件本可挂单，但事务回滚 → DB 上仍未挂
+    // 此处把 Z0001 标为 worker-held IN_PROCESS（C 组）触发短路，验证 Z0000/Z0002（A 组）
+    // 也未挂单（整单回滚的间接证据）。
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let asm_id = insert_assembly(&pool, l2, "L2099", "ASM-099", "总成099").await;
-    // 3 子件：2 个 INSPECTION + 1 个 IN_PROCESS
+
+    // 3 子件：Z0000/Z0002 → A 组 INSPECTION；Z0001 → C 组（worker-held IN_PROCESS）
+    let mut all_pids: Vec<i64> = Vec::new();
     for i in 0..3 {
-        let p = insert_part(&pool, &format!("Sub{i}"), l2, Some(&format!("Z{i:04}")), Some(asm_id))
-            .await;
-        let st = if i == 1 { "IN_PROCESS" } else { "INSPECTION" };
-        let _ = insert_batch(&pool, p, 1, 1, st).await;
-        let _ = p;
+        let p = insert_part(
+            &pool,
+            &format!("Sub{i}"),
+            l2,
+            Some(&format!("Z{i:04}")),
+            Some(asm_id),
+        )
+        .await;
+        all_pids.push(p);
+        if i == 1 {
+            // Z0001：C 组（带 holder 的 IN_PROCESS）
+            let _ = create_test_batch(&pool, p, "IN_PROCESS", Some(99)).await;
+        } else {
+            // Z0000 / Z0002：A 组 INSPECTION
+            let _ = create_test_batch(&pool, p, "INSPECTION", None).await;
+        }
     }
 
     let (app, token, pool) = login_manager(pool, "admin").await;
     let (s, env) = send(
-        app.clone(),
+        app,
         json_request(
             "POST",
             "/delivery-notes/scan",
@@ -585,47 +618,18 @@ async fn scan_assembly_atomic_reject_with_failures() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "atomic reject: {env}");
-    assert_eq!(env["code"], 21418);
-    // failures 应含 Z0001（IN_PROCESS）
-    let failures = env["data"]["failures"].as_array().expect("data.failures");
-    let any_bad = failures
-        .iter()
-        .any(|f| f["serial_no"] == "Z0001" && f["reason"].as_str().unwrap_or("").contains("IN_PROCESS"));
-    assert!(any_bad, "failures 应含 Z0001+IN_PROCESS; got: {failures:?}");
-
-    // ScanFailureDto 4 字段断言：part_id / batch_id / drawing_no / status
-    // (Task 4 扩字段；Task 6 跟进端到端契约验证)
-    let bad = failures
-        .iter()
-        .find(|f| f["serial_no"] == "Z0001")
-        .expect("Z0001 in failures");
-    // part_id 走 serialize_i64 → JSON string
-    assert!(
-        bad["part_id"].is_string(),
-        "part_id 应为 string: {bad}"
+    assert_eq!(s, StatusCode::BAD_REQUEST, "C 组短路 → 整单拒绝: {env}");
+    assert_eq!(
+        env["code"], 21421,
+        "worker-held IN_PROCESS 触发 classify_invalid_state → 21421；got: {env}"
     );
-    let bad_pid: i64 = bad["part_id"]
-        .as_str()
-        .expect("part_id string")
-        .parse()
-        .expect("parse part_id");
-    assert!(bad_pid > 0, "part_id 应 > 0; got {bad_pid}");
-    // batch_id 与 drawing_no / status 在 not-ready 分支填全
+    let msg = env["message"].as_str().unwrap_or("");
     assert!(
-        bad["batch_id"].is_string(),
-        "batch_id 应为 string: {bad}"
+        msg.contains("IN_PROCESS"),
+        "message 应含 IN_PROCESS：{msg}"
     );
-    let bad_bid: i64 = bad["batch_id"]
-        .as_str()
-        .expect("batch_id string")
-        .parse()
-        .expect("parse batch_id");
-    assert!(bad_bid > 0, "batch_id 应 > 0; got {bad_bid}");
-    assert_eq!(bad["drawing_no"], "D-001");
-    assert_eq!(bad["status"], "IN_PROCESS");
 
-    // 整单回滚：no batch attached
+    // 整单回滚：no batch attached（包含 A 组的 Z0000/Z0002 也未挂单）
     let count: i64 = sqlx::query_scalar!(
         "SELECT COUNT(*) AS \"c!\" FROM t_part_batch \
          WHERE delivery_note_id IN (SELECT id FROM t_delivery_note WHERE customer_id = $1)",
@@ -634,7 +638,24 @@ async fn scan_assembly_atomic_reject_with_failures() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(count, 0, "整单应回滚：no batch attached");
+    assert_eq!(
+        count, 0,
+        "整单应回滚：C 组短路 → A 组子件批次也不应挂单；got count={count}"
+    );
+
+    // 进一步断言：3 个子件的 batch.delivery_note_id 全部为 NULL（A 组 Z0000/Z0002 也未挂）
+    let attached_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_part_batch \
+         WHERE part_id = ANY($1) AND delivery_note_id IS NOT NULL",
+    )
+    .bind(&all_pids)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attached_count, 0,
+        "整单事务回滚后，3 个子件的批次均不应挂单；got attached_count={attached_count}"
+    );
 }
 
 #[tokio::test]
