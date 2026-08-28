@@ -645,12 +645,17 @@ impl PartRepo {
         }
     }
 
-    /// 部分通过：拆出 INSPECTION 批次。
+    /// 部分通过：拆出新批次（status 由 `new_batch_status` 指定）。
     ///
     /// 原子化三步（共享事务）：
     /// 1. 算同 part_id 下下一个 `batch_no`（max + 1）
-    /// 2. INSERT 新 INSPECTION 批次（quantity = split_quantity）
+    /// 2. INSERT 新批次（quantity = split_quantity，status = `new_batch_status`）
     /// 3. UPDATE 源批次 `quantity -= split_quantity`（OCC + 数量守卫）
+    ///
+    /// `new_batch_status` 通常传源批次 status：
+    /// - `to_ship` / `to_process`：源 = `INSPECTION`，新 = `INSPECTION`
+    /// - `to_inspection`：源 ∈ `{PENDING, PROGRAMMING, IN_PROCESS}`，新 = 源 status
+    ///   （确保 `mark_batch_inspected` 的 WHERE 守卫能匹配新批次）
     #[allow(clippy::too_many_arguments)]
     pub async fn split_batch_for_partial_pass(
         conn: &mut PgConnection,
@@ -659,6 +664,7 @@ impl PartRepo {
         src_version: i32,
         part_id: i64,
         split_quantity: i32,
+        new_batch_status: &str,
         current_user_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
         // 1. 算 next batch_no
@@ -673,7 +679,7 @@ impl PartRepo {
         .fetch_one(&mut *conn)
         .await?;
 
-        // 2. INSERT 新 INSPECTION 批次（quantity = split_quantity）
+        // 2. INSERT 新批次（quantity = split_quantity，status = new_batch_status）
         sqlx::query!(
             r#"
             INSERT INTO t_part_batch (
@@ -682,7 +688,7 @@ impl PartRepo {
                 delivery_note_id, parent_batch_id, has_been_repaired,
                 version, created_at, created_by, updated_at, updated_by
             )
-            SELECT $1, part_id, $2, $3, 'INSPECTION', location,
+            SELECT $1, part_id, $2, $3, $7, location,
                    current_holder_id, next_process_id, placed_at,
                    NULL, $4, has_been_repaired,
                    0, now(), $5, now(), $5
@@ -695,6 +701,7 @@ impl PartRepo {
             src_batch_id,
             current_user_id,
             src_batch_id,
+            new_batch_status,
         )
         .execute(&mut *conn)
         .await?;

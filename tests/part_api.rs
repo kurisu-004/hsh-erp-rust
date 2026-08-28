@@ -1193,16 +1193,10 @@ async fn to_ship_partial_split_happy_path() {
 ///
 /// 期望：`new_batch_id` 非 null（remainder 留 PENDING）；`part.status` 已翻转为 INSPECTION。
 ///
-/// **已知 issue（待 Task 1-4 修复）**：`split_batch_for_partial_pass` 把新批次硬编码
-/// 初始化为 `status='INSPECTION'`，但 `mark_batch_inspected` 的 WHERE 子句要求
-/// `status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')`，导致新批次 UPDATE 0 行
-/// → 40901 VERSION_CONFLICT。本测试暂用 `#[ignore]` 标记，等待 service 层把
-/// 「partial-split 起始状态」参数化（to_inspection 应该创建 status=源 status 的
-/// 新批次，或 service 层在拆分前先 UPDATE 新批次到源 status）。
-///
-/// 跟踪：见 Task 5 review note（to_inspection partial-split 不通过 40901）。
+/// `split_batch_for_partial_pass` 现在通过 `new_batch_status` 参数接收源批次 status，
+/// 因此 `to_inspection`（源 = `PENDING`）拆出的新批次以 `PENDING` 起始，能通过
+/// `mark_batch_inspected` 的 WHERE 守卫。
 #[tokio::test]
-#[ignore = "待修复 split_batch_for_partial_pass 与 mark_batch_inspected 的状态起点契约（Tasks 1-4 范畴）"]
 async fn to_inspection_partial_split_happy_path() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;

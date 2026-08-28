@@ -223,6 +223,7 @@ impl PartService {
                 target.version,
                 target.part_id,
                 op_qty,
+                &target.status,
                 Some(current.id),
             )
             .await?;
