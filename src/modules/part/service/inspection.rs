@@ -459,7 +459,7 @@ impl PartService {
 
         let mut submitted: Vec<ToXxxOut> = Vec::new();
         let mut failed: Vec<BatchOpFailure> = Vec::new();
-        for item in req.items {
+        for (idx, item) in req.items.iter().enumerate() {
             // 解析 batch_id：失败 → 推 sentinel failure + continue（不让 to_ship_core
             // 把歧义 BIZ_PART_BATCH_NOT_FOUND 当成"找不到 INSPECTION 批次"上报）。
             let parsed_bid: i64 = match item.batch_id.parse::<i64>() {
@@ -488,6 +488,12 @@ impl PartService {
                     continue;
                 }
             };
+            // per-item savepoint：失败 item 回滚部分写入，不影响后续 item（参考 batch_create_parts）
+            use sqlx::AssertSqlSafe;
+            let sp_name = format!("batch_to_ship_item_{idx}");
+            sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
+                .execute(&mut *conn)
+                .await?;
             match Self::to_ship_core(
                 &mut *conn,
                 snowflake,
@@ -498,27 +504,25 @@ impl PartService {
             )
             .await
             {
-                Ok(o) => submitted.push(o),
-                Err(e) => failed.push(BatchOpFailure {
-                    batch_id: target.id,
-                    code: e.code(),
-                    message: format!("{e}"),
-                }),
+                Ok(o) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    submitted.push(o);
+                }
+                Err(e) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    failed.push(BatchOpFailure {
+                        batch_id: target.id,
+                        code: e.code(),
+                        message: format!("{e}"),
+                    });
+                }
             }
         }
-        // —— 父装配件批量同步：成功 item 收集 part_id 后单次 sync_from_part_changes ——
-        let successful_part_ids: Vec<i64> = submitted.iter().map(|s| s.part.id).collect();
-        let sync_outcomes =
-            AssemblyService::sync_from_part_changes(&mut *conn, &successful_part_ids, current).await?;
-        // 把每个 Changed(aid) 分发到第一个 None 槽位（DISTINCT 保证每个 aid 仅出现一次；
-        // PartOut 不携带 assembly_id，因此用"首个未占用 slot"近似映射；前端按 assembly_id 去重）。
-        for outcome in sync_outcomes {
-            if let SyncOutcome::Changed(aid) = outcome
-                && let Some(slot) = submitted.iter_mut().find(|s| s.synced_assembly_id.is_none())
-            {
-                slot.synced_assembly_id = Some(aid);
-            }
-        }
+        // 父装配件同步已由各 to_ship_core 在 savepoint 内调用 sync_from_part_change 完成。
         Ok(BatchToXxxOut { submitted, failed })
     }
 
@@ -919,7 +923,7 @@ impl PartService {
 
         let mut submitted: Vec<ToXxxOut> = Vec::new();
         let mut failed: Vec<BatchOpFailure> = Vec::new();
-        for item in req.items {
+        for (idx, item) in req.items.iter().enumerate() {
             // 解析 batch_id：失败 → 推 sentinel failure + continue
             let parsed_bid: i64 = match item.batch_id.parse::<i64>() {
                 Ok(n) => n,
@@ -947,6 +951,12 @@ impl PartService {
                     continue;
                 }
             };
+            // per-item savepoint：失败 item 回滚部分写入，不影响后续 item（参考 batch_create_parts）
+            use sqlx::AssertSqlSafe;
+            let sp_name = format!("batch_to_inspection_item_{idx}");
+            sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
+                .execute(&mut *conn)
+                .await?;
             match Self::to_inspection_core(
                 &mut *conn,
                 snowflake,
@@ -959,27 +969,25 @@ impl PartService {
             )
             .await
             {
-                Ok(o) => submitted.push(o),
-                Err(e) => failed.push(BatchOpFailure {
-                    batch_id: target.id,
-                    code: e.code(),
-                    message: format!("{e}"),
-                }),
+                Ok(o) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    submitted.push(o);
+                }
+                Err(e) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    failed.push(BatchOpFailure {
+                        batch_id: target.id,
+                        code: e.code(),
+                        message: format!("{e}"),
+                    });
+                }
             }
         }
-        // —— 父装配件批量同步：成功 item 收集 part_id 后单次 sync_from_part_changes ——
-        let successful_part_ids: Vec<i64> = submitted.iter().map(|s| s.part.id).collect();
-        let sync_outcomes =
-            AssemblyService::sync_from_part_changes(&mut *conn, &successful_part_ids, current).await?;
-        // 把每个 Changed(aid) 分发到第一个 None 槽位（DISTINCT 保证每个 aid 仅出现一次；
-        // PartOut 不携带 assembly_id，因此用"首个未占用 slot"近似映射；前端按 assembly_id 去重）。
-        for outcome in sync_outcomes {
-            if let SyncOutcome::Changed(aid) = outcome
-                && let Some(slot) = submitted.iter_mut().find(|s| s.synced_assembly_id.is_none())
-            {
-                slot.synced_assembly_id = Some(aid);
-            }
-        }
+        // 父装配件同步已由各 to_inspection_core 在 savepoint 内调用 sync_from_part_change 完成。
         Ok(BatchToXxxOut { submitted, failed })
     }
 }
