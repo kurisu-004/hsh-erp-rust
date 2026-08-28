@@ -205,7 +205,7 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<(i64, i32, Option<i64>), AppError> {
         let op_qty = quantity.unwrap_or(target.quantity);
-        if op_qty <= 0 || op_qty > target.quantity {
+        if op_qty <= 0 {
             return Err(AppError::biz(
                 code::BIZ_PART_BATCH_INVALID_QUANTITY,
                 format!(

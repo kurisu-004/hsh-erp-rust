@@ -355,7 +355,7 @@ handler 当前为 3 行占位：
 
 ### 横切未完成
 
-- **WebSocket 真实握手**：`src/modules/dashboard/handler.rs` 仍为 stub（7 行注释）；WS 事件已通过 `WsHub::broadcast` 全部注册（DELIVERY_NOTE_*/INSPECTED*/WORKER_*），待 hub 真实握手后即可下发。
+- **WebSocket 真实握手**：`src/modules/dashboard/handler.rs` 仍为 stub（7 行注释）；WS 事件已通过 `WsHub::broadcast` 全部注册（DELIVERY_NOTE_*/PART_TO_*/BATCH_TO_*/WORKER_*），待 hub 真实握手后即可下发。
 - **auto_complete 后台任务**：`src/task/auto_complete.rs` 占位；DELIVERED→COMPLETED 定时循环未接业务查询。
 - **MCP 服务**：不在本仓库（用户决策：独立 MCP 服务器承载）。
 - **集成测试**：`tests/common/mod.rs` 已搭基建；按域补场景（当前有 worker_pool / part_worker_scan 等）。
