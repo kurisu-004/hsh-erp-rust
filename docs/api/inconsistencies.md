@@ -13,7 +13,7 @@
 | 整域缺失（Python 有 Rust 无） | 4 域 | cnc_program / outsource / statistics / part_file 扩展 |
 | 部分缺失（part 域） | ~32 端点 | Python 46 vs Rust 18（其中 4 个为 Rust-only） |
 | 部分缺失（其他域） | ~6 端点 | applicants 7 vs 5；assemblies 9 vs 5 |
-| Rust-only | ~9 端点 | delivery-notes 新增 P3 scan + batch-detail；worker-pool；delivery-groups；part 域 batch-pass-inspection + batch-scan-inspect |
+| Rust-only | ~9 端点 | delivery-notes 新增 P3 scan + batch-detail；worker-pool；delivery-groups；part 域 batch-to-ship + batch-to-inspection |
 | 占位模块（路由挂载但 Router 空） | 4 域 | cnc_program / outsource / part_file / statistics |
 | WS stub（路径不一致） | 1 | Rust `/ws/dashboard` vs Python `/api/v1/ws/dashboard` |
 
@@ -193,8 +193,8 @@
 |---|---|---|---|
 | POST | `/api/v2/delivery-notes/scan` | delivery_notes | P3 扫码建单（find-or-create 草稿） |
 | GET | `/api/v2/delivery-notes/batch-detail` | delivery_notes | 批量详情（按 id 列表） |
-| POST | `/api/v2/parts/batch-pass-inspection` | part | 批量通过品检（Python 仅单件 `/parts/{id}/pass-inspection`） |
-| POST | `/api/v2/parts/batch-scan-inspect` | part | 批量一键送检（Python 仅单件 `/parts/{id}/scan-inspect`） |
+| POST | `/api/v2/parts/batch-to-ship` | part | 批量通过品检（Python 仅单件 `/parts/{id}/to-ship`） |
+| POST | `/api/v2/parts/batch-to-inspection` | part | 批量送检（Python 仅单件 `/parts/{id}/to-inspection`） |
 | GET / POST | `/api/v2/delivery-groups` | delivery_groups | 送货分组（Rust 新增域） |
 | POST | `/api/v2/delivery-groups/{id}/update` / `soft-delete` | delivery_groups | 同上 |
 | GET | `/api/v2/worker-pool/state` | worker_pool | 工人池状态查询（Rust 新增域） |

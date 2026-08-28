@@ -11,7 +11,7 @@
 > - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker + mapping，2026-08-26）
 > - [`./workers.md`](./workers.md) — workers 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26）
 > - [`./work-types.md`](./work-types.md) — work_types 域（CRUD + process mapping + 三态更新，2026-08-26）
-> - [`./parts/index.md`](./parts/index.md) — part 域（part-pass-inspection 批量+单件 / scan-inspect / fail-inspection / **worker-scan**）
+> - [`./parts/index.md`](./parts/index.md) — part 域（to-inspection / to-ship 批量+单件 / to-process / **worker-scan**）
 > - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（装配体 CRUD + multipart PDF + 子件自动生成，2026-08-27）
 > - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove**）
 > - [`./delivery-notes/index.md`](./delivery-notes/index.md) — delivery_notes 域（已拆为子目录：[queries](./delivery-notes/queries.md) / [drafts](./delivery-notes/drafts.md) / [workflow](./delivery-notes/workflow.md) / [print](./delivery-notes/print.md)）

@@ -330,7 +330,7 @@ SQLX_OFFLINE=true cargo build --release
 
 - **数据层**：21 张表 + sqlx migrate + 所有 200xx–215xx 业务错误码常量（含 `status_from_code` 自动推导 + HTTP 表覆盖单测，见 `src/shared/error.rs`）。
 - **认证域（auth + users）**：14 端点 + Redis session（`session:tok:<sha256>` 主条目 + `sessions:user:<id>` Set 索引）。
-- **零件核心（part）**：6 端点（pass-inspection 单/批、scan-inspect 单/批、fail-inspection、worker-scan）+ state machine（`statemachine.rs`）+ WS 联动 worker-pool refill。
+- **零件核心（part）**：6 端点（to-inspection 单/批、to-ship 单/批、to-process、worker-scan）+ state machine（`statemachine.rs`）+ WS 联动 worker-pool refill。
 - **worker-pool**：3 端点（state / admin refill / admin remove）+ `take_one_from_pool` CTE（FOR UPDATE SKIP LOCKED）。
 - **送货单域（delivery_note + delivery_groups）**：18 端点（business 17 + batch-detail 1）+ P3 扫码建单 + P4 xlsx 打印/标签 + 送货分组。
 
