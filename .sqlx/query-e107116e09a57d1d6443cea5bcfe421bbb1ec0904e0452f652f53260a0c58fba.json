@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, request_date, planned_delivery_date, status, quantity, unit_price, total_price, version, created_at, created_by, updated_at, updated_by) VALUES ($1, $2, $3, '', $4, $5, $5, 'PENDING', 1, 0, 0, 0, $6, NULL, $6, NULL)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Int8",
+        "Date",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e107116e09a57d1d6443cea5bcfe421bbb1ec0904e0452f652f53260a0c58fba"
+}

@@ -438,6 +438,7 @@ to-XXX 流共用的部分通过拆批语义。**所有 5 个单 / 批端点行�
 |---|---|---|
 | `part` | [`PartOut`](./index.md#partout-字段) | 操作后 part 的最新投影（含 OCC 更新后的 `version`） |
 | `new_batch_id` | string (i64)? | 仅 `quantity < target.quantity` 走拆批分支时为 `Some(remainder_id)`（拆批后**剩余批次**的 id，留在源状态待后续操作）；整批操作时为 `null`（序列化为 JSON `null`）。前端拿到非 null 时应刷新批次列表 |
+| `synced_assembly_id` | string (i64)? | 仅 to-inspection / to-process / to-ship / worker-scan 端点附带：父装配件（`assembly_id`）因本次 part 状态变更被翻转到新状态时为 `Some(asm_id)`（序列化为 JSON 字符串，与 `asm_id` 字段类型对称）；父 asm 已是终态或不存在时为 `null`。批量端点（`batch-to-inspection` / `batch-to-ship`）per-item 独立返回，前端应用 `HashSet` 去重后只对每个发生 flip 的 asm 拉一次详情 / 刷新列表 |
 
 ### `BatchToInspectionRequest` 字段（`POST /batch-to-inspection` 入参）
 

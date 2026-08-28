@@ -48,7 +48,6 @@ use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::service::{AssemblyService, SyncOutcome};
-use hsh_erp_rust::shared::error::AppError;
 
 use helpers::*;
 
@@ -434,10 +433,3 @@ async fn batch_to_inspection_emits_per_assembly_update() {
         "再次 sync 时 target 已 = current → 全部 NoChange；got={outcomes:?}"
     );
 }
-
-// ===========================================================================
-//  辅助：silent guard 防止 AppError::from 误吞 sqlx 错误（仅文档性）
-// ===========================================================================
-
-#[allow(dead_code)]
-fn _silence_unused_app_error_marker(_: AppError) {}
