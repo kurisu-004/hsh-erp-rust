@@ -3,7 +3,7 @@
 > 本文件须与 `src/modules/part/{handler.rs,dto.rs,service.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
-> 域覆盖：CRUD / by-serial 查询 / upload-drawing / lifecycle 状态机（deliver / cancel / complete / start-repair）/ inspection 流（pass / scan-inspect / fail / worker-scan）。所有路径前缀 `/api/v2`。
+> 域覆盖：CRUD / by-serial 查询 / upload-drawing / lifecycle 状态机（deliver / cancel / complete / start-repair）/ inspection 流（to-inspection / to-ship / to-process / worker-scan）。所有路径前缀 `/api/v2`。
 > 已拆为子目录：
 >
 > 导航：[**`index.md`**](./index.md) · [`crud.md`](./crud.md) · [`lifecycle.md`](./lifecycle.md) · [`inspection.md`](./inspection.md)
@@ -26,14 +26,14 @@
 | POST | `/api/v2/parts/{part_id}/cancel` | Manager / Clerk | 5 状态白名单 → CANCELLED（拒 delivery_note 锁） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idcancel) |
 | POST | `/api/v2/parts/{part_id}/complete` | Manager / Clerk | DELIVERED → COMPLETED（清空 serial_no） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idcomplete) |
 | POST | `/api/v2/parts/{part_id}/start-repair` | Manager / Clerk / Inspector | IN_PROCESS → REPAIRING | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idstart-repair) |
-| POST | `/api/v2/parts/batch-pass-inspection` | Manager / Inspector | 批量通过品检（INSPECTION → READY_TO_SHIP） | [`inspection.md`](./inspection.md#post-apiv2partsbatch-pass-inspection) |
-| POST | `/api/v2/parts/{part_id}/pass-inspection` | Manager / Inspector | 单件通过品检（INSPECTION → READY_TO_SHIP） | [`inspection.md`](./inspection.md#post-apiv2partspart_idpass-inspection) |
-| POST | `/api/v2/parts/batch-scan-inspect` | Manager / Inspector | 批量一键送检（PENDING/PROGRAMMING/IN_PROCESS → INSPECTION） | [`inspection.md`](./inspection.md#post-apiv2partsbatch-scan-inspect) |
-| POST | `/api/v2/parts/{part_id}/scan-inspect` | Manager / Inspector | 单件一键送检 → PASS/FAIL | [`inspection.md`](./inspection.md#post-apiv2partspart_idscan-inspect) |
-| POST | `/api/v2/parts/{part_id}/fail-inspection` | Manager / Inspector | 单件品检打回（INSPECTION → IN_PROCESS） | [`inspection.md`](./inspection.md#post-apiv2partspart_idfail-inspection) |
+| POST | `/api/v2/parts/batch-to-inspection` | Manager / Inspector | 批量送检（PENDING/PROGRAMMING/IN_PROCESS → INSPECTION） | [`inspection.md`](./inspection.md#post-apiv2partsbatch-to-inspection) |
+| POST | `/api/v2/parts/{part_id}/to-inspection` | Manager / Inspector | 单件送检 | [`inspection.md`](./inspection.md#post-apiv2partspart_idto-inspection) |
+| POST | `/api/v2/parts/batch-to-ship` | Manager / Inspector | 批量通过品检（INSPECTION → READY_TO_SHIP） | [`inspection.md`](./inspection.md#post-apiv2partsbatch-to-ship) |
+| POST | `/api/v2/parts/{part_id}/to-ship` | Manager / Inspector | 单件通过品检（INSPECTION → READY_TO_SHIP） | [`inspection.md`](./inspection.md#post-apiv2partspart_idto-ship) |
+| POST | `/api/v2/parts/{part_id}/to-process` | Manager / Inspector | 单件指定下一工序（INSPECTION → IN_PROCESS） | [`inspection.md`](./inspection.md#post-apiv2partspart_idto-process) |
 | POST | `/api/v2/parts/worker-scan` | **Manager** / **ShelfAccount** | 工人扫码归还 / 送检；成功后同事务触发 worker-pool refill | [`inspection.md`](./inspection.md#post-apiv2partsworker-scan) |
 
-> 路由顺序：`/batch-pass-inspection`、`/batch-scan-inspect`、`/batch`、`/by-serial/{serial_no}`、`/worker-scan` 必须在 `/{part_id}/...` 之前注册（axum 防止静态段被解析成 `part_id`）。
+> 路由顺序：`/batch-to-inspection`、`/batch-to-ship`、`/batch`、`/by-serial/{serial_no}`、`/worker-scan` 必须在 `/{part_id}/...` 之前注册（axum 防止静态段被解析成 `part_id`）。
 
 ---
 
@@ -90,7 +90,7 @@
 
 part / lifecycle 错误码（20101 / 20103 / 20104 / 20109 / 20111 / 20115 / 20116 / 20117 / 20118 / 20119 / 21420 / 40001 / 40300 / 40901）见 [`./inspection.md`](./inspection.md#错误码参考part-lifecycle)。
 
-货架错误码（20511 / 20512 — scan-inspect / fail-inspection 专用）见 [`./inspection.md`](./inspection.md#货架错误码20511-20512-scan-inspect-fail-inspection-专用)。
+货架错误码（20511 / 20512 — to-inspection / to-process 专用）见 [`./inspection.md`](./inspection.md#货架错误码205xx--to-xxx--worker-scan-触发)。
 
 ## 参考
 
