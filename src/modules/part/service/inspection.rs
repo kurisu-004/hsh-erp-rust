@@ -27,7 +27,7 @@
 //! - 20103 `BIZ_INVALID_TRANSITION` —— 当前状态非合法 to-XXX 起点
 //! - 20104 `BIZ_INVALID_VALUE` —— 入参值非法
 //! - 20109 `BIZ_PART_BATCH_NOT_FOUND` —— 找不到指定批次 / 多个候选批次无 hint
-//! - 20111 `BIZ_PART_BATCH_INVALID_QUANTITY` —— 拆分数量非法（≤0 或 > batch_quantity）
+//! - 20111 `BIZ_PART_BATCH_INVALID_QUANTITY` —— 拆分数量非法（仅 ≤0；> batch_quantity 等价于整批操作）
 //! - 40001 `VALIDATION_ERROR` —— 批量入参校验失败（items 为空 / 超过上限 / batch_id 解析失败）
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败（已被并发修改）
 
