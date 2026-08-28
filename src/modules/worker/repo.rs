@@ -15,6 +15,8 @@
 
 use sqlx::{PgExecutor, QueryBuilder};
 
+use crate::shared::error::AppError;
+
 use super::model::TWorker;
 
 pub struct WorkerRepo;
@@ -316,5 +318,32 @@ impl WorkerRepo {
         .fetch_one(executor)
         .await?;
         Ok(row.0)
+    }
+
+    /// 列出可执行该 process 的所有 active worker（含其所属 work_type）。
+    /// SQL：t_worker JOIN t_work_type JOIN t_work_type_process，过滤
+    /// `is_active = TRUE AND deleted_at IS NULL`。
+    ///
+    /// 返回元组：(worker_id, worker_name, work_type_id, work_type_code)。
+    /// 同一 worker 若所属工种映射该 process 出现一次（t_worker.work_type_id 单值）。
+    pub async fn list_active_by_process_id<'e, E: PgExecutor<'e>>(
+        executor: E,
+        process_id: i64,
+    ) -> Result<Vec<(i64, String, i64, String)>, AppError> {
+        let rows: Vec<(i64, String, i64, String)> = sqlx::query_as(
+            r#"SELECT w.id, w.name, wt.id, wt.code
+               FROM t_worker w
+               JOIN t_work_type wt ON wt.id = w.work_type_id
+               JOIN t_work_type_process wtp ON wtp.work_type_id = wt.id
+               WHERE wtp.process_id = $1
+                 AND w.is_active = TRUE AND w.deleted_at IS NULL
+                 AND wt.deleted_at IS NULL
+               ORDER BY wt.sort_order ASC, w.id ASC"#,
+        )
+        .bind(process_id)
+        .fetch_all(executor)
+        .await
+        .map_err(AppError::from)?;
+        Ok(rows)
     }
 }
