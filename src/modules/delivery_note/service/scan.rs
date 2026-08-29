@@ -120,6 +120,7 @@ fn build_unresolved_target(e: TargetEvaluation) -> UnresolvedTargetDto {
             .into_iter()
             .map(|b| AvailableBatchDto {
                 batch_id: b.id,
+                version: b.version,
                 quantity: b.quantity,
                 status: BatchStatusDto::from_db(&b.status).unwrap_or(BatchStatusDto::Pending),
             })

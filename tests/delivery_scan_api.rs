@@ -519,6 +519,11 @@ async fn scan_part_in_process_on_production_shelf_returns_candidates() {
     );
     assert_eq!(avail[0]["status"], "IN_PROCESS");
     assert_eq!(avail[0]["quantity"], 10);
+    assert!(
+        avail[0]["version"].is_i64(),
+        "available_batches[0].version 必须存在且为整数，实际 = {}",
+        avail[0]["version"]
+    );
 
     // batch 不应挂单
     let dn_id: Option<i64> =
@@ -1245,6 +1250,11 @@ async fn scan_standalone_part_with_only_pending_returns_candidates() {
     );
     assert_eq!(avail[0]["status"], "PENDING");
     assert_eq!(avail[0]["quantity"], 10);
+    assert!(
+        avail[0]["version"].is_i64(),
+        "available_batches[0].version 必须存在且为整数，实际 = {}",
+        avail[0]["version"]
+    );
 
     // batch 不应挂单
     let dn_id: Option<i64> =
@@ -1407,6 +1417,11 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
     assert_eq!(avail.len(), 1);
     assert_eq!(avail[0]["batch_id"].as_str().unwrap(), b_bid.to_string());
     assert_eq!(avail[0]["status"], "PENDING");
+    assert!(
+        avail[0]["version"].is_i64(),
+        "available_batches[0].version 必须存在且为整数，实际 = {}",
+        avail[0]["version"]
+    );
 
     // B 组批次不进 delivery_note_id
     let b_dn_id: Option<i64> =

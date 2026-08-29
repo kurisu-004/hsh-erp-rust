@@ -599,10 +599,13 @@ pub struct UnresolvedTargetDto {
 
 /// B 组候选批次（`unresolved_targets[i].available_batches[]`）。
 /// part 级信息（serial_no/drawing_no/name）在 `UnresolvedTargetDto` 外层，不重复。
+/// `version`：批次乐观锁版本；前端把本结构直接转发给
+/// `POST /parts/batch-to-inspection` / `batch-to-ship` 的 `items[]` 时必须带上。
 #[derive(Debug, Clone, Serialize)]
 pub struct AvailableBatchDto {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub batch_id: i64,
+    pub version: i32,
     pub quantity: i32,
     pub status: BatchStatusDto,
 }
