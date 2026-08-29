@@ -774,7 +774,7 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
     .await
     .unwrap();
 
-    let (senv, _) = send(
+    let (senv, sbody) = send(
         app.clone(),
         json_request(
             "POST",
@@ -785,6 +785,11 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
     )
     .await;
     assert_eq!(senv, StatusCode::OK);
+    assert_eq!(sbody["data"]["outcome"], "SUBMITTED");
+    assert!(
+        sbody["data"].get("unresolved_targets").is_none(),
+        "SUBMITTED 分支不应出现 unresolved_targets 键: {sbody}"
+    );
 
     // remove on SUBMITTED → 21412（submit 之后 version+1）
     let (s3, env3) = send(
@@ -848,7 +853,7 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
     let _note_b_id = b_env["data"]["id"].as_str().unwrap().to_string();
 
     // submit note A
-    let (_, _) = send(
+    let (sa, sa_env) = send(
         app.clone(),
         json_request(
             "POST",
@@ -858,6 +863,9 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
         ),
     )
     .await;
+    assert_eq!(sa, StatusCode::OK, "submit note A: {sa_env}");
+    assert_eq!(sa_env["data"]["outcome"], "SUBMITTED");
+    assert_eq!(sa_env["data"]["note"]["status"], "SUBMITTED");
 
     // recall note A → 同范围已有 note B DRAFT → 21419
     let (s, env) = send(
@@ -957,7 +965,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
     assert_eq!(cs, StatusCode::OK);
     let note_id = cenv["data"]["id"].as_str().unwrap().to_string();
 
-    let (senv, _) = send(
+    let (senv, senv_body) = send(
         app.clone(),
         json_request(
             "POST",
@@ -968,6 +976,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
     )
     .await;
     assert_eq!(senv, StatusCode::OK);
+    assert_eq!(senv_body["data"]["outcome"], "SUBMITTED");
 
     // non-driver → 21409
     let (s1, env1) = send(
@@ -1075,7 +1084,7 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
     .await;
     let note_id2 = cenv2["data"]["id"].as_str().unwrap().to_string();
 
-    let (_, _) = send(
+    let (_, s2_env) = send(
         app.clone(),
         json_request(
             "POST",
@@ -1085,6 +1094,7 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
         ),
     )
     .await;
+    assert_eq!(s2_env["data"]["outcome"], "SUBMITTED");
 
     let (s2, env2) = send(
         app,
@@ -1132,6 +1142,158 @@ async fn version_conflict_on_write_returns_409_40901() {
     .await;
     assert_eq!(s, StatusCode::CONFLICT);
     assert_eq!(env["code"], 40901);
+}
+
+/// 送货单里存在仍在 INSPECTION 的批次 → 200 + CANDIDATES_AVAILABLE，不提交。
+///
+/// 混合场景：同一 part 挂两个批次（READY_TO_SHIP + INSPECTION），
+/// 候选里只能出现 INSPECTION 那个；单据必须仍是 DRAFT（零写入）。
+#[tokio::test]
+async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let part_id = insert_part(&pool, "刹车片", l2, Some("F0001")).await;
+    let ready_batch = insert_batch(&pool, part_id, 1, 2, "READY_TO_SHIP").await;
+    let insp_batch = insert_batch(&pool, part_id, 2, 3, "INSPECTION").await;
+
+    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (cs, cenv) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/delivery-notes",
+            Some(json!({
+                "customer_id": l1.to_string(),
+                "items": [
+                    {"batch_id": ready_batch.to_string()},
+                    {"batch_id": insp_batch.to_string()},
+                ],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "create draft: {cenv}");
+    let note_id = cenv["data"]["id"].as_str().unwrap().to_string();
+    let note_version = cenv["data"]["version"].as_i64().unwrap();
+
+    // 让 version 断言有牙齿：fixture 播种 version=0，先把 INSPECTION 批次的
+    // version 顶到非 0，再拿运行期查询读出真实值做等值比较。
+    sqlx::query("UPDATE t_part_batch SET version = version + 3 WHERE id = $1")
+        .bind(insp_batch)
+        .execute(&pool)
+        .await
+        .expect("bump batch version");
+    let expected_version: i32 =
+        sqlx::query_scalar("SELECT version FROM t_part_batch WHERE id = $1")
+            .bind(insp_batch)
+            .fetch_one(&pool)
+            .await
+            .expect("read batch version");
+    assert_ne!(expected_version, 0, "断言基准不能是 fixture 的默认 0");
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/delivery-notes/{note_id}/submit"),
+            Some(json!({"version": note_version})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "submit with INSPECTION batch: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(env["data"]["outcome"], "CANDIDATES_AVAILABLE");
+    assert!(env["data"]["note"].is_null(), "候选分支不返回 note: {env}");
+
+    let targets = env["data"]["unresolved_targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 1, "只有一个 part 有 INSPECTION 批次: {env}");
+    assert_eq!(targets[0]["part_id"], part_id.to_string());
+    assert_eq!(targets[0]["serial_no"], "F0001");
+    assert_eq!(targets[0]["name"], "刹车片");
+
+    let batches = targets[0]["available_batches"].as_array().unwrap();
+    assert_eq!(
+        batches.len(),
+        1,
+        "READY_TO_SHIP 批次不得出现在候选里: {env}"
+    );
+    let b = &batches[0];
+    assert_eq!(b["batch_id"], insp_batch.to_string(), "雪花 id 序列化为字符串");
+    assert_eq!(b["status"], "INSPECTION");
+    assert_eq!(b["quantity"], 3);
+    assert_eq!(
+        b["version"].as_i64().unwrap(),
+        i64::from(expected_version),
+        "version 必须是批次当前真实 version（供 batch-to-ship 转发）"
+    );
+
+    // 零写入：重新读单据仍是 DRAFT，且 version 未 bump
+    let (ds, denv) = send(
+        app,
+        json_request("GET", &format!("/delivery-notes/{note_id}"), None, Some(&token)),
+    )
+    .await;
+    assert_eq!(ds, StatusCode::OK, "get detail: {denv}");
+    assert_eq!(denv["data"]["status"], "DRAFT");
+    assert_eq!(denv["data"]["version"].as_i64().unwrap(), note_version);
+}
+
+/// 挂单批次被旁路改成 READY_TO_SHIP / INSPECTION 之外的状态 → 21421。
+#[tokio::test]
+async fn submit_with_illegal_batch_state_returns_21421() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let part_id = insert_part(&pool, "X", l2, Some("X011")).await;
+    let batch_id = insert_batch(&pool, part_id, 1, 1, "READY_TO_SHIP").await;
+
+    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (cs, cenv) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/delivery-notes",
+            Some(json!({
+                "customer_id": l1.to_string(),
+                "items": [{"batch_id": batch_id.to_string()}],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "create draft: {cenv}");
+    let note_id = cenv["data"]["id"].as_str().unwrap().to_string();
+    let note_version = cenv["data"]["version"].as_i64().unwrap();
+
+    // 旁路改成非法状态
+    sqlx::query("UPDATE t_part_batch SET status = 'PENDING' WHERE id = $1")
+        .bind(batch_id)
+        .execute(&pool)
+        .await
+        .expect("force illegal batch status");
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/delivery-notes/{note_id}/submit"),
+            Some(json!({"version": note_version})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(env["code"], 21421, "illegal batch state: {s} {env}");
+
+    // 单据未被提交
+    let (_, denv) = send(
+        app,
+        json_request("GET", &format!("/delivery-notes/{note_id}"), None, Some(&token)),
+    )
+    .await;
+    assert_eq!(denv["data"]["status"], "DRAFT");
 }
 
 #[tokio::test]
