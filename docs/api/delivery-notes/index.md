@@ -28,7 +28,7 @@
 | POST | `/api/v2/delivery-notes/{id}/update` | 已登录（DRAFT/SUBMITTED） | partial update（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidupdate) |
 | POST | `/api/v2/delivery-notes/{id}/add-parts` | 已登录（DRAFT） | 加件（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidadd-parts) |
 | POST | `/api/v2/delivery-notes/{id}/remove-parts` | 已登录（DRAFT） | 移除件（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidremove-parts) |
-| POST | `/api/v2/delivery-notes/{id}/submit` | 已登录 | DRAFT → SUBMITTED（OCC） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidsubmit) |
+| POST | `/api/v2/delivery-notes/{id}/submit` | Manager / Clerk / Inspector | DRAFT → SUBMITTED（OCC）；有未过检批次时返 200 候选不提交 | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidsubmit) |
 | POST | `/api/v2/delivery-notes/{id}/recall` | 已登录 | SUBMITTED → DRAFT（OCC） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidrecall) |
 | POST | `/api/v2/delivery-notes/{id}/pickup-scan` | 已登录 | 拣货扫描（验证 part_serial 在本单） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidpickup-scan) |
 | POST | `/api/v2/delivery-notes/{id}/pickup` | 已登录 | SUBMITTED → PICKED_UP（OCC + 司机） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidpickup) |
@@ -40,7 +40,7 @@
 
 ## 共享 DTO
 
-### DeliveryNoteSummary 字段
+### DeliveryNoteOut 字段
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -73,8 +73,8 @@
 
 ```jsonc
 {
-  // head 字段与 DeliveryNoteSummary 全部相同（flatten）
-  ...DeliveryNoteSummary,
+  // head 字段与 DeliveryNoteOut 全部相同（flatten）
+  ...DeliveryNoteOut,
   "line_items": [DeliveryNoteLineItem],
   "scanned_serials": []   // P2 阶段始终为 []（前端本地 Set 驱动）
 }

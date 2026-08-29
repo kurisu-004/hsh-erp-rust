@@ -196,7 +196,7 @@ Request：
 | `delivery_date` | date? | — | None = 不改 |
 | `note` | string? | — | None = 不改 |
 
-Response 200 `data`：[`DeliveryNoteSummary`](./index.md#deliverynotesummary-字段)
+Response 200 `data`：[`DeliveryNoteOut`](./index.md#deliverynoteout-字段)
 
 错误码：
 

@@ -201,8 +201,13 @@ pub mod code {
     pub const BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY: i32 = 21418;   // 装配件整套拒绝：含不可入单子件（message 附明细）
     pub const BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT: i32 = 21419;  // recall 时同范围已存在 DRAFT
     pub const BIZ_DELIVERY_NOTE_LOCKED_PART: i32 = 21420;          // 零件已锁定在另一张非 DRAFT 的送货单上 → 拒 cancel
-    /// batch 当前状态不允许扫描（C 组：DELIVERED / OUTSOURCE / IN_PROCESS 工人持有 / COMPLETED / CANCELLED）
-    /// 详见 docs/api/delivery-notes/scan-route-b-fix.md
+    /// batch 当前状态不允许本次操作，两个调用点：
+    /// - scan（`delivery_note::service::scan`）：C 组状态短路
+    ///   （DELIVERED / OUTSOURCE / IN_PROCESS 工人持有 / COMPLETED / CANCELLED）
+    /// - submit（`delivery_note::service::lifecycle`）：已挂单批次状态不在
+    ///   `{INSPECTION, READY_TO_SHIP}`（挂单后被旁路改状态的数据非法场景）
+    ///
+    /// 详见 docs/api/delivery-notes/drafts.md（scan）与 workflow.md（submit）
     pub const BIZ_DELIVERY_BATCH_STATE_INVALID: i32 = 21421;
 
     // 215xx 外协发货（t_outsource_shipment）
