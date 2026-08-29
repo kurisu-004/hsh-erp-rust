@@ -35,6 +35,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
@@ -143,6 +144,9 @@ impl PartService {
         };
         // 5. event_type 分支
         let event_type_str: &'static str;
+        // 父装配件 id（仅当 INSPECTED 分支触发父 status 变更时 Some）；
+        // RETURNED 分支 part.status 保持 IN_PROCESS，不挂 sync。
+        let mut synced_assembly_id: Option<i64> = None;
         match req.event_type {
             WorkerScanEvent::RETURNED => {
                 // RETURNED 必须传 next_process_id
@@ -279,6 +283,20 @@ impl PartService {
                 if n == 0 {
                     return Err(AppError::biz(code::VERSION_CONFLICT, "乐观锁失败"));
                 }
+                // 父装配件 status 同步回流：part 状态机 IN_PROCESS → INSPECTION
+                // 可能使父聚合 target 变化（e.g. ALL_INSPECTED → COMPLETED）。
+                // 同事务调用；VERSION_CONFLICT 由 AppError 自动冒泡到 handler，
+                // 整体回滚（含尚未写入的 SENT_TO_INSPECTION 事件）。
+                synced_assembly_id = match AssemblyService::sync_from_part_change(
+                    &mut *conn,
+                    part.id,
+                    current,
+                )
+                .await?
+                {
+                    SyncOutcome::Changed(aid) => Some(aid),
+                    SyncOutcome::NoChange => None,
+                };
                 PartRepo::insert_part_event(
                     &mut *conn,
                     NewPartEvent {
@@ -304,6 +322,7 @@ impl PartService {
             part_id: part.id,
             batch_id: batch.id,
             event_type: event_type_str.to_string(),
+            synced_assembly_id,
             work_type_id,
             badge_code: worker.badge_code.clone(),
         })

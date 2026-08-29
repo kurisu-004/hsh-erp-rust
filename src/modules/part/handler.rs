@@ -68,6 +68,15 @@ fn ws_broadcast_to_process(state: &AppState, part_id: i64) {
     });
 }
 
+/// 父装配件自动同步 WS 广播事件（commit 后调用；inspection 流触发父
+/// status 翻转时推送给 dashboard）。
+fn ws_broadcast_assembly_updated(state: &AppState, assembly_id: i64) {
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "ASSEMBLY_UPDATED".into(),
+        payload: serde_json::json!({ "assembly_id": assembly_id.to_string() }),
+    });
+}
+
 /// POST /api/v2/parts/{part_id}/to-ship
 ///
 /// payload 可空（`Option<Json<ToShipRequest>>` —— axum 0.8 中 `Json<T>`
@@ -97,6 +106,9 @@ pub async fn to_ship(
     )
     .await?;
     tx.commit().await?;
+    if let Some(aid) = out.synced_assembly_id {
+        ws_broadcast_assembly_updated(&state, aid);
+    }
     ws_broadcast_to_ship(&state, part_id);
     Ok(Json(R::ok(out)))
 }
@@ -132,6 +144,14 @@ pub async fn batch_to_ship(
     let mut tx = state.pool.begin().await?;
     let out = PartService::batch_to_ship(&mut tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
+    let mut seen_assemblies = std::collections::HashSet::new();
+    for item in &out.submitted {
+        if let Some(aid) = item.synced_assembly_id
+            && seen_assemblies.insert(aid)
+        {
+            ws_broadcast_assembly_updated(&state, aid);
+        }
+    }
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "BATCH_TO_SHIP".into(),
         payload: serde_json::json!({
@@ -162,6 +182,9 @@ pub async fn to_inspection(
     let mut tx = state.pool.begin().await?;
     let out = PartService::to_inspection(&mut tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
+    if let Some(aid) = out.synced_assembly_id {
+        ws_broadcast_assembly_updated(&state, aid);
+    }
     ws_broadcast_to_inspection(&state, part_id, "to-inspection");
     Ok(Json(R::ok(out)))
 }
@@ -185,6 +208,14 @@ pub async fn batch_to_inspection(
     let mut tx = state.pool.begin().await?;
     let out = PartService::batch_to_inspection(&mut tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
+    let mut seen_assemblies = std::collections::HashSet::new();
+    for item in &out.submitted {
+        if let Some(aid) = item.synced_assembly_id
+            && seen_assemblies.insert(aid)
+        {
+            ws_broadcast_assembly_updated(&state, aid);
+        }
+    }
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "BATCH_TO_INSPECTION".into(),
         payload: serde_json::json!({
@@ -215,6 +246,9 @@ pub async fn to_process(
     let mut tx = state.pool.begin().await?;
     let out = PartService::to_process(&mut tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
+    if let Some(aid) = out.synced_assembly_id {
+        ws_broadcast_assembly_updated(&state, aid);
+    }
     ws_broadcast_to_process(&state, part_id);
     Ok(Json(R::ok(out)))
 }
@@ -293,6 +327,9 @@ pub async fn worker_scan(
     .await?;
     tx.commit().await?;
     // commit 之后广播（对齐 Python 延迟广播模式）
+    if let Some(aid) = scan_out.synced_assembly_id {
+        ws_broadcast_assembly_updated(&state, aid);
+    }
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: scan_out.event_type.clone(),
         payload: serde_json::to_value(&scan_out).unwrap_or_default(),

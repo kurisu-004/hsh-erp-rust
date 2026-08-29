@@ -69,6 +69,7 @@ Response 200 `data`：`BatchToXxxOut`
 WS 广播（commit 后下发）：
 
 - `BATCH_TO_INSPECTION` —— payload `{ submitted: <count>, failed: <count> }`（仅计数，不含数组）
+- **父装配件自动同步**：若某 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。**响应字段位置**：实际翻转时，在该 item 对应 `data.submitted[i].synced_assembly_id = Some(<id>)`；不翻转时为 `null`（同 part 全无 assembly_id 时，整个字段缺省为 `null`）。
 
 错误码：
 
@@ -108,6 +109,7 @@ Request：`ToInspectionRequest`
 WS 广播（commit 后下发）：
 
 - `PART_TO_INSPECTION` —— payload `{ part_id, shelf_code }`
+- **父装配件自动同步**：若 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。实际翻转时响应 `data.synced_assembly_id = Some(<id>)`；不翻转时为 `null`。
 
 Response 200 `data`：`ToXxxOut`
 
@@ -173,6 +175,7 @@ Response 200 `data`：`BatchToXxxOut`
 WS 广播（commit 后下发）：
 
 - `BATCH_TO_SHIP` —— payload `{ submitted: <count>, failed: <count> }`
+- **父装配件自动同步**：若某 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。**响应字段位置**：实际翻转时，在该 item 对应 `data.submitted[i].synced_assembly_id = Some(<id>)`；不翻转时为 `null`（同 part 全无 assembly_id 时，整个字段缺省为 `null`）。
 
 错误码：
 
@@ -210,6 +213,7 @@ Request：`ToShipRequest`（**整个 body 可省略**，等价于全部字段全
 WS 广播（commit 后下发）：
 
 - `PART_TO_SHIP` —— payload `{ part_id }`
+- **父装配件自动同步**：若 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。实际翻转时响应 `data.synced_assembly_id = Some(<id>)`；不翻转时为 `null`。
 
 Response 200 `data`：`ToXxxOut`
 
@@ -261,6 +265,7 @@ Request：`ToProcessRequest`
 WS 广播（commit 后下发）：
 
 - `PART_TO_PROCESS` —— payload `{ part_id }`
+- **父装配件自动同步**：若 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。实际翻转时响应 `data.synced_assembly_id = Some(<id>)`；不翻转时为 `null`。
 
 Response 200 `data`：`ToXxxOut`
 
@@ -350,6 +355,7 @@ Response 200 `data`：`WorkerScanOut`
 WS 广播（commit 后下发）：
 
 - `WORKER_SCAN_RETURNED` / `WORKER_SCAN_INSPECTED`（依 `event_type`）—— payload = `WorkerScanCoreOut`
+- **父装配件自动同步**（仅 `INSPECTED` 分支）：若 `part.assembly_id IS NOT NULL`，同事务内按 [`auto-rollup 算法`](../assemblies/index.md#子件状态聚合auto-rollup) 聚合该 assembly 下所有子件状态，翻父 `t_assembly.status`。**响应字段位置**：实际翻转时 `data.scan.synced_assembly_id = Some(<id>)`；不翻转时为 `null`。`RETURNED` 分支不参与（part.status 不变，无副作用）。
 - 若 `refill.taken.len() > 0` → `WORKER_POOL_REFILL_DONE` —— payload = `RefillResult`
 - 若 `refill.pool_empty=true` 且 `taken` 为空 → `WORKER_POOL_EMPTY` —— payload `{ worker_id, shelf_id }`
 
@@ -432,6 +438,7 @@ to-XXX 流共用的部分通过拆批语义。**所有 5 个单 / 批端点行�
 |---|---|---|
 | `part` | [`PartOut`](./index.md#partout-字段) | 操作后 part 的最新投影（含 OCC 更新后的 `version`） |
 | `new_batch_id` | string (i64)? | 仅 `quantity < target.quantity` 走拆批分支时为 `Some(remainder_id)`（拆批后**剩余批次**的 id，留在源状态待后续操作）；整批操作时为 `null`（序列化为 JSON `null`）。前端拿到非 null 时应刷新批次列表 |
+| `synced_assembly_id` | string (i64)? | 仅 to-inspection / to-process / to-ship / worker-scan 端点附带：父装配件（`assembly_id`）因本次 part 状态变更被翻转到新状态时为 `Some(asm_id)`（序列化为 JSON 字符串，与 `asm_id` 字段类型对称）；父 asm 已是终态或不存在时为 `null`。批量端点（`batch-to-inspection` / `batch-to-ship`）per-item 独立返回，前端应用 `HashSet` 去重后只对每个发生 flip 的 asm 拉一次详情 / 刷新列表 |
 
 ### `BatchToInspectionRequest` 字段（`POST /batch-to-inspection` 入参）
 

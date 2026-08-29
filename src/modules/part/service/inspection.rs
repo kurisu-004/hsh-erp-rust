@@ -35,6 +35,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
 use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
@@ -368,6 +369,7 @@ impl PartService {
             return Ok(ToXxxOut {
                 part: PartOut::from(fresh),
                 new_batch_id: new_batch_id_out,
+                synced_assembly_id: None,
             });
         }
 
@@ -385,6 +387,14 @@ impl PartService {
                 format!("part {part_id} 版本冲突"),
             ));
         }
+        // —— 父装配件自动同步：part.status 翻 READY_TO_SHIP 后回流父 assembly ——
+        // 仅当 mark_part_passed_inspection 真正执行（即无其它 INSPECTION 批次）才触发；
+        // rollup guard 早返回路径跳过同步。
+        let synced = AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await?;
+        let synced_assembly_id = match synced {
+            SyncOutcome::Changed(aid) => Some(aid),
+            SyncOutcome::NoChange => None,
+        };
 
         // 9. 重读返回
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
@@ -395,6 +405,7 @@ impl PartService {
         Ok(ToXxxOut {
             part: PartOut::from(fresh),
             new_batch_id: new_batch_id_out,
+            synced_assembly_id,
         })
     }
 
@@ -448,7 +459,7 @@ impl PartService {
 
         let mut submitted: Vec<ToXxxOut> = Vec::new();
         let mut failed: Vec<BatchOpFailure> = Vec::new();
-        for item in req.items {
+        for (idx, item) in req.items.iter().enumerate() {
             // 解析 batch_id：失败 → 推 sentinel failure + continue（不让 to_ship_core
             // 把歧义 BIZ_PART_BATCH_NOT_FOUND 当成"找不到 INSPECTION 批次"上报）。
             let parsed_bid: i64 = match item.batch_id.parse::<i64>() {
@@ -477,6 +488,12 @@ impl PartService {
                     continue;
                 }
             };
+            // per-item savepoint：失败 item 回滚部分写入，不影响后续 item（参考 batch_create_parts）
+            use sqlx::AssertSqlSafe;
+            let sp_name = format!("batch_to_ship_item_{idx}");
+            sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
+                .execute(&mut *conn)
+                .await?;
             match Self::to_ship_core(
                 &mut *conn,
                 snowflake,
@@ -487,14 +504,25 @@ impl PartService {
             )
             .await
             {
-                Ok(o) => submitted.push(o),
-                Err(e) => failed.push(BatchOpFailure {
-                    batch_id: target.id,
-                    code: e.code(),
-                    message: format!("{e}"),
-                }),
+                Ok(o) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    submitted.push(o);
+                }
+                Err(e) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    failed.push(BatchOpFailure {
+                        batch_id: target.id,
+                        code: e.code(),
+                        message: format!("{e}"),
+                    });
+                }
             }
         }
+        // 父装配件同步已由各 to_ship_core 在 savepoint 内调用 sync_from_part_change 完成。
         Ok(BatchToXxxOut { submitted, failed })
     }
 
@@ -616,6 +644,7 @@ impl PartService {
             return Ok(ToXxxOut {
                 part: PartOut::from(fresh),
                 new_batch_id: new_batch_id_out,
+                synced_assembly_id: None,
             });
         }
         // 9. UPDATE t_part: 同步工单状态
@@ -625,12 +654,21 @@ impl PartService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, format!("part {part_id} 版本冲突")));
         }
+        // —— 父装配件自动同步：part.status 翻 IN_PROCESS 后回流父 assembly ——
+        // 仅当 mark_part_failed_inspection 真正执行（即无其它 INSPECTION 批次）才触发；
+        // rollup guard 早返回路径跳过同步。
+        let synced = AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await?;
+        let synced_assembly_id = match synced {
+            SyncOutcome::Changed(aid) => Some(aid),
+            SyncOutcome::NoChange => None,
+        };
         // 10. 重读返回
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id).await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished")))?;
         Ok(ToXxxOut {
             part: PartOut::from(fresh),
             new_batch_id: new_batch_id_out,
+            synced_assembly_id,
         })
     }
 
@@ -774,6 +812,12 @@ impl PartService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, format!("part {part_id} 版本冲突")));
         }
+        // —— 父装配件自动同步：part.status 翻 INSPECTION 后回流父 assembly ——
+        let synced = AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await?;
+        let synced_assembly_id = match synced {
+            SyncOutcome::Changed(aid) => Some(aid),
+            SyncOutcome::NoChange => None,
+        };
         // 9. 写 INSPECTED 事件日志
         let event_id = snowflake.next_id();
         let note_text = match from {
@@ -817,6 +861,7 @@ impl PartService {
         Ok(ToXxxOut {
             part: PartOut::from(fresh),
             new_batch_id: new_batch_id_out,
+            synced_assembly_id,
         })
     }
 
@@ -878,7 +923,7 @@ impl PartService {
 
         let mut submitted: Vec<ToXxxOut> = Vec::new();
         let mut failed: Vec<BatchOpFailure> = Vec::new();
-        for item in req.items {
+        for (idx, item) in req.items.iter().enumerate() {
             // 解析 batch_id：失败 → 推 sentinel failure + continue
             let parsed_bid: i64 = match item.batch_id.parse::<i64>() {
                 Ok(n) => n,
@@ -906,6 +951,12 @@ impl PartService {
                     continue;
                 }
             };
+            // per-item savepoint：失败 item 回滚部分写入，不影响后续 item（参考 batch_create_parts）
+            use sqlx::AssertSqlSafe;
+            let sp_name = format!("batch_to_inspection_item_{idx}");
+            sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
+                .execute(&mut *conn)
+                .await?;
             match Self::to_inspection_core(
                 &mut *conn,
                 snowflake,
@@ -918,14 +969,25 @@ impl PartService {
             )
             .await
             {
-                Ok(o) => submitted.push(o),
-                Err(e) => failed.push(BatchOpFailure {
-                    batch_id: target.id,
-                    code: e.code(),
-                    message: format!("{e}"),
-                }),
+                Ok(o) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    submitted.push(o);
+                }
+                Err(e) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
+                        .execute(&mut *conn)
+                        .await?;
+                    failed.push(BatchOpFailure {
+                        batch_id: target.id,
+                        code: e.code(),
+                        message: format!("{e}"),
+                    });
+                }
             }
         }
+        // 父装配件同步已由各 to_inspection_core 在 savepoint 内调用 sync_from_part_change 完成。
         Ok(BatchToXxxOut { submitted, failed })
     }
 }

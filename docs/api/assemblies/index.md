@@ -155,13 +155,45 @@
 - WS 广播在 `tx.commit().await?` **之后**（对齐 Python 延迟广播模式）。
 ---
 
+## 子件状态聚合（auto-rollup）
+
+父装配件 `t_assembly.status` 由 service 在 part inspection 流（同事务）自动同步，**前端无需主动调用**。
+
+算法与 Python `service/_assembly_rollup.py::recompute_assembly_status` 对齐，按以下顺序：
+
+1. 父已是 `COMPLETED` 或 `CANCELLED` → **短路**：不更新。
+2. 该 assembly 下所有未软删子件 `status` 集合：
+  - 空集 → noop
+  - 全部 `CANCELLED` → 父 → `CANCELLED`
+  - 全部非 `CANCELLED` 子件都是 `COMPLETED` → 父 → `COMPLETED`
+  - 其它 → 取非终态、非 `CANCELLED` 子件的最小 `progress`，对应映射（Rust 4 态压缩版）：
+
+  | part status | progress |
+  |---|---|
+  | `PENDING` | 0 |
+  | `PROGRAMMING` | 1 |
+  | `IN_PROCESS` / `REPAIRING` | 2 |
+  | `OUTSOURCE` | 3 |
+  | `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` | 4..6（均压成 `IN_PROCESS`） |
+
+  - `min_progress == 0` → 父 → `PENDING`
+  - 否则 → `IN_PROCESS`
+
+3. 目标 == 当前 → noop；否则 `UPDATE t_assembly SET status = $target, version = version + 1`，带 OCC + 终态守卫，0 行 → `40901 VERSION_CONFLICT`（事务回滚）。
+
+涉及的 part inspection 端点：`POST /parts/{id}/{to-inspection,to-ship,to-process}`、`POST /parts/{batch-to-inspection,batch-to-ship}`、`POST /parts/worker-scan`（仅 `INSPECTED` 分支；`RETURNED` 不动 part.status）。
+
+WS 广播：每次实际翻状态 → commit 后下发 `ASSEMBLY_UPDATED`（payload `{ assembly_id }`），与 assembly update endpoint 复用同一 kind。
+
+---
+
 ## 状态机
 
 | from | to | 触发场景 |
 |---|---|---|
-| PENDING | IN_PROCESS | 装配开始（当前未实现专用端点；走 `/update` 改 status 时由 service 校验） |
+| PENDING | IN_PROCESS | 任一 inspection 流子件翻非 `PENDING`（auto-rollup） |
+| IN_PROCESS | COMPLETED | 所有子件翻 `COMPLETED`（auto-rollup） |
 | PENDING | CANCELLED | `cancel`（service 内 `repo::cancel` 守卫） |
-| IN_PROCESS | COMPLETED | 装配完成（同上） |
 | IN_PROCESS | CANCELLED | `cancel` |
 | COMPLETED | 终态 | self-loop / 反向 / 跨度过渡均拒绝 |
 | CANCELLED | 终态 | self-loop / 反向 / 跨度过渡均拒绝 |

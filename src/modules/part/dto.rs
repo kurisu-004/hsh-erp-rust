@@ -152,11 +152,17 @@ pub struct ToProcessRequest {
 ///   整批操作时为 `None`（序列化为 JSON `null`），前端拿到非 null 时应刷新批次列表。
 ///   用 `serialize_i64_opt` 把 Some 序列化为 JSON 字符串、None 序列化为 `null`，
 ///   跟 [`PartOut`] 的雪花 id 序列化契约对齐。
+/// `synced_assembly_id`：仅当本 part 由 inspection 流触发父装配件 status 翻转时
+///   为 `Some(assembly_id)`（handler 据此发 `ASSEMBLY_UPDATED` WS 广播）；
+///   无父装配件或父未变更时为 `None`。
 #[derive(Debug, Clone, Serialize)]
 pub struct ToXxxOut {
     pub part: PartOut,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub new_batch_id: Option<i64>,
+    /// 父装配件 id（仅当本 part 由 inspection 流触发父 status 变更时 Some）
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub synced_assembly_id: Option<i64>,
 }
 
 /// 批量端点 item 公共结构（`POST /parts/batch-to-ship` / `batch-to-inspection`）。
@@ -267,6 +273,9 @@ pub struct WorkerScanCoreOut {
     #[serde(serialize_with = "serialize_i64")]
     pub batch_id: i64,
     pub event_type: String,
+    /// 父装配件 id（仅当 INSPECTED 分支触发父 status 变更时 Some）
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub synced_assembly_id: Option<i64>,
     /// 内部：透传给 refill，refill 不再 fetch worker。
     #[serde(skip)]
     pub work_type_id: i64,
