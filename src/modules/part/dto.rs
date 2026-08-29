@@ -89,15 +89,15 @@ impl From<crate::modules::part::model::TPart> for PartOut {
 /// 单件 to-ship 入参（`POST /parts/{id}/to-ship`）。
 ///
 /// 状态机迁移：`INSPECTION` → `READY_TO_SHIP`（含多批次 rollup 守卫 + OCC）。
-/// `batch_id`：当 part 下存在多个 INSPECTION 批次（由历史部分通过产生）时，
-/// caller 显式指定以消除歧义；缺省时按 part_id 唯一匹配。
-/// `quantity`：缺省 = 整批；`quantity < target.quantity` → service 拆批并返回
-/// 拆批后剩余批次 id（见 [`ToXxxOut::new_batch_id`]）；`quantity ≤ 0` → 20111。
+/// `batch_id`：**必填**（2026-08-29 起）；caller 侧乐观锁需要明确锚定批次，
+///   不再支持「按状态唯一匹配」推断。找不到 / 不属于该 part → 20109。
+/// `version`：**必填**；目标批次 `t_part_batch.version`；不符 → 40901。
+/// `quantity`：缺省 = 整批；`quantity ≤ 0` → 20111。
 /// `note`：≤ 500 字符；品检备注透传事件日志。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ToShipRequest {
-    #[serde(default)]
-    pub batch_id: Option<String>,
+    pub batch_id: String,
+    pub version: i32,
     #[serde(default)]
     pub quantity: Option<i32>,
     #[serde(default)]
@@ -109,17 +109,18 @@ pub struct ToShipRequest {
 /// 状态机迁移：`{PENDING, PROGRAMMING, IN_PROCESS}` → `INSPECTION`。
 /// `target_inspection_shelf_id`：必填；service 校验 `zone='INSPECTION'` 且
 ///   `is_active=true`（20511 / 20512）。
-/// `batch_id`：缺省按状态唯一匹配 `{PENDING, PROGRAMMING, IN_PROCESS}` 批次；
-///   多批次歧义 → 20109。
-/// `quantity`：缺省 = 整批；`quantity < target.quantity` → service 拆批（详见 service 层）。
+/// `batch_id`：**必填**（2026-08-29 起）；caller 侧乐观锁需要明确锚定批次，
+///   不再支持「按状态唯一匹配」推断。找不到 / 不属于该 part → 20109。
+/// `version`：**必填**；目标批次 `t_part_batch.version`；不符 → 40901。
+/// `quantity`：缺省 = 整批；`quantity ≤ 0` → 20111。
 /// `note`：≤ 500 字符；品检备注透传事件日志。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToInspectionRequest {
     pub target_inspection_shelf_id: String,
+    pub batch_id: String,
+    pub version: i32,
     #[serde(default)]
     pub note: Option<String>,
-    #[serde(default)]
-    pub batch_id: Option<String>,
     #[serde(default)]
     pub quantity: Option<i32>,
 }
@@ -129,17 +130,19 @@ pub struct ToInspectionRequest {
 /// 状态机迁移：`INSPECTION` → `IN_PROCESS`，同时写入目标 production shelf。
 /// `shelf_id`：必填；目标生产货架 id（`zone='PRODUCTION'` 且 `is_active=true`）。
 /// `next_process_id`：必填；下一道工序 id（与 shelf 映射）。
-/// `batch_id`：缺省按状态唯一 INSPECTION 批次解析；多批次歧义 → 20109。
-/// `quantity`：缺省 = 整批；部分通过走 service 拆批（`split_batch_for_partial_pass`）。
+/// `batch_id`：**必填**（2026-08-29 起）；caller 侧乐观锁需要明确锚定批次，
+///   不再支持「按状态唯一匹配」推断。找不到 / 不属于该 part → 20109。
+/// `version`：**必填**；目标批次 `t_part_batch.version`；不符 → 40901。
+/// `quantity`：缺省 = 整批；`quantity ≤ 0` → 20111。
 /// `note`：≤ 500 字符；品检备注透传事件日志。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToProcessRequest {
     pub shelf_id: String,
     pub next_process_id: String,
+    pub batch_id: String,
+    pub version: i32,
     #[serde(default)]
     pub note: Option<String>,
-    #[serde(default)]
-    pub batch_id: Option<String>,
     #[serde(default)]
     pub quantity: Option<i32>,
 }

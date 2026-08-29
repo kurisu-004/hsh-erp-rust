@@ -11,7 +11,7 @@
 //!
 //! ## to-XXX 路由（挂在 `/parts`）
 //! - `POST /batch-to-ship`            —— 批量通过品检（per-item 独立事务边界外的循环）
-//! - `POST /{part_id}/to-ship`        —— 单件通过品检（payload 可空 `Option<Json<…>>`）
+//! - `POST /{part_id}/to-ship`        —— 单件通过品检（body 必填 `ToShipRequest`）
 //! - `POST /batch-to-inspection`      —— 批量送检
 //! - `POST /{part_id}/to-inspection`  —— 单件送检
 //! - `POST /{part_id}/to-process`     —— 单件品检打回（推荐需求 3）
@@ -79,23 +79,19 @@ fn ws_broadcast_assembly_updated(state: &AppState, assembly_id: i64) {
 
 /// POST /api/v2/parts/{part_id}/to-ship
 ///
-/// payload 可空（`Option<Json<ToShipRequest>>` —— axum 0.8 中 `Json<T>`
-/// 已实现 `OptionalFromRequest`，无需 `Optional<T>` 包装）。
-///
 /// 行为：
 /// - 权限：`Manager` 或 `Inspector`
-/// - 入参：path `part_id` + 可选 body `{ batch_id?, quantity?, note? }`
-/// - 业务流转：`INSPECTION` → `READY_TO_SHIP`（含多批次 rollup 守卫 + OCC）
+/// - 入参：path `part_id` + body `ToShipRequest`（`batch_id` / `version` 必填）
+/// - 业务流转：`INSPECTION` → `READY_TO_SHIP`（含多批次 rollup 守卫 + 批次级 OCC）
 /// - WS 广播：commit 后 `PART_TO_SHIP`
 /// - 响应：`ToXxxOut { part, new_batch_id }`
 pub async fn to_ship(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(part_id): Path<i64>,
-    payload: Option<Json<ToShipRequest>>,
+    Json(req): Json<ToShipRequest>,
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
     current.require_any_role(TO_XXX_ROLES)?;
-    let req = payload.map(|j| j.0).unwrap_or_default();
     let mut tx = state.pool.begin().await?;
     let out = PartService::to_ship(
         &mut tx,
@@ -168,8 +164,8 @@ pub async fn batch_to_ship(
 ///
 /// 行为：
 /// - 权限：`Manager` 或 `Inspector`
-/// - 入参：path `part_id` + body `ToInspectionRequest`
-/// - 业务流转：见 service `to_inspection_core`
+/// - 入参：path `part_id` + body `ToInspectionRequest`（`batch_id` / `version` 必填）
+/// - 业务流转：见 service `to_inspection_core`（含批次级 OCC）
 /// - WS 广播：commit 后 `PART_TO_INSPECTION`
 /// - 响应：`ToXxxOut { part, new_batch_id }`
 pub async fn to_inspection(
@@ -232,8 +228,8 @@ pub async fn batch_to_inspection(
 ///
 /// 行为：
 /// - 权限：`Manager` 或 `Inspector`
-/// - 入参：path `part_id` + body `ToProcessRequest`
-/// - 业务流转：见 service `to_process_core`
+/// - 入参：path `part_id` + body `ToProcessRequest`（`batch_id` / `version` 必填）
+/// - 业务流转：见 service `to_process_core`（含批次级 OCC）
 /// - WS 广播：commit 后 `PART_TO_PROCESS`
 /// - 响应：`ToXxxOut { part, new_batch_id }`
 pub async fn to_process(

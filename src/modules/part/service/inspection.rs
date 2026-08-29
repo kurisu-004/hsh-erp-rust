@@ -186,6 +186,24 @@ impl PartService {
             })
     }
 
+    /// caller 侧乐观锁守卫：比对目标批次的 `version` 与请求携带的期望值。
+    ///
+    /// 锚定 `t_part_batch.version` 而非 `t_part.version`——后者是所有批次的聚合投影，
+    /// 同 part 下任意其它批次的写入都会把它 +1，用作 caller 锚点会产生假冲突。
+    /// 不符 → `40901 VERSION_CONFLICT`。
+    fn _assert_batch_version(target: &TPartBatch, expected: i32) -> Result<(), AppError> {
+        if target.version != expected {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                format!(
+                    "batch {} version 期望 {} 实际 {}",
+                    target.id, expected, target.version
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// 部分通过拆批（to_ship / to_inspection / to_process 共享）。
     ///
     /// 返回 `(operated_id, operated_version, new_batch_id_out)`：
@@ -255,7 +273,8 @@ impl PartService {
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
-        batch_id: Option<i64>,
+        batch_id: i64,
+        expected_batch_version: i32,
         quantity: Option<i32>,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
@@ -284,7 +303,7 @@ impl PartService {
         }
 
         // 3. 定位目标 INSPECTION 批次
-        let bid_hint = batch_id;
+        let bid_hint = Some(batch_id);
         let target: TPartBatch = match PartRepo::find_inprocess_batch_for_part(
             &mut *conn,
             part_id,
@@ -310,6 +329,10 @@ impl PartService {
             }
             Err(e) => return Err(AppError::from(e)),
         };
+
+        // 3.5 caller 侧乐观锁：锚定 batch 而非 part（part.version 会被同 part
+        // 下其它批次的操作撞掉，锚 part 会产生假冲突）。
+        Self::_assert_batch_version(&target, expected_batch_version)?;
 
         // 4. 部分通过拆批（如需要）
         let operated_quantity = quantity.unwrap_or(target.quantity);
@@ -420,12 +443,15 @@ impl PartService {
         req: ToShipRequest,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
-        let batch_id = req.batch_id.as_deref().and_then(|s| s.parse().ok());
+        let batch_id: i64 = req.batch_id.parse().map_err(|_| {
+            AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id))
+        })?;
         Self::to_ship_core(
             &mut *conn,
             snowflake,
             part_id,
             batch_id,
+            req.version,
             req.quantity,
             current,
         )
@@ -554,7 +580,8 @@ impl PartService {
         shelf_id: i64,
         next_process_id: i64,
         note: Option<&str>,
-        batch_id: Option<i64>,
+        batch_id: i64,
+        expected_batch_version: i32,
         quantity: Option<i32>,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
@@ -583,15 +610,16 @@ impl PartService {
         // 3. 校验 shelf（PRODUCTION 区 + active）
         Self::_validate_production_shelf_and_process(&mut *conn, shelf_id, next_process_id).await?;
         // 4. 定位目标 INSPECTION 批次
+        let bid_hint = Some(batch_id);
         let target: TPartBatch = match PartRepo::find_inspection_batch_for_fail(
-            &mut *conn, part_id, batch_id,
+            &mut *conn, part_id, bid_hint,
         )
         .await
         {
             Ok(Some(b)) => b,
             Ok(None) => return Err(AppError::biz(
                 code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("part {part_id} 找不到 INSPECTION 批次（hint={batch_id:?}）"),
+                format!("part {part_id} 找不到 INSPECTION 批次（hint={bid_hint:?}）"),
             )),
             Err(sqlx::Error::RowNotFound) => return Err(AppError::biz(
                 code::BIZ_PART_BATCH_NOT_FOUND,
@@ -599,6 +627,8 @@ impl PartService {
             )),
             Err(e) => return Err(AppError::from(e)),
         };
+        // 4.5 caller 侧乐观锁：锚定 batch 而非 part
+        Self::_assert_batch_version(&target, expected_batch_version)?;
         // 5. 部分通过拆批
         let (operated_id, operated_version, new_batch_id_out) = Self::_split_for_partial_op(
             &mut *conn, snowflake, &target, quantity, current,
@@ -686,10 +716,12 @@ impl PartService {
         let next_process_id: i64 = req.next_process_id.parse().map_err(|_| {
             AppError::biz(code::BIZ_INVALID_VALUE, format!("next_process_id '{}' is not a numeric id", req.next_process_id))
         })?;
-        let batch_id = req.batch_id.as_deref().and_then(|s| s.parse().ok());
+        let batch_id: i64 = req.batch_id.parse().map_err(|_| {
+            AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id))
+        })?;
         Self::to_process_core(
             &mut *conn, snowflake, part_id, shelf_id, next_process_id,
-            req.note.as_deref(), batch_id, req.quantity, current,
+            req.note.as_deref(), batch_id, req.version, req.quantity, current,
         ).await
     }
 
@@ -725,7 +757,8 @@ impl PartService {
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         target_inspection_shelf_id: i64,
-        batch_id: Option<i64>,
+        batch_id: i64,
+        expected_batch_version: i32,
         quantity: Option<i32>,
         note: Option<&str>,
         current: &CurrentUser,
@@ -779,7 +812,9 @@ impl PartService {
             }
         }
         // 5. 定位目标批次
-        let target = Self::_resolve_scan_target_batch(&mut *conn, part_id, batch_id).await?;
+        let target = Self::_resolve_scan_target_batch(&mut *conn, part_id, Some(batch_id)).await?;
+        // 5.5 caller 侧乐观锁：锚定 batch 而非 part
+        Self::_assert_batch_version(&target, expected_batch_version)?;
         // 6. 部分通过拆批
         let (operated_id, operated_version, new_batch_id_out) = Self::_split_for_partial_op(
             &mut *conn, snowflake, &target, quantity, current,
@@ -879,10 +914,12 @@ impl PartService {
                 format!("target_inspection_shelf_id '{}' is not a numeric id", req.target_inspection_shelf_id),
             )
         })?;
-        let batch_id = req.batch_id.as_deref().and_then(|s| s.parse().ok());
+        let batch_id: i64 = req.batch_id.parse().map_err(|_| {
+            AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id))
+        })?;
         Self::to_inspection_core(
             &mut *conn, snowflake, part_id, target_inspection_shelf_id,
-            batch_id, req.quantity, req.note.as_deref(), current,
+            batch_id, req.version, req.quantity, req.note.as_deref(), current,
         ).await
     }
 
