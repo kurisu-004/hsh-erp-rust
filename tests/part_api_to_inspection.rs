@@ -46,7 +46,8 @@ async fn to_inspection_from_pending_succeeds() {
         "PENDING",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -55,6 +56,8 @@ async fn to_inspection_from_pending_succeeds() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -84,7 +87,8 @@ async fn to_inspection_from_programming_succeeds() {
         "PROGRAMMING",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "PROGRAMMING").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PROGRAMMING").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -93,6 +97,8 @@ async fn to_inspection_from_programming_succeeds() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -139,6 +145,7 @@ async fn to_inspection_from_in_process_production_shelf_succeeds() {
     .execute(&_pool)
     .await
     .unwrap();
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -147,6 +154,8 @@ async fn to_inspection_from_in_process_production_shelf_succeeds() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -175,7 +184,7 @@ async fn to_inspection_in_process_worker_rejected() {
         "IN_PROCESS",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
     // current_holder_id 指向一个不存在的 id（模拟 worker 持有）
     let fake_holder: i64 = 999_999_999;
     sqlx::query!(
@@ -186,6 +195,7 @@ async fn to_inspection_in_process_worker_rejected() {
     .execute(&_pool)
     .await
     .unwrap();
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -194,6 +204,8 @@ async fn to_inspection_in_process_worker_rejected() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -225,7 +237,7 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
         "IN_PROCESS",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
     sqlx::query!(
         "UPDATE t_part SET current_holder_id = $1 WHERE id = $2",
         holder_shelf,
@@ -234,6 +246,7 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
     .execute(&_pool)
     .await
     .unwrap();
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -242,6 +255,8 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -269,7 +284,8 @@ async fn to_inspection_target_shelf_wrong_zone_rejected() {
         "PENDING",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -278,6 +294,8 @@ async fn to_inspection_target_shelf_wrong_zone_rejected() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": prod_shelf.to_string(),  // 故意用 PRODUCTION 架
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -309,7 +327,8 @@ async fn to_inspection_target_shelf_inactive_rejected() {
         "PENDING",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -318,6 +337,8 @@ async fn to_inspection_target_shelf_inactive_rejected() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -360,7 +381,7 @@ async fn batch_to_inspection_too_many_items_rejected() {
     let items: Vec<i64> = (1..=201).collect();
     let item_payloads: Vec<Value> = items
         .iter()
-        .map(|id| json!({ "batch_id": id.to_string() }))
+        .map(|id| json!({ "batch_id": id.to_string(), "version": 0 }))
         .collect();
 
     let (status, body) = send(
@@ -407,6 +428,11 @@ async fn batch_to_inspection_mixed_partial_success() {
         .execute(&_pool)
         .await
         .unwrap();
+    let (v1, v2, v3) = (
+        batch_version(&_pool, b1).await,
+        batch_version(&_pool, b2).await,
+        batch_version(&_pool, b3).await,
+    );
 
     let (status, body) = send(
         app,
@@ -416,9 +442,9 @@ async fn batch_to_inspection_mixed_partial_success() {
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
                 "items": [
-                    { "batch_id": b1.to_string() },
-                    { "batch_id": b2.to_string() },
-                    { "batch_id": b3.to_string() },
+                    { "batch_id": b1.to_string(), "version": v1 },
+                    { "batch_id": b2.to_string(), "version": v2 },
+                    { "batch_id": b3.to_string(), "version": v3 },
                 ],
             })),
             Some(&token),
@@ -447,7 +473,7 @@ async fn batch_to_inspection_clerk_forbidden() {
             "/parts/batch-to-inspection",
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
-                "items": [{ "batch_id": "1" }],
+                "items": [{ "batch_id": "1", "version": 0 }],
             })),
             Some(&token),
         ),
@@ -481,6 +507,7 @@ async fn to_inspection_partial_split_happy_path() {
     )
     .await;
     let batch_id = insert_batch(&_pool, part_id, 1, 10, "PENDING").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -489,6 +516,8 @@ async fn to_inspection_partial_split_happy_path() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
                 "quantity": 3,
             })),
             Some(&token),

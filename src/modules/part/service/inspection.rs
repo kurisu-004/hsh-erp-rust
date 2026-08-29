@@ -524,7 +524,9 @@ impl PartService {
                 &mut *conn,
                 snowflake,
                 target.part_id,
-                Some(target.id),
+                target.id,
+                // caller 送来的 version（**不是** target.version）——否则 OCC 恒真、静默失效
+                item.version,
                 item.quantity,
                 current,
             )
@@ -999,7 +1001,9 @@ impl PartService {
                 snowflake,
                 target.part_id,
                 target_inspection_shelf_id,
-                Some(target.id),
+                target.id,
+                // caller 送来的 version（**不是** target.version）——否则 OCC 恒真、静默失效
+                item.version,
                 item.quantity,
                 None,
                 current,

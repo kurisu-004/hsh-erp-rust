@@ -221,6 +221,21 @@ pub async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, 
     id
 }
 
+/// 读取批次当前乐观锁版本（测试构造 to-XXX / batch-to-XXX payload 用）。
+///
+/// to-XXX 端点自 batch 级 OCC 起要求 caller 在 body 里带 `version`（单件）或
+/// `items[].version`（批量），不符 → 40901 VERSION_CONFLICT。
+///
+/// 用运行时 `sqlx::query_scalar`（**不是** `query_scalar!` 宏），避免为一条纯测试
+/// 查询往 `.sqlx/` 离线缓存里塞新条目。
+pub async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
+    sqlx::query_scalar::<_, i32>("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .expect("batch not found")
+}
+
 /// to_inspection / to_process 测试用：插一个 INSPECTION 货架 + 一个 PRODUCTION 货架。
 ///
 /// `next_process_id` 是 to_process 需要的占位（service 仅透传，不校验存在性——

@@ -11,6 +11,8 @@
 //!   7. 批量 to-ship item.batch_id 非数字 → 200 / submitted=0 / failed=1 (code=40001)
 //!   8. to-ship partial-split：INSPECTION 批次 qty=10 → quantity=3，拆批
 //!   9. to-ship full-batch：INSPECTION 批次 qty=10 → quantity 省略 → 不拆批
+//!  10. 单件 to-ship 落后 version → 409 / 40901 VERSION_CONFLICT
+//!  11. 批量 to-ship 落后 version → 该 item 落 failed[40901]，兄弟 item 仍 submitted
 //!
 //! ## 并行 / 认证
 //! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
@@ -53,12 +55,12 @@ async fn batch_to_ship_happy_path() {
     }
 
     let (app, token, _pool) = login_manager(pool, "admin").await;
-    let body = json!({
-        "items": bids
-            .iter()
-            .map(|b| json!({"batch_id": b.to_string()}))
-            .collect::<Vec<_>>()
-    });
+    let mut items = Vec::new();
+    for b in &bids {
+        let v = batch_version(&_pool, *b).await;
+        items.push(json!({"batch_id": b.to_string(), "version": v}));
+    }
+    let body = json!({ "items": items });
     let (s, env) = send(
         app,
         json_request(
@@ -102,7 +104,8 @@ async fn batch_to_ship_partial_failure() {
         )
         .await;
         let bid = insert_batch(&pool, pid, 1, 1, status).await;
-        items.push(json!({"batch_id": bid.to_string()}));
+        let v = batch_version(&pool, bid).await;
+        items.push(json!({"batch_id": bid.to_string(), "version": v}));
     }
 
     let (app, token, _pool) = login_manager(pool, "admin").await;
@@ -183,7 +186,7 @@ async fn batch_to_ship_non_numeric_batch_id_40001() {
             "POST",
             "/parts/batch-to-ship",
             Some(json!({
-                "items": [{"batch_id": "abc"}]
+                "items": [{"batch_id": "abc", "version": 0}]
             })),
             Some(&token),
         ),
@@ -216,7 +219,7 @@ async fn batch_to_ship_clerk_forbidden() {
         json_request(
             "POST",
             "/parts/batch-to-ship",
-            Some(json!({"items": [{"batch_id": "1"}]})),
+            Some(json!({"items": [{"batch_id": "1", "version": 0}]})),
             Some(&token),
         ),
     )
@@ -244,7 +247,8 @@ async fn single_to_ship_happy_path() {
         "INSPECTION",
     )
     .await;
-    let _ = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
+    let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
+    let v = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (s, env) = send(
@@ -252,7 +256,7 @@ async fn single_to_ship_happy_path() {
         json_request(
             "POST",
             &format!("/parts/{pid}/to-ship"),
-            Some(json!({})),
+            Some(json!({"batch_id": bid.to_string(), "version": v})),
             Some(&token),
         ),
     )
@@ -286,7 +290,8 @@ async fn single_to_ship_retry_returns_20103() {
         "INSPECTION",
     )
     .await;
-    let _ = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
+    let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
+    let v = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_manager(pool, "admin").await;
 
@@ -296,7 +301,7 @@ async fn single_to_ship_retry_returns_20103() {
         json_request(
             "POST",
             &format!("/parts/{pid}/to-ship"),
-            Some(json!({})),
+            Some(json!({"batch_id": bid.to_string(), "version": v})),
             Some(&token),
         ),
     )
@@ -305,12 +310,15 @@ async fn single_to_ship_retry_returns_20103() {
     assert_eq!(env1["data"]["part"]["status"], "READY_TO_SHIP");
 
     // 2nd call：状态机拒绝，20103 BIZ_INVALID_TRANSITION
+    // 注意：core 里状态机守卫（步骤 2）在 batch OCC 断言（步骤 3.5）之前，
+    // 因此这里带上最新 version 也仍然是 20103，而不是 40901。
+    let v2 = batch_version(&_pool, bid).await;
     let (s2, env2) = send(
         app,
         json_request(
             "POST",
             &format!("/parts/{pid}/to-ship"),
-            Some(json!({})),
+            Some(json!({"batch_id": bid.to_string(), "version": v2})),
             Some(&token),
         ),
     )
@@ -349,6 +357,7 @@ async fn to_ship_partial_split_happy_path() {
     )
     .await;
     let batch_id = insert_batch(&_pool, part_id, 1, 10, "INSPECTION").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -356,6 +365,8 @@ async fn to_ship_partial_split_happy_path() {
             "POST",
             &format!("/parts/{part_id}/to-ship"),
             Some(json!({
+                "batch_id": batch_id.to_string(),
+                "version": v,
                 "quantity": 3,
             })),
             Some(&token),
@@ -399,13 +410,15 @@ async fn to_ship_full_batch() {
     )
     .await;
     let _batch_id = insert_batch(&_pool, part_id, 1, 10, "INSPECTION").await;
+    let v = batch_version(&_pool, _batch_id).await;
 
     let (status, body) = send(
         app,
         json_request(
             "POST",
             &format!("/parts/{part_id}/to-ship"),
-            Some(json!({})),  // quantity 缺省 = 整批
+            // quantity 缺省 = 整批
+            Some(json!({"batch_id": _batch_id.to_string(), "version": v})),
             Some(&token),
         ),
     )
@@ -418,4 +431,92 @@ async fn to_ship_full_batch() {
         serde_json::Value::Null,
         "整批操作 new_batch_id 应为 null: {body}"
     );
+}
+
+/// 单件 to-ship：caller 传的 batch version 落后 → 409 / 40901 VERSION_CONFLICT。
+///
+/// 覆盖 `to_ship_core` 步骤 3.5 的 `_assert_batch_version`：状态机守卫已通过
+/// （part 处于 INSPECTION），失败点必须是 batch 级 OCC 而非 20103。
+#[tokio::test]
+async fn single_to_ship_stale_version_returns_409_40901() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let part_id = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
+    let batch_id = insert_batch(&pool, part_id, 1, 5, "INSPECTION").await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/to-ship"),
+            Some(json!({"batch_id": batch_id.to_string(), "version": v - 1})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "stale version: {body}");
+    assert_eq!(body["code"], 40901, "stale version 应报 40901: {body}");
+}
+
+/// 批量 to-ship：一个 item 传落后 version → 落 `failed[]` (40901)，
+/// 同批另一个 version 正确的 item 仍进 `submitted[]`。
+///
+/// **回归护栏**：如果 `batch_to_ship` 把 `item.version` 换成
+/// `target.version`（DB 读出来的值），比对恒等成立、OCC 静默失效，
+/// 本用例会因 `failed.len() == 0` 而失败。
+#[tokio::test]
+async fn batch_to_ship_stale_version_lands_in_failed() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+
+    // item 1：version 正确 → submitted
+    let p1 = insert_part_with_status(&pool, "P1", l2, Some("P001"), None, "INSPECTION").await;
+    let b1 = insert_batch(&pool, p1, 1, 5, "INSPECTION").await;
+    let v1 = batch_version(&pool, b1).await;
+    // item 2：version 故意落后一版 → failed[40901]
+    let p2 = insert_part_with_status(&pool, "P2", l2, Some("P002"), None, "INSPECTION").await;
+    let b2 = insert_batch(&pool, p2, 1, 5, "INSPECTION").await;
+    let v2 = batch_version(&pool, b2).await;
+
+    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            "/parts/batch-to-ship",
+            Some(json!({
+                "items": [
+                    {"batch_id": b1.to_string(), "version": v1},
+                    {"batch_id": b2.to_string(), "version": v2 - 1},
+                ]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "batch stale version: {body}");
+    assert_eq!(body["code"], 0);
+    let submitted = body["data"]["submitted"].as_array().expect("data.submitted");
+    let failed = body["data"]["failed"].as_array().expect("data.failed");
+    assert_eq!(
+        failed.len(),
+        1,
+        "落后 version 的 item 必须落 failed[]（若聚合器传 target.version 则 OCC 静默失效）: {body}"
+    );
+    assert_eq!(failed[0]["code"], 40901, "失败码应为 40901: {body}");
+    assert_eq!(failed[0]["batch_id"], b2.to_string());
+    assert_eq!(submitted.len(), 1, "version 正确的 item 应 submitted: {body}");
+    assert_eq!(submitted[0]["part"]["status"], "READY_TO_SHIP");
+
+    // savepoint 回滚校验：失败 item 的批次仍留在 INSPECTION，version 未被撞
+    let b2_status = sqlx::query_scalar::<_, String>("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(b2)
+        .fetch_one(&_pool)
+        .await
+        .expect("b2");
+    assert_eq!(b2_status, "INSPECTION", "失败 item 应被 savepoint 回滚");
 }

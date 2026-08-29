@@ -177,11 +177,14 @@ pub struct ToXxxOut {
 ///   缺字段 → 40001 VALIDATION_ERROR；找不到批次 → 20109 BIZ_PART_BATCH_NOT_FOUND。
 ///   注意 `batch_id` 不是 `Option<String>`——service 把它作为反查 part 的唯一键，
 ///   必须存在。
+/// `version`：**必填**；目标批次 `t_part_batch.version`；不符 → 该 item 落
+///   `failed[] { code: 40901 }`，不中断其余 item（per-item savepoint 回滚）。
 /// `quantity`：缺省 = 整批（`#[serde(default)]`）；`quantity < target.quantity` →
 ///   service 拆批；`quantity ≤ 0` → 20111 BIZ_PART_BATCH_INVALID_QUANTITY。
 #[derive(Debug, Clone, Deserialize)]
 pub struct BatchOpItem {
     pub batch_id: String,
+    pub version: i32,
     #[serde(default)]
     pub quantity: Option<i32>,
 }
