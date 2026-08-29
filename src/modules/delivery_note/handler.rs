@@ -52,7 +52,7 @@ use super::dto::{
     DeliveryNoteListQuery, DeliveryNotePickupPendingQuery, DeliveryNotePickupRequest,
     DeliveryNotePickupScanOut, DeliveryNotePickupScanRequest, DeliveryNoteRemovePartsRequest,
     DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest, PrintDeliveryNoteRequest,
-    PrintLabelsRequest, ScanDeliveryOut, ScanDeliveryRequest,
+    PrintLabelsRequest, ScanDeliveryOut, ScanDeliveryRequest, SubmitDeliveryOut,
 };
 
 // ===========================================================================
@@ -287,23 +287,34 @@ pub async fn remove_delivery_note_parts(
 }
 
 /// POST /api/v2/delivery-notes/{id}/submit
+///
+/// 出参 `SubmitDeliveryOut` 含两种 outcome，前端据此分支：
+/// - `outcome = SUBMITTED`：`note` 为提交后的送货单投影；状态机 DRAFT → SUBMITTED 已发生；
+///   本次提交会发出 `DELIVERY_NOTE_SUBMITTED` 大屏事件。
+/// - `outcome = CANDIDATES_AVAILABLE`：存在仍在 `INSPECTION` 的已挂单批次，**本次未提交**；
+///   `note` 为 `null`；`unresolved_targets` 按 part 分组列出未过检批次（含 `version`，
+///   前端可一键转发到 `POST /parts/batch-to-ship` 让其到 READY_TO_SHIP 后再重提本接口）。
+///   候选分支不写库、不发事件。
 pub async fn submit_delivery_note(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNoteVersionedRequest>,
-) -> Result<Json<R<super::dto::DeliveryNoteOut>>, AppError> {
+) -> Result<Json<R<SubmitDeliveryOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = DeliveryNoteService::submit(&mut tx, &state.snowflake, path.id, req.version, &current).await?;
     tx.commit().await?;
 
-    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-        kind: "DELIVERY_NOTE_SUBMITTED".to_string(),
-        payload: serde_json::json!({
-            "delivery_note_id": out.id,
-            "delivery_note_no": out.delivery_note_no,
-        }),
-    });
+    // 仅真正提交时广播；候选分支未写库，不发事件
+    if let Some(note) = out.note.as_ref() {
+        state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_SUBMITTED".to_string(),
+            payload: serde_json::json!({
+                "delivery_note_id": note.id,
+                "delivery_note_no": note.delivery_note_no,
+            }),
+        });
+    }
 
     Ok(Json(R::ok(out)))
 }
