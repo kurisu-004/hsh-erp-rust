@@ -46,7 +46,8 @@ async fn to_process_invalid_shelf_id_rejected() {
         "INSPECTION",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -56,6 +57,8 @@ async fn to_process_invalid_shelf_id_rejected() {
             Some(json!({
                 "shelf_id": "abc",
                 "next_process_id": "1",
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -84,7 +87,8 @@ async fn to_process_invalid_next_process_id_rejected() {
         "INSPECTION",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -94,6 +98,8 @@ async fn to_process_invalid_next_process_id_rejected() {
             Some(json!({
                 "shelf_id": prod_shelf.to_string(),
                 "next_process_id": "abc",
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -120,7 +126,8 @@ async fn to_process_happy_path() {
         "INSPECTION",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -131,6 +138,8 @@ async fn to_process_happy_path() {
                 "shelf_id": prod_shelf.to_string(),
                 "next_process_id": next_proc.to_string(),
                 "note": "test fail",
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -158,7 +167,8 @@ async fn to_process_wrong_state_rejected() {
         "PENDING",
     )
     .await;
-    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -168,6 +178,8 @@ async fn to_process_wrong_state_rejected() {
             Some(json!({
                 "shelf_id": prod_shelf.to_string(),
                 "next_process_id": next_proc.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -201,6 +213,7 @@ async fn to_process_partial_split_happy_path() {
     )
     .await;
     let batch_id = insert_batch(&_pool, part_id, 1, 10, "INSPECTION").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -211,6 +224,8 @@ async fn to_process_partial_split_happy_path() {
                 "shelf_id": prod_shelf.to_string(),
                 "next_process_id": next_proc.to_string(),
                 "quantity": 3,
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),

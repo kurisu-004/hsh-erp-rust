@@ -124,10 +124,13 @@ Response 200 `data`：`ScanDeliveryOut`
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `batch_id` | string (i64) | |
+| `version` | i32 | 批次乐观锁版本；转发给 `batch-to-inspection` / `batch-to-ship` 的 `items[]` 时必填 |
 | `quantity` | i32 | |
 | `status` | string | `BatchStatusDto` 枚举，见下 |
 
 > part 级信息（`serial_no` / `drawing_no` / `name`）只在外层 `UnresolvedTargetDto` 上，`available_batches[]` 内不重复。
+>
+> B 候选转一键送检：前端把 `available_batches[]` 逐条映射为 `{ batch_id, version, quantity? }` 塞进 `POST /api/v2/parts/batch-to-inspection` 的 `items[]`。`version` 不符 → 该 item 落 `failed[].code = 40901`。
 
 `BatchStatusDto`（`t_part_batch.status` 强类型投影，序列化沿用 DB 列值）：
 
@@ -193,7 +196,7 @@ Request：
 | `delivery_date` | date? | — | None = 不改 |
 | `note` | string? | — | None = 不改 |
 
-Response 200 `data`：[`DeliveryNoteSummary`](./index.md#deliverynotesummary-字段)
+Response 200 `data`：[`DeliveryNoteOut`](./index.md#deliverynoteout-字段)
 
 错误码：
 

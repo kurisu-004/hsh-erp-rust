@@ -88,7 +88,7 @@ Query：
 |---|---|---|---|
 | `customer_id` | string (i64)? | — | 过滤客户 |
 
-Response 200 `data`：`{ items: [DeliveryNoteSummary] }`
+Response 200 `data`：`{ items: [DeliveryNoteOut] }`
 
 错误码：
 
@@ -114,7 +114,7 @@ Response 200 `data`：`DeliveryNoteListOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `items` | [DeliveryNoteSummary] | |
+| `items` | [DeliveryNoteOut] | |
 | `total` | i64 | |
 | `limit` | i64 | 回显 |
 | `offset` | i64 | 回显 |

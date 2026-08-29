@@ -137,7 +137,8 @@ async fn single_part_to_inspection_flips_assembly_to_in_process() {
     let asm_id = insert_assembly(&_pool, l2, "D-A1", "总成A1").await;
     let part_id =
         insert_part_with_status(&_pool, "P0", l2, Some("PA1-01"), Some(asm_id), "PENDING").await;
-    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -146,6 +147,8 @@ async fn single_part_to_inspection_flips_assembly_to_in_process() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -190,6 +193,7 @@ async fn mixed_children_assembly_rolls_up_to_min_progress() {
     let p2 =
         insert_part_with_status(&_pool, "P2", l2, Some("PA2-02"), Some(asm_id), "PENDING").await;
     let b2 = insert_batch(&_pool, p2, 1, 5, "PENDING").await;
+    let v2 = batch_version(&_pool, b2).await;
 
     let (status, body) = send(
         app,
@@ -199,6 +203,7 @@ async fn mixed_children_assembly_rolls_up_to_min_progress() {
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
                 "batch_id": b2.to_string(),
+                "version": v2,
             })),
             Some(&token),
         ),
@@ -298,7 +303,8 @@ async fn terminal_assembly_is_not_modified_by_child_change() {
 
     let part_id =
         insert_part_with_status(&_pool, "P1", l2, Some("PA4-01"), Some(asm_id), "PENDING").await;
-    insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
+    let v = batch_version(&_pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -307,6 +313,8 @@ async fn terminal_assembly_is_not_modified_by_child_change() {
             &format!("/parts/{part_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
             })),
             Some(&token),
         ),
@@ -364,6 +372,11 @@ async fn batch_to_inspection_emits_per_assembly_update() {
     let ba1 = insert_batch(&_pool, pa1, 1, 5, "PENDING").await;
     let ba2 = insert_batch(&_pool, pa2, 1, 5, "PENDING").await;
     let bb1 = insert_batch(&_pool, pb1, 1, 5, "PENDING").await;
+    let (va1, va2, vb1) = (
+        batch_version(&_pool, ba1).await,
+        batch_version(&_pool, ba2).await,
+        batch_version(&_pool, bb1).await,
+    );
 
     let (status, body) = send(
         app,
@@ -373,9 +386,9 @@ async fn batch_to_inspection_emits_per_assembly_update() {
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
                 "items": [
-                    { "batch_id": ba1.to_string() },
-                    { "batch_id": ba2.to_string() },
-                    { "batch_id": bb1.to_string() },
+                    { "batch_id": ba1.to_string(), "version": va1 },
+                    { "batch_id": ba2.to_string(), "version": va2 },
+                    { "batch_id": bb1.to_string(), "version": vb1 },
                 ],
             })),
             Some(&token),

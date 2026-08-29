@@ -8,6 +8,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::customer::repo::CustomerRepo;
+use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::modules::worker::repo::WorkerRepo;
@@ -15,7 +16,8 @@ use crate::modules::work_type::repo::WorkTypeRepo;
 use crate::shared::error::{code, AppError};
 
 use super::super::dto::{
-    DeliveryNoteCandidatePart, DeliveryNoteEventOut, DeliveryNotePickupScanOut,
+    AvailableBatchDto, BatchStatusDto, DeliveryNoteCandidatePart, DeliveryNoteEventOut,
+    DeliveryNotePickupScanOut, SubmitDeliveryOut, SubmitOutcomeDto, UnresolvedTargetDto,
 };
 use super::super::model::DeliveryNoteEventType;
 use super::super::repo::{DeliveryNoteEventRepo, DeliveryNoteRepo};
@@ -47,7 +49,7 @@ impl DeliveryNoteService {
         note_id: i64,
         version: i32,
         current: &CurrentUser,
-    ) -> Result<super::super::dto::DeliveryNoteOut, AppError> {
+    ) -> Result<SubmitDeliveryOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
         let mut obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
@@ -63,24 +65,73 @@ impl DeliveryNoteService {
             ));
         }
 
-        // 所有批次必须 READY_TO_SHIP
-        let batches = PartBatchRepo::list_by_delivery_note(&mut *conn, note_id).await?;
-        if batches.is_empty() {
+        // 已挂单批次 + part 展示字段（候选返回需要 serial_no / drawing_no / name）
+        let rows = PartBatchRepo::list_with_part_by_delivery_note(&mut *conn, note_id).await?;
+        if rows.is_empty() {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_INVALID_VALUE,
                 "empty delivery note; add parts before submit",
             ));
         }
-        for b in &batches {
-            if b.status != STATUS_READY_TO_SHIP {
-                return Err(AppError::biz(
-                    code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
-                    format!(
-                        "batch {} status={} (must be READY_TO_SHIP at submit)",
-                        b.batch_no, b.status
-                    ),
-                ));
+
+        // 批次能挂上送货单的前提是 INSPECTION / READY_TO_SHIP 二者之一：
+        // - READY_TO_SHIP：已过检，可提交
+        // - INSPECTION：仍在品检，进候选（本次不提交，交前端一键过检）
+        // - 其余：数据非法（挂单后被旁路改状态），硬报错
+        //
+        // group key = TPart.id（同一工单下的多批次合并）。保留首次出现的 part 顺序、
+        // 同 part 内沿用 repo 的 ORDER BY pb.id ASC 顺序，不另外排序。
+        let mut unresolved: Vec<(TPart, Vec<AvailableBatchDto>)> = Vec::new();
+        for (b, p) in &rows {
+            match b.status.as_str() {
+                STATUS_READY_TO_SHIP => {}
+                STATUS_INSPECTION => {
+                    let status = BatchStatusDto::from_db(&b.status).ok_or_else(|| {
+                        AppError::biz(
+                            code::BIZ_DELIVERY_NOTE_INVALID_VALUE,
+                            format!("batch {} status 非法: {}", b.id, b.status),
+                        )
+                    })?;
+                    let dto = AvailableBatchDto {
+                        batch_id: b.id,
+                        version: b.version,
+                        quantity: b.quantity,
+                        status,
+                    };
+                    match unresolved.iter_mut().find(|(pp, _)| pp.id == p.id) {
+                        Some((_, v)) => v.push(dto),
+                        None => unresolved.push((p.clone(), vec![dto])),
+                    }
+                }
+                other => {
+                    return Err(AppError::biz(
+                        code::BIZ_DELIVERY_BATCH_STATE_INVALID,
+                        format!(
+                            "batch {} status={other}（挂单批次只允许 INSPECTION / READY_TO_SHIP）",
+                            b.batch_no
+                        ),
+                    ));
+                }
             }
+        }
+
+        if !unresolved.is_empty() {
+            // 存在未过检批次：不写任何数据，返回候选供前端一键过检
+            let targets = unresolved
+                .into_iter()
+                .map(|(p, available_batches)| UnresolvedTargetDto {
+                    part_id: p.id,
+                    serial_no: p.serial_no.clone().unwrap_or_default(),
+                    drawing_no: p.drawing_no.clone(),
+                    name: p.name.clone(),
+                    available_batches,
+                })
+                .collect();
+            return Ok(SubmitDeliveryOut {
+                outcome: SubmitOutcomeDto::CandidatesAvailable,
+                note: None,
+                unresolved_targets: Some(targets),
+            });
         }
 
         // 状态机：DRAFT → SUBMITTED
@@ -115,7 +166,11 @@ impl DeliveryNoteService {
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         let out = build_note_outs(conn, std::slice::from_ref(&obj)).await?;
-        Ok(out.into_iter().next().unwrap())
+        Ok(SubmitDeliveryOut {
+            outcome: SubmitOutcomeDto::Submitted,
+            note: Some(out.into_iter().next().unwrap()),
+            unresolved_targets: None,
+        })
     }
 
     // ---------- recall ----------
