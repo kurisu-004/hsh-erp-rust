@@ -133,7 +133,7 @@ Response 200 `data`：`ToXxxOut`
 - 20511 BIZ_SHELF_NOT_INSPECTION_ZONE — `target_inspection_shelf.zone ≠ 'INSPECTION'`
 - 20512 BIZ_SHELF_INACTIVE — `target_inspection_shelf.is_active = false`
 - 40901 VERSION_CONFLICT — caller 传的 `version` ≠ 目标批次当前 `version`（见 [乐观锁](#乐观锁caller-侧-occ)）；或事务内 UPDATE 撞并发
-- 40001 VALIDATION_ERROR — payload shape 错误（如缺 `target_inspection_shelf_id` / `batch_id` / `version`）
+- HTTP 422 — payload shape 错误（缺 `target_inspection_shelf_id` / `batch_id` / `version` / 空 body）：axum `Json` extractor 在 service 之前直接拒，**非项目统一信封**
 - 40300 FORBIDDEN — 非 Manager / 非 Inspector
 
 ---
@@ -236,7 +236,7 @@ Response 200 `data`：`ToXxxOut`
 - 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不存在 / 不属于该工单 / 已划掉；或其状态不是 `INSPECTION`
 - 20111 BIZ_PART_BATCH_INVALID_QUANTITY — `quantity ≤ 0`
 - 40901 VERSION_CONFLICT — caller 传的 `version` ≠ 目标批次当前 `version`（见 [乐观锁](#乐观锁caller-侧-occ)）；或事务内 UPDATE 撞并发
-- 40001 VALIDATION_ERROR — payload shape 错误（如缺 `batch_id` / `version`，或整个 body 缺省）
+- HTTP 422 — payload shape 错误（缺 `batch_id` / `version` / 空 body）：axum `Json` extractor 在 service 之前直接拒，**非项目统一信封**
 - 40300 FORBIDDEN — 非 Manager / 非 Inspector
 
 ---
@@ -292,7 +292,7 @@ Response 200 `data`：`ToXxxOut`
 - 20507 BIZ_SHELF_PROCESS_NOT_MAPPED — `shelf_id` ↔ `next_process_id` 未映射（**待 shelf 域 PR 启用**，当前不报）
 - 20512 BIZ_SHELF_INACTIVE — `shelf.is_active = false`
 - 40901 VERSION_CONFLICT — caller 传的 `version` ≠ 目标批次当前 `version`（见 [乐观锁](#乐观锁caller-侧-occ)）；或事务内 UPDATE 撞并发
-- 40001 VALIDATION_ERROR — payload shape / 必填字段缺失（`shelf_id` / `next_process_id` / `batch_id` / `version`）
+- HTTP 422 — payload shape / 必填字段缺失（`shelf_id` / `next_process_id` / `batch_id` / `version` / 空 body）：axum `Json` extractor 在 service 之前直接拒，**非项目统一信封**
 - 40300 FORBIDDEN — 非 Manager / 非 Inspector
 
 ---
@@ -358,7 +358,7 @@ Response 200 `data`：`WorkerScanOut`
 - 20512 BIZ_SHELF_INACTIVE — `target_inspection_shelf.is_active = false`（INSPECTED 路径）
 - 40301 SHELF_MISMATCH — `shelf_id` / `target_inspection_shelf_id` 不在 `current.shelf_ids` 内且非 wildcard
 - 40300 FORBIDDEN — 非 Manager / 非 ShelfAccount
-- 40001 VALIDATION_ERROR — payload shape / 必填字段缺失
+- HTTP 422 — payload shape / 必填字段缺失：axum `Json` extractor 在 service 之前直接拒，**非项目统一信封**
 - 40901 VERSION_CONFLICT — 并发写，乐观锁失败
 
 WS 广播（commit 后下发）：
@@ -427,7 +427,7 @@ to-XXX 流共用的部分通过拆批语义。**所有 5 个单 / 批端点行�
 | `version` | i32 | ✓ | **必填**；目标批次 `t_part_batch.version`；不符 → 该 item 落 `failed[] { code: 40901 }`，不中断其余 item |
 | `quantity` | i32? | — | 缺省 = 整批；详见 [自动拆批](#自动拆批auto-split) |
 
-> 重要：`batch_id` 是 `String`、`version` 是 `i32`（均非 `Option`）—— `#[serde(default)]` 不会被触发；缺字段直接 `40001 VALIDATION_ERROR`。
+> 重要：`batch_id` 是 `String`、`version` 是 `i32`（均非 `Option`）—— `#[serde(default)]` 不会被触发；缺字段由 axum `Json` extractor 在 service 之前直接拒（HTTP 422，非项目统一信封）。
 
 ### `ToInspectionRequest` 字段（`{part_id}/to-inspection` 入参）
 
