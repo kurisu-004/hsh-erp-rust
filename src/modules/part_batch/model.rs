@@ -49,3 +49,14 @@ pub struct RecentBatchRow {
     /// `t_part.order_no` 是 nullable。
     pub order_no: Option<String>,
 }
+
+/// part-batches 端点的批次窄字段中间结构（service 内短暂使用，DTO 转换见 service）。
+/// SQL 列别名见 repo `list_active_by_part_id_with_holder`。
+#[derive(Debug, Clone)]
+pub struct PartBatchScanRow {
+    pub id: i64,
+    pub quantity: i32,
+    pub status: String,
+    pub holder_name: Option<String>,
+    pub version: i32,
+}

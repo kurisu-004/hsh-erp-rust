@@ -31,6 +31,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/", get(handler::list_parts).post(handler::create_part))
         .route("/batch", post(handler::batch_create_parts))
         .route("/by-serial/{serial_no}", get(handler::get_by_serial))
+        .route(
+            "/by-serial/{serial_no}/part-batches",
+            get(handler::get_by_serial_part_batches),
+        )
         .route("/batch-to-ship", post(handler::batch_to_ship))
         .route("/batch-to-inspection", post(handler::batch_to_inspection))
         // worker-scan 静态段也必须在 /{part_id}/... 之前注册，

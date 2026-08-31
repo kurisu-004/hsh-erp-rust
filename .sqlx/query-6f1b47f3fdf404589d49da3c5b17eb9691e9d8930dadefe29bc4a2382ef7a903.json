@@ -1,0 +1,71 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                pb.id       AS \"id!\",\n                pb.quantity AS \"quantity!\",\n                pb.status   AS \"status!\",\n                pb.version  AS \"version!\",\n                COALESCE(s.name, w.name, oc.name) AS \"holder_name?\"\n            FROM t_part_batch pb\n            LEFT JOIN t_shelf            s  ON s  .id = pb.current_holder_id\n            LEFT JOIN t_worker           w  ON w  .id = pb.current_holder_id\n            LEFT JOIN t_outsource_company oc ON oc.id = pb.current_holder_id\n            WHERE pb.part_id = $1 AND pb.deleted_at IS NULL\n            ORDER BY pb.batch_no ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "quantity!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "status!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "holder_name?",
+        "type_info": "Varchar",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "6f1b47f3fdf404589d49da3c5b17eb9691e9d8930dadefe29bc4a2382ef7a903"
+}
