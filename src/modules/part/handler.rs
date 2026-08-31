@@ -28,9 +28,10 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 #[allow(unused_imports)] // BatchOpFailure mandated by brief; accessed transitively via BatchToXxxOut field pattern matching.
 use crate::modules::part::dto::{
-    BatchOpFailure, BatchToInspectionRequest, BatchToShipRequest, BatchToXxxOut, PartOut,
-    PartScanContextOut, ToInspectionRequest, ToProcessRequest, ToShipRequest, ToXxxOut,
-    WorkerScanOut, WorkerScanRequest,
+    BatchOpFailure, BatchToInspectionRequest, BatchToShipRequest, BatchToXxxOut,
+    InspectionBatchListOut, InspectionBatchListQuery, PartOut, PartScanContextOut,
+    ToInspectionRequest, ToProcessRequest, ToShipRequest, ToXxxOut, WorkerScanOut,
+    WorkerScanRequest,
 };
 use crate::modules::part::service::{PartService, BATCH_TO_SHIP_MAX_ITEMS};
 use crate::modules::worker_pool::service::WorkerPoolService;
@@ -40,6 +41,9 @@ use crate::state::AppState;
 
 /// to-XXX 流均允许的角色：Manager 或 Inspector。
 const TO_XXX_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
+
+/// inspection 列表允许的角色：Manager + Inspector（对齐 v1 Python）。
+const INSPECTION_LIST_ROLES: &[Role] = &[Role::Manager, Role::Inspector];
 
 /// to-ship WS 广播事件（commit 后调用）。
 fn ws_broadcast_to_ship(state: &AppState, part_id: i64) {
@@ -381,6 +385,30 @@ pub async fn list_parts(
     current.require_any_role(LIST_PART_ROLES)?;
     let mut tx = state.pool.begin().await?;
     let out = PartService::list_parts(&mut tx, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/inspection-batches
+///
+/// 状态筛选列表：返回 `status='INSPECTION'` 全部活跃批次（含工单 + holder /
+/// process / delivery_note / customer 名称一次解析）。前端用每行的
+/// `batch_id + version` 直接拼 `POST /parts/{part_id}/to-ship` 或
+/// `to-inspection` 的请求体，替代每次扫码 / 手动输入。
+///
+/// 行为：
+/// - 权限：Manager 或 Inspector
+/// - Query：`InspectionBatchListQuery { keyword?, customer_id?, serial_no?, planned_delivery_date_from?, planned_delivery_date_to?, limit?, offset? }`
+/// - 业务流转：纯读，不开 WS 广播
+/// - 响应：`InspectionBatchListOut { items, total, limit, offset }`
+pub async fn list_inspection_batches(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<InspectionBatchListQuery>,
+) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
+    current.require_any_role(INSPECTION_LIST_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_inspection_batches(&mut tx, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }

@@ -15,6 +15,7 @@
 - [POST /api/v2/parts/{part_id}/to-process](#post-apiv2partspart_idto-process)
 - [POST /api/v2/parts/worker-scan](#post-apiv2partsworker-scan)
 - [GET /api/v2/parts/by-serial/{serial_no}/part-batches](#get-apiv2partsby-serialserial_nopart-batches)
+- [GET /api/v2/parts/inspection-batches](#get-apiv2partsinspection-batches)
 - [乐观锁（caller 侧 OCC）](#乐观锁caller-侧-occ)
 - [自动拆批（auto-split）](#自动拆批auto-split)
 
@@ -436,6 +437,113 @@ Response 200 `data`：`PartScanContextOut`
 - repo（批次 + holder 名称）：`src/modules/part_batch/repo.rs::list_active_by_part_id_with_holder` (line 547)，LEFT JOIN `t_worker` / `t_shelf` 拼 holder_name
 - repo（part）：`src/modules/part/repo/part.rs::get_by_serial` (line 140)
 - model：`src/modules/part_batch/model.rs::TPartBatch`（批次行 + 状态枚举）
+
+---
+
+### `GET /api/v2/parts/inspection-batches`
+
+权限: **Manager / Inspector**
+
+Query：
+
+| 参数 | 类型 | 必填 | 默认值 | 校验 / 说明 |
+|---|---|---|---|---|
+| `keyword` | string | — | — | ILIKE 匹配 `t_part.drawing_no` / `name` / `serial_no` / `order_no`；含 `%` / `_` / `\\` → `40001 VALIDATION_ERROR` |
+| `customer_id` | string (i64) | — | — | 单值；service 用 `expand_customer_id` 展开为 L1+L2 ids（关联 `t_customer.parent_id`） |
+| `serial_no` | string | — | — | ILIKE 匹配 `t_part.serial_no`；含 `%` / `_` / `\\` → `40001 VALIDATION_ERROR` |
+| `planned_delivery_date_from` | date | — | — | 范围下界（包含），匹配 `t_part.planned_delivery_date` |
+| `planned_delivery_date_to` | date | — | — | 范围上界（包含），匹配 `t_part.planned_delivery_date` |
+| `limit` | string (i64) | — | `200` | clamp 到 `[1, 200]`（`0` / 负数 → `1`；超过 `200` → `200`；非法 → `200`） |
+| `offset` | string (i64) | — | `0` | `max(0, v)`（负数 / 非法 → 取 0） |
+
+> 只读查询，无状态变更、无事务、无 WS 广播。
+
+业务说明：
+
+- 与现有 `by-serial/{serial_no}/part-batches` 的区别：
+  - **`by-serial/.../part-batches`** —— 按序列号扫码上下文，单 part 的全部活跃批次（不限 status），工单窄字段 + 全部活跃批次；典型场景：工人扫序列号弹窗显示该工单下全部批次
+  - **`inspection-batches`** —— 按状态筛选（固定 `status='INSPECTION'`）的全量批次列表，page-style（`limit` / `offset` / `total`），典型场景：品检员进入待品检队列页加载下一页
+- 与 to-XXX 流程的衔接：本端点返回的 `batch_id` + `version` 是后续 `POST /parts/{part_id}/to-ship` / `to-process` / `batch-to-ship` 等 caller OCC 锚点的**权威来源**（前端列表页拿到后直接拼请求体）。注意 `version` 是 `t_part_batch.version`，不是 `t_part.version`
+
+排序：`is_urgent DESC, planned_delivery_date ASC, batch.id ASC`（紧急件优先 → 交期近优先 → 批次 id 兜底稳定排序）
+
+Response 200 `data`：`InspectionBatchListOut`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `items` | [`InspectionBatchListItemOut`](#inspectionbatchlistitemout-字段)[] | 批次列表（按上述排序规则排序） |
+| `total` | string (i64) | 满足过滤条件的总数（`COUNT(*)`） |
+| `limit` | string (i64) | 实际生效的 limit（clamp 后） |
+| `offset` | string (i64) | 实际生效的 offset（max(0) 后） |
+
+#### `InspectionBatchListItemOut` 字段
+
+批次字段段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string (i64) | 批次雪花 ID |
+| `batch_no` | string? | 批次号 |
+| `quantity` | i32 | 批次数量 |
+| `status` | string | 批次状态枚举字符串（本端点固定为 `INSPECTION`） |
+| `location` | string? | 批次所在位置（`INSPECTION_SHELF` 等） |
+| `version` | i32 | 乐观锁（`t_part_batch.version`，caller OCC 锚点） |
+| `placed_at` | naive datetime? | 批次上架时间（`placed_at`） |
+| `has_been_repaired` | bool | 是否曾经被返工 |
+| `parent_batch_id` | string (i64)? | 拆批来源的父批次 ID（仅拆批产生的新批次非 None） |
+
+holder 解析段（LEFT JOIN `t_worker` / `t_shelf` 一次拼齐）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `current_holder_id` | string (i64)? | 当前持有人 id（worker.id 或 shelf.id） |
+| `holder_name` | string? | 当前持有人名称（worker 真名 / 货架 code / null） |
+| `next_process_id` | string (i64)? | 下一道工序 id（INSPECTION 状态下非 NULL，对应 `t_process`） |
+| `next_process_name` | string? | 下一道工序名称（`t_process.name`，LEFT JOIN 拼齐） |
+
+delivery_note 解析段（LEFT JOIN `t_delivery_note` 一次拼齐）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `delivery_note_id` | string (i64)? | 关联送货单 id（`t_part_batch.delivery_note_id`，LEFT JOIN 后填 `delivery_note_id`） |
+| `delivery_note_no` | string? | 关联送货单号（`t_delivery_note.delivery_note_no`） |
+
+工单字段段（`t_part`）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part_id` | string (i64) | 工单雪花 ID |
+| `serial_no` | string? | 工单序列号 |
+| `drawing_no` | string | 图号 |
+| `name` | string | 工单名 |
+| `order_no` | string? | 订单号 |
+| `planned_delivery_date` | date? | 计划交付日（用于范围过滤 + 排序） |
+| `is_urgent` | bool | 是否加急（用于排序：紧急件优先） |
+| `part_version` | i32 | part 聚合 version（**注意：caller OCC 必须用 `version`（即 `t_part_batch.version`），不能用 `part_version`**） |
+| `created_at` | naive datetime | 工单创建时间 |
+| `updated_at` | naive datetime | 工单更新时间 |
+
+客户解析段（LEFT JOIN `t_customer` L1 一次拼齐）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `customer_id` | string (i64) | 工单客户 id（`t_part.customer_id`） |
+| `customer_name` | string? | 客户名（`t_customer.name`） |
+| `l1_customer_name` | string? | L1 客户名（`t_customer.parent_id` → `t_customer.name` 拼齐；与 `crud.md` 列表保持一致） |
+
+错误码：
+
+- 40001 VALIDATION_ERROR — `keyword` / `serial_no` 含通配符 `%` / `_` / `\\`
+- 40100 UNAUTHORIZED — 未登录 / token 过期 / session 失效
+- 40300 FORBIDDEN — 非 Manager / 非 Inspector
+
+实现位置：
+
+- handler：`src/modules/part/handler.rs::list_inspection_batches` → `InspectionBatchListOut`
+- service：`src/modules/part/service/crud.rs::PartService::list_inspection_batches`（状态过滤 + 范围展开 + clamp + ILIKE 校验）
+- dto：`src/modules/part/dto.rs`（`InspectionBatchListQuery` / `InspectionBatchListItemOut` / `InspectionBatchListOut`）
+- repo：`src/modules/part_batch/repo_list.rs::PartBatchRepo::list_batches_with_part` / `count_batches_with_part`（单 SQL JOIN 8 表：t_part_batch + t_part + t_worker + t_shelf + t_process + t_delivery_note + t_customer + L1 customer）
+- model：`src/modules/part_batch/model.rs::InspectionBatchListRow` + `From<Row> for InspectionBatchListItemOut` impl
 
 ---
 

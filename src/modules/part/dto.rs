@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::modules::worker_pool::dto::WorkerScanEvent;
 use crate::modules::worker_pool::model::RefillResult;
-use crate::shared::types::{deserialize_i64, serialize_i64, serialize_i64_opt};
+use crate::shared::types::{deserialize_i64, deserialize_i64_opt, serialize_i64, serialize_i64_opt};
 
 /// 工单详情投影（to-ship / to-inspection / to-process 出参；其它端点复用做最小投影）。
 ///
@@ -364,4 +364,97 @@ impl From<crate::modules::part_batch::model::PartBatchScanRow> for PartBatchScan
             version: p.version,
         }
     }
+}
+
+// ===== Inspection Batch List =====
+
+/// `GET /parts/inspection-batches` 查询参数。
+///
+/// 与 Python `list_inspection_batches(*, keyword, customer_id, serial_no,
+/// planned_delivery_date_from, planned_delivery_date_to, limit=200, offset=0)`
+/// 对齐。`customer_id` 单值；service 层复用 `expand_customer_id` 展开为
+/// L1+L2 ids（与 `list_parts` 同逻辑）。`keyword` / `serial_no` ILIKE 匹配。
+/// `planned_delivery_date_*` 作用于 `t_part.planned_delivery_date`。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InspectionBatchListQuery {
+    #[serde(default)]
+    pub keyword: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub customer_id: Option<i64>,
+    #[serde(default)]
+    pub serial_no: Option<String>,
+    #[serde(default)]
+    pub planned_delivery_date_from: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    pub planned_delivery_date_to: Option<chrono::NaiveDate>,
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub limit: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub offset: Option<i64>,
+}
+
+/// `GET /parts/inspection-batches` 列表行：批次 + 工单 + 客户 + holder/process/
+/// delivery_note 名称（一次性 JOIN 解析，不在 service 做 N+1）。
+///
+/// 字段命名沿用 v1 `PartOut`/`PartBatchOut` 约定（`batch_id` 即 `t_part_batch.id`，
+/// `version` 即乐观锁版本号）。前端用 `batch_id + version` 直接拼
+/// `POST /parts/{part_id}/to-ship` 或 `to-inspection` 的请求体。
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionBatchListItemOut {
+    // ===== 批次字段 =====
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    pub batch_no: i32,
+    pub quantity: i32,
+    pub status: String,                         // 必为 "INSPECTION"
+    pub location: Option<String>,
+    pub version: i32,
+    pub placed_at: Option<chrono::NaiveDateTime>,
+    pub has_been_repaired: bool,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub parent_batch_id: Option<i64>,
+
+    // ===== holder 解析（COALESCE 三表）=====
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub current_holder_id: Option<i64>,
+    pub holder_name: Option<String>,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub next_process_id: Option<i64>,
+    pub next_process_name: Option<String>,
+
+    // ===== delivery_note 解析 =====
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub delivery_note_id: Option<i64>,
+    pub delivery_note_no: Option<String>,
+
+    // ===== 工单字段（JOIN t_part）=====
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    pub serial_no: Option<String>,
+    pub drawing_no: String,
+    pub name: String,
+    pub order_no: Option<String>,
+    pub planned_delivery_date: chrono::NaiveDate,
+    pub is_urgent: bool,
+    pub part_version: i32,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+
+    // ===== 客户解析（JOIN t_customer + 自连 L1）=====
+    #[serde(serialize_with = "serialize_i64")]
+    pub customer_id: i64,
+    pub customer_name: Option<String>,
+    pub l1_customer_name: Option<String>,
+}
+
+/// `GET /parts/inspection-batches` 出参（分页）。
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionBatchListOut {
+    pub items: Vec<InspectionBatchListItemOut>,
+    #[serde(serialize_with = "serialize_i64")]
+    pub total: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub limit: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub offset: i64,
 }

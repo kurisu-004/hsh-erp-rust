@@ -15,6 +15,15 @@
 //!
 //! 这之后所有表都处于「干净 + 已迁移」状态，可以放心 insert。
 
+// 跨测试文件共享的 fixtures + helpers（admin_database_url / ensure_database_exists
+// / test_pool / clean_db / insert_user_with_password 等）。每个 integration
+// test binary 通过 `#[path = "common/mod.rs"] mod common;` 引入本模块，
+// 但只用到其中一部分 helper → 编译单个 binary 时未引用的 helper 触发
+// `dead_code` warning；统一在 common 根豁免，避免每个 binary 都加
+// `#[allow(dead_code)]`。`duplicate-mod` 同理：多 test binary 共用本文件，
+// clippy --all-targets 会扫到「同文件被多次作为模块加载」。
+#![allow(dead_code, clippy::duplicate_mod)]
+
 use std::sync::Arc;
 
 use sqlx::PgPool;

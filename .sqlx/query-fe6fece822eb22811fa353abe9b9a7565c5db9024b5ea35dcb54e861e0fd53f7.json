@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) AS \"n!\"\n            FROM t_part_batch pb\n            JOIN t_part p\n              ON p.id = pb.part_id\n            WHERE pb.status = ANY($1)\n              AND pb.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n              AND p.customer_id = ANY($2)\n              AND ($3::text IS NULL\n                   OR p.drawing_no ILIKE $3\n                   OR p.name       ILIKE $3\n                   OR p.serial_no  ILIKE $3\n                   OR p.order_no   ILIKE $3)\n              AND ($4::text IS NULL OR p.serial_no ILIKE $4)\n              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)\n              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int8Array",
+        "Text",
+        "Text",
+        "Date",
+        "Date"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "fe6fece822eb22811fa353abe9b9a7565c5db9024b5ea35dcb54e861e0fd53f7"
+}
