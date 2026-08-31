@@ -449,11 +449,11 @@ Query：
 | 参数 | 类型 | 必填 | 默认值 | 校验 / 说明 |
 |---|---|---|---|---|
 | `keyword` | string | — | — | ILIKE 匹配 `t_part.drawing_no` / `name` / `serial_no` / `order_no`；含 `%` / `_` / `\\` → `40001 VALIDATION_ERROR` |
-| `customer_id` | string (i64) | — | — | 单值；service 用 `expand_customer_id` 展开为 L1+L2 ids（关联 `t_customer.l1_customer_id`） |
+| `customer_id` | string (i64) | — | — | 单值；service 用 `expand_customer_id` 展开为 L1+L2 ids（关联 `t_customer.parent_id`） |
 | `serial_no` | string | — | — | ILIKE 匹配 `t_part.serial_no`；含 `%` / `_` / `\\` → `40001 VALIDATION_ERROR` |
 | `planned_delivery_date_from` | date | — | — | 范围下界（包含），匹配 `t_part.planned_delivery_date` |
 | `planned_delivery_date_to` | date | — | — | 范围上界（包含），匹配 `t_part.planned_delivery_date` |
-| `limit` | string (i64) | — | `200` | clamp 到 `[1, 200]`（`0` / 负数 / 非法 → 取 200；超过 200 → 取 200） |
+| `limit` | string (i64) | — | `200` | clamp 到 `[1, 200]`（`0` / 负数 → `1`；超过 `200` → `200`；非法 → `200`） |
 | `offset` | string (i64) | — | `0` | `max(0, v)`（负数 / 非法 → 取 0） |
 
 > 只读查询，无状态变更、无事务、无 WS 广播。
@@ -529,7 +529,7 @@ delivery_note 解析段（LEFT JOIN `t_delivery_note` 一次拼齐）：
 |---|---|---|
 | `customer_id` | string (i64) | 工单客户 id（`t_part.customer_id`） |
 | `customer_name` | string? | 客户名（`t_customer.name`） |
-| `l1_customer_name` | string? | L1 客户名（`t_customer.l1_customer_id` → `t_customer.name` 拼齐；与 `crud.md` 列表保持一致） |
+| `l1_customer_name` | string? | L1 客户名（`t_customer.parent_id` → `t_customer.name` 拼齐；与 `crud.md` 列表保持一致） |
 
 错误码：
 
