@@ -14,6 +14,7 @@
 - [POST /api/v2/parts/{part_id}/to-ship](#post-apiv2partspart_idto-ship)
 - [POST /api/v2/parts/{part_id}/to-process](#post-apiv2partspart_idto-process)
 - [POST /api/v2/parts/worker-scan](#post-apiv2partsworker-scan)
+- [GET /api/v2/parts/by-serial/{serial_no}/part-batches](#get-apiv2partsby-serialserial_nopart-batches)
 - [乐观锁（caller 侧 OCC）](#乐观锁caller-侧-occ)
 - [自动拆批（auto-split）](#自动拆批auto-split)
 
@@ -369,6 +370,72 @@ WS 广播（commit 后下发）：
 - 若 `refill.pool_empty=true` 且 `taken` 为空 → `WORKER_POOL_EMPTY` —— payload `{ worker_id, shelf_id }`
 
 详见 [`../websocket.md`](../websocket.md) 与 [`../worker-pool.md`](../worker-pool.md)。
+
+---
+
+### `GET /api/v2/parts/by-serial/{serial_no}/part-batches`
+
+权限: **Manager / Clerk / Inspector / CncProgrammer**
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `serial_no` | string | 工单序列号（service 反查 part，串归一化同 `POST /parts/worker-scan`） |
+
+> 只读查询，无状态变更、无事务、无 WS 广播。
+
+业务说明：
+
+- 与既有 `/by-serial/{serial_no}` 共存但**字段更窄**：后者返回 `PartDetailOut`（`TPart` 完整 28 列 + `customer_name` / `l1_customer_name` / `current_batch_id` 冗余），适合详情页全字段渲染；本端点返回**工单窄字段 + 全部活跃批次**，专为扫码弹窗场景设计。
+- 前端扫码弹窗场景：工人 / 拣货员扫序列号 → 弹窗显示 `PartScanInfoOut` + `PartBatchScanOut[]` → 操作员选定一个 `INSPECTION` 批次 → 拼 `{ batch_id, version }` 请求体调 `POST /parts/{part_id}/to-ship`（或 `batch-to-ship`）。省去先拉详情再单独拉批次的两次往返。
+- **不返回 `customer_name`**（与 `by-serial` 的差异）：客户名取自 `t_customer`，本端点窄字段投影不冗余该列；若前端展示需要客户名，应另查 `t_customer` API。
+
+Response 200 `data`：`PartScanContextOut`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part` | [`PartScanInfoOut`](#partscaninfoout-字段) | 工单窄字段（9 字段） |
+| `batches` | [`PartBatchScanOut`](#partbatchscanout-字段)[] | 该 part 下全部活跃批次；按 `batch_no ASC` 排序；空数组表示该 part 尚无批次（不影响 200） |
+
+#### `PartScanInfoOut` 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string (i64) | 工单雪花 ID |
+| `drawing_no` | string | 图号 |
+| `name` | string | 工单名 |
+| `quantity` | i32 | 工单数量 |
+| `customer_id` | string (i64) | 客户 id（**不返回 `customer_name`**） |
+| `system_delivery_date` | date? | 计划交付日 |
+| `is_urgent` | bool | 是否加急 |
+| `order_no` | string? | 订单号 |
+| `note` | string? | 备注 |
+
+#### `PartBatchScanOut` 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string (i64) | 批次雪花 ID |
+| `quantity` | i32 | 批次数量 |
+| `status` | string | 批次状态枚举字符串（`PENDING` / `PROGRAMMING` / `IN_PROCESS` / `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` / `COMPLETED` / `CANCELLED`） |
+| `holder_name` | string? | 当前持有人名称（worker 真名 / 货架 code / null）；供弹窗直接展示，不用前端二次拼 holder 字典 |
+| `version` | i32 | 乐观锁（供 to-ship / to-process / to-inspection 等 caller OCC 锚点；**此即 `t_part_batch.version`，不是 part 的 version**） |
+
+排序：`batches` 按 `batch_no ASC`（批次创建顺序）；同一 part 下批次稳定顺序便于前端表格渲染。
+
+错误码：
+
+- 20101 BIZ_PART_NOT_FOUND — `serial_no` 无法解析为 part / 已软删
+
+实现位置：
+
+- handler：`src/modules/part/handler.rs` (`by_serial_part_batches` 路由 → `PartScanContextOut`)
+- service：`src/modules/part/service/crud.rs`（`get_scan_context_by_serial`）
+- dto：`src/modules/part/dto.rs`（`PartScanContextOut` / `PartScanInfoOut` / `PartBatchScanOut`）
+- repo（批次 + holder 名称）：`src/modules/part_batch/repo.rs`（`list_active_with_holder_by_part_id`，LEFT JOIN `t_worker` / `t_shelf` 拼 holder_name）
+- repo（part）：`src/modules/part/repo.rs::find_by_serial_no`
+- model：`src/modules/part_batch/model.rs::TPartBatch`（批次行 + 状态枚举）
 
 ---
 
