@@ -381,6 +381,10 @@ impl PartService {
     /// - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE`
     /// - 20512 `BIZ_SHELF_INACTIVE`
     /// - 40901 `VERSION_CONFLICT`
+    // 参数过多（9 > 7）。本函数聚合 part_id / shelf_id / batch_id / version /
+    // quantity / note 等必要输入，与 `to_ship_core` 同形；将它们打包为
+    // `ToInspectionCoreArgs` 结构体收益微薄、调用面广，重构 ROI 低，故豁免。
+    #[allow(clippy::too_many_arguments)]
     pub async fn to_inspection_core(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,

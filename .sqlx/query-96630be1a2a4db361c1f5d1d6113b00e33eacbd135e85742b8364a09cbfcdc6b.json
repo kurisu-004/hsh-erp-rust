@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COUNT(*) AS \"n!\"\n            FROM t_part_batch pb\n            JOIN t_part p\n              ON p.id = pb.part_id\n            WHERE pb.status = ANY($1)\n              AND pb.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n              -- customer_id 是可选过滤项：空数组 → 命中全部客户；\n              -- 非空 → 限定到展开后的 L1+L2 ids（与 list_batches_with_part 同逻辑）。\n              AND (cardinality($2::bigint[]) = 0 OR p.customer_id = ANY($2))\n              AND ($3::text IS NULL\n                   OR p.drawing_no ILIKE $3\n                   OR p.name       ILIKE $3\n                   OR p.serial_no  ILIKE $3\n                   OR p.order_no   ILIKE $3)\n              AND ($4::text IS NULL OR p.serial_no ILIKE $4)\n              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)\n              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int8Array",
+        "Text",
+        "Text",
+        "Date",
+        "Date"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "96630be1a2a4db361c1f5d1d6113b00e33eacbd135e85742b8364a09cbfcdc6b"
+}

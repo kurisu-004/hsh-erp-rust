@@ -9,6 +9,13 @@
 //!
 //! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
 
+// 跨测试文件共享的 fixtures：每个测试 binary 只用其中一部分（例如
+// part_api_to_ship 用 login_manager / login_clerk / batch_version，
+// part_api_inspection_batches 用 login_inspector / login_worker）。
+// 编译单个 binary 时未引用的 helper 会触发 `dead_code` warning；统一在
+// helpers crate 根豁免，避免每个 binary 都 `#[allow(dead_code)]`。
+#![allow(dead_code)]
+
 #[path = "common/mod.rs"]
 mod common;
 
@@ -115,6 +122,44 @@ pub async fn login_inspector(pool: PgPool, username: &str) -> (axum::Router, Str
 pub async fn login_clerk(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     add_role(&pool, uid, "CLERK", None, None).await;
+    let state = test_state(pool.clone()).await;
+    let app = test_app(state.clone());
+    let (_, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/auth/login",
+            Some(json!({"username": username, "password": "changeme"})),
+            None,
+        ),
+    )
+    .await;
+    let token = env["data"]["token"].as_str().unwrap().to_string();
+    let app2 = test_app(state);
+    (app2, token, pool)
+}
+
+/// 插「白名单外的角色」用户 + 登录拿 token —— 用于 part 域端点的角色守卫测试。
+///
+/// **实现说明（brief 偏差）**：brief 原话是「Worker role」，本仓库 5 角色（Manager /
+/// Clerk / Inspector / CncProgrammer / ShelfAccount）并无 `WORKER` 角色；`parse_role`
+/// 收到未知字符串会跳过、roles 向量清空，登录会被 `code::NO_ROLE` 兜底拒绝（登录本身失败，
+/// 拿不到 token，更别说测端点守卫）。本 helper 沿用既有 `part_api_to_inspection.rs`
+/// 测 8 (`part_batches_role_guard_rejects_unauthorized`) 的同形做法：注册一个
+/// `SHELF_ACCOUNT` 角色用户 —— 该角色合法登录，但 `INSPECTION_LIST_ROLES =
+/// [Manager, Inspector]` 不含 ShelfAccount → service `require_any_role` 拒绝 →
+/// 端点返回 403 / 40300。`login_shelf_account` 同名 helper 在 `worker_pool_api.rs`
+/// 也用此模式（`pool_by_process_forbidden_for_shelf_account`）。
+///
+/// ShelfAccount 必须 scope 到具体 `shelf_id`，故 helper 内部创建一个临时 INSPECTION
+/// 货架并把 scope_id 绑到该货架。
+pub async fn login_worker(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
+    use common::insert_shelf;
+    let uid = insert_user_with_password(&pool, username, "changeme").await;
+    // ShelfAccount 角色必须 scope 到具体 shelf（service `resolve_roles_and_scope`
+    // 否则会跳过）。临时建一个 INSPECTION 货架当 scope target。
+    let insp_scope_shelf = insert_shelf(&pool, "WORKER-ROLE-SCOPE", "WorkerRoleScope", "INSPECTION").await;
+    add_role(&pool, uid, "SHELF_ACCOUNT", Some("shelf"), Some(insp_scope_shelf)).await;
     let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env) = send(

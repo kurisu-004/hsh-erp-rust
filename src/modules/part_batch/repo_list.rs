@@ -51,7 +51,7 @@ impl PartBatchRepo {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<InspectionBatchListRow>, sqlx::Error> {
-        if statuses.is_empty() || customer_ids.is_empty() {
+        if statuses.is_empty() {
             return Ok(Vec::new());
         }
         // `query!` 宏的 text[] 绑定要求 `&[String]` / `Vec<String>`，不接受
@@ -112,7 +112,9 @@ impl PartBatchRepo {
             WHERE pb.status = ANY($1)
               AND pb.deleted_at IS NULL
               AND p.deleted_at IS NULL
-              AND p.customer_id = ANY($2)
+              -- customer_id 是可选过滤项：空数组 → 命中全部客户；
+              -- 非空 → 限定到展开后的 L1+L2 ids。
+              AND (cardinality($2::bigint[]) = 0 OR p.customer_id = ANY($2))
               AND ($3::text IS NULL
                    OR p.drawing_no ILIKE $3
                    OR p.name       ILIKE $3
@@ -190,7 +192,7 @@ impl PartBatchRepo {
         date_from: Option<NaiveDate>,
         date_to: Option<NaiveDate>,
     ) -> Result<i64, sqlx::Error> {
-        if statuses.is_empty() || customer_ids.is_empty() {
+        if statuses.is_empty() {
             return Ok(0);
         }
         // `query_scalar!` 宏的 text[] 绑定要求 `&[String]` / `Vec<String>`，
@@ -205,7 +207,9 @@ impl PartBatchRepo {
             WHERE pb.status = ANY($1)
               AND pb.deleted_at IS NULL
               AND p.deleted_at IS NULL
-              AND p.customer_id = ANY($2)
+              -- customer_id 是可选过滤项：空数组 → 命中全部客户；
+              -- 非空 → 限定到展开后的 L1+L2 ids（与 list_batches_with_part 同逻辑）。
+              AND (cardinality($2::bigint[]) = 0 OR p.customer_id = ANY($2))
               AND ($3::text IS NULL
                    OR p.drawing_no ILIKE $3
                    OR p.name       ILIKE $3
