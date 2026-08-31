@@ -296,3 +296,41 @@ pub struct WorkerScanOut {
     pub scan: WorkerScanCoreOut,
     pub refill: RefillResult,
 }
+
+// ===== Scan Context =====
+
+/// `GET /parts/by-serial/{serial_no}/part-batches` 出参：工单窄字段。
+/// 字段严格来自 `t_part`（仅 8 列 + id），不复用 `PartDetailOut` 的 28 列 flatten。
+#[derive(Debug, Clone, Serialize)]
+pub struct PartScanInfoOut {
+    #[serde(serialize_with = "serialize_i64")]
+    pub id: i64,
+    pub drawing_no: String,                  // b 图号
+    pub name: String,                        // 名称
+    pub quantity: i32,                       // 数量
+    #[serde(serialize_with = "serialize_i64")]
+    pub customer_id: i64,                    // 客户（仅 FK，不冗余 customer_name）
+    pub system_delivery_date: Option<chrono::NaiveDate>,  // 系统交期
+    pub is_urgent: bool,                     // 是否加急
+    pub order_no: Option<String>,            // 订单号
+    pub note: Option<String>,                // 备注
+}
+
+/// `GET /parts/by-serial/{serial_no}/part-batches` 出参：单批次窄字段。
+/// `holder_name` 由 service 层经 repo `list_active_by_part_id_with_holder` 解析。
+#[derive(Debug, Clone, Serialize)]
+pub struct PartBatchScanOut {
+    #[serde(serialize_with = "serialize_i64")]
+    pub id: i64,
+    pub quantity: i32,
+    pub status: String,                      // PartBatchStatus 字符串形态
+    pub holder_name: Option<String>,         // 当前持有人/货架名称（解析自 t_shelf/t_user/t_worker）
+    pub version: i32,                        // 乐观锁版本号（前端 to-ship 用）
+}
+
+/// Scan context 完整出参：工单 + 全部未删批次（按 batch_no 升序）。
+#[derive(Debug, Clone, Serialize)]
+pub struct PartScanContextOut {
+    pub part: PartScanInfoOut,
+    pub batches: Vec<PartBatchScanOut>,
+}
