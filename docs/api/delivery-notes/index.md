@@ -28,6 +28,7 @@
 | POST | `/api/v2/delivery-notes/{id}/update` | 已登录（DRAFT/SUBMITTED） | partial update（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidupdate) |
 | POST | `/api/v2/delivery-notes/{id}/add-parts` | 已登录（DRAFT） | 加件（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidadd-parts) |
 | POST | `/api/v2/delivery-notes/{id}/remove-parts` | 已登录（DRAFT） | 移除件（OCC） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidremove-parts) |
+| POST | `/api/v2/delivery-notes/{id}/attach-batches` | Manager / Clerk | 弹窗勾选 A 组后调用 attach 到 DRAFT 草稿（2026-08-31 新增） | [`drafts.md`](./drafts.md#post-apiv2delivery-notesidattach-batches--2026-08-31-新增) |
 | POST | `/api/v2/delivery-notes/{id}/submit` | Manager / Clerk / Inspector | DRAFT → SUBMITTED（OCC）；有未过检批次时返 200 候选不提交 | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidsubmit) |
 | POST | `/api/v2/delivery-notes/{id}/recall` | 已登录 | SUBMITTED → DRAFT（OCC） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidrecall) |
 | POST | `/api/v2/delivery-notes/{id}/pickup-scan` | 已登录 | 拣货扫描（验证 part_serial 在本单） | [`workflow.md`](./workflow.md#post-apiv2delivery-notesidpickup-scan) |

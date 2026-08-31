@@ -10,8 +10,9 @@
 //!
 //! 对外 API（`handler.rs` 调用面）保持原路径：
 //! - `service::DeliveryGroupService::{list_for_l1, create, update, soft_delete}`
-//! - `service::DeliveryNoteService::{list_with_filters, list_for_pickup, create_draft, get_with_parts, get_many_with_parts, update, add_parts, remove_parts, submit, recall, pickup_scan, pickup, soft_delete, list_events, list_candidate_parts, scan_add, print_xlsx}`
+//! - `service::DeliveryNoteService::{list_with_filters, list_for_pickup, create_draft, get_with_parts, get_many_with_parts, update, add_parts, remove_parts, submit, recall, pickup_scan, pickup, soft_delete, list_events, list_candidate_parts, scan_add, attach_batches, print_xlsx}`
 
+mod attach;
 mod crud;
 mod group;
 mod inner;

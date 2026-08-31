@@ -116,7 +116,11 @@ impl DeliveryNoteService {
         }
 
         if !unresolved.is_empty() {
-            // 存在未过检批次：不写任何数据，返回候选供前端一键过检
+            // 存在未过检批次：不写任何数据，返回候选供前端一键过检。
+            // A 组（READY_TO_SHIP）在 line 87 的空分支已跳过，不进入 unresolved。
+            // 只有 INSPECTION（line 88）进 unresolved 并填 available_batches。
+            // 顺带补 attachable_batches: Vec::new() —— submit 候选分支只列 B 组（INSPECTION 待过检），
+            // A 组（READY_TO_SHIP）走 attach 不在此处出现。
             let targets = unresolved
                 .into_iter()
                 .map(|(p, available_batches)| UnresolvedTargetDto {
@@ -125,6 +129,7 @@ impl DeliveryNoteService {
                     drawing_no: p.drawing_no.clone(),
                     name: p.name.clone(),
                     available_batches,
+                    attachable_batches: Vec::new(),
                 })
                 .collect();
             return Ok(SubmitDeliveryOut {

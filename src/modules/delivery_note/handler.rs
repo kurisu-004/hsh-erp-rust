@@ -21,6 +21,7 @@
 //! - `POST   /{id}/update`
 //! - `POST   /{id}/add-parts`
 //! - `POST   /{id}/remove-parts`
+//! - `POST   /{id}/attach-batches`            ← Phase P3+ 弹窗批量 attach A 组
 //! - `POST   /{id}/submit`
 //! - `POST   /{id}/recall`
 //! - `POST   /{id}/pickup-scan`
@@ -47,12 +48,13 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::dto::{
-    BatchDeliveryDetailData, DeliveryNoteAddPartsRequest, DeliveryNoteBatchDetailQuery,
-    DeliveryNoteCandidatePartsOut, DeliveryNoteCandidatePartsQuery, DeliveryNoteCreateRequest,
-    DeliveryNoteListQuery, DeliveryNotePickupPendingQuery, DeliveryNotePickupRequest,
-    DeliveryNotePickupScanOut, DeliveryNotePickupScanRequest, DeliveryNoteRemovePartsRequest,
-    DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest, PrintDeliveryNoteRequest,
-    PrintLabelsRequest, ScanDeliveryOut, ScanDeliveryRequest, SubmitDeliveryOut,
+    AttachBatchesOut, AttachBatchesRequest, BatchDeliveryDetailData,
+    DeliveryNoteAddPartsRequest, DeliveryNoteBatchDetailQuery, DeliveryNoteCandidatePartsOut,
+    DeliveryNoteCandidatePartsQuery, DeliveryNoteCreateRequest, DeliveryNoteListQuery,
+    DeliveryNotePickupPendingQuery, DeliveryNotePickupRequest, DeliveryNotePickupScanOut,
+    DeliveryNotePickupScanRequest, DeliveryNoteRemovePartsRequest, DeliveryNoteUpdateRequest,
+    DeliveryNoteVersionedRequest, PrintDeliveryNoteRequest, PrintLabelsRequest, ScanDeliveryOut,
+    ScanDeliveryRequest, SubmitDeliveryOut,
 };
 
 // ===========================================================================
@@ -447,6 +449,54 @@ pub async fn scan_delivery_note(
     Ok(Json(R::ok(out)))
 }
 
+/// POST /api/v2/delivery-notes/{note_id}/attach-batches
+///
+/// 弹窗提交时调用，把 A 组（INSPECTION / READY_TO_SHIP）批次 attach 到指定 DRAFT 送货单。
+/// 部分失败（OCC / 状态非法 / 重复）→ 200 + conflicts 列表。
+/// note 非 DRAFT → 409 `BIZ_DELIVERY_NOTE_NOT_DRAFT`（HTTP 409 由 biz_with_status 强制）。
+///
+/// RBAC：Manager / Clerk（**比 add_parts 更严格**：本端点只在 DRAFT 草稿做显式
+/// attach，不走扫码 / 工人路径，故不放宽到 Inspector）。
+pub async fn attach_batches(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(path): Path<DeliveryNotePath>,
+    Json(req): Json<AttachBatchesRequest>,
+) -> Result<Json<R<AttachBatchesOut>>, AppError> {
+    current.require_any_role(&[Role::Manager, Role::Clerk])?;
+
+    // 批量上限：单事务内对每个 item 至少 2 次 DB 调用（get_by_id + attach_to_note），
+    // 上限 200 防恶意请求长期持有连接。参考既有 batch-detail 的 BATCH_DETAIL_MAX_IDS 风格。
+    const ATTACH_BATCHES_MAX_ITEMS: usize = 200;
+    if req.batches.len() > ATTACH_BATCHES_MAX_ITEMS {
+        return Err(AppError::biz(
+            crate::shared::error::code::BIZ_INVALID_VALUE,
+            format!(
+                "too many batches: {} (max {})",
+                req.batches.len(),
+                ATTACH_BATCHES_MAX_ITEMS
+            ),
+        ));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let out = DeliveryNoteService::attach_batches(&mut tx, path.id, req.batches, &current).await?;
+    tx.commit().await?;
+
+    // 提交成功后广播（部分成功也广播，但 frontend 可用 conflicts 长度判断是否需要回滚 UI）
+    let payload = serde_json::json!({
+        "delivery_note_id": path.id,
+        "attached_count": out.attached,
+        "conflict_count": out.conflicts.len(),
+    });
+    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+        kind: "DELIVERY_NOTE_BATCHES_ATTACHED".to_string(),
+        payload,
+    });
+
+    Ok(Json(R::ok(out)))
+}
+
 // ===========================================================================
 //  P4 打印端点（设计 §6.2 + §8）
 // ===========================================================================
@@ -631,6 +681,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/events", get(list_delivery_note_events))
         .route("/{id}/update", post(update_delivery_note))
         .route("/{id}/add-parts", post(add_delivery_note_parts))
+        .route("/{id}/attach-batches", post(attach_batches))
         .route(
             "/{id}/remove-parts",
             post(remove_delivery_note_parts),

@@ -21,9 +21,9 @@ use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{code, AppError};
 
 use super::super::dto::{
-    AddedBatchDto, AvailableBatchDto, BatchStatusDto, RecentItemDto, ResolvedEntityDto,
-    ResolvedKindDto, ScanDeliveryNoteSummaryDto, ScanDeliveryOut, ScanOutcomeDto,
-    UnresolvedTargetDto,
+    AddedBatchDto, AttachableBatchDto, AvailableBatchDto, BatchStatusDto, RecentItemDto,
+    ResolvedEntityDto, ResolvedKindDto, ScanDeliveryNoteSummaryDto, ScanDeliveryOut,
+    ScanOutcomeDto, UnresolvedTargetDto,
 };
 use super::super::model::{DeliveryNote, NoteScope};
 use super::super::repo::{DeliveryGroupRepo, DeliveryNoteRepo};
@@ -38,7 +38,10 @@ const STATUS_DRAFT: &str = "DRAFT";
 // ---------------------------------------------------------------------------
 
 /// A 组：可直接 attach 入单（INSPECTION + READY_TO_SHIP）。
-fn is_attachable_state(status: &str) -> bool {
+///
+/// `pub(super)`：service::scan 与 service::attach 共用一份定义；不要在
+/// service/ 之外的代码里直接调用，attach 模块走 `super::scan::is_attachable_state`。
+pub(super) fn is_attachable_state(status: &str) -> bool {
     matches!(status, "READY_TO_SHIP" | "INSPECTION")
 }
 
@@ -68,22 +71,55 @@ fn classify_invalid_state(b: &TPartBatch) -> Option<&'static str> {
     }
 }
 
-/// 单 target（part）的 batch 5 类分组结果。
+/// 单 target（part）的 batch 4 类分组结果（A/B/D）。
 ///
-/// A/B/C 三 Vec 各承载落入该分组的 batch；`delivery_note_id == Some(note.id)`
-/// 的 batch 视为「已挂本单」**不入任何 Vec**，由调用方按需要去重。
+/// A 组：attachable（INSPECTION + READY_TO_SHIP）
+/// B 组：inspectable（PENDING/PROGRAMMING/REPAIRING/IN_PROCESS 非工人持有）
+/// D 组：conflict（已挂别的 active 单，由 service 层后续判定 21406）
+///
+/// C 组（DELIVERED/OUTSOURCE/COMPLETED/CANCELLED/IN_PROCESS 工人持有）由前置
+/// `has_fully_invalid_target` 静默过滤，不入此 struct。
+///
+/// `had_invalid` 记录该 target 在 C 组过滤前**是否至少有 1 个 C 组 batch**。
+/// 即便过滤后只剩 A/B，该 target 也会强制走弹窗路径（`classify_outcome` 短路），
+/// 让前端能看到剩余的合法批次让用户确认（spec：前端必须能看到 C 被过滤的迹象，
+/// 用户的语义预期是「即使只看到 A，也应该先确认再 attach」）。
+///
+/// `delivery_note_id == Some(note.id)` 的 batch 视为「已挂本单」不入任何 Vec，
+/// 由调用方按需要去重。
 struct TargetEvaluation {
     part: TPart,
     attachable: Vec<TPartBatch>,
     inspectable: Vec<TPartBatch>,
     conflict: Vec<TPartBatch>,
+    /// 该 target 在 5 组分类前是否有 C 组被静默过滤。
+    /// 即使分类后只剩 A，也会强制走弹窗路径（不让 A 静默自动 attach）。
+    had_invalid: bool,
 }
 
 /// 5 组分类的 outcome 判定（纯函数，单测覆盖）。
 ///
-/// 输入是从 evaluations 聚合而来的三个布尔量；返回的 ScanOutcomeDto 决定
+/// 输入是从 evaluations 聚合而来的四个布尔量；返回的 ScanOutcomeDto 决定
 /// handler 层后续是否 attach，以及响应里 `unresolved_targets` 的形状。
-fn classify_outcome(is_assembly: bool, any_inspectable: bool, all_attachable_empty: bool) -> ScanOutcomeDto {
+///
+/// 关键约束：只要任一 target 原始有 C 组被过滤（C@WORKER / DELIVERED /
+/// OUTSOURCE / COMPLETED / CANCELLED），就强制走弹窗路径
+/// （CandidatesAvailable / PartialAdded），即使用户最终看不到 C 也要走弹窗。
+/// 这是 spec 约定：前端代码依赖 `unresolved_targets` 展示剩余合法批次让
+/// 用户确认，不能让 A 在 C 被静默过滤的语义下静默自动 attach。
+fn classify_outcome(
+    is_assembly: bool,
+    any_inspectable: bool,
+    all_attachable_empty: bool,
+    any_had_invalid_filtered: bool,
+) -> ScanOutcomeDto {
+    if any_had_invalid_filtered {
+        return if is_assembly {
+            ScanOutcomeDto::PartialAdded
+        } else {
+            ScanOutcomeDto::CandidatesAvailable
+        };
+    }
     match (is_assembly, any_inspectable) {
         (false, true) => ScanOutcomeDto::CandidatesAvailable,
         (true, true) => ScanOutcomeDto::PartialAdded,
@@ -108,23 +144,68 @@ fn is_all_conflict(evaluations: &[TargetEvaluation]) -> bool {
         .all(|e| e.attachable.is_empty() && e.inspectable.is_empty() && !e.conflict.is_empty())
 }
 
-/// 由 evaluations[i] 构造 `UnresolvedTargetDto`（含 part 元数据 + B 组批次）。
+/// C 组分布判定（保留 21421 硬错误；纯函数，单测覆盖）。
+///
+/// 替代原「任一 C → 21421」全-or-无短路：原本工人持有（C）与货架上
+/// （A/B）的合法批次同存于一个子零件时，会错误地整单拒绝。改成
+/// 「按 part_id 聚合 → 任一 target 全 C 才报错」，且 C 组静默过滤，
+/// 让前端弹窗只看到合法 B 组候选。
+///
+/// 返回 true 当且仅当存在至少一个 `part_id`，其加载到的全部 batch
+/// 都落在 `classify_invalid_state` 命中集里。
+fn has_fully_invalid_target(batches: &[TPartBatch]) -> bool {
+    let mut by_part_total: HashMap<i64, usize> = HashMap::new();
+    let mut by_part_invalid: HashMap<i64, usize> = HashMap::new();
+    for b in batches {
+        *by_part_total.entry(b.part_id).or_insert(0) += 1;
+        if classify_invalid_state(b).is_some() {
+            *by_part_invalid.entry(b.part_id).or_insert(0) += 1;
+        }
+    }
+    by_part_total
+        .iter()
+        .any(|(part_id, total)| {
+            *total > 0 && by_part_invalid.get(part_id).copied().unwrap_or(0) == *total
+        })
+}
+
+/// 由 evaluations[i] 构造 `UnresolvedTargetDto`（含 part 元数据 + A/B 组批次）。
 fn build_unresolved_target(e: TargetEvaluation) -> UnresolvedTargetDto {
     UnresolvedTargetDto {
         part_id: e.part.id,
         serial_no: e.part.serial_no.clone().unwrap_or_default(),
         drawing_no: e.part.drawing_no.clone(),
         name: e.part.name.clone(),
-        available_batches: e
-            .inspectable
-            .into_iter()
-            .map(|b| AvailableBatchDto {
-                batch_id: b.id,
-                version: b.version,
-                quantity: b.quantity,
-                status: BatchStatusDto::from_db(&b.status).unwrap_or(BatchStatusDto::Pending),
-            })
-            .collect(),
+        available_batches: e.inspectable.into_iter().map(to_available_batch_dto).collect(),
+        attachable_batches: e.attachable.into_iter().map(to_attachable_batch_dto).collect(),
+    }
+}
+
+/// 把 `TPartBatch` 投影为 `AvailableBatchDto` / `AttachableBatchDto`。
+///
+/// ⚠️ **禁止合并为 generic helper**：`AvailableBatchDto` / `AttachableBatchDto`
+/// 当前字段同形，但设计上独立——未来字段分叉（status 派生逻辑、OCC version
+/// 来源、扩展字段）时各自演化。强行复用 generic 会导致所有调用点耦合。
+///
+/// 状态解析失败兜底为 `Pending`（与原 `build_unresolved_target` 行为一致）。
+fn to_available_batch_dto(b: TPartBatch) -> AvailableBatchDto {
+    AvailableBatchDto {
+        batch_id: b.id,
+        version: b.version,
+        quantity: b.quantity,
+        status: BatchStatusDto::from_db(&b.status).unwrap_or(BatchStatusDto::Pending),
+    }
+}
+
+/// `TPartBatch` → `AttachableBatchDto`（A 组；status 仅有 INSPECTION / READY_TO_SHIP）。
+///
+/// 状态解析失败兜底为 `Pending`（与原 `build_unresolved_target` 行为一致）。
+fn to_attachable_batch_dto(b: TPartBatch) -> AttachableBatchDto {
+    AttachableBatchDto {
+        batch_id: b.id,
+        version: b.version,
+        quantity: b.quantity,
+        status: BatchStatusDto::from_db(&b.status).unwrap_or(BatchStatusDto::Pending),
     }
 }
 
@@ -202,8 +283,7 @@ impl DeliveryNoteService {
     ///    已挂本单的 batch 跳过）；
     /// 5. outcome 判定：先全 conflict 短路（21406）→ 再 `classify_outcome`
     ///    （4 个变体：Added / AlreadyPresent / CandidatesAvailable / PartialAdded）；
-    /// 6. attach：仅 outcome = Added | PartialAdded 时，对 attachable 调用
-    ///    `PartBatchRepo::attach_to_note`（version-checked），生成 `AddedBatchDto`；
+    /// 6. attach（仅 Added 走；CandidatesAvailable / PartialAdded 由前端弹窗决定）
     /// 7. 重新装载 note + 按 outcome 构造 `unresolved_targets` → 返回。
     ///
     /// 事务边界：handler `pool.begin()` → 这里 → handler `commit()`。本方法不 commit。
@@ -344,15 +424,33 @@ impl DeliveryNoteService {
             PartBatchRepo::list_active_by_part_ids(&mut *conn, &target_part_ids).await?
         };
 
-        // C 组短路：任一 batch 状态非法 → 立即报错（无需额外 DB 查询）。
-        for b in all_batches.iter() {
-            if let Some(reason) = classify_invalid_state(b) {
-                return Err(AppError::biz(
-                    code::BIZ_DELIVERY_BATCH_STATE_INVALID,
-                    format!("batch {} is in invalid state: {reason}", b.id),
-                ));
+        // C 组分布判定：
+        // 仅当存在「target 加载到批次但全部为 C 组」时硬错误（21421）。
+        // 其它情况：过滤 C 组后继续走 A/B/D/E 分类。详见 helper
+        // `has_fully_invalid_target` 与 `c_group_distribution_tests`。
+        if has_fully_invalid_target(&all_batches) {
+            return Err(AppError::biz(
+                code::BIZ_DELIVERY_BATCH_STATE_INVALID,
+                "at least one target has all batches in invalid state (DELIVERED/OUTSOURCE/COMPLETED/CANCELLED/IN_PROCESS-held-by-worker)".to_string(),
+            ));
+        }
+
+        // 过滤 C 组前先按 part_id 记录「是否有 C 组被静默过滤」——
+        // 这是 outcome 短路的依据：即便过滤后只剩 A，也要走弹窗路径，
+        // 让前端展示剩余合法批次让用户确认（spec：不能让 A 在 C 被静默
+        // 过滤的语义下静默自动 attach）。
+        let mut had_invalid_by_part: HashMap<i64, bool> = HashMap::new();
+        for b in &all_batches {
+            if classify_invalid_state(b).is_some() {
+                had_invalid_by_part.insert(b.part_id, true);
             }
         }
+
+        // 过滤 C 组后继续走 A/B/D/E 分类（与原 5 组逻辑兼容）
+        let all_batches: Vec<TPartBatch> = all_batches
+            .into_iter()
+            .filter(|b| classify_invalid_state(b).is_none())
+            .collect();
 
         // 按 part_id 分桶（一次扫描）
         let mut batches_by_part: HashMap<i64, Vec<TPartBatch>> = HashMap::new();
@@ -399,6 +497,10 @@ impl DeliveryNoteService {
                 attachable,
                 inspectable,
                 conflict,
+                had_invalid: had_invalid_by_part
+                    .get(&target.id)
+                    .copied()
+                    .unwrap_or(false),
             });
         }
 
@@ -406,6 +508,7 @@ impl DeliveryNoteService {
         let is_assembly = matches!(kind, ScanKind::Assembly | ScanKind::PartOfAssembly(_));
         let any_inspectable = evaluations.iter().any(|e| !e.inspectable.is_empty());
         let all_attachable_empty = evaluations.iter().all(|e| e.attachable.is_empty());
+        let any_had_invalid_filtered = evaluations.iter().any(|e| e.had_invalid);
 
         if is_all_conflict(&evaluations) {
             return Err(AppError::biz(
@@ -414,14 +517,18 @@ impl DeliveryNoteService {
             ));
         }
 
-        let outcome = classify_outcome(is_assembly, any_inspectable, all_attachable_empty);
+        let outcome = classify_outcome(
+            is_assembly,
+            any_inspectable,
+            all_attachable_empty,
+            any_had_invalid_filtered,
+        );
 
-        // ===== Step 6: attach（仅 outcome = Added | PartialAdded 走）=====
+        // ===== Step 6: attach（仅 outcome = Added 全 A 走；CandidatesAvailable /
+        // PartialAdded 由前端弹窗勾选 A 组决定是否 attach；本接口仅在「全 A 无 B」
+        // 时自动 attach，避免在散件 / 装配件混合场景下替用户做"只过检"的决定）=====
         let mut added_batches: Vec<AddedBatchDto> = Vec::new();
-        if matches!(
-            outcome,
-            ScanOutcomeDto::Added | ScanOutcomeDto::PartialAdded
-        ) {
+        if matches!(outcome, ScanOutcomeDto::Added) {
             let now = now_naive();
             for e in &evaluations {
                 for b in &e.attachable {
@@ -506,11 +613,14 @@ impl DeliveryNoteService {
                 Some(vec![build_unresolved_target(e)])
             }
             ScanOutcomeDto::PartialAdded => {
-                // 装配件 A+B 混合 → 仅 B 组子件入列表
+                // 装配件 A+B 混合（或仅 A / 仅 B）→ 保留所有还有未决动作的子件
+                // （有 A 让前端弹窗勾选 attach，有 B 让前端送检）。
+                // 旧逻辑「仅 B」在「不再自动 attach A」之后会把 A-only 子件的
+                // attachable_batches 静默丢弃，必须改为 A 或 B 任一非空即保留。
                 Some(
                     evaluations
                         .into_iter()
-                        .filter(|e| !e.inspectable.is_empty())
+                        .filter(|e| !e.inspectable.is_empty() || !e.attachable.is_empty())
                         .map(build_unresolved_target)
                         .collect(),
                 )
@@ -925,13 +1035,14 @@ mod outcome_tests {
             attachable: mk(attachable),
             inspectable: mk(inspectable),
             conflict: mk(conflict),
+            had_invalid: false,
         }
     }
 
     #[test]
     fn outcome_added_when_all_attachable() {
         let evs = vec![eval(1, 1, 0, 0)];
-        assert_eq!(classify_outcome(false, false, false), ScanOutcomeDto::Added);
+        assert_eq!(classify_outcome(false, false, false, false), ScanOutcomeDto::Added);
         assert!(!is_all_conflict(&evs));
     }
 
@@ -939,14 +1050,20 @@ mod outcome_tests {
     fn outcome_already_present_when_all_on_note() {
         // attachable 全空 + inspectable 全空 + 无 conflict
         let evs = vec![eval(1, 0, 0, 0)];
-        assert_eq!(classify_outcome(false, false, true), ScanOutcomeDto::AlreadyPresent);
+        assert_eq!(
+            classify_outcome(false, false, true, false),
+            ScanOutcomeDto::AlreadyPresent
+        );
         assert!(!is_all_conflict(&evs));
     }
 
     #[test]
     fn outcome_candidates_available_when_standalone_only_inspectable() {
         let evs = vec![eval(1, 0, 1, 0)];
-        assert_eq!(classify_outcome(false, true, true), ScanOutcomeDto::CandidatesAvailable);
+        assert_eq!(
+            classify_outcome(false, true, true, false),
+            ScanOutcomeDto::CandidatesAvailable
+        );
         assert!(!is_all_conflict(&evs));
     }
 
@@ -954,7 +1071,10 @@ mod outcome_tests {
     fn outcome_partial_added_when_assembly_mixed() {
         // assembly 路径 + A 组 + B 组混合
         let evs = vec![eval(1, 1, 1, 0)];
-        assert_eq!(classify_outcome(true, true, false), ScanOutcomeDto::PartialAdded);
+        assert_eq!(
+            classify_outcome(true, true, false, false),
+            ScanOutcomeDto::PartialAdded
+        );
         assert!(!is_all_conflict(&evs));
     }
 
@@ -962,7 +1082,10 @@ mod outcome_tests {
     fn outcome_assembly_only_inspectable_still_partial_added() {
         // 装配件全部 B 组 → 仍归 PartialAdded（resolved=Assembly）
         let _evs = [eval(1, 0, 1, 0)];
-        assert_eq!(classify_outcome(true, true, true), ScanOutcomeDto::PartialAdded);
+        assert_eq!(
+            classify_outcome(true, true, true, false),
+            ScanOutcomeDto::PartialAdded
+        );
     }
 
     #[test]
@@ -970,5 +1093,522 @@ mod outcome_tests {
         // 全 conflict → 直接报 21406，不进 outcome 判定
         let evs = vec![eval(1, 0, 0, 1), eval(2, 0, 0, 2)];
         assert!(is_all_conflict(&evs));
+    }
+}
+
+// C 组分布判定单元测试：覆盖「任一 target 全 C 才报 21421」+「C 组
+// 静默过滤后只剩 A/B」两条核心语义（与 `classify_5groups_tests` 互为补充）。
+#[cfg(test)]
+mod c_group_distribution_tests {
+    use super::*;
+
+    /// 紧凑 mock：仅暴露本测试关注的字段，其余用 None / 0 / false 占位。
+    fn b(id: i64, part_id: i64, status: &str, location: Option<&str>) -> TPartBatch {
+        TPartBatch {
+            id,
+            part_id,
+            batch_no: 1,
+            quantity: 1,
+            status: status.to_string(),
+            location: location.map(str::to_string),
+            current_holder_id: None,
+            next_process_id: None,
+            placed_at: None,
+            delivery_note_id: None,
+            parent_batch_id: None,
+            has_been_repaired: false,
+            version: 0,
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            created_by: None,
+            updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            updated_by: None,
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn filter_invalid_state_keeps_attachable_and_inspectable() {
+        // 1 个 part：READY_TO_SHIP（A 组）+ PENDING（B 组）+ IN_PROCESS@WORKER（C 组）
+        // 过滤 C 组后剩 2 个（A/B）。
+        let all = vec![
+            b(1, 100, "READY_TO_SHIP", None),
+            b(2, 100, "PENDING", None),
+            b(3, 100, "IN_PROCESS", Some("WORKER")),
+        ];
+        let kept: Vec<TPartBatch> = all
+            .into_iter()
+            .filter(|x| classify_invalid_state(x).is_none())
+            .collect();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].id, 1);
+        assert_eq!(kept[1].id, 2);
+    }
+
+    #[test]
+    fn fully_invalid_target_detection_assembly_case() {
+        // 装配件：2 个 targets
+        //   A (part 100): 4 个 batch，2B + 2C → 部分 C 不是全 C → 不触发
+        //   B (part 200): 3 个 batch，全 C → 全 C → 触发
+        let all = vec![
+            b(1, 100, "PENDING", None),
+            b(2, 100, "PENDING", None),
+            b(3, 100, "DELIVERED", None),
+            b(4, 100, "CANCELLED", None),
+            b(5, 200, "DELIVERED", None),
+            b(6, 200, "OUTSOURCE", None),
+            b(7, 200, "COMPLETED", None),
+        ];
+        assert!(has_fully_invalid_target(&all));
+    }
+
+    #[test]
+    fn fully_invalid_target_detection_standalone_case() {
+        // 散件：1 个 target（part 100），3 个 batch 全 C → 触发。
+        let all = vec![
+            b(1, 100, "DELIVERED", None),
+            b(2, 100, "CANCELLED", None),
+            b(3, 100, "IN_PROCESS", Some("WORKER")),
+        ];
+        assert!(has_fully_invalid_target(&all));
+    }
+
+    #[test]
+    fn partial_invalid_not_trigger_21421() {
+        // 1 个 target（part 100），4 个 batch，B+B+C+C → 部分 C 不是全 C → 不触发。
+        let all = vec![
+            b(1, 100, "PENDING", None),
+            b(2, 100, "PENDING", None),
+            b(3, 100, "DELIVERED", None),
+            b(4, 100, "CANCELLED", None),
+        ];
+        assert!(!has_fully_invalid_target(&all));
+    }
+
+    #[test]
+    fn no_batches_does_not_trigger_21421() {
+        // 未生产 → 不应触发 21421（设计：避免空数据误报硬错误）。
+        let all: Vec<TPartBatch> = Vec::new();
+        assert!(!has_fully_invalid_target(&all));
+    }
+}
+
+// attachable_batches 单元测试：覆盖 build_unresolved_target 字段映射 +
+// outcome 分流（PartialAdded / CandidatesAvailable / C 组过滤）三种场景。
+#[cfg(test)]
+mod attachable_batches_tests {
+    use super::*;
+    use crate::modules::delivery_note::dto::{
+        AttachableBatchDto, AvailableBatchDto, BatchStatusDto, UnresolvedTargetDto,
+    };
+    use crate::modules::part::model::TPart;
+
+    /// 紧凑 mock：仅暴露本测试关注的字段，其余用 None / 0 / false 占位。
+    fn b(id: i64, part_id: i64, status: &str, location: Option<&str>, version: i32) -> TPartBatch {
+        TPartBatch {
+            id,
+            part_id,
+            batch_no: 1,
+            quantity: 10,
+            status: status.to_string(),
+            location: location.map(str::to_string),
+            current_holder_id: None,
+            next_process_id: None,
+            placed_at: None,
+            delivery_note_id: None,
+            parent_batch_id: None,
+            has_been_repaired: false,
+            version,
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            created_by: None,
+            updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+            updated_by: None,
+            deleted_at: None,
+        }
+    }
+
+    fn part(id: i64, serial: &str) -> TPart {
+        TPart {
+            id,
+            serial_no: Some(serial.to_string()),
+            name: format!("Part {id}"),
+            drawing_no: format!("D-{id:03}"),
+            applicant_name: String::new(),
+            quantity: 1,
+            request_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
+            planned_delivery_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
+            actual_delivery_date: None,
+            customer_id: 1,
+            assembly_id: None,
+            status: "INSPECTION".to_string(),
+            location: None,
+            is_urgent: false,
+            current_holder_id: None,
+            placed_at: None,
+            next_process_id: None,
+            order_no: None,
+            system_delivery_date: None,
+            note: None,
+            has_been_repaired: false,
+            version: 0,
+            created_at: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            created_by: None,
+            updated_at: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            updated_by: None,
+            deleted_at: None,
+            delivery_note_id: None,
+        }
+    }
+
+    /// 单 target 的 TargetEvaluation 构造助手。
+    fn eval_for(
+        part: TPart,
+        attachable: Vec<TPartBatch>,
+        inspectable: Vec<TPartBatch>,
+        conflict: Vec<TPartBatch>,
+    ) -> TargetEvaluation {
+        TargetEvaluation {
+            part,
+            attachable,
+            inspectable,
+            conflict,
+            had_invalid: false,
+        }
+    }
+
+    /// 单 target 的 TargetEvaluation 构造助手（含 had_invalid 标记）。
+    /// 用于测试 C 组过滤后强制走弹窗路径的 outcome 短路。
+    fn eval_for_with_invalid(
+        part: TPart,
+        attachable: Vec<TPartBatch>,
+        inspectable: Vec<TPartBatch>,
+        conflict: Vec<TPartBatch>,
+        had_invalid: bool,
+    ) -> TargetEvaluation {
+        TargetEvaluation {
+            part,
+            attachable,
+            inspectable,
+            conflict,
+            had_invalid,
+        }
+    }
+
+    #[test]
+    fn build_unresolved_target_converts_attachable_to_dto() {
+        // 直测 build_unresolved_target 的字段映射：
+        // - part 元数据透传
+        // - available_batches 来源于 inspectable
+        // - attachable_batches 来源于 attachable
+        let p = part(100, "SN100");
+        let attachable = vec![
+            b(1, 100, "INSPECTION", None, 5),
+            b(2, 100, "READY_TO_SHIP", None, 7),
+        ];
+        let inspectable = vec![
+            b(3, 100, "PENDING", None, 0),
+            b(4, 100, "IN_PROCESS", None, 1),
+        ];
+        let eval = eval_for(p, attachable, inspectable, Vec::new());
+        let out: UnresolvedTargetDto = build_unresolved_target(eval);
+
+        assert_eq!(out.part_id, 100);
+        assert_eq!(out.serial_no, "SN100");
+        assert_eq!(out.drawing_no, "D-100");
+        assert_eq!(out.name, "Part 100");
+
+        // B 组：2 个 inspectable → 2 个 AvailableBatchDto
+        assert_eq!(out.available_batches.len(), 2);
+        let avail_ids: Vec<i64> = out.available_batches.iter().map(|x| x.batch_id).collect();
+        assert_eq!(avail_ids, vec![3, 4]);
+        // 状态正确：PENDING → Pending；IN_PROCESS 无 location（不是 WORKER）→ Inspect 状态；
+        // 此处 from_db 校验 PENDING/IN_PROCESS 都能映射成对应 DTO
+        assert!(matches!(
+            out.available_batches[0].status,
+            BatchStatusDto::Pending
+        ));
+
+        // A 组：2 个 attachable → 2 个 AttachableBatchDto
+        assert_eq!(out.attachable_batches.len(), 2);
+        let attach_ids: Vec<i64> = out.attachable_batches.iter().map(|x| x.batch_id).collect();
+        assert_eq!(attach_ids, vec![1, 2]);
+        // version 透传（用于前端 add-parts 转发）
+        assert_eq!(out.attachable_batches[0].version, 5);
+        assert_eq!(out.attachable_batches[1].version, 7);
+        // quantity 透传
+        assert_eq!(out.attachable_batches[0].quantity, 10);
+        // status 透传
+        assert!(matches!(
+            out.attachable_batches[0].status,
+            BatchStatusDto::Inspection
+        ));
+        assert!(matches!(
+            out.attachable_batches[1].status,
+            BatchStatusDto::ReadyToShip
+        ));
+    }
+
+    #[test]
+    fn attachable_batches_populated_when_outcome_partial_added() {
+        // 装配件混合：sub-part 1 = [A,A]（attachable=2）、sub-part 2 = [B,B]（inspectable=2）
+        // → PartialAdded → unresolved_targets 包含 2 个元素：
+        //   sub-part 1 的 attachable_batches 非空，available_batches 空
+        //   sub-part 2 的 available_batches 非空，attachable_batches 空
+        let p1 = part(100, "SN100");
+        let p2 = part(200, "SN200");
+        let attachable_p1 = vec![
+            b(10, 100, "INSPECTION", None, 1),
+            b(11, 100, "READY_TO_SHIP", None, 2),
+        ];
+        let inspectable_p2 = vec![
+            b(20, 200, "PENDING", None, 3),
+            b(21, 200, "IN_PROCESS", None, 4),
+        ];
+        let evals = vec![
+            eval_for(p1, attachable_p1, Vec::new(), Vec::new()),
+            eval_for(p2, Vec::new(), inspectable_p2, Vec::new()),
+        ];
+
+        // Step 5 outcome 判定
+        let is_assembly = true;
+        let any_inspectable = evals.iter().any(|e| !e.inspectable.is_empty());
+        let all_attachable_empty = evals.iter().all(|e| e.attachable.is_empty());
+        let any_had_invalid_filtered = evals.iter().any(|e| e.had_invalid);
+        let outcome = classify_outcome(
+            is_assembly,
+            any_inspectable,
+            all_attachable_empty,
+            any_had_invalid_filtered,
+        );
+        assert_eq!(outcome, ScanOutcomeDto::PartialAdded);
+
+        // Step 7 unresolved_targets 构造（与生产代码 PartialAdded filter 一致：
+        // A 或 B 任一非空的子件都保留，让前端能看到 A 组的 attachable_batches）
+        let unresolved: Vec<UnresolvedTargetDto> = evals
+            .into_iter()
+            .filter(|e| !e.inspectable.is_empty() || !e.attachable.is_empty())
+            .map(build_unresolved_target)
+            .collect();
+        assert_eq!(unresolved.len(), 2);
+
+        // sub-part 100：有 attachable、无 inspectable → 进列表但 attachable_batches 含 2 个 A
+        let u0 = &unresolved[0];
+        assert_eq!(u0.part_id, 100);
+        assert_eq!(u0.attachable_batches.len(), 2);
+        assert_eq!(u0.available_batches.len(), 0);
+        let a_ids: Vec<i64> = u0.attachable_batches.iter().map(|x| x.batch_id).collect();
+        assert_eq!(a_ids, vec![10, 11]);
+
+        // sub-part 200：无 attachable、有 inspectable → 进列表但 available_batches 含 2 个 B
+        let u1 = &unresolved[1];
+        assert_eq!(u1.part_id, 200);
+        assert_eq!(u1.attachable_batches.len(), 0);
+        assert_eq!(u1.available_batches.len(), 2);
+        let b_ids: Vec<i64> = u1.available_batches.iter().map(|x| x.batch_id).collect();
+        assert_eq!(b_ids, vec![20, 21]);
+    }
+
+    #[test]
+    fn attachable_batches_empty_when_no_attachable() {
+        // 散件场景：全 B（inspectable=2，attachable=0）→ CandidatesAvailable →
+        // unresolved_targets 单元素，且 attachable_batches 必须为空 Vec
+        // （不漏字段、不为 None）。
+        let p = part(100, "SN100");
+        let inspectable = vec![
+            b(1, 100, "PENDING", None, 0),
+            b(2, 100, "IN_PROCESS", None, 0),
+        ];
+        let evals = vec![eval_for(p, Vec::new(), inspectable, Vec::new())];
+
+        let outcome = classify_outcome(false, true, true, false);
+        assert_eq!(outcome, ScanOutcomeDto::CandidatesAvailable);
+
+        let unresolved: Vec<UnresolvedTargetDto> = evals
+            .into_iter()
+            .next()
+            .map(|e| vec![build_unresolved_target(e)])
+            .unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].attachable_batches.len(), 0);
+        assert_eq!(unresolved[0].available_batches.len(), 2);
+        // 字段存在且为空 Vec（类型断言，编译期保证 Vec<AttachableBatchDto> 不是 Option）
+        let _: &Vec<AttachableBatchDto> = &unresolved[0].attachable_batches;
+        let _: &Vec<AvailableBatchDto> = &unresolved[0].available_batches;
+    }
+
+    #[test]
+    fn attachable_batches_filtered_when_c_group_present() {
+        // 散件 [A, B, C@WORKER]：
+        //   - A 组 (INSPECTION) → 进 attachable
+        //   - B 组 (PENDING) → 进 inspectable
+        //   - C 组 (IN_PROCESS@WORKER) → 被 C 组短路过滤，不进任何 Vec
+        // → CandidatesAvailable，attachable_batches 含 1 个 A，
+        // available_batches 含 1 个 B。
+        let all: Vec<TPartBatch> = vec![
+            b(1, 100, "INSPECTION", None, 0),
+            b(2, 100, "PENDING", None, 0),
+            b(3, 100, "IN_PROCESS", Some("WORKER"), 0),
+        ];
+
+        // C 组过滤（与 scan_add Step 4 一致）
+        let filtered: Vec<TPartBatch> = all
+            .into_iter()
+            .filter(|x| classify_invalid_state(x).is_none())
+            .collect();
+        assert_eq!(filtered.len(), 2);
+
+        // 按 attachable/inspectable 分桶（与 Step 4 一致）
+        let mut attachable = Vec::new();
+        let mut inspectable = Vec::new();
+        for b in &filtered {
+            if is_attachable_state(&b.status) {
+                attachable.push(b.clone());
+            } else if is_inspectable_state(b) {
+                inspectable.push(b.clone());
+            }
+        }
+        assert_eq!(attachable.len(), 1);
+        assert_eq!(attachable[0].id, 1);
+        assert_eq!(inspectable.len(), 1);
+        assert_eq!(inspectable[0].id, 2);
+
+        // outcome：C 组过滤后只剩 B → CandidatesAvailable
+        let outcome = classify_outcome(false, !inspectable.is_empty(), attachable.is_empty(), true);
+        assert_eq!(outcome, ScanOutcomeDto::CandidatesAvailable);
+
+        // build_unresolved_target：DTO 字段正确分离
+        let p = part(100, "SN100");
+        let eval = eval_for(p, attachable, inspectable, Vec::new());
+        let out = build_unresolved_target(eval);
+        assert_eq!(out.attachable_batches.len(), 1);
+        assert_eq!(out.attachable_batches[0].batch_id, 1);
+        assert_eq!(out.available_batches.len(), 1);
+        assert_eq!(out.available_batches[0].batch_id, 2);
+        // C 组 batch id=3 不出现在任何 Vec
+        for b in &out.attachable_batches {
+            assert_ne!(b.batch_id, 3);
+        }
+        for b in &out.available_batches {
+            assert_ne!(b.batch_id, 3);
+        }
+    }
+
+    // ---- had_invalid 短路 outcome 测试：覆盖 spec 约定的「原始含 C → 强制弹窗」 ----
+
+    /// 散件 [A, C@WORKER] 混合 → outcome 必须是 CandidatesAvailable（即使只剩 A），
+    /// A 不自动 attach，进入 attachable_batches 让前端弹窗确认。
+    ///
+    /// 这是本次 fix 的核心场景：spec 约定 C 被静默过滤后，剩余的合法批次
+    /// 也必须走弹窗路径，不能让 A 静默自动 attach。
+    #[test]
+    fn had_invalid_standalone_a_plus_c_returns_candidates() {
+        // 散件：1 个 target，attachable=[A]，inspectable=[]，had_invalid=true
+        let p = part(100, "SN100");
+        let attachable = vec![b(1, 100, "INSPECTION", None, 0)];
+        let eval = eval_for_with_invalid(p, attachable, Vec::new(), Vec::new(), true);
+
+        // outcome：C 被过滤（had_invalid=true）+ 散件 → CandidatesAvailable
+        let outcome = classify_outcome(
+            false,
+            false, // any_inspectable
+            false, // all_attachable_empty
+            true,  // any_had_invalid_filtered
+        );
+        assert_eq!(outcome, ScanOutcomeDto::CandidatesAvailable);
+
+        // 验证响应形态：unresolved_targets 单元素 + attachable_batches 含 A
+        let unresolved: Vec<UnresolvedTargetDto> =
+            vec![build_unresolved_target(eval)];
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].attachable_batches.len(), 1);
+        assert_eq!(unresolved[0].available_batches.len(), 0);
+        assert_eq!(unresolved[0].attachable_batches[0].batch_id, 1);
+    }
+
+    /// 装配件 + 某子件 had_invalid=true → PartialAdded（即便该子件只剩 A）。
+    ///
+    /// 装配件场景下，C 被过滤后该子件的 A 也必须走弹窗（不能被静默 auto-attach），
+    /// 让前端决定 attach 哪些子件。
+    #[test]
+    fn had_invalid_assembly_returns_partial_added() {
+        // 装配件 1 个子件：attachable=[A]，had_invalid=true
+        let p = part(100, "SN100");
+        let attachable = vec![b(1, 100, "INSPECTION", None, 0)];
+        let eval = eval_for_with_invalid(p, attachable, Vec::new(), Vec::new(), true);
+
+        let outcome = classify_outcome(
+            true,  // is_assembly
+            false, // any_inspectable
+            false, // all_attachable_empty
+            true,  // any_had_invalid_filtered
+        );
+        assert_eq!(outcome, ScanOutcomeDto::PartialAdded);
+
+        let unresolved: Vec<UnresolvedTargetDto> = vec![build_unresolved_target(eval)];
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].attachable_batches.len(), 1);
+        assert_eq!(unresolved[0].available_batches.len(), 0);
+    }
+
+    /// 散件 + 全 A（无 invalid + 无 inspectable）→ Added（既有行为不变）。
+    ///
+    /// 回归测试：had_invalid=false 时新参数完全不影响既有 outcome 分支。
+    #[test]
+    fn had_invalid_false_full_a_returns_added() {
+        let outcome = classify_outcome(
+            false, // is_assembly
+            false, // any_inspectable
+            false, // all_attachable_empty
+            false, // any_had_invalid_filtered
+        );
+        assert_eq!(outcome, ScanOutcomeDto::Added);
+    }
+
+    /// 散件 + invalid + B 同时存在 → CandidatesAvailable（与无 invalid 的
+    /// 「全 B 走 CandidatesAvailable」行为一致）。
+    ///
+    /// 验证 invalid 与 inspectable 共存时短路仍生效（CandidatesAvailable）。
+    #[test]
+    fn had_invalid_with_inspectable_returns_candidates() {
+        let outcome = classify_outcome(
+            false, // is_assembly
+            true,  // any_inspectable
+            false, // all_attachable_empty
+            true,  // any_had_invalid_filtered
+        );
+        assert_eq!(outcome, ScanOutcomeDto::CandidatesAvailable);
+    }
+
+    /// 散件 + 仅 B（无 invalid）→ CandidatesAvailable（既有行为不变）。
+    ///
+    /// 回归测试：had_invalid=false + any_inspectable=true → CandidatesAvailable。
+    #[test]
+    fn no_invalid_with_inspectable_returns_candidates() {
+        let outcome = classify_outcome(
+            false, // is_assembly
+            true,  // any_inspectable
+            false, // all_attachable_empty
+            false, // any_had_invalid_filtered
+        );
+        assert_eq!(outcome, ScanOutcomeDto::CandidatesAvailable);
+    }
+
+    /// 装配件 + 仅 B（无 invalid）→ PartialAdded（既有行为不变）。
+    ///
+    /// 回归测试：had_invalid=false + is_assembly=true + any_inspectable=true → PartialAdded。
+    #[test]
+    fn no_invalid_assembly_with_inspectable_returns_partial_added() {
+        let outcome = classify_outcome(
+            true,  // is_assembly
+            true,  // any_inspectable
+            true,  // all_attachable_empty
+            false, // any_had_invalid_filtered
+        );
+        assert_eq!(outcome, ScanOutcomeDto::PartialAdded);
     }
 }

@@ -183,7 +183,9 @@ pub mod code {
     // 214xx 送货单（t_delivery_note）
     pub const BIZ_DELIVERY_NOTE_NOT_FOUND: i32 = 21401;             // 找不到指定的送货单
     pub const BIZ_DELIVERY_NOTE_INVALID_TRANSITION: i32 = 21402;    // 当前状态不允许此操作
-    pub const BIZ_DELIVERY_NOTE_NOT_DRAFT: i32 = 21403;             // 非 DRAFT 状态不能 soft_delete
+    /// 非 DRAFT 状态：不能 soft_delete / attach-batches。
+    /// 注意：update 路径用 BIZ_INVALID_TRANSITION（21402）而非此码。
+    pub const BIZ_DELIVERY_NOTE_NOT_DRAFT: i32 = 21403;
     pub const BIZ_DELIVERY_NOTE_NOT_SUBMITTED: i32 = 21404;         // 非 SUBMITTED 状态不能 recall / pickup
     pub const BIZ_DELIVERY_NOTE_PART_NOT_READY: i32 = 21405;        // 零件状态非 READY_TO_SHIP
     pub const BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED: i32 = 21406; // 零件已在另一张送货单上（提升为 409：状态冲突）

@@ -33,6 +33,7 @@ Request：
 | ↳ `DELIVERY_NOTE_CREATED` | 送货单创建 | `note_id` |
 | ↳ `DELIVERY_NOTE_PARTS_ADDED` | 送货单加件 | `note_id`, `added_part_ids` |
 | ↳ `DELIVERY_NOTE_SCAN_ADD` | 扫码入单（高频） | `note_id`, `part_id`, `batch_id` |
+| ↳ `DELIVERY_NOTE_BATCHES_ATTACHED` | 弹窗提交后（`POST /{note_id}/attach-batches`，2026-08-31 新增） | `{ delivery_note_id, attached_count, conflict_count }`（监听端用 `conflict_count > 0` 判断是否有失败项） |
 | ↳ `DELIVERY_NOTE_SUBMITTED` | 提交 | `note_id` |
 | ↳ `DELIVERY_NOTE_PICKED_UP` | 司机领取 | `note_id`, `driver_user_id` |
 | ↳ `DELIVERY_NOTE_PRINTED` | 打印（kind=`note` 或 `label`） | `note_id`, `kind` |

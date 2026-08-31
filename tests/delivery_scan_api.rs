@@ -207,6 +207,31 @@ async fn create_test_batch(
     id
 }
 
+/// Task 9 helper：与 `create_test_batch` 同形但显式接受 `batch_no`，
+/// 用于「同一 part 上挂多个批次」的场景（`uq_t_part_batch_part_no` 唯一约束）。
+async fn create_test_batch_at(
+    pool: &sqlx::PgPool,
+    part_id: i64,
+    batch_no: i32,
+    status: &str,
+    holder_id: Option<i64>,
+    location: Option<&str>,
+) -> i64 {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO t_part_batch (part_id, batch_no, quantity, status, current_holder_id, location, version) \
+         VALUES ($1, $2, 10, $3, $4, $5, 1) RETURNING id",
+    )
+    .bind(part_id)
+    .bind(batch_no)
+    .bind(status)
+    .bind(holder_id)
+    .bind(location)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    id
+}
+
 async fn insert_assembly(
     pool: &PgPool,
     customer_id: i64,
@@ -1352,7 +1377,11 @@ async fn scan_assembly_with_all_ready_returns_added() {
 ///
 /// 3 子件：2 READY_TO_SHIP（A）+ 1 PENDING（B）。
 /// `is_assembly=true`、`any_inspectable=true` → `classify_outcome`
-/// 返回 PARTIAL_ADDED；A 组挂单 + B 组进 unresolved_targets。
+/// 返回 PARTIAL_ADDED。
+///
+/// 2026-08-31 修订：A 组不再由 scan 自动 attach（即使在 PARTIAL_ADDED 下）；
+/// 所有有 A 或 B 的子件都进 unresolved_targets，A 组放 attachable_batches，
+/// B 组放 available_batches，由前端弹窗勾选后转发 `POST /{id}/attach-batches`。
 #[tokio::test]
 async fn scan_assembly_with_partial_ready_returns_partial_added() {
     let (_guard, pool) = setup().await;
@@ -1398,29 +1427,73 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
     assert_eq!(env["data"]["outcome"], "PARTIAL_ADDED");
     assert_eq!(env["data"]["resolved"]["kind"], "ASSEMBLY");
 
-    // 2 个 A 组子件批次挂单
+    // 关键：PARTIAL_ADDED 下 A 组不再挂单（added_batches 必须为空）
     assert_eq!(
         env["data"]["added_batches"].as_array().unwrap().len(),
-        2
+        0,
+        "PARTIAL_ADDED 下 A 组不再自动 attach（2026-08-31 修订）"
     );
-    assert_eq!(env["data"]["note"]["line_count"], 2);
+    assert_eq!(
+        env["data"]["note"]["line_count"], 0,
+        "没有任何 batch 被自动 attach"
+    );
 
-    // 1 个 B 组子件进 unresolved_targets
+    // 3 个有 A 或 B 的子件都进 unresolved_targets（A-only 也进，等前端弹窗勾选）
     let unresolved = env["data"]["unresolved_targets"]
         .as_array()
         .expect("unresolved_targets 应为数组");
-    assert_eq!(unresolved.len(), 1, "A+B 装配件 → unresolved 单元素");
-    let target = &unresolved[0];
-    let target_pid: i64 = target["part_id"].as_str().unwrap().parse().unwrap();
-    assert_eq!(target_pid, b_pid, "B 组子件 part_id 应进 unresolved");
-    let avail = target["available_batches"].as_array().unwrap();
-    assert_eq!(avail.len(), 1);
-    assert_eq!(avail[0]["batch_id"].as_str().unwrap(), b_bid.to_string());
-    assert_eq!(avail[0]["status"], "PENDING");
+    assert_eq!(
+        unresolved.len(),
+        3,
+        "3 个有 A 或 B 的子件都进 unresolved_targets"
+    );
+
+    // 按 part_id 分类断言
+    let mut by_pid: std::collections::HashMap<i64, &Value> =
+        std::collections::HashMap::new();
+    for t in unresolved {
+        let pid: i64 = t["part_id"].as_str().unwrap().parse().unwrap();
+        by_pid.insert(pid, t);
+    }
+
+    // A-only 子件：attachable_batches 非空，available_batches 空
+    for a_pid in &a_pids {
+        let t = by_pid
+            .get(a_pid)
+            .unwrap_or_else(|| panic!("A 子件 {a_pid} 应在 unresolved_targets"));
+        let att = t["attachable_batches"]
+            .as_array()
+            .expect("attachable_batches 字段必须存在");
+        assert_eq!(att.len(), 1, "A 子件 attachable_batches=1");
+        assert_eq!(att[0]["status"], "READY_TO_SHIP");
+        let av = t["available_batches"]
+            .as_array()
+            .expect("available_batches 字段必须存在");
+        assert_eq!(av.len(), 0, "A 子件 available_batches 应为空");
+    }
+
+    // B 子件：attachable 空，available_batches 含 B
+    let b_target = by_pid
+        .get(&b_pid)
+        .expect("B 子件应在 unresolved_targets");
+    assert_eq!(b_target["serial_no"], "SP0002");
+    let b_att = b_target["attachable_batches"]
+        .as_array()
+        .expect("attachable_batches 字段必须存在");
+    assert_eq!(b_att.len(), 0, "B 子件 attachable_batches 应为空");
+    let b_avail = b_target["available_batches"]
+        .as_array()
+        .expect("available_batches 字段必须存在");
+    assert_eq!(b_avail.len(), 1);
+    assert_eq!(
+        b_avail[0]["batch_id"].as_str().unwrap(),
+        b_bid.to_string()
+    );
+    assert_eq!(b_avail[0]["status"], "PENDING");
     assert!(
-        avail[0]["version"].is_i64(),
+        b_avail[0]["version"].is_i64(),
         "available_batches[0].version 必须存在且为整数，实际 = {}",
-        avail[0]["version"]
+        b_avail[0]["version"]
     );
 
     // B 组批次不进 delivery_note_id
@@ -1432,7 +1505,7 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
             .unwrap();
     assert!(b_dn_id.is_none(), "B 组批次不应挂单");
 
-    // A 组 2 个批次都已挂本单
+    // A 组 2 个批次也都未挂本单（PARTIAL_ADDED 不写）
     let dn_id_i64: i64 = env["data"]["note"]["id"]
         .as_str()
         .unwrap()
@@ -1447,7 +1520,10 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(a_attached, 2, "A 组 2 个批次应全部挂单");
+    assert_eq!(
+        a_attached, 0,
+        "PARTIAL_ADDED 下 A 组批次也不挂单（弹窗勾选后才挂）"
+    );
 
     // ResolvedEntityDto 字段（无 assembly_id / child_count）
     assert!(env["data"]["resolved"].get("assembly_id").is_none());
@@ -1582,4 +1658,633 @@ async fn scan_twice_same_code_is_idempotent() {
         env2["data"].get("skipped").is_none(),
         "新 DTO 无 skipped 字段"
     );
+}
+
+// ===========================================================================
+//  Task 9: scan outcome 行为细化 — A 组不再自动 attach（除「全 A 无 B」外）
+// ===========================================================================
+//
+// 2026-08-31 路线 B 修订后语义：
+//   - 散件全 A 组（无 B）  → ADDED + 自动 attach（向后兼容；保持原行为）
+//   - 散件 A+B 混合       → CANDIDATES_AVAILABLE + attachable=A, available=B
+//                            不再自动 attach（即使 A 组齐全）
+//   - 散件 A+C（任一 C）   → CANDIDATES_AVAILABLE + attachable=A, available=空
+//                            （C 静默过滤，但只要原批次含 C 就不走 auto-attach 路径）
+//   - 散件 B+C            → CANDIDATES_AVAILABLE + attachable=空, available=B
+//   - 装配件 A+B 混合      → PARTIAL_ADDED，每个有 A 或 B 的子件进 unresolved_targets；
+//                            A-only 子件也进 unresolved_targets，attachable_batches 含 A 组
+//
+// 关键点：所有 CANDIDATES_AVAILABLE / PARTIAL_ADDED 场景下 `added_batches` 必须为空，
+// A 组只能通过前端弹窗勾选后转发到 `POST /{id}/attach-batches` 显式 attach。
+
+/// Task 9 场景 1：散件 + 2 个 A 组（INSPECTION）→ outcome=ADDED。
+///
+/// 全 A 组（无 B 无 C）→ 自动 attach，`unresolved_targets` 必须为 null。
+/// 这是「全 A 无 B」路径的回归测试，必须仍能向后兼容走 ADDED。
+#[tokio::test]
+async fn scan_standalone_full_a_returns_added_with_no_unresolved() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part(&pool, "P_full_a", l2, Some("FULLA0001"), None).await;
+    // 2 个 A 组批次（INSPECTION）→ batch_no 不同以满足 (part_id, batch_no) UNIQUE
+    let b1 = create_test_batch_at(&pool, pid, 1, "INSPECTION", None, None).await;
+    let b2 = create_test_batch_at(&pool, pid, 2, "INSPECTION", None, None).await;
+
+    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/delivery-notes/scan",
+            Some(json!({"code": "FULLA0001"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "全 A 组应 ADDED: {env}");
+    assert_eq!(env["data"]["outcome"], "ADDED");
+    assert_eq!(
+        env["data"]["added_batches"].as_array().unwrap().len(),
+        2,
+        "全 A 组 2 个批次都应挂单"
+    );
+    let added_ids: Vec<String> = env["data"]["added_batches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["batch_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(added_ids.contains(&b1.to_string()));
+    assert!(added_ids.contains(&b2.to_string()));
+    assert_eq!(
+        env["data"]["unresolved_targets"],
+        serde_json::Value::Null,
+        "ADDED 场景下 unresolved_targets 必须为 null"
+    );
+    assert_eq!(env["data"]["note"]["line_count"], 2);
+}
+
+/// Task 9 场景 2：散件 + [A, B] 混合 → outcome=CANDIDATES_AVAILABLE，
+/// A 放进 attachable_batches，B 放进 available_batches；**不再自动 attach**。
+///
+/// 这是路线 B 的核心变更点：即使 A 组齐全，也不再自动 attach，
+/// 留给前端弹窗勾选决定（POST /{id}/attach-batches 显式提交）。
+#[tokio::test]
+async fn scan_standalone_a_plus_b_returns_candidates_with_attachable_and_available() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part(&pool, "P_apb", l2, Some("APB00001"), None).await;
+    let a_bid = create_test_batch_at(&pool, pid, 1, "INSPECTION", None, None).await;
+    let b_bid = create_test_batch_at(&pool, pid, 2, "PENDING", None, None).await;
+
+    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/delivery-notes/scan",
+            Some(json!({"code": "APB00001"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "A+B 散件: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["outcome"],
+        "CANDIDATES_AVAILABLE",
+        "A+B 混合必须走 CANDIDATES_AVAILABLE；当前实现若直接 ADDED 则是回归"
+    );
+
+    // 关键断言：A 不再自动 attach
+    assert_eq!(
+        env["data"]["added_batches"].as_array().unwrap().len(),
+        0,
+        "CANDIDATES_AVAILABLE 下 added_batches 必须为空（A 由前端弹窗决定是否 attach）"
+    );
+
+    // unresolved_targets 单元素，含 A 和 B
+    let unresolved = env["data"]["unresolved_targets"]
+        .as_array()
+        .expect("unresolved_targets 应为数组");
+    assert_eq!(unresolved.len(), 1, "散件 → 单元素 unresolved_target");
+    let target = &unresolved[0];
+    let target_pid: i64 = target["part_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(target_pid, pid);
+
+    // A 组 → attachable_batches
+    let attachable = target["attachable_batches"]
+        .as_array()
+        .expect("attachable_batches 字段必须存在");
+    assert_eq!(attachable.len(), 1, "A 组 1 个批次应进 attachable_batches");
+    assert_eq!(
+        attachable[0]["batch_id"].as_str().unwrap(),
+        a_bid.to_string()
+    );
+    assert_eq!(attachable[0]["status"], "INSPECTION");
+    assert_eq!(attachable[0]["quantity"], 10);
+    assert!(
+        attachable[0]["version"].is_i64(),
+        "attachable_batches[].version 必须存在；got {}",
+        attachable[0]["version"]
+    );
+
+    // B 组 → available_batches
+    let available = target["available_batches"]
+        .as_array()
+        .expect("available_batches 字段必须存在");
+    assert_eq!(available.len(), 1, "B 组 1 个批次应进 available_batches");
+    assert_eq!(
+        available[0]["batch_id"].as_str().unwrap(),
+        b_bid.to_string()
+    );
+    assert_eq!(available[0]["status"], "PENDING");
+    assert!(
+        available[0]["version"].is_i64(),
+        "available_batches[].version 必须存在；got {}",
+        available[0]["version"]
+    );
+
+    // DB 校验：A 和 B 都未挂单
+    for bid in [a_bid, b_bid] {
+        let dn_id: Option<i64> =
+            sqlx::query_scalar("SELECT delivery_note_id FROM t_part_batch WHERE id = $1")
+                .bind(bid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            dn_id.is_none(),
+            "CANDIDATES_AVAILABLE 下 batch {bid} 不应挂单（前端还没勾选）"
+        );
+    }
+
+    // 草稿已建立但 line_count=0（没有任何 batch 自动 attach）
+    assert_eq!(env["data"]["note"]["status"], "DRAFT");
+    assert_eq!(env["data"]["note"]["line_count"], 0);
+}
+
+/// Task 9 场景 3：散件 + [A, C@WORKER] → outcome=CANDIDATES_AVAILABLE，
+/// attachable_batches 含 A，available_batches 空。
+///
+/// C 组（工人持有 IN_PROCESS）由 has_fully_invalid_target 静默过滤（不是「全 C」，
+/// 因此不报 21421）；但只要原批次集合含 C，就不走 auto-attach 路径，
+/// A 组放进 attachable_batches 供前端决定。
+#[tokio::test]
+async fn scan_standalone_a_plus_c_returns_candidates_with_only_attachable() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part(&pool, "P_apc", l2, Some("APC00001"), None).await;
+    let a_bid = create_test_batch_at(&pool, pid, 1, "READY_TO_SHIP", None, None).await;
+    let c_bid = create_test_batch_at(&pool, pid, 2, "IN_PROCESS", Some(99), Some("WORKER")).await;
+
+    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/delivery-notes/scan",
+            Some(json!({"code": "APC00001"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "A+C 散件: {env}");
+    assert_eq!(
+        env["code"], 0,
+        "非全 C 不应触发 21421；当前实现已静默过滤 C：{env}"
+    );
+    assert_eq!(
+        env["data"]["outcome"],
+        "CANDIDATES_AVAILABLE",
+        "含 C 的原批次集合必须走 CANDIDATES_AVAILABLE（不走 auto-attach）；\
+         若当前实现是 ADDED 则是任务约定的偏差，需要 backend 调整"
+    );
+
+    assert_eq!(
+        env["data"]["added_batches"].as_array().unwrap().len(),
+        0,
+        "CANDIDATES_AVAILABLE 下 A 也不再自动 attach"
+    );
+
+    let unresolved = env["data"]["unresolved_targets"]
+        .as_array()
+        .expect("unresolved_targets 应为数组");
+    assert_eq!(unresolved.len(), 1, "散件 → 单元素 unresolved_target");
+
+    // C 过滤后只剩 A → attachable_batches 有 1 个
+    let attachable = unresolved[0]["attachable_batches"]
+        .as_array()
+        .expect("attachable_batches 字段必须存在");
+    assert_eq!(
+        attachable.len(),
+        1,
+        "C 过滤后 A 组 1 个批次应进 attachable_batches"
+    );
+    assert_eq!(
+        attachable[0]["batch_id"].as_str().unwrap(),
+        a_bid.to_string()
+    );
+    assert_eq!(attachable[0]["status"], "READY_TO_SHIP");
+
+    // available_batches 必须为空（没有 B 组）
+    let available = unresolved[0]["available_batches"]
+        .as_array()
+        .expect("available_batches 字段必须存在");
+    assert_eq!(
+        available.len(),
+        0,
+        "available_batches 应为空（C 已过滤，无 B）"
+    );
+
+    // DB 校验：A 和 C 都未挂单
+    for bid in [a_bid, c_bid] {
+        let dn_id: Option<i64> =
+            sqlx::query_scalar("SELECT delivery_note_id FROM t_part_batch WHERE id = $1")
+                .bind(bid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            dn_id.is_none(),
+            "batch {bid} 不应挂单；got dn_id={dn_id:?}"
+        );
+    }
+
+    assert_eq!(env["data"]["note"]["status"], "DRAFT");
+    assert_eq!(env["data"]["note"]["line_count"], 0);
+}
+
+/// Task 9 场景 4：散件 + [B, C@WORKER] → outcome=CANDIDATES_AVAILABLE，
+/// attachable_batches 空，available_batches 含 B。
+///
+/// C 静默过滤，B 进 available 候选，前端送检流程按 B 组处理。
+#[tokio::test]
+async fn scan_standalone_b_plus_c_returns_candidates_with_only_available() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let pid = insert_part(&pool, "P_bpc", l2, Some("BPC00001"), None).await;
+    let b_bid = create_test_batch_at(&pool, pid, 1, "PENDING", None, None).await;
+    let c_bid = create_test_batch_at(&pool, pid, 2, "IN_PROCESS", Some(99), Some("WORKER")).await;
+
+    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/delivery-notes/scan",
+            Some(json!({"code": "BPC00001"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "B+C 散件: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(env["data"]["outcome"], "CANDIDATES_AVAILABLE");
+
+    assert_eq!(
+        env["data"]["added_batches"].as_array().unwrap().len(),
+        0
+    );
+
+    let unresolved = env["data"]["unresolved_targets"]
+        .as_array()
+        .expect("unresolved_targets 应为数组");
+    assert_eq!(unresolved.len(), 1);
+
+    // 没有 A 组 → attachable_batches 为空
+    let attachable = unresolved[0]["attachable_batches"]
+        .as_array()
+        .expect("attachable_batches 字段必须存在");
+    assert_eq!(
+        attachable.len(),
+        0,
+        "无 A 组 → attachable_batches 应为空"
+    );
+
+    // B 进 available_batches
+    let available = unresolved[0]["available_batches"]
+        .as_array()
+        .expect("available_batches 字段必须存在");
+    assert_eq!(available.len(), 1);
+    assert_eq!(
+        available[0]["batch_id"].as_str().unwrap(),
+        b_bid.to_string()
+    );
+    assert_eq!(available[0]["status"], "PENDING");
+
+    // DB 校验：B 和 C 都未挂单
+    for bid in [b_bid, c_bid] {
+        let dn_id: Option<i64> =
+            sqlx::query_scalar("SELECT delivery_note_id FROM t_part_batch WHERE id = $1")
+                .bind(bid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(dn_id.is_none(), "batch {bid} 不应挂单");
+    }
+
+    assert_eq!(env["data"]["note"]["status"], "DRAFT");
+    assert_eq!(env["data"]["note"]["line_count"], 0);
+}
+
+/// Task 9 场景 5：装配件 1 子件 [A,A]，1 子件 [B,B] → PARTIAL_ADDED，
+/// 两个子件都进 unresolved_targets，每个子件都同时有 attachable + available。
+///
+/// 与既有 `scan_assembly_with_partial_ready_returns_partial_added` 的差异：
+/// 这里**不**走 auto-attach（PARTIAL_ADDED 下 added_batches 必须为空）；
+/// 每个有 A 或 B 的子件都进 unresolved_targets（A-only 子件也进，
+/// attachable_batches 含其 A 组，等待前端弹窗勾选）。
+#[tokio::test]
+async fn scan_assembly_child_a_plus_b_returns_partial_added_with_attachable_per_child() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let asm_id = insert_assembly(&pool, l2, "ASM-MAB", "ASM-MAB-DWG", "A+B双批子件").await;
+
+    // 子件 1：[A,A]（READY_TO_SHIP 各 1 个）→ batch_no 不同
+    let child1_pid = insert_part(
+        &pool,
+        "ChildMAB-A",
+        l2,
+        Some("CMA0001"),
+        Some(asm_id),
+    )
+    .await;
+    let c1_a1 = create_test_batch_at(&pool, child1_pid, 1, "READY_TO_SHIP", None, None).await;
+    let c1_a2 = create_test_batch_at(&pool, child1_pid, 2, "READY_TO_SHIP", None, None).await;
+
+    // 子件 2：[B,B]（PENDING 各 1 个）→ batch_no 不同
+    let child2_pid = insert_part(
+        &pool,
+        "ChildMAB-B",
+        l2,
+        Some("CMB0001"),
+        Some(asm_id),
+    )
+    .await;
+    let c2_b1 = create_test_batch_at(&pool, child2_pid, 1, "PENDING", None, None).await;
+    let c2_b2 = create_test_batch_at(&pool, child2_pid, 2, "PENDING", None, None).await;
+
+    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/delivery-notes/scan",
+            Some(json!({"code": "ASM-MAB"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "装配件 A+B 双批子件: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(env["data"]["outcome"], "PARTIAL_ADDED");
+    assert_eq!(env["data"]["resolved"]["kind"], "ASSEMBLY");
+
+    // 关键断言：A 不再自动 attach
+    assert_eq!(
+        env["data"]["added_batches"].as_array().unwrap().len(),
+        0,
+        "PARTIAL_ADDED 下 A 组不再自动 attach；走前端弹窗"
+    );
+
+    // 两个子件都进 unresolved_targets
+    let unresolved = env["data"]["unresolved_targets"]
+        .as_array()
+        .expect("unresolved_targets 应为数组");
+    assert_eq!(
+        unresolved.len(),
+        2,
+        "两个子件都进 unresolved_targets（A-only 子件也保留以供前端弹窗）"
+    );
+
+    // 按 part_id 排序后断言每个子件的 attachable / available
+    let mut by_pid: std::collections::HashMap<i64, &Value> =
+        std::collections::HashMap::new();
+    for t in unresolved {
+        let pid: i64 = t["part_id"].as_str().unwrap().parse().unwrap();
+        by_pid.insert(pid, t);
+    }
+
+    // 子件 1 [A,A]：attachable=2, available=0
+    let t1 = by_pid
+        .get(&child1_pid)
+        .expect("子件 1 应在 unresolved_targets 中");
+    assert_eq!(t1["serial_no"], "CMA0001");
+    let a1 = t1["attachable_batches"]
+        .as_array()
+        .expect("子件 1 attachable_batches");
+    assert_eq!(a1.len(), 2, "子件 1 全部 A 组 → attachable_batches=2");
+    let a1_ids: Vec<String> = a1
+        .iter()
+        .map(|b| b["batch_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(a1_ids.contains(&c1_a1.to_string()));
+    assert!(a1_ids.contains(&c1_a2.to_string()));
+    for b in a1 {
+        assert_eq!(b["status"], "READY_TO_SHIP");
+        assert!(b["version"].is_i64(), "version 字段必须存在");
+    }
+    let v1 = t1["available_batches"]
+        .as_array()
+        .expect("子件 1 available_batches");
+    assert_eq!(v1.len(), 0, "子件 1 无 B 组 → available_batches=空");
+
+    // 子件 2 [B,B]：attachable=0, available=2
+    let t2 = by_pid
+        .get(&child2_pid)
+        .expect("子件 2 应在 unresolved_targets 中");
+    assert_eq!(t2["serial_no"], "CMB0001");
+    let a2 = t2["attachable_batches"]
+        .as_array()
+        .expect("子件 2 attachable_batches");
+    assert_eq!(a2.len(), 0, "子件 2 无 A 组 → attachable_batches=空");
+    let v2 = t2["available_batches"]
+        .as_array()
+        .expect("子件 2 available_batches");
+    assert_eq!(v2.len(), 2, "子件 2 全部 B 组 → available_batches=2");
+    let v2_ids: Vec<String> = v2
+        .iter()
+        .map(|b| b["batch_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(v2_ids.contains(&c2_b1.to_string()));
+    assert!(v2_ids.contains(&c2_b2.to_string()));
+    for b in v2 {
+        assert_eq!(b["status"], "PENDING");
+        assert!(b["version"].is_i64(), "version 字段必须存在");
+    }
+
+    // DB 校验：所有 4 个批次都未挂单（PARTIAL_ADDED 不写 DB）
+    for bid in [c1_a1, c1_a2, c2_b1, c2_b2] {
+        let dn_id: Option<i64> =
+            sqlx::query_scalar("SELECT delivery_note_id FROM t_part_batch WHERE id = $1")
+                .bind(bid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            dn_id.is_none(),
+            "PARTIAL_ADDED 下 batch {bid} 不应挂单；got dn_id={dn_id:?}"
+        );
+    }
+
+    assert_eq!(env["data"]["note"]["status"], "DRAFT");
+    assert_eq!(env["data"]["note"]["line_count"], 0);
+}
+
+/// 2026-08-31：装配件 per-child had_invalid 不对称——1 子件原始含 C（C 过滤），
+/// 另 1 子件纯 A。两者都应进 unresolved_targets，每个子件都正确携带 attachable_batches。
+///
+/// 这是 Task 4+7 review 发现的回归保护缺口（不对称 had_invalid 拓扑）：
+/// child_a = [A, A, C@WORKER]（C 静默过滤后剩 2 个 A）；
+/// child_b = [A]（纯 A）。
+/// 两个子件都应进 unresolved_targets，且各自 attachable_batches 独立携带正确批次。
+#[tokio::test]
+async fn scan_assembly_asymmetric_had_invalid_per_child_returns_partial_added() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "法拉电子", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let asm_id = insert_assembly(
+        &pool,
+        l2,
+        "ASM-ASYM",
+        "ASM-ASYM-DWG",
+        "A+C@WORKER vs A 不对称",
+    )
+    .await;
+
+    // 子件 a：[A, A, C@WORKER] → C 在 had_invalid 路径被静默过滤
+    let child_a = insert_part(&pool, "ChildAsym-A", l2, Some("CAA0001"), Some(asm_id)).await;
+    let a1 = create_test_batch_at(&pool, child_a, 1, "INSPECTION", None, None).await;
+    let a2 = create_test_batch_at(&pool, child_a, 2, "INSPECTION", None, None).await;
+    let c1 =
+        create_test_batch_at(&pool, child_a, 3, "IN_PROCESS", Some(99), Some("WORKER")).await;
+
+    // 子件 b：纯 [A]
+    let child_b = insert_part(&pool, "ChildAsym-B", l2, Some("CAB0001"), Some(asm_id)).await;
+    let a3 = create_test_batch_at(&pool, child_b, 1, "INSPECTION", None, None).await;
+
+    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/delivery-notes/scan",
+            Some(json!({"code": "ASM-ASYM"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "装配件 A+C(不对称) + A: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["outcome"],
+        "PARTIAL_ADDED",
+        "装配+非纯A 或 任一子件含 C → PARTIAL_ADDED；got: {env}"
+    );
+    assert_eq!(env["data"]["resolved"]["kind"], "ASSEMBLY");
+
+    // 关键断言：PARTIAL_ADDED 下 A 组不再自动 attach
+    assert_eq!(
+        env["data"]["added_batches"].as_array().unwrap().len(),
+        0,
+        "PARTIAL_ADDED 下 A 组不自动 attach"
+    );
+
+    // 两个子件都进 unresolved_targets（C 过滤对每个子件独立）
+    let unresolved = env["data"]["unresolved_targets"]
+        .as_array()
+        .expect("unresolved_targets 应为数组");
+    assert_eq!(
+        unresolved.len(),
+        2,
+        "两个子件都进 unresolved_targets（child_a 含 C 但 had_invalid 后仍保留）"
+    );
+
+    // 按 part_id 分类断言每个子件的 attachable / available
+    let mut by_pid: std::collections::HashMap<i64, &Value> =
+        std::collections::HashMap::new();
+    for t in unresolved {
+        let pid: i64 = t["part_id"].as_str().unwrap().parse().unwrap();
+        by_pid.insert(pid, t);
+    }
+
+    // child_a：C 过滤后剩 a1+a2 两个 A → attachable_batches=2，available=空
+    let t_a = by_pid
+        .get(&child_a)
+        .expect("child_a 应在 unresolved_targets 中");
+    assert_eq!(t_a["serial_no"], "CAA0001");
+    let att_a = t_a["attachable_batches"]
+        .as_array()
+        .expect("child_a attachable_batches");
+    assert_eq!(
+        att_a.len(),
+        2,
+        "child_a C 过滤后剩 2 个 A → attachable_batches=2"
+    );
+    let att_a_ids: Vec<String> = att_a
+        .iter()
+        .map(|b| b["batch_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(att_a_ids.contains(&a1.to_string()));
+    assert!(att_a_ids.contains(&a2.to_string()));
+    for b in att_a {
+        assert_eq!(b["status"], "INSPECTION");
+        assert!(b["version"].is_i64(), "version 字段必须存在");
+    }
+    let av_a = t_a["available_batches"]
+        .as_array()
+        .expect("child_a available_batches");
+    assert_eq!(av_a.len(), 0, "child_a 无 B 组 → available_batches=空");
+
+    // child_b：纯 A 单 a3 → attachable_batches=1，available=空
+    let t_b = by_pid
+        .get(&child_b)
+        .expect("child_b 应在 unresolved_targets 中");
+    assert_eq!(t_b["serial_no"], "CAB0001");
+    let att_b = t_b["attachable_batches"]
+        .as_array()
+        .expect("child_b attachable_batches");
+    assert_eq!(att_b.len(), 1, "child_b 纯 A → attachable_batches=1");
+    assert_eq!(att_b[0]["batch_id"].as_str().unwrap(), a3.to_string());
+    assert_eq!(att_b[0]["status"], "INSPECTION");
+    assert!(att_b[0]["version"].is_i64(), "version 字段必须存在");
+    let av_b = t_b["available_batches"]
+        .as_array()
+        .expect("child_b available_batches");
+    assert_eq!(av_b.len(), 0, "child_b 无 B 组 → available_batches=空");
+
+    // DB 校验：c1 状态保持 IN_PROCESS（C 在 had_invalid 路径不动 DB）；
+    // a1/a2/a3 都不挂单（PARTIAL_ADDED 不写 attachment）
+    let c_status: String =
+        sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+            .bind(c1)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        c_status, "IN_PROCESS",
+        "C 批次 c1 在 had_invalid 路径下状态不变"
+    );
+
+    for bid in [a1, a2, a3] {
+        let dn_id: Option<i64> =
+            sqlx::query_scalar("SELECT delivery_note_id FROM t_part_batch WHERE id = $1")
+                .bind(bid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            dn_id.is_none(),
+            "PARTIAL_ADDED 下 batch {bid} 不应挂单；got dn_id={dn_id:?}"
+        );
+    }
+
+    assert_eq!(env["data"]["note"]["status"], "DRAFT");
+    assert_eq!(env["data"]["note"]["line_count"], 0);
 }

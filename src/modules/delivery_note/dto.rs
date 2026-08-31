@@ -595,6 +595,10 @@ pub struct UnresolvedTargetDto {
     pub drawing_no: String,
     pub name: String,
     pub available_batches: Vec<AvailableBatchDto>,
+    /// A 组（可直接 attach）；CandidatesAvailable / PartialAdded 时携带，
+    /// Added / AlreadyPresent 时为空 Vec。
+    /// 字段与 AvailableBatchDto 同形状，独立成 DTO 便于未来扩展差异。
+    pub attachable_batches: Vec<AttachableBatchDto>,
 }
 
 /// B 组候选批次（`unresolved_targets[i].available_batches[]`）。
@@ -607,6 +611,20 @@ pub struct AvailableBatchDto {
     pub batch_id: i64,
     pub version: i32,
     pub quantity: i32,
+    pub status: BatchStatusDto,
+}
+
+/// A 组候选批次（`unresolved_targets[i].attachable_batches[]`），
+/// CandidatesAvailable / PartialAdded 时随 available_batches 一起返回
+/// 供前端弹窗勾选 attach（前端选中后转发到 `POST /delivery-notes/{id}/add-parts`）。
+/// 字段与 AvailableBatchDto 同形状，独立成 DTO 便于未来扩展差异。
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachableBatchDto {
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub batch_id: i64,
+    pub version: i32,
+    pub quantity: i32,
+    /// 仅 INSPECTION / READY_TO_SHIP（A 组定义）
     pub status: BatchStatusDto,
 }
 
@@ -664,4 +682,59 @@ pub struct SubmitDeliveryOut {
     pub note: Option<DeliveryNoteOut>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unresolved_targets: Option<Vec<UnresolvedTargetDto>>,
+}
+
+// ===========================================================================
+//  attach_batches 入参 / 出参（POST /delivery-notes/{id}/attach-batches）
+// ===========================================================================
+
+/// `POST /api/v2/delivery-notes/{note_id}/attach-batches` 请求体。
+///
+/// 弹窗勾选若干 A 组批次（INSPECTION / READY_TO_SHIP）一次性 attach 到指定
+/// DRAFT 送货单。每个 item 带 `version`（OCC 校验）；后端逐项独立处理：
+/// 失败项进入响应 `conflicts` 列表，不中断其它项；最终返回 200。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttachBatchesRequest {
+    pub batches: Vec<AttachBatchItem>,
+}
+
+/// 单个批次入参。
+///
+/// `batch_id` 用字符串反序列化（与 `t_part_batch.id` 列一致；前端 JSON 用
+/// 字符串防 JS 精度截断），`version` 是 t_part_batch 当前乐观锁版本。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AttachBatchItem {
+    #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
+    pub batch_id: i64,
+    pub version: i32,
+}
+
+/// `POST /api/v2/delivery-notes/{note_id}/attach-batches` 响应。
+///
+/// 即使部分失败也始终返回 200，前端按 `conflicts` 列表做差异处理：
+/// - 全失败：`attached=0`、`conflicts` 非空
+/// - 部分失败：`attached>0`、`conflicts` 列出失败项
+/// - 全部成功：`attached=n`、`conflicts=[]`
+///
+/// `note_id` 本身非 DRAFT（409）属于硬错误，不入本结构；OCC / 状态非法 /
+/// 重复 attach / 批次不存在 / 跨单等均在 `conflicts[].reason` 中以字符串表达。
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachBatchesOut {
+    pub attached: usize,
+    pub conflicts: Vec<AttachBatchConflict>,
+}
+
+/// 单个失败项（attach_batches 响应）。
+///
+/// `reason` 是稳定的 SCREAMING_SNAKE_CASE 字符串，便于前端 i18n / 分类：
+/// - `BATCH_NOT_FOUND` — 批次 id 不存在 / 已软删
+/// - `ALREADY_ATTACHED` — `delivery_note_id IS NOT NULL`（已挂在某张单上）
+/// - `INVALID_STATE:<STATUS>` — 批次当前 status 不在 A 组
+///   （`INSPECTION` / `READY_TO_SHIP`）；尖括号内为原 status 值
+/// - `VERSION_CONFLICT` — item.version 与 DB 不一致（OCC 失败）
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachBatchConflict {
+    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
+    pub batch_id: i64,
+    pub reason: String,
 }
