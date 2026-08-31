@@ -29,8 +29,8 @@ use crate::infra::ws_hub::WsEvent;
 #[allow(unused_imports)] // BatchOpFailure mandated by brief; accessed transitively via BatchToXxxOut field pattern matching.
 use crate::modules::part::dto::{
     BatchOpFailure, BatchToInspectionRequest, BatchToShipRequest, BatchToXxxOut, PartOut,
-    ToInspectionRequest, ToProcessRequest, ToShipRequest, ToXxxOut, WorkerScanOut,
-    WorkerScanRequest,
+    PartScanContextOut, ToInspectionRequest, ToProcessRequest, ToShipRequest, ToXxxOut,
+    WorkerScanOut, WorkerScanRequest,
 };
 use crate::modules::part::service::{PartService, BATCH_TO_SHIP_MAX_ITEMS};
 use crate::modules::worker_pool::service::WorkerPoolService;
@@ -411,6 +411,23 @@ pub async fn get_by_serial(
     current.require_any_role(LIST_PART_ROLES)?;
     let mut tx = state.pool.begin().await?;
     let out = PartService::get_part_by_serial(&mut tx, &serial_no, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/by-serial/{serial_no}/part-batches
+///
+/// 扫码快捷品检上下文：返回工单窄字段（8 列 + id）+ 全部活跃批次（含 holder 名称）。
+/// 前端扫码弹窗据此拼 `POST /parts/{part_id}/to-ship` 的 `{ batch_id, version }`。
+/// 与 `get_by_serial`（`PartDetailOut` 28 列）并存，互不替代。
+pub async fn get_by_serial_part_batches(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(serial_no): Path<String>,
+) -> Result<Json<R<PartScanContextOut>>, AppError> {
+    current.require_any_role(LIST_PART_ROLES)?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::get_part_batches_by_serial(&mut tx, &serial_no, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
