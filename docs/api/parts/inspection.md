@@ -430,11 +430,11 @@ Response 200 `data`：`PartScanContextOut`
 
 实现位置：
 
-- handler：`src/modules/part/handler.rs` (`by_serial_part_batches` 路由 → `PartScanContextOut`)
-- service：`src/modules/part/service/crud.rs`（`get_scan_context_by_serial`）
+- handler：`src/modules/part/handler.rs::get_by_serial_part_batches` (line 423) → `PartScanContextOut`
+- service：`src/modules/part/service/crud.rs::get_part_batches_by_serial` (line 366)
 - dto：`src/modules/part/dto.rs`（`PartScanContextOut` / `PartScanInfoOut` / `PartBatchScanOut`）
-- repo（批次 + holder 名称）：`src/modules/part_batch/repo.rs`（`list_active_with_holder_by_part_id`，LEFT JOIN `t_worker` / `t_shelf` 拼 holder_name）
-- repo（part）：`src/modules/part/repo.rs::find_by_serial_no`
+- repo（批次 + holder 名称）：`src/modules/part_batch/repo.rs::list_active_by_part_id_with_holder` (line 547)，LEFT JOIN `t_worker` / `t_shelf` 拼 holder_name
+- repo（part）：`src/modules/part/repo/part.rs::get_by_serial` (line 140)
 - model：`src/modules/part_batch/model.rs::TPartBatch`（批次行 + 状态枚举）
 
 ---
