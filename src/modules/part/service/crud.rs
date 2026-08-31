@@ -12,12 +12,16 @@
 use sqlx::PgConnection;
 use std::sync::Arc;
 
+use chrono::NaiveDate;
+
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::customer::repo::CustomerRepo;
+use crate::modules::part::dto::{PartBatchScanOut, PartScanContextOut, PartScanInfoOut};
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::part::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part::repo::PartRepo;
+use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::repo::{hash_bytes, NewPartFile, PartFileRepo};
 use crate::shared::error::{code, AppError};
@@ -28,6 +32,25 @@ use super::super::dto_crud::{
     PartListQuery, PartUpdateRequest,
 };
 use super::{BATCH_CREATE_PARTS_MAX_ITEMS, PartService};
+
+/// 扫码快捷品检上下文内部 FromRow 结构。
+///
+/// 仅本 crate 可见：`get_part_batches_by_serial` 用 `sqlx::query_as!` 接收
+/// `t_part` 的窄字段（id + 8 列），避免读 28 列 `TPart`。由
+/// `PartScanInfoOut::from` 转 DTO，转换实现位于 `src/modules/part/dto.rs`
+/// （与 DTO 同处，便于维护）。
+#[derive(sqlx::FromRow)]
+pub(crate) struct TPartScanRow {
+    pub(crate) id: i64,
+    pub(crate) drawing_no: String,
+    pub(crate) name: String,
+    pub(crate) quantity: i32,
+    pub(crate) customer_id: i64,
+    pub(crate) system_delivery_date: Option<NaiveDate>,
+    pub(crate) is_urgent: bool,
+    pub(crate) order_no: Option<String>,
+    pub(crate) note: Option<String>,
+}
 
 impl PartService {
     pub async fn create_part(
@@ -332,6 +355,58 @@ impl PartService {
                 )
             })?;
         Self::get_part(conn, p.id, current).await
+    }
+
+    /// 扫码快捷品检上下文：通过 serial 查工单窄字段 + 全部活跃批次（含 holder 名称）。
+    ///
+    /// 权限与 `get_part_by_serial` 一致（Manager / Clerk / Inspector / CncProgrammer）。
+    /// 用于前端扫码弹窗，让用户直接看到批次（id + quantity + status + holder +
+    /// version）并据此拼出 `POST /parts/{part_id}/to-ship` 的 `{ batch_id, version }`
+    /// 入参。
+    pub async fn get_part_batches_by_serial(
+        conn: &mut PgConnection,
+        serial_no: &str,
+        current: &CurrentUser,
+    ) -> Result<PartScanContextOut, AppError> {
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
+
+        // ① 查工单窄字段（仅 8 列 + id，避免读 28 列）
+        let part = sqlx::query_as!(
+            TPartScanRow,
+            r#"
+            SELECT id, drawing_no, name, quantity, customer_id,
+                   system_delivery_date, is_urgent, order_no, note
+            FROM t_part
+            WHERE serial_no = $1 AND deleted_at IS NULL
+            "#,
+            serial_no,
+        )
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_NOT_FOUND,
+                format!("serial_no {serial_no} 不存在"),
+            )
+        })?;
+
+        // ② 查全部活跃批次（含 holder 名称）
+        let batches =
+            PartBatchRepo::list_active_by_part_id_with_holder(&mut *conn, part.id).await?;
+
+        // ③ 拼 DTO
+        Ok(PartScanContextOut {
+            part: PartScanInfoOut::from(part),
+            batches: batches
+                .into_iter()
+                .map(PartBatchScanOut::from)
+                .collect(),
+        })
     }
 
     pub async fn update_part(

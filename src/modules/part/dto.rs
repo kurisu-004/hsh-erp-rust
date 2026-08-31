@@ -334,3 +334,34 @@ pub struct PartScanContextOut {
     pub part: PartScanInfoOut,
     pub batches: Vec<PartBatchScanOut>,
 }
+
+/// `PartScanInfoOut::from(TPartScanRow)`：service 内私有窄字段 FromRow
+/// (`src/modules/part/service/crud.rs::TPartScanRow`) → DTO 字段对拷。
+impl From<crate::modules::part::service::crud::TPartScanRow> for PartScanInfoOut {
+    fn from(p: crate::modules::part::service::crud::TPartScanRow) -> Self {
+        Self {
+            id: p.id,
+            drawing_no: p.drawing_no,
+            name: p.name,
+            quantity: p.quantity,
+            customer_id: p.customer_id,
+            system_delivery_date: p.system_delivery_date,
+            is_urgent: p.is_urgent,
+            order_no: p.order_no,
+            note: p.note,
+        }
+    }
+}
+
+/// `PartBatchScanOut::from(PartBatchScanRow)`：repo 解析出的批次窄字段 → DTO。
+impl From<crate::modules::part_batch::model::PartBatchScanRow> for PartBatchScanOut {
+    fn from(p: crate::modules::part_batch::model::PartBatchScanRow) -> Self {
+        Self {
+            id: p.id,
+            quantity: p.quantity,
+            status: p.status,
+            holder_name: p.holder_name,
+            version: p.version,
+        }
+    }
+}
