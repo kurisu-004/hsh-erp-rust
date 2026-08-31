@@ -1,0 +1,366 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                pb.id              AS \"pb_id!\",\n                pb.part_id         AS \"pb_part_id!\",\n                pb.batch_no        AS \"pb_batch_no!\",\n                pb.quantity        AS \"pb_quantity!\",\n                pb.status          AS \"pb_status!\",\n                pb.location        AS \"pb_location?\",\n                pb.version         AS \"pb_version!\",\n                pb.placed_at       AS \"pb_placed_at?\",\n                pb.has_been_repaired AS \"pb_has_been_repaired!\",\n                pb.parent_batch_id AS \"pb_parent_batch_id?\",\n                pb.current_holder_id AS \"pb_current_holder_id?\",\n                pb.next_process_id AS \"pb_next_process_id?\",\n                pb.delivery_note_id AS \"pb_delivery_note_id?\",\n                p.serial_no        AS \"p_serial_no?\",\n                p.drawing_no       AS \"p_drawing_no!\",\n                p.name             AS \"p_name!\",\n                p.order_no         AS \"p_order_no?\",\n                p.planned_delivery_date AS \"p_planned_delivery_date!\",\n                p.is_urgent        AS \"p_is_urgent!\",\n                p.version          AS \"p_version!\",\n                p.created_at       AS \"p_created_at!\",\n                p.updated_at       AS \"p_updated_at!\",\n                p.customer_id      AS \"p_customer_id!\",\n                c.name             AS \"c_name?\",\n                c.parent_id        AS \"c_parent_id?\",\n                pc.name            AS \"pc_name?\",\n                COALESCE(s.name, w.name, oc.name) AS \"holder_name?\",\n                np.name            AS \"np_name?\",\n                dn.delivery_note_no AS \"dn_no?\"\n            FROM t_part_batch pb\n            JOIN t_part p\n              ON p.id = pb.part_id\n            JOIN t_customer c\n              ON c.id = p.customer_id\n            LEFT JOIN t_customer pc\n              ON pc.id = c.parent_id\n            LEFT JOIN t_shelf s\n              ON s.id = pb.current_holder_id\n            LEFT JOIN t_worker w\n              ON w.id = pb.current_holder_id\n            LEFT JOIN t_outsource_company oc\n              ON oc.id = pb.current_holder_id\n            LEFT JOIN t_process np\n              ON np.id = pb.next_process_id\n            LEFT JOIN t_delivery_note dn\n              ON dn.id = pb.delivery_note_id\n            WHERE pb.status = ANY($1)\n              AND pb.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n              AND p.customer_id = ANY($2)\n              AND ($3::text IS NULL\n                   OR p.drawing_no ILIKE $3\n                   OR p.name       ILIKE $3\n                   OR p.serial_no  ILIKE $3\n                   OR p.order_no   ILIKE $3)\n              AND ($4::text IS NULL OR p.serial_no ILIKE $4)\n              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)\n              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)\n            ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, pb.id ASC\n            LIMIT $7 OFFSET $8\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "pb_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "pb_part_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "part_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "pb_batch_no!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "batch_no"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "pb_quantity!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "pb_status!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "pb_location?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "pb_version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "pb_placed_at?",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "placed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "pb_has_been_repaired!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "has_been_repaired"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "pb_parent_batch_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "parent_batch_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "pb_current_holder_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "current_holder_id"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "pb_next_process_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "next_process_id"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "pb_delivery_note_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "delivery_note_id"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "p_serial_no?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "serial_no"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "p_drawing_no!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "drawing_no"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "p_name!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "p_order_no?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "order_no"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "p_planned_delivery_date!",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "planned_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "p_is_urgent!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "is_urgent"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "p_version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "p_created_at!",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "p_updated_at!",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "p_customer_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "customer_id"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "c_name?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_customer",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
+        "name": "c_parent_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_customer",
+            "name": "parent_id"
+          }
+        }
+      },
+      {
+        "ordinal": 25,
+        "name": "pc_name?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_customer",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 26,
+        "name": "holder_name?",
+        "type_info": "Varchar",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 27,
+        "name": "np_name?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 28,
+        "name": "dn_no?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_delivery_note",
+            "name": "delivery_note_no"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "Int8Array",
+        "Text",
+        "Text",
+        "Date",
+        "Date",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      null,
+      false,
+      false
+    ]
+  },
+  "hash": "66b7f4d3279f63b0f923b718f6761eadaee782471ec0ffdba21191b714ecdc25"
+}
