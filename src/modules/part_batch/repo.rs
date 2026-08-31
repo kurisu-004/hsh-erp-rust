@@ -541,7 +541,7 @@ impl PartBatchRepo {
     }
 
     /// Scan context 专用：返回工单全部活跃批次 + 持有人/货架**名称**（已解析）。
-    /// `holder_name` 通过 `COALESCE(t_shelf.name, t_user.full_name, t_worker.name)` 解析，
+    /// `holder_name` 通过 `COALESCE(t_shelf.name, t_worker.name, t_outsource_company.name)` 解析，
     /// 适用于 `current_holder_id` 多态（shelf / worker / outsource 的 holder_id）。
     /// 按 `batch_no ASC` 排序，frontend 可直接渲染顺序。
     pub async fn list_active_by_part_id_with_holder<'e, E: PgExecutor<'e>>(
@@ -555,11 +555,11 @@ impl PartBatchRepo {
                 pb.quantity AS "quantity!",
                 pb.status   AS "status!",
                 pb.version  AS "version!",
-                COALESCE(s.name, u.full_name, w.name) AS "holder_name?"
+                COALESCE(s.name, w.name, oc.name) AS "holder_name?"
             FROM t_part_batch pb
-            LEFT JOIN t_shelf  s ON s.id = pb.current_holder_id
-            LEFT JOIN t_user   u ON u.id = pb.current_holder_id
-            LEFT JOIN t_worker w ON w.id = pb.current_holder_id
+            LEFT JOIN t_shelf            s  ON s  .id = pb.current_holder_id
+            LEFT JOIN t_worker           w  ON w  .id = pb.current_holder_id
+            LEFT JOIN t_outsource_company oc ON oc.id = pb.current_holder_id
             WHERE pb.part_id = $1 AND pb.deleted_at IS NULL
             ORDER BY pb.batch_no ASC
             "#,

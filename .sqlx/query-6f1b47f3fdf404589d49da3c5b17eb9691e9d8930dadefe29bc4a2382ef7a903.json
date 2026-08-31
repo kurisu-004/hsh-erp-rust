@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                pb.id       AS \"id!\",\n                pb.quantity AS \"quantity!\",\n                pb.status   AS \"status!\",\n                pb.version  AS \"version!\",\n                COALESCE(s.name, u.full_name, w.name) AS \"holder_name?\"\n            FROM t_part_batch pb\n            LEFT JOIN t_shelf  s ON s.id = pb.current_holder_id\n            LEFT JOIN t_user   u ON u.id = pb.current_holder_id\n            LEFT JOIN t_worker w ON w.id = pb.current_holder_id\n            WHERE pb.part_id = $1 AND pb.deleted_at IS NULL\n            ORDER BY pb.batch_no ASC\n            ",
+  "query": "\n            SELECT\n                pb.id       AS \"id!\",\n                pb.quantity AS \"quantity!\",\n                pb.status   AS \"status!\",\n                pb.version  AS \"version!\",\n                COALESCE(s.name, w.name, oc.name) AS \"holder_name?\"\n            FROM t_part_batch pb\n            LEFT JOIN t_shelf            s  ON s  .id = pb.current_holder_id\n            LEFT JOIN t_worker           w  ON w  .id = pb.current_holder_id\n            LEFT JOIN t_outsource_company oc ON oc.id = pb.current_holder_id\n            WHERE pb.part_id = $1 AND pb.deleted_at IS NULL\n            ORDER BY pb.batch_no ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -67,5 +67,5 @@
       null
     ]
   },
-  "hash": "695a23fd690f533073d085debf6871c4658bc6297ef81f7c831d0aa32f617664"
+  "hash": "6f1b47f3fdf404589d49da3c5b17eb9691e9d8930dadefe29bc4a2382ef7a903"
 }
