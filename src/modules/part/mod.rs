@@ -37,6 +37,12 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/batch-to-ship", post(handler::batch_to_ship))
         .route("/batch-to-inspection", post(handler::batch_to_inspection))
+        // inspection 列表（status 筛选）也必须在 /{part_id} 之前注册，
+        // 否则 axum 会把 `inspection-batches` 解析成 part_id 的 catch-all。
+        .route(
+            "/inspection-batches",
+            get(handler::list_inspection_batches),
+        )
         // worker-scan 静态段也必须在 /{part_id}/... 之前注册，
         // 否则 axum 会把 `worker-scan` 解析成 part_id=... 的 catch-all。
         .route("/worker-scan", post(handler::worker_scan))
