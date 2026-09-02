@@ -1,14 +1,18 @@
 //! assembly 状态机
 //!
-//! 对应 Python myERP/statemachines/assembly_statemachine.py。
+//! 对应 Python myERP/statemachines/assembly_statemachine.py（2026-08-03 起 7 态扩展）。
 //!
-//! 状态转移白名单（参考 part 状态机模式）：
-//! - PENDING    → IN_PROCESS | CANCELLED
-//! - IN_PROCESS → COMPLETED  | CANCELLED
-//! - COMPLETED  → 终态（self-loop / 反向 / 跨度过渡均拒绝）
-//! - CANCELLED  → 终态
+//! 状态转移白名单：
+//! - PENDING        → IN_PROCESS | CANCELLED
+//! - IN_PROCESS     → INSPECTION | COMPLETED | CANCELLED
+//! - INSPECTION     → READY_TO_SHIP | CANCELLED
+//! - READY_TO_SHIP  → DELIVERED | CANCELLED
+//! - DELIVERED      → COMPLETED | CANCELLED
+//! - COMPLETED      → 终态（self-loop / 反向 / 跨度过渡均拒绝）
+//! - CANCELLED      → 终态
 //!
-//! 注意：与 part 域不同，assembly 不走 inspection / 状态机扩展点，统一在此 enum 表达。
+//! 2026-09 Rust 端对齐 Python 的 7 态：新增 INSPECTION / READY_TO_SHIP / DELIVERED。
+//! 与 part 域不同——assembly 的 rollup 跟随子件进度跨越 INSPECTION / READY_TO_SHIP / DELIVERED。
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +21,12 @@ use serde::{Deserialize, Serialize};
 pub enum AssemblyStatus {
     PENDING,
     IN_PROCESS,
+    /// 2026-09 扩展：任一子件进入 INSPECTION 时父件跟随；对齐 Python `AssemblyStatus.INSPECTION`。
+    INSPECTION,
+    /// 2026-09 扩展：任一子件进入 READY_TO_SHIP 时父件跟随；对齐 Python。
+    READY_TO_SHIP,
+    /// 2026-09 扩展：任一子件进入 DELIVERED 时父件跟随；对齐 Python。
+    DELIVERED,
     COMPLETED,
     CANCELLED,
 }
@@ -29,6 +39,9 @@ impl AssemblyStatus {
         match s {
             "PENDING" => Some(Self::PENDING),
             "IN_PROCESS" => Some(Self::IN_PROCESS),
+            "INSPECTION" => Some(Self::INSPECTION),
+            "READY_TO_SHIP" => Some(Self::READY_TO_SHIP),
+            "DELIVERED" => Some(Self::DELIVERED),
             "COMPLETED" => Some(Self::COMPLETED),
             "CANCELLED" => Some(Self::CANCELLED),
             _ => None,
@@ -39,6 +52,9 @@ impl AssemblyStatus {
         match self {
             Self::PENDING => "PENDING",
             Self::IN_PROCESS => "IN_PROCESS",
+            Self::INSPECTION => "INSPECTION",
+            Self::READY_TO_SHIP => "READY_TO_SHIP",
+            Self::DELIVERED => "DELIVERED",
             Self::COMPLETED => "COMPLETED",
             Self::CANCELLED => "CANCELLED",
         }
@@ -48,8 +64,17 @@ impl AssemblyStatus {
         use AssemblyStatus::*;
         matches!(
             (self, to),
+            // 原有：4 条
             (PENDING, IN_PROCESS) | (PENDING, CANCELLED)
                 | (IN_PROCESS, COMPLETED) | (IN_PROCESS, CANCELLED)
+            // 2026-09 新增：跟随子件派生态 + 取消
+                | (IN_PROCESS, INSPECTION)
+                | (INSPECTION, READY_TO_SHIP)
+                | (READY_TO_SHIP, DELIVERED)
+                | (DELIVERED, COMPLETED)
+                | (INSPECTION, CANCELLED)
+                | (READY_TO_SHIP, CANCELLED)
+                | (DELIVERED, CANCELLED)
         )
     }
 }
@@ -63,6 +88,9 @@ mod tests {
         for s in [
             AssemblyStatus::PENDING,
             AssemblyStatus::IN_PROCESS,
+            AssemblyStatus::INSPECTION,
+            AssemblyStatus::READY_TO_SHIP,
+            AssemblyStatus::DELIVERED,
             AssemblyStatus::COMPLETED,
             AssemblyStatus::CANCELLED,
         ] {
@@ -83,6 +111,12 @@ mod tests {
         assert!(PENDING.can_transition_to(CANCELLED));
         assert!(IN_PROCESS.can_transition_to(COMPLETED));
         assert!(IN_PROCESS.can_transition_to(CANCELLED));
+        assert!(IN_PROCESS.can_transition_to(INSPECTION));
+        assert!(INSPECTION.can_transition_to(READY_TO_SHIP));
+        assert!(READY_TO_SHIP.can_transition_to(DELIVERED));
+        assert!(DELIVERED.can_transition_to(COMPLETED));
+        assert!(INSPECTION.can_transition_to(CANCELLED));
+        assert!(READY_TO_SHIP.can_transition_to(CANCELLED));
     }
 
     #[test]
@@ -90,6 +124,9 @@ mod tests {
         use AssemblyStatus::*;
         assert!(!PENDING.can_transition_to(PENDING));
         assert!(!IN_PROCESS.can_transition_to(IN_PROCESS));
+        assert!(!INSPECTION.can_transition_to(INSPECTION));
+        assert!(!READY_TO_SHIP.can_transition_to(READY_TO_SHIP));
+        assert!(!DELIVERED.can_transition_to(DELIVERED));
         assert!(!COMPLETED.can_transition_to(COMPLETED));
         assert!(!CANCELLED.can_transition_to(CANCELLED));
     }
@@ -108,6 +145,22 @@ mod tests {
         use AssemblyStatus::*;
         assert!(!PENDING.can_transition_to(COMPLETED));
         assert!(!IN_PROCESS.can_transition_to(PENDING));
+        assert!(!INSPECTION.can_transition_to(COMPLETED));
+        assert!(!INSPECTION.can_transition_to(DELIVERED));
+    }
+
+    #[test]
+    fn allowed_cancel_from_all_states() {
+        use AssemblyStatus::*;
+        // 5 条 cancel 边：PENDING / IN_PROCESS / INSPECTION / READY_TO_SHIP / DELIVERED → CANCELLED
+        assert!(PENDING.can_transition_to(CANCELLED));
+        assert!(IN_PROCESS.can_transition_to(CANCELLED));
+        assert!(INSPECTION.can_transition_to(CANCELLED));
+        assert!(READY_TO_SHIP.can_transition_to(CANCELLED));
+        assert!(DELIVERED.can_transition_to(CANCELLED));
+        // COMPLETED / CANCELLED 不可再 cancel
+        assert!(!COMPLETED.can_transition_to(CANCELLED));
+        assert!(!CANCELLED.can_transition_to(CANCELLED));
     }
 }
 
@@ -127,14 +180,16 @@ fn part_status_progress(s: &str) -> u8 {
 }
 
 /// Aggregate child statuses into target assembly status (mirrors Python
-/// `service/_assembly_rollup.py::recompute_assembly_status`, collapsed to
-/// Rust's 4-state AssemblyStatus enum).
+/// `service/_assembly_rollup.py::recompute_assembly_status` and its
+/// `ASSEMBLY_ROLLUP_TARGET` dict; 2026-09 Rust 端对齐 7 态）。
 ///
 /// Rules (in order):
 /// 1. Empty input → `None` (caller decides no-op).
 /// 2. All children CANCELLED → `Some(CANCELLED)`.
 /// 3. All non-CANCELLED children COMPLETED → `Some(COMPLETED)`.
-/// 4. Else `min(progress[child])` over non-terminal, non-cancelled → PENDING if 0 else IN_PROCESS.
+/// 4. Else `min(progress[child])` over non-terminal, non-cancelled → 依
+///    `part_status_progress` 0..6 映射到 7 态之一（PENDING / IN_PROCESS /
+///    INSPECTION / READY_TO_SHIP / DELIVERED），防御兜底 `IN_PROCESS`。
 pub fn compute_assembly_target<'a>(
     children_statuses: impl IntoIterator<Item = &'a str>,
 ) -> Option<AssemblyStatus> {
@@ -160,7 +215,16 @@ pub fn compute_assembly_target<'a>(
         .map(|s| part_status_progress(s))
         .min()
         .unwrap();
-    Some(if min_progress == 0 { PENDING } else { IN_PROCESS })
+    Some(match min_progress {
+        0 => PENDING,
+        1 => IN_PROCESS,
+        2 => IN_PROCESS,
+        3 => IN_PROCESS,
+        4 => INSPECTION,
+        5 => READY_TO_SHIP,
+        6 => DELIVERED,
+        _ => IN_PROCESS, // 防御兜底：未知子件 progress
+    })
 }
 
 #[cfg(test)]
@@ -210,14 +274,6 @@ mod rollup_tests {
     }
 
     #[test]
-    fn all_inspection_or_above_returns_in_process() {
-        assert_eq!(
-            compute_assembly_target(["INSPECTION", "READY_TO_SHIP", "DELIVERED"]),
-            Some(AssemblyStatus::IN_PROCESS)
-        );
-    }
-
-    #[test]
     fn cancelled_excluded_from_min() {
         // Without exclusion: min = CANCELLED. With exclusion: min = IN_PROCESS → IN_PROCESS.
         assert_eq!(
@@ -239,6 +295,30 @@ mod rollup_tests {
         assert_eq!(
             compute_assembly_target(["CANCELLED", "COMPLETED", "IN_PROCESS"]),
             Some(AssemblyStatus::IN_PROCESS)
+        );
+    }
+
+    #[test]
+    fn min_progress_four_returns_inspection() {
+        assert_eq!(
+            compute_assembly_target(["INSPECTION", "DELIVERED"]),
+            Some(AssemblyStatus::INSPECTION)
+        );
+    }
+
+    #[test]
+    fn min_progress_five_returns_ready_to_ship() {
+        assert_eq!(
+            compute_assembly_target(["READY_TO_SHIP", "DELIVERED"]),
+            Some(AssemblyStatus::READY_TO_SHIP)
+        );
+    }
+
+    #[test]
+    fn min_progress_six_returns_delivered() {
+        assert_eq!(
+            compute_assembly_target(["DELIVERED", "DELIVERED"]),
+            Some(AssemblyStatus::DELIVERED)
         );
     }
 }

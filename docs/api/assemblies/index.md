@@ -18,7 +18,7 @@
 | GET | `/api/v2/assemblies/{assembly_id}` | Manager / Clerk / Inspector / CncProgrammer | 详情（assembly + children parts + files 占位） | [`crud.md`](./crud.md#get-apiv2assembliesassembly_id) |
 | POST | `/api/v2/assemblies/{assembly_id}/update` | Manager / Clerk | 字段可选 UPDATE（含 `customer_id` 三态校验 + L2 校验，OCC） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idupdate) |
 | POST | `/api/v2/assemblies/{assembly_id}/soft-delete` | **Manager** | 软删（OCC） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idsoft-delete) |
-| POST | `/api/v2/assemblies/{assembly_id}/cancel` | Manager / Clerk | 取消（终态 COMPLETED/CANCELLED 禁 cancel） | [`cancel.md`](./cancel.md#post-apiv2assembliesassembly_idcancel) |
+| POST | `/api/v2/assemblies/{assembly_id}/cancel` | Manager / Clerk | 取消（终态 COMPLETED/CANCELLED 禁 cancel；非终态一律可 cancel） | [`cancel.md`](./cancel.md#post-apiv2assembliesassembly_idcancel) |
 
 > 路由顺序：`/{assembly_id}` 必须在 `/{assembly_id}/{action}` 之前注册；当前 `/{assembly_id}` 仅 `GET`，无静态冲突。
 
@@ -41,7 +41,7 @@
 | `planned_delivery_date` | date? | 计划交付日 |
 | `actual_delivery_date` | date? | 实际交付日 |
 | `is_urgent` | bool | 紧急标记 |
-| `status` | string | 状态枚举字符串（PENDING / IN_PROCESS / COMPLETED / CANCELLED） |
+| `status` | string | 状态枚举字符串（PENDING / IN_PROCESS / INSPECTION / READY_TO_SHIP / DELIVERED / COMPLETED / CANCELLED，2026-09 扩 7 态对齐 Python） |
 | `version` | i32 | 乐观锁 |
 | `serial_no` | string? | 主装配体序列号（无 PDF 时 None；格式 `{prefix}{counter:07}`） |
 | `quantity` | i32 | 数量 |
@@ -166,18 +166,17 @@
   - 空集 → noop
   - 全部 `CANCELLED` → 父 → `CANCELLED`
   - 全部非 `CANCELLED` 子件都是 `COMPLETED` → 父 → `COMPLETED`
-  - 其它 → 取非终态、非 `CANCELLED` 子件的最小 `progress`，对应映射（Rust 4 态压缩版）：
+  - 其它 → 取非终态、非 `CANCELLED` 子件的最小 `progress`，按 0..6 逐档映射父件（2026-09 7 态，对齐 Python）：
 
-  | part status | progress |
-  |---|---|
-  | `PENDING` | 0 |
-  | `PROGRAMMING` | 1 |
-  | `IN_PROCESS` / `REPAIRING` | 2 |
-  | `OUTSOURCE` | 3 |
-  | `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` | 4..6（均压成 `IN_PROCESS`） |
-
-  - `min_progress == 0` → 父 → `PENDING`
-  - 否则 → `IN_PROCESS`
+  | part status | progress | 父件状态 |
+  |---|---|---|
+  | `PENDING` | 0 | `PENDING` |
+  | `PROGRAMMING` | 1 | `IN_PROCESS` |
+  | `IN_PROCESS` / `REPAIRING` | 2 | `IN_PROCESS` |
+  | `OUTSOURCE` | 3 | `IN_PROCESS` |
+  | `INSPECTION` | 4 | `INSPECTION` |
+  | `READY_TO_SHIP` | 5 | `READY_TO_SHIP` |
+  | `DELIVERED` | 6 | `DELIVERED` |
 
 3. 目标 == 当前 → noop；否则 `UPDATE t_assembly SET status = $target, version = version + 1`，带 OCC + 终态守卫，0 行 → `40901 VERSION_CONFLICT`（事务回滚）。
 
@@ -192,9 +191,16 @@ WS 广播：每次实际翻状态 → commit 后下发 `ASSEMBLY_UPDATED`（payl
 | from | to | 触发场景 |
 |---|---|---|
 | PENDING | IN_PROCESS | 任一 inspection 流子件翻非 `PENDING`（auto-rollup） |
-| IN_PROCESS | COMPLETED | 所有子件翻 `COMPLETED`（auto-rollup） |
+| IN_PROCESS | INSPECTION | 任一子件进入 INSPECTION（auto-rollup） |
+| INSPECTION | READY_TO_SHIP | 任一子件进入 READY_TO_SHIP（auto-rollup） |
+| READY_TO_SHIP | DELIVERED | 任一子件进入 DELIVERED（auto-rollup） |
+| DELIVERED | COMPLETED | 所有非 CANCELLED 子件翻 `COMPLETED`（auto-rollup） |
+| IN_PROCESS | COMPLETED | 兼容：所有非 PENDING 子件全 COMPLETED |
 | PENDING | CANCELLED | `cancel`（service 内 `repo::cancel` 守卫） |
 | IN_PROCESS | CANCELLED | `cancel` |
+| INSPECTION | CANCELLED | `cancel` |
+| READY_TO_SHIP | CANCELLED | `cancel` |
+| DELIVERED | CANCELLED | `cancel` |
 | COMPLETED | 终态 | self-loop / 反向 / 跨度过渡均拒绝 |
 | CANCELLED | 终态 | self-loop / 反向 / 跨度过渡均拒绝 |
 
