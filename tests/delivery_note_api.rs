@@ -1408,3 +1408,103 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], 20104);
 }
+
+/// 2026-09-02 回归测试 —— 详情接口 line_items 必须把 part 的 6 字段
+/// （applicant_name / order_no / request_date / planned_delivery_date /
+/// system_delivery_date / note）从 `TPart` 透传到 `DeliveryNoteLineItem`。
+///
+/// 历史 bug：`service/inner.rs::get_with_parts` 与 `service/crud.rs`
+/// batch-detail 在组装 `DeliveryNoteLineItem` 时把这 6 个字段 hard-code
+/// 为 `None`，导致前端 `DeliveryNoteLineItemsTable` 的订单号 / 申请人 /
+/// 请购日期 / 计划交期 / 系统交期 / 备注 6 列永远显示 `—`。
+/// Tasks 1+2 已修复（`service/inner.rs:248-253`、`service/crud.rs:282-287`），
+/// 本测试锁定修复行为：建一个 6 字段都填的 part → 挂批 → 建单 →
+/// GET 详情，断言 line_items[0].{6 字段} 等于 part 原值。
+#[tokio::test]
+async fn test_get_delivery_note_line_items_fields_are_populated() {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let (_guard, pool) = setup().await;
+
+    // 1. 建 L1 客户（detail 端点的 customer_id 必须是 L1，service 校验）
+    let l1 = insert_l1(&pool, "详情字段客户", "D").await;
+    let _l2 = insert_l2(&pool, "二厂", l1).await;
+
+    // 2. 直插 part（**6 字段全填**）：用 `sqlx::query()` 而非 `query!` 宏，
+    //    避免为这条纯测试 INSERT 往 `.sqlx/` 离线缓存里塞新条目。
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, system_delivery_date, \
+         order_no, note, quantity, has_been_repaired, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 'Detail-Fields-Part', 'D-002', $3, 'READY_TO_SHIP', \
+         '张三', $4, $5, $6, \
+         $7, $8, 1, false, 0, \
+         $9, NULL, $9, NULL)",
+    )
+    .bind(part_id)
+    .bind(Some("D-002-SN"))
+    .bind(l1)
+    .bind(chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap())
+    .bind(chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap())
+    .bind(chrono::NaiveDate::from_ymd_opt(2026, 9, 20).unwrap())
+    .bind("ORD-2026-09-02-0001")
+    .bind("测试备注 2026-09-02")
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert part with full fields");
+
+    // 3. 直插批次（READY_TO_SHIP 才能挂到 DRAFT 单；service add_parts 校验）
+    let batch_id = insert_batch(&pool, part_id, 1, 5, "READY_TO_SHIP").await;
+
+    // 4. 登录 → POST /delivery-notes 建 DRAFT 单并挂批次 → GET 详情
+    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let (cs, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/delivery-notes",
+            Some(json!({
+                "customer_id": l1.to_string(),
+                "items": [{"batch_id": batch_id.to_string(), "quantity": null}],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "create draft: {env}");
+    let note_id = env["data"]["id"].as_str().unwrap().to_string();
+
+    let (gs, genv) = send(
+        app.clone(),
+        json_request("GET", &format!("/delivery-notes/{note_id}"), None, Some(&token)),
+    )
+    .await;
+    assert_eq!(gs, StatusCode::OK, "get detail: {genv}");
+
+    // 5. 断言 line_items[0] 的 6 字段 == part 原值
+    let items = genv["data"]["line_items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "line_items 应包含挂上的 1 个批次");
+    let item = &items[0];
+    assert_eq!(item["applicant_name"].as_str(), Some("张三"), "applicant_name 透传");
+    assert_eq!(item["order_no"].as_str(), Some("ORD-2026-09-02-0001"), "order_no 透传");
+    assert_eq!(item["request_date"].as_str(), Some("2026-09-01"), "request_date 透传");
+    assert_eq!(
+        item["planned_delivery_date"].as_str(),
+        Some("2026-09-15"),
+        "planned_delivery_date 透传"
+    );
+    assert_eq!(
+        item["system_delivery_date"].as_str(),
+        Some("2026-09-20"),
+        "system_delivery_date 透传"
+    );
+    assert_eq!(
+        item["note"].as_str(),
+        Some("测试备注 2026-09-02"),
+        "note 透传"
+    );
+}
