@@ -254,6 +254,13 @@ impl AssemblyService {
             version: p.version,
             quantity: p.quantity,
             planned_delivery_date: Some(p.planned_delivery_date),
+            // §3.4 — 透传 6 个继承/级联字段（来自 t_part 行）
+            applicant_name: p.applicant_name,
+            request_date: p.request_date,
+            order_no: p.order_no,
+            system_delivery_date: p.system_delivery_date,
+            is_urgent: p.is_urgent,
+            note: p.note,
         }).collect();
 
         Ok(AssemblyDetail {
@@ -427,6 +434,13 @@ impl AssemblyService {
                     version: 0,
                     quantity: child_qty,
                     planned_delivery_date: child_planned,
+                    // §3.4 — 创建时子件继承父件共享字段（与 §3.1 INSERT 一致）
+                    applicant_name: parent_applicant_name.to_string(),
+                    request_date: parent_request_date,
+                    order_no: req.order_no.clone(),
+                    system_delivery_date: req.system_delivery_date,
+                    is_urgent: parent_is_urgent,
+                    note: req.note.clone(),
                 });
             }
         }
@@ -551,12 +565,12 @@ impl AssemblyService {
         .map_err(AppError::from)?;
 
         // §3.3 套数缩放：`req.quantity` 有值且 ≠ 父件现值（old_qty）才触发
-        if let Some(new_qty) = req.quantity {
-            if new_qty != old_qty {
-                PartRepo::scale_children_quantity(&mut *conn, asm.id, old_qty, new_qty, current.id)
-                    .await
-                    .map_err(AppError::from)?;
-            }
+        if let Some(new_qty) = req.quantity
+            && new_qty != old_qty
+        {
+            PartRepo::scale_children_quantity(&mut *conn, asm.id, old_qty, new_qty, current.id)
+                .await
+                .map_err(AppError::from)?;
         }
 
         Ok(render_assembly_out(asm))

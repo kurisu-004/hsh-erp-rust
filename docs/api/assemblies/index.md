@@ -78,8 +78,16 @@
 | `drawing_no` | string? | 子件图号 |
 | `status` | string | part 状态 |
 | `version` | i32 | 乐观锁 |
-| `quantity` | i32 | 子件数量 |
+| `quantity` | i32 | 子件数量（实际加工数；2026-09-11 起按父件套数等比缩放，见 §方向 A） |
 | `planned_delivery_date` | date? | 计划交付日 |
+| `applicant_name` | string | 申请人（§3.1 创建时继承父件，§3.2 update 级联） |
+| `request_date` | date | 客户请求日（同上） |
+| `order_no` | string? | 订单号（同上） |
+| `system_delivery_date` | date? | 系统派工日（同上） |
+| `is_urgent` | bool | 紧急标记（同上） |
+| `note` | string? | 备注（同上） |
+
+> §3.4（2026-09-11）：后 6 字段为"共享信息字段"，创建时从父件 `t_assembly` 继承（§3.1），update 时按父件"更新后的当前行值"覆盖（§3.2）。`AssemblyService::get_assembly` 从 `t_part` 行直接透传。`AssemblyChildOut` 用于 `GET /assemblies/{id}`（children 数组）和 `POST /assemblies` 响应（created_children 数组）。
 
 ### AssemblyFileRef 字段
 

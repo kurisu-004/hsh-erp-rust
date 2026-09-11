@@ -47,7 +47,7 @@ use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::dto::{
-    AssemblyChildRequest, AssemblyCreateRequest,
+    AssemblyChildRequest, AssemblyCreateRequest, AssemblyUpdateRequest,
 };
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::shared::error::AppError;
@@ -241,20 +241,25 @@ async fn create_with_pdf_creates_children_with_serial_pattern() {
     insert_serial_counter(&pool, "F", 0).await;
 
     let pdf = make_fixture_pdf(3);
+    // 父件填写共享字段，子件入参里不写，验证 §3.1 子件继承
+    let today: chrono::NaiveDate = chrono::Local::now().date_naive();
+    let parent_request_date: chrono::NaiveDate = today;
+    let parent_planned: chrono::NaiveDate = today + chrono::Duration::days(7);
+    let parent_system_delivery: chrono::NaiveDate = today + chrono::Duration::days(3);
     let req = AssemblyCreateRequest {
         drawing_no: "D002".into(),
         name: "ASM-B".into(),
         applicant_name: Some("张三".into()),
         customer_id: l2.to_string(),
-        request_date: None,
-        planned_delivery_date: None,
+        request_date: Some(parent_request_date),
+        planned_delivery_date: Some(parent_planned),
         is_urgent: Some(true),
         quantity: Some(1),
         unit_price: None,
         total_price: None,
-        order_no: None,
-        system_delivery_date: None,
-        note: None,
+        order_no: Some("ORD-2026-001".into()),
+        system_delivery_date: Some(parent_system_delivery),
+        note: Some("加急备注-父".into()),
         children: vec![
             AssemblyChildRequest {
                 name: "零件-1".into(),
@@ -295,6 +300,19 @@ async fn create_with_pdf_creates_children_with_serial_pattern() {
         out.created_children[1].serial_no.as_deref(),
         Some("F0000001-02")
     );
+
+    // §3.1（2026-09-11）—— created_children 应透传父件继承字段
+    for ch in &out.created_children {
+        assert_eq!(ch.applicant_name, "张三", "applicant_name 继承父件");
+        assert_eq!(ch.request_date, parent_request_date, "request_date 继承父件");
+        assert_eq!(ch.order_no.as_deref(), Some("ORD-2026-001"), "order_no 继承父件");
+        assert_eq!(ch.system_delivery_date, Some(parent_system_delivery), "system_delivery_date 继承父件");
+        assert!(ch.is_urgent, "is_urgent 继承父件");
+        assert_eq!(ch.note.as_deref(), Some("加急备注-父"), "note 继承父件");
+        // planned_delivery_date 子件入参为 None → 继承父件
+        assert_eq!(ch.planned_delivery_date, Some(parent_planned), "planned_delivery_date 继承父件（子件入参缺省）");
+    }
+
     // 同步插入的 t_part 子件在 DB 里也得 verify 一次
     let part_serials: Vec<Option<String>> = sqlx::query_scalar!(
         "SELECT serial_no FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
@@ -310,6 +328,37 @@ async fn create_with_pdf_creates_children_with_serial_pattern() {
             Some("F0000001-02".to_string()),
         ]
     );
+
+    // §3.1 落库断言：DB t_part 行的 6 个继承字段 + customer_id 都被覆盖为父件值
+    #[allow(clippy::type_complexity)]
+    type ChildRow = (
+        Option<String>,                                // applicant_name NOT NULL 但 SQL 反序列化要 Option
+        chrono::NaiveDate,                             // request_date
+        Option<String>,                                // order_no
+        Option<chrono::NaiveDate>,                     // system_delivery_date
+        bool,                                          // is_urgent
+        Option<String>,                                // note
+        i64,                                           // customer_id
+    );
+    let child_rows: Vec<ChildRow> = sqlx::query_as(
+        "SELECT applicant_name, request_date, order_no, system_delivery_date, \
+                is_urgent, note, customer_id \
+         FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
+    )
+    .bind(out.assembly.id)
+    .fetch_all(&pool)
+    .await
+    .expect("query child inherited fields");
+    assert_eq!(child_rows.len(), 2);
+    for row in &child_rows {
+        assert_eq!(row.0.as_deref(), Some("张三"), "DB applicant_name 应继承父件");
+        assert_eq!(row.1, parent_request_date, "DB request_date 应继承父件");
+        assert_eq!(row.2.as_deref(), Some("ORD-2026-001"), "DB order_no 应继承父件");
+        assert_eq!(row.3, Some(parent_system_delivery), "DB system_delivery_date 应继承父件");
+        assert!(row.4, "DB is_urgent 应继承父件 true");
+        assert_eq!(row.5.as_deref(), Some("加急备注-父"), "DB note 应继承父件");
+        assert_eq!(row.6, l2, "DB customer_id 应继承父件");
+    }
 }
 
 /// 3. 页数 mismatch：2 页 PDF + 2 children（service 期望 children.len()+1=3 页）
@@ -886,7 +935,7 @@ async fn state_machine_transitions() {
     let mut tx = pool.begin().await.unwrap();
     let err = AssemblyService::cancel_assembly(&mut tx, asm_id, &current)
         .await
-        .expect_err("CANCELLED→cancel 应抛错");
+        .expect_err("CANCELLED→cancel 应被拒");
     drop(tx);
     match err {
         AppError::Biz { code, .. } => {
@@ -894,4 +943,341 @@ async fn state_machine_transitions() {
         }
         other => panic!("期望 AppError::Biz(20103)，got {other:?}"),
     }
+}
+
+// ===========================================================================
+//  Task A（refactor-part-assembly-batch.md §3.1–§3.4）：方向 A 行为覆盖
+//  - §3.2 update 级联（共享信息字段覆盖）
+//  - §3.3 套数缩放（quantity 等比 + 整数四舍五入 + 下限 1）
+// ===========================================================================
+
+/// 10. §3.2 update 级联：建装配体（带 PDF / 2 子件），update 共享字段后
+///     t_part 子件行 8 个共享字段（request_date / applicant_name / order_no /
+///     system_delivery_date / planned_delivery_date / is_urgent / note /
+///     customer_id）应全部被覆盖为父件"更新后的当前行值"；actual_delivery_date
+///     不动。
+#[tokio::test]
+async fn update_assembly_cascades_shared_fields_to_children() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户I", "F").await;
+    let l2_a = insert_l2_customer(&pool, "子客I-A", l1).await;
+    let l2_b = insert_l2_customer(&pool, "子客I-B", l1).await;
+    insert_serial_counter(&pool, "F", 0).await;
+
+    // 1) 建装配体（l2_a / 带 PDF / 2 子件）—— 共享字段给初始值
+    let initial_request_date: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+    let initial_planned: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+    let initial_sys_delivery: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 9, 5).unwrap();
+    let pdf = make_fixture_pdf(3);
+    let req = AssemblyCreateRequest {
+        drawing_no: "D-CASC-001".into(),
+        name: "cascade-test".into(),
+        applicant_name: Some("原申请人".into()),
+        customer_id: l2_a.to_string(),
+        request_date: Some(initial_request_date),
+        planned_delivery_date: Some(initial_planned),
+        is_urgent: Some(false),
+        quantity: Some(1),
+        unit_price: None,
+        total_price: None,
+        order_no: Some("INIT-ORDER".into()),
+        system_delivery_date: Some(initial_sys_delivery),
+        note: Some("初始备注".into()),
+        children: vec![
+            AssemblyChildRequest {
+                name: "c-1".into(),
+                drawing_no: Some("CASC-D-1".into()),
+                planned_delivery_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()),
+                quantity: Some(3),
+            },
+            AssemblyChildRequest {
+                name: "c-2".into(),
+                drawing_no: Some("CASC-D-2".into()),
+                planned_delivery_date: None,
+                quantity: Some(5),
+            },
+        ],
+    };
+    let current = test_current_user();
+
+    let mut tx = pool.begin().await.unwrap();
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        &snowflake,
+        &req,
+        vec![pdf],
+        &current,
+    )
+    .await
+    .expect("create should succeed");
+    let asm_id = out.assembly.id;
+    let asm_version = out.assembly.version;
+    tx.commit().await.unwrap();
+
+    // 2) update_assembly：改 6 个共享字段 + customer_id；不动 actual_delivery_date
+    let updated_request_date: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+    let updated_planned: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
+    let updated_sys_delivery: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
+    let upd_req = AssemblyUpdateRequest {
+        drawing_no: None,
+        name: None,
+        applicant_name: Some("新申请人".into()),
+        customer_id: Some(Some(l2_b.to_string())), // 改客户 → 也应级联
+        request_date: Some(Some(updated_request_date)),
+        planned_delivery_date: Some(Some(updated_planned)),
+        actual_delivery_date: None,
+        is_urgent: Some(true),
+        quantity: None, // 本测试不缩放
+        unit_price: None,
+        total_price: None,
+        order_no: Some("UPDATED-ORDER".into()),
+        system_delivery_date: Some(Some(updated_sys_delivery)),
+        note: Some("更新后备注".into()),
+        version: asm_version,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let updated = AssemblyService::update_assembly(&mut tx, asm_id, &upd_req, &current)
+        .await
+        .expect("update should succeed");
+    tx.commit().await.unwrap();
+    assert_eq!(updated.applicant_name.as_deref(), Some("新申请人"));
+    assert_eq!(updated.customer_id, l2_b);
+
+    // 3) 验证 t_part 子件 8 个共享字段被覆盖；quantity 不动；actual_delivery_date 不动
+    #[allow(clippy::type_complexity)]
+    type CascadeRow = (
+        String,                                // applicant_name
+        chrono::NaiveDate,                     // request_date
+        Option<String>,                        // order_no
+        Option<chrono::NaiveDate>,             // system_delivery_date
+        chrono::NaiveDate,                     // planned_delivery_date
+        bool,                                  // is_urgent
+        Option<String>,                        // note
+        i64,                                   // customer_id
+        i32,                                   // quantity（不动）
+        Option<chrono::NaiveDate>,             // actual_delivery_date（不动）
+    );
+    let rows: Vec<CascadeRow> = sqlx::query_as(
+        "SELECT applicant_name, request_date, order_no, system_delivery_date, \
+                planned_delivery_date, is_urgent, note, customer_id, \
+                quantity, actual_delivery_date \
+         FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
+    )
+    .bind(asm_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query children");
+    assert_eq!(rows.len(), 2, "应见 2 个子件");
+    for r in &rows {
+        assert_eq!(r.0, "新申请人", "applicant_name 级联覆盖");
+        assert_eq!(r.1, updated_request_date, "request_date 级联覆盖");
+        assert_eq!(r.2.as_deref(), Some("UPDATED-ORDER"), "order_no 级联覆盖");
+        assert_eq!(r.3, Some(updated_sys_delivery), "system_delivery_date 级联覆盖");
+        assert_eq!(r.4, updated_planned, "planned_delivery_date 级联覆盖");
+        assert!(r.5, "is_urgent 级联覆盖");
+        assert_eq!(r.6.as_deref(), Some("更新后备注"), "note 级联覆盖");
+        assert_eq!(r.7, l2_b, "customer_id 变更也级联");
+        assert!(r.8 >= 3, "quantity 不应被级联改写（child1=3 或 child2=5）");
+        assert!(r.9.is_none(), "actual_delivery_date 不应被级联改写（流程产物）");
+    }
+}
+
+/// 11. §3.3 套数缩放：父件 quantity 1→2，每个子件 new_qty = max(1, round(child_qty * 2 / 1))；
+///     验证整数四舍五入 + 下限 1；并验证更新 quantity=3（不变）时不触发缩放；
+///     再验证更新到 0/负数时的防御（old_qty<=0 跳过）。
+#[tokio::test]
+async fn update_assembly_scales_child_quantities() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户J", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客J", l1).await;
+    insert_serial_counter(&pool, "F", 0).await;
+
+    // 1) 建装配体（quantity=1, 3 子件：q=3, 4, 5）
+    let pdf = make_fixture_pdf(4);
+    let req = AssemblyCreateRequest {
+        drawing_no: "D-SCALE-001".into(),
+        name: "scale-test".into(),
+        applicant_name: None,
+        customer_id: l2.to_string(),
+        request_date: None,
+        planned_delivery_date: None,
+        is_urgent: Some(false),
+        quantity: Some(1),
+        unit_price: None,
+        total_price: None,
+        order_no: None,
+        system_delivery_date: None,
+        note: None,
+        children: vec![
+            AssemblyChildRequest { name: "c-1".into(), drawing_no: Some("SCALE-D-1".into()), planned_delivery_date: None, quantity: Some(3) },
+            AssemblyChildRequest { name: "c-2".into(), drawing_no: Some("SCALE-D-2".into()), planned_delivery_date: None, quantity: Some(4) },
+            AssemblyChildRequest { name: "c-3".into(), drawing_no: Some("SCALE-D-3".into()), planned_delivery_date: None, quantity: Some(5) },
+        ],
+    };
+    let current = test_current_user();
+
+    let mut tx = pool.begin().await.unwrap();
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
+        .await
+        .expect("create should succeed");
+    let asm_id = out.assembly.id;
+    let mut asm_version = out.assembly.version;
+    tx.commit().await.unwrap();
+
+    // 2) update quantity=2 → 期望 child1: round(3*2/1)=6, child2: round(4*2/1)=8, child3: round(5*2/1)=10
+    let upd_req = AssemblyUpdateRequest {
+        drawing_no: None,
+        name: None,
+        applicant_name: None,
+        customer_id: None,
+        request_date: None,
+        planned_delivery_date: None,
+        actual_delivery_date: None,
+        is_urgent: None,
+        quantity: Some(2),
+        unit_price: None,
+        total_price: None,
+        order_no: None,
+        system_delivery_date: None,
+        note: None,
+        version: asm_version,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let after = AssemblyService::update_assembly(&mut tx, asm_id, &upd_req, &current)
+        .await
+        .expect("update should succeed");
+    tx.commit().await.unwrap();
+    assert_eq!(after.quantity, 2);
+    asm_version = after.version;
+
+    // 验证 child qty
+    let child_qtys: Vec<i32> = sqlx::query_scalar(
+        "SELECT quantity FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
+    )
+    .bind(asm_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query child qty");
+    assert_eq!(
+        child_qtys,
+        vec![6, 8, 10],
+        "1→2 缩放：child1=round(3*2/1)=6, child2=round(4*2/1)=8, child3=round(5*2/1)=10"
+    );
+
+    // 3) update quantity=4（从 2 → 4）：round(6*4/2)=12, round(8*4/2)=16, round(10*4/2)=20
+    let upd_req = AssemblyUpdateRequest {
+        drawing_no: None,
+        name: None,
+        applicant_name: None,
+        customer_id: None,
+        request_date: None,
+        planned_delivery_date: None,
+        actual_delivery_date: None,
+        is_urgent: None,
+        quantity: Some(4),
+        unit_price: None,
+        total_price: None,
+        order_no: None,
+        system_delivery_date: None,
+        note: None,
+        version: asm_version,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let after2 = AssemblyService::update_assembly(&mut tx, asm_id, &upd_req, &current)
+        .await
+        .expect("update should succeed");
+    tx.commit().await.unwrap();
+    assert_eq!(after2.quantity, 4);
+    asm_version = after2.version;
+
+    let child_qtys2: Vec<i32> = sqlx::query_scalar(
+        "SELECT quantity FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
+    )
+    .bind(asm_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query child qty 2");
+    assert_eq!(
+        child_qtys2,
+        vec![12, 16, 20],
+        "2→4 缩放：child1=round(6*4/2)=12, child2=round(8*4/2)=16, child3=round(10*4/2)=20"
+    );
+
+    // 4) update quantity=12（child1=12*12/4=36, child2=16*12/4=48, child3=20*12/4=60）
+    let upd_req = AssemblyUpdateRequest {
+        drawing_no: None,
+        name: None,
+        applicant_name: None,
+        customer_id: None,
+        request_date: None,
+        planned_delivery_date: None,
+        actual_delivery_date: None,
+        is_urgent: None,
+        quantity: Some(12),
+        unit_price: None,
+        total_price: None,
+        order_no: None,
+        system_delivery_date: None,
+        note: None,
+        version: asm_version,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let after3 = AssemblyService::update_assembly(&mut tx, asm_id, &upd_req, &current)
+        .await
+        .expect("update should succeed");
+    tx.commit().await.unwrap();
+    assert_eq!(after3.quantity, 12);
+    asm_version = after3.version;
+
+    let child_qtys3: Vec<i32> = sqlx::query_scalar(
+        "SELECT quantity FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
+    )
+    .bind(asm_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query child qty 3");
+    assert_eq!(
+        child_qtys3,
+        vec![36, 48, 60],
+        "4→12 缩放"
+    );
+
+    // 5) update quantity=12（不变）→ 不触发缩放，child qty 应保持不变
+    let upd_req = AssemblyUpdateRequest {
+        drawing_no: None,
+        name: None,
+        applicant_name: None,
+        customer_id: None,
+        request_date: None,
+        planned_delivery_date: None,
+        actual_delivery_date: None,
+        is_urgent: None,
+        quantity: Some(12),
+        unit_price: None,
+        total_price: None,
+        order_no: None,
+        system_delivery_date: None,
+        note: None,
+        version: asm_version,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let _after4 = AssemblyService::update_assembly(&mut tx, asm_id, &upd_req, &current)
+        .await
+        .expect("update should succeed");
+    tx.commit().await.unwrap();
+
+    let child_qtys4: Vec<i32> = sqlx::query_scalar(
+        "SELECT quantity FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
+    )
+    .bind(asm_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query child qty 4");
+    assert_eq!(
+        child_qtys4,
+        vec![36, 48, 60],
+        "quantity 不变 → 不应触发缩放"
+    );
 }

@@ -72,6 +72,15 @@ pub struct AssemblyChildOut {
     pub version: i32,
     pub quantity: i32,
     pub planned_delivery_date: Option<NaiveDate>,
+    // §3.4（2026-09-11）— 子件继承自父件 / update 级联后的 6 个共享信息字段，
+    // 由 service 层从 t_part 行透传。`applicant_name` 在 t_part 是 NOT NULL
+    // VARCHAR(50)；其余可空。
+    pub applicant_name: String,
+    pub request_date: NaiveDate,
+    pub order_no: Option<String>,
+    pub system_delivery_date: Option<NaiveDate>,
+    pub is_urgent: bool,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
