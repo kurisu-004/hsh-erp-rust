@@ -18,6 +18,7 @@
 | GET | `/api/v2/worker-pool/{process_id}` | **Manager+Clerk+Inspector** | 按工序返回候选池详情（workers + work_types + 跨货架批次列表） |
 | POST | `/api/v2/admin/worker-pool/refill` | **Manager** | 为指定 worker 抢满 `max_held_batches`（同事务） |
 | POST | `/api/v2/admin/worker-pool/remove` | **Manager** | 把 worker 持有批次按 RETURNED 语义放回候选池 |
+| POST | `/api/v2/admin/worker-pool/auto-allocate` | **Manager** | 按 process + shelf 自动为多个 worker 抢批次数 / 累计工时（COUNT/TIME 模式 × fill_ratio） |
 
 > 路由挂载：`/worker-pool/state` 走 `/api/v2/worker-pool`，admin 端点走 `/api/v2/admin/worker-pool`（见 `src/modules/worker_pool/mod.rs`）。
 
@@ -142,6 +143,53 @@ Response 200 `data`：[`ProcessPoolDetail`](#processpooldetail-字段)
 - 20801 BIZ_PROCESS_NOT_FOUND — process_id 不存在 / 已软删
 - 40300 FORBIDDEN — 角色不在 Manager+Clerk+Inspector 集合内
 
+### `POST /api/v2/admin/worker-pool/auto-allocate`
+
+权限: **Manager**（`current.require_role(Role::Manager)`）
+
+按 `process_id + shelf_id` 范围为该 process 上的每个 active worker 计算 `target`，循环 `take_one_from_pool` 抢到 target / 池空。
+
+Request：`AutoAllocateRequest`
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `process_id` | string (i64) | ✓ | 候选池工序 ID（决定 work_type 映射范围） |
+| `shelf_id` | string (i64) | ✓ | 候选池货架 ID（决定批次范围） |
+| `mode` | string | ✓ | `COUNT`（按批次数）或 `TIME`（按累计预估工时） |
+| `fill_ratio` | f64 | ✓ | 填充比例 ∈ `[0.0, 1.0]`；out-of-range → 20704 |
+
+业务流转（service `auto_allocate_for_process`）：
+
+1. 校验 `fill_ratio ∈ [0.0, 1.0]` → `20704 BIZ_AUTO_ALLOCATE_INVALID_RATIO` (HTTP 400)
+2. 取 process 元数据；不存在 → `20801 BIZ_PROCESS_NOT_FOUND` (HTTP 404)
+3. 取 process 映射的 work_type 列表（含 `max_held_batches` + 二次查 `max_held_minutes`）；空 → `20905 BIZ_WORK_TYPE_NO_PROCESS_MAPPING`
+4. 取 `shelf_id` 上 active worker 列表（`WorkerRepo::list_active_by_process_id`）
+5. 对每个 worker：
+   - 找到其所属 work_type 的 max 阈值：
+     - `COUNT`：`max_held_batches`；NULL → `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`
+     - `TIME`：`max_held_minutes`；NULL → `20703 BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET`
+   - 计算 `target = ceil(max × fill_ratio)` as i32
+   - 循环 `WorkerPoolRepo::take_one_from_pool` 直到 target 满 / 池空
+   - 每抢到一批：写 `TAKEN_FROM_POOL` 事件 + 调 `PartService::sync_from_batch_change` rollup
+6. 累计所有 worker 的 filled，组装 `AutoAllocateResult` 返回
+
+Response 200 `data`：[`AutoAllocateResult`](#autoallocateresult-字段)
+
+错误码：
+
+- 20801 BIZ_PROCESS_NOT_FOUND — process_id 不存在 / 已软删
+- 20905 BIZ_WORK_TYPE_NO_PROCESS_MAPPING — process 无 work_type 映射
+- 20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET — COUNT 模式但 work_type.max_held_batches IS NULL
+- 20703 BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET — TIME 模式但 work_type.max_held_minutes IS NULL
+- 20704 BIZ_AUTO_ALLOCATE_INVALID_RATIO — fill_ratio ∉ [0.0, 1.0]
+- 20206 BIZ_WORKER_NO_WORK_TYPE — worker.work_type_id IS NULL（防御性，正常流不撞）
+- 40300 FORBIDDEN — 非 Manager
+- 40001 VALIDATION_ERROR — payload shape 错误
+
+WS 广播（commit 后下发）：
+
+- 始终 → `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`，前端按 `pool_empty + filled` 综合判断）
+
 ---
 
 ## 共享 DTO
@@ -264,6 +312,35 @@ Response 200 `data`：[`ProcessPoolDetail`](#processpooldetail-字段)
 | `total` | i64 | 候选批次总数（与 items.len() 一致，不分页；admin 视角全量） |
 | `items` | [PoolBatchItem](#poolbatchitem-字段) | 跨货架候选批次列表，排序 `system_delivery_date ASC NULLS LAST → is_urgent DESC → id ASC` |
 
+### AutoAllocateRequest 字段
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `process_id` | string (i64) | ✓ | 候选池工序 ID |
+| `shelf_id` | string (i64) | ✓ | 候选池货架 ID |
+| `mode` | `AutoAllocateMode` | ✓ | `COUNT` 或 `TIME`（Rust enum，JSON 形态 `UPPERCASE`） |
+| `fill_ratio` | f64 | ✓ | 填充比例 ∈ `[0.0, 1.0]` |
+
+### AutoAllocateResult 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `process_id` | string (i64) | 入参工序 ID |
+| `shelf_id` | string (i64) | 入参货架 ID |
+| `mode` | `AutoAllocateMode` | 入参模式 |
+| `fill_ratio` | f64 | 入参比例 |
+| `filled` | [WorkerFillItem](#workerfillitem-字段) | 各 worker 的填充结果（按 process 上的 worker 列表顺序） |
+| `pool_empty` | bool | 任一 worker 的 take 循环中途遇 `None`（池空 / 容量触顶）；前端按 `pool_empty + filled` 综合判断 |
+
+### WorkerFillItem 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `worker_id` | string (i64) | 工人雪花 ID |
+| `target` | i32 | 该 worker 的目标：COUNT 模式 = 抢批次数；TIME 模式 = 累计分钟数 |
+| `filled_count` | i32 | 实际抢到的批次 / 累计分钟数（按 `mode` 解释，与 `target` 同单位） |
+| `skipped_reason` | string? | 跳过原因（如 `worker 无 work_type`）；存在字段 ⇒ 跳过该 worker |
+
 ---
 
 ## WS 事件清单（worker-pool 相关）
@@ -278,6 +355,7 @@ Response 200 `data`：[`ProcessPoolDetail`](#processpooldetail-字段)
 | `WORKER_POOL_REFILL_DONE` | `POST /parts/worker-scan` 同事务 refill 抢到 / `POST /admin/worker-pool/refill` | `{ worker_id, shelf_id, taken: [TakenItem], pool_empty }`（即 `RefillResult`） |
 | `WORKER_POOL_EMPTY` | `POST /parts/worker-scan` 同事务 refill 池空 / `POST /admin/worker-pool/refill` 池空 | `{ worker_id, shelf_id }` |
 | `WORKER_POOL_ADMIN_REMOVED` | `POST /admin/worker-pool/remove` | `{ batch_id, part_id, batch_no, quantity, serial_no, drawing_no, system_delivery_date, planned_delivery_date, is_urgent, version }`（即 `TakenItem`） |
+| `WORKER_POOL_AUTO_ALLOCATE_DONE` | `POST /admin/worker-pool/auto-allocate` | `{ process_id, shelf_id, mode, fill_ratio, filled: [WorkerFillItem], pool_empty }`（即 `AutoAllocateResult`） |
 
 > 监听实现：`src/infra/ws_hub.rs::WsHub::broadcast`。前端订阅 `/ws/dashboard` 后按 `kind` 字段分发。
 
@@ -297,10 +375,11 @@ Response 200 `data`：[`ProcessPoolDetail`](#processpooldetail-字段)
 - ✅ Task 6：`worker_pool.repo::take_one_from_pool` CTE（FOR UPDATE SKIP LOCKED）
 - ✅ Task 7：`worker_pool.service`（refill_for_worker / compute_state / admin_remove_held_batch）+ handler 三端点 + admin router
 - ✅ Task 8：`POST /parts/worker-scan`（同事务联动 refill）
+- ✅ 2026-09-11 part-worker-pool-federated-rocket：新增 `auto_allocate_for_process` + 端点 `POST /admin/worker-pool/auto-allocate` + COUNT/TIME 模式 + fill_ratio 校验（20704）；错误码段 20701/20702/20703/20704
 - ⏳ 未上线：`WorkerRepo` 列表 / 创建 / 软删等 CRUD（worker 域当前仅供 worker_pool / parts worker-scan 复用）
 
 ## 参考
 
-- 集成测试：`tests/worker_pool_api.rs`（如已添加）/ `tests/part_worker_scan_api.rs`（如已添加）
+- 集成测试：`tests/worker_pool_api.rs` / `tests/worker_pool_auto_allocate_api.rs`
 - 仓库分层：`src/modules/worker_pool/handler.rs` (axum) → `service.rs` (业务) → `repo.rs` (SQL)
-- 错误码：`src/shared/error.rs::code`（20101 / 20114 / 20201 / 20202 / 20206 / 20901 / 20904 / 20905 / 40001 / 40300 / 40901）
+- 错误码：`src/shared/error.rs::code`（20101 / 20114 / 20201 / 20202 / 20206 / 20901 / 20904 / 20905 / 20703 / 20704 / 40001 / 40300 / 40901）

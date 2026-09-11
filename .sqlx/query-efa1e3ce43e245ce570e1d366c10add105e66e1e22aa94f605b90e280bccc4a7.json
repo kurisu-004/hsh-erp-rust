@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_work_type (id, code, name, sort_order, version, max_held_batches, max_held_minutes, created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $5, $6, $6)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Int4",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "efa1e3ce43e245ce570e1d366c10add105e66e1e22aa94f605b90e280bccc4a7"
+}

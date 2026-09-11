@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_process_chain_step\n            SET deleted_at = now(),\n                version    = version + 1,\n                updated_at = now()\n            WHERE chain_id = $1 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5bf25c3450fafc535c9d5d7afd72bb1804e06b6d14f18261a19171196285542a"
+}

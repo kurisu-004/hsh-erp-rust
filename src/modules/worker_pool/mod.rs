@@ -19,4 +19,5 @@ pub fn admin_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/refill", post(handler::admin_refill))
         .route("/remove", post(handler::admin_remove))
+        .route("/auto-allocate", post(handler::auto_allocate))
 }

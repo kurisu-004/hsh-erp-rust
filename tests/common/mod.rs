@@ -141,7 +141,8 @@ pub async fn clean_db(pool: &PgPool) {
     .expect("truncate auth-related tables");
 }
 
-/// 清表（业务域全集）：配送分组 / 配送单 / 批次 / 工单 / 装配体 / 客户 / 申请人 / 工种 / 工人。
+/// 清表（业务域全集）：配送分组 / 配送单 / 批次 / 工单 / 装配体 / 客户 / 申请人 / 工种 / 工人
+/// / 工艺链。
 ///
 /// 与 `clean_db` 互补 —— 后者只清 auth 表，本函数负责 P1+ 业务域测试需要的「干净世界」。
 /// 顺序按 FK 依赖自顶向下；CASCADE 兜底防止漏列。
@@ -154,6 +155,7 @@ pub async fn clean_business_db(pool: &PgPool) {
             t_delivery_group_member, t_delivery_group, \
             t_delivery_note_event, t_delivery_note_counter, t_delivery_note, \
             t_part_batch, t_part_event, t_part, \
+            t_process_chain_step, t_part_process_chain, \
             t_assembly, \
             t_customer, t_applicant, \
             t_work_type, t_worker, \

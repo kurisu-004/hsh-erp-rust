@@ -511,3 +511,78 @@ impl PartRepo {
         Ok(())
     }
 }
+
+// ===== rollup 相关 repo 函数（PR-B2 阶段新增；refactor f5b1ec0 删除但 worker_pool
+//        refill_for_worker / auto_allocate_for_process 仍在使用） =====
+//
+// 重新加回以恢复 worker_pool 编译。impl 块位于主 impl PartService / impl PartRepo
+// 之后；以下函数仅供 part/service/rollup.rs 的 `sync_from_batch_change` 调用。
+impl PartRepo {
+    /// rollup 读侧：part 当前派生列投影。
+    ///
+    /// 6 列：status / location / current_holder_id / next_process_id /
+    /// placed_at / version。`None` 表示 part 不存在或已软删。
+    #[allow(dead_code)]
+    pub async fn get_part_rollup_state<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+    ) -> Result<Option<crate::modules::part::model::TPartRollupState>, sqlx::Error> {
+        sqlx::query_as!(
+            crate::modules::part::model::TPartRollupState,
+            r#"
+            SELECT status, location, current_holder_id, next_process_id,
+                   placed_at, version
+            FROM t_part
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+            part_id,
+        )
+        .fetch_optional(executor)
+        .await
+    }
+
+    /// rollup 写侧：派生列 UPDATE。
+    ///
+    /// **不走 OCC**（派生写）：`WHERE id=$1 AND deleted_at IS NULL`。
+    /// 并发 rollup 由 SQL 行锁串行化；`version += 1` 仍写入（保证审计字段单调）。
+    /// 0 行 → part 已被并发软删（防御性 caller 走 NoChange）。
+    ///
+    /// `location` / `current_holder_id` / `next_process_id` / `placed_at` 必填
+    /// （从最慢批次物化；不存在 → `NULL`，与 batch 端的 `Optional<>` 对齐）。
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub async fn update_part_rollup<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        status: &str,
+        location: Option<&str>,
+        current_holder_id: Option<i64>,
+        next_process_id: Option<i64>,
+        placed_at: Option<chrono::NaiveDateTime>,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query!(
+            r#"
+            UPDATE t_part
+            SET status            = $2,
+                location          = $3,
+                current_holder_id = $4,
+                next_process_id   = $5,
+                placed_at         = $6,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $7
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+            part_id,
+            status,
+            location,
+            current_holder_id,
+            next_process_id,
+            placed_at,
+            updated_by,
+        )
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
+    }
+}

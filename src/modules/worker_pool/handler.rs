@@ -30,7 +30,7 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use super::dto::{AdminRefillRequest, AdminRemoveRequest, ProcessPoolDetail};
+use super::dto::{AdminRefillRequest, AdminRemoveRequest, AutoAllocateRequest, AutoAllocateResult, ProcessPoolDetail};
 use super::model::RefillResult;
 use super::model::WorkerPoolState;
 use super::service::WorkerPoolService;
@@ -130,4 +130,27 @@ pub async fn pool_by_process(
     let detail = WorkerPoolService::pool_by_process(&mut tx, &current, process_id).await?;
     tx.commit().await?;
     Ok(Json(R::ok(detail)))
+}
+
+/// POST /api/v2/admin/worker-pool/auto-allocate
+///
+/// 按 `process_id + shelf_id` 范围自动为每个匹配 worker 抢批次数 / 累计工时。
+///
+/// Manager 角色守卫下沉到 service（`auto_allocate_for_process` 内部 `require_role`）。
+/// Commit 后广播 `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`）。
+pub async fn auto_allocate(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<AutoAllocateRequest>,
+) -> Result<Json<R<AutoAllocateResult>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let result =
+        WorkerPoolService::auto_allocate_for_process(&mut tx, &state.snowflake, req, &current)
+            .await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "WORKER_POOL_AUTO_ALLOCATE_DONE".into(),
+        payload: serde_json::to_value(&result).unwrap_or_default(),
+    });
+    Ok(Json(R::ok(result)))
 }

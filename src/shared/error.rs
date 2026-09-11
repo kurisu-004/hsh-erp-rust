@@ -215,6 +215,12 @@ pub mod code {
     // 215xx 外协发货（t_outsource_shipment）
     pub const BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND: i32 = 21501;
 
+    // 207xx 工艺链（t_part_process_chain + t_process_chain_step）
+    pub const BIZ_PROCESS_CHAIN_NOT_FOUND: i32 = 20701;
+    pub const BIZ_PROCESS_CHAIN_STEP_NOT_FOUND: i32 = 20702;
+    pub const BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET: i32 = 20703;
+    pub const BIZ_AUTO_ALLOCATE_INVALID_RATIO: i32 = 20704;
+
     // 系统错误
     pub const INTERNAL: i32 = 50000;
     pub const DATABASE: i32 = 50001;
@@ -381,7 +387,9 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_DELIVERY_NOTE_NOT_FOUND
             || c == code::BIZ_DELIVERY_GROUP_NOT_FOUND
             || c == code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE
-            || c == code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND => StatusCode::NOT_FOUND,
+            || c == code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND
+            || c == code::BIZ_PROCESS_CHAIN_NOT_FOUND
+            || c == code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND => StatusCode::NOT_FOUND,
 
         // ---- 2xxxx 业务码：409 (状态冲突 / 重复 / 占用 / 锁) ----
         c if c == code::BIZ_USER_DUPLICATE
@@ -611,6 +619,11 @@ mod tests {
         (code::BIZ_DELIVERY_NOTE_LOCKED_PART, "BIZ_DELIVERY_NOTE_LOCKED_PART"),
         // 215xx
         (code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND"),
+        // 207xx 工艺链（worker-pool auto-allocate 阶段新增）
+        (code::BIZ_PROCESS_CHAIN_NOT_FOUND, "BIZ_PROCESS_CHAIN_NOT_FOUND"),
+        (code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND, "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND"),
+        (code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET, "BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET"),
+        (code::BIZ_AUTO_ALLOCATE_INVALID_RATIO, "BIZ_AUTO_ALLOCATE_INVALID_RATIO"),
     ];
 
     #[test]
@@ -781,6 +794,12 @@ mod tests {
 
         // 215xx
         assert_eq!(code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, 21501);
+
+        // 207xx
+        assert_eq!(code::BIZ_PROCESS_CHAIN_NOT_FOUND, 20701);
+        assert_eq!(code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND, 20702);
+        assert_eq!(code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET, 20703);
+        assert_eq!(code::BIZ_AUTO_ALLOCATE_INVALID_RATIO, 20704);
     }
 
     /// 数据驱动的 HTTP 表覆盖测试：每个 (code, expected_http, name) 一行。
@@ -827,6 +846,8 @@ mod tests {
         (code::BIZ_DELIVERY_GROUP_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_DELIVERY_GROUP_NOT_FOUND"),
         (code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE, StatusCode::NOT_FOUND, "BIZ_DELIVERY_SCAN_UNKNOWN_CODE"),
         (code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND"),
+        (code::BIZ_PROCESS_CHAIN_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_PROCESS_CHAIN_NOT_FOUND"),
+        (code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND"),
         // 2xxxx 显式 409
         (code::BIZ_USER_DUPLICATE, StatusCode::CONFLICT, "BIZ_USER_DUPLICATE"),
         (code::BIZ_USER_DUPLICATE_USERNAME, StatusCode::CONFLICT, "BIZ_USER_DUPLICATE_USERNAME"),

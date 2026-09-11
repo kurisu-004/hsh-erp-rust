@@ -24,6 +24,7 @@ pub mod part;
 pub mod part_batch;
 pub mod part_file;
 pub mod process;
+pub mod process_chain;
 pub mod shelf;
 pub mod statistics;
 pub mod user;
@@ -68,6 +69,7 @@ pub fn v2_router() -> Router<Arc<AppState>> {
         .nest("/statistics", statistics::router())
         .nest("/worker-pool", worker_pool::router())
         .nest("/admin/worker-pool", worker_pool::admin_router())
+        .nest("/process-chains", process_chain::router())
 }
 
 /// `/ws/*` WebSocket 入口（当前仅 dashboard 大屏）

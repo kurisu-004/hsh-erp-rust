@@ -117,3 +117,63 @@ pub struct ProcessPoolDetail {
     pub total: i64,
     pub items: Vec<PoolBatchItem>,
 }
+
+// ---------------------------------------------------------------------------
+// auto-allocate 端点（part-worker-pool-federated-rocket 2026-09-11 新增）
+// ---------------------------------------------------------------------------
+
+/// 自动分配模式：`COUNT` 按批次数填满；`TIME` 按累计预估工时填满。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum AutoAllocateMode {
+    Count,
+    Time,
+}
+
+/// `POST /api/v2/admin/worker-pool/auto-allocate`
+///
+/// 按 process + shelf 范围为每个匹配 worker 计算 `target` 并循环 refill。
+/// - `fill_ratio` 必须在 `[0.0, 1.0]`，否则 `20704 BIZ_AUTO_ALLOCATE_INVALID_RATIO`
+/// - `mode=COUNT`：`target = ceil(work_type.max_held_batches × fill_ratio)`；
+///   work_type.max_held_batches IS NULL → `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`
+/// - `mode=TIME`：`target = ceil(work_type.max_held_minutes × fill_ratio)`；
+///   work_type.max_held_minutes IS NULL → `20703 BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET`
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoAllocateRequest {
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub process_id: i64,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub shelf_id: i64,
+    pub mode: AutoAllocateMode,
+    pub fill_ratio: f64,
+}
+
+/// 单个 worker 的填充结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerFillItem {
+    #[serde(serialize_with = "serialize_i64")]
+    pub worker_id: i64,
+    /// 该 worker 的目标（按 mode 计算）
+    pub target: i32,
+    /// 实际抢到的批次 / 累计分钟数（按 mode 解释：COUNT=抢到的批次数；TIME=抢到的累计工时）
+    pub filled_count: i32,
+    /// 是否因业务错（如 max_held_batches/max_held_minutes IS NULL）跳过该 worker
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped_reason: Option<String>,
+}
+
+/// `POST /api/v2/admin/worker-pool/auto-allocate` 响应。
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoAllocateResult {
+    #[serde(serialize_with = "serialize_i64")]
+    pub process_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub shelf_id: i64,
+    pub mode: AutoAllocateMode,
+    pub fill_ratio: f64,
+    pub filled: Vec<WorkerFillItem>,
+    /// 任一 worker 的 `take_one_from_pool` 返回 `None`（池空）⇒ `pool_empty=true`。
+    /// 注意：与单 worker `refill_for_worker` 不同——这里是「所有 worker 中途出现池空」，
+    /// 不区分"容量触顶"与"池真空"（与单 worker 同语义；前端按 `pool_empty + filled` 综合判断）。
+    pub pool_empty: bool,
+}

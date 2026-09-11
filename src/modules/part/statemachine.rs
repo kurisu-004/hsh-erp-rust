@@ -230,3 +230,144 @@ mod tests {
         assert!(!PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::COMPLETED));
     }
 }
+
+// ===== rollup 派生列投影（PR-B2 重新加回，2026-09-11） =====
+//
+//  part/service/rollup.rs 的 `sync_from_batch_change` 需要纯函数聚合
+//  `t_part_batch.status` → `t_part.status` + 派生列，避免引入完整 TPartBatch
+//  让纯函数测试受阻。仅暴露 `BatchForRollup` + `compute_part_target` 两个 pub 工具。
+
+use chrono::NaiveDateTime;
+
+/// rollup 用的批次最小投影（仅 5 列）。
+#[derive(Debug, Clone)]
+pub struct BatchForRollup {
+    pub status: String,
+    pub location: Option<String>,
+    pub current_holder_id: Option<i64>,
+    pub next_process_id: Option<i64>,
+    pub placed_at: Option<NaiveDateTime>,
+}
+
+/// rollup target 派生列。
+#[derive(Debug, Clone)]
+pub struct PartTarget {
+    pub status: String,
+    pub location: Option<String>,
+    pub current_holder_id: Option<i64>,
+    pub next_process_id: Option<i64>,
+    pub placed_at: Option<NaiveDateTime>,
+}
+
+/// 从 part 的全部活跃批次聚合 part 的 target 派生列。
+///
+/// 聚合规则（PR-B2 简化版，2026-09-11 重新加回）：
+/// 1. 若任一批次 `status='DELIVERED'` ⇒ part.status = 'DELIVERED'
+/// 2. 若任一批次 `status='READY_TO_SHIP'` ⇒ part.status = 'READY_TO_SHIP'
+/// 3. 若任一批次 `status='INSPECTION'` ⇒ part.status = 'INSPECTION'
+/// 4. 若任一批次 `status='REPAIRING'` ⇒ part.status = 'REPAIRING'
+/// 5. 若任一批次 `status='OUTSOURCE'` ⇒ part.status = 'OUTSOURCE'
+/// 6. 若全部批次均 `IN_PROCESS` ⇒ part.status = 'IN_PROCESS'
+/// 7. 若全部批次均 `PENDING` ⇒ part.status = 'PENDING'
+/// 8. 全部批次状态一致 ⇒ 沿用
+/// 9. 空集 ⇒ None
+///
+/// 优先级：终态 > 进行态；INSPECTION > REPAIRING > OUTSOURCE > IN_PROCESS > PENDING。
+///
+/// `location` / `current_holder_id` / `next_process_id` / `placed_at` 取最慢批次
+/// （按 placed_at ASC NULLS LAST，缺 placed_at 的批次放最后）。
+pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartTarget> {
+    if batches.is_empty() {
+        return None;
+    }
+    // 优先级字符串：覆盖的优先级（值越大优先级越高）
+    let priority = |s: &str| match s {
+        "DELIVERED" => 6,
+        "READY_TO_SHIP" => 5,
+        "INSPECTION" => 4,
+        "REPAIRING" => 3,
+        "OUTSOURCE" => 3,
+        "IN_PROCESS" => 2,
+        "PROGRAMMING" => 2,
+        "PENDING" => 1,
+        "COMPLETED" => 0,
+        "CANCELLED" => 0,
+        _ => 0,
+    };
+
+    let best = batches
+        .iter()
+        .max_by_key(|b| (priority(&b.status), b.id_sort_key()))
+        .expect("batches non-empty");
+
+    Some(PartTarget {
+        status: best.status.clone(),
+        location: best.location.clone(),
+        current_holder_id: best.current_holder_id,
+        next_process_id: best.next_process_id,
+        placed_at: best.placed_at,
+    })
+}
+
+impl BatchForRollup {
+    /// 排序键：placed_at ASC NULLS LAST，缺 placed_at 排最后。
+    /// 用于 `compute_part_target` 取"最慢批次"。
+    fn id_sort_key(&self) -> (u8, i64) {
+        match self.placed_at {
+            Some(t) => (0, t.and_utc().timestamp()),
+            None => (1, 0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod rollup_tests {
+    use super::*;
+
+    fn br(status: &str, placed_at: Option<NaiveDateTime>) -> BatchForRollup {
+        BatchForRollup {
+            status: status.to_string(),
+            location: None,
+            current_holder_id: None,
+            next_process_id: None,
+            placed_at,
+        }
+    }
+
+    #[test]
+    fn empty_returns_none() {
+        assert!(compute_part_target(&[]).is_none());
+    }
+
+    #[test]
+    fn single_batch_passthrough() {
+        let t = compute_part_target(&[br("IN_PROCESS", None)]).unwrap();
+        assert_eq!(t.status, "IN_PROCESS");
+    }
+
+    #[test]
+    fn delivered_wins_over_in_process() {
+        let t = compute_part_target(&[
+            br("IN_PROCESS", None),
+            br("DELIVERED", None),
+        ])
+        .unwrap();
+        assert_eq!(t.status, "DELIVERED");
+    }
+
+    #[test]
+    fn inspection_wins_over_in_process() {
+        let t = compute_part_target(&[
+            br("IN_PROCESS", None),
+            br("INSPECTION", None),
+        ])
+        .unwrap();
+        assert_eq!(t.status, "INSPECTION");
+    }
+
+    #[test]
+    fn all_pending_returns_pending() {
+        let t = compute_part_target(&[br("PENDING", None), br("PENDING", None)]).unwrap();
+        assert_eq!(t.status, "PENDING");
+    }
+}
