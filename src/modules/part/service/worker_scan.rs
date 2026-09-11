@@ -70,7 +70,10 @@ impl PartService {
     ///
     /// `WorkerScanEvent` 是 unit enum（`Copy`），所以 `req` 按值传（caller 的
     /// DTO `req.clone()` 不再需要）。
-    #[allow(clippy::too_many_lines)]
+    // 2026-09-11 PR-B2 改造后保留 master 既有的 `event_type_str` 晚初始化模式（worker_scan.rs:146
+    // 是 master 既有的 pre-existing 例外），新版本 clippy (1.98) 会以
+    // `clippy::needless_late_init` 报警，故显式豁免。
+    #[allow(clippy::too_many_lines, clippy::needless_late_init)]
     pub async fn worker_scan_event(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,

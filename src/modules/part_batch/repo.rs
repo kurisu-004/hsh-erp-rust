@@ -858,10 +858,7 @@ impl PartBatchRepo {
         executor: E,
         new: NewInitialBatch<'_>,
     ) -> Result<i64, sqlx::Error> {
-        // 使用非宏 `sqlx::query_scalar`（不用 `query_scalar!`），避免
-        // `SQLX_OFFLINE=true` 时 .sqlx 缓存缺失报错；调用方需要重新生成缓存时，
-        // 可在 dev 库上跑 `./scripts/sqlx_prepare.sh`。
-        let id: i64 = sqlx::query_scalar(
+        let id: i64 = sqlx::query_scalar!(
             r#"
             INSERT INTO t_part_batch (
                 id, part_id, batch_no, quantity, status, location,
@@ -874,14 +871,14 @@ impl PartBatchRepo {
                 NULL, NULL, FALSE,
                 0, now(), $5, now(), $5
             )
-            RETURNING id
+            RETURNING id AS "id!"
             "#,
+            new.id,
+            new.part_id,
+            new.quantity,
+            new.location,
+            new.created_by,
         )
-        .bind(new.id)
-        .bind(new.part_id)
-        .bind(new.quantity)
-        .bind(new.location)
-        .bind(new.created_by)
         .fetch_one(executor)
         .await?;
         Ok(id)

@@ -86,7 +86,8 @@ impl WorkerPoolRepo {
         process_ids: &[i64],
         operator_user_id: i64,
     ) -> Result<Option<TakenItem>, AppError> {
-        let row: Option<TakenRow> = sqlx::query_as(
+        let row: Option<TakenRow> = sqlx::query_as!(
+            TakenRow,
             r#"
             WITH
             held AS (
@@ -126,7 +127,7 @@ impl WorkerPoolRepo {
                 FROM candidate
                 WHERE pb.id = candidate.id
                   AND pb.version = candidate.version
-                RETURNING pb.id AS batch_id, pb.part_id, pb.batch_no, pb.quantity, pb.version
+                RETURNING pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.version
             ),
             sel_part AS (
                 SELECT p.id, p.serial_no, p.drawing_no,
@@ -134,17 +135,17 @@ impl WorkerPoolRepo {
                 FROM t_part p
                 JOIN upd_batch ub ON ub.part_id = p.id
             )
-            SELECT ub.batch_id, ub.part_id, ub.batch_no, ub.quantity,
+            SELECT ub.id AS batch_id, ub.part_id, ub.batch_no, ub.quantity,
                    sp.serial_no, sp.drawing_no,
                    sp.system_delivery_date, sp.planned_delivery_date,
                    sp.is_urgent, ub.version
             FROM upd_batch ub JOIN sel_part sp ON sp.id = ub.part_id
             "#,
+            worker_id,
+            shelf_id,
+            process_ids as &[i64],
+            operator_user_id,
         )
-        .bind(worker_id)
-        .bind(shelf_id)
-        .bind(process_ids)
-        .bind(operator_user_id)
         .fetch_optional(&mut *conn)
         .await
         .map_err(AppError::from)?;

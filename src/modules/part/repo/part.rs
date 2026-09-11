@@ -492,7 +492,7 @@ impl PartRepo {
         current_user_id: i64,
         initial_batch_id: i64,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO t_part (
                 id, name, drawing_no, applicant_name, quantity, request_date,
@@ -506,22 +506,22 @@ impl PartRepo {
                 0, 0, $8, 0, $9
             )
             "#,
+            id,
+            name,
+            drawing_no,
+            quantity,
+            planned_delivery_date,
+            customer_id,
+            assembly_id,
+            serial_no,
+            current_user_id,
         )
-        .bind(id)
-        .bind(name)
-        .bind(drawing_no)
-        .bind(quantity)
-        .bind(planned_delivery_date)
-        .bind(customer_id)
-        .bind(assembly_id)
-        .bind(serial_no)
-        .bind(current_user_id)
         .execute(&mut *conn)
         .await?;
         // 初始批次（part/assembly/batch 重构方案 §4.1 PR-B1）：子件 location='OFFICE'。
         // 复用 `PartBatchRepo::create_initial_batch` 的 INSERT 形状，保持与
         // `create_part` / `batch_create_parts` 两个入口的批次初始化语义一致。
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO t_part_batch (
                 id, part_id, batch_no, quantity, status, location,
@@ -535,11 +535,11 @@ impl PartRepo {
                 0, now(), $4, now(), $4
             )
             "#,
+            initial_batch_id,
+            id,
+            quantity,
+            current_user_id,
         )
-        .bind(initial_batch_id)
-        .bind(id)
-        .bind(quantity)
-        .bind(current_user_id)
         .execute(&mut *conn)
         .await?;
         Ok(())
@@ -549,23 +549,20 @@ impl PartRepo {
     ///
     /// 6 列：status / location / current_holder_id / next_process_id /
     /// placed_at / version。`None` 表示 part 不存在或已软删。
-    ///
-    /// 使用非宏 `sqlx::query_as`（不用 `query_as!`），避免 `SQLX_OFFLINE=true`
-    /// 时 .sqlx 缓存缺失报错；调用方需要重新生成缓存时，可在 dev 库上跑
-    /// `./scripts/sqlx_prepare.sh`。
     pub async fn get_part_rollup_state<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
     ) -> Result<Option<crate::modules::part::model::TPartRollupState>, sqlx::Error> {
-        sqlx::query_as::<_, crate::modules::part::model::TPartRollupState>(
+        sqlx::query_as!(
+            crate::modules::part::model::TPartRollupState,
             r#"
             SELECT status, location, current_holder_id, next_process_id,
                    placed_at, version
             FROM t_part
             WHERE id = $1 AND deleted_at IS NULL
             "#,
+            part_id,
         )
-        .bind(part_id)
         .fetch_optional(executor)
         .await
     }
@@ -589,7 +586,7 @@ impl PartRepo {
         placed_at: Option<chrono::NaiveDateTime>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
+        let r = sqlx::query!(
             r#"
             UPDATE t_part
             SET status            = $2,
@@ -602,14 +599,14 @@ impl PartRepo {
                 updated_by        = $7
             WHERE id = $1 AND deleted_at IS NULL
             "#,
+            part_id,
+            status,
+            location,
+            current_holder_id,
+            next_process_id,
+            placed_at,
+            updated_by,
         )
-        .bind(part_id)
-        .bind(status)
-        .bind(location)
-        .bind(current_holder_id)
-        .bind(next_process_id)
-        .bind(placed_at)
-        .bind(updated_by)
         .execute(executor)
         .await?;
         Ok(r.rows_affected())
@@ -627,7 +624,7 @@ impl PartRepo {
         part_id: i64,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
+        let r = sqlx::query!(
             r#"
             UPDATE t_part
             SET has_been_repaired = TRUE,
@@ -636,9 +633,9 @@ impl PartRepo {
                 updated_by        = $2
             WHERE id = $1 AND deleted_at IS NULL
             "#,
+            part_id,
+            updated_by,
         )
-        .bind(part_id)
-        .bind(updated_by)
         .execute(executor)
         .await?;
         Ok(r.rows_affected())
