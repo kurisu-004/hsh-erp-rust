@@ -899,4 +899,35 @@ impl PartRepo {
         ).execute(executor).await?;
         Ok(r.rows_affected())
     }
+
+    /// 2026-09-11 part/assembly/batch 重构方案 §4.2 (PR-B2)：part cancel 时
+    /// 级联取消**全部活跃批次**（不只「最近一条 source-status」）。
+    ///
+    /// 单条 UPDATE：`WHERE part_id = $1 AND deleted_at IS NULL` 把 part 下所有
+    /// 活跃 batch → CANCELLED（不走 OCC；version += 1；写 updated_by）。
+    /// 不在 SQL 上做 status 白名单过滤：cancel 5 状态白名单由 service 层
+    /// `can_transition_to` 守；此处只管「part 已决定 cancel，批量同步 batch」。
+    ///
+    /// 返回影响行数（0 表示 part 下无活跃批次 —— 不视为错误，由 caller 决定）。
+    pub async fn cancel_all_active_batches_for_part<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        current_user_id: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            r#"
+            UPDATE t_part_batch
+            SET status     = 'CANCELLED',
+                version    = version + 1,
+                updated_at = now(),
+                updated_by = $2
+            WHERE part_id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(part_id)
+        .bind(current_user_id)
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
+    }
 }

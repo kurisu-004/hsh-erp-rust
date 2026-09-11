@@ -176,19 +176,15 @@ impl PartService {
                 format!("part {part_id} 版本冲突"),
             ));
         }
-        // 同步最近一条 source-status 批次。无源批次 → 跳过。
-        if let Some(b) =
-            PartRepo::find_most_recent_batch_for_part(&mut *conn, part_id, from.as_str()).await?
-        {
-            let bn =
-                PartRepo::mark_batch_cancelled(&mut *conn, b.id, b.version, current.id).await?;
-            if bn == 0 {
-                return Err(AppError::biz(
-                    code::VERSION_CONFLICT,
-                    format!("batch {} 版本冲突", b.id),
-                ));
-            }
-        }
+        // PR-B2 §4.2 cancel 改造：级联取消**全部活跃批次**（不只「最近一条
+        // source-status」），单条 UPDATE 即覆盖。无活跃批次 → 影响行数 0，
+        // 视为合法（新建工单未拆批场景）。
+        let _batches_cancelled = PartRepo::cancel_all_active_batches_for_part(
+            &mut *conn,
+            part_id,
+            current.id,
+        )
+        .await?;
         PartRepo::insert_part_event(
             &mut *conn,
             NewPartEvent {

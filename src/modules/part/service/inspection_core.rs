@@ -9,7 +9,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
+use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
@@ -152,46 +152,17 @@ impl PartService {
         )
         .await?;
 
-        // 7. 多轮 rollup 守卫：仅当无其它 INSPECTION 批次时才翻 t_part.status
-        let other_inprocess =
-            PartRepo::count_other_inprocess_batches(&mut *conn, part_id).await?;
-        if other_inprocess > 0 {
-            let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished"))
-                })?;
-            return Ok(ToXxxOut {
-                part: PartOut::from(fresh),
-                new_batch_id: new_batch_id_out,
-                synced_assembly_id: None,
-            });
-        }
-
-        // 8. UPDATE t_part: 同步工单状态
-        let n = PartRepo::mark_part_passed_inspection(
-            &mut *conn,
-            part_id,
-            part.version,
-            Some(current.id),
-        )
-        .await?;
-        if n == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("part {part_id} 版本冲突"),
-            ));
-        }
-        // —— 父装配件自动同步：part.status 翻 READY_TO_SHIP 后回流父 assembly ——
-        // 仅当 mark_part_passed_inspection 真正执行（即无其它 INSPECTION 批次）才触发；
-        // rollup guard 早返回路径跳过同步。
-        let synced = AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await?;
+        // 7. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
+        //    内部走 min-progress 规则（多条 INSPECTION 批次时 part 维持
+        //    INSPECTION，单条时升 READY_TO_SHIP）；status 变化时级联调
+        //    AssemblyService::sync_from_part_change 闭合链路。
+        let synced = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
         let synced_assembly_id = match synced {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
         };
 
-        // 9. 重读返回
+        // 8. 重读返回
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
             .await?
             .ok_or_else(|| {
@@ -318,33 +289,15 @@ impl PartService {
             },
         )
         .await?;
-        // 8. 多轮 rollup 守卫：还有别的 INSPECTION 批次？保留工单 INSPECTION 状态
-        let other_inprocess = PartRepo::count_other_inprocess_batches(&mut *conn, part_id).await?;
-        if other_inprocess > 0 {
-            let fresh = PartRepo::get_part_inspected(&mut *conn, part_id).await?
-                .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished")))?;
-            return Ok(ToXxxOut {
-                part: PartOut::from(fresh),
-                new_batch_id: new_batch_id_out,
-                synced_assembly_id: None,
-            });
-        }
-        // 9. UPDATE t_part: 同步工单状态
-        let n = PartRepo::mark_part_failed_inspection(
-            &mut *conn, part_id, part.version, shelf_id, next_process_id, Some(current.id),
-        ).await?;
-        if n == 0 {
-            return Err(AppError::biz(code::VERSION_CONFLICT, format!("part {part_id} 版本冲突")));
-        }
-        // —— 父装配件自动同步：part.status 翻 IN_PROCESS 后回流父 assembly ——
-        // 仅当 mark_part_failed_inspection 真正执行（即无其它 INSPECTION 批次）才触发；
-        // rollup guard 早返回路径跳过同步。
-        let synced = AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await?;
+        // 8. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
+        //    内部走 min-progress 规则；status 变化时级联调
+        //    AssemblyService::sync_from_part_change 闭合链路。
+        let synced = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
         let synced_assembly_id = match synced {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
         };
-        // 10. 重读返回
+        // 9. 重读返回
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id).await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished")))?;
         Ok(ToXxxOut {
@@ -472,16 +425,10 @@ impl PartService {
                 format!("batch {operated_id} 版本冲突"),
             ));
         }
-        // 8. UPDATE t_part
-        let n = PartRepo::mark_part_inspected(
-            &mut *conn, part_id, part.version, target_shelf.id, Some(current.id),
-        )
-        .await?;
-        if n == 0 {
-            return Err(AppError::biz(code::VERSION_CONFLICT, format!("part {part_id} 版本冲突")));
-        }
-        // —— 父装配件自动同步：part.status 翻 INSPECTION 后回流父 assembly ——
-        let synced = AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await?;
+        // 8. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
+        //    内部走 min-progress 规则；status 变化时级联调
+        //    AssemblyService::sync_from_part_change 闭合链路。
+        let synced = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
         let synced_assembly_id = match synced {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,

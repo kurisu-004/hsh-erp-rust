@@ -323,6 +323,7 @@ pub async fn worker_scan(
         req.shelf_id,
         &scan_out.badge_code,
         current.id,
+        &current,
     )
     .await?;
     tx.commit().await?;

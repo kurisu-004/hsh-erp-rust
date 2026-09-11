@@ -20,6 +20,7 @@ use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
+use crate::modules::part::service::PartService;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::modules::work_type::repo::WorkTypeRepo;
 use crate::modules::worker::repo::WorkerRepo;
@@ -53,6 +54,7 @@ impl WorkerPoolService {
         worker_id: i64,
         shelf_id: i64,
         operator_user_id: i64,
+        current: &CurrentUser,
     ) -> Result<RefillResult, AppError> {
         let worker = WorkerRepo::get_by_id(&mut *conn, worker_id, false)
             .await?
@@ -83,6 +85,7 @@ impl WorkerPoolService {
             shelf_id,
             &worker.badge_code,
             operator_user_id,
+            current,
         )
         .await
     }
@@ -107,6 +110,7 @@ impl WorkerPoolService {
         shelf_id: i64,
         badge_code: &str,
         operator_user_id: i64,
+        current: &CurrentUser,
     ) -> Result<RefillResult, AppError> {
         let work_type = WorkTypeRepo::get_by_id(&mut *conn, work_type_id)
             .await?
@@ -159,6 +163,9 @@ impl WorkerPoolService {
                 },
             )
             .await?;
+            // PR-B2：part 派生列（location/holder）由 sync_from_batch_change 统一
+            // 回填（worker_id → worker holder，location → 'WORKER'）。
+            PartService::sync_from_batch_change(&mut *conn, t.part_id, current).await?;
             taken.push(t);
         }
 
@@ -274,7 +281,7 @@ impl WorkerPoolService {
                 ),
             )
         })?;
-        // 3. 切 holder 到 shelf + 改 next_process_id（OCC）
+        // 3. 切 holder 到 shelf + 改 next_process_id（OCC，batch 级）
         let batch_rows =
             PartRepo::mark_batch_returned(&mut *conn, batch.id, batch.version, req.shelf_id,
                 req.next_process_id, Some(current.id)).await?;
@@ -287,22 +294,10 @@ impl WorkerPoolService {
         let part = PartRepo::get_by_id(&mut *conn, batch.part_id, false)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let part_rows = PartRepo::mark_part_returned(
-            &mut *conn,
-            part.id,
-            part.version,
-            req.shelf_id,
-            req.next_process_id,
-            Some(current.id),
-        )
-        .await?;
-        if part_rows == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("part {} 版本冲突", part.id),
-            ));
-        }
-        // 4. event
+        // 4. PR-B2：part 派生列由 sync_from_batch_change 统一回填
+        //    （location=PRODUCTION_SHELF / holder=shelf / next_process）。
+        PartService::sync_from_batch_change(&mut *conn, part.id, current).await?;
+        // 5. event
         PartRepo::insert_part_event(
             &mut *conn,
             NewPartEvent {
@@ -320,7 +315,7 @@ impl WorkerPoolService {
             },
         )
         .await?;
-        // 5. 返回
+        // 6. 返回
         Ok(TakenItem {
             batch_id: batch.id,
             part_id: part.id,

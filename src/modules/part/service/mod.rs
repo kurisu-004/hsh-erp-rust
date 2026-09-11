@@ -14,6 +14,7 @@ pub mod crud;
 pub mod inspection;
 pub mod inspection_core;
 pub mod lifecycle;
+pub mod rollup;
 pub mod worker_scan;
 
 // 重导出子模块内的 `pub const`（impl 块里的方法由 `PartService` 自身承载，
