@@ -1281,3 +1281,146 @@ async fn update_assembly_scales_child_quantities() {
         "quantity 不变 → 不应触发缩放"
     );
 }
+
+/// 12. §3.3 缩放公式在 SQL 端的覆盖：四舍五入边界 + GREATEST(1, ...) 下限。
+///     child_qty=1, old_qty=3, new_qty=5 → 1*5/3 ≈ 1.666 → round=2（验证四舍五入）
+///     child_qty=1, old_qty=10, new_qty=3 → 1*3/10 = 0.3 → round=0 → GREATEST 1 = 1（验证下限）
+///     child_qty=2, old_qty=3, new_qty=4 → 2*4/3 ≈ 2.666 → round=3（验证四舍五入）
+#[tokio::test]
+async fn update_assembly_scales_child_quantities_rounding_and_floor() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户K", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客K", l1).await;
+    insert_serial_counter(&pool, "F", 0).await;
+
+    // 建装配体（quantity=3，3 子件：q=1, 2, 1）
+    let pdf = make_fixture_pdf(4);
+    let req = AssemblyCreateRequest {
+        drawing_no: "D-SCALE-002".into(),
+        name: "scale-rounding-test".into(),
+        applicant_name: None,
+        customer_id: l2.to_string(),
+        request_date: None,
+        planned_delivery_date: None,
+        is_urgent: Some(false),
+        quantity: Some(3),
+        unit_price: None,
+        total_price: None,
+        order_no: None,
+        system_delivery_date: None,
+        note: None,
+        children: vec![
+            AssemblyChildRequest { name: "c-1".into(), drawing_no: Some("RD-D-1".into()), planned_delivery_date: None, quantity: Some(1) },
+            AssemblyChildRequest { name: "c-2".into(), drawing_no: Some("RD-D-2".into()), planned_delivery_date: None, quantity: Some(2) },
+            AssemblyChildRequest { name: "c-3".into(), drawing_no: Some("RD-D-3".into()), planned_delivery_date: None, quantity: Some(1) },
+        ],
+    };
+    let current = test_current_user();
+    let mut tx = pool.begin().await.unwrap();
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let out = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
+        .await
+        .expect("create should succeed");
+    let asm_id = out.assembly.id;
+    let asm_version = out.assembly.version;
+    tx.commit().await.unwrap();
+
+    // update quantity: 3 → 5
+    // child1: 1*5/3 = 1.666 → round = 2
+    // child2: 2*5/3 = 3.333 → round = 3
+    // child3: 1*5/3 = 1.666 → round = 2
+    let upd_req = AssemblyUpdateRequest {
+        drawing_no: None, name: None, applicant_name: None,
+        customer_id: None, request_date: None, planned_delivery_date: None,
+        actual_delivery_date: None, is_urgent: None,
+        quantity: Some(5),
+        unit_price: None, total_price: None,
+        order_no: None, system_delivery_date: None, note: None,
+        version: asm_version,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let after = AssemblyService::update_assembly(&mut tx, asm_id, &upd_req, &current)
+        .await
+        .expect("update should succeed");
+    tx.commit().await.unwrap();
+    assert_eq!(after.quantity, 5);
+
+    let child_qtys: Vec<i32> = sqlx::query_scalar(
+        "SELECT quantity FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
+    )
+    .bind(asm_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query child qty after 3→5");
+    assert_eq!(
+        child_qtys,
+        vec![2, 3, 2],
+        "3→5：round(1*5/3)=2, round(2*5/3)=3, round(1*5/3)=2（四舍五入）"
+    );
+
+    // update quantity: 5 → 3（验证缩小也走比例）
+    // child1: 2*3/5 = 1.2 → round = 1
+    // child2: 3*3/5 = 1.8 → round = 2
+    // child3: 2*3/5 = 1.2 → round = 1
+    let upd_req = AssemblyUpdateRequest {
+        drawing_no: None, name: None, applicant_name: None,
+        customer_id: None, request_date: None, planned_delivery_date: None,
+        actual_delivery_date: None, is_urgent: None,
+        quantity: Some(3),
+        unit_price: None, total_price: None,
+        order_no: None, system_delivery_date: None, note: None,
+        version: after.version,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let after2 = AssemblyService::update_assembly(&mut tx, asm_id, &upd_req, &current)
+        .await
+        .expect("update should succeed");
+    tx.commit().await.unwrap();
+    assert_eq!(after2.quantity, 3);
+
+    let child_qtys2: Vec<i32> = sqlx::query_scalar(
+        "SELECT quantity FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
+    )
+    .bind(asm_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query child qty after 5→3");
+    assert_eq!(
+        child_qtys2,
+        vec![1, 2, 1],
+        "5→3：round(2*3/5)=1, round(3*3/5)=2, round(2*3/5)=1"
+    );
+
+    // update quantity: 3 → 1（验证缩小到下限 1）
+    // child1: 1*1/3 = 0.333 → round = 0 → GREATEST 1 = 1
+    // child2: 2*1/3 = 0.666 → round = 1
+    // child3: 1*1/3 = 0.333 → round = 0 → GREATEST 1 = 1
+    let upd_req = AssemblyUpdateRequest {
+        drawing_no: None, name: None, applicant_name: None,
+        customer_id: None, request_date: None, planned_delivery_date: None,
+        actual_delivery_date: None, is_urgent: None,
+        quantity: Some(1),
+        unit_price: None, total_price: None,
+        order_no: None, system_delivery_date: None, note: None,
+        version: after2.version,
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let after3 = AssemblyService::update_assembly(&mut tx, asm_id, &upd_req, &current)
+        .await
+        .expect("update should succeed");
+    tx.commit().await.unwrap();
+    assert_eq!(after3.quantity, 1);
+
+    let child_qtys3: Vec<i32> = sqlx::query_scalar(
+        "SELECT quantity FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
+    )
+    .bind(asm_id)
+    .fetch_all(&pool)
+    .await
+    .expect("query child qty after 3→1");
+    assert_eq!(
+        child_qtys3,
+        vec![1, 1, 1],
+        "3→1：GREATEST(1, round(...))=1（下限命中；child2 round(2/3)=1）"
+    );
+}
