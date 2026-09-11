@@ -23,6 +23,24 @@ use crate::modules::part::model::TPart;
 
 pub struct PartBatchRepo;
 
+/// 初始批次 INSERT 入参（part/service/crud.rs 三创建入口共用）。
+///
+/// 2026-09-11 part/assembly/batch 重构方案 §4.1 (PR-B1)：新建 part 必须同事务
+/// INSERT 一条 `batch_no=1` 的初始批次，否则车间流转（to_inspection / to_ship /
+/// pickup）会因找不到 INSPECTION 批次而 20109 报错。
+///
+/// `location`：单件 / 批量 part 创建时为 `None`（part 行尚未确定 location）；
+/// 子件创建（`insert_child_for_assembly`）时为 `Some("OFFICE")`（与子件 part
+/// 行写入路径对齐）。其它派生列（`current_holder_id` / `next_process_id` /
+/// `placed_at` / `delivery_note_id`）新建时一律 `None`。
+pub struct NewInitialBatch<'a> {
+    pub id: i64,
+    pub part_id: i64,
+    pub quantity: i32,
+    pub location: Option<&'a str>,
+    pub created_by: Option<i64>,
+}
+
 impl PartBatchRepo {
     pub async fn get_by_id<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -820,5 +838,52 @@ impl PartBatchRepo {
         )
         .fetch_all(executor)
         .await
+    }
+
+    /// 创建初始批次（part/assembly/batch 重构方案 §4.1 PR-B1）。
+    ///
+    /// 在 part 创建入口（`create_part` / `batch_create_parts` / `insert_child_for_assembly`）
+    /// 同事务内调用，插入 `batch_no=1 / status='PENDING' / version=0 /
+    /// has_been_repaired=false / current_holder_id=NULL / next_process_id=NULL /
+    /// placed_at=NULL / delivery_note_id=NULL / parent_batch_id=NULL` 的初始批次。
+    ///
+    /// `location` 单件 / 批量创建时传 `None`，子件创建时传 `Some("OFFICE")`（与
+    /// `insert_child_for_assembly` 写入子件 part 行时的 location 对齐）。
+    ///
+    /// 重复插入（已存在 `batch_no=1` 的活跃批次）由 `uq_t_part_batch_part_no`
+    /// 触发 23505，由 caller 决定是否 swallow；正常创建入口不会触发。
+    ///
+    /// 返回写入行 id（与 `new.id` 一致；显式 RETURNING 兼容未来 trigger）。
+    pub async fn create_initial_batch<'e, E: PgExecutor<'e>>(
+        executor: E,
+        new: NewInitialBatch<'_>,
+    ) -> Result<i64, sqlx::Error> {
+        // 使用非宏 `sqlx::query_scalar`（不用 `query_scalar!`），避免
+        // `SQLX_OFFLINE=true` 时 .sqlx 缓存缺失报错；调用方需要重新生成缓存时，
+        // 可在 dev 库上跑 `./scripts/sqlx_prepare.sh`。
+        let id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO t_part_batch (
+                id, part_id, batch_no, quantity, status, location,
+                current_holder_id, next_process_id, placed_at,
+                delivery_note_id, parent_batch_id, has_been_repaired,
+                version, created_at, created_by, updated_at, updated_by
+            ) VALUES (
+                $1, $2, 1, $3, 'PENDING', $4,
+                NULL, NULL, NULL,
+                NULL, NULL, FALSE,
+                0, now(), $5, now(), $5
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(new.id)
+        .bind(new.part_id)
+        .bind(new.quantity)
+        .bind(new.location)
+        .bind(new.created_by)
+        .fetch_one(executor)
+        .await?;
+        Ok(id)
     }
 }

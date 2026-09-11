@@ -469,9 +469,18 @@ impl PartRepo {
     /// 子件随装配体一起建档；10 个参数都是必填的（id/asm_id/serial 是 3 个主键字段，
     /// name/quantity/drawing_no/planned_delivery_date/customer_id 是 5 个属性，created_by 是审计字段），
     /// 没有聚合语义，builder 包装反而是噪音。直接放宽即可。
+    ///
+    /// 2026-09-11 part/assembly/batch 重构方案 §4.1 (PR-B1)：本函数额外插入
+    /// 一条 `batch_no=1 / status='PENDING' / location='OFFICE' / quantity=$quantity`
+    /// 的初始批次（part/assembly/batch 重构后所有车间流转都锚定 batch，必须有
+    /// 初始批次）。`initial_batch_id` 由 caller 预生成雪花。
+    ///
+    /// 函数签名收 `&mut PgConnection`（非 `impl PgExecutor<'_>`），因为要在同一
+    /// 事务内连发两条 INSERT（与 `split_batch_for_partial_pass` / `split_batch`
+    /// 同模式）。
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert_child_for_assembly<'e, E: PgExecutor<'e>>(
-        executor: E,
+    pub async fn insert_child_for_assembly(
+        conn: &mut sqlx::PgConnection,
         id: i64,
         customer_id: i64,
         assembly_id: i64,
@@ -481,6 +490,7 @@ impl PartRepo {
         quantity: i32,
         planned_delivery_date: Option<chrono::NaiveDate>,
         current_user_id: i64,
+        initial_batch_id: i64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -506,7 +516,31 @@ impl PartRepo {
         .bind(assembly_id)
         .bind(serial_no)
         .bind(current_user_id)
-        .execute(executor)
+        .execute(&mut *conn)
+        .await?;
+        // 初始批次（part/assembly/batch 重构方案 §4.1 PR-B1）：子件 location='OFFICE'。
+        // 复用 `PartBatchRepo::create_initial_batch` 的 INSERT 形状，保持与
+        // `create_part` / `batch_create_parts` 两个入口的批次初始化语义一致。
+        sqlx::query(
+            r#"
+            INSERT INTO t_part_batch (
+                id, part_id, batch_no, quantity, status, location,
+                current_holder_id, next_process_id, placed_at,
+                delivery_note_id, parent_batch_id, has_been_repaired,
+                version, created_at, created_by, updated_at, updated_by
+            ) VALUES (
+                $1, $2, 1, $3, 'PENDING', 'OFFICE',
+                NULL, NULL, NULL,
+                NULL, NULL, FALSE,
+                0, now(), $4, now(), $4
+            )
+            "#,
+        )
+        .bind(initial_batch_id)
+        .bind(id)
+        .bind(quantity)
+        .bind(current_user_id)
+        .execute(&mut *conn)
         .await?;
         Ok(())
     }

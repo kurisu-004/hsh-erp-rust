@@ -24,7 +24,7 @@ use crate::modules::part::dto::{
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::part::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part::repo::PartRepo;
-use crate::modules::part_batch::repo::PartBatchRepo;
+use crate::modules::part_batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::repo::{hash_bytes, NewPartFile, PartFileRepo};
 use crate::shared::error::{code, AppError};
@@ -102,6 +102,21 @@ impl PartService {
         if let Err(e) = PartRepo::create_part(&mut *conn, new).await {
             return Err(map_create_error(e));
         }
+        // 2026-09-11 part/assembly/batch 重构方案 §4.1 (PR-B1)：同事务插入初始
+        // t_part_batch（batch_no=1 / status='PENDING' / location=NULL），让新建工单
+        // 即可走 to_inspection / to_ship / pickup 等 batch-锚定流转。
+        let initial_batch_id = snowflake.next_id();
+        PartBatchRepo::create_initial_batch(
+            &mut *conn,
+            NewInitialBatch {
+                id: initial_batch_id,
+                part_id: new_id,
+                quantity: req.quantity,
+                location: None,
+                created_by: Some(current.id),
+            },
+        )
+        .await?;
         let part = PartRepo::get_part_detail(&mut *conn, new_id)
             .await?
             .ok_or_else(|| {
@@ -179,6 +194,37 @@ impl PartService {
                 .await?;
             match PartRepo::create_part(&mut *conn, new).await {
                 Ok(_) => {
+                    // 2026-09-11 part/assembly/batch 重构方案 §4.1 (PR-B1)：
+                    // part INSERT 成功后同 savepoint 内插入初始 t_part_batch。
+                    // 若此处失败 → 走下方 Err 分支，savepoint ROLLBACK 同时撤销
+                    // part INSERT，保持 per-item 原子。
+                    let initial_batch_id = snowflake.next_id();
+                    if let Err(e) = PartBatchRepo::create_initial_batch(
+                        &mut *conn,
+                        NewInitialBatch {
+                            id: initial_batch_id,
+                            part_id: new_id,
+                            quantity: item.quantity,
+                            location: None,
+                            created_by: Some(current.id),
+                        },
+                    )
+                    .await
+                    {
+                        sqlx::raw_sql(AssertSqlSafe(format!(
+                            "ROLLBACK TO SAVEPOINT {sp_name}"
+                        )))
+                        .execute(&mut *conn)
+                        .await?;
+                        let mapped = map_create_error(e);
+                        failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
+                            part_id: None,
+                            code: mapped.code(),
+                            message: format!("{mapped}"),
+                            item_index: idx,
+                        });
+                        continue;
+                    }
                     sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
                         .execute(&mut *conn)
                         .await?;
