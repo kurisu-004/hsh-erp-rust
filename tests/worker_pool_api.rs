@@ -205,8 +205,24 @@ async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
     l1_id
 }
 
+/// 进程级共享雪花 ID 生成器（2026-09-11 PR-B2 后续修复）。
+///
+/// 多个集成测试在同一毫秒内连发 `insert_pool_part` 等 helper —— 每次独立构
+/// 造 `SnowflakeIdGenerator::new(...)` 会让 sequence=0 在同一毫秒内拿到相同
+/// id（23505 pkey 冲突）。改用 `OnceLock` 共享一个生成器，sequence 自增避
+/// 免重复。
+fn pool_snowflake() -> &'static SnowflakeIdGenerator {
+    use std::sync::OnceLock;
+    static S: OnceLock<SnowflakeIdGenerator> = OnceLock::new();
+    S.get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
+}
+
 /// 插一个 IN_PROCESS+PRODUCTION_SHELF 工单 + 批次 + placed_at。
 /// 返回 (part_id, batch_id)。
+///
+/// 2026-09-11 修复：批量插入时多次独立构造 `SnowflakeIdGenerator` 会在同一毫
+/// 秒内产生重复 id（23505 pkey 冲突）。改用进程级共享生成器 `pool_snowflake()`
+/// —— 内部 `next_id()` 自带 sequence 递增，避免重复。
 async fn insert_pool_part(
     pool: &PgPool,
     customer_id: i64,
@@ -216,10 +232,9 @@ async fn insert_pool_part(
     quantity: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
     let today = now.date();
-    let part_id = snowflake.next_id();
+    let part_id = pool_snowflake().next_id();
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
          request_date, planned_delivery_date, system_delivery_date, status, location, \
@@ -239,7 +254,7 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert t_part");
-    let batch_id = snowflake.next_id();
+    let batch_id = pool_snowflake().next_id();
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
          current_holder_id, next_process_id, placed_at, has_been_repaired, version, \
@@ -298,7 +313,7 @@ async fn insert_worker_held_part(
     .execute(pool)
     .await
     .expect("insert held t_part");
-    let batch_id = snowflake.next_id();
+    let batch_id = pool_snowflake().next_id();
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
          current_holder_id, next_process_id, placed_at, has_been_repaired, version, \

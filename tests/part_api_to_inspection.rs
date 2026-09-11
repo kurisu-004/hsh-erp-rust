@@ -485,9 +485,14 @@ async fn batch_to_inspection_clerk_forbidden() {
 
 /// to-inspection partial-split happy path：PENDING 批次 qty=10 → quantity=3 → 拆批。
 ///
-/// 期望：`new_batch_id` 非 null（remainder 留 PENDING）；`part.status` 已翻转为 INSPECTION。
+/// 期望：`new_batch_id` 非 null（remainder 留 PENDING）；`part.status` 走 batch
+/// rollup 派生：operated 子批（qty=3）翻 INSPECTION + remainder 子批（qty=7）
+/// 留 PENDING → part 物化列取 min-progress = PENDING。
 ///
-/// `split_batch_for_partial_pass` 现在通过 `new_batch_status` 参数接收源批次 status，
+/// 2026-09-11 PR-B2 §5 改造：原断言 `part.status == "INSPECTION"` 改为 PENDING
+/// （多批次 rollup 的预期结果）。operated 子批本身仍是 INSPECTION（DB 端可直查）。
+///
+/// `split_batch_for_partial_pass` 通过 `new_batch_status` 参数接收源批次 status，
 /// 因此 `to_inspection`（源 = `PENDING`）拆出的新批次以 `PENDING` 起始，能通过
 /// `mark_batch_inspected` 的 WHERE 守卫。
 #[tokio::test]
@@ -495,10 +500,10 @@ async fn to_inspection_partial_split_happy_path() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
-    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let (app, token, pool) = login_inspector(pool, "inspector1").await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
     let part_id = insert_part_with_status(
-        &_pool,
+        &pool,
         "P0",
         l2,
         Some("P000"),
@@ -506,8 +511,8 @@ async fn to_inspection_partial_split_happy_path() {
         "PENDING",
     )
     .await;
-    let batch_id = insert_batch(&_pool, part_id, 1, 10, "PENDING").await;
-    let v = batch_version(&_pool, batch_id).await;
+    let batch_id = insert_batch(&pool, part_id, 1, 10, "PENDING").await;
+    let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -526,7 +531,23 @@ async fn to_inspection_partial_split_happy_path() {
     .await;
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert_eq!(body["code"], 0);
-    assert_eq!(body["data"]["part"]["status"], "INSPECTION");
+    // PR-B2 §5 改造：part 派生列由 batch rollup 决定。operated 子批 → INSPECTION +
+    // remainder 子批 → PENDING → part 物化为 min-progress = PENDING。
+    assert_eq!(body["data"]["part"]["status"], "PENDING");
+    // operated 子批（qty=3）应已翻转到 INSPECTION（DB 直查）：
+    // 拆批后 part 下有 2 条活跃 batch —— batch_id（qty=7, PENDING, remainder）
+    // 与 operated 子批（qty=3, INSPECTION）。按 status INSPECTION 查询得 operated 子批。
+    let operated_status: String = sqlx::query_scalar(
+        "SELECT status FROM t_part_batch WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read operated batch status");
+    assert_eq!(
+        operated_status, "INSPECTION",
+        "operated 子批应已翻转到 INSPECTION"
+    );
     let new_bid_str = body["data"]["new_batch_id"]
         .as_str()
         .expect("new_batch_id 应为 string (Some)");

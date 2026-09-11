@@ -236,27 +236,59 @@ async fn list_parts_filter_status_and_customer() {
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
-    // 3 个 PENDING + 1 个 INSPECTION（都在 L2 下）
-    for i in 0..3 {
-        insert_part_with_status(
-            &pool,
-            &format!("P{i}"),
+    // 共用一个雪花生成器连发 4 个唯一 id（避免 4 次独立 generator 在同一
+    // 毫秒内拿到重复 id 触发 23505 pkey 冲突）。
+    {
+        let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
+            1_577_836_800_000,
+            1,
+        );
+        use hsh_erp_rust::infra::clock::now_naive;
+        for i in 0..3 {
+            let now = now_naive();
+            let today = now.date();
+            let id = snowflake.next_id();
+            sqlx::query!(
+                "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+                 applicant_name, request_date, planned_delivery_date, \
+                 quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, \
+                 assembly_id) \
+                 VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, $7)",
+                id,
+                format!("P{i:03}"),
+                format!("P{i}"),
+                l2,
+                now,
+                today,
+                None::<i64>,
+                "PENDING",
+            )
+            .execute(&pool)
+            .await
+            .expect("insert PENDING part");
+        }
+        let now = now_naive();
+        let today = now.date();
+        let id = snowflake.next_id();
+        sqlx::query!(
+            "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+             applicant_name, request_date, planned_delivery_date, \
+             quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, \
+             assembly_id) \
+             VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, $7)",
+            id,
+            "PINS",
+            "PINSP",
             l2,
-            Some(&format!("P{i:03}")),
-            None,
-            "PENDING",
+            now,
+            today,
+            None::<i64>,
+            "INSPECTION",
         )
-        .await;
+        .execute(&pool)
+        .await
+        .expect("insert INSPECTION part");
     }
-    insert_part_with_status(
-        &pool,
-        "PINSP",
-        l2,
-        Some("PINS"),
-        None,
-        "INSPECTION",
-    )
-    .await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1083,7 +1115,7 @@ async fn deliver_ready_to_ship_200() {
             "POST",
             &format!("/parts/{pid}/deliver"),
             Some(json!({
-                "batch_id": bid,
+                "batch_id": bid.to_string(),
                 "version": bver,
                 "note": "发货"
             })),
@@ -1125,7 +1157,7 @@ async fn deliver_wrong_state_400() {
             "POST",
             &format!("/parts/{pid}/deliver"),
             Some(json!({
-                "batch_id": bid,
+                "batch_id": bid.to_string(),
                 "version": bver,
             })),
             Some(&token),
@@ -1220,7 +1252,7 @@ async fn complete_delivered_200() {
             "POST",
             &format!("/parts/{pid}/complete"),
             Some(json!({
-                "batch_id": bid,
+                "batch_id": bid.to_string(),
                 "version": bver,
                 "note": "归档"
             })),
@@ -1258,7 +1290,7 @@ async fn complete_wrong_state_400() {
             "POST",
             &format!("/parts/{pid}/complete"),
             Some(json!({
-                "batch_id": bid,
+                "batch_id": bid.to_string(),
                 "version": bver,
             })),
             Some(&token),
@@ -1273,6 +1305,10 @@ async fn complete_wrong_state_400() {
 ///
 /// 允许角色：Manager / Clerk / Inspector（任一即可）。
 /// 2026-09-11 PR-B3：lifecycle 收 `batch_id` + `version`。
+///
+/// 2026-09-11 PR-B3：start_repair 把 `has_been_repaired=true` 写 batch（同 PR-B2 已
+/// 实现）+ 单独物化 part（`mark_part_repairing_flag_only`，不被 rollup 覆盖）。
+/// `PartOut` 当前不投影该字段（响应体最小化），故断言改为 DB 直查。
 #[tokio::test]
 async fn start_repair_in_process_200() {
     let (_guard, pool) = setup().await;
@@ -1290,14 +1326,14 @@ async fn start_repair_in_process_200() {
     let bid = insert_batch(&pool, pid, 1, 1, "IN_PROCESS").await;
     let bver = batch_version(&pool, bid).await;
 
-    let (app, token, _pool) = login_manager(pool, "mgr").await;
+    let (app, token, pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
         app,
         json_request(
             "POST",
             &format!("/parts/{pid}/start-repair"),
             Some(json!({
-                "batch_id": bid,
+                "batch_id": bid.to_string(),
                 "version": bver,
                 "reason": "尺寸偏大"
             })),
@@ -1309,10 +1345,14 @@ async fn start_repair_in_process_200() {
     assert_eq!(env["code"], 0);
     assert_eq!(env["data"]["status"], "REPAIRING");
     // start_repair 写 batch.has_been_repaired + 单独物化 part.has_been_repaired
-    assert_eq!(
-        env["data"]["has_been_repaired"], true,
-        "start-repair 应置 has_been_repaired=true: {env}"
-    );
+    // （`mark_part_repairing_flag_only`，不在 rollup 范围内 —— 见
+    // `src/modules/part/service/lifecycle.rs` start_repair 第 5 步注释）
+    let part_hbr: bool = sqlx::query_scalar("SELECT has_been_repaired FROM t_part WHERE id = $1")
+        .bind(pid)
+        .fetch_one(&pool)
+        .await
+        .expect("read part.has_been_repaired");
+    assert!(part_hbr, "start-repair 应置 part.has_been_repaired=true");
 }
 
 /// POST /parts/{id}/start-repair —— batch PENDING → 20118 BIZ_PART_REPAIR_NOT_TRIGGERED。
@@ -1335,7 +1375,7 @@ async fn start_repair_wrong_state_400() {
             "POST",
             &format!("/parts/{pid}/start-repair"),
             Some(json!({
-                "batch_id": bid,
+                "batch_id": bid.to_string(),
                 "version": bver,
                 "reason": "no-op"
             })),
@@ -1377,7 +1417,7 @@ async fn deliver_cancelled_409() {
             "POST",
             &format!("/parts/{pid}/deliver"),
             Some(json!({
-                "batch_id": bid,
+                "batch_id": bid.to_string(),
                 "version": bver,
             })),
             Some(&token),
@@ -1438,7 +1478,7 @@ async fn deliver_also_updates_batch() {
             "POST",
             &format!("/parts/{pid}/deliver"),
             Some(json!({
-                "batch_id": bid,
+                "batch_id": bid.to_string(),
                 "version": bver,
                 "note": "发货"
             })),
@@ -1526,7 +1566,7 @@ async fn deliver_without_source_batch_409() {
             "POST",
             &format!("/parts/{pid}/deliver"),
             Some(json!({
-                "batch_id": fake_bid,
+                "batch_id": fake_bid.to_string(),
                 "version": 0,
             })),
             Some(&token),
