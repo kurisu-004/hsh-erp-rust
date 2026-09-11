@@ -538,3 +538,106 @@ pub struct ChildInheritFields<'a> {
     pub is_urgent: bool,
     pub note: Option<&'a str>,
 }
+
+impl PartRepo {
+    /// §3.2 — 把父装配件"更新后的当前行值"覆盖级联到所有未软删子件。
+    ///
+    /// 同步字段：`request_date` / `applicant_name` / `order_no` /
+    /// `system_delivery_date` / `planned_delivery_date` / `is_urgent` / `note` /
+    /// `customer_id`。
+    ///
+    /// 排除：
+    /// - `actual_delivery_date`：deliver 流程写入的产物，不属于"信息字段"。
+    /// - `quantity`：单独走 §3.3 缩放逻辑。
+    ///
+    /// 实现上按"父件更新后的当前行值"做覆盖（即所有 8 个字段无条件覆写），
+    /// 未变更字段被覆写为原值（语义无差），避免三态解析歧义。
+    ///
+    /// 返回受影响行数（含 version+1）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn cascade_sync_from_assembly<'e, E: PgExecutor<'e>>(
+        executor: E,
+        assembly_id: i64,
+        request_date: chrono::NaiveDate,
+        applicant_name: &str,
+        order_no: Option<&str>,
+        system_delivery_date: Option<chrono::NaiveDate>,
+        planned_delivery_date: chrono::NaiveDate,
+        is_urgent: bool,
+        note: Option<&str>,
+        customer_id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            UPDATE t_part
+            SET request_date = $2,
+                applicant_name = $3,
+                order_no = $4,
+                system_delivery_date = $5,
+                planned_delivery_date = $6,
+                is_urgent = $7,
+                note = $8,
+                customer_id = $9,
+                version = version + 1,
+                updated_at = NOW(),
+                updated_by = $10
+            WHERE assembly_id = $1
+              AND deleted_at IS NULL
+            "#,
+        )
+        .bind(assembly_id)
+        .bind(request_date)
+        .bind(applicant_name)
+        .bind(order_no)
+        .bind(system_delivery_date)
+        .bind(planned_delivery_date)
+        .bind(is_urgent)
+        .bind(note)
+        .bind(customer_id)
+        .bind(updated_by)
+        .execute(executor)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// §3.3 — 父件 quantity 变化时，按比例缩放所有未软删子件的 quantity。
+    ///
+    /// 公式：`new_child_qty = max(1, round(child_qty * new_qty / old_qty))`；
+    /// 单条 UPDATE 走 `GREATEST(1, ROUND(quantity::numeric * new_qty / old_qty))`
+    /// 完成整批缩放，`version += 1`。
+    ///
+    /// 防御：`old_qty <= 0` → 直接跳过（视为无缩放），防除零 / 反向缩放。
+    /// **不**追溯调整 `t_part_batch.quantity`（已拆分流转中的批次保持原量）。
+    ///
+    /// 返回受影响行数。
+    pub async fn scale_children_quantity<'e, E: PgExecutor<'e>>(
+        executor: E,
+        assembly_id: i64,
+        old_qty: i32,
+        new_qty: i32,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        if old_qty <= 0 || new_qty <= 0 {
+            return Ok(0);
+        }
+        let res = sqlx::query(
+            r#"
+            UPDATE t_part
+            SET quantity = GREATEST(1, ROUND(quantity::numeric * $2::numeric / $1::numeric)::int),
+                version = version + 1,
+                updated_at = NOW(),
+                updated_by = $4
+            WHERE assembly_id = $3
+              AND deleted_at IS NULL
+            "#,
+        )
+        .bind(old_qty)
+        .bind(new_qty)
+        .bind(assembly_id)
+        .bind(updated_by)
+        .execute(executor)
+        .await?;
+        Ok(res.rows_affected())
+    }
+}

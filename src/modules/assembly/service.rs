@@ -447,6 +447,13 @@ impl AssemblyService {
     /// - `customer_id: None`（字段缺省）→ 不更新
     /// - `customer_id: Some(Some("xxx"))`（三态 Some(Some)）→ 覆盖 + L2 校验
     /// - `applicant_name` 等普通可空字段按 `Option<String>` 语义（None=不动、Some("")=覆盖）
+    ///
+    /// **§3.2 级联 + §3.3 缩放**：`update_partial` 成功后，同事务内：
+    /// 1. 把父件"更新后的当前行值"覆盖级联到所有未软删子件（8 个共享信息字段；
+    ///    排除 `actual_delivery_date` + `quantity`）。
+    /// 2. 若 `req.quantity` 有值且 ≠ 父件现值（old_qty），对每个子件
+    ///    `new_qty = max(1, round(child_qty * new_qty / old_qty))`，
+    ///    `version++`。不追溯调整 `t_part_batch.quantity`。
     pub async fn update_assembly(
         conn: &mut PgConnection,
         assembly_id: i64,
@@ -476,6 +483,17 @@ impl AssemblyService {
             None
         };
 
+        // 预读父件现值：捕获 old_qty 用于 §3.3 缩放触发判断；同事务内的
+        // read-after-write 由 OCC 守，TOCTOU 窗口不会导致错误数据写库。
+        let old_qty: i32 = sqlx::query_scalar(
+            "SELECT quantity FROM t_assembly WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(assembly_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, format!("assembly {assembly_id} 不存在")))?;
+
         let upd = AssemblyUpdate {
             drawing_no: req.drawing_no.as_deref(),
             name: req.name.as_deref(),
@@ -502,10 +520,45 @@ impl AssemblyService {
             return Err(AppError::biz(code::VERSION_CONFLICT, "version 不匹配或记录已删除"));
         }
 
+        // 读回父件"更新后的当前行值" → §3.2 级联 + §3.3 缩放共用此视图
         let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
+
+        // §3.2 级联：覆盖父件"应有值"到所有未软删子件。
+        // `request_date` / `planned_delivery_date` 在 t_assembly 是 NOT NULL，
+        // 由 service 层在 create 时填 today 兜底；update 时三态置 NULL 在本期
+        // 不允许（DTO 是 Option<Option<NaiveDate>> 但语义上 asm 行始终非空）。
+        let today = clock::now_naive().date();
+        let request_date = asm.request_date.unwrap_or(today);
+        let planned_delivery_date = asm.planned_delivery_date.unwrap_or(today);
+        let applicant_name = asm.applicant_name.as_deref().unwrap_or("");
+        PartRepo::cascade_sync_from_assembly(
+            &mut *conn,
+            asm.id,
+            request_date,
+            applicant_name,
+            asm.order_no.as_deref(),
+            asm.system_delivery_date,
+            planned_delivery_date,
+            asm.is_urgent,
+            asm.note.as_deref(),
+            asm.customer_id,
+            current.id,
+        )
+        .await
+        .map_err(AppError::from)?;
+
+        // §3.3 套数缩放：`req.quantity` 有值且 ≠ 父件现值（old_qty）才触发
+        if let Some(new_qty) = req.quantity {
+            if new_qty != old_qty {
+                PartRepo::scale_children_quantity(&mut *conn, asm.id, old_qty, new_qty, current.id)
+                    .await
+                    .map_err(AppError::from)?;
+            }
+        }
+
         Ok(render_assembly_out(asm))
     }
 
