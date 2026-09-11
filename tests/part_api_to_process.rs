@@ -233,10 +233,14 @@ async fn to_process_partial_split_happy_path() {
     .await;
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert_eq!(body["code"], 0);
-    // part.status 保持 INSPECTION（rollup 守卫：剩余 7 件还在 INSPECTION）
+    // PR-B2 §5 改造：partial-split 后 part.status 走 batch rollup（min-progress）：
+    //   operated 子批（qty=3）→ IN_PROCESS，remainder 子批（qty=7）留 INSPECTION
+    //   → 物化 status = min(IN_PROCESS, INSPECTION) = IN_PROCESS。
+    //   旧直接 UPDATE 路径会让 part.status = IN_PROCESS（operated 的状态）；
+    //   新 rollup 路径结果一致（min-progress 也取 IN_PROCESS）。
     assert_eq!(
-        body["data"]["part"]["status"], "INSPECTION",
-        "partial-split 后 part.status 应保持 INSPECTION（rollup 守卫检测到 remainder INSPECTION 批次）"
+        body["data"]["part"]["status"], "IN_PROCESS",
+        "partial-split 后 part.status 由 rollup 派生为 IN_PROCESS（min progress）"
     );
     // 拆批后剩余批次 id（remainder 留在 INSPECTION 待后续操作）
     let new_bid_str = body["data"]["new_batch_id"]

@@ -21,17 +21,35 @@
 
 权限: **Manager / Clerk**
 
-Request：`{ "note"?: string }`（可空）
+> ⚠️ **2026-09-11 BREAKING CHANGE (PR-B3)**：lifecycle 三端点（deliver /
+> complete / start-repair）改为 **batch 级**，OCC 锚定 `t_part_batch.version`。
+> 前端需先调 `GET /parts/by-serial/{serial_no}/part-batches` 拿 `batch_id` +
+> `version`，再传入本端点。
 
-Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后工单。同步翻转最近一条 `READY_TO_SHIP` 批次（同事务）。
+Request：
+
+```json
+{
+  "batch_id": 1234567890,    // 必填；操作的目标 batch id（雪花 i64）
+  "version": 0,               // 必填；batch.version（OCC）
+  "note": "string (可选)"
+}
+```
+
+业务流转：`READY_TO_SHIP → DELIVERED`（batch 级）；part 派生列由 PR-B2
+rollup 自动回填；事件日志 `DELIVERED` 的 `batch_id` / `quantity` 来自
+操作的批次。
+
+Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后工单。
 
 错误码：
 
 - 20101 — part 不存在 / 软删
 - 20104 — status 字符串非法
+- 20109 — batch 不存在 / 不属于该 part
 - 20115 — part 已 CANCELLED
-- 20117 — 当前状态非 READY_TO_SHIP（状态机白名单拒绝）
-- 40901 — 乐观锁失败（part 或 batch）
+- 20117 — batch 当前状态非 READY_TO_SHIP（状态机白名单拒绝）
+- 40901 — 乐观锁失败（batch version 冲突）
 
 ### `POST /api/v2/parts/{part_id}/cancel`
 
@@ -54,36 +72,72 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段)。同步翻转最�
 
 权限: **Manager / Clerk**
 
-Request：`{ "note"?: string }`（可空）
+> ⚠️ **2026-09-11 BREAKING CHANGE (PR-B3)**：收 `batch_id` + `version`，锚定
+> `t_part_batch.version`（与 inspection 三流一致）。状态机守卫读 batch 当前
+> 状态 `DELIVERED → COMPLETED`；part 终态后 `serial_no` 被清空（序列号已
+> 转交送货单）。
 
-Response 200 `data`：[`PartOut`](./index.md#partout-字段)。**`t_part.serial_no` 被清空**（序列号已转交送货单）。同步翻转最近一条 DELIVERED 批次（同事务）。
+Request：
+
+```json
+{
+  "batch_id": 1234567890,    // 必填；操作的目标 batch id
+  "version": 0,               // 必填；batch.version（OCC）
+  "note": "string (可选)"
+}
+```
+
+Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
 
 错误码：
 
 - 20101 — part 不存在 / 软删
+- 20109 — batch 不存在 / 不属于该 part
 - 20115 — part 已 CANCELLED
-- 20116 — 当前状态非 DELIVERED（状态机白名单拒绝）
+- 20116 — batch 当前状态非 DELIVERED（状态机白名单拒绝）
 - 40901 — 乐观锁失败
 
 ### `POST /api/v2/parts/{part_id}/start-repair`
 
 权限: **Manager / Clerk / Inspector**
 
-Request：`{ "reason"?: string, "note"?: string }`（`reason` 优先作为事件 note）
+> ⚠️ **2026-09-11 BREAKING CHANGE (PR-B3)**：收 `batch_id` + `version`，锚定
+> `t_part_batch.version`。状态机守卫读 batch 当前状态 `IN_PROCESS → REPAIRING`；
+> `has_been_repaired=true` 同时写 batch（PR-B3 §4.3 现状）与 part（rollup
+> 范围外单独物化）。
 
-Response 200 `data`：[`PartOut`](./index.md#partout-字段)。`t_part.has_been_repaired` 置 `true`；同步翻转最近一条 IN_PROCESS 批次（同事务）。
+Request：
+
+```json
+{
+  "batch_id": 1234567890,    // 必填；操作的目标 batch id
+  "version": 0,               // 必填；batch.version（OCC）
+  "reason": "string (可选)",  // 优先作为事件 note
+  "note": "string (可选)"
+}
+```
+
+Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
 
 错误码：
 
 - 20101 — part 不存在 / 软删
+- 20109 — batch 不存在 / 不属于该 part
 - 20115 — part 已 CANCELLED
-- 20118 — 当前状态非 IN_PROCESS（状态机白名单拒绝）
+- 20118 — batch 当前状态非 IN_PROCESS（状态机白名单拒绝）
 - 40901 — 乐观锁失败
 
 ---
 
 ## Lifecycle 专属 DTO
 
-### DeliverRequest / CancelRequest / CompleteRequest / StartRepairRequest 字段
+### DeliverRequest / CompleteRequest / StartRepairRequest 字段（PR-B3 batch 级）
 
-均仅含可选 `note` / `reason`（≤ 500 字符建议）；事件日志透传 `note`，cancel 与 start-repair 优先取 `reason` 作为事件 note。
+三者均含必填 `batch_id` + `version`（锚 `t_part_batch.version`）+ 可选
+`note` / `reason`（≤ 500 字符建议）。事件日志 `batch_id` / `quantity` 来自
+操作的批次；cancel 与 start-repair 优先取 `reason` 作为事件 note。
+
+### CancelRequest 字段（保持 part 级）
+
+仅含可选 `reason` / `note`（cancel 走 part 级 + 级联取消全部活跃批次，详见
+[重构方案 §4.2](../../refactor-part-assembly-batch.md#42-rollup-回调核心-新增-partservicesync_from_batch_change)）。

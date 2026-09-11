@@ -8,7 +8,8 @@
 //!   每抢到一批写一条 `TAKEN_FROM_POOL` 事件日志（commit 由 handler 负责）。
 //! - `compute_state` —— worker 当前持有数 + 池候选数（按工序分组）；用于 state 端点。
 //! - `admin_remove_held_batch` —— admin 主动把 worker 持有的某批次按 RETURNED 语义放回
-//!   候选池；调 `PartRepo::mark_batch_returned` + `mark_part_returned` + 写事件日志。
+//!   候选池；调 `PartRepo::mark_batch_returned`（OCC）+ `sync_from_batch_change`
+//!   同步 part 派生列 + 写事件日志。
 //!
 //! ## 阶段 worker-pool-by-process（Task 3）
 //! - `pool_by_process` —— admin 按工序查看候选池：process 元数据 + 映射工种 + 可执行工人 +
@@ -20,6 +21,7 @@ use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
+use crate::modules::part::service::PartService;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::modules::work_type::repo::WorkTypeRepo;
 use crate::modules::worker::repo::WorkerRepo;
@@ -53,6 +55,7 @@ impl WorkerPoolService {
         worker_id: i64,
         shelf_id: i64,
         operator_user_id: i64,
+        current: &CurrentUser,
     ) -> Result<RefillResult, AppError> {
         let worker = WorkerRepo::get_by_id(&mut *conn, worker_id, false)
             .await?
@@ -83,6 +86,7 @@ impl WorkerPoolService {
             shelf_id,
             &worker.badge_code,
             operator_user_id,
+            current,
         )
         .await
     }
@@ -107,6 +111,7 @@ impl WorkerPoolService {
         shelf_id: i64,
         badge_code: &str,
         operator_user_id: i64,
+        current: &CurrentUser,
     ) -> Result<RefillResult, AppError> {
         let work_type = WorkTypeRepo::get_by_id(&mut *conn, work_type_id)
             .await?
@@ -159,6 +164,9 @@ impl WorkerPoolService {
                 },
             )
             .await?;
+            // PR-B2：part 派生列（location/holder）由 sync_from_batch_change 统一
+            // 回填（worker_id → worker holder，location → 'WORKER'）。
+            PartService::sync_from_batch_change(&mut *conn, t.part_id, current).await?;
             taken.push(t);
         }
 
@@ -242,7 +250,7 @@ impl WorkerPoolService {
     /// 1. 取 worker（事件日志 `badge_code` 需要）；
     /// 2. 按 `(batch_id, holder_id = worker_id)` 找 IN_PROCESS+WORKER 批次，
     ///    找不到 → `20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER`；
-    /// 3. `mark_batch_returned` + `mark_part_returned`（OCC：version 冲突 →
+    /// 3. `mark_batch_returned`（OCC：version 冲突 →
     ///    `40901`）；shelf+next_process 由 admin 在 req 里指定（不校验 shelf
     ///    是否映射该 process —— 若 shelf 不映射此 process，下一次 worker refill
     ///    自然拿不到，由 service 抛出业务错时再处理）；
@@ -274,7 +282,7 @@ impl WorkerPoolService {
                 ),
             )
         })?;
-        // 3. 切 holder 到 shelf + 改 next_process_id（OCC）
+        // 3. 切 holder 到 shelf + 改 next_process_id（OCC，batch 级）
         let batch_rows =
             PartRepo::mark_batch_returned(&mut *conn, batch.id, batch.version, req.shelf_id,
                 req.next_process_id, Some(current.id)).await?;
@@ -287,22 +295,10 @@ impl WorkerPoolService {
         let part = PartRepo::get_by_id(&mut *conn, batch.part_id, false)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let part_rows = PartRepo::mark_part_returned(
-            &mut *conn,
-            part.id,
-            part.version,
-            req.shelf_id,
-            req.next_process_id,
-            Some(current.id),
-        )
-        .await?;
-        if part_rows == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("part {} 版本冲突", part.id),
-            ));
-        }
-        // 4. event
+        // 4. PR-B2：part 派生列由 sync_from_batch_change 统一回填
+        //    （location=PRODUCTION_SHELF / holder=shelf / next_process）。
+        PartService::sync_from_batch_change(&mut *conn, part.id, current).await?;
+        // 5. event
         PartRepo::insert_part_event(
             &mut *conn,
             NewPartEvent {
@@ -320,7 +316,7 @@ impl WorkerPoolService {
             },
         )
         .await?;
-        // 5. 返回
+        // 6. 返回
         Ok(TakenItem {
             batch_id: batch.id,
             part_id: part.id,

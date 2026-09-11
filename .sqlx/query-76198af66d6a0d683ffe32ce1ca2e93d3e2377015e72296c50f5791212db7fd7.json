@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO t_part_batch (\n                id, part_id, batch_no, quantity, status, location,\n                current_holder_id, next_process_id, placed_at,\n                delivery_note_id, parent_batch_id, has_been_repaired,\n                version, created_at, created_by, updated_at, updated_by\n            ) VALUES (\n                $1, $2, 1, $3, 'PENDING', $4,\n                NULL, NULL, NULL,\n                NULL, NULL, FALSE,\n                0, now(), $5, now(), $5\n            )\n            RETURNING id AS \"id!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "76198af66d6a0d683ffe32ce1ca2e93d3e2377015e72296c50f5791212db7fd7"
+}

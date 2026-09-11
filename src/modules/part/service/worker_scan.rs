@@ -35,7 +35,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
+use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
@@ -70,7 +70,10 @@ impl PartService {
     ///
     /// `WorkerScanEvent` 是 unit enum（`Copy`），所以 `req` 按值传（caller 的
     /// DTO `req.clone()` 不再需要）。
-    #[allow(clippy::too_many_lines)]
+    // 2026-09-11 PR-B2 改造后保留 master 既有的 `event_type_str` 晚初始化模式（worker_scan.rs:146
+    // 是 master 既有的 pre-existing 例外），新版本 clippy (1.98) 会以
+    // `clippy::needless_late_init` 报警，故显式豁免。
+    #[allow(clippy::too_many_lines, clippy::needless_late_init)]
     pub async fn worker_scan_event(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
@@ -186,18 +189,9 @@ impl PartService {
                 if n == 0 {
                     return Err(AppError::biz(code::VERSION_CONFLICT, "乐观锁失败"));
                 }
-                let n = PartRepo::mark_part_returned(
-                    &mut *conn,
-                    part.id,
-                    part.version,
-                    req.shelf_id,
-                    next_pid,
-                    Some(current.id),
-                )
-                .await?;
-                if n == 0 {
-                    return Err(AppError::biz(code::VERSION_CONFLICT, "乐观锁失败"));
-                }
+                // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
+                // 未变化（IN_PROCESS→IN_PROCESS）但 location/holder/process 物化。
+                PartService::sync_from_batch_change(&mut *conn, part.id, current).await?;
                 PartRepo::insert_part_event(
                     &mut *conn,
                     NewPartEvent {
@@ -272,22 +266,9 @@ impl PartService {
                 if n == 0 {
                     return Err(AppError::biz(code::VERSION_CONFLICT, "乐观锁失败"));
                 }
-                let n = PartRepo::mark_part_inspected(
-                    &mut *conn,
-                    part.id,
-                    part.version,
-                    target_id,
-                    Some(current.id),
-                )
-                .await?;
-                if n == 0 {
-                    return Err(AppError::biz(code::VERSION_CONFLICT, "乐观锁失败"));
-                }
-                // 父装配件 status 同步回流：part 状态机 IN_PROCESS → INSPECTION
-                // 可能使父聚合 target 变化（e.g. ALL_INSPECTED → COMPLETED）。
-                // 同事务调用；VERSION_CONFLICT 由 AppError 自动冒泡到 handler，
-                // 整体回滚（含尚未写入的 SENT_TO_INSPECTION 事件）。
-                synced_assembly_id = match AssemblyService::sync_from_part_change(
+                // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
+                // 变化时级联调 AssemblyService::sync_from_part_change 闭合链路。
+                synced_assembly_id = match PartService::sync_from_batch_change(
                     &mut *conn,
                     part.id,
                     current,

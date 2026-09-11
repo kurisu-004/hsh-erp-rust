@@ -142,3 +142,21 @@ pub struct NewPartEvent<'a> {
     pub note: Option<&'a str>,
     pub created_by: Option<i64>,
 }
+
+/// `t_part` rollup 派生列投影（PR-B2 `sync_from_batch_change` 用）。
+///
+/// 6 列：status / location / current_holder_id / next_process_id /
+/// placed_at / version。无 `Serialize`（service 内短暂使用）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TPartRollupState {
+    pub status: String,
+    pub location: Option<String>,
+    #[allow(dead_code)]
+    pub current_holder_id: Option<i64>,
+    #[allow(dead_code)]
+    pub next_process_id: Option<i64>,
+    #[allow(dead_code)]
+    pub placed_at: Option<chrono::NaiveDateTime>,
+    #[allow(dead_code)]
+    pub version: i32,
+}

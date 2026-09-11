@@ -10,6 +10,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::customer::repo::CustomerRepo;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
+use crate::modules::part::service::PartService;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::modules::worker::repo::WorkerRepo;
 use crate::modules::work_type::repo::WorkTypeRepo;
@@ -373,6 +374,7 @@ impl DeliveryNoteService {
         let now = now_naive();
 
         // 把每个批次的 status 推到 DELIVERED，清 holder/location，version++
+        let mut affected_part_ids: Vec<i64> = Vec::new();
         for b in &mut note_batches {
             b.status = "DELIVERED".to_string();
             b.current_holder_id = None;
@@ -395,6 +397,17 @@ impl DeliveryNoteService {
                     code::VERSION_CONFLICT,
                     "concurrent modification detected",
                 ));
+            }
+            affected_part_ids.push(b.part_id);
+        }
+
+        // PR-B2：pickup 翻完所有 batch 后按 part_id 去重逐个
+        // sync_from_batch_change；状态机 DELIVERED → COMPLETED / 全部非 CANCELLED
+        // 已 DELIVERED 时 part → DELIVERED，否则 part 维持更慢批次的状态。
+        let mut seen = std::collections::HashSet::new();
+        for pid in affected_part_ids {
+            if seen.insert(pid) {
+                PartService::sync_from_batch_change(&mut *conn, pid, current).await?;
             }
         }
 

@@ -1,15 +1,20 @@
 //! `t_part_batch` 批次查询 + 状态机 UPDATE
 //!
-//! 既有 14 个方法搬迁：
+//! 既有方法搬迁：
 //! - 3 个 `find_*`（inprocess / scan_target / inspection_for_fail）
-//! - 1 个 `count_other_inprocess_batches`
-//! - 6 个 `mark_*_passed_inspection` / `mark_*_inspected` / `mark_*_failed_inspection`
-//!   （part / batch 各一对共 6 个）
+//! - 6 个 `mark_*_inspection`（passed / failed / inspected，part / batch 各一对）
 //! - 1 个 `split_batch_for_partial_pass`
 //!
 //! Phase PR-CRUD 新增 8 个 `mark_*_lifecycle`（delivered / completed /
 //! cancelled / repairing 各 part + batch 一对），与 6 个 `mark_*_inspection`
 //! 同形但状态守卫不同。
+//!
+//! 2026-09-11 part/assembly/batch 重构方案 §4.2 (PR-B2)：删除 9 个「无业务调用
+//! 方」旧函数（`count_other_inprocess_batches` / `find_most_recent_batch_for_part`
+//! / `mark_part_passed_inspection` / `mark_part_inspected` /
+//! `mark_part_failed_inspection` / `mark_part_returned` / `mark_part_delivered`
+//! / `mark_part_completed` / `mark_part_repairing`）—— 工单流转现在统一走
+//! `PartService::sync_from_batch_change` rollup，不直接写 `t_part`。
 
 use sqlx::{PgConnection, PgExecutor};
 
@@ -253,23 +258,6 @@ impl PartRepo {
         .await
     }
 
-    /// 统计 part 仍处于 INSPECTION 状态的非软删批次数量。
-    pub async fn count_other_inprocess_batches<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-    ) -> Result<i64, sqlx::Error> {
-        let count: i64 = sqlx::query_scalar!(
-            r#"
-            SELECT COUNT(*) AS "n!"
-            FROM t_part_batch
-            WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL
-            "#,
-            part_id,
-        )
-        .fetch_one(executor)
-        .await?;
-        Ok(count)
-    }
 
     /// 批量通过（OCC UPDATE）。
     pub async fn mark_batch_passed_inspection<'e, E: PgExecutor<'e>>(
@@ -297,64 +285,6 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// to_ship 后同步工单状态（OCC UPDATE `t_part.status`）。
-    ///
-    /// **必须与 `mark_batch_passed_inspection` 在同一事务内调用**。
-    pub async fn mark_part_passed_inspection<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-        expected_version: i32,
-        current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query!(
-            r#"
-            UPDATE t_part
-            SET status     = 'READY_TO_SHIP',
-                version    = version + 1,
-                updated_at = now(),
-                updated_by = $3
-            WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
-              AND deleted_at IS NULL
-            "#,
-            part_id,
-            expected_version,
-            current_user_id,
-        )
-        .execute(executor)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
-    /// to-inspection 第一步：工单搬到品检架（OCC UPDATE t_part）。
-    pub async fn mark_part_inspected<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-        expected_version: i32,
-        shelf_id: i64,
-        current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query!(
-            r#"
-            UPDATE t_part
-            SET status            = 'INSPECTION',
-                location          = 'INSPECTION_SHELF',
-                current_holder_id = $3,
-                version           = version + 1,
-                updated_at        = now(),
-                updated_by        = $4
-            WHERE id = $1 AND version = $2
-              AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')
-              AND deleted_at IS NULL
-            "#,
-            part_id,
-            expected_version,
-            shelf_id,
-            current_user_id,
-        )
-        .execute(executor)
-        .await?;
-        Ok(result.rows_affected())
-    }
 
     /// to-inspection 第一步：批次状态同步（OCC UPDATE t_part_batch）。
     pub async fn mark_batch_inspected<'e, E: PgExecutor<'e>>(
@@ -420,38 +350,6 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// to-process：工单状态同步（OCC UPDATE t_part）。
-    pub async fn mark_part_failed_inspection<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-        expected_version: i32,
-        shelf_id: i64,
-        next_process_id: i64,
-        current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query!(
-            r#"
-            UPDATE t_part
-            SET status            = 'IN_PROCESS',
-                location          = 'PRODUCTION_SHELF',
-                current_holder_id = $3,
-                next_process_id   = $4,
-                version           = version + 1,
-                updated_at        = now(),
-                updated_by        = $5
-            WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
-              AND deleted_at IS NULL
-            "#,
-            part_id,
-            expected_version,
-            shelf_id,
-            next_process_id,
-            current_user_id,
-        )
-        .execute(executor)
-        .await?;
-        Ok(result.rows_affected())
-    }
 
 /// worker-pool admin_remove 用：按 `id + current_holder_id` 定位 IN_PROCESS+WORKER 批次。
     ///
@@ -525,41 +423,6 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-    /// worker-pool admin_remove / worker-scan RETURNED 用：工单 holder worker → shelf（OCC）。
-    ///
-    /// 与 `mark_batch_returned` 同事务调用。
-    /// 0 行 → 40901 VERSION_CONFLICT / 工单已软删 —— 由 service 层映射。
-    /// 成功 → `current_holder_id = shelf_id`，`location = 'PRODUCTION_SHELF'`，
-    ///   `next_process_id = $4`，`version += 1`。
-    pub async fn mark_part_returned<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-        expected_version: i32,
-        shelf_id: i64,
-        next_process_id: i64,
-        current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query!(
-            r#"
-            UPDATE t_part
-            SET current_holder_id = $3,
-                location          = 'PRODUCTION_SHELF',
-                next_process_id   = $4,
-                version           = version + 1,
-                updated_at        = now(),
-                updated_by        = $5
-            WHERE id = $1 AND version = $2 AND deleted_at IS NULL
-            "#,
-            part_id,
-            expected_version,
-            shelf_id,
-            next_process_id,
-            current_user_id,
-        )
-        .execute(executor)
-        .await?;
-        Ok(result.rows_affected())
-    }
 
     /// 定位 worker 持有的 IN_PROCESS 批次（worker-scan 用）。
     ///
@@ -733,55 +596,6 @@ impl PartRepo {
 
     // ===== Phase PR-CRUD 新增：8 个 lifecycle mark_* =====
 
-    /// 定位 part 当前 source-status 的最新批次（id DESC）。
-    ///
-    /// lifecycle 终结 / 翻转专用 —— 与 inspection 流 (`find_inprocess_batch_for_part`
-    /// / `find_scan_target_batch` / `find_inspection_batch_for_fail`) 不同：
-    /// lifecycle 无 `expected_batch_id` hint，且允许多个 source-status 批次存在时
-    /// 按 id DESC 取最末一条（最新创建 / 最新修改；与 python myERP 的隐式语义对齐）。
-    ///
-    /// 无匹配批次时返回 `Ok(None)`：service 层据此跳过 `mark_batch_*`，让 t_part
-    /// 单独翻转也合法（新建工单未拆批的场景）。
-    pub async fn find_most_recent_batch_for_part(
-        conn: &mut PgConnection,
-        part_id: i64,
-        status: &str,
-    ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        sqlx::query_as!(
-            TPartBatch,
-            r#"
-            SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, next_process_id, placed_at,
-                   delivery_note_id, parent_batch_id, has_been_repaired,
-                   version, created_at, created_by, updated_at, updated_by,
-                   deleted_at
-            FROM t_part_batch
-            WHERE part_id = $1 AND status = $2 AND deleted_at IS NULL
-            ORDER BY id DESC
-            LIMIT 1
-            "#,
-            part_id,
-            status,
-        )
-        .fetch_optional(&mut *conn)
-        .await
-    }
-
-    /// 工单 READY_TO_SHIP → DELIVERED（OCC UPDATE t_part）。
-    pub async fn mark_part_delivered<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-        expected_version: i32,
-        current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query!(
-            r#"UPDATE t_part SET status='DELIVERED', version=version+1,
-                updated_at=now(), updated_by=$3
-               WHERE id=$1 AND version=$2 AND status='READY_TO_SHIP' AND deleted_at IS NULL"#,
-            part_id, expected_version, current_user_id,
-        ).execute(executor).await?;
-        Ok(r.rows_affected())
-    }
 
     /// 批次 READY_TO_SHIP → DELIVERED（OCC UPDATE t_part_batch）。
     pub async fn mark_batch_delivered<'e, E: PgExecutor<'e>>(
@@ -799,21 +613,6 @@ impl PartRepo {
         Ok(r.rows_affected())
     }
 
-    /// 工单 DELIVERED → COMPLETED：清空 `serial_no`（序列号已被送货单占用）。
-    pub async fn mark_part_completed<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-        expected_version: i32,
-        current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query!(
-            r#"UPDATE t_part SET status='COMPLETED', version=version+1,
-                updated_at=now(), updated_by=$3, serial_no=NULL
-               WHERE id=$1 AND version=$2 AND status='DELIVERED' AND deleted_at IS NULL"#,
-            part_id, expected_version, current_user_id,
-        ).execute(executor).await?;
-        Ok(r.rows_affected())
-    }
 
     /// 批次 DELIVERED → COMPLETED。
     pub async fn mark_batch_completed<'e, E: PgExecutor<'e>>(
@@ -868,21 +667,6 @@ impl PartRepo {
         Ok(r.rows_affected())
     }
 
-    /// 工单 IN_PROCESS → REPAIRING：同时置 `has_been_repaired=true`。
-    pub async fn mark_part_repairing<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-        expected_version: i32,
-        current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query!(
-            r#"UPDATE t_part SET status='REPAIRING', version=version+1,
-                updated_at=now(), updated_by=$3, has_been_repaired=true
-               WHERE id=$1 AND version=$2 AND status='IN_PROCESS' AND deleted_at IS NULL"#,
-            part_id, expected_version, current_user_id,
-        ).execute(executor).await?;
-        Ok(r.rows_affected())
-    }
 
     /// 批次 IN_PROCESS → REPAIRING：同时置 `has_been_repaired=true`。
     pub async fn mark_batch_repairing<'e, E: PgExecutor<'e>>(
@@ -897,6 +681,37 @@ impl PartRepo {
                WHERE id=$1 AND version=$2 AND status='IN_PROCESS' AND deleted_at IS NULL"#,
             batch_id, expected_version, current_user_id,
         ).execute(executor).await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 2026-09-11 part/assembly/batch 重构方案 §4.2 (PR-B2)：part cancel 时
+    /// 级联取消**全部活跃批次**（不只「最近一条 source-status」）。
+    ///
+    /// 单条 UPDATE：`WHERE part_id = $1 AND deleted_at IS NULL` 把 part 下所有
+    /// 活跃 batch → CANCELLED（不走 OCC；version += 1；写 updated_by）。
+    /// 不在 SQL 上做 status 白名单过滤：cancel 5 状态白名单由 service 层
+    /// `can_transition_to` 守；此处只管「part 已决定 cancel，批量同步 batch」。
+    ///
+    /// 返回影响行数（0 表示 part 下无活跃批次 —— 不视为错误，由 caller 决定）。
+    pub async fn cancel_all_active_batches_for_part<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        current_user_id: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            r#"
+            UPDATE t_part_batch
+            SET status     = 'CANCELLED',
+                version    = version + 1,
+                updated_at = now(),
+                updated_by = $2
+            WHERE part_id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(part_id)
+        .bind(current_user_id)
+        .execute(executor)
+        .await?;
         Ok(r.rows_affected())
     }
 }

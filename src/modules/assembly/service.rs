@@ -22,6 +22,7 @@ use crate::modules::assembly::repo::{AssemblyListFilters, AssemblyRepo, Assembly
 use crate::modules::assembly::statemachine::{
     compute_assembly_target, AssemblyStatus,
 };
+use crate::modules::part::repo::part::ChildInheritFields;
 use crate::modules::part::repo::PartRepo;
 use crate::shared::error::{code, AppError};
 
@@ -253,6 +254,13 @@ impl AssemblyService {
             version: p.version,
             quantity: p.quantity,
             planned_delivery_date: Some(p.planned_delivery_date),
+            // §3.4 — 透传 6 个继承/级联字段（来自 t_part 行）
+            applicant_name: p.applicant_name,
+            request_date: p.request_date,
+            order_no: p.order_no,
+            system_delivery_date: p.system_delivery_date,
+            is_urgent: p.is_urgent,
+            note: p.note,
         }).collect();
 
         Ok(AssemblyDetail {
@@ -377,15 +385,34 @@ impl AssemblyService {
         AssemblyRepo::insert(&mut *conn, new).await.map_err(AppError::from)?;
 
         // 6. 插入子件（如有 PDF，则带 serial_no 派生 `{asm_serial}-{i:02d}`）
+        //
+        // 子件字段继承父件（§3.1）：applicant_name/request_date/order_no/system_delivery_date/
+        // is_urgent/note 由父件直接继承；planned_delivery_date 子件入参优先，缺省继承父件。
+        // 父件相关缺省值已在本函数上方确定（request_date/planned_delivery_date/
+        // is_urgent 见 NewAssembly 构造），这里直接把父件"应有值"打包传给 repo。
+        let parent_applicant_name = req.applicant_name.as_deref().unwrap_or("");
+        let parent_request_date = req.request_date.unwrap_or(today);
+        let parent_planned_delivery_date = req.planned_delivery_date.unwrap_or(today);
+        let parent_is_urgent = req.is_urgent.unwrap_or(false);
         let mut created_children_out: Vec<AssemblyChildOut> = Vec::new();
         if let (Some(asm_serial), Some(_)) = (serial_no.as_ref(), prefix) {
             for (i, ch) in req.children.iter().enumerate() {
                 let child_id = snowflake.next_id();
+                let initial_batch_id = snowflake.next_id();
                 let child_serial = format!("{}-{:02}", asm_serial, i + 1);
                 let child_qty = ch.quantity.unwrap_or(1);
+                let child_planned = ch.planned_delivery_date.or(Some(parent_planned_delivery_date));
                 let _ = page_count_opt; // reserved for AssemblyFileRef follow-up
+                let inherit = ChildInheritFields {
+                    applicant_name: parent_applicant_name,
+                    request_date: parent_request_date,
+                    order_no: req.order_no.as_deref(),
+                    system_delivery_date: req.system_delivery_date,
+                    is_urgent: parent_is_urgent,
+                    note: req.note.as_deref(),
+                };
                 PartRepo::insert_child_for_assembly(
-                    &mut *conn,
+                    conn,
                     child_id,
                     customer_id,
                     asm_id,
@@ -393,8 +420,10 @@ impl AssemblyService {
                     &ch.name,
                     ch.drawing_no.as_deref(),
                     child_qty,
-                    ch.planned_delivery_date,
+                    child_planned,
+                    inherit,
                     current.id,
+                    initial_batch_id,
                 )
                 .await
                 .map_err(AppError::from)?;
@@ -406,7 +435,14 @@ impl AssemblyService {
                     status: "PENDING".into(),
                     version: 0,
                     quantity: child_qty,
-                    planned_delivery_date: ch.planned_delivery_date,
+                    planned_delivery_date: child_planned,
+                    // §3.4 — 创建时子件继承父件共享字段（与 §3.1 INSERT 一致）
+                    applicant_name: parent_applicant_name.to_string(),
+                    request_date: parent_request_date,
+                    order_no: req.order_no.clone(),
+                    system_delivery_date: req.system_delivery_date,
+                    is_urgent: parent_is_urgent,
+                    note: req.note.clone(),
                 });
             }
         }
@@ -427,6 +463,13 @@ impl AssemblyService {
     /// - `customer_id: None`（字段缺省）→ 不更新
     /// - `customer_id: Some(Some("xxx"))`（三态 Some(Some)）→ 覆盖 + L2 校验
     /// - `applicant_name` 等普通可空字段按 `Option<String>` 语义（None=不动、Some("")=覆盖）
+    ///
+    /// **§3.2 级联 + §3.3 缩放**：`update_partial` 成功后，同事务内：
+    /// 1. 把父件"更新后的当前行值"覆盖级联到所有未软删子件（8 个共享信息字段；
+    ///    排除 `actual_delivery_date` + `quantity`）。
+    /// 2. 若 `req.quantity` 有值且 ≠ 父件现值（old_qty），对每个子件
+    ///    `new_qty = max(1, round(child_qty * new_qty / old_qty))`，
+    ///    `version++`。不追溯调整 `t_part_batch.quantity`。
     pub async fn update_assembly(
         conn: &mut PgConnection,
         assembly_id: i64,
@@ -456,6 +499,17 @@ impl AssemblyService {
             None
         };
 
+        // 预读父件现值：捕获 old_qty 用于 §3.3 缩放触发判断；同事务内的
+        // read-after-write 由 OCC 守，TOCTOU 窗口不会导致错误数据写库。
+        let old_qty: i32 = sqlx::query_scalar(
+            "SELECT quantity FROM t_assembly WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(assembly_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(AppError::from)?
+        .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, format!("assembly {assembly_id} 不存在")))?;
+
         let upd = AssemblyUpdate {
             drawing_no: req.drawing_no.as_deref(),
             name: req.name.as_deref(),
@@ -482,10 +536,45 @@ impl AssemblyService {
             return Err(AppError::biz(code::VERSION_CONFLICT, "version 不匹配或记录已删除"));
         }
 
+        // 读回父件"更新后的当前行值" → §3.2 级联 + §3.3 缩放共用此视图
         let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
+
+        // §3.2 级联：覆盖父件"应有值"到所有未软删子件。
+        // `request_date` / `planned_delivery_date` 在 t_assembly 是 NOT NULL，
+        // 由 service 层在 create 时填 today 兜底；update 时三态置 NULL 在本期
+        // 不允许（DTO 是 Option<Option<NaiveDate>> 但语义上 asm 行始终非空）。
+        let today = clock::now_naive().date();
+        let request_date = asm.request_date.unwrap_or(today);
+        let planned_delivery_date = asm.planned_delivery_date.unwrap_or(today);
+        let applicant_name = asm.applicant_name.as_deref().unwrap_or("");
+        PartRepo::cascade_sync_from_assembly(
+            &mut *conn,
+            asm.id,
+            request_date,
+            applicant_name,
+            asm.order_no.as_deref(),
+            asm.system_delivery_date,
+            planned_delivery_date,
+            asm.is_urgent,
+            asm.note.as_deref(),
+            asm.customer_id,
+            current.id,
+        )
+        .await
+        .map_err(AppError::from)?;
+
+        // §3.3 套数缩放：`req.quantity` 有值且 ≠ 父件现值（old_qty）才触发
+        if let Some(new_qty) = req.quantity
+            && new_qty != old_qty
+        {
+            PartRepo::scale_children_quantity(&mut *conn, asm.id, old_qty, new_qty, current.id)
+                .await
+                .map_err(AppError::from)?;
+        }
+
         Ok(render_assembly_out(asm))
     }
 

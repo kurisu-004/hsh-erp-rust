@@ -90,6 +90,22 @@ Multipart body：
 5. INSERT `t_assembly`（`status='PENDING'`，`version=0`）
 6. **若提供 PDF 且 serial 已派发**：为每个 child 按 `{asm_serial}-{i:02d}` 派生 `serial_no`，INSERT `t_part`（同事务）
 
+**§3.1（2026-09-11）子件字段继承**：第 6 步 INSERT 子件时，子件从父件 `t_assembly` 继承以下字段（不在入参里也能正确建档）：
+
+| 子件列 | 来源 |
+|---|---|
+| `applicant_name` | 父件 `applicant_name`（父空 → 子空串兜底） |
+| `request_date` | 父件 `request_date` |
+| `order_no` | 父件 `order_no` |
+| `system_delivery_date` | 父件 `system_delivery_date` |
+| `is_urgent` | 父件 `is_urgent` |
+| `note` | 父件 `note` |
+| `planned_delivery_date` | 子件入参优先；缺省继承父件 |
+| `customer_id` / `quantity` / `serial_no` | 现状不变（customer 继承父件；quantity 为实际加工数；serial `{asm_serial}-{i:02d}`） |
+| `unit_price` / `total_price` | 保持 0（本期不动价格语义） |
+
+> 保留「有 PDF 才派 serial、才建子件」的门槛；不在本期放开。
+
 WS 广播（commit 后下发）：
 
 - `ASSEMBLY_CREATED` —— payload `{ assembly_id }`
@@ -169,6 +185,27 @@ Response 200 `data`：[`AssemblyOut](./index.md#assemblyout-字段)
 WS 广播（commit 后下发）：
 
 - `ASSEMBLY_UPDATED` —— payload `{ assembly_id }`
+
+**§3.2（2026-09-11）update 级联**：本端点成功后**同事务**内级联 `UPDATE t_part SET ... WHERE assembly_id=$aid AND deleted_at IS NULL`，把以下 8 个共享信息字段无条件覆盖为父件"更新后的当前行值"（`version += 1`，`updated_by = current.id`）：
+
+| 子件列 | 来源 |
+|---|---|
+| `request_date` / `applicant_name` / `order_no` / `system_delivery_date` / `planned_delivery_date` / `is_urgent` / `note` / `customer_id` | 父件"更新后的当前行值" |
+
+> - 排除 `actual_delivery_date`：deliver 流程写入的产物，不属于"信息字段"。
+> - 排除 `quantity`：单独走 §3.3 缩放（见下）。
+> - 实现上按"父件更新后的当前行值"覆盖，避免三态解析歧义；未变更字段被覆写为原值（语义无差）。
+> - `customer_id` 变更时同样级联。
+
+**§3.3（2026-09-11）套数缩放**：本端点入参 `quantity` 有值且 ≠ 父件现值时，触发缩放：
+
+```
+new_child_qty = max(1, round(child_qty * new_qty / old_qty))
+```
+
+> - `old_qty <= 0` 视为无缩放（防御，避免除零 / 反向缩放）。
+> - 同事务 UPDATE 每个子件 `quantity`（`version += 1`）。
+> - **不**追溯调整 `t_part_batch.quantity`（已拆分流转中的批次保持原量）。
 
 错误码：
 
@@ -283,8 +320,15 @@ pub struct AssemblyChildOut {
     pub drawing_no: Option<String>,
     pub status: String,
     pub version: i32,
-    pub quantity: i32,
+    pub quantity: i32,                  // 实际加工数；2026-09-11 起按父件套数等比缩放
     pub planned_delivery_date: Option<NaiveDate>,
+    // §3.4 — 子件继承 / 级联字段（创建时 §3.1 继承父件；update 时 §3.2 级联）
+    pub applicant_name: String,
+    pub request_date: NaiveDate,
+    pub order_no: Option<String>,
+    pub system_delivery_date: Option<NaiveDate>,
+    pub is_urgent: bool,
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
