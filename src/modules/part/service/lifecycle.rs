@@ -36,6 +36,11 @@ use super::super::dto_crud::{CancelRequest, CompleteRequest, DeliverRequest, Sta
 use super::PartService;
 
 impl PartService {
+    /// deliver (PR-B3 batch 级)：锚定 `t_part_batch.version`，状态机守卫读
+    /// batch 当前状态 `READY_TO_SHIP → DELIVERED`。
+    ///
+    /// BREAKING CHANGE：DTO 新增 `batch_id` + `version`（前端从
+    /// `GET /parts/by-serial/{serial_no}/part-batches` 取 batch.id + version）。
     pub async fn deliver(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
@@ -44,51 +49,74 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 1. 读 part（仅 need drawing_no 用于事件日志 + 终态守卫；其它派生列
+        //    由 rollup 在 batch 翻转后回填）。
         let part = PartRepo::get_part_inspected(&mut *conn, part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
             })?;
-        let from = PartStatus::from_str(&part.status).ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("status 非法: {}", part.status),
-            )
-        })?;
-        if from == PartStatus::CANCELLED {
+        if PartStatus::from_str(&part.status) == Some(PartStatus::CANCELLED) {
             return Err(AppError::biz(
                 code::BIZ_PART_ALREADY_CANCELLED,
                 "工单已 CANCELLED",
             ));
         }
+        // 2. 定位 batch（必须属于 part + READY_TO_SHIP + 未软删）。
+        let batch = PartRepo::find_batch_by_id(&mut *conn, req.batch_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_BATCH_NOT_FOUND,
+                    format!("batch {} 不存在", req.batch_id),
+                )
+            })?;
+        if batch.part_id != part_id {
+            return Err(AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {} 不属于 part {}", req.batch_id, part_id),
+            ));
+        }
+        // 3. 状态机守卫：读 batch 当前状态（不是 part 派生列）。
+        let from = PartStatus::from_str(&batch.status).ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("batch {} status 非法: {}", batch.id, batch.status),
+            )
+        })?;
         if !from.can_transition_to(PartStatus::DELIVERED) {
             return Err(AppError::biz(
                 code::BIZ_PART_NOT_READY_TO_SHIP,
                 format!(
-                    "工单状态 {} 不允许 deliver（必须 READY_TO_SHIP）",
+                    "batch {} 当前状态 {} 不允许 deliver（必须 READY_TO_SHIP）",
+                    batch.id,
                     from.as_str()
                 ),
             ));
         }
-        let n = PartRepo::mark_part_delivered(&mut *conn, part_id, part.version, current.id).await?;
-        if n == 0 {
+        // 4. caller 侧乐观锁：锚定 batch.version。
+        if batch.version != req.version {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
-                format!("part {part_id} 版本冲突"),
+                format!(
+                    "batch {} 版本冲突（期望 {}，实际 {}）",
+                    batch.id, req.version, batch.version
+                ),
             ));
         }
-        // 同步最近一条 READY_TO_SHIP 批次。无源批次 → 跳过（新建工单未拆批合法）。
-        if let Some(b) =
-            PartRepo::find_most_recent_batch_for_part(&mut *conn, part_id, "READY_TO_SHIP").await?
-        {
-            let bn = PartRepo::mark_batch_delivered(&mut *conn, b.id, b.version, current.id).await?;
-            if bn == 0 {
-                return Err(AppError::biz(
-                    code::VERSION_CONFLICT,
-                    format!("batch {} 版本冲突", b.id),
-                ));
-            }
+        // 5. UPDATE batch: READY_TO_SHIP → DELIVERED（OCC）。
+        let bn = PartRepo::mark_batch_delivered(&mut *conn, batch.id, batch.version, current.id).await?;
+        if bn == 0 {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                format!("batch {} 版本冲突", batch.id),
+            ));
         }
+        // 6. PR-B2 rollup：翻 batch → 物化 part 派生列 + 级联 assembly sync。
+        //    （status 由 NoChange → DELIVERED 时 part 跟随；多批次场景下
+        //    rollup 会按 min-progress 决定 part 状态。）
+        let _ = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
+        // 7. 事件日志：batch_id + quantity 来自操作的批次。
         PartRepo::insert_part_event(
             &mut *conn,
             NewPartEvent {
@@ -97,8 +125,8 @@ impl PartService {
                 event_type: "DELIVERED",
                 from_status: Some("READY_TO_SHIP"),
                 to_status: Some("DELIVERED"),
-                batch_id: None,
-                quantity: None,
+                batch_id: Some(batch.id),
+                quantity: Some(batch.quantity),
                 drawing_code: Some(&part.drawing_no),
                 badge_code: None,
                 note: req.note.as_deref(),
@@ -224,49 +252,67 @@ impl PartService {
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
             })?;
-        let from = PartStatus::from_str(&part.status).ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("status 非法: {}", part.status),
-            )
-        })?;
-        if from == PartStatus::CANCELLED {
+        if PartStatus::from_str(&part.status) == Some(PartStatus::CANCELLED) {
             return Err(AppError::biz(
                 code::BIZ_PART_ALREADY_CANCELLED,
                 "工单已 CANCELLED",
             ));
         }
-        // Finding E：与 deliver / cancel 对齐走 `can_transition_to` 而非直接
-        // 等值比较，保证状态机白名单是单一事实源。
+        // 1. 定位 batch。
+        let batch = PartRepo::find_batch_by_id(&mut *conn, req.batch_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_BATCH_NOT_FOUND,
+                    format!("batch {} 不存在", req.batch_id),
+                )
+            })?;
+        if batch.part_id != part_id {
+            return Err(AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {} 不属于 part {}", req.batch_id, part_id),
+            ));
+        }
+        // 2. 状态机守卫：读 batch 当前状态。
+        let from = PartStatus::from_str(&batch.status).ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("batch {} status 非法: {}", batch.id, batch.status),
+            )
+        })?;
         if !from.can_transition_to(PartStatus::COMPLETED) {
             return Err(AppError::biz(
                 code::BIZ_PART_NOT_DELIVERED,
                 format!(
-                    "工单当前状态 {} 无法 complete（必须 DELIVERED）",
+                    "batch {} 当前状态 {} 无法 complete（必须 DELIVERED）",
+                    batch.id,
                     from.as_str()
                 ),
             ));
         }
-        let n = PartRepo::mark_part_completed(&mut *conn, part_id, part.version, current.id).await?;
-        if n == 0 {
+        // 3. caller 侧乐观锁：锚定 batch.version。
+        if batch.version != req.version {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
-                format!("part {part_id} 版本冲突"),
+                format!(
+                    "batch {} 版本冲突（期望 {}，实际 {}）",
+                    batch.id, req.version, batch.version
+                ),
             ));
         }
-        // 同步最近一条 DELIVERED 批次。无源批次 → 跳过。
-        if let Some(b) =
-            PartRepo::find_most_recent_batch_for_part(&mut *conn, part_id, "DELIVERED").await?
-        {
-            let bn =
-                PartRepo::mark_batch_completed(&mut *conn, b.id, b.version, current.id).await?;
-            if bn == 0 {
-                return Err(AppError::biz(
-                    code::VERSION_CONFLICT,
-                    format!("batch {} 版本冲突", b.id),
-                ));
-            }
+        // 4. UPDATE batch: DELIVERED → COMPLETED（OCC）。
+        let bn = PartRepo::mark_batch_completed(&mut *conn, batch.id, batch.version, current.id).await?;
+        if bn == 0 {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                format!("batch {} 版本冲突", batch.id),
+            ));
         }
+        // 5. PR-B2 rollup：翻 batch → 物化 part 派生列 + 级联 assembly sync。
+        let _ = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
+        // 6. part 进入 COMPLETED 时清空 serial_no（序列号已转交送货单）。
+        let _ = PartRepo::clear_part_serial_no_when_completed(&mut *conn, part_id, current.id).await?;
+        // 7. 事件日志：batch_id + quantity 来自操作的批次。
         PartRepo::insert_part_event(
             &mut *conn,
             NewPartEvent {
@@ -275,8 +321,8 @@ impl PartService {
                 event_type: "COMPLETED",
                 from_status: Some("DELIVERED"),
                 to_status: Some("COMPLETED"),
-                batch_id: None,
-                quantity: None,
+                batch_id: Some(batch.id),
+                quantity: Some(batch.quantity),
                 drawing_code: Some(&part.drawing_no),
                 badge_code: None,
                 note: req.note.as_deref(),
@@ -305,49 +351,71 @@ impl PartService {
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
             })?;
-        let from = PartStatus::from_str(&part.status).ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("status 非法: {}", part.status),
-            )
-        })?;
-        if from == PartStatus::CANCELLED {
+        if PartStatus::from_str(&part.status) == Some(PartStatus::CANCELLED) {
             return Err(AppError::biz(
                 code::BIZ_PART_ALREADY_CANCELLED,
                 "工单已 CANCELLED",
             ));
         }
-        // Finding E：与 deliver / cancel 对齐走 `can_transition_to` 而非直接
-        // 等值比较，保证状态机白名单是单一事实源。
+        // 1. 定位 batch。
+        let batch = PartRepo::find_batch_by_id(&mut *conn, req.batch_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_BATCH_NOT_FOUND,
+                    format!("batch {} 不存在", req.batch_id),
+                )
+            })?;
+        if batch.part_id != part_id {
+            return Err(AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {} 不属于 part {}", req.batch_id, part_id),
+            ));
+        }
+        // 2. 状态机守卫：读 batch 当前状态。
+        let from = PartStatus::from_str(&batch.status).ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("batch {} status 非法: {}", batch.id, batch.status),
+            )
+        })?;
         if !from.can_transition_to(PartStatus::REPAIRING) {
             return Err(AppError::biz(
                 code::BIZ_PART_REPAIR_NOT_TRIGGERED,
                 format!(
-                    "工单当前状态 {} 无法 start-repair（必须 IN_PROCESS）",
+                    "batch {} 当前状态 {} 无法 start-repair（必须 IN_PROCESS）",
+                    batch.id,
                     from.as_str()
                 ),
             ));
         }
-        let n = PartRepo::mark_part_repairing(&mut *conn, part_id, part.version, current.id).await?;
-        if n == 0 {
+        // 3. caller 侧乐观锁：锚定 batch.version。
+        if batch.version != req.version {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
-                format!("part {part_id} 版本冲突"),
+                format!(
+                    "batch {} 版本冲突（期望 {}，实际 {}）",
+                    batch.id, req.version, batch.version
+                ),
             ));
         }
-        // 同步最近一条 IN_PROCESS 批次。无源批次 → 跳过。
-        if let Some(b) =
-            PartRepo::find_most_recent_batch_for_part(&mut *conn, part_id, "IN_PROCESS").await?
-        {
-            let bn =
-                PartRepo::mark_batch_repairing(&mut *conn, b.id, b.version, current.id).await?;
-            if bn == 0 {
-                return Err(AppError::biz(
-                    code::VERSION_CONFLICT,
-                    format!("batch {} 版本冲突", b.id),
-                ));
-            }
+        // 4. UPDATE batch: IN_PROCESS → REPAIRING（OCC） + has_been_repaired=true。
+        let bn = PartRepo::mark_batch_repairing(&mut *conn, batch.id, batch.version, current.id).await?;
+        if bn == 0 {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                format!("batch {} 版本冲突", batch.id),
+            ));
         }
+        // 5. PR-B2 rollup：翻 batch → 物化 part 派生列（status=REPAIRING /
+        //    has_been_repaired=true）。
+        //    ⚠️ PR-B2 §4.3 注：start_repair 的 has_been_repaired=true 写 batch
+        //    （现有），part 由 rollup 同步（rollup 仅物化 status/location/holder/
+        //    process/placed_at 5 列；has_been_repaired 不在 rollup 范围内 —— 这
+        //    里显式补一次 UPDATE，保持向后兼容）。
+        let _ = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
+        let _ = PartRepo::mark_part_repairing_flag_only(&mut *conn, part_id, current.id).await?;
+        // 6. 事件日志。
         PartRepo::insert_part_event(
             &mut *conn,
             NewPartEvent {
@@ -356,8 +424,8 @@ impl PartService {
                 event_type: "REPAIR_STARTED",
                 from_status: Some("IN_PROCESS"),
                 to_status: Some("REPAIRING"),
-                batch_id: None,
-                quantity: None,
+                batch_id: Some(batch.id),
+                quantity: Some(batch.quantity),
                 drawing_code: Some(&part.drawing_no),
                 badge_code: None,
                 note: req.reason.as_deref().or(req.note.as_deref()),

@@ -614,4 +614,60 @@ impl PartRepo {
         .await?;
         Ok(r.rows_affected())
     }
+
+    /// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) start_repair 辅助：
+    /// 单独置 `has_been_repaired=true`（不被 rollup 覆盖；rollup 仅物化
+    /// status/location/holder/process/placed_at 5 列）。
+    ///
+    /// 幂等：`has_been_repaired = has_been_repaired OR TRUE` 语义上等价 `=TRUE`，
+    /// 但保留 OR 形式让 PG 优化器识别"no change"路径（已被设置时不写 WAL）。
+    /// **不走 OCC**（衍生写，与 rollup 一致）。
+    pub async fn mark_part_repairing_flag_only<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            r#"
+            UPDATE t_part
+            SET has_been_repaired = TRUE,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $2
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(part_id)
+        .bind(updated_by)
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) complete 辅助：
+    /// part 进入 COMPLETED 时清空 `serial_no`（序列号已转交送货单）。
+    ///
+    /// 条件：`status='COMPLETED'`（rollup 已把 part 推到终态）。0 行不影响事务。
+    /// **不走 OCC**（衍生写）。
+    pub async fn clear_part_serial_no_when_completed<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            r#"
+            UPDATE t_part
+            SET serial_no  = NULL,
+                version    = version + 1,
+                updated_at = now(),
+                updated_by = $2
+            WHERE id = $1 AND status = 'COMPLETED' AND deleted_at IS NULL
+            "#,
+        )
+        .bind(part_id)
+        .bind(updated_by)
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
+    }
 }

@@ -218,13 +218,27 @@ pub struct PartSoftDeleteRequest {
 // ===== Lifecycle =====
 
 /// `POST /parts/{id}/deliver` 入参。
+///
+/// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) BREAKING CHANGE：
+/// lifecycle 三端点（deliver / complete / start-repair）改为 batch 级，OCC
+/// 锚定 `t_part_batch.version`。`batch_id` 由前端从
+/// `GET /parts/by-serial/{serial_no}/part-batches` 拿到（每个 batch 含
+/// `id` + `version` + `status`），状态机守卫读 batch 当前状态。
+///
+/// `batch_id` 用 String 序列化（雪花 i64 > 2^53，按 string 透传）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DeliverRequest {
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub batch_id: i64,
+    pub version: i32,
     #[serde(default)]
     pub note: Option<String>,
 }
 
 /// `POST /parts/{id}/cancel` 入参。
+///
+/// cancel 保持 part 级（PR-B3 §4.3 D3）：级联取消全部活跃批次 → part 翻转
+/// CANCELLED。`reason` 优先作为事件 note。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CancelRequest {
     #[serde(default)]
@@ -234,15 +248,30 @@ pub struct CancelRequest {
 }
 
 /// `POST /parts/{id}/complete` 入参。
+///
+/// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) BREAKING CHANGE：
+/// 收 `batch_id` + `version`（锚 `t_part_batch.version`，与 inspection 三流一致）。
+/// 状态机守卫读 batch 当前状态 `DELIVERED → COMPLETED`。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CompleteRequest {
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub batch_id: i64,
+    pub version: i32,
     #[serde(default)]
     pub note: Option<String>,
 }
 
 /// `POST /parts/{id}/start-repair` 入参。
+///
+/// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) BREAKING CHANGE：
+/// 收 `batch_id` + `version`。状态机守卫读 batch 当前状态
+/// `IN_PROCESS → REPAIRING`；`has_been_repaired=true` 写 batch
+/// （part 由 rollup 同步）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StartRepairRequest {
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub batch_id: i64,
+    pub version: i32,
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]

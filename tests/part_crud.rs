@@ -1046,7 +1046,18 @@ async fn get_by_serial_404() {
 //  Tests — Part 5: lifecycle (deliver / cancel / complete / start-repair)
 // ===========================================================================
 
+/// 读取批次当前乐观锁版本（lifecycle batch 级 OCC payload 用，PR-B3 起）。
+async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
+    sqlx::query_scalar::<_, i32>("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .expect("batch not found")
+}
+
 /// POST /parts/{id}/deliver —— READY_TO_SHIP → DELIVERED (200 + status)。
+///
+/// 2026-09-11 PR-B3：lifecycle 收 `batch_id` + `version`（锚 batch.version）。
 #[tokio::test]
 async fn deliver_ready_to_ship_200() {
     let (_guard, pool) = setup().await;
@@ -1061,6 +1072,9 @@ async fn deliver_ready_to_ship_200() {
         "READY_TO_SHIP",
     )
     .await;
+    // PR-B3：必须配一条 READY_TO_SHIP 批次；service 端按 batch.version 守卫。
+    let bid = insert_batch(&pool, pid, 1, 1, "READY_TO_SHIP").await;
+    let bver = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1068,7 +1082,11 @@ async fn deliver_ready_to_ship_200() {
         json_request(
             "POST",
             &format!("/parts/{pid}/deliver"),
-            Some(json!({ "note": "发货" })),
+            Some(json!({
+                "batch_id": bid,
+                "version": bver,
+                "note": "发货"
+            })),
             Some(&token),
         ),
     )
@@ -1078,7 +1096,11 @@ async fn deliver_ready_to_ship_200() {
     assert_eq!(env["data"]["status"], "DELIVERED");
 }
 
-/// POST /parts/{id}/deliver —— INSPECTION → 20117 BIZ_PART_NOT_READY_TO_SHIP (HTTP 400)。
+/// POST /parts/{id}/deliver —— batch 当前 INSPECTION → 20117 BIZ_PART_NOT_READY_TO_SHIP (HTTP 400)。
+///
+/// 2026-09-11 PR-B3：状态机守卫读 batch 状态（不是 part 派生列）。测试构造：
+/// part=INSPECTION + batch=INSPECTION，service 应报 20117 而不是 20109（因为
+/// batch 存在但状态不匹配）。
 #[tokio::test]
 async fn deliver_wrong_state_400() {
     let (_guard, pool) = setup().await;
@@ -1093,6 +1115,8 @@ async fn deliver_wrong_state_400() {
         "INSPECTION",
     )
     .await;
+    let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
+    let bver = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1100,7 +1124,10 @@ async fn deliver_wrong_state_400() {
         json_request(
             "POST",
             &format!("/parts/{pid}/deliver"),
-            Some(json!({})),
+            Some(json!({
+                "batch_id": bid,
+                "version": bver,
+            })),
             Some(&token),
         ),
     )
@@ -1176,12 +1203,15 @@ async fn cancel_wrong_state_400() {
 /// POST /parts/{id}/complete —— DELIVERED → COMPLETED (200 + status)。
 ///
 /// 测试技巧：直接 INSERT status='DELIVERED'（最简洁路径，绕开 deliver 端点）。
+/// 2026-09-11 PR-B3：lifecycle 收 `batch_id` + `version`（锚 batch.version）。
 #[tokio::test]
 async fn complete_delivered_200() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "DELIVERED").await;
+    let bid = insert_batch(&pool, pid, 1, 1, "DELIVERED").await;
+    let bver = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1189,7 +1219,11 @@ async fn complete_delivered_200() {
         json_request(
             "POST",
             &format!("/parts/{pid}/complete"),
-            Some(json!({ "note": "归档" })),
+            Some(json!({
+                "batch_id": bid,
+                "version": bver,
+                "note": "归档"
+            })),
             Some(&token),
         ),
     )
@@ -1197,20 +1231,25 @@ async fn complete_delivered_200() {
     assert_eq!(s, StatusCode::OK, "complete 200: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(env["data"]["status"], "COMPLETED");
-    // mark_part_completed 会清空 serial_no
+    // clear_part_serial_no_when_completed 清空 serial_no
     assert!(
         env["data"]["serial_no"].is_null(),
         "COMPLETED 应清空 serial_no: {env}"
     );
 }
 
-/// POST /parts/{id}/complete —— INSPECTION 状态 → 20116 BIZ_PART_NOT_DELIVERED。
+/// POST /parts/{id}/complete —— batch 当前 INSPECTION → 20116 BIZ_PART_NOT_DELIVERED。
+///
+/// 2026-09-11 PR-B3：状态机守卫读 batch 状态。测试构造 part=INSPECTION +
+/// batch=INSPECTION，service 应报 20116 而不是 20109。
 #[tokio::test]
 async fn complete_wrong_state_400() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
+    let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
+    let bver = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1218,7 +1257,10 @@ async fn complete_wrong_state_400() {
         json_request(
             "POST",
             &format!("/parts/{pid}/complete"),
-            Some(json!({})),
+            Some(json!({
+                "batch_id": bid,
+                "version": bver,
+            })),
             Some(&token),
         ),
     )
@@ -1227,9 +1269,10 @@ async fn complete_wrong_state_400() {
     assert_eq!(env["code"], 20116, "BIZ_PART_NOT_DELIVERED: {env}");
 }
 
-/// POST /parts/{id}/start-repair —— IN_PROCESS → REPAIRING (200 + status)。
+/// POST /parts/{id}/start-repair —— batch IN_PROCESS → REPAIRING (200 + status)。
 ///
 /// 允许角色：Manager / Clerk / Inspector（任一即可）。
+/// 2026-09-11 PR-B3：lifecycle 收 `batch_id` + `version`。
 #[tokio::test]
 async fn start_repair_in_process_200() {
     let (_guard, pool) = setup().await;
@@ -1244,6 +1287,8 @@ async fn start_repair_in_process_200() {
         "IN_PROCESS",
     )
     .await;
+    let bid = insert_batch(&pool, pid, 1, 1, "IN_PROCESS").await;
+    let bver = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1251,7 +1296,11 @@ async fn start_repair_in_process_200() {
         json_request(
             "POST",
             &format!("/parts/{pid}/start-repair"),
-            Some(json!({ "reason": "尺寸偏大" })),
+            Some(json!({
+                "batch_id": bid,
+                "version": bver,
+                "reason": "尺寸偏大"
+            })),
             Some(&token),
         ),
     )
@@ -1259,15 +1308,25 @@ async fn start_repair_in_process_200() {
     assert_eq!(s, StatusCode::OK, "start-repair 200: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(env["data"]["status"], "REPAIRING");
+    // start_repair 写 batch.has_been_repaired + 单独物化 part.has_been_repaired
+    assert_eq!(
+        env["data"]["has_been_repaired"], true,
+        "start-repair 应置 has_been_repaired=true: {env}"
+    );
 }
 
-/// POST /parts/{id}/start-repair —— PENDING 状态 → 20118 BIZ_PART_REPAIR_NOT_TRIGGERED。
+/// POST /parts/{id}/start-repair —— batch PENDING → 20118 BIZ_PART_REPAIR_NOT_TRIGGERED。
+///
+/// 2026-09-11 PR-B3：状态机守卫读 batch 状态。part=PENDING + batch=PENDING，
+/// service 应报 20118 而不是 20109。
 #[tokio::test]
 async fn start_repair_wrong_state_400() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
+    let bid = insert_batch(&pool, pid, 1, 1, "PENDING").await;
+    let bver = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1275,7 +1334,11 @@ async fn start_repair_wrong_state_400() {
         json_request(
             "POST",
             &format!("/parts/{pid}/start-repair"),
-            Some(json!({ "reason": "no-op" })),
+            Some(json!({
+                "batch_id": bid,
+                "version": bver,
+                "reason": "no-op"
+            })),
             Some(&token),
         ),
     )
@@ -1287,8 +1350,8 @@ async fn start_repair_wrong_state_400() {
 /// POST /parts/{id}/deliver —— CANCELLED 状态 → 20115 BIZ_PART_ALREADY_CANCELLED (409)。
 ///
 /// service 内新增 status guard：`from == CANCELLED` 一律 20115，
-/// 走在 wrong-state 检查（20117 BIZ_PART_NOT_READY_TO_SHIP）之前。
-/// 同样的 guard 也加在 `complete` / `start_repair`，这里只验 deliver。
+/// 走在 batch 定位之前。2026-09-11 PR-B3：必须构造有效 `batch_id` + `version`
+/// 入参才能越过 axum Json 反序列化命中 service guard。
 #[tokio::test]
 async fn deliver_cancelled_409() {
     let (_guard, pool) = setup().await;
@@ -1303,6 +1366,9 @@ async fn deliver_cancelled_409() {
         "CANCELLED",
     )
     .await;
+    // 配任意活跃 batch（service guard 在 batch 定位前短路，不查 batch 状态）。
+    let bid = insert_batch(&pool, pid, 1, 1, "READY_TO_SHIP").await;
+    let bver = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1310,7 +1376,10 @@ async fn deliver_cancelled_409() {
         json_request(
             "POST",
             &format!("/parts/{pid}/deliver"),
-            Some(json!({})),
+            Some(json!({
+                "batch_id": bid,
+                "version": bver,
+            })),
             Some(&token),
         ),
     )
@@ -1340,9 +1409,10 @@ async fn batch_status_and_version(pool: &PgPool, part_id: i64, status: &str) -> 
 }
 
 /// POST /parts/{id}/deliver —— READY_TO_SHIP → DELIVERED 应同时翻转
-/// 最近一条 READY_TO_SHIP 批次到 DELIVERED（同事务）。
+/// 指定 batch 到 DELIVERED（PR-B3 batch 级）。
 ///
-/// Fix Batch 2 Finding A 回归测试：t_part_batch 不再 stale。
+/// Fix Batch 2 Finding A 回归测试（PR-B3 适配）：t_part_batch 不再 stale；
+/// 通过 `batch_id` + `version` 指定操作批次。
 #[tokio::test]
 async fn deliver_also_updates_batch() {
     let (_guard, pool) = setup().await;
@@ -1358,7 +1428,8 @@ async fn deliver_also_updates_batch() {
     )
     .await;
     // 同 part 配一条 READY_TO_SHIP 批次
-    let _bid = insert_batch(&pool, pid, 1, 1, "READY_TO_SHIP").await;
+    let bid = insert_batch(&pool, pid, 1, 1, "READY_TO_SHIP").await;
+    let bver = batch_version(&pool, bid).await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1366,7 +1437,11 @@ async fn deliver_also_updates_batch() {
         json_request(
             "POST",
             &format!("/parts/{pid}/deliver"),
-            Some(json!({ "note": "发货" })),
+            Some(json!({
+                "batch_id": bid,
+                "version": bver,
+                "note": "发货"
+            })),
             Some(&token),
         ),
     )
@@ -1423,13 +1498,12 @@ async fn cancel_also_updates_batch() {
     assert_eq!(batch_status, "CANCELLED", "batch.status 应同步翻为 CANCELLED");
 }
 
-/// POST /parts/{id}/deliver —— 工单无对应 source-status 批次时仍应成功
-/// （t_part 单独翻转合法）。
+/// POST /parts/{id}/deliver —— batch_id 不存在 → 20109 BIZ_PART_BATCH_NOT_FOUND。
 ///
-/// Fix Batch 2 Finding A 边界测试：`find_most_recent_batch_for_part` 返回
-/// `None` 时跳过 `mark_batch_*`，不报错。
+/// 2026-09-11 PR-B3：lifecycle 三端点必须传 `batch_id`。`batch_id` 不存在
+/// 或不属于该 part → 20109。
 #[tokio::test]
-async fn deliver_without_source_batch_ok() {
+async fn deliver_without_source_batch_409() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
@@ -1442,7 +1516,8 @@ async fn deliver_without_source_batch_ok() {
         "READY_TO_SHIP",
     )
     .await;
-    // 故意不插 batch
+    // 故意不插 batch，传一个伪造 batch_id
+    let fake_bid: i64 = 9_999_999_999;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1450,13 +1525,20 @@ async fn deliver_without_source_batch_ok() {
         json_request(
             "POST",
             &format!("/parts/{pid}/deliver"),
-            Some(json!({})),
+            Some(json!({
+                "batch_id": fake_bid,
+                "version": 0,
+            })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "deliver w/o batch: {env}");
-    assert_eq!(env["data"]["status"], "DELIVERED");
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "deliver w/o batch: {env}"
+    );
+    assert_eq!(env["code"], 20109, "BIZ_PART_BATCH_NOT_FOUND: {env}");
 }
 
 /// POST /parts/{id}/cancel —— part 已挂送货单 → 21420 BIZ_DELIVERY_NOTE_LOCKED_PART (HTTP 409)。
