@@ -408,9 +408,10 @@ impl PartService {
         .await?;
         // 7. UPDATE t_part_batch: {PENDING, PROGRAMMING, IN_PROCESS} → INSPECTION
         //
-        // 隐式多批次 rollup：本步不显式调用 `count_other_inprocess_batches`，
-        // 因为前置状态守卫（step 3）已限定 from ∈ {PENDING, PROGRAMMING, IN_PROCESS}，
-        // 该状态下不可能存在 INSPECTION 批次，翻转 `t_part.status` 安全。
+        // 隐式多批次 rollup：前置状态守卫（step 3）已限定 from ∈ {PENDING, PROGRAMMING,
+        // IN_PROCESS}，该状态下不可能存在 INSPECTION 批次，翻转 `t_part.status` 安全；
+        // 翻 batch 后调 `PartService::sync_from_batch_change`（下方 step 8）按
+        // min-progress 规则回填 part 派生列。
         let n = PartRepo::mark_batch_inspected(
             &mut *conn,
             operated_id,

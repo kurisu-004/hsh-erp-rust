@@ -8,7 +8,8 @@
 //!   每抢到一批写一条 `TAKEN_FROM_POOL` 事件日志（commit 由 handler 负责）。
 //! - `compute_state` —— worker 当前持有数 + 池候选数（按工序分组）；用于 state 端点。
 //! - `admin_remove_held_batch` —— admin 主动把 worker 持有的某批次按 RETURNED 语义放回
-//!   候选池；调 `PartRepo::mark_batch_returned` + `mark_part_returned` + 写事件日志。
+//!   候选池；调 `PartRepo::mark_batch_returned`（OCC）+ `sync_from_batch_change`
+//!   同步 part 派生列 + 写事件日志。
 //!
 //! ## 阶段 worker-pool-by-process（Task 3）
 //! - `pool_by_process` —— admin 按工序查看候选池：process 元数据 + 映射工种 + 可执行工人 +
@@ -249,7 +250,7 @@ impl WorkerPoolService {
     /// 1. 取 worker（事件日志 `badge_code` 需要）；
     /// 2. 按 `(batch_id, holder_id = worker_id)` 找 IN_PROCESS+WORKER 批次，
     ///    找不到 → `20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER`；
-    /// 3. `mark_batch_returned` + `mark_part_returned`（OCC：version 冲突 →
+    /// 3. `mark_batch_returned`（OCC：version 冲突 →
     ///    `40901`）；shelf+next_process 由 admin 在 req 里指定（不校验 shelf
     ///    是否映射该 process —— 若 shelf 不映射此 process，下一次 worker refill
     ///    自然拿不到，由 service 抛出业务错时再处理）；
