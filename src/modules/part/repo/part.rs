@@ -466,9 +466,13 @@ impl PartRepo {
             .await
     }
 
-    /// 子件随装配体一起建档；10 个参数都是必填的（id/asm_id/serial 是 3 个主键字段，
-    /// name/quantity/drawing_no/planned_delivery_date/customer_id 是 5 个属性，created_by 是审计字段），
-    /// 没有聚合语义，builder 包装反而是噪音。直接放宽即可。
+    /// 子件随装配体一起建档；除了 3 个主键（id / assembly_id / serial_no）、
+    /// 5 个子件自身属性（name / drawing_no / quantity / planned_delivery_date /
+    /// customer_id）和 1 个审计字段（created_by）外，新增 6 个**继承自父件**
+    /// 的字段（`inherit`），按 `refactor-part-assembly-batch.md §3.1`（2026-09-11）
+    /// 实施：子件从父件 `t_assembly` 继承 `applicant_name` / `request_date` /
+    /// `order_no` / `system_delivery_date` / `is_urgent` / `note`，`planned_delivery_date`
+    /// 由 service 层在传入前按「子件入参优先，缺省继承父件」完成合并。
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_child_for_assembly<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -480,6 +484,7 @@ impl PartRepo {
         drawing_no: Option<&str>,
         quantity: i32,
         planned_delivery_date: Option<chrono::NaiveDate>,
+        inherit: ChildInheritFields<'_>,
         current_user_id: i64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
@@ -490,24 +495,46 @@ impl PartRepo {
                 order_no, system_delivery_date, note, status, location,
                 unit_price, total_price, serial_no, version, created_by
             ) VALUES (
-                $1, $2, $3, '', $4, CURRENT_DATE,
-                COALESCE($5, CURRENT_DATE), FALSE, $6, $7,
-                NULL, NULL, NULL, 'PENDING', 'OFFICE',
-                0, 0, $8, 0, $9
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10,
+                $11, $12, $13, 'PENDING', 'OFFICE',
+                0, 0, $14, 0, $15
             )
             "#,
         )
         .bind(id)
         .bind(name)
         .bind(drawing_no)
+        .bind(inherit.applicant_name)
         .bind(quantity)
+        .bind(inherit.request_date)
         .bind(planned_delivery_date)
+        .bind(inherit.is_urgent)
         .bind(customer_id)
         .bind(assembly_id)
+        .bind(inherit.order_no)
+        .bind(inherit.system_delivery_date)
+        .bind(inherit.note)
         .bind(serial_no)
         .bind(current_user_id)
         .execute(executor)
         .await?;
         Ok(())
     }
+}
+
+/// 子件从父装配件继承的字段包（§3.1）。
+///
+/// `applicant_name` 在 `t_part` 是 `NOT NULL VARCHAR(50)`，父可空 → service 层
+/// 在传入前已用空串 `""` 兜底；`request_date` 在 `t_part` 也是 `NOT NULL`，
+/// 由父件 `request_date`（可能为父 service 层默认今天）兜底。
+/// `is_urgent` 父可空 → `bool` 缺省 `false` 由父 service 决定。
+#[derive(Debug, Clone)]
+pub struct ChildInheritFields<'a> {
+    pub applicant_name: &'a str,
+    pub request_date: chrono::NaiveDate,
+    pub order_no: Option<&'a str>,
+    pub system_delivery_date: Option<chrono::NaiveDate>,
+    pub is_urgent: bool,
+    pub note: Option<&'a str>,
 }

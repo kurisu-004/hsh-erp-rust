@@ -22,6 +22,7 @@ use crate::modules::assembly::repo::{AssemblyListFilters, AssemblyRepo, Assembly
 use crate::modules::assembly::statemachine::{
     compute_assembly_target, AssemblyStatus,
 };
+use crate::modules::part::repo::part::ChildInheritFields;
 use crate::modules::part::repo::PartRepo;
 use crate::shared::error::{code, AppError};
 
@@ -377,13 +378,31 @@ impl AssemblyService {
         AssemblyRepo::insert(&mut *conn, new).await.map_err(AppError::from)?;
 
         // 6. 插入子件（如有 PDF，则带 serial_no 派生 `{asm_serial}-{i:02d}`）
+        //
+        // 子件字段继承父件（§3.1）：applicant_name/request_date/order_no/system_delivery_date/
+        // is_urgent/note 由父件直接继承；planned_delivery_date 子件入参优先，缺省继承父件。
+        // 父件相关缺省值已在本函数上方确定（request_date/planned_delivery_date/
+        // is_urgent 见 NewAssembly 构造），这里直接把父件"应有值"打包传给 repo。
+        let parent_applicant_name = req.applicant_name.as_deref().unwrap_or("");
+        let parent_request_date = req.request_date.unwrap_or(today);
+        let parent_planned_delivery_date = req.planned_delivery_date.unwrap_or(today);
+        let parent_is_urgent = req.is_urgent.unwrap_or(false);
         let mut created_children_out: Vec<AssemblyChildOut> = Vec::new();
         if let (Some(asm_serial), Some(_)) = (serial_no.as_ref(), prefix) {
             for (i, ch) in req.children.iter().enumerate() {
                 let child_id = snowflake.next_id();
                 let child_serial = format!("{}-{:02}", asm_serial, i + 1);
                 let child_qty = ch.quantity.unwrap_or(1);
+                let child_planned = ch.planned_delivery_date.or(Some(parent_planned_delivery_date));
                 let _ = page_count_opt; // reserved for AssemblyFileRef follow-up
+                let inherit = ChildInheritFields {
+                    applicant_name: parent_applicant_name,
+                    request_date: parent_request_date,
+                    order_no: req.order_no.as_deref(),
+                    system_delivery_date: req.system_delivery_date,
+                    is_urgent: parent_is_urgent,
+                    note: req.note.as_deref(),
+                };
                 PartRepo::insert_child_for_assembly(
                     &mut *conn,
                     child_id,
@@ -393,7 +412,8 @@ impl AssemblyService {
                     &ch.name,
                     ch.drawing_no.as_deref(),
                     child_qty,
-                    ch.planned_delivery_date,
+                    child_planned,
+                    inherit,
                     current.id,
                 )
                 .await
@@ -406,7 +426,7 @@ impl AssemblyService {
                     status: "PENDING".into(),
                     version: 0,
                     quantity: child_qty,
-                    planned_delivery_date: ch.planned_delivery_date,
+                    planned_delivery_date: child_planned,
                 });
             }
         }
