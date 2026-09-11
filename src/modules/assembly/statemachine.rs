@@ -13,8 +13,15 @@
 //!
 //! 2026-09 Rust 端对齐 Python 的 7 态：新增 INSPECTION / READY_TO_SHIP / DELIVERED。
 //! 与 part 域不同——assembly 的 rollup 跟随子件进度跨越 INSPECTION / READY_TO_SHIP / DELIVERED。
+//!
+//! ## rollup 函数（part/assembly/batch 重构方案 §4.2 PR-B2）
+//!
+//! `part_status_progress` 提升到 `part::statemachine`（共享函数），本文件
+//! 通过 `use crate::modules::part::statemachine::part_status_progress;` 引用。
 
 use serde::{Deserialize, Serialize};
+
+use crate::modules::part::statemachine::part_status_progress;
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,21 +168,6 @@ mod tests {
         // COMPLETED / CANCELLED 不可再 cancel
         assert!(!COMPLETED.can_transition_to(CANCELLED));
         assert!(!CANCELLED.can_transition_to(CANCELLED));
-    }
-}
-
-/// Part status → "progress rank" (mirrors Python ROLLUP_PROGRESS).
-/// Unknown → 2 (IN_PROCESS-equivalent), safe default.
-fn part_status_progress(s: &str) -> u8 {
-    match s {
-        "PENDING" => 0,
-        "PROGRAMMING" => 1,
-        "IN_PROCESS" | "REPAIRING" => 2,
-        "OUTSOURCE" => 3,
-        "INSPECTION" => 4,
-        "READY_TO_SHIP" => 5,
-        "DELIVERED" => 6,
-        _ => 2,
     }
 }
 

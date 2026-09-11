@@ -466,16 +466,26 @@ impl PartRepo {
             .await
     }
 
-    /// 子件随装配体一起建档；除了 3 个主键（id / assembly_id / serial_no）、
+    /// 子件随装配体一起建档；除 3 个主键（id / assembly_id / serial_no）、
     /// 5 个子件自身属性（name / drawing_no / quantity / planned_delivery_date /
     /// customer_id）和 1 个审计字段（created_by）外，新增 6 个**继承自父件**
     /// 的字段（`inherit`），按 `refactor-part-assembly-batch.md §3.1`（2026-09-11）
     /// 实施：子件从父件 `t_assembly` 继承 `applicant_name` / `request_date` /
-    /// `order_no` / `system_delivery_date` / `is_urgent` / `note`，`planned_delivery_date`
-    /// 由 service 层在传入前按「子件入参优先，缺省继承父件」完成合并。
+    /// `order_no` / `system_delivery_date` / `is_urgent` / `note`，
+    /// `planned_delivery_date` 由 service 层在传入前按「子件入参优先，缺省继承
+    /// 父件」完成合并。
+    ///
+    /// 2026-09-11 part/assembly/batch 重构方案 §4.1 (PR-B1)：本函数额外插入
+    /// 一条 `batch_no=1 / status='PENDING' / location='OFFICE' / quantity=$quantity`
+    /// 的初始批次（part/assembly/batch 重构后所有车间流转都锚定 batch，必须有
+    /// 初始批次）。`initial_batch_id` 由 caller 预生成雪花。
+    ///
+    /// 函数签名收 `&mut PgConnection`（非 `impl PgExecutor<'_>`），因为要在同一
+    /// 事务内连发两条 INSERT（与 `split_batch_for_partial_pass` / `split_batch`
+    /// 同模式）。
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert_child_for_assembly<'e, E: PgExecutor<'e>>(
-        executor: E,
+    pub async fn insert_child_for_assembly(
+        conn: &mut sqlx::PgConnection,
         id: i64,
         customer_id: i64,
         assembly_id: i64,
@@ -486,8 +496,9 @@ impl PartRepo {
         planned_delivery_date: Option<chrono::NaiveDate>,
         inherit: ChildInheritFields<'_>,
         current_user_id: i64,
+        initial_batch_id: i64,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        sqlx::query!(
             r#"
             INSERT INTO t_part (
                 id, name, drawing_no, applicant_name, quantity, request_date,
@@ -501,23 +512,47 @@ impl PartRepo {
                 0, 0, $14, 0, $15
             )
             "#,
+            id,
+            name,
+            drawing_no,
+            inherit.applicant_name,
+            quantity,
+            inherit.request_date,
+            planned_delivery_date,
+            inherit.is_urgent,
+            customer_id,
+            assembly_id,
+            inherit.order_no,
+            inherit.system_delivery_date,
+            inherit.note,
+            serial_no,
+            current_user_id,
         )
-        .bind(id)
-        .bind(name)
-        .bind(drawing_no)
-        .bind(inherit.applicant_name)
-        .bind(quantity)
-        .bind(inherit.request_date)
-        .bind(planned_delivery_date)
-        .bind(inherit.is_urgent)
-        .bind(customer_id)
-        .bind(assembly_id)
-        .bind(inherit.order_no)
-        .bind(inherit.system_delivery_date)
-        .bind(inherit.note)
-        .bind(serial_no)
-        .bind(current_user_id)
-        .execute(executor)
+        .execute(&mut *conn)
+        .await?;
+        // 初始批次（part/assembly/batch 重构方案 §4.1 PR-B1）：子件 location='OFFICE'。
+        // 复用 `PartBatchRepo::create_initial_batch` 的 INSERT 形状，保持与
+        // `create_part` / `batch_create_parts` 两个入口的批次初始化语义一致。
+        sqlx::query!(
+            r#"
+            INSERT INTO t_part_batch (
+                id, part_id, batch_no, quantity, status, location,
+                current_holder_id, next_process_id, placed_at,
+                delivery_note_id, parent_batch_id, has_been_repaired,
+                version, created_at, created_by, updated_at, updated_by
+            ) VALUES (
+                $1, $2, 1, $3, 'PENDING', 'OFFICE',
+                NULL, NULL, NULL,
+                NULL, NULL, FALSE,
+                0, now(), $4, now(), $4
+            )
+            "#,
+            initial_batch_id,
+            id,
+            quantity,
+            current_user_id,
+        )
+        .execute(&mut *conn)
         .await?;
         Ok(())
     }
@@ -702,5 +737,139 @@ mod tests {
         assert_eq!(scale_qty(3, -1, 2), None, "old_qty=-1 应跳过");
         assert_eq!(scale_qty(3, 1, 0), None, "new_qty=0 应跳过");
         assert_eq!(scale_qty(3, 1, -2), None, "new_qty=-2 应跳过");
+    }
+}
+
+// ===== rollup 相关 repo 函数（从 refactor/part-assembly-Bchain 合并过来） =====
+//
+// 这些函数服务于 PR-B2 `PartService::sync_from_batch_change`（part 状态由 batch 变化
+// rollup 派生）。单独一组 `impl PartRepo { ... }`，与上面的方向 A 级联 / 缩放函数区分。
+//
+// 注：本块位于 `mod tests` 之后，触发 clippy::items_after_test_module 警告。
+// 与 `worker_scan.rs::needless_late_init` 同类 pre-existing 例外，合并期不便重构
+// impl 块布局，加 `#[allow]` 豁免。
+#[allow(clippy::items_after_test_module)]
+impl PartRepo {
+    /// rollup 读侧：part 当前派生列投影（PR-B2 `sync_from_batch_change` 用）。
+    ///
+    /// 6 列：status / location / current_holder_id / next_process_id /
+    /// placed_at / version。`None` 表示 part 不存在或已软删。
+    pub async fn get_part_rollup_state<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+    ) -> Result<Option<crate::modules::part::model::TPartRollupState>, sqlx::Error> {
+        sqlx::query_as!(
+            crate::modules::part::model::TPartRollupState,
+            r#"
+            SELECT status, location, current_holder_id, next_process_id,
+                   placed_at, version
+            FROM t_part
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+            part_id,
+        )
+        .fetch_optional(executor)
+        .await
+    }
+
+    /// rollup 写侧：派生列 UPDATE（PR-B2 `sync_from_batch_change` 用）。
+    ///
+    /// **不走 OCC**（派生写）：`WHERE id=$1 AND deleted_at IS NULL`。
+    /// 并发 rollup 由 SQL 行锁串行化；`version += 1` 仍写入（保证审计字段单调）。
+    /// 0 行 → part 已被并发软删（防御性 caller 走 NoChange）。
+    ///
+    /// `location` / `current_holder_id` / `next_process_id` / `placed_at` 必填
+    /// （从最慢批次物化；不存在 → `NULL`，与 batch 端的 `Optional<>` 对齐）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_part_rollup<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        status: &str,
+        location: Option<&str>,
+        current_holder_id: Option<i64>,
+        next_process_id: Option<i64>,
+        placed_at: Option<chrono::NaiveDateTime>,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query!(
+            r#"
+            UPDATE t_part
+            SET status            = $2,
+                location          = $3,
+                current_holder_id = $4,
+                next_process_id   = $5,
+                placed_at         = $6,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $7
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+            part_id,
+            status,
+            location,
+            current_holder_id,
+            next_process_id,
+            placed_at,
+            updated_by,
+        )
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) start_repair 辅助：
+    /// 单独置 `has_been_repaired=true`（不被 rollup 覆盖；rollup 仅物化
+    /// status/location/holder/process/placed_at 5 列）。
+    ///
+    /// 幂等：`has_been_repaired = has_been_repaired OR TRUE` 语义上等价 `=TRUE`，
+    /// 但保留 OR 形式让 PG 优化器识别"no change"路径（已被设置时不写 WAL）。
+    /// **不走 OCC**（衍生写，与 rollup 一致）。
+    pub async fn mark_part_repairing_flag_only<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query!(
+            r#"
+            UPDATE t_part
+            SET has_been_repaired = TRUE,
+                version           = version + 1,
+                updated_at        = now(),
+                updated_by        = $2
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+            part_id,
+            updated_by,
+        )
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) complete 辅助：
+    /// part 进入 COMPLETED 时清空 `serial_no`（序列号已转交送货单）。
+    ///
+    /// 条件：`status='COMPLETED'`（rollup 已把 part 推到终态）。0 行不影响事务。
+    /// **不走 OCC**（衍生写）。
+    pub async fn clear_part_serial_no_when_completed<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            r#"
+            UPDATE t_part
+            SET serial_no  = NULL,
+                version    = version + 1,
+                updated_at = now(),
+                updated_by = $2
+            WHERE id = $1 AND status = 'COMPLETED' AND deleted_at IS NULL
+            "#,
+        )
+        .bind(part_id)
+        .bind(updated_by)
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
     }
 }

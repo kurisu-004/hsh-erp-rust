@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part\n            SET has_been_repaired = TRUE,\n                version           = version + 1,\n                updated_at        = now(),\n                updated_by        = $2\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cee087eed7f01cd671a7c78efc03416f045618f9b3edde79611bdd58cef098e1"
+}

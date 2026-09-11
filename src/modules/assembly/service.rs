@@ -398,6 +398,7 @@ impl AssemblyService {
         if let (Some(asm_serial), Some(_)) = (serial_no.as_ref(), prefix) {
             for (i, ch) in req.children.iter().enumerate() {
                 let child_id = snowflake.next_id();
+                let initial_batch_id = snowflake.next_id();
                 let child_serial = format!("{}-{:02}", asm_serial, i + 1);
                 let child_qty = ch.quantity.unwrap_or(1);
                 let child_planned = ch.planned_delivery_date.or(Some(parent_planned_delivery_date));
@@ -411,7 +412,7 @@ impl AssemblyService {
                     note: req.note.as_deref(),
                 };
                 PartRepo::insert_child_for_assembly(
-                    &mut *conn,
+                    conn,
                     child_id,
                     customer_id,
                     asm_id,
@@ -422,6 +423,7 @@ impl AssemblyService {
                     child_planned,
                     inherit,
                     current.id,
+                    initial_batch_id,
                 )
                 .await
                 .map_err(AppError::from)?;

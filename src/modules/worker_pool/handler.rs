@@ -72,6 +72,7 @@ pub async fn admin_refill(
         req.worker_id,
         req.shelf_id,
         current.id,
+        &current,
     )
     .await?;
     tx.commit().await?;

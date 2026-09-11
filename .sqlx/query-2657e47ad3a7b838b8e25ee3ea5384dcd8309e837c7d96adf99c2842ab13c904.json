@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO t_part (\n                id, name, drawing_no, applicant_name, quantity, request_date,\n                planned_delivery_date, is_urgent, customer_id, assembly_id,\n                order_no, system_delivery_date, note, status, location,\n                unit_price, total_price, serial_no, version, created_by\n            ) VALUES (\n                $1, $2, $3, $4, $5, $6,\n                $7, $8, $9, $10,\n                $11, $12, $13, 'PENDING', 'OFFICE',\n                0, 0, $14, 0, $15\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Date",
+        "Date",
+        "Bool",
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Date",
+        "Varchar",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2657e47ad3a7b838b8e25ee3ea5384dcd8309e837c7d96adf99c2842ab13c904"
+}
