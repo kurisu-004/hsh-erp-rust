@@ -180,10 +180,14 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             refresh_ttl_days: 7,
         },
         cos: CosConfig {
+            // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
+            enabled: false,
             region: "ap-shanghai".into(),
             bucket: "test".into(),
             secret_id: "test".into(),
             secret_key: "test".into(),
+            app_id: "".into(),
+            endpoint: "".into(),
             scheme: "https".into(),
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
@@ -237,10 +241,14 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             refresh_ttl_days: 7,
         },
         cos: CosConfig {
+            // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
+            enabled: false,
             region: "ap-shanghai".into(),
             bucket: "test".into(),
             secret_id: "test".into(),
             secret_key: "test".into(),
+            app_id: "".into(),
+            endpoint: "".into(),
             scheme: "https".into(),
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,

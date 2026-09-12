@@ -48,10 +48,31 @@ pub struct JwtConfig {
 
 #[derive(Clone, Debug)]
 pub struct CosConfig {
+    /// 是否启用真实 COS 上传。
+    ///
+    /// - true：使用 TencentCos（真实 PUT/GET/DELETE 到腾讯云）；
+    /// - false：使用 NoopCos（静默成功，不真传，本地调试用）。
+    ///
+    /// 环境变量 `COS_ENABLED`，缺省 `true`。
+    ///
+    /// 2026-09-11 新增
+    pub enabled: bool,
     pub region: String,
     pub bucket: String,
     pub secret_id: String,
     pub secret_key: String,
+    /// COS AppId（腾讯云账户 ID）。若 bucket 命名为 `<name>-<appid>` 格式
+    /// （如 `erp-drawing-1410882329`），填 appid 用于拼 endpoint；空则尝试
+    /// 从 bucket 解析。环境变量 `COS_APP_ID`，缺省空串。
+    ///
+    /// 2026-09-11 新增
+    pub app_id: String,
+    /// 可选 endpoint 覆盖（私有化部署 / 加速域名）。
+    /// 留空走标准 endpoint：`{scheme}://{bucket}-{appid}.cos.{region}.myqcloud.com`。
+    /// 环境变量 `COS_ENDPOINT`，缺省空串。
+    ///
+    /// 2026-09-11 新增
+    pub endpoint: String,
     pub scheme: String,
     pub upload_prefix: String,
     pub presign_expire_seconds: u32,
@@ -91,15 +112,31 @@ impl AppConfig {
                 refresh_ttl_days: env_parse("JWT_REFRESH_TOKEN_EXPIRE_DAYS", 7)?,
             },
 
-            cos: CosConfig {
-                region: env_or("COS_REGION", "ap-shanghai"),
-                bucket: env_required("COS_BUCKET")?,
-                secret_id: env_required("COS_SECRET_ID")?,
-                secret_key: env_required("COS_SECRET_KEY")?,
-                scheme: env_or("COS_SCHEME", "https"),
-                upload_prefix: env_or("COS_UPLOAD_PREFIX", "uploads"),
-                presign_expire_seconds: env_parse("COS_PRESIGN_EXPIRE", 3600)?,
-                max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
+            cos: {
+                // 2026-09-11 修改：先读 COS_ENABLED；disabled 时 COS_SECRET_* 不强制要求，
+                // 占位空串即可（NoopCos 不读凭据）。
+                let cos_enabled = env_bool("COS_ENABLED", true)?;
+                let (secret_id, secret_key) = if cos_enabled {
+                    (
+                        env_required("COS_SECRET_ID")?,
+                        env_required("COS_SECRET_KEY")?,
+                    )
+                } else {
+                    (String::new(), String::new())
+                };
+                CosConfig {
+                    enabled: cos_enabled,
+                    region: env_or("COS_REGION", "ap-shanghai"),
+                    bucket: env_required("COS_BUCKET")?,
+                    secret_id,
+                    secret_key,
+                    app_id: env_or("COS_APP_ID", ""),
+                    endpoint: env_or("COS_ENDPOINT", ""),
+                    scheme: env_or("COS_SCHEME", "https"),
+                    upload_prefix: env_or("COS_UPLOAD_PREFIX", "uploads"),
+                    presign_expire_seconds: env_parse("COS_PRESIGN_EXPIRE", 3600)?,
+                    max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
+                }
             },
 
             snowflake: SnowflakeConfig {

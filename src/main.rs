@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 
 use hsh_erp_rust::auth::session::{NoopSessionStore, RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::AppConfig;
-use hsh_erp_rust::infra::cos::{CosClient, NoopCos};
+use hsh_erp_rust::infra::cos::{CosClient, NoopCos, TencentCos};
 use hsh_erp_rust::infra::db;
 use hsh_erp_rust::infra::redis;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
@@ -61,8 +61,18 @@ async fn main() -> anyhow::Result<()> {
     // 5. WebSocket 广播中枢
     let ws_hub = Arc::new(WsHub::new());
 
-    // 6. COS 客户端（骨架阶段占位）
-    let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
+    // 6. COS 客户端（按 COS_ENABLED 选择真实上传或 NoopCos）
+    // 2026-09-11 修改：按 env 开关二选一构造；TencentCos::new 失败时 `?` 终止启动。
+    let cos: Arc<dyn CosClient> = if config.cos.enabled {
+        info!("COS_ENABLED=true，启用 TencentCos（真实上传到腾讯云 COS）");
+        Arc::new(
+            TencentCos::new(config.cos.clone())
+                .context("初始化 TencentCos 失败（检查 COS_SECRET_ID / KEY / BUCKET / REGION）")?,
+        )
+    } else {
+        info!("COS_ENABLED=false，使用 NoopCos（不上传真实文件，仅本地调试）");
+        Arc::new(NoopCos)
+    };
 
     // 6.5 Redis 连接池 + 服务端 session 存储
     // 关掉后使用 NoopSessionStore（不连 Redis）；适用于 Rust 借 Python JWT 的迁移过渡期

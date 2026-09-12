@@ -18,8 +18,12 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{add_role, insert_user_with_password, test_app, test_state};
+use common::{add_role, clean_business_db, clean_db, insert_user_with_password, test_app, test_pool, test_state, test_state_with_disabled_session};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+use hsh_erp_rust::modules::part::service::PartService;
+use hsh_erp_rust::modules::part_file::policy;
+use hsh_erp_rust::modules::part_file::repo::PartFileRepo;
+use hsh_erp_rust::shared::error::code;
 
 // ===========================================================================
 //  全局串行化 + helpers (拷贝自 tests/part_api.rs，按约定不跨文件复用)
@@ -1667,4 +1671,223 @@ async fn upload_drawing_integration() {
     //       .multipart(multipart)
     //       .send().await.unwrap();
     //   assert_eq!(resp.status(), 200);
+}
+
+// ===========================================================================
+//  Tests — Part 6.5: 上传 service 层（2026-09-11 新增）
+//
+//  走 service 层直接调用，绕过 multipart HTTP 复杂度，验证：
+//  - NoopCos 静默成功 → t_part_file 落 DRAWING / 3D_MODEL 行
+//  - 扩展名 / content_type 白名单拦截
+//  - CAS key 格式符合 Python 同款（`{prefix}/{owner_kind}/{id}/{KIND}/{sha16}_{safe}`）
+// ===========================================================================
+
+/// 构造 Manager 角色 CurrentUser（service 层直调需要 current 参数）
+fn manager_current(id: i64) -> hsh_erp_rust::auth::rbac::CurrentUser {
+    use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
+    CurrentUser {
+        id,
+        username: "test-manager".into(),
+        roles: vec![Role::Manager],
+        shelf_ids: vec![],
+        shelf_wildcard: false,
+    }
+}
+
+/// 构造一个简单 PDF 字节（无需真实 PDF 格式，仅用于占位 bytes；service 不校验内容）
+fn fake_pdf_bytes() -> Vec<u8> {
+    b"%PDF-1.4\n%fake test drawing for upload integration\n%%EOF\n".to_vec()
+}
+
+/// 构造一个简单 STEP 字节
+fn fake_step_bytes() -> Vec<u8> {
+    b"ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION((''),'2;1');\nENDSEC;\nEND-ISO-10303-21;\n".to_vec()
+}
+
+#[tokio::test]
+#[ignore] // 跑 service 层需起 postgres-test + redis-test；CI 集成测试再开启
+async fn upload_drawing_service_integration() {
+    let _ = TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_db(&pool).await;
+    clean_business_db(&pool).await;
+
+    let state = test_state_with_disabled_session(pool.clone());
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 99); // 99 区分测试进程，避免 ID 冲突
+
+    // 建 L1+L2 客户 → PENDING part
+    let l1 = insert_l1(&pool, "U", "U").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let part_id = insert_part_with_status(&pool, "P-DRAW", l2, None, None, "PENDING").await;
+
+    let bytes = fake_pdf_bytes();
+    let mut conn = state.pool.begin().await.unwrap();
+    let pf = PartService::upload_drawing(
+        &mut conn,
+        &snowflake,
+        &state,
+        part_id,
+        &bytes,
+        "drawing.pdf",
+        "application/pdf",
+        &manager_current(1),
+    )
+    .await
+    .expect("upload_drawing 应成功");
+    conn.commit().await.unwrap();
+
+    // 验证 t_part_file 行
+    assert_eq!(pf.kind, "DRAWING");
+    assert_eq!(pf.file_type, "PDF");
+    assert_eq!(pf.part_id, part_id);
+    assert_eq!(pf.original_filename, "drawing.pdf");
+    assert_eq!(pf.file_size, bytes.len() as i64);
+    assert_eq!(pf.content_type, "application/pdf");
+    assert_eq!(pf.upload_status, "READY");
+    assert!(pf.content_sha256.is_some());
+    // CAS key 格式：`uploads/part/{id}/DRAWING/{sha16}_{safe}.pdf`
+    assert!(
+        pf.object_key.starts_with(&format!("uploads/part/{part_id}/DRAWING/")),
+        "CAS key 格式不符: {}",
+        pf.object_key
+    );
+    assert!(pf.object_key.ends_with("_drawing.pdf"));
+
+    // 反查 DB
+    let row = PartFileRepo::get_by_part_kind(&pool, part_id, "DRAWING")
+        .await
+        .unwrap()
+        .expect("DB 行应存在");
+    assert_eq!(row.id, pf.id);
+}
+
+#[tokio::test]
+#[ignore]
+async fn upload_3d_model_service_integration() {
+    let _ = TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_db(&pool).await;
+    clean_business_db(&pool).await;
+
+    let state = test_state_with_disabled_session(pool.clone());
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 99);
+
+    let l1 = insert_l1(&pool, "U", "U").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let part_id = insert_part_with_status(&pool, "P-3D", l2, None, None, "PENDING").await;
+
+    let bytes = fake_step_bytes();
+    let mut conn = state.pool.begin().await.unwrap();
+    let pf = PartService::upload_3d_model(
+        &mut conn,
+        &snowflake,
+        &state,
+        part_id,
+        &bytes,
+        "bracket.step",
+        "application/step",
+        &manager_current(1),
+    )
+    .await
+    .expect("upload_3d_model 应成功");
+    conn.commit().await.unwrap();
+
+    assert_eq!(pf.kind, "3D_MODEL");
+    assert_eq!(pf.file_type, "STEP");
+    assert_eq!(pf.part_id, part_id);
+    assert_eq!(pf.original_filename, "bracket.step");
+    assert_eq!(pf.file_size, bytes.len() as i64);
+    assert!(pf.object_key.starts_with(&format!("uploads/part/{part_id}/3D_MODEL/")));
+    assert!(pf.object_key.ends_with("_bracket.step"));
+
+    let row = PartFileRepo::get_by_part_kind(&pool, part_id, "3D_MODEL")
+        .await
+        .unwrap()
+        .expect("DB 行应存在");
+    assert_eq!(row.id, pf.id);
+    assert_eq!(row.file_type, "STEP");
+}
+
+#[tokio::test]
+#[ignore]
+async fn upload_bad_extension_rejected() {
+    // 2026-09-11 新增：DRAWING kind 不接受 .step 扩展名，应 BIZ_PART_FILE_BAD_TYPE
+    let _ = TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_db(&pool).await;
+    clean_business_db(&pool).await;
+
+    let state = test_state_with_disabled_session(pool.clone());
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 99);
+    let l1 = insert_l1(&pool, "U", "U").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let part_id = insert_part_with_status(&pool, "P-BAD", l2, None, None, "PENDING").await;
+
+    let mut conn = state.pool.begin().await.unwrap();
+    let err = PartService::upload_drawing(
+        &mut conn,
+        &snowflake,
+        &state,
+        part_id,
+        b"junk".to_vec().as_slice(),
+        "evil.step", // STEP 扩展名给 DRAWING 端点
+        "application/step",
+        &manager_current(1),
+    )
+    .await
+    .expect_err("应被扩展名白名单拦截");
+    conn.rollback().await.unwrap();
+
+    // 错误码断言：policy::allowed_exts("DRAWING") == ["pdf"]，"step" 不在 → BAD_TYPE
+    assert_eq!(err.code(), code::BIZ_PART_FILE_BAD_TYPE, "实际错误: {err:?}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn upload_content_type_mismatch_rejected() {
+    // 2026-09-11 新增：扩展名是 .pdf 但 content_type 不对，应 BIZ_PART_FILE_BAD_TYPE
+    let _ = TEST_LOCK.lock().await;
+    let pool = test_pool().await;
+    clean_db(&pool).await;
+    clean_business_db(&pool).await;
+
+    let state = test_state_with_disabled_session(pool.clone());
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 99);
+    let l1 = insert_l1(&pool, "U", "U").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let part_id = insert_part_with_status(&pool, "P-CT", l2, None, None, "PENDING").await;
+
+    let mut conn = state.pool.begin().await.unwrap();
+    let err = PartService::upload_drawing(
+        &mut conn,
+        &snowflake,
+        &state,
+        part_id,
+        b"junk".to_vec().as_slice(),
+        "drawing.pdf",
+        "image/png", // 扩展名 PDF 但 content_type 不匹配
+        &manager_current(1),
+    )
+    .await
+    .expect_err("应被 content_type 校验拦截");
+    conn.rollback().await.unwrap();
+
+    assert_eq!(err.code(), code::BIZ_PART_FILE_BAD_TYPE);
+}
+
+#[tokio::test]
+#[ignore]
+async fn policy_unit_smoke_integration() {
+    // 2026-09-11 新增：service 层直接验证 policy::allowed_exts / file_type_for_ext
+    // 已被 cargo test --lib 覆盖；这里仅冒烟，防止 policy 表未来被改坏时无声回归
+    assert_eq!(policy::allowed_exts("DRAWING"), &["pdf"]);
+    assert!(policy::allowed_exts("3D_MODEL").contains(&"step"));
+    assert!(policy::allowed_exts("3D_MODEL").contains(&"stl"));
+    assert_eq!(policy::file_type_for_ext("pdf"), Some("PDF"));
+    assert_eq!(policy::file_type_for_ext("STEP"), Some("STEP"));
+    assert_eq!(policy::file_type_for_ext("step"), Some("STEP"));
+    assert_eq!(policy::file_type_for_ext("unknown"), None);
+    let ext = policy::ext_of("foo.PDF");
+    assert_eq!(ext.as_deref(), Some("pdf"));
+    assert_eq!(policy::ext_of("noext"), None);
 }
