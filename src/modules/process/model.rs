@@ -28,4 +28,6 @@ pub struct TProcess {
     pub updated_by: Option<i64>,
     pub deleted_at: Option<chrono::NaiveDateTime>,
     pub requires_approval: bool,
+    /// 前端工序卡片颜色（hex 含 alpha）；格式 `#RRGGBBAA`，9 字符。NULL = 未设置。
+    pub color: Option<String>,
 }

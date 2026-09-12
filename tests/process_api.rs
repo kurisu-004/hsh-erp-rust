@@ -415,3 +415,180 @@ async fn soft_delete_process_referenced_by_part_returns_20803() {
         "expected BIZ_PROCESS_IN_USE; got: {env2}"
     );
 }
+
+// ===========================================================================
+//  color 字段（migration 020）—— 2026-09-12 新增
+// ===========================================================================
+
+/// 建工序带 color `#RRGGBBAA` → fetch 拿回原文；缺省字段不出现在响应。
+#[tokio::test]
+async fn create_process_color_round_trip() {
+    let (_guard, pool) = setup().await;
+    let (app, token) = login_manager(pool.clone(), "proc_color").await;
+
+    // 1. create with color
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/processes",
+            Some(json!({
+                "code": "P-COLOR-OK",
+                "name": "Colored",
+                "category": "INHOUSE",
+                "color": "#409EFFA0",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "create: {env}");
+    assert_eq!(env["data"]["color"], "#409EFFA0");
+    let pid = env["data"]["id"].as_str().unwrap().to_string();
+
+    // 2. fetch by id
+    let (s2, env2) = send(
+        app,
+        json_request("GET", &format!("/processes/{pid}"), None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(env2["data"]["color"], "#409EFFA0");
+}
+
+/// 不传 color → 响应字段缺省（skip_serializing_if = "Option::is_none"）。
+#[tokio::test]
+async fn create_process_no_color_omits_field() {
+    let (_guard, pool) = setup().await;
+    let (app, token) = login_manager(pool, "proc_nocolor").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/processes",
+            Some(json!({
+                "code": "P-NOCOLOR",
+                "name": "Plain",
+                "category": "INHOUSE",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{env}");
+    assert!(
+        env["data"]["color"].is_null(),
+        "未设 color 时应为 null: {env}"
+    );
+}
+
+/// color 格式错（不是 `#RRGGBBAA`）→ 20104 BIZ_INVALID_VALUE。
+#[tokio::test]
+async fn create_process_invalid_color_rejected() {
+    let (_guard, pool) = setup().await;
+    let (app, token) = login_manager(pool, "proc_badcolor").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/processes",
+            Some(json!({
+                "code": "P-BAD",
+                "name": "Bad color",
+                "category": "INHOUSE",
+                "color": "red",  // 错格式
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{env}");
+    assert_eq!(
+        env["code"].as_i64().unwrap(),
+        20104,
+        "BIZ_INVALID_VALUE: {env}"
+    );
+}
+
+/// UPDATE color 三态：
+/// - `color: null` ⇒ 显式清空
+/// - `color: "..."` ⇒ 改值
+/// - 字段缺省 ⇒ 不改
+#[tokio::test]
+async fn update_process_color_tristate() {
+    let (_guard, pool) = setup().await;
+    let (app, token) = login_manager(pool, "proc_color_ts").await;
+
+    // 建 + 初始 color
+    let (_, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/processes",
+            Some(json!({
+                "code": "P-TS",
+                "name": "Tristate",
+                "category": "INHOUSE",
+                "color": "#11111111",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    let pid = env["data"]["id"].as_str().unwrap().to_string();
+
+    // 1. update color to new value
+    let (s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/processes/{pid}/update"),
+            Some(json!({ "color": "#AABBCCDD" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "set: {env1}");
+    assert_eq!(env1["data"]["color"], "#AABBCCDD");
+
+    // 2. clear (null)
+    let (s2, env2) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/processes/{pid}/update"),
+            Some(json!({ "color": null })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "clear: {env2}");
+    assert!(env2["data"]["color"].is_null(), "清空后应为 null: {env2}");
+
+    // 3. leave unchanged (字段缺省) —— 设回一个值后，只 update name，应保留原 color
+    let _ = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/processes/{pid}/update"),
+            Some(json!({ "color": "#FF00FF00" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    let (s3, env3) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/processes/{pid}/update"),
+            Some(json!({ "name": "Renamed" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK, "leave: {env3}");
+    assert_eq!(
+        env3["data"]["color"], "#FF00FF00",
+        "未传 color 字段应保留原值: {env3}"
+    );
+}

@@ -45,6 +45,7 @@ fn to_process_out(p: TProcess) -> ProcessOut {
         sort_order: p.sort_order,
         description: p.description,
         requires_approval: p.requires_approval,
+        color: p.color,
         version: p.version,
         created_at: p.created_at,
         updated_at: p.updated_at,
@@ -60,6 +61,30 @@ fn check_category(s: &str) -> Result<String, AppError> {
             code::BIZ_INVALID_VALUE,
             "category 必须是 INHOUSE 或 OUTSOURCE",
         )),
+    }
+}
+
+/// 校验 `color` 为 `#RRGGBBAA` 9 字符（前端 el-color-picker color-format="hex8" 输出）。
+///
+/// 空串 / None → 视作 None（未设色）；非空但格式不对 → 20104。
+fn normalize_color(s: Option<&str>) -> Result<Option<&str>, AppError> {
+    match s {
+        None => Ok(None),
+        Some(raw) => {
+            let t = raw.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else if t.len() == 9 && t.starts_with('#')
+                && t[1..].chars().all(|c| c.is_ascii_hexdigit())
+            {
+                Ok(Some(t))
+            } else {
+                Err(AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    "color 格式必须为 #RRGGBBAA（9 字符，含 # 前缀）",
+                ))
+            }
+        }
     }
 }
 
@@ -150,6 +175,7 @@ impl ProcessService {
         let category = check_category(&req.category)?;
         let sort_order = req.sort_order.unwrap_or(0);
         let description = req.description.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let color = normalize_color(req.color.as_deref())?;
 
         // INHOUSE 强制 requires_approval = false（无视请求值）；OUTSOURCE 保留（默认 true）。
         let requires_approval = if category == CATEGORY_INHOUSE {
@@ -168,6 +194,7 @@ impl ProcessService {
             sort_order,
             description,
             requires_approval,
+            color,
             user.id,
         )
         .await
@@ -239,6 +266,17 @@ impl ProcessService {
             }
         };
 
+        // color 三态同上 + format 校验
+        let new_color_owned: Option<String>;
+        let color_update: Option<Option<&str>> = match &req.color {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(s)) => {
+                new_color_owned = normalize_color(Some(s.as_str()))?.map(str::to_string);
+                Some(Some(new_color_owned.as_deref().unwrap()))
+            }
+        };
+
         // requires_approval：INHOUSE 禁止开启（Some(true) ⇒ 拒），允许显式确认 false；
         // 其他情况（含 OUTSOURCE）尊重请求值；None ⇒ 不改（避免与 INHOUSE 当前值无谓重写）。
         if current.category == CATEGORY_INHOUSE && req.requires_approval == Some(true) {
@@ -257,6 +295,7 @@ impl ProcessService {
             req.sort_order,
             desc_update,
             requires_approval_update,
+            color_update,
             user.id,
         )
         .await
