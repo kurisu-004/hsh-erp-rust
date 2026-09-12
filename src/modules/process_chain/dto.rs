@@ -20,6 +20,9 @@ pub struct ProcessChainStepOut {
     #[serde(serialize_with = "serialize_i64")]
     pub process_id: i64,
     pub estimated_minutes: i32,
+    /// 单步备注（车间操作员参考）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub version: i32,
 }
 
@@ -46,13 +49,15 @@ pub struct ProcessChainOut {
 ///
 /// `process_id` 以字符串形式入参（雪花 ID 防 JS 精度截断约定），service 层
 /// `parse::<i64>()`；`estimated_minutes` 必须 ≥ 0；`sort_order` 由前端维护
-///（稀疏 10/20/30，DB 部分唯一索引兜底重复）。
+///（稀疏 10/20/30，DB 部分唯一索引兜底重复）。`note` 可选；空串视作 None。
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpsertChainStep {
     pub sort_order: i32,
     #[serde(default)]
     pub process_id: String,
     pub estimated_minutes: i32,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// 整组 upsert 请求：替换语义（不存在的 part 自动建链；存在的整组覆盖）。

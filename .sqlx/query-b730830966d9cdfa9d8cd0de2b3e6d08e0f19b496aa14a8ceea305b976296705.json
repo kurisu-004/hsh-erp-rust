@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, chain_id, sort_order, process_id, estimated_minutes,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_process_chain_step\n            WHERE chain_id = $1 AND deleted_at IS NULL\n            ORDER BY sort_order ASC, id ASC\n            ",
+  "query": "\n            SELECT id, chain_id, sort_order, process_id, estimated_minutes, note,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_process_chain_step\n            WHERE chain_id = $1 AND deleted_at IS NULL\n            ORDER BY sort_order ASC, id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,17 @@
       },
       {
         "ordinal": 5,
+        "name": "note",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "version",
         "type_info": "Int4",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
@@ -136,6 +147,7 @@
       false,
       false,
       false,
+      true,
       false,
       false,
       false,
@@ -144,5 +156,5 @@
       true
     ]
   },
-  "hash": "91def80d5120ae7bfc4722d4c184b60d9e3e9882f469da852d30e70de2c75577"
+  "hash": "b730830966d9cdfa9d8cd0de2b3e6d08e0f19b496aa14a8ceea305b976296705"
 }

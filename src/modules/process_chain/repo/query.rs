@@ -38,7 +38,7 @@ impl ProcessChainRepo {
         sqlx::query_as!(
             TProcessChainStep,
             r#"
-            SELECT id, chain_id, sort_order, process_id, estimated_minutes,
+            SELECT id, chain_id, sort_order, process_id, estimated_minutes, note,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_process_chain_step
             WHERE chain_id = $1 AND deleted_at IS NULL

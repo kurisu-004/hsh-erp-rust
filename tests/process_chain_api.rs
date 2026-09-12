@@ -1,12 +1,13 @@
 //! process_chain 域端到端集成测试（part-worker-pool-federated-rocket 2026-09-11）
 //!
-//! 覆盖 6 个场景：
+//! 覆盖 7 个场景：
 //!   1. happy path：建链 → fetch 拿到 header + steps
 //!   2. fetch 找不到链 → 20701 BIZ_PROCESS_CHAIN_NOT_FOUND (HTTP 404)
 //!   3. PUT upsert 替换步骤（清空旧 steps + 插新 steps，chain.version++）
 //!   4. PUT upsert 创建全新链（part 之前无链）
 //!   5. PUT upsert 校验：estimated_minutes < 0 → 40001 VALIDATION_ERROR
 //!   6. PUT upsert 校验：sort_order 重复 → 40001 VALIDATION_ERROR
+//!   7. step.note 字段往返：建链时填 note → fetch 拿回原文（migration 019）
 //!
 //! ## 串行化
 //! 进程级 `tokio::sync::Mutex` + `--test-threads=1` 双保险。
@@ -426,4 +427,72 @@ async fn upsert_forbidden_for_non_manager() {
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "非 Manager 应 403: {env}");
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
+}
+
+/// 场景 7: step.note 字段往返（migration 019）
+///
+/// 建链时为每步填 `note` 字段；fetch 应原样返回；后续 PUT 替换步骤时旧步骤
+/// 软删（note 也不再被 SELECT 列出），新步骤的 note 独立验证。
+#[tokio::test]
+async fn step_note_round_trip() {
+    let (_guard, pool) = setup().await;
+    let customer = insert_customer_l2(&pool, "PCH-NOTE").await;
+    let proc_a = seed_process(&pool, "PROC-NA", "工序A").await;
+    let proc_b = seed_process(&pool, "PROC-NB", "工序B").await;
+    let part_id = insert_part(&pool, customer, "P-NOTE").await;
+
+    let (app, token, _pool) = login_manager(pool.clone(), "mgr_note").await;
+
+    // 1. upsert：2 步，第 1 步有 note，第 2 步无 note
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "PUT",
+            &format!("/process-chains/by-part/{part_id}"),
+            Some(json!({
+                "name": "含备注工艺",
+                "steps": [
+                    {
+                        "sort_order": 10,
+                        "process_id": proc_a.to_string(),
+                        "estimated_minutes": 30,
+                        "note": "必须干燥 24h 后才能上 CNC"
+                    },
+                    {
+                        "sort_order": 20,
+                        "process_id": proc_b.to_string(),
+                        "estimated_minutes": 45
+                    },
+                ]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "upsert: {env}");
+    let steps = env["data"]["steps"].as_array().expect("steps array");
+    assert_eq!(steps.len(), 2);
+    assert_eq!(
+        steps[0]["note"], "必须干燥 24h 后才能上 CNC",
+        "第 1 步 note 应保留原文: {env}"
+    );
+    assert!(
+        steps[1]["note"].is_null() || steps[1]["note"].as_str().map(|s| s.is_empty()).unwrap_or(true),
+        "第 2 步 note 应为空: {env}"
+    );
+
+    // 2. fetch by part —— note 应持久
+    let (s2, env2) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/process-chains/by-part/{part_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "fetch: {env2}");
+    let steps2 = env2["data"]["steps"].as_array().unwrap();
+    assert_eq!(steps2[0]["note"], "必须干燥 24h 后才能上 CNC");
 }

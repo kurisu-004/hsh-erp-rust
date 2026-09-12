@@ -116,7 +116,7 @@ impl ProcessChainRepo {
         }
         let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
             "INSERT INTO t_process_chain_step (\
-                id, chain_id, sort_order, process_id, estimated_minutes, \
+                id, chain_id, sort_order, process_id, estimated_minutes, note, \
                 version, created_by, updated_by) ",
         );
         qb.push_values(rows.iter(), |mut b, row| {
@@ -126,6 +126,7 @@ impl ProcessChainRepo {
                 .push_bind(row.sort_order)
                 .push_bind(row.process_id)
                 .push_bind(row.estimated_minutes)
+                .push_bind(row.note.as_deref())
                 .push_bind(0_i32)
                 .push_bind(created_by)
                 .push_bind(created_by);

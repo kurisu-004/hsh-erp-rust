@@ -76,6 +76,12 @@ impl ProcessChainService {
                     sort_order: s.sort_order,
                     process_id: pid,
                     estimated_minutes: s.estimated_minutes,
+                    note: s
+                        .note
+                        .as_deref()
+                        .map(|t| t.trim())
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string),
                 });
             }
             v
@@ -206,6 +212,7 @@ fn chain_to_out(
                 sort_order: s.sort_order,
                 process_id: s.process_id,
                 estimated_minutes: s.estimated_minutes,
+                note: s.note,
                 version: s.version,
             })
             .collect(),

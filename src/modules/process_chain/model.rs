@@ -45,6 +45,9 @@ pub struct TProcessChainStep {
     pub process_id: i64,
     #[allow(dead_code)]
     pub estimated_minutes: i32,
+    /// 单步备注（车间操作员参考，如"必须干燥 24h 后才能上 CNC"）。NULL = 无备注。
+    #[allow(dead_code)]
+    pub note: Option<String>,
     pub version: i32,
     #[allow(dead_code)]
     pub created_at: NaiveDateTime,
@@ -64,4 +67,6 @@ pub struct NewProcessChainStep {
     pub sort_order: i32,
     pub process_id: i64,
     pub estimated_minutes: i32,
+    /// 单步备注；空串视作 None（service 层 trim）。
+    pub note: Option<String>,
 }
