@@ -83,6 +83,7 @@ Request：
 | `sort_order` | i32? | — | 默认 0 |
 | `description` | string? | — | trim 后空串视为 NULL |
 | `requires_approval` | bool? | — | OUTSOURCE：缺省 = true；INHOUSE：**忽略请求值**，强制 false |
+| `color` | string? | — | 格式 `#RRGGBBAA`（9 字符，含 `#` 前缀）；空串/null ⇒ NULL；格式错 → 20104。前端 `el-color-picker color-format="hex8"` 默认输出 |
 
 Response 201 `data`：`ProcessOut`
 
@@ -121,6 +122,7 @@ Request（部分更新；与 Python `exclude_unset` 语义一致）：
 | `sort_order` | i32? | — | None = 不改；Some(v) = 改 |
 | `description` | string? \| null? | — | 字段缺省 = 不改；`Some(null)` = 显式清空；`Some(value)` = 改值（trim 后写） |
 | `requires_approval` | bool? | — | INHOUSE 强制 false（无视 Some 内的任何值）；OUTSOURCE 保留请求值；None = 不改 |
+| `color` | string? \| null? | — | 三态同 `description`：字段缺省 = 不改；`Some(null)` = 显式清空；`Some(value)` = 改值（须匹配 `#RRGGBBAA`，否则 20104） |
 
 Response 200 `data`：`ProcessOut`（回读最新版本）
 
@@ -165,6 +167,7 @@ Response 200 `data`：`null`
 | `sort_order` | i32 | 显示顺序 |
 | `description` | string? | |
 | `requires_approval` | bool | INHOUSE 永远 false；OUTSOURCE 由请求决定 |
+| `color` | string? | 前端工序卡片颜色（`#RRGGBBAA`，9 字符含 alpha）；`Option::is_none` ⇒ 序列化时省略 |
 | `version` | i32 | 乐观锁；每次写操作 +1 |
 | `created_at` | naive datetime | Asia/Shanghai |
 | `updated_at` | naive datetime | Asia/Shanghai |
