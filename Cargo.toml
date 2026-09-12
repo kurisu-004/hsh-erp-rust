@@ -10,7 +10,6 @@ path = "src/lib.rs"
 # ---------------------------------------------------------------------------------
 # 后续业务实现阶段会按需追加（文档见 docs/architecture.md）：
 #   rust_decimal / bigdecimal    —— 金额、数量（Numeric 列）
-#   reqwest + HMAC-SHA1 签名      —— 腾讯云 COS XML API
 #   umya-spreadsheet 或 calamine —— 送货单 Excel 模板填充
 #   printpdf / lopdf              —— PDF 拆分与渲染
 #   barcoders                     —— Code128 条码
@@ -79,6 +78,16 @@ dashmap = "6"                                                     # ws 连接注
 # 任务说明强制指定 umya-spreadsheet = "2"；最新 3.x 已移除 get_* 弃用方法，
 # 需重写代码。这里先用 "2" 走通后续 P4 实施；后续可统一升级 + 评估。
 umya-spreadsheet = "2"
+
+# 腾讯云 COS 客户端
+# 2026-09-11 新增：社区 SDK cos-rust-sdk（仿 cos-python-sdk-v5 风格）覆盖
+# put/get/delete/head 等高频方法；SDK 内部透传 reqwest（HTTP + 重试 + TLS）。
+cos-rust-sdk = "0.1"
+# presigned URL SDK 未提供，手写 V1 签名所需的轻量算法 crate
+hmac = "0.12"
+sha1 = "0.10"
+hex = "0.4"
+base64 = "0.22"
 
 # P4 print_xml_patch 用 zip crate 直接读写 xlsx 内部 entry（绕过 umya 的
 # _xlnm.Print_Aria 重复 + pageSetUpPr + shrinkToFit 缺口）。这是 umya-spreadsheet

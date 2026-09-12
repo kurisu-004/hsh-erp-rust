@@ -51,6 +51,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/update", post(handler::update_part))
         .route("/{part_id}/soft-delete", post(handler::soft_delete_part))
         .route("/{part_id}/upload-drawing", post(handler::upload_drawing))
+        .route("/{part_id}/upload-3d-model", post(handler::upload_3d_model)) // 2026-09-11 新增：3D 模型上传
         .route("/{part_id}/deliver", post(handler::deliver))
         .route("/{part_id}/cancel", post(handler::cancel))
         .route("/{part_id}/complete", post(handler::complete))

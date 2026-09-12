@@ -4,7 +4,7 @@
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 > 共享 DTO（PartOut / PartListItem / PartListOut / PartDetailOut / 端点约束）见 [`./index.md`](./index.md)
 >
-> 范围：本文件覆盖 8 个 CRUD 端点（list / get / by-serial / create / batch / update / soft-delete / upload-drawing）。lifecycle / inspection 见 [`./lifecycle.md`](./lifecycle.md) / [`./inspection.md`](./inspection.md)。
+> 范围：本文件覆盖 9 个 CRUD 端点（list / get / by-serial / create / batch / update / soft-delete / upload-drawing / upload-3d-model）。lifecycle / inspection 见 [`./lifecycle.md`](./lifecycle.md) / [`./inspection.md`](./inspection.md)。
 
 ## 本文件目录
 
@@ -17,6 +17,7 @@
 - [POST /api/v2/parts/{part_id}/update](#post-apiv2partspart_idupdate)
 - [POST /api/v2/parts/{part_id}/soft-delete](#post-apiv2partspart_idsoft-delete)
 - [POST /api/v2/parts/{part_id}/upload-drawing](#post-apiv2partspart_idupload-drawing)
+- [POST /api/v2/parts/{part_id}/upload-3d-model](#post-apiv2partspart_idupload-3d-model)（2026-09-11 新增）
 
 ---
 
@@ -163,6 +164,45 @@ Multipart 严格校验：
 Response 200 `data`：最新 `TPartFile` 行（含 `content_type` / `file_size` / `content_sha256`）。
 
 错误码：40001（multipart 字段错）、40300（角色不符）、21102（MIME 错）、21103（size 错）、21104（COS 失败）、21105（part 不存在）、21108（同 part+kind+sha256 撞唯一索引）。
+
+**CAS key 格式（2026-09-11 变更）**：
+
+`object_key` 字段遵循 Python `core/file_hash.py:41-78` 同款模板：
+
+```
+{COS_UPLOAD_PREFIX}part/{part_id}/{KIND}/{sha16}_{safe_filename}
+```
+
+示例：`uploads/part/12345/DRAWING/abc123def4567890_drawing.pdf`
+
+跨语言可读：同一 part + sha256 + filename 在两个后端派生出同一 key。
+
+### `POST /api/v2/parts/{part_id}/upload-3d-model`
+
+权限: **Manager / Clerk**（同 `upload-drawing`）
+
+Multipart 严格校验：
+
+- 必须恰好含一个 `file` 字段；缺字段 / 多 `file` / 未知字段名一律 40001
+- 扩展名必须在 `3D_MODEL` 白名单内（`step` / `stp` / `iges` / `igs` / `stl` / `obj` / `3mf`），否则 21102
+- `file.content_type` 必须与扩展名匹配（白名单见下表）；不匹配 → 21102
+- `file` ≤ 50 MB → 21103
+
+`file_type` 字段由 service 层按扩展名推导（`policy::file_type_for_ext`）：
+
+| 扩展名 | `file_type` | 允许的 `content_type` |
+|---|---|---|
+| `step` / `stp` | `STEP` | `application/step` / `application/stp` / `application/octet-stream` |
+| `iges` / `igs` | `IGES` | `application/iges` / `application/igs` / `application/octet-stream` |
+| `stl` | `STL` | `model/stl` / `application/sla` / `application/octet-stream` |
+| `obj` | `OBJ` | `model/obj` / `application/octet-stream` |
+| `3mf` | `3MF` | `application/vnd.ms-3mfdocument` / `model/3mf` / `application/octet-stream` |
+
+Response 200 `data`：最新 `TPartFile` 行（`kind` = `3D_MODEL`，`file_type` 如上表）。
+
+错误码：40001（multipart 字段错 / 缺扩展名）、40300（角色不符）、21102（扩展名不在白名单 / content_type 与扩展名不一致）、21103（size 错）、21104（COS 失败）、21105（part 不存在）、21108（同 part+kind+sha256 撞唯一索引）。
+
+**CAS key 示例**：`uploads/part/12345/3D_MODEL/abc123def4567890_bracket.step`
 
 ---
 

@@ -598,6 +598,73 @@ pub async fn upload_drawing(
     Ok(Json(R::ok(pf)))
 }
 
+/// POST /api/v2/parts/{part_id}/upload-3d-model
+///
+/// 上传 part 3D 模型（STEP/STP/IGES/IGS/STL/OBJ/3MF），对齐 Python 后端
+/// `POST /api/v1/parts/{part_id}/3d-models`（2026-09-11 新增）。
+///
+/// Multipart 字段：
+/// - `file`：3D 模型字节（≤ 50 MB）；扩展名 + content_type 由 service 层
+///   `policy::allowed_exts("3D_MODEL")` / `expected_content_types_for_ext` 校验
+///
+/// 权限：`Manager` / `Clerk`（同 upload-drawing）
+///
+/// 错误码：
+/// - 21102 `BIZ_PART_FILE_BAD_TYPE` — 扩展名不在白名单 / content_type 与扩展名不一致
+/// - 21103 `BIZ_PART_FILE_TOO_LARGE` — 空字节 / > 50 MB
+/// - 21104 `BIZ_PART_FILE_UPLOAD_FAILED` — COS SDK 抛错
+/// - 21105 `BIZ_PART_FILE_OWNER_NOT_FOUND` — part 不存在
+/// - 21108 `BIZ_PART_FILE_DUPLICATE` — 同 part + kind + sha256 撞唯一索引
+pub async fn upload_3d_model(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    mut multipart: Multipart,
+) -> Result<Json<R<TPartFile>>, AppError> {
+    // 权限守卫先于 multipart 解析（同 upload_drawing）
+    current.require_any_role(CRUD_PART_ROLES)?;
+    let mut bytes: Option<(Vec<u8>, String, Option<String>)> = None;
+    let mut file_seen = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            if file_seen {
+                return Err(AppError::validation(
+                    "multipart 包含多个 'file' 字段（仅允许 1 个）",
+                ));
+            }
+            file_seen = true;
+            let fname = field.file_name().unwrap_or("model.step").to_string();
+            let ct = field.content_type().map(|m| m.to_string());
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::validation(format!("file 读取失败: {e}")))?
+                .to_vec();
+            bytes = Some((data, fname, ct));
+        } else {
+            return Err(AppError::validation(format!(
+                "multipart 未知字段: '{name}'（仅接受 'file'）"
+            )));
+        }
+    }
+    let (data, fname, ct) = bytes
+        .ok_or_else(|| AppError::validation("multipart 缺少 'file' 字段"))?;
+    let ct = ct
+        .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "file 缺少 content_type"))?;
+    let mut tx = state.pool.begin().await?;
+    let pf = PartService::upload_3d_model(
+        &mut tx, &state.snowflake, &state, part_id, &data, &fname, &ct, &current,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(pf)))
+}
+
 /// POST /api/v2/parts/{part_id}/deliver
 ///
 /// READY_TO_SHIP → DELIVERED；commit 后广播 `PART_DELIVERED`。

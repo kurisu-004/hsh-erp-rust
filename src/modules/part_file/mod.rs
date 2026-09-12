@@ -9,6 +9,7 @@
 pub mod dto;
 pub mod handler;
 pub mod model;
+pub mod policy; // 2026-09-11 新增：part_file kind → 扩展名 / file_type / content_type 映射
 pub mod repo;
 pub mod service;
 
