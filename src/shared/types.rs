@@ -87,3 +87,23 @@ pub fn deserialize_i64_vec_opt<'de, D: Deserializer<'de>>(
             .map(Some),
     }
 }
+
+/// `Option<Option<T>>` 三态反序列化辅助：
+///
+/// 默认 serde 行为下，JSON `null` 和"字段缺省"都被反序列化为外层 `None`，
+/// 无法区分"未提供" vs "显式置空"。本 helper 强制任何 JSON 值（包括 `null`）
+/// 都至少走外层 `Some(_)`，让 `None ⇒ 缺省不改`、`Some(None) ⇒ 显式清空`、
+/// `Some(Some(v)) ⇒ 改值` 三态可区分。
+///
+/// 用法：
+/// ```ignore
+/// #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+/// pub color: Option<Option<String>>,
+/// ```
+pub fn deserialize_some<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
+}

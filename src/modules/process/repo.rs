@@ -31,7 +31,7 @@ impl ProcessRepo {
             r#"
             SELECT id, code, name, category, sort_order, description, version,
                    created_at, created_by, updated_at, updated_by, deleted_at,
-                   requires_approval
+                   requires_approval, color
             FROM t_process
             WHERE id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -53,7 +53,7 @@ impl ProcessRepo {
             r#"
             SELECT id, code, name, category, sort_order, description, version,
                    created_at, created_by, updated_at, updated_by, deleted_at,
-                   requires_approval
+                   requires_approval, color
             FROM t_process
             WHERE code = $1 AND deleted_at IS NULL
             "#,
@@ -79,7 +79,7 @@ impl ProcessRepo {
             r#"
             SELECT id, code, name, category, sort_order, description, version,
                    created_at, created_by, updated_at, updated_by, deleted_at,
-                   requires_approval
+                   requires_approval, color
             FROM t_process
             WHERE id = ANY($1)
               AND deleted_at IS NULL
@@ -104,7 +104,7 @@ impl ProcessRepo {
         let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
             "SELECT id, code, name, category, sort_order, description, version, \
              created_at, created_by, updated_at, updated_by, deleted_at, \
-             requires_approval \
+             requires_approval, color \
              FROM t_process WHERE deleted_at IS NULL",
         );
         if let Some(cat) = category {
@@ -166,17 +166,18 @@ impl ProcessRepo {
         sort_order: i32,
         description: Option<&str>,
         requires_approval: bool,
+        color: Option<&str>,
         created_by: i64,
     ) -> Result<TProcess, sqlx::Error> {
         sqlx::query_as!(
             TProcess,
             r#"
             INSERT INTO t_process (id, code, name, category, sort_order, description,
-                                   requires_approval, created_by, updated_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+                                   requires_approval, color, created_by, updated_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
             RETURNING id, code, name, category, sort_order, description, version,
                       created_at, created_by, updated_at, updated_by, deleted_at,
-                      requires_approval
+                      requires_approval, color
             "#,
             snowflake_id,
             code,
@@ -185,6 +186,7 @@ impl ProcessRepo {
             sort_order,
             description,
             requires_approval,
+            color,
             created_by,
         )
         .fetch_one(executor)
@@ -194,8 +196,8 @@ impl ProcessRepo {
     /// 部分更新（OCC）：带乐观锁。`code` 不允许改（业务唯一键，由 service 层 enforce）。
     ///
     /// 三态编码：
-    /// - `name` / `sort_order` / `description` / `requires_approval`：None ⇒ 不改
-    /// - `description` 三态编码 `Option<Option<&str>>`：
+    /// - `name` / `sort_order` / `description` / `color` / `requires_approval`：None ⇒ 不改
+    /// - `description` / `color` 三态编码 `Option<Option<&str>>`：
     ///   - `None` ⇒ 字段缺省，不修改
     ///   - `Some(None)` ⇒ 显式清空（SET NULL）
     ///   - `Some(Some(v))` ⇒ 改值
@@ -208,10 +210,13 @@ impl ProcessRepo {
         sort_order: Option<i32>,
         description: Option<Option<&str>>,
         requires_approval: Option<bool>,
+        color: Option<Option<&str>>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error> {
         let set_description = description.is_some();
         let new_description = description.flatten();
+        let set_color = color.is_some();
+        let new_color = color.flatten();
         sqlx::query!(
             r#"
             UPDATE t_process
@@ -219,9 +224,10 @@ impl ProcessRepo {
                 sort_order      = COALESCE($4::integer, sort_order),
                 description     = CASE WHEN $5::bool THEN $6::varchar ELSE description END,
                 requires_approval = COALESCE($7::boolean, requires_approval),
+                color           = CASE WHEN $8::bool THEN $9::varchar ELSE color END,
                 version         = version + 1,
                 updated_at      = now(),
-                updated_by      = $8
+                updated_by      = $10
             WHERE id = $1 AND version = $2 AND deleted_at IS NULL
             "#,
             id,
@@ -231,6 +237,8 @@ impl ProcessRepo {
             set_description,
             new_description,
             requires_approval,
+            set_color,
+            new_color,
             updated_by,
         )
         .execute(executor)

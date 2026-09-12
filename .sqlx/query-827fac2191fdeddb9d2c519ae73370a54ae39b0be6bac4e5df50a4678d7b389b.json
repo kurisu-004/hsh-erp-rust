@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_process\n            SET name            = COALESCE($3::varchar, name),\n                sort_order      = COALESCE($4::integer, sort_order),\n                description     = CASE WHEN $5::bool THEN $6::varchar ELSE description END,\n                requires_approval = COALESCE($7::boolean, requires_approval),\n                color           = CASE WHEN $8::bool THEN $9::varchar ELSE color END,\n                version         = version + 1,\n                updated_at      = now(),\n                updated_by      = $10\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Int4",
+        "Bool",
+        "Varchar",
+        "Bool",
+        "Bool",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "827fac2191fdeddb9d2c519ae73370a54ae39b0be6bac4e5df50a4678d7b389b"
+}

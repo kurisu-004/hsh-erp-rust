@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, code, name, category, sort_order, description, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   requires_approval\n            FROM t_process\n            WHERE id = ANY($1)\n              AND deleted_at IS NULL\n            ORDER BY id ASC\n            ",
+  "query": "\n            SELECT id, code, name, category, sort_order, description, version,\n                   created_at, created_by, updated_at, updated_by, deleted_at,\n                   requires_approval, color\n            FROM t_process\n            WHERE code = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -145,11 +145,22 @@
             "name": "requires_approval"
           }
         }
+      },
+      {
+        "ordinal": 13,
+        "name": "color",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "color"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8Array"
+        "Text"
       ]
     },
     "nullable": [
@@ -165,8 +176,9 @@
       false,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "6dfb0f9f286ba14ac5c5c732734e0f4f5b1c3ce25ecb0c1854dd414af4e86e48"
+  "hash": "8d72cc56bf41dd4e2beffcf5e53712abd59387172429d03cd9665140586eb0cc"
 }

@@ -15,7 +15,7 @@
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
-use crate::shared::types::serialize_i64;
+use crate::shared::types::{deserialize_some, serialize_i64};
 
 // ---------------------------------------------------------------------------
 // 出参
@@ -30,8 +30,12 @@ pub struct ProcessOut {
     pub name: String,
     pub category: String,
     pub sort_order: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub requires_approval: bool,
+    /// 前端工序卡片颜色（`#RRGGBBAA`，9 字符含 alpha）。NULL = 未设置。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     pub version: i32,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
@@ -55,6 +59,7 @@ pub struct ProcessListOut {
 /// - `code` 业务唯一键（uk_t_process_code，活跃行唯一）；缺省/空 → 20104
 /// - `category` ∈ {INHOUSE, OUTSOURCE}；其他值 → 20104
 /// - `requires_approval`：OUTSOURCE 保留请求值（默认 true）；INHOUSE service 层强制 false
+/// - `color`：`#RRGGBBAA` 9 字符；空串/null ⇒ NULL（不设色）；非空但格式不对 ⇒ 20104
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProcessCreateRequest {
     pub code: String,
@@ -66,6 +71,8 @@ pub struct ProcessCreateRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub requires_approval: Option<bool>,
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 /// 部分更新：未提供的字段保持原值（与 Python `exclude_unset` 语义对齐）。
@@ -73,6 +80,7 @@ pub struct ProcessCreateRequest {
 /// - `code` 字段若传一律 20104（业务唯一键不可变）
 /// - `category` 同上：传了即拒
 /// - `description` 三态：`None` ⇒ 缺省不改；`Some(null)` ⇒ 显式清空；`Some(v)` ⇒ 改值
+/// - `color` 三态同上（service 层加 hex 格式校验）
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProcessUpdateRequest {
     /// 仅用作「拒绝」哨兵：客户端若传 `code` 字段一律 20104 BIZ_INVALID_VALUE
@@ -89,6 +97,10 @@ pub struct ProcessUpdateRequest {
     pub description: Option<Option<String>>,
     #[serde(default)]
     pub requires_approval: Option<bool>,
+    /// 三态：`None` ⇒ 缺省不改；`Some(null)` ⇒ 显式清空；`Some("...")` ⇒ 改值
+    /// （service 层做 `#RRGGBBAA` 格式校验）
+    #[serde(default, deserialize_with = "deserialize_some")]
+    pub color: Option<Option<String>>,
 }
 
 /// 列表查询参数：`code_like` / `category` 过滤 + 分页。

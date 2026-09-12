@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part_process_chain\n            SET version = version + 1,\n                name     = COALESCE($3::varchar, name),\n                note     = CASE WHEN $4::bool THEN $5::text ELSE note END,\n                updated_at = now(),\n                updated_by = $6\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Bool",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1af24c3399e748f5eced41cefe001471008a1b460cac7b9ec8fe608bdf8caf65"
+}

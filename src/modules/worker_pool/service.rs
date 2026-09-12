@@ -17,17 +17,21 @@
 
 use sqlx::PgConnection;
 
-use crate::auth::rbac::CurrentUser;
+use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;
 use crate::modules::part_batch::repo::PartBatchRepo;
+use crate::modules::process::repo::ProcessRepo;
 use crate::modules::work_type::repo::WorkTypeRepo;
 use crate::modules::worker::repo::WorkerRepo;
 use crate::shared::error::{code, AppError};
 
-use super::dto::{AdminRemoveRequest, PoolBatchItem, ProcessPoolDetail, WorkerBrief, WorkTypeMaxHeld};
+use super::dto::{
+    AdminRemoveRequest, AutoAllocateMode, AutoAllocateRequest, AutoAllocateResult, PoolBatchItem,
+    ProcessPoolDetail, WorkerBrief, WorkerFillItem, WorkTypeMaxHeld,
+};
 use super::model::{ProcessPoolCount, RefillResult, TakenItem, WorkerPoolState};
 use super::repo::WorkerPoolRepo;
 
@@ -399,6 +403,209 @@ impl WorkerPoolService {
             work_types,
             total,
             items,
+        })
+    }
+
+    /// `POST /api/v2/admin/worker-pool/auto-allocate` 业务逻辑。
+    ///
+    /// 按 `process_id + shelf_id` 范围，对每个匹配 worker 计算 target 并循环 refill：
+    /// 1. 角色守卫：`Manager`（service 内 require_role）
+    /// 2. 校验 `fill_ratio ∈ [0.0, 1.0]` → 20704
+    /// 3. 校验 `process_id` 存在 → 20801
+    /// 4. 取 process 映射的 work_types（`WorkTypeRepo::list_work_types_by_process_id`）
+    ///    —— 同一 process 可能被多个 work_type 映射，每个 work_type 持有独立阈值
+    /// 5. 取 `shelf_id` 货架上的 active worker 列表（复用现有 `WorkerRepo::list_active_by_process_id`）
+    /// 6. 对每个 worker：
+    ///    - 找到其所属 work_type 的 max 阈值（COUNT: `max_held_batches`；TIME: `max_held_minutes`）
+    ///    - target = `(max × fill_ratio).ceil() as i32`
+    ///    - 循环 `WorkerPoolRepo::take_one_from_pool` 直到 target 满 / 池空
+    ///    - 每抢到一批写 `TAKEN_FROM_POOL` 事件 + `PartService::sync_from_batch_change`
+    /// 7. 累计所有 worker 的 filled，组装 `AutoAllocateResult` 返回
+    ///
+    /// 错误码：
+    /// - 20801 BIZ_PROCESS_NOT_FOUND
+    /// - 20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET（COUNT 模式但 work_type.max_held_batches IS NULL）
+    /// - 20703 BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET（TIME 模式但 work_type.max_held_minutes IS NULL）
+    /// - 20704 BIZ_AUTO_ALLOCATE_INVALID_RATIO
+    /// - 20905 BIZ_WORK_TYPE_NO_PROCESS_MAPPING（process 无 work_type）
+    /// - 20201 BIZ_WORKER_NOT_FOUND / 20206 BIZ_WORKER_NO_WORK_TYPE（防御性）
+    /// - 40300 FORBIDDEN
+    pub async fn auto_allocate_for_process(
+        conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
+        req: AutoAllocateRequest,
+        current: &CurrentUser,
+    ) -> Result<AutoAllocateResult, AppError> {
+        current.require_role(Role::Manager)?;
+
+        // 1. 校验 fill_ratio
+        if !(0.0..=1.0).contains(&req.fill_ratio) {
+            return Err(AppError::biz(
+                code::BIZ_AUTO_ALLOCATE_INVALID_RATIO,
+                format!("fill_ratio 必须在 [0.0, 1.0]，当前 {}", req.fill_ratio),
+            ));
+        }
+
+        // 2. process 存在性
+        let _process = ProcessRepo::get_by_id(&mut *conn, req.process_id, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PROCESS_NOT_FOUND,
+                    format!("process {} 不存在", req.process_id),
+                )
+            })?;
+
+        // 3. process 映射的 work_types
+        let work_types =
+            WorkTypeRepo::list_work_types_by_process_id(&mut *conn, req.process_id).await?;
+        if work_types.is_empty() {
+            return Err(AppError::biz(
+                code::BIZ_WORK_TYPE_NO_PROCESS_MAPPING,
+                format!("process {} 未映射工种", req.process_id),
+            ));
+        }
+        // work_type_id → (max_held_batches, max_held_minutes)
+        let mut wt_max: std::collections::HashMap<i64, (Option<i32>, Option<i32>)> =
+            std::collections::HashMap::new();
+        for (wt_id, _code, _name, max_held_batches) in work_types {
+            // 二次查 max_held_minutes（list_work_types_by_process_id 未取该列）
+            let row: Option<(Option<i32>,)> =
+                sqlx::query_as("SELECT max_held_minutes FROM t_work_type WHERE id = $1")
+                    .bind(wt_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(AppError::from)?;
+            wt_max.insert(wt_id, (max_held_batches, row.and_then(|(v,)| v)));
+        }
+
+        // 4. 货架上的 active worker 列表（含 work_type_id）
+        let worker_rows =
+            WorkerRepo::list_active_by_process_id(&mut *conn, req.process_id).await?;
+
+        let mut filled = Vec::with_capacity(worker_rows.len());
+        let mut pool_empty_any = false;
+
+        for (worker_id, _worker_name, work_type_id, _wt_code) in worker_rows {
+            // list_active_by_process_id 已用 JOIN 过滤 `worker.work_type_id IS NOT NULL`
+            // （详见 WorkerRepo::list_active_by_process_id 的 SQL），故 work_type_id
+            // 必非 0 / 必非 NULL；防御性保留，但语义上一定有值。
+            if work_type_id == 0 {
+                filled.push(WorkerFillItem {
+                    worker_id,
+                    target: 0,
+                    filled_count: 0,
+                    skipped_reason: Some("worker 无 work_type".to_string()),
+                });
+                continue;
+            }
+            let (max_batches, max_minutes) = match wt_max.get(&work_type_id) {
+                Some(v) => *v,
+                None => {
+                    // 该 worker 所属 work_type 未映射本 process（理论上 list_active 已过滤）
+                    continue;
+                }
+            };
+
+            // 取该 worker 当前 badge_code（事件日志需要）
+            let worker = match WorkerRepo::get_by_id(&mut *conn, worker_id, false).await? {
+                Some(w) => w,
+                None => continue,
+            };
+            if !worker.is_active {
+                continue;
+            }
+
+            // 计算 target
+            let target: i32 = match req.mode {
+                AutoAllocateMode::Count => {
+                    let max = max_batches.ok_or_else(|| {
+                        AppError::biz(
+                            code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
+                            format!(
+                                "work_type {} max_held_batches 未设置（COUNT 模式）",
+                                work_type_id
+                            ),
+                        )
+                    })?;
+                    ((max as f64) * req.fill_ratio).ceil() as i32
+                }
+                AutoAllocateMode::Time => {
+                    let max = max_minutes.ok_or_else(|| {
+                        AppError::biz(
+                            code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET,
+                            format!(
+                                "work_type {} max_held_minutes 未设置（TIME 模式）",
+                                work_type_id
+                            ),
+                        )
+                    })?;
+                    ((max as f64) * req.fill_ratio).ceil() as i32
+                }
+            };
+
+            // 取该 work_type 映射的所有 process_ids（take_one_from_pool 限定）
+            let process_ids =
+                WorkTypeRepo::list_process_ids(&mut *conn, work_type_id).await?;
+            if process_ids.is_empty() {
+                continue;
+            }
+
+            // 循环 take_one_from_pool 直到 target / 池空
+            let mut filled_count = 0i32;
+            for _ in 0..target {
+                match WorkerPoolRepo::take_one_from_pool(
+                    &mut *conn,
+                    worker_id,
+                    req.shelf_id,
+                    &process_ids,
+                    current.id,
+                )
+                .await?
+                {
+                    Some(t) => {
+                        PartRepo::insert_part_event(
+                            &mut *conn,
+                            NewPartEvent {
+                                id: snowflake.next_id(),
+                                part_id: t.part_id,
+                                event_type: "TAKEN_FROM_POOL",
+                                from_status: Some("IN_PROCESS"),
+                                to_status: Some("IN_PROCESS"),
+                                batch_id: Some(t.batch_id),
+                                quantity: Some(t.quantity),
+                                drawing_code: Some(&t.drawing_no),
+                                badge_code: Some(&worker.badge_code),
+                                note: Some("auto_allocate"),
+                                created_by: Some(current.id),
+                            },
+                        )
+                        .await?;
+                        PartService::sync_from_batch_change(&mut *conn, t.part_id, current).await?;
+                        filled_count += 1;
+                    }
+                    None => {
+                        pool_empty_any = true;
+                        break;
+                    }
+                }
+            }
+
+            filled.push(WorkerFillItem {
+                worker_id,
+                target,
+                filled_count,
+                skipped_reason: None,
+            });
+        }
+
+        Ok(AutoAllocateResult {
+            process_id: req.process_id,
+            shelf_id: req.shelf_id,
+            mode: req.mode,
+            fill_ratio: req.fill_ratio,
+            filled,
+            pool_empty: pool_empty_any,
         })
     }
 }
