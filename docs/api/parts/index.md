@@ -103,5 +103,5 @@ part / lifecycle 错误码（20101 / 20103 / 20104 / 20109 / 20111 / 20115 / 201
 - 仓库分层：`src/modules/part/handler.rs` (axum) → `service/{crud,inspection,lifecycle}.rs` (业务) → `repo/{part,batch,event}.rs` (SQL)
 - 状态机：`src/modules/part/statemachine.rs`
 - 错误码：`src/shared/error.rs::code`
-- worker-scan 联动：详见 [`../worker-pool.md`](../worker-pool.md)
+- worker-scan 联动：详见 [`../production/worker-pool.md`](../production/worker-pool.md)
 - Python myERP 参考：`/Users/ren/Code/myERP/api/v1/part.py`（46 个端点；本目录 18 个端点之外的 32 个 Python 独有端点（其中 Rust 18 中有 4 个 Rust-only 端点）见 [`../inconsistencies.md`](../inconsistencies.md)）

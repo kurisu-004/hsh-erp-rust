@@ -7,14 +7,11 @@
 > - [`./users.md`](./users.md) — users 域
 > - [`./applicants.md`](./applicants.md) — applicant 域（申请人 CRUD，2026-08-26）
 > - [`./customers.md`](./customers.md) — customers 域（L1/L2 CRUD，2026-08-26）
-> - [`./processes.md`](./processes.md) — processes 域（INHOUSE/OUTSOURCE CRUD，2026-08-26）
 > - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker + mapping，2026-08-26）
 > - [`./workers.md`](./workers.md) — workers 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26）
-> - [`./work-types.md`](./work-types.md) — work_types 域（CRUD + process mapping + 三态更新，2026-08-26）
+> - [`./production/index.md`](./production/index.md) — **生产管理** 域（工种/工序/工序映射/工艺链/工人候选池；按前端 `production_group` 菜单整合为子目录，2026-09-12）
 > - [`./parts/index.md`](./parts/index.md) — part 域（to-inspection / to-ship 批量+单件 / to-process / **worker-scan**）
 > - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（装配体 CRUD + multipart PDF + 子件自动生成，2026-08-27）
-> - [`./worker-pool.md`](./worker-pool.md) — worker_pool 域（**state / admin refill / admin remove / auto-allocate**）
-> - [`./process-chain.md`](./process-chain.md) — process_chain 域（part 1:1 绑定的多步工艺链；2026-09-11）
 > - [`./delivery-notes/index.md`](./delivery-notes/index.md) — delivery_notes 域（已拆为子目录：[queries](./delivery-notes/queries.md) / [drafts](./delivery-notes/drafts.md) / [workflow](./delivery-notes/workflow.md) / [print](./delivery-notes/print.md)）
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
 > - [`./websocket.md`](./websocket.md) — WebSocket（含 **WORKER_SCAN_* / WORKER_POOL_***）
@@ -155,14 +152,11 @@ HTTP 状态码：
 | users | [`./users.md`](./users.md) | 9 | ✅ 完全上线 |
 | applicants | [`./applicants.md`](./applicants.md) | 5 | ✅ 完全上线（CRUD + L1 customer 校验 + OCC，2026-08-26） |
 | customers | [`./customers.md`](./customers.md) | 5 | ✅ 完全上线（CRUD + L1/L2 + OCC，2026-08-26） |
-| processes | [`./processes.md`](./processes.md) | 5 | ✅ 完全上线（CRUD + INHOUSE no-approval + 引用校验，2026-08-26） |
 | shelves | [`./shelves.md`](./shelves.md) | 11 | ✅ 完全上线（CRUD + picker + mapping，2026-08-26） |
 | workers | [`./workers.md`](./workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26） |
-| work-types | [`./work-types.md`](./work-types.md) | 7 | ✅ 完全上线（CRUD + process mapping + 三态更新 + 引用校验，2026-08-26） |
+| **生产管理** | [`./production/index.md`](./production/index.md) | **19** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池；按前端 `production_group` 菜单整合为子目录，2026-09-12） |
 | part | [`./parts/index.md`](./parts/index.md) | 6 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回、worker-scan（2026-08-25） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | 6 | 🟢 CRUD + multipart PDF + 子件自动生成 + L1→L2 展开（2026-08-27） |
-| worker_pool | [`./worker-pool.md`](./worker-pool.md) | 4 | 🟢 state + admin refill/remove/auto-allocate + worker-scan 联动（2026-09-11） |
-| process_chain | [`./process-chain.md`](./process-chain.md) | 2 | 🟢 part 1:1 工艺链 CRUD：GET/PUT by-part（2026-09-11） |
 | delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub（worker-pool WS 事件已注册，待 hub 真实握手） |

@@ -340,7 +340,7 @@ Response 200 `data`：`WorkerScanOut`
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `scan` | `WorkerScanCoreOut` | 扫码事件最小投影 |
-| `refill` | [`RefillResult`](../worker-pool.md#refillresult-字段) | 同事务 refill 结果 |
+| `refill` | [`RefillResult`](../production/worker-pool.md#refillresult-字段) | 同事务 refill 结果 |
 
 错误码：
 
@@ -370,7 +370,7 @@ WS 广播（commit 后下发）：
 - 若 `refill.taken.len() > 0` → `WORKER_POOL_REFILL_DONE` —— payload = `RefillResult`
 - 若 `refill.pool_empty=true` 且 `taken` 为空 → `WORKER_POOL_EMPTY` —— payload `{ worker_id, shelf_id }`
 
-详见 [`../websocket.md`](../websocket.md) 与 [`../worker-pool.md`](../worker-pool.md)。
+详见 [`../websocket.md`](../websocket.md) 与 [`../production/worker-pool.md`](../production/worker-pool.md)。
 
 ---
 
@@ -806,7 +806,7 @@ pub struct WorkerScanCoreOut {
 }
 
 // WorkerScanOut = { scan: WorkerScanCoreOut, refill: RefillResult }
-// （RefillResult 定义在 worker_pool/model.rs，详见 ./worker-pool.md）
+// （RefillResult 定义在 worker_pool/model.rs，详见 ../production/worker-pool.md）
 ```
 
 ---
