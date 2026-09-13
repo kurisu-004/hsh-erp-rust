@@ -205,8 +205,8 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
         json_request("POST", &format!("/parts/{pid}/place-on-shelf"), Some(body), Some(&token)),
     )
     .await;
-    // 20507 默认映射到 400（2xxxx 兜底段）
-    assert_eq!(s, StatusCode::BAD_REQUEST, "shelf↔process 缺失应拒绝: {env}");
+    // 20507 BIZ_SHELF_PROCESS_NOT_MAPPED → Phase 2 (2026-09-13) 显式映射 422
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "shelf↔process 缺失应拒绝: {env}");
     assert_eq!(env["code"], 20507);
 }
 

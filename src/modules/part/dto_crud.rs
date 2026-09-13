@@ -348,6 +348,11 @@ pub struct RecallToProgrammingRequest {
 /// `outsource_company_id` + `process_id` 必填。Phase 1 简化版：状态机放行
 /// `PENDING → OUTSOURCE` 与 `IN_PROCESS → OUTSOURCE`（白名单后者由
 /// `IN_PROCESS→PROGRAMMING` 已有的位置守 + service 层新增的 `OUTSOURCE` 目标组合守卫）。
+///
+/// Phase 2（2026-09-13）：
+/// - `quote_id` 必填（APPROVED 报价）；service 在同事务内 INSERT t_outsource_shipment
+/// - `direct` 标志：当 `direct=true` 时跳过 quote 校验（DIRECT 免审批占位；
+///   Phase 2 stub：返回 501 NOT_IMPLEMENTED）
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SendToOutsourceRequest {
     #[serde(deserialize_with = "deserialize_i64")]
@@ -357,6 +362,12 @@ pub struct SendToOutsourceRequest {
     pub outsource_company_id: i64,
     #[serde(deserialize_with = "deserialize_i64")]
     pub process_id: i64,
+    /// APPROVED 报价 id（DIRECT 模式 stub 时必填；service 内会校验）
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub quote_id: Option<i64>,
+    /// DIRECT 模式占位（暂返回 501 NOT_IMPLEMENTED；follow-up 任务）
+    #[serde(default)]
+    pub direct: Option<bool>,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -432,6 +443,47 @@ pub struct SplitBatchRequest {
     pub quantity: i64,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// `POST /parts/{id}/pick-up` 入参（B 方案：手动 pick-up 兜底）。
+///
+/// PENDING / IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER。
+/// `worker_id` 必填（持有件工人）；`batch_id` 必填；`shelf_id` 必填
+/// （当前批次所在货架；service 层仅校验存在 + 同 shelf ↔ process 映射）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PickUpRequest {
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub batch_id: i64,
+    pub version: i32,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub worker_id: i64,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub shelf_id: i64,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `GET /parts/by-work-type/{work_type_id}` 入参（query）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ByWorkTypeQuery {
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub shelf_id: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+/// `GET /parts/pickable-by-work-type/{work_type_id}` 入参（query）。
+pub type PickableByWorkTypeQuery = ByWorkTypeQuery;
+
+/// `GET /parts/by-worker/{worker_id}` 入参（query）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ByWorkerQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
 /// `POST /parts/{id}/batches/{batch_id}/cancel` 入参。

@@ -212,8 +212,11 @@ pub mod code {
     /// 详见 docs/api/delivery-notes/drafts.md（scan）与 workflow.md（submit）
     pub const BIZ_DELIVERY_BATCH_STATE_INVALID: i32 = 21421;
 
-    // 215xx 外协发货（t_outsource_shipment）
+    // 215xx 外协发货（t_outsource_shipment，2026-09-13 Phase 2 扩展）
     pub const BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND: i32 = 21501;
+    pub const BIZ_OUTSOURCE_SHIPMENT_INVALID_TRANSITION: i32 = 21502; // shipment.status 不允许本次操作
+    pub const BIZ_OUTSOURCE_SHIPMENT_NO_OPEN: i32 = 21503; // 找不到开口 OUTSOURCING shipment
+    pub const BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS: i32 = 21504; // 接收数量超过开口 shipment.quantity
 
     // 207xx 工艺链（t_part_process_chain + t_process_chain_step）
     pub const BIZ_PROCESS_CHAIN_NOT_FOUND: i32 = 20701;
@@ -423,7 +426,8 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_PART_NOT_DELETABLE => StatusCode::CONFLICT,
 
         // ---- 2xxxx 业务码：422 (校验类，Python 显式声明 21113 → 422) ----
-        c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER => StatusCode::UNPROCESSABLE_ENTITY,
+        c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER
+            || c == code::BIZ_SHELF_PROCESS_NOT_MAPPED => StatusCode::UNPROCESSABLE_ENTITY,
 
         // ---- 2xxxx 兜底：Python BizError 默认 400 ----
         c if c == code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH
@@ -619,6 +623,9 @@ mod tests {
         (code::BIZ_DELIVERY_NOTE_LOCKED_PART, "BIZ_DELIVERY_NOTE_LOCKED_PART"),
         // 215xx
         (code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND"),
+        (code::BIZ_OUTSOURCE_SHIPMENT_INVALID_TRANSITION, "BIZ_OUTSOURCE_SHIPMENT_INVALID_TRANSITION"),
+        (code::BIZ_OUTSOURCE_SHIPMENT_NO_OPEN, "BIZ_OUTSOURCE_SHIPMENT_NO_OPEN"),
+        (code::BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS, "BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS"),
         // 207xx 工艺链（worker-pool auto-allocate 阶段新增）
         (code::BIZ_PROCESS_CHAIN_NOT_FOUND, "BIZ_PROCESS_CHAIN_NOT_FOUND"),
         (code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND, "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND"),
@@ -794,6 +801,9 @@ mod tests {
 
         // 215xx
         assert_eq!(code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, 21501);
+        assert_eq!(code::BIZ_OUTSOURCE_SHIPMENT_INVALID_TRANSITION, 21502);
+        assert_eq!(code::BIZ_OUTSOURCE_SHIPMENT_NO_OPEN, 21503);
+        assert_eq!(code::BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS, 21504);
 
         // 207xx
         assert_eq!(code::BIZ_PROCESS_CHAIN_NOT_FOUND, 20701);
@@ -879,6 +889,7 @@ mod tests {
         (code::BIZ_DELIVERY_NOTE_LOCKED_PART, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_LOCKED_PART"),
         // 2xxxx 显式 422
         (code::BIZ_DELIVERY_PRINT_BAD_ORDER, StatusCode::UNPROCESSABLE_ENTITY, "BIZ_DELIVERY_PRINT_BAD_ORDER"),
+        (code::BIZ_SHELF_PROCESS_NOT_MAPPED, StatusCode::UNPROCESSABLE_ENTITY, "BIZ_SHELF_PROCESS_NOT_MAPPED"),
         // 2xxxx 默认 400 兜底
         (code::BIZ_INVALID_TRANSITION, StatusCode::BAD_REQUEST, "BIZ_INVALID_TRANSITION"),
         (code::BIZ_INVALID_VALUE, StatusCode::BAD_REQUEST, "BIZ_INVALID_VALUE"),

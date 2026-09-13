@@ -750,12 +750,13 @@ pub async fn start_repair(
 
 use crate::modules::part::dto_crud::{
     BatchUpdateOrderInfoOut, BatchUpdateOrderInfoRequest, BatchWithPdfsRequest,
-    CancelBatchRequest, CompleteRepairRequest, LocationTreeOut,
+    ByWorkTypeQuery, CancelBatchRequest, CompleteRepairRequest, LocationTreeOut,
     MatchByExcelItemsRequest, MatchByExcelItemResult, PartBatchListItemOut,
-    PartEventOut, PlaceOnShelfRequest, ReceiveFromOutsourceToInspectionRequest,
-    RecallToPendingRequest, RecallToProgrammingRequest, RepairDispatchRequest,
-    ScanDeliverPartRequest, ScanInspectRequest, SendToOutsourceRequest,
-    SendToProgrammingRequest, SplitBatchRequest,
+    PartEventOut, PickUpRequest, PlaceOnShelfRequest,
+    ReceiveFromOutsourceToInspectionRequest, RecallToPendingRequest,
+    RecallToProgrammingRequest, RepairDispatchRequest, ScanDeliverPartRequest,
+    ScanInspectRequest, SendToOutsourceRequest, SendToProgrammingRequest,
+    SplitBatchRequest,
 };
 
 /// POST /api/v2/parts/{part_id}/place-on-shelf
@@ -1172,6 +1173,73 @@ pub async fn batch_update_order_info(
 ) -> Result<Json<R<BatchUpdateOrderInfoOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = PartService::batch_update_order_info(&mut tx, &req, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+// ===== Phase 2 (2026-09-13) — 领取链路 (B 方案：手动 pick-up 兜底) =====
+
+/// POST /api/v2/parts/{part_id}/pick-up
+///
+/// 手动 pick-up（B 方案）：PENDING / IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER。
+/// Manager / Clerk / ShelfAccount 三角色可触发；worker 必须 active 且绑定 work_type。
+pub async fn pick_up(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<PickUpRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::pick_up(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_PICKED_UP".into(),
+        payload: json!({
+            "part_id": part_id.to_string(),
+            "worker_id": out.id.to_string(),
+        }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/by-work-type/{work_type_id}
+pub async fn list_by_work_type(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(work_type_id): Path<i64>,
+    Query(query): Query<ByWorkTypeQuery>,
+) -> Result<Json<R<crate::modules::part::dto_crud::PartListOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_by_work_type(&mut tx, work_type_id, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/pickable-by-work-type/{work_type_id}
+///
+/// 「可领取」列表（与 by-work-type 同形，但限定 shelf.zone=PRODUCTION + active）。
+pub async fn list_pickable_by_work_type(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(work_type_id): Path<i64>,
+    Query(query): Query<ByWorkTypeQuery>,
+) -> Result<Json<R<crate::modules::part::dto_crud::PartListOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out =
+        PartService::list_pickable_by_work_type(&mut tx, work_type_id, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/by-worker/{worker_id}
+pub async fn list_by_worker(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(worker_id): Path<i64>,
+    Query(query): Query<crate::modules::part::dto_crud::ByWorkerQuery>,
+) -> Result<Json<R<crate::modules::part::dto_crud::PartListOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_by_worker(&mut tx, worker_id, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }

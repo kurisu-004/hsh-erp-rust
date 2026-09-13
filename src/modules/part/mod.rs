@@ -57,6 +57,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/match-by-excel-items", post(handler::match_by_excel_items))
         .route("/batch-update-order-info", post(handler::batch_update_order_info))
         .route("/batch-with-pdfs", post(handler::batch_with_pdfs))
+        // ---- Phase 2 (2026-09-13) 静态段（by-work-type / pickable / by-worker）----
+        .route("/by-work-type/{work_type_id}", get(handler::list_by_work_type))
+        .route("/pickable-by-work-type/{work_type_id}", get(handler::list_pickable_by_work_type))
+        .route("/by-worker/{worker_id}", get(handler::list_by_worker))
         // ---- 单件 {part_id} ----
         .route("/{part_id}", get(handler::get_part_detail))
         .route("/{part_id}/update", post(handler::update_part))
@@ -83,6 +87,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/batches", get(handler::list_part_batches))
         .route("/{part_id}/batches/split", post(handler::split_batch))
         .route("/{part_id}/batches/{batch_id}/cancel", post(handler::cancel_batch))
+        // ---- Phase 2 (2026-09-13) 手动 pick-up ----
+        .route("/{part_id}/pick-up", post(handler::pick_up))
         // ---- to-XXX 流（替换 Phase F / F2 inspection）----
         .route("/{part_id}/to-ship", post(handler::to_ship))
         .route("/{part_id}/to-inspection", post(handler::to_inspection))

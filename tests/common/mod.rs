@@ -159,7 +159,9 @@ pub async fn clean_business_db(pool: &PgPool) {
             t_assembly, \
             t_customer, t_applicant, \
             t_work_type, t_worker, \
-            t_shelf_process, t_work_type_process, t_process \
+            t_shelf_process, t_work_type_process, t_process, \
+            t_outsource_company_process, t_outsource_company, \
+            t_outsource_shipment, t_outsource_quote_event, t_outsource_quote \
          RESTART IDENTITY CASCADE",
     )
     .execute(pool)
