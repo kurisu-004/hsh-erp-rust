@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::state::AppState;
 
+pub mod _e2e;
 pub mod applicant;
 pub mod assembly;
 pub mod auth;
@@ -72,6 +73,8 @@ pub fn v2_router() -> Router<Arc<AppState>> {
         .nest("/worker-pool", worker_pool::router())
         .nest("/admin/worker-pool", worker_pool::admin_router())
         .nest("/process-chains", process_chain::router())
+        // 2026-09-14 新增：e2e 测试 seed hook（dev/test 默认启用，release profile 硬关）
+        .nest("/_e2e", _e2e::router())
 }
 
 /// `/ws/*` WebSocket 入口（当前仅 dashboard 大屏）

@@ -21,6 +21,11 @@ pub struct AppConfig {
     /// 优先；缺省回退到编译期绝对路径 `<CARGO_MANIFEST_DIR>/template`，
     /// 因此本地 `cargo run` 不依赖 cwd。
     pub delivery_note_template_dir: PathBuf,
+    /// 2026-09-14 新增：是否启用 /api/v2/_e2e/* hook。
+    /// 启用后 e2e 测试可通过匿名 POST 直接灌入 seed 数据 + revoke session。
+    /// 仅 dev / test 环境开启；prod 强制 false（即使 env 误设为 true 也会被 main 二次校验为 false）。
+    /// 环境变量 `E2E_HOOKS_ENABLED`，缺省 `true`（dev/test 容器场景）。
+    pub enable_e2e_hooks: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +166,9 @@ impl AppConfig {
                 "DELIVERY_NOTE_TEMPLATE_DIR",
                 concat!(env!("CARGO_MANIFEST_DIR"), "/template"),
             )),
+            // 2026-09-14 新增：_e2e 路由门控。dev/test 默认开；prod 通过环境变量显式置 false。
+            // 注意 main.rs 还会基于 RUST_ENV / RELEASE profile 二次硬关，避免 prod 误启用。
+            enable_e2e_hooks: env_bool("E2E_HOOKS_ENABLED", true)?,
         })
     }
 }

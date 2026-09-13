@@ -89,7 +89,15 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
 
     // 8. 组装 AppState
-    let config = Arc::new(config);
+    // 2026-09-14 新增：_e2e hook 在 release profile 下硬关，防止 prod 误启用
+    // （env 误配 E2E_HOOKS_ENABLED=true 时 release 构建仍然 404）
+    let config = if cfg!(debug_assertions) {
+        Arc::new(config)
+    } else {
+        let mut c = config;
+        c.enable_e2e_hooks = false;
+        Arc::new(c)
+    };
     let state = Arc::new(AppState::new(
         pool,
         config.clone(),

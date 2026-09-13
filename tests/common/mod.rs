@@ -213,6 +213,7 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             interval_hours: 24,
         },
         delivery_note_template_dir: std::path::PathBuf::from("template"),
+        enable_e2e_hooks: true,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -274,6 +275,7 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             interval_hours: 24,
         },
         delivery_note_template_dir: std::path::PathBuf::from("template"),
+        enable_e2e_hooks: true,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
