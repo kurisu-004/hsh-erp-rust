@@ -745,3 +745,433 @@ pub async fn start_repair(
     });
     Ok(Json(R::ok(out)))
 }
+
+// ===== Phase 1（2026-09-13）14 端点 handlers =====
+
+use crate::modules::part::dto_crud::{
+    BatchUpdateOrderInfoOut, BatchUpdateOrderInfoRequest, BatchWithPdfsRequest,
+    CancelBatchRequest, CompleteRepairRequest, LocationTreeOut,
+    MatchByExcelItemsRequest, MatchByExcelItemResult, PartBatchListItemOut,
+    PartEventOut, PlaceOnShelfRequest, ReceiveFromOutsourceToInspectionRequest,
+    RecallToPendingRequest, RecallToProgrammingRequest, RepairDispatchRequest,
+    ScanDeliverPartRequest, ScanInspectRequest, SendToOutsourceRequest,
+    SendToProgrammingRequest, SplitBatchRequest,
+};
+
+/// POST /api/v2/parts/{part_id}/place-on-shelf
+pub async fn place_on_shelf(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<PlaceOnShelfRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::place_on_shelf(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_PLACED_ON_SHELF".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/recall-to-pending
+pub async fn recall_to_pending(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<RecallToPendingRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::recall_to_pending(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_RECALLED".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/send-to-programming
+pub async fn send_to_programming(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<SendToProgrammingRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::send_to_programming(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_SENT_TO_PROGRAMMING".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/release-from-programming
+pub async fn release_from_programming(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<PlaceOnShelfRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::release_from_programming(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_RELEASED_FROM_PROGRAMMING".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/recall-to-programming
+pub async fn recall_to_programming(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<RecallToProgrammingRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::recall_to_programming(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_RECALLED_TO_PROGRAMMING".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/pending-programming
+pub async fn list_pending_programming(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<PartListQuery>,
+) -> Result<Json<R<PartListOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_pending_programming(&mut tx, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/send-to-outsource
+pub async fn send_to_outsource(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<SendToOutsourceRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::send_to_outsource(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_SENT_TO_OUTSOURCE".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/receive-from-outsource
+pub async fn receive_from_outsource(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<PlaceOnShelfRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::receive_from_outsource(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_RECEIVED_FROM_OUTSOURCE".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/receive-from-outsource-to-inspection
+pub async fn receive_from_outsource_to_inspection(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<ReceiveFromOutsourceToInspectionRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::receive_from_outsource_to_inspection(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_RECEIVED_FROM_OUTSOURCE_INSPECTED".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/outsource-in-flight
+pub async fn list_outsource_in_flight(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<PartListQuery>,
+) -> Result<Json<R<PartListOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_outsource_in_flight(&mut tx, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/outsource-sendable
+pub async fn list_outsource_sendable(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<PartListQuery>,
+) -> Result<Json<R<PartListOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_outsource_sendable(&mut tx, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/complete-repair
+pub async fn complete_repair(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<CompleteRepairRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::complete_repair(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_REPAIR_COMPLETED".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/repair-dispatch
+pub async fn repair_dispatch(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<RepairDispatchRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::repair_dispatch(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_REPAIR_DISPATCHED".into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/repair-batches
+pub async fn list_repair_batches(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<InspectionBatchListQuery>,
+) -> Result<Json<R<crate::modules::part::dto::InspectionBatchListOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_repair_batches(&mut tx, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/repairing-batches
+pub async fn list_repairing_batches(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<InspectionBatchListQuery>,
+) -> Result<Json<R<crate::modules::part::dto::InspectionBatchListOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_repairing_batches(&mut tx, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/batches/split
+pub async fn split_batch(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<SplitBatchRequest>,
+) -> Result<Json<R<i64>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let new_batch_id = PartService::split_batch(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_BATCH_SPLIT".into(),
+        payload: json!({
+            "part_id": part_id.to_string(),
+            "new_batch_id": new_batch_id.to_string(),
+        }),
+    });
+    Ok(Json(R::ok(new_batch_id)))
+}
+
+/// POST /api/v2/parts/{part_id}/batches/{batch_id}/cancel
+pub async fn cancel_batch(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path((part_id, batch_id)): Path<(i64, i64)>,
+    Json(req): Json<CancelBatchRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::cancel_batch(&mut tx, &state.snowflake, part_id, batch_id, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_BATCH_CANCELLED".into(),
+        payload: json!({
+            "part_id": part_id.to_string(),
+            "batch_id": batch_id.to_string(),
+        }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/{part_id}/batches
+pub async fn list_part_batches(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+) -> Result<Json<R<Vec<PartBatchListItemOut>>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_batches(&mut tx, part_id, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/{part_id}/events
+pub async fn list_part_events(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+) -> Result<Json<R<Vec<PartEventOut>>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::list_events(&mut tx, part_id, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/parts/location-tree
+pub async fn get_location_tree(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+) -> Result<Json<R<LocationTreeOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::location_tree(&mut tx, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/{part_id}/scan-inspect
+pub async fn scan_inspect(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<ScanInspectRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::scan_inspect(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    let kind = if out.status == "READY_TO_SHIP" {
+        "PART_SCAN_INSPECT_PASSED"
+    } else {
+        "PART_SCAN_INSPECT_FAILED"
+    };
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: kind.into(),
+        payload: json!({ "part_id": part_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/scan/deliver-part
+pub async fn scan_deliver_part(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<ScanDeliverPartRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::scan_deliver_part(&mut tx, &state.snowflake, req, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_DELIVERED".into(),
+        payload: json!({ "part_id": out.id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/batch-with-pdfs (multipart)
+pub async fn batch_with_pdfs(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    mut multipart: Multipart,
+) -> Result<Json<R<crate::modules::part::dto_crud::PartDetailOut>>, AppError> {
+    let mut json_body: Option<BatchWithPdfsRequest> = None;
+    let mut pdf_files: Vec<Vec<u8>> = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "json" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::validation(format!("json 字段读取失败: {e}")))?;
+                json_body = Some(
+                    serde_json::from_str(&text)
+                        .map_err(|e| AppError::validation(format!("json 字段 JSON 解析失败: {e}")))?,
+                );
+            }
+            "pdf" | "file" => {
+                let data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::validation(format!("pdf 字段读取失败: {e}")))?
+                    .to_vec();
+                pdf_files.push(data);
+            }
+            _ => {
+                return Err(AppError::validation(format!(
+                    "multipart 未知字段: '{name}'（仅接受 'json' / 'pdf' / 'file'）"
+                )));
+            }
+        }
+    }
+    let req = json_body.ok_or_else(|| AppError::validation("multipart 缺少 'json' 字段"))?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::batch_with_pdfs(&mut tx, &state.snowflake, &req, &pdf_files, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "PART_BATCH_WITH_PDFS_CREATED".into(),
+        payload: json!({ "part_id": out.part.id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/match-by-excel-items
+pub async fn match_by_excel_items(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<MatchByExcelItemsRequest>,
+) -> Result<Json<R<Vec<MatchByExcelItemResult>>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::match_by_excel_items(&mut tx, &req, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// POST /api/v2/parts/batch-update-order-info
+pub async fn batch_update_order_info(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<BatchUpdateOrderInfoRequest>,
+) -> Result<Json<R<BatchUpdateOrderInfoOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartService::batch_update_order_info(&mut tx, &req, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}

@@ -46,6 +46,17 @@ pub fn router() -> Router<Arc<AppState>> {
         // worker-scan 静态段也必须在 /{part_id}/... 之前注册，
         // 否则 axum 会把 `worker-scan` 解析成 part_id=... 的 catch-all。
         .route("/worker-scan", post(handler::worker_scan))
+        // ---- Phase 1（2026-09-13）静态段（在 {part_id} catch-all 之前注册）----
+        .route("/pending-programming", get(handler::list_pending_programming))
+        .route("/outsource-in-flight", get(handler::list_outsource_in_flight))
+        .route("/outsource-sendable", get(handler::list_outsource_sendable))
+        .route("/repair-batches", get(handler::list_repair_batches))
+        .route("/repairing-batches", get(handler::list_repairing_batches))
+        .route("/location-tree", get(handler::get_location_tree))
+        .route("/scan/deliver-part", post(handler::scan_deliver_part))
+        .route("/match-by-excel-items", post(handler::match_by_excel_items))
+        .route("/batch-update-order-info", post(handler::batch_update_order_info))
+        .route("/batch-with-pdfs", post(handler::batch_with_pdfs))
         // ---- 单件 {part_id} ----
         .route("/{part_id}", get(handler::get_part_detail))
         .route("/{part_id}/update", post(handler::update_part))
@@ -56,6 +67,22 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/cancel", post(handler::cancel))
         .route("/{part_id}/complete", post(handler::complete))
         .route("/{part_id}/start-repair", post(handler::start_repair))
+        // ---- Phase 1 单件端点 ----
+        .route("/{part_id}/place-on-shelf", post(handler::place_on_shelf))
+        .route("/{part_id}/recall-to-pending", post(handler::recall_to_pending))
+        .route("/{part_id}/send-to-programming", post(handler::send_to_programming))
+        .route("/{part_id}/release-from-programming", post(handler::release_from_programming))
+        .route("/{part_id}/recall-to-programming", post(handler::recall_to_programming))
+        .route("/{part_id}/send-to-outsource", post(handler::send_to_outsource))
+        .route("/{part_id}/receive-from-outsource", post(handler::receive_from_outsource))
+        .route("/{part_id}/receive-from-outsource-to-inspection", post(handler::receive_from_outsource_to_inspection))
+        .route("/{part_id}/complete-repair", post(handler::complete_repair))
+        .route("/{part_id}/repair-dispatch", post(handler::repair_dispatch))
+        .route("/{part_id}/scan-inspect", post(handler::scan_inspect))
+        .route("/{part_id}/events", get(handler::list_part_events))
+        .route("/{part_id}/batches", get(handler::list_part_batches))
+        .route("/{part_id}/batches/split", post(handler::split_batch))
+        .route("/{part_id}/batches/{batch_id}/cancel", post(handler::cancel_batch))
         // ---- to-XXX 流（替换 Phase F / F2 inspection）----
         .route("/{part_id}/to-ship", post(handler::to_ship))
         .route("/{part_id}/to-inspection", post(handler::to_inspection))

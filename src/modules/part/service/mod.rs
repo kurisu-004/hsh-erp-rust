@@ -14,6 +14,7 @@ pub mod crud;
 pub mod inspection;
 pub mod inspection_core;
 pub mod lifecycle;
+pub mod phase1;
 pub mod rollup;
 pub mod worker_scan;
 

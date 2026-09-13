@@ -88,7 +88,7 @@ impl PartStatus {
         }
     }
 
-    /// 迁移白名单（共 14 个合法迁移）。
+    /// 迁移白名单（共 21 个合法迁移，Phase 1 2026-09-13 扩展）。
     ///
     /// to-XXX 流放行：
     /// - `INSPECTION → READY_TO_SHIP`：to_ship 路径
@@ -103,6 +103,22 @@ impl PartStatus {
     ///
     /// 扫描返修新增（scan-route B 组 to-inspection）：
     /// - `REPAIRING → INSPECTION` (to-inspection：返修完成 → 重新送检)
+    ///
+    /// Phase 1（2026-09-13）补齐 14 端点：
+    /// - `PENDING → IN_PROCESS`：place-on-shelf（ON_SHELF 在 DB 是 status=IN_PROCESS +
+    ///   location=PRODUCTION_SHELF，service 层守 location；状态机仅做 status 白名单）
+    /// - `IN_PROCESS → PENDING`：recall-to-pending（service 层要求 location=PRODUCTION_SHELF）
+    /// - `PROGRAMMING → PENDING`：recall-to-pending
+    /// - `PROGRAMMING → IN_PROCESS`：release-from-programming
+    /// - `IN_PROCESS → PROGRAMMING`：recall-to-programming（service 层守 location=PRODUCTION_SHELF）
+    /// - `REPAIRING → IN_PROCESS`：complete-repair（落回生产架）
+    /// - `OUTSOURCE → IN_PROCESS`：receive-from-outsource（回生产架）
+    /// - `OUTSOURCE → INSPECTION`：receive-from-outsource-to-inspection
+    /// - `PENDING → OUTSOURCE`：send-to-outsource（service 层也允许 IN_PROCESS 源走 OUTSOURCE；
+    ///   状态机放行 PENDING → OUTSOURCE，service 层另守 IN_PROCESS→OUTSOURCE）
+    /// - `INSPECTION → REPAIRING`：scan-inspect FAIL
+    /// - `REPAIRING → CANCELLED`：cancel 路径
+    /// - `OUTSOURCE → CANCELLED`：cancel 路径
     ///
     /// IN_PROCESS+WORKER 拒绝 / IN_PROCESS+非 PRODUCTION_SHELF 拒绝走
     /// service 层组合校验（仿 myERP `service/part.py:4140-4164`），不污染
@@ -128,6 +144,20 @@ impl PartStatus {
                 | (IN_PROCESS, REPAIRING)           // start-repair
             // 扫描返修新增（scan-route B 组走 to-inspection）
                 | (REPAIRING, INSPECTION)            // 返修完成 → 重新送检（B 组走 to-inspection）
+            // Phase 1（2026-09-13）补齐
+                | (PENDING, PROGRAMMING)             // send-to-programming（OFFICE）
+                | (PENDING, IN_PROCESS)              // place-on-shelf
+                | (IN_PROCESS, PENDING)              // recall-to-pending（service 层守 location=PRODUCTION_SHELF）
+                | (PROGRAMMING, PENDING)             // recall-to-pending
+                | (PROGRAMMING, IN_PROCESS)          // release-from-programming
+                | (IN_PROCESS, PROGRAMMING)          // recall-to-programming（service 层守 location=PRODUCTION_SHELF）
+                | (REPAIRING, IN_PROCESS)            // complete-repair（落回生产架）
+                | (OUTSOURCE, IN_PROCESS)            // receive-from-outsource（回生产架）
+                | (OUTSOURCE, INSPECTION)            // receive-from-outsource-to-inspection
+                | (PENDING, OUTSOURCE)               // send-to-outsource（DIRECT 路径从 PENDING 发）
+                | (INSPECTION, REPAIRING)            // scan-inspect FAIL
+                | (REPAIRING, CANCELLED)             // cancel 路径
+                | (OUTSOURCE, CANCELLED)             // cancel 路径
         )
     }
 }
@@ -206,7 +236,9 @@ mod tests {
     fn disallowed_transitions_repairing_rejects() {
         assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::READY_TO_SHIP));
         assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::COMPLETED));
-        assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::IN_PROCESS));
+        // Phase 1 (2026-09-13): REPAIRING → IN_PROCESS 现在允许（complete-repair 落回生产架）
+        // 由 `allowed_phase1_complete_repair_to_process` 单独断言；
+        // 本测试仅保留 READY_TO_SHIP / COMPLETED 两个明确拒绝的断言。
     }
 
     #[test]
@@ -219,6 +251,8 @@ mod tests {
             PartStatus::INSPECTION,
             PartStatus::READY_TO_SHIP,
             PartStatus::DELIVERED,
+            PartStatus::REPAIRING,    // Phase 1 新增
+            PartStatus::OUTSOURCE,    // Phase 1 新增
         ] {
             assert!(s.can_transition_to(PartStatus::CANCELLED), "from {s:?} should be cancellable");
         }
@@ -232,9 +266,140 @@ mod tests {
         assert!(!PartStatus::COMPLETED.can_transition_to(PartStatus::DELIVERED));
         assert!(!PartStatus::CANCELLED.can_transition_to(PartStatus::PENDING));
         assert!(!PartStatus::PENDING.can_transition_to(PartStatus::REPAIRING));
-        assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::REPAIRING));
+        // Phase 1 (2026-09-13): INSPECTION → REPAIRING 现在允许（scan-inspect FAIL）；
+        // 由 `allowed_phase1_scan_inspect_fail` 单独断言。
         assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::DELIVERED));
         assert!(!PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::COMPLETED));
+    }
+
+    // ===== Phase 1（2026-09-13）扩展测试 =====
+
+    #[test]
+    fn allowed_phase1_place_on_shelf() {
+        // PENDING → IN_PROCESS（place-on-shelf 入口）
+        assert!(PartStatus::PENDING.can_transition_to(PartStatus::IN_PROCESS));
+    }
+
+    #[test]
+    fn allowed_phase1_recall_to_pending() {
+        // IN_PROCESS → PENDING（recall-to-pending；service 层守 location=PRODUCTION_SHELF）
+        assert!(PartStatus::IN_PROCESS.can_transition_to(PartStatus::PENDING));
+        // PROGRAMMING → PENDING
+        assert!(PartStatus::PROGRAMMING.can_transition_to(PartStatus::PENDING));
+    }
+
+    #[test]
+    fn allowed_phase1_release_from_programming() {
+        // PROGRAMMING → IN_PROCESS（release-from-programming）
+        assert!(PartStatus::PROGRAMMING.can_transition_to(PartStatus::IN_PROCESS));
+    }
+
+    #[test]
+    fn allowed_phase1_recall_to_programming() {
+        // IN_PROCESS → PROGRAMMING（recall-to-programming；service 层守 location=PRODUCTION_SHELF）
+        assert!(PartStatus::IN_PROCESS.can_transition_to(PartStatus::PROGRAMMING));
+    }
+
+    #[test]
+    fn allowed_phase1_complete_repair_to_process() {
+        // REPAIRING → IN_PROCESS（complete-repair 落回生产架）
+        assert!(PartStatus::REPAIRING.can_transition_to(PartStatus::IN_PROCESS));
+    }
+
+    #[test]
+    fn allowed_phase1_receive_from_outsource() {
+        // OUTSOURCE → IN_PROCESS（receive-from-outsource 回生产架）
+        assert!(PartStatus::OUTSOURCE.can_transition_to(PartStatus::IN_PROCESS));
+        // OUTSOURCE → INSPECTION（receive-from-outsource-to-inspection）
+        assert!(PartStatus::OUTSOURCE.can_transition_to(PartStatus::INSPECTION));
+    }
+
+    #[test]
+    fn allowed_phase1_send_to_outsource() {
+        // PENDING → OUTSOURCE（send-to-outsource；DIRECT 路径）
+        assert!(PartStatus::PENDING.can_transition_to(PartStatus::OUTSOURCE));
+    }
+
+    #[test]
+    fn allowed_phase1_scan_inspect_fail() {
+        // INSPECTION → REPAIRING（scan-inspect FAIL：品检打回返修）
+        assert!(PartStatus::INSPECTION.can_transition_to(PartStatus::REPAIRING));
+    }
+
+    #[test]
+    fn allowed_phase1_cancel_repairing_outsource() {
+        // REPAIRING / OUTSOURCE 也允许 → CANCELLED
+        assert!(PartStatus::REPAIRING.can_transition_to(PartStatus::CANCELLED));
+        assert!(PartStatus::OUTSOURCE.can_transition_to(PartStatus::CANCELLED));
+    }
+
+    #[test]
+    fn disallowed_phase1_self_loops_and_invalid() {
+        // 自环非法（所有状态）
+        for s in [
+            PartStatus::PENDING,
+            PartStatus::PROGRAMMING,
+            PartStatus::IN_PROCESS,
+            PartStatus::INSPECTION,
+            PartStatus::READY_TO_SHIP,
+            PartStatus::DELIVERED,
+            PartStatus::REPAIRING,
+            PartStatus::OUTSOURCE,
+            PartStatus::COMPLETED,
+            PartStatus::CANCELLED,
+        ] {
+            assert!(!s.can_transition_to(s), "{s:?} 自环必须拒绝");
+        }
+        // COMPLETED → 任何状态都非法
+        for t in [
+            PartStatus::PENDING,
+            PartStatus::PROGRAMMING,
+            PartStatus::IN_PROCESS,
+            PartStatus::INSPECTION,
+            PartStatus::READY_TO_SHIP,
+            PartStatus::DELIVERED,
+            PartStatus::REPAIRING,
+            PartStatus::OUTSOURCE,
+            PartStatus::CANCELLED,
+        ] {
+            assert!(
+                !PartStatus::COMPLETED.can_transition_to(t),
+                "COMPLETED → {t:?} 必须拒绝"
+            );
+        }
+        // CANCELLED → 任何状态都非法
+        for t in [
+            PartStatus::PENDING,
+            PartStatus::PROGRAMMING,
+            PartStatus::IN_PROCESS,
+            PartStatus::INSPECTION,
+            PartStatus::READY_TO_SHIP,
+            PartStatus::DELIVERED,
+            PartStatus::REPAIRING,
+            PartStatus::OUTSOURCE,
+            PartStatus::COMPLETED,
+        ] {
+            assert!(
+                !PartStatus::CANCELLED.can_transition_to(t),
+                "CANCELLED → {t:?} 必须拒绝"
+            );
+        }
+        // OUTSOURCE → DELIVERED 非法（必须先经 READY_TO_SHIP）
+        assert!(!PartStatus::OUTSOURCE.can_transition_to(PartStatus::DELIVERED));
+        // REPAIRING → READY_TO_SHIP 非法（必须先经 INSPECTION → READY_TO_SHIP）
+        assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::READY_TO_SHIP));
+        // PROGRAMMING → OUTSOURCE 非法（必须先经 IN_PROCESS）
+        assert!(!PartStatus::PROGRAMMING.can_transition_to(PartStatus::OUTSOURCE));
+        // INSPECTION → OUTSOURCE 非法（不能跳过 IN_PROCESS）
+        assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::OUTSOURCE));
+        // DELIVERED → INSPECTION 非法（不可回退）
+        assert!(!PartStatus::DELIVERED.can_transition_to(PartStatus::INSPECTION));
+        // DELIVERED → REPAIRING 非法（不允许从 DELIVERED 直接进 REPAIRING）
+        assert!(!PartStatus::DELIVERED.can_transition_to(PartStatus::REPAIRING));
+        // READY_TO_SHIP → REPAIRING 非法
+        assert!(!PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::REPAIRING));
+        // OUTSOURCE → REPAIRING 非法（必须先经 IN_PROCESS）
+        assert!(!PartStatus::OUTSOURCE.can_transition_to(PartStatus::REPAIRING));
     }
 }
 
