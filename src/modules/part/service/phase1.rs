@@ -2054,9 +2054,12 @@ impl PartService {
 
     /// `POST /parts/batch-with-pdfs`：multipart JSON + PDFs。
     ///
-    /// 简化版（Phase 1）：multipart 解析 + 页数校验 + 创建 master part。
-    /// 子件创建留给 Phase 3（assembly 子件派发）；当 `page_count > 1` 时返回 501
-    /// 提示「子件自动派发待 Phase 3 实现」。
+    /// 2026-09-14 Phase 3 完整化：
+    /// - **page1 = master part**：建装配件 master（PENDING），serial 走 L1 客户 serial_prefix。
+    /// - **page2..N = auto-created children parts**：serial 派生 `{master_serial}-{i:02d}`，
+    ///   上限 99（与 `BIZ_ASSEMBLY_TOO_MANY_CHILDREN` 保持一致）。
+    /// - **page_count == 1**：仅创建 master，不派发子件（与之前行为一致）。
+    /// - **page_count == 0**（无 PDF）：仅创建 master，无 serial（与之前行为一致）。
     pub async fn batch_with_pdfs(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
@@ -2071,7 +2074,7 @@ impl PartService {
         let _customer = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?;
-        // 解析 PDF 页数
+        // 解析 PDF 总页数
         let mut page_count: i32 = 0;
         if !pdf_files.is_empty() {
             for pdf in pdf_files {
@@ -2084,17 +2087,45 @@ impl PartService {
                 page_count += doc.get_pages().len() as i32;
             }
         }
-        if page_count > 1 {
+        // 子件数量上限 99（page2..N 共 99 个）
+        let child_count = std::cmp::max(0, page_count - 1);
+        if child_count > 99 {
             return Err(AppError::biz(
-                code::BIZ_ASSEMBLY_PDF_INVALID,
-                "batch-with-pdfs 子件自动派发待 Phase 3 实现（page_count > 1）。当前 Phase 1 仅创建装配件本身",
+                code::BIZ_ASSEMBLY_TOO_MANY_CHILDREN,
+                format!("batch-with-pdfs 子件最多 99 个，当前 PDF 页数={page_count}"),
             ));
         }
-        // 创建 part（PENDING）
+
         let today = chrono::Local::now().date_naive();
         let new_id = snowflake.next_id();
         let name = format!("装配件-{}", today.format("%Y%m%d"));
         let drawing_no = format!("ASM-{}", today.format("%Y%m%d"));
+
+        // 若有 PDF → 派 master serial（从 L1 客户 serial_prefix 拿）
+        let master_serial: Option<String> = if page_count > 0 {
+            let l1_id: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(parent_id, id) FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(req.customer_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            let prefix_str: Option<String> = sqlx::query_scalar(
+                "SELECT serial_prefix FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(l1_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            let p = prefix_str.ok_or_else(|| {
+                AppError::biz(code::BIZ_CUSTOMER_NO_SERIAL_PREFIX, "L1 客户无 serial_prefix")
+            })?;
+            let ch = p.chars().next().ok_or_else(|| {
+                AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 为空")
+            })?;
+            Some(crate::shared::serial::acquire(&mut *conn, ch).await?)
+        } else {
+            None
+        };
+
         let new = crate::modules::part::repo::part::NewPartCreate {
             id: new_id,
             name: &name,
@@ -2112,6 +2143,14 @@ impl PartService {
             created_by: current.id,
         };
         PartRepo::create_part(&mut *conn, new).await?;
+        // master 设置 serial_no（仅在有 PDF 时）
+        if let Some(sn) = &master_serial {
+            sqlx::query("UPDATE t_part SET serial_no = $1 WHERE id = $2 AND deleted_at IS NULL")
+                .bind(sn)
+                .bind(new_id)
+                .execute(&mut *conn)
+                .await?;
+        }
         // 初始批次
         let initial_batch_id = snowflake.next_id();
         PartBatchRepo::create_initial_batch(
@@ -2125,7 +2164,51 @@ impl PartService {
             },
         )
         .await?;
-        // 重读
+
+        // 自动派发子件（page2..N）
+        if child_count > 0 {
+            let master_serial = master_serial.as_deref().expect("master_serial present when child_count > 0");
+            for i in 1..=child_count {
+                let child_id = snowflake.next_id();
+                let child_serial = format!("{}-{:02}", master_serial, i);
+                let child = crate::modules::part::repo::part::NewPartCreate {
+                    id: child_id,
+                    name: &format!("{name}-{:02}", i),
+                    drawing_no: &format!("{drawing_no}-{:02}", i),
+                    applicant_name: req.applicant_name.as_deref().unwrap_or(""),
+                    quantity: 1,
+                    request_date: req.request_date.unwrap_or(today),
+                    planned_delivery_date: req.planned_delivery_date.unwrap_or(today),
+                    is_urgent: req.is_urgent.unwrap_or(false),
+                    customer_id: req.customer_id,
+                    assembly_id: None,
+                    order_no: None,
+                    system_delivery_date: None,
+                    note: req.note.as_deref(),
+                    created_by: current.id,
+                };
+                PartRepo::create_part(&mut *conn, child).await?;
+                sqlx::query("UPDATE t_part SET serial_no = $1 WHERE id = $2 AND deleted_at IS NULL")
+                    .bind(&child_serial)
+                    .bind(child_id)
+                    .execute(&mut *conn)
+                    .await?;
+                // 初始批次
+                PartBatchRepo::create_initial_batch(
+                    &mut *conn,
+                    crate::modules::part_batch::repo::NewInitialBatch {
+                        id: snowflake.next_id(),
+                        part_id: child_id,
+                        quantity: 1,
+                        location: None,
+                        created_by: Some(current.id),
+                    },
+                )
+                .await?;
+            }
+        }
+
+        // 重读 master
         let part: crate::modules::part::model::TPart = PartRepo::get_by_id(&mut *conn, new_id, false)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "create 后查不到"))?;

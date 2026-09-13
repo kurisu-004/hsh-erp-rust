@@ -8,20 +8,20 @@
 
 | # | 项 | 原因 | 后续 PR 改什么 | 关联错误码 |
 |---|---|---|---|---|
-| 1 | **PDF 文件未上传到 COS**（`AssemblyFileRef` 始终为空） | COS 上传是 part 域的横切关注点，assembly 不应重复实现；本 PR 仅做 PDF 页数校验 | 加 `POST /api/v2/assemblies/{id}/files` 端点，参考 `part::handler::upload_drawing` | — |
-| 2 | **`applicant_name` / `order_no` / `note` 三态失效**（JSON `null` 不会清字段） | DTO 端设计为非三态 `Option<String>`，service 端用 `Some(...)` 包装丢失了 NULL-clear 语义 | 改 `AssemblyUpdateRequest` 这 3 个字段为 `Option<Option<String>>` + 复用 `deserialize_optional_optional_str` 模板（`dto.rs:176` `customer_id` 已有） | — |
-| 3 | **`soft_delete` 不查 `delivery_note_id IS NULL`** | 装配体本身无 `delivery_note_id` 列（子件 `t_part` 才有），需要 JOIN children 校验，查询更复杂 | service 层加 pre-check：`SELECT 1 FROM t_part WHERE assembly_id = $1 AND delivery_note_id IS NOT NULL LIMIT 1` 触发 20307 | `BIZ_ASSEMBLY_HAS_SHIPMENT` (20307) — 已预留 |
-| 4 | **PENDING→IN_PROCESS 状态转移无独立端点** | 本 PR 只暴露 create / update / soft_delete / cancel 4 个写端点；IN_PROCESS 状态由后续流程（车间扫码、装配开始）触发 | 加 `POST /api/v2/assemblies/{id}/start`（Manager+Clerk + 状态机守卫） | `BIZ_INVALID_TRANSITION` (20103) |
-| 5 | **`acquire_serial` 在 part 和 assembly 重复实现** | 抽到 `shared::serial` 会引入跨域重构，超出本 PR 范围 | 抽 `crate::shared::serial::acquire(conn, prefix) -> String` | — |
-| 6 | **`expand_customer_id_to_l2` 用 inline recursive CTE**，不依赖 `CustomerRepo::list_l2_ids_of_l1` | customer 域尚未合并到 master；本 PR 优先保证独立性 | customer 域合并后改为调 `CustomerRepo::list_l2_ids_of_l1` | — |
-| 7 | **`list_by_assembly_id` 不返回子件 `current_batch_id`** | TPart 模型本 PR 未读 `current_batch_id`；前端如有需要后续补 | 在 `AssemblyChildOut` 加 `current_batch_id: Option<i64>` 字段 | — |
+| 1 | **PDF 文件未上传到 COS**（`AssemblyFileRef` 始终为空） | COS 上传是 part 域的横切关注点，assembly 不应重复实现；本 PR 仅做 PDF 页数校验 | 加 `POST /api/v2/assemblies/{id}/files` 端点，参考 `part::handler::upload_drawing` ✅ DONE: Phase 3 commit（2026-09-14） | — |
+| 2 | **`applicant_name` / `order_no` / `note` 三态失效**（JSON `null` 不会清字段） | DTO 端设计为非三态 `Option<String>`，service 端用 `Some(...)` 包装丢失了 NULL-clear 语义 | 改 `AssemblyUpdateRequest` 这 3 个字段为 `Option<Option<String>>` + 复用 `deserialize_optional_optional_str` 模板（`dto.rs:176` `customer_id` 已有） ✅ DONE: Phase 3 commit（2026-09-14） | — |
+| 3 | **`soft_delete` 不查 `delivery_note_id IS NULL`** | 装配体本身无 `delivery_note_id` 列（子件 `t_part` 才有），需要 JOIN children 校验，查询更复杂 | service 层加 pre-check：`SELECT 1 FROM t_part WHERE assembly_id = $1 AND delivery_note_id IS NOT NULL LIMIT 1` 触发 20307 ✅ DONE: Phase 3 commit（2026-09-14） | `BIZ_ASSEMBLY_HAS_SHIPMENT` (20307) — 已预留 |
+| 4 | **PENDING→IN_PROCESS 状态转移无独立端点** | 本 PR 只暴露 create / update / soft_delete / cancel 4 个写端点；IN_PROCESS 状态由后续流程（车间扫码、装配开始）触发 | 加 `POST /api/v2/assemblies/{id}/start`（Manager+Clerk + 状态机守卫） ✅ DONE: Phase 3 commit（2026-09-14） | `BIZ_INVALID_TRANSITION` (20103) |
+| 5 | **`acquire_serial` 在 part 和 assembly 重复实现** | 抽到 `shared::serial` 会引入跨域重构，超出本 PR 范围 | 抽 `crate::shared::serial::acquire(conn, prefix) -> String` ✅ DONE: Phase 3 commit（2026-09-14） | — |
+| 6 | **`expand_customer_id_to_l2` 用 inline recursive CTE**，不依赖 `CustomerRepo::list_l2_ids_of_l1` | customer 域尚未合并到 master；本 PR 优先保证独立性 | customer 域合并后改为调 `CustomerRepo::list_l2_ids_of_l1`（未动：customer 域尚未合并，inline CTE 保留；本 PR 优先级不在此） | — |
+| 7 | **`list_by_assembly_id` 不返回子件 `current_batch_id`** | TPart 模型本 PR 未读 `current_batch_id`；前端如有需要后续补 | 在 `AssemblyChildOut` 加 `current_batch_id: Option<i64>` 字段 ✅ DONE: Phase 3 commit（2026-09-14） | — |
 
 ## 2. 错误码 / 错误码段
 
 | # | 项 | 原因 | 后续 PR 改什么 |
 |---|---|---|---|
 | 8 | **错误码 20306 `BIZ_ASSEMBLY_CHILD_PRICE_LOCKED` 已声明但本 PR 未使用** | 子件 price 锁 0 是硬编码约束（service 没暴露解锁路径），错误码占位预留 | 加端点 `POST /api/v2/assemblies/{id}/reprice-children` 或 service 层显式调用 |
-| 9 | **错误码 20307 `BIZ_ASSEMBLY_HAS_SHIPMENT` 已声明但未触发** | 见上表第 3 项 | 同上 |
+| 9 | **错误码 20307 `BIZ_ASSEMBLY_HAS_SHIPMENT` 已声明但未触发** | 见上表第 3 项 | 同上 ✅ DONE: Phase 3 commit（2026-09-14，deferred #3 落地） |
 | 10 | **`http_status()` 映射未对 20304-20308 单独配置** | 这些码当前走默认 400；与 part/customer 段惯例一致 | 无需改（已正确） |
 
 ## 3. 集成测试 / 验证

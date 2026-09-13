@@ -15,7 +15,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::shared::types::serialize_i64;
+use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 // ---------- 出参 ----------
 
@@ -81,6 +81,10 @@ pub struct AssemblyChildOut {
     pub system_delivery_date: Option<NaiveDate>,
     pub is_urgent: bool,
     pub note: Option<String>,
+    /// 2026-09-14 Phase 3（deferred #7）— 子件当前激活批次 id。
+    /// 子件无活跃批次（如刚被 CANCELLED）时为 `None`。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub current_batch_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -179,8 +183,10 @@ pub struct AssemblyUpdateRequest {
     pub drawing_no: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
-    pub applicant_name: Option<String>,
+    /// 2026-09-14 Phase 3（deferred #2）：三态。
+    /// None = 不更新；Some(None) = 置 NULL；Some(Some(v)) = 覆盖。
+    #[serde(default, deserialize_with = "deserialize_optional_optional_str")]
+    pub applicant_name: Option<Option<String>>,
     /// 三态：None 不动；Some(None) 置 NULL；Some(Some(v)) 覆盖
     #[serde(default, deserialize_with = "deserialize_optional_optional_str")]
     pub customer_id: Option<Option<String>>,
@@ -198,12 +204,14 @@ pub struct AssemblyUpdateRequest {
     pub unit_price: Option<Option<Decimal>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional_decimal")]
     pub total_price: Option<Option<Decimal>>,
-    #[serde(default)]
-    pub order_no: Option<String>,
+    /// 2026-09-14 Phase 3（deferred #2）：三态。
+    #[serde(default, deserialize_with = "deserialize_optional_optional_str")]
+    pub order_no: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional_date")]
     pub system_delivery_date: Option<Option<NaiveDate>>,
-    #[serde(default)]
-    pub note: Option<String>,
+    /// 2026-09-14 Phase 3（deferred #2）：三态。
+    #[serde(default, deserialize_with = "deserialize_optional_optional_str")]
+    pub note: Option<Option<String>>,
     pub version: i32,
 }
 

@@ -569,6 +569,7 @@ impl OutsourceService {
 
     pub async fn update_quote(
         conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
         id: i64,
         req: &OutsourceQuoteUpdateRequest,
         current: &CurrentUser,
@@ -613,7 +614,7 @@ impl OutsourceService {
         OutsourceQuoteEventRepo::create(
             &mut *conn,
             NewOutsourceQuoteEvent {
-                id: current_id_to_snowflake(current),
+                id: current_id_to_snowflake(snowflake),
                 quote_id: id,
                 event_type: "EDITED".to_string(),
                 from_status: Some(q.status.clone()),
@@ -631,6 +632,7 @@ impl OutsourceService {
 
     pub async fn submit_quote(
         conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
         id: i64,
         current: &CurrentUser,
     ) -> Result<OutsourceQuoteOut, AppError> {
@@ -659,7 +661,7 @@ impl OutsourceService {
         OutsourceQuoteEventRepo::create(
             &mut *conn,
             NewOutsourceQuoteEvent {
-                id: current_id_to_snowflake(current),
+                id: current_id_to_snowflake(snowflake),
                 quote_id: id,
                 event_type: "SUBMITTED".to_string(),
                 from_status: Some(from.as_str().to_string()),
@@ -677,6 +679,7 @@ impl OutsourceService {
 
     pub async fn approve_quote(
         conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
         id: i64,
         review_note: Option<&str>,
         version: i32,
@@ -724,7 +727,7 @@ impl OutsourceService {
         OutsourceQuoteEventRepo::create(
             &mut *conn,
             NewOutsourceQuoteEvent {
-                id: current_id_to_snowflake(current),
+                id: current_id_to_snowflake(snowflake),
                 quote_id: id,
                 event_type: "APPROVED".to_string(),
                 from_status: Some(from.as_str().to_string()),
@@ -742,6 +745,7 @@ impl OutsourceService {
 
     pub async fn reject_quote(
         conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
         id: i64,
         review_note: &str,
         version: i32,
@@ -784,7 +788,7 @@ impl OutsourceService {
         OutsourceQuoteEventRepo::create(
             &mut *conn,
             NewOutsourceQuoteEvent {
-                id: current_id_to_snowflake(current),
+                id: current_id_to_snowflake(snowflake),
                 quote_id: id,
                 event_type: "REJECTED".to_string(),
                 from_status: Some(from.as_str().to_string()),
@@ -1205,27 +1209,17 @@ fn parse_snowflake_id(s: &str, field: &str) -> Result<i64, AppError> {
     })
 }
 
-/// 事件 id 直接用 current.id 反推一个伪 snowflake（仅 id 唯一性需要）；
-/// 真实业务里 service 会从传入的 SnowflakeIdGenerator 拿，但本 service 函数签
-/// 名未传 snowflake → 用 current.id + 简单时间偏移保证 unique 不撞即可。
-/// 实际修复：本类型应当接受 &SnowflakeIdGenerator。Phase 2 暂保留 current.id 作为
-/// event id 占位（不会重复，因为 quote_event.id 是 PK + DB autoinc 由 schema 控制）。
-/// NOTE：实测 schema 中 t_outsource_quote_event.id 是 bigint PK；写死 current.id
-/// 会在并发场景撞 id。我们换成 now-based 雪花近似 id。
-fn current_id_to_snowflake(current: &CurrentUser) -> i64 {
-    // 真实生产应是 snowflake.next_id()；本辅助函数仅在 update/submit/approve/reject
-    // 路径用，handler 不需要外部 snowflake，因为这些 service 函数没传 snowflake。
-    // 解决：这些 service 函数应传 &SnowflakeIdGenerator；当前 Phase 2 临时用
-    // current.id XOR 一个时间戳后缀（够 unique 即可）。
-    let now = now_naive().timestamp_millis();
-    let cur = current.id;
-    // 简单组合：current.id + 时间 ms 末 4 位
-    (cur & 0x0000_FFFF_FFFF_FFFF) ^ (now & 0xFFFF)
+/// 2026-09-14 Phase 3 follow-up（current_id_to_snowflake 修复）：
+/// 事件 id 直接用传入的 `SnowflakeIdGenerator::next_id()`。
+/// 真实雪花 id 保证全局唯一，避免并发场景下 `current.id ^ 时间戳` 近似 id 的撞 id 风险。
+fn current_id_to_snowflake(snowflake: &SnowflakeIdGenerator) -> i64 {
+    snowflake.next_id()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::snowflake::SnowflakeIdGenerator;
 
     #[test]
     fn parse_price_valid_decimal() {
@@ -1260,18 +1254,11 @@ mod tests {
 
     #[test]
     fn current_id_to_snowflake_unique() {
-        // 当前用户同一时刻两次调用应不同（时间差保证）
-        let user = CurrentUser {
-            id: 100,
-            username: "u".to_string(),
-            roles: vec![Role::Manager],
-            shelf_ids: vec![],
-            shelf_wildcard: true,
-        };
-        let a = current_id_to_snowflake(&user);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let b = current_id_to_snowflake(&user);
-        // 时间戳末 4 位不同 ⇒ 必不同
-        assert_ne!(a, b);
+        // 2026-09-14 Phase 3 follow-up：使用真实雪花 id 生成器。
+        // 同一 generator 连续两次调用应产生不同的 id（雪花 id sequence 自增）。
+        let generator = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+        let a = current_id_to_snowflake(&generator);
+        let b = current_id_to_snowflake(&generator);
+        assert_ne!(a, b, "雪花 id 应当单调递增");
     }
 }

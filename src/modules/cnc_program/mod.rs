@@ -1,22 +1,22 @@
 //! cnc_program 域
 //!
-// 对应 Python myERP：
+//! 对应 Python myERP：
 //! - api/v1/cnc_program.py
 //! - service/cnc_program_service.py
 //! - repository/cnc_program_repository.py
-//! - model/cnc_program.py
-//! - schema/cnc_program.py
+//!
+//! 2026-09-14 Phase 3：补齐 cnc-pair 配对上传 + 列表端点。
+//! 存储复用 part_file（kind='G_CODE' + kind='SETUP_SHEET'，paired_file_id 互指）。
 pub mod dto;
 pub mod handler;
 pub mod model;
 pub mod repo;
 pub mod service;
 
-
 use std::sync::Arc;
 use axum::Router;
 use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
+    handler::router()
 }

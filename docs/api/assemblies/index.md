@@ -15,10 +15,12 @@
 |---|---|---|---|---|
 | GET | `/api/v2/assemblies` | Manager / Clerk / Inspector / CncProgrammer | 列表查询 + 分页 + L1 客户展开 + 多字段过滤 | [`crud.md`](./crud.md#get-apiv2assemblies) |
 | POST | `/api/v2/assemblies` | Manager / Clerk | 创建装配体（multipart：`data` JSON + 可选 `files` PDF）+ 自动派生子件 | [`crud.md`](./crud.md#post-apiv2assemblies) |
-| GET | `/api/v2/assemblies/{assembly_id}` | Manager / Clerk / Inspector / CncProgrammer | 详情（assembly + children parts + files 占位） | [`crud.md`](./crud.md#get-apiv2assembliesassembly_id) |
-| POST | `/api/v2/assemblies/{assembly_id}/update` | Manager / Clerk | 字段可选 UPDATE（含 `customer_id` 三态校验 + L2 校验，OCC） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idupdate) |
-| POST | `/api/v2/assemblies/{assembly_id}/soft-delete` | **Manager** | 软删（OCC） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idsoft-delete) |
+| GET | `/api/v2/assemblies/{assembly_id}` | Manager / Clerk / Inspector / CncProgrammer | 详情（assembly + children parts + files + child current_batch_id） | [`crud.md`](./crud.md#get-apiv2assembliesassembly_id) |
+| POST | `/api/v2/assemblies/{assembly_id}/update` | Manager / Clerk | 字段可选 UPDATE（含 `customer_id` 三态校验 + L2 校验，OCC；Phase 3：`applicant_name`/`order_no`/`note` 三态 NULL-clear） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idupdate) |
+| POST | `/api/v2/assemblies/{assembly_id}/soft-delete` | **Manager** | 软删（OCC；Phase 3：HAS_SHIPMENT 预检 → 20307） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idsoft-delete) |
 | POST | `/api/v2/assemblies/{assembly_id}/cancel` | Manager / Clerk | 取消（终态 COMPLETED/CANCELLED 禁 cancel；非终态一律可 cancel） | [`cancel.md`](./cancel.md#post-apiv2assembliesassembly_idcancel) |
+| POST | `/api/v2/assemblies/{assembly_id}/start` | Manager / Clerk | **Phase 3（deferred #4）**：PENDING → IN_PROCESS 状态机守卫 | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idstart) |
+| POST | `/api/v2/assemblies/{assembly_id}/files` | Manager / Clerk | **Phase 3（deferred #1）**：multipart PDF 上传到 COS（kind=ASSEMBLY_MASTER） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idfiles) |
 
 > 路由顺序：`/{assembly_id}` 必须在 `/{assembly_id}/{action}` 之前注册；当前 `/{assembly_id}` 仅 `GET`，无静态冲突。
 
@@ -68,7 +70,7 @@
 
 ### AssemblyChildOut 字段
 
-`TPart` 子件投影（来自 `PartRepo::list_by_assembly_id`）：
+`TPart` 子件投影（来自 `PartRepo::list_by_assembly_id`）+ **Phase 3（deferred #7）`current_batch_id`**：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -86,6 +88,7 @@
 | `system_delivery_date` | date? | 系统派工日（同上） |
 | `is_urgent` | bool | 紧急标记（同上） |
 | `note` | string? | 备注（同上） |
+| `current_batch_id` | string (i64)? | **Phase 3（deferred #7）**：子件当前激活批次 id；`None` 表示无活跃批次 |
 
 > §3.4（2026-09-11）：后 6 字段为"共享信息字段"，创建时从父件 `t_assembly` 继承（§3.1），update 时按父件"更新后的当前行值"覆盖（§3.2）。`AssemblyService::get_assembly` 从 `t_part` 行直接透传。`AssemblyChildOut` 用于 `GET /assemblies/{id}`（children 数组）和 `POST /assemblies` 响应（created_children 数组）。
 
@@ -93,9 +96,9 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` | string (i64) | t_assembly_file 雪花 ID |
+| `id` | string (i64) | part_file 雪花 ID（owner_kind='ASSEMBLY', kind='ASSEMBLY_MASTER'） |
 | `original_filename` | string | 原始文件名 |
-| `page_count` | i32? | PDF 页数 |
+| `page_count` | i32? | PDF 页数（**Phase 3**：当前 pass 总是 `None`，懒加载） |
 
 ### AssemblyDetail 字段
 
@@ -103,7 +106,7 @@
 |---|---|---|
 | `assembly` | [AssemblyOut](#assemblyout-字段) | |
 | `children` | [AssemblyChildOut](#assemblychildout-字段)[] | 该 assembly 下的 part 子件 |
-| `files` | [AssemblyFileRef](#assemblyfileref-字段)[] | PDF 文件引用；本 pass 始终为空数组 |
+| `files` | [AssemblyFileRef](#assemblyfileref-字段)[] | **Phase 3（deferred #1 落地）**：ASSEMBLY_MASTER kind 的 PDF 文件引用 |
 
 ### AssemblyCreateResult 字段
 

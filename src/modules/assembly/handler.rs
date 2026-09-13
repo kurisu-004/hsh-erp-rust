@@ -202,6 +202,79 @@ pub async fn cancel_assembly(
     Ok(Json(R::ok(out)))
 }
 
+/// `POST /api/v2/assemblies/{assembly_id}/start` → 200 OK
+///
+/// 2026-09-14 Phase 3（deferred #4）：PENDING → IN_PROCESS 状态机守卫。
+pub async fn start_assembly(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(assembly_id): Path<i64>,
+) -> Result<Json<R<AssemblyOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = AssemblyService::start_assembly(&mut tx, assembly_id, &current).await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "ASSEMBLY_UPDATED".into(),
+        payload: json!({ "assembly_id": out.id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// `POST /api/v2/assemblies/{assembly_id}/files` → 201 Created
+///
+/// 2026-09-14 Phase 3（deferred #1）：multipart PDF 上传到 COS。
+/// body: 多个 `file` 二进制字段（PDF）。
+pub async fn upload_assembly_files(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(assembly_id): Path<i64>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<R<Vec<crate::modules::assembly::dto::AssemblyFileRef>>>), AppError> {
+    let mut files: Vec<(Vec<u8>, String, String)> = Vec::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
+    {
+        match field.name().unwrap_or("") {
+            "file" => {
+                let filename = field
+                    .file_name()
+                    .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "file 缺少文件名"))?
+                    .to_string();
+                let content_type = field
+                    .content_type()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "application/pdf".to_string());
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::validation(format!("file 字段读取失败: {e}")))?
+                    .to_vec();
+                files.push((bytes, filename, content_type));
+            }
+            _ => {
+                let _ = field.bytes().await;
+            }
+        }
+    }
+    if files.is_empty() {
+        return Err(AppError::biz(code::BIZ_INVALID_VALUE, "至少需要一个 file 字段"));
+    }
+    let mut tx = state.pool.begin().await?;
+    let out = AssemblyService::upload_assembly_files(
+        &mut tx,
+        &state.snowflake,
+        state.cos.clone(),
+        assembly_id,
+        files,
+        &current,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(R::ok(out))))
+}
+
 /// assembly 域 axum 子路由（不含公共前缀；由 `mod.rs::router()` 桥接到 `/assemblies`）。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -210,4 +283,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{assembly_id}/update", post(update_assembly))
         .route("/{assembly_id}/soft-delete", post(soft_delete_assembly))
         .route("/{assembly_id}/cancel", post(cancel_assembly))
+        .route("/{assembly_id}/start", post(start_assembly))
+        .route("/{assembly_id}/files", post(upload_assembly_files))
 }

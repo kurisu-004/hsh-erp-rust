@@ -183,7 +183,7 @@ pub async fn update_quote(
     Json(req): Json<OutsourceQuoteUpdateRequest>,
 ) -> Result<Json<R<OutsourceQuoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = OutsourceService::update_quote(&mut tx, id, &req, &current).await?;
+    let out = OutsourceService::update_quote(&mut tx, &state.snowflake, id, &req, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -195,7 +195,7 @@ pub async fn submit_quote(
     Path(id): Path<i64>,
 ) -> Result<Json<R<OutsourceQuoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = OutsourceService::submit_quote(&mut tx, id, &current).await?;
+    let out = OutsourceService::submit_quote(&mut tx, &state.snowflake, id, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -208,7 +208,7 @@ pub async fn approve_quote(
     Json(req): Json<OutsourceQuoteApproveRequest>,
 ) -> Result<Json<R<OutsourceQuoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = OutsourceService::approve_quote(&mut tx, id, req.review_note.as_deref(), req.version, &current)
+    let out = OutsourceService::approve_quote(&mut tx, &state.snowflake, id, req.review_note.as_deref(), req.version, &current)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
@@ -222,7 +222,7 @@ pub async fn reject_quote(
     Json(req): Json<OutsourceQuoteRejectRequest>,
 ) -> Result<Json<R<OutsourceQuoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = OutsourceService::reject_quote(&mut tx, id, &req.review_note, req.version, &current)
+    let out = OutsourceService::reject_quote(&mut tx, &state.snowflake, id, &req.review_note, req.version, &current)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))

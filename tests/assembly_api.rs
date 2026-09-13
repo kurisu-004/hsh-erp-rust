@@ -1022,7 +1022,7 @@ async fn update_assembly_cascades_shared_fields_to_children() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None,
         name: None,
-        applicant_name: Some("新申请人".into()),
+        applicant_name: Some(Some("新申请人".into())),
         customer_id: Some(Some(l2_b.to_string())), // 改客户 → 也应级联
         request_date: Some(Some(updated_request_date)),
         planned_delivery_date: Some(Some(updated_planned)),
@@ -1031,9 +1031,9 @@ async fn update_assembly_cascades_shared_fields_to_children() {
         quantity: None, // 本测试不缩放
         unit_price: None,
         total_price: None,
-        order_no: Some("UPDATED-ORDER".into()),
+        order_no: Some(Some("UPDATED-ORDER".into())),
         system_delivery_date: Some(Some(updated_sys_delivery)),
-        note: Some("更新后备注".into()),
+        note: Some(Some("更新后备注".into())),
         version: asm_version,
     };
     let mut tx = pool.begin().await.unwrap();

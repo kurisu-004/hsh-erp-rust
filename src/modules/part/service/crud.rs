@@ -747,6 +747,7 @@ impl PartService {
             NewPartFile {
                 id: new_file_id,
                 part_id,
+                owner_kind: "PART",
                 kind,
                 file_type,
                 object_key: &real_key,

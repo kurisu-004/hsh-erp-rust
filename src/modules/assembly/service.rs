@@ -6,12 +6,14 @@
 //! 所有 service 方法首项 `conn: &mut PgConnection`，末尾不 commit。
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use rust_decimal::Decimal;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock;
+use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::dto::{
     AssemblyChildOut, AssemblyCreateRequest, AssemblyCreateResult, AssemblyDetail,
@@ -24,7 +26,9 @@ use crate::modules::assembly::statemachine::{
 };
 use crate::modules::part::repo::part::ChildInheritFields;
 use crate::modules::part::repo::PartRepo;
+use crate::modules::part_file::repo::{hash_bytes, NewPartFile, PartFileRepo};
 use crate::shared::error::{code, AppError};
+use crate::shared::serial as serial_helper;
 
 // ---------- helpers ----------
 
@@ -63,26 +67,15 @@ async fn expand_customer_id_to_l2(
 
 /// 从 `t_serial_counter` 派发下一个序列号（`prefix` 是单字符业务 PK）。
 ///
-/// 格式：`{prefix}{counter:07}`（与 Python myERP service/serial_helper.py 对齐）。
-/// `counter >= 99_999_999` 视为耗尽，返回 `BIZ_PART_SERIAL_EXHAUSTED`。
+/// 2026-09-14 Phase 3（deferred #5）：迁移到 `crate::shared::serial::acquire`，
+/// 保留本 wrapper 为薄 alias（service 调用点直接用 `serial::acquire`）。
+#[inline]
+#[allow(dead_code)]
 async fn acquire_serial(
     conn: &mut PgConnection,
     prefix: char,
 ) -> Result<String, AppError> {
-    let row: Option<(i64,)> = sqlx::query_as(
-        "UPDATE t_serial_counter SET counter = counter + 1, updated_at = NOW() \
-         WHERE prefix = $1 RETURNING counter",
-    )
-    .bind(prefix.to_string())
-    .fetch_optional(&mut *conn)
-    .await?;
-    let counter = row.ok_or_else(|| {
-        AppError::biz(code::BIZ_SERIAL_PREFIX_UNKNOWN, format!("prefix '{}' 未注册", prefix))
-    })?;
-    if counter.0 >= 99_999_999 {
-        return Err(AppError::biz(code::BIZ_PART_SERIAL_EXHAUSTED, "序列号池耗尽"));
-    }
-    Ok(format!("{}{:07}", prefix, counter.0))
+    serial_helper::acquire(conn, prefix).await
 }
 
 /// 批量拉 customer 的 `(name, parent_id)`。返回 `HashMap<id, (name, parent_id)>`。
@@ -231,6 +224,9 @@ impl AssemblyService {
     }
 
     /// 详情：装配体行 + children（part 子件）+ files（占位空数组）。
+    ///
+    /// 2026-09-14 Phase 3（deferred #7）：children 携带 `current_batch_id`（子件当前激活批次 id）。
+    /// 取法：`t_part_batch WHERE part_id = $1 AND deleted_at IS NULL ORDER BY batch_no DESC LIMIT 1`。
     pub async fn get_assembly(
         conn: &mut PgConnection,
         assembly_id: i64,
@@ -245,29 +241,78 @@ impl AssemblyService {
         let children_t = PartRepo::list_by_assembly_id(&mut *conn, assembly_id, false)
             .await
             .map_err(AppError::from)?;
-        let children = children_t.into_iter().map(|p| AssemblyChildOut {
-            id: p.id,
-            serial_no: p.serial_no,
-            name: p.name,
-            drawing_no: Some(p.drawing_no),
-            status: p.status,
-            version: p.version,
-            quantity: p.quantity,
-            planned_delivery_date: Some(p.planned_delivery_date),
-            // §3.4 — 透传 6 个继承/级联字段（来自 t_part 行）
-            applicant_name: p.applicant_name,
-            request_date: p.request_date,
-            order_no: p.order_no,
-            system_delivery_date: p.system_delivery_date,
-            is_urgent: p.is_urgent,
-            note: p.note,
+        // deferred #7：批量查 current_batch_id（O(1) 查询）
+        let child_ids: Vec<i64> = children_t.iter().map(|p| p.id).collect();
+        let current_batch_ids = Self::fetch_current_batch_ids(conn, &child_ids).await?;
+        let children = children_t.into_iter().map(|p| {
+            let cb_id = current_batch_ids.get(&p.id).copied().flatten();
+            AssemblyChildOut {
+                id: p.id,
+                serial_no: p.serial_no,
+                name: p.name,
+                drawing_no: Some(p.drawing_no),
+                status: p.status,
+                version: p.version,
+                quantity: p.quantity,
+                planned_delivery_date: Some(p.planned_delivery_date),
+                applicant_name: p.applicant_name,
+                request_date: p.request_date,
+                order_no: p.order_no,
+                system_delivery_date: p.system_delivery_date,
+                is_urgent: p.is_urgent,
+                note: p.note,
+                current_batch_id: cb_id,
+            }
         }).collect();
+
+        // 上传的文件列表（ASSEMBLY_MASTER kind）
+        let files_t = PartFileRepo::list_by_owner(&mut *conn, "ASSEMBLY", asm.id)
+            .await
+            .map_err(AppError::from)?;
+        let files: Vec<crate::modules::assembly::dto::AssemblyFileRef> = files_t
+            .into_iter()
+            .filter(|f| f.kind == "ASSEMBLY_MASTER")
+            .map(|f| crate::modules::assembly::dto::AssemblyFileRef {
+                id: f.id,
+                original_filename: f.original_filename,
+                page_count: None,
+            })
+            .collect();
 
         Ok(AssemblyDetail {
             assembly: render_assembly_out(asm),
             children,
-            files: Vec::new(), // 本 pass 不挂 PDF（与分支一致）
+            files,
         })
+    }
+
+    /// 批量拉子件 current_batch_id（最近一条活跃 batch）。
+    /// 返回 `HashMap<part_id, Option<batch_id>>`；`None` 值表示子件无活跃 batch。
+    async fn fetch_current_batch_ids(
+        conn: &mut PgConnection,
+        part_ids: &[i64],
+    ) -> Result<HashMap<i64, Option<i64>>, sqlx::Error> {
+        let mut out: HashMap<i64, Option<i64>> = HashMap::new();
+        if part_ids.is_empty() {
+            return Ok(out);
+        }
+        // 用 DISTINCT ON 取每个 part_id 的最大 batch_no 行
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT DISTINCT ON (part_id) part_id, id \
+             FROM t_part_batch \
+             WHERE part_id = ANY($1) AND deleted_at IS NULL \
+             ORDER BY part_id, batch_no DESC",
+        )
+        .bind(part_ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        for (pid, bid) in rows {
+            out.insert(pid, Some(bid));
+        }
+        for pid in part_ids {
+            out.entry(*pid).or_insert(None);
+        }
+        Ok(out)
     }
 
     /// 创建：multipart PDF（可选） + 子件 + 序列号派发。
@@ -351,7 +396,7 @@ impl AssemblyService {
             let ch = p.chars().next().ok_or_else(|| {
                 AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 为空")
             })?;
-            (Some(acquire_serial(conn, ch).await?), Some(ch))
+            (Some(serial_helper::acquire(conn, ch).await?), Some(ch))
         };
 
         // 5. INSERT t_assembly
@@ -436,13 +481,13 @@ impl AssemblyService {
                     version: 0,
                     quantity: child_qty,
                     planned_delivery_date: child_planned,
-                    // §3.4 — 创建时子件继承父件共享字段（与 §3.1 INSERT 一致）
                     applicant_name: parent_applicant_name.to_string(),
                     request_date: parent_request_date,
                     order_no: req.order_no.clone(),
                     system_delivery_date: req.system_delivery_date,
                     is_urgent: parent_is_urgent,
                     note: req.note.clone(),
+                    current_batch_id: Some(initial_batch_id),
                 });
             }
         }
@@ -513,9 +558,9 @@ impl AssemblyService {
         let upd = AssemblyUpdate {
             drawing_no: req.drawing_no.as_deref(),
             name: req.name.as_deref(),
-            // dto `applicant_name: Option<String>` 区别不出"缺省" vs "null"；
-            // 与 brief 对齐：None=不动，Some(_) = 覆盖（不支持三态 NULL clear）
-            applicant_name: Some(req.applicant_name.as_deref()),
+            // 2026-09-14 Phase 3（deferred #2）：三态语义
+            // None = 不更新；Some(None) = 置 NULL；Some(Some(v)) = 覆盖
+            applicant_name: req.applicant_name.as_ref().map(|opt| opt.as_deref()),
             customer_id: customer_id_i64,
             request_date: req.request_date,
             planned_delivery_date: req.planned_delivery_date,
@@ -524,9 +569,9 @@ impl AssemblyService {
             quantity: req.quantity,
             unit_price: req.unit_price,
             total_price: req.total_price,
-            order_no: Some(req.order_no.as_deref()),
+            order_no: req.order_no.as_ref().map(|opt| opt.as_deref()),
             system_delivery_date: req.system_delivery_date,
-            note: Some(req.note.as_deref()),
+            note: req.note.as_ref().map(|opt| opt.as_deref()),
             updated_by: current.id,
         };
         let affected = AssemblyRepo::update_partial(&mut *conn, assembly_id, req.version, upd)
@@ -580,6 +625,9 @@ impl AssemblyService {
 
     /// 软删（Manager only）：带版本号乐观锁；终态记录由 repo `status NOT IN`
     /// 守卫拦截（当前 repo 仅按 `deleted_at IS NULL` 守卫）。
+    ///
+    /// 2026-09-14 Phase 3（deferred #3）：service 层 pre-check 子件是否挂送货单。
+    /// 若任一子件 `delivery_note_id IS NOT NULL` → 拒软删，返回 20307 BIZ_ASSEMBLY_HAS_SHIPMENT。
     pub async fn soft_delete_assembly(
         conn: &mut PgConnection,
         assembly_id: i64,
@@ -587,6 +635,21 @@ impl AssemblyService {
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
+        // deferred #3：装配体本身无 delivery_note_id 列，需查子件
+        let has_shipment: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1::bigint FROM t_part WHERE assembly_id = $1 \
+             AND delivery_note_id IS NOT NULL AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(assembly_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(AppError::from)?;
+        if has_shipment.is_some() {
+            return Err(AppError::biz(
+                code::BIZ_ASSEMBLY_HAS_SHIPMENT,
+                "assembly 子件已挂送货单，禁止 soft_delete",
+            ));
+        }
         let affected = AssemblyRepo::soft_delete(&mut *conn, assembly_id, expected_version, current.id)
             .await
             .map_err(AppError::from)?;
@@ -617,6 +680,125 @@ impl AssemblyService {
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
         Ok(render_assembly_out(asm))
+    }
+
+    /// `POST /assemblies/{id}/start`：PENDING → IN_PROCESS（状态机守卫）。
+    ///
+    /// 2026-09-14 Phase 3（deferred #4）：独立端点暴露装配体进入加工态。
+    /// 权限：Manager / Clerk；状态机 `PENDING → IN_PROCESS` 校验在 service 层。
+    pub async fn start_assembly(
+        conn: &mut PgConnection,
+        assembly_id: i64,
+        current: &CurrentUser,
+    ) -> Result<AssemblyOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
+        let from = AssemblyStatus::from_str(&asm.status).ok_or_else(|| {
+            AppError::biz(code::BIZ_INVALID_VALUE, format!("未知 assembly status: {}", asm.status))
+        })?;
+        if !from.can_transition_to(AssemblyStatus::IN_PROCESS) {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_TRANSITION,
+                format!("start 状态机禁止: {} → IN_PROCESS", from.as_str()),
+            ));
+        }
+        let affected = AssemblyRepo::update_status_if_not_terminal(
+            &mut *conn,
+            assembly_id,
+            asm.version,
+            AssemblyStatus::IN_PROCESS.as_str(),
+            current.id,
+        )
+        .await
+        .map_err(AppError::from)?;
+        if affected == 0 {
+            return Err(AppError::biz(code::VERSION_CONFLICT, "version 不匹配或已终态"));
+        }
+        let fresh = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "start 后查不到"))?;
+        Ok(render_assembly_out(fresh))
+    }
+
+    /// `POST /assemblies/{id}/files`：multipart PDF 上传（deferred #1）。
+    ///
+    /// 复用 part_file 域上传逻辑（SHA-256 CAS + COS PUT + t_part_file INSERT）。
+    /// owner_kind='ASSEMBLY'，kind='ASSEMBLY_MASTER'；多 PDF 用多 part。
+    ///
+    /// 返回 AssemblyFileRef 列表（不含下载 URL，前端用 `GET /part-files/{id}/url`）。
+    pub async fn upload_assembly_files(
+        conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
+        cos: Arc<dyn CosClient>,
+        assembly_id: i64,
+        files: Vec<(Vec<u8>, String, String)>, // (bytes, filename, content_type)
+        current: &CurrentUser,
+    ) -> Result<Vec<crate::modules::assembly::dto::AssemblyFileRef>, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 校验 assembly 存在
+        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
+
+        let mut out = Vec::with_capacity(files.len());
+        for (bytes, filename, content_type) in files {
+            // 扩展名校验（仅允许 PDF）
+            let ext = crate::modules::part_file::policy::ext_of(&filename)
+                .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "文件缺少扩展名"))?;
+            if ext != "pdf" {
+                return Err(AppError::biz(
+                    code::BIZ_PART_FILE_BAD_TYPE,
+                    format!("ASSEMBLY_MASTER 仅接受 PDF，扩展名 {ext:?} 不允许"),
+                ));
+            }
+            // SHA-256 → CAS
+            let sha = hash_bytes(&bytes);
+            if let Some(existing) = PartFileRepo::get_by_owner_kind_sha(&mut *conn, asm.id, "ASSEMBLY_MASTER", &sha).await? {
+                out.push(crate::modules::assembly::dto::AssemblyFileRef {
+                    id: existing.id,
+                    original_filename: existing.original_filename,
+                    page_count: None, // PDF 页数由 GET 时 lopdf 重算；这里省略
+                });
+                continue;
+            }
+            // 上传 COS
+            let safe_filename = sanitize_cos_filename(&filename);
+            let object_key = format!(
+                "assembly/{}/ASSEMBLY_MASTER/{}_{}",
+                asm.id,
+                &sha[..16],
+                safe_filename,
+            );
+            cos.put_object(&object_key, bytes.clone(), &content_type).await?;
+            // INSERT
+            let file_id = snowflake.next_id();
+            let nf = NewPartFile {
+                id: file_id,
+                part_id: asm.id,
+                owner_kind: "ASSEMBLY",
+                kind: "ASSEMBLY_MASTER",
+                file_type: "PDF",
+                object_key: &object_key,
+                original_filename: &filename,
+                file_size: bytes.len() as i64,
+                content_type: &content_type,
+                upload_status: "READY",
+                content_sha256: Some(&sha),
+                created_by: current.id,
+            };
+            PartFileRepo::create_part_file(&mut *conn, nf).await?;
+            out.push(crate::modules::assembly::dto::AssemblyFileRef {
+                id: file_id,
+                original_filename: filename,
+                page_count: None,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -735,5 +917,47 @@ impl AssemblyService {
             ));
         }
         Ok(SyncOutcome::Changed(assembly_id))
+    }
+}
+
+// ---------- helpers for upload-files (deferred #1) ----------
+
+/// 把 client-supplied filename 清洗为 COS object key 安全字符串：
+/// - 保留 ASCII 字母 / 数字 / `.` / `-` / `_`
+/// - 其它字符（含中文 / 空格）替换为 `_`
+/// - 长度上限 80 字符
+fn sanitize_cos_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.len() > 80 {
+        out.truncate(80);
+    }
+    if out.is_empty() {
+        out.push_str("file");
+    }
+    out
+}
+
+#[cfg(test)]
+mod upload_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_cos_filename_basic() {
+        assert_eq!(sanitize_cos_filename("master.pdf"), "master.pdf");
+        assert_eq!(sanitize_cos_filename("图纸 v2.pdf"), "___v2.pdf");
+    }
+
+    #[test]
+    fn sanitize_cos_filename_empty_fallback() {
+        assert_eq!(sanitize_cos_filename(""), "file");
+        // 中文 → "__"（替换为下划线后非空，保留而非 fallback）
+        assert_eq!(sanitize_cos_filename("中文"), "__");
     }
 }
