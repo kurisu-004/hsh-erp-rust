@@ -840,6 +840,38 @@ impl PartBatchRepo {
         .await
     }
 
+    /// DELIVERED 状态且 `placed_at` 早于 threshold 的批次 ID 列表。
+    ///
+    /// `task::auto_complete` 后台任务使用：阈值来自 `AutoCompleteConfig::threshold_days`。
+    /// 与 Python `PartBatchRepository.find_delivered_older_than` 语义接近，但
+    /// Phase 0 简化版本用 `placed_at` 列直接过滤（避免 Python 中需要
+    /// `t_part_event` 关联查 latest DELIVERED 事件的复杂子查询）；后续若
+    /// 需要严格按事件时间迁移，再升级到 event-derived 实现。
+    ///
+    /// 仅返回批次 `id` + `part_id` + `version`（避免拉整行 17 列）。
+    pub async fn find_delivered_older_than<'e, E: PgExecutor<'e>>(
+        executor: E,
+        threshold: chrono::NaiveDateTime,
+    ) -> Result<Vec<(i64, i64, i32)>, sqlx::Error> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id        AS "id!",
+                   part_id   AS "part_id!",
+                   version   AS "version!"
+            FROM t_part_batch
+            WHERE status     = 'DELIVERED'
+              AND deleted_at IS NULL
+              AND placed_at  IS NOT NULL
+              AND placed_at  < $1
+            ORDER BY placed_at ASC, id ASC
+            "#,
+            threshold,
+        )
+        .fetch_all(executor)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.id, r.part_id, r.version)).collect())
+    }
+
     /// 创建初始批次（part/assembly/batch 重构方案 §4.1 PR-B1）。
     ///
     /// 在 part 创建入口（`create_part` / `batch_create_parts` / `insert_child_for_assembly`）

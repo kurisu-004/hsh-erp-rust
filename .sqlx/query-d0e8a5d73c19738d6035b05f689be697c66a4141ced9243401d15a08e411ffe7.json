@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE t_serial_counter\n                SET counter    = $2,\n                    version    = version + 1,\n                    updated_at = now()\n                WHERE prefix = $1\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d0e8a5d73c19738d6035b05f689be697c66a4141ced9243401d15a08e411ffe7"
+}

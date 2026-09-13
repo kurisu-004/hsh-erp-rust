@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT 1 AS \"taken!\"\n            FROM t_part\n            WHERE serial_no = $1\n              AND deleted_at IS NULL\n              AND status NOT IN ('COMPLETED', 'CANCELLED')\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "taken!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5572c2290293684e8180f2ff4cfe5086ab5477c15032f1b3a92425f238e41211"
+}

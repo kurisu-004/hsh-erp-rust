@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT counter AS \"counter!\" FROM t_serial_counter WHERE prefix = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "counter!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_serial_counter",
+            "name": "counter"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "baa7b066f4d5315b160f4302fa254a224f8c31a062a647f77ea7da9d93ed332b"
+}
