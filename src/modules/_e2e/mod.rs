@@ -7,8 +7,10 @@
 //!   从而 axum 不会触发 JWT 校验，spec 端 `request.newContext({ baseURL })` 即可调。
 //! - **每个 handler 开头**调用 `e2e_guard(&state)?` 二次校验：
 //!   `state.config.enable_e2e_hooks == true` 才放行；否则 404（不泄漏端点存在性）。
-//! - **生产硬关**：main.rs 在 RUST_ENV=production / `--release` profile 下二次硬置
-//!   `enable_e2e_hooks = false`，即使 env 误配也走不到。这里只做软门控。
+//! - **生产硬关**：完全靠 env `E2E_HOOKS_ENABLED` 控制（单一控制点）。
+//!   docker compose / dev `cargo run` 走默认（true）；prod / staging 必须显式
+//!   `E2E_HOOKS_ENABLED=false`（ops 责任，不靠编译期二分）。
+//!   2026-09-14 修复 Bug #1：移除 main.rs 原 release profile 二次硬关。
 //!
 //! ## 路由表
 //! 全部挂在 `/api/v2/_e2e`（见 `modules::v2_router().nest("/_e2e", _e2e::router())`）：

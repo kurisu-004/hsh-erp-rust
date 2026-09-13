@@ -89,15 +89,11 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
 
     // 8. 组装 AppState
-    // 2026-09-14 新增：_e2e hook 在 release profile 下硬关，防止 prod 误启用
-    // （env 误配 E2E_HOOKS_ENABLED=true 时 release 构建仍然 404）
-    let config = if cfg!(debug_assertions) {
-        Arc::new(config)
-    } else {
-        let mut c = config;
-        c.enable_e2e_hooks = false;
-        Arc::new(c)
-    };
+    // 2026-09-14 修复 Bug #1：移除 release profile 硬关 _e2e 的逻辑。
+    // 单一控制点 = env `E2E_HOOKS_ENABLED`（缺省 true）。
+    // docker compose / dev `cargo run` 走默认值（true）→ 启用；prod / staging 必须
+    // 显式 `E2E_HOOKS_ENABLED=false`（ops 责任，不靠编译期二分）。
+    let config = Arc::new(config);
     let state = Arc::new(AppState::new(
         pool,
         config.clone(),
