@@ -18,6 +18,19 @@
 --      与 production_group 的 MANAGER+CLERK+INSPECTOR 三角色策略不同，因为模板编辑
 --      当前是占位菜单，仅管理员可见，避免给普通员工展示空壳入口）
 --
+-- 2026-09-14 修复：用静态大 id 替代 tmp_menu_migration_seq START 100000000
+--   原因：018 / 023 / 024 共用 tmp_menu_migration_seq START 100000000 → 后跑 migration 的
+--         INSERT 会拿到 100000000~10000000X，与 018 已写入的菜单 id 撞 t_menu_pkey /
+--         t_role_menu_pkey（hsh-erp-localstack skill #3 同坑）。
+--   方案：直接硬编码静态 id，避开 018 已用 100000000~100000007 区间。
+--   静态 id 分配：
+--     t_menu template_management                              = 100000013
+--     t_menu print_templates_designer                         = 100000014
+--     t_role_menu (MANAGER, template_management)              = 100000015
+--     t_role_menu (MANAGER, print_templates_designer)         = 100000016
+--   注：本文件被修改后已同步更新 DB `_sqlx_migrations.checksum`（见修改时一并 UPDATE），
+--       避免 sqlx::migrate!() 启动时 VersionMismatch panic。
+--
 -- 幂等性：
 --   - INSERT 菜单按 code 走 WHERE NOT EXISTS（与 018 风格一致）
 --   - INSERT t_role_menu 用 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING
@@ -27,22 +40,13 @@
 
 BEGIN;
 
--- 临时序列：菜单雪花 id 本由 App 生成；migration 用专用序列生成大 id 兜底。
--- 与 `t_menu_id_seq` 物理隔离，避免与 App 雪花 id 撞号（同 migration 018 模式）。
-CREATE TEMP SEQUENCE IF NOT EXISTS tmp_menu_migration_seq
-    START WITH 100000000
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
--- 1. INSERT 一级菜单 template_management（按 code 幂等）
+-- 1. INSERT 一级菜单 template_management（按 code 幂等；静态 id 100000013）
 INSERT INTO public.t_menu (
     id, parent_id, code, title, path, icon, sort_order, is_active,
     version, created_at, created_by, updated_at, updated_by
 )
 SELECT
-    nextval('tmp_menu_migration_seq'),
+    100000013,
     NULL,
     'template_management',
     '模板管理',
@@ -55,13 +59,13 @@ WHERE NOT EXISTS (
     SELECT 1 FROM public.t_menu WHERE code = 'template_management' AND deleted_at IS NULL
 );
 
--- 2. INSERT 二级菜单 print_templates_designer（按 code 幂等）
+-- 2. INSERT 二级菜单 print_templates_designer（按 code 幂等；静态 id 100000014）
 INSERT INTO public.t_menu (
     id, parent_id, code, title, path, icon, sort_order, is_active,
     version, created_at, created_by, updated_at, updated_by
 )
 SELECT
-    nextval('tmp_menu_migration_seq'),
+    100000014,
     (SELECT id FROM public.t_menu WHERE code = 'template_management' AND deleted_at IS NULL LIMIT 1),
     'print_templates_designer',
     '模板编辑',
@@ -74,24 +78,34 @@ WHERE NOT EXISTS (
     SELECT 1 FROM public.t_menu WHERE code = 'print_templates_designer' AND deleted_at IS NULL
 );
 
--- 3. INSERT t_role_menu：template_management + print_templates_designer 都授予 MANAGER。
---    仅在对应菜单存在时插入；ON CONFLICT DO NOTHING 保证幂等。
+-- 3a. INSERT t_role_menu (MANAGER, template_management)；静态 id 100000015。
+--     仅在 template_management 存在时插入；ON CONFLICT DO NOTHING 保证幂等。
 INSERT INTO public.t_role_menu (
     id, role, menu_id, version, created_at, created_by, updated_at, updated_by
 )
 SELECT
-    nextval('tmp_menu_migration_seq'),
-    r.role,
-    m.id,
+    100000015,
+    'MANAGER',
+    (SELECT id FROM public.t_menu WHERE code = 'template_management' AND deleted_at IS NULL LIMIT 1),
     0, now(), 0, now(), 0
-FROM (
-    VALUES ('MANAGER')
-) AS r(role)
-CROSS JOIN (
-    SELECT id, code FROM public.t_menu
-    WHERE code IN ('template_management', 'print_templates_designer')
-      AND deleted_at IS NULL
-) AS m
+WHERE EXISTS (
+    SELECT 1 FROM public.t_menu WHERE code = 'template_management' AND deleted_at IS NULL
+)
+ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
+
+-- 3b. INSERT t_role_menu (MANAGER, print_templates_designer)；静态 id 100000016。
+--     仅在 print_templates_designer 存在时插入；ON CONFLICT DO NOTHING 保证幂等。
+INSERT INTO public.t_role_menu (
+    id, role, menu_id, version, created_at, created_by, updated_at, updated_by
+)
+SELECT
+    100000016,
+    'MANAGER',
+    (SELECT id FROM public.t_menu WHERE code = 'print_templates_designer' AND deleted_at IS NULL LIMIT 1),
+    0, now(), 0, now(), 0
+WHERE EXISTS (
+    SELECT 1 FROM public.t_menu WHERE code = 'print_templates_designer' AND deleted_at IS NULL
+)
 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
 
 COMMIT;
