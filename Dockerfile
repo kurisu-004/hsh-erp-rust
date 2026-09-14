@@ -10,9 +10,9 @@ ARG ALPINE_VERSION=3.22
 # ---------- 阶段 1：构建 ----------
 FROM rust:${RUST_VERSION}-alpine AS builder
 
-# Cargo.lock 里 openssl/native-tls/rustls/ring/aws-lc 全部 0 命中，
-# 只装 musl-dev。
-RUN apk add --no-cache musl-dev
+# 2026-09-12 修复：cos-rust-sdk 依赖 reqwest 默认特性 → hyper-tls → native-tls → openssl-sys，
+# musl 静态编译需要 openssl-dev + openssl-libs-static（pkgconfig 也用于链接探测）。
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconfig
 
 ENV SQLX_OFFLINE=true \
     CARGO_TERM_COLOR=never \
