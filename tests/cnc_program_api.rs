@@ -285,3 +285,138 @@ async fn list_pairs_for_part() {
         assert!(item.setup_sheet_id > 0);
     }
 }
+
+// ===== 2026-09-15 takeover-fill：alias 端点测试 =====
+
+#[tokio::test]
+async fn alias_download_url_returns_part_file_with_url() {
+    let (_guard, pool) = setup().await;
+    let part_id = insert_part(&pool).await;
+    let current = test_current_user(vec![Role::Manager]);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let cos = Arc::new(NoopCos);
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = CncProgramService::upload_cnc_pair(
+        &mut tx,
+        &snowflake,
+        cos.clone(),
+        part_id,
+        b"O0011\n".to_vec(),
+        "O0011.tap",
+        "application/octet-stream",
+        b"%PDF-1.5\nsetup\n%%EOF".to_vec(),
+        "setup.pdf",
+        "application/pdf",
+        &current,
+    )
+    .await
+    .expect("upload pair ok");
+    tx.commit().await.unwrap();
+
+    let g_id = out.g_code.id;
+    let s_id = out.setup_sheet.id;
+
+    // /download-url alias 应等于 part-files/{id}/url
+    let mut tx = pool.begin().await.unwrap();
+    let dl_url = CncProgramService::get_download_url(&mut tx, cos.clone(), g_id, &current)
+        .await
+        .expect("alias download-url ok");
+    tx.commit().await.unwrap();
+    assert_eq!(dl_url.id, g_id.to_string());
+    assert_eq!(dl_url.kind, "G_CODE");
+
+    let mut tx = pool.begin().await.unwrap();
+    let dl_url_s = CncProgramService::get_download_url(&mut tx, cos.clone(), s_id, &current)
+        .await
+        .expect("alias download-url setup ok");
+    tx.commit().await.unwrap();
+    assert_eq!(dl_url_s.id, s_id.to_string());
+    assert_eq!(dl_url_s.kind, "SETUP_SHEET");
+}
+
+#[tokio::test]
+async fn alias_content_returns_bytes() {
+    let (_guard, pool) = setup().await;
+    let part_id = insert_part(&pool).await;
+    let current = test_current_user(vec![Role::Manager]);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let cos = Arc::new(NoopCos);
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = CncProgramService::upload_cnc_pair(
+        &mut tx,
+        &snowflake,
+        cos.clone(),
+        part_id,
+        b"G0 X0\n".to_vec(),
+        "O0001.tap",
+        "application/octet-stream",
+        b"%PDF-1.5\nsetup\n%%EOF".to_vec(),
+        "setup.pdf",
+        "application/pdf",
+        &current,
+    )
+    .await
+    .expect("upload pair ok");
+    tx.commit().await.unwrap();
+
+    // alias content
+    let mut tx = pool.begin().await.unwrap();
+    let content = CncProgramService::get_content(&mut tx, cos, out.g_code.id, &current)
+        .await
+        .expect("alias content ok");
+    drop(tx);
+    // NoopCos.get_object 返空
+    assert!(content.bytes.is_empty());
+    assert!(content.content_type.is_some());
+}
+
+#[tokio::test]
+async fn alias_delete_soft_deletes_file() {
+    let (_guard, pool) = setup().await;
+    let part_id = insert_part(&pool).await;
+    let current = test_current_user(vec![Role::Manager]);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let cos = Arc::new(NoopCos);
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = CncProgramService::upload_cnc_pair(
+        &mut tx,
+        &snowflake,
+        cos.clone(),
+        part_id,
+        b"G0 X0\n".to_vec(),
+        "O0001.tap",
+        "application/octet-stream",
+        b"%PDF-1.5\nsetup\n%%EOF".to_vec(),
+        "setup.pdf",
+        "application/pdf",
+        &current,
+    )
+    .await
+    .expect("upload pair ok");
+    tx.commit().await.unwrap();
+    let version = sqlx::query_scalar::<_, i32>(
+        "SELECT version FROM t_part_file WHERE id = $1",
+    )
+    .bind(out.g_code.id)
+    .fetch_one(&pool)
+    .await
+    .expect("get version");
+
+    let mut tx = pool.begin().await.unwrap();
+    CncProgramService::delete(&mut tx, cos, out.g_code.id, version, &current)
+        .await
+        .expect("alias delete ok");
+    tx.commit().await.unwrap();
+
+    // 查应 not found
+    let mut tx = pool.begin().await.unwrap();
+    let row =
+        hsh_erp_rust::modules::part_file::repo::PartFileRepo::get_by_id(&mut *tx, out.g_code.id, false)
+            .await
+            .unwrap();
+    drop(tx);
+    assert!(row.is_none(), "G_CODE 软删后应查不到");
+}

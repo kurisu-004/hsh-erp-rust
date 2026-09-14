@@ -405,3 +405,135 @@ async fn get_url_returns_presigned_url() {
     assert!(detail.download_url.contains(&out.object_key));
     assert_eq!(detail.url_expires_in_seconds, 3600);
 }
+
+// ===== 2026-09-15 takeover-fill：content / delete 端点测试 =====
+#[tokio::test]
+async fn content_happy_path() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-Content", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-Content", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let current = test_current_user_with_roles(vec![Role::Manager]);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let cos = Arc::new(NoopCos);
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartFileService::upload_file_for_owner(
+        &mut tx,
+        &snowflake,
+        cos.clone(),
+        "PART",
+        part_id,
+        "DRAWING",
+        "content.pdf",
+        "application/pdf",
+        b"%PDF-1.5\nhello\n%%EOF".to_vec(),
+        &current,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // content 端点 — NoopCos.get_object 返空字节，但应正常返回
+    let mut tx = pool.begin().await.unwrap();
+    let content = PartFileService::get_file_content(&mut tx, cos, out.id, &current)
+        .await
+        .expect("content ok");
+    drop(tx);
+    assert!(content.content_type.is_some());
+    // NoopCos.get_object 返回空
+    assert!(content.bytes.is_empty());
+}
+
+#[tokio::test]
+async fn soft_delete_happy_path() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-Del", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-Del", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let current = test_current_user_with_roles(vec![Role::Manager]);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let cos = Arc::new(NoopCos);
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartFileService::upload_file_for_owner(
+        &mut tx,
+        &snowflake,
+        cos.clone(),
+        "PART",
+        part_id,
+        "DRAWING",
+        "del.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &current,
+    )
+    .await
+    .unwrap();
+    let version = out.version;
+    tx.commit().await.unwrap();
+
+    // delete by Manager（kind=DRAWING → M+C 通行）
+    let mut tx = pool.begin().await.unwrap();
+    let object_key = PartFileService::soft_delete_file(&mut tx, cos.clone(), out.id, version, &current)
+        .await
+        .expect("delete ok");
+    tx.commit().await.unwrap();
+    // 2026-09-15 review A2：service 应返回 cos object_key 供 handler commit 后清理
+    assert!(
+        !object_key.is_empty(),
+        "soft_delete_file 应返回 cos object_key"
+    );
+
+    // 再次查应 not found（include_deleted=false）
+    let mut tx = pool.begin().await.unwrap();
+    let row = hsh_erp_rust::modules::part_file::repo::PartFileRepo::get_by_id(&mut *tx, out.id, false)
+        .await
+        .unwrap();
+    drop(tx);
+    assert!(row.is_none(), "软删后应查不到");
+}
+
+#[tokio::test]
+async fn soft_delete_version_conflict() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-Conf", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-Conf", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let current = test_current_user_with_roles(vec![Role::Manager]);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let cos = Arc::new(NoopCos);
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartFileService::upload_file_for_owner(
+        &mut tx,
+        &snowflake,
+        cos.clone(),
+        "PART",
+        part_id,
+        "DRAWING",
+        "conf.pdf",
+        "application/pdf",
+        b"%PDF-1.5\n".to_vec(),
+        &current,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // 故意 version+999 → 冲突
+    let mut tx = pool.begin().await.unwrap();
+    let err = PartFileService::soft_delete_file(&mut tx, cos, out.id, out.version + 999, &current)
+        .await
+        .expect_err("version 冲突应抛错");
+    drop(tx);
+    match err {
+        hsh_erp_rust::shared::error::AppError::Biz { code, .. } => {
+            assert_eq!(code, 40901, "VERSION_CONFLICT");
+        }
+        other => panic!("期望 AppError::Biz(40901)，got {other:?}"),
+    }
+}

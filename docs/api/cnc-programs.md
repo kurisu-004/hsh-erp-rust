@@ -14,6 +14,17 @@
 |---|---|---|---|
 | POST | `/api/v2/cnc-programs/pairs` | Manager / CncProgrammer | 配对上传（multipart：`data` JSON + `g_code` 二进制 + `setup_sheet` 二进制） |
 | GET | `/api/v2/cnc-programs/parts/{part_id}` | Manager / Clerk / CncProgrammer / Inspector | 列出 part 全部 CNC 配对 |
+| GET | `/api/v2/cnc-programs/{file_id}/download-url` | Manager / Clerk / CncProgrammer / Inspector | alias → `/api/v2/part-files/{id}/url` |
+| GET | `/api/v2/cnc-programs/{file_id}/content` | Manager / Clerk / CncProgrammer / Inspector | alias → `/api/v2/part-files/{id}/content` |
+| POST | `/api/v2/cnc-programs/{file_id}/delete` | Manager / CncProgrammer（kind=G_CODE → M+CNC） | alias → `/api/v2/part-files/{id}/delete` |
+
+### `cnc-programs/{file_id}/*` alias 端点
+
+直接复用 `PartFileService::get_file_with_url` / `get_file_content` / `soft_delete_file`，**不重复业务逻辑**。
+
+权限矩阵与对应 part-files 端点对齐。
+
+错误码与对应 part-files 端点对齐（21101 / 21102 / 40901 等）。
 
 ---
 

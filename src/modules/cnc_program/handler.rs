@@ -1,10 +1,13 @@
-//! cnc_program 域 HTTP handler（2026-09-14 Phase 3）
+//! cnc_program 域 HTTP handler（2026-09-14 Phase 3 + 2026-09-15 takeover-fill）
 //!
 //! 对应 Python myERP/api/v1/cnc_program.py。
 //!
 //! ## 端点（挂在 `/api/v2/cnc-programs`，由 `mod.rs::router()` 桥接）
-//! - `POST /pairs`             —— 配对上传（multipart：`data` JSON + `g_code` + `setup_sheet` 二进制）
-//! - `GET  /parts/{part_id}`   —— 列出 part 全部 CNC 配对
+//! - `POST /pairs`                          —— 配对上传（multipart：`data` JSON + `g_code` + `setup_sheet` 二进制）
+//! - `GET  /parts/{part_id}`                —— 列出 part 全部 CNC 配对
+//! - `GET  /{file_id}/download-url`         —— alias → `/part-files/{file_id}/url`
+//! - `GET  /{file_id}/content`              —— alias → `/part-files/{file_id}/content`
+//! - `POST /{file_id}/delete`               —— alias → `/part-files/{file_id}/delete`
 //!
 //! ## 约束
 //! - 事务边界在 handler
@@ -15,8 +18,10 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{Multipart, Path, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
@@ -25,6 +30,8 @@ use serde::Deserialize;
 use crate::auth::rbac::CurrentUser;
 use crate::modules::cnc_program::dto::{CncPairListOut, CncPairOut};
 use crate::modules::cnc_program::service::CncProgramService;
+use crate::modules::part_file::dto::PartFileWithUrlOut;
+use crate::modules::part_file::handler::DeletePartFileRequest;
 use crate::shared::error::{code, AppError};
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -134,8 +141,72 @@ pub async fn list_pairs_for_part(
     Ok(Json(R::ok(out)))
 }
 
+/// `GET /api/v2/cnc-programs/{file_id}/download-url` —— alias → part-files/{id}/url
+pub async fn get_cnc_program_download_url(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(file_id): Path<i64>,
+) -> Result<Json<R<PartFileWithUrlOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = CncProgramService::get_download_url(&mut tx, state.cos.clone(), file_id, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `GET /api/v2/cnc-programs/{file_id}/content` —— alias → part-files/{id}/content
+pub async fn get_cnc_program_content(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(file_id): Path<i64>,
+) -> Result<Response, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = CncProgramService::get_content(&mut tx, state.cos.clone(), file_id, &current).await?;
+    tx.commit().await?;
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            out.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+        )
+        .header(header::CONTENT_LENGTH, out.bytes.len())
+        .body(Body::from(out.bytes))
+        .map_err(|e| AppError::internal(format!("response build: {e}")))?;
+    Ok(resp)
+}
+
+/// `POST /api/v2/cnc-programs/{file_id}/delete` —— alias → part-files/{id}/delete
+///
+/// 2026-09-15 review A2 修：commit 在前，spawn COS 在后（与 part_file handler 同 pattern）。
+pub async fn delete_cnc_program(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(file_id): Path<i64>,
+    Json(req): Json<DeletePartFileRequest>,
+) -> Result<Json<R<()>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let object_key =
+        CncProgramService::delete(&mut tx, state.cos.clone(), file_id, req.version, &current)
+            .await?;
+    tx.commit().await?;
+    let cos = state.cos.clone();
+    tokio::spawn(async move {
+        if let Err(e) = cos.delete_object(&object_key).await {
+            tracing::warn!(
+                key = %object_key,
+                error = %e,
+                "cnc_program COS 异步清理失败（已软删，不影响 API 返回）"
+            );
+        }
+    });
+    Ok(Json(R::ok_empty()))
+}
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/pairs", post(upload_cnc_pair))
+        // 静态段在 {file_id} 之前，避免被 catch-all 截胡
         .route("/parts/{part_id}", get(list_pairs_for_part))
+        .route("/{file_id}/download-url", get(get_cnc_program_download_url))
+        .route("/{file_id}/content", get(get_cnc_program_content))
+        .route("/{file_id}/delete", post(delete_cnc_program))
 }
