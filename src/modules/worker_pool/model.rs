@@ -30,11 +30,12 @@ pub struct TakenItem {
 /// `heldToCard` 字段降级（part_name/customer_name/applicant_name/location/shelf_code
 /// 等核心展示字段为空）的问题。
 ///
-/// 与 `TakenItem` 的差异：多 8 个字段（name / customer_name / parent_customer_name /
-/// applicant_name / location / shelf_code / note / system_delivery_date 重写）。
-/// `drawing_no` 字段不变。
+/// 与 `TakenItem` 的差异：多 7 个新字段（name / customer_name /
+/// parent_customer_name / applicant_name / location / shelf_code / note）。
+/// `system_delivery_date` 在 `TakenItem` 已存在（语义重写：来自 t_part 而非业务字段），
+/// 不计为新字段。`drawing_no` 字段不变。
 ///
-/// JOIN 拓扑（见 `part_batch/repo.rs::list_held_by_worker_with_part`）：
+/// JOIN 拓扑（见 `worker_pool/repo.rs::list_held_by_worker_with_part`）：
 /// - `t_part_batch pb`         主表
 /// - `t_part p`                INNER JOIN（pb.part_id）
 /// - `t_customer c2`           LEFT JOIN（p.customer_id）—— L2 叶子客户
@@ -64,9 +65,8 @@ pub struct HeldBatchItem {
     pub customer_name: Option<String>,
     /// L1 客户名（一级集团）
     pub parent_customer_name: Option<String>,
-    /// 申请人字符串（来自 t_part.applicant_name 关联到 t_applicant.name，
-    /// applicant 软删时回退到 t_part.applicant_name 字符串本身 → 不可空；
-    /// 当前实现因 LEFT JOIN 可能为 None）
+    /// 申请人字符串（来自 t_part.applicant_name LEFT JOIN t_applicant.name，
+    /// applicant 软删 / 不存在时为 None）
     pub applicant_name: Option<String>,
     /// 当前 holder 位置 enum（"WORKER"）
     pub location: String,
