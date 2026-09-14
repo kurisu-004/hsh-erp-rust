@@ -1,0 +1,220 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                pb.id                  AS \"batch_id!\",\n                pb.part_id             AS \"part_id!\",\n                pb.batch_no            AS \"batch_no!\",\n                pb.quantity            AS \"quantity!\",\n                pb.location            AS \"pb_location!\",\n                pb.version             AS \"batch_version!\",\n                p.serial_no            AS \"p_serial_no?\",\n                p.drawing_no           AS \"p_drawing_no!\",\n                p.name                 AS \"p_name!\",\n                p.system_delivery_date AS \"p_system_delivery_date?\",\n                p.planned_delivery_date AS \"p_planned_delivery_date!\",\n                p.is_urgent            AS \"p_is_urgent!\",\n                p.note                 AS \"p_note?\",\n                c2.name                AS \"customer_name?\",\n                c1.name                AS \"parent_customer_name?\",\n                a.name                 AS \"applicant_name?\",\n                s.code                 AS \"shelf_code?\"\n            FROM t_part_batch pb\n            JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL\n            LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL\n            LEFT JOIN t_customer c1 ON c1.id = c2.parent_id AND c1.deleted_at IS NULL\n            LEFT JOIN t_applicant a ON a.name = p.applicant_name AND a.deleted_at IS NULL\n            LEFT JOIN t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL\n            WHERE pb.status = 'IN_PROCESS'\n              AND pb.location = 'WORKER'\n              AND pb.current_holder_id = $1\n              AND pb.deleted_at IS NULL\n            ORDER BY pb.id ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "part_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "part_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "batch_no!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "batch_no"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "quantity!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "pb_location!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "batch_version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "p_serial_no?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "serial_no"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "p_drawing_no!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "drawing_no"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "p_name!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "p_system_delivery_date?",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "system_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "p_planned_delivery_date!",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "planned_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "p_is_urgent!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "is_urgent"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "p_note?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "customer_name?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_customer",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "parent_customer_name?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_customer",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "applicant_name?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_applicant",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "shelf_code?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_shelf",
+            "name": "code"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "250ae79e08c74acac315748c15e99a9fda689d38b9c04be1263197cfb9e99fbb"
+}

@@ -238,10 +238,13 @@ impl WorkerPoolService {
             });
         }
 
-        // 2026-09-14 follow-up-ux 新增：worker 当前持有的完整 batch 列表
-        // （JOIN t_part 转 TakenItem）。命中 ix_t_part_batch_holder_location。
+        // 2026-09-14 follow-up-ux 新增 → follow-up-round2 升级为 17 字段 HeldBatchItem：
+        // worker 当前持有的完整 batch 列表（JOIN 6 表：t_part_batch + t_part +
+        // t_customer L1+L2 + t_applicant + t_shelf）。命中 ix_t_part_batch_holder_location。
+        // 2026-09-14 review 第 1 轮下沉：本查询已从 part_batch/repo.rs 迁到
+        // worker_pool/repo.rs（owner 同域 + part_batch 行数 ≤1000）。
         let held_batches =
-            PartBatchRepo::list_held_by_worker_with_part(&mut *conn, worker_id).await?;
+            WorkerPoolRepo::list_held_by_worker_with_part(&mut *conn, worker_id).await?;
 
         Ok(WorkerPoolState {
             worker_id,

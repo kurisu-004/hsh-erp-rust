@@ -10,12 +10,12 @@
 //!   优先级取一批；(3) UPDATE t_part_batch 与 t_part 的 holder/location/version。
 //!   0 行 → 池空或达上限，返回 Ok(None)，由 service 决定是否抛容量/空池业务错。
 
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgExecutor};
 
 use crate::shared::error::AppError;
 
 use super::dto::PoolBatchItem;
-use super::model::TakenItem;
+use super::model::{HeldBatchItem, TakenItem};
 
 #[derive(Debug, sqlx::FromRow)]
 struct TakenRow {
@@ -347,6 +347,102 @@ impl WorkerPoolRepo {
                     placed_at: r.placed_at,
                     version: r.batch_version,
                 }
+            })
+            .collect())
+    }
+
+    /// 工人当前持有批次的「JOIN t_part + 客户/申请人/货架」完整 DTO（worker-pool state 端点用）。
+    ///
+    /// 2026-09-14 follow-up-ux 新增 → follow-up-round2 升级为 17 字段 `HeldBatchItem`：
+    /// 解决上轮 `heldToCard` 字段降级（part_name/customer_name/applicant_name/
+    /// location/shelf_code 等核心展示字段为空）。`WorkerPoolState` 一次性返回
+    /// worker 当前持有的全部 batch，含全部展示字段，避免前端按 worker 轮询 K 次
+    /// 单 batch 详情接口的 N+1。
+    ///
+    /// 2026-09-14 review 第 1 轮下沉：本函数原本位于 `part_batch/repo.rs`，
+    /// 但它只被 worker_pool 域消费（service 的 `compute_state` 调用一次），
+    /// 把 worker_pool 专用查询放到 part_batch 域违反了「owner 同域」原则，
+    /// 同时导致 part_batch/repo.rs 行数越过 conventions.md 1000 行上限。
+    /// 下沉到本域 repo，与 `take_one_from_pool` / `take_specific_from_pool` 同级。
+    ///
+    /// JOIN 拓扑（与 `list_candidates_by_process_all_shelves` 的 5 表 JOIN 同形；
+    /// t_applicant 用 `name = p.applicant_name` 因 t_part 无 applicant_id FK 字段）：
+    /// - `t_part_batch pb`            主表
+    /// - `t_part p`                   INNER JOIN（pb.part_id）
+    /// - `t_customer c2`              LEFT JOIN（p.customer_id）—— L2 叶子客户
+    /// - `t_customer c1`              LEFT JOIN（c2.parent_id）—— L1 一级集团
+    /// - `t_applicant a`              LEFT JOIN（a.name = p.applicant_name）—— 申请人
+    /// - `t_shelf s`                  LEFT JOIN（s.id = pb.current_holder_id）
+    ///   WORKER 持有时 current_holder_id = worker_id 非 shelf_id，故 shelf_code
+    ///   通常为 None
+    ///
+    /// 排序：按 `t_part_batch.id ASC`（与 `list_held_by_worker` 保持一致；前端按
+    /// batch_id 稳定展示）。
+    ///
+    /// 索引命中：`ix_t_part_batch_holder_location` 覆盖 `(current_holder_id,
+    /// location)` 谓词；JOIN t_part 走主键 `t_part.id`；JOIN t_customer / t_applicant
+    /// 走各自的 `id` / `name` 索引。
+    pub async fn list_held_by_worker_with_part<'e, E: PgExecutor<'e>>(
+        executor: E,
+        worker_id: i64,
+    ) -> Result<Vec<HeldBatchItem>, sqlx::Error> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                pb.id                  AS "batch_id!",
+                pb.part_id             AS "part_id!",
+                pb.batch_no            AS "batch_no!",
+                pb.quantity            AS "quantity!",
+                pb.location            AS "pb_location!",
+                pb.version             AS "batch_version!",
+                p.serial_no            AS "p_serial_no?",
+                p.drawing_no           AS "p_drawing_no!",
+                p.name                 AS "p_name!",
+                p.system_delivery_date AS "p_system_delivery_date?",
+                p.planned_delivery_date AS "p_planned_delivery_date!",
+                p.is_urgent            AS "p_is_urgent!",
+                p.note                 AS "p_note?",
+                c2.name                AS "customer_name?",
+                c1.name                AS "parent_customer_name?",
+                a.name                 AS "applicant_name?",
+                s.code                 AS "shelf_code?"
+            FROM t_part_batch pb
+            JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL
+            LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL
+            LEFT JOIN t_customer c1 ON c1.id = c2.parent_id AND c1.deleted_at IS NULL
+            LEFT JOIN t_applicant a ON a.name = p.applicant_name AND a.deleted_at IS NULL
+            LEFT JOIN t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL
+            WHERE pb.status = 'IN_PROCESS'
+              AND pb.location = 'WORKER'
+              AND pb.current_holder_id = $1
+              AND pb.deleted_at IS NULL
+            ORDER BY pb.id ASC
+            "#,
+            worker_id,
+        )
+        .fetch_all(executor)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| HeldBatchItem {
+                batch_id: r.batch_id,
+                part_id: r.part_id,
+                batch_no: r.batch_no,
+                quantity: r.quantity,
+                serial_no: r.p_serial_no,
+                drawing_no: r.p_drawing_no,
+                name: r.p_name,
+                system_delivery_date: r.p_system_delivery_date,
+                planned_delivery_date: Some(r.p_planned_delivery_date),
+                is_urgent: r.p_is_urgent,
+                customer_name: r.customer_name,
+                parent_customer_name: r.parent_customer_name,
+                applicant_name: r.applicant_name,
+                location: r.pb_location,
+                shelf_code: r.shelf_code,
+                note: r.p_note,
+                version: r.batch_version,
             })
             .collect())
     }
