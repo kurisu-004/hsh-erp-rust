@@ -163,6 +163,98 @@ impl WorkerPoolRepo {
         }))
     }
 
+    /// admin 端点「assign 单 batch」专用：从 `(shelf_id, batch_id)` 精确定位
+    /// 候选池中的某一批，单 SQL 原子完成 holder 切换。
+    ///
+    /// 2026-09-14 follow-up-ux 新增：与 `take_one_from_pool` 的语义差异——
+    /// 不按优先级排序候选，只取指定 `(batch_id, current_holder_id = shelf_id,
+    /// status = IN_PROCESS, location = PRODUCTION_SHELF)` 的那一批；用于前端
+    /// 单 batch 拖拽 UI（assign 端点）。
+    ///
+    /// **不**做 `held < max_held_batches` 守卫：该守卫下沉到 service
+    /// (`assign_batch_to_worker`)，service 已在事务内先取 `current_held` 并
+    /// 与 `max_held_batches` 比较，超额 → `20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED`。
+    /// 这样 SQL 里的 held/max 守卫只剩 candidate CTE 里 `current_holder_id
+    /// IS NOT NULL` 的隐式约束（candidate CTE 取不到 = batch 不在候选池）。
+    ///
+    /// 参数：
+    /// - `worker_id`：目标 worker（写入 `t_part_batch.current_holder_id` + `t_part.derived`）
+    /// - `shelf_id`：候选池货架（限定 `current_holder_id` 必须等于）
+    /// - `batch_id`：唯一指定的批次
+    /// - `operator_user_id`：审计字段 `updated_by`
+    ///
+    /// 返回：
+    /// - `Ok(None)`：批次不在候选池（status ≠ IN_PROCESS / location ≠
+    ///   PRODUCTION_SHELF / `current_holder_id` ≠ shelf_id / 已软删）
+    /// - `Ok(Some(taken))`：抢到（含 part 元数据）
+    /// - `Err(BIZ_WORKER_HOLD_LIMIT_EXCEEDED)`：由 service 守卫触发，本 repo 不抛
+    pub async fn take_specific_from_pool(
+        conn: &mut PgConnection,
+        worker_id: i64,
+        shelf_id: i64,
+        batch_id: i64,
+        operator_user_id: i64,
+    ) -> Result<Option<TakenItem>, AppError> {
+        let row: Option<TakenRow> = sqlx::query_as!(
+            TakenRow,
+            r#"
+            WITH
+            candidate AS (
+                SELECT pb.id, pb.version, pb.part_id
+                FROM t_part_batch pb
+                JOIN t_part p ON p.id = pb.part_id
+                WHERE pb.id = $3
+                  AND pb.status = 'IN_PROCESS'
+                  AND pb.location = 'PRODUCTION_SHELF'
+                  AND pb.current_holder_id = $2
+                  AND pb.deleted_at IS NULL
+                  AND p.deleted_at IS NULL
+                FOR UPDATE OF pb
+            ),
+            upd_batch AS (
+                UPDATE t_part_batch pb
+                SET current_holder_id = $1, location = 'WORKER',
+                    version = pb.version + 1,
+                    updated_at = NOW(), updated_by = $4
+                FROM candidate
+                WHERE pb.id = candidate.id
+                  AND pb.version = candidate.version
+                RETURNING pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.version
+            ),
+            sel_part AS (
+                SELECT p.id, p.serial_no, p.drawing_no,
+                       p.system_delivery_date, p.planned_delivery_date, p.is_urgent
+                FROM t_part p
+                JOIN upd_batch ub ON ub.part_id = p.id
+            )
+            SELECT ub.id AS batch_id, ub.part_id, ub.batch_no, ub.quantity,
+                   sp.serial_no, sp.drawing_no,
+                   sp.system_delivery_date, sp.planned_delivery_date,
+                   sp.is_urgent, ub.version
+            FROM upd_batch ub JOIN sel_part sp ON sp.id = ub.part_id
+            "#,
+            worker_id,
+            shelf_id,
+            batch_id,
+            operator_user_id,
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(AppError::from)?;
+        Ok(row.map(|r| TakenItem {
+            batch_id: r.batch_id,
+            part_id: r.part_id,
+            batch_no: r.batch_no,
+            quantity: r.quantity,
+            serial_no: r.serial_no,
+            drawing_no: r.drawing_no,
+            system_delivery_date: r.system_delivery_date,
+            planned_delivery_date: r.planned_delivery_date,
+            is_urgent: r.is_urgent,
+            version: r.version,
+        }))
+    }
+
     /// 列出某工序在所有生产货架上的候选批次（status=IN_PROCESS + location=PRODUCTION_SHELF
     /// + next_process_id=process_id）。
     ///

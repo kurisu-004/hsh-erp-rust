@@ -44,4 +44,9 @@ pub struct WorkerPoolState {
     pub current_held: i64,
     pub capacity_remaining: i32,
     pub pool_count_by_process: Vec<ProcessPoolCount>,
+    /// 2026-09-14 follow-up-ux 新增：worker 当前持有的完整 batch 列表
+    /// （JOIN t_part 后转 `TakenItem`）。避免前端按 worker 轮询 K 次
+    /// 单 batch 详情接口的 N+1；UI sink `WorkerQueueBoard.vue` 已对接
+    /// `:batches="workerHeld[w.id] ?? []"`。
+    pub held_batches: Vec<TakenItem>,
 }

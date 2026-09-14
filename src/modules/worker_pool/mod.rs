@@ -20,4 +20,6 @@ pub fn admin_router() -> Router<Arc<AppState>> {
         .route("/refill", post(handler::admin_refill))
         .route("/remove", post(handler::admin_remove))
         .route("/auto-allocate", post(handler::auto_allocate))
+        // 2026-09-14 follow-up-ux 新增：单 batch 拖拽分配
+        .route("/assign", post(handler::admin_assign))
 }
