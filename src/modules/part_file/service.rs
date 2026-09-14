@@ -349,15 +349,19 @@ impl PartFileService {
     ///
     /// 权限：按 `kind` 派生（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；
     /// G_CODE → M+CNC）。
-    /// 行为：乐观锁守；UPDATE `deleted_at = now()` + `version = version + 1`；commit 后
-    /// 异步调 `cos.delete_object`（失败仅 warn，不阻断）。
+    ///
+    /// 行为：乐观锁守；UPDATE `deleted_at = now()` + `version = version + 1`。
+    ///
+    /// 返回软删行的 `object_key`，由 **handler 在 `tx.commit()` 之后** 异步
+    /// `tokio::spawn(cos.delete_object(...))`——避免 commit 失败却已触发
+    /// COS 删除、孤儿对象风险（2026-09-15 review 第 1 轮 A2 修）。
     pub async fn soft_delete_file(
         conn: &mut PgConnection,
-        cos: Arc<dyn CosClient>,
+        _cos: Arc<dyn CosClient>,
         file_id: i64,
         version: i32,
         current: &CurrentUser,
-    ) -> Result<(), AppError> {
+    ) -> Result<String, AppError> {
         let row = PartFileRepo::get_by_id(&mut *conn, file_id, false)
             .await?
             .ok_or_else(|| {
@@ -406,16 +410,9 @@ impl PartFileService {
             ));
         }
 
-        // COS 异步清理（best-effort；handler commit 后台跑）
-        let cos = cos.clone();
-        let key = object_key.clone();
-        tokio::spawn(async move {
-            if let Err(e) = cos.delete_object(&key).await {
-                tracing::warn!(key = %key, error = %e, "part_file COS 异步清理失败（已软删）");
-            }
-        });
-
-        Ok(())
+        // 2026-09-15 review A2 修：service 不再 spawn COS delete；
+        // 把 object_key 返回给 handler，由 handler commit 后再触发。
+        Ok(object_key)
     }
 }
 

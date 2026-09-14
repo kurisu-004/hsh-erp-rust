@@ -151,6 +151,16 @@ async fn build_snapshot_with_workers_returns_full_shape() {
     assert_eq!(shelf_group.items.len(), 1);
     assert_eq!(shelf_group.items[0].id, part_id.to_string());
     assert_eq!(shelf_group.items[0].quantity, 5);
+    // 2026-09-15 review 修：batch_no 必须从 SQL 传到 DTO（之前硬编 None）
+    assert_eq!(
+        shelf_group.items[0].batch_no,
+        Some(1),
+        "batch_no 应为 INSERT 时填的 1，不应为 None"
+    );
+    assert_eq!(
+        shelf_group.items[0].batch_id.as_deref(),
+        Some(batch_id.to_string().as_str())
+    );
 }
 
 #[tokio::test]

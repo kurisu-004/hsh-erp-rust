@@ -477,10 +477,15 @@ async fn soft_delete_happy_path() {
 
     // delete by Manager（kind=DRAWING → M+C 通行）
     let mut tx = pool.begin().await.unwrap();
-    PartFileService::soft_delete_file(&mut tx, cos.clone(), out.id, version, &current)
+    let object_key = PartFileService::soft_delete_file(&mut tx, cos.clone(), out.id, version, &current)
         .await
         .expect("delete ok");
     tx.commit().await.unwrap();
+    // 2026-09-15 review A2：service 应返回 cos object_key 供 handler commit 后清理
+    assert!(
+        !object_key.is_empty(),
+        "soft_delete_file 应返回 cos object_key"
+    );
 
     // 再次查应 not found（include_deleted=false）
     let mut tx = pool.begin().await.unwrap();

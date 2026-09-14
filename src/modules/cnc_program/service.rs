@@ -287,15 +287,19 @@ impl CncProgramService {
     }
 
     /// `POST /api/v2/cnc-programs/{file_id}/delete` —— alias。
+    ///
+    /// 2026-09-15 review A2 修：转发 part_file::soft_delete_file 的 object_key，
+    /// 由 handler commit 后再 `tokio::spawn(cos.delete_object(...))`，
+    /// 避免 commit 失败却已触发 COS 删除。
     pub async fn delete(
         conn: &mut PgConnection,
-        cos: Arc<dyn CosClient>,
+        _cos: Arc<dyn CosClient>,
         file_id: i64,
         version: i32,
         current: &CurrentUser,
-    ) -> Result<(), AppError> {
+    ) -> Result<String, AppError> {
         crate::modules::part_file::service::PartFileService::soft_delete_file(
-            conn, cos, file_id, version, current,
+            conn, _cos, file_id, version, current,
         )
         .await
     }

@@ -59,7 +59,13 @@ impl StatisticsRepo {
         Ok(row.get::<i64, _>("cnt"))
     }
 
-    /// 期末在制：date_to+1 前已创建、且**不存在** COMPLETED/CANCELLED 工单级事件的工单数。
+    /// 期末在制：date_to 当天 24:00 前已创建、且截至查询时刻**未** COMPLETED/CANCELLED
+    /// 的工单数。
+    ///
+    /// 2026-09-15 review 修：原 NOT EXISTS 子查询带 `e.created_at < date_to+1` 过滤，
+    /// 导致 `date_to` 之后才 COMPLETED/CANCELLED 的工单在 `date_to` 统计里仍被算
+    /// 在制——期末口径偏差。改为「任何时刻存在 COMPLETED/CANCELLED 即不算在制」，
+    /// 并加 `p.status NOT IN (...)` 双保险（防止历史脏数据缺事件）。
     pub async fn count_in_process_at(
         conn: &mut PgConnection,
         date_to: NaiveDate,
@@ -69,12 +75,12 @@ impl StatisticsRepo {
              FROM t_part p \
              WHERE p.deleted_at IS NULL \
                AND p.created_at < ($1::date + INTERVAL '1 day')::timestamp \
+               AND p.status NOT IN ('COMPLETED', 'CANCELLED') \
                AND NOT EXISTS ( \
                  SELECT 1 FROM t_part_event e \
                  WHERE e.part_id = p.id \
                    AND e.batch_id IS NULL \
                    AND e.event_type IN ('COMPLETED', 'CANCELLED') \
-                   AND e.created_at < ($1::date + INTERVAL '1 day')::timestamp \
                )",
         )
         .bind(date_to)

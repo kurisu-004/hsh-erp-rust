@@ -259,6 +259,9 @@ impl DashboardService {
 #[derive(Debug, Clone)]
 struct BatchLite {
     batch_id: i64,
+    /// 2026-09-15 review 修：SQL 一直 `SELECT b.batch_no`，但 BatchLite 没字段，
+    /// 永远丢值 → DashboardItem.batch_no=None 破坏 v1 大屏契约。这里补回。
+    batch_no: Option<i32>,
     holder_id: Option<i64>,
     next_process_id: Option<i64>,
     placed_at: Option<NaiveDateTime>,
@@ -280,6 +283,8 @@ fn row_to_part_batch_pair(r: sqlx::postgres::PgRow) -> (BatchLite, PartLite) {
     (
         BatchLite {
             batch_id: r.get::<i64, _>("batch_id"),
+            // 2026-09-15 review 修：SQL alias `batch_no` 已 SELECT，这里读出回填
+            batch_no: r.try_get::<Option<i32>, _>("batch_no").ok().flatten(),
             holder_id: r.try_get::<Option<i64>, _>("holder_id").ok().flatten(),
             next_process_id: r.try_get::<Option<i64>, _>("next_process_id").ok().flatten(),
             placed_at: r.try_get::<Option<NaiveDateTime>, _>("placed_at").ok().flatten(),
@@ -568,7 +573,8 @@ fn part_to_item(
     DashboardItem {
         id: p.part_id.to_string(),
         batch_id: Some(b.batch_id.to_string()),
-        batch_no: None,
+        // 2026-09-15 review 修：从 BatchLite.batch_no 取值（之前硬编 None 丢数据）
+        batch_no: b.batch_no,
         serial_no: p.serial_no.clone(),
         name: p.name.clone(),
         drawing_no: p.drawing_no.clone(),

@@ -375,3 +375,88 @@ async fn pickup_skip_detail_happy_path() {
         assert_eq!(item.quantity, 1);
     }
 }
+
+// 2026-09-15 review A3：count_in_process_at 期末口径偏差测试。
+//   场景：date_to=2026-09-20；part A created 09-10，COMPLETED 事件 09-25（晚于 date_to）；
+//         part B created 09-10，无 COMPLETED/CANCELLED 事件。
+//   旧 SQL 因 NOT EXISTS 子查询带 `e.created_at < date_to+1` 过滤，
+//   会把 A 算作 09-20 在制（错）→ 期望 0。
+//   新 SQL 移除该过滤后：A 不在制，B 在制 → 期望 1。
+#[tokio::test]
+async fn count_in_process_at_date_to_boundary() {
+    use hsh_erp_rust::modules::statistics::repo::StatisticsRepo;
+
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户S-6", "F").await;
+    let l2 = insert_l2_customer(&pool, l1, "子客S-6").await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+
+    // part A：09-10 创建，09-25 COMPLETED（晚于 date_to）
+    let part_a = snowflake.next_id();
+    let created_a = NaiveDate::from_ymd_opt(2026, 9, 10)
+        .unwrap()
+        .and_hms_opt(8, 0, 0)
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
+         request_date, planned_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'pa', 'DWG', 'tester', $2, $3, $3, 'IN_PROCESS', 0, $4, NULL, $4, NULL)",
+    )
+    .bind(part_a)
+    .bind(l2)
+    .bind(NaiveDate::from_ymd_opt(2026, 9, 10).unwrap())
+    .bind(created_a)
+    .execute(&pool)
+    .await
+    .expect("insert part A");
+    sqlx::query(
+        "INSERT INTO t_part_event (id, part_id, worker_id, event_type, quantity, created_at) \
+         VALUES ($1, $2, NULL, 'COMPLETED', 1, $3)",
+    )
+    .bind(snowflake.next_id())
+    .bind(part_a)
+    .bind(NaiveDate::from_ymd_opt(2026, 9, 25)
+        .unwrap()
+        .and_hms_opt(10, 0, 0)
+        .unwrap())
+    .execute(&pool)
+    .await
+    .expect("insert part A COMPLETED event");
+
+    // part B：09-10 创建，无任何事件
+    let part_b = snowflake.next_id();
+    let created_b = NaiveDate::from_ymd_opt(2026, 9, 10)
+        .unwrap()
+        .and_hms_opt(9, 0, 0)
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
+         request_date, planned_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'pb', 'DWG', 'tester', $2, $3, $3, 'IN_PROCESS', 0, $4, NULL, $4, NULL)",
+    )
+    .bind(part_b)
+    .bind(l2)
+    .bind(NaiveDate::from_ymd_opt(2026, 9, 10).unwrap())
+    .bind(created_b)
+    .execute(&pool)
+    .await
+    .expect("insert part B");
+
+    let mut tx = pool.begin().await.unwrap();
+    let in_process = StatisticsRepo::count_in_process_at(
+        &mut tx,
+        NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
+    )
+    .await
+    .expect("count_in_process_at ok");
+    drop(tx);
+
+    // 期望：A 在 09-25 已 COMPLETED（不论是否在 date_to 之后），不算 09-20 期末在制；
+    //       B 无 COMPLETED 事件，09-20 期末算在制。总数 = 1。
+    assert_eq!(
+        in_process, 1,
+        "date_to 之后才 COMPLETED 的工单不应算在 date_to 期末在制"
+    );
+}

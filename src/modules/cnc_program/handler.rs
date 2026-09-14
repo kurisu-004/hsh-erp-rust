@@ -175,6 +175,8 @@ pub async fn get_cnc_program_content(
 }
 
 /// `POST /api/v2/cnc-programs/{file_id}/delete` —— alias → part-files/{id}/delete
+///
+/// 2026-09-15 review A2 修：commit 在前，spawn COS 在后（与 part_file handler 同 pattern）。
 pub async fn delete_cnc_program(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -182,8 +184,20 @@ pub async fn delete_cnc_program(
     Json(req): Json<DeletePartFileRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    CncProgramService::delete(&mut tx, state.cos.clone(), file_id, req.version, &current).await?;
+    let object_key =
+        CncProgramService::delete(&mut tx, state.cos.clone(), file_id, req.version, &current)
+            .await?;
     tx.commit().await?;
+    let cos = state.cos.clone();
+    tokio::spawn(async move {
+        if let Err(e) = cos.delete_object(&object_key).await {
+            tracing::warn!(
+                key = %object_key,
+                error = %e,
+                "cnc_program COS 异步清理失败（已软删，不影响 API 返回）"
+            );
+        }
+    });
     Ok(Json(R::ok_empty()))
 }
 

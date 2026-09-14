@@ -182,6 +182,10 @@ pub async fn get_part_file_content(
 /// 入参（JSON）：`{ version: i32 }`（OCC）。
 /// 权限：按 kind 派生角色（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；
 /// G_CODE → M+CNC）。
+///
+/// 2026-09-15 review A2 修：service 返回 `object_key` 后，handler 必须
+/// 先 `tx.commit()` 再 `tokio::spawn(cos.delete_object(...))`，避免
+/// commit 失败却已触发 COS 删除、产生孤儿对象。
 pub async fn soft_delete_part_file(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -189,9 +193,27 @@ pub async fn soft_delete_part_file(
     Json(req): Json<DeletePartFileRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    PartFileService::soft_delete_file(&mut tx, state.cos.clone(), file_id, req.version, &current)
-        .await?;
+    let object_key = PartFileService::soft_delete_file(
+        &mut tx,
+        state.cos.clone(),
+        file_id,
+        req.version,
+        &current,
+    )
+    .await?;
+    // commit 在前：DB 已是最终态，再触发副作用
     tx.commit().await?;
+    // commit 后再异步触发 COS 删除（best-effort，失败仅 warn）
+    let cos = state.cos.clone();
+    tokio::spawn(async move {
+        if let Err(e) = cos.delete_object(&object_key).await {
+            tracing::warn!(
+                key = %object_key,
+                error = %e,
+                "part_file COS 异步清理失败（已软删，不影响 API 返回）"
+            );
+        }
+    });
     Ok(Json(R::ok_empty()))
 }
 
