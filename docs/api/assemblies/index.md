@@ -170,6 +170,12 @@
 
 父装配件 `t_assembly.status` 由 service 在 part inspection 流（同事务）自动同步，**前端无需主动调用**。
 
+**触发点（PR-B3 后扩展）**：
+
+- Phase 0（仅 inspection 流）：`POST /parts/{id}/{to-inspection,to-ship,to-process}` + `POST /parts/batch-to-inspection` + `POST /parts/batch-to-ship` + `POST /parts/worker-scan`（仅 `INSPECTED` 分支）
+- **Phase 1（2026-09-11 起）**：`POST /parts/{id}/{deliver, complete, cancel, start-repair}` 等 batch lifecycle 端点也通过 `PartService::sync_from_batch_change` 触发同一 rollup——同一 part 的批次状态变化都会级联到父装配件
+- 详见 [`docs/refactor-part-assembly-batch.md`](../../refactor-part-assembly-batch.md#42-rollup-回调核心-新增-partservicesync_from_batch_change)
+
 算法与 Python `service/_assembly_rollup.py::recompute_assembly_status` 对齐，按以下顺序：
 
 1. 父已是 `COMPLETED` 或 `CANCELLED` → **短路**：不更新。

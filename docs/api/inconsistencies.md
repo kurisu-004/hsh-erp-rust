@@ -2,7 +2,7 @@
 
 > 本文件由 plan `2026-08-27-split-api-docs-and-find-gaps.md` 自动生成（手动维护）。
 > 权威源：Rust 后端 `src/modules/**/handler.rs` vs Python myERP `api/v1/*.py`。
-> 端点数：Rust **~104**（12 域已实现 + 4 域占位 + 1 WS stub）/ Python **~169**（19 域 + 1 WS + 1 MCP）。
+> 端点数：Rust **~162**（19 域已实现 + 1 域占位 + 1 WS stub + 1 _e2e seed）/ Python **~169**（19 域 + 1 WS + 1 MCP）。
 >
 > 🔧 **本文件仅作差距清单**，不对应已落地的 Rust 实现；Rust 代码补齐由后续 plan 实施。
 
@@ -10,49 +10,51 @@
 
 | 维度 | 数量 | 说明 |
 |---|---:|---|
-| 整域缺失（Python 有 Rust 无） | 4 域 | cnc_program / outsource / statistics / part_file 扩展 |
-| 部分缺失（part 域） | ~32 端点 | Python 46 vs Rust 18（其中 4 个为 Rust-only） |
-| 部分缺失（其他域） | ~6 端点 | applicants 7 vs 5；assemblies 9 vs 5 |
-| Rust-only | ~9 端点 | delivery-notes 新增 P3 scan + batch-detail；worker-pool；delivery-groups；part 域 batch-to-ship + batch-to-inspection |
-| 占位模块（路由挂载但 Router 空） | 4 域 | cnc_program / outsource / part_file / statistics |
+| 整域缺失（Python 有 Rust 无） | **1 域** | 仅 statistics（聚合读占位） |
+| 部分缺失（part 域） | ~3 端点 | Python 46 vs Rust 49（Rust 端大部分补齐；剩余 print-drawing-* / scan 通用端点） |
+| 部分缺失（其他域） | ~3 端点 | applicants 7 vs 5；assemblies 9 vs 8；少量边角未补 |
+| Rust-only | **30+** | delivery-notes 新增 P3 scan + batch-detail；worker-pool（5 端点）；_e2e seed hook（11 端点）；auto-allocate；by-work-type / pickable / by-worker；pick-up；send-to-outsource；receive-from-outsource；repair-dispatch；complete-repair；scan-inspect；scan/deliver-part；match-by-excel-items；batch-with-pdfs；assembly start + files |
+| 占位模块（路由挂载但 Router 空） | **2 域** | statistics + dashboard WS 握手 |
 | WS stub（路径不一致） | 1 | Rust `/ws/dashboard` vs Python `/api/v1/ws/dashboard` |
 
 ---
 
 ## 1. 整域缺失（Python 有，Rust 整域未实现）
 
-### 1.1 cnc_program 域 — Python 8 端点 / Rust 0
+### 1.1 cnc_program 域 — Python 8 端点 / **Rust 2 已上线**
 
 **Python 参考**：`/Users/ren/Code/myERP/api/v1/cnc_program.py`
 
-| Method | Path | 说明 |
-|---|---|---|
-| POST | `/api/v1/parts/{id}/cnc-pair` | 上传 CNC 程式 + 对应零件 |
-| GET | `/api/v1/parts/{id}/cnc-programs` | 列出零件的 CNC 程式 |
-| POST | `/api/v1/parts/{id}/setup-sheets` | 上传 setup sheet |
-| GET | `/api/v1/parts/{id}/setup-sheets` | 列出 setup sheet |
-| GET | `/api/v1/cnc-programs/{file_id}/download-url` | 下载 URL 签发 |
-| GET | `/api/v1/cnc-programs/{file_id}/content` | 下载二进制 |
-| DELETE | `/api/v1/cnc-programs/{file_id}` | 删除 |
-| （+1 internal） | — | Python `cnc_pair_router` 内部端点 |
+| Method | Path | 说明 | Rust 状态 |
+|---|---|---|---|
+| POST | `/api/v1/parts/{id}/cnc-pair` | 上传 CNC 程式 + 对应零件 | ✅ 已实现为 `/api/v2/cnc-programs/pairs`（multipart） |
+| GET | `/api/v1/parts/{id}/cnc-programs` | 列出零件的 CNC 程式 | ✅ 已实现为 `/api/v2/cnc-programs/parts/{part_id}` |
+| POST | `/api/v1/parts/{id}/setup-sheets` | 上传 setup sheet | ✅ 与 cnc-pair 合并（multipart） |
+| GET | `/api/v1/parts/{id}/setup-sheets` | 列出 setup sheet | ✅ 与 cnc-programs 合并 |
+| GET | `/api/v1/cnc-programs/{file_id}/download-url` | 下载 URL 签发 | ✅ 由 `part_file/{file_id}/url` 提供 |
+| GET | `/api/v1/cnc-programs/{file_id}/content` | 下载二进制 | ⚪ 当前未提供直下（走 COS 预签 URL） |
+| DELETE | `/api/v1/cnc-programs/{file_id}` | 删除 | ⚪ 当前未提供（part_file 域待补） |
 
-**Rust 状态**：`src/modules/cnc_program/` 三件套（handler / service / repo）全为占位；`src/modules/mod.rs` 挂载空 `Router::new()`。
-
-**🔧 待实施**：新建 cnc_program 域（model / repo / service / handler / dto）+ 数据库迁移（`t_cnc_program` / `t_setup_sheet` 表）+ COS 集成（与 part_file 共享）。
+**Rust 状态**：`src/modules/cnc_program/` 完整 6 文件（model / repo / service / handler / dto / mod）；kind=`G_CODE` + kind=`SETUP_SHEET` 复用 `t_part_file`；详见 [`./cnc-programs.md`](./cnc-programs.md)。
 
 ---
 
-### 1.2 outsource 三件套 — Python 19 端点 / Rust 0
+### 1.2 outsource 三件套 — Python 19 端点 / **Rust 16 已上线**
 
 **Python 参考**：`/Users/ren/Code/myERP/api/v1/outsource_company.py`（8 端点）+ `outsource_quote.py`（10 端点）+ `outsource_shipment.py`（1 端点）
 
-**Rust 状态**：`src/modules/outsource/` 三件套全为占位；空 Router。
+| 段 | Python | Rust | 差 |
+|---|---:|---:|---:|
+| `outsource_company` | 8 | **7** | -1（list-companies-by-process 实现位置不同） |
+| `outsource_quote` | 10 | **8** | -2（统计 / 批量查暂未暴露） |
+| `outsource_shipment` | 1 | **1** | 0 |
+| **合计** | **19** | **16** | **-3** |
 
-**🔧 待实施**：完整外协域（公司 / 报价 / 发货 三子域），复用已预留的错误码段 212xx / 213xx / 215xx（见 `src/shared/error.rs:168,178,206`），按需补充新码。
+**Rust 状态**：`src/modules/outsource/` 完整 7 文件（含 statemachine.rs）；详见 [`./outsource-companies.md`](./outsource-companies.md) / [`./outsource-quotes.md`](./outsource-quotes.md) / [`./outsource-shipments.md`](./outsource-shipments.md)。
 
 ---
 
-### 1.3 statistics 域 — Python 5 端点 / Rust 0
+### 1.3 statistics 域 — Python 5 端点 / Rust 0（仍占位）
 
 **Python 参考**：`/Users/ren/Code/myERP/api/v1/statistics.py`
 
@@ -64,101 +66,96 @@
 | GET | `/api/v1/statistics/customers/{id}` | 单客户统计 |
 | GET | `/api/v1/statistics/throughput` | 吞吐趋势（日 / 周 / 月） |
 
-**Rust 状态**：`src/modules/statistics/` 三件套全为占位；空 Router。
-
-**🔧 待实施**：纯查询域，可直接复用 part / assembly / delivery_note 的 repo 聚合查询。
+**Rust 状态**：`src/modules/statistics/` 仍是空 `Router::new()`；可复用 part / assembly / delivery_note 的 repo 聚合查询。
 
 ---
 
-### 1.4 part_file 扩展（drawing/cad） — Python 7 端点 / Rust 1 端点
+### 1.4 part_file 扩展 — Python 7 端点 / **Rust 3 已上线**
 
 **Python 参考**：`/Users/ren/Code/myERP/api/v1/drawing.py`
 
 | Method | Path | 说明 | Rust 状态 |
 |---|---|---|---|
 | POST | `/api/v1/parts/{id}/drawings` | 上传图纸（2D PDF/图片） | ✅ 已实现为 `/api/v2/parts/{part_id}/upload-drawing` |
-| POST | `/api/v1/parts/{id}/3d-models` | 上传 3D 模型 | ❌ 缺失 |
-| POST | `/api/v1/parts/{id}/cad-files` | 上传 CAD 文件 | ❌ 缺失 |
-| GET | `/api/v1/files/{id}/download-url` | 下载 URL 签发 | ❌ 缺失 |
-| GET | `/api/v1/files/{id}/content` | 直接下载二进制 | ❌ 缺失 |
-| DELETE | `/api/v1/files/{id}` | 删除文件 | ❌ 缺失 |
-| （+1 internal） | — | `file_router` 内部端点 | — |
+| POST | `/api/v1/parts/{id}/3d-models` | 上传 3D 模型 | ✅ 已实现为 `/api/v2/parts/{part_id}/upload-3d-model` |
+| POST | `/api/v1/parts/{id}/cad-files` | 上传 CAD 文件 | ✅ 已实现为 `/api/v2/part-files`（kind=`CAD_2D`） |
+| GET | `/api/v1/files/{id}/download-url` | 下载 URL 签发 | ✅ 已实现为 `/api/v2/part-files/{file_id}/url` |
+| GET | `/api/v1/files/{id}/content` | 直接下载二进制 | ⚪ 当前走 COS 预签 URL（302 重定向） |
+| DELETE | `/api/v1/files/{id}` | 删除文件 | ⚪ 当前未提供直删端点（业务侧未要求） |
 
-**Rust 状态**：`src/modules/part_file/` 三件套为占位（仅有 3 个 repo 壳函数）；空 Router。
-
-**🔧 待实施**：补 6 端点（除 upload-drawing 外）；共享 part_file repo 的 COS 集成。
+**Rust 状态**：`src/modules/part_file/` 完整 7 文件（model / repo / policy / service / handler / dto / mod）；详见 [`./files.md`](./files.md)。
 
 ---
 
-## 2. part 域部分缺失 — Python 46 端点 / Rust 18 端点（差 32，Rust 18 中 4 个为 Rust-only）
+## 2. part 域部分缺失 — Python 46 端点 / **Rust 49 端点**
 
 **Python 参考**：`/Users/ren/Code/myERP/api/v1/part.py`（46 端点）
-**Rust 当前**：[`./parts/index.md`](./parts/index.md)（18 端点）
+**Rust 当前**：[`./parts/index.md`](./parts/index.md)（**49 端点**，2026-09-14 Phase 1+2 补齐后已**超过** Python）
 
-### 2.1 列表/筛选（缺 7 端点）
+### 2.1 列表/筛选（Rust 已全补）
 
-| Method | Path | Python handler | 用途 |
+| Method | Path | Python | Rust |
 |---|---|---|---|
-| GET | `/api/v1/parts/pending-programming` | `pending_programming` | 待编程列表 |
-| GET | `/api/v1/parts/outsource-in-flight` | `outsource_in_flight` | 外协在途 |
-| GET | `/api/v1/parts/outsource-sendable` | `outsource_sendable` | 可发外协 |
-| GET | `/api/v1/parts/inspection-batches` | `inspection_batches` | 品检批次列表 |
-| GET | `/api/v1/parts/repair-batches` | `repair_batches` | 维修批次列表 |
-| GET | `/api/v1/parts/repairing-batches` | `repairing_batches` | 维修中批次列表 |
-| GET | `/api/v1/parts/location-tree` | `location_tree` | 库位树（按 shelf 维度） |
+| GET | `/api/v1/parts/pending-programming` | `pending_programming` | ✅ `/api/v2/parts/pending-programming` |
+| GET | `/api/v1/parts/outsource-in-flight` | `outsource_in_flight` | ✅ `/api/v2/parts/outsource-in-flight` |
+| GET | `/api/v1/parts/outsource-sendable` | `outsource_sendable` | ✅ `/api/v2/parts/outsource-sendable` |
+| GET | `/api/v1/parts/inspection-batches` | `inspection_batches` | ✅ `/api/v2/parts/inspection-batches` |
+| GET | `/api/v1/parts/repair-batches` | `repair_batches` | ✅ `/api/v2/parts/repair-batches` |
+| GET | `/api/v1/parts/repairing-batches` | `repairing_batches` | ✅ `/api/v2/parts/repairing-batches` |
+| GET | `/api/v1/parts/location-tree` | `location_tree` | ✅ `/api/v2/parts/location-tree` |
 
-### 2.2 批次管理（缺 3 端点）
+### 2.2 批次管理（Rust 已全补）
 
-| Method | Path | 用途 |
-|---|---|---|
-| GET | `/api/v1/parts/{id}/batches` | 列出 part 下所有批次 |
-| POST | `/api/v1/parts/{id}/batches/split` | 拆分批次 |
-| POST | `/api/v1/parts/{id}/batches/{batch_id}/cancel` | 取消批次 |
+| Method | Path | Python | Rust |
+|---|---|---|---|
+| GET | `/api/v1/parts/{id}/batches` | list | ✅ `/api/v2/parts/{part_id}/batches` |
+| POST | `/api/v1/parts/{id}/batches/split` | split | ✅ `/api/v2/parts/{part_id}/batches/split` |
+| POST | `/api/v1/parts/{id}/batches/{batch_id}/cancel` | cancel | ✅ `/api/v2/parts/{part_id}/batches/{batch_id}/cancel` |
 
-### 2.3 状态机扩展（缺 10 端点）
+### 2.3 状态机扩展（Rust 已全补）
 
-| Method | Path | 触发流转 |
-|---|---|---|
-| POST | `/api/v1/parts/{id}/place-on-shelf` | 上架 |
-| POST | `/api/v1/parts/{id}/recall-to-pending` | 召回至 PENDING |
-| POST | `/api/v1/parts/{id}/send-to-programming` | 派发编程 |
-| POST | `/api/v1/parts/{id}/recall-to-programming` | 召回编程 |
-| POST | `/api/v1/parts/{id}/release-from-programming` | 编程完成释放 |
-| POST | `/api/v1/parts/{id}/send-to-outsource` | 派发外协 |
-| POST | `/api/v1/parts/{id}/receive-from-outsource` | 外协回收入库 |
-| POST | `/api/v1/parts/{id}/receive-from-outsource-to-inspection` | 外协回收 → 品检 |
-| POST | `/api/v1/parts/{id}/repair-dispatch` | 派发维修 |
-| POST | `/api/v1/parts/{id}/start-repair` | ✅ 已实现（part lifecycle） |
-| POST | `/api/v1/parts/{id}/complete-repair` | 完成维修 |
+| Method | Path | Python | Rust |
+|---|---|---|---|
+| POST | `/api/v1/parts/{id}/place-on-shelf` | place-on-shelf | ✅ |
+| POST | `/api/v1/parts/{id}/recall-to-pending` | recall-to-pending | ✅ |
+| POST | `/api/v1/parts/{id}/send-to-programming` | send-to-programming | ✅ |
+| POST | `/api/v1/parts/{id}/recall-to-programming` | recall-to-programming | ✅ |
+| POST | `/api/v1/parts/{id}/release-from-programming` | release-from-programming | ✅ |
+| POST | `/api/v1/parts/{id}/send-to-outsource` | send-to-outsource | ✅ |
+| POST | `/api/v1/parts/{id}/receive-from-outsource` | receive-from-outsource | ✅ |
+| POST | `/api/v1/parts/{id}/receive-from-outsource-to-inspection` | receive-to-inspection | ✅ |
+| POST | `/api/v1/parts/{id}/repair-dispatch` | repair-dispatch | ✅ |
+| POST | `/api/v1/parts/{id}/start-repair` | start-repair | ✅ |
+| POST | `/api/v1/parts/{id}/complete-repair` | complete-repair | ✅ |
 
-### 2.4 扫码台（缺 6 端点）
+### 2.4 扫码台（Rust 已全补 + Rust-only）
 
-| Method | Path | 用途 |
-|---|---|---|
-| POST | `/api/v1/parts/scan` | 通用扫码（返回 part + 当前状态） |
-| POST | `/api/v1/parts/pick-up` | 领取件（worker-scan 的旧版） |
-| POST | `/api/v1/parts/scan/deliver-part` | 扫码发货 |
-| GET | `/api/v1/parts/by-work-type/{work_type_id}` | 按工种查 part |
-| GET | `/api/v1/parts/pickable-by-work-type/{work_type_id}` | 按工种查可领取 part |
-| GET | `/api/v1/parts/by-worker/{worker_id}` | 按工人查持有 part |
+| Method | Path | Python | Rust |
+|---|---|---|---|
+| POST | `/api/v1/parts/scan` | 通用扫码 | ⚪ 当前走 `worker-scan`（功能更细） |
+| POST | `/api/v1/parts/pick-up` | 领取件 | ⚪ 当前走 `worker-scan` + `/pick-up` B 方案 |
+| POST | `/api/v1/parts/scan/deliver-part` | 扫码发货 | ✅ |
+| GET | `/api/v1/parts/by-work-type/{work_type_id}` | 按工种查 | ✅ |
+| GET | `/api/v1/parts/pickable-by-work-type/{work_type_id}` | 按工种查可领取 | ✅ |
+| GET | `/api/v1/parts/by-worker/{worker_id}` | 按工人查持有 | ✅ |
 
-### 2.5 打印（缺 2 端点）
+### 2.5 打印（仍差 2 端点）
 
-| Method | Path | 用途 |
-|---|---|---|
-| GET | `/api/v1/parts/{id}/print-drawing` | 打印单件图纸 |
-| POST | `/api/v1/parts/print-drawing-batch` | 批量打印图纸 |
+| Method | Path | Python | Rust |
+|---|---|---|---|
+| GET | `/api/v1/parts/{id}/print-drawing` | 打印单件图纸 | ❌ 缺失 |
+| POST | `/api/v1/parts/print-drawing-batch` | 批量打印图纸 | ❌ 缺失 |
 
-### 2.6 流程辅助（缺 4 端点）
+### 2.6 流程辅助（Rust 已全补）
 
-| Method | Path | 用途 |
-|---|---|---|
-| POST | `/api/v1/parts/match-by-excel-items` | Excel 行匹配 part（导入辅助） |
-| POST | `/api/v1/parts/batch-update-order-info` | 批量更新订单信息 |
-| GET | `/api/v1/parts/{id}/events` | 工单事件时间线（Rust delivery-note 已有 events，part 域缺失） |
-| POST | `/api/v1/parts/batch-with-pdfs` | 多页 PDF 树形创建（assembly 派单场景） |
+| Method | Path | Python | Rust |
+|---|---|---|---|
+| POST | `/api/v1/parts/match-by-excel-items` | Excel 行匹配 | ✅ |
+| POST | `/api/v1/parts/batch-update-order-info` | 批量更新订单信息 | ✅ |
+| GET | `/api/v1/parts/{id}/events` | 工单事件时间线 | ✅ |
+| POST | `/api/v1/parts/batch-with-pdfs` | 多页 PDF 树形创建 | ✅ |
 
-> **🔧 待实施**：part 域 32 个端点补齐涉及状态机大幅扩展 + new error codes (e.g. 20120+ PROGRAMMING_NOT_READY)。
+> **剩余 ~3 个端点**：(a) `/parts/{id}/print-drawing` 单件图纸打印；(b) `/parts/print-drawing-batch` 批量图纸打印；(c) `/parts/scan` 通用扫码（与 worker-scan 功能重叠，留待业务侧决策是否保留）。
 
 ---
 
@@ -173,17 +170,18 @@
 
 > **🔧 待实施**：补 2 端点。Rust applicants 域仅 CRUD，未含搜索 / 批量 upsert。
 
-### 3.2 assemblies — Python 9 端点 / Rust 6 端点（差 4）
+### 3.2 assemblies — Python 9 端点 / **Rust 8 端点**（差 1）
 
-| Method | Path | 用途 |
-|---|---|---|
-| POST | `/api/v1/assemblies/{id}/upload-pdf` | 上传 PDF（与 create-multipart 解耦，独立端点） |
-| POST | `/api/v1/assemblies/{id}/cancel` | ✅ 已实现为 `/api/v2/assemblies/{assembly_id}/cancel` |
-| POST | `/api/v1/assemblies/{id}/children` | 详情页添加单个子件（写操作；Rust 缺失） |
-| GET | `/api/v1/parts/{part_id}/assembly` | **子件反查父装配件**（Rust 缺失） |
-| GET | `/api/v1/assemblies/{id}/files` | 列出 PDF 文件（Rust 缺失，`files` 字段恒为空） |
+| Method | Path | Python | Rust |
+|---|---|---|---|
+| POST | `/api/v1/assemblies/{id}/upload-pdf` | 上传 PDF | ⚪ 与 multipart create 合并 |
+| POST | `/api/v1/assemblies/{id}/cancel` | cancel | ✅ |
+| POST | `/api/v1/assemblies/{id}/children` | 详情页添加单个子件 | ⚪ 当前不支持（创建时一次性派生） |
+| GET | `/api/v1/parts/{part_id}/assembly` | 子件反查父装配件 | ⚪ 当前走 `GET /parts/{id}` 详情 |
+| GET | `/api/v1/assemblies/{id}/files` | 列出 PDF 文件 | ✅（含 `files` 字段，2026-09-14 Phase 3 落地） |
+| POST | `/api/v1/assemblies/{id}/start` | start | ✅（2026-09-14 Phase 3 落地） |
 
-> **🔧 待实施**：(a) `/parts/{part_id}/assembly` 反查端点；(b) `/assemblies/{id}/files` 列出文件（需 part_file 域支持）。
+> **剩余 ~1 个端点**：`/assemblies/{id}/children` 详情页添加单个子件（业务未要求独立端点）。
 
 ---
 
@@ -200,6 +198,17 @@
 | GET | `/api/v2/worker-pool/state` | worker_pool | 工人池状态查询（Rust 新增域） |
 | POST | `/api/v2/admin/worker-pool/refill` | worker_pool | 管理员手动 refill |
 | POST | `/api/v2/admin/worker-pool/remove` | worker_pool | 管理员手动 remove |
+| POST | `/api/v2/admin/worker-pool/auto-allocate` | worker_pool | auto-allocate 批量分配（Phase 2，2026-09-12） |
+| POST | `/api/v2/parts/by-work-type/{wt}` / `pickable-by-work-type/{wt}` / `by-worker/{w}` | part | 工种/工人视角列表（Phase 2） |
+| POST | `/api/v2/parts/{id}/pick-up` | part | B 方案手动 pick-up 兜底（Phase 2） |
+| POST | `/api/v2/parts/{id}/send-to-outsource` / `receive-from-outsource` | part | 派发外协 / 外协回收（Phase 1） |
+| POST | `/api/v2/parts/{id}/repair-dispatch` / `complete-repair` | part | 维修派发 / 完成（Phase 1） |
+| POST | `/api/v2/parts/{id}/scan-inspect` | part | 扫码品检（Phase 1） |
+| POST | `/api/v2/parts/scan/deliver-part` | part | 扫码发货（Phase 1） |
+| POST | `/api/v2/parts/match-by-excel-items` / `batch-update-order-info` / `batch-with-pdfs` | part | 流程辅助（Phase 1） |
+| POST | `/api/v2/assemblies/{id}/start` | assembly | 装配件启动（Phase 3 deferred #4） |
+| POST | `/api/v2/assemblies/{id}/files` | assembly | 装配件独立 PDF 上传（Phase 3 deferred #1） |
+| POST/GET | `/api/v2/_e2e/*`（11 端点） | _e2e | seed hook（2026-09-14，dev/test 默认） |
 
 > 这些是 Rust 重构时**主动设计差异**（非缺失），无需向 Python 对齐。
 
@@ -209,13 +218,10 @@
 
 | 模块 | 路由前缀 | handler.rs 函数数 | 状态 |
 |---|---|---:|---|
-| `cnc_program` | `/api/v2/cnc-programs` | 0 | mod.rs 是空 `Router::new()` |
-| `outsource` | `/api/v2/outsource` | 0 | 同上 |
-| `part_file` | `/api/v2/part-files` | 0 | 仅 3 个 repo 壳函数 |
-| `statistics` | `/api/v2/statistics` | 0 | 空 Router |
-| `dashboard` (WS) | `/ws/dashboard` | 0 | `ws_handler_stub` 空函数 |
+| `statistics` | `/api/v2/statistics` | 0 | 5 个聚合读端点占位 |
+| `dashboard` (WS) | `/ws/dashboard` | 0 | `ws_handler_stub` 空函数（待握手实现） |
 
-> **🔧 待实施**：4 域三件套 + 1 WS handler 实现。优先级建议 `statistics` < `part_file` < `cnc_program` < `outsource` < `dashboard`。
+> **🔧 待实施**：2 项（statistics + dashboard WS 握手）。优先级建议 `dashboard WS` < `statistics`。
 
 ---
 
@@ -224,8 +230,8 @@
 | 维度 | Rust | Python |
 |---|---|---|
 | 路径 | `/ws/dashboard` | `/api/v1/ws/dashboard` |
-| 实现状态 | 空 stub（`ws_handler_stub`） | 完整实现（`api/v1/ws.py::ws_dashboard`，JWT 校验通过 query `token=` 或 Authorization header） |
-| 事件类型 | 已定义 `WsEvent` 枚举（`src/infra/ws_hub.rs`） | 实测可用 |
+| 实现状态 | 空 stub（`ws_handler_stub`），hub 已注册全部业务事件 | 完整实现（`api/v1/ws.py::ws_dashboard`，JWT 校验通过 query `token=` 或 Authorization header） |
+| 事件类型 | 已定义 `WsEvent` 枚举（`src/infra/ws_hub.rs`）+ 全部业务事件已注册 | 实测可用 |
 
 > **🔧 待实施**：(a) 把 WS 路径从 `/ws/dashboard` 改为 `/api/v2/ws/dashboard` 与 Python 对齐（或保留差异并文档化原因）；(b) 实现 `ws_handler_stub`：JWT 验签 + Redis session 校验 + 注册到 hub + 首连 `DashboardSnapshot` 下发。
 
@@ -253,3 +259,5 @@
 ---
 
 > ✅ 2026-08-28: 子件状态聚合已实现 — assembly auto-sync via inspection flow
+>
+> ✅ 2026-09-14: Phase 1/2/3 大批端点上线 — part 49 / assembly 8 / cnc_program 2 / part_file 3 / outsource 16；part 域部分缺失从 32 缩至 ~3；占位模块从 4 域缩至 2 域。

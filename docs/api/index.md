@@ -10,11 +10,17 @@
 > - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker + mapping，2026-08-26）
 > - [`./workers.md`](./workers.md) — workers 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26）
 > - [`./production/index.md`](./production/index.md) — **生产管理** 域（工种/工序/工序映射/工艺链/工人候选池；按前端 `production_group` 菜单整合为子目录，2026-09-12）
-> - [`./parts/index.md`](./parts/index.md) — part 域（to-inspection / to-ship 批量+单件 / to-process / **worker-scan**）
-> - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（装配体 CRUD + multipart PDF + 子件自动生成，2026-08-27）
+> - [`./parts/index.md`](./parts/index.md) — part 域（49 端点：to-inspection / to-ship 批量+单件 / to-process / **worker-scan** + Phase 1/2 全套批量与单件状态机扩展，2026-09-14）
+> - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（8 端点：装配体 CRUD + multipart PDF + 子件自动生成 + start + 子件 auto-rollup，2026-09-14 Phase 3）
+> - [`./cnc-programs.md`](./cnc-programs.md) — cnc_program 域（2 端点：配对上传 + 列表，2026-09-14 Phase 3）
+> - [`./files.md`](./files.md) — part_file 域（3 端点：上传 + 列表 + 下载 URL，2026-09-14 Phase 3）
+> - [`./outsource-companies.md`](./outsource-companies.md) — 外协公司（7 端点，2026-09-13 Phase 2）
+> - [`./outsource-quotes.md`](./outsource-quotes.md) — 外协报价（8 端点，2026-09-13 Phase 2）
+> - [`./outsource-shipments.md`](./outsource-shipments.md) — 外协发货（1 端点：reconcile-update，2026-09-13 Phase 2）
 > - [`./delivery-notes/index.md`](./delivery-notes/index.md) — delivery_notes 域（已拆为子目录：[queries](./delivery-notes/queries.md) / [drafts](./delivery-notes/drafts.md) / [workflow](./delivery-notes/workflow.md) / [print](./delivery-notes/print.md)）
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
-> - [`./websocket.md`](./websocket.md) — WebSocket（含 **WORKER_SCAN_* / WORKER_POOL_***）
+> - [`./_e2e.md`](./_e2e.md) — e2e seed hook（11 端点；dev/test 默认启用，release profile 硬关，2026-09-14）
+> - [`./websocket.md`](./websocket.md) — WebSocket（含 **WORKER_SCAN_* / WORKER_POOL_* / 12+ 业务事件**）
 >
 > **同步流程**：
 > 1. 修改 `src/modules/<mod>/{handler.rs,dto.rs,service.rs}`
@@ -155,27 +161,30 @@ HTTP 状态码：
 | shelves | [`./shelves.md`](./shelves.md) | 11 | ✅ 完全上线（CRUD + picker + mapping，2026-08-26） |
 | workers | [`./workers.md`](./workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26） |
 | **生产管理** | [`./production/index.md`](./production/index.md) | **19** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池；按前端 `production_group` 菜单整合为子目录，2026-09-12） |
-| part | [`./parts/index.md`](./parts/index.md) | 6 | 🟢 单件+批量通过品检、一键送检（单/批）、单件打回、worker-scan（2026-08-25） |
-| assembly | [`./assemblies/index.md`](./assemblies/index.md) | 6 | 🟢 CRUD + multipart PDF + 子件自动生成 + L1→L2 展开（2026-08-27） |
+| part | [`./parts/index.md`](./parts/index.md) | **49** | ✅ 完全上线（Phase 1+2 全部状态机 / 批量 / 扫码 / pick-up 端点落地，2026-09-14） |
+| assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
+| cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
+| part-files | [`./files.md`](./files.md) | 3 | ✅ 完全上线（2026-09-14，Phase 3） |
+| outsource-companies | [`./outsource-companies.md`](./outsource-companies.md) | 7 | ✅ 完全上线（2026-09-14，Phase 2） |
+| outsource-quotes | [`./outsource-quotes.md`](./outsource-quotes.md) | 8 | ✅ 完全上线（2026-09-14，Phase 2） |
+| outsource-shipments | [`./outsource-shipments.md`](./outsource-shipments.md) | 1 | ✅ 完全上线（2026-09-14，Phase 2） |
 | delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
-| websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub（worker-pool WS 事件已注册，待 hub 真实握手） |
-| 其他 9 域 | — | 0 | ⚪ 仅占位（见下） |
+| process-chains | [`./production/process-chain.md`](./production/process-chain.md) | 2 | ✅ 完全上线（2026-09-12，process_chain 域） |
+| _e2e | [`./_e2e.md`](./_e2e.md) | 11 | ✅ 完全上线（2026-09-14，e2e seed hook，dev/test profile） |
+| websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub（handler 已搭骨架，待握手实现） |
+| 其他 1 域 | — | 0 | ⚪ 仅占位（见下） |
 
 ---
 
 ## 未上线域（前端勿调用）
 
-> 📋 Rust vs Python myERP 接口差距清单：[`./inconsistencies.md`](./inconsistencies.md)（4 域整域缺失 + 32 个 part 端点缺失 + WS 路径不一致）
+> 📋 Rust vs Python myERP 接口差距清单：[`./inconsistencies.md`](./inconsistencies.md)（1 域整域缺失 + 大部分 part gap 已补齐 + WS 路径差异）
 
 | 域 | 路由前缀 | 状态 |
 |---|---|---|
-| `part` | `/api/v2/parts` | 同上 |
-| `cnc_program` | `/api/v2/cnc-programs` | 同上 |
-| `part_file` | `/api/v2/part-files` | 同上 |
-| `outsource` | `/api/v2/outsource` | 同上 |
-| `statistics` | `/api/v2/statistics` | 同上 |
-| `part_batch` | （未挂载路由） | 仅供后端内部复用 |
+| `statistics` | `/api/v2/statistics` | 同上（5 个聚合读端点占位，纯查询域） |
+| `part_batch` | （未挂载独立路由） | 内部复用，无独立前端 API |
 
 > 调用任何"未上线域"会得到 `404 Not Found`（不是 panic / 500）。
 > 后续域实施后，需**在本目录新增对应文件**（参照现有 `<module>.md` 模板）。
@@ -216,21 +225,21 @@ HTTP 状态码：
 | 段 | 域 |
 |---|---|
 | 200xx | 用户/订单（USER_NOT_FOUND 20001 / USER_DUPLICATE 20002 / ORDER_NOT_FOUND 20003） |
-| 201xx | 零件/客户/序列号（PART_NOT_FOUND 20101 / CUSTOMER_NOT_FOUND 20102 / INVALID_TRANSITION 20103 / INVALID_VALUE 20104 / ... / PART_BATCH_NOT_FOUND 20109 / CUSTOMER_IN_USE 20113 / **PART_BATCH_NOT_HELD_BY_WORKER 20114**） |
+| 201xx | 零件/客户/序列号（PART_NOT_FOUND 20101 / CUSTOMER_NOT_FOUND 20102 / INVALID_TRANSITION 20103 / INVALID_VALUE 20104 / SERIAL_EXHAUSTED 20105 / ... / PART_BATCH_NOT_FOUND 20109 / PRICE_LOCKED_BY_ASSEMBLY 20110 / PART_BATCH_INVALID_QUANTITY 20111 / PART_QUANTITY_LOCKED 20112 / CUSTOMER_IN_USE 20113 / **PART_BATCH_NOT_HELD_BY_WORKER 20114 / PART_ALREADY_CANCELLED 20115 / PART_NOT_DELIVERED 20116 / PART_NOT_READY_TO_SHIP 20117 / PART_REPAIR_NOT_TRIGGERED 20118 / PART_NOT_DELETABLE 20119**） |
 | 202xx | 工人（WORKER_NOT_FOUND 20201 / WORKER_INACTIVE 20202 / WORKER_IN_USE 20203 / WORKER_HOLD_LIMIT_EXCEEDED 20204 / **WORKER_POOL_EMPTY 20205 / NO_WORK_TYPE 20206**） |
-| 203xx | 装配体（ASSEMBLY_NOT_FOUND 20301 / BAD_CUSTOMER 20302 / TOO_MANY_CHILDREN 20303） |
+| 203xx | 装配体（ASSEMBLY_NOT_FOUND 20301 / BAD_CUSTOMER 20302 / TOO_MANY_CHILDREN 20303 / **PDF_INVALID 20305 / CHILD_PRICE_LOCKED 20306 / HAS_SHIPMENT 20307 / CUSTOMER_NO_SERIAL_PREFIX 20308**） |
 | 204xx | 图纸文件（DRAWING_FILE_NOT_FOUND 20401 / BAD_TYPE 20402 / TOO_LARGE 20403 / UPLOAD_FAILED 20404） |
-| 205xx | 货架（SHELF_NOT_FOUND 20501 / DUPLICATE_CODE 20502 / IN_USE 20503 / ... / PROCESS_NOT_MAPPED 20507 / NOT_INSPECTION_ZONE 20511 / INACTIVE 20512） |
+| 205xx | 货架（SHELF_NOT_FOUND 20501 / DUPLICATE_CODE 20502 / IN_USE 20503 / **PROCESS_SHELF_NOT_FOUND 20504 / PROCESS_PROCESS_NOT_FOUND 20505 / NO_MATCH_FOR_PROCESS 20506** / PROCESS_NOT_MAPPED 20507 / NOT_INSPECTION_ZONE 20511 / INACTIVE 20512） |
 | 206xx | 账号（USER_ACCOUNT_NOT_FOUND 20601 / DUPLICATE_USERNAME 20602 / INACTIVE 20603 / ROLE_DUPLICATE 20604 / ROLE_NOT_FOUND 20605 / NO_ROLE 20606） |
+| 207xx | 工艺链（**PROCESS_CHAIN_NOT_FOUND 20701 / PROCESS_CHAIN_STEP_NOT_FOUND 20702 / WORK_TYPE_MAX_HELD_MINUTES_NOT_SET 20703 / AUTO_ALLOCATE_INVALID_RATIO 20704**） |
 | 208xx | 工序（PROCESS_NOT_FOUND 20801 / DUPLICATE_CODE 20802 / IN_USE 20803） |
 | 209xx | 工种（WORK_TYPE_NOT_FOUND 20901 / DUPLICATE_CODE 20902 / IN_USE 20903 / **MAX_HELD_NOT_SET 20904 / NO_PROCESS_MAPPING 20905**） |
-| 207xx | 工艺链（**PROCESS_CHAIN_NOT_FOUND 20701 / PROCESS_CHAIN_STEP_NOT_FOUND 20702 / WORK_TYPE_MAX_HELD_MINUTES_NOT_SET 20703 / AUTO_ALLOCATE_INVALID_RATIO 20704**） |
 | 210xx | 申请人（APPLICANT_NOT_FOUND 21001 / DUPLICATE_NAME 21002 / BAD_CUSTOMER 21003 / IN_USE 21004） |
 | 211xx | 零件文件 / 模板（PART_FILE_NOT_FOUND 21101 / BAD_TYPE 21102 / TOO_LARGE 21103 / UPLOAD_FAILED 21104 / OWNER_NOT_FOUND 21105 / DUPLICATE 21108 / DELIVERY_TEMPLATE_NOT_CONFIGURED 21109 / DELIVERY_PART_STATUS_INVALID 21111 / TEMPLATE_TOO_MANY_PARTS 21112 / PRINT_BAD_ORDER 21113）⚠️ 21110 已 deprecated 别名 = 21407 |
 | 212xx | 外协公司（OUTSOURCE_COMPANY_NOT_FOUND 21201 / DUPLICATE 21202 / BAD_PROCESS 21203 / PROCESS_NOT_MAPPED 21204 / IN_USE 21205 / **PART_NOT_OUTSOURCEABLE 21206 / DIRECT_REQUIRES_C2_SHELF 21207 / NO_SHELF 21208**） |
 | 213xx | 外协报价（OUTSOURCE_QUOTE_NOT_FOUND 21301 / INVALID_TRANSITION 21302 / DUPLICATE 21303 / NOT_APPROVED 21307） |
-| 214xx | 送货单（NOT_FOUND 21401 / INVALID_TRANSITION 21402 / NOT_DRAFT 21403 / NOT_SUBMITTED 21404 / PART_NOT_READY 21405 / PART_ALREADY_ASSIGNED 21406 / PARTS_MULTIPLE_CUSTOMERS 21407 / SCAN_MISMATCH 21408 / DRIVER_INVALID 21409 / SCAN_INCOMPLETE 21410 / INVALID_VALUE 21411 / PARTS_LOCKED 21412 / GROUP_NOT_FOUND 21413 / GROUP_DUPLICATE_NAME 21414 / GROUP_MEMBER_CONFLICT 21415 / SCOPE_MISMATCH 21416 / SCAN_UNKNOWN_CODE 21417 / ASSEMBLY_PARTS_NOT_READY 21418 / DRAFT_SCOPE_CONFLICT 21419 / **BATCH_STATE_INVALID 21421**） |
-| 215xx | 外协发货（OUTSOURCE_SHIPMENT_NOT_FOUND 21501） |
+| 214xx | 送货单（NOT_FOUND 21401 / INVALID_TRANSITION 21402 / NOT_DRAFT 21403 / NOT_SUBMITTED 21404 / PART_NOT_READY 21405 / PART_ALREADY_ASSIGNED 21406 / PARTS_MULTIPLE_CUSTOMERS 21407 / SCAN_MISMATCH 21408 / DRIVER_INVALID 21409 / SCAN_INCOMPLETE 21410 / INVALID_VALUE 21411 / PARTS_LOCKED 21412 / GROUP_NOT_FOUND 21413 / GROUP_DUPLICATE_NAME 21414 / GROUP_MEMBER_CONFLICT 21415 / SCOPE_MISMATCH 21416 / SCAN_UNKNOWN_CODE 21417 / ASSEMBLY_PARTS_NOT_READY 21418 / DRAFT_SCOPE_CONFLICT 21419 / LOCKED_PART 21420 / **BATCH_STATE_INVALID 21421**） |
+| 215xx | 外协发货（OUTSOURCE_SHIPMENT_NOT_FOUND 21501 / **INVALID_TRANSITION 21502 / NO_OPEN 21503 / QUANTITY_EXCEEDS 21504**） |
 
 ---
 

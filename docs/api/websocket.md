@@ -42,11 +42,23 @@ Request：
 | ↳ `PART_TO_PROCESS` | to-process 成功后 | `part_id` |
 | ↳ `BATCH_TO_SHIP` | batch-to-ship 完成后 | `{ submitted: i64, failed: i64 }`（仅计数，非完整数组；前端若需明细直接调 `GET /api/v2/parts/{id}`） |
 | ↳ `BATCH_TO_INSPECTION` | batch-to-inspection 完成后 | `{ submitted: i64, failed: i64 }`（仅计数，非完整数组） |
+| ↳ `PART_SOFT_DELETED` | part 软删 | `part_id` |
+| ↳ `PART_DELIVERED` | part deliver 成功（2 处广播：lifecycle + scan/deliver-part） | `part_id`, `batch_id` |
+| ↳ `PART_BATCH_SPLIT` | 批次拆分 | `part_id`, `batch_id`, `new_batch_id` |
+| ↳ `PART_BATCH_CANCELLED` | 批次取消 | `part_id`, `batch_id` |
+| ↳ `PART_SCAN_INSPECT_PASSED` | 扫码品检通过 | `part_id`, `batch_id` |
+| ↳ `PART_SCAN_INSPECT_FAILED` | 扫码品检失败 | `part_id`, `batch_id`, `reason` |
+| ↳ `PART_BATCH_WITH_PDFS_CREATED` | 多页 PDF 批量创建 | `part_ids`, `count` |
+| ↳ `PART_PICKED_UP` | B 方案手动 pick-up 成功（Phase 2） | `part_id`, `worker_id`, `batch_id` |
 | ↳ `WORKER_SCAN_RETURNED` | parts worker-scan RETURNED 成功后 | `worker_id`, `part_id`, `batch_id`, `event_type` |
 | ↳ `WORKER_SCAN_INSPECTED` | parts worker-scan INSPECTED 成功后 | `worker_id`, `part_id`, `batch_id`, `event_type`, `target_inspection_shelf_id` |
 | ↳ `WORKER_POOL_REFILL_DONE` | worker-scan / admin-refill 完成后（refill 抢到一批） | `worker_id`, `shelf_id`, `taken: [TakenItem]`, `pool_empty` |
 | ↳ `WORKER_POOL_EMPTY` | refill 池空（refill 没抢到任何一批） | `worker_id`, `shelf_id` |
 | ↳ `WORKER_POOL_ADMIN_REMOVED` | admin remove 完成后 | `batch_id`, `part_id`, `batch_no`, `quantity`, `serial_no`, `drawing_no`, `system_delivery_date`, `planned_delivery_date`, `is_urgent`, `version`, `worker_id`, `shelf_id`, `next_process_id` |
+| ↳ `WORKER_POOL_AUTO_ALLOCATE_DONE` | auto-allocate 批量分配完成 | `worker_id`, `allocated_count`, `process_id` |
+| ↳ `ASSEMBLY_CREATED` | 装配件创建 | `assembly_id` |
+| ↳ `ASSEMBLY_DELETED` | 装配件软删 | `assembly_id` |
+| ↳ `ASSEMBLY_CANCELLED` | 装配件取消 | `assembly_id` |
 | ↳ `ASSEMBLY_UPDATED` | 父装配件 status 更新（前端主动改字段 / inspection 流 auto-rollup） | `assembly_id` |
 | `Notification` | 通知 | `user_id`, `content` |
 | `Heartbeat` | 心跳 | `ts` |

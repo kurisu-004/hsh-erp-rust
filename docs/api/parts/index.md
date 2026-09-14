@@ -37,8 +37,47 @@
 | POST | `/api/v2/parts/{part_id}/to-ship` | Manager / Inspector | 单件通过品检（INSPECTION → READY_TO_SHIP） | [`inspection.md`](./inspection.md#post-apiv2partspart_idto-ship) |
 | POST | `/api/v2/parts/{part_id}/to-process` | Manager / Inspector | 单件指定下一工序（INSPECTION → IN_PROCESS） | [`inspection.md`](./inspection.md#post-apiv2partspart_idto-process) |
 | POST | `/api/v2/parts/worker-scan` | **Manager** / **ShelfAccount** | 工人扫码归还 / 送检；成功后同事务触发 worker-pool refill | [`inspection.md`](./inspection.md#post-apiv2partsworker-scan) |
+| GET | `/api/v2/parts/pending-programming` | Manager / Clerk / Inspector / CncProgrammer | 待编程列表（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
+| GET | `/api/v2/parts/outsource-in-flight` | Manager / Clerk / Inspector / CncProgrammer | 外协在途列表（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
+| GET | `/api/v2/parts/outsource-sendable` | Manager / Clerk / Inspector / CncProgrammer | 可发外协列表（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
+| GET | `/api/v2/parts/repair-batches` | Manager / Inspector | 维修批次列表（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
+| GET | `/api/v2/parts/repairing-batches` | Manager / Inspector | 维修中批次列表（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
+| GET | `/api/v2/parts/location-tree` | Manager / Clerk / Inspector / CncProgrammer | 库位树（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
+| POST | `/api/v2/parts/scan/deliver-part` | Manager / Clerk | 扫码发货（Phase 1） | [`inspection.md`](./inspection.md#post-apiv2partsscandeliver-part) |
+| POST | `/api/v2/parts/match-by-excel-items` | Manager / Clerk | Excel 行匹配（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
+| POST | `/api/v2/parts/batch-update-order-info` | Manager / Clerk | 批量更新订单信息（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
+| POST | `/api/v2/parts/batch-with-pdfs` | Manager / Clerk | 多页 PDF 树形创建（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
+| GET | `/api/v2/parts/by-work-type/{work_type_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工种查 part（Phase 2） | [`crud.md`](./crud.md#phase-2-工种工人视角) |
+| GET | `/api/v2/parts/pickable-by-work-type/{work_type_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工种查可领取 part（Phase 2） | [`crud.md`](./crud.md#phase-2-工种工人视角) |
+| GET | `/api/v2/parts/by-worker/{worker_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工人查持有 part（Phase 2） | [`crud.md`](./crud.md#phase-2-工种工人视角) |
+| POST | `/api/v2/parts/{part_id}/place-on-shelf` | Manager / Clerk | 上架（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idplace-on-shelf) |
+| POST | `/api/v2/parts/{part_id}/recall-to-pending` | Manager / Clerk | 召回至 PENDING（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idrecall-to-pending) |
+| POST | `/api/v2/parts/{part_id}/send-to-programming` | Manager / Clerk | 派发编程（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idsend-to-programming) |
+| POST | `/api/v2/parts/{part_id}/release-from-programming` | Manager / Clerk | 编程完成释放（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idrelease-from-programming) |
+| POST | `/api/v2/parts/{part_id}/recall-to-programming` | Manager / Clerk | 召回编程（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idrecall-to-programming) |
+| POST | `/api/v2/parts/{part_id}/send-to-outsource` | Manager / Clerk | 派发外协（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idsend-to-outsource) |
+| POST | `/api/v2/parts/{part_id}/receive-from-outsource` | Manager / Clerk | 外协回收入库（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idreceive-from-outsource) |
+| POST | `/api/v2/parts/{part_id}/receive-from-outsource-to-inspection` | Manager / Clerk / Inspector | 外协回收 → 品检（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idreceive-from-outsource-to-inspection) |
+| POST | `/api/v2/parts/{part_id}/complete-repair` | Manager / Clerk / Inspector | 完成维修（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idcomplete-repair) |
+| POST | `/api/v2/parts/{part_id}/repair-dispatch` | Manager / Clerk | 派发维修（Phase 1） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idrepair-dispatch) |
+| POST | `/api/v2/parts/{part_id}/scan-inspect` | Manager / Inspector | 扫码品检（Phase 1） | [`inspection.md`](./inspection.md#post-apiv2partspart_idscan-inspect) |
+| GET | `/api/v2/parts/{part_id}/events` | Manager / Clerk / Inspector / CncProgrammer | 工单事件时间线（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
+| GET | `/api/v2/parts/{part_id}/batches` | Manager / Clerk / Inspector / CncProgrammer | 列出 part 下所有批次（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
+| POST | `/api/v2/parts/{part_id}/batches/split` | Manager / Clerk | 拆分批次（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
+| POST | `/api/v2/parts/{part_id}/batches/{batch_id}/cancel` | Manager / Clerk | 取消批次（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
+| POST | `/api/v2/parts/{part_id}/pick-up` | Manager / Clerk / ShelfAccount | B 方案手动 pick-up 兜底（Phase 2） | [`inspection.md`](./inspection.md#post-apiv2partspart_idpick-up) |
 
-> 路由顺序：`/batch-to-inspection`、`/batch-to-ship`、`/batch`、`/by-serial/{serial_no}`、`/worker-scan` 必须在 `/{part_id}/...` 之前注册（axum 防止静态段被解析成 `part_id`）。
+> 路由顺序：所有静态段必须在 `/{part_id}/...` catch-all 前注册。`src/modules/part/mod.rs` 当前注册顺序：
+> 1. `GET /` + `POST /`
+> 2. `POST /batch`
+> 3. `GET /by-serial/{serial_no}` + `GET /by-serial/{serial_no}/part-batches`
+> 4. `POST /batch-to-ship` + `POST /batch-to-inspection` + `GET /inspection-batches`
+> 5. `POST /worker-scan`
+> 6. Phase 1 静态段：`pending-programming` / `outsource-in-flight` / `outsource-sendable` / `repair-batches` / `repairing-batches` / `location-tree` / `scan/deliver-part` / `match-by-excel-items` / `batch-update-order-info` / `batch-with-pdfs`
+> 7. Phase 2 静态段：`by-work-type/{work_type_id}` / `pickable-by-work-type/{work_type_id}` / `by-worker/{worker_id}`
+> 8. `GET /{part_id}` + Phase 1 单件 catch-all + `POST /{part_id}/to-ship` / `to-inspection` / `to-process`
+>
+> axum `/:col` 占位匹配会**先吃静态段**——任何静态段如果排在 `/{part_id}` 之后都会被解析成 `part_id`，返回 404。
 
 ---
 
@@ -62,7 +101,7 @@
 
 ### PartListItem 字段
 
-`TPart` 完整 28 列 + `customer_name` / `l1_customer_name` 冗余字段；见 [`../auth.md`](../auth.md) 关于 i64 字段序列化为 string 的约定。
+`TPart` 完整 28 列 + `customer_name` / `l1_customer_name` 冗余字段；见 [`./index.md#mainconventions`](./index.md#端点约束与-python-一致) 关于 i64 字段序列化为 string 的约定。
 
 ### PartListOut 字段
 
@@ -84,7 +123,12 @@
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → `20101`
 - **状态机**：详见 [状态机（can_transition_to 白名单）](./inspection.md#状态机can_transition_to-白名单)；不在白名单内的 source / target 组合返回 `20103 BIZ_INVALID_TRANSITION`（迁移表见 `src/modules/part/statemachine.rs`）
 - **事件日志**：状态迁移在 service 内事务内统一插入对应事件，service 提交后由 WS 中枢广播
-- **part↔batch 同步**：lifecycle 终态 / 翻转（deliver / cancel / complete / start-repair）同事务内除翻 `t_part` 外还需翻最近一条 source-status 批次（`PartRepo::find_most_recent_batch_for_part`），保证候选批次不被 stale 状态污染
+- **part↔batch 同步（PR-B2/B3 改写，2026-09-11）**：
+  part.status 不再直接 UPDATE，而是由 `PartService::sync_from_batch_change`
+  按"最慢批次"规则 rollup（min-progress）。lifecycle 终态 / 翻转（deliver / cancel /
+  complete / start-repair）只在最近一条 source-status 批次上翻状态；装配体子件
+  rollup 同步触发（见 [`../assemblies/index.md#子件状态聚合`](../assemblies/index.md#子件状态聚合auto-rollup)）。
+  详见 [`docs/refactor-part-assembly-batch.md`](../../refactor-part-assembly-batch.md)。
 ---
 
 ## 状态机

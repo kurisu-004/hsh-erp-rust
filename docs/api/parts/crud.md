@@ -73,7 +73,7 @@ Request：`PartCreateRequest`
 
 Response 201 `data`：[`PartDetailOut`](./index.md#partdetailout-字段) — 含 TPart 完整列 + 客户冗余 + `current_batch_id`。
 
-错误码：40001（字段空 / quantity≤0）、40300（角色不符）、20105（customer 不存在）。
+错误码：40001（字段空 / quantity≤0）、40300（角色不符）、20102（customer 不存在）。
 
 ### `POST /api/v2/parts/batch`
 

@@ -62,10 +62,9 @@ delivery_note/
 
 | 文件 | 行数 | 建议拆法 |
 |---|---:|---|
-| `src/modules/part/service.rs` | **1168** | `service/{crud, lifecycle, relation}.rs` |
-| `src/modules/delivery_note/print.rs` | **1123** | `print/{template, xml_patch, barcode}.rs` |
-| `src/shared/error.rs` | 924 | 当逼近 1000 时按 HTTP / 业务码 / Python 兼容拆 |
-| `src/modules/part/repo.rs` | 951 | 同上，按 query / mutate 拆 |
+| `src/shared/error.rs` | **1012** | 已超 1000 行红线；按 HTTP / 业务码 / Python 兼容拆 `error/{http, biz, python_compat}.rs`（TODO §6） |
+| `src/modules/part/handler.rs` | **1244** | 已超 1000 行红线；按 CRUD / inspection / lifecycle / Phase 1 拆 `handler/{crud, inspection, lifecycle, phase1}.rs`（TODO §6） |
+| `src/modules/delivery_note/handler.rs` | 785 | 接近 800 行 PR 须说明拆分决策；建议按 CRUD / scan / print / group 拆 |
 
 **常见切分维度**（按本仓库已出现的 pattern 排序）：
 
@@ -354,14 +353,14 @@ let seq = g.sequence.wrapping_add(1) & MAX_SEQUENCE;
 
 下列项本次不实施，但本规约生效后即应排期：
 
-- [ ] 拆分 `src/modules/part/service.rs`（1168 → 按 `crud/lifecycle/relation` 拆）
-- [ ] 拆分 `src/modules/delivery_note/print.rs`（1123 → 按 `template/xml_patch/barcode` 拆）
-- [ ] 拆分 `src/modules/part/repo.rs`（951 → 按 `query/mutate` 拆，与 delivery_note 对齐）
+- [ ] 拆分 `src/shared/error.rs`（**1012** → 按 `error/{http, biz, python_compat}.rs` 拆）
+- [ ] 拆分 `src/modules/part/handler.rs`（**1244** → 按 `handler/{crud, inspection, lifecycle, phase1}.rs` 拆）
+- [ ] 拆分 `src/modules/delivery_note/handler.rs`（785 → 按 CRUD / scan / print / group 拆，接近红线）
 - [ ] 接入 `cargo-llvm-cov` 为 dev-dependency
 - [ ] 新增 `.github/workflows/ci.yml`：cargo check / clippy / test / sqlx_prepare / coverage gate
 - [ ] 新增 `clippy.toml`：`cognitive_complexity_threshold = 30`、`too_many_arguments_threshold = 8`、`type_complexity_threshold = 250`
 - [ ] 新增 `rustfmt.toml`：`max_width = 100`、`imports_granularity = "Crate"`
-- [ ] 为 13 个 stub 业务域补 0 行业务代码（按 `docs/architecture.md` §7 路线图）
+- [ ] 为 **2 个** stub 业务域补 0 行业务代码：`statistics` 聚合读（5 端点）+ `dashboard` WS 握手实装
 - [ ] PR 模板（`.github/PULL_REQUEST_TEMPLATE.md`）含"已读 [docs/conventions.md](../docs/conventions.md)"勾选项
 
 ---

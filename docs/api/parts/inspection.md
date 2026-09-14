@@ -291,7 +291,7 @@ Response 200 `data`：`ToXxxOut`
 - 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不存在 / 不属于该工单 / 已划掉；或其状态不是 `INSPECTION`
 - 20111 BIZ_PART_BATCH_INVALID_QUANTITY — `quantity ≤ 0`
 - 20501 BIZ_SHELF_NOT_FOUND — `shelf_id` 不存在
-- 20507 BIZ_SHELF_PROCESS_NOT_MAPPED — `shelf_id` ↔ `next_process_id` 未映射（**待 shelf 域 PR 启用**，当前不报）
+- 20507 BIZ_SHELF_PROCESS_NOT_MAPPED — `shelf_id` ↔ `next_process_id` 未映射（shelf 域 2026-08-26 已上线，**现已在 service 内触发**）
 - 20512 BIZ_SHELF_INACTIVE — `shelf.is_active = false`
 - 40901 VERSION_CONFLICT — caller 传的 `version` ≠ 目标批次当前 `version`（见 [乐观锁](#乐观锁caller-侧-occ)）；或事务内 UPDATE 撞并发
 - HTTP 422 — payload shape / 必填字段缺失（`shelf_id` / `next_process_id` / `batch_id` / `version` / 空 body）：axum `Json` extractor 在 service 之前直接拒，**非项目统一信封**
