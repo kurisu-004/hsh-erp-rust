@@ -15,6 +15,29 @@
 | POST | `/api/v2/part-files` | Manager / Clerk / CncProgrammer | 单文件上传（multipart：`data` JSON + `file` 二进制） |
 | GET | `/api/v2/part-files` | Manager / Clerk / Inspector / CncProgrammer | 列表 + 分页（owner_kind / owner_id / kind 过滤） |
 | GET | `/api/v2/part-files/{file_id}/url` | Manager / Clerk / Inspector / CncProgrammer | 单条详情 + COS 预签下载 URL（默认 1h） |
+| GET | `/api/v2/part-files/{file_id}/content` | Manager / Clerk / Inspector / CncProgrammer | 后端代理文件二进制流（透传 content_type） |
+| POST | `/api/v2/part-files/{file_id}/delete` | 按 `kind` 派生（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；G_CODE → M+CNC） | 软删 + COS 异步清理 |
+
+### `POST /api/v2/part-files/{file_id}/delete`
+
+入参（JSON）：`{ "version": i32 }`（OCC）。
+
+权限按 kind 派生：
+
+| kind | 允许角色 |
+|---|---|
+| `DRAWING` / `3D_MODEL` / `CAD_2D` / `SETUP_SHEET` | Manager / Clerk |
+| `G_CODE` | Manager / CncProgrammer |
+
+行为：乐观锁守；UPDATE `deleted_at = now()` + `version = version + 1`；handler commit 后 `tokio::spawn` 异步调 `cos.delete_object`（失败仅 warn，不阻断）。
+
+错误码：
+
+| code | 名称 | HTTP | 触发场景 |
+|---|---|---|---|
+| 21101 | BIZ_PART_FILE_NOT_FOUND | 404 | file_id 不存在 |
+| 21102 | BIZ_PART_FILE_BAD_TYPE | 400 | kind 不可软删 |
+| 40901 | VERSION_CONFLICT | 409 | version 不匹配 |
 
 ---
 

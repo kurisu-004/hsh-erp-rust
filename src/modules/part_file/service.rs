@@ -306,6 +306,119 @@ pub async fn list_part_files_for_owner(
     PartFileRepo::list_by_owner(conn, owner_kind, owner_id).await
 }
 
+// ===== 2026-09-15 takeover-fill：content / delete（Phase 3 补齐） =====
+
+/// 后端代理文件二进制流：拉 `object_key` → COS `get_object` → 透传 content_type。
+///
+/// 权限：4 角色任意已登录（与 `get_file_with_url` 一致）。
+pub struct PartFileContent {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
+impl PartFileService {
+    /// `GET /api/v2/part-files/{file_id}/content`。
+    pub async fn get_file_content(
+        conn: &mut PgConnection,
+        cos: Arc<dyn CosClient>,
+        file_id: i64,
+        current: &CurrentUser,
+    ) -> Result<PartFileContent, AppError> {
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
+        let row = PartFileRepo::get_by_id(conn, file_id, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_FILE_NOT_FOUND,
+                    format!("part_file {file_id} 不存在"),
+                )
+            })?;
+        let bytes = cos.get_object(&row.object_key).await?;
+        Ok(PartFileContent {
+            bytes,
+            content_type: Some(row.content_type),
+        })
+    }
+
+    /// `POST /api/v2/part-files/{file_id}/delete`。
+    ///
+    /// 权限：按 `kind` 派生（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；
+    /// G_CODE → M+CNC）。
+    /// 行为：乐观锁守；UPDATE `deleted_at = now()` + `version = version + 1`；commit 后
+    /// 异步调 `cos.delete_object`（失败仅 warn，不阻断）。
+    pub async fn soft_delete_file(
+        conn: &mut PgConnection,
+        cos: Arc<dyn CosClient>,
+        file_id: i64,
+        version: i32,
+        current: &CurrentUser,
+    ) -> Result<(), AppError> {
+        let row = PartFileRepo::get_by_id(&mut *conn, file_id, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_FILE_NOT_FOUND,
+                    format!("part_file {file_id} 不存在"),
+                )
+            })?;
+        let kind = row.kind.clone();
+        let object_key = row.object_key.clone();
+        // 按 kind 派生权限
+        match kind.as_str() {
+            "DRAWING" | "3D_MODEL" | "CAD_2D" | "SETUP_SHEET" => {
+                current.require_any_role(&[Role::Manager, Role::Clerk])?;
+            }
+            "G_CODE" => {
+                current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
+            }
+            other => {
+                return Err(AppError::biz(
+                    code::BIZ_PART_FILE_BAD_TYPE,
+                    format!("kind={other:?} 不可软删（仅 DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET / G_CODE）"),
+                ));
+            }
+        }
+
+        let rows_affected = sqlx::query(
+            "UPDATE t_part_file \
+             SET deleted_at = now(), \
+                 version    = version + 1, \
+                 updated_at = now(), \
+                 updated_by = $2 \
+             WHERE id = $1 AND version = $3 AND deleted_at IS NULL",
+        )
+        .bind(file_id)
+        .bind(current.id)
+        .bind(version)
+        .execute(conn)
+        .await
+        .map_err(AppError::from)?
+        .rows_affected();
+        if rows_affected == 0 {
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                format!("part_file {file_id} 版本冲突（version={version}）"),
+            ));
+        }
+
+        // COS 异步清理（best-effort；handler commit 后台跑）
+        let cos = cos.clone();
+        let key = object_key.clone();
+        tokio::spawn(async move {
+            if let Err(e) = cos.delete_object(&key).await {
+                tracing::warn!(key = %key, error = %e, "part_file COS 异步清理失败（已软删）");
+            }
+        });
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

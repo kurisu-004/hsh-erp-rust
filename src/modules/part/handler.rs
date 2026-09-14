@@ -35,6 +35,8 @@ use crate::modules::part::dto::{
 };
 use crate::modules::part::service::{PartService, BATCH_TO_SHIP_MAX_ITEMS};
 use crate::modules::worker_pool::service::WorkerPoolService;
+use crate::modules::cnc_program::service::CncProgramService;
+use crate::modules::part_file::service::PartFileService;
 use crate::shared::error::{code, AppError};
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -1240,6 +1242,251 @@ pub async fn list_by_worker(
 ) -> Result<Json<R<crate::modules::part::dto_crud::PartListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = PartService::list_by_worker(&mut tx, worker_id, &query, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+// ===== 2026-09-15 takeover-fill：part 文件路由（Phase 3 补齐） =====
+
+/// 内部辅助：解析 multipart `file` 字段（与 upload_drawing / upload_3d_model 同形）。
+async fn read_part_file_multipart(
+    mut multipart: axum::extract::Multipart,
+) -> Result<(Vec<u8>, String, String), AppError> {
+    let mut bytes: Option<(Vec<u8>, String, Option<String>)> = None;
+    let mut file_seen = false;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            if file_seen {
+                return Err(AppError::validation("multipart 包含多个 'file' 字段"));
+            }
+            file_seen = true;
+            let fname = field.file_name().unwrap_or("upload.bin").to_string();
+            let ct = field.content_type().map(|m| m.to_string());
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::validation(format!("file 读取失败: {e}")))?
+                .to_vec();
+            bytes = Some((data, fname, ct));
+        } else {
+            return Err(AppError::validation(format!(
+                "multipart 未知字段: '{name}'（仅接受 'file'）"
+            )));
+        }
+    }
+    let (data, fname, ct) = bytes.ok_or_else(|| AppError::validation("multipart 缺少 'file' 字段"))?;
+    let ct = ct.ok_or_else(|| AppError::biz(crate::shared::error::code::BIZ_PART_FILE_BAD_TYPE, "file 缺少 content_type"))?;
+    Ok((data, fname, ct))
+}
+
+/// `POST /api/v2/parts/{part_id}/cad-files` —— 上传 CAD 文件（kind=CAD_2D）。
+pub async fn upload_cad_files(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    multipart: axum::extract::Multipart,
+) -> Result<Json<R<crate::modules::part_file::dto::PartFileOut>>, AppError> {
+    current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer])?;
+    let (data, fname, ct) = read_part_file_multipart(multipart).await?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartFileService::upload_file_for_owner(
+        &mut tx,
+        &state.snowflake,
+        state.cos.clone(),
+        "PART",
+        part_id,
+        "CAD_2D",
+        &fname,
+        &ct,
+        data,
+        &current,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `POST /api/v2/parts/{part_id}/cnc-programs` —— 上传 G_CODE（kind=G_CODE；M+CNC）。
+pub async fn upload_cnc_program(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    multipart: axum::extract::Multipart,
+) -> Result<Json<R<crate::modules::part_file::dto::PartFileOut>>, AppError> {
+    current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
+    let (data, fname, ct) = read_part_file_multipart(multipart).await?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartFileService::upload_file_for_owner(
+        &mut tx,
+        &state.snowflake,
+        state.cos.clone(),
+        "PART",
+        part_id,
+        "G_CODE",
+        &fname,
+        &ct,
+        data,
+        &current,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `POST /api/v2/parts/{part_id}/setup-sheets` —— 上传工艺卡 PDF（kind=SETUP_SHEET；M+CNC）。
+pub async fn upload_setup_sheet(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    multipart: axum::extract::Multipart,
+) -> Result<Json<R<crate::modules::part_file::dto::PartFileOut>>, AppError> {
+    current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
+    let (data, fname, ct) = read_part_file_multipart(multipart).await?;
+    let mut tx = state.pool.begin().await?;
+    let out = PartFileService::upload_file_for_owner(
+        &mut tx,
+        &state.snowflake,
+        state.cos.clone(),
+        "PART",
+        part_id,
+        "SETUP_SHEET",
+        &fname,
+        &ct,
+        data,
+        &current,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `POST /api/v2/parts/{part_id}/cnc-pair` —— 一次提交 G_CODE + SETUP_SHEET。
+pub async fn upload_cnc_pair(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    mut multipart: axum::extract::Multipart,
+) -> Result<Json<R<crate::modules::cnc_program::dto::CncPairOut>>, AppError> {
+    current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
+    let mut g: Option<(Vec<u8>, String, String)> = None;
+    let mut s: Option<(Vec<u8>, String, String)> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::validation(format!("multipart 解析失败: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        let fname = field.file_name().unwrap_or("upload.bin").to_string();
+        let ct = field
+            .content_type()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::validation(format!("{name} 读取失败: {e}")))?
+            .to_vec();
+        match name.as_str() {
+            "g_code" => g = Some((bytes, fname, ct)),
+            "setup_sheet" => s = Some((bytes, fname, ct)),
+            _ => {
+                return Err(AppError::validation(format!(
+                    "multipart 未知字段: '{name}'（仅接受 'g_code' / 'setup_sheet'）"
+                )))
+            }
+        }
+    }
+    let (g_bytes, g_name, g_ct) = g.ok_or_else(|| AppError::validation("缺少 g_code 字段"))?;
+    let (s_bytes, s_name, s_ct) = s.ok_or_else(|| AppError::validation("缺少 setup_sheet 字段"))?;
+    let mut tx = state.pool.begin().await?;
+    let out = CncProgramService::upload_cnc_pair(
+        &mut tx,
+        &state.snowflake,
+        state.cos.clone(),
+        part_id,
+        g_bytes,
+        &g_name,
+        &g_ct,
+        s_bytes,
+        &s_name,
+        &s_ct,
+        &current,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PartFilesQuery {
+    pub kind: Option<String>,
+}
+
+/// `GET /api/v2/parts/{part_id}/files` —— 列出 part 文件（kind 可选过滤）。
+pub async fn list_part_files(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Query(query): Query<PartFilesQuery>,
+) -> Result<Json<R<crate::modules::part_file::dto::PartFileListOut>>, AppError> {
+    current.require_any_role(&[
+        Role::Manager,
+        Role::Clerk,
+        Role::Inspector,
+        Role::CncProgrammer,
+    ])?;
+    let q = crate::modules::part_file::dto::PartFileListQuery {
+        owner_kind: Some("PART".into()),
+        owner_id: Some(part_id.to_string()),
+        kind: query.kind,
+        limit: Some(500),
+        offset: Some(0),
+    };
+    let mut tx = state.pool.begin().await?;
+    let out = PartFileService::list_files(&mut tx, &q, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `GET /api/v2/parts/{part_id}/cnc-programs` —— 列出 part 下 G_CODE 文件。
+pub async fn list_part_cnc_programs(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+) -> Result<Json<R<crate::modules::part_file::dto::PartFileListOut>>, AppError> {
+    let q = crate::modules::part_file::dto::PartFileListQuery {
+        owner_kind: Some("PART".into()),
+        owner_id: Some(part_id.to_string()),
+        kind: Some("G_CODE".into()),
+        limit: Some(500),
+        offset: Some(0),
+    };
+    let mut tx = state.pool.begin().await?;
+    let out = PartFileService::list_files(&mut tx, &q, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `GET /api/v2/parts/{part_id}/setup-sheets` —— 列出 part 下 SETUP_SHEET 文件。
+pub async fn list_part_setup_sheets(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+) -> Result<Json<R<crate::modules::part_file::dto::PartFileListOut>>, AppError> {
+    let q = crate::modules::part_file::dto::PartFileListQuery {
+        owner_kind: Some("PART".into()),
+        owner_id: Some(part_id.to_string()),
+        kind: Some("SETUP_SHEET".into()),
+        limit: Some(500),
+        offset: Some(0),
+    };
+    let mut tx = state.pool.begin().await?;
+    let out = PartFileService::list_files(&mut tx, &q, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }

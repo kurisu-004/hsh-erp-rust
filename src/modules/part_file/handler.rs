@@ -1,11 +1,13 @@
-//! part_file 域 HTTP handler（2026-09-14 Phase 3）
+//! part_file 域 HTTP handler（2026-09-14 Phase 3 + 2026-09-15 takeover-fill）
 //!
 //! 对应 Python myERP/api/v1/part_file.py。
 //!
 //! ## 端点（挂在 `/api/v2/part-files`，由 `mod.rs::router()` 桥接）
-//! - `POST /`                  —— 单文件上传（multipart：`data` JSON + `file` 二进制）
-//! - `GET  /`                  —— 列表查询 + 分页（`owner_kind` / `owner_id` / `kind` 过滤）
-//! - `GET  /{file_id}/url`     —— 单条详情 + COS 预签下载 URL
+//! - `POST /`                            —— 单文件上传（multipart：`data` JSON + `file` 二进制）
+//! - `GET  /`                            —— 列表查询 + 分页（`owner_kind` / `owner_id` / `kind` 过滤）
+//! - `GET  /{file_id}/url`               —— 单条详情 + COS 预签下载 URL
+//! - `GET  /{file_id}/content`           —— 后端代理文件内容（Phase 3 补齐）
+//! - `POST /{file_id}/delete`            —— 软删 + COS 异步清理（Phase 3 补齐）
 //!
 //! ## 约束
 //! - 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
@@ -18,8 +20,10 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{Multipart, Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
@@ -38,6 +42,12 @@ pub struct UploadFileData {
     pub owner_kind: String, // PART / ASSEMBLY
     pub owner_id: String,   // 雪花 id 字符串
     pub kind: String,       // DRAWING / 3D_MODEL / ...
+}
+
+/// `POST /{file_id}/delete` 入参：版本号 OCC。
+#[derive(Debug, Deserialize)]
+pub struct DeletePartFileRequest {
+    pub version: i32,
 }
 
 /// `POST /api/v2/part-files`（multipart） → 201 Created
@@ -137,9 +147,59 @@ pub async fn get_part_file_url(
     Ok(Json(R::ok(out)))
 }
 
+/// `GET /api/v2/part-files/{file_id}/content` —— 后端代理文件二进制流。
+///
+/// 拉 `t_part_file.object_key` + COS `get_object`，透传 `content_type` 头。
+/// 权限：与 `get_part_file_url` 一致（任意已登录可读）。
+pub async fn get_part_file_content(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(file_id): Path<i64>,
+) -> Result<Response, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = PartFileService::get_file_content(
+        &mut tx,
+        state.cos.clone(),
+        file_id,
+        &current,
+    )
+    .await?;
+    tx.commit().await?;
+    let resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            out.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+        )
+        .header(header::CONTENT_LENGTH, out.bytes.len())
+        .body(Body::from(out.bytes))
+        .map_err(|e| AppError::internal(format!("response build: {e}")))?;
+    Ok(resp)
+}
+
+/// `POST /api/v2/part-files/{file_id}/delete` —— 软删 + COS 异步清理。
+///
+/// 入参（JSON）：`{ version: i32 }`（OCC）。
+/// 权限：按 kind 派生角色（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；
+/// G_CODE → M+CNC）。
+pub async fn soft_delete_part_file(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(file_id): Path<i64>,
+    Json(req): Json<DeletePartFileRequest>,
+) -> Result<Json<R<()>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    PartFileService::soft_delete_file(&mut tx, state.cos.clone(), file_id, req.version, &current)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok_empty()))
+}
+
 /// part_file 域 axum 子路由。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", post(upload_part_file).get(list_part_files))
         .route("/{file_id}/url", get(get_part_file_url))
+        .route("/{file_id}/content", get(get_part_file_content))
+        .route("/{file_id}/delete", post(soft_delete_part_file))
 }

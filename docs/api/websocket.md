@@ -1,26 +1,73 @@
 # WebSocket API
 
-> 本文件须与 `src/infra/ws_hub.rs` + `src/modules/dashboard/handler.rs` 保持同步
+> 本文件须与 `src/infra/ws_hub.rs` + `src/modules/dashboard/{handler,service,dto}.rs` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
 ## 端点列表
 
 | Method | Path | 权限 | 状态 |
 |---|---|---|---|
-| GET | `/ws/dashboard` | 已登录（**待 JWT 校验实现**） | 🟡 当前为 stub |
+| GET | `/ws/dashboard` | 任意已登录（*） | ✅ 2026-09-15 takeover-fill：真实握手 + 快照推送 + 业务事件订阅 |
+
+> 路径：挂在 `modules::ws_router()` 下 `/ws` 前缀（**不带** `/api/v2`，与前端 nginx `/ws/*` → `rust-backend:3000` 反代一致）。
 
 ---
 
 ### `GET /ws/dashboard`  （WebSocket 升级）
 
-权限: 已登录（**待 JWT 校验实现**）
+权限: 任意已登录用户（MANAGER / SHELF_ACCOUNT / CLERK / INSPECTOR / CNC_PROGRAMMER）。
 
 Request：
 
 - Header: `Upgrade: websocket`、`Connection: Upgrade`
-- 鉴权方式（**待定**：建议 query `?token=<access_token>` 或在握手时校验 Header）
+- 鉴权：query `?token=<access_token>`（必填）
 
-⚠️ **当前为 stub**：`src/modules/dashboard/handler.rs::ws_handler_stub` 是空函数，**未做 WebSocket 握手 / JWT 校验**，前端调用会**卡到超时**。请等待 `ws_handler_stub` 被替换为真实实现。
+握手流程：
+
+1. 解 JWT + 验签（`iss` 绑定 `config.jwt.issuer`，`exp` 校验）。
+2. 若 `REDIS_SESSION_CHECK_ENABLED=true`：查 Redis `session:tok:<sha256_hex>` 必须存在；缺失 → 40105 `SESSION_REVOKED`。
+3. `WebSocketUpgrade.on_upgrade` 触发 upgrade；失败（如 token 无效）走 axum normal response（HTTP 4xx + JSON 信封）。
+4. 连接建立后立即推一次 `WsSnapshotMsg`（完整快照）。
+5. 订阅 `state.ws_hub.broadcast`：
+   - `WsEvent::DashboardSnapshot { data }` → 转发 `{"type":"snapshot","data":data,"ts":...}`
+   - `WsEvent::DashboardEvent { kind, payload }` → 转发 `WsEventMsg { type:"event", event_type, data, ts }`
+   - `WsEvent::Notification` / `WsEvent::Heartbeat` → 丢弃（dashboard 不消费）
+6. 心跳：30s `WsHeartbeatMsg { type:"heartbeat", ts }`。
+7. 客户端 `Ping` → `Pong`；`Close` / `None` / 错误 → 清理连接。
+
+响应（连接建立后服务端首发）：
+
+```json
+{
+  "type": "snapshot",
+  "data": {
+    "on_production_shelves": [...],
+    "on_inspection_shelves": [...],
+    "in_process": [...],
+    "upcoming_delivery": [{"date":"2026-09-15","count":0}, ...7 条],
+    "ts": "2026-09-15T10:00:00+08:00"
+  },
+  "ts": "..."
+}
+```
+
+错误码（握手阶段，HTTP 响应）：
+
+| code | 名称 | HTTP | 触发场景 |
+|---|---|---|---|
+| 40100 | UNAUTHORIZED | 401 | 缺少 `?token` |
+| 40100 | UNAUTHORIZED | 401 | JWT 解码 / 验签失败（过期 / 签名错） |
+| 40105 | SESSION_REVOKED | 401 | Redis session 不存在 |
+
+> 错误码段说明：本端点用通用 `UNAUTHORIZED`（非业务码），与 `BIZ_AUTH_INVALID 40101`（登录失败）刻意区分。
+
+## 实现要点
+
+- 快照构造：`DashboardService::build_snapshot_with_workers`（service 内部 `pool.begin()` + `commit()`）。
+- 业务事件订阅：`tokio::sync::broadcast::Sender` 多生产者多消费者；客户端 buffer 受 `WsHub::new()` 的 channel 容量（1024）约束，慢消费方会丢消息——dashboard 不消费 Notification/Heartbeat 故影响可控。
+- 心跳：服务端 30s 周期 ping；客户端 pong 自动响应 axum（`Message::Ping` → `Message::Pong`）。
+- 鉴权镜像 HTTP `CurrentUser::from_request_parts` extractor 的 Redis 校验语义（含 TTL 滑动）。
+- i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
 
 ### 预期事件类型
 

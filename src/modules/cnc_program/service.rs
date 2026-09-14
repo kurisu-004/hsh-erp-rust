@@ -21,7 +21,9 @@ use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::cnc_program::dto::{CncFileRef, CncPairListItem, CncPairListOut, CncPairOut};
 use crate::modules::cnc_program::repo::CncProgramRepo;
+use crate::modules::part_file::dto::PartFileWithUrlOut;
 use crate::modules::part_file::repo::{hash_bytes, NewPartFile, PartFileRepo};
+use crate::modules::part_file::service::PartFileContent;
 use crate::shared::error::{code, AppError};
 
 pub struct CncProgramService;
@@ -237,6 +239,65 @@ impl CncProgramService {
         // 预签 URL 不入列表（懒加载）；单独端点取详情时再生成
         let _ = cos; // suppress unused
         Ok(CncPairListOut { items, total })
+    }
+}
+
+// ===== 2026-09-15 takeover-fill：cnc-programs alias 端点（Phase 3 补齐） =====
+
+impl CncProgramService {
+    /// `GET /api/v2/cnc-programs/{file_id}/download-url` —— alias。
+    ///
+    /// 直接复用 `PartFileService::get_file_with_url`，不再重复业务逻辑。
+    /// 权限：4 角色任意已登录（与 part_file 一致）。
+    pub async fn get_download_url(
+        conn: &mut PgConnection,
+        cos: Arc<dyn CosClient>,
+        file_id: i64,
+        current: &CurrentUser,
+    ) -> Result<PartFileWithUrlOut, AppError> {
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
+        crate::modules::part_file::service::PartFileService::get_file_with_url(
+            conn, cos, file_id, current,
+        )
+        .await
+    }
+
+    /// `GET /api/v2/cnc-programs/{file_id}/content` —— alias。
+    pub async fn get_content(
+        conn: &mut PgConnection,
+        cos: Arc<dyn CosClient>,
+        file_id: i64,
+        current: &CurrentUser,
+    ) -> Result<PartFileContent, AppError> {
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
+        crate::modules::part_file::service::PartFileService::get_file_content(
+            conn, cos, file_id, current,
+        )
+        .await
+    }
+
+    /// `POST /api/v2/cnc-programs/{file_id}/delete` —— alias。
+    pub async fn delete(
+        conn: &mut PgConnection,
+        cos: Arc<dyn CosClient>,
+        file_id: i64,
+        version: i32,
+        current: &CurrentUser,
+    ) -> Result<(), AppError> {
+        crate::modules::part_file::service::PartFileService::soft_delete_file(
+            conn, cos, file_id, version, current,
+        )
+        .await
     }
 }
 
