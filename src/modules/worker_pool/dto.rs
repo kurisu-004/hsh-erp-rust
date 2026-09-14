@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use crate::shared::types::{deserialize_i64, serialize_i64};
+use crate::shared::types::{deserialize_i64, deserialize_i64_opt, serialize_i64};
+
+use super::model::TakenItem;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -176,4 +178,48 @@ pub struct AutoAllocateResult {
     /// 注意：与单 worker `refill_for_worker` 不同——这里是「所有 worker 中途出现池空」，
     /// 不区分"容量触顶"与"池真空"（与单 worker 同语义；前端按 `pool_empty + filled` 综合判断）。
     pub pool_empty: bool,
+}
+
+// ---------------------------------------------------------------------------
+// admin assign 端点（follow-up-ux 2026-09-14 新增）
+// ---------------------------------------------------------------------------
+
+/// `POST /api/v2/admin/worker-pool/assign`
+///
+/// 把指定 batch 从候选池（shelf 上的某 shelf）单条分配给 worker。
+/// 与 `refill`（循环抢至 max_held）的差异：assign 是**单 batch 拖拽**语义，
+/// 不会触顶 max_held；UI 是单条拖拽（前端乐观 UI 与 server 实际一致）。
+///
+/// `process_id` 可选：若提供则校验 `batch.next_process_id` 必须匹配（防止
+/// 工人对未排到该工序的批做 assign）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminAssignRequest {
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub worker_id: i64,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub batch_id: i64,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub shelf_id: i64,
+    /// 可选；若提供则校验 batch.next_process_id 必须匹配
+    #[serde(default)]
+    #[serde(deserialize_with = "deserialize_i64_opt")]
+    pub process_id: Option<i64>,
+}
+
+/// `POST /api/v2/admin/worker-pool/assign` 响应。
+///
+/// 含新持有的 `TakenItem`（含 part 元数据）+ 分配后 worker 持有数 / 工种上限。
+#[derive(Debug, Clone, Serialize)]
+pub struct AssignResult {
+    #[serde(serialize_with = "serialize_i64")]
+    pub worker_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub shelf_id: i64,
+    pub taken: TakenItem,
+    /// 分配后 worker 的 current_held（含本批次）
+    pub current_held: i32,
+    /// 分配后 worker 工种的 max_held_batches
+    pub max_held: i32,
 }

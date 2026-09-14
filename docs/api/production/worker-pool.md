@@ -14,11 +14,12 @@
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/worker-pool/state` | 已登录（无 role guard） | worker 当前持有 + 工序池候选数（按工序分组） |
+| GET | `/api/v2/worker-pool/state` | 已登录（无 role guard） | worker 当前持有（含完整 held_batches）+ 工序池候选数（按工序分组） |
 | GET | `/api/v2/worker-pool/{process_id}` | **Manager+Clerk+Inspector** | 按工序返回候选池详情（workers + work_types + 跨货架批次列表） |
 | POST | `/api/v2/admin/worker-pool/refill` | **Manager** | 为指定 worker 抢满 `max_held_batches`（同事务） |
 | POST | `/api/v2/admin/worker-pool/remove` | **Manager** | 把 worker 持有批次按 RETURNED 语义放回候选池 |
 | POST | `/api/v2/admin/worker-pool/auto-allocate` | **Manager** | 按 process + shelf 自动为多个 worker 抢批次数 / 累计工时（COUNT/TIME 模式 × fill_ratio） |
+| POST | `/api/v2/admin/worker-pool/assign` | **Manager** | 单 batch 拖拽分配（不循环触顶 max_held；用于 UI 单 batch 拖拽场景） |
 
 > 路由挂载：`/worker-pool/state` 走 `/api/v2/worker-pool`，admin 端点走 `/api/v2/admin/worker-pool`（见 `src/modules/worker_pool/mod.rs`）。
 
@@ -190,6 +191,51 @@ WS 广播（commit 后下发）：
 
 - 始终 → `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`，前端按 `pool_empty + filled` 综合判断）
 
+### `POST /api/v2/admin/worker-pool/assign`
+
+权限: **Manager**
+
+Request：`AdminAssignRequest`
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `worker_id` | string (i64) | ✓ | 目标 worker（`deserialize_i64`） |
+| `batch_id` | string (i64) | ✓ | 要分配的批次（必须位于候选池中：`status=IN_PROCESS AND location=PRODUCTION_SHELF`） |
+| `shelf_id` | string (i64) | ✓ | 候选池货架 ID（`current_holder_id` 必须等于） |
+| `process_id` | string (i64)? | ✗ | 可选；提供时校验 `batch.next_process_id` 必须匹配（防止对未排到该工序的批做 assign） |
+
+业务流转（service `assign_batch_to_worker`）：
+
+1. 角色守卫：Manager（service 内 `require_role`）
+2. 校验 worker：`is_active=false` → `20202 BIZ_WORKER_INACTIVE`；`work_type_id IS NULL` → `20206 BIZ_WORKER_NO_WORK_TYPE`
+3. 取 work_type；`max_held_batches IS NULL` → `20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET`
+4. 取 worker 当前持有批次数 `current_held`，若 ≥ `max_held_batches` → `20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED`（assign 路径仍守 max 上限，不循环触顶）
+5. 若 `process_id` 提供：校验 `batch.next_process_id == process_id`，否则 → `20104 BIZ_INVALID_VALUE`
+6. `WorkerPoolRepo::take_specific_from_pool`：单 SQL 限定 `(shelf_id, batch_id)` 原子切换 holder；找不到 → `20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER`（语义复用："不是 worker 可领取的批次"）
+7. `PartService::sync_from_batch_change` 同步 part 派生列（PR-B2）
+8. 写 `TAKEN_FROM_POOL` 事件日志（`note="admin_assign"` 区分 refill 来源）
+9. 返回 `AssignResult`
+
+Response 200 `data`：[`AssignResult`](#assignresult-字段)
+
+错误码：
+
+- 20201 BIZ_WORKER_NOT_FOUND — worker 不存在
+- 20202 BIZ_WORKER_INACTIVE — worker 已停用
+- 20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED — worker 持有数已达 max_held_batches 上限
+- 20206 BIZ_WORKER_NO_WORK_TYPE — worker.work_type_id IS NULL
+- 20901 BIZ_WORK_TYPE_NOT_FOUND — work_type 不存在（防御性）
+- 20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET — work_type.max_held_batches 未设置
+- 20109 BIZ_PART_BATCH_NOT_FOUND — 提供 process_id 时 batch 不存在
+- 20104 BIZ_INVALID_VALUE — 提供 process_id 时 batch.next_process_id 与之不匹配
+- 20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER — batch 不在候选池（status/location/holder 不符或已软删）
+- 40300 FORBIDDEN — 非 Manager
+- 40001 VALIDATION_ERROR — payload shape 错误
+
+WS 广播（commit 后下发）：
+
+- 始终 → `WORKER_POOL_ASSIGN_DONE`（payload = `AssignResult`）
+
 ---
 
 ## 共享 DTO
@@ -256,6 +302,7 @@ WS 广播（commit 后下发）：
 | `current_held` | i64 | worker 当前持有批次数（`t_part_batch` 中 `status='IN_PROCESS' AND location='WORKER' AND current_holder_id = worker_id`） |
 | `capacity_remaining` | i32 | `max(0, max_held - current_held)` |
 | `pool_count_by_process` | [ProcessPoolCount](#processpoolcount-字段) | 各工序候选池计数（仅含 work_type 映射到的工序） |
+| `held_batches` | [TakenItem](#takenitem-字段)[] | **2026-09-14 follow-up-ux 新增**：worker 当前持有的完整 batch 列表（JOIN t_part），按 `t_part_batch.id ASC` 排序。避免前端按 worker 轮询 K 次单 batch 详情接口的 N+1；UI sink `WorkerQueueBoard.vue` 已对接 `:batches="workerHeld[w.id] ?? []"` |
 
 ### PoolBatchItem 字段
 
@@ -341,6 +388,26 @@ WS 广播（commit 后下发）：
 | `filled_count` | i32 | 实际抢到的批次 / 累计分钟数（按 `mode` 解释，与 `target` 同单位） |
 | `skipped_reason` | string? | 跳过原因（如 `worker 无 work_type`）；存在字段 ⇒ 跳过该 worker |
 
+### AdminAssignRequest 字段
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `worker_id` | string (i64) | ✓ | `deserialize_i64` |
+| `batch_id` | string (i64) | ✓ | `deserialize_i64` |
+| `shelf_id` | string (i64) | ✓ | `deserialize_i64` |
+| `process_id` | string (i64)? | ✗ | `deserialize_i64_opt`；提供时校验 `batch.next_process_id` 必须匹配 |
+
+### AssignResult 字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `worker_id` | string (i64) | 工人雪花 ID（透传入参） |
+| `batch_id` | string (i64) | 批次雪花 ID（透传入参） |
+| `shelf_id` | string (i64) | 货架雪花 ID（透传入参） |
+| `taken` | [TakenItem](#takenitem-字段) | 新持有的批次（JOIN t_part 元数据） |
+| `current_held` | i32 | 分配后 worker 持有数（含本批次） |
+| `max_held` | i32 | 分配后 worker 工种的 `max_held_batches` |
+
 ---
 
 ## WS 事件清单（worker-pool 相关）
@@ -356,6 +423,7 @@ WS 广播（commit 后下发）：
 | `WORKER_POOL_EMPTY` | `POST /parts/worker-scan` 同事务 refill 池空 / `POST /admin/worker-pool/refill` 池空 | `{ worker_id, shelf_id }` |
 | `WORKER_POOL_ADMIN_REMOVED` | `POST /admin/worker-pool/remove` | `{ batch_id, part_id, batch_no, quantity, serial_no, drawing_no, system_delivery_date, planned_delivery_date, is_urgent, version }`（即 `TakenItem`） |
 | `WORKER_POOL_AUTO_ALLOCATE_DONE` | `POST /admin/worker-pool/auto-allocate` | `{ process_id, shelf_id, mode, fill_ratio, filled: [WorkerFillItem], pool_empty }`（即 `AutoAllocateResult`） |
+| `WORKER_POOL_ASSIGN_DONE` | `POST /admin/worker-pool/assign` | `{ worker_id, batch_id, shelf_id, taken: TakenItem, current_held, max_held }`（即 `AssignResult`） |
 
 > 监听实现：`src/infra/ws_hub.rs::WsHub::broadcast`。前端订阅 `/ws/dashboard` 后按 `kind` 字段分发。
 
@@ -376,10 +444,11 @@ WS 广播（commit 后下发）：
 - ✅ Task 7：`worker_pool.service`（refill_for_worker / compute_state / admin_remove_held_batch）+ handler 三端点 + admin router
 - ✅ Task 8：`POST /parts/worker-scan`（同事务联动 refill）
 - ✅ 2026-09-11 part-worker-pool-federated-rocket：新增 `auto_allocate_for_process` + 端点 `POST /admin/worker-pool/auto-allocate` + COUNT/TIME 模式 + fill_ratio 校验（20704）；错误码段 20701/20702/20703/20704
+- ✅ 2026-09-14 follow-up-ux：`WorkerPoolState` 新增 `held_batches` 字段（`list_held_by_worker_with_part` JOIN t_part 取全量）+ 新增 `POST /admin/worker-pool/assign` 端点（单 batch 拖拽分配，service `assign_batch_to_worker`）+ `WorkerPoolRepo::take_specific_from_pool`（单 SQL 限定 `(shelf_id, batch_id)` 原子切换 holder）；错误码沿用既有 20204 / 20114 / 20104
 - ⏳ 未上线：`WorkerRepo` 列表 / 创建 / 软删等 CRUD（worker 域当前仅供 worker_pool / parts worker-scan 复用）
 
 ## 参考
 
 - 集成测试：`tests/worker_pool_api.rs` / `tests/worker_pool_auto_allocate_api.rs`
 - 仓库分层：`src/modules/worker_pool/handler.rs` (axum) → `service.rs` (业务) → `repo.rs` (SQL)
-- 错误码：`src/shared/error.rs::code`（20101 / 20114 / 20201 / 20202 / 20206 / 20901 / 20904 / 20905 / 20703 / 20704 / 40001 / 40300 / 40901）
+- 错误码：`src/shared/error.rs::code`（20104 / 20109 / 20114 / 20201 / 20202 / 20204 / 20206 / 20901 / 20904 / 20905 / 20703 / 20704 / 40001 / 40300 / 40901）

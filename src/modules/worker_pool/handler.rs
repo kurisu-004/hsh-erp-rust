@@ -30,7 +30,10 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use super::dto::{AdminRefillRequest, AdminRemoveRequest, AutoAllocateRequest, AutoAllocateResult, ProcessPoolDetail};
+use super::dto::{
+    AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AssignResult,
+    AutoAllocateRequest, AutoAllocateResult, ProcessPoolDetail,
+};
 use super::model::RefillResult;
 use super::model::WorkerPoolState;
 use super::service::WorkerPoolService;
@@ -151,6 +154,29 @@ pub async fn auto_allocate(
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "WORKER_POOL_AUTO_ALLOCATE_DONE".into(),
+        payload: serde_json::to_value(&result).unwrap_or_default(),
+    });
+    Ok(Json(R::ok(result)))
+}
+
+/// POST /api/v2/admin/worker-pool/assign
+///
+/// 2026-09-14 follow-up-ux 新增：单 batch 拖拽分配（不循环触顶 max_held）。
+///
+/// Manager 角色守卫下沉到 service（`assign_batch_to_worker` 内部 `require_role`）。
+/// Commit 后广播 `WORKER_POOL_ASSIGN_DONE`（payload = `AssignResult`）。
+pub async fn admin_assign(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<AdminAssignRequest>,
+) -> Result<Json<R<AssignResult>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let result =
+        WorkerPoolService::assign_batch_to_worker(&mut tx, &state.snowflake, req, &current)
+            .await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "WORKER_POOL_ASSIGN_DONE".into(),
         payload: serde_json::to_value(&result).unwrap_or_default(),
     });
     Ok(Json(R::ok(result)))

@@ -29,8 +29,9 @@ use crate::modules::worker::repo::WorkerRepo;
 use crate::shared::error::{code, AppError};
 
 use super::dto::{
-    AdminRemoveRequest, AutoAllocateMode, AutoAllocateRequest, AutoAllocateResult, PoolBatchItem,
-    ProcessPoolDetail, WorkerBrief, WorkerFillItem, WorkTypeMaxHeld,
+    AdminAssignRequest, AdminRemoveRequest, AssignResult, AutoAllocateMode, AutoAllocateRequest,
+    AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkerBrief, WorkerFillItem,
+    WorkTypeMaxHeld,
 };
 use super::model::{ProcessPoolCount, RefillResult, TakenItem, WorkerPoolState};
 use super::repo::WorkerPoolRepo;
@@ -237,6 +238,11 @@ impl WorkerPoolService {
             });
         }
 
+        // 2026-09-14 follow-up-ux 新增：worker 当前持有的完整 batch 列表
+        // （JOIN t_part 转 TakenItem）。命中 ix_t_part_batch_holder_location。
+        let held_batches =
+            PartBatchRepo::list_held_by_worker_with_part(&mut *conn, worker_id).await?;
+
         Ok(WorkerPoolState {
             worker_id,
             worker_name: worker.name,
@@ -245,6 +251,7 @@ impl WorkerPoolService {
             current_held,
             capacity_remaining,
             pool_count_by_process,
+            held_batches,
         })
     }
 
@@ -606,6 +613,163 @@ impl WorkerPoolService {
             fill_ratio: req.fill_ratio,
             filled,
             pool_empty: pool_empty_any,
+        })
+    }
+
+    /// `POST /api/v2/admin/worker-pool/assign` 业务逻辑（单 batch 分配）。
+    ///
+    /// 2026-09-14 follow-up-ux 新增：补齐 UI 单 batch 拖拽缺口。
+    /// 与 `refill_for_worker` 的差异：assign 是**单 batch 拖拽**语义——
+    /// 不循环触顶 max_held_batches；只在 (worker_id, batch_id, shelf_id)
+    /// 三元组命中候选池时切换 holder。
+    ///
+    /// 流程：
+    /// 1. 角色守卫：Manager（service 内 require_role）
+    /// 2. 校验 worker is_active + work_type_id 非空 + work_type.max_held_batches 已设
+    ///    （与 refill 一致：未分配工种 / 未设上限都是错误）
+    /// 3. 取 worker 当前持有批次数，若 ≥ max_held_batches →
+    ///    `20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED`（assign 路径仍守 max 上限，
+    ///    不允许单条拖拽触顶；前端 UI 显示当前 worker 的 capacity_remaining 提示）
+    /// 4. 若 req.process_id.is_some()，校验 batch.next_process_id 必须匹配
+    ///    （防止工人对未排到该工序的批做 assign）
+    /// 5. `WorkerPoolRepo::take_specific_from_pool` → 若 None →
+    ///    `20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER`（语义复用：batch 不在
+    ///    候选池 = "不是 worker 可领取的批次"）
+    /// 6. `PartService::sync_from_batch_change(part_id)` 同步 part 派生列
+    /// 7. 写 `TAKEN_FROM_POOL` event（note="admin_assign"）
+    /// 8. 返回 `AssignResult { worker_id, batch_id, shelf_id, taken, current_held, max_held }`
+    pub async fn assign_batch_to_worker(
+        conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
+        req: AdminAssignRequest,
+        current: &CurrentUser,
+    ) -> Result<AssignResult, AppError> {
+        current.require_role(Role::Manager)?;
+
+        // 1. 取 worker（带 work_type + badge_code：worker_scan.rs 用法）
+        let worker = WorkerRepo::get_by_id(&mut *conn, req.worker_id, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_WORKER_NOT_FOUND,
+                    format!("worker {} 不存在", req.worker_id),
+                )
+            })?;
+        if !worker.is_active {
+            return Err(AppError::biz(
+                code::BIZ_WORKER_INACTIVE,
+                format!("worker {} 已停用", req.worker_id),
+            ));
+        }
+        let work_type_id = worker.work_type_id.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_WORKER_NO_WORK_TYPE,
+                format!("worker {} 未分配工种", req.worker_id),
+            )
+        })?;
+        let work_type = WorkTypeRepo::get_by_id(&mut *conn, work_type_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_WORK_TYPE_NOT_FOUND,
+                    format!("work_type {work_type_id} 不存在"),
+                )
+            })?;
+        let max_held = work_type.max_held_batches.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_WORK_TYPE_MAX_HELD_NOT_SET,
+                format!("work_type {work_type_id} max_held_batches 未设置"),
+            )
+        })?;
+
+        // 2. capacity 守卫：assign 路径仍守 max_held_batches 上限（不循环触顶）。
+        let current_held_before =
+            PartBatchRepo::count_held_by_worker(&mut *conn, req.worker_id).await?;
+        if current_held_before >= max_held as i64 {
+            return Err(AppError::biz(
+                code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED,
+                format!(
+                    "worker {} 已持有 {} 批次，工种上限 {} 触顶",
+                    req.worker_id, current_held_before, max_held
+                ),
+            ));
+        }
+
+        // 3. 可选 process_id 校验：若 req.process_id 提供，校验 batch.next_process_id
+        //    必须匹配（防止工人对未排到该工序的批做 assign）。
+        if let Some(pid) = req.process_id {
+            let batch = PartBatchRepo::get_by_id(&mut *conn, req.batch_id, false)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_PART_BATCH_NOT_FOUND,
+                        format!("batch {} 不存在", req.batch_id),
+                    )
+                })?;
+            match batch.next_process_id {
+                Some(bpid) if bpid == pid => {}
+                _ => {
+                    return Err(AppError::biz(
+                        code::BIZ_INVALID_VALUE,
+                        format!(
+                            "batch {} next_process_id={:?} 与 request process_id={} 不匹配",
+                            req.batch_id, batch.next_process_id, pid
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // 4. 原子切换 holder：单 SQL 限定 (shelf_id, batch_id)
+        let taken = WorkerPoolRepo::take_specific_from_pool(
+            &mut *conn,
+            req.worker_id,
+            req.shelf_id,
+            req.batch_id,
+            current.id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
+                format!(
+                    "batch {} 不在候选池（status/location/holder 不符或已软删）",
+                    req.batch_id
+                ),
+            )
+        })?;
+
+        // 5. part 派生列同步（PR-B2）
+        PartService::sync_from_batch_change(&mut *conn, taken.part_id, current).await?;
+
+        // 6. 写 TAKEN_FROM_POOL 事件日志（note="admin_assign" 区分 refill 来源）
+        PartRepo::insert_part_event(
+            &mut *conn,
+            NewPartEvent {
+                id: snowflake.next_id(),
+                part_id: taken.part_id,
+                event_type: "TAKEN_FROM_POOL",
+                from_status: Some("IN_PROCESS"),
+                to_status: Some("IN_PROCESS"),
+                batch_id: Some(taken.batch_id),
+                quantity: Some(taken.quantity),
+                drawing_code: Some(&taken.drawing_no),
+                badge_code: Some(&worker.badge_code),
+                note: Some("admin_assign"),
+                created_by: Some(current.id),
+            },
+        )
+        .await?;
+
+        // 7. 返回结果：current_held = 分配后持有数（含本批次）
+        let current_held_after = current_held_before + 1;
+        Ok(AssignResult {
+            worker_id: req.worker_id,
+            batch_id: req.batch_id,
+            shelf_id: req.shelf_id,
+            taken,
+            current_held: current_held_after as i32,
+            max_held,
         })
     }
 }
