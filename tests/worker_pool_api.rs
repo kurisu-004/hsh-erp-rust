@@ -1177,3 +1177,319 @@ async fn pool_by_process_no_candidates_when_no_batch() {
     assert_eq!(work_types.len(), 1, "work_types 应 1 个: {env}");
     assert_eq!(work_types[0]["max_held_batches"], 3);
 }
+
+// ===========================================================================
+//  admin/worker-pool/assign 端点集成测试（2026-09-14 follow-up-round2 新增）
+//
+// 覆盖 4 个场景：
+//  17. admin_assign_happy_path
+//  18. admin_assign_capacity_exceeded
+//  19. admin_assign_batch_not_in_pool
+//  20. admin_assign_process_id_mismatch
+// ===========================================================================
+
+/// 场景 17: admin_assign 端点 happy path
+///
+/// - 200 + AssignResult
+/// - t_part_batch.location='WORKER' + current_holder_id=worker_id + version+1
+/// - TAKEN_FROM_POOL 事件写入（note='admin_assign'）
+#[tokio::test]
+async fn admin_assign_happy_path() {
+    let (_guard, pool) = setup().await;
+    let customer = insert_customer_l2(&pool, "POOL17").await;
+    let proc = seed_process(&pool, "PROC-AA", "工序AA").await;
+    let wt = insert_work_type(&pool, "WT-AA", "工种AA", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = common::insert_shelf(&pool, "PROD-AA", "PROD-AA", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC017", "工17", Some(wt)).await;
+    let (_pool_part, pool_batch) =
+        insert_pool_part(&pool, customer, "P-017", prod_shelf, proc, 1).await;
+
+    // 记录 assign 前 batch 状态（version=0）
+    let before_loc: String = sqlx::query_scalar!(
+        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
+        pool_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query before assign loc");
+    assert_eq!(before_loc, "PRODUCTION_SHELF");
+    let before_ch: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        pool_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query before assign ch");
+    assert_eq!(before_ch, Some(prod_shelf));
+    let before_v: i32 = sqlx::query_scalar!(
+        r#"SELECT version AS "v!" FROM t_part_batch WHERE id = $1"#,
+        pool_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query before assign v");
+    assert_eq!(before_v, 0, "初始 version 应 0");
+
+    let (app, token, _pool) = login_manager(pool.clone(), "admin17").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/admin/worker-pool/assign",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "batch_id": pool_batch.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "admin_assign happy: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(env["data"]["worker_id"], worker.to_string());
+    assert_eq!(env["data"]["batch_id"], pool_batch.to_string());
+    assert_eq!(env["data"]["shelf_id"], prod_shelf.to_string());
+    assert_eq!(env["data"]["current_held"], 1);
+    assert_eq!(env["data"]["max_held"], 3);
+    assert_eq!(env["data"]["taken"]["batch_id"], pool_batch.to_string());
+
+    // t_part_batch 应：location=WORKER + current_holder_id=worker + version+1
+    let after_loc: String = sqlx::query_scalar!(
+        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
+        pool_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query after assign loc");
+    assert_eq!(after_loc, "WORKER", "assign 后 location 应 WORKER");
+    let after_ch: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        pool_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query after assign ch");
+    assert_eq!(after_ch, Some(worker), "assign 后 holder 应 worker");
+    let after_v: i32 = sqlx::query_scalar!(
+        r#"SELECT version AS "v!" FROM t_part_batch WHERE id = $1"#,
+        pool_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query after assign v");
+    assert_eq!(after_v, before_v + 1, "version 应 +1");
+
+    // t_part_event 应有 TAKEN_FROM_POOL（note=admin_assign）
+    let event_note: Option<String> = sqlx::query_scalar!(
+        r#"SELECT note AS "n?" FROM t_part_event
+           WHERE batch_id = $1 AND event_type = 'TAKEN_FROM_POOL' ORDER BY id ASC LIMIT 1"#,
+        pool_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query event");
+    assert_eq!(
+        event_note.as_deref(),
+        Some("admin_assign"),
+        "TAKEN_FROM_POOL 事件 note 应 admin_assign"
+    );
+}
+
+/// 场景 18: admin_assign capacity 超限
+///
+/// worker max_held=2 已持 2 批，再 assign 第 3 批 → 422 + 20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED
+#[tokio::test]
+async fn admin_assign_capacity_exceeded() {
+    let (_guard, pool) = setup().await;
+    let customer = insert_customer_l2(&pool, "POOL18").await;
+    let proc = seed_process(&pool, "PROC-CAP", "工序CAP").await;
+    let wt = insert_work_type(&pool, "WT-CAP", "工种CAP", Some(2)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = common::insert_shelf(&pool, "PROD-CAP", "PROD-CAP", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC018", "工18", Some(wt)).await;
+    // worker 已持 2 批（触顶）
+    for i in 0..2 {
+        let sn = format!("H-{:03}", i);
+        insert_worker_held_part(&pool, customer, &sn, worker, proc, 1).await;
+    }
+    // pool 里再放 1 批待分配
+    let (_pp, extra_batch) =
+        insert_pool_part(&pool, customer, "P-018", prod_shelf, proc, 1).await;
+    let held = count_held_by_worker(&pool, worker).await;
+    assert_eq!(held, 2, "前置：worker 已持 2 批");
+
+    let (app, token, _pool) = login_manager(pool.clone(), "admin18").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/admin/worker-pool/assign",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "batch_id": extra_batch.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "capacity 触顶应 409: {env}"
+    );
+    assert_eq!(
+        env["code"], 20204,
+        "BIZ_WORKER_HOLD_LIMIT_EXCEEDED 应 20204: {env}"
+    );
+
+    // 候选池批次不应被移动
+    let after_loc: String = sqlx::query_scalar!(
+        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
+        extra_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query after loc");
+    assert_eq!(after_loc, "PRODUCTION_SHELF", "批次应仍在候选池");
+    let after_ch: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        extra_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query after ch");
+    assert_eq!(after_ch, Some(prod_shelf));
+}
+
+/// 场景 19: admin_assign batch 不在候选池
+///
+/// 调 assign 一个不属于该 shelf 的 batch（属于另一 shelf 的候选）→
+/// 422 + 20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER
+#[tokio::test]
+async fn admin_assign_batch_not_in_pool() {
+    let (_guard, pool) = setup().await;
+    let customer = insert_customer_l2(&pool, "POOL19").await;
+    let proc = seed_process(&pool, "PROC-NP", "工序NP").await;
+    let wt = insert_work_type(&pool, "WT-NP", "工种NP", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    // shelf_a：batch 实际所在；shelf_b：admin 请求的 shelf_id（错的）
+    let shelf_a = common::insert_shelf(&pool, "PROD-A19", "PROD-A19", "PRODUCTION").await;
+    let shelf_b = common::insert_shelf(&pool, "PROD-B19", "PROD-B19", "PRODUCTION").await;
+    link_shelf_to_process(&pool, shelf_a, proc).await;
+    link_shelf_to_process(&pool, shelf_b, proc).await;
+
+    let worker = insert_worker(&pool, "BC019", "工19", Some(wt)).await;
+    // batch 实际在 shelf_a
+    let (_pp, batch_a) = insert_pool_part(&pool, customer, "P-019A", shelf_a, proc, 1).await;
+
+    let (app, token, _pool) = login_manager(pool.clone(), "admin19").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/admin/worker-pool/assign",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "batch_id": batch_a.to_string(),
+                "shelf_id": shelf_b.to_string(),  // 错的 shelf
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "batch 不在请求 shelf 的池应 409: {env}"
+    );
+    assert_eq!(
+        env["code"], 20114,
+        "BIZ_PART_BATCH_NOT_HELD_BY_WORKER 应 20114: {env}"
+    );
+
+    // 候选池批次应未动
+    let after_loc: String = sqlx::query_scalar!(
+        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
+        batch_a,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query after loc");
+    assert_eq!(after_loc, "PRODUCTION_SHELF", "batch 应仍在原 shelf");
+    let after_ch: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        batch_a,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query after ch");
+    assert_eq!(after_ch, Some(shelf_a));
+}
+
+/// 场景 20: admin_assign process_id 不匹配
+///
+/// 调 assign 带 process_id=9999999999998（不存在且 ≠ batch.next_process_id）→
+/// 422 + 20104 BIZ_INVALID_VALUE
+#[tokio::test]
+async fn admin_assign_process_id_mismatch() {
+    let (_guard, pool) = setup().await;
+    let customer = insert_customer_l2(&pool, "POOL20").await;
+    let proc1 = seed_process(&pool, "PROC-PM1", "工序PM1").await;
+    let proc_other: i64 = 9_999_999_999_998; // 故意一个远大于实际生成的"错误"process
+    let wt = insert_work_type(&pool, "WT-PM", "工种PM", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc1).await;
+    let prod_shelf = common::insert_shelf(&pool, "PROD-PM", "PROD-PM", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc1).await;
+
+    let worker = insert_worker(&pool, "BC020", "工20", Some(wt)).await;
+    // batch.next_process_id = proc1；req.process_id = proc_other（不匹配）
+    let (_pp, batch) = insert_pool_part(&pool, customer, "P-020", prod_shelf, proc1, 1).await;
+
+    let (app, token, _pool) = login_manager(pool.clone(), "admin20").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/admin/worker-pool/assign",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "batch_id": batch.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+                "process_id": proc_other.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "process_id 不匹配应 400: {env}"
+    );
+    assert_eq!(env["code"], 20104, "BIZ_INVALID_VALUE 应 20104: {env}");
+
+    // 候选池批次应未动
+    let after_loc: String = sqlx::query_scalar!(
+        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
+        batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query after loc");
+    assert_eq!(after_loc, "PRODUCTION_SHELF", "batch 应仍在候选池");
+    let after_ch: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query after ch");
+    assert_eq!(after_ch, Some(prod_shelf));
+}
