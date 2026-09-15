@@ -171,6 +171,46 @@ async fn create_outsource_company_duplicate_returns_21202() {
     assert_eq!(env2["code"].as_i64().unwrap(), 21202);
 }
 
+/// 2026-09-15 fix-outsource-409 回归测试：
+/// 同名第二次创建必须返回 409 而不是 500。Code 可以是：
+   /// - 21202（应用层 pre-check 命中：`OutsourceCompanyRepo::get_by_name` 找到 active 行）
+/// - 21214（DB `uk_t_outsource_company_name` 兜底：pre-check 漏网，INSERT 撞部分唯一索引）
+/// 单线程顺序测试通常命中前者，但保证两种路径下都不返 500。
+#[tokio::test]
+async fn create_outsource_company_duplicate_returns_409() {
+    let (_guard, pool) = setup().await;
+    let (app, token) = login_manager(pool, "oc_dup409").await;
+
+    let (s1, _) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/outsource-companies",
+            Some(json!({"name": "E2E_TEST_DUP_COMPANY"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED);
+
+    let (s2, env2) = send(
+        app,
+        json_request(
+            "POST",
+            "/outsource-companies",
+            Some(json!({"name": "E2E_TEST_DUP_COMPANY"})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::CONFLICT, "duplicate must be 409 not 500: {env2}");
+    let code = env2["code"].as_i64().unwrap();
+    assert!(
+        code == 21202 || code == 21214,
+        "duplicate code must be 21202 or 21214, got {code}; full env: {env2}"
+    );
+}
+
 #[tokio::test]
 async fn create_outsource_company_with_process_ids_creates_mapping() {
     let (_guard, pool) = setup().await;

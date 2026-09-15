@@ -28,7 +28,7 @@
 
 - **公司表** `t_outsource_company`：`id` / `name` / `is_active` / `version` / 审计字段 + 软删。
 - **工序映射** `t_outsource_company_process`：`(company_id, process_id)` 主键；`process_id` 必须指向 `t_process` 中 `category ∈ {OUTSOURCE, INHOUSE}` 的工序。
-- **公司名唯一约束**：同 L1 下不重名（DB partial unique 兜底 → 21202 DUPLICATE）。
+- **公司名唯一约束**：同 L1 下不重名（DB partial unique 兜底 → 21202 应用层预检 / 21214 DB 兜底）。
 
 ---
 
@@ -44,6 +44,7 @@
 | 21206 | BIZ_PART_NOT_OUTSOURCEABLE | 400 | 当前 part 状态不允许发送外协 |
 | 21207 | BIZ_OUTSOURCE_DIRECT_REQUIRES_C2_SHELF | 400 | 直接发送外协要求 part 位于绑定了外协工序的货架 |
 | 21208 | BIZ_OUTSOURCE_NO_SHELF | 400 | 系统无任何绑定了外协工序的货架 |
+| 21214 | BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME | 409 | DB `uk_t_outsource_company_name` 部分唯一兜底：pre-check 漏网（并发插入 / 跨事务）→ INSERT 撞唯一索引。与 21202 同义 409，仅 code 不同用以区分应用层预检 vs DB 兜底路径 |
 
 ---
 
