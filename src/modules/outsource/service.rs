@@ -190,19 +190,17 @@ impl OutsourceService {
             created_by: current.id,
         };
         let company = OutsourceCompanyRepo::create(&mut *conn, new).await.map_err(|e| {
-            // uk_t_outsource_company_name 兜底
-            if e.as_database_error()
-                .and_then(|d| d.code())
-                .as_deref()
-                == Some("23505")
-            {
-                AppError::biz(
-                    code::BIZ_OUTSOURCE_COMPANY_DUPLICATE,
-                    format!("外协公司「{name}」已存在"),
-                )
-            } else {
-                AppError::from(e)
+            // 2026-09-15 fix-outsource-409：用约束名精确定位 uk_t_outsource_company_name
+            // 兜底（pre-check 已 21202 拦下大部分场景；此处仅覆盖并发插入等竞态）。
+            if let Some(dbe) = e.as_database_error() {
+                if dbe.constraint() == Some("uk_t_outsource_company_name") {
+                    return AppError::biz(
+                        code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME,
+                        format!("外协公司「{name}」已存在"),
+                    );
+                }
             }
+            AppError::from(e)
         })?;
 
         // 可选：创建时一并写入工序能力清单（OUTSOURCE 类别）

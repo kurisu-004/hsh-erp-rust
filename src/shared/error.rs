@@ -173,6 +173,7 @@ pub mod code {
     pub const BIZ_PART_NOT_OUTSOURCEABLE: i32 = 21206;           // 当前状态不允许发送外协（兜底，正常流不该撞）
     pub const BIZ_OUTSOURCE_DIRECT_REQUIRES_C2_SHELF: i32 = 21207; // 直接发送外协要求零件位于绑定了外协工序的货架
     pub const BIZ_OUTSOURCE_NO_SHELF: i32 = 21208;               // 系统无任何绑定了外协工序的货架
+    pub const BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME: i32 = 21214; // DB uk_t_outsource_company_name 兜底（pre-check 漏网 → INSERT 撞唯一索引）；与 21202 同义 409，区分 DB 兜底 vs 应用层预检
 
     // 213xx 外协报价（t_outsource_quote）
     pub const BIZ_OUTSOURCE_QUOTE_NOT_FOUND: i32 = 21301;
@@ -413,6 +414,7 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_APPLICANT_IN_USE
             || c == code::BIZ_PART_FILE_DUPLICATE
             || c == code::BIZ_OUTSOURCE_COMPANY_DUPLICATE
+            || c == code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME
             || c == code::BIZ_OUTSOURCE_COMPANY_IN_USE
             || c == code::BIZ_OUTSOURCE_QUOTE_DUPLICATE
             || c == code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED
@@ -595,6 +597,7 @@ mod tests {
         (code::BIZ_PART_NOT_OUTSOURCEABLE, "BIZ_PART_NOT_OUTSOURCEABLE"),
         (code::BIZ_OUTSOURCE_DIRECT_REQUIRES_C2_SHELF, "BIZ_OUTSOURCE_DIRECT_REQUIRES_C2_SHELF"),
         (code::BIZ_OUTSOURCE_NO_SHELF, "BIZ_OUTSOURCE_NO_SHELF"),
+        (code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME, "BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME"),
         // 213xx
         (code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND, "BIZ_OUTSOURCE_QUOTE_NOT_FOUND"),
         (code::BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION, "BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION"),
@@ -878,6 +881,7 @@ mod tests {
         (code::BIZ_APPLICANT_IN_USE, StatusCode::CONFLICT, "BIZ_APPLICANT_IN_USE"),
         (code::BIZ_PART_FILE_DUPLICATE, StatusCode::CONFLICT, "BIZ_PART_FILE_DUPLICATE"),
         (code::BIZ_OUTSOURCE_COMPANY_DUPLICATE, StatusCode::CONFLICT, "BIZ_OUTSOURCE_COMPANY_DUPLICATE"),
+        (code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME, StatusCode::CONFLICT, "BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME"),
         (code::BIZ_OUTSOURCE_COMPANY_IN_USE, StatusCode::CONFLICT, "BIZ_OUTSOURCE_COMPANY_IN_USE"),
         (code::BIZ_OUTSOURCE_QUOTE_DUPLICATE, StatusCode::CONFLICT, "BIZ_OUTSOURCE_QUOTE_DUPLICATE"),
         (code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED"),
