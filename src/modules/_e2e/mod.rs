@@ -14,24 +14,26 @@
 //!
 //! ## 路由表
 //! 全部挂在 `/api/v2/_e2e`（见 `modules::v2_router().nest("/_e2e", _e2e::router())`）：
-//! - POST `/probe`             探测端点存在
-//! - POST `/reset`             清所有 t_e2e_seeded 标记行（不动 alembic seed）
-//! - POST `/seed/customer`     入参 { name, parent_id?, serial_prefix? }
-//! - POST `/seed/applicant`    入参 { name, customer_id }
-//! - POST `/seed/worker`       入参 { name, work_type_code }
-//! - POST `/seed/part`         入参 { serial, customer_id, applicant_name, name?, drawing_no? }
-//! - POST `/seed/outsource_company`  入参 { name }
-//! - POST `/seed/outsource_quote`    入参 { part_id, company_id, process_id, price }
-//! - POST `/seed/delivery_note`      入参 { status?, customer_id }
-//! - POST `/seed/user`               入参 { username, role_codes: string[], phone?, full_name? }
-//! - POST `/revoke-session`          入参 { username }，删该 user 全部 Redis session
+//! - POST   `/probe`             探测端点存在
+//! - POST   `/reset`             清所有 t_e2e_seeded 标记行（不动 alembic seed）
+//! - POST   `/seed/customer`     入参 { name, parent_id?, serial_prefix? }
+//! - POST   `/seed/applicant`    入参 { name, customer_id }
+//! - POST   `/seed/worker`       入参 { name, work_type_code }
+//! - POST   `/seed/part`         入参 { serial, customer_id, applicant_name, name?, drawing_no? }
+//! - POST   `/seed/outsource_company`  入参 { name }
+//! - POST   `/seed/outsource_quote`    入参 { part_id, company_id, process_id, price }
+//! - POST   `/seed/delivery_note`      入参 { status?, customer_id }
+//! - POST   `/seed/user`               入参 { username, role_codes: string[], phone?, full_name? }
+//! - POST   `/revoke-session`          入参 { username }，删该 user 全部 Redis session
+//! - DELETE `/hard-delete/outsource_company/{id}`  物理删外协公司 + 清 t_e2e_seeded 元数据
+//!   （仅供 e2e 清理，不走业务软删；idempotent）
 
 use std::sync::Arc;
 
-use axum::routing::post;
 use axum::Router;
+use axum::routing::{delete, post};
 
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
 pub mod dto;
@@ -64,4 +66,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/seed/delivery_note", post(handler::seed_delivery_note))
         .route("/seed/user", post(handler::seed_user))
         .route("/revoke-session", post(handler::revoke_session))
+        // 2026-09-15 新增：物理删外协公司 + 清 t_e2e_seeded 元数据（仅供 e2e 清理）
+        .route(
+            "/hard-delete/outsource_company/{id}",
+            delete(handler::hard_delete_outsource_company),
+        )
 }

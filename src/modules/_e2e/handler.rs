@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::{Path, State};
 use chrono::NaiveDateTime;
 use rust_decimal::Decimal;
 use sqlx::PgConnection;
@@ -20,14 +20,14 @@ use crate::modules::applicant::repo::ApplicantRepo;
 use crate::modules::customer::repo::CustomerRepo;
 use crate::modules::user::repo::{UserInsert, UserRepo, UserRoleInsert, UserRoleRepo};
 use crate::modules::worker::repo::WorkerRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::dto::{
-    ProbeResp, ResetResp, RevokeSessionReq, SeedApplicantReq, SeedCreatedResp, SeedCustomerReq,
-    SeedDeliveryNoteReq, SeedOutsourceCompanyReq, SeedOutsourceQuoteReq, SeedPartReq, SeedUserReq,
-    SeedWorkerReq,
+    HardDeleteResp, ProbeResp, ResetResp, RevokeSessionReq, SeedApplicantReq, SeedCreatedResp,
+    SeedCustomerReq, SeedDeliveryNoteReq, SeedOutsourceCompanyReq, SeedOutsourceQuoteReq,
+    SeedPartReq, SeedUserReq, SeedWorkerReq,
 };
 use super::e2e_guard;
 
@@ -35,16 +35,14 @@ use super::e2e_guard;
 const SEED_ACTOR_ID: i64 = 1;
 
 /// 把 e2e_seeded 元数据写入 `t_e2e_seeded`（reset 的依据）。
-async fn mark_seeded(
-    tx: &mut PgConnection,
-    entity: &str,
-    entity_id: i64,
-) -> Result<(), AppError> {
-    sqlx::query("INSERT INTO t_e2e_seeded (entity, entity_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-        .bind(entity)
-        .bind(entity_id)
-        .execute(&mut *tx)
-        .await?;
+async fn mark_seeded(tx: &mut PgConnection, entity: &str, entity_id: i64) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO t_e2e_seeded (entity, entity_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(entity)
+    .bind(entity_id)
+    .execute(&mut *tx)
+    .await?;
     Ok(())
 }
 
@@ -98,10 +96,7 @@ pub async fn seed_customer(
         })?),
         _ => None,
     };
-    let serial_prefix: Option<&str> = req
-        .serial_prefix
-        .as_deref()
-        .filter(|s| !s.is_empty());
+    let serial_prefix: Option<&str> = req.serial_prefix.as_deref().filter(|s| !s.is_empty());
 
     let id = state.snowflake.next_id();
     let created = CustomerRepo::create(
@@ -155,12 +150,11 @@ pub async fn seed_worker(
     let mut tx = state.pool.begin().await?;
 
     // 工种 code → id（工种必须存在，否则 404 20901）
-    let work_type_id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM t_work_type WHERE code = $1 AND deleted_at IS NULL",
-    )
-    .bind(&req.work_type_code)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let work_type_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM t_work_type WHERE code = $1 AND deleted_at IS NULL")
+            .bind(&req.work_type_code)
+            .fetch_optional(&mut *tx)
+            .await?;
     let work_type_id = work_type_id.ok_or_else(|| {
         AppError::biz(
             code::BIZ_WORK_TYPE_NOT_FOUND,
@@ -210,7 +204,7 @@ pub async fn seed_part(
     let name = req.name.unwrap_or_else(|| req.applicant_name.clone());
     let drawing_no = req
         .drawing_no
-        .unwrap_or_else(|| format!("E2E-DWG-{}", &req.serial));
+        .unwrap_or_else(|| format!("E2E-DWG-{}", req.serial));
 
     let id = state.snowflake.next_id();
     let now: NaiveDateTime = now_naive();
@@ -248,9 +242,7 @@ pub async fn seed_part(
 
     mark_seeded(&mut tx, "part", id).await?;
     tx.commit().await?;
-    Ok(Json(R::ok(SeedCreatedResp {
-        id: id.to_string(),
-    })))
+    Ok(Json(R::ok(SeedCreatedResp { id: id.to_string() })))
 }
 
 // ===========================================================================
@@ -285,9 +277,7 @@ pub async fn seed_outsource_company(
 
     mark_seeded(&mut tx, "outsource_company", id).await?;
     tx.commit().await?;
-    Ok(Json(R::ok(SeedCreatedResp {
-        id: id.to_string(),
-    })))
+    Ok(Json(R::ok(SeedCreatedResp { id: id.to_string() })))
 }
 
 // ===========================================================================
@@ -335,9 +325,10 @@ pub async fn seed_outsource_quote(
     .bind(part_id)
     .bind(company_id)
     .bind(process_id)
-    .bind(Decimal::from_str(&format!("{}", req.price)).map_err(|e| {
-        AppError::biz(code::BAD_REQUEST, format!("price 解析失败: {e}"))
-    })?)
+    .bind(
+        Decimal::from_str(&format!("{}", req.price))
+            .map_err(|e| AppError::biz(code::BAD_REQUEST, format!("price 解析失败: {e}")))?,
+    )
     .bind(now)
     .bind(created_by_some())
     .execute(&mut *tx)
@@ -345,9 +336,7 @@ pub async fn seed_outsource_quote(
 
     mark_seeded(&mut tx, "outsource_quote", id).await?;
     tx.commit().await?;
-    Ok(Json(R::ok(SeedCreatedResp {
-        id: id.to_string(),
-    })))
+    Ok(Json(R::ok(SeedCreatedResp { id: id.to_string() })))
 }
 
 // ===========================================================================
@@ -370,7 +359,7 @@ pub async fn seed_delivery_note(
     let now: NaiveDateTime = now_naive();
     // delivery_note_no：e2e 不与 counter 抢号；用 fake "DN-E2E-<id>" 即可（uq_t_delivery_note_no_active
     // 走 partial unique on deleted_at IS NULL；新单 deleted_at NULL → 不能撞。所以用唯一后缀即可）
-    let delivery_note_no = format!("DN-E2E-{:X}", id.abs() as u64);
+    let delivery_note_no = format!("DN-E2E-{:X}", id.unsigned_abs());
 
     sqlx::query(
         r#"INSERT INTO t_delivery_note (
@@ -397,9 +386,7 @@ pub async fn seed_delivery_note(
 
     mark_seeded(&mut tx, "delivery_note", id).await?;
     tx.commit().await?;
-    Ok(Json(R::ok(SeedCreatedResp {
-        id: id.to_string(),
-    })))
+    Ok(Json(R::ok(SeedCreatedResp { id: id.to_string() })))
 }
 
 // ===========================================================================
@@ -457,9 +444,7 @@ pub async fn seed_user(
 
     mark_seeded(&mut tx, "user", id).await?;
     tx.commit().await?;
-    Ok(Json(R::ok(SeedCreatedResp {
-        id: id.to_string(),
-    })))
+    Ok(Json(R::ok(SeedCreatedResp { id: id.to_string() })))
 }
 
 // ===========================================================================
@@ -472,17 +457,70 @@ pub async fn revoke_session(
 ) -> Result<Json<R<()>>, AppError> {
     e2e_guard(&state)?;
     let mut tx = state.pool.begin().await?;
-    let user_id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM t_user WHERE username = $1 AND deleted_at IS NULL",
-    )
-    .bind(req.username.trim().to_lowercase())
-    .fetch_optional(&mut *tx)
-    .await?;
-    let user_id = user_id.ok_or_else(|| {
-        AppError::biz(code::BIZ_USER_ACCOUNT_NOT_FOUND, "用户不存在")
-    })?;
+    let user_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM t_user WHERE username = $1 AND deleted_at IS NULL")
+            .bind(req.username.trim().to_lowercase())
+            .fetch_optional(&mut *tx)
+            .await?;
+    let user_id =
+        user_id.ok_or_else(|| AppError::biz(code::BIZ_USER_ACCOUNT_NOT_FOUND, "用户不存在"))?;
     tx.commit().await?;
     // Redis session 全清（独立于 PG tx；不是事务里）
     state.session.delete_all_user_sessions(user_id).await?;
     Ok(Json(R::ok_empty()))
+}
+
+// ===========================================================================
+//  DELETE /hard-delete/outsource_company/{id}     2026-09-15 新增
+// ===========================================================================
+//
+// 物理删除一行 t_outsource_company + 清 t_e2e_seeded 元数据，仅供 e2e 清理用。
+// 与业务软删路径（service.rs::soft_delete）走不同链路，**不动** is_active /
+// deleted_at / version / 审计字段。
+//
+// 幂等：id 不存在也返 deleted:true（PG DELETE 0 行不报错），避免 afterEach
+// 重复删除时挂 e2e 套件。
+//
+// 错误码语义：
+// - 21205 BIZ_OUTSOURCE_COMPANY_IN_USE：被 t_outsource_company_process 引用。
+//   **本表 schema 无物理 FK**（见 migrations/20260811100004，无 REFERENCES 子句；
+//   与 CLAUDE.md §DB 约定 一致：逻辑外键 bigint + 索引），所以 handler 必须**手动**
+//   SELECT 一次检测引用，**不**依赖 PG FK 23503 兜底。
+pub async fn hard_delete_outsource_company(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<Json<R<HardDeleteResp>>, AppError> {
+    e2e_guard(&state)?;
+    let mut tx = state.pool.begin().await?;
+
+    // 1) 引用检查：t_outsource_company_process 还有任何 (outsource_company_id=id)
+    //    且 deleted_at IS NULL 的行 → 拒删，返 21205。LIMIT 1 短路减少 IO。
+    let referenced: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM t_outsource_company_process \
+         WHERE outsource_company_id = $1 AND deleted_at IS NULL \
+         LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if referenced.is_some() {
+        return Err(AppError::biz(
+            code::BIZ_OUTSOURCE_COMPANY_IN_USE,
+            "外协公司仍被引用，无法硬删",
+        ));
+    }
+
+    // 2) 先清 t_e2e_seeded 元数据，再删 company（与 reset 风格一致）。
+    sqlx::query("DELETE FROM t_e2e_seeded WHERE entity = 'outsource_company' AND entity_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM t_outsource_company WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    // idempotent：id 不存在 → DELETE 0 行不报错，仍返 deleted:true
+    Ok(Json(R::ok(HardDeleteResp { deleted: true })))
 }
