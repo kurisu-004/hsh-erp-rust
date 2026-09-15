@@ -3,8 +3,9 @@
 > 本文件须与 `src/modules/_e2e/{handler.rs,dto.rs,mod.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
-> 域覆盖：e2e 测试 seed hook（11 端点），供 Playwright spec 匿名灌入 seed 数据。
+> 域覆盖：e2e 测试 seed hook（12 端点），供 Playwright spec 匿名灌入 seed 数据。
 > 2026-09-14 落地；dev/test profile 默认启用，release profile 必须显式 `E2E_HOOKS_ENABLED=false`。
+> 2026-09-15 新增 `DELETE /hard-delete/outsource_company/{id}`（物理删外协公司，仅供 e2e 清理）。
 > 配套迁移：`migrations/20260914100000_022_create_e2e_seeded_table.sql`
 
 ---
@@ -20,7 +21,7 @@
 
 ---
 
-## 端点列表（11 个，全部挂在 `/api/v2/_e2e`）
+## 端点列表（12 个，全部挂在 `/api/v2/_e2e`）
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
@@ -35,6 +36,7 @@
 | POST | `/api/v2/_e2e/seed/delivery_note` | **公开**（受 guard） | 灌入送货单（status 可指定） |
 | POST | `/api/v2/_e2e/seed/user` | **公开**（受 guard） | 灌入用户（带 roles，缺省密码 `changeme`） |
 | POST | `/api/v2/_e2e/revoke-session` | **公开**（受 guard） | 删除指定 user 全部 Redis session |
+| DELETE | `/api/v2/_e2e/hard-delete/outsource_company/{id}` | **公开**（受 guard） | 物理删外协公司 + 清 `t_e2e_seeded` 元数据（仅供 e2e 清理，不走业务软删；idempotent） |
 
 ---
 
@@ -75,6 +77,12 @@ CREATE TABLE t_e2e_seeded (
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `cleared` | i64 | 本次 reset 清掉的标记行数 |
+
+### HardDeleteResp 字段（2026-09-15 新增）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `deleted` | bool | 始终为 true（idempotent：id 不存在也返 true） |
 
 ### SeedCustomerReq 字段
 
@@ -187,8 +195,10 @@ prod / staging compose 用 `E2E_HOOKS_ENABLED: false` 显式覆盖。
 | code | 来源 | 触发场景 |
 |---|---|---|
 | 40000 | `BAD_REQUEST` | 雪花 ID parse 失败 / 缺字段 |
+| 40400 | `NOT_FOUND` | `e2e_guard` 关闭（`enable_e2e_hooks=false`）时所有端点统一返 404 |
 | 20601 | `BIZ_USER_ACCOUNT_NOT_FOUND` | `revoke-session` 的 username 不存在 |
 | 20901 | `BIZ_WORK_TYPE_NOT_FOUND` | `seed/worker` 的 `work_type_code` 不存在 |
+| 21205 | `BIZ_OUTSOURCE_COMPANY_IN_USE` | `hard-delete/outsource_company/{id}`：被 `t_outsource_company_process` 引用（**逻辑外键**，无 PG FK 兜底，handler 手动 SELECT 检测） |
 
 > 本域不注册独立错误码，全部复用 `shared::error::code` 的通用 / 业务码。
 
@@ -197,7 +207,7 @@ prod / staging compose 用 `E2E_HOOKS_ENABLED: false` 显式覆盖。
 ## 实现位置
 
 - mod：`src/modules/_e2e/mod.rs::e2e_guard + router()`
-- handler：`src/modules/_e2e/handler.rs`（11 个 handler，全走 sqlx 动态 query，不依赖 `.sqlx/` 离线元数据）
+- handler：`src/modules/_e2e/handler.rs`（11 个 handler + 2026-09-15 新增 `hard_delete_outsource_company`，共 12 个；全走 sqlx 动态 query，不依赖 `.sqlx/` 离线元数据）
 - dto：`src/modules/_e2e/dto.rs`
 - 路由挂载：`/_e2e`（见 `src/modules/mod.rs::v2_router`）
 - 配置：`src/infra/config.rs::E2eConfig::enable_e2e_hooks`（env `E2E_HOOKS_ENABLED`）
