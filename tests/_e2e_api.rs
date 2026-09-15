@@ -393,3 +393,233 @@ async fn e2e_guard_returns_404_when_disabled() {
 //  类型导入集中区 —— 避免上面散落 noise
 // ===========================================================================
 use hsh_erp_rust::infra::config::AppConfig;
+
+// ===========================================================================
+//  7) hard_delete_outsource_company — 删除一行 + 清 t_e2e_seeded 元数据
+// ===========================================================================
+//
+// 2026-09-15 新增：seed 一行 company，调 hard-delete，断言：
+// - 返 200 + deleted:true
+// - t_outsource_company 该 id 不存在（count=0）
+// - t_e2e_seeded 该 (entity, entity_id) 不存在（count=0）
+#[tokio::test]
+async fn hard_delete_outsource_company_removes_row_and_seeded_metadata() {
+    let (_guard, pool, redis) = setup().await;
+    let state = test_state_with_redis(pool.clone(), redis.clone());
+    let app = test_app(state);
+
+    // 1) seed 一个 company
+    let (seed_status, seed_resp) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/_e2e/seed/outsource_company",
+            Some(json!({"name": "DelTestCo"})),
+        ),
+    )
+    .await;
+    assert_eq!(seed_status, StatusCode::OK, "seed company: {seed_resp}");
+    let company_id: i64 = seed_resp["data"]["id"]
+        .as_str()
+        .expect("company id string")
+        .parse()
+        .expect("parse company id");
+
+    // 2) 调 hard-delete
+    let (status, env) = send(
+        app,
+        json_request(
+            "DELETE",
+            &format!("/_e2e/hard-delete/outsource_company/{company_id}"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "hard-delete: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(env["data"]["deleted"], true);
+
+    // 3) t_outsource_company 该 id 不存在
+    let company_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM t_outsource_company WHERE id = $1")
+            .bind(company_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count t_outsource_company");
+    assert_eq!(company_count, 0, "company row should be hard-deleted");
+
+    // 4) t_e2e_seeded 元数据也清
+    let seeded_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_e2e_seeded \
+         WHERE entity = 'outsource_company' AND entity_id = $1",
+    )
+    .bind(company_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count t_e2e_seeded");
+    assert_eq!(seeded_count, 0, "seeded metadata should be cleared");
+}
+
+// ===========================================================================
+//  8) hard_delete_outsource_company — id 不存在时幂等返 deleted:true（不 404）
+// ===========================================================================
+
+#[tokio::test]
+async fn hard_delete_outsource_company_idempotent_when_missing() {
+    let (_guard, pool, redis) = setup().await;
+    let state = test_state_with_redis(pool.clone(), redis.clone());
+    let app = test_app(state);
+
+    // 用一个肯定不在表里的 snowflake id（snowflake 永远正，且刚 seed 完表空）
+    let nonexistent_id: i64 = 999_999_999_999_999;
+
+    let (status, env) = send(
+        app,
+        json_request(
+            "DELETE",
+            &format!("/_e2e/hard-delete/outsource_company/{nonexistent_id}"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "idempotent delete should 200; got {env}"
+    );
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["deleted"], true,
+        "deleted 字段必须为 true（idempotent）；env={env}"
+    );
+}
+
+// ===========================================================================
+//  9) hard_delete_outsource_company — guard disabled 时返 404
+// ===========================================================================
+//
+// AppState 持有 Arc<AppConfig>（不可原地 mutate）；复用既有 `e2e_guard_returns_404_when_disabled`
+// 套路：构造一份新 AppConfig（enable_e2e_hooks=false），包成 Arc，重建 AppState。
+
+#[tokio::test]
+async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
+    let (_guard, pool, redis) = setup().await;
+    let state = test_state_with_redis(pool.clone(), redis.clone());
+
+    let mut new_config: AppConfig = (*state.config).clone();
+    new_config.enable_e2e_hooks = false;
+    let new_state = std::sync::Arc::new(hsh_erp_rust::state::AppState::new(
+        state.pool.clone(),
+        std::sync::Arc::new(new_config),
+        state.snowflake.clone(),
+        state.ws_hub.clone(),
+        state.cos.clone(),
+        state.shutdown.clone(),
+        state.session.clone(),
+    ));
+    let app = test_app(new_state);
+
+    let (status, env) = send(
+        app,
+        json_request(
+            "DELETE",
+            "/_e2e/hard-delete/outsource_company/1",
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "guard disabled should 404; got env: {env}"
+    );
+    assert_eq!(env["code"], 40400);
+}
+
+// ===========================================================================
+//  10) hard_delete_outsource_company — 被 t_outsource_company_process 引用时返 409
+// ===========================================================================
+//
+// 表无物理 FK（CLAUDE.md §DB 约定「bigint + 索引」），handler 手动 SELECT
+// t_outsource_company_process 检测，被引用即返 21205。
+
+#[tokio::test]
+async fn hard_delete_outsource_company_referenced_returns_409() {
+    let (_guard, pool, redis) = setup().await;
+    let state = test_state_with_redis(pool.clone(), redis.clone());
+    let app = test_app(state);
+
+    // 1) seed 一个 company
+    let (_, seed_resp) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/_e2e/seed/outsource_company",
+            Some(json!({"name": "ReferencedCo"})),
+        ),
+    )
+    .await;
+    let company_id: i64 = seed_resp["data"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // 2) 直接 INSERT 一个 t_process 行 + t_outsource_company_process 映射
+    //    （不依赖 alembic seed 数据——这些会被 clean_business_db 清掉）
+    let process_id: i64 = sqlx::query_scalar(
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
+         version, created_at, updated_at) \
+         VALUES (1, 'E2E_HD_PROC', 'e2e hd proc', 'OUTSOURCE', 0, false, 0, NOW(), NOW()) \
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("insert t_process");
+
+    let _mapping_id: i64 = sqlx::query_scalar(
+        "INSERT INTO t_outsource_company_process (id, outsource_company_id, process_id, \
+         sort_order, version, created_at, updated_at) \
+         VALUES (1, $1, $2, 0, 0, NOW(), NOW()) \
+         RETURNING id",
+    )
+    .bind(company_id)
+    .bind(process_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert t_outsource_company_process");
+
+    // 3) 调 hard-delete → 应被引用，返 409 + 21205
+    let (status, env) = send(
+        app,
+        json_request(
+            "DELETE",
+            &format!("/_e2e/hard-delete/outsource_company/{company_id}"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "referenced company should 409; got env: {env}"
+    );
+    assert_eq!(env["code"], 21205);
+    let msg = env["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("外协公司仍被引用"),
+        "message 应含「外协公司仍被引用」；got: {msg}"
+    );
+
+    // 4) company 仍在（拒删）
+    let company_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM t_outsource_company WHERE id = $1")
+            .bind(company_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count t_outsource_company after reject");
+    assert_eq!(
+        company_count, 1,
+        "company should still exist when hard-delete rejected"
+    );
+}

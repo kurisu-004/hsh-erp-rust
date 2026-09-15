@@ -42,8 +42,8 @@ pub struct SeedWorkerReq {
 
 #[derive(Debug, Deserialize)]
 pub struct SeedPartReq {
-    pub serial: String, // 序列号（如 "A1-0001"）
-    pub customer_id: String, // L2 客户 id
+    pub serial: String,         // 序列号（如 "A1-0001"）
+    pub customer_id: String,    // L2 客户 id
     pub applicant_name: String, // 与 t_part.applicant_name 字符串字段一致
     #[serde(default)]
     pub name: Option<String>,
@@ -99,4 +99,12 @@ pub struct RevokeSessionReq {
 #[derive(Debug, Serialize)]
 pub struct SeedCreatedResp {
     pub id: String, // 雪花 ID 字符串（前端约定）
+}
+
+/// 2026-09-15 新增：hard_delete_outsource_company 出参。
+/// 物理删一行 t_outsource_company + 清 t_e2e_seeded 元数据。
+/// `deleted` 始终为 true（idempotent：id 不存在也返 true）。
+#[derive(Debug, Serialize)]
+pub struct HardDeleteResp {
+    pub deleted: bool,
 }
