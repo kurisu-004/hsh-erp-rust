@@ -32,7 +32,7 @@ Request：
    - `WsEvent::DashboardSnapshot { data }` → 转发 `{"type":"snapshot","data":data,"ts":...}`
    - `WsEvent::DashboardEvent { kind, payload }` → 转发 `WsEventMsg { type:"event", event_type, data, ts }`
    - `WsEvent::Notification` / `WsEvent::Heartbeat` → 丢弃（dashboard 不消费）
-6. 心跳：30s `WsHeartbeatMsg { type:"heartbeat", ts }`。
+6. 心跳：30s `WsHeartbeatMsg { type:"heartbeat", ts }`，**作为 text 帧下发**（浏览器 JS `onmessage` 可直接监听；不是 protocol-level Ping）。
 7. 客户端 `Ping` → `Pong`；`Close` / `None` / 错误 → 清理连接。
 
 响应（连接建立后服务端首发）：
@@ -65,7 +65,7 @@ Request：
 
 - 快照构造：`DashboardService::build_snapshot_with_workers`（service 内部 `pool.begin()` + `commit()`）。
 - 业务事件订阅：`tokio::sync::broadcast::Sender` 多生产者多消费者；客户端 buffer 受 `WsHub::new()` 的 channel 容量（1024）约束，慢消费方会丢消息——dashboard 不消费 Notification/Heartbeat 故影响可控。
-- 心跳：服务端 30s 周期 ping；客户端 pong 自动响应 axum（`Message::Ping` → `Message::Pong`）。
+- 心跳：服务端 30s 周期发 `WsHeartbeatMsg` **text 帧**（浏览器 JS `onmessage` 可直接监听）；客户端 `Ping` → axum 协议层自动 `Pong`（与心跳 text 帧是两件事，不要混用）。
 - 鉴权镜像 HTTP `CurrentUser::from_request_parts` extractor 的 Redis 校验语义（含 TTL 滑动）。
 - i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
 

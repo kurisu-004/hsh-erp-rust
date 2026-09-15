@@ -22,6 +22,10 @@ use axum::{
 
 use crate::state::AppState;
 
+// 2026-09-15 followup-cleanup A8：part 维度文件路由集中处（cad-files / cnc-programs /
+// setup-sheets / cnc-pair / files）。`part::router()` 把 part_id 段 nest 到这个子路由。
+use crate::modules::part_file;
+
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ★ 静态段必须在 /{part_id}/... catch-all 之前注册，
@@ -93,11 +97,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/to-ship", post(handler::to_ship))
         .route("/{part_id}/to-inspection", post(handler::to_inspection))
         .route("/{part_id}/to-process", post(handler::to_process))
-        // ---- 2026-09-15 takeover-fill：part 文件路由（Phase 3 补齐）----
-        // 静态段在 {part_id} 之前注册，避免被 catch-all 截胡。
-        .route("/{part_id}/cad-files", post(handler::upload_cad_files))
-        .route("/{part_id}/cnc-programs", post(handler::upload_cnc_program).get(handler::list_part_cnc_programs))
-        .route("/{part_id}/setup-sheets", post(handler::upload_setup_sheet).get(handler::list_part_setup_sheets))
-        .route("/{part_id}/cnc-pair", post(handler::upload_cnc_pair))
-        .route("/{part_id}/files", get(handler::list_part_files))
+        // ---- 2026-09-15 followup-cleanup A8：part 维度文件路由（cad-files / cnc-programs /
+        //      setup-sheets / cnc-pair / files）已迁出到 part_file::part_nested_router()，
+        //      在这里 nest 以保留历史 URL `/api/v2/parts/{part_id}/<file>...`。
+        .nest("/{part_id}", part_file::handler::part_nested_router())
 }

@@ -105,6 +105,11 @@ tokio-stream = "0.1"
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。
 tower = { version = "0.5", features = ["util"] }
 
+# 2026-09-15 followup-cleanup A4：dashboard WS E2E 测试用真实 socket 客户端连接
+# ws://127.0.0.1:<random>/ws/dashboard?token=<JWT>。版本对齐 axum 0.8 已传递依赖
+# 的 tokio-tungstenite 0.29（避免 union features 之外引入额外版本）。
+tokio-tungstenite = "0.29"
+
 # calamine 现在的角色：P4 集成测试（tests/delivery_print_api.rs）回读生成的
 # xlsx 断言关键单元格。它是 umya-spreadsheet 的传递依赖，但这里**显式声明**
 # 让 dev-only 限制在测试范围内（P0 spike 时期它在主依赖里是因为 [[bin]] 不接受

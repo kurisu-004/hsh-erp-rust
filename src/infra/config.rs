@@ -27,6 +27,10 @@ pub struct AppConfig {
     /// 2026-09-14 修复 Bug #1：移除 main.rs 原 release profile 二次硬关。
     /// 环境变量 `E2E_HOOKS_ENABLED`，缺省 `true`（dev/test 容器场景）。
     pub enable_e2e_hooks: bool,
+    /// 2026-09-15 followup-cleanup A5/A6：dashboard WS 心跳间隔（秒）。
+    /// 生产 30s；测试可调小到 1s 以便在 CI 内验证 heartbeat text 帧。
+    /// 环境变量 `WS_HEARTBEAT_INTERVAL_SECONDS`，缺省 `30`。
+    pub ws_heartbeat_interval_seconds: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +176,8 @@ impl AppConfig {
             // 走默认（启用）；prod / staging 必须显式 `E2E_HOOKS_ENABLED=false`（ops 责任）。
             // 2026-09-14 修复 Bug #1：移除 main.rs 原 release profile 二次硬关。
             enable_e2e_hooks: env_bool("E2E_HOOKS_ENABLED", true)?,
+            // 2026-09-15 followup-cleanup A5/A6：dashboard WS 心跳间隔（秒）；生产 30，测试可调小。
+            ws_heartbeat_interval_seconds: env_parse("WS_HEARTBEAT_INTERVAL_SECONDS", 30u64)?,
         })
     }
 }

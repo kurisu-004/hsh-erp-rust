@@ -13,10 +13,8 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
-use rust_decimal::Decimal;
 use sqlx::PgConnection;
 
-use crate::auth::rbac::Role;
 use crate::infra::clock::now_naive;
 use crate::modules::statistics::dto::{
     DayCount, DeliveryPerformance, OverviewOut, PickupSkipDetailItem, PickupSkipDetailOut,
@@ -47,11 +45,12 @@ impl StatisticsService {
     }
 
     /// 校验 worker_id 字符串 → i64（雪花 ID）；非法 → 400。
+    // 2026-09-15 followup-cleanup A11：错误信息统一为"正整数雪花 ID 字符串"。
     fn parse_worker_id(s: &str) -> Result<i64, AppError> {
         s.parse::<i64>().map_err(|_| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,
-                format!("worker_id 必须是数字字符串: {s:?}"),
+                "worker_id 必须是正整数雪花 ID 字符串",
             )
         })
     }
@@ -129,6 +128,7 @@ impl StatisticsService {
         Self::validate_date_range(date_from, date_to)?;
 
         // 全部未软删工人（不分页 — 内部工人规模远小于 500）。
+        // 2026-09-15 followup-cleanup A9：明确 1000 远高于合理在持工人数（防爆兜底；如需全量应走分页）
         let workers_rows =
             WorkerRepo::list_with_filters(&mut *conn, None, None, 1000, 0).await?;
 
@@ -365,13 +365,8 @@ fn zero_fill_day_count(
 }
 
 // ============================================================
-// 仅占位防止 Role / Decimal 未使用告警（实际由上层调用）
+// 2026-09-15 followup-cleanup A7：删除原 `_unused()` 死代码（Role / Decimal 实际由上层 handler 引用）
 // ============================================================
-#[allow(dead_code)]
-fn _unused() {
-    let _ = Role::Manager;
-    let _: Decimal = Decimal::ZERO;
-}
 
 #[cfg(test)]
 mod tests {
