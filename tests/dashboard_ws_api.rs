@@ -1,24 +1,38 @@
-//! dashboard WS 集成测试（2026-09-15 takeover-fill）
+//! dashboard WS 集成测试（2026-09-15 takeover-fill + followup-cleanup A4）
 //!
-//! 覆盖（≥3 用例）：
-//!   1. build_snapshot_with_workers_basic — service 层直接调，验证 JSON shape
-//!   2. ws_handler_stub_replaced          — handler 函数签名替换验证
-//!   3. broadcast_to_subscribed_socket    — 业务事件可被订阅的 socket 接收
+//! 覆盖：
+//!   service / ws_hub 协作（takeover-fill）：
+//!     1. build_snapshot_with_workers_basic — service 层直接调，验证 JSON shape
+//!     2. build_snapshot_with_workers_returns_full_shape — shape 含 batch_no / batch_id
+//!     3. ws_hub_broadcast_subscription_receives_event — 业务事件订阅通路
+//!     4. ws_hub_broadcast_snapshot_subscription_receives_snapshot — snapshot 订阅通路
 //!
-//! 注：纯 axum + WebSocket 端到端（带 real socket）由 e2e/ 覆盖；本文件专注
-//! service / ws_hub 协作路径，确保 takeover-fill 关键路径不退化。
+//!   真实 socket E2E（followup-cleanup A4）：
+//!     5. ws_e2e_invalid_token_rejected        — 40101（JWT 验签失败）/ 40100（缺 token）
+//!     6. ws_e2e_valid_token_receives_snapshot — 握手后 ≤ 5s 收首条 snapshot text
+//!     7. ws_e2e_valid_token_receives_heartbeat_text — ≤ 心跳间隔 + 5s 收 WsHeartbeatMsg text
+//!                                                  （非 protocol-level Ping 帧；
+//!                                                  浏览器 JS `onmessage` 可直接收到）
 
 #[path = "common/mod.rs"]
 mod common;
 
 use chrono::NaiveDate;
-use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
+use common::{clean_business_db, clean_db, ensure_database_exists, test_pool, test_state, test_ws_app};
 
+use futures_util::StreamExt;
+use hsh_erp_rust::auth::jwt::encode_access;
+use hsh_erp_rust::auth::rbac::{Claims, Role};
+use hsh_erp_rust::auth::session::hash_token;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::modules::dashboard::service::DashboardService;
 use sqlx::PgPool;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -204,4 +218,191 @@ async fn ws_hub_broadcast_snapshot_subscription_receives_snapshot() {
         }
         other => panic!("期望 DashboardSnapshot，got {other:?}"),
     }
+}
+
+// ===========================================================================
+// 2026-09-15 followup-cleanup A4：dashboard WS 真实 socket E2E
+// ===========================================================================
+
+/// 启动 axum 服务端（绑定 127.0.0.1:0 随机端口），返回 (`base_url`, `state`)。
+async fn spawn_ws_server() -> (String, Arc<hsh_erp_rust::state::AppState>) {
+    let (_guard, pool) = setup().await;
+    let state = test_state(pool.clone()).await;
+    let app = test_ws_app(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind random port");
+    let addr = listener.local_addr().expect("local_addr");
+    // graceful_shutdown 等不到 cancel 时持续；这里用 select 包一层 on cancel drop。
+    let shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { shutdown.cancelled().await })
+            .await;
+    });
+    (format!("ws://127.0.0.1:{}", addr.port()), state)
+}
+
+/// 签发合法 access token + 写入 Redis session，使 dashboard WS 握手通过。
+async fn mint_test_token(
+    state: &Arc<hsh_erp_rust::state::AppState>,
+    user_id: i64,
+) -> String {
+    use hsh_erp_rust::auth::session::{CachedCurrentUser, TokenKind};
+    let claims = Claims {
+        sub: user_id,
+        username: "ws-tester".to_string(),
+        roles: vec![Role::Manager],
+        shelf_ids: vec![],
+        shelf_wildcard: true,
+        ver: 0,
+        typ: "access".into(),
+        iss: state.config.jwt.issuer.clone(),
+        exp: 0, // 由 encode_access 覆盖
+    };
+    let (token, _exp) = encode_access(
+        &claims,
+        &state.config.jwt.secret,
+        &state.config.jwt.issuer,
+        state.config.jwt.access_ttl_hours,
+    )
+    .expect("encode_access");
+    // 写 Redis session，让 session_check_enabled=true 时 ws_dashboard 不返 40105。
+    let cached = CachedCurrentUser {
+        id: user_id,
+        username: "ws-tester".to_string(),
+        roles: vec!["MANAGER".into()],
+        shelf_ids: vec![],
+        shelf_wildcard: true,
+    };
+    state
+        .session
+        .create_session(
+            &hash_token(&token),
+            user_id,
+            TokenKind::Access,
+            state.config.redis.session_ttl_seconds,
+            &cached,
+        )
+        .await
+        .expect("create_session");
+    token
+}
+
+#[tokio::test]
+async fn ws_e2e_invalid_token_rejected() {
+    let (base, _state) = spawn_ws_server().await;
+    let url = format!("{base}/dashboard?token=not-a-jwt-at-all");
+    // 用 connect_async 返回的 HTTP response 状态码断言 401（UNAUTHORIZED）
+    let result = tokio_tungstenite::connect_async(&url).await;
+    match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "非法 JWT 应返 401"
+            );
+        }
+        Err(other) => panic!("期望 HTTP 401 错误，got tungstenite err: {other:?}"),
+        Ok(_) => panic!("不应成功升级 WS"),
+    }
+}
+
+#[tokio::test]
+async fn ws_e2e_valid_token_receives_snapshot() {
+    let (base, state) = spawn_ws_server().await;
+    // 插一个 active 货架，让 snapshot 非空
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) \
+         VALUES ($1, 'S-WS1', 'WS一号架', 'PRODUCTION', true, 0, 0, $2, $2)",
+    )
+    .bind(snowflake.next_id())
+    .bind(now)
+    .execute(&state.pool)
+    .await
+    .expect("insert t_shelf");
+
+    let user_id = snowflake.next_id();
+    let token = mint_test_token(&state, user_id).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed for valid token");
+
+    // 收首条 snapshot，≤ 5s
+    let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("snapshot 超时")
+        .expect("ws stream closed")
+        .expect("ws frame err");
+    let text = match frame {
+        WsMessage::Text(t) => t,
+        other => panic!("首条 frame 应为 text，got {other:?}"),
+    };
+    let v: serde_json::Value = serde_json::from_str(&text).expect("snapshot JSON parse");
+    assert_eq!(v["type"], "snapshot", "首条 frame 应为 snapshot envelope");
+    assert!(v["data"]["on_production_shelves"].is_array());
+    assert!(!v["data"]["upcoming_delivery"].as_array().unwrap().is_empty());
+
+    // 主动关 socket 避免 graceful_shutdown 死等
+    let _ = ws.close(None).await;
+}
+
+#[tokio::test]
+async fn ws_e2e_valid_token_receives_heartbeat_text() {
+    let (base, state) = spawn_ws_server().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let user_id = snowflake.next_id();
+    let token = mint_test_token(&state, user_id).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed for valid token");
+
+    // 收首条 snapshot（先把它消耗掉）
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("snapshot 超时")
+        .expect("ws stream closed")
+        .expect("ws frame err");
+
+    // 等心跳：测试 config 把 ws_heartbeat_interval_seconds 设为 1；
+    // 给 1s + 5s slack 总 6s 上限避免 CI 抖动。期望收到 `WsHeartbeatMsg` text 帧
+    // （**不是** protocol-level Ping 帧）。
+    let heartbeat_interval = state.config.ws_heartbeat_interval_seconds;
+    let wait = Duration::from_secs(heartbeat_interval + 5);
+    let mut got_heartbeat = false;
+    let deadline = tokio::time::Instant::now() + wait;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+                    && v["type"] == "heartbeat"
+                    && v["ts"].is_number()
+                {
+                    got_heartbeat = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(WsMessage::Ping(_)))) => {
+                panic!("不应再收到 protocol-level Ping 帧；心跳应走 text（followup A6）");
+            }
+            Ok(Some(Ok(WsMessage::Pong(_)))) => continue,
+            Ok(Some(Ok(WsMessage::Close(_)))) => break,
+            Ok(Some(Ok(_))) => continue, // binary / 其它
+            Ok(Some(Err(e))) => panic!("ws frame err: {e}"),
+            Ok(None) => break,
+            Err(_) => continue, // 500ms 内无帧 → 继续轮询直到 deadline
+        }
+    }
+    let _ = ws.close(None).await;
+    assert!(
+        got_heartbeat,
+        "未在 {wait:?} 内收到 heartbeat text 帧（interval={heartbeat_interval}s）"
+    );
 }

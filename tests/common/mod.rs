@@ -214,6 +214,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         },
         delivery_note_template_dir: std::path::PathBuf::from("template"),
         enable_e2e_hooks: true,
+        // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳，E2E WS 用例可在 2s 内验到 text 帧。
+        ws_heartbeat_interval_seconds: 1,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -276,6 +278,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         },
         delivery_note_template_dir: std::path::PathBuf::from("template"),
         enable_e2e_hooks: true,
+        // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳。
+        ws_heartbeat_interval_seconds: 1,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -307,6 +311,15 @@ pub async fn test_state(pool: PgPool) -> Arc<AppState> {
 #[allow(dead_code)]
 pub fn test_app(state: Arc<AppState>) -> axum::Router {
     hsh_erp_rust::modules::v2_router().with_state(state)
+}
+
+/// axum Router：与 main.rs 中的 `/ws` nest 同形（用于 dashboard WS E2E 测试）。
+///
+/// 2026-09-15 followup-cleanup A4：测试需要真实 socket 客户端连接 ws://.../ws/dashboard，
+/// 在 axum::Router 上 bind TcpListener 后跑 axum::serve，再用 tokio_tungstenite 连接。
+#[allow(dead_code)]
+pub fn test_ws_app(state: Arc<AppState>) -> axum::Router {
+    hsh_erp_rust::modules::ws_router().with_state(state)
 }
 
 // ===========================================================================

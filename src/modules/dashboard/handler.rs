@@ -1,4 +1,4 @@
-//! dashboard WebSocket handler（2026-09-15 takeover-fill）
+//! dashboard WebSocket handler（2026-09-15 takeover-fill + followup-cleanup）
 //!
 //! 路径：`GET /ws/dashboard?token=<JWT>`（由 `dashboard::mod::router()` 桥接，
 //! 再由 `modules::ws_router()` 在 `/ws` 前缀下挂）。
@@ -9,7 +9,9 @@
 //! - WS 升级：`axum::extract::ws::WebSocketUpgrade`
 //! - 业务事件订阅：把 `state.ws_hub.broadcast` 上的 `WsEvent::DashboardEvent`
 //!   透传给本连接
-//! - 心跳：30s ping / 30s pong 超时断开
+//! - 心跳：30s 周期发 `WsHeartbeatMsg` 作为 **text** 帧（浏览器 JS `onmessage` 可直接收到；
+//!   原 `Message::Ping` 浏览器不会触发 `onmessage`，前端无法感知；2026-09-15 followup A6 改）。
+//!   间隔由 `state.config.ws_heartbeat_interval_seconds` 控制，生产 30s，测试可调小。
 //! - 推一次 `WsSnapshotMsg` 立即下发
 
 use std::sync::Arc;
@@ -30,8 +32,6 @@ use crate::modules::dashboard::dto::{WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
 use crate::modules::dashboard::service::DashboardService;
 use crate::shared::error::{code, AppError};
 use crate::state::AppState;
-
-const WS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
@@ -142,7 +142,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: i64) {
         return;
     }
 
-    let mut heartbeat_timer = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
+    let heartbeat_interval =
+        Duration::from_secs(state.config.ws_heartbeat_interval_seconds.max(1));
+    // 2026-09-15 followup-cleanup A5：首次 tick 不立即 fire（`interval_at` 把首次
+    // 触发时刻推迟到 now + period）；原 `interval(30s)` 在 select! 第一次轮询
+    // 时立刻 ready，会浪费一帧 CPU / 误导 E2E 用例把首 tick 误当成 30s 后的真心跳。
+    let mut heartbeat_timer = tokio::time::interval_at(
+        tokio::time::Instant::now() + heartbeat_interval,
+        heartbeat_interval,
+    );
     heartbeat_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -200,12 +208,21 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: i64) {
                     }
                 }
             }
-            // 30s 心跳 ping
+            // 30s 心跳：发 **text** 帧（浏览器 JS `onmessage` 可直接收到；
+            // 原 `Message::Ping` 浏览器不会触发 `onmessage`，前端无法感知；
+            // 2026-09-15 followup A6 改）。axum 协议层仍自动响应客户端的 Ping→Pong。
             _ = heartbeat_timer.tick() => {
                 let ts = chrono::Utc::now().timestamp();
                 let hb = WsHeartbeatMsg { msg_type: "heartbeat", ts };
-                let text = serde_json::to_string(&hb).unwrap_or_default();
-                if sender.send(Message::Ping(axum::body::Bytes::from(text.into_bytes()))).await.is_err() {
+                let text = match serde_json::to_string(&hb) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(error = %e, "ws dashboard: 心跳序列化失败，跳过本轮");
+                        continue;
+                    }
+                };
+                let frame = Message::Text(axum::extract::ws::Utf8Bytes::from(text));
+                if sender.send(frame).await.is_err() {
                     break;
                 }
             }
