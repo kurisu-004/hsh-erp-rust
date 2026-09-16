@@ -95,14 +95,33 @@
 | `version` | i32 | 乐观锁 |
 | `quantity` | i32 | |
 | `order_no` | string? | |
-| `actual_delivery_date` | date? | 实际交付日 |
 | `updated_at` | naive datetime | |
 | `updated_by` | string (i64)? | |
 
+> 2026-09-16 PR-2（migration 027）：`PartOut` 删 `actual_delivery_date` —— 由
+> `t_part_event.event_type='DELIVERED'` 事件派生（详见
+> [`../../api/statistics.md`](../../api/statistics.md) 交付口径）。实际交付日期前端
+> 应通过 `GET /parts/{part_id}/events` 拉时间线或由对应 DELIVERED 事件携带。
+
 ### PartListItem 字段
 
-`TPart` 完整 29 列 + `customer_name` / `l1_customer_name` 冗余字段；见 [`./index.md#mainconventions`](./index.md#端点约束与-python-一致) 关于 i64 字段序列化为 string 的约定。
+`TPart` 完整 23 列 + `customer_name` / `l1_customer_name` 冗余字段 + 列表项专用派生字段
+`location` / `holder_name`；见 [`./index.md#mainconventions`](./index.md#端点约束与-python-一致)
+关于 i64 字段序列化为 string 的约定。
 
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| ... 其它 TPart 列 ... | ... | 见下 |
+| `customer_name` | string? | 冗余（lookup_customer_names） |
+| `l1_customer_name` | string? | 冗余（lookup_customer_names） |
+| `location` | string? | **派生**（2026-09-16 PR-2 § part/service/crud.rs::enrich_part_list_with_location_and_holder）；`min-progress 活跃批次.location`（与 `compute_part_target` 一致）。无活跃批次 → `null`。前端展示文案规范由前端承担（`PRODUCTION_SHELF` → "货架 X" 等）；后端只负责值。 |
+| `holder_name` | string? | **派生**（同上）；按 min-progress 活跃批次的 `current_holder_id` 解析（按 batch.location 分桶：`PRODUCTION_SHELF` / `INSPECTION_SHELF` → `t_shelf.code`；`WORKER` → `t_worker.name`；`OUTSOURCE_COMPANY` → `t_outsource_company.name`；`OFFICE` / `None` → `null`）。 |
+
+> 2026-09-16 PR-2（migration 027）：`t_part` 删 `actual_delivery_date` /
+> `location` / `current_holder_id` / `placed_at` / `delivery_note_id` /
+> `has_been_repaired` 6 个批次依附列；`TPart` 由 29 列精简至 23 列。
+> 列表项位置/持有人展示由 service 层按 min-progress 活跃批次派生（见上）。
+>
 > 2026-09-16（migration 026 FK 翻转）：`TPart` 新增 `process_chain_id`（string i64?）
 > —— 逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链。前端「工序制定」页
 > 按此字段是否为 `null` 批量区分已制定 / 未制定工序的零件。

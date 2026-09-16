@@ -489,8 +489,12 @@ Response 200 `data`：`InspectionBatchListOut`
 | `location` | string? | 批次所在位置（`INSPECTION_SHELF` 等） |
 | `version` | i32 | 乐观锁（`t_part_batch.version`，caller OCC 锚点） |
 | `placed_at` | naive datetime? | 批次上架时间（`placed_at`） |
-| `has_been_repaired` | bool | 是否曾经被返工 |
 | `parent_batch_id` | string (i64)? | 拆批来源的父批次 ID（仅拆批产生的新批次非 None） |
+
+> 2026-09-16 PR-2（migration 027）：`InspectionBatchListItemOut` 删 `has_been_repaired`
+> 字段 —— `t_part_batch.has_been_repaired` 列已删；返修事实由
+> `t_part_event.event_type='REPAIR_STARTED'` 事件日志追溯（详见
+> [`../../api/parts/lifecycle.md`](../../api/parts/lifecycle.md) § start-repair）。
 
 holder 解析段（LEFT JOIN `t_worker` / `t_shelf` 一次拼齐）：
 

@@ -169,8 +169,11 @@ Request：`AssemblyUpdateRequest` — 字段全部可选（缺省 = DB 不动）
 | `customer_id` | string (i64)? (三态) | — | `None` = 不动；`Some("...")` = 覆盖 + L2 校验（→ 20302 / 20102） |
 | `request_date` | date? (三态) | — | `None` = 不动；`Some(null)` = 置 NULL；`Some("2026-08-27")` = 覆盖 |
 | `planned_delivery_date` | date? (三态) | — | 同上 |
-| `actual_delivery_date` | date? (三态) | — | 同上 |
 | `is_urgent` | bool? | — | |
+
+> 2026-09-16 PR-2（migration 027）：`AssemblyUpdateRequest` 删 `actual_delivery_date`
+> 入参 —— `t_assembly.actual_delivery_date` 列已删；实际交付日期由
+> `t_part_event.event_type='DELIVERED'` 事件派生（子件批次交付事件体现）。
 | `quantity` | i32? | — | |
 | `unit_price` | decimal? (三态) | — | `None` / `Some(null)` / `Some(0.5)` |
 | `total_price` | decimal? (三态) | — | 同上 |
@@ -192,7 +195,9 @@ WS 广播（commit 后下发）：
 |---|---|
 | `request_date` / `applicant_name` / `order_no` / `system_delivery_date` / `planned_delivery_date` / `is_urgent` / `note` / `customer_id` | 父件"更新后的当前行值" |
 
-> - 排除 `actual_delivery_date`：deliver 流程写入的产物，不属于"信息字段"。
+> - 2026-09-16 PR-2（migration 027）：`actual_delivery_date` 列已从 `t_assembly`
+>   删除（与 `t_part` 同处理），级联子件集合保持 8 字段不变（PR-2 §
+>   `assembly/service.rs:522` §3.2 注释）。
 > - 排除 `quantity`：单独走 §3.3 缩放（见下）。
 > - 实现上按"父件更新后的当前行值"覆盖，避免三态解析歧义；未变更字段被覆写为原值（语义无差）。
 > - `customer_id` 变更时同样级联。
@@ -262,7 +267,8 @@ WS 广播（commit 后下发）：
 
 ### AssemblyUpdateRequest 字段
 
-见上文 [`POST /assemblies/{id}/update`](#post-apiv2assembliesassembly_idupdate) 字段表。注意 `customer_id` / `request_date` / `planned_delivery_date` / `actual_delivery_date` / `unit_price` / `total_price` / `system_delivery_date` 是三态 `Option<Option<T>>`。
+见上文 [`POST /assemblies/{id}/update`](#post-apiv2assembliesassembly_idupdate) 字段表。注意 `customer_id` / `request_date` / `planned_delivery_date` / `unit_price` / `total_price` / `system_delivery_date` 是三态 `Option<Option<T>>`。
+> 2026-09-16 PR-2：`actual_delivery_date` 已从 `AssemblyUpdateRequest` 删除（t_assembly 列已删）。
 
 ## Rust DTO 定义
 
@@ -280,7 +286,8 @@ pub struct AssemblyOut {
     pub customer_id: i64,
     pub request_date: Option<NaiveDate>,
     pub planned_delivery_date: Option<NaiveDate>,
-    pub actual_delivery_date: Option<NaiveDate>,
+    // 2026-09-16 PR-2（migration 027）：删 `actual_delivery_date` —— 由
+    // t_part_event.event_type='DELIVERED' 派生（PR-2 § assembly/dto.rs:141）。
     pub is_urgent: bool,
     pub status: String,                 // PENDING / IN_PROCESS / COMPLETED / CANCELLED
     pub version: i32,
@@ -431,8 +438,8 @@ pub struct AssemblyUpdateRequest {
     pub request_date: Option<Option<NaiveDate>>,     // 三态
     #[serde(default, deserialize_with = "deserialize_optional_optional_date")]
     pub planned_delivery_date: Option<Option<NaiveDate>>,
-    #[serde(default, deserialize_with = "deserialize_optional_optional_date")]
-    pub actual_delivery_date: Option<Option<NaiveDate>>,
+    // 2026-09-16 PR-2（migration 027）：删 `actual_delivery_date` —— 由
+    // t_part_event.event_type='DELIVERED' 派生（PR-2 § assembly/dto.rs:174）。
     #[serde(default)]
     pub is_urgent: Option<bool>,
     #[serde(default)]

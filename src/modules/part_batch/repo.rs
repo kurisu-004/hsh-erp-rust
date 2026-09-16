@@ -222,8 +222,8 @@ impl PartBatchRepo {
     ///
     /// 2026-09-16 PR-2 瘦身（migration 027）：JOIN 投影同步删 `pb.has_been_repaired`
     /// + `p.actual_delivery_date` / `p.location` / `p.current_holder_id` /
-    /// `p.placed_at` / `p.delivery_note_id` / `p.has_been_repaired` 6 列；
-    /// TPart 字面量回填同步。
+    ///   `p.placed_at` / `p.delivery_note_id` / `p.has_been_repaired` 6 列；
+    ///   TPart 字面量回填同步。
     pub async fn list_with_part_by_delivery_note_ids<'e, E: PgExecutor<'e>>(
         executor: E,
         note_ids: &[i64],

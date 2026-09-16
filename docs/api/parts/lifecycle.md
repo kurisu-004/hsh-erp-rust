@@ -102,9 +102,12 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
 权限: **Manager / Clerk / Inspector**
 
 > ⚠️ **2026-09-11 BREAKING CHANGE (PR-B3)**：收 `batch_id` + `version`，锚定
-> `t_part_batch.version`。状态机守卫读 batch 当前状态 `IN_PROCESS → REPAIRING`；
-> `has_been_repaired=true` 同时写 batch（PR-B3 §4.3 现状）与 part（rollup
-> 范围外单独物化）。
+> `t_part_batch.version`。状态机守卫读 batch 当前状态 `IN_PROCESS → REPAIRING`。
+>
+> 2026-09-16 PR-2（migration 027）：`has_been_repaired` 列已从 `t_part` 与
+> `t_part_batch` 双删 —— 拆批后无法确定是哪一个批次返修，列语义失真整体废弃。
+> 返修事实改由 `t_part_event.event_type='REPAIR_STARTED'` 事件日志追溯（PR-2 §
+> part/service/lifecycle.rs:422）。
 
 Request：
 

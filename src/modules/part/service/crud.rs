@@ -879,7 +879,7 @@ pub(super) async fn lookup_customer_names(
 ///
 /// SQL 数：4 条（与页大小 N 无关）：
 /// 1. 一次性拉所有 part 的活跃批次（`list_active_by_part_ids`）
-/// 2-4. t_shelf / t_worker / t_outsource_company 各 1 条 `WHERE id = ANY(...)`
+///    2-4. t_shelf / t_worker / t_outsource_company 各 1 条 `WHERE id = ANY(...)`
 async fn enrich_part_list_with_location_and_holder(
     conn: &mut PgConnection,
     part_ids: &[i64],

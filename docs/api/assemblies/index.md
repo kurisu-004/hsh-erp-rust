@@ -41,8 +41,10 @@
 | `customer_id` | string (i64) | 二级客户 id |
 | `request_date` | date? | 客户请求日 |
 | `planned_delivery_date` | date? | 计划交付日 |
-| `actual_delivery_date` | date? | 实际交付日 |
 | `is_urgent` | bool | 紧急标记 |
+
+> 2026-09-16 PR-2（migration 027）：`AssemblyOut` 删 `actual_delivery_date` 字段
+> —— `t_assembly.actual_delivery_date` 列已删；装配体实际交付由子件批次交付事件体现。
 | `status` | string | 状态枚举字符串（PENDING / IN_PROCESS / INSPECTION / READY_TO_SHIP / DELIVERED / COMPLETED / CANCELLED，2026-09 扩 7 态对齐 Python） |
 | `version` | i32 | 乐观锁 |
 | `serial_no` | string? | 主装配体序列号（无 PDF 时 None；格式 `{prefix}{counter:07}`） |
