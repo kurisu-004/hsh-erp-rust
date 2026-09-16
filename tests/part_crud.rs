@@ -2032,12 +2032,7 @@ async fn batch_create_parts_handler_spawn_delete_on_ok() {
     // 5) 调用 handler
     let (status, envelope) = send(
         app2,
-        json_request(
-            "POST",
-            "/parts/batch",
-            Some(req_body),
-            Some(&token),
-        ),
+        json_request("POST", "/parts/batch", Some(req_body), Some(&token)),
     )
     .await;
 
@@ -2057,7 +2052,9 @@ async fn batch_create_parts_handler_spawn_delete_on_ok() {
     // 8) 断言 mock.delete_calls 包含 cleanup_tmp_keys 的所有 key
     let delete_calls = cos.delete_calls.lock().unwrap().clone();
     assert!(
-        delete_calls.iter().any(|k| k == "tmp/test/handler-spawn-delete.pdf"),
+        delete_calls
+            .iter()
+            .any(|k| k == "tmp/test/handler-spawn-delete.pdf"),
         "handler spawn delete 应触发 tmp_key 兜底: got {delete_calls:?}"
     );
 }

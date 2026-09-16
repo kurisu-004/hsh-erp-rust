@@ -386,14 +386,8 @@ pub async fn test_state_with_cos(
     let shutdown = CancellationToken::new();
     let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool));
     Arc::new(AppState::new(
-        pool,
-        config,
-        snowflake,
-        ws_hub,
-        cos, // 注入的 cos（替换默认 NoopCos）
-        sts,
-        shutdown,
-        session,
+        pool, config, snowflake, ws_hub, cos, // 注入的 cos（替换默认 NoopCos）
+        sts, shutdown, session,
     ))
 }
 
