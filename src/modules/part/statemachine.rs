@@ -438,20 +438,32 @@ pub fn part_status_progress(s: &str) -> u8 {
 /// 2026-09-16 PR-2 瘦身（migration 027）：`location` / `current_holder_id` /
 /// `placed_at` 列已从 t_part 删除，rollup 投影同步收窄。`next_process_id` 仍
 /// 保留作 part 派生列读缓存（service 层按 `next_process_id` 决策下一步）。
+///
+/// 2026-09-16 PR-3 批次 step 化（migration 028）：
+/// - 删 `placed_at`（t_part_batch 列已删）
+/// - `next_process_id` → `current_process_step_id`（t_part_batch 新列，逻辑 FK → step.id）
+/// - `BatchForRollup.current_process_step_id` 保留语义：service 层
+///   `sync_from_batch_change` 读后通过 `t_process_chain_step.process_id`
+///   派生 `t_part.next_process_id` 缓存（与 Python 行为对齐）
 #[derive(Debug, Clone, Default)]
 pub struct BatchForRollup {
     pub status: String,
     pub location: Option<String>,
     pub current_holder_id: Option<i64>,
-    pub next_process_id: Option<i64>,
-    pub placed_at: Option<chrono::NaiveDateTime>,
+    pub current_process_step_id: Option<i64>,
 }
 
 /// `compute_part_target` 的输出：目标 status + 派生列（从最慢批次物化）。
 ///
 /// 2026-09-16 PR-2 瘦身：只物化 `status` + `next_process_id`（t_part 保留的两
 /// 列 rollup 缓存）。`location` / `current_holder_id` / `placed_at` 真相源在
-/// `t_part_batch`，列表页按需在 service 层从 `t_part_batch` 直接派生。
+/// `t_part_batch`，由 `sync_from_batch_change` 的 caller 在需要时另查。
+///
+/// 2026-09-16 PR-3 批次 step 化：`next_process_id` 字段保留作为派生缓存值，
+/// 但派生源改为 `BatchForRollup.current_process_step_id`（service 层
+/// `sync_from_batch_change` JOIN `t_process_chain_step` 取 `process_id` 写入）。
+/// 本函数只搬运 step_id → next_process_id（语义对齐：step 进程维度 1:1，
+/// rollup 派生保留同一 process_id）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartRollupTarget {
     pub status: String,
@@ -467,11 +479,17 @@ pub struct PartRollupTarget {
 /// 2. 全部 CANCELLED → `status='CANCELLED'`
 /// 3. 非 CANCELLED 全部 COMPLETED → `status='COMPLETED'`
 /// 4. 否则取「最慢批次」（min progress over non-terminal, non-cancelled）的
-///    `status` + `next_process_id`；progress 表见 `part_status_progress`
+///    `status` + `current_process_step_id`（语义对齐 `next_process_id`）；
+///    progress 表见 `part_status_progress`
 ///
 /// 2026-09-16 PR-2 瘦身：返回值只剩 `status` + `next_process_id`；其它派
 /// 生列（`location` / `current_holder_id` / `placed_at`）真相源在
 /// `t_part_batch`，由 `sync_from_batch_change` 的 caller 在需要时另查。
+///
+/// 2026-09-16 PR-3：返回值字段名 `next_process_id` 不变（DTO 兼容），但内部
+/// 直接搬运 `current_process_step_id`（语义上「next_process_id」等价于
+/// `current_process_step_id.process_id`，由 caller 在写入 t_part 时经 step JOIN
+/// 派生）。本函数保持纯函数性质（不引入 SQL）。
 pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarget> {
     if batches.is_empty() {
         return None;
@@ -482,7 +500,7 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         let r = &batches[0];
         return Some(PartRollupTarget {
             status: "CANCELLED".to_string(),
-            next_process_id: r.next_process_id,
+            next_process_id: r.current_process_step_id,
         });
     }
     let non_terminal: Vec<&BatchForRollup> = non_cancelled
@@ -494,7 +512,7 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         let r = non_cancelled[0];
         return Some(PartRollupTarget {
             status: "COMPLETED".to_string(),
-            next_process_id: r.next_process_id,
+            next_process_id: r.current_process_step_id,
         });
     }
     // 取 min-progress 批次
@@ -505,7 +523,7 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         .unwrap(); // safety: non_terminal 至少有一条
     Some(PartRollupTarget {
         status: min.status.clone(),
-        next_process_id: min.next_process_id,
+        next_process_id: min.current_process_step_id,
     })
 }
 
@@ -518,8 +536,7 @@ mod rollup_tests {
             status: status.to_string(),
             location: None,
             current_holder_id: None,
-            next_process_id: None,
-            placed_at: None,
+            current_process_step_id: None,
         }
     }
 
@@ -528,8 +545,7 @@ mod rollup_tests {
             status: status.to_string(),
             location: loc.map(str::to_string),
             current_holder_id: None,
-            next_process_id: None,
-            placed_at: None,
+            current_process_step_id: None,
         }
     }
 
@@ -659,9 +675,13 @@ mod rollup_tests {
     fn materializes_next_process_from_min_progress_batch() {
         // 2026-09-16 PR-2 瘦身：rollup 只物化 status + next_process_id。
         // 验证 next_process_id 从 min-progress 批次派生（其它派生列忽略）。
+        //
+        // 2026-09-16 PR-3 批次 step 化：BatchForRollup.next_process_id 字段删除，
+        // 改用 current_process_step_id（service 层在写入 t_part.next_process_id
+        // 时经 step JOIN 取 process_id）；本函数保持纯函数性质，直接搬运 step_id。
         let mut b_in_process = batch_with_loc("IN_PROCESS", Some("PRODUCTION_SHELF"));
         b_in_process.current_holder_id = Some(42);
-        b_in_process.next_process_id = Some(7);
+        b_in_process.current_process_step_id = Some(7);
         let v = vec![b_in_process, batch_with_loc("DELIVERED", Some("OUTSOURCE_COMPANY"))];
         let r = compute_part_target(&v).unwrap();
         assert_eq!(r.status, "IN_PROCESS");

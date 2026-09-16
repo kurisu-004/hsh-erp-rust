@@ -15,6 +15,11 @@
 //! worker-pool 域新增：
 //! - `count_held_by_worker` —— worker 当前持有批次数（state 端点 + max_held_batches 校验）
 //! - `list_held_by_worker` —— worker 当前持有批次详情（state 端点 DTO）
+//!
+//! 2026-09-16 PR-3 批次 step 化（migration 028）：
+//! - 所有走 `TPartBatch` 投影的 SELECT 删 `next_process_id` / `placed_at` 列
+//! - 加 `current_process_step_id`（逻辑 FK → t_process_chain_step.id）
+//! - INSERT / UPDATE 字面量同步
 
 use sqlx::PgExecutor;
 
@@ -31,8 +36,11 @@ pub struct PartBatchRepo;
 ///
 /// `location`：单件 / 批量 part 创建时为 `None`（part 行尚未确定 location）；
 /// 子件创建（`insert_child_for_assembly`）时为 `Some("OFFICE")`（与子件 part
-/// 行写入路径对齐）。其它派生列（`current_holder_id` / `next_process_id` /
-/// `placed_at` / `delivery_note_id`）新建时一律 `None`。
+/// 行写入路径对齐）。
+///
+/// 2026-09-16 PR-3 批次 step 化（migration 028）：
+/// - `next_process_id` / `placed_at` 字段删除（t_part_batch 列已删）
+/// - 初始 batch 不在生产流内，`current_process_step_id = None`
 pub struct NewInitialBatch<'a> {
     pub id: i64,
     pub part_id: i64,
@@ -42,10 +50,9 @@ pub struct NewInitialBatch<'a> {
 }
 
 impl PartBatchRepo {
-    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 `has_been_repaired`
-    /// 列，查询投影同步收窄。`get_by_id` / `list_by_delivery_note` /
-    /// `list_by_part_ids` / `list_active_by_part_id` / `list_active_by_part_ids` /
-    /// `list_held_by_worker` 等所有走 `TPartBatch` 投影的查询同步删该列。
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：t_part_batch 删
+    /// `next_process_id` / `placed_at` 列，加 `current_process_step_id`。
+    /// 所有走 `TPartBatch` 投影的查询同步收窄。
     pub async fn get_by_id<'e, E: PgExecutor<'e>>(
         executor: E,
         id: i64,
@@ -55,7 +62,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, next_process_id, placed_at,
+                   current_holder_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -72,6 +79,9 @@ impl PartBatchRepo {
     /// 送货单的全部未删批次（Phase P2 列出 / Phase P3 扫码入单后回查）。
     /// 与 Python `list_by_delivery_note` 行为一致；本方法不 JOIN t_part，
     /// caller 需要展示字段时另调 `list_with_part_by_delivery_note`。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
+    /// current_process_step_id。
     pub async fn list_by_delivery_note<'e, E: PgExecutor<'e>>(
         executor: E,
         note_id: i64,
@@ -80,7 +90,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, next_process_id, placed_at,
+                   current_holder_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -102,6 +112,9 @@ impl PartBatchRepo {
     /// `p.current_holder_id` / `p.placed_at` / `p.delivery_note_id` /
     /// `p.has_been_repaired`（t_part 列已删，6 个批次依附列）；TPart 字面量
     /// 回填同步。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：删 `pb.next_process_id` /
+    /// `pb.placed_at`，加 `pb.current_process_step_id`。
     pub async fn list_with_part_by_delivery_note<'e, E: PgExecutor<'e>>(
         executor: E,
         note_id: i64,
@@ -116,8 +129,7 @@ impl PartBatchRepo {
                 pb.status        AS "pb_status!",
                 pb.location      AS "pb_location?",
                 pb.current_holder_id AS "pb_current_holder_id?",
-                pb.next_process_id AS "pb_next_process_id?",
-                pb.placed_at     AS "pb_placed_at?",
+                pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
                 pb.version       AS "pb_version!",
@@ -173,8 +185,7 @@ impl PartBatchRepo {
                         status: r.pb_status,
                         location: r.pb_location,
                         current_holder_id: r.pb_current_holder_id,
-                        next_process_id: r.pb_next_process_id,
-                        placed_at: r.pb_placed_at,
+                        current_process_step_id: r.pb_current_process_step_id,
                         delivery_note_id: r.pb_delivery_note_id,
                         parent_batch_id: r.pb_parent_batch_id,
                         version: r.pb_version,
@@ -224,6 +235,9 @@ impl PartBatchRepo {
     /// + `p.actual_delivery_date` / `p.location` / `p.current_holder_id` /
     ///   `p.placed_at` / `p.delivery_note_id` / `p.has_been_repaired` 6 列；
     ///   TPart 字面量回填同步。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：删 `pb.next_process_id` /
+    /// `pb.placed_at`，加 `pb.current_process_step_id`。
     pub async fn list_with_part_by_delivery_note_ids<'e, E: PgExecutor<'e>>(
         executor: E,
         note_ids: &[i64],
@@ -241,8 +255,7 @@ impl PartBatchRepo {
                 pb.status        AS "pb_status!",
                 pb.location      AS "pb_location?",
                 pb.current_holder_id AS "pb_current_holder_id?",
-                pb.next_process_id AS "pb_next_process_id?",
-                pb.placed_at     AS "pb_placed_at?",
+                pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
                 pb.version       AS "pb_version!",
@@ -296,8 +309,7 @@ impl PartBatchRepo {
                     status: r.pb_status,
                     location: r.pb_location,
                     current_holder_id: r.pb_current_holder_id,
-                    next_process_id: r.pb_next_process_id,
-                    placed_at: r.pb_placed_at,
+                    current_process_step_id: r.pb_current_process_step_id,
                     delivery_note_id: r.pb_delivery_note_id,
                     parent_batch_id: r.pb_parent_batch_id,
                     version: r.pb_version,
@@ -337,6 +349,9 @@ impl PartBatchRepo {
     }
 
     /// 多工单的未删批次批查（Phase P3 装配件整套入单时按子件 part_ids 一次拿齐）。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
+    /// current_process_step_id。
     pub async fn list_by_part_ids<'e, E: PgExecutor<'e>>(
         executor: E,
         part_ids: &[i64],
@@ -349,7 +364,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, next_process_id, placed_at,
+                   current_holder_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -432,7 +447,7 @@ impl PartBatchRepo {
     }
 
     /// 拆分批次：在 `qty` < `batch.quantity` 时调用，构造一条新批次（继承
-    /// 状态/位置/holder/next_process；**不继承** delivery_note_id 与
+    /// 状态/位置/holder/current_process_step；**不继承** delivery_note_id 与
     /// parent_batch_id），并把源批次 quantity 减 `qty`。整组写在一个 tx 内。
     ///
     /// 返回新批次雪花 id（caller 拿到后做后续 attach_to_note）。`batch_no` 用
@@ -442,6 +457,10 @@ impl PartBatchRepo {
     ///
     /// 注：本函数需在同一事务内连发三条 SQL（max + insert + update），而
     /// `impl PgExecutor<'_>` 不能 move 多次，因此显式收 `&mut PgConnection`。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
+    /// - `next_process_id` / `placed_at` 参数删除（t_part_batch 列已删）
+    /// - 改传 `current_process_step_id`（t_part_batch 新列）
     #[allow(clippy::too_many_arguments)]
     pub async fn split_batch(
         conn: &mut sqlx::PgConnection,
@@ -453,8 +472,7 @@ impl PartBatchRepo {
         status: &str,
         location: Option<&str>,
         current_holder_id: Option<i64>,
-        next_process_id: Option<i64>,
-        placed_at: Option<chrono::NaiveDateTime>,
+        current_process_step_id: Option<i64>,
         when: chrono::NaiveDateTime,
         created_by: Option<i64>,
         updated_by: Option<i64>,
@@ -472,19 +490,18 @@ impl PartBatchRepo {
         .await?;
 
         // 2. 插入新批次（quantity = qty，不继承 delivery_note_id，写 parent_batch_id）。
-        //    2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 has_been_repaired
-        //    列，INSERT 同步删该列。
+        //    2026-09-16 PR-3 批次 step 化：current_process_step_id 直接继承源批次。
         sqlx::query!(
             r#"
             INSERT INTO t_part_batch
                 (id, part_id, batch_no, quantity, status, location,
-                 current_holder_id, next_process_id, placed_at,
+                 current_holder_id, current_process_step_id,
                  delivery_note_id, parent_batch_id,
                  version, created_at, created_by, updated_at, updated_by)
             VALUES ($1, $2, $3, $4, $5, $6,
-                    $7, $8, $9,
-                    NULL, $10,
-                    0, $11, $12, $11, $13)
+                    $7, $8,
+                    NULL, $9,
+                    0, $10, $11, $10, $12)
             "#,
             new_batch_id,
             part_id,
@@ -493,8 +510,7 @@ impl PartBatchRepo {
             status,
             location,
             current_holder_id,
-            next_process_id,
-            placed_at,
+            current_process_step_id,
             source_batch_id,
             when,
             created_by,
@@ -530,6 +546,9 @@ impl PartBatchRepo {
 
     /// 工单全部活跃批次 + 批次自身状态（rollup 用）。
     /// 不传 `include_deleted`：rollup 只看活跃行。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
+    /// current_process_step_id。
     pub async fn list_active_by_part_id<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -538,7 +557,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, next_process_id, placed_at,
+                   current_holder_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -592,6 +611,9 @@ impl PartBatchRepo {
     }
 
     /// 多 part 全部活跃批次批查（pickup rollup 用）。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
+    /// current_process_step_id。
     pub async fn list_active_by_part_ids<'e, E: PgExecutor<'e>>(
         executor: E,
         part_ids: &[i64],
@@ -603,7 +625,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, next_process_id, placed_at,
+                   current_holder_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -622,6 +644,9 @@ impl PartBatchRepo {
     ///
     /// 2026-09-16 PR-2 瘦身（migration 027）：JOIN 投影删 `pb.has_been_repaired`
     /// + 6 个 t_part 批次依附列；TPart 字面量回填同步。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
+    /// current_process_step_id。
     pub async fn list_batches_with_part_in_customers<'e, E: PgExecutor<'e>>(
         executor: E,
         statuses: &[&str],
@@ -631,14 +656,10 @@ impl PartBatchRepo {
         if customer_ids.is_empty() || statuses.is_empty() {
             return Ok(Vec::new());
         }
-        // 用 sqlx::query_as + FromRow 风格：先把单行 decode 成 (TPartBatch, TPart)。
-        // SQL 静态（不带 format!），用 query_as! 与任意 ANY 绑定需要 `text[]` / `bigint[]`。
-        // 这里 owner 表用 status ANY($1) + customer_id ANY($2)，传入 `&[&str]` / `&[i64]`
-        // 由 sqlx 编码为 text[] / bigint[]。
         let sql = r#"
             SELECT
                 pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.status, pb.location,
-                pb.current_holder_id, pb.next_process_id, pb.placed_at,
+                pb.current_holder_id, pb.current_process_step_id,
                 pb.delivery_note_id, pb.parent_batch_id,
                 pb.version, pb.created_at, pb.created_by, pb.updated_at, pb.updated_by, pb.deleted_at,
                 p.id AS "p_id", p.serial_no AS "p_serial_no", p.name AS "p_name",
@@ -685,8 +706,7 @@ impl PartBatchRepo {
                 status: r.try_get("status")?,
                 location: r.try_get("location")?,
                 current_holder_id: r.try_get("current_holder_id")?,
-                next_process_id: r.try_get("next_process_id")?,
-                placed_at: r.try_get("placed_at")?,
+                current_process_step_id: r.try_get("current_process_step_id")?,
                 delivery_note_id: r.try_get("delivery_note_id")?,
                 parent_batch_id: r.try_get("parent_batch_id")?,
                 version: r.try_get("version")?,
@@ -802,6 +822,9 @@ impl PartBatchRepo {
 
     /// 工人当前持有批次列表（worker-pool state 端点用）。
     /// 同样命中 `ix_t_part_batch_holder_location`。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加
+    /// current_process_step_id。
     pub async fn list_held_by_worker<'e, E: PgExecutor<'e>>(
         executor: E,
         worker_id: i64,
@@ -810,7 +833,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, next_process_id, placed_at,
+                   current_holder_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -825,30 +848,32 @@ impl PartBatchRepo {
         .await
     }
 
-    /// DELIVERED 状态且 `placed_at` 早于 threshold 的批次 ID 列表。
+    /// DELIVERED 状态且 DELIVERED 事件 `created_at` 早于 threshold 的批次 ID 列表。
     ///
-    /// `task::auto_complete` 后台任务使用：阈值来自 `AutoCompleteConfig::threshold_days`。
-    /// 与 Python `PartBatchRepository.find_delivered_older_than` 语义接近，但
-    /// Phase 0 简化版本用 `placed_at` 列直接过滤（避免 Python 中需要
-    /// `t_part_event` 关联查 latest DELIVERED 事件的复杂子查询）；后续若
-    /// 需要严格按事件时间迁移，再升级到 event-derived 实现。
-    ///
-    /// 仅返回批次 `id` + `part_id` + `version`（避免拉整行 17 列）。
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
+    /// - 原口径 `placed_at < threshold` 已废弃：`placed_at` 列被删（不再统计生产时间）
+    /// - 新口径：读 `t_part_event` 中 `event_type='DELIVERED'` 事件的 `created_at`
+    ///   作为真实 DELIVERED 时间戳（与 Python `_run_once` 的 latest_event 派生
+    ///   口径对齐，避免 `placed_at`（首次 ON_SHELF 时间）与 DELIVERED 时间偏差）
     pub async fn find_delivered_older_than<'e, E: PgExecutor<'e>>(
         executor: E,
         threshold: chrono::NaiveDateTime,
     ) -> Result<Vec<(i64, i64, i32)>, sqlx::Error> {
         let rows = sqlx::query!(
             r#"
-            SELECT id        AS "id!",
-                   part_id   AS "part_id!",
-                   version   AS "version!"
-            FROM t_part_batch
-            WHERE status     = 'DELIVERED'
-              AND deleted_at IS NULL
-              AND placed_at  IS NOT NULL
-              AND placed_at  < $1
-            ORDER BY placed_at ASC, id ASC
+            SELECT b.id        AS "id!",
+                   b.part_id   AS "part_id!",
+                   b.version   AS "version!"
+            FROM t_part_batch b
+            WHERE b.status     = 'DELIVERED'
+              AND b.deleted_at IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM t_part_event e
+                  WHERE e.batch_id = b.id
+                    AND e.event_type = 'DELIVERED'
+                    AND e.created_at < $1
+              )
+            ORDER BY b.id ASC
             "#,
             threshold,
         )
@@ -861,11 +886,15 @@ impl PartBatchRepo {
     ///
     /// 在 part 创建入口（`create_part` / `batch_create_parts` / `insert_child_for_assembly`）
     /// 同事务内调用，插入 `batch_no=1 / status='PENDING' / version=0 /
-    /// current_holder_id=NULL / next_process_id=NULL /
-    /// placed_at=NULL / delivery_note_id=NULL / parent_batch_id=NULL` 的初始批次。
+    /// current_holder_id=NULL / current_process_step_id=NULL /
+    /// delivery_note_id=NULL / parent_batch_id=NULL` 的初始批次。
     ///
     /// 2026-09-16 PR-2 瘦身（migration 027）：`has_been_repaired` 列已删，INSERT
     /// 同步删该列；返修事实由 `t_part_event` REPAIR_STARTED 事件追溯。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
+    /// - 删 `next_process_id` / `placed_at` 列写入
+    /// - `current_process_step_id = NULL`（初始 batch 不在生产流）
     ///
     /// `location` 单件 / 批量创建时传 `None`，子件创建时传 `Some("OFFICE")`（与
     /// `insert_child_for_assembly` 写入子件 part 行时的 location 对齐）。
@@ -882,12 +911,12 @@ impl PartBatchRepo {
             r#"
             INSERT INTO t_part_batch (
                 id, part_id, batch_no, quantity, status, location,
-                current_holder_id, next_process_id, placed_at,
+                current_holder_id, current_process_step_id,
                 delivery_note_id, parent_batch_id,
                 version, created_at, created_by, updated_at, updated_by
             ) VALUES (
                 $1, $2, 1, $3, 'PENDING', $4,
-                NULL, NULL, NULL,
+                NULL, NULL,
                 NULL, NULL,
                 0, now(), $5, now(), $5
             )

@@ -540,16 +540,20 @@ impl PartRepo {
         // 初始批次（part/assembly/batch 重构方案 §4.1 PR-B1）：子件 location='OFFICE'。
         // 复用 `PartBatchRepo::create_initial_batch` 的 INSERT 形状，保持与
         // `create_part` / `batch_create_parts` 两个入口的批次初始化语义一致。
+        //
+        // 2026-09-16 PR-3 批次 step 化（migration 028）：
+        // - 删 `next_process_id` / `placed_at` 列写入
+        // - `current_process_step_id = NULL`（初始 batch 不在生产流）
         sqlx::query!(
             r#"
             INSERT INTO t_part_batch (
                 id, part_id, batch_no, quantity, status, location,
-                current_holder_id, next_process_id, placed_at,
+                current_holder_id, current_process_step_id,
                 delivery_note_id, parent_batch_id,
                 version, created_at, created_by, updated_at, updated_by
             ) VALUES (
                 $1, $2, 1, $3, 'PENDING', 'OFFICE',
-                NULL, NULL, NULL,
+                NULL, NULL,
                 NULL, NULL,
                 0, now(), $4, now(), $4
             )
@@ -759,6 +763,13 @@ mod tests {
 // `status` + `next_process_id`（作为 part 派生列读缓存）。`get_part_rollup_state`
 // 与 `update_part_rollup` 投影同步收窄；`mark_part_repairing_flag_only` 整体
 // 删除（t_part 已无该列；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
+//
+// 2026-09-16 PR-3 批次 step 化（migration 028）：rollup 派生规则不变，
+// `t_part.next_process_id` 仍保留为派生缓存，但**派生源**改为
+// `min-progress 活跃 batch.current_process_step_id JOIN t_process_chain_step.process_id`。
+// `compute_part_target` 在 service 层读 `BatchForRollup` 时同步改为读 step_id
+// （详见 `part/service/rollup.rs::sync_from_batch_change` 的派生逻辑）。
+// `t_part_batch.next_process_id` 列已删，rollup 取 `process_id` 需经 step JOIN。
 //
 // 注：本块位于 `mod tests` 之后，触发 clippy::items_after_test_module 警告。
 // 与 `worker_scan.rs::needless_late_init` 同类 pre-existing 例外，合并期不便重构
