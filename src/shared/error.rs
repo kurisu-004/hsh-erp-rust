@@ -20,9 +20,9 @@
 //!
 //! 业务实现阶段直接 `AppError::biz(code::BIZ_..., "...")`；常量在 `code` 模块内集中维护。
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use thiserror::Error;
 
 /// 错误码常量（沿用 Python 数字契约）
@@ -35,11 +35,11 @@ pub mod code {
     pub const UNAUTHORIZED: i32 = 40100;
 
     // Auth 域业务码（401xx，HTTP 语义层里的业务码，区别于通用 40100 UNAUTHORIZED）
-    pub const BIZ_AUTH_INVALID: i32 = 40101;        // 登录：用户不存在/已删/已停用/密码错统一
+    pub const BIZ_AUTH_INVALID: i32 = 40101; // 登录：用户不存在/已删/已停用/密码错统一
     pub const TOKEN_EXPIRED: i32 = 40102;
-    pub const REFRESH_INVALID: i32 = 40103;         // refresh token 失效/版本不匹配/用户停用
-    pub const OLD_PASSWORD_MISMATCH: i32 = 40104;   // 修改密码时旧密码错误
-    pub const SESSION_REVOKED: i32 = 40105;         // 服务端 Redis session 不存在（已 logout/改密/吊销）
+    pub const REFRESH_INVALID: i32 = 40103; // refresh token 失效/版本不匹配/用户停用
+    pub const OLD_PASSWORD_MISMATCH: i32 = 40104; // 修改密码时旧密码错误
+    pub const SESSION_REVOKED: i32 = 40105; // 服务端 Redis session 不存在（已 logout/改密/吊销）
 
     pub const FORBIDDEN: i32 = 40300;
 
@@ -62,54 +62,54 @@ pub mod code {
     pub const BIZ_CUSTOMER_NOT_FOUND: i32 = 20102;
     pub const BIZ_INVALID_TRANSITION: i32 = 20103;
     pub const BIZ_INVALID_VALUE: i32 = 20104;
-    pub const BIZ_PART_SERIAL_EXHAUSTED: i32 = 20105;            // 序列号池耗尽（>5000 活跃/PREFIX）
-    pub const BIZ_SERIAL_PREFIX_UNKNOWN: i32 = 20108;            // t_serial_counter 找不到对应 prefix
-    pub const BIZ_PART_BATCH_NOT_FOUND: i32 = 20109;             // 批次不存在 / 不属于该工单（Python 中此值曾被双重占用，详见模块 docstring）
-    pub const BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY: i32 = 20110;    // 父装配体已设总价，子件不能再单独改价
-    pub const BIZ_PART_BATCH_INVALID_QUANTITY: i32 = 20111;      // 拆分/部分流转数量非法（≤0 或超过批次量）
-    pub const BIZ_PART_QUANTITY_LOCKED: i32 = 20112;             // 已拆分或已流转的工单禁止改总量
-    pub const BIZ_CUSTOMER_IN_USE: i32 = 20113;                  // 客户仍被 part/assembly 引用 → 拒软删（Python 原 20109，新槽位独占）
-    pub const BIZ_PART_BATCH_NOT_HELD_BY_WORKER: i32 = 20114;   // worker-scan 找不到当前 worker 持有的批次
-    pub const BIZ_PART_ALREADY_CANCELLED: i32 = 20115;           // 零件已 CANCELLED，cancel/deliver/complete/start-repair 一律返回此码（status guard）
-    pub const BIZ_PART_NOT_DELIVERED: i32 = 20116;               // complete 操作要求零件当前为 DELIVERED
-    pub const BIZ_PART_NOT_READY_TO_SHIP: i32 = 20117;           // deliver 操作要求零件当前为 READY_TO_SHIP
-    pub const BIZ_PART_REPAIR_NOT_TRIGGERED: i32 = 20118;         // start-repair 操作要求零件当前为 IN_PROCESS
-    pub const BIZ_PART_NOT_DELETABLE: i32 = 20119;                // 零件处于终态 (DELIVERED/COMPLETED) 或已挂送货单，禁 soft-delete
+    pub const BIZ_PART_SERIAL_EXHAUSTED: i32 = 20105; // 序列号池耗尽（>5000 活跃/PREFIX）
+    pub const BIZ_SERIAL_PREFIX_UNKNOWN: i32 = 20108; // t_serial_counter 找不到对应 prefix
+    pub const BIZ_PART_BATCH_NOT_FOUND: i32 = 20109; // 批次不存在 / 不属于该工单（Python 中此值曾被双重占用，详见模块 docstring）
+    pub const BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY: i32 = 20110; // 父装配体已设总价，子件不能再单独改价
+    pub const BIZ_PART_BATCH_INVALID_QUANTITY: i32 = 20111; // 拆分/部分流转数量非法（≤0 或超过批次量）
+    pub const BIZ_PART_QUANTITY_LOCKED: i32 = 20112; // 已拆分或已流转的工单禁止改总量
+    pub const BIZ_CUSTOMER_IN_USE: i32 = 20113; // 客户仍被 part/assembly 引用 → 拒软删（Python 原 20109，新槽位独占）
+    pub const BIZ_PART_BATCH_NOT_HELD_BY_WORKER: i32 = 20114; // worker-scan 找不到当前 worker 持有的批次
+    pub const BIZ_PART_ALREADY_CANCELLED: i32 = 20115; // 零件已 CANCELLED，cancel/deliver/complete/start-repair 一律返回此码（status guard）
+    pub const BIZ_PART_NOT_DELIVERED: i32 = 20116; // complete 操作要求零件当前为 DELIVERED
+    pub const BIZ_PART_NOT_READY_TO_SHIP: i32 = 20117; // deliver 操作要求零件当前为 READY_TO_SHIP
+    pub const BIZ_PART_REPAIR_NOT_TRIGGERED: i32 = 20118; // start-repair 操作要求零件当前为 IN_PROCESS
+    pub const BIZ_PART_NOT_DELETABLE: i32 = 20119; // 零件处于终态 (DELIVERED/COMPLETED) 或已挂送货单，禁 soft-delete
 
     // 202xx 工人
     pub const BIZ_WORKER_NOT_FOUND: i32 = 20201;
     pub const BIZ_WORKER_INACTIVE: i32 = 20202;
-    pub const BIZ_WORKER_IN_USE: i32 = 20203;                    // 还有 part.current_holder_id 指向 → 拒停用
-    pub const BIZ_WORKER_HOLD_LIMIT_EXCEEDED: i32 = 20204;       // 工种 max_held_batches 上限触顶 → 拒领取
-    pub const BIZ_WORKER_POOL_EMPTY: i32 = 20205;                // refill 时工序池无候选
-    pub const BIZ_WORKER_NO_WORK_TYPE: i32 = 20206;              // worker.work_type_id IS NULL
+    pub const BIZ_WORKER_IN_USE: i32 = 20203; // 还有 part.current_holder_id 指向 → 拒停用
+    pub const BIZ_WORKER_HOLD_LIMIT_EXCEEDED: i32 = 20204; // 工种 max_held_batches 上限触顶 → 拒领取
+    pub const BIZ_WORKER_POOL_EMPTY: i32 = 20205; // refill 时工序池无候选
+    pub const BIZ_WORKER_NO_WORK_TYPE: i32 = 20206; // worker.work_type_id IS NULL
 
     // 203xx 装配体
     pub const BIZ_ASSEMBLY_NOT_FOUND: i32 = 20301;
-    pub const BIZ_ASSEMBLY_BAD_CUSTOMER: i32 = 20302;            // 客户节点不允许（一级集团 / 不存在）
-    pub const BIZ_ASSEMBLY_TOO_MANY_CHILDREN: i32 = 20303;       // 子件 > 99，序列号 {serial}-{i:02d} 派生失败
-    pub const BIZ_ASSEMBLY_PDF_INVALID: i32 = 20305;             // multipart PDF 页数与 children.len()+1 不匹配 / lopdf 解析失败
-    pub const BIZ_ASSEMBLY_CHILD_PRICE_LOCKED: i32 = 20306;      // 父装配体已设总价时禁止子件改价（预留）
-    pub const BIZ_ASSEMBLY_HAS_SHIPMENT: i32 = 20307;            // 装配体已挂送货单，禁止 soft_delete（预留）
-    pub const BIZ_CUSTOMER_NO_SERIAL_PREFIX: i32 = 20308;        // L1 客户的 serial_prefix 为空（无法派发序列号）
+    pub const BIZ_ASSEMBLY_BAD_CUSTOMER: i32 = 20302; // 客户节点不允许（一级集团 / 不存在）
+    pub const BIZ_ASSEMBLY_TOO_MANY_CHILDREN: i32 = 20303; // 子件 > 99，序列号 {serial}-{i:02d} 派生失败
+    pub const BIZ_ASSEMBLY_PDF_INVALID: i32 = 20305; // multipart PDF 页数与 children.len()+1 不匹配 / lopdf 解析失败
+    pub const BIZ_ASSEMBLY_CHILD_PRICE_LOCKED: i32 = 20306; // 父装配体已设总价时禁止子件改价（预留）
+    pub const BIZ_ASSEMBLY_HAS_SHIPMENT: i32 = 20307; // 装配体已挂送货单，禁止 soft_delete（预留）
+    pub const BIZ_CUSTOMER_NO_SERIAL_PREFIX: i32 = 20308; // L1 客户的 serial_prefix 为空（无法派发序列号）
 
     // 204xx 图纸文件（t_drawing_file + COS）
     pub const BIZ_DRAWING_FILE_NOT_FOUND: i32 = 20401;
-    pub const BIZ_DRAWING_FILE_BAD_TYPE: i32 = 20402;            // 扩展名不在 COS_ALLOWED_TYPES 白名单
-    pub const BIZ_DRAWING_FILE_TOO_LARGE: i32 = 20403;           // 文件大小 ≤0 或 > cos_max_file_size_bytes
-    pub const BIZ_DRAWING_UPLOAD_FAILED: i32 = 20404;            // COS SDK 抛错
+    pub const BIZ_DRAWING_FILE_BAD_TYPE: i32 = 20402; // 扩展名不在 COS_ALLOWED_TYPES 白名单
+    pub const BIZ_DRAWING_FILE_TOO_LARGE: i32 = 20403; // 文件大小 ≤0 或 > cos_max_file_size_bytes
+    pub const BIZ_DRAWING_UPLOAD_FAILED: i32 = 20404; // COS SDK 抛错
 
     // 205xx 货架（t_shelf）
     pub const BIZ_SHELF_NOT_FOUND: i32 = 20501;
     pub const BIZ_SHELF_DUPLICATE_CODE: i32 = 20502;
-    pub const BIZ_SHELF_IN_USE: i32 = 20503;                     // 还有 IN_PROCESS/INSPECTION 零件 → 拒软删
-    pub const BIZ_SHELF_PROCESS_SHELF_NOT_FOUND: i32 = 20504;    // 货架不存在
-    pub const BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND: i32 = 20505;  // 工序不存在
-    pub const BIZ_SHELF_NO_MATCH_FOR_PROCESS: i32 = 20506;       // 没有 active 货架映射指定 process
-    pub const BIZ_SHELF_PROCESS_NOT_MAPPED: i32 = 20507;         // 货架未映射该工序
+    pub const BIZ_SHELF_IN_USE: i32 = 20503; // 还有 IN_PROCESS/INSPECTION 零件 → 拒软删
+    pub const BIZ_SHELF_PROCESS_SHELF_NOT_FOUND: i32 = 20504; // 货架不存在
+    pub const BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND: i32 = 20505; // 工序不存在
+    pub const BIZ_SHELF_NO_MATCH_FOR_PROCESS: i32 = 20506; // 没有 active 货架映射指定 process
+    pub const BIZ_SHELF_PROCESS_NOT_MAPPED: i32 = 20507; // 货架未映射该工序
     // to-inspection 一键送检新增
-    pub const BIZ_SHELF_NOT_INSPECTION_ZONE: i32 = 20511;        // target_inspection_shelf.zone ≠ 'INSPECTION'
-    pub const BIZ_SHELF_INACTIVE: i32 = 20512;                   // target_inspection_shelf.is_active = false
+    pub const BIZ_SHELF_NOT_INSPECTION_ZONE: i32 = 20511; // target_inspection_shelf.zone ≠ 'INSPECTION'
+    pub const BIZ_SHELF_INACTIVE: i32 = 20512; // target_inspection_shelf.is_active = false
     // 20507 BIZ_SHELF_PROCESS_NOT_MAPPED（货架未映射该工序）已存在，worker-pool admin_remove 校验沿用此码，勿新增
 
     // 206xx 账号（t_user / t_user_role）—— Python 命名 BIZ_* 长名为正典
@@ -129,33 +129,42 @@ pub mod code {
     // 208xx 工序（t_process）
     pub const BIZ_PROCESS_NOT_FOUND: i32 = 20801;
     pub const BIZ_PROCESS_DUPLICATE_CODE: i32 = 20802;
-    pub const BIZ_PROCESS_IN_USE: i32 = 20803;                   // 仍有 part.next_process_id 或 mapping 引用时拒软删
+    pub const BIZ_PROCESS_IN_USE: i32 = 20803; // 仍有 part.next_process_id 或 mapping 引用时拒软删
 
     // 209xx 工种（t_work_type）
     pub const BIZ_WORK_TYPE_NOT_FOUND: i32 = 20901;
     pub const BIZ_WORK_TYPE_DUPLICATE_CODE: i32 = 20902;
-    pub const BIZ_WORK_TYPE_IN_USE: i32 = 20903;                 // 仍有 worker.work_type_id 或 mapping 引用时拒软删
-    pub const BIZ_WORK_TYPE_MAX_HELD_NOT_SET: i32 = 20904;       // work_type.max_held_batches IS NULL
+    pub const BIZ_WORK_TYPE_IN_USE: i32 = 20903; // 仍有 worker.work_type_id 或 mapping 引用时拒软删
+    pub const BIZ_WORK_TYPE_MAX_HELD_NOT_SET: i32 = 20904; // work_type.max_held_batches IS NULL
     // worker-pool refill_for_worker 新增（Task 7）
-    pub const BIZ_WORK_TYPE_NO_PROCESS_MAPPING: i32 = 20905;    // work_type_id 在 t_work_type_process 没工序映射
+    pub const BIZ_WORK_TYPE_NO_PROCESS_MAPPING: i32 = 20905; // work_type_id 在 t_work_type_process 没工序映射
 
     // 210xx 申请人（t_applicant）
     pub const BIZ_APPLICANT_NOT_FOUND: i32 = 21001;
-    pub const BIZ_APPLICANT_DUPLICATE_NAME: i32 = 21002;         // 同一一级客户下重名（DB partial unique 兜底）
-    pub const BIZ_APPLICANT_BAD_CUSTOMER: i32 = 21003;           // customer 不存在或不是一级
-    pub const BIZ_APPLICANT_IN_USE: i32 = 21004;                 // 被 part.applicant_name 引用 → 拒软删
+    pub const BIZ_APPLICANT_DUPLICATE_NAME: i32 = 21002; // 同一一级客户下重名（DB partial unique 兜底）
+    pub const BIZ_APPLICANT_BAD_CUSTOMER: i32 = 21003; // customer 不存在或不是一级
+    pub const BIZ_APPLICANT_IN_USE: i32 = 21004; // 被 part.applicant_name 引用 → 拒软删
 
     // 211xx 零件文件（t_part_file，统一 5 类；含送货模板相关码）
     pub const BIZ_PART_FILE_NOT_FOUND: i32 = 21101;
-    pub const BIZ_PART_FILE_BAD_TYPE: i32 = 21102;               // 扩展名与 kind 不匹配
-    pub const BIZ_PART_FILE_TOO_LARGE: i32 = 21103;              // 文件大小 ≤0 或 > cos_max_file_size_bytes
-    pub const BIZ_PART_FILE_UPLOAD_FAILED: i32 = 21104;          // COS SDK 抛错
-    pub const BIZ_PART_FILE_OWNER_NOT_FOUND: i32 = 21105;        // polymorphic owner (part/assembly) 不存在
-    pub const BIZ_PART_FILE_DUPLICATE: i32 = 21108;              // 同 part+kind+content_sha256 撞唯一索引（并发兜底）
+    pub const BIZ_PART_FILE_BAD_TYPE: i32 = 21102; // 扩展名与 kind 不匹配
+    pub const BIZ_PART_FILE_TOO_LARGE: i32 = 21103; // 文件大小 ≤0 或 > cos_max_file_size_bytes
+    pub const BIZ_PART_FILE_UPLOAD_FAILED: i32 = 21104; // COS SDK 抛错
+    pub const BIZ_PART_FILE_OWNER_NOT_FOUND: i32 = 21105; // polymorphic owner (part/assembly) 不存在
+    pub const BIZ_PART_FILE_DUPLICATE: i32 = 21108; // 同 part+kind+content_sha256 撞唯一索引（并发兜底）
     pub const BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED: i32 = 21109; // root prefix 未配置 DELIVERY_NOTE_TEMPLATE_BY_PREFIX
-    pub const BIZ_DELIVERY_PART_STATUS_INVALID: i32 = 21111;     // 所选零件状态非 READY_TO_SHIP
+    pub const BIZ_DELIVERY_PART_STATUS_INVALID: i32 = 21111; // 所选零件状态非 READY_TO_SHIP
     pub const BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS: i32 = 21112; // 所选零件超过模板容量（法 14 / 路 25）
-    pub const BIZ_DELIVERY_PRINT_BAD_ORDER: i32 = 21113;         // custom_order 含非法 batch id 或漏行（422）
+    pub const BIZ_DELIVERY_PRINT_BAD_ORDER: i32 = 21113; // custom_order 含非法 batch id 或漏行（422）
+    // 2026-09-16 M2-A 新增：前端直传 COS 链路 + STS 凭证签发错误码。
+    // 槽位选择说明：
+    // - 21114/21115 复用 211xx「零件文件」语义（tmp_key = `t_part_file.tmp_key`）；
+    // - 21116 复用 211xx 同段便于同模块错误码集中；语义上是 infra 层（STS）错误，
+    //   但调用点都在 part_file 域，跨段分裂反而增加心智成本。
+    // 槽位不与 21109/21110/21111/21112/21113 冲突（这些已被送货模板占用）。
+    pub const BIZ_PART_FILE_TMP_OBJECT_MISSING: i32 = 21114; // tmp_key 在 COS 不存在 / size=0（前端直传未成功落地）
+    pub const BIZ_PART_FILE_SIZE_MISMATCH: i32 = 21115; // tmp_key size 与 client 声明的 size_bytes 不一致
+    pub const BIZ_STS_ISSUE_FAILED: i32 = 21116; // StsClient.get_credentials 失败（业务侧重试 / 上报）
     // 21110 → 21407 的 deprecated 别名：旧调用点收敛后移除（详见模块 docstring）
     #[deprecated(
         since = "0.1.0",
@@ -166,44 +175,44 @@ pub mod code {
 
     // 212xx 外协公司（t_outsource_company + t_outsource_company_process）
     pub const BIZ_OUTSOURCE_COMPANY_NOT_FOUND: i32 = 21201;
-    pub const BIZ_OUTSOURCE_COMPANY_DUPLICATE: i32 = 21202;      // uk_t_outsource_company_name 部分唯一兜底
-    pub const BIZ_OUTSOURCE_COMPANY_BAD_PROCESS: i32 = 21203;    // 工序不存在 / 不是 OUTSOURCE/INHOUSE 类别
-    pub const BIZ_OUTSOURCE_PROCESS_NOT_MAPPED: i32 = 21204;     // 公司未映射该 OUTSOURCE 工序
-    pub const BIZ_OUTSOURCE_COMPANY_IN_USE: i32 = 21205;         // 被 part OUTSOURCE 引用 / 仍映射工序
-    pub const BIZ_PART_NOT_OUTSOURCEABLE: i32 = 21206;           // 当前状态不允许发送外协（兜底，正常流不该撞）
+    pub const BIZ_OUTSOURCE_COMPANY_DUPLICATE: i32 = 21202; // uk_t_outsource_company_name 部分唯一兜底
+    pub const BIZ_OUTSOURCE_COMPANY_BAD_PROCESS: i32 = 21203; // 工序不存在 / 不是 OUTSOURCE/INHOUSE 类别
+    pub const BIZ_OUTSOURCE_PROCESS_NOT_MAPPED: i32 = 21204; // 公司未映射该 OUTSOURCE 工序
+    pub const BIZ_OUTSOURCE_COMPANY_IN_USE: i32 = 21205; // 被 part OUTSOURCE 引用 / 仍映射工序
+    pub const BIZ_PART_NOT_OUTSOURCEABLE: i32 = 21206; // 当前状态不允许发送外协（兜底，正常流不该撞）
     pub const BIZ_OUTSOURCE_DIRECT_REQUIRES_C2_SHELF: i32 = 21207; // 直接发送外协要求零件位于绑定了外协工序的货架
-    pub const BIZ_OUTSOURCE_NO_SHELF: i32 = 21208;               // 系统无任何绑定了外协工序的货架
+    pub const BIZ_OUTSOURCE_NO_SHELF: i32 = 21208; // 系统无任何绑定了外协工序的货架
     pub const BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME: i32 = 21214; // DB uk_t_outsource_company_name 兜底（pre-check 漏网 → INSERT 撞唯一索引）；与 21202 同义 409，区分 DB 兜底 vs 应用层预检
 
     // 213xx 外协报价（t_outsource_quote）
     pub const BIZ_OUTSOURCE_QUOTE_NOT_FOUND: i32 = 21301;
-    pub const BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION: i32 = 21302;  // 当前状态不允许此操作
-    pub const BIZ_OUTSOURCE_QUOTE_DUPLICATE: i32 = 21303;           // 同 (part,company,process) 已存在活跃报价
-    pub const BIZ_OUTSOURCE_QUOTE_NOT_APPROVED: i32 = 21307;        // 找不到该 tuple 的 APPROVED 报价
+    pub const BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION: i32 = 21302; // 当前状态不允许此操作
+    pub const BIZ_OUTSOURCE_QUOTE_DUPLICATE: i32 = 21303; // 同 (part,company,process) 已存在活跃报价
+    pub const BIZ_OUTSOURCE_QUOTE_NOT_APPROVED: i32 = 21307; // 找不到该 tuple 的 APPROVED 报价
 
     // 214xx 送货单（t_delivery_note）
-    pub const BIZ_DELIVERY_NOTE_NOT_FOUND: i32 = 21401;             // 找不到指定的送货单
-    pub const BIZ_DELIVERY_NOTE_INVALID_TRANSITION: i32 = 21402;    // 当前状态不允许此操作
+    pub const BIZ_DELIVERY_NOTE_NOT_FOUND: i32 = 21401; // 找不到指定的送货单
+    pub const BIZ_DELIVERY_NOTE_INVALID_TRANSITION: i32 = 21402; // 当前状态不允许此操作
     /// 非 DRAFT 状态：不能 soft_delete / attach-batches。
     /// 注意：update 路径用 BIZ_INVALID_TRANSITION（21402）而非此码。
     pub const BIZ_DELIVERY_NOTE_NOT_DRAFT: i32 = 21403;
-    pub const BIZ_DELIVERY_NOTE_NOT_SUBMITTED: i32 = 21404;         // 非 SUBMITTED 状态不能 recall / pickup
-    pub const BIZ_DELIVERY_NOTE_PART_NOT_READY: i32 = 21405;        // 零件状态非 READY_TO_SHIP
+    pub const BIZ_DELIVERY_NOTE_NOT_SUBMITTED: i32 = 21404; // 非 SUBMITTED 状态不能 recall / pickup
+    pub const BIZ_DELIVERY_NOTE_PART_NOT_READY: i32 = 21405; // 零件状态非 READY_TO_SHIP
     pub const BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED: i32 = 21406; // 零件已在另一张送货单上（提升为 409：状态冲突）
     pub const BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS: i32 = 21407; // 同一单内混客户（与老 21110 同义）
-    pub const BIZ_DELIVERY_NOTE_SCAN_MISMATCH: i32 = 21408;         // 扫码的 serial_no 不在本单范围内
-    pub const BIZ_DELIVERY_NOTE_DRIVER_INVALID: i32 = 21409;        // 司机非送货司机 / 不活跃
-    pub const BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE: i32 = 21410;       // pickup 时还没扫齐
-    pub const BIZ_DELIVERY_NOTE_INVALID_VALUE: i32 = 21411;         // 空单 / 等其他非法入参
-    pub const BIZ_DELIVERY_NOTE_PARTS_LOCKED: i32 = 21412;          // SUBMITTED/PICKED_UP 后禁止 add_parts / remove_parts
-    pub const BIZ_DELIVERY_GROUP_NOT_FOUND: i32 = 21413;            // 找不到指定的送货分组 / 已软删
-    pub const BIZ_DELIVERY_GROUP_DUPLICATE_NAME: i32 = 21414;       // 同 L1 下分组重名
-    pub const BIZ_DELIVERY_GROUP_MEMBER_CONFLICT: i32 = 21415;      // L2 已属于其他活跃分组
-    pub const BIZ_DELIVERY_NOTE_SCOPE_MISMATCH: i32 = 21416;        // 零件分类与送货单范围不符（add_parts 校验）
-    pub const BIZ_DELIVERY_SCAN_UNKNOWN_CODE: i32 = 21417;          // 扫码的 serial_no 无法识别
-    pub const BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY: i32 = 21418;   // 装配件整套拒绝：含不可入单子件（message 附明细）
-    pub const BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT: i32 = 21419;  // recall 时同范围已存在 DRAFT
-    pub const BIZ_DELIVERY_NOTE_LOCKED_PART: i32 = 21420;          // 零件已锁定在另一张非 DRAFT 的送货单上 → 拒 cancel
+    pub const BIZ_DELIVERY_NOTE_SCAN_MISMATCH: i32 = 21408; // 扫码的 serial_no 不在本单范围内
+    pub const BIZ_DELIVERY_NOTE_DRIVER_INVALID: i32 = 21409; // 司机非送货司机 / 不活跃
+    pub const BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE: i32 = 21410; // pickup 时还没扫齐
+    pub const BIZ_DELIVERY_NOTE_INVALID_VALUE: i32 = 21411; // 空单 / 等其他非法入参
+    pub const BIZ_DELIVERY_NOTE_PARTS_LOCKED: i32 = 21412; // SUBMITTED/PICKED_UP 后禁止 add_parts / remove_parts
+    pub const BIZ_DELIVERY_GROUP_NOT_FOUND: i32 = 21413; // 找不到指定的送货分组 / 已软删
+    pub const BIZ_DELIVERY_GROUP_DUPLICATE_NAME: i32 = 21414; // 同 L1 下分组重名
+    pub const BIZ_DELIVERY_GROUP_MEMBER_CONFLICT: i32 = 21415; // L2 已属于其他活跃分组
+    pub const BIZ_DELIVERY_NOTE_SCOPE_MISMATCH: i32 = 21416; // 零件分类与送货单范围不符（add_parts 校验）
+    pub const BIZ_DELIVERY_SCAN_UNKNOWN_CODE: i32 = 21417; // 扫码的 serial_no 无法识别
+    pub const BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY: i32 = 21418; // 装配件整套拒绝：含不可入单子件（message 附明细）
+    pub const BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT: i32 = 21419; // recall 时同范围已存在 DRAFT
+    pub const BIZ_DELIVERY_NOTE_LOCKED_PART: i32 = 21420; // 零件已锁定在另一张非 DRAFT 的送货单上 → 拒 cancel
     /// batch 当前状态不允许本次操作，两个调用点：
     /// - scan（`delivery_note::service::scan`）：C 组状态短路
     ///   （DELIVERED / OUTSOURCE / IN_PROCESS 工人持有 / COMPLETED / CANCELLED）
@@ -300,11 +309,7 @@ impl AppError {
     /// - 想覆盖表里的默认值（如 `BIZ_DELIVERY_PRINT_BAD_ORDER` 强制 422）
     ///
     /// 表驱动场景优先用 [`AppError::biz`]。
-    pub fn biz_with_status(
-        code: i32,
-        message: impl Into<String>,
-        http_status: StatusCode,
-    ) -> Self {
+    pub fn biz_with_status(code: i32, message: impl Into<String>, http_status: StatusCode) -> Self {
         Self::Biz {
             code,
             message: message.into(),
@@ -358,7 +363,10 @@ fn status_from_code(c: i32) -> StatusCode {
         c if c == code::BIZ_AUTH_INVALID
             || c == code::REFRESH_INVALID
             || c == code::OLD_PASSWORD_MISMATCH
-            || c == code::SESSION_REVOKED => StatusCode::UNAUTHORIZED,
+            || c == code::SESSION_REVOKED =>
+        {
+            StatusCode::UNAUTHORIZED
+        }
         c if c == code::SHELF_MISMATCH => StatusCode::FORBIDDEN,
         c if c == code::USER_NOT_FOUND || c == code::ROLE_NOT_FOUND => StatusCode::NOT_FOUND,
         c if c == code::DUPLICATE_USERNAME || c == code::ROLE_DUPLICATE => StatusCode::CONFLICT,
@@ -393,7 +401,10 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE
             || c == code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND
             || c == code::BIZ_PROCESS_CHAIN_NOT_FOUND
-            || c == code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND => StatusCode::NOT_FOUND,
+            || c == code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND =>
+        {
+            StatusCode::NOT_FOUND
+        }
 
         // ---- 2xxxx 业务码：409 (状态冲突 / 重复 / 占用 / 锁) ----
         c if c == code::BIZ_USER_DUPLICATE
@@ -425,18 +436,25 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_PART_ALREADY_CANCELLED
             || c == code::BIZ_DELIVERY_NOTE_LOCKED_PART
             || c == code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER
-            || c == code::BIZ_PART_NOT_DELETABLE => StatusCode::CONFLICT,
+            || c == code::BIZ_PART_NOT_DELETABLE =>
+        {
+            StatusCode::CONFLICT
+        }
 
         // ---- 2xxxx 业务码：422 (校验类，Python 显式声明 21113 → 422) ----
-        c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER
-            || c == code::BIZ_SHELF_PROCESS_NOT_MAPPED => StatusCode::UNPROCESSABLE_ENTITY,
+        c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER || c == code::BIZ_SHELF_PROCESS_NOT_MAPPED => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
 
         // ---- 2xxxx 兜底：Python BizError 默认 400 ----
         c if c == code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH
             || c == code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY
             || c == code::BIZ_PART_NOT_DELIVERED
             || c == code::BIZ_PART_NOT_READY_TO_SHIP
-            || c == code::BIZ_PART_REPAIR_NOT_TRIGGERED => StatusCode::BAD_REQUEST,
+            || c == code::BIZ_PART_REPAIR_NOT_TRIGGERED =>
+        {
+            StatusCode::BAD_REQUEST
+        }
 
         // ---- 2xxxx 兜底：Python BizError 默认 400 ----
         c if (20000..30000).contains(&c) => StatusCode::BAD_REQUEST,
@@ -460,9 +478,7 @@ impl IntoResponse for AppError {
         // 直接拼装 JSON body（不走泛型 `R<T>`，因为 BizWithFailures 需要序列化
         // 非 `()` 的 `data`；这里手动构造，与 `R<T>` 序列化后的字段约定一致）。
         let body: serde_json::Value = match &self {
-            AppError::BizWithFailures {
-                code, failures, ..
-            } => serde_json::json!({
+            AppError::BizWithFailures { code, failures, .. } => serde_json::json!({
                 "code": code,
                 "message": &message,
                 "data": serde_json::json!({ "failures": failures }),
@@ -508,8 +524,14 @@ mod tests {
         (code::INTERNAL, "INTERNAL"),
         (code::DATABASE, "DATABASE"),
         // 206xx 长名（短别名见 constants_match_python_values）
-        (code::BIZ_USER_ACCOUNT_NOT_FOUND, "BIZ_USER_ACCOUNT_NOT_FOUND"),
-        (code::BIZ_USER_DUPLICATE_USERNAME, "BIZ_USER_DUPLICATE_USERNAME"),
+        (
+            code::BIZ_USER_ACCOUNT_NOT_FOUND,
+            "BIZ_USER_ACCOUNT_NOT_FOUND",
+        ),
+        (
+            code::BIZ_USER_DUPLICATE_USERNAME,
+            "BIZ_USER_DUPLICATE_USERNAME",
+        ),
         (code::BIZ_USER_INACTIVE, "BIZ_USER_INACTIVE"),
         (code::BIZ_USER_ROLE_DUPLICATE, "BIZ_USER_ROLE_DUPLICATE"),
         (code::BIZ_USER_ROLE_NOT_FOUND, "BIZ_USER_ROLE_NOT_FOUND"),
@@ -526,114 +548,325 @@ mod tests {
         (code::BIZ_PART_SERIAL_EXHAUSTED, "BIZ_PART_SERIAL_EXHAUSTED"),
         (code::BIZ_SERIAL_PREFIX_UNKNOWN, "BIZ_SERIAL_PREFIX_UNKNOWN"),
         (code::BIZ_PART_BATCH_NOT_FOUND, "BIZ_PART_BATCH_NOT_FOUND"),
-        (code::BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY, "BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY"),
-        (code::BIZ_PART_BATCH_INVALID_QUANTITY, "BIZ_PART_BATCH_INVALID_QUANTITY"),
+        (
+            code::BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY,
+            "BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY",
+        ),
+        (
+            code::BIZ_PART_BATCH_INVALID_QUANTITY,
+            "BIZ_PART_BATCH_INVALID_QUANTITY",
+        ),
         (code::BIZ_PART_QUANTITY_LOCKED, "BIZ_PART_QUANTITY_LOCKED"),
         (code::BIZ_CUSTOMER_IN_USE, "BIZ_CUSTOMER_IN_USE"),
-        (code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER, "BIZ_PART_BATCH_NOT_HELD_BY_WORKER"),
-        (code::BIZ_PART_ALREADY_CANCELLED, "BIZ_PART_ALREADY_CANCELLED"),
+        (
+            code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
+            "BIZ_PART_BATCH_NOT_HELD_BY_WORKER",
+        ),
+        (
+            code::BIZ_PART_ALREADY_CANCELLED,
+            "BIZ_PART_ALREADY_CANCELLED",
+        ),
         (code::BIZ_PART_NOT_DELIVERED, "BIZ_PART_NOT_DELIVERED"),
-        (code::BIZ_PART_NOT_READY_TO_SHIP, "BIZ_PART_NOT_READY_TO_SHIP"),
-        (code::BIZ_PART_REPAIR_NOT_TRIGGERED, "BIZ_PART_REPAIR_NOT_TRIGGERED"),
+        (
+            code::BIZ_PART_NOT_READY_TO_SHIP,
+            "BIZ_PART_NOT_READY_TO_SHIP",
+        ),
+        (
+            code::BIZ_PART_REPAIR_NOT_TRIGGERED,
+            "BIZ_PART_REPAIR_NOT_TRIGGERED",
+        ),
         (code::BIZ_PART_NOT_DELETABLE, "BIZ_PART_NOT_DELETABLE"),
         // 202xx
         (code::BIZ_WORKER_NOT_FOUND, "BIZ_WORKER_NOT_FOUND"),
         (code::BIZ_WORKER_INACTIVE, "BIZ_WORKER_INACTIVE"),
         (code::BIZ_WORKER_IN_USE, "BIZ_WORKER_IN_USE"),
-        (code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED, "BIZ_WORKER_HOLD_LIMIT_EXCEEDED"),
+        (
+            code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED,
+            "BIZ_WORKER_HOLD_LIMIT_EXCEEDED",
+        ),
         // 203xx
         (code::BIZ_ASSEMBLY_NOT_FOUND, "BIZ_ASSEMBLY_NOT_FOUND"),
         (code::BIZ_ASSEMBLY_BAD_CUSTOMER, "BIZ_ASSEMBLY_BAD_CUSTOMER"),
-        (code::BIZ_ASSEMBLY_TOO_MANY_CHILDREN, "BIZ_ASSEMBLY_TOO_MANY_CHILDREN"),
+        (
+            code::BIZ_ASSEMBLY_TOO_MANY_CHILDREN,
+            "BIZ_ASSEMBLY_TOO_MANY_CHILDREN",
+        ),
         (code::BIZ_ASSEMBLY_PDF_INVALID, "BIZ_ASSEMBLY_PDF_INVALID"),
-        (code::BIZ_ASSEMBLY_CHILD_PRICE_LOCKED, "BIZ_ASSEMBLY_CHILD_PRICE_LOCKED"),
+        (
+            code::BIZ_ASSEMBLY_CHILD_PRICE_LOCKED,
+            "BIZ_ASSEMBLY_CHILD_PRICE_LOCKED",
+        ),
         (code::BIZ_ASSEMBLY_HAS_SHIPMENT, "BIZ_ASSEMBLY_HAS_SHIPMENT"),
-        (code::BIZ_CUSTOMER_NO_SERIAL_PREFIX, "BIZ_CUSTOMER_NO_SERIAL_PREFIX"),
+        (
+            code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
+            "BIZ_CUSTOMER_NO_SERIAL_PREFIX",
+        ),
         // 204xx
-        (code::BIZ_DRAWING_FILE_NOT_FOUND, "BIZ_DRAWING_FILE_NOT_FOUND"),
+        (
+            code::BIZ_DRAWING_FILE_NOT_FOUND,
+            "BIZ_DRAWING_FILE_NOT_FOUND",
+        ),
         (code::BIZ_DRAWING_FILE_BAD_TYPE, "BIZ_DRAWING_FILE_BAD_TYPE"),
-        (code::BIZ_DRAWING_FILE_TOO_LARGE, "BIZ_DRAWING_FILE_TOO_LARGE"),
+        (
+            code::BIZ_DRAWING_FILE_TOO_LARGE,
+            "BIZ_DRAWING_FILE_TOO_LARGE",
+        ),
         (code::BIZ_DRAWING_UPLOAD_FAILED, "BIZ_DRAWING_UPLOAD_FAILED"),
         // 205xx
         (code::BIZ_SHELF_NOT_FOUND, "BIZ_SHELF_NOT_FOUND"),
         (code::BIZ_SHELF_DUPLICATE_CODE, "BIZ_SHELF_DUPLICATE_CODE"),
         (code::BIZ_SHELF_IN_USE, "BIZ_SHELF_IN_USE"),
-        (code::BIZ_SHELF_PROCESS_SHELF_NOT_FOUND, "BIZ_SHELF_PROCESS_SHELF_NOT_FOUND"),
-        (code::BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND, "BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND"),
-        (code::BIZ_SHELF_NO_MATCH_FOR_PROCESS, "BIZ_SHELF_NO_MATCH_FOR_PROCESS"),
-        (code::BIZ_SHELF_PROCESS_NOT_MAPPED, "BIZ_SHELF_PROCESS_NOT_MAPPED"),
-        (code::BIZ_SHELF_NOT_INSPECTION_ZONE, "BIZ_SHELF_NOT_INSPECTION_ZONE"),
+        (
+            code::BIZ_SHELF_PROCESS_SHELF_NOT_FOUND,
+            "BIZ_SHELF_PROCESS_SHELF_NOT_FOUND",
+        ),
+        (
+            code::BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND,
+            "BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND",
+        ),
+        (
+            code::BIZ_SHELF_NO_MATCH_FOR_PROCESS,
+            "BIZ_SHELF_NO_MATCH_FOR_PROCESS",
+        ),
+        (
+            code::BIZ_SHELF_PROCESS_NOT_MAPPED,
+            "BIZ_SHELF_PROCESS_NOT_MAPPED",
+        ),
+        (
+            code::BIZ_SHELF_NOT_INSPECTION_ZONE,
+            "BIZ_SHELF_NOT_INSPECTION_ZONE",
+        ),
         (code::BIZ_SHELF_INACTIVE, "BIZ_SHELF_INACTIVE"),
         // 208xx
         (code::BIZ_PROCESS_NOT_FOUND, "BIZ_PROCESS_NOT_FOUND"),
-        (code::BIZ_PROCESS_DUPLICATE_CODE, "BIZ_PROCESS_DUPLICATE_CODE"),
+        (
+            code::BIZ_PROCESS_DUPLICATE_CODE,
+            "BIZ_PROCESS_DUPLICATE_CODE",
+        ),
         (code::BIZ_PROCESS_IN_USE, "BIZ_PROCESS_IN_USE"),
         // 209xx
         (code::BIZ_WORK_TYPE_NOT_FOUND, "BIZ_WORK_TYPE_NOT_FOUND"),
-        (code::BIZ_WORK_TYPE_DUPLICATE_CODE, "BIZ_WORK_TYPE_DUPLICATE_CODE"),
+        (
+            code::BIZ_WORK_TYPE_DUPLICATE_CODE,
+            "BIZ_WORK_TYPE_DUPLICATE_CODE",
+        ),
         (code::BIZ_WORK_TYPE_IN_USE, "BIZ_WORK_TYPE_IN_USE"),
         // 210xx
         (code::BIZ_APPLICANT_NOT_FOUND, "BIZ_APPLICANT_NOT_FOUND"),
-        (code::BIZ_APPLICANT_DUPLICATE_NAME, "BIZ_APPLICANT_DUPLICATE_NAME"),
-        (code::BIZ_APPLICANT_BAD_CUSTOMER, "BIZ_APPLICANT_BAD_CUSTOMER"),
+        (
+            code::BIZ_APPLICANT_DUPLICATE_NAME,
+            "BIZ_APPLICANT_DUPLICATE_NAME",
+        ),
+        (
+            code::BIZ_APPLICANT_BAD_CUSTOMER,
+            "BIZ_APPLICANT_BAD_CUSTOMER",
+        ),
         (code::BIZ_APPLICANT_IN_USE, "BIZ_APPLICANT_IN_USE"),
         // 211xx（21110 deprecated 别名除外）
         (code::BIZ_PART_FILE_NOT_FOUND, "BIZ_PART_FILE_NOT_FOUND"),
         (code::BIZ_PART_FILE_BAD_TYPE, "BIZ_PART_FILE_BAD_TYPE"),
         (code::BIZ_PART_FILE_TOO_LARGE, "BIZ_PART_FILE_TOO_LARGE"),
-        (code::BIZ_PART_FILE_UPLOAD_FAILED, "BIZ_PART_FILE_UPLOAD_FAILED"),
-        (code::BIZ_PART_FILE_OWNER_NOT_FOUND, "BIZ_PART_FILE_OWNER_NOT_FOUND"),
+        (
+            code::BIZ_PART_FILE_UPLOAD_FAILED,
+            "BIZ_PART_FILE_UPLOAD_FAILED",
+        ),
+        (
+            code::BIZ_PART_FILE_OWNER_NOT_FOUND,
+            "BIZ_PART_FILE_OWNER_NOT_FOUND",
+        ),
         (code::BIZ_PART_FILE_DUPLICATE, "BIZ_PART_FILE_DUPLICATE"),
-        (code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED, "BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED"),
-        (code::BIZ_DELIVERY_PART_STATUS_INVALID, "BIZ_DELIVERY_PART_STATUS_INVALID"),
-        (code::BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS, "BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS"),
-        (code::BIZ_DELIVERY_PRINT_BAD_ORDER, "BIZ_DELIVERY_PRINT_BAD_ORDER"),
+        (
+            code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED,
+            "BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED",
+        ),
+        (
+            code::BIZ_DELIVERY_PART_STATUS_INVALID,
+            "BIZ_DELIVERY_PART_STATUS_INVALID",
+        ),
+        (
+            code::BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS,
+            "BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS",
+        ),
+        (
+            code::BIZ_DELIVERY_PRINT_BAD_ORDER,
+            "BIZ_DELIVERY_PRINT_BAD_ORDER",
+        ),
+        // 2026-09-16 M2-A：前端直传 COS 链路 + STS 凭证签发错误码
+        (
+            code::BIZ_PART_FILE_TMP_OBJECT_MISSING,
+            "BIZ_PART_FILE_TMP_OBJECT_MISSING",
+        ),
+        (
+            code::BIZ_PART_FILE_SIZE_MISMATCH,
+            "BIZ_PART_FILE_SIZE_MISMATCH",
+        ),
+        (code::BIZ_STS_ISSUE_FAILED, "BIZ_STS_ISSUE_FAILED"),
         // 212xx
-        (code::BIZ_OUTSOURCE_COMPANY_NOT_FOUND, "BIZ_OUTSOURCE_COMPANY_NOT_FOUND"),
-        (code::BIZ_OUTSOURCE_COMPANY_DUPLICATE, "BIZ_OUTSOURCE_COMPANY_DUPLICATE"),
-        (code::BIZ_OUTSOURCE_COMPANY_BAD_PROCESS, "BIZ_OUTSOURCE_COMPANY_BAD_PROCESS"),
-        (code::BIZ_OUTSOURCE_PROCESS_NOT_MAPPED, "BIZ_OUTSOURCE_PROCESS_NOT_MAPPED"),
-        (code::BIZ_OUTSOURCE_COMPANY_IN_USE, "BIZ_OUTSOURCE_COMPANY_IN_USE"),
-        (code::BIZ_PART_NOT_OUTSOURCEABLE, "BIZ_PART_NOT_OUTSOURCEABLE"),
-        (code::BIZ_OUTSOURCE_DIRECT_REQUIRES_C2_SHELF, "BIZ_OUTSOURCE_DIRECT_REQUIRES_C2_SHELF"),
+        (
+            code::BIZ_OUTSOURCE_COMPANY_NOT_FOUND,
+            "BIZ_OUTSOURCE_COMPANY_NOT_FOUND",
+        ),
+        (
+            code::BIZ_OUTSOURCE_COMPANY_DUPLICATE,
+            "BIZ_OUTSOURCE_COMPANY_DUPLICATE",
+        ),
+        (
+            code::BIZ_OUTSOURCE_COMPANY_BAD_PROCESS,
+            "BIZ_OUTSOURCE_COMPANY_BAD_PROCESS",
+        ),
+        (
+            code::BIZ_OUTSOURCE_PROCESS_NOT_MAPPED,
+            "BIZ_OUTSOURCE_PROCESS_NOT_MAPPED",
+        ),
+        (
+            code::BIZ_OUTSOURCE_COMPANY_IN_USE,
+            "BIZ_OUTSOURCE_COMPANY_IN_USE",
+        ),
+        (
+            code::BIZ_PART_NOT_OUTSOURCEABLE,
+            "BIZ_PART_NOT_OUTSOURCEABLE",
+        ),
+        (
+            code::BIZ_OUTSOURCE_DIRECT_REQUIRES_C2_SHELF,
+            "BIZ_OUTSOURCE_DIRECT_REQUIRES_C2_SHELF",
+        ),
         (code::BIZ_OUTSOURCE_NO_SHELF, "BIZ_OUTSOURCE_NO_SHELF"),
-        (code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME, "BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME"),
+        (
+            code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME,
+            "BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME",
+        ),
         // 213xx
-        (code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND, "BIZ_OUTSOURCE_QUOTE_NOT_FOUND"),
-        (code::BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION, "BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION"),
-        (code::BIZ_OUTSOURCE_QUOTE_DUPLICATE, "BIZ_OUTSOURCE_QUOTE_DUPLICATE"),
-        (code::BIZ_OUTSOURCE_QUOTE_NOT_APPROVED, "BIZ_OUTSOURCE_QUOTE_NOT_APPROVED"),
+        (
+            code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND,
+            "BIZ_OUTSOURCE_QUOTE_NOT_FOUND",
+        ),
+        (
+            code::BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION,
+            "BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION",
+        ),
+        (
+            code::BIZ_OUTSOURCE_QUOTE_DUPLICATE,
+            "BIZ_OUTSOURCE_QUOTE_DUPLICATE",
+        ),
+        (
+            code::BIZ_OUTSOURCE_QUOTE_NOT_APPROVED,
+            "BIZ_OUTSOURCE_QUOTE_NOT_APPROVED",
+        ),
         // 214xx
-        (code::BIZ_DELIVERY_NOTE_NOT_FOUND, "BIZ_DELIVERY_NOTE_NOT_FOUND"),
-        (code::BIZ_DELIVERY_NOTE_INVALID_TRANSITION, "BIZ_DELIVERY_NOTE_INVALID_TRANSITION"),
-        (code::BIZ_DELIVERY_NOTE_NOT_DRAFT, "BIZ_DELIVERY_NOTE_NOT_DRAFT"),
-        (code::BIZ_DELIVERY_NOTE_NOT_SUBMITTED, "BIZ_DELIVERY_NOTE_NOT_SUBMITTED"),
-        (code::BIZ_DELIVERY_NOTE_PART_NOT_READY, "BIZ_DELIVERY_NOTE_PART_NOT_READY"),
-        (code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED, "BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED"),
-        (code::BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS, "BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS"),
-        (code::BIZ_DELIVERY_NOTE_SCAN_MISMATCH, "BIZ_DELIVERY_NOTE_SCAN_MISMATCH"),
-        (code::BIZ_DELIVERY_NOTE_DRIVER_INVALID, "BIZ_DELIVERY_NOTE_DRIVER_INVALID"),
-        (code::BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE, "BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE"),
-        (code::BIZ_DELIVERY_NOTE_INVALID_VALUE, "BIZ_DELIVERY_NOTE_INVALID_VALUE"),
-        (code::BIZ_DELIVERY_NOTE_PARTS_LOCKED, "BIZ_DELIVERY_NOTE_PARTS_LOCKED"),
-        (code::BIZ_DELIVERY_GROUP_NOT_FOUND, "BIZ_DELIVERY_GROUP_NOT_FOUND"),
-        (code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME, "BIZ_DELIVERY_GROUP_DUPLICATE_NAME"),
-        (code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT, "BIZ_DELIVERY_GROUP_MEMBER_CONFLICT"),
-        (code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH, "BIZ_DELIVERY_NOTE_SCOPE_MISMATCH"),
-        (code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE, "BIZ_DELIVERY_SCAN_UNKNOWN_CODE"),
-        (code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY, "BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY"),
-        (code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT, "BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT"),
-        (code::BIZ_DELIVERY_NOTE_LOCKED_PART, "BIZ_DELIVERY_NOTE_LOCKED_PART"),
+        (
+            code::BIZ_DELIVERY_NOTE_NOT_FOUND,
+            "BIZ_DELIVERY_NOTE_NOT_FOUND",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_INVALID_TRANSITION,
+            "BIZ_DELIVERY_NOTE_INVALID_TRANSITION",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_NOT_DRAFT,
+            "BIZ_DELIVERY_NOTE_NOT_DRAFT",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_NOT_SUBMITTED,
+            "BIZ_DELIVERY_NOTE_NOT_SUBMITTED",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
+            "BIZ_DELIVERY_NOTE_PART_NOT_READY",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED,
+            "BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS,
+            "BIZ_DELIVERY_NOTE_PARTS_MULTIPLE_CUSTOMERS",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_SCAN_MISMATCH,
+            "BIZ_DELIVERY_NOTE_SCAN_MISMATCH",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
+            "BIZ_DELIVERY_NOTE_DRIVER_INVALID",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE,
+            "BIZ_DELIVERY_NOTE_SCAN_INCOMPLETE",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_INVALID_VALUE,
+            "BIZ_DELIVERY_NOTE_INVALID_VALUE",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_PARTS_LOCKED,
+            "BIZ_DELIVERY_NOTE_PARTS_LOCKED",
+        ),
+        (
+            code::BIZ_DELIVERY_GROUP_NOT_FOUND,
+            "BIZ_DELIVERY_GROUP_NOT_FOUND",
+        ),
+        (
+            code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME,
+            "BIZ_DELIVERY_GROUP_DUPLICATE_NAME",
+        ),
+        (
+            code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT,
+            "BIZ_DELIVERY_GROUP_MEMBER_CONFLICT",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH,
+            "BIZ_DELIVERY_NOTE_SCOPE_MISMATCH",
+        ),
+        (
+            code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE,
+            "BIZ_DELIVERY_SCAN_UNKNOWN_CODE",
+        ),
+        (
+            code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY,
+            "BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT,
+            "BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_LOCKED_PART,
+            "BIZ_DELIVERY_NOTE_LOCKED_PART",
+        ),
         // 215xx
-        (code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND"),
-        (code::BIZ_OUTSOURCE_SHIPMENT_INVALID_TRANSITION, "BIZ_OUTSOURCE_SHIPMENT_INVALID_TRANSITION"),
-        (code::BIZ_OUTSOURCE_SHIPMENT_NO_OPEN, "BIZ_OUTSOURCE_SHIPMENT_NO_OPEN"),
-        (code::BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS, "BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS"),
+        (
+            code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND,
+            "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND",
+        ),
+        (
+            code::BIZ_OUTSOURCE_SHIPMENT_INVALID_TRANSITION,
+            "BIZ_OUTSOURCE_SHIPMENT_INVALID_TRANSITION",
+        ),
+        (
+            code::BIZ_OUTSOURCE_SHIPMENT_NO_OPEN,
+            "BIZ_OUTSOURCE_SHIPMENT_NO_OPEN",
+        ),
+        (
+            code::BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS,
+            "BIZ_OUTSOURCE_SHIPMENT_QUANTITY_EXCEEDS",
+        ),
         // 207xx 工艺链（worker-pool auto-allocate 阶段新增）
-        (code::BIZ_PROCESS_CHAIN_NOT_FOUND, "BIZ_PROCESS_CHAIN_NOT_FOUND"),
-        (code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND, "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND"),
-        (code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET, "BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET"),
-        (code::BIZ_AUTO_ALLOCATE_INVALID_RATIO, "BIZ_AUTO_ALLOCATE_INVALID_RATIO"),
+        (
+            code::BIZ_PROCESS_CHAIN_NOT_FOUND,
+            "BIZ_PROCESS_CHAIN_NOT_FOUND",
+        ),
+        (
+            code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+            "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND",
+        ),
+        (
+            code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET,
+            "BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET",
+        ),
+        (
+            code::BIZ_AUTO_ALLOCATE_INVALID_RATIO,
+            "BIZ_AUTO_ALLOCATE_INVALID_RATIO",
+        ),
     ];
 
     #[test]
@@ -762,6 +995,10 @@ mod tests {
         assert_eq!(code::BIZ_DELIVERY_PART_STATUS_INVALID, 21111);
         assert_eq!(code::BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS, 21112);
         assert_eq!(code::BIZ_DELIVERY_PRINT_BAD_ORDER, 21113);
+        // 2026-09-16 M2-A：前端直传 COS + STS 错误码数值契约
+        assert_eq!(code::BIZ_PART_FILE_TMP_OBJECT_MISSING, 21114);
+        assert_eq!(code::BIZ_PART_FILE_SIZE_MISMATCH, 21115);
+        assert_eq!(code::BIZ_STS_ISSUE_FAILED, 21116);
         assert_eq!(code::BIZ_DELIVERY_PARTS_MULTIPLE_CUSTOMERS, 21407);
 
         // 212xx
@@ -820,90 +1057,390 @@ mod tests {
     const HTTP_TABLE_CASES: &[(i32, StatusCode, &str)] = &[
         // 4xxxx（既有）
         (code::BAD_REQUEST, StatusCode::BAD_REQUEST, "BAD_REQUEST"),
-        (code::VALIDATION_ERROR, StatusCode::UNPROCESSABLE_ENTITY, "VALIDATION_ERROR"),
+        (
+            code::VALIDATION_ERROR,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VALIDATION_ERROR",
+        ),
         (code::UNAUTHORIZED, StatusCode::UNAUTHORIZED, "UNAUTHORIZED"),
-        (code::BIZ_AUTH_INVALID, StatusCode::UNAUTHORIZED, "BIZ_AUTH_INVALID"),
-        (code::TOKEN_EXPIRED, StatusCode::UNAUTHORIZED, "TOKEN_EXPIRED"),
-        (code::REFRESH_INVALID, StatusCode::UNAUTHORIZED, "REFRESH_INVALID"),
-        (code::OLD_PASSWORD_MISMATCH, StatusCode::UNAUTHORIZED, "OLD_PASSWORD_MISMATCH"),
-        (code::SESSION_REVOKED, StatusCode::UNAUTHORIZED, "SESSION_REVOKED"),
+        (
+            code::BIZ_AUTH_INVALID,
+            StatusCode::UNAUTHORIZED,
+            "BIZ_AUTH_INVALID",
+        ),
+        (
+            code::TOKEN_EXPIRED,
+            StatusCode::UNAUTHORIZED,
+            "TOKEN_EXPIRED",
+        ),
+        (
+            code::REFRESH_INVALID,
+            StatusCode::UNAUTHORIZED,
+            "REFRESH_INVALID",
+        ),
+        (
+            code::OLD_PASSWORD_MISMATCH,
+            StatusCode::UNAUTHORIZED,
+            "OLD_PASSWORD_MISMATCH",
+        ),
+        (
+            code::SESSION_REVOKED,
+            StatusCode::UNAUTHORIZED,
+            "SESSION_REVOKED",
+        ),
         (code::FORBIDDEN, StatusCode::FORBIDDEN, "FORBIDDEN"),
-        (code::SHELF_MISMATCH, StatusCode::FORBIDDEN, "SHELF_MISMATCH"),
+        (
+            code::SHELF_MISMATCH,
+            StatusCode::FORBIDDEN,
+            "SHELF_MISMATCH",
+        ),
         (code::NO_ROLE, StatusCode::FORBIDDEN, "NO_ROLE"),
-        (code::USER_NOT_FOUND, StatusCode::NOT_FOUND, "USER_NOT_FOUND"),
-        (code::ROLE_NOT_FOUND, StatusCode::NOT_FOUND, "ROLE_NOT_FOUND"),
-        (code::DUPLICATE_USERNAME, StatusCode::CONFLICT, "DUPLICATE_USERNAME"),
+        (
+            code::USER_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "USER_NOT_FOUND",
+        ),
+        (
+            code::ROLE_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "ROLE_NOT_FOUND",
+        ),
+        (
+            code::DUPLICATE_USERNAME,
+            StatusCode::CONFLICT,
+            "DUPLICATE_USERNAME",
+        ),
         (code::ROLE_DUPLICATE, StatusCode::CONFLICT, "ROLE_DUPLICATE"),
         (code::NOT_FOUND, StatusCode::NOT_FOUND, "NOT_FOUND"),
-        (code::VERSION_CONFLICT, StatusCode::CONFLICT, "VERSION_CONFLICT"),
-        (code::REQUEST_TOO_LARGE, StatusCode::PAYLOAD_TOO_LARGE, "REQUEST_TOO_LARGE"),
-        (code::INTERNAL, StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL"),
-        (code::DATABASE, StatusCode::INTERNAL_SERVER_ERROR, "DATABASE"),
+        (
+            code::VERSION_CONFLICT,
+            StatusCode::CONFLICT,
+            "VERSION_CONFLICT",
+        ),
+        (
+            code::REQUEST_TOO_LARGE,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "REQUEST_TOO_LARGE",
+        ),
+        (
+            code::INTERNAL,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+        ),
+        (
+            code::DATABASE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DATABASE",
+        ),
         // 2xxxx 显式 404
-        (code::BIZ_USER_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_USER_NOT_FOUND"),
-        (code::BIZ_ORDER_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_ORDER_NOT_FOUND"),
-        (code::BIZ_PART_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_PART_NOT_FOUND"),
-        (code::BIZ_CUSTOMER_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_CUSTOMER_NOT_FOUND"),
-        (code::BIZ_PART_BATCH_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_PART_BATCH_NOT_FOUND"),
-        (code::BIZ_WORKER_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_WORKER_NOT_FOUND"),
-        (code::BIZ_ASSEMBLY_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_ASSEMBLY_NOT_FOUND"),
-        (code::BIZ_DRAWING_FILE_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_DRAWING_FILE_NOT_FOUND"),
-        (code::BIZ_SHELF_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_SHELF_NOT_FOUND"),
-        (code::BIZ_PROCESS_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_PROCESS_NOT_FOUND"),
-        (code::BIZ_WORK_TYPE_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_WORK_TYPE_NOT_FOUND"),
-        (code::BIZ_APPLICANT_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_APPLICANT_NOT_FOUND"),
-        (code::BIZ_PART_FILE_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_PART_FILE_NOT_FOUND"),
-        (code::BIZ_OUTSOURCE_COMPANY_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_OUTSOURCE_COMPANY_NOT_FOUND"),
-        (code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_OUTSOURCE_QUOTE_NOT_FOUND"),
-        (code::BIZ_DELIVERY_NOTE_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_DELIVERY_NOTE_NOT_FOUND"),
-        (code::BIZ_DELIVERY_GROUP_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_DELIVERY_GROUP_NOT_FOUND"),
-        (code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE, StatusCode::NOT_FOUND, "BIZ_DELIVERY_SCAN_UNKNOWN_CODE"),
-        (code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND"),
-        (code::BIZ_PROCESS_CHAIN_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_PROCESS_CHAIN_NOT_FOUND"),
-        (code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND, StatusCode::NOT_FOUND, "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND"),
+        (
+            code::BIZ_USER_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_USER_NOT_FOUND",
+        ),
+        (
+            code::BIZ_ORDER_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_ORDER_NOT_FOUND",
+        ),
+        (
+            code::BIZ_PART_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_PART_NOT_FOUND",
+        ),
+        (
+            code::BIZ_CUSTOMER_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_CUSTOMER_NOT_FOUND",
+        ),
+        (
+            code::BIZ_PART_BATCH_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_PART_BATCH_NOT_FOUND",
+        ),
+        (
+            code::BIZ_WORKER_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_WORKER_NOT_FOUND",
+        ),
+        (
+            code::BIZ_ASSEMBLY_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_ASSEMBLY_NOT_FOUND",
+        ),
+        (
+            code::BIZ_DRAWING_FILE_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_DRAWING_FILE_NOT_FOUND",
+        ),
+        (
+            code::BIZ_SHELF_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_SHELF_NOT_FOUND",
+        ),
+        (
+            code::BIZ_PROCESS_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_PROCESS_NOT_FOUND",
+        ),
+        (
+            code::BIZ_WORK_TYPE_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_WORK_TYPE_NOT_FOUND",
+        ),
+        (
+            code::BIZ_APPLICANT_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_APPLICANT_NOT_FOUND",
+        ),
+        (
+            code::BIZ_PART_FILE_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_PART_FILE_NOT_FOUND",
+        ),
+        (
+            code::BIZ_OUTSOURCE_COMPANY_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_OUTSOURCE_COMPANY_NOT_FOUND",
+        ),
+        (
+            code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_OUTSOURCE_QUOTE_NOT_FOUND",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_DELIVERY_NOTE_NOT_FOUND",
+        ),
+        (
+            code::BIZ_DELIVERY_GROUP_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_DELIVERY_GROUP_NOT_FOUND",
+        ),
+        (
+            code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE,
+            StatusCode::NOT_FOUND,
+            "BIZ_DELIVERY_SCAN_UNKNOWN_CODE",
+        ),
+        (
+            code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND",
+        ),
+        (
+            code::BIZ_PROCESS_CHAIN_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_PROCESS_CHAIN_NOT_FOUND",
+        ),
+        (
+            code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND",
+        ),
         // 2xxxx 显式 409
-        (code::BIZ_USER_DUPLICATE, StatusCode::CONFLICT, "BIZ_USER_DUPLICATE"),
-        (code::BIZ_USER_DUPLICATE_USERNAME, StatusCode::CONFLICT, "BIZ_USER_DUPLICATE_USERNAME"),
-        (code::BIZ_USER_ROLE_DUPLICATE, StatusCode::CONFLICT, "BIZ_USER_ROLE_DUPLICATE"),
-        (code::BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY, StatusCode::CONFLICT, "BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY"),
-        (code::BIZ_PART_QUANTITY_LOCKED, StatusCode::CONFLICT, "BIZ_PART_QUANTITY_LOCKED"),
-        (code::BIZ_CUSTOMER_IN_USE, StatusCode::CONFLICT, "BIZ_CUSTOMER_IN_USE"),
-        (code::BIZ_WORKER_IN_USE, StatusCode::CONFLICT, "BIZ_WORKER_IN_USE"),
-        (code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED, StatusCode::CONFLICT, "BIZ_WORKER_HOLD_LIMIT_EXCEEDED"),
-        (code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER, StatusCode::CONFLICT, "BIZ_PART_BATCH_NOT_HELD_BY_WORKER"),
-        (code::BIZ_SHELF_DUPLICATE_CODE, StatusCode::CONFLICT, "BIZ_SHELF_DUPLICATE_CODE"),
-        (code::BIZ_SHELF_IN_USE, StatusCode::CONFLICT, "BIZ_SHELF_IN_USE"),
-        (code::BIZ_PROCESS_DUPLICATE_CODE, StatusCode::CONFLICT, "BIZ_PROCESS_DUPLICATE_CODE"),
-        (code::BIZ_PROCESS_IN_USE, StatusCode::CONFLICT, "BIZ_PROCESS_IN_USE"),
-        (code::BIZ_WORK_TYPE_DUPLICATE_CODE, StatusCode::CONFLICT, "BIZ_WORK_TYPE_DUPLICATE_CODE"),
-        (code::BIZ_WORK_TYPE_IN_USE, StatusCode::CONFLICT, "BIZ_WORK_TYPE_IN_USE"),
-        (code::BIZ_APPLICANT_DUPLICATE_NAME, StatusCode::CONFLICT, "BIZ_APPLICANT_DUPLICATE_NAME"),
-        (code::BIZ_APPLICANT_IN_USE, StatusCode::CONFLICT, "BIZ_APPLICANT_IN_USE"),
-        (code::BIZ_PART_FILE_DUPLICATE, StatusCode::CONFLICT, "BIZ_PART_FILE_DUPLICATE"),
-        (code::BIZ_OUTSOURCE_COMPANY_DUPLICATE, StatusCode::CONFLICT, "BIZ_OUTSOURCE_COMPANY_DUPLICATE"),
-        (code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME, StatusCode::CONFLICT, "BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME"),
-        (code::BIZ_OUTSOURCE_COMPANY_IN_USE, StatusCode::CONFLICT, "BIZ_OUTSOURCE_COMPANY_IN_USE"),
-        (code::BIZ_OUTSOURCE_QUOTE_DUPLICATE, StatusCode::CONFLICT, "BIZ_OUTSOURCE_QUOTE_DUPLICATE"),
-        (code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED"),
-        (code::BIZ_DELIVERY_NOTE_PARTS_LOCKED, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_PARTS_LOCKED"),
-        (code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME, StatusCode::CONFLICT, "BIZ_DELIVERY_GROUP_DUPLICATE_NAME"),
-        (code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT, StatusCode::CONFLICT, "BIZ_DELIVERY_GROUP_MEMBER_CONFLICT"),
-        (code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT"),
-        (code::BIZ_PART_ALREADY_CANCELLED, StatusCode::CONFLICT, "BIZ_PART_ALREADY_CANCELLED"),
-        (code::BIZ_DELIVERY_NOTE_LOCKED_PART, StatusCode::CONFLICT, "BIZ_DELIVERY_NOTE_LOCKED_PART"),
+        (
+            code::BIZ_USER_DUPLICATE,
+            StatusCode::CONFLICT,
+            "BIZ_USER_DUPLICATE",
+        ),
+        (
+            code::BIZ_USER_DUPLICATE_USERNAME,
+            StatusCode::CONFLICT,
+            "BIZ_USER_DUPLICATE_USERNAME",
+        ),
+        (
+            code::BIZ_USER_ROLE_DUPLICATE,
+            StatusCode::CONFLICT,
+            "BIZ_USER_ROLE_DUPLICATE",
+        ),
+        (
+            code::BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY,
+            StatusCode::CONFLICT,
+            "BIZ_PART_PRICE_LOCKED_BY_ASSEMBLY",
+        ),
+        (
+            code::BIZ_PART_QUANTITY_LOCKED,
+            StatusCode::CONFLICT,
+            "BIZ_PART_QUANTITY_LOCKED",
+        ),
+        (
+            code::BIZ_CUSTOMER_IN_USE,
+            StatusCode::CONFLICT,
+            "BIZ_CUSTOMER_IN_USE",
+        ),
+        (
+            code::BIZ_WORKER_IN_USE,
+            StatusCode::CONFLICT,
+            "BIZ_WORKER_IN_USE",
+        ),
+        (
+            code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED,
+            StatusCode::CONFLICT,
+            "BIZ_WORKER_HOLD_LIMIT_EXCEEDED",
+        ),
+        (
+            code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
+            StatusCode::CONFLICT,
+            "BIZ_PART_BATCH_NOT_HELD_BY_WORKER",
+        ),
+        (
+            code::BIZ_SHELF_DUPLICATE_CODE,
+            StatusCode::CONFLICT,
+            "BIZ_SHELF_DUPLICATE_CODE",
+        ),
+        (
+            code::BIZ_SHELF_IN_USE,
+            StatusCode::CONFLICT,
+            "BIZ_SHELF_IN_USE",
+        ),
+        (
+            code::BIZ_PROCESS_DUPLICATE_CODE,
+            StatusCode::CONFLICT,
+            "BIZ_PROCESS_DUPLICATE_CODE",
+        ),
+        (
+            code::BIZ_PROCESS_IN_USE,
+            StatusCode::CONFLICT,
+            "BIZ_PROCESS_IN_USE",
+        ),
+        (
+            code::BIZ_WORK_TYPE_DUPLICATE_CODE,
+            StatusCode::CONFLICT,
+            "BIZ_WORK_TYPE_DUPLICATE_CODE",
+        ),
+        (
+            code::BIZ_WORK_TYPE_IN_USE,
+            StatusCode::CONFLICT,
+            "BIZ_WORK_TYPE_IN_USE",
+        ),
+        (
+            code::BIZ_APPLICANT_DUPLICATE_NAME,
+            StatusCode::CONFLICT,
+            "BIZ_APPLICANT_DUPLICATE_NAME",
+        ),
+        (
+            code::BIZ_APPLICANT_IN_USE,
+            StatusCode::CONFLICT,
+            "BIZ_APPLICANT_IN_USE",
+        ),
+        (
+            code::BIZ_PART_FILE_DUPLICATE,
+            StatusCode::CONFLICT,
+            "BIZ_PART_FILE_DUPLICATE",
+        ),
+        (
+            code::BIZ_OUTSOURCE_COMPANY_DUPLICATE,
+            StatusCode::CONFLICT,
+            "BIZ_OUTSOURCE_COMPANY_DUPLICATE",
+        ),
+        (
+            code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME,
+            StatusCode::CONFLICT,
+            "BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME",
+        ),
+        (
+            code::BIZ_OUTSOURCE_COMPANY_IN_USE,
+            StatusCode::CONFLICT,
+            "BIZ_OUTSOURCE_COMPANY_IN_USE",
+        ),
+        (
+            code::BIZ_OUTSOURCE_QUOTE_DUPLICATE,
+            StatusCode::CONFLICT,
+            "BIZ_OUTSOURCE_QUOTE_DUPLICATE",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED,
+            StatusCode::CONFLICT,
+            "BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_PARTS_LOCKED,
+            StatusCode::CONFLICT,
+            "BIZ_DELIVERY_NOTE_PARTS_LOCKED",
+        ),
+        (
+            code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME,
+            StatusCode::CONFLICT,
+            "BIZ_DELIVERY_GROUP_DUPLICATE_NAME",
+        ),
+        (
+            code::BIZ_DELIVERY_GROUP_MEMBER_CONFLICT,
+            StatusCode::CONFLICT,
+            "BIZ_DELIVERY_GROUP_MEMBER_CONFLICT",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT,
+            StatusCode::CONFLICT,
+            "BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT",
+        ),
+        (
+            code::BIZ_PART_ALREADY_CANCELLED,
+            StatusCode::CONFLICT,
+            "BIZ_PART_ALREADY_CANCELLED",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_LOCKED_PART,
+            StatusCode::CONFLICT,
+            "BIZ_DELIVERY_NOTE_LOCKED_PART",
+        ),
         // 2xxxx 显式 422
-        (code::BIZ_DELIVERY_PRINT_BAD_ORDER, StatusCode::UNPROCESSABLE_ENTITY, "BIZ_DELIVERY_PRINT_BAD_ORDER"),
-        (code::BIZ_SHELF_PROCESS_NOT_MAPPED, StatusCode::UNPROCESSABLE_ENTITY, "BIZ_SHELF_PROCESS_NOT_MAPPED"),
+        (
+            code::BIZ_DELIVERY_PRINT_BAD_ORDER,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "BIZ_DELIVERY_PRINT_BAD_ORDER",
+        ),
+        (
+            code::BIZ_SHELF_PROCESS_NOT_MAPPED,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "BIZ_SHELF_PROCESS_NOT_MAPPED",
+        ),
         // 2xxxx 默认 400 兜底
-        (code::BIZ_INVALID_TRANSITION, StatusCode::BAD_REQUEST, "BIZ_INVALID_TRANSITION"),
-        (code::BIZ_INVALID_VALUE, StatusCode::BAD_REQUEST, "BIZ_INVALID_VALUE"),
-        (code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED, StatusCode::BAD_REQUEST, "BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED"),
-        (code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH, StatusCode::BAD_REQUEST, "BIZ_DELIVERY_NOTE_SCOPE_MISMATCH"),
-        (code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY, StatusCode::BAD_REQUEST, "BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY"),
-        (code::BIZ_PART_NOT_DELIVERED, StatusCode::BAD_REQUEST, "BIZ_PART_NOT_DELIVERED"),
-        (code::BIZ_PART_NOT_READY_TO_SHIP, StatusCode::BAD_REQUEST, "BIZ_PART_NOT_READY_TO_SHIP"),
-        (code::BIZ_PART_REPAIR_NOT_TRIGGERED, StatusCode::BAD_REQUEST, "BIZ_PART_REPAIR_NOT_TRIGGERED"),
-        (code::BIZ_PART_NOT_DELETABLE, StatusCode::CONFLICT, "BIZ_PART_NOT_DELETABLE"),
+        (
+            code::BIZ_INVALID_TRANSITION,
+            StatusCode::BAD_REQUEST,
+            "BIZ_INVALID_TRANSITION",
+        ),
+        (
+            code::BIZ_INVALID_VALUE,
+            StatusCode::BAD_REQUEST,
+            "BIZ_INVALID_VALUE",
+        ),
+        (
+            code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED,
+            StatusCode::BAD_REQUEST,
+            "BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED",
+        ),
+        (
+            code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH,
+            StatusCode::BAD_REQUEST,
+            "BIZ_DELIVERY_NOTE_SCOPE_MISMATCH",
+        ),
+        (
+            code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY,
+            StatusCode::BAD_REQUEST,
+            "BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY",
+        ),
+        (
+            code::BIZ_PART_NOT_DELIVERED,
+            StatusCode::BAD_REQUEST,
+            "BIZ_PART_NOT_DELIVERED",
+        ),
+        (
+            code::BIZ_PART_NOT_READY_TO_SHIP,
+            StatusCode::BAD_REQUEST,
+            "BIZ_PART_NOT_READY_TO_SHIP",
+        ),
+        (
+            code::BIZ_PART_REPAIR_NOT_TRIGGERED,
+            StatusCode::BAD_REQUEST,
+            "BIZ_PART_REPAIR_NOT_TRIGGERED",
+        ),
+        (
+            code::BIZ_PART_NOT_DELETABLE,
+            StatusCode::CONFLICT,
+            "BIZ_PART_NOT_DELETABLE",
+        ),
     ];
 
     #[test]

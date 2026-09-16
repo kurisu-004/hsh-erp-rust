@@ -15,10 +15,10 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
+use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use deadpool_redis::redis::AsyncCommands;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -40,9 +40,8 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
         .await
         .expect("read body");
     let body_str = String::from_utf8_lossy(&body).to_string();
-    let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!("parse JSON: {e}; status={status} raw = {body_str:?}")
-    });
+    let envelope: Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("parse JSON: {e}; status={status} raw = {body_str:?}"));
     (status, envelope)
 }
 
@@ -58,7 +57,11 @@ fn json_request(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool, deadpool_redis::Pool) {
+async fn setup<'a>() -> (
+    tokio::sync::MutexGuard<'a, ()>,
+    PgPool,
+    deadpool_redis::Pool,
+) {
     let guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
@@ -165,20 +168,22 @@ async fn seed_customer_l1_then_l2() {
     .await;
     assert_eq!(s1, StatusCode::OK, "seed L1: {env1}");
     assert_eq!(env1["code"], 0);
-    let l1_id = env1["data"]["id"].as_str().expect("L1 id string").to_string();
+    let l1_id = env1["data"]["id"]
+        .as_str()
+        .expect("L1 id string")
+        .to_string();
     assert!(
         l1_id.parse::<i64>().is_ok(),
         "L1 id should be parseable as i64"
     );
 
     // 在 t_customer 查到 L1
-    let l1_back: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT name, serial_prefix FROM t_customer WHERE id = $1",
-    )
-    .bind(l1_id.parse::<i64>().unwrap())
-    .fetch_optional(&pool)
-    .await
-    .expect("query L1 back");
+    let l1_back: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, serial_prefix FROM t_customer WHERE id = $1")
+            .bind(l1_id.parse::<i64>().unwrap())
+            .fetch_optional(&pool)
+            .await
+            .expect("query L1 back");
     let (name, prefix) = l1_back.expect("L1 should exist in t_customer");
     assert_eq!(name, "ACME-L1");
     assert_eq!(prefix.as_deref(), Some("A"));
@@ -198,7 +203,10 @@ async fn seed_customer_l1_then_l2() {
     .await;
     assert_eq!(s2, StatusCode::OK, "seed L2: {env2}");
     assert_eq!(env2["code"], 0);
-    let l2_id = env2["data"]["id"].as_str().expect("L2 id string").to_string();
+    let l2_id = env2["data"]["id"]
+        .as_str()
+        .expect("L2 id string")
+        .to_string();
 
     // 确认 parent_id 在 DB 里关联正确
     let l2_parent: Option<i64> =
@@ -319,10 +327,7 @@ async fn revoke_session_clears_redis_user_set() {
     // 确认 set 有该 token_hash
     let set_key = format!("sessions:user:{uid}");
     let mut conn = redis.get().await.expect("redis conn");
-    let members_before: Vec<String> = conn
-        .smembers(&set_key)
-        .await
-        .expect("smembers before");
+    let members_before: Vec<String> = conn.smembers(&set_key).await.expect("smembers before");
     assert!(
         members_before.contains(&token_hash.to_string()),
         "expected token_hash in user set; got {members_before:?}"
@@ -342,10 +347,7 @@ async fn revoke_session_clears_redis_user_set() {
     assert_eq!(renv["code"], 0);
 
     // Redis set 应该被清空
-    let members_after: Vec<String> = conn
-        .smembers(&set_key)
-        .await
-        .expect("smembers after");
+    let members_after: Vec<String> = conn.smembers(&set_key).await.expect("smembers after");
     assert!(
         members_after.is_empty(),
         "expected empty user set after revoke; got {members_after:?}"
@@ -371,6 +373,8 @@ async fn e2e_guard_returns_404_when_disabled() {
         state.snowflake.clone(),
         state.ws_hub.clone(),
         state.cos.clone(),
+        // 2026-09-16 M2-A：测试场景直接复用原 state 的 sts（通常是 NoopSts）
+        state.sts.clone(),
         state.shutdown.clone(),
         state.session.clone(),
     ));
@@ -514,6 +518,8 @@ async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
         state.snowflake.clone(),
         state.ws_hub.clone(),
         state.cos.clone(),
+        // 2026-09-16 M2-A：测试场景直接复用原 state 的 sts（通常是 NoopSts）
+        state.sts.clone(),
         state.shutdown.clone(),
         state.session.clone(),
     ));
@@ -521,11 +527,7 @@ async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
 
     let (status, env) = send(
         app,
-        json_request(
-            "DELETE",
-            "/_e2e/hard-delete/outsource_company/1",
-            None,
-        ),
+        json_request("DELETE", "/_e2e/hard-delete/outsource_company/1", None),
     )
     .await;
     assert_eq!(
@@ -559,11 +561,7 @@ async fn hard_delete_outsource_company_referenced_returns_409() {
         ),
     )
     .await;
-    let company_id: i64 = seed_resp["data"]["id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let company_id: i64 = seed_resp["data"]["id"].as_str().unwrap().parse().unwrap();
 
     // 2) 直接 INSERT 一个 t_process 行 + t_outsource_company_process 映射
     //    （不依赖 alembic seed 数据——这些会被 clean_business_db 清掉）
