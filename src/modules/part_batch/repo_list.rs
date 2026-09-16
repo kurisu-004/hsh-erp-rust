@@ -39,6 +39,12 @@ impl PartBatchRepo {
     /// （`CASE pb.location WHEN 'WORKER' THEN w.name WHEN 'OUTSOURCE_COMPANY' THEN oc.name ELSE s.name END`）。
     /// 本函数为了与既有 repo 函数保持一致，**不**做该修复；如需修，会另开
     /// repo 层 patch PR 覆盖全部 4 处 COALESCE。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
+    /// - 删 `pb.placed_at`（t_part_batch 列已删）
+    /// - `pb.next_process_id` / `np.name` 改为派生：`LEFT JOIN t_process_chain_step s
+    ///   ON s.id = pb.current_process_step_id` 后取 `s.process_id` / `t_process.name`
+    /// - `pb.current_process_step_id` 新增
     #[allow(clippy::too_many_arguments)]
     pub async fn list_batches_with_part<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -70,11 +76,14 @@ impl PartBatchRepo {
                 pb.status          AS "pb_status!",
                 pb.location        AS "pb_location?",
                 pb.version         AS "pb_version!",
-                pb.placed_at       AS "pb_placed_at?",
+                pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
                 pb.current_holder_id AS "pb_current_holder_id?",
-                pb.next_process_id AS "pb_next_process_id?",
+                -- PR-3 step 化：next_process_id 派生自 step.process_id（JOIN）
+                s.process_id       AS "step_process_id?",
+                np.name            AS "np_name?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
+                dn.delivery_note_no AS "dn_no?",
                 p.serial_no        AS "p_serial_no?",
                 p.drawing_no       AS "p_drawing_no!",
                 p.name             AS "p_name!",
@@ -88,9 +97,7 @@ impl PartBatchRepo {
                 c.name             AS "c_name?",
                 c.parent_id        AS "c_parent_id?",
                 pc.name            AS "pc_name?",
-                COALESCE(s.name, w.name, oc.name) AS "holder_name?",
-                np.name            AS "np_name?",
-                dn.delivery_note_no AS "dn_no?"
+                COALESCE(sh.name, w.name, oc.name) AS "holder_name?"
             FROM t_part_batch pb
             JOIN t_part p
               ON p.id = pb.part_id
@@ -98,14 +105,17 @@ impl PartBatchRepo {
               ON c.id = p.customer_id
             LEFT JOIN t_customer pc
               ON pc.id = c.parent_id
-            LEFT JOIN t_shelf s
-              ON s.id = pb.current_holder_id
+            LEFT JOIN t_shelf sh
+              ON sh.id = pb.current_holder_id
             LEFT JOIN t_worker w
               ON w.id = pb.current_holder_id
             LEFT JOIN t_outsource_company oc
               ON oc.id = pb.current_holder_id
+            -- PR-3 step 化：step JOIN 取 process_id（替代原 next_process_id 列）
+            LEFT JOIN t_process_chain_step s
+              ON s.id = pb.current_process_step_id
             LEFT JOIN t_process np
-              ON np.id = pb.next_process_id
+              ON np.id = s.process_id
             LEFT JOIN t_delivery_note dn
               ON dn.id = pb.delivery_note_id
             WHERE pb.status = ANY($1)
@@ -155,11 +165,12 @@ impl PartBatchRepo {
                     status: r.pb_status,
                     location: r.pb_location,
                     version: r.pb_version,
-                    placed_at: r.pb_placed_at,
+                    current_process_step_id: r.pb_current_process_step_id,
                     parent_batch_id: r.pb_parent_batch_id,
                     current_holder_id: r.pb_current_holder_id,
                     holder_name: r.holder_name,
-                    next_process_id: r.pb_next_process_id,
+                    // PR-3 step 化：next_process_id 派生自 step.process_id
+                    next_process_id: r.step_process_id,
                     next_process_name: r.np_name,
                     delivery_note_id: r.pb_delivery_note_id,
                     delivery_note_no: r.dn_no,

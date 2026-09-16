@@ -235,6 +235,9 @@ pub mod code {
     pub const BIZ_AUTO_ALLOCATE_INVALID_RATIO: i32 = 20704;
     // 2026-09-16 新增（FK 翻转 PR-1）：part.status 非 PENDING 时禁止制定/修改工艺链
     pub const BIZ_PROCESS_CHAIN_PART_NOT_PENDING: i32 = 20705;
+    // 2026-09-16 新增（PR-3 批次 step 化）：批次进入生产流（place-on-shelf /
+    // release-from-programming / send-to-outsource）时 part 还未制定工艺链 → 拒
+    pub const BIZ_PROCESS_CHAIN_REQUIRED: i32 = 20706;
 
     // 系统错误
     pub const INTERNAL: i32 = 50000;
@@ -439,7 +442,8 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_DELIVERY_NOTE_LOCKED_PART
             || c == code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER
             || c == code::BIZ_PART_NOT_DELETABLE
-            || c == code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING =>
+            || c == code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING
+            || c == code::BIZ_PROCESS_CHAIN_REQUIRED =>
         {
             StatusCode::CONFLICT
         }
@@ -874,6 +878,11 @@ mod tests {
             code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING,
             "BIZ_PROCESS_CHAIN_PART_NOT_PENDING",
         ),
+        // 2026-09-16 PR-3 批次 step 化：part 无工艺链时禁上生产流
+        (
+            code::BIZ_PROCESS_CHAIN_REQUIRED,
+            "BIZ_PROCESS_CHAIN_REQUIRED",
+        ),
     ];
 
     #[test]
@@ -1058,6 +1067,8 @@ mod tests {
         assert_eq!(code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET, 20703);
         assert_eq!(code::BIZ_AUTO_ALLOCATE_INVALID_RATIO, 20704);
         assert_eq!(code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING, 20705);
+        // 2026-09-16 PR-3 批次 step 化：part 无工艺链时禁上生产流
+        assert_eq!(code::BIZ_PROCESS_CHAIN_REQUIRED, 20706);
     }
 
     /// 数据驱动的 HTTP 表覆盖测试：每个 (code, expected_http, name) 一行。
@@ -1250,6 +1261,11 @@ mod tests {
             code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING,
             StatusCode::CONFLICT,
             "BIZ_PROCESS_CHAIN_PART_NOT_PENDING",
+        ),
+        (
+            code::BIZ_PROCESS_CHAIN_REQUIRED,
+            StatusCode::CONFLICT,
+            "BIZ_PROCESS_CHAIN_REQUIRED",
         ),
         // 2xxxx 显式 409
         (

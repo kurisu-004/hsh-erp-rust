@@ -711,6 +711,11 @@ pub struct PartEventOut {
 ///
 /// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` 字段
 /// （t_part_batch 列已删；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
+///
+/// 2026-09-16 PR-3 批次 step 化（migration 028）：
+/// - 删 `placed_at`（t_part_batch 列已删，不再统计生产时间）
+/// - `next_process_id` 字段保留（DTO 兼容），但 service 层不再写入；保留仅作
+///   历史快照语义，**禁止**新端点写入该字段
 #[derive(Debug, Clone, Serialize)]
 pub struct PartBatchListItemOut {
     #[serde(serialize_with = "serialize_i64")]
@@ -724,10 +729,12 @@ pub struct PartBatchListItemOut {
     pub current_holder_id: Option<i64>,
     #[serde(default)]
     pub holder_name: Option<String>,
+    /// 2026-09-16 PR-3：DTO 保留字段名（兼容前端），但当前**全部为 None**——
+    /// 业务上「下一步工序」概念已迁移到 step（current_process_step_id →
+    /// JOIN step.process_id 派生）；新端点不应依赖该字段。如前端仍需该信息，
+    /// 由 frontend 自行 JOIN current_process_step_id → step.process_id。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
-    #[serde(default)]
-    pub placed_at: Option<chrono::NaiveDateTime>,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub delivery_note_id: Option<i64>,
     #[serde(serialize_with = "serialize_i64_opt")]

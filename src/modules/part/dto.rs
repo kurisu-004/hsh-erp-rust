@@ -406,6 +406,13 @@ pub struct InspectionBatchListQuery {
 ///
 /// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` 字段
 /// （t_part_batch 列已删；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
+///
+/// 2026-09-16 PR-3 批次 step 化（migration 028）：
+/// - 删 `placed_at`（t_part_batch 列已删，不再统计生产时间）
+/// - 新增 `current_process_step_id`：逻辑 FK → t_process_chain_step.id
+///   （批次当前所处的工艺链步骤；NULL = 批次尚未进入生产流或 part 无链）
+/// - `next_process_id` / `next_process_name` 字段保留，由 repo JOIN step 派生
+///   （保持 DTO 兼容，不破坏前端）
 #[derive(Debug, Clone, Serialize)]
 pub struct InspectionBatchListItemOut {
     // ===== 批次字段 =====
@@ -416,7 +423,9 @@ pub struct InspectionBatchListItemOut {
     pub status: String,                         // 必为 "INSPECTION"
     pub location: Option<String>,
     pub version: i32,
-    pub placed_at: Option<chrono::NaiveDateTime>,
+    /// 逻辑 FK → t_process_chain_step.id（2026-09-16 PR-3；替代 next_process_id 列）
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub current_process_step_id: Option<i64>,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub parent_batch_id: Option<i64>,
 
@@ -424,6 +433,8 @@ pub struct InspectionBatchListItemOut {
     #[serde(serialize_with = "serialize_i64_opt")]
     pub current_holder_id: Option<i64>,
     pub holder_name: Option<String>,
+    /// 派生自 current_process_step_id（JOIN step.process_id）；保留字段名以
+    /// 兼容前端契约（2026-09-16 PR-3）。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
     pub next_process_name: Option<String>,

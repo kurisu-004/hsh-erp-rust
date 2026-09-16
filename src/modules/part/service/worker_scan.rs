@@ -39,6 +39,7 @@ use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::process_chain::repo::ProcessChainRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::modules::worker::repo::WorkerRepo;
 use crate::modules::worker_pool::dto::WorkerScanEvent;
@@ -176,13 +177,31 @@ impl PartService {
                         format!("shelf {} 不映射到工序 {}", req.shelf_id, next_pid),
                     ));
                 }
+                // PR-3 批次 step 化：解析 step_id（chain 内 process_id → step_id）。
+                // 防御性：part 后续 chain 被运维软删时，chain_id_opt=None → 不能
+                // 静默抹除 batch.current_process_step_id（否则 part 持有件从
+                // worker 归还到货架后丢失 step 上下文）。此时保留旧 step_id 值。
+                let chain_id_opt: Option<i64> = sqlx::query_scalar(
+                    "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
+                )
+                .bind(batch.part_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+                let step_id_opt: Option<i64> = if let Some(chain_id) = chain_id_opt {
+                    ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, next_pid)
+                        .await?
+                } else {
+                    // chain 已删：保留 batch 旧的 current_process_step_id（fallback
+                    // 到入参快照，避免 chain 被软删时 RETURNED 把 step 上下文置 NULL）
+                    batch.current_process_step_id
+                };
                 // 切 holder worker → shelf（OCC）
                 let n = PartRepo::mark_batch_returned(
                     &mut *conn,
                     batch.id,
                     batch.version,
                     req.shelf_id,
-                    next_pid,
+                    step_id_opt,
                     Some(current.id),
                 )
                 .await?;

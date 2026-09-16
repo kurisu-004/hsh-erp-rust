@@ -18,6 +18,7 @@ mod helpers;
 use axum::http::StatusCode;
 use serde_json::json;
 
+use common::{create_chain_for_part, create_step};
 use helpers::*;
 
 // ===========================================================================
@@ -110,6 +111,8 @@ async fn to_process_invalid_next_process_id_rejected() {
 }
 
 /// to-process happy path：INSPECTION → IN_PROCESS（推荐需求 3）。
+///
+/// 2026-09-16 PR-3 适配：to-process 入口要求 part 已绑定工艺链（20706）。
 #[tokio::test]
 async fn to_process_happy_path() {
     let (_guard, pool) = setup().await;
@@ -126,6 +129,9 @@ async fn to_process_happy_path() {
         "INSPECTION",
     )
     .await;
+    // PR-3：建链并把 part 绑到 chain
+    let chain_id = create_chain_for_part(&_pool, part_id).await;
+    let _step_id = create_step(&_pool, chain_id, next_proc, 1).await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
     let v = batch_version(&_pool, batch_id).await;
 
@@ -212,6 +218,9 @@ async fn to_process_partial_split_happy_path() {
         "INSPECTION",
     )
     .await;
+    // 2026-09-16 PR-3：to_process 要求 part 已绑定工艺链
+    let chain_id = create_chain_for_part(&_pool, part_id).await;
+    let _step_id = create_step(&_pool, chain_id, next_proc, 1).await;
     let batch_id = insert_batch(&_pool, part_id, 1, 10, "INSPECTION").await;
     let v = batch_version(&_pool, batch_id).await;
 

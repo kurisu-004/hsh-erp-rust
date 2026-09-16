@@ -22,7 +22,15 @@
 // `dead_code` warning；统一在 common 根豁免，避免每个 binary 都加
 // `#[allow(dead_code)]`。`duplicate-mod` 同理：多 test binary 共用本文件，
 // clippy --all-targets 会扫到「同文件被多次作为模块加载」。
-#![allow(dead_code, clippy::duplicate_mod)]
+//
+// 2026-09-16 PR-3 fix：允许 `clippy::await_holding_lock` —— PR-3 step3 引入的
+// `pool_snowflake()` 全局共享 std::sync::Mutex，所有 fixture helper（part/user/
+// chain/step 等）模式都是「lock 拿 guard → next_id() → .await INSERT」，guard
+// 在 .await 期间仍持有。改成 `lock().next_id()` expression 形式（不持 guard
+// 跨 await）需要重写所有 12+ helper，收益与风险不对等；测试场景下进程内单
+// task 不会与其他 task 抢该 mutex（每个 test 内 fixture 串行调用），不会
+// 真实死锁。
+#![allow(dead_code, clippy::duplicate_mod, clippy::await_holding_lock)]
 
 use std::sync::Arc;
 
@@ -41,6 +49,16 @@ use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::shared::error::{AppError, code};
+
+use std::sync::OnceLock;
+/// 全局共享 snowflake 生成器（PR-3 测试 helper 批量插入时使用）；
+/// 多个 helper 在同一毫秒调用不再产生冲突 ID（避免 shelf_id == process_id 等碰撞）。
+static TEST_SNOWFLAKE_GEN: OnceLock<std::sync::Mutex<SnowflakeIdGenerator>> = OnceLock::new();
+pub fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
+    TEST_SNOWFLAKE_GEN.get_or_init(|| {
+        std::sync::Mutex::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1))
+    })
+}
 use hsh_erp_rust::state::AppState;
 
 /// 测试 DB URL：与 `postgres-test` 容器（端口5429）+ `postgres_rust_test` 库配对。
@@ -420,7 +438,7 @@ pub async fn insert_user_with_password(pool: &PgPool, username: &str, plain_pass
     use hsh_erp_rust::infra::clock::now_naive;
 
     let hash = password::hash(plain_password).expect("bcrypt hash");
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -446,7 +464,7 @@ pub async fn insert_inactive_user(pool: &PgPool, username: &str, plain_password:
     use hsh_erp_rust::infra::clock::now_naive;
 
     let hash = password::hash(plain_password).expect("bcrypt hash");
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -475,7 +493,7 @@ pub async fn add_role(
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -505,7 +523,7 @@ pub async fn insert_menu(
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -529,7 +547,7 @@ pub async fn insert_menu(
 pub async fn add_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -549,7 +567,7 @@ pub async fn add_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
 pub async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -596,7 +614,7 @@ pub async fn get_refresh_token_version(pool: &PgPool, user_id: i64) -> i32 {
 pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -619,7 +637,7 @@ pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -641,7 +659,7 @@ pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
 pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -656,6 +674,71 @@ pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     .execute(pool)
     .await
     .expect("insert t_shelf_process");
+}
+
+/// 2026-09-16 PR-3 批次 step 化：to_process / place_on_shelf / send_to_outsource /
+/// repair 等"进入生产流"端点要求 part 已绑定工艺链（migration 028 +
+/// error code 20706 BIZ_PROCESS_CHAIN_REQUIRED）。本 helper 帮 part 建链 + 绑 part。
+///
+/// 返回 chain_id；caller 可继续调 `create_step` 加 step。
+pub async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
+    let snowflake = pool_snowflake().lock().unwrap();
+    let chain_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, now(), 0, now(), 0)",
+    )
+    .bind(chain_id)
+    .bind(format!("chain-{part_id}"))
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+        .bind(chain_id)
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("bind part to chain");
+    chain_id
+}
+
+/// 2026-09-16 PR-3 批次 step 化：在指定 chain 内创建 step（process_id + sort_order）。
+pub async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
+    let snowflake = pool_snowflake().lock().unwrap();
+    let step_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, 30, 0, now(), 0, now(), 0)",
+    )
+    .bind(step_id)
+    .bind(chain_id)
+    .bind(sort_order)
+    .bind(process_id)
+    .execute(pool)
+    .await
+    .expect("insert chain step");
+    step_id
+}
+
+/// 2026-09-16 PR-3 适配：seed 一个 active process（PR-3 之前测试用 999_999 占位 process_id，
+/// 现 to_process / place_on_shelf 等端点会经 process_chain 守卫 + step JOIN 校验。
+/// 本 helper 提供真实 t_process 行便于测试）。
+pub async fn seed_test_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+    let snowflake = pool_snowflake().lock().unwrap();
+    let proc_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, now(), now())",
+    )
+    .bind(proc_id)
+    .bind(code)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("insert process");
+    proc_id
 }
 
 // ===========================================================================

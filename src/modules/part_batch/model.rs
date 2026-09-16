@@ -4,17 +4,29 @@
 //! - sqlx `FromRow` 行结构（含 version 乐观锁、deleted_at 软删、created/updated 审计字段）
 //!
 //! Phase P1（送货分组）只投影 delivery_note / delivery_group 后续会用到的列：
-//! 标识 + 工单 + 批次号 + 数量 + 状态 + 位置 + holder + next_process + placed_at +
+//! 标识 + 工单 + 批次号 + 数量 + 状态 + 位置 + holder + current_process_step +
 //! 送货单关联 + 父批次 + 乐观锁 + 软删。
 //! Python `TPartBatch` 的其他字段留到 part_batch 域实施阶段扩展。
+//!
+//! 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` —— 拆批后
+//! 无法确定是哪一个批次返修，列语义失真，整体废弃（返修事实仍可追溯
+//! `t_part_event` 的 REPAIR_STARTED 事件）。
+//!
+//! 2026-09-16 PR-3 批次 step 化（migration 028）：
+//! - 删 `next_process_id`（t_part_batch 列），改 `current_process_step_id`
+//!   指向所属 part 的工艺链步骤（t_process_chain_step.id）
+//! - 删 `placed_at`（不再统计生产时间）
+//!
+//! 真实 process_id 由 service 层 JOIN t_process_chain_step 按需派生。
 
 use chrono::{NaiveDate, NaiveDateTime};
 
-/// `t_part_batch` 行（Phase P1 投影）
+/// `t_part_batch` 行（Phase P1 投影；2026-09-16 PR-3 适配 step 化）
 ///
-/// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` —— 拆批后
-/// 无法确定是哪一个批次返修，列语义失真，整体废弃（返修事实仍可追溯
-/// `t_part_event` 的 REPAIR_STARTED 事件）。
+/// 字段变化：
+/// - `current_process_step_id: Option<i64>` —— 替代 `next_process_id`（已删），
+///   逻辑 FK → `t_process_chain_step.id`；NULL = 批次尚未进入生产流或 part 无链
+/// - `next_process_id` / `placed_at` 字段删除（t_part_batch 列已删）
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPartBatch {
     pub id: i64,
@@ -24,8 +36,10 @@ pub struct TPartBatch {
     pub status: String,
     pub location: Option<String>,
     pub current_holder_id: Option<i64>,
-    pub next_process_id: Option<i64>,
-    pub placed_at: Option<NaiveDateTime>,
+    /// 逻辑 FK → `t_process_chain_step.id`；NULL = 批次尚未进入生产流
+    /// （PENDING/PROGRAMMING/OUTSOURCE 起点）或所属 part 无工艺链。
+    /// 2026-09-16 PR-3 替代 `next_process_id`（已删）。
+    pub current_process_step_id: Option<i64>,
     pub delivery_note_id: Option<i64>,
     pub parent_batch_id: Option<i64>,
     pub version: i32,
@@ -71,6 +85,11 @@ pub struct PartBatchScanRow {
 /// SQL 列别名见 repo `list_batches_with_part`（单次 JOIN 8 表，含 holder_name
 /// / next_process_name / delivery_note_no / customer_name / l1_customer_name
 /// 全部解析）。
+///
+/// 2026-09-16 PR-3 批次 step 化：
+/// - 删 `placed_at`（t_part_batch 列已删）
+/// - `next_process_id` 改为派生：`step.process_id`（JOIN t_process_chain_step 取），
+///   保留字段名以兼容 DTO 与前端
 #[derive(Debug, Clone)]
 pub struct InspectionBatchListRow {
     // 批次
@@ -81,11 +100,14 @@ pub struct InspectionBatchListRow {
     pub status: String,
     pub location: Option<String>,
     pub version: i32,
-    pub placed_at: Option<NaiveDateTime>,
+    /// 逻辑 FK → t_process_chain_step.id（2026-09-16 PR-3 替代 next_process_id）
+    pub current_process_step_id: Option<i64>,
     pub parent_batch_id: Option<i64>,
     // holder / process / delivery_note 解析
     pub current_holder_id: Option<i64>,
     pub holder_name: Option<String>,
+    /// 派生自 current_process_step_id（JOIN step.process_id）；保留字段名以
+    /// 兼容下游 DTO 与前端。
     pub next_process_id: Option<i64>,
     pub next_process_name: Option<String>,
     pub delivery_note_id: Option<i64>,
@@ -117,7 +139,7 @@ impl From<InspectionBatchListRow>
             status: r.status,
             location: r.location,
             version: r.version,
-            placed_at: r.placed_at,
+            current_process_step_id: r.current_process_step_id,
             parent_batch_id: r.parent_batch_id,
             current_holder_id: r.current_holder_id,
             holder_name: r.holder_name,

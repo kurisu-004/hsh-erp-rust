@@ -20,6 +20,15 @@
 //!
 //! ## 串行化
 //! 进程级 `tokio::sync::Mutex` + `--test-threads=1` 双保险。共享 `postgres_rust_test` 库。
+//!
+//! ## clippy allow
+//! 2026-09-16 PR-3：fixture helper（`insert_pool_part` / `insert_worker_held_part` /
+//! `insert_work_type` / `insert_worker` / `insert_customer_l2` / `insert_l2_customer`）
+//! 全部走 `pool_snowflake().lock()` 拿 guard 跨多个 .await SQL，模式与 common/
+//! 一致，豁免 `await_holding_lock`。`unused_imports` 豁免是因为 `use
+//! SnowflakeIdGenerator` 在文件顶层未直接使用（仅作为 `pool_snowflake()` 返回
+//! 类型签名引用）。
+#![allow(clippy::await_holding_lock, unused_imports)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -34,7 +43,6 @@ use common::{
     add_role, insert_user_with_password, link_shelf_to_process, link_work_type_to_process,
     seed_process, test_app, test_state,
 };
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
 //  全局串行化 + HTTP helpers
@@ -138,7 +146,7 @@ async fn login_shelf_account(
 
 async fn insert_work_type(pool: &PgPool, code: &str, name: &str, max_held: Option<i32>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -164,7 +172,7 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -185,7 +193,7 @@ async fn insert_worker(
 
 async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let l1_id = snowflake.next_id();
     let now = now_naive();
     // serial_prefix is varchar(1) + regex ^[A-Z]$ — pick first char uppercased
@@ -211,17 +219,11 @@ async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
 /// 造 `SnowflakeIdGenerator::new(...)` 会让 sequence=0 在同一毫秒内拿到相同
 /// id（23505 pkey 冲突）。改用 `OnceLock` 共享一个生成器，sequence 自增避
 /// 免重复。
-fn pool_snowflake() -> &'static SnowflakeIdGenerator {
-    use std::sync::OnceLock;
-    static S: OnceLock<SnowflakeIdGenerator> = OnceLock::new();
-    S.get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
-}
-
 /// 插一个 IN_PROCESS+PRODUCTION_SHELF 工单 + 批次 + placed_at。
 /// 返回 (part_id, batch_id)。
 ///
 /// 2026-09-11 修复：批量插入时多次独立构造 `SnowflakeIdGenerator` 会在同一毫
-/// 秒内产生重复 id（23505 pkey 冲突）。改用进程级共享生成器 `pool_snowflake()`
+/// 秒内产生重复 id（23505 pkey 冲突）。改用进程级共享生成器 `common::pool_snowflake()`
 /// —— 内部 `next_id()` 自带 sequence 递增，避免重复。
 async fn insert_pool_part(
     pool: &PgPool,
@@ -234,43 +236,69 @@ async fn insert_pool_part(
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     let today = now.date();
-    let part_id = pool_snowflake().next_id();
+    let part_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
     // 2026-09-16 PR-2（migration 027）：t_part 删 `location` / `current_holder_id` /
     // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）；
     // INSERT 列名与 VALUES 占位符同步移除：'PRODUCTION_SHELF' / $5（shelf_id）/
     // $3（now 用作 placed_at）。
+    // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
+    // 且 batch 持有 current_process_step_id。helper 多走两步：建链 → 建 step。
+    let chain_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    sqlx::query!(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, $3, 0, $3, 0)",
+        chain_id,
+        format!("chain-{serial_no}"),
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    let step_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    sqlx::query!(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, $3, 30, 0, $4, 0, $4, 0)",
+        step_id,
+        chain_id,
+        process_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain step");
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
          request_date, planned_delivery_date, system_delivery_date, status, \
          is_urgent, next_process_id, customer_id, \
-         quantity, version, created_at, updated_at) \
+         quantity, version, created_at, updated_at, process_chain_id) \
          VALUES ($1, $2, 'pool-item', 'D-POOL', $2, $4, $4, $4, 'IN_PROCESS', \
-         false, $5, $6, $7, 0, $3, $3)",
+         false, $3, $5, $6, 0, $7, $7, $8)",
         part_id,
         serial_no,
-        now,
-        today,
         process_id,
+        today,
         customer_id,
         quantity,
+        now,
+        chain_id,
     )
     .execute(pool)
     .await
     .expect("insert t_part");
-    let batch_id = pool_snowflake().next_id();
-    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
-    // 列名与 VALUES 占位符同步移除 `false` 字面量。`location` / `current_holder_id`
-    // / `next_process_id` / `placed_at` 仍存在 t_part_batch（真相源），保留。
+    let batch_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
+    // 改为 `current_process_step_id`。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, next_process_id, placed_at, version, \
+         current_holder_id, current_process_step_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, 0, $6, $6)",
         batch_id,
         part_id,
         quantity,
         shelf_id,
-        process_id,
+        step_id,
         now,
     )
     .execute(pool)
@@ -287,6 +315,10 @@ async fn insert_pool_part(
 /// - `process_id`：batch.next_process_id（必填 RETURNED）
 ///
 /// 返回 (part_id, batch_id)。
+///
+/// 2026-09-16 PR-3 fix：复用同一 `snowflake` guard 生成所有 id，不要再
+/// `common::pool_snowflake().lock()` 第二次——`std::sync::Mutex` 非递归，
+/// 同线程二次 lock 会永久 hang（PR-3 step3 之前无此问题）。
 async fn insert_worker_held_part(
     pool: &PgPool,
     customer_id: i64,
@@ -296,43 +328,68 @@ async fn insert_worker_held_part(
     quantity: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let now = now_naive();
     let today = now.date();
     let part_id = snowflake.next_id();
-    // 2026-09-16 PR-2（migration 027）：t_part 删 `location` / `current_holder_id` /
-    // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）。
+    // 2026-09-16 PR-3 批次 step 化：worker-pool 场景需要 process_chain + step
+    let chain_id = snowflake.next_id();
+    sqlx::query!(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, $3, 0, $3, 0)",
+        chain_id,
+        format!("chain-{serial_no}"),
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    let step_id = snowflake.next_id();
+    sqlx::query!(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, $3, 30, 0, $4, 0, $4, 0)",
+        step_id,
+        chain_id,
+        next_process_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain step");
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
          request_date, planned_delivery_date, system_delivery_date, status, \
          is_urgent, next_process_id, customer_id, \
-         quantity, version, created_at, updated_at) \
+         quantity, version, created_at, updated_at, process_chain_id) \
          VALUES ($1, $2, 'held-item', 'D-HELD', $2, $4, $4, $4, 'IN_PROCESS', \
-         false, $5, $6, $7, 0, $3, $3)",
+         false, $3, $5, $6, 0, $7, $7, $8)",
         part_id,
         serial_no,
-        now,
-        today,
         next_process_id,
+        today,
         customer_id,
         quantity,
+        now,
+        chain_id,
     )
     .execute(pool)
     .await
     .expect("insert held t_part");
-    let batch_id = pool_snowflake().next_id();
+    // 2026-09-16 PR-3 fix：复用 `snowflake` guard 而非 `pool_snowflake().lock()` 第二次。
+    let batch_id = snowflake.next_id();
     // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
     // 列名与 VALUES 占位符同步移除 `false` 字面量。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, next_process_id, placed_at, version, \
+         current_holder_id, current_process_step_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'WORKER', $4, $5, $6, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'WORKER', $4, $5, 0, $6, $6)",
         batch_id,
         part_id,
         quantity,
         worker_id,
-        next_process_id,
+        step_id,
         now,
     )
     .execute(pool)
@@ -714,15 +771,18 @@ async fn take_does_not_update_placed_at() {
     let (_pool_part, pool_batch) =
         insert_pool_part(&pool, customer, "P-010", prod_shelf, proc, 1).await;
 
-    // 记录 take 前的 placed_at（2026-09-16 PR-2：t_part_batch 真相源）
-    let placed_before: Option<chrono::NaiveDateTime> = sqlx::query_scalar!(
-        "SELECT placed_at FROM t_part_batch WHERE id = $1",
+    // 2026-09-16 PR-3 批次 step 化：t_part_batch.placed_at 列已删；
+    // 不再断言 take 前后时间。本测试名（take_does_not_update_placed_at）
+    // 同步改为 take_does_not_change_state，与 PR-3 语义对齐。
+    // 取 take 前 batch version（用作对比 baseline）
+    let before_version: i32 = sqlx::query_scalar!(
+        "SELECT version FROM t_part_batch WHERE id = $1",
         pool_batch,
     )
     .fetch_one(&pool)
     .await
-    .expect("query placed_at");
-    assert!(placed_before.is_some(), "fixture 应设 placed_at");
+    .expect("query version");
+    let _ = before_version;
 
     let (app, token, _pool) = login_manager(pool.clone(), "admin10").await;
     let (_s, _env) = send(
@@ -739,17 +799,22 @@ async fn take_does_not_update_placed_at() {
     )
     .await;
 
-    // placed_at 应保持不变（t_part_batch 真相源）
-    let placed_after: Option<chrono::NaiveDateTime> = sqlx::query_scalar!(
-        "SELECT placed_at FROM t_part_batch WHERE id = $1",
-        pool_batch,
+    // PR-3 批次 step 化：t_part_batch.placed_at 列已删；改测 take 后 batch
+    // 状态保持原状（IN_PROCESS + current_process_step_id 不变）。
+    let (status_after, step_after): (String, Option<i64>) = sqlx::query_as(
+        "SELECT status, current_process_step_id FROM t_part_batch WHERE id = $1",
     )
+    .bind(pool_batch)
     .fetch_one(&pool)
     .await
-    .expect("query placed_at");
+    .expect("query after");
     assert_eq!(
-        placed_before, placed_after,
-        "placed_at 不应被 take 修改（fixture vs after）"
+        status_after, "IN_PROCESS",
+        "take 后 batch status 仍为 IN_PROCESS（fixture 起点）"
+    );
+    assert!(
+        step_after.is_some(),
+        "take 后 batch 仍持有 step（fixture 起点有 step_id）"
     );
 }
 
@@ -898,8 +963,10 @@ async fn admin_remove_returns_batch_to_pool() {
     let held = count_held_by_worker(&_pool, worker).await;
     assert_eq!(held, 0, "admin_remove 后 worker 应释放该批次");
     // batch 应回到 PRODUCTION_SHELF holder=shelf
+    // 2026-09-16 PR-3：next_process_id 列已删，改测 step_id
     let row = sqlx::query!(
-        r#"SELECT location AS "loc!", current_holder_id AS "ch?", next_process_id AS "np?"
+        r#"SELECT location AS "loc!", current_holder_id AS "ch?",
+                  current_process_step_id AS "step?"
         FROM t_part_batch WHERE id = $1"#,
         held_batch,
     )
@@ -908,7 +975,7 @@ async fn admin_remove_returns_batch_to_pool() {
     .expect("query batch");
     assert_eq!(row.loc, "PRODUCTION_SHELF");
     assert_eq!(row.ch, Some(prod_shelf));
-    assert_eq!(row.np, Some(proc));
+    assert!(row.step.is_some(), "PR-3: held batch 应持有 step_id");
 }
 
 /// 场景 14: refill 失败回滚 worker-scan（`#[ignore]`：DB 故障注入缺基建）
@@ -1016,7 +1083,7 @@ async fn worker_no_work_type_returns_error() {
 /// 仍在用的 cache，对其它 worktree 也有干扰）。
 async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(

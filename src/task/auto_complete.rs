@@ -3,19 +3,22 @@
 //! 对应 Python myERP/service/auto_complete.py 与 `core/database.py::lifespan`：
 //! - 启动后立即跑一轮
 //! - 间隔 `AUTO_COMPLETE_INTERVAL_HOURS`（默认 24h）
-//! - 扫描 DELIVERED 且 `placed_at < now() - interval 'AUTO_COMPLETE_THRESHOLD_DAYS days'`
-//!   的批次，逐个调用 `PartService::complete`（DELIVERED → COMPLETED）。
+//! - 扫描 DELIVERED 且对应 `t_part_event` 中 `event_type='DELIVERED'` 事件的
+//!   `created_at < now() - interval 'AUTO_COMPLETE_THRESHOLD_DAYS days'` 的批次，
+//!   逐个调用 `PartService::complete`（DELIVERED → COMPLETED）。
 //! - 收到 `CancellationToken` 时优雅退出
 //!
 //! Phase 0 实现要点：
 //! - 单事务包住「扫描 + 逐个 complete」：commit 后再广播 WS 事件（CLAUDE.md §架构 6）。
 //! - 构造伪 `CurrentUser`（id=0, username="system"）承担后台身份——
-//!   `PartService::complete` 要求 MANAGER/CLERK 角色；后续接 RBAC 时再升级。
+//   `PartService::complete` 要求 MANAGER/CLERK 角色；后续接 RBAC 时再升级。
 //! - 单批失败 log 继续（与 Python `_run_once` 一致），不影响后续批次。
-//! - 本 PR **不**做 latest-event-derived 阈值（Python `_run_once` 走
-//!   `t_part_event` 关联拿 `latest_delivered`，避免 `placed_at` 与 DELIVERED
-//!   时间不对齐的偏差），仅按 `placed_at` 直接过滤——`placed_at` 是批次首次
-//!   ON_SHELF 时间，简化版可接受；如需严格按事件时间迁移再升级。
+//!
+//! 2026-09-16 PR-3 批次 step 化（migration 028）：阈值口径由
+//! `t_part_batch.placed_at`（列已删）改为 `t_part_event` 中 DELIVERED 事件的
+//! `created_at`，与 Python `_run_once` 的 latest-event-derived 口径对齐（避免
+//! `placed_at` 首次 ON_SHELF 时间与 DELIVERED 时间不对齐的偏差）。SQL 见
+//! `PartBatchRepo::find_delivered_older_than`（src/modules/part_batch/repo.rs:858）。
 
 use std::sync::Arc;
 use std::time::Duration;

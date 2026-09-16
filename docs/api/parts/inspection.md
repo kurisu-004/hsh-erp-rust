@@ -488,9 +488,13 @@ Response 200 `data`：`InspectionBatchListOut`
 | `status` | string | 批次状态枚举字符串（本端点固定为 `INSPECTION`） |
 | `location` | string? | 批次所在位置（`INSPECTION_SHELF` 等） |
 | `version` | i32 | 乐观锁（`t_part_batch.version`，caller OCC 锚点） |
-| `placed_at` | naive datetime? | 批次上架时间（`placed_at`） |
+| `current_process_step_id` | string (i64)? | 逻辑 FK → `t_process_chain_step.id`（PR-3 批次 step 化 2026-09-16 新增，替代 next_process_id 列） |
 | `parent_batch_id` | string (i64)? | 拆批来源的父批次 ID（仅拆批产生的新批次非 None） |
 
+> 2026-09-16 PR-3 批次 step 化（migration 028）：删 `placed_at` 字段
+> —— `t_part_batch.placed_at` 列已删（不再统计生产时间）。
+> 新增 `current_process_step_id`（逻辑 FK → 工艺链步骤）。
+>
 > 2026-09-16 PR-2（migration 027）：`InspectionBatchListItemOut` 删 `has_been_repaired`
 > 字段 —— `t_part_batch.has_been_repaired` 列已删；返修事实由
 > `t_part_event.event_type='REPAIR_STARTED'` 事件日志追溯（详见

@@ -37,6 +37,7 @@ use crate::modules::part::repo::part::{PartListFilters, PartUpdate};
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part_batch::repo::PartBatchRepo;
+use crate::modules::process_chain::repo::ProcessChainRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::modules::worker::repo::WorkerRepo;
 use crate::shared::error::{code, AppError};
@@ -66,6 +67,7 @@ struct OutsourceLite {
 // compile-time DB access via .sqlx cache).
 
 #[derive(sqlx::FromRow)]
+#[allow(dead_code)] // current_process_step_id: 通过 service 层需要，但本 struct 仅 DTO 转换使用
 struct BatchListRow {
     id: i64,
     batch_no: i32,
@@ -73,7 +75,7 @@ struct BatchListRow {
     status: String,
     location: Option<String>,
     version: i32,
-    placed_at: Option<chrono::NaiveDateTime>,
+    current_process_step_id: Option<i64>,
     parent_batch_id: Option<i64>,
     current_holder_id: Option<i64>,
     holder_name: Option<String>,
@@ -105,7 +107,7 @@ struct InspectionRepairRow {
     status: String,
     location: Option<String>,
     version: i32,
-    placed_at: Option<chrono::NaiveDateTime>,
+    current_process_step_id: Option<i64>,
     parent_batch_id: Option<i64>,
     current_holder_id: Option<i64>,
     holder_name: Option<String>,
@@ -237,8 +239,13 @@ async fn assert_shelf_maps_process(
     Ok(())
 }
 
-/// 在 batch 上把状态机 + OCC 走完整（`UPDATE ... WHERE version=$expected`）。
-/// 返回影响行数（0 行由 caller 决定错误码）。
+/// 2026-09-16 PR-3 批次 step 化：
+/// - 删 `placed_at` 列写入（COALESCE(placed_at, now()) 已无意义）
+/// - `next_process_id: Option<i64>` → `current_process_step_id: Option<i64>`
+///   （写入 t_part_batch.current_process_step_id 新列）
+/// - `new_next_process_id` 参数改名为 `new_current_process_step_id`
+///   （DTO / worker / frontend 仍传 process_id，由 caller 在调本函数前
+///   经 `ProcessChainRepo::resolve_step_id_by_process` 解析）
 #[allow(clippy::too_many_arguments)]
 async fn mark_batch_with_status_and_meta<'e, E: PgExecutor<'e>>(
     executor: E,
@@ -247,12 +254,12 @@ async fn mark_batch_with_status_and_meta<'e, E: PgExecutor<'e>>(
     new_status: &str,
     new_location: Option<&str>,
     new_holder_id: Option<i64>,
-    new_next_process_id: Option<i64>,
+    new_current_process_step_id: Option<i64>,
     updated_by: i64,
 ) -> Result<u64, sqlx::Error> {
     let r = sqlx::query(
         "UPDATE t_part_batch SET status = $3, location = $4, current_holder_id = $5, \
-         next_process_id = $6, placed_at = COALESCE(placed_at, now()), \
+         current_process_step_id = $6, \
          version = version + 1, updated_at = now(), updated_by = $7 \
          WHERE id = $1 AND version = $2 AND status NOT IN ('CANCELLED', 'COMPLETED') \
          AND deleted_at IS NULL",
@@ -262,7 +269,7 @@ async fn mark_batch_with_status_and_meta<'e, E: PgExecutor<'e>>(
     .bind(new_status)
     .bind(new_location)
     .bind(new_holder_id)
-    .bind(new_next_process_id)
+    .bind(new_current_process_step_id)
     .bind(updated_by)
     .execute(executor)
     .await?;
@@ -292,6 +299,10 @@ async fn mark_batch_status_only<'e, E: PgExecutor<'e>>(
 }
 
 /// mark_batch 给 PROGRAMMING/OUTSOURCE 等特殊 location 转换用。
+///
+/// 2026-09-16 PR-3：删 placed_at 写入（列已删）；PENDING/PROGRAMMING 起点
+/// batch 的 current_process_step_id 通常为 NULL（不在生产流），由 caller
+/// 在调本函数前决定。
 #[allow(clippy::too_many_arguments)]
 async fn mark_batch_for_programming<'e, E: PgExecutor<'e>>(
     executor: E,
@@ -304,7 +315,7 @@ async fn mark_batch_for_programming<'e, E: PgExecutor<'e>>(
 ) -> Result<u64, sqlx::Error> {
     let r = sqlx::query(
         "UPDATE t_part_batch SET status = $3, location = $4, current_holder_id = $5, \
-         placed_at = now(), version = version + 1, updated_at = now(), updated_by = $6 \
+         version = version + 1, updated_at = now(), updated_by = $6 \
          WHERE id = $1 AND version = $2 AND status NOT IN ('CANCELLED', 'COMPLETED') \
          AND deleted_at IS NULL",
     )
@@ -319,10 +330,45 @@ async fn mark_batch_for_programming<'e, E: PgExecutor<'e>>(
     Ok(r.rows_affected())
 }
 
+/// 2026-09-16 PR-3 批次 step 化：part 进入生产流（place_on_shelf /
+/// release_from_programming / send_to_outsource）前必须已制定工艺链。
+///
+/// 守卫：
+/// - `process_chain_id IS NULL` → `BIZ_PROCESS_CHAIN_REQUIRED` 409 「请先制定工序链」
+/// - chain 已软删（防御）→ 同样 `BIZ_PROCESS_CHAIN_REQUIRED`
+///
+/// 返回：chain_id（已校验非空）。caller 继续用 `process_id` 经
+/// `ProcessChainRepo::resolve_step_id_by_process` 解析为 step_id。
+async fn require_process_chain(
+    conn: &mut PgConnection,
+    part_id: i64,
+) -> Result<i64, AppError> {
+    let row: Option<(Option<i64>,)> = sqlx::query_as(
+        "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(part_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let chain_id_opt = row
+        .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在")))?
+        .0;
+    chain_id_opt.ok_or_else(|| {
+        AppError::biz(
+            code::BIZ_PROCESS_CHAIN_REQUIRED,
+            "请先制定工序链（part 未绑定 process_chain）",
+        )
+    })
+}
+
 impl PartService {
     // ===== 1.1 上架 / 召回 =====
 
     /// `POST /parts/{id}/place-on-shelf`：PENDING → IN_PROCESS（PRODUCTION_SHELF）。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：
+    /// - 入口新增 process_chain 必须性守卫（`BIZ_PROCESS_CHAIN_REQUIRED`）
+    /// - `req.next_process_id` 经 `ProcessChainRepo::resolve_step_id_by_process`
+    ///   解析为 step_id 写入 `t_part_batch.current_process_step_id`
     pub async fn place_on_shelf(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
@@ -341,10 +387,25 @@ impl PartService {
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         ensure_transition(from, PartStatus::IN_PROCESS, "place-on-shelf")?;
+        // PR-3：part 必须已绑定工艺链
+        let chain_id = require_process_chain(&mut *conn, part_id).await?;
         // shelf 校验
         validate_shelf_zone(conn, req.shelf_id, "PRODUCTION").await?;
         // shelf ↔ process 映射
         assert_shelf_maps_process(conn, req.shelf_id, req.next_process_id).await?;
+        // PR-3：解析 step_id（chain 内 process_id → step_id）
+        let step_id =
+            ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, req.next_process_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                        format!(
+                            "chain {} 内找不到 process_id={} 的活跃 step",
+                            chain_id, req.next_process_id
+                        ),
+                    )
+                })?;
         // 翻状态
         let n = mark_batch_with_status_and_meta(
             &mut *conn,
@@ -353,7 +414,7 @@ impl PartService {
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
-            Some(req.next_process_id),
+            Some(step_id),
             current.id,
         )
         .await?;
@@ -510,6 +571,9 @@ impl PartService {
     }
 
     /// `POST /parts/{id}/release-from-programming`：PROGRAMMING → IN_PROCESS（PRODUCTION_SHELF）。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：chain 必须性守卫 + req.next_process_id
+    /// 解析为 step_id 写入 current_process_step_id。
     pub async fn release_from_programming(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
@@ -534,8 +598,23 @@ impl PartService {
                 "release-from-programming: 源状态必须是 PROGRAMMING",
             ));
         }
+        // PR-3：part 必须已绑定工艺链
+        let chain_id = require_process_chain(&mut *conn, part_id).await?;
         validate_shelf_zone(conn, req.shelf_id, "PRODUCTION").await?;
         assert_shelf_maps_process(conn, req.shelf_id, req.next_process_id).await?;
+        // PR-3：解析 step_id
+        let step_id =
+            ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, req.next_process_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                        format!(
+                            "chain {} 内找不到 process_id={} 的活跃 step",
+                            chain_id, req.next_process_id
+                        ),
+                    )
+                })?;
         let n = mark_batch_with_status_and_meta(
             &mut *conn,
             batch.id,
@@ -543,7 +622,7 @@ impl PartService {
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
-            Some(req.next_process_id),
+            Some(step_id),
             current.id,
         )
         .await?;
@@ -733,6 +812,8 @@ impl PartService {
                 "send-to-outsource: IN_PROCESS 批次必须在 PRODUCTION_SHELF 上",
             ));
         }
+        // 2026-09-16 PR-3：part 进入生产流前必须已绑定工艺链
+        let chain_id = require_process_chain(&mut *conn, part_id).await?;
         // 校验 outsource 公司存在 + 启用
         let company_row: Option<(bool,)> = sqlx::query_as(
             "SELECT is_active FROM t_outsource_company WHERE id = $1 AND deleted_at IS NULL",
@@ -763,6 +844,19 @@ impl PartService {
                 format!("process {} 不存在", req.process_id),
             ));
         }
+        // PR-3：解析 step_id（chain 内 process_id → step_id）写入 OUTSOURCE 批次
+        let step_id =
+            ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, req.process_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                        format!(
+                            "chain {} 内找不到 process_id={} 的活跃 step",
+                            chain_id, req.process_id
+                        ),
+                    )
+                })?;
         // Phase 2：quote_id 可选；若提供必须 APPROVED 状态
         let (quote_id_opt, unit_price): (Option<i64>, Option<rust_decimal::Decimal>) = if let Some(qid) = req.quote_id {
             let row: Option<(String, rust_decimal::Decimal, i64, i64, i64)> = sqlx::query_as(
@@ -806,7 +900,7 @@ impl PartService {
             "OUTSOURCE",
             Some("OUTSOURCE_COMPANY"),
             Some(req.outsource_company_id),
-            Some(req.process_id),
+            Some(step_id),
             current.id,
         )
         .await?;
@@ -885,6 +979,9 @@ impl PartService {
     /// `POST /parts/{id}/receive-from-outsource`：OUTSOURCE → IN_PROCESS（PRODUCTION_SHELF）。
     ///
     /// Phase 2（2026-09-13）扩展：同事务把批次开口 shipment 标 RECEIVED + 写 RECEIVED 事件。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：chain 必须性守卫 + req.next_process_id
+    /// 解析为 step_id 写入 current_process_step_id。
     pub async fn receive_from_outsource(
         conn: &mut PgConnection,
         snowflake: &SnowflakeIdGenerator,
@@ -909,8 +1006,23 @@ impl PartService {
                 "receive-from-outsource: 源状态必须是 OUTSOURCE",
             ));
         }
+        // PR-3：part 必须已绑定工艺链
+        let chain_id = require_process_chain(&mut *conn, part_id).await?;
         validate_shelf_zone(conn, req.shelf_id, "PRODUCTION").await?;
         assert_shelf_maps_process(conn, req.shelf_id, req.next_process_id).await?;
+        // PR-3：解析 step_id
+        let step_id =
+            ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, req.next_process_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                        format!(
+                            "chain {} 内找不到 process_id={} 的活跃 step",
+                            chain_id, req.next_process_id
+                        ),
+                    )
+                })?;
         let n = mark_batch_with_status_and_meta(
             &mut *conn,
             batch.id,
@@ -918,7 +1030,7 @@ impl PartService {
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
-            Some(req.next_process_id),
+            Some(step_id),
             current.id,
         )
         .await?;
@@ -1129,16 +1241,32 @@ impl PartService {
         if !shelf.is_active {
             return Err(AppError::biz(code::BIZ_SHELF_INACTIVE, "shelf 已停用"));
         }
-        let (new_status, new_location, next_proc_id) = match shelf.zone.as_str() {
+        let (new_status, new_location, step_id_opt) = match shelf.zone.as_str() {
             "PRODUCTION" => {
                 let np = req.next_process_id.ok_or_else(|| {
                     AppError::biz(code::BIZ_INVALID_VALUE, "PRODUCTION 区需要 next_process_id")
                 })?;
+                // PR-3：PRODUCTION 区必须已绑定工艺链
+                let chain_id = require_process_chain(&mut *conn, part_id).await?;
                 assert_shelf_maps_process(conn, req.shelf_id, np).await?;
-                ("IN_PROCESS", Some("PRODUCTION_SHELF"), Some(np))
+                // PR-3：解析 step_id
+                let step_id =
+                    ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, np)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::biz(
+                                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                                format!(
+                                    "chain {} 内找不到 process_id={} 的活跃 step",
+                                    chain_id, np
+                                ),
+                            )
+                        })?;
+                ("IN_PROCESS", Some("PRODUCTION_SHELF"), Some(step_id))
             }
             "INSPECTION" => {
-                // carried next_process_id（如果 caller 传了）不写回；service 不再校验
+                // INSPECTION 区不带 step（送检区不需要 process 上下文）；
+                // 检验完成后 to_process / to_ship 再设 step
                 ("INSPECTION", Some("INSPECTION_SHELF"), None)
             }
             other => {
@@ -1155,7 +1283,7 @@ impl PartService {
             new_status,
             new_location,
             Some(req.shelf_id),
-            next_proc_id,
+            step_id_opt,
             current.id,
         )
         .await?;
@@ -1226,13 +1354,28 @@ impl PartService {
         if !shelf.is_active {
             return Err(AppError::biz(code::BIZ_SHELF_INACTIVE, "shelf 已停用"));
         }
-        let (new_status, new_location, next_proc_id) = match shelf.zone.as_str() {
+        let (new_status, new_location, step_id_opt) = match shelf.zone.as_str() {
             "PRODUCTION" => {
                 let np = req.next_process_id.ok_or_else(|| {
                     AppError::biz(code::BIZ_INVALID_VALUE, "PRODUCTION 区需要 next_process_id")
                 })?;
+                // PR-3：PRODUCTION 区必须已绑定工艺链
+                let chain_id = require_process_chain(&mut *conn, part_id).await?;
                 assert_shelf_maps_process(conn, req.shelf_id, np).await?;
-                ("IN_PROCESS", Some("PRODUCTION_SHELF"), Some(np))
+                // PR-3：解析 step_id
+                let step_id =
+                    ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, np)
+                        .await?
+                        .ok_or_else(|| {
+                            AppError::biz(
+                                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                                format!(
+                                    "chain {} 内找不到 process_id={} 的活跃 step",
+                                    chain_id, np
+                                ),
+                            )
+                        })?;
+                ("IN_PROCESS", Some("PRODUCTION_SHELF"), Some(step_id))
             }
             "INSPECTION" => ("INSPECTION", Some("INSPECTION_SHELF"), None),
             other => {
@@ -1252,7 +1395,7 @@ impl PartService {
             new_status,
             new_location,
             Some(req.shelf_id),
-            next_proc_id,
+            step_id_opt,
             current.id,
         )
         .await?;
@@ -1336,7 +1479,7 @@ impl PartService {
         let offset = query.offset.unwrap_or(0).max(0);
         let keyword = query.keyword.as_deref().unwrap_or("");
         let rows: Vec<InspectionRepairRow> = sqlx::query_as::<_, InspectionRepairRow>(
-            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status,              b.location, b.version, b.placed_at, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              b.next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process p2 ON p2.id = b.next_process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND b.status = ANY($1)              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
+            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status,              b.location, b.version, b.current_process_step_id, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              LEFT JOIN t_process p2 ON p2.id = s2.process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND b.status = ANY($1)              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
         )
         .bind(statuses)
         .bind(keyword)
@@ -1357,7 +1500,7 @@ impl PartService {
                 status: r.status,
                 location: r.location,
                 version: r.version,
-                placed_at: r.placed_at,
+                current_process_step_id: r.current_process_step_id,
                 parent_batch_id: r.parent_batch_id,
                 current_holder_id: r.current_holder_id,
                 holder_name: r.holder_name,
@@ -1451,6 +1594,8 @@ impl PartService {
         }
         let new_batch_id = snowflake.next_id();
         let when = crate::infra::clock::now_naive();
+        // PR-3 批次 step 化：新批次继承源批次的 current_process_step_id；
+        // placed_at 列已删，不再传递。
         let new_id = PartBatchRepo::split_batch(
             &mut *conn,
             new_batch_id,
@@ -1461,8 +1606,7 @@ impl PartService {
             &batch.status,
             batch.location.as_deref(),
             batch.current_holder_id,
-            batch.next_process_id,
-            batch.placed_at,
+            batch.current_process_step_id,
             when,
             Some(current.id),
             Some(current.id),
@@ -1566,7 +1710,7 @@ impl PartService {
             AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在")
         })?;
         let rows: Vec<BatchListRow> = sqlx::query_as::<_, BatchListRow>(
-            "SELECT b.id AS id, b.batch_no, b.quantity, b.status, b.location,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              b.next_process_id, b.placed_at, b.delivery_note_id, b.parent_batch_id,              b.version              FROM t_part_batch b              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              WHERE b.part_id = $1 AND b.deleted_at IS NULL              ORDER BY b.batch_no ASC",
+            "SELECT b.id AS id, b.batch_no, b.quantity, b.status, b.location,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, b.current_process_step_id,              b.delivery_note_id, b.parent_batch_id,              b.version              FROM t_part_batch b              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              WHERE b.part_id = $1 AND b.deleted_at IS NULL              ORDER BY b.batch_no ASC",
         )
         .bind(part_id)
         .fetch_all(&mut *conn)
@@ -1581,8 +1725,11 @@ impl PartService {
                 location: r.location,
                 current_holder_id: r.current_holder_id,
                 holder_name: r.holder_name,
+                // 2026-09-16 PR-3 批次 step 化：next_process_id 由 step.process_id 派生；
+                // DTO 保留字段（兼容前端），但 PartBatchListItemOut 当前**总是 None**
+                // —— 见 dto_crud.rs 字段说明。如需该信息请前端改为读
+                // current_process_step_id 后端按需派生。
                 next_process_id: r.next_process_id,
-                placed_at: r.placed_at,
                 delivery_note_id: r.delivery_note_id,
                 parent_batch_id: r.parent_batch_id,
                 version: r.version,
@@ -2511,6 +2658,7 @@ impl PartService {
         }
         validate_shelf_zone(conn, req.shelf_id, "PRODUCTION").await?;
         // 翻状态：PENDING → IN_PROCESS+WORKER；IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER
+        // PR-3：保留 batch.current_process_step_id（pick-up 不改 step，只换 holder）
         let n = if from == PartStatus::PENDING {
             mark_batch_with_status_and_meta(
                 &mut *conn,
@@ -2519,15 +2667,15 @@ impl PartService {
                 "IN_PROCESS",
                 Some("WORKER"),
                 Some(req.worker_id),
-                batch.next_process_id,
+                batch.current_process_step_id,
                 current.id,
             )
             .await?
         } else {
             // IN_PROCESS：只翻 location+holder，status 保持 IN_PROCESS
+            // PR-3：删 placed_at 写入（列已删）
             sqlx::query(
                 "UPDATE t_part_batch SET location = 'WORKER', current_holder_id = $3, \
-                 placed_at = COALESCE(placed_at, now()), \
                  version = version + 1, updated_at = now(), updated_by = $4 \
                  WHERE id = $1 AND version = $2 AND status = 'IN_PROCESS' \
                    AND deleted_at IS NULL",
@@ -2670,14 +2818,16 @@ impl PartService {
         let shelf_filter = query.shelf_id;
         // 列：t_part_batch WHERE location=PRODUCTION_SHELF AND batch.next_process_id IN (工种→工序映射)
         let rows: Vec<(i64, String, String, i32, Option<i64>)> = sqlx::query_as(
-            "SELECT p.id, p.serial_no, p.drawing_no, b.quantity, b.next_process_id \
+            // PR-3：next_process_id 改读 step.process_id（JOIN t_process_chain_step）
+            "SELECT p.id, p.serial_no, p.drawing_no, b.quantity, s.process_id \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
-             JOIN t_work_type_process wtp ON wtp.process_id = b.next_process_id \
-             JOIN t_shelf s ON s.id = b.current_holder_id \
+             JOIN t_process_chain_step s ON s.id = b.current_process_step_id \
+             JOIN t_work_type_process wtp ON wtp.process_id = s.process_id \
+             JOIN t_shelf sh ON sh.id = b.current_holder_id \
              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL \
                AND b.status = 'IN_PROCESS' AND b.location = 'PRODUCTION_SHELF' \
-               AND s.is_active = true AND s.zone = 'PRODUCTION' \
+               AND sh.is_active = true AND sh.zone = 'PRODUCTION' \
                AND wtp.work_type_id = $1 \
                AND ($2::bigint IS NULL OR b.current_holder_id = $2) \
              ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, b.id ASC \
@@ -2725,11 +2875,12 @@ impl PartService {
             .collect();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM t_part_batch b \
-             JOIN t_work_type_process wtp ON wtp.process_id = b.next_process_id \
-             JOIN t_shelf s ON s.id = b.current_holder_id \
+             JOIN t_process_chain_step s ON s.id = b.current_process_step_id \
+             JOIN t_work_type_process wtp ON wtp.process_id = s.process_id \
+             JOIN t_shelf sh ON sh.id = b.current_holder_id \
              WHERE b.deleted_at IS NULL \
                AND b.status = 'IN_PROCESS' AND b.location = 'PRODUCTION_SHELF' \
-               AND s.is_active = true AND s.zone = 'PRODUCTION' \
+               AND sh.is_active = true AND sh.zone = 'PRODUCTION' \
                AND wtp.work_type_id = $1 \
                AND ($2::bigint IS NULL OR b.current_holder_id = $2)",
         )

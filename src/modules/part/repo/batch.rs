@@ -15,6 +15,13 @@
 //! `mark_part_failed_inspection` / `mark_part_returned` / `mark_part_delivered`
 //! / `mark_part_completed` / `mark_part_repairing`）—— 工单流转现在统一走
 //! `PartService::sync_from_batch_change` rollup，不直接写 `t_part`。
+//!
+//! 2026-09-16 PR-3 批次 step 化（migration 028）：
+//! - 所有 TPartBatch 投影删 `next_process_id` / `placed_at`，加 `current_process_step_id`
+//! - `mark_batch_failed_inspection` / `mark_batch_returned` 参数改：
+//!   - 旧：`next_process_id: i64`（写入 batch.next_process_id 列）
+//!   - 新：`current_process_step_id: Option<i64>`（写入 batch.current_process_step_id 列；
+//!     step_id 由 caller 在 phase1 service 中按 chain_id + process_id 解析后传入）
 
 use sqlx::{PgConnection, PgExecutor};
 
@@ -30,6 +37,8 @@ impl PartRepo {
     /// - `expected_batch_id = Some(bid)`：按 id 校验 ownership。
     ///
     /// 签名收 `&mut PgConnection`：方法在 `None` 分支需在同一事务内连发两条 SQL。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加 current_process_step_id。
     pub async fn find_inprocess_batch_for_part(
         conn: &mut PgConnection,
         part_id: i64,
@@ -40,7 +49,7 @@ impl PartRepo {
                 TPartBatch,
                 r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, next_process_id, placed_at,
+                       current_holder_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -70,7 +79,7 @@ impl PartRepo {
                         TPartBatch,
                         r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
-                               current_holder_id, next_process_id, placed_at,
+                               current_holder_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
@@ -90,6 +99,8 @@ impl PartRepo {
     }
 
     /// 定位 to-inspection 的目标批次（白名单 `{PENDING, PROGRAMMING, IN_PROCESS}`）。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加 current_process_step_id。
     pub async fn find_scan_target_batch(
         conn: &mut PgConnection,
         part_id: i64,
@@ -100,7 +111,7 @@ impl PartRepo {
                 TPartBatch,
                 r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, next_process_id, placed_at,
+                       current_holder_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -133,7 +144,7 @@ impl PartRepo {
                         TPartBatch,
                         r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
-                               current_holder_id, next_process_id, placed_at,
+                               current_holder_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
@@ -155,6 +166,8 @@ impl PartRepo {
     }
 
     /// 定位 to-process 的目标 INSPECTION 批次。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加 current_process_step_id。
     pub async fn find_inspection_batch_for_fail(
         conn: &mut PgConnection,
         part_id: i64,
@@ -165,7 +178,7 @@ impl PartRepo {
                 TPartBatch,
                 r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, next_process_id, placed_at,
+                       current_holder_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -195,7 +208,7 @@ impl PartRepo {
                         TPartBatch,
                         r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
-                               current_holder_id, next_process_id, placed_at,
+                               current_holder_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
@@ -237,6 +250,8 @@ impl PartRepo {
     ///
     /// 不存在或已软删 → `Ok(None)`，由 service 层映射
     /// `20109 BIZ_PART_BATCH_NOT_FOUND`。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加 current_process_step_id。
     pub async fn find_batch_by_id<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -245,10 +260,9 @@ impl PartRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, next_process_id, placed_at,
+                   current_holder_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
-                   version, created_at, created_by, updated_at, updated_by,
-                   deleted_at
+                   version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -300,6 +314,8 @@ impl PartRepo {
             SET status            = 'INSPECTION',
                 location          = 'INSPECTION_SHELF',
                 current_holder_id = $3,
+                -- 2026-09-16 PR-3：to_inspection 第一步保留 current_process_step_id
+                -- （即被打回的那一步，让 INSPECTION→to_process 时不丢 step 上下文）
                 version           = version + 1,
                 updated_at        = now(),
                 updated_by        = $4
@@ -318,31 +334,36 @@ impl PartRepo {
     }
 
     /// to-process：批次打回生产架（OCC UPDATE t_part_batch）。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
+    /// - 参数 `next_process_id: i64` 改 `current_process_step_id: Option<i64>`
+    /// - 写入列：t_part_batch.next_process_id（已删）→ t_part_batch.current_process_step_id
+    /// - step_id 由 phase1 service 在调用本函数前按 `chain_id + process_id` 解析后传入
     pub async fn mark_batch_failed_inspection<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
-        next_process_id: i64,
+        current_process_step_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query!(
             r#"
             UPDATE t_part_batch
-            SET status            = 'IN_PROCESS',
-                location          = 'PRODUCTION_SHELF',
-                current_holder_id = $3,
-                next_process_id   = $4,
-                version           = version + 1,
-                updated_at        = now(),
-                updated_by        = $5
+            SET status                  = 'IN_PROCESS',
+                location                = 'PRODUCTION_SHELF',
+                current_holder_id       = $3,
+                current_process_step_id = $4,
+                version                 = version + 1,
+                updated_at              = now(),
+                updated_by              = $5
             WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
               AND deleted_at IS NULL
             "#,
             batch_id,
             expected_version,
             shelf_id,
-            next_process_id,
+            current_process_step_id,
             current_user_id,
         )
         .execute(executor)
@@ -358,6 +379,8 @@ impl PartRepo {
     /// 0 行 / 不命中 → `Ok(None)`，由 service 层映射 `20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER`。
     ///
     /// 签名收 `&mut PgConnection`（同 `find_inprocess_batch_for_part`）。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加 current_process_step_id。
     pub async fn find_inprocess_batch_by_id_and_holder(
         conn: &mut PgConnection,
         batch_id: i64,
@@ -367,7 +390,7 @@ impl PartRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, next_process_id, placed_at,
+                   current_holder_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at
@@ -388,26 +411,30 @@ impl PartRepo {
     /// 0 行 → 40901 VERSION_CONFLICT / 状态非 IN_PROCESS / location 非 WORKER / 已软删
     ///   —— 由 service 层映射。
     /// 成功 → `current_holder_id = shelf_id`，`location = 'PRODUCTION_SHELF'`，
-    ///   `next_process_id = $4`，`version += 1`。
+    ///   `current_process_step_id = $4`，`version += 1`。
     ///
     /// `current_user_id` 写入 `updated_by`（nullable 与既有路径一致）。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
+    /// - 参数 `next_process_id: i64` 改 `current_process_step_id: Option<i64>`
+    /// - 写入列改为 t_part_batch.current_process_step_id
     pub async fn mark_batch_returned<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
-        next_process_id: i64,
+        current_process_step_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query!(
             r#"
             UPDATE t_part_batch
-            SET current_holder_id = $3,
-                location          = 'PRODUCTION_SHELF',
-                next_process_id   = $4,
-                version           = version + 1,
-                updated_at        = now(),
-                updated_by        = $5
+            SET current_holder_id       = $3,
+                location                = 'PRODUCTION_SHELF',
+                current_process_step_id = $4,
+                version                 = version + 1,
+                updated_at              = now(),
+                updated_by              = $5
             WHERE id = $1 AND version = $2
               AND status = 'IN_PROCESS' AND location = 'WORKER'
               AND deleted_at IS NULL
@@ -415,7 +442,7 @@ impl PartRepo {
             batch_id,
             expected_version,
             shelf_id,
-            next_process_id,
+            current_process_step_id,
             current_user_id,
         )
         .execute(executor)
@@ -437,6 +464,8 @@ impl PartRepo {
     ///
     /// 签名收 `&mut PgConnection`：方法在 `None` 分支需在同一事务内连发两条 SQL
     /// （COUNT + SELECT），与 `find_inprocess_batch_for_part` 同形。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加 current_process_step_id。
     pub async fn find_worker_held_batch_for_part(
         conn: &mut PgConnection,
         part_id: i64,
@@ -448,7 +477,7 @@ impl PartRepo {
                 TPartBatch,
                 r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, next_process_id, placed_at,
+                       current_holder_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -483,7 +512,7 @@ impl PartRepo {
                         TPartBatch,
                         r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
-                               current_holder_id, next_process_id, placed_at,
+                               current_holder_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
@@ -519,6 +548,10 @@ impl PartRepo {
     /// - `to_ship` / `to_process`：源 = `INSPECTION`，新 = `INSPECTION`
     /// - `to_inspection`：源 ∈ `{PENDING, PROGRAMMING, IN_PROCESS}`，新 = 源 status
     ///   （确保 `mark_batch_inspected` 的 WHERE 守卫能匹配新批次）
+    ///
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
+    /// - 删 `next_process_id` / `placed_at` 列写入
+    /// - 改传 `current_process_step_id`（新批次继承源批次 step 上下文）
     #[allow(clippy::too_many_arguments)]
     pub async fn split_batch_for_partial_pass(
         conn: &mut PgConnection,
@@ -543,18 +576,17 @@ impl PartRepo {
         .await?;
 
         // 2. INSERT 新批次（quantity = split_quantity，status = new_batch_status）
-        //    2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
-        //    `has_been_repaired` 列，INSERT...SELECT 同步删该列。
+        //    2026-09-16 PR-3 批次 step 化：current_process_step_id 继承源批次。
         sqlx::query!(
             r#"
             INSERT INTO t_part_batch (
                 id, part_id, batch_no, quantity, status, location,
-                current_holder_id, next_process_id, placed_at,
+                current_holder_id, current_process_step_id,
                 delivery_note_id, parent_batch_id,
                 version, created_at, created_by, updated_at, updated_by
             )
             SELECT $1, part_id, $2, $3, $7, location,
-                   current_holder_id, next_process_id, placed_at,
+                   current_holder_id, current_process_step_id,
                    NULL, $4,
                    0, now(), $5, now(), $5
             FROM t_part_batch

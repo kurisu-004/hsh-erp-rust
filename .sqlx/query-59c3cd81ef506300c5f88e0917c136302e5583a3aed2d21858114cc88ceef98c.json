@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part_batch\n            SET status            = 'INSPECTION',\n                location          = 'INSPECTION_SHELF',\n                current_holder_id = $3,\n                -- 2026-09-16 PR-3：to_inspection 第一步保留 current_process_step_id\n                -- （即被打回的那一步，让 INSPECTION→to_process 时不丢 step 上下文）\n                version           = version + 1,\n                updated_at        = now(),\n                updated_by        = $4\n            WHERE id = $1 AND version = $2\n              AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')\n              AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "59c3cd81ef506300c5f88e0917c136302e5583a3aed2d21858114cc88ceef98c"
+}

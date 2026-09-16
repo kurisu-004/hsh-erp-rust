@@ -326,8 +326,10 @@ WS 广播（commit 后下发）：
 | `shelf_name` | string | 当前货架名 |
 | `is_urgent` | bool | 是否加急（取自 t_part.is_urgent） |
 | `note` | string? | 工单级备注（t_part.note，DB 无 batch 级 remark 字段；复用） |
-| `placed_at` | datetime | 批次上架时间（t_part_batch.placed_at）—— 用于前端展示「积压多久」 |
 | `version` | i32 | 乐观锁 |
+
+> **2026-09-16 PR-3 字段下线**：`placed_at` 字段已移除（t_part_batch 列已删）。
+> 前端如需展示积压时长，由前端按 `PICKED_UP` 事件 `created_at` 自派生；或后端后续补字段。
 
 ### WorkerBrief 字段
 

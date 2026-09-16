@@ -24,6 +24,7 @@ use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::modules::process::repo::ProcessRepo;
+use crate::modules::process_chain::repo::ProcessChainRepo;
 use crate::modules::work_type::repo::WorkTypeRepo;
 use crate::modules::worker::repo::WorkerRepo;
 use crate::shared::error::{code, AppError};
@@ -220,13 +221,16 @@ impl WorkerPoolService {
 
         let mut pool_count_by_process = Vec::with_capacity(process_ids.len());
         for pid in &process_ids {
+            // PR-3 批次 step 化：next_process_id 列已删，JOIN step 取 process_id
             let n: i64 = sqlx::query_scalar!(
                 r#"SELECT COUNT(*) AS "n!" FROM t_part_batch pb
+                JOIN t_process_chain_step s ON s.id = pb.current_process_step_id
                 WHERE pb.status = 'IN_PROCESS'
                   AND pb.location = 'PRODUCTION_SHELF'
                   AND pb.current_holder_id = $1
-                  AND pb.next_process_id = $2
-                  AND pb.deleted_at IS NULL"#,
+                  AND s.process_id = $2
+                  AND pb.deleted_at IS NULL
+                  AND s.deleted_at IS NULL"#,
                 shelf_id,
                 pid
             )
@@ -296,10 +300,31 @@ impl WorkerPoolService {
                 ),
             )
         })?;
-        // 3. 切 holder 到 shelf + 改 next_process_id（OCC，batch 级）
-        let batch_rows =
-            PartRepo::mark_batch_returned(&mut *conn, batch.id, batch.version, req.shelf_id,
-                req.next_process_id, Some(current.id)).await?;
+        // 3. 切 holder 到 shelf + 改 current_process_step_id（OCC，batch 级）
+        //    PR-3 批次 step 化：admin_remove 路径下 step_id 由 caller
+        //    （前端 admin UI）解析或由 service 兜底；这里先按 process_id
+        //    查 chain step（admin_remove 前要求 part 已绑定链）
+        let chain_id_opt: Option<i64> = sqlx::query_scalar(
+            "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(batch.part_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let step_id_opt: Option<i64> = if let Some(chain_id) = chain_id_opt {
+            ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, req.next_process_id)
+                .await?
+        } else {
+            None
+        };
+        let batch_rows = PartRepo::mark_batch_returned(
+            &mut *conn,
+            batch.id,
+            batch.version,
+            req.shelf_id,
+            step_id_opt,
+            Some(current.id),
+        )
+        .await?;
         if batch_rows == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -698,8 +723,9 @@ impl WorkerPoolService {
             ));
         }
 
-        // 3. 可选 process_id 校验：若 req.process_id 提供，校验 batch.next_process_id
-        //    必须匹配（防止工人对未排到该工序的批做 assign）。
+        // 3. 可选 process_id 校验：若 req.process_id 提供，校验 batch 当前
+        //    step.process_id 必须匹配（PR-3 批次 step 化：原 batch.next_process_id
+        //    列已删，改为读 step.process_id；防止工人对未排到该工序的批做 assign）。
         if let Some(pid) = req.process_id {
             let batch = PartBatchRepo::get_by_id(&mut *conn, req.batch_id, false)
                 .await?
@@ -709,14 +735,27 @@ impl WorkerPoolService {
                         format!("batch {} 不存在", req.batch_id),
                     )
                 })?;
-            match batch.next_process_id {
-                Some(bpid) if bpid == pid => {}
+            // 解析 step.process_id（一次单行 SELECT）
+            let step_process_id: Option<i64> = if let Some(step_id) = batch.current_process_step_id
+            {
+                sqlx::query_scalar(
+                    "SELECT process_id FROM t_process_chain_step \
+                     WHERE id = $1 AND deleted_at IS NULL",
+                )
+                .bind(step_id)
+                .fetch_optional(&mut *conn)
+                .await?
+            } else {
+                None
+            };
+            match step_process_id {
+                Some(spid) if spid == pid => {}
                 _ => {
                     return Err(AppError::biz(
                         code::BIZ_INVALID_VALUE,
                         format!(
-                            "batch {} next_process_id={:?} 与 request process_id={} 不匹配",
-                            req.batch_id, batch.next_process_id, pid
+                            "batch {} 当前 step.process_id={:?} 与 request process_id={} 不匹配",
+                            req.batch_id, step_process_id, pid
                         ),
                     ));
                 }

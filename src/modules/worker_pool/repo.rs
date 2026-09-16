@@ -34,6 +34,8 @@ struct TakenRow {
 /// `list_candidates_by_process_all_shelves` 行结构（JOIN 5 表后的扁平投影）。
 ///
 /// 排序：system_delivery_date ASC NULLS LAST → planned_delivery_date → is_urgent DESC → id ASC。
+///
+/// 2026-09-16 PR-3 批次 step 化：删 `placed_at`（t_part_batch 列已删）。
 #[derive(Debug, sqlx::FromRow)]
 #[allow(dead_code)]
 struct CandidateRow {
@@ -43,7 +45,6 @@ struct CandidateRow {
     batch_no: i32,
     quantity: i32,
     location: String,
-    placed_at: chrono::NaiveDateTime,
     batch_version: i32,
     // —— t_part ——
     serial_no: Option<String>,
@@ -104,12 +105,16 @@ impl WorkerPoolRepo {
                 SELECT pb.id, pb.version, pb.part_id
                 FROM t_part_batch pb
                 JOIN t_part p ON p.id = pb.part_id
+                -- 2026-09-16 PR-3 批次 step 化：next_process_id 列已删，
+                -- 改为 JOIN t_process_chain_step s 取 process_id
+                JOIN t_process_chain_step s ON s.id = pb.current_process_step_id
                 WHERE pb.status = 'IN_PROCESS'
                   AND pb.location = 'PRODUCTION_SHELF'
                   AND pb.current_holder_id = $2
-                  AND pb.next_process_id = ANY($3)
+                  AND s.process_id = ANY($3)
                   AND pb.deleted_at IS NULL
                   AND p.deleted_at IS NULL
+                  AND s.deleted_at IS NULL
                   AND (SELECT n FROM held) < (SELECT max_held FROM max_batches)
                 ORDER BY
                     p.system_delivery_date ASC NULLS LAST,
@@ -278,7 +283,6 @@ impl WorkerPoolRepo {
                 pb.batch_no AS "batch_no!",
                 pb.quantity AS "quantity!",
                 pb.location AS "location!",
-                pb.placed_at AS "placed_at!",
                 pb.version AS "batch_version!",
                 p.serial_no AS "serial_no?",
                 p.name AS "name!",
@@ -299,11 +303,14 @@ impl WorkerPoolRepo {
             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL
             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL
             JOIN t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL
+            -- 2026-09-16 PR-3 批次 step 化：JOIN step 取 process_id（替代列）
+            JOIN t_process_chain_step s2 ON s2.id = pb.current_process_step_id
             WHERE pb.status = 'IN_PROCESS'
               AND pb.location = 'PRODUCTION_SHELF'
-              AND pb.next_process_id = $1
+              AND s2.process_id = $1
               AND pb.deleted_at IS NULL
               AND p.deleted_at IS NULL
+              AND s2.deleted_at IS NULL
             ORDER BY
                 p.system_delivery_date ASC NULLS LAST,
                 p.planned_delivery_date ASC NULLS LAST,
@@ -344,7 +351,7 @@ impl WorkerPoolRepo {
                     shelf_name: r.shelf_name,
                     is_urgent: r.is_urgent,
                     note: r.note,
-                    placed_at: r.placed_at,
+                    // PR-3 批次 step 化：placed_at 列已删，不再展示
                     version: r.batch_version,
                 }
             })

@@ -87,8 +87,9 @@ async fn seed_delivered_batch(
     let today = now.date();
     let part_id = snowflake.next_id();
     // 2026-09-16 PR-2（migration 027）：t_part 删 `actual_delivery_date` /
-    // `has_been_repaired`；实际交付日期真相源改为 t_part_event.DELIVERED 事件
-    // （auto_complete 阈值判定走 batch.placed_at，未受影响）。
+    // `has_been_repaired`；实际交付日期真相源改为 t_part_event.DELIVERED 事件。
+    // 2026-09-16 PR-3（migration 028）：t_part_batch 删 `placed_at`；auto_complete
+    // 阈值同步改走 DELIVERED 事件 created_at（与 Python `_run_once` 口径对齐）。
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, \
@@ -105,21 +106,36 @@ async fn seed_delivered_batch(
     .await
     .expect("insert part");
 
-    let placed_at = now - ChronoDuration::days(placed_days_ago);
+    // 2026-09-16 PR-3 批次 step 化：t_part_batch 删 `placed_at` 列；
+    // auto_complete 阈值改读 t_part_event DELIVERED 事件 created_at（与 Python 口径对齐）。
+    // 本 helper 改为同步插入一条 DELIVERED 事件，created_at = placed_at 旧值。
+    let delivered_event_at = now - ChronoDuration::days(placed_days_ago);
     let batch_id = snowflake.next_id();
-    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`。
     sqlx::query(
-        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, placed_at, \
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
          version, created_at, updated_at) \
-         VALUES ($1, $2, 1, 1, 'DELIVERED', $3, 0, $4, $4)",
+         VALUES ($1, $2, 1, 1, 'DELIVERED', 0, $3, $3)",
     )
     .bind(batch_id)
     .bind(part_id)
-    .bind(placed_at)
     .bind(now)
     .execute(pool)
     .await
     .expect("insert batch");
+    // 同步插入 DELIVERED 事件（PR-3 新口径：auto_complete 按事件 created_at 判定）
+    let event_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_event (id, part_id, batch_id, event_type, \
+         from_status, to_status, quantity, created_at, created_by) \
+         VALUES ($1, $2, $3, 'DELIVERED', 'READY_TO_SHIP', 'DELIVERED', 1, $4, NULL)",
+    )
+    .bind(event_id)
+    .bind(part_id)
+    .bind(batch_id)
+    .bind(delivered_event_at)
+    .execute(pool)
+    .await
+    .expect("insert DELIVERED event");
 
     (part_id, batch_id)
 }

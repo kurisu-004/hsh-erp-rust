@@ -29,7 +29,8 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{add_role, clean_business_db, clean_db, insert_user_with_password, link_shelf_to_process, seed_process, test_app, test_pool, test_state};
+use common::{
+    create_chain_for_part, create_step,add_role, clean_business_db, clean_db, insert_user_with_password, link_shelf_to_process, seed_process, test_app, test_pool, test_state};
 
 use helpers::*;
 
@@ -109,6 +110,9 @@ async fn place_on_shelf_happy_path() {
     let version = batch_version(&pool, bid).await;
     let prod_shelf = common::insert_shelf(&pool, "P-001", "生产架A", "PRODUCTION").await;
     let proc_id = seed_process(&pool, "PROC-A", "工序A").await;
+    // PR-3: 建链并绑 part
+    let chain_id = create_chain_for_part(&pool, pid).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     link_shelf_to_process(&pool, prod_shelf, proc_id).await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
@@ -137,6 +141,9 @@ async fn place_on_shelf_rbac_clerk_ok() {
     let version = batch_version(&pool, bid).await;
     let prod_shelf = common::insert_shelf(&pool, "P-002", "生产架B", "PRODUCTION").await;
     let proc_id = seed_process(&pool, "PROC-C", "工序C").await;
+    // PR-3: 建链并绑 part
+    let chain_id = create_chain_for_part(&pool, pid).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     link_shelf_to_process(&pool, prod_shelf, proc_id).await;
     let (app, token, _pool) = login_clerk(pool, "clerk1").await;
     let body = json!({
@@ -165,6 +172,9 @@ async fn place_on_shelf_invalid_transition_rejects() {
     let version = batch_version(&pool, bid).await;
     let prod_shelf = common::insert_shelf(&pool, "P-003", "生产架C", "PRODUCTION").await;
     let proc_id = seed_process(&pool, "PROC-D", "工序D").await;
+    // PR-3: 建链并绑 part
+    let chain_id = create_chain_for_part(&pool, pid).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     link_shelf_to_process(&pool, prod_shelf, proc_id).await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
@@ -193,6 +203,9 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
     let prod_shelf = common::insert_shelf(&pool, "P-004", "生产架D", "PRODUCTION").await;
     // 不创建映射 → 20507 BIZ_SHELF_PROCESS_NOT_MAPPED
     let proc_id = seed_process(&pool, "PROC-E", "工序E").await;
+    // PR-3: 建链并绑 part
+    let chain_id = create_chain_for_part(&pool, pid).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),
@@ -275,6 +288,9 @@ async fn release_from_programming_happy_path() {
     let version = batch_version(&pool, bid).await;
     let prod_shelf = common::insert_shelf(&pool, "P-005", "生产架E", "PRODUCTION").await;
     let proc_id = seed_process(&pool, "PROC-F", "工序F").await;
+    // PR-3: 建链并绑 part
+    let chain_id = create_chain_for_part(&pool, pid).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     link_shelf_to_process(&pool, prod_shelf, proc_id).await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
@@ -302,6 +318,9 @@ async fn release_from_programming_rbac_inspector_rejects() {
     let version = batch_version(&pool, bid).await;
     let prod_shelf = common::insert_shelf(&pool, "P-006", "生产架F", "PRODUCTION").await;
     let proc_id = seed_process(&pool, "PROC-G", "工序G").await;
+    // PR-3: 建链并绑 part
+    let chain_id = create_chain_for_part(&pool, pid).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     link_shelf_to_process(&pool, prod_shelf, proc_id).await;
     let (app, token, _pool) = login_inspector(pool, "insp1").await;
     let body = json!({

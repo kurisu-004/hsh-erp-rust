@@ -11,6 +11,13 @@
 //!
 //! ## 串行化
 //! 进程级 `tokio::sync::Mutex` + `--test-threads=1` 双保险。
+//!
+//! ## clippy allow
+//! 2026-09-16 PR-3：fixture helper（`insert_pool_part` / `insert_work_type` /
+//! `insert_worker` / `insert_l2_customer` 等）走 `pool_snowflake().lock()` 跨 .await
+//! 持锁模式，与 common/ + worker_pool_api.rs 一致；`unused_imports` 是顶层
+//! `use SnowflakeIdGenerator` 仅作类型签名引用。
+#![allow(clippy::await_holding_lock, unused_imports)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -25,7 +32,6 @@ use common::{
     add_role, insert_user_with_password, link_shelf_to_process, link_work_type_to_process,
     seed_process, test_app, test_state,
 };
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
 //  全局串行化 + HTTP helpers
@@ -98,12 +104,6 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, P
 //  worker-pool auto_allocate fixture helpers
 // ===========================================================================
 
-fn pool_snowflake() -> &'static SnowflakeIdGenerator {
-    use std::sync::OnceLock;
-    static S: OnceLock<SnowflakeIdGenerator> = OnceLock::new();
-    S.get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
-}
-
 async fn insert_work_type(
     pool: &PgPool,
     code: &str,
@@ -112,7 +112,7 @@ async fn insert_work_type(
     max_held_minutes: Option<i32>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -139,7 +139,7 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -160,7 +160,7 @@ async fn insert_worker(
 
 async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     let one_char: String = prefix.chars().next().unwrap_or('X').to_ascii_uppercase().to_string();
@@ -190,43 +190,67 @@ async fn insert_pool_part(
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     let today = now.date();
-    let part_id = pool_snowflake().next_id();
-    // 2026-09-16 PR-2（migration 027）：t_part 删 `location` / `current_holder_id` /
-    // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）。
-    // INSERT 列名与 VALUES 占位符同步移除：'PRODUCTION_SHELF'、$5（shelf_id）、
-    // $3（now 用作 placed_at）。剩余字段顺序对齐列名清单。
+    let part_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
+    // 且 batch 持有 current_process_step_id（worker.match 走 step.process_id）。
+    // helper 现在多走两步：建链 → 建 step → INSERT part/batch。
+    let chain_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    sqlx::query!(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, $3, 0, $3, 0)",
+        chain_id,
+        format!("chain-{serial_no}"),
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    let step_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    sqlx::query!(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, $3, 30, 0, $4, 0, $4, 0)",
+        step_id,
+        chain_id,
+        process_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain step");
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
          request_date, planned_delivery_date, system_delivery_date, status, \
          is_urgent, next_process_id, customer_id, \
-         quantity, version, created_at, updated_at) \
+         quantity, version, created_at, updated_at, process_chain_id) \
          VALUES ($1, $2, 'pool-item', 'D-POOL', $2, $4, $4, $4, 'IN_PROCESS', \
-         false, $5, $6, $7, 0, $3, $3)",
+         false, $3, $5, $6, 0, $7, $7, $8)",
         part_id,
         serial_no,
-        now,
-        today,
         process_id,
+        today,
         customer_id,
         quantity,
+        now,
+        chain_id,
     )
     .execute(pool)
     .await
     .expect("insert t_part");
-    let batch_id = pool_snowflake().next_id();
-    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
-    // 列名与 VALUES 占位符同步移除 `false` 字面量。`location` / `current_holder_id`
-    // / `next_process_id` / `placed_at` 仍存在 t_part_batch（真相源），保留。
+    let batch_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
+    // 改为 `current_process_step_id`。worker_pool 候选池匹配改为
+    // `s.process_id = ANY(worker.process_ids)`（JOIN t_process_chain_step）。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, next_process_id, placed_at, version, \
+         current_holder_id, current_process_step_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, 0, $6, $6)",
         batch_id,
         part_id,
         quantity,
         shelf_id,
-        process_id,
+        step_id,
         now,
     )
     .execute(pool)
