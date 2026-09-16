@@ -49,6 +49,11 @@ pub struct StsCredential {
 /// - `owner_kind`：域标识（如 `"part"` / `"assembly"` / `"outsource"`）
 /// - `owner_id`：业务表雪花 ID（用 `i64` 而非 string，避免 string 转换）
 /// - `kind`：文件类型标识（如 `"drawing"` / `"cnc_program"`）
+///
+/// 2026-09-16 M2-B 新增 `issue_for_intents(tmp_sub_prefix)`：批量预生成场景（场景 A
+/// batch_uuid / 场景 B owner_part_id）使用。caller 在调用方拼好 `{prefix}{scope}/`
+/// （不带 kind），policy resource 覆盖整 tmp_sub_prefix 下所有 kind + 文件
+/// （PUT / 分片上传 / Abort 一律允许）。
 #[async_trait]
 pub trait StsCredentialIssuer: Send + Sync {
     async fn issue(
@@ -57,6 +62,13 @@ pub trait StsCredentialIssuer: Send + Sync {
         owner_id: i64,
         kind: &str,
     ) -> Result<StsCredential, AppError>;
+
+    /// 2026-09-16 M2-B 新增：批量场景签发（upload-intents 端点用）。
+    ///
+    /// `tmp_sub_prefix`：caller 拼好的 tmp 前缀（不含 kind），policy 覆盖 `tmp_sub_prefix/*`。
+    /// 例：场景 A batch_uuid=`abc-...` → `tmp/abc-...`；场景 B owner_part_id=`123`
+    /// → `tmp/part/123`（多 kind 共享）。
+    async fn issue_for_intents(&self, tmp_sub_prefix: &str) -> Result<StsCredential, AppError>;
 }
 
 /// 真实 STS 凭证签发器（包装 `cos_rust_sdk::sts::StsClient`）。
@@ -160,6 +172,63 @@ impl StsCredentialIssuer for TencentSts {
             tmp_prefix: full_prefix,
         })
     }
+
+    /// 2026-09-16 M2-B 新增：批量场景 STS 凭证签发。
+    ///
+    /// 与 `issue` 形态一致，但 policy resource 直接覆盖 caller 拼好的 `tmp_sub_prefix/*`
+    /// —— 同一凭证支持上传多 kind 文件（场景 A 批量创建 / 场景 B 单 part 多文件）。
+    async fn issue_for_intents(&self, tmp_sub_prefix: &str) -> Result<StsCredential, AppError> {
+        // 1. 规范化 prefix：补尾斜杠，避免 resource 与 SDK 默认格式差一截 `/`
+        let full_prefix = if tmp_sub_prefix.ends_with('/') {
+            tmp_sub_prefix.to_string()
+        } else {
+            format!("{tmp_sub_prefix}/")
+        };
+
+        // 2. 构造 policy：默认 PutObject 系 actions + 追加 AbortMultipartUpload
+        //    （policy actions 与 `issue` 完全一致，区别仅在 resource 覆盖范围）
+        let mut policy = Policy::allow_put_object(&self.bucket, Some(&full_prefix));
+        if let Some(stmt) = policy.statement.first_mut() {
+            stmt.action
+                .push("name/cos:AbortMultipartUpload".to_string());
+        }
+
+        // 3. 调 SDK `get_credentials`
+        let creds = self
+            .inner
+            .get_credentials(GetCredentialsRequest {
+                policy,
+                name: Some(format!("hsh-erp-intents-{full_prefix}")),
+                duration_seconds: Some(self.duration_seconds),
+            })
+            .await
+            .map_err(|e| {
+                AppError::biz(
+                    code::BIZ_STS_ISSUE_FAILED,
+                    format!("STS get_credentials 失败: {e}"),
+                )
+            })?;
+
+        // 4. expired_time 缺省回退
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let expired_time = creds
+            .expired_time
+            .map(|e| e as i64)
+            .unwrap_or_else(|| now + self.duration_seconds as i64);
+
+        Ok(StsCredential {
+            tmp_secret_id: creds.tmp_secret_id,
+            tmp_secret_key: creds.tmp_secret_key,
+            session_token: creds.token,
+            expired_time,
+            bucket: self.bucket.clone(),
+            region: self.region.clone(),
+            tmp_prefix: full_prefix,
+        })
+    }
 }
 
 /// `COS_ENABLED=false` 时的占位实现（与 `NoopCos` 对偶）：返回合法结构体 + 长过期时间，
@@ -178,6 +247,30 @@ impl StsCredentialIssuer for NoopSts {
         kind: &str,
     ) -> Result<StsCredential, AppError> {
         let full_prefix = format!("tmp/{owner_kind}/{owner_id}/{kind}/");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Ok(StsCredential {
+            tmp_secret_id: "AKIDnoop".to_string(),
+            tmp_secret_key: "noop".to_string(),
+            session_token: "noop-token".to_string(),
+            expired_time: now + 3600,
+            bucket: "noop-bucket".to_string(),
+            region: "ap-shanghai".to_string(),
+            tmp_prefix: full_prefix,
+        })
+    }
+
+    /// 2026-09-16 M2-B 新增：批量场景 STS 凭证签发（Noop 占位实现）。
+    ///
+    /// `tmp_sub_prefix` 不强制要求 caller 补尾斜杠；NoopSts 内部规范化。
+    async fn issue_for_intents(&self, tmp_sub_prefix: &str) -> Result<StsCredential, AppError> {
+        let full_prefix = if tmp_sub_prefix.ends_with('/') {
+            tmp_sub_prefix.to_string()
+        } else {
+            format!("{tmp_sub_prefix}/")
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -280,5 +373,27 @@ mod tests {
         assert_eq!(cred.tmp_prefix, "tmp/part/123/drawing/");
         assert!(cred.expired_time > 0);
         // NoopSts 不报 INTERNAL/INTERNAL_SERVER_ERROR 类的错误
+    }
+
+    /// 2026-09-16 M2-B 新增：NoopSts::issue_for_intents 规范化 tmp_sub_prefix 尾斜杠
+    /// 并返回合法占位凭证。prefix 自动补齐的逻辑与 TencentSts 实现一致。
+    #[tokio::test]
+    async fn noop_sts_issue_for_intents_normalizes_trailing_slash() {
+        let issuer = NoopSts;
+
+        // 不带尾斜杠：自动补
+        let cred = issuer
+            .issue_for_intents("tmp/batch-uuid")
+            .await
+            .expect("NoopSts 不抛错");
+        assert_eq!(cred.tmp_prefix, "tmp/batch-uuid/");
+        assert!(cred.expired_time > 0);
+
+        // 已带尾斜杠：原样
+        let cred2 = issuer
+            .issue_for_intents("tmp/part/123/")
+            .await
+            .expect("NoopSts 不抛错");
+        assert_eq!(cred2.tmp_prefix, "tmp/part/123/");
     }
 }

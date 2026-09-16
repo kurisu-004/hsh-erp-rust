@@ -104,6 +104,10 @@ tokio-stream = "0.1"
 # （SDK 0.1.2 未暴露该接口，spike 已验证签名/编码规则）。rustls-tls 避免拖入 OpenSSL。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
+# 2026-09-16 M2-B 新增：upload-intents batch_uuid 派生。v4 随机 UUID
+# （场景 A 批量预生成 tmp 前缀，避免与场景 B 已有 part 的 tmp_key 撞前缀）。
+uuid = { version = "1", features = ["v4"] }
+
 [dev-dependencies]
 # 集成测试用 tower::ServiceExt::oneshot 直接驱动 Router。
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。
