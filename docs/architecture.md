@@ -421,8 +421,28 @@ SQLX_OFFLINE=true cargo build --release
 ### 7.4 数据库迁移
 
 22 个 SQL 文件，最新 `20260914100000_022_create_e2e_seeded_table.sql`（2026-09-14）。
+后续 2026-09-16/17 追加 7 个：023-029（含 PR-1 工艺链 FK 翻转 026 + PR-2 t_part 瘦身 027 + PR-3 批次 step 化 028 + PR-4 索引补齐 + 孤儿序列清理 029）。迁移最新编号：`20260916140000_029_add_missing_indexes_and_drop_orphan_seq.sql`。
 
 迁移命名：`<13位时间戳>_<顺序>_<描述>.sql`，详见 `migrations/README.md`。
+
+### 7.5 2026-09-17 重大重构（PR-1/2/3/4 串联）
+
+2026-09-16/17 完成 3 项重大重构 + 1 项卫生项，工艺链 / 工单 / 批次数据模型均经历结构调整：
+
+| PR | migration | 核心改动 | 关键端点 / 错误码 |
+|---|---|---|---|
+| **PR-1**（2026-09-16） | 026 | 工艺链 FK 翻转：`t_part_process_chain` 删 `part_id`，`t_part` 加 `process_chain_id`（1:1 binding） | 新增 `GET /api/v2/process-chains/{chain_id}`；新增错误码 `20705 BIZ_PROCESS_CHAIN_PART_NOT_PENDING`（part 非 PENDING 禁 PUT 工艺链） |
+| **PR-2**（2026-09-16） | 027 | t_part 瘦身：删 `actual_delivery_date` / `location` / `current_holder_id` / `placed_at` / `delivery_note_id` / `has_been_repaired` 6 列（真相源迁至 `t_part_batch`）；t_part_batch 删 `has_been_repaired`；t_assembly 删 `actual_delivery_date` | 前端 `PartListItem` 加 `location` / `holder_name` 派生字段（service 层 min-progress 活跃批次派生） |
+| **PR-3**（2026-09-16/17） | 028 | 批次 step 化：`t_part_batch.next_process_id` → `current_process_step_id`（逻辑 FK → t_process_chain_step.id）；删 `placed_at` | 新增错误码 `20706 BIZ_PROCESS_CHAIN_REQUIRED`（to_process / place_on_shelf / send_to_outsource 等"进入生产流"端点要求 part 已绑链）；`PartListItem.next_process_name` 派生 |
+| **PR-4**（2026-09-17） | 029 | 卫生项：B1 补 3 索引（`ix_t_part_batch_parent_batch_id` / `ix_t_part_system_delivery_date` / `ix_t_assembly_name`）；B4 清理孤儿 `t_assembly_id_seq` | A1 工序软删守卫补 `t_process_chain_step` 引用计数；A2 `GET /parts` 加 `locations` / `holder_ids` 过滤参数；B2 split_batch 公共函数合并；B3 `TAssembly.request_date` / `planned_delivery_date` 与 DDL NOT NULL 对齐去 Option |
+
+跨 PR 联动要点：
+- **「下一步工序」概念统一**：part → chain → step 是新工艺引用通道（PR-1 翻转）；batch 持有 `current_process_step_id`（PR-3 替换 `next_process_id` 列）；service 层按 `min-progress 活跃 batch.current_process_step_id JOIN step.process_id` 派生 `PartListItem.next_process_name`（PR-3）
+- **「位置 / 持有人」统一派生**：t_part 已无 location / current_holder_id 列（PR-2 删），service 层从 t_part_batch 派生（PR-2 列表 + PR-4 locations/holder_ids 过滤）
+- **「实际交付日期」统一派生**：t_part / t_assembly 已无 actual_delivery_date 列（PR-2 删），statistics 域统一查 `t_part_event.event_type='DELIVERED'`
+- **「返修事实」统一派生**：t_part / t_part_batch 已无 has_been_repaired 列（PR-2 删），由 `t_part_event.event_type='REPAIR_STARTED'` + `t_part_batch.status='REPAIRING'` 体现
+
+详细修复路线图见 [`docs/audit-5-tables-2026-09-16.md`](audit-5-tables-2026-09-16.md) §附录。
 
 ---
 

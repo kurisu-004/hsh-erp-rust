@@ -174,6 +174,11 @@ Request：`AssemblyUpdateRequest` — 字段全部可选（缺省 = DB 不动）
 > 2026-09-16 PR-2（migration 027）：`AssemblyUpdateRequest` 删 `actual_delivery_date`
 > 入参 —— `t_assembly.actual_delivery_date` 列已删；实际交付日期由
 > `t_part_event.event_type='DELIVERED'` 事件派生（子件批次交付事件体现）。
+>
+> 2026-09-17 PR-4：`request_date` / `planned_delivery_date` 在 DDL 是 NOT NULL
+> （migration 005:20-21），DTO 沿用三态语义（`Option<Option<NaiveDate>>`）保留
+> 兼容；service 层遇 `Some(None)` 改判 `20104 BIZ_INVALID_VALUE`（`t_assembly`
+> 模型与 DDL 对齐后两字段已非 `Option<>`）。
 | `quantity` | i32? | — | |
 | `unit_price` | decimal? (三态) | — | `None` / `Some(null)` / `Some(0.5)` |
 | `total_price` | decimal? (三态) | — | 同上 |
@@ -284,8 +289,9 @@ pub struct AssemblyOut {
     pub applicant_name: Option<String>,
     #[serde(serialize_with = "serialize_i64")]
     pub customer_id: i64,
-    pub request_date: Option<NaiveDate>,
-    pub planned_delivery_date: Option<NaiveDate>,
+    // 2026-09-17 PR-4：request_date / planned_delivery_date 与 DDL NOT NULL 对齐去 Option
+    pub request_date: NaiveDate,
+    pub planned_delivery_date: NaiveDate,
     // 2026-09-16 PR-2（migration 027）：删 `actual_delivery_date` —— 由
     // t_part_event.event_type='DELIVERED' 派生（PR-2 § assembly/dto.rs:141）。
     pub is_urgent: bool,

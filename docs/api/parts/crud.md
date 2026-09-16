@@ -34,6 +34,8 @@ Query：
 | `statuses` | string? | 多状态过滤，逗号分隔（如 `PENDING,READY_TO_SHIP`） |
 | `is_urgent` | bool? | 紧急标记过滤 |
 | `keyword` | string? | 模糊匹配 `name` / `drawing_no` / `serial_no` |
+| `locations` | string? | 2026-09-17 PR-4 新增。位置白名单，逗号分隔（`OFFICE` / `PRODUCTION_SHELF` / `WORKER` / `INSPECTION_SHELF` / `OUTSOURCE_COMPANY`），查 `t_part_batch.location`（多态批次的 `location` 字段） |
+| `holder_ids` | string? | 2026-09-17 PR-4 新增。持有人 ID 列表，逗号分隔雪花字符串（多态：t_shelf / t_worker / t_outsource_company 任一表匹配同雪花 id 即命中）；查 `t_part_batch.current_holder_id`。非法雪花 ID → `40001 VALIDATION_ERROR`（422） |
 | `sort_by` | string? | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它退化为 `CREATED_AT` |
 | `sort_dir` | string? | `ASC` / `DESC`（缺省 `DESC`） |
 | `limit` | int? | 1..=200（缺省 50） |

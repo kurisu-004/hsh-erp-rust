@@ -779,8 +779,9 @@ pub struct BatchToXxxOut {
 
 // `PartOut` 字段集与 `model::TPartInspected` 完全对齐：
 // id (i64 string) / serial_no / name / drawing_no / status / version /
-// quantity / order_no / actual_delivery_date / updated_at / updated_by
-// （详见 [`./index.md`](./index.md#partout-字段)）
+// quantity / order_no / updated_at / updated_by
+// （详见 [`./index.md`](./index.md#partout-字段)；
+// 2026-09-16 PR-2 删 `actual_delivery_date`，由 t_part_event DELIVERED 事件派生）
 ```
 
 ---

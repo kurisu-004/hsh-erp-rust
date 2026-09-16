@@ -4,6 +4,11 @@
 
 **读者**：所有向 `src/` 提交代码的人（含 Claude Code / 其他 AI 助手）。**目标**：让任何新人只看注释与本规约，就能把每个 `pub` 项在业务里的角色、对接的 Python 文件、隐藏的坑搞清楚。
 
+> 📌 **2026-09-17 PR-1/2/3/4 串联重大重构**：
+> - **字段命名约定**：part → chain → step 是新工艺引用通道（PR-1 翻转 + PR-3 批次 step 化）。`PartListItem.next_process_name` / `PartBatchListItemOut.current_process_step_id` 等派生字段定义见 [`docs/api/parts/index.md`](api/parts/index.md) + [`docs/api/parts/inspection.md`](api/parts/inspection.md)
+> - **派生 vs 物化列**：t_part / t_part_batch / t_assembly 三表的「位置 / 持有人 / 实际交付日期 / 返修事实 / 下一步工序」5 个字段在 PR-2/3 后均改为派生（event-driven 或 min-progress 活跃批次 JOIN），对应模型实体不再持有这些列。**新加派生字段统一走 service 层 + 现有 repo JOIN；不要回填到 t_part 列**
+> - **审计文档**：[`docs/audit-5-tables-2026-09-16.md`](audit-5-tables-2026-09-16.md) §附录记录 PR-1/2/3/4 完整修复路线图
+
 ---
 
 ## §1 单文件职责（一个文件只做一件事）
