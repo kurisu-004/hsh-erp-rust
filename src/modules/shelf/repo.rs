@@ -10,7 +10,8 @@
 //!   / `list_with_filters` / `count_with_filters` / `list_active_production_ordered`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder）
 //! - 写：`create` / `update` / `soft_delete`（同时 `is_active = false`）
-//! - 引用计数：`count_in_use_parts`（deactivate 前查 t_part.current_holder_id）
+//! - 引用计数：`count_in_use_parts`（deactivate 前查 t_part_batch.current_holder_id
+//!   + location + status 三维核对，PR-2 真相源迁移后已不再读 t_part）
 //!
 //! ## 约定
 //! - 全部使用 `sqlx::query!` / `query_as!` 编译期宏（需 `DATABASE_URL` 或 `.sqlx/` 离线元数据）
@@ -291,10 +292,15 @@ impl ShelfRepo {
         .map(|r| r.rows_affected())
     }
 
-    /// 软删前查引用：单条 `UNION ALL` 统计 `t_part.current_holder_id = shelf_id` 且
-    /// `status IN ('IN_PROCESS', 'INSPECTION', 'REPAIRING')` 的非软删零件数。
+    /// 软删前查引用：单条 `UNION ALL` 统计 `t_part_batch.current_holder_id = shelf_id` 且
+    /// `status IN ('IN_PROCESS', 'INSPECTION', 'REPAIRING')` 的非软删批次数。
     ///
     /// 任一分支 > 0 ⇒ 20503 BIZ_SHELF_IN_USE。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `current_holder_id` 列；
+    /// 「该 shelf 持有」改查 t_part_batch 真相源（status + holder + location
+    /// 三维核对：活跃 + 持有人为该 shelf + location='PRODUCTION_SHELF' 或
+    /// 'INSPECTION_SHELF'）。
     pub async fn count_in_use_parts<'e, E: PgExecutor<'e>>(
         executor: E,
         shelf_id: i64,
@@ -303,18 +309,21 @@ impl ShelfRepo {
             r#"
             SELECT
                 (
-                    (SELECT COUNT(*) FROM t_part
+                    (SELECT COUNT(*) FROM t_part_batch
                      WHERE current_holder_id = $1
+                       AND location IN ('PRODUCTION_SHELF', 'INSPECTION_SHELF')
                        AND status = 'IN_PROCESS'
                        AND deleted_at IS NULL)
                     +
-                    (SELECT COUNT(*) FROM t_part
+                    (SELECT COUNT(*) FROM t_part_batch
                      WHERE current_holder_id = $1
+                       AND location IN ('PRODUCTION_SHELF', 'INSPECTION_SHELF')
                        AND status = 'INSPECTION'
                        AND deleted_at IS NULL)
                     +
-                    (SELECT COUNT(*) FROM t_part
+                    (SELECT COUNT(*) FROM t_part_batch
                      WHERE current_holder_id = $1
+                       AND location IN ('PRODUCTION_SHELF', 'INSPECTION_SHELF')
                        AND status = 'REPAIRING'
                        AND deleted_at IS NULL)
                 )::bigint AS total

@@ -36,7 +36,7 @@
 | `verify-badge` | 命中且 `is_active=false` → 20202 `BIZ_WORKER_INACTIVE`（HTTP 400）；未命中 → 20201 `BIZ_WORKER_NOT_FOUND`（HTTP 404） |
 | `create` | `work_type_id`（若提供）必须指向现存工种；`badge_code` / `id_card_no` 撞唯一索引 → 40901 |
 | `update` | `work_type_id` 三态编码支持显式清空；OCC |
-| `deactivate` | `t_part.current_holder_id = worker_id` 且 `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 引用 > 0 → 20203 拒 |
+| `deactivate` | `t_part_batch.current_holder_id = worker_id` 且 `location = 'WORKER'` 且 `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 引用 > 0 → 20203 拒（**2026-09-16 PR-2**：`t_part.current_holder_id` 列已删，「该 worker 持有」改查 `t_part_batch` 真相源） |
 | `reactivate` | 行必须存在（已软删亦可）；行已是激活态 → 20104 拒 |
 
 ---
@@ -150,8 +150,9 @@ Response 200 `data`：`null`
 错误码：
 
 - 20201 `BIZ_WORKER_NOT_FOUND`
-- 20203 `BIZ_WORKER_IN_USE` — `t_part.current_holder_id = worker_id` 且
-  `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 仍有非软删引用 → 拒
+- 20203 `BIZ_WORKER_IN_USE` — `t_part_batch.current_holder_id = worker_id` 且
+  `location = 'WORKER'` 且 `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 仍有非软删引用 → 拒
+  （**2026-09-16 PR-2**：`t_part.current_holder_id` 列已删，守卫改查 `t_part_batch` 真相源）
 - 40901 `VERSION_CONFLICT`
 
 ### `POST /api/v2/workers/{id}/reactivate`

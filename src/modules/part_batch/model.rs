@@ -5,12 +5,16 @@
 //!
 //! Phase P1（送货分组）只投影 delivery_note / delivery_group 后续会用到的列：
 //! 标识 + 工单 + 批次号 + 数量 + 状态 + 位置 + holder + next_process + placed_at +
-//! 送货单关联 + 父批次 + 返修标 + 乐观锁 + 软删。
+//! 送货单关联 + 父批次 + 乐观锁 + 软删。
 //! Python `TPartBatch` 的其他字段留到 part_batch 域实施阶段扩展。
 
 use chrono::{NaiveDate, NaiveDateTime};
 
 /// `t_part_batch` 行（Phase P1 投影）
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` —— 拆批后
+/// 无法确定是哪一个批次返修，列语义失真，整体废弃（返修事实仍可追溯
+/// `t_part_event` 的 REPAIR_STARTED 事件）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPartBatch {
     pub id: i64,
@@ -24,7 +28,6 @@ pub struct TPartBatch {
     pub placed_at: Option<NaiveDateTime>,
     pub delivery_note_id: Option<i64>,
     pub parent_batch_id: Option<i64>,
-    pub has_been_repaired: bool,
     pub version: i32,
     pub created_at: NaiveDateTime,
     pub created_by: Option<i64>,
@@ -79,7 +82,6 @@ pub struct InspectionBatchListRow {
     pub location: Option<String>,
     pub version: i32,
     pub placed_at: Option<NaiveDateTime>,
-    pub has_been_repaired: bool,
     pub parent_batch_id: Option<i64>,
     // holder / process / delivery_note 解析
     pub current_holder_id: Option<i64>,
@@ -116,7 +118,6 @@ impl From<InspectionBatchListRow>
             location: r.location,
             version: r.version,
             placed_at: r.placed_at,
-            has_been_repaired: r.has_been_repaired,
             parent_batch_id: r.parent_batch_id,
             current_holder_id: r.current_holder_id,
             holder_name: r.holder_name,

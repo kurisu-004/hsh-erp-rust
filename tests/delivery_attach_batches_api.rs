@@ -139,12 +139,14 @@ async fn insert_part(
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired` 等 6 列；
+    // INSERT 列名与 VALUES 占位符同步移除。
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, \
-         quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, \
+         quantity, version, created_at, created_by, updated_at, updated_by, \
          assembly_id) \
-         VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, NULL)",
+         VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $6, $6, 1, 0, $5, NULL, $5, NULL, NULL)",
         id, serial_no, name, customer_id, now, today,
     )
     .execute(pool)

@@ -74,7 +74,6 @@ struct BatchListRow {
     location: Option<String>,
     version: i32,
     placed_at: Option<chrono::NaiveDateTime>,
-    has_been_repaired: bool,
     parent_batch_id: Option<i64>,
     current_holder_id: Option<i64>,
     holder_name: Option<String>,
@@ -107,7 +106,6 @@ struct InspectionRepairRow {
     location: Option<String>,
     version: i32,
     placed_at: Option<chrono::NaiveDateTime>,
-    has_been_repaired: bool,
     parent_batch_id: Option<i64>,
     current_holder_id: Option<i64>,
     holder_name: Option<String>,
@@ -683,6 +681,8 @@ impl PartService {
                 part: p,
                 customer_name: None,
                 l1_customer_name: None,
+                location: None,
+                holder_name: None,
             })
             .collect();
         Ok(PartListOut {
@@ -1259,13 +1259,9 @@ impl PartService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
-        // has_been_repaired 仍要写（一致性）
-        sqlx::query(
-            "UPDATE t_part_batch SET has_been_repaired = TRUE \
-             WHERE id = $1 AND has_been_repaired = FALSE")
-            .bind(batch.id)
-        .execute(&mut *conn)
-        .await?;
+        // 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
+        // `has_been_repaired` 列；返修事实由下方两条 t_part_event 事件日志
+        // 追溯（REPAIR_STARTED + REPAIR_COMPLETED）。
         let _ = Self::sync_from_batch_change(conn, part_id, current).await?;
         // 两条事件
         PartRepo::insert_part_event(
@@ -1340,7 +1336,7 @@ impl PartService {
         let offset = query.offset.unwrap_or(0).max(0);
         let keyword = query.keyword.as_deref().unwrap_or("");
         let rows: Vec<InspectionRepairRow> = sqlx::query_as::<_, InspectionRepairRow>(
-            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status,              b.location, b.version, b.placed_at, b.has_been_repaired, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              b.next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process p2 ON p2.id = b.next_process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND b.status = ANY($1)              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
+            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status,              b.location, b.version, b.placed_at, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              b.next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process p2 ON p2.id = b.next_process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND b.status = ANY($1)              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
         )
         .bind(statuses)
         .bind(keyword)
@@ -1362,7 +1358,6 @@ impl PartService {
                 location: r.location,
                 version: r.version,
                 placed_at: r.placed_at,
-                has_been_repaired: r.has_been_repaired,
                 parent_batch_id: r.parent_batch_id,
                 current_holder_id: r.current_holder_id,
                 holder_name: r.holder_name,
@@ -1571,7 +1566,7 @@ impl PartService {
             AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在")
         })?;
         let rows: Vec<BatchListRow> = sqlx::query_as::<_, BatchListRow>(
-            "SELECT b.id AS id, b.batch_no, b.quantity, b.status, b.location,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              b.next_process_id, b.placed_at, b.delivery_note_id, b.parent_batch_id,              b.has_been_repaired, b.version              FROM t_part_batch b              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              WHERE b.part_id = $1 AND b.deleted_at IS NULL              ORDER BY b.batch_no ASC",
+            "SELECT b.id AS id, b.batch_no, b.quantity, b.status, b.location,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              b.next_process_id, b.placed_at, b.delivery_note_id, b.parent_batch_id,              b.version              FROM t_part_batch b              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              WHERE b.part_id = $1 AND b.deleted_at IS NULL              ORDER BY b.batch_no ASC",
         )
         .bind(part_id)
         .fetch_all(&mut *conn)
@@ -1590,7 +1585,6 @@ impl PartService {
                 placed_at: r.placed_at,
                 delivery_note_id: r.delivery_note_id,
                 parent_batch_id: r.parent_batch_id,
-                has_been_repaired: r.has_been_repaired,
                 version: r.version,
             })
             .collect())
@@ -1881,16 +1875,12 @@ impl PartService {
             }
         } else {
             // FAIL：INSPECTION → REPAIRING；保留 shelf 为 INSPECTION_SHELF（carry 状态由下一步 complete_repair 接管）
+            // 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
+            // `has_been_repaired` 列；返修事实由下方 INSPECTION_FAILED 事件日志追溯。
             let n2 = mark_batch_status_only(&mut *conn, batch.id, mid_version, "REPAIRING", current.id).await?;
             if n2 == 0 {
                 return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突（INSPECTION→REPAIRING）"));
             }
-            sqlx::query(
-                "UPDATE t_part_batch SET has_been_repaired = TRUE \
-                 WHERE id = $1 AND has_been_repaired = FALSE")
-            .bind(batch.id)
-            .execute(&mut *conn)
-            .await?;
         }
         let _ = Self::sync_from_batch_change(conn, part_id, current).await?;
         // 事件日志（两条：INSPECTED + INSPECTION_RESULT）
@@ -1952,12 +1942,12 @@ impl PartService {
         // 反查 part
         let part: Option<crate::modules::part::model::TPart> = sqlx::query_as::<_, crate::modules::part::model::TPart>(
             "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
-             request_date, planned_delivery_date, actual_delivery_date, \
-             customer_id, assembly_id, status, location, \
-             is_urgent, current_holder_id, placed_at, next_process_id, \
-             order_no, system_delivery_date, note, has_been_repaired, \
+             request_date, planned_delivery_date, \
+             customer_id, assembly_id, status, \
+             is_urgent, next_process_id, \
+             order_no, system_delivery_date, note, \
              version, created_at, created_by, updated_at, updated_by, \
-             deleted_at, delivery_note_id, process_chain_id \
+             deleted_at, process_chain_id \
              FROM t_part WHERE serial_no = $1 AND deleted_at IS NULL",
         )
         .bind(&req.part_serial_no)
@@ -2017,14 +2007,9 @@ impl PartService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
-        // 写 actual_delivery_date
-        sqlx::query(
-            "UPDATE t_part SET actual_delivery_date = CURRENT_DATE, version = version + 1, \
-             updated_at = now(), updated_by = $1 WHERE id = $2 AND deleted_at IS NULL")
-            .bind(current.id)
-            .bind(part.id)
-        .execute(&mut *conn)
-        .await?;
+        // 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `actual_delivery_date` 列；
+        // 实际交付日期由下方 DELIVERED 事件日志写入 t_part_event，统计口径
+        // 按事件派生（见 statistics 域）。
         let _ = Self::sync_from_batch_change(conn, part.id, current).await?;
         // 事件
         PartRepo::insert_part_event(
@@ -2161,7 +2146,7 @@ impl PartService {
                 quantity: 1,
                 location: None,
                 created_by: Some(current.id),
-            },
+                },
         )
         .await?;
 
@@ -2200,9 +2185,9 @@ impl PartService {
                         id: snowflake.next_id(),
                         part_id: child_id,
                         quantity: 1,
-                        location: None,
+                location: None,
                         created_by: Some(current.id),
-                    },
+                },
                 )
                 .await?;
             }
@@ -2336,7 +2321,6 @@ impl PartService {
                 order_no: item.order_no.as_deref(),
                 system_delivery_date: item.system_delivery_date,
                 planned_delivery_date: None,
-                actual_delivery_date: None,
                 note: item.note.as_deref(),
                 is_urgent: None,
                 updated_by: current.id,
@@ -2400,6 +2384,8 @@ impl PartService {
                 part: p,
                 customer_name: None,
                 l1_customer_name: None,
+                location: None,
+                holder_name: None,
             })
             .collect();
         Ok(PartListOut {
@@ -2449,6 +2435,8 @@ impl PartService {
                 part: p,
                 customer_name: None,
                 l1_customer_name: None,
+                location: None,
+                holder_name: None,
             })
             .collect();
         Ok(PartListOut {
@@ -2621,26 +2609,20 @@ impl PartService {
                     quantity: qty,
                     request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
                     planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    actual_delivery_date: None,
                     customer_id: 0,
                     assembly_id: None,
                     status: "IN_PROCESS".to_string(),
-                    location: Some("WORKER".to_string()),
                     is_urgent: false,
-                    current_holder_id: None,
-                    placed_at: None,
                     next_process_id: None,
                     order_no: None,
                     system_delivery_date: None,
                     note: None,
-                    has_been_repaired: false,
                     version: 0,
                     created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
                     created_by: None,
                     updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
                     updated_by: None,
                     deleted_at: None,
-                    delivery_note_id: None,
                     process_chain_id: None,
                 };
                 let item: super::super::dto_crud::PartListItem =
@@ -2648,12 +2630,14 @@ impl PartService {
                         part: p,
                         customer_name: None,
                         l1_customer_name: None,
+                        location: None,
+                        holder_name: None,
                     };
-                // 附加 worker_name（轻量：DTO 上没字段，仅放 batch_id 展示）
-                let _ = bid;
-                let _ = worker_name;
-                item
-            })
+                    // 附加 worker_name（轻量：DTO 上没字段，仅放 batch_id 展示）
+                    let _ = bid;
+                    let _ = worker_name;
+                    item
+                })
             .collect();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM t_part_batch b \
@@ -2717,30 +2701,26 @@ impl PartService {
                     quantity: qty,
                     request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
                     planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    actual_delivery_date: None,
                     customer_id: 0,
                     assembly_id: None,
                     status: "IN_PROCESS".to_string(),
-                    location: Some("PRODUCTION_SHELF".to_string()),
                     is_urgent: false,
-                    current_holder_id: None,
-                    placed_at: None,
                     next_process_id: None,
                     order_no: None,
                     system_delivery_date: None,
                     note: None,
-                    has_been_repaired: false,
                     version: 0,
                     created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
                     created_by: None,
                     updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
                     updated_by: None,
                     deleted_at: None,
-                    delivery_note_id: None,
                     process_chain_id: None,
                 },
                 customer_name: None,
                 l1_customer_name: None,
+                location: None,
+                holder_name: None,
             })
             .collect();
         let total: i64 = sqlx::query_scalar(
@@ -2801,30 +2781,26 @@ impl PartService {
                     quantity: qty,
                     request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
                     planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    actual_delivery_date: None,
                     customer_id: 0,
                     assembly_id: None,
                     status: "IN_PROCESS".to_string(),
-                    location: Some("WORKER".to_string()),
                     is_urgent: false,
-                    current_holder_id: Some(worker_id),
-                    placed_at: None,
                     next_process_id: None,
                     order_no: None,
                     system_delivery_date: None,
                     note: None,
-                    has_been_repaired: false,
                     version: 0,
                     created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
                     created_by: None,
                     updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
                     updated_by: None,
                     deleted_at: None,
-                    delivery_note_id: None,
                     process_chain_id: None,
                 },
                 customer_name: None,
                 l1_customer_name: None,
+                location: None,
+                holder_name: None,
             })
             .collect();
         let total: i64 = sqlx::query_scalar(

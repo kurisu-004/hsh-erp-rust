@@ -360,9 +360,15 @@ async fn soft_delete_has_shipment_returns_20307() {
     let asm_version = asm.assembly.version;
 
     // 给子件设 delivery_note_id（模拟挂单）
+    //
+    // 2026-09-16 PR-2（migration 027）：t_part.delivery_note_id 列已删；20307
+    // BIZ_ASSEMBLY_HAS_SHIPMENT 守卫改查 t_part_batch.delivery_note_id（PR-2 §
+    // assembly/service.rs:639-646 JOIN t_part_batch），fixture 同步改写：UPDATE
+    // t_part_batch SET delivery_note_id（status 非 CANCELLED 即视为「活跃」）。
     sqlx::query(
-        "UPDATE t_part SET delivery_note_id = $3::bigint, version = version + 1, updated_at = now(), updated_by = $1 \
-         WHERE assembly_id = $2 AND deleted_at IS NULL",
+        "UPDATE t_part_batch SET delivery_note_id = $3::bigint, version = version + 1, updated_at = now(), updated_by = $1 \
+         WHERE part_id IN (SELECT id FROM t_part WHERE assembly_id = $2 AND deleted_at IS NULL) \
+           AND status <> 'CANCELLED'",
     )
     .bind(current.id)
     .bind(asm_id)
@@ -424,7 +430,6 @@ async fn three_state_note_clear_to_null() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: None,
         unit_price: None,

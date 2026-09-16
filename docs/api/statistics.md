@@ -15,6 +15,12 @@
 
 权限：`MANAGER-only`（与 Python router `dependencies=[Depends(require_role(UserRole.MANAGER))]` 对齐）。
 
+> 2026-09-16 PR-2（migration 027）交付 / 逾期口径变更：
+> 1. **实际交付日期** 改由 `t_part_event.event_type='DELIVERED'` 事件派生（`MAX(e.created_at)::date`），不再读 `t_part.actual_delivery_date`（已删列）。
+> 2. **未交付判定** 改用 `NOT EXISTS (DELIVERED 事件)` 口径（多批次场景：任一活跃批次的 DELIVERED 事件即视为已交付）。
+> 3. **orange / red 分类**（on_time / 晚于 planned / 晚于 system）沿用，不变。
+> 4. 详见 `src/modules/statistics/repo.rs::delivered_stats / count_overdue_undelivered` 与 [`../../api/parts/index.md`](../../api/parts/index.md) §PartOut。
+
 ---
 
 ## `GET /api/v2/statistics/overview`
@@ -31,11 +37,11 @@
 - `created_count`：期内 `t_part.created_at ∈ [date_from, date_to+1)` 新建工单数（未软删）。
 - `completed_count`：期内 `t_part_event.event_type='COMPLETED' AND batch_id IS NULL` 的 distinct part_id 数。
 - `in_process_count`：期末在制（事件重构）— `date_to+1` 前已创建且**不存在** COMPLETED/CANCELLED 工单级事件的工单数。
-- `delivered_count` / `delivered_value`：期内 `actual_delivery_date ∈ [from, to]` 交付件数与 `sum(total_price)`。
-- `late_orange_count`：`actual > planned AND (system IS NULL OR actual ≤ system)` 的红橙档命中数。
+- `delivered_count` / `delivered_value`：期内**实际交付日期 ∈ [from, to]** 交付件数与 `sum(total_price)`。**2026-09-16 PR-2（migration 027）**：实际交付日期由 `t_part_event.event_type='DELIVERED'` 派生（`MAX(e.created_at)::date WHERE b.deleted_at IS NULL`）；不再读 `t_part.actual_delivery_date`（已删列）。多批次场景下任一活跃批次的 DELIVERED 事件即视为已交付。
+- `late_orange_count`：`actual > planned AND (system IS NULL OR actual ≤ system)` 的红橙档命中数（actual 同上由 DELIVERED 事件派生）。
 - `late_red_count`：`system NOT NULL AND actual > system` 的严重逾期数。
 - `on_time`：`max(delivered_count - orange - red, 0)`（互斥拆分）。
-- `overdue_undelivered_count`：`planned < today AND actual IS NULL AND 非终态`（当前快照）。
+- `overdue_undelivered_count`：**2026-09-16 PR-2**：判定口径由「`actual IS NULL`」改为 `NOT EXISTS DELIVERED 事件`（`planned < today AND 状态非终态 AND t_part_event 无对应批次的 DELIVERED 记录`）。多批次场景下任一活跃批次有 DELIVERED 事件即视为已交付。
 - `repair_part_count`：期内 REPAIR_STARTED 事件 distinct part_id 数。
 - `daily_created` / `daily_completed`：零填充到 `[date_from, date_to]` 的每日计数。
 - `delivery_performance`：`{ on_time, orange, red }` 拆分。

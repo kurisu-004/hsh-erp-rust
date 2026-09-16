@@ -160,11 +160,13 @@ async fn insert_part(pool: &PgPool, name: &str, customer_id: i64, serial_no: Opt
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
+    // VALUES 占位符同步移除。
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, \
-         quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL)",
+         quantity, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $6, $6, 1, 0, $5, NULL, $5, NULL)",
         id,
         serial_no,
         name,
@@ -190,10 +192,12 @@ async fn insert_batch(
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
+    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
+    // 列名与 VALUES 占位符同步移除 `false` 字面量。
     sqlx::query!(
-        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, has_been_repaired, \
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
          version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, $3, $4, $5, false, 0, $6, NULL, $6, NULL)",
+         VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, $6, NULL)",
         id,
         part_id,
         batch_no,
@@ -1484,17 +1488,20 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
 
     // 2. 直插 part（**6 字段全填**）：用 `sqlx::query()` 而非 `query!` 宏，
     //    避免为这条纯测试 INSERT 往 `.sqlx/` 离线缓存里塞新条目。
+    //
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名
+    // 与 VALUES 占位符同步移除 `false` 字面量。
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let part_id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, system_delivery_date, \
-         order_no, note, quantity, has_been_repaired, version, \
+         order_no, note, quantity, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, 'Detail-Fields-Part', 'D-002', $3, 'READY_TO_SHIP', \
          '张三', $4, $5, $6, \
-         $7, $8, 1, false, 0, \
+         $7, $8, 1, 0, \
          $9, NULL, $9, NULL)",
     )
     .bind(part_id)

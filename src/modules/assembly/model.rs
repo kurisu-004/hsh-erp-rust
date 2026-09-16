@@ -6,11 +6,14 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use rust_decimal::Decimal;
 
-/// `t_assembly` 行结构（22 列 + id = 23 字段）。
+/// `t_assembly` 行结构（21 列 + id = 22 字段）。
 ///
 /// `customer_id` 逻辑外键 → `t_customer.id`（必须是 L2 叶子，service 校验）。
 /// `serial_no` 由 `t_serial_counter` 派发，格式 `F0000001`；子件 `serial_no` 模式
 /// `{asm_serial}-{i:02d}`（如 `F0000001-01`）。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date` —— 与
+/// t_part 同属批次依附信息；装配体实际交付由子件批次交付事件体现。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TAssembly {
     pub id: i64,
@@ -20,7 +23,6 @@ pub struct TAssembly {
     pub customer_id: i64,
     pub request_date: Option<NaiveDate>,
     pub planned_delivery_date: Option<NaiveDate>,
-    pub actual_delivery_date: Option<NaiveDate>,
     pub is_urgent: bool,
     pub status: String,
     pub version: i32,

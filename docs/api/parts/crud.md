@@ -136,9 +136,13 @@ Request：`PartUpdateRequest` — 字段全部可选（缺省 = DB 不动）；`
 | `order_no` | string? | — | |
 | `system_delivery_date` | date? | — | |
 | `planned_delivery_date` | date? | — | |
-| `actual_delivery_date` | date? | — | |
 | `note` | string? | — | |
 | `is_urgent` | bool? | — | |
+
+> 2026-09-16 PR-2（migration 027）：`PartUpdateRequest` 删 `actual_delivery_date`
+> 入参 —— 该列已从 `t_part` 删除；实际交付日期由 `t_part_event.event_type='DELIVERED'`
+> 事件派生，不接受手工改（详见
+> [`../../api/statistics.md`](../../api/statistics.md)）。
 
 Response 200 `data`：[`PartDetailOut`](./index.md#partdetailout-字段)。
 

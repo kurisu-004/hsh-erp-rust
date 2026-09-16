@@ -97,32 +97,52 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
     (app2, token)
 }
 
-/// 直插一个 `t_part` 行（`current_holder_id = shelf_id`，`status = IN_PROCESS`）
-/// 让 `deactivate` 的「被 IN_PROCESS/INSPECTION/REPAIRING 零件引用」分支触发
-/// 20503 `BIZ_SHELF_IN_USE`。绕开 part 域 CRUD（part CRUD 不是本任务范畴）。
+/// 直插一个 `t_part` + `t_part_batch` 行（批次 `current_holder_id = shelf_id`、
+/// `location = 'PRODUCTION_SHELF'`、`status = IN_PROCESS`）让 `deactivate` 的
+/// 「被 IN_PROCESS/INSPECTION/REPAIRING 批次引用」分支触发 20503
+/// `BIZ_SHELF_IN_USE`。绕开 part 域 CRUD（part CRUD 不是本任务范畴）。
+///
+/// 2026-09-16 PR-2（migration 027）：t_part 删 `current_holder_id`，「该 shelf 持有」
+/// 改查 t_part_batch 真相源（status + holder + location 三维核对），fixture 同步改写。
 async fn insert_part_held_by_shelf(pool: &PgPool, shelf_id: i64, status: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake =
         hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
+    let batch_id = snowflake.next_id();
     let now = now_naive();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `current_holder_id` 等批次依附列；
+    // INSERT 列名与 VALUES 占位符同步移除 `0, 0`（unit_price/total_price 不再写）。
     sqlx::query!(
-        "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
-         request_date, planned_delivery_date, customer_id, status, current_holder_id, version, \
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, \
+         request_date, planned_delivery_date, customer_id, status, version, \
          created_at, updated_at) \
-         VALUES ($1, 'TEST-NAME', 'TEST-DWG', 'TEST-APPLICANT', 1, 0, 0, CURRENT_DATE, CURRENT_DATE, \
-                 $2, $3, $4, 0, $5, $5)",
+         VALUES ($1, 'TEST-NAME', 'TEST-DWG', 'TEST-APPLICANT', 1, \
+                 CURRENT_DATE, CURRENT_DATE, $2, $3, 0, $4, $4)",
         id,
-        // 用伪 customer_id (1L)；因为 deactivate 检查只看 current_holder_id + status，不校验 FK，
-        // 但 t_part.customer_id NOT NULL —— truncate CASCADE 后 customer sequence 从 1 开始。
+        // 用伪 customer_id (1L)；truncate CASCADE 后 customer sequence 从 1 开始。
         1_i64,
+        status,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert t_part held by shelf");
+    // 同步插 t_part_batch（active + location='PRODUCTION_SHELF' + holder=shelf），
+    // 让 ShelfRepo::count_in_use_parts 命中 PR-2 真相源路径。
+    sqlx::query!(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, 1, $3, 'PRODUCTION_SHELF', $4, 0, $5, $5)",
+        batch_id,
+        id,
         status,
         shelf_id,
         now,
     )
     .execute(pool)
     .await
-    .expect("insert t_part held by shelf");
+    .expect("insert t_part_batch held by shelf");
     id
 }
 

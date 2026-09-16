@@ -148,12 +148,14 @@ async fn insert_part(
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
+    // VALUES 占位符同步移除。
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, \
-         quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, \
+         quantity, version, created_at, created_by, updated_at, updated_by, \
          assembly_id) \
-         VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, $7)",
+         VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $6, $6, 1, 0, $5, NULL, $5, NULL, $7)",
         id, serial_no, name, customer_id, now, today, assembly_id,
     )
     .execute(pool)
@@ -167,10 +169,12 @@ async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, stat
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
+    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
+    // 列名与 VALUES 占位符同步移除 `false` 字面量。
     sqlx::query!(
-        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, has_been_repaired, \
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
          version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, $3, $4, $5, false, 0, $6, NULL, $6, NULL)",
+         VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, $6, NULL)",
         id, part_id, batch_no, qty, status, now,
     )
     .execute(pool)
@@ -974,22 +978,24 @@ async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
         created_batch_ids.push(snowflake.next_id());
     }
     let max_batch_id = *created_batch_ids.iter().max().unwrap();
+    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；多行 INSERT
+    // 列名与 VALUES 占位符同步移除 `false` 字面量。
     sqlx::query!(
         r#"
         INSERT INTO t_part_batch
-            (id, part_id, batch_no, quantity, status, has_been_repaired,
+            (id, part_id, batch_no, quantity, status,
              version, created_at, created_by, updated_at, updated_by)
         VALUES
-            ($1, $11, 1, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
-            ($2, $11, 2, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
-            ($3, $11, 3, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
-            ($4, $11, 4, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
-            ($5, $11, 5, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
-            ($6, $11, 6, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
-            ($7, $11, 7, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
-            ($8, $11, 8, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
-            ($9, $11, 9, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL),
-            ($10, $11, 10, 1, 'READY_TO_SHIP', false, 0, $12, NULL, $12, NULL)
+            ($1, $11, 1, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL),
+            ($2, $11, 2, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL),
+            ($3, $11, 3, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL),
+            ($4, $11, 4, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL),
+            ($5, $11, 5, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL),
+            ($6, $11, 6, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL),
+            ($7, $11, 7, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL),
+            ($8, $11, 8, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL),
+            ($9, $11, 9, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL),
+            ($10, $11, 10, 1, 'READY_TO_SHIP', 0, $12, NULL, $12, NULL)
         "#,
         created_batch_ids[0],
         created_batch_ids[1],

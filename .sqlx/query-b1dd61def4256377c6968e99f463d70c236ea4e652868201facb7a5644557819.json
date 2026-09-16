@@ -1,0 +1,292 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, serial_no, name, drawing_no, applicant_name, quantity,\n                   request_date, planned_delivery_date,\n                   customer_id, assembly_id, status,\n                   is_urgent, next_process_id,\n                   order_no, system_delivery_date, note,\n                   version, created_at, created_by, updated_at, updated_by,\n                   deleted_at, process_chain_id\n            FROM t_part\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "serial_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "serial_no"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "drawing_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "drawing_no"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "applicant_name",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "applicant_name"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "quantity",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "request_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "request_date"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "planned_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "planned_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "customer_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "customer_id"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "assembly_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "assembly_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "status",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "is_urgent",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "is_urgent"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "next_process_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "next_process_id"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "order_no",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "order_no"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "system_delivery_date",
+        "type_info": "Date",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "system_delivery_date"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "note",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "updated_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "deleted_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "process_chain_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "process_chain_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "b1dd61def4256377c6968e99f463d70c236ea4e652868201facb7a5644557819"
+}

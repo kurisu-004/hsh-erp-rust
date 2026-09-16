@@ -42,6 +42,10 @@ pub struct NewInitialBatch<'a> {
 }
 
 impl PartBatchRepo {
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 `has_been_repaired`
+    /// 列，查询投影同步收窄。`get_by_id` / `list_by_delivery_note` /
+    /// `list_by_part_ids` / `list_active_by_part_id` / `list_active_by_part_ids` /
+    /// `list_held_by_worker` 等所有走 `TPartBatch` 投影的查询同步删该列。
     pub async fn get_by_id<'e, E: PgExecutor<'e>>(
         executor: E,
         id: i64,
@@ -52,7 +56,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, next_process_id, placed_at,
-                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE id = $1
@@ -77,7 +81,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, next_process_id, placed_at,
-                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE delivery_note_id = $1
@@ -92,6 +96,12 @@ impl PartBatchRepo {
 
     /// 送货单的全部未删批次 + 对应工单展示字段（Phase P2 列表输出需要：`name` /
     /// `drawing_no` 等不存于 `t_part_batch`，要 JOIN `t_part`）。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：JOIN 投影删 `pb.has_been_repaired`
+    /// （t_part_batch 列已删）+ `p.actual_delivery_date` / `p.location` /
+    /// `p.current_holder_id` / `p.placed_at` / `p.delivery_note_id` /
+    /// `p.has_been_repaired`（t_part 列已删，6 个批次依附列）；TPart 字面量
+    /// 回填同步。
     pub async fn list_with_part_by_delivery_note<'e, E: PgExecutor<'e>>(
         executor: E,
         note_id: i64,
@@ -110,7 +120,6 @@ impl PartBatchRepo {
                 pb.placed_at     AS "pb_placed_at?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
-                pb.has_been_repaired AS "pb_has_been_repaired!",
                 pb.version       AS "pb_version!",
                 pb.created_at    AS "pb_created_at!",
                 pb.created_by    AS "pb_created_by?",
@@ -130,21 +139,15 @@ impl PartBatchRepo {
                 p.updated_at     AS "p_updated_at!",
                 p.updated_by     AS "p_updated_by?",
                 p.deleted_at     AS "p_deleted_at?",
-                p.delivery_note_id AS "p_delivery_note_id?",
-                p.current_holder_id AS "p_current_holder_id?",
-                p.next_process_id   AS "p_next_process_id?",
                 p.applicant_name  AS "p_applicant_name!",
                 p.quantity        AS "p_quantity!",
                 p.request_date    AS "p_request_date!",
                 p.planned_delivery_date AS "p_planned_delivery_date!",
-                p.actual_delivery_date  AS "p_actual_delivery_date?",
-                p.location        AS "p_location?",
                 p.is_urgent       AS "p_is_urgent!",
-                p.placed_at       AS "p_placed_at?",
+                p.next_process_id   AS "p_next_process_id?",
                 p.order_no        AS "p_order_no?",
                 p.system_delivery_date AS "p_system_delivery_date?",
                 p.note            AS "p_note?",
-                p.has_been_repaired AS "p_has_been_repaired!",
                 p.process_chain_id AS "p_process_chain_id?"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
@@ -174,7 +177,6 @@ impl PartBatchRepo {
                         placed_at: r.pb_placed_at,
                         delivery_note_id: r.pb_delivery_note_id,
                         parent_batch_id: r.pb_parent_batch_id,
-                        has_been_repaired: r.pb_has_been_repaired,
                         version: r.pb_version,
                         created_at: r.pb_created_at,
                         created_by: r.pb_created_by,
@@ -191,26 +193,20 @@ impl PartBatchRepo {
                         quantity: r.p_quantity,
                         request_date: r.p_request_date,
                         planned_delivery_date: r.p_planned_delivery_date,
-                        actual_delivery_date: r.p_actual_delivery_date,
                         customer_id: r.p_customer_id,
                         assembly_id: r.p_assembly_id,
                         status: r.p_status,
-                        location: r.p_location,
                         is_urgent: r.p_is_urgent,
-                        current_holder_id: r.p_current_holder_id,
-                        placed_at: r.p_placed_at,
                         next_process_id: r.p_next_process_id,
                         order_no: r.p_order_no,
                         system_delivery_date: r.p_system_delivery_date,
                         note: r.p_note,
-                        has_been_repaired: r.p_has_been_repaired,
                         version: r.p_version,
                         created_at: r.p_created_at,
                         created_by: r.p_created_by,
                         updated_at: r.p_updated_at,
                         updated_by: r.p_updated_by,
                         deleted_at: r.p_deleted_at,
-                        delivery_note_id: r.p_delivery_note_id,
                         process_chain_id: r.p_process_chain_id,
                     },
                 )
@@ -223,6 +219,11 @@ impl PartBatchRepo {
     /// 与 `list_with_part_by_delivery_note` 同投影；改用 `WHERE pb.delivery_note_id = ANY($1)`，
     /// 由 caller 按 `b.delivery_note_id` 分桶后组装 N 个 `DeliveryNoteDetailOut`。
     /// 空输入短路（避免 `ANY($1::bigint[])` 抛 sqlx 类型推断错）。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：JOIN 投影同步删 `pb.has_been_repaired`
+    /// + `p.actual_delivery_date` / `p.location` / `p.current_holder_id` /
+    ///   `p.placed_at` / `p.delivery_note_id` / `p.has_been_repaired` 6 列；
+    ///   TPart 字面量回填同步。
     pub async fn list_with_part_by_delivery_note_ids<'e, E: PgExecutor<'e>>(
         executor: E,
         note_ids: &[i64],
@@ -244,7 +245,6 @@ impl PartBatchRepo {
                 pb.placed_at     AS "pb_placed_at?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
-                pb.has_been_repaired AS "pb_has_been_repaired!",
                 pb.version       AS "pb_version!",
                 pb.created_at    AS "pb_created_at!",
                 pb.created_by    AS "pb_created_by?",
@@ -264,21 +264,15 @@ impl PartBatchRepo {
                 p.updated_at     AS "p_updated_at!",
                 p.updated_by     AS "p_updated_by?",
                 p.deleted_at     AS "p_deleted_at?",
-                p.delivery_note_id AS "p_delivery_note_id?",
-                p.current_holder_id AS "p_current_holder_id?",
-                p.next_process_id   AS "p_next_process_id?",
                 p.applicant_name  AS "p_applicant_name!",
                 p.quantity        AS "p_quantity!",
                 p.request_date    AS "p_request_date!",
                 p.planned_delivery_date AS "p_planned_delivery_date!",
-                p.actual_delivery_date  AS "p_actual_delivery_date?",
-                p.location        AS "p_location?",
                 p.is_urgent       AS "p_is_urgent!",
-                p.placed_at       AS "p_placed_at?",
+                p.next_process_id   AS "p_next_process_id?",
                 p.order_no        AS "p_order_no?",
                 p.system_delivery_date AS "p_system_delivery_date?",
                 p.note            AS "p_note?",
-                p.has_been_repaired AS "p_has_been_repaired!",
                 p.process_chain_id AS "p_process_chain_id?"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
@@ -306,7 +300,6 @@ impl PartBatchRepo {
                     placed_at: r.pb_placed_at,
                     delivery_note_id: r.pb_delivery_note_id,
                     parent_batch_id: r.pb_parent_batch_id,
-                    has_been_repaired: r.pb_has_been_repaired,
                     version: r.pb_version,
                     created_at: r.pb_created_at,
                     created_by: r.pb_created_by,
@@ -323,26 +316,20 @@ impl PartBatchRepo {
                     quantity: r.p_quantity,
                     request_date: r.p_request_date,
                     planned_delivery_date: r.p_planned_delivery_date,
-                    actual_delivery_date: r.p_actual_delivery_date,
                     customer_id: r.p_customer_id,
                     assembly_id: r.p_assembly_id,
                     status: r.p_status,
-                    location: r.p_location,
                     is_urgent: r.p_is_urgent,
-                    current_holder_id: r.p_current_holder_id,
-                    placed_at: r.p_placed_at,
                     next_process_id: r.p_next_process_id,
                     order_no: r.p_order_no,
                     system_delivery_date: r.p_system_delivery_date,
                     note: r.p_note,
-                    has_been_repaired: r.p_has_been_repaired,
                     version: r.p_version,
                     created_at: r.p_created_at,
                     created_by: r.p_created_by,
                     updated_at: r.p_updated_at,
                     updated_by: r.p_updated_by,
                     deleted_at: r.p_deleted_at,
-                    delivery_note_id: r.p_delivery_note_id,
                     process_chain_id: r.p_process_chain_id,
                 },
             )
@@ -363,7 +350,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, next_process_id, placed_at,
-                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE part_id = ANY($1)
@@ -485,16 +472,18 @@ impl PartBatchRepo {
         .await?;
 
         // 2. 插入新批次（quantity = qty，不继承 delivery_note_id，写 parent_batch_id）。
+        //    2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 has_been_repaired
+        //    列，INSERT 同步删该列。
         sqlx::query!(
             r#"
             INSERT INTO t_part_batch
                 (id, part_id, batch_no, quantity, status, location,
                  current_holder_id, next_process_id, placed_at,
-                 delivery_note_id, parent_batch_id, has_been_repaired,
+                 delivery_note_id, parent_batch_id,
                  version, created_at, created_by, updated_at, updated_by)
             VALUES ($1, $2, $3, $4, $5, $6,
                     $7, $8, $9,
-                    NULL, $10, FALSE,
+                    NULL, $10,
                     0, $11, $12, $11, $13)
             "#,
             new_batch_id,
@@ -550,7 +539,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, next_process_id, placed_at,
-                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE part_id = $1 AND deleted_at IS NULL
@@ -615,7 +604,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, next_process_id, placed_at,
-                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE part_id = ANY($1) AND deleted_at IS NULL
@@ -630,6 +619,9 @@ impl PartBatchRepo {
     /// 候选入单池（list_candidate_parts 用）：状态 ∈ {INSPECTION, READY_TO_SHIP}，
     /// 非软删，工单非软删，客户 ∈ customer_ids。
     /// 与 Python `PartBatchRepository.list_batches_with_part` 对齐。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：JOIN 投影删 `pb.has_been_repaired`
+    /// + 6 个 t_part 批次依附列；TPart 字面量回填同步。
     pub async fn list_batches_with_part_in_customers<'e, E: PgExecutor<'e>>(
         executor: E,
         statuses: &[&str],
@@ -647,7 +639,7 @@ impl PartBatchRepo {
             SELECT
                 pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.status, pb.location,
                 pb.current_holder_id, pb.next_process_id, pb.placed_at,
-                pb.delivery_note_id, pb.parent_batch_id, pb.has_been_repaired,
+                pb.delivery_note_id, pb.parent_batch_id,
                 pb.version, pb.created_at, pb.created_by, pb.updated_at, pb.updated_by, pb.deleted_at,
                 p.id AS "p_id", p.serial_no AS "p_serial_no", p.name AS "p_name",
                 p.drawing_no AS "p_drawing_no", p.customer_id AS "p_customer_id",
@@ -655,21 +647,15 @@ impl PartBatchRepo {
                 p.version AS "p_version", p.created_at AS "p_created_at",
                 p.created_by AS "p_created_by", p.updated_at AS "p_updated_at",
                 p.updated_by AS "p_updated_by", p.deleted_at AS "p_deleted_at",
-                p.delivery_note_id AS "p_delivery_note_id",
                 p.applicant_name AS "p_applicant_name",
                 p.quantity AS "p_quantity",
                 p.request_date AS "p_request_date",
                 p.planned_delivery_date AS "p_planned_delivery_date",
-                p.actual_delivery_date AS "p_actual_delivery_date",
-                p.location AS "p_location",
                 p.is_urgent AS "p_is_urgent",
-                p.current_holder_id AS "p_current_holder_id",
-                p.placed_at AS "p_placed_at",
                 p.next_process_id AS "p_next_process_id",
                 p.order_no AS "p_order_no",
                 p.system_delivery_date AS "p_system_delivery_date",
                 p.note AS "p_note",
-                p.has_been_repaired AS "p_has_been_repaired",
                 p.process_chain_id AS "p_process_chain_id"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
@@ -703,7 +689,6 @@ impl PartBatchRepo {
                 placed_at: r.try_get("placed_at")?,
                 delivery_note_id: r.try_get("delivery_note_id")?,
                 parent_batch_id: r.try_get("parent_batch_id")?,
-                has_been_repaired: r.try_get("has_been_repaired")?,
                 version: r.try_get("version")?,
                 created_at: r.try_get("created_at")?,
                 created_by: r.try_get("created_by")?,
@@ -720,26 +705,20 @@ impl PartBatchRepo {
                 quantity: r.try_get("p_quantity")?,
                 request_date: r.try_get("p_request_date")?,
                 planned_delivery_date: r.try_get("p_planned_delivery_date")?,
-                actual_delivery_date: r.try_get("p_actual_delivery_date")?,
                 customer_id: r.try_get("p_customer_id")?,
                 assembly_id: r.try_get("p_assembly_id")?,
                 status: r.try_get("p_status")?,
-                location: r.try_get("p_location")?,
                 is_urgent: r.try_get("p_is_urgent")?,
-                current_holder_id: r.try_get("p_current_holder_id")?,
-                placed_at: r.try_get("p_placed_at")?,
                 next_process_id: r.try_get("p_next_process_id")?,
                 order_no: r.try_get("p_order_no")?,
                 system_delivery_date: r.try_get("p_system_delivery_date")?,
                 note: r.try_get("p_note")?,
-                has_been_repaired: r.try_get("p_has_been_repaired")?,
                 version: r.try_get("p_version")?,
                 created_at: r.try_get("p_created_at")?,
                 created_by: r.try_get("p_created_by")?,
                 updated_at: r.try_get("p_updated_at")?,
                 updated_by: r.try_get("p_updated_by")?,
                 deleted_at: r.try_get("p_deleted_at")?,
-                delivery_note_id: r.try_get("p_delivery_note_id")?,
                 process_chain_id: r.try_get("p_process_chain_id")?,
             };
             out.push((pb, p));
@@ -832,7 +811,7 @@ impl PartBatchRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, next_process_id, placed_at,
-                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE current_holder_id = $1
@@ -882,8 +861,11 @@ impl PartBatchRepo {
     ///
     /// 在 part 创建入口（`create_part` / `batch_create_parts` / `insert_child_for_assembly`）
     /// 同事务内调用，插入 `batch_no=1 / status='PENDING' / version=0 /
-    /// has_been_repaired=false / current_holder_id=NULL / next_process_id=NULL /
+    /// current_holder_id=NULL / next_process_id=NULL /
     /// placed_at=NULL / delivery_note_id=NULL / parent_batch_id=NULL` 的初始批次。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：`has_been_repaired` 列已删，INSERT
+    /// 同步删该列；返修事实由 `t_part_event` REPAIR_STARTED 事件追溯。
     ///
     /// `location` 单件 / 批量创建时传 `None`，子件创建时传 `Some("OFFICE")`（与
     /// `insert_child_for_assembly` 写入子件 part 行时的 location 对齐）。
@@ -901,12 +883,12 @@ impl PartBatchRepo {
             INSERT INTO t_part_batch (
                 id, part_id, batch_no, quantity, status, location,
                 current_holder_id, next_process_id, placed_at,
-                delivery_note_id, parent_batch_id, has_been_repaired,
+                delivery_note_id, parent_batch_id,
                 version, created_at, created_by, updated_at, updated_by
             ) VALUES (
                 $1, $2, 1, $3, 'PENDING', $4,
                 NULL, NULL, NULL,
-                NULL, NULL, FALSE,
+                NULL, NULL,
                 0, now(), $5, now(), $5
             )
             RETURNING id AS "id!"
@@ -920,5 +902,37 @@ impl PartBatchRepo {
         .fetch_one(executor)
         .await?;
         Ok(id)
+    }
+
+    /// 2026-09-16 PR-2 瘦身（migration 027）：替代 `t_part.delivery_note_id`
+    /// 守卫（Finding D）。part 是否「已挂送货单」改查其任意活跃批次的
+    /// `delivery_note_id IS NOT NULL`（真相源在 t_part_batch）。
+    ///
+    /// 用于：
+    /// - `PartService::cancel` 守 21420 `BIZ_DELIVERY_NOTE_LOCKED_PART`
+    /// - `PartService::soft_delete_part` 预检（替代原 `soft_delete_part` UPDATE
+    ///   内 `delivery_note_id IS NULL` 条件）
+    /// - `AssemblyService::soft_delete_assembly` 子件预检
+    ///
+    /// 返回 `true` ⇔ part 至少有 1 条 `deleted_at IS NULL` 活跃批次的
+    /// `delivery_note_id` 非空。0 行 ⇒ `false`（无活跃批次 / 全无挂单）。
+    pub async fn has_active_batch_on_delivery_note<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT 1::bigint
+            FROM t_part_batch
+            WHERE part_id = $1
+              AND delivery_note_id IS NOT NULL
+              AND deleted_at IS NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(part_id)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row.is_some())
     }
 }

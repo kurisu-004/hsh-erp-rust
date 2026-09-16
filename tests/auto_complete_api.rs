@@ -86,12 +86,15 @@ async fn seed_delivered_batch(
     let now = now_naive();
     let today = now.date();
     let part_id = snowflake.next_id();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `actual_delivery_date` /
+    // `has_been_repaired`；实际交付日期真相源改为 t_part_event.DELIVERED 事件
+    // （auto_complete 阈值判定走 batch.placed_at，未受影响）。
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
-         applicant_name, request_date, planned_delivery_date, actual_delivery_date, \
-         quantity, has_been_repaired, version, created_at, updated_at) \
-         VALUES ($1, $2, 'AC-TEST', 'D-001', $3, 'DELIVERED', 'TEST', $4, $4, $4, \
-                 1, false, 0, $5, $5)",
+         applicant_name, request_date, planned_delivery_date, \
+         quantity, version, created_at, updated_at) \
+         VALUES ($1, $2, 'AC-TEST', 'D-001', $3, 'DELIVERED', 'TEST', $4, $4, \
+                 1, 0, $5, $5)",
     )
     .bind(part_id)
     .bind(serial)
@@ -104,10 +107,11 @@ async fn seed_delivered_batch(
 
     let placed_at = now - ChronoDuration::days(placed_days_ago);
     let batch_id = snowflake.next_id();
+    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`。
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, placed_at, \
-         has_been_repaired, version, created_at, updated_at) \
-         VALUES ($1, $2, 1, 1, 'DELIVERED', $3, false, 0, $4, $4)",
+         version, created_at, updated_at) \
+         VALUES ($1, $2, 1, 1, 'DELIVERED', $3, 0, $4, $4)",
     )
     .bind(batch_id)
     .bind(part_id)

@@ -35,6 +35,11 @@ impl PartService {
     /// 错误码：
     /// - 20101 `BIZ_PART_NOT_FOUND` —— part 不存在或已软删
     /// - 5xxxx 系统错 —— sqlx / 内部错误
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：rollup 只物化 `status` +
+    /// `next_process_id`（t_part 保留的两列读缓存）；`location` /
+    /// `current_holder_id` / `placed_at` 真相源在 t_part_batch，列表页
+    /// 按需另查（见 `PartService::list_parts` enrichment）。
     pub async fn sync_from_batch_change(
         conn: &mut PgConnection,
         part_id: i64,
@@ -62,8 +67,8 @@ impl PartService {
             return Ok(SyncOutcome::NoChange);
         };
 
-        // 4. 读 part 当前派生列（仅 status/location/holder/process/placed_at/
-        //    version 6 列；完整 28 列读会引入额外 IO）。
+        // 4. 读 part 当前 rollup 状态（status + next_process_id，2 列）。
+        //    2026-09-16 PR-2 瘦身：location / current_holder_id / placed_at 列已删。
         let cur = PartRepo::get_part_rollup_state(&mut *conn, part_id)
             .await?
             .ok_or_else(|| {
@@ -71,12 +76,7 @@ impl PartService {
             })?;
 
         // 5. target == 当前 → NoChange
-        if cur.status == target.status
-            && cur.location == target.location
-            && cur.current_holder_id == target.current_holder_id
-            && cur.next_process_id == target.next_process_id
-            && cur.placed_at == target.placed_at
-        {
+        if cur.status == target.status && cur.next_process_id == target.next_process_id {
             return Ok(SyncOutcome::NoChange);
         }
 
@@ -86,10 +86,7 @@ impl PartService {
             &mut *conn,
             part_id,
             &target.status,
-            target.location.as_deref(),
-            target.current_holder_id,
             target.next_process_id,
-            target.placed_at,
             current.id,
         )
         .await?;
@@ -104,8 +101,8 @@ impl PartService {
         if cur.status != target.status {
             return AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await;
         }
-        // status 没变但 location/holder/process/placed_at 物化了 —— 仍算
-        // 派生写成功，返回 Changed(part_id) 供 handler 决定是否广播。
+        // status 没变但 next_process_id 物化了 —— 仍算派生写成功，返回
+        // Changed(part_id) 供 handler 决定是否广播。
         Ok(SyncOutcome::Changed(part_id))
     }
 }

@@ -41,7 +41,7 @@ impl PartRepo {
                 r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, next_process_id, placed_at,
-                       delivery_note_id, parent_batch_id, has_been_repaired,
+                       delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
@@ -71,7 +71,7 @@ impl PartRepo {
                         r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, next_process_id, placed_at,
-                               delivery_note_id, parent_batch_id, has_been_repaired,
+                               delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
                         FROM t_part_batch
@@ -101,7 +101,7 @@ impl PartRepo {
                 r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, next_process_id, placed_at,
-                       delivery_note_id, parent_batch_id, has_been_repaired,
+                       delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
@@ -134,7 +134,7 @@ impl PartRepo {
                         r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, next_process_id, placed_at,
-                               delivery_note_id, parent_batch_id, has_been_repaired,
+                               delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
                         FROM t_part_batch
@@ -166,7 +166,7 @@ impl PartRepo {
                 r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, next_process_id, placed_at,
-                       delivery_note_id, parent_batch_id, has_been_repaired,
+                       delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
@@ -196,7 +196,7 @@ impl PartRepo {
                         r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, next_process_id, placed_at,
-                               delivery_note_id, parent_batch_id, has_been_repaired,
+                               delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
                         FROM t_part_batch
@@ -246,7 +246,7 @@ impl PartRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, next_process_id, placed_at,
-                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at
             FROM t_part_batch
@@ -368,7 +368,7 @@ impl PartRepo {
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, next_process_id, placed_at,
-                   delivery_note_id, parent_batch_id, has_been_repaired,
+                   delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at
             FROM t_part_batch
@@ -449,7 +449,7 @@ impl PartRepo {
                 r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, next_process_id, placed_at,
-                       delivery_note_id, parent_batch_id, has_been_repaired,
+                       delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
@@ -484,7 +484,7 @@ impl PartRepo {
                         r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, next_process_id, placed_at,
-                               delivery_note_id, parent_batch_id, has_been_repaired,
+                               delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
                         FROM t_part_batch
@@ -543,17 +543,19 @@ impl PartRepo {
         .await?;
 
         // 2. INSERT 新批次（quantity = split_quantity，status = new_batch_status）
+        //    2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
+        //    `has_been_repaired` 列，INSERT...SELECT 同步删该列。
         sqlx::query!(
             r#"
             INSERT INTO t_part_batch (
                 id, part_id, batch_no, quantity, status, location,
                 current_holder_id, next_process_id, placed_at,
-                delivery_note_id, parent_batch_id, has_been_repaired,
+                delivery_note_id, parent_batch_id,
                 version, created_at, created_by, updated_at, updated_by
             )
             SELECT $1, part_id, $2, $3, $7, location,
                    current_holder_id, next_process_id, placed_at,
-                   NULL, $4, has_been_repaired,
+                   NULL, $4,
                    0, now(), $5, now(), $5
             FROM t_part_batch
             WHERE id = $6 AND deleted_at IS NULL
@@ -668,7 +670,11 @@ impl PartRepo {
     }
 
 
-    /// 批次 IN_PROCESS → REPAIRING：同时置 `has_been_repaired=true`。
+    /// 批次 IN_PROCESS → REPAIRING。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 `has_been_repaired`
+    /// 列；返修事实由 `t_part_event` REPAIR_STARTED 事件追溯，本函数不再
+    /// 写返修标。
     pub async fn mark_batch_repairing<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -677,7 +683,7 @@ impl PartRepo {
     ) -> Result<u64, sqlx::Error> {
         let r = sqlx::query!(
             r#"UPDATE t_part_batch SET status='REPAIRING', version=version+1,
-                updated_at=now(), updated_by=$3, has_been_repaired=true
+                updated_at=now(), updated_by=$3
                WHERE id=$1 AND version=$2 AND status='IN_PROCESS' AND deleted_at IS NULL"#,
             batch_id, expected_version, current_user_id,
         ).execute(executor).await?;

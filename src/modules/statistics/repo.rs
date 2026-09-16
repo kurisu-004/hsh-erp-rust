@@ -90,26 +90,42 @@ impl StatisticsRepo {
     }
 
     /// 期内交付集合：count / sum(total_price) / orange / red（单条 SQL 条件聚合）。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `actual_delivery_date` 列；
+    /// 「实际交付日期」改由 t_part_event 的 DELIVERED 事件派生 —— LATERAL 子查询
+    /// 取该 part 任一活跃批次（`deleted_at IS NULL`）的最近一条 DELIVERED 事件
+    /// 时间戳。无事件 → 视为未交付。分类口径不变：orange = 晚于 planned 且
+    /// 不晚于 system；red = 晚于 system。
     pub async fn delivered_stats(
         conn: &mut PgConnection,
         date_from: NaiveDate,
         date_to: NaiveDate,
     ) -> Result<(i64, Decimal, i64, i64), sqlx::Error> {
         let row = sqlx::query(
-            "SELECT \
+            "WITH delivered AS ( \
+                 SELECT p.id, p.total_price, p.planned_delivery_date, p.system_delivery_date, \
+                        (SELECT MAX(e.created_at)::date \
+                         FROM t_part_event e \
+                         JOIN t_part_batch b ON b.id = e.batch_id \
+                         WHERE b.part_id = p.id \
+                           AND b.deleted_at IS NULL \
+                           AND e.event_type = 'DELIVERED') AS actual_date \
+                 FROM t_part p \
+                 WHERE p.deleted_at IS NULL \
+             ) \
+             SELECT \
                  COUNT(*)::bigint AS cnt, \
                  COALESCE(SUM(total_price), 0)::numeric AS sum_total, \
                  COALESCE(SUM(CASE \
-                     WHEN actual_delivery_date > planned_delivery_date \
-                          AND (system_delivery_date IS NULL OR actual_delivery_date <= system_delivery_date) \
+                     WHEN actual_date > planned_delivery_date \
+                          AND (system_delivery_date IS NULL OR actual_date <= system_delivery_date) \
                      THEN 1 ELSE 0 END), 0)::bigint AS orange, \
                  COALESCE(SUM(CASE \
-                     WHEN system_delivery_date IS NOT NULL AND actual_delivery_date > system_delivery_date \
+                     WHEN system_delivery_date IS NOT NULL AND actual_date > system_delivery_date \
                      THEN 1 ELSE 0 END), 0)::bigint AS red \
-             FROM t_part \
-             WHERE deleted_at IS NULL \
-               AND actual_delivery_date >= $1 \
-               AND actual_delivery_date <= $2",
+             FROM delivered \
+             WHERE actual_date >= $1 \
+               AND actual_date <= $2",
         )
         .bind(date_from)
         .bind(date_to)
@@ -193,23 +209,33 @@ impl StatisticsRepo {
         Ok(row.get::<i64, _>("cnt"))
     }
 
-    /// 当前超期未交付工单数（planned < today, actual IS NULL, 非终态）。
+    /// 当前超期未交付工单数（planned < today, 无 DELIVERED 事件, 非终态）。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `actual_delivery_date` 列；
+    /// 「未交付」判定改 NOT EXISTS DELIVERED 事件（事件存在 ⇒ 已交付；无事件
+    /// ⇒ 未交付）。多批次场景下任一活跃批次有 DELIVERED 事件即视为已交付。
     pub async fn count_overdue_undelivered(
         conn: &mut PgConnection,
         today: NaiveDate,
     ) -> Result<i64, sqlx::Error> {
         let row = sqlx::query(
             "SELECT COUNT(*)::bigint AS cnt \
-             FROM t_part \
-             WHERE deleted_at IS NULL \
-               AND planned_delivery_date < $1 \
-               AND actual_delivery_date IS NULL \
-               AND status NOT IN ('COMPLETED', 'CANCELLED')",
+             FROM t_part p \
+             WHERE p.deleted_at IS NULL \
+               AND p.planned_delivery_date < $1 \
+               AND p.status NOT IN ('COMPLETED', 'CANCELLED') \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM t_part_event e \
+                 JOIN t_part_batch b ON b.id = e.batch_id \
+                 WHERE b.part_id = p.id \
+                   AND b.deleted_at IS NULL \
+                   AND e.event_type = 'DELIVERED' \
+               )",
         )
         .bind(today)
         .fetch_one(conn)
         .await?;
-        Ok(row.get::<i64, _>("cnt"))
+        Ok(row.get("cnt"))
     }
 
     /// 当前各 status 工单数 → `(status_value, count)`，包含 CANCELLED 便于前端看分布。

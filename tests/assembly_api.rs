@@ -952,10 +952,13 @@ async fn state_machine_transitions() {
 // ===========================================================================
 
 /// 10. §3.2 update 级联：建装配体（带 PDF / 2 子件），update 共享字段后
-///     t_part 子件行 8 个共享字段（request_date / applicant_name / order_no /
+///     t_part 子件行 8 个共享字段（applicant_name / request_date / order_no /
 ///     system_delivery_date / planned_delivery_date / is_urgent / note /
-///     customer_id）应全部被覆盖为父件"更新后的当前行值"；actual_delivery_date
-///     不动。
+///     customer_id）应全部被覆盖为父件"更新后的当前行值"。
+///
+/// 2026-09-16 PR-2（migration 027）：t_part 删 `actual_delivery_date` 列；
+/// 该字段已不在级联集合（也不在 SELECT 投影）。返修/发货事实改由 t_part_event
+/// 事件日志承担，与级联更新无关。
 #[tokio::test]
 async fn update_assembly_cascades_shared_fields_to_children() {
     let (_guard, pool) = setup().await;
@@ -1015,7 +1018,8 @@ async fn update_assembly_cascades_shared_fields_to_children() {
     let asm_version = out.assembly.version;
     tx.commit().await.unwrap();
 
-    // 2) update_assembly：改 6 个共享字段 + customer_id；不动 actual_delivery_date
+    // 2) update_assembly：改 7 个共享字段 + customer_id（PR-2 删 actual_delivery_date 后
+    //    级联集合 8 字段中本测试改 7 字段 + 验证 customer_id）
     let updated_request_date: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
     let updated_planned: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 11, 20).unwrap();
     let updated_sys_delivery: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 11, 5).unwrap();
@@ -1026,7 +1030,6 @@ async fn update_assembly_cascades_shared_fields_to_children() {
         customer_id: Some(Some(l2_b.to_string())), // 改客户 → 也应级联
         request_date: Some(Some(updated_request_date)),
         planned_delivery_date: Some(Some(updated_planned)),
-        actual_delivery_date: None,
         is_urgent: Some(true),
         quantity: None, // 本测试不缩放
         unit_price: None,
@@ -1044,7 +1047,11 @@ async fn update_assembly_cascades_shared_fields_to_children() {
     assert_eq!(updated.applicant_name.as_deref(), Some("新申请人"));
     assert_eq!(updated.customer_id, l2_b);
 
-    // 3) 验证 t_part 子件 8 个共享字段被覆盖；quantity 不动；actual_delivery_date 不动
+// 3) 验证 t_part 子件 8 个共享字段被覆盖；quantity 不动
+    //
+    // 2026-09-16 PR-2（migration 027）：`t_part.actual_delivery_date` 列已删；断言集合
+    // 由 9 列（8 共享 + actual_delivery_date）收窄为 8 列共享字段（quantity 单独
+    // 校验不动）。返修/发货事实改由 t_part_event 事件日志承担，与级联更新无关。
     #[allow(clippy::type_complexity)]
     type CascadeRow = (
         String,                                // applicant_name
@@ -1056,12 +1063,11 @@ async fn update_assembly_cascades_shared_fields_to_children() {
         Option<String>,                        // note
         i64,                                   // customer_id
         i32,                                   // quantity（不动）
-        Option<chrono::NaiveDate>,             // actual_delivery_date（不动）
     );
     let rows: Vec<CascadeRow> = sqlx::query_as(
         "SELECT applicant_name, request_date, order_no, system_delivery_date, \
                 planned_delivery_date, is_urgent, note, customer_id, \
-                quantity, actual_delivery_date \
+                quantity \
          FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
     )
     .bind(asm_id)
@@ -1079,7 +1085,6 @@ async fn update_assembly_cascades_shared_fields_to_children() {
         assert_eq!(r.6.as_deref(), Some("更新后备注"), "note 级联覆盖");
         assert_eq!(r.7, l2_b, "customer_id 变更也级联");
         assert!(r.8 >= 3, "quantity 不应被级联改写（child1=3 或 child2=5）");
-        assert!(r.9.is_none(), "actual_delivery_date 不应被级联改写（流程产物）");
     }
 }
 
@@ -1134,7 +1139,6 @@ async fn update_assembly_scales_child_quantities() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: Some(2),
         unit_price: None,
@@ -1174,7 +1178,6 @@ async fn update_assembly_scales_child_quantities() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: Some(4),
         unit_price: None,
@@ -1213,7 +1216,6 @@ async fn update_assembly_scales_child_quantities() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: Some(12),
         unit_price: None,
@@ -1252,7 +1254,6 @@ async fn update_assembly_scales_child_quantities() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: Some(12),
         unit_price: None,
@@ -1332,7 +1333,10 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None, name: None, applicant_name: None,
         customer_id: None, request_date: None, planned_delivery_date: None,
-        actual_delivery_date: None, is_urgent: None,
+        // 2026-09-16 PR-2（migration 027）：t_assembly 删 `actual_delivery_date` 列，
+        // AssemblyUpdateRequest 同步精简（is_urgent 一直是 Option<bool>，未变化）。
+        // 本测试场景不动 is_urgent，传 None。
+        is_urgent: None,
         quantity: Some(5),
         unit_price: None, total_price: None,
         order_no: None, system_delivery_date: None, note: None,
@@ -1365,7 +1369,9 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None, name: None, applicant_name: None,
         customer_id: None, request_date: None, planned_delivery_date: None,
-        actual_delivery_date: None, is_urgent: None,
+        // 2026-09-16 PR-2（migration 027）：t_assembly 删 `actual_delivery_date` 列
+        // （is_urgent 一直是 Option<bool>，未变化）。
+        is_urgent: None,
         quantity: Some(3),
         unit_price: None, total_price: None,
         order_no: None, system_delivery_date: None, note: None,
@@ -1398,7 +1404,9 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None, name: None, applicant_name: None,
         customer_id: None, request_date: None, planned_delivery_date: None,
-        actual_delivery_date: None, is_urgent: None,
+        // 2026-09-16 PR-2（migration 027）：t_assembly 删 `actual_delivery_date` 列
+        // （is_urgent 一直是 Option<bool>，未变化）。
+        is_urgent: None,
         quantity: Some(1),
         unit_price: None, total_price: None,
         order_no: None, system_delivery_date: None, note: None,
