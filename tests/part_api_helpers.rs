@@ -294,6 +294,50 @@ pub async fn setup_inspection_and_production_shelves(pool: &PgPool) -> (i64, i64
     use common::insert_shelf;
     let inspection_shelf = insert_shelf(pool, "INSP-001", "品检架A", "INSPECTION").await;
     let production_shelf = insert_shelf(pool, "PROD-001", "生产架A", "PRODUCTION").await;
-    let next_process_id = 999_999_i64;
-    (inspection_shelf, production_shelf, next_process_id)
+    // 2026-09-16 PR-3 适配：seed_process_id 走真实 t_process 插入（process 必须存在）
+    let proc_id = seed_process(pool, "PROC-001", "工序001").await;
+    // 把 PRODUCTION 货架绑到这个 process（to_process 入口要求 shelf↔process 映射）
+    link_shelf_to_process(pool, production_shelf, proc_id).await;
+    (inspection_shelf, production_shelf, proc_id)
 }
+
+/// 2026-09-16 PR-3 适配：seed 一个 active process（PR-3 之前测试用 999_999 占位，
+/// 现 to_process / place_on_shelf 端点要求真实 process）。本 helper 是
+/// part_api_helpers 私有的（tests/common/mod.rs 也有同名的 pub 版本）。
+async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let proc_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_process (id, code, name, is_active, is_outsource, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, true, false, 0, now(), now())",
+    )
+    .bind(proc_id)
+    .bind(code)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("insert process");
+    proc_id
+}
+
+/// 把 shelf 绑到 process（t_shelf_process）。私有的（common 也有同名的 pub 版本）。
+async fn link_shelf_to_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let map_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_shelf_process (id, shelf_id, process_id, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, now(), now()) \
+         ON CONFLICT (shelf_id, process_id) DO NOTHING",
+    )
+    .bind(map_id)
+    .bind(shelf_id)
+    .bind(process_id)
+    .execute(pool)
+    .await
+    .expect("insert shelf-process mapping");
+}
+

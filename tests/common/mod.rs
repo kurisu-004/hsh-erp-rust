@@ -658,6 +658,74 @@ pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     .expect("insert t_shelf_process");
 }
 
+/// 2026-09-16 PR-3 批次 step 化：to_process / place_on_shelf / send_to_outsource /
+/// repair 等"进入生产流"端点要求 part 已绑定工艺链（migration 028 +
+/// error code 20706 BIZ_PROCESS_CHAIN_REQUIRED）。本 helper 帮 part 建链 + 绑 part。
+///
+/// 返回 chain_id；caller 可继续调 `create_step` 加 step。
+pub async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let chain_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, now(), 0, now(), 0)",
+    )
+    .bind(chain_id)
+    .bind(format!("chain-{part_id}"))
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+        .bind(chain_id)
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("bind part to chain");
+    chain_id
+}
+
+/// 2026-09-16 PR-3 批次 step 化：在指定 chain 内创建 step（process_id + sort_order）。
+pub async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let step_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, 30, 0, now(), 0, now(), 0)",
+    )
+    .bind(step_id)
+    .bind(chain_id)
+    .bind(sort_order)
+    .bind(process_id)
+    .execute(pool)
+    .await
+    .expect("insert chain step");
+    step_id
+}
+
+/// 2026-09-16 PR-3 适配：seed 一个 active process（PR-3 之前测试用 999_999 占位 process_id，
+/// 现 to_process / place_on_shelf 等端点会经 process_chain 守卫 + step JOIN 校验。
+/// 本 helper 提供真实 t_process 行便于测试）。
+pub async fn seed_test_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let proc_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_process (id, code, name, is_active, is_outsource, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, true, false, 0, now(), now())",
+    )
+    .bind(proc_id)
+    .bind(code)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("insert process");
+    proc_id
+}
+
 // ===========================================================================
 // 2026-09-16 M2-B review 第 1 轮：MockCos
 //

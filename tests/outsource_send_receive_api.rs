@@ -19,6 +19,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 use common::{
+    create_chain_for_part, create_step,
     add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
     link_shelf_to_process, seed_process, test_app, test_pool, test_state,
 };
@@ -242,6 +243,8 @@ async fn send_to_outsource_inserts_shipment_out_sourcing() {
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "SendCo").await;
     let proc_id = seed_outsource_process(&pool, "PSND", "psend").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
 
     let (s, env) = send(
@@ -296,7 +299,14 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "DupCo").await;
     let proc_id = seed_outsource_process(&pool, "PDUP", "dup").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
+    // receive-from-outsource 要求 part 已绑定工艺链
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
 
     // 第一次 send 成功
     let (_, env1) = send(
@@ -376,6 +386,11 @@ async fn send_to_outsource_direct_returns_internal_error() {
     let company_id = insert_outsource_company(&pool, "DirCo").await;
     let proc_id = seed_outsource_process(&pool, "PDIR", "dir").await;
 
+
+    // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
+    // receive-from-outsource 要求 part 已绑定工艺链
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let (s, env) = send(
         app,
         json_request(
@@ -407,6 +422,11 @@ async fn send_to_outsource_quote_not_approved_returns_21307() {
     let company_id = insert_outsource_company(&pool, "QdCo").await;
     let proc_id = seed_outsource_process(&pool, "PQ", "pq").await;
     // 直接 raw SQL 插一个 DRAFT quote（不走 service 校验）
+
+    // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
+    // receive-from-outsource 要求 part 已绑定工艺链
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
         1_577_836_800_000, 1,
@@ -457,6 +477,11 @@ async fn receive_from_outsource_marks_shipment_received() {
     let company_id = insert_outsource_company(&pool, "RecvCo").await;
     let proc_id = seed_outsource_process(&pool, "PR", "pr").await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
+    // receive-from-outsource 要求 part 已绑定工艺链
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     // 直插一个 OUTSOURCING shipment
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
@@ -530,6 +555,11 @@ async fn reconcile_update_shipment_unit_price_quantity() {
     let company_id = insert_outsource_company(&pool, "RecCo").await;
     let proc_id = seed_outsource_process(&pool, "PRU", "pru").await;
     use hsh_erp_rust::infra::clock::now_naive;
+
+    // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
+    // receive-from-outsource 要求 part 已绑定工艺链
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let now = now_naive();
     // 直接插一个 shipment
     let shipment_id: i64 = {

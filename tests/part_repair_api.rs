@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{clean_business_db, clean_db, link_shelf_to_process, seed_process, test_pool};
+use common::{
+    create_chain_for_part, create_step,clean_business_db, clean_db, link_shelf_to_process, seed_process, test_pool};
 
 use helpers::*;
 
@@ -69,6 +70,11 @@ async fn complete_repair_to_process_happy_path() {
     let version = batch_version(&pool, bid).await;
     let prod_shelf = common::insert_shelf(&pool, "P-R01", "生产架R1", "PRODUCTION").await;
     let proc_id = seed_process(&pool, "PROC-R1", "工序R1").await;
+
+    // 2026-09-16 PR-3 批次 step 化：complete-repair / repair-dispatch
+    // PRODUCTION 区要求 part 已绑定工艺链
+    let chain_id = create_chain_for_part(&pool, pid).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     link_shelf_to_process(&pool, prod_shelf, proc_id).await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
@@ -121,6 +127,9 @@ async fn complete_repair_invalid_source_rejects() {
     let prod_shelf = common::insert_shelf(&pool, "P-R02", "生产架R2", "PRODUCTION").await;
     let proc_id = seed_process(&pool, "PROC-R2", "工序R2").await;
     link_shelf_to_process(&pool, prod_shelf, proc_id).await;
+    // PR-3：repair-dispatch PRODUCTION 区要求 part 已绑定工艺链
+    let chain_id = create_chain_for_part(&pool, pid).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),

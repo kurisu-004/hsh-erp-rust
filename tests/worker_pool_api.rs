@@ -243,8 +243,8 @@ async fn insert_pool_part(
     // 且 batch 持有 current_process_step_id。helper 多走两步：建链 → 建 step。
     let chain_id = pool_snowflake().next_id();
     sqlx::query!(
-        "INSERT INTO t_part_process_chain (id, name, version, created_at, updated_at) \
-         VALUES ($1, $2, 0, $3, $3)",
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, $3, 0, $3, 0)",
         chain_id,
         format!("chain-{serial_no}"),
         now,
@@ -329,8 +329,8 @@ async fn insert_worker_held_part(
     // 2026-09-16 PR-3 批次 step 化：worker-pool 场景需要 process_chain + step
     let chain_id = snowflake.next_id();
     sqlx::query!(
-        "INSERT INTO t_part_process_chain (id, name, version, created_at, updated_at) \
-         VALUES ($1, $2, 0, $3, $3)",
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, $3, 0, $3, 0)",
         chain_id,
         format!("chain-{serial_no}"),
         now,

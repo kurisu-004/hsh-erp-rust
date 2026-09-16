@@ -196,8 +196,8 @@ async fn insert_pool_part(
     // helper 现在多走两步：建链 → 建 step → INSERT part/batch。
     let chain_id = pool_snowflake().next_id();
     sqlx::query!(
-        "INSERT INTO t_part_process_chain (id, name, version, created_at, updated_at) \
-         VALUES ($1, $2, 0, $3, $3)",
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, $3, 0, $3, 0)",
         chain_id,
         format!("chain-{serial_no}"),
         now,
