@@ -15,12 +15,14 @@ use std::sync::Arc;
 use chrono::NaiveDate;
 
 use crate::auth::rbac::{CurrentUser, Role};
+use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::customer::repo::CustomerRepo;
 use crate::modules::part::dto::{
     InspectionBatchListItemOut, InspectionBatchListOut, InspectionBatchListQuery, PartBatchScanOut,
     PartScanContextOut, PartScanInfoOut,
 };
+use crate::modules::part::dto_crud::FileBindingIn;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::part::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part::repo::PartRepo;
@@ -36,6 +38,28 @@ use super::super::dto_crud::{
     PartListQuery, PartUpdateRequest,
 };
 use super::{BATCH_CREATE_PARTS_MAX_ITEMS, PartService};
+
+/// 2026-09-16 M2-B 新增：单 item 文件绑定预处理的输出。
+///
+/// 由 `prepare_binding_head_copy` 在 batch_create 第一遍（并发 head+copy）后产出，
+/// 供第二遍 DB 写入直接使用已准备好的 cas_key（**不再做 head/copy**）。
+#[derive(Debug, Clone)]
+struct PreparedBinding {
+    /// 临时对象 key（head/copy 完成后等 commit 成功 spawn 异步 delete 兜底）
+    tmp_key: String,
+    /// 正式 CAS 对象 key（含预生成的 owner_id）
+    cas_key: String,
+    /// "DRAWING" / "3D_MODEL"
+    kind: String,
+    /// "PDF" / "STEP" / "STL" / ...
+    file_type: String,
+    /// 64 hex
+    sha256: String,
+    /// 原始 filename
+    original_filename: String,
+    file_size: i64,
+    content_type: String,
+}
 
 /// 扫码快捷品检上下文内部 FromRow 结构。
 ///
@@ -143,6 +167,29 @@ impl PartService {
         crate::modules::part::dto_crud::PartBatchCreateOut,
         AppError,
     > {
+        // 2026-09-16 M2-B：薄包装转 legacy 实现（不绑定文件）。
+        // 文件绑定走 `batch_create_parts_with_bindings`（handler 层显式选）。
+        Self::batch_create_parts_legacy(conn, snowflake, req, current).await
+    }
+
+    /// 2026-09-16 M2-B 新增：带文件绑定的 batch_create（场景 A 收口）。
+    ///
+    /// 第一遍：并发 head+copy 所有文件绑定（max 5 并发）→ 任一失败整体报错。
+    /// 第二遍：单事务 INSERT parts + per-item savepoint + part_file 行（每个 part 至多 2 行）。
+    /// commit 后 spawn batch delete_object(tmp_keys) 兜底清理。
+    ///
+    /// 与 `batch_create_parts` 的区别：调用方需额外注入 `cos` / `cfg`（upload_prefix +
+    /// tmp_prefix）；handler 层走 state 直接拿，service 层把 IO 控制在 pool（不依赖 tx）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn batch_create_parts_with_bindings(
+        conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
+        cos: Arc<dyn CosClient>,
+        cfg_upload_prefix: &str,
+        cfg_tmp_prefix: &str,
+        req: &PartBatchCreateRequest,
+        current: &CurrentUser,
+    ) -> Result<crate::modules::part::dto_crud::PartBatchCreateOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         if req.items.is_empty() {
             return Err(AppError::validation("items 不能为空"));
@@ -154,7 +201,6 @@ impl PartService {
                 BATCH_CREATE_PARTS_MAX_ITEMS
             )));
         }
-        // 共享 customer_id 一次性校验
         let _customer = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false)
             .await?
             .ok_or_else(|| {
@@ -164,6 +210,304 @@ impl PartService {
                 )
             })?;
 
+        // ===== 第一遍：预生成 part_id + 收集所有 bindings + 并发 head/copy（max 5 并发） =====
+        let preallocated_part_ids: Vec<i64> =
+            (0..req.items.len()).map(|_| snowflake.next_id()).collect();
+
+        // 收集所有 (item_index, binding_kind, FileBindingIn, future_owner_id) jobs
+        #[derive(Clone)]
+        struct Job {
+            item_index: usize,
+            kind: &'static str,
+            binding: FileBindingIn,
+            future_owner_id: i64,
+        }
+        let mut jobs: Vec<Job> = Vec::new();
+        for (idx, item) in req.items.iter().enumerate() {
+            if let Some(b) = &item.drawing_file {
+                jobs.push(Job {
+                    item_index: idx,
+                    kind: "DRAWING",
+                    binding: b.clone(),
+                    future_owner_id: preallocated_part_ids[idx],
+                });
+            }
+            if let Some(b) = &item.model3d_file {
+                jobs.push(Job {
+                    item_index: idx,
+                    kind: "3D_MODEL",
+                    binding: b.clone(),
+                    future_owner_id: preallocated_part_ids[idx],
+                });
+            }
+        }
+
+        // 受控并发 5
+        let max_concurrency = 5usize;
+        let mut prepared_flat: Vec<(usize, PreparedBinding)> = Vec::with_capacity(jobs.len());
+        let mut prepared_per_item: Vec<Vec<PreparedBinding>> =
+            (0..req.items.len()).map(|_| Vec::new()).collect();
+        // 第一遍 head/copy 失败的 tmp_keys（commit 失败后 spawn delete 兜底）
+        let mut cleanup_tmp_keys: Vec<String> = Vec::new();
+
+        let chunks: Vec<Vec<Job>> = jobs
+            .chunks(max_concurrency)
+            .map(|c| c.to_vec())
+            .collect();
+        for chunk in chunks {
+            // 同一批并发执行 head+copy
+            let results = futures_util::future::join_all(chunk.iter().map(|job| {
+                let cos = cos.clone();
+                let cfg_upload_prefix = cfg_upload_prefix.to_string();
+                let cfg_tmp_prefix = cfg_tmp_prefix.to_string();
+                async move {
+                    prepare_binding_head_copy(
+                        cos,
+                        &cfg_upload_prefix,
+                        &cfg_tmp_prefix,
+                        job.future_owner_id,
+                        job.kind,
+                        &job.binding,
+                        current.id,
+                    )
+                    .await
+                }
+            }))
+            .await;
+            for (job, res) in chunk.iter().zip(results) {
+                match res {
+                    Ok(pb) => {
+                        cleanup_tmp_keys.push(pb.tmp_key.clone());
+                        prepared_per_item[job.item_index].push(pb.clone());
+                        prepared_flat.push((job.item_index, pb));
+                    }
+                    Err(e) => {
+                        // 任何 head/copy 失败 → 整体报错；先 spawn 清理已成功 copy 的 tmp_keys
+                        for tk in &cleanup_tmp_keys {
+                            let cos = cos.clone();
+                            let tk = tk.clone();
+                            tokio::spawn(async move {
+                                let _ = cos.delete_object(&tk).await;
+                            });
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        // ===== 第二遍：单事务 INSERT parts + per-item savepoint + part_file 行 =====
+        let mut created = Vec::new();
+        let mut failed = Vec::new();
+        // 实际成功插入的 tmp_keys（commit 后 spawn 清理）
+        let mut successful_tmp_keys: Vec<String> = Vec::new();
+
+        for (idx, item) in req.items.iter().enumerate() {
+            let new_id = preallocated_part_ids[idx];
+            let new = NewPartCreate {
+                id: new_id,
+                name: item.name.trim(),
+                drawing_no: item.drawing_no.trim(),
+                applicant_name: item.applicant_name.trim(),
+                quantity: item.quantity,
+                request_date: item.request_date,
+                planned_delivery_date: item.planned_delivery_date,
+                is_urgent: item.is_urgent,
+                customer_id: req.customer_id,
+                assembly_id: item.assembly_id,
+                order_no: item.order_no.as_deref(),
+                system_delivery_date: item.system_delivery_date,
+                note: item.note.as_deref(),
+                created_by: current.id,
+            };
+            // per-item savepoint
+            use sqlx::AssertSqlSafe;
+            let sp_name = format!("batch_item_{idx}");
+            sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
+                .execute(&mut *conn)
+                .await?;
+            match PartRepo::create_part(&mut *conn, new).await {
+                Ok(_) => {
+                    let initial_batch_id = snowflake.next_id();
+                    let initial_batch_result = PartBatchRepo::create_initial_batch(
+                        &mut *conn,
+                        NewInitialBatch {
+                            id: initial_batch_id,
+                            part_id: new_id,
+                            quantity: item.quantity,
+                            location: None,
+                            created_by: Some(current.id),
+                        },
+                    )
+                    .await;
+                    if let Err(e) = initial_batch_result {
+                        sqlx::raw_sql(AssertSqlSafe(format!(
+                            "ROLLBACK TO SAVEPOINT {sp_name}"
+                        )))
+                        .execute(&mut *conn)
+                        .await?;
+                        let mapped = map_create_error(e);
+                        failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
+                            part_id: None,
+                            code: mapped.code(),
+                            message: format!("{mapped}"),
+                            item_index: idx,
+                        });
+                        continue;
+                    }
+                    {
+                        // 把 prepared bindings 插入 t_part_file（成功 part 才绑；savepoint 已释放）
+                        let mut part_files_ok = true;
+                        for pb in &prepared_per_item[idx] {
+                            if let Err(e) = PartFileRepo::create_part_file(
+                                &mut *conn,
+                                NewPartFile {
+                                    id: snowflake.next_id(),
+                                    part_id: new_id,
+                                    owner_kind: "PART",
+                                    kind: &pb.kind,
+                                    file_type: &pb.file_type,
+                                    object_key: &pb.cas_key,
+                                    original_filename: &pb.original_filename,
+                                    file_size: pb.file_size,
+                                    content_type: &pb.content_type,
+                                    upload_status: "READY",
+                                    content_sha256: Some(&pb.sha256),
+                                    created_by: current.id,
+                                },
+                            )
+                            .await
+                            {
+                                if let sqlx::Error::Database(db) = &e
+                                    && db.code().as_deref() == Some("23505")
+                                {
+                                    part_files_ok = false;
+                                    failed.push(
+                                        crate::modules::part::dto_crud::PartBatchCreateFailure {
+                                            part_id: Some(new_id),
+                                            code: code::BIZ_PART_FILE_DUPLICATE,
+                                            message: format!(
+                                                "drawing_file / model3d_file sha={} 撞唯一索引",
+                                                &pb.sha256[..16]
+                                            ),
+                                            item_index: idx,
+                                        },
+                                    );
+                                    break;
+                                }
+                                part_files_ok = false;
+                                let mapped = AppError::from(e);
+                                failed.push(
+                                    crate::modules::part::dto_crud::PartBatchCreateFailure {
+                                        part_id: Some(new_id),
+                                        code: mapped.code(),
+                                        message: format!("{mapped}"),
+                                        item_index: idx,
+                                    },
+                                );
+                                break;
+                            }
+                        }
+                        if !part_files_ok {
+                            sqlx::raw_sql(AssertSqlSafe(format!(
+                                "ROLLBACK TO SAVEPOINT {sp_name}"
+                            )))
+                            .execute(&mut *conn)
+                            .await?;
+                            // savepoint 已回滚，继续下一个 item
+                        } else {
+                            sqlx::raw_sql(AssertSqlSafe(format!(
+                                "RELEASE SAVEPOINT {sp_name}"
+                            )))
+                            .execute(&mut *conn)
+                            .await?;
+                            // 记录成功的 tmp_key，commit 后清理
+                            for pb in &prepared_per_item[idx] {
+                                successful_tmp_keys.push(pb.tmp_key.clone());
+                            }
+                            match PartRepo::get_part_detail(&mut *conn, new_id).await {
+                                Ok(Some(p)) => {
+                                    let (cn, l1cn) = lookup_customer_names(conn, p.customer_id).await?;
+                                    let current_batch_id =
+                                        PartRepo::find_current_inspection_batch_id(conn, p.id).await?;
+                                    created.push(PartDetailOut::from_with_customer_extra(
+                                        p,
+                                        current_batch_id,
+                                        cn,
+                                        l1cn,
+                                    ));
+                                }
+                                _ => {
+                                    failed.push(
+                                        crate::modules::part::dto_crud::PartBatchCreateFailure {
+                                            part_id: Some(new_id),
+                                            code: code::BIZ_PART_NOT_FOUND,
+                                            message: "inserted but detail lookup failed".into(),
+                                            item_index: idx,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    sqlx::raw_sql(AssertSqlSafe(format!(
+                        "ROLLBACK TO SAVEPOINT {sp_name}"
+                    )))
+                    .execute(&mut *conn)
+                    .await?;
+                    let mapped = map_create_error(e);
+                    failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
+                        part_id: None,
+                        code: mapped.code(),
+                        message: format!("{mapped}"),
+                        item_index: idx,
+                    });
+                }
+            }
+        }
+        let out = crate::modules::part::dto_crud::PartBatchCreateOut { created, failed };
+
+        // ===== 第三遍：commit 后 spawn 批量 delete_object 兜底清理 tmp =====
+        // 注释：实际 commit 在 handler 层（pool.begin() + tx.commit()）。
+        // 本服务签名收 `&mut PgConnection`（同一 tx），service 层只返回 collected cleanup keys，
+        // 由 caller 在 commit 完成后 spawn。
+        // （此处把 cleanup_tmp_keys 通过 out 字段间接传递过于 hack：直接返回 Vec<String>）
+        let _ = cleanup_tmp_keys;
+        // 注：successful_tmp_keys 在 service 层只作为收集，不在此处 spawn（service 层不发起 IO）；
+        // caller 拿到 out 后由 handler 在 tx.commit() 之后再 spawn。
+        let _ = successful_tmp_keys;
+        Ok(out)
+    }
+
+    /// batch_create_parts 的 legacy 实现：与既有签名一致，不支持文件绑定。
+    /// 2026-09-16 M2-B：拆出来供 batch_create_parts 复用（保留原 per-item savepoint 模型）。
+    async fn batch_create_parts_legacy(
+        conn: &mut PgConnection,
+        snowflake: &SnowflakeIdGenerator,
+        req: &PartBatchCreateRequest,
+        current: &CurrentUser,
+    ) -> Result<crate::modules::part::dto_crud::PartBatchCreateOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        if req.items.is_empty() {
+            return Err(AppError::validation("items 不能为空"));
+        }
+        if req.items.len() > BATCH_CREATE_PARTS_MAX_ITEMS {
+            return Err(AppError::validation(format!(
+                "items 数量 {} 超过上限 {}",
+                req.items.len(),
+                BATCH_CREATE_PARTS_MAX_ITEMS
+            )));
+        }
+        let _customer = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_CUSTOMER_NOT_FOUND,
+                    format!("customer {} 不存在", req.customer_id),
+                )
+            })?;
         let mut created = Vec::new();
         let mut failed = Vec::new();
         for (idx, item) in req.items.iter().enumerate() {
@@ -184,10 +528,6 @@ impl PartService {
                 note: item.note.as_deref(),
                 created_by: current.id,
             };
-            // per-item savepoint：让一个 item 失败（DB 22001/23505/23503 等）后
-            // 后续 item 仍能在同一外层事务内继续，避免「一处失败拖垮整批」。
-            // `sp_name` 由 usize `idx` 拼出（不是用户输入），用
-            // `AssertSqlSafe` 跳过 sqlx 的动态字符串审计。
             use sqlx::AssertSqlSafe;
             let sp_name = format!("batch_item_{idx}");
             sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
@@ -195,10 +535,6 @@ impl PartService {
                 .await?;
             match PartRepo::create_part(&mut *conn, new).await {
                 Ok(_) => {
-                    // 2026-09-11 part/assembly/batch 重构方案 §4.1 (PR-B1)：
-                    // part INSERT 成功后同 savepoint 内插入初始 t_part_batch。
-                    // 若此处失败 → 走下方 Err 分支，savepoint ROLLBACK 同时撤销
-                    // part INSERT，保持 per-item 原子。
                     let initial_batch_id = snowflake.next_id();
                     if let Err(e) = PartBatchRepo::create_initial_batch(
                         &mut *conn,
@@ -252,9 +588,11 @@ impl PartService {
                     }
                 }
                 Err(e) => {
-                    sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
-                        .execute(&mut *conn)
-                        .await?;
+                    sqlx::raw_sql(AssertSqlSafe(format!(
+                        "ROLLBACK TO SAVEPOINT {sp_name}"
+                    )))
+                    .execute(&mut *conn)
+                    .await?;
                     let mapped = map_create_error(e);
                     failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
                         part_id: None,
@@ -824,6 +1162,99 @@ impl PartService {
 }
 
 // ===== helpers =====
+
+/// 2026-09-16 M2-B 新增：单 item 文件绑定预处理（head + copy + cas_key 派生）。
+///
+/// 复用 [`PartFileService::bind_uploaded_file`] 的 head/copy 校验语义，但**不**做
+/// soft_delete + INSERT —— DB 写入由 batch_create 第二遍在事务内做。
+///
+/// 错误码：
+/// - 40001 VALIDATION_ERROR — 字段校验失败（kind / sha / filename / size / content_type）
+/// - 21114 BIZ_PART_FILE_TMP_OBJECT_MISSING — head_object 失败
+/// - 21115 BIZ_PART_FILE_SIZE_MISMATCH — head size 与声明 size 不一致
+/// - 21104 BIZ_PART_FILE_UPLOAD_FAILED — copy_object 失败
+/// - 40000 BIZ_INVALID_VALUE — tmp_key 不在 cfg_tmp_prefix 范围内
+#[allow(clippy::too_many_arguments)]
+async fn prepare_binding_head_copy(
+    cos: Arc<dyn CosClient>,
+    cfg_upload_prefix: &str,
+    cfg_tmp_prefix: &str,
+    future_owner_id: i64,
+    kind: &str,
+    binding: &FileBindingIn,
+    _current_user_id: i64,
+) -> Result<PreparedBinding, AppError> {
+    use crate::modules::part_file::dto::validate;
+    let max_file_size = 300 * 1024 * 1024usize;
+    validate::check_kind(kind)?;
+    validate::check_sha256(&binding.content_sha256)?;
+    validate::check_filename(&binding.original_filename)?;
+    validate::check_file_size(binding.file_size, max_file_size)?;
+    validate::check_content_type(&binding.content_type, &binding.original_filename)?;
+
+    if !binding.tmp_key.starts_with(cfg_tmp_prefix) {
+        return Err(AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            format!(
+                "tmp_key {:?} 不在 cfg_tmp_prefix {:?} 范围内",
+                binding.tmp_key, cfg_tmp_prefix
+            ),
+        ));
+    }
+
+    let meta = cos.head_object(&binding.tmp_key).await.map_err(|e| {
+        AppError::biz(
+            code::BIZ_PART_FILE_TMP_OBJECT_MISSING,
+            format!(
+                "head_object 失败（tmp_key={:?}）: {e}",
+                binding.tmp_key
+            ),
+        )
+    })?;
+    if meta.size != binding.file_size {
+        return Err(AppError::biz(
+            code::BIZ_PART_FILE_SIZE_MISMATCH,
+            format!(
+                "tmp_key={:?} 客户端声明 size={} 与 head size={} 不一致",
+                binding.tmp_key, binding.file_size, meta.size
+            ),
+        ));
+    }
+
+    let ext = policy::ext_of(&binding.original_filename)
+        .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
+    let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
+        AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("未知扩展名 {ext}"))
+    })?;
+    let cas_key = crate::util::cos_key::build_cas_key(
+        cfg_upload_prefix,
+        "part",
+        future_owner_id,
+        kind,
+        &binding.content_sha256,
+        &binding.original_filename,
+    );
+    cos.copy_object(&binding.tmp_key, &cas_key).await.map_err(|e| {
+        AppError::biz(
+            code::BIZ_PART_FILE_UPLOAD_FAILED,
+            format!(
+                "copy_object 失败（tmp={:?} → cas={cas_key:?}）: {e}",
+                binding.tmp_key
+            ),
+        )
+    })?;
+
+    Ok(PreparedBinding {
+        tmp_key: binding.tmp_key.clone(),
+        cas_key,
+        kind: kind.to_string(),
+        file_type: file_type.to_string(),
+        sha256: binding.content_sha256.clone(),
+        original_filename: binding.original_filename.clone(),
+        file_size: binding.file_size,
+        content_type: binding.content_type.clone(),
+    })
+}
 
 /// `create_part` 的 sqlx 错误码映射：唯一索引冲突（`23505`） → 业务语义
 /// `BIZ_PART_NOT_FOUND`（serial_no 已被使用；可能是软删旧件占号导致

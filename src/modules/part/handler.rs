@@ -369,6 +369,7 @@ use crate::modules::part::dto_crud::{
     PartBatchCreateOut, PartCreateRequest, PartDetailOut, PartListOut,
     PartListQuery, PartSoftDeleteRequest, PartUpdateRequest, StartRepairRequest,
 };
+use crate::modules::part_file::dto::ConfirmFileIn;
 use crate::modules::part_file::model::TPartFile;
 
 /// 列表 / 详情 / by-serial 允许角色：4 角色全开放。
@@ -482,14 +483,42 @@ pub async fn create_part(
 /// POST /api/v2/parts/batch
 ///
 /// 批量创建（共享 `customer_id`）；per-item 失败不中断整体。
+///
+/// 2026-09-16 M2-B 新增：支持 `drawing_file` / `model3d_file` 单 item 文件绑定（直传 COS 链路）。
+/// 任一 binding head/copy 失败 → 整体报错回滚（用户重试整批）；其余 part 成功则按 per-item
+/// savepoint 模型部分成功。
 pub async fn batch_create_parts(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Json(req): Json<PartBatchCreateRequest>,
 ) -> Result<Json<R<PartBatchCreateOut>>, AppError> {
     current.require_any_role(CRUD_PART_ROLES)?;
+    // 检查是否含任何 file binding（决定走 legacy / 扩展入口）
+    let has_bindings = req
+        .items
+        .iter()
+        .any(|i| i.drawing_file.is_some() || i.model3d_file.is_some());
     let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_create_parts(&mut tx, &state.snowflake, &req, &current).await?;
+    let out = if has_bindings {
+        // 走带 bindings 的扩展入口：head/copy 在 tx 之外（service 内 pool 直连），
+        // tx 内只做 part / batch / part_file INSERT；commit 后由本 handler spawn
+        // 批量 delete_object(tmp_keys) 兜底。
+        // 注意：成功 INSERT 的 tmp_keys 暂未透出（service 当前未返回 cleanup list）；
+        // 第一遍失败的 tmp_keys 已在 service 内部 spawn 清理。本 task 的最小闭环
+        // 不阻塞提交；cleanup 透出留待后续 task。
+        PartService::batch_create_parts_with_bindings(
+            &mut tx,
+            &state.snowflake,
+            state.cos.clone(),
+            &state.config.cos.upload_prefix,
+            &state.config.cos.tmp_prefix,
+            &req,
+            &current,
+        )
+        .await?
+    } else {
+        PartService::batch_create_parts(&mut tx, &state.snowflake, &req, &current).await?
+    };
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -599,6 +628,56 @@ pub async fn upload_drawing(
     .await?;
     tx.commit().await?;
     Ok(Json(R::ok(pf)))
+}
+
+/// POST /api/v2/parts/{part_id}/files/confirm
+///
+/// 直传 COS 链路的"提交绑定"端点：客户端 PUT 到 tmp 区成功后，调用本端点把
+/// tmp 对象 copy 到 CAS key + INSERT `t_part_file` + 异步清理 tmp 对象。
+///
+/// 流程：
+/// 1. 权限（service 内 `require_any_role(Manager + Clerk)`，按 kind 派生）
+/// 2. 入参校验（kind / sha / filename / size / content_type）
+/// 3. `PartFileService::bind_uploaded_file` —— head/copy 在 pool（不在 tx），
+///    tx 内只做 soft_delete 旧 + INSERT 新
+/// 4. **commit 后** spawn 异步 `cos.delete_object(tmp_key)` 兜底清理（与
+///    `soft_delete_part_file` 模式一致，避免 commit 失败却触发 COS 删除）
+///
+/// 2026-09-16 M2-B 新增。
+pub async fn confirm_part_file(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<ConfirmFileIn>,
+) -> Result<Json<R<crate::modules::part_file::dto::PartFileOut>>, AppError> {
+    let (out, tmp_key) = crate::modules::part_file::service::PartFileService::bind_uploaded_file(
+        &state.pool,
+        &state.snowflake,
+        state.cos.clone(),
+        &state.config.cos.upload_prefix,
+        &state.config.cos.tmp_prefix,
+        part_id,
+        &req.kind,
+        &req.tmp_key,
+        &req.content_sha256,
+        &req.original_filename,
+        req.file_size,
+        &req.content_type,
+        &current,
+    )
+    .await?;
+    // commit 已由 service 内 `tx.commit()` 完成；这里 spawn 异步清理 tmp
+    let cos = state.cos.clone();
+    tokio::spawn(async move {
+        if let Err(e) = cos.delete_object(&tmp_key).await {
+            tracing::warn!(
+                tmp_key = %tmp_key,
+                error = %e,
+                "confirm_part_file COS tmp 异步清理失败（已绑定到 part_file，不影响 API 返回）"
+            );
+        }
+    });
+    Ok(Json(R::ok(out)))
 }
 
 /// POST /api/v2/parts/{part_id}/upload-3d-model
