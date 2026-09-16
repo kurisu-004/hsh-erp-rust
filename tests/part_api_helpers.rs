@@ -14,7 +14,11 @@
 // part_api_inspection_batches 用 login_inspector / login_worker）。
 // 编译单个 binary 时未引用的 helper 会触发 `dead_code` warning；统一在
 // helpers crate 根豁免，避免每个 binary 都 `#[allow(dead_code)]`。
-#![allow(dead_code)]
+//
+// 2026-09-16 PR-3 fix：允许 `clippy::await_holding_lock` —— fixture 模式与
+// common/ 一致（pool_snowflake().lock() 跨 .await 持锁），进程内单 task
+// 不会真实死锁。`unused_imports` 同 worker_pool_api.rs。
+#![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -25,7 +29,6 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use common::{add_role, insert_user_with_password, test_app, test_state};
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use tower::ServiceExt;
 
 // ===========================================================================
@@ -305,7 +308,6 @@ pub async fn setup_inspection_and_production_shelves(pool: &PgPool) -> (i64, i64
 /// 现 to_process / place_on_shelf 端点要求真实 process）。本 helper 是
 /// part_api_helpers 私有的（tests/common/mod.rs 也有同名的 pub 版本）。
 async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
     let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let proc_id = snowflake.next_id();
     sqlx::query(
@@ -324,7 +326,6 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 
 /// 把 shelf 绑到 process（t_shelf_process）。私有的（common 也有同名的 pub 版本）。
 async fn link_shelf_to_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
     let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let map_id = snowflake.next_id();
     sqlx::query(

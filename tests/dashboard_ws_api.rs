@@ -137,11 +137,12 @@ async fn build_snapshot_with_workers_returns_full_shape() {
     .unwrap();
 
     // part_batch IN_PROCESS + holder=shelf + location=PRODUCTION_SHELF
+    // 2026-09-16 PR-3 批次 step 化：t_part_batch 删 `placed_at` 列，INSERT 列名/占位符同步移除。
     let batch_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, placed_at, version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, 1, 5, 'IN_PROCESS', 'PRODUCTION_SHELF', $3, $4, 0, $4, NULL, $4, NULL)",
+         current_holder_id, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, 5, 'IN_PROCESS', 'PRODUCTION_SHELF', $3, 0, $4, NULL, $4, NULL)",
     )
     .bind(batch_id)
     .bind(part_id)

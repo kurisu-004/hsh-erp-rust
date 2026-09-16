@@ -22,7 +22,15 @@
 // `dead_code` warning；统一在 common 根豁免，避免每个 binary 都加
 // `#[allow(dead_code)]`。`duplicate-mod` 同理：多 test binary 共用本文件，
 // clippy --all-targets 会扫到「同文件被多次作为模块加载」。
-#![allow(dead_code, clippy::duplicate_mod)]
+//
+// 2026-09-16 PR-3 fix：允许 `clippy::await_holding_lock` —— PR-3 step3 引入的
+// `pool_snowflake()` 全局共享 std::sync::Mutex，所有 fixture helper（part/user/
+// chain/step 等）模式都是「lock 拿 guard → next_id() → .await INSERT」，guard
+// 在 .await 期间仍持有。改成 `lock().next_id()` expression 形式（不持 guard
+// 跨 await）需要重写所有 12+ helper，收益与风险不对等；测试场景下进程内单
+// task 不会与其他 task 抢该 mutex（每个 test 内 fixture 串行调用），不会
+// 真实死锁。
+#![allow(dead_code, clippy::duplicate_mod, clippy::await_holding_lock)]
 
 use std::sync::Arc;
 
@@ -674,7 +682,6 @@ pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
 ///
 /// 返回 chain_id；caller 可继续调 `create_step` 加 step。
 pub async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
     let snowflake = pool_snowflake().lock().unwrap();
     let chain_id = snowflake.next_id();
     sqlx::query(
@@ -697,7 +704,6 @@ pub async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
 
 /// 2026-09-16 PR-3 批次 step 化：在指定 chain 内创建 step（process_id + sort_order）。
 pub async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
     let snowflake = pool_snowflake().lock().unwrap();
     let step_id = snowflake.next_id();
     sqlx::query(
@@ -719,7 +725,6 @@ pub async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_ord
 /// 现 to_process / place_on_shelf 等端点会经 process_chain 守卫 + step JOIN 校验。
 /// 本 helper 提供真实 t_process 行便于测试）。
 pub async fn seed_test_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
     let snowflake = pool_snowflake().lock().unwrap();
     let proc_id = snowflake.next_id();
     sqlx::query(

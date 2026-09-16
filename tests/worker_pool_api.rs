@@ -20,6 +20,15 @@
 //!
 //! ## 串行化
 //! 进程级 `tokio::sync::Mutex` + `--test-threads=1` 双保险。共享 `postgres_rust_test` 库。
+//!
+//! ## clippy allow
+//! 2026-09-16 PR-3：fixture helper（`insert_pool_part` / `insert_worker_held_part` /
+//! `insert_work_type` / `insert_worker` / `insert_customer_l2` / `insert_l2_customer`）
+//! 全部走 `pool_snowflake().lock()` 拿 guard 跨多个 .await SQL，模式与 common/
+//! 一致，豁免 `await_holding_lock`。`unused_imports` 豁免是因为 `use
+//! SnowflakeIdGenerator` 在文件顶层未直接使用（仅作为 `pool_snowflake()` 返回
+//! 类型签名引用）。
+#![allow(clippy::await_holding_lock, unused_imports)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -34,7 +43,6 @@ use common::{
     add_role, insert_user_with_password, link_shelf_to_process, link_work_type_to_process,
     seed_process, test_app, test_state,
 };
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
 //  全局串行化 + HTTP helpers
@@ -307,6 +315,10 @@ async fn insert_pool_part(
 /// - `process_id`：batch.next_process_id（必填 RETURNED）
 ///
 /// 返回 (part_id, batch_id)。
+///
+/// 2026-09-16 PR-3 fix：复用同一 `snowflake` guard 生成所有 id，不要再
+/// `common::pool_snowflake().lock()` 第二次——`std::sync::Mutex` 非递归，
+/// 同线程二次 lock 会永久 hang（PR-3 step3 之前无此问题）。
 async fn insert_worker_held_part(
     pool: &PgPool,
     customer_id: i64,
@@ -364,7 +376,8 @@ async fn insert_worker_held_part(
     .execute(pool)
     .await
     .expect("insert held t_part");
-    let batch_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    // 2026-09-16 PR-3 fix：复用 `snowflake` guard 而非 `pool_snowflake().lock()` 第二次。
+    let batch_id = snowflake.next_id();
     // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
     // 列名与 VALUES 占位符同步移除 `false` 字面量。
     sqlx::query!(

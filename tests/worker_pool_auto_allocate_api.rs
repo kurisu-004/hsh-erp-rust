@@ -11,6 +11,13 @@
 //!
 //! ## 串行化
 //! 进程级 `tokio::sync::Mutex` + `--test-threads=1` 双保险。
+//!
+//! ## clippy allow
+//! 2026-09-16 PR-3：fixture helper（`insert_pool_part` / `insert_work_type` /
+//! `insert_worker` / `insert_l2_customer` 等）走 `pool_snowflake().lock()` 跨 .await
+//! 持锁模式，与 common/ + worker_pool_api.rs 一致；`unused_imports` 是顶层
+//! `use SnowflakeIdGenerator` 仅作类型签名引用。
+#![allow(clippy::await_holding_lock, unused_imports)]
 
 #[path = "common/mod.rs"]
 mod common;
@@ -25,7 +32,6 @@ use common::{
     add_role, insert_user_with_password, link_shelf_to_process, link_work_type_to_process,
     seed_process, test_app, test_state,
 };
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
 //  全局串行化 + HTTP helpers

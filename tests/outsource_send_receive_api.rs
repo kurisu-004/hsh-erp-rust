@@ -505,6 +505,10 @@ async fn receive_from_outsource_marks_shipment_received() {
     let prod_shelf = common::insert_shelf(&pool, "REC-1", "Recv", "PRODUCTION").await;
     let next_proc = seed_process(&pool, "REC-PROC", "recv_proc").await;
     link_shelf_to_process(&pool, prod_shelf, next_proc).await;
+    // 2026-09-16 PR-3：receive 路径要把 batch.current_process_step_id 切到
+    // (chain_id, next_process_id) 对应的 step，因此 fixture 必须为 next_proc 也建一个 step。
+    let next_step_id = create_step(&pool, chain_id, next_proc, 2).await;
+    let _ = next_step_id; // 确认 step 已落库；service 内自行解析
 
     let (s, env) = send(
         app.clone(),
