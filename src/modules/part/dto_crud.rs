@@ -43,6 +43,14 @@ pub struct PartCreateRequest {
 
 /// `POST /parts/batch` 单 item 入参：与 `PartCreateRequest` 字段集对齐，
 /// 但 `customer_id` 提到 batch 级别（共享）。
+///
+/// 2026-09-16 M2-B 新增可选字段：
+/// - `drawing_file`：上传图纸 PDF（kind=DRAWING）绑定
+/// - `model3d_file`：上传 3D 模型（kind=3D_MODEL）绑定
+///
+/// 两个字段都形如 [`FileBindingIn`]，由前端从 `POST /part-files/upload-intents`
+/// 拿到 `tmp_key` 后填回。`batch_create_parts` service 会先并发 head/copy 所有
+/// binding 项，**任一失败** → 整体回滚（让用户重试整批）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartBatchCreateItem {
     pub name: String,
@@ -61,6 +69,30 @@ pub struct PartBatchCreateItem {
     pub note: Option<String>,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
     pub assembly_id: Option<i64>,
+    /// 2026-09-16 M2-B 新增：上传图纸 PDF 绑定（kind=DRAWING，file_type=PDF）
+    #[serde(default)]
+    pub drawing_file: Option<FileBindingIn>,
+    /// 2026-09-16 M2-B 新增：上传 3D 模型绑定（kind=3D_MODEL，file_type 由扩展名推导）
+    #[serde(default)]
+    pub model3d_file: Option<FileBindingIn>,
+}
+
+/// `POST /parts/batch` 单个文件绑定子结构（drawing_file / model3d_file）。
+///
+/// 由前端在拿到 `POST /part-files/upload-intents` 返回的 `tmp_key` 后填回。
+/// `content_sha256` 必须与 upload-intents 提交时一致（CAS 命中场景下
+/// upload-intents 返回 `dedup_hit=true`，前端跳过上传，把 `existing_file` 拼
+/// 回 PartFileOut，本字段为 None——即 `binding` 也为 None）。
+///
+/// 2026-09-16 M2-B 新增。
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileBindingIn {
+    pub tmp_key: String,
+    pub content_sha256: String,
+    pub original_filename: String,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub file_size: i64,
+    pub content_type: String,
 }
 
 /// `POST /parts/batch` 入参：批量创建（共享 customer_id）。
@@ -85,10 +117,21 @@ pub struct PartBatchCreateFailure {
 }
 
 /// `POST /parts/batch` 出参：`created` 与 `failed` 互斥。
+///
+/// 2026-09-16 M2-B review 第 1 轮：`cleanup_tmp_keys` 新增字段。
+/// - 含义：本批次成功 INSERT 后、需要 commit 后异步清理的 tmp 对象 key 列表
+///   （client 已直传到 COS tmp 区，已被 service 端 head+copy 到 CAS key）。
+/// - 用途：handler 在 `tx.commit()` 之后 `tokio::spawn` 批量 `cos.delete_object(&key)`
+///   兜底，避免 commit 失败却已触发 COS 删除产生孤儿。
+/// - 前端不需要该字段（`#[serde(default)]` 兜空，前端忽略）；后端用 `out.cleanup_tmp_keys`。
+/// - legacy（无 binding）路径该列表为空，前端 / 集成测试无需关注。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartBatchCreateOut {
     pub created: Vec<PartDetailOut>,
     pub failed: Vec<PartBatchCreateFailure>,
+    /// commit 后由 handler spawn 异步清理的 tmp 对象 key 列表。
+    #[serde(default)]
+    pub cleanup_tmp_keys: Vec<String>,
 }
 
 // ===== Update =====

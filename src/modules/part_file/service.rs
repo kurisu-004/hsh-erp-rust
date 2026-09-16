@@ -1,4 +1,4 @@
-//! part_file 域业务逻辑（2026-09-14 Phase 3）
+//! part_file 域业务逻辑（2026-09-14 Phase 3 + 2026-09-16 M2-B 业务层）
 //!
 //! 对应 Python myERP/service/part_file_service.py + service/_file_kind_policy.py。
 //!
@@ -23,15 +23,23 @@
 //! ## 与 part 域的耦合
 //! 装配体 PDF（kind='ASSEMBLY_MASTER'）走相同上传通道，owner_kind='ASSEMBLY'，
 //! 由 assembly 域在创建流程或单独的 `POST /assemblies/{id}/files` 端点调用。
+//!
+//! ## 2026-09-16 M2-B 直传 COS 链路
+//! - `upload_intents`：场景 A/B 一次性签发 STS + 预生成 tmp_key / CAS 去重命中复用
+//! - `bind_uploaded_file`：confirm handler + batch_create service 共享的"已上传到 tmp
+//!   区 → 绑定到 owner"逻辑；head/copy 在 tx 之外，事务内只做 soft_delete + INSERT
 
 use std::sync::Arc;
 
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgPool};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part_file::dto::{PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut};
+use crate::modules::part_file::dto::{
+    validate, PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut,
+    UploadIntentItemOut, UploadIntentsIn, UploadIntentsOut,
+};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy;
 use crate::modules::part_file::repo::{hash_bytes, NewPartFile, PartFileRepo};
@@ -306,6 +314,307 @@ pub async fn list_part_files_for_owner(
     owner_id: i64,
 ) -> Result<Vec<TPartFile>, sqlx::Error> {
     PartFileRepo::list_by_owner(conn, owner_kind, owner_id).await
+}
+
+// ===== 2026-09-16 M2-B 业务层：直传 COS 链路 service =====
+
+impl PartFileService {
+    /// `POST /api/v2/part-files/upload-intents`（场景 A + 场景 B）。
+    ///
+    /// 流程：
+    /// 1. 权限守卫（Manager + Clerk）
+    /// 2. 逐项校验（kind / sha / filename / size / content_type）—— 用
+    ///    [`dto::validate`] 集中函数
+    /// 3. 场景 B（`owner_part_id` 非空）：
+    ///    - 校验 part 存在（`assert_owner_exists`）
+    ///    - 逐项查 `(part_id, kind, sha)` CAS 命中；命中 → 标 `dedup_hit=true`，
+    ///      附 `existing_file`，**不分配 tmp_key**
+    ///    - 未命中 → 分配 `tmp_key = format!("{owner_sub_prefix}/{kind}/{seq}_{safe}")`
+    /// 4. 场景 A（`owner_part_id` 空）：
+    ///    - 生成 `batch_uuid = Uuid::new_v4()`
+    ///    - 逐项分配 `tmp_key = format!("{batch_sub_prefix}/{seq}_{safe}")`（**不查重**
+    ///      —— part 还未建，无法查重；batch_create 时再按 (新建 part_id, kind, sha) 二次查）
+    /// 5. 一次性签 STS（`state.sts.issue_for_intents(tmp_sub_prefix)`）—— 单次签发覆盖
+    ///    本次 batch 的所有 tmp 对象，前端只需拿一组 credentials 即可
+    /// 6. 返回 `UploadIntentsOut`
+    ///
+    /// 关键不变式：
+    /// - **tmp_key 必须以 `tmp_sub_prefix` 开头**：前端按 prefix 写，服务端 confirm 时
+    ///   按 prefix 校验（防客户端乱传 key 读到别人文件）
+    /// - **STS policy resource 覆盖整个 tmp_sub_prefix**：caller 在 `issue_for_intents`
+    ///   内显式构造
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upload_intents(
+        pool: &PgPool,
+        cfg_tmp_prefix: &str,
+        sts: Arc<dyn crate::infra::sts::StsCredentialIssuer>,
+        req: &UploadIntentsIn,
+        current: &CurrentUser,
+    ) -> Result<UploadIntentsOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+
+        // 全空 files 列表直接返回空 items（前端可能请求后还没勾选文件）
+        if req.files.is_empty() {
+            // 仍签一次 STS（保持出参形态一致；frontend 拿到 credentials 后可丢弃）
+            let cred = sts.issue_for_intents(cfg_tmp_prefix).await?;
+            return Ok(UploadIntentsOut {
+                credentials: cos_credentials_out(&cred),
+                bucket: cred.bucket,
+                region: cred.region,
+                tmp_prefix: cred.tmp_prefix,
+                items: vec![],
+            });
+        }
+
+        // 1. 逐项校验
+        let max_file_size = 300 * 1024 * 1024usize; // 与 dto::validate 一致（默认 300MB）
+        for item in &req.files {
+            validate::check_upload_intent_item(item, max_file_size)?;
+        }
+
+        // 2. 派生 tmp_sub_prefix（场景 A 用 batch_uuid；场景 B 用 owner_part_id）
+        let mut conn = pool.acquire().await?;
+        let tmp_sub_prefix = if let Some(owner_id) = req.owner_part_id {
+            // 场景 B：先校验 part 存在
+            Self::assert_owner_exists(&mut conn, "PART", owner_id).await?;
+            format!("{cfg_tmp_prefix}part/{owner_id}")
+        } else {
+            // 场景 A：batch_uuid 一次性生成
+            format!("{cfg_tmp_prefix}{}", uuid::Uuid::new_v4())
+        };
+
+        // 3. 一次性签 STS（覆盖整 tmp_sub_prefix/*）
+        let cred = sts.issue_for_intents(&tmp_sub_prefix).await?;
+
+        // 4. 逐项分配 tmp_key 或 dedup 命中复用
+        let mut items = Vec::with_capacity(req.files.len());
+        for (seq, item) in req.files.iter().enumerate() {
+            let client_ref = seq.to_string();
+            // 场景 B：先查重；命中 → 复用，不分配 tmp_key
+            if let Some(owner_id) = req.owner_part_id
+                && let Some(existing) = PartFileRepo::get_by_owner_kind_sha(
+                    &mut *conn,
+                    owner_id,
+                    &item.kind,
+                    &item.content_sha256,
+                )
+                .await?
+            {
+                items.push(UploadIntentItemOut {
+                    client_ref,
+                    tmp_key: String::new(),
+                    dedup_hit: true,
+                    existing_file: Some(Self::render_out(&existing, "PART")),
+                });
+                continue;
+            }
+            // 未命中（场景 A 全走这里 + 场景 B 未命中）：分配 tmp_key
+            let safe = sanitize_filename(&item.filename);
+            let tmp_key = if let Some(_owner_id) = req.owner_part_id {
+                // 场景 B：tmp_key 形如 `tmp/part/{owner_id}/{kind}/{seq}_{safe}`
+                format!("{}/{}/{}_{}", tmp_sub_prefix, item.kind, seq, safe)
+            } else {
+                // 场景 A：tmp_key 形如 `tmp/{batch_uuid}/{seq}_{safe}`（无 kind 段）
+                format!("{tmp_sub_prefix}/{seq}_{safe}")
+            };
+            items.push(UploadIntentItemOut {
+                client_ref,
+                tmp_key,
+                dedup_hit: false,
+                existing_file: None,
+            });
+        }
+
+        Ok(UploadIntentsOut {
+            credentials: cos_credentials_out(&cred),
+            bucket: cred.bucket,
+            region: cred.region,
+            tmp_prefix: cred.tmp_prefix,
+            items,
+        })
+    }
+
+    /// 共享 service：把已上传到 COS tmp 区的一个对象绑定到 owner（INSERT t_part_file）。
+    ///
+    /// 调用方：`confirm handler`（T2.6）+ `batch_create service`（T2.7）。
+    ///
+    /// 流程：
+    /// 1. `tmp_key` 前缀防呆：必须以 `cfg_tmp_prefix` 开头（防客户端乱传 key 读到别人文件）
+    /// 2. `head_object` 校验对象存在 + size 与声明一致：
+    ///    - 不存在 → `BIZ_PART_FILE_TMP_OBJECT_MISSING` 21114
+    ///    - size 不一致 → `BIZ_PART_FILE_SIZE_MISMATCH` 21115
+    /// 3. 单文件 kind（DRAWING / 3D_MODEL）：事务内先 soft_delete 旧活跃行（保留 owner+kind+deleted_at IS NULL）
+    /// 4. 派生 CAS key：`util::cos_key::build_cas_key(prefix, "part", owner_id, kind, sha16, filename)`
+    /// 5. `cos.copy_object(tmp_key, cas_key)` —— 走 PermanentCos（不走 STS）
+    /// 6. INSERT t_part_file（upload_status="READY"）
+    /// 7. 返回 `(PartFileOut, tmp_key)` —— `tmp_key` 由 caller 拿到后 spawn 异步
+    ///    `delete_object(tmp_key)` 兜底清理
+    ///
+    /// **重要**：head/copy 是外部 IO，**不**放进事务 tx 里——tx 里只做 DB（事务回滚时
+    /// IO 已发生难恢复）。顺序：先 head（tx 之外，pool 直连）→ copy（tx 之外，pool 直连）
+    /// → 开 tx → soft_delete + INSERT → commit → caller spawn 异步 delete_object(tmp_key)
+    /// 兜底清理。
+    ///
+    /// 注：`pool` 直接传（不是 `&mut tx`）—— head/copy 必须用 pool，确保与 tx 隔离。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bind_uploaded_file(
+        pool: &PgPool,
+        snowflake: &SnowflakeIdGenerator,
+        cos: Arc<dyn CosClient>,
+        cfg_upload_prefix: &str,
+        cfg_tmp_prefix: &str,
+        owner_id: i64,
+        kind: &str,
+        tmp_key: &str,
+        sha256: &str,
+        original_filename: &str,
+        file_size: i64,
+        content_type: &str,
+        current: &CurrentUser,
+    ) -> Result<(PartFileOut, String), AppError> {
+        // 1. 权限（按 kind 派生：DRAWING / 3D_MODEL → M+C；与 multipart 端点一致）
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+
+        // 2. 字段校验（kind/sha/filename/size/content_type）
+        let max_file_size = 300 * 1024 * 1024usize;
+        validate::check_kind(kind)?;
+        validate::check_sha256(sha256)?;
+        validate::check_filename(original_filename)?;
+        validate::check_file_size(file_size, max_file_size)?;
+        validate::check_content_type(content_type, original_filename)?;
+
+        // 3. tmp_key 前缀防呆
+        if !tmp_key.starts_with(cfg_tmp_prefix) {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!(
+                    "tmp_key {tmp_key:?} 不在 cfg_tmp_prefix {cfg_tmp_prefix:?} 范围内"
+                ),
+            ));
+        }
+
+        // 4. head_object（IO 在 pool 上，不在 tx 里）
+        let meta = cos.head_object(tmp_key).await.map_err(|e| {
+            AppError::biz(
+                code::BIZ_PART_FILE_TMP_OBJECT_MISSING,
+                format!("head_object 失败（tmp_key={tmp_key:?}）: {e}"),
+            )
+        })?;
+        if meta.size != file_size {
+            return Err(AppError::biz(
+                code::BIZ_PART_FILE_SIZE_MISMATCH,
+                format!(
+                    "tmp_key={tmp_key:?} 客户端声明 size={file_size} 与服务端 head size={} 不一致",
+                    meta.size
+                ),
+            ));
+        }
+
+        // 5. 派生 CAS key（复用 build_cas_key 模板）
+        let ext = policy::ext_of(original_filename)
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
+        let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
+            AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("未知扩展名 {ext}"))
+        })?;
+        let cas_key = crate::util::cos_key::build_cas_key(
+            cfg_upload_prefix,
+            "part",
+            owner_id,
+            kind,
+            sha256,
+            original_filename,
+        );
+
+        // 6. copy_object（IO 在 pool 上）
+        cos.copy_object(tmp_key, &cas_key).await.map_err(|e| {
+            AppError::biz(
+                code::BIZ_PART_FILE_UPLOAD_FAILED,
+                format!("copy_object 失败（tmp={tmp_key:?} → cas={cas_key:?}）: {e}"),
+            )
+        })?;
+
+        // 2026-09-16 M2-B review 第 2 轮 B2 修：copy_object 成功后**立刻** spawn
+        // best-effort delete_object(tmp_key)，不等 commit。
+        // - commit 成功路径：handler 后续也会 spawn 一次 delete（与此处重复），但
+        //   delete_object 幂等（NoSuchKey 视为成功），不会报 21104。
+        // - commit 失败路径（create_part_file 撞 23505 / tx.commit() 抛错）：此 spawn
+        //   是**唯一**清理 tmp 的机会，否则 tmp 会留作孤儿（直到下次 list_objects
+        //   lifecycle 兜底）。
+        // 两层 spawn（service 一层 + handler 一层）双层防护；任何一层失败不阻塞另一层。
+        let cos_for_early_cleanup = cos.clone();
+        let tmp_key_for_early_cleanup = tmp_key.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = cos_for_early_cleanup
+                .delete_object(&tmp_key_for_early_cleanup)
+                .await
+            {
+                tracing::warn!(
+                    tmp_key = %tmp_key_for_early_cleanup,
+                    error = %e,
+                    "bind_uploaded_file copy 后早期 spawn delete 失败（best-effort，commit 后 handler 还会再 spawn）"
+                );
+            }
+        });
+
+        // 7. 开 tx：soft_delete 旧 + INSERT 新 + readback
+        let mut tx = pool.begin().await?;
+        // 单文件 kind（DRAWING / 3D_MODEL）下，旧活跃行要先 soft_delete
+        // （`uk_t_part_file_single` 部分唯一约束）。
+        let _ = sqlx::query(
+            "UPDATE t_part_file \
+             SET deleted_at = now(), version = version + 1, updated_at = now(), updated_by = $2 \
+             WHERE part_id = $1 AND kind = $3 AND deleted_at IS NULL",
+        )
+        .bind(owner_id)
+        .bind(current.id)
+        .bind(kind)
+        .execute(&mut *tx)
+        .await?;
+        let new_id = snowflake.next_id();
+        PartFileRepo::create_part_file(
+            &mut *tx,
+            NewPartFile {
+                id: new_id,
+                part_id: owner_id,
+                owner_kind: "PART",
+                kind,
+                file_type,
+                object_key: &cas_key,
+                original_filename,
+                file_size,
+                content_type,
+                upload_status: "READY",
+                content_sha256: Some(sha256),
+                created_by: current.id,
+            },
+        )
+        .await
+        .map_err(|e| {
+            if let sqlx::Error::Database(db) = &e
+                && db.code().as_deref() == Some("23505")
+            {
+                return AppError::biz(code::BIZ_PART_FILE_DUPLICATE, "相同文件已存在");
+            }
+            AppError::from(e)
+        })?;
+        let row = PartFileRepo::get_by_id(&mut *tx, new_id, true)
+            .await?
+            .ok_or_else(|| AppError::internal("刚 INSERT 的 part_file 查不到"))?;
+        let out = Self::render_out(&row, "PART");
+        tx.commit().await?;
+
+        Ok((out, tmp_key.to_string()))
+    }
+}
+
+/// 把 `StsCredential` 转 `CosCredentialsOut`（DTO 序列化层细节）。
+fn cos_credentials_out(cred: &crate::infra::sts::StsCredential) -> crate::modules::part_file::dto::CosCredentialsOut {
+    crate::modules::part_file::dto::CosCredentialsOut {
+        tmp_secret_id: cred.tmp_secret_id.clone(),
+        tmp_secret_key: cred.tmp_secret_key.clone(),
+        session_token: cred.session_token.clone(),
+        expired_time: cred.expired_time,
+    }
 }
 
 // ===== 2026-09-15 takeover-fill：content / delete（Phase 3 补齐） =====

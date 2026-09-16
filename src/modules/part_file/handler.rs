@@ -1,10 +1,11 @@
-//! part_file 域 HTTP handler（2026-09-14 Phase 3 + 2026-09-15 takeover-fill + followup-cleanup）
+//! part_file 域 HTTP handler（2026-09-14 Phase 3 + 2026-09-15 takeover-fill + followup-cleanup + 2026-09-16 M2-B 业务层）
 //!
 //! 对应 Python myERP/api/v1/part_file.py。
 //!
 //! ## 端点
 //! - 挂在 `/api/v2/part-files`（由 `mod.rs::router()` 桥接）：
 //!   - `POST /`                            —— 单文件上传（multipart：`data` JSON + `file` 二进制）
+//!   - `POST /upload-intents`              —— 一次性签 STS + 预生成 tmp_key（M2-B 新增，场景 A/B）
 //!   - `GET  /`                            —— 列表查询 + 分页（`owner_kind` / `owner_id` / `kind` 过滤）
 //!   - `GET  /{file_id}/url`               —— 单条详情 + COS 预签下载 URL
 //!   - `GET  /{file_id}/content`           —— 后端代理文件内容（Phase 3 补齐）
@@ -44,7 +45,8 @@ use serde::Deserialize;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::part_file::dto::{
-    PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut,
+    PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut, UploadIntentsIn,
+    UploadIntentsOut,
 };
 use crate::modules::part_file::service::PartFileService;
 use crate::shared::error::{code, AppError};
@@ -150,6 +152,32 @@ pub async fn list_part_files(
     Ok(Json(R::ok(out)))
 }
 
+/// `POST /api/v2/part-files/upload-intents` → 200 OK
+///
+/// 一次性签 STS + 预生成 tmp_key（COS 直传链路入口）。
+///
+/// - 场景 A（`owner_part_id` 空）：批量预生成；part 还未建，按 batch_uuid 派生 tmp 前缀。
+/// - 场景 B（`owner_part_id` 非空）：单 part 补传 / 详情页加文件；同
+///   `(owner_id, kind, sha)` 已存在 → `dedup_hit=true` 复用，不分配 tmp_key。
+///
+/// 权限：Manager + Clerk（service 内 `require_any_role`）。
+/// 2026-09-16 M2-B 新增。
+pub async fn upload_intents(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Json(req): Json<UploadIntentsIn>,
+) -> Result<Json<R<UploadIntentsOut>>, AppError> {
+    let out = PartFileService::upload_intents(
+        &state.pool,
+        &state.config.cos.tmp_prefix,
+        state.sts.clone(),
+        &req,
+        &current,
+    )
+    .await?;
+    Ok(Json(R::ok(out)))
+}
+
 /// `GET /api/v2/part-files/{file_id}/url` → 200 OK
 pub async fn get_part_file_url(
     State(state): State<Arc<AppState>>,
@@ -236,6 +264,9 @@ pub async fn soft_delete_part_file(
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", post(upload_part_file).get(list_part_files))
+        // 2026-09-16 M2-B 新增：直传 COS 入口。
+        // POST `/upload-intents` 与 POST `/` 同 method 但不同 path，axum 允许共存。
+        .route("/upload-intents", post(upload_intents))
         .route("/{file_id}/url", get(get_part_file_url))
         .route("/{file_id}/content", get(get_part_file_content))
         .route("/{file_id}/delete", post(soft_delete_part_file))

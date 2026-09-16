@@ -37,9 +37,10 @@ use hsh_erp_rust::infra::config::{
     AppConfig, AutoCompleteConfig, CosConfig, JwtConfig, RedisConfig as AppRedisConfig,
     SnowflakeConfig,
 };
-use hsh_erp_rust::infra::cos::{CosClient, NoopCos};
+use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
+use hsh_erp_rust::shared::error::{AppError, code};
 use hsh_erp_rust::state::AppState;
 
 /// 测试 DB URL：与 `postgres-test` 容器（端口5429）+ `postgres_rust_test` 库配对。
@@ -578,4 +579,174 @@ pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     .execute(pool)
     .await
     .expect("insert t_shelf_process");
+}
+
+// ===========================================================================
+// 2026-09-16 M2-B review 第 1 轮：MockCos
+//
+// 给 part_file / batch_create 集成测试用，按 key lookup 决定 head/copy/get/...
+// 的返回内容（NoopCos 全部返回 success 或 size=0，无法驱动 21114/21115/21116
+// 错误码分支）。生产实现 `NoopCos` 仍在 cos.rs 维护，本文件仅补测试侧 stub。
+//
+// 设计要点：
+// - `Arc<dyn CosClient>` 可直接替换 `state.cos`，对 service 层零侵入
+// - `head_responses`：按 tmp_key 返回不同 ObjectMeta（驱动 size mismatch 测试）
+// - `copy_results`：按 (src, dst) 返回 Ok 或带错误码的 Err（驱动 copy 失败分支）
+// - 默认返回 NoSuchKey 错误（与真实 COS 行为一致），便于验证 21114 TMP_MISSING
+// - 线程安全：`parking_lot::Mutex`（无锁实现，性能足够测试用）
+//
+// 当前实现覆盖的 6 个方法：put_object / get_object / presigned_get_url /
+// delete_object / head_object / copy_object。
+// ===========================================================================
+
+/// 测试用 MockCos：按 key 查找 `head_object` / `copy_object` 的响应，其余方法走默认行为。
+///
+/// 2026-09-16 M2-B review 第 1 轮：补齐 T2.5 / T2.6 验收要求的集成测试 stub。
+/// NoopCos 的 `head_object` 返回 `size=0`、无法驱动 21114/21115 错误码分支；
+/// MockCos 按 key 查找 ObjectMeta，`copy_object` 按 (src, dst) 返回 Result。
+///
+/// 所有 `Mutex` 均在返回前 drop，无 `.await` 跨锁，故用 `std::sync::Mutex`
+/// （`parking_lot` 不在依赖树，避免本轮新增 dev-deps）。
+pub struct MockCos {
+    /// `head_object` 按 key 返回不同 `ObjectMeta`；缺省 → NoSuchKey 错误。
+    pub head_responses: std::sync::Mutex<std::collections::HashMap<String, ObjectMeta>>,
+    /// `copy_object` 按 (src, dst) 返回 Ok / Err；缺省 → Ok(())。
+    pub copy_results:
+        std::sync::Mutex<std::collections::HashMap<(String, String), Result<(), String>>>,
+    /// `get_object` 按 key 返回字节；缺省 → NoSuchKey 错误。
+    pub get_responses: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+    /// 触发过的 `head_object` key 列表（测试可断言"head 被调用了 N 次"）。
+    pub head_calls: std::sync::Mutex<Vec<String>>,
+    /// 触发过的 `copy_object` (src, dst) 列表（测试可断言"copy 被调用了 N 次"）。
+    pub copy_calls: std::sync::Mutex<Vec<(String, String)>>,
+    /// 触发过的 `delete_object` key 列表（验证 spawn 兜底删除）。
+    pub delete_calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl Default for MockCos {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockCos {
+    pub fn new() -> Self {
+        Self {
+            head_responses: std::sync::Mutex::new(std::collections::HashMap::new()),
+            copy_results: std::sync::Mutex::new(std::collections::HashMap::new()),
+            get_responses: std::sync::Mutex::new(std::collections::HashMap::new()),
+            head_calls: std::sync::Mutex::new(Vec::new()),
+            copy_calls: std::sync::Mutex::new(Vec::new()),
+            delete_calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 注册 key → ObjectMeta（让 head_object 返回指定 size）。
+    pub fn set_head(&self, key: &str, size: i64) {
+        self.head_responses.lock().unwrap().insert(
+            key.to_string(),
+            ObjectMeta {
+                size,
+                etag: format!("mock-etag-{}", &key[..key.len().min(8)]),
+            },
+        );
+    }
+
+    /// 注册 (src, dst) → copy 结果（Ok 或 Err）。
+    pub fn set_copy(&self, src: &str, dst: &str, result: Result<(), String>) {
+        self.copy_results
+            .lock()
+            .unwrap()
+            .insert((src.to_string(), dst.to_string()), result);
+    }
+
+    /// 取 head 被调用次数（用于断言 head 被调用 / 未被调用）。
+    pub fn head_call_count(&self, key: &str) -> usize {
+        self.head_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| k.as_str() == key)
+            .count()
+    }
+
+    /// 取 delete 被调用次数。
+    pub fn delete_call_count(&self, key: &str) -> usize {
+        self.delete_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|k| k.as_str() == key)
+            .count()
+    }
+}
+
+#[async_trait::async_trait]
+impl CosClient for MockCos {
+    async fn put_object(
+        &self,
+        _key: &str,
+        _body: Vec<u8>,
+        _content_type: &str,
+    ) -> Result<(), AppError> {
+        // Mock 不模拟服务端写入（测试不走真实上传）
+        Ok(())
+    }
+
+    async fn get_object(&self, key: &str) -> Result<Vec<u8>, AppError> {
+        self.get_responses
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_FILE_UPLOAD_FAILED,
+                    format!("MockCos get_object NoSuch key={key}"),
+                )
+            })
+    }
+
+    async fn presigned_get_url(
+        &self,
+        key: &str,
+        _expires_seconds: u32,
+    ) -> Result<String, AppError> {
+        Ok(format!("local://mock/{key}"))
+    }
+
+    async fn delete_object(&self, key: &str) -> Result<(), AppError> {
+        self.delete_calls.lock().unwrap().push(key.to_string());
+        // 模拟幂等：删除总成功（NoSuchKey 也视为成功）
+        Ok(())
+    }
+
+    async fn head_object(&self, key: &str) -> Result<ObjectMeta, AppError> {
+        self.head_calls.lock().unwrap().push(key.to_string());
+        self.head_responses.lock().unwrap().get(key).cloned().ok_or_else(|| {
+            // 与 TencentCos 行为对齐：404 → NoSuchKey 包装为业务错误
+            AppError::biz(
+                code::BIZ_PART_FILE_UPLOAD_FAILED,
+                format!("MockCos head_object NoSuch key={key}"),
+            )
+        })
+    }
+
+    async fn copy_object(&self, src_key: &str, dst_key: &str) -> Result<(), AppError> {
+        self.copy_calls
+            .lock()
+            .unwrap()
+            .push((src_key.to_string(), dst_key.to_string()));
+        match self
+            .copy_results
+            .lock()
+            .unwrap()
+            .get(&(src_key.to_string(), dst_key.to_string()))
+            .cloned()
+        {
+            Some(Ok(())) => Ok(()),
+            Some(Err(msg)) => Err(AppError::biz(code::BIZ_PART_FILE_UPLOAD_FAILED, msg)),
+            None => Ok(()), // 缺省成功
+        }
+    }
 }

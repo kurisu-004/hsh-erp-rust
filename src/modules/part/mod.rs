@@ -100,5 +100,7 @@ pub fn router() -> Router<Arc<AppState>> {
         // ---- 2026-09-15 followup-cleanup A8：part 维度文件路由（cad-files / cnc-programs /
         //      setup-sheets / cnc-pair / files）已迁出到 part_file::part_nested_router()，
         //      在这里 nest 以保留历史 URL `/api/v2/parts/{part_id}/<file>...`。
+        // ---- 2026-09-16 M2-B 新增：直传 COS 链路 confirm 端点（POST /parts/{id}/files/confirm）----
+        .route("/{part_id}/files/confirm", post(handler::confirm_part_file))
         .nest("/{part_id}", part_file::handler::part_nested_router())
 }
