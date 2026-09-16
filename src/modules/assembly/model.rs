@@ -14,6 +14,12 @@ use rust_decimal::Decimal;
 ///
 /// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date` —— 与
 /// t_part 同属批次依附信息；装配体实际交付由子件批次交付事件体现。
+///
+/// 2026-09-17 PR-4 与 DDL 对齐：原本 `request_date` / `planned_delivery_date`
+/// 标 `Option<NaiveDate>`，但 DDL（migrations/005:20-21）这两列是 `date NOT NULL`。
+/// 改为 `NaiveDate`，与 DDL 一致；service 层在 create / update 时已用 `today`
+/// 兜底（service.rs:419-420 / 604-605），无需改 service；统计 / dashboard 等
+/// 读取路径同步去 Option 包裹。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TAssembly {
     pub id: i64,
@@ -21,8 +27,8 @@ pub struct TAssembly {
     pub name: String,
     pub applicant_name: Option<String>,
     pub customer_id: i64,
-    pub request_date: Option<NaiveDate>,
-    pub planned_delivery_date: Option<NaiveDate>,
+    pub request_date: NaiveDate,
+    pub planned_delivery_date: NaiveDate,
     pub is_urgent: bool,
     pub status: String,
     pub version: i32,

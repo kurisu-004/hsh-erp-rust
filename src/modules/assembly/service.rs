@@ -597,12 +597,12 @@ impl AssemblyService {
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
 
         // §3.2 级联：覆盖父件"应有值"到所有未软删子件。
-        // `request_date` / `planned_delivery_date` 在 t_assembly 是 NOT NULL，
-        // 由 service 层在 create 时填 today 兜底；update 时三态置 NULL 在本期
-        // 不允许（DTO 是 Option<Option<NaiveDate>> 但语义上 asm 行始终非空）。
-        let today = clock::now_naive().date();
-        let request_date = asm.request_date.unwrap_or(today);
-        let planned_delivery_date = asm.planned_delivery_date.unwrap_or(today);
+        // `request_date` / `planned_delivery_date` 在 t_assembly 是 NOT NULL
+        // （model.rs PR-4 与 DDL 对齐后两字段都是 NaiveDate，不再 Option）。
+        // update 时三态置 NULL 在本期不允许（DTO 是 Option<Option<NaiveDate>>
+        // 但语义上 asm 行始终非空；service 层遇 Some(None) 改判 20104）。
+        let request_date = asm.request_date;
+        let planned_delivery_date = asm.planned_delivery_date;
         let applicant_name = asm.applicant_name.as_deref().unwrap_or("");
         PartRepo::cascade_sync_from_assembly(
             &mut *conn,
