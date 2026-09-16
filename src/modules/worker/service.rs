@@ -6,7 +6,7 @@
 //! ## 业务约束（service 层 enforce）
 //! - `verify_badge` 命中但 `is_active=false` → 20202 `BIZ_WORKER_INACTIVE`（HTTP 400）；
 //!   未命中 → 20201 `BIZ_WORKER_NOT_FOUND`（HTTP 404）。
-//! - `deactivate` 前查 `t_part.current_holder_id = worker_id` 且
+//! - `deactivate` 前查 `t_part_batch.current_holder_id = worker_id` 且
 //!   `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 引用，>0 ⇒ 20203 拒
 //! - `create_worker` 时 `work_type_id` 校验（如果非空）—— `WorkTypeRepo::get_by_id`
 //! - `id_card_no` 部分唯一索引由 DB 兜底，捕获 `UniqueViolation`（23505）→ 40901
@@ -360,7 +360,7 @@ impl WorkerService {
     }
 
     /// 停用：`is_active=false` 同时 `deleted_at=now()`。
-    /// 停用前查 `t_part.current_holder_id = worker_id` 且
+    /// 停用前查 `t_part_batch.current_holder_id = worker_id` 且
     /// `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 引用，
     /// >0 ⇒ 20203 `BIZ_WORKER_IN_USE` 拒。
     pub async fn deactivate_worker(

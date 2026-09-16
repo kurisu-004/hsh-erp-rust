@@ -332,8 +332,11 @@ pub struct CompleteRequest {
 ///
 /// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) BREAKING CHANGE：
 /// 收 `batch_id` + `version`。状态机守卫读 batch 当前状态
-/// `IN_PROCESS → REPAIRING`；`has_been_repaired=true` 写 batch
-/// （part 由 rollup 同步）。
+/// `IN_PROCESS → REPAIRING`。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 `has_been_repaired` 列；
+/// 返修事实改由 `t_part_event.event_type='REPAIR_STARTED'` +
+/// `t_part_batch.status='REPAIRING'` 承担（part 派生列无需同步）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StartRepairRequest {
     #[serde(deserialize_with = "deserialize_i64")]

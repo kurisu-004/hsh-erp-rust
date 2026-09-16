@@ -513,14 +513,18 @@ impl AssemblyService {
     /// - `applicant_name` 等普通可空字段按 `Option<String>` 语义（None=不动、Some("")=覆盖）
     ///
     /// **§3.2 级联 + §3.3 缩放**：`update_partial` 成功后，同事务内：
-    /// 1. 把父件"更新后的当前行值"覆盖级联到所有未软删子件（7 个共享信息字段；
-    ///    排除 `quantity`）。
+    /// 1. 把父件"更新后的当前行值"覆盖级联到所有未软删子件（8 个共享信息字段：
+    ///    `applicant_name` / `request_date` / `planned_delivery_date` /
+    ///    `is_urgent` / `customer_id` / `order_no` / `system_delivery_date` /
+    ///    `note`；排除 `quantity`）。
     /// 2. 若 `req.quantity` 有值且 ≠ 父件现值（old_qty），对每个子件
     ///    `new_qty = max(1, round(child_qty * new_qty / old_qty))`，
     ///    `version++`。不追溯调整 `t_part_batch.quantity`。
     ///
     /// 2026-09-16 PR-2 瘦身（migration 027）：t_assembly 删 `actual_delivery_date`
-    /// 列，DTO `AssemblyUpdateRequest` 同步精简；级联子件集合保持 7 字段。
+    /// 列，DTO `AssemblyUpdateRequest` 同步精简；级联子件集合保持 8 字段
+    /// （`actual_delivery_date` 不在级联集合中 —— 该列已删，返修/发货事实改由
+    /// `t_part_event` 事件日志承担）。
     pub async fn update_assembly(
         conn: &mut PgConnection,
         assembly_id: i64,

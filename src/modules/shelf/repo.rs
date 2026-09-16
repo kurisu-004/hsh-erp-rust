@@ -10,7 +10,8 @@
 //!   / `list_with_filters` / `count_with_filters` / `list_active_production_ordered`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder）
 //! - 写：`create` / `update` / `soft_delete`（同时 `is_active = false`）
-//! - 引用计数：`count_in_use_parts`（deactivate 前查 t_part.current_holder_id）
+//! - 引用计数：`count_in_use_parts`（deactivate 前查 t_part_batch.current_holder_id
+//!   + location + status 三维核对，PR-2 真相源迁移后已不再读 t_part）
 //!
 //! ## 约定
 //! - 全部使用 `sqlx::query!` / `query_as!` 编译期宏（需 `DATABASE_URL` 或 `.sqlx/` 离线元数据）

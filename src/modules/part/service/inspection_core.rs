@@ -339,6 +339,12 @@ impl PartService {
     /// `location` + `current_holder_id`（真相源在 t_part_batch）。原 step 4
     /// 重排至 step 5 之后，用 `target_batch.location` 直接判定（避免原版
     /// 「holder 是否命中 t_shelf」启发式歧义）。
+    ///
+    /// 2026-09-16 PR-2 行为收紧：IN_PROCESS + `target_batch.location IS NULL` 由
+    /// 旧版「放行」改「拒绝」(`BIZ_INVALID_TRANSITION`)。理论上 IN_PROCESS 批次
+    /// location 不为空（旧版放行是漏检 —— 任何 IN_PROCESS 批次必须挂在
+    /// `PRODUCTION_SHELF` / `WORKER` / `OUTSOURCE_COMPANY` 之一，NULL 视为
+    /// 数据完整性违规，宁可拒绝也不静默放行）。
     // 参数过多（9 > 7）。本函数聚合 part_id / shelf_id / batch_id / version /
     // quantity / note 等必要输入，与 `to_ship_core` 同形；将它们打包为
     // `ToInspectionCoreArgs` 结构体收益微薄、调用面广，重构 ROI 低，故豁免。
