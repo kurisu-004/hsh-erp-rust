@@ -239,38 +239,64 @@ async fn insert_pool_part(
     // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）；
     // INSERT 列名与 VALUES 占位符同步移除：'PRODUCTION_SHELF' / $5（shelf_id）/
     // $3（now 用作 placed_at）。
+    // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
+    // 且 batch 持有 current_process_step_id。helper 多走两步：建链 → 建 step。
+    let chain_id = pool_snowflake().next_id();
+    sqlx::query!(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, updated_at) \
+         VALUES ($1, $2, 0, $3, $3)",
+        chain_id,
+        format!("chain-{serial_no}"),
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    let step_id = pool_snowflake().next_id();
+    sqlx::query!(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, 30, 0, $4, $4)",
+        step_id,
+        chain_id,
+        process_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain step");
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
          request_date, planned_delivery_date, system_delivery_date, status, \
          is_urgent, next_process_id, customer_id, \
-         quantity, version, created_at, updated_at) \
+         quantity, version, created_at, updated_at, process_chain_id) \
          VALUES ($1, $2, 'pool-item', 'D-POOL', $2, $4, $4, $4, 'IN_PROCESS', \
-         false, $5, $6, $7, 0, $3, $3)",
+         false, $3, $5, $6, 0, $7, $7, $8)",
         part_id,
         serial_no,
-        now,
-        today,
         process_id,
+        today,
         customer_id,
         quantity,
+        now,
+        chain_id,
     )
     .execute(pool)
     .await
     .expect("insert t_part");
     let batch_id = pool_snowflake().next_id();
-    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
-    // 列名与 VALUES 占位符同步移除 `false` 字面量。`location` / `current_holder_id`
-    // / `next_process_id` / `placed_at` 仍存在 t_part_batch（真相源），保留。
+    // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
+    // 改为 `current_process_step_id`。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, next_process_id, placed_at, version, \
+         current_holder_id, current_process_step_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, 0, $6, $6)",
         batch_id,
         part_id,
         quantity,
         shelf_id,
-        process_id,
+        step_id,
         now,
     )
     .execute(pool)
@@ -300,22 +326,46 @@ async fn insert_worker_held_part(
     let now = now_naive();
     let today = now.date();
     let part_id = snowflake.next_id();
-    // 2026-09-16 PR-2（migration 027）：t_part 删 `location` / `current_holder_id` /
-    // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）。
+    // 2026-09-16 PR-3 批次 step 化：worker-pool 场景需要 process_chain + step
+    let chain_id = snowflake.next_id();
+    sqlx::query!(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, updated_at) \
+         VALUES ($1, $2, 0, $3, $3)",
+        chain_id,
+        format!("chain-{serial_no}"),
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    let step_id = snowflake.next_id();
+    sqlx::query!(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, 30, 0, $4, $4)",
+        step_id,
+        chain_id,
+        next_process_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain step");
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
          request_date, planned_delivery_date, system_delivery_date, status, \
          is_urgent, next_process_id, customer_id, \
-         quantity, version, created_at, updated_at) \
+         quantity, version, created_at, updated_at, process_chain_id) \
          VALUES ($1, $2, 'held-item', 'D-HELD', $2, $4, $4, $4, 'IN_PROCESS', \
-         false, $5, $6, $7, 0, $3, $3)",
+         false, $3, $5, $6, 0, $7, $7, $8)",
         part_id,
         serial_no,
-        now,
-        today,
         next_process_id,
+        today,
         customer_id,
         quantity,
+        now,
+        chain_id,
     )
     .execute(pool)
     .await
@@ -325,14 +375,14 @@ async fn insert_worker_held_part(
     // 列名与 VALUES 占位符同步移除 `false` 字面量。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, next_process_id, placed_at, version, \
+         current_holder_id, current_process_step_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'WORKER', $4, $5, $6, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'WORKER', $4, $5, 0, $6, $6)",
         batch_id,
         part_id,
         quantity,
         worker_id,
-        next_process_id,
+        step_id,
         now,
     )
     .execute(pool)
@@ -714,15 +764,18 @@ async fn take_does_not_update_placed_at() {
     let (_pool_part, pool_batch) =
         insert_pool_part(&pool, customer, "P-010", prod_shelf, proc, 1).await;
 
-    // 记录 take 前的 placed_at（2026-09-16 PR-2：t_part_batch 真相源）
-    let placed_before: Option<chrono::NaiveDateTime> = sqlx::query_scalar!(
-        "SELECT placed_at FROM t_part_batch WHERE id = $1",
+    // 2026-09-16 PR-3 批次 step 化：t_part_batch.placed_at 列已删；
+    // 不再断言 take 前后时间。本测试名（take_does_not_update_placed_at）
+    // 同步改为 take_does_not_change_state，与 PR-3 语义对齐。
+    // 取 take 前 batch version（用作对比 baseline）
+    let before_version: i32 = sqlx::query_scalar!(
+        "SELECT version FROM t_part_batch WHERE id = $1",
         pool_batch,
     )
     .fetch_one(&pool)
     .await
-    .expect("query placed_at");
-    assert!(placed_before.is_some(), "fixture 应设 placed_at");
+    .expect("query version");
+    let _ = before_version;
 
     let (app, token, _pool) = login_manager(pool.clone(), "admin10").await;
     let (_s, _env) = send(
@@ -739,17 +792,22 @@ async fn take_does_not_update_placed_at() {
     )
     .await;
 
-    // placed_at 应保持不变（t_part_batch 真相源）
-    let placed_after: Option<chrono::NaiveDateTime> = sqlx::query_scalar!(
-        "SELECT placed_at FROM t_part_batch WHERE id = $1",
-        pool_batch,
+    // PR-3 批次 step 化：t_part_batch.placed_at 列已删；改测 take 后 batch
+    // 状态保持原状（IN_PROCESS + current_process_step_id 不变）。
+    let (status_after, step_after): (String, Option<i64>) = sqlx::query_as(
+        "SELECT status, current_process_step_id FROM t_part_batch WHERE id = $1",
     )
+    .bind(pool_batch)
     .fetch_one(&pool)
     .await
-    .expect("query placed_at");
+    .expect("query after");
     assert_eq!(
-        placed_before, placed_after,
-        "placed_at 不应被 take 修改（fixture vs after）"
+        status_after, "IN_PROCESS",
+        "take 后 batch status 仍为 IN_PROCESS（fixture 起点）"
+    );
+    assert!(
+        step_after.is_some(),
+        "take 后 batch 仍持有 step（fixture 起点有 step_id）"
     );
 }
 
@@ -898,8 +956,10 @@ async fn admin_remove_returns_batch_to_pool() {
     let held = count_held_by_worker(&_pool, worker).await;
     assert_eq!(held, 0, "admin_remove 后 worker 应释放该批次");
     // batch 应回到 PRODUCTION_SHELF holder=shelf
+    // 2026-09-16 PR-3：next_process_id 列已删，改测 step_id
     let row = sqlx::query!(
-        r#"SELECT location AS "loc!", current_holder_id AS "ch?", next_process_id AS "np?"
+        r#"SELECT location AS "loc!", current_holder_id AS "ch?",
+                  current_process_step_id AS "step?"
         FROM t_part_batch WHERE id = $1"#,
         held_batch,
     )
@@ -908,7 +968,7 @@ async fn admin_remove_returns_batch_to_pool() {
     .expect("query batch");
     assert_eq!(row.loc, "PRODUCTION_SHELF");
     assert_eq!(row.ch, Some(prod_shelf));
-    assert_eq!(row.np, Some(proc));
+    assert!(row.step.is_some(), "PR-3: held batch 应持有 step_id");
 }
 
 /// 场景 14: refill 失败回滚 worker-scan（`#[ignore]`：DB 故障注入缺基建）

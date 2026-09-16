@@ -16,6 +16,7 @@
 //! - 删 `next_process_id`（t_part_batch 列），改 `current_process_step_id`
 //!   指向所属 part 的工艺链步骤（t_process_chain_step.id）
 //! - 删 `placed_at`（不再统计生产时间）
+//!
 //! 真实 process_id 由 service 层 JOIN t_process_chain_step 按需派生。
 
 use chrono::{NaiveDate, NaiveDateTime};

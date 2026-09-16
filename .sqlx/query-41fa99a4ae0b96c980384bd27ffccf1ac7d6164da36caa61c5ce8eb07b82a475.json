@@ -1,0 +1,161 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, chain_id, sort_order, process_id, estimated_minutes, note,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_process_chain_step\n            WHERE chain_id = $1\n              AND sort_order > $2\n              AND deleted_at IS NULL\n            ORDER BY sort_order ASC\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "chain_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "chain_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "sort_order",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "sort_order"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "process_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "process_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "estimated_minutes",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "estimated_minutes"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "note",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "note"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "updated_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "updated_by",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "deleted_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "41fa99a4ae0b96c980384bd27ffccf1ac7d6164da36caa61c5ce8eb07b82a475"
+}

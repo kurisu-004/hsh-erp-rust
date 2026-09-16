@@ -609,8 +609,8 @@ impl PartRepo {
             UPDATE t_part_batch
             SET quantity    = quantity - $3,
                 version     = version + 1,
-                updated_at  = $4,
-                updated_by  = $5
+                updated_at  = now(),
+                updated_by  = $4
             WHERE id = $1 AND version = $2 AND deleted_at IS NULL
               AND quantity > $3
             "#,

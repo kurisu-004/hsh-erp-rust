@@ -52,7 +52,6 @@ pub struct DashboardItem {
     pub current_holder_id: Option<String>,
     pub current_holder_kind: Option<String>,
     pub shelf_code: Option<String>,
-    pub placed_at: Option<String>,
     pub customer_id: Option<String>,
     pub customer_name: Option<String>,
     pub customer_path: Option<String>,
@@ -97,13 +96,13 @@ impl DashboardService {
             Vec::new()
         } else {
             let rows = sqlx::query(
+                // 2026-09-16 PR-3 批次 step 化：next_process_id 列已删，JOIN step 取 process_id
                 "SELECT b.id            AS batch_id, \
                         b.part_id       AS part_id, \
                         b.batch_no      AS batch_no, \
                         b.quantity      AS quantity, \
                         b.current_holder_id AS holder_id, \
-                        b.next_process_id   AS next_process_id, \
-                        b.placed_at    AS placed_at, \
+                        s.process_id      AS next_process_id, \
                         p.id           AS p_id, \
                         p.serial_no    AS serial_no, \
                         p.name         AS p_name, \
@@ -113,6 +112,7 @@ impl DashboardService {
                         p.customer_id  AS customer_id \
                  FROM t_part_batch b \
                  JOIN t_part p ON p.id = b.part_id \
+                 LEFT JOIN t_process_chain_step s ON s.id = b.current_process_step_id \
                  WHERE b.status = 'IN_PROCESS' \
                    AND b.deleted_at IS NULL \
                    AND p.deleted_at IS NULL \
@@ -264,7 +264,6 @@ struct BatchLite {
     batch_no: Option<i32>,
     holder_id: Option<i64>,
     next_process_id: Option<i64>,
-    placed_at: Option<NaiveDateTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -287,7 +286,6 @@ fn row_to_part_batch_pair(r: sqlx::postgres::PgRow) -> (BatchLite, PartLite) {
             batch_no: r.try_get::<Option<i32>, _>("batch_no").ok().flatten(),
             holder_id: r.try_get::<Option<i64>, _>("holder_id").ok().flatten(),
             next_process_id: r.try_get::<Option<i64>, _>("next_process_id").ok().flatten(),
-            placed_at: r.try_get::<Option<NaiveDateTime>, _>("placed_at").ok().flatten(),
         },
         PartLite {
             part_id: r.get::<i64, _>("p_id"),
@@ -314,6 +312,7 @@ async fn fetch_zone_rows(
 ) -> Result<Vec<(BatchLite, PartLite)>, sqlx::Error> {
     let status_value = status.unwrap_or("IN_PROCESS");
     let rows = sqlx::query(
+        // 2026-09-16 PR-3 批次 step 化：next_process_id 列已删，JOIN step 取 process_id
         "WITH active_shelves AS ( \
             SELECT id FROM t_shelf \
             WHERE zone = $1 AND deleted_at IS NULL AND is_active = TRUE \
@@ -323,8 +322,7 @@ async fn fetch_zone_rows(
                 b.batch_no      AS batch_no, \
                 b.quantity      AS quantity, \
                 b.current_holder_id AS holder_id, \
-                b.next_process_id   AS next_process_id, \
-                b.placed_at    AS placed_at, \
+                s.process_id      AS next_process_id, \
                 p.id           AS p_id, \
                 p.serial_no    AS serial_no, \
                 p.name         AS p_name, \
@@ -334,6 +332,7 @@ async fn fetch_zone_rows(
                 p.customer_id  AS customer_id \
          FROM t_part_batch b \
          JOIN t_part p ON p.id = b.part_id \
+         LEFT JOIN t_process_chain_step s ON s.id = b.current_process_step_id \
          WHERE b.status = $2 \
            AND b.deleted_at IS NULL \
            AND p.deleted_at IS NULL \
@@ -356,13 +355,13 @@ async fn fetch_worker_rows(
     top_n: i64,
 ) -> Result<Vec<(BatchLite, PartLite)>, sqlx::Error> {
     let rows = sqlx::query(
+        // 2026-09-16 PR-3 批次 step 化：next_process_id 列已删，JOIN step 取 process_id
         "SELECT b.id            AS batch_id, \
                 b.part_id       AS part_id, \
                 b.batch_no      AS batch_no, \
                 b.quantity      AS quantity, \
                 b.current_holder_id AS holder_id, \
-                b.next_process_id   AS next_process_id, \
-                b.placed_at    AS placed_at, \
+                s.process_id      AS next_process_id, \
                 p.id           AS p_id, \
                 p.serial_no    AS serial_no, \
                 p.name         AS p_name, \
@@ -372,6 +371,7 @@ async fn fetch_worker_rows(
                 p.customer_id  AS customer_id \
          FROM t_part_batch b \
          JOIN t_part p ON p.id = b.part_id \
+         LEFT JOIN t_process_chain_step s ON s.id = b.current_process_step_id \
          WHERE b.status = 'IN_PROCESS' \
            AND b.location = 'WORKER' \
            AND b.deleted_at IS NULL \
@@ -585,7 +585,6 @@ fn part_to_item(
         current_holder_id: b.holder_id.map(|h| h.to_string()),
         current_holder_kind: None,
         shelf_code: None,
-        placed_at: b.placed_at.map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
         customer_id: Some(p.customer_id.to_string()),
         customer_name: cust_name,
         customer_path: Some(cust_path),

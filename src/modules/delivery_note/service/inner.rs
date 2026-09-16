@@ -457,7 +457,7 @@ pub(super) async fn add_parts_inner(
                 ));
             }
             if qty < batch.quantity {
-                // 拆：构造新批次
+                // 拆：构造新批次（PR-3 批次 step 化：传 current_process_step_id，不再传 placed_at）
                 let new_id = snowflake.next_id();
                 PartBatchRepo::split_batch(
                     conn,
@@ -469,8 +469,7 @@ pub(super) async fn add_parts_inner(
                     &batch.status,
                     batch.location.as_deref(),
                     batch.current_holder_id,
-                    batch.next_process_id,
-                    batch.placed_at,
+                    batch.current_process_step_id,
                     now,
                     Some(current.id),
                     Some(current.id),

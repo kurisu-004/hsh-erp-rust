@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_part_process_chain (id, name, version, created_at, updated_at) VALUES ($1, $2, 0, $3, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "56084943aa71978833dd4ef4c45d40cd0cef03a235c673731f4e5d88d2a435fb"
+}

@@ -72,8 +72,8 @@ pub struct PoolBatchItem {
     pub is_urgent: bool,
     /// 工单级备注（t_part.note，DB 无 batch 级 remark 字段；复用）
     pub note: Option<String>,
-    /// 批次上架时间（t_part_batch.placed_at）—— 用于前端展示「积压多久」
-    pub placed_at: chrono::NaiveDateTime,
+    // 2026-09-16 PR-3 批次 step 化：删 `placed_at`（t_part_batch 列已删）
+    // —— 前端如需展示积压时间，由前端按 PICKED_UP 事件 created_at 自派生
     pub version: i32,
 }
 

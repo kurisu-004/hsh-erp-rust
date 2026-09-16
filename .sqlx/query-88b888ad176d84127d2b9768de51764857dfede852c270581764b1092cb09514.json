@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT b.id        AS \"id!\",\n                   b.part_id   AS \"part_id!\",\n                   b.version   AS \"version!\"\n            FROM t_part_batch b\n            WHERE b.status     = 'DELIVERED'\n              AND b.deleted_at IS NULL\n              AND EXISTS (\n                  SELECT 1 FROM t_part_event e\n                  WHERE e.batch_id = b.id\n                    AND e.event_type = 'DELIVERED'\n                    AND e.created_at < $1\n              )\n            ORDER BY b.id ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "part_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "part_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamp"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "88b888ad176d84127d2b9768de51764857dfede852c270581764b1092cb09514"
+}

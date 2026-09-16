@@ -191,42 +191,66 @@ async fn insert_pool_part(
     let now = now_naive();
     let today = now.date();
     let part_id = pool_snowflake().next_id();
-    // 2026-09-16 PR-2（migration 027）：t_part 删 `location` / `current_holder_id` /
-    // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）。
-    // INSERT 列名与 VALUES 占位符同步移除：'PRODUCTION_SHELF'、$5（shelf_id）、
-    // $3（now 用作 placed_at）。剩余字段顺序对齐列名清单。
+    // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
+    // 且 batch 持有 current_process_step_id（worker.match 走 step.process_id）。
+    // helper 现在多走两步：建链 → 建 step → INSERT part/batch。
+    let chain_id = pool_snowflake().next_id();
+    sqlx::query!(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, updated_at) \
+         VALUES ($1, $2, 0, $3, $3)",
+        chain_id,
+        format!("chain-{serial_no}"),
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    let step_id = pool_snowflake().next_id();
+    sqlx::query!(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, 30, 0, $4, $4)",
+        step_id,
+        chain_id,
+        process_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert chain step");
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
          request_date, planned_delivery_date, system_delivery_date, status, \
          is_urgent, next_process_id, customer_id, \
-         quantity, version, created_at, updated_at) \
+         quantity, version, created_at, updated_at, process_chain_id) \
          VALUES ($1, $2, 'pool-item', 'D-POOL', $2, $4, $4, $4, 'IN_PROCESS', \
-         false, $5, $6, $7, 0, $3, $3)",
+         false, $3, $5, $6, 0, $7, $7, $8)",
         part_id,
         serial_no,
-        now,
-        today,
         process_id,
+        today,
         customer_id,
         quantity,
+        now,
+        chain_id,
     )
     .execute(pool)
     .await
     .expect("insert t_part");
     let batch_id = pool_snowflake().next_id();
-    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
-    // 列名与 VALUES 占位符同步移除 `false` 字面量。`location` / `current_holder_id`
-    // / `next_process_id` / `placed_at` 仍存在 t_part_batch（真相源），保留。
+    // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
+    // 改为 `current_process_step_id`。worker_pool 候选池匹配改为
+    // `s.process_id = ANY(worker.process_ids)`（JOIN t_process_chain_step）。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, next_process_id, placed_at, version, \
+         current_holder_id, current_process_step_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, 0, $6, $6)",
         batch_id,
         part_id,
         quantity,
         shelf_id,
-        process_id,
+        step_id,
         now,
     )
     .execute(pool)
