@@ -1875,6 +1875,161 @@ async fn upload_content_type_mismatch_rejected() {
     assert_eq!(err.code(), code::BIZ_PART_FILE_BAD_TYPE);
 }
 
+// ===========================================================================
+//  2026-09-16 M2-B review 第 2 轮 B1 修：cleanup_tmp_keys 全量收集回归测试
+//
+// 验证 service `batch_create_parts_with_bindings` 在 per-item DB 失败时仍然把
+// 所有 head/copy 成功的 tmp_key 收集到 `out.cleanup_tmp_keys`（B1 不变量）：
+// - 失败 item 的 tmp 对象：DB 没 INSERT part_file 行，但 CAS 对象已在 COS →
+//   必须删 tmp 防孤儿（DB 端可下次 batch 重传时复用 tmp_key，tmp 已被 head
+//   校验过 sha/size）。
+// - 成功 item 的 tmp 对象：DB 已 INSERT part_file 行指向 cas_key → 删 tmp
+//   是无害（CAS 完整性由 part_file.object_key 引用保证）。
+//
+// 触发策略：2 件 item 都带 drawing_file，item[0] applicant_name > 50 触发 DB 22001。
+// MockCos 预注册 head/copy 成功。期望 out.created=1 / out.failed=1 / cleanup_tmp_keys=2。
+// ===========================================================================
+
+#[tokio::test]
+async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
+    use common::MockCos;
+    use hsh_erp_rust::modules::part::dto_crud::{
+        FileBindingIn, PartBatchCreateItem, PartBatchCreateRequest,
+    };
+
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let current = manager_current(1);
+    let cos = std::sync::Arc::new(MockCos::new());
+
+    let tmp_key_0 = "tmp/test/binding-clean-0.pdf";
+    let tmp_key_1 = "tmp/test/binding-clean-1.pdf";
+    let sha_0 = "0".repeat(64);
+    let sha_1 = "1".repeat(64);
+    cos.set_head(tmp_key_0, 1024);
+    cos.set_head(tmp_key_1, 1024);
+
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .date_naive();
+    let long_name = "甲".repeat(60); // >50 触发 22001 → failed
+    let req = PartBatchCreateRequest {
+        customer_id: l2,
+        items: vec![
+            PartBatchCreateItem {
+                name: "bad-item".into(),
+                drawing_no: "D-BAD".into(),
+                applicant_name: long_name,
+                quantity: 1,
+                request_date: today,
+                planned_delivery_date: today,
+                is_urgent: false,
+                order_no: None,
+                system_delivery_date: None,
+                note: None,
+                assembly_id: None,
+                drawing_file: Some(FileBindingIn {
+                    tmp_key: tmp_key_0.into(),
+                    content_sha256: sha_0.clone(),
+                    original_filename: "first.pdf".into(),
+                    file_size: 1024,
+                    content_type: "application/pdf".into(),
+                }),
+                model3d_file: None,
+            },
+            PartBatchCreateItem {
+                name: "ok-item".into(),
+                drawing_no: "D-OK".into(),
+                applicant_name: "乙".into(),
+                quantity: 1,
+                request_date: today,
+                planned_delivery_date: today,
+                is_urgent: false,
+                order_no: None,
+                system_delivery_date: None,
+                note: None,
+                assembly_id: None,
+                drawing_file: Some(FileBindingIn {
+                    tmp_key: tmp_key_1.into(),
+                    content_sha256: sha_1.clone(),
+                    original_filename: "second.pdf".into(),
+                    file_size: 1024,
+                    content_type: "application/pdf".into(),
+                }),
+                model3d_file: None,
+            },
+        ],
+    };
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartService::batch_create_parts_with_bindings(
+        &mut tx,
+        &snowflake,
+        cos.clone(),
+        "uploads",
+        "tmp/",
+        &req,
+        &current,
+    )
+    .await
+    .expect("batch_create_parts_with_bindings 应整体返回 Ok（含 failed）");
+    tx.commit().await.unwrap();
+
+    // 1) item 0 DB 失败 → failed.len()=1；item 1 成功 → created.len()=1
+    assert_eq!(
+        out.created.len(),
+        1,
+        "应 created=1: failed={:?}",
+        out.failed
+    );
+    assert_eq!(out.failed.len(), 1, "应 failed=1");
+    assert_eq!(out.failed[0].item_index, 0, "失败项位于 idx=0");
+    assert_eq!(
+        out.failed[0].code, 50001,
+        "DATABASE 兜底码（applicant_name 超长 22001）"
+    );
+
+    // 2) B1 不变量：cleanup_tmp_keys 必须包含**所有** head/copy 成功的 tmp_key，
+    //    与 per-item DB 结果无关。失败 item 的 tmp_key 也必须在里面。
+    let keys = &out.cleanup_tmp_keys;
+    assert_eq!(
+        keys.len(),
+        2,
+        "cleanup_tmp_keys 应包含 2 个 key（成功 + 失败 item 各 1）: got {keys:?}"
+    );
+    assert!(
+        keys.contains(&tmp_key_0.to_string()),
+        "失败 item 的 tmp_key 必须保留在 cleanup_tmp_keys 中: {keys:?}"
+    );
+    assert!(
+        keys.contains(&tmp_key_1.to_string()),
+        "成功 item 的 tmp_key 也必须在 cleanup_tmp_keys 中: {keys:?}"
+    );
+
+    // 3) head + copy 都被调用各 1 次（每个 binding 一份）
+    assert_eq!(cos.head_call_count(tmp_key_0), 1, "item 0 head 应被调 1 次");
+    assert_eq!(cos.head_call_count(tmp_key_1), 1, "item 1 head 应被调 1 次");
+    let copy_calls = cos.copy_calls.lock().unwrap().clone();
+    assert_eq!(
+        copy_calls.len(),
+        2,
+        "copy_object 应被调 2 次（每个 binding 一份）: got {copy_calls:?}"
+    );
+
+    // 4) service 层不直接 spawn delete（这是 handler 的职责）；delete_calls 此时应为空。
+    //    handler 端的 spawn-delete 行为由后续端到端测试覆盖（受 part_crud 当前 fixture
+    //    限制——state.cos 是 NoopCos，硬替换 AppState.cos 工作量过大；service 层
+    //    cleanup_tmp_keys 已足够验证 B1 不变量）。
+    assert_eq!(
+        cos.delete_call_count(tmp_key_0),
+        0,
+        "service 层不应直接 spawn delete（属 handler 职责）"
+    );
+}
+
 #[tokio::test]
 #[ignore]
 async fn policy_unit_smoke_integration() {

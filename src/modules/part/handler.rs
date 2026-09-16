@@ -499,7 +499,7 @@ pub async fn batch_create_parts(
         .iter()
         .any(|i| i.drawing_file.is_some() || i.model3d_file.is_some());
     let mut tx = state.pool.begin().await?;
-    let out = if has_bindings {
+    let out_result = if has_bindings {
         // 走带 bindings 的扩展入口：head/copy 在 tx 之外（service 内 pool 直连），
         // tx 内只做 part / batch / part_file INSERT；commit 后由本 handler spawn
         // 批量 delete_object(tmp_keys) 兜底（与 confirm_part_file 模式一致：
@@ -515,29 +515,41 @@ pub async fn batch_create_parts(
             &req,
             &current,
         )
-        .await?
+        .await
     } else {
-        PartService::batch_create_parts(&mut tx, &state.snowflake, &req, &current).await?
+        // legacy 路径 service 直接返 cleanup_tmp_keys=Vec::new()（见
+        // batch_create_parts_legacy），spawn 条件 `!cleanup_keys.is_empty()` 自动跳过
+        PartService::batch_create_parts(&mut tx, &state.snowflake, &req, &current).await
     };
-    tx.commit().await?;
-    // 2026-09-16 M2-B review 第 1 轮修复：spawn 异步批量清理 tmp 对象。
-    // commit 已成功 → DB 是最终态，再触发副作用（best-effort，失败仅 warn 不影响 API 返回）。
-    // 与 `confirm_part_file` handler 的 spawn delete_object 模式对齐。
-    if has_bindings && !out.cleanup_tmp_keys.is_empty() {
+    // 2026-09-16 M2-B review 第 2 轮 B1 修：必须在 tx.commit() 之前拿到 cleanup_tmp_keys，
+    // 否则 tx.commit().await 持有 conn 时跨 .await 容易踩 sqlx 的 connection-held-across-await
+    // 警告（即便此处不报错也不优雅）。先把 keys move 出再 commit。
+    let cleanup_keys: Vec<String> = match &out_result {
+        Ok(out) => out.cleanup_tmp_keys.clone(),
+        // Err 路径下 service 层未透出 keys（head/copy 中途失败时 service 已自行 spawn
+        // 兜底）；后续如需"service Err 也透出 keys"再扩，本轮仅做 Ok 路径。
+        Err(_) => Vec::new(),
+    };
+    let commit_result = tx.commit().await;
+    // 2026-09-16 M2-B review 第 2 轮 B1 修：spawn 异步批量清理 tmp 对象，**无论** commit 成功
+    // 或失败均触发（commit 成功 → 删 tmp 无害；commit 失败 → DB 未持久化，tmp 必须删）。
+    // Best-effort：失败仅 warn，不影响 API 返回。
+    if has_bindings && !cleanup_keys.is_empty() {
         let cos = state.cos.clone();
-        let keys = out.cleanup_tmp_keys.clone();
         tokio::spawn(async move {
-            for key in keys {
+            for key in cleanup_keys {
                 if let Err(e) = cos.delete_object(&key).await {
                     tracing::warn!(
                         tmp_key = %key,
                         error = %e,
-                        "batch_create_parts COS tmp 异步清理失败（已绑定到 part_file，不影响 API 返回）"
+                        "batch_create_parts COS tmp 异步清理失败（best-effort）"
                     );
                 }
             }
         });
     }
+    let out = out_result?;
+    commit_result?;
     Ok(Json(R::ok(out)))
 }
 

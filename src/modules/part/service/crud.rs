@@ -244,10 +244,17 @@ impl PartService {
 
         // 受控并发 5
         let max_concurrency = 5usize;
-        let mut prepared_flat: Vec<(usize, PreparedBinding)> = Vec::with_capacity(jobs.len());
         let mut prepared_per_item: Vec<Vec<PreparedBinding>> =
             (0..req.items.len()).map(|_| Vec::new()).collect();
-        // 第一遍 head/copy 失败的 tmp_keys（commit 失败后 spawn delete 兜底）
+        // 2026-09-16 M2-B review 第 2 轮 B1 修：所有 head/copy 成功的 tmp_key 统一收集到
+        // `cleanup_tmp_keys`，不再按「per-item INSERT 是否成功」分流。
+        // 理由：INSERT 失败的 item 也已把 tmp 对象 copy 到 CAS key（COS 端实际有该对象），
+        // 但 DB 未提交 → 既然 DB 没有 part_file 行指向 cas_key，CAS 对象就成了孤儿。
+        // 反之 tmp 对象没 INSERT 记录引用、必须删。两个对象都要清：
+        // - tmp：必须在 commit 成功/失败后都删（前者防止下次重传误用旧文件；后者防止孤儿）
+        // - cas（INSERT 成功的）：被 part_file 引用，删了会破坏 CAS 不变量 → 不能动
+        // service 层不再分「成功 vs 失败」，统一把 head/copy 成功的 tmp_key 全收上来
+        // → handler commit 后无差别 spawn 删全部（不依赖 per-item DB 结果）。
         let mut cleanup_tmp_keys: Vec<String> = Vec::new();
 
         let chunks: Vec<Vec<Job>> = jobs
@@ -268,7 +275,6 @@ impl PartService {
                         job.future_owner_id,
                         job.kind,
                         &job.binding,
-                        current.id,
                     )
                     .await
                 }
@@ -278,11 +284,14 @@ impl PartService {
                 match res {
                     Ok(pb) => {
                         cleanup_tmp_keys.push(pb.tmp_key.clone());
-                        prepared_per_item[job.item_index].push(pb.clone());
-                        prepared_flat.push((job.item_index, pb));
+                        prepared_per_item[job.item_index].push(pb);
                     }
                     Err(e) => {
                         // 任何 head/copy 失败 → 整体报错；先 spawn 清理已成功 copy 的 tmp_keys
+                        // （此处保留 M2-B review 第 1 轮的逻辑：head/copy 中途失败，service
+                        // 直接 spawn 兜底，不再把 cleanup_tmp_keys 透出到 handler——因为
+                        // 整批失败时 handler 也已走 Err 分支，spawn 会重复执行；service 内的
+                        // spawn 已覆盖）
                         for tk in &cleanup_tmp_keys {
                             let cos = cos.clone();
                             let tk = tk.clone();
@@ -299,8 +308,6 @@ impl PartService {
         // ===== 第二遍：单事务 INSERT parts + per-item savepoint + part_file 行 =====
         let mut created = Vec::new();
         let mut failed = Vec::new();
-        // 实际成功插入的 tmp_keys（commit 后 spawn 清理）
-        let mut successful_tmp_keys: Vec<String> = Vec::new();
 
         for (idx, item) in req.items.iter().enumerate() {
             let new_id = preallocated_part_ids[idx];
@@ -421,10 +428,10 @@ impl PartService {
                             )))
                             .execute(&mut *conn)
                             .await?;
-                            // 记录成功的 tmp_key，commit 后清理
-                            for pb in &prepared_per_item[idx] {
-                                successful_tmp_keys.push(pb.tmp_key.clone());
-                            }
+                            // 注：2026-09-16 M2-B review 第 2 轮 B1 修 —— 不再在这里 push
+                            // `successful_tmp_keys`。cleanup_tmp_keys 已在第一遍 head/copy
+                            // 成功后全量收集，handler 统一 spawn 删除（与 per-item
+                            // DB 结果无关）。
                             match PartRepo::get_part_detail(&mut *conn, new_id).await {
                                 Ok(Some(p)) => {
                                     let (cn, l1cn) = lookup_customer_names(conn, p.customer_id).await?;
@@ -467,17 +474,14 @@ impl PartService {
                 }
             }
         }
-        // 2026-09-16 M2-B review 第 1 轮修复：把 `successful_tmp_keys` 通过 `out.cleanup_tmp_keys`
-        // 透传给 caller（handler），由 handler 在 tx.commit() 之后 spawn 异步批量 delete_object 兜底。
-        // （`cleanup_tmp_keys` 是「第一遍 head/copy 中途失败时需清理的 tmp_keys」——这种场景
-        // service 层直接 spawn 删除并 return Err，不会走到这里，所以这里不需要透出；变量仍持有以避免
-        // 编译期 unused 警告。）
+        // 2026-09-16 M2-B review 第 2 轮 B1 修：`cleanup_tmp_keys` 已是 head/copy 阶段
+        // 全量收集的所有 tmp_key（与 per-item INSERT 是否成功无关），handler commit 后
+        // 无差别 spawn 删除全部（成功 INSERT 的删 tmp 无害、失败未 INSERT 的删 tmp 必须）。
         let out = crate::modules::part::dto_crud::PartBatchCreateOut {
             created,
             failed,
-            cleanup_tmp_keys: successful_tmp_keys,
+            cleanup_tmp_keys,
         };
-        let _ = cleanup_tmp_keys; // 保留：service 中途失败已 spawn 删除；不进 out
         Ok(out)
     }
 
@@ -1187,7 +1191,6 @@ async fn prepare_binding_head_copy(
     future_owner_id: i64,
     kind: &str,
     binding: &FileBindingIn,
-    _current_user_id: i64,
 ) -> Result<PreparedBinding, AppError> {
     use crate::modules::part_file::dto::validate;
     let max_file_size = 300 * 1024 * 1024usize;
