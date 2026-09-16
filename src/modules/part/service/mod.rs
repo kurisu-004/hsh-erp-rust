@@ -1,15 +1,24 @@
 //! part 域业务逻辑（按业务流聚合）
 //!
+//! - `crud.rs`：单件 CRUD（create_part / get_part / list_parts / update_part / soft_delete_part
+//!   / upload_part_file / upload_drawing / upload_3d_model / list_inspection_batches /
+//!   get_part_batches_by_serial / list_parts）+ helpers（map_create_error /
+//!   expand_customer_id / lookup_customer_names）
+//! - `batch.rs`：批量创建（batch_create_parts legacy + batch_create_parts_with_bindings +
+//!   prepare_binding_head_copy + PreparedBinding），2026-09-16 M2-B + M2-C 重构
 //! - `inspection.rs`：to_ship / to_inspection / to_process 流薄 wrapper +
 //!   批量聚合器 + 共享私有辅助函数（Phase F2 / F3）
 //! - `inspection_core.rs`：to_ship / to_inspection / to_process 的 `*_core`
 //!   共享核心（impl 块拆文件，承接 inspection.rs 因 1000 行上限而拆出的逻辑）
 //! - `worker_scan.rs`：`POST /parts/worker-scan` 流（Task 8）；impl 块拆文件，
 //!   Rust 允许同一 `impl PartService { ... }` 分布在多个同 crate 文件中。
-//! - `crud.rs`：create / list / detail / update / soft-delete / by-serial /
-//!   batch-create / upload-drawing
-//! - `lifecycle.rs`：deliver / cancel / complete / start_repair
+//! - `lifecycle.rs`：deliver / cancel / complete / start_repair（终态翻转）
+//! - `phase1.rs`：Phase 1（2026-09-13）14 端点（place-on-shelf / programming /
+//!   outsource / repair / batch 操作 / 事件历史 / 位置树 / scan / match /
+//!   batch-with-pdfs / batch-update-order-info）
+//! - `rollup.rs`：rollup 工具（sync_from_batch_change）
 
+pub mod batch;
 pub mod crud;
 pub mod inspection;
 pub mod inspection_core;

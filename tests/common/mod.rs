@@ -314,6 +314,83 @@ pub async fn test_state(pool: PgPool) -> Arc<AppState> {
     test_state_with_redis(pool, redis_pool)
 }
 
+/// 2026-09-16 M2-C 增：构造测试用 AppState（用自定义 `CosClient` 替换 `state.cos`）。
+///
+/// 用途：让 handler 后置 `spawn delete` 在集成测试里可端到端断言
+/// （如 `MockCos::delete_calls`）。其它配置与 `test_state_with_redis` 同形，
+/// Redis 池 + session_store 一致；仅 `state.cos` 用 `cos` 参数替换。
+///
+/// ## 用法示例
+/// ```ignore
+/// let cos = std::sync::Arc::new(MockCos::new());
+/// let state = common::test_state_with_cos(pool.clone(), cos.clone()).await;
+/// // ... 调用 handler → cos.delete_calls.len() 应 = cleanup_tmp_keys.len()
+/// ```
+#[allow(dead_code)]
+pub async fn test_state_with_cos(
+    pool: PgPool,
+    cos: Arc<dyn hsh_erp_rust::infra::cos::CosClient>,
+) -> Arc<AppState> {
+    let redis_pool = test_redis_pool().await;
+    let config = Arc::new(AppConfig {
+        database_url: test_database_url(),
+        listen_addr: "0.0.0.0:3000".to_string(),
+        jwt: JwtConfig {
+            secret: TEST_JWT_SECRET.to_string(),
+            issuer: "hsh-erp-test".to_string(),
+            access_ttl_hours: 12,
+            refresh_ttl_days: 7,
+        },
+        cos: CosConfig {
+            enabled: false,
+            region: "ap-shanghai".into(),
+            bucket: "test".into(),
+            secret_id: "test".into(),
+            secret_key: "test".into(),
+            app_id: "".into(),
+            endpoint: "".into(),
+            scheme: "https".into(),
+            upload_prefix: "uploads".into(),
+            presign_expire_seconds: 3600,
+            max_file_size: 314_572_800,
+            sts_duration_seconds: 900,
+            tmp_prefix: "tmp/".into(),
+        },
+        snowflake: SnowflakeConfig {
+            epoch_ms: 1_577_836_800_000,
+            instance: 1,
+        },
+        redis: AppRedisConfig {
+            url: test_redis_url(),
+            session_ttl_seconds: 3600,
+            pool_max_size: 5,
+            session_check_enabled: true,
+        },
+        max_request_body_size: 314_572_800,
+        auto_complete: AutoCompleteConfig {
+            threshold_days: 7,
+            interval_hours: 24,
+        },
+        delivery_note_template_dir: std::path::PathBuf::from("template"),
+        enable_e2e_hooks: true,
+        ws_heartbeat_interval_seconds: 1,
+    });
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(
+        config.snowflake.epoch_ms,
+        config.snowflake.instance,
+    ));
+    let ws_hub = Arc::new(WsHub::new());
+    // 2026-09-16 M2-C 增：STS 用 NoopSts 占位（与 test_state_with_redis 一致）
+    let sts: Arc<dyn hsh_erp_rust::infra::sts::StsCredentialIssuer> =
+        Arc::new(hsh_erp_rust::infra::sts::NoopSts);
+    let shutdown = CancellationToken::new();
+    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool));
+    Arc::new(AppState::new(
+        pool, config, snowflake, ws_hub, cos, // 注入的 cos（替换默认 NoopCos）
+        sts, shutdown, session,
+    ))
+}
+
 /// axum Router：与 main.rs 中的 `/api/v2` nest 同形。
 ///
 /// 不再装 `inject_current_user_layer`：handler 现在用 `current: CurrentUser`
@@ -723,13 +800,18 @@ impl CosClient for MockCos {
 
     async fn head_object(&self, key: &str) -> Result<ObjectMeta, AppError> {
         self.head_calls.lock().unwrap().push(key.to_string());
-        self.head_responses.lock().unwrap().get(key).cloned().ok_or_else(|| {
-            // 与 TencentCos 行为对齐：404 → NoSuchKey 包装为业务错误
-            AppError::biz(
-                code::BIZ_PART_FILE_UPLOAD_FAILED,
-                format!("MockCos head_object NoSuch key={key}"),
-            )
-        })
+        self.head_responses
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or_else(|| {
+                // 与 TencentCos 行为对齐：404 → NoSuchKey 包装为业务错误
+                AppError::biz(
+                    code::BIZ_PART_FILE_UPLOAD_FAILED,
+                    format!("MockCos head_object NoSuch key={key}"),
+                )
+            })
     }
 
     async fn copy_object(&self, src_key: &str, dst_key: &str) -> Result<(), AppError> {

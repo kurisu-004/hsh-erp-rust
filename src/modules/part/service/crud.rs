@@ -1,13 +1,19 @@
-//! part 域 CRUD 业务逻辑
+//! part 域单件 CRUD 业务逻辑（2026-09-16 M2-C 拆分）
 //!
-//! 包含 8 个公开方法：
-//! - `create_part` / `batch_create_parts` —— 工单创建
-//! - `list_parts` / `get_part` / `get_part_by_serial` —— 工单查询
-//! - `update_part` / `soft_delete_part` —— 工单修改
-//! - `upload_drawing` —— 图纸 PDF 上传到 COS + 落 `t_part_file`
+//! 本文件承载单件 CRUD + 列表 + 上传 + 历史 / 位置树等查询；批量创建相关逻辑
+//! （含直传 COS 文件绑定 `batch_create_parts_with_bindings` / legacy 路径 /
+//! `prepare_binding_head_copy`）已迁出到 `service/batch.rs`，避免单文件超 1000 行。
 //!
-//! 配合 helper（`map_create_error` / `expand_customer_id` / `lookup_customer_names`）
-//! 复用错误码映射、客户过滤展开、客户名解析三段公共逻辑。
+//! ## 范围（本文件）
+//! - `create_part` / `list_parts` / `list_inspection_batches` / `get_part` /
+//!   `get_part_by_serial` / `get_part_batches_by_serial` / `update_part` /
+//!   `soft_delete_part` / `upload_part_file` / `upload_drawing` / `upload_3d_model`
+//! - `batch_create_parts` —— 薄包装，转 `service/batch.rs::batch_create_parts_legacy`
+//!
+//! ## helpers（pub(super)，供 batch.rs 复用）
+//! - `map_create_error` —— sqlx 错误码 → 业务错误码
+//! - `expand_customer_id` —— L1+L2 客户 id 展开
+//! - `lookup_customer_names` —— 取客户名 + L1 名
 
 use sqlx::PgConnection;
 use std::sync::Arc;
@@ -15,51 +21,27 @@ use std::sync::Arc;
 use chrono::NaiveDate;
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::customer::repo::CustomerRepo;
 use crate::modules::part::dto::{
     InspectionBatchListItemOut, InspectionBatchListOut, InspectionBatchListQuery, PartBatchScanOut,
     PartScanContextOut, PartScanInfoOut,
 };
-use crate::modules::part::dto_crud::FileBindingIn;
 use crate::modules::part::model::NewPartEvent;
-use crate::modules::part::repo::part::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part::repo::PartRepo;
+use crate::modules::part::repo::part::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part_batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
-use crate::modules::part_file::repo::{hash_bytes, NewPartFile, PartFileRepo};
-use crate::shared::error::{code, AppError};
+use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
+use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
 use super::super::dto_crud::{
     PartBatchCreateRequest, PartCreateRequest, PartDetailOut, PartListItem, PartListOut,
     PartListQuery, PartUpdateRequest,
 };
-use super::{BATCH_CREATE_PARTS_MAX_ITEMS, PartService};
-
-/// 2026-09-16 M2-B 新增：单 item 文件绑定预处理的输出。
-///
-/// 由 `prepare_binding_head_copy` 在 batch_create 第一遍（并发 head+copy）后产出，
-/// 供第二遍 DB 写入直接使用已准备好的 cas_key（**不再做 head/copy**）。
-#[derive(Debug, Clone)]
-struct PreparedBinding {
-    /// 临时对象 key（head/copy 完成后等 commit 成功 spawn 异步 delete 兜底）
-    tmp_key: String,
-    /// 正式 CAS 对象 key（含预生成的 owner_id）
-    cas_key: String,
-    /// "DRAWING" / "3D_MODEL"
-    kind: String,
-    /// "PDF" / "STEP" / "STL" / ...
-    file_type: String,
-    /// 64 hex
-    sha256: String,
-    /// 原始 filename
-    original_filename: String,
-    file_size: i64,
-    content_type: String,
-}
+use super::PartService;
 
 /// 扫码快捷品检上下文内部 FromRow 结构。
 ///
@@ -144,12 +126,9 @@ impl PartService {
         .await?;
         let part = PartRepo::get_part_detail(&mut *conn, new_id)
             .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, "新建 part 查不到")
-            })?;
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "新建 part 查不到"))?;
         let (cn, l1cn) = lookup_customer_names(conn, part.customer_id).await?;
-        let current_batch_id =
-            PartRepo::find_current_inspection_batch_id(conn, part.id).await?;
+        let current_batch_id = PartRepo::find_current_inspection_batch_id(conn, part.id).await?;
         Ok(PartDetailOut::from_with_customer_extra(
             part,
             current_batch_id,
@@ -163,456 +142,11 @@ impl PartService {
         snowflake: &SnowflakeIdGenerator,
         req: &PartBatchCreateRequest,
         current: &CurrentUser,
-    ) -> Result<
-        crate::modules::part::dto_crud::PartBatchCreateOut,
-        AppError,
-    > {
-        // 2026-09-16 M2-B：薄包装转 legacy 实现（不绑定文件）。
-        // 文件绑定走 `batch_create_parts_with_bindings`（handler 层显式选）。
+    ) -> Result<crate::modules::part::dto_crud::PartBatchCreateOut, AppError> {
+        // 2026-09-16 M2-B + M2-C：薄包装转 legacy 实现（不绑定文件）。
+        // 文件绑定走 `batch_create_parts_with_bindings`（handler 层显式选，
+        // 实现已迁出到 `service/batch.rs`）。
         Self::batch_create_parts_legacy(conn, snowflake, req, current).await
-    }
-
-    /// 2026-09-16 M2-B 新增：带文件绑定的 batch_create（场景 A 收口）。
-    ///
-    /// 第一遍：并发 head+copy 所有文件绑定（max 5 并发）→ 任一失败整体报错。
-    /// 第二遍：单事务 INSERT parts + per-item savepoint + part_file 行（每个 part 至多 2 行）。
-    /// commit 后 spawn batch delete_object(tmp_keys) 兜底清理。
-    ///
-    /// 与 `batch_create_parts` 的区别：调用方需额外注入 `cos` / `cfg`（upload_prefix +
-    /// tmp_prefix）；handler 层走 state 直接拿，service 层把 IO 控制在 pool（不依赖 tx）。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn batch_create_parts_with_bindings(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
-        cos: Arc<dyn CosClient>,
-        cfg_upload_prefix: &str,
-        cfg_tmp_prefix: &str,
-        req: &PartBatchCreateRequest,
-        current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto_crud::PartBatchCreateOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        if req.items.is_empty() {
-            return Err(AppError::validation("items 不能为空"));
-        }
-        if req.items.len() > BATCH_CREATE_PARTS_MAX_ITEMS {
-            return Err(AppError::validation(format!(
-                "items 数量 {} 超过上限 {}",
-                req.items.len(),
-                BATCH_CREATE_PARTS_MAX_ITEMS
-            )));
-        }
-        let _customer = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_CUSTOMER_NOT_FOUND,
-                    format!("customer {} 不存在", req.customer_id),
-                )
-            })?;
-
-        // ===== 第一遍：预生成 part_id + 收集所有 bindings + 并发 head/copy（max 5 并发） =====
-        let preallocated_part_ids: Vec<i64> =
-            (0..req.items.len()).map(|_| snowflake.next_id()).collect();
-
-        // 收集所有 (item_index, binding_kind, FileBindingIn, future_owner_id) jobs
-        #[derive(Clone)]
-        struct Job {
-            item_index: usize,
-            kind: &'static str,
-            binding: FileBindingIn,
-            future_owner_id: i64,
-        }
-        let mut jobs: Vec<Job> = Vec::new();
-        for (idx, item) in req.items.iter().enumerate() {
-            if let Some(b) = &item.drawing_file {
-                jobs.push(Job {
-                    item_index: idx,
-                    kind: "DRAWING",
-                    binding: b.clone(),
-                    future_owner_id: preallocated_part_ids[idx],
-                });
-            }
-            if let Some(b) = &item.model3d_file {
-                jobs.push(Job {
-                    item_index: idx,
-                    kind: "3D_MODEL",
-                    binding: b.clone(),
-                    future_owner_id: preallocated_part_ids[idx],
-                });
-            }
-        }
-
-        // 受控并发 5
-        let max_concurrency = 5usize;
-        let mut prepared_per_item: Vec<Vec<PreparedBinding>> =
-            (0..req.items.len()).map(|_| Vec::new()).collect();
-        // 2026-09-16 M2-B review 第 2 轮 B1 修：所有 head/copy 成功的 tmp_key 统一收集到
-        // `cleanup_tmp_keys`，不再按「per-item INSERT 是否成功」分流。
-        // 理由：INSERT 失败的 item 也已把 tmp 对象 copy 到 CAS key（COS 端实际有该对象），
-        // 但 DB 未提交 → 既然 DB 没有 part_file 行指向 cas_key，CAS 对象就成了孤儿。
-        // 反之 tmp 对象没 INSERT 记录引用、必须删。两个对象都要清：
-        // - tmp：必须在 commit 成功/失败后都删（前者防止下次重传误用旧文件；后者防止孤儿）
-        // - cas（INSERT 成功的）：被 part_file 引用，删了会破坏 CAS 不变量 → 不能动
-        // service 层不再分「成功 vs 失败」，统一把 head/copy 成功的 tmp_key 全收上来
-        // → handler commit 后无差别 spawn 删全部（不依赖 per-item DB 结果）。
-        let mut cleanup_tmp_keys: Vec<String> = Vec::new();
-
-        let chunks: Vec<Vec<Job>> = jobs
-            .chunks(max_concurrency)
-            .map(|c| c.to_vec())
-            .collect();
-        for chunk in chunks {
-            // 同一批并发执行 head+copy
-            let results = futures_util::future::join_all(chunk.iter().map(|job| {
-                let cos = cos.clone();
-                let cfg_upload_prefix = cfg_upload_prefix.to_string();
-                let cfg_tmp_prefix = cfg_tmp_prefix.to_string();
-                async move {
-                    prepare_binding_head_copy(
-                        cos,
-                        &cfg_upload_prefix,
-                        &cfg_tmp_prefix,
-                        job.future_owner_id,
-                        job.kind,
-                        &job.binding,
-                    )
-                    .await
-                }
-            }))
-            .await;
-            for (job, res) in chunk.iter().zip(results) {
-                match res {
-                    Ok(pb) => {
-                        cleanup_tmp_keys.push(pb.tmp_key.clone());
-                        prepared_per_item[job.item_index].push(pb);
-                    }
-                    Err(e) => {
-                        // 任何 head/copy 失败 → 整体报错；先 spawn 清理已成功 copy 的 tmp_keys
-                        // （此处保留 M2-B review 第 1 轮的逻辑：head/copy 中途失败，service
-                        // 直接 spawn 兜底，不再把 cleanup_tmp_keys 透出到 handler——因为
-                        // 整批失败时 handler 也已走 Err 分支，spawn 会重复执行；service 内的
-                        // spawn 已覆盖）
-                        for tk in &cleanup_tmp_keys {
-                            let cos = cos.clone();
-                            let tk = tk.clone();
-                            tokio::spawn(async move {
-                                let _ = cos.delete_object(&tk).await;
-                            });
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-        }
-
-        // ===== 第二遍：单事务 INSERT parts + per-item savepoint + part_file 行 =====
-        let mut created = Vec::new();
-        let mut failed = Vec::new();
-
-        for (idx, item) in req.items.iter().enumerate() {
-            let new_id = preallocated_part_ids[idx];
-            let new = NewPartCreate {
-                id: new_id,
-                name: item.name.trim(),
-                drawing_no: item.drawing_no.trim(),
-                applicant_name: item.applicant_name.trim(),
-                quantity: item.quantity,
-                request_date: item.request_date,
-                planned_delivery_date: item.planned_delivery_date,
-                is_urgent: item.is_urgent,
-                customer_id: req.customer_id,
-                assembly_id: item.assembly_id,
-                order_no: item.order_no.as_deref(),
-                system_delivery_date: item.system_delivery_date,
-                note: item.note.as_deref(),
-                created_by: current.id,
-            };
-            // per-item savepoint
-            use sqlx::AssertSqlSafe;
-            let sp_name = format!("batch_item_{idx}");
-            sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
-                .execute(&mut *conn)
-                .await?;
-            match PartRepo::create_part(&mut *conn, new).await {
-                Ok(_) => {
-                    let initial_batch_id = snowflake.next_id();
-                    let initial_batch_result = PartBatchRepo::create_initial_batch(
-                        &mut *conn,
-                        NewInitialBatch {
-                            id: initial_batch_id,
-                            part_id: new_id,
-                            quantity: item.quantity,
-                            location: None,
-                            created_by: Some(current.id),
-                        },
-                    )
-                    .await;
-                    if let Err(e) = initial_batch_result {
-                        sqlx::raw_sql(AssertSqlSafe(format!(
-                            "ROLLBACK TO SAVEPOINT {sp_name}"
-                        )))
-                        .execute(&mut *conn)
-                        .await?;
-                        let mapped = map_create_error(e);
-                        failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
-                            part_id: None,
-                            code: mapped.code(),
-                            message: format!("{mapped}"),
-                            item_index: idx,
-                        });
-                        continue;
-                    }
-                    {
-                        // 把 prepared bindings 插入 t_part_file（成功 part 才绑；savepoint 已释放）
-                        let mut part_files_ok = true;
-                        for pb in &prepared_per_item[idx] {
-                            if let Err(e) = PartFileRepo::create_part_file(
-                                &mut *conn,
-                                NewPartFile {
-                                    id: snowflake.next_id(),
-                                    part_id: new_id,
-                                    owner_kind: "PART",
-                                    kind: &pb.kind,
-                                    file_type: &pb.file_type,
-                                    object_key: &pb.cas_key,
-                                    original_filename: &pb.original_filename,
-                                    file_size: pb.file_size,
-                                    content_type: &pb.content_type,
-                                    upload_status: "READY",
-                                    content_sha256: Some(&pb.sha256),
-                                    created_by: current.id,
-                                },
-                            )
-                            .await
-                            {
-                                if let sqlx::Error::Database(db) = &e
-                                    && db.code().as_deref() == Some("23505")
-                                {
-                                    part_files_ok = false;
-                                    failed.push(
-                                        crate::modules::part::dto_crud::PartBatchCreateFailure {
-                                            part_id: Some(new_id),
-                                            code: code::BIZ_PART_FILE_DUPLICATE,
-                                            message: format!(
-                                                "drawing_file / model3d_file sha={} 撞唯一索引",
-                                                &pb.sha256[..16]
-                                            ),
-                                            item_index: idx,
-                                        },
-                                    );
-                                    break;
-                                }
-                                part_files_ok = false;
-                                let mapped = AppError::from(e);
-                                failed.push(
-                                    crate::modules::part::dto_crud::PartBatchCreateFailure {
-                                        part_id: Some(new_id),
-                                        code: mapped.code(),
-                                        message: format!("{mapped}"),
-                                        item_index: idx,
-                                    },
-                                );
-                                break;
-                            }
-                        }
-                        if !part_files_ok {
-                            sqlx::raw_sql(AssertSqlSafe(format!(
-                                "ROLLBACK TO SAVEPOINT {sp_name}"
-                            )))
-                            .execute(&mut *conn)
-                            .await?;
-                            // savepoint 已回滚，继续下一个 item
-                        } else {
-                            sqlx::raw_sql(AssertSqlSafe(format!(
-                                "RELEASE SAVEPOINT {sp_name}"
-                            )))
-                            .execute(&mut *conn)
-                            .await?;
-                            // 注：2026-09-16 M2-B review 第 2 轮 B1 修 —— 不再在这里 push
-                            // `successful_tmp_keys`。cleanup_tmp_keys 已在第一遍 head/copy
-                            // 成功后全量收集，handler 统一 spawn 删除（与 per-item
-                            // DB 结果无关）。
-                            match PartRepo::get_part_detail(&mut *conn, new_id).await {
-                                Ok(Some(p)) => {
-                                    let (cn, l1cn) = lookup_customer_names(conn, p.customer_id).await?;
-                                    let current_batch_id =
-                                        PartRepo::find_current_inspection_batch_id(conn, p.id).await?;
-                                    created.push(PartDetailOut::from_with_customer_extra(
-                                        p,
-                                        current_batch_id,
-                                        cn,
-                                        l1cn,
-                                    ));
-                                }
-                                _ => {
-                                    failed.push(
-                                        crate::modules::part::dto_crud::PartBatchCreateFailure {
-                                            part_id: Some(new_id),
-                                            code: code::BIZ_PART_NOT_FOUND,
-                                            message: "inserted but detail lookup failed".into(),
-                                            item_index: idx,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    sqlx::raw_sql(AssertSqlSafe(format!(
-                        "ROLLBACK TO SAVEPOINT {sp_name}"
-                    )))
-                    .execute(&mut *conn)
-                    .await?;
-                    let mapped = map_create_error(e);
-                    failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
-                        part_id: None,
-                        code: mapped.code(),
-                        message: format!("{mapped}"),
-                        item_index: idx,
-                    });
-                }
-            }
-        }
-        // 2026-09-16 M2-B review 第 2 轮 B1 修：`cleanup_tmp_keys` 已是 head/copy 阶段
-        // 全量收集的所有 tmp_key（与 per-item INSERT 是否成功无关），handler commit 后
-        // 无差别 spawn 删除全部（成功 INSERT 的删 tmp 无害、失败未 INSERT 的删 tmp 必须）。
-        let out = crate::modules::part::dto_crud::PartBatchCreateOut {
-            created,
-            failed,
-            cleanup_tmp_keys,
-        };
-        Ok(out)
-    }
-
-    /// batch_create_parts 的 legacy 实现：与既有签名一致，不支持文件绑定。
-    /// 2026-09-16 M2-B：拆出来供 batch_create_parts 复用（保留原 per-item savepoint 模型）。
-    async fn batch_create_parts_legacy(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
-        req: &PartBatchCreateRequest,
-        current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto_crud::PartBatchCreateOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        if req.items.is_empty() {
-            return Err(AppError::validation("items 不能为空"));
-        }
-        if req.items.len() > BATCH_CREATE_PARTS_MAX_ITEMS {
-            return Err(AppError::validation(format!(
-                "items 数量 {} 超过上限 {}",
-                req.items.len(),
-                BATCH_CREATE_PARTS_MAX_ITEMS
-            )));
-        }
-        let _customer = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_CUSTOMER_NOT_FOUND,
-                    format!("customer {} 不存在", req.customer_id),
-                )
-            })?;
-        let mut created = Vec::new();
-        let mut failed = Vec::new();
-        for (idx, item) in req.items.iter().enumerate() {
-            let new_id = snowflake.next_id();
-            let new = NewPartCreate {
-                id: new_id,
-                name: item.name.trim(),
-                drawing_no: item.drawing_no.trim(),
-                applicant_name: item.applicant_name.trim(),
-                quantity: item.quantity,
-                request_date: item.request_date,
-                planned_delivery_date: item.planned_delivery_date,
-                is_urgent: item.is_urgent,
-                customer_id: req.customer_id,
-                assembly_id: item.assembly_id,
-                order_no: item.order_no.as_deref(),
-                system_delivery_date: item.system_delivery_date,
-                note: item.note.as_deref(),
-                created_by: current.id,
-            };
-            use sqlx::AssertSqlSafe;
-            let sp_name = format!("batch_item_{idx}");
-            sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
-                .execute(&mut *conn)
-                .await?;
-            match PartRepo::create_part(&mut *conn, new).await {
-                Ok(_) => {
-                    let initial_batch_id = snowflake.next_id();
-                    if let Err(e) = PartBatchRepo::create_initial_batch(
-                        &mut *conn,
-                        NewInitialBatch {
-                            id: initial_batch_id,
-                            part_id: new_id,
-                            quantity: item.quantity,
-                            location: None,
-                            created_by: Some(current.id),
-                        },
-                    )
-                    .await
-                    {
-                        sqlx::raw_sql(AssertSqlSafe(format!(
-                            "ROLLBACK TO SAVEPOINT {sp_name}"
-                        )))
-                        .execute(&mut *conn)
-                        .await?;
-                        let mapped = map_create_error(e);
-                        failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
-                            part_id: None,
-                            code: mapped.code(),
-                            message: format!("{mapped}"),
-                            item_index: idx,
-                        });
-                        continue;
-                    }
-                    sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
-                        .execute(&mut *conn)
-                        .await?;
-                    match PartRepo::get_part_detail(&mut *conn, new_id).await {
-                        Ok(Some(p)) => {
-                            let (cn, l1cn) = lookup_customer_names(conn, p.customer_id).await?;
-                            let current_batch_id =
-                                PartRepo::find_current_inspection_batch_id(conn, p.id).await?;
-                            created.push(PartDetailOut::from_with_customer_extra(
-                                p,
-                                current_batch_id,
-                                cn,
-                                l1cn,
-                            ));
-                        }
-                        _ => {
-                            failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
-                                part_id: Some(new_id),
-                                code: code::BIZ_PART_NOT_FOUND,
-                                message: "inserted but detail lookup failed".into(),
-                                item_index: idx,
-                            });
-                        }
-                    }
-                }
-                Err(e) => {
-                    sqlx::raw_sql(AssertSqlSafe(format!(
-                        "ROLLBACK TO SAVEPOINT {sp_name}"
-                    )))
-                    .execute(&mut *conn)
-                    .await?;
-                    let mapped = map_create_error(e);
-                    failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
-                        part_id: None,
-                        code: mapped.code(),
-                        message: format!("{mapped}"),
-                        item_index: idx,
-                    });
-                }
-            }
-        }
-        Ok(crate::modules::part::dto_crud::PartBatchCreateOut {
-            created,
-            failed,
-            // legacy 路径不绑定文件，无 tmp 需清理
-            cleanup_tmp_keys: Vec::new(),
-        })
     }
 
     pub async fn list_parts(
@@ -735,9 +269,7 @@ impl PartService {
         let keyword_owned: Option<String> = match query.keyword.as_deref() {
             Some(kw) => {
                 if kw.contains(['%', '_', '\\']) {
-                    return Err(AppError::validation(
-                        "keyword 不能包含通配符 % _ \\",
-                    ));
+                    return Err(AppError::validation("keyword 不能包含通配符 % _ \\"));
                 }
                 Some(format!("%{kw}%"))
             }
@@ -749,9 +281,7 @@ impl PartService {
         let serial_no_owned: Option<String> = match query.serial_no.as_deref() {
             Some(sn) => {
                 if sn.contains(['%', '_', '\\']) {
-                    return Err(AppError::validation(
-                        "serial_no 不能包含通配符 % _ \\",
-                    ));
+                    return Err(AppError::validation("serial_no 不能包含通配符 % _ \\"));
                 }
                 Some(format!("%{sn}%"))
             }
@@ -816,8 +346,7 @@ impl PartService {
                 )
             })?;
         let (cn, l1cn) = lookup_customer_names(conn, part.customer_id).await?;
-        let current_batch_id =
-            PartRepo::find_current_inspection_batch_id(conn, part.id).await?;
+        let current_batch_id = PartRepo::find_current_inspection_batch_id(conn, part.id).await?;
         Ok(PartDetailOut::from_with_customer_extra(
             part,
             current_batch_id,
@@ -893,10 +422,7 @@ impl PartService {
         // ③ 拼 DTO
         Ok(PartScanContextOut {
             part: PartScanInfoOut::from(part),
-            batches: batches
-                .into_iter()
-                .map(PartBatchScanOut::from)
-                .collect(),
+            batches: batches.into_iter().map(PartBatchScanOut::from).collect(),
         })
     }
 
@@ -943,7 +469,8 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
-        let n = PartRepo::soft_delete_part(&mut *conn, part_id, expected_version, current.id).await?;
+        let n =
+            PartRepo::soft_delete_part(&mut *conn, part_id, expected_version, current.id).await?;
         match n {
             1 => {
                 PartRepo::insert_part_event(
@@ -984,7 +511,10 @@ impl PartService {
                     )),
                     Some(p) if p.version != expected_version => Err(AppError::biz(
                         code::VERSION_CONFLICT,
-                        format!("part {part_id} 版本冲突（期望 {expected_version}，实际 {}）", p.version),
+                        format!(
+                            "part {part_id} 版本冲突（期望 {expected_version}，实际 {}）",
+                            p.version
+                        ),
                     )),
                     Some(p) if p.delivery_note_id.is_some() => Err(AppError::biz(
                         code::BIZ_DELIVERY_NOTE_LOCKED_PART,
@@ -1135,9 +665,16 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<TPartFile, AppError> {
         Self::upload_part_file(
-            conn, snowflake, state, part_id, bytes,
-            original_filename, content_type,
-            "DRAWING", "PDF", current,
+            conn,
+            snowflake,
+            state,
+            part_id,
+            bytes,
+            original_filename,
+            content_type,
+            "DRAWING",
+            "PDF",
+            current,
         )
         .await
     }
@@ -1159,110 +696,28 @@ impl PartService {
         let ext = policy::ext_of(original_filename)
             .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
         let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
-            AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("未知 3D 模型扩展名: {ext}"))
+            AppError::biz(
+                code::BIZ_PART_FILE_BAD_TYPE,
+                format!("未知 3D 模型扩展名: {ext}"),
+            )
         })?;
         Self::upload_part_file(
-            conn, snowflake, state, part_id, bytes,
-            original_filename, content_type,
-            "3D_MODEL", file_type, current,
+            conn,
+            snowflake,
+            state,
+            part_id,
+            bytes,
+            original_filename,
+            content_type,
+            "3D_MODEL",
+            file_type,
+            current,
         )
         .await
     }
 }
 
 // ===== helpers =====
-
-/// 2026-09-16 M2-B 新增：单 item 文件绑定预处理（head + copy + cas_key 派生）。
-///
-/// 复用 [`PartFileService::bind_uploaded_file`] 的 head/copy 校验语义，但**不**做
-/// soft_delete + INSERT —— DB 写入由 batch_create 第二遍在事务内做。
-///
-/// 错误码：
-/// - 40001 VALIDATION_ERROR — 字段校验失败（kind / sha / filename / size / content_type）
-/// - 21114 BIZ_PART_FILE_TMP_OBJECT_MISSING — head_object 失败
-/// - 21115 BIZ_PART_FILE_SIZE_MISMATCH — head size 与声明 size 不一致
-/// - 21104 BIZ_PART_FILE_UPLOAD_FAILED — copy_object 失败
-/// - 40000 BIZ_INVALID_VALUE — tmp_key 不在 cfg_tmp_prefix 范围内
-#[allow(clippy::too_many_arguments)]
-async fn prepare_binding_head_copy(
-    cos: Arc<dyn CosClient>,
-    cfg_upload_prefix: &str,
-    cfg_tmp_prefix: &str,
-    future_owner_id: i64,
-    kind: &str,
-    binding: &FileBindingIn,
-) -> Result<PreparedBinding, AppError> {
-    use crate::modules::part_file::dto::validate;
-    let max_file_size = 300 * 1024 * 1024usize;
-    validate::check_kind(kind)?;
-    validate::check_sha256(&binding.content_sha256)?;
-    validate::check_filename(&binding.original_filename)?;
-    validate::check_file_size(binding.file_size, max_file_size)?;
-    validate::check_content_type(&binding.content_type, &binding.original_filename)?;
-
-    if !binding.tmp_key.starts_with(cfg_tmp_prefix) {
-        return Err(AppError::biz(
-            code::BIZ_INVALID_VALUE,
-            format!(
-                "tmp_key {:?} 不在 cfg_tmp_prefix {:?} 范围内",
-                binding.tmp_key, cfg_tmp_prefix
-            ),
-        ));
-    }
-
-    let meta = cos.head_object(&binding.tmp_key).await.map_err(|e| {
-        AppError::biz(
-            code::BIZ_PART_FILE_TMP_OBJECT_MISSING,
-            format!(
-                "head_object 失败（tmp_key={:?}）: {e}",
-                binding.tmp_key
-            ),
-        )
-    })?;
-    if meta.size != binding.file_size {
-        return Err(AppError::biz(
-            code::BIZ_PART_FILE_SIZE_MISMATCH,
-            format!(
-                "tmp_key={:?} 客户端声明 size={} 与 head size={} 不一致",
-                binding.tmp_key, binding.file_size, meta.size
-            ),
-        ));
-    }
-
-    let ext = policy::ext_of(&binding.original_filename)
-        .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
-    let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
-        AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("未知扩展名 {ext}"))
-    })?;
-    let cas_key = crate::util::cos_key::build_cas_key(
-        cfg_upload_prefix,
-        "part",
-        future_owner_id,
-        kind,
-        &binding.content_sha256,
-        &binding.original_filename,
-    );
-    cos.copy_object(&binding.tmp_key, &cas_key).await.map_err(|e| {
-        AppError::biz(
-            code::BIZ_PART_FILE_UPLOAD_FAILED,
-            format!(
-                "copy_object 失败（tmp={:?} → cas={cas_key:?}）: {e}",
-                binding.tmp_key
-            ),
-        )
-    })?;
-
-    Ok(PreparedBinding {
-        tmp_key: binding.tmp_key.clone(),
-        cas_key,
-        kind: kind.to_string(),
-        file_type: file_type.to_string(),
-        sha256: binding.content_sha256.clone(),
-        original_filename: binding.original_filename.clone(),
-        file_size: binding.file_size,
-        content_type: binding.content_type.clone(),
-    })
-}
 
 /// `create_part` 的 sqlx 错误码映射：唯一索引冲突（`23505`） → 业务语义
 /// `BIZ_PART_NOT_FOUND`（serial_no 已被使用；可能是软删旧件占号导致
@@ -1287,20 +742,21 @@ pub(super) fn map_create_error(e: sqlx::Error) -> AppError {
 /// 语义：
 /// - L1 客户（无 parent_id）→ 自身 + 全部 L2 子节点 ids
 /// - L2 客户（有 parent_id）→ 自身 + 同 L1 下所有兄弟 L2 ids
-async fn expand_customer_id(conn: &mut PgConnection, cid: i64) -> Result<Vec<i64>, AppError> {
-    let row: Option<(i64, Option<i64>)> = sqlx::query_as(
-        "SELECT id, parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(cid)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let (_id, parent_id) =
-        row.ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_CUSTOMER_NOT_FOUND,
-                format!("customer {cid} 不存在"),
-            )
-        })?;
+pub(super) async fn expand_customer_id(
+    conn: &mut PgConnection,
+    cid: i64,
+) -> Result<Vec<i64>, AppError> {
+    let row: Option<(i64, Option<i64>)> =
+        sqlx::query_as("SELECT id, parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL")
+            .bind(cid)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let (_id, parent_id) = row.ok_or_else(|| {
+        AppError::biz(
+            code::BIZ_CUSTOMER_NOT_FOUND,
+            format!("customer {cid} 不存在"),
+        )
+    })?;
     if let Some(p) = parent_id {
         let mut rows: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM t_customer WHERE parent_id = $1 AND deleted_at IS NULL",
@@ -1327,7 +783,7 @@ async fn expand_customer_id(conn: &mut PgConnection, cid: i64) -> Result<Vec<i64
 ///
 /// 返回 `(Some(name), Some(l1_name))`：当自身为 L1 时 l1_name 与 name 同；
 /// 当 customer 不存在 → `(None, None)`（service 层可容忍）。
-async fn lookup_customer_names(
+pub(super) async fn lookup_customer_names(
     conn: &mut PgConnection,
     customer_id: i64,
 ) -> Result<(Option<String>, Option<String>), AppError> {

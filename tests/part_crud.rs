@@ -12,13 +12,16 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{add_role, clean_business_db, clean_db, insert_user_with_password, test_app, test_pool, test_state, test_state_with_disabled_session};
+use common::{
+    add_role, clean_business_db, clean_db, insert_user_with_password, test_app, test_pool,
+    test_state, test_state_with_disabled_session,
+};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::part::service::PartService;
 use hsh_erp_rust::modules::part_file::policy;
@@ -42,7 +45,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -140,7 +148,10 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, NULL, $3, 0, $4, NULL, $4, NULL)",
-        id, name, prefix, now,
+        id,
+        name,
+        prefix,
+        now,
     )
     .execute(pool)
     .await
@@ -157,7 +168,10 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
-        id, name, l1_id, now,
+        id,
+        name,
+        l1_id,
+        now,
     )
     .execute(pool)
     .await
@@ -184,7 +198,14 @@ async fn insert_part_with_status(
          quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, \
          assembly_id) \
          VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, $7)",
-        id, serial_no, name, customer_id, now, today, assembly_id, status,
+        id,
+        serial_no,
+        name,
+        customer_id,
+        now,
+        today,
+        assembly_id,
+        status,
     )
     .execute(pool)
     .await
@@ -202,7 +223,12 @@ async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, stat
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, has_been_repaired, \
          version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, $4, $5, false, 0, $6, NULL, $6, NULL)",
-        id, part_id, batch_no, qty, status, now,
+        id,
+        part_id,
+        batch_no,
+        qty,
+        status,
+        now,
     )
     .execute(pool)
     .await
@@ -243,10 +269,8 @@ async fn list_parts_filter_status_and_customer() {
     // 共用一个雪花生成器连发 4 个唯一 id（避免 4 次独立 generator 在同一
     // 毫秒内拿到重复 id 触发 23505 pkey 冲突）。
     {
-        let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-            1_577_836_800_000,
-            1,
-        );
+        let snowflake =
+            hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
         use hsh_erp_rust::infra::clock::now_naive;
         for i in 0..3 {
             let now = now_naive();
@@ -327,10 +351,8 @@ async fn list_parts_pagination_limit_offset() {
     // 毫秒内拿到重复 id 触发 23505 pkey 冲突）。
     let mut pids = Vec::new();
     {
-        let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-            1_577_836_800_000,
-            1,
-        );
+        let snowflake =
+            hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
         use hsh_erp_rust::infra::clock::now_naive;
         for i in 0..5 {
             let now = now_naive();
@@ -397,25 +419,12 @@ async fn get_part_detail_200() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
         app,
-        json_request(
-            "GET",
-            &format!("/parts/{pid}"),
-            None::<Value>,
-            Some(&token),
-        ),
+        json_request("GET", &format!("/parts/{pid}"), None::<Value>, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "detail: {env}");
@@ -446,15 +455,7 @@ async fn get_part_detail_404_soft_deleted() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
 
     // 软删 (SQL 直删 — 绕开 RBAC)
     sqlx::query!(
@@ -468,12 +469,7 @@ async fn get_part_detail_404_soft_deleted() {
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
         app,
-        json_request(
-            "GET",
-            &format!("/parts/{pid}"),
-            None::<Value>,
-            Some(&token),
-        ),
+        json_request("GET", &format!("/parts/{pid}"), None::<Value>, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "soft-deleted detail: {env}");
@@ -995,15 +991,7 @@ async fn soft_delete_part_409_terminal_status() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "DELIVERED",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "DELIVERED").await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1033,15 +1021,7 @@ async fn get_by_serial_200() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("T-LOC-1"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("T-LOC-1"), None, "PENDING").await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1099,15 +1079,7 @@ async fn deliver_ready_to_ship_200() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "READY_TO_SHIP",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "READY_TO_SHIP").await;
     // PR-B3：必须配一条 READY_TO_SHIP 批次；service 端按 batch.version 守卫。
     let bid = insert_batch(&pool, pid, 1, 1, "READY_TO_SHIP").await;
     let bver = batch_version(&pool, bid).await;
@@ -1142,15 +1114,7 @@ async fn deliver_wrong_state_400() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
     let bver = batch_version(&pool, bid).await;
 
@@ -1178,15 +1142,7 @@ async fn cancel_pending_200() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1211,15 +1167,7 @@ async fn cancel_wrong_state_400() {
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // COMPLETED 不在 cancel 白名单内 (PENDING/PROGRAMMING/INSPECTION/READY_TO_SHIP/DELIVERED)
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        None,
-        None,
-        "COMPLETED",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "COMPLETED").await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
@@ -1318,15 +1266,7 @@ async fn start_repair_in_process_200() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "IN_PROCESS",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "IN_PROCESS").await;
     let bid = insert_batch(&pool, pid, 1, 1, "IN_PROCESS").await;
     let bver = batch_version(&pool, bid).await;
 
@@ -1387,7 +1327,11 @@ async fn start_repair_wrong_state_400() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "start-repair wrong state: {env}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "start-repair wrong state: {env}"
+    );
     assert_eq!(env["code"], 20118, "BIZ_PART_REPAIR_NOT_TRIGGERED: {env}");
 }
 
@@ -1401,15 +1345,7 @@ async fn deliver_cancelled_409() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "CANCELLED",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "CANCELLED").await;
     // 配任意活跃 batch（service guard 在 batch 定位前短路，不查 batch 状态）。
     let bid = insert_batch(&pool, pid, 1, 1, "READY_TO_SHIP").await;
     let bver = batch_version(&pool, bid).await;
@@ -1438,7 +1374,11 @@ async fn deliver_cancelled_409() {
 // ===========================================================================
 
 /// 取 part 的某状态批次的 status 字符串 + version（验证 batch 同步用）。
-async fn batch_status_and_version(pool: &PgPool, part_id: i64, status: &str) -> Option<(String, i32)> {
+async fn batch_status_and_version(
+    pool: &PgPool,
+    part_id: i64,
+    status: &str,
+) -> Option<(String, i32)> {
     let row: Option<(String, i32)> = sqlx::query_as(
         "SELECT status, version FROM t_part_batch \
          WHERE part_id = $1 AND status = $2 AND deleted_at IS NULL \
@@ -1462,15 +1402,7 @@ async fn deliver_also_updates_batch() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "READY_TO_SHIP",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "READY_TO_SHIP").await;
     // 同 part 配一条 READY_TO_SHIP 批次
     let bid = insert_batch(&pool, pid, 1, 1, "READY_TO_SHIP").await;
     let bver = batch_version(&pool, bid).await;
@@ -1494,11 +1426,13 @@ async fn deliver_also_updates_batch() {
     assert_eq!(env["data"]["status"], "DELIVERED");
 
     // 批次也应被翻到 DELIVERED
-    let (batch_status, _) =
-        batch_status_and_version(&_pool, pid, "DELIVERED")
-            .await
-            .expect("批次应存在并已被翻为 DELIVERED");
-    assert_eq!(batch_status, "DELIVERED", "batch.status 应同步翻为 DELIVERED");
+    let (batch_status, _) = batch_status_and_version(&_pool, pid, "DELIVERED")
+        .await
+        .expect("批次应存在并已被翻为 DELIVERED");
+    assert_eq!(
+        batch_status, "DELIVERED",
+        "batch.status 应同步翻为 DELIVERED"
+    );
 }
 
 /// POST /parts/{id}/cancel —— PENDING → CANCELLED 应同时翻转最近一条
@@ -1510,15 +1444,7 @@ async fn cancel_also_updates_batch() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
     let _bid = insert_batch(&pool, pid, 1, 1, "PENDING").await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
@@ -1535,11 +1461,13 @@ async fn cancel_also_updates_batch() {
     assert_eq!(s, StatusCode::OK, "cancel 200: {env}");
     assert_eq!(env["data"]["status"], "CANCELLED");
 
-    let (batch_status, _) =
-        batch_status_and_version(&_pool, pid, "CANCELLED")
-            .await
-            .expect("批次应存在并已被翻为 CANCELLED");
-    assert_eq!(batch_status, "CANCELLED", "batch.status 应同步翻为 CANCELLED");
+    let (batch_status, _) = batch_status_and_version(&_pool, pid, "CANCELLED")
+        .await
+        .expect("批次应存在并已被翻为 CANCELLED");
+    assert_eq!(
+        batch_status, "CANCELLED",
+        "batch.status 应同步翻为 CANCELLED"
+    );
 }
 
 /// POST /parts/{id}/deliver —— batch_id 不存在 → 20109 BIZ_PART_BATCH_NOT_FOUND。
@@ -1551,15 +1479,7 @@ async fn deliver_without_source_batch_409() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "READY_TO_SHIP",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "READY_TO_SHIP").await;
     // 故意不插 batch，传一个伪造 batch_id
     let fake_bid: i64 = 9_999_999_999;
 
@@ -1577,11 +1497,7 @@ async fn deliver_without_source_batch_409() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::NOT_FOUND,
-        "deliver w/o batch: {env}"
-    );
+    assert_eq!(s, StatusCode::NOT_FOUND, "deliver w/o batch: {env}");
     assert_eq!(env["code"], 20109, "BIZ_PART_BATCH_NOT_FOUND: {env}");
 }
 
@@ -1595,15 +1511,7 @@ async fn cancel_delivery_note_locked_409() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
 
     // 直接 SQL 模拟「part 已挂送货单」：随便写一个 delivery_note_id。
     // 21420 不要求送货单实际存在 —— service 层只看 part.delivery_note_id 是否非 NULL。
@@ -1626,15 +1534,8 @@ async fn cancel_delivery_note_locked_409() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::CONFLICT,
-        "delivery_note 锁 cancel: {env}"
-    );
-    assert_eq!(
-        env["code"], 21420,
-        "BIZ_DELIVERY_NOTE_LOCKED_PART: {env}"
-    );
+    assert_eq!(s, StatusCode::CONFLICT, "delivery_note 锁 cancel: {env}");
+    assert_eq!(env["code"], 21420, "BIZ_DELIVERY_NOTE_LOCKED_PART: {env}");
 
     // 确认 part.status 没被翻（事务回滚）
     let row: (String,) = sqlx::query_as("SELECT status FROM t_part WHERE id = $1")
@@ -1747,7 +1648,8 @@ async fn upload_drawing_service_integration() {
     assert!(pf.content_sha256.is_some());
     // CAS key 格式：`uploads/part/{id}/DRAWING/{sha16}_{safe}.pdf`
     assert!(
-        pf.object_key.starts_with(&format!("uploads/part/{part_id}/DRAWING/")),
+        pf.object_key
+            .starts_with(&format!("uploads/part/{part_id}/DRAWING/")),
         "CAS key 格式不符: {}",
         pf.object_key
     );
@@ -1797,7 +1699,10 @@ async fn upload_3d_model_service_integration() {
     assert_eq!(pf.part_id, part_id);
     assert_eq!(pf.original_filename, "bracket.step");
     assert_eq!(pf.file_size, bytes.len() as i64);
-    assert!(pf.object_key.starts_with(&format!("uploads/part/{part_id}/3D_MODEL/")));
+    assert!(
+        pf.object_key
+            .starts_with(&format!("uploads/part/{part_id}/3D_MODEL/"))
+    );
     assert!(pf.object_key.ends_with("_bracket.step"));
 
     let row = PartFileRepo::get_by_part_kind(&pool, part_id, "3D_MODEL")
@@ -1839,7 +1744,11 @@ async fn upload_bad_extension_rejected() {
     conn.rollback().await.unwrap();
 
     // 错误码断言：policy::allowed_exts("DRAWING") == ["pdf"]，"step" 不在 → BAD_TYPE
-    assert_eq!(err.code(), code::BIZ_PART_FILE_BAD_TYPE, "实际错误: {err:?}");
+    assert_eq!(
+        err.code(),
+        code::BIZ_PART_FILE_BAD_TYPE,
+        "实际错误: {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -1965,7 +1874,7 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
     };
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartService::batch_create_parts_with_bindings(
+    let (out, keys) = PartService::batch_create_parts_with_bindings(
         &mut tx,
         &snowflake,
         cos.clone(),
@@ -1975,6 +1884,7 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
         &current,
     )
     .await
+    .map_err(|(e, _)| e)
     .expect("batch_create_parts_with_bindings 应整体返回 Ok（含 failed）");
     tx.commit().await.unwrap();
 
@@ -1994,7 +1904,6 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
 
     // 2) B1 不变量：cleanup_tmp_keys 必须包含**所有** head/copy 成功的 tmp_key，
     //    与 per-item DB 结果无关。失败 item 的 tmp_key 也必须在里面。
-    let keys = &out.cleanup_tmp_keys;
     assert_eq!(
         keys.len(),
         2,
@@ -2020,9 +1929,8 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
     );
 
     // 4) service 层不直接 spawn delete（这是 handler 的职责）；delete_calls 此时应为空。
-    //    handler 端的 spawn-delete 行为由后续端到端测试覆盖（受 part_crud 当前 fixture
-    //    限制——state.cos 是 NoopCos，硬替换 AppState.cos 工作量过大；service 层
-    //    cleanup_tmp_keys 已足够验证 B1 不变量）。
+    //    handler 端的 spawn-delete 行为由 `test_state_with_cos` fixture + 后续端到端
+    //    测试覆盖（2026-09-16 M2-C 增）。
     assert_eq!(
         cos.delete_call_count(tmp_key_0),
         0,
@@ -2045,4 +1953,259 @@ async fn policy_unit_smoke_integration() {
     let ext = policy::ext_of("foo.PDF");
     assert_eq!(ext.as_deref(), Some("pdf"));
     assert_eq!(policy::ext_of("noext"), None);
+}
+
+// ===========================================================================
+// 2026-09-16 M2-C：handler 后置 spawn delete 端到端断言
+//
+// 验证 `POST /api/v2/parts/batch`（带 drawing_file binding）在
+// 1) 服务层 Ok 路径：handler commit 后 spawn delete 所有 tmp_keys（无论 per-item DB 结果）
+// 2) 服务层 Err 路径（head/copy 中途失败）：handler 仍 spawn delete 已成功 head/copy 的 tmp_keys
+//
+// 用 `test_state_with_cos` fixture 替换 `state.cos` 为 MockCos，让 spawn 后
+// 的 `delete_object` 调用被记录到 `mock.delete_calls` 中，可断言调用次数 / key 集合。
+// ===========================================================================
+
+#[tokio::test]
+async fn batch_create_parts_handler_spawn_delete_on_ok() {
+    use common::MockCos;
+    use std::sync::Arc;
+
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+
+    // 1) MockCos 预注册 head/copy 成功
+    let cos = Arc::new(MockCos::new());
+    let tmp_key = "tmp/test/handler-spawn-delete.pdf".to_string();
+    let sha = "a".repeat(64);
+    cos.set_head(&tmp_key, 1024);
+
+    // 2) 用 test_state_with_cos 构造 state（cos 已被 MockCos 替换）
+    let state = common::test_state_with_cos(pool.clone(), cos.clone()).await;
+    let app = test_app(state.clone());
+
+    // 3) 登录（用 state 内的 user / role）
+    let uid = insert_user_with_password(&pool, "manager-spawn", "changeme").await;
+    add_role(&pool, uid, "MANAGER", None, None).await;
+    let (app2, token, _) = {
+        let app_login = test_app(state.clone());
+        let (_, env) = send(
+            app_login,
+            json_request(
+                "POST",
+                "/auth/login",
+                Some(json!({"username": "manager-spawn", "password": "changeme"})),
+                None,
+            ),
+        )
+        .await;
+        let token = env["data"]["token"].as_str().unwrap().to_string();
+        (app, token, pool)
+    };
+
+    // 4) 构造 batch 请求（1 个 item 带 drawing_file）
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .date_naive();
+    let req_body = json!({
+        "customer_id": l2.to_string(),
+        "items": [{
+            "name": "spawn-delete-item",
+            "drawing_no": "D-SPAWN",
+            "applicant_name": "丙",
+            "quantity": 1,
+            "request_date": today.to_string(),
+            "planned_delivery_date": today.to_string(),
+            "is_urgent": false,
+            "drawing_file": {
+                "tmp_key": tmp_key,
+                "content_sha256": sha,
+                "original_filename": "handler.pdf",
+                "file_size": "1024",
+                "content_type": "application/pdf"
+            },
+            "model3d_file": null,
+        }],
+    });
+
+    // 5) 调用 handler
+    let (status, envelope) = send(
+        app2,
+        json_request("POST", "/parts/batch", Some(req_body), Some(&token)),
+    )
+    .await;
+
+    // 6) 业务响应断言
+    assert_eq!(status, axum::http::StatusCode::OK, "应 200: {envelope}");
+    assert_eq!(envelope["code"], 0, "应 code=0: {envelope}");
+    let created = envelope["data"]["created"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(created, 1, "应 created=1: {envelope}");
+
+    // 7) handler 后置 spawn-delete 是 tokio::spawn 异步任务，等待一帧让 spawn 完成
+    // （spawn 任务入队到 runtime，axum 处理完请求后会执行；这里用短 sleep 让 runtime 调度）
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 8) 断言 mock.delete_calls 包含 cleanup_tmp_keys 的所有 key
+    let delete_calls = cos.delete_calls.lock().unwrap().clone();
+    assert!(
+        delete_calls
+            .iter()
+            .any(|k| k == "tmp/test/handler-spawn-delete.pdf"),
+        "handler spawn delete 应触发 tmp_key 兜底: got {delete_calls:?}"
+    );
+}
+
+/// POST /parts/batch —— Err 路径下 handler 仍 spawn delete 已成功 head/copy 的 tmp_key。
+///
+/// 2026-09-16 M2-C review 第 2 轮补：与 [`batch_create_parts_handler_spawn_delete_on_ok`]
+/// 配对，验证 handler 在 service 返回 Err 时同样触发兜底 spawn-delete（避免 first-pass
+/// 已成功的 tmp 对象留作孤儿）。
+///
+/// ## 测试构造
+/// 请求体 2 件 items（数组顺序即 service 内 chunk zip 迭代顺序）：
+/// - `first_item`（数组 idx=0）：`set_head(first_tmp_key, 1024)` —— head OK + 默认 copy OK
+///   → service `prepare_binding_head_copy` 返回 Ok，`cleanup_tmp_keys.push(first_tmp_key)`
+/// - `second_item`（数组 idx=1）：**不**注册 `set_head` —— `MockCos.head_object` 返回
+///   `BIZ_PART_FILE_UPLOAD_FAILED` → service 内映射为 `BIZ_PART_FILE_TMP_OBJECT_MISSING`
+///   21114 → chunk zip 遇 Err 立即 `return Err((e, [first_tmp_key]))`
+///
+/// handler Err 分支：拿 `keys = [first_tmp_key]` → `if has_bindings && !cleanup_keys.is_empty()`
+/// → `tokio::spawn` 批量 `cos.delete_object(first_tmp_key)` → `cos.delete_calls` 包含
+/// `first_tmp_key`。
+///
+/// ## 为什么 first_item 必须放数组 idx=0
+/// service `batch_create_parts_with_bindings` 在 chunk 内并发 join_all 所有 job，但
+/// 串行迭代 `chunk.iter().zip(results)` —— 遇第一个 Err 立即 `return Err((e, cleanup_tmp_keys))`，
+/// **不**继续 push 后续 Ok 结果。若把 first_item（成功）放在 idx=1、second_item（失败）
+/// 放在 idx=0，则 first_item 的 tmp_key 永远不会被 push 到 cleanup_tmp_keys，handler
+/// Err 分支拿不到 keys → spawn-delete 不触发 → 测试无法断言 Err 路径兜底行为。
+///
+/// `second_item.tmp_key` 因 head 失败从未进 COS（没有 copy_object 调用），不在
+/// `delete_calls` 中 —— 这是正确行为，不是缺失。
+#[tokio::test]
+async fn batch_create_parts_handler_spawn_delete_on_err() {
+    use common::MockCos;
+    use std::sync::Arc;
+
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+
+    // 1) MockCos 预注册：first_tmp_key 走完整 head+copy OK，second_tmp_key 不注册
+    //    （head_object 走默认 NoSuchKey 分支）。
+    let cos = Arc::new(MockCos::new());
+    let first_tmp_key = "tmp/test/handler-err-spawn-delete-first.pdf";
+    let second_tmp_key = "tmp/test/handler-err-spawn-delete-second.pdf";
+    let first_sha = "a".repeat(64);
+    let second_sha = "b".repeat(64);
+    cos.set_head(first_tmp_key, 1024);
+    // second_tmp_key 故意不 set_head：触发 MockCos.head_object 默认 NoSuchKey 错误，
+    // 被 service `prepare_binding_head_copy` 映射为 21114 BIZ_PART_FILE_TMP_OBJECT_MISSING。
+
+    // 2) 用 test_state_with_cos 构造 state（cos 已被 MockCos 替换）
+    let state = common::test_state_with_cos(pool.clone(), cos.clone()).await;
+    let app = test_app(state.clone());
+
+    // 3) 登录 MANAGER 角色（service guard require Manager/Clerk）
+    let uid = insert_user_with_password(&pool, "manager-err-spawn", "changeme").await;
+    add_role(&pool, uid, "MANAGER", None, None).await;
+    let (app2, token, _) = {
+        let app_login = test_app(state.clone());
+        let (_, env) = send(
+            app_login,
+            json_request(
+                "POST",
+                "/auth/login",
+                Some(json!({"username": "manager-err-spawn", "password": "changeme"})),
+                None,
+            ),
+        )
+        .await;
+        let token = env["data"]["token"].as_str().unwrap().to_string();
+        (app, token, pool)
+    };
+
+    // 4) 构造 batch 请求：2 件 item，**first_item 放数组 idx=0**（必须！）
+    //    顺序在测试注释里已说明，否则 service chunk zip 早期 Err 会丢弃 first_item 的 Ok。
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .date_naive();
+    let req_body = json!({
+        "customer_id": l2.to_string(),
+        "items": [
+            {
+                "name": "first-item",
+                "drawing_no": "D-FIRST",
+                "applicant_name": "甲",
+                "quantity": 1,
+                "request_date": today.to_string(),
+                "planned_delivery_date": today.to_string(),
+                "is_urgent": false,
+                "drawing_file": {
+                    "tmp_key": first_tmp_key,
+                    "content_sha256": first_sha,
+                    "original_filename": "first.pdf",
+                    "file_size": "1024",
+                    "content_type": "application/pdf"
+                },
+                "model3d_file": null,
+            },
+            {
+                "name": "second-item",
+                "drawing_no": "D-SECOND",
+                "applicant_name": "乙",
+                "quantity": 1,
+                "request_date": today.to_string(),
+                "planned_delivery_date": today.to_string(),
+                "is_urgent": false,
+                "drawing_file": {
+                    "tmp_key": second_tmp_key,
+                    "content_sha256": second_sha,
+                    "original_filename": "second.pdf",
+                    "file_size": "1024",
+                    "content_type": "application/pdf"
+                },
+                "model3d_file": null,
+            },
+        ],
+    });
+
+    // 5) 调用 handler —— 期望 service Err → handler 返回非 2xx
+    let (status, envelope) = send(
+        app2,
+        json_request("POST", "/parts/batch", Some(req_body), Some(&token)),
+    )
+    .await;
+
+    // 6) 业务响应断言：非 2xx + 错误码 21114 BIZ_PART_FILE_TMP_OBJECT_MISSING
+    assert!(
+        !status.is_success(),
+        "Err 路径应非 2xx: status={status}, envelope={envelope}"
+    );
+    assert_eq!(
+        envelope["code"], 21114,
+        "Err 路径应报 21114 BIZ_PART_FILE_TMP_OBJECT_MISSING: {envelope}"
+    );
+
+    // 7) handler 后置 spawn-delete 是 tokio::spawn 异步任务，等待一帧让 spawn 完成
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 8) **关键断言**：Err 路径下 handler 仍 spawn delete 已成功 head/copy 的
+    //    `first_tmp_key`（service Err 返回时透出的 cleanup_tmp_keys）。
+    let delete_calls = cos.delete_calls.lock().unwrap().clone();
+    assert!(
+        delete_calls.iter().any(|k| k == first_tmp_key),
+        "Err 路径下 handler 应 spawn delete first_tmp_key 兜底（M2-C B1 不变量）: got {delete_calls:?}"
+    );
+    // 9) second_tmp_key 因 head_object 失败从未进 COS（service 在 head 失败后
+    //    立即 return Err，没有触发 copy_object），因此不应出现在 delete_calls。
+    //    这反向验证了"只清理实际存在的 tmp"——避免假阳性 delete。
+    assert!(
+        !delete_calls.iter().any(|k| k == second_tmp_key),
+        "second_tmp_key 因 head 失败未进 COS，不应被 delete: got {delete_calls:?}"
+    );
 }
