@@ -1954,3 +1954,110 @@ async fn policy_unit_smoke_integration() {
     assert_eq!(ext.as_deref(), Some("pdf"));
     assert_eq!(policy::ext_of("noext"), None);
 }
+
+// ===========================================================================
+// 2026-09-16 M2-C：handler 后置 spawn delete 端到端断言
+//
+// 验证 `POST /api/v2/parts/batch`（带 drawing_file binding）在
+// 1) 服务层 Ok 路径：handler commit 后 spawn delete 所有 tmp_keys（无论 per-item DB 结果）
+// 2) 服务层 Err 路径（head/copy 中途失败）：handler 仍 spawn delete 已成功 head/copy 的 tmp_keys
+//
+// 用 `test_state_with_cos` fixture 替换 `state.cos` 为 MockCos，让 spawn 后
+// 的 `delete_object` 调用被记录到 `mock.delete_calls` 中，可断言调用次数 / key 集合。
+// ===========================================================================
+
+#[tokio::test]
+async fn batch_create_parts_handler_spawn_delete_on_ok() {
+    use common::MockCos;
+    use std::sync::Arc;
+
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "L1", "L1").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+
+    // 1) MockCos 预注册 head/copy 成功
+    let cos = Arc::new(MockCos::new());
+    let tmp_key = "tmp/test/handler-spawn-delete.pdf".to_string();
+    let sha = "a".repeat(64);
+    cos.set_head(&tmp_key, 1024);
+
+    // 2) 用 test_state_with_cos 构造 state（cos 已被 MockCos 替换）
+    let state = common::test_state_with_cos(pool.clone(), cos.clone()).await;
+    let app = test_app(state.clone());
+
+    // 3) 登录（用 state 内的 user / role）
+    let uid = insert_user_with_password(&pool, "manager-spawn", "changeme").await;
+    add_role(&pool, uid, "MANAGER", None, None).await;
+    let (app2, token, _) = {
+        let app_login = test_app(state.clone());
+        let (_, env) = send(
+            app_login,
+            json_request(
+                "POST",
+                "/auth/login",
+                Some(json!({"username": "manager-spawn", "password": "changeme"})),
+                None,
+            ),
+        )
+        .await;
+        let token = env["data"]["token"].as_str().unwrap().to_string();
+        (app, token, pool)
+    };
+
+    // 4) 构造 batch 请求（1 个 item 带 drawing_file）
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .date_naive();
+    let req_body = json!({
+        "customer_id": l2.to_string(),
+        "items": [{
+            "name": "spawn-delete-item",
+            "drawing_no": "D-SPAWN",
+            "applicant_name": "丙",
+            "quantity": 1,
+            "request_date": today.to_string(),
+            "planned_delivery_date": today.to_string(),
+            "is_urgent": false,
+            "drawing_file": {
+                "tmp_key": tmp_key,
+                "content_sha256": sha,
+                "original_filename": "handler.pdf",
+                "file_size": 1024,
+                "content_type": "application/pdf"
+            },
+            "model3d_file": null,
+        }],
+    });
+
+    // 5) 调用 handler
+    let (status, envelope) = send(
+        app2,
+        json_request(
+            "POST",
+            "/parts/batch",
+            Some(req_body),
+            Some(&token),
+        ),
+    )
+    .await;
+
+    // 6) 业务响应断言
+    assert_eq!(status, axum::http::StatusCode::OK, "应 200: {envelope}");
+    assert_eq!(envelope["code"], 0, "应 code=0: {envelope}");
+    let created = envelope["data"]["created"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(created, 1, "应 created=1: {envelope}");
+
+    // 7) handler 后置 spawn-delete 是 tokio::spawn 异步任务，等待一帧让 spawn 完成
+    // （spawn 任务入队到 runtime，axum 处理完请求后会执行；这里用短 sleep 让 runtime 调度）
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 8) 断言 mock.delete_calls 包含 cleanup_tmp_keys 的所有 key
+    let delete_calls = cos.delete_calls.lock().unwrap().clone();
+    assert!(
+        delete_calls.iter().any(|k| k == "tmp/test/handler-spawn-delete.pdf"),
+        "handler spawn delete 应触发 tmp_key 兜底: got {delete_calls:?}"
+    );
+}
