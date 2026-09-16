@@ -204,6 +204,15 @@ Response 200 `data`：最新 `TPartFile` 行（`kind` = `3D_MODEL`，`file_type`
 
 **CAS key 示例**：`uploads/part/12345/3D_MODEL/abc123def4567890_bracket.step`
 
+### `POST /api/v2/parts/{part_id}/files/confirm`
+
+直传 COS 链路的「提交绑定」端点。完整契约见 [`../files.md`](../files.md#post-apiv2parts%7Bpart_id%7Dfilesconfirm)（part_file 域文档统一托管，本处只列要点）。
+
+- **权限**：Manager / Clerk
+- **用途**：客户端 PUT 到 tmp 区成功后调用本端点 → 把 tmp 对象 copy 到 CAS key + INSERT `t_part_file` + 异步清理 tmp
+- **场景**：批量预签（场景 A，`/parts/batch` 入参 items 含 `drawing_file` / `model3d_file`）的并发 PUT 完成后；详情页补传（场景 B） 单文件上传完成后
+- **错误码**：21102 / 21104 / 21105 / 21108 / 21114 / 21115（详见 files.md 完整表）
+
 ---
 
 ## CRUD 专属 DTO
