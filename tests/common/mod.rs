@@ -41,6 +41,16 @@ use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::shared::error::{AppError, code};
+
+use std::sync::OnceLock;
+/// 全局共享 snowflake 生成器（PR-3 测试 helper 批量插入时使用）；
+/// 多个 helper 在同一毫秒调用不再产生冲突 ID（避免 shelf_id == process_id 等碰撞）。
+static TEST_SNOWFLAKE_GEN: OnceLock<std::sync::Mutex<SnowflakeIdGenerator>> = OnceLock::new();
+pub fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
+    TEST_SNOWFLAKE_GEN.get_or_init(|| {
+        std::sync::Mutex::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1))
+    })
+}
 use hsh_erp_rust::state::AppState;
 
 /// 测试 DB URL：与 `postgres-test` 容器（端口5429）+ `postgres_rust_test` 库配对。
@@ -420,7 +430,7 @@ pub async fn insert_user_with_password(pool: &PgPool, username: &str, plain_pass
     use hsh_erp_rust::infra::clock::now_naive;
 
     let hash = password::hash(plain_password).expect("bcrypt hash");
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -446,7 +456,7 @@ pub async fn insert_inactive_user(pool: &PgPool, username: &str, plain_password:
     use hsh_erp_rust::infra::clock::now_naive;
 
     let hash = password::hash(plain_password).expect("bcrypt hash");
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -475,7 +485,7 @@ pub async fn add_role(
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -505,7 +515,7 @@ pub async fn insert_menu(
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -529,7 +539,7 @@ pub async fn insert_menu(
 pub async fn add_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -549,7 +559,7 @@ pub async fn add_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
 pub async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -596,7 +606,7 @@ pub async fn get_refresh_token_version(pool: &PgPool, user_id: i64) -> i32 {
 pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -619,7 +629,7 @@ pub async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -641,7 +651,7 @@ pub async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
 pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -665,7 +675,7 @@ pub async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
 /// 返回 chain_id；caller 可继续调 `create_step` 加 step。
 pub async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
     use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let chain_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
@@ -688,7 +698,7 @@ pub async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
 /// 2026-09-16 PR-3 批次 step 化：在指定 chain 内创建 step（process_id + sort_order）。
 pub async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
     use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let step_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
@@ -710,12 +720,12 @@ pub async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_ord
 /// 本 helper 提供真实 t_process 行便于测试）。
 pub async fn seed_test_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = pool_snowflake().lock().unwrap();
     let proc_id = snowflake.next_id();
     sqlx::query(
-        "INSERT INTO t_process (id, code, name, is_active, is_outsource, \
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
          version, created_at, updated_at) \
-         VALUES ($1, $2, $3, true, false, 0, now(), now())",
+         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, now(), now())",
     )
     .bind(proc_id)
     .bind(code)

@@ -184,7 +184,7 @@ pub async fn login_worker(pool: PgPool, username: &str) -> (axum::Router, String
 /// 插 L1 客户（一级；带 serial_prefix）。
 pub async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -202,7 +202,7 @@ pub async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 /// 插 L2 客户（二级；挂在 L1 下，无 prefix）。
 pub async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -230,7 +230,7 @@ pub async fn insert_part_with_status(
     status: &str,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
@@ -254,7 +254,7 @@ pub async fn insert_part_with_status(
 /// 插一个 part_batch（带 status 参数，与 part.status 通常对齐）。
 pub async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, status: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；
@@ -306,12 +306,12 @@ pub async fn setup_inspection_and_production_shelves(pool: &PgPool) -> (i64, i64
 /// part_api_helpers 私有的（tests/common/mod.rs 也有同名的 pub 版本）。
 async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let proc_id = snowflake.next_id();
     sqlx::query(
-        "INSERT INTO t_process (id, code, name, is_active, is_outsource, \
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
          version, created_at, updated_at) \
-         VALUES ($1, $2, $3, true, false, 0, now(), now())",
+         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, now(), now())",
     )
     .bind(proc_id)
     .bind(code)
@@ -325,13 +325,12 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 /// 把 shelf 绑到 process（t_shelf_process）。私有的（common 也有同名的 pub 版本）。
 async fn link_shelf_to_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
     use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let map_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_shelf_process (id, shelf_id, process_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, $3, 0, now(), now()) \
-         ON CONFLICT (shelf_id, process_id) DO NOTHING",
+         VALUES ($1, $2, $3, 0, now(), now())",
     )
     .bind(map_id)
     .bind(shelf_id)

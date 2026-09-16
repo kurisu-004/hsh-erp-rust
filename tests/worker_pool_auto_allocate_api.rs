@@ -98,12 +98,6 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, P
 //  worker-pool auto_allocate fixture helpers
 // ===========================================================================
 
-fn pool_snowflake() -> &'static SnowflakeIdGenerator {
-    use std::sync::OnceLock;
-    static S: OnceLock<SnowflakeIdGenerator> = OnceLock::new();
-    S.get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
-}
-
 async fn insert_work_type(
     pool: &PgPool,
     code: &str,
@@ -112,7 +106,7 @@ async fn insert_work_type(
     max_held_minutes: Option<i32>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -139,7 +133,7 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -160,7 +154,7 @@ async fn insert_worker(
 
 async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     let one_char: String = prefix.chars().next().unwrap_or('X').to_ascii_uppercase().to_string();
@@ -190,11 +184,11 @@ async fn insert_pool_part(
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     let today = now.date();
-    let part_id = pool_snowflake().next_id();
+    let part_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
     // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
     // 且 batch 持有 current_process_step_id（worker.match 走 step.process_id）。
     // helper 现在多走两步：建链 → 建 step → INSERT part/batch。
-    let chain_id = pool_snowflake().next_id();
+    let chain_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
     sqlx::query!(
         "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, 0, $3, 0, $3, 0)",
@@ -205,11 +199,11 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert chain");
-    let step_id = pool_snowflake().next_id();
+    let step_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
     sqlx::query!(
         "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
-         estimated_minutes, version, created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 30, 0, $4, $4)",
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, $3, 30, 0, $4, 0, $4, 0)",
         step_id,
         chain_id,
         process_id,
@@ -237,7 +231,7 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert t_part");
-    let batch_id = pool_snowflake().next_id();
+    let batch_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
     // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
     // 改为 `current_process_step_id`。worker_pool 候选池匹配改为
     // `s.process_id = ANY(worker.process_ids)`（JOIN t_process_chain_step）。
