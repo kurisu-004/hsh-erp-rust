@@ -736,6 +736,10 @@ impl PartService {
             statuses: &[],
             is_urgent: query.is_urgent,
             keyword: Some(query.keyword.as_deref().unwrap_or("")),
+            // 2026-09-17 PR-4 守卫修复：list_pending_programming 不透传
+            // locations/holder_ids（业务语义固定 PROGRAMMING 状态）
+            locations: &[],
+            holder_ids: &[],
             sort_by: match query.sort_by.as_deref().unwrap_or("PLANNED_DELIVERY_DATE") {
                 "CREATED_AT" => "created_at",
                 "UPDATED_AT" => "updated_at",
@@ -2508,6 +2512,10 @@ impl PartService {
             statuses: &[],
             is_urgent: query.is_urgent,
             keyword: Some(query.keyword.as_deref().unwrap_or("")),
+            // 2026-09-17 PR-4 守卫修复：list_outsource_in_flight 不透传
+            // locations/holder_ids（业务语义固定 OUTSOURCE 状态）
+            locations: &[],
+            holder_ids: &[],
             sort_by: match query.sort_by.as_deref().unwrap_or("PLANNED_DELIVERY_DATE") {
                 "CREATED_AT" => "created_at",
                 "UPDATED_AT" => "updated_at",
@@ -2559,6 +2567,10 @@ impl PartService {
             statuses: &["PENDING".into(), "IN_PROCESS".into()],
             is_urgent: query.is_urgent,
             keyword: Some(query.keyword.as_deref().unwrap_or("")),
+            // 2026-09-17 PR-4 守卫修复：list_outsource_sendable 不透传
+            // locations/holder_ids（业务语义固定 PENDING+IN_PROCESS 状态）
+            locations: &[],
+            holder_ids: &[],
             sort_by: match query.sort_by.as_deref().unwrap_or("PLANNED_DELIVERY_DATE") {
                 "CREATED_AT" => "created_at",
                 "UPDATED_AT" => "updated_at",

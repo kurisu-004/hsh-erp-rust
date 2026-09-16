@@ -205,6 +205,31 @@ impl PartService {
                     .collect()
             })
             .unwrap_or_default();
+        // 2026-09-17 PR-4 守卫修复：locations 逗号分隔 → Vec<String>
+        let locations_owned: Vec<String> = query
+            .locations
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .filter(|x| !x.is_empty())
+                    .map(|s| s.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 2026-09-17 PR-4 守卫修复：holder_ids 逗号分隔雪花 ID 字符串 → Vec<i64>
+        // 解析失败 → 返回 40001 VALIDATION_ERROR（前端拿到 4xx 立即修正）
+        let holder_ids_owned: Vec<i64> = match query.holder_ids.as_deref() {
+            Some(s) if !s.is_empty() => s
+                .split(',')
+                .filter(|x| !x.is_empty())
+                .map(|x| {
+                    x.trim().parse::<i64>().map_err(|_| {
+                        AppError::validation(format!("holder_ids 含非法雪花 ID: {x}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => Vec::new(),
+        };
 
         let filters = PartListFilters {
             customer_ids,
@@ -212,6 +237,8 @@ impl PartService {
             statuses: &statuses_owned,
             is_urgent: query.is_urgent,
             keyword: query.keyword.as_deref(),
+            locations: &locations_owned,
+            holder_ids: &holder_ids_owned,
             sort_by,
             sort_dir,
             limit,

@@ -254,3 +254,263 @@ async fn list_resolves_production_shelf_holder_to_shelf_code() {
         "holder_name 应解析为 t_shelf.code: {item}"
     );
 }
+
+// ===== 2026-09-17 PR-4 守卫修复：locations / holder_ids 过滤 =====
+//
+// 背景：前端 `usePartsListQuery.ts:204` 发 `locations` + `holder_ids` 两个 query
+// 参数，被 PartListQuery 静默忽略。本测试验证 PR-4 修复后两端点都按 t_part_batch
+// （PR-2 已删 t_part.location / current_holder_id 列）过滤。
+
+/// `GET /parts?locations=PRODUCTION_SHELF,WORKER` —— 仅返 part 下至少有一个
+/// active batch.location 命中白名单的 part。OFFICE 批次的 part 不应出现。
+#[tokio::test]
+async fn list_filters_by_locations_param() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let prod_shelf = insert_insp_shelf(&pool, "PROD-LOC-001").await;
+
+    // part_a：唯一批次 location=OFFICE → 不应命中
+    let pid_a = insert_part_with_status(&pool, "PA", l2, None, None, "PENDING").await;
+    add_batch_with_location(&pool, pid_a, 1, 1, "PENDING", Some("OFFICE"), None).await;
+    // part_b：唯一批次 location=PRODUCTION_SHELF → 应命中
+    let pid_b = insert_part_with_status(&pool, "PB", l2, None, None, "IN_PROCESS").await;
+    add_batch_with_location(
+        &pool,
+        pid_b,
+        1,
+        1,
+        "IN_PROCESS",
+        Some("PRODUCTION_SHELF"),
+        Some(prod_shelf),
+    )
+    .await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr_loc").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/parts?customer_id={l2}&locations=PRODUCTION_SHELF,WORKER&limit=10"),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "list: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().expect("items");
+    let names: Vec<&str> = items
+        .iter()
+        .map(|i| i["name"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        names.contains(&"PB"),
+        "PB（PRODUCTION_SHELF 批次）应在结果中: {env}"
+    );
+    assert!(
+        !names.contains(&"PA"),
+        "PA（OFFICE 批次）不应在结果中（被 locations 过滤掉）: {env}"
+    );
+}
+
+/// `GET /parts?holder_ids=<shelf_id>` —— 多态 holder：t_shelf / t_worker /
+/// t_outsource_company 任一表匹配同一雪花 id 即命中。
+///
+/// 场景：shelves 1 个（PROD-HOLDER-001）→ holder_id 命中其 id；worker 1 个
+/// (W-001) → holder_id 命中其 id（模拟 worker 已接管该 part 批次）。
+/// 构造 3 个 part：
+/// - part_x：批次 1 holder=shelf_id → 命中
+/// - part_y：批次 1 holder=worker_id → 命中（多态：worker 也命中）
+/// - part_z：批次 1 holder=另一个 shelf → 不命中
+#[tokio::test]
+async fn list_filters_by_holder_ids_param_polymorphic() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let shelf_a = insert_insp_shelf(&pool, "PROD-HOLDER-001").await;
+    let shelf_b = insert_insp_shelf(&pool, "PROD-HOLDER-002").await;
+
+    // 建一个 worker（直插 t_worker，复用 common 已有 helper 模式）
+    let worker_id = {
+        use hsh_erp_rust::infra::clock::now_naive;
+        use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+        let id = snowflake.next_id();
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_worker (id, badge_code, name, work_type_id, is_active, version, \
+             created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, $2, $3, NULL, true, 0, $4, NULL, $4, NULL)",
+        )
+        .bind(id)
+        .bind("BADGE-W-001")
+        .bind("W-001")
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert worker");
+        id
+    };
+
+    // part_x：批次 holder=shelf_a（命中 shelf_a 的 id）
+    let pid_x = insert_part_with_status(&pool, "PX", l2, None, None, "IN_PROCESS").await;
+    add_batch_with_location(
+        &pool,
+        pid_x,
+        1,
+        1,
+        "IN_PROCESS",
+        Some("WORKER"),
+        Some(shelf_a),
+    )
+    .await;
+    // part_y：批次 holder=worker（命中 worker_id）
+    let pid_y = insert_part_with_status(&pool, "PY", l2, None, None, "IN_PROCESS").await;
+    add_batch_with_location(
+        &pool,
+        pid_y,
+        1,
+        1,
+        "IN_PROCESS",
+        Some("WORKER"),
+        Some(worker_id),
+    )
+    .await;
+    // part_z：批次 holder=shelf_b（不在 holder_ids 白名单）
+    let pid_z = insert_part_with_status(&pool, "PZ", l2, None, None, "IN_PROCESS").await;
+    add_batch_with_location(
+        &pool,
+        pid_z,
+        1,
+        1,
+        "IN_PROCESS",
+        Some("WORKER"),
+        Some(shelf_b),
+    )
+    .await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr_holder").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            &format!(
+                "/parts?customer_id={l2}&holder_ids={shelf_a},{worker_id}&limit=10"
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "list: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().expect("items");
+    let names: Vec<&str> = items
+        .iter()
+        .map(|i| i["name"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        names.contains(&"PX"),
+        "PX（shelf_a holder）应在结果中: {env}"
+    );
+    assert!(
+        names.contains(&"PY"),
+        "PY（worker holder）应在结果中（多态命中）: {env}"
+    );
+    assert!(
+        !names.contains(&"PZ"),
+        "PZ（shelf_b holder）不应在结果中: {env}"
+    );
+}
+
+/// 不传 locations / holder_ids 时与旧行为一致（不过滤这两个维度）。
+/// 场景：3 个 part 各有 OFFICE / PRODUCTION_SHELF / WORKER 三种批次，
+/// 不传过滤 → 应全部返回。
+#[tokio::test]
+async fn list_without_locations_or_holder_ids_returns_all() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let prod_shelf = insert_insp_shelf(&pool, "PROD-BASE-001").await;
+
+    let pid_a = insert_part_with_status(&pool, "PALL-A", l2, None, None, "PENDING").await;
+    add_batch_with_location(&pool, pid_a, 1, 1, "PENDING", Some("OFFICE"), None).await;
+    let pid_b = insert_part_with_status(&pool, "PALL-B", l2, None, None, "IN_PROCESS").await;
+    add_batch_with_location(
+        &pool,
+        pid_b,
+        1,
+        1,
+        "IN_PROCESS",
+        Some("PRODUCTION_SHELF"),
+        Some(prod_shelf),
+    )
+    .await;
+    let pid_c = insert_part_with_status(&pool, "PALL-C", l2, None, None, "IN_PROCESS").await;
+    add_batch_with_location(
+        &pool,
+        pid_c,
+        1,
+        1,
+        "IN_PROCESS",
+        Some("WORKER"),
+        None,
+    )
+    .await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr_no_filt").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/parts?customer_id={l2}&limit=10"),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "list: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().expect("items");
+    let names: Vec<&str> = items
+        .iter()
+        .map(|i| i["name"].as_str().unwrap_or(""))
+        .collect();
+    for expected in ["PALL-A", "PALL-B", "PALL-C"] {
+        assert!(
+            names.contains(&expected),
+            "{expected} 应在结果中（不过滤）：{env}"
+        );
+    }
+}
+
+/// holder_ids 包含非法雪花 ID → 返回 40001 VALIDATION_ERROR（service 层 parse 失败兜底）。
+#[tokio::test]
+async fn list_holder_ids_invalid_format_returns_40001() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+
+    let (app, token, _pool) = login_manager(pool, "mgr_bad_h").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/parts?customer_id={l2}&holder_ids=not_a_number"),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "非法 holder_ids 应 422: {env}"
+    );
+    assert_eq!(
+        env["code"].as_i64().unwrap(),
+        40001,
+        "expected VALIDATION_ERROR: {env}"
+    );
+}

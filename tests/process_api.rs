@@ -592,3 +592,85 @@ async fn update_process_color_tristate() {
         "未传 color 字段应保留原值: {env3}"
     );
 }
+
+/// 2026-09-17 PR-4 守卫修复：process 被工艺链 step 引用时，软删应被拦下
+/// (BIZ_PROCESS_IN_USE 20803)。PR-1 FK 翻转后 part → chain → step 是新的
+/// 工艺引用通道；之前缺这条会漏掉 step 仍引用此 process 的场景。
+#[tokio::test]
+async fn soft_delete_process_referenced_by_chain_step_returns_20803() {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let (_guard, pool) = setup().await;
+    let (app, token) = login_manager(pool.clone(), "proc_chain_step_ref").await;
+
+    // 建一个 process
+    let (_s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/processes",
+            Some(json!({
+                "code": "P-STEPREF",
+                "name": "StepRef",
+                "category": "INHOUSE",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(env1["code"], 0);
+    let pid_str = env1["data"]["id"].as_str().unwrap().to_string();
+    let pid: i64 = pid_str.parse().unwrap();
+
+    // 直插 chain + step（绕开 part 软删级联，单纯看 step 是否拦截 soft-delete）
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
+        1_577_836_800_000,
+        1,
+    );
+    let chain_id = snowflake.next_id();
+    let step_id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, $3, 0, $3, 0)",
+    )
+    .bind(chain_id)
+    .bind("chain-stepref")
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert chain");
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, estimated_minutes, \
+         version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 10, $3, 30, 0, $4, 0, $4, 0)",
+    )
+    .bind(step_id)
+    .bind(chain_id)
+    .bind(pid)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert chain step referencing process");
+
+    // 软删 process 应被 step 引用拦下
+    let (s2, env2) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/processes/{pid_str}/soft-delete"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::CONFLICT,
+        "soft-delete 工艺链 step 引用的 process 应返回 409; got: {env2}"
+    );
+    assert_eq!(
+        env2["code"].as_i64().unwrap(),
+        20803,
+        "expected BIZ_PROCESS_IN_USE; got: {env2}"
+    );
+}

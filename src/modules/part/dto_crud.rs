@@ -172,6 +172,13 @@ pub struct PartUpdateRequest {
 ///
 /// `customer_id`：单值；service 层用 `expand_customer_id` 展开为 L1+L2 ids。
 /// `status` / `statuses`：单值 / 多值互不冲突；service 层二选一传入。
+/// `locations` / `holder_ids`：逗号分隔。`locations` 是 `t_part_batch.location`
+/// 字符串白名单（OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF /
+/// OUTSOURCE_COMPANY）；`holder_ids` 是雪花 ID 字符串，service 层 deserialize 成
+/// `Vec<i64>` 后查 `t_part_batch.current_holder_id`（多态：t_shelf /
+/// t_worker / t_outsource_company 任一表匹配即命中）。
+/// 两者均查 `t_part_batch`（真相源在 batch；t_part 已无 location /
+/// current_holder_id 列），按 part 下任意 active batch 命中即返。
 /// `sort_by` 白名单（CREATED_AT / UPDATED_AT / PLANNED_DELIVERY_DATE /
 /// REQUEST_DATE / SERIAL_NO / DRAWING_NO / NAME），其它退化为 `CREATED_AT`。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -186,6 +193,17 @@ pub struct PartListQuery {
     pub is_urgent: Option<bool>,
     #[serde(default)]
     pub keyword: Option<String>,
+    /// 2026-09-17 PR-4 修复：locations 逗号分隔字符串（query string 不支持 Vec
+    /// 友好，与 `statuses` 同形）。透传到 repo `PartListFilters.locations`，
+    /// 查 `t_part_batch.location = ANY(...)`。
+    #[serde(default)]
+    pub locations: Option<String>,
+    /// 2026-09-17 PR-4 修复：holder_ids 逗号分隔雪花 ID 字符串。service 层 parse
+    /// 成 `Vec<i64>`，透传到 repo `PartListFilters.holder_ids`，查
+    /// `t_part_batch.current_holder_id = ANY(...)`（多态 holder：t_shelf /
+    /// t_worker / t_outsource_company 任一匹配即命中）。
+    #[serde(default)]
+    pub holder_ids: Option<String>,
     #[serde(default)]
     pub sort_by: Option<String>,
     #[serde(default)]
