@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT placed_at FROM t_part_batch WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "placed_at",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "placed_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "a2c1349569f338a0d3bf2e516ad8adbfec4d47eb61a5d0c439a6ac63f4f83007"
+}

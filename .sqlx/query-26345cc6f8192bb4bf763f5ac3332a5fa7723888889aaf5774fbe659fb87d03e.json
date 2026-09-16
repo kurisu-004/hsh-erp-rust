@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_serial_counter (prefix, counter, version, created_at, created_by, updated_at, updated_by) VALUES ($1, $2, 0, $3, NULL, $3, NULL) ON CONFLICT (prefix) DO UPDATE SET counter = EXCLUDED.counter, version = 0, updated_at = EXCLUDED.updated_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Int8",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "26345cc6f8192bb4bf763f5ac3332a5fa7723888889aaf5774fbe659fb87d03e"
+}
