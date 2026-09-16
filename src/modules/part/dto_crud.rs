@@ -117,10 +117,21 @@ pub struct PartBatchCreateFailure {
 }
 
 /// `POST /parts/batch` 出参：`created` 与 `failed` 互斥。
+///
+/// 2026-09-16 M2-B review 第 1 轮：`cleanup_tmp_keys` 新增字段。
+/// - 含义：本批次成功 INSERT 后、需要 commit 后异步清理的 tmp 对象 key 列表
+///   （client 已直传到 COS tmp 区，已被 service 端 head+copy 到 CAS key）。
+/// - 用途：handler 在 `tx.commit()` 之后 `tokio::spawn` 批量 `cos.delete_object(&key)`
+///   兜底，避免 commit 失败却已触发 COS 删除产生孤儿。
+/// - 前端不需要该字段（`#[serde(default)]` 兜空，前端忽略）；后端用 `out.cleanup_tmp_keys`。
+/// - legacy（无 binding）路径该列表为空，前端 / 集成测试无需关注。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartBatchCreateOut {
     pub created: Vec<PartDetailOut>,
     pub failed: Vec<PartBatchCreateFailure>,
+    /// commit 后由 handler spawn 异步清理的 tmp 对象 key 列表。
+    #[serde(default)]
+    pub cleanup_tmp_keys: Vec<String>,
 }
 
 // ===== Update =====

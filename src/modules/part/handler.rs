@@ -502,10 +502,10 @@ pub async fn batch_create_parts(
     let out = if has_bindings {
         // 走带 bindings 的扩展入口：head/copy 在 tx 之外（service 内 pool 直连），
         // tx 内只做 part / batch / part_file INSERT；commit 后由本 handler spawn
-        // 批量 delete_object(tmp_keys) 兜底。
-        // 注意：成功 INSERT 的 tmp_keys 暂未透出（service 当前未返回 cleanup list）；
-        // 第一遍失败的 tmp_keys 已在 service 内部 spawn 清理。本 task 的最小闭环
-        // 不阻塞提交；cleanup 透出留待后续 task。
+        // 批量 delete_object(tmp_keys) 兜底（与 confirm_part_file 模式一致：
+        // commit 在前，避免 commit 失败却已触发 COS 删除产生孤儿）。
+        // service 通过 `out.cleanup_tmp_keys` 透出待清理的 tmp_key 列表；前端不需要该字段
+        // （`#[serde(default)]` 兜空），后端仅用于 spawn 删除。
         PartService::batch_create_parts_with_bindings(
             &mut tx,
             &state.snowflake,
@@ -520,6 +520,24 @@ pub async fn batch_create_parts(
         PartService::batch_create_parts(&mut tx, &state.snowflake, &req, &current).await?
     };
     tx.commit().await?;
+    // 2026-09-16 M2-B review 第 1 轮修复：spawn 异步批量清理 tmp 对象。
+    // commit 已成功 → DB 是最终态，再触发副作用（best-effort，失败仅 warn 不影响 API 返回）。
+    // 与 `confirm_part_file` handler 的 spawn delete_object 模式对齐。
+    if has_bindings && !out.cleanup_tmp_keys.is_empty() {
+        let cos = state.cos.clone();
+        let keys = out.cleanup_tmp_keys.clone();
+        tokio::spawn(async move {
+            for key in keys {
+                if let Err(e) = cos.delete_object(&key).await {
+                    tracing::warn!(
+                        tmp_key = %key,
+                        error = %e,
+                        "batch_create_parts COS tmp 异步清理失败（已绑定到 part_file，不影响 API 返回）"
+                    );
+                }
+            }
+        });
+    }
     Ok(Json(R::ok(out)))
 }
 

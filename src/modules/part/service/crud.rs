@@ -467,17 +467,17 @@ impl PartService {
                 }
             }
         }
-        let out = crate::modules::part::dto_crud::PartBatchCreateOut { created, failed };
-
-        // ===== 第三遍：commit 后 spawn 批量 delete_object 兜底清理 tmp =====
-        // 注释：实际 commit 在 handler 层（pool.begin() + tx.commit()）。
-        // 本服务签名收 `&mut PgConnection`（同一 tx），service 层只返回 collected cleanup keys，
-        // 由 caller 在 commit 完成后 spawn。
-        // （此处把 cleanup_tmp_keys 通过 out 字段间接传递过于 hack：直接返回 Vec<String>）
-        let _ = cleanup_tmp_keys;
-        // 注：successful_tmp_keys 在 service 层只作为收集，不在此处 spawn（service 层不发起 IO）；
-        // caller 拿到 out 后由 handler 在 tx.commit() 之后再 spawn。
-        let _ = successful_tmp_keys;
+        // 2026-09-16 M2-B review 第 1 轮修复：把 `successful_tmp_keys` 通过 `out.cleanup_tmp_keys`
+        // 透传给 caller（handler），由 handler 在 tx.commit() 之后 spawn 异步批量 delete_object 兜底。
+        // （`cleanup_tmp_keys` 是「第一遍 head/copy 中途失败时需清理的 tmp_keys」——这种场景
+        // service 层直接 spawn 删除并 return Err，不会走到这里，所以这里不需要透出；变量仍持有以避免
+        // 编译期 unused 警告。）
+        let out = crate::modules::part::dto_crud::PartBatchCreateOut {
+            created,
+            failed,
+            cleanup_tmp_keys: successful_tmp_keys,
+        };
+        let _ = cleanup_tmp_keys; // 保留：service 中途失败已 spawn 删除；不进 out
         Ok(out)
     }
 
@@ -603,7 +603,12 @@ impl PartService {
                 }
             }
         }
-        Ok(crate::modules::part::dto_crud::PartBatchCreateOut { created, failed })
+        Ok(crate::modules::part::dto_crud::PartBatchCreateOut {
+            created,
+            failed,
+            // legacy 路径不绑定文件，无 tmp 需清理
+            cleanup_tmp_keys: Vec::new(),
+        })
     }
 
     pub async fn list_parts(
