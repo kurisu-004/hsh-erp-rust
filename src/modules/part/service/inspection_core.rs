@@ -258,19 +258,30 @@ impl PartService {
         )
         .await?;
         // 6. UPDATE t_part_batch: INSPECTION → IN_PROCESS + location/holder/process
-        // PR-3 批次 step 化：解析 step_id（chain 内 process_id → step_id）
-        let chain_id: i64 = sqlx::query_scalar(
+        // PR-3 批次 step 化：解析 step_id（chain 内 process_id → step_id）。
+        // 注意：part 存在性已在 step 1（PartRepo::get_part_inspected）确认，
+        // 此处只需区分「part 软删 / 并发消失」与「part 未绑定工艺链」两种情形。
+        let row: Option<(Option<i64>,)> = sqlx::query_as(
             "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(part_id)
         .fetch_optional(&mut *conn)
-        .await?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PROCESS_CHAIN_REQUIRED,
-                "to_process: part 必须已绑定工艺链",
-            )
-        })?;
+        .await?;
+        let chain_id = match row {
+            None => {
+                return Err(AppError::biz(
+                    code::BIZ_PART_NOT_FOUND,
+                    format!("part {part_id} 不存在或已软删"),
+                ));
+            }
+            Some((None,)) => {
+                return Err(AppError::biz(
+                    code::BIZ_PROCESS_CHAIN_REQUIRED,
+                    "to_process: part 必须已绑定工艺链",
+                ));
+            }
+            Some((Some(cid),)) => cid,
+        };
         let step_id =
             ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, next_process_id)
                 .await?

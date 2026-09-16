@@ -189,6 +189,28 @@ Request：`UpsertChainRequest`
 - **事务边界在 handler**：`state.pool.begin()` → `&mut tx` 给 service → 显式 `tx.commit()`
 - **WS 广播**：本域暂无 WS（仅 upsert 改静态数据，前端按需轮询）
 
+### 20706 BIZ_PROCESS_CHAIN_REQUIRED（2026-09-16 PR-3 新增）
+
+「part 进入生产流前必须已绑定工艺链」守卫（service `require_process_chain`
+helper，`src/modules/part/service/phase1.rs:342`）。错误码 HTTP 409，业务含义：
+「请先制定工序链（part 未绑定 process_chain）」。触发条件：
+
+- `t_part.process_chain_id IS NULL`（part 还没制定工艺链）
+
+受影响的 7 个端点（part 域，含 6 个 Phase 1 + 1 个 inspection 流）：
+- `POST /api/v2/parts/{part_id}/place-on-shelf` —— 上架
+- `POST /api/v2/parts/{part_id}/release-from-programming` —— 编程完成释放
+- `POST /api/v2/parts/{part_id}/send-to-outsource` —— 派发外协
+- `POST /api/v2/parts/{part_id}/receive-from-outsource` —— 外协回收入库
+- `POST /api/v2/parts/{part_id}/complete-repair` —— 完成维修
+- `POST /api/v2/parts/{part_id}/repair-dispatch` —— 派发维修
+- `POST /api/v2/parts/{part_id}/to-process` —— 品检打回（`inspection_core.rs:262`）
+
+> 注：与 `to-process` 共用 service 的两个批量聚合端点（`batch-to-process`
+> 之类）一并继承此守卫。具体每个端点的「错误码」段列在
+> [`docs/api/parts/lifecycle.md`](../../api/parts/lifecycle.md) 与
+> [`docs/api/parts/inspection.md`](../../api/parts/inspection.md) 中。
+
 ## 实施状态
 
 - ✅ Migration 016：`t_work_type.max_held_minutes` 列（TIME 模式阈值依据）
@@ -196,7 +218,7 @@ Request：`UpsertChainRequest`
 - ✅ Migration 018：生产管理菜单（production_group 一级 + part_process_chain 二级 + worker_queue 迁移）
 - ✅ Migration 026（2026-09-16）：FK 方向翻转 —— `t_part.process_chain_id` + 回填 +
   `ix_t_part_process_chain_id` + `uq_t_part_process_chain`；`t_part_process_chain` 删 `part_id` 列
-- ✅ 错误码 20701 / 20702 / 20703 / 20704 / **20705（2026-09-16 新增，PENDING 守卫）**
+- ✅ 错误码 20701 / 20702 / 20703 / 20704 / 20705（PENDING 守卫）/ **20706（2026-09-16 PR-3 新增，PROCESS_CHAIN_REQUIRED，作用于 7 个生产流端点）**
 - ✅ 模块 6 文件 + repo / service 子模块拆分
 - ✅ 端点：`GET / PUT /by-part/{part_id}` + **`GET /{chain_id}`（2026-09-16 新增）**
 - ✅ 集成测试 10 场景：happy（含 part 指针回写断言）/ 404 / 替换 steps / negative minutes /
@@ -207,4 +229,4 @@ Request：`UpsertChainRequest`
 
 - 集成测试：`tests/process_chain_api.rs`
 - 仓库分层：`src/modules/process_chain/handler.rs` (axum) → `service/crud.rs` (业务) → `repo/query.rs` + `repo/mutate.rs` (SQL)
-- 错误码：`src/shared/error.rs::code`（20101 / 20104 / 20701 / 20702 / 20703 / 20704 / 20705 / 40001 / 40300 / 40901）
+- 错误码：`src/shared/error.rs::code`（20101 / 20104 / 20701 / 20702 / 20703 / 20704 / 20705 / **20706 PROCESS_CHAIN_REQUIRED（PR-3 新增）** / 40001 / 40300 / 40901）
