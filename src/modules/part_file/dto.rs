@@ -32,6 +32,12 @@ pub struct PartFileOut {
     pub content_type: String,
     pub upload_status: String,
     pub content_sha256: Option<String>,
+    /// CNC 配对文件 id（G_CODE <-> SETUP_SHEET 互指）；未配对为 null。
+    /// JSON 序列化为 string（雪花 id，防 JS 精度截断）。
+    /// 2026-09-16 补投影：v2 切流后前端零件详情 CNC 配对分组依赖本字段，
+    /// 此前 DB / model 均有值但 DTO 漏投导致前端配对分组静默失效。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub paired_file_id: Option<i64>,
     pub version: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<chrono::NaiveDateTime>,

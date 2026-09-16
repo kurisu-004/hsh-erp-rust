@@ -8,6 +8,7 @@
 //!   5. rbac_inspector_can_upload_returns_403  — Inspector 无 upload 权限
 //!   6. list_filter_by_kind                    — 仅返回 DRAWING
 //!   7. get_url_returns_presigned_url          — 详情 + 预签 URL
+//!   8. list_includes_paired_file_id           — 列表项投影 paired_file_id（2026-09-16 补）
 //!
 //! ## 集成策略
 //! 不启 axum（避免 JWT/Redis 开销），直接 service 直调；`pool.begin()` 开 tx →
@@ -156,6 +157,8 @@ async fn upload_pdf_happy_path() {
     assert_eq!(out.content_type, "application/pdf");
     assert_eq!(out.upload_status, "READY");
     assert!(out.object_key.contains("drawing.pdf"));
+    // 2026-09-16 补：新上传的 DRAWING 无配对，字段须存在且为 None
+    assert!(out.paired_file_id.is_none(), "新上传的 DRAWING 无配对文件");
 }
 
 #[tokio::test]
@@ -404,6 +407,91 @@ async fn get_url_returns_presigned_url() {
     assert_eq!(detail.kind, "DRAWING");
     assert!(detail.download_url.contains(&out.object_key));
     assert_eq!(detail.url_expires_in_seconds, 3600);
+}
+
+// ===== 2026-09-16 补：paired_file_id 投影测试（前端 CNC 配对分组契约字段） =====
+
+/// 列表项必须投影 `paired_file_id`：直接 SQL 造一对 CNC 配对行
+/// （G_CODE <-> SETUP_SHEET 互指），断言 list_files 出参带回配对 id，
+/// 且 JSON 序列化为 string（雪花 id 防 JS 精度截断）。
+#[tokio::test]
+async fn list_includes_paired_file_id() {
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-Pair", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-Pair", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    // 直接 SQL 造配对行（绕开 cnc_program 上传通道，聚焦 part_file 列表投影）
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let g_id = snowflake.next_id();
+    let s_id = snowflake.next_id();
+    for (id, kind, file_type, filename, sha, paired_id) in [
+        (g_id, "G_CODE", "NC", "prog.nc", "g".repeat(64), s_id),
+        (
+            s_id,
+            "SETUP_SHEET",
+            "PDF",
+            "setup.pdf",
+            "s".repeat(64),
+            g_id,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO t_part_file \
+               (id, part_id, kind, file_type, object_key, original_filename, \
+                file_size, content_type, upload_status, content_sha256, paired_file_id, \
+                created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, 100, 'application/octet-stream', 'READY', $7, \
+                     $8, now(), 1, now(), 1)",
+        )
+        .bind(id)
+        .bind(part_id)
+        .bind(kind)
+        .bind(file_type)
+        .bind(format!("part/{part_id}/{kind}/{filename}"))
+        .bind(filename)
+        .bind(sha)
+        .bind(paired_id)
+        .execute(&pool)
+        .await
+        .expect("insert paired row");
+    }
+
+    let current = test_current_user_with_roles(vec![Role::Manager]);
+    let query = hsh_erp_rust::modules::part_file::dto::PartFileListQuery {
+        owner_kind: Some("PART".into()),
+        owner_id: Some(part_id.to_string()),
+        kind: None,
+        limit: Some(50),
+        offset: Some(0),
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let out = PartFileService::list_files(&mut tx, &query, &current)
+        .await
+        .unwrap();
+    drop(tx);
+
+    assert_eq!(out.items.len(), 2);
+    let g = out
+        .items
+        .iter()
+        .find(|i| i.kind == "G_CODE")
+        .expect("G_CODE 行");
+    let s = out
+        .items
+        .iter()
+        .find(|i| i.kind == "SETUP_SHEET")
+        .expect("SETUP_SHEET 行");
+    assert_eq!(g.paired_file_id, Some(s_id), "G_CODE 应指向 SETUP_SHEET");
+    assert_eq!(s.paired_file_id, Some(g_id), "SETUP_SHEET 应指向 G_CODE");
+
+    // 契约守护：paired_file_id 字段必须存在于 JSON 且序列化为 string
+    let v = serde_json::to_value(g).unwrap();
+    assert_eq!(
+        v["paired_file_id"],
+        serde_json::Value::String(s_id.to_string()),
+        "paired_file_id 必须以 string 形式出现在 JSON"
+    );
 }
 
 // ===== 2026-09-15 takeover-fill：content / delete 端点测试 =====
