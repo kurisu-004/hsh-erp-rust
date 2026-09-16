@@ -641,21 +641,63 @@ mod tests {
 
     #[test]
     fn hmac_sha1_two_step_known_vector() {
-        // RFC 2202 §2 test case：key="Jefe", data="what do ya want for nothing?"
-        // HMAC-SHA1 = effcdf6ae5eb2fa2d27416d5f184df9c259a7c79
-        // 验证两步算法（hex SignKey → hex Signature）的链路
-        // SignKey = HMAC-SHA1("Jefe", "Jefe".as_bytes()) → ...（任意 KeyTime）
-        // 这里只验证第二步接口：HMAC-SHA1(hex(SignKey), StringToSign) 的输出
-        let inner = hmac_sha1_raw(b"Jefe", b"Jefe"); // 用相同 key+data 算 SignKey
-        let sign_key_hex = hex::encode(inner);
-        let sig = hmac_sha1_hex(sign_key_hex.as_bytes(), b"what do ya want for nothing?");
-        // SignKey 的 raw bytes 走 HMAC-SHA1(data)：
-        // - raw bytes = 20 字节 hex 解码后 → Key
-        // - data = "what do ya want for nothing?"
-        // - 输出 hex = ?
-        // 验证长度正确（40 chars）+ 全 hex 字符
-        assert_eq!(sig.len(), 40);
-        assert!(sig.chars().all(|c| c.is_ascii_hexdigit()));
+        // 2026-09-16 M2-A review 第 1 轮修复 M1：把测试从「仅断言长度+hex 字符」改成
+        // 「端到端比对已知 hex 输出」—— 覆盖两步签名链路上每个关键节点。
+        //
+        // 输入与 `Presigner::sign` 实际链路完全一致（SecretKey / KeyTime /
+        // HttpRequestInfo / StringToSign 格式都对齐），已知 hex 由 Python
+        // `hmac.new(..., hashlib.sha1).hexdigest()` 一次性算好后写死。
+        //
+        // 注意：第二步 HMAC 用的 key 是 **SignKey hex 字符串的 UTF-8 字节**（40 字节），
+        // 不是 raw 20 字节——与 COS V1 规范及 `Presigner::sign` 第 4b 步一致。
+        //
+        //   SecretKey       = b"AKIDtest"
+        //   KeyTime         = "1735600000;1735603600"
+        //   HttpRequestInfo = "GET\n/api/test\n\n\n"   (与 sign() 格式一致：method\npathname\nparams\nheaders\n)
+        //   SHA1(HRI)       = 9616409d12a5407ac8d3731fb66c152cd51fd39e
+        //   StringToSign    = "sha1\n1735600000;1735603600\n9616409d12a5407ac8d3731fb66c152cd51fd39e\n"
+        //
+        // 已知输出（Python hmac.new + hashlib.sha1，与 Rust hmac-sha1 crate 对齐）：
+        //   SignKey hex     = 7c17af9e890f4b58f58cc62e0b44683a6ebc952f
+        //   Signature hex   = cf5a0fd72e565cf5dfe931dc62ef0f90d96f4736
+        //
+        // 另附 RFC 2202 §2 已知向量作为底层 HMAC-SHA1 实现 sanity check：
+        //   HMAC-SHA1(b"Jefe", b"what do ya want for nothing?")
+        //     = effcdf6ae5eb2fa2d27416d5f184df9c259a7c79
+
+        // 0. 底层 HMAC-SHA1 sanity check（与 Presigner 无关，仅保证 hmac-sha1 crate 用法正确）
+        assert_eq!(
+            hmac_sha1_hex(b"Jefe", b"what do ya want for nothing?"),
+            "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79",
+        );
+
+        // 1. 第一步：SignKey = HMAC-SHA1(SecretKey, KeyTime) → hex（实质断言）
+        let secret_key = b"AKIDtest";
+        let key_time = "1735600000;1735603600";
+        let sign_key_hex = hmac_sha1_hex(secret_key, key_time.as_bytes());
+        assert_eq!(
+            sign_key_hex, "7c17af9e890f4b58f58cc62e0b44683a6ebc952f",
+            "SignKey = HMAC-SHA1(SecretKey, KeyTime) 与已知 hex 不一致",
+        );
+
+        // 2. HttpRequestInfo 的 SHA1 hex（与 Presigner::sign 第 3 步一致）
+        let http_request_info = b"GET\n/api/test\n\n\n";
+        let hashed_request = sha1_hex(http_request_info);
+        assert_eq!(
+            hashed_request, "9616409d12a5407ac8d3731fb66c152cd51fd39e",
+            "SHA1(HttpRequestInfo) 与已知 hex 不一致",
+        );
+
+        // 3. StringToSign 拼接（与 Presigner::sign 第 4 步格式一致）
+        let string_to_sign = format!("sha1\n{key_time}\n{hashed_request}\n");
+
+        // 4. 第二步：Signature = HMAC-SHA1(SignKey hex bytes, StringToSign) → hex（实质断言）。
+        //    key 是 hex 字符串的 UTF-8 字节（不是 raw 20 字节）—— 与 COS V1 规范对齐。
+        let signature = hmac_sha1_hex(sign_key_hex.as_bytes(), string_to_sign.as_bytes());
+        assert_eq!(
+            signature, "cf5a0fd72e565cf5dfe931dc62ef0f90d96f4736",
+            "Signature = HMAC-SHA1(SignKey hex, StringToSign) 与已知 hex 不一致",
+        );
     }
 
     #[test]
