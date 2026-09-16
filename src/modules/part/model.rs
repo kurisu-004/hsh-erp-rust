@@ -8,7 +8,7 @@
 //! part 域业务实现阶段再补，避免越权改动本域。
 //!
 //! Phase PR-CRUD 增量：
-//! - TPart 28 列完整投影；不含 `unit_price / total_price`（NUMERIC，待 `rust_decimal`）
+//! - TPart 29 列完整投影；不含 `unit_price / total_price`（NUMERIC，待 `rust_decimal`）
 //! - TPartEvent / NewPartEvent：保持不变（已对齐 migration 010）
 //!
 //! 完整列（含金额 / 数量 / holder / 日期 / note / has_been_repaired 等）待

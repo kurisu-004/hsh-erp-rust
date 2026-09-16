@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, serial_no, name, drawing_no, applicant_name, quantity,\n                   request_date, planned_delivery_date, actual_delivery_date,\n                   customer_id, assembly_id, status, location, is_urgent,\n                   current_holder_id, placed_at, next_process_id,\n                   order_no, system_delivery_date, note, has_been_repaired,\n                    version, created_at, created_by, updated_at, updated_by,\n                    deleted_at, delivery_note_id, process_chain_id\n            FROM t_part\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
+  "query": "\n            SELECT id, serial_no, name, drawing_no, applicant_name, quantity,\n                   request_date, planned_delivery_date, actual_delivery_date,\n                   customer_id, assembly_id, status, location, is_urgent,\n                   current_holder_id, placed_at, next_process_id,\n                   order_no, system_delivery_date, note, has_been_repaired,\n                   version, created_at, created_by, updated_at, updated_by,\n                   deleted_at, delivery_note_id, process_chain_id\n            FROM t_part\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
   "describe": {
     "columns": [
       {
@@ -360,5 +360,5 @@
       true
     ]
   },
-  "hash": "1cab67829cfa7d25cc0d3223db6ab84be3be6070602edba00d1d08ea1f72ce55"
+  "hash": "6c41c286e3d720aae2f060dbb29818744632e248635e332e54b52138058d47da"
 }

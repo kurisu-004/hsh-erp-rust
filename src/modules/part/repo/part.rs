@@ -215,7 +215,7 @@ impl PartRepo {
 
     // ===== Phase PR-CRUD 新增 =====
 
-    /// 详情接口：完整 28 列行（含软删检测）。
+    /// 详情接口：完整 29 列行（含软删检测）。
     ///
     /// service 层在 `get_by_id(..., include_deleted=false)` 失败时可用本方法
     /// 做兜底（含软删场景）以区分「不存在」与「已软删」。
@@ -231,8 +231,8 @@ impl PartRepo {
                    customer_id, assembly_id, status, location, is_urgent,
                    current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
-                    version, created_at, created_by, updated_at, updated_by,
-                    deleted_at, delivery_note_id, process_chain_id
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -445,20 +445,20 @@ impl PartRepo {
              customer_id, assembly_id, status, location, is_urgent, \
              current_holder_id, placed_at, next_process_id, \
              order_no, system_delivery_date, note, has_been_repaired, \
-              version, created_at, created_by, updated_at, updated_by, \
-              deleted_at, delivery_note_id, process_chain_id \
-              FROM t_part WHERE assembly_id = $1 \
-              ORDER BY serial_no ASC NULLS LAST, id ASC"
+             version, created_at, created_by, updated_at, updated_by, \
+             deleted_at, delivery_note_id, process_chain_id \
+             FROM t_part WHERE assembly_id = $1 \
+             ORDER BY serial_no ASC NULLS LAST, id ASC"
         } else {
             "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
              request_date, planned_delivery_date, actual_delivery_date, \
              customer_id, assembly_id, status, location, is_urgent, \
              current_holder_id, placed_at, next_process_id, \
              order_no, system_delivery_date, note, has_been_repaired, \
-              version, created_at, created_by, updated_at, updated_by, \
-              deleted_at, delivery_note_id, process_chain_id \
-              FROM t_part WHERE assembly_id = $1 AND deleted_at IS NULL \
-              ORDER BY serial_no ASC NULLS LAST, id ASC"
+             version, created_at, created_by, updated_at, updated_by, \
+             deleted_at, delivery_note_id, process_chain_id \
+             FROM t_part WHERE assembly_id = $1 AND deleted_at IS NULL \
+             ORDER BY serial_no ASC NULLS LAST, id ASC"
         };
         sqlx::query_as::<_, TPart>(sql)
             .bind(assembly_id)
