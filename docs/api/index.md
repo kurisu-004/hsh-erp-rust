@@ -170,7 +170,7 @@ HTTP 状态码：
 | outsource-shipments | [`./outsource-shipments.md`](./outsource-shipments.md) | 1 | ✅ 完全上线（2026-09-14，Phase 2） |
 | delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
-| process-chains | [`./production/process-chain.md`](./production/process-chain.md) | 2 | ✅ 完全上线（2026-09-12，process_chain 域） |
+| process-chains | [`./production/process-chain.md`](./production/process-chain.md) | 3 | ✅ 完全上线（2026-09-12，process_chain 域；2026-09-16 FK 翻转 + `GET /{chain_id}`） |
 | _e2e | [`./_e2e.md`](./_e2e.md) | 11 | ✅ 完全上线（2026-09-14，e2e seed hook，dev/test profile） |
 | websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub（handler 已搭骨架，待握手实现） |
 | 其他 1 域 | — | 0 | ⚪ 仅占位（见下） |
@@ -231,7 +231,7 @@ HTTP 状态码：
 | 204xx | 图纸文件（DRAWING_FILE_NOT_FOUND 20401 / BAD_TYPE 20402 / TOO_LARGE 20403 / UPLOAD_FAILED 20404） |
 | 205xx | 货架（SHELF_NOT_FOUND 20501 / DUPLICATE_CODE 20502 / IN_USE 20503 / **PROCESS_SHELF_NOT_FOUND 20504 / PROCESS_PROCESS_NOT_FOUND 20505 / NO_MATCH_FOR_PROCESS 20506** / PROCESS_NOT_MAPPED 20507 / NOT_INSPECTION_ZONE 20511 / INACTIVE 20512） |
 | 206xx | 账号（USER_ACCOUNT_NOT_FOUND 20601 / DUPLICATE_USERNAME 20602 / INACTIVE 20603 / ROLE_DUPLICATE 20604 / ROLE_NOT_FOUND 20605 / NO_ROLE 20606） |
-| 207xx | 工艺链（**PROCESS_CHAIN_NOT_FOUND 20701 / PROCESS_CHAIN_STEP_NOT_FOUND 20702 / WORK_TYPE_MAX_HELD_MINUTES_NOT_SET 20703 / AUTO_ALLOCATE_INVALID_RATIO 20704**） |
+| 207xx | 工艺链（**PROCESS_CHAIN_NOT_FOUND 20701 / PROCESS_CHAIN_STEP_NOT_FOUND 20702 / WORK_TYPE_MAX_HELD_MINUTES_NOT_SET 20703 / AUTO_ALLOCATE_INVALID_RATIO 20704 / PROCESS_CHAIN_PART_NOT_PENDING 20705**） |
 | 208xx | 工序（PROCESS_NOT_FOUND 20801 / DUPLICATE_CODE 20802 / IN_USE 20803） |
 | 209xx | 工种（WORK_TYPE_NOT_FOUND 20901 / DUPLICATE_CODE 20902 / IN_USE 20903 / **MAX_HELD_NOT_SET 20904 / NO_PROCESS_MAPPING 20905**） |
 | 210xx | 申请人（APPLICANT_NOT_FOUND 21001 / DUPLICATE_NAME 21002 / BAD_CUSTOMER 21003 / IN_USE 21004） |

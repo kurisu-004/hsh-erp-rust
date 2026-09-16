@@ -48,6 +48,12 @@ Response 200 `data`：`PartListOut`
 | `limit` | string (i64) | 实际生效的 limit |
 | `offset` | string (i64) | 实际生效的 offset |
 
+> 2026-09-16（migration 026 FK 翻转）：每行新增 `process_chain_id`（string i64?）——
+> 逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链。前端「工序制定」页
+> 按此字段是否为 `null` 批量区分已制定 / 未制定工序的零件，点击后调
+> `GET /api/v2/process-chains/{chain_id}` 加载工序（见
+> [`../production/process-chain.md`](../production/process-chain.md)）。
+
 错误码：40001（limit/offset 越界）、40300（角色不符）、50001（DB）。
 
 ### `POST /api/v2/parts`
@@ -100,6 +106,9 @@ Response 200 `data`：
 权限: **Manager / Clerk / Inspector / CncProgrammer**
 
 Response 200 `data`：[`PartDetailOut`](./index.md#partdetailout-字段)。
+
+> 2026-09-16（migration 026 FK 翻转）：响应含 `process_chain_id`（string i64?）——
+> 逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链。
 
 错误码：20101（不存在 / 已软删）、40300。
 
