@@ -122,6 +122,13 @@
 > `has_been_repaired` 6 个批次依附列；`TPart` 由 29 列精简至 23 列。
 > 列表项位置/持有人展示由 service 层按 min-progress 活跃批次派生（见上）。
 >
+> 2026-09-16 PR-3 批次 step 化（migration 028）：`t_part_batch.next_process_id` 列
+> 替换为 `current_process_step_id`（逻辑 FK → `t_process_chain_step.id`）。
+> `t_part_batch.placed_at` 列已删除（不再统计生产时间）。`TPart.next_process_id`
+> 字段保留作派生缓存，由 `sync_from_batch_change` rollup 派生
+> （min-progress 活跃 batch 的 step JOIN `t_process_chain_step.process_id`）。
+> 前端如需该信息，按 `current_process_step_id` 自行派生即可。
+>
 > 2026-09-16（migration 026 FK 翻转）：`TPart` 新增 `process_chain_id`（string i64?）
 > —— 逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链。前端「工序制定」页
 > 按此字段是否为 `null` 批量区分已制定 / 未制定工序的零件。
