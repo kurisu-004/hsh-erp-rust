@@ -531,6 +531,29 @@ impl PartFileService {
             )
         })?;
 
+        // 2026-09-16 M2-B review 第 2 轮 B2 修：copy_object 成功后**立刻** spawn
+        // best-effort delete_object(tmp_key)，不等 commit。
+        // - commit 成功路径：handler 后续也会 spawn 一次 delete（与此处重复），但
+        //   delete_object 幂等（NoSuchKey 视为成功），不会报 21104。
+        // - commit 失败路径（create_part_file 撞 23505 / tx.commit() 抛错）：此 spawn
+        //   是**唯一**清理 tmp 的机会，否则 tmp 会留作孤儿（直到下次 list_objects
+        //   lifecycle 兜底）。
+        // 两层 spawn（service 一层 + handler 一层）双层防护；任何一层失败不阻塞另一层。
+        let cos_for_early_cleanup = cos.clone();
+        let tmp_key_for_early_cleanup = tmp_key.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = cos_for_early_cleanup
+                .delete_object(&tmp_key_for_early_cleanup)
+                .await
+            {
+                tracing::warn!(
+                    tmp_key = %tmp_key_for_early_cleanup,
+                    error = %e,
+                    "bind_uploaded_file copy 后早期 spawn delete 失败（best-effort，commit 后 handler 还会再 spawn）"
+                );
+            }
+        });
+
         // 7. 开 tx：soft_delete 旧 + INSERT 新 + readback
         let mut tx = pool.begin().await?;
         // 单文件 kind（DRAWING / 3D_MODEL）下，旧活跃行要先 soft_delete
