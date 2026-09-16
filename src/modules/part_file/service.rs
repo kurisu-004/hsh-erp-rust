@@ -267,6 +267,8 @@ impl PartFileService {
             content_type: row.content_type.clone(),
             upload_status: row.upload_status.clone(),
             content_sha256: row.content_sha256.clone(),
+            // 2026-09-16 补投影：CNC 配对分组契约字段（G_CODE <-> SETUP_SHEET 互指）
+            paired_file_id: row.paired_file_id,
             version: row.version,
             created_at: Some(row.created_at),
             created_by: row.created_by,

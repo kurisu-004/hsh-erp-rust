@@ -84,6 +84,7 @@ CAS 命中（已上传过相同内容）→ 跳过 COS PUT，直接复用已有 
 | `content_type` | string | MIME |
 | `upload_status` | string | READY / PENDING / FAILED |
 | `content_sha256` | string? | SHA-256 hex |
+| `paired_file_id` | string (i64)? | CNC 配对文件 id（G_CODE <-> SETUP_SHEET 互指），未配对为 null；2026-09-16 补投影（前端零件详情 CNC 配对分组依赖） |
 | `version` | i32 | 乐观锁 |
 | `created_at` | naive datetime | |
 | `created_by` | string (i64)? | |
