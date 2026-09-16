@@ -305,8 +305,7 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
 
     // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
     // receive-from-outsource 要求 part 已绑定工艺链
-    let chain_id = create_chain_for_part(&pool, part_id).await;
-    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    // （chain + step 已在上面建好，无需重复 setup）
 
     // 第一次 send 成功
     let (_, env1) = send(

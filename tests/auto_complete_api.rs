@@ -87,8 +87,9 @@ async fn seed_delivered_batch(
     let today = now.date();
     let part_id = snowflake.next_id();
     // 2026-09-16 PR-2（migration 027）：t_part 删 `actual_delivery_date` /
-    // `has_been_repaired`；实际交付日期真相源改为 t_part_event.DELIVERED 事件
-    // （auto_complete 阈值判定走 batch.placed_at，未受影响）。
+    // `has_been_repaired`；实际交付日期真相源改为 t_part_event.DELIVERED 事件。
+    // 2026-09-16 PR-3（migration 028）：t_part_batch 删 `placed_at`；auto_complete
+    // 阈值同步改走 DELIVERED 事件 created_at（与 Python `_run_once` 口径对齐）。
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, \
