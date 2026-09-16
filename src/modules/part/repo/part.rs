@@ -19,10 +19,8 @@ use super::PartRepo;
 
 /// `create_part` 输入：service 层用 builder 模式注入。
 ///
-/// `id` 由 caller 预生成雪花；`status` 初始为 `'PENDING'`；`location` /
-/// `current_holder_id` / `next_process_id` / `serial_no` / `delivery_note_id` /
-/// `actual_delivery_date` / `deleted_at` / `version` / `has_been_repaired` 走
-/// DB 默认或 `NULL`。
+/// `id` 由 caller 预生成雪花；`status` 初始为 `'PENDING'`；`next_process_id` /
+/// `serial_no` / `deleted_at` / `version` 走 DB 默认或 `NULL`。
 pub struct NewPartCreate<'a> {
     pub id: i64,
     pub name: &'a str,
@@ -43,6 +41,9 @@ pub struct NewPartCreate<'a> {
 /// `update_part` 输入：所有字段 `Option`，未设置的字段不动。
 ///
 /// `version += 1` 与 `updated_at = now()` 强制写入；`updated_by` 必填。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date`（t_part
+/// 列已删；实际交付日期由 t_part_event DELIVERED 事件派生，不接受手工改）。
 pub struct PartUpdate<'a> {
     pub name: Option<&'a str>,
     pub drawing_no: Option<&'a str>,
@@ -51,7 +52,6 @@ pub struct PartUpdate<'a> {
     pub order_no: Option<&'a str>,
     pub system_delivery_date: Option<chrono::NaiveDate>,
     pub planned_delivery_date: Option<chrono::NaiveDate>,
-    pub actual_delivery_date: Option<chrono::NaiveDate>,
     pub note: Option<&'a str>,
     pub is_urgent: Option<bool>,
     pub updated_by: i64,
@@ -87,12 +87,12 @@ impl PartRepo {
             TPart,
             r#"
             SELECT id, serial_no, name, drawing_no, applicant_name, quantity,
-                   request_date, planned_delivery_date, actual_delivery_date,
-                   customer_id, assembly_id, status, location,
-                   is_urgent, current_holder_id, placed_at, next_process_id,
-                   order_no, system_delivery_date, note, has_been_repaired,
+                   request_date, planned_delivery_date,
+                   customer_id, assembly_id, status,
+                   is_urgent, next_process_id,
+                   order_no, system_delivery_date, note,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id, process_chain_id
+                   deleted_at, process_chain_id
             FROM t_part
             WHERE id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -116,12 +116,12 @@ impl PartRepo {
             TPart,
             r#"
             SELECT id, serial_no, name, drawing_no, applicant_name, quantity,
-                   request_date, planned_delivery_date, actual_delivery_date,
-                   customer_id, assembly_id, status, location,
-                   is_urgent, current_holder_id, placed_at, next_process_id,
-                   order_no, system_delivery_date, note, has_been_repaired,
+                   request_date, planned_delivery_date,
+                   customer_id, assembly_id, status,
+                   is_urgent, next_process_id,
+                   order_no, system_delivery_date, note,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id, process_chain_id
+                   deleted_at, process_chain_id
             FROM t_part
             WHERE id = ANY($1)
               AND ($2::bool OR deleted_at IS NULL)
@@ -146,12 +146,12 @@ impl PartRepo {
             TPart,
             r#"
             SELECT id, serial_no, name, drawing_no, applicant_name, quantity,
-                   request_date, planned_delivery_date, actual_delivery_date,
-                   customer_id, assembly_id, status, location,
-                   is_urgent, current_holder_id, placed_at, next_process_id,
-                   order_no, system_delivery_date, note, has_been_repaired,
+                   request_date, planned_delivery_date,
+                   customer_id, assembly_id, status,
+                   is_urgent, next_process_id,
+                   order_no, system_delivery_date, note,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id, process_chain_id
+                   deleted_at, process_chain_id
             FROM t_part
             WHERE serial_no = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -173,12 +173,12 @@ impl PartRepo {
             TPart,
             r#"
             SELECT id, serial_no, name, drawing_no, applicant_name, quantity,
-                   request_date, planned_delivery_date, actual_delivery_date,
-                   customer_id, assembly_id, status, location,
-                   is_urgent, current_holder_id, placed_at, next_process_id,
-                   order_no, system_delivery_date, note, has_been_repaired,
+                   request_date, planned_delivery_date,
+                   customer_id, assembly_id, status,
+                   is_urgent, next_process_id,
+                   order_no, system_delivery_date, note,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id, process_chain_id
+                   deleted_at, process_chain_id
             FROM t_part
             WHERE assembly_id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -194,6 +194,9 @@ impl PartRepo {
     /// to_ship 流专用最小投影（to-XXX 重命名后的 PartOut 必需列）。
     ///
     /// `include_deleted = false`（to_ship 不应对软删件操作）。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：投影删 `actual_delivery_date` /
+    /// `current_holder_id`（t_part 列已删）。
     pub async fn get_part_inspected<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -202,8 +205,7 @@ impl PartRepo {
             TPartInspected,
             r#"
             SELECT id, serial_no, name, drawing_no, status, version, quantity,
-                   order_no, actual_delivery_date, current_holder_id,
-                   updated_at, updated_by
+                   order_no, updated_at, updated_by
             FROM t_part
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -227,12 +229,12 @@ impl PartRepo {
             TPart,
             r#"
             SELECT id, serial_no, name, drawing_no, applicant_name, quantity,
-                   request_date, planned_delivery_date, actual_delivery_date,
-                   customer_id, assembly_id, status, location, is_urgent,
-                   current_holder_id, placed_at, next_process_id,
-                   order_no, system_delivery_date, note, has_been_repaired,
+                   request_date, planned_delivery_date,
+                   customer_id, assembly_id, status,
+                   is_urgent, next_process_id,
+                   order_no, system_delivery_date, note,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id, process_chain_id
+                   deleted_at, process_chain_id
             FROM t_part
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -298,7 +300,6 @@ impl PartRepo {
         if let Some(v) = upd.order_no { qb.push(", order_no = ").push_bind(v.to_string()); }
         if let Some(v) = upd.system_delivery_date { qb.push(", system_delivery_date = ").push_bind(v); }
         if let Some(v) = upd.planned_delivery_date { qb.push(", planned_delivery_date = ").push_bind(v); }
-        if let Some(v) = upd.actual_delivery_date { qb.push(", actual_delivery_date = ").push_bind(v); }
         if let Some(v) = upd.note { qb.push(", note = ").push_bind(v.to_string()); }
         if let Some(v) = upd.is_urgent { qb.push(", is_urgent = ").push_bind(v); }
         qb.push(" WHERE id = ").push_bind(part_id);
@@ -310,9 +311,12 @@ impl PartRepo {
 
     /// 软删：`deleted_at = now()` + `version += 1`。
     ///
-    /// 守卫：`status NOT IN ('DELIVERED','COMPLETED')` 且 `delivery_note_id IS NULL`
-    /// —— 已签收 / 已完结 / 已绑定送货单的工单不允许软删，由 service 层根据
-    /// 返回行数判断并映射错误码。
+    /// 守卫：`status NOT IN ('DELIVERED','COMPLETED')` —— 已签收 / 已完结的
+    /// 工单不允许软删，由 service 层根据返回行数判断并映射错误码。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part.delivery_note_id 列已删，
+    /// 「已挂送货单禁删」守卫移出本 UPDATE，改由 service 层用
+    /// `PartBatchRepo::has_active_batch_on_delivery_note` 预检（批次级真相源）。
     pub async fn soft_delete_part<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -328,7 +332,6 @@ impl PartRepo {
                 updated_by = $3
             WHERE id = $1 AND version = $2
               AND status NOT IN ('DELIVERED', 'COMPLETED')
-              AND delivery_note_id IS NULL
               AND deleted_at IS NULL
             "#,
             part_id, expected_version, current_user_id,
@@ -361,12 +364,12 @@ impl PartRepo {
 
         let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
             "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
-                    request_date, planned_delivery_date, actual_delivery_date, \
-                    customer_id, assembly_id, status, location, is_urgent, \
-                    current_holder_id, placed_at, next_process_id, \
-                    order_no, system_delivery_date, note, has_been_repaired, \
+                    request_date, planned_delivery_date, \
+                    customer_id, assembly_id, status, is_urgent, \
+                    next_process_id, \
+                    order_no, system_delivery_date, note, \
                     version, created_at, created_by, updated_at, updated_by, \
-                    deleted_at, delivery_note_id, process_chain_id \
+                    deleted_at, process_chain_id \
              FROM t_part WHERE 1=1",
         );
         if !f.include_deleted { qb.push(" AND deleted_at IS NULL"); }
@@ -441,22 +444,22 @@ impl PartRepo {
     ) -> Result<Vec<TPart>, sqlx::Error> {
         let sql = if include_deleted {
             "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
-             request_date, planned_delivery_date, actual_delivery_date, \
-             customer_id, assembly_id, status, location, is_urgent, \
-             current_holder_id, placed_at, next_process_id, \
-             order_no, system_delivery_date, note, has_been_repaired, \
+             request_date, planned_delivery_date, \
+             customer_id, assembly_id, status, is_urgent, \
+             next_process_id, \
+             order_no, system_delivery_date, note, \
              version, created_at, created_by, updated_at, updated_by, \
-             deleted_at, delivery_note_id, process_chain_id \
+             deleted_at, process_chain_id \
              FROM t_part WHERE assembly_id = $1 \
              ORDER BY serial_no ASC NULLS LAST, id ASC"
         } else {
             "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
-             request_date, planned_delivery_date, actual_delivery_date, \
-             customer_id, assembly_id, status, location, is_urgent, \
-             current_holder_id, placed_at, next_process_id, \
-             order_no, system_delivery_date, note, has_been_repaired, \
+             request_date, planned_delivery_date, \
+             customer_id, assembly_id, status, is_urgent, \
+             next_process_id, \
+             order_no, system_delivery_date, note, \
              version, created_at, created_by, updated_at, updated_by, \
-             deleted_at, delivery_note_id, process_chain_id \
+             deleted_at, process_chain_id \
              FROM t_part WHERE assembly_id = $1 AND deleted_at IS NULL \
              ORDER BY serial_no ASC NULLS LAST, id ASC"
         };
@@ -479,6 +482,10 @@ impl PartRepo {
     /// 一条 `batch_no=1 / status='PENDING' / location='OFFICE' / quantity=$quantity`
     /// 的初始批次（part/assembly/batch 重构后所有车间流转都锚定 batch，必须有
     /// 初始批次）。`initial_batch_id` 由 caller 预生成雪花。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：子件 part 行不再写
+    /// `location='OFFICE'`（t_part.location 列已删）；批次行仍写
+    /// `location='OFFICE'`（位置信息真相源在 t_part_batch）。
     ///
     /// 函数签名收 `&mut PgConnection`（非 `impl PgExecutor<'_>`），因为要在同一
     /// 事务内连发两条 INSERT（与 `split_batch_for_partial_pass` / `split_batch`
@@ -503,12 +510,12 @@ impl PartRepo {
             INSERT INTO t_part (
                 id, name, drawing_no, applicant_name, quantity, request_date,
                 planned_delivery_date, is_urgent, customer_id, assembly_id,
-                order_no, system_delivery_date, note, status, location,
+                order_no, system_delivery_date, note, status,
                 unit_price, total_price, serial_no, version, created_by
             ) VALUES (
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10,
-                $11, $12, $13, 'PENDING', 'OFFICE',
+                $11, $12, $13, 'PENDING',
                 0, 0, $14, 0, $15
             )
             "#,
@@ -538,12 +545,12 @@ impl PartRepo {
             INSERT INTO t_part_batch (
                 id, part_id, batch_no, quantity, status, location,
                 current_holder_id, next_process_id, placed_at,
-                delivery_note_id, parent_batch_id, has_been_repaired,
+                delivery_note_id, parent_batch_id,
                 version, created_at, created_by, updated_at, updated_by
             ) VALUES (
                 $1, $2, 1, $3, 'PENDING', 'OFFICE',
                 NULL, NULL, NULL,
-                NULL, NULL, FALSE,
+                NULL, NULL,
                 0, now(), $4, now(), $4
             )
             "#,
@@ -582,8 +589,10 @@ impl PartRepo {
     /// `customer_id`。
     ///
     /// 排除：
-    /// - `actual_delivery_date`：deliver 流程写入的产物，不属于"信息字段"。
     /// - `quantity`：单独走 §3.3 缩放逻辑。
+    ///
+    /// （2026-09-16 PR-2 注：原「排除 actual_delivery_date」条目随 migration 027
+    /// 删列而消失 —— t_part 已无该列。）
     ///
     /// 实现上按"父件更新后的当前行值"做覆盖（即所有 8 个字段无条件覆写），
     /// 未变更字段被覆写为原值（语义无差），避免三态解析歧义。
@@ -745,6 +754,12 @@ mod tests {
 // 这些函数服务于 PR-B2 `PartService::sync_from_batch_change`（part 状态由 batch 变化
 // rollup 派生）。单独一组 `impl PartRepo { ... }`，与上面的方向 A 级联 / 缩放函数区分。
 //
+// 2026-09-16 PR-2 瘦身（migration 027）：`t_part` 不再持有 `location` /
+// `current_holder_id` / `placed_at` / `has_been_repaired`，rollup 只物化
+// `status` + `next_process_id`（作为 part 派生列读缓存）。`get_part_rollup_state`
+// 与 `update_part_rollup` 投影同步收窄；`mark_part_repairing_flag_only` 整体
+// 删除（t_part 已无该列；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
+//
 // 注：本块位于 `mod tests` 之后，触发 clippy::items_after_test_module 警告。
 // 与 `worker_scan.rs::needless_late_init` 同类 pre-existing 例外，合并期不便重构
 // impl 块布局，加 `#[allow]` 豁免。
@@ -752,8 +767,9 @@ mod tests {
 impl PartRepo {
     /// rollup 读侧：part 当前派生列投影（PR-B2 `sync_from_batch_change` 用）。
     ///
-    /// 6 列：status / location / current_holder_id / next_process_id /
-    /// placed_at / version。`None` 表示 part 不存在或已软删。
+    /// 2026-09-16 PR-2 瘦身：2 列投影（status / next_process_id），其它派
+    /// 生列真相源在 t_part_batch。
+    /// `None` 表示 part 不存在或已软删。
     pub async fn get_part_rollup_state<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -761,8 +777,7 @@ impl PartRepo {
         sqlx::query_as!(
             crate::modules::part::model::TPartRollupState,
             r#"
-            SELECT status, location, current_holder_id, next_process_id,
-                   placed_at, version
+            SELECT status, next_process_id
             FROM t_part
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -774,71 +789,31 @@ impl PartRepo {
 
     /// rollup 写侧：派生列 UPDATE（PR-B2 `sync_from_batch_change` 用）。
     ///
-    /// **不走 OCC**（派生写）：`WHERE id=$1 AND deleted_at IS NULL`。
-    /// 并发 rollup 由 SQL 行锁串行化；`version += 1` 仍写入（保证审计字段单调）。
-    /// 0 行 → part 已被并发软删（防御性 caller 走 NoChange）。
-    ///
-    /// `location` / `current_holder_id` / `next_process_id` / `placed_at` 必填
-    /// （从最慢批次物化；不存在 → `NULL`，与 batch 端的 `Optional<>` 对齐）。
-    #[allow(clippy::too_many_arguments)]
+    /// 2026-09-16 PR-2 瘦身：只写 `status` + `next_process_id`（其它列已从
+    /// `t_part` 删除，真相源在 `t_part_batch`）。**不走 OCC**（派生写）：
+    /// `WHERE id=$1 AND deleted_at IS NULL`。并发 rollup 由 SQL 行锁串行化；
+    /// `version += 1` 仍写入（保证审计字段单调）。0 行 → part 已被并发软删
+    /// （防御性 caller 走 NoChange）。
     pub async fn update_part_rollup<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
         status: &str,
-        location: Option<&str>,
-        current_holder_id: Option<i64>,
         next_process_id: Option<i64>,
-        placed_at: Option<chrono::NaiveDateTime>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error> {
         let r = sqlx::query!(
             r#"
             UPDATE t_part
-            SET status            = $2,
-                location          = $3,
-                current_holder_id = $4,
-                next_process_id   = $5,
-                placed_at         = $6,
-                version           = version + 1,
-                updated_at        = now(),
-                updated_by        = $7
+            SET status          = $2,
+                next_process_id = $3,
+                version         = version + 1,
+                updated_at      = now(),
+                updated_by      = $4
             WHERE id = $1 AND deleted_at IS NULL
             "#,
             part_id,
             status,
-            location,
-            current_holder_id,
             next_process_id,
-            placed_at,
-            updated_by,
-        )
-        .execute(executor)
-        .await?;
-        Ok(r.rows_affected())
-    }
-
-    /// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) start_repair 辅助：
-    /// 单独置 `has_been_repaired=true`（不被 rollup 覆盖；rollup 仅物化
-    /// status/location/holder/process/placed_at 5 列）。
-    ///
-    /// 幂等：`has_been_repaired = has_been_repaired OR TRUE` 语义上等价 `=TRUE`，
-    /// 但保留 OR 形式让 PG 优化器识别"no change"路径（已被设置时不写 WAL）。
-    /// **不走 OCC**（衍生写，与 rollup 一致）。
-    pub async fn mark_part_repairing_flag_only<'e, E: PgExecutor<'e>>(
-        executor: E,
-        part_id: i64,
-        updated_by: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query!(
-            r#"
-            UPDATE t_part
-            SET has_been_repaired = TRUE,
-                version           = version + 1,
-                updated_at        = now(),
-                updated_by        = $2
-            WHERE id = $1 AND deleted_at IS NULL
-            "#,
-            part_id,
             updated_by,
         )
         .execute(executor)

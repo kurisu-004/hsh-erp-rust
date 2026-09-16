@@ -424,7 +424,6 @@ async fn three_state_note_clear_to_null() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: None,
         unit_price: None,

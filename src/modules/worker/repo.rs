@@ -274,16 +274,16 @@ impl WorkerRepo {
         .map(|r| r.rows_affected())
     }
 
-    /// 停用前查引用：单条 `UNION ALL` 统计 `t_part.current_holder_id = worker_id` 且
-    /// `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 的非软删零件数。
+    /// 停用前查引用：单条 `UNION ALL` 统计 `t_part_batch.current_holder_id = worker_id` 且
+    /// `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 的非软删批次数。
     ///
     /// 任一分支 > 0 ⇒ 20203 `BIZ_WORKER_IN_USE`。
     ///
-    /// 注：brief 说 "active 持有 (holder=WORKER)"，Python `_assert_not_holding_parts`
-    /// 同时过滤 `location='WORKER'`。本实现按 brief "simpler interpretation matching
-    /// Python" 接受 `current_holder_id = worker_id` 单条件 —— 在 Rust rollup 模型下
-    /// `current_holder_id` 已足够定位「该 worker 持有」的 part，不依赖 location
-    /// 多态列（location 主要给 Python ORM 多态鉴别用）。
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `current_holder_id` 列；
+    /// 「该 worker 持有」改查 t_part_batch 真相源（status / holder / location
+    /// 三个独立维度同时核对：当前活跃 + 持有人为该 worker + location='WORKER'
+    /// —— 比 v2 rollup 时期的纯 holder 引用更精确，与 Python
+    /// `_assert_not_holding_parts` 同语义）。
     pub async fn count_in_use_parts<'e, E: PgExecutor<'e>>(
         executor: E,
         worker_id: i64,
@@ -292,23 +292,27 @@ impl WorkerRepo {
             r#"
             SELECT
                 (
-                    (SELECT COUNT(*) FROM t_part
+                    (SELECT COUNT(*) FROM t_part_batch
                      WHERE current_holder_id = $1
+                       AND location = 'WORKER'
                        AND status = 'IN_PROCESS'
                        AND deleted_at IS NULL)
                     +
-                    (SELECT COUNT(*) FROM t_part
+                    (SELECT COUNT(*) FROM t_part_batch
                      WHERE current_holder_id = $1
+                       AND location = 'WORKER'
                        AND status = 'INSPECTION'
                        AND deleted_at IS NULL)
                     +
-                    (SELECT COUNT(*) FROM t_part
+                    (SELECT COUNT(*) FROM t_part_batch
                      WHERE current_holder_id = $1
+                       AND location = 'WORKER'
                        AND status = 'REPAIRING'
                        AND deleted_at IS NULL)
                     +
-                    (SELECT COUNT(*) FROM t_part
+                    (SELECT COUNT(*) FROM t_part_batch
                      WHERE current_holder_id = $1
+                       AND location = 'WORKER'
                        AND status = 'RETURNED'
                        AND deleted_at IS NULL)
                 )::bigint AS total

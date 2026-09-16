@@ -30,6 +30,7 @@ use crate::modules::part::dto::PartOut;
 use crate::modules::part::model::{NewPartEvent, TPart};
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{code, AppError};
 
 use super::super::dto_crud::{CancelRequest, CompleteRequest, DeliverRequest, StartRepairRequest};
@@ -178,14 +179,13 @@ impl PartService {
                 "工单已 CANCELLED",
             ));
         }
-        // Finding D：cancel 锁定守护 — part 已挂非 DRAFT 送货单 → 拒。
-        if part.delivery_note_id.is_some() {
+        // Finding D：cancel 锁定守护 — part 任一活跃批次已挂送货单 → 拒。
+        // 2026-09-16 PR-2 瘦身（migration 027）：t_part.delivery_note_id 列已删，
+        // 改查 t_part_batch.delivery_note_id 真相源。
+        if PartBatchRepo::has_active_batch_on_delivery_note(&mut *conn, part_id).await? {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_LOCKED_PART,
-                format!(
-                    "part {part_id} 已挂送货单（delivery_note_id={:?}），禁 cancel",
-                    part.delivery_note_id
-                ),
+                format!("part {part_id} 存在活跃批次已挂送货单，禁 cancel"),
             ));
         }
         if !from.can_transition_to(PartStatus::CANCELLED) {
@@ -399,7 +399,11 @@ impl PartService {
                 ),
             ));
         }
-        // 4. UPDATE batch: IN_PROCESS → REPAIRING（OCC） + has_been_repaired=true。
+        // 4. UPDATE batch: IN_PROCESS → REPAIRING（OCC）。
+        //    2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
+        //    `has_been_repaired` 列，mark_batch_repairing 不再写该列；t_part
+        //    同步删 `has_been_repaired` 列，mark_part_repairing_flag_only 整
+        //    个函数删除。返修事实由下方 REPAIR_STARTED 事件日志追溯。
         let bn = PartRepo::mark_batch_repairing(&mut *conn, batch.id, batch.version, current.id).await?;
         if bn == 0 {
             return Err(AppError::biz(
@@ -407,14 +411,8 @@ impl PartService {
                 format!("batch {} 版本冲突", batch.id),
             ));
         }
-        // 5. PR-B2 rollup：翻 batch → 物化 part 派生列（status=REPAIRING /
-        //    has_been_repaired=true）。
-        //    ⚠️ PR-B2 §4.3 注：start_repair 的 has_been_repaired=true 写 batch
-        //    （现有），part 由 rollup 同步（rollup 仅物化 status/location/holder/
-        //    process/placed_at 5 列；has_been_repaired 不在 rollup 范围内 —— 这
-        //    里显式补一次 UPDATE，保持向后兼容）。
+        // 5. PR-B2 rollup：翻 batch → 物化 part 派生列（status=REPAIRING）。
         let _ = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
-        let _ = PartRepo::mark_part_repairing_flag_only(&mut *conn, part_id, current.id).await?;
         // 6. 事件日志。
         PartRepo::insert_part_event(
             &mut *conn,

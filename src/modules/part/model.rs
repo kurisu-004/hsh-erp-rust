@@ -8,34 +8,31 @@
 //! part 域业务实现阶段再补，避免越权改动本域。
 //!
 //! Phase PR-CRUD 增量：
-//! - TPart 29 列完整投影；不含 `unit_price / total_price`（NUMERIC，待 `rust_decimal`）
+//! - TPart 23 列完整投影；不含 `unit_price / total_price`（NUMERIC，待 `rust_decimal`）
 //! - TPartEvent / NewPartEvent：保持不变（已对齐 migration 010）
 //!
-//! 完整列（含金额 / 数量 / holder / 日期 / note / has_been_repaired 等）待
-//! part 域业务实施时再补全 —— 当前 `Cargo.toml` 还未挂 `rust_decimal` feature，
-//! 而 `unit_price` / `total_price` 是 NUMERIC，缺 feature 时 sqlx 编译期拒收。
+//! 金额列（`unit_price` / `total_price` 是 NUMERIC）待 `rust_decimal` feature
+//! 上线后再补 —— 缺 feature 时 sqlx 编译期拒收。
 
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 use serde::Serialize;
 
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
-/// `t_part` 完整行投影（Phase PR-CRUD 2026-08-25；2026-09-16 增至 29 列）
+/// `t_part` 完整行投影（Phase PR-CRUD 2026-08-25；2026-09-16 PR-2 瘦身至 23 列）
 ///
-/// 29 列；不含 `unit_price` / `total_price`（NUMERIC，待 `rust_decimal` feature 上线）。
+/// 23 列；不含 `unit_price` / `total_price`（NUMERIC，待 `rust_decimal` feature 上线）。
 ///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删除 6 个批次依附列 ——
+/// `actual_delivery_date` / `location` / `current_holder_id` / `placed_at` /
+/// `delivery_note_id` / `has_been_repaired`。这些信息的真相源在 `t_part_batch`
+/// 同名列（返修标除外，已整体废弃）；实际交付日期由 `t_part_event` 的
+/// DELIVERED 事件派生。列表页位置 / 持有人展示由 service 层按
+/// 「min-progress 活跃批次」派生（见 `PartListItem.location` / `holder_name`）。
 ///
-/// PR-CRUD superset of master P1 + worker-pool 5-field addition:
-/// - master added: `location`, `next_process_id`, `planned_delivery_date`, `system_delivery_date`, `is_urgent`
-/// - PR-CRUD added the rest (`applicant_name`, `quantity`, `request_date`, `actual_delivery_date`,
-///   `current_holder_id`, `placed_at`, `order_no`, `note`, `has_been_repaired`) so this single
-///   28-col projection serves all current call sites including worker-pool's `take_one` CTE.
+/// `next_process_id` 保留：作 rollup 读缓存（PR-2 不动）。
 ///
-/// PR-CRUD 增量备注（2026-08-25）：
-/// - TPart::Serialize 用 `shared::types::serialize_i64{,_opt}` 标 8 个 i64 字段，
-///   与 Global Constraint #3（i64 主键 → JSON 字符串）一致。
-///
-/// 2026-09-16 增量（migration 026 FK 翻转）：+`process_chain_id`（29 列），
+/// 2026-09-16 增量（migration 026 FK 翻转）：+`process_chain_id`，
 /// 前端「工序制定」列表按它是否为 NULL 区分已制定 / 未制定。
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct TPart {
@@ -44,27 +41,21 @@ pub struct TPart {
     pub serial_no: Option<String>,
     pub name: String,
     pub drawing_no: String,
-    pub applicant_name: String,                                        // +1
-    pub quantity: i32,                                                  // +2
-    pub request_date: chrono::NaiveDate,                                // +3
-    pub planned_delivery_date: chrono::NaiveDate,                       // +4
-    pub actual_delivery_date: Option<chrono::NaiveDate>,
+    pub applicant_name: String,
+    pub quantity: i32,
+    pub request_date: chrono::NaiveDate,
+    pub planned_delivery_date: chrono::NaiveDate,
     #[serde(serialize_with = "serialize_i64")]
     pub customer_id: i64,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub assembly_id: Option<i64>,
     pub status: String,
-    pub location: Option<String>,                                       // +5
-    pub is_urgent: bool,                                                // +6
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub current_holder_id: Option<i64>,
-    pub placed_at: Option<chrono::NaiveDateTime>,                       // +7
+    pub is_urgent: bool,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
-    pub order_no: Option<String>,                                       // +8
-    pub system_delivery_date: Option<chrono::NaiveDate>,                // +9
-    pub note: Option<String>,                                           // +10
-    pub has_been_repaired: bool,                                        // +11
+    pub order_no: Option<String>,
+    pub system_delivery_date: Option<chrono::NaiveDate>,
+    pub note: Option<String>,
     pub version: i32,
     pub created_at: chrono::NaiveDateTime,
     #[serde(serialize_with = "serialize_i64_opt")]
@@ -73,8 +64,6 @@ pub struct TPart {
     #[serde(serialize_with = "serialize_i64_opt")]
     pub updated_by: Option<i64>,
     pub deleted_at: Option<chrono::NaiveDateTime>,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub delivery_note_id: Option<i64>,
     /// 逻辑 FK → `t_part_process_chain.id`（migration 026 FK 翻转，2026-09-16）。
     /// `None` = 未制定工艺链；活跃 part 间 1:1（`uq_t_part_process_chain`）。
     #[serde(serialize_with = "serialize_i64_opt")]
@@ -88,11 +77,12 @@ pub struct TPart {
 /// `rust_decimal` 上线、part 域业务实施时再补全。
 ///
 /// 与 `TPart`（Phase P1 投影）字段集不同：本结构服务于批量送检接口，
-/// 重点暴露 `status` / `version` / `quantity` / `actual_delivery_date` /
-/// `order_no` / `current_holder_id` 等本流程必需字段。
+/// 重点暴露 `status` / `version` / `quantity` / `order_no` 等本流程必需字段。
 ///
-/// Phase F2（to-inspection）：`current_holder_id` 用于「IN_PROCESS 组合校验」
-/// 启发式（命中 `t_shelf` → shelf；否则 → worker）。
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date` /
+/// `current_holder_id`（t_part 列已删）。原「IN_PROCESS 组合校验」的 holder
+/// 启发式改由 service 层读 min-progress 活跃批次的 `current_holder_id`
+///（见 `inspection_core.rs::to_inspection_core`）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPartInspected {
     pub id: i64,
@@ -103,8 +93,6 @@ pub struct TPartInspected {
     pub version: i32,
     pub quantity: i32,
     pub order_no: Option<String>,
-    pub actual_delivery_date: Option<NaiveDate>,
-    pub current_holder_id: Option<i64>,
     pub updated_at: NaiveDateTime,
     pub updated_by: Option<i64>,
 }
@@ -152,18 +140,13 @@ pub struct NewPartEvent<'a> {
 
 /// `t_part` rollup 派生列投影（PR-B2 `sync_from_batch_change` 用）。
 ///
-/// 6 列：status / location / current_holder_id / next_process_id /
-/// placed_at / version。无 `Serialize`（service 内短暂使用）。
+/// 2 列：status / next_process_id。无 `Serialize`（service 内短暂使用）。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：`location` / `current_holder_id` /
+/// `placed_at` 列已从 t_part 删除，rollup 只物化 status + next_process_id
+///（读缓存）；`version` 不参与 target==当前 比较，一并移出投影。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPartRollupState {
     pub status: String,
-    pub location: Option<String>,
-    #[allow(dead_code)]
-    pub current_holder_id: Option<i64>,
-    #[allow(dead_code)]
     pub next_process_id: Option<i64>,
-    #[allow(dead_code)]
-    pub placed_at: Option<chrono::NaiveDateTime>,
-    #[allow(dead_code)]
-    pub version: i32,
 }

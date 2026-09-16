@@ -1026,7 +1026,6 @@ async fn update_assembly_cascades_shared_fields_to_children() {
         customer_id: Some(Some(l2_b.to_string())), // 改客户 → 也应级联
         request_date: Some(Some(updated_request_date)),
         planned_delivery_date: Some(Some(updated_planned)),
-        actual_delivery_date: None,
         is_urgent: Some(true),
         quantity: None, // 本测试不缩放
         unit_price: None,
@@ -1134,7 +1133,6 @@ async fn update_assembly_scales_child_quantities() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: Some(2),
         unit_price: None,
@@ -1174,7 +1172,6 @@ async fn update_assembly_scales_child_quantities() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: Some(4),
         unit_price: None,
@@ -1213,7 +1210,6 @@ async fn update_assembly_scales_child_quantities() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: Some(12),
         unit_price: None,
@@ -1252,7 +1248,6 @@ async fn update_assembly_scales_child_quantities() {
         customer_id: None,
         request_date: None,
         planned_delivery_date: None,
-        actual_delivery_date: None,
         is_urgent: None,
         quantity: Some(12),
         unit_price: None,
@@ -1332,7 +1327,6 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None, name: None, applicant_name: None,
         customer_id: None, request_date: None, planned_delivery_date: None,
-        actual_delivery_date: None, is_urgent: None,
         quantity: Some(5),
         unit_price: None, total_price: None,
         order_no: None, system_delivery_date: None, note: None,
@@ -1365,7 +1359,6 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None, name: None, applicant_name: None,
         customer_id: None, request_date: None, planned_delivery_date: None,
-        actual_delivery_date: None, is_urgent: None,
         quantity: Some(3),
         unit_price: None, total_price: None,
         order_no: None, system_delivery_date: None, note: None,
@@ -1398,7 +1391,6 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None, name: None, applicant_name: None,
         customer_id: None, request_date: None, planned_delivery_date: None,
-        actual_delivery_date: None, is_urgent: None,
         quantity: Some(1),
         unit_price: None, total_price: None,
         order_no: None, system_delivery_date: None, note: None,

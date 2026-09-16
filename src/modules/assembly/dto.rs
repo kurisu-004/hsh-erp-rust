@@ -19,6 +19,9 @@ use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 // ---------- 出参 ----------
 
+/// 2026-09-16 PR-2 瘦身（migration 027）：t_assembly 删 `actual_delivery_date`
+/// 列，DTO `AssemblyOut` 同步删该字段。实际交付日期由子件批次的
+/// t_part_event DELIVERED 事件派生（前端按需另调 statistics 端点）。
 #[derive(Debug, Clone, Serialize)]
 pub struct AssemblyOut {
     #[serde(serialize_with = "serialize_i64")]
@@ -30,7 +33,6 @@ pub struct AssemblyOut {
     pub customer_id: i64,
     pub request_date: Option<NaiveDate>,
     pub planned_delivery_date: Option<NaiveDate>,
-    pub actual_delivery_date: Option<NaiveDate>,
     pub is_urgent: bool,
     pub status: String,
     pub version: i32,
@@ -194,8 +196,6 @@ pub struct AssemblyUpdateRequest {
     pub request_date: Option<Option<NaiveDate>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional_date")]
     pub planned_delivery_date: Option<Option<NaiveDate>>,
-    #[serde(default, deserialize_with = "deserialize_optional_optional_date")]
-    pub actual_delivery_date: Option<Option<NaiveDate>>,
     #[serde(default)]
     pub is_urgent: Option<bool>,
     #[serde(default)]

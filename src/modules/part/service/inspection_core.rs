@@ -334,6 +334,12 @@ impl PartService {
     /// - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE`
     /// - 20512 `BIZ_SHELF_INACTIVE`
     /// - 40901 `VERSION_CONFLICT`
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `current_holder_id` 列；
+    /// IN_PROCESS 组合校验的「工人持有件 / 非生产架件拒绝」改读**目标批次**的
+    /// `location` + `current_holder_id`（真相源在 t_part_batch）。原 step 4
+    /// 重排至 step 5 之后，用 `target_batch.location` 直接判定（避免原版
+    /// 「holder 是否命中 t_shelf」启发式歧义）。
     // 参数过多（9 > 7）。本函数聚合 part_id / shelf_id / batch_id / version /
     // quantity / note 等必要输入，与 `to_ship_core` 同形；将它们打包为
     // `ToInspectionCoreArgs` 结构体收益微薄、调用面广，重构 ROI 低，故豁免。
@@ -370,37 +376,39 @@ impl PartService {
                 ),
             ));
         }
-        // 4. IN_PROCESS 组合校验：工人持有件 / 非生产架件拒绝
+        // 5. 定位目标批次（先于 IN_PROCESS 组合校验，以便直接读 target_batch.location）
+        let target = Self::_resolve_scan_target_batch(&mut *conn, part_id, Some(batch_id)).await?;
+        // 5.5 caller 侧乐观锁：锚定 batch 而非 part
+        Self::_assert_batch_version(&target, expected_batch_version)?;
+        // 4（PR-2 重排后）IN_PROCESS 组合校验：工人持有件 / 非生产架件拒绝
         //
-        // 实现策略：`t_part.current_holder_id` 在 DB 层同时承载「worker 持有」与
-        // 「shelf 持有」两种语义；区分方式是看该 id 是否能命中 `t_shelf`：
-        // - ShelfRepo::get_by_id 返回 Some → 是 shelf
-        // - 返回 None → 是 worker（v1 myERP 也是用此启发式区分）
-        if from == PartStatus::IN_PROCESS
-            && let Some(holder_id) = part.current_holder_id
-        {
-            match ShelfRepo::get_by_id(&mut *conn, holder_id).await? {
-                None => {
-                    // holder 不在 t_shelf → 视为 worker 持有
+        // 实现策略：t_part_batch.location 是单一权威值（'PRODUCTION_SHELF' /
+        // 'INSPECTION_SHELF' / 'WORKER' / 'OUTSOURCE_COMPANY' / 'OFFICE'）。
+        // IN_PROCESS 状态要求 location='PRODUCTION_SHELF'；否则按目标位置
+        // 分类报错（工人持有 / 非生产架持有）。
+        if from == PartStatus::IN_PROCESS {
+            match target.location.as_deref() {
+                Some("PRODUCTION_SHELF") => { /* 放行 */ }
+                Some("WORKER") => {
                     return Err(AppError::biz(
                         code::BIZ_INVALID_TRANSITION,
                         "工人持有件请先归还或送检".to_string(),
                     ));
                 }
-                Some(holder_shelf) if holder_shelf.zone != "PRODUCTION" => {
-                    // holder 是 shelf 但不是生产架 → 拒绝
+                Some(other) => {
                     return Err(AppError::biz(
                         code::BIZ_INVALID_TRANSITION,
-                        "不在生产架上，无法送检".to_string(),
+                        format!("不在生产架上，无法送检（batch.location={other}）"),
                     ));
                 }
-                Some(_) => { /* holder 是 PRODUCTION 区货架 → 放行 */ }
+                None => {
+                    return Err(AppError::biz(
+                        code::BIZ_INVALID_TRANSITION,
+                        "batch.location 为空，无法送检".to_string(),
+                    ));
+                }
             }
         }
-        // 5. 定位目标批次
-        let target = Self::_resolve_scan_target_batch(&mut *conn, part_id, Some(batch_id)).await?;
-        // 5.5 caller 侧乐观锁：锚定 batch 而非 part
-        Self::_assert_batch_version(&target, expected_batch_version)?;
         // 6. 部分通过拆批
         let (operated_id, operated_version, new_batch_id_out) = Self::_split_for_partial_op(
             &mut *conn, snowflake, &target, quantity, current,

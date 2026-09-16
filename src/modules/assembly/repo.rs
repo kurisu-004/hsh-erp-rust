@@ -16,6 +16,10 @@ use super::model::TAssembly;
 pub struct AssemblyRepo;
 
 impl AssemblyRepo {
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_assembly 删 `actual_delivery_date`
+    /// 列；4 个 SELECT 投影（get_by_id / list_by_ids / get_by_serial /
+    /// list_with_filters）同步删该列。实际交付由子件批次的 t_part_event
+    /// DELIVERED 事件派生。
     pub async fn get_by_id<'e, E: PgExecutor<'e>>(
         executor: E,
         id: i64,
@@ -25,7 +29,7 @@ impl AssemblyRepo {
             TAssembly,
             r#"
             SELECT id, drawing_no, name, applicant_name, customer_id,
-                   request_date, planned_delivery_date, actual_delivery_date,
+                   request_date, planned_delivery_date,
                    is_urgent, status, version, created_at, created_by,
                    updated_at, updated_by, deleted_at, serial_no, quantity,
                    unit_price, total_price, order_no, system_delivery_date, note
@@ -52,7 +56,7 @@ impl AssemblyRepo {
             TAssembly,
             r#"
             SELECT id, drawing_no, name, applicant_name, customer_id,
-                   request_date, planned_delivery_date, actual_delivery_date,
+                   request_date, planned_delivery_date,
                    is_urgent, status, version, created_at, created_by,
                    updated_at, updated_by, deleted_at, serial_no, quantity,
                    unit_price, total_price, order_no, system_delivery_date, note
@@ -79,7 +83,7 @@ impl AssemblyRepo {
             TAssembly,
             r#"
             SELECT id, drawing_no, name, applicant_name, customer_id,
-                   request_date, planned_delivery_date, actual_delivery_date,
+                   request_date, planned_delivery_date,
                    is_urgent, status, version, created_at, created_by,
                    updated_at, updated_by, deleted_at, serial_no, quantity,
                    unit_price, total_price, order_no, system_delivery_date, note
@@ -165,6 +169,9 @@ impl AssemblyRepo {
 
 // ---------- UPDATE partial ----------
 
+/// 2026-09-16 PR-2 瘦身（migration 027）：t_assembly 删 `actual_delivery_date` 列；
+/// `AssemblyUpdate` 同步删该字段。实际交付日期由子件批次 t_part_event
+/// DELIVERED 事件派生，DTO `AssemblyUpdateRequest` 同步精简。
 pub struct AssemblyUpdate<'a> {
     pub drawing_no: Option<&'a str>,
     pub name: Option<&'a str>,
@@ -172,7 +179,6 @@ pub struct AssemblyUpdate<'a> {
     pub customer_id: Option<i64>,
     pub request_date: Option<Option<NaiveDate>>,
     pub planned_delivery_date: Option<Option<NaiveDate>>,
-    pub actual_delivery_date: Option<Option<NaiveDate>>,
     pub is_urgent: Option<bool>,
     pub quantity: Option<i32>,
     pub unit_price: Option<Option<Decimal>>,
@@ -267,12 +273,6 @@ impl AssemblyRepo {
             &mut qb,
             "planned_delivery_date",
             upd.planned_delivery_date,
-            &mut sep,
-        );
-        push_opt_opt_date(
-            &mut qb,
-            "actual_delivery_date",
-            upd.actual_delivery_date,
             &mut sep,
         );
         if let Some(u) = upd.is_urgent {
@@ -382,7 +382,7 @@ impl AssemblyRepo {
         f: &AssemblyListFilters<'_>,
     ) -> Result<Vec<TAssembly>, sqlx::Error> {
         let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-            "SELECT id, drawing_no, name, applicant_name, customer_id, request_date, planned_delivery_date, actual_delivery_date, is_urgent, status, version, created_at, created_by, updated_at, updated_by, deleted_at, serial_no, quantity, unit_price, total_price, order_no, system_delivery_date, note FROM t_assembly WHERE 1=1",
+            "SELECT id, drawing_no, name, applicant_name, customer_id, request_date, planned_delivery_date, is_urgent, status, version, created_at, created_by, updated_at, updated_by, deleted_at, serial_no, quantity, unit_price, total_price, order_no, system_delivery_date, note FROM t_assembly WHERE 1=1",
         );
         if !f.include_deleted {
             qb.push(" AND deleted_at IS NULL");

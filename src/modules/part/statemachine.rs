@@ -434,6 +434,10 @@ pub fn part_status_progress(s: &str) -> u8 {
 }
 
 /// `compute_part_target` 的输入投影（仅 rollup 所需列；避免引入完整 `TPartBatch`）。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：`location` / `current_holder_id` /
+/// `placed_at` 列已从 t_part 删除，rollup 投影同步收窄。`next_process_id` 仍
+/// 保留作 part 派生列读缓存（service 层按 `next_process_id` 决策下一步）。
 #[derive(Debug, Clone, Default)]
 pub struct BatchForRollup {
     pub status: String,
@@ -444,13 +448,14 @@ pub struct BatchForRollup {
 }
 
 /// `compute_part_target` 的输出：目标 status + 派生列（从最慢批次物化）。
+///
+/// 2026-09-16 PR-2 瘦身：只物化 `status` + `next_process_id`（t_part 保留的两
+/// 列 rollup 缓存）。`location` / `current_holder_id` / `placed_at` 真相源在
+/// `t_part_batch`，列表页按需在 service 层从 `t_part_batch` 直接派生。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartRollupTarget {
     pub status: String,
-    pub location: Option<String>,
-    pub current_holder_id: Option<i64>,
     pub next_process_id: Option<i64>,
-    pub placed_at: Option<chrono::NaiveDateTime>,
 }
 
 /// batch 集 → part rollup target（part/assembly/batch 重构方案 §4.2 步骤 1–6）。
@@ -459,12 +464,14 @@ pub struct PartRollupTarget {
 /// 词汇相同，直接取 status 字符串）：
 ///
 /// 1. 空集 → `None`（防御；caller 走 NoChange）
-/// 2. 全部 CANCELLED → `status='CANCELLED'`；location/holder/process/placed_at
-///    取首条（rollup 终态，派生列不影响业务语义）
-/// 3. 非 CANCELLED 全部 COMPLETED → `status='COMPLETED'`；派生列取首条非
-///    CANCELLED 批次（语义同上）
+/// 2. 全部 CANCELLED → `status='CANCELLED'`
+/// 3. 非 CANCELLED 全部 COMPLETED → `status='COMPLETED'`
 /// 4. 否则取「最慢批次」（min progress over non-terminal, non-cancelled）的
-///    status + 派生列；progress 表见 `part_status_progress`
+///    `status` + `next_process_id`；progress 表见 `part_status_progress`
+///
+/// 2026-09-16 PR-2 瘦身：返回值只剩 `status` + `next_process_id`；其它派
+/// 生列（`location` / `current_holder_id` / `placed_at`）真相源在
+/// `t_part_batch`，由 `sync_from_batch_change` 的 caller 在需要时另查。
 pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarget> {
     if batches.is_empty() {
         return None;
@@ -475,10 +482,7 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         let r = &batches[0];
         return Some(PartRollupTarget {
             status: "CANCELLED".to_string(),
-            location: r.location.clone(),
-            current_holder_id: r.current_holder_id,
             next_process_id: r.next_process_id,
-            placed_at: r.placed_at,
         });
     }
     let non_terminal: Vec<&BatchForRollup> = non_cancelled
@@ -490,10 +494,7 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         let r = non_cancelled[0];
         return Some(PartRollupTarget {
             status: "COMPLETED".to_string(),
-            location: r.location.clone(),
-            current_holder_id: r.current_holder_id,
             next_process_id: r.next_process_id,
-            placed_at: r.placed_at,
         });
     }
     // 取 min-progress 批次
@@ -504,17 +505,13 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         .unwrap(); // safety: non_terminal 至少有一条
     Some(PartRollupTarget {
         status: min.status.clone(),
-        location: min.location.clone(),
-        current_holder_id: min.current_holder_id,
         next_process_id: min.next_process_id,
-        placed_at: min.placed_at,
     })
 }
 
 #[cfg(test)]
 mod rollup_tests {
     use super::*;
-    use chrono::NaiveDateTime;
 
     fn batch(status: &str) -> BatchForRollup {
         BatchForRollup {
@@ -659,30 +656,27 @@ mod rollup_tests {
     }
 
     #[test]
-    fn materializes_location_from_min_progress_batch() {
+    fn materializes_next_process_from_min_progress_batch() {
+        // 2026-09-16 PR-2 瘦身：rollup 只物化 status + next_process_id。
+        // 验证 next_process_id 从 min-progress 批次派生（其它派生列忽略）。
         let mut b_in_process = batch_with_loc("IN_PROCESS", Some("PRODUCTION_SHELF"));
         b_in_process.current_holder_id = Some(42);
         b_in_process.next_process_id = Some(7);
-        let placed = NaiveDateTime::parse_from_str("2026-09-01T10:00:00", "%Y-%m-%dT%H:%M:%S")
-            .unwrap();
-        b_in_process.placed_at = Some(placed);
         let v = vec![b_in_process, batch_with_loc("DELIVERED", Some("OUTSOURCE_COMPANY"))];
         let r = compute_part_target(&v).unwrap();
         assert_eq!(r.status, "IN_PROCESS");
-        assert_eq!(r.location.as_deref(), Some("PRODUCTION_SHELF"));
-        assert_eq!(r.current_holder_id, Some(42));
         assert_eq!(r.next_process_id, Some(7));
-        assert_eq!(r.placed_at, Some(placed));
     }
 
     #[test]
-    fn all_cancelled_materializes_first_batch_loc() {
+    fn all_cancelled_returns_first_batch_next_process() {
         let v = vec![
             batch_with_loc("CANCELLED", Some("OFFICE")),
             batch_with_loc("CANCELLED", Some("PRODUCTION_SHELF")),
         ];
         let r = compute_part_target(&v).unwrap();
         assert_eq!(r.status, "CANCELLED");
-        assert_eq!(r.location.as_deref(), Some("OFFICE"));
+        // next_process_id 默认 None，无 active 派生
+        assert_eq!(r.next_process_id, None);
     }
 }

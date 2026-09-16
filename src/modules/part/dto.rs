@@ -30,6 +30,10 @@ use crate::shared::types::{deserialize_i64, deserialize_i64_opt, serialize_i64, 
 /// 字段集与 `model::TPartInspected` 完全对齐：仅含 to-XXX 流程与最小
 /// `PartOut` 响应必需列。完整业务字段（`applicant_name` / `unit_price` 等）待
 /// part 域业务实施时再补全。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date` 字段
+/// （t_part 列已删；实际交付日期由 t_part_event DELIVERED 事件派生，前端
+/// 按需额外调 statistics 端点获取）。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartOut {
     #[serde(serialize_with = "serialize_i64")]
@@ -41,7 +45,6 @@ pub struct PartOut {
     pub version: i32,
     pub quantity: i32,
     pub order_no: Option<String>,
-    pub actual_delivery_date: Option<chrono::NaiveDate>,
     pub updated_at: chrono::NaiveDateTime,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub updated_by: Option<i64>,
@@ -58,16 +61,18 @@ impl From<crate::modules::part::model::TPartInspected> for PartOut {
             version: p.version,
             quantity: p.quantity,
             order_no: p.order_no,
-            actual_delivery_date: p.actual_delivery_date,
             updated_at: p.updated_at,
             updated_by: p.updated_by,
         }
     }
 }
 
-/// 从完整 `TPart` 投影到 `PartOut`：cancel 流需要 `delivery_note_id` 守卫，
-/// 故 read 时用 `PartRepo::get_part_detail` 取完整行（含 delivery_note_id），
-/// 直接转 PartOut 响应。
+/// 从完整 `TPart` 投影到 `PartOut`。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date` 字段；
+/// `delivery_note_id` 守卫改在 service 层用
+/// `PartBatchRepo::has_active_batch_on_delivery_note` 预检（不再依赖
+/// TPart.delivery_note_id 字段）。
 impl From<crate::modules::part::model::TPart> for PartOut {
     fn from(p: crate::modules::part::model::TPart) -> Self {
         Self {
@@ -79,7 +84,6 @@ impl From<crate::modules::part::model::TPart> for PartOut {
             version: p.version,
             quantity: p.quantity,
             order_no: p.order_no,
-            actual_delivery_date: p.actual_delivery_date,
             updated_at: p.updated_at,
             updated_by: p.updated_by,
         }
@@ -399,6 +403,9 @@ pub struct InspectionBatchListQuery {
 /// 字段命名沿用 v1 `PartOut`/`PartBatchOut` 约定（`batch_id` 即 `t_part_batch.id`，
 /// `version` 即乐观锁版本号）。前端用 `batch_id + version` 直接拼
 /// `POST /parts/{part_id}/to-ship` 或 `to-inspection` 的请求体。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` 字段
+/// （t_part_batch 列已删；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
 #[derive(Debug, Clone, Serialize)]
 pub struct InspectionBatchListItemOut {
     // ===== 批次字段 =====
@@ -410,7 +417,6 @@ pub struct InspectionBatchListItemOut {
     pub location: Option<String>,
     pub version: i32,
     pub placed_at: Option<chrono::NaiveDateTime>,
-    pub has_been_repaired: bool,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub parent_batch_id: Option<i64>,
 

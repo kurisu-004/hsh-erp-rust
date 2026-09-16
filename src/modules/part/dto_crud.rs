@@ -139,6 +139,10 @@ pub struct PartBatchCreateOut {
 /// `PUT /parts/{id}` 入参：字段可选 UPDATE。
 ///
 /// `version` 必填（OCC）；其它字段未传 → DB 不动。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date` 入参
+/// （t_part 列已删；实际交付日期由 t_part_event DELIVERED 事件派生，不接
+/// 受手工改）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartUpdateRequest {
     pub version: i32,
@@ -156,8 +160,6 @@ pub struct PartUpdateRequest {
     pub system_delivery_date: Option<chrono::NaiveDate>,
     #[serde(default)]
     pub planned_delivery_date: Option<chrono::NaiveDate>,
-    #[serde(default)]
-    pub actual_delivery_date: Option<chrono::NaiveDate>,
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]
@@ -194,13 +196,35 @@ pub struct PartListQuery {
     pub offset: Option<i64>,
 }
 
-/// `GET /parts` 列表行：`TPart` + 客户冗余字段。
+/// `GET /parts` 列表行：`TPart` + 客户冗余字段 + 派生位置 / 持有人。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：t_part 不再持有 `location` /
+/// `current_holder_id`（已删列），前端列表需要的「位置 / 持有人」展示由
+/// service 层在 `list_parts` 内按 min-progress 活跃批次派生（见
+/// `PartService::list_parts` 内的 batch enrichment 段）。
+///
+/// 派生规则：
+/// - `location`：该 part min-progress 活跃批次（与 `compute_part_target` 一
+///   致；非 CANCELLED 非 COMPLETED 批次中 progress 最小者）的 `location`；
+///   无活跃批次 → `None`。
+/// - `holder_name`：同批次 `current_holder_id` 解析的展示名称；按
+///   `batch.location` 分桶：
+///   - `PRODUCTION_SHELF` / `INSPECTION_SHELF` → `t_shelf.code`
+///   - `WORKER` → `t_worker.name`
+///   - `OUTSOURCE_COMPANY` → `t_outsource_company.name`
+///   - `OFFICE` / `NULL` / 无活跃批次 → `None`
 #[derive(Debug, Clone, Serialize)]
 pub struct PartListItem {
     #[serde(flatten)]
     pub part: TPart,
     pub customer_name: Option<String>,
     pub l1_customer_name: Option<String>,
+    /// 派生位置（见字段级 doc 注释）。
+    #[serde(default)]
+    pub location: Option<String>,
+    /// 派生持有人名称（见字段级 doc 注释）。
+    #[serde(default)]
+    pub holder_name: Option<String>,
 }
 
 /// `GET /parts` 出参（分页）。
@@ -681,6 +705,9 @@ pub struct PartEventOut {
 }
 
 /// `GET /parts/{id}/batches` 出参：工单全部活跃批次 + holder 名称解析。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` 字段
+/// （t_part_batch 列已删；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartBatchListItemOut {
     #[serde(serialize_with = "serialize_i64")]
@@ -702,7 +729,6 @@ pub struct PartBatchListItemOut {
     pub delivery_note_id: Option<i64>,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub parent_batch_id: Option<i64>,
-    pub has_been_repaired: bool,
     pub version: i32,
 }
 

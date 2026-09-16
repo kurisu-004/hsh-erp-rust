@@ -101,6 +101,9 @@ async fn fetch_customer_names(
 }
 
 /// `TAssembly` → `AssemblyListItem`（含 customer_name / parent_customer_name 两次 join）。
+///
+/// 2026-09-16 PR-2 瘦身：t_assembly 删 `actual_delivery_date` 列，AssemblyOut
+/// 同步删该字段。
 fn render_list_item(asm: TAssembly, names: &HashMap<i64, (String, Option<i64>)>) -> AssemblyListItem {
     let (customer_name, parent_customer_name) = names
         .get(&asm.customer_id)
@@ -115,7 +118,6 @@ fn render_list_item(asm: TAssembly, names: &HashMap<i64, (String, Option<i64>)>)
             customer_id: asm.customer_id,
             request_date: asm.request_date,
             planned_delivery_date: asm.planned_delivery_date,
-            actual_delivery_date: asm.actual_delivery_date,
             is_urgent: asm.is_urgent,
             status: asm.status,
             version: asm.version,
@@ -135,6 +137,8 @@ fn render_list_item(asm: TAssembly, names: &HashMap<i64, (String, Option<i64>)>)
 }
 
 /// `TAssembly` → `AssemblyOut`（详情 / 更新 / 取消返回）。
+///
+/// 2026-09-16 PR-2 瘦身：删 `actual_delivery_date` 字段。
 fn render_assembly_out(asm: TAssembly) -> AssemblyOut {
     AssemblyOut {
         id: asm.id,
@@ -144,7 +148,6 @@ fn render_assembly_out(asm: TAssembly) -> AssemblyOut {
         customer_id: asm.customer_id,
         request_date: asm.request_date,
         planned_delivery_date: asm.planned_delivery_date,
-        actual_delivery_date: asm.actual_delivery_date,
         is_urgent: asm.is_urgent,
         status: asm.status,
         version: asm.version,
@@ -510,11 +513,14 @@ impl AssemblyService {
     /// - `applicant_name` 等普通可空字段按 `Option<String>` 语义（None=不动、Some("")=覆盖）
     ///
     /// **§3.2 级联 + §3.3 缩放**：`update_partial` 成功后，同事务内：
-    /// 1. 把父件"更新后的当前行值"覆盖级联到所有未软删子件（8 个共享信息字段；
-    ///    排除 `actual_delivery_date` + `quantity`）。
+    /// 1. 把父件"更新后的当前行值"覆盖级联到所有未软删子件（7 个共享信息字段；
+    ///    排除 `quantity`）。
     /// 2. 若 `req.quantity` 有值且 ≠ 父件现值（old_qty），对每个子件
     ///    `new_qty = max(1, round(child_qty * new_qty / old_qty))`，
     ///    `version++`。不追溯调整 `t_part_batch.quantity`。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_assembly 删 `actual_delivery_date`
+    /// 列，DTO `AssemblyUpdateRequest` 同步精简；级联子件集合保持 7 字段。
     pub async fn update_assembly(
         conn: &mut PgConnection,
         assembly_id: i64,
@@ -564,7 +570,6 @@ impl AssemblyService {
             customer_id: customer_id_i64,
             request_date: req.request_date,
             planned_delivery_date: req.planned_delivery_date,
-            actual_delivery_date: req.actual_delivery_date,
             is_urgent: req.is_urgent,
             quantity: req.quantity,
             unit_price: req.unit_price,
@@ -627,7 +632,12 @@ impl AssemblyService {
     /// 守卫拦截（当前 repo 仅按 `deleted_at IS NULL` 守卫）。
     ///
     /// 2026-09-14 Phase 3（deferred #3）：service 层 pre-check 子件是否挂送货单。
-    /// 若任一子件 `delivery_note_id IS NOT NULL` → 拒软删，返回 20307 BIZ_ASSEMBLY_HAS_SHIPMENT。
+    /// 若任一子件存在活跃批次（`t_part_batch.deleted_at IS NULL`）的
+    /// `delivery_note_id IS NOT NULL` → 拒软删，返回 20307
+    /// `BIZ_ASSEMBLY_HAS_SHIPMENT`。
+    ///
+    /// 2026-09-16 PR-2 瘦身（migration 027）：t_part.delivery_note_id 列已删，
+    /// 「子件挂送货单」改 JOIN t_part_batch 查（真相源在 t_part_batch）。
     pub async fn soft_delete_assembly(
         conn: &mut PgConnection,
         assembly_id: i64,
@@ -635,10 +645,16 @@ impl AssemblyService {
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
-        // deferred #3：装配体本身无 delivery_note_id 列，需查子件
+        // deferred #3 升级（PR-2）：子件挂送货单预检改查 t_part_batch。
         let has_shipment: Option<(i64,)> = sqlx::query_as(
-            "SELECT 1::bigint FROM t_part WHERE assembly_id = $1 \
-             AND delivery_note_id IS NOT NULL AND deleted_at IS NULL LIMIT 1",
+            "SELECT 1::bigint \
+             FROM t_part_batch pb \
+             JOIN t_part p ON p.id = pb.part_id \
+             WHERE p.assembly_id = $1 \
+               AND p.deleted_at IS NULL \
+               AND pb.deleted_at IS NULL \
+               AND pb.delivery_note_id IS NOT NULL \
+             LIMIT 1",
         )
         .bind(assembly_id)
         .fetch_optional(&mut *conn)
@@ -647,7 +663,7 @@ impl AssemblyService {
         if has_shipment.is_some() {
             return Err(AppError::biz(
                 code::BIZ_ASSEMBLY_HAS_SHIPMENT,
-                "assembly 子件已挂送货单，禁止 soft_delete",
+                "assembly 子件存在活跃批次已挂送货单，禁止 soft_delete",
             ));
         }
         let affected = AssemblyRepo::soft_delete(&mut *conn, assembly_id, expected_version, current.id)
