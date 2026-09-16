@@ -87,6 +87,14 @@ pub struct CosConfig {
     pub upload_prefix: String,
     pub presign_expire_seconds: u32,
     pub max_file_size: usize,
+    /// 2026-09-16 M2-A 新增：STS 临时凭证有效期（秒）。
+    /// 业务建议 900s，与 `presign_expire_seconds` 对齐；可通过
+    /// `COS_STS_DURATION_SECONDS` env 覆盖，缺省 900。
+    pub sts_duration_seconds: u32,
+    /// 2026-09-16 M2-A 新增：STS 凭证写入 prefix 模板前缀（默认 `tmp/`，含尾斜杠）。
+    /// 最终 tmp_prefix = `{tmp_prefix}{owner_kind}/{owner_id}/{kind}/`，用于 policy resource。
+    /// 可通过 `COS_TMP_PREFIX` env 覆盖，缺省 `tmp/`。
+    pub tmp_prefix: String,
 }
 
 /// 雪花 ID 配置（位布局对齐 myERP Python `snowflake-id` 包）：
@@ -146,6 +154,9 @@ impl AppConfig {
                     upload_prefix: env_or("COS_UPLOAD_PREFIX", "uploads"),
                     presign_expire_seconds: env_parse("COS_PRESIGN_EXPIRE", 3600)?,
                     max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
+                    // 2026-09-16 M2-A：STS 凭证有效期 + tmp_prefix
+                    sts_duration_seconds: env_parse("COS_STS_DURATION_SECONDS", 900u32)?,
+                    tmp_prefix: env_or("COS_TMP_PREFIX", "tmp/"),
                 }
             },
 

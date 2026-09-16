@@ -12,6 +12,7 @@ use crate::auth::session::SessionStore;
 use crate::infra::config::AppConfig;
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::infra::sts::StsCredentialIssuer;
 use crate::infra::ws_hub::WsHub;
 
 pub struct AppState {
@@ -20,6 +21,9 @@ pub struct AppState {
     pub snowflake: Arc<SnowflakeIdGenerator>,
     pub ws_hub: Arc<WsHub>,
     pub cos: Arc<dyn CosClient>,
+    /// 2026-09-16 M2-A 新增：STS 凭证签发器（前端直传 COS 用）。
+    /// `COS_ENABLED=true` → `TencentSts`（真实调 GetFederationToken）；否则 `NoopSts`（占位）。
+    pub sts: Arc<dyn StsCredentialIssuer>,
     pub shutdown: CancellationToken,
     /// Redis 服务端 session 真相源（access/refresh token 吊销）
     pub session: Arc<dyn SessionStore>,
@@ -33,6 +37,7 @@ impl AppState {
         snowflake: Arc<SnowflakeIdGenerator>,
         ws_hub: Arc<WsHub>,
         cos: Arc<dyn CosClient>,
+        sts: Arc<dyn StsCredentialIssuer>,
         shutdown: CancellationToken,
         session: Arc<dyn SessionStore>,
     ) -> Self {
@@ -42,6 +47,7 @@ impl AppState {
             snowflake,
             ws_hub,
             cos,
+            sts,
             shutdown,
             session,
         }

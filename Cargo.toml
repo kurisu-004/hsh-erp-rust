@@ -100,6 +100,10 @@ quick-xml = "0.37"
 # 前端 onDownloadProgress 由浏览器原生 a.download 兜住）。
 tokio-stream = "0.1"
 
+# 2026-09-16 M2-A 新增：copy_object 走 reqwest PUT + x-cos-copy-source + 手写 V1 签名
+# （SDK 0.1.2 未暴露该接口，spike 已验证签名/编码规则）。rustls-tls 避免拖入 OpenSSL。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
 [dev-dependencies]
 # 集成测试用 tower::ServiceExt::oneshot 直接驱动 Router。
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。

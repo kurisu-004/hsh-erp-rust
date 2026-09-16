@@ -44,12 +44,14 @@ use hsh_erp_rust::state::AppState;
 
 /// 测试 DB URL：与 `postgres-test` 容器（端口5429）+ `postgres_rust_test` 库配对。
 fn test_database_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test".to_string())
+    std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test".to_string()
+    })
 }
 
 #[allow(dead_code)]
-const TEST_DATABASE_URL_DEFAULT: &str = "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test";
+const TEST_DATABASE_URL_DEFAULT: &str =
+    "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test";
 
 /// Admin DB URL：用于在测试前创建 `postgres_rust_test` 库。
 fn admin_database_url() -> String {
@@ -66,8 +68,7 @@ const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
 /// 测试用 Redis URL：默认连 `redis-test` 容器（端口6380），db index 15 与 dev 默认 0 隔离。
 /// 可由 `TEST_REDIS_URL` 环境变量覆盖（跨 worktree 隔离用）。
 pub fn test_redis_url() -> String {
-    std::env::var("TEST_REDIS_URL")
-        .unwrap_or_else(|_| "redis://localhost:6380/15".to_string())
+    std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6380/15".to_string())
 }
 
 /// 第一次跑测试时建 `postgres_rust_test`（已存在则忽略）。
@@ -118,10 +119,7 @@ pub async fn test_redis_pool() -> RedisPool {
 /// 仅部分集成测试（如 auth_api）需要；其它测试不引用本函数 —— 故 `dead_code` 抑制。
 #[allow(dead_code)]
 pub async fn clean_redis(pool: &RedisPool) {
-    let mut conn = pool
-        .get()
-        .await
-        .expect("get redis conn from test pool");
+    let mut conn = pool.get().await.expect("get redis conn from test pool");
     let _: () = AsyncCommands::flushdb::<()>(&mut conn)
         .await
         .expect("flushdb test redis");
@@ -185,6 +183,7 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         },
         cos: CosConfig {
             // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
+            // 2026-09-16 M2-A：新增 sts_duration_seconds / tmp_prefix 字段（STS 占位用）。
             enabled: false,
             region: "ap-shanghai".into(),
             bucket: "test".into(),
@@ -196,6 +195,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
+            sts_duration_seconds: 900,
+            tmp_prefix: "tmp/".into(),
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
@@ -223,10 +224,13 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
+    // 2026-09-16 M2-A：测试场景 STS 用 NoopSts 占位（不连真实 GetFederationToken）。
+    let sts: Arc<dyn hsh_erp_rust::infra::sts::StsCredentialIssuer> =
+        Arc::new(hsh_erp_rust::infra::sts::NoopSts);
     let shutdown = CancellationToken::new();
     let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool));
     Arc::new(AppState::new(
-        pool, config, snowflake, ws_hub, cos, shutdown, session,
+        pool, config, snowflake, ws_hub, cos, sts, shutdown, session,
     ))
 }
 
@@ -249,6 +253,7 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         },
         cos: CosConfig {
             // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
+            // 2026-09-16 M2-A：新增 sts_duration_seconds / tmp_prefix 字段（STS 占位用）。
             enabled: false,
             region: "ap-shanghai".into(),
             bucket: "test".into(),
@@ -260,6 +265,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
+            sts_duration_seconds: 900,
+            tmp_prefix: "tmp/".into(),
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
@@ -287,12 +294,15 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
+    // 2026-09-16 M2-A：测试场景 STS 用 NoopSts 占位（不连真实 GetFederationToken）。
+    let sts: Arc<dyn hsh_erp_rust::infra::sts::StsCredentialIssuer> =
+        Arc::new(hsh_erp_rust::infra::sts::NoopSts);
     let shutdown = CancellationToken::new();
     // 注意：NoopSessionStore 不需要 Redis 池
     use hsh_erp_rust::auth::session::NoopSessionStore;
     let session: Arc<dyn SessionStore> = Arc::new(NoopSessionStore::new());
     Arc::new(AppState::new(
-        pool, config, snowflake, ws_hub, cos, shutdown, session,
+        pool, config, snowflake, ws_hub, cos, sts, shutdown, session,
     ))
 }
 
@@ -327,11 +337,7 @@ pub fn test_ws_app(state: Arc<AppState>) -> axum::Router {
 // ===========================================================================
 
 #[allow(dead_code)]
-pub async fn insert_user_with_password(
-    pool: &PgPool,
-    username: &str,
-    plain_password: &str,
-) -> i64 {
+pub async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password: &str) -> i64 {
     use hsh_erp_rust::auth::password;
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -357,11 +363,7 @@ pub async fn insert_user_with_password(
 
 /// 插一个 is_active=false 的用户（用于测试「已停用账号」拒绝登录）
 #[allow(dead_code)]
-pub async fn insert_inactive_user(
-    pool: &PgPool,
-    username: &str,
-    plain_password: &str,
-) -> i64 {
+pub async fn insert_inactive_user(pool: &PgPool, username: &str, plain_password: &str) -> i64 {
     use hsh_erp_rust::auth::password;
     use hsh_erp_rust::infra::clock::now_naive;
 

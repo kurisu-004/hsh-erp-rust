@@ -24,9 +24,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -52,7 +52,9 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
         panic!(
             "parse JSON: {e}; status={status}; content-type={:?}; raw = {}; headers={:?}",
-            headers.get("content-type").map(|v| v.to_str().unwrap_or("?")),
+            headers
+                .get("content-type")
+                .map(|v| v.to_str().unwrap_or("?")),
             String::from_utf8_lossy(&body),
             headers
         )
@@ -60,7 +62,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -147,12 +154,7 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 }
 
 /// 直插工单
-async fn insert_part(
-    pool: &PgPool,
-    name: &str,
-    customer_id: i64,
-    serial_no: Option<&str>,
-) -> i64 {
+async fn insert_part(pool: &PgPool, name: &str, customer_id: i64, serial_no: Option<&str>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
@@ -247,7 +249,13 @@ async fn insert_group_member(pool: &PgPool, group_id: i64, l2_id: i64) -> i64 {
 }
 
 /// 直插工种 + 工人
-async fn insert_worker(pool: &PgPool, badge: &str, name: &str, is_active: bool, work_type_code: &str) -> i64 {
+async fn insert_worker(
+    pool: &PgPool,
+    badge: &str,
+    name: &str,
+    is_active: bool,
+    work_type_code: &str,
+) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     // 找或插工种
@@ -309,7 +317,11 @@ async fn counter_acquires_sequential_numbers() {
     // 前缀（含日期）相同
     let prefix1: Vec<&str> = no1.split('-').collect();
     let prefix2: Vec<&str> = no2.split('-').collect();
-    assert_eq!(prefix1[0..2], prefix2[0..2], "DN-{{ymd}} prefix should match");
+    assert_eq!(
+        prefix1[0..2],
+        prefix2[0..2],
+        "DN-{{ymd}} prefix should match"
+    );
 }
 
 #[tokio::test]
@@ -428,12 +440,20 @@ async fn get_with_parts_with_assembly_fields() {
     .await;
     assert_eq!(cs, StatusCode::OK, "create: {env}");
     let note_id = env["data"]["id"].as_str().unwrap().to_string();
-    let head_no = env["data"]["delivery_note_no"].as_str().unwrap().to_string();
+    let head_no = env["data"]["delivery_note_no"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     // GET /delivery-notes/{id}
     let (gs, genv) = send(
         app.clone(),
-        json_request("GET", &format!("/delivery-notes/{note_id}"), None, Some(&token)),
+        json_request(
+            "GET",
+            &format!("/delivery-notes/{note_id}"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(gs, StatusCode::OK, "get: {genv}");
@@ -450,7 +470,12 @@ async fn get_with_parts_with_assembly_fields() {
     assert!(item["assembly_drawing_no"].is_null());
 
     // scanned_serials 应为空数组（P2 行为）
-    assert!(genv["data"]["scanned_serials"].as_array().unwrap().is_empty());
+    assert!(
+        genv["data"]["scanned_serials"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -884,7 +909,11 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
     // 现在软删 note B，再 recall 应成功
     sqlx::query!(
         "UPDATE t_part_batch SET delivery_note_id = NULL WHERE delivery_note_id = $1",
-        b_env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap()
+        b_env["data"]["id"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap()
     )
     .execute(&pool)
     .await
@@ -893,7 +922,10 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/delivery-notes/{}/soft-delete", b_env["data"]["id"].as_str().unwrap()),
+            &format!(
+                "/delivery-notes/{}/soft-delete",
+                b_env["data"]["id"].as_str().unwrap()
+            ),
             Some(json!({"version": 0})),
             Some(&token),
         ),
@@ -1007,8 +1039,12 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
         std::sync::Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1)),
         std::sync::Arc::new(hsh_erp_rust::infra::ws_hub::WsHub::default()),
         std::sync::Arc::new(hsh_erp_rust::infra::cos::NoopCos),
+        // 2026-09-16 M2-A：测试占位 STS（不上 GetFederationToken 真实网络）
+        std::sync::Arc::new(hsh_erp_rust::infra::sts::NoopSts),
         tokio_util::sync::CancellationToken::new(),
-        std::sync::Arc::new(hsh_erp_rust::auth::session::RedisSessionStore::new(redis_pool)),
+        std::sync::Arc::new(hsh_erp_rust::auth::session::RedisSessionStore::new(
+            redis_pool,
+        )),
     );
     let _ = state; // unused — pickup 测试通过 app 走
 
@@ -1221,7 +1257,11 @@ async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
         "READY_TO_SHIP 批次不得出现在候选里: {env}"
     );
     let b = &batches[0];
-    assert_eq!(b["batch_id"], insp_batch.to_string(), "雪花 id 序列化为字符串");
+    assert_eq!(
+        b["batch_id"],
+        insp_batch.to_string(),
+        "雪花 id 序列化为字符串"
+    );
     assert_eq!(b["status"], "INSPECTION");
     assert_eq!(b["quantity"], 3);
     assert_eq!(
@@ -1233,7 +1273,12 @@ async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
     // 零写入：重新读单据仍是 DRAFT，且 version 未 bump
     let (ds, denv) = send(
         app,
-        json_request("GET", &format!("/delivery-notes/{note_id}"), None, Some(&token)),
+        json_request(
+            "GET",
+            &format!("/delivery-notes/{note_id}"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(ds, StatusCode::OK, "get detail: {denv}");
@@ -1290,7 +1335,12 @@ async fn submit_with_illegal_batch_state_returns_21421() {
     // 单据未被提交
     let (_, denv) = send(
         app,
-        json_request("GET", &format!("/delivery-notes/{note_id}"), None, Some(&token)),
+        json_request(
+            "GET",
+            &format!("/delivery-notes/{note_id}"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(denv["data"]["status"], "DRAFT");
@@ -1402,7 +1452,10 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
     assert_eq!(body["code"], 20104);
 
     // 4) 201 项 → 400 BIZ_INVALID_VALUE
-    let too_many: String = (1..=201).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let too_many: String = (1..=201)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let uri = format!("/delivery-notes/batch-detail?ids={too_many}");
     let (status, body) = send(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1480,7 +1533,12 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
 
     let (gs, genv) = send(
         app.clone(),
-        json_request("GET", &format!("/delivery-notes/{note_id}"), None, Some(&token)),
+        json_request(
+            "GET",
+            &format!("/delivery-notes/{note_id}"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(gs, StatusCode::OK, "get detail: {genv}");
@@ -1489,9 +1547,21 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
     let items = genv["data"]["line_items"].as_array().unwrap();
     assert_eq!(items.len(), 1, "line_items 应包含挂上的 1 个批次");
     let item = &items[0];
-    assert_eq!(item["applicant_name"].as_str(), Some("张三"), "applicant_name 透传");
-    assert_eq!(item["order_no"].as_str(), Some("ORD-2026-09-02-0001"), "order_no 透传");
-    assert_eq!(item["request_date"].as_str(), Some("2026-09-01"), "request_date 透传");
+    assert_eq!(
+        item["applicant_name"].as_str(),
+        Some("张三"),
+        "applicant_name 透传"
+    );
+    assert_eq!(
+        item["order_no"].as_str(),
+        Some("ORD-2026-09-02-0001"),
+        "order_no 透传"
+    );
+    assert_eq!(
+        item["request_date"].as_str(),
+        Some("2026-09-01"),
+        "request_date 透传"
+    );
     assert_eq!(
         item["planned_delivery_date"].as_str(),
         Some("2026-09-15"),

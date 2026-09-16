@@ -23,6 +23,7 @@ use hsh_erp_rust::infra::cos::{CosClient, NoopCos, TencentCos};
 use hsh_erp_rust::infra::db;
 use hsh_erp_rust::infra::redis;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+use hsh_erp_rust::infra::sts::{NoopSts, StsCredentialIssuer, TencentSts};
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::modules;
 use hsh_erp_rust::state::AppState;
@@ -74,6 +75,20 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(NoopCos)
     };
 
+    // 6.4 STS 凭证签发器（前端直传 COS 用；M2-A 新增）
+    // 2026-09-16：与 cos 同样的二选一构造策略——COS_ENABLED=true 走 TencentSts（真实调
+    // GetFederationToken），否则 NoopSts（占位，本地 cargo run 调试不依赖凭据）。
+    let sts: Arc<dyn StsCredentialIssuer> = if config.cos.enabled {
+        info!("COS_ENABLED=true，启用 TencentSts（真实签发 STS 临时凭证）");
+        Arc::new(
+            TencentSts::new(&config.cos)
+                .context("初始化 TencentSts 失败（检查 COS_SECRET_ID / KEY / BUCKET / REGION）")?,
+        )
+    } else {
+        info!("COS_ENABLED=false，使用 NoopSts（占位签发器，本地调试用）");
+        Arc::new(NoopSts)
+    };
+
     // 6.5 Redis 连接池 + 服务端 session 存储
     // 关掉后使用 NoopSessionStore（不连 Redis）；适用于 Rust 借 Python JWT 的迁移过渡期
     let session: Arc<dyn SessionStore> = if config.redis.session_check_enabled {
@@ -100,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         snowflake,
         ws_hub.clone(),
         cos,
+        sts,
         shutdown.clone(),
         session,
     ));

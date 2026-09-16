@@ -17,4 +17,5 @@ pub mod db;
 pub mod redis;
 pub mod serial;
 pub mod snowflake;
+pub mod sts; // 2026-09-16 M2-A：STS 临时凭证签发（前端直传 COS）
 pub mod ws_hub;
