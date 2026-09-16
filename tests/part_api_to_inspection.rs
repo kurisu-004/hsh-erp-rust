@@ -128,17 +128,12 @@ async fn to_inspection_from_in_process_production_shelf_succeeds() {
     )
     .await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
-    // 把 part.current_holder_id 设为 prod_shelf（让 IN_PROCESS 路径通过组合校验）
+    // 2026-09-16 PR-2（migration 027）：IN_PROCESS 组合校验改读 target_batch.location +
+    // current_holder_id（PR-2 § inspection_core.rs 4 重排后）；fixture 同步改写：
+    // 设 t_part_batch.location='PRODUCTION_SHELF' + current_holder_id=prod_shelf。
     sqlx::query!(
-        "UPDATE t_part SET current_holder_id = $1 WHERE id = $2",
-        prod_shelf,
-        part_id
-    )
-    .execute(&_pool)
-    .await
-    .unwrap();
-    sqlx::query!(
-        "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
+        "UPDATE t_part_batch SET location = 'PRODUCTION_SHELF', current_holder_id = $1 \
+         WHERE id = $2",
         prod_shelf,
         batch_id
     )
@@ -185,12 +180,14 @@ async fn to_inspection_in_process_worker_rejected() {
     )
     .await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
-    // current_holder_id 指向一个不存在的 id（模拟 worker 持有）
+    // 2026-09-16 PR-2（migration 027）：工人持有改由 t_part_batch.location='WORKER'
+    // 标识（不再依赖 t_part.current_holder_id）；fixture 同步改写。
     let fake_holder: i64 = 999_999_999;
     sqlx::query!(
-        "UPDATE t_part SET current_holder_id = $1 WHERE id = $2",
+        "UPDATE t_part_batch SET location = 'WORKER', current_holder_id = $1 \
+         WHERE id = $2",
         fake_holder,
-        part_id
+        batch_id
     )
     .execute(&_pool)
     .await
@@ -238,10 +235,14 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
     )
     .await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
+    // 2026-09-16 PR-2（migration 027）：IN_PROCESS + 非 PRODUCTION_SHELF holder 拒绝
+    // 改由 t_part_batch.location 标识（PR-2 § inspection_core.rs 4 重排后）；
+    // fixture 同步改写：设 location='INSPECTION_SHELF'（非 PRODUCTION 的合法 holder）。
     sqlx::query!(
-        "UPDATE t_part SET current_holder_id = $1 WHERE id = $2",
+        "UPDATE t_part_batch SET location = 'INSPECTION_SHELF', current_holder_id = $1 \
+         WHERE id = $2",
         holder_shelf,
-        part_id
+        batch_id
     )
     .execute(&_pool)
     .await
@@ -424,10 +425,16 @@ async fn batch_to_inspection_mixed_partial_success() {
     // 第 3 件：IN_PROCESS + fake holder → 应失败 (20103)
     let p3 = insert_part_with_status(&_pool, "P3", l2, Some("P003"), None, "IN_PROCESS").await;
     let b3 = insert_batch(&_pool, p3, 1, 5, "IN_PROCESS").await;
-    sqlx::query!("UPDATE t_part SET current_holder_id = 999999999 WHERE id = $1", p3)
-        .execute(&_pool)
-        .await
-        .unwrap();
+    // 2026-09-16 PR-2（migration 027）：工人持有改由 t_part_batch.location='WORKER'
+    // 标识；fixture 同步改写为 UPDATE t_part_batch。
+    sqlx::query!(
+        "UPDATE t_part_batch SET location = 'WORKER', current_holder_id = 999999999 \
+         WHERE id = $1",
+        b3
+    )
+    .execute(&_pool)
+    .await
+    .unwrap();
     let (v1, v2, v3) = (
         batch_version(&_pool, b1).await,
         batch_version(&_pool, b2).await,

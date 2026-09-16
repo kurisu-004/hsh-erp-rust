@@ -62,15 +62,11 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
     )
     .await;
     let batch_a = insert_batch(&pool, part_a, 1, 5, "INSPECTION").await;
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `current_holder_id`；「holder 解析」
+    // 改查 t_part_batch（location + current_holder_id）。fixture 同步改写为
+    // 设 t_part_batch.location + current_holder_id。
     sqlx::query!(
-        "UPDATE t_part SET current_holder_id = $1 WHERE id = $2",
-        insp_shelf, part_a
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query!(
-        "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
+        "UPDATE t_part_batch SET location = 'INSPECTION_SHELF', current_holder_id = $1 WHERE id = $2",
         insp_shelf, batch_a
     )
     .execute(&pool)

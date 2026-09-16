@@ -56,11 +56,13 @@ async fn occupy_serial(pool: &sqlx::PgPool, prefix: &str, suffix: i64, customer_
     let serial = format!("{prefix}{suffix:04}");
     let now = now_naive();
     let today = now.date();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
+    // VALUES 占位符同步移除 `false` 字面量。
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, quantity, \
-         has_been_repaired, version, created_at, updated_at) \
-         VALUES ($1, $2, 'TEST', 'D-001', $3, 'PENDING', 'TEST', $4, $4, 1, false, 0, $5, $5)",
+         version, created_at, updated_at) \
+         VALUES ($1, $2, 'TEST', 'D-001', $3, 'PENDING', 'TEST', $4, $4, 1, 0, $5, $5)",
     )
     .bind(part_id)
     .bind(&serial)

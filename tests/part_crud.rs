@@ -192,12 +192,14 @@ async fn insert_part_with_status(
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
+    // VALUES 占位符同步移除 `false` 字面量。
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, \
-         quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, \
+         quantity, version, created_at, created_by, updated_at, updated_by, \
          assembly_id) \
-         VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, $7)",
+         VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, 0, $5, NULL, $5, NULL, $7)",
         id,
         serial_no,
         name,
@@ -219,10 +221,12 @@ async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, stat
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
+    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
+    // 列名与 VALUES 占位符同步移除 `false` 字面量。
     sqlx::query!(
-        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, has_been_repaired, \
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
          version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, $3, $4, $5, false, 0, $6, NULL, $6, NULL)",
+         VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, $6, NULL)",
         id,
         part_id,
         batch_no,
@@ -276,12 +280,14 @@ async fn list_parts_filter_status_and_customer() {
             let now = now_naive();
             let today = now.date();
             let id = snowflake.next_id();
+            // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
+            // VALUES 占位符同步移除 `false` 字面量。
             sqlx::query!(
                 "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
                  applicant_name, request_date, planned_delivery_date, \
-                 quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, \
+                 quantity, version, created_at, created_by, updated_at, updated_by, \
                  assembly_id) \
-                 VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, $7)",
+                 VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, 0, $5, NULL, $5, NULL, $7)",
                 id,
                 format!("P{i:03}"),
                 format!("P{i}"),
@@ -298,12 +304,14 @@ async fn list_parts_filter_status_and_customer() {
         let now = now_naive();
         let today = now.date();
         let id = snowflake.next_id();
+        // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
+        // VALUES 占位符同步移除 `false` 字面量。
         sqlx::query!(
             "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
              applicant_name, request_date, planned_delivery_date, \
-             quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, \
+             quantity, version, created_at, created_by, updated_at, updated_by, \
              assembly_id) \
-             VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, $7)",
+             VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, 0, $5, NULL, $5, NULL, $7)",
             id,
             "PINS",
             "PINSP",
@@ -360,12 +368,14 @@ async fn list_parts_pagination_limit_offset() {
             let id = snowflake.next_id();
             // 字段对齐 `insert_part_with_status`：name 复用为 applicant_name。
             // drawing_no 硬编码 'D-001'；$7=assembly_id=NULL；$8=status='PENDING'。
+            // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
+            // VALUES 占位符同步移除 `false` 字面量。
             sqlx::query!(
                 "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
                  applicant_name, request_date, planned_delivery_date, \
-                 quantity, has_been_repaired, version, created_at, created_by, updated_at, updated_by, \
+                 quantity, version, created_at, created_by, updated_at, updated_by, \
                  assembly_id) \
-                 VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, false, 0, $5, NULL, $5, NULL, $7)",
+                 VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, 0, $5, NULL, $5, NULL, $7)",
                 id,
                 format!("P{i:03}"),
                 format!("P{i}"),
@@ -1258,9 +1268,11 @@ async fn complete_wrong_state_400() {
 /// 允许角色：Manager / Clerk / Inspector（任一即可）。
 /// 2026-09-11 PR-B3：lifecycle 收 `batch_id` + `version`。
 ///
-/// 2026-09-11 PR-B3：start_repair 把 `has_been_repaired=true` 写 batch（同 PR-B2 已
-/// 实现）+ 单独物化 part（`mark_part_repairing_flag_only`，不被 rollup 覆盖）。
-/// `PartOut` 当前不投影该字段（响应体最小化），故断言改为 DB 直查。
+/// 2026-09-16 PR-2（migration 027）：原断言 `part.has_been_repaired=true`（物化列）
+/// 不再生效 —— `t_part` 与 `t_part_batch` 双删 `has_been_repaired`；返修事实改为
+/// 由 `t_part_event.event_type='REPAIR_STARTED'` 事件日志追溯（见
+/// `src/modules/part/service/lifecycle.rs` start_repair 第 5 步注释）。本用例断言
+/// 改为 t_part_event 是否写入 REPAIR_STARTED 事件。
 #[tokio::test]
 async fn start_repair_in_process_200() {
     let (_guard, pool) = setup().await;
@@ -1288,15 +1300,20 @@ async fn start_repair_in_process_200() {
     assert_eq!(s, StatusCode::OK, "start-repair 200: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(env["data"]["status"], "REPAIRING");
-    // start_repair 写 batch.has_been_repaired + 单独物化 part.has_been_repaired
-    // （`mark_part_repairing_flag_only`，不在 rollup 范围内 —— 见
-    // `src/modules/part/service/lifecycle.rs` start_repair 第 5 步注释）
-    let part_hbr: bool = sqlx::query_scalar("SELECT has_been_repaired FROM t_part WHERE id = $1")
-        .bind(pid)
-        .fetch_one(&pool)
-        .await
-        .expect("read part.has_been_repaired");
-    assert!(part_hbr, "start-repair 应置 part.has_been_repaired=true");
+    // 2026-09-16 PR-2：返修事实改由 t_part_event 事件日志追溯；断言 REPAIR_STARTED
+    // 事件已写入（status=REPAIRING 翻状态的同时 service 层在同事务插事件）。
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_part_event \
+         WHERE part_id = $1 AND event_type = 'REPAIR_STARTED'",
+    )
+    .bind(pid)
+    .fetch_one(&pool)
+    .await
+    .expect("count REPAIR_STARTED events");
+    assert!(
+        event_count >= 1,
+        "start-repair 应写 1 条 REPAIR_STARTED 事件日志到 t_part_event"
+    );
 }
 
 /// POST /parts/{id}/start-repair —— batch PENDING → 20118 BIZ_PART_REPAIR_NOT_TRIGGERED。
@@ -1504,19 +1521,27 @@ async fn deliver_without_source_batch_409() {
 /// POST /parts/{id}/cancel —— part 已挂送货单 → 21420 BIZ_DELIVERY_NOTE_LOCKED_PART (HTTP 409)。
 ///
 /// Fix Batch 2 Finding D 回归测试：cancel 流增加 delivery_note_id 守卫。
-/// service 内通过 `PartRepo::get_part_detail` 取完整 TPart（含 delivery_note_id），
-/// 锁定时返回 21420。
+///
+/// 2026-09-16 PR-2（migration 027）：`t_part.delivery_note_id` 列已删；21420 守卫
+/// 改查 `t_part_batch.delivery_note_id`（PR-2 § part/service/crud.rs:502 预检 +
+/// lifecycle.rs:185 cancel 守卫；service `has_active_batch_on_delivery_note`）。
+/// fixture 同步改写：先插 1 个 PENDING 批次，再 UPDATE 它的 delivery_note_id。
 #[tokio::test]
 async fn cancel_delivery_note_locked_409() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
+    // 2026-09-16 PR-2：插 1 个 PENDING 批次（PR-2 § has_active_batch_on_delivery_note
+    // 真相源在 t_part_batch.delivery_note_id，part 自身无 batch → 0 行命中 → 守卫放行）。
+    let _bid = insert_batch(&pool, pid, 1, 1, "PENDING").await;
 
-    // 直接 SQL 模拟「part 已挂送货单」：随便写一个 delivery_note_id。
-    // 21420 不要求送货单实际存在 —— service 层只看 part.delivery_note_id 是否非 NULL。
+    // 直接 SQL 模拟「part 已挂送货单」：在活跃批次上随便写一个 delivery_note_id。
+    // 21420 不要求送货单实际存在 —— service 层只看 part 是否有活跃批次
+    // delivery_note_id 非空。
     sqlx::query!(
-        "UPDATE t_part SET delivery_note_id = 88888888 WHERE id = $1",
+        "UPDATE t_part_batch SET delivery_note_id = 88888888 \
+         WHERE part_id = $1 AND deleted_at IS NULL",
         pid
     )
     .execute(&pool)

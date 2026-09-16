@@ -1043,7 +1043,11 @@ async fn update_assembly_cascades_shared_fields_to_children() {
     assert_eq!(updated.applicant_name.as_deref(), Some("新申请人"));
     assert_eq!(updated.customer_id, l2_b);
 
-    // 3) 验证 t_part 子件 8 个共享字段被覆盖；quantity 不动；actual_delivery_date 不动
+// 3) 验证 t_part 子件 8 个共享字段被覆盖；quantity 不动；actual_delivery_date 不动
+    //
+    // 2026-09-16 PR-2（migration 027）：`t_part.actual_delivery_date` 列已删；级联覆盖
+    // 断言集合收窄为 9 列（删 `actual_delivery_date`）。该列的「不动」语义由
+    // t_part_event.DELIVERED 事件派生，与级联更新无关（PR-2 § assembly/service.rs:594 注释）。
     #[allow(clippy::type_complexity)]
     type CascadeRow = (
         String,                                // applicant_name
@@ -1055,12 +1059,11 @@ async fn update_assembly_cascades_shared_fields_to_children() {
         Option<String>,                        // note
         i64,                                   // customer_id
         i32,                                   // quantity（不动）
-        Option<chrono::NaiveDate>,             // actual_delivery_date（不动）
     );
     let rows: Vec<CascadeRow> = sqlx::query_as(
         "SELECT applicant_name, request_date, order_no, system_delivery_date, \
                 planned_delivery_date, is_urgent, note, customer_id, \
-                quantity, actual_delivery_date \
+                quantity \
          FROM t_part WHERE assembly_id = $1 ORDER BY serial_no ASC NULLS LAST",
     )
     .bind(asm_id)
@@ -1078,7 +1081,6 @@ async fn update_assembly_cascades_shared_fields_to_children() {
         assert_eq!(r.6.as_deref(), Some("更新后备注"), "note 级联覆盖");
         assert_eq!(r.7, l2_b, "customer_id 变更也级联");
         assert!(r.8 >= 3, "quantity 不应被级联改写（child1=3 或 child2=5）");
-        assert!(r.9.is_none(), "actual_delivery_date 不应被级联改写（流程产物）");
     }
 }
 
@@ -1327,6 +1329,9 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None, name: None, applicant_name: None,
         customer_id: None, request_date: None, planned_delivery_date: None,
+        // 2026-09-16 PR-2（migration 027）：AssemblyUpdateRequest.is_urgent 改为必填
+        // （serde default 不影响 Rust 字面量初始化）。本测试场景不动 is_urgent，传 None。
+        is_urgent: None,
         quantity: Some(5),
         unit_price: None, total_price: None,
         order_no: None, system_delivery_date: None, note: None,
@@ -1359,6 +1364,8 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None, name: None, applicant_name: None,
         customer_id: None, request_date: None, planned_delivery_date: None,
+        // 2026-09-16 PR-2（migration 027）：AssemblyUpdateRequest.is_urgent 必填。
+        is_urgent: None,
         quantity: Some(3),
         unit_price: None, total_price: None,
         order_no: None, system_delivery_date: None, note: None,
@@ -1391,6 +1398,8 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
     let upd_req = AssemblyUpdateRequest {
         drawing_no: None, name: None, applicant_name: None,
         customer_id: None, request_date: None, planned_delivery_date: None,
+        // 2026-09-16 PR-2（migration 027）：AssemblyUpdateRequest.is_urgent 必填。
+        is_urgent: None,
         quantity: Some(1),
         unit_price: None, total_price: None,
         order_no: None, system_delivery_date: None, note: None,

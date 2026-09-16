@@ -191,18 +191,21 @@ async fn insert_pool_part(
     let now = now_naive();
     let today = now.date();
     let part_id = pool_snowflake().next_id();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `location` / `current_holder_id` /
+    // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）。
+    // INSERT 列名与 VALUES 占位符同步移除：'PRODUCTION_SHELF'、$5（shelf_id）、
+    // $3（now 用作 placed_at）。剩余字段顺序对齐列名清单。
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
-         request_date, planned_delivery_date, system_delivery_date, status, location, \
-         is_urgent, current_holder_id, placed_at, next_process_id, customer_id, \
+         request_date, planned_delivery_date, system_delivery_date, status, \
+         is_urgent, next_process_id, customer_id, \
          quantity, version, created_at, updated_at) \
          VALUES ($1, $2, 'pool-item', 'D-POOL', $2, $4, $4, $4, 'IN_PROCESS', \
-         'PRODUCTION_SHELF', false, $5, $3, $6, $7, $8, 0, $3, $3)",
+         false, $5, $6, $7, 0, $3, $3)",
         part_id,
         serial_no,
         now,
         today,
-        shelf_id,
         process_id,
         customer_id,
         quantity,
@@ -211,11 +214,14 @@ async fn insert_pool_part(
     .await
     .expect("insert t_part");
     let batch_id = pool_snowflake().next_id();
+    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
+    // 列名与 VALUES 占位符同步移除 `false` 字面量。`location` / `current_holder_id`
+    // / `next_process_id` / `placed_at` 仍存在 t_part_batch（真相源），保留。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, next_process_id, placed_at, has_been_repaired, version, \
+         current_holder_id, next_process_id, placed_at, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, false, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, 0, $6, $6)",
         batch_id,
         part_id,
         quantity,

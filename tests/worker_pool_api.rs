@@ -235,18 +235,21 @@ async fn insert_pool_part(
     let now = now_naive();
     let today = now.date();
     let part_id = pool_snowflake().next_id();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `location` / `current_holder_id` /
+    // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）；
+    // INSERT 列名与 VALUES 占位符同步移除：'PRODUCTION_SHELF' / $5（shelf_id）/
+    // $3（now 用作 placed_at）。
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
-         request_date, planned_delivery_date, system_delivery_date, status, location, \
-         is_urgent, current_holder_id, placed_at, next_process_id, customer_id, \
+         request_date, planned_delivery_date, system_delivery_date, status, \
+         is_urgent, next_process_id, customer_id, \
          quantity, version, created_at, updated_at) \
          VALUES ($1, $2, 'pool-item', 'D-POOL', $2, $4, $4, $4, 'IN_PROCESS', \
-         'PRODUCTION_SHELF', false, $5, $3, $6, $7, $8, 0, $3, $3)",
+         false, $5, $6, $7, 0, $3, $3)",
         part_id,
         serial_no,
         now,
         today,
-        shelf_id,
         process_id,
         customer_id,
         quantity,
@@ -255,11 +258,14 @@ async fn insert_pool_part(
     .await
     .expect("insert t_part");
     let batch_id = pool_snowflake().next_id();
+    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
+    // 列名与 VALUES 占位符同步移除 `false` 字面量。`location` / `current_holder_id`
+    // / `next_process_id` / `placed_at` 仍存在 t_part_batch（真相源），保留。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, next_process_id, placed_at, has_been_repaired, version, \
+         current_holder_id, next_process_id, placed_at, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, false, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, 0, $6, $6)",
         batch_id,
         part_id,
         quantity,
@@ -294,18 +300,19 @@ async fn insert_worker_held_part(
     let now = now_naive();
     let today = now.date();
     let part_id = snowflake.next_id();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `location` / `current_holder_id` /
+    // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）。
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
-         request_date, planned_delivery_date, system_delivery_date, status, location, \
-         is_urgent, current_holder_id, placed_at, next_process_id, customer_id, \
+         request_date, planned_delivery_date, system_delivery_date, status, \
+         is_urgent, next_process_id, customer_id, \
          quantity, version, created_at, updated_at) \
          VALUES ($1, $2, 'held-item', 'D-HELD', $2, $4, $4, $4, 'IN_PROCESS', \
-         'WORKER', false, $5, $3, $6, $7, $8, 0, $3, $3)",
+         false, $5, $6, $7, 0, $3, $3)",
         part_id,
         serial_no,
         now,
         today,
-        worker_id,
         next_process_id,
         customer_id,
         quantity,
@@ -314,11 +321,13 @@ async fn insert_worker_held_part(
     .await
     .expect("insert held t_part");
     let batch_id = pool_snowflake().next_id();
+    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
+    // 列名与 VALUES 占位符同步移除 `false` 字面量。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, next_process_id, placed_at, has_been_repaired, version, \
+         current_holder_id, next_process_id, placed_at, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'WORKER', $4, $5, $6, false, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'WORKER', $4, $5, $6, 0, $6, $6)",
         batch_id,
         part_id,
         quantity,
@@ -652,7 +661,7 @@ async fn take_updates_t_part_holder() {
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC009", "工9", Some(wt)).await;
-    let (pool_part, _pool_batch) =
+    let (_pool_part, pool_batch) =
         insert_pool_part(&pool, customer, "P-009", prod_shelf, proc, 1).await;
 
     let (app, token, _pool) = login_manager(pool.clone(), "admin9").await;
@@ -670,24 +679,24 @@ async fn take_updates_t_part_holder() {
     )
     .await;
 
-    // t_part.current_holder_id 应被改为 worker_id
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `current_holder_id` / `location`；
+    // 「take 更新 holder」改由 t_part_batch 承担，断言目标同步改写为 t_part_batch。
     let holder: Option<i64> = sqlx::query_scalar!(
-        "SELECT current_holder_id FROM t_part WHERE id = $1",
-        pool_part,
+        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
+        pool_batch,
     )
     .fetch_one(&pool)
     .await
     .expect("query holder");
-    assert_eq!(holder, Some(worker), "t_part holder 应被更新为 worker.id");
-    // t_part.location 应改为 WORKER
+    assert_eq!(holder, Some(worker), "t_part_batch holder 应被更新为 worker.id");
     let loc: String = sqlx::query_scalar!(
-        "SELECT location AS \"loc!\" FROM t_part WHERE id = $1",
-        pool_part,
+        "SELECT location AS \"loc!\" FROM t_part_batch WHERE id = $1",
+        pool_batch,
     )
     .fetch_one(&pool)
     .await
     .expect("query location");
-    assert_eq!(loc, "WORKER", "t_part.location 应=WORKER");
+    assert_eq!(loc, "WORKER", "t_part_batch.location 应=WORKER");
 }
 
 /// 场景 10: take 不更新 placed_at
@@ -702,13 +711,13 @@ async fn take_does_not_update_placed_at() {
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC010", "工10", Some(wt)).await;
-    let (pool_part, _pool_batch) =
+    let (_pool_part, pool_batch) =
         insert_pool_part(&pool, customer, "P-010", prod_shelf, proc, 1).await;
 
-    // 记录 take 前的 placed_at
+    // 记录 take 前的 placed_at（2026-09-16 PR-2：t_part_batch 真相源）
     let placed_before: Option<chrono::NaiveDateTime> = sqlx::query_scalar!(
-        "SELECT placed_at FROM t_part WHERE id = $1",
-        pool_part,
+        "SELECT placed_at FROM t_part_batch WHERE id = $1",
+        pool_batch,
     )
     .fetch_one(&pool)
     .await
@@ -730,10 +739,10 @@ async fn take_does_not_update_placed_at() {
     )
     .await;
 
-    // placed_at 应保持不变
+    // placed_at 应保持不变（t_part_batch 真相源）
     let placed_after: Option<chrono::NaiveDateTime> = sqlx::query_scalar!(
-        "SELECT placed_at FROM t_part WHERE id = $1",
-        pool_part,
+        "SELECT placed_at FROM t_part_batch WHERE id = $1",
+        pool_batch,
     )
     .fetch_one(&pool)
     .await
