@@ -61,6 +61,16 @@ pub struct PartUpdate<'a> {
 ///
 /// 排序字段用字符串映射到白名单列名（防 SQL 注入），方向仅接受 `ASC` / `DESC`。
 /// `status` 与 `statuses` 互不冲突：service 层按业务场景二选一传入。
+///
+/// 2026-09-17 PR-4 守卫修复：新增 `locations` / `holder_ids` 两过滤项。
+///
+/// - `locations`：字符串白名单（OFFICE / PRODUCTION_SHELF / WORKER /
+///   INSPECTION_SHELF / OUTSOURCE_COMPANY），查 `t_part_batch.location`。
+/// - `holder_ids`：雪花 ID 列表，多态查 `t_part_batch.current_holder_id`（命中
+///   t_shelf / t_worker / t_outsource_company 任一即算）。
+///
+/// 两者均通过 EXISTS 子查询挂到 `t_part`（PR-2 已删 location / current_holder_id
+/// 列），按 part 下任一 active batch 命中即返。空切片 → 不过滤（与旧行为一致）。
 #[derive(Debug, Default, Clone)]
 pub struct PartListFilters<'a> {
     pub customer_ids: &'a [i64],
@@ -68,6 +78,8 @@ pub struct PartListFilters<'a> {
     pub statuses: &'a [String],
     pub is_urgent: Option<bool>,
     pub keyword: Option<&'a str>,
+    pub locations: &'a [String],
+    pub holder_ids: &'a [i64],
     pub sort_by: &'a str,
     pub sort_dir: &'a str,
     pub limit: i64,
@@ -346,6 +358,9 @@ impl PartRepo {
     /// 排序字段白名单（防 SQL 注入）：CREATED_AT / UPDATED_AT /
     /// PLANNED_DELIVERY_DATE / REQUEST_DATE / SERIAL_NO / DRAWING_NO / NAME，
     /// 其它值退化为 `id`。方向仅接受 `ASC`，其它视为 `DESC`。
+    ///
+    /// 2026-09-17 PR-4 守卫修复：`locations` / `holder_ids` 走 EXISTS 子查询
+    /// 关联 `t_part_batch`（PR-2 已删 t_part.location / current_holder_id）。
     pub async fn list_with_filters<'e, E: PgExecutor<'e>>(
         executor: E,
         f: &PartListFilters<'_>,
@@ -393,6 +408,21 @@ impl PartRepo {
               .push(" OR serial_no ILIKE ").push_bind(pat)
               .push(")");
         }
+        // 2026-09-17 PR-4 守卫修复：locations 查 t_part_batch.location（多值走 ANY）
+        if !f.locations.is_empty() {
+            qb.push(" AND EXISTS (SELECT 1 FROM t_part_batch pb \
+                     WHERE pb.part_id = t_part.id \
+                       AND pb.location = ANY(").push_bind(f.locations.to_vec()).push(") \
+                       AND pb.deleted_at IS NULL)");
+        }
+        // 2026-09-17 PR-4 守卫修复：holder_ids 查 t_part_batch.current_holder_id（多值走 ANY；
+        // 多态 holder：t_shelf / t_worker / t_outsource_company 任一匹配即命中同一雪花 id）
+        if !f.holder_ids.is_empty() {
+            qb.push(" AND EXISTS (SELECT 1 FROM t_part_batch pb \
+                     WHERE pb.part_id = t_part.id \
+                       AND pb.current_holder_id = ANY(").push_bind(f.holder_ids.to_vec()).push(") \
+                       AND pb.deleted_at IS NULL)");
+        }
         qb.push(format!(" ORDER BY {order_col} {order_dir} NULLS LAST, id DESC"));
         qb.push(" LIMIT ").push_bind(f.limit);
         qb.push(" OFFSET ").push_bind(f.offset);
@@ -400,6 +430,8 @@ impl PartRepo {
     }
 
     /// 计数（与 `list_with_filters` 同一套筛选条件，不含排序与分页）。
+    ///
+    /// 2026-09-17 PR-4 守卫修复：同步加 `locations` / `holder_ids` 过滤。
     pub async fn count_with_filters<'e, E: PgExecutor<'e>>(
         executor: E,
         f: &PartListFilters<'_>,
@@ -427,6 +459,18 @@ impl PartRepo {
               .push(" OR drawing_no ILIKE ").push_bind(pat.clone())
               .push(" OR serial_no ILIKE ").push_bind(pat)
               .push(")");
+        }
+        if !f.locations.is_empty() {
+            qb.push(" AND EXISTS (SELECT 1 FROM t_part_batch pb \
+                     WHERE pb.part_id = t_part.id \
+                       AND pb.location = ANY(").push_bind(f.locations.to_vec()).push(") \
+                       AND pb.deleted_at IS NULL)");
+        }
+        if !f.holder_ids.is_empty() {
+            qb.push(" AND EXISTS (SELECT 1 FROM t_part_batch pb \
+                     WHERE pb.part_id = t_part.id \
+                       AND pb.current_holder_id = ANY(").push_bind(f.holder_ids.to_vec()).push(") \
+                       AND pb.deleted_at IS NULL)");
         }
         let row: (i64,) = qb.build_query_as().fetch_one(executor).await?;
         Ok(row.0)

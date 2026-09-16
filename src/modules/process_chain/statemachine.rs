@@ -6,6 +6,13 @@
 //! ## 约定
 //! - 全部为 `pub fn` + 单元测试覆盖（conventions.md §4.1：纯函数必须 100% 行覆盖）
 //! - 不引入 IO/全局可变状态依赖
+//!
+//! ## ⚠️ 2026-09-17 PR-4 卫生项 B5
+//! - `gap_for_mid_insert` / `reorder_with_step_size` 当前无业务调用方（PR-1
+//!   upsert_chain 走「先删旧 steps + 整组 bulk_insert」模式，不触发"中间
+//!   插入"路径）；保留为将来 sort 精度耗尽时「批量重排」入口。
+//! - 单元测试仍 100% 行覆盖（conventions.md §4.1 强制）；不删 fn 也不加
+//!   `#[allow(dead_code)]` 抑制，让 rustc 持续提示直到实际接入。
 
 /// 检测相邻步骤 sort_order 间隙是否还够"中间插入"。
 ///
@@ -19,6 +26,7 @@
 /// - 相邻差值 = 2（10/12）⇒ `(10+12)/2 = 11` ⇒ `Ok(11)`
 /// - 相邻差值 = 1（10/11）⇒ `(10+11)/2 = 10` ⇒ `NoGap`（精度耗尽）
 /// - 相邻差值 > 1 但奇偶冲突（10/13）⇒ `(10+13)/2 = 11` ⇒ `Ok(11)`
+#[allow(dead_code)] // ⚠️ 2026-09-17 PR-4 B5：当前无业务调用方，保留作 sort 精度耗尽场景入口
 pub fn gap_for_mid_insert(prev: i32, next: i32) -> Option<i32> {
     if prev < 0 || next < 0 {
         return None;
@@ -48,6 +56,7 @@ pub fn gap_for_mid_insert(prev: i32, next: i32) -> Option<i32> {
 /// - 1 项 → [10]
 /// - 3 项 → [10, 20, 30]
 /// - step_size=5 → [10, 15, 20]
+#[allow(dead_code)] // ⚠️ 2026-09-17 PR-4 B5：当前无业务调用方，保留作 sort 精度耗尽场景入口
 pub fn reorder_with_step_size(sort_orders: &[i32], step_size: i32) -> Vec<i32> {
     if step_size <= 0 {
         // 防御：step_size 非正 → 退化到 10

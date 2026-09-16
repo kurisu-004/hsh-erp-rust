@@ -12,6 +12,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **权威文档是 `docs/architecture.md`**——含完整技术栈选型理由、目录结构、Python→Rust 模块映射表、实施路线图。做任何架构决策前先读它；本文件只提炼不动脑就需要遵守的硬约定。
 
+> 📌 **2026-09-17 PR-1/2/3/4 串联重大重构已完成**：
+> - **PR-1**（migration 026）工艺链 FK 翻转：`t_part.process_chain_id` 承载 1:1 归属
+> - **PR-2**（migration 027）t_part 瘦身 + t_assembly 删 `actual_delivery_date`：6 列从 t_part 迁至 t_part_batch 真相源；「位置 / 持有人 / 实际交付日期 / 返修事实」4 类派生走 service 层 + event-driven
+> - **PR-3**（migration 028）批次 step 化：`t_part_batch.next_process_id` → `current_process_step_id`（逻辑 FK → t_process_chain_step.id）
+> - **PR-4**（migration 029）卫生项：3 索引补齐 + 孤儿 `t_assembly_id_seq` 清理 + split_batch 合并 + assembly model/DDL 对齐 + locations/holder_ids 过滤 + chain step 引用计数
+>
+> 详见 [`docs/audit-5-tables-2026-09-16.md`](docs/audit-5-tables-2026-09-16.md) §附录 + [`docs/architecture.md` §7.5](docs/architecture.md)。**改 part / assembly / process_chain / part_batch 域前先读 PR-1/2/3/4 的契约变更，避免回退到已废弃字段（如 `t_part.location` / `t_part_batch.next_process_id` 列）。**
+
 ## 常用命令
 
 ```bash

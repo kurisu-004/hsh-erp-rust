@@ -272,14 +272,21 @@ impl ProcessRepo {
     }
 
     /// 软删前查引用：跨 `t_work_type_process` + `t_outsource_company_process` +
-    /// `t_shelf_process` + `t_part.next_process_id` 4 张表的引用计数总和。
+    /// `t_shelf_process` + `t_part.next_process_id` + `t_process_chain_step` 5 张表
+    /// 的引用计数总和。
+    ///
+    /// 2026-09-17 PR-4 守卫修复：补 `t_process_chain_step.process_id`（PR-1 工艺链
+    /// FK 翻转 + PR-3 批次 step 化后，part → chain → step 是新的工艺引用通道；
+    /// 之前缺这条会漏掉「工艺链 step 仍引用此 process」场景，软删后 step 的
+    /// process_id 指向已软删 process 会撞 23503）。`t_part.next_process_id`
+    /// 保留作为 rollup 派生缓存（migration 027 不动），继续纳入计数。
     ///
     /// **best-effort**：mapping 表（work_type_process / outsource_company_process /
-    /// shelf_process）目前 Rust 端没有专门的 repo 暴露，本查询用单条 `UNION ALL` 一次往返；
-    /// 若对应表当前不存在（理论上不应发生，迁移 003/004/005 已建），本函数会被 PostgreSQL
-    /// 拒绝，service 层把 sqlx 错误转 `BIZ_PROCESS_IN_USE`（保守：宁可误拒也不放过真引用）。
-    /// 当前阶段（Phase P2）所有 4 张表均已迁移到位，best-effort 注释仅留给后续 junction
-    /// repo 拆分时回看。
+    /// shelf_process / process_chain_step）目前 Rust 端没有专门的 repo 暴露，
+    /// 本查询用单条 sub-select 加法一次往返；若对应表当前不存在（理论上不应发生，
+    /// 迁移 003/004/005/017 已建），本函数会被 PostgreSQL 拒绝，service 层把 sqlx
+    /// 错误转 `BIZ_PROCESS_IN_USE`（保守：宁可误拒也不放过真引用）。当前阶段所有
+    /// 5 张表均已迁移到位，best-effort 注释仅留给后续 junction repo 拆分时回看。
     pub async fn count_process_references<'e, E: PgExecutor<'e>>(
         executor: E,
         process_id: i64,
@@ -299,6 +306,9 @@ impl ProcessRepo {
                     +
                     (SELECT COUNT(*) FROM t_part
                      WHERE next_process_id = $1 AND deleted_at IS NULL)
+                    +
+                    (SELECT COUNT(*) FROM t_process_chain_step
+                     WHERE process_id = $1 AND deleted_at IS NULL)
                 )::bigint AS total
             "#,
         )

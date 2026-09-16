@@ -446,21 +446,125 @@ impl PartBatchRepo {
         Ok(res.rows_affected())
     }
 
-    /// 拆分批次：在 `qty` < `batch.quantity` 时调用，构造一条新批次（继承
+    /// 拆分批次（PR-4 卫生项 B2）：`_split_batch_inner` 是公共实现，
+    /// `split_batch`（手动部分量）+ `PartRepo::split_batch_for_partial_pass`
+    /// （to_ship/to_process/to_inspection 部分通过）都委托到这里。
+    ///
+    /// 行为：
+    /// 1. 同 part_id 下 max(batch_no) + 1（与 uq_t_part_batch_part_no 对齐）
+    /// 2. `INSERT ... SELECT FROM t_part_batch WHERE id = source_id`：
+    ///    - 继承源 location / current_holder_id / current_process_step_id
+    ///    - **不**继承 delivery_note_id（拆出批次独立流转）
+    ///    - 写 parent_batch_id = source_batch_id
+    ///    - quantity = caller 传入的 qty
+    ///    - status = caller 传入的新批次 status（通常等于源 status）
+    /// 3. 源批次 quantity -= qty（OCC + 数量守卫；0 行 → conflict）
+    ///
+    /// 返回新批次雪花 id（caller 拿到后做后续 attach_to_note 等操作）。
+    ///
+    /// 注：本函数需在同一事务内连发三条 SQL（max + insert + update），而
+    /// `impl PgExecutor<'_>` 不能 move 多次，因此显式收 `&mut PgConnection`。
+    ///
+    /// 2026-09-17 PR-4 卫生项 B2 合并：把 `split_batch`（part_batch/repo.rs）
+    /// 与 `split_batch_for_partial_pass`（part/repo/batch.rs）80% 重叠的逻辑
+    /// 抽到这里；两个公开 fn 改为薄包装。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：删 `next_process_id` /
+    /// `placed_at` 列写入；`current_process_step_id` 走 SELECT 继承源批次。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn _split_batch_inner(
+        conn: &mut sqlx::PgConnection,
+        new_batch_id: i64,
+        source_batch_id: i64,
+        source_version: i32,
+        part_id: i64,
+        qty: i32,
+        new_batch_status: &str,
+        user_id: i64,
+    ) -> Result<i64, sqlx::Error> {
+        // 1. 新 batch_no：同 part_id 下 max + 1（与 uq_t_part_batch_part_no 对齐）。
+        let next_batch_no: i32 = sqlx::query_scalar!(
+            r#"
+            SELECT COALESCE(MAX(batch_no), 0) + 1 AS "next!"
+            FROM t_part_batch
+            WHERE part_id = $1 AND deleted_at IS NULL
+            "#,
+            part_id,
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+
+        // 2. INSERT 新批次（继承源 location / current_holder_id /
+        //    current_process_step_id；quantity = qty；status = new_batch_status；
+        //    不继承 delivery_note_id；写 parent_batch_id）。
+        sqlx::query!(
+            r#"
+            INSERT INTO t_part_batch (
+                id, part_id, batch_no, quantity, status, location,
+                current_holder_id, current_process_step_id,
+                delivery_note_id, parent_batch_id,
+                version, created_at, created_by, updated_at, updated_by
+            )
+            SELECT $1, part_id, $2, $3, $4, location,
+                   current_holder_id, current_process_step_id,
+                   NULL, $5,
+                   0, now(), $6, now(), $6
+            FROM t_part_batch
+            WHERE id = $7 AND deleted_at IS NULL
+            "#,
+            new_batch_id,
+            next_batch_no,
+            qty,
+            new_batch_status,
+            source_batch_id,
+            user_id,
+            source_batch_id,
+        )
+        .execute(&mut *conn)
+        .await?;
+
+        // 3. 源批次 quantity -= qty（OCC + 数量守卫；0 行 → conflict）。
+        let res = sqlx::query!(
+            r#"
+            UPDATE t_part_batch
+            SET quantity    = quantity - $3,
+                version     = version + 1,
+                updated_at  = now(),
+                updated_by  = $4
+            WHERE id = $1 AND version = $2 AND deleted_at IS NULL
+              AND quantity > $3
+            "#,
+            source_batch_id,
+            source_version,
+            qty,
+            user_id,
+        )
+        .execute(&mut *conn)
+        .await?;
+        if res.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
+        Ok(new_batch_id)
+    }
+
+    /// 拆分批次（手动部分量）：`POST /parts/{id}/batches/split` 入口。
+    ///
+    /// 在 `qty` < `source_batch.quantity` 时调用，构造一条新批次（继承
     /// 状态/位置/holder/current_process_step；**不继承** delivery_note_id 与
-    /// parent_batch_id），并把源批次 quantity 减 `qty`。整组写在一个 tx 内。
+    /// parent_batch_id——这里 parent_batch_id = source_batch_id 写入以保留
+    /// 拆分谱系），并把源批次 quantity 减 `qty`。整组写在一个 tx 内。
     ///
     /// 返回新批次雪花 id（caller 拿到后做后续 attach_to_note）。`batch_no` 用
     /// 「当前 part_id 下 max(batch_no) + 1」生成。
     ///
     /// 镜像 Python `service/_batch_ops::split_batch`。
     ///
-    /// 注：本函数需在同一事务内连发三条 SQL（max + insert + update），而
-    /// `impl PgExecutor<'_>` 不能 move 多次，因此显式收 `&mut PgConnection`。
-    ///
     /// 2026-09-16 PR-3 批次 step 化（migration 028）：
     /// - `next_process_id` / `placed_at` 参数删除（t_part_batch 列已删）
-    /// - 改传 `current_process_step_id`（t_part_batch 新列）
+    /// - `current_process_step_id` 由内部 `_split_batch_inner` 走 SELECT 继承源
+    ///
+    /// 2026-09-17 PR-4 卫生项 B2：薄包装委托到 `_split_batch_inner`。
     #[allow(clippy::too_many_arguments)]
     pub async fn split_batch(
         conn: &mut sqlx::PgConnection,
@@ -477,71 +581,24 @@ impl PartBatchRepo {
         created_by: Option<i64>,
         updated_by: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
-        // 1. 新 batch_no：同 part_id 下 max + 1（与 uq_t_part_batch_part_no 对齐）。
-        let next_batch_no: i32 = sqlx::query_scalar!(
-            r#"
-            SELECT COALESCE(MAX(batch_no), 0) + 1 AS "next!"
-            FROM t_part_batch
-            WHERE part_id = $1 AND deleted_at IS NULL
-            "#,
-            part_id,
-        )
-        .fetch_one(&mut *conn)
-        .await?;
-
-        // 2. 插入新批次（quantity = qty，不继承 delivery_note_id，写 parent_batch_id）。
-        //    2026-09-16 PR-3 批次 step 化：current_process_step_id 直接继承源批次。
-        sqlx::query!(
-            r#"
-            INSERT INTO t_part_batch
-                (id, part_id, batch_no, quantity, status, location,
-                 current_holder_id, current_process_step_id,
-                 delivery_note_id, parent_batch_id,
-                 version, created_at, created_by, updated_at, updated_by)
-            VALUES ($1, $2, $3, $4, $5, $6,
-                    $7, $8,
-                    NULL, $9,
-                    0, $10, $11, $10, $12)
-            "#,
+        // location / current_holder_id / current_process_step_id 参数保留以
+        // 兼容 `PartService::split_batch` 调用方（caller 已知源当前值，传冗余
+        // 但不影响最终 INSERT——`_split_batch_inner` 走 SELECT 重新读源行做真相
+        // 源）。when / created_by / updated_by 也保留以兼容 service 拼装
+        // 现有调用形态；内部 helper 改用 now() + caller 的 user_id。
+        let _ = (location, current_holder_id, current_process_step_id, when, created_by);
+        let user_id = updated_by.unwrap_or(0);
+        Self::_split_batch_inner(
+            conn,
             new_batch_id,
-            part_id,
-            next_batch_no,
-            qty,
-            status,
-            location,
-            current_holder_id,
-            current_process_step_id,
-            source_batch_id,
-            when,
-            created_by,
-            updated_by,
-        )
-        .execute(&mut *conn)
-        .await?;
-
-        // 3. 源批次 quantity -= qty（带 version 校验；0 行 → conflict）。
-        let res = sqlx::query!(
-            r#"
-            UPDATE t_part_batch
-            SET quantity    = quantity - $3,
-                version     = version + 1,
-                updated_at  = $4,
-                updated_by  = $5
-            WHERE id = $1 AND version = $2 AND deleted_at IS NULL
-            "#,
             source_batch_id,
             source_version,
+            part_id,
             qty,
-            when,
-            updated_by,
+            status,
+            user_id,
         )
-        .execute(&mut *conn)
-        .await?;
-        if res.rows_affected() == 0 {
-            return Err(sqlx::Error::RowNotFound);
-        }
-
-        Ok(new_batch_id)
+        .await
     }
 
     /// 工单全部活跃批次 + 批次自身状态（rollup 用）。

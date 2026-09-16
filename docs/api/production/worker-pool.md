@@ -92,7 +92,7 @@ Request：`AdminRemoveRequest`
 | `worker_id` | string (i64) | ✓ | 工人雪花 ID |
 | `batch_id` | string (i64) | ✓ | 要放回的批次 ID（必须是该 worker 当前持有） |
 | `shelf_id` | string (i64) | ✓ | 候选池货架 ID（放回的目标） |
-| `next_process_id` | string (i64) | ✓ | 下一道工序 ID（与 shelf 映射） |
+| `next_process_id` | string (i64) | ✓ | 下一道工序 ID（与 shelf 映射）— 2026-09-16 PR-3 批次 step 化后，service 内部按 `process_id` + part.chain_id 解析为 `t_process_chain_step.id` 后写入 `batch.current_process_step_id`；API 入参名保留兼容 |
 
 业务流转（service `admin_remove_held_batch`）：
 

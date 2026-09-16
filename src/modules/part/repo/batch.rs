@@ -549,9 +549,12 @@ impl PartRepo {
     /// - `to_inspection`：源 ∈ `{PENDING, PROGRAMMING, IN_PROCESS}`，新 = 源 status
     ///   （确保 `mark_batch_inspected` 的 WHERE 守卫能匹配新批次）
     ///
-    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
-    /// - 删 `next_process_id` / `placed_at` 列写入
-    /// - 改传 `current_process_step_id`（新批次继承源批次 step 上下文）
+    /// 2026-09-16 PR-3 批次 step 化（migration 028）：删 `next_process_id` /
+    /// `placed_at` 列写入；`current_process_step_id` 由内部 `_split_batch_inner`
+    /// 走 SELECT 继承源。
+    ///
+    /// 2026-09-17 PR-4 卫生项 B2：薄包装委托到 `PartBatchRepo::_split_batch_inner`
+    /// （part_batch/repo.rs）；`split_batch`（手动部分量）也委托同一 helper。
     #[allow(clippy::too_many_arguments)]
     pub async fn split_batch_for_partial_pass(
         conn: &mut PgConnection,
@@ -563,69 +566,18 @@ impl PartRepo {
         new_batch_status: &str,
         current_user_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
-        // 1. 算 next batch_no
-        let next_batch_no: i32 = sqlx::query_scalar!(
-            r#"
-            SELECT COALESCE(MAX(batch_no), 0) + 1 AS "next!"
-            FROM t_part_batch
-            WHERE part_id = $1 AND deleted_at IS NULL
-            "#,
-            part_id,
-        )
-        .fetch_one(&mut *conn)
-        .await?;
-
-        // 2. INSERT 新批次（quantity = split_quantity，status = new_batch_status）
-        //    2026-09-16 PR-3 批次 step 化：current_process_step_id 继承源批次。
-        sqlx::query!(
-            r#"
-            INSERT INTO t_part_batch (
-                id, part_id, batch_no, quantity, status, location,
-                current_holder_id, current_process_step_id,
-                delivery_note_id, parent_batch_id,
-                version, created_at, created_by, updated_at, updated_by
-            )
-            SELECT $1, part_id, $2, $3, $7, location,
-                   current_holder_id, current_process_step_id,
-                   NULL, $4,
-                   0, now(), $5, now(), $5
-            FROM t_part_batch
-            WHERE id = $6 AND deleted_at IS NULL
-            "#,
+        let user_id = current_user_id.unwrap_or(0);
+        crate::modules::part_batch::repo::PartBatchRepo::_split_batch_inner(
+            conn,
             new_batch_id,
-            next_batch_no,
-            split_quantity,
-            src_batch_id,
-            current_user_id,
-            src_batch_id,
-            new_batch_status,
-        )
-        .execute(&mut *conn)
-        .await?;
-
-        // 3. UPDATE 源批次 quantity -= split_quantity
-        let res = sqlx::query!(
-            r#"
-            UPDATE t_part_batch
-            SET quantity    = quantity - $3,
-                version     = version + 1,
-                updated_at  = now(),
-                updated_by  = $4
-            WHERE id = $1 AND version = $2 AND deleted_at IS NULL
-              AND quantity > $3
-            "#,
             src_batch_id,
             src_version,
+            part_id,
             split_quantity,
-            current_user_id,
+            new_batch_status,
+            user_id,
         )
-        .execute(&mut *conn)
-        .await?;
-        if res.rows_affected() == 0 {
-            return Err(sqlx::Error::RowNotFound);
-        }
-
-        Ok(new_batch_id)
+        .await
     }
 
     // ===== Phase PR-CRUD 新增：8 个 lifecycle mark_* =====
