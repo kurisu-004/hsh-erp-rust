@@ -1972,7 +1972,7 @@ async fn batch_create_parts_handler_spawn_delete_on_ok() {
     use std::sync::Arc;
 
     let (_guard, pool) = setup().await;
-    let l1 = insert_l1(&pool, "L1", "L1").await;
+    let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
     // 1) MockCos 预注册 head/copy 成功
@@ -2022,7 +2022,7 @@ async fn batch_create_parts_handler_spawn_delete_on_ok() {
                 "tmp_key": tmp_key,
                 "content_sha256": sha,
                 "original_filename": "handler.pdf",
-                "file_size": 1024,
+                "file_size": "1024",
                 "content_type": "application/pdf"
             },
             "model3d_file": null,
@@ -2056,5 +2056,156 @@ async fn batch_create_parts_handler_spawn_delete_on_ok() {
             .iter()
             .any(|k| k == "tmp/test/handler-spawn-delete.pdf"),
         "handler spawn delete 应触发 tmp_key 兜底: got {delete_calls:?}"
+    );
+}
+
+/// POST /parts/batch —— Err 路径下 handler 仍 spawn delete 已成功 head/copy 的 tmp_key。
+///
+/// 2026-09-16 M2-C review 第 2 轮补：与 [`batch_create_parts_handler_spawn_delete_on_ok`]
+/// 配对，验证 handler 在 service 返回 Err 时同样触发兜底 spawn-delete（避免 first-pass
+/// 已成功的 tmp 对象留作孤儿）。
+///
+/// ## 测试构造
+/// 请求体 2 件 items（数组顺序即 service 内 chunk zip 迭代顺序）：
+/// - `first_item`（数组 idx=0）：`set_head(first_tmp_key, 1024)` —— head OK + 默认 copy OK
+///   → service `prepare_binding_head_copy` 返回 Ok，`cleanup_tmp_keys.push(first_tmp_key)`
+/// - `second_item`（数组 idx=1）：**不**注册 `set_head` —— `MockCos.head_object` 返回
+///   `BIZ_PART_FILE_UPLOAD_FAILED` → service 内映射为 `BIZ_PART_FILE_TMP_OBJECT_MISSING`
+///   21114 → chunk zip 遇 Err 立即 `return Err((e, [first_tmp_key]))`
+///
+/// handler Err 分支：拿 `keys = [first_tmp_key]` → `if has_bindings && !cleanup_keys.is_empty()`
+/// → `tokio::spawn` 批量 `cos.delete_object(first_tmp_key)` → `cos.delete_calls` 包含
+/// `first_tmp_key`。
+///
+/// ## 为什么 first_item 必须放数组 idx=0
+/// service `batch_create_parts_with_bindings` 在 chunk 内并发 join_all 所有 job，但
+/// 串行迭代 `chunk.iter().zip(results)` —— 遇第一个 Err 立即 `return Err((e, cleanup_tmp_keys))`，
+/// **不**继续 push 后续 Ok 结果。若把 first_item（成功）放在 idx=1、second_item（失败）
+/// 放在 idx=0，则 first_item 的 tmp_key 永远不会被 push 到 cleanup_tmp_keys，handler
+/// Err 分支拿不到 keys → spawn-delete 不触发 → 测试无法断言 Err 路径兜底行为。
+///
+/// `second_item.tmp_key` 因 head 失败从未进 COS（没有 copy_object 调用），不在
+/// `delete_calls` 中 —— 这是正确行为，不是缺失。
+#[tokio::test]
+async fn batch_create_parts_handler_spawn_delete_on_err() {
+    use common::MockCos;
+    use std::sync::Arc;
+
+    let (_guard, pool) = setup().await;
+    let l1 = insert_l1(&pool, "F", "F").await;
+    let l2 = insert_l2(&pool, "二厂", l1).await;
+
+    // 1) MockCos 预注册：first_tmp_key 走完整 head+copy OK，second_tmp_key 不注册
+    //    （head_object 走默认 NoSuchKey 分支）。
+    let cos = Arc::new(MockCos::new());
+    let first_tmp_key = "tmp/test/handler-err-spawn-delete-first.pdf";
+    let second_tmp_key = "tmp/test/handler-err-spawn-delete-second.pdf";
+    let first_sha = "a".repeat(64);
+    let second_sha = "b".repeat(64);
+    cos.set_head(first_tmp_key, 1024);
+    // second_tmp_key 故意不 set_head：触发 MockCos.head_object 默认 NoSuchKey 错误，
+    // 被 service `prepare_binding_head_copy` 映射为 21114 BIZ_PART_FILE_TMP_OBJECT_MISSING。
+
+    // 2) 用 test_state_with_cos 构造 state（cos 已被 MockCos 替换）
+    let state = common::test_state_with_cos(pool.clone(), cos.clone()).await;
+    let app = test_app(state.clone());
+
+    // 3) 登录 MANAGER 角色（service guard require Manager/Clerk）
+    let uid = insert_user_with_password(&pool, "manager-err-spawn", "changeme").await;
+    add_role(&pool, uid, "MANAGER", None, None).await;
+    let (app2, token, _) = {
+        let app_login = test_app(state.clone());
+        let (_, env) = send(
+            app_login,
+            json_request(
+                "POST",
+                "/auth/login",
+                Some(json!({"username": "manager-err-spawn", "password": "changeme"})),
+                None,
+            ),
+        )
+        .await;
+        let token = env["data"]["token"].as_str().unwrap().to_string();
+        (app, token, pool)
+    };
+
+    // 4) 构造 batch 请求：2 件 item，**first_item 放数组 idx=0**（必须！）
+    //    顺序在测试注释里已说明，否则 service chunk zip 早期 Err 会丢弃 first_item 的 Ok。
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
+        .date_naive();
+    let req_body = json!({
+        "customer_id": l2.to_string(),
+        "items": [
+            {
+                "name": "first-item",
+                "drawing_no": "D-FIRST",
+                "applicant_name": "甲",
+                "quantity": 1,
+                "request_date": today.to_string(),
+                "planned_delivery_date": today.to_string(),
+                "is_urgent": false,
+                "drawing_file": {
+                    "tmp_key": first_tmp_key,
+                    "content_sha256": first_sha,
+                    "original_filename": "first.pdf",
+                    "file_size": "1024",
+                    "content_type": "application/pdf"
+                },
+                "model3d_file": null,
+            },
+            {
+                "name": "second-item",
+                "drawing_no": "D-SECOND",
+                "applicant_name": "乙",
+                "quantity": 1,
+                "request_date": today.to_string(),
+                "planned_delivery_date": today.to_string(),
+                "is_urgent": false,
+                "drawing_file": {
+                    "tmp_key": second_tmp_key,
+                    "content_sha256": second_sha,
+                    "original_filename": "second.pdf",
+                    "file_size": "1024",
+                    "content_type": "application/pdf"
+                },
+                "model3d_file": null,
+            },
+        ],
+    });
+
+    // 5) 调用 handler —— 期望 service Err → handler 返回非 2xx
+    let (status, envelope) = send(
+        app2,
+        json_request("POST", "/parts/batch", Some(req_body), Some(&token)),
+    )
+    .await;
+
+    // 6) 业务响应断言：非 2xx + 错误码 21114 BIZ_PART_FILE_TMP_OBJECT_MISSING
+    assert!(
+        !status.is_success(),
+        "Err 路径应非 2xx: status={status}, envelope={envelope}"
+    );
+    assert_eq!(
+        envelope["code"], 21114,
+        "Err 路径应报 21114 BIZ_PART_FILE_TMP_OBJECT_MISSING: {envelope}"
+    );
+
+    // 7) handler 后置 spawn-delete 是 tokio::spawn 异步任务，等待一帧让 spawn 完成
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 8) **关键断言**：Err 路径下 handler 仍 spawn delete 已成功 head/copy 的
+    //    `first_tmp_key`（service Err 返回时透出的 cleanup_tmp_keys）。
+    let delete_calls = cos.delete_calls.lock().unwrap().clone();
+    assert!(
+        delete_calls.iter().any(|k| k == first_tmp_key),
+        "Err 路径下 handler 应 spawn delete first_tmp_key 兜底（M2-C B1 不变量）: got {delete_calls:?}"
+    );
+    // 9) second_tmp_key 因 head_object 失败从未进 COS（service 在 head 失败后
+    //    立即 return Err，没有触发 copy_object），因此不应出现在 delete_calls。
+    //    这反向验证了"只清理实际存在的 tmp"——避免假阳性 delete。
+    assert!(
+        !delete_calls.iter().any(|k| k == second_tmp_key),
+        "second_tmp_key 因 head 失败未进 COS，不应被 delete: got {delete_calls:?}"
     );
 }
