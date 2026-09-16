@@ -820,6 +820,7 @@ mod scan_resolve_tests {
             updated_by: None,
             deleted_at: None,
             delivery_note_id: None,
+            process_chain_id: None,
         }
     }
 
@@ -1031,6 +1032,7 @@ mod outcome_tests {
                 updated_by: None,
                 deleted_at: None,
                 delivery_note_id: None,
+                process_chain_id: None,
             },
             attachable: mk(attachable),
             inspectable: mk(inspectable),
@@ -1262,6 +1264,7 @@ mod attachable_batches_tests {
             updated_by: None,
             deleted_at: None,
             delivery_note_id: None,
+            process_chain_id: None,
         }
     }
 

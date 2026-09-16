@@ -27,12 +27,13 @@ pub struct ProcessChainStepOut {
 }
 
 /// 工艺链详情出参（header + steps）。
+///
+/// 2026-09-16 FK 翻转（migration 026）：移除 `part_id` 字段 —— 归属关系改由
+/// `t_part.process_chain_id` 承载，前端从 part 列表/详情读取。
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessChainOut {
     #[serde(serialize_with = "serialize_i64")]
     pub id: i64,
-    #[serde(serialize_with = "serialize_i64")]
-    pub part_id: i64,
     pub name: String,
     pub note: Option<String>,
     pub version: i32,

@@ -31,6 +31,7 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::repo::part::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part_batch::repo::{NewInitialBatch, PartBatchRepo};
+use crate::modules::process_chain::repo::ProcessChainRepo;
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
@@ -473,6 +474,20 @@ impl PartService {
             PartRepo::soft_delete_part(&mut *conn, part_id, expected_version, current.id).await?;
         match n {
             1 => {
+                // 2026-09-16 FK 翻转（migration 026）级联：part 有工艺链时同事务
+                // 软删链 + steps 并 unlink（顺序：steps → chain → unlink）。
+                // unlink 必须清掉已软删 part 的 process_chain_id，让出
+                // uq_t_part_process_chain 部分唯一索引槽位。
+                let chain_id = PartRepo::get_by_id(&mut *conn, part_id, true)
+                    .await?
+                    .and_then(|p| p.process_chain_id);
+                if let Some(chain_id) = chain_id {
+                    ProcessChainRepo::soft_delete_all_steps_for_chain(&mut *conn, chain_id)
+                        .await?;
+                    ProcessChainRepo::soft_delete_chain(&mut *conn, chain_id, current.id).await?;
+                    ProcessChainRepo::unlink_part_from_chain(&mut *conn, chain_id, current.id)
+                        .await?;
+                }
                 PartRepo::insert_part_event(
                     &mut *conn,
                     NewPartEvent {

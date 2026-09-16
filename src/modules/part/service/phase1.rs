@@ -1957,7 +1957,7 @@ impl PartService {
              is_urgent, current_holder_id, placed_at, next_process_id, \
              order_no, system_delivery_date, note, has_been_repaired, \
              version, created_at, created_by, updated_at, updated_by, \
-             deleted_at, delivery_note_id \
+             deleted_at, delivery_note_id, process_chain_id \
              FROM t_part WHERE serial_no = $1 AND deleted_at IS NULL",
         )
         .bind(&req.part_serial_no)
@@ -2641,6 +2641,7 @@ impl PartService {
                     updated_by: None,
                     deleted_at: None,
                     delivery_note_id: None,
+                    process_chain_id: None,
                 };
                 let item: super::super::dto_crud::PartListItem =
                     super::super::dto_crud::PartListItem {
@@ -2736,6 +2737,7 @@ impl PartService {
                     updated_by: None,
                     deleted_at: None,
                     delivery_note_id: None,
+                    process_chain_id: None,
                 },
                 customer_name: None,
                 l1_customer_name: None,
@@ -2819,6 +2821,7 @@ impl PartService {
                     updated_by: None,
                     deleted_at: None,
                     delivery_note_id: None,
+                    process_chain_id: None,
                 },
                 customer_name: None,
                 l1_customer_name: None,

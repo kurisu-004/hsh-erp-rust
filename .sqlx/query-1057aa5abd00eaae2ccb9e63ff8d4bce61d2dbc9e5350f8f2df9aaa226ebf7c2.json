@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part\n            SET process_chain_id = NULL,\n                version    = version + 1,\n                updated_at = now(),\n                updated_by = $2\n            WHERE process_chain_id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1057aa5abd00eaae2ccb9e63ff8d4bce61d2dbc9e5350f8f2df9aaa226ebf7c2"
+}

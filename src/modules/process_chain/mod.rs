@@ -4,10 +4,11 @@
 //! - service/process_chain_service.py（待后续 PR）
 //! - schema/process_chain.py（待后续 PR）
 //!
-//! ## 当前阶段（part-worker-pool-federated-rocket MVP）
-//! 2 端点挂在 `/api/v2/process-chains`：
+//! ## 当前阶段（part-worker-pool-federated-rocket MVP + 2026-09-16 FK 翻转）
+//! 3 端点挂在 `/api/v2/process-chains`：
 //! - `GET  /by-part/{part_id}`  —— 读 part 绑定的工艺链（404 + 20701）
 //! - `PUT  /by-part/{part_id}`  —— 整组 upsert：OCC + 软删旧 steps + INSERT 新 steps
+//! - `GET  /{chain_id}`         —— 按链 id 读工艺链（FK 翻转新增；404 + 20701）
 //!
 //! ## 子模块结构
 //! - `model`        —— 表行（header + step）+ 插入行 builder
@@ -29,8 +30,10 @@ use std::sync::Arc;
 use axum::{routing::get, Router};
 use crate::state::AppState;
 
-/// process_chain 域路由表（挂载点 `/api/v2/process-chains`，见 `modules::v2_router`）
+/// process_chain 域路由表（挂载点 `/api/v2/process-chains`，见 `modules::v2_router`）。
+/// 静态段 `by-part` 优先于参数段 `{chain_id}`（axum 路由匹配规则），顺序无关。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/by-part/{part_id}", get(handler::get_by_part).put(handler::upsert))
+        .route("/{chain_id}", get(handler::get_by_id))
 }

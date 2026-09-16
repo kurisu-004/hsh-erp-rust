@@ -92,7 +92,7 @@ impl PartRepo {
                    is_urgent, current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -121,7 +121,7 @@ impl PartRepo {
                    is_urgent, current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE id = ANY($1)
               AND ($2::bool OR deleted_at IS NULL)
@@ -151,7 +151,7 @@ impl PartRepo {
                    is_urgent, current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE serial_no = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -178,7 +178,7 @@ impl PartRepo {
                    is_urgent, current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE assembly_id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -231,8 +231,8 @@ impl PartRepo {
                    customer_id, assembly_id, status, location, is_urgent,
                    current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
-                   version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                    version, created_at, created_by, updated_at, updated_by,
+                    deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -366,7 +366,7 @@ impl PartRepo {
                     current_holder_id, placed_at, next_process_id, \
                     order_no, system_delivery_date, note, has_been_repaired, \
                     version, created_at, created_by, updated_at, updated_by, \
-                    deleted_at, delivery_note_id \
+                    deleted_at, delivery_note_id, process_chain_id \
              FROM t_part WHERE 1=1",
         );
         if !f.include_deleted { qb.push(" AND deleted_at IS NULL"); }
@@ -445,20 +445,20 @@ impl PartRepo {
              customer_id, assembly_id, status, location, is_urgent, \
              current_holder_id, placed_at, next_process_id, \
              order_no, system_delivery_date, note, has_been_repaired, \
-             version, created_at, created_by, updated_at, updated_by, \
-             deleted_at, delivery_note_id \
-             FROM t_part WHERE assembly_id = $1 \
-             ORDER BY serial_no ASC NULLS LAST, id ASC"
+              version, created_at, created_by, updated_at, updated_by, \
+              deleted_at, delivery_note_id, process_chain_id \
+              FROM t_part WHERE assembly_id = $1 \
+              ORDER BY serial_no ASC NULLS LAST, id ASC"
         } else {
             "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
              request_date, planned_delivery_date, actual_delivery_date, \
              customer_id, assembly_id, status, location, is_urgent, \
              current_holder_id, placed_at, next_process_id, \
              order_no, system_delivery_date, note, has_been_repaired, \
-             version, created_at, created_by, updated_at, updated_by, \
-             deleted_at, delivery_note_id \
-             FROM t_part WHERE assembly_id = $1 AND deleted_at IS NULL \
-             ORDER BY serial_no ASC NULLS LAST, id ASC"
+              version, created_at, created_by, updated_at, updated_by, \
+              deleted_at, delivery_note_id, process_chain_id \
+              FROM t_part WHERE assembly_id = $1 AND deleted_at IS NULL \
+              ORDER BY serial_no ASC NULLS LAST, id ASC"
         };
         sqlx::query_as::<_, TPart>(sql)
             .bind(assembly_id)
