@@ -5,20 +5,20 @@
 //! ## 端点（挂在 `/api/v2/process-chains`，由 `mod.rs::router()` 桥接）
 //! - `GET  /by-part/{part_id}` —— 读 part 绑定的工艺链（404 + 20701）
 //! - `PUT  /by-part/{part_id}` —— 整组 upsert：OCC + 软删旧 steps + INSERT 新 steps
+//! - `GET  /{chain_id}` —— 按链 id 读工艺链（2026-09-16 FK 翻转新增；404 + 20701）
+//!
+//! 路由顺序说明：axum 静态段 `by-part` 优先于参数段 `{chain_id}`，
+//! `/by-part/123` 不会被解析成 chain_id。
 //!
 //! ## 约定
 //! - 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式 `tx.commit()`
 //! - 统一响应信封：`Result<Json<R<T>>, AppError>`
 //! - 权限在 service 层（`current.require_role` / `require_any_role`）
-//!
-//! 当前 handler 文件 91 行（远低于 250 行硬红线），预留 process_chain 其他子端点（list
-//! all / delete / reorder 等）的扩展空间。
 
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::Json;
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::process_chain::dto::{ProcessChainOut, UpsertChainRequest};
@@ -42,11 +42,28 @@ pub async fn get_by_part(
     Ok(Json(R::ok(out)))
 }
 
+/// GET /api/v2/process-chains/{chain_id}
+///
+/// 按链 id 读工艺链（header + steps）。2026-09-16 FK 翻转新增：
+/// 前端在「工序制定」页点击零件后，按 `part.process_chain_id` 调本端点。
+/// 无链 / 已软删 → 20701 `BIZ_PROCESS_CHAIN_NOT_FOUND`（HTTP 404）。
+pub async fn get_by_id(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(chain_id): Path<i64>,
+) -> Result<Json<R<ProcessChainOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = ProcessChainService::get_chain_by_id(&mut tx, chain_id, &current).await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
 /// PUT /api/v2/process-chains/by-part/{part_id}
 ///
 /// 整组 upsert：
-/// - 无链 → INSERT header + INSERT all steps
+/// - 无链 → INSERT header + link 到 part + INSERT all steps
 /// - 有链 → bump chain version（OCC）→ 软删旧 steps → INSERT 新 steps
+/// - 守卫：part 不存在 → 20101；part.status 非 PENDING → 20705（2026-09-16 新增）
 ///
 /// Manager only。完成后回返更新后的整链。
 pub async fn upsert(
@@ -60,10 +77,4 @@ pub async fn upsert(
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
-}
-
-/// 本域路由表（挂载点 `/api/v2/process-chains`，见 `mod.rs::router()`）。
-pub fn router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/by-part/{part_id}", get(get_by_part).put(upsert))
 }

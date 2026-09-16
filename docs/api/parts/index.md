@@ -101,7 +101,11 @@
 
 ### PartListItem 字段
 
-`TPart` 完整 28 列 + `customer_name` / `l1_customer_name` 冗余字段；见 [`./index.md#mainconventions`](./index.md#端点约束与-python-一致) 关于 i64 字段序列化为 string 的约定。
+`TPart` 完整 29 列 + `customer_name` / `l1_customer_name` 冗余字段；见 [`./index.md#mainconventions`](./index.md#端点约束与-python-一致) 关于 i64 字段序列化为 string 的约定。
+
+> 2026-09-16（migration 026 FK 翻转）：`TPart` 新增 `process_chain_id`（string i64?）
+> —— 逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链。前端「工序制定」页
+> 按此字段是否为 `null` 批量区分已制定 / 未制定工序的零件。
 
 ### PartListOut 字段
 
@@ -114,7 +118,7 @@
 
 ### PartDetailOut 字段
 
-`TPart` 完整 28 列 + `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
+`TPart` 完整 29 列（含 2026-09-16 新增 `process_chain_id`）+ `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
 
 ## 端点约束（与 Python 一致）
 

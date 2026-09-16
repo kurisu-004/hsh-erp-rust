@@ -92,7 +92,7 @@ impl PartRepo {
                    is_urgent, current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -121,7 +121,7 @@ impl PartRepo {
                    is_urgent, current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE id = ANY($1)
               AND ($2::bool OR deleted_at IS NULL)
@@ -151,7 +151,7 @@ impl PartRepo {
                    is_urgent, current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE serial_no = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -178,7 +178,7 @@ impl PartRepo {
                    is_urgent, current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE assembly_id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -215,7 +215,7 @@ impl PartRepo {
 
     // ===== Phase PR-CRUD 新增 =====
 
-    /// 详情接口：完整 28 列行（含软删检测）。
+    /// 详情接口：完整 29 列行（含软删检测）。
     ///
     /// service 层在 `get_by_id(..., include_deleted=false)` 失败时可用本方法
     /// 做兜底（含软删场景）以区分「不存在」与「已软删」。
@@ -232,7 +232,7 @@ impl PartRepo {
                    current_holder_id, placed_at, next_process_id,
                    order_no, system_delivery_date, note, has_been_repaired,
                    version, created_at, created_by, updated_at, updated_by,
-                   deleted_at, delivery_note_id
+                   deleted_at, delivery_note_id, process_chain_id
             FROM t_part
             WHERE id = $1 AND deleted_at IS NULL
             "#,
@@ -366,7 +366,7 @@ impl PartRepo {
                     current_holder_id, placed_at, next_process_id, \
                     order_no, system_delivery_date, note, has_been_repaired, \
                     version, created_at, created_by, updated_at, updated_by, \
-                    deleted_at, delivery_note_id \
+                    deleted_at, delivery_note_id, process_chain_id \
              FROM t_part WHERE 1=1",
         );
         if !f.include_deleted { qb.push(" AND deleted_at IS NULL"); }
@@ -446,7 +446,7 @@ impl PartRepo {
              current_holder_id, placed_at, next_process_id, \
              order_no, system_delivery_date, note, has_been_repaired, \
              version, created_at, created_by, updated_at, updated_by, \
-             deleted_at, delivery_note_id \
+             deleted_at, delivery_note_id, process_chain_id \
              FROM t_part WHERE assembly_id = $1 \
              ORDER BY serial_no ASC NULLS LAST, id ASC"
         } else {
@@ -456,7 +456,7 @@ impl PartRepo {
              current_holder_id, placed_at, next_process_id, \
              order_no, system_delivery_date, note, has_been_repaired, \
              version, created_at, created_by, updated_at, updated_by, \
-             deleted_at, delivery_note_id \
+             deleted_at, delivery_note_id, process_chain_id \
              FROM t_part WHERE assembly_id = $1 AND deleted_at IS NULL \
              ORDER BY serial_no ASC NULLS LAST, id ASC"
         };

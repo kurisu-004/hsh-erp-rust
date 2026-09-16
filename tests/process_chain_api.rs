@@ -1,13 +1,16 @@
 //! process_chain 域端到端集成测试（part-worker-pool-federated-rocket 2026-09-11）
 //!
-//! 覆盖 7 个场景：
-//!   1. happy path：建链 → fetch 拿到 header + steps
+//! 覆盖场景：
+//!   1. happy path：建链 → fetch 拿到 header + steps；part.process_chain_id 已回写（026 翻转）
 //!   2. fetch 找不到链 → 20701 BIZ_PROCESS_CHAIN_NOT_FOUND (HTTP 404)
-//!   3. PUT upsert 替换步骤（清空旧 steps + 插新 steps，chain.version++）
+//!   3. PUT upsert 替换步骤（清空旧 steps + 插新 steps，chain.version++；part 指针不变）
 //!   4. PUT upsert 创建全新链（part 之前无链）
 //!   5. PUT upsert 校验：estimated_minutes < 0 → 40001 VALIDATION_ERROR
 //!   6. PUT upsert 校验：sort_order 重复 → 40001 VALIDATION_ERROR
 //!   7. step.note 字段往返：建链时填 note → fetch 拿回原文（migration 019）
+//!   8. 非 PENDING part upsert → 20705 BIZ_PROCESS_CHAIN_PART_NOT_PENDING (HTTP 409)
+//!   9. GET /process-chains/{chain_id} 命中 / 未命中（2026-09-16 FK 翻转新增端点）
+//!  10. soft_delete_part 级联：链 + steps 软删、part.process_chain_id 置 NULL（026 翻转）
 //!
 //! ## 串行化
 //! 进程级 `tokio::sync::Mutex` + `--test-threads=1` 双保险。
@@ -107,6 +110,16 @@ fn chain_snowflake() -> &'static SnowflakeIdGenerator {
 }
 
 async fn insert_part(pool: &PgPool, customer_id: i64, serial_no: &str) -> i64 {
+    insert_part_with_status(pool, customer_id, serial_no, "PENDING").await
+}
+
+/// 2026-09-16 新增：可指定初始 status 的 part fixture（20705 PENDING 守卫测试用）。
+async fn insert_part_with_status(
+    pool: &PgPool,
+    customer_id: i64,
+    serial_no: &str,
+    status: &str,
+) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let id = chain_snowflake().next_id();
     let now = now_naive();
@@ -116,13 +129,14 @@ async fn insert_part(pool: &PgPool, customer_id: i64, serial_no: &str) -> i64 {
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
          request_date, planned_delivery_date, status, is_urgent, customer_id, \
          quantity, unit_price, total_price, version, created_at, updated_at) \
-         VALUES ($1, $2, 'test', 'D-PCH', $3, $4, $4, 'PENDING', false, $5, \
-         1, 0, 0, 0, $6, $6)",
+         VALUES ($1, $2, 'test', 'D-PCH', $3, $4, $4, $5, false, $6, \
+         1, 0, 0, 0, $7, $7)",
     )
     .bind(id)
     .bind(serial_no)
     .bind(serial_no.to_string()) // applicant_name = serial_no
     .bind(today)
+    .bind(status)
     .bind(customer_id)
     .bind(now)
     .execute(pool)
@@ -207,7 +221,8 @@ async fn upsert_then_get_by_part_happy() {
     .await;
     assert_eq!(s, StatusCode::OK, "upsert: {env}");
     let data = &env["data"];
-    assert_eq!(data["part_id"], part_id.to_string());
+    // 2026-09-16 FK 翻转：ProcessChainOut 不再含 part_id（归属关系由 part 侧承载）
+    assert!(data.get("part_id").is_none(), "契约变更：不应再有 part_id: {env}");
     assert_eq!(data["name"], "默认工艺");
     assert_eq!(data["note"], "happy path");
     let steps = data["steps"].as_array().expect("steps array");
@@ -219,6 +234,17 @@ async fn upsert_then_get_by_part_happy() {
     assert_eq!(steps[1]["process_id"], proc_b.to_string());
     assert_eq!(steps[1]["estimated_minutes"], 45);
     let chain_id = data["id"].as_str().unwrap().to_string();
+
+    // FK 翻转核心断言：part.process_chain_id 已回写为新链 id
+    let chain_id_i64: i64 = chain_id.parse().expect("parse chain_id");
+    let linked: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT process_chain_id AS "linked?" FROM t_part WHERE id = $1"#,
+        part_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read part.process_chain_id");
+    assert_eq!(linked, Some(chain_id_i64), "part.process_chain_id 应回写: {env}");
 
     // 2. fetch by part
     let state = test_state(_pool).await;
@@ -329,6 +355,16 @@ async fn upsert_replaces_old_steps() {
     .await
     .expect("count active steps");
     assert_eq!(n_active, 1, "DB 应只剩 1 个活跃 step");
+
+    // FK 翻转：重复 upsert 后 part.process_chain_id 仍指向原链（链 id 不变）
+    let linked: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT process_chain_id AS "linked?" FROM t_part WHERE id = $1"#,
+        part_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read part.process_chain_id");
+    assert_eq!(linked, Some(chain_id_i64), "part 指针不应变化");
 }
 
 /// 场景 4: upsert 时 estimated_minutes < 0 → 40001
@@ -495,4 +531,211 @@ async fn step_note_round_trip() {
     assert_eq!(s2, StatusCode::OK, "fetch: {env2}");
     let steps2 = env2["data"]["steps"].as_array().unwrap();
     assert_eq!(steps2[0]["note"], "必须干燥 24h 后才能上 CNC");
+}
+
+/// 场景 8: 非 PENDING part upsert → 20705 BIZ_PROCESS_CHAIN_PART_NOT_PENDING (HTTP 409)
+///
+/// 2026-09-16 FK 翻转新增守卫：零件一旦下发（离开 PENDING），工艺链冻结，
+/// 禁止制定 / 修改。
+#[tokio::test]
+async fn upsert_rejects_non_pending_part() {
+    let (_guard, pool) = setup().await;
+    let customer = insert_customer_l2(&pool, "PCH-NP").await;
+    let proc = seed_process(&pool, "PROC-NP", "工序").await;
+    // 模拟"已下发"零件（IN_PROCESS 即非 PENDING 任一状态）
+    let part_id = insert_part_with_status(&pool, customer, "P-NP", "IN_PROCESS").await;
+
+    let (app, token, _pool) = login_manager(pool.clone(), "mgr_np").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "PUT",
+            &format!("/process-chains/by-part/{part_id}"),
+            Some(json!({
+                "steps": [
+                    { "sort_order": 10, "process_id": proc.to_string(), "estimated_minutes": 30 },
+                ]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "非 PENDING 应 409: {env}");
+    assert_eq!(env["code"], 20705, "BIZ_PROCESS_CHAIN_PART_NOT_PENDING: {env}");
+}
+
+/// 场景 9: GET /process-chains/{chain_id} 命中 / 未命中（2026-09-16 新增端点）
+#[tokio::test]
+async fn get_chain_by_id_hit_and_miss() {
+    let (_guard, pool) = setup().await;
+    let customer = insert_customer_l2(&pool, "PCH-GI").await;
+    let proc_a = seed_process(&pool, "PROC-GA", "工序A").await;
+    let part_id = insert_part(&pool, customer, "P-GI").await;
+
+    let (app, token, _pool) = login_manager(pool.clone(), "mgr_gi").await;
+
+    // 建链拿 chain_id
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "PUT",
+            &format!("/process-chains/by-part/{part_id}"),
+            Some(json!({
+                "name": "按 id 读取链",
+                "steps": [
+                    { "sort_order": 10, "process_id": proc_a.to_string(), "estimated_minutes": 30 },
+                ]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "upsert: {env}");
+    let chain_id = env["data"]["id"].as_str().unwrap().to_string();
+
+    // 命中：GET /process-chains/{chain_id}
+    let (s2, env2) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/process-chains/{chain_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "get by id: {env2}");
+    assert_eq!(env2["data"]["id"], chain_id);
+    assert_eq!(env2["data"]["name"], "按 id 读取链");
+    assert_eq!(env2["data"]["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(env2["data"]["steps"][0]["process_id"], proc_a.to_string());
+
+    // 未命中：随机雪花 id → 404 + 20701
+    let missing_id = chain_snowflake().next_id();
+    let (s3, env3) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/process-chains/{missing_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::NOT_FOUND, "未命中应 404: {env3}");
+    assert_eq!(env3["code"], 20701, "BIZ_PROCESS_CHAIN_NOT_FOUND: {env3}");
+}
+
+/// 场景 10: soft_delete_part 级联（2026-09-16 FK 翻转）
+///
+/// part 软删后同事务级联：steps 全软删 → chain 软删 → part.process_chain_id 置 NULL。
+/// 之后 get_chain_by_part / get_chain_by_id 均 20701。
+#[tokio::test]
+async fn soft_delete_part_cascades_chain() {
+    let (_guard, pool) = setup().await;
+    let customer = insert_customer_l2(&pool, "PCH-SD").await;
+    let proc_a = seed_process(&pool, "PROC-SA", "工序A").await;
+    let part_id = insert_part(&pool, customer, "P-SD").await;
+
+    let (app, token, _pool) = login_manager(pool.clone(), "mgr_sd").await;
+
+    // 1. 建链（link 会把 part.version 从 0 推到 1）
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "PUT",
+            &format!("/process-chains/by-part/{part_id}"),
+            Some(json!({
+                "steps": [
+                    { "sort_order": 10, "process_id": proc_a.to_string(), "estimated_minutes": 30 },
+                ]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "upsert: {env}");
+    let chain_id = env["data"]["id"].as_str().unwrap().to_string();
+    let chain_id_i64: i64 = chain_id.parse().expect("parse chain_id");
+
+    // 2. 读 part 当前 version（软删走 OCC）
+    let part_version: i32 = sqlx::query_scalar!(
+        r#"SELECT version AS "v!" FROM t_part WHERE id = $1"#,
+        part_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read part version");
+
+    // 3. 软删 part
+    let (s2, env2) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/soft-delete"),
+            Some(json!({ "version": part_version })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "soft-delete: {env2}");
+
+    // 4. 级联断言：链软删
+    let chain_deleted: bool = sqlx::query_scalar!(
+        r#"SELECT (deleted_at IS NOT NULL) AS "d!" FROM t_part_process_chain WHERE id = $1"#,
+        chain_id_i64,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read chain deleted_at");
+    assert!(chain_deleted, "链应被级联软删");
+
+    // 5. 级联断言：steps 全软删
+    let n_active_steps: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "n!" FROM t_process_chain_step
+        WHERE chain_id = $1 AND deleted_at IS NULL"#,
+        chain_id_i64,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count active steps");
+    assert_eq!(n_active_steps, 0, "steps 应被级联软删");
+
+    // 6. 级联断言：part.process_chain_id 置 NULL（让出 uq 槽位）
+    let linked: Option<i64> = sqlx::query_scalar!(
+        r#"SELECT process_chain_id AS "linked?" FROM t_part WHERE id = $1"#,
+        part_id,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read part.process_chain_id");
+    assert_eq!(linked, None, "part.process_chain_id 应为 NULL");
+
+    // 7. get_chain_by_part → 20701（part 已软删，JOIN 不上）
+    let (s3, env3) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/process-chains/by-part/{part_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::NOT_FOUND, "软删后 by-part 应 404: {env3}");
+    assert_eq!(env3["code"], 20701, "BIZ_PROCESS_CHAIN_NOT_FOUND: {env3}");
+
+    // 8. get_chain_by_id → 20701（链已软删）
+    let (s4, env4) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/process-chains/{chain_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s4, StatusCode::NOT_FOUND, "软删后 by-id 应 404: {env4}");
+    assert_eq!(env4["code"], 20701, "BIZ_PROCESS_CHAIN_NOT_FOUND: {env4}");
 }

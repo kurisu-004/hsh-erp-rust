@@ -13,10 +13,12 @@ use super::ProcessChainRepo;
 impl ProcessChainRepo {
     /// INSERT 新链 header（仅做 INSERT；service 层负责 OCC 与 1:1 唯一性检查）。
     /// `id` 由 caller（service）预生成雪花。
+    ///
+    /// 2026-09-16 FK 翻转（migration 026）：不再写 `part_id`；归属关系由
+    /// caller 同事务追加 `link_chain_to_part` 建立。
     pub async fn insert_chain<'e, E: PgExecutor<'e>>(
         executor: E,
         id: i64,
-        part_id: i64,
         name: &str,
         note: Option<&str>,
         created_by: i64,
@@ -25,21 +27,102 @@ impl ProcessChainRepo {
             TPartProcessChain,
             r#"
             INSERT INTO t_part_process_chain (
-                id, part_id, name, note, version, created_by, updated_by
+                id, name, note, version, created_by, updated_by
             ) VALUES (
-                $1, $2, $3, $4, 0, $5, $5
+                $1, $2, $3, 0, $4, $4
             )
-            RETURNING id, part_id, name, version, note,
+            RETURNING id, name, version, note,
                       created_at, created_by, updated_at, updated_by, deleted_at
             "#,
             id,
-            part_id,
             name,
             note,
             created_by,
         )
         .fetch_one(executor)
         .await
+    }
+
+    /// 把链绑定到 part：`t_part.process_chain_id = chain_id`（2026-09-16 FK 翻转新增）。
+    ///
+    /// 并发守卫：`process_chain_id IS NULL` 才允许占位 —— 返回行数：
+    /// - `1`：绑定成功
+    /// - `0`：part 不存在 / 已软删 / 已被并发绑定（service 映射 20104 并发冲突）
+    ///
+    /// 另一并发面：两个 part 同时绑同一 chain → 撞 `uq_t_part_process_chain`
+    /// 部分唯一索引（23505），由 service 映射 20104。
+    pub async fn link_chain_to_part<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        chain_id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query!(
+            r#"
+            UPDATE t_part
+            SET process_chain_id = $2,
+                version    = version + 1,
+                updated_at = now(),
+                updated_by = $3
+            WHERE id = $1 AND deleted_at IS NULL AND process_chain_id IS NULL
+            "#,
+            part_id,
+            chain_id,
+            updated_by,
+        )
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 软删链 header（2026-09-16 新增：part 软删级联用）。
+    /// 返回受影响行数；0 行 = 已软删 / 不存在（幂等容忍，caller 不视为错误）。
+    pub async fn soft_delete_chain<'e, E: PgExecutor<'e>>(
+        executor: E,
+        chain_id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query!(
+            r#"
+            UPDATE t_part_process_chain
+            SET deleted_at = now(),
+                version    = version + 1,
+                updated_at = now(),
+                updated_by = $2
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+            chain_id,
+            updated_by,
+        )
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 解除 part 对链的引用（2026-09-16 新增：part 软删级联用）。
+    ///
+    /// 故意**不带** `deleted_at IS NULL` 守卫：调用场景是 part 刚被软删，
+    /// 必须清掉它的 `process_chain_id` 以让出 `uq_t_part_process_chain` 槽位。
+    pub async fn unlink_part_from_chain<'e, E: PgExecutor<'e>>(
+        executor: E,
+        chain_id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query!(
+            r#"
+            UPDATE t_part
+            SET process_chain_id = NULL,
+                version    = version + 1,
+                updated_at = now(),
+                updated_by = $2
+            WHERE process_chain_id = $1
+            "#,
+            chain_id,
+            updated_by,
+        )
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
     }
 
     /// OCC：把 chain version 自增 + 更新 name / note，返回受影响行数；0 行 → service 转 VERSION_CONFLICT 409。

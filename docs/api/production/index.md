@@ -30,7 +30,8 @@
 | GET | `/api/v2/work-types/{id}/processes` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 该工种已映射工序列表 | [`work-type-process-mapping.md`](./work-type-process-mapping.md#get-apiv2work-typesidprocesses) |
 | POST | `/api/v2/work-types/{id}/processes` | MANAGER | 整组替换工种工序映射 | [`work-type-process-mapping.md`](./work-type-process-mapping.md#post-apiv2work-typesidprocesses) |
 | GET | `/api/v2/process-chains/by-part/{part_id}` | 已登录（任意角色，不含 ShelfAccount） | 读 part 绑定的工艺链（header + steps） | [`process-chain.md`](./process-chain.md#get-apiv2process-chainsby-partpart_id) |
-| PUT | `/api/v2/process-chains/by-part/{part_id}` | MANAGER | 整组 upsert 工艺链 + steps | [`process-chain.md`](./process-chain.md#put-apiv2process-chainsby-partpart_id) |
+| PUT | `/api/v2/process-chains/by-part/{part_id}` | MANAGER | 整组 upsert 工艺链 + steps（PENDING 守卫 20705） | [`process-chain.md`](./process-chain.md#put-apiv2process-chainsby-partpart_id) |
+| GET | `/api/v2/process-chains/{chain_id}` | 已登录（任意角色，不含 ShelfAccount） | 按链 id 读工艺链（2026-09-16 FK 翻转新增） | [`process-chain.md`](./process-chain.md#get-apiv2process-chainschain_id) |
 | GET | `/api/v2/worker-pool/state` | 已登录（无 role guard） | worker 当前持有 + 工序池候选数 | [`worker-pool.md`](./worker-pool.md#get-apiv2worker-poolstate) |
 | GET | `/api/v2/worker-pool/{process_id}` | Manager+Clerk+Inspector | 按工序返回候选池详情（admin 视角） | [`worker-pool.md`](./worker-pool.md#get-apiv2worker-poolprocess_id) |
 | POST | `/api/v2/admin/worker-pool/refill` | MANAGER | 为指定 worker 抢满 `max_held_batches` | [`worker-pool.md`](./worker-pool.md#post-apiv2adminworker-poolrefill) |

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, serial_no, name, drawing_no, applicant_name, quantity,\n                   request_date, planned_delivery_date, actual_delivery_date,\n                   customer_id, assembly_id, status, location, is_urgent,\n                   current_holder_id, placed_at, next_process_id,\n                   order_no, system_delivery_date, note, has_been_repaired,\n                   version, created_at, created_by, updated_at, updated_by,\n                   deleted_at, delivery_note_id\n            FROM t_part\n            WHERE id = $1 AND deleted_at IS NULL\n            ",
+  "query": "\n            SELECT id, serial_no, name, drawing_no, applicant_name, quantity,\n                   request_date, planned_delivery_date, actual_delivery_date,\n                   customer_id, assembly_id, status, location,\n                   is_urgent, current_holder_id, placed_at, next_process_id,\n                   order_no, system_delivery_date, note, has_been_repaired,\n                   version, created_at, created_by, updated_at, updated_by,\n                   deleted_at, delivery_note_id, process_chain_id\n            FROM t_part\n            WHERE id = ANY($1)\n              AND ($2::bool OR deleted_at IS NULL)\n            ORDER BY id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -310,11 +310,23 @@
             "name": "delivery_note_id"
           }
         }
+      },
+      {
+        "ordinal": 28,
+        "name": "process_chain_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "process_chain_id"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
-        "Int8"
+        "Int8Array",
+        "Bool"
       ]
     },
     "nullable": [
@@ -345,8 +357,9 @@
       false,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "4f0cd8cb36830f578b4aa9e2d2be6d2a88aa6eca8e7ea97718e9cd442a6dda15"
+  "hash": "33c044e0a572c44ada6c510e9a8a789052b64ff22adc98c5f32303c2e0829dfa"
 }

@@ -233,6 +233,8 @@ pub mod code {
     pub const BIZ_PROCESS_CHAIN_STEP_NOT_FOUND: i32 = 20702;
     pub const BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET: i32 = 20703;
     pub const BIZ_AUTO_ALLOCATE_INVALID_RATIO: i32 = 20704;
+    // 2026-09-16 新增（FK 翻转 PR-1）：part.status 非 PENDING 时禁止制定/修改工艺链
+    pub const BIZ_PROCESS_CHAIN_PART_NOT_PENDING: i32 = 20705;
 
     // 系统错误
     pub const INTERNAL: i32 = 50000;
@@ -436,7 +438,8 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_PART_ALREADY_CANCELLED
             || c == code::BIZ_DELIVERY_NOTE_LOCKED_PART
             || c == code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER
-            || c == code::BIZ_PART_NOT_DELETABLE =>
+            || c == code::BIZ_PART_NOT_DELETABLE
+            || c == code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING =>
         {
             StatusCode::CONFLICT
         }
@@ -867,6 +870,10 @@ mod tests {
             code::BIZ_AUTO_ALLOCATE_INVALID_RATIO,
             "BIZ_AUTO_ALLOCATE_INVALID_RATIO",
         ),
+        (
+            code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING,
+            "BIZ_PROCESS_CHAIN_PART_NOT_PENDING",
+        ),
     ];
 
     #[test]
@@ -1050,6 +1057,7 @@ mod tests {
         assert_eq!(code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND, 20702);
         assert_eq!(code::BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET, 20703);
         assert_eq!(code::BIZ_AUTO_ALLOCATE_INVALID_RATIO, 20704);
+        assert_eq!(code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING, 20705);
     }
 
     /// 数据驱动的 HTTP 表覆盖测试：每个 (code, expected_http, name) 一行。
@@ -1237,6 +1245,11 @@ mod tests {
             code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
             StatusCode::NOT_FOUND,
             "BIZ_PROCESS_CHAIN_STEP_NOT_FOUND",
+        ),
+        (
+            code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING,
+            StatusCode::CONFLICT,
+            "BIZ_PROCESS_CHAIN_PART_NOT_PENDING",
         ),
         // 2xxxx 显式 409
         (

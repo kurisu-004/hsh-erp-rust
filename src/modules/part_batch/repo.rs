@@ -144,7 +144,8 @@ impl PartBatchRepo {
                 p.order_no        AS "p_order_no?",
                 p.system_delivery_date AS "p_system_delivery_date?",
                 p.note            AS "p_note?",
-                p.has_been_repaired AS "p_has_been_repaired!"
+                p.has_been_repaired AS "p_has_been_repaired!",
+                p.process_chain_id AS "p_process_chain_id?"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
             WHERE pb.delivery_note_id = $1
@@ -210,6 +211,7 @@ impl PartBatchRepo {
                         updated_by: r.p_updated_by,
                         deleted_at: r.p_deleted_at,
                         delivery_note_id: r.p_delivery_note_id,
+                        process_chain_id: r.p_process_chain_id,
                     },
                 )
             })
@@ -276,7 +278,8 @@ impl PartBatchRepo {
                 p.order_no        AS "p_order_no?",
                 p.system_delivery_date AS "p_system_delivery_date?",
                 p.note            AS "p_note?",
-                p.has_been_repaired AS "p_has_been_repaired!"
+                p.has_been_repaired AS "p_has_been_repaired!",
+                p.process_chain_id AS "p_process_chain_id?"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
             WHERE pb.delivery_note_id = ANY($1)
@@ -340,6 +343,7 @@ impl PartBatchRepo {
                     updated_by: r.p_updated_by,
                     deleted_at: r.p_deleted_at,
                     delivery_note_id: r.p_delivery_note_id,
+                    process_chain_id: r.p_process_chain_id,
                 },
             )
         }).collect())
@@ -665,7 +669,8 @@ impl PartBatchRepo {
                 p.order_no AS "p_order_no",
                 p.system_delivery_date AS "p_system_delivery_date",
                 p.note AS "p_note",
-                p.has_been_repaired AS "p_has_been_repaired"
+                p.has_been_repaired AS "p_has_been_repaired",
+                p.process_chain_id AS "p_process_chain_id"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
             WHERE pb.deleted_at IS NULL
@@ -735,6 +740,7 @@ impl PartBatchRepo {
                 updated_by: r.try_get("p_updated_by")?,
                 deleted_at: r.try_get("p_deleted_at")?,
                 delivery_note_id: r.try_get("p_delivery_note_id")?,
+                process_chain_id: r.try_get("p_process_chain_id")?,
             };
             out.push((pb, p));
         }

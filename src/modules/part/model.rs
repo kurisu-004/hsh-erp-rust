@@ -8,7 +8,7 @@
 //! part 域业务实现阶段再补，避免越权改动本域。
 //!
 //! Phase PR-CRUD 增量：
-//! - TPart 28 列完整投影；不含 `unit_price / total_price`（NUMERIC，待 `rust_decimal`）
+//! - TPart 29 列完整投影；不含 `unit_price / total_price`（NUMERIC，待 `rust_decimal`）
 //! - TPartEvent / NewPartEvent：保持不变（已对齐 migration 010）
 //!
 //! 完整列（含金额 / 数量 / holder / 日期 / note / has_been_repaired 等）待
@@ -20,9 +20,9 @@ use serde::Serialize;
 
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
-/// `t_part` 完整行投影（Phase PR-CRUD 2026-08-25）
+/// `t_part` 完整行投影（Phase PR-CRUD 2026-08-25；2026-09-16 增至 29 列）
 ///
-/// 28 列；不含 `unit_price` / `total_price`（NUMERIC，待 `rust_decimal` feature 上线）。
+/// 29 列；不含 `unit_price` / `total_price`（NUMERIC，待 `rust_decimal` feature 上线）。
 ///
 ///
 /// PR-CRUD superset of master P1 + worker-pool 5-field addition:
@@ -34,6 +34,9 @@ use crate::shared::types::{serialize_i64, serialize_i64_opt};
 /// PR-CRUD 增量备注（2026-08-25）：
 /// - TPart::Serialize 用 `shared::types::serialize_i64{,_opt}` 标 8 个 i64 字段，
 ///   与 Global Constraint #3（i64 主键 → JSON 字符串）一致。
+///
+/// 2026-09-16 增量（migration 026 FK 翻转）：+`process_chain_id`（29 列），
+/// 前端「工序制定」列表按它是否为 NULL 区分已制定 / 未制定。
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct TPart {
     #[serde(serialize_with = "serialize_i64")]
@@ -72,6 +75,10 @@ pub struct TPart {
     pub deleted_at: Option<chrono::NaiveDateTime>,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub delivery_note_id: Option<i64>,
+    /// 逻辑 FK → `t_part_process_chain.id`（migration 026 FK 翻转，2026-09-16）。
+    /// `None` = 未制定工艺链；活跃 part 间 1:1（`uq_t_part_process_chain`）。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub process_chain_id: Option<i64>,
 }
 
 /// `t_part` 行（to_ship 流专用最小投影）

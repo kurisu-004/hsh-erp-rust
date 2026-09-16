@@ -1,7 +1,8 @@
 //! process_chain 域数据模型
 //!
-//! 对应表（migration 017）：
-//! - `t_part_process_chain` —— 1:1 绑定 part 的工艺链 header
+//! 对应表（migration 017；026 起 FK 方向翻转）：
+//! - `t_part_process_chain` —— 工艺链 header（与 part 1:1；2026-09-16 起由
+//!   `t_part.process_chain_id` 指向本表，本表不再持有 `part_id` 列）
 //! - `t_process_chain_step` —— 多步子表
 //!
 //! 行结构 + builder pattern：
@@ -14,8 +15,6 @@ use chrono::NaiveDateTime;
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPartProcessChain {
     pub id: i64,
-    #[allow(dead_code)]
-    pub part_id: i64,
     #[allow(dead_code)]
     pub name: String,
     pub version: i32,
