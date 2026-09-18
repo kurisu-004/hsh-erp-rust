@@ -627,153 +627,22 @@ async fn soft_delete_version_conflict() {
 }
 
 // ===========================================================================
-// 2026-09-16 M2-B review 第 1 轮：upload-intents / confirm 集成测试 stub
+// 2026-09-18 注释：原 M2-B review 第 1 轮的 upload-intents 集成测试
+// （upload_intents_owner_not_found / upload_intents_dedup_hit）已删除——
+// upload-intents 端点 2026-09-18 删除，迁移至 upload_session 域（Redis 共享
+// STS 凭证机制）。本文件保留 confirm 端点的集成测试（tmp_missing /
+// size_mismatch / replace_old_single 三条），通过 PartFileService::bind_uploaded_file
+// 端到端验证。
 //
-// 覆盖 plan T2.5 / T2.6 验收要求：
-//   - upload_intents_owner_not_found   part_id=999999 → 21105 OWNER_NOT_FOUND
-//   - upload_intents_dedup_hit         同 part+kind+sha 已有文件 → dedup_hit=true
-//                                       + existing_file 非空 + tmp_key 空
-//   - confirm_tmp_missing              head_object NoSuchKey → 21114
-//   - confirm_size_mismatch            head size 与声明 size 不一致 → 21115
-//   - confirm_replace_old_single       同 part+kind 二次 confirm → 旧行 deleted_at 设
-//
-// 用 MockCos 注入 head/copy 响应（NoopCos 的 head_object 永远返回 size=0，
-// 无法驱动 21114/21115 错误码分支）。STS 走 NoopSts（issue_for_intents 不发请求）。
+// 2026-09-18 注：原 upload-intents 测试用到的 `infra::sts::NoopSts` 也已删除，
+// 现统一用 `infra::python_sts::NoopPythonSts`（占位 STS 转发到 python 后端）。
 // ===========================================================================
 
-use hsh_erp_rust::infra::sts::NoopSts;
-use hsh_erp_rust::modules::part_file::dto::{
-    ConfirmFileIn, UploadIntentItemIn, UploadIntentsIn,
-};
+use hsh_erp_rust::modules::part_file::dto::ConfirmFileIn;
 use hsh_erp_rust::modules::part_file::repo::PartFileRepo;
 
 const UPLOAD_TMP_PREFIX: &str = "tmp/";
 const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
-
-#[tokio::test]
-async fn upload_intents_owner_not_found() {
-    // 验证 plan T2.5：owner_part_id 不存在 → 21105 OWNER_NOT_FOUND
-    let (_guard, pool) = setup().await;
-    let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let sts: Arc<dyn hsh_erp_rust::infra::sts::StsCredentialIssuer> = Arc::new(NoopSts);
-
-    // part_id = 999999_999_999_999，PG 必查不到
-    let nonexistent = 999_999_999_999_i64;
-    let req = UploadIntentsIn {
-        owner_part_id: Some(nonexistent),
-        files: vec![UploadIntentItemIn {
-            kind: "DRAWING".into(),
-            filename: "drawing.pdf".into(),
-            file_size: 1024,
-            content_sha256: "a".repeat(64),
-            content_type: "application/pdf".into(),
-        }],
-    };
-    let err = PartFileService::upload_intents(
-        &pool,
-        UPLOAD_TMP_PREFIX,
-        sts,
-        &req,
-        &current,
-    )
-    .await
-    .expect_err("不存在的 owner_part_id 应报错");
-
-    match err {
-        AppError::Biz { code, .. } => {
-            assert_eq!(code, 21105, "BIZ_PART_FILE_OWNER_NOT_FOUND");
-        }
-        other => panic!("期望 AppError::Biz(21105)，got {other:?}"),
-    }
-    let _ = (pool, snowflake);
-}
-
-#[tokio::test]
-async fn upload_intents_dedup_hit() {
-    // 验证 plan T2.5：dedup_hit 命中 → 返回 existing_file 不签 STS
-    let (_guard, pool) = setup().await;
-    let l1 = insert_l1_customer(&pool, "客户PF-Dedup", "F").await;
-    let l2 = insert_l2_customer(&pool, "子客PF-Dedup", l1).await;
-    let part_id = insert_part_for_owner(&pool, l2).await;
-
-    let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let sts: Arc<dyn hsh_erp_rust::infra::sts::StsCredentialIssuer> = Arc::new(NoopSts);
-    let cos = Arc::new(MockCos::new());
-
-    // 第一次：multipart 上传一个 DRAWING（part_file 已落库 → 后续 dedup 可命中）
-    let pdf_bytes = b"%PDF-1.5\ndedup content\n%%EOF".to_vec();
-    let pdf_size = pdf_bytes.len() as i64;
-    let mut tx = pool.begin().await.unwrap();
-    let _first = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos.clone(),
-        "PART",
-        part_id,
-        "DRAWING",
-        "first.pdf",
-        "application/pdf",
-        pdf_bytes,
-        &current,
-    )
-    .await
-    .expect("first upload ok");
-    tx.commit().await.unwrap();
-
-    // 第二次：upload-intents 同 part_id + kind + sha，应命中 dedup_hit=true
-    // 先查第一次上传的真实 sha（service 计算过 hash 并落库），用其作为第二次上传
-    // upload-intents 的 content_sha256 → 命中 dedup_hit
-    let mut tx = pool.begin().await.unwrap();
-    let first_row = PartFileRepo::get_by_part_kind(&mut *tx, part_id, "DRAWING")
-        .await
-        .unwrap()
-        .expect("first row 必存在");
-    let real_sha = first_row
-        .content_sha256
-        .clone()
-        .expect("content_sha256 必须已计算");
-    drop(tx);
-    let req = UploadIntentsIn {
-        owner_part_id: Some(part_id),
-        files: vec![UploadIntentItemIn {
-            kind: "DRAWING".into(),
-            filename: "second.pdf".into(),
-            file_size: pdf_size,
-            content_sha256: real_sha.clone(),
-            content_type: "application/pdf".into(),
-        }],
-    };
-    let out = PartFileService::upload_intents(
-        &pool,
-        UPLOAD_TMP_PREFIX,
-        sts,
-        &req,
-        &current,
-    )
-    .await
-    .expect("upload-intents ok");
-
-    assert_eq!(out.items.len(), 1);
-    let item = &out.items[0];
-    assert!(
-        item.dedup_hit,
-        "dedup_hit 应为 true（同 part+kind+sha 已有活跃文件）"
-    );
-    assert!(
-        item.tmp_key.is_empty(),
-        "dedup_hit 时 tmp_key 必须为空（前端跳过上传）"
-    );
-    assert!(
-        item.existing_file.is_some(),
-        "dedup_hit 时 existing_file 必须非空"
-    );
-    let existing = item.existing_file.as_ref().unwrap();
-    assert_eq!(existing.owner_id, part_id);
-    assert_eq!(existing.kind, "DRAWING");
-    assert_eq!(existing.original_filename, "first.pdf");
-}
 
 #[tokio::test]
 async fn confirm_tmp_missing_returns_21114() {

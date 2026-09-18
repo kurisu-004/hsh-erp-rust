@@ -28,10 +28,11 @@ pub mod process;
 pub mod process_chain;
 pub mod shelf;
 pub mod statistics;
+pub mod upload_session; // 2026-09-18 新增：Redis 共享 STS 凭证会话机制
 pub mod user;
+pub mod work_type;
 pub mod worker;
 pub mod worker_pool;
-pub mod work_type;
 
 #[derive(Serialize)]
 struct HealthResp {
@@ -64,6 +65,8 @@ pub fn v2_router() -> Router<Arc<AppState>> {
         .nest("/assemblies", assembly::router())
         .nest("/cnc-programs", cnc_program::router())
         .nest("/part-files", part_file::router())
+        // 2026-09-18 新增：上传会话域（7 个 POST 端点，挂在 /api/v2/upload-sessions）
+        .nest("/upload-sessions", upload_session::router())
         .nest("/outsource-companies", outsource::company_router())
         .nest("/outsource-quotes", outsource::quote_router())
         .nest("/outsource-shipments", outsource::shipment_router())

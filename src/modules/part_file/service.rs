@@ -1,4 +1,4 @@
-//! part_file 域业务逻辑（2026-09-14 Phase 3 + 2026-09-16 M2-B 业务层）
+//! part_file 域业务逻辑（2026-09-14 Phase 3 + 2026-09-16 M2-B 业务层 + 2026-09-18 upload-intents 删除）
 //!
 //! 对应 Python myERP/service/part_file_service.py + service/_file_kind_policy.py。
 //!
@@ -24,10 +24,11 @@
 //! 装配体 PDF（kind='ASSEMBLY_MASTER'）走相同上传通道，owner_kind='ASSEMBLY'，
 //! 由 assembly 域在创建流程或单独的 `POST /assemblies/{id}/files` 端点调用。
 //!
-//! ## 2026-09-16 M2-B 直传 COS 链路
-//! - `upload_intents`：场景 A/B 一次性签发 STS + 预生成 tmp_key / CAS 去重命中复用
-//! - `bind_uploaded_file`：confirm handler + batch_create service 共享的"已上传到 tmp
-//!   区 → 绑定到 owner"逻辑；head/copy 在 tx 之外，事务内只做 soft_delete + INSERT
+//! ## 2026-09-16 M2-B → 2026-09-18 upload_session 拆分
+//! - 原 `upload_intents` 业务函数（场景 A/B 一次性签 STS + CAS 去重命中复用）
+//!   **2026-09-18 已删除**：迁移至 `upload_session` 域（共享 STS 凭证 + Redis 会话）。
+//! - `bind_uploaded_file` 保留：confirm handler + batch_create service 共享的"已上传到
+//!   tmp 区 → 绑定到 owner"逻辑；head/copy 在 tx 之外，事务内只做 soft_delete + INSERT。
 
 use std::sync::Arc;
 
@@ -37,13 +38,12 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part_file::dto::{
-    validate, PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut,
-    UploadIntentItemOut, UploadIntentsIn, UploadIntentsOut,
+    PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut, validate,
 };
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy;
-use crate::modules::part_file::repo::{hash_bytes, NewPartFile, PartFileRepo};
-use crate::shared::error::{code, AppError};
+use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
+use crate::shared::error::{AppError, code};
 
 pub struct PartFileService;
 
@@ -73,8 +73,12 @@ impl PartFileService {
         Self::assert_owner_exists(conn, owner_kind, owner_id).await?;
 
         // 2. kind 白名单（policy::allowed_exts 自动挡掉未知 kind）
-        let ext = policy::ext_of(original_filename)
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("文件缺少扩展名: {original_filename:?}")))?;
+        let ext = policy::ext_of(original_filename).ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_FILE_BAD_TYPE,
+                format!("文件缺少扩展名: {original_filename:?}"),
+            )
+        })?;
         let allowed_exts = policy::allowed_exts(kind);
         if !allowed_exts.contains(&ext.as_str()) {
             return Err(AppError::biz(
@@ -84,7 +88,10 @@ impl PartFileService {
         }
         // 3. content_type 校验
         let expected = policy::expected_content_types_for_ext(&ext);
-        if !expected.iter().any(|c| c.eq_ignore_ascii_case(content_type)) {
+        if !expected
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(content_type))
+        {
             return Err(AppError::biz(
                 code::BIZ_PART_FILE_BAD_TYPE,
                 format!(
@@ -93,12 +100,18 @@ impl PartFileService {
             ));
         }
         // 4. file_type 推导
-        let file_type = policy::file_type_for_ext(&ext)
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("扩展名 {ext:?} 无对应 file_type")))?;
+        let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_FILE_BAD_TYPE,
+                format!("扩展名 {ext:?} 无对应 file_type"),
+            )
+        })?;
 
         // 5. SHA-256 → CAS 去重（撞唯一索引 → 21108 DUPLICATE）
         let sha = hash_bytes(&bytes);
-        if let Some(existing) = PartFileRepo::get_by_owner_kind_sha(&mut *conn, owner_id, kind, &sha).await? {
+        if let Some(existing) =
+            PartFileRepo::get_by_owner_kind_sha(&mut *conn, owner_id, kind, &sha).await?
+        {
             // CAS 命中：跳过 COS PUT，直接复用已有记录（返回 id / object_key）
             return Ok(Self::render_out(&existing, owner_kind));
         }
@@ -131,19 +144,21 @@ impl PartFileService {
             content_sha256: Some(&sha),
             created_by: current.id,
         };
-        let id = PartFileRepo::create_part_file(&mut *conn, nf).await.map_err(|e| match e {
-            sqlx::Error::Database(db) => {
-                if db.code().as_deref() == Some("23505") {
-                    AppError::biz(
-                        code::BIZ_PART_FILE_DUPLICATE,
-                        format!("owner {owner_id} / {kind} / sha={} 撞唯一索引", &sha[..16]),
-                    )
-                } else {
-                    AppError::from(sqlx::Error::Database(db))
+        let id = PartFileRepo::create_part_file(&mut *conn, nf)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(db) => {
+                    if db.code().as_deref() == Some("23505") {
+                        AppError::biz(
+                            code::BIZ_PART_FILE_DUPLICATE,
+                            format!("owner {owner_id} / {kind} / sha={} 撞唯一索引", &sha[..16]),
+                        )
+                    } else {
+                        AppError::from(sqlx::Error::Database(db))
+                    }
                 }
-            }
-            other => AppError::from(other),
-        })?;
+                other => AppError::from(other),
+            })?;
 
         // 8. 读回（include_deleted=true 兜底 INSERT 可见性）
         let row = PartFileRepo::get_by_id(&mut *conn, id, true)
@@ -158,7 +173,12 @@ impl PartFileService {
         query: &PartFileListQuery,
         current: &CurrentUser,
     ) -> Result<PartFileListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector, Role::CncProgrammer])?;
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
         let limit = query.limit.unwrap_or(50).clamp(1, 500);
         let offset = query.offset.unwrap_or(0).max(0);
         let owner_kind = query.owner_kind.as_deref().unwrap_or("PART");
@@ -197,10 +217,20 @@ impl PartFileService {
         file_id: i64,
         current: &CurrentUser,
     ) -> Result<PartFileWithUrlOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector, Role::CncProgrammer])?;
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
         let row = PartFileRepo::get_by_id(&mut *conn, file_id, false)
             .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_NOT_FOUND, format!("part_file {file_id} 不存在")))?;
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_FILE_NOT_FOUND,
+                    format!("part_file {file_id} 不存在"),
+                )
+            })?;
         let url = cos.presigned_get_url(&row.object_key, 3600).await?;
         Ok(PartFileWithUrlOut {
             id: row.id.to_string(),
@@ -224,12 +254,11 @@ impl PartFileService {
     ) -> Result<(), AppError> {
         match owner_kind {
             "PART" => {
-                let exists: Option<(i64,)> = sqlx::query_as(
-                    "SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-                )
-                .bind(owner_id)
-                .fetch_optional(&mut *conn)
-                .await?;
+                let exists: Option<(i64,)> =
+                    sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+                        .bind(owner_id)
+                        .fetch_optional(&mut *conn)
+                        .await?;
                 if exists.is_none() {
                     return Err(AppError::biz(
                         code::BIZ_PART_FILE_OWNER_NOT_FOUND,
@@ -316,124 +345,13 @@ pub async fn list_part_files_for_owner(
     PartFileRepo::list_by_owner(conn, owner_kind, owner_id).await
 }
 
-// ===== 2026-09-16 M2-B 业务层：直传 COS 链路 service =====
+// ===== 2026-09-16 M2-B 业务层：bind_uploaded_file（confirm + batch_create 共享） =====
+//
+// 2026-09-18 注：原 `upload_intents` 业务函数已**删除**（迁移至 upload_session 域）。
+// 保留 `bind_uploaded_file` 给 confirm handler + batch_create service 共用：
+// head/copy 在 tx 之外，事务内只做 soft_delete + INSERT。
 
 impl PartFileService {
-    /// `POST /api/v2/part-files/upload-intents`（场景 A + 场景 B）。
-    ///
-    /// 流程：
-    /// 1. 权限守卫（Manager + Clerk）
-    /// 2. 逐项校验（kind / sha / filename / size / content_type）—— 用
-    ///    [`dto::validate`] 集中函数
-    /// 3. 场景 B（`owner_part_id` 非空）：
-    ///    - 校验 part 存在（`assert_owner_exists`）
-    ///    - 逐项查 `(part_id, kind, sha)` CAS 命中；命中 → 标 `dedup_hit=true`，
-    ///      附 `existing_file`，**不分配 tmp_key**
-    ///    - 未命中 → 分配 `tmp_key = format!("{owner_sub_prefix}/{kind}/{seq}_{safe}")`
-    /// 4. 场景 A（`owner_part_id` 空）：
-    ///    - 生成 `batch_uuid = Uuid::new_v4()`
-    ///    - 逐项分配 `tmp_key = format!("{batch_sub_prefix}/{seq}_{safe}")`（**不查重**
-    ///      —— part 还未建，无法查重；batch_create 时再按 (新建 part_id, kind, sha) 二次查）
-    /// 5. 一次性签 STS（`state.sts.issue_for_intents(tmp_sub_prefix)`）—— 单次签发覆盖
-    ///    本次 batch 的所有 tmp 对象，前端只需拿一组 credentials 即可
-    /// 6. 返回 `UploadIntentsOut`
-    ///
-    /// 关键不变式：
-    /// - **tmp_key 必须以 `tmp_sub_prefix` 开头**：前端按 prefix 写，服务端 confirm 时
-    ///   按 prefix 校验（防客户端乱传 key 读到别人文件）
-    /// - **STS policy resource 覆盖整个 tmp_sub_prefix**：caller 在 `issue_for_intents`
-    ///   内显式构造
-    #[allow(clippy::too_many_arguments)]
-    pub async fn upload_intents(
-        pool: &PgPool,
-        cfg_tmp_prefix: &str,
-        sts: Arc<dyn crate::infra::sts::StsCredentialIssuer>,
-        req: &UploadIntentsIn,
-        current: &CurrentUser,
-    ) -> Result<UploadIntentsOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-
-        // 全空 files 列表直接返回空 items（前端可能请求后还没勾选文件）
-        if req.files.is_empty() {
-            // 仍签一次 STS（保持出参形态一致；frontend 拿到 credentials 后可丢弃）
-            let cred = sts.issue_for_intents(cfg_tmp_prefix).await?;
-            return Ok(UploadIntentsOut {
-                credentials: cos_credentials_out(&cred),
-                bucket: cred.bucket,
-                region: cred.region,
-                tmp_prefix: cred.tmp_prefix,
-                items: vec![],
-            });
-        }
-
-        // 1. 逐项校验
-        let max_file_size = 300 * 1024 * 1024usize; // 与 dto::validate 一致（默认 300MB）
-        for item in &req.files {
-            validate::check_upload_intent_item(item, max_file_size)?;
-        }
-
-        // 2. 派生 tmp_sub_prefix（场景 A 用 batch_uuid；场景 B 用 owner_part_id）
-        let mut conn = pool.acquire().await?;
-        let tmp_sub_prefix = if let Some(owner_id) = req.owner_part_id {
-            // 场景 B：先校验 part 存在
-            Self::assert_owner_exists(&mut conn, "PART", owner_id).await?;
-            format!("{cfg_tmp_prefix}part/{owner_id}")
-        } else {
-            // 场景 A：batch_uuid 一次性生成
-            format!("{cfg_tmp_prefix}{}", uuid::Uuid::new_v4())
-        };
-
-        // 3. 一次性签 STS（覆盖整 tmp_sub_prefix/*）
-        let cred = sts.issue_for_intents(&tmp_sub_prefix).await?;
-
-        // 4. 逐项分配 tmp_key 或 dedup 命中复用
-        let mut items = Vec::with_capacity(req.files.len());
-        for (seq, item) in req.files.iter().enumerate() {
-            let client_ref = seq.to_string();
-            // 场景 B：先查重；命中 → 复用，不分配 tmp_key
-            if let Some(owner_id) = req.owner_part_id
-                && let Some(existing) = PartFileRepo::get_by_owner_kind_sha(
-                    &mut *conn,
-                    owner_id,
-                    &item.kind,
-                    &item.content_sha256,
-                )
-                .await?
-            {
-                items.push(UploadIntentItemOut {
-                    client_ref,
-                    tmp_key: String::new(),
-                    dedup_hit: true,
-                    existing_file: Some(Self::render_out(&existing, "PART")),
-                });
-                continue;
-            }
-            // 未命中（场景 A 全走这里 + 场景 B 未命中）：分配 tmp_key
-            let safe = sanitize_filename(&item.filename);
-            let tmp_key = if let Some(_owner_id) = req.owner_part_id {
-                // 场景 B：tmp_key 形如 `tmp/part/{owner_id}/{kind}/{seq}_{safe}`
-                format!("{}/{}/{}_{}", tmp_sub_prefix, item.kind, seq, safe)
-            } else {
-                // 场景 A：tmp_key 形如 `tmp/{batch_uuid}/{seq}_{safe}`（无 kind 段）
-                format!("{tmp_sub_prefix}/{seq}_{safe}")
-            };
-            items.push(UploadIntentItemOut {
-                client_ref,
-                tmp_key,
-                dedup_hit: false,
-                existing_file: None,
-            });
-        }
-
-        Ok(UploadIntentsOut {
-            credentials: cos_credentials_out(&cred),
-            bucket: cred.bucket,
-            region: cred.region,
-            tmp_prefix: cred.tmp_prefix,
-            items,
-        })
-    }
-
     /// 共享 service：把已上传到 COS tmp 区的一个对象绑定到 owner（INSERT t_part_file）。
     ///
     /// 调用方：`confirm handler`（T2.6）+ `batch_create service`（T2.7）。
@@ -487,9 +405,7 @@ impl PartFileService {
         if !tmp_key.starts_with(cfg_tmp_prefix) {
             return Err(AppError::biz(
                 code::BIZ_INVALID_VALUE,
-                format!(
-                    "tmp_key {tmp_key:?} 不在 cfg_tmp_prefix {cfg_tmp_prefix:?} 范围内"
-                ),
+                format!("tmp_key {tmp_key:?} 不在 cfg_tmp_prefix {cfg_tmp_prefix:?} 范围内"),
             ));
         }
 
@@ -607,16 +523,6 @@ impl PartFileService {
     }
 }
 
-/// 把 `StsCredential` 转 `CosCredentialsOut`（DTO 序列化层细节）。
-fn cos_credentials_out(cred: &crate::infra::sts::StsCredential) -> crate::modules::part_file::dto::CosCredentialsOut {
-    crate::modules::part_file::dto::CosCredentialsOut {
-        tmp_secret_id: cred.tmp_secret_id.clone(),
-        tmp_secret_key: cred.tmp_secret_key.clone(),
-        session_token: cred.session_token.clone(),
-        expired_time: cred.expired_time,
-    }
-}
-
 // ===== 2026-09-15 takeover-fill：content / delete（Phase 3 补齐） =====
 
 /// 后端代理文件二进制流：拉 `object_key` → COS `get_object` → 透传 content_type。
@@ -694,7 +600,9 @@ impl PartFileService {
             other => {
                 return Err(AppError::biz(
                     code::BIZ_PART_FILE_BAD_TYPE,
-                    format!("kind={other:?} 不可软删（仅 DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET / G_CODE）"),
+                    format!(
+                        "kind={other:?} 不可软删（仅 DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET / G_CODE）"
+                    ),
                 ));
             }
         }

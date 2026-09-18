@@ -13,7 +13,8 @@
 > - [`./parts/index.md`](./parts/index.md) — part 域（49 端点：to-inspection / to-ship 批量+单件 / to-process / **worker-scan** + Phase 1/2 全套批量与单件状态机扩展，2026-09-14）
 > - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（8 端点：装配体 CRUD + multipart PDF + 子件自动生成 + start + 子件 auto-rollup，2026-09-14 Phase 3）
 > - [`./cnc-programs.md`](./cnc-programs.md) — cnc_program 域（2 端点：配对上传 + 列表，2026-09-14 Phase 3）
-> - [`./files.md`](./files.md) — part_file 域（3 端点：上传 + 列表 + 下载 URL，2026-09-14 Phase 3）
+> - [`./files.md`](./files.md) — part_file 域（multipart 上传 + 列表 + 下载 URL + confirm 绑定，2026-09-14 Phase 3；2026-09-18 删除 upload-intents）
+> - [`./upload_session.md`](./upload_session.md) — upload_session 域（7 端点：共享 STS 凭证的 Redis 会话机制，2026-09-18 新增；替代原 `POST /part-files/upload-intents`）
 > - [`./outsource-companies.md`](./outsource-companies.md) — 外协公司（7 端点，2026-09-13 Phase 2）
 > - [`./outsource-quotes.md`](./outsource-quotes.md) — 外协报价（8 端点，2026-09-13 Phase 2）
 > - [`./outsource-shipments.md`](./outsource-shipments.md) — 外协发货（1 端点：reconcile-update，2026-09-13 Phase 2）
@@ -164,7 +165,8 @@ HTTP 状态码：
 | part | [`./parts/index.md`](./parts/index.md) | **49** | ✅ 完全上线（Phase 1+2 全部状态机 / 批量 / 扫码 / pick-up 端点落地，2026-09-14） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
-| part-files | [`./files.md`](./files.md) | 3 | ✅ 完全上线（2026-09-14，Phase 3） |
+| part-files | [`./files.md`](./files.md) | 4 | ✅ 完全上线（2026-09-14，Phase 3；2026-09-18 删除 upload-intents → 改由 upload_session 域承载 STS 共享机制） |
+| upload-sessions | [`./upload_session.md`](./upload_session.md) | 7 | ✅ 完全上线（2026-09-18 新增：共享 STS 凭证 Redis 会话机制，替代原 upload-intents 一次性签发） |
 | outsource-companies | [`./outsource-companies.md`](./outsource-companies.md) | 7 | ✅ 完全上线（2026-09-14，Phase 2） |
 | outsource-quotes | [`./outsource-quotes.md`](./outsource-quotes.md) | 8 | ✅ 完全上线（2026-09-14，Phase 2） |
 | outsource-shipments | [`./outsource-shipments.md`](./outsource-shipments.md) | 1 | ✅ 完全上线（2026-09-14，Phase 2） |

@@ -9,13 +9,15 @@
 //! - `serial`：业务单号/序列号计数（占位）
 //! - `ws_hub`：WebSocket 广播中枢
 //! - `redis`：Redis 连接池构建（deadpool-redis 0.23，session store 用）
+//! - `sts`：STS 临时凭证签发（M2-A 旧 `TencentSts` 直连腾讯云；2026-09-18 已删除，
+//!   改为 `python_sts` 通过 HTTP 转发到 python 后端）
 
 pub mod clock;
 pub mod config;
 pub mod cos;
 pub mod db;
+pub mod python_sts; // 2026-09-18 新增：转发 python 后端签发 STS
 pub mod redis;
 pub mod serial;
 pub mod snowflake;
-pub mod sts; // 2026-09-16 M2-A：STS 临时凭证签发（前端直传 COS）
 pub mod ws_hub;

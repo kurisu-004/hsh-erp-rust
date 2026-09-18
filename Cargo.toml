@@ -104,8 +104,8 @@ tokio-stream = "0.1"
 # （SDK 0.1.2 未暴露该接口，spike 已验证签名/编码规则）。rustls-tls 避免拖入 OpenSSL。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
-# 2026-09-16 M2-B 新增：upload-intents batch_uuid 派生。v4 随机 UUID
-# （场景 A 批量预生成 tmp 前缀，避免与场景 B 已有 part 的 tmp_key 撞前缀）。
+# 2026-09-18 M3-B 新增：upload_session 域 `tmp/sess/<session_uuid>/` 派生。
+# v4 随机 UUID；原 upload-intents batch_uuid 派生已删除（迁移至 upload_session）。
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

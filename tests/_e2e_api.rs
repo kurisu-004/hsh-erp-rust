@@ -373,10 +373,11 @@ async fn e2e_guard_returns_404_when_disabled() {
         state.snowflake.clone(),
         state.ws_hub.clone(),
         state.cos.clone(),
-        // 2026-09-16 M2-A：测试场景直接复用原 state 的 sts（通常是 NoopSts）
-        state.sts.clone(),
+        // 2026-09-18 M3-B：测试场景直接复用原 state 的 python_sts（通常是 NoopPythonSts）
+        state.python_sts.clone(),
         state.shutdown.clone(),
         state.session.clone(),
+        state.upload_session_repo.clone(),
     ));
 
     let app = test_app(new_state);
@@ -518,10 +519,11 @@ async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
         state.snowflake.clone(),
         state.ws_hub.clone(),
         state.cos.clone(),
-        // 2026-09-16 M2-A：测试场景直接复用原 state 的 sts（通常是 NoopSts）
-        state.sts.clone(),
+        // 2026-09-18 M3-B：测试场景直接复用原 state 的 python_sts（通常是 NoopPythonSts）
+        state.python_sts.clone(),
         state.shutdown.clone(),
         state.session.clone(),
+        state.upload_session_repo.clone(),
     ));
     let app = test_app(new_state);
 

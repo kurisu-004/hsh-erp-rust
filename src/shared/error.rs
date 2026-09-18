@@ -10,7 +10,8 @@
 //! - `5xxxx`      系统错误（50000 INTERNAL、50001 DATABASE）
 //! - `2xxxx`      业务域错误：200xx 用户/订单、201xx 零件/客户、202xx 工人、203xx 装配体、
 //!   204xx 图纸文件、205xx 货架、206xx 账号、208xx 工序、209xx 工种、210xx 申请人、
-//!   211xx 零件文件、212xx 外协公司、213xx 外协报价、214xx 送货单、215xx 外协发货。
+//!   211xx 零件文件、212xx 外协公司、213xx 外协报价、214xx 送货单、215xx 外协发货、
+//!   216xx 上传会话（Redis 共享 STS 凭证机制）。
 //!
 //! ### 与 Python 的差异（冲突解决记录）
 //! - `20109` 在 Python 中被 `BIZ_PART_BATCH_NOT_FOUND` 与 `BIZ_CUSTOMER_IN_USE` 双重占用。
@@ -239,6 +240,21 @@ pub mod code {
     // release-from-programming / send-to-outsource）时 part 还未制定工艺链 → 拒
     pub const BIZ_PROCESS_CHAIN_REQUIRED: i32 = 20706;
 
+    // 216xx 上传会话（Redis 共享 STS 凭证机制，2026-09-18 新增）
+    // 槽位选择说明：
+    // - 21601~21609 为 upload_session 域独享（不与 part_file 21114~21116 等既有码冲突）。
+    // - 段号选取 216xx 而非复用 211xx：避免与 part_file 同段造成前端"上传相关"错误码
+    //   心智合并时新旧语义重叠（upload_session 是 redis 会话机制 + 转发 python 签发，
+    //   与 part_file.tmp_object 上传链路是两套独立通路）。
+    pub const BIZ_UPLOAD_SESSION_NOT_FOUND: i32 = 21601; // Redis key 不存在（discarded / TTL 过期）
+    pub const BIZ_UPLOAD_SESSION_SCOPE_INVALID: i32 = 21602; // scope 不在白名单（首期仅 "parts_new"）
+    pub const BIZ_UPLOAD_SESSION_MISMATCH: i32 = 21603; // path session_id != Redis session.session_id（用户/作用域不匹配）
+    pub const BIZ_UPLOAD_SESSION_FILE_NOT_FOUND: i32 = 21604; // allocate / complete / remove 时 client_ref 不在 session.files
+    pub const BIZ_UPLOAD_SESSION_BAD_TYPE: i32 = 21605; // kind 不在 DRAWING / 3D_MODEL 白名单
+    pub const BIZ_UPLOAD_SESSION_HEAD_FAILED: i32 = 21606; // complete 校验时 COS head_object 失败（tmp 对象不存在 / 不可达）
+    pub const BIZ_UPLOAD_SESSION_SIZE_MISMATCH: i32 = 21607; // complete 校验时 head size 与声明 size 不一致
+    pub const BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED: i32 = 21608; // PythonStsClient 转发 python 签发失败（HTTP 4xx/5xx/超时）
+
     // 系统错误
     pub const INTERNAL: i32 = 50000;
     pub const DATABASE: i32 = 50001;
@@ -381,6 +397,9 @@ fn status_from_code(c: i32) -> StatusCode {
         c if c == code::VERSION_CONFLICT => StatusCode::CONFLICT,
         c if c == code::REQUEST_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
         c if c == code::INTERNAL || c == code::DATABASE => StatusCode::INTERNAL_SERVER_ERROR,
+        // 2026-09-18 上传会话域：转发 python STS 签发失败（infra 层 5xx 显式登记）
+        // 用 SERVICE_UNAVAILABLE 而非 INTERNAL_SERVER_ERROR：业务可重试，与 5xxxx 系统错语义区分。
+        c if c == code::BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED => StatusCode::SERVICE_UNAVAILABLE,
 
         // ---- 2xxxx 业务码：404 (资源缺失) ----
         c if c == code::BIZ_USER_NOT_FOUND
@@ -406,7 +425,10 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE
             || c == code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND
             || c == code::BIZ_PROCESS_CHAIN_NOT_FOUND
-            || c == code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND =>
+            || c == code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND
+            // 2026-09-18 上传会话域：Redis key 不存在 + client_ref 不存在
+            || c == code::BIZ_UPLOAD_SESSION_NOT_FOUND
+            || c == code::BIZ_UPLOAD_SESSION_FILE_NOT_FOUND =>
         {
             StatusCode::NOT_FOUND
         }
@@ -443,13 +465,20 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER
             || c == code::BIZ_PART_NOT_DELETABLE
             || c == code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING
-            || c == code::BIZ_PROCESS_CHAIN_REQUIRED =>
+            || c == code::BIZ_PROCESS_CHAIN_REQUIRED
+            // 2026-09-18 上传会话域：path session_id 与 Redis session_id 不匹配
+            || c == code::BIZ_UPLOAD_SESSION_MISMATCH =>
         {
             StatusCode::CONFLICT
         }
 
         // ---- 2xxxx 业务码：422 (校验类，Python 显式声明 21113 → 422) ----
-        c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER || c == code::BIZ_SHELF_PROCESS_NOT_MAPPED => {
+        c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER
+            || c == code::BIZ_SHELF_PROCESS_NOT_MAPPED
+            // 2026-09-18 上传会话域：scope 不在白名单 / kind 不在白名单走 422（语义校验失败）
+            || c == code::BIZ_UPLOAD_SESSION_SCOPE_INVALID
+            || c == code::BIZ_UPLOAD_SESSION_BAD_TYPE =>
+        {
             StatusCode::UNPROCESSABLE_ENTITY
         }
 
@@ -458,7 +487,10 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY
             || c == code::BIZ_PART_NOT_DELIVERED
             || c == code::BIZ_PART_NOT_READY_TO_SHIP
-            || c == code::BIZ_PART_REPAIR_NOT_TRIGGERED =>
+            || c == code::BIZ_PART_REPAIR_NOT_TRIGGERED
+            // 2026-09-18 上传会话域：head 校验失败 / size 不一致（业务校验失败，HTTP 400）
+            || c == code::BIZ_UPLOAD_SESSION_HEAD_FAILED
+            || c == code::BIZ_UPLOAD_SESSION_SIZE_MISMATCH =>
         {
             StatusCode::BAD_REQUEST
         }
@@ -883,6 +915,39 @@ mod tests {
             code::BIZ_PROCESS_CHAIN_REQUIRED,
             "BIZ_PROCESS_CHAIN_REQUIRED",
         ),
+        // 2026-09-18 新增：upload_session 域错误码（Redis 共享 STS 凭证机制）
+        (
+            code::BIZ_UPLOAD_SESSION_NOT_FOUND,
+            "BIZ_UPLOAD_SESSION_NOT_FOUND",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_SCOPE_INVALID,
+            "BIZ_UPLOAD_SESSION_SCOPE_INVALID",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_MISMATCH,
+            "BIZ_UPLOAD_SESSION_MISMATCH",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_FILE_NOT_FOUND,
+            "BIZ_UPLOAD_SESSION_FILE_NOT_FOUND",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_BAD_TYPE,
+            "BIZ_UPLOAD_SESSION_BAD_TYPE",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_HEAD_FAILED,
+            "BIZ_UPLOAD_SESSION_HEAD_FAILED",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_SIZE_MISMATCH,
+            "BIZ_UPLOAD_SESSION_SIZE_MISMATCH",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED,
+            "BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED",
+        ),
     ];
 
     #[test]
@@ -1069,6 +1134,16 @@ mod tests {
         assert_eq!(code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING, 20705);
         // 2026-09-16 PR-3 批次 step 化：part 无工艺链时禁上生产流
         assert_eq!(code::BIZ_PROCESS_CHAIN_REQUIRED, 20706);
+
+        // 216xx 上传会话域（2026-09-18 新增）：Redis 共享 STS 凭证机制
+        assert_eq!(code::BIZ_UPLOAD_SESSION_NOT_FOUND, 21601);
+        assert_eq!(code::BIZ_UPLOAD_SESSION_SCOPE_INVALID, 21602);
+        assert_eq!(code::BIZ_UPLOAD_SESSION_MISMATCH, 21603);
+        assert_eq!(code::BIZ_UPLOAD_SESSION_FILE_NOT_FOUND, 21604);
+        assert_eq!(code::BIZ_UPLOAD_SESSION_BAD_TYPE, 21605);
+        assert_eq!(code::BIZ_UPLOAD_SESSION_HEAD_FAILED, 21606);
+        assert_eq!(code::BIZ_UPLOAD_SESSION_SIZE_MISMATCH, 21607);
+        assert_eq!(code::BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED, 21608);
     }
 
     /// 数据驱动的 HTTP 表覆盖测试：每个 (code, expected_http, name) 一行。
@@ -1266,6 +1341,47 @@ mod tests {
             code::BIZ_PROCESS_CHAIN_REQUIRED,
             StatusCode::CONFLICT,
             "BIZ_PROCESS_CHAIN_REQUIRED",
+        ),
+        // 2026-09-18 上传会话域：HTTP 表覆盖（4 个新码）
+        (
+            code::BIZ_UPLOAD_SESSION_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_UPLOAD_SESSION_NOT_FOUND",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_FILE_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_UPLOAD_SESSION_FILE_NOT_FOUND",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_MISMATCH,
+            StatusCode::CONFLICT,
+            "BIZ_UPLOAD_SESSION_MISMATCH",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_SCOPE_INVALID,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "BIZ_UPLOAD_SESSION_SCOPE_INVALID",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_BAD_TYPE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "BIZ_UPLOAD_SESSION_BAD_TYPE",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_HEAD_FAILED,
+            StatusCode::BAD_REQUEST,
+            "BIZ_UPLOAD_SESSION_HEAD_FAILED",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_SIZE_MISMATCH,
+            StatusCode::BAD_REQUEST,
+            "BIZ_UPLOAD_SESSION_SIZE_MISMATCH",
+        ),
+        (
+            code::BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED",
         ),
         // 2xxxx 显式 409
         (

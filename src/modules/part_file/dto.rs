@@ -5,17 +5,19 @@
 //! ## id 序列化约定
 //! 雪花 i64 字段用 `serialize_i64`（Global Constraint #3）。
 //!
-//! ## 2026-09-16 M2-B 业务层
-//! 新增直传 COS 链路的 DTO（`UploadIntentsIn` / `UploadIntentsOut` /
-//! `ConfirmFileIn` 等）+ `validate` 子模块集中校验函数。
+//! ## 2026-09-16 M2-B → 2026-09-18 上传会话拆分
+//! - 原 M2-B 直传 COS 链路 DTO（`UploadIntentsIn` / `UploadIntentsOut` /
+//!   `UploadIntentItemIn` / `UploadIntentItemOut` / `UploadIntentsIn` + 上传意图校验）
+//!   2026-09-18 已删除：上传意图机制迁移至 `upload_session` 域（共享 STS 凭证 +
+//!   Redis 会话），保留 `ConfirmFileIn` 作为 confirm 端点的入参。
+//! - `validate` 子模块保留：confirm 端点继续复用 kind / sha / filename / size /
+//!   content_type 校验函数。
 
 use serde::{Deserialize, Serialize};
 
 use crate::modules::part_file::policy;
-use crate::shared::error::{code, AppError};
-use crate::shared::types::{
-    deserialize_i64, deserialize_i64_opt, serialize_i64, serialize_i64_opt,
-};
+use crate::shared::error::{AppError, code};
+use crate::shared::types::{deserialize_i64, serialize_i64, serialize_i64_opt};
 
 // ---------- 出参 ----------
 
@@ -77,87 +79,15 @@ pub struct PartFileListOut {
     pub total: i64,
 }
 
-// ===== 2026-09-16 M2-B 业务层：直传 COS 链路 DTO =====
-
-/// `POST /api/v2/part-files/upload-intents` 单文件项。
-///
-/// 客户端用 `client_ref` 把本条意图回连到 UI 行；服务端按 `(owner_id, kind, sha)`
-/// 做 CAS 去重，命中则标记 `dedup_hit=true` 并复用已有 `PartFileOut`，不分配
-/// `tmp_key`（前端无需上传即可让前端直接刷列表）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct UploadIntentItemIn {
-    pub kind: String, // "DRAWING" / "3D_MODEL"
-    pub filename: String,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub file_size: i64,
-    /// 64 hex chars（客户端声明的 SHA-256；服务端在 confirm 时再算实际值交叉校验）。
-    pub content_sha256: String,
-    pub content_type: String,
-}
-
-/// `POST /api/v2/part-files/upload-intents` 入参。
-///
-/// - `owner_part_id = Some(_)`：场景 B（已有 part 的补传 / 详情页加文件）；
-///   同 `(owner_id, kind, sha)` 已存在 → 标记 `dedup_hit`。
-/// - `owner_part_id = None`：场景 A（批量预生成 + part 还未创建）；
-///   不做去重（part 还没建，无法查重），分配 batch_uuid 前缀。
-#[derive(Debug, Clone, Deserialize)]
-pub struct UploadIntentsIn {
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub owner_part_id: Option<i64>,
-    pub files: Vec<UploadIntentItemIn>,
-}
-
-/// 单条上传意图结果。
-///
-/// - `dedup_hit=true`：`tmp_key` 为空、`existing_file` 填充，前端跳过上传
-/// - `dedup_hit=false`：`tmp_key` 分配、`existing_file` 缺省
-#[derive(Debug, Clone, Serialize)]
-pub struct UploadIntentItemOut {
-    /// 客户端 reference，前端用此 key 把上传进度映射回行。
-    ///
-    /// service 端按入参顺序 1:1 返回 `seq`（0-based 序号转字符串）。
-    pub client_ref: String,
-    /// COS 临时对象 key（dedup_hit 时为空）。
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub tmp_key: String,
-    /// CAS 去重命中（同 owner+kind+sha 已有活跃文件）。
-    pub dedup_hit: bool,
-    /// 命中时返回已有文件（前端直接刷列表，免上传）。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub existing_file: Option<PartFileOut>,
-}
-
-/// `POST /api/v2/part-files/upload-intents` 出参。
-///
-/// 一次性下发 STS 凭证 + 整 batch 的 tmp 前缀 + 每文件的 tmp_key 或 dedup 命中标记。
-#[derive(Debug, Clone, Serialize)]
-pub struct UploadIntentsOut {
-    pub credentials: CosCredentialsOut,
-    pub bucket: String,
-    pub region: String,
-    /// 本次 batch 的 tmp 前缀（场景 A：`{tmp_prefix}{batch_uuid}/`；
-    /// 场景 B：`{tmp_prefix}part/{owner_id}/`）。
-    pub tmp_prefix: String,
-    pub items: Vec<UploadIntentItemOut>,
-}
-
-/// 客户端拿到后拼 PUT 请求时用的 STS 临时凭证子集。
-///
-/// 字段命名贴近 SDK `TemporaryCredentials`；`expired_time` 序列化为 unix 秒字符串。
-#[derive(Debug, Clone, Serialize)]
-pub struct CosCredentialsOut {
-    pub tmp_secret_id: String,
-    pub tmp_secret_key: String,
-    pub session_token: String,
-    #[serde(serialize_with = "serialize_i64")]
-    pub expired_time: i64,
-}
-
-/// `POST /api/v2/parts/{id}/files/confirm` 入参。
-///
-/// 客户端声明已上传完成的 tmp 对象；服务端 head_object 校验存在 + size 一致后
-/// copy 到 CAS key，再 INSERT `t_part_file` 并 spawn 异步 delete tmp 兜底。
+// ===== 2026-09-16 M2-B 业务层：ConfirmFileIn（保留） =====
+//
+// 2026-09-18 注：原 `UploadIntentsIn` / `UploadIntentsOut` / `UploadIntentItemIn` /
+// `UploadIntentItemOut` / `CosCredentialsOut` 等 DTO 已删除，迁移至
+// `upload_session` 域（共享 STS 凭证 + Redis 会话机制）。
+// - `POST /api/v2/part-files/upload-intents` 端点（删除）
+// - 直传意图分配 tmp_key 的 DTO（删除；由 upload_session.allocate 替代）
+//
+// confirm 端点（`POST /api/v2/parts/{id}/files/confirm`）仍保留，其入参：
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfirmFileIn {
     pub kind: String,
@@ -276,20 +206,6 @@ pub mod validate {
         Ok(())
     }
 
-    /// 一站式校验 `UploadIntentItemIn`（含 max_file_size 上下文）。
-    #[allow(clippy::too_many_arguments)]
-    pub fn check_upload_intent_item(
-        item: &UploadIntentItemIn,
-        max_file_size: usize,
-    ) -> Result<(), AppError> {
-        check_kind(&item.kind)?;
-        check_sha256(&item.content_sha256)?;
-        check_filename(&item.filename)?;
-        check_file_size(item.file_size, max_file_size)?;
-        check_content_type(&item.content_type, &item.filename)?;
-        Ok(())
-    }
-
     /// 一站式校验 `ConfirmFileIn`（bind_uploaded_file 用）。
     #[allow(clippy::too_many_arguments)]
     pub fn check_confirm_file_in(
@@ -394,18 +310,6 @@ mod tests {
     #[test]
     fn check_content_type_rejects_missing_ext() {
         assert!(validate::check_content_type("application/pdf", "noext").is_err());
-    }
-
-    #[test]
-    fn check_upload_intent_item_happy_path() {
-        let item = UploadIntentItemIn {
-            kind: "DRAWING".into(),
-            filename: "drawing.pdf".into(),
-            file_size: 1024,
-            content_sha256: "a".repeat(64),
-            content_type: "application/pdf".into(),
-        };
-        assert!(validate::check_upload_intent_item(&item, max_file_size()).is_ok());
     }
 
     #[test]
