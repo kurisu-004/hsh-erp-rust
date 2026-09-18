@@ -10,13 +10,12 @@
 //! - logout 通过 `AuthTokenHash` extractor 拿当前 token 的 sha256 hex，调
 //!   `state.session_service.logout(...)` 删 Redis session 条目，后续 `/iam/me` 立即 40105。
 //!
-//! ## 路由双注册（PR-1 兼容期）
-//! `auth_router()` / `users_router()` 是 `/api/v2/auth/*` / `/api/v2/users/*` 的旧 alias，
-//! handler 与 `router()` 共享（同一组 axum 路由函数挂到不同 nest 上）。保留期给前端 /
-//! 第三方客户端做迁移缓冲；PR-4（计划）会删。
-//!
 //! 2026-09-19 IAM 域合并：合并 `auth/handler.rs`（5 端点）+ `user/handler.rs`（9 端点），
-//! 业务 handler 函数 + router 工厂函数一并落到本文件。
+//! 业务 handler 函数 + 1 个 router 工厂函数一并落到本文件。
+//!
+//! 2026-09-19 IAM 域收尾（PR-4）：旧 alias `/api/v2/auth/*` + `/api/v2/users/*` 已下线，
+//! `/api/v2/iam/*` 成为 IAM 域唯一对外接口。`auth_router` / `users_router` 两个旧工厂
+//! 函数随 PR-1 兼容期一并移除。
 
 use std::sync::Arc;
 
@@ -200,13 +199,13 @@ pub async fn remove_role(
 }
 
 // ===========================================================================
-// 路由工厂函数（3 个：router / auth_router / users_router）
+// 路由工厂函数（1 个：router）
 //
-// `auth_router` 与 `users_router` 是 PR-1 兼容期的旧 alias；同组路由函数挂到不同
-// nest 上。前端在 PR-4 之前可继续用 `/api/v2/auth/*` + `/api/v2/users/*`。
+// 2026-09-19 IAM 域收尾（PR-4）：`auth_router` / `users_router` 旧 alias 已下线；
+// 新路径 `/api/v2/iam/*` 是 IAM 域唯一对外接口。
 // ===========================================================================
 
-/// 新路径 router（挂在 `/api/v2/iam`，见 `modules::v2_router`）
+/// iam 域 router（挂在 `/api/v2/iam`，见 `modules::v2_router`）
 pub fn router() -> Router<Arc<AppState>> {
     let session = Router::new()
         .route("/login", post(login))
@@ -227,26 +226,4 @@ pub fn router() -> Router<Arc<AppState>> {
         .merge(session)
         // account 端点挂在 `/iam/users`
         .nest("/users", users)
-}
-
-/// 旧 alias router（挂在 `/api/v2/auth`，PR-1 兼容期保留，PR-4 删除）
-pub fn auth_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/login", post(login))
-        .route("/me", get(me))
-        .route("/logout", post(logout))
-        .route("/change-password", post(change_password))
-        .route("/refresh", post(refresh))
-}
-
-/// 旧 alias router（挂在 `/api/v2/users`，PR-1 兼容期保留，PR-4 删除）
-pub fn users_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/", get(list_users).post(create_user))
-        .route("/{id}", get(get_user))
-        .route("/{id}/update", post(update_user))
-        .route("/{id}/reset-password", post(admin_reset_password))
-        .route("/{id}/deactivate", post(deactivate_user))
-        .route("/{id}/roles", get(list_user_roles).post(add_role))
-        .route("/{id}/roles/{role_id}/remove", post(remove_role))
 }

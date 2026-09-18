@@ -86,7 +86,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, P
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),
@@ -106,7 +106,7 @@ async fn login_inspector(pool: PgPool, username: &str) -> (axum::Router, String,
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),
@@ -126,7 +126,7 @@ async fn login_clerk(pool: PgPool, username: &str) -> (axum::Router, String, PgP
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),
@@ -2019,7 +2019,7 @@ async fn batch_create_parts_handler_spawn_delete_on_ok() {
             app_login,
             json_request(
                 "POST",
-                "/auth/login",
+                "/iam/login",
                 Some(json!({"username": "manager-spawn", "password": "changeme"})),
                 None,
             ),
@@ -2144,7 +2144,7 @@ async fn batch_create_parts_handler_spawn_delete_on_err() {
             app_login,
             json_request(
                 "POST",
-                "/auth/login",
+                "/iam/login",
                 Some(json!({"username": "manager-err-spawn", "password": "changeme"})),
                 None,
             ),

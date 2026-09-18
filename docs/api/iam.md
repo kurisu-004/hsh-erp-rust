@@ -3,10 +3,9 @@
 > 本文件须与 `src/modules/iam/{handler.rs,dto.rs,service/{session,account}.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
-> ⚠️ **2026-09-19 IAM 域合并（PR-1）**：原 `auth.md` + `users.md` 已合并为本文档。
-> 新路径 `/api/v2/iam/*`；保留旧 alias `/api/v2/auth/*` + `/api/v2/users/*` 至 PR-4 删除。
-> - [`./auth.md`](./auth.md) — 已废弃，保留为兼容期旧 alias 参考
-> - [`./users.md`](./users.md) — 已废弃，保留为兼容期旧 alias 参考
+> **2026-09-19 IAM 域合并（PR-1）**：原 `auth.md` + `users.md` 已合并为本文档。
+> **2026-09-19 IAM 域收尾（PR-4）**：旧 alias `/api/v2/auth/*` + `/api/v2/users/*` 已下线，
+> `/api/v2/iam/*` 成为 IAM 域唯一对外接口。`auth.md` + `users.md` 已删除。
 
 ## 端点列表
 
@@ -338,28 +337,3 @@ Response 200 `data`: `null`
 | `scope_id` | string (i64)? | 绑定的货架 ID（仅 `SHELF_ACCOUNT` 非空） |
 | `shelf_code` | string? | 货架编号（仅 `SHELF_ACCOUNT` 非空） |
 | `shelf_name` | string? | 货架名（仅 `SHELF_ACCOUNT` 非空） |
-
----
-
-## 旧 alias（PR-1 兼容期，PR-4 删除）
-
-PR-1 兼容期内保留以下旧 alias path（同组路由函数挂到不同 nest 上，前端 / 第三方客户端可继续使用）：
-
-| 旧 alias 新 path | 等价于 |
-|---|---|
-| `POST /api/v2/auth/login` | `POST /api/v2/iam/login` |
-| `GET /api/v2/auth/me` | `GET /api/v2/iam/me` |
-| `POST /api/v2/auth/logout` | `POST /api/v2/iam/logout` |
-| `POST /api/v2/auth/change-password` | `POST /api/v2/iam/change-password` |
-| `POST /api/v2/auth/refresh` | `POST /api/v2/iam/refresh` |
-| `GET /api/v2/users` | `GET /api/v2/iam/users` |
-| `POST /api/v2/users` | `POST /api/v2/iam/users` |
-| `GET /api/v2/users/{id}` | `GET /api/v2/iam/users/{id}` |
-| `POST /api/v2/users/{id}/update` | `POST /api/v2/iam/users/{id}/update` |
-| `POST /api/v2/users/{id}/reset-password` | `POST /api/v2/iam/users/{id}/reset-password` |
-| `POST /api/v2/users/{id}/deactivate` | `POST /api/v2/iam/users/{id}/deactivate` |
-| `GET /api/v2/users/{id}/roles` | `GET /api/v2/iam/users/{id}/roles` |
-| `POST /api/v2/users/{id}/roles` | `POST /api/v2/iam/users/{id}/roles` |
-| `POST /api/v2/users/{id}/roles/{role_id}/remove` | `POST /api/v2/iam/users/{id}/roles/{role_id}/remove` |
-
-PR-4 删除：`src/modules/iam/handler.rs::auth_router()` / `users_router()` 工厂函数 + 旧 alias 路由表。

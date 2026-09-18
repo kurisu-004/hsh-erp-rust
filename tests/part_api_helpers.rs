@@ -89,7 +89,7 @@ pub async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, Strin
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),
@@ -110,7 +110,7 @@ pub async fn login_inspector(pool: PgPool, username: &str) -> (axum::Router, Str
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),
@@ -131,7 +131,7 @@ pub async fn login_clerk(pool: PgPool, username: &str) -> (axum::Router, String,
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),
@@ -169,7 +169,7 @@ pub async fn login_worker(pool: PgPool, username: &str) -> (axum::Router, String
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),

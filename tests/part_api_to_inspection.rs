@@ -809,7 +809,7 @@ async fn part_batches_role_guard_rejects_unauthorized() {
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": "shelf_user_scan", "password": "changeme"})),
             None,
         ),
