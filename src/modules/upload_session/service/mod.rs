@@ -99,7 +99,9 @@ fn now_unix() -> i64 {
 ///
 /// `scope` 已校验过白名单（caller 负责）。
 ///
-/// 2026-09-18 新增。
+/// 2026-09-18 新增；2026-09-18 第 2 轮 review 修复：`PythonStsCredential` 字段路径
+/// 调整（嵌套 `credentials` + 顶层另 7 字段）；`tmp_prefix` 不再由 python 返回，
+/// 用本地变量（caller 已传入）作为 session.tmp_prefix。
 async fn issue_and_persist(
     repo: &Arc<dyn UploadSessionRepo>,
     sts: &Arc<dyn PythonSts>,
@@ -111,23 +113,26 @@ async fn issue_and_persist(
     let session_id = Uuid::new_v4().to_string();
     let tmp_prefix = format!("tmp/sess/{session_id}/");
 
-    // 调 python 签发（不传 prefix 让 python 端规范化；当前实现是按 caller 传的 prefix 原样回传）
+    // 调 python 签发。python schema 不返回 tmp_prefix（按 caller 传入原样回写
+    // 由 python 端业务约定；rust 端不二次解析），tmp_prefix 由本地变量持有。
     let cred = sts.issue(&tmp_prefix, sts_duration_seconds).await?;
 
     let now = now_unix();
     let credentials = SessionCredentials {
-        tmp_secret_id: cred.tmp_secret_id,
-        tmp_secret_key: cred.tmp_secret_key,
-        session_token: cred.session_token,
-        start_time: cred.start_time,
-        expired_time: cred.expired_time,
+        tmp_secret_id: cred.credentials.tmp_secret_id,
+        tmp_secret_key: cred.credentials.tmp_secret_key,
+        session_token: cred.credentials.session_token,
+        start_time: cred.credentials.start_time,
+        expired_time: cred.credentials.expired_time,
     };
 
     let session = UploadSession {
         session_id: session_id.clone(),
         user_id,
         scope: scope.to_string(),
-        tmp_prefix: cred.tmp_prefix.clone(),
+        // tmp_prefix 由 caller 拼好传给 python；不再从 cred 回读（python schema
+        // 不返回该字段）。renew_credentials 同样保留 session.tmp_prefix 不动。
+        tmp_prefix: tmp_prefix.clone(),
         bucket: cred.bucket,
         region: cred.region,
         expires_in: (credentials.expired_time - credentials.start_time).max(0),
@@ -143,15 +148,15 @@ async fn issue_and_persist(
 
 /// 在已存在的 session 上更新凭证（renew 用）。
 ///
-/// 不重新生成 session_id / tmp_prefix，保留同 session 的 tmp 前缀复用；
-/// 若 python 端换 prefix 则 tmp_prefix 跟随更新（极少出现；python 端约定 prefix 稳定）。
+/// 不重新生成 session_id / tmp_prefix，保留同 session 的 tmp 前缀复用（caller
+/// 把 session.tmp_prefix 传给 python，python 端约定原样回传；rust 端不再从 cred
+/// 回读 tmp_prefix）。
 ///
-/// 2026-09-18 review #13 修复：原实现 `updated.tmp_prefix = cred.tmp_prefix`
-/// 直接用 python 返回值，若 python 端异常返回不同 prefix（如 prefix 漂移）
-/// 会导致 session 内部 tmp_prefix 与已分配的 `session.files[*].tmp_key` 派生
-/// 锚点不一致 → 后续 complete / remove 用旧 tmp_prefix 找 COS 对象找不到。
-/// 修复：断言 `cred.tmp_prefix == session.tmp_prefix`，不等则 500 报错并保留
-/// session 旧 tmp_prefix（防止漂移扩散）。
+/// 2026-09-18 review #13 修复（prefix 漂移守护）的核心不变量保持：session.tmp_prefix
+/// 在 renew 前后**不变**——若 python 端异常漂移，由后续使用 `tmp_prefix` 派生的
+/// `session.files[*].tmp_key` 找不到对应 COS 对象来暴露。本函数不再做 prefix 比对
+/// 报错（python schema 不返回 tmp_prefix，无法比对），改由 service 整体契约
+/// 保证 tmp_prefix 由 rust 端独占持有。
 async fn renew_credentials(
     repo: &Arc<dyn UploadSessionRepo>,
     sts: &Arc<dyn PythonSts>,
@@ -159,31 +164,23 @@ async fn renew_credentials(
     ttl_seconds: u64,
     sts_duration_seconds: u32,
 ) -> Result<UploadSession, AppError> {
+    // 复用 session.tmp_prefix 传给 python；rust 端独占持有 tmp_prefix 派生权。
     let cred = sts.issue(&session.tmp_prefix, sts_duration_seconds).await?;
-    // 2026-09-18 review #13 修复：tmp_prefix 必须保持稳定（前端所有已分配的 tmp_key
-    // 都基于这个 prefix 派生）；python 端若异常返回不同 prefix → 拒绝落库，
-    // 业务侧走完整 retry 而不是悄悄漂移。
-    if cred.tmp_prefix != session.tmp_prefix {
-        return Err(AppError::internal(format!(
-            "python STS 返回 tmp_prefix {:?} 与 session {:?} 不一致，疑似 python 端 prefix 漂移",
-            cred.tmp_prefix, session.tmp_prefix
-        )));
-    }
     let now = now_unix();
 
     let mut updated = session.clone();
     updated.credentials = SessionCredentials {
-        tmp_secret_id: cred.tmp_secret_id,
-        tmp_secret_key: cred.tmp_secret_key,
-        session_token: cred.session_token,
-        start_time: cred.start_time,
-        expired_time: cred.expired_time,
+        tmp_secret_id: cred.credentials.tmp_secret_id,
+        tmp_secret_key: cred.credentials.tmp_secret_key,
+        session_token: cred.credentials.session_token,
+        start_time: cred.credentials.start_time,
+        expired_time: cred.credentials.expired_time,
     };
     updated.expires_in = (updated.credentials.expired_time - updated.credentials.start_time).max(0);
     updated.bucket = cred.bucket;
     updated.region = cred.region;
-    // tmp_prefix 跟随 python 端约定；通常与旧值一致（prefix 由 caller 拼后传入，python 端不重拼）
-    updated.tmp_prefix = cred.tmp_prefix;
+    // tmp_prefix 保持 session 旧值（不来自 cred；2026-09-18 第 2 轮 review 修复）
+    updated.tmp_prefix = session.tmp_prefix.clone();
     updated.updated_at = now;
 
     repo.put(&updated, ttl_seconds).await?;
