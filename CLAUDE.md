@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目定位
 
-`hsh-erp` monorepo 的 Rust 后端 v2 子模块（对应 `backend-rust/`），承担新功能域（auth / deliveryNote / scanInspect / part / assembly / outsource / cnc_program / part_file / worker_pool / process_chain / production / _e2e 等 19 域）；历史业务域在兄弟子模块 `backend-python/`（FastAPI v1）。跨后端契约（共享 JWT_SECRET / 共享 PostgreSQL 库 / 雪花 ID 实例号分工等）见根仓库 [`../CLAUDE.md`](../CLAUDE.md) §跨子模块架构，本文件不重复。
+`hsh-erp` monorepo 的 Rust 后端 v2 子模块（对应 `backend-rust/`），承担新功能域（iam / deliveryNote / scanInspect / part / assembly / outsource / cnc_program / part_file / worker_pool / process_chain / production / _e2e 等 19 域）；历史业务域在兄弟子模块 `backend-python/`（FastAPI v1）。跨后端契约（共享 JWT_SECRET / 共享 PostgreSQL 库 / 雪花 ID 实例号分工等）见根仓库 [`../CLAUDE.md`](../CLAUDE.md) §跨子模块架构，本文件不重复。
 
 **权威文档是 `docs/architecture.md`**——含完整技术栈选型理由、目录结构、Python→Rust 模块映射表、实施路线图。做任何架构决策前先读它；本文件只提炼不动脑就需要遵守的硬约定。
 

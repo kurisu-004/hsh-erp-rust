@@ -19,7 +19,7 @@
 //! - helper `resolve_roles_and_scope` 收 `&mut dyn IamUnitOfWork`（需 `shelf_repo().get_by_id(...)`），
 //!   保持与本服务在自己 begin 的 uow 同 tx。
 //!
-//! 2026-09-19 IAM 域合并：`AuthService` → `SessionService`，改密改密用 `AccountService`
+//! 2026-09-19 IAM 域合并：`AuthService` → `SessionService`，改密用 `AccountService`
 //! 取代原 `UserService`。
 
 use std::sync::Arc;
