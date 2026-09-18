@@ -12,7 +12,7 @@
 //! 覆盖 fixture。用一个进程级 `tokio::sync::Mutex` 在每个用例入口序列化对 DB 的写入。
 //!
 //! ## UoW 语义测试
-//! - `sqlx_uow_commit_persists_writes` —— 通过 SqlxUowProvider.begin() 开 tx，
+//! - `sqlx_uow_commit_persists_writes` —— 通过 SqlxIamUowProvider.begin() 开 tx，
 //!   经访问器写数据，commit() 后用独立 pool 查应可见；
 //! - `sqlx_uow_drop_without_commit_rolls_back` —— 开 tx 后写数据但直接 drop
 //!   （隐式回滚），用独立 pool 查应不可见。
@@ -31,11 +31,13 @@ use common::{ensure_database_exists, test_pool};
 
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-use hsh_erp_rust::modules::user::repo::{
+// 2026-09-19 IAM 域合并：原 `user::repo` / `user::uow` 重定向到 `iam::repo` / `iam::uow`，
+// 类型重命名为 `SqlxIamUowProvider` / `IamUowProvider`（加 Iam 前缀）。
+use hsh_erp_rust::modules::iam::repo::{
     MenuRepo, ShelfRepo, UserInsert, UserRepo, UserRoleInsert, UserRoleRepo,
 };
-use hsh_erp_rust::modules::user::uow::{
-    SqlxUowProvider, UowProvider,
+use hsh_erp_rust::modules::iam::uow::{
+    IamUowProvider, SqlxIamUowProvider,
 };
 
 // ===========================================================================
@@ -920,15 +922,15 @@ async fn shelf_get_by_id_returns_none_for_missing() {
 }
 
 // ===========================================================================
-// 多表组合事务 (2 例)：经 SqlxUowProvider 开 tx，跨多 repo 写，最后 commit。
+// 多表组合事务 (2 例)：经 SqlxIamUowProvider 开 tx，跨多 repo 写，最后 commit。
 // ===========================================================================
 
-/// `SqlxUowProvider`：commit 后写入对外可见
+/// `SqlxIamUowProvider`：commit 后写入对外可见
 #[tokio::test]
 async fn create_user_then_add_role_then_list_persists_all() {
     let (_g, pool) = setup().await;
 
-    let provider = SqlxUowProvider::new(pool.clone());
+    let provider = SqlxIamUowProvider::new(pool.clone());
     let mut uow = provider.begin().await.expect("begin");
 
     // 写 user
@@ -973,7 +975,7 @@ async fn create_user_then_add_role_then_list_persists_all() {
     assert_eq!(rows[0].role, "MANAGER");
 }
 
-/// `SqlxUowProvider`：commit 后不存在的 user 不能通过 list_by_user 看到软删 + role 关联
+/// `SqlxIamUowProvider`：commit 后不存在的 user 不能通过 list_by_user 看到软删 + role 关联
 #[tokio::test]
 async fn soft_delete_user_then_list_roles_returns_empty() {
     let (_g, pool) = setup().await;
@@ -982,7 +984,7 @@ async fn soft_delete_user_then_list_roles_returns_empty() {
     let uid = seed_user(&pool, "toclose", true).await;
     let _ = seed_role(&pool, uid, "CLERK", None, None).await;
 
-    let provider = SqlxUowProvider::new(pool.clone());
+    let provider = SqlxIamUowProvider::new(pool.clone());
     let mut uow = provider.begin().await.expect("begin");
 
     uow.user_repo()
@@ -1003,12 +1005,12 @@ async fn soft_delete_user_then_list_roles_returns_empty() {
 // UoW 语义 (2 例)：commit / drop 行为
 // ===========================================================================
 
-/// `SqlxUnitOfWork::commit()` 后写入持久化（独立连接可查到）
+/// `SqlxIamUnitOfWork::commit()` 后写入持久化（独立连接可查到）
 #[tokio::test]
 async fn sqlx_uow_commit_persists_writes() {
     let (_g, pool) = setup().await;
 
-    let provider = SqlxUowProvider::new(pool.clone());
+    let provider = SqlxIamUowProvider::new(pool.clone());
     let mut uow = provider.begin().await.expect("begin");
     let uid = snowflake().lock().unwrap().next_id();
     uow.user_repo()
@@ -1034,12 +1036,12 @@ async fn sqlx_uow_commit_persists_writes() {
     assert_eq!(u.username, "committed");
 }
 
-/// `SqlxUnitOfWork` 在不 commit 时 drop → 隐式回滚（写入不可见）
+/// `SqlxIamUnitOfWork` 在不 commit 时 drop → 隐式回滚（写入不可见）
 #[tokio::test]
 async fn sqlx_uow_drop_without_commit_rolls_back() {
     let (_g, pool) = setup().await;
 
-    let provider = SqlxUowProvider::new(pool.clone());
+    let provider = SqlxIamUowProvider::new(pool.clone());
     let mut uow = provider.begin().await.expect("begin");
     let uid = snowflake().lock().unwrap().next_id();
     uow.user_repo()

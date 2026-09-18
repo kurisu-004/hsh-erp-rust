@@ -1,6 +1,6 @@
-//! user 域 DTO
+//! iam 域 DTO
 //!
-//! 对应 Python myERP/schema/user.py。命名约定：
+//! 对应 Python myERP/schema/auth.py + schema/user.py。命名约定：
 //! - `XxxRequest`：写操作入参
 //! - `XxxOut`：出参（雪花 id 序列化为 JSON string，防 JS 精度截断）
 //! - `XxxListOut`：列表分页
@@ -11,6 +11,12 @@
 //! 可空 id（`scope_id` / `parent_id`）与 id 列表（`shelf_ids`）在 service 层就转成
 //! `Option<String>` / `Vec<String>`，避免为 `Option<i64>` 再写一套 serde helper——
 //! 出参 JSON 形态与 Python 完全一致（null 仍是 null）。
+//!
+//! ## 字段名硬约定
+//! `LoginResponse` 的字段必须严格是 `token` / `refresh_token` / `user`，对齐 Python 前端
+//! 已绑定的字段。
+//!
+//! 2026-09-19 IAM 域合并：合并 `auth/dto.rs` + `user/dto.rs` 到本文件。
 
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
@@ -66,7 +72,7 @@ pub struct MenuNodeOut {
     pub children: Vec<MenuNodeOut>,
 }
 
-/// `/auth/me` 出参：当前用户 + 扁平角色名 + 可访问货架 + 菜单树
+/// `/iam/me` 出参：当前用户 + 扁平角色名 + 可访问货架 + 菜单树
 #[derive(Debug, Clone, Serialize)]
 pub struct CurrentUserOut {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
@@ -92,9 +98,35 @@ pub struct UserListOut {
     pub offset: i64,
 }
 
+/// 登出结果（no-op，前端清除本地 token 即视为登出）
+#[derive(Debug, Serialize)]
+pub struct LogoutResponse {
+    pub ok: bool,
+}
+
 // ---------------------------------------------------------------------------
 // 入参
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+/// 登录与 refresh 的统一响应（含 access + refresh token + 用户信息）
+#[derive(Debug, Serialize)]
+pub struct LoginResponse {
+    pub token: String,
+    pub refresh_token: String,
+    pub user: CurrentUserOut,
+}
+
+/// refresh token 换新 access/refresh pair
+#[derive(Debug, Deserialize)]
+pub struct RefreshRequest {
+    pub refresh_token: String,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserCreateRequest {

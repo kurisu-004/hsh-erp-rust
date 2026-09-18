@@ -1,59 +1,63 @@
-//! auth 域业务逻辑
+//! iam 域会话 / 登录 / refresh / 改密 service
 //!
 //! 对应 Python myERP/service/auth_service.py。
 //! - login：username 归一化、bcrypt 校验、角色/shelf 范围解析、签发双 token、`last_login_at` 戳更新
 //! - refresh：decode refresh → 校验版本 → 轮转 `refresh_token_version` → 重签双 token
 //! - me：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单，返回最新视图
-//! - change_password：自助改密复用 user 域的 `change_own_password`
+//! - change_password：自助改密复用 `AccountService::change_own_password`
 //!
-//! ## 实施约定（2026-09-18 auth-di 重构 Wave 2B）
-//! - AuthService 持 `Arc<dyn UowProvider>` + `Arc<AppConfig>` + `Arc<dyn SessionStore>` +
-//!   `Arc<UserService>`；所有方法 `&self`。
+//! ## 实施约定（2026-09-18 auth-di 重构 Wave 2B + 2026-09-19 IAM 合并）
+//! - `SessionService` 持 `Arc<dyn IamUowProvider>` + `Arc<AppConfig>` + `Arc<dyn SessionStore>` +
+//!   `Arc<AccountService>`；所有方法 `&self`。
 //! - 写端点（login / refresh）：内部 `self.uow_provider.begin().await?` → 业务操作 →
 //!   `uow.commit().await?` → session 写/清**在 commit 之后**（plan v4 §3 V6 约定）。
 //! - 读端点（me）：内部 begin 后 drop（不 commit，隐式回滚）。
 //! - 不 begin 端点：
-//!   - change_password：纯委托给 `self.user_service.change_own_password(...)`，
-//!     user_service 内部自管 begin/commit。
+//!   - change_password：纯委托给 `self.account_service.change_own_password(...)`，
+//!     account_service 内部自管 begin/commit。
 //!   - logout：无 DB 操作，只清 Redis session。
-//! - helper `resolve_roles_and_scope` 收 `&mut dyn UnitOfWork`（需 `shelf_repo().get_by_id(...)`），
-//!   保持与 auth 在自己 begin 的 uow 同 tx。
+//! - helper `resolve_roles_and_scope` 收 `&mut dyn IamUnitOfWork`（需 `shelf_repo().get_by_id(...)`），
+//!   保持与本服务在自己 begin 的 uow 同 tx。
+//!
+//! 2026-09-19 IAM 域合并：`AuthService` → `SessionService`，改密改密用 `AccountService`
+//! 取代原 `UserService`。
 
 use std::sync::Arc;
 
 use crate::auth::jwt::{decode_refresh, issue_token_pair};
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::auth::session::{hash_token, CachedCurrentUser, SessionStore, TokenKind};
+use crate::auth::session::{CachedCurrentUser, SessionStore, TokenKind, hash_token};
 use crate::infra::clock::now_naive;
 use crate::infra::config::AppConfig;
-use crate::modules::user::dto::{ChangePasswordRequest, CurrentUserOut};
-use crate::modules::user::service::{role_as_str, UserService};
-use crate::modules::user::uow::UnitOfWork;
-use crate::modules::user::uow::UowProvider;
-use crate::shared::error::{code, AppError};
+use crate::modules::iam::dto::{ChangePasswordRequest, CurrentUserOut, LoginResponse, MenuNodeOut};
+use crate::modules::iam::model::User;
+use crate::modules::iam::repo::UserRoleRow;
+use crate::modules::iam::service::account::{AccountService, role_as_str};
+use crate::modules::iam::uow::{IamUnitOfWork, IamUowProvider};
+use crate::shared::error::{AppError, code};
 
-use super::dto::{LoginRequest, LoginResponse, RefreshRequest};
+use super::super::dto::{LoginRequest, RefreshRequest};
 
 /// SHELF_ACCOUNT 角色唯一合法的 scope_type
 const SCOPE_TYPE_SHELF: &str = "shelf";
 
-/// 可绑定 SHELF_ACCOUNT 的货架分区白名单（与 user 域 `validate_role_scope` 对齐）
+/// 可绑定 SHELF_ACCOUNT 的货架分区白名单（与 account 域 `validate_role_scope` 对齐）
 const ALLOWED_SHELF_ZONES: [&str; 2] = ["PRODUCTION", "INSPECTION"];
 
-/// auth 域服务。构造时注入 `Arc<dyn UowProvider>`（DB 事务来源）+ `Arc<AppConfig>`
-/// （JWT / Redis TTL 配置）+ `Arc<dyn SessionStore>`（服务端 session）+ `Arc<UserService>`
+/// iam 域会话 service。构造时注入 `Arc<dyn IamUowProvider>`（DB 事务来源）+ `Arc<AppConfig>`
+/// （JWT / Redis TTL 配置）+ `Arc<dyn SessionStore>`（服务端 session）+ `Arc<AccountService>`
 /// （跨域委托：menus / change_password）。
-pub struct AuthService {
-    uow_provider: Arc<dyn UowProvider>,
+pub struct SessionService {
+    uow_provider: Arc<dyn IamUowProvider>,
     config: Arc<AppConfig>,
     session: Arc<dyn SessionStore>,
-    user_service: Arc<UserService>,
+    account_service: Arc<AccountService>,
 }
 
 /// 把 DB 中的 role 字符串转回 `Role` 枚举。
 ///
-/// UserRoleRow.role 是数据库返回的 varchar，已由 seed 数据保证只含 5 种已知值；遇到未知值时
+/// `UserRoleRow.role` 是数据库返回的 varchar，已由 seed 数据保证只含 5 种已知值；遇到未知值时
 /// 记 warn 并跳过——宁可不识别也不 panic。
 fn parse_role(s: &str) -> Option<Role> {
     Some(match s {
@@ -66,31 +70,28 @@ fn parse_role(s: &str) -> Option<Role> {
     })
 }
 
-/// 重复 UserService::change_own_password 中的乐观锁翻译，service 局部使用。
+/// 重复 AccountService::change_own_password 中的乐观锁翻译，service 局部使用。
 fn version_conflict() -> AppError {
     AppError::biz(code::VERSION_CONFLICT, "数据已被他人修改，请刷新后重试")
 }
 
-impl AuthService {
+impl SessionService {
     /// 构造。
     pub fn new(
-        uow_provider: Arc<dyn UowProvider>,
+        uow_provider: Arc<dyn IamUowProvider>,
         config: Arc<AppConfig>,
         session: Arc<dyn SessionStore>,
-        user_service: Arc<UserService>,
+        account_service: Arc<AccountService>,
     ) -> Self {
         Self {
             uow_provider,
             config,
             session,
-            user_service,
+            account_service,
         }
     }
 
-    pub async fn login(
-        &self,
-        req: LoginRequest,
-    ) -> Result<LoginResponse, AppError> {
+    pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse, AppError> {
         // 1. username 归一化（对齐 Python `.strip().lower()`）
         let username_lower = req.username.trim().to_lowercase();
 
@@ -118,13 +119,16 @@ impl AuthService {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
 
-        // 6. 解析角色枚举 + shelf 范围；委托 user_service 取菜单
+        // 6. 解析角色枚举 + shelf 范围；委托 account_service 取菜单
         let (roles, shelf_ids, shelf_wildcard) =
             resolve_roles_and_scope(&mut *uow, &role_rows).await?;
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let menus = self.user_service.menus_for_roles(&mut *uow, &roles).await?;
+        let menus = self
+            .account_service
+            .menus_for_roles(&mut *uow, &roles)
+            .await?;
 
         // 7. 签发双 token
         let pair = issue_token_pair(
@@ -173,7 +177,7 @@ impl AuthService {
             )
             .await?;
 
-        // 10. 组装 CurrentUserOut（直接拼，不绕 user helper，避免 jwt 里 stale 数据回流到 /me）
+        // 10. 组装 CurrentUserOut（直接拼，不绕 account helper，避免 jwt 里 stale 数据回流到 /me）
         let user_out = build_current_user_out(&u, &roles, &shelf_ids, menus);
 
         Ok(LoginResponse {
@@ -183,10 +187,7 @@ impl AuthService {
         })
     }
 
-    pub async fn refresh(
-        &self,
-        req: RefreshRequest,
-    ) -> Result<LoginResponse, AppError> {
+    pub async fn refresh(&self, req: RefreshRequest) -> Result<LoginResponse, AppError> {
         // 1. 解码 refresh token，取 sub + ver
         let (sub, ver) = decode_refresh(
             &req.refresh_token,
@@ -221,19 +222,17 @@ impl AuthService {
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let menus = self.user_service.menus_for_roles(&mut *uow, &roles).await?;
+        let menus = self
+            .account_service
+            .menus_for_roles(&mut *uow, &roles)
+            .await?;
 
         // 5. 轮转 refresh_token_version（带乐观锁；0 行 → 409）
         let user_id = u.id;
         let user_version = u.version;
         let affected = uow
             .user_repo()
-            .increment_refresh_token_version(
-                user_id,
-                user_version,
-                now_naive(),
-                Some(user_id),
-            )
+            .increment_refresh_token_version(user_id, user_version, now_naive(), Some(user_id))
             .await?;
         if affected == 0 {
             return Err(version_conflict());
@@ -302,10 +301,7 @@ impl AuthService {
         })
     }
 
-    pub async fn me(
-        &self,
-        current: &CurrentUser,
-    ) -> Result<CurrentUserOut, AppError> {
+    pub async fn me(&self, current: &CurrentUser) -> Result<CurrentUserOut, AppError> {
         // 读端点：begin 后 drop（隐式回滚，不 commit）
         let mut uow = self.uow_provider.begin().await?;
 
@@ -322,14 +318,17 @@ impl AuthService {
         // 2. 重查角色 + shelf 范围 + 菜单（不走 JWT 里的 stale 数据）
         let role_rows = uow.user_role_repo().list_by_user(u.id).await?;
         let (roles, shelf_ids, _wildcard) = resolve_roles_and_scope(&mut *uow, &role_rows).await?;
-        let menus = self.user_service.menus_for_roles(&mut *uow, &roles).await?;
+        let menus = self
+            .account_service
+            .menus_for_roles(&mut *uow, &roles)
+            .await?;
 
         Ok(build_current_user_out(&u, &roles, &shelf_ids, menus))
     }
 
-    /// 自助改密：纯委托给 user_service（user_service 自己 begin + commit），
-    /// auth 端不 begin、不 commit。入口处的权限校验与 user_service 内部重复，
-    /// 显式提一处以便在 service 入口给出明确语义。
+    /// 自助改密：纯委托给 account_service（account_service 自己 begin + commit），
+    /// 本服务入口处的权限校验与 account_service 内部重复，显式提一处以便在 service
+    /// 入口给出明确语义。
     pub async fn change_password(
         &self,
         user_id: i64,
@@ -339,18 +338,13 @@ impl AuthService {
         if user_id != current.id && !current.has_role(Role::Manager) {
             return Err(AppError::biz(code::FORBIDDEN, "只能修改本人密码"));
         }
-        self.user_service
-            .change_own_password(
-                user_id,
-                &req.old_password,
-                &req.new_password,
-                current,
-            )
+        self.account_service
+            .change_own_password(user_id, &req.old_password, &req.new_password, current)
             .await
     }
 
-    /// 登出当前 token：删 Redis session 条目，使后续 `/me` 立即返回 40105。
-    /// 无 DB 操作，auth 端不 begin。
+    /// 登出当前 token：删 Redis session 条目，使后续 `/iam/me` 立即返回 40105。
+    /// 无 DB 操作，本服务不 begin。
     pub async fn logout(&self, token_hash: &str) -> Result<(), AppError> {
         self.session.delete_session(token_hash).await
     }
@@ -365,10 +359,10 @@ impl AuthService {
 /// 2. `Vec<i64>`：可访问的 shelf_id 列表（仅 SHELF_ACCOUNT 角色 + 货架 active + zone∈白名单）
 /// 3. `bool`：shelf_wildcard——任意一条 SHELF_ACCOUNT 行的 scope_id 为 NULL 时为 true
 ///
-/// 规则与 user_service.validate_role_scope / shelf_repo.get_by_id 一脉相承。
+/// 规则与 account_service.validate_role_scope / shelf_repo.get_by_id 一脉相承。
 async fn resolve_roles_and_scope(
-    uow: &mut dyn UnitOfWork,
-    rows: &[crate::modules::user::repo::UserRoleRow],
+    uow: &mut dyn IamUnitOfWork,
+    rows: &[UserRoleRow],
 ) -> Result<(Vec<Role>, Vec<i64>, bool), AppError> {
     let mut roles: Vec<Role> = Vec::with_capacity(rows.len());
     let mut shelf_ids: Vec<i64> = Vec::new();
@@ -399,13 +393,13 @@ async fn resolve_roles_and_scope(
     Ok((roles, shelf_ids, shelf_wildcard))
 }
 
-/// 直接从 DB User + 解析后的角色/shelf 拼 `CurrentUserOut`，避免绕路 user helper（该 helper
+/// 直接从 DB User + 解析后的角色/shelf 拼 `CurrentUserOut`，避免绕路 account helper（该 helper
 /// 依赖 `CurrentUser` 形参的角色/shelf，会把 stale 数据带进出参）。
 fn build_current_user_out(
-    u: &crate::modules::user::model::User,
+    u: &User,
     roles: &[Role],
     shelf_ids: &[i64],
-    menus: Vec<crate::modules::user::dto::MenuNodeOut>,
+    menus: Vec<MenuNodeOut>,
 ) -> CurrentUserOut {
     CurrentUserOut {
         id: u.id,
@@ -417,8 +411,3 @@ fn build_current_user_out(
         menus,
     }
 }
-
-// 2026-09-18 Wave 2 T10：30 例 mock 单测。仅在 `cargo test` 时编译。
-#[cfg(test)]
-#[path = "service_tests.rs"]
-mod service_tests;

@@ -18,7 +18,8 @@ use crate::auth::password;
 use crate::infra::clock::now_naive;
 use crate::modules::applicant::repo::ApplicantRepo;
 use crate::modules::customer::repo::CustomerRepo;
-use crate::modules::user::repo::{UserInsert, UserRepo, UserRoleInsert, UserRoleRepo};
+// 2026-09-19 IAM 域合并：原 `user::repo` 重定向到 `iam::repo`，方法零 diff。
+use crate::modules::iam::repo::{UserInsert, UserRepo, UserRoleInsert, UserRoleRepo};
 use crate::modules::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
