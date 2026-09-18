@@ -1,7 +1,17 @@
 //! user 域业务逻辑
 //!
 //! 对应 Python myERP/service/user.py + service/menu.py。
-//! 实施约定：方法签名接收 `&mut PgConnection`，由 handler 开 tx 并 commit。
+//!
+//! ## 事务边界（2026-09-18 重构）
+//! Service 持 `Arc<dyn UowProvider>`，所有数据访问经 `uow.user_repo().xxx()` /
+//! `uow.user_role_repo().xxx()` / `uow.menu_repo().xxx()` / `uow.shelf_repo().xxx()`
+//! 访问器；写端点最后 `uow.commit().await?`（消费 Box），读端点直接 drop（隐式回滚）。
+//! Handler 不再开 tx，完全薄壳化（见 `handler.rs`）。
+//!
+//! ## Session 清理
+//! `change_own_password` / `admin_reset_password` 在 `uow.commit().await?` **之后**
+//! 调用 `self.session.delete_all_user_sessions(user_id)`，best-effort 失败只打 warn；
+//! DB 的 `refresh_token_version` 轮转是兜底。
 //!
 //! ## 与 Python 的错误码映射
 //! Python 的 `BIZ_INVALID_VALUE = 20104` / `BIZ_SHELF_NOT_FOUND = 20501` 尚未进入
@@ -15,22 +25,22 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use sqlx::PgConnection;
-
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::session::SessionStore;
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::shared::error::{code, AppError};
-use crate::state::AppState;
 
 use super::dto::{
     CurrentUserOut, MenuNodeOut, UserAddRoleRequest, UserCreateRequest, UserListOut, UserListQuery,
     UserOut, UserRoleOut, UserUpdateRequest,
 };
 use super::model::{Menu, User};
-use super::repo::{
-    MenuRepo, ShelfRepo, UserInsert, UserRepo, UserRoleInsert, UserRoleRepo, UserRoleRow,
+// struct 来自 repo.rs（uow.rs 只 re-export trait，不 re-export struct）
+use super::repo::{UserInsert, UserRoleInsert, UserRoleRow};
+use super::uow::{
+    UnitOfWork, UowProvider,
 };
 
 /// 管理员重置密码时写入的默认口令（对齐 Python `DEFAULT_RESET_PASSWORD`）
@@ -78,30 +88,64 @@ fn trimmed_or_none(v: &str) -> Option<String> {
     }
 }
 
-pub struct UserService;
+/// user 域 service。实例字段 = UoW 来源 + 雪花 ID + session 存储：
+/// - `uow_provider` 是唯一事务入口（handler 不再开 tx）
+/// - `snowflake` 由 AppState 注入（与 Python `SNOWFLAKE_INSTANCE=0` 区分：rust 用实例号 1）
+/// - `session` 在 commit 后用于清该用户的 Redis session（自助改密 / 管理员重置）
+pub struct UserService {
+    uow_provider: Arc<dyn UowProvider>,
+    snowflake: Arc<SnowflakeIdGenerator>,
+    session: Arc<dyn SessionStore>,
+}
 
 impl UserService {
+    /// 三段装线入口：`AppState::new` 调用，注入 provider + snowflake + session。
+    pub fn new(
+        uow_provider: Arc<dyn UowProvider>,
+        snowflake: Arc<SnowflakeIdGenerator>,
+        session: Arc<dyn SessionStore>,
+    ) -> Self {
+        Self {
+            uow_provider,
+            snowflake,
+            session,
+        }
+    }
+
     // =======================================================================
     // 列表 / 详情
     // =======================================================================
 
     pub async fn list_users(
-        conn: &mut PgConnection,
+        &self,
         query: &UserListQuery,
         current: &CurrentUser,
     ) -> Result<UserListOut, AppError> {
         current.require_role(Role::Manager)?;
 
+        let mut uow = self.uow_provider.begin().await?;
+
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
-        let like = query.username_like.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let like = query
+            .username_like
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
-        let rows = UserRepo::list_with_filters(&mut *conn, like, query.is_active, limit, offset).await?;
-        let total = UserRepo::count_with_filters(&mut *conn, like, query.is_active).await?;
+        let rows = uow
+            .user_repo()
+            .list_with_filters(like, query.is_active, limit, offset)
+            .await?;
+        let total = uow
+            .user_repo()
+            .count_with_filters(like, query.is_active)
+            .await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for u in rows {
-            items.push(Self::to_user_out(&mut *conn, u).await?);
+            let roles = uow.user_role_repo().list_by_user(u.id).await?;
+            items.push(Self::assemble_user_out(u, roles));
         }
 
         Ok(UserListOut {
@@ -113,15 +157,20 @@ impl UserService {
     }
 
     pub async fn get_user(
-        conn: &mut PgConnection,
+        &self,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
-        let u = UserRepo::get_by_id(&mut *conn, user_id)
+        let mut uow = self.uow_provider.begin().await?;
+
+        let u = uow
+            .user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
-        Self::to_user_out(conn, u).await
+        let roles = uow.user_role_repo().list_by_user(u.id).await?;
+        Ok(Self::assemble_user_out(u, roles))
     }
 
     // =======================================================================
@@ -129,12 +178,12 @@ impl UserService {
     // =======================================================================
 
     pub async fn create_user(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+        &self,
         req: &UserCreateRequest,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
+        let mut uow = self.uow_provider.begin().await?;
 
         let username = req.username.trim().to_lowercase();
         if username.is_empty() {
@@ -145,7 +194,9 @@ impl UserService {
         }
 
         // 显式查重（partial unique 索引仍是最终防线，见下方 INSERT 的错误映射）
-        if UserRepo::get_by_username(&mut *conn, &username)
+        if uow
+            .user_repo()
+            .get_by_username(&username)
             .await?
             .is_some()
         {
@@ -161,7 +212,7 @@ impl UserService {
         }
 
         let insert = UserInsert {
-            id: snowflake.next_id(),
+            id: self.snowflake.next_id(),
             username,
             password_hash: password::hash(&req.password)?,
             full_name: full_name.to_string(),
@@ -171,25 +222,35 @@ impl UserService {
             created_by: Some(current.id),
         };
 
-        UserRepo::create(&mut *conn, &insert)
+        uow.user_repo()
+            .create(&insert)
             .await
             .map_err(map_duplicate_username)?;
 
-        let u = UserRepo::get_by_id(&mut *conn, insert.id)
+        let u = uow
+            .user_repo()
+            .get_by_id(insert.id)
             .await?
             .ok_or_else(|| AppError::internal("创建后回读用户失败"))?;
-        Self::to_user_out(conn, u).await
+        let roles = uow.user_role_repo().list_by_user(u.id).await?;
+        let out = Self::assemble_user_out(u, roles);
+
+        uow.commit().await?;
+        Ok(out)
     }
 
     pub async fn update_user(
-        conn: &mut PgConnection,
+        &self,
         user_id: i64,
         req: &UserUpdateRequest,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
+        let mut uow = self.uow_provider.begin().await?;
 
-        let u = UserRepo::get_by_id(&mut *conn, user_id)
+        let u = uow
+            .user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
@@ -216,53 +277,64 @@ impl UserService {
             None => None,
         };
 
-        let affected = UserRepo::update_partial(
-            &mut *conn,
-            u.id,
-            u.version,
-            full_name.as_deref(),
-            set_phone,
-            phone.as_deref(),
-            password_hash.as_deref(),
-            req.is_active,
-            now_naive(),
-            Some(current.id),
-        )
-        .await?;
+        let affected = uow
+            .user_repo()
+            .update_partial(
+                u.id,
+                u.version,
+                full_name.as_deref(),
+                set_phone,
+                phone.as_deref(),
+                password_hash.as_deref(),
+                req.is_active,
+                now_naive(),
+                Some(current.id),
+            )
+            .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
-        let updated = UserRepo::get_by_id(&mut *conn, user_id)
+        let updated = uow
+            .user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
-        Self::to_user_out(conn, updated).await
+        let roles = uow.user_role_repo().list_by_user(updated.id).await?;
+        let out = Self::assemble_user_out(updated, roles);
+
+        uow.commit().await?;
+        Ok(out)
     }
 
     /// 停用账号 = 软删（置 `deleted_at` + `is_active = false`）
     pub async fn deactivate_user(
-        conn: &mut PgConnection,
+        &self,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
+        let mut uow = self.uow_provider.begin().await?;
 
-        let u = UserRepo::get_by_id(&mut *conn, user_id)
+        let u = uow
+            .user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        let affected =
-            UserRepo::soft_delete(&mut *conn, u.id, u.version, now_naive(), Some(current.id))
-                .await?;
+        let affected = uow
+            .user_repo()
+            .soft_delete(u.id, u.version, now_naive(), Some(current.id))
+            .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
         // 软删后 get_by_id 会过滤掉该行，故用内存中的行 + 手工推进字段组装出参
         // （对齐 Python `_to_out(u, include_deleted=True)`）。
-        let roles = UserRoleRepo::list_by_user(&mut *conn, u.id).await?;
+        let roles = uow.user_role_repo().list_by_user(u.id).await?;
         let now = now_naive();
-        Ok(Self::assemble_user_out(
+        let out = Self::assemble_user_out(
             User {
                 is_active: false,
                 deleted_at: Some(now),
@@ -272,7 +344,10 @@ impl UserService {
                 ..u
             },
             roles,
-        ))
+        );
+
+        uow.commit().await?;
+        Ok(out)
     }
 
     // =======================================================================
@@ -282,14 +357,14 @@ impl UserService {
     /// 自助改密：校验旧密码，写新哈希并轮转 refresh token（同一条 UPDATE，原子）。
     ///
     /// 允许本人或 MANAGER 调用。注意与 `update_user` 的区别：这里**会**踢下线。
-    /// `state` 用于 DB 提交后 best-effort 清该用户的 Redis session（双保险）。
+    /// 流程：begin uow → 校验旧密码 → UPDATE 写新密码 + 轮转 ver → `uow.commit().await?`
+    /// → `self.session.delete_all_user_sessions(user_id)`（best-effort）。
     pub async fn change_own_password(
-        conn: &mut PgConnection,
+        &self,
         user_id: i64,
         old_password: &str,
         new_password: &str,
         current: &CurrentUser,
-        state: &Arc<AppState>,
     ) -> Result<(), AppError> {
         if user_id != current.id && !current.has_role(Role::Manager) {
             return Err(AppError::biz(code::FORBIDDEN, "只能修改本人密码"));
@@ -298,7 +373,11 @@ impl UserService {
             return Err(AppError::validation("new_password 不能为空"));
         }
 
-        let u = UserRepo::get_by_id(&mut *conn, user_id)
+        let mut uow = self.uow_provider.begin().await?;
+
+        let u = uow
+            .user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
         // get_by_id 已过滤 deleted_at；此处再挡停用账号（对齐 Python 的三重判断）
@@ -313,58 +392,68 @@ impl UserService {
             ));
         }
 
-        let affected = UserRepo::update_password_and_rotate(
-            &mut *conn,
-            u.id,
-            u.version,
-            &password::hash(new_password)?,
-            now_naive(),
-            Some(current.id),
-        )
-        .await?;
+        let affected = uow
+            .user_repo()
+            .update_password_and_rotate(
+                u.id,
+                u.version,
+                &password::hash(new_password)?,
+                now_naive(),
+                Some(current.id),
+            )
+            .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
+
+        uow.commit().await?;
         // DB 提交后清该用户的 Redis session（best-effort；DB 的 refresh_token_version 轮转是兜底）
-        if let Err(e) = state.session.delete_all_user_sessions(user_id).await {
+        if let Err(e) = self.session.delete_all_user_sessions(user_id).await {
             tracing::warn!(error = %e, user_id, "change_own_password: 清 session 失败");
         }
         Ok(())
     }
 
     /// 管理员重置密码为默认口令 `changeme`，并轮转 refresh token（踢下线）。
-    /// `state` 用于 DB 提交后 best-effort 清该用户的 Redis session。
     pub async fn admin_reset_password(
-        conn: &mut PgConnection,
+        &self,
         user_id: i64,
         current: &CurrentUser,
-        state: &Arc<AppState>,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
+        let mut uow = self.uow_provider.begin().await?;
 
-        let u = UserRepo::get_by_id(&mut *conn, user_id)
+        let u = uow
+            .user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        let affected = UserRepo::update_password_and_rotate(
-            &mut *conn,
-            u.id,
-            u.version,
-            &password::hash(DEFAULT_RESET_PASSWORD)?,
-            now_naive(),
-            Some(current.id),
-        )
-        .await?;
+        let affected = uow
+            .user_repo()
+            .update_password_and_rotate(
+                u.id,
+                u.version,
+                &password::hash(DEFAULT_RESET_PASSWORD)?,
+                now_naive(),
+                Some(current.id),
+            )
+            .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
-        let updated = UserRepo::get_by_id(&mut *conn, user_id)
+        let updated = uow
+            .user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
-        let out = Self::to_user_out(conn, updated).await?;
+        let roles = uow.user_role_repo().list_by_user(updated.id).await?;
+        let out = Self::assemble_user_out(updated, roles);
+
+        uow.commit().await?;
         // DB 提交后清该用户的 Redis session（best-effort）
-        if let Err(e) = state.session.delete_all_user_sessions(user_id).await {
+        if let Err(e) = self.session.delete_all_user_sessions(user_id).await {
             tracing::warn!(error = %e, user_id, "admin_reset_password: 清 session 失败");
         }
         Ok(out)
@@ -375,34 +464,37 @@ impl UserService {
     // =======================================================================
 
     pub async fn list_user_roles(
-        conn: &mut PgConnection,
+        &self,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<Vec<UserRoleOut>, AppError> {
         current.require_role(Role::Manager)?;
+        let mut uow = self.uow_provider.begin().await?;
 
-        UserRepo::get_by_id(&mut *conn, user_id)
+        uow.user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        let rows = UserRoleRepo::list_by_user(conn, user_id).await?;
+        let rows = uow.user_role_repo().list_by_user(user_id).await?;
         Ok(rows.into_iter().map(to_role_out).collect())
     }
 
     pub async fn add_role(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+        &self,
         user_id: i64,
         req: &UserAddRoleRequest,
         current: &CurrentUser,
     ) -> Result<UserRoleOut, AppError> {
         current.require_role(Role::Manager)?;
+        let mut uow = self.uow_provider.begin().await?;
 
-        UserRepo::get_by_id(&mut *conn, user_id)
+        uow.user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        Self::validate_role_scope(&mut *conn, req).await?;
+        Self::validate_role_scope(&mut *uow, req).await?;
 
         let role_str = role_as_str(req.role);
         let scope_type = req.scope_type.as_deref();
@@ -410,7 +502,9 @@ impl UserService {
         // 显式查重。Python 依赖唯一索引 + IntegrityError，但 partial unique 索引对
         // (user_id, role, NULL, NULL) 这类含 NULL 的组合不生效（SQL 里 NULL != NULL），
         // 导致非货架角色可以被重复添加。这里用 IS NOT DISTINCT FROM 显式查重堵住该缺口。
-        if UserRoleRepo::exists_same_scope(&mut *conn, user_id, role_str, scope_type, req.scope_id)
+        if uow
+            .user_role_repo()
+            .exists_same_scope(user_id, role_str, scope_type, req.scope_id)
             .await?
         {
             return Err(AppError::biz(
@@ -418,13 +512,15 @@ impl UserService {
                 format!(
                     "role {role_str} (scope={}/{}) already assigned to this user",
                     scope_type.unwrap_or("null"),
-                    req.scope_id.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+                    req.scope_id
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".into()),
                 ),
             ));
         }
 
         let insert = UserRoleInsert {
-            id: snowflake.next_id(),
+            id: self.snowflake.next_id(),
             user_id,
             role: role_str.to_string(),
             scope_type: scope_type.map(str::to_string),
@@ -432,30 +528,37 @@ impl UserService {
             created_at: now_naive(),
             created_by: Some(current.id),
         };
-        UserRoleRepo::create(&mut *conn, &insert)
+        uow.user_role_repo()
+            .create(&insert)
             .await
             .map_err(map_duplicate_role)?;
 
-        let rows = UserRoleRepo::list_by_user(conn, user_id).await?;
-        rows.into_iter()
+        let rows = uow.user_role_repo().list_by_user(user_id).await?;
+        let out = rows
+            .into_iter()
             .find(|r| r.id == insert.id)
             .map(to_role_out)
-            .ok_or_else(|| AppError::internal("创建后回读角色失败"))
+            .ok_or_else(|| AppError::internal("创建后回读角色失败"))?;
+
+        uow.commit().await?;
+        Ok(out)
     }
 
     pub async fn remove_role(
-        conn: &mut PgConnection,
+        &self,
         user_id: i64,
         role_id: i64,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
+        let mut uow = self.uow_provider.begin().await?;
 
-        UserRepo::get_by_id(&mut *conn, user_id)
+        uow.user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        let r = UserRoleRepo::get_by_id(&mut *conn, role_id).await?;
+        let r = uow.user_role_repo().get_by_id(role_id).await?;
         // 角色必须存在且属于该用户，否则一律 404（不泄露他人角色是否存在）
         let r = match r {
             Some(r) if r.user_id == user_id => r,
@@ -467,46 +570,57 @@ impl UserService {
             }
         };
 
-        let affected =
-            UserRoleRepo::soft_delete(conn, r.id, r.version, now_naive(), Some(current.id)).await?;
+        let affected = uow
+            .user_role_repo()
+            .soft_delete(r.id, r.version, now_naive(), Some(current.id))
+            .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
+
+        uow.commit().await?;
         Ok(())
     }
 
     // =======================================================================
-    // 菜单
+    // 菜单（helper：对 auth 域 `/me` 与登录响应开放）
     // =======================================================================
 
-    /// 取角色可见菜单并组树（供 auth 域 `/me` 与登录响应复用）
+    /// 取角色可见菜单并组树（供 auth 域复用）。调用方负责 `begin` + `drop` 或
+    /// `commit`——helper 不自管事务边界。
     pub async fn menus_for_roles(
-        conn: &mut PgConnection,
+        &self,
+        uow: &mut dyn UnitOfWork,
         roles: &[Role],
     ) -> Result<Vec<MenuNodeOut>, AppError> {
-        let role_strs: Vec<String> = roles
-            .iter()
-            .map(|r| role_as_str(*r).to_string())
-            .collect();
-        let menus = MenuRepo::list_active_for_roles(conn, &role_strs).await?;
+        let role_strs: Vec<String> = roles.iter().map(|r| role_as_str(*r).to_string()).collect();
+        let menus = uow.menu_repo().list_active_for_roles(&role_strs).await?;
         Ok(build_menu_tree(menus))
     }
 
-    /// 组装 `/auth/me` 出参（auth 域复用）
+    /// 组装 `/auth/me` 出参（auth 域复用）。调用方负责 `begin` + `drop` 或
+    /// `commit`——helper 不自管事务边界。
     pub async fn current_user_out(
-        conn: &mut PgConnection,
+        &self,
+        uow: &mut dyn UnitOfWork,
         current: &CurrentUser,
     ) -> Result<CurrentUserOut, AppError> {
-        let u = UserRepo::get_by_id(&mut *conn, current.id)
+        let u = uow
+            .user_repo()
+            .get_by_id(current.id)
             .await?
             .ok_or_else(|| user_not_found(current.id))?;
-        let menus = Self::menus_for_roles(conn, &current.roles).await?;
+        let menus = self.menus_for_roles(uow, &current.roles).await?;
         Ok(CurrentUserOut {
             id: u.id,
             username: u.username,
             full_name: u.full_name,
             is_active: u.is_active,
-            roles: current.roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
+            roles: current
+                .roles
+                .iter()
+                .map(|r| role_as_str(*r).to_string())
+                .collect(),
             shelf_ids: current.shelf_ids.iter().map(|v| v.to_string()).collect(),
             menus,
         })
@@ -516,8 +630,10 @@ impl UserService {
     // 内部
     // =======================================================================
 
+    /// 校验 SHELF_ACCOUNT 角色的 scope 形态、货架存在、zone 白名单、is_active。
+    /// 收 `&mut dyn UnitOfWork` 而非 `&mut uow`：调用方把 UoW 借进来，helper 只取 shelf_repo。
     async fn validate_role_scope(
-        conn: &mut PgConnection,
+        uow: &mut dyn UnitOfWork,
         req: &UserAddRoleRequest,
     ) -> Result<(), AppError> {
         if req.role == Role::ShelfAccount {
@@ -529,9 +645,11 @@ impl UserService {
                 ));
             }
             let shelf_id = req.scope_id.expect("上一步已校验非空");
-            let shelf = ShelfRepo::get_by_id(conn, shelf_id).await?.ok_or_else(|| {
-                AppError::biz(code::NOT_FOUND, format!("shelf {shelf_id} not found"))
-            })?;
+            let shelf = uow
+                .shelf_repo()
+                .get_by_id(shelf_id)
+                .await?
+                .ok_or_else(|| AppError::biz(code::NOT_FOUND, format!("shelf {shelf_id} not found")))?;
             if !ALLOWED_SHELF_ZONES.contains(&shelf.zone.as_str()) {
                 return Err(AppError::biz(
                     code::NOT_FOUND,
@@ -552,12 +670,6 @@ impl UserService {
             )));
         }
         Ok(())
-    }
-
-    /// 读取用户角色并组装 `UserOut`
-    async fn to_user_out(conn: &mut PgConnection, u: User) -> Result<UserOut, AppError> {
-        let roles = UserRoleRepo::list_by_user(conn, u.id).await?;
-        Ok(Self::assemble_user_out(u, roles))
     }
 
     fn assemble_user_out(u: User, roles: Vec<UserRoleRow>) -> UserOut {

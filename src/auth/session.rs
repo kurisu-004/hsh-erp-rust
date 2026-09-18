@@ -54,6 +54,7 @@ pub struct CachedCurrentUser {
 }
 
 /// session 存储抽象（trait + Arc<dyn> 与现有 `CosClient` 同模式）
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     /// 写入一条 session（同时建用户 Set 索引 + 双 TTL）

@@ -6,24 +6,32 @@
 //! - me：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单，返回最新视图
 //! - change_password：自助改密复用 user 域的 `change_own_password`
 //!
-//! 实施约定：
-//! - login / refresh / change_password 接收 `&mut PgConnection`（写事务），由 handler 开 tx 并 commit
-//! - me 因为只读，可走 pool-acquired conn；为统一签名也接收 `&mut PgConnection`
+//! ## 实施约定（2026-09-18 auth-di 重构 Wave 2B）
+//! - AuthService 持 `Arc<dyn UowProvider>` + `Arc<AppConfig>` + `Arc<dyn SessionStore>` +
+//!   `Arc<UserService>`；所有方法 `&self`。
+//! - 写端点（login / refresh）：内部 `self.uow_provider.begin().await?` → 业务操作 →
+//!   `uow.commit().await?` → session 写/清**在 commit 之后**（plan v4 §3 V6 约定）。
+//! - 读端点（me）：内部 begin 后 drop（不 commit，隐式回滚）。
+//! - 不 begin 端点：
+//!   - change_password：纯委托给 `self.user_service.change_own_password(...)`，
+//!     user_service 内部自管 begin/commit。
+//!   - logout：无 DB 操作，只清 Redis session。
+//! - helper `resolve_roles_and_scope` 收 `&mut dyn UnitOfWork`（需 `shelf_repo().get_by_id(...)`），
+//!   保持与 auth 在自己 begin 的 uow 同 tx。
 
 use std::sync::Arc;
-
-use sqlx::PgConnection;
 
 use crate::auth::jwt::{decode_refresh, issue_token_pair};
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::auth::session::{hash_token, CachedCurrentUser, TokenKind};
+use crate::auth::session::{hash_token, CachedCurrentUser, SessionStore, TokenKind};
 use crate::infra::clock::now_naive;
+use crate::infra::config::AppConfig;
 use crate::modules::user::dto::{ChangePasswordRequest, CurrentUserOut};
-use crate::modules::user::repo::{ShelfRepo, UserRepo, UserRoleRepo, UserRoleRow};
 use crate::modules::user::service::{role_as_str, UserService};
+use crate::modules::user::uow::UnitOfWork;
+use crate::modules::user::uow::UowProvider;
 use crate::shared::error::{code, AppError};
-use crate::state::AppState;
 
 use super::dto::{LoginRequest, LoginResponse, RefreshRequest};
 
@@ -33,7 +41,15 @@ const SCOPE_TYPE_SHELF: &str = "shelf";
 /// 可绑定 SHELF_ACCOUNT 的货架分区白名单（与 user 域 `validate_role_scope` 对齐）
 const ALLOWED_SHELF_ZONES: [&str; 2] = ["PRODUCTION", "INSPECTION"];
 
-pub struct AuthService;
+/// auth 域服务。构造时注入 `Arc<dyn UowProvider>`（DB 事务来源）+ `Arc<AppConfig>`
+/// （JWT / Redis TTL 配置）+ `Arc<dyn SessionStore>`（服务端 session）+ `Arc<UserService>`
+/// （跨域委托：menus / change_password）。
+pub struct AuthService {
+    uow_provider: Arc<dyn UowProvider>,
+    config: Arc<AppConfig>,
+    session: Arc<dyn SessionStore>,
+    user_service: Arc<UserService>,
+}
 
 /// 把 DB 中的 role 字符串转回 `Role` 枚举。
 ///
@@ -56,42 +72,61 @@ fn version_conflict() -> AppError {
 }
 
 impl AuthService {
+    /// 构造。
+    pub fn new(
+        uow_provider: Arc<dyn UowProvider>,
+        config: Arc<AppConfig>,
+        session: Arc<dyn SessionStore>,
+        user_service: Arc<UserService>,
+    ) -> Self {
+        Self {
+            uow_provider,
+            config,
+            session,
+            user_service,
+        }
+    }
+
     pub async fn login(
-        conn: &mut PgConnection,
+        &self,
         req: LoginRequest,
-        state: &Arc<AppState>,
     ) -> Result<LoginResponse, AppError> {
         // 1. username 归一化（对齐 Python `.strip().lower()`）
         let username_lower = req.username.trim().to_lowercase();
 
-        // 2. 查用户（已过滤软删）+ 校验 active
-        let u = UserRepo::get_by_username(&mut *conn, &username_lower)
+        // 2. 开事务
+        let mut uow = self.uow_provider.begin().await?;
+
+        // 3. 查用户（已过滤软删）+ 校验 active
+        let u = uow
+            .user_repo()
+            .get_by_username(&username_lower)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_AUTH_INVALID, "用户名或密码错误"))?;
         if !u.is_active {
             return Err(AppError::biz(code::BIZ_AUTH_INVALID, "用户名或密码错误"));
         }
 
-        // 3. bcrypt 校验
+        // 4. bcrypt 校验
         if !password::verify(&req.password, &u.password_hash)? {
             return Err(AppError::biz(code::BIZ_AUTH_INVALID, "用户名或密码错误"));
         }
 
-        // 4. 角色列表（为空 → 403 NO_ROLE，统一对外不区分原因）
-        let role_rows = UserRoleRepo::list_by_user(&mut *conn, u.id).await?;
+        // 5. 角色列表（为空 → 403 NO_ROLE，统一对外不区分原因）
+        let role_rows = uow.user_role_repo().list_by_user(u.id).await?;
         if role_rows.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
 
-        // 5. 解析角色枚举 + shelf 范围；调用用户域 helper 拼菜单
+        // 6. 解析角色枚举 + shelf 范围；委托 user_service 取菜单
         let (roles, shelf_ids, shelf_wildcard) =
-            resolve_roles_and_scope(&mut *conn, &role_rows).await?;
+            resolve_roles_and_scope(&mut *uow, &role_rows).await?;
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let menus = UserService::menus_for_roles(&mut *conn, &roles).await?;
+        let menus = self.user_service.menus_for_roles(&mut *uow, &roles).await?;
 
-        // 6. 签发双 token
+        // 7. 签发双 token
         let pair = issue_token_pair(
             u.id,
             &u.username,
@@ -99,18 +134,18 @@ impl AuthService {
             &shelf_ids,
             shelf_wildcard,
             u.refresh_token_version,
-            &state.config.jwt.secret,
-            &state.config.jwt.issuer,
-            state.config.jwt.access_ttl_hours,
-            state.config.jwt.refresh_ttl_days,
+            &self.config.jwt.secret,
+            &self.config.jwt.issuer,
+            self.config.jwt.access_ttl_hours,
+            self.config.jwt.refresh_ttl_days,
         )?;
 
-        // 7. 戳一下 last_login_at（不动 version，避开与并发业务更新冲突）
-        UserRepo::touch_login(&mut *conn, u.id, now_naive()).await?;
+        // 8. 戳一下 last_login_at（不动 version，避开与并发业务更新冲突）
+        uow.user_repo().touch_login(u.id, now_naive()).await?;
 
-        // 8. 服务端 session 入库（Redis）：
-        //    tx 已 commit（handler 端），此处为 tx 外。失败应直接抛错让登录失败，
-        //    否则用户拿 token 但下次 `/me` 立刻 40105 —— 比显式报错更迷惑。
+        // 9. 提交事务；session 写在 commit 之后（plan v4 §3 V6 新约定）
+        uow.commit().await?;
+
         let cached = CachedCurrentUser {
             id: u.id,
             username: u.username.clone(),
@@ -118,9 +153,8 @@ impl AuthService {
             shelf_ids: shelf_ids.clone(),
             shelf_wildcard,
         };
-        let ttl = state.config.redis.session_ttl_seconds;
-        state
-            .session
+        let ttl = self.config.redis.session_ttl_seconds;
+        self.session
             .create_session(
                 &hash_token(&pair.access_token),
                 u.id,
@@ -129,8 +163,7 @@ impl AuthService {
                 &cached,
             )
             .await?;
-        state
-            .session
+        self.session
             .create_session(
                 &hash_token(&pair.refresh_token),
                 u.id,
@@ -140,7 +173,7 @@ impl AuthService {
             )
             .await?;
 
-        // 9. 组装 CurrentUserOut（直接拼，不绕 user helper，避免 jwt 里 stale 数据回流到 /me）
+        // 10. 组装 CurrentUserOut（直接拼，不绕 user helper，避免 jwt 里 stale 数据回流到 /me）
         let user_out = build_current_user_out(&u, &roles, &shelf_ids, menus);
 
         Ok(LoginResponse {
@@ -151,20 +184,24 @@ impl AuthService {
     }
 
     pub async fn refresh(
-        conn: &mut PgConnection,
+        &self,
         req: RefreshRequest,
-        state: &Arc<AppState>,
     ) -> Result<LoginResponse, AppError> {
         // 1. 解码 refresh token，取 sub + ver
         let (sub, ver) = decode_refresh(
             &req.refresh_token,
-            &state.config.jwt.secret,
-            &state.config.jwt.issuer,
+            &self.config.jwt.secret,
+            &self.config.jwt.issuer,
         )
         .map_err(|_| AppError::biz(code::REFRESH_INVALID, "refresh token 失效"))?;
 
-        // 2. 查用户 + 校验 active + 校验版本号匹配
-        let u = UserRepo::get_by_id(&mut *conn, sub)
+        // 2. 开事务
+        let mut uow = self.uow_provider.begin().await?;
+
+        // 3. 查用户 + 校验 active + 校验版本号匹配
+        let u = uow
+            .user_repo()
+            .get_by_id(sub)
             .await?
             .ok_or_else(|| AppError::biz(code::REFRESH_INVALID, "refresh token 失效"))?;
         if !u.is_active {
@@ -174,35 +211,38 @@ impl AuthService {
             return Err(AppError::biz(code::REFRESH_INVALID, "refresh token 失效"));
         }
 
-        // 3. 取角色 + shelf 范围 + 菜单（与 login 同样的解析）
-        let role_rows = UserRoleRepo::list_by_user(&mut *conn, u.id).await?;
+        // 4. 取角色 + shelf 范围 + 菜单（与 login 同样的解析）
+        let role_rows = uow.user_role_repo().list_by_user(u.id).await?;
         if role_rows.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
         let (roles, shelf_ids, shelf_wildcard) =
-            resolve_roles_and_scope(&mut *conn, &role_rows).await?;
+            resolve_roles_and_scope(&mut *uow, &role_rows).await?;
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let menus = UserService::menus_for_roles(&mut *conn, &roles).await?;
+        let menus = self.user_service.menus_for_roles(&mut *uow, &roles).await?;
 
-        // 4. 轮转 refresh_token_version（带乐观锁；0 行 → 409）
+        // 5. 轮转 refresh_token_version（带乐观锁；0 行 → 409）
         let user_id = u.id;
         let user_version = u.version;
-        let affected = UserRepo::increment_refresh_token_version(
-            &mut *conn,
-            user_id,
-            user_version,
-            now_naive(),
-            Some(user_id),
-        )
-        .await?;
+        let affected = uow
+            .user_repo()
+            .increment_refresh_token_version(
+                user_id,
+                user_version,
+                now_naive(),
+                Some(user_id),
+            )
+            .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
-        // 5. 拿轮转后的 ver 重新签发（重读 DB 取 +1 后的新版本）
-        let u = UserRepo::get_by_id(&mut *conn, user_id)
+        // 6. 拿轮转后的 ver 重新签发（重读 DB 取 +1 后的新版本）
+        let u = uow
+            .user_repo()
+            .get_by_id(user_id)
             .await?
             .ok_or_else(|| AppError::biz(code::REFRESH_INVALID, "user disappeared"))?;
 
@@ -213,15 +253,17 @@ impl AuthService {
             &shelf_ids,
             shelf_wildcard,
             u.refresh_token_version,
-            &state.config.jwt.secret,
-            &state.config.jwt.issuer,
-            state.config.jwt.access_ttl_hours,
-            state.config.jwt.refresh_ttl_days,
+            &self.config.jwt.secret,
+            &self.config.jwt.issuer,
+            self.config.jwt.access_ttl_hours,
+            self.config.jwt.refresh_ttl_days,
         )?;
 
-        // 6. 旧 refresh 的 Redis session 删除（best-effort）+ 新一对 token 写 session
+        // 7. 提交事务；session 删旧 + 写在 commit 之后
+        uow.commit().await?;
+
         let old_refresh_hash = hash_token(&req.refresh_token);
-        if let Err(e) = state.session.delete_session(&old_refresh_hash).await {
+        if let Err(e) = self.session.delete_session(&old_refresh_hash).await {
             tracing::warn!(error = %e, user_id = u.id, "refresh: 删旧 refresh session 失败");
         }
         let cached = CachedCurrentUser {
@@ -231,9 +273,8 @@ impl AuthService {
             shelf_ids: shelf_ids.clone(),
             shelf_wildcard,
         };
-        let ttl = state.config.redis.session_ttl_seconds;
-        state
-            .session
+        let ttl = self.config.redis.session_ttl_seconds;
+        self.session
             .create_session(
                 &hash_token(&pair.access_token),
                 u.id,
@@ -242,8 +283,7 @@ impl AuthService {
                 &cached,
             )
             .await?;
-        state
-            .session
+        self.session
             .create_session(
                 &hash_token(&pair.refresh_token),
                 u.id,
@@ -263,12 +303,16 @@ impl AuthService {
     }
 
     pub async fn me(
-        conn: &mut PgConnection,
+        &self,
         current: &CurrentUser,
-        _state: &Arc<AppState>,
     ) -> Result<CurrentUserOut, AppError> {
+        // 读端点：begin 后 drop（隐式回滚，不 commit）
+        let mut uow = self.uow_provider.begin().await?;
+
         // 1. 重读用户（handle 被外部停用/软删的极端情况）→ 不存在/已删 → UNAUTHORIZED
-        let u = UserRepo::get_by_id(&mut *conn, current.id)
+        let u = uow
+            .user_repo()
+            .get_by_id(current.id)
             .await?
             .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "用户不存在或已停用"))?;
         if !u.is_active {
@@ -276,41 +320,39 @@ impl AuthService {
         }
 
         // 2. 重查角色 + shelf 范围 + 菜单（不走 JWT 里的 stale 数据）
-        let role_rows = UserRoleRepo::list_by_user(&mut *conn, u.id).await?;
-        let (roles, shelf_ids, _wildcard) =
-            resolve_roles_and_scope(&mut *conn, &role_rows).await?;
-        let menus = UserService::menus_for_roles(&mut *conn, &roles).await?;
+        let role_rows = uow.user_role_repo().list_by_user(u.id).await?;
+        let (roles, shelf_ids, _wildcard) = resolve_roles_and_scope(&mut *uow, &role_rows).await?;
+        let menus = self.user_service.menus_for_roles(&mut *uow, &roles).await?;
 
         Ok(build_current_user_out(&u, &roles, &shelf_ids, menus))
     }
 
+    /// 自助改密：纯委托给 user_service（user_service 自己 begin + commit），
+    /// auth 端不 begin、不 commit。入口处的权限校验与 user_service 内部重复，
+    /// 显式提一处以便在 service 入口给出明确语义。
     pub async fn change_password(
-        conn: &mut PgConnection,
+        &self,
         user_id: i64,
         req: ChangePasswordRequest,
         current: &CurrentUser,
-        state: &Arc<AppState>,
     ) -> Result<(), AppError> {
-        // 权限：本人或 MANAGER；与 user_service.change_own_password 内部校验重复，
-        // 显式提一处以便在 service 入口给出明确语义。
         if user_id != current.id && !current.has_role(Role::Manager) {
             return Err(AppError::biz(code::FORBIDDEN, "只能修改本人密码"));
         }
-        UserService::change_own_password(
-            conn,
-            user_id,
-            &req.old_password,
-            &req.new_password,
-            current,
-            state,
-        )
-        .await
+        self.user_service
+            .change_own_password(
+                user_id,
+                &req.old_password,
+                &req.new_password,
+                current,
+            )
+            .await
     }
 
     /// 登出当前 token：删 Redis session 条目，使后续 `/me` 立即返回 40105。
-    /// 注意 — 此函数不依赖 tx，service 入口在 handler 处负责提交（此处没有 DB 写）。
-    pub async fn logout(state: &Arc<AppState>, token_hash: &str) -> Result<(), AppError> {
-        state.session.delete_session(token_hash).await
+    /// 无 DB 操作，auth 端不 begin。
+    pub async fn logout(&self, token_hash: &str) -> Result<(), AppError> {
+        self.session.delete_session(token_hash).await
     }
 }
 
@@ -325,8 +367,8 @@ impl AuthService {
 ///
 /// 规则与 user_service.validate_role_scope / shelf_repo.get_by_id 一脉相承。
 async fn resolve_roles_and_scope(
-    conn: &mut PgConnection,
-    rows: &[UserRoleRow],
+    uow: &mut dyn UnitOfWork,
+    rows: &[crate::modules::user::repo::UserRoleRow],
 ) -> Result<(Vec<Role>, Vec<i64>, bool), AppError> {
     let mut roles: Vec<Role> = Vec::with_capacity(rows.len());
     let mut shelf_ids: Vec<i64> = Vec::new();
@@ -341,7 +383,7 @@ async fn resolve_roles_and_scope(
             match r.scope_id {
                 None => shelf_wildcard = true,
                 Some(sid) => {
-                    let shelf = ShelfRepo::get_by_id(&mut *conn, sid).await?;
+                    let shelf = uow.shelf_repo().get_by_id(sid).await?;
                     if let Some(s) = shelf
                         && s.is_active
                         && ALLOWED_SHELF_ZONES.contains(&s.zone.as_str())
@@ -375,3 +417,8 @@ fn build_current_user_out(
         menus,
     }
 }
+
+// 2026-09-18 Wave 2 T10：30 例 mock 单测。仅在 `cargo test` 时编译。
+#[cfg(test)]
+#[path = "service_tests.rs"]
+mod service_tests;

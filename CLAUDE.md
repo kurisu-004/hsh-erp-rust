@@ -51,13 +51,24 @@ SQLX_OFFLINE=true cargo build --release   # CI/Docker 用离线元数据构建
 
 ## 必须遵守的架构约定
 
-1. **事务边界在 handler**：handler 里 `state.pool.begin()` → 传 `&mut tx` 给 service → 显式 `tx.commit()`；Drop 自动回滚。repo 用 `impl PgExecutor<'_>` 以同时接受 pool/conn/tx。
+1. **事务边界在 service**：service 持 `Arc<dyn UowProvider>`，调用 `provider.begin().await?` 得 `Box<dyn UnitOfWork>`，所有跨 repo 操作经 UoW 访问器（`uow.user_repo().xxx()`），写端点 `uow.commit().await?`、读端点 drop（隐式回滚）。handler 薄壳化不接触 `pool.begin/commit`。
+   - 例外清单（仍走 handler 边界）：
+     - `_e2e` 直调方（测试 fixture 自管 tx）
+     - 既有 `tests/auth_api.rs` 等 HTTP 契约测试（不改测试代码）
 2. **统一响应信封**：handler 返回 `Result<Json<R<T>>, AppError>`。`R { code: 0, message: "ok", data }`；错误由 `AppError::into_response()` 装入同一信封。不做 middleware 后置包装。
 3. **错误码分段契约**（`src/shared/error.rs::code`，与 Python 前端对齐）：0 成功、4xxxx HTTP 语义、5xxxx 系统、2xxxx 业务域（每域一个段，如 201xx 零件/客户、214xx 送货单，新增域错误码先入对应段）。
 4. **权限在服务层**：`CurrentUser` 经 `FromRequestParts` 从 Bearer JWT 解析；JWT 验签后额外查 Redis（`session:tok:<sha256_hex>`）确认 session 仍有效，查不到 → 40105 SESSION_REVOKED。service 调 `user.require_role(Role::Manager)?` 守卫。五角色见 `src/auth/rbac.rs`；`ShelfAccount` 用 `can_access_shelf(id)` 校验货架范围；如需 token 哈希（如 logout），注入 `AuthTokenHash` extractor。
 5. **状态机不写 DB**：`statemachine.rs` 只做内存 enum + `can_transition_to` 迁移表；事件日志由 service 在事务内统一插入。
 6. **WS 广播在 commit 之后**（对齐 Python 延迟广播模式），用 `state.ws_hub.broadcast(...)`。
 7. **路由挂载**：业务 REST 统一 `/api/v2`（与 Python `/api/v1` 并行），WS 在 `/ws/dashboard`。`/api/mcp` 不在本仓库。
+
+## UoW 范式（service 控制事务）
+
+- **按域各写各的 UoW**：user 域有 `user/uow.rs`（4 访问器），delivery_note 域应有 `delivery_note/uow.rs`，**禁止 17 域访问器堆进一个全局 UoW trait**
+- **repo trait 独立 + automock**：4 个 repo trait 各自 `#[cfg_attr(test, automock)]`，方法名回归 `repo.rs` 固有命名（无前缀）
+- **访问器模式**：UoW = 4 访问器 + `commit(self: Box<Self>)` / `rollback(self: Box<Self>)`，**不含 begin**
+- **跨域原子写**：用 supertrait 组合 `trait SalesUoW: UnitOfWork + DeliveryNoteUoW {}` + blanket impl，**不**为跨域引入新 UoW trait 而污染单域接口
+- **SharedTx 解法**：单域内多 repo 共享 `Arc<tokio::sync::Mutex<Option<Transaction<'static, Postgres>>>>`；访问器要 `&mut self`，同一 UoW 调用天然串行，锁只是内部可变性通道；Drop 即回滚
 
 ## DB 约定（迁移与查询必须沿用）
 
@@ -68,6 +79,8 @@ SQLX_OFFLINE=true cargo build --release   # CI/Docker 用离线元数据构建
 - i64 主键序列化为 JSON string（`shared/types.rs` 的 serde helper），防 JS 精度截断
 - 时间列存 naive `timestamp`，写入用 `infra::clock::now_naive()`（Asia/Shanghai）
 - 迁移命名：`<13位时间戳>_<顺序>_<描述>.sql`，见 `migrations/README.md`
+- `repo.rs` 固有静态方法签名收 `impl PgExecutor<'_>`，与 Sqlx*Repo 实现委托兼容；`repo.rs` 是 UoW 的唯一真源，**零 diff 是硬 gate**
+- service 持有 `Arc<dyn UowProvider>`，不持 `Arc<dyn Repo>`，不持 `PgPool`（pool 仅 `AppState` 与 `SqlxUowProvider` 持有）
 
 ## 环境要点
 

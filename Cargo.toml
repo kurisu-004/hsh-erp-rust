@@ -113,6 +113,11 @@ uuid = { version = "1", features = ["v4"] }
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。
 tower = { version = "0.5", features = ["util"] }
 
+# 2026-09-18 auth+user DI 重构（Wave 1A/T1）：service 单测在 src/modules/{auth,user}/service_tests.rs
+# 用 mockall 对 repo trait / SessionStore / UowProvider 做 automock；测试零数据库依赖。
+# 注：plan v4 §3 写 `mockall = "1"`，实际 crates.io 最新是 0.15.0（无 1.x 发布）；按现行版本落地。
+mockall = "0.15"
+
 # 2026-09-15 followup-cleanup A4：dashboard WS E2E 测试用真实 socket 客户端连接
 # ws://127.0.0.1:<random>/ws/dashboard?token=<JWT>。版本对齐 axum 0.8 已传递依赖
 # 的 tokio-tungstenite 0.29（避免 union features 之外引入额外版本）。

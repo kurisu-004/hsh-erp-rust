@@ -15,6 +15,9 @@ use crate::infra::python_sts::PythonSts;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsHub;
 use crate::modules::upload_session::repo::UploadSessionRepo;
+use crate::modules::auth::service::AuthService;
+use crate::modules::user::service::UserService;
+use crate::modules::user::uow::{SqlxUowProvider, UowProvider};
 
 pub struct AppState {
     pub pool: PgPool,
@@ -37,6 +40,10 @@ pub struct AppState {
     /// 与 `session` 同池（共用 `state.redis_pool`），通过 `cfg.redis.session_check_enabled`
     /// 决定真实 Redis 实现还是 Noop 占位。
     pub upload_session_repo: Arc<dyn UploadSessionRepo>,
+    /// 2026-09-18 新增：user 域 service（实例化结构，UoW provider 注入）
+    pub user_service: Arc<UserService>,
+    /// 2026-09-18 新增：auth 域 service（实例化结构，依赖 user_service + uow_provider）
+    pub auth_service: Arc<AuthService>,
 }
 
 impl AppState {
@@ -52,6 +59,19 @@ impl AppState {
         session: Arc<dyn SessionStore>,
         upload_session_repo: Arc<dyn UploadSessionRepo>,
     ) -> Self {
+        // 三段装线：UowProvider → user_service → auth_service
+        let uow_provider: Arc<dyn UowProvider> = Arc::new(SqlxUowProvider::new(pool.clone()));
+        let user_service = Arc::new(UserService::new(
+            uow_provider.clone(),
+            snowflake.clone(),
+            session.clone(),
+        ));
+        let auth_service = Arc::new(AuthService::new(
+            uow_provider.clone(),
+            config.clone(),
+            session.clone(),
+            user_service.clone(),
+        ));
         Self {
             pool,
             config,
@@ -62,6 +82,8 @@ impl AppState {
             shutdown,
             session,
             upload_session_repo,
+            user_service,
+            auth_service,
         }
     }
 }

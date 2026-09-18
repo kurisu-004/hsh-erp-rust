@@ -2,22 +2,21 @@
 //!
 //! 对应 Python myERP/api/v1/user.py。
 //!
-//! ## 约定
-//! - 事务边界在 handler：`state.pool.begin()` → 传 `&mut *tx` 给 service → 显式 `tx.commit()`；
-//!   提前 return（`?`）时 `Transaction` 的 Drop 自动回滚。
+//! ## 约定（2026-09-18 重构）
+//! - 事务边界在 service（见 `service.rs` 头注释）。Handler 完全薄壳化——
+//!   9 端点不再直接开/关 sqlx 事务，直接转发到 `state.user_service.xxx(...)`。
 //! - 统一响应信封：返回 `Result<Json<R<T>>, AppError>`，错误由 `AppError::into_response()`
 //!   装进同一个 `R` 信封，不做 middleware 后置包装。
 //! - 权限在服务层（`current.require_role(Role::Manager)?`），此处不重复校验：
 //!   Python 是 router 级 `dependencies=[require_role(MANAGER)]`，本实现下沉到 service，
 //!   保证绕过 HTTP 直接调 service 时同样受控。
-//! - 只读接口同样开事务，以获得一致性快照（列表 + count 两条查询之间不会被并发写撕裂）。
 
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Json, Router};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::shared::error::AppError;
@@ -28,7 +27,6 @@ use super::dto::{
     UserAddRoleRequest, UserCreateRequest, UserListOut, UserListQuery, UserOut, UserRoleOut,
     UserUpdateRequest,
 };
-use super::service::UserService;
 
 /// GET /api/v2/users
 pub async fn list_users(
@@ -36,9 +34,7 @@ pub async fn list_users(
     current: CurrentUser,
     Query(query): Query<UserListQuery>,
 ) -> Result<Json<R<UserListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = UserService::list_users(&mut tx, &query, &current).await?;
-    tx.commit().await?;
+    let out = state.user_service.list_users(&query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -48,9 +44,7 @@ pub async fn create_user(
     current: CurrentUser,
     Json(req): Json<UserCreateRequest>,
 ) -> Result<(StatusCode, Json<R<UserOut>>), AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = UserService::create_user(&mut tx, &state.snowflake, &req, &current).await?;
-    tx.commit().await?;
+    let out = state.user_service.create_user(&req, &current).await?;
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
 
@@ -60,9 +54,7 @@ pub async fn get_user(
     current: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<R<UserOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = UserService::get_user(&mut tx, id, &current).await?;
-    tx.commit().await?;
+    let out = state.user_service.get_user(id, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -73,9 +65,7 @@ pub async fn update_user(
     Path(id): Path<i64>,
     Json(req): Json<UserUpdateRequest>,
 ) -> Result<Json<R<UserOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = UserService::update_user(&mut tx, id, &req, &current).await?;
-    tx.commit().await?;
+    let out = state.user_service.update_user(id, &req, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -85,9 +75,10 @@ pub async fn admin_reset_password(
     current: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<R<UserOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = UserService::admin_reset_password(&mut tx, id, &current, &state).await?;
-    tx.commit().await?;
+    let out = state
+        .user_service
+        .admin_reset_password(id, &current)
+        .await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -97,9 +88,7 @@ pub async fn deactivate_user(
     current: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<R<UserOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = UserService::deactivate_user(&mut tx, id, &current).await?;
-    tx.commit().await?;
+    let out = state.user_service.deactivate_user(id, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -109,9 +98,7 @@ pub async fn list_user_roles(
     current: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<Json<R<Vec<UserRoleOut>>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = UserService::list_user_roles(&mut tx, id, &current).await?;
-    tx.commit().await?;
+    let out = state.user_service.list_user_roles(id, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -122,9 +109,7 @@ pub async fn add_role(
     Path(id): Path<i64>,
     Json(req): Json<UserAddRoleRequest>,
 ) -> Result<(StatusCode, Json<R<UserRoleOut>>), AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = UserService::add_role(&mut tx, &state.snowflake, id, &req, &current).await?;
-    tx.commit().await?;
+    let out = state.user_service.add_role(id, &req, &current).await?;
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
 
@@ -134,9 +119,10 @@ pub async fn remove_role(
     current: CurrentUser,
     Path((id, role_id)): Path<(i64, i64)>,
 ) -> Result<Json<R<()>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    UserService::remove_role(&mut tx, id, role_id, &current).await?;
-    tx.commit().await?;
+    state
+        .user_service
+        .remove_role(id, role_id, &current)
+        .await?;
     Ok(Json(R::ok_empty()))
 }
 
