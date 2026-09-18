@@ -1,9 +1,9 @@
-//! user 域业务逻辑
+//! iam 域账号管理 service（CRUD + 角色 + 改密）
 //!
-//! 对应 Python myERP/service/user.py + service/menu.py。
+//! 对应 Python myERP/service/user.py。
 //!
-//! ## 事务边界（2026-09-18 重构）
-//! Service 持 `Arc<dyn UowProvider>`，所有数据访问经 `uow.user_repo().xxx()` /
+//! ## 事务边界（2026-09-18 重构 + 2026-09-19 IAM 合并）
+//! Service 持 `Arc<dyn IamUowProvider>`，所有数据访问经 `uow.user_repo().xxx()` /
 //! `uow.user_role_repo().xxx()` / `uow.menu_repo().xxx()` / `uow.shelf_repo().xxx()`
 //! 访问器；写端点最后 `uow.commit().await?`（消费 Box），读端点直接 drop（隐式回滚）。
 //! Handler 不再开 tx，完全薄壳化（见 `handler.rs`）。
@@ -21,8 +21,11 @@
 //!   （Python 对这三种情况复用同一个 20501，仅 HTTP 状态码不同）
 //!
 //! 待 205xx / 201xx 段补齐后可无损替换。
+//!
+//! 2026-09-19 IAM 域合并：`UserService` → `AccountService`，方法签名 + 业务逻辑零 diff，
+//! 仅路径变更。`menus_for_roles` / `current_user_out` 仍保留在本服务，作为
+//! `SessionService`（原 AuthService）跨域委托的目标。
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::auth::password;
@@ -30,18 +33,18 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::auth::session::SessionStore;
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
-use super::dto::{
+use super::menu::build_menu_tree;
+// `iam/service/` 子目录中 dto / model / repo / uow 是 sibling 的兄弟模块 —— 用 `super::super::` 跨级
+use super::super::dto::{
     CurrentUserOut, MenuNodeOut, UserAddRoleRequest, UserCreateRequest, UserListOut, UserListQuery,
     UserOut, UserRoleOut, UserUpdateRequest,
 };
-use super::model::{Menu, User};
+use super::super::model::User;
 // struct 来自 repo.rs（uow.rs 只 re-export trait，不 re-export struct）
-use super::repo::{UserInsert, UserRoleInsert, UserRoleRow};
-use super::uow::{
-    UnitOfWork, UowProvider,
-};
+use super::super::repo::{UserInsert, UserRoleInsert, UserRoleRow};
+use super::super::uow::{IamUnitOfWork, IamUowProvider};
 
 /// 管理员重置密码时写入的默认口令（对齐 Python `DEFAULT_RESET_PASSWORD`）
 pub const DEFAULT_RESET_PASSWORD: &str = "changeme";
@@ -67,10 +70,7 @@ pub fn role_as_str(role: Role) -> &'static str {
 }
 
 fn user_not_found(user_id: i64) -> AppError {
-    AppError::biz(
-        code::USER_NOT_FOUND,
-        format!("user {user_id} not found"),
-    )
+    AppError::biz(code::USER_NOT_FOUND, format!("user {user_id} not found"))
 }
 
 /// 乐观锁写入返回 0 行 → 409。已在事务内先 SELECT 过，故 0 行只可能是并发改动。
@@ -88,20 +88,20 @@ fn trimmed_or_none(v: &str) -> Option<String> {
     }
 }
 
-/// user 域 service。实例字段 = UoW 来源 + 雪花 ID + session 存储：
+/// iam 域账号管理 service。实例字段 = UoW 来源 + 雪花 ID + session 存储：
 /// - `uow_provider` 是唯一事务入口（handler 不再开 tx）
 /// - `snowflake` 由 AppState 注入（与 Python `SNOWFLAKE_INSTANCE=0` 区分：rust 用实例号 1）
 /// - `session` 在 commit 后用于清该用户的 Redis session（自助改密 / 管理员重置）
-pub struct UserService {
-    uow_provider: Arc<dyn UowProvider>,
+pub struct AccountService {
+    uow_provider: Arc<dyn IamUowProvider>,
     snowflake: Arc<SnowflakeIdGenerator>,
     session: Arc<dyn SessionStore>,
 }
 
-impl UserService {
+impl AccountService {
     /// 三段装线入口：`AppState::new` 调用，注入 provider + snowflake + session。
     pub fn new(
-        uow_provider: Arc<dyn UowProvider>,
+        uow_provider: Arc<dyn IamUowProvider>,
         snowflake: Arc<SnowflakeIdGenerator>,
         session: Arc<dyn SessionStore>,
     ) -> Self {
@@ -156,11 +156,7 @@ impl UserService {
         })
     }
 
-    pub async fn get_user(
-        &self,
-        user_id: i64,
-        current: &CurrentUser,
-    ) -> Result<UserOut, AppError> {
+    pub async fn get_user(&self, user_id: i64, current: &CurrentUser) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
         let mut uow = self.uow_provider.begin().await?;
 
@@ -194,12 +190,7 @@ impl UserService {
         }
 
         // 显式查重（partial unique 索引仍是最终防线，见下方 INSERT 的错误映射）
-        if uow
-            .user_repo()
-            .get_by_username(&username)
-            .await?
-            .is_some()
-        {
+        if uow.user_repo().get_by_username(&username).await?.is_some() {
             return Err(AppError::biz(
                 code::DUPLICATE_USERNAME,
                 format!("username '{username}' already exists"),
@@ -386,10 +377,7 @@ impl UserService {
         }
 
         if !password::verify(old_password, &u.password_hash)? {
-            return Err(AppError::biz(
-                code::OLD_PASSWORD_MISMATCH,
-                "旧密码不正确",
-            ));
+            return Err(AppError::biz(code::OLD_PASSWORD_MISMATCH, "旧密码不正确"));
         }
 
         let affected = uow
@@ -566,7 +554,7 @@ impl UserService {
                 return Err(AppError::biz(
                     code::ROLE_NOT_FOUND,
                     format!("role {role_id} not found for user {user_id}"),
-                ))
+                ));
             }
         };
 
@@ -583,14 +571,14 @@ impl UserService {
     }
 
     // =======================================================================
-    // 菜单（helper：对 auth 域 `/me` 与登录响应开放）
+    // 菜单（helper：对 SessionService（原 AuthService）`/me` 与登录响应开放）
     // =======================================================================
 
-    /// 取角色可见菜单并组树（供 auth 域复用）。调用方负责 `begin` + `drop` 或
+    /// 取角色可见菜单并组树（供 SessionService 复用）。调用方负责 `begin` + `drop` 或
     /// `commit`——helper 不自管事务边界。
     pub async fn menus_for_roles(
         &self,
-        uow: &mut dyn UnitOfWork,
+        uow: &mut dyn IamUnitOfWork,
         roles: &[Role],
     ) -> Result<Vec<MenuNodeOut>, AppError> {
         let role_strs: Vec<String> = roles.iter().map(|r| role_as_str(*r).to_string()).collect();
@@ -598,11 +586,11 @@ impl UserService {
         Ok(build_menu_tree(menus))
     }
 
-    /// 组装 `/auth/me` 出参（auth 域复用）。调用方负责 `begin` + `drop` 或
+    /// 组装 `/iam/me` 出参（SessionService 复用）。调用方负责 `begin` + `drop` 或
     /// `commit`——helper 不自管事务边界。
     pub async fn current_user_out(
         &self,
-        uow: &mut dyn UnitOfWork,
+        uow: &mut dyn IamUnitOfWork,
         current: &CurrentUser,
     ) -> Result<CurrentUserOut, AppError> {
         let u = uow
@@ -631,9 +619,9 @@ impl UserService {
     // =======================================================================
 
     /// 校验 SHELF_ACCOUNT 角色的 scope 形态、货架存在、zone 白名单、is_active。
-    /// 收 `&mut dyn UnitOfWork` 而非 `&mut uow`：调用方把 UoW 借进来，helper 只取 shelf_repo。
+    /// 收 `&mut dyn IamUnitOfWork` 而非 `&mut uow`：调用方把 UoW 借进来，helper 只取 shelf_repo。
     async fn validate_role_scope(
-        uow: &mut dyn UnitOfWork,
+        uow: &mut dyn IamUnitOfWork,
         req: &UserAddRoleRequest,
     ) -> Result<(), AppError> {
         if req.role == Role::ShelfAccount {
@@ -645,11 +633,9 @@ impl UserService {
                 ));
             }
             let shelf_id = req.scope_id.expect("上一步已校验非空");
-            let shelf = uow
-                .shelf_repo()
-                .get_by_id(shelf_id)
-                .await?
-                .ok_or_else(|| AppError::biz(code::NOT_FOUND, format!("shelf {shelf_id} not found")))?;
+            let shelf = uow.shelf_repo().get_by_id(shelf_id).await?.ok_or_else(|| {
+                AppError::biz(code::NOT_FOUND, format!("shelf {shelf_id} not found"))
+            })?;
             if !ALLOWED_SHELF_ZONES.contains(&shelf.zone.as_str()) {
                 return Err(AppError::biz(
                     code::NOT_FOUND,
@@ -721,86 +707,4 @@ fn map_duplicate_role(e: sqlx::Error) -> AppError {
 /// PostgreSQL SQLSTATE 23505 = unique_violation
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
-}
-
-// ===========================================================================
-// 菜单树组装（纯函数，对齐 Python service/menu.py::_to_tree）
-// ===========================================================================
-
-/// 把拍平的菜单行组装成树。
-///
-/// 规则（与 Python `_to_tree` 逐条对齐）：
-/// - 根与每层 children 均按 `(sort_order, code)` 升序
-/// - `parent_id` 为 NULL，或指向**不在可见集合内**的父节点（父节点被停用/软删/
-///   不属于当前角色）→ 该节点提升为根（孤儿兜底）
-/// - 不做深循环检测：DB CHECK `ck_t_menu_no_self_loop` 已挡单行自环，seed 数据可信。
-///   但本实现用「从 map 取走节点」的方式递归，即便出现环也只会丢弃成环节点，
-///   不会无限递归（比 Python 多一层安全兜底）。
-pub fn build_menu_tree(menus: Vec<Menu>) -> Vec<MenuNodeOut> {
-    let visible: HashSet<i64> = menus.iter().map(|m| m.id).collect();
-    let sort_keys: HashMap<i64, (i32, String)> = menus
-        .iter()
-        .map(|m| (m.id, (m.sort_order, m.code.clone())))
-        .collect();
-
-    let mut nodes: HashMap<i64, MenuNodeOut> = HashMap::with_capacity(menus.len());
-    let mut children_of: HashMap<i64, Vec<i64>> = HashMap::new();
-    let mut root_ids: Vec<i64> = Vec::new();
-
-    for m in menus {
-        let id = m.id;
-        let parent_id = m.parent_id;
-        nodes.insert(
-            id,
-            MenuNodeOut {
-                id,
-                version: m.version,
-                parent_id: parent_id.map(|p| p.to_string()),
-                code: m.code,
-                title: m.title,
-                path: m.path,
-                icon: m.icon,
-                sort_order: m.sort_order,
-                children: Vec::new(),
-            },
-        );
-        match parent_id {
-            // 父节点可见且非自环 → 挂为子节点
-            Some(p) if p != id && visible.contains(&p) => {
-                children_of.entry(p).or_default().push(id);
-            }
-            // parent_id 为 NULL，或父节点不可见 → 升为根（孤儿兜底）
-            _ => root_ids.push(id),
-        }
-    }
-
-    sort_ids(&mut root_ids, &sort_keys);
-    for kids in children_of.values_mut() {
-        sort_ids(kids, &sort_keys);
-    }
-
-    root_ids
-        .into_iter()
-        .filter_map(|id| assemble_node(id, &mut nodes, &children_of))
-        .collect()
-}
-
-fn sort_ids(ids: &mut [i64], sort_keys: &HashMap<i64, (i32, String)>) {
-    ids.sort_by(|a, b| sort_keys.get(a).cmp(&sort_keys.get(b)));
-}
-
-/// 递归组装：从 `nodes` 中「取走」节点，天然防止环导致的无限递归。
-fn assemble_node(
-    id: i64,
-    nodes: &mut HashMap<i64, MenuNodeOut>,
-    children_of: &HashMap<i64, Vec<i64>>,
-) -> Option<MenuNodeOut> {
-    let mut node = nodes.remove(&id)?;
-    if let Some(kids) = children_of.get(&id) {
-        node.children = kids
-            .iter()
-            .filter_map(|k| assemble_node(*k, nodes, children_of))
-            .collect();
-    }
-    Some(node)
 }

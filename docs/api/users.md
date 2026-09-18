@@ -1,3 +1,10 @@
+# users 域 API（已废弃 — 2026-09-19 IAM 域合并）
+
+> ⚠️ **本文件已废弃（DEPRECATED）**：2026-09-19 IAM 域合并起，`auth.md` + `users.md`
+> 合并为 [`./iam.md`](./iam.md)。新路径 `/api/v2/iam/*`，旧 alias
+> `/api/v2/auth/*` + `/api/v2/users/*` 在 PR-1 兼容期保留至 PR-4 删除。
+>
+> 全部端点请参考 [`./iam.md`](./iam.md)。本文件**不再维护**，保留仅为历史参考。
 # users 域 API
 
 > 本文件须与 `src/modules/user/{handler.rs,dto.rs,service.rs}` 保持同步

@@ -2,13 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/index.md)（[index.md](docs/api/index.md) 为总入口，含通用约定 + 跨域错误码速查；按模块拆分为 `auth.md` / `users.md` / `applicants.md` / `customers.md` / `shelves.md` / `workers.md` / `websocket.md` / `delivery-groups.md` / `cnc-programs.md` / `files.md` / `outsource-companies.md` / `outsource-quotes.md` / `outsource-shipments.md` / `_e2e.md`，`parts` 因端点 ≥49 已拆为 `docs/api/parts/` 子目录（`index.md` / `crud.md` / `lifecycle.md` / `inspection.md`），`assemblies` 拆为 `docs/api/assemblies/`，`production` 拆为 `docs/api/production/`（`index.md` + 5 子页），`delivery-notes` 拆为 `docs/api/delivery-notes/`（4 子页））。**后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须立即同步更新对应模块文件**。
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/index.md)（[index.md](docs/api/index.md) 为总入口，含通用约定 + 跨域错误码速查；按模块拆分为 `iam.md` / `applicants.md` / `customers.md` / `shelves.md` / `workers.md` / `websocket.md` / `delivery-groups.md` / `cnc-programs.md` / `files.md` / `outsource-companies.md` / `outsource-quotes.md` / `outsource-shipments.md` / `_e2e.md`，`parts` 因端点 ≥49 已拆为 `docs/api/parts/` 子目录（`index.md` / `crud.md` / `lifecycle.md` / `inspection.md`），`assemblies` 拆为 `docs/api/assemblies/`，`production` 拆为 `docs/api/production/`（`index.md` + 5 子页），`delivery-notes` 拆为 `docs/api/delivery-notes/`（4 子页）；2026-09-19 IAM 域合并：原 `auth.md` + `users.md` → `iam.md`）。**后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须立即同步更新对应模块文件**。
 
 > 📌 **开发规约**：单文件职责、1000 行上限、SQL 防 N+1、单元测试覆盖（纯函数 100% / 含 IO 不强求）、函数 / 结构体 / 枚举注释规范等硬约定见 [docs/conventions.md](docs/conventions.md)。**新增 / 修改 `src/` 代码前必读**。
 
 ## 项目定位
 
-`hsh-erp` monorepo 的 Rust 后端 v2 子模块（对应 `backend-rust/`），承担新功能域（auth / deliveryNote / scanInspect / part / assembly / outsource / cnc_program / part_file / worker_pool / process_chain / production / _e2e 等 19 域）；历史业务域在兄弟子模块 `backend-python/`（FastAPI v1）。跨后端契约（共享 JWT_SECRET / 共享 PostgreSQL 库 / 雪花 ID 实例号分工等）见根仓库 [`../CLAUDE.md`](../CLAUDE.md) §跨子模块架构，本文件不重复。
+`hsh-erp` monorepo 的 Rust 后端 v2 子模块（对应 `backend-rust/`），承担新功能域（iam / deliveryNote / scanInspect / part / assembly / outsource / cnc_program / part_file / worker_pool / process_chain / production / _e2e 等 19 域）；历史业务域在兄弟子模块 `backend-python/`（FastAPI v1）。跨后端契约（共享 JWT_SECRET / 共享 PostgreSQL 库 / 雪花 ID 实例号分工等）见根仓库 [`../CLAUDE.md`](../CLAUDE.md) §跨子模块架构，本文件不重复。
 
 **权威文档是 `docs/architecture.md`**——含完整技术栈选型理由、目录结构、Python→Rust 模块映射表、实施路线图。做任何架构决策前先读它；本文件只提炼不动脑就需要遵守的硬约定。
 

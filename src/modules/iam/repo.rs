@@ -1,4 +1,4 @@
-//! user 域数据访问
+//! iam 域数据访问
 //!
 //! 对应 Python myERP/repository/user_repository.py。函数签名接收 `impl PgExecutor<'_>`，
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
@@ -9,6 +9,9 @@
 //! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
 //! - 时间戳由调用方传入 `crate::infra::clock::now_naive()`（Asia/Shanghai），
 //!   **不使用 DB 的 `now()`**——容器时区为 UTC，会与应用侧写入的 naive 时间不一致。
+//!
+//! 2026-09-19 IAM 域合并：从 `modules::user::repo` 整体迁移过来（路径变化，
+//! SQL 与签名零 diff）。
 
 use chrono::NaiveDateTime;
 use sqlx::PgExecutor;
