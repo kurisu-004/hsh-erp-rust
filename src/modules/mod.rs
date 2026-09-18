@@ -20,8 +20,9 @@ pub mod customer;
 pub mod dashboard;
 pub mod delivery_note;
 // 2026-09-19 IAM 域合并（PR-1）：合并 `auth` + `user` 为单一 `iam` 业务域；
-// handler 内 14 端点 + 3 router 工厂函数（`router` 新 + `auth_router` + `users_router` 旧 alias）。
-// auth / user 目录已删除。
+// handler 内 14 端点 + 1 个 router 工厂函数 `router()`。auth / user 目录已删除。
+// 2026-09-19 IAM 域收尾（PR-4）：旧 alias `/auth` + `/users` nest 已下线，
+// `/api/v2/iam/*` 成为 IAM 域唯一对外接口。
 pub mod iam;
 pub mod outsource;
 pub mod part;
@@ -53,16 +54,12 @@ async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResp> {
 
 /// `/api/v2/*` 业务路由聚合（重构版统一版本前缀）
 ///
-/// 2026-09-19 IAM 域合并（PR-1）：新增 `/iam` 新路径；保留 `/auth` + `/users` 旧 alias
-/// 路由至 PR-4（兼容期，便于前端 / 第三方客户端迁移）。三路由全部指向
-/// `iam::handler::{router, auth_router, users_router}`。
+/// 2026-09-19 IAM 域收尾（PR-4）：旧 alias `/auth` + `/users` nest 已删除，
+/// `/api/v2/iam/*` 成为 IAM 域唯一对外接口。
 pub fn v2_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
-        // 2026-09-19 IAM 域合并：原 auth::router() / user::router() 指向新的 iam 域
-        .nest("/auth", iam::auth_router())
-        .nest("/users", iam::users_router())
-        // 2026-09-19 IAM 域合并：新路径 `/iam` 14 端点
+        // 2026-09-19 IAM 域：新路径 `/iam` 14 端点（PR-1 起开放，PR-4 收尾后唯一）
         .nest("/iam", iam::router())
         .nest("/customers", customer::router())
         .nest("/applicants", applicant::router())

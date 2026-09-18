@@ -85,7 +85,7 @@ async fn login_inspector(pool: PgPool, username: &str) -> (axum::Router, String,
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),

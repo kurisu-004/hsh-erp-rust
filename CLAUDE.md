@@ -54,7 +54,7 @@ SQLX_OFFLINE=true cargo build --release   # CI/Docker 用离线元数据构建
 1. **事务边界在 service**：service 持 `Arc<dyn UowProvider>`，调用 `provider.begin().await?` 得 `Box<dyn UnitOfWork>`，所有跨 repo 操作经 UoW 访问器（`uow.user_repo().xxx()`），写端点 `uow.commit().await?`、读端点 drop（隐式回滚）。handler 薄壳化不接触 `pool.begin/commit`。
    - 例外清单（仍走 handler 边界）：
      - `_e2e` 直调方（测试 fixture 自管 tx）
-     - 既有 `tests/auth_api.rs` 等 HTTP 契约测试（不改测试代码）
+     - 既有 `tests/iam_api.rs` 等 HTTP 契约测试（不改测试代码）
 2. **统一响应信封**：handler 返回 `Result<Json<R<T>>, AppError>`。`R { code: 0, message: "ok", data }`；错误由 `AppError::into_response()` 装入同一信封。不做 middleware 后置包装。
 3. **错误码分段契约**（`src/shared/error.rs::code`，与 Python 前端对齐）：0 成功、4xxxx HTTP 语义、5xxxx 系统、2xxxx 业务域（每域一个段，如 201xx 零件/客户、214xx 送货单，新增域错误码先入对应段）。
 4. **权限在服务层**：`CurrentUser` 经 `FromRequestParts` 从 Bearer JWT 解析；JWT 验签后额外查 Redis（`session:tok:<sha256_hex>`）确认 session 仍有效，查不到 → 40105 SESSION_REVOKED。service 调 `user.require_role(Role::Manager)?` 守卫。五角色见 `src/auth/rbac.rs`；`ShelfAccount` 用 `can_access_shelf(id)` 校验货架范围；如需 token 哈希（如 logout），注入 `AuthTokenHash` extractor。

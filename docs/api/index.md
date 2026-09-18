@@ -3,9 +3,7 @@
 > ⚠️ **本目录文件须与 `src/modules/*/{handler,dto}.rs` 保持同步**
 >
 > 后端代码变更（**新增 / 修改 / 删除端点**，或**修改 DTO 字段 / 错误码**）后，必须**立即**更新对应模块文件：
-> - [`./iam.md`](./iam.md) — iam 域（auth + user 合并，2026-09-19；旧 alias `/auth` + `/users` 保留至 PR-4）
-> - [`./auth.md`](./auth.md) — ⚠️ 已废弃，保留为兼容期参考
-> - [`./users.md`](./users.md) — ⚠️ 已废弃，保留为兼容期参考
+> - [`./iam.md`](./iam.md) — iam 域（auth + user 合并，2026-09-19；PR-4 收尾后 `/api/v2/iam/*` 为唯一对外接口，旧 alias `/auth` + `/users` 已下线）
 > - [`./applicants.md`](./applicants.md) — applicant 域（申请人 CRUD，2026-08-26）
 > - [`./customers.md`](./customers.md) — customers 域（L1/L2 CRUD，2026-08-26）
 > - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker + mapping，2026-08-26）
@@ -101,7 +99,7 @@ HTTP 状态码：
 
 > ⚠️ 当 `REDIS_SESSION_CHECK_ENABLED=false` 时（迁移过渡期），extractor 不查 Redis，
 > 40105 SESSION_REVOKED 不会再触发；session 写入也走 no-op store。
-> 见 `docs/api/auth.md` 末段。
+> 见 `docs/api/iam.md` 末段。
 
 ### 五角色 RBAC
 
@@ -156,7 +154,7 @@ HTTP 状态码：
 
 | 模块 | 文件 | 端点数 | 状态 |
 |---|---|---|---|
-| auth + users | [`./iam.md`](./iam.md) | 14 | ✅ 完全上线（2026-09-19 合并为单一 iam 域） |
+| auth + users | [`./iam.md`](./iam.md) | 14 | ✅ 完全上线（2026-09-19 合并为单一 iam 域；PR-4 收尾后 `/api/v2/iam/*` 为唯一对外接口） |
 | applicants | [`./applicants.md`](./applicants.md) | 5 | ✅ 完全上线（CRUD + L1 customer 校验 + OCC，2026-08-26） |
 | customers | [`./customers.md`](./customers.md) | 5 | ✅ 完全上线（CRUD + L1/L2 + OCC，2026-08-26） |
 | shelves | [`./shelves.md`](./shelves.md) | 11 | ✅ 完全上线（CRUD + picker + mapping，2026-08-26） |

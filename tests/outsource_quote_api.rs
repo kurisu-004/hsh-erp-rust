@@ -78,7 +78,7 @@ async fn login(pool: PgPool, username: &str, role: &str) -> (axum::Router, Strin
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),

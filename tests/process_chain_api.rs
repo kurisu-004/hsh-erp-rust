@@ -87,7 +87,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, P
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": username, "password": "changeme"})),
             None,
         ),
@@ -438,7 +438,7 @@ async fn upsert_forbidden_for_non_manager() {
         app,
         json_request(
             "POST",
-            "/auth/login",
+            "/iam/login",
             Some(json!({"username": "clerk1", "password": "changeme"})),
             None,
         ),

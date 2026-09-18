@@ -15,8 +15,8 @@
 //! 这是测试基建约束，不是产品代码约束——产品代码里每个 tx 都是原子的。
 //!
 //! 2026-09-19 IAM 域合并：从 `tests/auth_api.rs` 整体迁移过来，路径全改为
-//! `/api/v2/iam/*`。原 `tests/auth_api_legacy.rs`（PR-1 兼容期）保留 5 条回归用例
-//! 验证旧 alias `/api/v2/auth/*` + `/api/v2/users/*` 仍 200。
+//! `/api/v2/iam/*`。原 `tests/auth_api_legacy.rs`（PR-1 兼容期回归 5 用例）随 PR-4
+//! 旧 alias 下线一并删除。
 
 #[path = "common/mod.rs"]
 mod common;
