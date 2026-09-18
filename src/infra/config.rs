@@ -4,7 +4,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -15,7 +15,7 @@ pub struct AppConfig {
     pub snowflake: SnowflakeConfig,
     pub max_request_body_size: usize,
     pub auto_complete: AutoCompleteConfig,
-/// Redis 会话存储（服务端 session 真相源；access token 吊销依赖）
+    /// Redis 会话存储（服务端 session 真相源；access token 吊销依赖）
     pub redis: RedisConfig,
     /// 送货单 Excel 模板目录（P4 打印）。环境变量 `DELIVERY_NOTE_TEMPLATE_DIR`
     /// 优先；缺省回退到编译期绝对路径 `<CARGO_MANIFEST_DIR>/template`，
@@ -31,6 +31,8 @@ pub struct AppConfig {
     /// 生产 30s；测试可调小到 1s 以便在 CI 内验证 heartbeat text 帧。
     /// 环境变量 `WS_HEARTBEAT_INTERVAL_SECONDS`，缺省 `30`。
     pub ws_heartbeat_interval_seconds: u64,
+    /// 2026-09-18 新增：上传会话域配置（Redis 会话机制 + python STS 转发）。
+    pub upload_session: UploadSessionConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -87,12 +89,21 @@ pub struct CosConfig {
     pub upload_prefix: String,
     pub presign_expire_seconds: u32,
     pub max_file_size: usize,
-    /// 2026-09-16 M2-A 新增：STS 临时凭证有效期（秒）。
-    /// 业务建议 900s，与 `presign_expire_seconds` 对齐；可通过
-    /// `COS_STS_DURATION_SECONDS` env 覆盖，缺省 900。
+    /// STS 临时凭证有效期（秒）。
+    ///
+    /// - 2026-09-16 M2-A：原 `TencentSts`（已删除 2026-09-18）用此值调 GetFederationToken。
+    /// - 2026-09-18：字段保留以兼容历史 `.env`（`COS_STS_DURATION_SECONDS`），新逻辑改
+    ///   用 `UploadSessionConfig::sts_duration_seconds`（`UPLOAD_SESSION_STS_DURATION_SECONDS`）。
+    ///   字段当前未被任何代码读取，留待未来清理；不要删除以避免破坏现有 .env 配置。
+    ///
+    /// 2026-09-18 review #3 修复：`#[allow(dead_code)]` 抑制 clippy -D warnings
+    /// （字段保留是兼容 .env 的明确决策，非死代码）。
+    #[allow(dead_code)]
     pub sts_duration_seconds: u32,
-    /// 2026-09-16 M2-A 新增：STS 凭证写入 prefix 模板前缀（默认 `tmp/`，含尾斜杠）。
-    /// 最终 tmp_prefix = `{tmp_prefix}{owner_kind}/{owner_id}/{kind}/`，用于 policy resource。
+    /// COS 临时对象 prefix 模板前缀（默认 `tmp/`，含尾斜杠）。可用于多种场景：
+    /// - confirm handler 校验 `tmp_key` 必须以此前缀开头
+    /// - upload_session 域 `tmp/sess/<uuid>/` 派生时也以此前缀为锚
+    ///
     /// 可通过 `COS_TMP_PREFIX` env 覆盖，缺省 `tmp/`。
     pub tmp_prefix: String,
 }
@@ -111,6 +122,32 @@ pub struct SnowflakeConfig {
 pub struct AutoCompleteConfig {
     pub threshold_days: u32,
     pub interval_hours: u64,
+}
+
+/// 上传会话域配置（2026-09-18 新增）
+///
+/// 集中管理 upload_session 域的所有可调参数：
+/// - `python_backend_base_url`：rust → python STS 转发目标地址
+/// - `ttl_seconds`：Redis key TTL（24h 滑动）
+/// - `sts_duration_seconds`：请求 python 签发时的 expire_seconds（python 端可能按
+///   自身配置上下限收敛；此值仅作调用方期望值）
+/// - `renew_threshold_seconds`：get_or_create hit 路径下，凭证 < 此阈值自动 renew
+#[derive(Clone, Debug)]
+pub struct UploadSessionConfig {
+    /// 完整 base URL（含 scheme / host / port），如 `http://backend:8000`。
+    /// 留空 → NoopPythonSts（本地调试用）。
+    /// 环境变量 `PYTHON_BACKEND_BASE_URL`，缺省 `http://backend:8000`。
+    pub python_backend_base_url: String,
+    /// Redis 会话条目 TTL（秒）；每次写都 SET EX 续期。
+    /// 环境变量 `UPLOAD_SESSION_TTL_SECONDS`，缺省 `86400`（24h）。
+    pub ttl_seconds: u64,
+    /// 请求 python 端签发 STS 时的期望有效期（秒）。
+    /// 环境变量 `UPLOAD_SESSION_STS_DURATION_SECONDS`，缺省 `7200`（2h，比 STS
+    /// 默认 900s 长以减少 renew 频率）。
+    pub sts_duration_seconds: u32,
+    /// get_or_create hit 路径下，凭证剩余有效期 < 此阈值 → 自动 renew。
+    /// 环境变量 `UPLOAD_SESSION_RENEW_THRESHOLD_SECONDS`，缺省 `600`（10min）。
+    pub renew_threshold_seconds: i64,
 }
 
 impl AppConfig {
@@ -189,6 +226,16 @@ impl AppConfig {
             enable_e2e_hooks: env_bool("E2E_HOOKS_ENABLED", true)?,
             // 2026-09-15 followup-cleanup A5/A6：dashboard WS 心跳间隔（秒）；生产 30，测试可调小。
             ws_heartbeat_interval_seconds: env_parse("WS_HEARTBEAT_INTERVAL_SECONDS", 30u64)?,
+            // 2026-09-18 新增：upload_session 域配置
+            upload_session: UploadSessionConfig {
+                python_backend_base_url: env_or("PYTHON_BACKEND_BASE_URL", "http://backend:8000"),
+                ttl_seconds: env_parse("UPLOAD_SESSION_TTL_SECONDS", 86_400u64)?,
+                sts_duration_seconds: env_parse("UPLOAD_SESSION_STS_DURATION_SECONDS", 7_200u32)?,
+                renew_threshold_seconds: env_parse(
+                    "UPLOAD_SESSION_RENEW_THRESHOLD_SECONDS",
+                    600i64,
+                )?,
+            },
         })
     }
 }
@@ -230,8 +277,8 @@ pub fn build_test_database_url() -> Result<String> {
 /// 从环境变量构建 Redis 连接 URL（session store）
 ///
 /// 两层回退：优先 `REDIS_URL`（含密码 / db index），否则按 `REDIS_HOST/PORT/DB/PASSWORD`
- /// 拼接（dev/test 默认即可）。注意测试容器走 `redis://localhost:6380/15`（与
- /// dev 的 db 0 隔离）。
+/// 拼接（dev/test 默认即可）。注意测试容器走 `redis://localhost:6380/15`（与
+/// dev 的 db 0 隔离）。
 pub fn build_redis_url() -> String {
     if let Ok(url) = env::var("REDIS_URL") {
         return url;

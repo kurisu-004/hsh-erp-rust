@@ -43,11 +43,15 @@ use deadpool_redis::{Config as RedisConfig, Pool as RedisPool, Runtime as RedisR
 use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
     AppConfig, AutoCompleteConfig, CosConfig, JwtConfig, RedisConfig as AppRedisConfig,
-    SnowflakeConfig,
+    SnowflakeConfig, UploadSessionConfig,
 };
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
+use hsh_erp_rust::infra::python_sts::{NoopPythonSts, PythonSts};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
+use hsh_erp_rust::modules::upload_session::repo::{
+    NoopUploadSessionRepo, RedisUploadSessionRepo, UploadSessionRepo,
+};
 use hsh_erp_rust::shared::error::{AppError, code};
 
 use std::sync::OnceLock;
@@ -236,6 +240,13 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         enable_e2e_hooks: true,
         // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳，E2E WS 用例可在 2s 内验到 text 帧。
         ws_heartbeat_interval_seconds: 1,
+        // 2026-09-18 新增：upload_session 域默认配置（测试场景）
+        upload_session: UploadSessionConfig {
+            python_backend_base_url: "http://backend-test:8000".into(),
+            ttl_seconds: 86400,
+            sts_duration_seconds: 7200,
+            renew_threshold_seconds: 600,
+        },
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -243,13 +254,23 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
-    // 2026-09-16 M2-A：测试场景 STS 用 NoopSts 占位（不连真实 GetFederationToken）。
-    let sts: Arc<dyn hsh_erp_rust::infra::sts::StsCredentialIssuer> =
-        Arc::new(hsh_erp_rust::infra::sts::NoopSts);
+    // 2026-09-18 M3-B：测试场景 STS 转发用 NoopPythonSts 占位（不连真实 python 后端）。
+    // 原 `state.sts` (TencentSts / NoopSts) 2026-09-18 已删除——rust 不再直连腾讯云 STS。
+    let python_sts: Arc<dyn PythonSts> = Arc::new(NoopPythonSts);
     let shutdown = CancellationToken::new();
-    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool));
+    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
+    let upload_session_repo: Arc<dyn UploadSessionRepo> =
+        Arc::new(RedisUploadSessionRepo::new(redis_pool));
     Arc::new(AppState::new(
-        pool, config, snowflake, ws_hub, cos, sts, shutdown, session,
+        pool,
+        config,
+        snowflake,
+        ws_hub,
+        cos,
+        python_sts,
+        shutdown,
+        session,
+        upload_session_repo,
     ))
 }
 
@@ -306,6 +327,13 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         enable_e2e_hooks: true,
         // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳。
         ws_heartbeat_interval_seconds: 1,
+        // 2026-09-18 新增：upload_session 域默认配置（测试场景）
+        upload_session: UploadSessionConfig {
+            python_backend_base_url: "http://backend-test:8000".into(),
+            ttl_seconds: 86400,
+            sts_duration_seconds: 7200,
+            renew_threshold_seconds: 600,
+        },
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -313,15 +341,23 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
-    // 2026-09-16 M2-A：测试场景 STS 用 NoopSts 占位（不连真实 GetFederationToken）。
-    let sts: Arc<dyn hsh_erp_rust::infra::sts::StsCredentialIssuer> =
-        Arc::new(hsh_erp_rust::infra::sts::NoopSts);
+    // 2026-09-18 M3-B：测试场景 STS 转发用 NoopPythonSts 占位。
+    let python_sts: Arc<dyn PythonSts> = Arc::new(NoopPythonSts);
     let shutdown = CancellationToken::new();
     // 注意：NoopSessionStore 不需要 Redis 池
     use hsh_erp_rust::auth::session::NoopSessionStore;
     let session: Arc<dyn SessionStore> = Arc::new(NoopSessionStore::new());
+    let upload_session_repo: Arc<dyn UploadSessionRepo> = Arc::new(NoopUploadSessionRepo);
     Arc::new(AppState::new(
-        pool, config, snowflake, ws_hub, cos, sts, shutdown, session,
+        pool,
+        config,
+        snowflake,
+        ws_hub,
+        cos,
+        python_sts,
+        shutdown,
+        session,
+        upload_session_repo,
     ))
 }
 
@@ -392,20 +428,35 @@ pub async fn test_state_with_cos(
         delivery_note_template_dir: std::path::PathBuf::from("template"),
         enable_e2e_hooks: true,
         ws_heartbeat_interval_seconds: 1,
+        // 2026-09-18 新增：upload_session 域默认配置（测试场景）
+        upload_session: UploadSessionConfig {
+            python_backend_base_url: "http://backend-test:8000".into(),
+            ttl_seconds: 86400,
+            sts_duration_seconds: 7200,
+            renew_threshold_seconds: 600,
+        },
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
         config.snowflake.instance,
     ));
     let ws_hub = Arc::new(WsHub::new());
-    // 2026-09-16 M2-C 增：STS 用 NoopSts 占位（与 test_state_with_redis 一致）
-    let sts: Arc<dyn hsh_erp_rust::infra::sts::StsCredentialIssuer> =
-        Arc::new(hsh_erp_rust::infra::sts::NoopSts);
+    // 2026-09-18 M3-B：测试场景 STS 转发用 NoopPythonSts 占位（与 test_state_with_redis 一致）
+    let python_sts: Arc<dyn PythonSts> = Arc::new(NoopPythonSts);
     let shutdown = CancellationToken::new();
-    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool));
+    let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
+    let upload_session_repo: Arc<dyn UploadSessionRepo> =
+        Arc::new(RedisUploadSessionRepo::new(redis_pool));
     Arc::new(AppState::new(
-        pool, config, snowflake, ws_hub, cos, // 注入的 cos（替换默认 NoopCos）
-        sts, shutdown, session,
+        pool,
+        config,
+        snowflake,
+        ws_hub,
+        cos, // 注入的 cos（替换默认 NoopCos）
+        python_sts,
+        shutdown,
+        session,
+        upload_session_repo,
     ))
 }
 

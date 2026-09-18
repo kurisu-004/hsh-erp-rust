@@ -21,11 +21,14 @@ use hsh_erp_rust::auth::session::{NoopSessionStore, RedisSessionStore, SessionSt
 use hsh_erp_rust::infra::config::AppConfig;
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos, TencentCos};
 use hsh_erp_rust::infra::db;
+use hsh_erp_rust::infra::python_sts::{HttpPythonSts, NoopPythonSts, PythonSts};
 use hsh_erp_rust::infra::redis;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-use hsh_erp_rust::infra::sts::{NoopSts, StsCredentialIssuer, TencentSts};
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::modules;
+use hsh_erp_rust::modules::upload_session::repo::{
+    NoopUploadSessionRepo, RedisUploadSessionRepo, UploadSessionRepo,
+};
 use hsh_erp_rust::state::AppState;
 use hsh_erp_rust::task;
 
@@ -75,30 +78,63 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(NoopCos)
     };
 
-    // 6.4 STS 凭证签发器（前端直传 COS 用；M2-A 新增）
-    // 2026-09-16：与 cos 同样的二选一构造策略——COS_ENABLED=true 走 TencentSts（真实调
-    // GetFederationToken），否则 NoopSts（占位，本地 cargo run 调试不依赖凭据）。
-    let sts: Arc<dyn StsCredentialIssuer> = if config.cos.enabled {
-        info!("COS_ENABLED=true，启用 TencentSts（真实签发 STS 临时凭证）");
+    // 6.4 Python STS 凭证转发客户端（2026-09-18 新增；替代原 TencentSts 直连）
+    // 走 HTTP 转发到 python 后端内部端点 `/api/v1/files/sts-prefix-credentials`；
+    // 本地 cargo run 时如不想启 python 后端，把 `PYTHON_BACKEND_BASE_URL` 设为空
+    // 走 Noop 占位（仅供前端骨架调试，业务上不真上传）。
+    //
+    // 2026-09-18 review #5 修复：fail-fast —— COS_ENABLED=true 且 PYTHON_BACKEND_BASE_URL
+    // 为空是典型的生产 misconfiguration（业务要真实上传但 STS 链路未就绪）。原代码
+    // 静默回退到 NoopPythonSts 会让前端拿到"看上去合法"的占位 token 上传，触发
+    // 一连串 403 / 头像丢失等下游问题；现改为直接 bail! 拒绝启动，强制 ops
+    // 修复环境变量。dev / 测试场景显式 `COS_ENABLED=false` 仍走 Noop。
+    let python_sts: Arc<dyn PythonSts> = if config.cos.enabled
+        && !config.upload_session.python_backend_base_url.is_empty()
+    {
+        info!(
+            base_url = %config.upload_session.python_backend_base_url,
+            "PYTHON_BACKEND_BASE_URL 已配置，启用 HttpPythonSts（转发 python 后端签发 STS）"
+        );
         Arc::new(
-            TencentSts::new(&config.cos)
-                .context("初始化 TencentSts 失败（检查 COS_SECRET_ID / KEY / BUCKET / REGION）")?,
+            HttpPythonSts::new(config.upload_session.python_backend_base_url.clone())
+                .context("初始化 HttpPythonSts 失败")?,
         )
+    } else if config.cos.enabled && config.upload_session.python_backend_base_url.is_empty() {
+        // fail-fast：COS_ENABLED=true 但 PYTHON_BACKEND_BASE_URL 缺失 —— 不静默回退
+        anyhow::bail!(
+            "COS_ENABLED=true 但 PYTHON_BACKEND_BASE_URL 未配置；rust 上传会话域必须转发 \
+             python 后端签发 STS。请在 .env 设置 PYTHON_BACKEND_BASE_URL=http://backend:8000 \
+             （或显式 COS_ENABLED=false 走 Noop 占位）。这是 review #5 修复的 fail-fast \
+             防 misconfiguration 静默启用。"
+        );
     } else {
-        info!("COS_ENABLED=false，使用 NoopSts（占位签发器，本地调试用）");
-        Arc::new(NoopSts)
+        info!(
+            cos_enabled = config.cos.enabled,
+            python_base_url = %config.upload_session.python_backend_base_url,
+            "PYTHON_BACKEND_BASE_URL 未配置或 COS_ENABLED=false，使用 NoopPythonSts（占位，本地调试用）"
+        );
+        Arc::new(NoopPythonSts)
     };
 
     // 6.5 Redis 连接池 + 服务端 session 存储
-    // 关掉后使用 NoopSessionStore（不连 Redis）；适用于 Rust 借 Python JWT 的迁移过渡期
-    let session: Arc<dyn SessionStore> = if config.redis.session_check_enabled {
-        let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
-        info!("Redis session 存储已就绪");
-        Arc::new(RedisSessionStore::new(redis_pool))
-    } else {
-        info!("REDIS_SESSION_CHECK_ENABLED=false，跳过 Redis 连接，使用 NoopSessionStore");
-        Arc::new(NoopSessionStore::new())
-    };
+    // 关掉后使用 NoopSessionStore（不连 Redis）；适用于 Rust 借 Python JWT 的过渡期
+    let (session, upload_session_repo): (Arc<dyn SessionStore>, Arc<dyn UploadSessionRepo>) =
+        if config.redis.session_check_enabled {
+            let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
+            info!("Redis session 存储 + upload_session 存储已就绪");
+            (
+                Arc::new(RedisSessionStore::new(redis_pool.clone())),
+                Arc::new(RedisUploadSessionRepo::new(redis_pool)),
+            )
+        } else {
+            info!(
+                "REDIS_SESSION_CHECK_ENABLED=false，跳过 Redis 连接，使用 NoopSessionStore + NoopUploadSessionRepo"
+            );
+            (
+                Arc::new(NoopSessionStore::new()),
+                Arc::new(NoopUploadSessionRepo),
+            )
+        };
 
     // 7. 优雅退出令牌
     let shutdown = CancellationToken::new();
@@ -108,6 +144,8 @@ async fn main() -> anyhow::Result<()> {
     // 单一控制点 = env `E2E_HOOKS_ENABLED`（缺省 true）。
     // docker compose / dev `cargo run` 走默认值（true）→ 启用；prod / staging 必须
     // 显式 `E2E_HOOKS_ENABLED=false`（ops 责任，不靠编译期二分）。
+    // 2026-09-18：移除 `state.sts`（TencentSts）；改为 `state.python_sts`（HttpPythonSts /
+    // NoopPythonSts）+ `state.upload_session_repo`（RedisUploadSessionRepo / NoopUploadSessionRepo）。
     let config = Arc::new(config);
     let state = Arc::new(AppState::new(
         pool,
@@ -115,9 +153,10 @@ async fn main() -> anyhow::Result<()> {
         snowflake,
         ws_hub.clone(),
         cos,
-        sts,
+        python_sts,
         shutdown.clone(),
         session,
+        upload_session_repo,
     ));
 
     // 9. 启动后台任务

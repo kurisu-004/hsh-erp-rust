@@ -1,15 +1,18 @@
-//! part_file 域 HTTP handler（2026-09-14 Phase 3 + 2026-09-15 takeover-fill + followup-cleanup + 2026-09-16 M2-B 业务层）
+//! part_file 域 HTTP handler（2026-09-14 Phase 3 + 2026-09-15 takeover-fill + followup-cleanup + 2026-09-16 M2-B 业务层 + 2026-09-18 upload-intents 删除）
 //!
 //! 对应 Python myERP/api/v1/part_file.py。
 //!
 //! ## 端点
 //! - 挂在 `/api/v2/part-files`（由 `mod.rs::router()` 桥接）：
 //!   - `POST /`                            —— 单文件上传（multipart：`data` JSON + `file` 二进制）
-//!   - `POST /upload-intents`              —— 一次性签 STS + 预生成 tmp_key（M2-B 新增，场景 A/B）
 //!   - `GET  /`                            —— 列表查询 + 分页（`owner_kind` / `owner_id` / `kind` 过滤）
 //!   - `GET  /{file_id}/url`               —— 单条详情 + COS 预签下载 URL
 //!   - `GET  /{file_id}/content`           —— 后端代理文件内容（Phase 3 补齐）
 //!   - `POST /{file_id}/delete`            —— 软删 + COS 异步清理（Phase 3 补齐）
+//!
+//! 2026-09-18 重要变更：原 `POST /upload-intents` 端点已**删除** ——
+//! 上传意图机制迁移至 `upload_session` 域（共享 STS 凭证 + Redis 会话）。
+//! confirm 端点 `POST /parts/{part_id}/files/confirm` 仍保留（见 `part::handler::batch`）。
 //!
 //! - 挂在 `/api/v2/part-files/parts/{part_id}`（由 `part_nested_router()` 提供；
 //!   同时也被 `part::router()` 通过 `nest("/parts/{part_id}", ...)` 挂在
@@ -33,23 +36,22 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Multipart, Path, Query, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::Response,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Deserialize;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::part_file::dto::{
-    PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut, UploadIntentsIn,
-    UploadIntentsOut,
+    PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut,
 };
 use crate::modules::part_file::service::PartFileService;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
 
@@ -111,14 +113,18 @@ pub async fn upload_part_file(
         }
     }
 
-    let data_json = data_json.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 data 字段"))?;
-    let data: UploadFileData = serde_json::from_str(&data_json).map_err(|e| {
-        AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}"))
-    })?;
+    let data_json =
+        data_json.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 data 字段"))?;
+    let data: UploadFileData = serde_json::from_str(&data_json)
+        .map_err(|e| AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}")))?;
     let owner_id: i64 = data.owner_id.parse().map_err(|_| {
-        AppError::biz(code::BIZ_INVALID_VALUE, format!("owner_id 非法: {}", data.owner_id))
+        AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            format!("owner_id 非法: {}", data.owner_id),
+        )
     })?;
-    let bytes = file_bytes.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 file 字段"))?;
+    let bytes =
+        file_bytes.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 file 字段"))?;
     let filename = file_name.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少文件名"))?;
     let content_type = file_content_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -152,32 +158,6 @@ pub async fn list_part_files(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/part-files/upload-intents` → 200 OK
-///
-/// 一次性签 STS + 预生成 tmp_key（COS 直传链路入口）。
-///
-/// - 场景 A（`owner_part_id` 空）：批量预生成；part 还未建，按 batch_uuid 派生 tmp 前缀。
-/// - 场景 B（`owner_part_id` 非空）：单 part 补传 / 详情页加文件；同
-///   `(owner_id, kind, sha)` 已存在 → `dedup_hit=true` 复用，不分配 tmp_key。
-///
-/// 权限：Manager + Clerk（service 内 `require_any_role`）。
-/// 2026-09-16 M2-B 新增。
-pub async fn upload_intents(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Json(req): Json<UploadIntentsIn>,
-) -> Result<Json<R<UploadIntentsOut>>, AppError> {
-    let out = PartFileService::upload_intents(
-        &state.pool,
-        &state.config.cos.tmp_prefix,
-        state.sts.clone(),
-        &req,
-        &current,
-    )
-    .await?;
-    Ok(Json(R::ok(out)))
-}
-
 /// `GET /api/v2/part-files/{file_id}/url` → 200 OK
 pub async fn get_part_file_url(
     State(state): State<Arc<AppState>>,
@@ -185,7 +165,8 @@ pub async fn get_part_file_url(
     Path(file_id): Path<i64>,
 ) -> Result<Json<R<PartFileWithUrlOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::get_file_with_url(&mut tx, state.cos.clone(), file_id, &current).await?;
+    let out =
+        PartFileService::get_file_with_url(&mut tx, state.cos.clone(), file_id, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -200,19 +181,15 @@ pub async fn get_part_file_content(
     Path(file_id): Path<i64>,
 ) -> Result<Response, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::get_file_content(
-        &mut tx,
-        state.cos.clone(),
-        file_id,
-        &current,
-    )
-    .await?;
+    let out =
+        PartFileService::get_file_content(&mut tx, state.cos.clone(), file_id, &current).await?;
     tx.commit().await?;
     let resp = Response::builder()
         .status(StatusCode::OK)
         .header(
             header::CONTENT_TYPE,
-            out.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+            out.content_type
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
         )
         .header(header::CONTENT_LENGTH, out.bytes.len())
         .body(Body::from(out.bytes))
@@ -264,15 +241,13 @@ pub async fn soft_delete_part_file(
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", post(upload_part_file).get(list_part_files))
-        // 2026-09-16 M2-B 新增：直传 COS 入口。
-        // POST `/upload-intents` 与 POST `/` 同 method 但不同 path，axum 允许共存。
-        .route("/upload-intents", post(upload_intents))
         .route("/{file_id}/url", get(get_part_file_url))
         .route("/{file_id}/content", get(get_part_file_content))
         .route("/{file_id}/delete", post(soft_delete_part_file))
         // 2026-09-15 followup-cleanup A8：原 part/handler.rs 的 7 个 part 维度
         // 文件路由（`POST /parts/{part_id}/cad-files` 等）也通过 `/part-files/parts/{part_id}`
         // 路径对外暴露，便于前端 / 第三方客户端不依赖 parts 入口也能命中。
+        // 2026-09-18 注：原 `/upload-intents` 路由已删除（迁移至 upload_session 域）。
         .nest("/parts/{part_id}", part_nested_router())
 }
 
@@ -321,7 +296,8 @@ async fn read_part_file_multipart(
             )));
         }
     }
-    let (data, fname, ct) = bytes.ok_or_else(|| AppError::validation("multipart 缺少 'file' 字段"))?;
+    let (data, fname, ct) =
+        bytes.ok_or_else(|| AppError::validation("multipart 缺少 'file' 字段"))?;
     let ct = ct.ok_or_else(|| AppError::validation("file 缺少 content_type"))?;
     Ok((data, fname, ct))
 }
@@ -439,7 +415,7 @@ pub async fn upload_cnc_pair(
             _ => {
                 return Err(AppError::validation(format!(
                     "multipart 未知字段: '{name}'（仅接受 'g_code' / 'setup_sheet'）"
-                )))
+                )));
             }
         }
     }
