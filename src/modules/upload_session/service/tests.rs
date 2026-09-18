@@ -9,8 +9,9 @@
 //! - renew 自动触发（review #11 修复：用 mock PythonSts 模拟"已过期"，不再篡改 Redis）
 //! - python STS 错误映射传播（review #12 修复：mock PythonSts 返回
 //!   `BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED`，验证 service 透传）
-//! - renew tmp_prefix 漂移守护（review #13 修复：mock PythonSts 返回不同 prefix，
-//!   验证 service 拒绝）
+//! - renew tmp_prefix 稳定守护（review #13 + 第 2 轮 review 修复：tmp_prefix
+//!   由 rust 端独占持有，不再从 python 响应回读；mock 验证 renew 后 session.tmp_prefix
+//!   不变）
 //! - discard 路径 session_id 校验（review #14：Redis 存在时必须 MISMATCH）
 
 use super::super::dto::{AllocateFileItemIn, ConsumeFilesIn, DiscardIn, RemoveFilesIn, RenewIn};
@@ -18,7 +19,7 @@ use super::super::repo::InMemoryUploadSessionRepo;
 use super::*;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::NoopCos;
-use crate::infra::python_sts::{NoopPythonSts, PythonSts, PythonStsCredential};
+use crate::infra::python_sts::{Credentials, NoopPythonSts, PythonSts, PythonStsCredential};
 use crate::shared::error::code;
 
 fn current_user() -> CurrentUser {
@@ -72,19 +73,25 @@ fn dummy_sts_long_expiry() -> Arc<dyn PythonSts> {
     impl PythonSts for LongSts {
         async fn issue(
             &self,
-            prefix: &str,
+            _prefix: &str,
             _expire_seconds: u32,
         ) -> Result<PythonStsCredential, AppError> {
             let now = now_unix();
             Ok(PythonStsCredential {
-                tmp_secret_id: "id".into(),
-                tmp_secret_key: "key".into(),
-                session_token: "tok".into(),
+                credentials: Credentials {
+                    tmp_secret_id: "id".into(),
+                    tmp_secret_key: "key".into(),
+                    session_token: "tok".into(),
+                    start_time: now,
+                    expired_time: now + 86400, // 24h，远超 600s 阈值
+                },
                 start_time: now,
-                expired_time: now + 86400, // 24h，远超 600s 阈值
+                expired_time: now + 86400,
+                expires_in: 86400,
                 bucket: "b".into(),
                 region: "r".into(),
-                tmp_prefix: prefix.into(),
+                endpoint: "https://cos.ap-shanghai.myqcloud.com".into(),
+                scheme: "https".into(),
             })
         }
     }
@@ -92,27 +99,33 @@ fn dummy_sts_long_expiry() -> Arc<dyn PythonSts> {
 }
 
 /// 2026-09-18 review #11 修复：mock PythonSts 返回已过期的 expired_time，
-/// 不再篡改 Redis。返回的 tmp_prefix 与 caller 传入一致（prefix 漂移守护
-/// 互不干扰，见 #13）。
+/// 不再篡改 Redis。2026-09-18 第 2 轮 review 修复：tmp_prefix 字段已删除，
+/// mock 不再设置（service 层用本地变量持有 tmp_prefix）。
 fn dummy_sts_already_expired() -> Arc<dyn PythonSts> {
     struct ExpiredSts;
     #[async_trait]
     impl PythonSts for ExpiredSts {
         async fn issue(
             &self,
-            prefix: &str,
+            _prefix: &str,
             _expire_seconds: u32,
         ) -> Result<PythonStsCredential, AppError> {
             let now = now_unix();
             Ok(PythonStsCredential {
-                tmp_secret_id: "id".into(),
-                tmp_secret_key: "key".into(),
-                session_token: "tok".into(),
-                start_time: now - 7200,   // 2h 前
-                expired_time: now - 3600, // 1h 前已过期；renew 触发后写回 now+7200
+                credentials: Credentials {
+                    tmp_secret_id: "id".into(),
+                    tmp_secret_key: "key".into(),
+                    session_token: "tok".into(),
+                    start_time: now - 7200,   // 2h 前
+                    expired_time: now - 3600, // 1h 前已过期；renew 触发后写回 now+7200
+                },
+                start_time: now - 7200,
+                expired_time: now - 3600,
+                expires_in: 3600,
                 bucket: "b".into(),
                 region: "r".into(),
-                tmp_prefix: prefix.into(),
+                endpoint: "https://cos.ap-shanghai.myqcloud.com".into(),
+                scheme: "https".into(),
             })
         }
     }
@@ -141,8 +154,13 @@ fn dummy_sts_forward_failed() -> Arc<dyn PythonSts> {
     Arc::new(FailedSts)
 }
 
-/// 2026-09-18 review #13 修复：mock PythonSts 在 renew 时返回与 caller 不一致的
-/// tmp_prefix（模拟 python 端异常漂移）。
+/// 2026-09-18 review #13 + 2026-09-18 第 2 轮 review 修复：原 mock 通过
+/// 返回不同 tmp_prefix 模拟 prefix 漂移；现在 python schema 不返回 tmp_prefix
+/// 且 rust 端独占持有 tmp_prefix（不再从 cred 回读），漂移守护**不再适用**——
+///
+/// 本 mock 现仅用于触发**与 prefix 无关**的业务异常路径占位；保留函数符号
+/// 是为了**测试可读性**（仍是 PythonSts trait 的 mock 实现），不再断言 prefix
+/// 比对行为。
 fn dummy_sts_drifted_prefix() -> Arc<dyn PythonSts> {
     struct DriftedSts;
     #[async_trait]
@@ -152,17 +170,23 @@ fn dummy_sts_drifted_prefix() -> Arc<dyn PythonSts> {
             _prefix: &str,
             _expire_seconds: u32,
         ) -> Result<PythonStsCredential, AppError> {
-            // caller 传入 prefix = "tmp/sess/<uuid>/"，但本 mock 返回完全不同的 prefix
+            // 仍返回合法结构（service 现不校验 prefix 内容）
             let now = now_unix();
             Ok(PythonStsCredential {
-                tmp_secret_id: "id".into(),
-                tmp_secret_key: "key".into(),
-                session_token: "tok".into(),
+                credentials: Credentials {
+                    tmp_secret_id: "id".into(),
+                    tmp_secret_key: "key".into(),
+                    session_token: "tok".into(),
+                    start_time: now,
+                    expired_time: now + 7200,
+                },
                 start_time: now,
                 expired_time: now + 7200,
+                expires_in: 7200,
                 bucket: "b".into(),
                 region: "r".into(),
-                tmp_prefix: "tmp/drifted/wrong-prefix/".into(),
+                endpoint: "https://cos.ap-shanghai.myqcloud.com".into(),
+                scheme: "https".into(),
             })
         }
     }
@@ -880,14 +904,18 @@ async fn python_sts_forward_failure_propagates_error_code() {
     assert_eq!(err2.code(), code::BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED);
 }
 
-/// 2026-09-18 review #13 修复：renew 时若 python 返回的 tmp_prefix 与 session 内
-/// 不一致 → service 拒绝（返回 internal 错误），不静默漂移。
+/// 2026-09-18 review #13 修复 + 2026-09-18 第 2 轮 review 修复：原测试验证
+/// "renew 时若 python 返回的 tmp_prefix 与 session 内不一致 → service 拒绝"。
+/// 现在 python schema 不返回 tmp_prefix 且 rust 端独占持有 tmp_prefix（不再
+/// 从 cred 回读），drift 检测已无意义——本测试改为**正向**断言：renew 后
+/// `session.tmp_prefix` 保持**不变**（不依赖 python 端响应），所有 tmp_key 派生
+/// 锚点稳定。
 #[tokio::test]
-async fn renew_rejects_drifted_tmp_prefix() {
+async fn renew_preserves_session_tmp_prefix() {
     let repo = Arc::new(InMemoryUploadSessionRepo::new());
 
-    // 第一次：long_expiry 创建 session（session.tmp_prefix = "tmp/sess/<uuid>/"）
-    let out = UploadSessionService::get_or_create(
+    // 第一次：long_expiry 创建 session（session.tmp_prefix 由 rust 端派生）
+    let out1 = UploadSessionService::get_or_create(
         repo.clone(),
         dummy_sts_long_expiry(),
         &cfg(),
@@ -898,11 +926,20 @@ async fn renew_rejects_drifted_tmp_prefix() {
     )
     .await
     .unwrap();
-    let session_id = out.session_id.clone();
+    let session_id = out1.session_id.clone();
+    let original_tmp_prefix = out1.tmp_prefix.clone();
 
-    // 第二次：调 renew，但用 drifted mock（返回不同 prefix）→ 应拒绝
-    let err = UploadSessionService::renew(
-        repo,
+    // 直接 mutate Redis 让 expired_time 略低于 now（剩余 < 600s 阈值），触发 renew
+    {
+        let mut s = repo.get(42, "parts_new").await.unwrap().unwrap();
+        s.credentials.expired_time = now_unix() + 300;
+        s.credentials.start_time = s.credentials.expired_time - 7200;
+        repo.put(&s, 86400).await.unwrap();
+    }
+
+    // 第二次：用 drifted mock（不再漂移；mock 行为与 long_expiry 一致）→ 应成功
+    let out2 = UploadSessionService::renew(
+        repo.clone(),
         dummy_sts_drifted_prefix(),
         &cfg(),
         &session_id,
@@ -912,13 +949,22 @@ async fn renew_rejects_drifted_tmp_prefix() {
         &current_user(),
     )
     .await
-    .expect_err("drifted prefix 应拒绝");
+    .expect("renew 应成功（tmp_prefix 由 rust 独占持有）");
 
-    // 检查错误消息含 "prefix 漂移"
-    let msg = format!("{}", err);
+    // session.tmp_prefix 在 renew 前后必须保持一致
     assert!(
-        msg.contains("prefix") && msg.contains("漂移"),
-        "错误消息应明示 prefix 漂移原因；实际 = {msg}"
+        out2.credentials.expired_time > now_unix(),
+        "renew 后 expired_time 应被推到远期"
+    );
+    // 校验 Redis 中 session.tmp_prefix 未漂移
+    let stored_session = repo
+        .get(42, "parts_new")
+        .await
+        .unwrap()
+        .expect("renew 后 session 应仍在 Redis 中");
+    assert_eq!(
+        stored_session.tmp_prefix, original_tmp_prefix,
+        "renew 后 session.tmp_prefix 必须保持不变（rust 端独占持有）"
     );
 }
 

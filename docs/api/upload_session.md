@@ -46,6 +46,11 @@
 - 改为转发到 python 后端 `POST {PYTHON_BACKEND_BASE_URL}/api/v1/files/sts-prefix-credentials`
 - python 端负责凭据管理 / 审计 / 限流
 - 超时 10s；HTTP 4xx/5xx 映射到 `BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED` (21608)
+- **python 后端统一信封**（`UnifiedResponseMiddleware` 包装）：所有响应均为
+  `{code, message, data}` 三段式；rust 端先解信封再取 `data`。
+  - 成功：`code == 0` 且 `data` = STS 凭证对象
+  - 业务异常：`code != 0`（如 21503 权限不足）；rust 错误消息透传 `[<python_code>] <原 message>`
+- 实现见 `src/infra/python_sts.rs::parse_python_response`（纯函数，单测全覆盖）
 
 ### 自动 renew 触发条件
 
@@ -109,7 +114,7 @@
 {
   "session_id": "uuid",                     // 服务端生成（v4）
   "scope": "parts_new",
-  "tmp_prefix": "tmp/sess/<uuid>/",         // 写入 COS tmp 区的前缀（前端按此拼 key）
+  "tmp_prefix": "tmp/sess/<uuid>/",         // rust 端独占派生（不是从 python 端响应取）
   "bucket": "...",                           // 从 python 端 sts 响应取
   "region": "...",
   "credentials": {
@@ -497,5 +502,66 @@ pub struct SessionCredentials {
 - **kind 白名单**：`is_valid_kind` 复用 `part_file::policy::allowed_exts`（与 multipart 上传 kind 一致）
 - **STS 转发**：`HttpPythonSts` 调 `POST {PYTHON_BACKEND_BASE_URL}/api/v1/files/sts-prefix-credentials`，
   body `{prefix, expire_seconds}`，超时 10s；HTTP 4xx/5xx → `BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED` (21608)
+- **python 信封解包**：python 后端所有响应经 `UnifiedResponseMiddleware` 包装为
+  `{code, message, data}`；rust 端 `parse_python_response` 先反序列化为 `PythonEnvelope<T>`
+  再判 `code` / 取 `data`。成功路径返回 `data`，业务异常路径把 python `code` + `message`
+  透传到 rust 错误消息（前端能看到原始错码）。解析失败（malformed JSON / data 缺字段）
+  → 21608 + body 前 200 字节预览。2026-09-18 修复 21608 历史 bug 时引入；2026-09-18
+  第 2 轮 review 修复：`PythonStsCredential` 字段路径对齐 python 真实 schema
+  （嵌套 `credentials` + 顶层 `start_time` / `expired_time` / `expires_in` /
+  `bucket` / `region` / `endpoint` / `scheme`）；python schema **不返回
+  `tmp_prefix`**，rust 端在 `issue(prefix, ...)` 时已收 prefix 入参，由
+  `service::issue_and_persist` 独占派生并写入 `session.tmp_prefix`。
 - **trait 注入模式**：与 `CosClient` / `StsCredentialIssuer` / `SessionStore` 同形
   （trait + `Arc<dyn>` + Noop 占位）
+
+---
+
+### python 后端契约：`POST /api/v1/files/sts-prefix-credentials`
+
+> 2026-09-18 锁定；2026-09-18 第 2 轮 review 修复后与 rust 端对齐。
+
+**请求 body**：
+
+```jsonc
+{ "prefix": "tmp/sess/<uuid>/", "expire_seconds": 1800 }
+```
+
+**成功响应**（HTTP 2xx + `code == 0`）：
+
+```jsonc
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "credentials": {
+      "tmp_secret_id": "...",
+      "tmp_secret_key": "...",
+      "session_token": "...",
+      "start_time": 1734567890,    // unix 秒
+      "expired_time": 1734571490   // unix 秒
+    },
+    "start_time": 1734567890,      // 与 credentials.start_time 同步
+    "expired_time": 1734571490,    // 与 credentials.expired_time 同步
+    "expires_in": 3600,
+    "bucket": "myerp-prod-1300000000",
+    "region": "ap-shanghai",
+    "endpoint": "https://cos.ap-shanghai.myqcloud.com",
+    "scheme": "https"
+  }
+}
+```
+
+> 注意：python schema **不返回 `tmp_prefix`**。rust 端在请求 body 里传
+> `prefix` 时已经派生（`tmp/sess/<uuid>/`），session.tmp_prefix 由
+> rust 端独占持有，python 端不参与 prefix 派生或回写。
+
+**业务异常响应**（`code != 0`，HTTP 通常 4xx）：
+
+```jsonc
+{ "code": 21503, "message": "权限不足", "data": null }
+```
+
+→ rust 端 `parse_python_response` 把 `code` + `message` 透传到错误消息
+（`"python STS 业务错误 [{code}] {message}"`），同时映射到
+`BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED` (21608)。
