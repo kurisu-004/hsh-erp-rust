@@ -275,13 +275,14 @@ pub fn is_valid_scope(scope: &str) -> bool {
 /// `"drawing"` / `"3d_model"`；大小写不敏感）。
 ///
 /// 不匹配 → 422 `BIZ_UPLOAD_SESSION_BAD_TYPE`。
+///
+/// 2026-09-18 review #7 修复：原实现把 "drawing"/"3d_model" 显式映射到
+/// "DRAWING"/"3D_MODEL" 查 policy，**回退分支**直接传小写给 policy（policy
+/// 是大写 key，等价于永远查不到）。新实现统一 `to_ascii_uppercase` 后查 policy，
+/// 删除冗余的 match 回退分支。
 pub fn is_valid_kind(kind: &str) -> bool {
-    let upper = match kind.to_ascii_lowercase().as_str() {
-        "drawing" => "DRAWING",
-        "3d_model" => "3D_MODEL",
-        other => return !policy::allowed_exts(other).is_empty(),
-    };
-    !policy::allowed_exts(upper).is_empty()
+    let upper = kind.to_ascii_uppercase();
+    !policy::allowed_exts(&upper).is_empty()
 }
 
 /// 复用 part_file sanitize_filename 规则（ASCII 字母数字 / `.` / `-` / `_` 保留，

@@ -82,6 +82,12 @@ async fn main() -> anyhow::Result<()> {
     // 走 HTTP 转发到 python 后端内部端点 `/api/v1/files/sts-prefix-credentials`；
     // 本地 cargo run 时如不想启 python 后端，把 `PYTHON_BACKEND_BASE_URL` 设为空
     // 走 Noop 占位（仅供前端骨架调试，业务上不真上传）。
+    //
+    // 2026-09-18 review #5 修复：fail-fast —— COS_ENABLED=true 且 PYTHON_BACKEND_BASE_URL
+    // 为空是典型的生产 misconfiguration（业务要真实上传但 STS 链路未就绪）。原代码
+    // 静默回退到 NoopPythonSts 会让前端拿到"看上去合法"的占位 token 上传，触发
+    // 一连串 403 / 头像丢失等下游问题；现改为直接 bail! 拒绝启动，强制 ops
+    // 修复环境变量。dev / 测试场景显式 `COS_ENABLED=false` 仍走 Noop。
     let python_sts: Arc<dyn PythonSts> = if config.cos.enabled
         && !config.upload_session.python_backend_base_url.is_empty()
     {
@@ -93,6 +99,14 @@ async fn main() -> anyhow::Result<()> {
             HttpPythonSts::new(config.upload_session.python_backend_base_url.clone())
                 .context("初始化 HttpPythonSts 失败")?,
         )
+    } else if config.cos.enabled && config.upload_session.python_backend_base_url.is_empty() {
+        // fail-fast：COS_ENABLED=true 但 PYTHON_BACKEND_BASE_URL 缺失 —— 不静默回退
+        anyhow::bail!(
+            "COS_ENABLED=true 但 PYTHON_BACKEND_BASE_URL 未配置；rust 上传会话域必须转发 \
+             python 后端签发 STS。请在 .env 设置 PYTHON_BACKEND_BASE_URL=http://backend:8000 \
+             （或显式 COS_ENABLED=false 走 Noop 占位）。这是 review #5 修复的 fail-fast \
+             防 misconfiguration 静默启用。"
+        );
     } else {
         info!(
             cos_enabled = config.cos.enabled,

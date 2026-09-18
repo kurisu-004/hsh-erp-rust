@@ -3,7 +3,7 @@
 //! 2026-09-18 新增。背景：
 //! - 原 backend-rust `infra::sts::TencentSts` 直连腾讯云 `sts.tencentcloudapi.com`，
 //!   绕过 python 后端的凭据管理 + 权限审计 + 限流。
-//! - 新设计：rust 后端通过 HTTP 转发到 python 端内部端点
+//! - 新设计：rust 后端通过 HTTP 转发到 python 后端内部端点
 //!   `POST {PYTHON_BACKEND_BASE_URL}/api/v1/files/sts-prefix-credentials`，
 //!   body `{prefix, expire_seconds}`；让 python 端统一管 STS 凭据 / 审计 / 限流，
 //!   rust 仅做"传话筒"。
@@ -14,6 +14,17 @@
 //! - 超时 10s（reqwest 默认无超时；长任务需显式）。HTTP 4xx/5xx 映射到
 //!   `BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED` (21608)。
 //! - 不重试：转发失败由调用方决定（业务上让前端走完整重试链路更直观）。
+//!
+//! ## 鉴权策略（2026-09-18 review #6 明确）
+//! - 当前**不携带任何鉴权 header**，依赖 docker 内网隔离（rust ↔ python 走 backend
+//!   service 之间的 compose network；该端点目前**裸开**无 token / mTLS）。
+//! - 若未来 python 端加 token 鉴权（如 `Authorization: Bearer <internal-token>`），
+//!   在此 `.send().await` 前显式构造 header，并从环境变量读取 token：
+//!   ```ignore
+//!   let token = env::var("PYTHON_BACKEND_INTERNAL_TOKEN").unwrap_or_default();
+//!   req = req.bearer_auth(token);
+//!   ```
+//! - 不要把 token 硬编码进代码或写入 git。
 //!
 //! ## 响应体格式（python 端契约，2026-09-18 起草）
 //! ```jsonc

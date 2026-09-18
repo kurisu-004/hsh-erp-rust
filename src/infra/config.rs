@@ -95,6 +95,10 @@ pub struct CosConfig {
     /// - 2026-09-18：字段保留以兼容历史 `.env`（`COS_STS_DURATION_SECONDS`），新逻辑改
     ///   用 `UploadSessionConfig::sts_duration_seconds`（`UPLOAD_SESSION_STS_DURATION_SECONDS`）。
     ///   字段当前未被任何代码读取，留待未来清理；不要删除以避免破坏现有 .env 配置。
+    ///
+    /// 2026-09-18 review #3 修复：`#[allow(dead_code)]` 抑制 clippy -D warnings
+    /// （字段保留是兼容 .env 的明确决策，非死代码）。
+    #[allow(dead_code)]
     pub sts_duration_seconds: u32,
     /// COS 临时对象 prefix 模板前缀（默认 `tmp/`，含尾斜杠）。可用于多种场景：
     /// - confirm handler 校验 `tmp_key` 必须以此前缀开头

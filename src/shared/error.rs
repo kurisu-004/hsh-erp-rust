@@ -165,7 +165,13 @@ pub mod code {
     // 槽位不与 21109/21110/21111/21112/21113 冲突（这些已被送货模板占用）。
     pub const BIZ_PART_FILE_TMP_OBJECT_MISSING: i32 = 21114; // tmp_key 在 COS 不存在 / size=0（前端直传未成功落地）
     pub const BIZ_PART_FILE_SIZE_MISMATCH: i32 = 21115; // tmp_key size 与 client 声明的 size_bytes 不一致
-    pub const BIZ_STS_ISSUE_FAILED: i32 = 21116; // StsClient.get_credentials 失败（业务侧重试 / 上报）
+    /// 2026-09-18 review #9 修复：原 `TencentSts::issue`（M2-A）使用此常量；
+    /// 2026-09-18 M3-B 后 rust 直连 STS 链路迁移至 `infra::python_sts::HttpPythonSts`
+    /// （失败映射到 21608 `BIZ_UPLOAD_SESSION_STS_FORWARD_FAILED`），本常量**无业务调用方**。
+    /// 保留原因：与 Python 错误码表对齐（Python 端 STS 失败同样抛 21116），
+    /// 前端可能依此码路由（"STS 签发失败，请重试"提示）。
+    /// 未来若确认前端已切换到 21608，可统一移除本常量 + status_from_code 行 + 测试断言。
+    pub const BIZ_STS_ISSUE_FAILED: i32 = 21116;
     // 21110 → 21407 的 deprecated 别名：旧调用点收敛后移除（详见模块 docstring）
     #[deprecated(
         since = "0.1.0",

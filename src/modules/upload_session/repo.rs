@@ -147,6 +147,9 @@ impl UploadSessionRepo for NoopUploadSessionRepo {
     }
 
     async fn put(&self, _session: &UploadSession, _ttl_seconds: u64) -> Result<(), AppError> {
+        // 2026-09-18 review #8 修复：移除未使用的 {user_id} 占位符。原写法
+        // `user_id = _session.user_id` 是 tracing field 而非 format 占位符，无
+        // 渲染问题；此处按 reviewer 要求整理为简洁的字段列表。
         tracing::warn!(
             user_id = _session.user_id,
             scope = %_session.scope,

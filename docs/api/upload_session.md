@@ -1,6 +1,6 @@
 # upload_session 域 API
 
-> 本文件须与 `src/modules/upload_session/{handler.rs,dto.rs,service.rs,repo.rs}` 保持同步
+> 本文件须与 `src/modules/upload_session/{handler.rs,dto.rs,service/,repo.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
 > 域覆盖：**共享 STS 凭证的 Redis 会话机制**——前端直传 COS 凭证由本域统一管理，
@@ -10,6 +10,25 @@
 > 2026-09-18 新增。**替代原 `POST /api/v2/part-files/upload-intents`** —— 上传意图
 > 机制迁移：原一次性签 STS + 无状态 RPC → 现服务端维护 redis 会话，TTL 24h 滑动；
 > 凭证 < 10min 自动 renew。
+
+---
+
+## 消费方说明
+
+> 2026-09-18 review #4 修复：本模块的**主要消费方是前端 composable**（`useUploadSession`），
+> 不是后端 part batch_create 流程。具体路径：
+>
+> - 前端 `usePartBatchPdf` / `usePartBatchManual` 等业务 composable 走 `session.allocate`
+>   （分配 tmp_key）→ 前端用 STS 直传 COS tmp → `session.markComplete`（head 校验）→
+>   `session.consume`（业务消费）；session 全部 7 个端点都通过 `useUploadSession`
+>   composable 封装。
+> - 后端 `part batch_create` 流程**只接受前端传来的 `tmp_key`**，做服务端
+>   `cos.copy_object(tmp_key → CAS 永久 key)`；该流程与 session **完全解耦**——
+>   业务接入会在独立的 PR 通过 `useUploadSession` 接入，前端契约已稳定后由
+>   前端 team 联调。
+>
+> 也就是说：本模块本身是**前端直传 COS 的服务端脚手架**，上线即被 `useUploadSession`
+> 使用；后端 part_batch 流程的 session 接入在独立 PR，不属于本模块范围。
 
 ---
 
