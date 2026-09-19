@@ -8,7 +8,7 @@
 //! - schema/customer.py
 //!
 //! 域内含 L1（一级集团，parent_id IS NULL，带 serial_prefix 单大写字母）与
-//! L2（叶子客户，parent_id 非 NULL）两层结构。CRUD 端点挂在 `/api/v2/customers`。
+//! L2（叶子客户，parent_id 非 NULL）两层结构。CRUD 端点挂在 `/api/v2/com/customers`。
 
 use std::sync::Arc;
 

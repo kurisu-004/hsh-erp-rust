@@ -18,15 +18,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::applicant::dto::{
+use crate::modules::com::applicant::dto::{
     ApplicantCreateRequest, ApplicantListOut, ApplicantListQuery, ApplicantOut, ApplicantUpdateRequest,
 };
-use crate::modules::applicant::service::ApplicantService;
+use crate::modules::com::applicant::service::ApplicantService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-/// GET /api/v2/applicants
+/// GET /api/v2/com/applicants
 pub async fn list_applicants(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -38,7 +38,7 @@ pub async fn list_applicants(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/applicants → 201
+/// POST /api/v2/com/applicants → 201
 pub async fn create_applicant(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -52,7 +52,7 @@ pub async fn create_applicant(
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
 
-/// GET /api/v2/applicants/{id}
+/// GET /api/v2/com/applicants/{id}
 pub async fn get_applicant(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -64,7 +64,7 @@ pub async fn get_applicant(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/applicants/{id}/update
+/// POST /api/v2/com/applicants/{id}/update
 pub async fn update_applicant(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -77,7 +77,7 @@ pub async fn update_applicant(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/applicants/{id}/soft-delete
+/// POST /api/v2/com/applicants/{id}/soft-delete
 pub async fn soft_delete_applicant(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -89,7 +89,7 @@ pub async fn soft_delete_applicant(
     Ok(Json(R::ok(())))
 }
 
-/// 本域路由表（挂载点 `/api/v2/applicants`，见 `modules::v2_router`）
+/// 本域路由表（挂载点 `/api/v2/com/applicants`，见 `modules::v2_router`）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_applicants).post(create_applicant))

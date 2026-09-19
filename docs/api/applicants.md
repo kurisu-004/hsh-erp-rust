@@ -1,21 +1,21 @@
 # applicants 域 API
 
-> 本文件须与 `src/modules/applicant/{handler.rs,dto.rs,service.rs}` 保持同步
+> 本文件须与 `src/modules/com/applicant/{handler.rs,dto.rs,service.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
 ## 端点列表
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/applicants` | 已登录（**service 层强制 Manager / Clerk**） | 申请人列表（过滤 + 分页） |
-| POST | `/api/v2/applicants` | 已登录（**service 层强制 Manager / Clerk**） | 新增申请人（`customer_id` 必须指向 L1） |
-| GET | `/api/v2/applicants/{id}` | 已登录（**service 层强制 Manager / Clerk**） | 申请人详情（含 `customer_name`） |
-| POST | `/api/v2/applicants/{id}/update` | 已登录（**service 层强制 Manager / Clerk**） | 部分更新（含乐观锁） |
-| POST | `/api/v2/applicants/{id}/soft-delete` | 已登录（**service 层强制 Manager / Clerk**） | 软删（被 `t_part.applicant_name` 引用则拒） |
+| GET | `/api/v2/com/applicants` | 已登录（**service 层强制 Manager / Clerk**） | 申请人列表（过滤 + 分页） |
+| POST | `/api/v2/com/applicants` | 已登录（**service 层强制 Manager / Clerk**） | 新增申请人（`customer_id` 必须指向 L1） |
+| GET | `/api/v2/com/applicants/{id}` | 已登录（**service 层强制 Manager / Clerk**） | 申请人详情（含 `customer_name`） |
+| POST | `/api/v2/com/applicants/{id}/update` | 已登录（**service 层强制 Manager / Clerk**） | 部分更新（含乐观锁） |
+| POST | `/api/v2/com/applicants/{id}/soft-delete` | 已登录（**service 层强制 Manager / Clerk**） | 软删（被 `t_part.applicant_name` 引用则拒） |
 
 ---
 
-### `GET /api/v2/applicants`
+### `GET /api/v2/com/applicants`
 
 权限: 已登录（**service 层强制 Manager / Clerk** —— 非该角色返 40300 FORBIDDEN）
 
@@ -41,7 +41,7 @@ Response 200 `data`：[`ApplicantListOut`](#applicantout-字段)
 
 - 40300 FORBIDDEN — 非 Manager / Clerk
 
-### `POST /api/v2/applicants`
+### `POST /api/v2/com/applicants`
 
 权限: 已登录（**service 层强制 Manager / Clerk**）
 
@@ -67,7 +67,7 @@ Response 201 `data`：[`ApplicantOut`](#applicantout-字段)（`version` 初始�
 - 40001 VALIDATION_ERROR — 姓名为空 / 非数字 ID
 - 40300 FORBIDDEN — 非 Manager / Clerk
 
-### `GET /api/v2/applicants/{id}`
+### `GET /api/v2/com/applicants/{id}`
 
 权限: 已登录（**service 层强制 Manager / Clerk**）
 
@@ -84,7 +84,7 @@ Response 200 `data`：[`ApplicantOut`](#applicantout-字段)
 - 21001 BIZ_APPLICANT_NOT_FOUND — 申请人不存在 / 已软删
 - 40300 FORBIDDEN — 非 Manager / Clerk
 
-### `POST /api/v2/applicants/{id}/update`
+### `POST /api/v2/com/applicants/{id}/update`
 
 权限: 已登录（**service 层强制 Manager / Clerk**）
 
@@ -120,7 +120,7 @@ Response 200 `data`：[`ApplicantOut`](#applicantout-字段)（`version` +1）
 > 乐观锁版本号由后端内部管理（请求体**不**接受 `version` 字段），冲突由 service 在
 > UPDATE `WHERE id=$1 AND version=$2` 撞 0 行时返回 `40901`。
 
-### `POST /api/v2/applicants/{id}/soft-delete`
+### `POST /api/v2/com/applicants/{id}/soft-delete`
 
 权限: 已登录（**service 层强制 Manager / Clerk**）
 

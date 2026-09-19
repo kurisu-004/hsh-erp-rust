@@ -1,7 +1,7 @@
 //! applicant 域 6 端点集成测试（Task 5 / plan §11）
 //!
 //! 覆盖：
-//!   1. list_applicants_empty                          — 空 DB GET /applicants → items=[]
+//!   1. list_applicants_empty                          — 空 DB GET /com/applicants → items=[]
 //!   2. create_get_update_soft_delete_applicant_happy_path — 全生命周期 + version 递增 + 软删后 404
 //!   3. create_with_l2_customer_returns_21003          — L1 校验
 //!   4. duplicate_name_under_same_customer_returns_21002 — 同客户下重名
@@ -13,8 +13,9 @@
 //! 每个用例 MANAGER token；与其它 applicant 域用例共享同一 token 来源（用户独立）。
 //!
 //! ## URL 约定
-//! `test_app` 返回 `v2_router()` 直挂，无 `/api/v2` 前缀 —— 故 URL 写 `/applicants` 而非
-//! `/api/v2/applicants`（与 main.rs 的 `/api/v2` nest 区分）。该写法与 worker_pool_api.rs /
+//! `test_app` 返回 `v2_router()` 直挂，无 `/api/v2` 前缀 —— 故 URL 写 `/com/applicants` 而非
+//! `/api/v2/com/applicants`（与 main.rs 的 `/api/v2` nest 区分；2026-09-19 applicant 聚合至 com nest）。
+//! 该写法与 worker_pool_api.rs /
 //! part_api.rs / delivery_*_api.rs 等保持一致。
 
 #[path = "common/mod.rs"]
@@ -190,7 +191,7 @@ async fn insert_part_referencing_applicant(
 //  Tests
 // ===========================================================================
 
-/// 1. 空 DB：GET /applicants → 200 / items=[] / total=0 / limit=100（DEFAULT_LIMIT）。
+/// 1. 空 DB：GET /com/applicants → 200 / items=[] / total=0 / limit=100（DEFAULT_LIMIT）。
 #[tokio::test]
 async fn list_applicants_empty() {
     let (_guard, pool) = setup().await;
@@ -198,7 +199,7 @@ async fn list_applicants_empty() {
 
     let (s, env) = send(
         app,
-        json_request("GET", "/applicants", None, Some(&token)),
+        json_request("GET", "/com/applicants", None, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "list empty: {env}");
@@ -226,7 +227,7 @@ async fn create_get_update_soft_delete_applicant_happy_path() {
         app.clone(),
         json_request(
             "POST",
-            "/applicants",
+            "/com/applicants",
             Some(json!({"name": "张三", "customer_id": l1.to_string()})),
             Some(&token),
         ),
@@ -245,7 +246,7 @@ async fn create_get_update_soft_delete_applicant_happy_path() {
         app.clone(),
         json_request(
             "GET",
-            &format!("/applicants/{id}"),
+            &format!("/com/applicants/{id}"),
             None,
             Some(&token),
         ),
@@ -261,7 +262,7 @@ async fn create_get_update_soft_delete_applicant_happy_path() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/applicants/{id}/update"),
+            &format!("/com/applicants/{id}/update"),
             Some(json!({"name": "李四"})),
             Some(&token),
         ),
@@ -276,7 +277,7 @@ async fn create_get_update_soft_delete_applicant_happy_path() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/applicants/{id}/soft-delete"),
+            &format!("/com/applicants/{id}/soft-delete"),
             None,
             Some(&token),
         ),
@@ -290,7 +291,7 @@ async fn create_get_update_soft_delete_applicant_happy_path() {
         app,
         json_request(
             "GET",
-            &format!("/applicants/{id}"),
+            &format!("/com/applicants/{id}"),
             None,
             Some(&token),
         ),
@@ -312,7 +313,7 @@ async fn create_with_l2_customer_returns_21003() {
         app,
         json_request(
             "POST",
-            "/applicants",
+            "/com/applicants",
             Some(json!({"name": "王五", "customer_id": l2.to_string()})),
             Some(&token),
         ),
@@ -334,7 +335,7 @@ async fn duplicate_name_under_same_customer_returns_21002() {
         app.clone(),
         json_request(
             "POST",
-            "/applicants",
+            "/com/applicants",
             Some(json!({"name": "重复名", "customer_id": l1.to_string()})),
             Some(&token),
         ),
@@ -347,7 +348,7 @@ async fn duplicate_name_under_same_customer_returns_21002() {
         app,
         json_request(
             "POST",
-            "/applicants",
+            "/com/applicants",
             Some(json!({"name": "重复名", "customer_id": l1.to_string()})),
             Some(&token),
         ),
@@ -377,7 +378,7 @@ async fn update_with_stale_version_returns_409() {
         app1.clone(),
         json_request(
             "POST",
-            "/applicants",
+            "/com/applicants",
             Some(json!({"name": "occ-target", "customer_id": l1.to_string()})),
             Some(&token1),
         ),
@@ -387,7 +388,7 @@ async fn update_with_stale_version_returns_409() {
     let id = env["data"]["id"].as_str().unwrap().to_string();
 
     // 两个并发 update（不同名字）—— 一个会成功 V=0→1，另一个会撞 stale version → 40901
-    let uri = format!("/applicants/{id}/update");
+    let uri = format!("/com/applicants/{id}/update");
     let req_a = json_request(
         "POST",
         &uri,
@@ -440,7 +441,7 @@ async fn soft_delete_in_use_returns_21004() {
         app.clone(),
         json_request(
             "POST",
-            "/applicants",
+            "/com/applicants",
             Some(json!({"name": "被引用名", "customer_id": l1.to_string()})),
             Some(&token),
         ),
@@ -457,7 +458,7 @@ async fn soft_delete_in_use_returns_21004() {
         app,
         json_request(
             "POST",
-            &format!("/applicants/{id}/soft-delete"),
+            &format!("/com/applicants/{id}/soft-delete"),
             None,
             Some(&token),
         ),

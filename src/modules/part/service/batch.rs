@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::customer::repo::CustomerRepo;
+use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::part::dto_crud::{FileBindingIn, PartBatchCreateOut, PartBatchCreateRequest};
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::repo::part::NewPartCreate;
