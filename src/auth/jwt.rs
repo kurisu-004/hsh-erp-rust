@@ -59,12 +59,21 @@ pub fn encode_access(
 }
 
 /// 解码 access token
+///
+/// 2026-09-20 修改：`jsonwebtoken::errors::ErrorKind::ExpiredSignature` 单独映射
+/// 到 `code::TOKEN_EXPIRED` (40102)，便于前端细分提示「请用 refresh token 续期」
+/// vs 其它签名错误（40100 仍是「请重新登录」）。其余 ErrorKind 仍走 40100。
 pub fn decode_access(token: &str, secret: &str, issuer: &str) -> Result<Claims, AppError> {
     let mut v = Validation::new(Algorithm::HS256);
     v.set_issuer(&[issuer]);
     decode::<Claims>(token, &DecodingKey::from_secret(secret.as_bytes()), &v)
         .map(|d| d.claims)
-        .map_err(|e| AppError::biz(code::UNAUTHORIZED, format!("jwt: {e}")))
+        .map_err(|e| match e.kind() {
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
+                AppError::biz(code::TOKEN_EXPIRED, "token expired")
+            }
+            _ => AppError::biz(code::UNAUTHORIZED, format!("jwt: {e}")),
+        })
 }
 
 /// 签发 refresh token（仅含 sub + ver）

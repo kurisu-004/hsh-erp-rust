@@ -25,7 +25,7 @@ lopdf = { version = "0.44", default-features = false }
 # Web 框架
 axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors", "limit", "timeout"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "limit", "timeout", "request-id", "compression-gzip", "catch-panic"] }
 
 # 异步运行时
 tokio = { version = "1", features = ["full"] }

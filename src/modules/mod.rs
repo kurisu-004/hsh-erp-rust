@@ -60,7 +60,14 @@ async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResp> {
 ///
 /// 2026-09-19 com 模块聚合：customer + applicant 已平移至 `com` 子模块，
 /// nest 路径由 `/customers` + `/applicants` 迁至 `/com/customers` + `/com/applicants`。
-pub fn v2_router() -> Router<Arc<AppState>> {
+///
+/// 2026-09-20 新增：签名收 `Arc<AppState>`，在 `route_layer` 上挂 `auth_middleware`
+/// —— Bearer JWT 验签 + Redis session 校验 + 滑动 TTL 集中处理；公开路径
+/// （health / login / refresh / `_e2e`）在 middleware 内部白名单放行。
+/// `route_layer` 仅作用于已匹配路由，404 不会被强制鉴权（与现状一致）。
+/// 需要 state：axum 0.8 的 `from_fn` 不支持 `State` 提取，必须用
+/// `from_fn_with_state(state.clone(), ...)`，因此 v2_router 收 state。
+pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
         // 2026-09-19 IAM 域：新路径 `/iam` 14 端点（PR-1 起开放，PR-4 收尾后唯一）
@@ -88,6 +95,11 @@ pub fn v2_router() -> Router<Arc<AppState>> {
         .nest("/process-chains", process_chain::router())
         // 2026-09-14 新增：e2e 测试 seed hook（dev/test 默认启用，release profile 硬关）
         .nest("/_e2e", _e2e::router())
+        // 2026-09-20 新增：JWT 验证统一走中间件（详见 auth::middleware）
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::auth::middleware::auth_middleware,
+        ))
 }
 
 /// `/ws/*` WebSocket 入口（当前仅 dashboard 大屏）

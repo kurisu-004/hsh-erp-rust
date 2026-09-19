@@ -98,6 +98,8 @@ pub(crate) fn test_config() -> Arc<AppConfig> {
         delivery_note_template_dir: std::path::PathBuf::from("/tmp"),
         enable_e2e_hooks: false,
         ws_heartbeat_interval_seconds: 30,
+        // 2026-09-20 新增：HTTP nest 请求超时；service 单测不挂 tower 层，此字段仅占位。
+        request_timeout_seconds: 30,
         upload_session: UploadSessionConfig {
             python_backend_base_url: "http://localhost:8000".into(),
             ttl_seconds: 86_400,

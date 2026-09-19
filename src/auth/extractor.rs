@@ -1,6 +1,10 @@
-//! axum extractor：从 Authorization: Bearer 解析为 CurrentUser
+//! axum extractor：从 request extensions 读取 `CurrentUser` / `AuthTokenHash`
 //!
-//! Handler 用法：
+//! 2026-09-20 重构：原本的 JWT 验签 + Redis session 校验 + 滑动 TTL 全部迁移到
+//! `auth::middleware::auth_middleware`；本模块**仅**作为薄壳，从
+//! `req.extensions()` 读 `CurrentUser` / `AuthTokenHash`，由 middleware 注入。
+//!
+//! Handler 用法（不变）：
 //! ```ignore
 //! async fn handler(
 //!     user: CurrentUser,
@@ -12,116 +16,60 @@
 //! }
 //! ```
 //!
-//! Router 的 state 类型必须是 `Arc<AppState>`（main.rs 已设置）。
-//!
-//! ## 服务端 session 校验（可关闭）
-//! 每次解析都查 Redis `session:tok:<sha256(token)>`：
-//! - 不存在 → `SESSION_REVOKED`（40105），强制重新登录
-//! - 存在但 `user_id` 与 JWT claims 不一致 → `SESSION_REVOKED`
-//! - 通过后滑动 TTL（`EXPIRE`）；失败仅 warn，不阻断请求
-//!
-//! 当 `REDIS_SESSION_CHECK_ENABLED=false`（Rust 借 Python JWT 的迁移过渡期），
-//! 跳过 Redis 查询，直接从 claims 构造 `CurrentUser`。
+//! ## fail-closed 设计
+//! 取不到 `CurrentUser` / `AuthTokenHash`（例如 middleware 未挂、或 whitelist
+//! 路径下 handler 误取）→ `AppError::biz(code::UNAUTHORIZED, ...)`（40100）。
+//! 报错信息含「middleware misconfigured」提示，便于主代理排查配置问题。
 
 use std::sync::Arc;
 
 use axum::extract::FromRequestParts;
-use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 
-use crate::auth::jwt::decode_access;
-use crate::auth::rbac::{CurrentUser, parse_role_str_or_warn};
-use crate::auth::session::hash_token;
+use crate::auth::rbac::CurrentUser;
 use crate::shared::error::{AppError, code};
-use crate::state::AppState;
 
-impl FromRequestParts<Arc<AppState>> for CurrentUser {
+impl FromRequestParts<Arc<crate::state::AppState>> for CurrentUser {
     type Rejection = AppError;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &Arc<AppState>,
+        _state: &Arc<crate::state::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let token = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "缺少 Bearer token"))?;
-
-        let claims = decode_access(token, &state.config.jwt.secret, &state.config.jwt.issuer)?;
-
-        if state.config.redis.session_check_enabled {
-            // 服务端 session 校验：Redis 中必须存在 sha256(token) 对应的条目。
-            let token_hash = hash_token(token);
-            let cached = state
-                .session
-                .get_session(&token_hash)
-                .await?
-                .ok_or_else(|| AppError::biz(code::SESSION_REVOKED, "会话已被吊销，请重新登录"))?;
-            if cached.user_id != claims.sub {
-                return Err(AppError::biz(
-                    code::SESSION_REVOKED,
-                    "会话已被吊销，请重新登录",
-                ));
-            }
-
-            // 滑动 TTL（best-effort；失败仅 warn，不阻断请求）
-            if let Err(e) = state
-                .session
-                .touch_session(&token_hash, state.config.redis.session_ttl_seconds)
-                .await
-            {
-                tracing::warn!(error = %e, "刷新 session TTL 失败");
-            }
-
-            // 把缓存中的大写 role 字符串转回 Role enum（未知值走 `parse_role_str_or_warn` 跳过）
-            let mut roles = Vec::with_capacity(cached.cached.roles.len());
-            for r in &cached.cached.roles {
-                if let Some(role) = parse_role_str_or_warn(r) {
-                    roles.push(role);
-                }
-            }
-
-            Ok(CurrentUser {
-                id: claims.sub,
-                username: claims.username,
-                roles,
-                shelf_ids: cached.cached.shelf_ids,
-                shelf_wildcard: cached.cached.shelf_wildcard,
+        parts
+            .extensions
+            .get::<CurrentUser>()
+            .cloned()
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::UNAUTHORIZED,
+                    "missing CurrentUser in request extensions (middleware misconfigured)",
+                )
             })
-        } else {
-            // 关闭 Redis 服务端 session 校验：直接用 JWT claims 构造 CurrentUser
-            Ok(CurrentUser {
-                id: claims.sub,
-                username: claims.username,
-                roles: claims.roles,
-                shelf_ids: claims.shelf_ids,
-                shelf_wildcard: claims.shelf_wildcard,
-            })
-        }
     }
 }
 
-/// 第二个 extractor：仅取 Bearer token 并返回 sha256 hex，**不查 Redis**。
-///
-/// 用途：handler 想拿到 token 哈希去做进一步动作（如 logout 调用
-/// `SessionStore::delete_session(token_hash)`）。
+/// Token hash（由 middleware 写入 extensions，供 logout 等 handler 拿 sha256 去删 Redis）
+#[derive(Clone)]
 pub struct AuthTokenHash(pub String);
 
-impl FromRequestParts<Arc<AppState>> for AuthTokenHash {
+impl FromRequestParts<Arc<crate::state::AppState>> for AuthTokenHash {
     type Rejection = AppError;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        _state: &Arc<AppState>,
+        _state: &Arc<crate::state::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let token = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "缺少 Bearer token"))?;
-        Ok(Self(hash_token(token)))
+        // 同样取不到 → 40100 fail-closed
+        parts
+            .extensions
+            .get::<AuthTokenHash>()
+            .cloned()
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::UNAUTHORIZED,
+                    "missing AuthTokenHash in request extensions (middleware misconfigured)",
+                )
+            })
     }
 }
