@@ -6,7 +6,7 @@ use std::path::Path;
 use sqlx::PgPool;
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::customer::repo::CustomerRepo;
+use crate::modules::com::customer::repo::CustomerRepo;
 use crate::shared::error::{code, AppError};
 
 use super::inner::{customer_not_found, get_with_parts};

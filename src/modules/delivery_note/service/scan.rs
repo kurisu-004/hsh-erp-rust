@@ -13,7 +13,7 @@ use crate::infra::{
 };
 use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::AssemblyRepo;
-use crate::modules::customer::repo::CustomerRepo;
+use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part_batch::model::TPartBatch;

@@ -13,10 +13,11 @@ use serde::Serialize;
 use crate::state::AppState;
 
 pub mod _e2e;
-pub mod applicant;
 pub mod assembly;
 pub mod cnc_program;
-pub mod customer;
+// 2026-09-19 新增 com 模块聚合：customer + applicant 平移至 `com::customer` / `com::applicant`，
+// URL 迁移到 `/api/v2/com/*`（见本文件 `v2_router` 与 `com/mod.rs`）。
+pub mod com;
 pub mod dashboard;
 pub mod delivery_note;
 // 2026-09-19 IAM 域合并（PR-1）：合并 `auth` + `user` 为单一 `iam` 业务域；
@@ -56,13 +57,16 @@ async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResp> {
 ///
 /// 2026-09-19 IAM 域收尾（PR-4）：旧 alias `/auth` + `/users` nest 已删除，
 /// `/api/v2/iam/*` 成为 IAM 域唯一对外接口。
+///
+/// 2026-09-19 com 模块聚合：customer + applicant 已平移至 `com` 子模块，
+/// nest 路径由 `/customers` + `/applicants` 迁至 `/com/customers` + `/com/applicants`。
 pub fn v2_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
         // 2026-09-19 IAM 域：新路径 `/iam` 14 端点（PR-1 起开放，PR-4 收尾后唯一）
         .nest("/iam", iam::router())
-        .nest("/customers", customer::router())
-        .nest("/applicants", applicant::router())
+        // 2026-09-19 com 聚合：customer + applicant 统一挂在 `/com/*` 下
+        .nest("/com", com::router())
         .nest("/workers", worker::router())
         .nest("/work-types", work_type::router())
         .nest("/processes", process::router())

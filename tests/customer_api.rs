@@ -9,7 +9,7 @@
 //! 进程级 `tokio::sync::Mutex` 串行化。
 //!
 //! ## 认证
-//! 用 MANAGER 用户跑通（POST /customers 写路径要求 M/C，按设计 §6.1 用 M 即可）。
+//! 用 MANAGER 用户跑通（POST /com/customers 写路径要求 M/C，按设计 §6.1 用 M 即可；2026-09-19 聚合到 com nest）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -127,7 +127,7 @@ async fn create_customer_root_then_l2_then_soft_delete_in_use() {
         app.clone(),
         json_request(
             "POST",
-            "/customers",
+            "/com/customers",
             Some(json!({"name": "ACME", "serial_prefix": "A"})),
             Some(&token),
         ),
@@ -143,7 +143,7 @@ async fn create_customer_root_then_l2_then_soft_delete_in_use() {
         app.clone(),
         json_request(
             "POST",
-            "/customers",
+            "/com/customers",
             Some(json!({
                 "name": "ACME-Workshop1",
                 "parent_id": l1_id.clone(),
@@ -165,7 +165,7 @@ async fn create_customer_root_then_l2_then_soft_delete_in_use() {
         app,
         json_request(
             "POST",
-            &format!("/customers/{l1_id}/soft-delete"),
+            &format!("/com/customers/{l1_id}/soft-delete"),
             None,
             Some(&token),
         ),
@@ -193,7 +193,7 @@ async fn update_customer_serial_prefix_collision_returns_20104() {
         app.clone(),
         json_request(
             "POST",
-            "/customers",
+            "/com/customers",
             Some(json!({"name": "Alpha", "serial_prefix": "A"})),
             Some(&token),
         ),
@@ -206,7 +206,7 @@ async fn update_customer_serial_prefix_collision_returns_20104() {
         app.clone(),
         json_request(
             "POST",
-            "/customers",
+            "/com/customers",
             Some(json!({"name": "Bravo", "serial_prefix": "B"})),
             Some(&token),
         ),
@@ -219,7 +219,7 @@ async fn update_customer_serial_prefix_collision_returns_20104() {
         app,
         json_request(
             "POST",
-            &format!("/customers/{l1_a_id}/update"),
+            &format!("/com/customers/{l1_a_id}/update"),
             Some(json!({"serial_prefix": "B"})),
             Some(&token),
         ),

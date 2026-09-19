@@ -17,15 +17,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::customer::dto::{
+use crate::modules::com::customer::dto::{
     CustomerCreateRequest, CustomerListOut, CustomerListQuery, CustomerOut, CustomerUpdateRequest,
 };
-use crate::modules::customer::service::CustomerService;
+use crate::modules::com::customer::service::CustomerService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-/// GET /api/v2/customers
+/// GET /api/v2/com/customers
 pub async fn list_customers(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -37,7 +37,7 @@ pub async fn list_customers(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/customers → 201
+/// POST /api/v2/com/customers → 201
 pub async fn create_customer(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -49,7 +49,7 @@ pub async fn create_customer(
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
 
-/// GET /api/v2/customers/{id}
+/// GET /api/v2/com/customers/{id}
 pub async fn get_customer(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -61,7 +61,7 @@ pub async fn get_customer(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/customers/{id}/update
+/// POST /api/v2/com/customers/{id}/update
 pub async fn update_customer(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -74,7 +74,7 @@ pub async fn update_customer(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/customers/{id}/soft-delete
+/// POST /api/v2/com/customers/{id}/soft-delete
 pub async fn soft_delete_customer(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -86,7 +86,7 @@ pub async fn soft_delete_customer(
     Ok(Json(R::ok(())))
 }
 
-/// 本域路由表（挂载点 `/api/v2/customers`，见 `modules::v2_router`）
+/// 本域路由表（挂载点 `/api/v2/com/customers`，见 `modules::v2_router`）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_customers).post(create_customer))

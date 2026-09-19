@@ -17,9 +17,9 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::customer::dto::*;
-use crate::modules::customer::model::TCustomer;
-use crate::modules::customer::repo::CustomerRepo;
+use crate::modules::com::customer::dto::*;
+use crate::modules::com::customer::model::TCustomer;
+use crate::modules::com::customer::repo::CustomerRepo;
 use crate::shared::error::{code, AppError};
 
 const DEFAULT_LIMIT: i64 = 50;

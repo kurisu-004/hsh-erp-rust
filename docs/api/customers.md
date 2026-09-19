@@ -1,19 +1,19 @@
 # customers 域 API
 
-> 本文件须与 `src/modules/customer/{handler.rs,dto.rs,service.rs}` 保持同步
+> 本文件须与 `src/modules/com/customer/{handler.rs,dto.rs,service.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
 ## 端点列表
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/customers` | 已登录（M/C/INSPECTOR/CNC） | 列表（L1+L2 + 过滤） |
-| POST | `/api/v2/customers` | 已登录（M/C） | 创建客户（L1 或 L2） |
-| GET | `/api/v2/customers/{id}` | 已登录（M/C/INSPECTOR/CNC） | 客户详情 |
-| POST | `/api/v2/customers/{id}/update` | 已登录（M/C） | 部分更新（OCC） |
-| POST | `/api/v2/customers/{id}/soft-delete` | 已登录（M/C） | 软删（OCC，被 part/assembly 引用时拒） |
+| GET | `/api/v2/com/customers` | 已登录（M/C/INSPECTOR/CNC） | 列表（L1+L2 + 过滤） |
+| POST | `/api/v2/com/customers` | 已登录（M/C） | 创建客户（L1 或 L2） |
+| GET | `/api/v2/com/customers/{id}` | 已登录（M/C/INSPECTOR/CNC） | 客户详情 |
+| POST | `/api/v2/com/customers/{id}/update` | 已登录（M/C） | 部分更新（OCC） |
+| POST | `/api/v2/com/customers/{id}/soft-delete` | 已登录（M/C） | 软删（OCC，被 part/assembly 引用时拒） |
 
-挂载点：`/api/v2/customers`（见 `src/modules/mod.rs::v2_router`）。
+挂载点：`/api/v2/com/customers`（`com` nest 聚合，见 `src/modules/com/mod.rs`）。
 
 ---
 
@@ -37,7 +37,7 @@
 
 ---
 
-### `GET /api/v2/customers`
+### `GET /api/v2/com/customers`
 
 权限：已登录（M/C/INSPECTOR/CNC；service 层 `require_any_role`）
 
@@ -60,7 +60,7 @@ Response 200 `data`：`CustomerListOut`
 | `limit` | i64 | 回显 |
 | `offset` | i64 | 回显 |
 
-### `POST /api/v2/customers`
+### `POST /api/v2/com/customers`
 
 权限：已登录（M/C；service 层 `require_any_role([M, C])`）
 
@@ -79,7 +79,7 @@ Response 201 `data`：`CustomerOut`
 - 20104 `BIZ_INVALID_VALUE` — name 空 / parent_id 非整数 / L1 缺 prefix / L2 传了 prefix / prefix 非单大写字母
 - 20104 `BIZ_INVALID_VALUE` — `serial_prefix` 与已有活跃 L1 撞唯一索引（uk_t_customer_root_prefix）
 
-### `GET /api/v2/customers/{id}`
+### `GET /api/v2/com/customers/{id}`
 
 权限：已登录（M/C/INSPECTOR/CNC）
 
@@ -95,7 +95,7 @@ Response 200 `data`：`CustomerOut`
 
 - 20102 `BIZ_CUSTOMER_NOT_FOUND`
 
-### `POST /api/v2/customers/{id}/update`
+### `POST /api/v2/com/customers/{id}/update`
 
 权限：已登录（M/C）
 
@@ -115,7 +115,7 @@ Response 200 `data`：`CustomerOut`（回读最新版本）
 - 20104 `BIZ_INVALID_VALUE` — name 空 / L2 改 prefix / L2 清 prefix / 试图改 parent_id / prefix 非单大写字母
 - 40901 `VERSION_CONFLICT` — 乐观锁冲突（前端需重新 GET 后再试）
 
-### `POST /api/v2/customers/{id}/soft-delete`
+### `POST /api/v2/com/customers/{id}/soft-delete`
 
 权限：已登录（M/C）
 

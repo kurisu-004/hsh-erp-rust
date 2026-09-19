@@ -28,7 +28,7 @@ use sqlx::{PgConnection, PgExecutor};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::customer::repo::CustomerRepo;
+use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::part::dto::{
     InspectionBatchListItemOut, InspectionBatchListOut, InspectionBatchListQuery,
 };

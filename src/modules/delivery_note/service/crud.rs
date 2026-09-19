@@ -8,7 +8,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::serial::next_delivery_note_no;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::customer::repo::CustomerRepo;
+use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{code, AppError};
 
@@ -179,7 +179,7 @@ impl DeliveryNoteService {
     ) -> Result<Vec<DeliveryNoteDetailOut>, AppError> {
         use crate::modules::assembly::model::TAssembly;
         use crate::modules::assembly::repo::AssemblyRepo;
-        use crate::modules::customer::model::TCustomer;
+        use crate::modules::com::customer::model::TCustomer;
         use std::collections::HashSet;
 
         use super::super::dto::DeliveryNoteLineItem;
