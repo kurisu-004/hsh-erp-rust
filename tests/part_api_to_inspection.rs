@@ -18,7 +18,7 @@ mod common;
 mod helpers;
 
 use axum::http::StatusCode;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use helpers::*;
 
@@ -37,15 +37,7 @@ async fn to_inspection_from_pending_succeeds() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "PENDING").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
     let v = batch_version(&_pool, batch_id).await;
 
@@ -78,15 +70,8 @@ async fn to_inspection_from_programming_succeeds() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PROGRAMMING",
-    )
-    .await;
+    let part_id =
+        insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "PROGRAMMING").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "PROGRAMMING").await;
     let v = batch_version(&_pool, batch_id).await;
 
@@ -118,15 +103,7 @@ async fn to_inspection_from_in_process_production_shelf_succeeds() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (insp_shelf, prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "IN_PROCESS",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "IN_PROCESS").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
     // 2026-09-16 PR-2（migration 027）：IN_PROCESS 组合校验改读 target_batch.location +
     // current_holder_id（PR-2 § inspection_core.rs 4 重排后）；fixture 同步改写：
@@ -170,15 +147,7 @@ async fn to_inspection_in_process_worker_rejected() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "IN_PROCESS",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "IN_PROCESS").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
     // 2026-09-16 PR-2（migration 027）：工人持有改由 t_part_batch.location='WORKER'
     // 标识（不再依赖 t_part.current_holder_id）；fixture 同步改写。
@@ -225,15 +194,7 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
     // 第二个 INSPECTION 货架当 holder（让 part 持有一个非 PRODUCTION 的 shelf）
     let holder_shelf = common::insert_shelf(&_pool, "INSP-002", "品检架B", "INSPECTION").await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "IN_PROCESS",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "IN_PROCESS").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "IN_PROCESS").await;
     // 2026-09-16 PR-2（migration 027）：IN_PROCESS + 非 PRODUCTION_SHELF holder 拒绝
     // 改由 t_part_batch.location 标识（PR-2 § inspection_core.rs 4 重排后）；
@@ -276,15 +237,7 @@ async fn to_inspection_target_shelf_wrong_zone_rejected() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (_insp_shelf, prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "PENDING").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
     let v = batch_version(&_pool, batch_id).await;
 
@@ -315,19 +268,14 @@ async fn to_inspection_target_shelf_inactive_rejected() {
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
     // 把品检架置为 inactive
-    sqlx::query!("UPDATE t_shelf SET is_active = false WHERE id = $1", insp_shelf)
-        .execute(&_pool)
-        .await
-        .unwrap();
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
+    sqlx::query!(
+        "UPDATE t_shelf SET is_active = false WHERE id = $1",
+        insp_shelf
     )
-    .await;
+    .execute(&_pool)
+    .await
+    .unwrap();
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "PENDING").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
     let v = batch_version(&_pool, batch_id).await;
 
@@ -509,15 +457,7 @@ async fn to_inspection_partial_split_happy_path() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, pool) = login_inspector(pool, "inspector1").await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
-    let part_id = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let part_id = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
     let batch_id = insert_batch(&pool, part_id, 1, 10, "PENDING").await;
     let v = batch_version(&pool, batch_id).await;
 
@@ -607,22 +547,14 @@ async fn part_batches_returns_narrow_part_and_batches_with_holder() {
         chrono::Utc::now().timestamp_millis() % 100_000_000
     );
 
-    let part_id = insert_part_with_status(
-        &pool,
-        "P-SCAN",
-        l2,
-        Some(&serial_no),
-        None,
-        "PENDING",
-    )
-    .await;
+    let part_id =
+        insert_part_with_status(&pool, "P-SCAN", l2, Some(&serial_no), None, "PENDING").await;
     let batch_id = insert_batch(&pool, part_id, 1, 5, "PENDING").await;
     let v_initial = batch_version(&pool, batch_id).await;
 
     // Step 1：INSPECTOR 触发 to-inspection
     let (app, insp_token, _pool) = login_inspector(pool, "inspector_scan").await;
-    let (insp_shelf, _prod_shelf, _proc) =
-        setup_inspection_and_production_shelves(&_pool).await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
     let (status, body) = send(
         app,
         json_request(
@@ -666,7 +598,11 @@ async fn part_batches_returns_narrow_part_and_batches_with_holder() {
         "customer_id 应序列化为 string: {part}"
     );
     assert_eq!(
-        part["customer_id"].as_str().unwrap().parse::<i64>().unwrap(),
+        part["customer_id"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .unwrap(),
         l2,
         "customer_id 应等于 l2 id"
     );
@@ -731,8 +667,7 @@ async fn part_batches_returns_narrow_part_and_batches_with_holder() {
     );
     assert_eq!(body3["code"], 0);
     assert_eq!(
-        body3["data"]["part"]["status"],
-        "READY_TO_SHIP",
+        body3["data"]["part"]["status"], "READY_TO_SHIP",
         "to-ship 后 part.status 应翻转为 READY_TO_SHIP: {body3}"
     );
 }
@@ -761,11 +696,7 @@ async fn part_batches_serial_not_found_returns_20101() {
         StatusCode::NOT_FOUND,
         "serial 不存在应映射 404: body={body}"
     );
-    assert_eq!(
-        body["code"],
-        20101,
-        "BIZ_PART_NOT_FOUND: body={body}"
-    );
+    assert_eq!(body["code"], 20101, "BIZ_PART_NOT_FOUND: body={body}");
     let msg = body["message"].as_str().expect("message 应为 string");
     assert!(
         msg.contains("不存在"),
@@ -789,15 +720,8 @@ async fn part_batches_role_guard_rejects_unauthorized() {
         "T-RG-{:08}",
         chrono::Utc::now().timestamp_millis() % 100_000_000
     );
-    let _part_id = insert_part_with_status(
-        &pool,
-        "P-RG",
-        l2,
-        Some(&serial_no),
-        None,
-        "PENDING",
-    )
-    .await;
+    let _part_id =
+        insert_part_with_status(&pool, "P-RG", l2, Some(&serial_no), None, "PENDING").await;
 
     // inline shelf_account login（mirror worker_pool_api.rs::login_shelf_account）
     let uid = common::insert_user_with_password(&pool, "shelf_user_scan", "changeme").await;

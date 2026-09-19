@@ -88,7 +88,10 @@ pub struct UpdateDeliveryGroupRequest {
     pub version: i32,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default, deserialize_with = "crate::shared::types::deserialize_i64_vec_opt")]
+    #[serde(
+        default,
+        deserialize_with = "crate::shared::types::deserialize_i64_vec_opt"
+    )]
     pub member_customer_ids: Option<Vec<i64>>,
 }
 
@@ -121,11 +124,20 @@ pub struct DeliveryNoteOut {
     pub status: String,
     pub submitted_at: Option<NaiveDateTime>,
     pub picked_up_at: Option<NaiveDateTime>,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64_opt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        serialize_with = "crate::shared::types::serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub submitted_by: Option<i64>,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64_opt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        serialize_with = "crate::shared::types::serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub picked_up_by: Option<i64>,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64_opt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        serialize_with = "crate::shared::types::serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub driver_worker_id: Option<i64>,
     pub driver_worker_name: Option<String>,
     pub part_count: i64,
@@ -134,10 +146,16 @@ pub struct DeliveryNoteOut {
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
     /// 范围字段（D1 范围列）
-    #[serde(serialize_with = "crate::shared::types::serialize_i64_opt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        serialize_with = "crate::shared::types::serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub delivery_group_id: Option<i64>,
     pub delivery_group_name: Option<String>,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64_opt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        serialize_with = "crate::shared::types::serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub leaf_customer_id: Option<i64>,
     pub leaf_customer_name: Option<String>,
     /// 范围展示文案（设计 §6.2：分组名 / L2 名 / L1 名）
@@ -174,7 +192,10 @@ pub struct DeliveryNoteLineItem {
     pub is_scanned: bool,
     pub scanned: bool,
     /// 装配件父行字段（仅子件行填；散件 None）
-    #[serde(serialize_with = "crate::shared::types::serialize_i64_opt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        serialize_with = "crate::shared::types::serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub assembly_id: Option<i64>,
     pub assembly_serial_no: Option<String>,
     pub assembly_drawing_no: Option<String>,
@@ -224,7 +245,10 @@ pub struct DeliveryNoteEventOut {
     pub from_status: Option<String>,
     pub to_status: Option<String>,
     pub note: Option<String>,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64_opt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        serialize_with = "crate::shared::types::serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub created_by: Option<i64>,
     pub created_at: Option<NaiveDateTime>,
 }
@@ -374,7 +398,10 @@ pub struct DeliveryNoteCandidatePartsOut {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNoteListQuery {
     pub statuses: Option<String>,
-    #[serde(default, deserialize_with = "crate::shared::types::deserialize_i64_opt")]
+    #[serde(
+        default,
+        deserialize_with = "crate::shared::types::deserialize_i64_opt"
+    )]
     pub customer_id: Option<i64>,
     pub keyword: Option<String>,
     pub sort_by: Option<String>,
@@ -386,7 +413,10 @@ pub struct DeliveryNoteListQuery {
 /// GET /delivery-notes/pickup-pending 查询参数。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNotePickupPendingQuery {
-    #[serde(default, deserialize_with = "crate::shared::types::deserialize_i64_opt")]
+    #[serde(
+        default,
+        deserialize_with = "crate::shared::types::deserialize_i64_opt"
+    )]
     pub customer_id: Option<i64>,
 }
 

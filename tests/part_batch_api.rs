@@ -16,9 +16,9 @@ mod common;
 #[path = "part_api_helpers.rs"]
 mod helpers;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -39,7 +39,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -83,7 +88,12 @@ async fn split_batch_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/batches/split"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/batches/split"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "split: {env}");
@@ -109,7 +119,12 @@ async fn split_batch_invalid_quantity_rejects() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/batches/split"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/batches/split"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "quantity=全量应拒绝: {env}");
@@ -132,7 +147,12 @@ async fn split_batch_quantity_negative_rejects() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/batches/split"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/batches/split"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "quantity<0 应拒绝: {env}");
@@ -157,7 +177,12 @@ async fn invariant_split_preserves_total_quantity() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/batches/split"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/batches/split"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "split: {env}");
@@ -186,7 +211,12 @@ async fn cancel_batch_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/batches/{bid}/cancel"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/batches/{bid}/cancel"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "cancel-batch: {env}");
@@ -207,7 +237,12 @@ async fn cancel_batch_terminal_protection() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/batches/{bid}/cancel"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/batches/{bid}/cancel"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "COMPLETED 批次禁止取消: {env}");
@@ -264,5 +299,8 @@ async fn location_tree_happy_path() {
     assert_eq!(s, StatusCode::OK, "location-tree: {env}");
     assert_eq!(env["code"], 0);
     let items = env["data"]["items"].as_array().expect("data.items");
-    assert!(!items.is_empty(), "至少返回 OFFICE / PRODUCTION_SHELF 等父节点");
+    assert!(
+        !items.is_empty(),
+        "至少返回 OFFICE / PRODUCTION_SHELF 等父节点"
+    );
 }

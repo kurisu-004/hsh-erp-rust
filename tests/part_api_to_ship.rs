@@ -63,12 +63,7 @@ async fn batch_to_ship_happy_path() {
     let body = json!({ "items": items });
     let (s, env) = send(
         app,
-        json_request(
-            "POST",
-            "/parts/batch-to-ship",
-            Some(body),
-            Some(&token),
-        ),
+        json_request("POST", "/parts/batch-to-ship", Some(body), Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "happy path: {env}");
@@ -128,10 +123,15 @@ async fn batch_to_ship_partial_failure() {
     assert_eq!(failed[0]["code"], 20103, "失败码应为 20103: {env}");
     // message 来自 AppError Display: "[20103] part <id> 当前状态 IN_PROCESS 不允许品检通过"
     let msg = failed[0]["message"].as_str().expect("failed.message");
-    assert!(msg.starts_with("[20103]"), "message 应以 [20103] 开头: {msg}");
+    assert!(
+        msg.starts_with("[20103]"),
+        "message 应以 [20103] 开头: {msg}"
+    );
     assert!(msg.contains("IN_PROCESS"), "message 应含 IN_PROCESS: {msg}");
     // failed.batch_id 应当是 IN_PROCESS 的 P001 对应的 batch（i=1）
-    let failed_bid = failed[0]["batch_id"].as_str().expect("failed.batch_id is string");
+    let failed_bid = failed[0]["batch_id"]
+        .as_str()
+        .expect("failed.batch_id is string");
     let expected = items[1]["batch_id"].as_str().unwrap().to_string();
     assert_eq!(failed_bid, expected);
 }
@@ -168,15 +168,7 @@ async fn batch_to_ship_non_numeric_batch_id_40001() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     let _ = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
 
     let (app, token, _pool) = login_manager(pool, "admin").await;
@@ -205,8 +197,13 @@ async fn batch_to_ship_non_numeric_batch_id_40001() {
     let msg = failed[0]["message"].as_str().expect("failed.message");
     assert!(msg.contains("abc"), "message 应含原值 'abc': {msg}");
     // failed.batch_id 应当是 sentinel 0（无法 parse 的 batch_id 不回填）
-    let failed_bid = failed[0]["batch_id"].as_str().expect("failed.batch_id is string");
-    assert_eq!(failed_bid, "0", "未 parse 的 batch_id 应 fallback 到 sentinel 0");
+    let failed_bid = failed[0]["batch_id"]
+        .as_str()
+        .expect("failed.batch_id is string");
+    assert_eq!(
+        failed_bid, "0",
+        "未 parse 的 batch_id 应 fallback 到 sentinel 0"
+    );
 }
 
 /// 批量 to-ship CLERK 越权 → 403 / 40300 FORBIDDEN。
@@ -238,15 +235,7 @@ async fn single_to_ship_happy_path() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
     let v = batch_version(&pool, bid).await;
 
@@ -281,15 +270,7 @@ async fn single_to_ship_retry_returns_20103() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(
-        &pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
     let v = batch_version(&pool, bid).await;
 
@@ -347,15 +328,7 @@ async fn to_ship_partial_split_happy_path() {
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 10, "INSPECTION").await;
     let v = batch_version(&_pool, batch_id).await;
 
@@ -400,15 +373,7 @@ async fn to_ship_full_batch() {
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     let _batch_id = insert_batch(&_pool, part_id, 1, 10, "INSPECTION").await;
     let v = batch_version(&_pool, _batch_id).await;
 
@@ -500,7 +465,9 @@ async fn batch_to_ship_stale_version_lands_in_failed() {
     .await;
     assert_eq!(status, StatusCode::OK, "batch stale version: {body}");
     assert_eq!(body["code"], 0);
-    let submitted = body["data"]["submitted"].as_array().expect("data.submitted");
+    let submitted = body["data"]["submitted"]
+        .as_array()
+        .expect("data.submitted");
     let failed = body["data"]["failed"].as_array().expect("data.failed");
     assert_eq!(
         failed.len(),
@@ -509,14 +476,19 @@ async fn batch_to_ship_stale_version_lands_in_failed() {
     );
     assert_eq!(failed[0]["code"], 40901, "失败码应为 40901: {body}");
     assert_eq!(failed[0]["batch_id"], b2.to_string());
-    assert_eq!(submitted.len(), 1, "version 正确的 item 应 submitted: {body}");
+    assert_eq!(
+        submitted.len(),
+        1,
+        "version 正确的 item 应 submitted: {body}"
+    );
     assert_eq!(submitted[0]["part"]["status"], "READY_TO_SHIP");
 
     // savepoint 回滚校验：失败 item 的批次仍留在 INSPECTION，version 未被撞
-    let b2_status = sqlx::query_scalar::<_, String>("SELECT status FROM t_part_batch WHERE id = $1")
-        .bind(b2)
-        .fetch_one(&_pool)
-        .await
-        .expect("b2");
+    let b2_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM t_part_batch WHERE id = $1")
+            .bind(b2)
+            .fetch_one(&_pool)
+            .await
+            .expect("b2");
     assert_eq!(b2_status, "INSPECTION", "失败 item 应被 savepoint 回滚");
 }

@@ -13,7 +13,7 @@ use sqlx::{PgConnection, PgExecutor};
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::process::repo::ProcessRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::dto::{ShelfProcessMappingItem, ShelfProcessMappingOut};
 
@@ -116,7 +116,10 @@ impl ShelfProcessRepo {
                 .push_bind(created_by)
                 .push_bind(created_by);
         });
-        qb.build().execute(executor).await.map(|r| r.rows_affected())
+        qb.build()
+            .execute(executor)
+            .await
+            .map(|r| r.rows_affected())
     }
 }
 
@@ -170,10 +173,7 @@ impl ShelfProcessService {
         let mut process_ids: Vec<i64> = Vec::with_capacity(items.len());
         for it in items {
             let pid = it.process_id.parse::<i64>().map_err(|_| {
-                AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    "process_id 必须为雪花 ID 字符串",
-                )
+                AppError::biz(code::BIZ_INVALID_VALUE, "process_id 必须为雪花 ID 字符串")
             })?;
             process_ids.push(pid);
         }

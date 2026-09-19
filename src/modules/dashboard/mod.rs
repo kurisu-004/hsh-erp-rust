@@ -10,10 +10,10 @@ pub mod dto;
 pub mod handler;
 pub mod service;
 
-use std::sync::Arc;
-use axum::routing::get;
-use axum::Router;
 use crate::state::AppState;
+use axum::Router;
+use axum::routing::get;
+use std::sync::Arc;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new().route("/dashboard", get(handler::ws_dashboard))

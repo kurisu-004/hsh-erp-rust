@@ -11,7 +11,9 @@ use crate::modules::iam::model::{Menu, Shelf, User, UserRole};
 use crate::modules::iam::repo::UserRoleRow;
 use crate::modules::iam::service::AccountService;
 use crate::modules::iam::uow::IamUowProvider;
-use crate::modules::iam::uow::test_support::{IamUowFlags, MockIamUnitOfWork, MockIamUowProvider, provider_returning};
+use crate::modules::iam::uow::test_support::{
+    IamUowFlags, MockIamUnitOfWork, MockIamUowProvider, provider_returning,
+};
 
 /// 模拟 `sqlx::Error::RowNotFound`（与原 user/service_tests.rs 同形）
 pub(crate) fn test_db_error() -> sqlx::Error {

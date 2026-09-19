@@ -231,22 +231,34 @@ mod rollup_tests {
 
     #[test]
     fn all_cancelled_returns_cancelled() {
-        assert_eq!(compute_assembly_target(["CANCELLED", "CANCELLED"]), Some(AssemblyStatus::CANCELLED));
+        assert_eq!(
+            compute_assembly_target(["CANCELLED", "CANCELLED"]),
+            Some(AssemblyStatus::CANCELLED)
+        );
     }
 
     #[test]
     fn all_completed_non_cancelled_returns_completed() {
-        assert_eq!(compute_assembly_target(["COMPLETED", "COMPLETED"]), Some(AssemblyStatus::COMPLETED));
+        assert_eq!(
+            compute_assembly_target(["COMPLETED", "COMPLETED"]),
+            Some(AssemblyStatus::COMPLETED)
+        );
     }
 
     #[test]
     fn cancelled_ignored_others_completed_returns_completed() {
-        assert_eq!(compute_assembly_target(["COMPLETED", "CANCELLED"]), Some(AssemblyStatus::COMPLETED));
+        assert_eq!(
+            compute_assembly_target(["COMPLETED", "CANCELLED"]),
+            Some(AssemblyStatus::COMPLETED)
+        );
     }
 
     #[test]
     fn single_pending_returns_pending() {
-        assert_eq!(compute_assembly_target(["PENDING"]), Some(AssemblyStatus::PENDING));
+        assert_eq!(
+            compute_assembly_target(["PENDING"]),
+            Some(AssemblyStatus::PENDING)
+        );
     }
 
     #[test]

@@ -21,9 +21,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -49,7 +49,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -97,10 +102,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
 /// 直插 L1 客户（绕开 customer 域 CRUD）
 async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -121,10 +123,7 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 /// 直插 L2 客户（parent_id = l1_id）
 async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -462,7 +461,10 @@ async fn create_with_non_l1_customer_returns_400_20104() {
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert_eq!(env["code"], 20104, "code = 20104 (BIZ_INVALID_VALUE); full = {env}");
+    assert_eq!(
+        env["code"], 20104,
+        "code = 20104 (BIZ_INVALID_VALUE); full = {env}"
+    );
 }
 
 #[tokio::test]

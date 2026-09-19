@@ -10,11 +10,11 @@ use crate::infra::serial::next_delivery_note_no;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::part_batch::repo::PartBatchRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
-    DeliveryNoteAddItem, DeliveryNoteCreateRequest, DeliveryNoteDetailOut,
-    DeliveryNoteListOut, DeliveryNoteOut, DeliveryNoteUpdateRequest,
+    DeliveryNoteAddItem, DeliveryNoteCreateRequest, DeliveryNoteDetailOut, DeliveryNoteListOut,
+    DeliveryNoteOut, DeliveryNoteUpdateRequest,
 };
 use super::super::model::{DeliveryNote, DeliveryNoteEventType};
 use super::super::repo::{DeliveryNoteRepo, SortDir};
@@ -50,9 +50,17 @@ impl DeliveryNoteService {
             Role::CncProgrammer,
         ])?;
 
-        let rows =
-            DeliveryNoteRepo::list_with_filters(&mut *conn, statuses, customer_id, keyword, sort_by, sort_dir, limit, offset)
-                .await?;
+        let rows = DeliveryNoteRepo::list_with_filters(
+            &mut *conn,
+            statuses,
+            customer_id,
+            keyword,
+            sort_by,
+            sort_dir,
+            limit,
+            offset,
+        )
+        .await?;
         let total =
             DeliveryNoteRepo::count_with_filters(&mut *conn, statuses, customer_id, keyword)
                 .await?;
@@ -193,7 +201,8 @@ impl DeliveryNoteService {
         }
         let head_ids: Vec<i64> = heads.iter().map(|n| n.id).collect();
 
-        let rows = PartBatchRepo::list_with_part_by_delivery_note_ids(&mut *conn, &head_ids).await?;
+        let rows =
+            PartBatchRepo::list_with_part_by_delivery_note_ids(&mut *conn, &head_ids).await?;
 
         let leaf_ids: HashSet<i64> = rows.iter().map(|(_b, p)| p.customer_id).collect();
         let leaf_list = CustomerRepo::list_by_ids(
@@ -202,11 +211,9 @@ impl DeliveryNoteService {
             false,
         )
         .await?;
-        let leaf_map: HashMap<i64, TCustomer> =
-            leaf_list.into_iter().map(|c| (c.id, c)).collect();
+        let leaf_map: HashMap<i64, TCustomer> = leaf_list.into_iter().map(|c| (c.id, c)).collect();
 
-        let parent_ids: HashSet<i64> =
-            leaf_map.values().filter_map(|c| c.parent_id).collect();
+        let parent_ids: HashSet<i64> = leaf_map.values().filter_map(|c| c.parent_id).collect();
         let parent_list = if parent_ids.is_empty() {
             Vec::new()
         } else {
@@ -239,7 +246,13 @@ impl DeliveryNoteService {
             head_outs.into_iter().map(|h| (h.id, h)).collect();
 
         // 按 b.delivery_note_id 分桶
-        let mut by_note: HashMap<i64, Vec<(crate::modules::part_batch::model::TPartBatch, crate::modules::part::model::TPart)>> = HashMap::new();
+        let mut by_note: HashMap<
+            i64,
+            Vec<(
+                crate::modules::part_batch::model::TPartBatch,
+                crate::modules::part::model::TPart,
+            )>,
+        > = HashMap::new();
         for r in rows {
             if let Some(nid) = r.0.delivery_note_id {
                 by_note.entry(nid).or_default().push(r);
@@ -249,7 +262,9 @@ impl DeliveryNoteService {
         // 按入参 ids 顺序装配
         let mut out = Vec::with_capacity(heads.len());
         for nid in &head_ids {
-            let Some(head) = head_out_map.get(nid) else { continue };
+            let Some(head) = head_out_map.get(nid) else {
+                continue;
+            };
             let items_rows = by_note.remove(nid).unwrap_or_default();
             let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(items_rows.len());
             for (b, p) in items_rows {

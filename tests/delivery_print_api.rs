@@ -12,14 +12,17 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use calamine::{open_workbook_auto, Reader};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use calamine::{Reader, open_workbook_auto};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password, test_app};
+use common::{
+    add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
+    test_app,
+};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -33,7 +36,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     (status, body.to_vec())
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -130,9 +138,7 @@ fn umya_and_calamine_roundtrip_smoke() {
     let ws = wb.get_active_sheet_mut();
     ws.set_name("Sheet1");
     let _ = ws.get_cell_mut((1u32, 1u32)).set_value("hello");
-    let _ = ws
-        .get_cell_mut((1u32, 2u32))
-        .set_value_number(7.0);
+    let _ = ws.get_cell_mut((1u32, 2u32)).set_value_number(7.0);
 
     let tmp = std::env::temp_dir().join("calamine_smoke.xlsx");
     umya_spreadsheet::writer::xlsx::write(&wb, &tmp).expect("write xlsx");
@@ -153,7 +159,10 @@ fn umya_and_calamine_roundtrip_smoke() {
         Some(_) => 0,
         None => 0, // calamine 0.26 对 set_value_number 的 round-trip 兼容性边界；返回 0 不视为失败
     };
-    assert!(n == 7 || n == 0, "round-trip num expected 7 or got 0; got {n}");
+    assert!(
+        n == 7 || n == 0,
+        "round-trip num expected 7 or got 0; got {n}"
+    );
 
     let _ = std::fs::remove_file(&tmp);
 }

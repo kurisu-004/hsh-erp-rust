@@ -14,9 +14,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -37,15 +37,17 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
         .await
         .expect("read body");
     let body_str = String::from_utf8_lossy(&body).to_string();
-    let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!(
-            "parse JSON: {e}; status={status} uri=? raw = {body_str:?}"
-        )
-    });
+    let envelope: Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("parse JSON: {e}; status={status} uri=? raw = {body_str:?}"));
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -93,10 +95,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
 /// 触发 `20113 BIZ_CUSTOMER_IN_USE`。绕开 part 域 CRUD（part CRUD 不是本任务范畴）。
 async fn insert_part_with_customer(pool: &PgPool, customer_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(

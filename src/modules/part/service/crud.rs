@@ -32,10 +32,10 @@ use crate::modules::part::repo::PartRepo;
 use crate::modules::part::repo::part::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part_batch::model::TPartBatch;
 use crate::modules::part_batch::repo::{NewInitialBatch, PartBatchRepo};
-use crate::modules::process_chain::repo::ProcessChainRepo;
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
+use crate::modules::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
@@ -223,9 +223,9 @@ impl PartService {
                 .split(',')
                 .filter(|x| !x.is_empty())
                 .map(|x| {
-                    x.trim().parse::<i64>().map_err(|_| {
-                        AppError::validation(format!("holder_ids 含非法雪花 ID: {x}"))
-                    })
+                    x.trim()
+                        .parse::<i64>()
+                        .map_err(|_| AppError::validation(format!("holder_ids 含非法雪花 ID: {x}")))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
             _ => Vec::new(),
@@ -261,19 +261,12 @@ impl PartService {
         //    t_shelf；WORKER → t_worker；OUTSOURCE_COMPANY → t_outsource_company），
         //    每桶 1 条 IN 查询解析名称（最多 3 条 SQL，与页大小 N 无关）。
         let part_ids: Vec<i64> = rows.iter().map(|p| p.id).collect();
-        let batch_enrichment = enrich_part_list_with_location_and_holder(
-            conn,
-            &part_ids,
-        )
-        .await?;
+        let batch_enrichment = enrich_part_list_with_location_and_holder(conn, &part_ids).await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for p in rows {
             let (cn, l1cn) = lookup_customer_names(conn, p.customer_id).await?;
-            let (loc, holder) = batch_enrichment
-                .get(&p.id)
-                .cloned()
-                .unwrap_or((None, None));
+            let (loc, holder) = batch_enrichment.get(&p.id).cloned().unwrap_or((None, None));
             items.push(PartListItem {
                 part: p,
                 customer_name: cn,
@@ -544,8 +537,7 @@ impl PartService {
                     .await?
                     .and_then(|p| p.process_chain_id);
                 if let Some(chain_id) = chain_id {
-                    ProcessChainRepo::soft_delete_all_steps_for_chain(&mut *conn, chain_id)
-                        .await?;
+                    ProcessChainRepo::soft_delete_all_steps_for_chain(&mut *conn, chain_id).await?;
                     ProcessChainRepo::soft_delete_chain(&mut *conn, chain_id, current.id).await?;
                     ProcessChainRepo::unlink_part_from_chain(&mut *conn, chain_id, current.id)
                         .await?;
@@ -1022,16 +1014,16 @@ async fn enrich_part_list_with_location_and_holder(
     // 5. 组装结果。
     for (part_id, b) in target_per_part {
         let location = b.location.clone();
-        let holder_name = b.current_holder_id.and_then(|hid| {
-            match b.location.as_deref() {
+        let holder_name = b
+            .current_holder_id
+            .and_then(|hid| match b.location.as_deref() {
                 Some("PRODUCTION_SHELF") | Some("INSPECTION_SHELF") => {
                     shelf_names.get(&hid).cloned()
                 }
                 Some("WORKER") => worker_names.get(&hid).cloned(),
                 Some("OUTSOURCE_COMPANY") => outsource_names.get(&hid).cloned(),
                 _ => None,
-            }
-        });
+            });
         out.insert(part_id, (location, holder_name));
     }
     Ok(out)

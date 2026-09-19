@@ -19,7 +19,8 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::com::applicant::dto::{
-    ApplicantCreateRequest, ApplicantListOut, ApplicantListQuery, ApplicantOut, ApplicantUpdateRequest,
+    ApplicantCreateRequest, ApplicantListOut, ApplicantListQuery, ApplicantOut,
+    ApplicantUpdateRequest,
 };
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::shared::error::AppError;
@@ -45,9 +46,7 @@ pub async fn create_applicant(
     Json(req): Json<ApplicantCreateRequest>,
 ) -> Result<(StatusCode, Json<R<ApplicantOut>>), AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = ApplicantService::create_applicant(
-        &mut tx, &state.snowflake, &req, &current,
-    ).await?;
+    let out = ApplicantService::create_applicant(&mut tx, &state.snowflake, &req, &current).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }

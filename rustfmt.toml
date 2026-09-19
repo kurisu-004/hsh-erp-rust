@@ -1,0 +1,23 @@
+# backend-rust/rustfmt.toml
+# 2026-09-19 新增：落实 docs/conventions.md §6 TODO（温和版）
+#
+# 规约原文：max_width = 100、imports_granularity = "Crate"
+# 实际采用：
+#   - max_width = 100  ✅（规约一致）
+#   - imports_granularity = "Module"  ❌ 与规约 §6 字面 "Crate" 偏离；
+#     原因：rustfmt 1.9.0-stable（rust 1.98.1 自带）下 `imports_granularity`、
+#     `group_imports`、`format_strings`、`condense_wildcard_suffixes`、
+#     `wrap_comments`、`comment_width`、`normalize_doc_attributes`
+#     仍为 nightly-only 选项，开启需要 nightly 工具链，与本仓「stable 工具链」约束冲突。
+#     规约对齐留待后续 PR 升级 nightly + 重写 import 段。
+#
+# 当前 stable rustfmt 已生效的项：max_width / edition / newline_style /
+#   use_small_heuristics / reorder_imports / reorder_modules。
+
+max_width = 100
+tab_spaces = 4
+edition = "2024"
+newline_style = "Unix"
+use_small_heuristics = "Default"
+reorder_imports = true
+reorder_modules = true

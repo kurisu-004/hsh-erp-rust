@@ -20,14 +20,14 @@ use crate::modules::assembly::dto::{
     AssemblyListItem, AssemblyListOut, AssemblyListQuery, AssemblyOut, AssemblyUpdateRequest,
 };
 use crate::modules::assembly::model::TAssembly;
-use crate::modules::assembly::repo::{AssemblyListFilters, AssemblyRepo, AssemblyUpdate, NewAssembly};
-use crate::modules::assembly::statemachine::{
-    compute_assembly_target, AssemblyStatus,
+use crate::modules::assembly::repo::{
+    AssemblyListFilters, AssemblyRepo, AssemblyUpdate, NewAssembly,
 };
-use crate::modules::part::repo::part::ChildInheritFields;
+use crate::modules::assembly::statemachine::{AssemblyStatus, compute_assembly_target};
 use crate::modules::part::repo::PartRepo;
-use crate::modules::part_file::repo::{hash_bytes, NewPartFile, PartFileRepo};
-use crate::shared::error::{code, AppError};
+use crate::modules::part::repo::part::ChildInheritFields;
+use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
+use crate::shared::error::{AppError, code};
 use crate::shared::serial as serial_helper;
 
 // ---------- helpers ----------
@@ -71,10 +71,7 @@ async fn expand_customer_id_to_l2(
 /// 保留本 wrapper 为薄 alias（service 调用点直接用 `serial::acquire`）。
 #[inline]
 #[allow(dead_code)]
-async fn acquire_serial(
-    conn: &mut PgConnection,
-    prefix: char,
-) -> Result<String, AppError> {
+async fn acquire_serial(conn: &mut PgConnection, prefix: char) -> Result<String, AppError> {
     serial_helper::acquire(conn, prefix).await
 }
 
@@ -89,8 +86,9 @@ async fn fetch_customer_names(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut qb: QueryBuilder<Postgres> =
-        QueryBuilder::new("SELECT id, name, parent_id FROM t_customer WHERE deleted_at IS NULL AND id IN (");
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT id, name, parent_id FROM t_customer WHERE deleted_at IS NULL AND id IN (",
+    );
     let mut sep = qb.separated(", ");
     for id in ids {
         sep.push_bind(*id);
@@ -104,10 +102,18 @@ async fn fetch_customer_names(
 ///
 /// 2026-09-16 PR-2 瘦身：t_assembly 删 `actual_delivery_date` 列，AssemblyOut
 /// 同步删该字段。
-fn render_list_item(asm: TAssembly, names: &HashMap<i64, (String, Option<i64>)>) -> AssemblyListItem {
+fn render_list_item(
+    asm: TAssembly,
+    names: &HashMap<i64, (String, Option<i64>)>,
+) -> AssemblyListItem {
     let (customer_name, parent_customer_name) = names
         .get(&asm.customer_id)
-        .map(|(n, p)| (Some(n.clone()), p.and_then(|pid| names.get(&pid).map(|(pn, _)| pn.clone()))))
+        .map(|(n, p)| {
+            (
+                Some(n.clone()),
+                p.and_then(|pid| names.get(&pid).map(|(pn, _)| pn.clone())),
+            )
+        })
         .unwrap_or((None, None));
     AssemblyListItem {
         assembly: AssemblyOut {
@@ -175,13 +181,23 @@ impl AssemblyService {
         query: &AssemblyListQuery,
         current: &CurrentUser,
     ) -> Result<AssemblyListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector, Role::CncProgrammer])?;
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
 
         let customer_ids = if let Some(cid_str) = &query.customer_id {
             let cid: i64 = cid_str.parse().map_err(|_| {
-                AppError::biz(code::BIZ_INVALID_VALUE, format!("customer_id 非法: {cid_str}"))
+                AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    format!("customer_id 非法: {cid_str}"),
+                )
             })?;
-            expand_customer_id_to_l2(conn, cid).await.map_err(AppError::from)?
+            expand_customer_id_to_l2(conn, cid)
+                .await
+                .map_err(AppError::from)?
         } else {
             Vec::new()
         };
@@ -218,12 +234,26 @@ impl AssemblyService {
             .map_err(AppError::from)?;
 
         // 批量拉 customer name（O(1) 查询）；先 BTreeSet 去重再 collect 保持稳定顺序
-        let unique_ids: Vec<i64> = rows.iter().map(|r| r.customer_id).collect::<BTreeSet<_>>()
-            .into_iter().collect();
-        let names = fetch_customer_names(conn, &unique_ids).await.map_err(AppError::from)?;
+        let unique_ids: Vec<i64> = rows
+            .iter()
+            .map(|r| r.customer_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let names = fetch_customer_names(conn, &unique_ids)
+            .await
+            .map_err(AppError::from)?;
 
-        let items = rows.into_iter().map(|r| render_list_item(r, &names)).collect();
-        Ok(AssemblyListOut { items, total, limit, offset })
+        let items = rows
+            .into_iter()
+            .map(|r| render_list_item(r, &names))
+            .collect();
+        Ok(AssemblyListOut {
+            items,
+            total,
+            limit,
+            offset,
+        })
     }
 
     /// 详情：装配体行 + children（part 子件）+ files（占位空数组）。
@@ -235,11 +265,21 @@ impl AssemblyService {
         assembly_id: i64,
         current: &CurrentUser,
     ) -> Result<AssemblyDetail, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector, Role::CncProgrammer])?;
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
         let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
             .await
             .map_err(AppError::from)?
-            .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, format!("assembly {assembly_id} 不存在")))?;
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_ASSEMBLY_NOT_FOUND,
+                    format!("assembly {assembly_id} 不存在"),
+                )
+            })?;
 
         let children_t = PartRepo::list_by_assembly_id(&mut *conn, assembly_id, false)
             .await
@@ -247,26 +287,29 @@ impl AssemblyService {
         // deferred #7：批量查 current_batch_id（O(1) 查询）
         let child_ids: Vec<i64> = children_t.iter().map(|p| p.id).collect();
         let current_batch_ids = Self::fetch_current_batch_ids(conn, &child_ids).await?;
-        let children = children_t.into_iter().map(|p| {
-            let cb_id = current_batch_ids.get(&p.id).copied().flatten();
-            AssemblyChildOut {
-                id: p.id,
-                serial_no: p.serial_no,
-                name: p.name,
-                drawing_no: Some(p.drawing_no),
-                status: p.status,
-                version: p.version,
-                quantity: p.quantity,
-                planned_delivery_date: Some(p.planned_delivery_date),
-                applicant_name: p.applicant_name,
-                request_date: p.request_date,
-                order_no: p.order_no,
-                system_delivery_date: p.system_delivery_date,
-                is_urgent: p.is_urgent,
-                note: p.note,
-                current_batch_id: cb_id,
-            }
-        }).collect();
+        let children = children_t
+            .into_iter()
+            .map(|p| {
+                let cb_id = current_batch_ids.get(&p.id).copied().flatten();
+                AssemblyChildOut {
+                    id: p.id,
+                    serial_no: p.serial_no,
+                    name: p.name,
+                    drawing_no: Some(p.drawing_no),
+                    status: p.status,
+                    version: p.version,
+                    quantity: p.quantity,
+                    planned_delivery_date: Some(p.planned_delivery_date),
+                    applicant_name: p.applicant_name,
+                    request_date: p.request_date,
+                    order_no: p.order_no,
+                    system_delivery_date: p.system_delivery_date,
+                    is_urgent: p.is_urgent,
+                    note: p.note,
+                    current_batch_id: cb_id,
+                }
+            })
+            .collect();
 
         // 上传的文件列表（ASSEMBLY_MASTER kind）
         let files_t = PartFileRepo::list_by_owner(&mut *conn, "ASSEMBLY", asm.id)
@@ -336,39 +379,51 @@ impl AssemblyService {
 
         // 1. customer_id 必须为 L2 叶子（parent_id NOT NULL）
         let customer_id: i64 = req.customer_id.parse().map_err(|_| {
-            AppError::biz(code::BIZ_INVALID_VALUE, format!("customer_id 非法: {}", req.customer_id))
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("customer_id 非法: {}", req.customer_id),
+            )
         })?;
-        let parent_check: Option<(Option<i64>,)> = sqlx::query_as(
-            "SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(customer_id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(AppError::from)?;
+        let parent_check: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL")
+                .bind(customer_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(AppError::from)?;
         let parent_id = parent_check
             .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?
             .0;
         if parent_id.is_none() {
-            return Err(AppError::biz(code::BIZ_ASSEMBLY_BAD_CUSTOMER,
-                "customer_id 必须是 L2 叶子节点"));
+            return Err(AppError::biz(
+                code::BIZ_ASSEMBLY_BAD_CUSTOMER,
+                "customer_id 必须是 L2 叶子节点",
+            ));
         }
 
         // 2. 子件上限
         if req.children.len() > 99 {
-            return Err(AppError::biz(code::BIZ_ASSEMBLY_TOO_MANY_CHILDREN,
-                format!("子件最多 99 个，当前 {}", req.children.len())));
+            return Err(AppError::biz(
+                code::BIZ_ASSEMBLY_TOO_MANY_CHILDREN,
+                format!("子件最多 99 个，当前 {}", req.children.len()),
+            ));
         }
 
         // 3. PDF 校验（如果提供）：首份 PDF 页数 == children.len() + 1
         let page_count_opt = if !pdf_files.is_empty() {
             // 当前只处理第一份 PDF（与分支一致）；其它累计忽略
             let pdf = &pdf_files[0];
-            let doc = lopdf::Document::load_mem(pdf)
-                .map_err(|e| AppError::biz(code::BIZ_ASSEMBLY_PDF_INVALID, format!("PDF 解析失败: {e}")))?;
+            let doc = lopdf::Document::load_mem(pdf).map_err(|e| {
+                AppError::biz(code::BIZ_ASSEMBLY_PDF_INVALID, format!("PDF 解析失败: {e}"))
+            })?;
             let page_count = doc.get_pages().len();
             if page_count != req.children.len() + 1 {
-                return Err(AppError::biz(code::BIZ_ASSEMBLY_PDF_INVALID,
-                    format!("PDF 页数 {page_count} 与 children.len()+1={} 不匹配", req.children.len() + 1)));
+                return Err(AppError::biz(
+                    code::BIZ_ASSEMBLY_PDF_INVALID,
+                    format!(
+                        "PDF 页数 {page_count} 与 children.len()+1={} 不匹配",
+                        req.children.len() + 1
+                    ),
+                ));
             }
             Some(page_count as i32)
         } else {
@@ -394,11 +449,16 @@ impl AssemblyService {
             .fetch_one(&mut *conn)
             .await
             .map_err(AppError::from)?;
-            let p = prefix_str
-                .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NO_SERIAL_PREFIX, "L1 客户无 serial_prefix"))?;
-            let ch = p.chars().next().ok_or_else(|| {
-                AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 为空")
+            let p = prefix_str.ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
+                    "L1 客户无 serial_prefix",
+                )
             })?;
+            let ch = p
+                .chars()
+                .next()
+                .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 为空"))?;
             (Some(serial_helper::acquire(conn, ch).await?), Some(ch))
         };
 
@@ -430,7 +490,9 @@ impl AssemblyService {
             note: req.note.as_deref(),
             created_by: current.id,
         };
-        AssemblyRepo::insert(&mut *conn, new).await.map_err(AppError::from)?;
+        AssemblyRepo::insert(&mut *conn, new)
+            .await
+            .map_err(AppError::from)?;
 
         // 6. 插入子件（如有 PDF，则带 serial_no 派生 `{asm_serial}-{i:02d}`）
         //
@@ -449,7 +511,9 @@ impl AssemblyService {
                 let initial_batch_id = snowflake.next_id();
                 let child_serial = format!("{}-{:02}", asm_serial, i + 1);
                 let child_qty = ch.quantity.unwrap_or(1);
-                let child_planned = ch.planned_delivery_date.or(Some(parent_planned_delivery_date));
+                let child_planned = ch
+                    .planned_delivery_date
+                    .or(Some(parent_planned_delivery_date));
                 let _ = page_count_opt; // reserved for AssemblyFileRef follow-up
                 let inherit = ChildInheritFields {
                     applicant_name: parent_applicant_name,
@@ -536,7 +600,10 @@ impl AssemblyService {
         // customer_id 三态解析（None 缺省 = 不更新；Some(Some(cid_str)) = 覆盖 + L2 校验）
         let customer_id_i64 = if let Some(Some(cid_str)) = req.customer_id.as_ref() {
             let cid: i64 = cid_str.parse().map_err(|_| {
-                AppError::biz(code::BIZ_INVALID_VALUE, format!("customer_id 非法: {cid_str}"))
+                AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    format!("customer_id 非法: {cid_str}"),
+                )
             })?;
             // 校验 L2 叶子（parent_id NOT NULL）
             let parent: Option<Option<i64>> = sqlx::query_scalar(
@@ -548,7 +615,9 @@ impl AssemblyService {
             .map_err(AppError::from)?;
             let _parent_id = parent
                 .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?
-                .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_BAD_CUSTOMER, "customer_id 必须是 L2"))?;
+                .ok_or_else(|| {
+                    AppError::biz(code::BIZ_ASSEMBLY_BAD_CUSTOMER, "customer_id 必须是 L2")
+                })?;
             Some(cid)
         } else {
             None
@@ -563,7 +632,12 @@ impl AssemblyService {
         .fetch_optional(&mut *conn)
         .await
         .map_err(AppError::from)?
-        .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, format!("assembly {assembly_id} 不存在")))?;
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_ASSEMBLY_NOT_FOUND,
+                format!("assembly {assembly_id} 不存在"),
+            )
+        })?;
 
         let upd = AssemblyUpdate {
             drawing_no: req.drawing_no.as_deref(),
@@ -587,7 +661,10 @@ impl AssemblyService {
             .await
             .map_err(AppError::from)?;
         if affected == 0 {
-            return Err(AppError::biz(code::VERSION_CONFLICT, "version 不匹配或记录已删除"));
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                "version 不匹配或记录已删除",
+            ));
         }
 
         // 读回父件"更新后的当前行值" → §3.2 级联 + §3.3 缩放共用此视图
@@ -670,11 +747,15 @@ impl AssemblyService {
                 "assembly 子件存在活跃批次已挂送货单，禁止 soft_delete",
             ));
         }
-        let affected = AssemblyRepo::soft_delete(&mut *conn, assembly_id, expected_version, current.id)
-            .await
-            .map_err(AppError::from)?;
+        let affected =
+            AssemblyRepo::soft_delete(&mut *conn, assembly_id, expected_version, current.id)
+                .await
+                .map_err(AppError::from)?;
         if affected == 0 {
-            return Err(AppError::biz(code::VERSION_CONFLICT, "version 不匹配或记录已删除"));
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                "version 不匹配或记录已删除",
+            ));
         }
         Ok(())
     }
@@ -693,7 +774,10 @@ impl AssemblyService {
             .await
             .map_err(AppError::from)?;
         if affected == 0 {
-            return Err(AppError::biz(code::BIZ_INVALID_TRANSITION, "终态禁 cancel 或已删除"));
+            return Err(AppError::biz(
+                code::BIZ_INVALID_TRANSITION,
+                "终态禁 cancel 或已删除",
+            ));
         }
         let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
             .await
@@ -717,7 +801,10 @@ impl AssemblyService {
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
         let from = AssemblyStatus::from_str(&asm.status).ok_or_else(|| {
-            AppError::biz(code::BIZ_INVALID_VALUE, format!("未知 assembly status: {}", asm.status))
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("未知 assembly status: {}", asm.status),
+            )
         })?;
         if !from.can_transition_to(AssemblyStatus::IN_PROCESS) {
             return Err(AppError::biz(
@@ -735,7 +822,10 @@ impl AssemblyService {
         .await
         .map_err(AppError::from)?;
         if affected == 0 {
-            return Err(AppError::biz(code::VERSION_CONFLICT, "version 不匹配或已终态"));
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                "version 不匹配或已终态",
+            ));
         }
         let fresh = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
             .await
@@ -778,7 +868,10 @@ impl AssemblyService {
             }
             // SHA-256 → CAS
             let sha = hash_bytes(&bytes);
-            if let Some(existing) = PartFileRepo::get_by_owner_kind_sha(&mut *conn, asm.id, "ASSEMBLY_MASTER", &sha).await? {
+            if let Some(existing) =
+                PartFileRepo::get_by_owner_kind_sha(&mut *conn, asm.id, "ASSEMBLY_MASTER", &sha)
+                    .await?
+            {
                 out.push(crate::modules::assembly::dto::AssemblyFileRef {
                     id: existing.id,
                     original_filename: existing.original_filename,
@@ -794,7 +887,8 @@ impl AssemblyService {
                 &sha[..16],
                 safe_filename,
             );
-            cos.put_object(&object_key, bytes.clone(), &content_type).await?;
+            cos.put_object(&object_key, bytes.clone(), &content_type)
+                .await?;
             // INSERT
             let file_id = snowflake.next_id();
             let nf = NewPartFile {
@@ -846,13 +940,12 @@ impl AssemblyService {
         part_id: i64,
         current: &CurrentUser,
     ) -> Result<SyncOutcome, AppError> {
-        let row: Option<(Option<i64>,)> = sqlx::query_as(
-            "SELECT assembly_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(part_id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(AppError::from)?;
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT assembly_id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+                .bind(part_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(AppError::from)?;
         let Some((Some(assembly_id),)) = row else {
             return Ok(SyncOutcome::NoChange);
         };
@@ -897,21 +990,30 @@ impl AssemblyService {
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| {
-                AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, format!("assembly {assembly_id} 不存在"))
+                AppError::biz(
+                    code::BIZ_ASSEMBLY_NOT_FOUND,
+                    format!("assembly {assembly_id} 不存在"),
+                )
             })?;
         let current_status = AssemblyStatus::from_str(&asm.status).ok_or_else(|| {
-            AppError::biz(code::BIZ_INVALID_VALUE, format!("未知 assembly status: {}", asm.status))
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("未知 assembly status: {}", asm.status),
+            )
         })?;
-        if matches!(current_status, AssemblyStatus::COMPLETED | AssemblyStatus::CANCELLED) {
+        if matches!(
+            current_status,
+            AssemblyStatus::COMPLETED | AssemblyStatus::CANCELLED
+        ) {
             return Ok(SyncOutcome::NoChange);
         }
 
         // 聚合子件
-        let children_statuses =
-            AssemblyRepo::aggregate_children_status(&mut *conn, assembly_id)
-                .await
-                .map_err(AppError::from)?;
-        let Some(target) = compute_assembly_target(children_statuses.iter().map(|s| s.as_str())) else {
+        let children_statuses = AssemblyRepo::aggregate_children_status(&mut *conn, assembly_id)
+            .await
+            .map_err(AppError::from)?;
+        let Some(target) = compute_assembly_target(children_statuses.iter().map(|s| s.as_str()))
+        else {
             return Ok(SyncOutcome::NoChange);
         };
 
@@ -933,7 +1035,10 @@ impl AssemblyService {
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
-                format!("assembly {assembly_id} version {} 已变化或已终态", asm.version),
+                format!(
+                    "assembly {assembly_id} version {} 已变化或已终态",
+                    asm.version
+                ),
             ));
         }
         Ok(SyncOutcome::Changed(assembly_id))

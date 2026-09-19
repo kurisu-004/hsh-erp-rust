@@ -15,7 +15,7 @@ use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part_batch::model::TPartBatch;
 use crate::modules::process_chain::repo::ProcessChainRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::{PartOut, ToXxxOut};
 use super::PartService;
@@ -51,8 +51,9 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
         // 1. 读 part
-        let part: TPartInspected =
-            PartRepo::get_part_inspected(&mut *conn, part_id).await?.ok_or_else(|| {
+        let part: TPartInspected = PartRepo::get_part_inspected(&mut *conn, part_id)
+            .await?
+            .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
             })?;
 
@@ -76,31 +77,26 @@ impl PartService {
 
         // 3. 定位目标 INSPECTION 批次
         let bid_hint = Some(batch_id);
-        let target: TPartBatch = match PartRepo::find_inprocess_batch_for_part(
-            &mut *conn,
-            part_id,
-            bid_hint,
-        )
-        .await
-        {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                return Err(AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    format!(
-                        "part {part_id} 找不到 INSPECTION 批次（requested={:?}）",
-                        bid_hint
-                    ),
-                ));
-            }
-            Err(sqlx::Error::RowNotFound) => {
-                return Err(AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    "multiple INSPECTION batches; specify batch_id".to_string(),
-                ));
-            }
-            Err(e) => return Err(AppError::from(e)),
-        };
+        let target: TPartBatch =
+            match PartRepo::find_inprocess_batch_for_part(&mut *conn, part_id, bid_hint).await {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    return Err(AppError::biz(
+                        code::BIZ_PART_BATCH_NOT_FOUND,
+                        format!(
+                            "part {part_id} 找不到 INSPECTION 批次（requested={:?}）",
+                            bid_hint
+                        ),
+                    ));
+                }
+                Err(sqlx::Error::RowNotFound) => {
+                    return Err(AppError::biz(
+                        code::BIZ_PART_BATCH_NOT_FOUND,
+                        "multiple INSPECTION batches; specify batch_id".to_string(),
+                    ));
+                }
+                Err(e) => return Err(AppError::from(e)),
+            };
 
         // 3.5 caller 侧乐观锁：锚定 batch 而非 part（part.version 会被同 part
         // 下其它批次的操作撞掉，锚 part 会产生假冲突）。
@@ -108,14 +104,8 @@ impl PartService {
 
         // 4. 部分通过拆批（如需要）
         let operated_quantity = quantity.unwrap_or(target.quantity);
-        let (operated_id, operated_version, new_batch_id_out) = Self::_split_for_partial_op(
-            &mut *conn,
-            snowflake,
-            &target,
-            quantity,
-            current,
-        )
-        .await?;
+        let (operated_id, operated_version, new_batch_id_out) =
+            Self::_split_for_partial_op(&mut *conn, snowflake, &target, quantity, current).await?;
 
         // 5. UPDATE t_part_batch: INSPECTION → READY_TO_SHIP（OCC + 写 updated_by）
         let n = PartRepo::mark_batch_passed_inspection(
@@ -209,8 +199,9 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
         // 1. 读 part
-        let part: TPartInspected =
-            PartRepo::get_part_inspected(&mut *conn, part_id).await?.ok_or_else(|| {
+        let part: TPartInspected = PartRepo::get_part_inspected(&mut *conn, part_id)
+            .await?
+            .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
             })?;
         // 2. 状态机守卫：必须 INSPECTION
@@ -234,29 +225,28 @@ impl PartService {
         Self::_validate_production_shelf_and_process(&mut *conn, shelf_id, next_process_id).await?;
         // 4. 定位目标 INSPECTION 批次
         let bid_hint = Some(batch_id);
-        let target: TPartBatch = match PartRepo::find_inspection_batch_for_fail(
-            &mut *conn, part_id, bid_hint,
-        )
-        .await
-        {
-            Ok(Some(b)) => b,
-            Ok(None) => return Err(AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("part {part_id} 找不到 INSPECTION 批次（hint={bid_hint:?}）"),
-            )),
-            Err(sqlx::Error::RowNotFound) => return Err(AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                "multiple INSPECTION batches; specify batch_id".to_string(),
-            )),
-            Err(e) => return Err(AppError::from(e)),
-        };
+        let target: TPartBatch =
+            match PartRepo::find_inspection_batch_for_fail(&mut *conn, part_id, bid_hint).await {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    return Err(AppError::biz(
+                        code::BIZ_PART_BATCH_NOT_FOUND,
+                        format!("part {part_id} 找不到 INSPECTION 批次（hint={bid_hint:?}）"),
+                    ));
+                }
+                Err(sqlx::Error::RowNotFound) => {
+                    return Err(AppError::biz(
+                        code::BIZ_PART_BATCH_NOT_FOUND,
+                        "multiple INSPECTION batches; specify batch_id".to_string(),
+                    ));
+                }
+                Err(e) => return Err(AppError::from(e)),
+            };
         // 4.5 caller 侧乐观锁：锚定 batch 而非 part
         Self::_assert_batch_version(&target, expected_batch_version)?;
         // 5. 部分通过拆批
-        let (operated_id, operated_version, new_batch_id_out) = Self::_split_for_partial_op(
-            &mut *conn, snowflake, &target, quantity, current,
-        )
-        .await?;
+        let (operated_id, operated_version, new_batch_id_out) =
+            Self::_split_for_partial_op(&mut *conn, snowflake, &target, quantity, current).await?;
         // 6. UPDATE t_part_batch: INSPECTION → IN_PROCESS + location/holder/process
         // PR-3 批次 step 化：解析 step_id（chain 内 process_id → step_id）。
         // 注意：part 存在性已在 step 1（PartRepo::get_part_inspected）确认，
@@ -304,7 +294,10 @@ impl PartService {
         )
         .await?;
         if n == 0 {
-            return Err(AppError::biz(code::VERSION_CONFLICT, format!("batch {operated_id} 版本冲突")));
+            return Err(AppError::biz(
+                code::VERSION_CONFLICT,
+                format!("batch {operated_id} 版本冲突"),
+            ));
         }
         // 7. 写事件日志
         let event_id = snowflake.next_id();
@@ -334,8 +327,11 @@ impl PartService {
             SyncOutcome::NoChange => None,
         };
         // 9. 重读返回
-        let fresh = PartRepo::get_part_inspected(&mut *conn, part_id).await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished")))?;
+        let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished"))
+            })?;
         Ok(ToXxxOut {
             part: PartOut::from(fresh),
             new_batch_id: new_batch_id_out,
@@ -401,21 +397,22 @@ impl PartService {
         let target_shelf =
             Self::_validate_inspection_shelf(&mut *conn, target_inspection_shelf_id).await?;
         // 2. 读 part
-        let part: TPartInspected =
-            PartRepo::get_part_inspected(&mut *conn, part_id).await?.ok_or_else(|| {
+        let part: TPartInspected = PartRepo::get_part_inspected(&mut *conn, part_id)
+            .await?
+            .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
             })?;
         // 3. 状态机守卫：必须在 {PENDING, PROGRAMMING, IN_PROCESS}
         let from = PartStatus::from_str(&part.status).ok_or_else(|| {
-            AppError::biz(code::BIZ_INVALID_VALUE, format!("part {} 状态非法: {}", part_id, part.status))
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("part {} 状态非法: {}", part_id, part.status),
+            )
         })?;
         if !from.can_transition_to(PartStatus::INSPECTION) {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,
-                format!(
-                    "part {} 当前状态 {} 不允许送检",
-                    part_id, from.as_str()
-                ),
+                format!("part {} 当前状态 {} 不允许送检", part_id, from.as_str()),
             ));
         }
         // 5. 定位目标批次（先于 IN_PROCESS 组合校验，以便直接读 target_batch.location）
@@ -452,10 +449,8 @@ impl PartService {
             }
         }
         // 6. 部分通过拆批
-        let (operated_id, operated_version, new_batch_id_out) = Self::_split_for_partial_op(
-            &mut *conn, snowflake, &target, quantity, current,
-        )
-        .await?;
+        let (operated_id, operated_version, new_batch_id_out) =
+            Self::_split_for_partial_op(&mut *conn, snowflake, &target, quantity, current).await?;
         // 7. UPDATE t_part_batch: {PENDING, PROGRAMMING, IN_PROCESS} → INSPECTION
         //
         // 隐式多批次 rollup：前置状态守卫（step 3）已限定 from ∈ {PENDING, PROGRAMMING,
@@ -487,18 +482,9 @@ impl PartService {
         // 9. 写 INSPECTED 事件日志
         let event_id = snowflake.next_id();
         let note_text = match from {
-            PartStatus::PENDING => format!(
-                "送检：来自待下发 → 品检架 {}",
-                target_shelf.code
-            ),
-            PartStatus::PROGRAMMING => format!(
-                "送检：来自编程中 → 品检架 {}",
-                target_shelf.code
-            ),
-            PartStatus::IN_PROCESS => format!(
-                "送检：来自生产架 → 品检架 {}",
-                target_shelf.code
-            ),
+            PartStatus::PENDING => format!("送检：来自待下发 → 品检架 {}", target_shelf.code),
+            PartStatus::PROGRAMMING => format!("送检：来自编程中 → 品检架 {}", target_shelf.code),
+            PartStatus::IN_PROCESS => format!("送检：来自生产架 → 品检架 {}", target_shelf.code),
             _ => format!("送检 → 品检架 {}", target_shelf.code),
         };
         PartRepo::insert_part_event(

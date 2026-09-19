@@ -18,7 +18,7 @@
 mod helpers;
 
 use axum::http::StatusCode;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use helpers::*;
 
@@ -48,19 +48,11 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (insp_shelf, _prod_shelf, _proc) =
-        setup_inspection_and_production_shelves(&pool).await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
 
     // part A：INSPECTION 状态 + INSPECTION 批次 + 货架 holder 指向品检架
-    let part_a = insert_part_with_status(
-        &pool,
-        "PART_A",
-        l2,
-        Some("P-A-001"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_a =
+        insert_part_with_status(&pool, "PART_A", l2, Some("P-A-001"), None, "INSPECTION").await;
     let batch_a = insert_batch(&pool, part_a, 1, 5, "INSPECTION").await;
     // 2026-09-16 PR-2（migration 027）：t_part 删 `current_holder_id`；「holder 解析」
     // 改查 t_part_batch（location + current_holder_id）。fixture 同步改写为
@@ -74,15 +66,8 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
     .unwrap();
 
     // part B：IN_PROCESS 状态 + IN_PROCESS 批次（必须不出现在 list 中）
-    let _part_b = insert_part_with_status(
-        &pool,
-        "PART_B",
-        l2,
-        Some("P-B-001"),
-        None,
-        "IN_PROCESS",
-    )
-    .await;
+    let _part_b =
+        insert_part_with_status(&pool, "PART_B", l2, Some("P-B-001"), None, "IN_PROCESS").await;
     let batch_b = insert_batch(&pool, _part_b, 1, 3, "IN_PROCESS").await;
 
     let (app, token, _pool) = login_inspector(pool, "inspector_list").await;
@@ -107,10 +92,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
         .expect("total 应为 string (i64 serialize)")
         .parse()
         .expect("total 应可解析为 i64");
-    assert!(
-        total_val >= 1,
-        "total 应 ≥ 1（至少 part A）: body={body}"
-    );
+    assert!(total_val >= 1, "total 应 ≥ 1（至少 part A）: body={body}");
     let items = body["data"]["items"].as_array().expect("data.items");
     assert!(
         !items.is_empty(),
@@ -160,9 +142,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
 
     // 不应包含 part B 的 IN_PROCESS 批次
     let batch_b_str = batch_b.to_string();
-    let contains_b = items
-        .iter()
-        .any(|i| i["batch_id"] == batch_b_str);
+    let contains_b = items.iter().any(|i| i["batch_id"] == batch_b_str);
     assert!(
         !contains_b,
         "items 不应含 part B 的 IN_PROCESS 批次（batch_id={batch_b}）: body={body}"
@@ -209,43 +189,30 @@ async fn inspection_batches_filters_by_keyword_and_customer() {
     let (_guard, pool) = setup().await;
     let l1_a = insert_l1(&pool, "ACMEA", "A").await;
     let l1_b = insert_l1(&pool, "ACMEB", "B").await;
-    let (insp_shelf, _prod_shelf, _proc) =
-        setup_inspection_and_production_shelves(&pool).await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
 
     // L1_a 下 1 个 part（用 L1_a 自己作为 customer_id：expand_customer_id
     // 对 L1 返回 [L1_a]，L1_b 不会命中）
-    let part_a = insert_part_with_status(
-        &pool,
-        "PARTA",
-        l1_a,
-        Some("PA001"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_a =
+        insert_part_with_status(&pool, "PARTA", l1_a, Some("PA001"), None, "INSPECTION").await;
     let batch_a = insert_batch(&pool, part_a, 1, 2, "INSPECTION").await;
     sqlx::query!(
         "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
-        insp_shelf, batch_a
+        insp_shelf,
+        batch_a
     )
     .execute(&pool)
     .await
     .unwrap();
 
     // L1_b 下 1 个 part
-    let part_b = insert_part_with_status(
-        &pool,
-        "PARTB",
-        l1_b,
-        Some("PB001"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_b =
+        insert_part_with_status(&pool, "PARTB", l1_b, Some("PB001"), None, "INSPECTION").await;
     let batch_b = insert_batch(&pool, part_b, 1, 2, "INSPECTION").await;
     sqlx::query!(
         "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
-        insp_shelf, batch_b
+        insp_shelf,
+        batch_b
     )
     .execute(&pool)
     .await
@@ -258,9 +225,7 @@ async fn inspection_batches_filters_by_keyword_and_customer() {
         app,
         json_request(
             "GET",
-            &format!(
-                "/parts/inspection-batches?customer_id={l1_a}&keyword=PARTA"
-            ),
+            &format!("/parts/inspection-batches?customer_id={l1_a}&keyword=PARTA"),
             None::<Value>,
             Some(&token),
         ),
@@ -278,16 +243,12 @@ async fn inspection_batches_filters_by_keyword_and_customer() {
     let l1_a_str = l1_a.to_string();
 
     // 应仅含 L1_a 的 batch
-    let contains_a = items
-        .iter()
-        .any(|i| i["batch_id"] == batch_a_str);
+    let contains_a = items.iter().any(|i| i["batch_id"] == batch_a_str);
     assert!(
         contains_a,
         "items 应含 L1_a 的 batch_id={batch_a}: body={body}"
     );
-    let contains_b = items
-        .iter()
-        .any(|i| i["batch_id"] == batch_b_str);
+    let contains_b = items.iter().any(|i| i["batch_id"] == batch_b_str);
     assert!(
         !contains_b,
         "items 不应含 L1_b 的 batch_id={batch_b}（被 customer_id 过滤）: body={body}"
@@ -315,23 +276,16 @@ async fn inspection_batches_role_guard_rejects_worker() {
     let (_guard, pool) = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (insp_shelf, _prod_shelf, _proc) =
-        setup_inspection_and_production_shelves(&pool).await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
 
     // 准备 1 个 INSPECTION 批次（让 list 在权限通过时返回非空，确保拒绝原因是角色）
-    let part_id = insert_part_with_status(
-        &pool,
-        "PART_RG",
-        l2,
-        Some("P-RG-001"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_id =
+        insert_part_with_status(&pool, "PART_RG", l2, Some("P-RG-001"), None, "INSPECTION").await;
     let batch_id = insert_batch(&pool, part_id, 1, 1, "INSPECTION").await;
     sqlx::query!(
         "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
-        insp_shelf, batch_id
+        insp_shelf,
+        batch_id
     )
     .execute(&pool)
     .await
@@ -360,9 +314,7 @@ async fn inspection_batches_role_guard_rejects_worker() {
         "白名单外角色应得 40300 FORBIDDEN: body={body}"
     );
     // message 形态由 require_any_role 决定，含「无权限」
-    let msg = body["message"]
-        .as_str()
-        .expect("message 应为 string");
+    let msg = body["message"].as_str().expect("message 应为 string");
     assert!(
         msg.contains("无权限") || msg.contains("40300") || msg.contains("forbidden"),
         "message 应含权限拒绝语义（无权限 / 40300 / forbidden）: msg={msg}"
@@ -381,8 +333,7 @@ async fn inspection_batches_role_guard_rejects_worker() {
 #[tokio::test]
 async fn inspection_batches_pagination_limit_offset() {
     let (_guard, pool) = setup().await;
-    let (insp_shelf, _prod_shelf, _proc) =
-        setup_inspection_and_production_shelves(&pool).await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
     // 3 个 L1 客户（互不关联）；serial_prefix 单字符大写字母（A / C / E，
     // 故意跳过 B/D 避免与已有 prefix 碰撞 —— 数据库有 UNIQUE 索引约束）。
     let l1_a = insert_l1(&pool, "PAGA", "A").await;
@@ -405,7 +356,8 @@ async fn inspection_batches_pagination_limit_offset() {
         let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
         sqlx::query!(
             "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
-            insp_shelf, bid
+            insp_shelf,
+            bid
         )
         .execute(&pool)
         .await
@@ -430,11 +382,7 @@ async fn inspection_batches_pagination_limit_offset() {
     assert_eq!(body["code"], 0);
 
     let items = body["data"]["items"].as_array().expect("data.items");
-    assert_eq!(
-        items.len(),
-        2,
-        "limit=2 时 items.len() 应 = 2: body={body}"
-    );
+    assert_eq!(items.len(), 2, "limit=2 时 items.len() 应 = 2: body={body}");
     let total = body["data"]["total"]
         .as_str()
         .expect("data.total 应为 string (i64 serialize)")
@@ -469,9 +417,5 @@ async fn inspection_batches_pagination_limit_offset() {
     .await;
     assert_eq!(status2, StatusCode::OK, "second page: body={body2}");
     let items2 = body2["data"]["items"].as_array().expect("data.items2");
-    assert_eq!(
-        items2.len(),
-        1,
-        "offset=2, limit=2 应剩 1 条: body={body2}"
-    );
+    assert_eq!(items2.len(), 1, "offset=2, limit=2 应剩 1 条: body={body2}");
 }

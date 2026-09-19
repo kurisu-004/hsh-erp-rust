@@ -60,7 +60,12 @@ use helpers::*;
 /// 复刻 `tests/assembly_api.rs::insert_*` 风格但**不**复用 master 的
 /// `tests/delivery_scan_api.rs::insert_assembly`（后者写死 status='ACTIVE'，
 /// 不适合 rollup 测试）。
-async fn insert_assembly(pool: &sqlx::PgPool, customer_id: i64, drawing_no: &str, name: &str) -> i64 {
+async fn insert_assembly(
+    pool: &sqlx::PgPool,
+    customer_id: i64,
+    drawing_no: &str,
+    name: &str,
+) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
@@ -98,12 +103,11 @@ async fn force_assembly_status(pool: &sqlx::PgPool, asm_id: i64, status: &str) {
 
 /// 取当前 `t_assembly` (status, version)。
 async fn get_assembly_status_version(pool: &sqlx::PgPool, asm_id: i64) -> (String, i32) {
-    let row: (String, i32) =
-        sqlx::query_as("SELECT status, version FROM t_assembly WHERE id = $1")
-            .bind(asm_id)
-            .fetch_one(pool)
-            .await
-            .expect("query t_assembly");
+    let row: (String, i32) = sqlx::query_as("SELECT status, version FROM t_assembly WHERE id = $1")
+        .bind(asm_id)
+        .fetch_one(pool)
+        .await
+        .expect("query t_assembly");
     row
 }
 
@@ -161,7 +165,8 @@ async fn single_part_to_inspection_flips_assembly_to_in_process() {
         .as_str()
         .expect("synced_assembly_id 应为非 null 字符串");
     assert_eq!(
-        synced_aid, asm_id.to_string(),
+        synced_aid,
+        asm_id.to_string(),
         "data.synced_assembly_id 应等于父 asm.id"
     );
 
@@ -242,9 +247,11 @@ async fn all_children_cancelled_flips_assembly_to_cancelled() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
     let asm_id = insert_assembly(&pool, l2, "D-A3", "总成A3").await;
-    let p1 = insert_part_with_status(&pool, "P1", l2, Some("PA3-01"), Some(asm_id), "PENDING").await;
+    let p1 =
+        insert_part_with_status(&pool, "P1", l2, Some("PA3-01"), Some(asm_id), "PENDING").await;
     insert_batch(&pool, p1, 1, 5, "PENDING").await;
-    let p2 = insert_part_with_status(&pool, "P2", l2, Some("PA3-02"), Some(asm_id), "PENDING").await;
+    let p2 =
+        insert_part_with_status(&pool, "P2", l2, Some("PA3-02"), Some(asm_id), "PENDING").await;
     insert_batch(&pool, p2, 1, 5, "PENDING").await;
 
     // 直接 UPDATE 把两件子推 CANCELLED（绕开 HTTP + role 守卫）
@@ -329,7 +336,10 @@ async fn terminal_assembly_is_not_modified_by_child_change() {
     );
 
     let (st, version_after) = get_assembly_status_version(&_pool, asm_id).await;
-    assert_eq!(st, "COMPLETED", "父 asm 应保持 COMPLETED，不被子状态变更改写");
+    assert_eq!(
+        st, "COMPLETED",
+        "父 asm 应保持 COMPLETED，不被子状态变更改写"
+    );
     assert_eq!(
         version_after, version_before,
         "父终态时 sync 不应产生 UPDATE → version 必须 0 自增"
@@ -366,9 +376,12 @@ async fn batch_to_inspection_emits_per_assembly_update() {
 
     let asm_a = insert_assembly(&_pool, l2, "D-A5A", "总成A5-A").await;
     let asm_b = insert_assembly(&_pool, l2, "D-A5B", "总成A5-B").await;
-    let pa1 = insert_part_with_status(&_pool, "P-A1", l2, Some("PA5-01"), Some(asm_a), "PENDING").await;
-    let pa2 = insert_part_with_status(&_pool, "P-A2", l2, Some("PA5-02"), Some(asm_a), "PENDING").await;
-    let pb1 = insert_part_with_status(&_pool, "P-B1", l2, Some("PB5-01"), Some(asm_b), "PENDING").await;
+    let pa1 =
+        insert_part_with_status(&_pool, "P-A1", l2, Some("PA5-01"), Some(asm_a), "PENDING").await;
+    let pa2 =
+        insert_part_with_status(&_pool, "P-A2", l2, Some("PA5-02"), Some(asm_a), "PENDING").await;
+    let pb1 =
+        insert_part_with_status(&_pool, "P-B1", l2, Some("PB5-01"), Some(asm_b), "PENDING").await;
     let ba1 = insert_batch(&_pool, pa1, 1, 5, "PENDING").await;
     let ba2 = insert_batch(&_pool, pa2, 1, 5, "PENDING").await;
     let bb1 = insert_batch(&_pool, pb1, 1, 5, "PENDING").await;
@@ -432,15 +445,15 @@ async fn batch_to_inspection_emits_per_assembly_update() {
     // 应返回 `Vec<SyncOutcome>`，且全部 = NoChange（target 已 == current）。
     let current = test_current_user();
     let mut tx = pool.clone().begin().await.expect("begin tx");
-    let outcomes = AssemblyService::sync_from_part_changes(
-        &mut tx,
-        &[pa1, pa2, pb1],
-        &current,
-    )
-    .await
-    .expect("sync_from_part_changes 应 OK");
+    let outcomes = AssemblyService::sync_from_part_changes(&mut tx, &[pa1, pa2, pb1], &current)
+        .await
+        .expect("sync_from_part_changes 应 OK");
     tx.commit().await.expect("commit tx");
-    assert_eq!(outcomes.len(), 2, "distinct assembly_ids 去重后 = 2（asm-A + asm-B）");
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "distinct assembly_ids 去重后 = 2（asm-A + asm-B）"
+    );
     assert!(
         outcomes.iter().all(|o| matches!(o, SyncOutcome::NoChange)),
         "再次 sync 时 target 已 = current → 全部 NoChange；got={outcomes:?}"

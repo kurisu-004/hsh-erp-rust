@@ -30,9 +30,9 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 
 use crate::auth::jwt::decode_access;
-use crate::auth::rbac::{parse_role_str_or_warn, CurrentUser};
+use crate::auth::rbac::{CurrentUser, parse_role_str_or_warn};
 use crate::auth::session::hash_token;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
 impl FromRequestParts<Arc<AppState>> for CurrentUser {

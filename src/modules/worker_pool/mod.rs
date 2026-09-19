@@ -5,9 +5,12 @@ pub mod model;
 pub mod repo;
 pub mod service;
 
-use std::sync::Arc;
-use axum::{routing::{get, post}, Router};
 use crate::state::AppState;
+use axum::{
+    Router,
+    routing::{get, post},
+};
+use std::sync::Arc;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()

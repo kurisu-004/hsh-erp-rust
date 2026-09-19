@@ -14,7 +14,7 @@
 
 use sqlx::{PgConnection, PgExecutor};
 
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 /// 从 `t_serial_counter` 派发下一个序列号（`prefix` 是单字符业务 PK）。
 ///
@@ -24,10 +24,7 @@ use crate::shared::error::{code, AppError};
 /// `counter >= 99_999_999` 视为耗尽，返回 `BIZ_PART_SERIAL_EXHAUSTED`（20105）。
 ///
 /// `prefix` 必须是 A-Z 单字符（DB CHECK 约束），其它字符或空字符串 → `BIZ_INVALID_VALUE`。
-pub async fn acquire(
-    conn: &mut PgConnection,
-    prefix: char,
-) -> Result<String, AppError> {
+pub async fn acquire(conn: &mut PgConnection, prefix: char) -> Result<String, AppError> {
     let prefix_str = prefix.to_string();
     if !prefix.is_ascii_uppercase() {
         return Err(AppError::biz(
@@ -62,10 +59,7 @@ pub async fn acquire(
 /// caller 只有 `&sqlx::PgPool` 时（少量集成测试场景）可用；正式 service 流程
 /// 必须传 `&mut PgConnection` 以保证事务一致性。
 #[allow(dead_code)]
-pub async fn acquire_via_pool(
-    pool: &sqlx::PgPool,
-    prefix: char,
-) -> Result<String, AppError> {
+pub async fn acquire_via_pool(pool: &sqlx::PgPool, prefix: char) -> Result<String, AppError> {
     let mut tx = pool.begin().await?;
     let serial = acquire(&mut tx, prefix).await?;
     tx.commit().await?;

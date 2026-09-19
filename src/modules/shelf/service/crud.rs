@@ -19,7 +19,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::*;
 use super::super::model::TShelf;
@@ -97,17 +97,22 @@ impl ShelfService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let items =
-            ShelfRepo::list_with_filters(&mut *conn, code_like, zone, query.is_active, limit, offset)
-                .await?;
+        let items = ShelfRepo::list_with_filters(
+            &mut *conn,
+            code_like,
+            zone,
+            query.is_active,
+            limit,
+            offset,
+        )
+        .await?;
         let total =
             ShelfRepo::count_with_filters(&mut *conn, code_like, zone, query.is_active).await?;
 
         // account_count 单条 GROUP BY 批量算（防 N+1）
         let ids: Vec<i64> = items.iter().map(|s| s.id).collect();
         let account_rows = ShelfRepo::count_accounts_by_shelf(&mut *conn, &ids).await?;
-        let account_map: std::collections::HashMap<i64, i64> =
-            account_rows.into_iter().collect();
+        let account_map: std::collections::HashMap<i64, i64> = account_rows.into_iter().collect();
 
         let out_items = items
             .into_iter()
@@ -193,13 +198,16 @@ impl ShelfService {
             current.id,
         )
         .await
-        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-            // uk_t_shelf_code：活跃行唯一
-            Some("23505") => {
-                AppError::biz(code::BIZ_SHELF_DUPLICATE_CODE, format!("code '{code}' 已被占用"))
-            }
-            _ => AppError::from(e),
-        })?;
+        .map_err(
+            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                // uk_t_shelf_code：活跃行唯一
+                Some("23505") => AppError::biz(
+                    code::BIZ_SHELF_DUPLICATE_CODE,
+                    format!("code '{code}' 已被占用"),
+                ),
+                _ => AppError::from(e),
+            },
+        )?;
 
         Ok(to_shelf_out(s, 0))
     }
@@ -250,14 +258,16 @@ impl ShelfService {
             current.id,
         )
         .await
-        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-            // zone CHECK（理论 service 已 catch）
-            Some("23514") => AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                "zone 必须是 PRODUCTION 或 INSPECTION",
-            ),
-            _ => AppError::from(e),
-        })?;
+        .map_err(
+            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                // zone CHECK（理论 service 已 catch）
+                Some("23514") => AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    "zone 必须是 PRODUCTION 或 INSPECTION",
+                ),
+                _ => AppError::from(e),
+            },
+        )?;
         if affected == 0 {
             return Err(version_conflict());
         }

@@ -16,9 +16,9 @@ use sqlx::PgConnection;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::part_batch::repo::PartBatchRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
-use super::super::dto::{AttachBatchItem, AttachBatchConflict, AttachBatchesOut};
+use super::super::dto::{AttachBatchConflict, AttachBatchItem, AttachBatchesOut};
 use super::super::repo::DeliveryNoteRepo;
 use super::inner::note_not_found;
 use super::scan::is_attachable_state;
@@ -113,7 +113,10 @@ impl DeliveryNoteService {
             }
         }
 
-        Ok(AttachBatchesOut { attached, conflicts })
+        Ok(AttachBatchesOut {
+            attached,
+            conflicts,
+        })
     }
 }
 

@@ -140,10 +140,7 @@ impl DeliveryNoteStatus {
         use DeliveryNoteStatus::*;
         matches!(
             (*self, next),
-            (Draft, Submitted)
-                | (Submitted, Draft)
-                | (Submitted, PickedUp)
-                | (PickedUp, Archived)
+            (Draft, Submitted) | (Submitted, Draft) | (Submitted, PickedUp) | (PickedUp, Archived)
         )
     }
 }

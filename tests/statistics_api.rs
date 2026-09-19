@@ -236,7 +236,11 @@ async fn workers_stats_happy_path() {
     assert_eq!(zhang.pickup_count, 3);
     assert_eq!(zhang.pickup_quantity, 3);
     assert_eq!(zhang.contribution_pct, Some(30.0));
-    let li = out.items.iter().find(|i| i.worker_id == w2).expect("李四在场");
+    let li = out
+        .items
+        .iter()
+        .find(|i| i.worker_id == w2)
+        .expect("李四在场");
     assert_eq!(li.pickup_quantity, 7);
     assert_eq!(li.contribution_pct, Some(70.0));
 }
@@ -416,10 +420,12 @@ async fn count_in_process_at_date_to_boundary() {
     )
     .bind(snowflake.next_id())
     .bind(part_a)
-    .bind(NaiveDate::from_ymd_opt(2026, 9, 25)
-        .unwrap()
-        .and_hms_opt(10, 0, 0)
-        .unwrap())
+    .bind(
+        NaiveDate::from_ymd_opt(2026, 9, 25)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap(),
+    )
     .execute(&pool)
     .await
     .expect("insert part A COMPLETED event");
@@ -445,12 +451,10 @@ async fn count_in_process_at_date_to_boundary() {
     .expect("insert part B");
 
     let mut tx = pool.begin().await.unwrap();
-    let in_process = StatisticsRepo::count_in_process_at(
-        &mut tx,
-        NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
-    )
-    .await
-    .expect("count_in_process_at ok");
+    let in_process =
+        StatisticsRepo::count_in_process_at(&mut tx, NaiveDate::from_ymd_opt(2026, 9, 20).unwrap())
+            .await
+            .expect("count_in_process_at ok");
     drop(tx);
 
     // 期望：A 在 09-25 已 COMPLETED（不论是否在 date_to 之后），不算 09-20 期末在制；

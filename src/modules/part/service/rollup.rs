@@ -27,9 +27,9 @@ use sqlx::PgConnection;
 use crate::auth::rbac::CurrentUser;
 use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
 use crate::modules::part::repo::PartRepo;
-use crate::modules::part::statemachine::{compute_part_target, BatchForRollup};
+use crate::modules::part::statemachine::{BatchForRollup, compute_part_target};
 use crate::modules::part_batch::repo::PartBatchRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::PartService;
 

@@ -15,9 +15,9 @@ pub mod repo;
 pub mod service;
 pub mod statemachine;
 
-use std::sync::Arc;
-use axum::Router;
 use crate::state::AppState;
+use axum::Router;
+use std::sync::Arc;
 
 /// 公司域路由（挂载点 `/outsource-companies`，见 `modules::v2_router`）。
 pub fn company_router() -> Router<Arc<AppState>> {

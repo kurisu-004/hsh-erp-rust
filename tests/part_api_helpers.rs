@@ -23,9 +23,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use common::{add_role, insert_user_with_password, test_app, test_state};
@@ -51,7 +51,12 @@ pub async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) 
 }
 
 /// 构造 axum `Request<Body>`：method/uri/bearer/body。
-pub fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+pub fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -161,8 +166,16 @@ pub async fn login_worker(pool: PgPool, username: &str) -> (axum::Router, String
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     // ShelfAccount 角色必须 scope 到具体 shelf（service `resolve_roles_and_scope`
     // 否则会跳过）。临时建一个 INSPECTION 货架当 scope target。
-    let insp_scope_shelf = insert_shelf(&pool, "WORKER-ROLE-SCOPE", "WorkerRoleScope", "INSPECTION").await;
-    add_role(&pool, uid, "SHELF_ACCOUNT", Some("shelf"), Some(insp_scope_shelf)).await;
+    let insp_scope_shelf =
+        insert_shelf(&pool, "WORKER-ROLE-SCOPE", "WorkerRoleScope", "INSPECTION").await;
+    add_role(
+        &pool,
+        uid,
+        "SHELF_ACCOUNT",
+        Some("shelf"),
+        Some(insp_scope_shelf),
+    )
+    .await;
     let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env) = send(
@@ -187,14 +200,19 @@ pub async fn login_worker(pool: PgPool, username: &str) -> (axum::Router, String
 /// 插 L1 客户（一级；带 serial_prefix）。
 pub async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, NULL, $3, 0, $4, NULL, $4, NULL)",
-        id, name, prefix, now,
+        id,
+        name,
+        prefix,
+        now,
     )
     .execute(pool)
     .await
@@ -205,14 +223,19 @@ pub async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 /// 插 L2 客户（二级；挂在 L1 下，无 prefix）。
 pub async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
-        id, name, l1_id, now,
+        id,
+        name,
+        l1_id,
+        now,
     )
     .execute(pool)
     .await
@@ -233,7 +256,9 @@ pub async fn insert_part_with_status(
     status: &str,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
@@ -246,7 +271,14 @@ pub async fn insert_part_with_status(
          quantity, version, created_at, created_by, updated_at, updated_by, \
          assembly_id) \
          VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, 0, $5, NULL, $5, NULL, $7)",
-        id, serial_no, name, customer_id, now, today, assembly_id, status,
+        id,
+        serial_no,
+        name,
+        customer_id,
+        now,
+        today,
+        assembly_id,
+        status,
     )
     .execute(pool)
     .await
@@ -255,9 +287,17 @@ pub async fn insert_part_with_status(
 }
 
 /// 插一个 part_batch（带 status 参数，与 part.status 通常对齐）。
-pub async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, status: &str) -> i64 {
+pub async fn insert_batch(
+    pool: &PgPool,
+    part_id: i64,
+    batch_no: i32,
+    qty: i32,
+    status: &str,
+) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；
@@ -266,7 +306,12 @@ pub async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, 
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
          version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, $6, NULL)",
-        id, part_id, batch_no, qty, status, now,
+        id,
+        part_id,
+        batch_no,
+        qty,
+        status,
+        now,
     )
     .execute(pool)
     .await
@@ -308,7 +353,9 @@ pub async fn setup_inspection_and_production_shelves(pool: &PgPool) -> (i64, i64
 /// 现 to_process / place_on_shelf 端点要求真实 process）。本 helper 是
 /// part_api_helpers 私有的（tests/common/mod.rs 也有同名的 pub 版本）。
 async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let proc_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
@@ -326,7 +373,9 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 
 /// 把 shelf 绑到 process（t_shelf_process）。私有的（common 也有同名的 pub 版本）。
 async fn link_shelf_to_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let map_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_shelf_process (id, shelf_id, process_id, version, \
@@ -340,4 +389,3 @@ async fn link_shelf_to_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
     .await
     .expect("insert shelf-process mapping");
 }
-

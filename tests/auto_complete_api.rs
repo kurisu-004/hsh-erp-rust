@@ -158,7 +158,10 @@ async fn run_once_completes_overdue_delivered_batch() {
         .fetch_one(&pool)
         .await
         .expect("re-read batch");
-    assert_eq!(status, "COMPLETED", "30 天前 DELIVERED 应被 auto_complete 翻 COMPLETED");
+    assert_eq!(
+        status, "COMPLETED",
+        "30 天前 DELIVERED 应被 auto_complete 翻 COMPLETED"
+    );
 }
 
 /// DELIVERED + placed_at 在阈值内（recent）→ run_once 不动。
@@ -216,5 +219,8 @@ async fn run_once_emits_ws_event_after_commit() {
             Err(_) => break,
         }
     }
-    assert!(found, "ws_hub 应在 commit 后收到 PART_COMPLETED 事件 (part_id={part_id})");
+    assert!(
+        found,
+        "ws_hub 应在 commit 后收到 PART_COMPLETED 事件 (part_id={part_id})"
+    );
 }

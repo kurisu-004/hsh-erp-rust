@@ -75,8 +75,8 @@ fn patch_in_memory(
     let mut new_bytes: Vec<u8> = Vec::new();
     {
         let mut zip_out = zip::ZipWriter::new(Cursor::new(&mut new_bytes));
-        let options =
-            zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         for i in 0..zip_in.len() {
             let mut entry = zip_in
                 .by_index(i)
@@ -113,9 +113,7 @@ fn patch_in_memory(
                 .write_all(&patched)
                 .map_err(|e| format!("write entry: {e}"))?;
         }
-        zip_out
-            .finish()
-            .map_err(|e| format!("finish zip: {e}"))?;
+        zip_out.finish().map_err(|e| format!("finish zip: {e}"))?;
     }
     *xlsx_bytes = new_bytes;
     Ok(())
@@ -213,15 +211,8 @@ fn patch_luda_i2_date(xml: Vec<u8>) -> Result<Vec<u8>, String> {
         };
         // 替换
         let new_tag = match (s_attr.as_deref(), t_attr.as_deref()) {
-            (Some(s), _) => format!(
-                r#"<c r="I2" s="{}" t="n" v="{}"/>"#,
-                escape_attr(s),
-                serial
-            ),
-            (None, _) => format!(
-                r#"<c r="I2" t="n" v="{}"/>"#,
-                serial
-            ),
+            (Some(s), _) => format!(r#"<c r="I2" s="{}" t="n" v="{}"/>"#, escape_attr(s), serial),
+            (None, _) => format!(r#"<c r="I2" t="n" v="{}"/>"#, serial),
         };
         let mut out = String::with_capacity(text.len());
         out.push_str(&text[..abs]);
@@ -244,10 +235,7 @@ fn patch_luda_i2_date(xml: Vec<u8>) -> Result<Vec<u8>, String> {
 ///
 /// 这一步需要先有 sheet1.xml 的数据，本函数依赖一个 two-pass via `xl/styles.xml`
 /// + 一个 helper（`collect_xfids_in_shrink_cols`）由调用方传入 sheet1.xml。
-fn inject_shrink_to_fit(
-    styles_xml: &[u8],
-    _cfg: &TemplateConfig,
-) -> Result<Vec<u8>, String> {
+fn inject_shrink_to_fit(styles_xml: &[u8], _cfg: &TemplateConfig) -> Result<Vec<u8>, String> {
     // 简化策略：对 cfg.shrink_fit_cols 所列每一列，扫描所有 styles.xml 中的 xf，
     // 若其 alignment 段缺失或没有 shrinkToFit，则**统一**给这些列所有引用过的
     // xf 加 shrinkToFit="1"。
@@ -358,7 +346,9 @@ fn patch_alignment_in_xf(xf_elem: &str) -> String {
         // 跳到第一个 `/>` 之后
         let mut chars_after = &xf_elem[pos + 2..];
         // 跳过空白
-        while chars_after.starts_with(' ') || chars_after.starts_with('\t') || chars_after.starts_with('\n')
+        while chars_after.starts_with(' ')
+            || chars_after.starts_with('\t')
+            || chars_after.starts_with('\n')
         {
             chars_after = &chars_after[1..];
         }
@@ -433,10 +423,7 @@ fn last_print_area_block(section: &str) -> Option<String> {
 
 fn rebuild_defined_names(section: &str, print_area_keep: Option<&str>) -> String {
     // 找 <definedNames ...> 起始（含开标签前缀）
-    let open_close_rel = section
-        .find(">")
-        .map(|p| p + 1)
-        .unwrap_or(section.len());
+    let open_close_rel = section.find(">").map(|p| p + 1).unwrap_or(section.len());
     let header = &section[..open_close_rel];
     // 收集所有 <definedName ...>...</definedName>，剔除 _xlnm.Print_Aria。
     let body = &section[open_close_rel..];
@@ -466,7 +453,6 @@ fn rebuild_defined_names(section: &str, print_area_keep: Option<&str>) -> String
     section_out.push_str(&out);
     section_out
 }
-
 
 // =================================================================================
 // helpers

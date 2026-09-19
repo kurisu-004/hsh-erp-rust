@@ -177,10 +177,7 @@ impl SessionStore for RedisSessionStore {
 
     async fn get_session(&self, token_hash: &str) -> Result<Option<CachedSession>, AppError> {
         let mut conn = self.conn().await?;
-        let raw: Option<String> = conn
-            .get(key_token(token_hash))
-            .await
-            .map_err(map_redis)?;
+        let raw: Option<String> = conn.get(key_token(token_hash)).await.map_err(map_redis)?;
         match raw {
             None => Ok(None),
             Some(s) => serde_json::from_str(&s)
@@ -192,10 +189,7 @@ impl SessionStore for RedisSessionStore {
     async fn delete_session(&self, token_hash: &str) -> Result<(), AppError> {
         // GET → user_id（SREM 必需）；失败/不存在也允许继续 DEL（幂等）
         let mut conn = self.conn().await?;
-        let raw: Option<String> = conn
-            .get(key_token(token_hash))
-            .await
-            .map_err(map_redis)?;
+        let raw: Option<String> = conn.get(key_token(token_hash)).await.map_err(map_redis)?;
         let user_id = raw
             .as_deref()
             .and_then(|s| serde_json::from_str::<CachedSession>(s).ok())
@@ -281,14 +275,13 @@ impl SessionStore for NoopSessionStore {
         _cached: &CachedCurrentUser,
     ) -> Result<(), AppError> {
         // 借用 Python JWT 时不该有写入；打 warn 以便误用时可见
-        tracing::warn!("NoopSessionStore::create_session 被调用（REDIS_SESSION_CHECK_ENABLED=false）");
+        tracing::warn!(
+            "NoopSessionStore::create_session 被调用（REDIS_SESSION_CHECK_ENABLED=false）"
+        );
         Ok(())
     }
 
-    async fn get_session(
-        &self,
-        _token_hash: &str,
-    ) -> Result<Option<CachedSession>, AppError> {
+    async fn get_session(&self, _token_hash: &str) -> Result<Option<CachedSession>, AppError> {
         Ok(None)
     }
 
@@ -300,11 +293,7 @@ impl SessionStore for NoopSessionStore {
         Ok(())
     }
 
-    async fn touch_session(
-        &self,
-        _token_hash: &str,
-        _ttl_seconds: u64,
-    ) -> Result<bool, AppError> {
+    async fn touch_session(&self, _token_hash: &str, _ttl_seconds: u64) -> Result<bool, AppError> {
         Ok(false)
     }
 }

@@ -36,9 +36,7 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::iam::repo::{
     MenuRepo, ShelfRepo, UserInsert, UserRepo, UserRoleInsert, UserRoleRepo,
 };
-use hsh_erp_rust::modules::iam::uow::{
-    IamUowProvider, SqlxIamUowProvider,
-};
+use hsh_erp_rust::modules::iam::uow::{IamUowProvider, SqlxIamUowProvider};
 
 // ===========================================================================
 // 全局串行化互斥：所有用例共享同一 DB。
@@ -117,7 +115,9 @@ async fn get_by_id_returns_user_when_active() {
 #[tokio::test]
 async fn get_by_id_returns_none_for_missing_id() {
     let (_g, pool) = setup().await;
-    let u = UserRepo::get_by_id(&pool, 999_999_999_999).await.expect("query");
+    let u = UserRepo::get_by_id(&pool, 999_999_999_999)
+        .await
+        .expect("query");
     assert!(u.is_none(), "不存在的 id 应返回 None");
 }
 
@@ -126,10 +126,14 @@ async fn get_by_id_returns_none_for_missing_id() {
 async fn get_by_id_excludes_soft_deleted() {
     let (_g, pool) = setup().await;
     let id = seed_user(&pool, "ghost", true).await;
-    sqlx::query!("UPDATE t_user SET deleted_at = $2 WHERE id = $1", id, now_naive())
-        .execute(&pool)
-        .await
-        .expect("soft delete");
+    sqlx::query!(
+        "UPDATE t_user SET deleted_at = $2 WHERE id = $1",
+        id,
+        now_naive()
+    )
+    .execute(&pool)
+    .await
+    .expect("soft delete");
 
     let u = UserRepo::get_by_id(&pool, id).await.expect("query");
     assert!(u.is_none(), "软删用户应被排除");
@@ -155,10 +159,14 @@ async fn get_by_username_is_case_sensitive_in_repo() {
     let (_g, pool) = setup().await;
     let _id = seed_user(&pool, "Bob", true).await;
     // seed_user 已 lowercase 存 "bob"，所以 query("BOB") 找不到
-    let u = UserRepo::get_by_username(&pool, "BOB").await.expect("query");
+    let u = UserRepo::get_by_username(&pool, "BOB")
+        .await
+        .expect("query");
     assert!(u.is_none(), "repo 不做归一，BOB != bob");
     // 但 query("bob") 能命中
-    let u = UserRepo::get_by_username(&pool, "bob").await.expect("query");
+    let u = UserRepo::get_by_username(&pool, "bob")
+        .await
+        .expect("query");
     assert!(u.is_some(), "小写精确匹配应命中");
 }
 
@@ -305,7 +313,10 @@ async fn create_inserts_new_user() {
     };
     UserRepo::create(&pool, &insert).await.expect("create");
 
-    let u = UserRepo::get_by_id(&pool, id).await.expect("query").expect("hit");
+    let u = UserRepo::get_by_id(&pool, id)
+        .await
+        .expect("query")
+        .expect("hit");
     assert_eq!(u.username, "newuser");
     assert_eq!(u.full_name, "New User");
     assert_eq!(u.refresh_token_version, 0);
@@ -353,7 +364,10 @@ async fn update_partial_updates_full_name() {
     .await
     .expect("update");
     assert_eq!(affected, 1);
-    let u = UserRepo::get_by_id(&pool, id).await.expect("query").expect("hit");
+    let u = UserRepo::get_by_id(&pool, id)
+        .await
+        .expect("query")
+        .expect("hit");
     assert_eq!(u.full_name, "Alice New");
     assert_eq!(u.version, 1);
 }
@@ -376,19 +390,25 @@ async fn update_partial_set_phone_flag_clears_phone() {
         &pool,
         id,
         0,
-        None,        // full_name
-        true,        // set_phone：明确清空
-        None,        // phone: None + set_phone=true → phone=NULL
-        None,        // password_hash
-        None,        // is_active
+        None, // full_name
+        true, // set_phone：明确清空
+        None, // phone: None + set_phone=true → phone=NULL
+        None, // password_hash
+        None, // is_active
         now_naive(),
         None,
     )
     .await
     .expect("update");
     assert_eq!(affected, 1);
-    let u = UserRepo::get_by_id(&pool, id).await.expect("query").expect("hit");
-    assert!(u.phone.is_none(), "set_phone=true + phone=None 应清空 phone");
+    let u = UserRepo::get_by_id(&pool, id)
+        .await
+        .expect("query")
+        .expect("hit");
+    assert!(
+        u.phone.is_none(),
+        "set_phone=true + phone=None 应清空 phone"
+    );
 }
 
 /// `UserRepo::update_partial`：set_phone=false 保留 phone
@@ -410,7 +430,7 @@ async fn update_partial_no_set_phone_keeps_existing() {
         id,
         0,
         None,
-        false, // set_phone=false：不动 phone
+        false,               // set_phone=false：不动 phone
         Some("13900139000"), // 即使传 phone 也不更新
         None,
         None,
@@ -420,7 +440,10 @@ async fn update_partial_no_set_phone_keeps_existing() {
     .await
     .expect("update");
     assert_eq!(affected, 1);
-    let u = UserRepo::get_by_id(&pool, id).await.expect("query").expect("hit");
+    let u = UserRepo::get_by_id(&pool, id)
+        .await
+        .expect("query")
+        .expect("hit");
     assert_eq!(u.phone.as_deref(), Some("13800138000"));
 }
 
@@ -489,7 +512,9 @@ async fn touch_login_updates_last_login_at() {
     let (_g, pool) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let when: NaiveDateTime = now_naive() + chrono::Duration::hours(1);
-    UserRepo::touch_login(&pool, id, when).await.expect("touch_login");
+    UserRepo::touch_login(&pool, id, when)
+        .await
+        .expect("touch_login");
 
     let raw = sqlx::query!(
         "SELECT last_login_at AS \"last_login_at?\" FROM t_user WHERE id = $1",
@@ -506,15 +531,9 @@ async fn touch_login_updates_last_login_at() {
 async fn increment_refresh_token_version_rotates_token_version() {
     let (_g, pool) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
-    let affected = UserRepo::increment_refresh_token_version(
-        &pool,
-        id,
-        0,
-        now_naive(),
-        None,
-    )
-    .await
-    .expect("increment");
+    let affected = UserRepo::increment_refresh_token_version(&pool, id, 0, now_naive(), None)
+        .await
+        .expect("increment");
     assert_eq!(affected, 1);
 
     let raw = sqlx::query!(
@@ -532,15 +551,9 @@ async fn increment_refresh_token_version_rotates_token_version() {
 async fn increment_refresh_token_version_zero_rows_for_version_conflict() {
     let (_g, pool) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
-    let affected = UserRepo::increment_refresh_token_version(
-        &pool,
-        id,
-        99,
-        now_naive(),
-        None,
-    )
-    .await
-    .expect("increment");
+    let affected = UserRepo::increment_refresh_token_version(&pool, id, 99, now_naive(), None)
+        .await
+        .expect("increment");
     assert_eq!(affected, 0);
 }
 
@@ -549,16 +562,10 @@ async fn increment_refresh_token_version_zero_rows_for_version_conflict() {
 async fn update_password_and_rotate_updates_hash_and_rotates() {
     let (_g, pool) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
-    let affected = UserRepo::update_password_and_rotate(
-        &pool,
-        id,
-        0,
-        "new-hash",
-        now_naive(),
-        None,
-    )
-    .await
-    .expect("update");
+    let affected =
+        UserRepo::update_password_and_rotate(&pool, id, 0, "new-hash", now_naive(), None)
+            .await
+            .expect("update");
     assert_eq!(affected, 1);
 
     let raw = sqlx::query!(
@@ -690,7 +697,9 @@ async fn get_by_id_returns_role() {
 #[tokio::test]
 async fn get_by_id_returns_none_for_missing() {
     let (_g, pool) = setup().await;
-    let r = UserRoleRepo::get_by_id(&pool, 999_999_999_999).await.expect("query");
+    let r = UserRoleRepo::get_by_id(&pool, 999_999_999_999)
+        .await
+        .expect("query");
     assert!(r.is_none());
 }
 
@@ -917,7 +926,9 @@ async fn get_by_id_returns_shelf() {
 #[tokio::test]
 async fn shelf_get_by_id_returns_none_for_missing() {
     let (_g, pool) = setup().await;
-    let s = ShelfRepo::get_by_id(&pool, 999_999_999_999).await.expect("query");
+    let s = ShelfRepo::get_by_id(&pool, 999_999_999_999)
+        .await
+        .expect("query");
     assert!(s.is_none());
 }
 
@@ -968,7 +979,10 @@ async fn create_user_then_add_role_then_list_persists_all() {
     uow.commit().await.expect("commit");
 
     // 用独立 SQL 查应可见
-    let u = UserRepo::get_by_id(&pool, uid).await.expect("query").expect("hit");
+    let u = UserRepo::get_by_id(&pool, uid)
+        .await
+        .expect("query")
+        .expect("hit");
     assert_eq!(u.username, "atomic-user");
     let rows = UserRoleRepo::list_by_user(&pool, uid).await.expect("list");
     assert_eq!(rows.len(), 1);
@@ -996,7 +1010,11 @@ async fn soft_delete_user_then_list_roles_returns_empty() {
 
     // 软删后再 list_by_user —— 角色还在（list_by_user 不 JOIN t_user），但 user 不可见
     let rows = UserRoleRepo::list_by_user(&pool, uid).await.expect("list");
-    assert_eq!(rows.len(), 1, "list_by_user 只看 t_user_role.deleted_at，与 user 软删无关");
+    assert_eq!(
+        rows.len(),
+        1,
+        "list_by_user 只看 t_user_role.deleted_at，与 user 软删无关"
+    );
     let u = UserRepo::get_by_id(&pool, uid).await.expect("query");
     assert!(u.is_none(), "user 已软删");
 }
@@ -1119,7 +1137,10 @@ async fn update_partial_changes_is_active() {
     .await
     .expect("update");
     assert_eq!(affected, 1);
-    let u = UserRepo::get_by_id(&pool, id).await.expect("query").expect("hit");
+    let u = UserRepo::get_by_id(&pool, id)
+        .await
+        .expect("query")
+        .expect("hit");
     assert!(!u.is_active);
 }
 

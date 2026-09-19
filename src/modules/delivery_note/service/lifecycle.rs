@@ -12,9 +12,9 @@ use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;
 use crate::modules::part_batch::repo::PartBatchRepo;
-use crate::modules::worker::repo::WorkerRepo;
 use crate::modules::work_type::repo::WorkTypeRepo;
-use crate::shared::error::{code, AppError};
+use crate::modules::worker::repo::WorkerRepo;
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
     AvailableBatchDto, BatchStatusDto, DeliveryNoteCandidatePart, DeliveryNoteEventOut,
@@ -22,7 +22,9 @@ use super::super::dto::{
 };
 use super::super::model::DeliveryNoteEventType;
 use super::super::repo::{DeliveryNoteEventRepo, DeliveryNoteRepo};
-use super::inner::{build_note_outs, note_not_found, note_version_conflict, scope_from_note, write_event};
+use super::inner::{
+    build_note_outs, note_not_found, note_version_conflict, scope_from_note, write_event,
+};
 
 use super::DeliveryNoteService;
 
@@ -205,9 +207,13 @@ impl DeliveryNoteService {
 
         // 同范围 DRAFT 撞唯一（设计 §3.3 / 21419）：如果存在另一张同范围的活跃 DRAFT 则拒
         let scope = scope_from_note(&obj);
-        if let Some(_other) =
-            DeliveryNoteRepo::find_open_draft_by_scope(&mut *conn, obj.customer_id, scope, Some(note_id))
-                .await?
+        if let Some(_other) = DeliveryNoteRepo::find_open_draft_by_scope(
+            &mut *conn,
+            obj.customer_id,
+            scope,
+            Some(note_id),
+        )
+        .await?
         {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT,
@@ -272,7 +278,11 @@ impl DeliveryNoteService {
 
         let part = PartRepo::get_by_serial(&mut *conn, part_serial, false).await?;
         let note_batches = PartBatchRepo::list_by_delivery_note(&mut *conn, note_id).await?;
-        if part.is_none() || !note_batches.iter().any(|b| Some(b.part_id) == part.as_ref().map(|p| p.id)) {
+        if part.is_none()
+            || !note_batches
+                .iter()
+                .any(|b| Some(b.part_id) == part.as_ref().map(|p| p.id))
+        {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_SCAN_MISMATCH,
                 format!("serial {part_serial:?} is not in this delivery note"),
@@ -318,10 +328,12 @@ impl DeliveryNoteService {
         // 司机校验
         let driver = WorkerRepo::get_by_id(&mut *conn, driver_worker_id, false)
             .await?
-            .ok_or_else(|| AppError::biz(
-                code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
-                format!("driver worker {driver_worker_id} not found or inactive"),
-            ))?;
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
+                    format!("driver worker {driver_worker_id} not found or inactive"),
+                )
+            })?;
         if !driver.is_active {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
@@ -331,17 +343,16 @@ impl DeliveryNoteService {
         if let Some(wt_id) = driver.work_type_id {
             let wt = WorkTypeRepo::get_by_id(&mut *conn, wt_id)
                 .await?
-                .ok_or_else(|| AppError::biz(
-                    code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
-                    "driver work_type not found",
-                ))?;
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
+                        "driver work_type not found",
+                    )
+                })?;
             if wt.code != WORK_TYPE_DRIVER_CODE {
                 return Err(AppError::biz(
                     code::BIZ_DELIVERY_NOTE_DRIVER_INVALID,
-                    format!(
-                        "driver work_type {} != {WORK_TYPE_DRIVER_CODE:?}",
-                        wt.code
-                    ),
+                    format!("driver work_type {} != {WORK_TYPE_DRIVER_CODE:?}", wt.code),
                 ));
             }
         } else {
@@ -385,7 +396,7 @@ impl DeliveryNoteService {
             let affected = PartBatchRepo::update(
                 &mut *conn,
                 b.id,
-                b.version - 1, // expected_version 是之前的
+                b.version - 1,      // expected_version 是之前的
                 b.delivery_note_id, // 保留 delivery_note_id（PICKED_UP/ARCHIVED 后仍可打印）
                 Some("DELIVERED"),
                 now,
@@ -486,9 +497,14 @@ impl DeliveryNoteService {
         .execute(&mut *conn)
         .await?;
 
-        let affected =
-            DeliveryNoteRepo::soft_delete(&mut *conn, note_id, obj.version, now_naive(), Some(current.id))
-                .await?;
+        let affected = DeliveryNoteRepo::soft_delete(
+            &mut *conn,
+            note_id,
+            obj.version,
+            now_naive(),
+            Some(current.id),
+        )
+        .await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,

@@ -149,7 +149,9 @@ pub struct AssemblyChildRequest {
     pub quantity: Option<i32>,
 }
 
-fn default_child_qty() -> Option<i32> { Some(1) }
+fn default_child_qty() -> Option<i32> {
+    Some(1)
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssemblyCreateRequest {
@@ -180,7 +182,9 @@ pub struct AssemblyCreateRequest {
     pub children: Vec<AssemblyChildRequest>,
 }
 
-fn default_qty() -> Option<i32> { Some(1) }
+fn default_qty() -> Option<i32> {
+    Some(1)
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AssemblyUpdateRequest {
@@ -219,12 +223,18 @@ pub struct AssemblyUpdateRequest {
 }
 
 use serde::Deserializer;
-fn deserialize_optional_optional_str<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
+fn deserialize_optional_optional_str<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<String>>, D::Error> {
     Ok(Some(Option::<String>::deserialize(d)?))
 }
-fn deserialize_optional_optional_date<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<NaiveDate>>, D::Error> {
+fn deserialize_optional_optional_date<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<NaiveDate>>, D::Error> {
     Ok(Some(Option::<NaiveDate>::deserialize(d)?))
 }
-fn deserialize_optional_optional_decimal<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<Decimal>>, D::Error> {
+fn deserialize_optional_optional_decimal<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<Decimal>>, D::Error> {
     Ok(Some(Option::<Decimal>::deserialize(d)?))
 }

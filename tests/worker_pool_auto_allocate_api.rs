@@ -22,9 +22,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -112,7 +112,9 @@ async fn insert_work_type(
     max_held_minutes: Option<i32>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -139,7 +141,9 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -160,10 +164,17 @@ async fn insert_worker(
 
 async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
-    let one_char: String = prefix.chars().next().unwrap_or('X').to_ascii_uppercase().to_string();
+    let one_char: String = prefix
+        .chars()
+        .next()
+        .unwrap_or('X')
+        .to_ascii_uppercase()
+        .to_string();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) \
@@ -190,11 +201,17 @@ async fn insert_pool_part(
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     let today = now.date();
-    let part_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    let part_id = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
     // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
     // 且 batch 持有 current_process_step_id（worker.match 走 step.process_id）。
     // helper 现在多走两步：建链 → 建 step → INSERT part/batch。
-    let chain_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    let chain_id = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
     sqlx::query!(
         "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, 0, $3, 0, $3, 0)",
@@ -205,7 +222,10 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert chain");
-    let step_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    let step_id = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
     sqlx::query!(
         "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
          estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
@@ -237,7 +257,10 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert t_part");
-    let batch_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    let batch_id = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
     // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
     // 改为 `current_process_step_id`。worker_pool 候选池匹配改为
     // `s.process_id = ANY(worker.process_ids)`（JOIN t_process_chain_step）。
@@ -422,8 +445,15 @@ async fn auto_allocate_time_mode_minutes_not_set() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "max_held_minutes NULL 应 400: {env}");
-    assert_eq!(env["code"], 20703, "BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET: {env}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "max_held_minutes NULL 应 400: {env}"
+    );
+    assert_eq!(
+        env["code"], 20703,
+        "BIZ_WORK_TYPE_MAX_HELD_MINUTES_NOT_SET: {env}"
+    );
 }
 
 /// 场景 5: fill_ratio > 1.0 → 20704

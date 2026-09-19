@@ -134,9 +134,8 @@ impl ProcessRepo {
         code_like: Option<&str>,
         category: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
-        let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-            "SELECT COUNT(*)::bigint FROM t_process WHERE deleted_at IS NULL",
-        );
+        let mut qb: QueryBuilder<sqlx::Postgres> =
+            QueryBuilder::new("SELECT COUNT(*)::bigint FROM t_process WHERE deleted_at IS NULL");
         if let Some(cat) = category {
             let trimmed = cat.trim();
             if !trimmed.is_empty() {

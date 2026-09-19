@@ -21,11 +21,11 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::work_type::repo::WorkTypeRepo;
 use crate::modules::worker::dto::*;
 use crate::modules::worker::model::TWorker;
 use crate::modules::worker::repo::WorkerRepo;
-use crate::modules::work_type::repo::WorkTypeRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
@@ -66,7 +66,9 @@ fn to_worker_out(w: TWorker, work_type_name: Option<String>) -> WorkerOut {
 
 /// 把 `Some("")` / `Some("   ")` 视作 None；保留 trim 后的非空 owned String。
 fn normalize_optional_str(s: Option<&str>) -> Option<String> {
-    s.map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
+    s.map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 /// 校验 `work_type_id` 字符串并解析为 i64，校验工种是否存在。
@@ -138,8 +140,7 @@ impl WorkerService {
         let items =
             WorkerRepo::list_with_filters(&mut *conn, name_like, query.is_active, limit, offset)
                 .await?;
-        let total =
-            WorkerRepo::count_with_filters(&mut *conn, name_like, query.is_active).await?;
+        let total = WorkerRepo::count_with_filters(&mut *conn, name_like, query.is_active).await?;
 
         // work_type_name 一次性批量补全（防 N+1）
         let wt_ids: Vec<i64> = items.iter().filter_map(|w| w.work_type_id).collect();
@@ -197,7 +198,10 @@ impl WorkerService {
 
         let badge_code = req.badge_code.trim();
         if badge_code.is_empty() {
-            return Err(AppError::biz(code::BIZ_INVALID_VALUE, "badge_code 不能为空"));
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                "badge_code 不能为空",
+            ));
         }
         let name = req.name.trim();
         if name.is_empty() {
@@ -217,8 +221,7 @@ impl WorkerService {
 
         let id_card_no_owned = normalize_optional_str(req.id_card_no.as_deref());
         let phone_owned = normalize_optional_str(req.phone.as_deref());
-        let work_type_id =
-            resolve_work_type_id(&mut *conn, req.work_type_id.as_deref()).await?;
+        let work_type_id = resolve_work_type_id(&mut *conn, req.work_type_id.as_deref()).await?;
 
         let id = snowflake.next_id();
         let w = WorkerRepo::create(
@@ -232,14 +235,16 @@ impl WorkerService {
             user.id,
         )
         .await
-        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-            // uk_t_worker_badge_code（23505）或 uk_t_worker_id_card_no（23505）
-            // 统一映射到 40901（与 Python / brief 决策一致）。
-            Some("23505") => {
-                AppError::biz(code::VERSION_CONFLICT, "badge_code 或 id_card_no 已存在")
-            }
-            _ => AppError::from(e),
-        })?;
+        .map_err(
+            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                // uk_t_worker_badge_code（23505）或 uk_t_worker_id_card_no（23505）
+                // 统一映射到 40901（与 Python / brief 决策一致）。
+                Some("23505") => {
+                    AppError::biz(code::VERSION_CONFLICT, "badge_code 或 id_card_no 已存在")
+                }
+                _ => AppError::from(e),
+            },
+        )?;
 
         // 回读时再补 work_type_name（与 list 一致）
         let work_type_name = match w.work_type_id {
@@ -345,12 +350,14 @@ impl WorkerService {
             user.id,
         )
         .await
-        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-            Some("23505") => {
-                AppError::biz(code::VERSION_CONFLICT, "badge_code 或 id_card_no 已存在")
-            }
-            _ => AppError::from(e),
-        })?;
+        .map_err(
+            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                Some("23505") => {
+                    AppError::biz(code::VERSION_CONFLICT, "badge_code 或 id_card_no 已存在")
+                }
+                _ => AppError::from(e),
+            },
+        )?;
         if affected == 0 {
             return Err(version_conflict());
         }

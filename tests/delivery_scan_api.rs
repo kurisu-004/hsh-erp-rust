@@ -29,9 +29,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -58,7 +58,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -111,7 +116,10 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, NULL, $3, 0, $4, NULL, $4, NULL)",
-        id, name, prefix, now,
+        id,
+        name,
+        prefix,
+        now,
     )
     .execute(pool)
     .await
@@ -128,7 +136,10 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
-        id, name, l1_id, now,
+        id,
+        name,
+        l1_id,
+        now,
     )
     .execute(pool)
     .await
@@ -156,7 +167,13 @@ async fn insert_part(
          quantity, version, created_at, created_by, updated_at, updated_by, \
          assembly_id) \
          VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $6, $6, 1, 0, $5, NULL, $5, NULL, $7)",
-        id, serial_no, name, customer_id, now, today, assembly_id,
+        id,
+        serial_no,
+        name,
+        customer_id,
+        now,
+        today,
+        assembly_id,
     )
     .execute(pool)
     .await
@@ -175,7 +192,12 @@ async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, stat
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
          version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, $6, NULL)",
-        id, part_id, batch_no, qty, status, now,
+        id,
+        part_id,
+        batch_no,
+        qty,
+        status,
+        now,
     )
     .execute(pool)
     .await
@@ -253,7 +275,13 @@ async fn insert_assembly(
          request_date, planned_delivery_date, status, serial_no, quantity, \
          unit_price, total_price, version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, '', $4, $5, $5, 'ACTIVE', $6, 1, 0, 0, 0, $7, NULL, $7, NULL)",
-        id, drawing_no, name, customer_id, today, serial_no, now,
+        id,
+        drawing_no,
+        name,
+        customer_id,
+        today,
+        serial_no,
+        now,
     )
     .execute(pool)
     .await
@@ -270,7 +298,10 @@ async fn insert_group(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
         "INSERT INTO t_delivery_group (id, customer_id, name, version, created_at, \
          created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, 0, $4, NULL, $4, NULL)",
-        id, l1_id, name, now,
+        id,
+        l1_id,
+        name,
+        now,
     )
     .execute(pool)
     .await
@@ -286,7 +317,10 @@ async fn insert_group_member(pool: &PgPool, group_id: i64, l2_id: i64) -> i64 {
     sqlx::query!(
         "INSERT INTO t_delivery_group_member (id, group_id, customer_id, created_at, created_by) \
          VALUES ($1, $2, $3, $4, NULL)",
-        id, group_id, l2_id, now,
+        id,
+        group_id,
+        l2_id,
+        now,
     )
     .execute(pool)
     .await
@@ -493,14 +527,7 @@ async fn scan_part_in_process_on_production_shelf_returns_candidates() {
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("PE0002"), None).await;
-    let bid = create_test_batch(
-        &pool,
-        pid,
-        "IN_PROCESS",
-        Some(88),
-        Some("PRODUCTION_SHELF"),
-    )
-    .await;
+    let bid = create_test_batch(&pool, pid, "IN_PROCESS", Some(88), Some("PRODUCTION_SHELF")).await;
 
     let (app, token, pool) = login_manager(pool, "admin").await;
     let (s, env) = send(
@@ -520,8 +547,7 @@ async fn scan_part_in_process_on_production_shelf_returns_candidates() {
     );
     assert_eq!(env["code"], 0);
     assert_eq!(
-        env["data"]["outcome"],
-        "CANDIDATES_AVAILABLE",
+        env["data"]["outcome"], "CANDIDATES_AVAILABLE",
         "B 组应返回 CANDIDATES_AVAILABLE"
     );
     assert_eq!(
@@ -539,7 +565,9 @@ async fn scan_part_in_process_on_production_shelf_returns_candidates() {
     assert_eq!(target_pid, pid);
     assert_eq!(target["serial_no"], "PE0002");
 
-    let avail = target["available_batches"].as_array().expect("available_batches");
+    let avail = target["available_batches"]
+        .as_array()
+        .expect("available_batches");
     assert_eq!(avail.len(), 1);
     assert_eq!(
         avail[0]["batch_id"].as_str().unwrap(),
@@ -603,7 +631,10 @@ async fn scan_part_on_other_active_note_returns_409_21406() {
     .await;
     assert_eq!(cs, StatusCode::OK, "create draft: {cenv}");
     let other_id = cenv["data"]["id"].as_str().unwrap().to_string();
-    let other_no = cenv["data"]["delivery_note_no"].as_str().unwrap().to_string();
+    let other_no = cenv["data"]["delivery_note_no"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let (sub, _) = send(
         app.clone(),
@@ -649,7 +680,14 @@ async fn scan_assembly_full_all_subparts_ready_added() {
     let asm_id = insert_assembly(&pool, l2, "L1067", "ASM-067", "总成067").await;
     let mut sub_pids: Vec<i64> = Vec::new();
     for i in 0..3 {
-        let p = insert_part(&pool, &format!("Sub{i}"), l2, Some(&format!("S{i:04}")), Some(asm_id)).await;
+        let p = insert_part(
+            &pool,
+            &format!("Sub{i}"),
+            l2,
+            Some(&format!("S{i:04}")),
+            Some(asm_id),
+        )
+        .await;
         let _ = insert_batch(&pool, p, 1, 2, "READY_TO_SHIP").await;
         sub_pids.push(p);
     }
@@ -669,7 +707,10 @@ async fn scan_assembly_full_all_subparts_ready_added() {
     assert_eq!(s, StatusCode::OK, "scan assembly: {env}");
     assert_eq!(env["data"]["outcome"], "ADDED");
     assert_eq!(env["data"]["resolved"]["kind"], "ASSEMBLY");
-    assert_eq!(env["data"]["resolved"]["id"].as_str().unwrap(), asm_id.to_string());
+    assert_eq!(
+        env["data"]["resolved"]["id"].as_str().unwrap(),
+        asm_id.to_string()
+    );
     // ResolvedEntityDto 不再有 child_count 字段（Task 3 DTO 精简移除）
     assert!(
         env["data"]["resolved"].get("child_count").is_none(),
@@ -744,10 +785,7 @@ async fn scan_assembly_atomic_reject_with_failures() {
         "worker-held IN_PROCESS 触发 classify_invalid_state → 21421；got: {env}"
     );
     let msg = env["message"].as_str().unwrap_or("");
-    assert!(
-        msg.contains("IN_PROCESS"),
-        "message 应含 IN_PROCESS：{msg}"
-    );
+    assert!(msg.contains("IN_PROCESS"), "message 应含 IN_PROCESS：{msg}");
 
     // 整单回滚：no batch attached（包含 A 组的 Z0000/Z0002 也未挂单）
     let count: i64 = sqlx::query_scalar!(
@@ -785,8 +823,14 @@ async fn scan_assembly_rescan_idempotent_already_present() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let asm_id = insert_assembly(&pool, l2, "L3055", "ASM-055", "总成055").await;
     for i in 0..2 {
-        let p = insert_part(&pool, &format!("Sub{i}"), l2, Some(&format!("Y{i:04}")), Some(asm_id))
-            .await;
+        let p = insert_part(
+            &pool,
+            &format!("Sub{i}"),
+            l2,
+            Some(&format!("Y{i:04}")),
+            Some(asm_id),
+        )
+        .await;
         let _ = insert_batch(&pool, p, 1, 1, "READY_TO_SHIP").await;
     }
 
@@ -1030,10 +1074,7 @@ async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
     assert_eq!(env["data"]["outcome"], "ADDED");
     // 全部 10 个批次挂上了（line_count 与 added_batches 都应是 10）
     assert_eq!(env["data"]["note"]["line_count"], 10);
-    assert_eq!(
-        env["data"]["added_batches"].as_array().unwrap().len(),
-        10
-    );
+    assert_eq!(env["data"]["added_batches"].as_array().unwrap().len(), 10);
 
     // ===== 断言 recent_items 形状 + 长度 =====
     let recent = env["data"]["note"]["recent_items"]
@@ -1068,10 +1109,7 @@ async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
             .as_str()
             .unwrap_or_else(|| panic!("recent[{idx}].part_id 应该是字符串"));
         let parsed_pid: i64 = pid_str.parse().expect("part_id 可解析为 i64");
-        assert_eq!(
-            parsed_pid, pid,
-            "recent[{idx}].part_id 应等于该 part 的 id"
-        );
+        assert_eq!(parsed_pid, pid, "recent[{idx}].part_id 应等于该 part 的 id");
 
         // serial_no / drawing_no / name：字符串（serial_no 可 null —— t_part.serial_no 是 nullable）
         assert!(
@@ -1087,10 +1125,7 @@ async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
             item["drawing_no"].is_string(),
             "recent[{idx}].drawing_no 应为 string"
         );
-        assert!(
-            item["name"].is_string(),
-            "recent[{idx}].name 应为 string"
-        );
+        assert!(item["name"].is_string(), "recent[{idx}].name 应为 string");
 
         // order_no：JSON null 或 string 都接受（DB 列 nullable）
         let on = &item["order_no"];
@@ -1221,10 +1256,7 @@ async fn scan_standalone_part_with_inspection_batch_returns_added() {
     .await;
     assert_eq!(s, StatusCode::OK, "scan INSPECTION: {env}");
     assert_eq!(env["data"]["outcome"], "ADDED");
-    assert_eq!(
-        env["data"]["added_batches"].as_array().unwrap().len(),
-        1
-    );
+    assert_eq!(env["data"]["added_batches"].as_array().unwrap().len(), 1);
     let added = &env["data"]["added_batches"][0];
     assert!(
         added.get("status").is_none(),
@@ -1272,7 +1304,9 @@ async fn scan_standalone_part_with_only_pending_returns_candidates() {
     assert_eq!(target_pid, pid);
     assert_eq!(target["serial_no"], "PE0001");
 
-    let avail = target["available_batches"].as_array().expect("available_batches");
+    let avail = target["available_batches"]
+        .as_array()
+        .expect("available_batches");
     assert_eq!(avail.len(), 1);
     assert_eq!(
         avail[0]["batch_id"].as_str().unwrap(),
@@ -1349,17 +1383,10 @@ async fn scan_assembly_with_all_ready_returns_added() {
     assert_eq!(added.len(), 3, "全 A 组 → 全部 3 个子件批次挂单");
     assert_eq!(env["data"]["note"]["line_count"], 3);
     // unresolved_targets 应为 null（Added 路径不构建 B 组列表）
-    assert_eq!(
-        env["data"]["unresolved_targets"],
-        serde_json::Value::Null
-    );
+    assert_eq!(env["data"]["unresolved_targets"], serde_json::Value::Null);
 
     // DB 层断言：3 个子件批次都已挂到该草稿的 delivery_note_id
-    let dn_id_i64: i64 = env["data"]["note"]["id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let dn_id_i64: i64 = env["data"]["note"]["id"].as_str().unwrap().parse().unwrap();
     let attached: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM t_part_batch \
          WHERE part_id = ANY($1) AND delivery_note_id = $2",
@@ -1455,8 +1482,7 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
     );
 
     // 按 part_id 分类断言
-    let mut by_pid: std::collections::HashMap<i64, &Value> =
-        std::collections::HashMap::new();
+    let mut by_pid: std::collections::HashMap<i64, &Value> = std::collections::HashMap::new();
     for t in unresolved {
         let pid: i64 = t["part_id"].as_str().unwrap().parse().unwrap();
         by_pid.insert(pid, t);
@@ -1479,9 +1505,7 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
     }
 
     // B 子件：attachable 空，available_batches 含 B
-    let b_target = by_pid
-        .get(&b_pid)
-        .expect("B 子件应在 unresolved_targets");
+    let b_target = by_pid.get(&b_pid).expect("B 子件应在 unresolved_targets");
     assert_eq!(b_target["serial_no"], "SP0002");
     let b_att = b_target["attachable_batches"]
         .as_array()
@@ -1491,10 +1515,7 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
         .as_array()
         .expect("available_batches 字段必须存在");
     assert_eq!(b_avail.len(), 1);
-    assert_eq!(
-        b_avail[0]["batch_id"].as_str().unwrap(),
-        b_bid.to_string()
-    );
+    assert_eq!(b_avail[0]["batch_id"].as_str().unwrap(), b_bid.to_string());
     assert_eq!(b_avail[0]["status"], "PENDING");
     assert!(
         b_avail[0]["version"].is_i64(),
@@ -1512,11 +1533,7 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
     assert!(b_dn_id.is_none(), "B 组批次不应挂单");
 
     // A 组 2 个批次也都未挂本单（PARTIAL_ADDED 不写）
-    let dn_id_i64: i64 = env["data"]["note"]["id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
+    let dn_id_i64: i64 = env["data"]["note"]["id"].as_str().unwrap().parse().unwrap();
     let a_attached: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM t_part_batch \
          WHERE part_id = ANY($1) AND delivery_note_id = $2",
@@ -1613,10 +1630,7 @@ async fn scan_twice_same_code_is_idempotent() {
     assert_eq!(s1, StatusCode::OK, "first scan: {env1}");
     assert_eq!(env1["data"]["outcome"], "ADDED");
     assert_eq!(env1["data"]["added_batches"].as_array().unwrap().len(), 1);
-    let note_id_first = env1["data"]["note"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let note_id_first = env1["data"]["note"]["id"].as_str().unwrap().to_string();
     assert_eq!(env1["data"]["note"]["line_count"], 1);
 
     // 第二次 → ALREADY_PRESENT（幂等）
@@ -1642,10 +1656,7 @@ async fn scan_twice_same_code_is_idempotent() {
         serde_json::Value::Null,
         "ALREADY_PRESENT 场景无 unresolved_targets"
     );
-    let note_id_second = env2["data"]["note"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let note_id_second = env2["data"]["note"]["id"].as_str().unwrap().to_string();
     assert_eq!(
         note_id_first, note_id_second,
         "ALREADY_PRESENT 应回到同一草稿"
@@ -1759,8 +1770,7 @@ async fn scan_standalone_a_plus_b_returns_candidates_with_attachable_and_availab
     assert_eq!(s, StatusCode::OK, "A+B 散件: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(
-        env["data"]["outcome"],
-        "CANDIDATES_AVAILABLE",
+        env["data"]["outcome"], "CANDIDATES_AVAILABLE",
         "A+B 混合必须走 CANDIDATES_AVAILABLE；当前实现若直接 ADDED 则是回归"
     );
 
@@ -1864,8 +1874,7 @@ async fn scan_standalone_a_plus_c_returns_candidates_with_only_attachable() {
         "非全 C 不应触发 21421；当前实现已静默过滤 C：{env}"
     );
     assert_eq!(
-        env["data"]["outcome"],
-        "CANDIDATES_AVAILABLE",
+        env["data"]["outcome"], "CANDIDATES_AVAILABLE",
         "含 C 的原批次集合必须走 CANDIDATES_AVAILABLE（不走 auto-attach）；\
          若当前实现是 ADDED 则是任务约定的偏差，需要 backend 调整"
     );
@@ -1914,10 +1923,7 @@ async fn scan_standalone_a_plus_c_returns_candidates_with_only_attachable() {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!(
-            dn_id.is_none(),
-            "batch {bid} 不应挂单；got dn_id={dn_id:?}"
-        );
+        assert!(dn_id.is_none(), "batch {bid} 不应挂单；got dn_id={dn_id:?}");
     }
 
     assert_eq!(env["data"]["note"]["status"], "DRAFT");
@@ -1952,10 +1958,7 @@ async fn scan_standalone_b_plus_c_returns_candidates_with_only_available() {
     assert_eq!(env["code"], 0);
     assert_eq!(env["data"]["outcome"], "CANDIDATES_AVAILABLE");
 
-    assert_eq!(
-        env["data"]["added_batches"].as_array().unwrap().len(),
-        0
-    );
+    assert_eq!(env["data"]["added_batches"].as_array().unwrap().len(), 0);
 
     let unresolved = env["data"]["unresolved_targets"]
         .as_array()
@@ -1966,11 +1969,7 @@ async fn scan_standalone_b_plus_c_returns_candidates_with_only_available() {
     let attachable = unresolved[0]["attachable_batches"]
         .as_array()
         .expect("attachable_batches 字段必须存在");
-    assert_eq!(
-        attachable.len(),
-        0,
-        "无 A 组 → attachable_batches 应为空"
-    );
+    assert_eq!(attachable.len(), 0, "无 A 组 → attachable_batches 应为空");
 
     // B 进 available_batches
     let available = unresolved[0]["available_batches"]
@@ -2013,26 +2012,12 @@ async fn scan_assembly_child_a_plus_b_returns_partial_added_with_attachable_per_
     let asm_id = insert_assembly(&pool, l2, "ASM-MAB", "ASM-MAB-DWG", "A+B双批子件").await;
 
     // 子件 1：[A,A]（READY_TO_SHIP 各 1 个）→ batch_no 不同
-    let child1_pid = insert_part(
-        &pool,
-        "ChildMAB-A",
-        l2,
-        Some("CMA0001"),
-        Some(asm_id),
-    )
-    .await;
+    let child1_pid = insert_part(&pool, "ChildMAB-A", l2, Some("CMA0001"), Some(asm_id)).await;
     let c1_a1 = create_test_batch_at(&pool, child1_pid, 1, "READY_TO_SHIP", None, None).await;
     let c1_a2 = create_test_batch_at(&pool, child1_pid, 2, "READY_TO_SHIP", None, None).await;
 
     // 子件 2：[B,B]（PENDING 各 1 个）→ batch_no 不同
-    let child2_pid = insert_part(
-        &pool,
-        "ChildMAB-B",
-        l2,
-        Some("CMB0001"),
-        Some(asm_id),
-    )
-    .await;
+    let child2_pid = insert_part(&pool, "ChildMAB-B", l2, Some("CMB0001"), Some(asm_id)).await;
     let c2_b1 = create_test_batch_at(&pool, child2_pid, 1, "PENDING", None, None).await;
     let c2_b2 = create_test_batch_at(&pool, child2_pid, 2, "PENDING", None, None).await;
 
@@ -2070,8 +2055,7 @@ async fn scan_assembly_child_a_plus_b_returns_partial_added_with_attachable_per_
     );
 
     // 按 part_id 排序后断言每个子件的 attachable / available
-    let mut by_pid: std::collections::HashMap<i64, &Value> =
-        std::collections::HashMap::new();
+    let mut by_pid: std::collections::HashMap<i64, &Value> = std::collections::HashMap::new();
     for t in unresolved {
         let pid: i64 = t["part_id"].as_str().unwrap().parse().unwrap();
         by_pid.insert(pid, t);
@@ -2168,8 +2152,7 @@ async fn scan_assembly_asymmetric_had_invalid_per_child_returns_partial_added() 
     let child_a = insert_part(&pool, "ChildAsym-A", l2, Some("CAA0001"), Some(asm_id)).await;
     let a1 = create_test_batch_at(&pool, child_a, 1, "INSPECTION", None, None).await;
     let a2 = create_test_batch_at(&pool, child_a, 2, "INSPECTION", None, None).await;
-    let c1 =
-        create_test_batch_at(&pool, child_a, 3, "IN_PROCESS", Some(99), Some("WORKER")).await;
+    let c1 = create_test_batch_at(&pool, child_a, 3, "IN_PROCESS", Some(99), Some("WORKER")).await;
 
     // 子件 b：纯 [A]
     let child_b = insert_part(&pool, "ChildAsym-B", l2, Some("CAB0001"), Some(asm_id)).await;
@@ -2189,8 +2172,7 @@ async fn scan_assembly_asymmetric_had_invalid_per_child_returns_partial_added() 
     assert_eq!(s, StatusCode::OK, "装配件 A+C(不对称) + A: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(
-        env["data"]["outcome"],
-        "PARTIAL_ADDED",
+        env["data"]["outcome"], "PARTIAL_ADDED",
         "装配+非纯A 或 任一子件含 C → PARTIAL_ADDED；got: {env}"
     );
     assert_eq!(env["data"]["resolved"]["kind"], "ASSEMBLY");
@@ -2213,8 +2195,7 @@ async fn scan_assembly_asymmetric_had_invalid_per_child_returns_partial_added() 
     );
 
     // 按 part_id 分类断言每个子件的 attachable / available
-    let mut by_pid: std::collections::HashMap<i64, &Value> =
-        std::collections::HashMap::new();
+    let mut by_pid: std::collections::HashMap<i64, &Value> = std::collections::HashMap::new();
     for t in unresolved {
         let pid: i64 = t["part_id"].as_str().unwrap().parse().unwrap();
         by_pid.insert(pid, t);
@@ -2267,12 +2248,11 @@ async fn scan_assembly_asymmetric_had_invalid_per_child_returns_partial_added() 
 
     // DB 校验：c1 状态保持 IN_PROCESS（C 在 had_invalid 路径不动 DB）；
     // a1/a2/a3 都不挂单（PARTIAL_ADDED 不写 attachment）
-    let c_status: String =
-        sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
-            .bind(c1)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let c_status: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(c1)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         c_status, "IN_PROCESS",
         "C 批次 c1 在 had_invalid 路径下状态不变"

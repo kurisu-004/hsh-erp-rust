@@ -31,7 +31,7 @@ use crate::modules::part::model::{NewPartEvent, TPart};
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part_batch::repo::PartBatchRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto_crud::{CancelRequest, CompleteRequest, DeliverRequest, StartRepairRequest};
 use super::PartService;
@@ -106,7 +106,8 @@ impl PartService {
             ));
         }
         // 5. UPDATE batch: READY_TO_SHIP → DELIVERED（OCC）。
-        let bn = PartRepo::mark_batch_delivered(&mut *conn, batch.id, batch.version, current.id).await?;
+        let bn =
+            PartRepo::mark_batch_delivered(&mut *conn, batch.id, batch.version, current.id).await?;
         if bn == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -137,9 +138,7 @@ impl PartService {
         .await?;
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
             .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, "deliver 后查不到")
-            })?;
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "deliver 后查不到"))?;
         Ok(PartOut::from(fresh))
     }
 
@@ -197,7 +196,8 @@ impl PartService {
                 ),
             ));
         }
-        let n = PartRepo::mark_part_cancelled(&mut *conn, part_id, part.version, current.id).await?;
+        let n =
+            PartRepo::mark_part_cancelled(&mut *conn, part_id, part.version, current.id).await?;
         if n == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -207,12 +207,8 @@ impl PartService {
         // PR-B2 §4.2 cancel 改造：级联取消**全部活跃批次**（不只「最近一条
         // source-status」），单条 UPDATE 即覆盖。无活跃批次 → 影响行数 0，
         // 视为合法（新建工单未拆批场景）。
-        let _batches_cancelled = PartRepo::cancel_all_active_batches_for_part(
-            &mut *conn,
-            part_id,
-            current.id,
-        )
-        .await?;
+        let _batches_cancelled =
+            PartRepo::cancel_all_active_batches_for_part(&mut *conn, part_id, current.id).await?;
         PartRepo::insert_part_event(
             &mut *conn,
             NewPartEvent {
@@ -233,9 +229,7 @@ impl PartService {
         // 重读走 TPartInspected（响应只需 PartOut 最小投影）。
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
             .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, "cancel 后查不到")
-            })?;
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "cancel 后查不到"))?;
         Ok(PartOut::from(fresh))
     }
 
@@ -301,7 +295,8 @@ impl PartService {
             ));
         }
         // 4. UPDATE batch: DELIVERED → COMPLETED（OCC）。
-        let bn = PartRepo::mark_batch_completed(&mut *conn, batch.id, batch.version, current.id).await?;
+        let bn =
+            PartRepo::mark_batch_completed(&mut *conn, batch.id, batch.version, current.id).await?;
         if bn == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -311,7 +306,8 @@ impl PartService {
         // 5. PR-B2 rollup：翻 batch → 物化 part 派生列 + 级联 assembly sync。
         let _ = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
         // 6. part 进入 COMPLETED 时清空 serial_no（序列号已转交送货单）。
-        let _ = PartRepo::clear_part_serial_no_when_completed(&mut *conn, part_id, current.id).await?;
+        let _ =
+            PartRepo::clear_part_serial_no_when_completed(&mut *conn, part_id, current.id).await?;
         // 7. 事件日志：batch_id + quantity 来自操作的批次。
         PartRepo::insert_part_event(
             &mut *conn,
@@ -332,9 +328,7 @@ impl PartService {
         .await?;
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
             .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, "complete 后查不到")
-            })?;
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "complete 后查不到"))?;
         Ok(PartOut::from(fresh))
     }
 
@@ -404,7 +398,8 @@ impl PartService {
         //    `has_been_repaired` 列，mark_batch_repairing 不再写该列；t_part
         //    同步删 `has_been_repaired` 列，mark_part_repairing_flag_only 整
         //    个函数删除。返修事实由下方 REPAIR_STARTED 事件日志追溯。
-        let bn = PartRepo::mark_batch_repairing(&mut *conn, batch.id, batch.version, current.id).await?;
+        let bn =
+            PartRepo::mark_batch_repairing(&mut *conn, batch.id, batch.version, current.id).await?;
         if bn == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -433,9 +428,7 @@ impl PartService {
         .await?;
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
             .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, "start-repair 后查不到")
-            })?;
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "start-repair 后查不到"))?;
         Ok(PartOut::from(fresh))
     }
 }

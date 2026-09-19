@@ -128,9 +128,7 @@ pub struct InspectionBatchListRow {
     pub l1_customer_name: Option<String>,
 }
 
-impl From<InspectionBatchListRow>
-    for crate::modules::part::dto::InspectionBatchListItemOut
-{
+impl From<InspectionBatchListRow> for crate::modules::part::dto::InspectionBatchListItemOut {
     fn from(r: InspectionBatchListRow) -> Self {
         Self {
             batch_id: r.batch_id,

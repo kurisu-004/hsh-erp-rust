@@ -335,7 +335,11 @@ async fn list_filter_by_kind() {
     .into_iter()
     .enumerate()
     {
-        let unique_prefix = format!("UNIQUE-PREFIX-{}-{}", i, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        let unique_prefix = format!(
+            "UNIQUE-PREFIX-{}-{}",
+            i,
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        );
         let body = format!("{}{}", unique_prefix, "x".repeat(1024)).into_bytes();
         let mut tx = pool.begin().await.unwrap();
         PartFileService::upload_file_for_owner(
@@ -364,7 +368,9 @@ async fn list_filter_by_kind() {
         offset: Some(0),
     };
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::list_files(&mut tx, &query, &current).await.unwrap();
+    let out = PartFileService::list_files(&mut tx, &query, &current)
+        .await
+        .unwrap();
     drop(tx);
     assert_eq!(out.items.len(), 1, "list_filter_by_kind 应仅返 DRAWING");
     assert!(out.items.iter().all(|i| i.kind == "DRAWING"));
@@ -565,9 +571,10 @@ async fn soft_delete_happy_path() {
 
     // delete by Manager（kind=DRAWING → M+C 通行）
     let mut tx = pool.begin().await.unwrap();
-    let object_key = PartFileService::soft_delete_file(&mut tx, cos.clone(), out.id, version, &current)
-        .await
-        .expect("delete ok");
+    let object_key =
+        PartFileService::soft_delete_file(&mut tx, cos.clone(), out.id, version, &current)
+            .await
+            .expect("delete ok");
     tx.commit().await.unwrap();
     // 2026-09-15 review A2：service 应返回 cos object_key 供 handler commit 后清理
     assert!(
@@ -577,9 +584,10 @@ async fn soft_delete_happy_path() {
 
     // 再次查应 not found（include_deleted=false）
     let mut tx = pool.begin().await.unwrap();
-    let row = hsh_erp_rust::modules::part_file::repo::PartFileRepo::get_by_id(&mut *tx, out.id, false)
-        .await
-        .unwrap();
+    let row =
+        hsh_erp_rust::modules::part_file::repo::PartFileRepo::get_by_id(&mut *tx, out.id, false)
+            .await
+            .unwrap();
     drop(tx);
     assert!(row.is_none(), "软删后应查不到");
 }

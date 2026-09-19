@@ -20,7 +20,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::dto::*;
 use crate::modules::com::customer::model::TCustomer;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
@@ -109,8 +109,7 @@ impl CustomerService {
         )
         .await?;
         let total =
-            CustomerRepo::count_with_filters(&mut *conn, name_like, parent_id_i64, is_root)
-                .await?;
+            CustomerRepo::count_with_filters(&mut *conn, name_like, parent_id_i64, is_root).await?;
 
         // 父客户名补全（防 N+1：一次 list_by_ids 拿齐）
         let parent_ids: Vec<i64> = items.iter().filter_map(|c| c.parent_id).collect();
@@ -121,9 +120,7 @@ impl CustomerService {
         let out_items = items
             .into_iter()
             .map(|c| {
-                let parent_name = c
-                    .parent_id
-                    .and_then(|pid| parent_map.get(&pid).cloned());
+                let parent_name = c.parent_id.and_then(|pid| parent_map.get(&pid).cloned());
                 to_customer_out(c, parent_name)
             })
             .collect();
@@ -215,13 +212,13 @@ impl CustomerService {
             user.id,
         )
         .await
-        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-            // uk_t_customer_root_prefix：同 L1 不可重 prefix
-            Some("23505") => {
-                AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 已存在")
-            }
-            _ => AppError::from(e),
-        })?;
+        .map_err(
+            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                // uk_t_customer_root_prefix：同 L1 不可重 prefix
+                Some("23505") => AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 已存在"),
+                _ => AppError::from(e),
+            },
+        )?;
 
         Ok(to_customer_out(c, None))
     }
@@ -298,13 +295,13 @@ impl CustomerService {
             user.id,
         )
         .await
-        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-            // uq_t_customer_root_prefix：把 L1 的 prefix 改成另一个 L1 已占用的值
-            Some("23505") => {
-                AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 已存在")
-            }
-            _ => AppError::from(e),
-        })?;
+        .map_err(
+            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                // uq_t_customer_root_prefix：把 L1 的 prefix 改成另一个 L1 已占用的值
+                Some("23505") => AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 已存在"),
+                _ => AppError::from(e),
+            },
+        )?;
         if affected == 0 {
             return Err(version_conflict());
         }
@@ -340,9 +337,7 @@ impl CustomerService {
         if part_count > 0 || assembly_count > 0 {
             return Err(AppError::biz(
                 code::BIZ_CUSTOMER_IN_USE,
-                format!(
-                    "客户仍被引用（part={part_count}, assembly={assembly_count}），无法软删"
-                ),
+                format!("客户仍被引用（part={part_count}, assembly={assembly_count}），无法软删"),
             ));
         }
 

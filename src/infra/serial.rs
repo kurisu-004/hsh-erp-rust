@@ -18,7 +18,7 @@ use chrono::{Duration, NaiveDate};
 use sqlx::{PgExecutor, PgPool};
 
 use crate::infra::clock::now_naive;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 /// 客户级序列号格式常量（与 Python `core/serial.py::SERIAL_MIN/MAX/POOL_SIZE` 对齐）。
 const SERIAL_MIN: i64 = 1000;
@@ -169,7 +169,10 @@ fn normalize_prefix(prefix: &str) -> Result<String, AppError> {
     if prefix.len() != 1 {
         return Err(AppError::biz(
             code::BIZ_INVALID_VALUE,
-            format!("prefix 必须是单字符，当前 {prefix:?}（长度={}）", prefix.len()),
+            format!(
+                "prefix 必须是单字符，当前 {prefix:?}（长度={}）",
+                prefix.len()
+            ),
         ));
     }
     let upper = prefix.to_ascii_uppercase();
@@ -276,11 +279,7 @@ mod tests {
     fn customer_serial_format_pads_to_four_digits() {
         let s = format!("{:0width$}", SERIAL_MIN, width = SERIAL_FORMAT_WIDTH);
         assert_eq!(s, "1000");
-        let s = format!(
-            "F{:0width$}",
-            SERIAL_MAX,
-            width = SERIAL_FORMAT_WIDTH
-        );
+        let s = format!("F{:0width$}", SERIAL_MAX, width = SERIAL_FORMAT_WIDTH);
         assert_eq!(s, "F9999");
     }
 }

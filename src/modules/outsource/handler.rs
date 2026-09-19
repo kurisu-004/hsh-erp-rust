@@ -129,8 +129,9 @@ pub async fn set_company_processes(
     Json(req): Json<SetOutsourceCompanyProcessRequest>,
 ) -> Result<Json<R<OutsourceCompanyWithProcessesOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = OutsourceService::set_company_processes(&mut tx, &state.snowflake, id, &req, &current)
-        .await?;
+    let out =
+        OutsourceService::set_company_processes(&mut tx, &state.snowflake, id, &req, &current)
+            .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -208,8 +209,15 @@ pub async fn approve_quote(
     Json(req): Json<OutsourceQuoteApproveRequest>,
 ) -> Result<Json<R<OutsourceQuoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = OutsourceService::approve_quote(&mut tx, &state.snowflake, id, req.review_note.as_deref(), req.version, &current)
-        .await?;
+    let out = OutsourceService::approve_quote(
+        &mut tx,
+        &state.snowflake,
+        id,
+        req.review_note.as_deref(),
+        req.version,
+        &current,
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -222,8 +230,15 @@ pub async fn reject_quote(
     Json(req): Json<OutsourceQuoteRejectRequest>,
 ) -> Result<Json<R<OutsourceQuoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = OutsourceService::reject_quote(&mut tx, &state.snowflake, id, &req.review_note, req.version, &current)
-        .await?;
+    let out = OutsourceService::reject_quote(
+        &mut tx,
+        &state.snowflake,
+        id,
+        &req.review_note,
+        req.version,
+        &current,
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -265,10 +280,7 @@ pub async fn reconcile_update_shipment(
 pub fn company_router() -> Router<Arc<AppState>> {
     Router::new()
         // 静态段必须在 `/{id}` catch-all 之前
-        .route(
-            "/by-process/{process_id}",
-            get(list_companies_by_process),
-        )
+        .route("/by-process/{process_id}", get(list_companies_by_process))
         .route("/", get(list_companies).post(create_company))
         .route("/{id}/update", post(update_company))
         .route("/{id}/soft-delete", post(soft_delete_company))
@@ -290,6 +302,5 @@ pub fn quote_router() -> Router<Arc<AppState>> {
 
 /// Shipment 路由（挂载点 `/outsource-shipments`）
 pub fn shipment_router() -> Router<Arc<AppState>> {
-    Router::new()
-        .route("/{id}/reconcile-update", post(reconcile_update_shipment))
+    Router::new().route("/{id}/reconcile-update", post(reconcile_update_shipment))
 }

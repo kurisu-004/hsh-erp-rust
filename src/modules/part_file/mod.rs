@@ -16,9 +16,9 @@ pub mod policy;
 pub mod repo;
 pub mod service;
 
-use std::sync::Arc;
-use axum::Router;
 use crate::state::AppState;
+use axum::Router;
+use std::sync::Arc;
 
 pub fn router() -> Router<Arc<AppState>> {
     handler::router()

@@ -4,8 +4,8 @@
 
 use std::time::Duration;
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 
 use crate::infra::config::AppConfig;
 

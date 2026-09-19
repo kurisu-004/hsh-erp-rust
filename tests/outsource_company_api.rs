@@ -12,9 +12,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -38,14 +38,17 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
         .expect("read body");
     let body_str = String::from_utf8_lossy(&body).to_string();
     let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!(
-            "parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}"
-        )
+        panic!("parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}")
     });
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -92,10 +95,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
 /// 插一个 OUTSOURCE 类别 process（不走 common::seed_process）
 async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -173,7 +173,7 @@ async fn create_outsource_company_duplicate_returns_21202() {
 
 /// 2026-09-15 fix-outsource-409 回归测试：
 /// 同名第二次创建必须返回 409 而不是 500。Code 可以是：
-   /// - 21202（应用层 pre-check 命中：`OutsourceCompanyRepo::get_by_name` 找到 active 行）
+/// - 21202（应用层 pre-check 命中：`OutsourceCompanyRepo::get_by_name` 找到 active 行）
 /// - 21214（DB `uk_t_outsource_company_name` 兜底：pre-check 漏网，INSERT 撞部分唯一索引）
 /// 单线程顺序测试通常命中前者，但保证两种路径下都不返 500。
 #[tokio::test]
@@ -203,7 +203,11 @@ async fn create_outsource_company_duplicate_returns_409() {
         ),
     )
     .await;
-    assert_eq!(s2, StatusCode::CONFLICT, "duplicate must be 409 not 500: {env2}");
+    assert_eq!(
+        s2,
+        StatusCode::CONFLICT,
+        "duplicate must be 409 not 500: {env2}"
+    );
     let code = env2["code"].as_i64().unwrap();
     assert!(
         code == 21202 || code == 21214,
@@ -343,7 +347,12 @@ async fn list_outsource_companies_name_like_and_is_active_filter() {
     // name_like=AA → 1
     let (_, env1) = send(
         app.clone(),
-        json_request("GET", "/outsource-companies?name_like=AA", None, Some(&token)),
+        json_request(
+            "GET",
+            "/outsource-companies?name_like=AA",
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(env1["data"]["total"].as_i64().unwrap(), 1);
@@ -351,7 +360,12 @@ async fn list_outsource_companies_name_like_and_is_active_filter() {
     // is_active=true → 2
     let (_, env2) = send(
         app.clone(),
-        json_request("GET", "/outsource-companies?is_active=true", None, Some(&token)),
+        json_request(
+            "GET",
+            "/outsource-companies?is_active=true",
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(env2["data"]["total"].as_i64().unwrap(), 2);
@@ -424,7 +438,9 @@ async fn list_outsource_companies_by_process_filters_inactive() {
         json_request(
             "POST",
             "/outsource-companies",
-            Some(json!({"name": "Inactive Co", "is_active": false, "process_ids": [p.to_string()]})),
+            Some(
+                json!({"name": "Inactive Co", "is_active": false, "process_ids": [p.to_string()]}),
+            ),
             Some(&token),
         ),
     )

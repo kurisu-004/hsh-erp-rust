@@ -3,17 +3,16 @@
 //! 覆盖 `AccountService::change_own_password` / `admin_reset_password` 两方法。
 //! 共享 helper 见 `super::helpers`。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::auth::session::MockSessionStore;
 use crate::modules::iam::uow::test_support::{MockIamUnitOfWork, provider_returning};
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::helpers::{
-    clerk_current, guard_svc, make_svc, make_user, make_user_with_hash, manager_current,
-    write_svc,
+    clerk_current, guard_svc, make_svc, make_user, make_user_with_hash, manager_current, write_svc,
 };
 
 // ===========================================================================
@@ -150,9 +149,7 @@ async fn change_own_password_rejects_empty_new_password() {
         shelf_ids: vec![],
         shelf_wildcard: false,
     };
-    let res = svc
-        .change_own_password(42, "oldpass", "", &current)
-        .await;
+    let res = svc.change_own_password(42, "oldpass", "", &current).await;
     assert!(matches!(res, Err(AppError::Validation(_))));
 }
 

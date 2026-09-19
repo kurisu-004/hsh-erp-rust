@@ -1050,9 +1050,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
             redis_pool.clone(),
         )),
         std::sync::Arc::new(
-            hsh_erp_rust::modules::upload_session::repo::RedisUploadSessionRepo::new(
-                redis_pool,
-            ),
+            hsh_erp_rust::modules::upload_session::repo::RedisUploadSessionRepo::new(redis_pool),
         ),
     );
     let _ = state; // unused — pickup 测试通过 app 走

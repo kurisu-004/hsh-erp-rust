@@ -20,10 +20,10 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -35,7 +35,7 @@ use crate::modules::assembly::dto::{
     AssemblyListQuery, AssemblyOut, AssemblyUpdateRequest,
 };
 use crate::modules::assembly::service::AssemblyService;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
 
@@ -118,14 +118,15 @@ pub async fn create_assembly(
             }
         }
     }
-    let data_json = data_json.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 data 字段"))?;
-    let req: AssemblyCreateRequest = serde_json::from_str(&data_json).map_err(|e| {
-        AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}"))
-    })?;
+    let data_json =
+        data_json.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 data 字段"))?;
+    let req: AssemblyCreateRequest = serde_json::from_str(&data_json)
+        .map_err(|e| AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}")))?;
 
     let mut tx = state.pool.begin().await?;
     let out =
-        AssemblyService::create_assembly(&mut tx, &state.snowflake, &req, pdf_files, &current).await?;
+        AssemblyService::create_assembly(&mut tx, &state.snowflake, &req, pdf_files, &current)
+            .await?;
     tx.commit().await?;
     // commit 之后广播（对齐 Python 延迟广播模式）
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
@@ -229,7 +230,13 @@ pub async fn upload_assembly_files(
     current: CurrentUser,
     Path(assembly_id): Path<i64>,
     mut multipart: Multipart,
-) -> Result<(StatusCode, Json<R<Vec<crate::modules::assembly::dto::AssemblyFileRef>>>), AppError> {
+) -> Result<
+    (
+        StatusCode,
+        Json<R<Vec<crate::modules::assembly::dto::AssemblyFileRef>>>,
+    ),
+    AppError,
+> {
     let mut files: Vec<(Vec<u8>, String, String)> = Vec::new();
     while let Some(field) = multipart
         .next_field()
@@ -259,7 +266,10 @@ pub async fn upload_assembly_files(
         }
     }
     if files.is_empty() {
-        return Err(AppError::biz(code::BIZ_INVALID_VALUE, "至少需要一个 file 字段"));
+        return Err(AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            "至少需要一个 file 字段",
+        ));
     }
     let mut tx = state.pool.begin().await?;
     let out = AssemblyService::upload_assembly_files(

@@ -3,7 +3,7 @@
 //! 与 `src/infra/db.rs::create_pool` 同形态。`deadpool_redis::Config::builder()` 返回
 //! `PoolBuilder`，按需 `.max_size(...)` / `.runtime(...)` 后 `.build()`。
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use deadpool_redis::{Config as RedisPoolConfig, Pool, Runtime};
 
 use crate::infra::config::AppConfig;

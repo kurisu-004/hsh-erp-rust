@@ -32,7 +32,7 @@ use chrono::{Datelike, NaiveDate};
 
 use crate::infra::clock::now_naive;
 use crate::modules::delivery_note::dto::{DeliveryNoteDetailOut, DeliveryNoteLineItem};
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::print_xml_patch::post_patch_xlsx;
 
@@ -88,19 +88,34 @@ pub struct CellBinding {
 
 impl CellBinding {
     pub const fn row_index(col: u32) -> Self {
-        Self { col, source: CellSource::RowIndex }
+        Self {
+            col,
+            source: CellSource::RowIndex,
+        }
     }
     pub const fn field(col: u32, name: &'static str) -> Self {
-        Self { col, source: CellSource::RowField(name) }
+        Self {
+            col,
+            source: CellSource::RowField(name),
+        }
     }
     pub const fn customer_name(col: u32) -> Self {
-        Self { col, source: CellSource::CustomerName }
+        Self {
+            col,
+            source: CellSource::CustomerName,
+        }
     }
     pub const fn unit(col: u32) -> Self {
-        Self { col, source: CellSource::RowUnit }
+        Self {
+            col,
+            source: CellSource::RowUnit,
+        }
     }
     pub const fn const_value(col: u32, value: &'static str) -> Self {
-        Self { col, source: CellSource::Const(value) }
+        Self {
+            col,
+            source: CellSource::Const(value),
+        }
     }
 }
 
@@ -261,12 +276,13 @@ pub fn configs() -> &'static HashMap<char, TemplateConfig> {
 
 /// 从 prefix 推导模板绝对路径（默认相对执行目录）。
 pub fn template_path(prefix: char, template_dir: &Path) -> Result<PathBuf, AppError> {
-    let (_, basename) =
-        template_for_prefix(prefix).ok_or_else(|| AppError::biz_with_status(
+    let (_, basename) = template_for_prefix(prefix).ok_or_else(|| {
+        AppError::biz_with_status(
             code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED,
             format!("未配置 prefix {prefix:?} 的送货单模板"),
             axum::http::StatusCode::BAD_REQUEST,
-        ))?;
+        )
+    })?;
     Ok(template_dir.join(basename))
 }
 
@@ -278,11 +294,13 @@ pub fn template_path(prefix: char, template_dir: &Path) -> Result<PathBuf, AppEr
 pub fn render_note(req: &PrintRequest) -> Result<(Vec<u8>, char), AppError> {
     let cfg = template_for_prefix(req.prefix)
         .map(|(c, _)| c)
-        .ok_or_else(|| AppError::biz_with_status(
-            code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED,
-            format!("未配置 prefix {:?} 的送货单模板", req.prefix),
-            axum::http::StatusCode::BAD_REQUEST,
-        ))?;
+        .ok_or_else(|| {
+            AppError::biz_with_status(
+                code::BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED,
+                format!("未配置 prefix {:?} 的送货单模板", req.prefix),
+                axum::http::StatusCode::BAD_REQUEST,
+            )
+        })?;
     let bytes = render_template(&req.template_path, cfg, req)?;
     Ok((bytes, req.prefix))
 }
@@ -303,19 +321,22 @@ pub fn render_labels(req: &PrintRequest) -> Result<(Vec<u8>, char), AppError> {
     ws.set_name("标签");
     let headers = ["客户", "申请人", "名称", "图号", "数量", "单位"];
     for (c, h) in headers.iter().enumerate() {
-        let coord = (
-            1u32,
-            (c + 1) as u32,
-        );
+        let coord = (1u32, (c + 1) as u32);
         let _ = ws.get_cell_mut(coord).set_value(*h);
     }
     for (i, row) in print_rows.iter().enumerate() {
         let r = (i + 2) as u32;
-        let _ = ws.get_cell_mut((r, 1u32)).set_value(row.customer_name.clone());
-        let _ = ws.get_cell_mut((r, 2u32)).set_value(row.applicant_name.clone());
+        let _ = ws
+            .get_cell_mut((r, 1u32))
+            .set_value(row.customer_name.clone());
+        let _ = ws
+            .get_cell_mut((r, 2u32))
+            .set_value(row.applicant_name.clone());
         let _ = ws.get_cell_mut((r, 3u32)).set_value(row.name.clone());
         let _ = ws.get_cell_mut((r, 4u32)).set_value(row.drawing_no.clone());
-        let _ = ws.get_cell_mut((r, 5u32)).set_value_number(row.quantity as f64);
+        let _ = ws
+            .get_cell_mut((r, 5u32))
+            .set_value_number(row.quantity as f64);
         let _ = ws.get_cell_mut((r, 6u32)).set_value(row.unit.clone());
     }
     autosize_label_columns(ws);
@@ -341,9 +362,8 @@ fn render_template(
             axum::http::StatusCode::BAD_REQUEST,
         ));
     }
-    let mut book = umya_spreadsheet::reader::xlsx::read(template_path).map_err(|e| {
-        AppError::internal(format!("read template xlsx: {e:?}"))
-    })?;
+    let mut book = umya_spreadsheet::reader::xlsx::read(template_path)
+        .map_err(|e| AppError::internal(format!("read template xlsx: {e:?}")))?;
     let sheet_name = cfg.sheet_name.to_string();
     if book.get_sheet_by_name_mut(&sheet_name).is_none() {
         return Err(AppError::biz_with_status(
@@ -384,9 +404,8 @@ fn render_template(
             .get_sheet_by_name(&sheet_name)
             .cloned()
             .ok_or_else(|| AppError::internal("cloning source sheet"))?;
-        book.add_sheet(cloned_src).map_err(|e| {
-            AppError::internal(format!("add cloned sheet: {e}"))
-        })?;
+        book.add_sheet(cloned_src)
+            .map_err(|e| AppError::internal(format!("add cloned sheet: {e}")))?;
         // add_sheet 把 cloned 拷进来后用它原始的 sheet_name；这里 rename 成 cloned_title
         // （axum 的路由约定：sheet name 唯一，多份要带 ` (n)` 后缀）
         if let Some(ws) = book.get_sheet_by_name_mut(&sheet_name) {
@@ -419,14 +438,13 @@ fn render_template(
     }
 
     // ===== 6) 写出 =====
-    let bytes = write_xlsx_to_bytes(&book)
-        .map_err(|e| AppError::internal(format!("write xlsx: {e:?}")))?;
+    let bytes =
+        write_xlsx_to_bytes(&book).map_err(|e| AppError::internal(format!("write xlsx: {e:?}")))?;
 
     // ===== 7) XML 后处理（pageSetUpPr / shrinkToFit / I2 日期 serial / Print_Aria 去重）=====
     let mut patched = bytes;
-    post_patch_xlsx(&mut patched, cfg, req.prefix).map_err(|e| {
-        AppError::internal(format!("xlsx post-patch: {e:?}"))
-    })?;
+    post_patch_xlsx(&mut patched, cfg, req.prefix)
+        .map_err(|e| AppError::internal(format!("xlsx post-patch: {e:?}")))?;
     Ok(patched)
 }
 
@@ -439,9 +457,8 @@ fn write_xlsx_to_bytes(wb: &umya_spreadsheet::Spreadsheet) -> Result<Vec<u8>, st
     let pid = std::process::id();
     let tmp_dir = std::env::temp_dir();
     let path = tmp_dir.join(format!("hsh_delivery_print_{pid}_{seq}.xlsx"));
-    umya_spreadsheet::writer::xlsx::write(wb, &path).map_err(|e| {
-        std::io::Error::other(format!("{e:?}"))
-    })?;
+    umya_spreadsheet::writer::xlsx::write(wb, &path)
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
     let bytes = std::fs::read(&path)?;
     let _ = std::fs::remove_file(&path);
     Ok(bytes)
@@ -488,7 +505,10 @@ pub fn prepare_print_rows(req: &PrintRequest) -> Result<Vec<PrintRow>, AppError>
             if !missing.is_empty() {
                 return Err(AppError::biz_with_status(
                     code::BIZ_DELIVERY_PRINT_BAD_ORDER,
-                    format!("custom_order 漏掉 {} 个 batch id: {missing:?}", missing.len()),
+                    format!(
+                        "custom_order 漏掉 {} 个 batch id: {missing:?}",
+                        missing.len()
+                    ),
                     axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                 ));
             }
@@ -516,7 +536,8 @@ pub fn prepare_print_rows(req: &PrintRequest) -> Result<Vec<PrintRow>, AppError>
         }
         let wanted: std::collections::HashSet<i64> = li_ids.iter().copied().collect();
         // 检查 unknown
-        let known_li_ids: std::collections::HashSet<i64> = ordered_li.iter().map(|li| li.id).collect();
+        let known_li_ids: std::collections::HashSet<i64> =
+            ordered_li.iter().map(|li| li.id).collect();
         let unknown: Vec<String> = wanted
             .difference(&known_li_ids)
             .map(|i| i.to_string())
@@ -554,7 +575,9 @@ pub fn prepare_print_rows(req: &PrintRequest) -> Result<Vec<PrintRow>, AppError>
         collapsed
             .into_iter()
             .map(|li| {
-                let planned = li.planned_delivery_date.and_then(|d| format_print_date(Some(d)));
+                let planned = li
+                    .planned_delivery_date
+                    .and_then(|d| format_print_date(Some(d)));
                 PrintRow {
                     order_no: li.order_no.unwrap_or_default(),
                     applicant_name: li.applicant_name.unwrap_or_default(),
@@ -643,7 +666,9 @@ fn do_merge_assemblies(
     }
     let mut per_row: Vec<(usize, PrintRow)> = Vec::with_capacity(collapsed.len());
     for (idx, li) in collapsed.iter().enumerate() {
-        let planned = li.planned_delivery_date.and_then(|d| format_print_date(Some(d)));
+        let planned = li
+            .planned_delivery_date
+            .and_then(|d| format_print_date(Some(d)));
         per_row.push((
             idx,
             PrintRow {
@@ -682,10 +707,7 @@ fn do_merge_assemblies(
             PrintRow {
                 order_no: first_part.assembly_order_no.clone().unwrap_or_default(),
                 applicant_name: String::new(), // asm 没有 applicant_name 字段
-                drawing_no: first_part
-                    .assembly_drawing_no
-                    .clone()
-                    .unwrap_or_default(),
+                drawing_no: first_part.assembly_drawing_no.clone().unwrap_or_default(),
                 name: first_part.assembly_name.clone().unwrap_or_default(),
                 quantity: merge_quantities.get(aid).copied().unwrap_or(1),
                 unit: "套".to_string(),
@@ -755,7 +777,13 @@ fn resolve_cell_value(binding: &CellBinding, row: &PrintRow, idx: u32) -> String
     }
 }
 
-fn fill_row(ws: &mut umya_spreadsheet::Worksheet, target_row: u32, idx: u32, row: &PrintRow, bindings: &[CellBinding]) {
+fn fill_row(
+    ws: &mut umya_spreadsheet::Worksheet,
+    target_row: u32,
+    idx: u32,
+    row: &PrintRow,
+    bindings: &[CellBinding],
+) {
     for b in bindings {
         let coord = format!("{}{}", col_letter(b.col), target_row);
         let val = resolve_cell_value(b, row, idx);
@@ -790,12 +818,7 @@ fn write_footer(ws: &mut umya_spreadsheet::Worksheet, prefix: char, date: NaiveD
 }
 
 fn format_fala_footer_date(d: NaiveDate) -> String {
-    format!(
-        "送货日期：{}年{}月{}日",
-        d.year(),
-        d.month(),
-        d.day()
-    )
+    format!("送货日期：{}年{}月{}日", d.year(), d.month(), d.day())
 }
 
 /// `_format_print_date`：None 透传；date → "M月D日"（无前导零）。
@@ -807,7 +830,12 @@ pub fn format_print_date(d: Option<NaiveDate>) -> Option<String> {
 // 行高 / 列宽 / 对齐
 // =================================================================================
 
-fn set_data_row_heights(ws: &mut umya_spreadsheet::Worksheet, start_row: u32, count: u32, height: f64) {
+fn set_data_row_heights(
+    ws: &mut umya_spreadsheet::Worksheet,
+    start_row: u32,
+    count: u32,
+    height: f64,
+) {
     for r in start_row..(start_row + count) {
         let _ = ws.get_row_dimension_mut(&r).set_height(height);
     }
@@ -900,7 +928,11 @@ fn apply_budgeted_widths(
     }
 }
 
-fn apply_data_alignments(ws: &mut umya_spreadsheet::Worksheet, cfg: &TemplateConfig, page_row_count: u32) {
+fn apply_data_alignments(
+    ws: &mut umya_spreadsheet::Worksheet,
+    cfg: &TemplateConfig,
+    page_row_count: u32,
+) {
     if cfg.data_alignments.is_empty() {
         return;
     }

@@ -96,11 +96,7 @@ async fn insert_draft_delivery_note(pool: &sqlx::PgPool, customer_id: i64) -> i6
 }
 
 /// 把指定 part 的活跃批次挂上 delivery_note_id（模拟「已发草稿送货单」）。
-async fn attach_batch_to_note(
-    pool: &sqlx::PgPool,
-    batch_id: i64,
-    delivery_note_id: i64,
-) {
+async fn attach_batch_to_note(pool: &sqlx::PgPool, batch_id: i64, delivery_note_id: i64) {
     sqlx::query(
         "UPDATE t_part_batch SET delivery_note_id = $1, version = version + 1 \
          WHERE id = $2 AND deleted_at IS NULL",

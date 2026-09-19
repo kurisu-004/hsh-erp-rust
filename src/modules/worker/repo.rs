@@ -108,9 +108,8 @@ impl WorkerRepo {
         name_like: Option<&str>,
         is_active: Option<bool>,
     ) -> Result<i64, sqlx::Error> {
-        let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-            "SELECT COUNT(*)::bigint FROM t_worker WHERE deleted_at IS NULL",
-        );
+        let mut qb: QueryBuilder<sqlx::Postgres> =
+            QueryBuilder::new("SELECT COUNT(*)::bigint FROM t_worker WHERE deleted_at IS NULL");
         if let Some(active) = is_active {
             qb.push(" AND is_active = ").push_bind(active);
         }

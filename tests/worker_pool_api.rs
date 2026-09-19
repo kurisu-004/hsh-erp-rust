@@ -33,9 +33,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -146,7 +146,9 @@ async fn login_shelf_account(
 
 async fn insert_work_type(pool: &PgPool, code: &str, name: &str, max_held: Option<i32>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -172,7 +174,9 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -193,11 +197,18 @@ async fn insert_worker(
 
 async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let l1_id = snowflake.next_id();
     let now = now_naive();
     // serial_prefix is varchar(1) + regex ^[A-Z]$ — pick first char uppercased
-    let one_char: String = prefix.chars().next().unwrap_or('X').to_ascii_uppercase().to_string();
+    let one_char: String = prefix
+        .chars()
+        .next()
+        .unwrap_or('X')
+        .to_ascii_uppercase()
+        .to_string();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) \
@@ -236,14 +247,20 @@ async fn insert_pool_part(
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     let today = now.date();
-    let part_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    let part_id = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
     // 2026-09-16 PR-2（migration 027）：t_part 删 `location` / `current_holder_id` /
     // `placed_at` 等批次依附列（位置/持有人真相源改在 t_part_batch 同名列）；
     // INSERT 列名与 VALUES 占位符同步移除：'PRODUCTION_SHELF' / $5（shelf_id）/
     // $3（now 用作 placed_at）。
     // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
     // 且 batch 持有 current_process_step_id。helper 多走两步：建链 → 建 step。
-    let chain_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    let chain_id = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
     sqlx::query!(
         "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, 0, $3, 0, $3, 0)",
@@ -254,7 +271,10 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert chain");
-    let step_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    let step_id = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
     sqlx::query!(
         "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
          estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
@@ -286,7 +306,10 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert t_part");
-    let batch_id = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner()).next_id();
+    let batch_id = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
     // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
     // 改为 `current_process_step_id`。
     sqlx::query!(
@@ -328,7 +351,9 @@ async fn insert_worker_held_part(
     quantity: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let now = now_naive();
     let today = now.date();
     let part_id = snowflake.next_id();
@@ -459,7 +484,9 @@ async fn worker_scan_inspected_triggers_refill() {
     assert_eq!(env["data"]["scan"]["part_id"], held_part.to_string());
     assert_eq!(env["data"]["scan"]["event_type"], "WORKER_SCAN_INSPECTED");
     // refill 出参：从池里抢到 1 件 + pool_empty=false
-    let taken = env["data"]["refill"]["taken"].as_array().expect("refill.taken");
+    let taken = env["data"]["refill"]["taken"]
+        .as_array()
+        .expect("refill.taken");
     assert_eq!(taken.len(), 1, "refill 应抢到 1 件: {env}");
     assert_eq!(env["data"]["refill"]["pool_empty"], false);
 
@@ -505,9 +532,15 @@ async fn worker_scan_returned_triggers_refill() {
     assert_eq!(s, StatusCode::OK, "scan RETURNED: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(env["data"]["scan"]["event_type"], "WORKER_SCAN_RETURNED");
-    let taken = env["data"]["refill"]["taken"].as_array().expect("refill.taken");
+    let taken = env["data"]["refill"]["taken"]
+        .as_array()
+        .expect("refill.taken");
     // REFILL 抢满 max=5；池里放回 1 件（H-002）+ 原 1 件 → refill 抢 2 件
-    assert_eq!(taken.len(), 2, "refill 应抢到 2 件（returned 1 + pool 1）: {env}");
+    assert_eq!(
+        taken.len(),
+        2,
+        "refill 应抢到 2 件（returned 1 + pool 1）: {env}"
+    );
 }
 
 /// 场景 3: 池空时 refill 返回 empty + pool_empty=true
@@ -745,7 +778,11 @@ async fn take_updates_t_part_holder() {
     .fetch_one(&pool)
     .await
     .expect("query holder");
-    assert_eq!(holder, Some(worker), "t_part_batch holder 应被更新为 worker.id");
+    assert_eq!(
+        holder,
+        Some(worker),
+        "t_part_batch holder 应被更新为 worker.id"
+    );
     let loc: String = sqlx::query_scalar!(
         "SELECT location AS \"loc!\" FROM t_part_batch WHERE id = $1",
         pool_batch,
@@ -775,13 +812,11 @@ async fn take_does_not_update_placed_at() {
     // 不再断言 take 前后时间。本测试名（take_does_not_update_placed_at）
     // 同步改为 take_does_not_change_state，与 PR-3 语义对齐。
     // 取 take 前 batch version（用作对比 baseline）
-    let before_version: i32 = sqlx::query_scalar!(
-        "SELECT version FROM t_part_batch WHERE id = $1",
-        pool_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query version");
+    let before_version: i32 =
+        sqlx::query_scalar!("SELECT version FROM t_part_batch WHERE id = $1", pool_batch,)
+            .fetch_one(&pool)
+            .await
+            .expect("query version");
     let _ = before_version;
 
     let (app, token, _pool) = login_manager(pool.clone(), "admin10").await;
@@ -801,13 +836,12 @@ async fn take_does_not_update_placed_at() {
 
     // PR-3 批次 step 化：t_part_batch.placed_at 列已删；改测 take 后 batch
     // 状态保持原状（IN_PROCESS + current_process_step_id 不变）。
-    let (status_after, step_after): (String, Option<i64>) = sqlx::query_as(
-        "SELECT status, current_process_step_id FROM t_part_batch WHERE id = $1",
-    )
-    .bind(pool_batch)
-    .fetch_one(&pool)
-    .await
-    .expect("query after");
+    let (status_after, step_after): (String, Option<i64>) =
+        sqlx::query_as("SELECT status, current_process_step_id FROM t_part_batch WHERE id = $1")
+            .bind(pool_batch)
+            .fetch_one(&pool)
+            .await
+            .expect("query after");
     assert_eq!(
         status_after, "IN_PROCESS",
         "take 后 batch status 仍为 IN_PROCESS（fixture 起点）"
@@ -1029,10 +1063,7 @@ async fn max_held_null_returns_error() {
         StatusCode::BAD_REQUEST,
         "max_held NULL 应 400 (BIZ 业务错默认 400): {env}"
     );
-    assert_eq!(
-        env["code"], 20904,
-        "BIZ_WORK_TYPE_MAX_HELD_NOT_SET: {env}"
-    );
+    assert_eq!(env["code"], 20904, "BIZ_WORK_TYPE_MAX_HELD_NOT_SET: {env}");
 }
 
 /// 场景 16: worker.work_type_id = NULL → 20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET (走不到)
@@ -1083,7 +1114,9 @@ async fn worker_no_work_type_returns_error() {
 /// 仍在用的 cache，对其它 worktree 也有干扰）。
 async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let snowflake = common::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -1124,10 +1157,8 @@ async fn pool_by_process_happy() {
     // `insert_pool_part` 把 is_urgent 硬编码为 false —— 加急单用 UPDATE 翻成 true。
     // 用 `sqlx::query`（runtime）而非 `query!` 避免动 `.sqlx` cache（会清掉
     // 同 worktree 其它测试文件仍在用的离线 metadata）。
-    let (p_urgent, _b_urgent) =
-        insert_pool_part(&pool, l2, "U-001", prod_shelf, proc, 2).await;
-    let (_p_normal, _b_normal) =
-        insert_pool_part(&pool, l2, "N-001", prod_shelf, proc, 5).await;
+    let (p_urgent, _b_urgent) = insert_pool_part(&pool, l2, "U-001", prod_shelf, proc, 2).await;
+    let (_p_normal, _b_normal) = insert_pool_part(&pool, l2, "N-001", prod_shelf, proc, 5).await;
     sqlx::query("UPDATE t_part SET is_urgent = true WHERE id = $1")
         .bind(p_urgent)
         .execute(&pool)
@@ -1154,22 +1185,24 @@ async fn pool_by_process_happy() {
     let work_types = data["work_types"].as_array().expect("work_types array");
     assert_eq!(work_types.len(), 2, "work_types 应 2 个: {env}");
     // 找到 max_held_batches = Some(3) 与 None 的两条
-    let has_three = work_types
-        .iter()
-        .any(|w| w["max_held_batches"] == 3);
-    let has_null = work_types
-        .iter()
-        .any(|w| w["max_held_batches"].is_null());
+    let has_three = work_types.iter().any(|w| w["max_held_batches"] == 3);
+    let has_null = work_types.iter().any(|w| w["max_held_batches"].is_null());
     assert!(has_three && has_null, "max_held 应含 Some(3) + None: {env}");
 
     assert_eq!(data["total"], 2, "total 应 2: {env}");
     let items = data["items"].as_array().expect("items array");
     assert_eq!(items.len(), 2, "items 应 2 个: {env}");
     // items[0] 应为加急单
-    assert_eq!(items[0]["is_urgent"], true, "items[0] 应 is_urgent=true: {env}");
+    assert_eq!(
+        items[0]["is_urgent"], true,
+        "items[0] 应 is_urgent=true: {env}"
+    );
     assert_eq!(items[0]["serial_no"], "U-001");
     // items[1] 应为非加急单
-    assert_eq!(items[1]["is_urgent"], false, "items[1] 应 is_urgent=false: {env}");
+    assert_eq!(
+        items[1]["is_urgent"], false,
+        "items[1] 应 is_urgent=false: {env}"
+    );
     assert_eq!(items[1]["serial_no"], "N-001");
     // customer_path 应为 "L1-NAME / L2-NAME"
     assert_eq!(
@@ -1195,11 +1228,7 @@ async fn pool_by_process_process_not_found() {
     let (app, token, _pool) = login_manager(pool.clone(), "admin_nf").await;
     let uri = format!("/worker-pool/{nonexistent_id}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
-    assert_eq!(
-        s,
-        StatusCode::NOT_FOUND,
-        "不存在 process 应 404: {env}"
-    );
+    assert_eq!(s, StatusCode::NOT_FOUND, "不存在 process 应 404: {env}");
     assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
 }
 
@@ -1213,14 +1242,11 @@ async fn pool_by_process_forbidden_for_shelf_account() {
     let prod_shelf = common::insert_shelf(&pool, "PROD-FB", "PROD-FB", "PRODUCTION").await;
 
     // ShelfAccount 绑一个 shelf（scope 必须给才能登录；调用端点时仍会被 service 拒绝）
-    let (app, token, _pool) = login_shelf_account(pool.clone(), "shelf_user_fb", &[prod_shelf]).await;
+    let (app, token, _pool) =
+        login_shelf_account(pool.clone(), "shelf_user_fb", &[prod_shelf]).await;
     let uri = format!("/worker-pool/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
-    assert_eq!(
-        s,
-        StatusCode::FORBIDDEN,
-        "ShelfAccount 应 403: {env}"
-    );
+    assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
 }
 
@@ -1395,8 +1421,7 @@ async fn admin_assign_capacity_exceeded() {
         insert_worker_held_part(&pool, customer, &sn, worker, proc, 1).await;
     }
     // pool 里再放 1 批待分配
-    let (_pp, extra_batch) =
-        insert_pool_part(&pool, customer, "P-018", prod_shelf, proc, 1).await;
+    let (_pp, extra_batch) = insert_pool_part(&pool, customer, "P-018", prod_shelf, proc, 1).await;
     let held = count_held_by_worker(&pool, worker).await;
     assert_eq!(held, 2, "前置：worker 已持 2 批");
 
@@ -1415,11 +1440,7 @@ async fn admin_assign_capacity_exceeded() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::CONFLICT,
-        "capacity 触顶应 409: {env}"
-    );
+    assert_eq!(s, StatusCode::CONFLICT, "capacity 触顶应 409: {env}");
     assert_eq!(
         env["code"], 20204,
         "BIZ_WORKER_HOLD_LIMIT_EXCEEDED 应 20204: {env}"
@@ -1544,11 +1565,7 @@ async fn admin_assign_process_id_mismatch() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::BAD_REQUEST,
-        "process_id 不匹配应 400: {env}"
-    );
+    assert_eq!(s, StatusCode::BAD_REQUEST, "process_id 不匹配应 400: {env}");
     assert_eq!(env["code"], 20104, "BIZ_INVALID_VALUE 应 20104: {env}");
 
     // 候选池批次应未动

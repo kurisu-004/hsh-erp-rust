@@ -14,9 +14,11 @@ use sqlx::PgConnection;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
-use crate::modules::process_chain::dto::{ProcessChainOut, ProcessChainStepOut, UpsertChainRequest};
+use crate::modules::process_chain::dto::{
+    ProcessChainOut, ProcessChainStepOut, UpsertChainRequest,
+};
 use crate::modules::process_chain::model::{NewProcessChainStep, TPartProcessChain};
 use crate::modules::process_chain::repo::ProcessChainRepo;
 
@@ -90,10 +92,7 @@ impl ProcessChainService {
             let mut v = Vec::with_capacity(req.steps.len());
             for s in &req.steps {
                 let pid = s.process_id.parse::<i64>().map_err(|_| {
-                    AppError::biz(
-                        code::BIZ_INVALID_VALUE,
-                        "process_id 必须为雪花 ID 字符串",
-                    )
+                    AppError::biz(code::BIZ_INVALID_VALUE, "process_id 必须为雪花 ID 字符串")
                 })?;
                 if s.estimated_minutes < 0 {
                     return Err(AppError::biz(
@@ -200,14 +199,16 @@ impl ProcessChainService {
                 .await?;
             let linked = ProcessChainRepo::link_chain_to_part(&mut *conn, part_id, id, current.id)
                 .await
-                .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                    // uq_t_part_process_chain：同一 chain 被并发绑到两个 part
-                    Some("23505") => AppError::biz(
-                        code::BIZ_INVALID_VALUE,
-                        format!("part {part_id} 已存在工艺链（并发）"),
-                    ),
-                    _ => AppError::from(e),
-                })?;
+                .map_err(
+                    |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                        // uq_t_part_process_chain：同一 chain 被并发绑到两个 part
+                        Some("23505") => AppError::biz(
+                            code::BIZ_INVALID_VALUE,
+                            format!("part {part_id} 已存在工艺链（并发）"),
+                        ),
+                        _ => AppError::from(e),
+                    },
+                )?;
             if linked == 0 {
                 // process_chain_id IS NULL 守卫未命中：并发请求已抢先绑定
                 return Err(AppError::biz(

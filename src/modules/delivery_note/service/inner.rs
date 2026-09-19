@@ -15,7 +15,7 @@ use crate::modules::com::customer::model::TCustomer;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part_batch::repo::PartBatchRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
     DeliveryNoteAddItem, DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut,
@@ -116,7 +116,9 @@ pub(super) async fn build_note_outs(
                 Some(c.name.clone()),
             ),
             Some(c) => {
-                let parent_name = c.parent_id.and_then(|p| cust_map.get(&p).map(|p| p.name.clone()));
+                let parent_name = c
+                    .parent_id
+                    .and_then(|p| cust_map.get(&p).map(|p| p.name.clone()));
                 let path = match (&parent_name, &Some(c.name.clone())) {
                     (Some(p), Some(l)) => Some(format!("{p} / {l}")),
                     _ => Some(c.name.clone()),
@@ -126,14 +128,18 @@ pub(super) async fn build_note_outs(
             None => (None, None, None),
         };
 
-        let leaf_customer_name = n.leaf_customer_id.and_then(|id| {
-            cust_map.get(&id).map(|c| c.name.clone())
-        });
-        let group_name = n.delivery_group_id.and_then(|id| group_map.get(&id).cloned());
+        let leaf_customer_name = n
+            .leaf_customer_id
+            .and_then(|id| cust_map.get(&id).map(|c| c.name.clone()));
+        let group_name = n
+            .delivery_group_id
+            .and_then(|id| group_map.get(&id).cloned());
 
         let scope_label = match (n.delivery_group_id, n.leaf_customer_id) {
             (Some(_), _) => group_name.clone().or_else(|| Some("(group)".to_string())),
-            (None, Some(_)) => leaf_customer_name.clone().or_else(|| Some("(leaf)".to_string())),
+            (None, Some(_)) => leaf_customer_name
+                .clone()
+                .or_else(|| Some("(leaf)".to_string())),
             (None, None) => customer_name.clone().or_else(|| Some("(L1)".to_string())),
         };
 
@@ -141,7 +147,9 @@ pub(super) async fn build_note_outs(
             .await?
             .len() as i64;
 
-        let driver_worker_name = n.driver_worker_id.and_then(|id| driver_map.get(&id).cloned());
+        let driver_worker_name = n
+            .driver_worker_id
+            .and_then(|id| driver_map.get(&id).cloned());
 
         out.push(DeliveryNoteOut {
             id: n.id,
@@ -189,13 +197,23 @@ pub(super) async fn get_with_parts(
     for (_b, p) in &rows {
         leaf_ids.insert(p.customer_id);
     }
-    let leaf_list = CustomerRepo::list_by_ids(&mut *conn, &leaf_ids.iter().copied().collect::<Vec<_>>(), false).await?;
+    let leaf_list = CustomerRepo::list_by_ids(
+        &mut *conn,
+        &leaf_ids.iter().copied().collect::<Vec<_>>(),
+        false,
+    )
+    .await?;
     let leaf_map: HashMap<i64, TCustomer> = leaf_list.into_iter().map(|c| (c.id, c)).collect();
     let parent_ids: HashSet<i64> = leaf_map.values().filter_map(|c| c.parent_id).collect();
     let parent_list = if parent_ids.is_empty() {
         Vec::new()
     } else {
-        CustomerRepo::list_by_ids(&mut *conn, &parent_ids.iter().copied().collect::<Vec<_>>(), false).await?
+        CustomerRepo::list_by_ids(
+            &mut *conn,
+            &parent_ids.iter().copied().collect::<Vec<_>>(),
+            false,
+        )
+        .await?
     };
     let parent_map: HashMap<i64, TCustomer> = parent_list.into_iter().map(|c| (c.id, c)).collect();
 
@@ -217,11 +235,11 @@ pub(super) async fn get_with_parts(
     let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(rows.len());
     for (b, p) in rows {
         let leaf = leaf_map.get(&p.customer_id);
-        let parent = leaf.and_then(|l| l.parent_id).and_then(|pid| parent_map.get(&pid));
+        let parent = leaf
+            .and_then(|l| l.parent_id)
+            .and_then(|pid| parent_map.get(&pid));
         let leaf_name = leaf.map(|c| c.name.clone());
-        let parent_name = parent
-            .map(|c| c.name.clone())
-            .or_else(|| leaf_name.clone()); // L1 自指同 leaf
+        let parent_name = parent.map(|c| c.name.clone()).or_else(|| leaf_name.clone()); // L1 自指同 leaf
         let path = match (&parent_name, &leaf_name) {
             (Some(p), Some(l)) if p != l => Some(format!("{p} / {l}")),
             _ => leaf_name.clone(),
@@ -291,10 +309,12 @@ pub(super) async fn check_scope(
             // 加载 group + members
             let grp = DeliveryGroupRepo::get_by_id(&mut *conn, gid, false)
                 .await?
-                .ok_or_else(|| AppError::biz(
-                    code::BIZ_DELIVERY_GROUP_NOT_FOUND,
-                    format!("delivery group {gid} not found"),
-                ))?;
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_DELIVERY_GROUP_NOT_FOUND,
+                        format!("delivery group {gid} not found"),
+                    )
+                })?;
             // 必须仍是同一 L1 客户
             if grp.customer_id != obj.customer_id {
                 return Err(AppError::biz(
@@ -302,7 +322,8 @@ pub(super) async fn check_scope(
                     "group 与本单 L1 不匹配",
                 ));
             }
-            let members = DeliveryGroupRepo::list_members_by_group_ids(&mut *conn, &[gid], false).await?;
+            let members =
+                DeliveryGroupRepo::list_members_by_group_ids(&mut *conn, &[gid], false).await?;
             if !members.iter().any(|m| m.customer_id == part_customer_id) {
                 return Err(AppError::biz(
                     code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH,
@@ -351,7 +372,10 @@ pub(super) async fn add_parts_inner(
     if obj.status != STATUS_DRAFT {
         return Err(AppError::biz(
             code::BIZ_DELIVERY_NOTE_PARTS_LOCKED,
-            format!("送货单已提交（{}），不能新增零件；如需调整请先撤回。", obj.status),
+            format!(
+                "送货单已提交（{}），不能新增零件；如需调整请先撤回。",
+                obj.status
+            ),
         ));
     }
     if items.is_empty() {
@@ -359,14 +383,17 @@ pub(super) async fn add_parts_inner(
     }
 
     // 加载所有 batch + part + part 客户
-    let mut batches_by_id: HashMap<i64, crate::modules::part_batch::model::TPartBatch> = HashMap::new();
+    let mut batches_by_id: HashMap<i64, crate::modules::part_batch::model::TPartBatch> =
+        HashMap::new();
     for it in items {
         let b = PartBatchRepo::get_by_id(&mut *conn, it.batch_id, false)
             .await?
-            .ok_or_else(|| AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("batch {} 不存在或已删除", it.batch_id),
-            ))?;
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_BATCH_NOT_FOUND,
+                    format!("batch {} 不存在或已删除", it.batch_id),
+                )
+            })?;
         batches_by_id.insert(it.batch_id, b);
     }
 
@@ -376,8 +403,7 @@ pub(super) async fn add_parts_inner(
         parts.into_iter().map(|p| (p.id, p)).collect();
 
     // 加载所有 part 客户（含 L2）以推 L1
-    let mut part_customer_ids: HashSet<i64> =
-        part_map.values().map(|p| p.customer_id).collect();
+    let mut part_customer_ids: HashSet<i64> = part_map.values().map(|p| p.customer_id).collect();
     part_customer_ids.insert(obj.customer_id);
     let customers = CustomerRepo::list_by_ids(
         &mut *conn,
@@ -391,13 +417,12 @@ pub(super) async fn add_parts_inner(
 
     for it in items {
         let batch = batches_by_id.get(&it.batch_id).cloned().unwrap();
-        let part = part_map
-            .get(&batch.part_id)
-            .cloned()
-            .ok_or_else(|| AppError::biz(
+        let part = part_map.get(&batch.part_id).cloned().ok_or_else(|| {
+            AppError::biz(
                 code::BIZ_PART_NOT_FOUND,
                 format!("batch {} 所属工单 {} 不存在", batch.id, batch.part_id),
-            ))?;
+            )
+        })?;
 
         if batch.status != STATUS_INSPECTION && batch.status != STATUS_READY_TO_SHIP {
             return Err(AppError::biz(
@@ -409,10 +434,12 @@ pub(super) async fn add_parts_inner(
             ));
         }
 
-        let part_cust = cust_map.get(&part.customer_id).cloned().ok_or_else(|| AppError::biz(
-            code::BIZ_CUSTOMER_NOT_FOUND,
-            format!("part {} 所属客户 {} 不存在", part.id, part.customer_id),
-        ))?;
+        let part_cust = cust_map.get(&part.customer_id).cloned().ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_CUSTOMER_NOT_FOUND,
+                format!("part {} 所属客户 {} 不存在", part.id, part.customer_id),
+            )
+        })?;
         let part_l1_id = match part_cust.parent_id {
             Some(pid) => pid,
             None => part_cust.id,
@@ -488,10 +515,12 @@ pub(super) async fn add_parts_inner(
         } else {
             PartBatchRepo::get_by_id(&mut *conn, target_id, false)
                 .await?
-                .ok_or_else(|| AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    format!("newly split batch {target_id} not found"),
-                ))?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_PART_BATCH_NOT_FOUND,
+                        format!("newly split batch {target_id} not found"),
+                    )
+                })?
         };
 
         let affected = PartBatchRepo::attach_to_note(
@@ -544,15 +573,24 @@ pub(super) async fn write_event(
 // ===========================================================================
 
 pub(super) fn customer_not_found(id: i64) -> AppError {
-    AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, format!("customer {id} not found"))
+    AppError::biz(
+        code::BIZ_CUSTOMER_NOT_FOUND,
+        format!("customer {id} not found"),
+    )
 }
 
 pub(super) fn note_not_found(id: i64) -> AppError {
-    AppError::biz(code::BIZ_DELIVERY_NOTE_NOT_FOUND, format!("delivery note {id} not found"))
+    AppError::biz(
+        code::BIZ_DELIVERY_NOTE_NOT_FOUND,
+        format!("delivery note {id} not found"),
+    )
 }
 
 pub(super) fn group_not_found(id: i64) -> AppError {
-    AppError::biz(code::BIZ_DELIVERY_GROUP_NOT_FOUND, format!("delivery group {id} not found"))
+    AppError::biz(
+        code::BIZ_DELIVERY_GROUP_NOT_FOUND,
+        format!("delivery group {id} not found"),
+    )
 }
 
 pub(super) fn note_version_conflict(id: i64, have: i32, want: i32) -> AppError {
@@ -619,7 +657,10 @@ pub(super) async fn validate_l2_members(
     Ok(ordered)
 }
 
-pub(super) async fn l1_children_lookup(conn: &mut PgConnection, l2_id: i64) -> Result<String, AppError> {
+pub(super) async fn l1_children_lookup(
+    conn: &mut PgConnection,
+    l2_id: i64,
+) -> Result<String, AppError> {
     let c = CustomerRepo::get_by_id(&mut *conn, l2_id, true)
         .await?
         .ok_or_else(|| customer_not_found(l2_id))?;

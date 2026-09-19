@@ -10,13 +10,18 @@ use std::sync::{Arc, Mutex};
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::auth::session::MockSessionStore;
-use crate::modules::iam::dto::{CurrentUserOut, MenuNodeOut, UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest};
-use crate::modules::iam::uow::test_support::{MockIamUnitOfWork, MockIamUowProvider, provider_returning};
-use crate::shared::error::{code, AppError};
+use crate::modules::iam::dto::{
+    CurrentUserOut, MenuNodeOut, UserAddRoleRequest, UserCreateRequest, UserListQuery,
+    UserUpdateRequest,
+};
+use crate::modules::iam::uow::test_support::{
+    MockIamUnitOfWork, MockIamUowProvider, provider_returning,
+};
+use crate::shared::error::{AppError, code};
 
 use super::helpers::{
-    make_menu, make_svc, make_session, make_shelf, make_user, make_user_with_hash,
-    manager_current, test_db_error, write_svc,
+    make_menu, make_session, make_shelf, make_svc, make_user, make_user_with_hash, manager_current,
+    test_db_error, write_svc,
 };
 
 // ===========================================================================

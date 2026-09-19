@@ -20,7 +20,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::process::repo::ProcessRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::*;
 use super::super::process_mapping::ShelfProcessRepo;
@@ -60,7 +60,10 @@ impl super::crud::ShelfService {
                         "next_process_id 必须为雪花 ID 字符串",
                     )
                 })?;
-                if ProcessRepo::get_by_id(&mut *conn, pid, false).await?.is_none() {
+                if ProcessRepo::get_by_id(&mut *conn, pid, false)
+                    .await?
+                    .is_none()
+                {
                     return Err(AppError::biz(
                         code::BIZ_PROCESS_NOT_FOUND,
                         format!("process {pid} 不存在"),

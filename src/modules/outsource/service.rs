@@ -24,7 +24,7 @@ use sqlx::PgConnection;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::dto::*;
 use super::model::*;
@@ -105,9 +105,12 @@ impl OutsourceService {
             offset,
         )
         .await?;
-        let total =
-            OutsourceCompanyRepo::count_with_filters(&mut *conn, query.name_like.as_deref(), query.is_active)
-                .await?;
+        let total = OutsourceCompanyRepo::count_with_filters(
+            &mut *conn,
+            query.name_like.as_deref(),
+            query.is_active,
+        )
+        .await?;
         let items = rows.into_iter().map(Self::company_out).collect();
         Ok(OutsourceCompanyListOut {
             items,
@@ -173,7 +176,10 @@ impl OutsourceService {
         if name.is_empty() {
             return Err(AppError::biz(code::BIZ_INVALID_VALUE, "name 不能为空"));
         }
-        if OutsourceCompanyRepo::get_by_name(&mut *conn, name).await?.is_some() {
+        if OutsourceCompanyRepo::get_by_name(&mut *conn, name)
+            .await?
+            .is_some()
+        {
             return Err(AppError::biz(
                 code::BIZ_OUTSOURCE_COMPANY_DUPLICATE,
                 format!("外协公司「{name}」已存在"),
@@ -183,38 +189,49 @@ impl OutsourceService {
         let new = NewOutsourceCompany {
             id,
             name: name.to_string(),
-            contact_name: req.contact_name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
-            contact_phone: req.contact_phone.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
-            address: req.address.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+            contact_name: req
+                .contact_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            contact_phone: req
+                .contact_phone
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            address: req
+                .address
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             is_active: req.is_active,
             created_by: current.id,
         };
-        let company = OutsourceCompanyRepo::create(&mut *conn, new).await.map_err(|e| {
-            // 2026-09-15 fix-outsource-409：用约束名精确定位 uk_t_outsource_company_name
-            // 兜底（pre-check 已 21202 拦下大部分场景；此处仅覆盖并发插入等竞态）。
-            if let Some(dbe) = e.as_database_error() {
-                if dbe.constraint() == Some("uk_t_outsource_company_name") {
-                    return AppError::biz(
-                        code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME,
-                        format!("外协公司「{name}」已存在"),
-                    );
+        let company = OutsourceCompanyRepo::create(&mut *conn, new)
+            .await
+            .map_err(|e| {
+                // 2026-09-15 fix-outsource-409：用约束名精确定位 uk_t_outsource_company_name
+                // 兜底（pre-check 已 21202 拦下大部分场景；此处仅覆盖并发插入等竞态）。
+                if let Some(dbe) = e.as_database_error() {
+                    if dbe.constraint() == Some("uk_t_outsource_company_name") {
+                        return AppError::biz(
+                            code::BIZ_OUTSOURCE_COMPANY_DUPLICATE_NAME,
+                            format!("外协公司「{name}」已存在"),
+                        );
+                    }
                 }
-            }
-            AppError::from(e)
-        })?;
+                AppError::from(e)
+            })?;
 
         // 可选：创建时一并写入工序能力清单（OUTSOURCE 类别）
         if let Some(ref process_ids) = req.process_ids {
             let int_ids = Self::parse_process_ids(process_ids)?;
             Self::validate_processes_outsource(&mut *conn, &int_ids).await?;
-            Self::replace_processes(
-                &mut *conn,
-                snowflake,
-                company.id,
-                &int_ids,
-                current.id,
-            )
-            .await?;
+            Self::replace_processes(&mut *conn, snowflake, company.id, &int_ids, current.id)
+                .await?;
         }
 
         Self::build_with_processes(&mut *conn, company).await
@@ -279,15 +296,8 @@ impl OutsourceService {
         )
         .await
         .map_err(|e| {
-            if e.as_database_error()
-                .and_then(|d| d.code())
-                .as_deref()
-                == Some("23505")
-            {
-                AppError::biz(
-                    code::BIZ_OUTSOURCE_COMPANY_DUPLICATE,
-                    "外协公司名已存在",
-                )
+            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505") {
+                AppError::biz(code::BIZ_OUTSOURCE_COMPANY_DUPLICATE, "外协公司名已存在")
             } else {
                 AppError::from(e)
             }
@@ -321,7 +331,8 @@ impl OutsourceService {
                 ),
             ));
         }
-        let n = OutsourceCompanyRepo::soft_delete(&mut *conn, id, company.version, current.id).await?;
+        let n =
+            OutsourceCompanyRepo::soft_delete(&mut *conn, id, company.version, current.id).await?;
         if n == 0 {
             return Err(version_conflict());
         }
@@ -365,14 +376,19 @@ impl OutsourceService {
 
         // keyword / customer_id → part_ids
         let part_ids_in: Vec<i64> = if query.keyword.is_some() || query.customer_id.is_some() {
-            let kw = query.keyword.as_deref().map(str::trim).filter(|s| !s.is_empty());
-            let _cid = if let Some(s) = query.customer_id.as_deref().filter(|s| !s.is_empty()) {
-                Some(s.parse::<i64>().map_err(|_| {
-                    AppError::biz(code::BIZ_INVALID_VALUE, "customer_id 非整数")
-                })?)
-            } else {
-                None
-            };
+            let kw = query
+                .keyword
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let _cid =
+                if let Some(s) = query.customer_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(s.parse::<i64>().map_err(|_| {
+                        AppError::biz(code::BIZ_INVALID_VALUE, "customer_id 非整数")
+                    })?)
+                } else {
+                    None
+                };
             // 仅按 keyword（忽略 customer_id 展开以避免跨表依赖）
             if let Some(k) = kw {
                 let rows: Vec<(i64,)> = sqlx::query_as(
@@ -398,14 +414,20 @@ impl OutsourceService {
                 offset,
             });
         }
-        let part_id: Option<i64> = if let Some(s) = query.part_id.as_deref().filter(|s| !s.is_empty()) {
-            Some(s.parse::<i64>().map_err(|_| {
-                AppError::biz(code::BIZ_INVALID_VALUE, "part_id 非整数")
-            })?)
-        } else {
-            None
-        };
-        let company_id: Option<i64> = if let Some(s) = query.outsource_company_id.as_deref().filter(|s| !s.is_empty()) {
+        let part_id: Option<i64> =
+            if let Some(s) = query.part_id.as_deref().filter(|s| !s.is_empty()) {
+                Some(
+                    s.parse::<i64>()
+                        .map_err(|_| AppError::biz(code::BIZ_INVALID_VALUE, "part_id 非整数"))?,
+                )
+            } else {
+                None
+            };
+        let company_id: Option<i64> = if let Some(s) = query
+            .outsource_company_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
             Some(s.parse::<i64>().map_err(|_| {
                 AppError::biz(code::BIZ_INVALID_VALUE, "outsource_company_id 非整数")
             })?)
@@ -468,12 +490,11 @@ impl OutsourceService {
         let price = parse_price(&req.price)?;
 
         // part 存在
-        let part_exists: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(part_id)
-        .fetch_optional(&mut *conn)
-        .await?;
+        let part_exists: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+                .bind(part_id)
+                .fetch_optional(&mut *conn)
+                .await?;
         if part_exists.is_none() {
             return Err(AppError::biz(
                 code::BIZ_PART_NOT_FOUND,
@@ -485,12 +506,11 @@ impl OutsourceService {
             .await?
             .ok_or_else(|| not_found_company(company_id))?;
         // 工序存在 + OUTSOURCE 类别
-        let proc: Option<(String,)> = sqlx::query_as(
-            "SELECT category FROM t_process WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(process_id)
-        .fetch_optional(&mut *conn)
-        .await?;
+        let proc: Option<(String,)> =
+            sqlx::query_as("SELECT category FROM t_process WHERE id = $1 AND deleted_at IS NULL")
+                .bind(process_id)
+                .fetch_optional(&mut *conn)
+                .await?;
         let proc_category = proc.ok_or_else(|| {
             AppError::biz(
                 code::BIZ_PROCESS_NOT_FOUND,
@@ -504,10 +524,9 @@ impl OutsourceService {
             ));
         }
         // 重复检查（应用层预校验 + DB 部分唯一索引双重兜底）
-        if let Some(existing) = OutsourceQuoteRepo::get_active_for_tuple(
-            &mut *conn, part_id, company_id, process_id,
-        )
-        .await?
+        if let Some(existing) =
+            OutsourceQuoteRepo::get_active_for_tuple(&mut *conn, part_id, company_id, process_id)
+                .await?
         {
             return Err(AppError::biz(
                 code::BIZ_OUTSOURCE_QUOTE_DUPLICATE,
@@ -533,21 +552,19 @@ impl OutsourceService {
                 .map(str::to_string),
             created_by: current.id,
         };
-        let q = OutsourceQuoteRepo::create(&mut *conn, new).await.map_err(|e| {
-            // uq_t_outsource_quote_approved_part_process 兜底
-            if e.as_database_error()
-                .and_then(|d| d.code())
-                .as_deref()
-                == Some("23505")
-            {
-                AppError::biz(
-                    code::BIZ_OUTSOURCE_QUOTE_DUPLICATE,
-                    "同一 (零件 / 外协公司 / 工序) 已存在活跃报价",
-                )
-            } else {
-                AppError::from(e)
-            }
-        })?;
+        let q = OutsourceQuoteRepo::create(&mut *conn, new)
+            .await
+            .map_err(|e| {
+                // uq_t_outsource_quote_approved_part_process 兜底
+                if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23505") {
+                    AppError::biz(
+                        code::BIZ_OUTSOURCE_QUOTE_DUPLICATE,
+                        "同一 (零件 / 外协公司 / 工序) 已存在活跃报价",
+                    )
+                } else {
+                    AppError::from(e)
+                }
+            })?;
         // CREATED 事件
         OutsourceQuoteEventRepo::create(
             &mut *conn,
@@ -585,10 +602,7 @@ impl OutsourceService {
         if q.version != req.version {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
-                format!(
-                    "报价版本不一致：当前 {}，请求 {}",
-                    q.version, req.version
-                ),
+                format!("报价版本不一致：当前 {}，请求 {}", q.version, req.version),
             ));
         }
         let price = req.price.as_deref().map(parse_price).transpose()?;
@@ -596,15 +610,8 @@ impl OutsourceService {
             .note
             .as_ref()
             .map(|inner| inner.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()));
-        let n = OutsourceQuoteRepo::update(
-            &mut *conn,
-            id,
-            req.version,
-            price,
-            note,
-            current.id,
-        )
-        .await?;
+        let n = OutsourceQuoteRepo::update(&mut *conn, id, req.version, price, note, current.id)
+            .await?;
         if n == 0 {
             return Err(version_conflict());
         }
@@ -718,7 +725,8 @@ impl OutsourceService {
                 format!("{:?} → {:?} 不允许", from, to),
             ));
         }
-        let n = OutsourceQuoteRepo::approve(&mut *conn, id, version, review_note, current.id).await?;
+        let n =
+            OutsourceQuoteRepo::approve(&mut *conn, id, version, review_note, current.id).await?;
         if n == 0 {
             return Err(version_conflict());
         }
@@ -751,10 +759,7 @@ impl OutsourceService {
     ) -> Result<OutsourceQuoteOut, AppError> {
         current.require_role(Role::Manager)?;
         if review_note.trim().is_empty() {
-            return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                "review_note 必填",
-            ));
+            return Err(AppError::biz(code::BIZ_INVALID_VALUE, "review_note 必填"));
         }
         let q = OutsourceQuoteRepo::get_by_id(&mut *conn, id, false)
             .await?
@@ -779,7 +784,8 @@ impl OutsourceService {
                 format!("{:?} → {:?} 不允许", from, to),
             ));
         }
-        let n = OutsourceQuoteRepo::reject(&mut *conn, id, version, review_note, current.id).await?;
+        let n =
+            OutsourceQuoteRepo::reject(&mut *conn, id, version, review_note, current.id).await?;
         if n == 0 {
             return Err(version_conflict());
         }
@@ -834,10 +840,7 @@ impl OutsourceService {
         {
             if let Some(q) = req.quantity {
                 if q <= 0 {
-                    return Err(AppError::biz(
-                        code::BIZ_INVALID_VALUE,
-                        "quantity 必须 > 0",
-                    ));
+                    return Err(AppError::biz(code::BIZ_INVALID_VALUE, "quantity 必须 > 0"));
                 }
             }
         }
@@ -984,7 +987,11 @@ impl OutsourceService {
         .fetch_all(&mut *conn)
         .await?;
         let found: std::collections::HashSet<i64> = rows.iter().map(|r| r.0).collect();
-        let missing: Vec<i64> = ordered.iter().copied().filter(|p| !found.contains(p)).collect();
+        let missing: Vec<i64> = ordered
+            .iter()
+            .copied()
+            .filter(|p| !found.contains(p))
+            .collect();
         if !missing.is_empty() {
             return Err(AppError::biz(
                 code::BIZ_PROCESS_NOT_FOUND,
@@ -1018,8 +1025,9 @@ impl OutsourceService {
             .copied()
             .filter(|p| seen.insert(*p))
             .collect();
-        let _ = OutsourceCompanyProcessRepo::soft_delete_by_company(&mut *conn, company_id, updated_by)
-            .await?;
+        let _ =
+            OutsourceCompanyProcessRepo::soft_delete_by_company(&mut *conn, company_id, updated_by)
+                .await?;
         for (idx, pid) in ordered.iter().enumerate() {
             OutsourceCompanyProcessRepo::create(
                 &mut *conn,
@@ -1047,7 +1055,10 @@ impl OutsourceService {
         let company_ids: Vec<i64> = quotes.iter().map(|q| q.outsource_company_id).collect();
         let process_ids: Vec<i64> = quotes.iter().map(|q| q.process_id).collect();
 
-        let part_map: std::collections::HashMap<i64, (Option<String>, String, String, bool, Option<String>)> = {
+        let part_map: std::collections::HashMap<
+            i64,
+            (Option<String>, String, String, bool, Option<String>),
+        > = {
             let rows: Vec<(i64, Option<String>, String, String, bool, Option<String>)> =
                 sqlx::query_as(
                     "SELECT id, serial_no, drawing_no, name, is_urgent, unit_price::text \
@@ -1083,10 +1094,10 @@ impl OutsourceService {
 
         let mut out = Vec::with_capacity(quotes.len());
         for q in quotes {
-            let (serial, drawing, name, urgent, unit_price) =
-                part_map.get(&q.part_id).cloned().unwrap_or_else(|| {
-                    (None, String::new(), String::new(), false, None)
-                });
+            let (serial, drawing, name, urgent, unit_price) = part_map
+                .get(&q.part_id)
+                .cloned()
+                .unwrap_or_else(|| (None, String::new(), String::new(), false, None));
             let company_name = company_map.get(&q.outsource_company_id).cloned();
             let (proc_code, proc_name) = process_map
                 .get(&q.process_id)

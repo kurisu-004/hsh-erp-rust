@@ -367,9 +367,10 @@ impl DeliveryNoteRepo {
         other_than: Option<i64>,
     ) -> Result<Option<DeliveryNote>, sqlx::Error> {
         match scope {
-            NoteScope::Group(gid) => sqlx::query_as!(
-                DeliveryNote,
-                r#"
+            NoteScope::Group(gid) => {
+                sqlx::query_as!(
+                    DeliveryNote,
+                    r#"
                 SELECT id, delivery_note_no, customer_id, status,
                        submitted_at, picked_up_at, submitted_by, picked_up_by,
                        driver_worker_id, note, delivery_date,
@@ -384,15 +385,17 @@ impl DeliveryNoteRepo {
                 ORDER BY id ASC
                 LIMIT 1
                 "#,
-                l1_id,
-                gid,
-                other_than,
-            )
-            .fetch_optional(executor)
-            .await,
-            NoteScope::Leaf(cid) => sqlx::query_as!(
-                DeliveryNote,
-                r#"
+                    l1_id,
+                    gid,
+                    other_than,
+                )
+                .fetch_optional(executor)
+                .await
+            }
+            NoteScope::Leaf(cid) => {
+                sqlx::query_as!(
+                    DeliveryNote,
+                    r#"
                 SELECT id, delivery_note_no, customer_id, status,
                        submitted_at, picked_up_at, submitted_by, picked_up_by,
                        driver_worker_id, note, delivery_date,
@@ -407,15 +410,17 @@ impl DeliveryNoteRepo {
                 ORDER BY id ASC
                 LIMIT 1
                 "#,
-                l1_id,
-                cid,
-                other_than,
-            )
-            .fetch_optional(executor)
-            .await,
-            NoteScope::L1Wide => sqlx::query_as!(
-                DeliveryNote,
-                r#"
+                    l1_id,
+                    cid,
+                    other_than,
+                )
+                .fetch_optional(executor)
+                .await
+            }
+            NoteScope::L1Wide => {
+                sqlx::query_as!(
+                    DeliveryNote,
+                    r#"
                 SELECT id, delivery_note_no, customer_id, status,
                        submitted_at, picked_up_at, submitted_by, picked_up_by,
                        driver_worker_id, note, delivery_date,
@@ -431,11 +436,12 @@ impl DeliveryNoteRepo {
                 ORDER BY id ASC
                 LIMIT 1
                 "#,
-                l1_id,
-                other_than,
-            )
-            .fetch_optional(executor)
-            .await,
+                    l1_id,
+                    other_than,
+                )
+                .fetch_optional(executor)
+                .await
+            }
         }
     }
 }

@@ -23,14 +23,17 @@ mod common;
 #[path = "part_api_helpers.rs"]
 mod helpers;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
 use common::{
-    create_chain_for_part, create_step,add_role, clean_business_db, clean_db, insert_user_with_password, link_shelf_to_process, seed_process, test_app, test_pool, test_state};
+    add_role, clean_business_db, clean_db, create_chain_for_part, create_step,
+    insert_user_with_password, link_shelf_to_process, seed_process, test_app, test_pool,
+    test_state,
+};
 
 use helpers::*;
 
@@ -51,7 +54,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -123,7 +131,12 @@ async fn place_on_shelf_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/place-on-shelf"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/place-on-shelf"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "place-on-shelf: {env}");
@@ -154,7 +167,12 @@ async fn place_on_shelf_rbac_clerk_ok() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/place-on-shelf"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/place-on-shelf"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "clerk should be allowed: {env}");
@@ -185,10 +203,19 @@ async fn place_on_shelf_invalid_transition_rejects() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/place-on-shelf"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/place-on-shelf"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "COMPLETED → IN_PROCESS 应被状态机拒绝: {env}");
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "COMPLETED → IN_PROCESS 应被状态机拒绝: {env}"
+    );
     assert_eq!(env["code"], 20103);
 }
 
@@ -215,11 +242,20 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/place-on-shelf"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/place-on-shelf"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     // 20507 BIZ_SHELF_PROCESS_NOT_MAPPED → Phase 2 (2026-09-13) 显式映射 422
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "shelf↔process 缺失应拒绝: {env}");
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "shelf↔process 缺失应拒绝: {env}"
+    );
     assert_eq!(env["code"], 20507);
 }
 
@@ -244,7 +280,12 @@ async fn recall_to_pending_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/recall-to-pending"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/recall-to-pending"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "recall: {env}");
@@ -271,7 +312,12 @@ async fn send_to_programming_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/send-to-programming"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/send-to-programming"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "send-to-programming: {env}");
@@ -301,7 +347,12 @@ async fn release_from_programming_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/release-from-programming"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/release-from-programming"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "release: {env}");
@@ -331,10 +382,19 @@ async fn release_from_programming_rbac_inspector_rejects() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/release-from-programming"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/release-from-programming"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "INSPECTOR 不应能 release-from-programming: {env}");
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "INSPECTOR 不应能 release-from-programming: {env}"
+    );
     assert_eq!(env["code"], 40300);
 }
 
@@ -360,7 +420,12 @@ async fn scan_inspect_pass_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/scan-inspect"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/scan-inspect"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "scan-inspect PASS: {env}");
@@ -393,7 +458,12 @@ async fn scan_inspect_fail_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/scan-inspect"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/scan-inspect"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "scan-inspect FAIL: {env}");
@@ -418,7 +488,12 @@ async fn scan_inspect_invalid_transition_rejects() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/scan-inspect"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/scan-inspect"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "DELIVERED 起点不允许: {env}");
@@ -431,7 +506,8 @@ async fn scan_deliver_part_requires_driver() {
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // 创建 part 带 serial_no
-    let pid = insert_part_with_status(&pool, "P0", l2, Some("B001-001"), None, "READY_TO_SHIP").await;
+    let pid =
+        insert_part_with_status(&pool, "P0", l2, Some("B001-001"), None, "READY_TO_SHIP").await;
     let bid = insert_batch(&pool, pid, 1, 5, "READY_TO_SHIP").await;
     let _version = batch_version(&pool, bid).await;
     let (app, token, _pool) = login_manager(pool, "admin").await;

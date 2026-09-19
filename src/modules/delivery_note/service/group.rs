@@ -8,7 +8,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
     DeliveryGroupListOut, DeliveryGroupMemberOut, DeliveryGroupOut, UngroupedCustomerOut,
@@ -16,8 +16,7 @@ use super::super::dto::{
 use super::super::model::{DeliveryGroup, DeliveryGroupMember};
 use super::super::repo::DeliveryGroupRepo;
 use super::inner::{
-    group_not_found, l1_children_lookup, validate_group_name, validate_l2_members,
-    version_conflict,
+    group_not_found, l1_children_lookup, validate_group_name, validate_l2_members, version_conflict,
 };
 
 use super::DeliveryGroupService;
@@ -111,12 +110,14 @@ impl DeliveryGroupService {
         {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_GROUP_DUPLICATE_NAME,
-                format!("group name '{name}' already exists under customer {}", req.customer_id),
+                format!(
+                    "group name '{name}' already exists under customer {}",
+                    req.customer_id
+                ),
             ));
         }
 
-        let validated_members =
-            validate_l2_members(conn, &l1.id, &req.member_customer_ids).await?;
+        let validated_members = validate_l2_members(conn, &l1.id, &req.member_customer_ids).await?;
 
         let now = now_naive();
         let group = DeliveryGroup {
@@ -275,9 +276,14 @@ impl DeliveryGroupService {
         }
 
         let now = now_naive();
-        let affected =
-            DeliveryGroupRepo::soft_delete(&mut *conn, group_id, req.version, now, Some(current.id))
-                .await?;
+        let affected = DeliveryGroupRepo::soft_delete(
+            &mut *conn,
+            group_id,
+            req.version,
+            now,
+            Some(current.id),
+        )
+        .await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,

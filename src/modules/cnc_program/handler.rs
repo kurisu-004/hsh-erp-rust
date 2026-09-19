@@ -18,12 +18,12 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Multipart, Path, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::Response,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Deserialize;
 
@@ -32,7 +32,7 @@ use crate::modules::cnc_program::dto::{CncPairListOut, CncPairOut};
 use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::part_file::dto::PartFileWithUrlOut;
 use crate::modules::part_file::handler::DeletePartFileRequest;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
 
@@ -96,18 +96,25 @@ pub async fn upload_cnc_pair(
         }
     }
 
-    let data_json = data_json.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 data 字段"))?;
-    let data: PairUploadData = serde_json::from_str(&data_json).map_err(|e| {
-        AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}"))
-    })?;
+    let data_json =
+        data_json.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 data 字段"))?;
+    let data: PairUploadData = serde_json::from_str(&data_json)
+        .map_err(|e| AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}")))?;
     let part_id: i64 = data.part_id.parse().map_err(|_| {
-        AppError::biz(code::BIZ_INVALID_VALUE, format!("part_id 非法: {}", data.part_id))
+        AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            format!("part_id 非法: {}", data.part_id),
+        )
     })?;
-    let g_bytes = g_bytes.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 g_code 字段"))?;
-    let g_name = g_name.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 g_code 文件名"))?;
+    let g_bytes =
+        g_bytes.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 g_code 字段"))?;
+    let g_name =
+        g_name.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 g_code 文件名"))?;
     let g_ct = g_ct.unwrap_or_else(|| "application/octet-stream".to_string());
-    let s_bytes = s_bytes.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 setup_sheet 字段"))?;
-    let s_name = s_name.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 setup_sheet 文件名"))?;
+    let s_bytes =
+        s_bytes.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 setup_sheet 字段"))?;
+    let s_name =
+        s_name.ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "缺少 setup_sheet 文件名"))?;
     let s_ct = s_ct.unwrap_or_else(|| "application/pdf".to_string());
 
     let mut tx = state.pool.begin().await?;
@@ -136,7 +143,8 @@ pub async fn list_pairs_for_part(
     Path(part_id): Path<i64>,
 ) -> Result<Json<R<CncPairListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = CncProgramService::list_pairs_for_part(&mut tx, state.cos.clone(), part_id, &current).await?;
+    let out = CncProgramService::list_pairs_for_part(&mut tx, state.cos.clone(), part_id, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -148,7 +156,8 @@ pub async fn get_cnc_program_download_url(
     Path(file_id): Path<i64>,
 ) -> Result<Json<R<PartFileWithUrlOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = CncProgramService::get_download_url(&mut tx, state.cos.clone(), file_id, &current).await?;
+    let out =
+        CncProgramService::get_download_url(&mut tx, state.cos.clone(), file_id, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -166,7 +175,8 @@ pub async fn get_cnc_program_content(
         .status(StatusCode::OK)
         .header(
             header::CONTENT_TYPE,
-            out.content_type.unwrap_or_else(|| "application/octet-stream".to_string()),
+            out.content_type
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
         )
         .header(header::CONTENT_LENGTH, out.bytes.len())
         .body(Body::from(out.bytes))

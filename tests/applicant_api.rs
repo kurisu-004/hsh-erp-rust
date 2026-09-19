@@ -21,9 +21,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -49,7 +49,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -244,12 +249,7 @@ async fn create_get_update_soft_delete_applicant_happy_path() {
     // get
     let (s, env) = send(
         app.clone(),
-        json_request(
-            "GET",
-            &format!("/com/applicants/{id}"),
-            None,
-            Some(&token),
-        ),
+        json_request("GET", &format!("/com/applicants/{id}"), None, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "get: {env}");
@@ -289,12 +289,7 @@ async fn create_get_update_soft_delete_applicant_happy_path() {
     // 软删后 GET → 404 / code=21001
     let (s, env) = send(
         app,
-        json_request(
-            "GET",
-            &format!("/com/applicants/{id}"),
-            None,
-            Some(&token),
-        ),
+        json_request("GET", &format!("/com/applicants/{id}"), None, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "软删后 GET 应 404: {env}");
@@ -389,18 +384,8 @@ async fn update_with_stale_version_returns_409() {
 
     // 两个并发 update（不同名字）—— 一个会成功 V=0→1，另一个会撞 stale version → 40901
     let uri = format!("/com/applicants/{id}/update");
-    let req_a = json_request(
-        "POST",
-        &uri,
-        Some(json!({"name": "name-A"})),
-        Some(&token1),
-    );
-    let req_b = json_request(
-        "POST",
-        &uri,
-        Some(json!({"name": "name-B"})),
-        Some(&token2),
-    );
+    let req_a = json_request("POST", &uri, Some(json!({"name": "name-A"})), Some(&token1));
+    let req_b = json_request("POST", &uri, Some(json!({"name": "name-B"})), Some(&token2));
     let (r1, r2) = tokio::join!(send(app1, req_a), send(app2, req_b));
     let (s_a, e_a) = r1;
     let (s_b, e_b) = r2;
@@ -408,7 +393,10 @@ async fn update_with_stale_version_returns_409() {
     // 期望：恰好一个 200，一个 409
     let pair = [(s_a, &e_a), (s_b, &e_b)];
     let ok_count = pair.iter().filter(|(s, _)| *s == StatusCode::OK).count();
-    let conflict_count = pair.iter().filter(|(s, _)| *s == StatusCode::CONFLICT).count();
+    let conflict_count = pair
+        .iter()
+        .filter(|(s, _)| *s == StatusCode::CONFLICT)
+        .count();
     assert_eq!(
         ok_count, 1,
         "exactly one update should succeed: A={s_a}/{e_a}; B={s_b}/{e_b}"

@@ -20,8 +20,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
 use axum::Json;
+use axum::extract::{Query, State};
 use serde::Deserialize;
 
 use crate::auth::rbac::{CurrentUser, Role};
@@ -31,8 +31,8 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::dto::{
-    AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AssignResult,
-    AutoAllocateRequest, AutoAllocateResult, ProcessPoolDetail,
+    AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AssignResult, AutoAllocateRequest,
+    AutoAllocateResult, ProcessPoolDetail,
 };
 use super::model::RefillResult;
 use super::model::WorkerPoolState;
@@ -172,8 +172,7 @@ pub async fn admin_assign(
 ) -> Result<Json<R<AssignResult>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let result =
-        WorkerPoolService::assign_batch_to_worker(&mut tx, &state.snowflake, req, &current)
-            .await?;
+        WorkerPoolService::assign_batch_to_worker(&mut tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "WORKER_POOL_ASSIGN_DONE".into(),

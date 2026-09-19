@@ -397,13 +397,11 @@ async fn alias_delete_soft_deletes_file() {
     .await
     .expect("upload pair ok");
     tx.commit().await.unwrap();
-    let version = sqlx::query_scalar::<_, i32>(
-        "SELECT version FROM t_part_file WHERE id = $1",
-    )
-    .bind(out.g_code.id)
-    .fetch_one(&pool)
-    .await
-    .expect("get version");
+    let version = sqlx::query_scalar::<_, i32>("SELECT version FROM t_part_file WHERE id = $1")
+        .bind(out.g_code.id)
+        .fetch_one(&pool)
+        .await
+        .expect("get version");
 
     let mut tx = pool.begin().await.unwrap();
     CncProgramService::delete(&mut tx, cos, out.g_code.id, version, &current)
@@ -413,10 +411,13 @@ async fn alias_delete_soft_deletes_file() {
 
     // 查应 not found
     let mut tx = pool.begin().await.unwrap();
-    let row =
-        hsh_erp_rust::modules::part_file::repo::PartFileRepo::get_by_id(&mut *tx, out.g_code.id, false)
-            .await
-            .unwrap();
+    let row = hsh_erp_rust::modules::part_file::repo::PartFileRepo::get_by_id(
+        &mut *tx,
+        out.g_code.id,
+        false,
+    )
+    .await
+    .unwrap();
     drop(tx);
     assert!(row.is_none(), "G_CODE 软删后应查不到");
 }

@@ -17,7 +17,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::applicant::dto::*;
 use crate::modules::com::applicant::model::TApplicant;
 use crate::modules::com::applicant::repo::ApplicantRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 100;
 const MAX_LIMIT: i64 = 500;
@@ -29,10 +29,16 @@ fn version_conflict() -> AppError {
     AppError::biz(code::VERSION_CONFLICT, "乐观锁冲突，请刷新后重试")
 }
 fn duplicate_name() -> AppError {
-    AppError::biz(code::BIZ_APPLICANT_DUPLICATE_NAME, "同一客户下已存在同名申请人")
+    AppError::biz(
+        code::BIZ_APPLICANT_DUPLICATE_NAME,
+        "同一客户下已存在同名申请人",
+    )
 }
 fn bad_customer() -> AppError {
-    AppError::biz(code::BIZ_APPLICANT_BAD_CUSTOMER, "customer_id 必须指向一级客户（L1）")
+    AppError::biz(
+        code::BIZ_APPLICANT_BAD_CUSTOMER,
+        "customer_id 必须指向一级客户（L1）",
+    )
 }
 fn in_use() -> AppError {
     AppError::biz(code::BIZ_APPLICANT_IN_USE, "申请人被零件引用，无法软删")
@@ -75,12 +81,10 @@ impl ApplicantService {
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
 
-        let rows = ApplicantRepo::list_with_filters(
-            &mut *conn, customer_id, name_like, limit, offset,
-        ).await?;
-        let total = ApplicantRepo::count_with_filters(
-            &mut *conn, customer_id, name_like,
-        ).await?;
+        let rows =
+            ApplicantRepo::list_with_filters(&mut *conn, customer_id, name_like, limit, offset)
+                .await?;
+        let total = ApplicantRepo::count_with_filters(&mut *conn, customer_id, name_like).await?;
 
         // 一次性补 customer_name（防 N+1；空列表短路）
         let names = if rows.is_empty() {
@@ -94,7 +98,12 @@ impl ApplicantService {
             .map(|(a, n)| to_applicant_out(a, n))
             .collect();
 
-        Ok(ApplicantListOut { items, total, limit, offset })
+        Ok(ApplicantListOut {
+            items,
+            total,
+            limit,
+            offset,
+        })
     }
 
     pub async fn get_applicant(
@@ -103,7 +112,8 @@ impl ApplicantService {
         current: &CurrentUser,
     ) -> Result<ApplicantOut, AppError> {
         require_role(current)?;
-        let row = ApplicantRepo::get_by_id(&mut *conn, id, false).await?
+        let row = ApplicantRepo::get_by_id(&mut *conn, id, false)
+            .await?
             .ok_or_else(applicant_not_found)?;
         let customer_name = ApplicantRepo::customer_name(&mut *conn, row.customer_id).await?;
         Ok(to_applicant_out(row, customer_name))
@@ -119,10 +129,7 @@ impl ApplicantService {
 
         let name = req.name.trim();
         if name.is_empty() {
-            return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                "申请人姓名不能为空",
-            ));
+            return Err(AppError::biz(code::BIZ_INVALID_VALUE, "申请人姓名不能为空"));
         }
         let customer_id = req.customer_id.parse::<i64>().map_err(|_| bad_customer())?;
 
@@ -139,12 +146,11 @@ impl ApplicantService {
         }
 
         let new_id = sf.next_id();
-        ApplicantRepo::create(
-            &mut *conn, new_id, name, customer_id, Some(current.id),
-        ).await?;
+        ApplicantRepo::create(&mut *conn, new_id, name, customer_id, Some(current.id)).await?;
 
         // 重读一次拿 server-side defaults（version / created_at / updated_at）
-        let row = ApplicantRepo::get_by_id(&mut *conn, new_id, false).await?
+        let row = ApplicantRepo::get_by_id(&mut *conn, new_id, false)
+            .await?
             .ok_or_else(applicant_not_found)?;
         let customer_name = ApplicantRepo::customer_name(&mut *conn, row.customer_id).await?;
         Ok(to_applicant_out(row, customer_name))
@@ -158,7 +164,8 @@ impl ApplicantService {
     ) -> Result<ApplicantOut, AppError> {
         require_role(current)?;
 
-        let row = ApplicantRepo::get_by_id(&mut *conn, id, false).await?
+        let row = ApplicantRepo::get_by_id(&mut *conn, id, false)
+            .await?
             .ok_or_else(applicant_not_found)?;
 
         // name: Some("") ⇒ 显式清空（拒，校验失败）；None ⇒ 不修改
@@ -166,10 +173,7 @@ impl ApplicantService {
             Some(s) => {
                 let t = s.trim();
                 if t.is_empty() {
-                    return Err(AppError::biz(
-                        code::BIZ_INVALID_VALUE,
-                        "申请人姓名不能为空",
-                    ));
+                    return Err(AppError::biz(code::BIZ_INVALID_VALUE, "申请人姓名不能为空"));
                 }
                 Some(t)
             }
@@ -194,12 +198,14 @@ impl ApplicantService {
             new_name,
             new_customer_id,
             Some(current.id),
-        ).await?;
+        )
+        .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
-        let updated = ApplicantRepo::get_by_id(&mut *conn, id, false).await?
+        let updated = ApplicantRepo::get_by_id(&mut *conn, id, false)
+            .await?
             .ok_or_else(applicant_not_found)?;
         let customer_name = ApplicantRepo::customer_name(&mut *conn, updated.customer_id).await?;
         Ok(to_applicant_out(updated, customer_name))
@@ -212,20 +218,20 @@ impl ApplicantService {
     ) -> Result<(), AppError> {
         require_role(current)?;
 
-        let row = ApplicantRepo::get_by_id(&mut *conn, id, false).await?
+        let row = ApplicantRepo::get_by_id(&mut *conn, id, false)
+            .await?
             .ok_or_else(applicant_not_found)?;
 
         // in-use 校验：被 t_part 引用则拒
-        let ref_count = ApplicantRepo::count_parts_using_applicant_name(
-            &mut *conn, &row.name, row.customer_id,
-        ).await?;
+        let ref_count =
+            ApplicantRepo::count_parts_using_applicant_name(&mut *conn, &row.name, row.customer_id)
+                .await?;
         if ref_count > 0 {
             return Err(in_use());
         }
 
-        let affected = ApplicantRepo::soft_delete(
-            &mut *conn, id, row.version, Some(current.id),
-        ).await?;
+        let affected =
+            ApplicantRepo::soft_delete(&mut *conn, id, row.version, Some(current.id)).await?;
         if affected == 0 {
             return Err(version_conflict());
         }
@@ -251,13 +257,12 @@ async fn lookup_customer_names(
         }
         s.into_iter().collect()
     };
-    let names: Vec<(i64, Option<String>)> = sqlx::query_as(
-        "SELECT id, name FROM t_customer WHERE id = ANY($1) AND deleted_at IS NULL",
-    )
-    .bind(&unique)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(AppError::from)?;
+    let names: Vec<(i64, Option<String>)> =
+        sqlx::query_as("SELECT id, name FROM t_customer WHERE id = ANY($1) AND deleted_at IS NULL")
+            .bind(&unique)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(AppError::from)?;
     let map: HashMap<i64, String> = names
         .into_iter()
         .filter_map(|(i, n)| n.map(|s| (i, s)))

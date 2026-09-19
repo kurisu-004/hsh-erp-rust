@@ -12,9 +12,9 @@
 //! 编译期宏需要 `.sqlx` 离线缓存（sqlx_prepare.sh 产物）；本域运行时 SQL
 //! 改动频繁（Phase 3 集中落地），不强依赖离线缓存。
 
+use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 use sqlx::PgExecutor;
-use sha2::{Digest, Sha256};
 
 use super::model::TPartFile;
 
@@ -220,7 +220,11 @@ impl PartFileRepo {
 pub fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -245,6 +249,9 @@ mod tests {
     fn hash_bytes_output_64_chars_lowercase_hex() {
         let s = hash_bytes(b"test");
         assert_eq!(s.len(), 64);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 }

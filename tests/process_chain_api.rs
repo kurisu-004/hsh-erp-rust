@@ -18,15 +18,13 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{
-    add_role, insert_user_with_password, test_app, test_state,
-};
+use common::{add_role, insert_user_with_password, test_app, test_state};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
@@ -150,7 +148,12 @@ async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
-    let one_char: String = prefix.chars().next().unwrap_or('X').to_ascii_uppercase().to_string();
+    let one_char: String = prefix
+        .chars()
+        .next()
+        .unwrap_or('X')
+        .to_ascii_uppercase()
+        .to_string();
     sqlx::query!(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) \
@@ -222,7 +225,10 @@ async fn upsert_then_get_by_part_happy() {
     assert_eq!(s, StatusCode::OK, "upsert: {env}");
     let data = &env["data"];
     // 2026-09-16 FK 翻转：ProcessChainOut 不再含 part_id（归属关系由 part 侧承载）
-    assert!(data.get("part_id").is_none(), "契约变更：不应再有 part_id: {env}");
+    assert!(
+        data.get("part_id").is_none(),
+        "契约变更：不应再有 part_id: {env}"
+    );
     assert_eq!(data["name"], "默认工艺");
     assert_eq!(data["note"], "happy path");
     let steps = data["steps"].as_array().expect("steps array");
@@ -244,7 +250,11 @@ async fn upsert_then_get_by_part_happy() {
     .fetch_one(&pool)
     .await
     .expect("read part.process_chain_id");
-    assert_eq!(linked, Some(chain_id_i64), "part.process_chain_id 应回写: {env}");
+    assert_eq!(
+        linked,
+        Some(chain_id_i64),
+        "part.process_chain_id 应回写: {env}"
+    );
 
     // 2. fetch by part
     let state = test_state(_pool).await;
@@ -338,11 +348,15 @@ async fn upsert_replaces_old_steps() {
     assert_eq!(env2["data"]["name"], "新链", "name 应更新");
     assert!(
         env2["data"]["version"].as_i64().unwrap() > version_before,
-        "version 应自增 (前={version_before}, 后={})", env2["data"]["version"]
+        "version 应自增 (前={version_before}, 后={})",
+        env2["data"]["version"]
     );
     let steps = env2["data"]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), 1, "应只剩 1 步");
-    assert_eq!(steps[0]["estimated_minutes"], 60, "应使用新 step 的 minutes");
+    assert_eq!(
+        steps[0]["estimated_minutes"], 60,
+        "应使用新 step 的 minutes"
+    );
 
     // 3. 验证旧 step 已软删（DB 直接查）
     let chain_id_i64: i64 = chain_id.parse().expect("parse chain_id");
@@ -513,7 +527,11 @@ async fn step_note_round_trip() {
         "第 1 步 note 应保留原文: {env}"
     );
     assert!(
-        steps[1]["note"].is_null() || steps[1]["note"].as_str().map(|s| s.is_empty()).unwrap_or(true),
+        steps[1]["note"].is_null()
+            || steps[1]["note"]
+                .as_str()
+                .map(|s| s.is_empty())
+                .unwrap_or(true),
         "第 2 步 note 应为空: {env}"
     );
 
@@ -561,7 +579,10 @@ async fn upsert_rejects_non_pending_part() {
     )
     .await;
     assert_eq!(s, StatusCode::CONFLICT, "非 PENDING 应 409: {env}");
-    assert_eq!(env["code"], 20705, "BIZ_PROCESS_CHAIN_PART_NOT_PENDING: {env}");
+    assert_eq!(
+        env["code"], 20705,
+        "BIZ_PROCESS_CHAIN_PART_NOT_PENDING: {env}"
+    );
 }
 
 /// 场景 9: GET /process-chains/{chain_id} 命中 / 未命中（2026-09-16 新增端点）

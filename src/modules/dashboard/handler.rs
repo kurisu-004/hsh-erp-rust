@@ -25,12 +25,12 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::auth::jwt::decode_access;
-use crate::auth::rbac::{parse_role_str_or_warn, CurrentUser};
+use crate::auth::rbac::{CurrentUser, parse_role_str_or_warn};
 use crate::auth::session::hash_token;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::dashboard::dto::{WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
 use crate::modules::dashboard::service::DashboardService;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -51,11 +51,7 @@ pub async fn ws_dashboard(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "缺少 token 查询参数"))?;
-    let claims = decode_access(
-        token,
-        &state.config.jwt.secret,
-        &state.config.jwt.issuer,
-    )?;
+    let claims = decode_access(token, &state.config.jwt.secret, &state.config.jwt.issuer)?;
 
     // 2. 服务端 session 校验（与 HTTP extractor 同语义）
     let cached_roles = if state.config.redis.session_check_enabled {
@@ -64,9 +60,7 @@ pub async fn ws_dashboard(
             .session
             .get_session(&token_hash)
             .await?
-            .ok_or_else(|| {
-                AppError::biz(code::SESSION_REVOKED, "会话已被吊销，请重新登录")
-            })?;
+            .ok_or_else(|| AppError::biz(code::SESSION_REVOKED, "会话已被吊销，请重新登录"))?;
         if cached.user_id != claims.sub {
             return Err(AppError::biz(
                 code::SESSION_REVOKED,
@@ -142,8 +136,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: i64) {
         return;
     }
 
-    let heartbeat_interval =
-        Duration::from_secs(state.config.ws_heartbeat_interval_seconds.max(1));
+    let heartbeat_interval = Duration::from_secs(state.config.ws_heartbeat_interval_seconds.max(1));
     // 2026-09-15 followup-cleanup A5：首次 tick 不立即 fire（`interval_at` 把首次
     // 触发时刻推迟到 now + period）；原 `interval(30s)` 在 select! 第一次轮询
     // 时立刻 ready，会浪费一帧 CPU / 误导 E2E 用例把首 tick 误当成 30s 后的真心跳。
@@ -246,6 +239,8 @@ async fn send_msg(
     text: &str,
 ) -> Result<(), axum::Error> {
     sender
-        .send(Message::Text(axum::extract::ws::Utf8Bytes::from(text.to_string())))
+        .send(Message::Text(axum::extract::ws::Utf8Bytes::from(
+            text.to_string(),
+        )))
         .await
 }

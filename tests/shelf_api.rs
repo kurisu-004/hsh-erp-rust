@@ -22,9 +22,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -45,15 +45,17 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
         .await
         .expect("read body");
     let body_str = String::from_utf8_lossy(&body).to_string();
-    let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!(
-            "parse JSON: {e}; status={status}; raw = {body_str:?}"
-        )
-    });
+    let envelope: Value = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("parse JSON: {e}; status={status}; raw = {body_str:?}"));
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -106,8 +108,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
 /// 改查 t_part_batch 真相源（status + holder + location 三维核对），fixture 同步改写。
 async fn insert_part_held_by_shelf(pool: &PgPool, shelf_id: i64, status: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake =
-        hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let batch_id = snowflake.next_id();
     let now = now_naive();
@@ -149,8 +150,7 @@ async fn insert_part_held_by_shelf(pool: &PgPool, shelf_id: i64, status: &str) -
 /// 直插一个 INHOUSE t_process 工序（mapping 端点要校验 process_id 存在）。
 async fn insert_test_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake =
-        hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -213,7 +213,11 @@ async fn create_then_get_shelf_round_trip() {
         json_request("GET", &format!("/shelves/{shelf_id}"), None, Some(&token)),
     )
     .await;
-    assert_eq!(s_get, StatusCode::OK, "get shelf should return 200; got: {env_get}");
+    assert_eq!(
+        s_get,
+        StatusCode::OK,
+        "get shelf should return 200; got: {env_get}"
+    );
     assert_eq!(env_get["code"], 0);
     assert_eq!(env_get["data"]["id"].as_str().unwrap(), shelf_id);
     assert_eq!(env_get["data"]["code"], "S-CRT-01");
@@ -368,13 +372,14 @@ async fn set_shelf_processes_replaces_existing_mapping() {
     assert_eq!(pids, vec![p2.to_string(), p3.to_string()]);
 
     // 6. DB 侧：P1 mapping 行已软删
-    let row: Option<(Option<chrono::NaiveDateTime>,)> =
-        sqlx::query_as("SELECT deleted_at FROM t_shelf_process WHERE shelf_id = $1 AND process_id = $2")
-            .bind(shelf_id)
-            .bind(p1)
-            .fetch_optional(&pool)
-            .await
-            .expect("query old mapping deleted_at");
+    let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(
+        "SELECT deleted_at FROM t_shelf_process WHERE shelf_id = $1 AND process_id = $2",
+    )
+    .bind(shelf_id)
+    .bind(p1)
+    .fetch_optional(&pool)
+    .await
+    .expect("query old mapping deleted_at");
     let deleted_at = row.expect("old mapping row exists").0;
     assert!(
         deleted_at.is_some(),

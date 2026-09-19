@@ -21,7 +21,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 /// 把 DB / Redis 缓存里的大写 role 字符串转回 `Role` 枚举。
 ///

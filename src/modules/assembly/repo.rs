@@ -202,18 +202,21 @@ impl AssemblyRepo {
         qb.push_bind(upd.updated_by);
         let mut sep: &'static str = " , ";
         let push_opt_str = |qb: &mut QueryBuilder<Postgres>,
-                                col: &str,
-                                v: Option<&str>,
-                                sep: &mut &'static str| {
+                            col: &str,
+                            v: Option<&str>,
+                            sep: &mut &'static str| {
             if let Some(val) = v {
-                qb.push(*sep).push(col).push(" = ").push_bind(val.to_string());
+                qb.push(*sep)
+                    .push(col)
+                    .push(" = ")
+                    .push_bind(val.to_string());
                 *sep = " , ";
             }
         };
         let push_opt_opt_str = |qb: &mut QueryBuilder<Postgres>,
-                                    col: &str,
-                                    v: Option<Option<&str>>,
-                                    sep: &mut &'static str| {
+                                col: &str,
+                                v: Option<Option<&str>>,
+                                sep: &mut &'static str| {
             if let Some(opt) = v {
                 qb.push(*sep).push(col).push(" = ");
                 match opt {
@@ -228,9 +231,9 @@ impl AssemblyRepo {
             }
         };
         let push_opt_opt_date = |qb: &mut QueryBuilder<Postgres>,
-                                     col: &str,
-                                     v: Option<Option<NaiveDate>>,
-                                     sep: &mut &'static str| {
+                                 col: &str,
+                                 v: Option<Option<NaiveDate>>,
+                                 sep: &mut &'static str| {
             if let Some(opt) = v {
                 qb.push(*sep).push(col).push(" = ");
                 match opt {
@@ -245,9 +248,9 @@ impl AssemblyRepo {
             }
         };
         let push_opt_opt_dec = |qb: &mut QueryBuilder<Postgres>,
-                                    col: &str,
-                                    v: Option<Option<Decimal>>,
-                                    sep: &mut &'static str| {
+                                col: &str,
+                                v: Option<Option<Decimal>>,
+                                sep: &mut &'static str| {
             if let Some(opt) = v {
                 qb.push(*sep).push(col).push(" = ");
                 match opt {
@@ -294,8 +297,10 @@ impl AssemblyRepo {
         );
         push_opt_opt_str(&mut qb, "note", upd.note, &mut sep);
 
-        qb.push(" WHERE id = ").push_bind(id)
-            .push(" AND version = ").push_bind(expected_version)
+        qb.push(" WHERE id = ")
+            .push_bind(id)
+            .push(" AND version = ")
+            .push_bind(expected_version)
             .push(" AND deleted_at IS NULL");
         let res = qb.build().execute(executor).await?;
         Ok(res.rows_affected())
@@ -411,13 +416,24 @@ impl AssemblyRepo {
         }
         if let Some(k) = f.keyword {
             let pat = format!("%{}%", k.trim());
-            qb.push(" AND (drawing_no ILIKE ").push_bind(pat.clone())
-                .push(" OR name ILIKE ").push_bind(pat)
-                .push(" OR serial_no ILIKE ").push_bind(format!("%{}%", k.trim()))
+            qb.push(" AND (drawing_no ILIKE ")
+                .push_bind(pat.clone())
+                .push(" OR name ILIKE ")
+                .push_bind(pat)
+                .push(" OR serial_no ILIKE ")
+                .push_bind(format!("%{}%", k.trim()))
                 .push(")");
         }
         let col = assembly_sort_col(f.sort_by);
-        let dir = if f.sort_dir.map(|s| s.eq_ignore_ascii_case("ASC")).unwrap_or(false) { "ASC" } else { "DESC" };
+        let dir = if f
+            .sort_dir
+            .map(|s| s.eq_ignore_ascii_case("ASC"))
+            .unwrap_or(false)
+        {
+            "ASC"
+        } else {
+            "DESC"
+        };
         qb.push(" ORDER BY ").push(col).push(" ").push(dir);
         qb.push(" LIMIT ").push_bind(f.limit);
         qb.push(" OFFSET ").push_bind(f.offset);
@@ -428,7 +444,8 @@ impl AssemblyRepo {
         executor: E,
         f: &AssemblyListFilters<'_>,
     ) -> Result<i64, sqlx::Error> {
-        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new("SELECT COUNT(*) FROM t_assembly WHERE 1=1");
+        let mut qb: QueryBuilder<Postgres> =
+            QueryBuilder::new("SELECT COUNT(*) FROM t_assembly WHERE 1=1");
         if !f.include_deleted {
             qb.push(" AND deleted_at IS NULL");
         }
@@ -456,9 +473,12 @@ impl AssemblyRepo {
         }
         if let Some(k) = f.keyword {
             let pat = format!("%{}%", k.trim());
-            qb.push(" AND (drawing_no ILIKE ").push_bind(pat.clone())
-                .push(" OR name ILIKE ").push_bind(pat)
-                .push(" OR serial_no ILIKE ").push_bind(format!("%{}%", k.trim()))
+            qb.push(" AND (drawing_no ILIKE ")
+                .push_bind(pat.clone())
+                .push(" OR name ILIKE ")
+                .push_bind(pat)
+                .push(" OR serial_no ILIKE ")
+                .push_bind(format!("%{}%", k.trim()))
                 .push(")");
         }
         let row: (i64,) = qb.build_query_as().fetch_one(executor).await?;

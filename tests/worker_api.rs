@@ -17,9 +17,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -43,14 +43,17 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
         .expect("read body");
     let body_str = String::from_utf8_lossy(&body).to_string();
     let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!(
-            "parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}"
-        )
+        panic!("parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}")
     });
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -114,11 +117,7 @@ async fn verify_badge_inactive_returns_20202() {
         ),
     )
     .await;
-    assert_eq!(
-        s_create,
-        StatusCode::CREATED,
-        "create worker: {env_create}"
-    );
+    assert_eq!(s_create, StatusCode::CREATED, "create worker: {env_create}");
     assert_eq!(env_create["code"], 0);
     let wid = env_create["data"]["id"].as_str().unwrap().to_string();
 
@@ -133,11 +132,7 @@ async fn verify_badge_inactive_returns_20202() {
         ),
     )
     .await;
-    assert_eq!(
-        s_deact,
-        StatusCode::OK,
-        "deactivate worker: {env_deact}"
-    );
+    assert_eq!(s_deact, StatusCode::OK, "deactivate worker: {env_deact}");
 
     // verify-badge → 20202 (BIZ_WORKER_INACTIVE) with HTTP 400
     let (s_verify, env_verify) = send(

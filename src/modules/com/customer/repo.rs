@@ -185,9 +185,8 @@ impl CustomerRepo {
         parent_id: Option<i64>,
         is_root: Option<bool>,
     ) -> Result<i64, sqlx::Error> {
-        let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-            "SELECT COUNT(*)::bigint FROM t_customer WHERE deleted_at IS NULL",
-        );
+        let mut qb: QueryBuilder<sqlx::Postgres> =
+            QueryBuilder::new("SELECT COUNT(*)::bigint FROM t_customer WHERE deleted_at IS NULL");
         if let Some(p) = parent_id {
             qb.push(" AND parent_id = ").push_bind(p);
         } else if matches!(is_root, Some(true)) {

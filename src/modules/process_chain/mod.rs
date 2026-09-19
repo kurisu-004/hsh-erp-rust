@@ -26,14 +26,17 @@ pub mod repo;
 pub mod service;
 pub mod statemachine;
 
-use std::sync::Arc;
-use axum::{routing::get, Router};
 use crate::state::AppState;
+use axum::{Router, routing::get};
+use std::sync::Arc;
 
 /// process_chain 域路由表（挂载点 `/api/v2/process-chains`，见 `modules::v2_router`）。
 /// 静态段 `by-part` 优先于参数段 `{chain_id}`（axum 路由匹配规则），顺序无关。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/by-part/{part_id}", get(handler::get_by_part).put(handler::upsert))
+        .route(
+            "/by-part/{part_id}",
+            get(handler::get_by_part).put(handler::upsert),
+        )
         .route("/{chain_id}", get(handler::get_by_id))
 }

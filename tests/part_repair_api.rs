@@ -12,14 +12,16 @@ mod common;
 #[path = "part_api_helpers.rs"]
 mod helpers;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
 use common::{
-    create_chain_for_part, create_step,clean_business_db, clean_db, link_shelf_to_process, seed_process, test_pool};
+    clean_business_db, clean_db, create_chain_for_part, create_step, link_shelf_to_process,
+    seed_process, test_pool,
+};
 
 use helpers::*;
 
@@ -36,7 +38,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -85,7 +92,12 @@ async fn complete_repair_to_process_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/complete-repair"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/complete-repair"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "complete-repair: {env}");
@@ -109,7 +121,12 @@ async fn complete_repair_to_inspection_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/complete-repair"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/complete-repair"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "complete-repair INSPECTION: {env}");
@@ -139,7 +156,12 @@ async fn complete_repair_invalid_source_rejects() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/complete-repair"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/complete-repair"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "PENDING 起点不允许: {env}");
@@ -164,7 +186,12 @@ async fn repair_dispatch_happy_path() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/repair-dispatch"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/repair-dispatch"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "repair-dispatch: {env}");
@@ -188,7 +215,12 @@ async fn repair_dispatch_invalid_source_rejects() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/parts/{pid}/repair-dispatch"), Some(body), Some(&token)),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/repair-dispatch"),
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "CANCELLED 起点不允许: {env}");

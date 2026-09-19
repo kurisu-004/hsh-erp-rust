@@ -23,8 +23,8 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::shelf::dto::{
-    AllShelfProcessMappingOut, SetShelfProcessesRequest, ShelfForInspectionOut, ShelfForReturnOut,
-    ShelfForReturnQuery, ShelfListOut, ShelfListQuery, ShelfOut, ShelfCreateRequest,
+    AllShelfProcessMappingOut, SetShelfProcessesRequest, ShelfCreateRequest, ShelfForInspectionOut,
+    ShelfForReturnOut, ShelfForReturnQuery, ShelfListOut, ShelfListQuery, ShelfOut,
     ShelfProcessMappingOut, ShelfUpdateRequest,
 };
 use crate::modules::shelf::process_mapping::ShelfProcessService;
@@ -148,14 +148,8 @@ pub async fn set_shelf_processes(
     Json(req): Json<SetShelfProcessesRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    ShelfProcessService::set_shelf_processes(
-        &mut tx,
-        &state.snowflake,
-        id,
-        &req.items,
-        &current,
-    )
-    .await?;
+    ShelfProcessService::set_shelf_processes(&mut tx, &state.snowflake, id, &req.items, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(())))
 }
@@ -170,5 +164,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}", get(get_shelf))
         .route("/{id}/update", post(update_shelf))
         .route("/{id}/deactivate", post(deactivate_shelf))
-        .route("/{id}/processes", get(list_shelf_processes).post(set_shelf_processes))
+        .route(
+            "/{id}/processes",
+            get(list_shelf_processes).post(set_shelf_processes),
+        )
 }

@@ -440,9 +440,15 @@ impl StatisticsRepo {
                     worker_id: r.get::<i64, _>("worker_id"),
                     worker_name: r.get::<String, _>("worker_name"),
                     badge_code: r.get::<String, _>("badge_code"),
-                    work_type_name: r.try_get::<Option<String>, _>("work_type_name").ok().flatten(),
+                    work_type_name: r
+                        .try_get::<Option<String>, _>("work_type_name")
+                        .ok()
+                        .flatten(),
                     skip_count: r.get::<i64, _>("skip_count"),
-                    last_skip_at: r.try_get::<Option<NaiveDateTime>, _>("last_skip_at").ok().flatten(),
+                    last_skip_at: r
+                        .try_get::<Option<NaiveDateTime>, _>("last_skip_at")
+                        .ok()
+                        .flatten(),
                 })
             })
             .collect()

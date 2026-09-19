@@ -12,16 +12,16 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
 use common::{
-    create_chain_for_part, create_step,
-    add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
-    link_shelf_to_process, seed_process, test_app, test_pool, test_state,
+    add_role, clean_business_db, clean_db, create_chain_for_part, create_step,
+    ensure_database_exists, insert_user_with_password, link_shelf_to_process, seed_process,
+    test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -39,14 +39,17 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
         .expect("read body");
     let body_str = String::from_utf8_lossy(&body).to_string();
     let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!(
-            "parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}"
-        )
+        panic!("parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}")
     });
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -92,9 +95,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -113,9 +114,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 
 async fn insert_part(pool: &PgPool, customer_id: i64, status: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -138,9 +137,7 @@ async fn insert_part(pool: &PgPool, customer_id: i64, status: &str) -> i64 {
 
 async fn insert_batch(pool: &PgPool, part_id: i64, status: &str, location: Option<&str>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -161,9 +158,7 @@ async fn insert_batch(pool: &PgPool, part_id: i64, status: &str, location: Optio
 
 async fn insert_outsource_company(pool: &PgPool, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -181,9 +176,7 @@ async fn insert_outsource_company(pool: &PgPool, name: &str) -> i64 {
 
 async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -208,9 +201,7 @@ async fn insert_approved_quote(
     process_id: i64,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -365,13 +356,12 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
     )
     .await;
     assert_eq!(env2["code"], 0, "2nd send: {env2}");
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM t_outsource_shipment WHERE batch_id = $1",
-    )
-    .bind(bid)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_shipment WHERE batch_id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(count, 2);
 }
 
@@ -384,7 +374,6 @@ async fn send_to_outsource_direct_returns_internal_error() {
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "DirCo").await;
     let proc_id = seed_outsource_process(&pool, "PDIR", "dir").await;
-
 
     // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
     // receive-from-outsource 要求 part 已绑定工艺链
@@ -427,9 +416,7 @@ async fn send_to_outsource_quote_not_approved_returns_21307() {
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let qid = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_outsource_quote \
@@ -528,13 +515,12 @@ async fn receive_from_outsource_marks_shipment_received() {
     assert_eq!(env["data"]["status"], "IN_PROCESS");
 
     // 验证 shipment → RECEIVED + received_at 写入
-    let (status, _received_at): (String, Option<chrono::NaiveDateTime>) = sqlx::query_as(
-        "SELECT status, received_at FROM t_outsource_shipment WHERE batch_id = $1",
-    )
-    .bind(bid)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (status, _received_at): (String, Option<chrono::NaiveDateTime>) =
+        sqlx::query_as("SELECT status, received_at FROM t_outsource_shipment WHERE batch_id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(status, "RECEIVED");
     // 验证 quote_event 写了 RECEIVED
     let count: i64 = sqlx::query_scalar(
@@ -566,9 +552,8 @@ async fn reconcile_update_shipment_unit_price_quantity() {
     let now = now_naive();
     // 直接插一个 shipment
     let shipment_id: i64 = {
-        let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-            1_577_836_800_000, 1,
-        );
+        let snowflake =
+            hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
         let id = snowflake.next_id();
         sqlx::query(
             "INSERT INTO t_outsource_shipment \

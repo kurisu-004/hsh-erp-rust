@@ -281,10 +281,20 @@ impl PartRepo {
             )
             RETURNING id AS "id!"
             "#,
-            new.id, new.name, new.drawing_no, new.applicant_name, new.quantity,
-            new.request_date, new.planned_delivery_date, new.is_urgent,
-            new.customer_id, new.assembly_id, new.order_no, new.system_delivery_date,
-            new.note, new.created_by,
+            new.id,
+            new.name,
+            new.drawing_no,
+            new.applicant_name,
+            new.quantity,
+            new.request_date,
+            new.planned_delivery_date,
+            new.is_urgent,
+            new.customer_id,
+            new.assembly_id,
+            new.order_no,
+            new.system_delivery_date,
+            new.note,
+            new.created_by,
         )
         .fetch_one(executor)
         .await?;
@@ -305,15 +315,33 @@ impl PartRepo {
             "UPDATE t_part SET version = version + 1, updated_at = now(), updated_by = ",
         );
         qb.push_bind(upd.updated_by);
-        if let Some(v) = upd.name { qb.push(", name = ").push_bind(v.to_string()); }
-        if let Some(v) = upd.drawing_no { qb.push(", drawing_no = ").push_bind(v.to_string()); }
-        if let Some(v) = upd.applicant_name { qb.push(", applicant_name = ").push_bind(v.to_string()); }
-        if let Some(v) = upd.quantity { qb.push(", quantity = ").push_bind(v); }
-        if let Some(v) = upd.order_no { qb.push(", order_no = ").push_bind(v.to_string()); }
-        if let Some(v) = upd.system_delivery_date { qb.push(", system_delivery_date = ").push_bind(v); }
-        if let Some(v) = upd.planned_delivery_date { qb.push(", planned_delivery_date = ").push_bind(v); }
-        if let Some(v) = upd.note { qb.push(", note = ").push_bind(v.to_string()); }
-        if let Some(v) = upd.is_urgent { qb.push(", is_urgent = ").push_bind(v); }
+        if let Some(v) = upd.name {
+            qb.push(", name = ").push_bind(v.to_string());
+        }
+        if let Some(v) = upd.drawing_no {
+            qb.push(", drawing_no = ").push_bind(v.to_string());
+        }
+        if let Some(v) = upd.applicant_name {
+            qb.push(", applicant_name = ").push_bind(v.to_string());
+        }
+        if let Some(v) = upd.quantity {
+            qb.push(", quantity = ").push_bind(v);
+        }
+        if let Some(v) = upd.order_no {
+            qb.push(", order_no = ").push_bind(v.to_string());
+        }
+        if let Some(v) = upd.system_delivery_date {
+            qb.push(", system_delivery_date = ").push_bind(v);
+        }
+        if let Some(v) = upd.planned_delivery_date {
+            qb.push(", planned_delivery_date = ").push_bind(v);
+        }
+        if let Some(v) = upd.note {
+            qb.push(", note = ").push_bind(v.to_string());
+        }
+        if let Some(v) = upd.is_urgent {
+            qb.push(", is_urgent = ").push_bind(v);
+        }
         qb.push(" WHERE id = ").push_bind(part_id);
         qb.push(" AND version = ").push_bind(expected_version);
         qb.push(" AND deleted_at IS NULL");
@@ -346,7 +374,9 @@ impl PartRepo {
               AND status NOT IN ('DELIVERED', 'COMPLETED')
               AND deleted_at IS NULL
             "#,
-            part_id, expected_version, current_user_id,
+            part_id,
+            expected_version,
+            current_user_id,
         )
         .execute(executor)
         .await?;
@@ -375,7 +405,11 @@ impl PartRepo {
             "NAME" => "name",
             _ => "id",
         };
-        let order_dir = if f.sort_dir.eq_ignore_ascii_case("ASC") { "ASC" } else { "DESC" };
+        let order_dir = if f.sort_dir.eq_ignore_ascii_case("ASC") {
+            "ASC"
+        } else {
+            "DESC"
+        };
 
         let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
             "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
@@ -387,11 +421,17 @@ impl PartRepo {
                     deleted_at, process_chain_id \
              FROM t_part WHERE 1=1",
         );
-        if !f.include_deleted { qb.push(" AND deleted_at IS NULL"); }
-        if !f.customer_ids.is_empty() {
-            qb.push(" AND customer_id = ANY(").push_bind(f.customer_ids.to_vec()).push(")");
+        if !f.include_deleted {
+            qb.push(" AND deleted_at IS NULL");
         }
-        if let Some(s) = f.status { qb.push(" AND status = ").push_bind(s.to_string()); }
+        if !f.customer_ids.is_empty() {
+            qb.push(" AND customer_id = ANY(")
+                .push_bind(f.customer_ids.to_vec())
+                .push(")");
+        }
+        if let Some(s) = f.status {
+            qb.push(" AND status = ").push_bind(s.to_string());
+        }
         if !f.statuses.is_empty() {
             let arr = f.statuses.to_vec();
             if arr.len() == 1 {
@@ -400,30 +440,49 @@ impl PartRepo {
                 qb.push(" AND status = ANY(").push_bind(arr).push(")");
             }
         }
-        if let Some(u) = f.is_urgent { qb.push(" AND is_urgent = ").push_bind(u); }
+        if let Some(u) = f.is_urgent {
+            qb.push(" AND is_urgent = ").push_bind(u);
+        }
         if let Some(k) = f.keyword {
             let pat = format!("%{}%", k.trim());
-            qb.push(" AND (name ILIKE ").push_bind(pat.clone())
-              .push(" OR drawing_no ILIKE ").push_bind(pat.clone())
-              .push(" OR serial_no ILIKE ").push_bind(pat)
-              .push(")");
+            qb.push(" AND (name ILIKE ")
+                .push_bind(pat.clone())
+                .push(" OR drawing_no ILIKE ")
+                .push_bind(pat.clone())
+                .push(" OR serial_no ILIKE ")
+                .push_bind(pat)
+                .push(")");
         }
         // 2026-09-17 PR-4 守卫修复：locations 查 t_part_batch.location（多值走 ANY）
         if !f.locations.is_empty() {
-            qb.push(" AND EXISTS (SELECT 1 FROM t_part_batch pb \
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM t_part_batch pb \
                      WHERE pb.part_id = t_part.id \
-                       AND pb.location = ANY(").push_bind(f.locations.to_vec()).push(") \
-                       AND pb.deleted_at IS NULL)");
+                       AND pb.location = ANY(",
+            )
+            .push_bind(f.locations.to_vec())
+            .push(
+                ") \
+                       AND pb.deleted_at IS NULL)",
+            );
         }
         // 2026-09-17 PR-4 守卫修复：holder_ids 查 t_part_batch.current_holder_id（多值走 ANY；
         // 多态 holder：t_shelf / t_worker / t_outsource_company 任一匹配即命中同一雪花 id）
         if !f.holder_ids.is_empty() {
-            qb.push(" AND EXISTS (SELECT 1 FROM t_part_batch pb \
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM t_part_batch pb \
                      WHERE pb.part_id = t_part.id \
-                       AND pb.current_holder_id = ANY(").push_bind(f.holder_ids.to_vec()).push(") \
-                       AND pb.deleted_at IS NULL)");
+                       AND pb.current_holder_id = ANY(",
+            )
+            .push_bind(f.holder_ids.to_vec())
+            .push(
+                ") \
+                       AND pb.deleted_at IS NULL)",
+            );
         }
-        qb.push(format!(" ORDER BY {order_col} {order_dir} NULLS LAST, id DESC"));
+        qb.push(format!(
+            " ORDER BY {order_col} {order_dir} NULLS LAST, id DESC"
+        ));
         qb.push(" LIMIT ").push_bind(f.limit);
         qb.push(" OFFSET ").push_bind(f.offset);
         qb.build_query_as::<TPart>().fetch_all(executor).await
@@ -436,14 +495,19 @@ impl PartRepo {
         executor: E,
         f: &PartListFilters<'_>,
     ) -> Result<i64, sqlx::Error> {
-        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
-            "SELECT COUNT(*) FROM t_part WHERE 1=1",
-        );
-        if !f.include_deleted { qb.push(" AND deleted_at IS NULL"); }
-        if !f.customer_ids.is_empty() {
-            qb.push(" AND customer_id = ANY(").push_bind(f.customer_ids.to_vec()).push(")");
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> =
+            sqlx::QueryBuilder::new("SELECT COUNT(*) FROM t_part WHERE 1=1");
+        if !f.include_deleted {
+            qb.push(" AND deleted_at IS NULL");
         }
-        if let Some(s) = f.status { qb.push(" AND status = ").push_bind(s.to_string()); }
+        if !f.customer_ids.is_empty() {
+            qb.push(" AND customer_id = ANY(")
+                .push_bind(f.customer_ids.to_vec())
+                .push(")");
+        }
+        if let Some(s) = f.status {
+            qb.push(" AND status = ").push_bind(s.to_string());
+        }
         if !f.statuses.is_empty() {
             let arr = f.statuses.to_vec();
             if arr.len() == 1 {
@@ -452,25 +516,42 @@ impl PartRepo {
                 qb.push(" AND status = ANY(").push_bind(arr).push(")");
             }
         }
-        if let Some(u) = f.is_urgent { qb.push(" AND is_urgent = ").push_bind(u); }
+        if let Some(u) = f.is_urgent {
+            qb.push(" AND is_urgent = ").push_bind(u);
+        }
         if let Some(k) = f.keyword {
             let pat = format!("%{}%", k.trim());
-            qb.push(" AND (name ILIKE ").push_bind(pat.clone())
-              .push(" OR drawing_no ILIKE ").push_bind(pat.clone())
-              .push(" OR serial_no ILIKE ").push_bind(pat)
-              .push(")");
+            qb.push(" AND (name ILIKE ")
+                .push_bind(pat.clone())
+                .push(" OR drawing_no ILIKE ")
+                .push_bind(pat.clone())
+                .push(" OR serial_no ILIKE ")
+                .push_bind(pat)
+                .push(")");
         }
         if !f.locations.is_empty() {
-            qb.push(" AND EXISTS (SELECT 1 FROM t_part_batch pb \
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM t_part_batch pb \
                      WHERE pb.part_id = t_part.id \
-                       AND pb.location = ANY(").push_bind(f.locations.to_vec()).push(") \
-                       AND pb.deleted_at IS NULL)");
+                       AND pb.location = ANY(",
+            )
+            .push_bind(f.locations.to_vec())
+            .push(
+                ") \
+                       AND pb.deleted_at IS NULL)",
+            );
         }
         if !f.holder_ids.is_empty() {
-            qb.push(" AND EXISTS (SELECT 1 FROM t_part_batch pb \
+            qb.push(
+                " AND EXISTS (SELECT 1 FROM t_part_batch pb \
                      WHERE pb.part_id = t_part.id \
-                       AND pb.current_holder_id = ANY(").push_bind(f.holder_ids.to_vec()).push(") \
-                       AND pb.deleted_at IS NULL)");
+                       AND pb.current_holder_id = ANY(",
+            )
+            .push_bind(f.holder_ids.to_vec())
+            .push(
+                ") \
+                       AND pb.deleted_at IS NULL)",
+            );
         }
         let row: (i64,) = qb.build_query_as().fetch_one(executor).await?;
         Ok(row.0)

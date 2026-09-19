@@ -12,9 +12,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -38,14 +38,17 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
         .expect("read body");
     let body_str = String::from_utf8_lossy(&body).to_string();
     let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!(
-            "parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}"
-        )
+        panic!("parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}")
     });
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -100,9 +103,7 @@ async fn login_clerk(pool: PgPool, username: &str) -> (axum::Router, String) {
 /// 直插客户（L1）—— 绕开 customer CRUD。
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -122,9 +123,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 /// 直插 part（PENDING）—— 绕开 part CRUD。
 async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -147,9 +146,7 @@ async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
 /// 直插 OUTSOURCE 类别 process。
 async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -170,9 +167,7 @@ async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 /// 直插外协公司。
 async fn insert_company(pool: &PgPool, name: &str, is_active: bool) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000, 1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -243,7 +238,12 @@ async fn create_quote_duplicate_returns_21303() {
     });
     let (_, _) = send(
         app.clone(),
-        json_request("POST", "/outsource-quotes", Some(body.clone()), Some(&token)),
+        json_request(
+            "POST",
+            "/outsource-quotes",
+            Some(body.clone()),
+            Some(&token),
+        ),
     )
     .await;
     let (s2, env2) = send(
@@ -283,7 +283,12 @@ async fn quote_full_lifecycle_draft_submit_approve() {
     // submit
     let (s_sub, env_sub) = send(
         app.clone(),
-        json_request("POST", &format!("/outsource-quotes/{qid}/submit"), None, Some(&token)),
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/submit"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s_sub, StatusCode::OK, "submit: {env_sub}");
@@ -380,7 +385,12 @@ async fn reject_quote_requires_review_note() {
     // submit
     let (_, _) = send(
         app.clone(),
-        json_request("POST", &format!("/outsource-quotes/{qid}/submit"), None, Some(&token)),
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/submit"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     // reject with empty note → 400
@@ -435,13 +445,23 @@ async fn submit_quote_wrong_status_returns_21302() {
     // 第一次 submit OK
     let (_, _) = send(
         app.clone(),
-        json_request("POST", &format!("/outsource-quotes/{qid}/submit"), None, Some(&token)),
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/submit"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     // 第二次 submit → 400 / 21302
     let (s, env) = send(
         app,
-        json_request("POST", &format!("/outsource-quotes/{qid}/submit"), None, Some(&token)),
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/submit"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "2nd submit: {env}");
@@ -472,7 +492,12 @@ async fn soft_delete_quote_approved_forbidden() {
     // submit + approve → APPROVED
     let (_, _) = send(
         app.clone(),
-        json_request("POST", &format!("/outsource-quotes/{qid}/submit"), None, Some(&token)),
+        json_request(
+            "POST",
+            &format!("/outsource-quotes/{qid}/submit"),
+            None,
+            Some(&token),
+        ),
     )
     .await;
     let (_, _) = send(

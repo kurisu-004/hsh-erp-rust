@@ -112,10 +112,8 @@ mod tests {
     #[test]
     fn allowed_transitions() {
         assert!(OutsourceQuoteStatus::DRAFT.can_transition_to(OutsourceQuoteStatus::SUBMITTED));
-        assert!(OutsourceQuoteStatus::SUBMITTED
-            .can_transition_to(OutsourceQuoteStatus::APPROVED));
-        assert!(OutsourceQuoteStatus::SUBMITTED
-            .can_transition_to(OutsourceQuoteStatus::REJECTED));
+        assert!(OutsourceQuoteStatus::SUBMITTED.can_transition_to(OutsourceQuoteStatus::APPROVED));
+        assert!(OutsourceQuoteStatus::SUBMITTED.can_transition_to(OutsourceQuoteStatus::REJECTED));
     }
 
     #[test]
@@ -128,10 +126,7 @@ mod tests {
             OutsourceQuoteStatus::REJECTED,
             OutsourceQuoteStatus::USED,
         ] {
-            assert!(
-                !s.can_transition_to(s),
-                "{s:?} 自环必须拒绝"
-            );
+            assert!(!s.can_transition_to(s), "{s:?} 自环必须拒绝");
         }
         // DRAFT → APPROVED / REJECTED 非法（必须先 SUBMITTED）
         assert!(!OutsourceQuoteStatus::DRAFT.can_transition_to(OutsourceQuoteStatus::APPROVED));
@@ -139,12 +134,10 @@ mod tests {
         // APPROVED → 任何其它都非法（终端在 Phase 2 实现里视为允许流转到 USED，
         // 但 Phase 2 不实现 USED 流转；保持白名单严格）
         assert!(!OutsourceQuoteStatus::APPROVED.can_transition_to(OutsourceQuoteStatus::USED));
-        assert!(!OutsourceQuoteStatus::APPROVED
-            .can_transition_to(OutsourceQuoteStatus::REJECTED));
+        assert!(!OutsourceQuoteStatus::APPROVED.can_transition_to(OutsourceQuoteStatus::REJECTED));
         // REJECTED → 任何都非法（终态）
         assert!(!OutsourceQuoteStatus::REJECTED.can_transition_to(OutsourceQuoteStatus::DRAFT));
-        assert!(!OutsourceQuoteStatus::REJECTED
-            .can_transition_to(OutsourceQuoteStatus::SUBMITTED));
+        assert!(!OutsourceQuoteStatus::REJECTED.can_transition_to(OutsourceQuoteStatus::SUBMITTED));
         // USED → 任何都非法（终态）
         assert!(!OutsourceQuoteStatus::USED.can_transition_to(OutsourceQuoteStatus::DRAFT));
     }

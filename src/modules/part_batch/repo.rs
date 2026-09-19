@@ -299,53 +299,56 @@ impl PartBatchRepo {
         .fetch_all(executor)
         .await?;
 
-        Ok(rows.into_iter().map(|r| {
-            (
-                TPartBatch {
-                    id: r.pb_id,
-                    part_id: r.pb_part_id,
-                    batch_no: r.pb_batch_no,
-                    quantity: r.pb_quantity,
-                    status: r.pb_status,
-                    location: r.pb_location,
-                    current_holder_id: r.pb_current_holder_id,
-                    current_process_step_id: r.pb_current_process_step_id,
-                    delivery_note_id: r.pb_delivery_note_id,
-                    parent_batch_id: r.pb_parent_batch_id,
-                    version: r.pb_version,
-                    created_at: r.pb_created_at,
-                    created_by: r.pb_created_by,
-                    updated_at: r.pb_updated_at,
-                    updated_by: r.pb_updated_by,
-                    deleted_at: r.pb_deleted_at,
-                },
-                TPart {
-                    id: r.p_id,
-                    serial_no: r.p_serial_no,
-                    name: r.p_name,
-                    drawing_no: r.p_drawing_no,
-                    applicant_name: r.p_applicant_name,
-                    quantity: r.p_quantity,
-                    request_date: r.p_request_date,
-                    planned_delivery_date: r.p_planned_delivery_date,
-                    customer_id: r.p_customer_id,
-                    assembly_id: r.p_assembly_id,
-                    status: r.p_status,
-                    is_urgent: r.p_is_urgent,
-                    next_process_id: r.p_next_process_id,
-                    order_no: r.p_order_no,
-                    system_delivery_date: r.p_system_delivery_date,
-                    note: r.p_note,
-                    version: r.p_version,
-                    created_at: r.p_created_at,
-                    created_by: r.p_created_by,
-                    updated_at: r.p_updated_at,
-                    updated_by: r.p_updated_by,
-                    deleted_at: r.p_deleted_at,
-                    process_chain_id: r.p_process_chain_id,
-                },
-            )
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    TPartBatch {
+                        id: r.pb_id,
+                        part_id: r.pb_part_id,
+                        batch_no: r.pb_batch_no,
+                        quantity: r.pb_quantity,
+                        status: r.pb_status,
+                        location: r.pb_location,
+                        current_holder_id: r.pb_current_holder_id,
+                        current_process_step_id: r.pb_current_process_step_id,
+                        delivery_note_id: r.pb_delivery_note_id,
+                        parent_batch_id: r.pb_parent_batch_id,
+                        version: r.pb_version,
+                        created_at: r.pb_created_at,
+                        created_by: r.pb_created_by,
+                        updated_at: r.pb_updated_at,
+                        updated_by: r.pb_updated_by,
+                        deleted_at: r.pb_deleted_at,
+                    },
+                    TPart {
+                        id: r.p_id,
+                        serial_no: r.p_serial_no,
+                        name: r.p_name,
+                        drawing_no: r.p_drawing_no,
+                        applicant_name: r.p_applicant_name,
+                        quantity: r.p_quantity,
+                        request_date: r.p_request_date,
+                        planned_delivery_date: r.p_planned_delivery_date,
+                        customer_id: r.p_customer_id,
+                        assembly_id: r.p_assembly_id,
+                        status: r.p_status,
+                        is_urgent: r.p_is_urgent,
+                        next_process_id: r.p_next_process_id,
+                        order_no: r.p_order_no,
+                        system_delivery_date: r.p_system_delivery_date,
+                        note: r.p_note,
+                        version: r.p_version,
+                        created_at: r.p_created_at,
+                        created_by: r.p_created_by,
+                        updated_at: r.p_updated_at,
+                        updated_by: r.p_updated_by,
+                        deleted_at: r.p_deleted_at,
+                        process_chain_id: r.p_process_chain_id,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// 多工单的未删批次批查（Phase P3 装配件整套入单时按子件 part_ids 一次拿齐）。
@@ -586,7 +589,13 @@ impl PartBatchRepo {
         // 但不影响最终 INSERT——`_split_batch_inner` 走 SELECT 重新读源行做真相
         // 源）。when / created_by / updated_by 也保留以兼容 service 拼装
         // 现有调用形态；内部 helper 改用 now() + caller 的 user_id。
-        let _ = (location, current_holder_id, current_process_step_id, when, created_by);
+        let _ = (
+            location,
+            current_holder_id,
+            current_process_step_id,
+            when,
+            created_by,
+        );
         let user_id = updated_by.unwrap_or(0);
         Self::_split_batch_inner(
             conn,
@@ -936,7 +945,10 @@ impl PartBatchRepo {
         )
         .fetch_all(executor)
         .await?;
-        Ok(rows.into_iter().map(|r| (r.id, r.part_id, r.version)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.id, r.part_id, r.version))
+            .collect())
     }
 
     /// 创建初始批次（part/assembly/batch 重构方案 §4.1 PR-B1）。

@@ -17,14 +17,14 @@ pub struct TPartFile {
     pub id: i64,
     #[serde(serialize_with = "serialize_i64")]
     pub part_id: i64,
-    pub kind: String,                              // DRAWING / 3D_MODEL / G_CODE / SETUP_SHEET / ASSEMBLY_MASTER / CAD_2D
-    pub file_type: String,                         // uppercased extension
-    pub object_key: String,                        // COS object key
+    pub kind: String, // DRAWING / 3D_MODEL / G_CODE / SETUP_SHEET / ASSEMBLY_MASTER / CAD_2D
+    pub file_type: String, // uppercased extension
+    pub object_key: String, // COS object key
     pub original_filename: String,
     #[serde(serialize_with = "serialize_i64")]
     pub file_size: i64,
     pub content_type: String,
-    pub upload_status: String,                     // READY / PENDING / FAILED
+    pub upload_status: String, // READY / PENDING / FAILED
     pub content_sha256: Option<String>,
     pub version: i32,
     pub created_at: chrono::NaiveDateTime,

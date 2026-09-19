@@ -19,7 +19,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::process::dto::*;
 use crate::modules::process::model::TProcess;
 use crate::modules::process::repo::ProcessRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
@@ -74,7 +74,8 @@ fn normalize_color(s: Option<&str>) -> Result<Option<&str>, AppError> {
             let t = raw.trim();
             if t.is_empty() {
                 Ok(None)
-            } else if t.len() == 9 && t.starts_with('#')
+            } else if t.len() == 9
+                && t.starts_with('#')
                 && t[1..].chars().all(|c| c.is_ascii_hexdigit())
             {
                 Ok(Some(t))
@@ -174,7 +175,11 @@ impl ProcessService {
         }
         let category = check_category(&req.category)?;
         let sort_order = req.sort_order.unwrap_or(0);
-        let description = req.description.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let description = req
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let color = normalize_color(req.color.as_deref())?;
 
         // INHOUSE 强制 requires_approval = false（无视请求值）；OUTSOURCE 保留（默认 true）。
@@ -198,19 +203,21 @@ impl ProcessService {
             user.id,
         )
         .await
-        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-            // uk_t_process_code：活跃行唯一
-            Some("23505") => AppError::biz(
-                code::BIZ_PROCESS_DUPLICATE_CODE,
-                format!("code '{code}' 已被占用"),
-            ),
-            // ck_t_process_category：CHECK 约束兜底（理论 service 已 catch）
-            Some("23514") => AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                "category 必须是 INHOUSE 或 OUTSOURCE",
-            ),
-            _ => AppError::from(e),
-        })?;
+        .map_err(
+            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                // uk_t_process_code：活跃行唯一
+                Some("23505") => AppError::biz(
+                    code::BIZ_PROCESS_DUPLICATE_CODE,
+                    format!("code '{code}' 已被占用"),
+                ),
+                // ck_t_process_category：CHECK 约束兜底（理论 service 已 catch）
+                Some("23514") => AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    "category 必须是 INHOUSE 或 OUTSOURCE",
+                ),
+                _ => AppError::from(e),
+            },
+        )?;
 
         Ok(to_process_out(p))
     }
@@ -299,13 +306,15 @@ impl ProcessService {
             user.id,
         )
         .await
-        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-            Some("23514") => AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                "category 必须是 INHOUSE 或 OUTSOURCE",
-            ),
-            _ => AppError::from(e),
-        })?;
+        .map_err(
+            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                Some("23514") => AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    "category 必须是 INHOUSE 或 OUTSOURCE",
+                ),
+                _ => AppError::from(e),
+            },
+        )?;
         if affected == 0 {
             return Err(version_conflict());
         }
@@ -334,8 +343,7 @@ impl ProcessService {
             ));
         }
 
-        let affected =
-            ProcessRepo::soft_delete(&mut *conn, id, current.version, user.id).await?;
+        let affected = ProcessRepo::soft_delete(&mut *conn, id, current.version, user.id).await?;
         if affected == 0 {
             return Err(version_conflict());
         }

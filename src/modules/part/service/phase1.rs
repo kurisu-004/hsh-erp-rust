@@ -33,25 +33,25 @@ use crate::modules::part::dto::{
     InspectionBatchListItemOut, InspectionBatchListOut, InspectionBatchListQuery,
 };
 use crate::modules::part::model::NewPartEvent;
-use crate::modules::part::repo::part::{PartListFilters, PartUpdate};
 use crate::modules::part::repo::PartRepo;
+use crate::modules::part::repo::part::{PartListFilters, PartUpdate};
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::modules::process_chain::repo::ProcessChainRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::modules::worker::repo::WorkerRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
+use super::super::dto_crud::PartListOut;
 use super::super::dto_crud::{
     BatchUpdateOrderInfoFailure, BatchUpdateOrderInfoOut, BatchUpdateOrderInfoRequest,
-    BatchWithPdfsRequest, ByWorkTypeQuery, CancelBatchRequest,
-    CompleteRepairRequest, LocationTreeNodeOut, LocationTreeOut, MatchByExcelItemResult,
-    MatchByExcelItemsRequest, PartBatchListItemOut, PartEventOut, PickUpRequest,
-    PlaceOnShelfRequest, ReceiveFromOutsourceToInspectionRequest, RecallToPendingRequest,
-    RecallToProgrammingRequest, RepairDispatchRequest, ScanDeliverPartRequest,
-    ScanInspectRequest, SendToOutsourceRequest, SendToProgrammingRequest, SplitBatchRequest,
+    BatchWithPdfsRequest, ByWorkTypeQuery, CancelBatchRequest, CompleteRepairRequest,
+    LocationTreeNodeOut, LocationTreeOut, MatchByExcelItemResult, MatchByExcelItemsRequest,
+    PartBatchListItemOut, PartEventOut, PickUpRequest, PlaceOnShelfRequest, RecallToPendingRequest,
+    RecallToProgrammingRequest, ReceiveFromOutsourceToInspectionRequest, RepairDispatchRequest,
+    ScanDeliverPartRequest, ScanInspectRequest, SendToOutsourceRequest, SendToProgrammingRequest,
+    SplitBatchRequest,
 };
-use super::super::dto_crud::PartListOut;
 use super::PartService;
 
 /// 外协公司精简投影（outsource 域 Phase 2 stub 期间绕过 OutsourceCompanyRepo）。
@@ -135,8 +135,6 @@ struct HolderCountRow {
     n: i64,
 }
 
-
-
 /// 状态机迁移守卫 + 错误码映射（在 phase1.rs 内复用）：
 /// - 起点状态非法 → 20103 `BIZ_INVALID_TRANSITION`
 /// - 起点已是终态 → 20115 `BIZ_PART_ALREADY_CANCELLED`（仅 cancel 路径）
@@ -175,9 +173,7 @@ fn validate_batch_ownership(
     if batch_version_mismatch(batch_id, expected_version, actual_version) {
         return Err(AppError::biz(
             code::VERSION_CONFLICT,
-            format!(
-                "batch {batch_id} 版本冲突（期望 {expected_version}，实际 {actual_version}）"
-            ),
+            format!("batch {batch_id} 版本冲突（期望 {expected_version}，实际 {actual_version}）"),
         ));
     }
     Ok(())
@@ -194,9 +190,14 @@ async fn validate_shelf_zone(
     shelf_id: i64,
     expected_zone: &str,
 ) -> Result<(), AppError> {
-    let shelf = ShelfRepo::get_by_id(&mut *conn, shelf_id).await?.ok_or_else(|| {
-        AppError::biz(code::BIZ_SHELF_NOT_FOUND, format!("shelf {shelf_id} 不存在"))
-    })?;
+    let shelf = ShelfRepo::get_by_id(&mut *conn, shelf_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_SHELF_NOT_FOUND,
+                format!("shelf {shelf_id} 不存在"),
+            )
+        })?;
     if !shelf.is_active {
         return Err(AppError::biz(
             code::BIZ_SHELF_INACTIVE,
@@ -339,16 +340,12 @@ async fn mark_batch_for_programming<'e, E: PgExecutor<'e>>(
 ///
 /// 返回：chain_id（已校验非空）。caller 继续用 `process_id` 经
 /// `ProcessChainRepo::resolve_step_id_by_process` 解析为 step_id。
-async fn require_process_chain(
-    conn: &mut PgConnection,
-    part_id: i64,
-) -> Result<i64, AppError> {
-    let row: Option<(Option<i64>,)> = sqlx::query_as(
-        "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(part_id)
-    .fetch_optional(&mut *conn)
-    .await?;
+async fn require_process_chain(conn: &mut PgConnection, part_id: i64) -> Result<i64, AppError> {
+    let row: Option<(Option<i64>,)> =
+        sqlx::query_as("SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+            .bind(part_id)
+            .fetch_optional(&mut *conn)
+            .await?;
     let chain_id_opt = row
         .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在")))?
         .0;
@@ -566,7 +563,9 @@ impl PartService {
         .await?;
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
             .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "send-to-programming 后查不到"))?;
+            .ok_or_else(|| {
+                AppError::biz(code::BIZ_PART_NOT_FOUND, "send-to-programming 后查不到")
+            })?;
         Ok(crate::modules::part::dto::PartOut::from(fresh))
     }
 
@@ -711,7 +710,9 @@ impl PartService {
         .await?;
         let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
             .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "recall-to-programming 后查不到"))?;
+            .ok_or_else(|| {
+                AppError::biz(code::BIZ_PART_NOT_FOUND, "recall-to-programming 后查不到")
+            })?;
         Ok(crate::modules::part::dto::PartOut::from(fresh))
     }
 
@@ -838,10 +839,11 @@ impl PartService {
             ));
         }
         // 校验 process 存在
-        let proc: Option<(i64,)> = sqlx::query_as("SELECT id FROM t_process WHERE id = $1 AND deleted_at IS NULL")
-            .bind(req.process_id)
-            .fetch_optional(&mut *conn)
-            .await?;
+        let proc: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM t_process WHERE id = $1 AND deleted_at IS NULL")
+                .bind(req.process_id)
+                .fetch_optional(&mut *conn)
+                .await?;
         if proc.is_none() {
             return Err(AppError::biz(
                 code::BIZ_PROCESS_NOT_FOUND,
@@ -862,41 +864,44 @@ impl PartService {
                     )
                 })?;
         // Phase 2：quote_id 可选；若提供必须 APPROVED 状态
-        let (quote_id_opt, unit_price): (Option<i64>, Option<rust_decimal::Decimal>) = if let Some(qid) = req.quote_id {
-            let row: Option<(String, rust_decimal::Decimal, i64, i64, i64)> = sqlx::query_as(
-                "SELECT status, price, part_id, outsource_company_id, process_id \
+        let (quote_id_opt, unit_price): (Option<i64>, Option<rust_decimal::Decimal>) =
+            if let Some(qid) = req.quote_id {
+                let row: Option<(String, rust_decimal::Decimal, i64, i64, i64)> = sqlx::query_as(
+                    "SELECT status, price, part_id, outsource_company_id, process_id \
                  FROM t_outsource_quote \
                  WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(qid)
-            .fetch_optional(&mut *conn)
-            .await?;
-            let (status, price, q_part_id, q_company_id, q_process_id) = row.ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND,
-                    format!("quote {qid} 不存在"),
                 )
-            })?;
-            if status != "APPROVED" {
-                return Err(AppError::biz(
-                    code::BIZ_OUTSOURCE_QUOTE_NOT_APPROVED,
-                    format!(
-                        "quote {qid} 当前 {status}，非 APPROVED 不可发送"
-                    ),
-                ));
-            }
-            if q_part_id != part_id || q_company_id != req.outsource_company_id || q_process_id != req.process_id {
-                return Err(AppError::biz(
-                    code::BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION,
-                    format!(
-                        "quote {qid} 与 send_to_outsource 参数不一致（part/company/process）"
-                    ),
-                ));
-            }
-            (Some(qid), Some(price))
-        } else {
-            (None, None)
-        };
+                .bind(qid)
+                .fetch_optional(&mut *conn)
+                .await?;
+                let (status, price, q_part_id, q_company_id, q_process_id) =
+                    row.ok_or_else(|| {
+                        AppError::biz(
+                            code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND,
+                            format!("quote {qid} 不存在"),
+                        )
+                    })?;
+                if status != "APPROVED" {
+                    return Err(AppError::biz(
+                        code::BIZ_OUTSOURCE_QUOTE_NOT_APPROVED,
+                        format!("quote {qid} 当前 {status}，非 APPROVED 不可发送"),
+                    ));
+                }
+                if q_part_id != part_id
+                    || q_company_id != req.outsource_company_id
+                    || q_process_id != req.process_id
+                {
+                    return Err(AppError::biz(
+                        code::BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION,
+                        format!(
+                            "quote {qid} 与 send_to_outsource 参数不一致（part/company/process）"
+                        ),
+                    ));
+                }
+                (Some(qid), Some(price))
+            } else {
+                (None, None)
+            };
         let n = mark_batch_with_status_and_meta(
             &mut *conn,
             batch.id,
@@ -1126,7 +1131,11 @@ impl PartService {
         validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
-        ensure_transition(from, PartStatus::INSPECTION, "receive-from-outsource-to-inspection")?;
+        ensure_transition(
+            from,
+            PartStatus::INSPECTION,
+            "receive-from-outsource-to-inspection",
+        )?;
         if from != PartStatus::OUTSOURCE {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,
@@ -1579,7 +1588,10 @@ impl PartService {
         validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
         // 数量校验
         let qty: i32 = req.quantity.try_into().map_err(|_| {
-            AppError::biz(code::BIZ_PART_BATCH_INVALID_QUANTITY, "quantity 超出 i32 范围")
+            AppError::biz(
+                code::BIZ_PART_BATCH_INVALID_QUANTITY,
+                "quantity 超出 i32 范围",
+            )
         })?;
         if qty <= 0 {
             return Err(AppError::biz(
@@ -1617,9 +1629,7 @@ impl PartService {
         )
         .await
         .map_err(|e| match e {
-            sqlx::Error::RowNotFound => {
-                AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突")
-            }
+            sqlx::Error::RowNotFound => AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"),
             other => AppError::from(other),
         })?;
         // SPLIT 事件
@@ -1670,7 +1680,8 @@ impl PartService {
                 format!("batch 当前状态 {} 不允许取消", from.as_str()),
             ));
         }
-        let n = mark_batch_status_only(&mut *conn, batch.id, req.version, "CANCELLED", current.id).await?;
+        let n = mark_batch_status_only(&mut *conn, batch.id, req.version, "CANCELLED", current.id)
+            .await?;
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
@@ -1710,9 +1721,9 @@ impl PartService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let _ = PartRepo::get_part_inspected(&mut *conn, part_id).await?.ok_or_else(|| {
-            AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在")
-        })?;
+        let _ = PartRepo::get_part_inspected(&mut *conn, part_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         let rows: Vec<BatchListRow> = sqlx::query_as::<_, BatchListRow>(
             "SELECT b.id AS id, b.batch_no, b.quantity, b.status, b.location,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, b.current_process_step_id,              b.delivery_note_id, b.parent_batch_id,              b.version              FROM t_part_batch b              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              WHERE b.part_id = $1 AND b.deleted_at IS NULL              ORDER BY b.batch_no ASC",
         )
@@ -1755,9 +1766,9 @@ impl PartService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let _ = PartRepo::get_part_inspected(&mut *conn, part_id).await?.ok_or_else(|| {
-            AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在")
-        })?;
+        let _ = PartRepo::get_part_inspected(&mut *conn, part_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         let rows: Vec<EventListRow> = sqlx::query_as::<_, EventListRow>(
             "SELECT id, event_type, from_status, to_status, batch_id, quantity,              drawing_code, badge_code, note, created_at, created_by              FROM t_part_event WHERE part_id = $1 ORDER BY id DESC",
         )
@@ -1853,7 +1864,11 @@ impl PartService {
         .unwrap_or_default();
         let outsources: Vec<OutsourceLite> = outsource_rows
             .into_iter()
-            .map(|(id, name, is_active)| OutsourceLite { id, name, is_active })
+            .map(|(id, name, is_active)| OutsourceLite {
+                id,
+                name,
+                is_active,
+            })
             .collect();
         let mut items: Vec<LocationTreeNodeOut> = Vec::new();
         // OFFICE 父节点
@@ -2022,15 +2037,23 @@ impl PartService {
             )
             .await?;
             if n2 == 0 {
-                return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突（INSPECTION→READY_TO_SHIP）"));
+                return Err(AppError::biz(
+                    code::VERSION_CONFLICT,
+                    "batch 版本冲突（INSPECTION→READY_TO_SHIP）",
+                ));
             }
         } else {
             // FAIL：INSPECTION → REPAIRING；保留 shelf 为 INSPECTION_SHELF（carry 状态由下一步 complete_repair 接管）
             // 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
             // `has_been_repaired` 列；返修事实由下方 INSPECTION_FAILED 事件日志追溯。
-            let n2 = mark_batch_status_only(&mut *conn, batch.id, mid_version, "REPAIRING", current.id).await?;
+            let n2 =
+                mark_batch_status_only(&mut *conn, batch.id, mid_version, "REPAIRING", current.id)
+                    .await?;
             if n2 == 0 {
-                return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突（INSPECTION→REPAIRING）"));
+                return Err(AppError::biz(
+                    code::VERSION_CONFLICT,
+                    "batch 版本冲突（INSPECTION→REPAIRING）",
+                ));
             }
         }
         let _ = Self::sync_from_batch_change(conn, part_id, current).await?;
@@ -2091,8 +2114,9 @@ impl PartService {
     ) -> Result<crate::modules::part::dto::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::ShelfAccount])?;
         // 反查 part
-        let part: Option<crate::modules::part::model::TPart> = sqlx::query_as::<_, crate::modules::part::model::TPart>(
-            "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
+        let part: Option<crate::modules::part::model::TPart> =
+            sqlx::query_as::<_, crate::modules::part::model::TPart>(
+                "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
              request_date, planned_delivery_date, \
              customer_id, assembly_id, status, \
              is_urgent, next_process_id, \
@@ -2100,19 +2124,20 @@ impl PartService {
              version, created_at, created_by, updated_at, updated_by, \
              deleted_at, process_chain_id \
              FROM t_part WHERE serial_no = $1 AND deleted_at IS NULL",
-        )
-        .bind(&req.part_serial_no)
-        .fetch_optional(&mut *conn)
-        .await?;
+            )
+            .bind(&req.part_serial_no)
+            .fetch_optional(&mut *conn)
+            .await?;
         let part = part.ok_or_else(|| {
-            AppError::biz(code::BIZ_PART_NOT_FOUND, format!("serial_no {} 找不到 part", req.part_serial_no))
+            AppError::biz(
+                code::BIZ_PART_NOT_FOUND,
+                format!("serial_no {} 找不到 part", req.part_serial_no),
+            )
         })?;
         // 校验 worker 是送货司机
         let worker = WorkerRepo::get_by_badge_code(&mut *conn, &req.worker_badge_code, false)
             .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_WORKER_NOT_FOUND, "工牌码无效")
-            })?;
+            .ok_or_else(|| AppError::biz(code::BIZ_WORKER_NOT_FOUND, "工牌码无效"))?;
         if !worker.is_active {
             return Err(AppError::biz(code::BIZ_WORKER_INACTIVE, "工人已停用"));
         }
@@ -2132,9 +2157,8 @@ impl PartService {
             ));
         }
         // 校验 part.status == READY_TO_SHIP
-        let from = PartStatus::from_str(&part.status).ok_or_else(|| {
-            AppError::biz(code::BIZ_INVALID_VALUE, "part.status 非法")
-        })?;
+        let from = PartStatus::from_str(&part.status)
+            .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "part.status 非法"))?;
         if from != PartStatus::READY_TO_SHIP {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_PART_NOT_READY,
@@ -2154,7 +2178,8 @@ impl PartService {
                 ));
             }
         };
-        let n = PartRepo::mark_batch_delivered(&mut *conn, batch.id, batch.version, current.id).await?;
+        let n =
+            PartRepo::mark_batch_delivered(&mut *conn, batch.id, batch.version, current.id).await?;
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
@@ -2205,7 +2230,10 @@ impl PartService {
     ) -> Result<crate::modules::part::dto_crud::PartDetailOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         if req.customer_id == 0 {
-            return Err(AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer_id 必填"));
+            return Err(AppError::biz(
+                code::BIZ_CUSTOMER_NOT_FOUND,
+                "customer_id 必填",
+            ));
         }
         let _customer = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false)
             .await?
@@ -2215,10 +2243,7 @@ impl PartService {
         if !pdf_files.is_empty() {
             for pdf in pdf_files {
                 let doc = lopdf::Document::load_mem(pdf).map_err(|e| {
-                    AppError::biz(
-                        code::BIZ_ASSEMBLY_PDF_INVALID,
-                        format!("PDF 解析失败: {e}"),
-                    )
+                    AppError::biz(code::BIZ_ASSEMBLY_PDF_INVALID, format!("PDF 解析失败: {e}"))
                 })?;
                 page_count += doc.get_pages().len() as i32;
             }
@@ -2252,11 +2277,15 @@ impl PartService {
             .fetch_one(&mut *conn)
             .await?;
             let p = prefix_str.ok_or_else(|| {
-                AppError::biz(code::BIZ_CUSTOMER_NO_SERIAL_PREFIX, "L1 客户无 serial_prefix")
+                AppError::biz(
+                    code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
+                    "L1 客户无 serial_prefix",
+                )
             })?;
-            let ch = p.chars().next().ok_or_else(|| {
-                AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 为空")
-            })?;
+            let ch = p
+                .chars()
+                .next()
+                .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 为空"))?;
             Some(crate::shared::serial::acquire(&mut *conn, ch).await?)
         } else {
             None
@@ -2297,13 +2326,15 @@ impl PartService {
                 quantity: 1,
                 location: None,
                 created_by: Some(current.id),
-                },
+            },
         )
         .await?;
 
         // 自动派发子件（page2..N）
         if child_count > 0 {
-            let master_serial = master_serial.as_deref().expect("master_serial present when child_count > 0");
+            let master_serial = master_serial
+                .as_deref()
+                .expect("master_serial present when child_count > 0");
             for i in 1..=child_count {
                 let child_id = snowflake.next_id();
                 let child_serial = format!("{}-{:02}", master_serial, i);
@@ -2324,11 +2355,13 @@ impl PartService {
                     created_by: current.id,
                 };
                 PartRepo::create_part(&mut *conn, child).await?;
-                sqlx::query("UPDATE t_part SET serial_no = $1 WHERE id = $2 AND deleted_at IS NULL")
-                    .bind(&child_serial)
-                    .bind(child_id)
-                    .execute(&mut *conn)
-                    .await?;
+                sqlx::query(
+                    "UPDATE t_part SET serial_no = $1 WHERE id = $2 AND deleted_at IS NULL",
+                )
+                .bind(&child_serial)
+                .bind(child_id)
+                .execute(&mut *conn)
+                .await?;
                 // 初始批次
                 PartBatchRepo::create_initial_batch(
                     &mut *conn,
@@ -2336,24 +2369,24 @@ impl PartService {
                         id: snowflake.next_id(),
                         part_id: child_id,
                         quantity: 1,
-                location: None,
+                        location: None,
                         created_by: Some(current.id),
-                },
+                    },
                 )
                 .await?;
             }
         }
 
         // 重读 master
-        let part: crate::modules::part::model::TPart = PartRepo::get_by_id(&mut *conn, new_id, false)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "create 后查不到"))?;
-        Ok(crate::modules::part::dto_crud::PartDetailOut::from_with_customer_extra(
-            part,
-            None,
-            None,
-            None,
-        ))
+        let part: crate::modules::part::model::TPart =
+            PartRepo::get_by_id(&mut *conn, new_id, false)
+                .await?
+                .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "create 后查不到"))?;
+        Ok(
+            crate::modules::part::dto_crud::PartDetailOut::from_with_customer_extra(
+                part, None, None, None,
+            ),
+        )
     }
 
     /// `POST /parts/match-by-excel-items`：Excel 行（drawing_no 或 serial_no）→ 现有 part id。
@@ -2654,7 +2687,10 @@ impl PartService {
         .fetch_optional(&mut *conn)
         .await?;
         let (is_active, wt_id) = worker.ok_or_else(|| {
-            AppError::biz(code::BIZ_WORKER_NOT_FOUND, format!("worker {} 不存在", req.worker_id))
+            AppError::biz(
+                code::BIZ_WORKER_NOT_FOUND,
+                format!("worker {} 不存在", req.worker_id),
+            )
         })?;
         if !is_active {
             return Err(AppError::biz(
@@ -2737,7 +2773,12 @@ impl PartService {
         query: &ByWorkTypeQuery,
         current: &CurrentUser,
     ) -> Result<super::super::dto_crud::PartListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector, Role::ShelfAccount])?;
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::ShelfAccount,
+        ])?;
         let limit = query.limit.unwrap_or(50).clamp(1, 200);
         let offset = query.offset.unwrap_or(0).max(0);
         // 直接列出该工种所有 worker 当前持有的件（IN_PROCESS + location=WORKER）
@@ -2793,11 +2834,11 @@ impl PartService {
                         location: None,
                         holder_name: None,
                     };
-                    // 附加 worker_name（轻量：DTO 上没字段，仅放 batch_id 展示）
-                    let _ = bid;
-                    let _ = worker_name;
-                    item
-                })
+                // 附加 worker_name（轻量：DTO 上没字段，仅放 batch_id 展示）
+                let _ = bid;
+                let _ = worker_name;
+                item
+            })
             .collect();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM t_part_batch b \
@@ -2824,7 +2865,12 @@ impl PartService {
         query: &ByWorkTypeQuery,
         current: &CurrentUser,
     ) -> Result<super::super::dto_crud::PartListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector, Role::ShelfAccount])?;
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::ShelfAccount,
+        ])?;
         let limit = query.limit.unwrap_or(50).clamp(1, 200);
         let offset = query.offset.unwrap_or(0).max(0);
         let shelf_filter = query.shelf_id;
@@ -2853,37 +2899,39 @@ impl PartService {
         .await?;
         let items: Vec<super::super::dto_crud::PartListItem> = rows
             .into_iter()
-            .map(|(id, serial, drawing, qty, _np)| super::super::dto_crud::PartListItem {
-                part: crate::modules::part::model::TPart {
-                    id,
-                    serial_no: Some(serial),
-                    name: drawing.clone(),
-                    drawing_no: drawing,
-                    applicant_name: String::new(),
-                    quantity: qty,
-                    request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    customer_id: 0,
-                    assembly_id: None,
-                    status: "IN_PROCESS".to_string(),
-                    is_urgent: false,
-                    next_process_id: None,
-                    order_no: None,
-                    system_delivery_date: None,
-                    note: None,
-                    version: 0,
-                    created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                    created_by: None,
-                    updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                    updated_by: None,
-                    deleted_at: None,
-                    process_chain_id: None,
+            .map(
+                |(id, serial, drawing, qty, _np)| super::super::dto_crud::PartListItem {
+                    part: crate::modules::part::model::TPart {
+                        id,
+                        serial_no: Some(serial),
+                        name: drawing.clone(),
+                        drawing_no: drawing,
+                        applicant_name: String::new(),
+                        quantity: qty,
+                        request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                        planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                        customer_id: 0,
+                        assembly_id: None,
+                        status: "IN_PROCESS".to_string(),
+                        is_urgent: false,
+                        next_process_id: None,
+                        order_no: None,
+                        system_delivery_date: None,
+                        note: None,
+                        version: 0,
+                        created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
+                        created_by: None,
+                        updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
+                        updated_by: None,
+                        deleted_at: None,
+                        process_chain_id: None,
+                    },
+                    customer_name: None,
+                    l1_customer_name: None,
+                    location: None,
+                    holder_name: None,
                 },
-                customer_name: None,
-                l1_customer_name: None,
-                location: None,
-                holder_name: None,
-            })
+            )
             .collect();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM t_part_batch b \
@@ -2915,7 +2963,12 @@ impl PartService {
         query: &super::super::dto_crud::ByWorkerQuery,
         current: &CurrentUser,
     ) -> Result<super::super::dto_crud::PartListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector, Role::ShelfAccount])?;
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::ShelfAccount,
+        ])?;
         let limit = query.limit.unwrap_or(50).clamp(1, 200);
         let offset = query.offset.unwrap_or(0).max(0);
         let rows: Vec<(i64, String, String, i32)> = sqlx::query_as(
@@ -2934,37 +2987,39 @@ impl PartService {
         .await?;
         let items: Vec<super::super::dto_crud::PartListItem> = rows
             .into_iter()
-            .map(|(id, serial, drawing, qty)| super::super::dto_crud::PartListItem {
-                part: crate::modules::part::model::TPart {
-                    id,
-                    serial_no: Some(serial),
-                    name: drawing.clone(),
-                    drawing_no: drawing,
-                    applicant_name: String::new(),
-                    quantity: qty,
-                    request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    customer_id: 0,
-                    assembly_id: None,
-                    status: "IN_PROCESS".to_string(),
-                    is_urgent: false,
-                    next_process_id: None,
-                    order_no: None,
-                    system_delivery_date: None,
-                    note: None,
-                    version: 0,
-                    created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                    created_by: None,
-                    updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                    updated_by: None,
-                    deleted_at: None,
-                    process_chain_id: None,
+            .map(
+                |(id, serial, drawing, qty)| super::super::dto_crud::PartListItem {
+                    part: crate::modules::part::model::TPart {
+                        id,
+                        serial_no: Some(serial),
+                        name: drawing.clone(),
+                        drawing_no: drawing,
+                        applicant_name: String::new(),
+                        quantity: qty,
+                        request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                        planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                        customer_id: 0,
+                        assembly_id: None,
+                        status: "IN_PROCESS".to_string(),
+                        is_urgent: false,
+                        next_process_id: None,
+                        order_no: None,
+                        system_delivery_date: None,
+                        note: None,
+                        version: 0,
+                        created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
+                        created_by: None,
+                        updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
+                        updated_by: None,
+                        deleted_at: None,
+                        process_chain_id: None,
+                    },
+                    customer_name: None,
+                    l1_customer_name: None,
+                    location: None,
+                    holder_name: None,
                 },
-                customer_name: None,
-                l1_customer_name: None,
-                location: None,
-                holder_name: None,
-            })
+            )
             .collect();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM t_part_batch b \

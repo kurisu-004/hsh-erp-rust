@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::modules::worker_pool::dto::WorkerScanEvent;
 use crate::modules::worker_pool::model::RefillResult;
-use crate::shared::types::{deserialize_i64, deserialize_i64_opt, serialize_i64, serialize_i64_opt};
+use crate::shared::types::{
+    deserialize_i64, deserialize_i64_opt, serialize_i64, serialize_i64_opt,
+};
 
 /// 工单详情投影（to-ship / to-inspection / to-process 出参；其它端点复用做最小投影）。
 ///
@@ -309,15 +311,15 @@ pub struct WorkerScanOut {
 pub struct PartScanInfoOut {
     #[serde(serialize_with = "serialize_i64")]
     pub id: i64,
-    pub drawing_no: String,                  // b 图号
-    pub name: String,                        // 名称
-    pub quantity: i32,                       // 数量
+    pub drawing_no: String, // b 图号
+    pub name: String,       // 名称
+    pub quantity: i32,      // 数量
     #[serde(serialize_with = "serialize_i64")]
-    pub customer_id: i64,                    // 客户（仅 FK，不冗余 customer_name）
-    pub system_delivery_date: Option<chrono::NaiveDate>,  // 系统交期
-    pub is_urgent: bool,                     // 是否加急
-    pub order_no: Option<String>,            // 订单号
-    pub note: Option<String>,                // 备注
+    pub customer_id: i64, // 客户（仅 FK，不冗余 customer_name）
+    pub system_delivery_date: Option<chrono::NaiveDate>, // 系统交期
+    pub is_urgent: bool,    // 是否加急
+    pub order_no: Option<String>, // 订单号
+    pub note: Option<String>, // 备注
 }
 
 /// `GET /parts/by-serial/{serial_no}/part-batches` 出参：单批次窄字段。
@@ -327,9 +329,9 @@ pub struct PartBatchScanOut {
     #[serde(serialize_with = "serialize_i64")]
     pub id: i64,
     pub quantity: i32,
-    pub status: String,                      // PartBatchStatus 字符串形态
-    pub holder_name: Option<String>,         // 当前持有人/货架名称（解析自 t_shelf/t_user/t_worker）
-    pub version: i32,                        // 乐观锁版本号（前端 to-ship 用）
+    pub status: String,              // PartBatchStatus 字符串形态
+    pub holder_name: Option<String>, // 当前持有人/货架名称（解析自 t_shelf/t_user/t_worker）
+    pub version: i32,                // 乐观锁版本号（前端 to-ship 用）
 }
 
 /// Scan context 完整出参：工单 + 全部未删批次（按 batch_no 升序）。
@@ -420,7 +422,7 @@ pub struct InspectionBatchListItemOut {
     pub batch_id: i64,
     pub batch_no: i32,
     pub quantity: i32,
-    pub status: String,                         // 必为 "INSPECTION"
+    pub status: String, // 必为 "INSPECTION"
     pub location: Option<String>,
     pub version: i32,
     /// 逻辑 FK → t_process_chain_step.id（2026-09-16 PR-3；替代 next_process_id 列）

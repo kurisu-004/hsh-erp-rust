@@ -43,7 +43,7 @@ use crate::modules::part::repo::PartRepo;
 use crate::modules::part_batch::model::TPartBatch;
 use crate::modules::shelf::model::TShelf;
 use crate::modules::shelf::repo::ShelfRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
     BatchOpFailure, BatchToInspectionRequest, BatchToShipRequest, BatchToXxxOut,
@@ -192,7 +192,10 @@ impl PartService {
     /// 锚定 `t_part_batch.version` 而非 `t_part.version`——后者是所有批次的聚合投影，
     /// 同 part 下任意其它批次的写入都会把它 +1，用作 caller 锚点会产生假冲突。
     /// 不符 → `40901 VERSION_CONFLICT`。
-    pub(super) fn _assert_batch_version(target: &TPartBatch, expected: i32) -> Result<(), AppError> {
+    pub(super) fn _assert_batch_version(
+        target: &TPartBatch,
+        expected: i32,
+    ) -> Result<(), AppError> {
         if target.version != expected {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -261,9 +264,10 @@ impl PartService {
         req: ToShipRequest,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
-        let batch_id: i64 = req.batch_id.parse().map_err(|_| {
-            AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id))
-        })?;
+        let batch_id: i64 = req
+            .batch_id
+            .parse()
+            .map_err(|_| AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id)))?;
         Self::to_ship_core(
             &mut *conn,
             snowflake,
@@ -312,10 +316,7 @@ impl PartService {
                     failed.push(BatchOpFailure {
                         batch_id: 0,
                         code: code::VALIDATION_ERROR,
-                        message: format!(
-                            "batch_id '{}' 解析失败",
-                            item.batch_id
-                        ),
+                        message: format!("batch_id '{}' 解析失败", item.batch_id),
                     });
                     continue;
                 }
@@ -381,18 +382,37 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
         let shelf_id: i64 = req.shelf_id.parse().map_err(|_| {
-            AppError::biz(code::BIZ_INVALID_VALUE, format!("shelf_id '{}' is not a numeric id", req.shelf_id))
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("shelf_id '{}' is not a numeric id", req.shelf_id),
+            )
         })?;
         let next_process_id: i64 = req.next_process_id.parse().map_err(|_| {
-            AppError::biz(code::BIZ_INVALID_VALUE, format!("next_process_id '{}' is not a numeric id", req.next_process_id))
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!(
+                    "next_process_id '{}' is not a numeric id",
+                    req.next_process_id
+                ),
+            )
         })?;
-        let batch_id: i64 = req.batch_id.parse().map_err(|_| {
-            AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id))
-        })?;
+        let batch_id: i64 = req
+            .batch_id
+            .parse()
+            .map_err(|_| AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id)))?;
         Self::to_process_core(
-            &mut *conn, snowflake, part_id, shelf_id, next_process_id,
-            req.note.as_deref(), batch_id, req.version, req.quantity, current,
-        ).await
+            &mut *conn,
+            snowflake,
+            part_id,
+            shelf_id,
+            next_process_id,
+            req.note.as_deref(),
+            batch_id,
+            req.version,
+            req.quantity,
+            current,
+        )
+        .await
     }
 
     /// to_inspection 薄包装（handler 调用）。
@@ -403,19 +423,32 @@ impl PartService {
         req: ToInspectionRequest,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
-        let target_inspection_shelf_id: i64 = req.target_inspection_shelf_id.parse().map_err(|_| {
-            AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("target_inspection_shelf_id '{}' is not a numeric id", req.target_inspection_shelf_id),
-            )
-        })?;
-        let batch_id: i64 = req.batch_id.parse().map_err(|_| {
-            AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id))
-        })?;
+        let target_inspection_shelf_id: i64 =
+            req.target_inspection_shelf_id.parse().map_err(|_| {
+                AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    format!(
+                        "target_inspection_shelf_id '{}' is not a numeric id",
+                        req.target_inspection_shelf_id
+                    ),
+                )
+            })?;
+        let batch_id: i64 = req
+            .batch_id
+            .parse()
+            .map_err(|_| AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id)))?;
         Self::to_inspection_core(
-            &mut *conn, snowflake, part_id, target_inspection_shelf_id,
-            batch_id, req.version, req.quantity, req.note.as_deref(), current,
-        ).await
+            &mut *conn,
+            snowflake,
+            part_id,
+            target_inspection_shelf_id,
+            batch_id,
+            req.version,
+            req.quantity,
+            req.note.as_deref(),
+            current,
+        )
+        .await
     }
 
     /// 批量 to-inspection：每个 item 在 caller 的外层事务内执行（共享 `&mut PgConnection`）。
@@ -444,12 +477,16 @@ impl PartService {
                 BATCH_TO_INSPECTION_MAX_ITEMS
             )));
         }
-        let target_inspection_shelf_id: i64 = req.target_inspection_shelf_id.parse().map_err(|_| {
-            AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("target_inspection_shelf_id '{}' is not a numeric id", req.target_inspection_shelf_id),
-            )
-        })?;
+        let target_inspection_shelf_id: i64 =
+            req.target_inspection_shelf_id.parse().map_err(|_| {
+                AppError::biz(
+                    code::BIZ_INVALID_VALUE,
+                    format!(
+                        "target_inspection_shelf_id '{}' is not a numeric id",
+                        req.target_inspection_shelf_id
+                    ),
+                )
+            })?;
         // 共享品检架校验（一次性）—— 不合法 → 顶层 20511 / 20512（整批失败）
         Self::_validate_inspection_shelf(&mut *conn, target_inspection_shelf_id).await?;
 
@@ -463,10 +500,7 @@ impl PartService {
                     failed.push(BatchOpFailure {
                         batch_id: 0,
                         code: code::VALIDATION_ERROR,
-                        message: format!(
-                            "batch_id '{}' 解析失败",
-                            item.batch_id
-                        ),
+                        message: format!("batch_id '{}' 解析失败", item.batch_id),
                     });
                     continue;
                 }

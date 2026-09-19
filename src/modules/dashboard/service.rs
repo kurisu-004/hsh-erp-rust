@@ -129,13 +129,8 @@ impl DashboardService {
         };
 
         // 3) 品检区扁平
-        let on_insp_rows = fetch_zone_rows(
-            &mut *conn,
-            "INSPECTION",
-            Some("INSPECTION"),
-            top_n,
-        )
-        .await?;
+        let on_insp_rows =
+            fetch_zone_rows(&mut *conn, "INSPECTION", Some("INSPECTION"), top_n).await?;
 
         // 4) 工人持有
         let worker_rows = fetch_worker_rows(&mut *conn, top_n).await?;
@@ -220,15 +215,16 @@ impl DashboardService {
             .collect();
 
         // 8) 工人持有
-        let worker_batch_ids: Vec<i64> =
-            worker_rows.iter().map(|(b, _)| b.batch_id).collect();
+        let worker_batch_ids: Vec<i64> = worker_rows.iter().map(|(b, _)| b.batch_id).collect();
         let picked_at_map = fetch_picked_up_at_map(&mut *conn, &worker_batch_ids).await?;
         let worker_items: Vec<DashboardItem> = worker_rows
             .into_iter()
             .map(|(b, p)| {
                 let mut item = part_to_item(&p, &b, &cust_map, &process_name_map);
                 item.current_holder_kind = Some("worker".into());
-                item.worker_name = b.holder_id.and_then(|wid| worker_name_map.get(&wid).cloned());
+                item.worker_name = b
+                    .holder_id
+                    .and_then(|wid| worker_name_map.get(&wid).cloned());
                 if let Some(bid) = picked_at_map.get(&b.batch_id) {
                     item.picked_up_at = Some(bid.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
                 }
@@ -285,7 +281,10 @@ fn row_to_part_batch_pair(r: sqlx::postgres::PgRow) -> (BatchLite, PartLite) {
             // 2026-09-15 review 修：SQL alias `batch_no` 已 SELECT，这里读出回填
             batch_no: r.try_get::<Option<i32>, _>("batch_no").ok().flatten(),
             holder_id: r.try_get::<Option<i64>, _>("holder_id").ok().flatten(),
-            next_process_id: r.try_get::<Option<i64>, _>("next_process_id").ok().flatten(),
+            next_process_id: r
+                .try_get::<Option<i64>, _>("next_process_id")
+                .ok()
+                .flatten(),
         },
         PartLite {
             part_id: r.get::<i64, _>("p_id"),
@@ -385,8 +384,7 @@ async fn fetch_worker_rows(
     .fetch_all(conn)
     .await?;
 
-    let pairs: Vec<(BatchLite, PartLite)> =
-        rows.into_iter().map(row_to_part_batch_pair).collect();
+    let pairs: Vec<(BatchLite, PartLite)> = rows.into_iter().map(row_to_part_batch_pair).collect();
 
     // 按 holder 分桶限流
     let mut per_holder: HashMap<i64, i64> = HashMap::new();
@@ -411,12 +409,11 @@ async fn fetch_customer_path(
     if cust_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let customers = sqlx::query(
-        "SELECT id, name, parent_id FROM t_customer WHERE id = ANY($1::bigint[])",
-    )
-    .bind(cust_ids)
-    .fetch_all(&mut *conn)
-    .await?;
+    let customers =
+        sqlx::query("SELECT id, name, parent_id FROM t_customer WHERE id = ANY($1::bigint[])")
+            .bind(cust_ids)
+            .fetch_all(&mut *conn)
+            .await?;
     let mut id_to_parent: HashMap<i64, Option<i64>> = HashMap::new();
     let mut id_to_name: HashMap<i64, String> = HashMap::new();
     let mut parent_ids: Vec<i64> = Vec::new();
@@ -435,12 +432,10 @@ async fn fetch_customer_path(
     let parents: Vec<(i64, String)> = if parent_ids.is_empty() {
         Vec::new()
     } else {
-        let rows = sqlx::query(
-            "SELECT id, name FROM t_customer WHERE id = ANY($1::bigint[])",
-        )
-        .bind(&parent_ids)
-        .fetch_all(conn)
-        .await?;
+        let rows = sqlx::query("SELECT id, name FROM t_customer WHERE id = ANY($1::bigint[])")
+            .bind(&parent_ids)
+            .fetch_all(conn)
+            .await?;
         rows.into_iter()
             .map(|r| (r.get::<i64, _>("id"), r.get::<String, _>("name")))
             .collect()
@@ -450,8 +445,8 @@ async fn fetch_customer_path(
     let mut out: HashMap<i64, (Option<String>, String)> = HashMap::new();
     for (id, name) in id_to_name.iter() {
         let parent_name = id_to_parent
-        .get(id)
-        .and_then(|p| p.and_then(|pid| parent_map.get(&pid).cloned()));
+            .get(id)
+            .and_then(|p| p.and_then(|pid| parent_map.get(&pid).cloned()));
         let path = match (parent_name, name.as_str()) {
             (Some(p), c) if !p.is_empty() && !c.is_empty() => Some(format!("{p} / {c}")),
             (_, c) if !c.is_empty() => Some(c.to_string()),
@@ -518,7 +513,12 @@ async fn fetch_picked_up_at_map(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| (r.get::<i64, _>("batch_id"), r.get::<NaiveDateTime, _>("created_at")))
+        .map(|r| {
+            (
+                r.get::<i64, _>("batch_id"),
+                r.get::<NaiveDateTime, _>("created_at"),
+            )
+        })
         .collect())
 }
 
@@ -580,7 +580,9 @@ fn part_to_item(
         drawing_no: p.drawing_no.clone(),
         quantity: p.quantity,
         is_urgent: p.is_urgent,
-        planned_delivery_date: p.planned_delivery_date.map(|d| d.format("%Y-%m-%d").to_string()),
+        planned_delivery_date: p
+            .planned_delivery_date
+            .map(|d| d.format("%Y-%m-%d").to_string()),
         picked_up_at: None,
         current_holder_id: b.holder_id.map(|h| h.to_string()),
         current_holder_kind: None,

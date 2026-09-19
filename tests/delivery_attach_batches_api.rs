@@ -19,9 +19,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -48,7 +48,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -103,7 +108,10 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, NULL, $3, 0, $4, NULL, $4, NULL)",
-        id, name, prefix, now,
+        id,
+        name,
+        prefix,
+        now,
     )
     .execute(pool)
     .await
@@ -120,7 +128,10 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
-        id, name, l1_id, now,
+        id,
+        name,
+        l1_id,
+        now,
     )
     .execute(pool)
     .await
@@ -128,12 +139,7 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     id
 }
 
-async fn insert_part(
-    pool: &PgPool,
-    name: &str,
-    customer_id: i64,
-    serial_no: Option<&str>,
-) -> i64 {
+async fn insert_part(pool: &PgPool, name: &str, customer_id: i64, serial_no: Option<&str>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
@@ -355,10 +361,7 @@ async fn attach_batches_occ_conflict_via_wrong_version() {
     assert_eq!(resp["data"]["attached"], 0);
     let conflicts = resp["data"]["conflicts"].as_array().unwrap();
     assert_eq!(conflicts.len(), 1);
-    assert_eq!(
-        conflicts[0]["batch_id"].as_str().unwrap(),
-        bid.to_string()
-    );
+    assert_eq!(conflicts[0]["batch_id"].as_str().unwrap(), bid.to_string());
     assert_eq!(conflicts[0]["reason"], "VERSION_CONFLICT");
 
     // 落库断言：batch 未挂到本单
@@ -406,7 +409,11 @@ async fn attach_batches_already_attached_conflict() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "ALREADY_ATTACHED 不影响 HTTP 状态: {resp}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "ALREADY_ATTACHED 不影响 HTTP 状态: {resp}"
+    );
     assert_eq!(resp["data"]["attached"], 0);
     let conflicts = resp["data"]["conflicts"].as_array().unwrap();
     assert_eq!(conflicts.len(), 1);
@@ -585,10 +592,7 @@ async fn attach_batches_partial_success() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "部分成功应 200: {resp}");
-    assert_eq!(
-        resp["data"]["attached"], 1,
-        "1 个 OK 应挂单；got {resp}"
-    );
+    assert_eq!(resp["data"]["attached"], 1, "1 个 OK 应挂单；got {resp}");
     let conflicts = resp["data"]["conflicts"].as_array().unwrap();
     assert_eq!(conflicts.len(), 1, "1 个 OCC 应进 conflicts");
     assert_eq!(

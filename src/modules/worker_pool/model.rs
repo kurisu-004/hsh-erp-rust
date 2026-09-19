@@ -1,5 +1,5 @@
-use serde::Serialize;
 use crate::shared::types::serialize_i64;
+use serde::Serialize;
 
 /// `assign` / `refill` 单条返回形状（向后兼容）。
 ///

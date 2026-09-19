@@ -114,10 +114,7 @@ pub async fn run_once(state: &Arc<AppState>, threshold_days: u32) -> anyhow::Res
         match complete_one(&mut tx, &state.snowflake, part_id, req, &system_user).await {
             Ok(_) => {
                 completed.push((batch_id, part_id));
-                info!(
-                    batch_id,
-                    part_id, "auto_complete: completed batch"
-                );
+                info!(batch_id, part_id, "auto_complete: completed batch");
             }
             Err(e) => {
                 warn!(

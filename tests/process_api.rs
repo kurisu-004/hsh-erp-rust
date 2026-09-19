@@ -16,9 +16,9 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use axum::body::{to_bytes, Body};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
-use serde_json::{json, Value};
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -43,7 +43,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     (status, envelope)
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body> {
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+    bearer: Option<&str>,
+) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = bearer {
         builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
@@ -92,10 +97,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
 /// 绕开 part 域 CRUD（part CRUD 不是本任务范畴）。
 async fn insert_part_with_next_process(pool: &PgPool, process_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -312,7 +314,11 @@ async fn update_process_inhouse_no_approval_field_does_not_bump_version() {
         ),
     )
     .await;
-    assert_eq!(s2, StatusCode::OK, "no-op update should succeed; got: {env2}");
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "no-op update should succeed; got: {env2}"
+    );
     assert_eq!(env2["code"], 0);
     assert_eq!(
         env2["data"]["requires_approval"], false,
@@ -622,10 +628,7 @@ async fn soft_delete_process_referenced_by_chain_step_returns_20803() {
     let pid: i64 = pid_str.parse().unwrap();
 
     // 直插 chain + step（绕开 part 软删级联，单纯看 step 是否拦截 soft-delete）
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(
-        1_577_836_800_000,
-        1,
-    );
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let chain_id = snowflake.next_id();
     let step_id = snowflake.next_id();
     let now = now_naive();

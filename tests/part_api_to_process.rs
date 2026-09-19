@@ -38,15 +38,7 @@ async fn to_process_invalid_shelf_id_rejected() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (_insp, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
     let v = batch_version(&_pool, batch_id).await;
 
@@ -79,15 +71,7 @@ async fn to_process_invalid_next_process_id_rejected() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (_insp, prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
     let v = batch_version(&_pool, batch_id).await;
 
@@ -120,15 +104,7 @@ async fn to_process_happy_path() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (_insp, prod_shelf, next_proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     // PR-3：建链并把 part 绑到 chain
     let chain_id = create_chain_for_part(&_pool, part_id).await;
     let _step_id = create_step(&_pool, chain_id, next_proc, 1).await;
@@ -164,15 +140,7 @@ async fn to_process_wrong_state_rejected() {
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (_insp, prod_shelf, next_proc) = setup_inspection_and_production_shelves(&_pool).await;
     // setup: PENDING part（非 INSPECTION）
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "PENDING",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "PENDING").await;
     let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
     let v = batch_version(&_pool, batch_id).await;
 
@@ -209,15 +177,7 @@ async fn to_process_partial_split_happy_path() {
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (_insp, prod_shelf, next_proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(
-        &_pool,
-        "P0",
-        l2,
-        Some("P000"),
-        None,
-        "INSPECTION",
-    )
-    .await;
+    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
     // 2026-09-16 PR-3：to_process 要求 part 已绑定工艺链
     let chain_id = create_chain_for_part(&_pool, part_id).await;
     let _step_id = create_step(&_pool, chain_id, next_proc, 1).await;

@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::auth::rbac::Role;
 use crate::modules::iam::dto::UserAddRoleRequest;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::helpers::{
-    clerk_current, guard_svc, make_shelf, make_user, make_user_role,
-    make_user_role_row, manager_current, write_svc,
+    clerk_current, guard_svc, make_shelf, make_user, make_user_role, make_user_role_row,
+    manager_current, write_svc,
 };
 
 // ===========================================================================

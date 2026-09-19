@@ -43,7 +43,7 @@ use crate::modules::process_chain::repo::ProcessChainRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::modules::worker::repo::WorkerRepo;
 use crate::modules::worker_pool::dto::WorkerScanEvent;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::{WorkerScanCoreOut, WorkerScanRequest};
 use super::PartService;
@@ -123,10 +123,7 @@ impl PartService {
         // 4. 定位 batch（worker 持有 IN_PROCESS+WORKER）
         let bid_hint = req.batch_id.as_deref().and_then(|s| s.parse().ok());
         let batch = match PartRepo::find_worker_held_batch_for_part(
-            &mut *conn,
-            part.id,
-            worker.id,
-            bid_hint,
+            &mut *conn, part.id, worker.id, bid_hint,
         )
         .await
         {
@@ -260,17 +257,12 @@ impl PartService {
                     ));
                 }
                 // 状态机：IN_PROCESS → INSPECTION
-                let from = PartStatus::from_str(&part.status).ok_or_else(|| {
-                    AppError::biz(code::BIZ_INVALID_VALUE, "非法 part 状态")
-                })?;
+                let from = PartStatus::from_str(&part.status)
+                    .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "非法 part 状态"))?;
                 if !from.can_transition_to(PartStatus::INSPECTION) {
                     return Err(AppError::biz(
                         code::BIZ_INVALID_TRANSITION,
-                        format!(
-                            "part {} 当前状态 {} 不允许送检",
-                            part.id,
-                            from.as_str()
-                        ),
+                        format!("part {} 当前状态 {} 不允许送检", part.id, from.as_str()),
                     ));
                 }
                 // 切 holder worker → target_shelf + 状态 IN_PROCESS → INSPECTION（OCC）
@@ -288,9 +280,7 @@ impl PartService {
                 // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
                 // 变化时级联调 AssemblyService::sync_from_part_change 闭合链路。
                 synced_assembly_id = match PartService::sync_from_batch_change(
-                    &mut *conn,
-                    part.id,
-                    current,
+                    &mut *conn, part.id, current,
                 )
                 .await?
                 {

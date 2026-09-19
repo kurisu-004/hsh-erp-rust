@@ -145,9 +145,8 @@ impl WorkTypeRepo {
         executor: E,
         code_like: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
-        let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-            "SELECT COUNT(*)::bigint FROM t_work_type WHERE deleted_at IS NULL",
-        );
+        let mut qb: QueryBuilder<sqlx::Postgres> =
+            QueryBuilder::new("SELECT COUNT(*)::bigint FROM t_work_type WHERE deleted_at IS NULL");
         if let Some(needle) = code_like {
             let trimmed = needle.trim();
             if !trimmed.is_empty() {

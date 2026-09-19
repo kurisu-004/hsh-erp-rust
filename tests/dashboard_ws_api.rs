@@ -18,7 +18,9 @@
 mod common;
 
 use chrono::NaiveDate;
-use common::{clean_business_db, clean_db, ensure_database_exists, test_pool, test_state, test_ws_app};
+use common::{
+    clean_business_db, clean_db, ensure_database_exists, test_pool, test_state, test_ws_app,
+};
 
 use futures_util::StreamExt;
 use hsh_erp_rust::auth::jwt::encode_access;
@@ -70,10 +72,11 @@ async fn build_snapshot_with_workers_basic() {
     drop(tx);
 
     // 必有 on_production_shelves 包含该架（空 items 也算）
-    assert!(snap
-        .on_production_shelves
-        .iter()
-        .any(|g| g.shelf_code == "S-001"));
+    assert!(
+        snap.on_production_shelves
+            .iter()
+            .any(|g| g.shelf_code == "S-001")
+    );
     assert_eq!(snap.upcoming_delivery.len(), 7, "未来 7 天固定 7 条");
     assert!(!snap.ts.is_empty());
 }
@@ -245,10 +248,7 @@ async fn spawn_ws_server() -> (String, Arc<hsh_erp_rust::state::AppState>) {
 }
 
 /// 签发合法 access token + 写入 Redis session，使 dashboard WS 握手通过。
-async fn mint_test_token(
-    state: &Arc<hsh_erp_rust::state::AppState>,
-    user_id: i64,
-) -> String {
+async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
     use hsh_erp_rust::auth::session::{CachedCurrentUser, TokenKind};
     let claims = Claims {
         sub: user_id,
@@ -347,7 +347,12 @@ async fn ws_e2e_valid_token_receives_snapshot() {
     let v: serde_json::Value = serde_json::from_str(&text).expect("snapshot JSON parse");
     assert_eq!(v["type"], "snapshot", "首条 frame 应为 snapshot envelope");
     assert!(v["data"]["on_production_shelves"].is_array());
-    assert!(!v["data"]["upcoming_delivery"].as_array().unwrap().is_empty());
+    assert!(
+        !v["data"]["upcoming_delivery"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 
     // 主动关 socket 避免 graceful_shutdown 死等
     let _ = ws.close(None).await;

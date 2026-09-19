@@ -167,13 +167,7 @@ async fn delivered_stats_counts_via_delivered_events() {
     )
     .await;
     let b1 = insert_initial_batch(&pool, p1).await;
-    insert_delivered_event(
-        &pool,
-        p1,
-        b1,
-        NaiveDate::from_ymd_opt(2026, 9, 12).unwrap(),
-    )
-    .await;
+    insert_delivered_event(&pool, p1, b1, NaiveDate::from_ymd_opt(2026, 9, 12).unwrap()).await;
 
     let p2 = insert_part_with_dates(
         &pool,
@@ -184,13 +178,7 @@ async fn delivered_stats_counts_via_delivered_events() {
     )
     .await;
     let b2 = insert_initial_batch(&pool, p2).await;
-    insert_delivered_event(
-        &pool,
-        p2,
-        b2,
-        NaiveDate::from_ymd_opt(2026, 9, 16).unwrap(),
-    )
-    .await;
+    insert_delivered_event(&pool, p2, b2, NaiveDate::from_ymd_opt(2026, 9, 16).unwrap()).await;
 
     let p3 = insert_part_with_dates(
         &pool,
@@ -201,13 +189,7 @@ async fn delivered_stats_counts_via_delivered_events() {
     )
     .await;
     let b3 = insert_initial_batch(&pool, p3).await;
-    insert_delivered_event(
-        &pool,
-        p3,
-        b3,
-        NaiveDate::from_ymd_opt(2026, 9, 11).unwrap(),
-    )
-    .await;
+    insert_delivered_event(&pool, p3, b3, NaiveDate::from_ymd_opt(2026, 9, 11).unwrap()).await;
 
     let mut tx = pool.begin().await.unwrap();
     let (cnt, _sum_total, orange, red) = StatisticsRepo::delivered_stats(
@@ -220,8 +202,14 @@ async fn delivered_stats_counts_via_delivered_events() {
     drop(tx);
 
     assert_eq!(cnt, 3, "3 个 part 都有 DELIVERED 事件：{cnt}");
-    assert_eq!(red, 1, "P2 实际晚于 system (09-16 > 09-15) → 1 个 red: {red}");
-    assert_eq!(orange, 2, "P1 (晚于 planned 但 ≤ system) + P3 (晚于 planned + system IS NULL) → orange=2: {orange}");
+    assert_eq!(
+        red, 1,
+        "P2 实际晚于 system (09-16 > 09-15) → 1 个 red: {red}"
+    );
+    assert_eq!(
+        orange, 2,
+        "P1 (晚于 planned 但 ≤ system) + P3 (晚于 planned + system IS NULL) → orange=2: {orange}"
+    );
 }
 
 /// count_overdue_undelivered 按 NOT EXISTS DELIVERED 事件口径：
@@ -276,7 +264,10 @@ async fn count_overdue_undelivered_uses_event_absence() {
         .expect("count_overdue_undelivered ok");
     drop(tx);
 
-    assert_eq!(cnt, 1, "仅 P1 满足「planned<today + 无 DELIVERED 事件」: {cnt}");
+    assert_eq!(
+        cnt, 1,
+        "仅 P1 满足「planned<today + 无 DELIVERED 事件」: {cnt}"
+    );
 }
 
 /// 反例：part 软删后，count_overdue_undelivered 不计软删件（PR-2 § repo.rs:224
@@ -297,13 +288,11 @@ async fn count_overdue_undelivered_excludes_soft_deleted() {
     )
     .await;
     insert_initial_batch(&pool, p1).await;
-    sqlx::query(
-        "UPDATE t_part SET deleted_at = now(), version = version + 1 WHERE id = $1",
-    )
-    .bind(p1)
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE t_part SET deleted_at = now(), version = version + 1 WHERE id = $1")
+        .bind(p1)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let mut tx = pool.begin().await.unwrap();
     let cnt = StatisticsRepo::count_overdue_undelivered(&mut tx, today)

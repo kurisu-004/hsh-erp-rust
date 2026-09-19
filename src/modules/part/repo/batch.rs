@@ -45,9 +45,10 @@ impl PartRepo {
         expected_batch_id: Option<i64>,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
         match expected_batch_id {
-            Some(bid) => sqlx::query_as!(
-                TPartBatch,
-                r#"
+            Some(bid) => {
+                sqlx::query_as!(
+                    TPartBatch,
+                    r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
@@ -57,11 +58,12 @@ impl PartRepo {
                 WHERE id = $1 AND part_id = $2 AND status = 'INSPECTION'
                   AND deleted_at IS NULL
                 "#,
-                bid,
-                part_id,
-            )
-            .fetch_optional(&mut *conn)
-            .await,
+                    bid,
+                    part_id,
+                )
+                .fetch_optional(&mut *conn)
+                .await
+            }
             None => {
                 let count: i64 = sqlx::query_scalar!(
                     r#"
@@ -75,9 +77,10 @@ impl PartRepo {
                 .await?;
                 match count {
                     0 => Ok(None),
-                    1 => sqlx::query_as!(
-                        TPartBatch,
-                        r#"
+                    1 => {
+                        sqlx::query_as!(
+                            TPartBatch,
+                            r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
@@ -88,10 +91,11 @@ impl PartRepo {
                         ORDER BY id ASC
                         LIMIT 1
                         "#,
-                        part_id,
-                    )
-                    .fetch_optional(&mut *conn)
-                    .await,
+                            part_id,
+                        )
+                        .fetch_optional(&mut *conn)
+                        .await
+                    }
                     _ => Err(sqlx::Error::RowNotFound),
                 }
             }
@@ -107,9 +111,10 @@ impl PartRepo {
         expected_batch_id: Option<i64>,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
         match expected_batch_id {
-            Some(bid) => sqlx::query_as!(
-                TPartBatch,
-                r#"
+            Some(bid) => {
+                sqlx::query_as!(
+                    TPartBatch,
+                    r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
@@ -120,11 +125,12 @@ impl PartRepo {
                   AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')
                   AND deleted_at IS NULL
                 "#,
-                bid,
-                part_id,
-            )
-            .fetch_optional(&mut *conn)
-            .await,
+                    bid,
+                    part_id,
+                )
+                .fetch_optional(&mut *conn)
+                .await
+            }
             None => {
                 let count: i64 = sqlx::query_scalar!(
                     r#"
@@ -140,9 +146,10 @@ impl PartRepo {
                 .await?;
                 match count {
                     0 => Ok(None),
-                    1 => sqlx::query_as!(
-                        TPartBatch,
-                        r#"
+                    1 => {
+                        sqlx::query_as!(
+                            TPartBatch,
+                            r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
@@ -155,10 +162,11 @@ impl PartRepo {
                         ORDER BY id ASC
                         LIMIT 1
                         "#,
-                        part_id,
-                    )
-                    .fetch_optional(&mut *conn)
-                    .await,
+                            part_id,
+                        )
+                        .fetch_optional(&mut *conn)
+                        .await
+                    }
                     _ => Err(sqlx::Error::RowNotFound),
                 }
             }
@@ -174,9 +182,10 @@ impl PartRepo {
         expected_batch_id: Option<i64>,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
         match expected_batch_id {
-            Some(bid) => sqlx::query_as!(
-                TPartBatch,
-                r#"
+            Some(bid) => {
+                sqlx::query_as!(
+                    TPartBatch,
+                    r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
@@ -186,11 +195,12 @@ impl PartRepo {
                 WHERE id = $1 AND part_id = $2 AND status = 'INSPECTION'
                   AND deleted_at IS NULL
                 "#,
-                bid,
-                part_id,
-            )
-            .fetch_optional(&mut *conn)
-            .await,
+                    bid,
+                    part_id,
+                )
+                .fetch_optional(&mut *conn)
+                .await
+            }
             None => {
                 let count: i64 = sqlx::query_scalar!(
                     r#"
@@ -204,9 +214,10 @@ impl PartRepo {
                 .await?;
                 match count {
                     0 => Ok(None),
-                    1 => sqlx::query_as!(
-                        TPartBatch,
-                        r#"
+                    1 => {
+                        sqlx::query_as!(
+                            TPartBatch,
+                            r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
@@ -217,10 +228,11 @@ impl PartRepo {
                         ORDER BY id ASC
                         LIMIT 1
                         "#,
-                        part_id,
-                    )
-                    .fetch_optional(&mut *conn)
-                    .await,
+                            part_id,
+                        )
+                        .fetch_optional(&mut *conn)
+                        .await
+                    }
                     _ => Err(sqlx::Error::RowNotFound),
                 }
             }
@@ -272,7 +284,6 @@ impl PartRepo {
         .await
     }
 
-
     /// 批量通过（OCC UPDATE）。
     pub async fn mark_batch_passed_inspection<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -298,7 +309,6 @@ impl PartRepo {
         .await?;
         Ok(result.rows_affected())
     }
-
 
     /// to-inspection 第一步：批次状态同步（OCC UPDATE t_part_batch）。
     pub async fn mark_batch_inspected<'e, E: PgExecutor<'e>>(
@@ -371,8 +381,7 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-
-/// worker-pool admin_remove 用：按 `id + current_holder_id` 定位 IN_PROCESS+WORKER 批次。
+    /// worker-pool admin_remove 用：按 `id + current_holder_id` 定位 IN_PROCESS+WORKER 批次。
     ///
     /// 必须满足：`status='IN_PROCESS'` + `location='WORKER'` + `current_holder_id = holder_id`，
     /// 且 `deleted_at IS NULL`。
@@ -450,7 +459,6 @@ impl PartRepo {
         Ok(result.rows_affected())
     }
 
-
     /// 定位 worker 持有的 IN_PROCESS 批次（worker-scan 用）。
     ///
     /// 与 `find_inprocess_batch_for_part` 同形：
@@ -473,9 +481,10 @@ impl PartRepo {
         expected_batch_id: Option<i64>,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
         match expected_batch_id {
-            Some(bid) => sqlx::query_as!(
-                TPartBatch,
-                r#"
+            Some(bid) => {
+                sqlx::query_as!(
+                    TPartBatch,
+                    r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
@@ -486,12 +495,13 @@ impl PartRepo {
                   AND status = 'IN_PROCESS' AND location = 'WORKER'
                   AND deleted_at IS NULL
                 "#,
-                bid,
-                part_id,
-                worker_id,
-            )
-            .fetch_optional(&mut *conn)
-            .await,
+                    bid,
+                    part_id,
+                    worker_id,
+                )
+                .fetch_optional(&mut *conn)
+                .await
+            }
             None => {
                 let count: i64 = sqlx::query_scalar!(
                     r#"
@@ -508,9 +518,10 @@ impl PartRepo {
                 .await?;
                 match count {
                     0 => Ok(None),
-                    1 => sqlx::query_as!(
-                        TPartBatch,
-                        r#"
+                    1 => {
+                        sqlx::query_as!(
+                            TPartBatch,
+                            r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
@@ -523,11 +534,12 @@ impl PartRepo {
                         ORDER BY id ASC
                         LIMIT 1
                         "#,
-                        part_id,
-                        worker_id,
-                    )
-                    .fetch_optional(&mut *conn)
-                    .await,
+                            part_id,
+                            worker_id,
+                        )
+                        .fetch_optional(&mut *conn)
+                        .await
+                    }
                     // ≥2 个 IN_PROCESS+WORKER 批次：歧义。Service 层负责把
                     // `sqlx::Error::RowNotFound` 翻译为 `AppError::Biz` /
                     // `20114 / BIZ_PART_BATCH_NOT_HELD_BY_WORKER`。
@@ -582,7 +594,6 @@ impl PartRepo {
 
     // ===== Phase PR-CRUD 新增：8 个 lifecycle mark_* =====
 
-
     /// 批次 READY_TO_SHIP → DELIVERED（OCC UPDATE t_part_batch）。
     pub async fn mark_batch_delivered<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -594,11 +605,14 @@ impl PartRepo {
             r#"UPDATE t_part_batch SET status='DELIVERED', version=version+1,
                 updated_at=now(), updated_by=$3
                WHERE id=$1 AND version=$2 AND status='READY_TO_SHIP' AND deleted_at IS NULL"#,
-            batch_id, expected_version, current_user_id,
-        ).execute(executor).await?;
+            batch_id,
+            expected_version,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
         Ok(r.rows_affected())
     }
-
 
     /// 批次 DELIVERED → COMPLETED。
     pub async fn mark_batch_completed<'e, E: PgExecutor<'e>>(
@@ -611,8 +625,12 @@ impl PartRepo {
             r#"UPDATE t_part_batch SET status='COMPLETED', version=version+1,
                 updated_at=now(), updated_by=$3
                WHERE id=$1 AND version=$2 AND status='DELIVERED' AND deleted_at IS NULL"#,
-            batch_id, expected_version, current_user_id,
-        ).execute(executor).await?;
+            batch_id,
+            expected_version,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
         Ok(r.rows_affected())
     }
 
@@ -630,8 +648,12 @@ impl PartRepo {
                WHERE id=$1 AND version=$2
                  AND status IN ('PENDING','PROGRAMMING','INSPECTION','READY_TO_SHIP','DELIVERED')
                  AND deleted_at IS NULL"#,
-            part_id, expected_version, current_user_id,
-        ).execute(executor).await?;
+            part_id,
+            expected_version,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
         Ok(r.rows_affected())
     }
 
@@ -648,11 +670,14 @@ impl PartRepo {
                WHERE id=$1 AND version=$2
                  AND status IN ('PENDING','PROGRAMMING','INSPECTION','READY_TO_SHIP','DELIVERED')
                  AND deleted_at IS NULL"#,
-            batch_id, expected_version, current_user_id,
-        ).execute(executor).await?;
+            batch_id,
+            expected_version,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
         Ok(r.rows_affected())
     }
-
 
     /// 批次 IN_PROCESS → REPAIRING。
     ///
@@ -669,8 +694,12 @@ impl PartRepo {
             r#"UPDATE t_part_batch SET status='REPAIRING', version=version+1,
                 updated_at=now(), updated_by=$3
                WHERE id=$1 AND version=$2 AND status='IN_PROCESS' AND deleted_at IS NULL"#,
-            batch_id, expected_version, current_user_id,
-        ).execute(executor).await?;
+            batch_id,
+            expected_version,
+            current_user_id,
+        )
+        .execute(executor)
+        .await?;
         Ok(r.rows_affected())
     }
 

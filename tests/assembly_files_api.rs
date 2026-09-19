@@ -27,7 +27,7 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::dto::AssemblyUpdateRequest;
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::shared::error::AppError;
-use lopdf::{dictionary, Document, Object, ObjectId};
+use lopdf::{Document, Object, ObjectId, dictionary};
 use sqlx::PgPool;
 use std::sync::Arc;
 
@@ -210,7 +210,11 @@ async fn upload_files_happy_path() {
         &snowflake,
         cos,
         asm_id,
-        vec![(pdf_bytes, "master.pdf".to_string(), "application/pdf".to_string())],
+        vec![(
+            pdf_bytes,
+            "master.pdf".to_string(),
+            "application/pdf".to_string(),
+        )],
         &current,
     )
     .await
@@ -222,7 +226,9 @@ async fn upload_files_happy_path() {
 
     // 详情应返回 file
     let mut tx = pool.begin().await.unwrap();
-    let detail = AssemblyService::get_assembly(&mut tx, asm_id, &current).await.unwrap();
+    let detail = AssemblyService::get_assembly(&mut tx, asm_id, &current)
+        .await
+        .unwrap();
     drop(tx);
     assert_eq!(detail.files.len(), 1);
     assert_eq!(detail.files[0].original_filename, "master.pdf");
@@ -267,7 +273,11 @@ async fn upload_files_ext_must_be_pdf() {
         &snowflake,
         cos,
         asm.assembly.id,
-        vec![(b"data".to_vec(), "master.step".to_string(), "application/octet-stream".to_string())],
+        vec![(
+            b"data".to_vec(),
+            "master.step".to_string(),
+            "application/octet-stream".to_string(),
+        )],
         &current,
     )
     .await
@@ -342,14 +352,12 @@ async fn soft_delete_has_shipment_returns_20307() {
         order_no: None,
         system_delivery_date: None,
         note: None,
-        children: vec![
-            hsh_erp_rust::modules::assembly::dto::AssemblyChildRequest {
-                name: "child-1".into(),
-                drawing_no: Some("D-SD-SHIP-01".into()),
-                planned_delivery_date: None,
-                quantity: Some(1),
-            },
-        ],
+        children: vec![hsh_erp_rust::modules::assembly::dto::AssemblyChildRequest {
+            name: "child-1".into(),
+            drawing_no: Some("D-SD-SHIP-01".into()),
+            planned_delivery_date: None,
+            quantity: Some(1),
+        }],
     };
     let current = test_current_user(vec![Role::Manager]);
     let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
@@ -471,14 +479,12 @@ async fn child_current_batch_id_in_detail() {
         order_no: None,
         system_delivery_date: None,
         note: None,
-        children: vec![
-            hsh_erp_rust::modules::assembly::dto::AssemblyChildRequest {
-                name: "c-1".into(),
-                drawing_no: Some("D-CB-01".into()),
-                planned_delivery_date: None,
-                quantity: Some(1),
-            },
-        ],
+        children: vec![hsh_erp_rust::modules::assembly::dto::AssemblyChildRequest {
+            name: "c-1".into(),
+            drawing_no: Some("D-CB-01".into()),
+            planned_delivery_date: None,
+            quantity: Some(1),
+        }],
     };
     let current = test_current_user(vec![Role::Manager]);
     let asm = AssemblyService::create_assembly(&mut tx, &snowflake, &req, vec![pdf], &current)
@@ -488,7 +494,9 @@ async fn child_current_batch_id_in_detail() {
     let asm_id = asm.assembly.id;
 
     let mut tx = pool.begin().await.unwrap();
-    let detail = AssemblyService::get_assembly(&mut tx, asm_id, &current).await.unwrap();
+    let detail = AssemblyService::get_assembly(&mut tx, asm_id, &current)
+        .await
+        .unwrap();
     drop(tx);
     assert_eq!(detail.children.len(), 1);
     let cb_id = detail.children[0].current_batch_id;

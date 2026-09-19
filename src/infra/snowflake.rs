@@ -138,7 +138,8 @@ mod tests {
             (MAX_TIMESTAMP, 1, 1),
         ];
         for (ts, instance, seq) in cases {
-            let expected: i64 = ((ts as u128) << 22 | (instance as u128) << 12 | seq as u128) as i64;
+            let expected: i64 =
+                ((ts as u128) << 22 | (instance as u128) << 12 | seq as u128) as i64;
             assert_eq!(
                 compose(ts, instance, seq),
                 expected,
@@ -153,13 +154,7 @@ mod tests {
         // 抽样而非全量（41 位空间太大），覆盖边界 + 任意组合。
         let mut instances = vec![0u16, 1, 31, 32, 511, 512, 1023];
         let sequences: [u16; 5] = [0, 1, 0x7FF, 0x800, 0xFFF];
-        let timestamps = [
-            0u64,
-            1,
-            MAX_TIMESTAMP / 2,
-            MAX_TIMESTAMP - 1,
-            MAX_TIMESTAMP,
-        ];
+        let timestamps = [0u64, 1, MAX_TIMESTAMP / 2, MAX_TIMESTAMP - 1, MAX_TIMESTAMP];
         for &ts in &timestamps {
             for &ins in &instances {
                 for &seq in &sequences {
@@ -168,8 +163,14 @@ mod tests {
                     let back_ins = ((id as u64) >> 12) & (MAX_INSTANCE as u64);
                     let back_seq = id as u64 & (MAX_SEQUENCE as u64);
                     assert_eq!(back_ts, ts, "ts mismatch ts={ts} ins={ins} seq={seq}");
-                    assert_eq!(back_ins, ins as u64, "instance mismatch ts={ts} ins={ins} seq={seq}");
-                    assert_eq!(back_seq, seq as u64, "seq mismatch ts={ts} ins={ins} seq={seq}");
+                    assert_eq!(
+                        back_ins, ins as u64,
+                        "instance mismatch ts={ts} ins={ins} seq={seq}"
+                    );
+                    assert_eq!(
+                        back_seq, seq as u64,
+                        "seq mismatch ts={ts} ins={ins} seq={seq}"
+                    );
                 }
             }
         }
@@ -219,8 +220,14 @@ mod tests {
         assert_eq!(parts_a.instance, 5);
         assert_eq!(parts_b.instance, 5);
         assert_eq!(parts_c.instance, 5);
-        assert!(parts_b.sequence > parts_a.sequence || parts_b.timestamp_ms_since_epoch > parts_a.timestamp_ms_since_epoch);
-        assert!(parts_c.sequence > parts_b.sequence || parts_c.timestamp_ms_since_epoch > parts_b.timestamp_ms_since_epoch);
+        assert!(
+            parts_b.sequence > parts_a.sequence
+                || parts_b.timestamp_ms_since_epoch > parts_a.timestamp_ms_since_epoch
+        );
+        assert!(
+            parts_c.sequence > parts_b.sequence
+                || parts_c.timestamp_ms_since_epoch > parts_b.timestamp_ms_since_epoch
+        );
     }
 
     /// epoch=0 烟雾：连续 100 次生成的 ID 必须单调递增、全部 > 0。

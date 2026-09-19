@@ -19,7 +19,7 @@ pub struct ApplicantOut {
     pub name: String,
     #[serde(serialize_with = "serialize_i64")]
     pub customer_id: i64,
-    pub customer_name: Option<String>,  // 由 service 连 t_customer 补
+    pub customer_name: Option<String>, // 由 service 连 t_customer 补
     pub version: i32,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,

@@ -383,7 +383,7 @@ async fn list_parts_pagination_limit_offset() {
                 now,
                 today,
                 Option::<i64>::None, // $7 = assembly_id
-                "PENDING",            // $8 = status
+                "PENDING",           // $8 = status
             )
             .execute(&pool)
             .await

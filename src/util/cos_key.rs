@@ -55,12 +55,20 @@ pub fn safe_filename(name: &str) -> String {
     let mut result = match ext {
         Some(e) => {
             let cleaned_stem = stem.trim_matches(|c| c == '.' || c == '_' || c == '-');
-            let stem = if cleaned_stem.is_empty() { "file" } else { cleaned_stem };
+            let stem = if cleaned_stem.is_empty() {
+                "file"
+            } else {
+                cleaned_stem
+            };
             format!("{stem}.{e}")
         }
         None => {
             let cleaned = folded.trim_matches(|c| c == '.' || c == '_' || c == '-');
-            if cleaned.is_empty() { "file".to_string() } else { cleaned.to_string() }
+            if cleaned.is_empty() {
+                "file".to_string()
+            } else {
+                cleaned.to_string()
+            }
         }
     };
 
@@ -172,7 +180,10 @@ mod tests {
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
             "drawing.pdf",
         );
-        assert_eq!(key, "uploads/part/12345/DRAWING/abcdef0123456789_drawing.pdf");
+        assert_eq!(
+            key,
+            "uploads/part/12345/DRAWING/abcdef0123456789_drawing.pdf"
+        );
     }
 
     #[test]
@@ -187,19 +198,30 @@ mod tests {
         );
         // 安全文件名折叠后是 "file.step"（stem 全 _- → 回退 "file"）；
         // sha16 是 sha256_hex 前 16 字符
-        assert_eq!(key, "uploads/assembly/99/3D_MODEL/0011223344556677_file.step");
+        assert_eq!(
+            key,
+            "uploads/assembly/99/3D_MODEL/0011223344556677_file.step"
+        );
     }
 
     #[test]
     fn build_cas_key_auto_appends_trailing_slash() {
         // 2026-09-11 新增：prefix 缺尾斜杠时自动补，等价 `uploads/`
         let k1 = build_cas_key(
-            "uploads", "part", 1, "DRAWING",
-            "00112233445566778899aabbccddeeff", "a.pdf",
+            "uploads",
+            "part",
+            1,
+            "DRAWING",
+            "00112233445566778899aabbccddeeff",
+            "a.pdf",
         );
         let k2 = build_cas_key(
-            "uploads/", "part", 1, "DRAWING",
-            "00112233445566778899aabbccddeeff", "a.pdf",
+            "uploads/",
+            "part",
+            1,
+            "DRAWING",
+            "00112233445566778899aabbccddeeff",
+            "a.pdf",
         );
         assert_eq!(k1, k2);
         assert_eq!(k1, "uploads/part/1/DRAWING/0011223344556677_a.pdf");
@@ -209,8 +231,12 @@ mod tests {
     fn build_cas_key_empty_prefix_yields_root_key() {
         // 2026-09-11 新增：空 prefix 直接拼 owner_kind，不带多余 `/`
         let k = build_cas_key(
-            "", "part", 7, "3D_MODEL",
-            "00112233445566778899aabbccddeeff", "x.step",
+            "",
+            "part",
+            7,
+            "3D_MODEL",
+            "00112233445566778899aabbccddeeff",
+            "x.step",
         );
         assert_eq!(k, "part/7/3D_MODEL/0011223344556677_x.step");
     }

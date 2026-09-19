@@ -2,7 +2,7 @@
 //!
 // 对应 Python myERP/core/security.py 的 bcrypt 直接 hash/verify（不用 passlib）。
 
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 pub fn hash(password: &str) -> Result<String, AppError> {
     bcrypt::hash(password, bcrypt::DEFAULT_COST)

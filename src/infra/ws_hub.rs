@@ -19,7 +19,10 @@ pub enum WsEvent {
     /// 大屏完整快照（首连接 / 定时全量）
     DashboardSnapshot { data: serde_json::Value },
     /// 大屏增量事件（如 PICKED_UP）
-    DashboardEvent { kind: String, payload: serde_json::Value },
+    DashboardEvent {
+        kind: String,
+        payload: serde_json::Value,
+    },
     /// 用户级精准通知
     Notification { user_id: i64, content: String },
     /// 心跳

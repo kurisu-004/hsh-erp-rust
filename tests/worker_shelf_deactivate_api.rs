@@ -19,10 +19,12 @@
 mod common;
 
 use axum::http::StatusCode;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{add_role, clean_business_db, clean_db, insert_user_with_password, test_app, test_state};
+use common::{
+    add_role, clean_business_db, clean_db, insert_user_with_password, test_app, test_state,
+};
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use sqlx::PgPool;
@@ -125,12 +127,7 @@ async fn insert_l2_customer(pool: &PgPool) -> (i64, i64) {
     (l1, l2)
 }
 
-async fn insert_part(
-    pool: &PgPool,
-    customer_id: i64,
-    name: &str,
-    serial_no: Option<&str>,
-) -> i64 {
+async fn insert_part(pool: &PgPool, customer_id: i64, name: &str, serial_no: Option<&str>) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
@@ -298,11 +295,7 @@ async fn shelf_deactivate_succeeds_when_no_active_holders() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::OK,
-        "无持有 → deactivate 应通过: {env}"
-    );
+    assert_eq!(s, StatusCode::OK, "无持有 → deactivate 应通过: {env}");
     assert_eq!(env["code"], 0);
 }
 
@@ -322,10 +315,6 @@ async fn worker_deactivate_succeeds_when_holding_nothing() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::OK,
-        "无持有 → deactivate 应通过: {env}"
-    );
+    assert_eq!(s, StatusCode::OK, "无持有 → deactivate 应通过: {env}");
     assert_eq!(env["code"], 0);
 }

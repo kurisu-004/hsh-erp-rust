@@ -27,12 +27,12 @@ use crate::modules::process::repo::ProcessRepo;
 use crate::modules::process_chain::repo::ProcessChainRepo;
 use crate::modules::work_type::repo::WorkTypeRepo;
 use crate::modules::worker::repo::WorkerRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::dto::{
     AdminAssignRequest, AdminRemoveRequest, AssignResult, AutoAllocateMode, AutoAllocateRequest,
-    AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkerBrief, WorkerFillItem,
-    WorkTypeMaxHeld,
+    AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkTypeMaxHeld, WorkerBrief,
+    WorkerFillItem,
 };
 use super::model::{ProcessPoolCount, RefillResult, TakenItem, WorkerPoolState};
 use super::repo::WorkerPoolRepo;
@@ -294,10 +294,7 @@ impl WorkerPoolService {
         .ok_or_else(|| {
             AppError::biz(
                 code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
-                format!(
-                    "batch {} 不是 worker {} 持有",
-                    req.batch_id, req.worker_id
-                ),
+                format!("batch {} 不是 worker {} 持有", req.batch_id, req.worker_id),
             )
         })?;
         // 3. 切 holder 到 shelf + 改 current_process_step_id（OCC，batch 级）
@@ -402,7 +399,8 @@ impl WorkerPoolService {
             })?;
 
         // 2. work_types
-        let work_types = WorkTypeRepo::list_work_types_by_process_id(&mut *conn, process_id).await?;
+        let work_types =
+            WorkTypeRepo::list_work_types_by_process_id(&mut *conn, process_id).await?;
         let work_types = work_types
             .into_iter()
             .map(|(id, code, name, max_held_batches)| WorkTypeMaxHeld {
@@ -417,12 +415,14 @@ impl WorkerPoolService {
         let worker_rows = WorkerRepo::list_active_by_process_id(&mut *conn, process_id).await?;
         let workers = worker_rows
             .into_iter()
-            .map(|(worker_id, name, work_type_id, work_type_code)| WorkerBrief {
-                worker_id,
-                name,
-                work_type_id,
-                work_type_code,
-            })
+            .map(
+                |(worker_id, name, work_type_id, work_type_code)| WorkerBrief {
+                    worker_id,
+                    name,
+                    work_type_id,
+                    work_type_code,
+                },
+            )
             .collect();
 
         // 4. candidates
@@ -515,8 +515,7 @@ impl WorkerPoolService {
         }
 
         // 4. 货架上的 active worker 列表（含 work_type_id）
-        let worker_rows =
-            WorkerRepo::list_active_by_process_id(&mut *conn, req.process_id).await?;
+        let worker_rows = WorkerRepo::list_active_by_process_id(&mut *conn, req.process_id).await?;
 
         let mut filled = Vec::with_capacity(worker_rows.len());
         let mut pool_empty_any = false;
@@ -580,8 +579,7 @@ impl WorkerPoolService {
             };
 
             // 取该 work_type 映射的所有 process_ids（take_one_from_pool 限定）
-            let process_ids =
-                WorkTypeRepo::list_process_ids(&mut *conn, work_type_id).await?;
+            let process_ids = WorkTypeRepo::list_process_ids(&mut *conn, work_type_id).await?;
             if process_ids.is_empty() {
                 continue;
             }

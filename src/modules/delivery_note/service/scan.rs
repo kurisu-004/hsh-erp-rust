@@ -18,7 +18,7 @@ use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part_batch::model::TPartBatch;
 use crate::modules::part_batch::repo::PartBatchRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
     AddedBatchDto, AttachableBatchDto, AvailableBatchDto, BatchStatusDto, RecentItemDto,
@@ -27,7 +27,7 @@ use super::super::dto::{
 };
 use super::super::model::{DeliveryNote, NoteScope};
 use super::super::repo::{DeliveryGroupRepo, DeliveryNoteRepo};
-use super::inner::{note_not_found, GroupWithMemberIds};
+use super::inner::{GroupWithMemberIds, note_not_found};
 
 use super::DeliveryNoteService;
 
@@ -66,7 +66,9 @@ fn classify_invalid_state(b: &TPartBatch) -> Option<&'static str> {
         "OUTSOURCE" => Some("OUTSOURCE"),
         "COMPLETED" => Some("COMPLETED"),
         "CANCELLED" => Some("CANCELLED"),
-        "IN_PROCESS" if b.location.as_deref() == Some("WORKER") => Some("IN_PROCESS_HELD_BY_WORKER"),
+        "IN_PROCESS" if b.location.as_deref() == Some("WORKER") => {
+            Some("IN_PROCESS_HELD_BY_WORKER")
+        }
         _ => None,
     }
 }
@@ -162,11 +164,9 @@ fn has_fully_invalid_target(batches: &[TPartBatch]) -> bool {
             *by_part_invalid.entry(b.part_id).or_insert(0) += 1;
         }
     }
-    by_part_total
-        .iter()
-        .any(|(part_id, total)| {
-            *total > 0 && by_part_invalid.get(part_id).copied().unwrap_or(0) == *total
-        })
+    by_part_total.iter().any(|(part_id, total)| {
+        *total > 0 && by_part_invalid.get(part_id).copied().unwrap_or(0) == *total
+    })
 }
 
 /// 由 evaluations[i] 构造 `UnresolvedTargetDto`（含 part 元数据 + A/B 组批次）。
@@ -176,8 +176,16 @@ fn build_unresolved_target(e: TargetEvaluation) -> UnresolvedTargetDto {
         serial_no: e.part.serial_no.clone().unwrap_or_default(),
         drawing_no: e.part.drawing_no.clone(),
         name: e.part.name.clone(),
-        available_batches: e.inspectable.into_iter().map(to_available_batch_dto).collect(),
-        attachable_batches: e.attachable.into_iter().map(to_attachable_batch_dto).collect(),
+        available_batches: e
+            .inspectable
+            .into_iter()
+            .map(to_available_batch_dto)
+            .collect(),
+        attachable_batches: e
+            .attachable
+            .into_iter()
+            .map(to_attachable_batch_dto)
+            .collect(),
     }
 }
 
@@ -336,10 +344,12 @@ impl DeliveryNoteService {
             ScanKind::PartOfAssembly(aid) => {
                 let asm = AssemblyRepo::get_by_id(&mut *conn, aid, false)
                     .await?
-                    .ok_or_else(|| AppError::biz(
-                        code::BIZ_ASSEMBLY_NOT_FOUND,
-                        format!("assembly {aid} not found"),
-                    ))?;
+                    .ok_or_else(|| {
+                        AppError::biz(
+                            code::BIZ_ASSEMBLY_NOT_FOUND,
+                            format!("assembly {aid} not found"),
+                        )
+                    })?;
                 let cs = PartRepo::list_children(&mut *conn, aid, false).await?;
                 for c in &cs {
                     targets.push(c.clone());
@@ -385,18 +395,18 @@ impl DeliveryNoteService {
         };
 
         // ===== Step 2: 锚点 + L1 + 分类 =====
-        let leaf_cust =
-            CustomerRepo::get_by_id(&mut *conn, anchor_customer_id, false)
-                .await?
-                .ok_or_else(|| AppError::biz(
+        let leaf_cust = CustomerRepo::get_by_id(&mut *conn, anchor_customer_id, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
                     code::BIZ_CUSTOMER_NOT_FOUND,
                     format!("anchor customer {anchor_customer_id} not found"),
-                ))?;
+                )
+            })?;
         let l1_id = leaf_cust.parent_id.unwrap_or(leaf_cust.id);
 
         let groups_with_members =
-            DeliveryGroupRepo::list_active_groups_with_members_for_l1(&mut *conn, l1_id)
-                .await?;
+            DeliveryGroupRepo::list_active_groups_with_members_for_l1(&mut *conn, l1_id).await?;
         let groups_for_classify: Vec<GroupWithMemberIds> = groups_with_members
             .iter()
             .map(|(g, m)| GroupWithMemberIds {
@@ -407,14 +417,7 @@ impl DeliveryNoteService {
         let scope = NoteScope::classify(anchor_customer_id, &groups_for_classify);
 
         // ===== Step 3: find-or-create 草稿 =====
-        let note = Self::scan_find_or_create_draft(
-            conn,
-            snowflake,
-            l1_id,
-            scope,
-            current,
-        )
-        .await?;
+        let note = Self::scan_find_or_create_draft(conn, snowflake, l1_id, scope, current).await?;
 
         // ===== Step 4: 加载 target 全部活跃 batch → C 组短路 → 5 组分类 =====
         let target_part_ids: Vec<i64> = targets.iter().map(|p| p.id).collect();
@@ -598,8 +601,12 @@ impl DeliveryNoteService {
                 (Some(l1), None) => l1.clone(),
                 _ => leaf_cust.name.clone(),
             },
-            NoteScope::L1Wide => l1_cust_name.clone().unwrap_or_else(|| leaf_cust.name.clone()),
-            NoteScope::Group(_) => l1_cust_name.clone().unwrap_or_else(|| leaf_cust.name.clone()),
+            NoteScope::L1Wide => l1_cust_name
+                .clone()
+                .unwrap_or_else(|| leaf_cust.name.clone()),
+            NoteScope::Group(_) => l1_cust_name
+                .clone()
+                .unwrap_or_else(|| leaf_cust.name.clone()),
         };
 
         // unresolved_targets 按 outcome 分流构建
@@ -716,17 +723,11 @@ impl DeliveryNoteService {
             Ok(()) => DeliveryNoteRepo::get_by_id(&mut *conn, new_note.id, false)
                 .await?
                 .ok_or_else(|| note_not_found(new_note.id)),
-            Err(sqlx::Error::Database(db_err))
-                if db_err.code().as_deref() == Some("23505") =>
-            {
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
                 // 唯一索引撞 → 重查（同 scope 应有另一个 DRAFT 草稿）
-                if let Some(n) = DeliveryNoteRepo::find_open_draft_by_scope(
-                    &mut *conn,
-                    l1_id,
-                    scope,
-                    None,
-                )
-                .await?
+                if let Some(n) =
+                    DeliveryNoteRepo::find_open_draft_by_scope(&mut *conn, l1_id, scope, None)
+                        .await?
                 {
                     Ok(n)
                 } else {
@@ -780,8 +781,8 @@ mod classify_tests {
 #[cfg(test)]
 mod scan_resolve_tests {
     use super::*;
-    use crate::modules::part::model::TPart;
     use crate::modules::assembly::model::TAssembly;
+    use crate::modules::part::model::TPart;
 
     /// 构造一个最小化的 TPart 用作 fixture。
     fn make_part(id: i64, assembly_id: Option<i64>) -> TPart {
@@ -917,10 +918,22 @@ mod classify_5groups_tests {
 
     #[test]
     fn c_group_delivered_short_circuits() {
-        assert_eq!(classify_invalid_state(&b("DELIVERED", None, None)), Some("DELIVERED"));
-        assert_eq!(classify_invalid_state(&b("OUTSOURCE", None, None)), Some("OUTSOURCE"));
-        assert_eq!(classify_invalid_state(&b("COMPLETED", None, None)), Some("COMPLETED"));
-        assert_eq!(classify_invalid_state(&b("CANCELLED", None, None)), Some("CANCELLED"));
+        assert_eq!(
+            classify_invalid_state(&b("DELIVERED", None, None)),
+            Some("DELIVERED")
+        );
+        assert_eq!(
+            classify_invalid_state(&b("OUTSOURCE", None, None)),
+            Some("OUTSOURCE")
+        );
+        assert_eq!(
+            classify_invalid_state(&b("COMPLETED", None, None)),
+            Some("COMPLETED")
+        );
+        assert_eq!(
+            classify_invalid_state(&b("CANCELLED", None, None)),
+            Some("CANCELLED")
+        );
     }
 
     #[test]
@@ -952,9 +965,17 @@ mod classify_5groups_tests {
         assert!(is_inspectable_state(&b("REPAIRING", None, None)));
         assert!(is_inspectable_state(&b("IN_PROCESS", None, None)));
         // 货架持有的 IN_PROCESS 也可送检（回归：多态 holder 误判）
-        assert!(is_inspectable_state(&b("IN_PROCESS", Some(7), Some("PRODUCTION_SHELF"))));
+        assert!(is_inspectable_state(&b(
+            "IN_PROCESS",
+            Some(7),
+            Some("PRODUCTION_SHELF")
+        )));
         // 仅工人持有（location='WORKER'）不可
-        assert!(!is_inspectable_state(&b("IN_PROCESS", Some(7), Some("WORKER"))));
+        assert!(!is_inspectable_state(&b(
+            "IN_PROCESS",
+            Some(7),
+            Some("WORKER")
+        )));
     }
 }
 
@@ -962,7 +983,12 @@ mod classify_5groups_tests {
 mod outcome_tests {
     use super::*;
 
-    fn eval(part_id: i64, attachable: usize, inspectable: usize, conflict: usize) -> TargetEvaluation {
+    fn eval(
+        part_id: i64,
+        attachable: usize,
+        inspectable: usize,
+        conflict: usize,
+    ) -> TargetEvaluation {
         fn mk(n: usize) -> Vec<TPartBatch> {
             (0..n)
                 .map(|i| TPartBatch {
@@ -1027,7 +1053,10 @@ mod outcome_tests {
     #[test]
     fn outcome_added_when_all_attachable() {
         let evs = vec![eval(1, 1, 0, 0)];
-        assert_eq!(classify_outcome(false, false, false, false), ScanOutcomeDto::Added);
+        assert_eq!(
+            classify_outcome(false, false, false, false),
+            ScanOutcomeDto::Added
+        );
         assert!(!is_all_conflict(&evs));
     }
 
@@ -1490,16 +1519,14 @@ mod attachable_batches_tests {
 
         // outcome：C 被过滤（had_invalid=true）+ 散件 → CandidatesAvailable
         let outcome = classify_outcome(
-            false,
-            false, // any_inspectable
+            false, false, // any_inspectable
             false, // all_attachable_empty
             true,  // any_had_invalid_filtered
         );
         assert_eq!(outcome, ScanOutcomeDto::CandidatesAvailable);
 
         // 验证响应形态：unresolved_targets 单元素 + attachable_batches 含 A
-        let unresolved: Vec<UnresolvedTargetDto> =
-            vec![build_unresolved_target(eval)];
+        let unresolved: Vec<UnresolvedTargetDto> = vec![build_unresolved_target(eval)];
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].attachable_batches.len(), 1);
         assert_eq!(unresolved[0].available_batches.len(), 0);

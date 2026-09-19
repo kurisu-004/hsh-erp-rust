@@ -48,13 +48,13 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::dto::{
-    AttachBatchesOut, AttachBatchesRequest, BatchDeliveryDetailData,
-    DeliveryNoteAddPartsRequest, DeliveryNoteBatchDetailQuery, DeliveryNoteCandidatePartsOut,
-    DeliveryNoteCandidatePartsQuery, DeliveryNoteCreateRequest, DeliveryNoteListQuery,
-    DeliveryNotePickupPendingQuery, DeliveryNotePickupRequest, DeliveryNotePickupScanOut,
-    DeliveryNotePickupScanRequest, DeliveryNoteRemovePartsRequest, DeliveryNoteUpdateRequest,
-    DeliveryNoteVersionedRequest, PrintDeliveryNoteRequest, PrintLabelsRequest, ScanDeliveryOut,
-    ScanDeliveryRequest, SubmitDeliveryOut,
+    AttachBatchesOut, AttachBatchesRequest, BatchDeliveryDetailData, DeliveryNoteAddPartsRequest,
+    DeliveryNoteBatchDetailQuery, DeliveryNoteCandidatePartsOut, DeliveryNoteCandidatePartsQuery,
+    DeliveryNoteCreateRequest, DeliveryNoteListQuery, DeliveryNotePickupPendingQuery,
+    DeliveryNotePickupRequest, DeliveryNotePickupScanOut, DeliveryNotePickupScanRequest,
+    DeliveryNoteRemovePartsRequest, DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest,
+    PrintDeliveryNoteRequest, PrintLabelsRequest, ScanDeliveryOut, ScanDeliveryRequest,
+    SubmitDeliveryOut,
 };
 
 // ===========================================================================
@@ -124,8 +124,7 @@ pub async fn list_candidate_parts(
     Query(q): Query<DeliveryNoteCandidatePartsQuery>,
 ) -> Result<Json<R<DeliveryNoteCandidatePartsOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let items =
-        DeliveryNoteService::list_candidate_parts(&mut tx, q.customer_id, &current).await?;
+    let items = DeliveryNoteService::list_candidate_parts(&mut tx, q.customer_id, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(DeliveryNoteCandidatePartsOut { items })))
 }
@@ -199,14 +198,16 @@ pub async fn create_delivery_note(
     tx.commit().await?;
 
     // commit 后广播（设计 §5：commit 之后再 push，避免回滚后误推）
-    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-        kind: "DELIVERY_NOTE_CREATED".to_string(),
-        payload: serde_json::json!({
-            "delivery_note_id": out.head.id,
-            "delivery_note_no": out.head.delivery_note_no,
-            "customer_id": out.head.customer_id,
-        }),
-    });
+    state
+        .ws_hub
+        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_CREATED".to_string(),
+            payload: serde_json::json!({
+                "delivery_note_id": out.head.id,
+                "delivery_note_no": out.head.delivery_note_no,
+                "customer_id": out.head.customer_id,
+            }),
+        });
 
     Ok(Json(R::ok(out)))
 }
@@ -243,7 +244,8 @@ pub async fn update_delivery_note(
     Json(req): Json<DeliveryNoteUpdateRequest>,
 ) -> Result<Json<R<super::dto::DeliveryNoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::update(&mut tx, &state.snowflake, path.id, req, &current).await?;
+    let out =
+        DeliveryNoteService::update(&mut tx, &state.snowflake, path.id, req, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -267,10 +269,12 @@ pub async fn add_delivery_note_parts(
     .await?;
     tx.commit().await?;
 
-    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-        kind: "DELIVERY_NOTE_PARTS_ADDED".to_string(),
-        payload: serde_json::json!({"delivery_note_id": out.head.id}),
-    });
+    state
+        .ws_hub
+        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_PARTS_ADDED".to_string(),
+            payload: serde_json::json!({"delivery_note_id": out.head.id}),
+        });
 
     Ok(Json(R::ok(out)))
 }
@@ -283,7 +287,9 @@ pub async fn remove_delivery_note_parts(
     Json(req): Json<DeliveryNoteRemovePartsRequest>,
 ) -> Result<Json<R<super::dto::DeliveryNoteDetailOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::remove_parts(&mut tx, path.id, &req.batch_ids, req.version, &current).await?;
+    let out =
+        DeliveryNoteService::remove_parts(&mut tx, path.id, &req.batch_ids, req.version, &current)
+            .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -304,18 +310,22 @@ pub async fn submit_delivery_note(
     Json(req): Json<DeliveryNoteVersionedRequest>,
 ) -> Result<Json<R<SubmitDeliveryOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::submit(&mut tx, &state.snowflake, path.id, req.version, &current).await?;
+    let out =
+        DeliveryNoteService::submit(&mut tx, &state.snowflake, path.id, req.version, &current)
+            .await?;
     tx.commit().await?;
 
     // 仅真正提交时广播；候选分支未写库，不发事件
     if let Some(note) = out.note.as_ref() {
-        state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-            kind: "DELIVERY_NOTE_SUBMITTED".to_string(),
-            payload: serde_json::json!({
-                "delivery_note_id": note.id,
-                "delivery_note_no": note.delivery_note_no,
-            }),
-        });
+        state
+            .ws_hub
+            .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+                kind: "DELIVERY_NOTE_SUBMITTED".to_string(),
+                payload: serde_json::json!({
+                    "delivery_note_id": note.id,
+                    "delivery_note_no": note.delivery_note_no,
+                }),
+            });
     }
 
     Ok(Json(R::ok(out)))
@@ -329,7 +339,9 @@ pub async fn recall_delivery_note(
     Json(req): Json<DeliveryNoteVersionedRequest>,
 ) -> Result<Json<R<super::dto::DeliveryNoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::recall(&mut tx, &state.snowflake, path.id, req.version, &current).await?;
+    let out =
+        DeliveryNoteService::recall(&mut tx, &state.snowflake, path.id, req.version, &current)
+            .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -380,10 +392,12 @@ pub async fn pickup_delivery_note(
         "part_count": out.part_count,
         "driver_worker_id": out.driver_worker_id,
     });
-    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-        kind: "DELIVERY_NOTE_PICKED_UP".to_string(),
-        payload: payload.clone(),
-    });
+    state
+        .ws_hub
+        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_PICKED_UP".to_string(),
+            payload: payload.clone(),
+        });
     tracing::info!(?payload, "delivery_note picked up");
 
     Ok(Json(R::ok(out)))
@@ -417,34 +431,39 @@ pub async fn scan_delivery_note(
 ) -> Result<Json<R<ScanDeliveryOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
     let mut tx = state.pool.begin().await?;
-    let out =
-        DeliveryNoteService::scan_add(&mut tx, &state.snowflake, &req.code, &current).await?;
+    let out = DeliveryNoteService::scan_add(&mut tx, &state.snowflake, &req.code, &current).await?;
     tx.commit().await?;
 
     let added_count = out.added_batches.len();
     let note_id = out.note.id;
     let note_no = out.note.delivery_note_no.clone();
-    let unresolved_count = out.unresolved_targets.as_ref().map(|v| v.len()).unwrap_or(0);
-    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-        kind: "DELIVERY_NOTE_SCAN_ADD".to_string(),
-        payload: serde_json::json!({
-            "delivery_note_id": note_id,
-            "delivery_note_no": note_no,
-            "added_count": added_count,
-            "unresolved_count": unresolved_count,
-            "line_count": out.note.line_count,
-            "resolved_kind": match out.resolved.kind {
-                super::dto::ResolvedKindDto::Part => "PART",
-                super::dto::ResolvedKindDto::Assembly => "ASSEMBLY",
-            },
-            "outcome": match out.outcome {
-                super::dto::ScanOutcomeDto::Added => "ADDED",
-                super::dto::ScanOutcomeDto::AlreadyPresent => "ALREADY_PRESENT",
-                super::dto::ScanOutcomeDto::CandidatesAvailable => "CANDIDATES_AVAILABLE",
-                super::dto::ScanOutcomeDto::PartialAdded => "PARTIAL_ADDED",
-            },
-        }),
-    });
+    let unresolved_count = out
+        .unresolved_targets
+        .as_ref()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    state
+        .ws_hub
+        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_SCAN_ADD".to_string(),
+            payload: serde_json::json!({
+                "delivery_note_id": note_id,
+                "delivery_note_no": note_no,
+                "added_count": added_count,
+                "unresolved_count": unresolved_count,
+                "line_count": out.note.line_count,
+                "resolved_kind": match out.resolved.kind {
+                    super::dto::ResolvedKindDto::Part => "PART",
+                    super::dto::ResolvedKindDto::Assembly => "ASSEMBLY",
+                },
+                "outcome": match out.outcome {
+                    super::dto::ScanOutcomeDto::Added => "ADDED",
+                    super::dto::ScanOutcomeDto::AlreadyPresent => "ALREADY_PRESENT",
+                    super::dto::ScanOutcomeDto::CandidatesAvailable => "CANDIDATES_AVAILABLE",
+                    super::dto::ScanOutcomeDto::PartialAdded => "PARTIAL_ADDED",
+                },
+            }),
+        });
 
     Ok(Json(R::ok(out)))
 }
@@ -489,10 +508,12 @@ pub async fn attach_batches(
         "attached_count": out.attached,
         "conflict_count": out.conflicts.len(),
     });
-    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-        kind: "DELIVERY_NOTE_BATCHES_ATTACHED".to_string(),
-        payload,
-    });
+    state
+        .ws_hub
+        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_BATCHES_ATTACHED".to_string(),
+            payload,
+        });
 
     Ok(Json(R::ok(out)))
 }
@@ -511,7 +532,7 @@ pub async fn print_delivery_note(
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<PrintDeliveryNoteRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, CACHE_CONTROL};
+    use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
     current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
     let custom_order = parse_i64_opt(req.custom_order.as_ref(), "custom_order")?;
@@ -530,14 +551,14 @@ pub async fn print_delivery_note(
     .await?;
     let (bytes, _prefix) = bytes_prefix;
 
-    let filename = format!(
-        "F-{}-note.xlsx",
-        chrono::Local::now().format("%Y-%m-%d")
-    );
+    let filename = format!("F-{}-note.xlsx", chrono::Local::now().format("%Y-%m-%d"));
     let len = bytes.len();
     let resp = axum::response::Response::builder()
         .status(axum::http::StatusCode::OK)
-        .header(CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        .header(
+            CONTENT_TYPE,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
         .header(
             CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),
@@ -548,13 +569,15 @@ pub async fn print_delivery_note(
         .map_err(|e| AppError::internal(format!("build print response: {e}")))?;
 
     // 渲染成功后广播（轻量：只推单据级事件，不按行推送）
-    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-        kind: "DELIVERY_NOTE_PRINTED".to_string(),
-        payload: serde_json::json!({
-            "delivery_note_id": path.id,
-            "kind": "note",
-        }),
-    });
+    state
+        .ws_hub
+        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_PRINTED".to_string(),
+            payload: serde_json::json!({
+                "delivery_note_id": path.id,
+                "kind": "note",
+            }),
+        });
 
     Ok(resp)
 }
@@ -568,7 +591,7 @@ pub async fn print_labels(
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<PrintLabelsRequest>,
 ) -> Result<axum::response::Response, AppError> {
-    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, CACHE_CONTROL};
+    use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
     current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
     let custom_order = parse_i64_opt(req.custom_order.as_ref(), "custom_order")?;
@@ -588,14 +611,14 @@ pub async fn print_labels(
     .await?;
     let (bytes, _prefix) = bytes_prefix;
 
-    let filename = format!(
-        "F-{}-labels.xlsx",
-        chrono::Local::now().format("%Y-%m-%d")
-    );
+    let filename = format!("F-{}-labels.xlsx", chrono::Local::now().format("%Y-%m-%d"));
     let len = bytes.len();
     let resp = axum::response::Response::builder()
         .status(axum::http::StatusCode::OK)
-        .header(CONTENT_TYPE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        .header(
+            CONTENT_TYPE,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
         .header(
             CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),
@@ -606,13 +629,15 @@ pub async fn print_labels(
         .map_err(|e| AppError::internal(format!("build labels response: {e}")))?;
 
     // 渲染成功后广播（轻量：只推单据级事件，不按行推送）
-    state.ws_hub.broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-        kind: "DELIVERY_NOTE_PRINTED".to_string(),
-        payload: serde_json::json!({
-            "delivery_note_id": path.id,
-            "kind": "label",
-        }),
-    });
+    state
+        .ws_hub
+        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
+            kind: "DELIVERY_NOTE_PRINTED".to_string(),
+            payload: serde_json::json!({
+                "delivery_note_id": path.id,
+                "kind": "label",
+            }),
+        });
 
     Ok(resp)
 }
@@ -672,20 +697,14 @@ pub fn router() -> Router<Arc<AppState>> {
         // ---- delivery-notes/* ----
         .route("/batch-detail", get(batch_get_delivery_notes)) // ★静态段必须早于 /{id}
         .route("/scan", post(scan_delivery_note))
-        .route(
-            "/candidate-parts",
-            get(list_candidate_parts),
-        )
+        .route("/candidate-parts", get(list_candidate_parts))
         .route("/pickup-pending", get(list_pickup_pending))
         .route("/", get(list_delivery_notes).post(create_delivery_note))
         .route("/{id}/events", get(list_delivery_note_events))
         .route("/{id}/update", post(update_delivery_note))
         .route("/{id}/add-parts", post(add_delivery_note_parts))
         .route("/{id}/attach-batches", post(attach_batches))
-        .route(
-            "/{id}/remove-parts",
-            post(remove_delivery_note_parts),
-        )
+        .route("/{id}/remove-parts", post(remove_delivery_note_parts))
         .route("/{id}/submit", post(submit_delivery_note))
         .route("/{id}/recall", post(recall_delivery_note))
         .route("/{id}/pickup-scan", post(pickup_scan))
@@ -722,7 +741,10 @@ mod tests {
 /// P1 送货分组路由子表；前缀 `/delivery-groups` 已由 `router()` nest 上去。
 fn p1_group_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/", get(p1_list_delivery_groups).post(p1_create_delivery_group))
+        .route(
+            "/",
+            get(p1_list_delivery_groups).post(p1_create_delivery_group),
+        )
         .route("/{id}/update", post(p1_update_delivery_group))
         .route("/{id}/soft-delete", post(p1_soft_delete_delivery_group))
 }

@@ -133,9 +133,8 @@ impl ShelfRepo {
         zone: Option<&str>,
         is_active: Option<bool>,
     ) -> Result<i64, sqlx::Error> {
-        let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-            "SELECT COUNT(*)::bigint FROM t_shelf WHERE deleted_at IS NULL",
-        );
+        let mut qb: QueryBuilder<sqlx::Postgres> =
+            QueryBuilder::new("SELECT COUNT(*)::bigint FROM t_shelf WHERE deleted_at IS NULL");
         if let Some(z) = zone {
             let trimmed = z.trim();
             if !trimmed.is_empty() {

@@ -15,7 +15,7 @@
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder 防 N+1）
 //! - 写：`create` / `update` / `soft_delete`
 
-use sqlx::{PgExecutor, QueryBuilder, Postgres};
+use sqlx::{PgExecutor, Postgres, QueryBuilder};
 
 use super::model::TApplicant;
 

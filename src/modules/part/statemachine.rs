@@ -157,7 +157,7 @@ impl PartStatus {
                 | (PENDING, OUTSOURCE)               // send-to-outsource（DIRECT 路径从 PENDING 发）
                 | (INSPECTION, REPAIRING)            // scan-inspect FAIL
                 | (REPAIRING, CANCELLED)             // cancel 路径
-                | (OUTSOURCE, CANCELLED)             // cancel 路径
+                | (OUTSOURCE, CANCELLED) // cancel 路径
         )
     }
 }
@@ -251,10 +251,13 @@ mod tests {
             PartStatus::INSPECTION,
             PartStatus::READY_TO_SHIP,
             PartStatus::DELIVERED,
-            PartStatus::REPAIRING,    // Phase 1 新增
-            PartStatus::OUTSOURCE,    // Phase 1 新增
+            PartStatus::REPAIRING, // Phase 1 新增
+            PartStatus::OUTSOURCE, // Phase 1 新增
         ] {
-            assert!(s.can_transition_to(PartStatus::CANCELLED), "from {s:?} should be cancellable");
+            assert!(
+                s.can_transition_to(PartStatus::CANCELLED),
+                "from {s:?} should be cancellable"
+            );
         }
         assert!(PartStatus::IN_PROCESS.can_transition_to(PartStatus::REPAIRING));
     }
@@ -682,7 +685,10 @@ mod rollup_tests {
         let mut b_in_process = batch_with_loc("IN_PROCESS", Some("PRODUCTION_SHELF"));
         b_in_process.current_holder_id = Some(42);
         b_in_process.current_process_step_id = Some(7);
-        let v = vec![b_in_process, batch_with_loc("DELIVERED", Some("OUTSOURCE_COMPANY"))];
+        let v = vec![
+            b_in_process,
+            batch_with_loc("DELIVERED", Some("OUTSOURCE_COMPANY")),
+        ];
         let r = compute_part_target(&v).unwrap();
         assert_eq!(r.status, "IN_PROCESS");
         assert_eq!(r.next_process_id, Some(7));

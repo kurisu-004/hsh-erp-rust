@@ -8,11 +8,11 @@
 //! HS256 算法；`iss` 在校验时绑定到 `Jwt_ISSUER`。
 
 use chrono::Utc;
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::rbac::{Claims, Role};
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshClaims {
@@ -93,11 +93,7 @@ pub fn encode_refresh(
 }
 
 /// 解码 refresh token
-pub fn decode_refresh(
-    token: &str,
-    secret: &str,
-    issuer: &str,
-) -> Result<(i64, i32), AppError> {
+pub fn decode_refresh(token: &str, secret: &str, issuer: &str) -> Result<(i64, i32), AppError> {
     let mut v = Validation::new(Algorithm::HS256);
     v.set_issuer(&[issuer]);
     decode::<RefreshClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &v)

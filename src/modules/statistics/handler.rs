@@ -15,15 +15,15 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     routing::get,
-    Json, Router,
 };
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::statistics::dto::{
-    DateRangeQuery, OverviewOut, PickupSkipDetailOut, PickupSkipDetailQuery,
-    PickupSkipSummaryOut, WorkerDetailOut, WorkerStatsListOut,
+    DateRangeQuery, OverviewOut, PickupSkipDetailOut, PickupSkipDetailQuery, PickupSkipSummaryOut,
+    WorkerDetailOut, WorkerStatsListOut,
 };
 use crate::modules::statistics::service::StatisticsService;
 use crate::shared::response::R;
@@ -64,8 +64,7 @@ pub async fn worker_detail(
 ) -> Result<Json<R<WorkerDetailOut>>, crate::shared::error::AppError> {
     current.require_role(Role::Manager)?;
     let mut tx = state.pool.begin().await?;
-    let out =
-        StatisticsService::worker_detail(&mut tx, &worker_id, q.date_from, q.date_to).await?;
+    let out = StatisticsService::worker_detail(&mut tx, &worker_id, q.date_from, q.date_to).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -93,8 +92,7 @@ pub async fn pickup_skip_detail(
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
     let mut tx = state.pool.begin().await?;
-    let out =
-        StatisticsService::pickup_skip_detail(&mut tx, &worker_id, limit, offset).await?;
+    let out = StatisticsService::pickup_skip_detail(&mut tx, &worker_id, limit, offset).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }

@@ -395,9 +395,7 @@ async fn list_filters_by_holder_ids_param_polymorphic() {
         app,
         json_request(
             "GET",
-            &format!(
-                "/parts?customer_id={l2}&holder_ids={shelf_a},{worker_id}&limit=10"
-            ),
+            &format!("/parts?customer_id={l2}&holder_ids={shelf_a},{worker_id}&limit=10"),
             None::<Value>,
             Some(&token),
         ),
@@ -448,16 +446,7 @@ async fn list_without_locations_or_holder_ids_returns_all() {
     )
     .await;
     let pid_c = insert_part_with_status(&pool, "PALL-C", l2, None, None, "IN_PROCESS").await;
-    add_batch_with_location(
-        &pool,
-        pid_c,
-        1,
-        1,
-        "IN_PROCESS",
-        Some("WORKER"),
-        None,
-    )
-    .await;
+    add_batch_with_location(&pool, pid_c, 1, 1, "IN_PROCESS", Some("WORKER"), None).await;
 
     let (app, token, _pool) = login_manager(pool, "mgr_no_filt").await;
     let (s, env) = send(

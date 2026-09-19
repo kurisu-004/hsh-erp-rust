@@ -22,9 +22,9 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::cnc_program::dto::{CncFileRef, CncPairListItem, CncPairListOut, CncPairOut};
 use crate::modules::cnc_program::repo::CncProgramRepo;
 use crate::modules::part_file::dto::PartFileWithUrlOut;
-use crate::modules::part_file::repo::{hash_bytes, NewPartFile, PartFileRepo};
+use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
 use crate::modules::part_file::service::PartFileContent;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 pub struct CncProgramService;
 
@@ -49,12 +49,11 @@ impl CncProgramService {
         current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
 
         // 1. 校验 part 存在
-        let exists: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(part_id)
-        .fetch_optional(&mut *conn)
-        .await?;
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+                .bind(part_id)
+                .fetch_optional(&mut *conn)
+                .await?;
         if exists.is_none() {
             return Err(AppError::biz(
                 code::BIZ_PART_NOT_FOUND,
@@ -65,7 +64,10 @@ impl CncProgramService {
         // 2. 校验扩展名 / content_type
         use crate::modules::part_file::policy;
         let g_ext = policy::ext_of(g_code_filename).ok_or_else(|| {
-            AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("g_code 缺少扩展名: {g_code_filename:?}"))
+            AppError::biz(
+                code::BIZ_PART_FILE_BAD_TYPE,
+                format!("g_code 缺少扩展名: {g_code_filename:?}"),
+            )
         })?;
         if !["tap", "nc", "gcode", "mpf", "cnc"].contains(&g_ext.as_str()) {
             return Err(AppError::biz(
@@ -74,7 +76,10 @@ impl CncProgramService {
             ));
         }
         let s_ext = policy::ext_of(setup_filename).ok_or_else(|| {
-            AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("setup_sheet 缺少扩展名: {setup_filename:?}"))
+            AppError::biz(
+                code::BIZ_PART_FILE_BAD_TYPE,
+                format!("setup_sheet 缺少扩展名: {setup_filename:?}"),
+            )
         })?;
         if !["pdf"].contains(&s_ext.as_str()) {
             return Err(AppError::biz(
@@ -87,8 +92,10 @@ impl CncProgramService {
         let g_sha = hash_bytes(&g_code_bytes);
         let s_sha = hash_bytes(&setup_bytes);
 
-        let g_existing = PartFileRepo::get_by_owner_kind_sha(&mut *conn, part_id, "G_CODE", &g_sha).await?;
-        let s_existing = PartFileRepo::get_by_owner_kind_sha(&mut *conn, part_id, "SETUP_SHEET", &s_sha).await?;
+        let g_existing =
+            PartFileRepo::get_by_owner_kind_sha(&mut *conn, part_id, "G_CODE", &g_sha).await?;
+        let s_existing =
+            PartFileRepo::get_by_owner_kind_sha(&mut *conn, part_id, "SETUP_SHEET", &s_sha).await?;
 
         // 4. COS 上传（CAS 命中跳过）
         let (g_key, s_key) = match (&g_existing, &s_existing) {
@@ -97,12 +104,22 @@ impl CncProgramService {
                 let mut g_key = String::new();
                 let mut s_key = String::new();
                 if g_existing.is_none() {
-                    g_key = format!("part/{part_id}/G_CODE/{}_{}", &g_sha[..16], sanitize_filename(g_code_filename));
-                    cos.put_object(&g_key, g_code_bytes.clone(), g_code_content_type).await?;
+                    g_key = format!(
+                        "part/{part_id}/G_CODE/{}_{}",
+                        &g_sha[..16],
+                        sanitize_filename(g_code_filename)
+                    );
+                    cos.put_object(&g_key, g_code_bytes.clone(), g_code_content_type)
+                        .await?;
                 }
                 if s_existing.is_none() {
-                    s_key = format!("part/{part_id}/SETUP_SHEET/{}_{}", &s_sha[..16], sanitize_filename(setup_filename));
-                    cos.put_object(&s_key, setup_bytes.clone(), setup_content_type).await?;
+                    s_key = format!(
+                        "part/{part_id}/SETUP_SHEET/{}_{}",
+                        &s_sha[..16],
+                        sanitize_filename(setup_filename)
+                    );
+                    cos.put_object(&s_key, setup_bytes.clone(), setup_content_type)
+                        .await?;
                 }
                 (g_key, s_key)
             }
@@ -219,7 +236,12 @@ impl CncProgramService {
         part_id: i64,
         current: &CurrentUser,
     ) -> Result<CncPairListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer, Role::Inspector])?;
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::CncProgrammer,
+            Role::Inspector,
+        ])?;
         let pairs = CncProgramRepo::list_pairs_for_part(&mut *conn, part_id).await?;
         let mut items = Vec::with_capacity(pairs.len());
         for (g, s_opt) in pairs {

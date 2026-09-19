@@ -59,9 +59,8 @@ use std::sync::OnceLock;
 /// 多个 helper 在同一毫秒调用不再产生冲突 ID（避免 shelf_id == process_id 等碰撞）。
 static TEST_SNOWFLAKE_GEN: OnceLock<std::sync::Mutex<SnowflakeIdGenerator>> = OnceLock::new();
 pub fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
-    TEST_SNOWFLAKE_GEN.get_or_init(|| {
-        std::sync::Mutex::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1))
-    })
+    TEST_SNOWFLAKE_GEN
+        .get_or_init(|| std::sync::Mutex::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1)))
 }
 use hsh_erp_rust::state::AppState;
 

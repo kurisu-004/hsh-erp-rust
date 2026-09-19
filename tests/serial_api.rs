@@ -15,8 +15,8 @@ mod common;
 use common::{ensure_database_exists, test_pool};
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::serial::next_customer_serial_via_pool;
+use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::shared::error::code;
 
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -83,7 +83,9 @@ async fn acquire_returns_prefixed_4digit_serial() {
     reset_serial_state(&pool).await;
     seed_prefix(&pool, "Z").await;
 
-    let serial = next_customer_serial_via_pool(&pool, 1, "Z").await.expect("acquire Z");
+    let serial = next_customer_serial_via_pool(&pool, 1, "Z")
+        .await
+        .expect("acquire Z");
     assert_eq!(serial, "Z1000", "首次 acquire 应返回 Z + 1000");
 }
 
@@ -96,8 +98,12 @@ async fn acquire_two_calls_returns_distinct_serials() {
     reset_serial_state(&pool).await;
     seed_prefix(&pool, "Y").await;
 
-    let s1 = next_customer_serial_via_pool(&pool, 1, "Y").await.expect("acquire 1");
-    let s2 = next_customer_serial_via_pool(&pool, 1, "Y").await.expect("acquire 2");
+    let s1 = next_customer_serial_via_pool(&pool, 1, "Y")
+        .await
+        .expect("acquire 1");
+    let s2 = next_customer_serial_via_pool(&pool, 1, "Y")
+        .await
+        .expect("acquire 2");
     assert_ne!(s1, s2, "连续 acquire 拿不同号");
     assert_eq!(s1, "Y1000");
     assert_eq!(s2, "Y1001");

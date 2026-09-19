@@ -26,7 +26,7 @@ use crate::modules::statistics::repo::{
 };
 use crate::modules::work_type::repo::WorkTypeRepo;
 use crate::modules::worker::repo::WorkerRepo;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 pub struct StatisticsService;
 
@@ -36,9 +36,7 @@ impl StatisticsService {
         if date_from > date_to {
             return Err(AppError::biz(
                 code::BIZ_INVALID_VALUE,
-                format!(
-                    "date_from ({date_from}) must be <= date_to ({date_to})"
-                ),
+                format!("date_from ({date_from}) must be <= date_to ({date_to})"),
             ));
         }
         Ok(())
@@ -68,16 +66,12 @@ impl StatisticsService {
         let today = now_naive().date();
 
         let created_count = StatisticsRepo::count_created(conn, date_from, date_to).await?;
-        let completed_count =
-            StatisticsRepo::count_completed(conn, date_from, date_to).await?;
-        let in_process_count =
-            StatisticsRepo::count_in_process_at(conn, date_to).await?;
+        let completed_count = StatisticsRepo::count_completed(conn, date_from, date_to).await?;
+        let in_process_count = StatisticsRepo::count_in_process_at(conn, date_to).await?;
         let (delivered_count, delivered_value, orange, red) =
             StatisticsRepo::delivered_stats(conn, date_from, date_to).await?;
-        let overdue_undelivered =
-            StatisticsRepo::count_overdue_undelivered(conn, today).await?;
-        let repair_count =
-            StatisticsRepo::count_repair_parts(conn, date_from, date_to).await?;
+        let overdue_undelivered = StatisticsRepo::count_overdue_undelivered(conn, today).await?;
+        let repair_count = StatisticsRepo::count_repair_parts(conn, date_from, date_to).await?;
         let daily_created_raw =
             StatisticsRepo::daily_created_counts(conn, date_from, date_to).await?;
         let daily_completed_raw =
@@ -111,7 +105,10 @@ impl StatisticsService {
             },
             status_distribution: status_dist
                 .into_iter()
-                .map(|(status_value, count)| StatusCount { status_value, count })
+                .map(|(status_value, count)| StatusCount {
+                    status_value,
+                    count,
+                })
                 .collect(),
         })
     }
@@ -129,8 +126,7 @@ impl StatisticsService {
 
         // 全部未软删工人（不分页 — 内部工人规模远小于 500）。
         // 2026-09-15 followup-cleanup A9：明确 1000 远高于合理在持工人数（防爆兜底；如需全量应走分页）
-        let workers_rows =
-            WorkerRepo::list_with_filters(&mut *conn, None, None, 1000, 0).await?;
+        let workers_rows = WorkerRepo::list_with_filters(&mut *conn, None, None, 1000, 0).await?;
 
         let work_type_ids: Vec<i64> = workers_rows
             .iter()
@@ -162,9 +158,7 @@ impl StatisticsService {
                     is_active: w.is_active,
                     pickup_count: agg.map(|a| a.pickup_count).unwrap_or(0),
                     pickup_quantity: agg.map(|a| a.pickup_quantity).unwrap_or(0),
-                    participated_part_count: agg
-                        .map(|a| a.participated_part_count)
-                        .unwrap_or(0),
+                    participated_part_count: agg.map(|a| a.participated_part_count).unwrap_or(0),
                     contribution_pct: contribution_map.get(&w.id).copied().flatten(),
                 }
             })
@@ -186,12 +180,14 @@ impl StatisticsService {
         Self::validate_date_range(date_from, date_to)?;
         let wid_int = Self::parse_worker_id(worker_id_str)?;
 
-        let worker = WorkerRepo::get_by_id(&mut *conn, wid_int, false).await?.ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_WORKER_NOT_FOUND,
-                format!("worker {worker_id_str} 不存在或已软删"),
-            )
-        })?;
+        let worker = WorkerRepo::get_by_id(&mut *conn, wid_int, false)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_WORKER_NOT_FOUND,
+                    format!("worker {worker_id_str} 不存在或已软删"),
+                )
+            })?;
 
         let work_type_name: Option<String> = if let Some(wt_id) = worker.work_type_id {
             WorkTypeRepo::get_by_id(&mut *conn, wt_id)
@@ -278,8 +274,7 @@ impl StatisticsService {
         let limit = limit.clamp(1, 200);
         let offset = offset.max(0);
 
-        let rows =
-            StatisticsRepo::pickup_skip_detail(conn, wid_int, limit, offset).await?;
+        let rows = StatisticsRepo::pickup_skip_detail(conn, wid_int, limit, offset).await?;
         let total = StatisticsRepo::pickup_skip_detail_count(conn, wid_int).await?;
 
         let items = rows

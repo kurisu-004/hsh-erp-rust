@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::shared::types::{deserialize_i64, deserialize_i64_opt, serialize_i64};
+use serde::{Deserialize, Serialize};
 
 use super::model::TakenItem;
 

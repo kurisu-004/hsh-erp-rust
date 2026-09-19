@@ -15,7 +15,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 
 use super::dto::*;
 use super::model::TWorkType;
@@ -83,14 +83,12 @@ impl WorkTypeService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let items =
-            WorkTypeRepo::list_with_filters(&mut *conn, code_like, limit, offset).await?;
+        let items = WorkTypeRepo::list_with_filters(&mut *conn, code_like, limit, offset).await?;
         let total = WorkTypeRepo::count_with_filters(&mut *conn, code_like).await?;
 
         // process_ids 单条 SQL 批量算（防 N+1）
         let ids: Vec<i64> = items.iter().map(|w| w.id).collect();
-        let mapping_rows =
-            WorkTypeProcessRepo::list_by_work_types_batch(&mut *conn, &ids).await?;
+        let mapping_rows = WorkTypeProcessRepo::list_by_work_types_batch(&mut *conn, &ids).await?;
         let mut mapping_map: std::collections::HashMap<i64, Vec<i64>> =
             std::collections::HashMap::new();
         for (wt_id, pid) in mapping_rows {
@@ -194,14 +192,16 @@ impl WorkTypeService {
             current.id,
         )
         .await
-        .map_err(|e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-            // uk_t_work_type_code：活跃行唯一
-            Some("23505") => AppError::biz(
-                code::BIZ_WORK_TYPE_DUPLICATE_CODE,
-                format!("code '{code}' 已被占用"),
-            ),
-            _ => AppError::from(e),
-        })?;
+        .map_err(
+            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                // uk_t_work_type_code：活跃行唯一
+                Some("23505") => AppError::biz(
+                    code::BIZ_WORK_TYPE_DUPLICATE_CODE,
+                    format!("code '{code}' 已被占用"),
+                ),
+                _ => AppError::from(e),
+            },
+        )?;
 
         Ok(to_work_type_out(wt, Vec::new()))
     }
@@ -310,8 +310,7 @@ impl WorkTypeService {
             ));
         }
 
-        let affected =
-            WorkTypeRepo::soft_delete(&mut *conn, id, wt.version, current.id).await?;
+        let affected = WorkTypeRepo::soft_delete(&mut *conn, id, wt.version, current.id).await?;
         if affected == 0 {
             return Err(version_conflict());
         }
