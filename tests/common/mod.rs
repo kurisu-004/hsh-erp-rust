@@ -1,13 +1,31 @@
 //! 集成测试共享基建
 //!
-//! 测试库由 docker-compose 的 `postgres-test` 服务提供（localhost:5429，
-//! 账号 `hsh_test`）。首次跑测试时 `ensure_database_exists()` 自动建
-//! `postgres_rust_test` 库（已存在则跳过），`test_pool()` 连接后跑
-//! `sqlx::migrate!` apply 全部迁移。
+//! 2026-09-20 起改为 `ephemeral-postgres`（底层 testcontainers + docker daemon）：
+//! 每个 integration test binary 进程内复用 1 个 `Cluster`（postgres:18-alpine
+//! 容器），每次 `test_pool()` 调用在 cluster 上 `create_database()` 拿一个**独立**
+//! 数据库 → 跑 `sqlx::migrate!` → 返回 `PgPool`。这从源头消除两个 flaky：
 //!
-//! 每个集成测试用例在开头三步：
+//! - 根因 #1：`TEST_SNOWFLAKE_GEN` 跨 binary 共享 (epoch, instance=1) 撞 ID
+//!   → 各 binary 现在跑在各自的 PG 容器里，`pool_snowflake()` 仍复用 instance=1，
+//!   但 snowflake ID 仅在进程内 / 数据库内有意义，跨进程不再撞
+//! - 根因 #2：原 `postgres-test` 单库被 36 binary 共享 → TRUNCATE 残留 +
+//!   `_sqlx_migrations` 状态串号 → 现每测试 fresh database
+//!
+//! 集群复用策略（trade-off）：
+//! 用 `tokio::sync::OnceCell<Cluster>` 进程内复用 cluster；`test_pool()` 每次
+//! 调 `cluster.create_database()` 拿独立 DB。这样同 binary 内多测试只起一次容器，
+//! 避免 36 binary × N tests = 数百容器同时跑撑爆本机。代价：进程退出时
+//! `Cluster` 永不被 drop，docker daemon 清理 anonymous container。
+//!
+//! 已知限制：
+//! - 需要 docker daemon 在 PATH 且能 pull `postgres:18-alpine`
+//! - 建议 `RUST_TEST_THREADS=4`（默认 256 会瞬间拉起几十个容器）
+//! - `Database` 无 `Drop` 实现 → 单次 cargo test 跑完会在 cluster 容器里留下
+//!   几十个 `test_<uuid>` 库，进程退出后随容器被 docker daemon 回收
+//!
+//! 每个集成测试用例的惯用开头（保持与原 helper 接口一致）：
 //! ```ignore
-//! ensure_database_exists().await;
+//! ensure_database_exists().await; // 现在是 no-op（保留仅为不让 caller 报错）
 //! let pool = test_pool().await;
 //! clean_db(&pool).await;
 //! clean_redis(&redis_pool).await;  // 如需
@@ -35,10 +53,15 @@
 use std::sync::Arc;
 
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 
 use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::{Config as RedisConfig, Pool as RedisPool, Runtime as RedisRuntime};
+
+use ephemeral_postgres::cluster::Cluster;
+use ephemeral_postgres::cluster_params::ClusterParams;
+use ephemeral_postgres::postgres_image::PostgresImage;
 
 use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
@@ -57,6 +80,10 @@ use hsh_erp_rust::shared::error::{AppError, code};
 use std::sync::OnceLock;
 /// 全局共享 snowflake 生成器（PR-3 测试 helper 批量插入时使用）；
 /// 多个 helper 在同一毫秒调用不再产生冲突 ID（避免 shelf_id == process_id 等碰撞）。
+///
+/// 2026-09-20：仍保留 (epoch=1_577_836_800_000, instance=1)，各 integration test
+/// binary 现在跑在各自独立的 ephemeral PG 容器里（见 `CLUSTER` + `test_pool`），
+/// 所以进程内不再撞 ID、跨进程也不再撞。无需 per-instance 派生。
 static TEST_SNOWFLAKE_GEN: OnceLock<std::sync::Mutex<SnowflakeIdGenerator>> = OnceLock::new();
 pub fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
     TEST_SNOWFLAKE_GEN
@@ -64,67 +91,143 @@ pub fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
 }
 use hsh_erp_rust::state::AppState;
 
-/// 测试 DB URL：与 `postgres-test` 容器（端口5429）+ `postgres_rust_test` 库配对。
+/// 2026-09-20 起：每个 integration test binary 进程内复用的 ephemeral PG cluster。
+///
+/// 用 `tokio::sync::OnceCell`（异步 init：`Cluster::start` 是 async fn）。整个
+/// binary 只起一次容器，每次 `test_pool()` 在 cluster 上 `create_database()`
+/// 拿独立 db。这样：
+/// - 同 binary 多测试 → 1 个 cluster + N 个独立 db
+/// - 跨 binary → 互不可见（隔离 snowflake / TRUNCATE 残留 / `_sqlx_migrations` 状态）
+///
+/// trade-off：Cluster 放在 static 里永不被 Drop；进程退出时 docker daemon 清理
+/// anonymous container（ephemeral-postgres 不带 SIGINT watchdog）。如果哪天
+/// 跑 `cargo test` 后看到遗留 container，可手动 `docker ps -a | grep ephemeral`
+/// + `docker rm`。
+static CLUSTER: tokio::sync::OnceCell<Cluster> = tokio::sync::OnceCell::const_new();
+
+/// 进程内取 cluster（首次调用拉起 postgres:18-alpine 容器）。
+async fn cluster() -> &'static Cluster {
+    CLUSTER
+        .get_or_init(|| async {
+            Cluster::start(ClusterParams::new(PostgresImage::new(
+                "postgres",
+                "18-alpine",
+            )))
+            .await
+            .expect(
+                "start ephemeral postgres cluster (确认 docker daemon 在跑且能 pull postgres:18-alpine)",
+            )
+        })
+        .await
+}
+
+/// 2026-09-20：自建 admin pool。`ephemeral-postgres::Cluster::create_database()`
+/// 内部用的 admin pool 是 `max_connections=5`，且 acquire_timeout 是从 init
+/// 倒推的「剩余时间」（首次 init 完成后通常 ~30s）。但实测发现：auth_middleware
+/// 等做大量 SQL 的测试跑完后，下一次 `create_database()` 报 `PoolTimedOut` ——
+///
+/// 可能原因（推测）：前一个测试持有的 PgPool 异步 drop 时，sqlx 给 PG 发的
+/// terminate 包在 docker bridge 上延迟，导致 admin pool 新拿到的连接也被
+/// 算入 Postgres 后端进程数 → admin pool 的 5 个连接被 postgres backend
+/// 进程数上限挤出。
+///
+/// workaround：直接绕过 `Cluster::create_database()`，每次 test_pool() 临时
+/// 新建一个 admin pool（max_connections=10 + 长 acquire_timeout）跑一次
+/// `CREATE DATABASE` 后立刻 drop。开销约 50ms（TCP+auth），可接受。
+async fn fresh_database_url(cluster: &Cluster) -> String {
+    let admin_url = format!("{}/postgres", cluster.base_url());
+    let admin = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect(&admin_url)
+        .await
+        .expect("connect ephemeral admin pool");
+    let db_name = format!("test_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db_name}\"")))
+        .execute(&admin)
+        .await
+        .expect("CREATE DATABASE on ephemeral admin pool");
+    // admin pool 在函数末尾 drop，PG 后端进程立即关闭。
+    drop(admin);
+    format!("{}/{db_name}", cluster.base_url())
+}
+
+/// 测试 DB URL：仅作 `AppConfig.database_url` 字段占位。**实际连接走 caller 传入
+/// 的 `PgPool`**，测试路径不经过 `infra/db.rs::create_pool`，所以本返回值是否
+/// 「合法」无关紧要 —— 永远不会被任何代码 dial。
+///
+/// 2026-09-20 review：早先版本试图用 `set_test_database_url()` 把 ephemeral db URL
+/// 写进静态变量供本函数读，但 `set_test_database_url` 写的是另一个独立的
+/// `static URL`（函数作用域不同），本函数从自己作用域的 `static URL` 读永远拿不到，
+/// 形成 dead store。已删 `set_test_database_url` + 对应 `static URL`，本函数改为
+/// 固定占位字符串。
 fn test_database_url() -> String {
-    std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test".to_string()
-    })
+    "postgres://ephemeral/pending".to_string()
 }
-
-#[allow(dead_code)]
-const TEST_DATABASE_URL_DEFAULT: &str =
-    "postgres://hsh_test:6065161test@localhost:5429/postgres_rust_test";
-
-/// Admin DB URL：用于在测试前创建 `postgres_rust_test` 库。
-fn admin_database_url() -> String {
-    std::env::var("ADMIN_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://hsh_test:6065161test@localhost:5429/postgres".to_string())
-}
-
-#[allow(dead_code)]
-const ADMIN_DATABASE_URL_DEFAULT: &str = "postgres://hsh_test:6065161test@localhost:5429/postgres";
 
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
 const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
 
-/// 测试用 Redis URL：默认连 `redis-test` 容器（端口6380），db index 15 与 dev 默认 0 隔离。
-/// 可由 `TEST_REDIS_URL` 环境变量覆盖（跨 worktree 隔离用）。
+/// 测试用 Redis URL：默认连 `redis-test` 容器（端口6380），db index 用
+/// `CARGO_BIN_NAME` 派生（替代原固定 db=15）。跨 binary 隔离 session key；
+/// 同 binary 内多线程仍共享 → clean_redis() 的 FLUSHDB 必须在每个需要
+/// session 的测试前调。
+///
+/// 派生算法：FNV-1a hash mod 16（0..=15）。约 36 binary → 多数 binary 落
+/// 不同 db，少量 hash collision 不可避免，但所有用 session 的测试都先
+/// `clean_redis`，碰撞不致污染。
+///
+/// 可由 `TEST_REDIS_URL` 环境变量整体覆盖（跨 worktree 隔离用）。
 pub fn test_redis_url() -> String {
-    std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6380/15".to_string())
-}
-
-/// 第一次跑测试时建 `postgres_rust_test`（已存在则忽略）。
-pub async fn ensure_database_exists() {
-    let admin = PgPool::connect(&admin_database_url())
-        .await
-        .expect("connect admin db (postgres) — 确认 postgres-test 容器在 5429");
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname='postgres_rust_test')",
-    )
-    .fetch_one(&admin)
-    .await
-    .expect("query pg_database");
-    if !exists {
-        sqlx::query(
-            "CREATE DATABASE postgres_rust_test \
-             ENCODING 'UTF8' LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8' TEMPLATE template0",
-        )
-        .execute(&admin)
-        .await
-        .expect("create test db");
+    if let Ok(url) = std::env::var("TEST_REDIS_URL") {
+        return url;
     }
-    admin.close().await;
+    let bin = std::env::var("CARGO_BIN_NAME").unwrap_or_else(|_| "default".to_string());
+    let db_index = redis_db_index(&bin);
+    format!("redis://localhost:6380/{db_index}")
 }
 
-/// 建测试连接池 + 跑迁移。已迁移过则 `migrate!` 是 no-op。
+fn redis_db_index(bin: &str) -> u8 {
+    // FNV-1a 32-bit hash → mod 16（redis 默认支持 db 0..=15）。
+    let mut h: u32 = 0x811c_9dc5;
+    for b in bin.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h % 16) as u8
+}
+
+/// 2026-09-20 起为 no-op：ephemeral-postgres 每次 `test_pool()` 都建独立 db，
+/// 不需要预创建共享库。保留函数签名仅为不让 caller 报错。
+pub async fn ensure_database_exists() {
+    // no-op：cluster + database 由 test_pool() 内部管理
+}
+
+/// 建测试连接池：从进程内 `CLUSTER` 派生一个 fresh database + 跑全部迁移。
+///
+/// 各 binary 独立 PG 实例 → 各 binary 独立 snowflake instance=1 不再撞键；
+/// 独立 database → TRUNCATE 残留 / `_sqlx_migrations` 状态不串号。
 pub async fn test_pool() -> PgPool {
-    let pool = PgPool::connect(&test_database_url())
+    let cluster = cluster().await;
+
+    // 1) fresh database URL —— 临时 admin pool 跑 CREATE DATABASE 后立即 drop，
+    //    避免 Cluster::create_database 自带 admin pool 的连接瓶颈。
+    let db_url = fresh_database_url(cluster).await;
+
+    // 2) Open 一个 PgPool 指向新 db（max_connections=10 足够测试）。
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .acquire_timeout(std::time::Duration::from_secs(30))
+        .connect(&db_url)
         .await
-        .expect("connect test db postgres_rust_test");
+        .expect("connect to fresh ephemeral database");
+
+    // 3) 跑全部迁移。
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
-        .expect("apply migrations on test db");
+        .expect("apply migrations on ephemeral test db");
+
     pool
 }
 
