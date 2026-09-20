@@ -21,12 +21,12 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::work_type::dto::{
+use crate::modules::prod::work_type::dto::{
     SetWorkTypeProcessesRequest, WorkTypeCreateRequest, WorkTypeListOut, WorkTypeListQuery,
     WorkTypeOut, WorkTypeProcessMappingOut, WorkTypeUpdateRequest,
 };
-use crate::modules::work_type::process_mapping::WorkTypeProcessService;
-use crate::modules::work_type::service::WorkTypeService;
+use crate::modules::prod::work_type::process_mapping::WorkTypeProcessService;
+use crate::modules::prod::work_type::service::WorkTypeService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

@@ -7,8 +7,8 @@
 > - [`./applicants.md`](./applicants.md) — applicant 域（申请人 CRUD，2026-08-26；2026-09-19 聚合于 com 模块 → `/api/v2/com/applicants`）
 > - [`./customers.md`](./customers.md) — customers 域（L1/L2 CRUD，2026-08-26；2026-09-19 聚合于 com 模块 → `/api/v2/com/customers`）
 > - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker + mapping，2026-08-26）
-> - [`./workers.md`](./workers.md) — workers 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26）
-> - [`./production/index.md`](./production/index.md) — **生产管理** 域（工种/工序/工序映射/工艺链/工人候选池；按前端 `production_group` 菜单整合为子目录，2026-09-12）
+> - [`./production/workers.md`](./production/workers.md) — worker 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文件从顶层迁入 `production/`）
+> - [`./production/index.md`](./production/index.md) — **生产管理** 域（工种/工序/工序映射/工艺链/工人候选池 + 工人档案；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias）
 > - [`./parts/index.md`](./parts/index.md) — part 域（49 端点：to-inspection / to-ship 批量+单件 / to-process / **worker-scan** + Phase 1/2 全套批量与单件状态机扩展，2026-09-14）
 > - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（8 端点：装配体 CRUD + multipart PDF + 子件自动生成 + start + 子件 auto-rollup，2026-09-14 Phase 3）
 > - [`./cnc-programs.md`](./cnc-programs.md) — cnc_program 域（2 端点：配对上传 + 列表，2026-09-14 Phase 3）
@@ -158,8 +158,8 @@ HTTP 状态码：
 | applicants | [`./applicants.md`](./applicants.md) | 5 | ✅ 完全上线（CRUD + L1 customer 校验 + OCC，2026-08-26；聚合于 com 模块，2026-09-19） |
 | customers | [`./customers.md`](./customers.md) | 5 | ✅ 完全上线（CRUD + L1/L2 + OCC，2026-08-26；聚合于 com 模块，2026-09-19） |
 | shelves | [`./shelves.md`](./shelves.md) | 11 | ✅ 完全上线（CRUD + picker + mapping，2026-08-26） |
-| workers | [`./workers.md`](./workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26） |
-| **生产管理** | [`./production/index.md`](./production/index.md) | **19** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池；按前端 `production_group` 菜单整合为子目录，2026-09-12） |
+| workers（已并入 prod） | [`./production/workers.md`](./production/workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文档从顶层迁入 `production/`） |
+| **生产管理** | [`./production/index.md`](./production/index.md) | **27** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池 + 工人档案；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步） |
 | part | [`./parts/index.md`](./parts/index.md) | **49** | ✅ 完全上线（Phase 1+2 全部状态机 / 批量 / 扫码 / pick-up 端点落地，2026-09-14） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
@@ -170,7 +170,6 @@ HTTP 状态码：
 | outsource-shipments | [`./outsource-shipments.md`](./outsource-shipments.md) | 1 | ✅ 完全上线（2026-09-14，Phase 2） |
 | delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
-| process-chains | [`./production/process-chain.md`](./production/process-chain.md) | 3 | ✅ 完全上线（2026-09-12，process_chain 域；2026-09-16 FK 翻转 + `GET /{chain_id}`） |
 | _e2e | [`./_e2e.md`](./_e2e.md) | 11 | ✅ 完全上线（2026-09-14，e2e seed hook，dev/test profile） |
 | websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub（handler 已搭骨架，待握手实现） |
 | 其他 1 域 | — | 0 | ⚪ 仅占位（见下） |

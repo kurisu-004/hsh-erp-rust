@@ -20,7 +20,7 @@ use crate::modules::com::applicant::repo::ApplicantRepo;
 use crate::modules::com::customer::repo::CustomerRepo;
 // 2026-09-19 IAM 域合并：原 `user::repo` 重定向到 `iam::repo`，方法零 diff。
 use crate::modules::iam::repo::{UserInsert, UserRepo, UserRoleInsert, UserRoleRepo};
-use crate::modules::worker::repo::WorkerRepo;
+use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;

@@ -259,7 +259,7 @@ async fn worker_deactivate_rejects_when_holding_active_batch() {
         app,
         json_request(
             "POST",
-            &format!("/workers/{worker_id}/deactivate"),
+            &format!("/prod/workers/{worker_id}/deactivate"),
             None::<Value>,
             Some(&token),
         ),
@@ -309,7 +309,7 @@ async fn worker_deactivate_succeeds_when_holding_nothing() {
         app,
         json_request(
             "POST",
-            &format!("/workers/{worker_id}/deactivate"),
+            &format!("/prod/workers/{worker_id}/deactivate"),
             None::<Value>,
             Some(&token),
         ),

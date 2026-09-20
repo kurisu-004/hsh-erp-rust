@@ -115,7 +115,7 @@ async fn create_work_type_then_set_processes_then_soft_delete_in_use() {
         app.clone(),
         json_request(
             "POST",
-            "/work-types",
+            "/prod/work-types",
             Some(json!({
                 "code": "WT-CNC",
                 "name": "CNC Operator",
@@ -152,7 +152,7 @@ async fn create_work_type_then_set_processes_then_soft_delete_in_use() {
         app,
         json_request(
             "POST",
-            &format!("/work-types/{wt_id_str}/soft-delete"),
+            &format!("/prod/work-types/{wt_id_str}/soft-delete"),
             None,
             Some(&token),
         ),

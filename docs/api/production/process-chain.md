@@ -1,6 +1,6 @@
 # process_chain 域 API
 
-> 本文件须与 `src/modules/process_chain/{handler.rs,dto.rs,service.rs,model.rs,repo/}` 保持同步
+> 本文件须与 `src/modules/prod/process_chain/{handler.rs,dto.rs,service.rs,model.rs,repo/}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 范围：每个 part 绑定一份多步工艺链（part 1:1 chain；chain 1:N steps）。
@@ -11,9 +11,9 @@
 > 点击零件后按 `process_chain_id` 调 `GET /{chain_id}` 加载工序信息。
 >
 > 当前暴露 3 个端点：
-> - `GET /api/v2/process-chains/by-part/{part_id}` —— 读 part 绑定的工艺链（header + steps）
-> - `PUT /api/v2/process-chains/by-part/{part_id}` —— 整组 upsert（替换语义：保留 header id，version++，软删旧 steps，INSERT 新 steps）
-> - `GET /api/v2/process-chains/{chain_id}` —— 按链 id 读工艺链（FK 翻转新增）
+> - `GET /api/v2/prod/process-chains/by-part/{part_id}` —— 读 part 绑定的工艺链（header + steps）
+> - `PUT /api/v2/prod/process-chains/by-part/{part_id}` —— 整组 upsert（替换语义：保留 header id，version++，软删旧 steps，INSERT 新 steps）
+> - `GET /api/v2/prod/process-chains/{chain_id}` —— 按链 id 读工艺链（FK 翻转新增）
 >
 > 实施阶段：part-worker-pool-federated-rocket（2026-09-11）；FK 翻转 PR-1（2026-09-16）
 
@@ -21,16 +21,16 @@
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/process-chains/by-part/{part_id}` | **Manager+Clerk+Inspector+CncProgrammer**（任意已登录） | 读 part 绑定的工艺链（header + steps）。无链 → 20701 + 404 |
-| PUT | `/api/v2/process-chains/by-part/{part_id}` | **Manager** | 整组 upsert：1:1 binding、OCC、软删旧 steps、INSERT 新 steps、单事务；**PENDING 守卫（20705）** |
-| GET | `/api/v2/process-chains/{chain_id}` | **Manager+Clerk+Inspector+CncProgrammer**（任意已登录） | 按链 id 读工艺链。无链 / 已软删 → 20701 + 404 |
+| GET | `/api/v2/prod/process-chains/by-part/{part_id}` | **Manager+Clerk+Inspector+CncProgrammer**（任意已登录） | 读 part 绑定的工艺链（header + steps）。无链 → 20701 + 404 |
+| PUT | `/api/v2/prod/process-chains/by-part/{part_id}` | **Manager** | 整组 upsert：1:1 binding、OCC、软删旧 steps、INSERT 新 steps、单事务；**PENDING 守卫（20705）** |
+| GET | `/api/v2/prod/process-chains/{chain_id}` | **Manager+Clerk+Inspector+CncProgrammer**（任意已登录） | 按链 id 读工艺链。无链 / 已软删 → 20701 + 404 |
 
 > 路由挂载：`/process-chains` 走 `/api/v2`（见 `src/modules/mod.rs`）。
 > axum 静态段 `by-part` 优先于参数段 `{chain_id}`，`/by-part/123` 不会被解析成 chain_id。
 
 ---
 
-### `GET /api/v2/process-chains/by-part/{part_id}`
+### `GET /api/v2/prod/process-chains/by-part/{part_id}`
 
 权限：**Manager+Clerk+Inspector+CncProgrammer**（service 内 `require_any_role`；无 `ShelfAccount`）。
 
@@ -54,7 +54,7 @@ Response 200 `data`：[`ProcessChainOut`](#processchainout-字段)
 - 20701 BIZ_PROCESS_CHAIN_NOT_FOUND — part 尚未绑定工艺链 / 已软删
 - 40300 FORBIDDEN — 角色不在白名单
 
-### `GET /api/v2/process-chains/{chain_id}`
+### `GET /api/v2/prod/process-chains/{chain_id}`
 
 **2026-09-16 FK 翻转新增。** 前端在「工序制定」页点击零件后，按 part 的
 `process_chain_id` 调本端点加载工序信息。
@@ -80,7 +80,7 @@ Response 200 `data`：[`ProcessChainOut`](#processchainout-字段)
 - 20701 BIZ_PROCESS_CHAIN_NOT_FOUND — 链不存在 / 已软删
 - 40300 FORBIDDEN — 角色不在白名单
 
-### `PUT /api/v2/process-chains/by-part/{part_id}`
+### `PUT /api/v2/prod/process-chains/by-part/{part_id}`
 
 权限：**Manager**（service 内 `require_role`）。
 
@@ -228,5 +228,5 @@ helper，`src/modules/part/service/phase1.rs:342`）。错误码 HTTP 409，业�
 ## 参考
 
 - 集成测试：`tests/process_chain_api.rs`
-- 仓库分层：`src/modules/process_chain/handler.rs` (axum) → `service/crud.rs` (业务) → `repo/query.rs` + `repo/mutate.rs` (SQL)
+- 仓库分层：`src/modules/prod/process_chain/handler.rs` (axum) → `service/crud.rs` (业务) → `repo/query.rs` + `repo/mutate.rs` (SQL)
 - 错误码：`src/shared/error.rs::code`（20101 / 20104 / 20701 / 20702 / 20703 / 20704 / 20705 / **20706 PROCESS_CHAIN_REQUIRED（PR-3 新增）** / 40001 / 40300 / 40901）

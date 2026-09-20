@@ -21,8 +21,8 @@ use axum::Json;
 use axum::extract::{Path, State};
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::process_chain::dto::{ProcessChainOut, UpsertChainRequest};
-use crate::modules::process_chain::service::crud::ProcessChainService;
+use crate::modules::prod::process_chain::dto::{ProcessChainOut, UpsertChainRequest};
+use crate::modules::prod::process_chain::service::crud::ProcessChainService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

@@ -21,8 +21,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::modules::worker_pool::dto::WorkerScanEvent;
-use crate::modules::worker_pool::model::RefillResult;
+use crate::modules::prod::worker_pool::dto::WorkerScanEvent;
+use crate::modules::prod::worker_pool::model::RefillResult;
 use crate::shared::types::{
     deserialize_i64, deserialize_i64_opt, serialize_i64, serialize_i64_opt,
 };

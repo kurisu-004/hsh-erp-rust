@@ -1,7 +1,9 @@
 # hsh-erp-rust 架构设计
 
 > 本仓库为 Python FastAPI ERP 系统 `/Users/ren/Code/myERP` 的 Rust 重构版。
-> **项目阶段**：基础设施（axum 路由 / 错误信封 / JWT+RBAC+session / 雪花 ID / WS 中枢 / DB 迁移）已就绪，19 个核心域（auth / users / applicants / customers / shelves / workers / work_types / processes / production / parts / assemblies / cnc_program / part_file / outsource / delivery_note / delivery_group / process_chain / _e2e + 1 WS stub）已完成业务 handler；仅 1 域（statistics）+ dashboard WS 握手待实施。详见 §7 当前进度。
+> **项目阶段**：基础设施（axum 路由 / 错误信封 / JWT+RBAC+session / 雪花 ID / WS 中枢 / DB 迁移）已就绪，15 个核心域（iam / com / prod / shelves / part / part_batch / assembly / cnc_program / part_file / outsource / delivery_note / statistics / upload_session / _e2e + 1 WS stub）已完成业务 handler；仅 dashboard WS 握手待实施。详见 §7 当前进度。
+>
+> 容器聚合进展：2026-09-19 IAM 域（auth + user 融合）→ com 域（customer + applicant 容器聚合）→ prod 域（worker + work_type + process + process_chain + worker_pool 容器聚合）。part / assembly 是 ERP 核心实体（跨域枢纽），**未并入 prod**；报工端点保留在 part 域。
 > 本文档是骨架的"自述手册"，回答**目录为什么这样组织、各模块做什么、关键模式是什么**。
 
 ## 1. 技术栈
@@ -83,25 +85,28 @@ hsh-erp-rust/
     │   ├── excel.rs
     │   └── pdf.rs
     │
-    └── modules/                   # 业务域（垂直切片，20 域：18 业务 + 1 _e2e seed hook + 1 WS dashboard）
+    └── modules/                   # 业务域（垂直切片，15 域：12 业务 + 1 _e2e seed hook + 1 WS dashboard + 2 容器：iam + com + prod）
         ├── mod.rs                 # v2_router()/ws_router() 聚合 + /api/v2/health
-        ├── auth/                  # 登录/refresh/改密
-        ├── user/                  # 账号+角色+菜单
-        ├── customer/              # 客户树
-        ├── applicant/             # 申请人
-        ├── worker/                # 工人
-        ├── work_type/             # 工种
-        ├── process/               # 工序
+        ├── iam/                   # iam 域：auth + user 合并（2026-09-19 PR-4 收尾，14 端点）
+        ├── com/                   # com 容器：customer + applicant（2026-09-19 聚合，URL /api/v2/com/*）
+        │   ├── customer/
+        │   └── applicant/
+        ├── prod/                  # prod 容器：工人 / 工种 / 工序 / 工艺链 / 工人池（2026-09-19 PR-N 聚合，URL /api/v2/prod/*）
+        │   ├── worker/            # 工人档案 + verify-badge（7 端点）
+        │   ├── work_type/         # 工种（含 process_mapping.rs，7 端点）
+        │   ├── process/           # 工序（5 端点）
+        │   ├── process_chain/     # 工艺链（含 statemachine.rs + repo/ + service/，5 端点）
+        │   └── worker_pool/       # 工人候选池（state + admin refill/remove/auto-allocate/assign，6 端点）
         ├── shelf/                 # 货架
-        ├── worker_pool/           # 工人候选池（auto_allocate / refill / remove / take_one）
-        ├── part/                  # ★核心：零件工单（含 statemachine.rs）
+        ├── part/                  # ★核心：零件工单（含 statemachine.rs；报工端点 worker-scan / pick-up / to-* / complete 留本域）
         │   ├── dto.rs / dto_crud.rs            # 请求/响应 DTO
-        │   ├── handler.rs                      # axum handler（49 端点）
+        │   ├── handler/{mod,crud,lifecycle,inspection,batch}.rs  # axum handler（49 端点）
         │   ├── model.rs                        # TPart + 域枚举
         │   ├── repo/{part,batch,event}.rs      # sqlx 查询（按读 / 写 / 事件 拆）
-        │   ├── service/{crud,inspection,inspection_core,lifecycle,worker_scan,rollup,phase1}.rs
+        │   ├── service/{crud,inspection,inspection_core,lifecycle,worker_scan,rollup,phase1,batch}.rs
         │   └── statemachine.rs                 # 状态机 + reorder_with_step_size helper（PR-B2）
-        ├── assembly/              # 装配件（含 statemachine.rs + 子件 rollup）
+        ├── part_batch/            # 批次真相源（被 part + worker_pool + delivery_note 等共享，无 router）
+        ├── assembly/              # 装配件（含 statemachine.rs + 子件 rollup；不并入 prod，因依赖 part）
         ├── cnc_program/           # CNC 程序（pairs 上传 + 列表，Phase 3）
         ├── part_file/             # 零件文件/图纸（kind 全统一为 t_part_file，Phase 3）
         ├── outsource/             # 外协域（company / quote / shipment 三子域，含 statemachine.rs）
@@ -111,8 +116,8 @@ hsh-erp-rust/
         │   ├── print.rs / print_xml_patch.rs    # 打印模板 + XML 补丁
         │   ├── repo/{mod,query,mutate}.rs      # 读 / 写 分文件
         │   ├── service/{mod,crud,inner,lifecycle,group,scan,print,attach}.rs
-        ├── process_chain/         # 工艺链（含 statemachine.rs，reorder_with_step_size helper）
         ├── statistics/            # 生产统计（占位，无 model.rs）
+        ├── upload_session/        # 上传会话（7 端点，Redis 共享 STS，2026-09-18）
         ├── _e2e/                  # e2e seed hook（11 端点，dev/test 默认 / release 硬关，2026-09-14）
         └── dashboard/             # WebSocket 大屏（handler 骨架已搭，待握手实现）
 ```

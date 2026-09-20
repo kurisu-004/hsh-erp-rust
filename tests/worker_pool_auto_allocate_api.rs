@@ -308,7 +308,7 @@ async fn auto_allocate_count_mode_full_fill() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/auto-allocate",
+            "/prod/admin/worker-pool/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -354,7 +354,7 @@ async fn auto_allocate_count_mode_zero_fill() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/auto-allocate",
+            "/prod/admin/worker-pool/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -395,7 +395,7 @@ async fn auto_allocate_time_mode_target_calc() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/auto-allocate",
+            "/prod/admin/worker-pool/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -434,7 +434,7 @@ async fn auto_allocate_time_mode_minutes_not_set() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/auto-allocate",
+            "/prod/admin/worker-pool/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -468,7 +468,7 @@ async fn auto_allocate_rejects_ratio_above_one() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/auto-allocate",
+            "/prod/admin/worker-pool/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -495,7 +495,7 @@ async fn auto_allocate_rejects_negative_ratio() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/auto-allocate",
+            "/prod/admin/worker-pool/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -528,7 +528,7 @@ async fn auto_allocate_pool_empty() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/auto-allocate",
+            "/prod/admin/worker-pool/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -557,7 +557,7 @@ async fn auto_allocate_process_not_found() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/auto-allocate",
+            "/prod/admin/worker-pool/auto-allocate",
             Some(json!({
                 "process_id": nonexistent.to_string(),
                 "shelf_id": shelf.to_string(),

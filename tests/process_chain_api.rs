@@ -209,7 +209,7 @@ async fn upsert_then_get_by_part_happy() {
         app.clone(),
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "默认工艺",
                 "note": "happy path",
@@ -263,7 +263,7 @@ async fn upsert_then_get_by_part_happy() {
         app,
         json_request(
             "GET",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             None,
             Some(&token),
         ),
@@ -286,7 +286,7 @@ async fn get_by_part_chain_not_found() {
         app,
         json_request(
             "GET",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             None,
             Some(&token),
         ),
@@ -312,7 +312,7 @@ async fn upsert_replaces_old_steps() {
         app.clone(),
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "原链",
                 "steps": [
@@ -332,7 +332,7 @@ async fn upsert_replaces_old_steps() {
         app,
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "新链",
                 "steps": [
@@ -394,7 +394,7 @@ async fn upsert_rejects_negative_minutes() {
         app,
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [
                     { "sort_order": 10, "process_id": proc.to_string(), "estimated_minutes": -1 },
@@ -421,7 +421,7 @@ async fn upsert_rejects_duplicate_sort_order() {
         app,
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [
                     { "sort_order": 10, "process_id": proc.to_string(), "estimated_minutes": 30 },
@@ -465,7 +465,7 @@ async fn upsert_forbidden_for_non_manager() {
         app,
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [
                     { "sort_order": 10, "process_id": proc.to_string(), "estimated_minutes": 30 },
@@ -498,7 +498,7 @@ async fn step_note_round_trip() {
         app.clone(),
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "含备注工艺",
                 "steps": [
@@ -540,7 +540,7 @@ async fn step_note_round_trip() {
         app,
         json_request(
             "GET",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             None,
             Some(&token),
         ),
@@ -568,7 +568,7 @@ async fn upsert_rejects_non_pending_part() {
         app,
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [
                     { "sort_order": 10, "process_id": proc.to_string(), "estimated_minutes": 30 },
@@ -600,7 +600,7 @@ async fn get_chain_by_id_hit_and_miss() {
         app.clone(),
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "按 id 读取链",
                 "steps": [
@@ -619,7 +619,7 @@ async fn get_chain_by_id_hit_and_miss() {
         app.clone(),
         json_request(
             "GET",
-            &format!("/process-chains/{chain_id}"),
+            &format!("/prod/process-chains/{chain_id}"),
             None,
             Some(&token),
         ),
@@ -637,7 +637,7 @@ async fn get_chain_by_id_hit_and_miss() {
         app,
         json_request(
             "GET",
-            &format!("/process-chains/{missing_id}"),
+            &format!("/prod/process-chains/{missing_id}"),
             None,
             Some(&token),
         ),
@@ -665,7 +665,7 @@ async fn soft_delete_part_cascades_chain() {
         app.clone(),
         json_request(
             "PUT",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [
                     { "sort_order": 10, "process_id": proc_a.to_string(), "estimated_minutes": 30 },
@@ -737,7 +737,7 @@ async fn soft_delete_part_cascades_chain() {
         app.clone(),
         json_request(
             "GET",
-            &format!("/process-chains/by-part/{part_id}"),
+            &format!("/prod/process-chains/by-part/{part_id}"),
             None,
             Some(&token),
         ),
@@ -751,7 +751,7 @@ async fn soft_delete_part_cascades_chain() {
         app,
         json_request(
             "GET",
-            &format!("/process-chains/{chain_id}"),
+            &format!("/prod/process-chains/{chain_id}"),
             None,
             Some(&token),
         ),

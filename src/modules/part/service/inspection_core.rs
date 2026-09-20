@@ -14,7 +14,7 @@ use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part_batch::model::TPartBatch;
-use crate::modules::process_chain::repo::ProcessChainRepo;
+use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{PartOut, ToXxxOut};

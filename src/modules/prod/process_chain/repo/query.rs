@@ -5,7 +5,7 @@
 
 use sqlx::PgExecutor;
 
-use crate::modules::process_chain::model::{TPartProcessChain, TProcessChainStep};
+use crate::modules::prod::process_chain::model::{TPartProcessChain, TProcessChainStep};
 
 use super::ProcessChainRepo;
 

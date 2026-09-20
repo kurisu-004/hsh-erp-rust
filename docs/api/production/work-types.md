@@ -1,6 +1,6 @@
 # work_types 域 API
 
-> 本文件须与 `src/modules/work_type/{handler.rs,dto.rs,service.rs}` 保持同步
+> 本文件须与 `src/modules/prod/work_type/{handler.rs,dto.rs,service.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 范围：工种 CRUD。工种 ↔ 工序 映射见 [`./work-type-process-mapping.md`](./work-type-process-mapping.md)。
@@ -11,13 +11,13 @@
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/work-types` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 列表（`code_like` 过滤 + 分页） |
-| POST | `/api/v2/work-types` | MANAGER | 创建工种 |
-| GET | `/api/v2/work-types/{id}` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 工种详情（含 `process_ids`） |
-| POST | `/api/v2/work-types/{id}/update` | MANAGER | 部分更新（OCC） |
-| POST | `/api/v2/work-types/{id}/soft-delete` | MANAGER | 软删（OCC，被 worker / process mapping 引用时拒） |
+| GET | `/api/v2/prod/work-types` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 列表（`code_like` 过滤 + 分页） |
+| POST | `/api/v2/prod/work-types` | MANAGER | 创建工种 |
+| GET | `/api/v2/prod/work-types/{id}` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 工种详情（含 `process_ids`） |
+| POST | `/api/v2/prod/work-types/{id}/update` | MANAGER | 部分更新（OCC） |
+| POST | `/api/v2/prod/work-types/{id}/soft-delete` | MANAGER | 软删（OCC，被 worker / process mapping 引用时拒） |
 
-挂载点：`/api/v2/work-types`（见 `src/modules/mod.rs::v2_router`）。
+挂载点：`/api/v2/prod/work-types`（见 `src/modules/mod.rs::v2_router`）。
 
 ---
 
@@ -49,7 +49,7 @@
 
 ---
 
-### `GET /api/v2/work-types`
+### `GET /api/v2/prod/work-types`
 
 权限：已登录（M/C/CNC/SHELF/INSPECTOR；service 层 `require_any_role`）
 
@@ -70,7 +70,7 @@ Response 200 `data`：`WorkTypeListOut`
 | `limit` | i64 | 回显 |
 | `offset` | i64 | 回显 |
 
-### `POST /api/v2/work-types`
+### `POST /api/v2/prod/work-types`
 
 权限：MANAGER（service 层 `require_role`）
 
@@ -91,7 +91,7 @@ Response 201 `data`：`WorkTypeOut`（`process_ids` 为空数组 — 创建时�
 - 20104 `BIZ_INVALID_VALUE` — code/name 空 / max_held_batches < 1
 - 20902 `BIZ_WORK_TYPE_DUPLICATE_CODE` — `uk_t_work_type_code` 撞唯一索引
 
-### `GET /api/v2/work-types/{id}`
+### `GET /api/v2/prod/work-types/{id}`
 
 权限：已登录（M/C/CNC/SHELF/INSPECTOR）
 
@@ -107,7 +107,7 @@ Response 200 `data`：`WorkTypeOut`（含 `process_ids` —— 单次批量查�
 
 - 20901 `BIZ_WORK_TYPE_NOT_FOUND`
 
-### `POST /api/v2/work-types/{id}/update`
+### `POST /api/v2/prod/work-types/{id}/update`
 
 权限：MANAGER
 
@@ -129,7 +129,7 @@ Response 200 `data`：`WorkTypeOut`（回读最新版本 + `process_ids`）
 - 20104 `BIZ_INVALID_VALUE` — code 试图改 / name 空 / max_held_batches < 1
 - 40901 `VERSION_CONFLICT` — 乐观锁冲突（前端需重新 GET 后再试）
 
-### `POST /api/v2/work-types/{id}/soft-delete`
+### `POST /api/v2/prod/work-types/{id}/soft-delete`
 
 权限：MANAGER
 

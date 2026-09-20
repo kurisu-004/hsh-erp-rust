@@ -9,7 +9,7 @@
 //! - 软删前查 `t_worker.work_type_id` + `t_work_type_process` 引用，>0 ⇒ 20903 拒
 //!
 //! ## mapping 端点
-//! 见 `crate::modules::work_type::process_mapping`（set / list per-work_type）。
+//! 见 `crate::modules::prod::work_type::process_mapping`（set / list per-work_type）。
 
 use sqlx::PgConnection;
 

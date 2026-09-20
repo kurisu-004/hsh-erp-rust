@@ -111,7 +111,7 @@ async fn verify_badge_inactive_returns_20202() {
         app.clone(),
         json_request(
             "POST",
-            "/workers",
+            "/prod/workers",
             Some(json!({"badge_code": "B001", "name": "Alice"})),
             Some(&token),
         ),
@@ -126,7 +126,7 @@ async fn verify_badge_inactive_returns_20202() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/workers/{wid}/deactivate"),
+            &format!("/prod/workers/{wid}/deactivate"),
             None,
             Some(&token),
         ),
@@ -139,7 +139,7 @@ async fn verify_badge_inactive_returns_20202() {
         app,
         json_request(
             "POST",
-            "/workers/verify-badge",
+            "/prod/workers/verify-badge",
             Some(json!({"badge_code": "B001"})),
             Some(&token),
         ),
@@ -176,7 +176,7 @@ async fn reactivate_worker_version_conflict_returns_40901() {
         app.clone(),
         json_request(
             "POST",
-            "/workers",
+            "/prod/workers",
             Some(json!({"badge_code": "B-VC-001", "name": "Bob"})),
             Some(&token),
         ),
@@ -200,7 +200,7 @@ async fn reactivate_worker_version_conflict_returns_40901() {
         app,
         json_request(
             "POST",
-            &format!("/workers/{wid_str}/reactivate"),
+            &format!("/prod/workers/{wid_str}/reactivate"),
             None,
             Some(&token),
         ),

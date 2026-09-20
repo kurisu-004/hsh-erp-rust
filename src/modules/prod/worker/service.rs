@@ -21,10 +21,10 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::work_type::repo::WorkTypeRepo;
-use crate::modules::worker::dto::*;
-use crate::modules::worker::model::TWorker;
-use crate::modules::worker::repo::WorkerRepo;
+use crate::modules::prod::work_type::repo::WorkTypeRepo;
+use crate::modules::prod::worker::dto::*;
+use crate::modules::prod::worker::model::TWorker;
+use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;

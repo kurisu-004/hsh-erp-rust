@@ -1,6 +1,6 @@
 # work_type ↔ process 工序映射 域 API
 
-> 本文件须与 `src/modules/work_type/{handler.rs,process_mapping.rs,service.rs,repo.rs}` 保持同步
+> 本文件须与 `src/modules/prod/work_type/{handler.rs,process_mapping.rs,service.rs,repo.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 范围：`t_work_type_process` 多对多映射的读写。工种 CRUD 见 [`./work-types.md`](./work-types.md)；工序 CRUD 见 [`./processes.md`](./processes.md)。
@@ -11,10 +11,10 @@
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/work-types/{id}/processes` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 该工种已映射工序列表 |
-| POST | `/api/v2/work-types/{id}/processes` | MANAGER | 整组替换工种工序映射 |
+| GET | `/api/v2/prod/work-types/{id}/processes` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 该工种已映射工序列表 |
+| POST | `/api/v2/prod/work-types/{id}/processes` | MANAGER | 整组替换工种工序映射 |
 
-挂载点：`/api/v2/work-types`（见 `src/modules/mod.rs::v2_router`）。
+挂载点：`/api/v2/prod/work-types`（见 `src/modules/mod.rs::v2_router`）。
 
 ---
 
@@ -39,7 +39,7 @@
 
 ---
 
-### `GET /api/v2/work-types/{id}/processes`
+### `GET /api/v2/prod/work-types/{id}/processes`
 
 权限：已登录（M/C/CNC/SHELF/INSPECTOR；service 层 `require_any_role`）
 
@@ -55,7 +55,7 @@ Response 200 `data`：`WorkTypeProcessMappingOut`
 |---|---|---|
 | `items` | [WorkTypeProcessMappingItem](#worktypeprocessmappingitem-字段) | 按 `sort_order ASC, id ASC` |
 
-### `POST /api/v2/work-types/{id}/processes`
+### `POST /api/v2/prod/work-types/{id}/processes`
 
 权限：MANAGER
 

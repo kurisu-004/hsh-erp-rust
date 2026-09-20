@@ -12,7 +12,7 @@ use sqlx::{PgConnection, PgExecutor};
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::process::repo::ProcessRepo;
+use crate::modules::prod::process::repo::ProcessRepo;
 use crate::shared::error::{AppError, code};
 
 use super::dto::{SetWorkTypeProcessesItem, WorkTypeProcessMappingItem, WorkTypeProcessMappingOut};

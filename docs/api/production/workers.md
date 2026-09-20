@@ -1,21 +1,21 @@
 # workers 域 API
 
-> 本文件须与 `src/modules/worker/{handler.rs,dto.rs,service.rs}` 保持同步
+> 本文件须与 `src/modules/prod/worker/{handler.rs,dto.rs,service.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
 ## 端点列表
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| POST | `/api/v2/workers/verify-badge` | 已登录（任意角色） | 扫码台按 badge_code 定位工人 |
-| GET | `/api/v2/workers` | 已登录（MANAGER） | 列表（按 `name_like` / `is_active` 过滤 + 分页） |
-| POST | `/api/v2/workers` | 已登录（MANAGER） | 创建工人 |
-| GET | `/api/v2/workers/{id}` | 已登录（MANAGER） | 工人详情 |
-| POST | `/api/v2/workers/{id}/update` | 已登录（MANAGER） | 部分更新（OCC） |
-| POST | `/api/v2/workers/{id}/deactivate` | 已登录（MANAGER） | 停用（OCC，被 IN_PROCESS/INSPECTION/REPAIRING/RETURNED 零件引用时拒） |
-| POST | `/api/v2/workers/{id}/reactivate` | 已登录（MANAGER） | 重启（OCC；is_active=true + deleted_at=NULL） |
+| POST | `/api/v2/prod/workers/verify-badge` | 已登录（任意角色） | 扫码台按 badge_code 定位工人 |
+| GET | `/api/v2/prod/workers` | 已登录（MANAGER） | 列表（按 `name_like` / `is_active` 过滤 + 分页） |
+| POST | `/api/v2/prod/workers` | 已登录（MANAGER） | 创建工人 |
+| GET | `/api/v2/prod/workers/{id}` | 已登录（MANAGER） | 工人详情 |
+| POST | `/api/v2/prod/workers/{id}/update` | 已登录（MANAGER） | 部分更新（OCC） |
+| POST | `/api/v2/prod/workers/{id}/deactivate` | 已登录（MANAGER） | 停用（OCC，被 IN_PROCESS/INSPECTION/REPAIRING/RETURNED 零件引用时拒） |
+| POST | `/api/v2/prod/workers/{id}/reactivate` | 已登录（MANAGER） | 重启（OCC；is_active=true + deleted_at=NULL） |
 
-挂载点：`/api/v2/workers`（见 `src/modules/mod.rs::v2_router`）。
+挂载点：`/api/v2/prod/workers`（见 `src/modules/mod.rs::v2_router`）。
 
 ---
 
@@ -41,7 +41,7 @@
 
 ---
 
-### `POST /api/v2/workers/verify-badge`
+### `POST /api/v2/prod/workers/verify-badge`
 
 权限：已登录（任意角色；service 层只校验 JWT，不限角色）
 
@@ -58,7 +58,7 @@ Response 200 `data`：`WorkerOut`（**不**含 `work_type_name`；如需由前�
 - 20201 `BIZ_WORKER_NOT_FOUND` — `badge_code` 不存在（或空串）
 - 20202 `BIZ_WORKER_INACTIVE` — 工人存在但 `is_active=false`（HTTP 400）
 
-### `GET /api/v2/workers`
+### `GET /api/v2/prod/workers`
 
 权限：已登录（MANAGER）
 
@@ -73,7 +73,7 @@ Query：
 
 Response 200 `data`：`WorkerListOut`
 
-### `POST /api/v2/workers`
+### `POST /api/v2/prod/workers`
 
 权限：已登录（MANAGER）
 
@@ -95,7 +95,7 @@ Response 201 `data`：`WorkerOut`
 - 40901 `VERSION_CONFLICT` — badge_code 或 id_card_no 已存在（DB 唯一索引兜底）
 - 20901 `BIZ_WORK_TYPE_NOT_FOUND` — work_type_id 指向不存在或已软删的工种
 
-### `GET /api/v2/workers/{id}`
+### `GET /api/v2/prod/workers/{id}`
 
 权限：已登录（MANAGER）
 
@@ -111,7 +111,7 @@ Response 200 `data`：`WorkerOut`（含 `work_type_name`）
 
 - 20201 `BIZ_WORKER_NOT_FOUND`
 
-### `POST /api/v2/workers/{id}/update`
+### `POST /api/v2/prod/workers/{id}/update`
 
 权限：已登录（MANAGER）
 
@@ -133,7 +133,7 @@ Response 200 `data`：`WorkerOut`（回读最新版本）
 - 20104 `BIZ_INVALID_VALUE` — name/badge_code 空 / work_type_id 非整数 / 工种不存在
 - 40901 `VERSION_CONFLICT` — OCC 冲突 / badge_code 撞 uk / id_card_no 撞 uk
 
-### `POST /api/v2/workers/{id}/deactivate`
+### `POST /api/v2/prod/workers/{id}/deactivate`
 
 权限：已登录（MANAGER）
 
@@ -155,7 +155,7 @@ Response 200 `data`：`null`
   （**2026-09-16 PR-2**：`t_part.current_holder_id` 列已删，守卫改查 `t_part_batch` 真相源）
 - 40901 `VERSION_CONFLICT`
 
-### `POST /api/v2/workers/{id}/reactivate`
+### `POST /api/v2/prod/workers/{id}/reactivate`
 
 权限：已登录（MANAGER）
 

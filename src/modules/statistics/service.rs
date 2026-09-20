@@ -24,8 +24,8 @@ use crate::modules::statistics::dto::{
 use crate::modules::statistics::repo::{
     PickupSkipDetailRow, PickupSkipSummaryRow, StatisticsRepo, WorkerPartRow, WorkerPickupRow,
 };
-use crate::modules::work_type::repo::WorkTypeRepo;
-use crate::modules::worker::repo::WorkerRepo;
+use crate::modules::prod::work_type::repo::WorkTypeRepo;
+use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
 pub struct StatisticsService;

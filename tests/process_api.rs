@@ -133,7 +133,7 @@ async fn create_process_inhouse_forces_requires_approval_false() {
         app,
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-CUT",
                 "name": "Cutting",
@@ -163,7 +163,7 @@ async fn create_process_outsource_keeps_requires_approval_default_true() {
         app,
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-COAT",
                 "name": "Coating",
@@ -192,7 +192,7 @@ async fn create_process_duplicate_code_returns_20802() {
         app.clone(),
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-DUP",
                 "name": "First",
@@ -208,7 +208,7 @@ async fn create_process_duplicate_code_returns_20802() {
         app,
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-DUP",
                 "name": "Second",
@@ -240,7 +240,7 @@ async fn update_process_inhouse_requires_approval_true_rejected() {
         app.clone(),
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-INH-APV",
                 "name": "Inhouse NoApv",
@@ -258,7 +258,7 @@ async fn update_process_inhouse_requires_approval_true_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/processes/{pid}/update"),
+            &format!("/prod/processes/{pid}/update"),
             Some(json!({"requires_approval": true})),
             Some(&token),
         ),
@@ -287,7 +287,7 @@ async fn update_process_inhouse_no_approval_field_does_not_bump_version() {
         app.clone(),
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-INH-NOOP",
                 "name": "Inhouse NoOp",
@@ -308,7 +308,7 @@ async fn update_process_inhouse_no_approval_field_does_not_bump_version() {
         app,
         json_request(
             "POST",
-            &format!("/processes/{pid}/update"),
+            &format!("/prod/processes/{pid}/update"),
             Some(json!({})),
             Some(&token),
         ),
@@ -337,7 +337,7 @@ async fn update_process_code_change_rejected() {
         app.clone(),
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-ORIG",
                 "name": "Original",
@@ -355,7 +355,7 @@ async fn update_process_code_change_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/processes/{pid}/update"),
+            &format!("/prod/processes/{pid}/update"),
             Some(json!({"code": "P-NEW", "name": "Renamed"})),
             Some(&token),
         ),
@@ -383,7 +383,7 @@ async fn soft_delete_process_referenced_by_part_returns_20803() {
         app.clone(),
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-IN-USE",
                 "name": "Referenced",
@@ -404,7 +404,7 @@ async fn soft_delete_process_referenced_by_part_returns_20803() {
         app,
         json_request(
             "POST",
-            &format!("/processes/{pid_str}/soft-delete"),
+            &format!("/prod/processes/{pid_str}/soft-delete"),
             None,
             Some(&token),
         ),
@@ -437,7 +437,7 @@ async fn create_process_color_round_trip() {
         app.clone(),
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-COLOR-OK",
                 "name": "Colored",
@@ -455,7 +455,7 @@ async fn create_process_color_round_trip() {
     // 2. fetch by id
     let (s2, env2) = send(
         app,
-        json_request("GET", &format!("/processes/{pid}"), None, Some(&token)),
+        json_request("GET", &format!("/prod/processes/{pid}"), None, Some(&token)),
     )
     .await;
     assert_eq!(s2, StatusCode::OK);
@@ -471,7 +471,7 @@ async fn create_process_no_color_omits_field() {
         app,
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-NOCOLOR",
                 "name": "Plain",
@@ -497,7 +497,7 @@ async fn create_process_invalid_color_rejected() {
         app,
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-BAD",
                 "name": "Bad color",
@@ -530,7 +530,7 @@ async fn update_process_color_tristate() {
         app.clone(),
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-TS",
                 "name": "Tristate",
@@ -548,7 +548,7 @@ async fn update_process_color_tristate() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/processes/{pid}/update"),
+            &format!("/prod/processes/{pid}/update"),
             Some(json!({ "color": "#AABBCCDD" })),
             Some(&token),
         ),
@@ -562,7 +562,7 @@ async fn update_process_color_tristate() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/processes/{pid}/update"),
+            &format!("/prod/processes/{pid}/update"),
             Some(json!({ "color": null })),
             Some(&token),
         ),
@@ -576,7 +576,7 @@ async fn update_process_color_tristate() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/processes/{pid}/update"),
+            &format!("/prod/processes/{pid}/update"),
             Some(json!({ "color": "#FF00FF00" })),
             Some(&token),
         ),
@@ -586,7 +586,7 @@ async fn update_process_color_tristate() {
         app,
         json_request(
             "POST",
-            &format!("/processes/{pid}/update"),
+            &format!("/prod/processes/{pid}/update"),
             Some(json!({ "name": "Renamed" })),
             Some(&token),
         ),
@@ -613,7 +613,7 @@ async fn soft_delete_process_referenced_by_chain_step_returns_20803() {
         app.clone(),
         json_request(
             "POST",
-            "/processes",
+            "/prod/processes",
             Some(json!({
                 "code": "P-STEPREF",
                 "name": "StepRef",
@@ -660,7 +660,7 @@ async fn soft_delete_process_referenced_by_chain_step_returns_20803() {
         app,
         json_request(
             "POST",
-            &format!("/processes/{pid_str}/soft-delete"),
+            &format!("/prod/processes/{pid_str}/soft-delete"),
             None,
             Some(&token),
         ),

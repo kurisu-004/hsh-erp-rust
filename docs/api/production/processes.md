@@ -1,19 +1,19 @@
 # processes 域 API
 
-> 本文件须与 `src/modules/process/{handler.rs,dto.rs,service.rs}` 保持同步
+> 本文件须与 `src/modules/prod/process/{handler.rs,dto.rs,service.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
 ## 端点列表
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/processes` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 列表（过滤 + 分页） |
-| POST | `/api/v2/processes` | MANAGER | 创建工序（INHOUSE/OUTSOURCE） |
-| GET | `/api/v2/processes/{id}` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 工序详情 |
-| POST | `/api/v2/processes/{id}/update` | MANAGER | 部分更新（OCC） |
-| POST | `/api/v2/processes/{id}/soft-delete` | MANAGER | 软删（OCC，被引用时拒） |
+| GET | `/api/v2/prod/processes` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 列表（过滤 + 分页） |
+| POST | `/api/v2/prod/processes` | MANAGER | 创建工序（INHOUSE/OUTSOURCE） |
+| GET | `/api/v2/prod/processes/{id}` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 工序详情 |
+| POST | `/api/v2/prod/processes/{id}/update` | MANAGER | 部分更新（OCC） |
+| POST | `/api/v2/prod/processes/{id}/soft-delete` | MANAGER | 软删（OCC，被引用时拒） |
 
-挂载点：`/api/v2/processes`（见 `src/modules/mod.rs::v2_router`）。
+挂载点：`/api/v2/prod/processes`（见 `src/modules/mod.rs::v2_router`）。
 
 ---
 
@@ -47,7 +47,7 @@
 
 ---
 
-### `GET /api/v2/processes`
+### `GET /api/v2/prod/processes`
 
 权限：已登录（M/C/CNC/SHELF/INSPECTOR；service 层 `require_any_role`）
 
@@ -69,7 +69,7 @@ Response 200 `data`：`ProcessListOut`
 | `limit` | i64 | 回显 |
 | `offset` | i64 | 回显 |
 
-### `POST /api/v2/processes`
+### `POST /api/v2/prod/processes`
 
 权限：MANAGER（service 层 `require_role`）
 
@@ -92,7 +92,7 @@ Response 201 `data`：`ProcessOut`
 - 20104 `BIZ_INVALID_VALUE` — code/name 空 / category 不在 {INHOUSE, OUTSOURCE}
 - 20802 `BIZ_PROCESS_DUPLICATE_CODE` — `uk_t_process_code` 撞唯一索引
 
-### `GET /api/v2/processes/{id}`
+### `GET /api/v2/prod/processes/{id}`
 
 权限：已登录（M/C/CNC/SHELF/INSPECTOR）
 
@@ -108,7 +108,7 @@ Response 200 `data`：`ProcessOut`
 
 - 20801 `BIZ_PROCESS_NOT_FOUND`
 
-### `POST /api/v2/processes/{id}/update`
+### `POST /api/v2/prod/processes/{id}/update`
 
 权限：MANAGER
 
@@ -132,7 +132,7 @@ Response 200 `data`：`ProcessOut`（回读最新版本）
 - 20104 `BIZ_INVALID_VALUE` — code/category 试图改 / name 空
 - 40901 `VERSION_CONFLICT` — 乐观锁冲突（前端需重新 GET 后再试）
 
-### `POST /api/v2/processes/{id}/soft-delete`
+### `POST /api/v2/prod/processes/{id}/soft-delete`
 
 权限：MANAGER
 

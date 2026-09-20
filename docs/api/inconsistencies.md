@@ -195,10 +195,10 @@
 | POST | `/api/v2/parts/batch-to-inspection` | part | 批量送检（Python 仅单件 `/parts/{id}/to-inspection`） |
 | GET / POST | `/api/v2/delivery-groups` | delivery_groups | 送货分组（Rust 新增域） |
 | POST | `/api/v2/delivery-groups/{id}/update` / `soft-delete` | delivery_groups | 同上 |
-| GET | `/api/v2/worker-pool/state` | worker_pool | 工人池状态查询（Rust 新增域） |
-| POST | `/api/v2/admin/worker-pool/refill` | worker_pool | 管理员手动 refill |
-| POST | `/api/v2/admin/worker-pool/remove` | worker_pool | 管理员手动 remove |
-| POST | `/api/v2/admin/worker-pool/auto-allocate` | worker_pool | auto-allocate 批量分配（Phase 2，2026-09-12） |
+| GET | `/api/v2/prod/worker-pool/state` | worker_pool | 工人池状态查询（Rust 新增域） |
+| POST | `/api/v2/prod/admin/worker-pool/refill` | worker_pool | 管理员手动 refill |
+| POST | `/api/v2/prod/admin/worker-pool/remove` | worker_pool | 管理员手动 remove |
+| POST | `/api/v2/prod/admin/worker-pool/auto-allocate` | worker_pool | auto-allocate 批量分配（Phase 2，2026-09-12） |
 | POST | `/api/v2/parts/by-work-type/{wt}` / `pickable-by-work-type/{wt}` / `by-worker/{w}` | part | 工种/工人视角列表（Phase 2） |
 | POST | `/api/v2/parts/{id}/pick-up` | part | B 方案手动 pick-up 兜底（Phase 2） |
 | POST | `/api/v2/parts/{id}/send-to-outsource` / `receive-from-outsource` | part | 派发外协 / 外协回收（Phase 1） |

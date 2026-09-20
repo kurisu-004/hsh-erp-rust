@@ -23,11 +23,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::worker::dto::{
+use crate::modules::prod::worker::dto::{
     VerifyBadgeRequest, WorkerCreateRequest, WorkerListOut, WorkerListQuery, WorkerOut,
     WorkerUpdateRequest,
 };
-use crate::modules::worker::service::WorkerService;
+use crate::modules::prod::worker::service::WorkerService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

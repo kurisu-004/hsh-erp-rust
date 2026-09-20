@@ -16,11 +16,11 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepo;
 use crate::shared::error::{AppError, code};
 
-use crate::modules::process_chain::dto::{
+use crate::modules::prod::process_chain::dto::{
     ProcessChainOut, ProcessChainStepOut, UpsertChainRequest,
 };
-use crate::modules::process_chain::model::{NewProcessChainStep, TPartProcessChain};
-use crate::modules::process_chain::repo::ProcessChainRepo;
+use crate::modules::prod::process_chain::model::{NewProcessChainStep, TPartProcessChain};
+use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 
 pub struct ProcessChainService;
 
@@ -249,7 +249,7 @@ impl ProcessChainService {
 /// 把 row + steps 装成 DTO（service 单一出口，避免重复）。
 fn chain_to_out(
     chain: TPartProcessChain,
-    steps: Vec<crate::modules::process_chain::model::TProcessChainStep>,
+    steps: Vec<crate::modules::prod::process_chain::model::TProcessChainStep>,
 ) -> ProcessChainOut {
     ProcessChainOut {
         id: chain.id,

@@ -1,6 +1,6 @@
 # worker_pool 域 API
 
-> 本文件须与 `src/modules/worker_pool/{handler.rs,dto.rs,service.rs,model.rs}` 保持同步
+> 本文件须与 `src/modules/prod/worker_pool/{handler.rs,dto.rs,service.rs,model.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 范围：工人扫码台（worker-scan）配套的工序候选池管理：
@@ -14,18 +14,18 @@
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/worker-pool/state` | 已登录（无 role guard） | worker 当前持有（含完整 held_batches）+ 工序池候选数（按工序分组） |
-| GET | `/api/v2/worker-pool/{process_id}` | **Manager+Clerk+Inspector** | 按工序返回候选池详情（workers + work_types + 跨货架批次列表） |
-| POST | `/api/v2/admin/worker-pool/refill` | **Manager** | 为指定 worker 抢满 `max_held_batches`（同事务） |
-| POST | `/api/v2/admin/worker-pool/remove` | **Manager** | 把 worker 持有批次按 RETURNED 语义放回候选池 |
-| POST | `/api/v2/admin/worker-pool/auto-allocate` | **Manager** | 按 process + shelf 自动为多个 worker 抢批次数 / 累计工时（COUNT/TIME 模式 × fill_ratio） |
-| POST | `/api/v2/admin/worker-pool/assign` | **Manager** | 单 batch 拖拽分配（不循环触顶 max_held；用于 UI 单 batch 拖拽场景） |
+| GET | `/api/v2/prod/worker-pool/state` | 已登录（无 role guard） | worker 当前持有（含完整 held_batches）+ 工序池候选数（按工序分组） |
+| GET | `/api/v2/prod/worker-pool/{process_id}` | **Manager+Clerk+Inspector** | 按工序返回候选池详情（workers + work_types + 跨货架批次列表） |
+| POST | `/api/v2/prod/admin/worker-pool/refill` | **Manager** | 为指定 worker 抢满 `max_held_batches`（同事务） |
+| POST | `/api/v2/prod/admin/worker-pool/remove` | **Manager** | 把 worker 持有批次按 RETURNED 语义放回候选池 |
+| POST | `/api/v2/prod/admin/worker-pool/auto-allocate` | **Manager** | 按 process + shelf 自动为多个 worker 抢批次数 / 累计工时（COUNT/TIME 模式 × fill_ratio） |
+| POST | `/api/v2/prod/admin/worker-pool/assign` | **Manager** | 单 batch 拖拽分配（不循环触顶 max_held；用于 UI 单 batch 拖拽场景） |
 
-> 路由挂载：`/worker-pool/state` 走 `/api/v2/worker-pool`，admin 端点走 `/api/v2/admin/worker-pool`（见 `src/modules/worker_pool/mod.rs`）。
+> 路由挂载：`/worker-pool/state` 走 `/api/v2/prod/worker-pool`，admin 端点走 `/api/v2/prod/admin/worker-pool`（见 `src/modules/prod/worker_pool/mod.rs`）。
 
 ---
 
-### `GET /api/v2/worker-pool/state`
+### `GET /api/v2/prod/worker-pool/state`
 
 权限: 已登录（**无 role guard** —— worker 自查 + admin 监控共用；admin 监控可传任意 `worker_id`）
 
@@ -44,7 +44,7 @@ Response 200 `data`：[`WorkerPoolState`](#workerpoolstate-字段)
 
 > 端点不要求 worker.work_type_id 已设置；`max_held` 退化为 0、`process_ids` 为空、`capacity_remaining=0`、`pool_count_by_process=[]`（前端应展示「工种未设置」占位）。
 
-### `POST /api/v2/admin/worker-pool/refill`
+### `POST /api/v2/prod/admin/worker-pool/refill`
 
 权限: **Manager**
 
@@ -81,7 +81,7 @@ WS 广播（commit 后下发）：
 - `taken.len() > 0` → `WORKER_POOL_REFILL_DONE`（payload = `RefillResult`）
 - `pool_empty=true` 且 `taken=[]` → `WORKER_POOL_EMPTY`（payload `{ worker_id, shelf_id }`）
 
-### `POST /api/v2/admin/worker-pool/remove`
+### `POST /api/v2/prod/admin/worker-pool/remove`
 
 权限: **Manager**
 
@@ -119,7 +119,7 @@ WS 广播（commit 后下发）：
 
 - `WORKER_POOL_ADMIN_REMOVED`（payload = `TakenItem`）
 
-### `GET /api/v2/worker-pool/{process_id}`
+### `GET /api/v2/prod/worker-pool/{process_id}`
 
 权限：**Manager + Clerk + Inspector**（`current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])` —— admin 视角但不止 Manager；不指定 shelf_id，返回所有货架）。
 
@@ -144,7 +144,7 @@ Response 200 `data`：[`ProcessPoolDetail`](#processpooldetail-字段)
 - 20801 BIZ_PROCESS_NOT_FOUND — process_id 不存在 / 已软删
 - 40300 FORBIDDEN — 角色不在 Manager+Clerk+Inspector 集合内
 
-### `POST /api/v2/admin/worker-pool/auto-allocate`
+### `POST /api/v2/prod/admin/worker-pool/auto-allocate`
 
 权限: **Manager**（`current.require_role(Role::Manager)`）
 
@@ -191,7 +191,7 @@ WS 广播（commit 后下发）：
 
 - 始终 → `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`，前端按 `pool_empty + filled` 综合判断）
 
-### `POST /api/v2/admin/worker-pool/assign`
+### `POST /api/v2/prod/admin/worker-pool/assign`
 
 权限: **Manager**
 
@@ -452,5 +452,5 @@ WS 广播（commit 后下发）：
 ## 参考
 
 - 集成测试：`tests/worker_pool_api.rs` / `tests/worker_pool_auto_allocate_api.rs`
-- 仓库分层：`src/modules/worker_pool/handler.rs` (axum) → `service.rs` (业务) → `repo.rs` (SQL)
+- 仓库分层：`src/modules/prod/worker_pool/handler.rs` (axum) → `service.rs` (业务) → `repo.rs` (SQL)
 - 错误码：`src/shared/error.rs::code`（20104 / 20109 / 20114 / 20201 / 20202 / 20204 / 20206 / 20901 / 20904 / 20905 / 20703 / 20704 / 40001 / 40300 / 40901）

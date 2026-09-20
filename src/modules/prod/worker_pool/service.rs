@@ -23,10 +23,10 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;
 use crate::modules::part_batch::repo::PartBatchRepo;
-use crate::modules::process::repo::ProcessRepo;
-use crate::modules::process_chain::repo::ProcessChainRepo;
-use crate::modules::work_type::repo::WorkTypeRepo;
-use crate::modules::worker::repo::WorkerRepo;
+use crate::modules::prod::process::repo::ProcessRepo;
+use crate::modules::prod::process_chain::repo::ProcessChainRepo;
+use crate::modules::prod::work_type::repo::WorkTypeRepo;
+use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
 use super::dto::{
@@ -384,7 +384,7 @@ impl WorkerPoolService {
         process_id: i64,
     ) -> Result<ProcessPoolDetail, AppError> {
         use crate::auth::rbac::Role;
-        use crate::modules::process::repo::ProcessRepo;
+        use crate::modules::prod::process::repo::ProcessRepo;
 
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 

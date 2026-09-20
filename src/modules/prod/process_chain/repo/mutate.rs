@@ -6,7 +6,7 @@
 use sqlx::{PgConnection, PgExecutor, QueryBuilder};
 
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::process_chain::model::{NewProcessChainStep, TPartProcessChain};
+use crate::modules::prod::process_chain::model::{NewProcessChainStep, TPartProcessChain};
 
 use super::ProcessChainRepo;
 

@@ -16,9 +16,9 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::process::dto::*;
-use crate::modules::process::model::TProcess;
-use crate::modules::process::repo::ProcessRepo;
+use crate::modules::prod::process::dto::*;
+use crate::modules::prod::process::model::TProcess;
+use crate::modules::prod::process::repo::ProcessRepo;
 use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;

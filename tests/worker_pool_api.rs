@@ -564,7 +564,7 @@ async fn refill_when_pool_empty_returns_empty() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/refill",
+            "/prod/admin/worker-pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -586,7 +586,7 @@ async fn refill_when_pool_empty_returns_empty() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/refill",
+            "/prod/admin/worker-pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -624,7 +624,7 @@ async fn refill_caps_at_max_held_batches() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/refill",
+            "/prod/admin/worker-pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -676,7 +676,7 @@ async fn refill_respects_shelf_scope() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/refill",
+            "/prod/admin/worker-pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": shelf_a.to_string(),
@@ -759,7 +759,7 @@ async fn take_updates_t_part_holder() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/refill",
+            "/prod/admin/worker-pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -824,7 +824,7 @@ async fn take_does_not_update_placed_at() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/refill",
+            "/prod/admin/worker-pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -940,7 +940,7 @@ async fn admin_refill_endpoint_works() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/refill",
+            "/prod/admin/worker-pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -977,7 +977,7 @@ async fn admin_remove_returns_batch_to_pool() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/remove",
+            "/prod/admin/worker-pool/remove",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "batch_id": held_batch.to_string(),
@@ -1049,7 +1049,7 @@ async fn max_held_null_returns_error() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/refill",
+            "/prod/admin/worker-pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1086,7 +1086,7 @@ async fn worker_no_work_type_returns_error() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/refill",
+            "/prod/admin/worker-pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1169,7 +1169,7 @@ async fn pool_by_process_happy() {
     // 注意：`tests/common::test_app` 用 `v2_router()`（不带 `/api/v2` nest，
     // 与 main.rs `nest("/api/v2", v2_router())` 不一样），所以测试 URI
     // 是 `/worker-pool/{id}` 而不是 `/api/v2/worker-pool/{id}`。
-    let uri = format!("/worker-pool/{proc}");
+    let uri = format!("/prod/worker-pool/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "pool_by_process happy: {env}");
     assert_eq!(env["code"], 0, "code 应 0: {env}");
@@ -1226,7 +1226,7 @@ async fn pool_by_process_process_not_found() {
     let nonexistent_id: i64 = 9_999_999_999_999;
 
     let (app, token, _pool) = login_manager(pool.clone(), "admin_nf").await;
-    let uri = format!("/worker-pool/{nonexistent_id}");
+    let uri = format!("/prod/worker-pool/{nonexistent_id}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "不存在 process 应 404: {env}");
     assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
@@ -1244,7 +1244,7 @@ async fn pool_by_process_forbidden_for_shelf_account() {
     // ShelfAccount 绑一个 shelf（scope 必须给才能登录；调用端点时仍会被 service 拒绝）
     let (app, token, _pool) =
         login_shelf_account(pool.clone(), "shelf_user_fb", &[prod_shelf]).await;
-    let uri = format!("/worker-pool/{proc}");
+    let uri = format!("/prod/worker-pool/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
@@ -1260,7 +1260,7 @@ async fn pool_by_process_no_candidates_when_no_batch() {
     let _w = insert_worker(&pool, "BC-EMPTY", "空工人", Some(wt)).await;
 
     let (app, token, _pool) = login_manager(pool.clone(), "admin_empty").await;
-    let uri = format!("/worker-pool/{proc}");
+    let uri = format!("/prod/worker-pool/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "无 batch 应 200: {env}");
     assert_eq!(env["code"], 0, "code 应 0: {env}");
@@ -1340,7 +1340,7 @@ async fn admin_assign_happy_path() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/assign",
+            "/prod/admin/worker-pool/assign",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "batch_id": pool_batch.to_string(),
@@ -1430,7 +1430,7 @@ async fn admin_assign_capacity_exceeded() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/assign",
+            "/prod/admin/worker-pool/assign",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "batch_id": extra_batch.to_string(),
@@ -1491,7 +1491,7 @@ async fn admin_assign_batch_not_in_pool() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/assign",
+            "/prod/admin/worker-pool/assign",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "batch_id": batch_a.to_string(),
@@ -1554,7 +1554,7 @@ async fn admin_assign_process_id_mismatch() {
         app,
         json_request(
             "POST",
-            "/admin/worker-pool/assign",
+            "/prod/admin/worker-pool/assign",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "batch_id": batch.to_string(),

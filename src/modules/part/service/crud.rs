@@ -35,7 +35,7 @@ use crate::modules::part_batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
-use crate::modules::process_chain::repo::ProcessChainRepo;
+use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 

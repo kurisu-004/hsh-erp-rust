@@ -23,7 +23,7 @@ use crate::modules::part::dto::{
 };
 use crate::modules::part::dto_crud::{ScanDeliverPartRequest, ScanInspectRequest};
 use crate::modules::part::service::{BATCH_TO_SHIP_MAX_ITEMS, PartService};
-use crate::modules::worker_pool::service::WorkerPoolService;
+use crate::modules::prod::worker_pool::service::WorkerPoolService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

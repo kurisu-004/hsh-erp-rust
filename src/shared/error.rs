@@ -13,6 +13,12 @@
 //!   211xx 零件文件、212xx 外协公司、213xx 外协报价、214xx 送货单、215xx 外协发货、
 //!   216xx 上传会话（Redis 共享 STS 凭证机制）。
 //!
+//!   错误码段位归属（2026-09-19 prod 聚合后）：
+//!   - `prod::worker` / `prod::worker_pool` → `202xx` 工人段（共享；worker_pool 的 `WORKER_POOL_EMPTY`/`NO_WORK_TYPE` 等复用 `20205`/`20206`）
+//!   - `prod::process_chain` → `207xx` 工艺链段
+//!   - `prod::process` → `208xx` 工序段
+//!   - `prod::work_type` → `209xx` 工种段
+//!
 //! ### 与 Python 的差异（冲突解决记录）
 //! - `20109` 在 Python 中被 `BIZ_PART_BATCH_NOT_FOUND` 与 `BIZ_CUSTOMER_IN_USE` 双重占用。
 //!   Rust 中 `20109` 保留给 `BIZ_PART_BATCH_NOT_FOUND`，`BIZ_CUSTOMER_IN_USE` 移到新槽位 `20113`。

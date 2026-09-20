@@ -19,7 +19,7 @@
 use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::process::repo::ProcessRepo;
+use crate::modules::prod::process::repo::ProcessRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::*;

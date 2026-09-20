@@ -17,10 +17,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::process::dto::{
+use crate::modules::prod::process::dto::{
     ProcessCreateRequest, ProcessListOut, ProcessListQuery, ProcessOut, ProcessUpdateRequest,
 };
-use crate::modules::process::service::ProcessService;
+use crate::modules::prod::process::service::ProcessService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
