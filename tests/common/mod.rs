@@ -1,31 +1,36 @@
 //! 集成测试共享基建
 //!
-//! 2026-09-20 起改为 `ephemeral-postgres`（底层 testcontainers + docker daemon）：
-//! 每个 integration test binary 进程内复用 1 个 `Cluster`（postgres:18-alpine
-//! 容器），每次 `test_pool()` 调用在 cluster 上 `create_database()` 拿一个**独立**
-//! 数据库 → 跑 `sqlx::migrate!` → 返回 `PgPool`。这从源头消除两个 flaky：
+//! 2026-09-20 重大重构：自定义 bash runner 接管 PG 容器生命周期（替代原 `ephemeral-postgres`）。
 //!
-//! - 根因 #1：`TEST_SNOWFLAKE_GEN` 跨 binary 共享 (epoch, instance=1) 撞 ID
-//!   → 各 binary 现在跑在各自的 PG 容器里，`pool_snowflake()` 仍复用 instance=1，
-//!   但 snowflake ID 仅在进程内 / 数据库内有意义，跨进程不再撞
-//! - 根因 #2：原 `postgres-test` 单库被 36 binary 共享 → TRUNCATE 残留 +
-//!   `_sqlx_migrations` 状态串号 → 现每测试 fresh database
+//! ## 两层隔离模型（新架构）
 //!
-//! 集群复用策略（trade-off）：
-//! 用 `tokio::sync::OnceCell<Cluster>` 进程内复用 cluster；`test_pool()` 每次
-//! 调 `cluster.create_database()` 拿独立 DB。这样同 binary 内多测试只起一次容器，
-//! 避免 36 binary × N tests = 数百容器同时跑撑爆本机。代价：进程退出时
-//! `Cluster` 永不被 drop，docker daemon 清理 anonymous container。
+//! ### Layer 1：容器生命周期 —— bash runner + trap EXIT
+//! - `.cargo/config.toml` 的 `target.<cfg>.runner = "scripts/test_runner.sh"` 让每个
+//!   integration test binary 启动前由 bash runner 起一个 `postgres:18-alpine` 容器，
+//!   把容器 ID 绑到 shell `trap EXIT` —— binary 进程退出（无论正常 / panic / 信号）
+//!   都强制 `docker rm -f`，**零 Rust Drop 依赖**。
+//! - 4 个转义口：TEST_DATABASE_BASE_URL 已注入 / `--list` / 非 deps 路径（cargo run
+//!   主 binary）/ hsh_erp_rust-*（lib/bin 单测）。详见 scripts/test_runner.sh。
+//! - nextest session 模式：scripts/test_nextest.sh 起 1 个 session 级容器（绕过
+//!   per-test 容器开销），binary 启动时走转义口 1 复用。
 //!
-//! 已知限制：
+//! ### Layer 2：每测试 fresh database —— test_pool() 内部
+//! - `fresh_database_url()` 在 runner 起好的容器上 CREATE DATABASE test_<uuid>，
+//!   返回独立 URL → `sqlx::migrate!` → 返回 PgPool。容器内多 db 共享，但 db 间
+//!   schema 完全独立 → 彻底消除 TRUNCATE 残留 / `_sqlx_migrations` 状态串号。
+//!
+//! ### Snowflake ID 隔离（新增 2026-09-20）
+//! - `test_snowflake_instance()` 用 pid ⊕ startup_nanos 派生 0-1023 unique instance，
+//!   替代原固定 `instance=1` → 消除 nextest 并行下跨进程 user_id 撞 key（redis session key）。
+//!
+//! ## 已知限制
 //! - 需要 docker daemon 在 PATH 且能 pull `postgres:18-alpine`
-//! - 建议 `RUST_TEST_THREADS=4`（默认 256 会瞬间拉起几十个容器）
-//! - `Database` 无 `Drop` 实现 → 单次 cargo test 跑完会在 cluster 容器里留下
-//!   几十个 `test_<uuid>` 库，进程退出后随容器被 docker daemon 回收
+//! - 跑 `cargo test` 时建议 `RUST_TEST_THREADS=4`（.cargo/config.toml 已强制），
+//!   或用 cargo-nextest 跑（scripts/test_nextest.sh —— 推荐路径）
 //!
-//! 每个集成测试用例的惯用开头（保持与原 helper 接口一致）：
+//! ## 惯用开头（保持与原 helper 接口一致）
 //! ```ignore
-//! ensure_database_exists().await; // 现在是 no-op（保留仅为不让 caller 报错）
+//! ensure_database_exists().await; // no-op（保留仅为不让 caller 报错）
 //! let pool = test_pool().await;
 //! clean_db(&pool).await;
 //! clean_redis(&redis_pool).await;  // 如需
@@ -59,10 +64,6 @@ use tokio_util::sync::CancellationToken;
 use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::{Config as RedisConfig, Pool as RedisPool, Runtime as RedisRuntime};
 
-use ephemeral_postgres::cluster::Cluster;
-use ephemeral_postgres::cluster_params::ClusterParams;
-use ephemeral_postgres::postgres_image::PostgresImage;
-
 use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
     AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, RedisConfig as AppRedisConfig,
@@ -81,65 +82,57 @@ use std::sync::OnceLock;
 /// 全局共享 snowflake 生成器（PR-3 测试 helper 批量插入时使用）；
 /// 多个 helper 在同一毫秒调用不再产生冲突 ID（避免 shelf_id == process_id 等碰撞）。
 ///
-/// 2026-09-20：仍保留 (epoch=1_577_836_800_000, instance=1)，各 integration test
-/// binary 现在跑在各自独立的 ephemeral PG 容器里（见 `CLUSTER` + `test_pool`），
-/// 所以进程内不再撞 ID、跨进程也不再撞。无需 per-instance 派生。
+/// 2026-09-20：instance 改为 `test_snowflake_instance()` 派生（pid ⊕ 启动纳秒），
+/// 取代固定 `instance=1`。nextest process-per-test 模型下，跨进程并行若共享
+/// instance=1 会撞 redis session key（sessions:user:{id} 等）。
 static TEST_SNOWFLAKE_GEN: OnceLock<std::sync::Mutex<SnowflakeIdGenerator>> = OnceLock::new();
 pub fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
-    TEST_SNOWFLAKE_GEN
-        .get_or_init(|| std::sync::Mutex::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1)))
+    TEST_SNOWFLAKE_GEN.get_or_init(|| {
+        std::sync::Mutex::new(SnowflakeIdGenerator::new(
+            1_577_836_800_000,
+            test_snowflake_instance(),
+        ))
+    })
+}
+
+/// per-process snowflake instance：pid ⊕ 启动时间纳秒低位 → 0-1023。
+///
+/// 2026-09-20 新增：nextest process-per-test 模型下，同毫秒并行的多个测试进程若
+/// 共享 (epoch, instance=1) 会生成相同 user_id → 撞 redis key（sessions:user:{id} /
+/// upload_session:{id}:{scope}）。pid 与 startup_nanos 的低位异或后 mod 1024 即可在
+/// 1024 个并行进程内几乎无碰撞；实现零依赖（不引入 fnv crate）。
+fn test_snowflake_instance() -> u16 {
+    static INSTANCE: OnceLock<u16> = OnceLock::new();
+    *INSTANCE.get_or_init(|| {
+        let pid = std::process::id() as u64;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64;
+        ((pid ^ nanos) % 1024) as u16
+    })
 }
 use hsh_erp_rust::state::AppState;
 
-/// 2026-09-20 起：每个 integration test binary 进程内复用的 ephemeral PG cluster。
+/// 2026-09-20：fresh database URL —— 在 runner 已起好的容器上 CREATE DATABASE。
 ///
-/// 用 `tokio::sync::OnceCell`（异步 init：`Cluster::start` 是 async fn）。整个
-/// binary 只起一次容器，每次 `test_pool()` 在 cluster 上 `create_database()`
-/// 拿独立 db。这样：
-/// - 同 binary 多测试 → 1 个 cluster + N 个独立 db
-/// - 跨 binary → 互不可见（隔离 snowflake / TRUNCATE 残留 / `_sqlx_migrations` 状态）
+/// 容器由 scripts/test_runner.sh（或 scripts/test_nextest.sh session 级）提前
+/// 起好，通过 `TEST_DATABASE_BASE_URL` 注入（形如 `postgres://postgres:postgres@127.0.0.1:<port>`）。
 ///
-/// trade-off：Cluster 放在 static 里永不被 Drop；进程退出时 docker daemon 清理
-/// anonymous container（ephemeral-postgres 不带 SIGINT watchdog）。如果哪天
-/// 跑 `cargo test` 后看到遗留 container，可手动 `docker ps -a | grep ephemeral`
-/// + `docker rm`。
-static CLUSTER: tokio::sync::OnceCell<Cluster> = tokio::sync::OnceCell::const_new();
-
-/// 进程内取 cluster（首次调用拉起 postgres:18-alpine 容器）。
-async fn cluster() -> &'static Cluster {
-    CLUSTER
-        .get_or_init(|| async {
-            Cluster::start(ClusterParams::new(PostgresImage::new(
-                "postgres",
-                "18-alpine",
-            )))
-            .await
-            .expect(
-                "start ephemeral postgres cluster (确认 docker daemon 在跑且能 pull postgres:18-alpine)",
-            )
-        })
-        .await
-}
-
-/// 2026-09-20：自建 admin pool。`ephemeral-postgres::Cluster::create_database()`
-/// 内部用的 admin pool 是 `max_connections=5`，且 acquire_timeout 是从 init
-/// 倒推的「剩余时间」（首次 init 完成后通常 ~30s）。但实测发现：auth_middleware
-/// 等做大量 SQL 的测试跑完后，下一次 `create_database()` 报 `PoolTimedOut` ——
-///
-/// 可能原因（推测）：前一个测试持有的 PgPool 异步 drop 时，sqlx 给 PG 发的
-/// terminate 包在 docker bridge 上延迟，导致 admin pool 新拿到的连接也被
-/// 算入 Postgres 后端进程数 → admin pool 的 5 个连接被 postgres backend
-/// 进程数上限挤出。
-///
-/// workaround：直接绕过 `Cluster::create_database()`，每次 test_pool() 临时
-/// 新建一个 admin pool（max_connections=10 + 长 acquire_timeout）跑一次
-/// `CREATE DATABASE` 后立刻 drop。开销约 50ms（TCP+auth），可接受。
-async fn fresh_database_url(cluster: &Cluster) -> String {
-    let admin_url = format!("{}/postgres", cluster.base_url());
+/// `max_connections(10) → 2`（plan §4 B7 调整）：admin pool 只跑一条 CREATE
+/// DATABASE；nextest 8 并行下 8×(2 admin + 10 test pool + 迁移连接) ≈ 120
+/// 连接 < session 容器 max_connections=500 上限。`Cluster::create_database()`
+/// 内部 admin pool 的 5 连接 PoolTimedOut 问题不再存在（已经不走那个 API）。
+async fn fresh_database_url() -> String {
+    let base_url = std::env::var("TEST_DATABASE_BASE_URL").expect(
+        "TEST_DATABASE_BASE_URL 未设置 —— 经 `cargo test` 运行（runner 自动注入）；\
+         或手动 export 指向 postgres-test：\
+         postgres://hsh_test:6065161test@localhost:5429",
+    );
     let admin = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&admin_url)
+        .connect(&format!("{base_url}/postgres"))
         .await
         .expect("connect ephemeral admin pool");
     let db_name = format!("test_{}", uuid::Uuid::new_v4().simple());
@@ -151,18 +144,15 @@ async fn fresh_database_url(cluster: &Cluster) -> String {
     .expect("CREATE DATABASE on ephemeral admin pool");
     // admin pool 在函数末尾 drop，PG 后端进程立即关闭。
     drop(admin);
-    format!("{}/{db_name}", cluster.base_url())
+    format!("{base_url}/{db_name}")
 }
 
 /// 测试 DB URL：仅作 `AppConfig.database_url` 字段占位。**实际连接走 caller 传入
 /// 的 `PgPool`**，测试路径不经过 `infra/db.rs::create_pool`，所以本返回值是否
 /// 「合法」无关紧要 —— 永远不会被任何代码 dial。
 ///
-/// 2026-09-20 review：早先版本试图用 `set_test_database_url()` 把 ephemeral db URL
-/// 写进静态变量供本函数读，但 `set_test_database_url` 写的是另一个独立的
-/// `static URL`（函数作用域不同），本函数从自己作用域的 `static URL` 读永远拿不到，
-/// 形成 dead store。已删 `set_test_database_url` + 对应 `static URL`，本函数改为
-/// 固定占位字符串。
+/// 2026-09-20：保留固定占位字符串。runner 起容器 + test_pool() 走 fresh_database_url()
+/// 派生真 URL，AppConfig 这一字段值不再被任何代码实际读取。
 fn test_database_url() -> String {
     "postgres://ephemeral/pending".to_string()
 }
@@ -170,51 +160,78 @@ fn test_database_url() -> String {
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
 const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
 
-/// 测试用 Redis URL：默认连 `redis-test` 容器（端口6380），db index 用
-/// `CARGO_BIN_NAME` 派生（替代原固定 db=15）。跨 binary 隔离 session key；
-/// 同 binary 内多线程仍共享 → clean_redis() 的 FLUSHDB 必须在每个需要
-/// session 的测试前调。
+/// 测试用 Redis URL：默认连 `redis-test` 容器（端口6380），db index 用测试
+/// binary 名派生（替代原固定 db=15）。跨 binary 隔离 session key；同 binary
+/// 内多线程仍共享 → clean_redis() 的 FLUSHDB 必须在每个需要 session 的测试
+/// 前调。
 ///
-/// 派生算法：FNV-1a hash mod 16（0..=15）。约 36 binary → 多数 binary 落
-/// 不同 db，少量 hash collision 不可避免，但所有用 session 的测试都先
-/// `clean_redis`，碰撞不致污染。
+/// 2026-09-20 race #2 修复：3 个 FLUSHDB binary（_e2e_api / auth_middleware /
+/// iam_api）分配**固定独占** db（13/14/15），其它 binary 走 FNV-1a hash mod 13
+/// 派生。理由：nextest 跨 binary 并行下，这 3 个 binary 的 setup 调 FLUSHDB
+/// 会杀其它并行测试的 session → 40105 SESSION_REVOKED flake。即便走
+/// `.config/nextest.toml` 的 `test-group = "redis-flush"` + max-threads=1 串行
+/// 仍可能因 hash collision 误清空其它 binary 的 db（derive 算法 hash bin 名
+/// 可能落到 13/14/15 之一）；固定独占 db 从源头断绝冲突。
+///
+/// 来源选择：nextest 下 `CARGO_BIN_NAME` 是测试 binary 名（"iam_api"），
+/// 但保险起见改用 `std::env::current_exe()` 解析文件名（rust test binary 路径
+/// 形如 `target/debug/deps/iam_api-<hash>`），对两种调用模式（cargo test 与
+/// cargo nextest run）都生效。
 ///
 /// 可由 `TEST_REDIS_URL` 环境变量整体覆盖（跨 worktree 隔离用）。
 pub fn test_redis_url() -> String {
     if let Ok(url) = std::env::var("TEST_REDIS_URL") {
         return url;
     }
-    let bin = std::env::var("CARGO_BIN_NAME").unwrap_or_else(|_| "default".to_string());
-    let db_index = redis_db_index(&bin);
+    let bin = current_test_binary_name();
+    let db_index = match bin.as_str() {
+        "_e2e_api" => 13,
+        "auth_middleware" => 14,
+        "iam_api" => 15,
+        _ => redis_db_index(&bin) % 13,
+    };
     format!("redis://localhost:6380/{db_index}")
 }
 
+/// 取当前测试 binary 名（去掉 cargo 注入的 hash 后缀）。
+///
+/// nextest 下 binary 路径形如 `target/debug/deps/iam_api-<16hex>`；
+/// 解析出 `iam_api` 这部分作为 caller 路由 db index 的依据。
+fn current_test_binary_name() -> String {
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("default"));
+    let stem = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("default");
+    // binary 名形如 "iam_api-3f4a5b6c7d8e9f01" → 切 '-' 取首段
+    stem.split('-').next().unwrap_or("default").to_string()
+}
+
+/// FNV-1a 32-bit hash（手写，避开新增 fnv crate 依赖）。
 fn redis_db_index(bin: &str) -> u8 {
-    // FNV-1a 32-bit hash → mod 16（redis 默认支持 db 0..=15）。
     let mut h: u32 = 0x811c_9dc5;
     for b in bin.as_bytes() {
         h ^= *b as u32;
         h = h.wrapping_mul(0x0100_0193);
     }
-    (h % 16) as u8
+    (h % 256) as u8
 }
 
-/// 2026-09-20 起为 no-op：ephemeral-postgres 每次 `test_pool()` 都建独立 db，
-/// 不需要预创建共享库。保留函数签名仅为不让 caller 报错。
+/// 2026-09-20 起为 no-op：runner 已起容器 + `fresh_database_url()` 每次 `test_pool()`
+/// 都建独立 db，不需要预创建共享库。保留函数签名仅为不让 caller 报错。
 pub async fn ensure_database_exists() {
-    // no-op：cluster + database 由 test_pool() 内部管理
+    // no-op：容器由 runner 起，database 由 test_pool() 内部 fresh_database_url() 派生
 }
 
-/// 建测试连接池：从进程内 `CLUSTER` 派生一个 fresh database + 跑全部迁移。
+/// 建测试连接池：从 runner 已起好的容器派生一个 fresh database + 跑全部迁移。
 ///
-/// 各 binary 独立 PG 实例 → 各 binary 独立 snowflake instance=1 不再撞键；
-/// 独立 database → TRUNCATE 残留 / `_sqlx_migrations` 状态不串号。
+/// 两层隔离：
+/// - 容器：runner 进程级 1 个（同进程多测试共享容器，但 DB 独立）
+/// - 数据库：每测试 fresh database → TRUNCATE 残留 / `_sqlx_migrations` 状态不串号
+/// - snowflake instance：per-process 派生（test_snowflake_instance）→ 跨进程不撞 ID
 pub async fn test_pool() -> PgPool {
-    let cluster = cluster().await;
-
-    // 1) fresh database URL —— 临时 admin pool 跑 CREATE DATABASE 后立即 drop，
-    //    避免 Cluster::create_database 自带 admin pool 的连接瓶颈。
-    let db_url = fresh_database_url(cluster).await;
+    // 1) fresh database URL —— 临时 admin pool 跑 CREATE DATABASE 后立即 drop。
+    let db_url = fresh_database_url().await;
 
     // 2) Open 一个 PgPool 指向新 db（max_connections=10 足够测试）。
     let pool = PgPoolOptions::new()
@@ -330,7 +347,9 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
-            instance: 1,
+            // 2026-09-20：per-process instance（pid ⊕ 启动纳秒 mod 1024），
+            // 替代原固定 1，消除 nextest 跨进程并行撞 snowflake ID（详见 test_snowflake_instance）。
+            instance: test_snowflake_instance(),
         },
         redis: AppRedisConfig {
             url: test_redis_url(),
@@ -420,7 +439,9 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
-            instance: 1,
+            // 2026-09-20：per-process instance（pid ⊕ 启动纳秒 mod 1024），
+            // 替代原固定 1，消除 nextest 跨进程并行撞 snowflake ID（详见 test_snowflake_instance）。
+            instance: test_snowflake_instance(),
         },
         redis: AppRedisConfig {
             url: test_redis_url(),
@@ -525,7 +546,9 @@ pub async fn test_state_with_cos(
         },
         snowflake: SnowflakeConfig {
             epoch_ms: 1_577_836_800_000,
-            instance: 1,
+            // 2026-09-20：per-process instance（pid ⊕ 启动纳秒 mod 1024），
+            // 替代原固定 1，消除 nextest 跨进程并行撞 snowflake ID（详见 test_snowflake_instance）。
+            instance: test_snowflake_instance(),
         },
         redis: AppRedisConfig {
             url: test_redis_url(),

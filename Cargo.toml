@@ -15,8 +15,10 @@ path = "src/lib.rs"
 #   barcoders                     —— Code128 条码
 #   rmcp                          —— MCP Streamable HTTP（远期）
 #
-# 集成测试 PG 基建：见 [dev-dependencies] 的 `ephemeral-postgres`，替代原
-# testcontainers-rs 占位注释（2026-09-20）。
+# 集成测试 PG 基建：见 [dev-dependencies] 下方注释 + scripts/test_runner.sh。
+# 容器生命周期由 .cargo/config.toml runner 接管（绑到 binary 进程，shell trap EXIT 清理），
+# 不依赖任何 testcontainers 库；2026-09-20 起替代原 `ephemeral-postgres` crate
+# （后者把 Cluster 放 static OnceCell → docker 容器永不释放，已堆 128 个）。
 # ---------------------------------------------------------------------------------
 
 [dependencies]
@@ -125,15 +127,26 @@ uuid = { version = "1", features = ["v4"] }
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。
 tower = { version = "0.5", features = ["util"] }
 
-# 2026-09-20 新增：ephemeral-postgres 给每个 integration test binary 拉起独立
-# postgres:18-alpine 容器 + 每测试 fresh database，从源头消除以下两个 flaky：
-#   - 根因 #1：原 `TEST_SNOWFLAKE_GEN` 跨 binary 共享 (epoch, instance=1) 撞 ID
-#   - 根因 #2：原 postgres-test 共享 docker 容器（库 postgres_rust_test 36 binary 共用）
-#     导致 TRUNCATE 残留 + _sqlx_migrations 状态串号
-# 各 binary 走 `OnceCell<Cluster>` 复用 cluster、`test_pool()` 每次 `create_database()`
-# 拿独立 db；进程退出时 docker daemon 清理 anonymous container（无 SIGINT watchdog）。
-# 建议：跑集成测试时显式限速 `RUST_TEST_THREADS=4`（默认 256 会瞬间拉起几十个 PG 容器）。
-ephemeral-postgres = "0.3"
+# 2026-09-20 重大重构：去掉 `ephemeral-postgres` 依赖，改用自定义 bash runner 方案。
+# 背景：ephemeral-postgres 0.3 把 Cluster 放在 `static OnceCell<Cluster>`，
+# Rust static 永不 Drop → docker 容器永不释放（用户实测已堆 128 个 postgres:18-alpine）。
+#
+# 新方案架构（两层隔离模型）：
+# 1) .cargo/config.toml 的 `runner = "scripts/test_runner.sh"` 接管每个 integration
+#    test binary 的 PG 容器生命周期 —— shell `trap EXIT` 强制清理，零 Rust Drop 依赖。
+# 2) nextest session 模式：scripts/test_nextest.sh 起 1 个 session 级容器，
+#    每个测试 fresh database（test_pool() 内部 CREATE DATABASE test_<uuid>）。
+#
+# 两层都消除了原方案的两个 flaky 根因：
+#   - 根因 #1：跨 binary 共享 (epoch, instance=1) 撞 snowflake ID →
+#     现在每进程用 pid⊕nanos 派生唯一 instance（test_snowflake_instance()）
+#   - 根因 #2：原 postgres-test 单库被 36 binary 共享 → TRUNCATE 残留 +
+#     _sqlx_migrations 状态串号 → 现每测试 fresh database
+#
+# 进程内 binary 限速仍走 RUST_TEST_THREADS=4（同 .cargo/config.toml），
+# nextest 模式下由 .config/nextest.toml 的 test-threads=8 控制。
+# 历史注解（已删）保留了 ephemeral-postgres 0.3 方案的注释；现方案不需要任何
+# testcontainers 库依赖。
 
 # 2026-09-18 auth+user DI 重构（Wave 1A/T1）：service 单测在 src/modules/{auth,user}/service_tests.rs
 # 用 mockall 对 repo trait / SessionStore / UowProvider 做 automock；测试零数据库依赖。

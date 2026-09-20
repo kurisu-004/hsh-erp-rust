@@ -35,6 +35,18 @@ cargo run                   # 需先 cp .env.example .env 并起 postgres-dev
 
 ./scripts/sqlx_prepare.sh   # 每次 query! 宏改动后必须重跑，生成 .sqlx/query-*.json 并提交
 SQLX_OFFLINE=true cargo build --release   # CI/Docker 用离线元数据构建
+
+# 一次性安装 nextest
+cargo install cargo-nextest --locked
+
+# 全量并行测试（推荐；走 test_nextest.sh 起 session 级容器 + per-test database）
+scripts/test_nextest.sh
+
+# 单个 binary 调试（runner 自动起容器、用完即删）
+cargo test --test <name>
+
+# 快速路：复用 postgres-test 服务（:5429，跳过容器）
+TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo nextest run
 ```
 
 ## 领域结构（垂直切片）

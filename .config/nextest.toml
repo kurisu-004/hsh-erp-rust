@@ -1,0 +1,27 @@
+# 2026-09-20 新增：cargo-nextest profile
+#
+# 背景：原 libtest binary 间串行 + binary 内 4 线程（.cargo/config.toml RUST_TEST_THREADS=4）
+# 跑 ~5min。改用 nextest process-per-test + binary 级并行，目标 ~1min 全量。
+#
+# 设计点：
+# - test-threads=8：连接数预算见 scripts/test_nextest.sh（容器 max_connections=500）；
+#   8 × (2 admin + 10 test pool + 迁移连接) ≈ 120 连接 < 500
+# - fail-fast=false：全量跑收齐所有失败（CI 友好）
+# - slow-timeout 60s/2x：HTTP/WS 测试宽松超时 —— 60s 告警、120s 杀
+
+[profile.default]
+test-threads = 8
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# 2026-09-20 修复竞态 #2：3 个 FLUSHDB binary 串行（_e2e_api / auth_middleware /
+# iam_api 在 setup 调 FLUSHDB；nextest 跨 binary 并行下会杀并行测试的 session →
+# 40105 SESSION_REVOKED flake）。max-threads=1 让这 3 个 binary 的测试串行跑，
+# 跨 binary 仍并行（其余 40 个 binary 全并行）。[test-groups] 必须先声明 group
+# 名才能在 overrides 里引用（nextest 强类型校验）。
+[test-groups]
+redis-flush = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = "binary(/^(_e2e_api|auth_middleware|iam_api)$/)"
+test-group = "redis-flush"
