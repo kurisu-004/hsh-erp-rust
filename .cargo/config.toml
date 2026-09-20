@@ -1,0 +1,7 @@
+# 2026-09-20 新增：限制集成测试并发数，避免 36 binary 同时拉起几十个
+# PG 容器压垮本机 / CI runner。默认 RUST_TEST_THREADS 是 CPU 数（典型 8-16），
+# cargo test 实际还会加上 binary 数倍线程（test 框架自身），实测默认会瞬间
+# 拉起 36 个 postgres:18-alpine 容器。强制 4 是经验值 —— 4 并发 × ~30s 启动
+# 总时间可控，CI 上跑完 ~10min 内存峰值 ~6GB。
+[test]
+env = { RUST_TEST_THREADS = "4" }

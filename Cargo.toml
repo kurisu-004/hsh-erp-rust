@@ -13,8 +13,10 @@ path = "src/lib.rs"
 #   umya-spreadsheet 或 calamine —— 送货单 Excel 模板填充
 #   printpdf / lopdf              —— PDF 拆分与渲染
 #   barcoders                     —— Code128 条码
-#   testcontainers-rs            —— 集成测试独立 PG
 #   rmcp                          —— MCP Streamable HTTP（远期）
+#
+# 集成测试 PG 基建：见 [dev-dependencies] 的 `ephemeral-postgres`，替代原
+# testcontainers-rs 占位注释（2026-09-20）。
 # ---------------------------------------------------------------------------------
 
 [dependencies]
@@ -112,6 +114,16 @@ uuid = { version = "1", features = ["v4"] }
 # 集成测试用 tower::ServiceExt::oneshot 直接驱动 Router。
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。
 tower = { version = "0.5", features = ["util"] }
+
+# 2026-09-20 新增：ephemeral-postgres 给每个 integration test binary 拉起独立
+# postgres:18-alpine 容器 + 每测试 fresh database，从源头消除以下两个 flaky：
+#   - 根因 #1：原 `TEST_SNOWFLAKE_GEN` 跨 binary 共享 (epoch, instance=1) 撞 ID
+#   - 根因 #2：原 postgres-test 共享 docker 容器（库 postgres_rust_test 36 binary 共用）
+#     导致 TRUNCATE 残留 + _sqlx_migrations 状态串号
+# 各 binary 走 `OnceCell<Cluster>` 复用 cluster、`test_pool()` 每次 `create_database()`
+# 拿独立 db；进程退出时 docker daemon 清理 anonymous container（无 SIGINT watchdog）。
+# 建议：跑集成测试时显式限速 `RUST_TEST_THREADS=4`（默认 256 会瞬间拉起几十个 PG 容器）。
+ephemeral-postgres = "0.3"
 
 # 2026-09-18 auth+user DI 重构（Wave 1A/T1）：service 单测在 src/modules/{auth,user}/service_tests.rs
 # 用 mockall 对 repo trait / SessionStore / UowProvider 做 automock；测试零数据库依赖。
