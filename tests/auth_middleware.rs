@@ -38,16 +38,14 @@ use tower::ServiceExt;
 // ===========================================================================
 // 全局串行化互斥：所有测试共享同一 DB + 同一 Redis db 15，必须串行避免 fixture 冲突。
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     let redis_pool = common::test_redis_pool().await;
     clean_db(&pool).await;
     clean_redis(&redis_pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -147,7 +145,7 @@ async fn mint_expired_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id:
 
 #[tokio::test]
 async fn protected_endpoint_without_token_returns_40100() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let state = test_state(pool).await;
     let app = test_app(state);
 
@@ -170,7 +168,7 @@ async fn protected_endpoint_without_token_returns_40100() {
 
 #[tokio::test]
 async fn forged_signature_returns_40100() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let uid = insert_user_with_password(&pool, "forge_admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
 
@@ -210,7 +208,7 @@ async fn forged_signature_returns_40100() {
 
 #[tokio::test]
 async fn expired_token_returns_40102() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let uid = insert_user_with_password(&pool, "exp_admin", "changeme").await;
     let state = test_state(pool).await;
     let expired = mint_expired_token(&state, uid).await;
@@ -235,7 +233,7 @@ async fn expired_token_returns_40102() {
 
 #[tokio::test]
 async fn valid_jwt_without_session_returns_40105() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let uid = insert_user_with_password(&pool, "nosess_admin", "changeme").await;
     let state = test_state(pool).await;
     // 签名合法，但不写 Redis session
@@ -264,7 +262,7 @@ async fn valid_jwt_without_session_returns_40105() {
 
 #[tokio::test]
 async fn health_whitelist_no_token_200() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let state = test_state(pool).await;
     let app = test_app(state);
 
@@ -286,7 +284,7 @@ async fn health_whitelist_no_token_200() {
 
 #[tokio::test]
 async fn login_whitelist_no_token_40101() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let state = test_state(pool).await;
     let app = test_app(state);
 
@@ -318,7 +316,7 @@ async fn login_whitelist_no_token_40101() {
 
 #[tokio::test]
 async fn refresh_whitelist_no_token_40001() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let state = test_state(pool).await;
     let app = test_app(state);
 
@@ -347,7 +345,7 @@ async fn refresh_whitelist_no_token_40001() {
 
 #[tokio::test]
 async fn logout_then_old_token_returns_40105() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let uid = insert_user_with_password(&pool, "logout_admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
 
@@ -404,7 +402,7 @@ async fn logout_then_old_token_returns_40105() {
 
 #[tokio::test]
 async fn nonexistent_route_returns_404_not_40100() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let state = test_state(pool).await;
     let app = test_app(state);
 

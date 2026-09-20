@@ -6,8 +6,9 @@
 //! 3. `acquire_unknown_prefix_returns_biz_serial_prefix_unknown` —— 未知 prefix → 20108；
 //! 4. `acquire_taken_serial_skips_to_next` —— 已存在活跃 part.serial_no 时回退到下一号。
 //!
-//! 集成测试运行需要 `tests/common::test_pool` + `ensure_database_exists`（共享
-//! `postgres_rust_test`，与其它业务测试互不干扰）。
+//! 集成测试运行需要 `tests/common::test_pool` + `ensure_database_exists`：
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），与其它业务测试
+//! 互不干扰（DB 间 schema 完全独立）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -19,7 +20,6 @@ use hsh_erp_rust::infra::serial::next_customer_serial_via_pool;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::shared::error::code;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 清空 `t_serial_counter` + `t_part`（acquire 关联表），保证测试隔离。
 async fn reset_serial_state(pool: &sqlx::PgPool) {
@@ -77,7 +77,6 @@ async fn occupy_serial(pool: &sqlx::PgPool, prefix: &str, suffix: i64, customer_
 /// 单次 acquire 返回 `<PREFIX><4位数字>` 格式串。
 #[tokio::test]
 async fn acquire_returns_prefixed_4digit_serial() {
-    let _guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     reset_serial_state(&pool).await;
@@ -92,7 +91,6 @@ async fn acquire_returns_prefixed_4digit_serial() {
 /// 连续两次 acquire 拿不同且递增号。
 #[tokio::test]
 async fn acquire_two_calls_returns_distinct_serials() {
-    let _guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     reset_serial_state(&pool).await;
@@ -112,7 +110,6 @@ async fn acquire_two_calls_returns_distinct_serials() {
 /// 未知 prefix → `BIZ_SERIAL_PREFIX_UNKNOWN`。
 #[tokio::test]
 async fn acquire_unknown_prefix_returns_biz_serial_prefix_unknown() {
-    let _guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     reset_serial_state(&pool).await;
@@ -131,7 +128,6 @@ async fn acquire_unknown_prefix_returns_biz_serial_prefix_unknown() {
 /// 已存在活跃 serial 时，acquire 跳过占用的号返回下一个空号。
 #[tokio::test]
 async fn acquire_taken_serial_skips_to_next() {
-    let _guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     reset_serial_state(&pool).await;

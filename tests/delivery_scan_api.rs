@@ -23,7 +23,8 @@
 //! 本 Task 7 新增的 7 个测试用新 DTO 形态重新覆盖：
 //!
 //! ## 并行 / 认证
-//! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //! 每个用例 MANAGER token（M/C/I 三角色之一都能用，本系列用 MANAGER）。
 
 #[path = "common/mod.rs"]
@@ -45,7 +46,6 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 //  全局串行化 + helpers
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -78,13 +78,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
@@ -334,7 +333,7 @@ async fn insert_group_member(pool: &PgPool, group_id: i64, l2_id: i64) -> i64 {
 
 #[tokio::test]
 async fn scan_empty_code_returns_400_20104() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let _ = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _) = login_manager(pool, "admin").await;
@@ -355,7 +354,7 @@ async fn scan_empty_code_returns_400_20104() {
 
 #[tokio::test]
 async fn scan_unknown_code_returns_404_21417() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let _ = insert_part(&pool, "P", l2, Some("ABCD1234"), None).await;
@@ -377,7 +376,7 @@ async fn scan_unknown_code_returns_404_21417() {
 
 #[tokio::test]
 async fn scan_single_part_inspection_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("P001"), None).await;
@@ -435,7 +434,7 @@ async fn scan_single_part_inspection_happy_path() {
 
 #[tokio::test]
 async fn scan_rescan_same_part_idempotent_already_present() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("P002"), None).await;
@@ -484,7 +483,7 @@ async fn scan_part_in_process_returns_400_21405() {
     // （返回 200 + CANDIDATES_AVAILABLE），不是 400/21405；要触发 C 组短路需带 holder
     // 且 `location='WORKER'`（仅 holder 不再够，因为 holder 多态，可能是货架）。
     // 这里给批次加上 Some(99) holder + Some("WORKER") → C 组短路 → 400/21421。
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("P003"), None).await;
@@ -523,7 +522,7 @@ async fn scan_part_in_process_returns_400_21405() {
 /// `PRODUCTION_SHELF` 应继续走 B 组 candidates 列表。
 #[tokio::test]
 async fn scan_part_in_process_on_production_shelf_returns_candidates() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("PE0002"), None).await;
@@ -598,7 +597,7 @@ async fn scan_part_in_process_on_production_shelf_returns_candidates() {
 
 #[tokio::test]
 async fn scan_part_on_other_active_note_returns_409_21406() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("P004"), None).await;
@@ -673,7 +672,7 @@ async fn scan_part_on_other_active_note_returns_409_21406() {
 
 #[tokio::test]
 async fn scan_assembly_full_all_subparts_ready_added() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // 装配件 + 3 个子件，全部 READY_TO_SHIP
@@ -742,7 +741,7 @@ async fn scan_assembly_atomic_reject_with_failures() {
     //   - A 组子件本可挂单，但事务回滚 → DB 上仍未挂
     // 此处把 Z0001 标为 worker-held IN_PROCESS（C 组）触发短路，验证 Z0000/Z0002（A 组）
     // 也未挂单（整单回滚的间接证据）。
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let asm_id = insert_assembly(&pool, l2, "L2099", "ASM-099", "总成099").await;
@@ -818,7 +817,7 @@ async fn scan_assembly_atomic_reject_with_failures() {
 
 #[tokio::test]
 async fn scan_assembly_rescan_idempotent_already_present() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let asm_id = insert_assembly(&pool, l2, "L3055", "ASM-055", "总成055").await;
@@ -866,7 +865,7 @@ async fn scan_assembly_rescan_idempotent_already_present() {
 
 #[tokio::test]
 async fn scan_auto_routes_by_l2_to_distinct_groups() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2_in = insert_l2(&pool, "二厂", l1).await;
     let l2_out = insert_l2(&pool, "五厂", l1).await;
@@ -929,7 +928,7 @@ async fn scan_auto_routes_by_l2_to_distinct_groups() {
 
 #[tokio::test]
 async fn scan_no_groups_for_l1_collapses_to_one_l1wide_note() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2_a = insert_l2(&pool, "二厂", l1).await;
     let l2_b = insert_l2(&pool, "五厂", l1).await;
@@ -996,7 +995,7 @@ async fn scan_no_groups_for_l1_collapses_to_one_l1wide_note() {
 /// - 第一条 `batch_id` 是 10 个批次中 id 最大的（ORDER BY id DESC）
 #[tokio::test]
 async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // 1 个 part，带订单号（验证 order_no 字段透传）
@@ -1177,7 +1176,7 @@ async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
 /// A 组覆盖，散件挂单成功，`added_batches=1`。
 #[tokio::test]
 async fn scan_standalone_part_with_ready_batch_returns_added() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("RB0001"), None).await;
@@ -1237,7 +1236,7 @@ async fn scan_standalone_part_with_ready_batch_returns_added() {
 /// INSPECTION 也是 A 组（设计 `is_attachable_state`），直接挂单。
 #[tokio::test]
 async fn scan_standalone_part_with_inspection_batch_returns_added() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("IB0001"), None).await;
@@ -1270,7 +1269,7 @@ async fn scan_standalone_part_with_inspection_batch_returns_added() {
 /// 走 `unresolved_targets` 单元素路径。
 #[tokio::test]
 async fn scan_standalone_part_with_only_pending_returns_candidates() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("PE0001"), None).await;
@@ -1341,7 +1340,7 @@ async fn scan_standalone_part_with_only_pending_returns_candidates() {
 /// → `classify_outcome` 返回 ADDED；全部子件挂入 added_batches。
 #[tokio::test]
 async fn scan_assembly_with_all_ready_returns_added() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let asm_id = insert_assembly(&pool, l2, "ASM-R1", "ASM-R1-DWG", "全A组装").await;
@@ -1417,7 +1416,7 @@ async fn scan_assembly_with_all_ready_returns_added() {
 /// B 组放 available_batches，由前端弹窗勾选后转发 `POST /{id}/attach-batches`。
 #[tokio::test]
 async fn scan_assembly_with_partial_ready_returns_partial_added() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let asm_id = insert_assembly(&pool, l2, "ASM-P1", "ASM-P1-DWG", "A+B组装").await;
@@ -1559,7 +1558,7 @@ async fn scan_assembly_with_partial_ready_returns_partial_added() {
 /// `BIZ_DELIVERY_BATCH_STATE_INVALID`，不挂任何批次（整单回滚）。
 #[tokio::test]
 async fn scan_with_delivered_batch_returns_21421() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("DV0001"), None).await;
@@ -1608,7 +1607,7 @@ async fn scan_with_delivered_batch_returns_21421() {
 /// `added_batches=[]`、`unresolved_targets=null`，且 note.id 不变。
 #[tokio::test]
 async fn scan_twice_same_code_is_idempotent() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P1", l2, Some("ID0001"), None).await;
@@ -1700,7 +1699,7 @@ async fn scan_twice_same_code_is_idempotent() {
 /// 这是「全 A 无 B」路径的回归测试，必须仍能向后兼容走 ADDED。
 #[tokio::test]
 async fn scan_standalone_full_a_returns_added_with_no_unresolved() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P_full_a", l2, Some("FULLA0001"), None).await;
@@ -1749,7 +1748,7 @@ async fn scan_standalone_full_a_returns_added_with_no_unresolved() {
 /// 留给前端弹窗勾选决定（POST /{id}/attach-batches 显式提交）。
 #[tokio::test]
 async fn scan_standalone_a_plus_b_returns_candidates_with_attachable_and_available() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P_apb", l2, Some("APB00001"), None).await;
@@ -1850,7 +1849,7 @@ async fn scan_standalone_a_plus_b_returns_candidates_with_attachable_and_availab
 /// A 组放进 attachable_batches 供前端决定。
 #[tokio::test]
 async fn scan_standalone_a_plus_c_returns_candidates_with_only_attachable() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P_apc", l2, Some("APC00001"), None).await;
@@ -1936,7 +1935,7 @@ async fn scan_standalone_a_plus_c_returns_candidates_with_only_attachable() {
 /// C 静默过滤，B 进 available 候选，前端送检流程按 B 组处理。
 #[tokio::test]
 async fn scan_standalone_b_plus_c_returns_candidates_with_only_available() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P_bpc", l2, Some("BPC00001"), None).await;
@@ -2006,7 +2005,7 @@ async fn scan_standalone_b_plus_c_returns_candidates_with_only_available() {
 /// attachable_batches 含其 A 组，等待前端弹窗勾选）。
 #[tokio::test]
 async fn scan_assembly_child_a_plus_b_returns_partial_added_with_attachable_per_child() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let asm_id = insert_assembly(&pool, l2, "ASM-MAB", "ASM-MAB-DWG", "A+B双批子件").await;
@@ -2136,7 +2135,7 @@ async fn scan_assembly_child_a_plus_b_returns_partial_added_with_attachable_per_
 /// 两个子件都应进 unresolved_targets，且各自 attachable_batches 独立携带正确批次。
 #[tokio::test]
 async fn scan_assembly_asymmetric_had_invalid_per_child_returns_partial_added() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let asm_id = insert_assembly(

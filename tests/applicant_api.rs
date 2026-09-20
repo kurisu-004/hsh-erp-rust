@@ -9,7 +9,8 @@
 //!   6. soft_delete_in_use_returns_21004               — 被 t_part.applicant_name 引用 → 拒软删
 //!
 //! ## 并行 / 认证
-//! 共享 `postgres_rust_test` 库；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //! 每个用例 MANAGER token；与其它 applicant 域用例共享同一 token 来源（用户独立）。
 //!
 //! ## URL 约定
@@ -36,7 +37,6 @@ use common::{
 //  全局串行化 + HTTP helpers（沿用 worker_pool_api.rs / part_api.rs 风格）
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -69,13 +69,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 // ----- 角色登录 helper -----
@@ -199,7 +198,7 @@ async fn insert_part_referencing_applicant(
 /// 1. 空 DB：GET /com/applicants → 200 / items=[] / total=0 / limit=100（DEFAULT_LIMIT）。
 #[tokio::test]
 async fn list_applicants_empty() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "admin_empty").await;
 
     let (s, env) = send(
@@ -223,7 +222,7 @@ async fn list_applicants_empty() {
 /// - soft-delete 后 GET 返 404 / code=21001 BIZ_APPLICANT_NOT_FOUND
 #[tokio::test]
 async fn create_get_update_soft_delete_applicant_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "admin_crud").await;
     let l1 = insert_l1(&_pool, "TestCo-Crud").await;
 
@@ -299,7 +298,7 @@ async fn create_get_update_soft_delete_applicant_happy_path() {
 /// 3. customer_id 指向 L2（非一级） → POST → 400 / 21003 BIZ_APPLICANT_BAD_CUSTOMER。
 #[tokio::test]
 async fn create_with_l2_customer_returns_21003() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "admin_l2").await;
     let l1 = insert_l1(&_pool, "L2CoRoot").await;
     let l2 = insert_l2(&_pool, "L2Child", l1).await;
@@ -321,7 +320,7 @@ async fn create_with_l2_customer_returns_21003() {
 /// 4. 同一 L1 下姓名重复 → POST → 409 / 21002 BIZ_APPLICANT_DUPLICATE_NAME。
 #[tokio::test]
 async fn duplicate_name_under_same_customer_returns_21002() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "admin_dup").await;
     let l1 = insert_l1(&_pool, "DupCo").await;
 
@@ -363,7 +362,7 @@ async fn duplicate_name_under_same_customer_returns_21002() {
 /// 断言：恰好 1 个 200 + 1 个 409。
 #[tokio::test]
 async fn update_with_stale_version_returns_409() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app1, token1, _pool) = login_manager(pool, "admin_occ_a").await;
     let (app2, token2, pool) = login_manager(_pool, "admin_occ_b").await;
     let l1 = insert_l1(&pool, "OccCo").await;
@@ -420,7 +419,7 @@ async fn update_with_stale_version_returns_409() {
 ///    soft-delete → 409 / 21004 BIZ_APPLICANT_IN_USE。
 #[tokio::test]
 async fn soft_delete_in_use_returns_21004() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "admin_inuse").await;
     let l1 = insert_l1(&_pool, "InUseCo").await;
 

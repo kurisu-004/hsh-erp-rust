@@ -12,7 +12,8 @@
 //!   4. 分页：`limit + offset` 正确切分 total / items。
 //!
 //! ## 并行 / 认证
-//! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 
 #[path = "part_api_helpers.rs"]
 mod helpers;
@@ -45,7 +46,7 @@ use helpers::*;
 ///       前端会基于 holder_name 渲染提示）。
 #[tokio::test]
 async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and_version() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
@@ -186,7 +187,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
 /// （VALIDATION_ERROR 40001）。关键字用大写字母串（避开 `_` / `%` / `\\`）。
 #[tokio::test]
 async fn inspection_batches_filters_by_keyword_and_customer() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1_a = insert_l1(&pool, "ACMEA", "A").await;
     let l1_b = insert_l1(&pool, "ACMEB", "B").await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
@@ -273,7 +274,7 @@ async fn inspection_batches_filters_by_keyword_and_customer() {
 /// `helpers::login_worker` 用 ShelfAccount（合法登录但不在白名单内）模拟。
 #[tokio::test]
 async fn inspection_batches_role_guard_rejects_worker() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
@@ -332,7 +333,7 @@ async fn inspection_batches_role_guard_rejects_worker() {
 /// CHECK `^[A-Z]$`（大写字母单字符）。每个 L1 用不同大写字母当 prefix。
 #[tokio::test]
 async fn inspection_batches_pagination_limit_offset() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
     // 3 个 L1 客户（互不关联）；serial_prefix 单字符大写字母（A / C / E，
     // 故意跳过 B/D 避免与已有 prefix 碰撞 —— 数据库有 UNIQUE 索引约束）。

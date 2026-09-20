@@ -15,7 +15,8 @@
 //!  11. 批量 to-ship 落后 version → 该 item 落 failed[40901]，兄弟 item 仍 submitted
 //!
 //! ## 并行 / 认证
-//! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //! 每个用例 MANAGER 或 INSPECTOR token。
 
 #[path = "common/mod.rs"]
@@ -36,7 +37,7 @@ use helpers::*;
 /// 批量 to-ship happy path：3 个 INSPECTION 工单 → 200 / submitted=3 / failed=0。
 #[tokio::test]
 async fn batch_to_ship_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let mut bids = Vec::new();
@@ -83,7 +84,7 @@ async fn batch_to_ship_happy_path() {
 /// submitted=2 / failed=1 (code=20103)。
 #[tokio::test]
 async fn batch_to_ship_partial_failure() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let mut items = Vec::new();
@@ -139,7 +140,7 @@ async fn batch_to_ship_partial_failure() {
 /// 批量 to-ship items=[] → 422 / 40001 VALIDATION_ERROR（handler 兜底校验）。
 #[tokio::test]
 async fn batch_to_ship_empty_items_40001() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
     let (s, env) = send(
         app,
@@ -165,7 +166,7 @@ async fn batch_to_ship_empty_items_40001() {
 /// part；无法 parse 的 batch_id 落到 `40001` 失败，sentinel `batch_id=0`。
 #[tokio::test]
 async fn batch_to_ship_non_numeric_batch_id_40001() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
@@ -209,7 +210,7 @@ async fn batch_to_ship_non_numeric_batch_id_40001() {
 /// 批量 to-ship CLERK 越权 → 403 / 40300 FORBIDDEN。
 #[tokio::test]
 async fn batch_to_ship_clerk_forbidden() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_clerk(pool, "clerk1").await;
     let (s, env) = send(
         app,
@@ -232,7 +233,7 @@ async fn batch_to_ship_clerk_forbidden() {
 /// 整批操作时 new_batch_id=null。
 #[tokio::test]
 async fn single_to_ship_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
@@ -267,7 +268,7 @@ async fn single_to_ship_happy_path() {
 /// `READY_TO_SHIP → READY_TO_SHIP`，返回 20103 而非 40901。
 #[tokio::test]
 async fn single_to_ship_retry_returns_20103() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
@@ -324,7 +325,7 @@ async fn single_to_ship_retry_returns_20103() {
 /// - 响应 `part` 投影展示最新 OCC 版本。
 #[tokio::test]
 async fn to_ship_partial_split_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -369,7 +370,7 @@ async fn to_ship_partial_split_happy_path() {
 /// 期望：`new_batch_id == null`（整批操作不触发 split_batch_for_partial_pass）。
 #[tokio::test]
 async fn to_ship_full_batch() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -404,7 +405,7 @@ async fn to_ship_full_batch() {
 /// （part 处于 INSPECTION），失败点必须是 batch 级 OCC 而非 20103。
 #[tokio::test]
 async fn single_to_ship_stale_version_returns_409_40901() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
@@ -434,7 +435,7 @@ async fn single_to_ship_stale_version_returns_409_40901() {
 /// 本用例会因 `failed.len() == 0` 而失败。
 #[tokio::test]
 async fn batch_to_ship_stale_version_lands_in_failed() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 

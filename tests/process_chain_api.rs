@@ -13,7 +13,8 @@
 //!  10. soft_delete_part 级联：链 + steps 软删、part.process_chain_id 置 NULL（026 翻转）
 //!
 //! ## 串行化
-//! 进程级 `tokio::sync::Mutex` + `--test-threads=1` 双保险。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex / `--test-threads=1` 双保险。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -31,7 +32,6 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 //  全局串行化 + HTTP helpers
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -64,14 +64,13 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup() -> (tokio::sync::MutexGuard<'static, ()>, PgPool) {
+async fn setup() -> PgPool {
     use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
-    let guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 // ----- 角色登录 helper -----
@@ -196,7 +195,7 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 /// 场景 1: happy path —— 创链 → fetch 拿到 header + steps
 #[tokio::test]
 async fn upsert_then_get_by_part_happy() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH").await;
     let proc_a = seed_process(&pool, "PROC-A", "工序A").await;
     let proc_b = seed_process(&pool, "PROC-B", "工序B").await;
@@ -277,7 +276,7 @@ async fn upsert_then_get_by_part_happy() {
 /// 场景 2: 找不到链 → 20701 BIZ_PROCESS_CHAIN_NOT_FOUND
 #[tokio::test]
 async fn get_by_part_chain_not_found() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH-NF").await;
     let part_id = insert_part(&pool, customer, "P-NF").await;
 
@@ -299,7 +298,7 @@ async fn get_by_part_chain_not_found() {
 /// 场景 3: PUT 整组替换：先有 2 步 → 换成 1 步；旧 steps 软删，新 step 新 id
 #[tokio::test]
 async fn upsert_replaces_old_steps() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH-REP").await;
     let proc_a = seed_process(&pool, "PROC-RA", "工序A").await;
     let proc_b = seed_process(&pool, "PROC-RB", "工序B").await;
@@ -384,7 +383,7 @@ async fn upsert_replaces_old_steps() {
 /// 场景 4: upsert 时 estimated_minutes < 0 → 40001
 #[tokio::test]
 async fn upsert_rejects_negative_minutes() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH-NEG").await;
     let proc = seed_process(&pool, "PROC-NEG", "工序").await;
     let part_id = insert_part(&pool, customer, "P-NEG").await;
@@ -411,7 +410,7 @@ async fn upsert_rejects_negative_minutes() {
 /// 场景 5: upsert 时 sort_order 重复 → 40001
 #[tokio::test]
 async fn upsert_rejects_duplicate_sort_order() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH-DUP").await;
     let proc = seed_process(&pool, "PROC-DUP", "工序").await;
     let part_id = insert_part(&pool, customer, "P-DUP").await;
@@ -439,7 +438,7 @@ async fn upsert_rejects_duplicate_sort_order() {
 /// 场景 6: 非 Manager 调用 upsert → 40300 FORBIDDEN
 #[tokio::test]
 async fn upsert_forbidden_for_non_manager() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH-FB").await;
     let proc = seed_process(&pool, "PROC-FB", "工序").await;
     let part_id = insert_part(&pool, customer, "P-FB").await;
@@ -485,7 +484,7 @@ async fn upsert_forbidden_for_non_manager() {
 /// 软删（note 也不再被 SELECT 列出），新步骤的 note 独立验证。
 #[tokio::test]
 async fn step_note_round_trip() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH-NOTE").await;
     let proc_a = seed_process(&pool, "PROC-NA", "工序A").await;
     let proc_b = seed_process(&pool, "PROC-NB", "工序B").await;
@@ -557,7 +556,7 @@ async fn step_note_round_trip() {
 /// 禁止制定 / 修改。
 #[tokio::test]
 async fn upsert_rejects_non_pending_part() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH-NP").await;
     let proc = seed_process(&pool, "PROC-NP", "工序").await;
     // 模拟"已下发"零件（IN_PROCESS 即非 PENDING 任一状态）
@@ -588,7 +587,7 @@ async fn upsert_rejects_non_pending_part() {
 /// 场景 9: GET /process-chains/{chain_id} 命中 / 未命中（2026-09-16 新增端点）
 #[tokio::test]
 async fn get_chain_by_id_hit_and_miss() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH-GI").await;
     let proc_a = seed_process(&pool, "PROC-GA", "工序A").await;
     let part_id = insert_part(&pool, customer, "P-GI").await;
@@ -653,7 +652,7 @@ async fn get_chain_by_id_hit_and_miss() {
 /// 之后 get_chain_by_part / get_chain_by_id 均 20701。
 #[tokio::test]
 async fn soft_delete_part_cascades_chain() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "PCH-SD").await;
     let proc_a = seed_process(&pool, "PROC-SA", "工序A").await;
     let part_id = insert_part(&pool, customer, "P-SD").await;

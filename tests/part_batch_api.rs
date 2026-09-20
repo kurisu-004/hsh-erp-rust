@@ -26,7 +26,6 @@ use common::{clean_business_db, clean_db, test_pool};
 
 use helpers::*;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -59,13 +58,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     common::ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 // ===========================================================================
@@ -74,7 +72,7 @@ async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
 
 #[tokio::test]
 async fn split_batch_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -104,7 +102,7 @@ async fn split_batch_happy_path() {
 
 #[tokio::test]
 async fn split_batch_invalid_quantity_rejects() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -133,7 +131,7 @@ async fn split_batch_invalid_quantity_rejects() {
 
 #[tokio::test]
 async fn split_batch_quantity_negative_rejects() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -163,7 +161,7 @@ async fn split_batch_quantity_negative_rejects() {
 
 #[tokio::test]
 async fn invariant_split_preserves_total_quantity() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -199,7 +197,7 @@ async fn invariant_split_preserves_total_quantity() {
 
 #[tokio::test]
 async fn cancel_batch_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -225,7 +223,7 @@ async fn cancel_batch_happy_path() {
 
 #[tokio::test]
 async fn cancel_batch_terminal_protection() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "COMPLETED").await;
@@ -251,7 +249,7 @@ async fn cancel_batch_terminal_protection() {
 
 #[tokio::test]
 async fn list_batches_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -271,7 +269,7 @@ async fn list_batches_happy_path() {
 
 #[tokio::test]
 async fn list_events_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -289,7 +287,7 @@ async fn list_events_happy_path() {
 
 #[tokio::test]
 async fn location_tree_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
     let (s, env) = send(
         app,

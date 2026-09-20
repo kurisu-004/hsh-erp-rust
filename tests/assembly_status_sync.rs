@@ -26,14 +26,15 @@
 //!   postgres:18-alpine
 //!
 //! # 2. 跑测试（一次性覆盖 DATABASE_URL 给 sqlx 编译期校验 + TEST_DATABASE_URL）
-//! DATABASE_URL="postgres://hsh_test:6065161test@localhost:5434/postgres_rust_test" \
-//! TEST_DATABASE_URL="postgres://hsh_test:6065161test@localhost:5434/postgres_rust_test" \
+//! DATABASE_URL="postgres://hsh_test:6065161test@localhost:5434/hsh_erp_template" \
+//! TEST_DATABASE_URL="postgres://hsh_test:6065161test@localhost:5434/hsh_erp_template" \
 //! ADMIN_DATABASE_URL="postgres://hsh_test:6065161test@localhost:5434/postgres" \
 //!   cargo test --test assembly_status_sync -- --test-threads=1
 //! ```
 //!
 //! ## 并行 / 认证
-//! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -132,7 +133,7 @@ fn test_current_user() -> CurrentUser {
 /// 期望：`data.synced_assembly_id == Some(asm.id)`；DB `t_assembly.status == 'IN_PROCESS'`。
 #[tokio::test]
 async fn single_part_to_inspection_flips_assembly_to_in_process() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool.clone(), "inspector1").await;
@@ -183,7 +184,7 @@ async fn single_part_to_inspection_flips_assembly_to_in_process() {
 /// `min(progress)` → INSPECTION 的 progress=4 → `IN_PROCESS`。
 #[tokio::test]
 async fn mixed_children_assembly_rolls_up_to_min_progress() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool.clone(), "inspector1").await;
@@ -242,7 +243,7 @@ async fn mixed_children_assembly_rolls_up_to_min_progress() {
 /// 决策（cancel 不属于「业务流转」范畴），与本测试的算法正确性正交。
 #[tokio::test]
 async fn all_children_cancelled_flips_assembly_to_cancelled() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -290,7 +291,7 @@ async fn all_children_cancelled_flips_assembly_to_cancelled() {
 /// 断言：`status` 不变；`version` 不变；响应 `data.synced_assembly_id == null`。
 #[tokio::test]
 async fn terminal_assembly_is_not_modified_by_child_change() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool.clone(), "inspector1").await;
@@ -368,7 +369,7 @@ async fn terminal_assembly_is_not_modified_by_child_change() {
 /// handler 侧的 dedup 逻辑通过 service 直调 `sync_from_part_changes` 覆盖（见下）。
 #[tokio::test]
 async fn batch_to_inspection_emits_per_assembly_update() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool.clone(), "inspector1").await;

@@ -36,20 +36,18 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 #[tokio::test]
 async fn build_snapshot_with_workers_basic() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     // 插一个 active 生产区货架
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
@@ -83,7 +81,7 @@ async fn build_snapshot_with_workers_basic() {
 
 #[tokio::test]
 async fn build_snapshot_with_workers_returns_full_shape() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     // 插 L1 + L2 customer + part + 一个 shelf 上的 IN_PROCESS 批次
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
@@ -230,7 +228,7 @@ async fn ws_hub_broadcast_snapshot_subscription_receives_snapshot() {
 
 /// 启动 axum 服务端（绑定 127.0.0.1:0 随机端口），返回 (`base_url`, `state`)。
 async fn spawn_ws_server() -> (String, Arc<hsh_erp_rust::state::AppState>) {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let state = test_state(pool.clone()).await;
     let app = test_ws_app(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")

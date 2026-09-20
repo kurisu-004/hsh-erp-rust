@@ -15,7 +15,8 @@
 //!   - scan-deliver-part: 司机扫码发货
 //!
 //! ## 并行 / 认证
-//! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -41,7 +42,6 @@ use helpers::*;
 //  全局串行化
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -74,13 +74,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     common::ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 /// 创建一个 INSPECTOR 用户 + 登录拿 token。
@@ -110,7 +109,7 @@ async fn login_inspector(pool: PgPool, username: &str) -> (axum::Router, String,
 
 #[tokio::test]
 async fn place_on_shelf_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -146,7 +145,7 @@ async fn place_on_shelf_happy_path() {
 
 #[tokio::test]
 async fn place_on_shelf_rbac_clerk_ok() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -181,7 +180,7 @@ async fn place_on_shelf_rbac_clerk_ok() {
 
 #[tokio::test]
 async fn place_on_shelf_invalid_transition_rejects() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // 工单 COMPLETED 状态（place-on-shelf 要求 PENDING）
@@ -221,7 +220,7 @@ async fn place_on_shelf_invalid_transition_rejects() {
 
 #[tokio::test]
 async fn place_on_shelf_shelf_process_not_mapped_rejects() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -261,7 +260,7 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
 
 #[tokio::test]
 async fn recall_to_pending_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "IN_PROCESS").await;
@@ -299,7 +298,7 @@ async fn recall_to_pending_happy_path() {
 
 #[tokio::test]
 async fn send_to_programming_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -326,7 +325,7 @@ async fn send_to_programming_happy_path() {
 
 #[tokio::test]
 async fn release_from_programming_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PROGRAMMING").await;
@@ -361,7 +360,7 @@ async fn release_from_programming_happy_path() {
 
 #[tokio::test]
 async fn release_from_programming_rbac_inspector_rejects() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PROGRAMMING").await;
@@ -404,7 +403,7 @@ async fn release_from_programming_rbac_inspector_rejects() {
 
 #[tokio::test]
 async fn scan_inspect_pass_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -434,7 +433,7 @@ async fn scan_inspect_pass_happy_path() {
 
 #[tokio::test]
 async fn scan_inspect_fail_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "IN_PROCESS").await;
@@ -472,7 +471,7 @@ async fn scan_inspect_fail_happy_path() {
 
 #[tokio::test]
 async fn scan_inspect_invalid_transition_rejects() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "DELIVERED").await;
@@ -502,7 +501,7 @@ async fn scan_inspect_invalid_transition_rejects() {
 
 #[tokio::test]
 async fn scan_deliver_part_requires_driver() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // 创建 part 带 serial_no

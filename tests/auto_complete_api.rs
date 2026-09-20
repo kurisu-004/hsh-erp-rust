@@ -23,7 +23,6 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::task::auto_complete::run_once;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 清空 auto_complete 涉及表（customer / part / batch）。
 /// 用 CASCADE 兜底防止依赖漏列；测试库每次跑都从零开始。
@@ -143,7 +142,6 @@ async fn seed_delivered_batch(
 /// DELIVERED + placed_at 早于阈值（7 天）→ run_once 翻为 COMPLETED。
 #[tokio::test]
 async fn run_once_completes_overdue_delivered_batch() {
-    let _guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     reset_auto_complete_state(&pool).await;
@@ -167,7 +165,6 @@ async fn run_once_completes_overdue_delivered_batch() {
 /// DELIVERED + placed_at 在阈值内（recent）→ run_once 不动。
 #[tokio::test]
 async fn run_once_skips_recent_batch() {
-    let _guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     reset_auto_complete_state(&pool).await;
@@ -191,7 +188,6 @@ async fn run_once_skips_recent_batch() {
 /// commit 后 ws_hub 收到 PART_COMPLETED 事件。
 #[tokio::test]
 async fn run_once_emits_ws_event_after_commit() {
-    let _guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     reset_auto_complete_state(&pool).await;

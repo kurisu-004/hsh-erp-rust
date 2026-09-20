@@ -1,6 +1,6 @@
 //! assembly 域 9 个集成测试
 //!
-//! 镜像 `tests/applicant_api.rs` 的 TEST_LOCK + setup() 模式。
+//! 镜像 `tests/applicant_api.rs` 的 setup() 模式（plan 2 后无 TEST_LOCK）。
 //! 私有 helpers：l1/l2 customer fixture、serial counter、PDF fixture。
 //!
 //! ## 覆盖（Task 8 + Task 3）
@@ -56,15 +56,13 @@ use hsh_erp_rust::shared::error::AppError;
 //  全局串行化 + setup（沿用 applicant_api.rs 模式）
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 // ===========================================================================
@@ -186,7 +184,7 @@ fn test_current_user() -> CurrentUser {
 /// 1. 无 PDF：service 不派发 serial，不插 children；assembly.serial_no = None。
 #[tokio::test]
 async fn create_without_pdf_creates_empty_assembly() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户A", "F").await;
     let l2 = insert_l2_customer(&pool, "子客A", l1).await;
     insert_serial_counter(&pool, "F", 0).await;
@@ -237,7 +235,7 @@ async fn create_without_pdf_creates_empty_assembly() {
 ///    - children[0].serial_no = "F0000001-01"，children[1].serial_no = "F0000001-02"
 #[tokio::test]
 async fn create_with_pdf_creates_children_with_serial_pattern() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户B", "F").await;
     let l2 = insert_l2_customer(&pool, "子客B", l1).await;
     insert_serial_counter(&pool, "F", 0).await;
@@ -388,7 +386,7 @@ async fn create_with_pdf_creates_children_with_serial_pattern() {
 ///    → `AppError::Biz { code: 20305, .. }`。
 #[tokio::test]
 async fn create_pdf_page_mismatch_returns_20305() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户C", "F").await;
     let l2 = insert_l2_customer(&pool, "子客C", l1).await;
     insert_serial_counter(&pool, "F", 0).await;
@@ -444,7 +442,7 @@ async fn create_pdf_page_mismatch_returns_20305() {
 /// 4. 子件 100 个（> 99 上限） → `AppError::Biz { code: 20303, .. }`。
 #[tokio::test]
 async fn create_too_many_children_returns_20303() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户D", "F").await;
     let l2 = insert_l2_customer(&pool, "子客D", l1).await;
     insert_serial_counter(&pool, "F", 0).await;
@@ -498,7 +496,7 @@ async fn create_too_many_children_returns_20303() {
 ///    0 行 → `AppError::Biz { code: 20103, .. }`。
 #[tokio::test]
 async fn cancel_blocks_completed_assembly() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户E", "F").await;
     let l2 = insert_l2_customer(&pool, "子客E", l1).await;
     insert_serial_counter(&pool, "F", 0).await;
@@ -570,7 +568,7 @@ async fn cancel_blocks_completed_assembly() {
 ///    - `customer_id = L2-A` → total=2（L2 叶子不展开）
 #[tokio::test]
 async fn list_with_filters_and_l1_expansion() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "集团X", "X").await;
     let l2_a = insert_l2_customer(&pool, "子客A", l1).await;
     let l2_b = insert_l2_customer(&pool, "子客B", l1).await;
@@ -674,7 +672,7 @@ async fn list_with_filters_and_l1_expansion() {
 /// 4 参（多 `expected_version`）。completed/cancelled 状态直接 SQL UPDATE 跳过 OCC bump。
 #[tokio::test]
 async fn soft_delete_blocks_terminal_states() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户F", "F").await;
     let l2 = insert_l2_customer(&pool, "子客F", l1).await;
     insert_serial_counter(&pool, "F", 0).await;
@@ -806,7 +804,7 @@ async fn soft_delete_blocks_terminal_states() {
 /// serial_no 走 Option<String>（无 PDF 时为 None）。
 #[tokio::test]
 async fn create_assembly_default_not_null_columns() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户G", "F").await;
     let l2 = insert_l2_customer(&pool, "子客G", l1).await;
     insert_serial_counter(&pool, "F", 0).await;
@@ -929,7 +927,7 @@ async fn state_machine_transitions() {
     assert!(!AssemblyStatus::PENDING.can_transition_to(AssemblyStatus::COMPLETED));
 
     // ---- 9b. service cancel_assembly 命中终态守卫 ----
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户H", "F").await;
     let l2 = insert_l2_customer(&pool, "子客H", l1).await;
     insert_serial_counter(&pool, "F", 0).await;
@@ -1004,7 +1002,7 @@ async fn state_machine_transitions() {
 /// 事件日志承担，与级联更新无关。
 #[tokio::test]
 async fn update_assembly_cascades_shared_fields_to_children() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户I", "F").await;
     let l2_a = insert_l2_customer(&pool, "子客I-A", l1).await;
     let l2_b = insert_l2_customer(&pool, "子客I-B", l1).await;
@@ -1138,7 +1136,7 @@ async fn update_assembly_cascades_shared_fields_to_children() {
 ///     再验证更新到 0/负数时的防御（old_qty<=0 跳过）。
 #[tokio::test]
 async fn update_assembly_scales_child_quantities() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户J", "F").await;
     let l2 = insert_l2_customer(&pool, "子客J", l1).await;
     insert_serial_counter(&pool, "F", 0).await;
@@ -1345,7 +1343,7 @@ async fn update_assembly_scales_child_quantities() {
 ///     child_qty=2, old_qty=3, new_qty=4 → 2*4/3 ≈ 2.666 → round=3（验证四舍五入）
 #[tokio::test]
 async fn update_assembly_scales_child_quantities_rounding_and_floor() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户K", "F").await;
     let l2 = insert_l2_customer(&pool, "子客K", l1).await;
     insert_serial_counter(&pool, "F", 0).await;

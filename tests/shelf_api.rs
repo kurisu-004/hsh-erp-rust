@@ -7,8 +7,8 @@
 //! 3. `set_shelf_processes_replaces_existing_mapping` — mapping 端点整组替换。
 //!
 //! ## 并行
-//! 所有用例共享 `postgres_rust_test` + `uk_t_shelf_code` 唯一约束，用
-//! 进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //!
 //! ## 认证
 //! 用 MANAGER 用户跑通（POST /shelves 写路径要求 M-only，按设计 §6.1 用 M 即可）。
@@ -36,7 +36,6 @@ use common::{
 // ===========================================================================
 // 全局串行化 + helpers（与 customer_api.rs / process_api.rs 同形）
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -70,13 +69,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
@@ -175,7 +173,7 @@ async fn insert_test_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 /// 货架创建 + 详情往返：`location` 字段必须出现在 response 里。
 #[tokio::test]
 async fn create_then_get_shelf_round_trip() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "shelf_create").await;
 
     let (s_create, env_create) = send(
@@ -228,7 +226,7 @@ async fn create_then_get_shelf_round_trip() {
 /// → 20503 `BIZ_SHELF_IN_USE`（与 brief Step 1 一致）。
 #[tokio::test]
 async fn create_shelf_then_deactivate_with_in_use_part_fails() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "shelf_in_use").await;
 
     // 1. 创建 PRODUCTION 货架（带 location）
@@ -282,7 +280,7 @@ async fn create_shelf_then_deactivate_with_in_use_part_fails() {
 /// 旧映射 (P1) 软删、新映射 (P2+P3) 在场。
 #[tokio::test]
 async fn set_shelf_processes_replaces_existing_mapping() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "shelf_map").await;
 
     // 1. 创建 INSPECTION 货架

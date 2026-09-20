@@ -19,7 +19,8 @@
 //!  16. worker_no_work_type_returns_error
 //!
 //! ## 串行化
-//! 进程级 `tokio::sync::Mutex` + `--test-threads=1` 双保险。共享 `postgres_rust_test` 库。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex / `--test-threads=1` 双保险。
 //!
 //! ## clippy allow
 //! 2026-09-16 PR-3：fixture helper（`insert_pool_part` / `insert_worker_held_part` /
@@ -48,7 +49,6 @@ use common::{
 //  全局串行化 + HTTP helpers
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -81,14 +81,13 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup() -> (tokio::sync::MutexGuard<'static, ()>, PgPool) {
+async fn setup() -> PgPool {
     use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
-    let guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 // ----- 角色登录 helper -----
@@ -443,7 +442,7 @@ async fn count_held_by_worker(pool: &PgPool, worker_id: i64) -> i64 {
 /// 场景 1: worker-scan INSPECTED → 自动 refill
 #[tokio::test]
 async fn worker_scan_inspected_triggers_refill() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL").await;
     let proc = seed_process(&pool, "PROC-A", "工序A").await;
     let wt = insert_work_type(&pool, "WT-A", "工种A", Some(5)).await;
@@ -498,7 +497,7 @@ async fn worker_scan_inspected_triggers_refill() {
 /// 场景 2: worker-scan RETURNED → 自动 refill
 #[tokio::test]
 async fn worker_scan_returned_triggers_refill() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL2").await;
     let proc = seed_process(&pool, "PROC-B", "工序B").await;
     let wt = insert_work_type(&pool, "WT-B", "工种B", Some(5)).await;
@@ -546,7 +545,7 @@ async fn worker_scan_returned_triggers_refill() {
 /// 场景 3: 池空时 refill 返回 empty + pool_empty=true
 #[tokio::test]
 async fn refill_when_pool_empty_returns_empty() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL3").await;
     let proc = seed_process(&pool, "PROC-C", "工序C").await;
     let wt = insert_work_type(&pool, "WT-C", "工种C", Some(10)).await;
@@ -604,7 +603,7 @@ async fn refill_when_pool_empty_returns_empty() {
 /// 场景 4: refill 上限 = max_held_batches
 #[tokio::test]
 async fn refill_caps_at_max_held_batches() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL4").await;
     let proc = seed_process(&pool, "PROC-D", "工序D").await;
     let wt = insert_work_type(&pool, "WT-D", "工种D", Some(5)).await;
@@ -654,7 +653,7 @@ async fn concurrent_refill_no_double_pick() {
 /// 场景 6: refill 限定 shelf 范围（worker 只能从所绑 shelf 的池里抢）
 #[tokio::test]
 async fn refill_respects_shelf_scope() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL6").await;
     let proc = seed_process(&pool, "PROC-F", "工序F").await;
     let wt = insert_work_type(&pool, "WT-F", "工种F", Some(5)).await;
@@ -703,7 +702,7 @@ async fn refill_skips_concurrently_modified_batch() {
 /// 场景 8: worker-scan 越权 shelf → 40301 SHELF_MISMATCH
 #[tokio::test]
 async fn worker_scan_shelf_scope_violation_403() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL8").await;
     let proc = seed_process(&pool, "PROC-H", "工序H").await;
     let wt = insert_work_type(&pool, "WT-H", "工种H", Some(5)).await;
@@ -742,7 +741,7 @@ async fn worker_scan_shelf_scope_violation_403() {
 /// 场景 9: take 更新 t_part.current_holder_id = worker_id
 #[tokio::test]
 async fn take_updates_t_part_holder() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL9").await;
     let proc = seed_process(&pool, "PROC-I", "工序I").await;
     let wt = insert_work_type(&pool, "WT-I", "工种I", Some(5)).await;
@@ -796,7 +795,7 @@ async fn take_updates_t_part_holder() {
 /// 场景 10: take 不更新 placed_at
 #[tokio::test]
 async fn take_does_not_update_placed_at() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL10").await;
     let proc = seed_process(&pool, "PROC-J", "工序J").await;
     let wt = insert_work_type(&pool, "WT-J", "工种J", Some(5)).await;
@@ -855,7 +854,7 @@ async fn take_does_not_update_placed_at() {
 /// 场景 11: t_part_event 持久化 TAKEN_FROM_POOL / RETURNED_TO_SHELF / SENT_TO_INSPECTION
 #[tokio::test]
 async fn events_persisted_to_t_part_event() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL11").await;
     let proc = seed_process(&pool, "PROC-K", "工序K").await;
     let wt = insert_work_type(&pool, "WT-K", "工种K", Some(5)).await;
@@ -921,7 +920,7 @@ async fn events_persisted_to_t_part_event() {
 /// 场景 12: admin refill 端点
 #[tokio::test]
 async fn admin_refill_endpoint_works() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL12").await;
     let proc = seed_process(&pool, "PROC-L", "工序L").await;
     let wt = insert_work_type(&pool, "WT-L", "工种L", Some(3)).await;
@@ -960,7 +959,7 @@ async fn admin_refill_endpoint_works() {
 /// 场景 13: admin_remove 把持有批次放回候选池
 #[tokio::test]
 async fn admin_remove_returns_batch_to_pool() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL13").await;
     let proc = seed_process(&pool, "PROC-M", "工序M").await;
     let wt = insert_work_type(&pool, "WT-M", "工种M", Some(5)).await;
@@ -1033,7 +1032,7 @@ async fn refill_failure_rolls_back_worker_scan() {
 /// 场景 15: work_type.max_held_batches = NULL → 20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET
 #[tokio::test]
 async fn max_held_null_returns_error() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL15").await;
     let proc = seed_process(&pool, "PROC-O", "工序O").await;
     let wt = insert_work_type(&pool, "WT-O", "工种O", None).await;
@@ -1070,7 +1069,7 @@ async fn max_held_null_returns_error() {
 /// 实际：worker.work_type_id = NULL → BIZ_WORKER_NO_WORK_TYPE (20206)
 #[tokio::test]
 async fn worker_no_work_type_returns_error() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL16").await;
     let proc = seed_process(&pool, "PROC-P", "工序P").await;
     let wt = insert_work_type(&pool, "WT-P", "工种P", Some(5)).await;
@@ -1138,7 +1137,7 @@ async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 /// 跨货架候选批次列表。排序：system_delivery_date ASC NULLS LAST → is_urgent DESC → id ASC。
 #[tokio::test]
 async fn pool_by_process_happy() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     // L1 + L2 客户（L2.parent_id = L1.id → 触发 "L1 / L2" 路径）
     let l1 = insert_customer_l2(&pool, "L1-NAME").await;
     let l2 = insert_l2_customer(&pool, "L2-NAME", l1).await;
@@ -1218,7 +1217,7 @@ async fn pool_by_process_happy() {
 /// 场景 H2: 不存在的 process_id → 20801 BIZ_PROCESS_NOT_FOUND + 404
 #[tokio::test]
 async fn pool_by_process_process_not_found() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let proc = seed_process(&pool, "PROC-NF", "工序NF").await;
     let _wt = insert_work_type(&pool, "WT-NF", "工种NF", Some(3)).await;
     link_work_type_to_process(&pool, _wt, proc).await;
@@ -1235,7 +1234,7 @@ async fn pool_by_process_process_not_found() {
 /// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（service 守卫：Manager/Clerk/Inspector only）
 #[tokio::test]
 async fn pool_by_process_forbidden_for_shelf_account() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let proc = seed_process(&pool, "PROC-FB", "工序FB").await;
     let wt = insert_work_type(&pool, "WT-FB", "工种FB", Some(3)).await;
     link_work_type_to_process(&pool, wt, proc).await;
@@ -1253,7 +1252,7 @@ async fn pool_by_process_forbidden_for_shelf_account() {
 /// 场景 H4: process 存在但无候选批次 → total=0, items=[]，元数据正常返回
 #[tokio::test]
 async fn pool_by_process_no_candidates_when_no_batch() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let proc = seed_process(&pool, "PROC-EMPTY", "空工序").await;
     let wt = insert_work_type(&pool, "WT-EMPTY", "空工种", Some(3)).await;
     link_work_type_to_process(&pool, wt, proc).await;
@@ -1297,7 +1296,7 @@ async fn pool_by_process_no_candidates_when_no_batch() {
 /// - TAKEN_FROM_POOL 事件写入（note='admin_assign'）
 #[tokio::test]
 async fn admin_assign_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL17").await;
     let proc = seed_process(&pool, "PROC-AA", "工序AA").await;
     let wt = insert_work_type(&pool, "WT-AA", "工种AA", Some(3)).await;
@@ -1406,7 +1405,7 @@ async fn admin_assign_happy_path() {
 /// worker max_held=2 已持 2 批，再 assign 第 3 批 → 422 + 20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED
 #[tokio::test]
 async fn admin_assign_capacity_exceeded() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL18").await;
     let proc = seed_process(&pool, "PROC-CAP", "工序CAP").await;
     let wt = insert_work_type(&pool, "WT-CAP", "工种CAP", Some(2)).await;
@@ -1471,7 +1470,7 @@ async fn admin_assign_capacity_exceeded() {
 /// 422 + 20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER
 #[tokio::test]
 async fn admin_assign_batch_not_in_pool() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL19").await;
     let proc = seed_process(&pool, "PROC-NP", "工序NP").await;
     let wt = insert_work_type(&pool, "WT-NP", "工种NP", Some(3)).await;
@@ -1536,7 +1535,7 @@ async fn admin_assign_batch_not_in_pool() {
 /// 422 + 20104 BIZ_INVALID_VALUE
 #[tokio::test]
 async fn admin_assign_process_id_mismatch() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "POOL20").await;
     let proc1 = seed_process(&pool, "PROC-PM1", "工序PM1").await;
     let proc_other: i64 = 9_999_999_999_998; // 故意一个远大于实际生成的"错误"process

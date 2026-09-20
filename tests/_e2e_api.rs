@@ -9,8 +9,8 @@
 //! 6. `e2e_guard_disabled` → 把 state.config.enable_e2e_hooks 改 false，probe → 404
 //!
 //! ## 并行
-//! 与 customer_api.rs 共享 `postgres_rust_test` 库，用进程级
-//! `tokio::sync::Mutex` 串行化（避免 t_user / t_customer 唯一索引互相影响）。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化（与 customer_api 等互不影响 t_user / t_customer）。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -31,7 +31,6 @@ use hsh_erp_rust::auth::session::{CachedCurrentUser, RedisSessionStore, SessionS
 // ===========================================================================
 //  全局串行化 + helpers
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -57,19 +56,15 @@ fn json_request(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (
-    tokio::sync::MutexGuard<'a, ()>,
-    PgPool,
-    deadpool_redis::Pool,
-) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> (PgPool, deadpool_redis::Pool) {
+
     ensure_database_exists().await;
     let pool = test_pool().await;
     let redis = test_redis_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
     clean_redis(&redis).await;
-    (guard, pool, redis)
+    (pool, redis)
 }
 
 // ===========================================================================
@@ -78,7 +73,7 @@ async fn setup<'a>() -> (
 
 #[tokio::test]
 async fn probe_returns_ok_when_enabled() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
     let app = test_app(state);
 
@@ -96,7 +91,7 @@ async fn probe_returns_ok_when_enabled() {
 
 #[tokio::test]
 async fn reset_clears_seeded_metadata_only() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
     let app = test_app(state.clone());
 
@@ -152,7 +147,7 @@ async fn reset_clears_seeded_metadata_only() {
 
 #[tokio::test]
 async fn seed_customer_l1_then_l2() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
     let app = test_app(state);
 
@@ -224,7 +219,7 @@ async fn seed_customer_l1_then_l2() {
 
 #[tokio::test]
 async fn seed_user_with_roles_inserts_role_rows() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
     let app = test_app(state);
 
@@ -284,7 +279,7 @@ async fn seed_user_with_roles_inserts_role_rows() {
 
 #[tokio::test]
 async fn revoke_session_clears_redis_user_set() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
     let app = test_app(state.clone());
 
@@ -360,7 +355,7 @@ async fn revoke_session_clears_redis_user_set() {
 
 #[tokio::test]
 async fn e2e_guard_returns_404_when_disabled() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
 
     // 临时改 config 关掉 hook —— 需要独占可变访问（Arc<AppConfig> 是只读）
@@ -409,7 +404,7 @@ use hsh_erp_rust::infra::config::AppConfig;
 // - t_e2e_seeded 该 (entity, entity_id) 不存在（count=0）
 #[tokio::test]
 async fn hard_delete_outsource_company_removes_row_and_seeded_metadata() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
     let app = test_app(state);
 
@@ -471,7 +466,7 @@ async fn hard_delete_outsource_company_removes_row_and_seeded_metadata() {
 
 #[tokio::test]
 async fn hard_delete_outsource_company_idempotent_when_missing() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
     let app = test_app(state);
 
@@ -508,7 +503,7 @@ async fn hard_delete_outsource_company_idempotent_when_missing() {
 
 #[tokio::test]
 async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
 
     let mut new_config: AppConfig = (*state.config).clone();
@@ -549,7 +544,7 @@ async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
 
 #[tokio::test]
 async fn hard_delete_outsource_company_referenced_returns_409() {
-    let (_guard, pool, redis) = setup().await;
+    let (pool, redis) = setup().await;
     let state = test_state_with_redis(pool.clone(), redis.clone());
     let app = test_app(state);
 

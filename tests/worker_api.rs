@@ -8,8 +8,8 @@
 //!    （Task 4 修复：与「已激活无变化」场景分流）。
 //!
 //! ## 并行
-//! 所有用例共享 `postgres_rust_test` + `uk_t_worker_badge_code` 唯一约束，用
-//! 进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //!
 //! ## 认证
 //! 用 MANAGER 用户跑通（写路径要求 M-only，按设计 §6.1 用 M 即可）。
@@ -31,7 +31,6 @@ use common::{
 // ===========================================================================
 // 全局串行化 + helpers（与 customer_api.rs / process_api.rs / shelf_api.rs 同形）
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let uri = req.uri().to_string();
@@ -68,13 +67,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
@@ -103,7 +101,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
 
 #[tokio::test]
 async fn verify_badge_inactive_returns_20202() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "worker_admin").await;
 
     // Create worker (active by default).
@@ -168,7 +166,7 @@ async fn verify_badge_inactive_returns_20202() {
 /// 是 service 的正确分流必须能处理它。
 #[tokio::test]
 async fn reactivate_worker_version_conflict_returns_40901() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "worker_admin_vc").await;
 
     // 1) 建一个 active 工人

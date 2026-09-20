@@ -29,15 +29,13 @@ use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use sqlx::PgPool;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     common::ensure_database_exists().await;
     let pool = common::test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn send(
@@ -209,7 +207,7 @@ async fn insert_worker_min(pool: &PgPool, badge: &str, name: &str) -> i64 {
 ///    AND status = 'IN_PROCESS' AND deleted_at IS NULL`。
 #[tokio::test]
 async fn shelf_deactivate_rejects_when_held_by_active_batch() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (_l1, l2) = insert_l2_customer(&pool).await;
     let shelf_id = common::insert_shelf(&pool, "WSDA-SHELF", "WSDA", "PRODUCTION").await;
 
@@ -247,7 +245,7 @@ async fn shelf_deactivate_rejects_when_held_by_active_batch() {
 ///    AND status = 'IN_PROCESS' AND deleted_at IS NULL`。
 #[tokio::test]
 async fn worker_deactivate_rejects_when_holding_active_batch() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (_l1, l2) = insert_l2_customer(&pool).await;
     let worker_id = insert_worker_min(&pool, "WSDA-BC001", "工-WSDA").await;
 
@@ -281,7 +279,7 @@ async fn worker_deactivate_rejects_when_holding_active_batch() {
 /// 避免 PR-2 改查真相源后误把所有 deactivate 都拒。
 #[tokio::test]
 async fn shelf_deactivate_succeeds_when_no_active_holders() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let shelf_id = common::insert_shelf(&pool, "WSDA-EMPTY", "WSDA-empty", "PRODUCTION").await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;
@@ -301,7 +299,7 @@ async fn shelf_deactivate_succeeds_when_no_active_holders() {
 
 #[tokio::test]
 async fn worker_deactivate_succeeds_when_holding_nothing() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let worker_id = insert_worker_min(&pool, "WSDA-BC002", "工-WSDA-empty").await;
 
     let (app, token, _pool) = login_manager(pool, "mgr").await;

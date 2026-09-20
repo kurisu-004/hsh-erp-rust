@@ -13,7 +13,8 @@
 //!   INVALID_STATE:XXX   — status 不在 A 组（INSPECTION / READY_TO_SHIP）
 //!   VERSION_CONFLICT    — item.version 与 DB 不一致（OCC 失败）
 //!
-//! 并行 / 认证：共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 并行 / 认证：进程级 test_pool 每次 fresh database（plan 2 2026-09-20），
+//! DB 间 schema 完全独立，无需 Mutex 串行化。
 //! 每个用例 MANAGER token。
 
 #[path = "common/mod.rs"]
@@ -35,7 +36,6 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 //  全局串行化 + helpers
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -68,13 +68,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
@@ -268,7 +267,7 @@ async fn submit_note(app: axum::Router, token: &str, note_id: i64, pool: &PgPool
 /// 这是最基础的 happy path：弹窗勾选后批量 attach 全成功。
 #[tokio::test]
 async fn attach_batches_normal_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABN00001")).await;
@@ -326,7 +325,7 @@ async fn attach_batches_normal_path() {
 /// 验证乐观锁路径：不影响其它 item（这里只 1 个 item）。
 #[tokio::test]
 async fn attach_batches_occ_conflict_via_wrong_version() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABOCC0001")).await;
@@ -377,7 +376,7 @@ async fn attach_batches_occ_conflict_via_wrong_version() {
 /// 3. ALREADY_ATTACHED：batch 已挂在别的 note 上 → 200 + conflicts 含 ALREADY_ATTACHED。
 #[tokio::test]
 async fn attach_batches_already_attached_conflict() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABA00001")).await;
@@ -426,7 +425,7 @@ async fn attach_batches_already_attached_conflict() {
 /// 验证：A 组过滤在 attach 路径同样生效，非 INSPECTION/READY_TO_SHIP 一律拒绝。
 #[tokio::test]
 async fn attach_batches_invalid_state_conflict() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABI00001")).await;
@@ -475,7 +474,7 @@ async fn attach_batches_invalid_state_conflict() {
 /// 状态机进入 SUBMITTED 后整单已对外承诺，不能再 attach。
 #[tokio::test]
 async fn attach_batches_non_draft_note_returns_409() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABND00001")).await;
@@ -522,7 +521,7 @@ async fn attach_batches_non_draft_note_returns_409() {
 /// 单事务内对每个 item 至少 2 次 DB 调用；上限 200 防恶意请求长期持有连接。
 #[tokio::test]
 async fn attach_batches_too_many_items_returns_400() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let note_id = create_draft_note(&pool, l1).await;
 
@@ -561,7 +560,7 @@ async fn attach_batches_too_many_items_returns_400() {
 /// 验证：单 item 失败不中断其它 item；`attached` 与 `conflicts.len()` 之和等于总 items。
 #[tokio::test]
 async fn attach_batches_partial_success() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 

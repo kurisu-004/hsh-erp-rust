@@ -8,7 +8,8 @@
 //!   - to-inspection partial-split：PENDING 批次 qty=10 → quantity=3，拆批
 //!
 //! ## 并行 / 认证
-//! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //! 每个用例 INSPECTOR token（白名单）。
 
 #[path = "common/mod.rs"]
@@ -32,7 +33,7 @@ use helpers::*;
 /// to-ship + to-process 三步；此用例只验证送检（to-inspection）单步。
 #[tokio::test]
 async fn to_inspection_from_pending_succeeds() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -65,7 +66,7 @@ async fn to_inspection_from_pending_succeeds() {
 /// to-inspection happy path：PROGRAMMING → INSPECTION。
 #[tokio::test]
 async fn to_inspection_from_programming_succeeds() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -98,7 +99,7 @@ async fn to_inspection_from_programming_succeeds() {
 /// service 层组合校验：IN_PROCESS + 当前 holder 是 PRODUCTION 货架才放行。
 #[tokio::test]
 async fn to_inspection_from_in_process_production_shelf_succeeds() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -142,7 +143,7 @@ async fn to_inspection_from_in_process_production_shelf_succeeds() {
 /// service 用 `ShelfRepo::get_by_id(current_holder_id)` 返回 None 启发式识别 worker 持有。
 #[tokio::test]
 async fn to_inspection_in_process_worker_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -187,7 +188,7 @@ async fn to_inspection_in_process_worker_rejected() {
 /// holder 是 INSPECTION 货架 → service 拒绝「不在生产架上」。
 #[tokio::test]
 async fn to_inspection_in_process_non_production_shelf_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -232,7 +233,7 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
 /// to-inspection 拒绝：target_inspection_shelf.zone = PRODUCTION → 20511。
 #[tokio::test]
 async fn to_inspection_target_shelf_wrong_zone_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -262,7 +263,7 @@ async fn to_inspection_target_shelf_wrong_zone_rejected() {
 /// to-inspection 拒绝：target_inspection_shelf.is_active = false → 20512。
 #[tokio::test]
 async fn to_inspection_target_shelf_inactive_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -300,7 +301,7 @@ async fn to_inspection_target_shelf_inactive_rejected() {
 /// batch-to-inspection 拒绝：items 为空 → 422 / 40001 VALIDATION_ERROR。
 #[tokio::test]
 async fn batch_to_inspection_empty_items_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
 
@@ -324,7 +325,7 @@ async fn batch_to_inspection_empty_items_rejected() {
 /// batch-to-inspection 拒绝：items 数量 > 200 → 422 / 40001 VALIDATION_ERROR。
 #[tokio::test]
 async fn batch_to_inspection_too_many_items_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
     let items: Vec<i64> = (1..=201).collect();
@@ -358,7 +359,7 @@ async fn batch_to_inspection_too_many_items_rejected() {
 /// to-XXX 重命名后 BatchOpItem 用 `batch_id` 定位失败项，`part_id` 已删除。
 #[tokio::test]
 async fn batch_to_inspection_mixed_partial_success() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -417,7 +418,7 @@ async fn batch_to_inspection_mixed_partial_success() {
 /// batch-to-inspection 权限：CLERK 越权 → 403 / 40300 FORBIDDEN。
 #[tokio::test]
 async fn batch_to_inspection_clerk_forbidden() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_clerk(pool, "clerk1").await;
     let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
 
@@ -452,7 +453,7 @@ async fn batch_to_inspection_clerk_forbidden() {
 /// `mark_batch_inspected` 的 WHERE 守卫。
 #[tokio::test]
 async fn to_inspection_partial_split_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, pool) = login_inspector(pool, "inspector1").await;
@@ -536,7 +537,7 @@ async fn to_inspection_partial_split_happy_path() {
 ///      → 断言 200 + part.status="READY_TO_SHIP"（核心验收：扫码弹窗 → 品检通过）
 #[tokio::test]
 async fn part_batches_returns_narrow_part_and_batches_with_holder() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -678,7 +679,7 @@ async fn part_batches_returns_narrow_part_and_batches_with_holder() {
 /// `code::BIZ_PART_NOT_FOUND (20101)`，message 形如 `serial_no XXX 不存在`。
 #[tokio::test]
 async fn part_batches_serial_not_found_returns_20101() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "manager_scan_miss").await;
 
     let (status, body) = send(
@@ -713,7 +714,7 @@ async fn part_batches_serial_not_found_returns_20101() {
 /// pattern 与 `tests/worker_pool_api.rs::pool_by_process_forbidden_for_shelf_account` 同形。
 #[tokio::test]
 async fn part_batches_role_guard_rejects_unauthorized() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let serial_no = format!(

@@ -26,7 +26,6 @@ use common::{
 // ===========================================================================
 //  全局串行化 + helpers
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let uri = req.uri().to_string();
@@ -63,13 +62,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
@@ -119,7 +117,7 @@ async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 
 #[tokio::test]
 async fn create_outsource_company_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "oc_admin").await;
 
     let (s, env) = send(
@@ -142,7 +140,7 @@ async fn create_outsource_company_happy_path() {
 
 #[tokio::test]
 async fn create_outsource_company_duplicate_returns_21202() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "oc_dup").await;
 
     let (s1, _) = send(
@@ -178,7 +176,7 @@ async fn create_outsource_company_duplicate_returns_21202() {
 /// 单线程顺序测试通常命中前者，但保证两种路径下都不返 500。
 #[tokio::test]
 async fn create_outsource_company_duplicate_returns_409() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "oc_dup409").await;
 
     let (s1, _) = send(
@@ -217,7 +215,7 @@ async fn create_outsource_company_duplicate_returns_409() {
 
 #[tokio::test]
 async fn create_outsource_company_with_process_ids_creates_mapping() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "oc_proc").await;
     let p1 = seed_outsource_process(&pool, "PROC-O-1", "外协工序1").await;
     let p2 = seed_outsource_process(&pool, "PROC-O-2", "外协工序2").await;
@@ -260,7 +258,7 @@ async fn create_outsource_company_with_process_ids_creates_mapping() {
 
 #[tokio::test]
 async fn update_outsource_company_version_conflict_returns_40901() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "oc_vc").await;
 
     let (_, env_c) = send(
@@ -292,7 +290,7 @@ async fn update_outsource_company_version_conflict_returns_40901() {
 
 #[tokio::test]
 async fn soft_delete_outsource_company_in_use_returns_21205() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "oc_inuse").await;
     let p1 = seed_outsource_process(&pool, "PROC-INUSE", "外协INUSE").await;
     let (_, env_c) = send(
@@ -326,7 +324,7 @@ async fn soft_delete_outsource_company_in_use_returns_21205() {
 
 #[tokio::test]
 async fn list_outsource_companies_name_like_and_is_active_filter() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "oc_list").await;
 
     // 3 个公司：A 激活、B 激活、C 停用
@@ -373,7 +371,7 @@ async fn list_outsource_companies_name_like_and_is_active_filter() {
 
 #[tokio::test]
 async fn set_outsource_company_processes_replaces_mapping() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "oc_setproc").await;
     let p1 = seed_outsource_process(&pool, "SP-1", "sp1").await;
     let p2 = seed_outsource_process(&pool, "SP-2", "sp2").await;
@@ -418,7 +416,7 @@ async fn set_outsource_company_processes_replaces_mapping() {
 
 #[tokio::test]
 async fn list_outsource_companies_by_process_filters_inactive() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "oc_byp").await;
     let p = seed_outsource_process(&pool, "BYP", "byp").await;
     // active

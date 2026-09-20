@@ -10,7 +10,8 @@
 //!   7. process_id 不存在 → 20801 BIZ_PROCESS_NOT_FOUND
 //!
 //! ## 串行化
-//! 进程级 `tokio::sync::Mutex` + `--test-threads=1` 双保险。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex / `--test-threads=1` 双保险。
 //!
 //! ## clippy allow
 //! 2026-09-16 PR-3：fixture helper（`insert_pool_part` / `insert_work_type` /
@@ -37,7 +38,6 @@ use common::{
 //  全局串行化 + HTTP helpers
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -70,14 +70,13 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup() -> (tokio::sync::MutexGuard<'static, ()>, PgPool) {
+async fn setup() -> PgPool {
     use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
-    let guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
@@ -289,7 +288,7 @@ async fn insert_pool_part(
 /// 场景 1: COUNT mode happy —— fill_ratio=1.0 抢满 max_held_batches
 #[tokio::test]
 async fn auto_allocate_count_mode_full_fill() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "AC1").await;
     let proc = seed_process(&pool, "PROC-AC1", "工序").await;
     let wt = insert_work_type(&pool, "WT-AC1", "工种", Some(5), None).await;
@@ -335,7 +334,7 @@ async fn auto_allocate_count_mode_full_fill() {
 /// 场景 2: COUNT mode fill_ratio=0 → 抢 0 个
 #[tokio::test]
 async fn auto_allocate_count_mode_zero_fill() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "AC2").await;
     let proc = seed_process(&pool, "PROC-AC2", "工序").await;
     let wt = insert_work_type(&pool, "WT-AC2", "工种", Some(10), None).await;
@@ -380,7 +379,7 @@ async fn auto_allocate_count_mode_zero_fill() {
 /// 但本测试场景下池里只放 1 件，pool_empty=true 即可；target 数值仍按 60 验证。）
 #[tokio::test]
 async fn auto_allocate_time_mode_target_calc() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let proc = seed_process(&pool, "PROC-AC3", "工序").await;
     // TIME 模式需要 max_held_minutes 设置；同时为兼容 take_one_from_pool CTE 也设 max_held_batches
     let wt = insert_work_type(&pool, "WT-AC3", "工种", Some(5), Some(120)).await;
@@ -417,7 +416,7 @@ async fn auto_allocate_time_mode_target_calc() {
 /// 场景 4: TIME mode 但 max_held_minutes IS NULL → 20703
 #[tokio::test]
 async fn auto_allocate_time_mode_minutes_not_set() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let customer = insert_customer_l2(&pool, "AC4").await;
     let proc = seed_process(&pool, "PROC-AC4", "工序").await;
     // max_held_batches 也设，max_held_minutes NULL
@@ -459,7 +458,7 @@ async fn auto_allocate_time_mode_minutes_not_set() {
 /// 场景 5: fill_ratio > 1.0 → 20704
 #[tokio::test]
 async fn auto_allocate_rejects_ratio_above_one() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let proc = seed_process(&pool, "PROC-AC5", "工序").await;
     let shelf = common::insert_shelf(&pool, "PROD-AC5", "PROD-AC5", "PRODUCTION").await;
 
@@ -486,7 +485,7 @@ async fn auto_allocate_rejects_ratio_above_one() {
 /// 场景 5b: fill_ratio < 0.0 → 20704
 #[tokio::test]
 async fn auto_allocate_rejects_negative_ratio() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let proc = seed_process(&pool, "PROC-AC5B", "工序").await;
     let shelf = common::insert_shelf(&pool, "PROD-AC5B", "PROD-AC5B", "PRODUCTION").await;
 
@@ -513,7 +512,7 @@ async fn auto_allocate_rejects_negative_ratio() {
 /// 场景 6: 池空 → pool_empty=true
 #[tokio::test]
 async fn auto_allocate_pool_empty() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let proc = seed_process(&pool, "PROC-AC6", "工序").await;
     let wt = insert_work_type(&pool, "WT-AC6", "工种", Some(5), None).await;
     link_work_type_to_process(&pool, wt, proc).await;
@@ -548,7 +547,7 @@ async fn auto_allocate_pool_empty() {
 /// 场景 7: process_id 不存在 → 20801
 #[tokio::test]
 async fn auto_allocate_process_not_found() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let shelf = common::insert_shelf(&pool, "PROD-AC7", "PROD-AC7", "PRODUCTION").await;
     let nonexistent: i64 = 9_999_999_999_999;
 

@@ -8,8 +8,8 @@
 // 5. soft-delete 检查引用 → 20803 BIZ_PROCESS_IN_USE（挂 part.next_process_id）
 
 // ## 并行
-// 所有用例共享 `postgres_rust_test` + `uk_t_process_code` 唯一约束，用
-// 进程级 `tokio::sync::Mutex` 串行化。
+// 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+// 完全独立，无需 Mutex 串行化。
 // ## 认证
 // 用 MANAGER 用户跑通（POST /processes 写路径要求 M-only，按设计 §6.1 用 M 即可）。
 
@@ -30,7 +30,6 @@ use common::{
 // ===========================================================================
 // 全局串行化 + helpers（与 customer_api.rs / worker_pool_api.rs 同形）
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -63,13 +62,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
@@ -126,7 +124,7 @@ async fn insert_part_with_next_process(pool: &PgPool, process_id: i64) -> i64 {
 /// （与 Python `_assert_inhouse_no_approval` 对齐）。
 #[tokio::test]
 async fn create_process_inhouse_forces_requires_approval_false() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "proc_inhouse").await;
 
     let (s, env) = send(
@@ -156,7 +154,7 @@ async fn create_process_inhouse_forces_requires_approval_false() {
 /// OUTSOURCE 工序：保留 `requires_approval` 默认 true。
 #[tokio::test]
 async fn create_process_outsource_keeps_requires_approval_default_true() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "proc_outsrc").await;
 
     let (s, env) = send(
@@ -185,7 +183,7 @@ async fn create_process_outsource_keeps_requires_approval_default_true() {
 /// 重复 code：撞 `uk_t_process_code` 部分唯一索引 → 20802 BIZ_PROCESS_DUPLICATE_CODE。
 #[tokio::test]
 async fn create_process_duplicate_code_returns_20802() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "proc_dup").await;
 
     let (_s1, env1) = send(
@@ -233,7 +231,7 @@ async fn create_process_duplicate_code_returns_20802() {
 /// update INHOUSE 显式 `requires_approval=true` → 20104 BIZ_INVALID_VALUE。
 #[tokio::test]
 async fn update_process_inhouse_requires_approval_true_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "proc_inh_apv").await;
 
     let (_s1, env1) = send(
@@ -280,7 +278,7 @@ async fn update_process_inhouse_requires_approval_true_rejected() {
 /// 字段维持原值。修复前该路径会在 DB 层无谓重写 `requires_approval=false` 并 bump version。
 #[tokio::test]
 async fn update_process_inhouse_no_approval_field_does_not_bump_version() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "proc_inh_noop").await;
 
     let (_s1, env1) = send(
@@ -329,7 +327,7 @@ async fn update_process_inhouse_no_approval_field_does_not_bump_version() {
 /// update 时改 `code` 必拒 → 20104 BIZ_INVALID_VALUE（code 是业务唯一键，不可变）。
 #[tokio::test]
 async fn update_process_code_change_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "proc_code_lock").await;
 
     // 创建一个工序
@@ -376,7 +374,7 @@ async fn update_process_code_change_rejected() {
 /// 软删前查引用：`t_part.next_process_id` 仍有引用 → 20803 BIZ_PROCESS_IN_USE。
 #[tokio::test]
 async fn soft_delete_process_referenced_by_part_returns_20803() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "proc_in_use").await;
 
     let (_s1, env1) = send(
@@ -429,7 +427,7 @@ async fn soft_delete_process_referenced_by_part_returns_20803() {
 /// 建工序带 color `#RRGGBBAA` → fetch 拿回原文；缺省字段不出现在响应。
 #[tokio::test]
 async fn create_process_color_round_trip() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "proc_color").await;
 
     // 1. create with color
@@ -465,7 +463,7 @@ async fn create_process_color_round_trip() {
 /// 不传 color → 响应字段缺省（skip_serializing_if = "Option::is_none"）。
 #[tokio::test]
 async fn create_process_no_color_omits_field() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "proc_nocolor").await;
     let (s, env) = send(
         app,
@@ -491,7 +489,7 @@ async fn create_process_no_color_omits_field() {
 /// color 格式错（不是 `#RRGGBBAA`）→ 20104 BIZ_INVALID_VALUE。
 #[tokio::test]
 async fn create_process_invalid_color_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "proc_badcolor").await;
     let (s, env) = send(
         app,
@@ -522,7 +520,7 @@ async fn create_process_invalid_color_rejected() {
 /// - 字段缺省 ⇒ 不改
 #[tokio::test]
 async fn update_process_color_tristate() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool, "proc_color_ts").await;
 
     // 建 + 初始 color
@@ -605,7 +603,7 @@ async fn update_process_color_tristate() {
 #[tokio::test]
 async fn soft_delete_process_referenced_by_chain_step_returns_20803() {
     use hsh_erp_rust::infra::clock::now_naive;
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "proc_chain_step_ref").await;
 
     // 建一个 process

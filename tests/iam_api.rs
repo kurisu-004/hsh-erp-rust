@@ -9,9 +9,8 @@
 //! 6. /iam/users/{id}/roles 添加 SHELF_ACCOUNT / 重复分配 409
 //!
 //! ## 测试并行注意
-//! 所有用例共享同一个 `postgres_rust_test` 库 + `t_user.username` 唯一索引（partial）。
-//! 多个 `#[tokio::test]` 并发跑时会相互覆盖 fixture，撞唯一约束。
-//! 用一个进程级 `tokio::sync::Mutex` 在每个用例入口序列化对 DB 的写入/截断。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立（每个用例 fresh database，无 fixture 覆盖 / 唯一约束撞车问题）。
 //! 这是测试基建约束，不是产品代码约束——产品代码里每个 tx 都是原子的。
 //!
 //! 2026-09-19 IAM 域合并：从 `tests/auth_api.rs` 整体迁移过来，路径全改为
@@ -35,7 +34,6 @@ use common::{
 // ===========================================================================
 // 全局串行化互斥：所有测试共享同一 DB，必须串行访问避免 fixture 冲突。
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 取单测用的 username → 在 DB 中回查 user_id
 async fn get_user_id(pool: &sqlx::PgPool, username: &str) -> i64 {
@@ -102,12 +100,11 @@ async fn login_admin(app: axum::Router, username: &str, password: &str) -> (Stat
 ///
 /// **重要**：返回的 `MutexGuard` 必须绑到 `_guard` 一直活到用例结束，否则锁在
 /// `setup()` 返回时立刻释放，后续用例会并发跑、相互覆盖 fixture。
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, sqlx::PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> sqlx::PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 // ===========================================================================
@@ -116,7 +113,7 @@ async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, sqlx::PgPool) {
 
 #[tokio::test]
 async fn login_success_returns_token_pair_and_stamps_last_login() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     let uid = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
@@ -150,7 +147,7 @@ async fn login_success_returns_token_pair_and_stamps_last_login() {
 
 #[tokio::test]
 async fn login_unknown_user_returns_40101() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let _ = pool;
 
     let state = test_state(pool).await;
@@ -163,7 +160,7 @@ async fn login_unknown_user_returns_40101() {
 
 #[tokio::test]
 async fn login_wrong_password_returns_40101() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     insert_user_with_password(&pool, "admin", "changeme").await;
 
@@ -177,7 +174,7 @@ async fn login_wrong_password_returns_40101() {
 
 #[tokio::test]
 async fn login_inactive_user_returns_40101() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     insert_inactive_user(&pool, "admin", "changeme").await;
 
@@ -191,7 +188,7 @@ async fn login_inactive_user_returns_40101() {
 
 #[tokio::test]
 async fn login_user_with_no_roles_returns_403_20606() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     insert_user_with_password(&pool, "lonely", "changeme").await;
     // 不插角色
@@ -210,7 +207,7 @@ async fn login_user_with_no_roles_returns_403_20606() {
 
 #[tokio::test]
 async fn me_success_returns_full_user_view() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     let uid = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
@@ -235,7 +232,7 @@ async fn me_success_returns_full_user_view() {
 
 #[tokio::test]
 async fn me_without_authorization_returns_401() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let _ = pool;
 
     let state = test_state(pool).await;
@@ -252,7 +249,7 @@ async fn me_without_authorization_returns_401() {
 
 #[tokio::test]
 async fn refresh_rotates_token_and_bumps_version() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     let uid = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
@@ -290,7 +287,7 @@ async fn refresh_rotates_token_and_bumps_version() {
 
 #[tokio::test]
 async fn refresh_reusing_old_token_returns_40103() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     let uid = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
@@ -340,7 +337,7 @@ async fn refresh_reusing_old_token_returns_40103() {
 
 #[tokio::test]
 async fn change_password_invalidates_old_refresh_token() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     insert_user_with_password(&pool, "admin", "changeme").await;
     let uid = get_user_id(&pool, "admin").await;
@@ -388,7 +385,7 @@ async fn change_password_invalidates_old_refresh_token() {
 
 #[tokio::test]
 async fn change_password_wrong_old_password_returns_40104() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     insert_user_with_password(&pool, "admin", "changeme").await;
     let uid = get_user_id(&pool, "admin").await;
@@ -420,7 +417,7 @@ async fn change_password_wrong_old_password_returns_40104() {
 
 #[tokio::test]
 async fn list_users_without_manager_role_returns_403() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     // 创建 admin（MANAGER） + 普通 user（CLERK）
     let admin_id = insert_user_with_password(&pool, "admin", "changeme").await;
@@ -449,7 +446,7 @@ async fn list_users_without_manager_role_returns_403() {
 
 #[tokio::test]
 async fn add_shelf_account_role_succeeds_for_manager() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     let admin_id = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, admin_id, "MANAGER", None, None).await;
@@ -485,7 +482,7 @@ async fn add_shelf_account_role_succeeds_for_manager() {
 
 #[tokio::test]
 async fn add_duplicate_role_returns_409() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     let admin_id = insert_user_with_password(&pool, "admin", "changeme").await;
     add_role(&pool, admin_id, "MANAGER", None, None).await;
@@ -528,23 +525,19 @@ async fn add_duplicate_role_returns_409() {
 // Redis session 集成测试（PR-1 兼容期 IAM 域端到端测试）
 // ===========================================================================
 
-async fn setup_with_redis<'a>() -> (
-    tokio::sync::MutexGuard<'a, ()>,
-    sqlx::PgPool,
-    deadpool_redis::Pool,
-) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup_with_redis() -> (sqlx::PgPool, deadpool_redis::Pool) {
+
     ensure_database_exists().await;
     let pg_pool = test_pool().await;
     clean_db(&pg_pool).await;
     let redis_pool = test_redis_pool().await;
     clean_redis(&redis_pool).await;
-    (guard, pg_pool, redis_pool)
+    (pg_pool, redis_pool)
 }
 
 #[tokio::test]
 async fn logout_kills_current_session() {
-    let (_guard, pool, redis_pool) = setup_with_redis().await;
+    let (pool, redis_pool) = setup_with_redis().await;
 
     insert_user_with_password(&pool, "admin", "changeme").await;
     let uid = get_user_id(&pool, "admin").await;

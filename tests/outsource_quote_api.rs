@@ -26,7 +26,6 @@ use common::{
 // ===========================================================================
 //  Helpers
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let uri = req.uri().to_string();
@@ -63,13 +62,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login(pool: PgPool, username: &str, role: &str) -> (axum::Router, String) {
@@ -200,7 +198,7 @@ async fn setup_basic(pool: &PgPool) -> (i64, i64, i64) {
 
 #[tokio::test]
 async fn create_quote_draft_happy() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "q_admin").await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
@@ -226,7 +224,7 @@ async fn create_quote_draft_happy() {
 
 #[tokio::test]
 async fn create_quote_duplicate_returns_21303() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "q_dup").await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
@@ -257,7 +255,7 @@ async fn create_quote_duplicate_returns_21303() {
 
 #[tokio::test]
 async fn quote_full_lifecycle_draft_submit_approve() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "q_life").await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
@@ -313,7 +311,7 @@ async fn quote_full_lifecycle_draft_submit_approve() {
 
 #[tokio::test]
 async fn approve_quote_clerk_forbidden_40300() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app_mgr, m_token) = login_manager(pool.clone(), "q_clerk_mgr").await;
     let (app_clerk, c_token) = login_clerk(pool.clone(), "q_clerk").await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
@@ -362,7 +360,7 @@ async fn approve_quote_clerk_forbidden_40300() {
 
 #[tokio::test]
 async fn reject_quote_requires_review_note() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "q_rej").await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
@@ -422,7 +420,7 @@ async fn reject_quote_requires_review_note() {
 
 #[tokio::test]
 async fn submit_quote_wrong_status_returns_21302() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "q_ws").await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
@@ -470,7 +468,7 @@ async fn submit_quote_wrong_status_returns_21302() {
 
 #[tokio::test]
 async fn soft_delete_quote_approved_forbidden() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "q_sd").await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
     let (_, env_c) = send(

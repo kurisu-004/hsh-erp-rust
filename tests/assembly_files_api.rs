@@ -31,15 +31,13 @@ use lopdf::{Document, Object, ObjectId, dictionary};
 use sqlx::PgPool;
 use std::sync::Arc;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
@@ -172,7 +170,7 @@ async fn seed_assembly(pool: &PgPool) -> (i64, i64, i64) {
 
 #[tokio::test]
 async fn upload_files_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let cos = Arc::new(NoopCos);
@@ -239,7 +237,7 @@ async fn upload_files_happy_path() {
 
 #[tokio::test]
 async fn upload_files_ext_must_be_pdf() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let cos = Arc::new(NoopCos);
@@ -293,7 +291,7 @@ async fn upload_files_ext_must_be_pdf() {
 
 #[tokio::test]
 async fn start_pending_to_in_process() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
@@ -331,7 +329,7 @@ async fn start_pending_to_in_process() {
 
 #[tokio::test]
 async fn soft_delete_has_shipment_returns_20307() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
@@ -400,7 +398,7 @@ async fn soft_delete_has_shipment_returns_20307() {
 
 #[tokio::test]
 async fn three_state_note_clear_to_null() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
@@ -458,7 +456,7 @@ async fn three_state_note_clear_to_null() {
 
 #[tokio::test]
 async fn child_current_batch_id_in_detail() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 

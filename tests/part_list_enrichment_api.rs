@@ -29,15 +29,13 @@ use helpers::*;
 //  全局串行化
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, sqlx::PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> sqlx::PgPool {
     common::ensure_database_exists().await;
     let pool = common::test_pool().await;
     common::clean_db(&pool).await;
     common::clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 /// 在 part 上追加一个非默认 status / location / holder 的批次。
@@ -104,7 +102,7 @@ async fn insert_insp_shelf(pool: &sqlx::PgPool, code: &str) -> i64 {
 /// 期望：list 返回 `location="OFFICE"`，`holder_name=null`（PENDING 批次无 holder）。
 #[tokio::test]
 async fn list_returns_min_progress_batch_location_and_holder() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let prod_shelf = insert_insp_shelf(&pool, "PROD-LIST-001").await;
@@ -174,7 +172,7 @@ async fn list_returns_min_progress_batch_location_and_holder() {
 /// 没有非软删批次（即 `list_active_by_part_ids` 返回空）。
 #[tokio::test]
 async fn list_returns_null_location_when_no_active_batches() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -212,7 +210,7 @@ async fn list_returns_null_location_when_no_active_batches() {
 /// 直接验证 holder_name 解析路径（PRODUCTION_SHELF → t_shelf.code）。
 #[tokio::test]
 async fn list_resolves_production_shelf_holder_to_shelf_code() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let prod_shelf = insert_insp_shelf(&pool, "SHELF-CODE-XYZ").await;
@@ -265,7 +263,7 @@ async fn list_resolves_production_shelf_holder_to_shelf_code() {
 /// active batch.location 命中白名单的 part。OFFICE 批次的 part 不应出现。
 #[tokio::test]
 async fn list_filters_by_locations_param() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let prod_shelf = insert_insp_shelf(&pool, "PROD-LOC-001").await;
@@ -325,7 +323,7 @@ async fn list_filters_by_locations_param() {
 /// - part_z：批次 1 holder=另一个 shelf → 不命中
 #[tokio::test]
 async fn list_filters_by_holder_ids_param_polymorphic() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let shelf_a = insert_insp_shelf(&pool, "PROD-HOLDER-001").await;
@@ -427,7 +425,7 @@ async fn list_filters_by_holder_ids_param_polymorphic() {
 /// 不传过滤 → 应全部返回。
 #[tokio::test]
 async fn list_without_locations_or_holder_ids_returns_all() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let prod_shelf = insert_insp_shelf(&pool, "PROD-BASE-001").await;
@@ -477,7 +475,7 @@ async fn list_without_locations_or_holder_ids_returns_all() {
 /// holder_ids 包含非法雪花 ID → 返回 40001 VALIDATION_ERROR（service 层 parse 失败兜底）。
 #[tokio::test]
 async fn list_holder_ids_invalid_format_returns_40001() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
