@@ -1,7 +1,9 @@
-# 2026-09-20 新增：限制集成测试并发数，避免 36 binary 同时拉起几十个
-# PG 容器压垮本机 / CI runner。默认 RUST_TEST_THREADS 是 CPU 数（典型 8-16），
-# cargo test 实际还会加上 binary 数倍线程（test 框架自身），实测默认会瞬间
-# 拉起 36 个 postgres:18-alpine 容器。强制 4 是经验值 —— 4 并发 × ~30s 启动
-# 总时间可控，CI 上跑完 ~10min 内存峰值 ~6GB。
+# 2026-09-20：限制集成测试并发数 + 自定义 runner（修复 ephemeral-postgres 容器泄漏）
+#
+# runner 接管 PG 容器生命周期（绑到 binary 进程，shell trap EXIT 清理）。
+# 详细见 scripts/test_runner.sh 的 4 个转义口 + 主路径设计。
 [test]
 env = { RUST_TEST_THREADS = "4" }
+
+[target.'cfg(unix)']
+runner = "scripts/test_runner.sh"
