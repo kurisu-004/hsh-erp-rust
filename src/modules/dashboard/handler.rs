@@ -4,7 +4,11 @@
 //! 再由 `modules::ws_router()` 在 `/ws` 前缀下挂）。
 //!
 //! 实现要点：
-//! - query token 鉴权：解 JWT + 验签 + 查 Redis session（如 `session_check_enabled=true`）
+//! - query token 鉴权：走 `auth::middleware::verify_access_token` 共享核验函数
+//!   （与 HTTP middleware 同源：Bearer JWT 验签 + iss 校验 + Redis session 校验
+//!   + 滑动 TTL；本 handler 不重复实现，2026-09-20 重构）
+//! - WS 不走 axum middleware（query-token 而非 Bearer；WS upgrade 帧也无法被
+//!   HTTP middleware 拦截），故单独调一次 `verify_access_token`
 //! - 任意已登录（*）即可连接
 //! - WS 升级：`axum::extract::ws::WebSocketUpgrade`
 //! - 业务事件订阅：把 `state.ws_hub.broadcast` 上的 `WsEvent::DashboardEvent`
@@ -24,9 +28,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::auth::jwt::decode_access;
-use crate::auth::rbac::{CurrentUser, parse_role_str_or_warn};
-use crate::auth::session::hash_token;
+use crate::auth::middleware::verify_access_token;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::dashboard::dto::{WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
 use crate::modules::dashboard::service::DashboardService;
@@ -44,71 +46,21 @@ pub async fn ws_dashboard(
     Query(q): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    // 1. 鉴权
+    // 1. 鉴权：与 HTTP middleware 同源（详见 `auth::middleware::verify_access_token`）
     let token = q
         .token
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "缺少 token 查询参数"))?;
-    let claims = decode_access(token, &state.config.jwt.secret, &state.config.jwt.issuer)?;
+    let (user, _token_hash) = verify_access_token(&state, token).await?;
+    // 2026-09-20 修改：username 写日志，便于按用户名排查连接异常；当前端点任意已登录即可，
+    // 故不调用 user.require_role(...)。未来若加「仅 MANAGER 可见」再启用 require_role 守卫。
+    info!(user_id = user.id, username = %user.username, "ws dashboard: 鉴权通过");
+    let user_id = user.id;
 
-    // 2. 服务端 session 校验（与 HTTP extractor 同语义）
-    let cached_roles = if state.config.redis.session_check_enabled {
-        let token_hash = hash_token(token);
-        let cached = state
-            .session
-            .get_session(&token_hash)
-            .await?
-            .ok_or_else(|| AppError::biz(code::SESSION_REVOKED, "会话已被吊销，请重新登录"))?;
-        if cached.user_id != claims.sub {
-            return Err(AppError::biz(
-                code::SESSION_REVOKED,
-                "会话已被吊销，请重新登录",
-            ));
-        }
-        // 滑动 TTL（best-effort）
-        if let Err(e) = state
-            .session
-            .touch_session(&token_hash, state.config.redis.session_ttl_seconds)
-            .await
-        {
-            warn!(error = %e, "ws dashboard: 刷新 session TTL 失败");
-        }
-        cached.cached.roles
-    } else {
-        // 关闭时直接用 JWT claims 的 roles
-        claims
-            .roles
-            .iter()
-            .map(|r| match r {
-                crate::auth::rbac::Role::Manager => "MANAGER".to_string(),
-                crate::auth::rbac::Role::Clerk => "CLERK".to_string(),
-                crate::auth::rbac::Role::Inspector => "INSPECTOR".to_string(),
-                crate::auth::rbac::Role::CncProgrammer => "CNC_PROGRAMMER".to_string(),
-                crate::auth::rbac::Role::ShelfAccount => "SHELF_ACCOUNT".to_string(),
-            })
-            .collect()
-    };
-
-    // 3. 构造 CurrentUser（仅用于日志/后续权限扩展；本端点任意已登录）
-    let mut roles = Vec::with_capacity(cached_roles.len());
-    for r in &cached_roles {
-        if let Some(role) = parse_role_str_or_warn(r) {
-            roles.push(role);
-        }
-    }
-    let _current = CurrentUser {
-        id: claims.sub,
-        username: claims.username.clone(),
-        roles,
-        shelf_ids: claims.shelf_ids.clone(),
-        shelf_wildcard: claims.shelf_wildcard,
-    };
-
-    // 4. 升级 + 把 state + user_id 移交给子任务
+    // 2. 升级 + 把 state + user_id 移交给子任务
     let state_clone = state.clone();
-    let user_id = claims.sub;
     let resp = ws.on_upgrade(move |socket| handle_socket(socket, state_clone, user_id));
     Ok(resp)
 }

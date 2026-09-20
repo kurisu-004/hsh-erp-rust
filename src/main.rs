@@ -4,15 +4,30 @@
 //!   tracing init → 配置 → PgPool → 雪花 ID → WS 广播中枢 → COS 客户端（占位）
 //!   → CancellationToken → AppState → 后台任务 spawn → Router nest (/api/v2 /api/mcp /ws)
 //!   → axum::serve + graceful_shutdown (Ctrl-C → 取消后台任务)
+//!
+//! 2026-09-20 新增：5 个 tower / tower-http 中间件（外层 + nest 内层）：
+//! - 外层：RequestId / PropagateRequestId / CatchPanic / Trace / CORS / Body limit
+//! - 内层（仅 `/api/v2` nest）：Compression（gzip）/ Timeout（默认 30s）
+//!   WS nest **不**挂 Compression 与 Timeout（前者会压 upgrade 响应，后者会杀长连接）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use axum::Json;
 use axum::Router;
+use axum::extract::Request as AxumRequest;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::response::Response;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
+use tower_http::catch_panic::CatchPanicLayer;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -167,13 +182,54 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 10. 路由组装
+    // 2026-09-20 修复 review #1：axum `.layer()` 语义是「**后加的在外层**」
+    // （tower Layer 的 Service wrapped 顺序：后调用的 Layer 包裹先调用的），
+    // 因此下面按「**内→外**」顺序书写（最先 `.layer` 的是最内层），
+    // request 实际执行顺序（外→内）为：
+    //   BodyLimit → CORS → SetRequestId → PropagateRequestId → CatchPanic
+    //     → TraceLayer(make_span_with) → router
+    // 关键：SetRequestId 必须在 TraceLayer 外侧跑，否则 `make_request_span`
+    // 读不到注入的 `x-request-id` header，所有 span 都退化成 `request_id = "-"`。
+    //
+    // 越外层越先看到 request / 后看到 response；越内层越先看到 response。
+    //
+    // nest 内层（仅 `/api/v2`）：Compression（gzip 响应压缩）+ Timeout（请求超时）。
+    // **TimeoutLayer 是 nest 内最外层（覆盖 Compression）** —— 先超时判定、再 gzip 响应，
+    // 即超时分支直接 408 plain 不会被压缩；超时与压缩均只对 `/api/v2` 子树生效。
+    // WS nest **不**挂这两层：Compression 会压缩 WS upgrade 响应（破坏握手），
+    // Timeout 会杀 WS 心跳长连接。两者都必须局限在 `/api/v2` 子树内。
     let max_body = state.config.max_request_body_size;
+    let request_timeout = Duration::from_secs(state.config.request_timeout_seconds);
+    let api_v2 = modules::v2_router(state.clone())
+        .layer(CompressionLayer::new()) // gzip 响应压缩（nest 内层）
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            request_timeout,
+        )); // 请求级超时（nest 内最外层，覆盖 Compression；不影响 WS）
     let app: Router = Router::new()
-        .nest("/api/v2", modules::v2_router())
+        .nest("/api/v2", api_v2)
         .nest("/ws", modules::ws_router())
-        .layer(RequestBodyLimitLayer::new(max_body))
-        .layer(TraceLayer::new_for_http())
+        // ----- 安全 / 可观测层（按内→外书写：最先 .layer 的是最内层） -----
+        // 1) Trace 定制：span 带 request_id/method/path，on_response 记 status+耗时
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(make_request_span)
+                .on_response(trace_on_response),
+        )
+        // 2) Panic 兜底：handler panic → 统一 500 信封（不是断连）
+        .layer(CatchPanicLayer::custom(handle_panic))
+        // 3) 回写 x-request-id 到响应头
+        .layer(PropagateRequestIdLayer::x_request_id())
+        // 4) RequestId：生成或透传 x-request-id（必须在 TraceLayer 外侧）
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        // 5) CORS（现状保留）
         .layer(CorsLayer::permissive())
+        // 6) Body limit（现状保留）
+        .layer(RequestBodyLimitLayer::new(max_body))
+        // 2026-09-20 修复 review #1：state 同时是 `Arc<AppState>`（中间件用：
+        // `route_layer(from_fn_with_state(state.clone(), auth_middleware))`）
+        // 与 `Router<S = Arc<AppState>>` 的 S（handler extractor 用）的同一 Arc，
+        // `state.clone()` 两次仅 bump Arc 引用计数、不做深拷贝。
         .with_state(state.clone());
 
     // 11. 监听
@@ -200,4 +256,67 @@ async fn main() -> anyhow::Result<()> {
 
     info!("服务退出");
     Ok(())
+}
+
+// ===========================================================================
+// 2026-09-20 新增：tower_http 中间件回调 fn pointer（满足 Fn / FnMut / FnOnce
+// + Clone + Send + Sync + 'static，详见 tower-http 文档对 TraceLayer /
+// CatchPanicLayer 的 trait bound 要求）。
+// ===========================================================================
+
+/// Panic 兜底：handler panic → 统一 500 信封（与 AppError::into_response 同形）。
+///
+/// `code: 50000 / INTERNAL` 是系统错误的固定段，HTTP 500。fn pointer 形式满足
+/// `CatchPanicHandler` trait bound（自动实现）。
+///
+/// 2026-09-20 修复 review #1：原实现 `_err` 直接吞掉，运维侧拿不到 panic payload
+/// 难以定位事故现场。现 downcast 出 `&str`（最常见 panic 信息形式）后走
+/// `tracing::error!` 落地日志；`String` payload 也兼容；其它类型退化为类型名。
+/// panic 仍以 500 信封对外 —— 日志仅作运维排查依据，**不**泄漏到客户端。
+#[allow(dead_code)]
+fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
+    // 2026-09-20 修复 review #1：downcast payload 落日志（运维排查）
+    let payload = if let Some(s) = err.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    };
+    tracing::error!(panic = %payload, "handler panic（被 CatchPanicLayer 兜底为 500）");
+    let body = serde_json::json!({
+        "code": hsh_erp_rust::shared::error::code::INTERNAL,
+        "message": "internal server error",
+        "data": serde_json::Value::Null,
+    });
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+}
+
+/// TraceLayer 的 span 工厂：每个 HTTP 请求一个 `http_request` span，
+/// 含 method / path / request_id（来自 SetRequestIdLayer 注入的 header）。
+#[allow(dead_code)]
+fn make_request_span(req: &AxumRequest) -> tracing::Span {
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-");
+    tracing::info_span!(
+        "http_request",
+        method = %req.method(),
+        path = %req.uri().path(),
+        request_id = %request_id,
+    )
+}
+
+/// TraceLayer 的响应回调。成功走 `info!`，4xx/5xx 走 `warn!`（CI 日志分级友好）。
+#[allow(dead_code)]
+fn trace_on_response(resp: &Response, latency: Duration, _span: &tracing::Span) {
+    let status = resp.status();
+    let latency_ms = latency.as_millis();
+    if status.is_success() {
+        tracing::info!(status = %status, latency_ms = %latency_ms, "http response");
+    } else {
+        tracing::warn!(status = %status, latency_ms = %latency_ms, "http response");
+    }
 }

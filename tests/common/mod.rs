@@ -239,6 +239,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         enable_e2e_hooks: true,
         // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳，E2E WS 用例可在 2s 内验到 text 帧。
         ws_heartbeat_interval_seconds: 1,
+        // 2026-09-20 新增：HTTP nest 请求超时；30s 默认足够测试用例（<1s）。
+        request_timeout_seconds: 30,
         // 2026-09-18 新增：upload_session 域默认配置（测试场景）
         upload_session: UploadSessionConfig {
             python_backend_base_url: "http://backend-test:8000".into(),
@@ -275,8 +277,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
 
 /// 构造测试用 AppState：session check **关闭**，**不**建 Redis 池。
 ///
-/// 用途：验证 `REDIS_SESSION_CHECK_ENABLED=false` 时，extractor 直接用 JWT Claims
-/// 构造 CurrentUser，不依赖 Redis 进程存在。
+/// 用途：验证 `REDIS_SESSION_CHECK_ENABLED=false` 时，`auth::middleware::verify_access_token`
+/// 的关闭分支直接用 JWT Claims 构造 CurrentUser，不依赖 Redis 进程存在。
 ///
 /// 仅 `tests/auth_api.rs` 调用；其它 integration test 不引用 —— 故 `dead_code` 抑制。
 #[allow(dead_code)]
@@ -326,6 +328,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         enable_e2e_hooks: true,
         // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳。
         ws_heartbeat_interval_seconds: 1,
+        // 2026-09-20 新增：HTTP nest 请求超时。
+        request_timeout_seconds: 30,
         // 2026-09-18 新增：upload_session 域默认配置（测试场景）
         upload_session: UploadSessionConfig {
             python_backend_base_url: "http://backend-test:8000".into(),
@@ -427,6 +431,8 @@ pub async fn test_state_with_cos(
         delivery_note_template_dir: std::path::PathBuf::from("template"),
         enable_e2e_hooks: true,
         ws_heartbeat_interval_seconds: 1,
+        // 2026-09-20 新增：HTTP nest 请求超时。
+        request_timeout_seconds: 30,
         // 2026-09-18 新增：upload_session 域默认配置（测试场景）
         upload_session: UploadSessionConfig {
             python_backend_base_url: "http://backend-test:8000".into(),
@@ -461,12 +467,17 @@ pub async fn test_state_with_cos(
 
 /// axum Router：与 main.rs 中的 `/api/v2` nest 同形。
 ///
-/// 不再装 `inject_current_user_layer`：handler 现在用 `current: CurrentUser`
-/// 直接参数（依赖 `CurrentUser` 的 `FromRequestParts<Arc<AppState>>` impl 自动
-/// 从 Bearer JWT 解析），与生产路径一致。
+/// 2026-09-20 修改：`v2_router(state)` 收 Arc<AppState>（用于 from_fn_with_state 挂
+/// auth_middleware），不再需要额外 `with_state`；中间件已内置，handler 端
+/// `current: CurrentUser` 直接从 extensions 读。
+///
+/// 显式 `with_state(state.clone())` 把 `Router<Arc<AppState>>` 类型擦回到
+/// `axum::Router`（S 由调用方 inference），让测试侧 `send(app: axum::Router)`
+/// 无需改签名。
 #[allow(dead_code)]
 pub fn test_app(state: Arc<AppState>) -> axum::Router {
-    hsh_erp_rust::modules::v2_router().with_state(state)
+    let state_for_router = state.clone();
+    hsh_erp_rust::modules::v2_router(state).with_state(state_for_router)
 }
 
 /// axum Router：与 main.rs 中的 `/ws` nest 同形（用于 dashboard WS E2E 测试）。

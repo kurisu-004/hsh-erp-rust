@@ -31,6 +31,10 @@ pub struct AppConfig {
     /// 生产 30s；测试可调小到 1s 以便在 CI 内验证 heartbeat text 帧。
     /// 环境变量 `WS_HEARTBEAT_INTERVAL_SECONDS`，缺省 `30`。
     pub ws_heartbeat_interval_seconds: u64,
+    /// 2026-09-20 新增：HTTP `/api/v2/*` nest 请求超时（秒）。仅挂在 nest 内层
+    /// （不影响 WS 长连接，也不影响根 Router 的 CORS/Body limit）。环境变量
+    /// `REQUEST_TIMEOUT_SECONDS`，缺省 `30`。
+    pub request_timeout_seconds: u64,
     /// 2026-09-18 新增：上传会话域配置（Redis 会话机制 + python STS 转发）。
     pub upload_session: UploadSessionConfig,
 }
@@ -226,6 +230,8 @@ impl AppConfig {
             enable_e2e_hooks: env_bool("E2E_HOOKS_ENABLED", true)?,
             // 2026-09-15 followup-cleanup A5/A6：dashboard WS 心跳间隔（秒）；生产 30，测试可调小。
             ws_heartbeat_interval_seconds: env_parse("WS_HEARTBEAT_INTERVAL_SECONDS", 30u64)?,
+            // 2026-09-20 新增：HTTP nest 请求超时；与 WS 隔离（挂在内层）。
+            request_timeout_seconds: env_parse("REQUEST_TIMEOUT_SECONDS", 30u64)?,
             // 2026-09-18 新增：upload_session 域配置
             upload_session: UploadSessionConfig {
                 python_backend_base_url: env_or("PYTHON_BACKEND_BASE_URL", "http://backend:8000"),
