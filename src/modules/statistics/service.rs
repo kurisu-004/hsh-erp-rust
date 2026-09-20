@@ -16,6 +16,8 @@ use chrono::NaiveDate;
 use sqlx::PgConnection;
 
 use crate::infra::clock::now_naive;
+use crate::modules::prod::work_type::repo::WorkTypeRepo;
+use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::statistics::dto::{
     DayCount, DeliveryPerformance, OverviewOut, PickupSkipDetailItem, PickupSkipDetailOut,
     PickupSkipSummaryItem, PickupSkipSummaryOut, StatusCount, WorkerBrief, WorkerDetailOut,
@@ -24,8 +26,6 @@ use crate::modules::statistics::dto::{
 use crate::modules::statistics::repo::{
     PickupSkipDetailRow, PickupSkipSummaryRow, StatisticsRepo, WorkerPartRow, WorkerPickupRow,
 };
-use crate::modules::prod::work_type::repo::WorkTypeRepo;
-use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
 pub struct StatisticsService;

@@ -62,16 +62,40 @@ pub struct JwtConfig {
     pub refresh_ttl_days: i64,
 }
 
+/// COS 客户端 backend 选择（2026-09-20 spike 新增，2026-09-20 迁移清理后只保留两路）。
+///
+/// 迁移清理前曾保留三路（`cos_sdk` / `opendal` / `noop`）；迁完只保留
+/// `OpenDal` + `Noop`，删掉 `cos_sdk`（及其依赖的 `cos-rust-sdk` + 手写 V1 签名
+/// Presigner，详见 `OPENDAL_SPIKE.md` §12）。
+///
+/// 通过 `COS_BACKEND` 环境变量切换：
+/// - `opendal`（默认）：走 `OpenDalCos`（Apache OpenDAL S3 backend）
+/// - `noop`：强制走 `NoopCos`，与 `COS_ENABLED=false` 效果相同（本地 cargo run / 集成测）
+///
+/// 选 `opendal` 时仍受 `COS_ENABLED` 控制：enabled=true → `OpenDalCos`，
+/// enabled=false → `NoopOpenDal`（与 spike 业务回归测试路径对齐）。
+///
+/// 非法值（如历史 `.env` 残留的 `cos_sdk`）→ 解析失败并报错，不静默 fallback。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CosBackend {
+    OpenDal,
+    Noop,
+}
+
 #[derive(Clone, Debug)]
 pub struct CosConfig {
+    /// 2026-09-20 spike 新增；2026-09-20 迁移清理后保留 2 路（`OpenDal` / `Noop`）。
+    /// env `COS_BACKEND` 解析，缺省 `OpenDal`（迁移默认从 `cos_sdk` 切到 `opendal`）。
+    pub backend: CosBackend,
     /// 是否启用真实 COS 上传。
     ///
-    /// - true：使用 TencentCos（真实 PUT/GET/DELETE 到腾讯云）；
-    /// - false：使用 NoopCos（静默成功，不真传，本地调试用）。
+    /// - true：使用 OpenDalCos（真实上传到腾讯云，S3 v4 兼容）
+    /// - false：使用 NoopOpenDal（OpenDAL Memory backend 本地内存占位，**不走网络**）
     ///
     /// 环境变量 `COS_ENABLED`，缺省 `true`。
     ///
-    /// 2026-09-11 新增
+    /// 2026-09-11 新增；2026-09-20 迁移：NoopCos 仅保留给 `COS_BACKEND=noop` 显式场景，
+    /// `enabled=false` 默认走 OpenDalCos 路径下的 NoopOpenDal（保持 OpenDAL 全链路可测）。
     pub enabled: bool,
     pub region: String,
     pub bucket: String,
@@ -84,26 +108,17 @@ pub struct CosConfig {
     /// 2026-09-11 新增
     pub app_id: String,
     /// 可选 endpoint 覆盖（私有化部署 / 加速域名）。
-    /// 留空走标准 endpoint：`{scheme}://{bucket}-{appid}.cos.{region}.myqcloud.com`。
+    /// 留空走标准 endpoint：`{scheme}://cos.{region}.myqcloud.com`。
     /// 环境变量 `COS_ENDPOINT`，缺省空串。
     ///
-    /// 2026-09-11 新增
+    /// 2026-09-11 新增；2026-09-20 spike 修正：endpoint 拼装去掉 `-{app_id}` 后缀，
+    /// 由 OpenDAL 配合 `enable_virtual_host_style()` 把 bucket 名（已含 appid 后缀）
+    /// 整体作为 virtual-host 第一段。
     pub endpoint: String,
     pub scheme: String,
     pub upload_prefix: String,
     pub presign_expire_seconds: u32,
     pub max_file_size: usize,
-    /// STS 临时凭证有效期（秒）。
-    ///
-    /// - 2026-09-16 M2-A：原 `TencentSts`（已删除 2026-09-18）用此值调 GetFederationToken。
-    /// - 2026-09-18：字段保留以兼容历史 `.env`（`COS_STS_DURATION_SECONDS`），新逻辑改
-    ///   用 `UploadSessionConfig::sts_duration_seconds`（`UPLOAD_SESSION_STS_DURATION_SECONDS`）。
-    ///   字段当前未被任何代码读取，留待未来清理；不要删除以避免破坏现有 .env 配置。
-    ///
-    /// 2026-09-18 review #3 修复：`#[allow(dead_code)]` 抑制 clippy -D warnings
-    /// （字段保留是兼容 .env 的明确决策，非死代码）。
-    #[allow(dead_code)]
-    pub sts_duration_seconds: u32,
     /// COS 临时对象 prefix 模板前缀（默认 `tmp/`，含尾斜杠）。可用于多种场景：
     /// - confirm handler 校验 `tmp_key` 必须以此前缀开头
     /// - upload_session 域 `tmp/sess/<uuid>/` 派生时也以此前缀为锚
@@ -173,9 +188,38 @@ impl AppConfig {
 
             cos: {
                 // 2026-09-11 修改：先读 COS_ENABLED；disabled 时 COS_SECRET_* 不强制要求，
-                // 占位空串即可（NoopCos 不读凭据）。
+                // 占位空串即可（NoopCos / NoopOpenDal 不读凭据）。
                 let cos_enabled = env_bool("COS_ENABLED", true)?;
-                let (secret_id, secret_key) = if cos_enabled {
+                // 2026-09-20 迁移清理：env `COS_BACKEND` 仅支持 `opendal` / `noop`，
+                // 缺省 `opendal`（迁移默认从 `cos_sdk` 切到 `opendal`，与 spike 验证
+                // 结论一致）。非法值（如历史 `.env` 残留的 `cos_sdk`）→ 解析失败并
+                // 报错（不静默 fallback 到 `opendal`），便于 ops 显式确认旧配置已迁。
+                //
+                // 强制规则（2026-09-20 迁移新增）：
+                //   - COS_ENABLED=false → backend 强制 Noop（不论 env 怎么设），便于
+                //     「关掉 COS」的本地 cargo run / 集成测场景走最简路径
+                //   - COS_ENABLED=true + COS_BACKEND 未设 → 默认 OpenDal（生产推荐）
+                let backend_raw = std::env::var("COS_BACKEND").ok();
+                let backend = if !cos_enabled {
+                    CosBackend::Noop
+                } else {
+                    match backend_raw
+                        .unwrap_or_else(|| "opendal".to_string())
+                        .to_ascii_lowercase()
+                        .as_str()
+                    {
+                        "opendal" => CosBackend::OpenDal,
+                        "noop" => CosBackend::Noop,
+                        other => {
+                            return Err(anyhow!(
+                                "环境变量 COS_BACKEND 无法解析为合法 backend: {other:?} \
+                                 （仅支持 `opendal` / `noop`；2026-09-20 迁移清理后 \
+                                 删除 `cos_sdk` 选项）"
+                            ));
+                        }
+                    }
+                };
+                let (secret_id, secret_key) = if cos_enabled && backend != CosBackend::Noop {
                     (
                         env_required("COS_SECRET_ID")?,
                         env_required("COS_SECRET_KEY")?,
@@ -184,6 +228,7 @@ impl AppConfig {
                     (String::new(), String::new())
                 };
                 CosConfig {
+                    backend,
                     enabled: cos_enabled,
                     region: env_or("COS_REGION", "ap-shanghai"),
                     bucket: env_required("COS_BUCKET")?,
@@ -195,8 +240,9 @@ impl AppConfig {
                     upload_prefix: env_or("COS_UPLOAD_PREFIX", "uploads"),
                     presign_expire_seconds: env_parse("COS_PRESIGN_EXPIRE", 3600)?,
                     max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
-                    // 2026-09-16 M2-A：STS 凭证有效期 + tmp_prefix
-                    sts_duration_seconds: env_parse("COS_STS_DURATION_SECONDS", 900u32)?,
+                    // 2026-09-20 迁移：删 `sts_duration_seconds` 字段（spike 已记
+                    // 「未来清理」）；STS 链路完全走 `UploadSessionConfig::sts_duration_seconds`
+                    // + python 后端转发，与 COS 对象存储解耦。
                     tmp_prefix: env_or("COS_TMP_PREFIX", "tmp/"),
                 }
             },

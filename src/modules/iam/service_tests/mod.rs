@@ -25,7 +25,7 @@ use crate::auth::password;
 use crate::auth::rbac::CurrentUser;
 use crate::auth::session::{CachedCurrentUser, SessionStore, TokenKind};
 use crate::infra::config::{
-    AppConfig, AutoCompleteConfig, CosConfig, JwtConfig, RedisConfig, SnowflakeConfig,
+    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, RedisConfig, SnowflakeConfig,
     UploadSessionConfig,
 };
 use crate::infra::cos::NoopCos;
@@ -66,6 +66,8 @@ pub(crate) fn test_config() -> Arc<AppConfig> {
             refresh_ttl_days: 7,
         },
         cos: CosConfig {
+            // 2026-09-20 迁移清理：删 `sts_duration_seconds`；backend 从 `CosSdk` 改为 `OpenDal`。
+            backend: CosBackend::OpenDal,
             enabled: false,
             region: "ap-shanghai".into(),
             bucket: "test".into(),
@@ -77,7 +79,6 @@ pub(crate) fn test_config() -> Arc<AppConfig> {
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
             max_file_size: 1024,
-            sts_duration_seconds: 900,
             tmp_prefix: "tmp/".into(),
         },
         snowflake: SnowflakeConfig {

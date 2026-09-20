@@ -38,8 +38,8 @@ use crate::modules::part::repo::part::{PartListFilters, PartUpdate};
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
-use crate::modules::shelf::repo::ShelfRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
+use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto_crud::PartListOut;

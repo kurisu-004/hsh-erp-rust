@@ -40,9 +40,9 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
-use crate::modules::shelf::repo::ShelfRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::prod::worker_pool::dto::WorkerScanEvent;
+use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{WorkerScanCoreOut, WorkerScanRequest};

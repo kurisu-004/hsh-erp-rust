@@ -65,7 +65,7 @@ use ephemeral_postgres::postgres_image::PostgresImage;
 
 use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
-    AppConfig, AutoCompleteConfig, CosConfig, JwtConfig, RedisConfig as AppRedisConfig,
+    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, RedisConfig as AppRedisConfig,
     SnowflakeConfig, UploadSessionConfig,
 };
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
@@ -143,10 +143,12 @@ async fn fresh_database_url(cluster: &Cluster) -> String {
         .await
         .expect("connect ephemeral admin pool");
     let db_name = format!("test_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db_name}\"")))
-        .execute(&admin)
-        .await
-        .expect("CREATE DATABASE on ephemeral admin pool");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE \"{db_name}\""
+    )))
+    .execute(&admin)
+    .await
+    .expect("CREATE DATABASE on ephemeral admin pool");
     // admin pool 在函数末尾 drop，PG 后端进程立即关闭。
     drop(admin);
     format!("{}/{db_name}", cluster.base_url())
@@ -308,7 +310,11 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         },
         cos: CosConfig {
             // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
-            // 2026-09-16 M2-A：新增 sts_duration_seconds / tmp_prefix 字段（STS 占位用）。
+            // 2026-09-20 spike：新增 backend 字段。
+            // 2026-09-20 迁移清理：删 `sts_duration_seconds` 字段；backend 从 `CosSdk`
+            // 改为 `OpenDal`（迁移后唯一真实 backend）。测试场景 `enabled=false` → 走
+            // `NoopOpenDal`（OpenDAL Memory backend 本地内存）。
+            backend: CosBackend::OpenDal,
             enabled: false,
             region: "ap-shanghai".into(),
             bucket: "test".into(),
@@ -320,7 +326,6 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
-            sts_duration_seconds: 900,
             tmp_prefix: "tmp/".into(),
         },
         snowflake: SnowflakeConfig {
@@ -397,7 +402,9 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         },
         cos: CosConfig {
             // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
-            // 2026-09-16 M2-A：新增 sts_duration_seconds / tmp_prefix 字段（STS 占位用）。
+            // 2026-09-20 spike：新增 backend 字段。
+            // 2026-09-20 迁移清理：删 `sts_duration_seconds`；backend 从 `CosSdk` 改为 `OpenDal`。
+            backend: CosBackend::OpenDal,
             enabled: false,
             region: "ap-shanghai".into(),
             bucket: "test".into(),
@@ -409,7 +416,6 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
-            sts_duration_seconds: 900,
             tmp_prefix: "tmp/".into(),
         },
         snowflake: SnowflakeConfig {
@@ -502,6 +508,8 @@ pub async fn test_state_with_cos(
             refresh_ttl_days: 7,
         },
         cos: CosConfig {
+            // 2026-09-20 迁移清理：删 `sts_duration_seconds`；backend 从 `CosSdk` 改为 `OpenDal`。
+            backend: CosBackend::OpenDal,
             enabled: false,
             region: "ap-shanghai".into(),
             bucket: "test".into(),
@@ -513,7 +521,6 @@ pub async fn test_state_with_cos(
             upload_prefix: "uploads".into(),
             presign_expire_seconds: 3600,
             max_file_size: 314_572_800,
-            sts_duration_seconds: 900,
             tmp_prefix: "tmp/".into(),
         },
         snowflake: SnowflakeConfig {
@@ -1053,7 +1060,8 @@ impl CosClient for MockCos {
             .get(key)
             .cloned()
             .ok_or_else(|| {
-                // 与 TencentCos 行为对齐：404 → NoSuchKey 包装为业务错误
+                // 业务层 head_object 期望语义清晰：不存在 → 业务侧 404 / NoSuchKey
+                // 包装为业务错误（与 OpenDalCos 行为对齐）
                 AppError::biz(
                     code::BIZ_PART_FILE_UPLOAD_FAILED,
                     format!("MockCos head_object NoSuch key={key}"),

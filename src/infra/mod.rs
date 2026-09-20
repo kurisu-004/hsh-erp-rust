@@ -4,6 +4,7 @@
 //! - `config`：应用配置（dotenvy + env 读取）
 //! - `db`：sqlx PgPool 构建
 //! - `cos`：腾讯云 COS 抽象（trait + NoopCos 占位）
+//! - `cos_opendal`：Apache OpenDAL S3 backend 实现的 COS 客户端（2026-09-20 spike）
 //! - `snowflake`：分布式雪花 ID 生成器
 //! - `clock`：Asia/Shanghai 时区工具
 //! - `serial`：业务单号/序列号计数（占位）
@@ -16,6 +17,7 @@
 pub mod clock;
 pub mod config;
 pub mod cos;
+pub mod cos_opendal; // 2026-09-20 spike：OpenDAL S3 backend 替代 cos-rust-sdk 可行性验证
 pub mod db;
 pub mod python_sts; // 2026-09-18 新增：转发 python 后端签发 STS
 pub mod redis;

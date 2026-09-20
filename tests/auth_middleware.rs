@@ -195,7 +195,11 @@ async fn forged_signature_returns_40100() {
     let forged: String = chars.into_iter().collect();
 
     let app2 = test_app(state);
-    let (status, env) = send(app2, json_request("GET", "/prod/workers", None, Some(&forged))).await;
+    let (status, env) = send(
+        app2,
+        json_request("GET", "/prod/workers", None, Some(&forged)),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "伪造签名应返 401: {env}");
     assert_eq!(env["code"], 40100, "伪造签名应返 UNAUTHORIZED (40100)");
 }
@@ -212,7 +216,11 @@ async fn expired_token_returns_40102() {
     let expired = mint_expired_token(&state, uid).await;
 
     let app = test_app(state);
-    let (status, env) = send(app, json_request("GET", "/prod/workers", None, Some(&expired))).await;
+    let (status, env) = send(
+        app,
+        json_request("GET", "/prod/workers", None, Some(&expired)),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
@@ -234,7 +242,11 @@ async fn valid_jwt_without_session_returns_40105() {
     let token = mint_token_no_session(&state, uid).await;
 
     let app = test_app(state);
-    let (status, env) = send(app, json_request("GET", "/prod/workers", None, Some(&token))).await;
+    let (status, env) = send(
+        app,
+        json_request("GET", "/prod/workers", None, Some(&token)),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,

@@ -81,15 +81,24 @@ dashmap = "6"                                                     # ws 连接注
 # 需重写代码。这里先用 "2" 走通后续 P4 实施；后续可统一升级 + 评估。
 umya-spreadsheet = "2"
 
-# 腾讯云 COS 客户端
-# 2026-09-11 新增：社区 SDK cos-rust-sdk（仿 cos-python-sdk-v5 风格）覆盖
-# put/get/delete/head 等高频方法；SDK 内部透传 reqwest（HTTP + 重试 + TLS）。
-cos-rust-sdk = "0.1"
-# presigned URL SDK 未提供，手写 V1 签名所需的轻量算法 crate
-hmac = "0.12"
-sha1 = "0.10"
-hex = "0.4"
-base64 = "0.22"
+# 2026-09-20 迁移清理：OpenDAL S3 backend（COS 兼容）+ reqwest HTTP 客户端。
+#
+# 历史（2026-09-11 ~ 2026-09-16）：用社区 SDK `cos-rust-sdk`（仿 cos-python-sdk-v5
+# 风格）覆盖 put/get/delete/head；presigned URL SDK 未提供，单独用 `hmac` + `sha1` +
+# `hex` + `base64` 手写 COS V1 签名（两步 HMAC-SHA1）。
+#
+# 2026-09-20 迁移：全量切到 Apache OpenDAL（services-s3 走 S3 v4 兼容，services-memory
+# 走本地 in-memory BTreeMap）；cos-rust-sdk/hmac/sha1/hex/base64 全删，codebase 净减
+# ~325 行（V1 Presigner / 已知向量测试 / percent_encode helpers）。详见
+# `OPENDAL_SPIKE.md` §7 + §12。
+#
+#   - services-s3：真实 COS 走 OpenDAL 内置 S3 builder + presign（S3 v4）
+#   - services-memory：本地 in-memory BTreeMap，单测 / 集成测 0 网络依赖
+#   - 0.53 无 TLS feature 名（TLS 由传递依赖 reqwest 自行选择，rustls 是默认）
+opendal = { version = "0.53", default-features = false, features = [
+    "services-s3",
+    "services-memory",
+] }
 
 # P4 print_xml_patch 用 zip crate 直接读写 xlsx 内部 entry（绕过 umya 的
 # _xlnm.Print_Aria 重复 + pageSetUpPr + shrinkToFit 缺口）。这是 umya-spreadsheet
@@ -102,9 +111,10 @@ quick-xml = "0.37"
 # 前端 onDownloadProgress 由浏览器原生 a.download 兜住）。
 tokio-stream = "0.1"
 
-# 2026-09-16 M2-A 新增：copy_object 走 reqwest PUT + x-cos-copy-source + 手写 V1 签名
-# （SDK 0.1.2 未暴露该接口，spike 已验证签名/编码规则）。rustls-tls 避免拖入 OpenSSL。
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# reqwest：OpenDAL 传递依赖 + python STS HTTP 转发（infra::python_sts.rs）+ 真 COS
+# 端到端回归测试（tests/cos_real_smoke.rs）。rustls-tls 避免拖入 OpenSSL；
+# `json` feature 是 `RequestBuilder::json()` 必需（python_sts.rs 用它序列化请求体）。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # 2026-09-18 M3-B 新增：upload_session 域 `tmp/sess/<session_uuid>/` 派生。
 # v4 随机 UUID；原 upload-intents batch_uuid 派生已删除（迁移至 upload_session）。

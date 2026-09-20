@@ -34,7 +34,8 @@ use tracing_subscriber::EnvFilter;
 
 use hsh_erp_rust::auth::session::{NoopSessionStore, RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::AppConfig;
-use hsh_erp_rust::infra::cos::{CosClient, NoopCos, TencentCos};
+use hsh_erp_rust::infra::cos::CosClient;
+use hsh_erp_rust::infra::cos_opendal::build_cos_client;
 use hsh_erp_rust::infra::db;
 use hsh_erp_rust::infra::python_sts::{HttpPythonSts, NoopPythonSts, PythonSts};
 use hsh_erp_rust::infra::redis;
@@ -80,18 +81,12 @@ async fn main() -> anyhow::Result<()> {
     // 5. WebSocket 广播中枢
     let ws_hub = Arc::new(WsHub::new());
 
-    // 6. COS 客户端（按 COS_ENABLED 选择真实上传或 NoopCos）
-    // 2026-09-11 修改：按 env 开关二选一构造；TencentCos::new 失败时 `?` 终止启动。
-    let cos: Arc<dyn CosClient> = if config.cos.enabled {
-        info!("COS_ENABLED=true，启用 TencentCos（真实上传到腾讯云 COS）");
-        Arc::new(
-            TencentCos::new(config.cos.clone())
-                .context("初始化 TencentCos 失败（检查 COS_SECRET_ID / KEY / BUCKET / REGION）")?,
-        )
-    } else {
-        info!("COS_ENABLED=false，使用 NoopCos（不上传真实文件，仅本地调试）");
-        Arc::new(NoopCos)
-    };
+    // 6. COS 客户端（按 `COS_BACKEND` 二选一：`opendal` / `noop`）
+    // 2026-09-11 修改：原二选一 `if config.cos.enabled` 构造 TencentCos / NoopCos。
+    // 2026-09-20 spike：扩展为三选一（`build_cos_client` 内部按 `CosBackend` enum dispatch）。
+    // 2026-09-20 迁移清理：删 `cos_sdk` 变体后回到二选一（`opendal` / `noop`），缺省
+    // `opendal`。`OpenDalCos::new` 失败时 `?` 终止启动；`NoopOpenDal` 永不失败。
+    let cos: Arc<dyn CosClient> = build_cos_client(&config.cos).context("构造 COS 客户端失败")?;
 
     // 6.4 Python STS 凭证转发客户端（2026-09-18 新增；替代原 TencentSts 直连）
     // 走 HTTP 转发到 python 后端内部端点 `/api/v1/files/sts-prefix-credentials`；
