@@ -21,15 +21,13 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::statistics::service::StatisticsService;
 use sqlx::PgPool;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn insert_work_type(pool: &PgPool, code: &str, name: &str) -> i64 {
@@ -132,7 +130,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 
 #[tokio::test]
 async fn overview_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     // 插一条 part 让 created_count > 0
     let l1 = insert_l1_customer(&pool, "客户S-1", "F").await;
     let l2 = insert_l2_customer(&pool, l1, "子客S-1").await;
@@ -157,7 +155,7 @@ async fn overview_happy_path() {
 
 #[tokio::test]
 async fn overview_invalid_date_range_returns_400() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let mut tx = pool.begin().await.unwrap();
     let err = StatisticsService::overview(
         &mut tx,
@@ -177,7 +175,7 @@ async fn overview_invalid_date_range_returns_400() {
 
 #[tokio::test]
 async fn workers_stats_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let wt = insert_work_type(&pool, "WT-S", "机加工").await;
     let w1 = insert_worker(&pool, "B001", "张三", Some(wt)).await;
     let w2 = insert_worker(&pool, "B002", "李四", Some(wt)).await;
@@ -247,7 +245,7 @@ async fn workers_stats_happy_path() {
 
 #[tokio::test]
 async fn worker_detail_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let wt = insert_work_type(&pool, "WT-D", "焊工").await;
     let w_id = insert_worker(&pool, "B003", "王五", Some(wt)).await;
     let l1 = insert_l1_customer(&pool, "客户S-3", "F").await;
@@ -288,7 +286,7 @@ async fn worker_detail_happy_path() {
 
 #[tokio::test]
 async fn pickup_skips_summary_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let wt = insert_work_type(&pool, "WT-SK", "车工").await;
     let w_id = insert_worker(&pool, "B004", "跳序工", Some(wt)).await;
     let l1 = insert_l1_customer(&pool, "客户S-4", "F").await;
@@ -335,7 +333,7 @@ async fn pickup_skips_summary_happy_path() {
 
 #[tokio::test]
 async fn pickup_skip_detail_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let wt = insert_work_type(&pool, "WT-SD", "铣工").await;
     let w_id = insert_worker(&pool, "B005", "跳序工D", Some(wt)).await;
     let l1 = insert_l1_customer(&pool, "客户S-5", "F").await;
@@ -390,7 +388,7 @@ async fn pickup_skip_detail_happy_path() {
 async fn count_in_process_at_date_to_boundary() {
     use hsh_erp_rust::modules::statistics::repo::StatisticsRepo;
 
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户S-6", "F").await;
     let l2 = insert_l2_customer(&pool, l1, "子客S-6").await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);

@@ -5,8 +5,8 @@
 //!    BIZ_CUSTOMER_IN_USE（因为 L1 仍被 t_part 引用）。
 //!
 //! ## 并行
-//! 所有用例共享 `postgres_rust_test` + 唯一约束 `uq_t_customer_root_prefix`，用
-//! 进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //!
 //! ## 认证
 //! 用 MANAGER 用户跑通（POST /com/customers 写路径要求 M/C，按设计 §6.1 用 M 即可；2026-09-19 聚合到 com nest）。
@@ -28,7 +28,6 @@ use common::{
 // ===========================================================================
 //  全局串行化 + helpers（与 delivery_group_api.rs 同形，按约定不跨文件复用）
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -62,13 +61,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
@@ -118,7 +116,7 @@ async fn insert_part_with_customer(pool: &PgPool, customer_id: i64) -> i64 {
 
 #[tokio::test]
 async fn create_customer_root_then_l2_then_soft_delete_in_use() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "cust_admin").await;
 
     // Create L1
@@ -184,7 +182,7 @@ async fn create_customer_root_then_l2_then_soft_delete_in_use() {
 
 #[tokio::test]
 async fn update_customer_serial_prefix_collision_returns_20104() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "cust_prefix").await;
 
     // Create two L1 customers with distinct serial_prefix values.

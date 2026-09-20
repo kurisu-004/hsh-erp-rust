@@ -6,7 +6,8 @@
 //!   - by-serial / deliver / cancel / complete / start-repair
 //!
 //! ## 并行 / 认证
-//! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //! 每个用例按需使用 MANAGER / CLERK / INSPECTOR token。
 
 #[path = "common/mod.rs"]
@@ -32,7 +33,6 @@ use hsh_erp_rust::shared::error::code;
 //  全局串行化 + helpers (拷贝自 tests/part_api.rs，按约定不跨文件复用)
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -65,14 +65,13 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
+async fn setup() -> PgPool {
     use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
-    let guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 // ----- 角色登录 helper（拷贝自 tests/part_api.rs） -----
@@ -247,7 +246,7 @@ async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, stat
 /// GET /parts?limit=10 —— 空库返回 200 / items=[] / total=0。
 #[tokio::test]
 async fn list_parts_basic() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
         app,
@@ -266,7 +265,7 @@ async fn list_parts_basic() {
 /// filter PENDING 拿到 3 件 (L2 展开 + status 过滤)。
 #[tokio::test]
 async fn list_parts_filter_status_and_customer() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -351,7 +350,7 @@ async fn list_parts_filter_status_and_customer() {
 /// GET /parts?limit=2&offset=2 —— 5 件，offset=2 拿第 3、4 件（按默认 id DESC）。
 #[tokio::test]
 async fn list_parts_pagination_limit_offset() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -426,7 +425,7 @@ async fn list_parts_pagination_limit_offset() {
 /// GET /parts/{id} —— 标准详情返回 200 / status=PENDING / customer_name 冗余。
 #[tokio::test]
 async fn get_part_detail_200() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -448,7 +447,7 @@ async fn get_part_detail_200() {
 /// GET /parts/{nonexistent_id} —— 20101 BIZ_PART_NOT_FOUND（HTTP 404）。
 #[tokio::test]
 async fn get_part_detail_404_not_found() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
         app,
@@ -462,7 +461,7 @@ async fn get_part_detail_404_not_found() {
 /// GET /parts/{id} —— 软删后 GET → 20101 (get_part_detail 不含软删件)。
 #[tokio::test]
 async fn get_part_detail_404_soft_deleted() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -493,7 +492,7 @@ async fn get_part_detail_404_soft_deleted() {
 /// POST /parts —— MANAGER 创建成功：201 / status=PENDING / 新 id。
 #[tokio::test]
 async fn create_part_200_manager() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -531,7 +530,7 @@ async fn create_part_200_manager() {
 /// POST /parts —— INSPECTOR 角色 → 40300 FORBIDDEN。
 #[tokio::test]
 async fn create_part_403_inspector() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -564,7 +563,7 @@ async fn create_part_403_inspector() {
 /// POST /parts —— 空 name → service 层 40001 VALIDATION_ERROR（HTTP 422）。
 #[tokio::test]
 async fn create_part_validation_failed() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -597,7 +596,7 @@ async fn create_part_validation_failed() {
 /// POST /parts/batch —— 2 件都成功 → 200 / created=2 / failed=[]。
 #[tokio::test]
 async fn batch_create_parts_all_success() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -656,7 +655,7 @@ async fn batch_create_parts_all_success() {
 /// 兜底后送进 `failed`。
 #[tokio::test]
 async fn batch_create_parts_partial_failure() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -716,7 +715,7 @@ async fn batch_create_parts_partial_failure() {
 /// 保持可写。
 #[tokio::test]
 async fn batch_create_parts_savepoint_recovers_after_failure() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -781,7 +780,7 @@ async fn batch_create_parts_savepoint_recovers_after_failure() {
 /// POST /parts/{id}/update —— 改 name + is_urgent → 200 / name 更新 / version 自增。
 #[tokio::test]
 async fn update_part_200() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -811,7 +810,7 @@ async fn update_part_200() {
 /// POST /parts/{id}/update —— version 不匹配 → 40901 VERSION_CONFLICT (HTTP 409)。
 #[tokio::test]
 async fn update_part_version_conflict() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -837,7 +836,7 @@ async fn update_part_version_conflict() {
 /// POST /parts/{id}/update —— 已软删件 → 40901 VERSION_CONFLICT（update 守卫 deleted_at IS NULL）。
 #[tokio::test]
 async fn update_part_404_soft_deleted() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -872,7 +871,7 @@ async fn update_part_404_soft_deleted() {
 /// POST /parts/{id}/soft-delete —— MANAGER 成功 → 200 / R.ok (data=null)。
 #[tokio::test]
 async fn soft_delete_part_manager_ok() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -908,7 +907,7 @@ async fn soft_delete_part_manager_ok() {
 /// POST /parts/{id}/soft-delete —— CLERK 角色 → 40300 FORBIDDEN。
 #[tokio::test]
 async fn soft_delete_part_403_clerk() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -934,7 +933,7 @@ async fn soft_delete_part_403_clerk() {
 /// → 分支 `p.deleted_at.is_some()` → 20101, "已软删"。HTTP=404。
 #[tokio::test]
 async fn soft_delete_part_404_soft_deleted() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -970,7 +969,7 @@ async fn soft_delete_part_404_soft_deleted() {
 /// → 分支 `p.version != expected_version` → 40901。
 #[tokio::test]
 async fn soft_delete_part_409_version_conflict() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // 初始 version=0；客户端传 99 触发不匹配。
@@ -998,7 +997,7 @@ async fn soft_delete_part_409_version_conflict() {
 /// → 20119。
 #[tokio::test]
 async fn soft_delete_part_409_terminal_status() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "DELIVERED").await;
@@ -1028,7 +1027,7 @@ async fn soft_delete_part_409_terminal_status() {
 /// GET /parts/by-serial/{serial} —— 命中 → 200 / id 一致。
 #[tokio::test]
 async fn get_by_serial_200() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("T-LOC-1"), None, "PENDING").await;
@@ -1052,7 +1051,7 @@ async fn get_by_serial_200() {
 /// GET /parts/by-serial/{serial} —— 找不到 → 20101 BIZ_PART_NOT_FOUND。
 #[tokio::test]
 async fn get_by_serial_404() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
         app,
@@ -1086,7 +1085,7 @@ async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
 /// 2026-09-11 PR-B3：lifecycle 收 `batch_id` + `version`（锚 batch.version）。
 #[tokio::test]
 async fn deliver_ready_to_ship_200() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "READY_TO_SHIP").await;
@@ -1121,7 +1120,7 @@ async fn deliver_ready_to_ship_200() {
 /// batch 存在但状态不匹配）。
 #[tokio::test]
 async fn deliver_wrong_state_400() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
@@ -1149,7 +1148,7 @@ async fn deliver_wrong_state_400() {
 /// POST /parts/{id}/cancel —— PENDING → CANCELLED (200 + status)。
 #[tokio::test]
 async fn cancel_pending_200() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -1173,7 +1172,7 @@ async fn cancel_pending_200() {
 /// POST /parts/{id}/cancel —— COMPLETED 状态不能 cancel → 20103 BIZ_INVALID_TRANSITION。
 #[tokio::test]
 async fn cancel_wrong_state_400() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // COMPLETED 不在 cancel 白名单内 (PENDING/PROGRAMMING/INSPECTION/READY_TO_SHIP/DELIVERED)
@@ -1200,7 +1199,7 @@ async fn cancel_wrong_state_400() {
 /// 2026-09-11 PR-B3：lifecycle 收 `batch_id` + `version`（锚 batch.version）。
 #[tokio::test]
 async fn complete_delivered_200() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "DELIVERED").await;
@@ -1238,7 +1237,7 @@ async fn complete_delivered_200() {
 /// batch=INSPECTION，service 应报 20116 而不是 20109。
 #[tokio::test]
 async fn complete_wrong_state_400() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
@@ -1275,7 +1274,7 @@ async fn complete_wrong_state_400() {
 /// 改为 t_part_event 是否写入 REPAIR_STARTED 事件。
 #[tokio::test]
 async fn start_repair_in_process_200() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "IN_PROCESS").await;
@@ -1322,7 +1321,7 @@ async fn start_repair_in_process_200() {
 /// service 应报 20118 而不是 20109。
 #[tokio::test]
 async fn start_repair_wrong_state_400() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -1359,7 +1358,7 @@ async fn start_repair_wrong_state_400() {
 /// 入参才能越过 axum Json 反序列化命中 service guard。
 #[tokio::test]
 async fn deliver_cancelled_409() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "CANCELLED").await;
@@ -1416,7 +1415,7 @@ async fn batch_status_and_version(
 /// 通过 `batch_id` + `version` 指定操作批次。
 #[tokio::test]
 async fn deliver_also_updates_batch() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "READY_TO_SHIP").await;
@@ -1458,7 +1457,7 @@ async fn deliver_also_updates_batch() {
 /// Fix Batch 2 Finding A 回归测试：cancel 流同样需 batch 同步。
 #[tokio::test]
 async fn cancel_also_updates_batch() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -1493,7 +1492,7 @@ async fn cancel_also_updates_batch() {
 /// 或不属于该 part → 20109。
 #[tokio::test]
 async fn deliver_without_source_batch_409() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "READY_TO_SHIP").await;
@@ -1528,7 +1527,7 @@ async fn deliver_without_source_batch_409() {
 /// fixture 同步改写：先插 1 个 PENDING 批次，再 UPDATE 它的 delivery_note_id。
 #[tokio::test]
 async fn cancel_delivery_note_locked_409() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, Some("P000"), None, "PENDING").await;
@@ -1633,7 +1632,6 @@ fn fake_step_bytes() -> Vec<u8> {
 #[tokio::test]
 #[ignore] // 跑 service 层需起 postgres-test + redis-test；CI 集成测试再开启
 async fn upload_drawing_service_integration() {
-    let _ = TEST_LOCK.lock().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
@@ -1691,7 +1689,6 @@ async fn upload_drawing_service_integration() {
 #[tokio::test]
 #[ignore]
 async fn upload_3d_model_service_integration() {
-    let _ = TEST_LOCK.lock().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
@@ -1742,7 +1739,6 @@ async fn upload_3d_model_service_integration() {
 #[ignore]
 async fn upload_bad_extension_rejected() {
     // 2026-09-11 新增：DRAWING kind 不接受 .step 扩展名，应 BIZ_PART_FILE_BAD_TYPE
-    let _ = TEST_LOCK.lock().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
@@ -1780,7 +1776,6 @@ async fn upload_bad_extension_rejected() {
 #[ignore]
 async fn upload_content_type_mismatch_rejected() {
     // 2026-09-11 新增：扩展名是 .pdf 但 content_type 不对，应 BIZ_PART_FILE_BAD_TYPE
-    let _ = TEST_LOCK.lock().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
@@ -1831,7 +1826,7 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
         FileBindingIn, PartBatchCreateItem, PartBatchCreateRequest,
     };
 
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -1996,7 +1991,7 @@ async fn batch_create_parts_handler_spawn_delete_on_ok() {
     use common::MockCos;
     use std::sync::Arc;
 
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -2116,7 +2111,7 @@ async fn batch_create_parts_handler_spawn_delete_on_err() {
     use common::MockCos;
     use std::sync::Arc;
 
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 

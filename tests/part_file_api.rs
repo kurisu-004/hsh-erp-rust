@@ -32,15 +32,13 @@ use std::sync::Arc;
 //  全局串行化 + setup
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 // ===========================================================================
@@ -124,7 +122,7 @@ async fn insert_part_for_owner(pool: &PgPool, customer_id: i64) -> i64 {
 
 #[tokio::test]
 async fn upload_pdf_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-1", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-1", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -163,7 +161,7 @@ async fn upload_pdf_happy_path() {
 
 #[tokio::test]
 async fn upload_invalid_kind_returns_21102() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-2", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-2", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -198,7 +196,7 @@ async fn upload_invalid_kind_returns_21102() {
 
 #[tokio::test]
 async fn upload_cas_dedup_skips_cos() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-3", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-3", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -253,7 +251,7 @@ async fn upload_cas_dedup_skips_cos() {
 
 #[tokio::test]
 async fn upload_owner_not_found_returns_21105() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let current = test_current_user_with_roles(vec![Role::Manager]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let cos = Arc::new(NoopCos);
@@ -284,7 +282,7 @@ async fn upload_owner_not_found_returns_21105() {
 
 #[tokio::test]
 async fn rbac_inspector_can_upload_returns_403() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-RBAC", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-RBAC", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -318,7 +316,7 @@ async fn rbac_inspector_can_upload_returns_403() {
 
 #[tokio::test]
 async fn list_filter_by_kind() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-List", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-List", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -378,7 +376,7 @@ async fn list_filter_by_kind() {
 
 #[tokio::test]
 async fn get_url_returns_presigned_url() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-URL", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-URL", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -422,7 +420,7 @@ async fn get_url_returns_presigned_url() {
 /// 且 JSON 序列化为 string（雪花 id 防 JS 精度截断）。
 #[tokio::test]
 async fn list_includes_paired_file_id() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-Pair", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-Pair", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -503,7 +501,7 @@ async fn list_includes_paired_file_id() {
 // ===== 2026-09-15 takeover-fill：content / delete 端点测试 =====
 #[tokio::test]
 async fn content_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-Content", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-Content", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -542,7 +540,7 @@ async fn content_happy_path() {
 
 #[tokio::test]
 async fn soft_delete_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-Del", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-Del", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -594,7 +592,7 @@ async fn soft_delete_happy_path() {
 
 #[tokio::test]
 async fn soft_delete_version_conflict() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-Conf", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-Conf", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -655,7 +653,7 @@ const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
 #[tokio::test]
 async fn confirm_tmp_missing_returns_21114() {
     // 验证 plan T2.6：head_object 返回 NoSuchKey → 21114 TMP_OBJECT_MISSING
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-TmpMiss", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-TmpMiss", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -709,7 +707,7 @@ async fn confirm_tmp_missing_returns_21114() {
 #[tokio::test]
 async fn confirm_size_mismatch_returns_21115() {
     // 验证 plan T2.6：head size 与声明 size 不一致 → 21115 SIZE_MISMATCH
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-SizeMM", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-SizeMM", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;
@@ -759,7 +757,7 @@ async fn confirm_size_mismatch_returns_21115() {
 #[tokio::test]
 async fn confirm_replace_old_single_returns_ready() {
     // 验证 plan T2.6：同 part+kind 二次 confirm → 旧行 deleted_at 已设，新行 READY
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-Replace", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-Replace", l1).await;
     let part_id = insert_part_for_owner(&pool, l2).await;

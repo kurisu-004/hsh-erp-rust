@@ -6,7 +6,8 @@
 //!   - to-process partial-split：INSPECTION 批次 qty=10 → quantity=3，拆批
 //!
 //! ## 并行 / 认证
-//! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //! 每个用例 INSPECTOR token（白名单）。
 
 #[path = "common/mod.rs"]
@@ -33,7 +34,7 @@ use helpers::*;
 /// 「非数字」值（"abc"）保留 service 层 20104 校验路径的覆盖。
 #[tokio::test]
 async fn to_process_invalid_shelf_id_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -66,7 +67,7 @@ async fn to_process_invalid_shelf_id_rejected() {
 /// to-process 拒绝：next_process_id 非数字 → 20104 BIZ_INVALID_VALUE。
 #[tokio::test]
 async fn to_process_invalid_next_process_id_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -99,7 +100,7 @@ async fn to_process_invalid_next_process_id_rejected() {
 /// 2026-09-16 PR-3 适配：to-process 入口要求 part 已绑定工艺链（20706）。
 #[tokio::test]
 async fn to_process_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -134,7 +135,7 @@ async fn to_process_happy_path() {
 /// to-process 拒绝：非 INSPECTION 状态（PENDING） → 400 / 20103。
 #[tokio::test]
 async fn to_process_wrong_state_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;
@@ -172,7 +173,7 @@ async fn to_process_wrong_state_rejected() {
 /// - 响应 `part` 投影展示最新 OCC 版本。
 #[tokio::test]
 async fn to_process_partial_split_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let (app, token, _pool) = login_inspector(pool, "inspector1").await;

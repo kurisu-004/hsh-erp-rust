@@ -18,8 +18,8 @@
 //! 10. version conflict on any write → 40901
 //! 11. list_candidate_parts for L1 (200, contains fixtures); non-L1 → 400
 //!
-//! 所有用例共享 `postgres_rust_test` + 唯一约束（delivery_note_no unique、
-//! uq_t_delivery_note_draft_group/leaf），用进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -40,7 +40,6 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 //  全局串行化 + helpers
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -82,13 +81,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
@@ -298,7 +296,7 @@ async fn insert_worker(
 #[tokio::test]
 async fn counter_acquires_sequential_numbers() {
     use hsh_erp_rust::infra::serial::next_delivery_note_no;
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     // 清表
     sqlx::query!("TRUNCATE t_delivery_note_counter")
@@ -330,7 +328,7 @@ async fn counter_acquires_sequential_numbers() {
 
 #[tokio::test]
 async fn create_draft_for_l1_succeeds_and_for_l2_returns_400_21407() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -371,7 +369,7 @@ async fn create_draft_for_l1_succeeds_and_for_l2_returns_400_21407() {
 
 #[tokio::test]
 async fn list_with_filters_status_and_pagination() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
 
@@ -422,7 +420,7 @@ async fn list_with_filters_status_and_pagination() {
 
 #[tokio::test]
 async fn get_with_parts_with_assembly_fields() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "零件 A", l2, Some("A001")).await;
@@ -484,7 +482,7 @@ async fn get_with_parts_with_assembly_fields() {
 
 #[tokio::test]
 async fn add_parts_same_l1_ok_different_l1_returns_400_21407() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1_a = insert_l1(&pool, "法拉电子", "F").await;
     let l1_b = insert_l1(&pool, "路达电子", "L").await;
     let l2_b = insert_l2(&pool, "路达一厂", l1_b).await;
@@ -527,7 +525,7 @@ async fn add_parts_same_l1_ok_different_l1_returns_400_21407() {
 
 #[tokio::test]
 async fn add_parts_already_assigned_returns_409_21406() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X002")).await;
@@ -587,7 +585,7 @@ async fn add_parts_already_assigned_returns_409_21406() {
 
 #[tokio::test]
 async fn add_parts_invalid_status_returns_400_21405() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X003")).await;
@@ -628,7 +626,7 @@ async fn add_parts_invalid_status_returns_400_21405() {
 
 #[tokio::test]
 async fn add_parts_partial_quantity_splits_batch() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X004")).await;
@@ -681,7 +679,7 @@ async fn add_parts_partial_quantity_splits_batch() {
 
 #[tokio::test]
 async fn add_parts_group_scope_mismatch_returns_400_21416() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2_a = insert_l2(&pool, "二厂", l1).await;
     let l2_b = insert_l2(&pool, "五厂", l1).await; // 组外
@@ -738,7 +736,7 @@ async fn add_parts_group_scope_mismatch_returns_400_21416() {
 
 #[tokio::test]
 async fn remove_parts_draft_ok_submitted_returns_409_21412() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X006")).await;
@@ -840,7 +838,7 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
 
 #[tokio::test]
 async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X007")).await;
@@ -953,7 +951,7 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
 
 #[tokio::test]
 async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X008")).await;
@@ -1074,7 +1072,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
 
 #[tokio::test]
 async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X009")).await;
@@ -1155,7 +1153,7 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
 
 #[tokio::test]
 async fn version_conflict_on_write_returns_409_40901() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let (app, token, _pool) = login_manager(pool, "admin").await;
 
@@ -1193,7 +1191,7 @@ async fn version_conflict_on_write_returns_409_40901() {
 /// 候选里只能出现 INSPECTION 那个；单据必须仍是 DRAFT（零写入）。
 #[tokio::test]
 async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "刹车片", l2, Some("F0001")).await;
@@ -1296,7 +1294,7 @@ async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
 /// 挂单批次被旁路改成 READY_TO_SHIP / INSPECTION 之外的状态 → 21421。
 #[tokio::test]
 async fn submit_with_illegal_batch_state_returns_21421() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X011")).await;
@@ -1355,7 +1353,7 @@ async fn submit_with_illegal_batch_state_returns_21421() {
 
 #[tokio::test]
 async fn list_candidate_parts_l1_returns_fixtures_non_l1_returns_400() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X010")).await;
@@ -1394,7 +1392,7 @@ async fn list_candidate_parts_l1_returns_fixtures_non_l1_returns_400() {
 
 #[tokio::test]
 async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, pool) = login_manager(pool, "admin").await;
 
     // 3 张 DRAFT 送货单（最小列插入）
@@ -1483,7 +1481,7 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
 #[tokio::test]
 async fn test_get_delivery_note_line_items_fields_are_populated() {
     use hsh_erp_rust::infra::clock::now_naive;
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     // 1. 建 L1 客户（detail 端点的 customer_id 必须是 L1，service 校验）
     let l1 = insert_l1(&pool, "详情字段客户", "D").await;

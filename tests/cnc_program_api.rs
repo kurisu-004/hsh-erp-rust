@@ -22,15 +22,13 @@ use hsh_erp_rust::shared::error::AppError;
 use sqlx::PgPool;
 use std::sync::Arc;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 fn test_current_user(roles: Vec<Role>) -> CurrentUser {
@@ -81,7 +79,7 @@ async fn insert_part(pool: &PgPool) -> i64 {
 
 #[tokio::test]
 async fn upload_pair_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let part_id = insert_part(&pool).await;
     let current = test_current_user(vec![Role::Manager]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -118,7 +116,7 @@ async fn upload_pair_happy_path() {
 
 #[tokio::test]
 async fn upload_with_invalid_gcode_ext() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let part_id = insert_part(&pool).await;
     let current = test_current_user(vec![Role::Manager]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -150,7 +148,7 @@ async fn upload_with_invalid_gcode_ext() {
 
 #[tokio::test]
 async fn upload_with_invalid_setup_ext() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let part_id = insert_part(&pool).await;
     let current = test_current_user(vec![Role::Manager]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -182,7 +180,7 @@ async fn upload_with_invalid_setup_ext() {
 
 #[tokio::test]
 async fn upload_part_not_found_returns_20101() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let current = test_current_user(vec![Role::Manager]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let cos = Arc::new(NoopCos);
@@ -213,7 +211,7 @@ async fn upload_part_not_found_returns_20101() {
 
 #[tokio::test]
 async fn upload_rbac_clerk_returns_403() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let part_id = insert_part(&pool).await;
     let clerk = test_current_user(vec![Role::Clerk]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -245,7 +243,7 @@ async fn upload_rbac_clerk_returns_403() {
 
 #[tokio::test]
 async fn list_pairs_for_part() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let part_id = insert_part(&pool).await;
     let current = test_current_user(vec![Role::Manager]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -290,7 +288,7 @@ async fn list_pairs_for_part() {
 
 #[tokio::test]
 async fn alias_download_url_returns_part_file_with_url() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let part_id = insert_part(&pool).await;
     let current = test_current_user(vec![Role::Manager]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -337,7 +335,7 @@ async fn alias_download_url_returns_part_file_with_url() {
 
 #[tokio::test]
 async fn alias_content_returns_bytes() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let part_id = insert_part(&pool).await;
     let current = test_current_user(vec![Role::Manager]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -374,7 +372,7 @@ async fn alias_content_returns_bytes() {
 
 #[tokio::test]
 async fn alias_delete_soft_deletes_file() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let part_id = insert_part(&pool).await;
     let current = test_current_user(vec![Role::Manager]);
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);

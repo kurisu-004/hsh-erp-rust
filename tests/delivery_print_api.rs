@@ -25,7 +25,6 @@ use common::{
 };
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -56,13 +55,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = common::test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
@@ -88,7 +86,7 @@ async fn login(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
 
 #[tokio::test]
 async fn print_endpoint_requires_auth() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let state = common::test_state(pool.clone()).await;
     let app = test_app(state);
     let req = json_request("POST", "/delivery-notes/1/print", Some(json!({})), None);
@@ -98,7 +96,7 @@ async fn print_endpoint_requires_auth() {
 
 #[tokio::test]
 async fn print_endpoint_passes_role_check_for_manager() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _) = login(pool, "print_mgr").await;
     let req = json_request(
         "POST",
@@ -115,7 +113,7 @@ async fn print_endpoint_passes_role_check_for_manager() {
 
 #[tokio::test]
 async fn print_labels_route_exists() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token, _) = login(pool, "labels_mgr").await;
     let req = json_request(
         "POST",

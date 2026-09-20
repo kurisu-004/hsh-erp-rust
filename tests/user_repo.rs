@@ -8,8 +8,8 @@
 //! 复用成本，本仓库约定集成测试可豁免 1000 行上限。
 //!
 //! ## 测试并行注意
-//! 所有用例共享同一个 `postgres_rust_test` 库。多个 `#[tokio::test]` 并发跑时会相互
-//! 覆盖 fixture。用一个进程级 `tokio::sync::Mutex` 在每个用例入口序列化对 DB 的写入。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化（每个用例 fresh database，无 fixture 覆盖）。
 //!
 //! ## UoW 语义测试
 //! - `sqlx_uow_commit_persists_writes` —— 通过 SqlxIamUowProvider.begin() 开 tx，
@@ -25,7 +25,6 @@ mod common;
 
 use chrono::NaiveDateTime;
 use sqlx::PgPool;
-use tokio::sync::Mutex;
 
 use common::{ensure_database_exists, test_pool};
 
@@ -41,7 +40,6 @@ use hsh_erp_rust::modules::iam::uow::{IamUowProvider, SqlxIamUowProvider};
 // ===========================================================================
 // 全局串行化互斥：所有用例共享同一 DB。
 // ===========================================================================
-static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// 进程级共享雪花生成器：每次 `SnowflakeIdGenerator::new(...)` 都把 sequence 重置为 0，
 /// 同一毫秒内多次 seed 会撞 ID。共享同一生成器才能保证每个用例内多 ID 唯一。
@@ -50,11 +48,8 @@ fn snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
     common::pool_snowflake()
 }
 
-/// 用例开头固定三步：拿锁 → 建库 → 连池 + 迁移 → 清表。
-///
-/// 返回的 `MutexGuard` 必须绑到 `_guard` 一直活到用例结束。
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+/// 用例开头固定三步：建库 → 连池 → 清表（test_pool 每次 fresh database，无残留）。
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     // 仅清 auth 表，user_repo 测试只触这 5 张表
@@ -64,7 +59,7 @@ async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
     .execute(&pool)
     .await
     .expect("truncate auth tables");
-    (guard, pool)
+    pool
 }
 
 // ===========================================================================
@@ -98,7 +93,7 @@ async fn seed_user(pool: &PgPool, username: &str, is_active: bool) -> i64 {
 /// `UserRepo::get_by_id`：命中（活跃用户）
 #[tokio::test]
 async fn get_by_id_returns_user_when_active() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
 
     let u = UserRepo::get_by_id(&pool, id)
@@ -114,7 +109,7 @@ async fn get_by_id_returns_user_when_active() {
 /// `UserRepo::get_by_id`：不存在的 id 返回 None
 #[tokio::test]
 async fn get_by_id_returns_none_for_missing_id() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let u = UserRepo::get_by_id(&pool, 999_999_999_999)
         .await
         .expect("query");
@@ -124,7 +119,7 @@ async fn get_by_id_returns_none_for_missing_id() {
 /// `UserRepo::get_by_id`：软删除的用户被过滤
 #[tokio::test]
 async fn get_by_id_excludes_soft_deleted() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "ghost", true).await;
     sqlx::query!(
         "UPDATE t_user SET deleted_at = $2 WHERE id = $1",
@@ -142,7 +137,7 @@ async fn get_by_id_excludes_soft_deleted() {
 /// `UserRepo::get_by_username`：命中（按 lowercase 查询）
 #[tokio::test]
 async fn get_by_username_returns_active_user() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let _id = seed_user(&pool, "Bob", true).await;
     // 调用方需 trim().to_lowercase()，repo 不做归一
     let u = UserRepo::get_by_username(&pool, "bob")
@@ -156,7 +151,7 @@ async fn get_by_username_returns_active_user() {
 /// `UserRepo::get_by_username`：repo 不做大小写归一
 #[tokio::test]
 async fn get_by_username_is_case_sensitive_in_repo() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let _id = seed_user(&pool, "Bob", true).await;
     // seed_user 已 lowercase 存 "bob"，所以 query("BOB") 找不到
     let u = UserRepo::get_by_username(&pool, "BOB")
@@ -173,7 +168,7 @@ async fn get_by_username_is_case_sensitive_in_repo() {
 /// `UserRepo::get_by_username`：不存在的 username 返回 None
 #[tokio::test]
 async fn get_by_username_returns_none_for_missing() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let u = UserRepo::get_by_username(&pool, "no-such-user")
         .await
         .expect("query");
@@ -183,7 +178,7 @@ async fn get_by_username_returns_none_for_missing() {
 /// `UserRepo::list_with_filters`：空表
 #[tokio::test]
 async fn list_with_filters_empty_returns_empty() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let rows = UserRepo::list_with_filters(&pool, None, None, 50, 0)
         .await
         .expect("query");
@@ -193,7 +188,7 @@ async fn list_with_filters_empty_returns_empty() {
 /// `UserRepo::list_with_filters`：username_like 模糊匹配
 #[tokio::test]
 async fn list_with_filters_username_like_filters() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let _ = seed_user(&pool, "alice", true).await;
     let _ = seed_user(&pool, "alex", true).await;
     let _ = seed_user(&pool, "bob", true).await;
@@ -210,7 +205,7 @@ async fn list_with_filters_username_like_filters() {
 /// `UserRepo::list_with_filters`：is_active 过滤
 #[tokio::test]
 async fn list_with_filters_is_active_filters() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let _ = seed_user(&pool, "active1", true).await;
     let _ = seed_user(&pool, "active2", true).await;
     let _ = seed_user(&pool, "inactive1", false).await;
@@ -229,7 +224,7 @@ async fn list_with_filters_is_active_filters() {
 /// `UserRepo::list_with_filters`：limit + offset 分页
 #[tokio::test]
 async fn list_with_filters_pagination() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     for i in 0..5 {
         let _ = seed_user(&pool, &format!("user-{i:02}"), true).await;
     }
@@ -250,7 +245,7 @@ async fn list_with_filters_pagination() {
 /// `UserRepo::list_with_filters`：按 created_at DESC, id DESC 排序
 #[tokio::test]
 async fn list_with_filters_orders_by_created_at_desc() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let _ = seed_user(&pool, "first", true).await;
     // 等一毫秒确保 created_at 不同
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -267,7 +262,7 @@ async fn list_with_filters_orders_by_created_at_desc() {
 /// `UserRepo::count_with_filters`：只数活跃
 #[tokio::test]
 async fn count_with_filters_counts_active_only() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let _ = seed_user(&pool, "u1", true).await;
     let _ = seed_user(&pool, "u2", true).await;
     let _ = seed_user(&pool, "u3", false).await;
@@ -285,7 +280,7 @@ async fn count_with_filters_counts_active_only() {
 /// `UserRepo::count_with_filters`：username_like 过滤
 #[tokio::test]
 async fn count_with_filters_with_username_filter() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let _ = seed_user(&pool, "alpha-1", true).await;
     let _ = seed_user(&pool, "alpha-2", true).await;
     let _ = seed_user(&pool, "beta-1", true).await;
@@ -299,7 +294,7 @@ async fn count_with_filters_with_username_filter() {
 /// `UserRepo::create`：INSERT 新用户，再 get_by_id 应拿到
 #[tokio::test]
 async fn create_inserts_new_user() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = snowflake().lock().unwrap().next_id();
     let insert = UserInsert {
         id,
@@ -326,7 +321,7 @@ async fn create_inserts_new_user() {
 /// `UserRepo::create`：username 撞唯一索引 → sqlx::Error
 #[tokio::test]
 async fn create_returns_error_on_duplicate_username() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let _ = seed_user(&pool, "dup", true).await;
 
     let id = snowflake().lock().unwrap().next_id();
@@ -347,7 +342,7 @@ async fn create_returns_error_on_duplicate_username() {
 /// `UserRepo::update_partial`：更新 full_name
 #[tokio::test]
 async fn update_partial_updates_full_name() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = UserRepo::update_partial(
         &pool,
@@ -375,7 +370,7 @@ async fn update_partial_updates_full_name() {
 /// `UserRepo::update_partial`：set_phone=true 清空 phone
 #[tokio::test]
 async fn update_partial_set_phone_flag_clears_phone() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     sqlx::query!(
         "UPDATE t_user SET phone = $2 WHERE id = $1",
@@ -414,7 +409,7 @@ async fn update_partial_set_phone_flag_clears_phone() {
 /// `UserRepo::update_partial`：set_phone=false 保留 phone
 #[tokio::test]
 async fn update_partial_no_set_phone_keeps_existing() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     sqlx::query!(
         "UPDATE t_user SET phone = $2 WHERE id = $1",
@@ -450,7 +445,7 @@ async fn update_partial_no_set_phone_keeps_existing() {
 /// `UserRepo::update_partial`：version 不匹配 → 0 行
 #[tokio::test]
 async fn update_partial_zero_rows_for_version_conflict() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = UserRepo::update_partial(
         &pool,
@@ -472,7 +467,7 @@ async fn update_partial_zero_rows_for_version_conflict() {
 /// `UserRepo::soft_delete`：软删成功 + 后续 get_by_id 不可见
 #[tokio::test]
 async fn soft_delete_sets_deleted_at_and_is_active_false() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = UserRepo::soft_delete(&pool, id, 0, now_naive(), None)
         .await
@@ -498,7 +493,7 @@ async fn soft_delete_sets_deleted_at_and_is_active_false() {
 /// `UserRepo::soft_delete`：version 不匹配 → 0 行
 #[tokio::test]
 async fn soft_delete_zero_rows_for_version_conflict() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = UserRepo::soft_delete(&pool, id, 99, now_naive(), None)
         .await
@@ -509,7 +504,7 @@ async fn soft_delete_zero_rows_for_version_conflict() {
 /// `UserRepo::touch_login`：刷新 last_login_at
 #[tokio::test]
 async fn touch_login_updates_last_login_at() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let when: NaiveDateTime = now_naive() + chrono::Duration::hours(1);
     UserRepo::touch_login(&pool, id, when)
@@ -529,7 +524,7 @@ async fn touch_login_updates_last_login_at() {
 /// `UserRepo::increment_refresh_token_version`：轮转成功
 #[tokio::test]
 async fn increment_refresh_token_version_rotates_token_version() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = UserRepo::increment_refresh_token_version(&pool, id, 0, now_naive(), None)
         .await
@@ -549,7 +544,7 @@ async fn increment_refresh_token_version_rotates_token_version() {
 /// `UserRepo::increment_refresh_token_version`：version 不匹配 → 0 行
 #[tokio::test]
 async fn increment_refresh_token_version_zero_rows_for_version_conflict() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = UserRepo::increment_refresh_token_version(&pool, id, 99, now_naive(), None)
         .await
@@ -560,7 +555,7 @@ async fn increment_refresh_token_version_zero_rows_for_version_conflict() {
 /// `UserRepo::update_password_and_rotate`：同时改密 + 轮转
 #[tokio::test]
 async fn update_password_and_rotate_updates_hash_and_rotates() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected =
         UserRepo::update_password_and_rotate(&pool, id, 0, "new-hash", now_naive(), None)
@@ -584,7 +579,7 @@ async fn update_password_and_rotate_updates_hash_and_rotates() {
 /// `UserRepo::update_password_and_rotate`：version 不匹配 → 0 行
 #[tokio::test]
 async fn update_password_and_rotate_zero_rows_for_version_conflict() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = UserRepo::update_password_and_rotate(
         &pool,
@@ -633,7 +628,7 @@ async fn seed_role(
 /// `UserRoleRepo::list_by_user`：返回该用户全部活跃角色
 #[tokio::test]
 async fn list_by_user_returns_active_roles() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     let _ = seed_role(&pool, uid, "MANAGER", None, None).await;
     let _ = seed_role(&pool, uid, "CLERK", None, None).await;
@@ -647,7 +642,7 @@ async fn list_by_user_returns_active_roles() {
 /// `UserRoleRepo::list_by_user`：无角色用户返回空
 #[tokio::test]
 async fn list_by_user_returns_empty_when_no_roles() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "lonely", true).await;
     let rows = UserRoleRepo::list_by_user(&pool, uid).await.expect("list");
     assert!(rows.is_empty());
@@ -656,7 +651,7 @@ async fn list_by_user_returns_empty_when_no_roles() {
 /// `UserRoleRepo::list_by_user`：LEFT JOIN t_shelf 带出 shelf_code/shelf_name
 #[tokio::test]
 async fn list_by_user_includes_shelf_code_and_name() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "shelfie", true).await;
 
     let shelf_id = snowflake().lock().unwrap().next_id();
@@ -681,7 +676,7 @@ async fn list_by_user_includes_shelf_code_and_name() {
 /// `UserRoleRepo::get_by_id`：命中
 #[tokio::test]
 async fn get_by_id_returns_role() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     let rid = seed_role(&pool, uid, "MANAGER", None, None).await;
 
@@ -696,7 +691,7 @@ async fn get_by_id_returns_role() {
 /// `UserRoleRepo::get_by_id`：不存在的 id
 #[tokio::test]
 async fn get_by_id_returns_none_for_missing() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let r = UserRoleRepo::get_by_id(&pool, 999_999_999_999)
         .await
         .expect("query");
@@ -706,7 +701,7 @@ async fn get_by_id_returns_none_for_missing() {
 /// `UserRoleRepo::exists_same_scope`：已存在重复
 #[tokio::test]
 async fn exists_same_scope_returns_true_for_dup() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     let _ = seed_role(&pool, uid, "MANAGER", None, None).await;
     let dup = UserRoleRepo::exists_same_scope(&pool, uid, "MANAGER", None, None)
@@ -718,7 +713,7 @@ async fn exists_same_scope_returns_true_for_dup() {
 /// `UserRoleRepo::exists_same_scope`：不重复
 #[tokio::test]
 async fn exists_same_scope_returns_false_when_no_dup() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     let dup = UserRoleRepo::exists_same_scope(&pool, uid, "MANAGER", None, None)
         .await
@@ -730,7 +725,7 @@ async fn exists_same_scope_returns_false_when_no_dup() {
 /// （(NULL, NULL) = (NULL, NULL) 在 SQL 里是 NULL，依赖 `=` 会漏判）
 #[tokio::test]
 async fn exists_same_scope_handles_null_scope_via_is_not_distinct_from() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     // seed 一个 (None, None) 的 MANAGER
     let _ = seed_role(&pool, uid, "MANAGER", None, None).await;
@@ -745,7 +740,7 @@ async fn exists_same_scope_handles_null_scope_via_is_not_distinct_from() {
 /// `UserRoleRepo::create`：INSERT 成功
 #[tokio::test]
 async fn create_inserts_new_role() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     let rid = snowflake().lock().unwrap().next_id();
     let insert = UserRoleInsert {
@@ -770,7 +765,7 @@ async fn create_inserts_new_role() {
 /// `UserRoleRepo::soft_delete`：软删成功 + 后续 list_by_user 不见
 #[tokio::test]
 async fn soft_delete_marks_deleted_at() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     let rid = seed_role(&pool, uid, "CLERK", None, None).await;
     let affected = UserRoleRepo::soft_delete(&pool, rid, 0, now_naive(), None)
@@ -785,7 +780,7 @@ async fn soft_delete_marks_deleted_at() {
 /// `UserRoleRepo::soft_delete`：version 不匹配 → 0 行
 #[tokio::test]
 async fn soft_delete_returns_zero_rows_on_version_conflict() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     let rid = seed_role(&pool, uid, "CLERK", None, None).await;
     let affected = UserRoleRepo::soft_delete(&pool, rid, 99, now_naive(), None)
@@ -837,7 +832,7 @@ async fn link_role_menu(pool: &PgPool, role: &str, menu_id: i64) {
 /// `MenuRepo::list_active_for_roles`：多个 role 共用同一菜单应去重（DISTINCT）
 #[tokio::test]
 async fn list_active_for_roles_returns_distinct_menus() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let m = seed_menu(&pool, "shared-menu", 0, true).await;
     link_role_menu(&pool, "MANAGER", m).await;
     link_role_menu(&pool, "CLERK", m).await;
@@ -852,7 +847,7 @@ async fn list_active_for_roles_returns_distinct_menus() {
 /// `MenuRepo::list_active_for_roles`：is_active=false 的菜单被排除
 #[tokio::test]
 async fn list_active_for_roles_excludes_inactive_menus() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let active = seed_menu(&pool, "active", 0, true).await;
     let inactive = seed_menu(&pool, "inactive", 1, false).await;
     link_role_menu(&pool, "MANAGER", active).await;
@@ -868,7 +863,7 @@ async fn list_active_for_roles_excludes_inactive_menus() {
 /// `MenuRepo::list_active_for_roles`：按 sort_order, code 排序
 #[tokio::test]
 async fn list_active_for_roles_ordered_by_sort_order_code() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let m3 = seed_menu(&pool, "z-sort-3", 30, true).await;
     let m1 = seed_menu(&pool, "a-sort-1", 10, true).await;
     let m2 = seed_menu(&pool, "b-sort-2", 20, true).await;
@@ -911,7 +906,7 @@ async fn seed_shelf(pool: &PgPool, code: &str, zone: &str) -> i64 {
 /// `ShelfRepo::get_by_id`：命中
 #[tokio::test]
 async fn get_by_id_returns_shelf() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let sid = seed_shelf(&pool, "S-001", "PRODUCTION").await;
     let s = ShelfRepo::get_by_id(&pool, sid)
         .await
@@ -925,7 +920,7 @@ async fn get_by_id_returns_shelf() {
 /// `ShelfRepo::get_by_id`：不存在的 id
 #[tokio::test]
 async fn shelf_get_by_id_returns_none_for_missing() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let s = ShelfRepo::get_by_id(&pool, 999_999_999_999)
         .await
         .expect("query");
@@ -939,7 +934,7 @@ async fn shelf_get_by_id_returns_none_for_missing() {
 /// `SqlxIamUowProvider`：commit 后写入对外可见
 #[tokio::test]
 async fn create_user_then_add_role_then_list_persists_all() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
 
     let provider = SqlxIamUowProvider::new(pool.clone());
     let mut uow = provider.begin().await.expect("begin");
@@ -992,7 +987,7 @@ async fn create_user_then_add_role_then_list_persists_all() {
 /// `SqlxIamUowProvider`：commit 后不存在的 user 不能通过 list_by_user 看到软删 + role 关联
 #[tokio::test]
 async fn soft_delete_user_then_list_roles_returns_empty() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
 
     // seed 一个 user + role
     let uid = seed_user(&pool, "toclose", true).await;
@@ -1026,7 +1021,7 @@ async fn soft_delete_user_then_list_roles_returns_empty() {
 /// `SqlxIamUnitOfWork::commit()` 后写入持久化（独立连接可查到）
 #[tokio::test]
 async fn sqlx_uow_commit_persists_writes() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
 
     let provider = SqlxIamUowProvider::new(pool.clone());
     let mut uow = provider.begin().await.expect("begin");
@@ -1057,7 +1052,7 @@ async fn sqlx_uow_commit_persists_writes() {
 /// `SqlxIamUnitOfWork` 在不 commit 时 drop → 隐式回滚（写入不可见）
 #[tokio::test]
 async fn sqlx_uow_drop_without_commit_rolls_back() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
 
     let provider = SqlxIamUowProvider::new(pool.clone());
     let mut uow = provider.begin().await.expect("begin");
@@ -1089,7 +1084,7 @@ async fn sqlx_uow_drop_without_commit_rolls_back() {
 /// `UserRepo::update_partial`：同时改 password_hash（管理员重置密码不踢下线路径）
 #[tokio::test]
 async fn update_partial_changes_password_hash_without_rotate() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = UserRepo::update_partial(
         &pool,
@@ -1120,7 +1115,7 @@ async fn update_partial_changes_password_hash_without_rotate() {
 /// `UserRepo::update_partial`：同时改 is_active=false（管理员停用）
 #[tokio::test]
 async fn update_partial_changes_is_active() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = UserRepo::update_partial(
         &pool,
@@ -1147,7 +1142,7 @@ async fn update_partial_changes_is_active() {
 /// `UserRoleRepo::list_by_user`：过滤软删的角色
 #[tokio::test]
 async fn list_by_user_excludes_soft_deleted_roles() {
-    let (_g, pool) = setup().await;
+    let pool = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     let active_rid = seed_role(&pool, uid, "MANAGER", None, None).await;
     let deleted_rid = seed_role(&pool, uid, "CLERK", None, None).await;

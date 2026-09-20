@@ -21,15 +21,13 @@ use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::statistics::repo::StatisticsRepo;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     common::ensure_database_exists().await;
     let pool = common::test_pool().await;
     common::clean_db(&pool).await;
     common::clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn insert_l2_customer(pool: &PgPool) -> (i64, i64) {
@@ -155,7 +153,7 @@ async fn insert_delivered_event(pool: &PgPool, part_id: i64, batch_id: i64, at_d
 /// 范围取 [2026-09-10, 2026-09-20] 全覆盖 3 个事件日。
 #[tokio::test]
 async fn delivered_stats_counts_via_delivered_events() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (_l1, l2) = insert_l2_customer(&pool).await;
 
     let p1 = insert_part_with_dates(
@@ -220,7 +218,7 @@ async fn delivered_stats_counts_via_delivered_events() {
 /// 期望：cnt=1（P1）。
 #[tokio::test]
 async fn count_overdue_undelivered_uses_event_absence() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (_l1, l2) = insert_l2_customer(&pool).await;
     let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
 
@@ -274,7 +272,7 @@ async fn count_overdue_undelivered_uses_event_absence() {
 /// `p.deleted_at IS NULL`）。
 #[tokio::test]
 async fn count_overdue_undelivered_excludes_soft_deleted() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (_l1, l2) = insert_l2_customer(&pool).await;
     let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
 

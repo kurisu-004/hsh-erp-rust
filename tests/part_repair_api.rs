@@ -25,7 +25,6 @@ use common::{
 
 use helpers::*;
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -58,18 +57,17 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     common::ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 #[tokio::test]
 async fn complete_repair_to_process_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "REPAIRING").await;
@@ -106,7 +104,7 @@ async fn complete_repair_to_process_happy_path() {
 
 #[tokio::test]
 async fn complete_repair_to_inspection_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "REPAIRING").await;
@@ -135,7 +133,7 @@ async fn complete_repair_to_inspection_happy_path() {
 
 #[tokio::test]
 async fn complete_repair_invalid_source_rejects() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -170,7 +168,7 @@ async fn complete_repair_invalid_source_rejects() {
 
 #[tokio::test]
 async fn repair_dispatch_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // 入口：INSPECTION / READY_TO_SHIP / IN_PROCESS / DELIVERED
@@ -200,7 +198,7 @@ async fn repair_dispatch_happy_path() {
 
 #[tokio::test]
 async fn repair_dispatch_invalid_source_rejects() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "CANCELLED").await;
@@ -229,7 +227,7 @@ async fn repair_dispatch_invalid_source_rejects() {
 
 #[tokio::test]
 async fn list_repair_batches_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "DELIVERED").await;
@@ -246,7 +244,7 @@ async fn list_repair_batches_happy_path() {
 
 #[tokio::test]
 async fn list_repairing_batches_happy_path() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "REPAIRING").await;

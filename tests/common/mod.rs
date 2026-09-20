@@ -1,8 +1,9 @@
 //! 集成测试共享基建
 //!
 //! 2026-09-20 重大重构：自定义 bash runner 接管 PG 容器生命周期（替代原 `ephemeral-postgres`）。
+//! 2026-09-20 plan 2：单容器 + DATABASE TEMPLATE 克隆（替代 CREATE DATABASE 全量迁移）。
 //!
-//! ## 两层隔离模型（新架构）
+//! ## 两层隔离模型（plan 2 架构）
 //!
 //! ### Layer 1：容器生命周期 —— bash runner + trap EXIT
 //! - `.cargo/config.toml` 的 `target.<cfg>.runner = "scripts/test_runner.sh"` 让每个
@@ -11,15 +12,18 @@
 //!   都强制 `docker rm -f`，**零 Rust Drop 依赖**。
 //! - 4 个转义口：TEST_DATABASE_BASE_URL 已注入 / `--list` / 非 deps 路径（cargo run
 //!   主 binary）/ hsh_erp_rust-*（lib/bin 单测）。详见 scripts/test_runner.sh。
-//! - nextest session 模式：scripts/test_nextest.sh 起 1 个 session 级容器（绕过
-//!   per-test 容器开销），binary 启动时走转义口 1 复用。
+//! - nextest session 模式：scripts/test_nextest.sh 起 1 个 session 级容器，在容器内
+//!   CREATE DATABASE hsh_erp_template + 跑 24 个 schema 迁移 → 注入
+//!   TEST_DATABASE_BASE_URL 指向 template；binary 启动时走转义口 1 复用。
 //!
-//! ### Layer 2：每测试 fresh database —— test_pool() 内部
-//! - `fresh_database_url()` 在 runner 起好的容器上 CREATE DATABASE test_<uuid>，
-//!   返回独立 URL → `sqlx::migrate!` → 返回 PgPool。容器内多 db 共享，但 db 间
-//!   schema 完全独立 → 彻底消除 TRUNCATE 残留 / `_sqlx_migrations` 状态串号。
+//! ### Layer 2：每测试 fresh database —— test_pool() 内部 TEMPLATE 克隆
+//! - `fresh_database_url()` 在 runner 起好的 template 上
+//!   `CREATE DATABASE test_<uuid> TEMPLATE hsh_erp_template`，tmpfs 下 ~100ms
+//!   文件级克隆 → test_pool 直接 connect 即可（schema + seed 已在 template 里）。
+//! - 替代原 CREATE DATABASE + `sqlx::migrate!` 全量跑 24 个迁移（旧 ~600ms）；
+//!   TEMPLATE clone 在 tmpfs 下 ~100ms，性能提升 ~6x。
 //!
-//! ### Snowflake ID 隔离（新增 2026-09-20）
+//! ### Snowflake ID 隔离（plan 2 保留）
 //! - `test_snowflake_instance()` 用 pid ⊕ startup_nanos 派生 0-1023 unique instance，
 //!   替代原固定 `instance=1` → 消除 nextest 并行下跨进程 user_id 撞 key（redis session key）。
 //!
@@ -32,11 +36,11 @@
 //! ```ignore
 //! ensure_database_exists().await; // no-op（保留仅为不让 caller 报错）
 //! let pool = test_pool().await;
-//! clean_db(&pool).await;
 //! clean_redis(&redis_pool).await;  // 如需
 //! ```
 //!
-//! 这之后所有表都处于「干净 + 已迁移」状态，可以放心 insert。
+//! clean_db / clean_business_db 已改 no-op（test_pool 每次 fresh database，无需清）；
+//! 保留函数签名仅为不让 38 处 caller 报错。这之后所有表都处于「干净 + 已迁移」状态。
 
 // 跨测试文件共享的 fixtures + helpers（admin_database_url / ensure_database_exists
 // / test_pool / clean_db / insert_user_with_password 等）。每个 integration
@@ -114,37 +118,74 @@ fn test_snowflake_instance() -> u16 {
 }
 use hsh_erp_rust::state::AppState;
 
-/// 2026-09-20：fresh database URL —— 在 runner 已起好的容器上 CREATE DATABASE。
+/// 2026-09-20 plan 2：fresh database URL —— 在 template 上 `CREATE DATABASE ... TEMPLATE`。
 ///
 /// 容器由 scripts/test_runner.sh（或 scripts/test_nextest.sh session 级）提前
-/// 起好，通过 `TEST_DATABASE_BASE_URL` 注入（形如 `postgres://postgres:postgres@127.0.0.1:<port>`）。
+/// 起好，通过 `TEST_DATABASE_BASE_URL` 注入。plan 2 后 URL 形如：
+/// `postgres://postgres:postgres@127.0.0.1:<port>/hsh_erp_template`
+/// （带 /hsh_erp_template 后缀，由 session 启动时建好 template + 跑完 24 个 schema 迁移）。
 ///
-/// `max_connections(10) → 2`（plan §4 B7 调整）：admin pool 只跑一条 CREATE
-/// DATABASE；nextest 8 并行下 8×(2 admin + 10 test pool + 迁移连接) ≈ 120
-/// 连接 < session 容器 max_connections=500 上限。`Cluster::create_database()`
-/// 内部 admin pool 的 5 连接 PoolTimedOut 问题不再存在（已经不走那个 API）。
-async fn fresh_database_url() -> String {
-    let base_url = std::env::var("TEST_DATABASE_BASE_URL").expect(
+/// 每测试走 `CREATE DATABASE test_<uuid> TEMPLATE hsh_erp_template` 文件级克隆，
+/// tmpfs 下 ~100ms，远快于旧版 CREATE DATABASE + sqlx::migrate! (~600ms)。
+///
+/// admin pool `max_connections=1`：每次只跑一条 CREATE DATABASE；nextest 8 并行
+/// 下 8×(1 admin + 10 test pool) ≈ 88 连接 < session 容器 max_connections=500 上限。
+///
+/// ## 兼容路径（test_runner.sh 单 binary 调用）
+/// plan §Phase 1 step 8 要求 test_runner.sh 保持不变 → runner 只起容器不建 template。
+/// 此时 fresh_database_url() 探测到 template 不存在，自动 fallback 到
+/// plain `CREATE DATABASE` + test_pool() 跑 `sqlx::migrate!`。nextest session 路径
+/// 走 TEMPLATE 克隆（plan §Phase 1 step 3），绕过此 fallback。
+async fn fresh_database_url() -> (String, bool) {
+    let raw_url = std::env::var("TEST_DATABASE_BASE_URL").expect(
         "TEST_DATABASE_BASE_URL 未设置 —— 经 `cargo test` 运行（runner 自动注入）；\
          或手动 export 指向 postgres-test：\
-         postgres://hsh_test:6065161test@localhost:5429",
+         postgres://hsh_test:6065161test@localhost:5429/hsh_erp_template",
     );
+    // 2026-09-20 plan 2：URL 可能带 /<dbname> 后缀（指向 template），
+    // admin pool 必须连 /postgres（内置管理库）而不是 /template/postgres。
+    // 不能 split_once('/') —— postgres:// 中的 `//` 会把切到 scheme 后面（应取 LAST '/'，即 path 分隔）。
+    let server_url = match raw_url.find("://") {
+        Some(scheme_end) => match raw_url[scheme_end + 3..].find('/') {
+            Some(path_idx) => raw_url[..scheme_end + 3 + path_idx].to_string(),
+            None => raw_url,
+        },
+        None => raw_url,
+    };
     let admin = PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(1)
         .acquire_timeout(std::time::Duration::from_secs(30))
-        .connect(&format!("{base_url}/postgres"))
+        .connect(&format!("{server_url}/postgres"))
         .await
         .expect("connect ephemeral admin pool");
-    let db_name = format!("test_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE DATABASE \"{db_name}\""
-    )))
-    .execute(&admin)
+    // 探测 template 是否存在：nextest session 启动时建好，cargo test 单 binary 路径无。
+    let template_exists: bool = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'hsh_erp_template')",
+    )
+    .fetch_one(&admin)
     .await
-    .expect("CREATE DATABASE on ephemeral admin pool");
+    .unwrap_or(false);
+    let db_name = format!("test_{}", uuid::Uuid::new_v4().simple());
+    if template_exists {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE \"{db_name}\" TEMPLATE hsh_erp_template"
+        )))
+        .execute(&admin)
+        .await
+        .expect("CREATE DATABASE TEMPLATE hsh_erp_template");
+    } else {
+        // 兼容路径（test_runner.sh 不建 template）—— fallback 到 plain CREATE DATABASE。
+        // test_pool() 后续会跑 sqlx::migrate! 建 schema。
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE DATABASE \"{db_name}\""
+        )))
+        .execute(&admin)
+        .await
+        .expect("CREATE DATABASE on ephemeral admin pool");
+    }
     // admin pool 在函数末尾 drop，PG 后端进程立即关闭。
     drop(admin);
-    format!("{base_url}/{db_name}")
+    (format!("{server_url}/{db_name}"), template_exists)
 }
 
 /// 测试 DB URL：仅作 `AppConfig.database_url` 字段占位。**实际连接走 caller 传入
@@ -223,15 +264,20 @@ pub async fn ensure_database_exists() {
     // no-op：容器由 runner 起，database 由 test_pool() 内部 fresh_database_url() 派生
 }
 
-/// 建测试连接池：从 runner 已起好的容器派生一个 fresh database + 跑全部迁移。
+/// 建测试连接池：从 runner 已起好的容器派生一个 fresh database。
 ///
-/// 两层隔离：
+/// 两层隔离（plan 2）：
 /// - 容器：runner 进程级 1 个（同进程多测试共享容器，但 DB 独立）
-/// - 数据库：每测试 fresh database → TRUNCATE 残留 / `_sqlx_migrations` 状态不串号
+/// - 数据库：每测试 fresh database（nextest session：TEMPLATE 克隆 ~100ms；
+///   cargo test 单 binary 兼容路径：plain CREATE DATABASE + sqlx::migrate ~600ms）
 /// - snowflake instance：per-process 派生（test_snowflake_instance）→ 跨进程不撞 ID
+///
+/// template_used=true（nextest session）：schema 已在 hsh_erp_template 跑过 24 个迁移，
+/// 不再跑 migrate。template_used=false（test_runner.sh 单 binary 兼容路径）：
+/// fresh database 是空的，必须跑 migrate 建 schema。
 pub async fn test_pool() -> PgPool {
     // 1) fresh database URL —— 临时 admin pool 跑 CREATE DATABASE 后立即 drop。
-    let db_url = fresh_database_url().await;
+    let (db_url, template_used) = fresh_database_url().await;
 
     // 2) Open 一个 PgPool 指向新 db（max_connections=10 足够测试）。
     let pool = PgPoolOptions::new()
@@ -241,11 +287,13 @@ pub async fn test_pool() -> PgPool {
         .await
         .expect("connect to fresh ephemeral database");
 
-    // 3) 跑全部迁移。
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("apply migrations on ephemeral test db");
+    // 3) 仅兼容路径跑迁移：nextest session 走 TEMPLATE 克隆，schema 已就位。
+    if !template_used {
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("apply migrations on ephemeral test db");
+    }
 
     pool
 }
@@ -270,45 +318,23 @@ pub async fn clean_redis(pool: &RedisPool) {
 }
 
 /// 清表（auth 链路涉及的最小集）：用户/角色/菜单/角色-菜单/货架。
-/// `schema_migrations`（sqlx 自动维护）不动。
 ///
-/// 该函数**只**清理 auth 域相关表，**不**触碰业务域表（delivery / part / customer
-/// 等），保证后续要追加业务域集成测试时可按需调用 `clean_business_db` 而不互相干扰。
-pub async fn clean_db(pool: &PgPool) {
-    sqlx::query(
-        "TRUNCATE t_user, t_user_role, t_menu, t_role_menu, t_shelf RESTART IDENTITY CASCADE",
-    )
-    .execute(pool)
-    .await
-    .expect("truncate auth-related tables");
+/// 2026-09-20 plan 2 改为 no-op：test_pool() 每次走 TEMPLATE 克隆派生全新 DB，
+/// 已是最干净状态，无需 TRUNCATE。保留函数签名仅为不让 38 处 caller 报错。
+#[allow(dead_code, clippy::unused_async)]
+pub async fn clean_db(_pool: &PgPool) {
+    // no-op：test_pool() 每次 fresh database（nextest: TEMPLATE clone ~100ms；
+    // cargo test 兼容路径: plain CREATE DATABASE + migrate ~600ms）。
 }
 
 /// 清表（业务域全集）：配送分组 / 配送单 / 批次 / 工单 / 装配体 / 客户 / 申请人 / 工种 / 工人
 /// / 工艺链。
 ///
-/// 与 `clean_db` 互补 —— 后者只清 auth 表，本函数负责 P1+ 业务域测试需要的「干净世界」。
-/// 顺序按 FK 依赖自顶向下；CASCADE 兜底防止漏列。
-///
-/// 仅部分集成测试（如 delivery_*）需要；其它测试不引用本函数 —— 故 `dead_code` 抑制。
-#[allow(dead_code)]
-pub async fn clean_business_db(pool: &PgPool) {
-    sqlx::query(
-        "TRUNCATE \
-            t_delivery_group_member, t_delivery_group, \
-            t_delivery_note_event, t_delivery_note_counter, t_delivery_note, \
-            t_part_batch, t_part_event, t_part, \
-            t_process_chain_step, t_part_process_chain, \
-            t_assembly, \
-            t_customer, t_applicant, \
-            t_work_type, t_worker, \
-            t_shelf_process, t_work_type_process, t_process, \
-            t_outsource_company_process, t_outsource_company, \
-            t_outsource_shipment, t_outsource_quote_event, t_outsource_quote \
-         RESTART IDENTITY CASCADE",
-    )
-    .execute(pool)
-    .await
-    .expect("truncate business tables");
+/// 2026-09-20 plan 2 改为 no-op：test_pool() 每次 fresh database，无需 TRUNCATE。
+/// 保留函数签名仅为不让 caller 报错。
+#[allow(dead_code, clippy::unused_async)]
+pub async fn clean_business_db(_pool: &PgPool) {
+    // no-op：同上 clean_db
 }
 
 /// 构造测试用 AppState：与 main.rs 同形，差别仅在 secret / 数据库 / Redis URL。

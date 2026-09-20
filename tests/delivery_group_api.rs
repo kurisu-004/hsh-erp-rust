@@ -11,8 +11,8 @@
 //! 8. customer_id 不存在 → 404 / 20102
 //!
 //! ## 并行
-//! 所有用例共享 `postgres_rust_test` + 唯一约束 (`uq_t_delivery_group_name_active`、
-//! `uq_t_customer_root_prefix`)，用进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //!
 //! ## 认证
 //! 每个用例都创建一个 MANAGER 用户、登录拿 token。所有 POST /delivery-groups/*
@@ -36,7 +36,6 @@ use common::{
 //  全局串行化 + helpers
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let response = app.oneshot(req).await.expect("oneshot");
@@ -69,13 +68,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 /// 建一个 MANAGER 用户并登录，返回 access token + state
@@ -147,7 +145,7 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 
 #[tokio::test]
 async fn create_group_succeeds_and_appears_in_list() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2_a = insert_l2(&pool, "二厂", l1).await;
     let l2_b = insert_l2(&pool, "五厂", l1).await;
@@ -194,7 +192,7 @@ async fn create_group_succeeds_and_appears_in_list() {
 
 #[tokio::test]
 async fn create_duplicate_name_returns_409_21414() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     insert_l2(&pool, "二厂", l1).await;
 
@@ -238,7 +236,7 @@ async fn create_duplicate_name_returns_409_21414() {
 
 #[tokio::test]
 async fn create_with_member_in_other_group_returns_409_21415() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2_a = insert_l2(&pool, "二厂", l1).await;
     let l2_b = insert_l2(&pool, "五厂", l1).await;
@@ -283,7 +281,7 @@ async fn create_with_member_in_other_group_returns_409_21415() {
 
 #[tokio::test]
 async fn update_members_full_replace_succeeds() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2_a = insert_l2(&pool, "二厂", l1).await;
     let l2_b = insert_l2(&pool, "五厂", l1).await;
@@ -340,7 +338,7 @@ async fn update_members_full_replace_succeeds() {
 
 #[tokio::test]
 async fn update_with_wrong_version_returns_409_version_conflict() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
 
     let (app, token) = login_manager(pool, "admin").await;
@@ -382,7 +380,7 @@ async fn update_with_wrong_version_returns_409_version_conflict() {
 
 #[tokio::test]
 async fn soft_delete_removes_group_from_list() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
 
     let (app, token) = login_manager(pool, "admin").await;
@@ -439,7 +437,7 @@ async fn soft_delete_removes_group_from_list() {
 
 #[tokio::test]
 async fn create_with_non_l1_customer_returns_400_20104() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await; // L2 customer
 
@@ -469,7 +467,7 @@ async fn create_with_non_l1_customer_returns_400_20104() {
 
 #[tokio::test]
 async fn list_with_nonexistent_customer_returns_404_20102() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
 
     let (app, token) = login_manager(pool, "admin").await;
 

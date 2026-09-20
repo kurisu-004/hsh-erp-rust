@@ -5,8 +5,8 @@
 //!    soft-delete-in-use 拒：创建工种 → set 工序映射 → 试图软删 → 期望 20903 BIZ_WORK_TYPE_IN_USE。
 //!
 //! ## 并行
-//! 所有用例共享 `postgres_rust_test` + `uk_t_work_type_code` 唯一约束，用
-//! 进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 //!
 //! ## 认证
 //! 用 MANAGER 用户跑通（写路径要求 M-only，按设计 §6.1 用 M 即可）。
@@ -29,7 +29,6 @@ use common::{
 // 全局串行化 + helpers（与 customer_api.rs / process_api.rs / shelf_api.rs /
 // worker_api.rs 同形）
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let uri = req.uri().to_string();
@@ -66,13 +65,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
@@ -107,7 +105,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
 ///    （service 层 UNION ALL 查 t_worker.work_type_id + t_work_type_process 引用）
 #[tokio::test]
 async fn create_work_type_then_set_processes_then_soft_delete_in_use() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "wt_admin").await;
 
     // 1) Create work type

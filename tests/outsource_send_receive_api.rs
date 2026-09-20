@@ -27,7 +27,6 @@ use common::{
 // ===========================================================================
 //  Helpers
 // ===========================================================================
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
     let uri = req.uri().to_string();
@@ -64,13 +63,12 @@ fn json_request(
     builder.body(body).expect("build request")
 }
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
@@ -227,7 +225,7 @@ async fn insert_approved_quote(
 
 #[tokio::test]
 async fn send_to_outsource_inserts_shipment_out_sourcing() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "send_admin").await;
     let customer_id = insert_l1_customer(&pool, "Snd", "S").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
@@ -283,7 +281,7 @@ async fn send_to_outsource_inserts_shipment_out_sourcing() {
 
 #[tokio::test]
 async fn send_to_outsource_duplicate_open_shipment_rejected() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "send_dup").await;
     let customer_id = insert_l1_customer(&pool, "Dup", "D").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
@@ -367,7 +365,7 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
 
 #[tokio::test]
 async fn send_to_outsource_direct_returns_internal_error() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "send_direct").await;
     let customer_id = insert_l1_customer(&pool, "Dir", "I").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
@@ -402,7 +400,7 @@ async fn send_to_outsource_direct_returns_internal_error() {
 
 #[tokio::test]
 async fn send_to_outsource_quote_not_approved_returns_21307() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "send_qdraft").await;
     let customer_id = insert_l1_customer(&pool, "Qd", "Q").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
@@ -455,7 +453,7 @@ async fn send_to_outsource_quote_not_approved_returns_21307() {
 
 #[tokio::test]
 async fn receive_from_outsource_marks_shipment_received() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "recv_admin").await;
     let customer_id = insert_l1_customer(&pool, "R", "R").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
@@ -536,7 +534,7 @@ async fn receive_from_outsource_marks_shipment_received() {
 
 #[tokio::test]
 async fn reconcile_update_shipment_unit_price_quantity() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let (app, token) = login_manager(pool.clone(), "rec_admin").await;
     let customer_id = insert_l1_customer(&pool, "RU", "U").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;

@@ -28,15 +28,13 @@ use helpers::*;
 //  全局串行化（与现有 part_api_* 系列一致）
 // ===========================================================================
 
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, sqlx::PgPool) {
-    let guard = TEST_LOCK.lock().await;
+async fn setup() -> sqlx::PgPool {
     common::ensure_database_exists().await;
     let pool = common::test_pool().await;
     common::clean_db(&pool).await;
     common::clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 async fn insert_assembly_min(pool: &sqlx::PgPool, customer_id: i64) -> i64 {
@@ -118,7 +116,7 @@ async fn attach_batch_to_note(pool: &sqlx::PgPool, batch_id: i64, delivery_note_
 /// （真相源在 t_part_batch.delivery_note_id）。
 #[tokio::test]
 async fn cancel_part_blocked_by_active_batch_on_delivery_note() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // part PENDING 状态 + 1 个 PENDING 批次 + 1 张 DRAFT 送货单 → 挂上
@@ -159,7 +157,7 @@ async fn cancel_part_blocked_by_active_batch_on_delivery_note() {
 /// `PartBatchRepo::has_active_batch_on_delivery_note`，命中则拒。
 #[tokio::test]
 async fn soft_delete_part_blocked_by_active_batch_on_delivery_note() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
@@ -210,7 +208,7 @@ async fn soft_delete_part_blocked_by_active_batch_on_delivery_note() {
 /// 查 `pb.delivery_note_id IS NOT NULL`（PR-2 之前 JOIN t_part.delivery_note_id）。
 #[tokio::test]
 async fn soft_delete_assembly_blocked_by_child_batch_on_delivery_note() {
-    let (_guard, pool) = setup().await;
+    let pool = setup().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     // 1 个 asm + 1 个子件（PENDING）+ 1 个子件批次（已挂 DRAFT 送货单）

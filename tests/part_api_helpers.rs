@@ -7,7 +7,8 @@
 //! 设计意图：把 `tests/part_api.rs`（原 1337 行）拆成按 to-XXX 端点切分的
 //! 顶层测试文件，每个文件 ≤ 1000 行（CLAUDE.md 单文件行数上限）。
 //!
-//! 共享 `postgres_rust_test`；进程级 `tokio::sync::Mutex` 串行化。
+//! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
+//! 完全独立，无需 Mutex 串行化。
 
 // 跨测试文件共享的 fixtures：每个测试 binary 只用其中一部分（例如
 // part_api_to_ship 用 login_manager / login_clerk / batch_version，
@@ -34,9 +35,6 @@ use tower::ServiceExt;
 // ===========================================================================
 //  全局串行化 + HTTP helpers
 // ===========================================================================
-
-/// 进程级测试串行化（共享 `postgres_rust_test`）。
-pub static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// 发请求 → 拆响应为 (status, envelope JSON)。测试用 envelope 解析失败立即 panic。
 pub async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -71,15 +69,14 @@ pub fn json_request(
     builder.body(body).expect("build request")
 }
 
-/// 串行化 + 拿 TEST_LOCK + 拿干净 PgPool。
-pub async fn setup<'a>() -> (tokio::sync::MutexGuard<'a, ()>, PgPool) {
+/// 拿干净 PgPool（test_pool 每次 fresh database，无需 TEST_LOCK 串行化）。
+pub async fn setup() -> PgPool {
     use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
-    let guard = TEST_LOCK.lock().await;
     ensure_database_exists().await;
     let pool = test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
-    (guard, pool)
+    pool
 }
 
 // ----- 角色登录 helper（建用户 → 加角色 → 登录拿 token） -----
