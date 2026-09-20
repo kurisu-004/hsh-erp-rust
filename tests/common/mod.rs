@@ -277,8 +277,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
 
 /// 构造测试用 AppState：session check **关闭**，**不**建 Redis 池。
 ///
-/// 用途：验证 `REDIS_SESSION_CHECK_ENABLED=false` 时，extractor 直接用 JWT Claims
-/// 构造 CurrentUser，不依赖 Redis 进程存在。
+/// 用途：验证 `REDIS_SESSION_CHECK_ENABLED=false` 时，`auth::middleware::verify_access_token`
+/// 的关闭分支直接用 JWT Claims 构造 CurrentUser，不依赖 Redis 进程存在。
 ///
 /// 仅 `tests/auth_api.rs` 调用；其它 integration test 不引用 —— 故 `dead_code` 抑制。
 #[allow(dead_code)]

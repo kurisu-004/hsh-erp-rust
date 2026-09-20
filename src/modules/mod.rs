@@ -64,7 +64,10 @@ async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResp> {
 /// 2026-09-20 新增：签名收 `Arc<AppState>`，在 `route_layer` 上挂 `auth_middleware`
 /// —— Bearer JWT 验签 + Redis session 校验 + 滑动 TTL 集中处理；公开路径
 /// （health / login / refresh / `_e2e`）在 middleware 内部白名单放行。
-/// `route_layer` 仅作用于已匹配路由，404 不会被强制鉴权（与现状一致）。
+/// `route_layer` 仅作用于已匹配路由，404 不会被强制鉴权（与现状一致）；
+/// 边界由 `tests/auth_middleware.rs::nonexistent_route_returns_404_not_40100`
+/// 守住不变量——**绝对不能**换成 `.layer()`，否则 404 路径会先过 middleware
+/// 拿 40100，掩盖真实路由错误。
 /// 需要 state：axum 0.8 的 `from_fn` 不支持 `State` 提取，必须用
 /// `from_fn_with_state(state.clone(), ...)`，因此 v2_router 收 state。
 pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {

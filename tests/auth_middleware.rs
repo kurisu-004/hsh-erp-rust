@@ -376,3 +376,33 @@ async fn logout_then_old_token_returns_40105() {
         "logout 后旧 token 应返 SESSION_REVOKED (40105)"
     );
 }
+
+// ===========================================================================
+// 9. route_layer 边界：不存在的路径不带 token → 404 而非 40100
+//
+// 2026-09-20 修复 review #1：`route_layer` 仅作用于已匹配路由（axum 0.8
+// 文档语义：failed routes 不进入 layer）。如果改为 `.layer()`，404 路径
+// 也会走 auth_middleware → middleware 白名单不命中 → 40100，反而掩盖
+// 真实路由错误。本测试用例守住这个不变量：404 应是 404，不是 40100。
+// ===========================================================================
+
+#[tokio::test]
+async fn nonexistent_route_returns_404_not_40100() {
+    let (_guard, pool) = setup().await;
+    let state = test_state(pool).await;
+    let app = test_app(state);
+
+    // 不存在的路径，不带 token。期望：404 NOT_FOUND（route_layer 短路），
+    // 而**不是** 401 UNAUTHORIZED（说明 middleware 没误判 404 为受保护端点）。
+    let response = app
+        .oneshot(json_request("GET", "/nonexistent", None, None))
+        .await
+        .expect("oneshot");
+    let status = response.status();
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "不存在的路径不带 token 应是 404（route_layer 不对 failed routes \
+         走 middleware），不是 401 强制鉴权: {status}"
+    );
+}
