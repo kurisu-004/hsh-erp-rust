@@ -147,6 +147,20 @@ pub(crate) fn test_state(
         session_service,
         customer_service: Arc::new(CustomerService::new(snowflake.clone())),
         applicant_service: Arc::new(ApplicantService::new(snowflake.clone())),
+        // 2026-09-22 Group C 新增：part_file + cnc_program service；unit tests 不
+        // 直接走这两个 service（service_tests 仅覆盖 iam），传占位实例即可。
+        part_file_service: Arc::new(
+            crate::modules::part_file::service::PartFileService::new(
+                snowflake.clone(),
+                Arc::new(NoopCos),
+            ),
+        ),
+        cnc_program_service: Arc::new(
+            crate::modules::cnc_program::service::CncProgramService::new(
+                snowflake.clone(),
+                Arc::new(NoopCos),
+            ),
+        ),
     })
 }
 

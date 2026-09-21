@@ -56,7 +56,7 @@ fn test_current_user_with_roles(roles: Vec<Role>) -> CurrentUser {
 }
 
 async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -75,7 +75,7 @@ async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 }
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -94,7 +94,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 }
 
 async fn insert_part_for_owner(pool: &PgPool, customer_id: i64) -> i64 {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
@@ -128,15 +128,13 @@ async fn upload_pdf_happy_path() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let pdf_bytes = b"%PDF-1.5\nhello world\n%%EOF".to_vec();
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos,
+    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         part_id,
         "DRAWING",
@@ -167,15 +165,13 @@ async fn upload_invalid_kind_returns_21102() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let bytes = b"some step data".to_vec();
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos,
+    let err = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         part_id,
         "DRAWING", // DRAWING 不接受 step
@@ -202,17 +198,15 @@ async fn upload_cas_dedup_skips_cos() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let pdf_bytes = b"%PDF-1.5\nidentical content\n%%EOF".to_vec();
 
     // 第一次上传
     let mut tx = pool.begin().await.unwrap();
-    let out1 = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos.clone(),
+    let out1 = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         part_id,
         "DRAWING",
@@ -227,10 +221,8 @@ async fn upload_cas_dedup_skips_cos() {
 
     // 第二次上传同 sha → CAS 命中，复用 object_key，id 不同
     let mut tx = pool.begin().await.unwrap();
-    let out2 = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos.clone(),
+    let out2 = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         part_id,
         "DRAWING",
@@ -253,15 +245,13 @@ async fn upload_cas_dedup_skips_cos() {
 async fn upload_owner_not_found_returns_21105() {
     let pool = setup().await;
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let nonexistent = 99_999_999_999_i64;
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos,
+    let err = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         nonexistent,
         "DRAWING",
@@ -288,14 +278,12 @@ async fn rbac_inspector_can_upload_returns_403() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let inspector = test_current_user_with_roles(vec![Role::Inspector]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos,
+    let err = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         part_id,
         "DRAWING",
@@ -322,7 +310,7 @@ async fn list_filter_by_kind() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     // 上传 1 个 DRAWING + 1 个 3D_MODEL（每 kind 在 uk_t_part_file_single 下只能 1 个/owner）
@@ -340,10 +328,8 @@ async fn list_filter_by_kind() {
         );
         let body = format!("{}{}", unique_prefix, "x".repeat(1024)).into_bytes();
         let mut tx = pool.begin().await.unwrap();
-        PartFileService::upload_file_for_owner(
-            &mut tx,
-            &snowflake,
-            cos.clone(),
+        PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+            &mut *tx,
             "PART",
             part_id,
             kind,
@@ -366,7 +352,7 @@ async fn list_filter_by_kind() {
         offset: Some(0),
     };
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::list_files(&mut tx, &query, &current)
+    let out = PartFileService::new(snowflake.clone(), cos.clone()).list_files(&mut *tx, &query, &current)
         .await
         .unwrap();
     drop(tx);
@@ -382,14 +368,12 @@ async fn get_url_returns_presigned_url() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos.clone(),
+    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         part_id,
         "DRAWING",
@@ -403,7 +387,7 @@ async fn get_url_returns_presigned_url() {
     tx.commit().await.unwrap();
 
     let mut tx = pool.begin().await.unwrap();
-    let detail = PartFileService::get_file_with_url(&mut tx, cos, out.id, &current)
+    let detail = PartFileService::new(snowflake.clone(), cos.clone()).get_file_with_url(&mut *tx, cos.clone(), out.id, &current)
         .await
         .unwrap();
     drop(tx);
@@ -426,7 +410,8 @@ async fn list_includes_paired_file_id() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     // 直接 SQL 造配对行（绕开 cnc_program 上传通道，聚焦 part_file 列表投影）
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
+    let cos = Arc::new(NoopCos);
     let g_id = snowflake.next_id();
     let s_id = snowflake.next_id();
     for (id, kind, file_type, filename, sha, paired_id) in [
@@ -470,7 +455,7 @@ async fn list_includes_paired_file_id() {
         offset: Some(0),
     };
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::list_files(&mut tx, &query, &current)
+    let out = PartFileService::new(snowflake.clone(), cos.clone()).list_files(&mut *tx, &query, &current)
         .await
         .unwrap();
     drop(tx);
@@ -507,14 +492,12 @@ async fn content_happy_path() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos.clone(),
+    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         part_id,
         "DRAWING",
@@ -529,7 +512,7 @@ async fn content_happy_path() {
 
     // content 端点 — NoopCos.get_object 返空字节，但应正常返回
     let mut tx = pool.begin().await.unwrap();
-    let content = PartFileService::get_file_content(&mut tx, cos, out.id, &current)
+    let content = PartFileService::new(snowflake.clone(), cos.clone()).get_file_content(&mut *tx, cos.clone(), out.id, &current)
         .await
         .expect("content ok");
     drop(tx);
@@ -546,14 +529,12 @@ async fn soft_delete_happy_path() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos.clone(),
+    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         part_id,
         "DRAWING",
@@ -570,7 +551,7 @@ async fn soft_delete_happy_path() {
     // delete by Manager（kind=DRAWING → M+C 通行）
     let mut tx = pool.begin().await.unwrap();
     let object_key =
-        PartFileService::soft_delete_file(&mut tx, cos.clone(), out.id, version, &current)
+        PartFileService::new(snowflake.clone(), cos.clone()).soft_delete_file(&mut *tx, out.id, version, &current)
             .await
             .expect("delete ok");
     tx.commit().await.unwrap();
@@ -598,14 +579,12 @@ async fn soft_delete_version_conflict() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &snowflake,
-        cos.clone(),
+    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
+        &mut *tx,
         "PART",
         part_id,
         "DRAWING",
@@ -620,7 +599,7 @@ async fn soft_delete_version_conflict() {
 
     // 故意 version+999 → 冲突
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::soft_delete_file(&mut tx, cos, out.id, out.version + 999, &current)
+    let err = PartFileService::new(snowflake.clone(), cos.clone()).soft_delete_file(&mut *tx, out.id, out.version + 999, &current)
         .await
         .expect_err("version 冲突应抛错");
     drop(tx);
@@ -659,7 +638,7 @@ async fn confirm_tmp_missing_returns_21114() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(MockCos::new()); // 未注册 tmp_key → head_object NoSuch
 
     let tmp_key = "tmp/test/missing.pdf";
@@ -713,7 +692,7 @@ async fn confirm_size_mismatch_returns_21115() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(MockCos::new());
 
     let tmp_key = "tmp/test/sizemm.pdf";
@@ -763,7 +742,7 @@ async fn confirm_replace_old_single_returns_ready() {
     let part_id = insert_part_for_owner(&pool, l2).await;
 
     let current = test_current_user_with_roles(vec![Role::Manager]);
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
     let cos = Arc::new(MockCos::new());
 
     // 第一次 confirm（kind=DRAWING / sha=aaa...）
