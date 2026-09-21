@@ -1,4 +1,4 @@
-//! assembly 域数据访问
+//! assembly 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
 //!
 //! 对应 Python myERP/repository/assembly_repository.py。函数签名接收 `impl PgExecutor<'_>`，
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
@@ -6,12 +6,22 @@
 //! Phase P1（送货分组）只暴露 delivery_note + delivery_group 后续会用到的只读点：
 //! - `get_by_id` / `list_by_ids`
 //! - `get_by_serial` —— 扫码入单解析（Phase P3）需要 exact match
+//!
+//! 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff，
+//! `.sqlx/query-*.json` 哈希不变；新增的 `AssemblyRepoTrait` 在 `repo/mod.rs`。
+//!
+//! ## 为什么保留 `AssemblyRepo` ZST
+//! delivery_note 域 service/{crud,inner,scan}.rs 都 `use crate::modules::assembly::repo::AssemblyRepo;`
+//! 然后 `AssemblyRepo::list_by_ids / get_by_id / get_by_serial(&mut *conn, ...)`
+//! 走 ZST 静态方法。本任务（Group D-3）不在 delivery_note 范围，故不能破坏 ZST 对外身份。
+//! 解法：本文件 ZST `AssemblyRepo` 保留全部 11 个静态方法（与原 repo.rs 一致）；新增的
+//! `AssemblyRepoTrait` 在 `repo/mod.rs`，trait impl `for &mut PgConnection` 一行委托到此 ZST。
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use sqlx::{PgExecutor, Postgres, QueryBuilder};
 
-use super::model::TAssembly;
+use super::super::model::TAssembly;
 
 pub struct AssemblyRepo;
 

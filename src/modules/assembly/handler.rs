@@ -9,13 +9,22 @@
 //! - `POST /{assembly_id}/update`          —— 字段可选 UPDATE（OCC）
 //! - `POST /{assembly_id}/soft-delete`     —— Manager 软删（OCC）
 //! - `POST /{assembly_id}/cancel`          —— Manager/Clerk 取消
+//! - `POST /{assembly_id}/start`           —— PENDING → IN_PROCESS 状态机守卫
+//! - `POST /{assembly_id}/files`           —— multipart PDF 上传到 COS
 //!
-//! ## 约定
-//! - 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
+//! ## 约定（2026-09-22 Group D-3 重构对齐 iam 范本）
+//! - 事务边界在 handler：`state.pool.begin()` → service（trait 注入式签名
+//!   `<R: AssemblyRepoTrait>(&self, mut repo: R, ...)` 收 `&mut tx`）→ 显式
 //!   `tx.commit()`；提前 return 时 `Transaction` 的 Drop 自动回滚。
 //! - 统一响应信封：`Result<Json<R<T>>, AppError>`。
 //! - 权限在 service 层（`current.require_role(...)` 守卫）。
-//! - WS 广播在 commit 之后（对齐 Python 延迟广播模式）。
+//! - WS 广播在 commit 之后（对齐 Python 延迟广播模式）；service 不直接调 ws_hub。
+//!
+//! ## handler 三形态
+//! - ① 纯写端点：`pool.begin() → service → commit`，再广播。
+//! - ② 读端点（list / get）：`pool.acquire() → service`，不开事务。
+//! - ③ multipart 上传（create / files）：`pool.begin() → service → commit`；commit 后
+//!   广播（仅 create）。
 
 use std::sync::Arc;
 
@@ -47,29 +56,30 @@ pub struct VersionBody {
 
 /// GET /api/v2/assemblies
 ///
-/// 列表查询 + 分页（service 内已校验角色）。
+/// 列表查询 + 分页（service 内已校验角色）。读端点，不开事务。
+///
+/// 2026-09-22 D-3：handler 直接走 `AssemblyService::list_assemblies` 的 ZST 静态
+/// wrapper（接受 `&mut PgConnection`），与既存集成测试一致。
 pub async fn list_assemblies(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(query): Query<AssemblyListQuery>,
 ) -> Result<Json<R<AssemblyListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = AssemblyService::list_assemblies(&mut tx, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = AssemblyService::list_assemblies(&mut conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// GET /api/v2/assemblies/{assembly_id}
 ///
-/// 单条详情（assembly 行 + children parts + files 占位空数组）。
+/// 单条详情（assembly 行 + children parts + files 占位空数组）。读端点，不开事务。
 pub async fn get_assembly(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(assembly_id): Path<i64>,
 ) -> Result<Json<R<AssemblyDetail>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = AssemblyService::get_assembly(&mut tx, assembly_id, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = AssemblyService::get_assembly(&mut conn, assembly_id, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -124,9 +134,14 @@ pub async fn create_assembly(
         .map_err(|e| AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}")))?;
 
     let mut tx = state.pool.begin().await?;
-    let out =
-        AssemblyService::create_assembly(&mut tx, &state.snowflake, &req, pdf_files, &current)
-            .await?;
+    let out = AssemblyService::create_assembly(
+        &mut tx,
+        &state.snowflake,
+        &req,
+        pdf_files,
+        &current,
+    )
+    .await?;
     tx.commit().await?;
     // commit 之后广播（对齐 Python 延迟广播模式）
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
