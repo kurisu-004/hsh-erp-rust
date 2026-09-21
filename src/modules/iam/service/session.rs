@@ -6,25 +6,29 @@
 //! - me：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单，返回最新视图
 //! - change_password：自助改密复用 `AccountService::change_own_password`
 //!
-//! ## 实施约定（2026-09-18 auth-di 重构 Wave 2B + 2026-09-19 IAM 合并）
-//! - `SessionService` 持 `Arc<dyn IamUowProvider>` + `Arc<AppConfig>` + `Arc<dyn SessionStore>` +
-//!   `Arc<AccountService>`；所有方法 `&self`。
-//! - 写端点（login / refresh）：内部 `self.uow_provider.begin().await?` → 业务操作 →
-//!   `uow.commit().await?` → session 写/清**在 commit 之后**（plan v4 §3 V6 约定）。
-//! - 读端点（me）：内部 begin 后 drop（不 commit，隐式回滚）。
+//! ## 实施约定（2026-09-21 事务分层重构）
+//! - `SessionService` 持 `Arc<AppConfig>` + `Arc<dyn SessionStore>` + `Arc<AccountService>`
+//!   （`uow_provider` 字段移除）；所有方法 `&self`。
+//! - 事务移交 handler：`login` / `refresh` 拆两阶段——
+//!   1. `login<R>(&self, repo: &mut R, req) -> LoginPending`：业务逻辑 + DB 写，
+//!      handler 拿到结果后 commit。
+//!   2. `complete_login(&self, pending: LoginPending) -> LoginResponse`：写 Redis session +
+//!      组装响应，commit 之后做（plan v4 §3 V6 约定）。
+//!
+//!   refresh 同。
+//! - 读端点（me）：方法签名 `me<R>(&self, repo: &mut R, current)`；handler 仍 `pool.acquire()`
+//!   不开事务，service 内 `repo.xxx()` 在一次性连接上执行，读完 drop 即可。
 //! - 不 begin 端点：
-//!   - change_password：纯委托给 `self.account_service.change_own_password(...)`，
-//!     account_service 内部自管 begin/commit。
+//!   - change_password：纯委托给 `self.account_service.change_own_password(repo, ...)`。
 //!   - logout：无 DB 操作，只清 Redis session。
-//! - helper `resolve_roles_and_scope` 收 `&mut dyn IamUnitOfWork`（需 `shelf_repo().get_by_id(...)`），
-//!   保持与本服务在自己 begin 的 uow 同 tx。
+//! - helper `resolve_roles_and_scope` 收 `&mut R: IamRepo`，与 `IamRepo` trait 方法一致。
 //!
 //! 2026-09-19 IAM 域合并：`AuthService` → `SessionService`，改密用 `AccountService`
 //! 取代原 `UserService`。
 
 use std::sync::Arc;
 
-use crate::auth::jwt::{decode_refresh, issue_token_pair};
+use crate::auth::jwt::{TokenPair, decode_refresh, issue_token_pair};
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::auth::session::{CachedCurrentUser, SessionStore, TokenKind, hash_token};
@@ -32,9 +36,8 @@ use crate::infra::clock::now_naive;
 use crate::infra::config::AppConfig;
 use crate::modules::iam::dto::{ChangePasswordRequest, CurrentUserOut, LoginResponse, MenuNodeOut};
 use crate::modules::iam::model::User;
-use crate::modules::iam::repo::UserRoleRow;
+use crate::modules::iam::repo::{IamRepo, UserRoleRow};
 use crate::modules::iam::service::account::{AccountService, role_as_str};
-use crate::modules::iam::uow::{IamUnitOfWork, IamUowProvider};
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{LoginRequest, RefreshRequest};
@@ -45,11 +48,37 @@ const SCOPE_TYPE_SHELF: &str = "shelf";
 /// 可绑定 SHELF_ACCOUNT 的货架分区白名单（与 account 域 `validate_role_scope` 对齐）
 const ALLOWED_SHELF_ZONES: [&str; 2] = ["PRODUCTION", "INSPECTION"];
 
-/// iam 域会话 service。构造时注入 `Arc<dyn IamUowProvider>`（DB 事务来源）+ `Arc<AppConfig>`
-/// （JWT / Redis TTL 配置）+ `Arc<dyn SessionStore>`（服务端 session）+ `Arc<AccountService>`
-/// （跨域委托：menus / change_password）。
+/// login 第一阶段产出：DB 操作结果 + 待签 token + 用户视图素材。
+/// handler 拿到后 commit，然后调 `complete_login` 写 Redis + 组装响应。
+#[derive(Debug)]
+pub struct LoginPending {
+    pub pair: TokenPair,
+    pub user: User,
+    pub roles: Vec<Role>,
+    pub shelf_ids: Vec<i64>,
+    pub shelf_wildcard: bool,
+    pub menus: Vec<MenuNodeOut>,
+}
+
+/// refresh 第一阶段产出：DB 操作结果 + 待签 token + 用户视图素材 + 旧 refresh hash。
+/// handler 拿到后 commit，然后调 `complete_refresh` 删旧 session + 写新 + 组装响应。
+#[derive(Debug)]
+pub struct RefreshPending {
+    pub pair: TokenPair,
+    pub user: User,
+    pub roles: Vec<Role>,
+    pub shelf_ids: Vec<i64>,
+    pub shelf_wildcard: bool,
+    pub menus: Vec<MenuNodeOut>,
+    pub old_refresh_hash: String,
+}
+
+/// iam 域会话 service。构造时注入 `Arc<AppConfig>`（JWT / Redis TTL 配置）+
+/// `Arc<dyn SessionStore>`（服务端 session）+ `Arc<AccountService>`（跨域委托）。
+///
+/// 2026-09-21 重构：移除 `Arc<dyn IamUowProvider>` 字段——事务由 handler 管，service
+/// 不知事务边界。
 pub struct SessionService {
-    uow_provider: Arc<dyn IamUowProvider>,
     config: Arc<AppConfig>,
     session: Arc<dyn SessionStore>,
     account_service: Arc<AccountService>,
@@ -78,29 +107,33 @@ fn version_conflict() -> AppError {
 impl SessionService {
     /// 构造。
     pub fn new(
-        uow_provider: Arc<dyn IamUowProvider>,
         config: Arc<AppConfig>,
         session: Arc<dyn SessionStore>,
         account_service: Arc<AccountService>,
     ) -> Self {
         Self {
-            uow_provider,
             config,
             session,
             account_service,
         }
     }
 
-    pub async fn login(&self, req: LoginRequest) -> Result<LoginResponse, AppError> {
+    // =======================================================================
+    // login：两阶段（DB 在第一阶段 commit，Redis 写在第二阶段 commit 后）
+    // =======================================================================
+
+    /// login 第一阶段：DB 操作（用户查 / 角色 / 菜单 / touch_login），返回待签 token 配对
+    /// 与菜单视图。**不** commit、**不**写 Redis——由 handler commit 后调 `complete_login`。
+    pub async fn login<R: IamRepo + ?Sized>(
+        &self,
+        repo: &mut R,
+        req: LoginRequest,
+    ) -> Result<LoginPending, AppError> {
         // 1. username 归一化（对齐 Python `.strip().lower()`）
         let username_lower = req.username.trim().to_lowercase();
 
-        // 2. 开事务
-        let mut uow = self.uow_provider.begin().await?;
-
-        // 3. 查用户（已过滤软删）+ 校验 active
-        let u = uow
-            .user_repo()
+        // 2. 查用户（已过滤软删）+ 校验 active
+        let u = repo
             .get_by_username(&username_lower)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_AUTH_INVALID, "用户名或密码错误"))?;
@@ -108,29 +141,26 @@ impl SessionService {
             return Err(AppError::biz(code::BIZ_AUTH_INVALID, "用户名或密码错误"));
         }
 
-        // 4. bcrypt 校验
+        // 3. bcrypt 校验
         if !password::verify(&req.password, &u.password_hash)? {
             return Err(AppError::biz(code::BIZ_AUTH_INVALID, "用户名或密码错误"));
         }
 
-        // 5. 角色列表（为空 → 403 NO_ROLE，统一对外不区分原因）
-        let role_rows = uow.user_role_repo().list_by_user(u.id).await?;
+        // 4. 角色列表（为空 → 403 NO_ROLE，统一对外不区分原因）
+        let role_rows = repo.list_by_user(u.id).await?;
         if role_rows.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
 
-        // 6. 解析角色枚举 + shelf 范围；委托 account_service 取菜单
+        // 5. 解析角色枚举 + shelf 范围；委托 account_service 取菜单
         let (roles, shelf_ids, shelf_wildcard) =
-            resolve_roles_and_scope(&mut *uow, &role_rows).await?;
+            resolve_roles_and_scope(repo, &role_rows).await?;
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let menus = self
-            .account_service
-            .menus_for_roles(&mut *uow, &roles)
-            .await?;
+        let menus = self.account_service.menus_for_roles(repo, &roles).await?;
 
-        // 7. 签发双 token
+        // 6. 签发双 token
         let pair = issue_token_pair(
             u.id,
             &u.username,
@@ -144,11 +174,29 @@ impl SessionService {
             self.config.jwt.refresh_ttl_days,
         )?;
 
-        // 8. 戳一下 last_login_at（不动 version，避开与并发业务更新冲突）
-        uow.user_repo().touch_login(u.id, now_naive()).await?;
+        // 7. 戳一下 last_login_at（不动 version，避开与并发业务更新冲突）
+        repo.touch_login(u.id, now_naive()).await?;
 
-        // 9. 提交事务；session 写在 commit 之后（plan v4 §3 V6 新约定）
-        uow.commit().await?;
+        Ok(LoginPending {
+            pair,
+            user: u,
+            roles,
+            shelf_ids,
+            shelf_wildcard,
+            menus,
+        })
+    }
+
+    /// login 第二阶段（commit 之后）：写 Redis session + 组装响应。
+    pub async fn complete_login(&self, pending: LoginPending) -> Result<LoginResponse, AppError> {
+        let LoginPending {
+            pair,
+            user: u,
+            roles,
+            shelf_ids,
+            shelf_wildcard,
+            menus,
+        } = pending;
 
         let cached = CachedCurrentUser {
             id: u.id,
@@ -177,7 +225,6 @@ impl SessionService {
             )
             .await?;
 
-        // 10. 组装 CurrentUserOut（直接拼，不绕 account helper，避免 jwt 里 stale 数据回流到 /me）
         let user_out = build_current_user_out(&u, &roles, &shelf_ids, menus);
 
         Ok(LoginResponse {
@@ -187,8 +234,19 @@ impl SessionService {
         })
     }
 
-    pub async fn refresh(&self, req: RefreshRequest) -> Result<LoginResponse, AppError> {
-        // 1. 解码 refresh token，取 sub + ver
+    // =======================================================================
+    // refresh：两阶段
+    // =======================================================================
+
+    /// refresh 第一阶段：DB 操作 + 轮转 refresh_token_version + 签发新 token，
+    /// 返回 `RefreshPending`（含旧 refresh hash）。**不** commit、**不**删旧 session、
+    /// **不**写新 Redis session——由 handler commit 后调 `complete_refresh`。
+    pub async fn refresh<R: IamRepo + ?Sized>(
+        &self,
+        repo: &mut R,
+        req: RefreshRequest,
+    ) -> Result<RefreshPending, AppError> {
+        // 1. 解码 refresh token，取 sub + ver（在 open tx 前即可拒）
         let (sub, ver) = decode_refresh(
             &req.refresh_token,
             &self.config.jwt.secret,
@@ -196,12 +254,8 @@ impl SessionService {
         )
         .map_err(|_| AppError::biz(code::REFRESH_INVALID, "refresh token 失效"))?;
 
-        // 2. 开事务
-        let mut uow = self.uow_provider.begin().await?;
-
-        // 3. 查用户 + 校验 active + 校验版本号匹配
-        let u = uow
-            .user_repo()
+        // 2. 查用户 + 校验 active + 校验版本号匹配
+        let u = repo
             .get_by_id(sub)
             .await?
             .ok_or_else(|| AppError::biz(code::REFRESH_INVALID, "refresh token 失效"))?;
@@ -212,35 +266,30 @@ impl SessionService {
             return Err(AppError::biz(code::REFRESH_INVALID, "refresh token 失效"));
         }
 
-        // 4. 取角色 + shelf 范围 + 菜单（与 login 同样的解析）
-        let role_rows = uow.user_role_repo().list_by_user(u.id).await?;
+        // 3. 取角色 + shelf 范围 + 菜单（与 login 同样的解析）
+        let role_rows = repo.list_by_user(u.id).await?;
         if role_rows.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
         let (roles, shelf_ids, shelf_wildcard) =
-            resolve_roles_and_scope(&mut *uow, &role_rows).await?;
+            resolve_roles_and_scope(repo, &role_rows).await?;
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let menus = self
-            .account_service
-            .menus_for_roles(&mut *uow, &roles)
-            .await?;
+        let menus = self.account_service.menus_for_roles(repo, &roles).await?;
 
-        // 5. 轮转 refresh_token_version（带乐观锁；0 行 → 409）
+        // 4. 轮转 refresh_token_version（带乐观锁；0 行 → 409）
         let user_id = u.id;
         let user_version = u.version;
-        let affected = uow
-            .user_repo()
+        let affected = repo
             .increment_refresh_token_version(user_id, user_version, now_naive(), Some(user_id))
             .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
-        // 6. 拿轮转后的 ver 重新签发（重读 DB 取 +1 后的新版本）
-        let u = uow
-            .user_repo()
+        // 5. 拿轮转后的 ver 重新签发（重读 DB 取 +1 后的新版本）
+        let u = repo
             .get_by_id(user_id)
             .await?
             .ok_or_else(|| AppError::biz(code::REFRESH_INVALID, "user disappeared"))?;
@@ -258,10 +307,33 @@ impl SessionService {
             self.config.jwt.refresh_ttl_days,
         )?;
 
-        // 7. 提交事务；session 删旧 + 写在 commit 之后
-        uow.commit().await?;
+        Ok(RefreshPending {
+            pair,
+            user: u,
+            roles,
+            shelf_ids,
+            shelf_wildcard,
+            menus,
+            old_refresh_hash: hash_token(&req.refresh_token),
+        })
+    }
 
-        let old_refresh_hash = hash_token(&req.refresh_token);
+    /// refresh 第二阶段（commit 之后）：删旧 refresh session + 写新 access/refresh session
+    /// + 组装响应。
+    pub async fn complete_refresh(
+        &self,
+        pending: RefreshPending,
+    ) -> Result<LoginResponse, AppError> {
+        let RefreshPending {
+            pair,
+            user: u,
+            roles,
+            shelf_ids,
+            shelf_wildcard,
+            menus,
+            old_refresh_hash,
+        } = pending;
+
         if let Err(e) = self.session.delete_session(&old_refresh_hash).await {
             tracing::warn!(error = %e, user_id = u.id, "refresh: 删旧 refresh session 失败");
         }
@@ -301,13 +373,19 @@ impl SessionService {
         })
     }
 
-    pub async fn me(&self, current: &CurrentUser) -> Result<CurrentUserOut, AppError> {
-        // 读端点：begin 后 drop（隐式回滚，不 commit）
-        let mut uow = self.uow_provider.begin().await?;
+    // =======================================================================
+    // me（读端点）
+    // =======================================================================
 
+    /// `/iam/me`：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单。
+    /// 读端点，handler `pool.acquire()` 不开事务，service 借到的 `repo` 用完即 drop。
+    pub async fn me<R: IamRepo + ?Sized>(
+        &self,
+        repo: &mut R,
+        current: &CurrentUser,
+    ) -> Result<CurrentUserOut, AppError> {
         // 1. 重读用户（handle 被外部停用/软删的极端情况）→ 不存在/已删 → UNAUTHORIZED
-        let u = uow
-            .user_repo()
+        let u = repo
             .get_by_id(current.id)
             .await?
             .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "用户不存在或已停用"))?;
@@ -316,21 +394,24 @@ impl SessionService {
         }
 
         // 2. 重查角色 + shelf 范围 + 菜单（不走 JWT 里的 stale 数据）
-        let role_rows = uow.user_role_repo().list_by_user(u.id).await?;
-        let (roles, shelf_ids, _wildcard) = resolve_roles_and_scope(&mut *uow, &role_rows).await?;
-        let menus = self
-            .account_service
-            .menus_for_roles(&mut *uow, &roles)
-            .await?;
+        let role_rows = repo.list_by_user(u.id).await?;
+        let (roles, shelf_ids, _wildcard) =
+            resolve_roles_and_scope(repo, &role_rows).await?;
+        let menus = self.account_service.menus_for_roles(repo, &roles).await?;
 
         Ok(build_current_user_out(&u, &roles, &shelf_ids, menus))
     }
 
-    /// 自助改密：纯委托给 account_service（account_service 自己 begin + commit），
+    // =======================================================================
+    // change_password / logout（DB 委派 / 无 DB）
+    // =======================================================================
+
+    /// 自助改密：纯委托给 account_service（account_service 借传入的 repo 跑业务）。
     /// 本服务入口处的权限校验与 account_service 内部重复，显式提一处以便在 service
     /// 入口给出明确语义。
-    pub async fn change_password(
+    pub async fn change_password<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         user_id: i64,
         req: ChangePasswordRequest,
         current: &CurrentUser,
@@ -339,7 +420,7 @@ impl SessionService {
             return Err(AppError::biz(code::FORBIDDEN, "只能修改本人密码"));
         }
         self.account_service
-            .change_own_password(user_id, &req.old_password, &req.new_password, current)
+            .change_own_password(repo, user_id, &req.old_password, &req.new_password, current)
             .await
     }
 
@@ -360,8 +441,8 @@ impl SessionService {
 /// 3. `bool`：shelf_wildcard——任意一条 SHELF_ACCOUNT 行的 scope_id 为 NULL 时为 true
 ///
 /// 规则与 account_service.validate_role_scope / shelf_repo.get_by_id 一脉相承。
-async fn resolve_roles_and_scope(
-    uow: &mut dyn IamUnitOfWork,
+async fn resolve_roles_and_scope<R: IamRepo + ?Sized>(
+    repo: &mut R,
     rows: &[UserRoleRow],
 ) -> Result<(Vec<Role>, Vec<i64>, bool), AppError> {
     let mut roles: Vec<Role> = Vec::with_capacity(rows.len());
@@ -377,7 +458,7 @@ async fn resolve_roles_and_scope(
             match r.scope_id {
                 None => shelf_wildcard = true,
                 Some(sid) => {
-                    let shelf = uow.shelf_repo().get_by_id(sid).await?;
+                    let shelf = repo.shelf_get_by_id(sid).await?;
                     if let Some(s) = shelf
                         && s.is_active
                         && ALLOWED_SHELF_ZONES.contains(&s.zone.as_str())

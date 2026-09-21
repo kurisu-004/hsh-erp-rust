@@ -2,6 +2,10 @@
 //!
 //! 以 `Arc<AppState>` 作为 axum Router 的 state 类型，跨 handler 共享。
 //! 跨域组件在构造时一次性初始化；CancellationToken 用于优雅退出后台任务。
+//!
+//! 2026-09-21 事务分层重构：iam 域不再注入 `IamUowProvider`（事务移交 handler 后，
+//! service 仅持雪花 ID 生成器 / 配置 / session store / 跨域委托）。handler 自行
+//! `state.pool.begin()` / `acquire()`。
 
 use std::sync::Arc;
 
@@ -15,7 +19,6 @@ use crate::infra::python_sts::PythonSts;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsHub;
 use crate::modules::iam::service::{AccountService, SessionService};
-use crate::modules::iam::uow::{IamUowProvider, SqlxIamUowProvider};
 use crate::modules::upload_session::repo::UploadSessionRepo;
 
 pub struct AppState {
@@ -41,9 +44,11 @@ pub struct AppState {
     pub upload_session_repo: Arc<dyn UploadSessionRepo>,
     /// 2026-09-19 IAM 域合并：原 `user_service` 重命名为 `account_service`，承载
     /// 账号 CRUD + 角色管理 + 改密（service::AccountService，原 UserService）。
+    /// 2026-09-21 事务分层重构：字段仅 `snowflake`；handler 借连接传入 repo。
     pub account_service: Arc<AccountService>,
     /// 2026-09-19 IAM 域合并：原 `auth_service` 重命名为 `session_service`，承载
     /// login / refresh / me / logout / change-password（service::SessionService，原 AuthService）。
+    /// 2026-09-21 事务分层重构：字段去掉 `uow_provider`；handler 借连接传入 repo。
     pub session_service: Arc<SessionService>,
 }
 
@@ -60,15 +65,10 @@ impl AppState {
         session: Arc<dyn SessionStore>,
         upload_session_repo: Arc<dyn UploadSessionRepo>,
     ) -> Self {
-        // 三段装线：IamUowProvider → AccountService → SessionService
-        let uow_provider: Arc<dyn IamUowProvider> = Arc::new(SqlxIamUowProvider::new(pool.clone()));
-        let account_service = Arc::new(AccountService::new(
-            uow_provider.clone(),
-            snowflake.clone(),
-            session.clone(),
-        ));
+        // 装线（2026-09-21 事务分层重构后无 IamUowProvider）：
+        // AccountService::new(snowflake) → SessionService::new(config, session, account_service)
+        let account_service = Arc::new(AccountService::new(snowflake.clone()));
         let session_service = Arc::new(SessionService::new(
-            uow_provider.clone(),
             config.clone(),
             session.clone(),
             account_service.clone(),

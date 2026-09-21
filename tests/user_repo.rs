@@ -1,21 +1,18 @@
-//! user 域 repo 集成测试 + UoW 语义测试
+//! user 域 repo 集成测试
 //!
-//! 总计 49 例：
-//! - 47 例覆盖 user/repo.rs 17 个固有静态方法（happy path + error path）
-//! - 2 例 SqlxUoW commit/drop 语义
+//! 总计 47 例：覆盖 iam/repo/sql.rs 17 个固有静态方法（happy path + error path）。
 //!
-//! 本文件为集成测试，承载 4 域 repo 测试用例 + UoW 语义测试；按域拆分会增加 fixture
-//! 复用成本，本仓库约定集成测试可豁免 1000 行上限。
+//! 本文件为集成测试，承载 4 域 repo 测试用例；按域拆分会增加 fixture 复用成本，本仓库
+//! 约定集成测试可豁免 1000 行上限。
 //!
 //! ## 测试并行注意
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化（每个用例 fresh database，无 fixture 覆盖）。
 //!
-//! ## UoW 语义测试
-//! - `sqlx_uow_commit_persists_writes` —— 通过 SqlxIamUowProvider.begin() 开 tx，
-//!   经访问器写数据，commit() 后用独立 pool 查应可见；
-//! - `sqlx_uow_drop_without_commit_rolls_back` —— 开 tx 后写数据但直接 drop
-//!   （隐式回滚），用独立 pool 查应不可见。
+//! ## 事务迁移（2026-09-21）
+//! 原 2 例 SqlxUoW commit / drop 语义测试已删除——`uow.rs` 全家删除后 UoW 不再存在，
+//! 事务由 handler 层 `state.pool.begin()` 管；handler 层语义回归改由
+//! `tests/iam_api.rs`（HTTP 契约测试，强回归网）承担。本文件保留 SQL/repo 层 47 例。
 //!
 //! 复用 `tests/common/mod.rs` 的 fixture（ensure_database_exists / test_pool / clean_db
 //! / insert_user_with_password 等），与既有 tests/* 风格一致。
@@ -30,12 +27,12 @@ use common::{ensure_database_exists, test_pool};
 
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-// 2026-09-19 IAM 域合并：原 `user::repo` / `user::uow` 重定向到 `iam::repo` / `iam::uow`，
-// 类型重命名为 `SqlxIamUowProvider` / `IamUowProvider`（加 Iam 前缀）。
+// 2026-09-19 IAM 域合并：原 `user::repo` 重定向到 `iam::repo`。
+// 2026-09-21 事务分层重构：`iam::uow` 删除；如需 PG 借连接，借 `iam::repo::PgIamRepo`。
+// `IamRepo` trait 必导入——`PgIamRepo` 实现的方法来自 trait，必须 in scope 才能调用。
 use hsh_erp_rust::modules::iam::repo::{
-    MenuRepo, ShelfRepo, UserInsert, UserRepo, UserRoleInsert, UserRoleRepo,
+    IamRepo, MenuRepo, PgIamRepo, ShelfRepo, UserInsert, UserRepo, UserRoleInsert, UserRoleRepo,
 };
-use hsh_erp_rust::modules::iam::uow::{IamUowProvider, SqlxIamUowProvider};
 
 // ===========================================================================
 // 全局串行化互斥：所有用例共享同一 DB。
@@ -920,50 +917,50 @@ async fn shelf_get_by_id_returns_none_for_missing() {
 }
 
 // ===========================================================================
-// 多表组合事务 (2 例)：经 SqlxIamUowProvider 开 tx，跨多 repo 写，最后 commit。
+// 多表组合事务 (2 例)：经 PgIamRepo + pool.begin() 开 tx，跨多 repo 写，最后 commit。
+// 与 handler 层 `state.pool.begin()` + `PgIamRepo::new(&mut tx)` 路径同构（2026-09-21
+// 事务分层重构后的事务边界）。
 // ===========================================================================
 
-/// `SqlxIamUowProvider`：commit 后写入对外可见
+/// `PgIamRepo` + 手写 begin/commit：commit 后写入对外可见
 #[tokio::test]
+#[allow(clippy::explicit_auto_deref)] // `&mut *tx` 是 sqlx 借 `&mut PgConnection` 的标准模式
 async fn create_user_then_add_role_then_list_persists_all() {
     let pool = setup().await;
 
-    let provider = SqlxIamUowProvider::new(pool.clone());
-    let mut uow = provider.begin().await.expect("begin");
+    let mut tx = pool.begin().await.expect("begin");
+    let mut repo = PgIamRepo::new(&mut *tx);
 
     // 写 user
     let uid = snowflake().lock().unwrap().next_id();
-    uow.user_repo()
-        .create(&UserInsert {
-            id: uid,
-            username: "atomic-user".to_string(),
-            password_hash: "h".to_string(),
-            full_name: "Atomic User".to_string(),
-            phone: None,
-            is_active: true,
-            created_at: now_naive(),
-            created_by: None,
-        })
-        .await
-        .expect("create user");
+    repo.create(&UserInsert {
+        id: uid,
+        username: "atomic-user".to_string(),
+        password_hash: "h".to_string(),
+        full_name: "Atomic User".to_string(),
+        phone: None,
+        is_active: true,
+        created_at: now_naive(),
+        created_by: None,
+    })
+    .await
+    .expect("create user");
 
     // 写 role
     let rid = snowflake().lock().unwrap().next_id();
-    uow.user_role_repo()
-        .create(&UserRoleInsert {
-            id: rid,
-            user_id: uid,
-            role: "MANAGER".to_string(),
-            scope_type: None,
-            scope_id: None,
-            created_at: now_naive(),
-            created_by: None,
-        })
-        .await
-        .expect("create role");
+    repo.role_create(&UserRoleInsert {
+        id: rid,
+        user_id: uid,
+        role: "MANAGER".to_string(),
+        scope_type: None,
+        scope_id: None,
+        created_at: now_naive(),
+        created_by: None,
+    })
+    .await
+    .expect("create role");
 
-    // commit（消费 Box<Self>）
-    uow.commit().await.expect("commit");
+    tx.commit().await.expect("commit");
 
     // 用独立 SQL 查应可见
     let u = UserRepo::get_by_id(&pool, uid)
@@ -976,8 +973,9 @@ async fn create_user_then_add_role_then_list_persists_all() {
     assert_eq!(rows[0].role, "MANAGER");
 }
 
-/// `SqlxIamUowProvider`：commit 后不存在的 user 不能通过 list_by_user 看到软删 + role 关联
+/// `PgIamRepo` + 手写 begin/commit：commit 后 user 软删生效（list_by_user 只看 role.deleted_at）
 #[tokio::test]
+#[allow(clippy::explicit_auto_deref)]
 async fn soft_delete_user_then_list_roles_returns_empty() {
     let pool = setup().await;
 
@@ -985,15 +983,14 @@ async fn soft_delete_user_then_list_roles_returns_empty() {
     let uid = seed_user(&pool, "toclose", true).await;
     let _ = seed_role(&pool, uid, "CLERK", None, None).await;
 
-    let provider = SqlxIamUowProvider::new(pool.clone());
-    let mut uow = provider.begin().await.expect("begin");
-
-    uow.user_repo()
-        .soft_delete(uid, 0, now_naive(), None)
-        .await
-        .expect("soft delete");
-
-    uow.commit().await.expect("commit");
+    let mut tx = pool.begin().await.expect("begin");
+    {
+        let mut repo = PgIamRepo::new(&mut *tx);
+        repo.soft_delete(uid, 0, now_naive(), None)
+            .await
+            .expect("soft delete");
+    }
+    tx.commit().await.expect("commit");
 
     // 软删后再 list_by_user —— 角色还在（list_by_user 不 JOIN t_user），但 user 不可见
     let rows = UserRoleRepo::list_by_user(&pool, uid).await.expect("list");
@@ -1007,31 +1004,31 @@ async fn soft_delete_user_then_list_roles_returns_empty() {
 }
 
 // ===========================================================================
-// UoW 语义 (2 例)：commit / drop 行为
+// 事务边界 (2 例)：手写 begin + commit / drop 行为（替代原 SqlxIamUnitOfWork commit/drop 语义）
 // ===========================================================================
 
-/// `SqlxIamUnitOfWork::commit()` 后写入持久化（独立连接可查到）
+/// 事务 commit 后写入持久化（独立连接可查到）
 #[tokio::test]
-async fn sqlx_uow_commit_persists_writes() {
+#[allow(clippy::explicit_auto_deref)]
+async fn transaction_commit_persists_writes() {
     let pool = setup().await;
 
-    let provider = SqlxIamUowProvider::new(pool.clone());
-    let mut uow = provider.begin().await.expect("begin");
+    let mut tx = pool.begin().await.expect("begin");
+    let mut repo = PgIamRepo::new(&mut *tx);
     let uid = snowflake().lock().unwrap().next_id();
-    uow.user_repo()
-        .create(&UserInsert {
-            id: uid,
-            username: "committed".to_string(),
-            password_hash: "h".to_string(),
-            full_name: "Committed".to_string(),
-            phone: None,
-            is_active: true,
-            created_at: now_naive(),
-            created_by: None,
-        })
-        .await
-        .expect("create");
-    uow.commit().await.expect("commit");
+    repo.create(&UserInsert {
+        id: uid,
+        username: "committed".to_string(),
+        password_hash: "h".to_string(),
+        full_name: "Committed".to_string(),
+        phone: None,
+        is_active: true,
+        created_at: now_naive(),
+        created_by: None,
+    })
+    .await
+    .expect("create");
+    tx.commit().await.expect("commit");
 
     // 同一 pool（连接）直接查应可见（commit 已让事务落库）
     let u = UserRepo::get_by_id(&pool, uid)
@@ -1041,36 +1038,37 @@ async fn sqlx_uow_commit_persists_writes() {
     assert_eq!(u.username, "committed");
 }
 
-/// `SqlxIamUnitOfWork` 在不 commit 时 drop → 隐式回滚（写入不可见）
+/// 事务在 commit 前 drop → 隐式回滚（写入不可见）
 #[tokio::test]
-async fn sqlx_uow_drop_without_commit_rolls_back() {
+#[allow(clippy::explicit_auto_deref)]
+async fn transaction_drop_without_commit_rolls_back() {
     let pool = setup().await;
 
-    let provider = SqlxIamUowProvider::new(pool.clone());
-    let mut uow = provider.begin().await.expect("begin");
+    let mut tx = pool.begin().await.expect("begin");
+    let mut repo = PgIamRepo::new(&mut *tx);
     let uid = snowflake().lock().unwrap().next_id();
-    uow.user_repo()
-        .create(&UserInsert {
-            id: uid,
-            username: "rolledback".to_string(),
-            password_hash: "h".to_string(),
-            full_name: "RolledBack".to_string(),
-            phone: None,
-            is_active: true,
-            created_at: now_naive(),
-            created_by: None,
-        })
-        .await
-        .expect("create");
-    // 不调 commit，直接 drop —— sqlx::Transaction 的 Drop 语义 = ROLLBACK
-    drop(uow);
+    repo.create(&UserInsert {
+        id: uid,
+        username: "rolledback".to_string(),
+        password_hash: "h".to_string(),
+        full_name: "RolledBack".to_string(),
+        phone: None,
+        is_active: true,
+        created_at: now_naive(),
+        created_by: None,
+    })
+    .await
+    .expect("create");
+
+    // 不调 commit，让 `tx` 在作用域结束时 drop —— sqlx::Transaction 的 Drop 语义 = ROLLBACK
+    drop(tx);
 
     let u = UserRepo::get_by_id(&pool, uid).await.expect("query");
     assert!(u.is_none(), "drop 未 commit → 隐式回滚 → 数据不可见");
 }
 
 // ===========================================================================
-// 3 个补充集成测试（计数对齐 47 + 2 = 49）
+// 3 个补充集成测试
 // ===========================================================================
 
 /// `UserRepo::update_partial`：同时改 password_hash（管理员重置密码不踢下线路径）

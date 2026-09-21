@@ -1,19 +1,18 @@
 //! iam AccountService 单测共享 helpers（不计入 service_tests 行数额度）
+//!
+//! 2026-09-21 事务分层重构后：service 签名 `<R: IamRepo>(&self, repo: &mut R, ...)`，
+//! 单测用 `MockIamRepo` 直接注入；事务边界不再在 service 层，故无 commit/rollback 断言。
+//! 写端点原本的 `assert_committed()` / `assert_not_committed()` 整体删除——服务不知事务。
 
 use std::sync::{Arc, Mutex};
 
 use chrono::NaiveDateTime;
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::auth::session::{MockSessionStore, SessionStore};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::iam::model::{Menu, Shelf, User, UserRole};
-use crate::modules::iam::repo::UserRoleRow;
+use crate::modules::iam::repo::{MockIamRepo, UserRoleRow};
 use crate::modules::iam::service::AccountService;
-use crate::modules::iam::uow::IamUowProvider;
-use crate::modules::iam::uow::test_support::{
-    IamUowFlags, MockIamUnitOfWork, MockIamUowProvider, provider_returning,
-};
 
 /// 模拟 `sqlx::Error::RowNotFound`（与原 user/service_tests.rs 同形）
 pub(crate) fn test_db_error() -> sqlx::Error {
@@ -50,38 +49,25 @@ pub(crate) fn clerk_current() -> CurrentUser {
 pub(crate) fn make_snowflake() -> Arc<SnowflakeIdGenerator> {
     Arc::new(SnowflakeIdGenerator::new(1_700_000_000_000, 1))
 }
-pub(crate) fn make_session() -> Arc<dyn SessionStore> {
-    Arc::new(MockSessionStore::new())
+
+/// 直接构造 `AccountService`（2026-09-21 后仅需 snowflake）。
+pub(crate) fn make_account_service() -> Arc<AccountService> {
+    Arc::new(AccountService::new(make_snowflake()))
 }
 
-/// 走 provider 的 service 装线（写端点 / 读端点共用）
-pub(crate) fn make_svc(
-    provider: Arc<dyn IamUowProvider>,
-    session: Arc<dyn SessionStore>,
-) -> Arc<AccountService> {
-    Arc::new(AccountService::new(provider, make_snowflake(), session))
+/// 构造一个按 `setup` 配置好的 `MockIamRepo`。用例调用 `make_repo_with(|r| { ... })`。
+///
+/// 不再返回 `flags` —— service 不再 commit/rollback，时序断言整体删除（plan v4 §5.2
+/// 表的「service 不再管事务」改造）。
+pub(crate) fn make_repo_with<F: FnOnce(&mut MockIamRepo)>(setup: F) -> MockIamRepo {
+    let mut repo = MockIamRepo::new();
+    setup(&mut repo);
+    repo
 }
 
-/// 写端点通用 helper：构造 mock uow → 装线 service → 应用 setup → 返回 svc + flags
-pub(crate) async fn write_svc<F: FnOnce(&mut MockIamUnitOfWork)>(
-    setup: F,
-) -> (Arc<AccountService>, IamUowFlags) {
-    let (mut uow, flags) = MockIamUnitOfWork::new();
-    setup(&mut uow);
-    (make_svc(provider_returning(uow), make_session()), flags)
-}
-
-/// 读端点 / 守卫类通用 helper（同一形态，断言不同）
-#[allow(dead_code)]
-pub(crate) async fn read_svc<F: FnOnce(&mut MockIamUnitOfWork)>(
-    setup: F,
-) -> (Arc<AccountService>, IamUowFlags) {
-    write_svc(setup).await
-}
-
-/// 守卫类 helper：provider 零 begin
-pub(crate) fn guard_svc() -> Arc<AccountService> {
-    make_svc(Arc::new(MockIamUowProvider::new()), make_session())
+/// 守卫类 helper：service 构造 + 空 MockIamRepo（用于「权限拒」类用例，无 repo 期望）
+pub(crate) fn guard_repo() -> (Arc<AccountService>, MockIamRepo) {
+    (make_account_service(), MockIamRepo::new())
 }
 
 pub(crate) fn make_user(id: i64) -> User {

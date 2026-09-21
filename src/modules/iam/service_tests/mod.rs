@@ -1,18 +1,23 @@
 //! iam 域 service 共享测试 helper + 子模块声明
 //!
 //! 两个 `#[cfg(test)] mod` 共享本模块：
-//! - `session_tests`（原 `auth/service_tests.rs` 31 例）
-//! - `account_tests`（原 `user/service_tests.rs` 67 例）
+//! - `session_tests`（原 `auth/service_tests.rs` 30 例）
+//! - `account_tests`（原 `user/service_tests.rs` 65 例）
 //!
 //! ## 拆分原因
 //! `iam/service_tests.rs` 原本是单文件 ~1700 行；按 conventions §2（1000 行硬红线）
 //! 拆为目录式子模块，与 `delivery_note/service/` 子目录正典一致。
 //!
-//! ## 共享形态（2026-09-19 IAM 合并）
-//! - 构造器：`test_config()` / `test_state(...)` / `manager_current()` / `clerk_current()` /
+//! ## 共享形态（2026-09-21 事务分层重构后）
+//! - 构造器：`test_config()` / `manager_current()` / `clerk_current()` /
 //!   `sample_user(...)` / `sample_role_row(...)` / `sample_shelf(...)` / `sample_menu(...)`
-//! - `build_*_with(...)`：装配 `SessionService` + `AccountService` + `Arc<AppState>`
+//!   / `make_session_service(account_svc)` / `test_state(...)`
 //! - `make_refresh_token(...)`：用本模块的 `test_config()` 签一对齐 secret/issuer 的 refresh token
+//!
+//! ## 与重构前的差异（plan v4 §3 V7 → §5.2）
+//! - service 不再 commit/rollback ——`IamUowFlags` / `MockIamUnitOfWork` / `provider_returning`
+//!   全部删除；测试改用 `MockIamRepo` 直接注入方法参数。
+//! - `test_state` 不再构造 `SqlxIamUowProvider`；AccountService 直接装线（只持 snowflake）。
 
 #![allow(clippy::needless_borrow, clippy::redundant_clone)]
 
@@ -21,9 +26,8 @@ use std::sync::Arc;
 use chrono::NaiveDateTime;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::password;
 use crate::auth::rbac::CurrentUser;
-use crate::auth::session::{CachedCurrentUser, SessionStore, TokenKind};
+use crate::auth::session::SessionStore;
 use crate::infra::config::{
     AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, RedisConfig, SnowflakeConfig,
     UploadSessionConfig,
@@ -35,8 +39,6 @@ use crate::infra::ws_hub::WsHub;
 use crate::modules::iam::model::{Menu, Shelf, User};
 use crate::modules::iam::repo::UserRoleRow;
 use crate::modules::iam::service::{AccountService, SessionService};
-use crate::modules::iam::uow::IamUowProvider;
-use crate::modules::iam::uow::SqlxIamUowProvider;
 use crate::modules::upload_session::repo::InMemoryUploadSessionRepo;
 use crate::state::AppState;
 
@@ -66,7 +68,6 @@ pub(crate) fn test_config() -> Arc<AppConfig> {
             refresh_ttl_days: 7,
         },
         cos: CosConfig {
-            // 2026-09-20 迁移清理：删 `sts_duration_seconds`；backend 从 `CosSdk` 改为 `OpenDal`。
             backend: CosBackend::OpenDal,
             enabled: false,
             region: "ap-shanghai".into(),
@@ -99,7 +100,6 @@ pub(crate) fn test_config() -> Arc<AppConfig> {
         delivery_note_template_dir: std::path::PathBuf::from("/tmp"),
         enable_e2e_hooks: false,
         ws_heartbeat_interval_seconds: 30,
-        // 2026-09-20 新增：HTTP nest 请求超时；service 单测不挂 tower 层，此字段仅占位。
         request_timeout_seconds: 30,
         upload_session: UploadSessionConfig {
             python_backend_base_url: "http://localhost:8000".into(),
@@ -110,6 +110,18 @@ pub(crate) fn test_config() -> Arc<AppConfig> {
     })
 }
 
+/// 构造 `SessionService`（轻壳），供 service_tests/session_tests 用。
+pub(crate) fn make_session_service(
+    session: Arc<dyn SessionStore>,
+    account_service: Arc<AccountService>,
+) -> Arc<SessionService> {
+    Arc::new(SessionService::new(
+        test_config(),
+        session,
+        account_service,
+    ))
+}
+
 /// 构造最小 `AppState`（懒连 pool，不触 DB）。service 方法的 `state` 形参几乎不用，仅满足类型签名。
 pub(crate) fn test_state(
     account_service: Arc<AccountService>,
@@ -118,9 +130,6 @@ pub(crate) fn test_state(
 ) -> Arc<AppState> {
     let pool = sqlx::Pool::<sqlx::Postgres>::connect_lazy("postgres://test:test@localhost:1/test")
         .unwrap();
-    let provider: Arc<dyn IamUowProvider> = Arc::new(SqlxIamUowProvider::new(pool.clone()));
-    // 重新构造（传入的 account_service 已经持有 provider；这里只为再装一份给 state）
-    let _ = provider;
     Arc::new(AppState {
         pool,
         config: test_config(),
@@ -251,18 +260,4 @@ pub(crate) fn make_refresh_token(sub: i64, ver: i32) -> String {
     )
     .unwrap()
     .0
-}
-
-/// 抑制未使用警告：service 字段虽然未直接访问，但 mock 类型需要在本文件出现
-#[allow(dead_code)]
-pub(crate) fn _unused_witnesses() {
-    let _ = password::hash;
-    let _: CachedCurrentUser = CachedCurrentUser {
-        id: 0,
-        username: String::new(),
-        roles: vec![],
-        shelf_ids: vec![],
-        shelf_wildcard: false,
-    };
-    let _: TokenKind = TokenKind::Access;
 }
