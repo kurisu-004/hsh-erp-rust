@@ -10,13 +10,13 @@
 //! - `SessionService` 持 `Arc<AppConfig>` + `Arc<dyn SessionStore>` + `Arc<AccountService>`
 //!   （`uow_provider` 字段移除）；所有方法 `&self`。
 //! - 事务移交 handler：`login` / `refresh` 拆两阶段——
-//!   1. `login<R>(&self, repo: &mut R, req) -> LoginPending`：业务逻辑 + DB 写，
+//!   1. `login<R>(&self, mut repo: R, req) -> LoginPending`：业务逻辑 + DB 写，
 //!      handler 拿到结果后 commit。
 //!   2. `complete_login(&self, pending: LoginPending) -> LoginResponse`：写 Redis session +
 //!      组装响应，commit 之后做（plan v4 §3 V6 约定）。
 //!
 //!   refresh 同。
-//! - 读端点（me）：方法签名 `me<R>(&self, repo: &mut R, current)`；handler 仍 `pool.acquire()`
+//! - 读端点（me）：方法签名 `me<R>(&self, mut repo: R, current)`；handler 仍 `pool.acquire()`
 //!   不开事务，service 内 `repo.xxx()` 在一次性连接上执行，读完 drop 即可。
 //! - 不 begin 端点：
 //!   - change_password：纯委托给 `self.account_service.change_own_password(repo, ...)`。

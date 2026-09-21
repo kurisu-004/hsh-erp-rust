@@ -10,7 +10,8 @@
 //! ## 为什么是胖 trait 而不是按实体拆 4 trait
 //! `&mut PgConnection` 同一作用域只能借给一个 repo 实例；如果按实体拆 4 trait，service
 //! 同时使用 user_repo + user_role_repo 时无法表达「同连接两次借用」。胖 trait `IamRepo`
-//! 是单借位，service 签名 `<R: IamRepo>(&self, repo: &mut R, ...)` 一次借出，方法体内
+//! 是单借位，service 签名 `<R: IamRepo>(&self, mut repo: R, ...)` 一次收下（by-value；
+//! 生产路径 `R = &mut PgConnection`，单测 `R = MockIamRepo`），方法体内
 //! 全部 `repo.xxx()` 都走同一连接。
 //!
 //! ## 为什么 trait 可以直接对 `&mut PgConnection` 实现

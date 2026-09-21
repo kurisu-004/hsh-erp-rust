@@ -7,6 +7,8 @@
 //!
 //! 2026-09-21 事务分层重构后：service 不再 commit/rollback；helpers 改为收 `&mut R: IamRepo`，
 //! `menus_for_roles` 不再要求 `&mut dyn IamUnitOfWork`。
+//! 2026-09-22 删 `PgIamRepo` 转发壳后：以上描述专指 helpers（私有 helper 仍借 `&mut R` 以便
+//! 多次调 trait 方法）；service 公开方法形参已改为 by-value `mut repo: R`，不可与 helpers 混用。
 //! 2026-09-22 删 `AccountService::current_user_out`（死方法，零生产调用方），对应 2 例
 //! 删除。
 

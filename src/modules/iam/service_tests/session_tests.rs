@@ -2,8 +2,9 @@
 //!
 //! 5 方法分组：login (9) / refresh (7) / me (5) / change_password (5) / logout (4)。
 //!
-//! ## 测试形态（2026-09-21 事务分层重构后）
-//! 纯 `#[tokio::test]`，零数据库。service 方法签名 `<R: IamRepo>(&self, repo: &mut R, ...)`，
+//! ## 测试形态（2026-09-21 事务分层重构 + 2026-09-22 删 `PgIamRepo` 转发壳后）
+//! 纯 `#[tokio::test]`，零数据库。service 方法签名 `<R: IamRepo>(&self, mut repo: R, ...)`
+//! （by-value；生产 `R = &mut PgConnection`，单测 `R = MockIamRepo`），
 //! 单测用 `MockIamRepo` 直接注入；事务不在 service 层（handler 管），故无 commit 时序断言。
 //!
 //! ## 形态变化

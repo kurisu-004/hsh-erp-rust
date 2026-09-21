@@ -2,10 +2,12 @@
 //!
 //! 对应 Python myERP/service/user.py。
 //!
-//! ## 事务边界（2026-09-21 重构）
+//! ## 事务边界（2026-09-21 重构 + 2026-09-22 删 `PgIamRepo` 转发壳）
 //! 事务移交 handler（与 20 个 handler 文件现状对齐）：service 仅业务逻辑，所有跨 repo
-//! 操作经 `repo: &mut R`（`R: IamRepo`）参数传入。service 不知事务——handler `pool.begin()` +
-//! `tx.commit()` 包外，写端点 commit 后做 post-commit 副作用（Redis session 删/WS 广播）。
+//! 操作经 `repo: R`（by-value；`R: IamRepo`）参数传入——handler/service 借 `&mut *tx` /
+//! `&mut *conn` 喂给 `IamRepo` trait（trait 已直接 `impl for &mut PgConnection`）。
+//! service 不知事务——handler `pool.begin()` + `tx.commit()` 包外，写端点 commit 后做
+//! post-commit 副作用（Redis session 删/WS 广播）。
 //!
 //! ## Session 清理
 //! `change_own_password` / `admin_reset_password` 不再自己清 Redis session：服务内只更新
@@ -21,9 +23,10 @@
 //! 2026-09-19 IAM 域合并：`UserService` → `AccountService`，方法签名 + 业务逻辑零 diff，
 //! 仅路径变更。
 //!
-//! 2026-09-21 事务分层重构：`uow_provider` 字段移除，方法签名全部加 `repo: &mut R`；
+//! 2026-09-21 事务分层重构 + 2026-09-22 删 `PgIamRepo` 转发壳：`uow_provider` 字段移除，
+//! 方法签名全部改为 `mut repo: R`（by-value；trait 已直接 `impl for &mut PgConnection`）；
 //! `change_own_password` / `admin_reset_password` 不再内部 commit + 清 session（移交
-//! handler）；helpers 改 `&mut R`。
+//! handler）；helpers 收 `&mut R`（私有 helper 仍借 `&mut` 多次调用 trait 方法）。
 
 use std::sync::Arc;
 
@@ -84,11 +87,11 @@ fn trimmed_or_none(v: &str) -> Option<String> {
     }
 }
 
-/// iam 域账号管理 service（2026-09-21 重构后）
+/// iam 域账号管理 service（2026-09-21 重构 + 2026-09-22 删 `PgIamRepo` 转发壳后）
 ///
 /// 字段仅 `snowflake`（事务已移交 handler；session 清理也移交 handler）。实例为轻壳，
-/// 可直接 `Arc<AccountService>` 存 `AppState`；方法签名收 `repo: &mut R`，单测用
-/// `MockIamRepo` 直接注入。
+/// 可直接 `Arc<AccountService>` 存 `AppState`；方法签名收 `mut repo: R`（by-value；
+/// 生产 `R = &mut PgConnection`，单测 `R = MockIamRepo`），单测用 `MockIamRepo` 直接注入。
 pub struct AccountService {
     snowflake: Arc<SnowflakeIdGenerator>,
 }

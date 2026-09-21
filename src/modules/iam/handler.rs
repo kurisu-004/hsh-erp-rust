@@ -12,10 +12,10 @@
 //! - ③ **读端点**（list_users / get_user / list_user_roles / me）：`pool.acquire()` 不开
 //!   事务，service 借 `&mut *conn` 执行查询，用完即 drop。
 //!
-//! 2026-09-22 删 `PgIamRepo` 转发壳：service 形参 `repo: &mut R: IamRepo` 直接收
+//! 2026-09-22 删 `PgIamRepo` 转发壳：service 形参 `repo: R: IamRepo`（by-value）直接收
 //! `&mut *tx` / `&mut *conn`（trait `IamRepo` 已对 `&'a mut PgConnection` 实现）。
 //!
-//! service 仅业务逻辑（方法签名 `<R: IamRepo>(&self, repo: &mut R, ...)`），不知事务。
+//! service 仅业务逻辑（方法签名 `<R: IamRepo>(&self, mut repo: R, ...)`），不知事务。
 //!
 //! ## 公开端点
 //! `login` / `refresh` 不注入 `CurrentUser`；其余端点都需 Bearer JWT。logout 通过
