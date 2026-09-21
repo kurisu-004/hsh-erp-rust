@@ -21,6 +21,7 @@ use crate::infra::ws_hub::WsHub;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
 use crate::modules::iam::service::{AccountService, SessionService};
+use crate::modules::outsource::service::OutsourceService;
 use crate::modules::upload_session::repo::UploadSessionRepo;
 
 pub struct AppState {
@@ -58,6 +59,10 @@ pub struct AppState {
     /// 2026-09-22 新增：com/applicant service（CRUD）。字段仅 `snowflake`；handler
     /// 借 `&mut *tx` 喂两次 trait（`ApplicantRepo` + `CustomerRepo::lookup_names`）。
     pub applicant_service: Arc<ApplicantService>,
+    /// 2026-09-22 新增：outsource service（company / quote / shipment 17 端点）。
+    /// 字段仅 `snowflake`；handler 借 `&mut *tx` / `&mut *conn` 喂给 `OutsourceRepoTrait`
+    /// 胖 trait（impl on `&mut PgConnection`）。
+    pub outsource_service: Arc<OutsourceService>,
 }
 
 impl AppState {
@@ -84,6 +89,8 @@ impl AppState {
         // 2026-09-22 com/customer + com/applicant service 装线：仅需 snowflake。
         let customer_service = Arc::new(CustomerService::new(snowflake.clone()));
         let applicant_service = Arc::new(ApplicantService::new(snowflake.clone()));
+        // 2026-09-22 outsource service 装线：仅需 snowflake（17 端点 company + quote + shipment）。
+        let outsource_service = Arc::new(OutsourceService::new(snowflake.clone()));
         Self {
             pool,
             config,
@@ -98,6 +105,7 @@ impl AppState {
             session_service,
             customer_service,
             applicant_service,
+            outsource_service,
         }
     }
 }

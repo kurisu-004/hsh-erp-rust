@@ -43,6 +43,7 @@ use crate::modules::upload_session::repo::InMemoryUploadSessionRepo;
 use crate::state::AppState;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
+use crate::modules::outsource::service::OutsourceService;
 
 #[cfg(test)]
 mod session_tests;
@@ -147,6 +148,7 @@ pub(crate) fn test_state(
         session_service,
         customer_service: Arc::new(CustomerService::new(snowflake.clone())),
         applicant_service: Arc::new(ApplicantService::new(snowflake.clone())),
+        outsource_service: Arc::new(OutsourceService::new(snowflake.clone())),
     })
 }
 
