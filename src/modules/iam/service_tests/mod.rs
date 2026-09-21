@@ -41,6 +41,8 @@ use crate::modules::iam::repo::UserRoleRow;
 use crate::modules::iam::service::{AccountService, SessionService};
 use crate::modules::upload_session::repo::InMemoryUploadSessionRepo;
 use crate::state::AppState;
+use crate::modules::com::applicant::service::ApplicantService;
+use crate::modules::com::customer::service::CustomerService;
 
 #[cfg(test)]
 mod session_tests;
@@ -130,10 +132,11 @@ pub(crate) fn test_state(
 ) -> Arc<AppState> {
     let pool = sqlx::Pool::<sqlx::Postgres>::connect_lazy("postgres://test:test@localhost:1/test")
         .unwrap();
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_735_689_600_000, 1));
     Arc::new(AppState {
         pool,
         config: test_config(),
-        snowflake: Arc::new(SnowflakeIdGenerator::new(1_735_689_600_000, 1)),
+        snowflake: snowflake.clone(),
         ws_hub: Arc::new(WsHub::new()),
         cos: Arc::new(NoopCos),
         python_sts: Arc::new(NoopPythonSts),
@@ -142,6 +145,8 @@ pub(crate) fn test_state(
         upload_session_repo: Arc::new(InMemoryUploadSessionRepo::new()),
         account_service,
         session_service,
+        customer_service: Arc::new(CustomerService::new(snowflake.clone())),
+        applicant_service: Arc::new(ApplicantService::new(snowflake.clone())),
     })
 }
 

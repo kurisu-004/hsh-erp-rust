@@ -18,6 +18,8 @@ use crate::infra::cos::CosClient;
 use crate::infra::python_sts::PythonSts;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsHub;
+use crate::modules::com::applicant::service::ApplicantService;
+use crate::modules::com::customer::service::CustomerService;
 use crate::modules::iam::service::{AccountService, SessionService};
 use crate::modules::upload_session::repo::UploadSessionRepo;
 
@@ -50,6 +52,12 @@ pub struct AppState {
     /// login / refresh / me / logout / change-password（service::SessionService，原 AuthService）。
     /// 2026-09-21 事务分层重构：字段去掉 `uow_provider`；handler 借连接传入 repo。
     pub session_service: Arc<SessionService>,
+    /// 2026-09-22 新增：com/customer service（CRUD）。字段仅 `snowflake`；handler
+    /// 借 `&mut *tx` / `&mut *conn` 喂给 `CustomerRepo` trait。
+    pub customer_service: Arc<CustomerService>,
+    /// 2026-09-22 新增：com/applicant service（CRUD）。字段仅 `snowflake`；handler
+    /// 借 `&mut *tx` 喂两次 trait（`ApplicantRepo` + `CustomerRepo::lookup_names`）。
+    pub applicant_service: Arc<ApplicantService>,
 }
 
 impl AppState {
@@ -73,6 +81,9 @@ impl AppState {
             session.clone(),
             account_service.clone(),
         ));
+        // 2026-09-22 com/customer + com/applicant service 装线：仅需 snowflake。
+        let customer_service = Arc::new(CustomerService::new(snowflake.clone()));
+        let applicant_service = Arc::new(ApplicantService::new(snowflake.clone()));
         Self {
             pool,
             config,
@@ -85,6 +96,8 @@ impl AppState {
             upload_session_repo,
             account_service,
             session_service,
+            customer_service,
+            applicant_service,
         }
     }
 }

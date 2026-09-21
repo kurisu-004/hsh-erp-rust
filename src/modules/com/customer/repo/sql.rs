@@ -1,4 +1,4 @@
-//! customer 域数据访问
+//! customer 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
 //!
 //! 对应 Python myERP/repository/customer.py。函数签名接收 `impl PgExecutor<'_>`，
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
@@ -12,11 +12,28 @@
 //! - 读：`get_by_id` / `list_by_ids` / `list_children` / `list_roots` / `list_all`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder，防 N+1）
 //! - 写：`create` / `update` / `soft_delete`
+//! - 跨域 helper（2026-09-22 抽 trait 时同步搬迁）：
+//!   - `lookup_names` —— `applicant` 域批量补 `customer_name` 用
+//!   - `count_parts_using_customer` / `count_assemblies_using_customer` ——
+//!     本域 `soft_delete_customer` 「被 part/assembly 引用」校验用
+//!
+//! 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff；
+//! 新增 3 个方法承载原本散落在 `service.rs` 的 inline 跨域 SQL（SQL 字符串完全不变）。
+//! trait `CustomerRepoTrait` 在 `repo/mod.rs`，直接 `impl for &mut PgConnection`；
+//! ZST 仍名 `CustomerRepo`（不改名）以保留跨模块静态调用方
+//! `part` / `delivery_note` / `_e2e` 的 `CustomerRepo::xxx(&mut *conn, ...)` 调用。
+//!
+//! ## ZST 命名仍为 `CustomerRepo`
+//! 与 shelf 同形：跨模块静态调用方 10+ 处直接走 ZST 静态方法，本任务**不能**
+//! 破坏 `CustomerRepo` 作为 ZST 的对外身份，故 trait 改名 `CustomerRepoTrait`
+//! （与 shelf `ShelfRepoTrait` 一致）。
 
 use sqlx::{PgExecutor, QueryBuilder};
 
-use super::model::TCustomer;
+use super::super::model::TCustomer;
 
+/// SQL 真源 ZST。trait 名为 `CustomerRepoTrait`（公共接口），ZST 仍名
+/// `CustomerRepo`（跨模块静态调用方依赖此名）。
 pub struct CustomerRepo;
 
 impl CustomerRepo {
@@ -295,5 +312,63 @@ impl CustomerRepo {
         .execute(executor)
         .await
         .map(|r| r.rows_affected())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 跨域 helper（2026-09-22 抽 trait 时从 service.rs inline SQL 搬迁过来）
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 按 id 批量查 `(id, name)`；仅返回未软删。
+    ///
+    /// 跨域 helper：原本散落在 `applicant::service::lookup_customer_names`
+    /// （`applicant/repo.rs` 之外的 inline SQL），2026-09-22 抽 trait 时收敛到
+    /// `customer::repo::CustomerRepo::lookup_names` 让 applicant 通过 `CustomerRepo`
+    /// trait 借用，service 层不再持有任何 t_customer SQL。
+    ///
+    /// SQL 字符串与原 inline 完全一致：`SELECT id, name FROM t_customer WHERE id = ANY($1) AND deleted_at IS NULL`。
+    pub async fn lookup_names<'e, E: PgExecutor<'e>>(
+        executor: E,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, String)>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 保留原 inline SQL 形式（runtime `sqlx::query_as`，非 `query_as!` 宏），
+        // SQL 字符串零 diff；空数组短路避免对空 IN 子句做无谓 round-trip。
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, name FROM t_customer WHERE id = ANY($1) AND deleted_at IS NULL",
+        )
+        .bind(ids)
+        .fetch_all(executor)
+        .await?;
+        Ok(rows)
+    }
+
+    /// `t_part` 引用此 customer 的非软删计数。供本域 `soft_delete_customer`
+    /// 「被 part 引用」校验用，SQL 从原 service.rs inline 平移，字符串零 diff。
+    pub async fn count_parts_using_customer<'e, E: PgExecutor<'e>>(
+        executor: E,
+        customer_id: i64,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "c!" FROM t_part WHERE customer_id = $1 AND deleted_at IS NULL"#,
+            customer_id,
+        )
+        .fetch_one(executor)
+        .await
+    }
+
+    /// `t_assembly` 引用此 customer 的非软删计数。供本域 `soft_delete_customer`
+    /// 「被 assembly 引用」校验用，SQL 从原 service.rs inline 平移，字符串零 diff。
+    pub async fn count_assemblies_using_customer<'e, E: PgExecutor<'e>>(
+        executor: E,
+        customer_id: i64,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "c!" FROM t_assembly WHERE customer_id = $1 AND deleted_at IS NULL"#,
+            customer_id,
+        )
+        .fetch_one(executor)
+        .await
     }
 }
