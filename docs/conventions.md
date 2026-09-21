@@ -140,6 +140,38 @@ delivery_note/
 
 **事务边界与 repo 范式（2026-09-21 iam 范本 + 2026-09-22 删 `PgIamRepo` 转发壳）**：事务由 handler `state.pool.begin()` 开 + `tx.commit()` 收，service 不知事务。Service 方法签名 `<R: IamRepo>(&self, mut repo: R, ...)`（by-value），handler/service 借 `&mut *tx` / `&mut *conn` 即可——`IamRepo` trait 已直接 `impl for &mut PgConnection`，无需任何中间壳。**不再**写裸 `&mut PgConnection` 跨 service 调用。UowProvider / IamUnitOfWork 等中介物整体删除；`PgIamRepo<'a>` 转发壳也于 2026-09-22 一并删去。
 
+### §3.1 事务与 repo 范式（6 条编号清单，可复用模板）
+
+> 📌 **2026-09-22 写定**：本节是后续 13 域（Group B/C/D/E）的事务分层重构统一模板。
+> shelf 域（Group A，commit 在本任务）作为**完整落地示例**，见附录 [A. shelf 落地示例](#a-shelf-落地示例)。
+
+1. **事务边界在 handler**：handler 显式 `state.pool.begin()` / `tx.commit()`；错误路径 `tx drop` 隐式回滚。service 不知事务存在。
+2. **service 不知事务**：service 方法签名一律 `<R: XxxRepo>(&self, mut repo: R, ...)`（by-value；`XxxRepo` 是域内胖 trait），handler/service 借 `&mut *tx` / `&mut *conn` 喂给 trait 即可。
+3. **胖 trait（不按实体拆）**：每域定义一个胖 trait `XxxRepo`，合并本域所有实体方法（不按 entity 拆 UserRepo / UserRoleRepo / MenuRepo 多个 trait）。理由：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，拆分会逼 service 借两次 reborrow，破坏胖 trait 范式。
+4. **直接 `impl XxxRepo for &mut PgConnection`**：reborrow `&mut **self`（trait `&mut self` → impl 在 `&mut PgConnection` 上 → `self: &mut &mut PgConnection` → `**self: PgConnection`）。handler/service 借 `&mut *tx` / `&mut *conn` 即可调用 trait 方法，**零中间壳**（无需 `<域>PgRepo<'a>` 转发壳）。
+5. **handler 三形态**（严格区分）：
+   - ① **纯写**：`pool.begin() → service → tx.commit()`。错误路径 tx drop 隐式回滚。
+   - ② **写 + post-commit 副作用**（Redis session / WS broadcast / COS spawn 等）：① + commit 后做（best-effort，DB 的 refresh_token_version 轮转等兜底）。
+   - ③ **读**：`pool.acquire()` 不开事务，service 借 `&mut PgConnection` 跑查询，连接用完即 drop。
+6. **service 字段仅持轻量协约/生成器依赖**：不持 pool / tx / repo（handler 已替 service 接管事务边界；trait 已直接 `impl for &mut PgConnection`，service 通过 by-value `repo: R` 参数化访问数据）。典型字段：`Arc<SnowflakeIdGenerator>` / `Arc<AppConfig>` / `Arc<dyn SessionStore>` / `Arc<OtherService>`。
+
+#### A. shelf 落地示例
+
+shelf 域（Group A，2026-09-22 完成事务分层重构）作为本范式的**完整落地示例**：
+
+| 关键点 | shelf 域实现位置 |
+|---|---|
+| 胖 trait `ShelfRepoTrait`（14 方法 = t_shelf 8 + t_shelf_process 4 + 跨域 helper 2） | `src/modules/shelf/repo/mod.rs` |
+| `impl ShelfRepoTrait for &mut PgConnection`（reborrow `&mut **self`） | `src/modules/shelf/repo/mod.rs` |
+| `ShelfService`（unit struct，无字段）方法签名 `<R: ShelfRepoTrait>(&self, mut repo: R, ...)` | `src/modules/shelf/service/crud.rs` + `picker.rs` |
+| `ShelfProcessService` 方法签名 `<R: ShelfRepoTrait>(&self, mut repo: R, ...)` | `src/modules/shelf/process_mapping/mod.rs` |
+| handler 三形态严格区分 | `src/modules/shelf/handler.rs` |
+| 跨域 helper（trait 内部封装跨域 `ProcessRepo` 静态调用） | `src/modules/shelf/repo/mod.rs::proc_check_process_exists` / `proc_list_existing_process_ids` |
+
+> ⚠️ **跨域 helper 模式**：当 service 需要跨域访问其他域的 ZST 静态方法（无 trait）时，把跨域调用封装到本域 trait 的 helper 方法中——trait impl 在 `&mut PgConnection` 上时一行委托到 `OtherDomainRepo::xxx`。这样 service 仍只需一个 `repo: R: XxxRepo` 参数，无需收第二个 `&mut PgConnection`。shelf 域 `list_for_return` / `set_shelf_processes` 即用此模式封装 prod 域 `ProcessRepo` 调用。
+
+> ⚠️ **trait 命名例外**：shelf 域因 part 域（cross-module 调用方）静态调用 `crate::modules::shelf::repo::ShelfRepo::xxx(&mut *conn, ...)`（ZST 静态方法名路径），为不破坏该 3 处 cross-module 调用，本任务内 trait 命名为 `ShelfRepoTrait`（非 `ShelfRepo`，保留 ZST 名）。其余 12 域若无 cross-module ZST 静态调用方，trait 应命名为 `<域>Repo`（如 `IamRepo`）。
+
 **Code review 检查项**（每个 PR 都要过）：
 
 - `rg "fetch_one|fetch_optional" src/modules/*/service/*.rs` —— 出现循环里调用 = 红色警报
