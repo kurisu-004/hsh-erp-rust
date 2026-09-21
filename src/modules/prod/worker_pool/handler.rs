@@ -13,10 +13,18 @@
 //! - `POST /api/v2/admin/worker-pool/remove`                —— admin 把 worker
 //!   持有的批次按 RETURNED 语义放回候选池。Manager role 守卫。
 //!
-//! ## 事务 + WS 广播
-//! - 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
-//!   `tx.commit()`；提前 return 时 `Transaction` 的 Drop 自动回滚。
-//! - WS 广播在 commit 之后（Python `session.info` 延迟模式对齐）。
+//! ## 事务 + WS 广播（2026-09-22 D-2 重构对齐 iam 范本）
+//! 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
+//! `tx.commit()`；提前 return 时 `Transaction` 的 Drop 自动回滚。读端点走
+//! `pool.acquire()` 不开事务。
+//!
+//! - ① 纯写端点（admin_refill / admin_remove / auto_allocate / admin_assign）：
+//!   `pool.begin() → service → commit`，commit 后发 WS 广播。
+//! - ③ 读端点（state / pool_by_process）：`pool.acquire() → service`，不开事务。
+//!
+//! service 公共方法收 `&mut PgConnection`（生产），service 内部 reborrow `&mut *conn`
+//! 喂 `WorkerPoolRepoTrait`（trait 已直接 `impl for &mut PgConnection`，2026-09-22
+//! 替代任何 `PgWorkerPoolRepo<'a>` 壳）。
 
 use std::sync::Arc;
 
@@ -47,13 +55,14 @@ pub struct StateQuery {
 /// GET /api/v2/worker-pool/state?worker_id=&shelf_id=
 ///
 /// 无 role guard —— worker 自查 / admin 监控共用。
+///
+/// 读端点（③ 形态）：`pool.acquire()` 不开事务；service 借 `&mut PgConnection` 跑查询。
 pub async fn state(
     State(state): State<Arc<AppState>>,
     Query(q): Query<StateQuery>,
 ) -> Result<Json<R<WorkerPoolState>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let s = WorkerPoolService::compute_state(&mut tx, q.worker_id, q.shelf_id).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let s = WorkerPoolService::compute_state(&mut conn, q.worker_id, q.shelf_id).await?;
     Ok(Json(R::ok(s)))
 }
 
@@ -62,6 +71,8 @@ pub async fn state(
 /// Manager role 守卫。Commit 后：
 /// - `taken.len() > 0` → 广播 `WORKER_POOL_REFILL_DONE`
 /// - `pool_empty`（没抢到任何一批） → 广播 `WORKER_POOL_EMPTY`
+///
+/// 纯写端点（① 形态）：`pool.begin() → service → commit`。
 pub async fn admin_refill(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -101,6 +112,8 @@ pub async fn admin_refill(
 ///
 /// Manager role 守卫。把 worker 持有的指定 batch 按 RETURNED 语义放回候选池。
 /// Commit 后广播 `WORKER_POOL_ADMIN_REMOVED`。
+///
+/// 纯写端点（① 形态）：`pool.begin() → service → commit`。
 pub async fn admin_remove(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -125,14 +138,16 @@ pub async fn admin_remove(
 ///
 /// 角色守卫下沉到 service（`pool_by_process` 内部 `require_any_role`），handler
 /// 不重复校验（与 work_type/assembly 域惯例一致）。
+///
+/// 读端点（③ 形态）：`pool.acquire()` 不开事务。
 pub async fn pool_by_process(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     axum::extract::Path(process_id): axum::extract::Path<i64>,
 ) -> Result<Json<R<ProcessPoolDetail>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let detail = WorkerPoolService::pool_by_process(&mut tx, &current, process_id).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let detail =
+        WorkerPoolService::pool_by_process(&mut conn, &current, process_id).await?;
     Ok(Json(R::ok(detail)))
 }
 
@@ -142,15 +157,21 @@ pub async fn pool_by_process(
 ///
 /// Manager 角色守卫下沉到 service（`auto_allocate_for_process` 内部 `require_role`）。
 /// Commit 后广播 `WORKER_POOL_AUTO_ALLOCATE_DONE`（payload = `AutoAllocateResult`）。
+///
+/// 纯写端点（① 形态）：`pool.begin() → service → commit`。
 pub async fn auto_allocate(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Json(req): Json<AutoAllocateRequest>,
 ) -> Result<Json<R<AutoAllocateResult>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let result =
-        WorkerPoolService::auto_allocate_for_process(&mut tx, &state.snowflake, req, &current)
-            .await?;
+    let result = WorkerPoolService::auto_allocate_for_process(
+        &mut tx,
+        &state.snowflake,
+        req,
+        &current,
+    )
+    .await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "WORKER_POOL_AUTO_ALLOCATE_DONE".into(),
@@ -165,14 +186,21 @@ pub async fn auto_allocate(
 ///
 /// Manager 角色守卫下沉到 service（`assign_batch_to_worker` 内部 `require_role`）。
 /// Commit 后广播 `WORKER_POOL_ASSIGN_DONE`（payload = `AssignResult`）。
+///
+/// 纯写端点（① 形态）：`pool.begin() → service → commit`。
 pub async fn admin_assign(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Json(req): Json<AdminAssignRequest>,
 ) -> Result<Json<R<AssignResult>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let result =
-        WorkerPoolService::assign_batch_to_worker(&mut tx, &state.snowflake, req, &current).await?;
+    let result = WorkerPoolService::assign_batch_to_worker(
+        &mut tx,
+        &state.snowflake,
+        req,
+        &current,
+    )
+    .await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "WORKER_POOL_ASSIGN_DONE".into(),

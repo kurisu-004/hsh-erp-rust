@@ -1,4 +1,4 @@
-//! worker_pool 域数据访问
+//! worker_pool 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
 //!
 //! 对应 Python myERP/repository/worker_pool_repository.py。函数签名接收
 //! `&mut PgConnection`（CTE 内含多条 SQL，发射多次借用同一连接）。
@@ -9,13 +9,17 @@
 //!   (2) 从候选池按 system_delivery_date → planned_delivery_date → is_urgent → id
 //!   优先级取一批；(3) UPDATE t_part_batch 与 t_part 的 holder/location/version。
 //!   0 行 → 池空或达上限，返回 Ok(None)，由 service 决定是否抛容量/空池业务错。
+//!
+//! 2026-09-22 D-2 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零
+//! diff，`.sqlx/query-*.json` 哈希不变；新增的 `WorkerPoolRepoTrait` 胖 trait 在
+//! `repo/mod.rs`（含本域 4 方法 + 跨域 helper 14 方法）。
 
 use sqlx::{PgConnection, PgExecutor};
 
 use crate::shared::error::AppError;
 
-use super::dto::PoolBatchItem;
-use super::model::{HeldBatchItem, TakenItem};
+use crate::modules::prod::worker_pool::dto::PoolBatchItem;
+use crate::modules::prod::worker_pool::model::{HeldBatchItem, TakenItem};
 
 #[derive(Debug, sqlx::FromRow)]
 struct TakenRow {

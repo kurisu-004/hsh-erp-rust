@@ -147,6 +147,10 @@ impl AppState {
         let work_type_process_service = Arc::new(WorkTypeProcessService);
         // 2026-09-22 D-2-simple prod/process service 装线：仅需 snowflake。
         let process_service = Arc::new(ProcessService::new(snowflake.clone()));
+        // 2026-09-22 D-2 prod/worker_pool service 是 unit struct，无字段依赖，
+        // 无需装线到 AppState——handler 直接 `WorkerPoolService::method(&mut *tx, ...)`
+        // 静态调用即可（与原 `WorkerPoolService` 调用形态一致，part 域
+        // `part/handler/inspection.rs:298` 沿用）。
         Self {
             pool,
             config,

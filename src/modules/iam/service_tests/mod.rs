@@ -173,6 +173,8 @@ process_chain_service: Arc::new(ProcessChainService::new(snowflake.clone())),
         work_type_service: Arc::new(WorkTypeService::new(snowflake.clone())),
         work_type_process_service: Arc::new(WorkTypeProcessService),
         process_service: Arc::new(ProcessService::new(snowflake.clone())),
+        // 2026-09-22 D-2 新增：prod/worker_pool service 是 unit struct，无字段
+        // 不装线到 AppState；handler 直接走 ZST 静态调用 `WorkerPoolService::xxx`。
     })
 }
 
