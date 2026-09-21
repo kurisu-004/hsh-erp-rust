@@ -1,4 +1,4 @@
-//! applicant 域数据访问
+//! applicant 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
 //!
 //! 对应 Python myERP/repository/applicant_repository.py。函数签名接收 `impl PgExecutor<'_>`，
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
@@ -14,11 +14,24 @@
 //! - 校验：`l1_customer_exists` / `count_parts_using_applicant_name`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder 防 N+1）
 //! - 写：`create` / `update` / `soft_delete`
+//!
+//! 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff；
+//! `.sqlx/query-*.json` 哈希不变；`customer_name`（跨域读 t_customer.name 单值）保留
+//! 在本域 trait（用于单条 get / create / update），批量补 `customer_name` 的 inline
+//! t_customer SQL 从 `service.rs` 收敛到 `CustomerRepo::lookup_names`（跨域）。
+//! trait `ApplicantRepoTrait` 在 `repo/mod.rs`；ZST 仍名 `ApplicantRepo` 以对称
+//! customer 域（两者 trait 同加 `Trait` 后缀，与 shelf `ShelfRepoTrait` 同形）。
+//!
+//! ## ZST 命名仍为 `ApplicantRepo`
+//! 与 shelf / customer 同形：trait 改名 `ApplicantRepoTrait`（带 `Trait` 后缀），
+//! ZST 保留原名，避免后续 part / delivery_note 等域引入 applicant 静态调用时再破。
 
 use sqlx::{PgExecutor, Postgres, QueryBuilder};
 
-use super::model::TApplicant;
+use super::super::model::TApplicant;
 
+/// SQL 真源 ZST。trait 名为 `ApplicantRepoTrait`（公共接口），ZST 仍名
+/// `ApplicantRepo`（对称 customer 域命名约定）。
 pub struct ApplicantRepo;
 
 impl ApplicantRepo {
@@ -70,6 +83,9 @@ impl ApplicantRepo {
 
     /// 取指定客户的展示名（`deleted_at IS NULL` 过滤）。
     /// service 拼 `ApplicantOut.customer_name` 用。
+    ///
+    /// 注：跨域读 t_customer。批量补 `customer_name` 走
+    /// `CustomerRepo::lookup_names`（service 借 `&mut R3` 喂两次 trait）。
     pub async fn customer_name<'e, E: PgExecutor<'e>>(
         executor: E,
         customer_id: i64,

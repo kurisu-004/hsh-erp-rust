@@ -1,9 +1,8 @@
-//! customer 域业务逻辑
+//! customer 域 CRUD service
 //!
-//! 对应 Python myERP/service/customer.py + repository/customer_repository.py。
-//! 实施约定：方法签名接收 `&mut PgConnection`，由 handler 开 tx 并 commit。
+//! 列表 / 详情 / 创建 / 更新 / 软删 —— 共 5 个端点。
 //!
-//! ## L1 / L2 约束（与 Python 一致）
+//! ## 业务约束（service 层 enforce）
 //! - L1：`parent_id IS NULL`，`serial_prefix` 必须为单个大写字母
 //! - L2：`parent_id` 非 NULL（指向 L1），`serial_prefix` 必须 NULL
 //!
@@ -12,14 +11,28 @@
 //! `t_assembly.customer_id` 的非软删引用计数，>0 即拒软删，抛 `20113 BIZ_CUSTOMER_IN_USE`。
 //! **不**检查 `t_customer.parent_id`（子 L2），所以「L1 仍有 L2 子节点」**不会**触发此码——
 //! L1 子节点的语义由前端在删除前显式 cascade 处理，与 Python 行为一致。
+//!
+//! 2026-09-22 重构：跨域 inline SQL（`t_part` / `t_assembly` 引用计数）从本文件下沉到
+//! `CustomerRepo::count_parts_using_customer` / `count_assemblies_using_customer`——
+//! service 仍只持 `Arc<SnowflakeIdGenerator>` 字段，所有跨 repo 操作经 `repo: R` 形参。
+//!
+//! ## 事务边界（2026-09-22 重构对齐 iam 范本）
+//! 事务移交 handler（与 20 个 handler 文件现状对齐）：service 仅业务逻辑，所有跨 repo
+//! 操作经 `repo: R`（by-value；`R: CustomerRepo`）参数传入——handler/service 借
+//! `&mut *tx` / `&mut *conn` 喂给 `CustomerRepo` trait（trait 已直接
+//! `impl for &mut PgConnection`）。service 不知事务——handler `pool.begin()` +
+//! `tx.commit()` 包外。
+//!
+//! `CustomerService` 是 unit struct（无字段依赖，iam 范本 §6）；方法签名
+//! `<R: CustomerRepoTrait>(&self, mut repo: R, ...)`，生产 `R = &mut PgConnection`。
 
-use sqlx::PgConnection;
+use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::dto::*;
 use crate::modules::com::customer::model::TCustomer;
-use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::com::customer::repo::CustomerRepoTrait;
 use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;
@@ -59,15 +72,29 @@ fn check_serial_prefix(s: &str) -> Result<String, AppError> {
     Ok(upper)
 }
 
-pub struct CustomerService;
+/// customer 域 service（2026-09-22 重构后）
+///
+/// 字段仅 `snowflake`（事务已移交 handler）。实例为轻壳，可直接
+/// `Arc<CustomerService>` 存 `AppState`；方法签名收 `mut repo: R`（by-value；
+/// 生产 `R = &mut PgConnection`，单测 `R = MockCustomerRepo`），单测用 `MockCustomerRepo`
+/// 直接注入。
+pub struct CustomerService {
+    snowflake: Arc<SnowflakeIdGenerator>,
+}
 
 impl CustomerService {
+    /// 构造：仅需雪花 ID 生成器。
+    pub fn new(snowflake: Arc<SnowflakeIdGenerator>) -> Self {
+        Self { snowflake }
+    }
+
     // =======================================================================
     // 列表 / 详情
     // =======================================================================
 
-    pub async fn list_customers(
-        conn: &mut PgConnection,
+    pub async fn list_customers<R: CustomerRepoTrait>(
+        &self,
+        mut repo: R,
         query: &CustomerListQuery,
         user: &CurrentUser,
     ) -> Result<CustomerListOut, AppError> {
@@ -99,21 +126,16 @@ impl CustomerService {
             query.is_root
         };
 
-        let items = CustomerRepo::list_with_filters(
-            &mut *conn,
-            name_like,
-            parent_id_i64,
-            is_root,
-            limit,
-            offset,
-        )
-        .await?;
-        let total =
-            CustomerRepo::count_with_filters(&mut *conn, name_like, parent_id_i64, is_root).await?;
+        let items = repo
+            .list_with_filters(name_like, parent_id_i64, is_root, limit, offset)
+            .await?;
+        let total = repo
+            .count_with_filters(name_like, parent_id_i64, is_root)
+            .await?;
 
         // 父客户名补全（防 N+1：一次 list_by_ids 拿齐）
         let parent_ids: Vec<i64> = items.iter().filter_map(|c| c.parent_id).collect();
-        let parents = CustomerRepo::list_by_ids(&mut *conn, &parent_ids, true).await?;
+        let parents = repo.list_by_ids(&parent_ids, true).await?;
         let parent_map: std::collections::HashMap<i64, String> =
             parents.into_iter().map(|p| (p.id, p.name)).collect();
 
@@ -133,8 +155,9 @@ impl CustomerService {
         })
     }
 
-    pub async fn get_customer(
-        conn: &mut PgConnection,
+    pub async fn get_customer<R: CustomerRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         user: &CurrentUser,
     ) -> Result<CustomerOut, AppError> {
@@ -145,12 +168,14 @@ impl CustomerService {
             Role::Inspector,
         ])?;
 
-        let c = CustomerRepo::get_by_id(&mut *conn, id, false)
+        let c = repo
+            .get_by_id(id, false)
             .await?
             .ok_or_else(customer_not_found)?;
 
         let parent_name = match c.parent_id {
-            Some(pid) => CustomerRepo::get_by_id(&mut *conn, pid, true)
+            Some(pid) => repo
+                .get_by_id(pid, true)
                 .await?
                 .map(|p| p.name),
             None => None,
@@ -163,9 +188,9 @@ impl CustomerService {
     // 创建 / 更新 / 软删
     // =======================================================================
 
-    pub async fn create_customer(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn create_customer<R: CustomerRepoTrait>(
+        &self,
+        mut repo: R,
         req: &CustomerCreateRequest,
         user: &CurrentUser,
     ) -> Result<CustomerOut, AppError> {
@@ -202,36 +227,32 @@ impl CustomerService {
             _ => None,
         };
 
-        let id = snowflake.next_id();
-        let c = CustomerRepo::create(
-            &mut *conn,
-            id,
-            name,
-            parent_id,
-            prefix_upper.as_deref(),
-            user.id,
-        )
-        .await
-        .map_err(
-            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                // uk_t_customer_root_prefix：同 L1 不可重 prefix
-                Some("23505") => AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 已存在"),
-                _ => AppError::from(e),
-            },
-        )?;
+        let id = self.snowflake.next_id();
+        let c = repo
+            .create(id, name, parent_id, prefix_upper.as_deref(), user.id)
+            .await
+            .map_err(
+                |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                    // uk_t_customer_root_prefix：同 L1 不可重 prefix
+                    Some("23505") => AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 已存在"),
+                    _ => AppError::from(e),
+                },
+            )?;
 
         Ok(to_customer_out(c, None))
     }
 
-    pub async fn update_customer(
-        conn: &mut PgConnection,
+    pub async fn update_customer<R: CustomerRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         req: &CustomerUpdateRequest,
         user: &CurrentUser,
     ) -> Result<CustomerOut, AppError> {
         user.require_any_role(&[Role::Manager, Role::Clerk])?;
 
-        let current = CustomerRepo::get_by_id(&mut *conn, id, false)
+        let current = repo
+            .get_by_id(id, false)
             .await?
             .ok_or_else(customer_not_found)?;
 
@@ -286,54 +307,45 @@ impl CustomerService {
             ));
         }
 
-        let affected = CustomerRepo::update(
-            &mut *conn,
-            id,
-            current.version,
-            name_update,
-            prefix_update,
-            user.id,
-        )
-        .await
-        .map_err(
-            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                // uq_t_customer_root_prefix：把 L1 的 prefix 改成另一个 L1 已占用的值
-                Some("23505") => AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 已存在"),
-                _ => AppError::from(e),
-            },
-        )?;
+        let affected = repo
+            .update(id, current.version, name_update, prefix_update, user.id)
+            .await
+            .map_err(
+                |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                    // uq_t_customer_root_prefix：把 L1 的 prefix 改成另一个 L1 已占用的值
+                    Some("23505") => AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 已存在"),
+                    _ => AppError::from(e),
+                },
+            )?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
         // 回读最新行 + 父客户名
-        Self::get_customer(conn, id, user).await
+        self.get_customer(repo, id, user).await
     }
 
-    pub async fn soft_delete_customer(
-        conn: &mut PgConnection,
+    /// 软删：置 `deleted_at = now()` + `version + 1`。
+    /// 软删前查 `t_part.customer_id` 与 `t_assembly.customer_id` 非软删引用计数，
+    /// 大于 0 即拒（20113 BIZ_CUSTOMER_IN_USE）。引用计数 SQL 已下沉到
+    /// `CustomerRepoTrait::count_parts_using_customer` 与
+    /// `CustomerRepoTrait::count_assemblies_using_customer`。
+    pub async fn soft_delete_customer<R: CustomerRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         user: &CurrentUser,
     ) -> Result<(), AppError> {
         user.require_any_role(&[Role::Manager, Role::Clerk])?;
 
-        let current = CustomerRepo::get_by_id(&mut *conn, id, false)
+        let current = repo
+            .get_by_id(id, false)
             .await?
             .ok_or_else(customer_not_found)?;
 
         // 与 Python `service/customer.py:soft_delete_customer` 对齐：检查 part + assembly 引用
-        let part_count: i64 = sqlx::query_scalar!(
-            r#"SELECT COUNT(*) AS "c!" FROM t_part WHERE customer_id = $1 AND deleted_at IS NULL"#,
-            id
-        )
-        .fetch_one(&mut *conn)
-        .await?;
-        let assembly_count: i64 = sqlx::query_scalar!(
-            r#"SELECT COUNT(*) AS "c!" FROM t_assembly WHERE customer_id = $1 AND deleted_at IS NULL"#,
-            id
-        )
-        .fetch_one(&mut *conn)
-        .await?;
+        let part_count = repo.count_parts_using_customer(id).await?;
+        let assembly_count = repo.count_assemblies_using_customer(id).await?;
         if part_count > 0 || assembly_count > 0 {
             return Err(AppError::biz(
                 code::BIZ_CUSTOMER_IN_USE,
@@ -341,7 +353,7 @@ impl CustomerService {
             ));
         }
 
-        let affected = CustomerRepo::soft_delete(&mut *conn, id, current.version, user.id).await?;
+        let affected = repo.soft_delete(id, current.version, user.id).await?;
         if affected == 0 {
             return Err(version_conflict());
         }
