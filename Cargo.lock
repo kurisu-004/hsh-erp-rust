@@ -1401,6 +1401,7 @@ dependencies = [
  "dotenvy",
  "futures-util",
  "jsonwebtoken",
+ "libc",
  "lopdf",
  "mockall",
  "opendal",

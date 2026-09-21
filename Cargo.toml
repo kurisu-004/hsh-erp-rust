@@ -164,6 +164,12 @@ tokio-tungstenite = "0.29"
 # dev-deps；spike 已废弃，移除 bin 后即可下放到 dev-deps）。
 calamine = "0.26"
 
+# 2026-09-21：test 进程退出时 DROP DATABASE。tests/common/mod.rs 注册 libc::atexit
+# handler 回收 fresh_database_url() 在本进程创建的 test_<uuid> 库，避免 nextest
+# session tmpfs 累积（439 测试 × 库大小）。已在 tokio 传递依赖树里，固定版本
+# 锁定避免版本漂移；tokio 未引用时 [dev-dependencies] 仍正常解析。
+libc = "0.2"
+
 # ---------------------------------------------------------------------------------
 # P0 spike bin 已删除（迁移到 src/modules/delivery_note/print.rs）。
 # ---------------------------------------------------------------------------------

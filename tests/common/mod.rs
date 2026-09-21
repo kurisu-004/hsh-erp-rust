@@ -23,6 +23,15 @@
 //! - 替代原 CREATE DATABASE + `sqlx::migrate!` 全量跑 24 个迁移（旧 ~600ms）；
 //!   TEMPLATE clone 在 tmpfs 下 ~100ms，性能提升 ~6x。
 //!
+//! ### Layer 2.5：fresh database 进程退出回收 —— libc::atexit + admin DROP
+//! - 2026-09-21 补：plan 2 仅由 session 容器删除回收，nextest 439 测试下 tmpfs
+//!   残留 439 个完整 TEMPLATE 拷贝，爆炸。本模块在 `fresh_database_url()` 建库
+//!   后登记 `(server_url, db_name)` 进进程全局 Vec，`libc::atexit` 注册一次性
+//!   handler；进程退出时建临时 current_thread runtime，对每条条目连 admin 库
+//!   执行 `DROP DATABASE IF EXISTS ... WITH (FORCE)`，best-effort。
+//! - 调试逃生门：设 `TEST_KEEP_DB=1` 跳过清理；失败重跑时配合
+//!   `scripts/test_nextest.sh <test-name-substring>` 只跑失败子集。
+//!
 //! ### Snowflake ID 隔离（plan 2 保留）
 //! - `test_snowflake_instance()` 用 pid ⊕ startup_nanos 派生 0-1023 unique instance，
 //!   替代原固定 `instance=1` → 消除 nextest 并行下跨进程 user_id 撞 key（redis session key）。
@@ -60,6 +69,7 @@
 #![allow(dead_code, clippy::duplicate_mod, clippy::await_holding_lock)]
 
 use std::sync::Arc;
+use std::sync::Once;
 
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -117,6 +127,111 @@ fn test_snowflake_instance() -> u16 {
     })
 }
 use hsh_erp_rust::state::AppState;
+
+/// 2026-09-21：test_<uuid> 库进程级回收（atexit）。
+///
+/// `fresh_database_url()` 在每个测试里 `CREATE DATABASE test_<uuid> ...`，但
+/// plan 2 仅由 session 容器删除回收 —— nextest session 跑 439 个测试时，
+/// tmpfs 上残留 439 个完整 TEMPLATE 拷贝直到 trap EXIT。临时抱佛脚：进程内
+/// 登记 `(server_url, db_name)`，退出时 `libc::atexit` 回调里建一次性
+/// current_thread runtime，开 admin 连接 `DROP DATABASE ... WITH (FORCE)`。
+///
+/// 设计要点：
+/// - `OnceLock<Mutex<Vec<...>>>`：进程级共享，`Once::call_once` 保证 `atexit`
+///   只注册一次；
+/// - `TEST_KEEP_DB=1`：调试逃生门，handler 立即返回，旧「失败保留容器 + 提示
+///   inspect test_%」工作流通过 `TEST_KEEP_DB=1 ./scripts/test_nextest.sh <filter>`
+///   重跑失败子集复现；
+/// - `WITH (FORCE)`（PG13+ 语法，镜像 PG18 ✓）杀残留后端连接，不依赖 pool
+///   close 时序；
+/// - 仅 SIGTERM/SIGKILL 等信号杀死进程走不到 atexit（nextest slow-timeout
+///   terminate-after=2 超时强杀场景）；量级 ≤ 并发数 × 单库大小，session
+///   结束删容器时一并清。可接受，不引入 reaper。
+///
+/// 零调用点改动：`test_pool()` 签名不变，59 处 caller / 145 处 `pool.clone()`
+/// 不动。
+static CREATED_DBS: OnceLock<std::sync::Mutex<Vec<(String, String)>>> = OnceLock::new();
+static ATEXIT_ONCE: Once = Once::new();
+
+fn register_db_for_drop(server_url: &str, db_name: &str) {
+    ATEXIT_ONCE.call_once(|| unsafe {
+        libc::atexit(drop_dbs_atexit);
+    });
+    CREATED_DBS
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("CREATED_DBS mutex poisoned")
+        .push((server_url.to_string(), db_name.to_string()));
+}
+
+extern "C" fn drop_dbs_atexit() {
+    let _ = std::panic::catch_unwind(|| {
+        if std::env::var_os("TEST_KEEP_DB").is_some() {
+            return;
+        }
+        let entries = std::mem::take(
+            &mut *CREATED_DBS
+                .get()
+                .expect("atexit handler ran without registry init")
+                .lock()
+                .expect("CREATED_DBS mutex poisoned"),
+        );
+        if entries.is_empty() {
+            return;
+        }
+        let mut by_url: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (url, db) in entries {
+            by_url.entry(url).or_default().push(db);
+        }
+        // 2026-09-21 调试心得：复用常驻 `cleanup_runtime()` 在 atexit 阶段
+        // `block_on` 仍 panic（推测 IO driver 与进程退出路径上的资源清理
+        // 冲突），catch_unwind 也只能吞部分错误。改在独立 std::thread 内
+        // 全新建一个 current_thread runtime，绕开所有 atexit 阶段的不确定
+        // 状态。
+        let handle = std::thread::Builder::new()
+            .name("test-db-cleanup".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(_) => return,
+                };
+                rt.block_on(async move {
+                    for (server_url, db_names) in by_url {
+                        let admin = match PgPoolOptions::new()
+                            .max_connections(1)
+                            .acquire_timeout(std::time::Duration::from_secs(5))
+                            .connect(&format!("{server_url}/postgres"))
+                            .await
+                        {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+                        for db_name in db_names {
+                            let stmt = sqlx::query(sqlx::AssertSqlSafe(format!(
+                                "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+                            )));
+                            let _ = stmt.execute(&admin).await;
+                        }
+                        admin.close().await;
+                    }
+                });
+            });
+        if let Ok(h) = handle {
+            let _ = h.join();
+        }
+    });
+}
+
+// 2026-09-21 设计心得（atexit 阶段踩坑）：main thread 上建 / 复用 tokio runtime
+// 都会 panic —— IO driver 注册 epoll 与进程退出路径上的资源清理冲突，catch_unwind
+// 也只能吞部分错误。唯一稳的路径是 atexit 阶段另起独立 std::thread，在新线程里建
+// 全新的 current_thread runtime 跑 DROP，与进程退出路径完全隔离。具体实现见上面
+// `drop_dbs_atexit`。
 
 /// 2026-09-20 plan 2：fresh database URL —— 在 template 上 `CREATE DATABASE ... TEMPLATE`。
 ///
@@ -185,6 +300,7 @@ async fn fresh_database_url() -> (String, bool) {
     }
     // admin pool 在函数末尾 drop，PG 后端进程立即关闭。
     drop(admin);
+    register_db_for_drop(&server_url, &db_name);
     (format!("{server_url}/{db_name}"), template_exists)
 }
 
