@@ -7,7 +7,7 @@ use sqlx::PgExecutor;
 
 use crate::modules::prod::process_chain::model::{TPartProcessChain, TProcessChainStep};
 
-use super::ProcessChainRepo;
+use super::sql::ProcessChainRepo;
 
 impl ProcessChainRepo {
     /// 按 `part_id` 取链 header（活跃行，未软删）。
