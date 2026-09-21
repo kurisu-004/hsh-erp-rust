@@ -1,102 +1,115 @@
-//! assembly 域业务逻辑
+//! assembly 域 CRUD service
 //!
-//! 对应 Python myERP/service/assembly_service.py（及 _<d>_*.py helper）。
+//! 列表 / 详情 / 创建 / 更新 / 软删 / 取消 —— 共 6 个端点。
 //!
-//! 事务边界：本文件**不**创建事务，由 handler 在外层 `state.pool.begin()`。
-//! 所有 service 方法首项 `conn: &mut PgConnection`，末尾不 commit。
+//! ## 业务约束（service 层 enforce）
+//! - 列表：`customer_id` 支持 L1 展开（recursive CTE，由 trait 提供）
+//! - 创建：`customer_id` 必须是 L2 叶子；子件 ≤ 99；PDF 页数 == children.len()+1；
+//!   有 PDF 时从 L1 customer.serial_prefix 派发序列号
+//! - 更新：customer_id 三态（None/Some(None)/Some(Some(v))）+ L2 校验；OCC；§3.2
+//!   级联覆盖父件到所有未软删子件（8 个共享信息字段）；§3.3 套数缩放
+//! - 软删：Manager only；OCC；终态守；预检子件挂送货单（PR-2 后 JOIN t_part_batch 查）
+//! - 取消：Manager/Clerk；repo 按 `status NOT IN ('COMPLETED','CANCELLED')` 守卫，
+//!   命中 0 行 → 终态禁 cancel（返回 `BIZ_INVALID_TRANSITION`）
+//!
+//! ## 事务边界（2026-09-22 重构对齐 iam 范本）
+//! 事务移交 handler：service 仅业务逻辑，所有跨 repo 操作经 `repo: R`
+//! （by-value；`R: AssemblyRepoTrait`）参数传入——handler/service 借 `&mut *tx` /
+//! `&mut *conn` 喂给 trait（trait 已直接 `impl for &mut PgConnection`）。
+//!
+//! ## 跨域调用（2026-09-22 D-3 决策）
+//! 所有跨域 SQL（含 t_customer / t_part / t_part_file / t_part_batch）均通过
+//! `AssemblyRepoTrait` 的跨域 helper 方法收口——service 不直接调 `PartRepo::xxx` /
+//! `PartFileRepo::xxx` ZST 静态方法。这保证 `&mut PgConnection` 同一作用域只借给一个
+//! repo 实例（即 trait 对象本身），避免重复借用。
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
 
 use rust_decimal::Decimal;
-use sqlx::{PgConnection, Postgres, QueryBuilder};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock;
-use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::dto::{
     AssemblyChildOut, AssemblyCreateRequest, AssemblyCreateResult, AssemblyDetail,
     AssemblyListItem, AssemblyListOut, AssemblyListQuery, AssemblyOut, AssemblyUpdateRequest,
 };
 use crate::modules::assembly::model::TAssembly;
-use crate::modules::assembly::repo::{
-    AssemblyListFilters, AssemblyRepo, AssemblyUpdate, NewAssembly,
-};
-use crate::modules::assembly::statemachine::{AssemblyStatus, compute_assembly_target};
-use crate::modules::part::repo::PartRepo;
+use crate::modules::assembly::repo::{AssemblyRepoTrait, NewAssembly, AssemblyUpdate};
 use crate::modules::part::repo::part::ChildInheritFields;
-use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
 use crate::shared::error::{AppError, code};
-use crate::shared::serial as serial_helper;
+
+use super::AssemblyService;
+
+// =============================================================================
+// 兼容旧测试的 ZST 静态 wrapper 实现（2026-09-22 D-3 决策）
+// =============================================================================
+//
+// 既存集成测试以 `AssemblyService::create_assembly(&mut tx, ...)` 形式直调 service。
+// trait 注入式新签名 `<R: AssemblyRepoTrait>(&self, mut repo: R, ...)` 要求 caller
+// 写 `AssemblyService.xxx(&mut *tx, ...)`，与旧测试不兼容。本任务"不修改测试代码"，
+// 故以下 `_impl` 函数保留旧签名（接收 `&mut PgConnection`），内部一行委托到 trait 方法。
+//
+// 2026-09-22 D-3 决策：保留 wrapper 而非把 service 改成旧签名，原因是新签名是 iam 范本
+// 要求（`<R: AssemblyRepoTrait>`）。wrapper 仅 ~10 行 / 方法，不破坏任何未来 trait 注入。
+
+pub(crate) async fn list_assemblies_dispatch(
+    conn: &mut sqlx::PgConnection,
+    query: &AssemblyListQuery,
+    current: &CurrentUser,
+) -> Result<AssemblyListOut, AppError> {
+    AssemblyService.list_assemblies_inner(conn, query, current).await
+}
+
+pub(crate) async fn get_assembly_dispatch(
+    conn: &mut sqlx::PgConnection,
+    assembly_id: i64,
+    current: &CurrentUser,
+) -> Result<AssemblyDetail, AppError> {
+    AssemblyService.get_assembly_inner(conn, assembly_id, current).await
+}
+
+pub(crate) async fn create_assembly_dispatch(
+    conn: &mut sqlx::PgConnection,
+    snowflake: &SnowflakeIdGenerator,
+    req: &AssemblyCreateRequest,
+    pdf_files: Vec<Vec<u8>>,
+    current: &CurrentUser,
+) -> Result<AssemblyCreateResult, AppError> {
+    AssemblyService
+        .create_assembly_inner(conn, snowflake, req, pdf_files, current)
+        .await
+}
+
+pub(crate) async fn update_assembly_dispatch(
+    conn: &mut sqlx::PgConnection,
+    assembly_id: i64,
+    req: &AssemblyUpdateRequest,
+    current: &CurrentUser,
+) -> Result<AssemblyOut, AppError> {
+    AssemblyService.update_assembly_inner(conn, assembly_id, req, current).await
+}
+
+pub(crate) async fn soft_delete_assembly_dispatch(
+    conn: &mut sqlx::PgConnection,
+    assembly_id: i64,
+    expected_version: i32,
+    current: &CurrentUser,
+) -> Result<(), AppError> {
+    AssemblyService
+        .soft_delete_assembly_inner(conn, assembly_id, expected_version, current)
+        .await
+}
+
+pub(crate) async fn cancel_assembly_dispatch(
+    conn: &mut sqlx::PgConnection,
+    assembly_id: i64,
+    current: &CurrentUser,
+) -> Result<AssemblyOut, AppError> {
+    AssemblyService.cancel_assembly_inner(conn, assembly_id, current).await
+}
 
 // ---------- helpers ----------
-
-/// 把 `customer_id` 展开为下游 `t_assembly.customer_id IN (...)` 的查询列表。
-///
-/// - 若 `customer_id` 是 L1（`parent_id IS NULL`）：递归取所有 L2 子节点 + 自身；
-/// - 否则：仅返回 `[customer_id]`（L2 叶子直接当 in-list 传入，SQL 写法一致）。
-async fn expand_customer_id_to_l2(
-    conn: &mut PgConnection,
-    customer_id: i64,
-) -> Result<Vec<i64>, sqlx::Error> {
-    // 先看自身是不是 L1（parent_id IS NULL） → 是：收集自身 + 所有 L2 子节点；否：仅自身
-    let row: Option<(Option<i64>,)> =
-        sqlx::query_as("SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL")
-            .bind(customer_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-    match row {
-        Some((None,)) => {
-            // L1：递归取所有 L2（用 recursive CTE 一次拿齐）
-            let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-                "WITH RECURSIVE subtree AS (SELECT id FROM t_customer WHERE id = ",
-            );
-            qb.push_bind(customer_id);
-            qb.push(
-                " AND deleted_at IS NULL UNION ALL SELECT c.id FROM t_customer c \
-                 INNER JOIN subtree s ON c.parent_id = s.id WHERE c.deleted_at IS NULL) \
-                 SELECT id FROM subtree",
-            );
-            let ids: Vec<(i64,)> = qb.build_query_as().fetch_all(&mut *conn).await?;
-            Ok(ids.into_iter().map(|(i,)| i).collect())
-        }
-        _ => Ok(vec![customer_id]),
-    }
-}
-
-/// 从 `t_serial_counter` 派发下一个序列号（`prefix` 是单字符业务 PK）。
-///
-/// 2026-09-14 Phase 3（deferred #5）：迁移到 `crate::shared::serial::acquire`，
-/// 保留本 wrapper 为薄 alias（service 调用点直接用 `serial::acquire`）。
-#[inline]
-#[allow(dead_code)]
-async fn acquire_serial(conn: &mut PgConnection, prefix: char) -> Result<String, AppError> {
-    serial_helper::acquire(conn, prefix).await
-}
-
-/// 批量拉 customer 的 `(name, parent_id)`。返回 `HashMap<id, (name, parent_id)>`。
-///
-/// 防 N+1：`AssemblyService::list_assemblies` 一次性拉齐所有出现过的 customer。
-/// `ids` 为空时直接返回空 HashMap，避免构造 `IN ()` 空 SQL。
-async fn fetch_customer_names(
-    conn: &mut PgConnection,
-    ids: &[i64],
-) -> Result<HashMap<i64, (String, Option<i64>)>, sqlx::Error> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT id, name, parent_id FROM t_customer WHERE deleted_at IS NULL AND id IN (",
-    );
-    let mut sep = qb.separated(", ");
-    for id in ids {
-        sep.push_bind(*id);
-    }
-    qb.push(")");
-    let rows: Vec<(i64, String, Option<i64>)> = qb.build_query_as().fetch_all(&mut *conn).await?;
-    Ok(rows.into_iter().map(|(i, n, p)| (i, (n, p))).collect())
-}
 
 /// `TAssembly` → `AssemblyListItem`（含 customer_name / parent_customer_name 两次 join）。
 ///
@@ -169,15 +182,15 @@ fn render_assembly_out(asm: TAssembly) -> AssemblyOut {
     }
 }
 
-// ---------- service struct + 6 methods ----------
-
-/// assembly 域业务门面。handler 经 `state.pool.begin()` 开 tx 后透传 `&mut tx`。
-pub struct AssemblyService;
-
 impl AssemblyService {
+    // =======================================================================
+    // 列表 / 详情
+    // =======================================================================
+
     /// 列表查询：L1 客户展开 + 多维筛选 + 计数 + customer name 批量 join。
-    pub async fn list_assemblies(
-        conn: &mut PgConnection,
+    pub async fn list_assemblies_inner<R: AssemblyRepoTrait>(
+        &self,
+        mut repo: R,
         query: &AssemblyListQuery,
         current: &CurrentUser,
     ) -> Result<AssemblyListOut, AppError> {
@@ -195,7 +208,7 @@ impl AssemblyService {
                     format!("customer_id 非法: {cid_str}"),
                 )
             })?;
-            expand_customer_id_to_l2(conn, cid)
+            repo.expand_customer_l2_ids(cid)
                 .await
                 .map_err(AppError::from)?
         } else {
@@ -213,23 +226,30 @@ impl AssemblyService {
         let limit = query.limit.unwrap_or(50).clamp(1, 500);
         let offset = query.offset.unwrap_or(0).max(0);
 
-        let filters = AssemblyListFilters {
-            customer_ids: &customer_ids,
-            status: query.status.as_deref(),
-            statuses: &statuses,
-            is_urgent: query.is_urgent,
-            keyword: query.keyword.as_deref(),
-            sort_by: query.sort_by.as_deref(),
-            sort_dir: query.sort_dir.as_deref(),
-            limit,
-            offset,
-            include_deleted: false,
-        };
-
-        let rows = AssemblyRepo::list_with_filters(&mut *conn, &filters)
+        let rows = repo
+            .list_with_filters(
+                &customer_ids,
+                query.status.as_deref(),
+                &statuses,
+                query.is_urgent,
+                query.keyword.as_deref(),
+                query.sort_by.as_deref(),
+                query.sort_dir.as_deref(),
+                limit,
+                offset,
+                false,
+            )
             .await
             .map_err(AppError::from)?;
-        let total = AssemblyRepo::count_with_filters(&mut *conn, &filters)
+        let total = repo
+            .count_with_filters(
+                &customer_ids,
+                query.status.as_deref(),
+                &statuses,
+                query.is_urgent,
+                query.keyword.as_deref(),
+                false,
+            )
             .await
             .map_err(AppError::from)?;
 
@@ -240,7 +260,8 @@ impl AssemblyService {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let names = fetch_customer_names(conn, &unique_ids)
+        let names = repo
+            .fetch_customer_names_by_ids(&unique_ids)
             .await
             .map_err(AppError::from)?;
 
@@ -260,8 +281,9 @@ impl AssemblyService {
     ///
     /// 2026-09-14 Phase 3（deferred #7）：children 携带 `current_batch_id`（子件当前激活批次 id）。
     /// 取法：`t_part_batch WHERE part_id = $1 AND deleted_at IS NULL ORDER BY batch_no DESC LIMIT 1`。
-    pub async fn get_assembly(
-        conn: &mut PgConnection,
+    pub async fn get_assembly_inner<R: AssemblyRepoTrait>(
+        &self,
+        mut repo: R,
         assembly_id: i64,
         current: &CurrentUser,
     ) -> Result<AssemblyDetail, AppError> {
@@ -271,7 +293,8 @@ impl AssemblyService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
+        let asm = repo
+            .get_by_id(assembly_id, false)
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| {
@@ -281,12 +304,16 @@ impl AssemblyService {
                 )
             })?;
 
-        let children_t = PartRepo::list_by_assembly_id(&mut *conn, assembly_id, false)
+        let children_t = repo
+            .list_parts_by_assembly_id(assembly_id, false)
             .await
             .map_err(AppError::from)?;
         // deferred #7：批量查 current_batch_id（O(1) 查询）
         let child_ids: Vec<i64> = children_t.iter().map(|p| p.id).collect();
-        let current_batch_ids = Self::fetch_current_batch_ids(conn, &child_ids).await?;
+        let current_batch_ids = repo
+            .fetch_current_batch_ids_for_parts(&child_ids)
+            .await
+            .map_err(AppError::from)?;
         let children = children_t
             .into_iter()
             .map(|p| {
@@ -312,7 +339,8 @@ impl AssemblyService {
             .collect();
 
         // 上传的文件列表（ASSEMBLY_MASTER kind）
-        let files_t = PartFileRepo::list_by_owner(&mut *conn, "ASSEMBLY", asm.id)
+        let files_t = repo
+            .list_part_files_by_owner("ASSEMBLY", asm.id)
             .await
             .map_err(AppError::from)?;
         let files: Vec<crate::modules::assembly::dto::AssemblyFileRef> = files_t
@@ -332,34 +360,9 @@ impl AssemblyService {
         })
     }
 
-    /// 批量拉子件 current_batch_id（最近一条活跃 batch）。
-    /// 返回 `HashMap<part_id, Option<batch_id>>`；`None` 值表示子件无活跃 batch。
-    async fn fetch_current_batch_ids(
-        conn: &mut PgConnection,
-        part_ids: &[i64],
-    ) -> Result<HashMap<i64, Option<i64>>, sqlx::Error> {
-        let mut out: HashMap<i64, Option<i64>> = HashMap::new();
-        if part_ids.is_empty() {
-            return Ok(out);
-        }
-        // 用 DISTINCT ON 取每个 part_id 的最大 batch_no 行
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            "SELECT DISTINCT ON (part_id) part_id, id \
-             FROM t_part_batch \
-             WHERE part_id = ANY($1) AND deleted_at IS NULL \
-             ORDER BY part_id, batch_no DESC",
-        )
-        .bind(part_ids)
-        .fetch_all(&mut *conn)
-        .await?;
-        for (pid, bid) in rows {
-            out.insert(pid, Some(bid));
-        }
-        for pid in part_ids {
-            out.entry(*pid).or_insert(None);
-        }
-        Ok(out)
-    }
+    // =======================================================================
+    // 创建
+    // =======================================================================
 
     /// 创建：multipart PDF（可选） + 子件 + 序列号派发。
     ///
@@ -368,8 +371,9 @@ impl AssemblyService {
     /// 2. 子件 ≤ 99（`BIZ_ASSEMBLY_TOO_MANY_CHILDREN`）
     /// 3. 若提供 PDF：页数 == `children.len() + 1`（首页 + 每子件 1 页）
     /// 4. 若提供 PDF：从 L1 客户的 `serial_prefix` 派发序列号（无 prefix → `BIZ_CUSTOMER_NO_SERIAL_PREFIX`）
-    pub async fn create_assembly(
-        conn: &mut PgConnection,
+    pub async fn create_assembly_inner<R: AssemblyRepoTrait>(
+        &self,
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         req: &AssemblyCreateRequest,
         pdf_files: Vec<Vec<u8>>,
@@ -384,15 +388,11 @@ impl AssemblyService {
                 format!("customer_id 非法: {}", req.customer_id),
             )
         })?;
-        let parent_check: Option<(Option<i64>,)> =
-            sqlx::query_as("SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL")
-                .bind(customer_id)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(AppError::from)?;
-        let parent_id = parent_check
-            .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?
-            .0;
+        let parent_id = repo
+            .fetch_customer_parent_id(customer_id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?;
         if parent_id.is_none() {
             return Err(AppError::biz(
                 code::BIZ_ASSEMBLY_BAD_CUSTOMER,
@@ -435,31 +435,28 @@ impl AssemblyService {
             (None, None)
         } else {
             // 取 L1 客户的 serial_prefix 首字母（约定 L1 customer 必有 serial_prefix）
-            let l1_id: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(parent_id, id) FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(customer_id)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(AppError::from)?;
-            let prefix_str: Option<String> = sqlx::query_scalar(
-                "SELECT serial_prefix FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(l1_id)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(AppError::from)?;
-            let p = prefix_str.ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
-                    "L1 客户无 serial_prefix",
-                )
-            })?;
-            let ch = p
+            let l1_id = repo
+                .fetch_customer_l1_id(customer_id)
+                .await
+                .map_err(AppError::from)?
+                .ok_or_else(|| {
+                    AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在")
+                })?;
+            let prefix_str = repo
+                .fetch_customer_serial_prefix(l1_id)
+                .await
+                .map_err(AppError::from)?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
+                        "L1 客户无 serial_prefix",
+                    )
+                })?;
+            let ch = prefix_str
                 .chars()
                 .next()
                 .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 为空"))?;
-            (Some(serial_helper::acquire(conn, ch).await?), Some(ch))
+            (Some(repo.acquire_serial(ch).await?), Some(ch))
         };
 
         // 5. INSERT t_assembly
@@ -490,9 +487,7 @@ impl AssemblyService {
             note: req.note.as_deref(),
             created_by: current.id,
         };
-        AssemblyRepo::insert(&mut *conn, new)
-            .await
-            .map_err(AppError::from)?;
+        repo.insert(new).await.map_err(AppError::from)?;
 
         // 6. 插入子件（如有 PDF，则带 serial_no 派生 `{asm_serial}-{i:02d}`）
         //
@@ -523,8 +518,7 @@ impl AssemblyService {
                     is_urgent: parent_is_urgent,
                     note: req.note.as_deref(),
                 };
-                PartRepo::insert_child_for_assembly(
-                    conn,
+                repo.insert_part_child_for_assembly(
                     child_id,
                     customer_id,
                     asm_id,
@@ -560,7 +554,8 @@ impl AssemblyService {
         }
 
         // 7. 读回返回（用 `include_deleted=true` 兜底刚 INSERT 的可见性）
-        let asm_t = AssemblyRepo::get_by_id(&mut *conn, asm_id, true)
+        let asm_t = repo
+            .get_by_id(asm_id, true)
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "刚创建却查不到"))?;
@@ -569,6 +564,10 @@ impl AssemblyService {
             created_children: created_children_out,
         })
     }
+
+    // =======================================================================
+    // 更新
+    // =======================================================================
 
     /// 字段可选 UPDATE（含 customer_id 三态校验 + L2 校验）。
     ///
@@ -589,8 +588,9 @@ impl AssemblyService {
     /// 列，DTO `AssemblyUpdateRequest` 同步精简；级联子件集合保持 8 字段
     /// （`actual_delivery_date` 不在级联集合中 —— 该列已删，返修/发货事实改由
     /// `t_part_event` 事件日志承担）。
-    pub async fn update_assembly(
-        conn: &mut PgConnection,
+    pub async fn update_assembly_inner<R: AssemblyRepoTrait>(
+        &self,
+        mut repo: R,
         assembly_id: i64,
         req: &AssemblyUpdateRequest,
         current: &CurrentUser,
@@ -606,18 +606,14 @@ impl AssemblyService {
                 )
             })?;
             // 校验 L2 叶子（parent_id NOT NULL）
-            let parent: Option<Option<i64>> = sqlx::query_scalar(
-                "SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(cid)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(AppError::from)?;
-            let _parent_id = parent
-                .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?
-                .ok_or_else(|| {
-                    AppError::biz(code::BIZ_ASSEMBLY_BAD_CUSTOMER, "customer_id 必须是 L2")
-                })?;
+            let parent = repo
+                .fetch_customer_parent_id(cid)
+                .await
+                .map_err(AppError::from)?
+                .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?;
+            let _parent_id = parent.ok_or_else(|| {
+                AppError::biz(code::BIZ_ASSEMBLY_BAD_CUSTOMER, "customer_id 必须是 L2")
+            })?;
             Some(cid)
         } else {
             None
@@ -625,19 +621,16 @@ impl AssemblyService {
 
         // 预读父件现值：捕获 old_qty 用于 §3.3 缩放触发判断；同事务内的
         // read-after-write 由 OCC 守，TOCTOU 窗口不会导致错误数据写库。
-        let old_qty: i32 = sqlx::query_scalar(
-            "SELECT quantity FROM t_assembly WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(assembly_id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(AppError::from)?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_ASSEMBLY_NOT_FOUND,
-                format!("assembly {assembly_id} 不存在"),
-            )
-        })?;
+        let old_qty: i32 = repo
+            .fetch_assembly_quantity(assembly_id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_ASSEMBLY_NOT_FOUND,
+                    format!("assembly {assembly_id} 不存在"),
+                )
+            })?;
 
         let upd = AssemblyUpdate {
             drawing_no: req.drawing_no.as_deref(),
@@ -657,7 +650,8 @@ impl AssemblyService {
             note: req.note.as_ref().map(|opt| opt.as_deref()),
             updated_by: current.id,
         };
-        let affected = AssemblyRepo::update_partial(&mut *conn, assembly_id, req.version, upd)
+        let affected = repo
+            .update_partial(assembly_id, req.version, upd)
             .await
             .map_err(AppError::from)?;
         if affected == 0 {
@@ -668,7 +662,8 @@ impl AssemblyService {
         }
 
         // 读回父件"更新后的当前行值" → §3.2 级联 + §3.3 缩放共用此视图
-        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
+        let asm = repo
+            .get_by_id(assembly_id, false)
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
@@ -681,8 +676,7 @@ impl AssemblyService {
         let request_date = asm.request_date;
         let planned_delivery_date = asm.planned_delivery_date;
         let applicant_name = asm.applicant_name.as_deref().unwrap_or("");
-        PartRepo::cascade_sync_from_assembly(
-            &mut *conn,
+        repo.cascade_sync_from_assembly(
             asm.id,
             request_date,
             applicant_name,
@@ -701,13 +695,17 @@ impl AssemblyService {
         if let Some(new_qty) = req.quantity
             && new_qty != old_qty
         {
-            PartRepo::scale_children_quantity(&mut *conn, asm.id, old_qty, new_qty, current.id)
+            repo.scale_children_quantity(asm.id, old_qty, new_qty, current.id)
                 .await
                 .map_err(AppError::from)?;
         }
 
         Ok(render_assembly_out(asm))
     }
+
+    // =======================================================================
+    // 软删（Manager only）
+    // =======================================================================
 
     /// 软删（Manager only）：带版本号乐观锁；终态记录由 repo `status NOT IN`
     /// 守卫拦截（当前 repo 仅按 `deleted_at IS NULL` 守卫）。
@@ -719,38 +717,29 @@ impl AssemblyService {
     ///
     /// 2026-09-16 PR-2 瘦身（migration 027）：t_part.delivery_note_id 列已删，
     /// 「子件挂送货单」改 JOIN t_part_batch 查（真相源在 t_part_batch）。
-    pub async fn soft_delete_assembly(
-        conn: &mut PgConnection,
+    pub async fn soft_delete_assembly_inner<R: AssemblyRepoTrait>(
+        &self,
+        mut repo: R,
         assembly_id: i64,
         expected_version: i32,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
         // deferred #3 升级（PR-2）：子件挂送货单预检改查 t_part_batch。
-        let has_shipment: Option<(i64,)> = sqlx::query_as(
-            "SELECT 1::bigint \
-             FROM t_part_batch pb \
-             JOIN t_part p ON p.id = pb.part_id \
-             WHERE p.assembly_id = $1 \
-               AND p.deleted_at IS NULL \
-               AND pb.deleted_at IS NULL \
-               AND pb.delivery_note_id IS NOT NULL \
-             LIMIT 1",
-        )
-        .bind(assembly_id)
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(AppError::from)?;
-        if has_shipment.is_some() {
+        let has_shipment = repo
+            .has_active_shipment_for_assembly(assembly_id)
+            .await
+            .map_err(AppError::from)?;
+        if has_shipment {
             return Err(AppError::biz(
                 code::BIZ_ASSEMBLY_HAS_SHIPMENT,
                 "assembly 子件存在活跃批次已挂送货单，禁止 soft_delete",
             ));
         }
-        let affected =
-            AssemblyRepo::soft_delete(&mut *conn, assembly_id, expected_version, current.id)
-                .await
-                .map_err(AppError::from)?;
+        let affected = repo
+            .soft_delete(assembly_id, expected_version, current.id)
+            .await
+            .map_err(AppError::from)?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -764,13 +753,15 @@ impl AssemblyService {
     /// 命中 0 行 → 终态禁 cancel（返回 `BIZ_INVALID_TRANSITION`）。
     ///
     /// 设计上无 OCC（cancel 是单向状态翻转，重复 cancel 走 0 行 → 409）。
-    pub async fn cancel_assembly(
-        conn: &mut PgConnection,
+    pub async fn cancel_assembly_inner<R: AssemblyRepoTrait>(
+        &self,
+        mut repo: R,
         assembly_id: i64,
         current: &CurrentUser,
     ) -> Result<AssemblyOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        let affected = AssemblyRepo::cancel(&mut *conn, assembly_id, current.id)
+        let affected = repo
+            .cancel(assembly_id, current.id)
             .await
             .map_err(AppError::from)?;
         if affected == 0 {
@@ -779,310 +770,11 @@ impl AssemblyService {
                 "终态禁 cancel 或已删除",
             ));
         }
-        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
+        let asm = repo
+            .get_by_id(assembly_id, false)
             .await
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
         Ok(render_assembly_out(asm))
-    }
-
-    /// `POST /assemblies/{id}/start`：PENDING → IN_PROCESS（状态机守卫）。
-    ///
-    /// 2026-09-14 Phase 3（deferred #4）：独立端点暴露装配体进入加工态。
-    /// 权限：Manager / Clerk；状态机 `PENDING → IN_PROCESS` 校验在 service 层。
-    pub async fn start_assembly(
-        conn: &mut PgConnection,
-        assembly_id: i64,
-        current: &CurrentUser,
-    ) -> Result<AssemblyOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
-            .await
-            .map_err(AppError::from)?
-            .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
-        let from = AssemblyStatus::from_str(&asm.status).ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("未知 assembly status: {}", asm.status),
-            )
-        })?;
-        if !from.can_transition_to(AssemblyStatus::IN_PROCESS) {
-            return Err(AppError::biz(
-                code::BIZ_INVALID_TRANSITION,
-                format!("start 状态机禁止: {} → IN_PROCESS", from.as_str()),
-            ));
-        }
-        let affected = AssemblyRepo::update_status_if_not_terminal(
-            &mut *conn,
-            assembly_id,
-            asm.version,
-            AssemblyStatus::IN_PROCESS.as_str(),
-            current.id,
-        )
-        .await
-        .map_err(AppError::from)?;
-        if affected == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                "version 不匹配或已终态",
-            ));
-        }
-        let fresh = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
-            .await
-            .map_err(AppError::from)?
-            .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "start 后查不到"))?;
-        Ok(render_assembly_out(fresh))
-    }
-
-    /// `POST /assemblies/{id}/files`：multipart PDF 上传（deferred #1）。
-    ///
-    /// 复用 part_file 域上传逻辑（SHA-256 CAS + COS PUT + t_part_file INSERT）。
-    /// owner_kind='ASSEMBLY'，kind='ASSEMBLY_MASTER'；多 PDF 用多 part。
-    ///
-    /// 返回 AssemblyFileRef 列表（不含下载 URL，前端用 `GET /part-files/{id}/url`）。
-    pub async fn upload_assembly_files(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
-        cos: Arc<dyn CosClient>,
-        assembly_id: i64,
-        files: Vec<(Vec<u8>, String, String)>, // (bytes, filename, content_type)
-        current: &CurrentUser,
-    ) -> Result<Vec<crate::modules::assembly::dto::AssemblyFileRef>, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        // 校验 assembly 存在
-        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
-            .await
-            .map_err(AppError::from)?
-            .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
-
-        let mut out = Vec::with_capacity(files.len());
-        for (bytes, filename, content_type) in files {
-            // 扩展名校验（仅允许 PDF）
-            let ext = crate::modules::part_file::policy::ext_of(&filename)
-                .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "文件缺少扩展名"))?;
-            if ext != "pdf" {
-                return Err(AppError::biz(
-                    code::BIZ_PART_FILE_BAD_TYPE,
-                    format!("ASSEMBLY_MASTER 仅接受 PDF，扩展名 {ext:?} 不允许"),
-                ));
-            }
-            // SHA-256 → CAS
-            let sha = hash_bytes(&bytes);
-            if let Some(existing) =
-                PartFileRepo::get_by_owner_kind_sha(&mut *conn, asm.id, "ASSEMBLY_MASTER", &sha)
-                    .await?
-            {
-                out.push(crate::modules::assembly::dto::AssemblyFileRef {
-                    id: existing.id,
-                    original_filename: existing.original_filename,
-                    page_count: None, // PDF 页数由 GET 时 lopdf 重算；这里省略
-                });
-                continue;
-            }
-            // 上传 COS
-            let safe_filename = sanitize_cos_filename(&filename);
-            let object_key = format!(
-                "assembly/{}/ASSEMBLY_MASTER/{}_{}",
-                asm.id,
-                &sha[..16],
-                safe_filename,
-            );
-            cos.put_object(&object_key, bytes.clone(), &content_type)
-                .await?;
-            // INSERT
-            let file_id = snowflake.next_id();
-            let nf = NewPartFile {
-                id: file_id,
-                part_id: asm.id,
-                owner_kind: "ASSEMBLY",
-                kind: "ASSEMBLY_MASTER",
-                file_type: "PDF",
-                object_key: &object_key,
-                original_filename: &filename,
-                file_size: bytes.len() as i64,
-                content_type: &content_type,
-                upload_status: "READY",
-                content_sha256: Some(&sha),
-                created_by: current.id,
-            };
-            PartFileRepo::create_part_file(&mut *conn, nf).await?;
-            out.push(crate::modules::assembly::dto::AssemblyFileRef {
-                id: file_id,
-                original_filename: filename,
-                page_count: None,
-            });
-        }
-        Ok(out)
-    }
-}
-
-// ---------- sync hook (assembly-status-auto-sync Task 1) ----------
-
-/// Sync hook result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SyncOutcome {
-    /// 父装配件已为终态 / 无子件 / 目标 == 当前 → 不写库
-    NoChange,
-    /// 实际更新了 t_assembly.status；handler 据此发 ASSEMBLY_UPDATED
-    Changed(i64),
-}
-
-impl AssemblyService {
-    /// 从单个 part 的状态变更回流到父装配件（同事务调用）。
-    /// 1. 反查 `part.assembly_id`（None → NoChange）
-    /// 2. 父已是 COMPLETED/CANCELLED → NoChange（Python 短路 L92）
-    /// 3. 拉子件 status → `compute_assembly_target` → Some(target)
-    /// 4. 取父当前 version + status；target == 当前 → NoChange
-    /// 5. `update_status_if_not_terminal`；0 行 → VERSION_CONFLICT（事务回滚）
-    /// 6. 返回 `Changed(assembly_id)`
-    pub async fn sync_from_part_change(
-        conn: &mut PgConnection,
-        part_id: i64,
-        current: &CurrentUser,
-    ) -> Result<SyncOutcome, AppError> {
-        let row: Option<(Option<i64>,)> =
-            sqlx::query_as("SELECT assembly_id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
-                .bind(part_id)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(AppError::from)?;
-        let Some((Some(assembly_id),)) = row else {
-            return Ok(SyncOutcome::NoChange);
-        };
-        Self::sync_assembly_status(conn, assembly_id, current).await
-    }
-
-    /// 批量版本：传入本次批量成功的 part_id 列表；
-    /// 用单条 SQL `SELECT DISTINCT assembly_id` 去重，再逐个 sync。
-    pub async fn sync_from_part_changes(
-        conn: &mut PgConnection,
-        part_ids: &[i64],
-        current: &CurrentUser,
-    ) -> Result<Vec<SyncOutcome>, AppError> {
-        if part_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<(Option<i64>,)> = sqlx::query_as(
-            "SELECT DISTINCT assembly_id FROM t_part \
-             WHERE id = ANY($1) AND assembly_id IS NOT NULL \
-               AND deleted_at IS NULL",
-        )
-        .bind(part_ids)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(AppError::from)?;
-        let assembly_ids: Vec<i64> = rows.into_iter().filter_map(|(a,)| a).collect();
-        let mut out = Vec::with_capacity(assembly_ids.len());
-        for aid in assembly_ids {
-            out.push(Self::sync_assembly_status(conn, aid, current).await?);
-        }
-        Ok(out)
-    }
-
-    /// 实际聚合 + 翻转的核心；`sync_from_part_change` / `sync_from_part_changes` 共用。
-    async fn sync_assembly_status(
-        conn: &mut PgConnection,
-        assembly_id: i64,
-        current: &CurrentUser,
-    ) -> Result<SyncOutcome, AppError> {
-        // 父存在性 + 终态短路
-        let asm = AssemblyRepo::get_by_id(&mut *conn, assembly_id, false)
-            .await
-            .map_err(AppError::from)?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_ASSEMBLY_NOT_FOUND,
-                    format!("assembly {assembly_id} 不存在"),
-                )
-            })?;
-        let current_status = AssemblyStatus::from_str(&asm.status).ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("未知 assembly status: {}", asm.status),
-            )
-        })?;
-        if matches!(
-            current_status,
-            AssemblyStatus::COMPLETED | AssemblyStatus::CANCELLED
-        ) {
-            return Ok(SyncOutcome::NoChange);
-        }
-
-        // 聚合子件
-        let children_statuses = AssemblyRepo::aggregate_children_status(&mut *conn, assembly_id)
-            .await
-            .map_err(AppError::from)?;
-        let Some(target) = compute_assembly_target(children_statuses.iter().map(|s| s.as_str()))
-        else {
-            return Ok(SyncOutcome::NoChange);
-        };
-
-        // target == current → NoChange
-        if target == current_status {
-            return Ok(SyncOutcome::NoChange);
-        }
-
-        // OCC 翻转
-        let affected = AssemblyRepo::update_status_if_not_terminal(
-            &mut *conn,
-            assembly_id,
-            asm.version,
-            target.as_str(),
-            current.id,
-        )
-        .await
-        .map_err(AppError::from)?;
-        if affected == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!(
-                    "assembly {assembly_id} version {} 已变化或已终态",
-                    asm.version
-                ),
-            ));
-        }
-        Ok(SyncOutcome::Changed(assembly_id))
-    }
-}
-
-// ---------- helpers for upload-files (deferred #1) ----------
-
-/// 把 client-supplied filename 清洗为 COS object key 安全字符串：
-/// - 保留 ASCII 字母 / 数字 / `.` / `-` / `_`
-/// - 其它字符（含中文 / 空格）替换为 `_`
-/// - 长度上限 80 字符
-fn sanitize_cos_filename(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.len() > 80 {
-        out.truncate(80);
-    }
-    if out.is_empty() {
-        out.push_str("file");
-    }
-    out
-}
-
-#[cfg(test)]
-mod upload_helpers_tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_cos_filename_basic() {
-        assert_eq!(sanitize_cos_filename("master.pdf"), "master.pdf");
-        assert_eq!(sanitize_cos_filename("图纸 v2.pdf"), "___v2.pdf");
-    }
-
-    #[test]
-    fn sanitize_cos_filename_empty_fallback() {
-        assert_eq!(sanitize_cos_filename(""), "file");
-        // 中文 → "__"（替换为下划线后非空，保留而非 fallback）
-        assert_eq!(sanitize_cos_filename("中文"), "__");
     }
 }
