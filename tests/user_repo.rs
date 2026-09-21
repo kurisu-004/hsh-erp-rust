@@ -48,18 +48,10 @@ fn snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
     common::pool_snowflake()
 }
 
-/// 用例开头固定三步：建库 → 连池 → 清表（test_pool 每次 fresh database，无残留）。
+/// 用例开头固定两步：建库 → 连池（test_pool 每次 fresh database，无残留，无需清表）。
 async fn setup() -> PgPool {
     ensure_database_exists().await;
-    let pool = test_pool().await;
-    // 仅清 auth 表，user_repo 测试只触这 5 张表
-    sqlx::query(
-        "TRUNCATE t_user, t_user_role, t_menu, t_role_menu, t_shelf RESTART IDENTITY CASCADE",
-    )
-    .execute(&pool)
-    .await
-    .expect("truncate auth tables");
-    pool
+    test_pool().await
 }
 
 // ===========================================================================
