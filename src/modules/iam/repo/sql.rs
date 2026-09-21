@@ -14,8 +14,9 @@
 //! SQL 与签名零 diff）。
 //!
 //! 2026-09-21 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff，
-//! `.sqlx/query-*.json` 哈希不变；新增的 `IamRepo` trait 与 `PgIamRepo` 实现分别在
-//! `repo/mod.rs` 与 `repo/pg.rs`。
+//! `.sqlx/query-*.json` 哈希不变；新增的 `IamRepo` trait 在 `repo/mod.rs`。
+//! 2026-09-22 删 `PgIamRepo`：`IamRepo` trait 直接对 `&'a mut PgConnection` 实现（见
+//! `repo/mod.rs` 末尾 `impl IamRepo for &'a mut PgConnection` 块），本文件 SQL 与签名零 diff。
 
 use chrono::NaiveDateTime;
 use sqlx::PgExecutor;

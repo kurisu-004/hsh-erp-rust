@@ -65,7 +65,7 @@ TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo next
 
 ## 必须遵守的架构约定
 
-1. **事务边界在 handler（2026-09-21 重构后 iam 与其余 20 个 handler 文件一致）**：handler 显式 `state.pool.begin()` / `tx.commit()`，错误路径 tx drop 隐式回滚。service 不知事务——所有跨 repo 操作经 `repo: &mut R`（`R: IamRepo` / 域内对应 trait）参数传入。
+1. **事务边界在 handler（2026-09-21 重构 + 2026-09-22 删 `PgIamRepo` 转发壳后 iam 与其余 20 个 handler 文件一致）**：handler 显式 `state.pool.begin()` / `tx.commit()`，错误路径 tx drop 隐式回滚。service 不知事务——所有跨 repo 操作经 `repo: R`（by-value；`IamRepo` / 域内对应 trait 已直接 `impl for &mut PgConnection`，handler/service 借 `&mut *tx` / `&mut *conn` 即可）参数传入。
    - 例外清单（仍走 handler 边界）：
      - `_e2e` 直调方（测试 fixture 自管 tx）
      - 既有 `tests/iam_api.rs` 等 HTTP 契约测试（不改测试代码）
@@ -79,7 +79,7 @@ TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo next
 
 ## 事务与 repo 范式（2026-09-21 iam 范本）
 
-- **事务由 handler 管**：handler 显式 `pool.begin()` / `tx.commit()` / `tx drop = rollback`；service 方法签名 `<R: IamRepo>(&self, repo: &mut R, ...)`，service 不知事务。post-commit 副作用（Redis session 写 / WS 广播）在 handler 内 commit 之后做（best-effort）。
+- **事务由 handler 管**：handler 显式 `pool.begin()` / `tx.commit()` / `tx drop = rollback`；service 方法签名 `<R: IamRepo>(&self, mut repo: R, ...)`（by-value；trait 已直接 `impl for &mut PgConnection`），service 不知事务。post-commit 副作用（Redis session 写 / WS 广播）在 handler 内 commit 之后做（best-effort）。
 - **胖 trait 借连接**：每域定义一个胖 trait（如 iam 的 `IamRepo`，17 方法）而非按实体拆 4 trait——`&mut PgConnection` 同一作用域只能借给一个 repo 实例，拆分会让 service 无法同时持有 user_repo + user_role_repo。Trait 方法签名 = `repo/sql.rs` 固有静态方法去 executor 形参；`<'a>` 显式生命周期是 mockall 0.15 automock 在 async_trait 上下文的硬性要求。
 - **借连接实现**：`<域>PgRepo<'a> { conn: &'a mut PgConnection }` 借 handler 开出的 `Transaction` 或 `pool.acquire()`，方法体 = `sql::XxxRepo::yyy(&mut *conn, ...)` 一行委托。**不能**存 `AppState`（生命周期短）。
 - **handler 三形态**：① 纯写端点 `pool.begin() → service → commit`；② 写 + post-commit Redis（login / refresh / change_password / admin_reset_password）`pool.begin() → service → commit → state.session.xxx`；③ 读端点（me / list_users / get_user / list_user_roles）`pool.acquire() → service`，不开事务。
@@ -95,7 +95,7 @@ TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo next
 - 时间列存 naive `timestamp`，写入用 `infra::clock::now_naive()`（Asia/Shanghai）
 - 迁移命名：`<13位时间戳>_<顺序>_<描述>.sql`，见 `migrations/README.md`
 - `repo/sql.rs` 固有静态方法签名收 `impl PgExecutor<'_>`，与胖 trait 方法签名 1:1；`sql.rs` 是 SQL 真源，**零 diff 是硬 gate**
-- service 不持 repo / pool——repo 由 handler 在每请求栈上构造 `PgIamRepo<'a>`（生命周期短，借 `&mut PgConnection`），作为方法参数借给 service；service 本身只持轻量依赖（雪花 ID 生成器 / 配置 / session store / 跨域 service 委托）
+- service 不持 repo / pool——handler/service 直接借 `&mut *tx` / `&mut *conn` 喂给 `IamRepo` trait（trait 已 `impl for &mut PgConnection`，2026-09-22 替代 `PgIamRepo<'a>` 转发壳）；service 本身只持轻量依赖（雪花 ID 生成器 / 配置 / session store / 跨域 service 委托）
 
 ## 环境要点
 

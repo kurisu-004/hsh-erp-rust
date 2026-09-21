@@ -1,8 +1,11 @@
 //! iam AccountService 单测共享 helpers（不计入 service_tests 行数额度）
 //!
-//! 2026-09-21 事务分层重构后：service 签名 `<R: IamRepo>(&self, repo: &mut R, ...)`，
+//! 2026-09-21 事务分层重构后：service 签名 `<R: IamRepo>(&self, repo: R, ...)`（by-value），
 //! 单测用 `MockIamRepo` 直接注入；事务边界不再在 service 层，故无 commit/rollback 断言。
 //! 写端点原本的 `assert_committed()` / `assert_not_committed()` 整体删除——服务不知事务。
+//!
+//! 2026-09-22 删 `PgIamRepo` 转发壳：service 形参 `repo: R` 直接收 `MockIamRepo`（单测）或
+//! `&mut PgConnection`（生产 handler 借 `&mut *tx`）。
 
 use std::sync::{Arc, Mutex};
 

@@ -2,16 +2,17 @@
 //!
 //! 5 方法分组：login (9) / refresh (7) / me (5) / change_password (5) / logout (4)。
 //!
-//! ## 测试形态（2026-09-21 事务分层重构后）
-//! 纯 `#[tokio::test]`，零数据库。service 方法签名 `<R: IamRepo>(&self, repo: &mut R, ...)`，
+//! ## 测试形态（2026-09-21 事务分层重构 + 2026-09-22 删 `PgIamRepo` 转发壳后）
+//! 纯 `#[tokio::test]`，零数据库。service 方法签名 `<R: IamRepo>(&self, mut repo: R, ...)`
+//! （by-value；生产 `R = &mut PgConnection`，单测 `R = MockIamRepo`），
 //! 单测用 `MockIamRepo` 直接注入；事务不在 service 层（handler 管），故无 commit 时序断言。
 //!
 //! ## 形态变化
-//! - `login` / `refresh` 拆两阶段：第一阶段 `svc.login(&mut repo, req) -> LoginPending`
-//!   / `svc.refresh(&mut repo, req) -> RefreshPending` 跑 DB；第二阶段
+//! - `login` / `refresh` 拆两阶段：第一阶段 `svc.login(repo, req) -> LoginPending`
+//!   / `svc.refresh(repo, req) -> RefreshPending` 跑 DB；第二阶段
 //!   `svc.complete_login(pending) -> LoginResponse` / `svc.complete_refresh(pending) -> LoginResponse`
 //!   写 Redis session。service 层两阶段独立可测。
-//! - `change_password` 直接 `svc.change_password(&mut repo, user_id, req, &current)`，
+//! - `change_password` 直接 `svc.change_password(repo, user_id, req, &current)`，
 //!   内部委托给 `account_service.change_own_password(repo, ...)`。
 //!
 //! 2026-09-19 IAM 域合并：从 `auth/service_tests.rs` 整体迁移过来，路径全改为
@@ -28,8 +29,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::auth::session::{MockSessionStore, SessionStore, hash_token};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::iam::dto::ChangePasswordRequest;
-use crate::modules::iam::model::User;
-use crate::modules::iam::repo::{IamRepo, MockIamRepo};
+use crate::modules::iam::repo::MockIamRepo;
 use crate::modules::iam::service::AccountService;
 use crate::modules::iam::service::SessionService;
 use crate::shared::error::{AppError, code};
@@ -94,7 +94,7 @@ async fn login_returns_token_pair_for_valid_manager() {
 
     let (svc, _state) = build(account, arc_session(session));
     let resp = svc
-        .login(&mut repo, crate::modules::iam::dto::LoginRequest {
+        .login(repo, crate::modules::iam::dto::LoginRequest {
             username: "alice".into(),
             password: "p".into(),
         })
@@ -130,7 +130,7 @@ async fn login_returns_token_pair_for_valid_shelf_account() {
         .returning(|_, _, _, _, _| Ok(()));
     let (svc, _state) = build(account, arc_session(session));
     let pending = svc
-        .login(&mut repo, crate::modules::iam::dto::LoginRequest {
+        .login(repo, crate::modules::iam::dto::LoginRequest {
             username: "shelf_user".into(),
             password: "p".into(),
         })
@@ -161,7 +161,7 @@ async fn login_returns_token_pair_for_wildcard_shelf_account() {
         .returning(|_, _, _, _, _| Ok(()));
     let (svc, _state) = build(account, arc_session(session));
     let pending = svc
-        .login(&mut repo, crate::modules::iam::dto::LoginRequest {
+        .login(repo, crate::modules::iam::dto::LoginRequest {
             username: "shelf_user".into(),
             password: "p".into(),
         })
@@ -180,7 +180,7 @@ async fn login_rejects_unknown_username_as_biz_auth_invalid() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .login(&mut repo, crate::modules::iam::dto::LoginRequest {
+        .login(repo, crate::modules::iam::dto::LoginRequest {
             username: "ghost".into(),
             password: "any".into(),
         })
@@ -200,7 +200,7 @@ async fn login_rejects_wrong_password_as_biz_auth_invalid() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .login(&mut repo, crate::modules::iam::dto::LoginRequest {
+        .login(repo, crate::modules::iam::dto::LoginRequest {
             username: "alice".into(),
             password: "wrong".into(),
         })
@@ -221,7 +221,7 @@ async fn login_rejects_inactive_user_as_biz_auth_invalid() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .login(&mut repo, crate::modules::iam::dto::LoginRequest {
+        .login(repo, crate::modules::iam::dto::LoginRequest {
             username: "alice".into(),
             password: "p".into(),
         })
@@ -243,7 +243,7 @@ async fn login_rejects_user_with_no_roles_as_no_role() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .login(&mut repo, crate::modules::iam::dto::LoginRequest {
+        .login(repo, crate::modules::iam::dto::LoginRequest {
             username: "alice".into(),
             password: "p".into(),
         })
@@ -274,7 +274,7 @@ async fn login_includes_active_shelf_for_shelf_account() {
         .returning(|_, _, _, _, _| Ok(()));
     let (svc, _state) = build(account, arc_session(session));
     let pending = svc
-        .login(&mut repo, crate::modules::iam::dto::LoginRequest {
+        .login(repo, crate::modules::iam::dto::LoginRequest {
             username: "shelf_user".into(),
             password: "p".into(),
         })
@@ -306,7 +306,7 @@ async fn login_excludes_inactive_shelf_for_shelf_account() {
         .returning(|_, _, _, _, _| Ok(()));
     let (svc, _state) = build(account, arc_session(session));
     let pending = svc
-        .login(&mut repo, crate::modules::iam::dto::LoginRequest {
+        .login(repo, crate::modules::iam::dto::LoginRequest {
             username: "shelf_user".into(),
             password: "p".into(),
         })
@@ -363,7 +363,7 @@ async fn refresh_rotates_tokens_after_validating_version() {
         .returning(|_, _, _, _, _| Ok(()));
     let (svc, _state) = build(account, arc_session(session));
     let pending = svc
-        .refresh(&mut repo, crate::modules::iam::dto::RefreshRequest {
+        .refresh(repo, crate::modules::iam::dto::RefreshRequest {
             refresh_token: refresh_token.clone(),
         })
         .await
@@ -377,11 +377,11 @@ async fn refresh_rotates_tokens_after_validating_version() {
 async fn refresh_rejects_undecodable_token_as_refresh_invalid() {
     // decode_refresh 在 `repo` 借进来**之前**就拒了（service 拿不到 repo）。
     let account = make_account();
-    let mut repo = MockIamRepo::new();
+    let repo = MockIamRepo::new();
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .refresh(&mut repo, crate::modules::iam::dto::RefreshRequest {
+        .refresh(repo, crate::modules::iam::dto::RefreshRequest {
             refresh_token: "not-a-valid-jwt".into(),
         })
         .await
@@ -402,7 +402,7 @@ async fn refresh_rejects_version_mismatch_as_refresh_invalid() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .refresh(&mut repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
+        .refresh(repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
         .await
         .expect_err("expected error");
     assert_eq!(err.code(), code::REFRESH_INVALID);
@@ -418,7 +418,7 @@ async fn refresh_rejects_unknown_user_as_refresh_invalid() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .refresh(&mut repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
+        .refresh(repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
         .await
         .expect_err("expected error");
     assert_eq!(err.code(), code::REFRESH_INVALID);
@@ -437,7 +437,7 @@ async fn refresh_rejects_inactive_user_as_refresh_invalid() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .refresh(&mut repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
+        .refresh(repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
         .await
         .expect_err("expected error");
     assert_eq!(err.code(), code::REFRESH_INVALID);
@@ -457,7 +457,7 @@ async fn refresh_rejects_user_with_no_roles_as_no_role() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .refresh(&mut repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
+        .refresh(repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
         .await
         .expect_err("expected error");
     assert_eq!(err.code(), code::NO_ROLE);
@@ -482,7 +482,7 @@ async fn refresh_returns_version_conflict_when_increment_returns_zero() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .refresh(&mut repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
+        .refresh(repo, crate::modules::iam::dto::RefreshRequest { refresh_token })
         .await
         .expect_err("expected error");
     assert_eq!(err.code(), code::VERSION_CONFLICT);
@@ -506,7 +506,7 @@ async fn me_returns_fresh_user_view_for_manager() {
         .returning(|_| Ok(vec![sample_menu(1, "dashboard", "Dashboard")]));
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
-    let out = svc.me(&mut repo, &manager_current()).await.expect("ok");
+    let out = svc.me(repo, &manager_current()).await.expect("ok");
     assert_eq!(out.username, "alice");
     assert_eq!(out.roles, vec!["MANAGER".to_string()]);
 }
@@ -534,7 +534,7 @@ async fn me_returns_fresh_user_view_for_shelf_account() {
         shelf_ids: vec![10],
         shelf_wildcard: false,
     };
-    let out = svc.me(&mut repo, &current).await.expect("ok");
+    let out = svc.me(repo, &current).await.expect("ok");
     assert_eq!(out.shelf_ids, vec!["10".to_string()]);
 }
 
@@ -547,7 +547,7 @@ async fn me_returns_unauthorized_when_user_not_found() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .me(&mut repo, &manager_current())
+        .me(repo, &manager_current())
         .await
         .expect_err("expected error");
     assert_eq!(err.code(), code::UNAUTHORIZED);
@@ -565,7 +565,7 @@ async fn me_returns_unauthorized_when_user_inactive() {
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
     let err = svc
-        .me(&mut repo, &manager_current())
+        .me(repo, &manager_current())
         .await
         .expect_err("expected error");
     assert_eq!(err.code(), code::UNAUTHORIZED);
@@ -586,7 +586,7 @@ async fn me_reflects_role_changes_after_token_issued() {
         .returning(|_| Ok(vec![sample_menu(1, "dashboard", "Dashboard")]));
     let session = MockSessionStore::new();
     let (svc, _state) = build(account, arc_session(session));
-    let out = svc.me(&mut repo, &manager_current()).await.expect("ok");
+    let out = svc.me(repo, &manager_current()).await.expect("ok");
     assert_eq!(out.roles, vec!["CLERK".to_string()]);
 }
 
@@ -611,7 +611,7 @@ async fn change_password_delegates_to_account_service_for_self() {
     let (svc, _state) = build(account.clone(), arc_session(session));
     let current = manager_current();
     svc.change_password(
-        &mut account_repo,
+        account_repo,
         42,
         ChangePasswordRequest {
             old_password: "old".into(),
@@ -640,7 +640,7 @@ async fn change_password_delegates_to_account_service_for_manager_changing_other
     let (svc, _state) = build(account.clone(), arc_session(session));
     let current = manager_current();
     svc.change_password(
-        &mut account_repo,
+        account_repo,
         99,
         ChangePasswordRequest {
             old_password: "old".into(),
@@ -656,13 +656,13 @@ async fn change_password_delegates_to_account_service_for_manager_changing_other
 async fn change_password_rejects_non_self_non_manager_as_forbidden() {
     // account_service 不应被调（permission 在 session 端挡）。
     let account = make_account();
-    let mut account_repo = MockIamRepo::new(); // 无 expect → 任何调用都会 panic
+    let account_repo = MockIamRepo::new(); // 无 expect → 任何调用都会 panic
     let session = MockSessionStore::new();
     let (svc, _state) = build(account.clone(), arc_session(session));
     let current = clerk_current(); // id=99, CLERK
     let err = svc
         .change_password(
-            &mut account_repo,
+            account_repo,
             42,
             ChangePasswordRequest {
                 old_password: "old".into(),
@@ -690,7 +690,7 @@ async fn change_password_propagates_account_service_old_password_mismatch() {
     let current = manager_current();
     let err = svc
         .change_password(
-            &mut account_repo,
+            account_repo,
             42,
             ChangePasswordRequest {
                 old_password: "wrong".into(),
@@ -706,13 +706,13 @@ async fn change_password_propagates_account_service_old_password_mismatch() {
 #[tokio::test]
 async fn change_password_propagates_account_service_validation_error() {
     let account = make_account();
-    let mut account_repo = MockIamRepo::new();
+    let account_repo = MockIamRepo::new();
     let session = MockSessionStore::new();
     let (svc, _state) = build(account.clone(), arc_session(session));
     let current = manager_current();
     let err = svc
         .change_password(
-            &mut account_repo,
+            account_repo,
             42,
             ChangePasswordRequest {
                 old_password: "old".into(),
@@ -790,10 +790,3 @@ use std::sync::Mutex as StdMutex;
 
 /// refresh happy 用例：get_by_id 需返回两次不同结果（v0 → v1）。单线程测试用全局计数器 toggle。
 static GET_BY_ID_COUNT: StdMutex<u32> = StdMutex::new(0);
-
-// 抑制「未使用」警告
-#[allow(dead_code)]
-fn _unused_anchor(u: &User, r: &dyn IamRepo) {
-    let _ = u;
-    let _ = r;
-}

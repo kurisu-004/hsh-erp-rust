@@ -28,10 +28,11 @@ use common::{ensure_database_exists, test_pool};
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 // 2026-09-19 IAM 域合并：原 `user::repo` 重定向到 `iam::repo`。
-// 2026-09-21 事务分层重构：`iam::uow` 删除；如需 PG 借连接，借 `iam::repo::PgIamRepo`。
-// `IamRepo` trait 必导入——`PgIamRepo` 实现的方法来自 trait，必须 in scope 才能调用。
+// 2026-09-22 删 `PgIamRepo` 转发壳：组合事务（跨多 repo 写）改为直调
+// `sql::UserRepo::xxx(&mut *tx, ...)` / `sql::UserRoleRepo::xxx(&mut *tx, ...)`，
+// 与 handler 层 `state.pool.begin()` + `&mut *tx` 路径同构。
 use hsh_erp_rust::modules::iam::repo::{
-    IamRepo, MenuRepo, PgIamRepo, ShelfRepo, UserInsert, UserRepo, UserRoleInsert, UserRoleRepo,
+    MenuRepo, ShelfRepo, UserInsert, UserRepo, UserRoleInsert, UserRoleRepo,
 };
 
 // ===========================================================================
@@ -917,23 +918,22 @@ async fn shelf_get_by_id_returns_none_for_missing() {
 }
 
 // ===========================================================================
-// 多表组合事务 (2 例)：经 PgIamRepo + pool.begin() 开 tx，跨多 repo 写，最后 commit。
-// 与 handler 层 `state.pool.begin()` + `PgIamRepo::new(&mut tx)` 路径同构（2026-09-21
-// 事务分层重构后的事务边界）。
+// 多表组合事务 (2 例)：直调 `sql::UserRepo::xxx(&mut *tx, ...)` + `pool.begin()` 开 tx，
+// 跨多 repo 写，最后 commit。与 handler 层 `state.pool.begin()` + `&mut *tx` 路径同构
+// （2026-09-22 删 `PgIamRepo` 转发壳后的事务边界）。
 // ===========================================================================
 
-/// `PgIamRepo` + 手写 begin/commit：commit 后写入对外可见
+/// 手写 begin/commit：commit 后写入对外可见
 #[tokio::test]
 #[allow(clippy::explicit_auto_deref)] // `&mut *tx` 是 sqlx 借 `&mut PgConnection` 的标准模式
 async fn create_user_then_add_role_then_list_persists_all() {
     let pool = setup().await;
 
     let mut tx = pool.begin().await.expect("begin");
-    let mut repo = PgIamRepo::new(&mut *tx);
 
     // 写 user
     let uid = snowflake().lock().unwrap().next_id();
-    repo.create(&UserInsert {
+    UserRepo::create(&mut *tx, &UserInsert {
         id: uid,
         username: "atomic-user".to_string(),
         password_hash: "h".to_string(),
@@ -948,7 +948,7 @@ async fn create_user_then_add_role_then_list_persists_all() {
 
     // 写 role
     let rid = snowflake().lock().unwrap().next_id();
-    repo.role_create(&UserRoleInsert {
+    UserRoleRepo::create(&mut *tx, &UserRoleInsert {
         id: rid,
         user_id: uid,
         role: "MANAGER".to_string(),
@@ -973,7 +973,7 @@ async fn create_user_then_add_role_then_list_persists_all() {
     assert_eq!(rows[0].role, "MANAGER");
 }
 
-/// `PgIamRepo` + 手写 begin/commit：commit 后 user 软删生效（list_by_user 只看 role.deleted_at）
+/// 手写 begin/commit：commit 后 user 软删生效（list_by_user 只看 role.deleted_at）
 #[tokio::test]
 #[allow(clippy::explicit_auto_deref)]
 async fn soft_delete_user_then_list_roles_returns_empty() {
@@ -985,8 +985,7 @@ async fn soft_delete_user_then_list_roles_returns_empty() {
 
     let mut tx = pool.begin().await.expect("begin");
     {
-        let mut repo = PgIamRepo::new(&mut *tx);
-        repo.soft_delete(uid, 0, now_naive(), None)
+        UserRepo::soft_delete(&mut *tx, uid, 0, now_naive(), None)
             .await
             .expect("soft delete");
     }
@@ -1014,9 +1013,8 @@ async fn transaction_commit_persists_writes() {
     let pool = setup().await;
 
     let mut tx = pool.begin().await.expect("begin");
-    let mut repo = PgIamRepo::new(&mut *tx);
     let uid = snowflake().lock().unwrap().next_id();
-    repo.create(&UserInsert {
+    UserRepo::create(&mut *tx, &UserInsert {
         id: uid,
         username: "committed".to_string(),
         password_hash: "h".to_string(),
@@ -1045,9 +1043,8 @@ async fn transaction_drop_without_commit_rolls_back() {
     let pool = setup().await;
 
     let mut tx = pool.begin().await.expect("begin");
-    let mut repo = PgIamRepo::new(&mut *tx);
     let uid = snowflake().lock().unwrap().next_id();
-    repo.create(&UserInsert {
+    UserRepo::create(&mut *tx, &UserInsert {
         id: uid,
         username: "rolledback".to_string(),
         password_hash: "h".to_string(),
