@@ -44,7 +44,11 @@ use crate::state::AppState;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
 use crate::modules::outsource::service::OutsourceService;
+use crate::modules::prod::process::service::ProcessService;
 use crate::modules::prod::process_chain::service::crud::ProcessChainService;
+use crate::modules::prod::work_type::process_mapping::WorkTypeProcessService;
+use crate::modules::prod::work_type::service::WorkTypeService;
+use crate::modules::prod::worker::service::WorkerService;
 
 #[cfg(test)]
 mod session_tests;
@@ -165,6 +169,10 @@ process_chain_service: Arc::new(ProcessChainService::new(snowflake.clone())),
                 Arc::new(NoopCos),
             ),
         ),
+        worker_service: Arc::new(WorkerService::new(snowflake.clone())),
+        work_type_service: Arc::new(WorkTypeService::new(snowflake.clone())),
+        work_type_process_service: Arc::new(WorkTypeProcessService),
+        process_service: Arc::new(ProcessService::new(snowflake.clone())),
     })
 }
 

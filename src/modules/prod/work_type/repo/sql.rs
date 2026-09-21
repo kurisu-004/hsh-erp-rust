@@ -1,4 +1,4 @@
-//! work_type 域数据访问
+//! work_type 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
 //!
 //! 对应 Python myERP/repository/work_type_repository.py。函数签名接收 `impl PgExecutor<'_>`，
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
@@ -14,12 +14,17 @@
 //! - 全部使用 `sqlx::query!` / `query_as!` 编译期宏（需 `DATABASE_URL` 或 `.sqlx/` 离线元数据）
 //! - 读查询一律带 `deleted_at IS NULL`（软删）
 //! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
+//!
+//! ## 2026-09-22 重构（D-2-simple）
+//! 原 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff，
+//! `.sqlx/query-*.json` 哈希不变；新增的 `WorkTypeRepoTrait` 胖 trait 在 `repo/mod.rs`。
+//! trait 已直接 `impl for &mut PgConnection`（与 iam 2026-09-22 同步，零转发壳）。
 
 use sqlx::{PgExecutor, QueryBuilder};
 
 use crate::shared::error::AppError;
 
-use super::model::TWorkType;
+use super::super::model::TWorkType;
 
 pub struct WorkTypeRepo;
 
@@ -305,6 +310,11 @@ impl WorkTypeRepo {
     ///  ORDER BY wt.sort_order ASC, wt.id ASC
     ///
     /// 返回元组，service 层负责构造 DTO。
+    ///
+    /// 注：本方法保留 `Result<_, AppError>` 返回类型（与原 `repo.rs` 一致），原因是
+    /// 跨模块静态调用方 `prod::worker_pool::service` 直接走 ZST 静态方法 +
+    /// `AppError` 自动 `?`，不能破坏其调用形态。
+    /// 胖 trait `WorkTypeRepoTrait` 也对应返回 `AppError`（见 `repo/mod.rs`）。
     pub async fn list_work_types_by_process_id<'e, E: PgExecutor<'e>>(
         executor: E,
         process_id: i64,
