@@ -1,9 +1,13 @@
-//! shelf 域数据访问
+//! shelf 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
 //!
-//! 对应 Python myERP/repository/shelf_repository.py。函数签名接收
-//! `impl PgExecutor<'_>`（除非要复用同一事务内的多次调用 —— 那种情况收
-//! `&mut PgConnection`），兼容 `&PgPool` / `&mut PgConnection` /
-//! `&mut Transaction`。
+//! 对应 Python myERP/repository/shelf_repository.py。函数签名接收 `impl PgExecutor<'_>`，
+//! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
+//!
+//! ## 约定
+//! - 全部使用 `sqlx::query!` / `query_as!` 编译期宏（需 `DATABASE_URL` 或 `.sqlx/` 离线元数据）
+//! - 读查询一律带 `deleted_at IS NULL`（软删）
+//! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
+//! - `list_active_production_ordered` 通过 LEFT JOIN `t_part_batch` 聚合 current_load
 //!
 //! ## Phase P3+ shelf CRUD 暴露给 service 的能力
 //! - 读：`get_active_by_id` / `get_by_id` / `get_by_id_zone`
@@ -13,22 +17,46 @@
 //! - 引用计数：`count_in_use_parts`（deactivate 前查 t_part_batch.current_holder_id
 //!   + location + status 三维核对，PR-2 真相源迁移后已不再读 t_part）
 //!
-//! ## 约定
-//! - 全部使用 `sqlx::query!` / `query_as!` 编译期宏（需 `DATABASE_URL` 或 `.sqlx/` 离线元数据）
-//! - 读查询一律带 `deleted_at IS NULL`（软删）
-//! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
-//! - `list_active_production_ordered` 通过 LEFT JOIN `t_part_batch` 聚合 current_load
+//! 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff，
+//! `.sqlx/query-*.json` 哈希不变；新增的 `ShelfRepo` 胖 trait 在 `repo/mod.rs`。
+//! 胖 trait 含 t_shelf + t_shelf_process 全部方法（决策方案 A），t_shelf_process 的 SQL
+//! 真源放在同级 `crate::modules::shelf::process_mapping::sql::ShelfProcessRepo`。
 
-use sqlx::{PgConnection, PgExecutor, QueryBuilder};
+use sqlx::{PgExecutor, QueryBuilder};
 
-use super::model::TShelf;
+use crate::modules::shelf::model::TShelf;
+
+/// `TShelf` + 聚合 `current_load`（来自 t_part_batch LEFT JOIN）。
+///
+/// 用于 `list_active_production_ordered`（picker for-return）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TShelfWithLoad {
+    pub id: i64,
+    pub code: String,
+    pub name: String,
+    pub zone: String,
+    pub location: Option<String>,
+    pub is_active: bool,
+    pub display_order: i32,
+    pub version: i32,
+    pub created_at: chrono::NaiveDateTime,
+    pub created_by: Option<i64>,
+    pub updated_at: chrono::NaiveDateTime,
+    pub updated_by: Option<i64>,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+    pub current_load: i64,
+}
+
+// ---------------------------------------------------------------------------
+// ShelfRepo（t_shelf，8 方法）
+// ---------------------------------------------------------------------------
 
 pub struct ShelfRepo;
 
 impl ShelfRepo {
     /// 按 id 查 active 货架（is_active=true, deleted_at IS NULL）。用于 INSPECTION/PRODUCTION 区校验。
-    pub async fn get_active_by_id(
-        conn: &mut PgConnection,
+    pub async fn get_active_by_id<'e, E: PgExecutor<'e>>(
+        executor: E,
         id: i64,
     ) -> Result<Option<TShelf>, sqlx::Error> {
         sqlx::query_as!(
@@ -41,13 +69,13 @@ impl ShelfRepo {
             "#,
             id,
         )
-        .fetch_optional(&mut *conn)
+        .fetch_optional(executor)
         .await
     }
 
     /// 按 id 查（不强制 is_active；用于 service 层区分 20501 NOT_FOUND vs 20512 INACTIVE）。
-    pub async fn get_by_id(
-        conn: &mut PgConnection,
+    pub async fn get_by_id<'e, E: PgExecutor<'e>>(
+        executor: E,
         id: i64,
     ) -> Result<Option<TShelf>, sqlx::Error> {
         sqlx::query_as!(
@@ -60,14 +88,14 @@ impl ShelfRepo {
             "#,
             id,
         )
-        .fetch_optional(&mut *conn)
+        .fetch_optional(executor)
         .await
     }
 
     /// 按 id + zone 双键查（worker-pool 投放 / 看板用）。
     /// 命中失败 → worker 把 batch 投到不属于自己的区，service 层应拒绝。
-    pub async fn get_by_id_zone(
-        conn: &mut PgConnection,
+    pub async fn get_by_id_zone<'e, E: PgExecutor<'e>>(
+        executor: E,
         id: i64,
         zone: &str,
     ) -> Result<Option<TShelf>, sqlx::Error> {
@@ -82,7 +110,7 @@ impl ShelfRepo {
             id,
             zone,
         )
-        .fetch_optional(&mut *conn)
+        .fetch_optional(executor)
         .await
     }
 
@@ -360,25 +388,4 @@ impl ShelfRepo {
         .await?;
         Ok(rows)
     }
-}
-
-/// `TShelf` + 聚合 `current_load`（来自 t_part_batch LEFT JOIN）。
-///
-/// 用于 `list_active_production_ordered`（picker for-return）。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct TShelfWithLoad {
-    pub id: i64,
-    pub code: String,
-    pub name: String,
-    pub zone: String,
-    pub location: Option<String>,
-    pub is_active: bool,
-    pub display_order: i32,
-    pub version: i32,
-    pub created_at: chrono::NaiveDateTime,
-    pub created_by: Option<i64>,
-    pub updated_at: chrono::NaiveDateTime,
-    pub updated_by: Option<i64>,
-    pub deleted_at: Option<chrono::NaiveDateTime>,
-    pub current_load: i64,
 }

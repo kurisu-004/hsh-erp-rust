@@ -14,16 +14,23 @@
 //!
 //! ## mapping 端点
 //! 见 `crate::modules::shelf::process_mapping`（per-shelf set/list）。
-
-use sqlx::PgConnection;
+//!
+//! ## 事务边界（2026-09-22 重构对齐 iam 范本）
+//! 事务移交 handler（与 20 个 handler 文件现状对齐）：service 仅业务逻辑，所有
+//! 跨 repo 操作经 `repo: R`（by-value；`R: ShelfRepo`）参数传入——handler/service
+//! 借 `&mut *tx` / `&mut *conn` 喂给 `ShelfRepo` trait（trait 已直接
+//! `impl for &mut PgConnection`）。service 不知事务——handler `pool.begin()` +
+//! `tx.commit()` 包外。
+//!
+//! `ShelfService` 是 unit struct（无字段依赖，iam 范本 §6）；方法签名
+//! `<R: ShelfRepoTrait>(&self, mut repo: R, ...)`，生产 `R = &mut PgConnection`。
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::*;
 use super::super::model::TShelf;
-use super::super::repo::ShelfRepo;
+use super::super::repo::ShelfRepoTrait;
 use super::{DEFAULT_LIMIT, MAX_LIMIT, ZONE_INSPECTION, ZONE_PRODUCTION};
 
 fn shelf_not_found() -> AppError {
@@ -71,8 +78,9 @@ impl ShelfService {
     // 列表 / 详情
     // =======================================================================
 
-    pub async fn list_shelves(
-        conn: &mut PgConnection,
+    pub async fn list_shelves<R: ShelfRepoTrait>(
+        &self,
+        mut repo: R,
         query: &ShelfListQuery,
         current: &CurrentUser,
     ) -> Result<ShelfListOut, AppError> {
@@ -97,21 +105,16 @@ impl ShelfService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let items = ShelfRepo::list_with_filters(
-            &mut *conn,
-            code_like,
-            zone,
-            query.is_active,
-            limit,
-            offset,
-        )
-        .await?;
-        let total =
-            ShelfRepo::count_with_filters(&mut *conn, code_like, zone, query.is_active).await?;
+        let items = repo
+            .list_with_filters(code_like, zone, query.is_active, limit, offset)
+            .await?;
+        let total = repo
+            .count_with_filters(code_like, zone, query.is_active)
+            .await?;
 
         // account_count 单条 GROUP BY 批量算（防 N+1）
         let ids: Vec<i64> = items.iter().map(|s| s.id).collect();
-        let account_rows = ShelfRepo::count_accounts_by_shelf(&mut *conn, &ids).await?;
+        let account_rows = repo.count_accounts_by_shelf(&ids).await?;
         let account_map: std::collections::HashMap<i64, i64> = account_rows.into_iter().collect();
 
         let out_items = items
@@ -130,8 +133,9 @@ impl ShelfService {
         })
     }
 
-    pub async fn get_shelf(
-        conn: &mut PgConnection,
+    pub async fn get_shelf<R: ShelfRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         current: &CurrentUser,
     ) -> Result<ShelfOut, AppError> {
@@ -143,7 +147,8 @@ impl ShelfService {
             Role::Inspector,
         ])?;
 
-        let s = ShelfRepo::get_by_id(&mut *conn, id)
+        let s = repo
+            .get_by_id(id)
             .await?
             .ok_or_else(shelf_not_found)?;
 
@@ -162,9 +167,10 @@ impl ShelfService {
     // 创建 / 更新 / 软删（deactivate）
     // =======================================================================
 
-    pub async fn create_shelf(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn create_shelf<R: ShelfRepoTrait>(
+        &self,
+        mut repo: R,
+        snowflake: &crate::infra::snowflake::SnowflakeIdGenerator,
         req: &ShelfCreateRequest,
         current: &CurrentUser,
     ) -> Result<ShelfOut, AppError> {
@@ -187,40 +193,34 @@ impl ShelfService {
         let display_order = req.display_order.unwrap_or(0);
 
         let id = snowflake.next_id();
-        let s = ShelfRepo::create(
-            &mut *conn,
-            id,
-            code,
-            name,
-            &zone,
-            location,
-            display_order,
-            current.id,
-        )
-        .await
-        .map_err(
-            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                // uk_t_shelf_code：活跃行唯一
-                Some("23505") => AppError::biz(
-                    code::BIZ_SHELF_DUPLICATE_CODE,
-                    format!("code '{code}' 已被占用"),
-                ),
-                _ => AppError::from(e),
-            },
-        )?;
+        let s = repo
+            .create(id, code, name, &zone, location, display_order, current.id)
+            .await
+            .map_err(
+                |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                    // uk_t_shelf_code：活跃行唯一
+                    Some("23505") => AppError::biz(
+                        code::BIZ_SHELF_DUPLICATE_CODE,
+                        format!("code '{code}' 已被占用"),
+                    ),
+                    _ => AppError::from(e),
+                },
+            )?;
 
         Ok(to_shelf_out(s, 0))
     }
 
-    pub async fn update_shelf(
-        conn: &mut PgConnection,
+    pub async fn update_shelf<R: ShelfRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         req: &ShelfUpdateRequest,
         current: &CurrentUser,
     ) -> Result<ShelfOut, AppError> {
         current.require_role(Role::Manager)?;
 
-        let current_shelf = ShelfRepo::get_by_id(&mut *conn, id)
+        let current_shelf = repo
+            .get_by_id(id)
             .await?
             .ok_or_else(shelf_not_found)?;
 
@@ -248,49 +248,51 @@ impl ShelfService {
             }
         };
 
-        let affected = ShelfRepo::update(
-            &mut *conn,
-            id,
-            current_shelf.version,
-            name_update,
-            loc_update,
-            req.display_order,
-            current.id,
-        )
-        .await
-        .map_err(
-            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                // zone CHECK（理论 service 已 catch）
-                Some("23514") => AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    "zone 必须是 PRODUCTION 或 INSPECTION",
-                ),
-                _ => AppError::from(e),
-            },
-        )?;
+        let affected = repo
+            .update(
+                id,
+                current_shelf.version,
+                name_update,
+                loc_update,
+                req.display_order,
+                current.id,
+            )
+            .await
+            .map_err(
+                |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                    // zone CHECK（理论 service 已 catch）
+                    Some("23514") => AppError::biz(
+                        code::BIZ_INVALID_VALUE,
+                        "zone 必须是 PRODUCTION 或 INSPECTION",
+                    ),
+                    _ => AppError::from(e),
+                },
+            )?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
         // 回读最新行
-        Self::get_shelf(conn, id, current).await
+        self.get_shelf(repo, id, current).await
     }
 
     /// 软删 + 停用（`is_active = false` 同时 `deleted_at = now()`）。
     /// 软删前查 `t_part.current_holder_id = shelf_id` 且
     /// `status IN ('IN_PROCESS','INSPECTION','REPAIRING')` 引用，>0 ⇒ 20503 拒。
-    pub async fn soft_delete_shelf(
-        conn: &mut PgConnection,
+    pub async fn soft_delete_shelf<R: ShelfRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
 
-        let shelf = ShelfRepo::get_by_id(&mut *conn, id)
+        let shelf = repo
+            .get_by_id(id)
             .await?
             .ok_or_else(shelf_not_found)?;
 
-        let in_use = ShelfRepo::count_in_use_parts(&mut *conn, id).await?;
+        let in_use = repo.count_in_use_parts(id).await?;
         if in_use > 0 {
             return Err(AppError::biz(
                 code::BIZ_SHELF_IN_USE,
@@ -301,7 +303,7 @@ impl ShelfService {
             ));
         }
 
-        let affected = ShelfRepo::soft_delete(&mut *conn, id, shelf.version, current.id).await?;
+        let affected = repo.soft_delete(id, shelf.version, current.id).await?;
         if affected == 0 {
             return Err(version_conflict());
         }

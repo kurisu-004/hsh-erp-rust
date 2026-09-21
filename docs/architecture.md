@@ -157,24 +157,32 @@ hsh-erp-rust/
 
 ### 3.1 事务边界在 handler
 
+> 📌 **2026-09-22 范本升级**：本节精简版（伪代码骨架 + 3 形态清单）。完整 6 条编号模板见 [`docs/conventions.md` §3.1](conventions.md#31-事务与-repo-范式6-条编号清单可复用模板)。落地正典：iam 域（2026-09-21 完成）+ shelf 域（2026-09-22 完成，详见 conventions.md 附录 A）。
+
 ```rust
-// handler.rs 伪代码
+// handler.rs 伪代码（2026-09-22 范本）
 async fn create_part(
     State(state): State<Arc<AppState>>,
     user: CurrentUser,
     Json(req): Json<CreatePartReq>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     user.require_role(Role::Manager)?;
-    let mut tx = state.pool.begin().await?;        // ← tx 起点
-    let part = PartService::create(&mut tx, req, &user).await?;
+    let mut tx = state.pool.begin().await?;        // ← tx 起点（写端点形态 ①）
+    let part = PartService::create(&mut *tx, req, &user).await?;  // ← 借 &mut *tx 喂 trait
     tx.commit().await?;                            // ← 显式 commit
     Ok(Json(R::ok(PartOut::from(part))))
 }
 ```
 
-- Service 方法签名：`&mut PgConnection`（不是 `&mut Transaction`——`&mut Transaction` 自动 deref 到 `&mut PgConnection`，传递更灵活）。
+- Service 方法签名：`<R: XxxRepo>(&self, mut repo: R, ...)`（by-value；胖 trait `XxxRepo` 已直接 `impl for &mut PgConnection`），service 不知事务。
 - Repository 函数签名：`impl PgExecutor<'_>`——同时接受 `&PgPool` / `&mut PgConnection` / `&mut Transaction`，由调用方决定。
 - 失败时 `tx` Drop 自动回滚，无需显式 `tx.rollback()`。
+
+**handler 三形态**（与 conventions.md §3.1 一致）：
+
+- ① **纯写**：`pool.begin() → service → tx.commit()`
+- ② **写 + post-commit 副作用**（Redis session / WS broadcast / COS spawn）：① + commit 后做
+- ③ **读**：`pool.acquire()` 不开事务
 
 ### 3.2 统一响应信封
 
@@ -203,10 +211,13 @@ handler 返回 `Result<Json<R<T>>, AppError>`：
 
 ### 3.4 DI 与权限
 
+> 📌 **2026-09-22 范本升级**：本节精简版（DI 字段清单 + 角色守卫）。完整 6 条模板（特别是胖 trait + `impl for &mut PgConnection` 的 by-value `repo: R` 模式）见 [`docs/conventions.md` §3.1](conventions.md#31-事务与-repo-范式6-条编号清单可复用模板)。
+
 - `Arc<AppState>` 作为 axum Router 的 state，含 `pool / config / snowflake / ws_hub / cos / session / shutdown` 七个字段。
 - `CurrentUser` 实现 `FromRequestParts<Arc<AppState>>`：从 `Authorization` 头解析 Bearer JWT → 解码 Claims → 当 `REDIS_SESSION_CHECK_ENABLED=true`（默认）时用 sha256(token) 查 Redis（`session:tok:<hash>`）→ 用 `CachedCurrentUser` 构造 CurrentUser → EXPIRE 续期。查不到返回 40105 SESSION_REVOKED。当该开关关闭时跳过整段 Redis 查询，直接从 Claims 构造 CurrentUser——适用于借 Python 后端 JWT 的迁移过渡期（详见 `.env.example` 与 `docs/api/auth.md`）。
 - `AuthTokenHash`（同 impl）给需要原始 token 哈希的端点（如 logout）使用。
 - **角色守卫**：服务层调用 `user.require_role(Role::Manager)?`（Command 守卫）。
+- **服务层 DI 模式（2026-09-22 范本）**：service 字段仅持轻量依赖（雪花 ID 生成器 / 配置 / session store / 跨域 service 委托），**不持 pool / tx / repo**。service 方法签名 `<R: XxxRepo>(&self, mut repo: R, ...)`——胖 trait 已直接 `impl for &mut PgConnection`，handler 借 `&mut *tx` / `&mut *conn` 喂给 trait 即可。完整说明 + 落地示例（shelf 域）见 conventions.md §3.1。
 
 ```rust
 // usage

@@ -15,16 +15,21 @@
 //! - 其他：按 user.shelf_ids 过滤（等价于「else」分支）
 //!
 //! 对 `list_all_process_mappings` 同理改造。
-
-use sqlx::PgConnection;
+//!
+//! ## 跨域 `process_id` 校验
+//! `list_for_return` 校验 `next_process_id` 存在通过 trait helper
+//! `repo.proc_check_process_exists`（impl 一行委托到 prod `ProcessRepo::get_by_id`），
+//! 避免 service 收第二个 conn 参数。
+//!
+//! ## 事务边界（2026-09-22 重构对齐 iam 范本）
+//! 事务移交 handler；service 方法签名 `<R: ShelfRepoTrait>(&self, mut repo: R, ...)`，
+//! 生产 `R = &mut PgConnection`。
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::prod::process::repo::ProcessRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::*;
-use super::super::process_mapping::ShelfProcessRepo;
-use super::super::repo::{ShelfRepo, TShelfWithLoad};
+use super::super::repo::{ShelfRepoTrait, TShelfWithLoad};
 use super::{MAX_LIMIT, ZONE_INSPECTION};
 
 impl super::crud::ShelfService {
@@ -39,8 +44,9 @@ impl super::crud::ShelfService {
     /// `next_process_id` 仅占位校验：service 校验 process 存在即可（不强制该货架
     /// 必映射此 process —— picker 前端会把 next_process_id 与候选 shelf 一并
     /// 提交给 worker-scan，由 worker-scan 在后端强校验）。
-    pub async fn list_for_return(
-        conn: &mut PgConnection,
+    pub async fn list_for_return<R: ShelfRepoTrait>(
+        &self,
+        mut repo: R,
         query: &ShelfForReturnQuery,
         current: &CurrentUser,
     ) -> Result<ShelfForReturnOut, AppError> {
@@ -51,7 +57,7 @@ impl super::crud::ShelfService {
             Role::CncProgrammer,
         ])?;
 
-        // 校验 next_process_id 存在（若有）
+        // 校验 next_process_id 存在（若有；走 trait helper 跨域查 prod ProcessRepo）
         let next_pid_opt = match query.next_process_id.as_deref().map(str::trim) {
             Some(s) if !s.is_empty() => {
                 let pid = s.parse::<i64>().map_err(|_| {
@@ -60,9 +66,10 @@ impl super::crud::ShelfService {
                         "next_process_id 必须为雪花 ID 字符串",
                     )
                 })?;
-                if ProcessRepo::get_by_id(&mut *conn, pid, false)
-                    .await?
-                    .is_none()
+                if !repo
+                    .proc_check_process_exists(pid)
+                    .await
+                    .map_err(AppError::from)?
                 {
                     return Err(AppError::biz(
                         code::BIZ_PROCESS_NOT_FOUND,
@@ -80,7 +87,7 @@ impl super::crud::ShelfService {
         // 「if manager/wildcard 则全集 else 按 shelf_ids 过滤」分支，但代码更短。
         // 策略：拉全集 → 过滤 → 按 current_load 排序（统一一次拉取，避免 ORDER BY
         // 在 PG 与 filter 在 app 不同步；量小，几十条以内）。
-        let all = ShelfRepo::list_active_production_ordered(&mut *conn).await?;
+        let all = repo.list_active_production_ordered().await?;
         let scoped: Vec<TShelfWithLoad> = all
             .into_iter()
             .filter(|s| current.can_access_shelf(s.id))
@@ -109,8 +116,9 @@ impl super::crud::ShelfService {
 
     /// `GET /shelves/for-inspection`：仅 `zone='INSPECTION' AND is_active=true`。
     /// 不过滤 SHELF_ACCOUNT scope（品检架通常由全员可见）。
-    pub async fn list_for_inspection(
-        conn: &mut PgConnection,
+    pub async fn list_for_inspection<R: ShelfRepoTrait>(
+        &self,
+        mut repo: R,
         current: &CurrentUser,
     ) -> Result<ShelfForInspectionOut, AppError> {
         // 任意已登录
@@ -123,15 +131,15 @@ impl super::crud::ShelfService {
         ])?;
 
         // 直接复用 list_with_filters，zone='INSPECTION' AND is_active=true
-        let shelves = ShelfRepo::list_with_filters(
-            &mut *conn,
-            None,
-            Some(ZONE_INSPECTION),
-            Some(true),
-            MAX_LIMIT,
-            0,
-        )
-        .await?;
+        let shelves = repo
+            .list_with_filters(
+                None,
+                Some(ZONE_INSPECTION),
+                Some(true),
+                MAX_LIMIT,
+                0,
+            )
+            .await?;
         let items = shelves
             .into_iter()
             .map(|s| ShelfForInspectionItem {
@@ -152,8 +160,9 @@ impl super::crud::ShelfService {
 
     /// `GET /shelves/processes`：所有 active shelf 的全部 mapping，单条 SQL
     /// JOIN（防 N+1）。任意已登录可调。
-    pub async fn list_all_process_mappings(
-        conn: &mut PgConnection,
+    pub async fn list_all_process_mappings<R: ShelfRepoTrait>(
+        &self,
+        mut repo: R,
         current: &CurrentUser,
     ) -> Result<AllShelfProcessMappingOut, AppError> {
         current.require_any_role(&[
@@ -164,7 +173,7 @@ impl super::crud::ShelfService {
             Role::Inspector,
         ])?;
 
-        let rows = ShelfProcessRepo::list_all_active_mappings(&mut *conn).await?;
+        let rows = repo.proc_list_all_active_mappings().await?;
 
         // SHELF_ACCOUNT scope：统一走 `can_access_shelf`（见 list_for_return
         // 上方注释）。Manager / wildcard 始终看到全集；其他按 shelf_ids 收窄。
