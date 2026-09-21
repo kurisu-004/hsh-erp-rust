@@ -22,7 +22,8 @@ set -euo pipefail
 # 转义：外部已注入（如指向 postgres-test:5429 的快速路）→ 直通
 if [ -n "${TEST_DATABASE_BASE_URL:-}" ]; then
     cargo nextest run "$@"
-    exit $?
+    NEXTEST_FAILED=$?
+    exit "$NEXTEST_FAILED"
 fi
 
 CID=$(docker run -d \
@@ -31,7 +32,31 @@ CID=$(docker run -d \
     -p 127.0.0.1:0:5432 \
     postgres:18-alpine \
     -c max_connections=500)
-trap 'docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+# 2026-09-21 改造：nextest 失败时保留容器供 debug。
+# NEXTEST_FAILED 未设置 / 空 → setup 阶段退出 → 删容器（兜底）；
+# NEXTEST_FAILED=0 → nextest 成功 → 删容器；
+# NEXTEST_FAILED 非 0 → nextest 失败 → 保留容器 + 打印调试指引。
+# 注意：cleanup() 内不用 local rc=...，因为 local 内置在 set -u 下有未初始化窗口
+# 会触发 unbound variable。直接赋值给全局 rc + 默认值兼容 unset 场景。
+cleanup() {
+    rc="${NEXTEST_FAILED:-}"
+    port=$(docker port "$CID" 5432/tcp 2>/dev/null | head -n1 | awk -F: '{print $NF}')
+    if [ "$rc" = "0" ]; then
+        docker rm -f "$CID" >/dev/null 2>&1 || true
+    elif [ -n "$rc" ]; then
+        # 2026-09-21 备注：bash 3.2 (macOS) 把 `$rc` 后接 UTF-8 高字节误并入变量名，
+        # 导致 set -u 下报 unbound；用 ${rc} 大括号显式划界。
+        echo "warning: nextest 退出码 ${rc}；保留容器 $CID 用于 debug" >&2
+        echo "  连接 DB: psql -h 127.0.0.1 -p ${port:-?} -U postgres -d hsh_erp_template" >&2
+        echo "  列 test DB: SELECT datname FROM pg_database WHERE datname LIKE 'test_%';" >&2
+        echo "  或:    docker exec -it $CID psql -U postgres" >&2
+        echo "  清理:   docker rm -f $CID" >&2
+    else
+        # setup 阶段失败 → 删容器兜底
+        docker rm -f "$CID" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
 
 # pg_isready 轮询 ≤30s（0.5s 间隔）
 ready=0
@@ -83,5 +108,11 @@ export TEST_DATABASE_BASE_URL="postgres://postgres:postgres@127.0.0.1:${PORT}/${
 # 不要 `exec` —— exec 会替换 shell 进程导致 EXIT trap 失效（2026-09-20 修复 bug：
 # cargo nextest 退出后 shell 已不在，容器不会被 trap 清理）。改用普通调用让
 # wrapper 自然走到末尾，trap 在脚本退出时清理 CID。
+# 2026-09-21 备注：cargo nextest run 失败时需要保留 $? 给 cleanup()，
+# 所以临时关 set -e 让赋值 NEXTEST_FAILED=$? 能跑到；否则 set -e 会
+# 在 cargo nextest 失败那一刻直接退出、跳过赋值，cleanup 拿到空值。
+set +e
 cargo nextest run "$@"
-exit $?
+NEXTEST_FAILED=$?
+set -e
+exit "$NEXTEST_FAILED"

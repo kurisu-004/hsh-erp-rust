@@ -298,12 +298,6 @@ async fn counter_acquires_sequential_numbers() {
     use hsh_erp_rust::infra::serial::next_delivery_note_no;
     let pool = setup().await;
 
-    // 清表
-    sqlx::query!("TRUNCATE t_delivery_note_counter")
-        .execute(&pool)
-        .await
-        .expect("truncate counter");
-
     let no1 = next_delivery_note_no(&pool, 0).await.expect("acquire 1");
     let no2 = next_delivery_note_no(&pool, 0).await.expect("acquire 2");
 

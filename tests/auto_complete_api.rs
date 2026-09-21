@@ -24,18 +24,6 @@ use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::task::auto_complete::run_once;
 
 
-/// 清空 auto_complete 涉及表（customer / part / batch）。
-/// 用 CASCADE 兜底防止依赖漏列；测试库每次跑都从零开始。
-async fn reset_auto_complete_state(pool: &sqlx::PgPool) {
-    sqlx::query(
-        "TRUNCATE t_customer, t_part_event, t_part_batch, t_part \
-         RESTART IDENTITY CASCADE",
-    )
-    .execute(pool)
-    .await
-    .expect("truncate customer+part+batch");
-}
-
 /// 构造 L1 + L2 客户。L1 用唯一前缀（按时间戳后缀）防 `uq_t_customer_root_prefix` 冲突。
 async fn seed_customer(pool: &sqlx::PgPool) -> (i64, i64) {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -144,7 +132,6 @@ async fn seed_delivered_batch(
 async fn run_once_completes_overdue_delivered_batch() {
     ensure_database_exists().await;
     let pool = test_pool().await;
-    reset_auto_complete_state(&pool).await;
     let (_l1, l2) = seed_customer(&pool).await;
     let (_part_id, batch_id) = seed_delivered_batch(&pool, l2, "AC-OLD", 30).await; // 30 天前 ON_SHELF
 
@@ -167,7 +154,6 @@ async fn run_once_completes_overdue_delivered_batch() {
 async fn run_once_skips_recent_batch() {
     ensure_database_exists().await;
     let pool = test_pool().await;
-    reset_auto_complete_state(&pool).await;
     let (_l1, l2) = seed_customer(&pool).await;
     let (_part_id, batch_id) = seed_delivered_batch(&pool, l2, "AC-NEW", 1).await; // 1 天前
 
@@ -190,7 +176,6 @@ async fn run_once_skips_recent_batch() {
 async fn run_once_emits_ws_event_after_commit() {
     ensure_database_exists().await;
     let pool = test_pool().await;
-    reset_auto_complete_state(&pool).await;
     let (_l1, l2) = seed_customer(&pool).await;
     let (part_id, _batch_id) = seed_delivered_batch(&pool, l2, "AC-WS", 30).await;
 
