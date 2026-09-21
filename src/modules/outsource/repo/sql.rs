@@ -1,4 +1,4 @@
-//! outsource 域数据访问（Phase 2 2026-09-13）
+//! outsource 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
 //!
 //! 对应 Python myERP/repository/outsource*.py。
 //!
@@ -7,10 +7,17 @@
 //! - 软删：默认 `deleted_at IS NULL`；写 UPDATE 带 `WHERE id=$1 AND version=$2` 乐观锁
 //! - 0 行由 service 转 409 / BIZ_VERSION_CONFLICT
 //! - `&mut PgConnection` 走引用 `&mut *conn`，与 part / customer 域同形
+//!
+//! 2026-09-22 refactor（outsource 对齐 iam 事务分层范式）：
+//! 从 `repo.rs` 平移到 `repo/sql.rs`，**所有 SQL 字符串零 diff**（`.sqlx/query-*.json`
+//! 哈希不变）；`OutsourceRepoTrait` 在 `repo/mod.rs`，直接 `impl for &mut PgConnection`。
+//! 3 个 ZST struct `OutsourceCompanyRepo` / `OutsourceQuoteRepo` /
+//! `OutsourceShipmentRepo` 保持原名（trait 命名为 `OutsourceRepoTrait`，避开与
+//! 单 ZST 名歧义；outsource 自封闭，无 cross-module 静态调用方）。
 
 use sqlx::PgExecutor;
 
-use super::model::{
+use super::super::model::{
     NewOutsourceCompany, NewOutsourceCompanyProcess, NewOutsourceQuote, NewOutsourceQuoteEvent,
     NewOutsourceShipment, TOutsourceCompany, TOutsourceCompanyProcess, TOutsourceQuote,
     TOutsourceQuoteEvent, TOutsourceShipment,

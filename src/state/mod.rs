@@ -21,6 +21,7 @@ use crate::infra::ws_hub::WsHub;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
 use crate::modules::iam::service::{AccountService, SessionService};
+use crate::modules::outsource::service::OutsourceService;
 use crate::modules::prod::process_chain::service::crud::ProcessChainService;
 use crate::modules::upload_session::repo::UploadSessionRepo;
 
@@ -59,10 +60,14 @@ pub struct AppState {
     /// 2026-09-22 新增：com/applicant service（CRUD）。字段仅 `snowflake`；handler
     /// 借 `&mut *tx` 喂两次 trait（`ApplicantRepo` + `CustomerRepo::lookup_names`）。
     pub applicant_service: Arc<ApplicantService>,
-    /// 2026-09-22 D-1 新增：prod/process_chain service（get / upsert）。字段仅
+/// 2026-09-22 D-1 新增：prod/process_chain service（get / upsert）。字段仅
     /// `snowflake`；handler 借 `&mut *tx` / `&mut *conn` 喂给 `ProcessChainRepoTrait`
     /// （trait 已直接 `impl for &mut PgConnection`，2026-09-22 替代任何 `PgProcessChainRepo` 壳）。
     pub process_chain_service: Arc<ProcessChainService>,
+    /// 2026-09-22 新增：outsource service（company / quote / shipment 16 端点）。
+    /// 字段仅 `snowflake`；handler 借 `&mut *tx` / `&mut *conn` 喂给 `OutsourceRepoTrait`
+    /// 胖 trait（impl on `&mut PgConnection`）。
+    pub outsource_service: Arc<OutsourceService>,
 }
 
 impl AppState {
@@ -89,8 +94,10 @@ impl AppState {
         // 2026-09-22 com/customer + com/applicant service 装线：仅需 snowflake。
         let customer_service = Arc::new(CustomerService::new(snowflake.clone()));
         let applicant_service = Arc::new(ApplicantService::new(snowflake.clone()));
-        // 2026-09-22 D-1 prod/process_chain service 装线：仅需 snowflake。
+// 2026-09-22 D-1 prod/process_chain service 装线：仅需 snowflake。
         let process_chain_service = Arc::new(ProcessChainService::new(snowflake.clone()));
+        // 2026-09-22 outsource service 装线：仅需 snowflake（16 端点 company + quote + shipment）。
+        let outsource_service = Arc::new(OutsourceService::new(snowflake.clone()));
         Self {
             pool,
             config,
@@ -106,6 +113,7 @@ impl AppState {
             customer_service,
             applicant_service,
             process_chain_service,
+            outsource_service,
         }
     }
 }
