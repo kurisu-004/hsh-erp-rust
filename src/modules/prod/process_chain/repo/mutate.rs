@@ -3,12 +3,12 @@
 //! 签名：INSERT/UPDATE 多用 `impl PgExecutor<'_>`；同一事务内连发多条 INSERT 走
 //! `&mut PgConnection`（因 `PgExecutor` 不能 move 多次）。
 
-use sqlx::{PgConnection, PgExecutor, QueryBuilder};
+use sqlx::{PgExecutor, QueryBuilder};
 
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::prod::process_chain::model::{NewProcessChainStep, TPartProcessChain};
 
-use super::ProcessChainRepo;
+use super::sql::ProcessChainRepo;
 
 impl ProcessChainRepo {
     /// INSERT 新链 header（仅做 INSERT；service 层负责 OCC 与 1:1 唯一性检查）。
@@ -185,10 +185,11 @@ impl ProcessChainRepo {
     /// 一次往返即可写完全部（防 N+1）。
     /// 空切片短路返回 0 行。
     ///
-    /// 函数签名收 `&mut PgConnection`（非 `impl PgExecutor<'_>`），因为批量
-    /// INSERT 通常与 `soft_delete_all_steps_for_chain` 在同一事务内连发。
-    pub async fn bulk_insert_steps(
-        conn: &mut PgConnection,
+    /// 2026-09-22 D-1 重构：签名由 `&mut PgConnection` 改为 `impl PgExecutor<'_>`，
+    /// 让 trait `ProcessChainRepoTrait` 可直接对本方法收编（与 shelf `bulk_insert`
+    /// 同形）；SQL 字符串零 diff，`qb.build().execute(executor)` 行为不变。
+    pub async fn bulk_insert_steps<'e, E: PgExecutor<'e>>(
+        executor: E,
         chain_id: i64,
         rows: &[NewProcessChainStep],
         snowflake: &SnowflakeIdGenerator,
@@ -214,7 +215,7 @@ impl ProcessChainRepo {
                 .push_bind(created_by)
                 .push_bind(created_by);
         });
-        let r = qb.build().execute(&mut *conn).await?;
+        let r = qb.build().execute(executor).await?;
         Ok(r.rows_affected())
     }
 }

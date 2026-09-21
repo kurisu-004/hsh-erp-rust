@@ -1,15 +1,16 @@
-//! part_batch 域 —— 待检批次列表 / COUNT 专用查询。
+//! part_batch 域 —— 待检批次列表 / COUNT 专用查询（ZST `PartBatchRepo` impl 块）。
 //!
-//! 从 `repo.rs` 抽出，对应 `GET /parts/inspection-batches` 列表 + 配套分页
-//! count。本文件只放 `PartBatchRepo` 的两个 list/count 方法 + 它们唯一的
-//! 依赖（`InspectionBatchListRow` / `NaiveDate`），便于把 `repo.rs` 控制
-//! 在 1000 行硬上限内（conventions.md §2）。
+//! 2026-09-22 D-1 重构：从旧 `repo_list.rs` 合并到 `repo/` 子目录，与 `sql.rs`
+//! 同 ZST `PartBatchRepo` 的 impl 块；方法体 SQL 与原 `repo_list.rs` 完全一致。
+//!
+//! 文件拆分原因：`GET /parts/inspection-batches` 列表 + 配套分页 count 的两个
+//! 方法 8 JOIN 表，单独文件避免 `sql.rs` 触线 conventions.md §2 硬上限 1000 行。
 
 use chrono::NaiveDate;
 use sqlx::PgExecutor;
 
-use super::model::InspectionBatchListRow;
-use super::repo::PartBatchRepo;
+use super::sql::PartBatchRepo;
+use super::super::model::InspectionBatchListRow;
 
 impl PartBatchRepo {
     /// `GET /parts/inspection-batches` 专用：返回 `status=INSPECTION` 全部活跃

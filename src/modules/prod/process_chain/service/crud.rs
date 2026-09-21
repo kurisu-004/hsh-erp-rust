@@ -1,49 +1,66 @@
 //! process_chain 域业务编排：get / upsert（header + steps 整组替换）
 //!
-//! 约定：
-//! - 事务边界在 handler；service 收 `&mut PgConnection`
-//! - upsert 单事务内做：bump chain version（OCC）→ 软删旧 steps → INSERT 新 steps
-//! - 部分 UPDATE/INSERT 异常时由 `Transaction::Drop` 自动回滚；service 不显式 rollback
+//! ## 约定（2026-09-22 D-1 重构对齐 iam / shelf / customer 范本）
+//! - 事务边界在 handler：handler `pool.begin()` / `tx.commit()`；service 不知事务。
+//! - service 字段仅 `Arc<SnowflakeIdGenerator>`（事务已移交 handler）。
+//! - service 方法签名 `<R: ProcessChainRepoTrait>(&self, mut repo: R, ...)`（by-value；
+//!   生产 `R = &mut PgConnection`，单测 `R = MockProcessChainRepo`）。
+//! - 跨域调用（`PartRepo::get_by_id`）封装到 trait 的 helper `part_get_by_id` 里
+//!   （与 shelf `proc_check_process_exists` 同形）——service 不持第二个 `&mut PgConnection`。
+//!
+//! upsert 单事务内做：bump chain version（OCC）→ 软删旧 steps → INSERT 新 steps；
+//! 部分 UPDATE/INSERT 异常时由 `Transaction::Drop` 自动回滚；service 不显式 rollback。
 //!
 //! 2026-09-16 FK 翻转（migration 026）：
 //! - upsert 新增 PENDING 守卫（非 PENDING → 20705）
 //! - 无链路径改为 `insert_chain` + `link_chain_to_part`（同事务）
 
-use sqlx::PgConnection;
+use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::repo::PartRepo;
 use crate::shared::error::{AppError, code};
 
 use crate::modules::prod::process_chain::dto::{
     ProcessChainOut, ProcessChainStepOut, UpsertChainRequest,
 };
 use crate::modules::prod::process_chain::model::{NewProcessChainStep, TPartProcessChain};
-use crate::modules::prod::process_chain::repo::ProcessChainRepo;
+use crate::modules::prod::process_chain::repo::ProcessChainRepoTrait;
 
-pub struct ProcessChainService;
+/// process_chain 域 service（2026-09-22 D-1 重构后）
+///
+/// 字段仅 `snowflake`（事务已移交 handler）。实例为轻壳，可直接
+/// `Arc<ProcessChainService>` 存 `AppState`；方法签名收 `mut repo: R`（by-value；
+/// 生产 `R = &mut PgConnection`，单测 `R = MockProcessChainRepo`），单测用
+/// `MockProcessChainRepo` 直接注入。
+pub struct ProcessChainService {
+    snowflake: Arc<SnowflakeIdGenerator>,
+}
 
 impl ProcessChainService {
+    /// 构造：仅需雪花 ID 生成器。
+    pub fn new(snowflake: Arc<SnowflakeIdGenerator>) -> Self {
+        Self { snowflake }
+    }
+
     /// 读 part 绑定的工艺链（header + steps）。
     /// 无链 → 20701 `BIZ_PROCESS_CHAIN_NOT_FOUND`（HTTP 404）。
     /// 权限：任意已登录用户可读（车间排产视角：Manager/Clerk/Inspector/CncProgrammer）。
-    pub async fn get_by_part(
-        conn: &mut PgConnection,
+    pub async fn get_by_part<R: ProcessChainRepoTrait>(
+        &self,
+        mut repo: R,
         part_id: i64,
         current: &CurrentUser,
     ) -> Result<ProcessChainOut, AppError> {
         require_any_read(current)?;
 
-        let chain = ProcessChainRepo::get_chain_by_part(&mut *conn, part_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PROCESS_CHAIN_NOT_FOUND,
-                    format!("part {part_id} 尚未绑定工艺链"),
-                )
-            })?;
-        let steps = ProcessChainRepo::list_steps_by_chain(&mut *conn, chain.id).await?;
+        let chain = repo.get_chain_by_part(part_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PROCESS_CHAIN_NOT_FOUND,
+                format!("part {part_id} 尚未绑定工艺链"),
+            )
+        })?;
+        let steps = repo.list_steps_by_chain(chain.id).await?;
         Ok(chain_to_out(chain, steps))
     }
 
@@ -51,22 +68,21 @@ impl ProcessChainService {
     /// 前端在「工序制定」页点击零件后，按 `part.process_chain_id` 调本端点。
     /// 无链 / 已软删 → 20701 `BIZ_PROCESS_CHAIN_NOT_FOUND`（HTTP 404）。
     /// 权限：与 `get_by_part` 相同。
-    pub async fn get_chain_by_id(
-        conn: &mut PgConnection,
+    pub async fn get_chain_by_id<R: ProcessChainRepoTrait>(
+        &self,
+        mut repo: R,
         chain_id: i64,
         current: &CurrentUser,
     ) -> Result<ProcessChainOut, AppError> {
         require_any_read(current)?;
 
-        let chain = ProcessChainRepo::get_chain_by_id(&mut *conn, chain_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PROCESS_CHAIN_NOT_FOUND,
-                    format!("工艺链 {chain_id} 不存在或已删除"),
-                )
-            })?;
-        let steps = ProcessChainRepo::list_steps_by_chain(&mut *conn, chain.id).await?;
+        let chain = repo.get_chain_by_id(chain_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PROCESS_CHAIN_NOT_FOUND,
+                format!("工艺链 {chain_id} 不存在或已删除"),
+            )
+        })?;
+        let steps = repo.list_steps_by_chain(chain.id).await?;
         Ok(chain_to_out(chain, steps))
     }
 
@@ -77,9 +93,9 @@ impl ProcessChainService {
     /// - 守卫（2026-09-16 新增）：part 不存在 → 20101；part.status 非 PENDING → 20705
     ///
     /// 权限：Manager only（写入域统一约定）。
-    pub async fn upsert_chain(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn upsert_chain<R: ProcessChainRepoTrait>(
+        &self,
+        mut repo: R,
         part_id: i64,
         req: &UpsertChainRequest,
         current: &CurrentUser,
@@ -128,7 +144,10 @@ impl ProcessChainService {
         }
 
         // 2. 加载 part（FK 翻转后 part 是归属关系的载体，必须先校验存在性）
-        let part = PartRepo::get_by_id(&mut *conn, part_id, false)
+        //    2026-09-22 D-1 重构：跨域调用 PartRepo::get_by_id 封装为 trait helper
+        //    `part_get_by_id`，service 不再直接借 `&mut PgConnection`。
+        let part = repo
+            .part_get_by_id(part_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -150,7 +169,7 @@ impl ProcessChainService {
         }
 
         // 4. 查现有链
-        let existing = ProcessChainRepo::get_chain_by_part(&mut *conn, part_id).await?;
+        let existing = repo.get_chain_by_part(part_id).await?;
 
         // 5. 整组事务
         let chain_id: i64 = if let Some(c) = existing {
@@ -171,15 +190,15 @@ impl ProcessChainService {
                     }
                 }
             };
-            let affected = ProcessChainRepo::bump_chain_version(
-                &mut *conn,
-                c.id,
-                c.version,
-                new_name,
-                note_update,
-                current.id,
-            )
-            .await?;
+            let affected = repo
+                .bump_chain_version(
+                    c.id,
+                    c.version,
+                    new_name,
+                    note_update,
+                    current.id,
+                )
+                .await?;
             if affected == 0 {
                 return Err(AppError::biz(
                     code::VERSION_CONFLICT,
@@ -189,15 +208,14 @@ impl ProcessChainService {
             c.id
         } else {
             // 5b. 新建 header + 绑定 part（同事务；2026-09-16 FK 翻转）
-            let id = snowflake.next_id();
+            let id = self.snowflake.next_id();
             let name = if req.name.trim().is_empty() {
                 "默认工艺"
             } else {
                 req.name.trim()
             };
-            ProcessChainRepo::insert_chain(&mut *conn, id, name, req.note.as_deref(), current.id)
-                .await?;
-            let linked = ProcessChainRepo::link_chain_to_part(&mut *conn, part_id, id, current.id)
+            repo.insert_chain(id, name, req.note.as_deref(), current.id).await?;
+            let linked = repo.link_chain_to_part(part_id, id, current.id)
                 .await
                 .map_err(
                     |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
@@ -220,20 +238,20 @@ impl ProcessChainService {
         };
 
         // 6. 软删旧 steps（替换语义）
-        ProcessChainRepo::soft_delete_all_steps_for_chain(&mut *conn, chain_id).await?;
+        repo.soft_delete_all_steps_for_chain(chain_id).await?;
 
         // 7. INSERT 新 steps
-        ProcessChainRepo::bulk_insert_steps(
-            &mut *conn,
+        repo.bulk_insert_steps(
             chain_id,
             &parsed_steps,
-            snowflake,
+            &self.snowflake,
             current.id,
         )
         .await?;
 
         // 8. 回读 header（version 已 +1）+ steps
-        let refreshed = ProcessChainRepo::get_chain_by_part(&mut *conn, part_id)
+        let refreshed = repo
+            .get_chain_by_part(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -241,7 +259,7 @@ impl ProcessChainService {
                     "工艺链 upsert 后回读失败",
                 )
             })?;
-        let steps = ProcessChainRepo::list_steps_by_chain(&mut *conn, chain_id).await?;
+        let steps = repo.list_steps_by_chain(chain_id).await?;
         Ok(chain_to_out(refreshed, steps))
     }
 }

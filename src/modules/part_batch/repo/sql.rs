@@ -1,7 +1,13 @@
-//! part_batch 域数据访问
+//! part_batch 域 SQL 真源（ZST `PartBatchRepo` + 固有静态方法；零 diff 搬迁自旧 `repo.rs`）
 //!
 //! 对应 Python myERP/repository/part_batch_repository.py。函数签名接收 `impl PgExecutor<'_>`，
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
+//!
+//! ## 文件拆分（2026-09-22 D-1 重构对齐 iam 范本）
+//! - `sql.rs`（本文件）：t_part_batch 全部 CRUD + 跨域联表查询（13 个静态方法）
+//! - `list.rs`：GET /parts/inspection-batches 专用 list/count（2 个静态方法）
+//!   （不合并到 sql.rs 是因为 sql.rs 已 1100+ 行，超过 conventions.md §2 硬上限 1000 行）
+//! - `mod.rs`：胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection` + 重导出
 //!
 //! Phase P1（送货分组）只暴露 delivery_note / delivery_group 后续会用到的点：
 //! - `get_by_id`
@@ -20,12 +26,19 @@
 //! - 所有走 `TPartBatch` 投影的 SELECT 删 `next_process_id` / `placed_at` 列
 //! - 加 `current_process_step_id`（逻辑 FK → t_process_chain_step.id）
 //! - INSERT / UPDATE 字面量同步
+//!
+//! ## trait 命名 `PartBatchRepoTrait`（带 `Trait` 后缀）
+//! 跨模块静态调用方 11 处直接走 ZST 静态方法（part 域 8 + worker_pool 域 3 + 注释
+//! 引用 1），本任务**不能**破坏 `part_batch::repo::PartBatchRepo` 作为 ZST 的对外
+//! 身份，故 trait 改名 `PartBatchRepoTrait`（与 shelf / customer 范本同形）。
 
 use sqlx::PgExecutor;
 
-use super::model::{PartBatchScanRow, RecentBatchRow, TPartBatch};
+use super::super::model::{PartBatchScanRow, RecentBatchRow, TPartBatch};
 use crate::modules::part::model::TPart;
 
+/// SQL 真源 ZST。trait 名为 `PartBatchRepoTrait`（公共接口），
+/// ZST 仍名 `PartBatchRepo`（跨模块静态调用方依赖此名）。
 pub struct PartBatchRepo;
 
 /// 初始批次 INSERT 入参（part/service/crud.rs 三创建入口共用）。
