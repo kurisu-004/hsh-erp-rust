@@ -10,7 +10,10 @@
 //!   `pool.begin()` → service 跑 DB → `tx.commit()` → handler 写 Redis session 或删 session
 //!   （best-effort，DB 的 refresh_token_version 轮转是兜底）。复用 plan v4 §3 V6 约定。
 //! - ③ **读端点**（list_users / get_user / list_user_roles / me）：`pool.acquire()` 不开
-//!   事务，service 借连接执行查询，用完即 drop。
+//!   事务，service 借 `&mut *conn` 执行查询，用完即 drop。
+//!
+//! 2026-09-22 删 `PgIamRepo` 转发壳：service 形参 `repo: &mut R: IamRepo` 直接收
+//! `&mut *tx` / `&mut *conn`（trait `IamRepo` 已对 `&'a mut PgConnection` 实现）。
 //!
 //! service 仅业务逻辑（方法签名 `<R: IamRepo>(&self, repo: &mut R, ...)`），不知事务。
 //!
@@ -40,7 +43,6 @@ use super::dto::{
     RefreshRequest, UserAddRoleRequest, UserCreateRequest, UserListOut, UserListQuery, UserOut,
     UserRoleOut, UserUpdateRequest,
 };
-use super::repo::PgIamRepo;
 
 // ===========================================================================
 // Session 端点（5 个，原 auth 域）
@@ -52,10 +54,7 @@ pub async fn login(
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<R<LoginResponse>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let pending = {
-        let mut repo = PgIamRepo::new(&mut tx);
-        state.session_service.login(&mut repo, req).await?
-    };
+    let pending = state.session_service.login(&mut *tx, req).await?;
     tx.commit().await?;
     let resp = state.session_service.complete_login(pending).await?;
     Ok(Json(R::ok(resp)))
@@ -67,8 +66,7 @@ pub async fn me(
     user: CurrentUser,
 ) -> Result<Json<R<CurrentUserOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
-    let mut repo = PgIamRepo::new(&mut conn);
-    let out = state.session_service.me(&mut repo, &user).await?;
+    let out = state.session_service.me(&mut *conn, &user).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -93,10 +91,9 @@ pub async fn change_password(
     {
         let mut tx = state.pool.begin().await?;
         {
-            let mut repo = PgIamRepo::new(&mut tx);
             state
                 .session_service
-                .change_password(&mut repo, user_id, req, &user)
+                .change_password(&mut *tx, user_id, req, &user)
                 .await?;
         }
         tx.commit().await?;
@@ -114,10 +111,7 @@ pub async fn refresh(
     Json(req): Json<RefreshRequest>,
 ) -> Result<Json<R<LoginResponse>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let pending = {
-        let mut repo = PgIamRepo::new(&mut tx);
-        state.session_service.refresh(&mut repo, req).await?
-    };
+    let pending = state.session_service.refresh(&mut *tx, req).await?;
     tx.commit().await?;
     let resp = state.session_service.complete_refresh(pending).await?;
     Ok(Json(R::ok(resp)))
@@ -134,10 +128,9 @@ pub async fn list_users(
     Query(query): Query<UserListQuery>,
 ) -> Result<Json<R<UserListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
-    let mut repo = PgIamRepo::new(&mut conn);
     let out = state
         .account_service
-        .list_users(&mut repo, &query, &current)
+        .list_users(&mut *conn, &query, &current)
         .await?;
     Ok(Json(R::ok(out)))
 }
@@ -149,13 +142,10 @@ pub async fn create_user(
     Json(req): Json<UserCreateRequest>,
 ) -> Result<(StatusCode, Json<R<UserOut>>), AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = {
-        let mut repo = PgIamRepo::new(&mut tx);
-        state
-            .account_service
-            .create_user(&mut repo, &req, &current)
-            .await?
-    };
+    let out = state
+        .account_service
+        .create_user(&mut *tx, &req, &current)
+        .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
@@ -167,10 +157,9 @@ pub async fn get_user(
     Path(id): Path<i64>,
 ) -> Result<Json<R<UserOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
-    let mut repo = PgIamRepo::new(&mut conn);
     let out = state
         .account_service
-        .get_user(&mut repo, id, &current)
+        .get_user(&mut *conn, id, &current)
         .await?;
     Ok(Json(R::ok(out)))
 }
@@ -183,13 +172,10 @@ pub async fn update_user(
     Json(req): Json<UserUpdateRequest>,
 ) -> Result<Json<R<UserOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = {
-        let mut repo = PgIamRepo::new(&mut tx);
-        state
-            .account_service
-            .update_user(&mut repo, id, &req, &current)
-            .await?
-    };
+    let out = state
+        .account_service
+        .update_user(&mut *tx, id, &req, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -201,13 +187,10 @@ pub async fn admin_reset_password(
     Path(id): Path<i64>,
 ) -> Result<Json<R<UserOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = {
-        let mut repo = PgIamRepo::new(&mut tx);
-        state
-            .account_service
-            .admin_reset_password(&mut repo, id, &current)
-            .await?
-    };
+    let out = state
+        .account_service
+        .admin_reset_password(&mut *tx, id, &current)
+        .await?;
     tx.commit().await?;
     // commit 之后清该用户的 Redis session（best-effort）
     if let Err(e) = state.session.delete_all_user_sessions(id).await {
@@ -223,13 +206,10 @@ pub async fn deactivate_user(
     Path(id): Path<i64>,
 ) -> Result<Json<R<UserOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = {
-        let mut repo = PgIamRepo::new(&mut tx);
-        state
-            .account_service
-            .deactivate_user(&mut repo, id, &current)
-            .await?
-    };
+    let out = state
+        .account_service
+        .deactivate_user(&mut *tx, id, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -241,10 +221,9 @@ pub async fn list_user_roles(
     Path(id): Path<i64>,
 ) -> Result<Json<R<Vec<UserRoleOut>>>, AppError> {
     let mut conn = state.pool.acquire().await?;
-    let mut repo = PgIamRepo::new(&mut conn);
     let out = state
         .account_service
-        .list_user_roles(&mut repo, id, &current)
+        .list_user_roles(&mut *conn, id, &current)
         .await?;
     Ok(Json(R::ok(out)))
 }
@@ -257,13 +236,10 @@ pub async fn add_role(
     Json(req): Json<UserAddRoleRequest>,
 ) -> Result<(StatusCode, Json<R<UserRoleOut>>), AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = {
-        let mut repo = PgIamRepo::new(&mut tx);
-        state
-            .account_service
-            .add_role(&mut repo, id, &req, &current)
-            .await?
-    };
+    let out = state
+        .account_service
+        .add_role(&mut *tx, id, &req, &current)
+        .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
@@ -276,10 +252,9 @@ pub async fn remove_role(
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
     {
-        let mut repo = PgIamRepo::new(&mut tx);
         state
             .account_service
-            .remove_role(&mut repo, id, role_id, &current)
+            .remove_role(&mut *tx, id, role_id, &current)
             .await?;
     }
     tx.commit().await?;

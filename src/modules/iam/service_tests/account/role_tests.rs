@@ -23,13 +23,13 @@ use super::helpers::{
 #[tokio::test]
 async fn list_user_roles_returns_roles_for_user() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_list_by_user()
             .returning(|id| Ok(vec![make_user_role_row(1, id, "MANAGER")]));
     });
     let roles = svc
-        .list_user_roles(&mut repo, 42, &manager_current())
+        .list_user_roles(repo, 42, &manager_current())
         .await
         .unwrap();
     assert_eq!(roles.len(), 1);
@@ -38,9 +38,9 @@ async fn list_user_roles_returns_roles_for_user() {
 
 #[tokio::test]
 async fn list_user_roles_requires_manager_role() {
-    let (svc, mut repo) = guard_repo();
+    let (svc, repo) = guard_repo();
     let res = svc
-        .list_user_roles(&mut repo, 42, &clerk_current())
+        .list_user_roles(repo, 42, &clerk_current())
         .await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::FORBIDDEN));
 }
@@ -48,11 +48,11 @@ async fn list_user_roles_requires_manager_role() {
 #[tokio::test]
 async fn list_user_roles_returns_not_found_when_user_missing() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|_| Ok(None));
     });
     let res = svc
-        .list_user_roles(&mut repo, 999, &manager_current())
+        .list_user_roles(repo, 999, &manager_current())
         .await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::USER_NOT_FOUND));
 }
@@ -60,12 +60,12 @@ async fn list_user_roles_returns_not_found_when_user_missing() {
 #[tokio::test]
 async fn list_user_roles_returns_empty_list_when_no_roles() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_list_by_user().returning(|_| Ok(vec![]));
     });
     let roles = svc
-        .list_user_roles(&mut repo, 42, &manager_current())
+        .list_user_roles(repo, 42, &manager_current())
         .await
         .unwrap();
     assert!(roles.is_empty());
@@ -81,7 +81,7 @@ async fn add_role_succeeds_for_non_shelf_role() {
     let captured_id: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
     let cap2 = captured_id.clone();
     let svc = make_account_service();
-    let mut repo = make_repo_with(move |r| {
+    let repo = make_repo_with(move |r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_exists_same_scope().returning(|_, _, _, _| Ok(false));
         r.expect_role_create().returning(move |ins| {
@@ -99,7 +99,7 @@ async fn add_role_succeeds_for_non_shelf_role() {
         scope_id: None,
     };
     let out = svc
-        .add_role(&mut repo, 42, &req, &manager_current())
+        .add_role(repo, 42, &req, &manager_current())
         .await
         .unwrap();
     assert_eq!(out.role, "CLERK");
@@ -107,20 +107,20 @@ async fn add_role_succeeds_for_non_shelf_role() {
 
 #[tokio::test]
 async fn add_role_requires_manager_role() {
-    let (svc, mut repo) = guard_repo();
+    let (svc, repo) = guard_repo();
     let req = UserAddRoleRequest {
         role: Role::Clerk,
         scope_type: None,
         scope_id: None,
     };
-    let res = svc.add_role(&mut repo, 42, &req, &clerk_current()).await;
+    let res = svc.add_role(repo, 42, &req, &clerk_current()).await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::FORBIDDEN));
 }
 
 #[tokio::test]
 async fn add_role_shelf_account_without_scope_fails_validation() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
     });
     let req = UserAddRoleRequest {
@@ -129,7 +129,7 @@ async fn add_role_shelf_account_without_scope_fails_validation() {
         scope_id: None,
     };
     assert!(matches!(
-        svc.add_role(&mut repo, 42, &req, &manager_current()).await,
+        svc.add_role(repo, 42, &req, &manager_current()).await,
         Err(AppError::Validation(_))
     ));
 }
@@ -137,7 +137,7 @@ async fn add_role_shelf_account_without_scope_fails_validation() {
 #[tokio::test]
 async fn add_role_non_shelf_role_with_scope_fails_validation() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
     });
     let req = UserAddRoleRequest {
@@ -146,7 +146,7 @@ async fn add_role_non_shelf_role_with_scope_fails_validation() {
         scope_id: Some(7),
     };
     assert!(matches!(
-        svc.add_role(&mut repo, 42, &req, &manager_current()).await,
+        svc.add_role(repo, 42, &req, &manager_current()).await,
         Err(AppError::Validation(_))
     ));
 }
@@ -154,7 +154,7 @@ async fn add_role_non_shelf_role_with_scope_fails_validation() {
 #[tokio::test]
 async fn add_role_shelf_account_returns_not_found_when_shelf_missing() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_shelf_get_by_id().returning(|_| Ok(None));
     });
@@ -164,7 +164,7 @@ async fn add_role_shelf_account_returns_not_found_when_shelf_missing() {
         scope_id: Some(999),
     };
     let res = svc
-        .add_role(&mut repo, 42, &req, &manager_current())
+        .add_role(repo, 42, &req, &manager_current())
         .await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::NOT_FOUND));
 }
@@ -172,7 +172,7 @@ async fn add_role_shelf_account_returns_not_found_when_shelf_missing() {
 #[tokio::test]
 async fn add_role_shelf_account_returns_not_found_when_zone_invalid() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_shelf_get_by_id()
             .returning(|id| Ok(Some(make_shelf(id, "STORAGE", true))));
@@ -183,7 +183,7 @@ async fn add_role_shelf_account_returns_not_found_when_zone_invalid() {
         scope_id: Some(7),
     };
     let res = svc
-        .add_role(&mut repo, 42, &req, &manager_current())
+        .add_role(repo, 42, &req, &manager_current())
         .await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::NOT_FOUND));
 }
@@ -191,7 +191,7 @@ async fn add_role_shelf_account_returns_not_found_when_zone_invalid() {
 #[tokio::test]
 async fn add_role_returns_duplicate_role_409() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_exists_same_scope().returning(|_, _, _, _| Ok(true));
     });
@@ -201,7 +201,7 @@ async fn add_role_returns_duplicate_role_409() {
         scope_id: None,
     };
     let res = svc
-        .add_role(&mut repo, 42, &req, &manager_current())
+        .add_role(repo, 42, &req, &manager_current())
         .await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::ROLE_DUPLICATE));
 }
@@ -213,22 +213,22 @@ async fn add_role_returns_duplicate_role_409() {
 #[tokio::test]
 async fn remove_role_succeeds() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_role_get_by_id()
             .returning(|id| Ok(Some(make_user_role(id, 42, "MANAGER"))));
         r.expect_role_soft_delete().returning(|_, _, _, _| Ok(1));
     });
-    svc.remove_role(&mut repo, 42, 99, &manager_current())
+    svc.remove_role(repo, 42, 99, &manager_current())
         .await
         .unwrap();
 }
 
 #[tokio::test]
 async fn remove_role_requires_manager_role() {
-    let (svc, mut repo) = guard_repo();
+    let (svc, repo) = guard_repo();
     let res = svc
-        .remove_role(&mut repo, 42, 99, &clerk_current())
+        .remove_role(repo, 42, 99, &clerk_current())
         .await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::FORBIDDEN));
 }
@@ -236,12 +236,12 @@ async fn remove_role_requires_manager_role() {
 #[tokio::test]
 async fn remove_role_returns_not_found_when_role_missing() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_role_get_by_id().returning(|_| Ok(None));
     });
     let res = svc
-        .remove_role(&mut repo, 42, 999, &manager_current())
+        .remove_role(repo, 42, 999, &manager_current())
         .await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::ROLE_NOT_FOUND));
 }
@@ -249,13 +249,13 @@ async fn remove_role_returns_not_found_when_role_missing() {
 #[tokio::test]
 async fn remove_role_returns_not_found_when_role_belongs_to_other_user() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_role_get_by_id()
             .returning(|id| Ok(Some(make_user_role(id, 99, "MANAGER"))));
     });
     let res = svc
-        .remove_role(&mut repo, 42, 100, &manager_current())
+        .remove_role(repo, 42, 100, &manager_current())
         .await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::ROLE_NOT_FOUND));
 }
@@ -263,14 +263,14 @@ async fn remove_role_returns_not_found_when_role_belongs_to_other_user() {
 #[tokio::test]
 async fn remove_role_returns_version_conflict_when_no_row_affected() {
     let svc = make_account_service();
-    let mut repo = make_repo_with(|r| {
+    let repo = make_repo_with(|r| {
         r.expect_get_by_id().returning(|id| Ok(Some(make_user(id))));
         r.expect_role_get_by_id()
             .returning(|id| Ok(Some(make_user_role(id, 42, "MANAGER"))));
         r.expect_role_soft_delete().returning(|_, _, _, _| Ok(0));
     });
     let res = svc
-        .remove_role(&mut repo, 42, 99, &manager_current())
+        .remove_role(repo, 42, 99, &manager_current())
         .await;
     assert!(matches!(res, Err(AppError::Biz { code: c, .. }) if c == code::VERSION_CONFLICT));
 }

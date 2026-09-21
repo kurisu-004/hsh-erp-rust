@@ -4,7 +4,7 @@
 //! - api/v1/auth.py + api/v1/user.py → `handler.rs`（14 端点，1 个 router 工厂函数）
 //! - service/auth_service.py + service/user_service.py + service/menu.py → `service/{session,account,menu}.rs`
 //! - repository/user_repository.py + repository/menu_repository.py + repository/shelf_repository.py
-//!   → `repo/sql.rs`（SQL 真源）+ `repo/pg.rs`（PgIamRepo 借连接）+ `repo/mod.rs`（IamRepo trait）
+//!   → `repo/sql.rs`（SQL 真源）+ `repo/mod.rs`（IamRepo trait + 直接 impl for `&mut PgConnection`）
 //! - model/user.py + model/menu.py → `model.rs`
 //! - schema/auth.py + schema/user.py → `dto.rs`
 //!
@@ -23,15 +23,18 @@
 //! - service 拆分（conventions §4.2 / §2 1000 行硬约束）：
 //!   `service::SessionService`（登录 / refresh / me / logout / change-password） +
 //!   `service::AccountService`（账号 CRUD / 角色 / 改密）+ `service::build_menu_tree`（纯函数）。
-//! - repo（2026-09-21 重构后）：`repo/mod.rs` 内胖 trait `IamRepo`（17 方法合并单 trait，
-//!   因 `&mut PgConnection` 同一作用域只能借给一个 repo）+ `PgIamRepo<'a>` 借连接实现 +
-//!   `repo/sql.rs` 内固有静态方法 SQL 真源。
+//! - repo（2026-09-22 重构后）：`repo/mod.rs` 内胖 trait `IamRepo`（17 方法合并单 trait，
+//!   因 `&mut PgConnection` 同一作用域只能借给一个 repo）+ trait 直接 `impl for &mut PgConnection`
+//!   （借 `&mut *tx` / `&mut *conn` 即可） + `repo/sql.rs` 内固有静态方法 SQL 真源。
 //!
 //! 2026-09-19 IAM 域合并（PR-1）：合并 `auth` + `user` 两个垂直切片为单一 `iam` 域。
 //! 2026-09-19 IAM 域收尾（PR-4）：删除旧 alias `/auth` + `/users` 兼容期 nest，
 //! `/api/v2/iam/*` 成为 IAM 域唯一对外接口。JWT 契约 / Redis session / DB schema 零修改。
-//! 2026-09-21 事务分层重构：删 `uow.rs`，事务移交 handler，service 借 `repo: &mut R`
-//! 参数化；胖 trait + PgIamRepo 借连接 + MockIamRepo 单测注入。
+//! 2026-09-21 事务分层重构：删 `uow.rs`，事务移交 handler，service 借 `repo: R` by-value
+//! 参数化（生产 `R = &mut PgConnection`，单测 `R = MockIamRepo`）；胖 trait + MockIamRepo
+//! 单测注入。
+//! 2026-09-22 删 `PgIamRepo` 转发壳：`IamRepo` 直接对 `&mut PgConnection` 实现，
+//! handler/service 借 `&mut *tx` / `&mut *conn` 即可（2026-09-21 范本简化）。
 
 pub mod dto;
 pub mod handler;

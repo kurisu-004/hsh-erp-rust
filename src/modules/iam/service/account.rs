@@ -36,7 +36,7 @@ use crate::shared::error::{AppError, code};
 use super::menu::build_menu_tree;
 // `iam/service/` 子目录中 dto / model / repo 是 sibling 的兄弟模块 —— 用 `super::super::` 跨级
 use super::super::dto::{
-    CurrentUserOut, MenuNodeOut, UserAddRoleRequest, UserCreateRequest, UserListOut, UserListQuery,
+    MenuNodeOut, UserAddRoleRequest, UserCreateRequest, UserListOut, UserListQuery,
     UserOut, UserRoleOut, UserUpdateRequest,
 };
 use super::super::model::User;
@@ -103,9 +103,9 @@ impl AccountService {
     // 列表 / 详情
     // =======================================================================
 
-    pub async fn list_users<R: IamRepo + ?Sized>(
+    pub async fn list_users<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         query: &UserListQuery,
         current: &CurrentUser,
     ) -> Result<UserListOut, AppError> {
@@ -138,9 +138,9 @@ impl AccountService {
         })
     }
 
-    pub async fn get_user<R: IamRepo + ?Sized>(
+    pub async fn get_user<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
@@ -158,9 +158,9 @@ impl AccountService {
     // 创建 / 更新 / 停用
     // =======================================================================
 
-    pub async fn create_user<R: IamRepo + ?Sized>(
+    pub async fn create_user<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         req: &UserCreateRequest,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
@@ -208,9 +208,9 @@ impl AccountService {
         Ok(Self::assemble_user_out(u, roles))
     }
 
-    pub async fn update_user<R: IamRepo + ?Sized>(
+    pub async fn update_user<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         user_id: i64,
         req: &UserUpdateRequest,
         current: &CurrentUser,
@@ -271,9 +271,9 @@ impl AccountService {
     }
 
     /// 停用账号 = 软删（置 `deleted_at` + `is_active = false`）
-    pub async fn deactivate_user<R: IamRepo + ?Sized>(
+    pub async fn deactivate_user<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
@@ -317,9 +317,9 @@ impl AccountService {
     /// 允许本人或 MANAGER 调用。**不**再自己清 Redis session——handler 在 commit 之后
     /// 调 `state.session.delete_all_user_sessions(user_id)`（best-effort）。DB 的
     /// `refresh_token_version` 轮转是兜底。
-    pub async fn change_own_password<R: IamRepo + ?Sized>(
+    pub async fn change_own_password<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         user_id: i64,
         old_password: &str,
         new_password: &str,
@@ -362,9 +362,9 @@ impl AccountService {
 
     /// 管理员重置密码为默认口令 `changeme`，并轮转 refresh token（踢下线）。
     /// **不**再自己清 Redis session——handler 在 commit 之后清（best-effort）。
-    pub async fn admin_reset_password<R: IamRepo + ?Sized>(
+    pub async fn admin_reset_password<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
@@ -400,9 +400,9 @@ impl AccountService {
     // 角色管理
     // =======================================================================
 
-    pub async fn list_user_roles<R: IamRepo + ?Sized>(
+    pub async fn list_user_roles<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<Vec<UserRoleOut>, AppError> {
@@ -416,9 +416,9 @@ impl AccountService {
         Ok(rows.into_iter().map(to_role_out).collect())
     }
 
-    pub async fn add_role<R: IamRepo + ?Sized>(
+    pub async fn add_role<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         user_id: i64,
         req: &UserAddRoleRequest,
         current: &CurrentUser,
@@ -429,7 +429,7 @@ impl AccountService {
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        Self::validate_role_scope(repo, req).await?;
+        Self::validate_role_scope(&mut repo, req).await?;
 
         let role_str = role_as_str(req.role);
         let scope_type = req.scope_type.as_deref();
@@ -473,9 +473,9 @@ impl AccountService {
         Ok(out)
     }
 
-    pub async fn remove_role<R: IamRepo + ?Sized>(
+    pub async fn remove_role<R: IamRepo>(
         &self,
-        repo: &mut R,
+        mut repo: R,
         user_id: i64,
         role_id: i64,
         current: &CurrentUser,
@@ -512,7 +512,7 @@ impl AccountService {
     // =======================================================================
 
     /// 取角色可见菜单并组树（供 SessionService 复用）。调用方传 `repo`，helper 不自管事务。
-    pub async fn menus_for_roles<R: IamRepo + ?Sized>(
+    pub async fn menus_for_roles<R: IamRepo>(
         &self,
         repo: &mut R,
         roles: &[Role],
@@ -522,39 +522,13 @@ impl AccountService {
         Ok(build_menu_tree(menus))
     }
 
-    /// 组装 `/iam/me` 出参（SessionService 复用）。调用方传 `repo`。
-    pub async fn current_user_out<R: IamRepo + ?Sized>(
-        &self,
-        repo: &mut R,
-        current: &CurrentUser,
-    ) -> Result<CurrentUserOut, AppError> {
-        let u = repo
-            .get_by_id(current.id)
-            .await?
-            .ok_or_else(|| user_not_found(current.id))?;
-        let menus = self.menus_for_roles(repo, &current.roles).await?;
-        Ok(CurrentUserOut {
-            id: u.id,
-            username: u.username,
-            full_name: u.full_name,
-            is_active: u.is_active,
-            roles: current
-                .roles
-                .iter()
-                .map(|r| role_as_str(*r).to_string())
-                .collect(),
-            shelf_ids: current.shelf_ids.iter().map(|v| v.to_string()).collect(),
-            menus,
-        })
-    }
-
     // =======================================================================
     // 内部
     // =======================================================================
 
     /// 校验 SHELF_ACCOUNT 角色的 scope 形态、货架存在、zone 白名单、is_active。
     /// 收 `&mut R` 而非 `&mut uow`：调用方把 repo 借进来，helper 只取 shelf_repo。
-    async fn validate_role_scope<R: IamRepo + ?Sized>(
+    async fn validate_role_scope<R: IamRepo>(
         repo: &mut R,
         req: &UserAddRoleRequest,
     ) -> Result<(), AppError> {
