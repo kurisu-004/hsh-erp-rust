@@ -1,24 +1,35 @@
-//! part_file 域数据访问（Phase 3 2026-09-14）
+//! part_file 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
 //!
-//! `PartFileRepo` 提供 `t_part_file` 的写入 + 查询 + 列表：
-//! - `create_part_file`：INSERT 雪花 id 行
-//! - `get_by_id` / `get_by_part_kind` / `get_by_owner_kind_sha`：单条查询
-//! - `list_with_filters` / `list_by_owner`：列表 + 过滤
+//! 对应 Python myERP/repository/part_file_repository.py。函数签名接收 `impl PgExecutor<'_>`，
+//! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
 //!
-//! `hash_bytes` 为 SHA-256 hex 工具函数（service 层在上传完成后算 hash，
-//! 走 `uk_t_part_file_part_kind_sha` 部分唯一索引去重）。
+//! ## 约定
+//! - 全部使用运行时 `sqlx::query_as` / `sqlx::query` / `sqlx::query_scalar`
+//!   （**不**用 `query!` 宏：本域运行时 SQL 改动频繁，不强依赖 `.sqlx/` 离线缓存）。
+//! - 读查询一律带 `deleted_at IS NULL`（软删）
+//! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
 //!
-//! ## 全部走运行时 `sqlx::query_as` / `sqlx::query` 而非 `query_as!` 宏
-//! 编译期宏需要 `.sqlx` 离线缓存（sqlx_prepare.sh 产物）；本域运行时 SQL
-//! 改动频繁（Phase 3 集中落地），不强依赖离线缓存。
+//! ## 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`
+//! 本文件 SQL 与方法签名零 diff，`.sqlx/` 哈希不变（part_file 本来就不用 `query!` 宏，
+//! 无 `.sqlx/query-*.json` 影响）。新增的胖 trait `PartFileRepoTrait` 在
+//! `repo/mod.rs`——trait 既含本文件 ZST 6 个方法的 trait 化版本，也含跨域 owner 校验
+//! helper（`part_owner_exists` / `assembly_owner_exists`）和软删 helper（`soft_delete_file`
+//! / `soft_delete_active_by_part_kind`），这些 helper 的 SQL 是从原 service.rs 迁来的，
+//! 字符串不变（见 `repo/mod.rs` 注释）。
+//!
+//! ## 为什么保留 `PartFileRepo` ZST 名
+//! `assembly` / `part` / `cnc_program` 共 6+ 处直接 `PartFileRepo::xxx(&mut *conn, ...)`
+//! 走 ZST 静态方法（assembly/service.rs ×3、part/service/batch.rs ×1、part/service/crud.rs ×2、
+//! cnc_program/service.rs ×3），属于其他 worktree 范围（Group A/B/C/D/E），本任务**不能**
+//! 破坏 `part_file::repo::PartFileRepo` 作为 ZST 的对外身份。故：
+//! - `part_file::repo::PartFileRepo` —— ZST struct，保留 6 个 pub 静态方法签名不变
+//!   （cross-module 调用方零修改）。
+//! - `part_file::repo::PartFileRepoTrait` —— `mod.rs` 新加的胖 trait（含跨域 helper），
+//!   part_file 域内部 service 用 `<R: PartFileRepoTrait>` 收。
 
-use sha2::{Digest, Sha256};
-use sqlx::PgConnection;
 use sqlx::PgExecutor;
 
-use super::model::TPartFile;
-
-pub struct PartFileRepo;
+use crate::modules::part_file::model::TPartFile;
 
 /// `create_part_file` 输入：service 层用 builder 模式注入。
 ///
@@ -42,6 +53,8 @@ pub struct NewPartFile<'a> {
     pub content_sha256: Option<&'a str>,
     pub created_by: i64,
 }
+
+pub struct PartFileRepo;
 
 impl PartFileRepo {
     /// INSERT `t_part_file`：返回写入行的雪花 `id`。
@@ -152,7 +165,7 @@ impl PartFileRepo {
     /// 注：`part_id` 列在 schema 里是 polymorphic（part 或 assembly）；
     /// 这里以 `part_id` 当 owner_id，配合 `owner_kind` 字符串区分语义。
     pub async fn list_with_filters(
-        conn: &mut PgConnection,
+        conn: &mut sqlx::PgConnection,
         _owner_kind: &str,
         owner_id: Option<i64>,
         kind: Option<&str>,
@@ -210,48 +223,5 @@ impl PartFileRepo {
         .bind(owner_id)
         .fetch_all(executor)
         .await
-    }
-}
-
-/// SHA-256 hex 编码（小写 64 字符）。
-///
-/// service 层在上传完成后用其计算 `content_sha256`，写入 `t_part_file`；
-/// `uk_t_part_file_part_kind_sha` 唯一索引据此去重。
-pub fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hash_bytes_known_vector() {
-        // sha256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
-        assert_eq!(
-            hash_bytes(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        // sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-        assert_eq!(
-            hash_bytes(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn hash_bytes_output_64_chars_lowercase_hex() {
-        let s = hash_bytes(b"test");
-        assert_eq!(s.len(), 64);
-        assert!(
-            s.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
     }
 }

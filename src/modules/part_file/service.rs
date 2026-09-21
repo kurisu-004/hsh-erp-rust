@@ -1,16 +1,17 @@
-//! part_file 域业务逻辑（2026-09-14 Phase 3 + 2026-09-16 M2-B 业务层 + 2026-09-18 upload-intents 删除）
+//! part_file 域业务逻辑（2026-09-14 Phase 3 + 2026-09-16 M2-B 业务层 + 2026-09-18 upload-intents 删除 + 2026-09-22 对齐 iam 范式）
 //!
 //! 对应 Python myERP/service/part_file_service.py + service/_file_kind_policy.py。
 //!
 //! ## 上传核心逻辑（`upload_file_for_owner`）
-//! 1. 取 `owner_kind`（PART / ASSEMBLY），校验存在性（21105 OWNER_NOT_FOUND）
+//! 1. 取 `owner_kind`（PART / ASSEMBLY），校验存在性（21105 OWNER_NOT_FOUND）—— 走
+//!    `repo.part_owner_exists` / `repo.assembly_owner_exists`
 //! 2. 校验 `kind` 在白名单内（policy::allowed_exts）
 //! 3. 校验扩展名（policy::ext_of）—— 无扩展名 / 不在白名单 → 21102 BAD_TYPE
 //! 4. 校验 content_type（policy::expected_content_types_for_ext）—— 不匹配 → 21102
-//! 5. SHA-256 算 hash → 同 owner + kind + sha 撞唯一索引 → 21108 DUPLICATE（CAS 去重）
+//! 5. SHA-256 算 hash → `repo.get_by_owner_kind_sha` 撞唯一索引 → 21108 DUPLICATE（CAS 去重）
 //!    注意：CAS 命中时**跳过 COS PUT**，直接复用已有 object_key（节省 COS 流量）
 //! 6. 上传 COS（infra/cos.rs::put_object）
-//! 7. INSERT t_part_file
+//! 7. `repo.create_part_file` 写 DB
 //! 8. 返回 PartFileOut
 //!
 //! ## multipart 上传契约
@@ -29,6 +30,16 @@
 //!   **2026-09-18 已删除**：迁移至 `upload_session` 域（共享 STS 凭证 + Redis 会话）。
 //! - `bind_uploaded_file` 保留：confirm handler + batch_create service 共享的"已上传到
 //!   tmp 区 → 绑定到 owner"逻辑；head/copy 在 tx 之外，事务内只做 soft_delete + INSERT。
+//!
+//! ## 事务边界（2026-09-22 重构对齐 iam 范式）
+//! 事务移交 handler（与 20 个 handler 文件现状对齐）：service 仅业务逻辑，所有跨
+//! repo 操作经 `repo: R`（by-value；`R: PartFileRepoTrait`）参数传入——handler/service
+//! 借 `&mut *tx` / `&mut *conn` 喂给 trait（trait 已直接 `impl for &mut PgConnection`）。
+//! service 不知事务——handler `pool.begin()` + `tx.commit()` 包外。
+//!
+//! `PartFileService` 字段仅 `snowflake`（事务已移交 handler）；实例为轻壳，可直接
+//! `Arc<PartFileService>` 存 `AppState`；方法签名 `<R: PartFileRepoTrait>(&self, mut repo: R, ...)`，
+//! 生产 `R = &mut PgConnection`，单测 `R = MockPartFileRepoTrait` 直接注入。
 
 use std::sync::Arc;
 
@@ -42,12 +53,22 @@ use crate::modules::part_file::dto::{
 };
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy;
-use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
+use crate::modules::part_file::repo::{NewPartFile, PartFileRepoTrait, hash_bytes};
 use crate::shared::error::{AppError, code};
 
-pub struct PartFileService;
+pub struct PartFileService {
+    snowflake: Arc<SnowflakeIdGenerator>,
+    cos: Arc<dyn CosClient>,
+}
 
 impl PartFileService {
+    /// 构造：雪花 ID 生成器 + COS 客户端（2026-09-22 重构：cos 从 handler 形参
+    /// 收归到 service 字段，service 自管 cos 不变量；handler 仍按需
+    /// `state.cos.clone()` 注入即可，service 调用 `&self.cos`）。
+    pub fn new(snowflake: Arc<SnowflakeIdGenerator>, cos: Arc<dyn CosClient>) -> Self {
+        Self { snowflake, cos }
+    }
+
     /// 单文件上传（multipart `file` 字段 + JSON `data` 字段已解析）。
     ///
     /// `original_filename` 是客户端 multipart 的 filename；`content_type` 是
@@ -55,10 +76,9 @@ impl PartFileService {
     ///
     /// 返回新建的 `PartFileOut`（含 id）。
     #[allow(clippy::too_many_arguments)]
-    pub async fn upload_file_for_owner(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
-        cos: Arc<dyn CosClient>,
+    pub async fn upload_file_for_owner<R: PartFileRepoTrait>(
+        &self,
+        mut repo: R,
         owner_kind: &str,
         owner_id: i64,
         kind: &str,
@@ -69,8 +89,8 @@ impl PartFileService {
     ) -> Result<PartFileOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer])?;
 
-        // 1. owner 存在性校验
-        Self::assert_owner_exists(conn, owner_kind, owner_id).await?;
+        // 1. owner 存在性校验（走 trait helper）
+        Self::assert_owner_exists(&mut repo, owner_kind, owner_id).await?;
 
         // 2. kind 白名单（policy::allowed_exts 自动挡掉未知 kind）
         let ext = policy::ext_of(original_filename).ok_or_else(|| {
@@ -110,7 +130,7 @@ impl PartFileService {
         // 5. SHA-256 → CAS 去重（撞唯一索引 → 21108 DUPLICATE）
         let sha = hash_bytes(&bytes);
         if let Some(existing) =
-            PartFileRepo::get_by_owner_kind_sha(&mut *conn, owner_id, kind, &sha).await?
+            repo.get_by_owner_kind_sha(owner_id, kind, &sha).await?
         {
             // CAS 命中：跳过 COS PUT，直接复用已有记录（返回 id / object_key）
             return Ok(Self::render_out(&existing, owner_kind));
@@ -126,12 +146,13 @@ impl PartFileService {
             &sha[..16],
             safe_filename,
         );
-        cos.put_object(&object_key, bytes.clone(), content_type)
+        self.cos
+            .put_object(&object_key, bytes.clone(), content_type)
             .await?;
 
         // 7. INSERT t_part_file
         let nf = NewPartFile {
-            id: snowflake.next_id(),
+            id: self.snowflake.next_id(),
             part_id: owner_id,
             owner_kind,
             kind,
@@ -144,7 +165,8 @@ impl PartFileService {
             content_sha256: Some(&sha),
             created_by: current.id,
         };
-        let id = PartFileRepo::create_part_file(&mut *conn, nf)
+        let id = repo
+            .create_part_file(nf)
             .await
             .map_err(|e| match e {
                 sqlx::Error::Database(db) => {
@@ -161,15 +183,17 @@ impl PartFileService {
             })?;
 
         // 8. 读回（include_deleted=true 兜底 INSERT 可见性）
-        let row = PartFileRepo::get_by_id(&mut *conn, id, true)
+        let row = repo
+            .get_by_id(id, true)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_NOT_FOUND, "刚 INSERT 却查不到"))?;
         Ok(Self::render_out(&row, owner_kind))
     }
 
     /// 列表：按 owner_kind + owner_id + kind 过滤 + 分页。
-    pub async fn list_files(
-        conn: &mut PgConnection,
+    pub async fn list_files<R: PartFileRepoTrait>(
+        &self,
+        mut repo: R,
         query: &PartFileListQuery,
         current: &CurrentUser,
     ) -> Result<PartFileListOut, AppError> {
@@ -194,15 +218,9 @@ impl PartFileService {
             .transpose()?;
         let kind_opt = query.kind.as_deref();
 
-        let (rows, total) = PartFileRepo::list_with_filters(
-            &mut *conn,
-            owner_kind,
-            owner_id_opt,
-            kind_opt,
-            limit,
-            offset,
-        )
-        .await?;
+        let (rows, total) = repo
+            .list_with_filters(owner_kind, owner_id_opt, kind_opt, limit, offset)
+            .await?;
         let items = rows
             .into_iter()
             .map(|r| Self::render_out(&r, owner_kind))
@@ -211,8 +229,10 @@ impl PartFileService {
     }
 
     /// 单条详情 + 预签下载 URL。
-    pub async fn get_file_with_url(
-        conn: &mut PgConnection,
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_file_with_url<R: PartFileRepoTrait>(
+        &self,
+        mut repo: R,
         cos: Arc<dyn CosClient>,
         file_id: i64,
         current: &CurrentUser,
@@ -223,7 +243,8 @@ impl PartFileService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let row = PartFileRepo::get_by_id(&mut *conn, file_id, false)
+        let row = repo
+            .get_by_id(file_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -246,20 +267,15 @@ impl PartFileService {
         })
     }
 
-    /// 校验 owner 存在性（polymorphic）。
-    async fn assert_owner_exists(
-        conn: &mut PgConnection,
+    /// 校验 owner 存在性（polymorphic，走 trait helper）。
+    async fn assert_owner_exists<R: PartFileRepoTrait>(
+        repo: &mut R,
         owner_kind: &str,
         owner_id: i64,
     ) -> Result<(), AppError> {
         match owner_kind {
             "PART" => {
-                let exists: Option<(i64,)> =
-                    sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
-                        .bind(owner_id)
-                        .fetch_optional(&mut *conn)
-                        .await?;
-                if exists.is_none() {
+                if !repo.part_owner_exists(owner_id).await? {
                     return Err(AppError::biz(
                         code::BIZ_PART_FILE_OWNER_NOT_FOUND,
                         format!("part {owner_id} 不存在"),
@@ -267,13 +283,7 @@ impl PartFileService {
                 }
             }
             "ASSEMBLY" => {
-                let exists: Option<(i64,)> = sqlx::query_as(
-                    "SELECT id FROM t_assembly WHERE id = $1 AND deleted_at IS NULL",
-                )
-                .bind(owner_id)
-                .fetch_optional(&mut *conn)
-                .await?;
-                if exists.is_none() {
+                if !repo.assembly_owner_exists(owner_id).await? {
                     return Err(AppError::biz(
                         code::BIZ_PART_FILE_OWNER_NOT_FOUND,
                         format!("assembly {owner_id} 不存在"),
@@ -335,21 +345,31 @@ fn sanitize_filename(name: &str) -> String {
     out
 }
 
-// 公开给装配体 upload-files 端点用的辅助：列出某 owner 的 part_file（不限定 kind）。
+/// 公开给装配体 upload-files 端点用的辅助：列出某 owner 的 part_file（不限定 kind）。
 #[allow(dead_code)]
 pub async fn list_part_files_for_owner(
     conn: &mut PgConnection,
     owner_kind: &str,
     owner_id: i64,
 ) -> Result<Vec<TPartFile>, sqlx::Error> {
-    PartFileRepo::list_by_owner(conn, owner_kind, owner_id).await
+    crate::modules::part_file::repo::PartFileRepo::list_by_owner(conn, owner_kind, owner_id).await
 }
 
-// ===== 2026-09-16 M2-B 业务层：bind_uploaded_file（confirm + batch_create 共享） =====
+// ===== 2026-09-16 M2-B 业务层：bind_uploaded_file（confirm + batch_create 共享） ==============
 //
 // 2026-09-18 注：原 `upload_intents` 业务函数已**删除**（迁移至 upload_session 域）。
 // 保留 `bind_uploaded_file` 给 confirm handler + batch_create service 共用：
 // head/copy 在 tx 之外，事务内只做 soft_delete + INSERT。
+//
+// 2026-09-22 重构说明：本方法是「事务由 service 自管」的特例——
+// - 调用方：`part/handler/batch.rs::confirm_part_file`（part 域，不在本 worktree 范围）
+//   + `part/service/batch.rs::prepare_binding_head_copy`（part 域，同样不在范围）。
+// - 两者当前都是 `PartFileService::bind_uploaded_file(...)` 静态调用风格（无 `&self`）。
+// - 为避免改动 part 域（spec §禁区 #7：禁止碰其他 13 域），本方法保持原签名
+//   （pool / snowflake / cos 全部参数化），由 service 自行 `pool.begin()` 开 tx；
+//   tx 内 DB 操作仍走 trait 模式（`&mut *tx` 直接喂给 `PartFileRepoTrait`）。
+// - 这是 handler 移交事务范式的**唯一例外**，余下 5 个 part_file 端点
+//   （upload/list/get_url/get_content/soft_delete）均按 handler 管 tx 范式改造。
 
 impl PartFileService {
     /// 共享 service：把已上传到 COS tmp 区的一个对象绑定到 owner（INSERT t_part_file）。
@@ -361,19 +381,20 @@ impl PartFileService {
     /// 2. `head_object` 校验对象存在 + size 与声明一致：
     ///    - 不存在 → `BIZ_PART_FILE_TMP_OBJECT_MISSING` 21114
     ///    - size 不一致 → `BIZ_PART_FILE_SIZE_MISMATCH` 21115
-    /// 3. 单文件 kind（DRAWING / 3D_MODEL）：事务内先 soft_delete 旧活跃行（保留 owner+kind+deleted_at IS NULL）
-    /// 4. 派生 CAS key：`util::cos_key::build_cas_key(prefix, "part", owner_id, kind, sha16, filename)`
-    /// 5. `cos.copy_object(tmp_key, cas_key)` —— 走 PermanentCos（不走 STS）
-    /// 6. INSERT t_part_file（upload_status="READY"）
-    /// 7. 返回 `(PartFileOut, tmp_key)` —— `tmp_key` 由 caller 拿到后 spawn 异步
-    ///    `delete_object(tmp_key)` 兜底清理
+    /// 3. 派生 CAS key：`util::cos_key::build_cas_key(prefix, "part", owner_id, kind, sha16, filename)`
+    /// 4. `cos.copy_object(tmp_key, cas_key)` —— 走 PermanentCos（不走 STS）
+    /// 5. copy_object 成功后**立刻 spawn** best-effort delete_object(tmp_key) 早期清理
+    /// 6. 开 tx：soft_delete 旧活跃行（`uk_t_part_file_single` 部分唯一约束） + INSERT 新行
+    /// 7. commit
+    /// 8. 返回 `(PartFileOut, tmp_key)` —— caller 拿到 tmp_key 后**已 commit**，再
+    ///    spawn 异步 delete_object(tmp_key) 兜底清理
     ///
     /// **重要**：head/copy 是外部 IO，**不**放进事务 tx 里——tx 里只做 DB（事务回滚时
-    /// IO 已发生难恢复）。顺序：先 head（tx 之外，pool 直连）→ copy（tx 之外，pool 直连）
-    /// → 开 tx → soft_delete + INSERT → commit → caller spawn 异步 delete_object(tmp_key)
-    /// 兜底清理。
+    /// IO 已发生难恢复），依赖 5 / 8 两层 spawn 双层防护。
     ///
-    /// 注：`pool` 直接传（不是 `&mut tx`）—— head/copy 必须用 pool，确保与 tx 隔离。
+    /// 注：pool 直接传（不是 `&mut tx`）—— head/copy 用 pool 直连，确保与 tx 隔离。
+    /// 本方法自管 tx（part 域 caller 不开 tx），不依赖 handler 借连接——是事务范式的
+    /// 唯一例外（详见模块 doc-comment）。
     #[allow(clippy::too_many_arguments)]
     pub async fn bind_uploaded_file(
         pool: &PgPool,
@@ -409,7 +430,7 @@ impl PartFileService {
             ));
         }
 
-        // 4. head_object（IO 在 pool 上，不在 tx 里）
+        // 4. head_object（IO，无 DB）
         let meta = cos.head_object(tmp_key).await.map_err(|e| {
             AppError::biz(
                 code::BIZ_PART_FILE_TMP_OBJECT_MISSING,
@@ -441,7 +462,7 @@ impl PartFileService {
             original_filename,
         );
 
-        // 6. copy_object（IO 在 pool 上）
+        // 6. copy_object（IO，无 DB）
         cos.copy_object(tmp_key, &cas_key).await.map_err(|e| {
             AppError::biz(
                 code::BIZ_PART_FILE_UPLOAD_FAILED,
@@ -472,23 +493,21 @@ impl PartFileService {
             }
         });
 
-        // 7. 开 tx：soft_delete 旧 + INSERT 新 + readback
+        // 7. 开 tx：soft_delete 旧 + INSERT 新 + readback（事务范式特例：本方法自管 tx）
         let mut tx = pool.begin().await?;
         // 单文件 kind（DRAWING / 3D_MODEL）下，旧活跃行要先 soft_delete
         // （`uk_t_part_file_single` 部分唯一约束）。
-        let _ = sqlx::query(
-            "UPDATE t_part_file \
-             SET deleted_at = now(), version = version + 1, updated_at = now(), updated_by = $2 \
-             WHERE part_id = $1 AND kind = $3 AND deleted_at IS NULL",
+        let mut repo: &mut sqlx::PgConnection = &mut tx;
+        let _ = PartFileRepoTrait::soft_delete_active_by_part_kind(
+            &mut repo,
+            owner_id,
+            current.id,
+            kind,
         )
-        .bind(owner_id)
-        .bind(current.id)
-        .bind(kind)
-        .execute(&mut *tx)
         .await?;
         let new_id = snowflake.next_id();
-        PartFileRepo::create_part_file(
-            &mut *tx,
+        PartFileRepoTrait::create_part_file(
+            &mut repo,
             NewPartFile {
                 id: new_id,
                 part_id: owner_id,
@@ -513,7 +532,7 @@ impl PartFileService {
             }
             AppError::from(e)
         })?;
-        let row = PartFileRepo::get_by_id(&mut *tx, new_id, true)
+        let row = PartFileRepoTrait::get_by_id(&mut repo, new_id, true)
             .await?
             .ok_or_else(|| AppError::internal("刚 INSERT 的 part_file 查不到"))?;
         let out = Self::render_out(&row, "PART");
@@ -523,7 +542,7 @@ impl PartFileService {
     }
 }
 
-// ===== 2026-09-15 takeover-fill：content / delete（Phase 3 补齐） =====
+// ===== 2026-09-15 takeover-fill：content / delete（Phase 3 补齐） ==========================
 
 /// 后端代理文件二进制流：拉 `object_key` → COS `get_object` → 透传 content_type。
 ///
@@ -535,8 +554,9 @@ pub struct PartFileContent {
 
 impl PartFileService {
     /// `GET /api/v2/part-files/{file_id}/content`。
-    pub async fn get_file_content(
-        conn: &mut PgConnection,
+    pub async fn get_file_content<R: PartFileRepoTrait>(
+        &self,
+        mut repo: R,
         cos: Arc<dyn CosClient>,
         file_id: i64,
         current: &CurrentUser,
@@ -547,7 +567,8 @@ impl PartFileService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let row = PartFileRepo::get_by_id(conn, file_id, false)
+        let row = repo
+            .get_by_id(file_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -572,14 +593,15 @@ impl PartFileService {
     /// 返回软删行的 `object_key`，由 **handler 在 `tx.commit()` 之后** 异步
     /// `tokio::spawn(cos.delete_object(...))`——避免 commit 失败却已触发
     /// COS 删除、孤儿对象风险（2026-09-15 review 第 1 轮 A2 修）。
-    pub async fn soft_delete_file(
-        conn: &mut PgConnection,
-        _cos: Arc<dyn CosClient>,
+    pub async fn soft_delete_file<R: PartFileRepoTrait>(
+        &self,
+        mut repo: R,
         file_id: i64,
         version: i32,
         current: &CurrentUser,
     ) -> Result<String, AppError> {
-        let row = PartFileRepo::get_by_id(&mut *conn, file_id, false)
+        let row = repo
+            .get_by_id(file_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -607,21 +629,10 @@ impl PartFileService {
             }
         }
 
-        let rows_affected = sqlx::query(
-            "UPDATE t_part_file \
-             SET deleted_at = now(), \
-                 version    = version + 1, \
-                 updated_at = now(), \
-                 updated_by = $2 \
-             WHERE id = $1 AND version = $3 AND deleted_at IS NULL",
-        )
-        .bind(file_id)
-        .bind(current.id)
-        .bind(version)
-        .execute(conn)
-        .await
-        .map_err(AppError::from)?
-        .rows_affected();
+        let rows_affected = repo
+            .soft_delete_file(file_id, version, current.id)
+            .await
+            .map_err(AppError::from)?;
         if rows_affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,

@@ -6,6 +6,11 @@
 //! 2026-09-21 事务分层重构：iam 域不再注入 `IamUowProvider`（事务移交 handler 后，
 //! service 仅持雪花 ID 生成器 / 配置 / session store / 跨域委托）。handler 自行
 //! `state.pool.begin()` / `acquire()`。
+//!
+//! 2026-09-22 Group C 重构：`cnc_program_service` / `part_file_service` 装线。
+//! 两个 service 字段仅 `Arc<SnowflakeIdGenerator>` + `Arc<dyn CosClient>`，事务由
+//! handler 借 `&mut *tx` / `&mut *conn` 喂给 trait（`CncProgramRepoTrait` /
+//! `PartFileRepoTrait`，均直接 `impl for &mut PgConnection`）。
 
 use std::sync::Arc;
 
@@ -18,10 +23,13 @@ use crate::infra::cos::CosClient;
 use crate::infra::python_sts::PythonSts;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsHub;
+use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
+use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::iam::service::{AccountService, SessionService};
 use crate::modules::outsource::service::OutsourceService;
+use crate::modules::part_file::service::PartFileService;
 use crate::modules::prod::process_chain::service::crud::ProcessChainService;
 use crate::modules::upload_session::repo::UploadSessionRepo;
 
@@ -68,6 +76,17 @@ pub struct AppState {
     /// 字段仅 `snowflake`；handler 借 `&mut *tx` / `&mut *conn` 喂给 `OutsourceRepoTrait`
     /// 胖 trait（impl on `&mut PgConnection`）。
     pub outsource_service: Arc<OutsourceService>,
+    /// 2026-09-22 Group C 新增：part_file service。字段 `Arc<SnowflakeIdGenerator>` +
+    /// `Arc<dyn CosClient>`；handler 借 `&mut *tx` 喂给 `PartFileRepoTrait`。
+    /// 6 个 handler 端点（upload/list/get_url/get_content/soft_delete）走 handler 管 tx
+    /// 范式；`bind_uploaded_file` 是事务范式特例（part 域 caller 不开 tx，由 service 自管）。
+    pub part_file_service: Arc<PartFileService>,
+    /// 2026-09-22 Group C 新增：cnc_program service。字段 `Arc<SnowflakeIdGenerator>` +
+    /// `Arc<dyn CosClient>`；handler 借 `&mut *tx` 喂给 `CncProgramRepoTrait`。
+    /// 5 个 handler 端点（upload_cnc_pair / list_pairs_for_part / 3 个 alias）走 handler 管 tx 范式。
+    /// 3 个 alias 端点（download-url / content / delete）由 handler 直接转发到
+    /// `state.part_file_service.method(&mut *tx, ...)`，不抽 trait 到 part_file。
+    pub cnc_program_service: Arc<CncProgramService>,
 }
 
 impl AppState {
@@ -98,6 +117,9 @@ impl AppState {
         let process_chain_service = Arc::new(ProcessChainService::new(snowflake.clone()));
         // 2026-09-22 outsource service 装线：仅需 snowflake（16 端点 company + quote + shipment）。
         let outsource_service = Arc::new(OutsourceService::new(snowflake.clone()));
+        // 2026-09-22 Group C 装线：part_file + cnc_program service；字段含 snowflake + cos。
+        let part_file_service = Arc::new(PartFileService::new(snowflake.clone(), cos.clone()));
+        let cnc_program_service = Arc::new(CncProgramService::new(snowflake.clone(), cos.clone()));
         Self {
             pool,
             config,
@@ -112,8 +134,10 @@ impl AppState {
             session_service,
             customer_service,
             applicant_service,
-            process_chain_service,
+process_chain_service,
             outsource_service,
+            part_file_service,
+            cnc_program_service,
         }
     }
 }

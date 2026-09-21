@@ -1,4 +1,5 @@
-//! part_file 域 HTTP handler（2026-09-14 Phase 3 + 2026-09-15 takeover-fill + followup-cleanup + 2026-09-16 M2-B 业务层 + 2026-09-18 upload-intents 删除）
+//! part_file 域 HTTP handler（2026-09-14 Phase 3 + 2026-09-15 takeover-fill + followup-cleanup
+//! + 2026-09-16 M2-B 业务层 + 2026-09-18 upload-intents 删除 + 2026-09-22 对齐 iam 范式）
 //!
 //! 对应 Python myERP/api/v1/part_file.py。
 //!
@@ -25,12 +26,26 @@
 //!
 //! 2026-09-15 followup A8：从 `part/handler.rs` 拆过来，原 1491 行单文件降到 1000 行内。
 //!
+//! ## 事务边界（2026-09-22 重构对齐 iam 范式）
+//! handler 负责 `pool.begin()` / `tx.commit()` —— service 不知事务：
+//! - ① **纯写端点**（upload_part_file / upload_cad_files / upload_cnc_program /
+//!   upload_setup_sheet / upload_cnc_pair）：`pool.begin()` → `state.part_file_service.xxx(&mut tx, ...)`
+//!   → `tx.commit()`，错误路径 tx drop 隐式回滚。
+//! - ② **写 + post-commit 副作用**（soft_delete_part_file）：`pool.begin()` →
+//!   `state.part_file_service.soft_delete_file(&mut tx, ...)` → 拿到 object_key 后
+//!   `tx.commit()` → handler `tokio::spawn(cos.delete_object(...))`（review A2 约定：
+//!   commit 在前，spawn 在后）。
+//! - ③ **读端点**（list_part_files / get_part_file_url / get_part_file_content /
+//!   list_part_files_for_part / list_part_cnc_programs / list_part_setup_sheets）：
+//!   `pool.begin()` → service 跑查询 → `tx.commit()`。
+//!
+//! service 仅业务逻辑（方法签名 `<R: PartFileRepoTrait>(&self, mut repo: R, ...)`，
+//! `PartFileRepoTrait` 已对 `&mut PgConnection` 实现），handler/service 借
+//! `&mut *tx` / `&mut *conn` 喂给 trait。
+//!
 //! ## 约束
-//! - 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
-//!   `tx.commit()`；提前 return 时 `Transaction` 的 Drop 自动回滚。
 //! - 统一响应信封：`Result<Json<R<T>>, AppError>`。
 //! - 权限在 service 层（`current.require_any_role(...)` 守卫）。
-//! - COS 客户端从 `state.cos` 拿；handler 注入到 service。
 //! - WS 广播：本域不上报 WS 事件（part_file 是只读资产）。
 
 use std::sync::Arc;
@@ -46,11 +61,9 @@ use axum::{
 use serde::Deserialize;
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::part_file::dto::{
     PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut,
 };
-use crate::modules::part_file::service::PartFileService;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -129,19 +142,19 @@ pub async fn upload_part_file(
     let content_type = file_content_type.unwrap_or_else(|| "application/octet-stream".to_string());
 
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &state.snowflake,
-        state.cos.clone(),
-        &data.owner_kind,
-        owner_id,
-        &data.kind,
-        &filename,
-        &content_type,
-        bytes,
-        &current,
-    )
-    .await?;
+    let out = state
+        .part_file_service
+        .upload_file_for_owner(
+            &mut *tx,
+            &data.owner_kind,
+            owner_id,
+            &data.kind,
+            &filename,
+            &content_type,
+            bytes,
+            &current,
+        )
+        .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
@@ -153,7 +166,10 @@ pub async fn list_part_files(
     Query(query): Query<PartFileListQuery>,
 ) -> Result<Json<R<PartFileListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::list_files(&mut tx, &query, &current).await?;
+    let out = state
+        .part_file_service
+        .list_files(&mut *tx, &query, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -165,8 +181,10 @@ pub async fn get_part_file_url(
     Path(file_id): Path<i64>,
 ) -> Result<Json<R<PartFileWithUrlOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out =
-        PartFileService::get_file_with_url(&mut tx, state.cos.clone(), file_id, &current).await?;
+    let out = state
+        .part_file_service
+        .get_file_with_url(&mut *tx, state.cos.clone(), file_id, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -181,8 +199,10 @@ pub async fn get_part_file_content(
     Path(file_id): Path<i64>,
 ) -> Result<Response, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out =
-        PartFileService::get_file_content(&mut tx, state.cos.clone(), file_id, &current).await?;
+    let out = state
+        .part_file_service
+        .get_file_content(&mut *tx, state.cos.clone(), file_id, &current)
+        .await?;
     tx.commit().await?;
     let resp = Response::builder()
         .status(StatusCode::OK)
@@ -197,7 +217,7 @@ pub async fn get_part_file_content(
     Ok(resp)
 }
 
-/// `POST /api/v2/part-files/{file_id}/delete` —— 软删 + COS 异步清理。
+/// `POST /api/v2/part-files/{file_id}/delete` —— 软删 + COS 异步清理（形态 ②）。
 ///
 /// 入参（JSON）：`{ version: i32 }`（OCC）。
 /// 权限：按 kind 派生角色（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；
@@ -213,14 +233,10 @@ pub async fn soft_delete_part_file(
     Json(req): Json<DeletePartFileRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let object_key = PartFileService::soft_delete_file(
-        &mut tx,
-        state.cos.clone(),
-        file_id,
-        req.version,
-        &current,
-    )
-    .await?;
+    let object_key = state
+        .part_file_service
+        .soft_delete_file(&mut *tx, file_id, req.version, &current)
+        .await?;
     // commit 在前：DB 已是最终态，再触发副作用
     tx.commit().await?;
     // commit 后再异步触发 COS 删除（best-effort，失败仅 warn）
@@ -312,19 +328,19 @@ pub async fn upload_cad_files(
     current.require_any_role(&[Role::Manager, Role::Clerk, Role::CncProgrammer])?;
     let (data, fname, ct) = read_part_file_multipart(multipart).await?;
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &state.snowflake,
-        state.cos.clone(),
-        "PART",
-        part_id,
-        "CAD_2D",
-        &fname,
-        &ct,
-        data,
-        &current,
-    )
-    .await?;
+    let out = state
+        .part_file_service
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "CAD_2D",
+            &fname,
+            &ct,
+            data,
+            &current,
+        )
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -339,19 +355,19 @@ pub async fn upload_cnc_program(
     current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
     let (data, fname, ct) = read_part_file_multipart(multipart).await?;
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &state.snowflake,
-        state.cos.clone(),
-        "PART",
-        part_id,
-        "G_CODE",
-        &fname,
-        &ct,
-        data,
-        &current,
-    )
-    .await?;
+    let out = state
+        .part_file_service
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "G_CODE",
+            &fname,
+            &ct,
+            data,
+            &current,
+        )
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -366,24 +382,27 @@ pub async fn upload_setup_sheet(
     current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
     let (data, fname, ct) = read_part_file_multipart(multipart).await?;
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::upload_file_for_owner(
-        &mut tx,
-        &state.snowflake,
-        state.cos.clone(),
-        "PART",
-        part_id,
-        "SETUP_SHEET",
-        &fname,
-        &ct,
-        data,
-        &current,
-    )
-    .await?;
+    let out = state
+        .part_file_service
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "SETUP_SHEET",
+            &fname,
+            &ct,
+            data,
+            &current,
+        )
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `POST /parts/{part_id}/cnc-pair` —— 一次提交 G_CODE + SETUP_SHEET。
+///
+/// 2026-09-22 重构：委托给 `state.cnc_program_service`（与 `cnc-programs/pairs` 同形），
+/// 不再走 `part_file` 的上传逻辑。`part_file::handler` 不直接耦合 cnc_program 业务。
 pub async fn upload_cnc_pair(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -422,20 +441,20 @@ pub async fn upload_cnc_pair(
     let (g_bytes, g_name, g_ct) = g.ok_or_else(|| AppError::validation("缺少 g_code 字段"))?;
     let (s_bytes, s_name, s_ct) = s.ok_or_else(|| AppError::validation("缺少 setup_sheet 字段"))?;
     let mut tx = state.pool.begin().await?;
-    let out = CncProgramService::upload_cnc_pair(
-        &mut tx,
-        &state.snowflake,
-        state.cos.clone(),
-        part_id,
-        g_bytes,
-        &g_name,
-        &g_ct,
-        s_bytes,
-        &s_name,
-        &s_ct,
-        &current,
-    )
-    .await?;
+    let out = state
+        .cnc_program_service
+        .upload_cnc_pair(
+            &mut *tx,
+            part_id,
+            g_bytes,
+            &g_name,
+            &g_ct,
+            s_bytes,
+            &s_name,
+            &s_ct,
+            &current,
+        )
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -461,7 +480,10 @@ pub async fn list_part_files_for_part(
         offset: Some(0),
     };
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::list_files(&mut tx, &q, &current).await?;
+    let out = state
+        .part_file_service
+        .list_files(&mut *tx, &q, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -480,7 +502,10 @@ pub async fn list_part_cnc_programs(
         offset: Some(0),
     };
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::list_files(&mut tx, &q, &current).await?;
+    let out = state
+        .part_file_service
+        .list_files(&mut *tx, &q, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -499,7 +524,10 @@ pub async fn list_part_setup_sheets(
         offset: Some(0),
     };
     let mut tx = state.pool.begin().await?;
-    let out = PartFileService::list_files(&mut tx, &q, &current).await?;
+    let out = state
+        .part_file_service
+        .list_files(&mut *tx, &q, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
