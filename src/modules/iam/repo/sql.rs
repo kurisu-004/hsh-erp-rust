@@ -1,4 +1,4 @@
-//! iam 域数据访问
+//! iam 域数据访问（SQL 真源，零 diff 搬迁自 `repo.rs`）
 //!
 //! 对应 Python myERP/repository/user_repository.py。函数签名接收 `impl PgExecutor<'_>`，
 //! 兼容 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。
@@ -12,11 +12,15 @@
 //!
 //! 2026-09-19 IAM 域合并：从 `modules::user::repo` 整体迁移过来（路径变化，
 //! SQL 与签名零 diff）。
+//!
+//! 2026-09-21 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff，
+//! `.sqlx/query-*.json` 哈希不变；新增的 `IamRepo` trait 与 `PgIamRepo` 实现分别在
+//! `repo/mod.rs` 与 `repo/pg.rs`。
 
 use chrono::NaiveDateTime;
 use sqlx::PgExecutor;
 
-use super::model::{Menu, Shelf, User, UserRole};
+use crate::modules::iam::model::{Menu, Shelf, User, UserRole};
 
 /// `t_user_role` LEFT JOIN `t_shelf` 后的读模型（附带货架编号/名称）
 #[derive(Debug, Clone)]

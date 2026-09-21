@@ -136,7 +136,9 @@ delivery_note/
   //! - `list_with_part_by_delivery_note` —— 同上，JOIN t_part 一次拿齐（防 N+1）
   ```
 
-**repo 函数签名约定**：接收 `impl PgExecutor<'_>`，可同时接受 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。**例外**：方法需在同一事务内连发多条 SQL 时收 `&mut PgConnection`，并在该函数 `///` 注释里说明。新代码不再写裸 `&mut PgConnection` 跨 service 调用——改走 `uow.user_repo().xxx()` 访问器模式，让 service 控制 tx 生命周期。
+**repo 函数签名约定**：接收 `impl PgExecutor<'_>`，可同时接受 `&PgPool` / `&mut PgConnection` / `&mut Transaction`。**例外**：方法需在同一事务内连发多条 SQL 时收 `&mut PgConnection`，并在该函数 `///` 注释里说明。
+
+**事务边界与 repo 范式（2026-09-21 iam 范本）**：事务由 handler `state.pool.begin()` 开 + `tx.commit()` 收，service 不知事务。Service 方法签名 `<R: IamRepo>(&self, repo: &mut R, ...)`，`repo` 是 handler 借该 tx 构造的 `PgIamRepo<'a>`（短生命周期，借 `&mut PgConnection`，不可存 `AppState`）。**不再**写裸 `&mut PgConnection` 跨 service 调用——`PgIamRepo` 在 handler 一次性栈上构造。UowProvider / IamUnitOfWork 等中介物整体删除。
 
 **Code review 检查项**（每个 PR 都要过）：
 
@@ -362,6 +364,7 @@ let seq = g.sequence.wrapping_add(1) & MAX_SEQUENCE;
 - [ ] 拆分 `src/modules/part/handler.rs`（**1244** → 按 `handler/{crud, inspection, lifecycle, phase1}.rs` 拆）
 - [ ] 拆分 `src/modules/delivery_note/handler.rs`（785 → 按 CRUD / scan / print / group 拆，接近红线）
 - [ ] user 域 UoW 接入（v4 已完成；其余 17 域按 V8 supertrait 模式各自接入）
+  - ✅ 2026-09-21 iam 域先行完成事务分层重构：handler 接管 begin/commit + 胖 trait `IamRepo` + `PgIamRepo<'a>` 借连接 + `MockIamRepo` 单测。**UoW 范式整体废弃**，不再有 V8 supertrait 复合的接口需求；其余 17 域按 iam 范本迁移。
 - [ ] 接入 `cargo-llvm-cov` 为 dev-dependency
 - [ ] 新增 `.github/workflows/ci.yml`：cargo check / clippy / test / sqlx_prepare / coverage gate
 - [ ] 新增 `clippy.toml`：`cognitive_complexity_threshold = 30`、`too_many_arguments_threshold = 8`、`type_complexity_threshold = 250`

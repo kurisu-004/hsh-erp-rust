@@ -2,16 +2,14 @@
 //!
 //! 对应 Python myERP/service/user.py。
 //!
-//! ## 事务边界（2026-09-18 重构 + 2026-09-19 IAM 合并）
-//! Service 持 `Arc<dyn IamUowProvider>`，所有数据访问经 `uow.user_repo().xxx()` /
-//! `uow.user_role_repo().xxx()` / `uow.menu_repo().xxx()` / `uow.shelf_repo().xxx()`
-//! 访问器；写端点最后 `uow.commit().await?`（消费 Box），读端点直接 drop（隐式回滚）。
-//! Handler 不再开 tx，完全薄壳化（见 `handler.rs`）。
+//! ## 事务边界（2026-09-21 重构）
+//! 事务移交 handler（与 20 个 handler 文件现状对齐）：service 仅业务逻辑，所有跨 repo
+//! 操作经 `repo: &mut R`（`R: IamRepo`）参数传入。service 不知事务——handler `pool.begin()` +
+//! `tx.commit()` 包外，写端点 commit 后做 post-commit 副作用（Redis session 删/WS 广播）。
 //!
 //! ## Session 清理
-//! `change_own_password` / `admin_reset_password` 在 `uow.commit().await?` **之后**
-//! 调用 `self.session.delete_all_user_sessions(user_id)`，best-effort 失败只打 warn；
-//! DB 的 `refresh_token_version` 轮转是兜底。
+//! `change_own_password` / `admin_reset_password` 不再自己清 Redis session：服务内只更新
+//! DB（refresh_token_version 轮转），handler 在 commit 之后调 `state.session.delete_all_user_sessions(...)`。
 //!
 //! ## 与 Python 的错误码映射
 //! Python 的 `BIZ_INVALID_VALUE = 20104` / `BIZ_SHELF_NOT_FOUND = 20501` 尚未进入
@@ -20,31 +18,29 @@
 //! - 货架不存在 / zone 非法 / 已停用 → `NOT_FOUND`(40400)
 //!   （Python 对这三种情况复用同一个 20501，仅 HTTP 状态码不同）
 //!
-//! 待 205xx / 201xx 段补齐后可无损替换。
-//!
 //! 2026-09-19 IAM 域合并：`UserService` → `AccountService`，方法签名 + 业务逻辑零 diff，
-//! 仅路径变更。`menus_for_roles` / `current_user_out` 仍保留在本服务，作为
-//! `SessionService`（原 AuthService）跨域委托的目标。
+//! 仅路径变更。
+//!
+//! 2026-09-21 事务分层重构：`uow_provider` 字段移除，方法签名全部加 `repo: &mut R`；
+//! `change_own_password` / `admin_reset_password` 不再内部 commit + 清 session（移交
+//! handler）；helpers 改 `&mut R`。
 
 use std::sync::Arc;
 
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::auth::session::SessionStore;
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::shared::error::{AppError, code};
 
 use super::menu::build_menu_tree;
-// `iam/service/` 子目录中 dto / model / repo / uow 是 sibling 的兄弟模块 —— 用 `super::super::` 跨级
+// `iam/service/` 子目录中 dto / model / repo 是 sibling 的兄弟模块 —— 用 `super::super::` 跨级
 use super::super::dto::{
     CurrentUserOut, MenuNodeOut, UserAddRoleRequest, UserCreateRequest, UserListOut, UserListQuery,
     UserOut, UserRoleOut, UserUpdateRequest,
 };
 use super::super::model::User;
-// struct 来自 repo.rs（uow.rs 只 re-export trait，不 re-export struct）
-use super::super::repo::{UserInsert, UserRoleInsert, UserRoleRow};
-use super::super::uow::{IamUnitOfWork, IamUowProvider};
+use super::super::repo::{IamRepo, UserInsert, UserRoleInsert, UserRoleRow};
 
 /// 管理员重置密码时写入的默认口令（对齐 Python `DEFAULT_RESET_PASSWORD`）
 pub const DEFAULT_RESET_PASSWORD: &str = "changeme";
@@ -88,42 +84,32 @@ fn trimmed_or_none(v: &str) -> Option<String> {
     }
 }
 
-/// iam 域账号管理 service。实例字段 = UoW 来源 + 雪花 ID + session 存储：
-/// - `uow_provider` 是唯一事务入口（handler 不再开 tx）
-/// - `snowflake` 由 AppState 注入（与 Python `SNOWFLAKE_INSTANCE=0` 区分：rust 用实例号 1）
-/// - `session` 在 commit 后用于清该用户的 Redis session（自助改密 / 管理员重置）
+/// iam 域账号管理 service（2026-09-21 重构后）
+///
+/// 字段仅 `snowflake`（事务已移交 handler；session 清理也移交 handler）。实例为轻壳，
+/// 可直接 `Arc<AccountService>` 存 `AppState`；方法签名收 `repo: &mut R`，单测用
+/// `MockIamRepo` 直接注入。
 pub struct AccountService {
-    uow_provider: Arc<dyn IamUowProvider>,
     snowflake: Arc<SnowflakeIdGenerator>,
-    session: Arc<dyn SessionStore>,
 }
 
 impl AccountService {
-    /// 三段装线入口：`AppState::new` 调用，注入 provider + snowflake + session。
-    pub fn new(
-        uow_provider: Arc<dyn IamUowProvider>,
-        snowflake: Arc<SnowflakeIdGenerator>,
-        session: Arc<dyn SessionStore>,
-    ) -> Self {
-        Self {
-            uow_provider,
-            snowflake,
-            session,
-        }
+    /// 构造：仅需雪花 ID 生成器。
+    pub fn new(snowflake: Arc<SnowflakeIdGenerator>) -> Self {
+        Self { snowflake }
     }
 
     // =======================================================================
     // 列表 / 详情
     // =======================================================================
 
-    pub async fn list_users(
+    pub async fn list_users<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         query: &UserListQuery,
         current: &CurrentUser,
     ) -> Result<UserListOut, AppError> {
         current.require_role(Role::Manager)?;
-
-        let mut uow = self.uow_provider.begin().await?;
 
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0).max(0);
@@ -133,18 +119,14 @@ impl AccountService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let rows = uow
-            .user_repo()
+        let rows = repo
             .list_with_filters(like, query.is_active, limit, offset)
             .await?;
-        let total = uow
-            .user_repo()
-            .count_with_filters(like, query.is_active)
-            .await?;
+        let total = repo.count_with_filters(like, query.is_active).await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for u in rows {
-            let roles = uow.user_role_repo().list_by_user(u.id).await?;
+            let roles = repo.list_by_user(u.id).await?;
             items.push(Self::assemble_user_out(u, roles));
         }
 
@@ -156,16 +138,19 @@ impl AccountService {
         })
     }
 
-    pub async fn get_user(&self, user_id: i64, current: &CurrentUser) -> Result<UserOut, AppError> {
+    pub async fn get_user<R: IamRepo + ?Sized>(
+        &self,
+        repo: &mut R,
+        user_id: i64,
+        current: &CurrentUser,
+    ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
-        let mut uow = self.uow_provider.begin().await?;
 
-        let u = uow
-            .user_repo()
+        let u = repo
             .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
-        let roles = uow.user_role_repo().list_by_user(u.id).await?;
+        let roles = repo.list_by_user(u.id).await?;
         Ok(Self::assemble_user_out(u, roles))
     }
 
@@ -173,13 +158,13 @@ impl AccountService {
     // 创建 / 更新 / 停用
     // =======================================================================
 
-    pub async fn create_user(
+    pub async fn create_user<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         req: &UserCreateRequest,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
-        let mut uow = self.uow_provider.begin().await?;
 
         let username = req.username.trim().to_lowercase();
         if username.is_empty() {
@@ -190,7 +175,7 @@ impl AccountService {
         }
 
         // 显式查重（partial unique 索引仍是最终防线，见下方 INSERT 的错误映射）
-        if uow.user_repo().get_by_username(&username).await?.is_some() {
+        if repo.get_by_username(&username).await?.is_some() {
             return Err(AppError::biz(
                 code::DUPLICATE_USERNAME,
                 format!("username '{username}' already exists"),
@@ -213,34 +198,26 @@ impl AccountService {
             created_by: Some(current.id),
         };
 
-        uow.user_repo()
-            .create(&insert)
-            .await
-            .map_err(map_duplicate_username)?;
+        repo.create(&insert).await.map_err(map_duplicate_username)?;
 
-        let u = uow
-            .user_repo()
+        let u = repo
             .get_by_id(insert.id)
             .await?
             .ok_or_else(|| AppError::internal("创建后回读用户失败"))?;
-        let roles = uow.user_role_repo().list_by_user(u.id).await?;
-        let out = Self::assemble_user_out(u, roles);
-
-        uow.commit().await?;
-        Ok(out)
+        let roles = repo.list_by_user(u.id).await?;
+        Ok(Self::assemble_user_out(u, roles))
     }
 
-    pub async fn update_user(
+    pub async fn update_user<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         user_id: i64,
         req: &UserUpdateRequest,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
-        let mut uow = self.uow_provider.begin().await?;
 
-        let u = uow
-            .user_repo()
+        let u = repo
             .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
@@ -268,8 +245,7 @@ impl AccountService {
             None => None,
         };
 
-        let affected = uow
-            .user_repo()
+        let affected = repo
             .update_partial(
                 u.id,
                 u.version,
@@ -286,35 +262,29 @@ impl AccountService {
             return Err(version_conflict());
         }
 
-        let updated = uow
-            .user_repo()
+        let updated = repo
             .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
-        let roles = uow.user_role_repo().list_by_user(updated.id).await?;
-        let out = Self::assemble_user_out(updated, roles);
-
-        uow.commit().await?;
-        Ok(out)
+        let roles = repo.list_by_user(updated.id).await?;
+        Ok(Self::assemble_user_out(updated, roles))
     }
 
     /// 停用账号 = 软删（置 `deleted_at` + `is_active = false`）
-    pub async fn deactivate_user(
+    pub async fn deactivate_user<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
-        let mut uow = self.uow_provider.begin().await?;
 
-        let u = uow
-            .user_repo()
+        let u = repo
             .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        let affected = uow
-            .user_repo()
+        let affected = repo
             .soft_delete(u.id, u.version, now_naive(), Some(current.id))
             .await?;
         if affected == 0 {
@@ -323,9 +293,9 @@ impl AccountService {
 
         // 软删后 get_by_id 会过滤掉该行，故用内存中的行 + 手工推进字段组装出参
         // （对齐 Python `_to_out(u, include_deleted=True)`）。
-        let roles = uow.user_role_repo().list_by_user(u.id).await?;
+        let roles = repo.list_by_user(u.id).await?;
         let now = now_naive();
-        let out = Self::assemble_user_out(
+        Ok(Self::assemble_user_out(
             User {
                 is_active: false,
                 deleted_at: Some(now),
@@ -335,10 +305,7 @@ impl AccountService {
                 ..u
             },
             roles,
-        );
-
-        uow.commit().await?;
-        Ok(out)
+        ))
     }
 
     // =======================================================================
@@ -347,11 +314,12 @@ impl AccountService {
 
     /// 自助改密：校验旧密码，写新哈希并轮转 refresh token（同一条 UPDATE，原子）。
     ///
-    /// 允许本人或 MANAGER 调用。注意与 `update_user` 的区别：这里**会**踢下线。
-    /// 流程：begin uow → 校验旧密码 → UPDATE 写新密码 + 轮转 ver → `uow.commit().await?`
-    /// → `self.session.delete_all_user_sessions(user_id)`（best-effort）。
-    pub async fn change_own_password(
+    /// 允许本人或 MANAGER 调用。**不**再自己清 Redis session——handler 在 commit 之后
+    /// 调 `state.session.delete_all_user_sessions(user_id)`（best-effort）。DB 的
+    /// `refresh_token_version` 轮转是兜底。
+    pub async fn change_own_password<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         user_id: i64,
         old_password: &str,
         new_password: &str,
@@ -364,10 +332,7 @@ impl AccountService {
             return Err(AppError::validation("new_password 不能为空"));
         }
 
-        let mut uow = self.uow_provider.begin().await?;
-
-        let u = uow
-            .user_repo()
+        let u = repo
             .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
@@ -380,8 +345,7 @@ impl AccountService {
             return Err(AppError::biz(code::OLD_PASSWORD_MISMATCH, "旧密码不正确"));
         }
 
-        let affected = uow
-            .user_repo()
+        let affected = repo
             .update_password_and_rotate(
                 u.id,
                 u.version,
@@ -393,32 +357,25 @@ impl AccountService {
         if affected == 0 {
             return Err(version_conflict());
         }
-
-        uow.commit().await?;
-        // DB 提交后清该用户的 Redis session（best-effort；DB 的 refresh_token_version 轮转是兜底）
-        if let Err(e) = self.session.delete_all_user_sessions(user_id).await {
-            tracing::warn!(error = %e, user_id, "change_own_password: 清 session 失败");
-        }
         Ok(())
     }
 
     /// 管理员重置密码为默认口令 `changeme`，并轮转 refresh token（踢下线）。
-    pub async fn admin_reset_password(
+    /// **不**再自己清 Redis session——handler 在 commit 之后清（best-effort）。
+    pub async fn admin_reset_password<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<UserOut, AppError> {
         current.require_role(Role::Manager)?;
-        let mut uow = self.uow_provider.begin().await?;
 
-        let u = uow
-            .user_repo()
+        let u = repo
             .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        let affected = uow
-            .user_repo()
+        let affected = repo
             .update_password_and_rotate(
                 u.id,
                 u.version,
@@ -431,58 +388,48 @@ impl AccountService {
             return Err(version_conflict());
         }
 
-        let updated = uow
-            .user_repo()
+        let updated = repo
             .get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
-        let roles = uow.user_role_repo().list_by_user(updated.id).await?;
-        let out = Self::assemble_user_out(updated, roles);
-
-        uow.commit().await?;
-        // DB 提交后清该用户的 Redis session（best-effort）
-        if let Err(e) = self.session.delete_all_user_sessions(user_id).await {
-            tracing::warn!(error = %e, user_id, "admin_reset_password: 清 session 失败");
-        }
-        Ok(out)
+        let roles = repo.list_by_user(updated.id).await?;
+        Ok(Self::assemble_user_out(updated, roles))
     }
 
     // =======================================================================
     // 角色管理
     // =======================================================================
 
-    pub async fn list_user_roles(
+    pub async fn list_user_roles<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         user_id: i64,
         current: &CurrentUser,
     ) -> Result<Vec<UserRoleOut>, AppError> {
         current.require_role(Role::Manager)?;
-        let mut uow = self.uow_provider.begin().await?;
 
-        uow.user_repo()
-            .get_by_id(user_id)
+        repo.get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        let rows = uow.user_role_repo().list_by_user(user_id).await?;
+        let rows = repo.list_by_user(user_id).await?;
         Ok(rows.into_iter().map(to_role_out).collect())
     }
 
-    pub async fn add_role(
+    pub async fn add_role<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         user_id: i64,
         req: &UserAddRoleRequest,
         current: &CurrentUser,
     ) -> Result<UserRoleOut, AppError> {
         current.require_role(Role::Manager)?;
-        let mut uow = self.uow_provider.begin().await?;
 
-        uow.user_repo()
-            .get_by_id(user_id)
+        repo.get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        Self::validate_role_scope(&mut *uow, req).await?;
+        Self::validate_role_scope(repo, req).await?;
 
         let role_str = role_as_str(req.role);
         let scope_type = req.scope_type.as_deref();
@@ -490,8 +437,7 @@ impl AccountService {
         // 显式查重。Python 依赖唯一索引 + IntegrityError，但 partial unique 索引对
         // (user_id, role, NULL, NULL) 这类含 NULL 的组合不生效（SQL 里 NULL != NULL），
         // 导致非货架角色可以被重复添加。这里用 IS NOT DISTINCT FROM 显式查重堵住该缺口。
-        if uow
-            .user_role_repo()
+        if repo
             .exists_same_scope(user_id, role_str, scope_type, req.scope_id)
             .await?
         {
@@ -516,37 +462,31 @@ impl AccountService {
             created_at: now_naive(),
             created_by: Some(current.id),
         };
-        uow.user_role_repo()
-            .create(&insert)
-            .await
-            .map_err(map_duplicate_role)?;
+        repo.role_create(&insert).await.map_err(map_duplicate_role)?;
 
-        let rows = uow.user_role_repo().list_by_user(user_id).await?;
+        let rows = repo.list_by_user(user_id).await?;
         let out = rows
             .into_iter()
             .find(|r| r.id == insert.id)
             .map(to_role_out)
             .ok_or_else(|| AppError::internal("创建后回读角色失败"))?;
-
-        uow.commit().await?;
         Ok(out)
     }
 
-    pub async fn remove_role(
+    pub async fn remove_role<R: IamRepo + ?Sized>(
         &self,
+        repo: &mut R,
         user_id: i64,
         role_id: i64,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
-        let mut uow = self.uow_provider.begin().await?;
 
-        uow.user_repo()
-            .get_by_id(user_id)
+        repo.get_by_id(user_id)
             .await?
             .ok_or_else(|| user_not_found(user_id))?;
 
-        let r = uow.user_role_repo().get_by_id(role_id).await?;
+        let r = repo.role_get_by_id(role_id).await?;
         // 角色必须存在且属于该用户，否则一律 404（不泄露他人角色是否存在）
         let r = match r {
             Some(r) if r.user_id == user_id => r,
@@ -558,15 +498,12 @@ impl AccountService {
             }
         };
 
-        let affected = uow
-            .user_role_repo()
-            .soft_delete(r.id, r.version, now_naive(), Some(current.id))
+        let affected = repo
+            .role_soft_delete(r.id, r.version, now_naive(), Some(current.id))
             .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
-
-        uow.commit().await?;
         Ok(())
     }
 
@@ -574,31 +511,28 @@ impl AccountService {
     // 菜单（helper：对 SessionService（原 AuthService）`/me` 与登录响应开放）
     // =======================================================================
 
-    /// 取角色可见菜单并组树（供 SessionService 复用）。调用方负责 `begin` + `drop` 或
-    /// `commit`——helper 不自管事务边界。
-    pub async fn menus_for_roles(
+    /// 取角色可见菜单并组树（供 SessionService 复用）。调用方传 `repo`，helper 不自管事务。
+    pub async fn menus_for_roles<R: IamRepo + ?Sized>(
         &self,
-        uow: &mut dyn IamUnitOfWork,
+        repo: &mut R,
         roles: &[Role],
     ) -> Result<Vec<MenuNodeOut>, AppError> {
         let role_strs: Vec<String> = roles.iter().map(|r| role_as_str(*r).to_string()).collect();
-        let menus = uow.menu_repo().list_active_for_roles(&role_strs).await?;
+        let menus = repo.list_active_for_roles(&role_strs).await?;
         Ok(build_menu_tree(menus))
     }
 
-    /// 组装 `/iam/me` 出参（SessionService 复用）。调用方负责 `begin` + `drop` 或
-    /// `commit`——helper 不自管事务边界。
-    pub async fn current_user_out(
+    /// 组装 `/iam/me` 出参（SessionService 复用）。调用方传 `repo`。
+    pub async fn current_user_out<R: IamRepo + ?Sized>(
         &self,
-        uow: &mut dyn IamUnitOfWork,
+        repo: &mut R,
         current: &CurrentUser,
     ) -> Result<CurrentUserOut, AppError> {
-        let u = uow
-            .user_repo()
+        let u = repo
             .get_by_id(current.id)
             .await?
             .ok_or_else(|| user_not_found(current.id))?;
-        let menus = self.menus_for_roles(uow, &current.roles).await?;
+        let menus = self.menus_for_roles(repo, &current.roles).await?;
         Ok(CurrentUserOut {
             id: u.id,
             username: u.username,
@@ -619,9 +553,9 @@ impl AccountService {
     // =======================================================================
 
     /// 校验 SHELF_ACCOUNT 角色的 scope 形态、货架存在、zone 白名单、is_active。
-    /// 收 `&mut dyn IamUnitOfWork` 而非 `&mut uow`：调用方把 UoW 借进来，helper 只取 shelf_repo。
-    async fn validate_role_scope(
-        uow: &mut dyn IamUnitOfWork,
+    /// 收 `&mut R` 而非 `&mut uow`：调用方把 repo 借进来，helper 只取 shelf_repo。
+    async fn validate_role_scope<R: IamRepo + ?Sized>(
+        repo: &mut R,
         req: &UserAddRoleRequest,
     ) -> Result<(), AppError> {
         if req.role == Role::ShelfAccount {
@@ -633,7 +567,7 @@ impl AccountService {
                 ));
             }
             let shelf_id = req.scope_id.expect("上一步已校验非空");
-            let shelf = uow.shelf_repo().get_by_id(shelf_id).await?.ok_or_else(|| {
+            let shelf = repo.shelf_get_by_id(shelf_id).await?.ok_or_else(|| {
                 AppError::biz(code::NOT_FOUND, format!("shelf {shelf_id} not found"))
             })?;
             if !ALLOWED_SHELF_ZONES.contains(&shelf.zone.as_str()) {
