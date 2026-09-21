@@ -10,17 +10,29 @@
 //!
 //! ## mapping 端点
 //! 见 `crate::modules::prod::work_type::process_mapping`（set / list per-work_type）。
+//!
+//! ## 事务边界（2026-09-22 D-2-simple 重构对齐 iam / shelf / customer 范本）
+//! 事务移交 handler：handler 显式 `pool.begin()` / `commit()`，service 仅业务逻辑。
+//! 所有跨 repo 操作经 `repo: R`（by-value；`R: WorkTypeRepoTrait`）参数传入——
+//! handler/service 借 `&mut *tx` / `&mut *conn` 喂给 trait（trait 已直接
+//! `impl for &mut PgConnection`）。
+//!
+//! `WorkTypeService` 字段仅 `snowflake: Arc<SnowflakeIdGenerator>`（雪花 ID 在
+//! `create_work_type` 用）。实例为轻壳，可直接 `Arc<WorkTypeService>` 存 `AppState`。
+//! `process_ids` 批量补齐走 trait 方法 `worktypeproc_list_by_work_types_batch`。
+//!
+//! `WorkTypeProcessService`（`process_mapping/mod.rs`）也只收
+//! `<R: WorkTypeRepoTrait>`——胖 trait 已合并 `t_work_type_process` 的 4 个方法，
+//! service 单 trait 一次收下即可。
 
-use sqlx::PgConnection;
+use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::prod::work_type::dto::*;
+use crate::modules::prod::work_type::model::TWorkType;
+use crate::modules::prod::work_type::repo::WorkTypeRepoTrait;
 use crate::shared::error::{AppError, code};
-
-use super::dto::*;
-use super::model::TWorkType;
-use super::process_mapping::WorkTypeProcessRepo;
-use super::repo::WorkTypeRepo;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
@@ -34,7 +46,7 @@ fn version_conflict() -> AppError {
 }
 
 /// 把 service 的 `TWorkType` 转 `WorkTypeOut`。`process_ids` 由 caller 在 list / get 时
-/// 用 `WorkTypeProcessRepo::list_by_work_types_batch` 批量补齐（防 N+1）。
+/// 用 `repo.worktypeproc_list_by_work_types_batch` 批量补齐（防 N+1）。
 fn to_work_type_out(wt: TWorkType, process_ids: Vec<String>) -> WorkTypeOut {
     WorkTypeOut {
         id: wt.id,
@@ -55,15 +67,29 @@ fn pid_to_string(pid: i64) -> String {
     pid.to_string()
 }
 
-pub struct WorkTypeService;
+/// work_type 域 service（2026-09-22 D-2-simple 重构后）
+///
+/// 字段仅 `snowflake`（事务已移交 handler）。实例为轻壳，可直接
+/// `Arc<WorkTypeService>` 存 `AppState`；方法签名收 `mut repo: R`（by-value；
+/// 生产 `R = &mut PgConnection`，单测 `R = MockWorkTypeRepo`），单测用 `MockWorkTypeRepo`
+/// 直接注入。
+pub struct WorkTypeService {
+    snowflake: Arc<SnowflakeIdGenerator>,
+}
 
 impl WorkTypeService {
+    /// 构造：仅需雪花 ID 生成器。
+    pub fn new(snowflake: Arc<SnowflakeIdGenerator>) -> Self {
+        Self { snowflake }
+    }
+
     // =======================================================================
     // 列表 / 详情
     // =======================================================================
 
-    pub async fn list_work_types(
-        conn: &mut PgConnection,
+    pub async fn list_work_types<R: WorkTypeRepoTrait>(
+        &self,
+        mut repo: R,
         query: &WorkTypeListQuery,
         current: &CurrentUser,
     ) -> Result<WorkTypeListOut, AppError> {
@@ -83,12 +109,14 @@ impl WorkTypeService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let items = WorkTypeRepo::list_with_filters(&mut *conn, code_like, limit, offset).await?;
-        let total = WorkTypeRepo::count_with_filters(&mut *conn, code_like).await?;
+        let items = repo
+            .list_with_filters(code_like, limit, offset)
+            .await?;
+        let total = repo.count_with_filters(code_like).await?;
 
-        // process_ids 单条 SQL 批量算（防 N+1）
+        // process_ids 单条 SQL 批量算（防 N+1）—— 走胖 trait 方法
         let ids: Vec<i64> = items.iter().map(|w| w.id).collect();
-        let mapping_rows = WorkTypeProcessRepo::list_by_work_types_batch(&mut *conn, &ids).await?;
+        let mapping_rows = repo.worktypeproc_list_by_work_types_batch(&ids).await?;
         let mut mapping_map: std::collections::HashMap<i64, Vec<i64>> =
             std::collections::HashMap::new();
         for (wt_id, pid) in mapping_rows {
@@ -116,8 +144,9 @@ impl WorkTypeService {
         })
     }
 
-    pub async fn get_work_type(
-        conn: &mut PgConnection,
+    pub async fn get_work_type<R: WorkTypeRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         current: &CurrentUser,
     ) -> Result<WorkTypeOut, AppError> {
@@ -129,13 +158,13 @@ impl WorkTypeService {
             Role::Inspector,
         ])?;
 
-        let wt = WorkTypeRepo::get_by_id(&mut *conn, id)
+        let wt = repo
+            .get_by_id(id)
             .await?
             .ok_or_else(work_type_not_found)?;
 
         // process_ids 单条批量查（防 N+1：get 不必有 mapping 时也走同一函数）
-        let mapping_rows =
-            WorkTypeProcessRepo::list_by_work_types_batch(&mut *conn, &[wt.id]).await?;
+        let mapping_rows = repo.worktypeproc_list_by_work_types_batch(&[wt.id]).await?;
         let process_ids: Vec<String> = mapping_rows
             .into_iter()
             .map(|(_, pid)| pid_to_string(pid))
@@ -148,9 +177,9 @@ impl WorkTypeService {
     // 创建 / 更新 / 软删（MANAGER-only）
     // =======================================================================
 
-    pub async fn create_work_type(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn create_work_type<R: WorkTypeRepoTrait>(
+        &self,
+        mut repo: R,
         req: &WorkTypeCreateRequest,
         current: &CurrentUser,
     ) -> Result<WorkTypeOut, AppError> {
@@ -180,34 +209,35 @@ impl WorkTypeService {
             ));
         }
 
-        let id = snowflake.next_id();
-        let wt = WorkTypeRepo::create(
-            &mut *conn,
-            id,
-            code,
-            name,
-            description,
-            sort_order,
-            max_held_batches,
-            current.id,
-        )
-        .await
-        .map_err(
-            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                // uk_t_work_type_code：活跃行唯一
-                Some("23505") => AppError::biz(
-                    code::BIZ_WORK_TYPE_DUPLICATE_CODE,
-                    format!("code '{code}' 已被占用"),
-                ),
-                _ => AppError::from(e),
-            },
-        )?;
+        let id = self.snowflake.next_id();
+        let wt = repo
+            .create(
+                id,
+                code,
+                name,
+                description,
+                sort_order,
+                max_held_batches,
+                current.id,
+            )
+            .await
+            .map_err(
+                |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                    // uk_t_work_type_code：活跃行唯一
+                    Some("23505") => AppError::biz(
+                        code::BIZ_WORK_TYPE_DUPLICATE_CODE,
+                        format!("code '{code}' 已被占用"),
+                    ),
+                    _ => AppError::from(e),
+                },
+            )?;
 
         Ok(to_work_type_out(wt, Vec::new()))
     }
 
-    pub async fn update_work_type(
-        conn: &mut PgConnection,
+    pub async fn update_work_type<R: WorkTypeRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         req: &WorkTypeUpdateRequest,
         current: &CurrentUser,
@@ -222,7 +252,8 @@ impl WorkTypeService {
             ));
         }
 
-        let existing = WorkTypeRepo::get_by_id(&mut *conn, id)
+        let existing = repo
+            .get_by_id(id)
             .await?
             .ok_or_else(work_type_not_found)?;
 
@@ -268,38 +299,40 @@ impl WorkTypeService {
             }
         };
 
-        let affected = WorkTypeRepo::update(
-            &mut *conn,
-            id,
-            existing.version,
-            name_update,
-            desc_update,
-            req.sort_order,
-            mhb_update,
-            current.id,
-        )
-        .await?;
+        let affected = repo
+            .update(
+                id,
+                existing.version,
+                name_update,
+                desc_update,
+                req.sort_order,
+                mhb_update,
+                current.id,
+            )
+            .await?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
         // 回读最新行 + process_ids
-        Self::get_work_type(conn, id, current).await
+        Self::get_work_type(self, repo, id, current).await
     }
 
     /// 软删前查引用：`t_worker.work_type_id` + `t_work_type_process` 任一 > 0 ⇒ 20903 拒。
-    pub async fn soft_delete_work_type(
-        conn: &mut PgConnection,
+    pub async fn soft_delete_work_type<R: WorkTypeRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
 
-        let wt = WorkTypeRepo::get_by_id(&mut *conn, id)
+        let wt = repo
+            .get_by_id(id)
             .await?
             .ok_or_else(work_type_not_found)?;
 
-        let ref_count = WorkTypeRepo::count_work_type_references(&mut *conn, id).await?;
+        let ref_count = repo.count_work_type_references(id).await?;
         if ref_count > 0 {
             return Err(AppError::biz(
                 code::BIZ_WORK_TYPE_IN_USE,
@@ -310,7 +343,7 @@ impl WorkTypeService {
             ));
         }
 
-        let affected = WorkTypeRepo::soft_delete(&mut *conn, id, wt.version, current.id).await?;
+        let affected = repo.soft_delete(id, wt.version, current.id).await?;
         if affected == 0 {
             return Err(version_conflict());
         }

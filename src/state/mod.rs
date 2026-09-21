@@ -26,11 +26,14 @@ use crate::infra::ws_hub::WsHub;
 use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
-use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::iam::service::{AccountService, SessionService};
 use crate::modules::outsource::service::OutsourceService;
 use crate::modules::part_file::service::PartFileService;
+use crate::modules::prod::process::service::ProcessService;
 use crate::modules::prod::process_chain::service::crud::ProcessChainService;
+use crate::modules::prod::work_type::process_mapping::WorkTypeProcessService;
+use crate::modules::prod::work_type::service::WorkTypeService;
+use crate::modules::prod::worker::service::WorkerService;
 use crate::modules::upload_session::repo::UploadSessionRepo;
 
 pub struct AppState {
@@ -87,6 +90,22 @@ pub struct AppState {
     /// 3 个 alias 端点（download-url / content / delete）由 handler 直接转发到
     /// `state.part_file_service.method(&mut *tx, ...)`，不抽 trait 到 part_file。
     pub cnc_program_service: Arc<CncProgramService>,
+    /// 2026-09-22 D-2-simple 新增：prod/worker service（CRUD + verify-badge）。
+    /// 字段仅 `snowflake`；handler 借 `&mut *tx` 喂给 `WorkerRepoTrait`
+    /// （trait 已直接 `impl for &mut PgConnection`）。
+    pub worker_service: Arc<WorkerService>,
+    /// 2026-09-22 D-2-simple 新增：prod/work_type service（CRUD）。
+    /// 字段仅 `snowflake`；handler 借 `&mut *tx` 喂给 `WorkTypeRepoTrait`
+    /// （胖 trait 已合并 t_work_type + t_work_type_process + 跨域 helper，单 trait 一次借位）。
+    pub work_type_service: Arc<WorkTypeService>,
+    /// 2026-09-22 D-2-simple 新增：prod/work_type/process_mapping service（set / list）。
+    /// 无字段；handler 借 `&mut *tx` 喂给 `WorkTypeRepoTrait`（胖 trait，
+    /// process_mapping 4 方法已合并入 trait）。
+    pub work_type_process_service: Arc<WorkTypeProcessService>,
+    /// 2026-09-22 D-2-simple 新增：prod/process service（CRUD）。
+    /// 字段仅 `snowflake`；handler 借 `&mut *tx` 喂给 `ProcessRepoTrait`
+    /// （trait 已直接 `impl for &mut PgConnection`）。
+    pub process_service: Arc<ProcessService>,
 }
 
 impl AppState {
@@ -120,6 +139,14 @@ impl AppState {
         // 2026-09-22 Group C 装线：part_file + cnc_program service；字段含 snowflake + cos。
         let part_file_service = Arc::new(PartFileService::new(snowflake.clone(), cos.clone()));
         let cnc_program_service = Arc::new(CncProgramService::new(snowflake.clone(), cos.clone()));
+        // 2026-09-22 D-2-simple prod/worker service 装线：仅需 snowflake。
+        let worker_service = Arc::new(WorkerService::new(snowflake.clone()));
+        // 2026-09-22 D-2-simple prod/work_type service 装线：仅需 snowflake。
+        let work_type_service = Arc::new(WorkTypeService::new(snowflake.clone()));
+        // 2026-09-22 D-2-simple prod/work_type/process_mapping service 装线：无字段。
+        let work_type_process_service = Arc::new(WorkTypeProcessService);
+        // 2026-09-22 D-2-simple prod/process service 装线：仅需 snowflake。
+        let process_service = Arc::new(ProcessService::new(snowflake.clone()));
         Self {
             pool,
             config,
@@ -138,6 +165,10 @@ process_chain_service,
             outsource_service,
             part_file_service,
             cnc_program_service,
+            worker_service,
+            work_type_service,
+            work_type_process_service,
+            process_service,
         }
     }
 }

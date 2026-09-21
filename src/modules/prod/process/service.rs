@@ -1,7 +1,6 @@
 //! process 域业务逻辑
 //!
-//! 对应 Python myERP/service/process_service.py。实施约定：方法签名接收
-//! `&mut PgConnection`，由 handler 开 tx 并 commit。
+//! 对应 Python myERP/service/process_service.py。
 //!
 //! ## 业务约束（service 层 enforce）
 //! - INHOUSE：create 强制 `requires_approval = false`（与 Python `_assert_inhouse_no_approval` 对齐）；
@@ -11,14 +10,23 @@
 //! - 软删前查 `t_work_type_process` + `t_outsource_company_process` +
 //!   `t_shelf_process` + `t_part.next_process_id` 引用计数（best-effort，见
 //!   `ProcessRepo::count_process_references`）
+//!
+//! ## 事务边界（2026-09-22 D-2-simple 重构对齐 iam / shelf / customer 范本）
+//! 事务移交 handler：handler 显式 `pool.begin()` / `commit()`，service 仅业务逻辑。
+//! 所有跨 repo 操作经 `repo: R`（by-value；`R: ProcessRepoTrait`）参数传入——
+//! handler/service 借 `&mut *tx` / `&mut *conn` 喂给 trait（trait 已直接
+//! `impl for &mut PgConnection`）。
+//!
+//! `ProcessService` 字段仅 `snowflake: Arc<SnowflakeIdGenerator>`（雪花 ID 在
+//! `create_process` 用）。实例为轻壳，可直接 `Arc<ProcessService>` 存 `AppState`。
 
-use sqlx::PgConnection;
+use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::prod::process::dto::*;
 use crate::modules::prod::process::model::TProcess;
-use crate::modules::prod::process::repo::ProcessRepo;
+use crate::modules::prod::process::repo::ProcessRepoTrait;
 use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;
@@ -89,15 +97,29 @@ fn normalize_color(s: Option<&str>) -> Result<Option<&str>, AppError> {
     }
 }
 
-pub struct ProcessService;
+/// process 域 service（2026-09-22 D-2-simple 重构后）
+///
+/// 字段仅 `snowflake`（事务已移交 handler）。实例为轻壳，可直接
+/// `Arc<ProcessService>` 存 `AppState`；方法签名收 `mut repo: R`（by-value；
+/// 生产 `R = &mut PgConnection`，单测 `R = MockProcessRepo`），单测用 `MockProcessRepo`
+/// 直接注入。
+pub struct ProcessService {
+    snowflake: Arc<SnowflakeIdGenerator>,
+}
 
 impl ProcessService {
+    /// 构造：仅需雪花 ID 生成器。
+    pub fn new(snowflake: Arc<SnowflakeIdGenerator>) -> Self {
+        Self { snowflake }
+    }
+
     // =======================================================================
     // 列表 / 详情
     // =======================================================================
 
-    pub async fn list_processes(
-        conn: &mut PgConnection,
+    pub async fn list_processes<R: ProcessRepoTrait>(
+        &self,
+        mut repo: R,
         query: &ProcessListQuery,
         user: &CurrentUser,
     ) -> Result<ProcessListOut, AppError> {
@@ -122,9 +144,12 @@ impl ProcessService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let items =
-            ProcessRepo::list_with_filters(&mut *conn, code_like, category, limit, offset).await?;
-        let total = ProcessRepo::count_with_filters(&mut *conn, code_like, category).await?;
+        let items = repo
+            .list_with_filters(code_like, category, limit, offset)
+            .await?;
+        let total = repo
+            .count_with_filters(code_like, category)
+            .await?;
 
         Ok(ProcessListOut {
             items: items.into_iter().map(to_process_out).collect(),
@@ -134,8 +159,9 @@ impl ProcessService {
         })
     }
 
-    pub async fn get_process(
-        conn: &mut PgConnection,
+    pub async fn get_process<R: ProcessRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         user: &CurrentUser,
     ) -> Result<ProcessOut, AppError> {
@@ -147,7 +173,8 @@ impl ProcessService {
             Role::Inspector,
         ])?;
 
-        let p = ProcessRepo::get_by_id(&mut *conn, id, false)
+        let p = repo
+            .get_by_id(id, false)
             .await?
             .ok_or_else(process_not_found)?;
         Ok(to_process_out(p))
@@ -157,9 +184,9 @@ impl ProcessService {
     // 创建 / 更新 / 软删
     // =======================================================================
 
-    pub async fn create_process(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn create_process<R: ProcessRepoTrait>(
+        &self,
+        mut repo: R,
         req: &ProcessCreateRequest,
         user: &CurrentUser,
     ) -> Result<ProcessOut, AppError> {
@@ -189,41 +216,42 @@ impl ProcessService {
             req.requires_approval.unwrap_or(true)
         };
 
-        let id = snowflake.next_id();
-        let p = ProcessRepo::create(
-            &mut *conn,
-            id,
-            code,
-            name,
-            &category,
-            sort_order,
-            description,
-            requires_approval,
-            color,
-            user.id,
-        )
-        .await
-        .map_err(
-            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                // uk_t_process_code：活跃行唯一
-                Some("23505") => AppError::biz(
-                    code::BIZ_PROCESS_DUPLICATE_CODE,
-                    format!("code '{code}' 已被占用"),
-                ),
-                // ck_t_process_category：CHECK 约束兜底（理论 service 已 catch）
-                Some("23514") => AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    "category 必须是 INHOUSE 或 OUTSOURCE",
-                ),
-                _ => AppError::from(e),
-            },
-        )?;
+        let id = self.snowflake.next_id();
+        let p = repo
+            .create(
+                id,
+                code,
+                name,
+                &category,
+                sort_order,
+                description,
+                requires_approval,
+                color,
+                user.id,
+            )
+            .await
+            .map_err(
+                |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                    // uk_t_process_code：活跃行唯一
+                    Some("23505") => AppError::biz(
+                        code::BIZ_PROCESS_DUPLICATE_CODE,
+                        format!("code '{code}' 已被占用"),
+                    ),
+                    // ck_t_process_category：CHECK 约束兜底（理论 service 已 catch）
+                    Some("23514") => AppError::biz(
+                        code::BIZ_INVALID_VALUE,
+                        "category 必须是 INHOUSE 或 OUTSOURCE",
+                    ),
+                    _ => AppError::from(e),
+                },
+            )?;
 
         Ok(to_process_out(p))
     }
 
-    pub async fn update_process(
-        conn: &mut PgConnection,
+    pub async fn update_process<R: ProcessRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         req: &ProcessUpdateRequest,
         user: &CurrentUser,
@@ -244,7 +272,8 @@ impl ProcessService {
             ));
         }
 
-        let current = ProcessRepo::get_by_id(&mut *conn, id, false)
+        let current = repo
+            .get_by_id(id, false)
             .await?
             .ok_or_else(process_not_found)?;
 
@@ -294,48 +323,50 @@ impl ProcessService {
         }
         let requires_approval_update: Option<bool> = req.requires_approval;
 
-        let affected = ProcessRepo::update(
-            &mut *conn,
-            id,
-            current.version,
-            name_update,
-            req.sort_order,
-            desc_update,
-            requires_approval_update,
-            color_update,
-            user.id,
-        )
-        .await
-        .map_err(
-            |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
-                Some("23514") => AppError::biz(
-                    code::BIZ_INVALID_VALUE,
-                    "category 必须是 INHOUSE 或 OUTSOURCE",
-                ),
-                _ => AppError::from(e),
-            },
-        )?;
+        let affected = repo
+            .update(
+                id,
+                current.version,
+                name_update,
+                req.sort_order,
+                desc_update,
+                requires_approval_update,
+                color_update,
+                user.id,
+            )
+            .await
+            .map_err(
+                |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
+                    Some("23514") => AppError::biz(
+                        code::BIZ_INVALID_VALUE,
+                        "category 必须是 INHOUSE 或 OUTSOURCE",
+                    ),
+                    _ => AppError::from(e),
+                },
+            )?;
         if affected == 0 {
             return Err(version_conflict());
         }
 
         // 回读最新行
-        Self::get_process(conn, id, user).await
+        Self::get_process(self, repo, id, user).await
     }
 
-    pub async fn soft_delete_process(
-        conn: &mut PgConnection,
+    pub async fn soft_delete_process<R: ProcessRepoTrait>(
+        &self,
+        mut repo: R,
         id: i64,
         user: &CurrentUser,
     ) -> Result<(), AppError> {
         user.require_role(Role::Manager)?;
 
-        let current = ProcessRepo::get_by_id(&mut *conn, id, false)
+        let current = repo
+            .get_by_id(id, false)
             .await?
             .ok_or_else(process_not_found)?;
 
         // 软删前查引用计数（best-effort：见 repo 注释）
-        let ref_count = ProcessRepo::count_process_references(&mut *conn, id).await?;
+        let ref_count = repo.count_process_references(id).await?;
         if ref_count > 0 {
             return Err(AppError::biz(
                 code::BIZ_PROCESS_IN_USE,
@@ -343,7 +374,7 @@ impl ProcessService {
             ));
         }
 
-        let affected = ProcessRepo::soft_delete(&mut *conn, id, current.version, user.id).await?;
+        let affected = repo.soft_delete(id, current.version, user.id).await?;
         if affected == 0 {
             return Err(version_conflict());
         }
