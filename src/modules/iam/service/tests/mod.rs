@@ -1,7 +1,7 @@
 //! iam 域 service 层单元测试公共 fixture（2026-09-23 新增）
 //!
 //! 为 `account.rs`（27 用例）+ `session.rs`（13 用例）提供：
-//! - `MockIamRepo` 注入（mockall 0.15 automock 自动生成于 `iam/repo/mod.rs`）
+//! - `MockIamRepoTrait` 注入（mockall 0.15 automock 自动生成于 `iam/repo/mod.rs`）
 //! - `test_snowflake()`：固定 `instance_id=1` 的雪花 ID 生成器
 //! - `current_with_role(role)` / `current_manager()` / `current_worker()` / `current_inspector()`
 //! - `make_account_service()` / `make_session_service()`：service 实例工厂

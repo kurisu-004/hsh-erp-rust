@@ -19,7 +19,7 @@ use super::*;
 use crate::modules::iam::dto::{
     UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest,
 };
-use crate::modules::iam::repo::MockIamRepo;
+use crate::modules::iam::repo::MockIamRepoTrait;
 use crate::modules::iam::service::AccountService;
 use crate::modules::iam::vo::UserListOut;
 use crate::shared::error::{AppError, code};
@@ -31,7 +31,7 @@ use crate::shared::error::{AppError, code};
 #[tokio::test]
 async fn list_users_returns_empty_when_repo_yields_no_rows() {
     // Arrange
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_list_users_with_filters()
         .returning(|_, _, _, _| Ok(vec![]));
     mock.expect_count_users_with_filters()
@@ -64,7 +64,7 @@ async fn list_users_returns_rows_with_total_count() {
     let u2 = sample_user(102, "bob");
     let r1 = sample_user_role(201, 101, "MANAGER");
     let r2 = sample_user_role(202, 102, "CLERK");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_list_users_with_filters()
         .returning(move |_, _, _, _| Ok(vec![u1.clone(), u2.clone()]));
     mock.expect_count_users_with_filters()
@@ -109,7 +109,7 @@ async fn get_user_returns_user_when_found() {
     // Arrange
     let u = sample_user(101, "alice");
     let r = sample_user_role(201, 101, "MANAGER");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .with(eq(101))
         .returning(move |_| Ok(Some(u.clone())));
@@ -133,7 +133,7 @@ async fn get_user_returns_user_when_found() {
 #[tokio::test]
 async fn get_user_returns_not_found_when_repo_yields_none() {
     // Arrange
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(|_| Ok(None));
     let svc = make_account_service();
@@ -165,7 +165,7 @@ async fn create_user_happy_path_returns_user_with_roles() {
         Arc::new(Mutex::new(None));
     let u_for_create = u_holder.clone();
     let u_for_get = u_holder.clone();
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_username()
         .returning(|_| Ok(None));
     mock.expect_create_user()
@@ -212,7 +212,7 @@ async fn create_user_happy_path_returns_user_with_roles() {
 #[tokio::test]
 async fn create_user_duplicate_username_returns_409() {
     // Arrange
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_username()
         .returning(|_| Ok(Some(sample_user(101, "alice")))); // 已存在
     let svc = make_account_service();
@@ -239,7 +239,7 @@ async fn create_user_duplicate_username_returns_409() {
 #[tokio::test]
 async fn create_user_empty_password_returns_validation_error() {
     // Arrange
-    let mock = MockIamRepo::new();
+    let mock = MockIamRepoTrait::new();
     let svc = make_account_service();
     let req = UserCreateRequest {
         username: "alice".into(),
@@ -264,7 +264,7 @@ async fn create_user_empty_password_returns_validation_error() {
 #[tokio::test]
 async fn create_user_empty_username_returns_validation_error() {
     // Arrange
-    let mock = MockIamRepo::new();
+    let mock = MockIamRepoTrait::new();
     let svc = make_account_service();
     let req = UserCreateRequest {
         username: "   ".into(), // trim 后为空
@@ -289,7 +289,7 @@ async fn create_user_empty_username_returns_validation_error() {
 #[tokio::test]
 async fn create_user_forbidden_for_non_manager() {
     // Arrange
-    let mock = MockIamRepo::new();
+    let mock = MockIamRepoTrait::new();
     let svc = make_account_service();
     let req = UserCreateRequest {
         username: "alice".into(),
@@ -328,7 +328,7 @@ async fn update_user_happy_path_returns_updated_user() {
         version: 2,
         ..sample_user(101, "alice")
     };
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     let u_clone1 = u.clone();
     let u_updated_clone = u_updated.clone();
     let call_count = Arc::new(AtomicUsize::new(0));
@@ -368,7 +368,7 @@ async fn update_user_happy_path_returns_updated_user() {
 #[tokio::test]
 async fn update_user_not_found_when_user_missing() {
     // Arrange
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(|_| Ok(None));
     let svc = make_account_service();
@@ -396,7 +396,7 @@ async fn update_user_not_found_when_user_missing() {
 async fn update_user_version_conflict_returns_409() {
     // Arrange
     let u = sample_user(101, "alice");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_update_user_partial()
@@ -430,7 +430,7 @@ async fn update_user_version_conflict_returns_409() {
 async fn admin_reset_password_happy_path_returns_user() {
     // Arrange
     let u = sample_user(101, "alice");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_update_user_password_and_rotate()
@@ -454,7 +454,7 @@ async fn admin_reset_password_happy_path_returns_user() {
 #[tokio::test]
 async fn admin_reset_password_not_found() {
     // Arrange
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(|_| Ok(None));
     let svc = make_account_service();
@@ -475,7 +475,7 @@ async fn admin_reset_password_not_found() {
 #[tokio::test]
 async fn admin_reset_password_forbidden_for_worker() {
     // Arrange
-    let mock = MockIamRepo::new();
+    let mock = MockIamRepoTrait::new();
     let svc = make_account_service();
 
     // Act
@@ -499,7 +499,7 @@ async fn admin_reset_password_forbidden_for_worker() {
 async fn deactivate_user_happy_path_returns_deactivated_user() {
     // Arrange
     let u = sample_user(101, "alice");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_soft_delete_user()
@@ -523,7 +523,7 @@ async fn deactivate_user_happy_path_returns_deactivated_user() {
 async fn deactivate_user_already_inactive_returns_version_conflict() {
     // Arrange
     let u = sample_user(101, "alice");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_soft_delete_user()
@@ -551,7 +551,7 @@ async fn deactivate_user_already_inactive_returns_version_conflict() {
 async fn list_user_roles_empty_returns_empty_vec() {
     // Arrange
     let u = sample_user(101, "alice");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_list_user_roles_by_user_id()
@@ -574,7 +574,7 @@ async fn list_user_roles_with_roles_returns_role_list() {
     let u = sample_user(101, "alice");
     let r1 = sample_user_role(201, 101, "MANAGER");
     let r2 = sample_user_role(202, 101, "CLERK");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_list_user_roles_by_user_id()
@@ -606,7 +606,7 @@ async fn add_role_happy_path_returns_role() {
     let captured: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
     let cap_for_create = captured.clone();
     let cap_for_list = captured.clone();
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_has_user_role_with_scope()
@@ -643,7 +643,7 @@ async fn add_role_happy_path_returns_role() {
 async fn add_role_duplicate_returns_role_duplicate() {
     // Arrange
     let u = sample_user(101, "alice");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_has_user_role_with_scope()
@@ -672,7 +672,7 @@ async fn add_role_duplicate_returns_role_duplicate() {
 async fn add_role_invalid_role_string_returns_validation_error() {
     // Arrange
     let u = sample_user(101, "alice");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     let svc = make_account_service();
@@ -718,7 +718,7 @@ async fn remove_role_happy_path_succeeds() {
         version: 1,
         ..make_user_role_dummy(201)
     };
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_get_user_role_by_id()
@@ -737,7 +737,7 @@ async fn remove_role_happy_path_succeeds() {
 async fn remove_role_not_found_returns_role_not_found() {
     // Arrange
     let u = sample_user(101, "alice");
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     // 角色存在但属于别的用户
@@ -803,7 +803,7 @@ async fn change_own_password_happy_path_succeeds() {
         version: 1,
         ..sample_user(1, "alice")
     };
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_update_user_password_and_rotate()
@@ -827,7 +827,7 @@ async fn change_own_password_wrong_old_password_returns_mismatch() {
         version: 1,
         ..sample_user(1, "alice")
     };
-    let mut mock = MockIamRepo::new();
+    let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
     let svc = make_account_service();
@@ -848,7 +848,7 @@ async fn change_own_password_wrong_old_password_returns_mismatch() {
 #[tokio::test]
 async fn change_own_password_forbidden_for_other_user() {
     // Arrange — clerk (id=1) 想改别人（id=999）的密码
-    let mock = MockIamRepo::new();
+    let mock = MockIamRepoTrait::new();
     let svc = make_account_service();
 
     // Act

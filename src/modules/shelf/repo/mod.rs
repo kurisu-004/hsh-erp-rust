@@ -12,7 +12,7 @@
 //!   一行委托到此 ZST。
 //!
 //! ## 为什么 trait 命名为 `ShelfRepoTrait` 而非 `ShelfRepo`
-//! iam 范本里 trait 名 = `IamRepo`。但 shelf 域有跨模块静态调用方（part 域
+//! iam 范本里 trait 名 = `IamRepoTrait`。但 shelf 域有跨模块静态调用方（part 域
 //! `worker_scan` / `phase1` / `inspection` 三个 service 文件都
 //! `use crate::modules::shelf::repo::ShelfRepo;` 然后 `ShelfRepo::xxx(&mut *conn, ...)`
 //! 走 ZST 静态方法）。**该 3 文件本次不在本任务范围**（属于 Group B/C/D/E），

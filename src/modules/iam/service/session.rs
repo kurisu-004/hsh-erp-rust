@@ -20,7 +20,7 @@
 //! - 不 begin 端点：
 //!   - change_password：纯委托给 `self.account_service.change_own_password(repo, ...)`。
 //!   - logout：无 DB 操作，只清 Redis session。
-//! - helper `resolve_roles_and_scope` 收 `&mut R: IamRepo`，与 `IamRepo` trait 方法一致。
+//! - helper `resolve_roles_and_scope` 收 `&mut R: IamRepoTrait`，与 `IamRepoTrait` trait 方法一致。
 //!
 //! 2026-09-19 IAM 域合并：`AuthService` → `SessionService`，改密用 `AccountService`
 //! 取代原 `UserService`。
@@ -53,7 +53,7 @@ use crate::shared::error::{AppError, code};
 use super::account::{AccountService, role_as_str};
 use super::super::dto::{ChangePasswordRequest, LoginRequest, RefreshRequest};
 use super::super::repo::model::User;
-use super::super::repo::{IamRepo, UserRoleRow};
+use super::super::repo::{IamRepoTrait, UserRoleRow};
 use super::super::vo::{CurrentUserOut, LoginResponse, MenuNodeOut};
 
 /// SHELF_ACCOUNT 角色唯一合法的 scope_type
@@ -148,7 +148,7 @@ impl SessionService {
 
     /// login 第一阶段：DB 操作（用户查 / 角色 / 菜单 / `touch_user_last_login_at`），返回待签 token 配对
     /// 与菜单视图。**不** commit、**不**写 Redis——由 handler commit 后调 `complete_login`。
-    pub async fn login<R: IamRepo>(
+    pub async fn login<R: IamRepoTrait>(
         &self,
         mut repo: R,
         req: LoginRequest,
@@ -264,7 +264,7 @@ impl SessionService {
     ///
     /// 2026-09-23 重构：旧 refresh 的 session key 不再做 sha256(token) 派生，
     /// 直接从 `decode_refresh(...).jwt_id` 取 jti 字符串。
-    pub async fn refresh<R: IamRepo>(
+    pub async fn refresh<R: IamRepoTrait>(
         &self,
         mut repo: R,
         req: RefreshRequest,
@@ -488,7 +488,7 @@ impl SessionService {
 
     /// `/iam/me`：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单。
     /// 读端点，handler `pool.acquire()` 不开事务，service 借到的 `repo` 用完即 drop。
-    pub async fn me<R: IamRepo>(
+    pub async fn me<R: IamRepoTrait>(
         &self,
         mut repo: R,
         current: &CurrentUser,
@@ -518,7 +518,7 @@ impl SessionService {
     /// 自助改密：纯委托给 account_service（account_service 借传入的 repo 跑业务）。
     /// 本服务入口处的权限校验与 account_service 内部重复，显式提一处以便在 service
     /// 入口给出明确语义。
-    pub async fn change_password<R: IamRepo>(
+    pub async fn change_password<R: IamRepoTrait>(
         &self,
         repo: R,
         user_id: i64,
@@ -553,7 +553,7 @@ impl SessionService {
 /// 3. `bool`：shelf_wildcard——任意一条 SHELF_ACCOUNT 行的 scope_id 为 NULL 时为 true
 ///
 /// 规则与 account_service.validate_role_scope / shelf_repo.get_by_id 一脉相承。
-async fn resolve_roles_and_scope<R: IamRepo>(
+async fn resolve_roles_and_scope<R: IamRepoTrait>(
     repo: &mut R,
     rows: &[UserRoleRow],
 ) -> Result<(Vec<Role>, Vec<i64>, bool), AppError> {

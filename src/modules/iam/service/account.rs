@@ -13,7 +13,7 @@ use super::super::dto::{
 };
 use super::super::repo::model::User;
 use super::super::repo::{
-    IamRepo, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow,
+    IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow,
 };
 use super::super::vo::{MenuNodeOut, UserListOut, UserOut, UserRoleOut};
 
@@ -63,7 +63,7 @@ fn trimmed_or_none(v: &str) -> Option<String> {
 ///
 /// 字段仅 `snowflake`（事务已移交 handler；session 清理也移交 handler）。实例为轻壳，
 /// 可直接 `Arc<AccountService>` 存 `AppState`；方法签名收 `mut repo: R`（by-value；
-/// 生产 `R = &mut PgConnection`，单测 `R = MockIamRepo`），单测用 `MockIamRepo` 直接注入。
+/// 生产 `R = &mut PgConnection`，单测 `R = MockIamRepoTrait`），单测用 `MockIamRepoTrait` 直接注入。
 pub struct AccountService {
     snowflake: Arc<SnowflakeIdGenerator>,
 }
@@ -78,7 +78,7 @@ impl AccountService {
     // 列表 / 详情
     // =======================================================================
 
-    pub async fn list_users<R: IamRepo>(
+    pub async fn list_users<R: IamRepoTrait>(
         &self,
         mut repo: R,
         query: &UserListQuery,
@@ -113,7 +113,7 @@ impl AccountService {
         })
     }
 
-    pub async fn get_user<R: IamRepo>(
+    pub async fn get_user<R: IamRepoTrait>(
         &self,
         mut repo: R,
         user_id: i64,
@@ -133,7 +133,7 @@ impl AccountService {
     // 创建 / 更新 / 停用
     // =======================================================================
 
-    pub async fn create_user<R: IamRepo>(
+    pub async fn create_user<R: IamRepoTrait>(
         &self,
         mut repo: R,
         req: &UserCreateRequest,
@@ -183,7 +183,7 @@ impl AccountService {
         Ok(Self::assemble_user_out(u, roles))
     }
 
-    pub async fn update_user<R: IamRepo>(
+    pub async fn update_user<R: IamRepoTrait>(
         &self,
         mut repo: R,
         user_id: i64,
@@ -248,7 +248,7 @@ impl AccountService {
     }
 
     /// 停用账号 = 软删（置 `deleted_at` + `is_active = false`）
-    pub async fn deactivate_user<R: IamRepo>(
+    pub async fn deactivate_user<R: IamRepoTrait>(
         &self,
         mut repo: R,
         user_id: i64,
@@ -294,7 +294,7 @@ impl AccountService {
     /// 允许本人或 MANAGER 调用。**不**再自己清 Redis session——handler 在 commit 之后
     /// 调 `state.session.delete_all_user_sessions(user_id)`（best-effort）。DB 的
     /// `refresh_token_version` 轮转是兜底。
-    pub async fn change_own_password<R: IamRepo>(
+    pub async fn change_own_password<R: IamRepoTrait>(
         &self,
         mut repo: R,
         user_id: i64,
@@ -339,7 +339,7 @@ impl AccountService {
 
     /// 管理员重置密码为默认口令 `changeme`，并轮转 refresh token（踢下线）。
     /// **不**再自己清 Redis session——handler 在 commit 之后清（best-effort）。
-    pub async fn admin_reset_password<R: IamRepo>(
+    pub async fn admin_reset_password<R: IamRepoTrait>(
         &self,
         mut repo: R,
         user_id: i64,
@@ -377,7 +377,7 @@ impl AccountService {
     // 角色管理
     // =======================================================================
 
-    pub async fn list_user_roles<R: IamRepo>(
+    pub async fn list_user_roles<R: IamRepoTrait>(
         &self,
         mut repo: R,
         user_id: i64,
@@ -393,7 +393,7 @@ impl AccountService {
         Ok(rows.into_iter().map(to_role_out).collect())
     }
 
-    pub async fn add_role<R: IamRepo>(
+    pub async fn add_role<R: IamRepoTrait>(
         &self,
         mut repo: R,
         user_id: i64,
@@ -450,7 +450,7 @@ impl AccountService {
         Ok(out)
     }
 
-    pub async fn remove_role<R: IamRepo>(
+    pub async fn remove_role<R: IamRepoTrait>(
         &self,
         mut repo: R,
         user_id: i64,
@@ -489,7 +489,7 @@ impl AccountService {
     // =======================================================================
 
     /// 取角色可见菜单并组树（供 SessionService 复用）。调用方传 `repo`，helper 不自管事务。
-    pub async fn menus_for_roles<R: IamRepo>(
+    pub async fn menus_for_roles<R: IamRepoTrait>(
         &self,
         repo: &mut R,
         roles: &[Role],
@@ -505,7 +505,7 @@ impl AccountService {
 
     /// 校验 SHELF_ACCOUNT 角色的 scope 形态、货架存在、zone 白名单、is_active。
     /// 收 `&mut R` 而非 `&mut uow`：调用方把 repo 借进来，helper 只取 shelf_repo。
-    async fn validate_role_scope<R: IamRepo>(
+    async fn validate_role_scope<R: IamRepoTrait>(
         repo: &mut R,
         req: &UserAddRoleRequest,
     ) -> Result<(), AppError> {
