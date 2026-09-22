@@ -13,9 +13,12 @@
 //! 不带 token 也能访问：health、login、refresh、`/_e2e/*` 全部前缀。
 //!
 //! ## 错误码
-//! - 40100 `UNAUTHORIZED`：缺 / 坏 token、签名失败、claims 不合规
+//! - 40100 `UNAUTHORIZED`：缺 / 坏 token、签名失败、claims 不合规（含缺 `aud` / `sub`
+//!   等必填 claim；详见 `jwt::decode_access` 的 `set_required_spec_claims`）
 //! - 40102 `TOKEN_EXPIRED`：jwt ErrorKind::ExpiredSignature
-//! - 40105 `SESSION_REVOKED`：Redis 中查不到 / user_id 不匹配 / session check 被关闭
+//! - 40105 `SESSION_REVOKED`：Redis 中查不到 / user_id 不匹配（session 真源已吊销）
+//! - 50000 `INTERNAL`：`session_check_enabled=false` 配置错误；强制 prod 必须开启 Redis，
+//!   关闭时直接 5xxxx 让运维感知（而非 40105 让用户被踢下线困惑）
 //!
 //! ## 授权（角色检查）
 //! **不动** —— `CurrentUser::require_role(Role::Manager)?` 仍在 service / handler 层调用，
@@ -27,8 +30,9 @@
 //! ## 2026-09-22 重构要点
 //! - `auth_middleware` → `authenticate_middleware` / `verify_access_token` → `verify_session_token`
 //!   / `extract_bearer_token` → `extract_bearer_authorization`：全词化命名。
-//! - session_check=false 路径**直接返回** `SESSION_REVOKED`：access token 已不再携带业务
-//!   字段，关闭 session check 后服务端无法从 JWT 重建 `CurrentUser`，强制 prod 必须开启 Redis。
+//! - session_check=false 路径**直接返回** `INTERNAL` (50000)：access token 已不再携带业务
+//!   字段，关闭 session check 后服务端无法从 JWT 重建 `CurrentUser`，强制 prod 必须开启 Redis；
+//!   5xxxx 让运维感知配置错误，而非 40105 SESSION_REVOKED 让用户被踢下线困惑。
 //! - `Claims` → `AccessTokenClaims`：JWT 字段全词化（subject/audience/issued_at/...），
 //!   通过 `#[serde(rename = "...")]` 桥接 RFC 7519 短码。
 
@@ -69,11 +73,13 @@ fn is_public_path(path: &str) -> bool {
 /// HTTP middleware 与 WS dashboard 共用本函数（避免校验逻辑两处实现漂移）。
 ///
 /// 流程：
-/// 1. `decode_access` 验签（带 iss/aud 校验；ExpiredSignature → 40102，其余 40100）
+/// 1. `decode_access` 验签（带 iss/aud 校验 + `set_required_spec_claims`；
+///    ExpiredSignature → 40102，其余 40100）
 /// 2. 必须 `state.config.redis.session_check_enabled=true`：从 `state.session.get_session`
 ///    查 Redis；查不到 / user_id 不匹配 → 40105；通过则继续。
-///    **关闭 session check 时直接返回 40105**：access token 不再携带业务字段，服务端
-///    无法从 JWT 重建 `CurrentUser`，强制 prod 必须开启 Redis。
+///    **关闭 session check 时直接返回 50000 INTERNAL**（2026-09-22 重构：原 40105）：
+///    access token 不再携带业务字段，服务端无法从 JWT 重建 `CurrentUser`，
+///    强制 prod 必须开启 Redis；5xxxx 让运维感知配置错误。
 /// 3. `touch_session` 滑动 TTL；失败仅 warn
 /// 4. roles 走 `parse_role_string` 把缓存里的大写字符串转回 `Role` enum（未知值 warn+skip）
 /// 5. username/roles/shelf_ids/shelf_wildcard 从 `cached.profile.{...}` 取（注意字段名是
@@ -93,9 +99,13 @@ pub async fn verify_session_token(
     let token_hash = hash_token(token);
 
     // 2) session check gate：关掉则直接拒（强制 prod 必须开 Redis）
+    //
+    // 2026-09-22 重构：此分支映射到 `INTERNAL` (50000) 而非 `SESSION_REVOKED` (40105)。
+    // `SESSION_REVOKED` 语义是"用户会话已被吊销"，前端会清 token 跳登录页；
+    // 但 `session_check_enabled=false` 实际是**配置错误/部署阶段**问题——
+    // 应让运维立刻看到 5xxxx 错误触发响应，而不是让用户被踢下线困惑。
     if !state.config.redis.session_check_enabled {
-        return Err(AppError::biz(
-            code::SESSION_REVOKED,
+        return Err(AppError::internal(
             "Redis session check 必须开启（access token 已不再携带业务字段）",
         ));
     }

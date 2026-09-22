@@ -5,11 +5,11 @@
 //! 再由 `modules::ws_router()` 在 `/ws` 前缀下挂）。
 //!
 //! ## 实现要点
-//! - query token 鉴权：走 `auth::middleware::verify_access_token` 共享核验函数
+//! - query token 鉴权：走 `auth::middleware::verify_session_token` 共享核验函数
 //!   （与 HTTP middleware 同源：Bearer JWT 验签 + iss 校验 + Redis session 校验
 //!   + 滑动 TTL；本 handler 不重复实现，2026-09-20 重构）
 //! - WS 不走 axum middleware（query-token 而非 Bearer；WS upgrade 帧也无法被
-//!   HTTP middleware 拦截），故单独调一次 `verify_access_token`
+//!   HTTP middleware 拦截），故单独调一次 `verify_session_token`
 //! - 任意已登录（*）即可连接
 //! - WS 升级：`axum::extract::ws::WebSocketUpgrade`
 //! - 业务事件订阅：把 `state.ws_hub.broadcast` 上的 `WsEvent::DashboardEvent`
@@ -51,7 +51,7 @@ pub struct WsQuery {
 ///
 /// WS-only 端点（2026-09-22 Group E 重构）：
 /// - 路径：`/ws/dashboard`（`modules::ws_router()` 在 `/ws` 前缀下挂，无 `/api/v2`）
-/// - 鉴权：`verify_access_token`（不走 HTTP middleware；WS upgrade 帧不能被拦截）
+/// - 鉴权：`verify_session_token`（不走 HTTP middleware；WS upgrade 帧不能被拦截）
 /// - snapshot 拉取走 handler 三形态 ①（`pool.begin() → service → commit`，开 tx 仅作
 ///   单次只读聚合边界，commit 即结束）
 /// - 后续 ws_hub.broadcast 是订阅模式，不开 tx、不再走 service

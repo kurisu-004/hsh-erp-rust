@@ -110,8 +110,10 @@ HTTP 状态码：
   token 并跳回登录页。session 条目默认 TTL 12h，每次成功访问会 EXPIRE 续期（滑动窗口）。
 
 > ⚠️ 当 `REDIS_SESSION_CHECK_ENABLED=false` 时，access token 不再携带业务字段，
-> 服务端无法从 JWT 重建 `CurrentUser` —— middleware 直接返 40105 SESSION_REVOKED，
-> 强制 prod 必须开启 Redis session check。session 写入也走 no-op store。
+> 服务端无法从 JWT 重建 `CurrentUser` —— middleware 直接返 **50000 INTERNAL**
+> （2026-09-22 重构：原 40105 SESSION_REVOKED 语义已迁；40105 只用于「真源已吊销」
+> 场景）。这是**部署/配置问题**，5xxxx 让运维感知而非用户被踢下线困惑。
+> session 写入也走 no-op store。
 
 ### 五角色 RBAC
 
@@ -251,6 +253,22 @@ HTTP 状态码：
 | 213xx | 外协报价（OUTSOURCE_QUOTE_NOT_FOUND 21301 / INVALID_TRANSITION 21302 / DUPLICATE 21303 / NOT_APPROVED 21307） |
 | 214xx | 送货单（NOT_FOUND 21401 / INVALID_TRANSITION 21402 / NOT_DRAFT 21403 / NOT_SUBMITTED 21404 / PART_NOT_READY 21405 / PART_ALREADY_ASSIGNED 21406 / PARTS_MULTIPLE_CUSTOMERS 21407 / SCAN_MISMATCH 21408 / DRIVER_INVALID 21409 / SCAN_INCOMPLETE 21410 / INVALID_VALUE 21411 / PARTS_LOCKED 21412 / GROUP_NOT_FOUND 21413 / GROUP_DUPLICATE_NAME 21414 / GROUP_MEMBER_CONFLICT 21415 / SCOPE_MISMATCH 21416 / SCAN_UNKNOWN_CODE 21417 / ASSEMBLY_PARTS_NOT_READY 21418 / DRAFT_SCOPE_CONFLICT 21419 / LOCKED_PART 21420 / **BATCH_STATE_INVALID 21421**） |
 | 215xx | 外协发货（OUTSOURCE_SHIPMENT_NOT_FOUND 21501 / **INVALID_TRANSITION 21502 / NO_OPEN 21503 / QUANTITY_EXCEEDS 21504**） |
+
+---
+
+### 部署顺序（auth 重构后）
+
+`CachedSession` 字段 `cached → profile` 重命名导致线上已存在的 Redis session entry
+（JSON 含 `cached` 字段）反序列化失败。**上线前必须**按以下顺序之一操作：
+
+1. **推荐（先清后发版）**：发版前停服务 → `redis-cli -h <host> FLUSHDB`
+   （或选择性删除 `session:tok:*` + `sessions:user:*`）→ 起新版本。
+2. **滚动发布（接受短暂 5xx）**：先发版后清 Redis——已登录用户会在
+   `session_check_enabled=true` 路径下持续 5xx（50000 INTERNAL）直到 session TTL
+   自然到期（默认 12h）或主动清 Redis。
+3. **配置错误码**：若部署时 `REDIS_SESSION_CHECK_ENABLED=false`，所有受保护端点
+   都会返 50000 INTERNAL（不再是 40105 SESSION_REVOKED；详见
+   `src/auth/middleware.rs::verify_session_token`）。运维应立即检查 env 配置。
 
 ---
 

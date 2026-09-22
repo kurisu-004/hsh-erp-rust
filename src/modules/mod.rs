@@ -65,7 +65,7 @@ async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResp> {
 /// 旧 `/workers` + `/work-types` + `/processes` + `/process-chains` + `/worker-pool` +
 /// `/admin/worker-pool` 6 个 nest 同步下线，无 alias（前端配套 PR 锁步）。
 ///
-/// 2026-09-20 新增：签名收 `Arc<AppState>`，在 `route_layer` 上挂 `auth_middleware`
+/// 2026-09-20 新增：签名收 `Arc<AppState>`，在 `route_layer` 上挂 `authenticate_middleware`
 /// —— Bearer JWT 验签 + Redis session 校验 + 滑动 TTL 集中处理；公开路径
 /// （health / login / refresh / `_e2e`）在 middleware 内部白名单放行。
 /// `route_layer` 仅作用于已匹配路由，404 不会被强制鉴权（与现状一致）；

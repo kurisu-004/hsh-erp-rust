@@ -548,7 +548,7 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
 
 /// 构造测试用 AppState：session check **关闭**，**不**建 Redis 池。
 ///
-/// 用途：验证 `REDIS_SESSION_CHECK_ENABLED=false` 时，`auth::middleware::verify_access_token`
+/// 用途：验证 `REDIS_SESSION_CHECK_ENABLED=false` 时，`auth::middleware::verify_session_token`
 /// 的关闭分支直接用 JWT Claims 构造 CurrentUser，不依赖 Redis 进程存在。
 ///
 /// 仅 `tests/auth_api.rs` 调用；其它 integration test 不引用 —— 故 `dead_code` 抑制。
@@ -749,7 +749,7 @@ pub async fn test_state_with_cos(
 /// axum Router：与 main.rs 中的 `/api/v2` nest 同形。
 ///
 /// 2026-09-20 修改：`v2_router(state)` 收 Arc<AppState>（用于 from_fn_with_state 挂
-/// auth_middleware），不再需要额外 `with_state`；中间件已内置，handler 端
+/// authenticate_middleware），不再需要额外 `with_state`；中间件已内置，handler 端
 /// `current: CurrentUser` 直接从 extensions 读。
 ///
 /// 显式 `with_state(state.clone())` 把 `Router<Arc<AppState>>` 类型擦回到

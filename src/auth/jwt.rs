@@ -19,6 +19,26 @@
 //! - `iss` 校验：`Validation::set_issuer`
 //! - `aud` 校验：`Validation::set_audience`（jsonwebtoken 10.x）
 //! - `exp` 校验：默认 `validate_exp = true`，`leeway = 30s`
+//! - 必填标准 claim（`Validation::set_required_spec_claims`）：
+//!   - access token：`["exp", "aud", "iss"]`
+//!   - refresh token：`["exp", "aud", "iss"]`
+//!
+//! ### 为什么 `aud` 必须列入 `set_required_spec_claims`
+//!
+//! `set_audience` 只设置"允许的 audience 列表"，**不**把 `aud` 加入
+//! `required_spec_claims`。jsonwebtoken 10.x 在 `aud` 校验时：`validate_aud=true` +
+//! `set_audience=[...]` 路径下，若 token **缺** `aud` 字段，match 会落到 `_ => {}`
+//! 直接 Ok，**漏过校验**。`set_required_spec_claims` 把 `aud` 列为必填，杜绝此类
+//! token 漏过校验。
+//!
+//! ### 为什么 `sub` **不**列入 `set_required_spec_claims`
+//!
+//! jsonwebtoken 10.x 内部 `ClaimsForValidation.sub` 类型是 `TryParse<Cow<'_, str>>`，
+//! **要求 JSON 中 `sub` 字段是字符串**。本仓库 `AccessTokenClaims.subject` /
+//! `RefreshTokenClaims.subject` 沿用 `i64`（雪花 ID 数值序列化更紧凑，与 Python 后端
+//! 约定对齐），加进 `required_spec_claims` 会让所有合法 token 立刻被 `MissingRequiredClaim`
+//! 拒掉。sub 字段的"必填"由 Rust 结构体非 `Option` 字段在 deserialize 阶段兜底：
+//! 缺 `sub` → serde "missing field" → jsonwebtoken 错误包 → 40100 UNAUTHORIZED。
 
 use chrono::Utc;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -135,6 +155,9 @@ pub fn decode_access(
     let mut v = Validation::new(Algorithm::HS256);
     v.set_issuer(&[issuer]);
     v.set_audience(&[audience]);
+    // 2026-09-22 重构：显式声明必填标准 claim，杜绝"缺 aud 的 token 漏过校验"；
+    // `sub` 由 Rust 结构体非 Option 字段 deserialize 兜底（详见模块 docstring）。
+    v.set_required_spec_claims(&["exp", "aud", "iss"]);
     // 30s leeway 容忍跨节点时钟漂移
     v.leeway = 30;
     decode::<AccessTokenClaims>(
@@ -194,6 +217,9 @@ pub fn decode_refresh(
     let mut v = Validation::new(Algorithm::HS256);
     v.set_issuer(&[issuer]);
     v.set_audience(&[audience]);
+    // 2026-09-22 重构：refresh token 必填 exp/aud/iss；`sub` 由 Rust 结构体非 Option
+    // 字段 deserialize 兜底（详见模块 docstring）。
+    v.set_required_spec_claims(&["exp", "aud", "iss"]);
     v.leeway = 30;
     decode::<RefreshTokenClaims>(
         token,
