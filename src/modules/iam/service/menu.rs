@@ -1,18 +1,8 @@
 //! iam 域菜单树组装（纯函数）
-//!
-//! 对应 Python myERP/service/menu.py::_to_tree。
-//!
-//! 2026-09-19 IAM 域合并：从 `modules::user::service::build_menu_tree` 迁移过来，
-//! 单独成文件（rust 惯例：conventions §4.2 纯函数 inline 测试）。
-//!
-//! 2026-09-19 review 落地：`build_menu_tree` 移到本文件后，inline `#[cfg(test)] mod tests`
-//! 保留 ~10 行原算法的环检测兜底测试（plan §4.2 列在原 service.rs，本任务一并迁过来；
-//! 树组装的细节分支测试在 `tests/user_repo.rs` 与 service_tests 的 menus_for_roles 用例覆盖）。
-
 use std::collections::{HashMap, HashSet};
 
-use crate::modules::iam::dto::MenuNodeOut;
-use crate::modules::iam::model::Menu;
+use crate::modules::iam::repo::model::Menu;
+use crate::modules::iam::vo::MenuNodeOut;
 
 /// 把拍平的菜单行组装成树。
 ///

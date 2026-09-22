@@ -1,15 +1,4 @@
-//! iam 域数据模型
-//!
-//! 对应 Python myERP/model/user.py + model/menu.py。包含：
-//! - sqlx `FromRow` 行结构（含 version 乐观锁、deleted_at 软删、created/updated 审计字段）
-//! - 域枚举（DB 用 varchar，应用层用 `crate::auth::rbac::Role` 校验）
-//!
-//! 说明：`t_role_menu` 不建模——本域只做 `t_menu JOIN t_role_menu` 的读查询，
-//! 没有单表读需求，故省略行结构。
-//!
-//! 2026-09-19 IAM 域合并：从 `modules::user::model` 整体迁移过来（路径变化，
-//! 字段语义未改），见 `modules::iam` 模块 doc。
-
+// iam 域数据模型
 use chrono::NaiveDateTime;
 
 /// `t_user` 行

@@ -34,13 +34,16 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::auth::session::{CachedCurrentUser, SessionStore, TokenKind, hash_token};
 use crate::infra::clock::now_naive;
 use crate::infra::config::AppConfig;
-use crate::modules::iam::dto::{ChangePasswordRequest, CurrentUserOut, LoginResponse, MenuNodeOut};
-use crate::modules::iam::model::User;
-use crate::modules::iam::repo::{IamRepo, UserRoleRow};
-use crate::modules::iam::service::account::{AccountService, role_as_str};
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::{LoginRequest, RefreshRequest};
+// `iam/service/` 子目录中 dto / vo / repo 是 sibling 的兄弟模块 —— 用 `super::super::` 跨级
+// account 是同 parent 下的兄弟 service 文件，用 `super::account::`（与 account.rs 的
+// `super::menu::` 同形）
+use super::account::{AccountService, role_as_str};
+use super::super::dto::{ChangePasswordRequest, LoginRequest, RefreshRequest};
+use super::super::repo::model::User;
+use super::super::repo::{IamRepo, UserRoleRow};
+use super::super::vo::{CurrentUserOut, LoginResponse, MenuNodeOut};
 
 /// SHELF_ACCOUNT 角色唯一合法的 scope_type
 const SCOPE_TYPE_SHELF: &str = "shelf";
@@ -122,7 +125,7 @@ impl SessionService {
     // login：两阶段（DB 在第一阶段 commit，Redis 写在第二阶段 commit 后）
     // =======================================================================
 
-    /// login 第一阶段：DB 操作（用户查 / 角色 / 菜单 / touch_login），返回待签 token 配对
+    /// login 第一阶段：DB 操作（用户查 / 角色 / 菜单 / `touch_user_last_login_at`），返回待签 token 配对
     /// 与菜单视图。**不** commit、**不**写 Redis——由 handler commit 后调 `complete_login`。
     pub async fn login<R: IamRepo>(
         &self,
@@ -134,7 +137,7 @@ impl SessionService {
 
         // 2. 查用户（已过滤软删）+ 校验 active
         let u = repo
-            .get_by_username(&username_lower)
+            .get_user_by_username(&username_lower)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_AUTH_INVALID, "用户名或密码错误"))?;
         if !u.is_active {
@@ -147,7 +150,7 @@ impl SessionService {
         }
 
         // 4. 角色列表（为空 → 403 NO_ROLE，统一对外不区分原因）
-        let role_rows = repo.list_by_user(u.id).await?;
+        let role_rows = repo.list_user_roles_by_user_id(u.id).await?;
         if role_rows.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
@@ -175,7 +178,7 @@ impl SessionService {
         )?;
 
         // 7. 戳一下 last_login_at（不动 version，避开与并发业务更新冲突）
-        repo.touch_login(u.id, now_naive()).await?;
+        repo.touch_user_last_login_at(u.id, now_naive()).await?;
 
         Ok(LoginPending {
             pair,
@@ -256,7 +259,7 @@ impl SessionService {
 
         // 2. 查用户 + 校验 active + 校验版本号匹配
         let u = repo
-            .get_by_id(sub)
+            .get_user_by_id(sub)
             .await?
             .ok_or_else(|| AppError::biz(code::REFRESH_INVALID, "refresh token 失效"))?;
         if !u.is_active {
@@ -267,7 +270,7 @@ impl SessionService {
         }
 
         // 3. 取角色 + shelf 范围 + 菜单（与 login 同样的解析）
-        let role_rows = repo.list_by_user(u.id).await?;
+        let role_rows = repo.list_user_roles_by_user_id(u.id).await?;
         if role_rows.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
@@ -282,7 +285,7 @@ impl SessionService {
         let user_id = u.id;
         let user_version = u.version;
         let affected = repo
-            .increment_refresh_token_version(user_id, user_version, now_naive(), Some(user_id))
+            .increment_user_refresh_token_version(user_id, user_version, now_naive(), Some(user_id))
             .await?;
         if affected == 0 {
             return Err(version_conflict());
@@ -290,7 +293,7 @@ impl SessionService {
 
         // 5. 拿轮转后的 ver 重新签发（重读 DB 取 +1 后的新版本）
         let u = repo
-            .get_by_id(user_id)
+            .get_user_by_id(user_id)
             .await?
             .ok_or_else(|| AppError::biz(code::REFRESH_INVALID, "user disappeared"))?;
 
@@ -386,7 +389,7 @@ impl SessionService {
     ) -> Result<CurrentUserOut, AppError> {
         // 1. 重读用户（handle 被外部停用/软删的极端情况）→ 不存在/已删 → UNAUTHORIZED
         let u = repo
-            .get_by_id(current.id)
+            .get_user_by_id(current.id)
             .await?
             .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "用户不存在或已停用"))?;
         if !u.is_active {
@@ -394,7 +397,7 @@ impl SessionService {
         }
 
         // 2. 重查角色 + shelf 范围 + 菜单（不走 JWT 里的 stale 数据）
-        let role_rows = repo.list_by_user(u.id).await?;
+        let role_rows = repo.list_user_roles_by_user_id(u.id).await?;
         let (roles, shelf_ids, _wildcard) =
             resolve_roles_and_scope(&mut repo, &role_rows).await?;
         let menus = self.account_service.menus_for_roles(&mut repo, &roles).await?;
@@ -458,7 +461,7 @@ async fn resolve_roles_and_scope<R: IamRepo>(
             match r.scope_id {
                 None => shelf_wildcard = true,
                 Some(sid) => {
-                    let shelf = repo.shelf_get_by_id(sid).await?;
+                    let shelf = repo.get_shelf_by_id(sid).await?;
                     if let Some(s) = shelf
                         && s.is_active
                         && ALLOWED_SHELF_ZONES.contains(&s.zone.as_str())

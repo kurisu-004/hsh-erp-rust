@@ -18,8 +18,8 @@ use crate::auth::password;
 use crate::infra::clock::now_naive;
 use crate::modules::com::applicant::repo::ApplicantRepo;
 use crate::modules::com::customer::repo::CustomerRepo;
-// 2026-09-19 IAM 域合并：原 `user::repo` 重定向到 `iam::repo`，方法零 diff。
-use crate::modules::iam::repo::{UserInsert, UserRepo, UserRoleInsert, UserRoleRepo};
+use crate::modules::iam::repo::{UserInsert, UserRoleInsert};
+use crate::modules::iam::repo::sql::{user as user_sql, user_role as user_role_sql};
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
@@ -409,8 +409,8 @@ pub async fn seed_user(
     let id = state.snowflake.next_id();
     let now: NaiveDateTime = now_naive();
 
-    // t_user（用 UserRepo.create 走 repo 校验字段顺序）
-    UserRepo::create(
+    // t_user（用 user_sql::create 走 repo 校验字段顺序）
+    user_sql::create_user(
         &mut *tx,
         &UserInsert {
             id,
@@ -428,7 +428,7 @@ pub async fn seed_user(
     // 每个 role 一行 t_user_role
     for role in &req.role_codes {
         let rid = state.snowflake.next_id();
-        UserRoleRepo::create(
+        user_role_sql::create_user_role(
             &mut *tx,
             &UserRoleInsert {
                 id: rid,
