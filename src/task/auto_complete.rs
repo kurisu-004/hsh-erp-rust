@@ -35,7 +35,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::dto_crud::CompleteRequest;
 use crate::modules::part::service::PartService;
-use crate::modules::part_batch::repo::PartBatchRepo;
+use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::shared::error::AppError;
 use crate::state::AppState;
 

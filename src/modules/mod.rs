@@ -27,7 +27,9 @@ pub mod delivery_note;
 pub mod iam;
 pub mod outsource;
 pub mod part;
-pub mod part_batch;
+// 2026-09-22 PR2 合并：原 `part_batch` 域（1866 行 helper，无独立 URL）
+// 物理合并入 part 域的 `part::batch` 子模块（src/modules/part/batch/）。
+// 这里不再 `pub mod part_batch;`，所有引用改走 `crate::modules::part::batch::*`。
 pub mod part_file;
 // 2026-09-19 新增 prod 模块聚合：worker + work_type + process + process_chain +
 // worker_pool 平移至 `prod::*`，URL 硬切换到 `/api/v2/prod/*`（无 alias，前端锁步）。

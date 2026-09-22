@@ -19,7 +19,7 @@ use crate::modules::com::customer::model::TCustomer;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::repo::PartRepo;
-use crate::modules::part_batch::repo::PartBatchRepo;
+use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
@@ -390,7 +390,7 @@ pub(super) async fn add_parts_inner(
     }
 
     // 加载所有 batch + part + part 客户
-    let mut batches_by_id: HashMap<i64, crate::modules::part_batch::model::TPartBatch> =
+    let mut batches_by_id: HashMap<i64, crate::modules::part::batch::model::TPartBatch> =
         HashMap::new();
     for it in items {
         let b = PartBatchRepo::get_by_id(&mut *conn, it.batch_id, false)

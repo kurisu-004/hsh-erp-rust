@@ -14,6 +14,12 @@ pub mod repo;
 pub mod service;
 pub mod statemachine;
 
+// 2026-09-22 PR2 合并：原 `part_batch` 域（1866 行 helper，无独立 URL，5 域静态
+// 调用）物理合并入 part 域的 `part/batch/` 子目录。访问路径：
+// `crate::modules::part::batch::{model, repo, PartBatchRepo, PartBatchRepoTrait,
+// NewInitialBatch, TPartBatch, PartBatchScanRow, RecentBatchRow, InspectionBatchListRow}`。
+pub mod batch;
+
 use axum::{
     Router,
     routing::{get, post},

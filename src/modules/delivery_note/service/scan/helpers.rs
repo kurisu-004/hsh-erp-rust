@@ -8,7 +8,7 @@ use crate::modules::delivery_note::dto::{
     AttachableBatchDto, AvailableBatchDto, BatchStatusDto,
 };
 use crate::modules::delivery_note::model::NoteScope;
-use crate::modules::part_batch::model::TPartBatch;
+use crate::modules::part::batch::model::TPartBatch;
 
 use super::super::inner::GroupWithMemberIds;
 
