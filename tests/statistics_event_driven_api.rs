@@ -19,8 +19,7 @@ use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-use hsh_erp_rust::modules::statistics::repo::StatisticsRepo;
-
+use hsh_erp_rust::modules::statistics::repo::sql as statistics_sql;
 
 async fn setup() -> PgPool {
     common::ensure_database_exists().await;
@@ -190,7 +189,7 @@ async fn delivered_stats_counts_via_delivered_events() {
     insert_delivered_event(&pool, p3, b3, NaiveDate::from_ymd_opt(2026, 9, 11).unwrap()).await;
 
     let mut tx = pool.begin().await.unwrap();
-    let (cnt, _sum_total, orange, red) = StatisticsRepo::delivered_stats(
+    let (cnt, _sum_total, orange, red) = statistics_sql::delivered_stats(
         &mut tx,
         NaiveDate::from_ymd_opt(2026, 9, 10).unwrap(),
         NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
@@ -257,7 +256,7 @@ async fn count_overdue_undelivered_uses_event_absence() {
     insert_initial_batch(&pool, p3).await;
 
     let mut tx = pool.begin().await.unwrap();
-    let cnt = StatisticsRepo::count_overdue_undelivered(&mut tx, today)
+    let cnt = statistics_sql::count_overdue_undelivered(&mut tx, today)
         .await
         .expect("count_overdue_undelivered ok");
     drop(tx);
@@ -293,7 +292,7 @@ async fn count_overdue_undelivered_excludes_soft_deleted() {
         .unwrap();
 
     let mut tx = pool.begin().await.unwrap();
-    let cnt = StatisticsRepo::count_overdue_undelivered(&mut tx, today)
+    let cnt = statistics_sql::count_overdue_undelivered(&mut tx, today)
         .await
         .expect("count_overdue_undelivered ok");
     drop(tx);

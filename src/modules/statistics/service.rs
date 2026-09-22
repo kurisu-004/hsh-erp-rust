@@ -1,4 +1,4 @@
-//! statistics 域业务逻辑（2026-09-15 takeover-fill）
+//! statistics 域业务逻辑（2026-09-15 takeover-fill + 2026-09-23 PR8 重构）
 //!
 //! 对应 Python myERP/service/statistics.py。三段：overview / worker_stats /
 //! worker_detail + 跳序取件两段（summary / detail）。
@@ -9,22 +9,29 @@
 //! - statistics 端点**只读**，不写 DB，不广播 dashboard。
 //! - 错误码统一 `BIZ_INVALID_VALUE` / `BIZ_INVALID_QUERY`（与 plan §4.1 决议一致）。
 //! - 权限：handler `require_role(Role::Manager)`。
+//!
+//! ## 2026-09-23 PR8：service 签名加 `mut repo: R where R: StatisticsRepoTrait`
+//! - 之前所有方法签名收 `&mut PgConnection` 直接传 `StatisticsRepo::xxx(conn, ...)`；
+//! - 现在改为 `<R: StatisticsRepoTrait>(&self, mut repo: R, ...)`（by-value；生产
+//!   `R = &mut PgConnection`，单测 `R = MockStatisticsRepoTrait`）。
+//! - 跨域 ZST（`WorkerRepo::xxx` / `WorkTypeRepo::xxx`）走 `repo.conn_mut()` 借位
+//!   （与 `DeliveryNoteRepoTrait::conn_mut` 2026-09-22 D-5 引入同形）。
+//! - **零业务行为变化**：仅 trait 注入；service 内 SQL 装配 / 数据映射逻辑 1:1 保留。
 
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
-use sqlx::PgConnection;
 
 use crate::infra::clock::now_naive;
 use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
+use crate::modules::statistics::repo::{
+    PickupSkipDetailRow, PickupSkipSummaryRow, StatisticsRepoTrait, WorkerPartRow, WorkerPickupRow,
+};
 use crate::modules::statistics::vo::{
     DeliveryPerformance, OverviewOut, PickupSkipDetailItem, PickupSkipDetailOut,
     PickupSkipSummaryItem, PickupSkipSummaryOut, StatusCount, WorkerBrief, WorkerDetailOut,
     WorkerPartItem, WorkerStatsItem, WorkerStatsListOut,
-};
-use crate::modules::statistics::repo::{
-    PickupSkipDetailRow, PickupSkipSummaryRow, StatisticsRepo, WorkerPartRow, WorkerPickupRow,
 };
 use crate::shared::analytics::{
     daily_buckets::fill_zero_daily_counts, worker_contribution::compute_worker_contribution,
@@ -60,26 +67,25 @@ impl StatisticsService {
     // tab1: Overview
     // ============================================================
 
-    pub async fn overview(
-        conn: &mut PgConnection,
+    pub async fn overview<R: StatisticsRepoTrait>(
+        &self,
+        mut repo: R,
         date_from: NaiveDate,
         date_to: NaiveDate,
     ) -> Result<OverviewOut, AppError> {
         Self::validate_date_range(date_from, date_to)?;
         let today = now_naive().date();
 
-        let created_count = StatisticsRepo::count_created(conn, date_from, date_to).await?;
-        let completed_count = StatisticsRepo::count_completed(conn, date_from, date_to).await?;
-        let in_process_count = StatisticsRepo::count_in_process_at(conn, date_to).await?;
+        let created_count = repo.count_created(date_from, date_to).await?;
+        let completed_count = repo.count_completed(date_from, date_to).await?;
+        let in_process_count = repo.count_in_process_at(date_to).await?;
         let (delivered_count, delivered_value, orange, red) =
-            StatisticsRepo::delivered_stats(conn, date_from, date_to).await?;
-        let overdue_undelivered = StatisticsRepo::count_overdue_undelivered(conn, today).await?;
-        let repair_count = StatisticsRepo::count_repair_parts(conn, date_from, date_to).await?;
-        let daily_created_raw =
-            StatisticsRepo::daily_created_counts(conn, date_from, date_to).await?;
-        let daily_completed_raw =
-            StatisticsRepo::daily_completed_counts(conn, date_from, date_to).await?;
-        let status_dist = StatisticsRepo::status_distribution(conn).await?;
+            repo.delivered_stats(date_from, date_to).await?;
+        let overdue_undelivered = repo.count_overdue_undelivered(today).await?;
+        let repair_count = repo.count_repair_parts(date_from, date_to).await?;
+        let daily_created_raw = repo.daily_created_counts(date_from, date_to).await?;
+        let daily_completed_raw = repo.daily_completed_counts(date_from, date_to).await?;
+        let status_dist = repo.status_distribution().await?;
 
         let daily_created = fill_zero_daily_counts(date_from, date_to, &daily_created_raw);
         let daily_completed = fill_zero_daily_counts(date_from, date_to, &daily_completed_raw);
@@ -120,15 +126,18 @@ impl StatisticsService {
     // tab2: WorkerStats
     // ============================================================
 
-    pub async fn worker_stats(
-        conn: &mut PgConnection,
+    pub async fn worker_stats<R: StatisticsRepoTrait>(
+        &self,
+        mut repo: R,
         date_from: NaiveDate,
         date_to: NaiveDate,
     ) -> Result<WorkerStatsListOut, AppError> {
         Self::validate_date_range(date_from, date_to)?;
 
-        // 全部未软删工人（不分页 — 内部工人规模远小于 500）。
+        // 跨域 ZST（WorkerRepo / WorkTypeRepo）走 conn_mut 借位（PR8 引入 conn_mut 访问器，
+        // 与 DeliveryNoteRepoTrait::conn_mut 2026-09-22 D-5 引入同形）。
         // 2026-09-15 followup-cleanup A9：明确 1000 远高于合理在持工人数（防爆兜底；如需全量应走分页）
+        let conn = repo.conn_mut();
         let workers_rows = WorkerRepo::list_with_filters(&mut *conn, None, None, 1000, 0).await?;
 
         let work_type_ids: Vec<i64> = workers_rows
@@ -141,7 +150,7 @@ impl StatisticsService {
         let wt_name_map: HashMap<i64, String> =
             wt_rows.into_iter().map(|wt| (wt.id, wt.name)).collect();
 
-        let rows = StatisticsRepo::worker_pickup_rows(&mut *conn, date_from, date_to).await?;
+        let rows = repo.worker_pickup_rows(date_from, date_to).await?;
         let agg_map: HashMap<i64, WorkerPickupRow> =
             rows.iter().map(|r| (r.worker_id, r.clone())).collect();
 
@@ -174,8 +183,9 @@ impl StatisticsService {
     // tab3: WorkerDetail
     // ============================================================
 
-    pub async fn worker_detail(
-        conn: &mut PgConnection,
+    pub async fn worker_detail<R: StatisticsRepoTrait>(
+        &self,
+        mut repo: R,
         worker_id_str: &str,
         date_from: NaiveDate,
         date_to: NaiveDate,
@@ -183,6 +193,7 @@ impl StatisticsService {
         Self::validate_date_range(date_from, date_to)?;
         let wid_int = Self::parse_worker_id(worker_id_str)?;
 
+        let conn = repo.conn_mut();
         let worker = WorkerRepo::get_by_id(&mut *conn, wid_int, false)
             .await?
             .ok_or_else(|| {
@@ -200,12 +211,13 @@ impl StatisticsService {
             None
         };
 
-        let (pickup_count, pickup_quantity, return_count) =
-            StatisticsRepo::worker_detail_events(&mut *conn, wid_int, date_from, date_to).await?;
-        let daily_pickups_raw =
-            StatisticsRepo::worker_daily_pickups(&mut *conn, wid_int, date_from, date_to).await?;
-        let parts_rows =
-            StatisticsRepo::worker_parts(&mut *conn, wid_int, date_from, date_to).await?;
+        let (pickup_count, pickup_quantity, return_count) = repo
+            .worker_detail_events(wid_int, date_from, date_to)
+            .await?;
+        let daily_pickups_raw = repo
+            .worker_daily_pickups(wid_int, date_from, date_to)
+            .await?;
+        let parts_rows = repo.worker_parts(wid_int, date_from, date_to).await?;
         let daily_pickups = fill_zero_daily_counts(date_from, date_to, &daily_pickups_raw);
 
         // distinct part_id（即便 part 已软删也计数 — 与 parts 列表口径不同）
@@ -249,10 +261,11 @@ impl StatisticsService {
     // tab4 跳序取件
     // ============================================================
 
-    pub async fn pickup_skip_summary(
-        conn: &mut PgConnection,
+    pub async fn pickup_skip_summary<R: StatisticsRepoTrait>(
+        &self,
+        mut repo: R,
     ) -> Result<PickupSkipSummaryOut, AppError> {
-        let rows = StatisticsRepo::pickup_skip_summary(conn).await?;
+        let rows = repo.pickup_skip_summary().await?;
         let items = rows
             .into_iter()
             .map(|r: PickupSkipSummaryRow| PickupSkipSummaryItem {
@@ -267,8 +280,9 @@ impl StatisticsService {
         Ok(PickupSkipSummaryOut { items })
     }
 
-    pub async fn pickup_skip_detail(
-        conn: &mut PgConnection,
+    pub async fn pickup_skip_detail<R: StatisticsRepoTrait>(
+        &self,
+        mut repo: R,
         worker_id_str: &str,
         limit: i64,
         offset: i64,
@@ -277,8 +291,8 @@ impl StatisticsService {
         let limit = limit.clamp(1, 200);
         let offset = offset.max(0);
 
-        let rows = StatisticsRepo::pickup_skip_detail(conn, wid_int, limit, offset).await?;
-        let total = StatisticsRepo::pickup_skip_detail_count(conn, wid_int).await?;
+        let rows = repo.pickup_skip_detail(wid_int, limit, offset).await?;
+        let total = repo.pickup_skip_detail_count(wid_int).await?;
 
         let items = rows
             .into_iter()
@@ -307,7 +321,3 @@ impl StatisticsService {
 // 2026-09-22 PR3：原 `compute_contribution` / `zero_fill_day_count` 两个私有 fn 已抽离到
 // `crate::shared::analytics::{worker_contribution, daily_buckets}`，行为 1:1 保留。
 // 单元测试随抽离搬到各 fn 所在文件，service.rs 此处不再重复。
-
-// ============================================================
-// 2026-09-15 followup-cleanup A7：删除原 `_unused()` 死代码（Role / Decimal 实际由上层 handler 引用）
-// ============================================================
