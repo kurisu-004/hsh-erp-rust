@@ -30,7 +30,7 @@ use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::part::dto_crud::{FileBindingIn, PartBatchCreateOut, PartBatchCreateRequest};
 use crate::modules::part::repo::NewPartCreate;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part_batch::repo::{NewInitialBatch, PartBatchRepo};
+use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part_file::policy;
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo};
 use crate::shared::error::{AppError, code};

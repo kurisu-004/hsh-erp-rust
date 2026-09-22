@@ -25,7 +25,7 @@ use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;
-use crate::modules::part_batch::repo::PartBatchRepo;
+use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};

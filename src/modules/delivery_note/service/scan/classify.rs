@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::modules::delivery_note::dto::{ScanOutcomeDto, UnresolvedTargetDto};
 use crate::modules::part::model::TPart;
-use crate::modules::part_batch::model::TPartBatch;
+use crate::modules::part::batch::model::TPartBatch;
 
 use super::helpers;
 

@@ -11,7 +11,7 @@ use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::part_batch::model::TPartBatch;
+use crate::modules::part::batch::model::TPartBatch;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 

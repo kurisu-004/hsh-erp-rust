@@ -15,7 +15,7 @@ use axum::http::StatusCode;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
-use crate::modules::part_batch::repo::PartBatchRepo;
+use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{AttachBatchConflict, AttachBatchItem, AttachBatchesOut};

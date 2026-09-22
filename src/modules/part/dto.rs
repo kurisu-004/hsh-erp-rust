@@ -360,8 +360,8 @@ impl From<crate::modules::part::service::crud::TPartScanRow> for PartScanInfoOut
 }
 
 /// `PartBatchScanOut::from(PartBatchScanRow)`：repo 解析出的批次窄字段 → DTO。
-impl From<crate::modules::part_batch::model::PartBatchScanRow> for PartBatchScanOut {
-    fn from(p: crate::modules::part_batch::model::PartBatchScanRow) -> Self {
+impl From<crate::modules::part::batch::model::PartBatchScanRow> for PartBatchScanOut {
+    fn from(p: crate::modules::part::batch::model::PartBatchScanRow) -> Self {
         Self {
             id: p.id,
             quantity: p.quantity,

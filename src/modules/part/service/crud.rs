@@ -36,7 +36,7 @@ use crate::modules::part::dto::{
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::{NewPartCreate, PartListFilters, PartUpdate};
-use crate::modules::part_batch::repo::{NewInitialBatch, PartBatchRepo};
+use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};

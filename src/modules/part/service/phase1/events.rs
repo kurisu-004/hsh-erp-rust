@@ -14,7 +14,7 @@ use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::part::repo::NewPartCreate;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::PartUpdate;
-use crate::modules::part_batch::repo::PartBatchRepo;
+use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
@@ -352,7 +352,7 @@ impl PartService {
         let initial_batch_id = snowflake.next_id();
         PartBatchRepo::create_initial_batch(
             repo.conn_mut(),
-            crate::modules::part_batch::repo::NewInitialBatch {
+            crate::modules::part::batch::repo::NewInitialBatch {
                 id: initial_batch_id,
                 part_id: new_id,
                 quantity: 1,
@@ -397,7 +397,7 @@ impl PartService {
                 // 初始批次
                 PartBatchRepo::create_initial_batch(
                     repo.conn_mut(),
-                    crate::modules::part_batch::repo::NewInitialBatch {
+                    crate::modules::part::batch::repo::NewInitialBatch {
                         id: snowflake.next_id(),
                         part_id: child_id,
                         quantity: 1,

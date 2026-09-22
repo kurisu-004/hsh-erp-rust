@@ -164,7 +164,7 @@ mod classify_5groups_tests {
     use super::super::classify::{
         classify_invalid_state, is_attachable_state, is_inspectable_state,
     };
-    use crate::modules::part_batch::model::TPartBatch;
+    use crate::modules::part::batch::model::TPartBatch;
 
     fn b(status: &str, holder: Option<i64>, location: Option<&str>) -> TPartBatch {
         TPartBatch {
@@ -253,7 +253,7 @@ mod classify_5groups_tests {
 #[cfg(test)]
 mod c_group_distribution_tests {
     use super::super::classify::{classify_invalid_state, has_fully_invalid_target};
-    use crate::modules::part_batch::model::TPartBatch;
+    use crate::modules::part::batch::model::TPartBatch;
 
     /// 紧凑 mock：仅暴露本测试关注的字段，其余用 None / 0 / false 占位。
     fn b(id: i64, part_id: i64, status: &str, location: Option<&str>) -> TPartBatch {
@@ -351,7 +351,7 @@ mod attachable_batches_tests {
         AttachableBatchDto, AvailableBatchDto, BatchStatusDto, ScanOutcomeDto, UnresolvedTargetDto,
     };
     use crate::modules::part::model::TPart;
-    use crate::modules::part_batch::model::TPartBatch;
+    use crate::modules::part::batch::model::TPartBatch;
 
     /// 紧凑 mock：仅暴露本测试关注的字段，其余用 None / 0 / false 占位。
     fn b(id: i64, part_id: i64, status: &str, location: Option<&str>, version: i32) -> TPartBatch {

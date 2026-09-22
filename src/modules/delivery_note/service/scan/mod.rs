@@ -39,7 +39,7 @@ use crate::modules::delivery_note::dto::{
 use crate::modules::delivery_note::model::NoteScope;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::repo::PartRepo;
-use crate::modules::part_batch::repo::PartBatchRepo;
+use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::inner::{note_not_found, GroupWithMemberIds};
@@ -214,7 +214,7 @@ impl DeliveryNoteService {
 
         // ===== Step 4: 加载 target 全部活跃 batch → C 组短路 → 5 组分类 =====
         let target_part_ids: Vec<i64> = targets.iter().map(|p| p.id).collect();
-        let all_batches: Vec<crate::modules::part_batch::model::TPartBatch> =
+        let all_batches: Vec<crate::modules::part::batch::model::TPartBatch> =
             if target_part_ids.is_empty() {
                 Vec::new()
             } else {
@@ -245,13 +245,13 @@ impl DeliveryNoteService {
         }
 
         // 过滤 C 组后继续走 A/B/D/E 分类（与原 5 组逻辑兼容）
-        let all_batches: Vec<crate::modules::part_batch::model::TPartBatch> = all_batches
+        let all_batches: Vec<crate::modules::part::batch::model::TPartBatch> = all_batches
             .into_iter()
             .filter(|b| classify_invalid_state(b).is_none())
             .collect();
 
         // 按 part_id 分桶（一次扫描）
-        let mut batches_by_part: HashMap<i64, Vec<crate::modules::part_batch::model::TPartBatch>> =
+        let mut batches_by_part: HashMap<i64, Vec<crate::modules::part::batch::model::TPartBatch>> =
             HashMap::new();
         for b in all_batches {
             batches_by_part.entry(b.part_id).or_default().push(b);
@@ -266,9 +266,9 @@ impl DeliveryNoteService {
         for target in &targets {
             let empty = Vec::new();
             let bs = batches_by_part.get(&target.id).unwrap_or(&empty);
-            let mut attachable: Vec<crate::modules::part_batch::model::TPartBatch> = Vec::new();
-            let mut inspectable: Vec<crate::modules::part_batch::model::TPartBatch> = Vec::new();
-            let mut conflict: Vec<crate::modules::part_batch::model::TPartBatch> = Vec::new();
+            let mut attachable: Vec<crate::modules::part::batch::model::TPartBatch> = Vec::new();
+            let mut inspectable: Vec<crate::modules::part::batch::model::TPartBatch> = Vec::new();
+            let mut conflict: Vec<crate::modules::part::batch::model::TPartBatch> = Vec::new();
             for b in bs {
                 match b.delivery_note_id {
                     Some(other_id) if other_id == note.id => {

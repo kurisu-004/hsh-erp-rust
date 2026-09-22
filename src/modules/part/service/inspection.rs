@@ -40,7 +40,7 @@
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part_batch::model::TPartBatch;
+use crate::modules::part::batch::model::TPartBatch;
 use crate::modules::shelf::model::TShelf;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};

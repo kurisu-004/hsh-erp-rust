@@ -67,7 +67,7 @@ use async_trait::async_trait;
 use sqlx::PgConnection;
 
 use crate::modules::part::model::{NewPartEvent, TPart};
-use crate::modules::part_batch::model::TPartBatch;
+use crate::modules::part::batch::model::TPartBatch;
 use crate::modules::prod::process::model::TProcess;
 use crate::modules::prod::work_type::model::TWorkType;
 use crate::modules::prod::worker::model::TWorker;
@@ -449,7 +449,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         &mut self,
         worker_id: i64,
     ) -> Result<i64, sqlx::Error> {
-        crate::modules::part_batch::repo::PartBatchRepo::count_held_by_worker(&mut **self, worker_id)
+        crate::modules::part::batch::repo::PartBatchRepo::count_held_by_worker(&mut **self, worker_id)
             .await
     }
 
@@ -458,7 +458,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         id: i64,
         include_deleted: bool,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        crate::modules::part_batch::repo::PartBatchRepo::get_by_id(&mut **self, id, include_deleted)
+        crate::modules::part::batch::repo::PartBatchRepo::get_by_id(&mut **self, id, include_deleted)
             .await
     }
 
@@ -467,7 +467,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
     ) -> Result<Vec<TPartBatch>, sqlx::Error> {
-        crate::modules::part_batch::repo::PartBatchRepo::list_active_by_part_id(
+        crate::modules::part::batch::repo::PartBatchRepo::list_active_by_part_id(
             &mut **self,
             part_id,
         )
