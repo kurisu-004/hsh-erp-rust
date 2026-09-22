@@ -144,9 +144,9 @@ Response 200 `data`：同 [`/iam/login`](#post-apiv2iamlogin)
 
 - `true`（默认）：登录/refresh 时把 token hash 写入 Redis；每次请求查 Redis 校验；
   logout/change_password 删 Redis 条目强制吊销。40105 SESSION_REVOKED 仍会触发。
-- `false`：不建 Redis 连接池；所有 session 写入走 NoopSessionStore（silent 成功但不持久化）；
-  extractor 直接从 JWT Claims 构造 CurrentUser，**不再返回 40105**。
-  仅当 Rust 后端在借 Python 后端签发的 JWT 时使用——切回 `true` 后所有已发 token 必须重新登录。
+- `false`：不建 Redis 连接池；middleware 直接返 50000 INTERNAL（强制 prod 必须开启 Redis；
+  详见 src/auth/middleware.rs::verify_session_token）。业务场景：仅用于过渡期调试；
+  切回 `true` 后所有已发 token 必须重新登录。
 
 ---
 

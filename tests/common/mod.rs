@@ -424,7 +424,7 @@ pub async fn test_redis_pool() -> RedisPool {
 
 /// 清空测试 Redis db（FLUSHDB；与 `clean_db` 配套保证 DB + Redis 状态都干净）。
 ///
-/// 仅部分集成测试（如 auth_api）需要；其它测试不引用本函数 —— 故 `dead_code` 抑制。
+/// 仅部分集成测试（如 iam_api）需要；其它测试不引用本函数 —— 故 `dead_code` 抑制。
 #[allow(dead_code)]
 pub async fn clean_redis(pool: &RedisPool) {
     let mut conn = pool.get().await.expect("get redis conn from test pool");
@@ -549,9 +549,11 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
 /// 构造测试用 AppState：session check **关闭**，**不**建 Redis 池。
 ///
 /// 用途：验证 `REDIS_SESSION_CHECK_ENABLED=false` 时，`auth::middleware::verify_session_token`
-/// 的关闭分支直接用 JWT Claims 构造 CurrentUser，不依赖 Redis 进程存在。
+/// 的关闭分支直接返 `AppError::internal(...)`（50000 INTERNAL），不依赖 Redis 进程存在；
+/// session check 关闭后走 HTTP middleware 的所有请求会立刻 500，不可用于 HTTP 集成测试。
 ///
-/// 仅 `tests/auth_api.rs` 调用；其它 integration test 不引用 —— 故 `dead_code` 抑制。
+/// 仅供 service 层单测用；当前 caller：auto_complete_api / part_crud。
+/// 其它 HTTP integration test 不引用 —— 故 `dead_code` 抑制。
 #[allow(dead_code)]
 pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
     let config = Arc::new(AppConfig {
