@@ -341,27 +341,29 @@ pub async fn worker_scan(
 /// `GET /api/v2/parts/repair-batches`
 ///
 /// DELIVERED 批次列表（Manager + Clerk + Inspector）。
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_repair_batches(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(query): Query<InspectionBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_repair_batches(&mut *tx, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_repair_batches(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `GET /api/v2/parts/repairing-batches`
 ///
 /// REPAIRING 批次列表（Manager + Clerk + Inspector）。
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_repairing_batches(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(query): Query<InspectionBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_repairing_batches(&mut *tx, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_repairing_batches(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }

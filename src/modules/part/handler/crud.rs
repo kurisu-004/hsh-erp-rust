@@ -56,15 +56,16 @@ fn ws_broadcast_soft_deleted(state: &AppState, part_id: i64) {
 /// `GET /api/v2/parts`
 ///
 /// 列表查询 + 分页（service 内已校验角色）。
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`，不开事务（连接用完即 drop 归还）。
 pub async fn list_parts(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(query): Query<PartListQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
     current.require_any_role(LIST_PART_ROLES)?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_parts(&mut *tx, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_parts(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -80,45 +81,48 @@ pub async fn list_parts(
 /// - Query：`InspectionBatchListQuery { keyword?, customer_id?, serial_no?, planned_delivery_date_from?, planned_delivery_date_to?, limit?, offset? }`
 /// - 业务流转：纯读，不开 WS 广播
 /// - 响应：`InspectionBatchListOut { items, total, limit, offset }`
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_inspection_batches(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(query): Query<InspectionBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Inspector])?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_inspection_batches(&mut *tx, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_inspection_batches(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `GET /api/v2/parts/{part_id}`
 ///
 /// 单件详情。`path` 段 `part_id` 是 i64；service 内 OCC 已用 version 守。
+///
+/// 2026-09-22 PR5：只读 get 端点改 `pool.acquire()`。
 pub async fn get_part_detail(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(part_id): Path<i64>,
 ) -> Result<Json<R<PartDetailOut>>, AppError> {
     current.require_any_role(LIST_PART_ROLES)?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::get_part(&mut *tx, part_id, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::get_part(&mut *conn, part_id, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `GET /api/v2/parts/by-serial/{serial_no}`
 ///
 /// 通过序列号查详情（`part.serial_no` 唯一索引）。
+///
+/// 2026-09-22 PR5：只读 get 端点改 `pool.acquire()`。
 pub async fn get_by_serial(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(serial_no): Path<String>,
 ) -> Result<Json<R<PartDetailOut>>, AppError> {
     current.require_any_role(LIST_PART_ROLES)?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::get_part_by_serial(&mut *tx, &serial_no, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::get_part_by_serial(&mut *conn, &serial_no, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -127,15 +131,16 @@ pub async fn get_by_serial(
 /// 扫码快捷品检上下文：返回工单窄字段（8 列 + id）+ 全部活跃批次（含 holder 名称）。
 /// 前端扫码弹窗据此拼 `POST /parts/{part_id}/to-ship` 的 `{ batch_id, version }`。
 /// 与 `get_by_serial`（`PartDetailOut` 28 列）并存，互不替代。
+///
+/// 2026-09-22 PR5：只读 get 端点改 `pool.acquire()`。
 pub async fn get_by_serial_part_batches(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(serial_no): Path<String>,
 ) -> Result<Json<R<PartScanContextOut>>, AppError> {
     current.require_any_role(LIST_PART_ROLES)?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::get_part_batches_by_serial(&mut *tx, &serial_no, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::get_part_batches_by_serial(&mut *conn, &serial_no, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -311,14 +316,15 @@ async fn read_single_file_field(
 /// `GET /api/v2/parts/{part_id}/events`
 ///
 /// 事件历史（按 created_at DESC）。
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_part_events(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(part_id): Path<i64>,
 ) -> Result<Json<R<Vec<PartEventOut>>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_events(&mut *tx, part_id, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_events(&mut *conn, part_id, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -326,33 +332,35 @@ pub async fn list_part_events(
 ///
 /// 按 shelf/status 聚合位置树（OFFICE / PRODUCTION_SHELF / WORKER /
 /// INSPECTION_SHELF / OUTSOURCE_COMPANY 五区 + 各 holder 子节点）。
+///
+/// 2026-09-22 PR5：只读 aggregate 端点改 `pool.acquire()`。
 pub async fn get_location_tree(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
 ) -> Result<Json<R<LocationTreeOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::location_tree(&mut *tx, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::location_tree(&mut *conn, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `POST /api/v2/parts/match-by-excel-items`
 ///
 /// 用 Excel 序列号清单反查 part 匹配结果（批量导入前置校验）。
+///
+/// 2026-09-22 PR5：POST 入参但纯只读匹配，改 `pool.acquire()`。
 pub async fn match_by_excel_items(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Json(req): Json<MatchByExcelItemsRequest>,
 ) -> Result<Json<R<Vec<MatchByExcelItemResult>>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::match_by_excel_items(&mut *tx, &req, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::match_by_excel_items(&mut *conn, &req, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `POST /api/v2/parts/batch-update-order-info`
 ///
-/// 批量更新工单 order_no / system_delivery_date / note。
+/// 批量更新工单 order_no / system_delivery_date / note（保留 `begin + commit`，写端点）。
 pub async fn batch_update_order_info(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -367,13 +375,14 @@ pub async fn batch_update_order_info(
 /// `GET /api/v2/parts/{part_id}/batches`
 ///
 /// 工单全部活跃批次列表（含 holder 名称 / 下一工序 / 父批次等元信息）。
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_part_batches(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(part_id): Path<i64>,
 ) -> Result<Json<R<Vec<PartBatchListItemOut>>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_batches(&mut *tx, part_id, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_batches(&mut *conn, part_id, &current).await?;
     Ok(Json(R::ok(out)))
 }
