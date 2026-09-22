@@ -84,6 +84,10 @@ pub async fn change_password(
 }
 
 /// POST /api/v2/iam/refresh —— 写端点（refresh 两阶段：DB 在 tx 内，旧/新 Redis session 在 commit 后）
+///
+/// 2026-09-23 重构：黑名单（reuse detection `revoked:<old_refresh_jti>`）写在 commit 后，
+/// 由 `complete_refresh` 在 `delete_session` 之后调 `revoke_jti` 完成；
+/// 黑名单 TTL = `max(0, old_refresh_exp - now)`，与旧 refresh 自身剩余有效期对齐。
 pub async fn refresh(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RefreshRequest>,

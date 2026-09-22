@@ -37,6 +37,15 @@
 //!   改为 `jti`，`hash_token` 函数被删除（`sha2` crate 因 part_file 仍保留——见 Cargo.toml 注释）。
 //! - `AuthenticatedTokenHash` 重命名为 `SessionJti`，值类型仍为 `String`，但语义
 //!   从 sha256 hex 改为 jti UUID v4。
+//!
+//! ## 2026-09-23 重构要点：refresh rotation + reuse detection
+//! - `verify_session_token` 在 `decode_access` 拿到 jti 后、`get_session` 之前
+//!   新增黑名单 EXISTS 闸：`is_jti_revoked(&jti)` 为 true 即返回 40105 SESSION_REVOKED。
+//! - 这是 refresh 轮转流程的入口闸——任何被轮转过的 access jti 在黑名单 TTL
+//!   期间内被任意请求撞上即视为会话已失效，前端应清除本地 token 并跳回登录页。
+//! - refresh 路径在 `iam::service::session::refresh` phase 1 还有第二道闸：
+//!   撞上 refresh jti 黑名单视为 reuse detection 命中，触发
+//!   `delete_all_user_sessions` 强制下线该用户所有 session（ACCOUNT_SECURITY_EVENT）。
 
 use std::sync::Arc;
 
@@ -76,10 +85,12 @@ fn is_public_path(path: &str) -> bool {
 /// 流程：
 /// 1. `decode_access` 验签（带 iss/aud 校验 + `set_required_spec_claims`；
 ///    ExpiredSignature → 40102，其余 40100）
-/// 2. 查 Redis `session:tok:<jti>`；查不到 / user_id 不匹配 → 40105；通过则继续
-/// 3. `touch_session` 滑动 TTL；失败仅 warn
-/// 4. roles 走 `parse_role_string` 把缓存里的大写字符串转回 `Role` enum（未知值 warn+skip）
-/// 5. username/roles/shelf_ids/shelf_wildcard 从 `cached.profile.{...}` 取（注意字段名是
+/// 2. `is_jti_revoked(&jti)` 查黑名单（2026-09-23 新增）—— refresh rotation 入口闸；
+///    命中即返回 40105，跳过 Redis 主条目查询
+/// 3. 查 Redis `session:tok:<jti>`；查不到 / user_id 不匹配 → 40105；通过则继续
+/// 4. `touch_session` 滑动 TTL；失败仅 warn
+/// 5. roles 走 `parse_role_string` 把缓存里的大写字符串转回 `Role` enum（未知值 warn+skip）
+/// 6. username/roles/shelf_ids/shelf_wildcard 从 `cached.profile.{...}` 取（注意字段名是
 ///    `profile`，不是 `cached`；2026-09-22 重命名）
 ///
 /// ## 2026-09-23 重构：Redis session key 直接使用 JWT 自带的 jti
@@ -102,7 +113,19 @@ pub async fn verify_session_token(
     // 不再对 token 做 sha256 哈希。
     let jti = claims.jwt_id.clone();
 
-    // 2) 查 Redis session
+    // 2) 2026-09-23 重构：refresh rotation reuse detection 黑名单闸。
+    // 黑名单命中 → 40105 SESSION_REVOKED，跳过 Redis 主条目查询。
+    // 此闸是 access 路径的；refresh 路径在 `iam::service::session::refresh` phase 1 另有
+    // 第二道闸（命中即触发 force_logout + ACCOUNT_SECURITY_EVENT）。
+    if state.session.is_jti_revoked(&jti).await? {
+        tracing::warn!(jti = %jti, "verify_session_token: access jti 在黑名单");
+        return Err(AppError::biz(
+            code::SESSION_REVOKED,
+            "会话已被吊销，请重新登录",
+        ));
+    }
+
+    // 3) 查 Redis session
     let cached = state
         .session
         .get_session(&jti)
@@ -115,7 +138,7 @@ pub async fn verify_session_token(
         ));
     }
 
-    // 3) 滑动 TTL（best-effort；失败仅 warn，不阻断请求）
+    // 4) 滑动 TTL（best-effort；失败仅 warn，不阻断请求）
     if let Err(e) = state
         .session
         .touch_session(&jti, state.config.redis.session_ttl_seconds)
@@ -124,7 +147,7 @@ pub async fn verify_session_token(
         tracing::warn!(error = %e, "刷新 session TTL 失败");
     }
 
-    // 4) 把缓存中的大写 role 字符串转回 Role enum（未知值 warn+skip）
+    // 5) 把缓存中的大写 role 字符串转回 Role enum（未知值 warn+skip）
     let mut roles = Vec::with_capacity(cached.profile.roles.len());
     for r in &cached.profile.roles {
         if let Some(role) = parse_role_string(r) {

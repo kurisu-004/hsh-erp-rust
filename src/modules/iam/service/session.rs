@@ -28,6 +28,14 @@
 //! 2026-09-23 重构：Redis session key 由 `sha256(token)` 改为 JWT 自带 jti（UUID v4）。
 //! `complete_login` / `complete_refresh` 现在直接用 `pair.access_jti` / `pair.refresh_jti`
 //! 写 Redis；refresh 阶段从入参 token 的 `claims.jwt_id` 取旧 refresh jti。
+//!
+//! 2026-09-23 重构：refresh rotation + reuse detection。
+//! - `refresh()` phase 1 在 `decode_refresh` 之后、`get_user_by_id` 之前插入黑名单闸
+//!   `is_jti_revoked(&claims.jwt_id)`：命中即 `delete_all_user_sessions(claims.subject)`
+//!   强制下线 + 返回 40105 SESSION_REVOKED + tracing `ACCOUNT_SECURITY_EVENT`。
+//! - `complete_refresh()` 在 `delete_session` 之后调用 `revoke_jti(old_refresh_jti,
+//!   max(0, old_refresh_expires_at - now))` 把旧 jti 入黑名单，TTL 与 refresh 自身有效期对齐。
+//! - `RefreshPending` 携带 `old_refresh_expires_at` 字段供 `complete_refresh` 计算 TTL。
 
 use std::sync::Arc;
 
@@ -71,6 +79,12 @@ pub struct LoginPending {
 ///
 /// 2026-09-23 重构：`old_refresh_hash: String` → `old_refresh_jti: String`，值来源从
 /// `hash_token(&req.refresh_token)` 改为 `decode_refresh(...).jwt_id.clone()`。
+///
+/// 2026-09-23 重构（reuse detection）：新增 `old_refresh_expires_at: i64`（旧 refresh
+/// token 的 `exp` 时间戳）。`complete_refresh` 写入黑名单时据此计算 TTL——
+/// `ttl = max(0, old_refresh_expires_at - now)`，与 refresh token 自身有效期一致。
+/// 与 `pair.refresh_expires_at`（新签发的 refresh 的 exp）严格区分：前者是旧 jti
+/// 黑名单 TTL 锚点，后者是返回给前端的新 refresh 的过期时间。
 #[derive(Debug)]
 pub struct RefreshPending {
     pub pair: TokenPair,
@@ -80,6 +94,7 @@ pub struct RefreshPending {
     pub shelf_wildcard: bool,
     pub menus: Vec<MenuNodeOut>,
     pub old_refresh_jti: String,
+    pub old_refresh_expires_at: i64,
 }
 
 /// iam 域会话 service。构造时注入 `Arc<AppConfig>`（JWT / Redis TTL 配置）+
@@ -264,6 +279,39 @@ impl SessionService {
         // 2026-09-23 重构：从 `claims.jwt_id` 取旧 refresh jti，不再调用 `hash_token`。
         let old_refresh_jti = claims.jwt_id.clone();
 
+        // 2. 2026-09-23 重构：reuse detection（adjust D：必须在 DB version check 之前）。
+        //
+        // 背景：refresh rotation 写入黑名单后，旧 refresh jti 在 `ttl = refresh_exp - now`
+        // 期间内任何请求撞上即视为会话失效。如果黑名单命中发生在 DB 校验之后
+        // （如 `complete_refresh` 已写黑名单），就会被 DB version mismatch（40103）
+        // 先一步拦截，40105 reuse detection 永远触发不到——security event dead branch。
+        //
+        // 故闸位放在 `decode_refresh` 之后、`get_user_by_id` 之前：
+        // - decode_refresh 失败 → 40103（refresh 失效）
+        // - 黑名单命中 → 40105 + force_logout（reuse detection，本节）
+        // - DB version 不匹配 → 40103（refresh 失效，正常流）
+        // - 一切正常 → 既有路径
+        //
+        // 黑名单命中即跳过整个用户查询/版本校验/轮转，直接走安全响应通道
+        // （不必查 DB 拿 user_id——从 `claims.subject` 取即可）。
+        if self.session.is_jti_revoked(&claims.jwt_id).await? {
+            let user_id = claims.subject;
+            if let Err(e) = self.session.delete_all_user_sessions(user_id).await {
+                tracing::error!(
+                    error = %e, user_id,
+                    "reuse detection: delete_all_user_sessions 失败"
+                );
+            }
+            tracing::warn!(
+                user_id, jti = %claims.jwt_id,
+                "ACCOUNT_SECURITY_EVENT refresh_token_reuse_detected"
+            );
+            return Err(AppError::biz(
+                code::SESSION_REVOKED,
+                "会话已被吊销，请重新登录",
+            ));
+        }
+
         // 2. 查用户 + 校验 active + 校验版本号匹配
         let u = repo
             .get_user_by_id(sub)
@@ -323,6 +371,9 @@ impl SessionService {
             shelf_wildcard,
             menus,
             old_refresh_jti,
+            // 2026-09-23 重构：旧 refresh token 的 exp 时间戳——`complete_refresh`
+            // 写入 reuse detection 黑名单时用作 TTL 锚点。
+            old_refresh_expires_at: claims.expires_at,
         })
     }
 
@@ -340,11 +391,37 @@ impl SessionService {
             shelf_wildcard,
             menus,
             old_refresh_jti,
+            // 2026-09-23 重构：旧 refresh exp 时间戳 —— 写入 reuse detection 黑名单时
+            // 用作 TTL 锚点（`ttl = max(0, expires - now)`）。
+            old_refresh_expires_at,
         } = pending;
 
         // 2026-09-23 重构：直接用旧 refresh jti 删 session。
         if let Err(e) = self.session.delete_session(&old_refresh_jti).await {
             tracing::warn!(error = %e, user_id = u.id, "refresh: 删旧 refresh session 失败");
+        }
+        // 2026-09-23 重构：reuse detection——把旧 refresh jti 入黑名单，TTL 至原 expires_at。
+        // TTL ≤ 0 时仍调 `revoke_jti(... 0)`（Redis 接到 EX 0 直接过期，效果是「下次查不到」，
+        // 符合预期——refresh 自身也到期了，黑名单随之无效化）。
+        // 失败仅 warn，不阻断 refresh 响应（best-effort 模式与 delete_session 一致）；
+        // 闸位已在 phase 1 装好，黑名单失败的最坏后果是 reuse 攻击者可再试一次
+        // 但仍会被 DB version 40103 兜底拦截。
+        let now_unix = chrono::Utc::now().timestamp();
+        let ttl: u64 = (old_refresh_expires_at - now_unix).max(0) as u64;
+        match self.session.revoke_jti(&old_refresh_jti, ttl).await {
+            Ok(true) => {} // 新写入
+            Ok(false) => {
+                tracing::warn!(
+                    jti = %old_refresh_jti,
+                    "complete_refresh: 黑名单已存在，本次写入跳过"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e, jti = %old_refresh_jti,
+                    "complete_refresh: 黑名单写入失败（reuse detection 闸仍由 phase 1 把守）"
+                );
+            }
         }
         // 2026-09-22 重构：`CachedCurrentUser` → `CachedUserProfile`（删 id 字段）；
         // `CachedSession.profile` 字段名对应。
