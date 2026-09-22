@@ -8,7 +8,7 @@
 //! - refresh phase 1：happy / invalid_token
 //! - refresh phase 2（complete_refresh）：happy / redis_fail
 //!
-//! mockall 用法：`MockIamRepo` + `MockSessionStore` 注入 service。Redis session
+//! mockall 用法：`MockIamRepoTrait` + `MockSessionStore` 注入 service。Redis session
 //! 操作由 MockSessionStore 提供；jwt 签发/解码用 `tests/mod.rs::test_jwt_config()`
 //! 提供的 2048-bit RSA keypair（进程级 OnceLock 缓存）。
 
@@ -20,7 +20,7 @@ use crate::auth::rbac::Role;
 use crate::auth::session::MockSessionStore;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::iam::dto::ChangePasswordRequest;
-use crate::modules::iam::repo::MockIamRepo;
+use crate::modules::iam::repo::MockIamRepoTrait;
 use crate::modules::iam::repo::model::UserRole;
 use crate::modules::iam::service::SessionService;
 use crate::shared::error::{AppError, code};
@@ -96,7 +96,7 @@ async fn login_happy_path_returns_pending() {
         role: "MANAGER".into(),
         ..sample_user_role(1, 42, "MANAGER")
     };
-    let mut mock_repo = MockIamRepo::new();
+    let mut mock_repo = MockIamRepoTrait::new();
     mock_repo
         .expect_get_user_by_username()
         .returning(move |_| Ok(Some(u.clone())));
@@ -142,7 +142,7 @@ async fn login_wrong_password_returns_invalid() {
         is_active: true,
         ..sample_user(42, "alice")
     };
-    let mut mock_repo = MockIamRepo::new();
+    let mut mock_repo = MockIamRepoTrait::new();
     mock_repo
         .expect_get_user_by_username()
         .returning(move |_| Ok(Some(u.clone())));
@@ -173,7 +173,7 @@ async fn login_inactive_user_returns_invalid() {
         is_active: false, // 已停用
         ..sample_user(42, "alice")
     };
-    let mut mock_repo = MockIamRepo::new();
+    let mut mock_repo = MockIamRepoTrait::new();
     mock_repo
         .expect_get_user_by_username()
         .returning(move |_| Ok(Some(u.clone())));
@@ -203,7 +203,7 @@ async fn login_bcrypt_error_returns_internal() {
         is_active: true,
         ..sample_user(42, "alice")
     };
-    let mut mock_repo = MockIamRepo::new();
+    let mut mock_repo = MockIamRepoTrait::new();
     mock_repo
         .expect_get_user_by_username()
         .returning(move |_| Ok(Some(u.clone())));
@@ -233,7 +233,7 @@ async fn me_happy_returns_current_user_out() {
     // Arrange
     let u = sample_user(42, "alice");
     let role_row = sample_user_role(1, 42, "MANAGER");
-    let mut mock_repo = MockIamRepo::new();
+    let mut mock_repo = MockIamRepoTrait::new();
     mock_repo
         .expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
@@ -295,7 +295,7 @@ async fn change_password_happy_delegates_to_account_service() {
         version: 1,
         ..sample_user(1, "alice")
     };
-    let mut mock_repo = MockIamRepo::new();
+    let mut mock_repo = MockIamRepoTrait::new();
     mock_repo
         .expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
@@ -327,7 +327,7 @@ async fn change_password_wrong_old_propagates_mismatch() {
         version: 1,
         ..sample_user(1, "alice")
     };
-    let mut mock_repo = MockIamRepo::new();
+    let mut mock_repo = MockIamRepoTrait::new();
     mock_repo
         .expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
@@ -355,7 +355,7 @@ async fn change_password_wrong_old_propagates_mismatch() {
 #[tokio::test]
 async fn change_password_forbidden_for_other_user() {
     // Arrange — clerk (id=1) 想改别人（id=999）的密码
-    let mock_repo = MockIamRepo::new();
+    let mock_repo = MockIamRepoTrait::new();
     let mock_session = MockSessionStore::new();
     let svc = make_session_service(mock_session);
     let req = ChangePasswordRequest {
@@ -435,7 +435,7 @@ async fn refresh_happy_returns_pending_with_new_pair() {
         ..sample_user(42, "alice")
     };
     let role_row = sample_user_role(1, 42, "MANAGER");
-    let mut mock_repo = MockIamRepo::new();
+    let mut mock_repo = MockIamRepoTrait::new();
     mock_repo
         .expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
@@ -477,7 +477,7 @@ async fn refresh_happy_returns_pending_with_new_pair() {
 #[tokio::test]
 async fn refresh_invalid_token_returns_refresh_invalid() {
     // Arrange — 直接传 garbage token
-    let mock_repo = MockIamRepo::new();
+    let mock_repo = MockIamRepoTrait::new();
     // refresh 失败在 decode_refresh 阶段，不会调用 mock_repo
     let mut mock_session = MockSessionStore::new();
     mock_session.expect_is_jti_revoked().returning(|_| Ok(false));

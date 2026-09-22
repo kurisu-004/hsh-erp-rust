@@ -1,11 +1,11 @@
-//! iam 域 SQL 真源（按实体拆 4 子文件）+ 单一 `impl IamRepo for &mut PgConnection` 块
+//! iam 域 SQL 真源（按实体拆 4 子文件）+ 单一 `impl IamRepoTrait for &mut PgConnection` 块
 //!
 //! ## 结构（2026-09-22 重构 #2）
 //! - `user.rs`        — `t_user` 10 个 SQL fns + `UserInsert` / `UserPartialUpdate<'_>` 入参
 //! - `user_role.rs`   — `t_user_role` 5 个 SQL fns + `UserRoleInsert` / `UserRoleRow`
 //! - `menu.rs`        — `t_menu` 1 个 SQL fn
 //! - `shelf.rs`       — `t_shelf` 1 个 SQL fn（本域只读）
-//! - `mod.rs`（本文件）— 声明子模块 + **单一** `impl IamRepo for &mut PgConnection` 块
+//! - `mod.rs`（本文件）— 声明子模块 + **单一** `impl IamRepoTrait for &mut PgConnection` 块
 //!   （覆盖全部 17 方法，按实体分组；call 各子文件 free fn）
 //!
 //! ## 为什么不是 4 个分散 impl 块
@@ -27,13 +27,13 @@ use chrono::NaiveDateTime;
 use sqlx::PgConnection;
 
 use crate::modules::iam::repo::model::{Menu, Shelf, User, UserRole};
-use crate::modules::iam::repo::{IamRepo, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow};
+use crate::modules::iam::repo::{IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow};
 
-/// 统一 `IamRepo for &mut PgConnection` 实现（按实体分组，零业务逻辑）
+/// 统一 `IamRepoTrait for &mut PgConnection` 实现（按实体分组，零业务逻辑）
 ///
 /// Rust 同一类型 + trait 至多一个 impl 块，故本块收在此处；子文件 sql/* 仅放 SQL 真源。
 #[async_trait]
-impl IamRepo for &mut PgConnection {
+impl IamRepoTrait for &mut PgConnection {
     // ── t_user（10）──
     async fn get_user_by_id(&mut self, id: i64) -> Result<Option<User>, sqlx::Error> {
         user::get_user_by_id(&mut **self, id).await

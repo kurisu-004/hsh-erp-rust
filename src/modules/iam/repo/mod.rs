@@ -21,7 +21,7 @@ use chrono::NaiveDateTime;
 /// - JOIN 过滤 → list_主实体_by_条件
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
-pub trait IamRepo: Send {
+pub trait IamRepoTrait: Send {
     // ── t_user（10）──
     async fn get_user_by_id(&mut self, id: i64) -> Result<Option<User>, sqlx::Error>;
     async fn get_user_by_username<'a>(
