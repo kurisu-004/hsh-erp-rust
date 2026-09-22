@@ -28,7 +28,6 @@ use common::{
     test_pool, test_state,
 };
 use hsh_erp_rust::auth::jwt::encode_access;
-use hsh_erp_rust::auth::rbac::{Claims, Role};
 
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -81,21 +80,13 @@ fn json_request(
 
 /// 签发合法 access token 但**不**写 Redis session（用于 case 4）。
 async fn mint_token_no_session(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
-    let claims = Claims {
-        sub: user_id,
-        username: "mw-tester".to_string(),
-        roles: vec![Role::Manager],
-        shelf_ids: vec![],
-        shelf_wildcard: true,
-        ver: 0,
-        typ: "access".into(),
-        iss: state.config.jwt.issuer.clone(),
-        exp: 0,
-    };
+    // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_hours)`，
+    // 不再收 Claims；iat/nbf/jti/aud/typ 由函数内部填。直接调用即可。
     let (token, _exp) = encode_access(
-        &claims,
         &state.config.jwt.secret,
         &state.config.jwt.issuer,
+        &state.config.jwt.audience,
+        user_id,
         state.config.jwt.access_ttl_hours,
     )
     .expect("encode_access");
@@ -108,28 +99,29 @@ async fn mint_token_no_session(state: &Arc<hsh_erp_rust::state::AppState>, user_
 /// 仍在 leeway 内不会触发 ExpiredSignature。120s 才能稳定触发 40102。
 async fn mint_expired_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    /// 2026-09-22 重构：JSON 字段名按 RFC 7519 短码（sub/aud/iat/nbf/exp/iss/jti/typ）；
+    /// 删 username/roles/shelf_ids/shelf_wildcard/ver 业务字段。
     #[derive(serde::Serialize)]
     struct ExpClaims<'a> {
         sub: i64,
-        username: &'a str,
-        roles: Vec<&'a str>,
-        shelf_ids: Vec<i64>,
-        shelf_wildcard: bool,
-        ver: i32,
-        typ: &'a str,
+        aud: &'a str,
+        iat: i64,
+        nbf: i64,
         iss: &'a str,
         exp: i64,
+        jti: String,
+        typ: &'a str,
     }
+    let now = Utc::now().timestamp();
     let c = ExpClaims {
         sub: user_id,
-        username: "mw-tester",
-        roles: vec!["MANAGER"],
-        shelf_ids: vec![],
-        shelf_wildcard: true,
-        ver: 0,
-        typ: "access",
+        aud: &state.config.jwt.audience,
+        iat: now,
+        nbf: now,
         iss: &state.config.jwt.issuer,
-        exp: Utc::now().timestamp() - 120,
+        exp: now - 120,
+        jti: uuid::Uuid::new_v4().to_string(),
+        typ: "access",
     };
     encode(
         &Header::new(Algorithm::HS256),

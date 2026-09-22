@@ -464,6 +464,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         jwt: JwtConfig {
             secret: TEST_JWT_SECRET.to_string(),
             issuer: "hsh-erp-test".to_string(),
+            // 2026-09-22 新增 audience 字段（与生产 `hsh-erp-rust` 对齐；测试用独立值便于排查）
+            audience: "hsh-erp-rust-test".to_string(),
             access_ttl_hours: 12,
             refresh_ttl_days: 7,
         },
@@ -558,6 +560,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         jwt: JwtConfig {
             secret: TEST_JWT_SECRET.to_string(),
             issuer: "hsh-erp-test".to_string(),
+            // 2026-09-22 新增 audience 字段（与生产 `hsh-erp-rust` 对齐；测试用独立值便于排查）
+            audience: "hsh-erp-rust-test".to_string(),
             access_ttl_hours: 12,
             refresh_ttl_days: 7,
         },
@@ -667,6 +671,8 @@ pub async fn test_state_with_cos(
         jwt: JwtConfig {
             secret: TEST_JWT_SECRET.to_string(),
             issuer: "hsh-erp-test".to_string(),
+            // 2026-09-22 新增 audience 字段（与生产 `hsh-erp-rust` 对齐；测试用独立值便于排查）
+            audience: "hsh-erp-rust-test".to_string(),
             access_ttl_hours: 12,
             refresh_ttl_days: 7,
         },

@@ -99,9 +99,10 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 2026-09-14 新增：e2e 测试 seed hook（dev/test 默认启用，release profile 硬关）
         .nest("/_e2e", _e2e::router())
         // 2026-09-20 新增：JWT 验证统一走中间件（详见 auth::middleware）
+        // 2026-09-22 重构：`auth_middleware` → `authenticate_middleware`（全词化）。
         .route_layer(axum::middleware::from_fn_with_state(
             state,
-            crate::auth::middleware::auth_middleware,
+            crate::auth::middleware::authenticate_middleware,
         ))
 }
 

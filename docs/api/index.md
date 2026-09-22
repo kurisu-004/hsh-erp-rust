@@ -90,16 +90,28 @@ HTTP 状态码：
 - Header：`Authorization: Bearer <access_token>`
 - 各端点小节里**标注"权限: 公开"**的端点无需登录；其余均需 Bearer JWT
 - access token 默认 12h 过期；refresh token 默认 7d
-- JWT 载荷含：`sub`（用户 i64）/ `roles`（[Role]）/ `shelf_ids`（[i64]）/ `shelf_wildcard`（bool）/ `ver`（用户版本号，用于 refresh 校验）
+- **JWT 载荷（2026-09-22 重构）**：仅含 RFC 7519 标准字段——
+  - `sub`：用户 snowflake id（i64）
+  - `aud`：受众，固定 `hsh-erp-rust`
+  - `iat`：issued-at（unix 秒）
+  - `nbf`：not-before（同 iat）
+  - `exp`：expiration（unix 秒）
+  - `iss`：issuer
+  - `jti`：JWT ID（UUID v4，防重放审计）
+  - `typ`：token type（`access` / `refresh`）
+  - refresh token 额外带 `ver`：用户在 DB 端的 `refresh_token_version`
+- **业务上下文从 Redis session 或 DB 兜底获取，不在 JWT 内**——
+  `CurrentUser` 所需的 `username` / `roles` / `shelf_ids` / `shelf_wildcard` 不写进 JWT，
+  全靠服务端 session 真源或 DB 查得；前端无需关心这些字段是否在 token 里。
 - **服务端 session**：每个 access / refresh token 必须对应 Redis 一条 `session:tok:<sha256_hex>`
   条目才视为有效。`CurrentUser` extractor 在 JWT 验签后额外查 Redis；
   查不到 → 40105 SESSION_REVOKED。登出（删当前 token 条目）、改密 / 管理员停用
   （清整个用户 Set `sessions:user:<id>`）都会触发吊销。前端拿到 40105 应清本地
   token 并跳回登录页。session 条目默认 TTL 12h，每次成功访问会 EXPIRE 续期（滑动窗口）。
 
-> ⚠️ 当 `REDIS_SESSION_CHECK_ENABLED=false` 时（迁移过渡期），extractor 不查 Redis，
-> 40105 SESSION_REVOKED 不会再触发；session 写入也走 no-op store。
-> 见 `docs/api/iam.md` 末段。
+> ⚠️ 当 `REDIS_SESSION_CHECK_ENABLED=false` 时，access token 不再携带业务字段，
+> 服务端无法从 JWT 重建 `CurrentUser` —— middleware 直接返 40105 SESSION_REVOKED，
+> 强制 prod 必须开启 Redis session check。session 写入也走 no-op store。
 
 ### 五角色 RBAC
 

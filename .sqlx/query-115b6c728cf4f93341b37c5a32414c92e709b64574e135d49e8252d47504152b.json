@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1 FROM t_user_role\n            WHERE user_id = $1\n              AND role = $2\n              AND scope_type IS NOT DISTINCT FROM $3::varchar\n              AND scope_id IS NOT DISTINCT FROM $4::bigint\n              AND deleted_at IS NULL\n        ) AS \"exists!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "115b6c728cf4f93341b37c5a32414c92e709b64574e135d49e8252d47504152b"
+}

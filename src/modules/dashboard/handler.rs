@@ -36,7 +36,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::auth::middleware::verify_access_token;
+use crate::auth::middleware::verify_session_token;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::dashboard::dto::{WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
 use crate::shared::error::{AppError, code};
@@ -60,14 +60,14 @@ pub async fn ws_dashboard(
     Query(q): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, AppError> {
-    // 1. 鉴权：与 HTTP middleware 同源（详见 `auth::middleware::verify_access_token`）
+    // 1. 鉴权：与 HTTP middleware 同源（详见 `auth::middleware::verify_session_token`）
     let token = q
         .token
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "缺少 token 查询参数"))?;
-    let (user, _token_hash) = verify_access_token(&state, token).await?;
+    let (user, _token_hash) = verify_session_token(&state, token).await?;
     // 2026-09-20 修改：username 写日志，便于按用户名排查连接异常；当前端点任意已登录即可，
     // 故不调用 user.require_role(...)。未来若加「仅 MANAGER 可见」再启用 require_role 守卫。
     info!(user_id = user.id, username = %user.username, "ws dashboard: 鉴权通过");

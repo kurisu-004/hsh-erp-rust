@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, current_holder_id, version, created_at, updated_at) VALUES ($1, $2, 1, 1, $3, 'PRODUCTION_SHELF', $4, 0, $5, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Int8",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4bbb04a8da25ed7879e7dbf7466a5a9dfbe2c9425d19a508acbb4bb462dcba19"
+}

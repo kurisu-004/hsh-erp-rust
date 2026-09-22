@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE t_part_batch SET status = 'READY_TO_SHIP' WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cec229258ef52fd35414a0829571598dbeffede357a92c0254d8953735800c27"
+}

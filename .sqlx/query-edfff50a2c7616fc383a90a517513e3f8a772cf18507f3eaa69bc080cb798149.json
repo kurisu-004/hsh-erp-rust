@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, created_at, updated_at) VALUES ($1, $2, NULL, $3, 0, $4, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "edfff50a2c7616fc383a90a517513e3f8a772cf18507f3eaa69bc080cb798149"
+}

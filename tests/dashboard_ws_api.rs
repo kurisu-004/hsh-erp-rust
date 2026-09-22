@@ -24,7 +24,6 @@ use common::{
 
 use futures_util::StreamExt;
 use hsh_erp_rust::auth::jwt::encode_access;
-use hsh_erp_rust::auth::rbac::{Claims, Role};
 use hsh_erp_rust::auth::session::hash_token;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
@@ -255,28 +254,20 @@ async fn spawn_ws_server() -> (String, Arc<hsh_erp_rust::state::AppState>) {
 
 /// 签发合法 access token + 写入 Redis session，使 dashboard WS 握手通过。
 async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
-    use hsh_erp_rust::auth::session::{CachedCurrentUser, TokenKind};
-    let claims = Claims {
-        sub: user_id,
-        username: "ws-tester".to_string(),
-        roles: vec![Role::Manager],
-        shelf_ids: vec![],
-        shelf_wildcard: true,
-        ver: 0,
-        typ: "access".into(),
-        iss: state.config.jwt.issuer.clone(),
-        exp: 0, // 由 encode_access 覆盖
-    };
+    use hsh_erp_rust::auth::session::{CachedUserProfile, TokenKind};
+    // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_hours)`，
+    // 不再收 Claims；iat/nbf/jti/aud/typ 由函数内部填。
     let (token, _exp) = encode_access(
-        &claims,
         &state.config.jwt.secret,
         &state.config.jwt.issuer,
+        &state.config.jwt.audience,
+        user_id,
         state.config.jwt.access_ttl_hours,
     )
     .expect("encode_access");
     // 写 Redis session，让 session_check_enabled=true 时 ws_dashboard 不返 40105。
-    let cached = CachedCurrentUser {
-        id: user_id,
+    // 2026-09-22 重构：`CachedCurrentUser` → `CachedUserProfile`（删 id 字段）。
+    let profile = CachedUserProfile {
         username: "ws-tester".to_string(),
         roles: vec!["MANAGER".into()],
         shelf_ids: vec![],
@@ -289,7 +280,7 @@ async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i6
             user_id,
             TokenKind::Access,
             state.config.redis.session_ttl_seconds,
-            &cached,
+            &profile,
         )
         .await
         .expect("create_session");

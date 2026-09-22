@@ -1,6 +1,5 @@
 //! iam 域会话 / 登录 / refresh / 改密 service
 //!
-//! 对应 Python myERP/service/auth_service.py。
 //! - login：username 归一化、bcrypt 校验、角色/shelf 范围解析、签发双 token、`last_login_at` 戳更新
 //! - refresh：decode refresh → 校验版本 → 轮转 `refresh_token_version` → 重签双 token
 //! - me：从 DB 重读当前用户 + 角色 + shelf 范围 + 菜单，返回最新视图
@@ -31,7 +30,7 @@ use std::sync::Arc;
 use crate::auth::jwt::{TokenPair, decode_refresh, issue_token_pair};
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::auth::session::{CachedCurrentUser, SessionStore, TokenKind, hash_token};
+use crate::auth::session::{CachedUserProfile, SessionStore, TokenKind, hash_token};
 use crate::infra::clock::now_naive;
 use crate::infra::config::AppConfig;
 use crate::shared::error::{AppError, code};
@@ -163,16 +162,13 @@ impl SessionService {
         }
         let menus = self.account_service.menus_for_roles(&mut repo, &roles).await?;
 
-        // 6. 签发双 token
+        // 6. 签发双 token（2026-09-22 重构：删业务字段参数，新增 audience）
         let pair = issue_token_pair(
             u.id,
-            &u.username,
-            &roles,
-            &shelf_ids,
-            shelf_wildcard,
             u.refresh_token_version,
             &self.config.jwt.secret,
             &self.config.jwt.issuer,
+            &self.config.jwt.audience,
             self.config.jwt.access_ttl_hours,
             self.config.jwt.refresh_ttl_days,
         )?;
@@ -201,8 +197,9 @@ impl SessionService {
             menus,
         } = pending;
 
-        let cached = CachedCurrentUser {
-            id: u.id,
+        // 2026-09-22 重构：`CachedCurrentUser` → `CachedUserProfile`（删 id 字段）；
+        // `CachedSession.profile` 字段名对应。
+        let profile = CachedUserProfile {
             username: u.username.clone(),
             roles: roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
             shelf_ids: shelf_ids.clone(),
@@ -215,7 +212,7 @@ impl SessionService {
                 u.id,
                 TokenKind::Access,
                 ttl,
-                &cached,
+                &profile,
             )
             .await?;
         self.session
@@ -224,7 +221,7 @@ impl SessionService {
                 u.id,
                 TokenKind::Refresh,
                 ttl,
-                &cached,
+                &profile,
             )
             .await?;
 
@@ -249,13 +246,16 @@ impl SessionService {
         mut repo: R,
         req: RefreshRequest,
     ) -> Result<RefreshPending, AppError> {
-        // 1. 解码 refresh token，取 sub + ver（在 open tx 前即可拒）
-        let (sub, ver) = decode_refresh(
+        // 1. 解码 refresh token，取 sub + refresh_version（在 open tx 前即可拒）
+        // 2026-09-22 重构：`decode_refresh` 增加 `audience` 参数。
+        let claims = decode_refresh(
             &req.refresh_token,
             &self.config.jwt.secret,
             &self.config.jwt.issuer,
+            &self.config.jwt.audience,
         )
         .map_err(|_| AppError::biz(code::REFRESH_INVALID, "refresh token 失效"))?;
+        let (sub, ver) = (claims.subject, claims.refresh_version);
 
         // 2. 查用户 + 校验 active + 校验版本号匹配
         let u = repo
@@ -297,15 +297,13 @@ impl SessionService {
             .await?
             .ok_or_else(|| AppError::biz(code::REFRESH_INVALID, "user disappeared"))?;
 
+        // 2026-09-22 重构：删业务字段参数，新增 audience
         let pair = issue_token_pair(
             u.id,
-            &u.username,
-            &roles,
-            &shelf_ids,
-            shelf_wildcard,
             u.refresh_token_version,
             &self.config.jwt.secret,
             &self.config.jwt.issuer,
+            &self.config.jwt.audience,
             self.config.jwt.access_ttl_hours,
             self.config.jwt.refresh_ttl_days,
         )?;
@@ -340,8 +338,9 @@ impl SessionService {
         if let Err(e) = self.session.delete_session(&old_refresh_hash).await {
             tracing::warn!(error = %e, user_id = u.id, "refresh: 删旧 refresh session 失败");
         }
-        let cached = CachedCurrentUser {
-            id: u.id,
+        // 2026-09-22 重构：`CachedCurrentUser` → `CachedUserProfile`（删 id 字段）；
+        // `CachedSession.profile` 字段名对应。
+        let profile = CachedUserProfile {
             username: u.username.clone(),
             roles: roles.iter().map(|r| role_as_str(*r).to_string()).collect(),
             shelf_ids: shelf_ids.clone(),
@@ -354,7 +353,7 @@ impl SessionService {
                 u.id,
                 TokenKind::Access,
                 ttl,
-                &cached,
+                &profile,
             )
             .await?;
         self.session
@@ -363,7 +362,7 @@ impl SessionService {
                 u.id,
                 TokenKind::Refresh,
                 ttl,
-                &cached,
+                &profile,
             )
             .await?;
 
