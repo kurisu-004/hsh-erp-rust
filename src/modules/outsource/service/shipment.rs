@@ -12,9 +12,8 @@
 //! impl 块直接挂在 `OutsourceService` 上（与 mod.rs / company.rs / quote.rs 共同 impl）。
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::outsource::dto::{
-    OutsourceShipmentOut, OutsourceShipmentReconcileUpdateRequest,
-};
+use crate::modules::outsource::dto::OutsourceShipmentReconcileUpdateRequest;
+use crate::modules::outsource::vo::OutsourceShipmentOut;
 use crate::modules::outsource::model::TOutsourceShipment;
 use crate::modules::outsource::repo::OutsourceRepoTrait;
 use crate::shared::error::{AppError, code};

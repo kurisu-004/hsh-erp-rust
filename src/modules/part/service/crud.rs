@@ -29,14 +29,15 @@ use chrono::NaiveDate;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::part::dto::{
-    InspectionBatchListItemOut, InspectionBatchListOut, InspectionBatchListQuery, PartBatchScanOut,
-    PartScanContextOut, PartScanInfoOut,
-};
+use crate::modules::part::dto::InspectionBatchListQuery;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
+use crate::modules::part::vo::{
+    InspectionBatchListItemOut, InspectionBatchListOut, PartBatchScanOut, PartDetailOut,
+    PartListItem, PartListOut, PartScanContextOut, PartScanInfoOut,
+};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
@@ -45,8 +46,7 @@ use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
 use super::super::dto_crud::{
-    PartBatchCreateRequest, PartCreateRequest, PartDetailOut, PartListItem, PartListOut,
-    PartListQuery, PartUpdateRequest,
+    PartBatchCreateRequest, PartCreateRequest, PartListQuery, PartUpdateRequest,
 };
 use super::PartService;
 use super::list_enrichment::enrich_part_list_with_location_and_holder;
@@ -151,7 +151,7 @@ impl PartService {
         snowflake: &SnowflakeIdGenerator,
         req: &PartBatchCreateRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto_crud::PartBatchCreateOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartBatchCreateOut, AppError> {
         // 2026-09-16 M2-B + M2-C：薄包装转 legacy 实现（不绑定文件）。
         // 文件绑定走 `batch_create_parts_with_bindings`（handler 层显式选，
         // 实现已迁出到 `service/batch.rs`）。

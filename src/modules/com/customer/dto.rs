@@ -1,45 +1,14 @@
-//! customer 域 DTO
+//! customer 域 DTO（仅入参）
 //!
 //! 对应 Python myERP/schema/customer.py。
 //!
 //! ## id 序列化约定
-//! 裸 `i64` 字段用 `#[serde(serialize_with = "crate::shared::types::serialize_i64")]`。
-//! 可空 id（`parent_id`）在 service 层就转成 `Option<String>`，避免为 `Option<i64>`
-//! 再写一套 serde helper——出参 JSON 形态与 Python 完全一致（null 仍是 null）。
+//! 入参 `parent_id` 走字符串（雪花 ID 防 JS 精度截断约定），service 层 `parse::<i64>()`。
+//! 出参 VO（`CustomerOut` / `CustomerListOut`）已抽离到 `super::vo`，本文件不再 derive Serialize。
+//!
+//! 2026-09-22 PR4：出参结构平移到 `vo/customer.rs`，对齐 iam 范本。
 
-use chrono::NaiveDateTime;
-use serde::{Deserialize, Serialize};
-
-use crate::shared::types::serialize_i64;
-
-// ---------------------------------------------------------------------------
-// 出参
-// ---------------------------------------------------------------------------
-
-/// 客户详情出参。`parent_name` 由 service 层补全（连表查父客户的 name）。
-#[derive(Debug, Clone, Serialize)]
-pub struct CustomerOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    pub name: String,
-    pub parent_id: Option<String>,
-    pub parent_name: Option<String>,
-    pub serial_prefix: Option<String>,
-    pub version: i32,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
-
-/// 客户列表出参（不分页：phase 1 仅返回全部；后续加 limit/offset 后再补）。
-///
-/// 字段顺序对齐 Python `schema/customer.py::CustomerListOut`。
-#[derive(Debug, Clone, Serialize)]
-pub struct CustomerListOut {
-    pub items: Vec<CustomerOut>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
+use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // 入参

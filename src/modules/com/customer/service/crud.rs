@@ -33,6 +33,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::dto::*;
 use crate::modules::com::customer::model::TCustomer;
 use crate::modules::com::customer::repo::CustomerRepoTrait;
+use crate::modules::com::customer::vo::{CustomerListOut, CustomerOut};
 use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;

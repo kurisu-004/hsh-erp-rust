@@ -63,9 +63,12 @@ use axum::{
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::upload_session::dto::{
-    AllocateFilesIn, AllocateFilesOut, CompleteFileIn, CompleteFileOut, ConsumeFilesIn,
-    ConsumeFilesOut, DiscardIn, DiscardOut, GetOrCreateIn, GetOrCreateOut, RemoveFilesIn,
-    RemoveFilesOut, RenewIn, RenewOut,
+    AllocateFilesIn, CompleteFileIn, ConsumeFilesIn, DiscardIn, GetOrCreateIn, RemoveFilesIn,
+    RenewIn,
+};
+use crate::modules::upload_session::vo::{
+    AllocateFilesOut, CompleteFileOut, ConsumeFilesOut, DiscardOut, GetOrCreateOut,
+    RemoveFilesOut, RenewOut,
 };
 use crate::modules::upload_session::service::UploadSessionService;
 use crate::shared::error::AppError;

@@ -104,7 +104,7 @@ pub trait WorkerPoolRepoTrait: Send {
     async fn list_candidates_by_process_all_shelves(
         &mut self,
         process_id: i64,
-    ) -> Result<Vec<super::dto::PoolBatchItem>, sqlx::Error>;
+    ) -> Result<Vec<super::vo::PoolBatchItem>, sqlx::Error>;
 
     async fn list_held_by_worker_with_part(
         &mut self,
@@ -318,7 +318,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
     async fn list_candidates_by_process_all_shelves(
         &mut self,
         process_id: i64,
-    ) -> Result<Vec<super::dto::PoolBatchItem>, sqlx::Error> {
+    ) -> Result<Vec<super::vo::PoolBatchItem>, sqlx::Error> {
         WorkerPoolRepo::list_candidates_by_process_all_shelves(&mut **self, process_id)
             .await
             .map_err(|e| match e {

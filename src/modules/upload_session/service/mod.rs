@@ -36,12 +36,15 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use super::dto::{
-    AllocateFileItemOut, AllocateFilesIn, AllocateFilesOut, CompleteFileIn, CompleteFileOut,
-    ConsumeFilesIn, ConsumeFilesOut, DiscardIn, DiscardOut, GetOrCreateIn, GetOrCreateOut,
-    RemoveFilesIn, RemoveFilesOut, RenewIn, RenewOut, SessionCredentials, SessionCredentialsOut,
-    SessionFile, UploadSession, is_valid_kind, is_valid_scope, sanitize_filename,
+    AllocateFilesIn, CompleteFileIn, ConsumeFilesIn, DiscardIn, GetOrCreateIn, RemoveFilesIn,
+    RenewIn, SessionCredentials, SessionFile, UploadSession, is_valid_kind, is_valid_scope,
+    sanitize_filename,
 };
 use super::repo::UploadSessionRepo;
+use super::vo::{
+    AllocateFileItemOut, AllocateFilesOut, CompleteFileOut, ConsumeFilesOut, DiscardOut,
+    GetOrCreateOut, RemoveFilesOut, RenewOut, SessionCredentialsOut, SessionFileOut,
+};
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::python_sts::PythonSts;
@@ -253,7 +256,7 @@ impl UploadSessionService {
             region: session.region.clone(),
             credentials: SessionCredentialsOut::from(&session.credentials),
             expires_in: session.expires_in,
-            files: session.files.clone(),
+            files: session.files.iter().map(SessionFileOut::from).collect(),
         })
     }
 
@@ -453,7 +456,8 @@ impl UploadSessionService {
                 session.updated_at = now_unix();
                 let out = session.files[pos].clone();
                 repo.put(&session, cfg_ttl_seconds).await?;
-                Ok(out)
+                // 2026-09-22 PR4：内部 SessionFile 转 VO（CompleteFileOut = SessionFileOut）。
+                Ok(SessionFileOut::from(out))
             }
         }
     }

@@ -30,9 +30,12 @@ use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::prod::worker::dto::*;
+use crate::modules::prod::worker::dto::{
+    WorkerCreateRequest, WorkerListQuery, WorkerUpdateRequest,
+};
 use crate::modules::prod::worker::model::TWorker;
 use crate::modules::prod::worker::repo::WorkerRepoTrait;
+use crate::modules::prod::worker::vo::{WorkerListOut, WorkerOut};
 use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;

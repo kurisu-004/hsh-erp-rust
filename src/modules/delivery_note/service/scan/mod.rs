@@ -32,7 +32,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::delivery_note::dto::{
+use crate::modules::delivery_note::vo::{
     AddedBatchDto, RecentItemDto, ResolvedEntityDto, ResolvedKindDto, ScanDeliveryNoteSummaryDto,
     ScanDeliveryOut, ScanOutcomeDto,
 };

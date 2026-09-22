@@ -2,63 +2,25 @@
 //!
 //! 对应 Python myERP/schema/delivery_note.py。命名约定：
 //! - `CreateXxxRequest` / `UpdateXxxRequest`：写操作入参
-//! - `XxxOut`：单条详情出参（id 字段用 `#[serde(serialize_with = "shared::types::serialize_i64")]`）
-//! - `XxxListItem` / `XxxListOut`：列表分页
+//! - `XxxQuery` / `XxxPath`：查询 / 路径参数
+//! - `XxxRequest` / `XxxItem`：业务入参
+//!
+//! 出参（响应）VO 已拆分到 `super::vo`（2026-09-22 PR4 重构，对齐 iam
+//! vo/ 范本）。本文件仅保留 `Deserialize` 入参。
 //!
 //! ## Phase 范围
 //! - **P1**：送货分组（§6.1）
 //! - **P2**：送货单生命周期 + 候选入单（不含扫码 P3 / 打印 P4）
-//! - **P3**：扫码入单（§5）—— Scan* DTO
+//! - **P3**：扫码入单（§5）—— ScanRequest 等
 
 use std::collections::HashMap;
 
-use chrono::{NaiveDate, NaiveDateTime};
-use serde::{Deserialize, Serialize};
+use chrono::NaiveDate;
+use serde::Deserialize;
 
-// ---------------------------------------------------------------------------
-//  出参
-// ---------------------------------------------------------------------------
-
-/// 组成员出参（id 序列化为字符串，避免 JS 精度截断）
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryGroupMemberOut {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub customer_id: i64,
-    pub customer_name: String,
-}
-
-/// 分组头出参
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryGroupOut {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub customer_id: i64,
-    pub name: String,
-    pub members: Vec<DeliveryGroupMemberOut>,
-    pub version: i32,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
-
-/// 组外 L2 出参（按设计 §6.1：所有未入组的 L2）
-#[derive(Debug, Clone, Serialize)]
-pub struct UngroupedCustomerOut {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    pub name: String,
-}
-
-/// 分组列表出参（GET /delivery-groups）
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryGroupListOut {
-    pub groups: Vec<DeliveryGroupOut>,
-    pub ungrouped_customers: Vec<UngroupedCustomerOut>,
-}
-
-// ---------------------------------------------------------------------------
-//  入参
-// ---------------------------------------------------------------------------
+// ===========================================================================
+//  P1：送货分组 DTO（设计 §6.1）
+// ===========================================================================
 
 /// 创建分组入参（POST /delivery-groups）
 ///
@@ -104,158 +66,6 @@ pub struct DeliveryGroupIdRequest {
 // ===========================================================================
 //  P2：送货单生命周期 DTO（移植 + 范围字段扩展）
 // ===========================================================================
-
-// ---------------------------------------------------------------------------
-//  出参：单子概要 / 详情 / 行项
-// ---------------------------------------------------------------------------
-
-/// 送货单概要（list + 大部分接口的公共响应）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteOut {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    pub version: i32,
-    pub delivery_note_no: String,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub customer_id: i64,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
-    pub customer_path: Option<String>,
-    pub status: String,
-    pub submitted_at: Option<NaiveDateTime>,
-    pub picked_up_at: Option<NaiveDateTime>,
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub submitted_by: Option<i64>,
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub picked_up_by: Option<i64>,
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub driver_worker_id: Option<i64>,
-    pub driver_worker_name: Option<String>,
-    pub part_count: i64,
-    pub note: Option<String>,
-    pub delivery_date: Option<NaiveDate>,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-    /// 范围字段（D1 范围列）
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub delivery_group_id: Option<i64>,
-    pub delivery_group_name: Option<String>,
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub leaf_customer_id: Option<i64>,
-    pub leaf_customer_name: Option<String>,
-    /// 范围展示文案（设计 §6.2：分组名 / L2 名 / L1 名）
-    pub scope_label: Option<String>,
-}
-
-/// 送货单下一行零件的投影（行=批次；id = batch_id）
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteLineItem {
-    /// 批次 id（行身份）
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    /// 工单 id
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub part_id: i64,
-    pub batch_no: i32,
-    pub batch_label: String,
-    pub serial_no: String,
-    pub drawing_no: String,
-    pub name: String,
-    pub quantity: i32,
-    pub is_urgent: bool,
-    pub status: String,
-    pub applicant_name: Option<String>,
-    pub request_date: Option<NaiveDate>,
-    pub planned_delivery_date: Option<NaiveDate>,
-    pub system_delivery_date: Option<NaiveDate>,
-    pub order_no: Option<String>,
-    pub note: Option<String>,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
-    pub customer_path: Option<String>,
-    /// 兼容字段（前端两种命名都接受）
-    pub is_scanned: bool,
-    pub scanned: bool,
-    /// 装配件父行字段（仅子件行填；散件 None）
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub assembly_id: Option<i64>,
-    pub assembly_serial_no: Option<String>,
-    pub assembly_drawing_no: Option<String>,
-    pub assembly_name: Option<String>,
-    pub assembly_order_no: Option<String>,
-}
-
-/// 送货单详情（head + line_items + 扫码进度）。
-///
-/// `scanned_serials` 在 P2 阶段始终为空数组（Python 2026-07-23 起后端不再维护
-/// 扫码状态，由前端本地 Set 驱动）；保留字段以保持 schema 兼容。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteDetailOut {
-    #[serde(flatten)]
-    pub head: DeliveryNoteOut,
-    pub line_items: Vec<DeliveryNoteLineItem>,
-    pub scanned_serials: Vec<String>,
-}
-
-/// `GET /delivery-notes/batch-detail?ids=...` 响应载体。
-///
-/// 仅作为 `items: [DeliveryNoteDetailOut]` 的轻量封装，避免 schema 顶层直接
-/// 给出数组（信封 `data` 不能是裸数组）。`DeliveryNoteDetailOut` 自身已
-/// `#[serde(flatten)] head: DeliveryNoteOut`，因此每个 item 在 wire 上仍是
-/// head + `line_items` + `scanned_serials` 的扁平结构。
-#[derive(Debug, Clone, Serialize)]
-pub struct BatchDeliveryDetailData {
-    pub items: Vec<DeliveryNoteDetailOut>,
-}
-
-/// `GET /delivery-notes/batch-detail?ids=1,2,3` 查询参数。
-/// `ids` 为可选；handler 内部做 split/trim/filter/dedupe/parse i64 + 1..=200
-/// 校验。这里只声明 query 形状。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeliveryNoteBatchDetailQuery {
-    pub ids: Option<String>,
-}
-
-/// 送货单事件条目（时间线）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteEventOut {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub delivery_note_id: i64,
-    pub event_type: String,
-    pub from_status: Option<String>,
-    pub to_status: Option<String>,
-    pub note: Option<String>,
-    #[serde(
-        serialize_with = "crate::shared::types::serialize_i64_opt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub created_by: Option<i64>,
-    pub created_at: Option<NaiveDateTime>,
-}
-
-// ---------------------------------------------------------------------------
-//  入参
-// ---------------------------------------------------------------------------
 
 /// 入单条目（批次 + 可选部分数量）。
 #[derive(Debug, Clone, Deserialize)]
@@ -313,18 +123,6 @@ pub struct DeliveryNotePickupScanRequest {
     pub badge_code: Option<String>,
 }
 
-/// 扫码响应（P2 始终 `scanned_count=0 / scanned_serials=[] / ready=false`，
-/// 与 Python 2026-07-23 起后端行为一致）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNotePickupScanOut {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub delivery_note_id: i64,
-    pub scanned_count: i64,
-    pub expected_count: i64,
-    pub ready: bool,
-    pub scanned_serials: Vec<String>,
-}
-
 /// 领取入参（POST /delivery-notes/{id}/pickup）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeliveryNotePickupRequest {
@@ -335,61 +133,16 @@ pub struct DeliveryNotePickupRequest {
 }
 
 // ---------------------------------------------------------------------------
-//  列表响应
-// ---------------------------------------------------------------------------
-
-/// 一览响应（GET /delivery-notes；含分页总计）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteListOut {
-    pub items: Vec<DeliveryNoteOut>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-/// 待司机领取一览（GET /delivery-notes/pickup-pending）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNotePickupListOut {
-    pub items: Vec<DeliveryNoteOut>,
-}
-
-// ---------------------------------------------------------------------------
-//  候选入单（GET /delivery-notes/candidate-parts）
-// ---------------------------------------------------------------------------
-
-/// 候选入单零件（INSPECTION + READY_TO_SHIP 批次，同 L1 根，不在 active 单上）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteCandidatePart {
-    /// 工单 id（展示 / 反查用）
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    /// 批次 id（入单回传用）
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub batch_id: i64,
-    pub batch_no: i32,
-    pub batch_label: String,
-    pub serial_no: String,
-    pub drawing_no: String,
-    pub name: String,
-    pub quantity: i32,
-    pub applicant_name: Option<String>,
-    pub status: String,
-    pub planned_delivery_date: Option<NaiveDate>,
-    pub order_no: Option<String>,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
-    pub customer_path: Option<String>,
-}
-
-/// 候选入单响应（GET /delivery-notes/candidate-parts）。
-#[derive(Debug, Clone, Serialize)]
-pub struct DeliveryNoteCandidatePartsOut {
-    pub items: Vec<DeliveryNoteCandidatePart>,
-}
-
-// ---------------------------------------------------------------------------
 //  列表 query DTO
 // ---------------------------------------------------------------------------
+
+/// GET /delivery-notes/batch-detail?ids=... 查询参数。
+/// `ids` 为可选；handler 内部做 split/trim/filter/dedupe/parse i64 + 1..=200
+/// 校验。这里只声明 query 形状。
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeliveryNoteBatchDetailQuery {
+    pub ids: Option<String>,
+}
 
 /// GET /delivery-notes 查询参数。
 ///
@@ -486,236 +239,8 @@ pub struct ScanDeliveryRequest {
     pub code: String,
 }
 
-/// 扫码入单结果（200 OK 路径）。
-///
-/// - `ADDED`：A 组覆盖所有 target，本次成功挂载 ≥1 个
-/// - `ALREADY_PRESENT`：A 组覆盖所有 target，但都已在本单（幂等）
-/// - `CANDIDATES_AVAILABLE`：散件仅 B 组 → unresolved_targets 单元素
-/// - `PARTIAL_ADDED`：装配件 A+B 混合 → unresolved_targets 多元素
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ScanOutcomeDto {
-    Added,
-    AlreadyPresent,
-    CandidatesAvailable,
-    PartialAdded,
-}
-
-/// `t_part_batch.status` 强类型投影。序列化沿用 DB 列值（SCREAMING_SNAKE_CASE）。
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum BatchStatusDto {
-    Pending,
-    Programming,
-    InProcess,
-    Inspection,
-    ReadyToShip,
-    Delivered,
-    Repairing,
-    Outsource,
-    Completed,
-    Cancelled,
-}
-
-impl BatchStatusDto {
-    /// 由 DB 字符串反序列化为枚举；未知值返回 `None`。
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_db(s: &str) -> Option<Self> {
-        Some(match s {
-            "PENDING" => Self::Pending,
-            "PROGRAMMING" => Self::Programming,
-            "IN_PROCESS" => Self::InProcess,
-            "INSPECTION" => Self::Inspection,
-            "READY_TO_SHIP" => Self::ReadyToShip,
-            "DELIVERED" => Self::Delivered,
-            "REPAIRING" => Self::Repairing,
-            "OUTSOURCE" => Self::Outsource,
-            "COMPLETED" => Self::Completed,
-            "CANCELLED" => Self::Cancelled,
-            _ => return None,
-        })
-    }
-}
-
-/// 解析结果类别（驱动前端"是装配件还是散件"决策）。
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ResolvedKindDto {
-    Part,
-    Assembly,
-}
-
-/// 解析结果（识别出来的实体）。
-///
-/// - `kind = Part`：单工单（可能隶属于某个装配件的子件）；`id` = part.id
-/// - `kind = Assembly`：扫的是装配件总图，`id` = assembly.id
-///
-/// **路线 B 重构（2026-08-27）移除字段**：
-/// - `assembly_id`：scan 路径不会扫到子件；如需查父装配体走 `GET /api/v2/assemblies/{id}`
-/// - `child_count`：候选列表响应里前端不需要"装配体有几个子件"；要查子件清单走 `GET /api/v2/assemblies/{id}/children`
-#[derive(Debug, Clone, Serialize)]
-pub struct ResolvedEntityDto {
-    pub kind: ResolvedKindDto,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    pub serial_no: String,
-    pub drawing_no: String,
-    pub name: String,
-}
-
-/// 扫码命中的送货单概要（响应里的 `note` 字段）。
-#[derive(Debug, Clone, Serialize)]
-pub struct ScanDeliveryNoteSummaryDto {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub id: i64,
-    pub delivery_note_no: String,
-    pub version: i32,
-    pub status: String,
-    pub scope_label: String,
-    pub customer_path: String,
-    pub line_count: usize,
-    /// 最近加入该草稿的批次条目（按 batch id DESC 最多 8 条；空单 = 空 Vec）。
-    ///
-    /// 2026-08-22 新增：原只有 `line_count` 总数，前端草稿卡片要直接展示
-    /// 「最近加入序列号/名称/订单号」又不想 N 次额外 GET，于是 DTO 一次性
-    /// 把这些字段塞过来。`order_no` 是 Option（工单可能没填）。
-    pub recent_items: Vec<RecentItemDto>,
-}
-
-/// 草稿卡片里要展示的最近批次条目。
-///
-/// 2026-08-22：原 `AddedBatchDto` 没有 drawing_no/name/order_no，前端卡片
-/// 需要这些字段直接展示（序列号 + 名称 + 订单号），避免每次 N 次
-/// GET /notes/{id}。这里独立成一个 DTO，与 added_batches 用 `AddedBatchDto`
-/// （极简）解耦。
-#[derive(Debug, Clone, Serialize)]
-pub struct RecentItemDto {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub batch_id: i64,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub part_id: i64,
-    /// 工单序列号；t_part.serial_no 是 nullable → 落 Some/None。
-    /// 序列化永远给字符串（None → null），与 ScanDeliveryNoteSummaryDto 内
-    /// 其它字段对齐。
-    pub serial_no: Option<String>,
-    pub drawing_no: String,
-    pub name: String,
-    /// 工单订单号；nullable → Some/None。
-    pub order_no: Option<String>,
-}
-
-/// 已挂载批次（`added_batches[]`）；跨子件场景 part_id/serial_no 必填。
-#[derive(Debug, Clone, Serialize)]
-pub struct AddedBatchDto {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub batch_id: i64,
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub part_id: i64,
-    pub serial_no: String,
-    pub quantity: i32,
-}
-
-/// 未就绪 part + 其 B 组候选批次（`unresolved_targets[]`）。
-/// 散件场景：单元素；装配件场景：每个未就绪子件一个元素。
-#[derive(Debug, Clone, Serialize)]
-pub struct UnresolvedTargetDto {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub part_id: i64,
-    pub serial_no: String,
-    pub drawing_no: String,
-    pub name: String,
-    pub available_batches: Vec<AvailableBatchDto>,
-    /// A 组（可直接 attach）；CandidatesAvailable / PartialAdded 时携带，
-    /// Added / AlreadyPresent 时为空 Vec。
-    /// 字段与 AvailableBatchDto 同形状，独立成 DTO 便于未来扩展差异。
-    pub attachable_batches: Vec<AttachableBatchDto>,
-}
-
-/// B 组候选批次（`unresolved_targets[i].available_batches[]`）。
-/// part 级信息（serial_no/drawing_no/name）在 `UnresolvedTargetDto` 外层，不重复。
-/// `version`：批次乐观锁版本；前端把本结构直接转发给
-/// `POST /parts/batch-to-inspection` / `batch-to-ship` 的 `items[]` 时必须带上。
-#[derive(Debug, Clone, Serialize)]
-pub struct AvailableBatchDto {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    pub quantity: i32,
-    pub status: BatchStatusDto,
-}
-
-/// A 组候选批次（`unresolved_targets[i].attachable_batches[]`），
-/// CandidatesAvailable / PartialAdded 时随 available_batches 一起返回
-/// 供前端弹窗勾选 attach（前端选中后转发到 `POST /delivery-notes/{id}/add-parts`）。
-/// 字段与 AvailableBatchDto 同形状，独立成 DTO 便于未来扩展差异。
-#[derive(Debug, Clone, Serialize)]
-pub struct AttachableBatchDto {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    pub quantity: i32,
-    /// 仅 INSPECTION / READY_TO_SHIP（A 组定义）
-    pub status: BatchStatusDto,
-}
-
-/// `POST /delivery-notes/scan` 出参（200 OK）。
-///
-/// 场景 → outcome 映射：
-/// - `ADDED`：A 组覆盖所有 target，本次挂载 ≥1 个；`added_batches` 非空，`unresolved_targets = None`
-/// - `ALREADY_PRESENT`：A 组覆盖所有 target，但都已在本单（幂等）；二者均空 / None
-/// - `CANDIDATES_AVAILABLE`：散件仅 B 组；`unresolved_targets` 单元素
-/// - `PARTIAL_ADDED`：装配件 A+B 混合；`added_batches` 是 A 组已挂部分，`unresolved_targets` 是 B 组子件
-#[derive(Debug, Clone, Serialize)]
-pub struct ScanDeliveryOut {
-    pub outcome: ScanOutcomeDto,
-    pub resolved: ResolvedEntityDto,
-    pub note: ScanDeliveryNoteSummaryDto,
-
-    /// 场景 ①、③、④-已挂载部分；其余场景为 `[]`
-    pub added_batches: Vec<AddedBatchDto>,
-
-    /// 场景 ②（单元素）、④（多元素）；其余场景为 `None`
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unresolved_targets: Option<Vec<UnresolvedTargetDto>>,
-}
-
 // ===========================================================================
-//  P2：submit 出参（POST /delivery-notes/{id}/submit）
-// ===========================================================================
-
-/// `POST /delivery-notes/{id}/submit` 的结果类别。
-///
-/// - `SUBMITTED`：全部批次已 `READY_TO_SHIP`，状态机 DRAFT → SUBMITTED 已提交；
-///   `note` 字段返回提交后的送货单投影。
-/// - `CANDIDATES_AVAILABLE`：存在仍在 `INSPECTION` 的批次，**本次未提交**；
-///   返回这些批次供前端一键过检（转发 `POST /parts/batch-to-ship`）；
-///   `note` 为 `null`（未提交，无新状态可返回）。
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum SubmitOutcomeDto {
-    Submitted,
-    CandidatesAvailable,
-}
-
-/// `POST /delivery-notes/{id}/submit` 出参（200 OK）。
-///
-/// `outcome = SUBMITTED` → `note` 为提交后的送货单投影，`unresolved_targets` 缺省不序列化。
-/// `outcome = CANDIDATES_AVAILABLE` → `note` 为 `null`（未提交，无新状态可返回），
-///   `unresolved_targets` 按 part 分组列出仍在 `INSPECTION` 的已挂单批次。
-///
-/// `note` 字段故意不挂 `skip_serializing_if`：候选分支必须以字面量 `null`
-/// 显式出现，让前端判 `note != null` 即可识别提交是否真的发生过。
-/// `unresolved_targets` 反过来必须挂：`SUBMITTED` 分支不出现该字段，避免泄漏 INSPECTION 详情。
-#[derive(Debug, Clone, Serialize)]
-pub struct SubmitDeliveryOut {
-    pub outcome: SubmitOutcomeDto,
-    pub note: Option<DeliveryNoteOut>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unresolved_targets: Option<Vec<UnresolvedTargetDto>>,
-}
-
-// ===========================================================================
-//  attach_batches 入参 / 出参（POST /delivery-notes/{id}/attach-batches）
+//  attach_batches 入参（POST /delivery-notes/{id}/attach-batches）
 // ===========================================================================
 
 /// `POST /api/v2/delivery-notes/{note_id}/attach-batches` 请求体。
@@ -739,32 +264,5 @@ pub struct AttachBatchItem {
     pub version: i32,
 }
 
-/// `POST /api/v2/delivery-notes/{note_id}/attach-batches` 响应。
-///
-/// 即使部分失败也始终返回 200，前端按 `conflicts` 列表做差异处理：
-/// - 全失败：`attached=0`、`conflicts` 非空
-/// - 部分失败：`attached>0`、`conflicts` 列出失败项
-/// - 全部成功：`attached=n`、`conflicts=[]`
-///
-/// `note_id` 本身非 DRAFT（409）属于硬错误，不入本结构；OCC / 状态非法 /
-/// 重复 attach / 批次不存在 / 跨单等均在 `conflicts[].reason` 中以字符串表达。
-#[derive(Debug, Clone, Serialize)]
-pub struct AttachBatchesOut {
-    pub attached: usize,
-    pub conflicts: Vec<AttachBatchConflict>,
-}
-
-/// 单个失败项（attach_batches 响应）。
-///
-/// `reason` 是稳定的 SCREAMING_SNAKE_CASE 字符串，便于前端 i18n / 分类：
-/// - `BATCH_NOT_FOUND` — 批次 id 不存在 / 已软删
-/// - `ALREADY_ATTACHED` — `delivery_note_id IS NOT NULL`（已挂在某张单上）
-/// - `INVALID_STATE:<STATUS>` — 批次当前 status 不在 A 组
-///   （`INSPECTION` / `READY_TO_SHIP`）；尖括号内为原 status 值
-/// - `VERSION_CONFLICT` — item.version 与 DB 不一致（OCC 失败）
-#[derive(Debug, Clone, Serialize)]
-pub struct AttachBatchConflict {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub batch_id: i64,
-    pub reason: String,
-}
+// 注：原本 dto.rs 中 `use serde::Serialize` / `serialize_i64*` 全部移除，
+// 出参类型已迁出至 `super::vo`（2026-09-22 PR4 重构）。

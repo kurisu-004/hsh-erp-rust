@@ -12,12 +12,13 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartListFilters;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::part::vo::{PartListItem, PartListOut};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::super::dto_crud::{
-    PartListItem, PartListOut, PartListQuery, PlaceOnShelfRequest,
-    ReceiveFromOutsourceToInspectionRequest, SendToOutsourceRequest,
+    PartListQuery, PlaceOnShelfRequest, ReceiveFromOutsourceToInspectionRequest,
+    SendToOutsourceRequest,
 };
 use super::super::PartService;
 
@@ -41,7 +42,7 @@ impl PartService {
         part_id: i64,
         req: SendToOutsourceRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
         // DIRECT 模式 stub（Phase 2 占位；follow-up：免审批自动建 quote + shipment）
         if req.direct.unwrap_or(false) {
@@ -234,7 +235,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "send-to-outsource 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `POST /parts/{id}/receive-from-outsource`：OUTSOURCE → IN_PROCESS（PRODUCTION_SHELF）。
@@ -249,7 +250,7 @@ impl PartService {
         part_id: i64,
         req: PlaceOnShelfRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -361,7 +362,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "receive 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `POST /parts/{id}/receive-from-outsource-to-inspection`：OUTSOURCE → INSPECTION。
@@ -374,7 +375,7 @@ impl PartService {
         part_id: i64,
         req: ReceiveFromOutsourceToInspectionRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -473,7 +474,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "receive 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     // ===== 1.3 外协辅助列表 =====

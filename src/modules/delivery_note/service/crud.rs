@@ -19,9 +19,9 @@ use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
-    DeliveryNoteAddItem, DeliveryNoteCreateRequest, DeliveryNoteDetailOut, DeliveryNoteListOut,
-    DeliveryNoteOut, DeliveryNoteUpdateRequest,
+    DeliveryNoteAddItem, DeliveryNoteCreateRequest, DeliveryNoteUpdateRequest,
 };
+use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut};
 use super::super::model::{DeliveryNote, DeliveryNoteEventType};
 use super::super::repo::SortDir;
 use super::inner::{
@@ -209,7 +209,7 @@ impl DeliveryNoteService {
         use crate::modules::com::customer::model::TCustomer;
         use std::collections::HashSet;
 
-        use super::super::dto::DeliveryNoteLineItem;
+        use super::super::vo::DeliveryNoteLineItem;
 
         if ids.is_empty() {
             return Ok(Vec::new());

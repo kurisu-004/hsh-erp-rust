@@ -2,17 +2,15 @@
 //!
 //! 命名约定：
 //! - `CreateXxxRequest` / `UpdateXxxRequest`：写操作入参
-//! - `XxxOut`：单条详情出参（id 字段用 `#[serde(serialize_with =
-//!   shared::types::serialize_i64)]`）
-//! - `XxxListItem` / `XxxListOut`：列表分页
 //! - `XxxListQuery`：列表查询参数
+//!
+//! 出参（*Out 类型）已迁移到 `super::vo`（2026-09-22 PR4 重构）：DTO 仅含
+//! axum extractor 反序列化目标（`#[derive(Deserialize)]`），VO 仅含 handler
+//! 返回序列化目标（`#[derive(Serialize)]`），二者不再同文件。
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::modules::part::model::TPart;
-use crate::shared::types::{
-    deserialize_i64, deserialize_i64_opt, serialize_i64, serialize_i64_opt,
-};
+use crate::shared::types::{deserialize_i64, deserialize_i64_opt};
 
 // ===== Create =====
 
@@ -103,37 +101,6 @@ pub struct PartBatchCreateRequest {
     pub items: Vec<PartBatchCreateItem>,
 }
 
-/// `POST /parts/batch` per-item 失败明细。
-///
-/// `part_id`：`Some(id)` = INSERT 成功但 detail lookup 失败；
-///            `None` = INSERT 本身失败。
-#[derive(Debug, Clone, Serialize)]
-pub struct PartBatchCreateFailure {
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub part_id: Option<i64>,
-    pub code: i32,
-    pub message: String,
-    pub item_index: usize,
-}
-
-/// `POST /parts/batch` 出参：`created` 与 `failed` 互斥。
-///
-/// 2026-09-16 M2-B review 第 1 轮：`cleanup_tmp_keys` 新增字段。
-/// - 含义：本批次成功 INSERT 后、需要 commit 后异步清理的 tmp 对象 key 列表
-///   （client 已直传到 COS tmp 区，已被 service 端 head+copy 到 CAS key）。
-/// - 用途：handler 在 `tx.commit()` 之后 `tokio::spawn` 批量 `cos.delete_object(&key)`
-///   兜底，避免 commit 失败却已触发 COS 删除产生孤儿。
-/// - 前端不需要该字段（`#[serde(default)]` 兜空，前端忽略）；后端用 `out.cleanup_tmp_keys`。
-/// - legacy（无 binding）路径该列表为空，前端 / 集成测试无需关注。
-#[derive(Debug, Clone, Serialize)]
-pub struct PartBatchCreateOut {
-    pub created: Vec<PartDetailOut>,
-    pub failed: Vec<PartBatchCreateFailure>,
-    /// commit 后由 handler spawn 异步清理的 tmp 对象 key 列表。
-    #[serde(default)]
-    pub cleanup_tmp_keys: Vec<String>,
-}
-
 // ===== Update =====
 
 /// `PUT /parts/{id}` 入参：字段可选 UPDATE。
@@ -212,84 +179,6 @@ pub struct PartListQuery {
     pub limit: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
     pub offset: Option<i64>,
-}
-
-/// `GET /parts` 列表行：`TPart` + 客户冗余字段 + 派生位置 / 持有人。
-///
-/// 2026-09-16 PR-2 瘦身（migration 027）：t_part 不再持有 `location` /
-/// `current_holder_id`（已删列），前端列表需要的「位置 / 持有人」展示由
-/// service 层在 `list_parts` 内按 min-progress 活跃批次派生（见
-/// `PartService::list_parts` 内的 batch enrichment 段）。
-///
-/// 派生规则：
-/// - `location`：该 part min-progress 活跃批次（与 `compute_part_target` 一
-///   致；非 CANCELLED 非 COMPLETED 批次中 progress 最小者）的 `location`；
-///   无活跃批次 → `None`。
-/// - `holder_name`：同批次 `current_holder_id` 解析的展示名称；按
-///   `batch.location` 分桶：
-///   - `PRODUCTION_SHELF` / `INSPECTION_SHELF` → `t_shelf.code`
-///   - `WORKER` → `t_worker.name`
-///   - `OUTSOURCE_COMPANY` → `t_outsource_company.name`
-///   - `OFFICE` / `NULL` / 无活跃批次 → `None`
-#[derive(Debug, Clone, Serialize)]
-pub struct PartListItem {
-    #[serde(flatten)]
-    pub part: TPart,
-    pub customer_name: Option<String>,
-    pub l1_customer_name: Option<String>,
-    /// 派生位置（见字段级 doc 注释）。
-    #[serde(default)]
-    pub location: Option<String>,
-    /// 派生持有人名称（见字段级 doc 注释）。
-    #[serde(default)]
-    pub holder_name: Option<String>,
-}
-
-/// `GET /parts` 出参（分页）。
-#[derive(Debug, Clone, Serialize)]
-pub struct PartListOut {
-    pub items: Vec<PartListItem>,
-    #[serde(serialize_with = "serialize_i64")]
-    pub total: i64,
-    #[serde(serialize_with = "serialize_i64")]
-    pub limit: i64,
-    #[serde(serialize_with = "serialize_i64")]
-    pub offset: i64,
-}
-
-// ===== Detail =====
-
-/// `POST /parts` / `GET /parts/{id}` 出参：完整工单 + 客户冗余字段 +
-/// 当前 INSPECTION 批次 id（前端轮询用；`None` 表示当前不在 INSPECTION）。
-#[derive(Debug, Clone, Serialize)]
-pub struct PartDetailOut {
-    #[serde(flatten)]
-    pub part: TPart,
-    pub customer_name: Option<String>,
-    pub l1_customer_name: Option<String>,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub current_batch_id: Option<i64>,
-}
-
-impl PartDetailOut {
-    /// 由完整 `TPart` + 客户冗余字段 + 当前 INSPECTION 批次 id 构造。
-    ///
-    /// `current_batch_id` 由 service 层调用
-    /// [`crate::modules::part::repo::PartRepo::find_current_inspection_batch_id`]
-    /// 取值；`None` 表示当前不在 INSPECTION。
-    pub fn from_with_customer_extra(
-        part: TPart,
-        current_batch_id: Option<i64>,
-        customer_name: Option<String>,
-        l1_customer_name: Option<String>,
-    ) -> Self {
-        Self {
-            part,
-            customer_name,
-            l1_customer_name,
-            current_batch_id,
-        }
-    }
 }
 
 // ===== Soft-delete =====
@@ -652,20 +541,6 @@ pub struct MatchByExcelItem {
     pub name: Option<String>,
 }
 
-/// `POST /parts/match-by-excel-items` 出参：单行匹配结果（part_id 或 null）。
-#[derive(Debug, Clone, Serialize)]
-pub struct MatchByExcelItemResult {
-    #[serde(default)]
-    pub drawing_no: Option<String>,
-    #[serde(default)]
-    pub serial_no: Option<String>,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub part_id: Option<i64>,
-    pub status: String, // "MATCHED" / "NOT_FOUND" / "AMBIGUOUS"
-    #[serde(default)]
-    pub message: Option<String>,
-}
-
 /// `POST /parts/batch-update-order-info` 入参。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BatchUpdateOrderInfoRequest {
@@ -684,100 +559,3 @@ pub struct BatchUpdateOrderInfoItem {
     #[serde(default)]
     pub note: Option<String>,
 }
-
-/// `POST /parts/batch-update-order-info` 出参：成功 N，失败列表。
-#[derive(Debug, Clone, Serialize)]
-pub struct BatchUpdateOrderInfoOut {
-    pub updated: i64,
-    pub failed: Vec<BatchUpdateOrderInfoFailure>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct BatchUpdateOrderInfoFailure {
-    #[serde(serialize_with = "serialize_i64")]
-    pub part_id: i64,
-    pub code: i32,
-    pub message: String,
-}
-
-/// `GET /parts/{id}/events` 出参：工单事件日志列表（按 created_at 倒序）。
-#[derive(Debug, Clone, Serialize)]
-pub struct PartEventOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    pub event_type: String,
-    #[serde(default)]
-    pub from_status: Option<String>,
-    #[serde(default)]
-    pub to_status: Option<String>,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub batch_id: Option<i64>,
-    #[serde(default)]
-    pub quantity: Option<i32>,
-    #[serde(default)]
-    pub drawing_code: Option<String>,
-    #[serde(default)]
-    pub badge_code: Option<String>,
-    #[serde(default)]
-    pub note: Option<String>,
-    pub created_at: chrono::NaiveDateTime,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub created_by: Option<i64>,
-}
-
-/// `GET /parts/{id}/batches` 出参：工单全部活跃批次 + holder 名称解析。
-///
-/// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` 字段
-/// （t_part_batch 列已删；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
-///
-/// 2026-09-16 PR-3 批次 step 化（migration 028）：
-/// - 删 `placed_at`（t_part_batch 列已删，不再统计生产时间）
-/// - `next_process_id` 字段保留（DTO 兼容），但 service 层不再写入；保留仅作
-///   历史快照语义，**禁止**新端点写入该字段
-#[derive(Debug, Clone, Serialize)]
-pub struct PartBatchListItemOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    pub batch_no: i32,
-    pub quantity: i32,
-    pub status: String,
-    #[serde(default)]
-    pub location: Option<String>,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub current_holder_id: Option<i64>,
-    #[serde(default)]
-    pub holder_name: Option<String>,
-    /// 2026-09-16 PR-3：DTO 保留字段名（兼容前端），但当前**全部为 None**——
-    /// 业务上「下一步工序」概念已迁移到 step（current_process_step_id →
-    /// JOIN step.process_id 派生）；新端点不应依赖该字段。如前端仍需该信息，
-    /// 由 frontend 自行 JOIN current_process_step_id → step.process_id。
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub next_process_id: Option<i64>,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub delivery_note_id: Option<i64>,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub parent_batch_id: Option<i64>,
-    pub version: i32,
-}
-
-/// `GET /parts/location-tree` 出参：按 shelf/status 聚合的位置树。
-#[derive(Debug, Clone, Serialize)]
-pub struct LocationTreeNodeOut {
-    pub id: String,
-    pub label: String,
-    pub kind: String, // "OFFICE" / "PRODUCTION_SHELF" / "WORKER" / "INSPECTION_SHELF" / "OUTSOURCE_COMPANY"
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub parent_id: Option<i64>,
-    pub count: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LocationTreeOut {
-    pub items: Vec<LocationTreeNodeOut>,
-}
-
-/// `GET /parts/pending-programming` 出参：PROGRAMMING 状态工单一览（复用 PartListOut）。
-pub type PendingProgrammingOut = crate::modules::part::dto_crud::PartListOut;
-
-/// `GET /parts/repair-batches` / `repairing-batches` 出参：返修批次列表（复用 InspectionBatchListOut）。
-pub type RepairBatchesOut = crate::modules::part::dto::InspectionBatchListOut;

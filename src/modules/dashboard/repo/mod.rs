@@ -62,7 +62,7 @@ pub use sql::{
 pub trait DashboardRepoTrait: Send {
     /// 未来 N 天交付分桶（counter buckets）。0 计数天也填充（保证 7 天固定 7 条）。
     async fn snapshot_counters(&mut self, days: i64)
-        -> Result<Vec<crate::modules::dashboard::dto::UpcomingDeliveryBucket>, sqlx::Error>;
+        -> Result<Vec<crate::modules::dashboard::vo::UpcomingDeliveryBucket>, sqlx::Error>;
 
     /// 产线架 + IN_PROCESS 批次 + 品检区批次 + 客户 / 工序 名字查表。
     /// 一次调用拉全量，返回 `TopPartsData` 富结构；service 内部聚合 → `OnProductionShelfGroup`。
@@ -91,7 +91,7 @@ impl DashboardRepoTrait for &mut PgConnection {
     async fn snapshot_counters(
         &mut self,
         days: i64,
-    ) -> Result<Vec<crate::modules::dashboard::dto::UpcomingDeliveryBucket>, sqlx::Error> {
+    ) -> Result<Vec<crate::modules::dashboard::vo::UpcomingDeliveryBucket>, sqlx::Error> {
         DashboardRepo::snapshot_counters(&mut **self, days).await
     }
 

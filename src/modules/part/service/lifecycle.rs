@@ -27,10 +27,10 @@
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::dto::PartOut;
 use crate::modules::part::model::{NewPartEvent, TPart};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::part::vo::PartOut;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto_crud::{CancelRequest, CompleteRequest, DeliverRequest, StartRepairRequest};

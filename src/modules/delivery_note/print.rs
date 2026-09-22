@@ -36,7 +36,7 @@ use std::sync::OnceLock;
 use chrono::{Datelike, NaiveDate};
 
 use crate::infra::clock::now_naive;
-use crate::modules::delivery_note::dto::{DeliveryNoteDetailOut, DeliveryNoteLineItem};
+use crate::modules::delivery_note::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem};
 use crate::shared::error::{AppError, code};
 
 use super::print_xml_patch::post_patch_xlsx;

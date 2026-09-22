@@ -27,9 +27,9 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::prod::worker::dto::{
-    VerifyBadgeRequest, WorkerCreateRequest, WorkerListOut, WorkerListQuery, WorkerOut,
-    WorkerUpdateRequest,
+    VerifyBadgeRequest, WorkerCreateRequest, WorkerListQuery, WorkerUpdateRequest,
 };
+use crate::modules::prod::worker::vo::{WorkerListOut, WorkerOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

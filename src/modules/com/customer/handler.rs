@@ -35,8 +35,9 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::com::customer::dto::{
-    CustomerCreateRequest, CustomerListOut, CustomerListQuery, CustomerOut, CustomerUpdateRequest,
+    CustomerCreateRequest, CustomerListQuery, CustomerUpdateRequest,
 };
+use crate::modules::com::customer::vo::{CustomerListOut, CustomerOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

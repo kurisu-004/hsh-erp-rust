@@ -18,7 +18,8 @@ use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::{AttachBatchConflict, AttachBatchItem, AttachBatchesOut};
+use super::super::dto::AttachBatchItem;
+use super::super::vo::{AttachBatchConflict, AttachBatchesOut};
 use super::inner::note_not_found;
 use super::scan::is_attachable_state;
 

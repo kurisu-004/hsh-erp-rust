@@ -24,9 +24,12 @@ use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::prod::process::dto::*;
+use crate::modules::prod::process::dto::{
+    ProcessCreateRequest, ProcessListQuery, ProcessUpdateRequest,
+};
 use crate::modules::prod::process::model::TProcess;
 use crate::modules::prod::process::repo::ProcessRepoTrait;
+use crate::modules::prod::process::vo::{ProcessListOut, ProcessOut};
 use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;

@@ -47,8 +47,10 @@ use crate::auth::rbac::CurrentUser;
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::dto::{
-    AssemblyCreateRequest, AssemblyCreateResult, AssemblyDetail, AssemblyListOut,
-    AssemblyListQuery, AssemblyOut, AssemblyUpdateRequest,
+    AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
+};
+use crate::modules::assembly::vo::{
+    AssemblyCreateResult, AssemblyDetail, AssemblyListOut, AssemblyOut,
 };
 use crate::shared::error::AppError;
 
@@ -165,7 +167,7 @@ impl AssemblyService {
         assembly_id: i64,
         files: Vec<(Vec<u8>, String, String)>,
         current: &CurrentUser,
-    ) -> Result<Vec<crate::modules::assembly::dto::AssemblyFileRef>, AppError> {
+    ) -> Result<Vec<crate::modules::assembly::vo::AssemblyFileRef>, AppError> {
         lifecycle::upload_assembly_files_dispatch(conn, snowflake, cos, assembly_id, files, current)
             .await
     }

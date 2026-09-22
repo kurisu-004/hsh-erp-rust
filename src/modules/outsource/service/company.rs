@@ -23,9 +23,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::outsource::dto::{
-    OutsourceCompanyCreateRequest, OutsourceCompanyListOut, OutsourceCompanyListQuery,
-    OutsourceCompanyOut, OutsourceCompanyProcessLinkOut, OutsourceCompanyUpdateRequest,
-    OutsourceCompanyWithProcessesOut, SetOutsourceCompanyProcessRequest,
+    OutsourceCompanyCreateRequest, OutsourceCompanyListQuery, OutsourceCompanyUpdateRequest,
+    SetOutsourceCompanyProcessRequest,
+};
+use crate::modules::outsource::vo::{
+    OutsourceCompanyListOut, OutsourceCompanyOut, OutsourceCompanyProcessLinkOut,
+    OutsourceCompanyWithProcessesOut,
 };
 use crate::modules::outsource::model::{NewOutsourceCompany, NewOutsourceCompanyProcess, TOutsourceCompany};
 use crate::modules::outsource::repo::OutsourceRepoTrait;

@@ -61,8 +61,9 @@ use axum::{
 use serde::Deserialize;
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::part_file::dto::{
-    PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut,
+use crate::modules::part_file::dto::PartFileListQuery;
+use crate::modules::part_file::vo::{
+    PartFileListOut, PartFileOut, PartFileWithUrlOut,
 };
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
@@ -408,7 +409,7 @@ pub async fn upload_cnc_pair(
     current: CurrentUser,
     Path(part_id): Path<i64>,
     mut multipart: Multipart,
-) -> Result<Json<R<crate::modules::cnc_program::dto::CncPairOut>>, AppError> {
+) -> Result<Json<R<crate::modules::cnc_program::vo::CncPairOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
     let mut g: Option<(Vec<u8>, String, String)> = None;
     let mut s: Option<(Vec<u8>, String, String)> = None;

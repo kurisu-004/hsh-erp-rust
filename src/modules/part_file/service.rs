@@ -48,9 +48,8 @@ use sqlx::{PgConnection, PgPool};
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part_file::dto::{
-    PartFileListOut, PartFileListQuery, PartFileOut, PartFileWithUrlOut, validate,
-};
+use crate::modules::part_file::dto::{PartFileListQuery, validate};
+use crate::modules::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy;
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepoTrait, hash_bytes};

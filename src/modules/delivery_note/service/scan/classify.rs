@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::modules::delivery_note::dto::{ScanOutcomeDto, UnresolvedTargetDto};
+use crate::modules::delivery_note::vo::{ScanOutcomeDto, UnresolvedTargetDto};
 use crate::modules::part::model::TPart;
 use crate::modules::part::batch::model::TPartBatch;
 

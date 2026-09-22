@@ -30,7 +30,7 @@ use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::{
+use super::super::vo::{
     AvailableBatchDto, BatchStatusDto, DeliveryNoteCandidatePart, DeliveryNoteEventOut,
     DeliveryNotePickupScanOut, SubmitDeliveryOut, SubmitOutcomeDto, UnresolvedTargetDto,
 };
@@ -204,7 +204,7 @@ impl DeliveryNoteService {
         note_id: i64,
         version: i32,
         current: &CurrentUser,
-    ) -> Result<super::super::dto::DeliveryNoteOut, AppError> {
+    ) -> Result<super::super::vo::DeliveryNoteOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
         let mut obj = repo
@@ -322,7 +322,7 @@ impl DeliveryNoteService {
         version: i32,
         _badge_code: Option<&str>,
         current: &CurrentUser,
-    ) -> Result<super::super::dto::DeliveryNoteOut, AppError> {
+    ) -> Result<super::super::vo::DeliveryNoteOut, AppError> {
         // 任意已登录账号即可（service 层校验司机）
         let _ = current;
 

@@ -26,9 +26,9 @@ use std::collections::HashMap;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::outsource::dto::{
-    OutsourceQuoteCreateRequest, OutsourceQuoteListOut, OutsourceQuoteListQuery,
-    OutsourceQuoteOut, OutsourceQuoteUpdateRequest,
+    OutsourceQuoteCreateRequest, OutsourceQuoteListQuery, OutsourceQuoteUpdateRequest,
 };
+use crate::modules::outsource::vo::{OutsourceQuoteListOut, OutsourceQuoteOut};
 use crate::modules::outsource::model::{NewOutsourceQuote, NewOutsourceQuoteEvent, TOutsourceQuote};
 use crate::modules::outsource::repo::OutsourceRepoTrait;
 use crate::modules::outsource::statemachine::OutsourceQuoteStatus;

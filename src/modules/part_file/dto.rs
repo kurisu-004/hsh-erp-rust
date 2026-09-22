@@ -1,83 +1,16 @@
-//! part_file 域 DTO
+//! part_file 域 DTO（2026-09-16 M2-B → 2026-09-18 上传会话拆分 + 2026-09-22 PR4 拆分）
 //!
 //! 对应 Python myERP/schema/part_file.py。
 //!
-//! ## id 序列化约定
-//! 雪花 i64 字段用 `serialize_i64`（Global Constraint #3）。
-//!
-//! ## 2026-09-16 M2-B → 2026-09-18 上传会话拆分
-//! - 原 M2-B 直传 COS 链路 DTO（`UploadIntentsIn` / `UploadIntentsOut` /
-//!   `UploadIntentItemIn` / `UploadIntentItemOut` / `UploadIntentsIn` + 上传意图校验）
-//!   2026-09-18 已删除：上传意图机制迁移至 `upload_session` 域（共享 STS 凭证 +
-//!   Redis 会话），保留 `ConfirmFileIn` 作为 confirm 端点的入参。
-//! - `validate` 子模块保留：confirm 端点继续复用 kind / sha / filename / size /
-//!   content_type 校验函数。
+//! ## DTO/VO 边界（2026-09-22 PR4 重构）
+//! 本文件仅含入参（Deserialize）；出参结构（`PartFileOut` / `PartFileWithUrlOut` /
+//! `PartFileListOut`）已迁移至 `super::vo`。
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::modules::part_file::policy;
 use crate::shared::error::{AppError, code};
-use crate::shared::types::{deserialize_i64, serialize_i64, serialize_i64_opt};
-
-// ---------- 出参 ----------
-
-/// 单条 part_file 出参（`TPartFile` 完整投影）。
-///
-/// `content_sha256` / `paired_file_id` 可空；owner 是 polymorphic part/assembly。
-/// 2026-09-14 新增。
-#[derive(Debug, Clone, Serialize)]
-pub struct PartFileOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    /// polymorphic owner id（part.id 或 assembly.id）。
-    #[serde(serialize_with = "serialize_i64")]
-    pub owner_id: i64,
-    pub owner_kind: String, // "PART" / "ASSEMBLY"
-    pub kind: String,
-    pub file_type: String,
-    pub object_key: String,
-    pub original_filename: String,
-    #[serde(serialize_with = "serialize_i64")]
-    pub file_size: i64,
-    pub content_type: String,
-    pub upload_status: String,
-    pub content_sha256: Option<String>,
-    /// CNC 配对文件 id（G_CODE <-> SETUP_SHEET 互指）；未配对为 null。
-    /// JSON 序列化为 string（雪花 id，防 JS 精度截断）。
-    /// 2026-09-16 补投影：v2 切流后前端零件详情 CNC 配对分组依赖本字段，
-    /// 此前 DB / model 均有值但 DTO 漏投导致前端配对分组静默失效。
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub paired_file_id: Option<i64>,
-    pub version: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<chrono::NaiveDateTime>,
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub created_by: Option<i64>,
-}
-
-/// 单条 part_file 详情 + COS 预签下载 URL。
-///
-/// 2026-09-14 新增：服务端即时拼 URL（默认 1h 有效期），前端无需关心签名逻辑。
-#[derive(Debug, Clone, Serialize)]
-pub struct PartFileWithUrlOut {
-    pub id: String,
-    pub kind: String,
-    pub file_type: String,
-    pub original_filename: String,
-    pub file_size: i64,
-    pub content_type: String,
-    pub content_sha256: Option<String>,
-    pub upload_status: String,
-    pub download_url: String,
-    pub url_expires_in_seconds: u32,
-}
-
-/// part_file 列表出参（按 owner + kind 过滤；纯 list）。
-#[derive(Debug, Clone, Serialize)]
-pub struct PartFileListOut {
-    pub items: Vec<PartFileOut>,
-    pub total: i64,
-}
+use crate::shared::types::deserialize_i64;
 
 // ===== 2026-09-16 M2-B 业务层：ConfirmFileIn（保留） =====
 //

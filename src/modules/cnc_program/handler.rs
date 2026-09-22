@@ -46,8 +46,8 @@ use axum::{
 use serde::Deserialize;
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::cnc_program::dto::{CncPairListOut, CncPairOut};
-use crate::modules::part_file::dto::PartFileWithUrlOut;
+use crate::modules::cnc_program::vo::{CncPairListOut, CncPairOut};
+use crate::modules::part_file::vo::PartFileWithUrlOut;
 use crate::modules::part_file::handler::DeletePartFileRequest;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;

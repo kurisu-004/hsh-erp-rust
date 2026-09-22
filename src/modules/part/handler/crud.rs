@@ -19,15 +19,16 @@ use serde_json::json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::dto::{
-    InspectionBatchListOut, InspectionBatchListQuery, PartScanContextOut,
-};
+use crate::modules::part::dto::InspectionBatchListQuery;
 use crate::modules::part::dto_crud::{
-    BatchUpdateOrderInfoOut, BatchUpdateOrderInfoRequest, LocationTreeOut, MatchByExcelItemResult,
-    MatchByExcelItemsRequest, PartBatchListItemOut, PartCreateRequest, PartDetailOut, PartEventOut,
-    PartListOut, PartListQuery, PartSoftDeleteRequest, PartUpdateRequest,
+    BatchUpdateOrderInfoRequest, MatchByExcelItemsRequest, PartCreateRequest, PartListQuery,
+    PartSoftDeleteRequest, PartUpdateRequest,
 };
 use crate::modules::part::service::PartService;
+use crate::modules::part::vo::{
+    BatchUpdateOrderInfoOut, InspectionBatchListOut, LocationTreeOut, MatchByExcelItemResult,
+    PartBatchListItemOut, PartDetailOut, PartEventOut, PartListOut, PartScanContextOut,
+};
 use crate::modules::part_file::model::TPartFile;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;

@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use crate::modules::dashboard::dto::{DashboardItem, DashboardSnapshot, OnProductionShelfGroup};
+use crate::modules::dashboard::vo::{DashboardItem, DashboardSnapshot, OnProductionShelfGroup};
 use crate::modules::dashboard::repo::{BatchLite, DashboardRepoTrait, PartLite};
 use crate::shared::analytics::shelf_grouping::group_by_shelf;
 

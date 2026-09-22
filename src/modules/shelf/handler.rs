@@ -41,12 +41,15 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::shelf::dto::{
-    AllShelfProcessMappingOut, SetShelfProcessesRequest, ShelfCreateRequest, ShelfForInspectionOut,
-    ShelfForReturnOut, ShelfForReturnQuery, ShelfListOut, ShelfListQuery, ShelfOut,
-    ShelfProcessMappingOut, ShelfUpdateRequest,
+    SetShelfProcessesRequest, ShelfCreateRequest, ShelfForReturnQuery, ShelfListQuery,
+    ShelfUpdateRequest,
 };
 use crate::modules::shelf::process_mapping::ShelfProcessService;
 use crate::modules::shelf::service::ShelfService;
+use crate::modules::shelf::vo::{
+    AllShelfProcessMappingOut, ShelfForInspectionOut, ShelfForReturnOut, ShelfListOut, ShelfOut,
+    ShelfProcessMappingOut,
+};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

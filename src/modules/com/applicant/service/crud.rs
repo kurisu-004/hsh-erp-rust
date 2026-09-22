@@ -39,6 +39,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::applicant::dto::*;
 use crate::modules::com::applicant::model::TApplicant;
 use crate::modules::com::applicant::repo::{ApplicantRepo as ApplicantRepoImpl, ApplicantRepoTrait};
+use crate::modules::com::applicant::vo::{ApplicantListOut, ApplicantOut};
 use crate::modules::com::customer::repo::CustomerRepo as CustomerRepoImpl;
 use crate::shared::error::{AppError, code};
 

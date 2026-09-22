@@ -13,7 +13,9 @@ use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::super::dto_crud::{PlaceOnShelfRequest, RecallToProgrammingRequest, SendToProgrammingRequest};
+use super::super::super::dto_crud::{
+    PlaceOnShelfRequest, RecallToProgrammingRequest, SendToProgrammingRequest,
+};
 use super::super::PartService;
 
 use super::{
@@ -32,7 +34,7 @@ impl PartService {
         part_id: i64,
         req: SendToProgrammingRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -82,7 +84,7 @@ impl PartService {
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, "send-to-programming 后查不到")
             })?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `POST /parts/{id}/release-from-programming`：PROGRAMMING → IN_PROCESS（PRODUCTION_SHELF）。
@@ -95,7 +97,7 @@ impl PartService {
         part_id: i64,
         req: PlaceOnShelfRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -167,7 +169,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "release 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `POST /parts/{id}/recall-to-programming`：IN_PROCESS+PRODUCTION_SHELF → PROGRAMMING。
@@ -177,7 +179,7 @@ impl PartService {
         part_id: i64,
         req: RecallToProgrammingRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -233,6 +235,6 @@ impl PartService {
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, "recall-to-programming 后查不到")
             })?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 }

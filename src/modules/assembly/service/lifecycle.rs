@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::assembly::dto::AssemblyOut;
+use crate::modules::assembly::vo::AssemblyOut;
 use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::AssemblyRepoTrait;
 use crate::modules::assembly::statemachine::AssemblyStatus;
@@ -54,7 +54,7 @@ pub(crate) async fn upload_assembly_files_dispatch(
     assembly_id: i64,
     files: Vec<(Vec<u8>, String, String)>,
     current: &CurrentUser,
-) -> Result<Vec<crate::modules::assembly::dto::AssemblyFileRef>, AppError> {
+) -> Result<Vec<crate::modules::assembly::vo::AssemblyFileRef>, AppError> {
     AssemblyService
         .upload_assembly_files_inner(conn, snowflake, cos, assembly_id, files, current)
         .await
@@ -134,7 +134,7 @@ impl AssemblyService {
         assembly_id: i64,
         files: Vec<(Vec<u8>, String, String)>, // (bytes, filename, content_type)
         current: &CurrentUser,
-    ) -> Result<Vec<crate::modules::assembly::dto::AssemblyFileRef>, AppError> {
+    ) -> Result<Vec<crate::modules::assembly::vo::AssemblyFileRef>, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         // 校验 assembly 存在
         let asm = repo
@@ -160,7 +160,7 @@ impl AssemblyService {
                 .part_file_get_by_owner_kind_sha(asm.id, "ASSEMBLY_MASTER", &sha)
                 .await?
             {
-                out.push(crate::modules::assembly::dto::AssemblyFileRef {
+                out.push(crate::modules::assembly::vo::AssemblyFileRef {
                     id: existing.id,
                     original_filename: existing.original_filename,
                     page_count: None, // PDF 页数由 GET 时 lopdf 重算；这里省略
@@ -194,7 +194,7 @@ impl AssemblyService {
                 created_by: current.id,
             };
             repo.part_file_create(nf).await?;
-            out.push(crate::modules::assembly::dto::AssemblyFileRef {
+            out.push(crate::modules::assembly::vo::AssemblyFileRef {
                 id: file_id,
                 original_filename: filename,
                 page_count: None,

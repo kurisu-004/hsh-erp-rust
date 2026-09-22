@@ -22,6 +22,7 @@ pub mod print_xml_patch;
 pub mod repo;
 pub mod service;
 pub mod statemachine;
+pub mod vo;
 
 use std::sync::Arc;
 

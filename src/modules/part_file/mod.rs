@@ -24,6 +24,7 @@ pub mod model;
 pub mod policy;
 pub mod repo;
 pub mod service;
+pub mod vo;
 
 use crate::state::AppState;
 use axum::Router;

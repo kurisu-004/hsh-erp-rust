@@ -38,7 +38,7 @@ use tracing::{info, warn};
 
 use crate::auth::middleware::verify_session_token;
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::dashboard::dto::{WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
+use crate::modules::dashboard::vo::{WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
 use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 

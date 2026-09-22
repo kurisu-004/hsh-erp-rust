@@ -128,36 +128,3 @@ pub struct InspectionBatchListRow {
     pub l1_customer_name: Option<String>,
 }
 
-impl From<InspectionBatchListRow> for crate::modules::part::dto::InspectionBatchListItemOut {
-    fn from(r: InspectionBatchListRow) -> Self {
-        Self {
-            batch_id: r.batch_id,
-            batch_no: r.batch_no,
-            quantity: r.quantity,
-            status: r.status,
-            location: r.location,
-            version: r.version,
-            current_process_step_id: r.current_process_step_id,
-            parent_batch_id: r.parent_batch_id,
-            current_holder_id: r.current_holder_id,
-            holder_name: r.holder_name,
-            next_process_id: r.next_process_id,
-            next_process_name: r.next_process_name,
-            delivery_note_id: r.delivery_note_id,
-            delivery_note_no: r.delivery_note_no,
-            part_id: r.part_id,
-            serial_no: r.serial_no,
-            drawing_no: r.drawing_no,
-            name: r.name,
-            order_no: r.order_no,
-            planned_delivery_date: r.planned_delivery_date,
-            is_urgent: r.is_urgent,
-            part_version: r.part_version,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-            customer_id: r.customer_id,
-            customer_name: r.customer_name,
-            l1_customer_name: r.l1_customer_name,
-        }
-    }
-}

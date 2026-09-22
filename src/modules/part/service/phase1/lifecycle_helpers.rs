@@ -14,11 +14,11 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartListFilters;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::part::vo::{PartBatchListItemOut, PartListItem, PartListOut};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::super::dto_crud::{PartBatchListItemOut, PartListItem, PartListOut, PartListQuery, RecallToPendingRequest};
-use super::super::super::dto_crud::PlaceOnShelfRequest;
+use super::super::super::dto_crud::{PartListQuery, PlaceOnShelfRequest, RecallToPendingRequest};
 use super::super::PartService;
 
 use super::{
@@ -41,7 +41,7 @@ impl PartService {
         part_id: i64,
         req: PlaceOnShelfRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -112,7 +112,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "place-on-shelf 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `POST /parts/{id}/recall-to-pending`：ON_SHELF / PROGRAMMING → PENDING。
@@ -122,7 +122,7 @@ impl PartService {
         part_id: i64,
         req: RecallToPendingRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -179,7 +179,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "recall 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `GET /parts/pending-programming`：status=PROGRAMMING 一览（复用 PartListOut）。

@@ -39,12 +39,12 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::dto::{
-    AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AssignResult, AutoAllocateRequest,
-    AutoAllocateResult, ProcessPoolDetail,
+    AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AutoAllocateRequest,
 };
 use super::model::RefillResult;
 use super::model::WorkerPoolState;
 use super::service::WorkerPoolService;
+use super::vo::{AssignResult, AutoAllocateResult, ProcessPoolDetail};
 
 #[derive(Debug, Deserialize)]
 pub struct StateQuery {

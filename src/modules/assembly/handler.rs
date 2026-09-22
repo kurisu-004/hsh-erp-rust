@@ -40,10 +40,12 @@ use serde_json::json;
 use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::assembly::dto::{
-    AssemblyCreateRequest, AssemblyCreateResult, AssemblyDetail, AssemblyListOut,
-    AssemblyListQuery, AssemblyOut, AssemblyUpdateRequest,
+    AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
 };
 use crate::modules::assembly::service::AssemblyService;
+use crate::modules::assembly::vo::{
+    AssemblyCreateResult, AssemblyDetail, AssemblyListOut, AssemblyOut,
+};
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -248,7 +250,7 @@ pub async fn upload_assembly_files(
 ) -> Result<
     (
         StatusCode,
-        Json<R<Vec<crate::modules::assembly::dto::AssemblyFileRef>>>,
+        Json<R<Vec<crate::modules::assembly::vo::AssemblyFileRef>>>,
     ),
     AppError,
 > {

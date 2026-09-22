@@ -36,6 +36,7 @@ use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::dto_crud::CompleteRequest;
 use crate::modules::part::service::PartService;
 use crate::modules::part::batch::repo::PartBatchRepo;
+use crate::modules::part::vo::PartOut;
 use crate::shared::error::AppError;
 use crate::state::AppState;
 
@@ -171,7 +172,7 @@ async fn complete_one(
     part_id: i64,
     req: CompleteRequest,
     current: &CurrentUser,
-) -> Result<crate::modules::part::dto::PartOut, AppError> {
+) -> Result<PartOut, AppError> {
     PartService::complete(conn, snowflake, part_id, req, current).await
 }
 
