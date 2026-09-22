@@ -418,7 +418,7 @@ impl DeliveryNoteService {
         let mut seen = std::collections::HashSet::new();
         for pid in affected_part_ids {
             if seen.insert(pid) {
-                PartService::sync_from_batch_change(&mut *conn, pid, current).await?;
+                PartService::sync_from_batch_change_with_conn(&mut *conn, pid, current).await?;
             }
         }
 

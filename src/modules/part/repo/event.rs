@@ -1,47 +1,15 @@
-//! `t_part_event` 事件日志
+//! `t_part_event` 事件日志（2026-09-22 D-6 重构后**重导出壳**）
 //!
-//! 搬迁 `insert_part_event`：service 层在事务内统一插入状态翻转 /
-//! 批次拆分 / 返修等事件；本方法只负责 `INSERT`。
+//! ## 历史背景
+//! 2026-09-22 D-6 重构把原 `repo/part.rs` + `repo/batch.rs` + `repo/event.rs`
+//! 三文件 SQL 全部合并到 `repo/sql.rs` 的单 ZST `PartRepo`，并新增胖 trait
+//! `PartRepoTrait`（在 `mod.rs`）。
+//!
+//! 本文件保留为**重导出壳**，让跨模块调用方的 `use crate::modules::part::repo::event::*`
+//! （如有）路径仍可解析。
+//!
+//! ## 本任务不修改 SQL 字符串
+//! 所有 SQL 字符串都在 `sql.rs` 内（ZST `PartRepo` 固有静态方法），保持原样。
 
-use sqlx::PgExecutor;
-
-use crate::modules::part::model::NewPartEvent;
-
-use super::PartRepo;
-
-impl PartRepo {
-    /// 插入 `t_part_event` 事件日志。
-    ///
-    /// `id` 由 caller 用 `SnowflakeIdGenerator::next_id()` 预生成；
-    /// `created_at` 走 DB 默认 `now()`。
-    pub async fn insert_part_event<'e, E: PgExecutor<'e>>(
-        executor: E,
-        e: NewPartEvent<'_>,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query!(
-            r#"
-            INSERT INTO t_part_event (
-                id, part_id, event_type, from_status, to_status,
-                batch_id, quantity, drawing_code, badge_code, note,
-                created_at, created_by
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now(), $11
-            )
-            "#,
-            e.id,
-            e.part_id,
-            e.event_type,
-            e.from_status,
-            e.to_status,
-            e.batch_id,
-            e.quantity,
-            e.drawing_code,
-            e.badge_code,
-            e.note,
-            e.created_by,
-        )
-        .execute(executor)
-        .await?;
-        Ok(())
-    }
-}
+// `t_part_event` INSERT 方法 `PartRepo::insert_part_event` 已在 `sql.rs` 内合并。
+// 此模块当前为空（保留模块路径兼容），如未来需要拆 `EventRepo` ZST 再启用。

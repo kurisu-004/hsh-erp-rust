@@ -193,7 +193,7 @@ impl WorkerPoolService {
             .await?;
             // PR-B2：part 派生列（location/holder）由 sync_from_batch_change 统一
             // 回填（worker_id → worker holder，location → 'WORKER'）。
-            PartService::sync_from_batch_change(&mut *conn, t.part_id, current).await?;
+            PartService::sync_from_batch_change_with_conn(&mut *conn, t.part_id, current).await?;
             taken.push(t);
         }
 
@@ -339,7 +339,7 @@ impl WorkerPoolService {
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         // 4. PR-B2：part 派生列由 sync_from_batch_change 统一回填
         //    （location=PRODUCTION_SHELF / holder=shelf / next_process）。
-        PartService::sync_from_batch_change(&mut *conn, part.id, current).await?;
+        PartService::sync_from_batch_change_with_conn(&mut *conn, part.id, current).await?;
         // 5. event
         let event_id = snowflake.next_id();
         (&mut *conn).part_insert_part_event(
@@ -585,7 +585,7 @@ impl WorkerPoolService {
                             Some(current.id),
                         )
                         .await?;
-                        PartService::sync_from_batch_change(&mut *conn, t.part_id, current).await?;
+                        PartService::sync_from_batch_change_with_conn(&mut *conn, t.part_id, current).await?;
                         filled_count += 1;
                     }
                     None => {
@@ -717,7 +717,7 @@ impl WorkerPoolService {
             )
         })?;
 
-        PartService::sync_from_batch_change(&mut *conn, taken.part_id, current).await?;
+        PartService::sync_from_batch_change_with_conn(&mut *conn, taken.part_id, current).await?;
 
         let event_id = snowflake.next_id();
         (&mut *conn).part_insert_part_event(

@@ -65,7 +65,7 @@ pub async fn deliver(
 ) -> Result<Json<R<PartOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Clerk])?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::deliver(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::deliver(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -86,7 +86,7 @@ pub async fn cancel(
 ) -> Result<Json<R<PartOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Clerk])?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::cancel(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::cancel(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -107,7 +107,7 @@ pub async fn complete(
 ) -> Result<Json<R<PartOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Clerk])?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::complete(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::complete(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -128,7 +128,7 @@ pub async fn start_repair(
 ) -> Result<Json<R<PartOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::start_repair(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::start_repair(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -149,7 +149,7 @@ pub async fn place_on_shelf(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::place_on_shelf(&mut tx, &state.snowflake, part_id, req, &current).await?;
+        PartService::place_on_shelf(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -168,7 +168,7 @@ pub async fn recall_to_pending(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::recall_to_pending(&mut tx, &state.snowflake, part_id, req, &current).await?;
+        PartService::recall_to_pending(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -187,7 +187,7 @@ pub async fn send_to_programming(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::send_to_programming(&mut tx, &state.snowflake, part_id, req, &current).await?;
+        PartService::send_to_programming(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -206,7 +206,7 @@ pub async fn release_from_programming(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::release_from_programming(&mut tx, &state.snowflake, part_id, req, &current)
+        PartService::release_from_programming(&mut *tx, &state.snowflake, part_id, req, &current)
             .await?;
     tx.commit().await?;
     ws_broadcast(
@@ -225,7 +225,7 @@ pub async fn recall_to_programming(
     Json(req): Json<RecallToProgrammingRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::recall_to_programming(&mut tx, &state.snowflake, part_id, req, &current)
+    let out = PartService::recall_to_programming(&mut *tx, &state.snowflake, part_id, req, &current)
         .await?;
     tx.commit().await?;
     ws_broadcast(
@@ -243,7 +243,7 @@ pub async fn list_pending_programming(
     Query(query): Query<crate::modules::part::dto_crud::PartListQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_pending_programming(&mut tx, &query, &current).await?;
+    let out = PartService::list_pending_programming(&mut *tx, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -257,7 +257,7 @@ pub async fn send_to_outsource(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::send_to_outsource(&mut tx, &state.snowflake, part_id, req, &current).await?;
+        PartService::send_to_outsource(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -276,7 +276,7 @@ pub async fn receive_from_outsource(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::receive_from_outsource(&mut tx, &state.snowflake, part_id, req, &current)
+        PartService::receive_from_outsource(&mut *tx, &state.snowflake, part_id, req, &current)
             .await?;
     tx.commit().await?;
     ws_broadcast(
@@ -296,7 +296,7 @@ pub async fn receive_from_outsource_to_inspection(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = PartService::receive_from_outsource_to_inspection(
-        &mut tx,
+        &mut *tx,
         &state.snowflake,
         part_id,
         req,
@@ -319,7 +319,7 @@ pub async fn list_outsource_in_flight(
     Query(query): Query<crate::modules::part::dto_crud::PartListQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_outsource_in_flight(&mut tx, &query, &current).await?;
+    let out = PartService::list_outsource_in_flight(&mut *tx, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -331,7 +331,7 @@ pub async fn list_outsource_sendable(
     Query(query): Query<crate::modules::part::dto_crud::PartListQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_outsource_sendable(&mut tx, &query, &current).await?;
+    let out = PartService::list_outsource_sendable(&mut *tx, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -347,7 +347,7 @@ pub async fn complete_repair(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::complete_repair(&mut tx, &state.snowflake, part_id, req, &current).await?;
+        PartService::complete_repair(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -369,7 +369,7 @@ pub async fn repair_dispatch(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::repair_dispatch(&mut tx, &state.snowflake, part_id, req, &current).await?;
+        PartService::repair_dispatch(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -388,7 +388,7 @@ pub async fn split_batch(
 ) -> Result<Json<R<i64>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let new_batch_id =
-        PartService::split_batch(&mut tx, &state.snowflake, part_id, req, &current).await?;
+        PartService::split_batch(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -410,7 +410,7 @@ pub async fn cancel_batch(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::cancel_batch(&mut tx, &state.snowflake, part_id, batch_id, req, &current)
+        PartService::cancel_batch(&mut *tx, &state.snowflake, part_id, batch_id, req, &current)
             .await?;
     tx.commit().await?;
     ws_broadcast(
@@ -437,7 +437,7 @@ pub async fn pick_up(
     Json(req): Json<PickUpRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::pick_up(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::pick_up(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -458,7 +458,7 @@ pub async fn list_by_work_type(
     Query(query): Query<ByWorkTypeQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_by_work_type(&mut tx, work_type_id, &query, &current).await?;
+    let out = PartService::list_by_work_type(&mut *tx, work_type_id, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -474,7 +474,7 @@ pub async fn list_pickable_by_work_type(
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::list_pickable_by_work_type(&mut tx, work_type_id, &query, &current).await?;
+        PartService::list_pickable_by_work_type(&mut *tx, work_type_id, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -487,7 +487,7 @@ pub async fn list_by_worker(
     Query(query): Query<ByWorkerQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_by_worker(&mut tx, worker_id, &query, &current).await?;
+    let out = PartService::list_by_worker(&mut *tx, worker_id, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }

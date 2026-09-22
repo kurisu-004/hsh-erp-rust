@@ -34,6 +34,7 @@ use crate::modules::prod::process_chain::service::crud::ProcessChainService;
 use crate::modules::prod::work_type::process_mapping::WorkTypeProcessService;
 use crate::modules::prod::work_type::service::WorkTypeService;
 use crate::modules::prod::worker::service::WorkerService;
+use crate::modules::prod::worker_pool::service::WorkerPoolService;
 use crate::modules::upload_session::repo::UploadSessionRepo;
 
 pub struct AppState {
@@ -71,7 +72,7 @@ pub struct AppState {
     /// 2026-09-22 新增：com/applicant service（CRUD）。字段仅 `snowflake`；handler
     /// 借 `&mut *tx` 喂两次 trait（`ApplicantRepo` + `CustomerRepo::lookup_names`）。
     pub applicant_service: Arc<ApplicantService>,
-/// 2026-09-22 D-1 新增：prod/process_chain service（get / upsert）。字段仅
+    /// 2026-09-22 D-1 新增：prod/process_chain service（get / upsert）。字段仅
     /// `snowflake`；handler 借 `&mut *tx` / `&mut *conn` 喂给 `ProcessChainRepoTrait`
     /// （trait 已直接 `impl for &mut PgConnection`，2026-09-22 替代任何 `PgProcessChainRepo` 壳）。
     pub process_chain_service: Arc<ProcessChainService>,
@@ -106,6 +107,9 @@ pub struct AppState {
     /// 字段仅 `snowflake`；handler 借 `&mut *tx` 喂给 `ProcessRepoTrait`
     /// （trait 已直接 `impl for &mut PgConnection`）。
     pub process_service: Arc<ProcessService>,
+    /// 2026-09-22 D-6 新增：prod/worker_pool service 注入到 AppState。
+    /// unit struct（无字段）；handler 借 `&mut *tx` / `&mut *conn` 喂给 service 静态方法。
+    pub worker_pool_service: Arc<WorkerPoolService>,
 }
 
 impl AppState {
@@ -132,7 +136,7 @@ impl AppState {
         // 2026-09-22 com/customer + com/applicant service 装线：仅需 snowflake。
         let customer_service = Arc::new(CustomerService::new(snowflake.clone()));
         let applicant_service = Arc::new(ApplicantService::new(snowflake.clone()));
-// 2026-09-22 D-1 prod/process_chain service 装线：仅需 snowflake。
+        // 2026-09-22 D-1 prod/process_chain service 装线：仅需 snowflake。
         let process_chain_service = Arc::new(ProcessChainService::new(snowflake.clone()));
         // 2026-09-22 outsource service 装线：仅需 snowflake（16 端点 company + quote + shipment）。
         let outsource_service = Arc::new(OutsourceService::new(snowflake.clone()));
@@ -147,10 +151,11 @@ impl AppState {
         let work_type_process_service = Arc::new(WorkTypeProcessService);
         // 2026-09-22 D-2-simple prod/process service 装线：仅需 snowflake。
         let process_service = Arc::new(ProcessService::new(snowflake.clone()));
-        // 2026-09-22 D-2 prod/worker_pool service 是 unit struct，无字段依赖，
+        // 2026-09-22 prod/worker_pool service 是 unit struct，无字段依赖，
         // 无需装线到 AppState——handler 直接 `WorkerPoolService::method(&mut *tx, ...)`
         // 静态调用即可（与原 `WorkerPoolService` 调用形态一致，part 域
         // `part/handler/inspection.rs:298` 沿用）。
+        let worker_pool_service = Arc::new(WorkerPoolService::new());
         Self {
             pool,
             config,
@@ -165,7 +170,7 @@ impl AppState {
             session_service,
             customer_service,
             applicant_service,
-process_chain_service,
+            process_chain_service,
             outsource_service,
             part_file_service,
             cnc_program_service,
@@ -173,6 +178,7 @@ process_chain_service,
             work_type_service,
             work_type_process_service,
             process_service,
+            worker_pool_service,
         }
     }
 }

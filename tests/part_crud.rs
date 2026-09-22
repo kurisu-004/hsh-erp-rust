@@ -1647,7 +1647,7 @@ async fn upload_drawing_service_integration() {
     let bytes = fake_pdf_bytes();
     let mut conn = state.pool.begin().await.unwrap();
     let pf = PartService::upload_drawing(
-        &mut conn,
+        &mut *conn,
         &snowflake,
         &state,
         part_id,
@@ -1703,7 +1703,7 @@ async fn upload_3d_model_service_integration() {
     let bytes = fake_step_bytes();
     let mut conn = state.pool.begin().await.unwrap();
     let pf = PartService::upload_3d_model(
-        &mut conn,
+        &mut *conn,
         &snowflake,
         &state,
         part_id,
@@ -1751,7 +1751,7 @@ async fn upload_bad_extension_rejected() {
 
     let mut conn = state.pool.begin().await.unwrap();
     let err = PartService::upload_drawing(
-        &mut conn,
+        &mut *conn,
         &snowflake,
         &state,
         part_id,
@@ -1788,7 +1788,7 @@ async fn upload_content_type_mismatch_rejected() {
 
     let mut conn = state.pool.begin().await.unwrap();
     let err = PartService::upload_drawing(
-        &mut conn,
+        &mut *conn,
         &snowflake,
         &state,
         part_id,
@@ -1895,7 +1895,7 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
 
     let mut tx = pool.begin().await.unwrap();
     let (out, keys) = PartService::batch_create_parts_with_bindings(
-        &mut tx,
+        &mut *tx,
         &snowflake,
         cos.clone(),
         "uploads",

@@ -7,7 +7,11 @@
 //! 本文件只承载 `PartService::worker_scan_event`（impl 块拆文件，Rust 允许
 //! 同一 `impl Foo { ... }` 块分布在多个同 crate 文件中，编译器合并）。
 //!
-//! 实施约定：方法签名接收 `&mut PgConnection`，由 handler 开 tx 并 commit。
+//! 实施约定：方法签名 `<R: PartRepoTrait>(mut repo: R, ...)`，由 handler 开 tx
+//! 并 commit。生产 `R = &mut PgConnection`，跨域 repo（shelf / worker / process_chain）
+//! 与 inline sqlx 查询（t_shelf_process / t_part.process_chain_id）经 `repo.conn_mut()`
+//! 调用——Rust auto-deref + reborrow 让 `repo: &mut &mut PgConnection` 的
+//! `repo.conn_mut()` 表达式得到 `&mut PgConnection`（sqlx Executor）。
 //!
 //! ## worker_scan_event
 //! - 两分支 `WorkerScanEvent::{RETURNED, INSPECTED}`，分别走 mark_*_returned /
@@ -30,14 +34,15 @@
 //! - 40001 `VALIDATION_ERROR` —— next_process_id / target_inspection_shelf_id 缺 / 非法
 //! - 40301 `SHELF_MISMATCH` —— 当前用户无权限访问 target shelf
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败
-
-use sqlx::PgConnection;
+//!
+//! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
+//! `impl for &mut PgConnection`）。
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::model::NewPartEvent;
-use crate::modules::part::repo::PartRepo;
+use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
@@ -75,14 +80,14 @@ impl PartService {
     // 是 master 既有的 pre-existing 例外），新版本 clippy (1.98) 会以
     // `clippy::needless_late_init` 报警，故显式豁免。
     #[allow(clippy::too_many_lines, clippy::needless_late_init)]
-    pub async fn worker_scan_event(
-        conn: &mut PgConnection,
+    pub async fn worker_scan_event<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         req: WorkerScanRequest,
         current: &CurrentUser,
     ) -> Result<WorkerScanCoreOut, AppError> {
         // 1. shelf 校验（worker-scan shelf 必须 PRODUCTION 区 active；存在性 + zone 守卫）
-        let _shelf = ShelfRepo::get_by_id_zone(&mut *conn, req.shelf_id, "PRODUCTION")
+        let _shelf = ShelfRepo::get_by_id_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION")
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -91,7 +96,7 @@ impl PartService {
                 )
             })?;
         // 2. 反查 worker
-        let worker = WorkerRepo::get_by_badge_code(&mut *conn, &req.badge_code, false)
+        let worker = WorkerRepo::get_by_badge_code(repo.conn_mut(), &req.badge_code, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -112,7 +117,8 @@ impl PartService {
             )
         })?;
         // 3. 定位 part
-        let part = PartRepo::get_by_serial(&mut *conn, &req.serial_no, false)
+        let part = repo
+            .get_by_serial(&req.serial_no, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -122,10 +128,9 @@ impl PartService {
             })?;
         // 4. 定位 batch（worker 持有 IN_PROCESS+WORKER）
         let bid_hint = req.batch_id.as_deref().and_then(|s| s.parse().ok());
-        let batch = match PartRepo::find_worker_held_batch_for_part(
-            &mut *conn, part.id, worker.id, bid_hint,
-        )
-        .await
+        let batch = match repo
+            .find_worker_held_batch_for_part(part.id, worker.id, bid_hint)
+            .await
         {
             Ok(Some(b)) => b,
             Ok(None) => {
@@ -166,7 +171,7 @@ impl PartService {
                     req.shelf_id,
                     next_pid,
                 )
-                .fetch_one(&mut *conn)
+                .fetch_one(repo.conn_mut())
                 .await?;
                 if !maps {
                     return Err(AppError::biz(
@@ -182,10 +187,10 @@ impl PartService {
                     "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
                 )
                 .bind(batch.part_id)
-                .fetch_optional(&mut *conn)
+                .fetch_optional(repo.conn_mut())
                 .await?;
                 let step_id_opt: Option<i64> = if let Some(chain_id) = chain_id_opt {
-                    ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, next_pid)
+                    ProcessChainRepo::resolve_step_id_by_process(repo.conn_mut(), chain_id, next_pid)
                         .await?
                 } else {
                     // chain 已删：保留 batch 旧的 current_process_step_id（fallback
@@ -193,37 +198,34 @@ impl PartService {
                     batch.current_process_step_id
                 };
                 // 切 holder worker → shelf（OCC）
-                let n = PartRepo::mark_batch_returned(
-                    &mut *conn,
-                    batch.id,
-                    batch.version,
-                    req.shelf_id,
-                    step_id_opt,
-                    Some(current.id),
-                )
-                .await?;
+                let n = repo
+                    .mark_batch_returned(
+                        batch.id,
+                        batch.version,
+                        req.shelf_id,
+                        step_id_opt,
+                        Some(current.id),
+                    )
+                    .await?;
                 if n == 0 {
                     return Err(AppError::biz(code::VERSION_CONFLICT, "乐观锁失败"));
                 }
                 // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
                 // 未变化（IN_PROCESS→IN_PROCESS）但 location/holder/process 物化。
-                PartService::sync_from_batch_change(&mut *conn, part.id, current).await?;
-                PartRepo::insert_part_event(
-                    &mut *conn,
-                    NewPartEvent {
-                        id: snowflake.next_id(),
-                        part_id: part.id,
-                        event_type: "RETURNED_TO_SHELF",
-                        from_status: Some("IN_PROCESS"),
-                        to_status: Some("IN_PROCESS"),
-                        batch_id: Some(batch.id),
-                        quantity: Some(batch.quantity),
-                        drawing_code: Some(&part.drawing_no),
-                        badge_code: Some(&worker.badge_code),
-                        note: None,
-                        created_by: Some(current.id),
-                    },
-                )
+                PartService::sync_from_batch_change(&mut repo, part.id, current).await?;
+                repo.insert_part_event(NewPartEvent {
+                    id: snowflake.next_id(),
+                    part_id: part.id,
+                    event_type: "RETURNED_TO_SHELF",
+                    from_status: Some("IN_PROCESS"),
+                    to_status: Some("IN_PROCESS"),
+                    batch_id: Some(batch.id),
+                    quantity: Some(batch.quantity),
+                    drawing_code: Some(&part.drawing_no),
+                    badge_code: Some(&worker.badge_code),
+                    note: None,
+                    created_by: Some(current.id),
+                })
                 .await?;
                 event_type_str = "WORKER_SCAN_RETURNED";
             }
@@ -237,7 +239,7 @@ impl PartService {
                     })?
                     .parse()
                     .map_err(|_| AppError::validation("target_inspection_shelf_id 非法"))?;
-                let target = ShelfRepo::get_active_by_id(&mut *conn, target_id)
+                let target = ShelfRepo::get_active_by_id(repo.conn_mut(), target_id)
                     .await?
                     .ok_or_else(|| {
                         AppError::biz(code::BIZ_SHELF_NOT_FOUND, "target shelf 不存在")
@@ -266,43 +268,35 @@ impl PartService {
                     ));
                 }
                 // 切 holder worker → target_shelf + 状态 IN_PROCESS → INSPECTION（OCC）
-                let n = PartRepo::mark_batch_inspected(
-                    &mut *conn,
-                    batch.id,
-                    batch.version,
-                    target_id,
-                    Some(current.id),
-                )
-                .await?;
+                let n = repo
+                    .mark_batch_inspected(batch.id, batch.version, target_id, Some(current.id))
+                    .await?;
                 if n == 0 {
                     return Err(AppError::biz(code::VERSION_CONFLICT, "乐观锁失败"));
                 }
                 // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
                 // 变化时级联调 AssemblyService::sync_from_part_change 闭合链路。
                 synced_assembly_id = match PartService::sync_from_batch_change(
-                    &mut *conn, part.id, current,
+                    &mut repo, part.id, current,
                 )
                 .await?
                 {
                     SyncOutcome::Changed(aid) => Some(aid),
                     SyncOutcome::NoChange => None,
                 };
-                PartRepo::insert_part_event(
-                    &mut *conn,
-                    NewPartEvent {
-                        id: snowflake.next_id(),
-                        part_id: part.id,
-                        event_type: "SENT_TO_INSPECTION",
-                        from_status: Some("IN_PROCESS"),
-                        to_status: Some("INSPECTION"),
-                        batch_id: Some(batch.id),
-                        quantity: Some(batch.quantity),
-                        drawing_code: Some(&part.drawing_no),
-                        badge_code: Some(&worker.badge_code),
-                        note: None,
-                        created_by: Some(current.id),
-                    },
-                )
+                repo.insert_part_event(NewPartEvent {
+                    id: snowflake.next_id(),
+                    part_id: part.id,
+                    event_type: "SENT_TO_INSPECTION",
+                    from_status: Some("IN_PROCESS"),
+                    to_status: Some("INSPECTION"),
+                    batch_id: Some(batch.id),
+                    quantity: Some(batch.quantity),
+                    drawing_code: Some(&part.drawing_no),
+                    badge_code: Some(&worker.badge_code),
+                    note: None,
+                    created_by: Some(current.id),
+                })
                 .await?;
                 event_type_str = "WORKER_SCAN_INSPECTED";
             }

@@ -62,7 +62,7 @@ pub async fn list_parts(
 ) -> Result<Json<R<PartListOut>>, AppError> {
     current.require_any_role(LIST_PART_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_parts(&mut tx, &query, &current).await?;
+    let out = PartService::list_parts(&mut *tx, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -86,7 +86,7 @@ pub async fn list_inspection_batches(
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Inspector])?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_inspection_batches(&mut tx, &query, &current).await?;
+    let out = PartService::list_inspection_batches(&mut *tx, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -101,7 +101,7 @@ pub async fn get_part_detail(
 ) -> Result<Json<R<PartDetailOut>>, AppError> {
     current.require_any_role(LIST_PART_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::get_part(&mut tx, part_id, &current).await?;
+    let out = PartService::get_part(&mut *tx, part_id, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -116,7 +116,7 @@ pub async fn get_by_serial(
 ) -> Result<Json<R<PartDetailOut>>, AppError> {
     current.require_any_role(LIST_PART_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::get_part_by_serial(&mut tx, &serial_no, &current).await?;
+    let out = PartService::get_part_by_serial(&mut *tx, &serial_no, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -133,7 +133,7 @@ pub async fn get_by_serial_part_batches(
 ) -> Result<Json<R<PartScanContextOut>>, AppError> {
     current.require_any_role(LIST_PART_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::get_part_batches_by_serial(&mut tx, &serial_no, &current).await?;
+    let out = PartService::get_part_batches_by_serial(&mut *tx, &serial_no, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -149,7 +149,7 @@ pub async fn create_part(
 ) -> Result<(StatusCode, Json<R<PartDetailOut>>), AppError> {
     current.require_any_role(CRUD_PART_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::create_part(&mut tx, &state.snowflake, &req, &current).await?;
+    let out = PartService::create_part(&mut *tx, &state.snowflake, &req, &current).await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
@@ -165,7 +165,7 @@ pub async fn update_part(
 ) -> Result<Json<R<PartDetailOut>>, AppError> {
     current.require_any_role(CRUD_PART_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::update_part(&mut tx, part_id, &req, &current).await?;
+    let out = PartService::update_part(&mut *tx, part_id, &req, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -181,7 +181,7 @@ pub async fn soft_delete_part(
 ) -> Result<Json<R<()>>, AppError> {
     current.require_role(Role::Manager)?;
     let mut tx = state.pool.begin().await?;
-    PartService::soft_delete_part(&mut tx, &state.snowflake, part_id, req.version, &current)
+    PartService::soft_delete_part(&mut *tx, &state.snowflake, part_id, req.version, &current)
         .await?;
     tx.commit().await?;
     ws_broadcast_soft_deleted(&state, part_id);
@@ -210,7 +210,7 @@ pub async fn upload_drawing(
         ct.ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "file 缺少 content_type"))?;
     let mut tx = state.pool.begin().await?;
     let pf = PartService::upload_drawing(
-        &mut tx,
+        &mut *tx,
         &state.snowflake,
         &state,
         part_id,
@@ -254,7 +254,7 @@ pub async fn upload_3d_model(
         ct.ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "file 缺少 content_type"))?;
     let mut tx = state.pool.begin().await?;
     let pf = PartService::upload_3d_model(
-        &mut tx,
+        &mut *tx,
         &state.snowflake,
         &state,
         part_id,
@@ -316,7 +316,7 @@ pub async fn list_part_events(
     Path(part_id): Path<i64>,
 ) -> Result<Json<R<Vec<PartEventOut>>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_events(&mut tx, part_id, &current).await?;
+    let out = PartService::list_events(&mut *tx, part_id, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -330,7 +330,7 @@ pub async fn get_location_tree(
     current: CurrentUser,
 ) -> Result<Json<R<LocationTreeOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::location_tree(&mut tx, &current).await?;
+    let out = PartService::location_tree(&mut *tx, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -344,7 +344,7 @@ pub async fn match_by_excel_items(
     Json(req): Json<MatchByExcelItemsRequest>,
 ) -> Result<Json<R<Vec<MatchByExcelItemResult>>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::match_by_excel_items(&mut tx, &req, &current).await?;
+    let out = PartService::match_by_excel_items(&mut *tx, &req, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -358,7 +358,7 @@ pub async fn batch_update_order_info(
     Json(req): Json<BatchUpdateOrderInfoRequest>,
 ) -> Result<Json<R<BatchUpdateOrderInfoOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_update_order_info(&mut tx, &req, &current).await?;
+    let out = PartService::batch_update_order_info(&mut *tx, &req, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -372,7 +372,7 @@ pub async fn list_part_batches(
     Path(part_id): Path<i64>,
 ) -> Result<Json<R<Vec<PartBatchListItemOut>>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_batches(&mut tx, part_id, &current).await?;
+    let out = PartService::list_batches(&mut *tx, part_id, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }

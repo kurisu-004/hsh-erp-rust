@@ -83,7 +83,7 @@ pub async fn to_ship(
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
     current.require_any_role(TO_XXX_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::to_ship(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::to_ship(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     if let Some(aid) = out.synced_assembly_id {
         ws_broadcast_assembly_updated(&state, aid);
@@ -121,7 +121,7 @@ pub async fn batch_to_ship(
         )));
     }
     let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_to_ship(&mut tx, &state.snowflake, req, &current).await?;
+    let out = PartService::batch_to_ship(&mut *tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     let mut seen_assemblies = std::collections::HashSet::new();
     for item in &out.submitted {
@@ -159,7 +159,7 @@ pub async fn to_inspection(
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
     current.require_any_role(TO_XXX_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::to_inspection(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::to_inspection(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     if let Some(aid) = out.synced_assembly_id {
         ws_broadcast_assembly_updated(&state, aid);
@@ -186,7 +186,7 @@ pub async fn to_process(
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
     current.require_any_role(TO_XXX_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::to_process(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::to_process(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     if let Some(aid) = out.synced_assembly_id {
         ws_broadcast_assembly_updated(&state, aid);
@@ -206,7 +206,7 @@ pub async fn scan_inspect(
     Json(req): Json<ScanInspectRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::scan_inspect(&mut tx, &state.snowflake, part_id, req, &current).await?;
+    let out = PartService::scan_inspect(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     let kind = if out.status == "READY_TO_SHIP" {
         "PART_SCAN_INSPECT_PASSED"
@@ -229,7 +229,7 @@ pub async fn scan_deliver_part(
     Json(req): Json<ScanDeliverPartRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::scan_deliver_part(&mut tx, &state.snowflake, req, &current).await?;
+    let out = PartService::scan_deliver_part(&mut *tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "PART_DELIVERED".into(),
@@ -290,9 +290,9 @@ pub async fn worker_scan(
     let mut tx = state.pool.begin().await?;
     // scan（状态翻转 + 写事件日志）
     let scan_out =
-        PartService::worker_scan_event(&mut tx, &state.snowflake, req.clone(), &current).await?;
-    // refill（同事务；WorkerPoolService::refill_for_worker_with_work_type 内部对 work_type / process
-    // 映射校验失败会抛业务错——事务自动回滚 scan 写入，保持原子语义）。
+        PartService::worker_scan_event(&mut *tx, &state.snowflake, req.clone(), &current).await?;
+    // refill（同事务；WorkerPoolService::refill_for_worker_with_work_type 内部
+    // 对 work_type / process 映射校验失败会抛业务错——事务自动回滚 scan 写入，保持原子语义）。
     // 复用 worker_scan_event 已经 fetch 过的 work_type_id + badge_code，
     // 跳过 worker_pool service 内的 WorkerRepo::get_by_id 重复查询。
     let refill_out = WorkerPoolService::refill_for_worker_with_work_type(
@@ -300,12 +300,12 @@ pub async fn worker_scan(
         &state.snowflake,
         scan_out.worker_id,
         scan_out.work_type_id,
-        req.shelf_id,
-        &scan_out.badge_code,
-        current.id,
-        &current,
-    )
-    .await?;
+            req.shelf_id,
+            &scan_out.badge_code,
+            current.id,
+            &current,
+        )
+        .await?;
     tx.commit().await?;
     // commit 之后广播（对齐 Python 延迟广播模式）
     if let Some(aid) = scan_out.synced_assembly_id {
@@ -345,7 +345,7 @@ pub async fn list_repair_batches(
     Query(query): Query<InspectionBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_repair_batches(&mut tx, &query, &current).await?;
+    let out = PartService::list_repair_batches(&mut *tx, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -359,7 +359,7 @@ pub async fn list_repairing_batches(
     Query(query): Query<InspectionBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::list_repairing_batches(&mut tx, &query, &current).await?;
+    let out = PartService::list_repairing_batches(&mut *tx, &query, &current).await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }

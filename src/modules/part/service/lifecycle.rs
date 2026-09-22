@@ -21,16 +21,16 @@
 //! - 20119 `BIZ_PART_NOT_DELETABLE` —— soft_delete 终态禁删（lifecycle 不直接用）
 //! - 21420 `BIZ_DELIVERY_NOTE_LOCKED_PART` —— cancel 时 part 已挂送货单
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败
-
-use sqlx::PgConnection;
+//!
+//! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
+//! `impl for &mut PgConnection`）。
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::dto::PartOut;
 use crate::modules::part::model::{NewPartEvent, TPart};
-use crate::modules::part::repo::PartRepo;
+use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto_crud::{CancelRequest, CompleteRequest, DeliverRequest, StartRepairRequest};
@@ -42,8 +42,8 @@ impl PartService {
     ///
     /// BREAKING CHANGE：DTO 新增 `batch_id` + `version`（前端从
     /// `GET /parts/by-serial/{serial_no}/part-batches` 取 batch.id + version）。
-    pub async fn deliver(
-        conn: &mut PgConnection,
+    pub async fn deliver<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         req: DeliverRequest,
@@ -52,7 +52,8 @@ impl PartService {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         // 1. 读 part（仅 need drawing_no 用于事件日志 + 终态守卫；其它派生列
         //    由 rollup 在 batch 翻转后回填）。
-        let part = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let part = repo
+            .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -64,7 +65,8 @@ impl PartService {
             ));
         }
         // 2. 定位 batch（必须属于 part + READY_TO_SHIP + 未软删）。
-        let batch = PartRepo::find_batch_by_id(&mut *conn, req.batch_id)
+        let batch = repo
+            .find_batch_by_id(req.batch_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -106,8 +108,9 @@ impl PartService {
             ));
         }
         // 5. UPDATE batch: READY_TO_SHIP → DELIVERED（OCC）。
-        let bn =
-            PartRepo::mark_batch_delivered(&mut *conn, batch.id, batch.version, current.id).await?;
+        let bn = repo
+            .mark_batch_delivered(batch.id, batch.version, current.id)
+            .await?;
         if bn == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -117,26 +120,24 @@ impl PartService {
         // 6. PR-B2 rollup：翻 batch → 物化 part 派生列 + 级联 assembly sync。
         //    （status 由 NoChange → DELIVERED 时 part 跟随；多批次场景下
         //    rollup 会按 min-progress 决定 part 状态。）
-        let _ = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
+        let _ = PartService::sync_from_batch_change(&mut repo, part_id, current).await?;
         // 7. 事件日志：batch_id + quantity 来自操作的批次。
-        PartRepo::insert_part_event(
-            &mut *conn,
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "DELIVERED",
-                from_status: Some("READY_TO_SHIP"),
-                to_status: Some("DELIVERED"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "DELIVERED",
+            from_status: Some("READY_TO_SHIP"),
+            to_status: Some("DELIVERED"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
-        let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let fresh = repo
+            .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "deliver 后查不到"))?;
         Ok(PartOut::from(fresh))
@@ -151,8 +152,8 @@ impl PartService {
     /// 4. delivery_note_id 锁定 → 21420（**Finding D**）
     /// 5. status 不在 cancel 白名单 → 20103
     /// 6. part 翻转 → 同事务同步最近一条 source-status 批次
-    pub async fn cancel(
-        conn: &mut PgConnection,
+    pub async fn cancel<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         req: CancelRequest,
@@ -161,7 +162,8 @@ impl PartService {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         // 取完整 TPart（含 delivery_note_id）—— Finding D 要求 service 层守
         // 已挂送货单的 part 不能取消。
-        let part: TPart = PartRepo::get_part_detail(&mut *conn, part_id)
+        let part: TPart = repo
+            .get_part_detail(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -181,7 +183,10 @@ impl PartService {
         // Finding D：cancel 锁定守护 — part 任一活跃批次已挂送货单 → 拒。
         // 2026-09-16 PR-2 瘦身（migration 027）：t_part.delivery_note_id 列已删，
         // 改查 t_part_batch.delivery_note_id 真相源。
-        if PartBatchRepo::has_active_batch_on_delivery_note(&mut *conn, part_id).await? {
+        if repo
+            .part_batch_has_active_on_delivery_note(part_id)
+            .await?
+        {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_LOCKED_PART,
                 format!("part {part_id} 存在活跃批次已挂送货单，禁 cancel"),
@@ -196,8 +201,9 @@ impl PartService {
                 ),
             ));
         }
-        let n =
-            PartRepo::mark_part_cancelled(&mut *conn, part_id, part.version, current.id).await?;
+        let n = repo
+            .mark_part_cancelled(part_id, part.version, current.id)
+            .await?;
         if n == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -207,41 +213,41 @@ impl PartService {
         // PR-B2 §4.2 cancel 改造：级联取消**全部活跃批次**（不只「最近一条
         // source-status」），单条 UPDATE 即覆盖。无活跃批次 → 影响行数 0，
         // 视为合法（新建工单未拆批场景）。
-        let _batches_cancelled =
-            PartRepo::cancel_all_active_batches_for_part(&mut *conn, part_id, current.id).await?;
-        PartRepo::insert_part_event(
-            &mut *conn,
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "CANCELLED",
-                from_status: Some(from.as_str()),
-                to_status: Some("CANCELLED"),
-                batch_id: None,
-                quantity: None,
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.reason.as_deref().or(req.note.as_deref()),
-                created_by: Some(current.id),
-            },
-        )
+        let _batches_cancelled = repo
+            .cancel_all_active_batches_for_part(part_id, current.id)
+            .await?;
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "CANCELLED",
+            from_status: Some(from.as_str()),
+            to_status: Some("CANCELLED"),
+            batch_id: None,
+            quantity: None,
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.reason.as_deref().or(req.note.as_deref()),
+            created_by: Some(current.id),
+        })
         .await?;
         // 重读走 TPartInspected（响应只需 PartOut 最小投影）。
-        let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let fresh = repo
+            .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "cancel 后查不到"))?;
         Ok(PartOut::from(fresh))
     }
 
-    pub async fn complete(
-        conn: &mut PgConnection,
+    pub async fn complete<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         req: CompleteRequest,
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        let part = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let part = repo
+            .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -253,7 +259,8 @@ impl PartService {
             ));
         }
         // 1. 定位 batch。
-        let batch = PartRepo::find_batch_by_id(&mut *conn, req.batch_id)
+        let batch = repo
+            .find_batch_by_id(req.batch_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -295,8 +302,9 @@ impl PartService {
             ));
         }
         // 4. UPDATE batch: DELIVERED → COMPLETED（OCC）。
-        let bn =
-            PartRepo::mark_batch_completed(&mut *conn, batch.id, batch.version, current.id).await?;
+        let bn = repo
+            .mark_batch_completed(batch.id, batch.version, current.id)
+            .await?;
         if bn == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -304,43 +312,43 @@ impl PartService {
             ));
         }
         // 5. PR-B2 rollup：翻 batch → 物化 part 派生列 + 级联 assembly sync。
-        let _ = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
+        let _ = PartService::sync_from_batch_change(&mut repo, part_id, current).await?;
         // 6. part 进入 COMPLETED 时清空 serial_no（序列号已转交送货单）。
-        let _ =
-            PartRepo::clear_part_serial_no_when_completed(&mut *conn, part_id, current.id).await?;
+        let _ = repo
+            .clear_part_serial_no_when_completed(part_id, current.id)
+            .await?;
         // 7. 事件日志：batch_id + quantity 来自操作的批次。
-        PartRepo::insert_part_event(
-            &mut *conn,
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "COMPLETED",
-                from_status: Some("DELIVERED"),
-                to_status: Some("COMPLETED"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "COMPLETED",
+            from_status: Some("DELIVERED"),
+            to_status: Some("COMPLETED"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
-        let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let fresh = repo
+            .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "complete 后查不到"))?;
         Ok(PartOut::from(fresh))
     }
 
-    pub async fn start_repair(
-        conn: &mut PgConnection,
+    pub async fn start_repair<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         req: StartRepairRequest,
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-        let part = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let part = repo
+            .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -352,7 +360,8 @@ impl PartService {
             ));
         }
         // 1. 定位 batch。
-        let batch = PartRepo::find_batch_by_id(&mut *conn, req.batch_id)
+        let batch = repo
+            .find_batch_by_id(req.batch_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -398,8 +407,9 @@ impl PartService {
         //    `has_been_repaired` 列，mark_batch_repairing 不再写该列；t_part
         //    同步删 `has_been_repaired` 列，mark_part_repairing_flag_only 整
         //    个函数删除。返修事实由下方 REPAIR_STARTED 事件日志追溯。
-        let bn =
-            PartRepo::mark_batch_repairing(&mut *conn, batch.id, batch.version, current.id).await?;
+        let bn = repo
+            .mark_batch_repairing(batch.id, batch.version, current.id)
+            .await?;
         if bn == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -407,26 +417,24 @@ impl PartService {
             ));
         }
         // 5. PR-B2 rollup：翻 batch → 物化 part 派生列（status=REPAIRING）。
-        let _ = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
+        let _ = PartService::sync_from_batch_change(&mut repo, part_id, current).await?;
         // 6. 事件日志。
-        PartRepo::insert_part_event(
-            &mut *conn,
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "REPAIR_STARTED",
-                from_status: Some("IN_PROCESS"),
-                to_status: Some("REPAIRING"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.reason.as_deref().or(req.note.as_deref()),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "REPAIR_STARTED",
+            from_status: Some("IN_PROCESS"),
+            to_status: Some("REPAIRING"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.reason.as_deref().or(req.note.as_deref()),
+            created_by: Some(current.id),
+        })
         .await?;
-        let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let fresh = repo
+            .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "start-repair 后查不到"))?;
         Ok(PartOut::from(fresh))
