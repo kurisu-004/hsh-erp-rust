@@ -23,6 +23,19 @@
 //!   jti 直接复用 JWT 自带的 `claims.jwt_id`（UUID v4），不再调用 `hash_token`。
 //! - 删除 `hash_token` 函数（`sha2` crate 因 part_file 仍保留），`SessionStore` trait
 //!   入参从 `token_hash: &str` 改为 `jti: &str`；语义改名 `AuthenticatedTokenHash` → `SessionJti`。
+//!
+//! ## 2026-09-23 重构：refresh token rotation + reuse detection 黑名单
+//! - `SessionStore` trait 新增两个方法：
+//!   - `revoke_jti(jti, ttl_seconds)`：把 jti 写入 Redis 黑名单 `revoked:<jti>`（空值 + EX TTL），
+//!     `SET ... NX` 语义避免覆盖已有条目；返回 `true` 表示本次写入、`false` 表示已存在跳过。
+//!   - `is_jti_revoked(jti)`：`EXISTS revoked:<jti>` 检查 jti 是否被吊销。
+//! - TTL 由调用方计算（业务层：`refresh_exp - now`，saturating 0；最多 7d，因 refresh TTL 默认 7d）。
+//!   黑名单存活时间恰好覆盖原 refresh token 的剩余有效期，TTL 到期后 entry 被 Redis 自动回收，
+//!   与 refresh 自身过期保持语义一致——refresh 失效了，黑名单也无需再保留。
+//! - 复用检测触发逻辑（`auth/middleware.rs::verify_session_token` 与
+//!   `modules/iam/service/session.rs::refresh` phase 1）：任一处看到 `is_jti_revoked=true`
+//!   即视为会话/refresh 已失效，返回 40105 SESSION_REVOKED；refresh 路径额外触发
+//!   `delete_all_user_sessions` 全清该用户的所有 session（强制下线）。
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -109,6 +122,21 @@ pub trait SessionStore: Send + Sync {
 
     /// 滑动 TTL；返回 true iff key 存在并 EXPIRE 成功
     async fn touch_session(&self, jti: &str, ttl_seconds: u64) -> Result<bool, AppError>;
+
+    /// 2026-09-23 重构：把 jti 写入 refresh reuse detection 黑名单。
+    ///
+    /// Redis 实现：`SET revoked:<jti> "" EX <ttl_seconds>`（带 NX 语义避免覆盖）。
+    /// 返回 `true` 表示本次新写入；`false` 表示黑名单已存在，跳过本次写入。
+    ///
+    /// 调用方负责计算 TTL（业务语义：refresh 剩余有效期）。
+    async fn revoke_jti(&self, jti: &str, ttl_seconds: u64) -> Result<bool, AppError>;
+
+    /// 2026-09-23 重构：检查 jti 是否在 reuse detection 黑名单中。
+    ///
+    /// Redis 实现：`EXISTS revoked:<jti>` 转 bool。
+    /// 被 `auth::middleware::verify_session_token`（access jti 闸）和
+    /// `iam::service::session::refresh`（refresh reuse 检测）调用。
+    async fn is_jti_revoked(&self, jti: &str) -> Result<bool, AppError>;
 }
 
 /// Redis 实现的 SessionStore
@@ -135,6 +163,14 @@ fn key_session(jti: &str) -> String {
 
 fn key_user_set(user_id: i64) -> String {
     format!("sessions:user:{user_id}")
+}
+
+/// 2026-09-23 新增：reuse detection 黑名单 key。
+///
+/// 空值写入（payload 仅占位），TTL 由业务层根据 refresh 剩余有效期计算。
+/// TTL 到期即由 Redis 自动回收——与 refresh token 自身的过期保持语义一致。
+fn key_revoked(jti: &str) -> String {
+    format!("revoked:{jti}")
 }
 
 fn now_unix() -> i64 {
@@ -260,6 +296,30 @@ impl SessionStore for RedisSessionStore {
             .map_err(map_redis)?;
         Ok(updated)
     }
+
+    async fn revoke_jti(&self, jti: &str, ttl_seconds: u64) -> Result<bool, AppError> {
+        // 2026-09-23 重构：reuse detection 黑名单。
+        // SET revoked:<jti> "" EX <ttl> NX —— NX 标志确保不会覆盖已有条目（race condition
+        // 兜底：两条 refresh 几乎同时写同一个 jti，Redis 只接第一条）。
+        // Redis 返回 nil 时（key 已存在）转 false；返回 "OK" 时转 true。
+        let mut conn = self.conn().await?;
+        let reply: Option<String> = redis::cmd("SET")
+            .arg(key_revoked(jti))
+            .arg("")
+            .arg("EX")
+            .arg(ttl_seconds)
+            .arg("NX")
+            .query_async(&mut conn)
+            .await
+            .map_err(map_redis)?;
+        Ok(reply.is_some())
+    }
+
+    async fn is_jti_revoked(&self, jti: &str) -> Result<bool, AppError> {
+        let mut conn = self.conn().await?;
+        let exists: bool = conn.exists(key_revoked(jti)).await.map_err(map_redis)?;
+        Ok(exists)
+    }
 }
 
 /// No-op 实现：所有写入和读取都是 no-op。服务路径下 extractor 不会调到本实现
@@ -310,6 +370,20 @@ impl SessionStore for NoopSessionStore {
     }
 
     async fn touch_session(&self, _jti: &str, _ttl_seconds: u64) -> Result<bool, AppError> {
+        Ok(false)
+    }
+
+    async fn revoke_jti(&self, _jti: &str, _ttl_seconds: u64) -> Result<bool, AppError> {
+        // Noop 实现：生产不该走到这里（已统一 RedisSessionStore）。打 warn 以便误用时可见。
+        tracing::warn!(
+            "NoopSessionStore::revoke_jti 被调用（仅测试 fixture，生产不应到达）"
+        );
+        Ok(false)
+    }
+
+    async fn is_jti_revoked(&self, _jti: &str) -> Result<bool, AppError> {
+        // Noop 路径下永远视为未吊销 —— 测试 fixture 中复用检测分支将永远走 false
+        // （即不会被黑名单拦截）；若测试需要走黑名单分支，必须用真实 RedisSessionStore。
         Ok(false)
     }
 }

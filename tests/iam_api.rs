@@ -286,7 +286,12 @@ async fn refresh_rotates_token_and_bumps_version() {
 }
 
 #[tokio::test]
-async fn refresh_reusing_old_token_returns_40103() {
+async fn refresh_reusing_old_token_returns_40105() {
+    // 2026-09-23 重构：reuse detection 接管"旧 refresh 二次使用"语义——
+    // 第一次 refresh 时 `complete_refresh` 把旧 refresh jti 写黑名单（TTL 至 refresh_exp），
+    // 第二次同 refresh 再调时 phase 1 `is_jti_revoked` 命中，40105 + force_logout，
+    // 而不是 DB version check 的 40103。底层 DB 40103 路径仍然存在但被闸位抢答，
+    // 详见 `refresh_reuse_detection_triggers_force_logout_and_40105` 端到端覆盖。
     let pool = setup().await;
 
     let uid = insert_user_with_password(&pool, "admin", "changeme").await;
@@ -315,7 +320,7 @@ async fn refresh_reusing_old_token_returns_40103() {
     .await;
     assert_eq!(s1, StatusCode::OK);
 
-    // 第二次使用旧 refresh：版本已轮转 → REFRESH_INVALID
+    // 第二次使用旧 refresh：黑名单命中 → SESSION_REVOKED（reuse detection）
     let app3 = test_app(state);
     let (status, env) = send(
         app3,
@@ -328,7 +333,98 @@ async fn refresh_reusing_old_token_returns_40103() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(env["code"], 40103);
+    assert_eq!(
+        env["code"], 40105,
+        "reuse detection 接管旧 refresh 二次使用 → 40105（不是 DB version 40103）: {env}"
+    );
+}
+
+#[tokio::test]
+async fn refresh_reuse_detection_triggers_force_logout_and_40105() {
+    // 2026-09-23 重构：端到端覆盖 refresh rotation + reuse detection + force_logout 全链路。
+    //
+    // 关键断言：
+    // 1. login → 拿 J1 (old_refresh)
+    // 2. refresh(J1) 成功 → 拿 J2_access / J2_refresh（佐证 rotation 写新 session + 旧 jti 黑名单）
+    // 3. GET /me 用 J2_access → 200（佐证 J2 已发新 session，旧 jti 黑名单不影响 J2）
+    // 4. refresh(J1) 再来一次 → 40105（reuse detection 命中 + force_logout）
+    // 5. GET /me 用 J2_access → 40105（佐证 force_logout 清空了 J2 用户的所有 session）
+    //
+    // 必须在 setup_with_redis 而非 setup() 下跑——`is_jti_revoked` 走 Redis 黑名单；
+    // `test_state` 走 test_state_with_redis（建 redis_pool），`setup_with_redis` 调
+    // `clean_redis` 保证 `session:tok:*` 与 `revoked:*` 都是空状态，避免上一个用例残留。
+    let (pool, redis_pool) = setup_with_redis().await;
+
+    let uid = insert_user_with_password(&pool, "admin", "changeme").await;
+    add_role(&pool, uid, "MANAGER", None, None).await;
+
+    let state = common::test_state_with_redis(pool.clone(), redis_pool);
+    let app = test_app(state.clone());
+
+    // 1) login → J1 (old_refresh)
+    let (_, login_env) = login_admin(app, "admin", "changeme").await;
+    let j1 = login_env["data"]["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 2) refresh(J1) → J2_access / J2_refresh
+    let app2 = test_app(state.clone());
+    let (s1, refresh_env) = send(
+        app2,
+        json_request("POST", "/iam/refresh", Some(json!({"refresh_token": j1.clone()})), None),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "第一次 refresh 应成功: {refresh_env}");
+    let j2_access = refresh_env["data"]["token"].as_str().unwrap().to_string();
+    let j2_refresh = refresh_env["data"]["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(j1, j2_refresh, "新 refresh 必须与旧 refresh 不同（rotation 换了 jti）");
+
+    // 3) GET /me 用 J2_access → 200
+    let app3 = test_app(state.clone());
+    let (s2, me_env) = send(app3, json_request("GET", "/iam/me", None, Some(&j2_access))).await;
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "新签发的 J2_access 必须立即可用（佐证 complete_refresh 已写 J2 session）: {me_env}"
+    );
+
+    // 4) refresh(J1) 再来一次 → 40105（reuse detection）
+    let app4 = test_app(state.clone());
+    let (s3, reuse_env) = send(
+        app4,
+        json_request("POST", "/iam/refresh", Some(json!({"refresh_token": j1})), None),
+    )
+    .await;
+    assert_eq!(
+        s3,
+        StatusCode::UNAUTHORIZED,
+        "reuse detection 命中 → 401: {reuse_env}"
+    );
+    assert_eq!(
+        reuse_env["code"], 40105,
+        "reuse detection 走 SESSION_REVOKED（不是 DB version 40103）: {reuse_env}"
+    );
+
+    // 5) GET /me 用 J2_access → 40105（force_logout 已清空所有 session）
+    let app5 = test_app(state);
+    let (s4, me_after_env) = send(
+        app5,
+        json_request("GET", "/iam/me", None, Some(&j2_access)),
+    )
+    .await;
+    assert_eq!(
+        s4,
+        StatusCode::UNAUTHORIZED,
+        "force_logout 必须让 J2_access 也失效 → 401: {me_after_env}"
+    );
+    assert_eq!(
+        me_after_env["code"], 40105,
+        "force_logout 后 /me 必须 40105（黑名单闸 + Redis 主条目都被清）: {me_after_env}"
+    );
 }
 
 // ===========================================================================

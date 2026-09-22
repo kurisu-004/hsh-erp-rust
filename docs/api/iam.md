@@ -135,10 +135,43 @@ Response 200 `data`：同 [`/iam/login`](#post-apiv2iamlogin)
 错误码：
 
 - 40103 REFRESH_INVALID — refresh 失效 / 版本不匹配 / 用户已停用
+- 40105 SESSION_REVOKED — **reuse detection 命中**（见下方 2026-09-23 重构说明）
+
+> 更新于 2026-09-23 重构：refresh token rotation + reuse detection
+>
+> **轮转（rotation）** —— 每次 refresh 成功后：
+>
+> - 服务端把旧 refresh jti 写入 Redis 黑名单 `revoked:<old_refresh_jti>`（空值 + `EX <ttl>`），
+>   TTL = `max(0, old_refresh_exp - now)`，与旧 refresh 自身剩余有效期对齐（最长 7d）。
+> - DB 端 `t_user.refresh_token_version` +1，旧 refresh 因版本不匹配即时作废。
+>
+> **复用检测（reuse detection）** —— 任何时刻同一 refresh token 被再次使用：
+>
+> - 后端在 phase 1 解码 refresh 后立刻查黑名单，命中即视为 token 已被轮转过 → 40105 SESSION_REVOKED。
+> - 进一步触发 `delete_all_user_sessions(user_id)` 强制下线该用户的所有 session（含
+>   access + 其他设备上的 refresh），并打 `tracing::warn!` 日志
+>   `ACCOUNT_SECURITY_EVENT refresh_token_reuse_detected`（含 user_id + jti）。
+> - 闸位在 DB 版本校验之前，保证 40105 不会先被 40103 拦截而成为 dead branch。
+>
+> **access 闸** —— 闸位是**防御性的**：rotation 路径**只**黑名单 refresh jti
+> （`complete_refresh` 调 `revoke_jti(&old_refresh_jti, ttl)`，access jti 不入黑名单）。
+> 因此 `auth::middleware::verify_session_token` 的 `EXISTS revoked:<jti>` 闸
+> 实际只对 refresh jti 命中；access token 在自然 TTL（默认 15min）内仍可用，
+> 与标准 OAuth 行为一致。access 真要立即失效需新增 `/iam/refresh` 请求携带
+> access token 字段并由 rotation 同步黑名单 access jti，本期未做。
+>
+> **部署注意事项**：
+>
+> - 黑名单是新引入的 Redis 数据结构，**无需迁移**；旧条目自然过期（最长 7d）。
+> - `verify_session_token` 的闸位在 Redis 主条目查询之前，会让已 logout 但仍携带旧
+>   access token 的请求直接返 40105（不再走 `cached.user_id != claims.subject` 路径），
+>   客户端语义不变（40105 → 清 token → 跳登录）。
+> - 上线顺序：先发后端 → Redis 启用黑名单 key（前向兼容：黑名单空时闸不命中）→
+>   前端无需配合改动。
 
 ### Session 域错误码补充
 
-- 40105 SESSION_REVOKED — 会话已被吊销（Redis 中不存在 / 已失效）。前端应清除本地 token 并跳回登录页。
+- 40105 SESSION_REVOKED — 会话已被吊销（Redis 中不存在 / 已失效 / refresh reuse detection 命中）。前端应清除本地 token 并跳回登录页。
 
 ---
 
