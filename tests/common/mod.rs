@@ -72,6 +72,18 @@ use std::sync::Arc;
 use std::sync::Once;
 
 use sqlx::PgPool;
+
+// 2026-09-23 重构：RS256 + kid 多密钥轮换。pem 模块提供测试用 2048-bit RSA 密钥对
+// （process 级 OnceLock 缓存 + PEM 字符串导出），三处 JwtConfig 字面量（test_state
+// 系列 + test_state_with_cos）从同源 pem 派生 private_key / public_keys，
+// 集成测试签发的 access / refresh token 与服务端解码端共享同一密钥材料。
+//
+// ⚠️ 必须是 `pub mod pem`，不能是 `mod pem` —— tests/auth_middleware.rs 等
+// integration test binary 顶层需要 `use common::pem;` 拿到同一份模块实例（共享
+// OnceLock），若 mod.rs 用私有 mod，二进制顶层需要 `#[path = "common/pem.rs"]
+// mod pem;` 引入第二个 pem 实例 → 两套独立 OnceLock → 签发与验签用不同 keypair
+// → 40100 InvalidSignature。
+pub mod pem;
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 
@@ -315,6 +327,10 @@ fn test_database_url() -> String {
 }
 
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
+///
+/// 2026-09-23 重构：HS256 fallback 过渡期仍占用（`allow_hs256_fallback=true`
+/// 时 JWT_SECRET 必填，decode 端走 secret 验签历史 HS256 token）；下轮 cleanup
+/// PR 删除 secret 字段 + fallback 路径。
 const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
 
 /// 测试用 Redis URL：默认连 `redis-test` 容器（端口6380），db index 用测试
@@ -468,6 +484,26 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             audience: "hsh-erp-rust-test".to_string(),
             access_ttl_seconds: 900,
             refresh_ttl_days: 7,
+            // 2026-09-23 重构：RS256 + kid 多密钥轮换。signing_kid = "current"
+            // 与 pem 模块 DEFAULT_KID 对齐；public_keys 字典装入 (kid, pub_pem)
+            // 多对（current + next），与生产 JwtConfig 同结构。private_key 从
+            // pem 模块缓存的 PKCS#8 PEM 派生。allow_hs256_fallback=true 与
+            // 生产默认对齐（JWT_SECRET 仍被 decode 端用于 fallback 验签）。
+            signing_kid: "current".into(),
+            private_key: jsonwebtoken::EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
+                .expect("test private pem"),
+            public_keys: {
+                let mut m = std::collections::BTreeMap::new();
+                for (kid, pem_str) in pem::test_public_kids() {
+                    m.insert(
+                        kid.to_string(),
+                        jsonwebtoken::DecodingKey::from_rsa_pem(pem_str.as_bytes())
+                            .expect("test public pem"),
+                    );
+                }
+                m
+            },
+            allow_hs256_fallback: true,
         },
         cos: CosConfig {
             // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
@@ -545,6 +581,44 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     ))
 }
 
+/// 2026-09-23 review #1 新增 fixture：构造 `allow_hs256_fallback=false` 的
+/// `AppState`，其它字段与 `test_state_with_redis` 完全一致。
+///
+/// 用法：`tests/auth_middleware.rs::hs256_rejected_when_fallback_off_returns_40100`
+/// —— 验证 `verify_session_token` / `decode_refresh` 在 fallback 关闭时把
+/// hs256_fallback_secret 传 `None`，HS256 + 空 secret 的 token 一律 40100
+/// "HS256 not allowed"（而不是 `DecodingKey::from_secret(b"")` 走空 HMAC bypass）。
+///
+/// 实现：`Arc::make_mut(&mut state.config)` —— 我们是 AppState 的唯一 Arc 持有者，
+/// `config: Arc<AppConfig>` 也只被本 AppState 引用，copy-on-write 安全；
+/// 直接修改 `.jwt.allow_hs256_fallback = false` 即可，不重建 services（service
+/// 字段对 JWT 配置无依赖：JwtConfig 改造只影响 encode/decode，session_service
+/// 只在 login/refresh 时透传给 jwt 函数，重建 service 字段无谓增加复杂度）。
+#[allow(dead_code)]
+pub async fn test_state_with_hs256_fallback_off(pool: PgPool) -> Arc<AppState> {
+    let redis_pool = test_redis_pool().await;
+    let mut state = test_state_with_redis(pool, redis_pool);
+    // state.config 在 SessionService::new 内被 .clone() —— 共享强计数 > 1，
+    // `Arc::get_mut(&mut state.config)` 会 panic。改走「构造新 config 替换」路径：
+    // 1. 拿到唯一 state Arc（Arc::get_mut 在 state 上是 unique 的）
+    // 2. 替换 state_inner.config 为新 Arc<AppConfig>（allow_hs256_fallback=false）
+    // 3. session_service 仍持有旧 config —— 但本 fixture 仅走 auth_middleware 路径
+    //    （不被 login/refresh 调用），不影响测试断言；HS256 fallback 关闸逻辑
+    //    完全由 state.config.jwt.allow_hs256_fallback 控制（见
+    //    `verify_session_token` 与 `iam::service::session::refresh` 的 hs256 分支透传）。
+    let state_inner = Arc::get_mut(&mut state).expect("state Arc 必须 unique");
+    let old_cfg = (*state_inner.config).clone();
+    let new_cfg = Arc::new(AppConfig {
+        jwt: JwtConfig {
+            allow_hs256_fallback: false,
+            ..old_cfg.jwt.clone()
+        },
+        ..old_cfg
+    });
+    state_inner.config = new_cfg;
+    state
+}
+
 /// service 单元测试 fixture：显式注入 `NoopSessionStore` + `NoopUploadSessionRepo`，
 /// 不依赖 Redis 进程存在。
 ///
@@ -562,6 +636,22 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             audience: "hsh-erp-rust-test".to_string(),
             access_ttl_seconds: 900,
             refresh_ttl_days: 7,
+            // 2026-09-23 重构：RS256 + kid（与 test_state_with_redis 同形）
+            signing_kid: "current".into(),
+            private_key: jsonwebtoken::EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
+                .expect("test private pem"),
+            public_keys: {
+                let mut m = std::collections::BTreeMap::new();
+                for (kid, pem_str) in pem::test_public_kids() {
+                    m.insert(
+                        kid.to_string(),
+                        jsonwebtoken::DecodingKey::from_rsa_pem(pem_str.as_bytes())
+                            .expect("test public pem"),
+                    );
+                }
+                m
+            },
+            allow_hs256_fallback: true,
         },
         cos: CosConfig {
             // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
@@ -672,6 +762,22 @@ pub async fn test_state_with_cos(
             audience: "hsh-erp-rust-test".to_string(),
             access_ttl_seconds: 900,
             refresh_ttl_days: 7,
+            // 2026-09-23 重构：RS256 + kid（与前两处同形）
+            signing_kid: "current".into(),
+            private_key: jsonwebtoken::EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
+                .expect("test private pem"),
+            public_keys: {
+                let mut m = std::collections::BTreeMap::new();
+                for (kid, pem_str) in pem::test_public_kids() {
+                    m.insert(
+                        kid.to_string(),
+                        jsonwebtoken::DecodingKey::from_rsa_pem(pem_str.as_bytes())
+                            .expect("test public pem"),
+                    );
+                }
+                m
+            },
+            allow_hs256_fallback: true,
         },
         cos: CosConfig {
             // 2026-09-20 迁移清理：删 `sts_duration_seconds`；backend 从 `CosSdk` 改为 `OpenDal`。
