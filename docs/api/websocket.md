@@ -25,6 +25,12 @@ Request：
 握手流程：
 
 1. 解 JWT + 验签（`iss` 绑定 `config.jwt.issuer`，`exp` 校验）。
+
+> 2026-09-23 重构：RS256 + kid —— JWT 签名算法由 HS256 切到 RS256，header.kid
+> 按 `JWT_SIGNING_KID` env 路由公钥字典（`JWT_PUBLIC_KEYS_DIR` 目录扫描 `*.pem`，
+> kid = 文件名去后缀）；HS256 仅作 fallback（`JWT_ALLOW_HS256_FALLBACK=true`）。
+> 详见 `index.md` "JWT 签名算法与 kid" 段。前端无感（payload 字段不变）。
+
 2. 服务端强制 session 校验：查 Redis `session:tok:<jti>` 必须存在；缺失 → 40105 `SESSION_REVOKED`。
    （2026-09-23 重构：Redis session key 由 sha256(token) 改为 JWT claims.jwt_id（UUID v4），
    直接以 jti 作为 key 后缀，**不**对 token 做哈希。）

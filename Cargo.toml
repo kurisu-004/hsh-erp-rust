@@ -174,6 +174,20 @@ calamine = "0.26"
 # 锁定避免版本漂移；tokio 未引用时 [dev-dependencies] 仍正常解析。
 libc = "0.2"
 
+# 2026-09-23 重构：JWT 切 RS256 + kid 多密钥轮换。tests/common/pem.rs 在每个
+# 测试进程首调 `test_private_pem()` / `test_public_pem()` 时用 rsa crate 生成
+# 2048-bit RSA 密钥对（OnceLock 缓存，过程内不写磁盘）。`pem` feature 启
+# `to_pkcs8_pem` / `to_public_key_pem` 走 PEM 输出，与 jsonwebtoken 的
+# `EncodingKey::from_rsa_pem` / `DecodingKey::from_rsa_pem` 配套。
+# 生产构建**不**引入 rsa（dev-only）。
+rsa = { version = "0.9", features = ["pem"] }
+
+# 2026-09-23 重构：tests/auth_middleware.rs 的 `protected_endpoint_with_alg_none_returns_40100`
+# 负向用例手工拼 alg=none 的 JWT（header / payload base64url），避免引 `jsonwebtoken`
+# 库（其 0.10 起已禁 alg=none 的 encode，构造不出来）。base64 已是传递依赖
+# （opendal / reqwest 等），但显式声明避免 union features 漂移。
+base64 = "0.22"
+
 # ---------------------------------------------------------------------------------
 # P0 spike bin 已删除（迁移到 src/modules/delivery_note/print.rs）。
 # ---------------------------------------------------------------------------------

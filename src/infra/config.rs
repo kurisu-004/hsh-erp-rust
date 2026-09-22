@@ -1,10 +1,13 @@
 //! 应用配置：dotenvy 加载 .env 后从 std::env 读取
 //! 对应 Python myERP/core/config.py
 
+use std::collections::BTreeMap;
 use std::env;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
+use jsonwebtoken::{DecodingKey, EncodingKey};
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -49,8 +52,21 @@ pub struct RedisConfig {
     pub pool_max_size: usize,
 }
 
+/// JWT 配置（2026-09-22 增 audience 字段 + 2026-09-23 重构 RS256 + kid）
+///
+/// ## 2026-09-23 重构要点（HS256 → RS256 + kid）
+/// - `signing_kid` / `private_key` / `public_keys` / `allow_hs256_fallback` 4 字段
+///   本轮新增，详见字段 doc。
+/// - `secret` 字段保留：HS256 fallback 过渡期 decode 端仍按 `allow_hs256_fallback=true`
+///   走 secret 验签；签发端永不产出 HS256 token。下轮 cleanup PR 删除 secret + fallback 路径。
+/// - 启动期严格校验：`JWT_PRIVATE_KEY_PATH` / `JWT_PUBLIC_KEYS_DIR` / `signing_kid ∈ public_keys`
+///   任何一项缺失或格式错误即 bail（fail-fast，避免运行时才发现签不出/发不出对应 kid）。
 #[derive(Clone, Debug)]
 pub struct JwtConfig {
+    /// 2026-09-23 重构：HS256 fallback 过渡期仍占用。**签发端不再使用**（encode 强制
+    /// RS256），仅作为 `decode_access` / `decode_refresh` 在 `allow_hs256_fallback=true`
+    /// 时对历史 HS256 token 的验签 secret。环境变量 `JWT_SECRET`，仅在
+    /// `allow_hs256_fallback=true` 时必填；下轮 cleanup PR 删除。
     pub secret: String,
     pub issuer: String,
     /// JWT `aud` 校验目标（2026-09-22 新增：删 Python v1 兼容后 Rust 自签 token 强绑定 audience）。
@@ -58,6 +74,22 @@ pub struct JwtConfig {
     pub audience: String,
     pub access_ttl_seconds: i64,
     pub refresh_ttl_days: i64,
+    /// 2026-09-23 重构：RS256 + kid 多密钥轮换。
+    ///
+    /// - `signing_kid`：签发端写入 header.kid 的值；环境变量 `JWT_SIGNING_KID`，缺省 `current`。
+    ///   必须出现在 `public_keys` 字典里（启动期校验：避免签发端 kid 找不到对应公钥）。
+    /// - `private_key`：从 `JWT_PRIVATE_KEY_PATH`（必填）读 PEM 后构造的 `EncodingKey`。
+    ///   生产构建中这是 RS256 私钥；签发端不再走 HS256 secret。
+    /// - `public_keys`：从 `JWT_PUBLIC_KEYS_DIR`（必填）目录扫描 `*.pem`，kid = 文件名
+    ///   去后缀（同一目录 kid 必须唯一）。`BTreeMap` 保证按 kid 字典序遍历，便于审计。
+    /// - `allow_hs256_fallback`：环境变量 `JWT_ALLOW_HS256_FALLBACK`，缺省 `true`；
+    ///   `true` 时 `secret` 必填且 `decode_access` / `decode_refresh` 接受 HS256 token
+    ///   走 `secret` 验签；`false` 时仅 RS256。HS256 fallback 段写明过渡期保留，
+    ///   下轮 cleanup PR 删除。
+    pub signing_kid: String,
+    pub private_key: EncodingKey,
+    pub public_keys: BTreeMap<String, DecodingKey>,
+    pub allow_hs256_fallback: bool,
 }
 
 /// COS 客户端 backend 选择（2026-09-20 spike 新增，2026-09-20 迁移清理后只保留两路）。
@@ -177,13 +209,59 @@ impl AppConfig {
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3000"),
             max_request_body_size: env_parse("MAX_REQUEST_BODY_SIZE", 300 * 1024 * 1024)?,
 
-            jwt: JwtConfig {
-                secret: env_required("JWT_SECRET")?,
-                issuer: env_or("JWT_ISSUER", "myerp"),
-                // 2026-09-22 新增：audience 强校验（删 Python v1 兼容后改回硬绑定）。
-                audience: env_or("JWT_AUDIENCE", "hsh-erp-rust"),
-                access_ttl_seconds: env_parse("JWT_ACCESS_TOKEN_EXPIRE_SECONDS", 900)?,
-                refresh_ttl_days: env_parse("JWT_REFRESH_TOKEN_EXPIRE_DAYS", 7)?,
+            jwt: {
+                // 2026-09-23 重构：RS256 + kid 多密钥轮换。
+                //
+                // 加载规则：
+                // 1. JWT_PRIVATE_KEY_PATH（必填）→ fs::read → EncodingKey::from_rsa_pem
+                //    失败即 bail（缺私钥签不出 token）
+                // 2. JWT_PUBLIC_KEYS_DIR（必填）→ fs::read_dir 扫描 *.pem，kid = 文件名去
+                //    后缀；kid 唯一性校验；目录不存在 bail
+                // 3. JWT_SIGNING_KID 必须在 public_keys 字典内（启动期断言：签发端
+                //    kid 必须有对应公钥），缺失 bail
+                // 4. JWT_ALLOW_HS256_FALLBACK=true（默认）：保留 HS256 fallback 能力，
+                //    此时 JWT_SECRET 仍必填（decode 走 secret 验签）；false：仅 RS256，
+                //    JWT_SECRET 可省略（HS256 token 一律 40100）
+                //
+                // HS256 fallback 段：过渡期保留——decode_access / decode_refresh 按
+                // header.alg 分支，HS256 仅在 allow_hs256_fallback=true 且
+                // hs256_fallback_secret.is_some() 时走 secret 验签；签发端永不产出
+                // HS256 token。下轮 cleanup PR（next iteration）删除 secret 字段 +
+                // fallback 路径。
+                let private_key_path = env_required("JWT_PRIVATE_KEY_PATH")?;
+                let private_key = load_private_key(&private_key_path)
+                    .with_context(|| format!("加载 JWT 私钥失败 ({private_key_path})"))?;
+                let public_keys_dir = env_required("JWT_PUBLIC_KEYS_DIR")?;
+                let public_keys = load_public_keys_dir(&public_keys_dir)
+                    .with_context(|| format!("扫描 JWT 公钥目录失败 ({public_keys_dir})"))?;
+                let signing_kid = env_or("JWT_SIGNING_KID", "current");
+                if !public_keys.contains_key(&signing_kid) {
+                    return Err(anyhow!(
+                        "JWT_SIGNING_KID={signing_kid:?} 不在 JWT_PUBLIC_KEYS_DIR={public_keys_dir:?} \
+                         扫描出的公钥字典中（kid = PEM 文件名去后缀）。请检查 env 配置或 \
+                         把 {signing_kid}.pem 放进公钥目录"
+                    ));
+                }
+                let allow_hs256_fallback = env_bool("JWT_ALLOW_HS256_FALLBACK", true)?;
+                // secret 在 HS256 fallback=true 时仍必填；false 时允许省略。
+                let secret = if allow_hs256_fallback {
+                    env_required("JWT_SECRET").context(
+                        "JWT_ALLOW_HS256_FALLBACK=true 时 JWT_SECRET 必填（HS256 fallback 用）",
+                    )?
+                } else {
+                    env::var("JWT_SECRET").unwrap_or_default()
+                };
+                JwtConfig {
+                    secret,
+                    issuer: env_or("JWT_ISSUER", "myerp"),
+                    audience: env_or("JWT_AUDIENCE", "hsh-erp-rust"),
+                    access_ttl_seconds: env_parse("JWT_ACCESS_TOKEN_EXPIRE_SECONDS", 900)?,
+                    refresh_ttl_days: env_parse("JWT_REFRESH_TOKEN_EXPIRE_DAYS", 7)?,
+                    signing_kid,
+                    private_key,
+                    public_keys,
+                    allow_hs256_fallback,
+                }
             },
 
             cos: {
@@ -348,6 +426,72 @@ pub fn build_redis_url() -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// 从 PEM 文件加载 RS256 私钥 → `jsonwebtoken::EncodingKey`。
+///
+/// 2026-09-23 重构：JWT_PRIVATE_KEY_PATH 指向单个 PEM 文件（PKCS#8 / PKCS#1
+/// 都可，jsonwebtoken 内部自动识别）。
+fn load_private_key(path: &str) -> Result<EncodingKey> {
+    let pem_bytes = fs::read(path)
+        .with_context(|| format!("读取文件失败 {path}（确认 JWT_PRIVATE_KEY_PATH 路径正确）"))?;
+    EncodingKey::from_rsa_pem(&pem_bytes)
+        .with_context(|| format!("PEM 解析失败 {path}（确认是 RS256 私钥 PKCS#8 / PKCS#1 格式）"))
+}
+
+/// 扫描 `JWT_PUBLIC_KEYS_DIR` 目录所有 `*.pem` 文件，构建 `BTreeMap<kid, DecodingKey>`。
+///
+/// kid = 文件名去后缀（例：`/keys/public/current.pem` → kid = `"current"`）。
+/// 同目录 kid 必须唯一（重复 → bail）。
+/// 目录不存在或非目录 → bail；空目录 → 启动失败（必须有公钥才能验签）。
+fn load_public_keys_dir(dir: &str) -> Result<BTreeMap<String, DecodingKey>> {
+    let dir_path = Path::new(dir);
+    if !dir_path.is_dir() {
+        return Err(anyhow!(
+            "JWT_PUBLIC_KEYS_DIR 指向的路径不是目录或不存在: {dir}"
+        ));
+    }
+    let mut map: BTreeMap<String, DecodingKey> = BTreeMap::new();
+    for entry in fs::read_dir(dir_path)
+        .with_context(|| format!("读取目录失败 {dir}（确认 JWT_PUBLIC_KEYS_DIR 可访问）"))?
+    {
+        let entry = entry.with_context(|| format!("读取目录项失败 {dir}"))?;
+        let path = entry.path();
+        // 只处理 *.pem（大小写不敏感；linux fs 默认大小写敏感，这里只匹配 .pem / .PEM）
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if !ext.eq_ignore_ascii_case("pem") {
+            continue;
+        }
+        // 文件名去后缀 = kid
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem.is_empty() {
+            continue;
+        }
+        if map.contains_key(stem) {
+            return Err(anyhow!(
+                "JWT_PUBLIC_KEYS_DIR={dir} 含重复 kid={stem:?}（文件名去后缀必须唯一）"
+            ));
+        }
+        let pem_bytes = fs::read(&path)
+            .with_context(|| format!("读取 PEM 文件失败 {}", path.display()))?;
+        let key = DecodingKey::from_rsa_pem(&pem_bytes).with_context(|| {
+            format!(
+                "PEM 解析失败 {}（确认是 RS256 公钥 SPKI 格式）",
+                path.display()
+            )
+        })?;
+        map.insert(stem.to_string(), key);
+    }
+    if map.is_empty() {
+        return Err(anyhow!(
+            "JWT_PUBLIC_KEYS_DIR={dir} 目录无 *.pem 公钥文件（至少 1 枚才能验签）"
+        ));
+    }
+    Ok(map)
 }
 
 fn env_required(key: &str) -> Result<String> {
