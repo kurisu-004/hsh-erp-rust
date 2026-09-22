@@ -15,6 +15,9 @@ mod account;
 mod menu;
 mod session;
 
+#[cfg(test)]
+mod tests;
+
 pub use account::{AccountService, DEFAULT_RESET_PASSWORD, role_as_str};
 pub use menu::build_menu_tree;
 pub use session::SessionService;
