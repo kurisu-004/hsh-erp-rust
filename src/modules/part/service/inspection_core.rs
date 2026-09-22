@@ -5,13 +5,11 @@
 //! 三个 core 与 `inspection.rs` 里的薄 wrapper / 批量聚合器同属 `impl PartService`，
 //! 分文件不改变可见性与调用方式（与 `worker_scan.rs` 同一模式）。
 
-use sqlx::PgConnection;
-
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::model::{NewPartEvent, TPartInspected};
-use crate::modules::part::repo::PartRepo;
+use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part_batch::model::TPartBatch;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
@@ -41,8 +39,8 @@ impl PartService {
     /// - 20109 `BIZ_PART_BATCH_NOT_FOUND` —— 找不到 INSPECTION 批次 / 多批歧义
     /// - 20111 `BIZ_PART_BATCH_INVALID_QUANTITY`
     /// - 40901 `VERSION_CONFLICT`
-    pub async fn to_ship_core(
-        conn: &mut PgConnection,
+    pub async fn to_ship_core<R: PartRepoTrait>(
+        repo: &mut R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         batch_id: i64,
@@ -51,7 +49,7 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
         // 1. 读 part
-        let part: TPartInspected = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let part: TPartInspected = repo.get_part_inspected(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -78,7 +76,7 @@ impl PartService {
         // 3. 定位目标 INSPECTION 批次
         let bid_hint = Some(batch_id);
         let target: TPartBatch =
-            match PartRepo::find_inprocess_batch_for_part(&mut *conn, part_id, bid_hint).await {
+            match repo.find_inprocess_batch_for_part(part_id, bid_hint).await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     return Err(AppError::biz(
@@ -105,11 +103,10 @@ impl PartService {
         // 4. 部分通过拆批（如需要）
         let operated_quantity = quantity.unwrap_or(target.quantity);
         let (operated_id, operated_version, new_batch_id_out) =
-            Self::_split_for_partial_op(&mut *conn, snowflake, &target, quantity, current).await?;
+            Self::_split_for_partial_op(repo, snowflake, &target, quantity, current).await?;
 
         // 5. UPDATE t_part_batch: INSPECTION → READY_TO_SHIP（OCC + 写 updated_by）
-        let n = PartRepo::mark_batch_passed_inspection(
-            &mut *conn,
+        let n = repo.mark_batch_passed_inspection(
             operated_id,
             operated_version,
             Some(current.id),
@@ -124,8 +121,7 @@ impl PartService {
 
         // 6. 写 t_part_event 事件日志（无条件）
         let event_id = snowflake.next_id();
-        PartRepo::insert_part_event(
-            &mut *conn,
+        repo.insert_part_event(
             NewPartEvent {
                 id: event_id,
                 part_id,
@@ -146,14 +142,14 @@ impl PartService {
         //    内部走 min-progress 规则（多条 INSPECTION 批次时 part 维持
         //    INSPECTION，单条时升 READY_TO_SHIP）；status 变化时级联调
         //    AssemblyService::sync_from_part_change 闭合链路。
-        let synced = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
+        let synced = PartService::sync_from_batch_change(repo, part_id, current).await?;
         let synced_assembly_id = match synced {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
         };
 
         // 8. 重读返回
-        let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let fresh = repo.get_part_inspected(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished"))
@@ -186,8 +182,8 @@ impl PartService {
     /// - 20512 `BIZ_SHELF_INACTIVE`
     /// - 40901 `VERSION_CONFLICT`
     #[allow(clippy::too_many_arguments)]
-    pub async fn to_process_core(
-        conn: &mut PgConnection,
+    pub async fn to_process_core<R: PartRepoTrait>(
+        repo: &mut R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         shelf_id: i64,
@@ -199,7 +195,7 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
         // 1. 读 part
-        let part: TPartInspected = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let part: TPartInspected = repo.get_part_inspected(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -222,11 +218,11 @@ impl PartService {
             ));
         }
         // 3. 校验 shelf（PRODUCTION 区 + active）
-        Self::_validate_production_shelf_and_process(&mut *conn, shelf_id, next_process_id).await?;
+        Self::_validate_production_shelf_and_process(repo, shelf_id, next_process_id).await?;
         // 4. 定位目标 INSPECTION 批次
         let bid_hint = Some(batch_id);
         let target: TPartBatch =
-            match PartRepo::find_inspection_batch_for_fail(&mut *conn, part_id, bid_hint).await {
+            match repo.find_inspection_batch_for_fail(part_id, bid_hint).await {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     return Err(AppError::biz(
@@ -246,7 +242,7 @@ impl PartService {
         Self::_assert_batch_version(&target, expected_batch_version)?;
         // 5. 部分通过拆批
         let (operated_id, operated_version, new_batch_id_out) =
-            Self::_split_for_partial_op(&mut *conn, snowflake, &target, quantity, current).await?;
+            Self::_split_for_partial_op(repo, snowflake, &target, quantity, current).await?;
         // 6. UPDATE t_part_batch: INSPECTION → IN_PROCESS + location/holder/process
         // PR-3 批次 step 化：解析 step_id（chain 内 process_id → step_id）。
         // 注意：part 存在性已在 step 1（PartRepo::get_part_inspected）确认，
@@ -255,7 +251,7 @@ impl PartService {
             "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(part_id)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(repo.conn_mut())
         .await?;
         let chain_id = match row {
             None => {
@@ -273,7 +269,7 @@ impl PartService {
             Some((Some(cid),)) => cid,
         };
         let step_id =
-            ProcessChainRepo::resolve_step_id_by_process(&mut *conn, chain_id, next_process_id)
+            ProcessChainRepo::resolve_step_id_by_process(repo.conn_mut(), chain_id, next_process_id)
                 .await?
                 .ok_or_else(|| {
                     AppError::biz(
@@ -284,8 +280,7 @@ impl PartService {
                         ),
                     )
                 })?;
-        let n = PartRepo::mark_batch_failed_inspection(
-            &mut *conn,
+        let n = repo.mark_batch_failed_inspection(
             operated_id,
             operated_version,
             shelf_id,
@@ -301,8 +296,7 @@ impl PartService {
         }
         // 7. 写事件日志
         let event_id = snowflake.next_id();
-        PartRepo::insert_part_event(
-            &mut *conn,
+        repo.insert_part_event(
             NewPartEvent {
                 id: event_id,
                 part_id,
@@ -321,13 +315,13 @@ impl PartService {
         // 8. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
         //    内部走 min-progress 规则；status 变化时级联调
         //    AssemblyService::sync_from_part_change 闭合链路。
-        let synced = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
+        let synced = PartService::sync_from_batch_change(repo, part_id, current).await?;
         let synced_assembly_id = match synced {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
         };
         // 9. 重读返回
-        let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let fresh = repo.get_part_inspected(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished"))
@@ -382,8 +376,8 @@ impl PartService {
     // quantity / note 等必要输入，与 `to_ship_core` 同形；将它们打包为
     // `ToInspectionCoreArgs` 结构体收益微薄、调用面广，重构 ROI 低，故豁免。
     #[allow(clippy::too_many_arguments)]
-    pub async fn to_inspection_core(
-        conn: &mut PgConnection,
+    pub async fn to_inspection_core<R: PartRepoTrait>(
+        repo: &mut R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         target_inspection_shelf_id: i64,
@@ -395,9 +389,9 @@ impl PartService {
     ) -> Result<ToXxxOut, AppError> {
         // 1. 校验品检架（target_inspection_shelf）
         let target_shelf =
-            Self::_validate_inspection_shelf(&mut *conn, target_inspection_shelf_id).await?;
+            Self::_validate_inspection_shelf(repo, target_inspection_shelf_id).await?;
         // 2. 读 part
-        let part: TPartInspected = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let part: TPartInspected = repo.get_part_inspected(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -416,7 +410,7 @@ impl PartService {
             ));
         }
         // 5. 定位目标批次（先于 IN_PROCESS 组合校验，以便直接读 target_batch.location）
-        let target = Self::_resolve_scan_target_batch(&mut *conn, part_id, Some(batch_id)).await?;
+        let target = Self::_resolve_scan_target_batch(repo, part_id, Some(batch_id)).await?;
         // 5.5 caller 侧乐观锁：锚定 batch 而非 part
         Self::_assert_batch_version(&target, expected_batch_version)?;
         // 4（PR-2 重排后）IN_PROCESS 组合校验：工人持有件 / 非生产架件拒绝
@@ -450,15 +444,14 @@ impl PartService {
         }
         // 6. 部分通过拆批
         let (operated_id, operated_version, new_batch_id_out) =
-            Self::_split_for_partial_op(&mut *conn, snowflake, &target, quantity, current).await?;
+            Self::_split_for_partial_op(repo, snowflake, &target, quantity, current).await?;
         // 7. UPDATE t_part_batch: {PENDING, PROGRAMMING, IN_PROCESS} → INSPECTION
         //
         // 隐式多批次 rollup：前置状态守卫（step 3）已限定 from ∈ {PENDING, PROGRAMMING,
         // IN_PROCESS}，该状态下不可能存在 INSPECTION 批次，翻转 `t_part.status` 安全；
         // 翻 batch 后调 `PartService::sync_from_batch_change`（下方 step 8）按
         // min-progress 规则回填 part 派生列。
-        let n = PartRepo::mark_batch_inspected(
-            &mut *conn,
+        let n = repo.mark_batch_inspected(
             operated_id,
             operated_version,
             target_shelf.id,
@@ -474,7 +467,7 @@ impl PartService {
         // 8. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
         //    内部走 min-progress 规则；status 变化时级联调
         //    AssemblyService::sync_from_part_change 闭合链路。
-        let synced = PartService::sync_from_batch_change(&mut *conn, part_id, current).await?;
+        let synced = PartService::sync_from_batch_change(repo, part_id, current).await?;
         let synced_assembly_id = match synced {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
@@ -487,8 +480,7 @@ impl PartService {
             PartStatus::IN_PROCESS => format!("送检：来自生产架 → 品检架 {}", target_shelf.code),
             _ => format!("送检 → 品检架 {}", target_shelf.code),
         };
-        PartRepo::insert_part_event(
-            &mut *conn,
+        repo.insert_part_event(
             NewPartEvent {
                 id: event_id,
                 part_id,
@@ -505,7 +497,7 @@ impl PartService {
         )
         .await?;
         // 10. 重读返回
-        let fresh = PartRepo::get_part_inspected(&mut *conn, part_id)
+        let fresh = repo.get_part_inspected(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} vanished"))

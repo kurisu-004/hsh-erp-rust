@@ -21,14 +21,18 @@
 //!   → LEFT JOIN t_process_chain_step s ON s.id = step_id → s.process_id
 //! - 派生列实际写入：service 层用 step JOIN 取 process_id 后写入 t_part.next_process_id
 //! - 多个 batch 共享同一 step 时去重（典型场景：拆分前的同一 step 上下文）
+//!
+//! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
+//! `impl for &mut PgConnection`）。inline sqlx 查询（`t_process_chain_step` 不属于
+//! PartRepoTrait 范围）经 `repo.conn_mut()` 走——trait 自带 `conn_mut()` 方法
+//! 返回 `&mut PgConnection`（sqlx Executor）。
 
 use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
-use crate::modules::part::repo::PartRepo;
+use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::{BatchForRollup, compute_part_target};
-use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::PartService;
@@ -55,13 +59,21 @@ impl PartService {
     /// - step_id 与 process_id 1:1 对应（同 chain 内 step.process_id 唯一），
     ///   故纯函数 `compute_part_target` 搬运 step_id 再做语义对齐；
     ///   实际写入时已转回 process_id（caller 透传）
-    pub async fn sync_from_batch_change(
-        conn: &mut PgConnection,
+    ///
+    /// 签名收 `&mut R: PartRepoTrait`（而非 `R` by-value）——本方法是 service 层
+    /// helper（lifecycle / worker_scan 在 mid-method 调用后仍需继续用 repo），不
+    /// 对 handler 暴露。caller 借 `&mut repo` 传入即可继续使用。
+    ///
+    /// inline sqlx 查询（`t_process_chain_step` 不属于 PartRepoTrait 范围）经
+    /// `repo.conn_mut()` 走——生产 `R = &mut PgConnection` 时 `repo: &mut &mut PgConnection`，
+    /// `repo.conn_mut()` 由 Rust auto-deref + reborrow 得到 `&mut PgConnection`（sqlx Executor）。
+    pub async fn sync_from_batch_change<R: PartRepoTrait>(
+        repo: &mut R,
         part_id: i64,
         current: &CurrentUser,
     ) -> Result<SyncOutcome, AppError> {
         // 1. 拉 part 全部活跃批次（rollup 只看活跃行）。
-        let batches = PartBatchRepo::list_active_by_part_id(&mut *conn, part_id).await?;
+        let batches = repo.part_batch_list_active_by_part_id(part_id).await?;
 
         // 2. 投影到 `BatchForRollup`（仅 rollup 所需 4 列；避免引入完整
         //    `TPartBatch` 让纯函数测试受阻）。
@@ -87,7 +99,8 @@ impl PartService {
 
         // 4. 读 part 当前 rollup 状态（status + next_process_id，2 列）。
         //    2026-09-16 PR-2 瘦身：location / current_holder_id / placed_at 列已删。
-        let cur = PartRepo::get_part_rollup_state(&mut *conn, part_id)
+        let cur = repo
+            .get_part_rollup_state(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -105,7 +118,7 @@ impl PartService {
                  WHERE id = $1 AND deleted_at IS NULL",
             )
             .bind(step_id)
-            .fetch_optional(&mut *conn)
+            .fetch_optional(repo.conn_mut())
             .await?;
             row.map(|(pid,)| pid)
         } else {
@@ -120,14 +133,9 @@ impl PartService {
 
         // 7. 派生写：`WHERE id=$1 AND deleted_at IS NULL`（**不走 OCC 冲突**，
         //    并发 rollup 由 SQL 行锁串行化；version 仍 += 1）。
-        let affected = PartRepo::update_part_rollup(
-            &mut *conn,
-            part_id,
-            &target.status,
-            derived_next_process_id,
-            current.id,
-        )
-        .await?;
+        let affected = repo
+            .update_part_rollup(part_id, &target.status, derived_next_process_id, current.id)
+            .await?;
         if affected == 0 {
             // 防御：part 在两次 select 之间被并发软删（极端并发）。整体事务回滚
             // 由 caller 决定 —— 此处返回 NoChange 让 caller 不重试。
@@ -137,10 +145,28 @@ impl PartService {
         // 8. part.status 实际变化 → 调 AssemblyService::sync_from_part_change
         //    闭合链路；返回其 SyncOutcome（可能 Changed/ NoChange）。
         if cur.status != target.status {
-            return AssemblyService::sync_from_part_change(&mut *conn, part_id, current).await;
+            return AssemblyService::sync_from_part_change(repo.conn_mut(), part_id, current).await;
         }
         // status 没变但 next_process_id 物化了 —— 仍算派生写成功，返回
         // Changed(part_id) 供 handler 决定是否广播。
         Ok(SyncOutcome::Changed(part_id))
+    }
+
+    /// 跨域 / 旧路径兼容入口（`conn: &mut PgConnection` → `<&mut PgConnection as PartRepoTrait>`）。
+    ///
+    /// 由 worker_pool / delivery_note / delivery_group 等**非 part 域** service 调用；
+    /// 这些域内部 service 签名仍是 `&mut PgConnection` 直传，没有 `repo: R` 借位。
+    /// 通过此薄壳手动指定 `<&mut PgConnection>` 实例化 trait 泛型，避免外部 caller
+    /// 写 `&mut &mut *conn` 这种双层 deref。
+    ///
+    /// part 域内部 lifecycle / worker_scan / phase1 全部走主入口（`repo: &mut R`），
+    /// 借 `&mut *tx` 继续使用同一 tx 即可，无需本壳。
+    pub async fn sync_from_batch_change_with_conn(
+        conn: &mut PgConnection,
+        part_id: i64,
+        current: &CurrentUser,
+    ) -> Result<SyncOutcome, AppError> {
+        let mut conn = conn;
+        Self::sync_from_batch_change::<&mut PgConnection>(&mut conn, part_id, current).await
     }
 }

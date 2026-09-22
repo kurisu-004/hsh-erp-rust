@@ -2,7 +2,9 @@
 //!
 //! 对应 Python myERP/service/part_service.py 中三个 inspection 流的实现（已统一为
 //! to_ship / to_inspection / to_process 模型）。
-//! 实施约定：方法签名接收 `&mut PgConnection`，由 handler 开 tx 并 commit。
+//! 实施约定：方法签名 `<R: PartRepoTrait>(mut repo: R, ...)`（2026-09-22 D-6），
+//! 由 handler 开 tx 并 commit；生产 `R = &mut PgConnection`，跨域 repo 与
+//! inline sqlx 走 `repo.conn_mut()`（Rust auto-deref + reborrow 拿到 `&mut PgConnection`）。
 //!
 //! 三个 `*_core` 共享核心已拆到 `inspection_core.rs`（impl 块拆文件；与
 //! `worker_scan.rs` 同一模式）；本文件只留薄 wrapper / 批量聚合器与共享私有
@@ -35,11 +37,9 @@
 //! - 40001 `VALIDATION_ERROR` —— 批量入参校验失败（items 为空 / 超过上限 / batch_id 解析失败）
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败（已被并发修改）
 
-use sqlx::PgConnection;
-
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::repo::PartRepo;
+use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part_batch::model::TPartBatch;
 use crate::modules::shelf::model::TShelf;
 use crate::modules::shelf::repo::ShelfRepo;
@@ -64,11 +64,11 @@ impl PartService {
     /// - 20501 `BIZ_SHELF_NOT_FOUND`：不存在 / 已软删
     /// - 20512 `BIZ_SHELF_INACTIVE`：is_active=false
     /// - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE`：zone ≠ 'INSPECTION'
-    pub(super) async fn _validate_inspection_shelf(
-        conn: &mut PgConnection,
+    pub(super) async fn _validate_inspection_shelf<R: PartRepoTrait>(
+        repo: &mut R,
         shelf_id: i64,
     ) -> Result<TShelf, AppError> {
-        let shelf = ShelfRepo::get_by_id(&mut *conn, shelf_id)
+        let shelf = ShelfRepo::get_by_id(repo.conn_mut(), shelf_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -105,12 +105,12 @@ impl PartService {
     /// - 20501 `BIZ_SHELF_NOT_FOUND`
     /// - 20512 `BIZ_SHELF_INACTIVE`
     /// - 20104 `BIZ_INVALID_VALUE`：zone ≠ 'PRODUCTION'
-    pub(super) async fn _validate_production_shelf_and_process(
-        conn: &mut PgConnection,
+    pub(super) async fn _validate_production_shelf_and_process<R: PartRepoTrait>(
+        repo: &mut R,
         shelf_id: i64,
         next_process_id: i64,
     ) -> Result<TShelf, AppError> {
-        let shelf = ShelfRepo::get_by_id(&mut *conn, shelf_id)
+        let shelf = ShelfRepo::get_by_id(repo.conn_mut(), shelf_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -146,12 +146,12 @@ impl PartService {
     ///
     /// 错误码：
     /// - 20109 `BIZ_PART_BATCH_NOT_FOUND`
-    pub(super) async fn _resolve_scan_target_batch(
-        conn: &mut PgConnection,
+    pub(super) async fn _resolve_scan_target_batch<R: PartRepoTrait>(
+        repo: &mut R,
         part_id: i64,
         batch_id: Option<i64>,
     ) -> Result<TPartBatch, AppError> {
-        match PartRepo::find_scan_target_batch(&mut *conn, part_id, batch_id).await {
+        match repo.find_scan_target_batch(part_id, batch_id).await {
             Ok(Some(b)) => Ok(b),
             Ok(None) => Err(AppError::biz(
                 code::BIZ_PART_BATCH_NOT_FOUND,
@@ -173,11 +173,11 @@ impl PartService {
     ///
     /// 委托给 [`PartRepo::find_batch_by_id`]（编译期 `sqlx::query_as!`）,
     /// 走 repo 层统一约定,避免 service 内联 SQL。
-    pub(super) async fn _lookup_batch_by_id(
-        conn: &mut PgConnection,
+    pub(super) async fn _lookup_batch_by_id<R: PartRepoTrait>(
+        repo: &mut R,
         batch_id: i64,
     ) -> Result<TPartBatch, AppError> {
-        PartRepo::find_batch_by_id(&mut *conn, batch_id)
+        repo.find_batch_by_id(batch_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -217,8 +217,8 @@ impl PartService {
     /// - `op_qty >= target.quantity`（缺省 / 等于 / 大于 0）：不拆批，
     ///   operated = target，new_batch_id_out = `None`。
     /// - `op_qty <= 0` 或 `op_qty > target.quantity`：抛 20111。
-    pub(super) async fn _split_for_partial_op(
-        conn: &mut PgConnection,
+    pub(super) async fn _split_for_partial_op<R: PartRepoTrait>(
+        repo: &mut R,
         snowflake: &SnowflakeIdGenerator,
         target: &TPartBatch,
         quantity: Option<i32>,
@@ -236,8 +236,7 @@ impl PartService {
         }
         if op_qty < target.quantity {
             let new_batch_id = snowflake.next_id();
-            PartRepo::split_batch_for_partial_pass(
-                &mut *conn,
+            repo.split_batch_for_partial_pass(
                 new_batch_id,
                 target.id,
                 target.version,
@@ -257,8 +256,8 @@ impl PartService {
     ///
     /// 当前为 to_ship_core 的薄包装；保留独立方法名以便后续在单件路径上
     /// 插入与批量路径不同的横切逻辑（如单条额外的审计事件）。
-    pub async fn to_ship(
-        conn: &mut PgConnection,
+    pub async fn to_ship<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         req: ToShipRequest,
@@ -269,7 +268,7 @@ impl PartService {
             .parse()
             .map_err(|_| AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id)))?;
         Self::to_ship_core(
-            &mut *conn,
+            &mut repo,
             snowflake,
             part_id,
             batch_id,
@@ -288,8 +287,8 @@ impl PartService {
     /// - `items` 为空 → `40001 VALIDATION_ERROR`
     /// - `items.len() > BATCH_TO_SHIP_MAX_ITEMS` → `40001 VALIDATION_ERROR`
     /// - item.batch_id 解析失败 → 推 `BatchOpFailure { batch_id: 0 (sentinel), code: 40001, message: "batch_id 解析失败" }`
-    pub async fn batch_to_ship(
-        conn: &mut PgConnection,
+    pub async fn batch_to_ship<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         req: BatchToShipRequest,
         current: &CurrentUser,
@@ -322,7 +321,7 @@ impl PartService {
                 }
             };
             // 反查 batch（拿 part_id + 校验存在 + 校验未软删）
-            let target = match Self::_lookup_batch_by_id(&mut *conn, parsed_bid).await {
+            let target = match Self::_lookup_batch_by_id(&mut repo, parsed_bid).await {
                 Ok(t) => t,
                 Err(e) => {
                     failed.push(BatchOpFailure {
@@ -337,10 +336,10 @@ impl PartService {
             use sqlx::AssertSqlSafe;
             let sp_name = format!("batch_to_ship_item_{idx}");
             sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
-                .execute(&mut *conn)
+                .execute(repo.conn_mut())
                 .await?;
             match Self::to_ship_core(
-                &mut *conn,
+                &mut repo,
                 snowflake,
                 target.part_id,
                 target.id,
@@ -353,13 +352,13 @@ impl PartService {
             {
                 Ok(o) => {
                     sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
-                        .execute(&mut *conn)
+                        .execute(repo.conn_mut())
                         .await?;
                     submitted.push(o);
                 }
                 Err(e) => {
                     sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
-                        .execute(&mut *conn)
+                        .execute(repo.conn_mut())
                         .await?;
                     failed.push(BatchOpFailure {
                         batch_id: target.id,
@@ -374,8 +373,8 @@ impl PartService {
     }
 
     /// to_process 薄包装（handler 调用）。
-    pub async fn to_process(
-        conn: &mut PgConnection,
+    pub async fn to_process<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         req: ToProcessRequest,
@@ -401,7 +400,7 @@ impl PartService {
             .parse()
             .map_err(|_| AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id)))?;
         Self::to_process_core(
-            &mut *conn,
+            &mut repo,
             snowflake,
             part_id,
             shelf_id,
@@ -416,8 +415,8 @@ impl PartService {
     }
 
     /// to_inspection 薄包装（handler 调用）。
-    pub async fn to_inspection(
-        conn: &mut PgConnection,
+    pub async fn to_inspection<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         req: ToInspectionRequest,
@@ -438,7 +437,7 @@ impl PartService {
             .parse()
             .map_err(|_| AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id)))?;
         Self::to_inspection_core(
-            &mut *conn,
+            &mut repo,
             snowflake,
             part_id,
             target_inspection_shelf_id,
@@ -461,8 +460,8 @@ impl PartService {
     /// - `target_inspection_shelf_id` 在循环外一次性做（zone='INSPECTION' +
     ///   is_active=true）—— 不合法 → 顶层 20511 / 20512（**整批失败**，不让
     ///   per-item 循环开始）。
-    pub async fn batch_to_inspection(
-        conn: &mut PgConnection,
+    pub async fn batch_to_inspection<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         req: BatchToInspectionRequest,
         current: &CurrentUser,
@@ -488,7 +487,7 @@ impl PartService {
                 )
             })?;
         // 共享品检架校验（一次性）—— 不合法 → 顶层 20511 / 20512（整批失败）
-        Self::_validate_inspection_shelf(&mut *conn, target_inspection_shelf_id).await?;
+        Self::_validate_inspection_shelf(&mut repo, target_inspection_shelf_id).await?;
 
         let mut submitted: Vec<ToXxxOut> = Vec::new();
         let mut failed: Vec<BatchOpFailure> = Vec::new();
@@ -506,7 +505,7 @@ impl PartService {
                 }
             };
             // 反查 batch（拿 part_id + 校验存在 + 校验未软删）
-            let target = match Self::_lookup_batch_by_id(&mut *conn, parsed_bid).await {
+            let target = match Self::_lookup_batch_by_id(&mut repo, parsed_bid).await {
                 Ok(t) => t,
                 Err(e) => {
                     failed.push(BatchOpFailure {
@@ -521,10 +520,10 @@ impl PartService {
             use sqlx::AssertSqlSafe;
             let sp_name = format!("batch_to_inspection_item_{idx}");
             sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
-                .execute(&mut *conn)
+                .execute(repo.conn_mut())
                 .await?;
             match Self::to_inspection_core(
-                &mut *conn,
+                &mut repo,
                 snowflake,
                 target.part_id,
                 target_inspection_shelf_id,
@@ -539,13 +538,13 @@ impl PartService {
             {
                 Ok(o) => {
                     sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
-                        .execute(&mut *conn)
+                        .execute(repo.conn_mut())
                         .await?;
                     submitted.push(o);
                 }
                 Err(e) => {
                     sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
-                        .execute(&mut *conn)
+                        .execute(repo.conn_mut())
                         .await?;
                     failed.push(BatchOpFailure {
                         batch_id: target.id,

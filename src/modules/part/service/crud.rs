@@ -14,6 +14,12 @@
 //! - `map_create_error` —— sqlx 错误码 → 业务错误码
 //! - `expand_customer_id` —— L1+L2 客户 id 展开
 //! - `lookup_customer_names` —— 取客户名 + L1 名
+//!
+//! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
+//! `impl for &mut PgConnection`）。生产 `R = &mut PgConnection`，handler/service
+//! 借 `&mut *tx` / `repo.conn_mut()` 即可喂给 trait 与跨域 ZST 调用。Inline sqlx 查询
+//! 与 ZST 跨域调用走 `repo.conn_mut()`（同一 `PgConnection` 借位，trait 与
+//! `CustomerRepo` / `ProcessChainRepo` / `PartBatchRepo` 等同时持有）。
 
 use sqlx::PgConnection;
 use std::sync::Arc;
@@ -28,9 +34,8 @@ use crate::modules::part::dto::{
     PartScanContextOut, PartScanInfoOut,
 };
 use crate::modules::part::model::NewPartEvent;
-use crate::modules::part::repo::PartRepo;
-use crate::modules::part::repo::part::{NewPartCreate, PartListFilters, PartUpdate};
-use crate::modules::part_batch::model::TPartBatch;
+use crate::modules::part::repo::PartRepoTrait;
+use crate::modules::part::repo::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part_batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
@@ -44,6 +49,7 @@ use super::super::dto_crud::{
     PartListQuery, PartUpdateRequest,
 };
 use super::PartService;
+use super::list_enrichment::enrich_part_list_with_location_and_holder;
 
 /// 扫码快捷品检上下文内部 FromRow 结构。
 ///
@@ -65,8 +71,8 @@ pub(crate) struct TPartScanRow {
 }
 
 impl PartService {
-    pub async fn create_part(
-        conn: &mut PgConnection,
+    pub async fn create_part<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         req: &PartCreateRequest,
         current: &CurrentUser,
@@ -83,7 +89,7 @@ impl PartService {
         if req.quantity <= 0 {
             return Err(AppError::validation("quantity 必须 > 0"));
         }
-        let _customer = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false)
+        let _customer = CustomerRepo::get_by_id(repo.conn_mut(), req.customer_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -108,7 +114,7 @@ impl PartService {
             note: req.note.as_deref(),
             created_by: current.id,
         };
-        if let Err(e) = PartRepo::create_part(&mut *conn, new).await {
+        if let Err(e) = repo.create_part(new).await {
             return Err(map_create_error(e));
         }
         // 2026-09-11 part/assembly/batch 重构方案 §4.1 (PR-B1)：同事务插入初始
@@ -116,7 +122,7 @@ impl PartService {
         // 即可走 to_inspection / to_ship / pickup 等 batch-锚定流转。
         let initial_batch_id = snowflake.next_id();
         PartBatchRepo::create_initial_batch(
-            &mut *conn,
+            repo.conn_mut(),
             NewInitialBatch {
                 id: initial_batch_id,
                 part_id: new_id,
@@ -126,11 +132,12 @@ impl PartService {
             },
         )
         .await?;
-        let part = PartRepo::get_part_detail(&mut *conn, new_id)
+        let part = repo
+            .get_part_detail(new_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "新建 part 查不到"))?;
-        let (cn, l1cn) = lookup_customer_names(conn, part.customer_id).await?;
-        let current_batch_id = PartRepo::find_current_inspection_batch_id(conn, part.id).await?;
+        let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), part.customer_id).await?;
+        let current_batch_id = repo.find_current_inspection_batch_id(part.id).await?;
         Ok(PartDetailOut::from_with_customer_extra(
             part,
             current_batch_id,
@@ -139,8 +146,8 @@ impl PartService {
         ))
     }
 
-    pub async fn batch_create_parts(
-        conn: &mut PgConnection,
+    pub async fn batch_create_parts<R: PartRepoTrait>(
+        repo: R,
         snowflake: &SnowflakeIdGenerator,
         req: &PartBatchCreateRequest,
         current: &CurrentUser,
@@ -148,11 +155,11 @@ impl PartService {
         // 2026-09-16 M2-B + M2-C：薄包装转 legacy 实现（不绑定文件）。
         // 文件绑定走 `batch_create_parts_with_bindings`（handler 层显式选，
         // 实现已迁出到 `service/batch.rs`）。
-        Self::batch_create_parts_legacy(conn, snowflake, req, current).await
+        Self::batch_create_parts_legacy(repo, snowflake, req, current).await
     }
 
-    pub async fn list_parts(
-        conn: &mut PgConnection,
+    pub async fn list_parts<R: PartRepoTrait>(
+        mut repo: R,
         query: &PartListQuery,
         current: &CurrentUser,
     ) -> Result<PartListOut, AppError> {
@@ -190,7 +197,7 @@ impl PartService {
 
         let customer_ids_owned: Vec<i64>;
         let customer_ids: &[i64] = if let Some(cid) = query.customer_id {
-            customer_ids_owned = expand_customer_id(conn, cid).await?;
+            customer_ids_owned = expand_customer_id(repo.conn_mut(), cid).await?;
             &customer_ids_owned
         } else {
             &[]
@@ -245,8 +252,8 @@ impl PartService {
             offset,
             include_deleted: false,
         };
-        let rows = PartRepo::list_with_filters(&mut *conn, &filters).await?;
-        let total = PartRepo::count_with_filters(&mut *conn, &filters).await?;
+        let rows = repo.list_with_filters(&filters).await?;
+        let total = repo.count_with_filters(&filters).await?;
 
         // 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `location` /
         // `current_holder_id`（已删列），列表页需要的「位置 / 持有人」展示由
@@ -261,11 +268,12 @@ impl PartService {
         //    t_shelf；WORKER → t_worker；OUTSOURCE_COMPANY → t_outsource_company），
         //    每桶 1 条 IN 查询解析名称（最多 3 条 SQL，与页大小 N 无关）。
         let part_ids: Vec<i64> = rows.iter().map(|p| p.id).collect();
-        let batch_enrichment = enrich_part_list_with_location_and_holder(conn, &part_ids).await?;
+        let batch_enrichment =
+            enrich_part_list_with_location_and_holder(&mut repo, &part_ids).await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for p in rows {
-            let (cn, l1cn) = lookup_customer_names(conn, p.customer_id).await?;
+            let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), p.customer_id).await?;
             let (loc, holder) = batch_enrichment.get(&p.id).cloned().unwrap_or((None, None));
             items.push(PartListItem {
                 part: p,
@@ -293,8 +301,8 @@ impl PartService {
     /// customer_id：单值 → `expand_customer_id` 展开为 L1+L2 ids（与 `list_parts` 同逻辑）。
     /// keyword / serial_no：service 层拼 `%...%` 加通配符；为防 SQL 注入风险，
     /// 拒绝 `%` / `_` / `\\` 等通配符特殊字符（含任一 → VALIDATION_ERROR 40001）。
-    pub async fn list_inspection_batches(
-        conn: &mut PgConnection,
+    pub async fn list_inspection_batches<R: PartRepoTrait>(
+        mut repo: R,
         query: &InspectionBatchListQuery,
         current: &CurrentUser,
     ) -> Result<InspectionBatchListOut, AppError> {
@@ -306,7 +314,7 @@ impl PartService {
         // customer_id 展开：单值 → [L1, 所有 L2]；None → 不传（走全客户）
         let customer_ids_owned: Vec<i64>;
         let customer_ids: &[i64] = if let Some(cid) = query.customer_id {
-            customer_ids_owned = expand_customer_id(conn, cid).await?;
+            customer_ids_owned = expand_customer_id(repo.conn_mut(), cid).await?;
             &customer_ids_owned
         } else {
             &[]
@@ -339,7 +347,7 @@ impl PartService {
         let statuses: &[&str] = &["INSPECTION"];
 
         let rows = PartBatchRepo::list_batches_with_part(
-            &mut *conn,
+            repo.conn_mut(),
             statuses,
             customer_ids,
             keyword,
@@ -352,7 +360,7 @@ impl PartService {
         .await?;
 
         let total = PartBatchRepo::count_batches_with_part(
-            &mut *conn,
+            repo.conn_mut(),
             statuses,
             customer_ids,
             keyword,
@@ -373,8 +381,8 @@ impl PartService {
         })
     }
 
-    pub async fn get_part(
-        conn: &mut PgConnection,
+    pub async fn get_part<R: PartRepoTrait>(
+        mut repo: R,
         part_id: i64,
         current: &CurrentUser,
     ) -> Result<PartDetailOut, AppError> {
@@ -384,7 +392,8 @@ impl PartService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let part = PartRepo::get_part_detail(&mut *conn, part_id)
+        let part = repo
+            .get_part_detail(part_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -392,8 +401,8 @@ impl PartService {
                     format!("part {part_id} 不存在或已删除"),
                 )
             })?;
-        let (cn, l1cn) = lookup_customer_names(conn, part.customer_id).await?;
-        let current_batch_id = PartRepo::find_current_inspection_batch_id(conn, part.id).await?;
+        let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), part.customer_id).await?;
+        let current_batch_id = repo.find_current_inspection_batch_id(part.id).await?;
         Ok(PartDetailOut::from_with_customer_extra(
             part,
             current_batch_id,
@@ -402,8 +411,8 @@ impl PartService {
         ))
     }
 
-    pub async fn get_part_by_serial(
-        conn: &mut PgConnection,
+    pub async fn get_part_by_serial<R: PartRepoTrait>(
+        mut repo: R,
         serial_no: &str,
         current: &CurrentUser,
     ) -> Result<PartDetailOut, AppError> {
@@ -413,7 +422,8 @@ impl PartService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let p = PartRepo::get_by_serial(&mut *conn, serial_no, false)
+        let p = repo
+            .get_by_serial(serial_no, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -421,7 +431,7 @@ impl PartService {
                     format!("serial_no {serial_no} 不存在"),
                 )
             })?;
-        Self::get_part(conn, p.id, current).await
+        Self::get_part(repo, p.id, current).await
     }
 
     /// 扫码快捷品检上下文：通过 serial 查工单窄字段 + 全部活跃批次（含 holder 名称）。
@@ -430,8 +440,8 @@ impl PartService {
     /// 用于前端扫码弹窗，让用户直接看到批次（id + quantity + status + holder +
     /// version）并据此拼出 `POST /parts/{part_id}/to-ship` 的 `{ batch_id, version }`
     /// 入参。
-    pub async fn get_part_batches_by_serial(
-        conn: &mut PgConnection,
+    pub async fn get_part_batches_by_serial<R: PartRepoTrait>(
+        mut repo: R,
         serial_no: &str,
         current: &CurrentUser,
     ) -> Result<PartScanContextOut, AppError> {
@@ -453,7 +463,7 @@ impl PartService {
             "#,
             serial_no,
         )
-        .fetch_optional(&mut *conn)
+        .fetch_optional(repo.conn_mut())
         .await?
         .ok_or_else(|| {
             AppError::biz(
@@ -464,7 +474,7 @@ impl PartService {
 
         // ② 查全部活跃批次（含 holder 名称）
         let batches =
-            PartBatchRepo::list_active_by_part_id_with_holder(&mut *conn, part.id).await?;
+            PartBatchRepo::list_active_by_part_id_with_holder(repo.conn_mut(), part.id).await?;
 
         // ③ 拼 DTO
         Ok(PartScanContextOut {
@@ -473,42 +483,42 @@ impl PartService {
         })
     }
 
-    pub async fn update_part(
-        conn: &mut PgConnection,
+    pub async fn update_part<R: PartRepoTrait>(
+        mut repo: R,
         part_id: i64,
         req: &PartUpdateRequest,
         current: &CurrentUser,
     ) -> Result<PartDetailOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        let n = PartRepo::update_part(
-            &mut *conn,
-            part_id,
-            req.version,
-            PartUpdate {
-                name: req.name.as_deref(),
-                drawing_no: req.drawing_no.as_deref(),
-                applicant_name: req.applicant_name.as_deref(),
-                quantity: req.quantity,
-                order_no: req.order_no.as_deref(),
-                system_delivery_date: req.system_delivery_date,
-                planned_delivery_date: req.planned_delivery_date,
-                note: req.note.as_deref(),
-                is_urgent: req.is_urgent,
-                updated_by: current.id,
-            },
-        )
-        .await?;
+        let n = repo
+            .update_part(
+                part_id,
+                req.version,
+                PartUpdate {
+                    name: req.name.as_deref(),
+                    drawing_no: req.drawing_no.as_deref(),
+                    applicant_name: req.applicant_name.as_deref(),
+                    quantity: req.quantity,
+                    order_no: req.order_no.as_deref(),
+                    system_delivery_date: req.system_delivery_date,
+                    planned_delivery_date: req.planned_delivery_date,
+                    note: req.note.as_deref(),
+                    is_urgent: req.is_urgent,
+                    updated_by: current.id,
+                },
+            )
+            .await?;
         if n == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 format!("part {part_id} 版本冲突或已删除"),
             ));
         }
-        Self::get_part(conn, part_id, current).await
+        Self::get_part(repo, part_id, current).await
     }
 
-    pub async fn soft_delete_part(
-        conn: &mut PgConnection,
+    pub async fn soft_delete_part<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         part_id: i64,
         expected_version: i32,
@@ -519,45 +529,48 @@ impl PartService {
         // 「已挂送货单禁删」守卫移出 PartRepo::soft_delete_part UPDATE，
         // 改在 service 层用 PartBatchRepo::has_active_batch_on_delivery_note
         // 预检（批次级真相源）。
-        if PartBatchRepo::has_active_batch_on_delivery_note(&mut *conn, part_id).await? {
+        if repo
+            .part_batch_has_active_on_delivery_note(part_id)
+            .await?
+        {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_LOCKED_PART,
                 format!("part {part_id} 存在活跃批次已挂送货单，禁 soft-delete"),
             ));
         }
-        let n =
-            PartRepo::soft_delete_part(&mut *conn, part_id, expected_version, current.id).await?;
+        let n = repo
+            .soft_delete_part(part_id, expected_version, current.id)
+            .await?;
         match n {
             1 => {
                 // 2026-09-16 FK 翻转（migration 026）级联：part 有工艺链时同事务
                 // 软删链 + steps 并 unlink（顺序：steps → chain → unlink）。
                 // unlink 必须清掉已软删 part 的 process_chain_id，让出
                 // uq_t_part_process_chain 部分唯一索引槽位。
-                let chain_id = PartRepo::get_by_id(&mut *conn, part_id, true)
+                let chain_id = repo
+                    .get_by_id(part_id, true)
                     .await?
                     .and_then(|p| p.process_chain_id);
                 if let Some(chain_id) = chain_id {
-                    ProcessChainRepo::soft_delete_all_steps_for_chain(&mut *conn, chain_id).await?;
-                    ProcessChainRepo::soft_delete_chain(&mut *conn, chain_id, current.id).await?;
-                    ProcessChainRepo::unlink_part_from_chain(&mut *conn, chain_id, current.id)
+                    ProcessChainRepo::soft_delete_all_steps_for_chain(repo.conn_mut(), chain_id)
+                        .await?;
+                    ProcessChainRepo::soft_delete_chain(repo.conn_mut(), chain_id, current.id).await?;
+                    ProcessChainRepo::unlink_part_from_chain(repo.conn_mut(), chain_id, current.id)
                         .await?;
                 }
-                PartRepo::insert_part_event(
-                    &mut *conn,
-                    NewPartEvent {
-                        id: snowflake.next_id(),
-                        part_id,
-                        event_type: "SOFT_DELETED",
-                        from_status: None,
-                        to_status: None,
-                        batch_id: None,
-                        quantity: None,
-                        drawing_code: None,
-                        badge_code: None,
-                        note: Some("manager soft-delete"),
-                        created_by: Some(current.id),
-                    },
-                )
+                repo.insert_part_event(NewPartEvent {
+                    id: snowflake.next_id(),
+                    part_id,
+                    event_type: "SOFT_DELETED",
+                    from_status: None,
+                    to_status: None,
+                    batch_id: None,
+                    quantity: None,
+                    drawing_code: None,
+                    badge_code: None,
+                    note: Some("manager soft-delete"),
+                    created_by: Some(current.id),
+                })
                 .await?;
                 Ok(())
             }
@@ -570,7 +583,7 @@ impl PartService {
                 // 注：21420 BIZ_DELIVERY_NOTE_LOCKED_PART 已在上方预检拦截（service 层
                 // 调用 PartBatchRepo::has_active_batch_on_delivery_note），不会进入
                 // 此 match。
-                let p = PartRepo::get_by_id(&mut *conn, part_id, true).await?;
+                let p = repo.get_by_id(part_id, true).await?;
                 match p {
                     None => Err(AppError::biz(
                         code::BIZ_PART_NOT_FOUND,
@@ -610,8 +623,8 @@ impl PartService {
     /// DRAWING / 3D_MODEL 等 kind 共用同一段上传 + 落库逻辑。
     /// 调用方（`upload_drawing` / `upload_3d_model`）只负责决定 kind 和 file_type。
     #[allow(clippy::too_many_arguments)]
-    pub async fn upload_part_file(
-        conn: &mut PgConnection,
+    pub async fn upload_part_file<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         state: &Arc<AppState>,
         part_id: i64,
@@ -655,10 +668,7 @@ impl PartService {
             ));
         }
         // 上传前 part 必须存在
-        if PartRepo::get_part_detail(&mut *conn, part_id)
-            .await?
-            .is_none()
-        {
+        if repo.get_part_detail(part_id).await?.is_none() {
             return Err(AppError::biz(
                 code::BIZ_PART_FILE_OWNER_NOT_FOUND,
                 format!("part {part_id} 不存在"),
@@ -687,7 +697,7 @@ impl PartService {
                 )
             })?;
         PartFileRepo::create_part_file(
-            &mut *conn,
+            repo.conn_mut(),
             NewPartFile {
                 id: new_file_id,
                 part_id,
@@ -712,7 +722,7 @@ impl PartService {
             }
             AppError::from(e)
         })?;
-        let pf = PartFileRepo::get_by_part_kind(&mut *conn, part_id, kind)
+        let pf = PartFileRepo::get_by_part_kind(repo.conn_mut(), part_id, kind)
             .await?
             .ok_or_else(|| AppError::internal("刚 INSERT 的 file 查不到"))?;
         Ok(pf)
@@ -721,8 +731,8 @@ impl PartService {
     /// 上传 part 图纸 PDF（multipart 处理上传到 COS + INSERT t_part_file）。
     /// 2026-09-11 修改：改为对 `upload_part_file` 的薄包装。
     #[allow(clippy::too_many_arguments)]
-    pub async fn upload_drawing(
-        conn: &mut PgConnection,
+    pub async fn upload_drawing<R: PartRepoTrait>(
+        repo: R,
         snowflake: &SnowflakeIdGenerator,
         state: &Arc<AppState>,
         part_id: i64,
@@ -732,7 +742,7 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<TPartFile, AppError> {
         Self::upload_part_file(
-            conn,
+            repo,
             snowflake,
             state,
             part_id,
@@ -750,8 +760,8 @@ impl PartService {
     /// 2026-09-11 新增：与 Python `POST /api/v1/parts/{id}/3d-models` 对齐。
     /// file_type 由扩展名推导（`policy::file_type_for_ext`）。
     #[allow(clippy::too_many_arguments)]
-    pub async fn upload_3d_model(
-        conn: &mut PgConnection,
+    pub async fn upload_3d_model<R: PartRepoTrait>(
+        repo: R,
         snowflake: &SnowflakeIdGenerator,
         state: &Arc<AppState>,
         part_id: i64,
@@ -769,7 +779,7 @@ impl PartService {
             )
         })?;
         Self::upload_part_file(
-            conn,
+            repo,
             snowflake,
             state,
             part_id,
@@ -876,170 +886,4 @@ pub(super) async fn lookup_customer_names(
         None => Some(name.clone()),
     };
     Ok((Some(name), l1_name))
-}
-
-/// 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `location` /
-/// `current_holder_id`（已删列），列表页需要的「位置 / 持有人」展示由
-/// service 层在 list_parts 内按 min-progress 活跃批次派生。
-///
-/// 输入：分页内的 part ids（去重）。
-/// 输出：`HashMap<part_id, (Option<location>, Option<holder_name>)>`；
-/// `part_id` 不在结果中 → caller 走 `(None, None)` 默认值（视为无活跃批次）。
-///
-/// 派生规则：
-/// - min-progress 活跃批次选择：与 `compute_part_target` 一致 —— 排除
-///   `CANCELLED`；非空时再排除 `COMPLETED`；剩余取 `part_status_progress`
-///   最小者；多批 progress 相等时取首条（与 rollup 行为对齐）。
-/// - holder_name 解析：按目标批次 `location` 分桶：
-///   - `PRODUCTION_SHELF` / `INSPECTION_SHELF` → `t_shelf.code`
-///   - `WORKER` → `t_worker.name`
-///   - `OUTSOURCE_COMPANY` → `t_outsource_company.name`
-///   - `OFFICE` / `None` / 无活跃批次 → `None`
-///
-/// SQL 数：4 条（与页大小 N 无关）：
-/// 1. 一次性拉所有 part 的活跃批次（`list_active_by_part_ids`）
-///    2-4. t_shelf / t_worker / t_outsource_company 各 1 条 `WHERE id = ANY(...)`
-async fn enrich_part_list_with_location_and_holder(
-    conn: &mut PgConnection,
-    part_ids: &[i64],
-) -> Result<std::collections::HashMap<i64, (Option<String>, Option<String>)>, AppError> {
-    use std::collections::HashMap;
-    let mut out: HashMap<i64, (Option<String>, Option<String>)> = HashMap::new();
-    if part_ids.is_empty() {
-        return Ok(out);
-    }
-
-    // 1. 拉所有 part 的活跃批次（O(1) SQL）。
-    let batches = PartBatchRepo::list_active_by_part_ids(&mut *conn, part_ids).await?;
-
-    // 2. 按 part_id 分桶 + Rust 内 min-progress 选目标批次。
-    use std::collections::HashMap as HM;
-    let mut per_part: HM<i64, Vec<&TPartBatch>> = HM::new();
-    for b in &batches {
-        per_part.entry(b.part_id).or_default().push(b);
-    }
-    let mut target_per_part: HM<i64, &TPartBatch> = HM::new();
-    for (part_id, bs) in per_part {
-        // 排除 CANCELLED。
-        let non_cancelled: Vec<&&TPartBatch> =
-            bs.iter().filter(|b| b.status != "CANCELLED").collect();
-        let candidates: Vec<&&TPartBatch> = if !non_cancelled.is_empty() {
-            // 非空时排除 COMPLETED。
-            let non_terminal: Vec<&&TPartBatch> = non_cancelled
-                .iter()
-                .copied()
-                .filter(|b| b.status != "COMPLETED")
-                .collect();
-            if !non_terminal.is_empty() {
-                non_terminal
-            } else {
-                non_cancelled
-            }
-        } else {
-            bs.iter().collect()
-        };
-        // min progress（与 statemachine::part_status_progress 对齐）。
-        if let Some(min) = candidates
-            .iter()
-            .min_by_key(|b| part_status_progress_inline(&b.status))
-            .copied()
-        {
-            target_per_part.insert(part_id, min);
-        }
-    }
-
-    // 3. 把目标批次的 current_holder_id 按 location 分桶。
-    use std::collections::HashSet;
-    let mut shelf_ids: HashSet<i64> = HashSet::new();
-    let mut worker_ids: HashSet<i64> = HashSet::new();
-    let mut outsource_ids: HashSet<i64> = HashSet::new();
-    for b in target_per_part.values() {
-        if let Some(hid) = b.current_holder_id {
-            match b.location.as_deref() {
-                Some("PRODUCTION_SHELF") | Some("INSPECTION_SHELF") => {
-                    shelf_ids.insert(hid);
-                }
-                Some("WORKER") => {
-                    worker_ids.insert(hid);
-                }
-                Some("OUTSOURCE_COMPANY") => {
-                    outsource_ids.insert(hid);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // 4. 解析名称（每桶 1 条 SQL）。
-    let mut shelf_names: HashMap<i64, String> = HashMap::new();
-    if !shelf_ids.is_empty() {
-        let ids: Vec<i64> = shelf_ids.iter().copied().collect();
-        let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT id, code FROM t_shelf WHERE id = ANY($1) AND deleted_at IS NULL",
-        )
-        .bind(&ids)
-        .fetch_all(&mut *conn)
-        .await?;
-        for (id, code) in rows {
-            shelf_names.insert(id, code);
-        }
-    }
-    let mut worker_names: HashMap<i64, String> = HashMap::new();
-    if !worker_ids.is_empty() {
-        let ids: Vec<i64> = worker_ids.iter().copied().collect();
-        let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT id, name FROM t_worker WHERE id = ANY($1) AND deleted_at IS NULL",
-        )
-        .bind(&ids)
-        .fetch_all(&mut *conn)
-        .await?;
-        for (id, name) in rows {
-            worker_names.insert(id, name);
-        }
-    }
-    let mut outsource_names: HashMap<i64, String> = HashMap::new();
-    if !outsource_ids.is_empty() {
-        let ids: Vec<i64> = outsource_ids.iter().copied().collect();
-        let rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT id, name FROM t_outsource_company WHERE id = ANY($1) AND deleted_at IS NULL",
-        )
-        .bind(&ids)
-        .fetch_all(&mut *conn)
-        .await?;
-        for (id, name) in rows {
-            outsource_names.insert(id, name);
-        }
-    }
-
-    // 5. 组装结果。
-    for (part_id, b) in target_per_part {
-        let location = b.location.clone();
-        let holder_name = b
-            .current_holder_id
-            .and_then(|hid| match b.location.as_deref() {
-                Some("PRODUCTION_SHELF") | Some("INSPECTION_SHELF") => {
-                    shelf_names.get(&hid).cloned()
-                }
-                Some("WORKER") => worker_names.get(&hid).cloned(),
-                Some("OUTSOURCE_COMPANY") => outsource_names.get(&hid).cloned(),
-                _ => None,
-            });
-        out.insert(part_id, (location, holder_name));
-    }
-    Ok(out)
-}
-
-/// 与 `crate::modules::part::statemachine::part_status_progress` 同逻辑的内
-/// 联副本（避免在 service 层引一圈 statemachine 依赖）。PR-2 增列同步。
-fn part_status_progress_inline(s: &str) -> u8 {
-    match s {
-        "PENDING" => 0,
-        "PROGRAMMING" => 1,
-        "IN_PROCESS" | "REPAIRING" => 2,
-        "OUTSOURCE" => 3,
-        "INSPECTION" => 4,
-        "READY_TO_SHIP" => 5,
-        "DELIVERED" => 6,
-        _ => 2,
-    }
 }

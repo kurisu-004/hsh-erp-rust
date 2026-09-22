@@ -21,7 +21,6 @@
 //! 与 `batch_create_parts` 的区别：调用方需额外注入 `cos` / `cfg`（upload_prefix +
 //! tmp_prefix）；handler 层走 state 直接拿，service 层把 IO 控制在 pool（不依赖 tx）。
 
-use sqlx::PgConnection;
 use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
@@ -29,8 +28,8 @@ use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::part::dto_crud::{FileBindingIn, PartBatchCreateOut, PartBatchCreateRequest};
-use crate::modules::part::repo::PartRepo;
-use crate::modules::part::repo::part::NewPartCreate;
+use crate::modules::part::repo::NewPartCreate;
+use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part_batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part_file::policy;
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo};
@@ -75,8 +74,8 @@ impl PartService {
     /// 与 `batch_create_parts` 的区别：调用方需额外注入 `cos` / `cfg`（upload_prefix +
     /// tmp_prefix）；handler 层走 state 直接拿，service 层把 IO 控制在 pool（不依赖 tx）。
     #[allow(clippy::too_many_arguments)]
-    pub async fn batch_create_parts_with_bindings(
-        conn: &mut PgConnection,
+    pub async fn batch_create_parts_with_bindings<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         cos: Arc<dyn CosClient>,
         cfg_upload_prefix: &str,
@@ -100,7 +99,7 @@ impl PartService {
                 Vec::new(),
             ));
         }
-        let customer_check = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false).await;
+        let customer_check = CustomerRepo::get_by_id(repo.conn_mut(), req.customer_id, false).await;
         match customer_check {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -227,16 +226,16 @@ impl PartService {
             use sqlx::AssertSqlSafe;
             let sp_name = format!("batch_item_{idx}");
             if let Err(e) = sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
-                .execute(&mut *conn)
+                .execute(repo.conn_mut())
                 .await
             {
                 return Err((AppError::from(e), cleanup_tmp_keys));
             }
-            match PartRepo::create_part(&mut *conn, new).await {
+            match repo.create_part(new).await {
                 Ok(_) => {
                     let initial_batch_id = snowflake.next_id();
                     let initial_batch_result = PartBatchRepo::create_initial_batch(
-                        &mut *conn,
+                        repo.conn_mut(),
                         NewInitialBatch {
                             id: initial_batch_id,
                             part_id: new_id,
@@ -249,7 +248,7 @@ impl PartService {
                     if let Err(e) = initial_batch_result {
                         if let Err(e) =
                             sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
-                                .execute(&mut *conn)
+                                .execute(repo.conn_mut())
                                 .await
                         {
                             return Err((AppError::from(e), cleanup_tmp_keys));
@@ -268,7 +267,7 @@ impl PartService {
                         let mut part_files_ok = true;
                         for pb in &prepared_per_item[idx] {
                             if let Err(e) = PartFileRepo::create_part_file(
-                                &mut *conn,
+                                repo.conn_mut(),
                                 NewPartFile {
                                     id: snowflake.next_id(),
                                     part_id: new_id,
@@ -320,7 +319,7 @@ impl PartService {
                             if let Err(e) = sqlx::raw_sql(AssertSqlSafe(format!(
                                 "ROLLBACK TO SAVEPOINT {sp_name}"
                             )))
-                            .execute(&mut *conn)
+                            .execute(repo.conn_mut())
                             .await
                             {
                                 return Err((AppError::from(e), cleanup_tmp_keys));
@@ -329,7 +328,7 @@ impl PartService {
                         } else {
                             if let Err(e) =
                                 sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
-                                    .execute(&mut *conn)
+                                    .execute(repo.conn_mut())
                                     .await
                             {
                                 return Err((AppError::from(e), cleanup_tmp_keys));
@@ -338,13 +337,13 @@ impl PartService {
                             // `successful_tmp_keys`。cleanup_tmp_keys 已在第一遍 head/copy
                             // 成功后全量收集，handler 统一 spawn 删除（与 per-item
                             // DB 结果无关）。
-                            match PartRepo::get_part_detail(&mut *conn, new_id).await {
+                            match repo.get_part_detail(new_id).await {
                                 Ok(Some(p)) => {
-                                    let (cn, l1cn) = lookup_customer_names(conn, p.customer_id)
+                                    let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), p.customer_id)
                                         .await
                                         .map_err(|e| (e, cleanup_tmp_keys.clone()))?;
                                     let current_batch_id =
-                                        PartRepo::find_current_inspection_batch_id(conn, p.id)
+                                        repo.find_current_inspection_batch_id(p.id)
                                             .await
                                             .map_err(|e| {
                                                 (AppError::from(e), cleanup_tmp_keys.clone())
@@ -373,7 +372,7 @@ impl PartService {
                 Err(e) => {
                     if let Err(e) =
                         sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
-                            .execute(&mut *conn)
+                            .execute(repo.conn_mut())
                             .await
                     {
                         return Err((AppError::from(e), cleanup_tmp_keys));
@@ -402,8 +401,8 @@ impl PartService {
     /// batch_create_parts 的 legacy 实现：与既有签名一致，不支持文件绑定。
     /// 2026-09-16 M2-B：拆出来供 batch_create_parts 复用（保留原 per-item savepoint 模型）。
     /// 2026-09-16 M2-C：从 crud.rs 迁移到本文件（按 docs/conventions.md §2 单文件职责拆分）。
-    pub(super) async fn batch_create_parts_legacy(
-        conn: &mut PgConnection,
+    pub(super) async fn batch_create_parts_legacy<R: PartRepoTrait>(
+        mut repo: R,
         snowflake: &SnowflakeIdGenerator,
         req: &PartBatchCreateRequest,
         current: &CurrentUser,
@@ -419,7 +418,7 @@ impl PartService {
                 BATCH_CREATE_PARTS_MAX_ITEMS
             )));
         }
-        let _customer = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false)
+        let _customer = CustomerRepo::get_by_id(repo.conn_mut(), req.customer_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -450,13 +449,13 @@ impl PartService {
             use sqlx::AssertSqlSafe;
             let sp_name = format!("batch_item_{idx}");
             sqlx::raw_sql(AssertSqlSafe(format!("SAVEPOINT {sp_name}")))
-                .execute(&mut *conn)
+                .execute(repo.conn_mut())
                 .await?;
-            match PartRepo::create_part(&mut *conn, new).await {
+            match repo.create_part(new).await {
                 Ok(_) => {
                     let initial_batch_id = snowflake.next_id();
                     if let Err(e) = PartBatchRepo::create_initial_batch(
-                        &mut *conn,
+                        repo.conn_mut(),
                         NewInitialBatch {
                             id: initial_batch_id,
                             part_id: new_id,
@@ -468,7 +467,7 @@ impl PartService {
                     .await
                     {
                         sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
-                            .execute(&mut *conn)
+                            .execute(repo.conn_mut())
                             .await?;
                         let mapped = map_create_error(e);
                         failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
@@ -480,13 +479,13 @@ impl PartService {
                         continue;
                     }
                     sqlx::raw_sql(AssertSqlSafe(format!("RELEASE SAVEPOINT {sp_name}")))
-                        .execute(&mut *conn)
+                        .execute(repo.conn_mut())
                         .await?;
-                    match PartRepo::get_part_detail(&mut *conn, new_id).await {
+                    match repo.get_part_detail(new_id).await {
                         Ok(Some(p)) => {
-                            let (cn, l1cn) = lookup_customer_names(conn, p.customer_id).await?;
+                            let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), p.customer_id).await?;
                             let current_batch_id =
-                                PartRepo::find_current_inspection_batch_id(conn, p.id).await?;
+                                repo.find_current_inspection_batch_id(p.id).await?;
                             created.push(PartDetailOut::from_with_customer_extra(
                                 p,
                                 current_batch_id,
@@ -506,7 +505,7 @@ impl PartService {
                 }
                 Err(e) => {
                     sqlx::raw_sql(AssertSqlSafe(format!("ROLLBACK TO SAVEPOINT {sp_name}")))
-                        .execute(&mut *conn)
+                        .execute(repo.conn_mut())
                         .await?;
                     let mapped = map_create_error(e);
                     failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {

@@ -70,7 +70,7 @@ pub async fn batch_create_parts(
             // 批量 delete_object(tmp_keys) 兜底。
             // service 签名：成功 (Out, keys) / 失败 (AppError, keys)。
             PartService::batch_create_parts_with_bindings(
-                &mut tx,
+                &mut *tx,
                 &state.snowflake,
                 state.cos.clone(),
                 &state.config.cos.upload_prefix,
@@ -84,7 +84,7 @@ pub async fn batch_create_parts(
             // batch_create_parts_legacy），spawn 条件 `!cleanup_keys.is_empty()` 自动跳过。
             // legacy 路径无 IO，Err 不可能带 keys —— 直接 spread。
             let res =
-                PartService::batch_create_parts(&mut tx, &state.snowflake, &req, &current).await;
+                PartService::batch_create_parts(&mut *tx, &state.snowflake, &req, &current).await;
             res.map(|out| (out, Vec::new()))
                 .map_err(|e| (e, Vec::new()))
         };
@@ -224,7 +224,7 @@ pub async fn batch_with_pdfs(
     let req = json_body.ok_or_else(|| AppError::validation("multipart 缺少 'json' 字段"))?;
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::batch_with_pdfs(&mut tx, &state.snowflake, &req, &pdf_files, &current).await?;
+        PartService::batch_with_pdfs(&mut *tx, &state.snowflake, &req, &pdf_files, &current).await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "PART_BATCH_WITH_PDFS_CREATED".into(),
@@ -254,7 +254,7 @@ pub async fn batch_to_inspection(
 ) -> Result<Json<R<BatchToXxxOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Inspector])?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_to_inspection(&mut tx, &state.snowflake, req, &current).await?;
+    let out = PartService::batch_to_inspection(&mut *tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     let mut seen_assemblies = std::collections::HashSet::new();
     for item in &out.submitted {

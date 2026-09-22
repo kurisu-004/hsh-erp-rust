@@ -17,12 +17,15 @@
 //!   outsource / repair / batch 操作 / 事件历史 / 位置树 / scan / match /
 //!   batch-with-pdfs / batch-update-order-info）
 //! - `rollup.rs`：rollup 工具（sync_from_batch_change）
+//! - `list_enrichment.rs`：list_parts 派生层「位置 / 持有人」跨三表解析
+//!   helper（2026-09-22 review 第 2 轮从 crud.rs 抽出，原 1054 行超限）
 
 pub mod batch;
 pub mod crud;
 pub mod inspection;
 pub mod inspection_core;
 pub mod lifecycle;
+pub mod list_enrichment;
 pub mod phase1;
 pub mod rollup;
 pub mod worker_scan;
