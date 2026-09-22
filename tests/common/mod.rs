@@ -361,6 +361,10 @@ pub fn test_redis_url() -> String {
         "_e2e_api" => 13,
         "auth_middleware" => 14,
         "iam_api" => 15,
+        // 2026-09-23 新增 Idempotency 中间件集成测试 binary：独占 db 12，
+        // 与其它 3 个 FLUSHDB binary 隔离（理由同 race #2 修复）。Redis 默认
+        // 16 个 db（0-15），db 16 会越界。
+        "idempotency_api" => 12,
         _ => redis_db_index(&bin) % 13,
     };
     format!("redis://localhost:6380/{db_index}")
@@ -554,6 +558,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             sts_duration_seconds: 7200,
             renew_threshold_seconds: 600,
         },
+        // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
+        idempotency_ttl_seconds: 86400,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -567,7 +573,13 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     let shutdown = CancellationToken::new();
     let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
     let upload_session_repo: Arc<dyn UploadSessionRepo> =
-        Arc::new(RedisUploadSessionRepo::new(redis_pool));
+        Arc::new(RedisUploadSessionRepo::new(redis_pool.clone()));
+    // 2026-09-23 新增 Idempotency 中间件存储：默认走 RedisIdempotencyStore
+    // （与 session 共享同一 redis_pool）。
+    let idempotency_store: Arc<dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore> =
+        Arc::new(hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(
+            redis_pool,
+        ));
     Arc::new(AppState::new(
         pool,
         config,
@@ -578,6 +590,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         shutdown,
         session,
         upload_session_repo,
+        // 2026-09-23 新增 Idempotency 中间件存储
+        idempotency_store,
     ))
 }
 
@@ -700,6 +714,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             sts_duration_seconds: 7200,
             renew_threshold_seconds: 600,
         },
+        // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
+        idempotency_ttl_seconds: 86400,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -714,6 +730,10 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
     use hsh_erp_rust::auth::session::NoopSessionStore;
     let session: Arc<dyn SessionStore> = Arc::new(NoopSessionStore::new());
     let upload_session_repo: Arc<dyn UploadSessionRepo> = Arc::new(NoopUploadSessionRepo);
+    // 2026-09-23 新增 Idempotency 中间件存储：disabled session 场景走 Noop
+    let idempotency_store: Arc<
+        dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore,
+    > = Arc::new(hsh_erp_rust::middleware::idempotency::NoopIdempotencyStore::new());
     Arc::new(AppState::new(
         pool,
         config,
@@ -724,6 +744,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         shutdown,
         session,
         upload_session_repo,
+        // 2026-09-23 新增 Idempotency 中间件存储
+        idempotency_store,
     ))
 }
 
@@ -823,6 +845,8 @@ pub async fn test_state_with_cos(
             sts_duration_seconds: 7200,
             renew_threshold_seconds: 600,
         },
+        // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
+        idempotency_ttl_seconds: 86400,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -834,7 +858,12 @@ pub async fn test_state_with_cos(
     let shutdown = CancellationToken::new();
     let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
     let upload_session_repo: Arc<dyn UploadSessionRepo> =
-        Arc::new(RedisUploadSessionRepo::new(redis_pool));
+        Arc::new(RedisUploadSessionRepo::new(redis_pool.clone()));
+    // 2026-09-23 新增 Idempotency 中间件存储：cos 替换场景同 test_state_with_redis
+    let idempotency_store: Arc<dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore> =
+        Arc::new(hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(
+            redis_pool,
+        ));
     Arc::new(AppState::new(
         pool,
         config,
@@ -845,6 +874,8 @@ pub async fn test_state_with_cos(
         shutdown,
         session,
         upload_session_repo,
+        // 2026-09-23 新增 Idempotency 中间件存储
+        idempotency_store,
     ))
 }
 

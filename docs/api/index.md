@@ -168,6 +168,16 @@ HTTP 状态码：
 
 响应体（含 `items, total, limit, offset` 四个字段，部分接口叫别的名字，详见各域）。
 
+### 幂等性（Idempotency-Key）
+
+- Header：`Idempotency-Key: <uuid>`（Stripe / IETF 草案）
+- 仅 `POST / PUT / PATCH` 启用；`GET / DELETE / HEAD` 跳过
+- 命中缓存（同 key 24h 内）：直接返回首次响应（status + headers + body 字节级一致）
+- 缺失 header：pass-through（零 Redis I/O）
+- 公开路径（health / login / refresh / _e2e）：不缓存（防 JWT 缓存泄漏劫持 session）
+- 简化方案：key 不与 method/path 绑定——跨方法同 key 撞车（client bug，暴露而非掩盖）
+- TTL：默认 24h（`IDEMPOTENCY_TTL_SECONDS` env 可调）
+
 ### 错误码分段
 
 详见 `src/shared/error.rs::code` 模块顶部注释 + 常量定义。
