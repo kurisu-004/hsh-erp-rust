@@ -8,6 +8,8 @@
 //! VO **禁止** 出现在 axum extractor 反序列化侧——`serde::Deserialize` 不实现；
 //! 只用于 service 组装 + handler `Json(R::ok(...))` 返回值序列化。
 
+// 2026-09-22 PR1：标记为 vo/ 模板源。PR4 全域复制本目录结构时以此为基准。
+
 pub mod account;
 pub mod menu;
 pub mod session;
