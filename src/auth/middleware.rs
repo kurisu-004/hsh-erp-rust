@@ -155,6 +155,8 @@ pub async fn verify_session_token(
         }
     }
 
+    // 6) 从 cached.profile.{...} 拼装 CurrentUser（id/username/roles/shelf_ids/
+    //    shelf_wildcard）；注意字段名是 `profile`，不是 `cached`（2026-09-22 重命名）。
     Ok((
         CurrentUser {
             id: cached.user_id,

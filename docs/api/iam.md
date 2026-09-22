@@ -153,9 +153,12 @@ Response 200 `data`：同 [`/iam/login`](#post-apiv2iamlogin)
 >   `ACCOUNT_SECURITY_EVENT refresh_token_reuse_detected`（含 user_id + jti）。
 > - 闸位在 DB 版本校验之前，保证 40105 不会先被 40103 拦截而成为 dead branch。
 >
-> **access 闸** —— `auth::middleware::verify_session_token` 同步加了
-> `EXISTS revoked:<jti>` 闸：被轮转过的 access jti 在黑名单 TTL 内任何请求撞上即
-> 40105 SESSION_REVOKED，前端应清除本地 token 并跳回登录页。
+> **access 闸** —— 闸位是**防御性的**：rotation 路径**只**黑名单 refresh jti
+> （`complete_refresh` 调 `revoke_jti(&old_refresh_jti, ttl)`，access jti 不入黑名单）。
+> 因此 `auth::middleware::verify_session_token` 的 `EXISTS revoked:<jti>` 闸
+> 实际只对 refresh jti 命中；access token 在自然 TTL（默认 15min）内仍可用，
+> 与标准 OAuth 行为一致。access 真要立即失效需新增 `/iam/refresh` 请求携带
+> access token 字段并由 rotation 同步黑名单 access jti，本期未做。
 >
 > **部署注意事项**：
 >

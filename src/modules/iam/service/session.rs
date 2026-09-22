@@ -401,26 +401,32 @@ impl SessionService {
             tracing::warn!(error = %e, user_id = u.id, "refresh: 删旧 refresh session 失败");
         }
         // 2026-09-23 重构：reuse detection——把旧 refresh jti 入黑名单，TTL 至原 expires_at。
-        // TTL ≤ 0 时仍调 `revoke_jti(... 0)`（Redis 接到 EX 0 直接过期，效果是「下次查不到」，
-        // 符合预期——refresh 自身也到期了，黑名单随之无效化）。
+        // TTL=0（旧 refresh 已过期）时跳过 `revoke_jti` 调用：Redis `SET ... EX 0` 会返
+        // ERR invalid expire time，且写入无意义（refresh token 本就 expired，黑名单随其
+        // 过期同步失效）。改为提前分支走 debug 日志，避免无意义的 warn 噪声。
         // 失败仅 warn，不阻断 refresh 响应（best-effort 模式与 delete_session 一致）；
         // 闸位已在 phase 1 装好，黑名单失败的最坏后果是 reuse 攻击者可再试一次
         // 但仍会被 DB version 40103 兜底拦截。
         let now_unix = chrono::Utc::now().timestamp();
         let ttl: u64 = (old_refresh_expires_at - now_unix).max(0) as u64;
-        match self.session.revoke_jti(&old_refresh_jti, ttl).await {
-            Ok(true) => {} // 新写入
-            Ok(false) => {
-                tracing::warn!(
-                    jti = %old_refresh_jti,
-                    "complete_refresh: 黑名单已存在，本次写入跳过"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e, jti = %old_refresh_jti,
-                    "complete_refresh: 黑名单写入失败（reuse detection 闸仍由 phase 1 把守）"
-                );
+        if ttl == 0 {
+            // 旧 refresh 已过期，黑名单无意义（refresh token 本就 expired），跳过写入
+            tracing::debug!(jti = %old_refresh_jti, "complete_refresh: 旧 refresh 已过期，跳过黑名单");
+        } else {
+            match self.session.revoke_jti(&old_refresh_jti, ttl).await {
+                Ok(true) => {} // 新写入
+                Ok(false) => {
+                    tracing::warn!(
+                        jti = %old_refresh_jti,
+                        "complete_refresh: 黑名单已存在，本次写入跳过"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e, jti = %old_refresh_jti,
+                        "complete_refresh: 黑名单写入失败（reuse detection 闸仍由 phase 1 把守）"
+                    );
+                }
             }
         }
         // 2026-09-22 重构：`CachedCurrentUser` → `CachedUserProfile`（删 id 字段）；
