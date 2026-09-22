@@ -103,7 +103,7 @@ HTTP 状态码：
 - **业务上下文从 Redis session 或 DB 兜底获取，不在 JWT 内**——
   `CurrentUser` 所需的 `username` / `roles` / `shelf_ids` / `shelf_wildcard` 不写进 JWT，
   全靠服务端 session 真源或 DB 查得；前端无需关心这些字段是否在 token 里。
-- **服务端 session**：每个 access / refresh token 必须对应 Redis 一条 `session:tok:<sha256_hex>`
+- **服务端 session**：每个 access / refresh token 必须对应 Redis 一条 `session:tok:<jti UUID v4>`
   条目才视为有效。`CurrentUser` extractor 在 JWT 验签后额外查 Redis；
   查不到 → 40105 SESSION_REVOKED。登出（删当前 token 条目）、改密 / 管理员停用
   （清整个用户 Set `sessions:user:<id>`）都会触发吊销。前端拿到 40105 应清本地
@@ -269,6 +269,12 @@ HTTP 状态码：
 3. **配置错误码**：若部署时 `REDIS_SESSION_CHECK_ENABLED=false`，所有受保护端点
    都会返 50000 INTERNAL（不再是 40105 SESSION_REVOKED；详见
    `src/auth/middleware.rs::verify_session_token`）。运维应立即检查 env 配置。
+
+> 2026-09-23 重构：本轮 Redis session key 从 sha256(token) 改为 JWT jti（UUID v4），
+> key 形状由 `session:tok:<sha256>` 变为 `session:tok:<jti>`。本改造**不涉及**
+> `CachedSession` 字段 rename，旧 key 上的 session 在 12h TTL 内自然过期，不需要
+> 数据迁移；上线顺序：先发 backend-rust（新代码读写新 jti key，旧 sha256 key 上的
+> session 随 TTL 12h 自然清空），再发 frontend（无协议变化），过渡期所有用户需重新登录。
 
 ---
 

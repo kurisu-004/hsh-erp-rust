@@ -6,8 +6,8 @@
 //! `CurrentUser` extractor 每次都查 Redis——条目缺失即视为吊销。
 //!
 //! ## 键策略（双层）
-//! - 每 token 一条主条目：`session:tok:<sha256_hex>`（string，存 JSON `CachedSession`，TTL 滑动）
-//! - 每用户一个 Set 索引：`sessions:user:<user_id>`（每条 token 一个 sha256_hex）
+//! - 每 token 一条主条目：`session:tok:<jti UUID v4>`（string，存 JSON `CachedSession`，TTL 滑动）
+//! - 每用户一个 Set 索引：`sessions:user:<user_id>`（每条 token 一个 jti (UUID v4)）
 //!
 //! ## 兜底
 //! `t_user.refresh_token_version` 的 DB 轮转保留——Redis 数据丢失或被 `FLUSHDB` 时，
@@ -17,12 +17,17 @@
 //! - `CachedCurrentUser` → `CachedUserProfile`（删除 `id` 字段；user_id 由外层 `CachedSession`
 //!   字段权威锚定，避免内外两个 id 漂移）。
 //! - `CachedSession.cached` → `CachedSession.profile`，与字段语义对齐。
+//!
+//! ## 2026-09-23 重构
+//! - Redis 主条目 key 从 `session:tok:<sha256(token)>` 改为 `session:tok:<jti>`，
+//!   jti 直接复用 JWT 自带的 `claims.jwt_id`（UUID v4），不再调用 `hash_token`。
+//! - 删除 `hash_token` 函数（`sha2` crate 因 part_file 仍保留），`SessionStore` trait
+//!   入参从 `token_hash: &str` 改为 `jti: &str`；语义改名 `AuthenticatedTokenHash` → `SessionJti`。
 
 use async_trait::async_trait;
 use chrono::Utc;
 use deadpool_redis::redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::shared::error::AppError;
 
@@ -68,14 +73,25 @@ pub struct CachedUserProfile {
     pub shelf_wildcard: bool,
 }
 
+/// 从 JWT claims.jwt_id 提取的 UUID v4，即 Redis session key `session:tok:<jti>`
+/// 的后缀。
+///
+/// 2026-09-23 重构：原 `AuthenticatedTokenHash(String)` 改名而来；值类型不变
+/// （仍是 String），但语义从 sha256 hex 改为 jti UUID v4 字符串。
+#[derive(Debug, Clone)]
+pub struct SessionJti(pub String);
+
 /// session 存储抽象（trait + Arc<dyn> 与现有 `CosClient` 同模式）
+///
+/// 2026-09-23 重构：所有形参从 `token_hash: &str` 改为 `jti: &str`，
+/// 业务层直接传 JWT 的 `claims.jwt_id`（UUID v4）。
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     /// 写入一条 session（同时建用户 Set 索引 + 双 TTL）
     async fn create_session(
         &self,
-        token_hash: &str,
+        jti: &str,
         user_id: i64,
         kind: TokenKind,
         ttl_seconds: u64,
@@ -83,16 +99,16 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<(), AppError>;
 
     /// 读一条 session；不存在返回 `Ok(None)`，存在但解码失败走 `AppError::Internal`
-    async fn get_session(&self, token_hash: &str) -> Result<Option<CachedSession>, AppError>;
+    async fn get_session(&self, jti: &str) -> Result<Option<CachedSession>, AppError>;
 
     /// 删一条 session：GET user_id → DEL 主键 + SREM 用户 Set
-    async fn delete_session(&self, token_hash: &str) -> Result<(), AppError>;
+    async fn delete_session(&self, jti: &str) -> Result<(), AppError>;
 
     /// 全清某用户的全部 session：SMEMBERS → 逐条 DEL → DEL Set
     async fn delete_all_user_sessions(&self, user_id: i64) -> Result<(), AppError>;
 
     /// 滑动 TTL；返回 true iff key 存在并 EXPIRE 成功
-    async fn touch_session(&self, token_hash: &str, ttl_seconds: u64) -> Result<bool, AppError>;
+    async fn touch_session(&self, jti: &str, ttl_seconds: u64) -> Result<bool, AppError>;
 }
 
 /// Redis 实现的 SessionStore
@@ -113,21 +129,8 @@ impl RedisSessionStore {
     }
 }
 
-/// sha256(token) → hex；Redis key 的派生，避免直接用明文 token 当 key
-pub fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(&mut hex, "{b:02x}");
-    }
-    hex
-}
-
-fn key_token(token_hash: &str) -> String {
-    format!("session:tok:{token_hash}")
+fn key_session(jti: &str) -> String {
+    format!("session:tok:{jti}")
 }
 
 fn key_user_set(user_id: i64) -> String {
@@ -146,7 +149,7 @@ fn map_redis(e: redis::RedisError) -> AppError {
 impl SessionStore for RedisSessionStore {
     async fn create_session(
         &self,
-        token_hash: &str,
+        jti: &str,
         user_id: i64,
         kind: TokenKind,
         ttl_seconds: u64,
@@ -166,19 +169,19 @@ impl SessionStore for RedisSessionStore {
         let mut conn = self.conn().await?;
         // pipe().atomic() 在 MULTI/EXEC 块中执行：
         //   1. SET <key> <payload> EX <ttl>
-        //   2. SADD <user_set> <token_hash>
+        //   2. SADD <user_set> <jti>
         //   3. EXPIRE <user_set> <ttl>  （与主条目 TTL 对齐，避免 Set 永久残留）
         redis::pipe()
             .atomic()
             .cmd("SET")
-            .arg(key_token(token_hash))
+            .arg(key_session(jti))
             .arg(payload)
             .arg("EX")
             .arg(ttl_seconds)
             .ignore()
             .cmd("SADD")
             .arg(key_user_set(user_id))
-            .arg(token_hash)
+            .arg(jti)
             .ignore()
             .cmd("EXPIRE")
             .arg(key_user_set(user_id))
@@ -190,9 +193,9 @@ impl SessionStore for RedisSessionStore {
         Ok(())
     }
 
-    async fn get_session(&self, token_hash: &str) -> Result<Option<CachedSession>, AppError> {
+    async fn get_session(&self, jti: &str) -> Result<Option<CachedSession>, AppError> {
         let mut conn = self.conn().await?;
-        let raw: Option<String> = conn.get(key_token(token_hash)).await.map_err(map_redis)?;
+        let raw: Option<String> = conn.get(key_session(jti)).await.map_err(map_redis)?;
         match raw {
             None => Ok(None),
             Some(s) => serde_json::from_str(&s)
@@ -201,10 +204,10 @@ impl SessionStore for RedisSessionStore {
         }
     }
 
-    async fn delete_session(&self, token_hash: &str) -> Result<(), AppError> {
+    async fn delete_session(&self, jti: &str) -> Result<(), AppError> {
         // GET → user_id（SREM 必需）；失败/不存在也允许继续 DEL（幂等）
         let mut conn = self.conn().await?;
-        let raw: Option<String> = conn.get(key_token(token_hash)).await.map_err(map_redis)?;
+        let raw: Option<String> = conn.get(key_session(jti)).await.map_err(map_redis)?;
         let user_id = raw
             .as_deref()
             .and_then(|s| serde_json::from_str::<CachedSession>(s).ok())
@@ -213,7 +216,7 @@ impl SessionStore for RedisSessionStore {
         redis::pipe()
             .atomic()
             .cmd("DEL")
-            .arg(key_token(token_hash))
+            .arg(key_session(jti))
             .ignore()
             .query_async::<()>(&mut conn)
             .await
@@ -221,7 +224,7 @@ impl SessionStore for RedisSessionStore {
 
         if let Some(uid) = user_id {
             let _: () = conn
-                .srem(key_user_set(uid), token_hash)
+                .srem(key_user_set(uid), jti)
                 .await
                 .map_err(map_redis)?;
         }
@@ -231,28 +234,28 @@ impl SessionStore for RedisSessionStore {
     async fn delete_all_user_sessions(&self, user_id: i64) -> Result<(), AppError> {
         let mut conn = self.conn().await?;
         let set_key = key_user_set(user_id);
-        // SMEMBERS 当前用户 Set 的全部 token_hash
-        let hashes: Vec<String> = conn.smembers(&set_key).await.map_err(map_redis)?;
-        if !hashes.is_empty() {
+        // SMEMBERS 当前用户 Set 的全部 jti
+        let jtis: Vec<String> = conn.smembers(&set_key).await.map_err(map_redis)?;
+        if !jtis.is_empty() {
             // 用 DEL 批量删除所有 token 主条目（key 不存在会被 Redis 忽略，幂等）
             let mut pipe = redis::pipe();
             pipe.atomic();
-            for h in &hashes {
-                pipe.cmd("DEL").arg(key_token(h)).ignore();
+            for jti in &jtis {
+                pipe.cmd("DEL").arg(key_session(jti)).ignore();
             }
             pipe.query_async::<()>(&mut conn).await.map_err(map_redis)?;
-            // SREM 把这些 hash 从 Set 里摘掉（最后一次 DEL 后 Set 也会被下面清空）
-            let _: () = conn.srem(&set_key, &hashes).await.map_err(map_redis)?;
+            // SREM 把这些 jti 从 Set 里摘掉（最后一次 DEL 后 Set 也会被下面清空）
+            let _: () = conn.srem(&set_key, &jtis).await.map_err(map_redis)?;
         }
         // DEL 用户 Set 本体
         let _: () = conn.del(&set_key).await.map_err(map_redis)?;
         Ok(())
     }
 
-    async fn touch_session(&self, token_hash: &str, ttl_seconds: u64) -> Result<bool, AppError> {
+    async fn touch_session(&self, jti: &str, ttl_seconds: u64) -> Result<bool, AppError> {
         let mut conn = self.conn().await?;
         let updated: bool = conn
-            .expire(key_token(token_hash), ttl_seconds as i64)
+            .expire(key_session(jti), ttl_seconds as i64)
             .await
             .map_err(map_redis)?;
         Ok(updated)
@@ -281,7 +284,7 @@ impl Default for NoopSessionStore {
 impl SessionStore for NoopSessionStore {
     async fn create_session(
         &self,
-        _token_hash: &str,
+        _jti: &str,
         _user_id: i64,
         _kind: TokenKind,
         _ttl_seconds: u64,
@@ -294,11 +297,11 @@ impl SessionStore for NoopSessionStore {
         Ok(())
     }
 
-    async fn get_session(&self, _token_hash: &str) -> Result<Option<CachedSession>, AppError> {
+    async fn get_session(&self, _jti: &str) -> Result<Option<CachedSession>, AppError> {
         Ok(None)
     }
 
-    async fn delete_session(&self, _token_hash: &str) -> Result<(), AppError> {
+    async fn delete_session(&self, _jti: &str) -> Result<(), AppError> {
         Ok(())
     }
 
@@ -306,7 +309,7 @@ impl SessionStore for NoopSessionStore {
         Ok(())
     }
 
-    async fn touch_session(&self, _token_hash: &str, _ttl_seconds: u64) -> Result<bool, AppError> {
+    async fn touch_session(&self, _jti: &str, _ttl_seconds: u64) -> Result<bool, AppError> {
         Ok(false)
     }
 }

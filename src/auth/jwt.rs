@@ -102,24 +102,35 @@ fn default_jwt_id() -> String {
 }
 
 /// 双 token 签发结果
+///
+/// 2026-09-23 重构：新增 `access_jti` / `refresh_jti` 字段（UUID v4）。
+/// jti 直接写入 JWT payload（`claims.jwt_id`），同时充当 Redis session cache key
+/// 的后缀（`session:tok:<jti>`），与 sha256 派生 key 完全解耦。
 #[derive(Debug, Clone)]
 pub struct TokenPair {
     pub access_token: String,
     pub refresh_token: String,
+    pub access_jti: String,
+    pub refresh_jti: String,
     pub access_expires_at: i64,
     pub refresh_expires_at: i64,
 }
 
 /// 签发 access token：自动填 `iat` / `nbf` / `jti` / `aud` / `typ`；`expires_at` 按 ttl 算。
+///
+/// 2026-09-23 重构：返回 `(token, jti, exp)` 三元组。`jti` 即 JWT payload 中
+/// `claims.jwt_id`（UUID v4），是 Redis session key `session:tok:<jti>` 的
+/// 后缀来源，业务层据此写入 Redis 而无需对 token 做哈希。
 pub fn encode_access(
     secret: &str,
     issuer: &str,
     audience: &str,
     subject: i64,
     ttl_hours: i64,
-) -> Result<(String, i64), AppError> {
+) -> Result<(String, String, i64), AppError> {
     let now = Utc::now().timestamp();
     let exp = now + ttl_hours * 3600;
+    let jti = Uuid::new_v4().to_string();
     let claims = AccessTokenClaims {
         subject,
         audience: audience.to_string(),
@@ -127,7 +138,7 @@ pub fn encode_access(
         not_before: now,
         expires_at: exp,
         issuer: issuer.to_string(),
-        jwt_id: Uuid::new_v4().to_string(),
+        jwt_id: jti.clone(),
         token_type: "access".into(),
     };
     encode(
@@ -135,7 +146,7 @@ pub fn encode_access(
         &claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )
-    .map(|t| (t, exp))
+    .map(|t| (t, jti, exp))
     .map_err(|e| AppError::biz(code::INTERNAL, format!("jwt encode: {e}")))
 }
 
@@ -175,6 +186,8 @@ pub fn decode_access(
 }
 
 /// 签发 refresh token：自动填 `iat` / `nbf` / `jti` / `aud` / `typ`；`expires_at` 按 ttl 算。
+///
+/// 2026-09-23 重构：返回 `(token, jti, exp)` 三元组，语义同 `encode_access`。
 pub fn encode_refresh(
     secret: &str,
     issuer: &str,
@@ -182,9 +195,10 @@ pub fn encode_refresh(
     subject: i64,
     refresh_version: i32,
     ttl_days: i64,
-) -> Result<(String, i64), AppError> {
+) -> Result<(String, String, i64), AppError> {
     let now = Utc::now().timestamp();
     let exp = now + ttl_days * 86_400;
+    let jti = Uuid::new_v4().to_string();
     let claims = RefreshTokenClaims {
         subject,
         audience: audience.to_string(),
@@ -192,7 +206,7 @@ pub fn encode_refresh(
         not_before: now,
         expires_at: exp,
         issuer: issuer.to_string(),
-        jwt_id: Uuid::new_v4().to_string(),
+        jwt_id: jti.clone(),
         token_type: "refresh".into(),
         refresh_version,
     };
@@ -201,7 +215,7 @@ pub fn encode_refresh(
         &claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )
-    .map(|t| (t, exp))
+    .map(|t| (t, jti, exp))
     .map_err(|e| AppError::biz(code::INTERNAL, format!("refresh encode: {e}")))
 }
 
@@ -234,6 +248,10 @@ pub fn decode_refresh(
 ///
 /// 2026-09-22 重构：参数从 10 个简化为 7 个——移除 `username/roles/shelf_ids/shelf_wildcard`
 /// （业务字段不再带进 JWT）；新增 `audience`；增加 `refresh_version` 作为 refresh 校验字段。
+///
+/// 2026-09-23 重构：内部使用 `encode_access` / `encode_refresh` 的三元组返回值，
+/// 把各自的 `jti` 写入 `TokenPair`，业务层据此分别去 Redis 创建 access / refresh
+/// session。
 pub fn issue_token_pair(
     subject: i64,
     refresh_version: i32,
@@ -243,9 +261,9 @@ pub fn issue_token_pair(
     access_ttl_hours: i64,
     refresh_ttl_days: i64,
 ) -> Result<TokenPair, AppError> {
-    let (access_token, access_exp) =
+    let (access_token, access_jti, access_exp) =
         encode_access(secret, issuer, audience, subject, access_ttl_hours)?;
-    let (refresh_token, refresh_exp) = encode_refresh(
+    let (refresh_token, refresh_jti, refresh_exp) = encode_refresh(
         secret,
         issuer,
         audience,
@@ -256,6 +274,8 @@ pub fn issue_token_pair(
     Ok(TokenPair {
         access_token,
         refresh_token,
+        access_jti,
+        refresh_jti,
         access_expires_at: access_exp,
         refresh_expires_at: refresh_exp,
     })

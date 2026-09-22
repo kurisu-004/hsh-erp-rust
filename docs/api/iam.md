@@ -97,9 +97,11 @@ Response 200 `data`：
 |---|---|---|
 | `ok` | bool | 始终 `true` |
 
-> 后端从 Bearer token 解析 sha256，删除 Redis 中 `session:tok:<hash>` 条目与
-> 用户 Set 索引中的对应成员；当前 token 立即失效，后续 `/me` 返回 40105 SESSION_REVOKED。
-> 其他 token（同一用户的其他设备）不受影响。
+> 更新于 2026-09-23 重构
+>
+> 后端从 Bearer token 提取 JWT claims.jwt_id（即 jti，UUID v4），删除 Redis 中
+> `session:tok:<jti>` 条目与用户 Set 索引中的对应成员；当前 token 立即失效，
+> 后续 `/me` 返回 40105 SESSION_REVOKED。其他 token（同一用户的其他设备）不受影响。
 
 ### `POST /api/v2/iam/change-password`
 
@@ -142,7 +144,7 @@ Response 200 `data`：同 [`/iam/login`](#post-apiv2iamlogin)
 
 环境变量 `REDIS_SESSION_CHECK_ENABLED`（默认 `true`）控制 Rust 后端是否在每次请求中校验 Redis 服务端 session：
 
-- `true`（默认）：登录/refresh 时把 token hash 写入 Redis；每次请求查 Redis 校验；
+- `true`（默认）：登录/refresh 时把 JWT jti 写入 Redis；每次请求查 Redis 校验；
   logout/change_password 删 Redis 条目强制吊销。40105 SESSION_REVOKED 仍会触发。
 - `false`：不建 Redis 连接池；middleware 直接返 50000 INTERNAL（强制 prod 必须开启 Redis；
   详见 src/auth/middleware.rs::verify_session_token）。业务场景：仅用于过渡期调试；

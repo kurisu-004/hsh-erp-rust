@@ -1,11 +1,11 @@
-//! axum 中间件层：JWT + 服务端 session 校验（2026-09-20 新增 + 2026-09-22 重构）
+//! axum 中间件层：JWT + 服务端 session 校验（2026-09-20 新增 + 2026-09-22 重构 + 2026-09-23 重构）
 //!
 //! 历史背景：认证原本由 `CurrentUser` extractor 在 handler 参数里即时触发；100+ 处
 //! `require_role` 散布在 service 层。WS dashboard 又把校验逻辑手工复制了一份。
-//! 这次重构把"Token → CurrentUser / AuthenticatedTokenHash"的链路收敛到一处：
+//! 这次重构把"Token → CurrentUser / SessionJti"的链路收敛到一处：
 //!
 //! - HTTP REST：注册 `authenticate_middleware` 到 `v2_router()` 顶层 `route_layer`，
-//!   middleware 验证后把 `CurrentUser` / `AuthenticatedTokenHash` 写入 `req.extensions_mut()`，
+//!   middleware 验证后把 `CurrentUser` / `SessionJti` 写入 `req.extensions_mut()`，
 //!   handler 的 extractor 退化成薄壳（仅从 extensions 读取）。
 //! - WS dashboard：query-token 鉴权走 `verify_session_token` 共享核验函数（不走中间件）。
 //!
@@ -35,6 +35,13 @@
 //!   5xxxx 让运维感知配置错误，而非 40105 SESSION_REVOKED 让用户被踢下线困惑。
 //! - `Claims` → `AccessTokenClaims`：JWT 字段全词化（subject/audience/issued_at/...），
 //!   通过 `#[serde(rename = "...")]` 桥接 RFC 7519 短码。
+//!
+//! ## 2026-09-23 重构要点
+//! - session key 由 `sha256(token)` 改为 JWT 自带 jti（UUID v4）：
+//!   Redis 主条目 key 现在是 `session:tok:<jti>`，`SessionStore` 入参从 `token_hash`
+//!   改为 `jti`，`hash_token` 函数被删除（`sha2` crate 因 part_file 仍保留——见 Cargo.toml 注释）。
+//! - `AuthenticatedTokenHash` 重命名为 `SessionJti`，值类型仍为 `String`，但语义
+//!   从 sha256 hex 改为 jti UUID v4。
 
 use std::sync::Arc;
 
@@ -43,10 +50,9 @@ use axum::http::{HeaderMap, header::AUTHORIZATION};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use crate::auth::extractor::AuthenticatedTokenHash;
+use crate::auth::extractor::SessionJti;
 use crate::auth::jwt::decode_access;
 use crate::auth::rbac::{CurrentUser, parse_role_string};
-use crate::auth::session::hash_token;
 use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
@@ -68,7 +74,7 @@ fn is_public_path(path: &str) -> bool {
         || stripped.starts_with("/_e2e/")
 }
 
-/// 校验 access token + Redis session，返回 `(CurrentUser, sha256_hex)`。
+/// 校验 access token + Redis session，返回 `(CurrentUser, jti UUID v4)`。
 ///
 /// HTTP middleware 与 WS dashboard 共用本函数（避免校验逻辑两处实现漂移）。
 ///
@@ -84,10 +90,15 @@ fn is_public_path(path: &str) -> bool {
 /// 4. roles 走 `parse_role_string` 把缓存里的大写字符串转回 `Role` enum（未知值 warn+skip）
 /// 5. username/roles/shelf_ids/shelf_wildcard 从 `cached.profile.{...}` 取（注意字段名是
 ///    `profile`，不是 `cached`；2026-09-22 重命名）
+///
+/// ## 2026-09-23 重构：Redis session key 直接使用 JWT 自带的 jti
+///
+/// 注意：Redis session 的 key 是 JWT payload 里的 `claims.jwt_id`（UUID v4），
+/// **无法**通过对 token 做 sha256 派生匹配——sha256 路径在本轮已被移除。
 pub async fn verify_session_token(
     state: &Arc<AppState>,
     token: &str,
-) -> Result<(CurrentUser, String /* token_hash */), AppError> {
+) -> Result<(CurrentUser, String /* jti */), AppError> {
     // 1) JWT 验签（带 iss + aud 校验）
     let claims = decode_access(
         token,
@@ -96,7 +107,9 @@ pub async fn verify_session_token(
         &state.config.jwt.audience,
     )?;
 
-    let token_hash = hash_token(token);
+    // 2026-09-23 重构：session key 直接用 JWT 自带 jti（claims.jwt_id），
+    // 不再对 token 做 sha256 哈希。
+    let jti = claims.jwt_id.clone();
 
     // 2) session check gate：关掉则直接拒（强制 prod 必须开 Redis）
     //
@@ -113,7 +126,7 @@ pub async fn verify_session_token(
     // 3) 查 Redis session
     let cached = state
         .session
-        .get_session(&token_hash)
+        .get_session(&jti)
         .await?
         .ok_or_else(|| AppError::biz(code::SESSION_REVOKED, "会话已被吊销，请重新登录"))?;
     if cached.user_id != claims.subject {
@@ -126,7 +139,7 @@ pub async fn verify_session_token(
     // 4) 滑动 TTL（best-effort；失败仅 warn，不阻断请求）
     if let Err(e) = state
         .session
-        .touch_session(&token_hash, state.config.redis.session_ttl_seconds)
+        .touch_session(&jti, state.config.redis.session_ttl_seconds)
         .await
     {
         tracing::warn!(error = %e, "刷新 session TTL 失败");
@@ -148,12 +161,12 @@ pub async fn verify_session_token(
             shelf_ids: cached.profile.shelf_ids,
             shelf_wildcard: cached.profile.shelf_wildcard,
         },
-        token_hash,
+        jti,
     ))
 }
 
 /// axum 中间件：解析 `Authorization: Bearer <token>`，调 `verify_session_token`，
-/// 把 `CurrentUser` + `AuthenticatedTokenHash` 写入 `req.extensions_mut()`，再交给下一层。
+/// 把 `CurrentUser` + `SessionJti` 写入 `req.extensions_mut()`，再交给下一层。
 ///
 /// 公开路径（health / login / refresh / _e2e）直接 `next.run(req).await`，
 /// 不写 extensions —— 这些端点本身不带 token，handler 也不取 `CurrentUser`。
@@ -179,15 +192,15 @@ pub async fn authenticate_middleware(
     };
 
     // 校验 + 构造 CurrentUser
-    let (user, token_hash) = match verify_session_token(&state, &token).await {
+    let (user, jti) = match verify_session_token(&state, &token).await {
         Ok(v) => v,
         Err(e) => return e.into_response(),
     };
 
     // 写入 request extensions（handler 端 `CurrentUser::from_request_parts` /
-    // `AuthenticatedTokenHash::from_request_parts` 从这里读）
+    // `SessionJti::from_request_parts` 从这里读）
     req.extensions_mut().insert(user);
-    req.extensions_mut().insert(AuthenticatedTokenHash(token_hash));
+    req.extensions_mut().insert(SessionJti(jti));
 
     next.run(req).await
 }
