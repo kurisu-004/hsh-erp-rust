@@ -65,12 +65,13 @@ bcrypt = "0.17"
 # Redis（用户会话存储，服务端 session 真相源；吊销 access token 用）
 # - redis 1.x：deadpool-redis 0.23 透传；显式 pin + 关闭默认 features，避免拖入多余 runtime
 # - deadpool-redis 0.23：连接池，默认 feature rt_tokio_1 拉 `redis/tokio-comp`
+redis = { version = "1", default-features = false, features = ["tokio-comp"] }
+deadpool-redis = "0.23"
+
 # 2026-09-23 重构：本轮 Redis session key 由 `sha256(token)` 改为 JWT 自带 jti
 # （UUID v4），`auth::session::hash_token` 函数被删除。但 `sha2` crate **保留**——
 # `part_file::repo::hash_bytes`（文件内容 sha256，用于 `t_part_file.content_sha256`
 # 去重唯一索引 `uk_t_part_file_part_kind_sha`）仍依赖它，与 auth 改造正交。
-redis = { version = "1", default-features = false, features = ["tokio-comp"] }
-deadpool-redis = "0.23"
 sha2 = "0.10"
 
 # 配置加载

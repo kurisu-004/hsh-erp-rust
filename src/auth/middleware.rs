@@ -39,7 +39,7 @@
 //! ## 2026-09-23 重构要点
 //! - session key 由 `sha256(token)` 改为 JWT 自带 jti（UUID v4）：
 //!   Redis 主条目 key 现在是 `session:tok:<jti>`，`SessionStore` 入参从 `token_hash`
-//!   改为 `jti`，`hash_token` 函数被删除（`sha2` crate 同步移除）。
+//!   改为 `jti`，`hash_token` 函数被删除（`sha2` crate 因 part_file 仍保留——见 Cargo.toml 注释）。
 //! - `AuthenticatedTokenHash` 重命名为 `SessionJti`，值类型仍为 `String`，但语义
 //!   从 sha256 hex 改为 jti UUID v4。
 

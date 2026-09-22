@@ -273,8 +273,8 @@ HTTP 状态码：
 > 2026-09-23 重构：本轮 Redis session key 从 sha256(token) 改为 JWT jti（UUID v4），
 > key 形状由 `session:tok:<sha256>` 变为 `session:tok:<jti>`。本改造**不涉及**
 > `CachedSession` 字段 rename，旧 key 上的 session 在 12h TTL 内自然过期，不需要
-> 数据迁移；上线顺序：先发 backend-rust（新代码只读新 key），再发 frontend（无协议变化），
-> 无需停服。
+> 数据迁移；上线顺序：先发 backend-rust（新代码读写新 jti key，旧 sha256 key 上的
+> session 随 TTL 12h 自然清空），再发 frontend（无协议变化），过渡期所有用户需重新登录。
 
 ---
 

@@ -144,7 +144,7 @@ Response 200 `data`：同 [`/iam/login`](#post-apiv2iamlogin)
 
 环境变量 `REDIS_SESSION_CHECK_ENABLED`（默认 `true`）控制 Rust 后端是否在每次请求中校验 Redis 服务端 session：
 
-- `true`（默认）：登录/refresh 时把 token hash 写入 Redis；每次请求查 Redis 校验；
+- `true`（默认）：登录/refresh 时把 JWT jti 写入 Redis；每次请求查 Redis 校验；
   logout/change_password 删 Redis 条目强制吊销。40105 SESSION_REVOKED 仍会触发。
 - `false`：不建 Redis 连接池；middleware 直接返 50000 INTERNAL（强制 prod 必须开启 Redis；
   详见 src/auth/middleware.rs::verify_session_token）。业务场景：仅用于过渡期调试；

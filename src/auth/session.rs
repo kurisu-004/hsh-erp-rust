@@ -21,8 +21,8 @@
 //! ## 2026-09-23 重构
 //! - Redis 主条目 key 从 `session:tok:<sha256(token)>` 改为 `session:tok:<jti>`，
 //!   jti 直接复用 JWT 自带的 `claims.jwt_id`（UUID v4），不再调用 `hash_token`。
-//! - 删除 `hash_token` 函数（及其 `sha2` 依赖），`SessionStore` trait 入参从
-//!   `token_hash: &str` 改为 `jti: &str`；语义改名 `AuthenticatedTokenHash` → `SessionJti`。
+//! - 删除 `hash_token` 函数（`sha2` crate 因 part_file 仍保留），`SessionStore` trait
+//!   入参从 `token_hash: &str` 改为 `jti: &str`；语义改名 `AuthenticatedTokenHash` → `SessionJti`。
 
 use async_trait::async_trait;
 use chrono::Utc;
