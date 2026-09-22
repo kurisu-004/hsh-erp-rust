@@ -3,10 +3,10 @@
 > 本文件须与 `src/modules/part/{handler.rs,dto.rs,service.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
-> 域覆盖：CRUD / by-serial 查询 / upload-drawing / lifecycle 状态机（deliver / cancel / complete / start-repair）/ inspection 流（to-inspection / to-ship / to-process / worker-scan）。所有路径前缀 `/api/v2`。
+> 域覆盖：CRUD / by-serial 查询 / upload-drawing / lifecycle 状态机（deliver / cancel / complete / start-repair）/ inspection 流（to-inspection / to-ship / to-process / worker-scan）/ batch split（batch-with-pdfs / `/{part_id}/batches` / `batches/split`）。所有路径前缀 `/api/v2`。
 > 已拆为子目录：
 >
-> 导航：[**`index.md`**](./index.md) · [`crud.md`](./crud.md) · [`lifecycle.md`](./lifecycle.md) · [`inspection.md`](./inspection.md)
+> 导航：[**`index.md`**](./index.md) · [`crud.md`](./crud.md) · [`lifecycle.md`](./lifecycle.md) · [`inspection.md`](./inspection.md) · [`batch.md`](./batch.md)
 >
 > · part-batches 详情见 [inspection.md](./inspection.md#get-apiv2partsby-serialserial_nopart-batches)
 

@@ -870,3 +870,38 @@ INSPECTION → IN_PROCESS 由 `POST /parts/{id}/to-process`（to_process 流）�
 | 20507 | BIZ_SHELF_PROCESS_NOT_MAPPED | worker-scan RETURNED：`shelf_id` ↔ `next_process_id` 在 `t_shelf_process` 未映射；to-process 待 shelf 域 PR 启用 |
 | 20511 | BIZ_SHELF_NOT_INSPECTION_ZONE | `target_inspection_shelf.zone ≠ 'INSPECTION'` |
 | 20512 | BIZ_SHELF_INACTIVE | `shelf.is_active = false` |
+
+---
+
+### `POST /api/v2/parts/scan/deliver-part`
+
+权限: **已登录**
+
+> 2026-09-23 起 PR12 补：扫码交付端点（区别于 `delivery_note/scan`，本端点是
+> 工人扫码交付在制 part，触发 P3 流转）。前端从 PDA / 扫描枪直接 POST，body
+> 仅含 `part_serial_no`（或 `batch_id`），服务端按状态机守卫 + 自动流转。
+
+Request：
+
+```json
+{
+  "serial_no": "string (必填；若用 batch_id 则二选一)",
+  "batch_id": 1234567890,    // 可选；扫描到 part_id 后再用
+  "to_worker_id": 42,         // 可选；指定交付目标工人（默认当前 user）
+  "note": "string (可选)"
+}
+```
+
+业务流转：
+- 扫描 `serial_no` → 找到 part + 当前 active batch
+- 状态机检查：`IN_PROCESS → DELIVERED`（worker scan 流程）
+- 同事务：写 `t_part_event(event_type='DELIVERED')` + `t_part_event(actor_user_id=worker)`
+
+Response 200 `data`：`{ part_id, batch_id, from_status, to_status, version }`。
+
+错误码：
+- 20101 / 20109 / 20114 / 20115 / 20116 / 20117 / 40901
+
+---
+
+> **2026-09-23 PR12 同步说明**：本节 1 个端点（`/scan/deliver-part`）原 docs/api/parts/inspection.md 未覆盖，本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。

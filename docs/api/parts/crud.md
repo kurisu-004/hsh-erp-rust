@@ -255,3 +255,92 @@ Response 200 `data`：最新 `TPartFile` 行（`kind` = `3D_MODEL`，`file_type`
 ### PartUpdateRequest 字段
 
 见上文 [`POST /parts/{id}/update`](#post-apiv2partspart_idupdate) 字段表。
+
+---
+
+### `GET /api/v2/parts/{part_id}/events`
+
+权限: **已登录**
+
+> 2026-09-23 起 PR12 补：列出 part 全部事件日志（含状态机流转 + batch 流转 + repair + delivery note 挂接等）。
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `part_id` | string (i64) | 雪花 ID |
+
+Query：`event_type?` / `batch_id?` / `limit?` / `offset?`（默认 100 / 0）。
+
+Response 200 `data`：`{ items: [PartEventOut], total, limit, offset }`。
+
+`PartEventOut` 字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string (i64) | 雪花 |
+| `part_id` | string (i64) | |
+| `batch_id` | string (i64)? | batch 级事件有值 |
+| `event_type` | string | `CREATED` / `STATUS_CHANGED` / `DELIVERED` / `COMPLETED` / `CANCELLED` / `REPAIR_STARTED` / `PICKED_UP` / `SHIPPED` 等 |
+| `from_status` | string? | 状态机起点 |
+| `to_status` | string? | 状态机终点 |
+| `actor_user_id` | string (i64)? | 操作者 |
+| `note` | string? | |
+| `created_at` | naive datetime | |
+
+### `GET /api/v2/parts/location-tree`
+
+权限: **已登录**
+
+> 2026-09-23 起 PR12 补：返回货架树（按 zone 分组：PRODUCTION / INSPECTION / RETURN），用于前端 picker。
+
+Response 200 `data`：`[ShelfNode]`（递归 `children`）。
+
+`ShelfNode` 字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `zone` | string | `PRODUCTION` / `INSPECTION` / `RETURN` |
+| `zone_label` | string | 中文显示 |
+| `shelves` | [Shelf] | 该 zone 下货架（按 `sort_order` 排序） |
+
+`Shelf` 见 [`../shelves.md#shelf-字段`](../shelves.md#shelf-字段)。
+
+### `POST /api/v2/parts/match-by-excel-items`
+
+权限: **Manager / Clerk**
+
+> 2026-09-23 起 PR12 补：Excel 批量匹配（POST 入参 body）。前端上传 Excel → 服务端按 `part_name` / `drawing_no` / `serial_no` 三种 key 分别匹配已有 part；返回每个 item 的匹配结果（用于人工确认导入）。
+
+Request：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `items` | [ExcelItem] | ✓ | Excel 解析后的 item 列表 |
+| `default_match_key` | string? | — | `part_name` / `drawing_no` / `serial_no`，默认 `part_name` |
+
+`ExcelItem` 字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part_name` | string | |
+| `drawing_no` | string? | |
+| `serial_no` | string? | |
+| `quantity` | i32? | |
+
+Response 200 `data`：`{ matches: [MatchResult], unmatched: [ExcelItem] }`。
+
+`MatchResult` 字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `item_index` | usize | 在原 `items[]` 中的位置 |
+| `matched_part_id` | string (i64)? | null = 未匹配 |
+| `match_key` | string | 实际命中的 key 类型 |
+| `confidence` | string | `EXACT` / `FUZZY` / `BY_DRAWING_NO` / `BY_SERIAL` |
+
+错误码：40001 / 20104。
+
+---
+
+> **2026-09-23 PR12 同步说明**：本节 3 个端点（`/{part_id}/events` / `/location-tree` / `/match-by-excel-items`）原 docs/api/parts/crud.md 未覆盖，本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。

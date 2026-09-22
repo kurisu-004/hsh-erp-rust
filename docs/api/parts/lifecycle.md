@@ -144,3 +144,140 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
 
 仅含可选 `reason` / `note`（cancel 走 part 级 + 级联取消全部活跃批次，详见
 [重构方案 §4.2](../../refactor-part-assembly-batch.md#42-rollup-回调核心-新增-partservicesync_from_batch_change)）。
+
+---
+
+### `POST /api/v2/parts/{part_id}/pick-up`
+
+权限: **Worker**（自己的 part 拣货；其它人需 Manager）
+
+> 2026-09-22 起 P3 pickup 端点（替换原 `pick-up-batch` 独立端点为 batch-级 OCC 集成）。
+> 用于 worker 主动拣走自己的在制件；`version` 锚定 `t_part_batch.version`。
+
+Request：
+
+```json
+{
+  "batch_id": 1234567890,    // 必填；操作的目标 batch id
+  "version": 0,               // 必填；batch.version（OCC）
+  "note": "string (可选)"
+}
+```
+
+Response 200 `data`：`PartOut`。
+
+错误码：20101 / 20109 / 20119 / 40901。
+
+### `POST /api/v2/parts/{part_id}/place-on-shelf`
+
+权限: **Manager / Clerk**
+
+> 2026-09-22 起 P3 lifecycle 端点（PR-B3 batch 级）。工人拣走件入库上货架。
+> 状态机：`IN_PROCESS → ON_SHELF`。
+
+Request：
+
+```json
+{
+  "batch_id": 1234567890,
+  "version": 0,
+  "shelf_id": 42,            // 必填；货架 id
+  "note": "string (可选)"
+}
+```
+
+Response 200 `data`：`PartOut`。
+
+错误码：20101 / 20109 / 20120 / 40400 / 40901。
+
+### `POST /api/v2/parts/{part_id}/complete-repair`
+
+权限: **Manager / Inspector**
+
+> 2026-09-22 起 P3 repair 收尾。`version` 锚 `t_part_batch.version`。
+> 状态机：`REPAIRING → IN_PROCESS`。
+
+Request：
+
+```json
+{
+  "batch_id": 1234567890,
+  "version": 0,
+  "note": "string (可选)"
+}
+```
+
+Response 200 `data`：`PartOut`。
+
+错误码：20101 / 20109 / 20121 / 40901。
+
+### `POST /api/v2/parts/{part_id}/repair-dispatch`
+
+权限: **Manager**
+
+> 2026-09-22 起 P3 repair 起始（与 `start-repair` 类似但用于派工而非自检）。
+> 状态机：`IN_PROCESS → REPAIRING`。
+
+Request：
+
+```json
+{
+  "batch_id": 1234567890,
+  "version": 0,
+  "worker_id": 42,           // 必填；被派工工人
+  "reason": "string (可选)",
+  "note": "string (可选)"
+}
+```
+
+Response 200 `data`：`PartOut`。
+
+错误码：20101 / 20109 / 20118 / 40901。
+
+### `GET /api/v2/parts/by-worker/{worker_id}`
+
+权限: **已登录**
+
+> 2026-09-22 起 P3 list by worker。返回该 worker 名下所有活跃 part 列表。
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `worker_id` | string (i64) | 工人雪花 ID |
+
+Query：`status?` / `limit?` / `offset?`（默认 50 / 0）。
+
+Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
+
+### `GET /api/v2/parts/outsource-sendable`
+
+权限: **Manager / Clerk**
+
+> 2026-09-22 起 P3 list。返回可发送外协的 part 列表（状态 = READY_TO_SHIP 且无 active 外协 quote）。
+
+Query：`process_id?` / `limit?` / `offset?`。
+
+Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
+
+### `GET /api/v2/parts/repair-batches`
+
+权限: **Manager / Inspector**
+
+> 2026-09-22 起 P3 list。返回所有 REPAIRING 状态的 batch 汇总。
+
+Query：`worker_id?` / `process_id?` / `limit?` / `offset?`。
+
+Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
+
+### `GET /api/v2/parts/repairing-batches`
+
+权限: **Manager / Inspector**
+
+> 2026-09-22 起 P3 list（与 `repair-batches` 同语义，区别：含 worker 在制中）。
+
+Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
+
+---
+
+> **2026-09-23 PR12 同步说明**：本节 8 个端点（pick-up / place-on-shelf / complete-repair / repair-dispatch / 4 个 GET 列表）原 docs/api/parts/lifecycle.md 未覆盖，本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。
