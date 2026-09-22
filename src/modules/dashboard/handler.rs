@@ -1,9 +1,10 @@
-//! dashboard WebSocket handler（2026-09-15 takeover-fill + followup-cleanup）
+//! dashboard WebSocket handler（2026-09-15 takeover-fill + followup-cleanup +
+//! 2026-09-22 Group E 重构）
 //!
 //! 路径：`GET /ws/dashboard?token=<JWT>`（由 `dashboard::mod::router()` 桥接，
 //! 再由 `modules::ws_router()` 在 `/ws` 前缀下挂）。
 //!
-//! 实现要点：
+//! ## 实现要点
 //! - query token 鉴权：走 `auth::middleware::verify_access_token` 共享核验函数
 //!   （与 HTTP middleware 同源：Bearer JWT 验签 + iss 校验 + Redis session 校验
 //!   + 滑动 TTL；本 handler 不重复实现，2026-09-20 重构）
@@ -17,6 +18,13 @@
 //!   原 `Message::Ping` 浏览器不会触发 `onmessage`，前端无法感知；2026-09-15 followup A6 改）。
 //!   间隔由 `state.config.ws_heartbeat_interval_seconds` 控制，生产 30s，测试可调小。
 //! - 推一次 `WsSnapshotMsg` 立即下发
+//!
+//! ## 2026-09-22 Group E 重构：handler 三形态 ①（snapshot 单次只读聚合）
+//! `build_snapshot_msg` 走 `state.pool.begin() → state.dashboard_service.build_snapshot_with_workers(&mut tx, None) → tx.commit()`
+//! 路径，commit 即结束（WS 协议不依赖 tx，handler 内已完成全部 DB 读取）。后续 ws_hub.broadcast
+//! 是订阅事件模式，不再走 service、不开 tx。
+//!
+//! 详见本文件 module-level doc + `service/mod.rs`。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +39,6 @@ use tracing::{info, warn};
 use crate::auth::middleware::verify_access_token;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::dashboard::dto::{WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
-use crate::modules::dashboard::service::DashboardService;
 use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
@@ -41,6 +48,13 @@ pub struct WsQuery {
 }
 
 /// `GET /ws/dashboard?token=<JWT>`
+///
+/// WS-only 端点（2026-09-22 Group E 重构）：
+/// - 路径：`/ws/dashboard`（`modules::ws_router()` 在 `/ws` 前缀下挂，无 `/api/v2`）
+/// - 鉴权：`verify_access_token`（不走 HTTP middleware；WS upgrade 帧不能被拦截）
+/// - snapshot 拉取走 handler 三形态 ①（`pool.begin() → service → commit`，开 tx 仅作
+///   单次只读聚合边界，commit 即结束）
+/// - 后续 ws_hub.broadcast 是订阅模式，不开 tx、不再走 service
 pub async fn ws_dashboard(
     State(state): State<Arc<AppState>>,
     Query(q): Query<WsQuery>,
@@ -177,10 +191,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: i64) {
     info!(user_id = user_id, "ws dashboard: 连接清理完成");
 }
 
-/// 拉一次快照并组装 envelope。
+/// 拉一次快照并组装 envelope（handler 三形态 ①：开 tx → service → commit）。
+///
+/// 2026-09-22 Group E 重构：从 `state.dashboard_service`（不是业务层 `AppState`
+/// 直接持有）取 service 实例；service 方法签名改 `<R: DashboardRepoTrait>(&self,
+/// mut repo: R, ...)` by-value，handler 借 `&mut *tx` 喂给 trait（trait 已直接
+/// `impl for &mut PgConnection`，2026-09-22 同 iam 范式）。
 async fn build_snapshot_msg(state: &AppState) -> Result<String, AppError> {
     let mut tx = state.pool.begin().await?;
-    let snap = DashboardService::build_snapshot_with_workers(&mut tx, None).await?;
+    let snap = state
+        .dashboard_service
+        .build_snapshot_with_workers(&mut *tx, None)
+        .await?;
     tx.commit().await?;
     let envelope = WsSnapshotMsg::new(snap);
     Ok(serde_json::to_string(&envelope).unwrap_or_default())
