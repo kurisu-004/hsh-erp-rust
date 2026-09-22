@@ -97,9 +97,11 @@ Response 200 `data`：
 |---|---|---|
 | `ok` | bool | 始终 `true` |
 
-> 后端从 Bearer token 解析 sha256，删除 Redis 中 `session:tok:<hash>` 条目与
-> 用户 Set 索引中的对应成员；当前 token 立即失效，后续 `/me` 返回 40105 SESSION_REVOKED。
-> 其他 token（同一用户的其他设备）不受影响。
+> 更新于 2026-09-23 重构
+>
+> 后端从 Bearer token 提取 JWT claims.jwt_id（即 jti，UUID v4），删除 Redis 中
+> `session:tok:<jti>` 条目与用户 Set 索引中的对应成员；当前 token 立即失效，
+> 后续 `/me` 返回 40105 SESSION_REVOKED。其他 token（同一用户的其他设备）不受影响。
 
 ### `POST /api/v2/iam/change-password`
 

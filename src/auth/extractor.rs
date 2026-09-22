@@ -1,8 +1,12 @@
-//! axum extractor：从 request extensions 读取 `CurrentUser` / `AuthenticatedTokenHash`
+//! axum extractor：从 request extensions 读取 `CurrentUser` / `SessionJti`
 //!
 //! 2026-09-20 重构：原本的 JWT 验签 + Redis session 校验 + 滑动 TTL 全部迁移到
 //! `auth::middleware::authenticate_middleware`；本模块**仅**作为薄壳，从
-//! `req.extensions()` 读 `CurrentUser` / `AuthenticatedTokenHash`，由 middleware 注入。
+//! `req.extensions()` 读 `CurrentUser` / `SessionJti`，由 middleware 注入。
+//!
+//! 2026-09-23 重构：session key 由 `sha256(token)` 改为 JWT 自带 jti（UUID v4），
+//! `AuthenticatedTokenHash` → `SessionJti`，值类型不变（String），但语义从 sha256 hex
+//! 改为 jti UUID v4。
 //!
 //! Handler 用法（不变）：
 //! ```ignore
@@ -17,7 +21,7 @@
 //! ```
 //!
 //! ## fail-closed 设计
-//! 取不到 `CurrentUser` / `AuthenticatedTokenHash`（例如 middleware 未挂、或 whitelist
+//! 取不到 `CurrentUser` / `SessionJti`（例如 middleware 未挂、或 whitelist
 //! 路径下 handler 误取）→ `AppError::biz(code::UNAUTHORIZED, ...)`（40100）。
 //! 报错信息含「middleware misconfigured」提示，便于主代理排查配置问题。
 
@@ -49,14 +53,16 @@ impl FromRequestParts<Arc<crate::state::AppState>> for CurrentUser {
     }
 }
 
-/// Token hash（由 middleware 写入 extensions，供 logout 等 handler 拿 sha256 去删 Redis）
+/// SessionJti（由 middleware 写入 extensions，供 logout 等 handler 拿 jti 去删 Redis）
 ///
 /// 2026-09-22 重命名：原 `AuthTokenHash` → `AuthenticatedTokenHash`，与 `authenticate_middleware`
 /// 命名风格对齐（已鉴权产物）。
+/// 2026-09-23 重命名：`AuthenticatedTokenHash` → `SessionJti`，值类型不变（`String`），
+/// 语义从 sha256 hex 改为 jti UUID v4（与 `auth::session::SessionJti` 同形）。
 #[derive(Clone)]
-pub struct AuthenticatedTokenHash(pub String);
+pub struct SessionJti(pub String);
 
-impl FromRequestParts<Arc<crate::state::AppState>> for AuthenticatedTokenHash {
+impl FromRequestParts<Arc<crate::state::AppState>> for SessionJti {
     type Rejection = AppError;
 
     async fn from_request_parts(
@@ -66,12 +72,12 @@ impl FromRequestParts<Arc<crate::state::AppState>> for AuthenticatedTokenHash {
         // 同样取不到 → 40100 fail-closed
         parts
             .extensions
-            .get::<AuthenticatedTokenHash>()
+            .get::<SessionJti>()
             .cloned()
             .ok_or_else(|| {
                 AppError::biz(
                     code::UNAUTHORIZED,
-                    "missing AuthenticatedTokenHash in request extensions (middleware misconfigured)",
+                    "missing SessionJti in request extensions (middleware misconfigured)",
                 )
             })
     }

@@ -67,7 +67,9 @@ pub async fn ws_dashboard(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "缺少 token 查询参数"))?;
-    let (user, _token_hash) = verify_session_token(&state, token).await?;
+    // 2026-09-23 重构：返回值的第二个元素从 sha256 hash 改为 JWT jti (UUID v4)，
+    // WS 端点不持久化 token，仅丢弃 jti（与 HTTP middleware 同源）。
+    let (user, _jti) = verify_session_token(&state, token).await?;
     // 2026-09-20 修改：username 写日志，便于按用户名排查连接异常；当前端点任意已登录即可，
     // 故不调用 user.require_role(...)。未来若加「仅 MANAGER 可见」再启用 require_role 守卫。
     info!(user_id = user.id, username = %user.username, "ws dashboard: 鉴权通过");

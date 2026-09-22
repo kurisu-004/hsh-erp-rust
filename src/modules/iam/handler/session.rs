@@ -1,6 +1,6 @@
 //! iam 域 session 端点 handler（5 个，原 auth 域）
 //!
-//! ## 事务边界（2026-09-21 重构 + 2026-09-22 删 `PgIamRepo` 转发壳）
+//! ## 事务边界（2026-09-21 重构 + 2026-09-22 删 `PgIamRepo` 转发壳 + 2026-09-23 重构）
 //! - `login` / `refresh`：两阶段——handler `pool.begin()` → service → commit →
 //!   service.complete_login/complete_refresh（commit 后写 Redis）。
 //! - `change_password`：handler `pool.begin()` → service → commit → handler 清 Redis
@@ -9,13 +9,16 @@
 //! - `logout`：无 DB 操作，仅删 Redis session。
 //!
 //! 全部端点要求 Bearer JWT（除 `login` / `refresh` 是公开），权限守卫在 service 层。
+//!
+//! 2026-09-23 重构：`logout` handler 用 `SessionJti` 替代 `AuthenticatedTokenHash`
+//! （值类型仍为 `String`，但语义从 sha256 hex 改为 JWT jti UUID v4）。
 
 use std::sync::Arc;
 
 use axum::extract::State;
 use axum::Json;
 
-use crate::auth::extractor::AuthenticatedTokenHash;
+use crate::auth::extractor::SessionJti;
 use crate::auth::rbac::CurrentUser;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
@@ -48,12 +51,15 @@ pub async fn me(
 
 /// POST /api/v2/iam/logout —— 删当前 token 的 Redis session，使后续 `/me` 立即 40105。
 /// 无 DB 操作。
+///
+/// 2026-09-23 重构：从 `SessionJti` 拿 JWT 自带 jti（UUID v4）去删 Redis
+/// `session:tok:<jti>` 条目，替代原 sha256(token) hash 路径。
 pub async fn logout(
     State(state): State<Arc<AppState>>,
     _user: CurrentUser,
-    AuthenticatedTokenHash(token_hash): AuthenticatedTokenHash,
+    SessionJti(jti): SessionJti,
 ) -> Result<Json<R<LogoutResponse>>, AppError> {
-    state.session_service.logout(&token_hash).await?;
+    state.session_service.logout(&jti).await?;
     Ok(Json(R::ok(LogoutResponse { ok: true })))
 }
 

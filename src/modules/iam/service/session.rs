@@ -24,13 +24,17 @@
 //!
 //! 2026-09-19 IAM 域合并：`AuthService` → `SessionService`，改密用 `AccountService`
 //! 取代原 `UserService`。
+//!
+//! 2026-09-23 重构：Redis session key 由 `sha256(token)` 改为 JWT 自带 jti（UUID v4）。
+//! `complete_login` / `complete_refresh` 现在直接用 `pair.access_jti` / `pair.refresh_jti`
+//! 写 Redis；refresh 阶段从入参 token 的 `claims.jwt_id` 取旧 refresh jti。
 
 use std::sync::Arc;
 
 use crate::auth::jwt::{TokenPair, decode_refresh, issue_token_pair};
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::auth::session::{CachedUserProfile, SessionStore, TokenKind, hash_token};
+use crate::auth::session::{CachedUserProfile, SessionStore, TokenKind};
 use crate::infra::clock::now_naive;
 use crate::infra::config::AppConfig;
 use crate::shared::error::{AppError, code};
@@ -62,8 +66,11 @@ pub struct LoginPending {
     pub menus: Vec<MenuNodeOut>,
 }
 
-/// refresh 第一阶段产出：DB 操作结果 + 待签 token + 用户视图素材 + 旧 refresh hash。
+/// refresh 第一阶段产出：DB 操作结果 + 待签 token + 用户视图素材 + 旧 refresh jti。
 /// handler 拿到后 commit，然后调 `complete_refresh` 删旧 session + 写新 + 组装响应。
+///
+/// 2026-09-23 重构：`old_refresh_hash: String` → `old_refresh_jti: String`，值来源从
+/// `hash_token(&req.refresh_token)` 改为 `decode_refresh(...).jwt_id.clone()`。
 #[derive(Debug)]
 pub struct RefreshPending {
     pub pair: TokenPair,
@@ -72,7 +79,7 @@ pub struct RefreshPending {
     pub shelf_ids: Vec<i64>,
     pub shelf_wildcard: bool,
     pub menus: Vec<MenuNodeOut>,
-    pub old_refresh_hash: String,
+    pub old_refresh_jti: String,
 }
 
 /// iam 域会话 service。构造时注入 `Arc<AppConfig>`（JWT / Redis TTL 配置）+
@@ -206,18 +213,13 @@ impl SessionService {
             shelf_wildcard,
         };
         let ttl = self.config.redis.session_ttl_seconds;
+        // 2026-09-23 重构：Redis session key 直接使用 JWT 自带 jti（UUID v4）。
         self.session
-            .create_session(
-                &hash_token(&pair.access_token),
-                u.id,
-                TokenKind::Access,
-                ttl,
-                &profile,
-            )
+            .create_session(&pair.access_jti, u.id, TokenKind::Access, ttl, &profile)
             .await?;
         self.session
             .create_session(
-                &hash_token(&pair.refresh_token),
+                &pair.refresh_jti,
                 u.id,
                 TokenKind::Refresh,
                 ttl,
@@ -239,8 +241,11 @@ impl SessionService {
     // =======================================================================
 
     /// refresh 第一阶段：DB 操作 + 轮转 refresh_token_version + 签发新 token，
-    /// 返回 `RefreshPending`（含旧 refresh hash）。**不** commit、**不**删旧 session、
+    /// 返回 `RefreshPending`（含旧 refresh jti）。**不** commit、**不**删旧 session、
     /// **不**写新 Redis session——由 handler commit 后调 `complete_refresh`。
+    ///
+    /// 2026-09-23 重构：旧 refresh 的 session key 不再做 sha256(token) 派生，
+    /// 直接从 `decode_refresh(...).jwt_id` 取 jti 字符串。
     pub async fn refresh<R: IamRepo>(
         &self,
         mut repo: R,
@@ -256,6 +261,8 @@ impl SessionService {
         )
         .map_err(|_| AppError::biz(code::REFRESH_INVALID, "refresh token 失效"))?;
         let (sub, ver) = (claims.subject, claims.refresh_version);
+        // 2026-09-23 重构：从 `claims.jwt_id` 取旧 refresh jti，不再调用 `hash_token`。
+        let old_refresh_jti = claims.jwt_id.clone();
 
         // 2. 查用户 + 校验 active + 校验版本号匹配
         let u = repo
@@ -315,7 +322,7 @@ impl SessionService {
             shelf_ids,
             shelf_wildcard,
             menus,
-            old_refresh_hash: hash_token(&req.refresh_token),
+            old_refresh_jti,
         })
     }
 
@@ -332,10 +339,11 @@ impl SessionService {
             shelf_ids,
             shelf_wildcard,
             menus,
-            old_refresh_hash,
+            old_refresh_jti,
         } = pending;
 
-        if let Err(e) = self.session.delete_session(&old_refresh_hash).await {
+        // 2026-09-23 重构：直接用旧 refresh jti 删 session。
+        if let Err(e) = self.session.delete_session(&old_refresh_jti).await {
             tracing::warn!(error = %e, user_id = u.id, "refresh: 删旧 refresh session 失败");
         }
         // 2026-09-22 重构：`CachedCurrentUser` → `CachedUserProfile`（删 id 字段）；
@@ -347,18 +355,13 @@ impl SessionService {
             shelf_wildcard,
         };
         let ttl = self.config.redis.session_ttl_seconds;
+        // 2026-09-23 重构：Redis session key 直接使用 JWT 自带 jti（UUID v4）。
         self.session
-            .create_session(
-                &hash_token(&pair.access_token),
-                u.id,
-                TokenKind::Access,
-                ttl,
-                &profile,
-            )
+            .create_session(&pair.access_jti, u.id, TokenKind::Access, ttl, &profile)
             .await?;
         self.session
             .create_session(
-                &hash_token(&pair.refresh_token),
+                &pair.refresh_jti,
                 u.id,
                 TokenKind::Refresh,
                 ttl,
@@ -428,8 +431,11 @@ impl SessionService {
 
     /// 登出当前 token：删 Redis session 条目，使后续 `/iam/me` 立即返回 40105。
     /// 无 DB 操作，本服务不 begin。
-    pub async fn logout(&self, token_hash: &str) -> Result<(), AppError> {
-        self.session.delete_session(token_hash).await
+    ///
+    /// 2026-09-23 重构：形参名 `token_hash` → `jti`，语义从 sha256(token) hex 改为
+    /// JWT 自带 jti（UUID v4）。
+    pub async fn logout(&self, jti: &str) -> Result<(), AppError> {
+        self.session.delete_session(jti).await
     }
 }
 

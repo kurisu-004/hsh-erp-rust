@@ -24,7 +24,6 @@ use common::{
 
 use futures_util::StreamExt;
 use hsh_erp_rust::auth::jwt::encode_access;
-use hsh_erp_rust::auth::session::hash_token;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
@@ -257,7 +256,9 @@ async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i6
     use hsh_erp_rust::auth::session::{CachedUserProfile, TokenKind};
     // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_hours)`，
     // 不再收 Claims；iat/nbf/jti/aud/typ 由函数内部填。
-    let (token, _exp) = encode_access(
+    // 2026-09-23 重构：encode_access 返回三元组 `(token, jti, exp)`，jti 即为 Redis session
+    // key 后缀来源（`session:tok:<jti>`），无需再调用 `hash_token`。
+    let (token, jti, _exp) = encode_access(
         &state.config.jwt.secret,
         &state.config.jwt.issuer,
         &state.config.jwt.audience,
@@ -276,7 +277,7 @@ async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i6
     state
         .session
         .create_session(
-            &hash_token(&token),
+            &jti,
             user_id,
             TokenKind::Access,
             state.config.redis.session_ttl_seconds,

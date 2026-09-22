@@ -82,7 +82,9 @@ fn json_request(
 async fn mint_token_no_session(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
     // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_hours)`，
     // 不再收 Claims；iat/nbf/jti/aud/typ 由函数内部填。直接调用即可。
-    let (token, _exp) = encode_access(
+    // 2026-09-23 重构：encode_access 返回 `(token, jti, exp)` 三元组；本 helper 不写
+    // Redis session，丢弃 jti 即可。
+    let (token, _jti, _exp) = encode_access(
         &state.config.jwt.secret,
         &state.config.jwt.issuer,
         &state.config.jwt.audience,
