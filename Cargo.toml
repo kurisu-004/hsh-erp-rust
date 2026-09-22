@@ -170,12 +170,6 @@ calamine = "0.26"
 # 锁定避免版本漂移；tokio 未引用时 [dev-dependencies] 仍正常解析。
 libc = "0.2"
 
-# 2026-09-22 新增：SQLite POC，探索「oneshot + SQLite + nextest」能否让集成测试
-# 摆脱 PG 容器。**仅 dev-deps**，主依赖零侵入；与主依赖同 crate 同版本，cargo
-# 自动 union features（仅追加 `sqlite`）。不引入新版本，与 Cargo.lock 已锁的
-# sqlx 0.9 共享。
-sqlx = { version = "0.9", features = ["sqlite"] }
-
 # ---------------------------------------------------------------------------------
 # P0 spike bin 已删除（迁移到 src/modules/delivery_note/print.rs）。
 # ---------------------------------------------------------------------------------

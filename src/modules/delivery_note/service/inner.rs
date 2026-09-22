@@ -26,9 +26,6 @@ use super::super::dto::{
     DeliveryNoteAddItem, DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut,
 };
 use super::super::model::{DeliveryNote, DeliveryNoteEvent, NoteScope};
-use super::super::repo::{DeliveryNoteEventRepo, DeliveryNoteRepo};
-
-use super::DeliveryNoteService;
 
 // ===========================================================================
 //  types
@@ -193,7 +190,7 @@ pub(super) async fn build_note_outs(
 
 /// `get_with_parts`：单子 + 批次行（行 = 批次）+ 装配件父行字段。
 pub(super) async fn get_with_parts(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     note_id: i64,
 ) -> Result<DeliveryNoteDetailOut, AppError> {
     let n = conn.note_get_by_id(note_id, false).await?
@@ -307,7 +304,7 @@ pub(super) async fn get_with_parts(
 /// - `Group(gid)`：part.customer_id ∈ group.member_ids
 /// - `Leaf(cid)`：part.customer_id == leaf_customer_id
 pub(super) async fn check_scope(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     obj: &DeliveryNote,
     part_customer_id: i64,
 ) -> Result<(), AppError> {
@@ -367,7 +364,7 @@ pub(super) fn scope_from_note(n: &DeliveryNote) -> NoteScope {
 
 /// add_parts 内部实现（被 create_draft 与 add_parts handler 复用）。
 pub(super) async fn add_parts_inner(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     snowflake: &SnowflakeIdGenerator,
     note_id: i64,
     items: &[DeliveryNoteAddItem],
@@ -554,7 +551,7 @@ pub(super) async fn add_parts_inner(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write_event(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     snowflake: &SnowflakeIdGenerator,
     note_id: i64,
     event_type: super::super::model::DeliveryNoteEventType,
@@ -631,7 +628,7 @@ pub(super) fn validate_group_name(raw: &str) -> Result<String, AppError> {
 }
 
 pub(super) async fn validate_l2_members(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     l1_id: &i64,
     ids: &[i64],
 ) -> Result<Vec<i64>, AppError> {

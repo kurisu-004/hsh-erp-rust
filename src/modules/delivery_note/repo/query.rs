@@ -17,6 +17,6 @@
 // 重导出 sql.rs 内的全部 ZST struct + 读查询方法（保留原 query.rs 的 ZST 静态
 // 调用面，方便潜在 caller 不破坏）。所有 SQL 真源均在 sql.rs，本文件不再承载任何
 // sqlx::query! 调用。
-pub use super::sql::DeliveryGroupRepo as _DeliveryGroupRepoQuery;
-pub use super::sql::DeliveryNoteEventRepo as _DeliveryNoteEventRepoQuery;
-pub use super::sql::DeliveryNoteRepo as _DeliveryNoteRepoQuery;
+pub use super::DeliveryGroupRepo as _DeliveryGroupRepoQuery;
+pub use super::DeliveryNoteEventRepo as _DeliveryNoteEventRepoQuery;
+pub use super::DeliveryNoteRepo as _DeliveryNoteRepoQuery;

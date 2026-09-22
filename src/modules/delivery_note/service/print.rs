@@ -1,4 +1,8 @@
 //! P4：送货单 Excel 打印（print_xlsx）。CPU 密集部分包 `spawn_blocking`。
+//!
+//! 2026-09-22 D-5 + review 第 1 轮：print 是只读端点（tx 仅装 detail），不开写；
+//! 仍由 service 自己开 tx（与「pool.acquire() → service 走 bound conn」范式一致）；
+//! 形参改为 `&self`（service 装线 AppState）。
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -31,6 +35,7 @@ impl DeliveryNoteService {
     /// `print::render_labels`，否则 `print::render_note`。
     #[allow(clippy::too_many_arguments)]
     pub async fn print_xlsx(
+        &self,
         pool: &PgPool,
         note_id: i64,
         custom_order: Option<Vec<i64>>,

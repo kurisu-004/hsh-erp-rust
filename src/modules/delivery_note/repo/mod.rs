@@ -49,11 +49,20 @@ pub mod mutate;
 pub mod query;
 pub mod sql;
 
-// 重导出 sql.rs 中的 ZST struct 与 model 表行类型，让上层继续用
-// `super::repo::{DeliveryGroup, DeliveryNote, DeliveryNoteEvent, DeliveryGroupMember,
-//  DeliveryGroupRepo, DeliveryNoteRepo, DeliveryNoteEventRepo}` 这种路径不破。
+// ZST struct 定义（review 第 1 轮修复：原 commit `a64ec0f` 删除但下游
+// `impl super::DeliveryGroupRepo` / `impl super::DeliveryNoteRepo` /
+// `impl super::DeliveryNoteEventRepo` 仍引用，造成 E0432「unresolved import
+// super::sql::DeliveryGroupRepo」。ZST 与 SQL 真源同在 `sql.rs` 内——
+// 定义放本文件（与 SQL 隔开），`impl super::XxxRepo` 一行委托 SQL 真源）。
+pub struct DeliveryGroupRepo;
+pub struct DeliveryNoteRepo;
+pub struct DeliveryNoteEventRepo;
+
+// 重导出 model 表行类型，让上层继续用
+// `super::repo::{DeliveryGroup, DeliveryNote, DeliveryNoteEvent, DeliveryGroupMember}` 这种路径不破。
+// ZST struct（DeliveryGroupRepo / DeliveryNoteRepo / DeliveryNoteEventRepo）
+// 直接在本文件定义（见上方 `pub struct XxxRepo;`），不再从 sql.rs 重导出。
 pub use super::model::{DeliveryGroup, DeliveryGroupMember, DeliveryNote, DeliveryNoteEvent};
-pub use sql::{DeliveryGroupRepo, DeliveryNoteEventRepo, DeliveryNoteRepo};
 
 /// 排序方向（与 Python `model.enums::SortDir` 对齐）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +83,11 @@ pub enum SortDir {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait DeliveryNoteRepoTrait: Send {
+    /// 借位访问器：返回 `&mut PgConnection`，供跨域 ZST 静态调用
+    /// （`PartRepo::xxx(&mut *repo.conn_mut(), ...)` / `CustomerRepo::xxx(...)` 等）。
+    /// 生产实现（`&mut PgConnection`）直返 `self`；mock 测试不调用此方法。
+    fn conn_mut(&mut self) -> &mut PgConnection;
+
     // ── t_delivery_group 查询（6）──
     async fn group_list_by_customer(
         &mut self,
@@ -150,7 +164,7 @@ pub trait DeliveryNoteRepoTrait: Send {
         statuses: &'a [&'a str],
         customer_id: Option<i64>,
         keyword: Option<&'a str>,
-        sort_by: super::super::model::DeliveryNoteSortKey,
+        sort_by: super::model::DeliveryNoteSortKey,
         sort_dir: SortDir,
         limit: i64,
         offset: i64,
@@ -168,7 +182,7 @@ pub trait DeliveryNoteRepoTrait: Send {
     async fn note_find_open_draft_by_scope(
         &mut self,
         l1_id: i64,
-        scope: super::super::model::NoteScope,
+        scope: super::model::NoteScope,
         other_than: Option<i64>,
     ) -> Result<Option<DeliveryNote>, sqlx::Error>;
 
@@ -201,6 +215,10 @@ pub trait DeliveryNoteRepoTrait: Send {
 /// 须写 `&mut **self`（reborrow，避免 move 引用本身）。
 #[async_trait]
 impl DeliveryNoteRepoTrait for &mut PgConnection {
+    fn conn_mut(&mut self) -> &mut PgConnection {
+        self
+    }
+
     // ── t_delivery_group 查询（6）── 一行委托 sql::DeliveryGroupRepo ───────
     async fn group_list_by_customer(
         &mut self,
@@ -313,7 +331,7 @@ impl DeliveryNoteRepoTrait for &mut PgConnection {
         statuses: &'b [&'b str],
         customer_id: Option<i64>,
         keyword: Option<&'b str>,
-        sort_by: super::super::model::DeliveryNoteSortKey,
+        sort_by: super::model::DeliveryNoteSortKey,
         sort_dir: SortDir,
         limit: i64,
         offset: i64,
@@ -350,7 +368,7 @@ impl DeliveryNoteRepoTrait for &mut PgConnection {
     async fn note_find_open_draft_by_scope(
         &mut self,
         l1_id: i64,
-        scope: super::super::model::NoteScope,
+        scope: super::model::NoteScope,
         other_than: Option<i64>,
     ) -> Result<Option<DeliveryNote>, sqlx::Error> {
         DeliveryNoteRepo::find_open_draft_by_scope(&mut **self, l1_id, scope, other_than).await

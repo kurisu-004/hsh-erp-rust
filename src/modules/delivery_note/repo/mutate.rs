@@ -15,8 +15,8 @@
 //!
 //! 2026-09-22：原 `query.rs` + `mutate.rs` 全文内容已搬迁至 `sql.rs`。
 
-// 重导出 sql.rs 内的全部 ZST struct + 写查询方法（保留原 mutate.rs 的 ZST 静态
-// 调用面）。所有 SQL 真源均在 sql.rs，本文件不再承载任何 sqlx::query! 调用。
-pub use super::sql::DeliveryGroupRepo as _DeliveryGroupRepoMutate;
-pub use super::sql::DeliveryNoteEventRepo as _DeliveryNoteEventRepoMutate;
-pub use super::sql::DeliveryNoteRepo as _DeliveryNoteRepoMutate;
+// 重导出 mod.rs 内的 ZST struct（写查询面）。所有 SQL 真源均在 sql.rs，
+// 本文件不再承载任何 sqlx::query! 调用。
+pub use super::DeliveryGroupRepo as _DeliveryGroupRepoMutate;
+pub use super::DeliveryNoteEventRepo as _DeliveryNoteEventRepoMutate;
+pub use super::DeliveryNoteRepo as _DeliveryNoteRepoMutate;

@@ -1,17 +1,13 @@
 //! `scan_add` 5 组分类 helpers（2026-09-22 D-5 拆出）
 //!
-//! 单元测试保留在 `mod.rs` 末尾（rust 2018+ 规定 `#[cfg(test)] mod` 之后只能再放
-//! `#[cfg(test)]` 项）。
+//! 单元测试保留在 `tests.rs`（review 第 1 轮抽出，本文件只留生产 helpers）。
 
 use std::collections::HashMap;
 
-use crate::modules::delivery_note::dto::{
-    AttachableBatchDto, AvailableBatchDto, BatchStatusDto, ScanOutcomeDto, UnresolvedTargetDto,
-};
-use crate::modules::delivery_note::model::TPart;
+use crate::modules::delivery_note::dto::{ScanOutcomeDto, UnresolvedTargetDto};
+use crate::modules::part::model::TPart;
 use crate::modules::part_batch::model::TPartBatch;
 
-use super::super::DeliveryNoteService;
 use super::helpers;
 
 // ---------------------------------------------------------------------------
@@ -20,9 +16,9 @@ use super::helpers;
 
 /// A 组：可直接 attach 入单（INSPECTION + READY_TO_SHIP）。
 ///
-/// `pub(super)`：service::scan 与 service::attach 共用一份定义；不要在
+/// `pub(crate)`：service::scan 与 service::attach 共用一份定义；不要在
 /// service/ 之外的代码里直接调用，attach 模块走 `super::scan::is_attachable_state`。
-pub(super) fn is_attachable_state(status: &str) -> bool {
+pub(crate) fn is_attachable_state(status: &str) -> bool {
     matches!(status, "READY_TO_SHIP" | "INSPECTION")
 }
 
@@ -41,7 +37,7 @@ pub(super) fn is_inspectable_state(b: &TPartBatch) -> bool {
 }
 
 /// C 组：直接报错的非法状态。`IN_PROCESS` 被工人持有（`location = 'WORKER'`）归此类。
-pub(super) fn classify_invalid_state(b: &TPartBatch) -> Option<&'static str> {
+pub(crate) fn classify_invalid_state(b: &TPartBatch) -> Option<&'static str> {
     match b.status.as_str() {
         "DELIVERED" => Some("DELIVERED"),
         "OUTSOURCE" => Some("OUTSOURCE"),

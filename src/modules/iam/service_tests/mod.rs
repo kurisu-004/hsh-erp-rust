@@ -43,6 +43,7 @@ use crate::modules::upload_session::repo::InMemoryUploadSessionRepo;
 use crate::state::AppState;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
+use crate::modules::delivery_note::service::{DeliveryGroupService, DeliveryNoteService};
 use crate::modules::outsource::service::OutsourceService;
 use crate::modules::prod::process::service::ProcessService;
 use crate::modules::prod::process_chain::service::crud::ProcessChainService;
@@ -177,6 +178,10 @@ process_chain_service: Arc::new(ProcessChainService::new(snowflake.clone())),
         // 2026-09-22 prod/worker_pool service 是 unit struct，无字段
         // 不装线到 AppState；handler 直接走 ZST 静态调用 `WorkerPoolService::xxx`。
         worker_pool_service: Arc::new(WorkerPoolService::new()),
+        // 2026-09-22 D-5 delivery_note service 装线：仅需 snowflake（unit tests
+        // 不直接走这两个 service，iam/service_tests 仅覆盖 iam，传占位实例即可）。
+        delivery_note_service: Arc::new(DeliveryNoteService::new(snowflake.clone())),
+        delivery_group_service: Arc::new(DeliveryGroupService::new(snowflake.clone())),
     })
 }
 

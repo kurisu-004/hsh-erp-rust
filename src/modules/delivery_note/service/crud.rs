@@ -1,13 +1,18 @@
 //! DeliveryNoteService 列表 / 草稿 / 详情 / 编辑 / 添加 / 移除。
+//!
+//! ## 2026-09-22 D-5 + review 第 1 轮修正（service by-value trait）
+//! - 所有方法签名从 `pub async fn xxx(conn: &mut PgConnection, snowflake: &SnowflakeIdGenerator, ...)`
+//!   改成 `pub async fn xxx<R: DeliveryNoteRepoTrait>(&self, mut repo: R, ...)`（iam 严格范本）。
+//! - 跨域 ZST 静态调用走 `&mut *repo.conn_mut()`；私有 helper（`add_parts_inner` /
+//!   `build_note_outs` / `get_with_parts` / `write_event`）收 `&mut PgConnection`，
+//!   caller 喂 `&mut *repo.conn_mut()`。
+//! - 原 `sqlx::query!(...)` 直调走 `&mut *repo.conn_mut()` 替换 `&mut *conn`。
 
 use std::collections::HashMap;
-
-use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::serial::next_delivery_note_no;
-use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part_batch::repo::PartBatchRepo;
@@ -33,8 +38,9 @@ impl DeliveryNoteService {
     // ---------- list ----------
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn list_with_filters(
-        conn: &mut PgConnection,
+    pub async fn list_with_filters<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         statuses: &[&str],
         customer_id: Option<i64>,
         keyword: Option<&str>,
@@ -51,7 +57,7 @@ impl DeliveryNoteService {
             Role::CncProgrammer,
         ])?;
 
-        let rows = conn
+        let rows = repo
             .note_list_with_filters(
                 statuses,
                 customer_id,
@@ -62,11 +68,11 @@ impl DeliveryNoteService {
                 offset,
             )
             .await?;
-        let total = conn
+        let total = repo
             .note_count_with_filters(statuses, customer_id, keyword)
             .await?;
 
-        let items = build_note_outs(conn, &rows).await?;
+        let items = build_note_outs(&mut *repo.conn_mut(), &rows).await?;
         Ok(DeliveryNoteListOut {
             items,
             total,
@@ -75,8 +81,9 @@ impl DeliveryNoteService {
         })
     }
 
-    pub async fn list_for_pickup(
-        conn: &mut PgConnection,
+    pub async fn list_for_pickup<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         customer_id: Option<i64>,
         current: &CurrentUser,
     ) -> Result<Vec<DeliveryNoteOut>, AppError> {
@@ -84,22 +91,22 @@ impl DeliveryNoteService {
         // 这里不做角色硬限；具体 worker 校验在 pickup/pickup_scan 里。
         let _ = current;
 
-        let rows = conn.note_list_for_pickup(customer_id).await?;
-        build_note_outs(conn, &rows).await
+        let rows = repo.note_list_for_pickup(customer_id).await?;
+        build_note_outs(&mut *repo.conn_mut(), &rows).await
     }
 
     // ---------- create_draft ----------
 
-    pub async fn create_draft(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn create_draft<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         req: DeliveryNoteCreateRequest,
         current: &CurrentUser,
     ) -> Result<DeliveryNoteDetailOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
         // 1. 校验 L1 存在且是 L1（parent_id IS NULL）
-        let l1 = CustomerRepo::get_by_id(&mut *conn, req.customer_id, false)
+        let l1 = CustomerRepo::get_by_id(&mut *repo.conn_mut(), req.customer_id, false)
             .await?
             .ok_or_else(|| super::inner::customer_not_found(req.customer_id))?;
         if l1.parent_id.is_some() {
@@ -113,12 +120,13 @@ impl DeliveryNoteService {
         }
 
         // 2. 发放单号
-        let delivery_note_no = next_delivery_note_no(&mut *conn, req.customer_id).await?;
+        let delivery_note_no =
+            next_delivery_note_no(&mut *repo.conn_mut(), req.customer_id).await?;
 
         // 3. 写入草稿
         let now = now_naive();
         let note = DeliveryNote {
-            id: snowflake.next_id(),
+            id: self.snowflake.next_id(),
             delivery_note_no,
             customer_id: req.customer_id,
             status: STATUS_DRAFT.to_string(),
@@ -138,12 +146,12 @@ impl DeliveryNoteService {
             delivery_group_id: None,
             leaf_customer_id: None,
         };
-        conn.note_create(&note).await?;
+        repo.note_create(&note).await?;
 
         // 4. CREATED 事件
         write_event(
-            conn,
-            snowflake,
+            &mut *repo.conn_mut(),
+            &self.snowflake,
             note.id,
             DeliveryNoteEventType::Created,
             None,
@@ -155,19 +163,28 @@ impl DeliveryNoteService {
 
         // 5. 原子带入首批零件（如果给了 items）
         if !req.items.is_empty() {
-            add_parts_inner(conn, snowflake, note.id, &req.items, note.version, current).await?;
+            add_parts_inner(
+                &mut *repo.conn_mut(),
+                &self.snowflake,
+                note.id,
+                &req.items,
+                note.version,
+                current,
+            )
+            .await?;
         }
 
-        get_with_parts(conn, note.id).await
+        get_with_parts(&mut *repo.conn_mut(), note.id).await
     }
 
     // ---------- get_with_parts ----------
 
-    pub async fn get_with_parts(
-        conn: &mut PgConnection,
+    pub async fn get_with_parts<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
     ) -> Result<DeliveryNoteDetailOut, AppError> {
-        get_with_parts(conn, note_id).await
+        get_with_parts(&mut *repo.conn_mut(), note_id).await
     }
 
     // ---------- get_many_with_parts (PR3 batch-detail) ----------
@@ -182,8 +199,9 @@ impl DeliveryNoteService {
     ///
     /// 输出按入参 `ids` 顺序排列；缺失 id 静默跳过；入参应已 dedupe（caller 责任）。
     #[allow(clippy::too_many_lines)]
-    pub async fn get_many_with_parts(
-        conn: &mut PgConnection,
+    pub async fn get_many_with_parts<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         ids: &[i64],
     ) -> Result<Vec<DeliveryNoteDetailOut>, AppError> {
         use crate::modules::assembly::model::TAssembly;
@@ -196,18 +214,21 @@ impl DeliveryNoteService {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let heads = conn.note_list_by_ids(ids, false).await?;
+        let heads = repo.note_list_by_ids(ids, false).await?;
         if heads.is_empty() {
             return Ok(Vec::new());
         }
         let head_ids: Vec<i64> = heads.iter().map(|n| n.id).collect();
 
-        let rows =
-            PartBatchRepo::list_with_part_by_delivery_note_ids(&mut *conn, &head_ids).await?;
+        let rows = PartBatchRepo::list_with_part_by_delivery_note_ids(
+            &mut *repo.conn_mut(),
+            &head_ids,
+        )
+        .await?;
 
         let leaf_ids: HashSet<i64> = rows.iter().map(|(_b, p)| p.customer_id).collect();
         let leaf_list = CustomerRepo::list_by_ids(
-            &mut *conn,
+            &mut *repo.conn_mut(),
             &leaf_ids.iter().copied().collect::<Vec<_>>(),
             false,
         )
@@ -219,7 +240,7 @@ impl DeliveryNoteService {
             Vec::new()
         } else {
             CustomerRepo::list_by_ids(
-                &mut *conn,
+                &mut *repo.conn_mut(),
                 &parent_ids.iter().copied().collect::<Vec<_>>(),
                 false,
             )
@@ -236,13 +257,13 @@ impl DeliveryNoteService {
             .collect();
         let mut assembly_map: HashMap<i64, TAssembly> = HashMap::new();
         if !asm_ids.is_empty() {
-            let asms = AssemblyRepo::list_by_ids(&mut *conn, &asm_ids, false).await?;
+            let asms = AssemblyRepo::list_by_ids(&mut *repo.conn_mut(), &asm_ids, false).await?;
             for a in asms {
                 assembly_map.insert(a.id, a);
             }
         }
 
-        let head_outs = build_note_outs(conn, &heads).await?;
+        let head_outs = build_note_outs(&mut *repo.conn_mut(), &heads).await?;
         let head_out_map: HashMap<i64, DeliveryNoteOut> =
             head_outs.into_iter().map(|h| (h.id, h)).collect();
 
@@ -324,16 +345,16 @@ impl DeliveryNoteService {
 
     // ---------- update (partial) ----------
 
-    pub async fn update(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn update<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
         req: DeliveryNoteUpdateRequest,
         current: &CurrentUser,
     ) -> Result<DeliveryNoteOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let mut obj = conn
+        let mut obj = repo
             .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
@@ -375,7 +396,7 @@ impl DeliveryNoteService {
             obj.version += 1;
             obj.updated_at = now;
             obj.updated_by = Some(current.id);
-            let affected = conn.note_update(&obj).await?;
+            let affected = repo.note_update(&obj).await?;
             if affected == 0 {
                 return Err(AppError::biz(
                     code::VERSION_CONFLICT,
@@ -383,35 +404,43 @@ impl DeliveryNoteService {
                 ));
             }
             // 立即 reload 让 updated_at 拿到 server 值
-            obj = conn
+            obj = repo
                 .note_get_by_id(note_id, false)
                 .await?
                 .ok_or_else(|| note_not_found(note_id))?;
         }
-        let _ = snowflake;
-        let out = build_note_outs(conn, std::slice::from_ref(&obj)).await?;
+        let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
         Ok(out.into_iter().next().unwrap())
     }
 
     // ---------- add_parts ----------
 
-    pub async fn add_parts(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn add_parts<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
         items: &[DeliveryNoteAddItem],
         version: i32,
         current: &CurrentUser,
     ) -> Result<DeliveryNoteDetailOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-        add_parts_inner(conn, snowflake, note_id, items, version, current).await?;
-        get_with_parts(conn, note_id).await
+        add_parts_inner(
+            &mut *repo.conn_mut(),
+            &self.snowflake,
+            note_id,
+            items,
+            version,
+            current,
+        )
+        .await?;
+        get_with_parts(&mut *repo.conn_mut(), note_id).await
     }
 
     // ---------- remove_parts ----------
 
-    pub async fn remove_parts(
-        conn: &mut PgConnection,
+    pub async fn remove_parts<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
         batch_ids: &[i64],
         version: i32,
@@ -419,7 +448,7 @@ impl DeliveryNoteService {
     ) -> Result<DeliveryNoteDetailOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let obj = conn
+        let obj = repo
             .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
@@ -437,7 +466,7 @@ impl DeliveryNoteService {
         }
 
         if batch_ids.is_empty() {
-            return get_with_parts(conn, note_id).await;
+            return get_with_parts(&mut *repo.conn_mut(), note_id).await;
         }
 
         let now = now_naive();
@@ -457,10 +486,10 @@ impl DeliveryNoteService {
                 Some(current.id),
                 note_id,
             )
-            .execute(&mut *conn)
+            .execute(&mut *repo.conn_mut())
             .await?;
         }
 
-        get_with_parts(conn, note_id).await
+        get_with_parts(&mut *repo.conn_mut(), note_id).await
     }
 }

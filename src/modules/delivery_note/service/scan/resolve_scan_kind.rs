@@ -9,7 +9,7 @@
 //! > 也挂在 assembly** —— 解析分支不会有歧义。
 
 use crate::modules::assembly::model::TAssembly;
-use crate::modules::delivery_note::model::TPart;
+use crate::modules::part::model::TPart;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ScanKind {

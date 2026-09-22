@@ -2,33 +2,18 @@
 //!
 //! 对应 Python myERP/api/v1/delivery_note.py（设计 §6）。
 //!
-//! ## 约定
-//! - 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
+//! ## 约定（2026-09-22 D-5 + review 第 1 轮）
+//! - 事务边界在 handler：`state.pool.begin()` → 借 `&mut *tx` 喂给 service → 显式
 //!   `tx.commit()`；提前 return（`?`）时 `Transaction` 的 Drop 自动回滚。
+//! - **service 形参 by-value trait**（iam 严格范本）：handler 借 `&mut *tx` 给
+//!   `state.delivery_note_service.xxx(&mut *tx, ...)` 或 `&mut *conn` 给读端点。
+//! - **handler 三形态**：
+//!   - ① 纯写端点 `pool.begin() → service → commit`；
+//!   - ② 写 + post-commit Redis / WS（broadcast 落 handler，service 不持有 WsHub）`pool.begin() → service → commit → state.ws_hub.broadcast(...)`；
+//!   - ③ 读端点（list_*/get_*）`pool.acquire() → service`，不开事务。
 //! - 统一响应信封：`Result<Json<R<T>>, AppError>`。
-//! - 权限在 service 层（`current.require_any_role(...)`）；handler 这里
-//!   只解析 query / path / body。
-//!
-//! ## Phase 路由（设计 §6 + §6.2）
-//! 业务端点统一 `/api/v2/delivery-notes/*`：
-//! - `POST   /scan`                           ← Phase P3 扫码建单（设计 §5）
-//! - `GET    /candidate-parts?customer_id=...`
-//! - `GET    /pickup-pending?customer_id=...`
-//! - `GET    /`
-//! - `POST   /`
-//! - `GET    /{id}`
-//! - `GET    /{id}/events`
-//! - `POST   /{id}/update`
-//! - `POST   /{id}/add-parts`
-//! - `POST   /{id}/remove-parts`
-//! - `POST   /{id}/attach-batches`            ← Phase P3+ 弹窗批量 attach A 组
-//! - `POST   /{id}/submit`
-//! - `POST   /{id}/recall`
-//! - `POST   /{id}/pickup-scan`
-//! - `POST   /{id}/pickup`
-//! - `POST   /{id}/soft-delete`
-//!
-//! 打印 `/print` / `/print-labels` 留到 P4，本期不注册。
+//! - 权限在 service 层（`current.require_any_role(...)`）；handler 这里只解析
+//!   query / path / body。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -42,7 +27,6 @@ use serde::Deserialize;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::delivery_note::model::DeliveryNoteSortKey;
 use crate::modules::delivery_note::repo::SortDir;
-use crate::modules::delivery_note::service::DeliveryNoteService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -105,15 +89,17 @@ pub async fn batch_get_delivery_notes(
             crate::shared::error::code::BIZ_INVALID_VALUE,
             format!(
                 "ids length exceeds {} (got {})",
-                BATCH_DETAIL_MAX_IDS,
-                ids.len()
+                BATCH_DETAIL_MAX_IDS, ids.len()
             ),
         ));
     }
 
-    let mut tx = state.pool.begin().await?;
-    let items = DeliveryNoteService::get_many_with_parts(&mut tx, &ids).await?;
-    tx.commit().await?;
+    // 读端点：pool.acquire() → service → drop。不开事务（与 iam me/list_users 同形）。
+    let mut conn = state.pool.acquire().await?;
+    let items = state
+        .delivery_note_service
+        .get_many_with_parts(&mut *conn, &ids)
+        .await?;
     Ok(Json(R::ok(BatchDeliveryDetailData { items })))
 }
 
@@ -123,9 +109,12 @@ pub async fn list_candidate_parts(
     current: CurrentUser,
     Query(q): Query<DeliveryNoteCandidatePartsQuery>,
 ) -> Result<Json<R<DeliveryNoteCandidatePartsOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let items = DeliveryNoteService::list_candidate_parts(&mut tx, q.customer_id, &current).await?;
-    tx.commit().await?;
+    // 读端点：pool.acquire() → service → drop。
+    let mut conn = state.pool.acquire().await?;
+    let items = state
+        .delivery_note_service
+        .list_candidate_parts(&mut *conn, q.customer_id, &current)
+        .await?;
     Ok(Json(R::ok(DeliveryNoteCandidatePartsOut { items })))
 }
 
@@ -135,9 +124,12 @@ pub async fn list_pickup_pending(
     current: CurrentUser,
     Query(q): Query<DeliveryNotePickupPendingQuery>,
 ) -> Result<Json<R<super::dto::DeliveryNotePickupListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let items = DeliveryNoteService::list_for_pickup(&mut tx, q.customer_id, &current).await?;
-    tx.commit().await?;
+    // 读端点：pool.acquire() → service → drop。
+    let mut conn = state.pool.acquire().await?;
+    let items = state
+        .delivery_note_service
+        .list_for_pickup(&mut *conn, q.customer_id, &current)
+        .await?;
     Ok(Json(R::ok(super::dto::DeliveryNotePickupListOut { items })))
 }
 
@@ -147,7 +139,7 @@ pub async fn list_delivery_notes(
     current: CurrentUser,
     Query(q): Query<DeliveryNoteListQuery>,
 ) -> Result<Json<R<super::dto::DeliveryNoteListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
+    // 读端点：pool.acquire() → service → drop。
 
     // 解析 statuses：query string `?statuses=A,B` → vec!["A","B"]
     let status_vec: Vec<String> = match q.statuses.as_deref() {
@@ -171,19 +163,22 @@ pub async fn list_delivery_notes(
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
     let status_strs: Vec<&str> = status_vec.iter().map(|s| s.as_str()).collect();
-    let out = DeliveryNoteService::list_with_filters(
-        &mut tx,
-        &status_strs,
-        q.customer_id,
-        q.keyword.as_deref(),
-        sort_by,
-        sort_dir,
-        limit,
-        offset,
-        &current,
-    )
-    .await?;
-    tx.commit().await?;
+
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .delivery_note_service
+        .list_with_filters(
+            &mut *conn,
+            &status_strs,
+            q.customer_id,
+            q.keyword.as_deref(),
+            sort_by,
+            sort_dir,
+            limit,
+            offset,
+            &current,
+        )
+        .await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -194,7 +189,10 @@ pub async fn create_delivery_note(
     Json(req): Json<DeliveryNoteCreateRequest>,
 ) -> Result<Json<R<super::dto::DeliveryNoteDetailOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::create_draft(&mut tx, &state.snowflake, req, &current).await?;
+    let out = state
+        .delivery_note_service
+        .create_draft(&mut *tx, req, &current)
+        .await?;
     tx.commit().await?;
 
     // commit 后广播（设计 §5：commit 之后再 push，避免回滚后误推）
@@ -218,9 +216,12 @@ pub async fn get_delivery_note(
     _current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
 ) -> Result<Json<R<super::dto::DeliveryNoteDetailOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::get_with_parts(&mut tx, path.id).await?;
-    tx.commit().await?;
+    // 读端点：pool.acquire() → service → drop。
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .delivery_note_service
+        .get_with_parts(&mut *conn, path.id)
+        .await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -230,9 +231,12 @@ pub async fn list_delivery_note_events(
     _current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
 ) -> Result<Json<R<Vec<super::dto::DeliveryNoteEventOut>>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let events = DeliveryNoteService::list_events(&mut tx, path.id).await?;
-    tx.commit().await?;
+    // 读端点：pool.acquire() → service → drop。
+    let mut conn = state.pool.acquire().await?;
+    let events = state
+        .delivery_note_service
+        .list_events(&mut *conn, path.id)
+        .await?;
     Ok(Json(R::ok(events)))
 }
 
@@ -244,8 +248,10 @@ pub async fn update_delivery_note(
     Json(req): Json<DeliveryNoteUpdateRequest>,
 ) -> Result<Json<R<super::dto::DeliveryNoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out =
-        DeliveryNoteService::update(&mut tx, &state.snowflake, path.id, req, &current).await?;
+    let out = state
+        .delivery_note_service
+        .update(&mut *tx, path.id, req, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -258,15 +264,10 @@ pub async fn add_delivery_note_parts(
     Json(req): Json<DeliveryNoteAddPartsRequest>,
 ) -> Result<Json<R<super::dto::DeliveryNoteDetailOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::add_parts(
-        &mut tx,
-        &state.snowflake,
-        path.id,
-        &req.items,
-        req.version,
-        &current,
-    )
-    .await?;
+    let out = state
+        .delivery_note_service
+        .add_parts(&mut *tx, path.id, &req.items, req.version, &current)
+        .await?;
     tx.commit().await?;
 
     state
@@ -287,9 +288,10 @@ pub async fn remove_delivery_note_parts(
     Json(req): Json<DeliveryNoteRemovePartsRequest>,
 ) -> Result<Json<R<super::dto::DeliveryNoteDetailOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out =
-        DeliveryNoteService::remove_parts(&mut tx, path.id, &req.batch_ids, req.version, &current)
-            .await?;
+    let out = state
+        .delivery_note_service
+        .remove_parts(&mut *tx, path.id, &req.batch_ids, req.version, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -310,9 +312,10 @@ pub async fn submit_delivery_note(
     Json(req): Json<DeliveryNoteVersionedRequest>,
 ) -> Result<Json<R<SubmitDeliveryOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out =
-        DeliveryNoteService::submit(&mut tx, &state.snowflake, path.id, req.version, &current)
-            .await?;
+    let out = state
+        .delivery_note_service
+        .submit(&mut *tx, path.id, req.version, &current)
+        .await?;
     tx.commit().await?;
 
     // 仅真正提交时广播；候选分支未写库，不发事件
@@ -339,9 +342,10 @@ pub async fn recall_delivery_note(
     Json(req): Json<DeliveryNoteVersionedRequest>,
 ) -> Result<Json<R<super::dto::DeliveryNoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out =
-        DeliveryNoteService::recall(&mut tx, &state.snowflake, path.id, req.version, &current)
-            .await?;
+    let out = state
+        .delivery_note_service
+        .recall(&mut *tx, path.id, req.version, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -354,14 +358,10 @@ pub async fn pickup_scan(
     Json(req): Json<DeliveryNotePickupScanRequest>,
 ) -> Result<Json<R<DeliveryNotePickupScanOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::pickup_scan(
-        &mut tx,
-        path.id,
-        &req.part_serial,
-        req.badge_code.as_deref(),
-        &current,
-    )
-    .await?;
+    let out = state
+        .delivery_note_service
+        .pickup_scan(&mut *tx, path.id, &req.part_serial, req.badge_code.as_deref(), &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -374,16 +374,17 @@ pub async fn pickup_delivery_note(
     Json(req): Json<DeliveryNotePickupRequest>,
 ) -> Result<Json<R<super::dto::DeliveryNoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::pickup(
-        &mut tx,
-        &state.snowflake,
-        path.id,
-        req.driver_worker_id,
-        req.version,
-        req.badge_code.as_deref(),
-        &current,
-    )
-    .await?;
+    let out = state
+        .delivery_note_service
+        .pickup(
+            &mut *tx,
+            path.id,
+            req.driver_worker_id,
+            req.version,
+            req.badge_code.as_deref(),
+            &current,
+        )
+        .await?;
     tx.commit().await?;
 
     let payload = serde_json::json!({
@@ -411,7 +412,10 @@ pub async fn soft_delete_delivery_note(
     Json(req): Json<DeliveryNoteVersionedRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    DeliveryNoteService::soft_delete(&mut tx, path.id, req.version, &current).await?;
+    state
+        .delivery_note_service
+        .soft_delete(&mut *tx, path.id, req.version, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok_empty()))
 }
@@ -431,7 +435,10 @@ pub async fn scan_delivery_note(
 ) -> Result<Json<R<ScanDeliveryOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::scan_add(&mut tx, &state.snowflake, &req.code, &current).await?;
+    let out = state
+        .delivery_note_service
+        .scan_add(&mut *tx, &req.code, &current)
+        .await?;
     tx.commit().await?;
 
     let added_count = out.added_batches.len();
@@ -499,7 +506,10 @@ pub async fn attach_batches(
     }
 
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryNoteService::attach_batches(&mut tx, path.id, req.batches, &current).await?;
+    let out = state
+        .delivery_note_service
+        .attach_batches(&mut *tx, path.id, req.batches, &current)
+        .await?;
     tx.commit().await?;
 
     // 提交成功后广播（部分成功也广播，但 frontend 可用 conflicts 长度判断是否需要回滚 UI）
@@ -538,17 +548,19 @@ pub async fn print_delivery_note(
     let custom_order = parse_i64_opt(req.custom_order.as_ref(), "custom_order")?;
     let merge_quantities = parse_i64_map_opt(req.merge_quantities.as_ref(), "merge_quantities")?;
 
-    let bytes_prefix = DeliveryNoteService::print_xlsx(
-        &state.pool,
-        path.id,
-        custom_order,
-        req.merge_assemblies.unwrap_or(false),
-        merge_quantities,
-        None,
-        &state.config.delivery_note_template_dir,
-        &current,
-    )
-    .await?;
+    let bytes_prefix = state
+        .delivery_note_service
+        .print_xlsx(
+            &state.pool,
+            path.id,
+            custom_order,
+            req.merge_assemblies.unwrap_or(false),
+            merge_quantities,
+            None,
+            &state.config.delivery_note_template_dir,
+            &current,
+        )
+        .await?;
     let (bytes, _prefix) = bytes_prefix;
 
     let filename = format!("F-{}-note.xlsx", chrono::Local::now().format("%Y-%m-%d"));
@@ -598,17 +610,19 @@ pub async fn print_labels(
     let merge_quantities = parse_i64_map_opt(req.merge_quantities.as_ref(), "merge_quantities")?;
     let line_item_ids = parse_i64_opt(req.line_item_ids.as_ref(), "line_item_ids")?;
 
-    let bytes_prefix = DeliveryNoteService::print_xlsx(
-        &state.pool,
-        path.id,
-        custom_order,
-        req.merge_assemblies.unwrap_or(true), // labels 默认 true（与 Python 一致）
-        merge_quantities,
-        line_item_ids,
-        &state.config.delivery_note_template_dir,
-        &current,
-    )
-    .await?;
+    let bytes_prefix = state
+        .delivery_note_service
+        .print_xlsx(
+            &state.pool,
+            path.id,
+            custom_order,
+            req.merge_assemblies.unwrap_or(true), // labels 默认 true（与 Python 一致）
+            merge_quantities,
+            line_item_ids,
+            &state.config.delivery_note_template_dir,
+            &current,
+        )
+        .await?;
     let (bytes, _prefix) = bytes_prefix;
 
     let filename = format!("F-{}-labels.xlsx", chrono::Local::now().format("%Y-%m-%d"));
@@ -753,8 +767,6 @@ fn p1_group_router() -> Router<Arc<AppState>> {
 //  P1 handler thin wrappers（直接复用 P1 handler 函数）
 // ===========================================================================
 
-use crate::modules::delivery_note::service::DeliveryGroupService;
-
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DeliveryGroupListQuery {
     #[serde(deserialize_with = "crate::shared::types::deserialize_i64")]
@@ -766,9 +778,12 @@ async fn p1_list_delivery_groups(
     current: CurrentUser,
     Query(q): Query<DeliveryGroupListQuery>,
 ) -> Result<Json<R<super::dto::DeliveryGroupListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = DeliveryGroupService::list_for_l1(&mut tx, q.customer_id, &current).await?;
-    tx.commit().await?;
+    // 读端点：pool.acquire() → service → drop。
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .delivery_group_service
+        .list_for_l1(&mut *conn, q.customer_id, &current)
+        .await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -778,7 +793,10 @@ async fn p1_create_delivery_group(
     Json(req): Json<super::dto::CreateDeliveryGroupRequest>,
 ) -> Result<Json<R<super::dto::DeliveryGroupOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryGroupService::create(&mut tx, &state.snowflake, req, &current).await?;
+    let out = state
+        .delivery_group_service
+        .create(&mut *tx, req, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -790,7 +808,10 @@ async fn p1_update_delivery_group(
     Json(req): Json<super::dto::UpdateDeliveryGroupRequest>,
 ) -> Result<Json<R<super::dto::DeliveryGroupOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = DeliveryGroupService::update(&mut tx, &state.snowflake, id, req, &current).await?;
+    let out = state
+        .delivery_group_service
+        .update(&mut *tx, id, req, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
 }
@@ -802,7 +823,10 @@ async fn p1_soft_delete_delivery_group(
     Json(req): Json<super::dto::DeliveryGroupIdRequest>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    DeliveryGroupService::soft_delete(&mut tx, id, req, &current).await?;
+    state
+        .delivery_group_service
+        .soft_delete(&mut *tx, id, req, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok_empty()))
 }
