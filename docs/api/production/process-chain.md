@@ -230,3 +230,11 @@ helper，`src/modules/part/service/phase1.rs:342`）。错误码 HTTP 409，业�
 - 集成测试：`tests/process_chain_api.rs`
 - 仓库分层：`src/modules/prod/process_chain/handler.rs` (axum) → `service/crud.rs` (业务) → `repo/query.rs` + `repo/mutate.rs` (SQL)
 - 错误码：`src/shared/error.rs::code`（20101 / 20104 / 20701 / 20702 / 20703 / 20704 / 20705 / **20706 PROCESS_CHAIN_REQUIRED（PR-3 新增）** / 40001 / 40300 / 40901）
+
+---
+
+> **2026-09-23 PR12 同步说明**：仓库内部重构（PR6）将 `prod/process_chain/statemachine.rs`
+> 改名 `helpers.rs`（文件名误导 —— 该文件内容非状态机，仅是 sort_order 间隙检测
+> 等 helper 集合；改名后 git mv 保留历史）。**对外 API 与 DTO 无任何变化**，
+> docs/api/production/process-chain.md 现有 4 个章节（端点列表 / 共享 DTO / 端点约束
+> / 错误码）保持不变。

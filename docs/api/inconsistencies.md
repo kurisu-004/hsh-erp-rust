@@ -261,3 +261,10 @@
 > ✅ 2026-08-28: 子件状态聚合已实现 — assembly auto-sync via inspection flow
 >
 > ✅ 2026-09-14: Phase 1/2/3 大批端点上线 — part 49 / assembly 8 / cnc_program 2 / part_file 3 / outsource 16；part 域部分缺失从 32 缩至 ~3；占位模块从 4 域缩至 2 域。
+
+## 2026-09-23 PR11/12 docs/api/ drift 报告 + 修复（in-progress）
+
+- **报告**：[docs/api/DRIFT_REPORT.md](./DRIFT_REPORT.md)（主代理主 checkout 直接 commit，2026-09-23 commit `1dca185`）
+- **修复（已做）**：parts/ 域补 12 个缺失端点 + 新增 batch.md（commit `cc7654b`）
+- **修复（未做）**：production/* 错误码 review / statistics.md 错误码段 / customers/applicants/shelves PR4 vo/ 字段一致性核对（drift 报告 P2/P3 项）
+- **决策**：PR12 已基本完成（P0 parts 全部补齐）。P2/P3 留给后续 doc-drift PR。
