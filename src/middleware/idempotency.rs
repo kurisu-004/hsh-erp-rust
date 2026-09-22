@@ -9,10 +9,17 @@
 //
 // CachedResponse.headers 用 BTreeMap<String,String> 序列化会丢多值 header
 // （如 set-cookie）—— 当前 API 形态（auth cookie + JSON 响应）不受影响。
+//
+// 2026-09-23 review #1 修复：内置 public path 闸门。即使 route_layer 顺序
+// 正确，公开路径（login / refresh / health / _e2e）即便带 Idempotency-Key
+// 也不该被缓存——否则 A POST /iam/login 带 K 的 200 OK 含 JWT 会被缓存，
+// 后续任意请求带 K 即命中缓存拿到 A 的 JWT → session 劫持。这是与
+// `auth::middleware::is_public_path` 的对偶防御：auth 闸门保证公开路径
+// 不鉴权，本闸门保证公开路径不缓存。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -94,12 +101,24 @@ impl IdempotencyStore for NoopIdempotencyStore {
 
 /// 内存版 IdempotencyStore —— 单进程测试 fixture 用。
 ///
-/// 数据结构：`Mutex<HashMap<String, (CachedResponse, Instant)>>`，TTL 在
-/// `get` 路径上做 lazy 清理（过期 key 直接 `None`，并在 hold 锁时移除）。
+/// 数据结构：`Mutex<HashMap<String, InMemoryEntry>>`，每条带 `expires_at: Instant`。
+/// `get` 路径上做 lazy 过期检查：过期 key 直接移除并返回 `None`，命中则在 TTL
+/// 内返回 `CachedResponse`。`put` 时 caller 传的 `ttl_seconds` 显式落地到
+/// `expires_at`——避免「参数被吞」的 silent footgun（M1 review）。
 ///
 /// 进程重启数据丢失；多实例部署不能用——生产必走 `RedisIdempotencyStore`。
 pub struct InMemoryIdempotencyStore {
-    entries: Mutex<HashMap<String, (CachedResponse, Instant)>>,
+    entries: Mutex<HashMap<String, InMemoryEntry>>,
+}
+
+/// 单条内存缓存：响应 + 过期时间点（Instant）。
+///
+/// 2026-09-23 review #1：把 `(CachedResponse, Instant)` 拆成具名结构体——
+/// 旧的元组第二字段语义模糊（_inserted_at），TTL 实际未生效；改 `expires_at`
+/// 后命名即文档，避免再误用。
+struct InMemoryEntry {
+    response: CachedResponse,
+    expires_at: Instant,
 }
 
 impl InMemoryIdempotencyStore {
@@ -119,23 +138,34 @@ impl Default for InMemoryIdempotencyStore {
 #[async_trait]
 impl IdempotencyStore for InMemoryIdempotencyStore {
     async fn get(&self, key: &str) -> anyhow::Result<Option<CachedResponse>> {
-        let guard = self.entries.lock().await;
-        if let Some((value, _inserted_at)) = guard.get(key).cloned() {
-            // 简化版：InMemory 不存 ttl，永远返回命中。TTL 验证走 Redis 路径。
-            // 当前测试用 TTL=86400 也用不到过期场景。
-            return Ok(Some(value));
+        let mut guard = self.entries.lock().await;
+        // lazy 过期：现取 `now()`，命中若过期则移除并返 None。
+        let now = Instant::now();
+        match guard.get(key) {
+            Some(entry) if entry.expires_at > now => Ok(Some(entry.response.clone())),
+            Some(_) => {
+                // 过期——持有锁时移除避免后续 put 残留
+                guard.remove(key);
+                Ok(None)
+            }
+            None => Ok(None),
         }
-        Ok(None)
     }
 
     async fn put(
         &self,
         key: &str,
         value: &CachedResponse,
-        _ttl_seconds: u64,
+        ttl_seconds: u64,
     ) -> anyhow::Result<()> {
         let mut guard = self.entries.lock().await;
-        guard.insert(key.to_string(), (value.clone(), Instant::now()));
+        guard.insert(
+            key.to_string(),
+            InMemoryEntry {
+                response: value.clone(),
+                expires_at: Instant::now() + Duration::from_secs(ttl_seconds),
+            },
+        );
         Ok(())
     }
 }
@@ -233,6 +263,15 @@ pub async fn idempotency_middleware(
         return next.run(req).await;
     }
 
+    // 1.5) 公开路径闸门：login / refresh / health / _e2e 的 200 OK 不该被缓存。
+    // 防御目标：POST /iam/login 带 Idempotency-Key → 200 OK 含 access/refresh
+    // token → 缓存条目 idem:<key> 含其它用户敏感数据；任意后续请求带同 key
+    // 命中缓存即拿到原用户的 JWT → session 劫持。本闸门与 route_layer 顺序
+    // （auth 在外层 = 先跑）是双保险：即便顺序错位也不缓存公开路径响应。
+    if is_public_idempotency_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+
     // 2) 提取 header 并校验长度
     let key = match extract_key(req.headers()) {
         Some(k) => k,
@@ -322,6 +361,30 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
         return None;
     }
     Some(raw.to_string())
+}
+
+/// 公开路径闸门（idempotency 对偶版）：login / refresh / health / _e2e 全子树
+/// 不缓存响应（即便带 Idempotency-Key）。
+///
+/// 与 `crate::auth::middleware::is_public_path` 对偶：
+/// - auth 闸门：公开路径不鉴权（health / login / refresh / _e2e 免 Bearer）；
+/// - idem 闸门：公开路径不缓存（防止 POST /iam/login 的 200 OK 含 JWT 被
+///   缓存后撞 key 劫持 session）。
+///
+/// 2026-09-23 review #1 实现：复制 auth 侧白名单逻辑，避免循环依赖（idem 是
+/// infra 中间件层，auth 是 modules 之上层；调用方向反了）。两份白名单必须
+/// 同步演化——新增公开路径时同时改这里与 auth 侧 `is_public_path`。
+///
+/// 路径形式：生产 nest `/api/v2` + 模块子路径（`/api/v2/iam/login`）；测试
+/// 直接挂 `v2_router` 时为 `/iam/login`。本函数先 strip `/api/v2` 前缀再匹配，
+/// 两种调用模式都放行。
+fn is_public_idempotency_path(path: &str) -> bool {
+    let stripped = path.strip_prefix("/api/v2").unwrap_or(path);
+    stripped == "/health"
+        || stripped == "/iam/login"
+        || stripped == "/iam/refresh"
+        || stripped == "/_e2e"
+        || stripped.starts_with("/_e2e/")
 }
 
 /// 把 HeaderMap 扁平化为 `BTreeMap<String, String>`（供 CachedResponse 序列化）。

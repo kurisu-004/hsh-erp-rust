@@ -102,14 +102,24 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/_e2e", _e2e::router())
         // 2026-09-20 新增：JWT 验证统一走中间件（详见 auth::middleware）
         // 2026-09-22 重构：`auth_middleware` → `authenticate_middleware`（全词化）。
+        //
+        // 2026-09-23 review #1 修复：route_layer 调用顺序语义是「后调 = 外层 =
+        // 请求先经过」。想要 auth 先跑 → auth 必须「后调 = 最后写」。现顺序：
+        // 1. idempotency_middleware 先调 = 内层 = handler 之前最后跑（命中即返）
+        // 2. authenticate_middleware 后调 = 外层 = handler 之前最先跑（先鉴权）
+        // 请求流：auth → idempotency → handler；鉴权失败的 401 不会被 idem 缓存，
+        // 公开路径（login / refresh / health / _e2e）也在 auth 白名单直接放行，
+        // idem 内置 public path 闸门是双保险（即使顺序错也不缓存登录 JWT）。
+        // 顺序不可换：若 auth 在内层，idem 在外层，则 A 带 key K POST 的响应会
+        // 被 idem 缓存，B 用同 key POST 命中缓存直接拿到 A 的响应 → 跨用户数据
+        // 泄漏 + 公开路径 JWT 缓存劫持 session。
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            crate::auth::middleware::authenticate_middleware,
+            crate::middleware::idempotency::idempotency_middleware,
         ))
-        // 2026-09-23 新增 Idempotency 中间件挂载
         .route_layer(axum::middleware::from_fn_with_state(
             state,
-            crate::middleware::idempotency::idempotency_middleware,
+            crate::auth::middleware::authenticate_middleware,
         ))
 }
 

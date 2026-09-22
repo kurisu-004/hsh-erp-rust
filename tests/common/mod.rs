@@ -595,24 +595,6 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     ))
 }
 
-/// 2026-09-23 新增 fixture：构造 Idempotency 中间件用 `InMemoryIdempotencyStore`
-/// 的 `AppState`（不走 Redis 池）。
-///
-/// 用法：`tests/idempotency_api.rs` 的 in-memory 测试场景——快速验证缓存命中 /
-/// 重复跳过逻辑，避免依赖 Redis（虽然生产是 Redis-backed，单元测试 in-memory
-/// 已能覆盖核心行为；TTL 验证见 Redis 路径）。
-#[allow(dead_code)]
-pub async fn test_state_with_in_memory_idempotency(pool: PgPool) -> Arc<AppState> {
-    let redis_pool = test_redis_pool().await;
-    let mut state = test_state_with_redis(pool, redis_pool);
-    // 替换 idempotency_store 为 in-memory 实现：同 Arc::get_mut 直接改字段
-    let state_inner = Arc::get_mut(&mut state).expect("state Arc 必须 unique");
-    state_inner.idempotency_store = Arc::new(
-        hsh_erp_rust::middleware::idempotency::InMemoryIdempotencyStore::new(),
-    );
-    state
-}
-
 /// 2026-09-23 review #1 新增 fixture：构造 `allow_hs256_fallback=false` 的
 /// `AppState`，其它字段与 `test_state_with_redis` 完全一致。
 ///
