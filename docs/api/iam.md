@@ -169,6 +169,10 @@ Response 200 `data`：同 [`/iam/login`](#post-apiv2iamlogin)
 > - 上线顺序：先发后端 → Redis 启用黑名单 key（前向兼容：黑名单空时闸不命中）→
 >   前端无需配合改动。
 
+> 2026-09-23 重构补充：refresh token 算法同步切到 RS256；与 access token
+> 共用同一私钥/公钥对。HS256 fallback 在服务端保留（仅验签端兼容历史 token，
+> 签发端不再产出），过渡期结束后 cleanup PR 删除。
+
 ### Session 域错误码补充
 
 - 40105 SESSION_REVOKED — 会话已被吊销（Redis 中不存在 / 已失效 / refresh reuse detection 命中）。前端应清除本地 token 并跳回登录页。

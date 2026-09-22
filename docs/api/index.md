@@ -90,6 +90,13 @@ HTTP 状态码：
 - Header：`Authorization: Bearer <access_token>`
 - 各端点小节里**标注"权限: 公开"**的端点无需登录；其余均需 Bearer JWT
 - access token 默认 15min（900s）过期；refresh token 默认 7d
+
+> 2026-09-23 重构：签发端从 HS256 切到 RS256，header 加 kid 字段（值为
+> `JWT_SIGNING_KID` env，默认 `current`）；payload 字段不变，前端无感。
+> 验签端支持多公钥目录扫描以利密钥轮换（详见下方"## JWT 签名算法与 kid"）。
+> HS256 仅作 fallback（`JWT_ALLOW_HS256_FALLBACK=true` 启用），
+> 过渡期保留兼容历史 token；签发端不再产出 HS256 token。
+
 - **JWT 载荷（2026-09-22 重构）**：仅含 RFC 7519 标准字段——
   - `sub`：用户 snowflake id（i64）
   - `aud`：受众，固定 `hsh-erp-rust`
@@ -108,6 +115,20 @@ HTTP 状态码：
   查不到 → 40105 SESSION_REVOKED。登出（删当前 token 条目）、改密 / 管理员停用
   （清整个用户 Set `sessions:user:<id>`）都会触发吊销。前端拿到 40105 应清本地
   token 并跳回登录页。session 条目默认 TTL 15min（900s），每次成功访问会 EXPIRE 续期（滑动窗口）。
+
+#### JWT 签名算法与 kid（2026-09-23 重构）
+
+- **签名算法**：签发端 RS256（强制）；decode 端按 `header.alg` 分支——
+  RS256 走公钥字典查 kid；HS256 仅在 `JWT_ALLOW_HS256_FALLBACK=true` 时作为
+  fallback 走 `JWT_SECRET` 验签（兼容历史 token，过渡期保留）；其它一律 40100。
+- **kid 路由**：header.kid = `JWT_SIGNING_KID` env（缺省 `current`）。验签端从
+  `JWT_PUBLIC_KEYS_DIR` 目录扫描 `*.pem` 公钥，kid = 文件名去后缀
+  （例：`./keys/public/current.pem` → kid = `current`）；同一目录 kid 必须唯一。
+- **密钥轮换**：把新公钥（如 `next.pem`）放进公钥目录后，签发端把
+  `JWT_SIGNING_KID=next` 即可对外签新 kid；老客户端持有的 `current` kid token
+  在公钥字典内仍可验签，直至自然过期。下轮 cleanup PR 补 hot-reload。
+- **HS256 fallback 段**：服务端保留（仅验签端兼容历史 token，签发端不再产出），
+  过渡期结束后 cleanup PR 删除。
 
 ### 五角色 RBAC
 

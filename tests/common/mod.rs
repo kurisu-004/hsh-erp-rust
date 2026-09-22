@@ -72,6 +72,18 @@ use std::sync::Arc;
 use std::sync::Once;
 
 use sqlx::PgPool;
+
+// 2026-09-23 重构：RS256 + kid 多密钥轮换。pem 模块提供测试用 2048-bit RSA 密钥对
+// （process 级 OnceLock 缓存 + PEM 字符串导出），三处 JwtConfig 字面量（test_state
+// 系列 + test_state_with_cos）从同源 pem 派生 private_key / public_keys，
+// 集成测试签发的 access / refresh token 与服务端解码端共享同一密钥材料。
+//
+// ⚠️ 必须是 `pub mod pem`，不能是 `mod pem` —— tests/auth_middleware.rs 等
+// integration test binary 顶层需要 `use common::pem;` 拿到同一份模块实例（共享
+// OnceLock），若 mod.rs 用私有 mod，二进制顶层需要 `#[path = "common/pem.rs"]
+// mod pem;` 引入第二个 pem 实例 → 两套独立 OnceLock → 签发与验签用不同 keypair
+// → 40100 InvalidSignature。
+pub mod pem;
 use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 
@@ -315,6 +327,10 @@ fn test_database_url() -> String {
 }
 
 /// 测试用 JWT secret：长度 >= 32（HS256 建议）+ 与生产区分
+///
+/// 2026-09-23 重构：HS256 fallback 过渡期仍占用（`allow_hs256_fallback=true`
+/// 时 JWT_SECRET 必填，decode 端走 secret 验签历史 HS256 token）；下轮 cleanup
+/// PR 删除 secret 字段 + fallback 路径。
 const TEST_JWT_SECRET: &str = "test-secret-test-secret-test-secret-1234";
 
 /// 测试用 Redis URL：默认连 `redis-test` 容器（端口6380），db index 用测试
@@ -468,6 +484,26 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             audience: "hsh-erp-rust-test".to_string(),
             access_ttl_seconds: 900,
             refresh_ttl_days: 7,
+            // 2026-09-23 重构：RS256 + kid 多密钥轮换。signing_kid = "current"
+            // 与 pem 模块 DEFAULT_KID 对齐；public_keys 字典装入 (kid, pub_pem)
+            // 多对（current + next），与生产 JwtConfig 同结构。private_key 从
+            // pem 模块缓存的 PKCS#8 PEM 派生。allow_hs256_fallback=true 与
+            // 生产默认对齐（JWT_SECRET 仍被 decode 端用于 fallback 验签）。
+            signing_kid: "current".into(),
+            private_key: jsonwebtoken::EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
+                .expect("test private pem"),
+            public_keys: {
+                let mut m = std::collections::BTreeMap::new();
+                for (kid, pem_str) in pem::test_public_kids() {
+                    m.insert(
+                        kid.to_string(),
+                        jsonwebtoken::DecodingKey::from_rsa_pem(pem_str.as_bytes())
+                            .expect("test public pem"),
+                    );
+                }
+                m
+            },
+            allow_hs256_fallback: true,
         },
         cos: CosConfig {
             // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
@@ -562,6 +598,22 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             audience: "hsh-erp-rust-test".to_string(),
             access_ttl_seconds: 900,
             refresh_ttl_days: 7,
+            // 2026-09-23 重构：RS256 + kid（与 test_state_with_redis 同形）
+            signing_kid: "current".into(),
+            private_key: jsonwebtoken::EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
+                .expect("test private pem"),
+            public_keys: {
+                let mut m = std::collections::BTreeMap::new();
+                for (kid, pem_str) in pem::test_public_kids() {
+                    m.insert(
+                        kid.to_string(),
+                        jsonwebtoken::DecodingKey::from_rsa_pem(pem_str.as_bytes())
+                            .expect("test public pem"),
+                    );
+                }
+                m
+            },
+            allow_hs256_fallback: true,
         },
         cos: CosConfig {
             // 2026-09-11 修改：新增 enabled / app_id / endpoint 字段；测试场景全部置 false / 空。
@@ -672,6 +724,22 @@ pub async fn test_state_with_cos(
             audience: "hsh-erp-rust-test".to_string(),
             access_ttl_seconds: 900,
             refresh_ttl_days: 7,
+            // 2026-09-23 重构：RS256 + kid（与前两处同形）
+            signing_kid: "current".into(),
+            private_key: jsonwebtoken::EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
+                .expect("test private pem"),
+            public_keys: {
+                let mut m = std::collections::BTreeMap::new();
+                for (kid, pem_str) in pem::test_public_kids() {
+                    m.insert(
+                        kid.to_string(),
+                        jsonwebtoken::DecodingKey::from_rsa_pem(pem_str.as_bytes())
+                            .expect("test public pem"),
+                    );
+                }
+                m
+            },
+            allow_hs256_fallback: true,
         },
         cos: CosConfig {
             // 2026-09-20 迁移清理：删 `sts_duration_seconds`；backend 从 `CosSdk` 改为 `OpenDal`。

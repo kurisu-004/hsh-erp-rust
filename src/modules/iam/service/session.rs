@@ -184,11 +184,14 @@ impl SessionService {
         }
         let menus = self.account_service.menus_for_roles(&mut repo, &roles).await?;
 
-        // 6. 签发双 token（2026-09-22 重构：删业务字段参数，新增 audience）
+        // 6. 签发双 token（2026-09-22 重构：删业务字段参数，新增 audience；
+        // 2026-09-23 重构：RS256 + kid —— 第 3 参数 `secret` 拆为
+        // `private_key` + `signing_kid`）
         let pair = issue_token_pair(
             u.id,
             u.refresh_token_version,
-            &self.config.jwt.secret,
+            &self.config.jwt.private_key,
+            &self.config.jwt.signing_kid,
             &self.config.jwt.issuer,
             &self.config.jwt.audience,
             self.config.jwt.access_ttl_seconds,
@@ -268,9 +271,14 @@ impl SessionService {
     ) -> Result<RefreshPending, AppError> {
         // 1. 解码 refresh token，取 sub + refresh_version（在 open tx 前即可拒）
         // 2026-09-22 重构：`decode_refresh` 增加 `audience` 参数。
+        // 2026-09-23 重构：RS256 + kid —— 第 3 参数 `secret` 拆为 `public_keys` +
+        // `Some(&secret)`（HS256 fallback 开关由 jwt.rs 内部根据
+        // `allow_hs256_fallback` 决定；调用方始终传 Some，让 jwt.rs 据 header.alg
+        // 分支判断是否启用 fallback）。
         let claims = decode_refresh(
             &req.refresh_token,
-            &self.config.jwt.secret,
+            &self.config.jwt.public_keys,
+            Some(&self.config.jwt.secret),
             &self.config.jwt.issuer,
             &self.config.jwt.audience,
         )
@@ -353,10 +361,13 @@ impl SessionService {
             .ok_or_else(|| AppError::biz(code::REFRESH_INVALID, "user disappeared"))?;
 
         // 2026-09-22 重构：删业务字段参数，新增 audience
+        // 2026-09-23 重构：RS256 + kid —— 第 3 参数 `secret` 拆为
+        // `private_key` + `signing_kid`
         let pair = issue_token_pair(
             u.id,
             u.refresh_token_version,
-            &self.config.jwt.secret,
+            &self.config.jwt.private_key,
+            &self.config.jwt.signing_kid,
             &self.config.jwt.issuer,
             &self.config.jwt.audience,
             self.config.jwt.access_ttl_seconds,

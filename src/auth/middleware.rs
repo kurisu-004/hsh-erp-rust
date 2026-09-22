@@ -102,9 +102,16 @@ pub async fn verify_session_token(
     token: &str,
 ) -> Result<(CurrentUser, String /* jti */), AppError> {
     // 1) JWT 验签（带 iss + aud 校验）
+    //
+    // 2026-09-23 重构：decode_access 走 RS256 + kid 路由，HS256 仅作 fallback。
+    // 第二个参数 `public_keys` 来自 JwtConfig.public_keys（启动期目录扫描填充），
+    // 第三个参数传 Some(&secret) —— jwt.rs 内部按 JwtConfig::allow_hs256_fallback
+    // 决定是否启用 HS256 fallback 分支（caller 始终传 Some，由 jwt.rs 据 header.alg
+    // 分支判断）。这样 call site 不需要在 middleware 重复读 config。
     let claims = decode_access(
         token,
-        &state.config.jwt.secret,
+        &state.config.jwt.public_keys,
+        Some(&state.config.jwt.secret),
         &state.config.jwt.issuer,
         &state.config.jwt.audience,
     )?;

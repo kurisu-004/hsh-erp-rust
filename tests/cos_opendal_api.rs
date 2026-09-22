@@ -1,5 +1,11 @@
 //! OpenDAL S3 backend 集成测试（2026-09-20 spike 第 4 轮 / 迁移清理后）
 //!
+//! 2026-09-23 重构：补 `JWT_PRIVATE_KEY_PATH` / `JWT_PUBLIC_KEYS_DIR` env
+//! （RS256 + kid 多密钥轮换要求）。本测试不实际签发/验签 token（仅调
+//! `AppConfig::from_env` 走 COS_BACKEND 解析路径），但 from_env 启动期严格校验
+//! 必须有 PEM 文件存在；用 tempfile 在测试 setUp 阶段写一对一次性 pem，`JwtConfig`
+//! 解析成功即可。环境串行锁避免与其它 set_var 测试并行冲突。
+//!
 //! 覆盖 OpenDAL `Operator` 适配 `CosClient` trait 的 6 个 method +
 //! 配置 / backend 选择路径。**不发起任何网络请求**，全部走 `NoopOpenDal`（Memory backend）。
 //!
@@ -282,14 +288,75 @@ async fn end_to_end_all_six_methods_on_fresh_namespace() {
 /// 单 binary 内串行访问；不同 binary 间各自持锁不冲突。
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 2026-09-23 重构：测试用 RSA PEM 路径（PKCS#8 私钥 + SPKI 公钥目录）。
+///
+/// 4 个 AppConfig::from_env 测试需要 `JWT_PRIVATE_KEY_PATH` 与
+/// `JWT_PUBLIC_KEYS_DIR` 指向真实存在的 PEM 文件，否则 from_env 在启动期严格
+/// 校验阶段 bail。本函数：
+/// 1. 进程级 `OnceLock` 内生成一对 2048-bit RSA（pkcs8 私钥 + spki 公钥）；
+/// 2. 写到 `std::env::temp_dir()` 下唯一的 `cos_opendal_test_pem_<uuid>/` 目录
+///    （private key: `current.pem`，public dir 即该目录）；
+/// 3. 返回 `(private_pem_path, public_keys_dir)` 绝对路径。
+///
+/// 文件**不**主动删除：进程退出后由 OS 清理 tmp；目录命名带 uuid 防多进程冲突。
+/// 测试目的仅满足 from_env 校验，不真用 token。
+fn test_jwt_pem_paths() -> (&'static str, &'static str) {
+    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+    use rsa::traits::PublicKeyParts;
+    use rsa::{RsaPrivateKey, RsaPublicKey};
+
+    static PATHS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    let (priv_str, dir_str) = PATHS.get_or_init(|| {
+        let mut rng = rsa::rand_core::OsRng;
+        let priv_key = RsaPrivateKey::new(&mut rng, 2048).expect("gen rsa priv");
+        let pub_key = RsaPublicKey::from(&priv_key);
+        debug_assert_eq!(pub_key.size() * 8, 2048);
+
+        // 目录：<tmp>/cos_opendal_test_pem_<uuid>/
+        let tmp = std::env::temp_dir();
+        let dir_name = format!(
+            "cos_opendal_test_pem_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let dir = tmp.join(&dir_name);
+        std::fs::create_dir_all(&dir).expect("create tmp pem dir");
+
+        let priv_path = dir.join("current.pem");
+        let pub_path = dir.join("current.pem.pub");
+
+        let priv_pem = priv_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("priv pem")
+            .to_string();
+        let pub_pem = pub_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("pub pem");
+
+        std::fs::write(&priv_path, priv_pem.as_bytes()).expect("write priv pem");
+        std::fs::write(&pub_path, pub_pem.as_bytes()).expect("write pub pem");
+
+        (
+            priv_path.to_string_lossy().into_owned(),
+            dir.to_string_lossy().into_owned(),
+        )
+    });
+    // 安全：OnceLock 持有的 String 是 'static
+    let priv_static: &'static str = Box::leak(priv_str.clone().into_boxed_str());
+    let dir_static: &'static str = Box::leak(dir_str.clone().into_boxed_str());
+    (priv_static, dir_static)
+}
+
 #[test]
 fn app_config_from_env_with_cos_backend_opendal() {
     // 2026-09-20 迁移清理：COS_ENABLED=true + COS_BACKEND=opendal → OpenDal
     // （迁移前 COS_ENABLED=false + COS_BACKEND=opendal 也是 OpenDal；新行为下
     // COS_ENABLED=false 强制 Noop，详见 config.rs from_env 注释）。
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (priv_path, pub_dir) = test_jwt_pem_paths();
     unsafe {
         std::env::set_var("JWT_SECRET", "test_secret_for_opendal_spike");
+        std::env::set_var("JWT_PRIVATE_KEY_PATH", priv_path);
+        std::env::set_var("JWT_PUBLIC_KEYS_DIR", pub_dir);
         std::env::set_var("POSTGRES_USER", "test");
         std::env::set_var("POSTGRES_PASSWORD", "test");
         std::env::set_var("POSTGRES_DB", "test");
@@ -304,6 +371,8 @@ fn app_config_from_env_with_cos_backend_opendal() {
     assert!(cfg.cos.enabled, "应读出 COS_ENABLED=true");
     unsafe {
         std::env::remove_var("COS_BACKEND");
+        std::env::remove_var("JWT_PRIVATE_KEY_PATH");
+        std::env::remove_var("JWT_PUBLIC_KEYS_DIR");
     }
 }
 
@@ -311,8 +380,11 @@ fn app_config_from_env_with_cos_backend_opendal() {
 fn app_config_cos_enabled_false_forces_noop_regardless_of_backend_env() {
     // 2026-09-20 迁移清理：COS_ENABLED=false 强制 Noop（不论 COS_BACKEND 怎么设）。
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (priv_path, pub_dir) = test_jwt_pem_paths();
     unsafe {
         std::env::set_var("JWT_SECRET", "test_secret_for_opendal_spike");
+        std::env::set_var("JWT_PRIVATE_KEY_PATH", priv_path);
+        std::env::set_var("JWT_PUBLIC_KEYS_DIR", pub_dir);
         std::env::set_var("POSTGRES_USER", "test");
         std::env::set_var("POSTGRES_PASSWORD", "test");
         std::env::set_var("POSTGRES_DB", "test");
@@ -329,6 +401,8 @@ fn app_config_cos_enabled_false_forces_noop_regardless_of_backend_env() {
     );
     unsafe {
         std::env::remove_var("COS_BACKEND");
+        std::env::remove_var("JWT_PRIVATE_KEY_PATH");
+        std::env::remove_var("JWT_PUBLIC_KEYS_DIR");
     }
 }
 
@@ -338,8 +412,11 @@ fn app_config_default_backend_is_opendal() {
     // 需要 COS_ENABLED=true 才会走 COS_BACKEND 解析（false 强制 Noop），
     // 此时 from_env 强制要求 COS_SECRET_ID / COS_SECRET_KEY。
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (priv_path, pub_dir) = test_jwt_pem_paths();
     unsafe {
         std::env::set_var("JWT_SECRET", "test_secret_for_opendal_spike");
+        std::env::set_var("JWT_PRIVATE_KEY_PATH", priv_path);
+        std::env::set_var("JWT_PUBLIC_KEYS_DIR", pub_dir);
         std::env::set_var("POSTGRES_USER", "test");
         std::env::set_var("POSTGRES_PASSWORD", "test");
         std::env::set_var("POSTGRES_DB", "test");
@@ -351,14 +428,21 @@ fn app_config_default_backend_is_opendal() {
     }
     let cfg = AppConfig::from_env(".env.nonexistent_for_test").expect("from_env");
     assert_eq!(cfg.cos.backend, CosBackend::OpenDal);
+    unsafe {
+        std::env::remove_var("JWT_PRIVATE_KEY_PATH");
+        std::env::remove_var("JWT_PUBLIC_KEYS_DIR");
+    }
 }
 
 #[test]
 fn app_config_from_env_with_invalid_cos_backend_fails() {
     // 2026-09-20 迁移清理：非法值（含历史 `cos_sdk`）→ anyhow bail（不静默 fallback）
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (priv_path, pub_dir) = test_jwt_pem_paths();
     unsafe {
         std::env::set_var("JWT_SECRET", "test_secret_for_opendal_spike");
+        std::env::set_var("JWT_PRIVATE_KEY_PATH", priv_path);
+        std::env::set_var("JWT_PUBLIC_KEYS_DIR", pub_dir);
         std::env::set_var("POSTGRES_USER", "test");
         std::env::set_var("POSTGRES_PASSWORD", "test");
         std::env::set_var("POSTGRES_DB", "test");
@@ -371,6 +455,8 @@ fn app_config_from_env_with_invalid_cos_backend_fails() {
     let result = AppConfig::from_env(".env.nonexistent_for_test");
     unsafe {
         std::env::remove_var("COS_BACKEND");
+        std::env::remove_var("JWT_PRIVATE_KEY_PATH");
+        std::env::remove_var("JWT_PUBLIC_KEYS_DIR");
     }
     assert!(
         result.is_err(),
