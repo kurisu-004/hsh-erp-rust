@@ -5,9 +5,8 @@
 //!   **内容零 diff**（`.sqlx/query-*.json` 哈希不变）。其中
 //!   `list_work_types_by_process_id` 保留 `Result<_, AppError>` 返回类型，跨模块
 //!   静态调用方（`worker_pool::service`）零修改。
-//! - `../process_mapping/sql.rs`：`t_work_type_process` SQL 真源（4 静态方法 +
-//!   `NewWorkTypeProcessRow`），与 `process_mapping::mod.rs` 同目录（与 shelf
-//!   process_mapping 同形）。
+//! - `../service.rs`（2026-09-22 PR6 合并入）：`t_work_type_process` SQL 真源（4 静态方法 +
+//!   `NewWorkTypeProcessRow`），原 `process_mapping/{mod.rs, sql.rs}` 子目录合并而来。
 //! - `mod.rs`（本文件）：对外暴露胖 trait `WorkTypeRepoTrait`（15 方法合并单 trait；
 //!   t_work_type 9 + 跨域 helper 2 + t_work_type_process 4），并直接
 //!   `impl WorkTypeRepoTrait for &mut PgConnection`——handler/service 借
@@ -42,7 +41,7 @@
 //!
 //! ## t_work_type_process 方法（4）── 用 `worktypeproc_` 前缀消歧义
 //! trait 同时承载 `t_work_type_process` 的 4 个方法（与 shelf
-//! `ShelfRepoTrait::proc_*` 同形），impl 一行委托到 `process_mapping::sql::WorkTypeProcessRepo`。
+//! `ShelfRepoTrait::proc_*` 同形），impl 一行委托到 `super::service::WorkTypeProcessRepo`。
 //!
 //! ## 为什么 trait 可以直接对 `&mut PgConnection` 实现
 //! `Transaction<'_, Postgres>` 与 `PoolConnection<Postgres>` 都 `DerefMut<Target = PgConnection>`，
@@ -64,7 +63,7 @@ use sqlx::PgConnection;
 
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::prod::process::model::TProcess;
-use crate::modules::prod::work_type::process_mapping::sql::{NewWorkTypeProcessRow, WorkTypeProcessRepo};
+use crate::modules::prod::work_type::service::{NewWorkTypeProcessRow, WorkTypeProcessRepo};
 
 pub mod sql;
 
@@ -325,7 +324,7 @@ impl WorkTypeRepoTrait for &mut PgConnection {
         ProcessRepo::list_by_ids(&mut **self, ids).await
     }
 
-    // ── t_work_type_process（4）── 一行委托 process_mapping::sql::WorkTypeProcessRepo ─
+    // ── t_work_type_process（4）── 一行委托 super::service::WorkTypeProcessRepo ─
     async fn worktypeproc_list_by_work_type(
         &mut self,
         work_type_id: i64,

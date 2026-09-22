@@ -12,12 +12,12 @@
 //! 写 4 (MANAGER)：create / update / soft_delete / set_work_type_processes
 //!
 //! ## 子模块
-//! `process_mapping.rs` 单文件拆出 `t_work_type_process` 的 repo + service，
-//! 让主 `service.rs` 控制在 1000 行内（conventions.md §2）。
+//! 2026-09-22 PR6：原 `process_mapping/{mod.rs, sql.rs}` 子目录已合并入本域
+//! `service.rs`（`WorkTypeProcessRepo` + `WorkTypeProcessService`）；本目录不再
+//! 持有 `process_mapping` 子模块，service.rs 仍控制在 1000 行内（合并后约 660 行）。
 pub mod dto;
 pub mod handler;
 pub mod model;
-pub mod process_mapping;
 pub mod repo;
 pub mod service;
 pub mod vo;

@@ -12,7 +12,8 @@
 //!
 //! ## 子模块结构
 //! - `model`        —— 表行（header + step）+ 插入行 builder
-//! - `statemachine` —— 纯函数（sort_order 间隙检测 + reorder helper）
+//! - `helpers`      —— 纯函数（sort_order 间隙检测 + reorder helper）；
+//!   2026-09-22 PR6 改名自 `statemachine.rs`（本文件内容非状态机，仅 helper 集合）。
 //! - `repo`         —— SELECT 在 query.rs；INSERT/UPDATE/DELETE 在 mutate.rs
 //! - `service`      —— `crud.rs` 单文件（业务编排：upsert 整组事务）
 //!
@@ -21,10 +22,10 @@
 
 pub mod dto;
 pub mod handler;
+pub mod helpers;
 pub mod model;
 pub mod repo;
 pub mod service;
-pub mod statemachine;
 pub mod vo;
 
 use crate::state::AppState;

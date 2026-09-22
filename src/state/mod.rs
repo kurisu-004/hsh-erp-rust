@@ -33,7 +33,7 @@ use crate::modules::outsource::service::OutsourceService;
 use crate::modules::part_file::service::PartFileService;
 use crate::modules::prod::process::service::ProcessService;
 use crate::modules::prod::process_chain::service::crud::ProcessChainService;
-use crate::modules::prod::work_type::process_mapping::WorkTypeProcessService;
+use crate::modules::prod::work_type::service::WorkTypeProcessService;
 use crate::modules::prod::work_type::service::WorkTypeService;
 use crate::modules::prod::worker::service::WorkerService;
 use crate::modules::prod::worker_pool::service::WorkerPoolService;
@@ -100,7 +100,8 @@ pub struct AppState {
     /// 字段仅 `snowflake`；handler 借 `&mut *tx` 喂给 `WorkTypeRepoTrait`
     /// （胖 trait 已合并 t_work_type + t_work_type_process + 跨域 helper，单 trait 一次借位）。
     pub work_type_service: Arc<WorkTypeService>,
-    /// 2026-09-22 D-2-simple 新增：prod/work_type/process_mapping service（set / list）。
+    /// 2026-09-22 D-2-simple 新增：prod/work_type process_mapping service（set / list）；
+    /// 2026-09-22 PR6 起合并入 `prod/work_type/service.rs`（不再独立子模块）。
     /// 无字段；handler 借 `&mut *tx` 喂给 `WorkTypeRepoTrait`（胖 trait，
     /// process_mapping 4 方法已合并入 trait）。
     pub work_type_process_service: Arc<WorkTypeProcessService>,
@@ -164,7 +165,8 @@ impl AppState {
         let worker_service = Arc::new(WorkerService::new(snowflake.clone()));
         // 2026-09-22 D-2-simple prod/work_type service 装线：仅需 snowflake。
         let work_type_service = Arc::new(WorkTypeService::new(snowflake.clone()));
-        // 2026-09-22 D-2-simple prod/work_type/process_mapping service 装线：无字段。
+        // 2026-09-22 D-2-simple prod/work_type process_mapping service 装线：无字段；
+        // 2026-09-22 PR6 起合入 prod/work_type/service.rs，本行不变。
         let work_type_process_service = Arc::new(WorkTypeProcessService);
         // 2026-09-22 D-2-simple prod/process service 装线：仅需 snowflake。
         let process_service = Arc::new(ProcessService::new(snowflake.clone()));

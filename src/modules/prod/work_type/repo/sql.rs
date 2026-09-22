@@ -8,7 +8,8 @@
 //! - 写：`create` / `update` / `soft_delete`
 //! - 引用计数：`count_work_type_references`（软删前查 `t_worker.work_type_id` +
 //!   `t_work_type_process` 引用，best-effort）
-//! - mapping 子模块 `process_mapping.rs` 维护 `t_work_type_process`
+//! - mapping：`t_work_type_process` SQL 真源（`WorkTypeProcessRepo` ZST + 4 静态方法）
+//!   2026-09-22 PR6 起合并入 `super::service.rs`，本文件不再维护。
 //!
 //! 约定：
 //! - 全部使用 `sqlx::query!` / `query_as!` 编译期宏（需 `DATABASE_URL` 或 `.sqlx/` 离线元数据）
