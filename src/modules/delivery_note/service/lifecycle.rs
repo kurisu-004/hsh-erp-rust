@@ -8,6 +8,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;
@@ -21,7 +22,6 @@ use super::super::dto::{
     DeliveryNotePickupScanOut, SubmitDeliveryOut, SubmitOutcomeDto, UnresolvedTargetDto,
 };
 use super::super::model::DeliveryNoteEventType;
-use super::super::repo::{DeliveryNoteEventRepo, DeliveryNoteRepo};
 use super::inner::{
     build_note_outs, note_not_found, note_version_conflict, scope_from_note, write_event,
 };
@@ -55,7 +55,8 @@ impl DeliveryNoteService {
     ) -> Result<SubmitDeliveryOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let mut obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let mut obj = conn
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.version != version {
@@ -163,14 +164,14 @@ impl DeliveryNoteService {
         )
         .await?;
 
-        let affected = DeliveryNoteRepo::update(&mut *conn, &obj).await?;
+        let affected = conn.note_update(&obj).await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 "concurrent modification detected",
             ));
         }
-        obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        obj = conn.note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         let out = build_note_outs(conn, std::slice::from_ref(&obj)).await?;
@@ -192,7 +193,8 @@ impl DeliveryNoteService {
     ) -> Result<super::super::dto::DeliveryNoteOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let mut obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let mut obj = conn
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.version != version {
@@ -207,13 +209,9 @@ impl DeliveryNoteService {
 
         // 同范围 DRAFT 撞唯一（设计 §3.3 / 21419）：如果存在另一张同范围的活跃 DRAFT 则拒
         let scope = scope_from_note(&obj);
-        if let Some(_other) = DeliveryNoteRepo::find_open_draft_by_scope(
-            &mut *conn,
-            obj.customer_id,
-            scope,
-            Some(note_id),
-        )
-        .await?
+        if let Some(_other) = conn
+            .note_find_open_draft_by_scope(obj.customer_id, scope, Some(note_id))
+            .await?
         {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT,
@@ -241,14 +239,14 @@ impl DeliveryNoteService {
         )
         .await?;
 
-        let affected = DeliveryNoteRepo::update(&mut *conn, &obj).await?;
+        let affected = conn.note_update(&obj).await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 "concurrent modification detected",
             ));
         }
-        obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        obj = conn.note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         let out = build_note_outs(conn, std::slice::from_ref(&obj)).await?;
@@ -266,7 +264,7 @@ impl DeliveryNoteService {
     ) -> Result<DeliveryNotePickupScanOut, AppError> {
         let _ = current;
 
-        let obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let obj = conn.note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.status != STATUS_SUBMITTED {
@@ -312,7 +310,8 @@ impl DeliveryNoteService {
         // 任意已登录账号即可（service 层校验司机）
         let _ = current;
 
-        let mut obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let mut obj = conn
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.version != version {
@@ -443,14 +442,14 @@ impl DeliveryNoteService {
         )
         .await?;
 
-        let affected = DeliveryNoteRepo::update(&mut *conn, &obj).await?;
+        let affected = conn.note_update(&obj).await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 "concurrent modification detected",
             ));
         }
-        obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        obj = conn.note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         let out = build_note_outs(conn, std::slice::from_ref(&obj)).await?;
@@ -467,7 +466,7 @@ impl DeliveryNoteService {
     ) -> Result<(), AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let obj = conn.note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.version != version {
@@ -497,14 +496,9 @@ impl DeliveryNoteService {
         .execute(&mut *conn)
         .await?;
 
-        let affected = DeliveryNoteRepo::soft_delete(
-            &mut *conn,
-            note_id,
-            obj.version,
-            now_naive(),
-            Some(current.id),
-        )
-        .await?;
+        let affected = conn
+            .note_soft_delete(note_id, obj.version, now_naive(), Some(current.id))
+            .await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -521,7 +515,7 @@ impl DeliveryNoteService {
         note_id: i64,
     ) -> Result<Vec<DeliveryNoteEventOut>, AppError> {
         // 任何已登录账号可看；service 不做角色硬限（与 Python 一致）
-        let events = DeliveryNoteEventRepo::list_by_note(&mut *conn, note_id).await?;
+        let events = conn.event_list_by_note(note_id).await?;
         Ok(events
             .into_iter()
             .map(|e| DeliveryNoteEventOut {
@@ -582,12 +576,9 @@ impl DeliveryNoteService {
         let active_note_ids: HashSet<i64> = if linked_note_ids.is_empty() {
             HashSet::new()
         } else {
-            let notes = DeliveryNoteRepo::list_by_ids(
-                &mut *conn,
-                &linked_note_ids.iter().copied().collect::<Vec<_>>(),
-                false,
-            )
-            .await?;
+            let notes = conn
+                .note_list_by_ids(&linked_note_ids.iter().copied().collect::<Vec<_>>(), false)
+                .await?;
             notes
                 .into_iter()
                 .filter(|n| n.status == STATUS_DRAFT || n.status == STATUS_SUBMITTED)

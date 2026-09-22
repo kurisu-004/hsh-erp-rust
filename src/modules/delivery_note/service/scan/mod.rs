@@ -1,7 +1,28 @@
-//! P3：扫码入单（scan_add）+ 解析 helper（resolve_scan_kind）+ NoteScope 投影。
+//! P3：扫码入单（scan_add）（2026-09-22 D-5 拆出，原 1617 行超 1000 行上限）
 //!
-//! 单元测试（`classify_tests` / `scan_resolve_tests` / `classify_5groups_tests` /
-//! `outcome_tests`）就地保留在本模块。
+//! ## 子模块拆分（2026-09-22 D-5）
+//! - `classify`         — 5 组分类 helpers（is_attachable_state / is_inspectable_state /
+//!                        classify_invalid_state / TargetEvaluation / classify_outcome /
+//!                        is_all_conflict / has_fully_invalid_target / build_unresolved_target）
+//! - `resolve_scan_kind`— ScanKind enum + resolve_scan_kind 纯函数
+//! - `helpers`          — DTO 投影小 helpers（to_available_batch_dto / to_attachable_batch_dto）
+//!                        + NoteScope::classify impl
+//! - `mod.rs`（本文件）  — `DeliveryNoteService::scan_add` 入口 + `scan_find_or_create_draft` +
+//!                        单元测试（classify_tests / scan_resolve_tests / classify_5groups_tests /
+//!                        c_group_distribution_tests / attachable_batches_tests / outcome_tests）
+//!
+//! 单元测试就地保留在 `mod.rs` 末尾（rust 2018+ 规定 `#[cfg(test)] mod` 之后只能再放
+//! `#[cfg(test)]` 项，不能放任何生产代码）。
+//!
+//! ## 跨域 SQL 调用（2026-09-22 D-5）
+//! 跨域调用（t_part / t_assembly / t_customer / t_part_batch）通过 `&mut PgConnection`
+//! 上的 `DeliveryNoteRepoTrait` trait 方法（`note_*` / `group_*` / `event_*`）+ 跨域
+//! ZST 静态方法（`PartRepo::xxx` / `AssemblyRepo::xxx` / `CustomerRepo::xxx` /
+//! `PartBatchRepo::xxx`）混合使用。
+//!
+//! ## 事务边界（2026-09-22 D-5）
+//! handler `state.pool.begin()` → 这里 → handler `commit()`；本方法不 commit。
+//! service 不知事务——所有 SQL 通过 trait 形参（trait impl for &mut PgConnection）。
 
 use std::collections::HashMap;
 
@@ -11,271 +32,32 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::{
     clock::now_naive, serial::next_delivery_note_no, snowflake::SnowflakeIdGenerator,
 };
-use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::part::model::TPart;
+use crate::modules::delivery_note::dto::{
+    AddedBatchDto, RecentItemDto, ResolvedEntityDto, ResolvedKindDto, ScanDeliveryNoteSummaryDto,
+    ScanDeliveryOut, ScanOutcomeDto,
+};
+use crate::modules::delivery_note::model::{DeliveryNote, NoteScope};
+use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::repo::PartRepo;
-use crate::modules::part_batch::model::TPartBatch;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::{
-    AddedBatchDto, AttachableBatchDto, AvailableBatchDto, BatchStatusDto, RecentItemDto,
-    ResolvedEntityDto, ResolvedKindDto, ScanDeliveryNoteSummaryDto, ScanDeliveryOut,
-    ScanOutcomeDto, UnresolvedTargetDto,
-};
-use super::super::model::{DeliveryNote, NoteScope};
-use super::super::repo::{DeliveryGroupRepo, DeliveryNoteRepo};
-use super::inner::{GroupWithMemberIds, note_not_found};
+use super::inner::{note_not_found, GroupWithMemberIds};
 
-use super::DeliveryNoteService;
+use super::super::DeliveryNoteService;
+mod classify;
+mod helpers;
+mod resolve_scan_kind;
+
+use classify::{
+    build_unresolved_target, classify_invalid_state, classify_outcome, has_fully_invalid_target,
+    is_all_conflict, is_attachable_state, is_inspectable_state, TargetEvaluation,
+};
+use resolve_scan_kind::{resolve_scan_kind, ScanKind};
 
 const STATUS_DRAFT: &str = "DRAFT";
-
-// ---------------------------------------------------------------------------
-//  batch 状态 5 类分组（设计：scan-route-b-fix.md）
-// ---------------------------------------------------------------------------
-
-/// A 组：可直接 attach 入单（INSPECTION + READY_TO_SHIP）。
-///
-/// `pub(super)`：service::scan 与 service::attach 共用一份定义；不要在
-/// service/ 之外的代码里直接调用，attach 模块走 `super::scan::is_attachable_state`。
-pub(super) fn is_attachable_state(status: &str) -> bool {
-    matches!(status, "READY_TO_SHIP" | "INSPECTION")
-}
-
-/// B 组：可送检。`IN_PROCESS` 需未被工人持有。
-///
-/// 「工人持有」以 `location = 'WORKER'` 判定（与 worker_pool / part repo 的
-/// 全部查询一致）。**不能用 `current_holder_id`**：该列多态——批次放货架时
-/// 存 `t_shelf.id`（`location = 'PRODUCTION_SHELF' / 'INSPECTION_SHELF'`），
-/// 只有工人取件时才存 worker id（`location = 'WORKER'`）。
-fn is_inspectable_state(b: &TPartBatch) -> bool {
-    match b.status.as_str() {
-        "PENDING" | "PROGRAMMING" | "REPAIRING" => true,
-        "IN_PROCESS" => b.location.as_deref() != Some("WORKER"),
-        _ => false,
-    }
-}
-
-/// C 组：直接报错的非法状态。`IN_PROCESS` 被工人持有（`location = 'WORKER'`）归此类。
-fn classify_invalid_state(b: &TPartBatch) -> Option<&'static str> {
-    match b.status.as_str() {
-        "DELIVERED" => Some("DELIVERED"),
-        "OUTSOURCE" => Some("OUTSOURCE"),
-        "COMPLETED" => Some("COMPLETED"),
-        "CANCELLED" => Some("CANCELLED"),
-        "IN_PROCESS" if b.location.as_deref() == Some("WORKER") => {
-            Some("IN_PROCESS_HELD_BY_WORKER")
-        }
-        _ => None,
-    }
-}
-
-/// 单 target（part）的 batch 4 类分组结果（A/B/D）。
-///
-/// A 组：attachable（INSPECTION + READY_TO_SHIP）
-/// B 组：inspectable（PENDING/PROGRAMMING/REPAIRING/IN_PROCESS 非工人持有）
-/// D 组：conflict（已挂别的 active 单，由 service 层后续判定 21406）
-///
-/// C 组（DELIVERED/OUTSOURCE/COMPLETED/CANCELLED/IN_PROCESS 工人持有）由前置
-/// `has_fully_invalid_target` 静默过滤，不入此 struct。
-///
-/// `had_invalid` 记录该 target 在 C 组过滤前**是否至少有 1 个 C 组 batch**。
-/// 即便过滤后只剩 A/B，该 target 也会强制走弹窗路径（`classify_outcome` 短路），
-/// 让前端能看到剩余的合法批次让用户确认（spec：前端必须能看到 C 被过滤的迹象，
-/// 用户的语义预期是「即使只看到 A，也应该先确认再 attach」）。
-///
-/// `delivery_note_id == Some(note.id)` 的 batch 视为「已挂本单」不入任何 Vec，
-/// 由调用方按需要去重。
-struct TargetEvaluation {
-    part: TPart,
-    attachable: Vec<TPartBatch>,
-    inspectable: Vec<TPartBatch>,
-    conflict: Vec<TPartBatch>,
-    /// 该 target 在 5 组分类前是否有 C 组被静默过滤。
-    /// 即使分类后只剩 A，也会强制走弹窗路径（不让 A 静默自动 attach）。
-    had_invalid: bool,
-}
-
-/// 5 组分类的 outcome 判定（纯函数，单测覆盖）。
-///
-/// 输入是从 evaluations 聚合而来的四个布尔量；返回的 ScanOutcomeDto 决定
-/// handler 层后续是否 attach，以及响应里 `unresolved_targets` 的形状。
-///
-/// 关键约束：只要任一 target 原始有 C 组被过滤（C@WORKER / DELIVERED /
-/// OUTSOURCE / COMPLETED / CANCELLED），就强制走弹窗路径
-/// （CandidatesAvailable / PartialAdded），即使用户最终看不到 C 也要走弹窗。
-/// 这是 spec 约定：前端代码依赖 `unresolved_targets` 展示剩余合法批次让
-/// 用户确认，不能让 A 在 C 被静默过滤的语义下静默自动 attach。
-fn classify_outcome(
-    is_assembly: bool,
-    any_inspectable: bool,
-    all_attachable_empty: bool,
-    any_had_invalid_filtered: bool,
-) -> ScanOutcomeDto {
-    if any_had_invalid_filtered {
-        return if is_assembly {
-            ScanOutcomeDto::PartialAdded
-        } else {
-            ScanOutcomeDto::CandidatesAvailable
-        };
-    }
-    match (is_assembly, any_inspectable) {
-        (false, true) => ScanOutcomeDto::CandidatesAvailable,
-        (true, true) => ScanOutcomeDto::PartialAdded,
-        (_, false) => {
-            if all_attachable_empty {
-                ScanOutcomeDto::AlreadyPresent
-            } else {
-                ScanOutcomeDto::Added
-            }
-        }
-    }
-}
-
-/// 全 conflict 短路判定（保留 21406 硬错误；纯函数）。
-///
-/// 每个 target 的 conflict 非空、attachable 与 inspectable 都为空 → 用户
-/// 期望的批次全被别的 active 单锁死。返回 true 时 caller 应直接
-/// `BIZ_DELIVERY_NOTE_PART_ALREADY_ASSIGNED` 报错。
-fn is_all_conflict(evaluations: &[TargetEvaluation]) -> bool {
-    evaluations
-        .iter()
-        .all(|e| e.attachable.is_empty() && e.inspectable.is_empty() && !e.conflict.is_empty())
-}
-
-/// C 组分布判定（保留 21421 硬错误；纯函数，单测覆盖）。
-///
-/// 替代原「任一 C → 21421」全-or-无短路：原本工人持有（C）与货架上
-/// （A/B）的合法批次同存于一个子零件时，会错误地整单拒绝。改成
-/// 「按 part_id 聚合 → 任一 target 全 C 才报错」，且 C 组静默过滤，
-/// 让前端弹窗只看到合法 B 组候选。
-///
-/// 返回 true 当且仅当存在至少一个 `part_id`，其加载到的全部 batch
-/// 都落在 `classify_invalid_state` 命中集里。
-fn has_fully_invalid_target(batches: &[TPartBatch]) -> bool {
-    let mut by_part_total: HashMap<i64, usize> = HashMap::new();
-    let mut by_part_invalid: HashMap<i64, usize> = HashMap::new();
-    for b in batches {
-        *by_part_total.entry(b.part_id).or_insert(0) += 1;
-        if classify_invalid_state(b).is_some() {
-            *by_part_invalid.entry(b.part_id).or_insert(0) += 1;
-        }
-    }
-    by_part_total.iter().any(|(part_id, total)| {
-        *total > 0 && by_part_invalid.get(part_id).copied().unwrap_or(0) == *total
-    })
-}
-
-/// 由 evaluations[i] 构造 `UnresolvedTargetDto`（含 part 元数据 + A/B 组批次）。
-fn build_unresolved_target(e: TargetEvaluation) -> UnresolvedTargetDto {
-    UnresolvedTargetDto {
-        part_id: e.part.id,
-        serial_no: e.part.serial_no.clone().unwrap_or_default(),
-        drawing_no: e.part.drawing_no.clone(),
-        name: e.part.name.clone(),
-        available_batches: e
-            .inspectable
-            .into_iter()
-            .map(to_available_batch_dto)
-            .collect(),
-        attachable_batches: e
-            .attachable
-            .into_iter()
-            .map(to_attachable_batch_dto)
-            .collect(),
-    }
-}
-
-/// 把 `TPartBatch` 投影为 `AvailableBatchDto` / `AttachableBatchDto`。
-///
-/// ⚠️ **禁止合并为 generic helper**：`AvailableBatchDto` / `AttachableBatchDto`
-/// 当前字段同形，但设计上独立——未来字段分叉（status 派生逻辑、OCC version
-/// 来源、扩展字段）时各自演化。强行复用 generic 会导致所有调用点耦合。
-///
-/// 状态解析失败兜底为 `Pending`（与原 `build_unresolved_target` 行为一致）。
-fn to_available_batch_dto(b: TPartBatch) -> AvailableBatchDto {
-    AvailableBatchDto {
-        batch_id: b.id,
-        version: b.version,
-        quantity: b.quantity,
-        status: BatchStatusDto::from_db(&b.status).unwrap_or(BatchStatusDto::Pending),
-    }
-}
-
-/// `TPartBatch` → `AttachableBatchDto`（A 组；status 仅有 INSPECTION / READY_TO_SHIP）。
-///
-/// 状态解析失败兜底为 `Pending`（与原 `build_unresolved_target` 行为一致）。
-fn to_attachable_batch_dto(b: TPartBatch) -> AttachableBatchDto {
-    AttachableBatchDto {
-        batch_id: b.id,
-        version: b.version,
-        quantity: b.quantity,
-        status: BatchStatusDto::from_db(&b.status).unwrap_or(BatchStatusDto::Pending),
-    }
-}
-
-// ---------------------------------------------------------------------------
-//  NoteScope / classify  (设计 §3.2)
-// ---------------------------------------------------------------------------
-
-impl NoteScope {
-    pub(super) fn classify(leaf_customer_id: i64, groups: &[GroupWithMemberIds]) -> Self {
-        if groups.is_empty() {
-            return Self::L1Wide;
-        }
-        for g in groups {
-            if g.member_ids.contains(&leaf_customer_id) {
-                return Self::Group(g.group_id);
-            }
-        }
-        Self::Leaf(leaf_customer_id)
-    }
-}
-
-// ---------------------------------------------------------------------------
-//  scan_add 解析（设计 §5，纯函数 + service 内 combine DB 数据）
-// ---------------------------------------------------------------------------
-
-/// `scan_add` 第一步的解析形态（基于「part 优先 / 退避 assembly」结果）。
-///
-/// Idempotency 假设（与 Python `service/delivery_note.py::pickup_scan` 一致，
-/// 在 comment block 中固化说明）：
-/// > part serial 与 assembly serial 由同一 `t_serial_counter`（per-prefix）
-/// > 池子发放；part 表 `uk_t_part_serial_no` partial unique + assembly 表
-/// > `uk_t_assembly_serial_no` partial unique 都在 `serial_no IS NOT NULL AND
-/// > deleted_at IS NULL` 域内全局唯一，因此 **同一 serial 不可能既挂在 part
-/// > 也挂在 assembly** —— 解析分支不会有歧义。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ScanKind {
-    /// Part 命中，且 `part.assembly_id IS NULL` → 散件扫描。
-    StandalonePart,
-    /// Part 命中，但 `part.assembly_id IS NOT NULL` → 视作装配件整套。
-    /// 取 `assembly_id` 加载装配件头 + 全部子件。
-    PartOfAssembly(i64),
-    /// Part 未命中但 Assembly 命中 → 装配件总图。
-    Assembly,
-    /// 两者都没命中 → 404 `BIZ_DELIVERY_SCAN_UNKNOWN_CODE`。
-    Unknown,
-}
-
-/// 纯函数：根据 SQL 已装载的 part / assembly 行决定 scan 处理的形态。
-/// 测试覆盖在 `mod scan_resolve_tests`。
-fn resolve_scan_kind(part: Option<&TPart>, assembly: Option<&TAssembly>) -> ScanKind {
-    match (part, assembly) {
-        (Some(p), _) => {
-            if let Some(aid) = p.assembly_id {
-                ScanKind::PartOfAssembly(aid)
-            } else {
-                ScanKind::StandalonePart
-            }
-        }
-        (None, Some(_)) => ScanKind::Assembly,
-        (None, None) => ScanKind::Unknown,
-    }
-}
 
 impl DeliveryNoteService {
     // ---------- scan_add (P3，§5) ----------
@@ -325,7 +107,7 @@ impl DeliveryNoteService {
         }
 
         // 装配体 + children + 锚点（part.id 排序，幂等）
-        let mut targets: Vec<TPart> = Vec::new();
+        let mut targets: Vec<crate::modules::part::model::TPart> = Vec::new();
         let (resolved, anchor_customer_id) = match kind {
             ScanKind::StandalonePart => {
                 let p = part_opt.expect("StandalonePart implies Some(part)");
@@ -405,8 +187,9 @@ impl DeliveryNoteService {
             })?;
         let l1_id = leaf_cust.parent_id.unwrap_or(leaf_cust.id);
 
-        let groups_with_members =
-            DeliveryGroupRepo::list_active_groups_with_members_for_l1(&mut *conn, l1_id).await?;
+        let groups_with_members = conn
+            .group_list_active_groups_with_members_for_l1(l1_id)
+            .await?;
         let groups_for_classify: Vec<GroupWithMemberIds> = groups_with_members
             .iter()
             .map(|(g, m)| GroupWithMemberIds {
@@ -421,11 +204,12 @@ impl DeliveryNoteService {
 
         // ===== Step 4: 加载 target 全部活跃 batch → C 组短路 → 5 组分类 =====
         let target_part_ids: Vec<i64> = targets.iter().map(|p| p.id).collect();
-        let all_batches: Vec<TPartBatch> = if target_part_ids.is_empty() {
-            Vec::new()
-        } else {
-            PartBatchRepo::list_active_by_part_ids(&mut *conn, &target_part_ids).await?
-        };
+        let all_batches: Vec<crate::modules::part_batch::model::TPartBatch> =
+            if target_part_ids.is_empty() {
+                Vec::new()
+            } else {
+                PartBatchRepo::list_active_by_part_ids(&mut *conn, &target_part_ids).await?
+            };
 
         // C 组分布判定：
         // 仅当存在「target 加载到批次但全部为 C 组」时硬错误（21421）。
@@ -450,13 +234,14 @@ impl DeliveryNoteService {
         }
 
         // 过滤 C 组后继续走 A/B/D/E 分类（与原 5 组逻辑兼容）
-        let all_batches: Vec<TPartBatch> = all_batches
+        let all_batches: Vec<crate::modules::part_batch::model::TPartBatch> = all_batches
             .into_iter()
             .filter(|b| classify_invalid_state(b).is_none())
             .collect();
 
         // 按 part_id 分桶（一次扫描）
-        let mut batches_by_part: HashMap<i64, Vec<TPartBatch>> = HashMap::new();
+        let mut batches_by_part: HashMap<i64, Vec<crate::modules::part_batch::model::TPartBatch>> =
+            HashMap::new();
         for b in all_batches {
             batches_by_part.entry(b.part_id).or_default().push(b);
         }
@@ -470,9 +255,9 @@ impl DeliveryNoteService {
         for target in &targets {
             let empty = Vec::new();
             let bs = batches_by_part.get(&target.id).unwrap_or(&empty);
-            let mut attachable: Vec<TPartBatch> = Vec::new();
-            let mut inspectable: Vec<TPartBatch> = Vec::new();
-            let mut conflict: Vec<TPartBatch> = Vec::new();
+            let mut attachable: Vec<crate::modules::part_batch::model::TPartBatch> = Vec::new();
+            let mut inspectable: Vec<crate::modules::part_batch::model::TPartBatch> = Vec::new();
+            let mut conflict: Vec<crate::modules::part_batch::model::TPartBatch> = Vec::new();
             for b in bs {
                 match b.delivery_note_id {
                     Some(other_id) if other_id == note.id => {
@@ -564,7 +349,8 @@ impl DeliveryNoteService {
         }
 
         // ===== Step 7: 重新装载 note + 构建响应 =====
-        let fresh_note = DeliveryNoteRepo::get_by_id(&mut *conn, note.id, false)
+        let fresh_note = conn
+            .note_get_by_id(note.id, false)
             .await?
             .ok_or_else(|| note_not_found(note.id))?;
         let line_count = PartBatchRepo::list_by_delivery_note(&mut *conn, fresh_note.id)
@@ -684,8 +470,9 @@ impl DeliveryNoteService {
         scope: NoteScope,
         current: &CurrentUser,
     ) -> Result<DeliveryNote, AppError> {
-        if let Some(n) =
-            DeliveryNoteRepo::find_open_draft_by_scope(&mut *conn, l1_id, scope, None).await?
+        if let Some(n) = conn
+            .note_find_open_draft_by_scope(l1_id, scope, None)
+            .await?
         {
             return Ok(n);
         }
@@ -719,15 +506,16 @@ impl DeliveryNoteService {
             leaf_customer_id: lcid,
         };
 
-        match DeliveryNoteRepo::create(&mut *conn, &new_note).await {
-            Ok(()) => DeliveryNoteRepo::get_by_id(&mut *conn, new_note.id, false)
+        match conn.note_create(&new_note).await {
+            Ok(()) => conn
+                .note_get_by_id(new_note.id, false)
                 .await?
                 .ok_or_else(|| note_not_found(new_note.id)),
             Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
                 // 唯一索引撞 → 重查（同 scope 应有另一个 DRAFT 草稿）
-                if let Some(n) =
-                    DeliveryNoteRepo::find_open_draft_by_scope(&mut *conn, l1_id, scope, None)
-                        .await?
+                if let Some(n) = conn
+                    .note_find_open_draft_by_scope(l1_id, scope, None)
+                    .await?
                 {
                     Ok(n)
                 } else {
@@ -740,12 +528,15 @@ impl DeliveryNoteService {
     }
 }
 
-// classify 单元测试放在文件末尾，避免 `items after a test module` 警告
-// （rust 2018+ 规定 #[cfg(test)] mod 之后只能再放 #[cfg(test)] 项）。
+// =============================================================================
+//  单元测试（classify / resolve_scan_kind / outcome / c_group_distribution /
+//            attachable_batches 共 6 组，就地保留在 mod.rs 末尾）
+// =============================================================================
 
 #[cfg(test)]
 mod classify_tests {
-    use super::*;
+    use super::super::super::inner::GroupWithMemberIds;
+    use crate::modules::delivery_note::model::NoteScope;
 
     fn g(id: i64, members: &[i64]) -> GroupWithMemberIds {
         GroupWithMemberIds {
@@ -780,9 +571,9 @@ mod classify_tests {
 
 #[cfg(test)]
 mod scan_resolve_tests {
-    use super::*;
+    use super::resolve_scan_kind::{resolve_scan_kind, ScanKind};
     use crate::modules::assembly::model::TAssembly;
-    use crate::modules::part::model::TPart;
+    use crate::modules::delivery_note::model::TPart;
 
     /// 构造一个最小化的 TPart 用作 fixture。
     fn make_part(id: i64, assembly_id: Option<i64>) -> TPart {
@@ -893,7 +684,10 @@ mod scan_resolve_tests {
 
 #[cfg(test)]
 mod classify_5groups_tests {
-    use super::*;
+    use super::classify::{
+        classify_invalid_state, is_attachable_state, is_inspectable_state,
+    };
+    use crate::modules::part_batch::model::TPartBatch;
 
     fn b(status: &str, holder: Option<i64>, location: Option<&str>) -> TPartBatch {
         TPartBatch {
@@ -980,141 +774,9 @@ mod classify_5groups_tests {
 }
 
 #[cfg(test)]
-mod outcome_tests {
-    use super::*;
-
-    fn eval(
-        part_id: i64,
-        attachable: usize,
-        inspectable: usize,
-        conflict: usize,
-    ) -> TargetEvaluation {
-        fn mk(n: usize) -> Vec<TPartBatch> {
-            (0..n)
-                .map(|i| TPartBatch {
-                    id: i as i64,
-                    part_id: 1,
-                    batch_no: 1,
-                    quantity: 1,
-                    status: "INSPECTION".to_string(),
-                    location: None,
-                    current_holder_id: None,
-                    current_process_step_id: None,
-                    delivery_note_id: None,
-                    parent_batch_id: None,
-                    version: 0,
-                    created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
-                    created_by: None,
-                    updated_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
-                    updated_by: None,
-                    deleted_at: None,
-                })
-                .collect()
-        }
-        TargetEvaluation {
-            part: TPart {
-                id: part_id,
-                serial_no: Some(format!("F{part_id:04}")),
-                name: format!("Part {part_id}"),
-                drawing_no: format!("D-{part_id:03}"),
-                applicant_name: String::new(),
-                quantity: 1,
-                request_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
-                planned_delivery_date: chrono::NaiveDate::from_ymd_opt(2026, 8, 22).unwrap(),
-                customer_id: 1,
-                assembly_id: None,
-                status: "INSPECTION".to_string(),
-                is_urgent: false,
-                next_process_id: None,
-                order_no: None,
-                system_delivery_date: None,
-                note: None,
-                version: 0,
-                created_at: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap(),
-                created_by: None,
-                updated_at: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap(),
-                updated_by: None,
-                deleted_at: None,
-                process_chain_id: None,
-            },
-            attachable: mk(attachable),
-            inspectable: mk(inspectable),
-            conflict: mk(conflict),
-            had_invalid: false,
-        }
-    }
-
-    #[test]
-    fn outcome_added_when_all_attachable() {
-        let evs = vec![eval(1, 1, 0, 0)];
-        assert_eq!(
-            classify_outcome(false, false, false, false),
-            ScanOutcomeDto::Added
-        );
-        assert!(!is_all_conflict(&evs));
-    }
-
-    #[test]
-    fn outcome_already_present_when_all_on_note() {
-        // attachable 全空 + inspectable 全空 + 无 conflict
-        let evs = vec![eval(1, 0, 0, 0)];
-        assert_eq!(
-            classify_outcome(false, false, true, false),
-            ScanOutcomeDto::AlreadyPresent
-        );
-        assert!(!is_all_conflict(&evs));
-    }
-
-    #[test]
-    fn outcome_candidates_available_when_standalone_only_inspectable() {
-        let evs = vec![eval(1, 0, 1, 0)];
-        assert_eq!(
-            classify_outcome(false, true, true, false),
-            ScanOutcomeDto::CandidatesAvailable
-        );
-        assert!(!is_all_conflict(&evs));
-    }
-
-    #[test]
-    fn outcome_partial_added_when_assembly_mixed() {
-        // assembly 路径 + A 组 + B 组混合
-        let evs = vec![eval(1, 1, 1, 0)];
-        assert_eq!(
-            classify_outcome(true, true, false, false),
-            ScanOutcomeDto::PartialAdded
-        );
-        assert!(!is_all_conflict(&evs));
-    }
-
-    #[test]
-    fn outcome_assembly_only_inspectable_still_partial_added() {
-        // 装配件全部 B 组 → 仍归 PartialAdded（resolved=Assembly）
-        let _evs = [eval(1, 0, 1, 0)];
-        assert_eq!(
-            classify_outcome(true, true, true, false),
-            ScanOutcomeDto::PartialAdded
-        );
-    }
-
-    #[test]
-    fn c_group_short_circuits_before_outcome_judgement() {
-        // 全 conflict → 直接报 21406，不进 outcome 判定
-        let evs = vec![eval(1, 0, 0, 1), eval(2, 0, 0, 2)];
-        assert!(is_all_conflict(&evs));
-    }
-}
-
-// C 组分布判定单元测试：覆盖「任一 target 全 C 才报 21421」+「C 组
-// 静默过滤后只剩 A/B」两条核心语义（与 `classify_5groups_tests` 互为补充）。
-#[cfg(test)]
 mod c_group_distribution_tests {
-    use super::*;
+    use super::classify::{classify_invalid_state, has_fully_invalid_target};
+    use crate::modules::part_batch::model::TPartBatch;
 
     /// 紧凑 mock：仅暴露本测试关注的字段，其余用 None / 0 / false 占位。
     fn b(id: i64, part_id: i64, status: &str, location: Option<&str>) -> TPartBatch {
@@ -1204,15 +866,15 @@ mod c_group_distribution_tests {
     }
 }
 
-// attachable_batches 单元测试：覆盖 build_unresolved_target 字段映射 +
-// outcome 分流（PartialAdded / CandidatesAvailable / C 组过滤）三种场景。
 #[cfg(test)]
 mod attachable_batches_tests {
-    use super::*;
+    use super::classify::{build_unresolved_target, classify_outcome, TargetEvaluation};
+    use super::helpers::{to_attachable_batch_dto, to_available_batch_dto};
     use crate::modules::delivery_note::dto::{
-        AttachableBatchDto, AvailableBatchDto, BatchStatusDto, UnresolvedTargetDto,
+        AttachableBatchDto, AvailableBatchDto, BatchStatusDto, ScanOutcomeDto, UnresolvedTargetDto,
     };
-    use crate::modules::part::model::TPart;
+    use crate::modules::delivery_note::model::TPart;
+    use crate::modules::part_batch::model::TPartBatch;
 
     /// 紧凑 mock：仅暴露本测试关注的字段，其余用 None / 0 / false 占位。
     fn b(id: i64, part_id: i64, status: &str, location: Option<&str>, version: i32) -> TPartBatch {
@@ -1463,11 +1125,12 @@ mod attachable_batches_tests {
         // C 组过滤（与 scan_add Step 4 一致）
         let filtered: Vec<TPartBatch> = all
             .into_iter()
-            .filter(|x| classify_invalid_state(x).is_none())
+            .filter(|x| classify_invalid_state(x).is_none()) // 直接调，不依赖上面的 mod path
             .collect();
         assert_eq!(filtered.len(), 2);
 
         // 按 attachable/inspectable 分桶（与 Step 4 一致）
+        use super::classify::{is_attachable_state, is_inspectable_state};
         let mut attachable = Vec::new();
         let mut inspectable = Vec::new();
         for b in &filtered {
@@ -1501,6 +1164,21 @@ mod attachable_batches_tests {
         for b in &out.available_batches {
             assert_ne!(b.batch_id, 3);
         }
+    }
+
+    #[test]
+    fn helper_dto_under_separate_paths() {
+        // 测试 helpers::to_available_batch_dto / to_attachable_batch_dto
+        // 拆分后独立可用（覆盖子模块入口）。
+        let batch = b(99, 1, "INSPECTION", None, 3);
+        let avail: AvailableBatchDto = to_available_batch_dto(batch.clone());
+        assert_eq!(avail.batch_id, 99);
+        assert_eq!(avail.version, 3);
+        assert_eq!(avail.quantity, 10);
+        let attach: AttachableBatchDto = to_attachable_batch_dto(batch);
+        assert_eq!(attach.batch_id, 99);
+        assert_eq!(attach.version, 3);
+        assert_eq!(attach.quantity, 10);
     }
 
     // ---- had_invalid 短路 outcome 测试：覆盖 spec 约定的「原始含 C → 强制弹窗」 ----

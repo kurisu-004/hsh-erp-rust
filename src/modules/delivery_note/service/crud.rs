@@ -9,6 +9,7 @@ use crate::infra::clock::now_naive;
 use crate::infra::serial::next_delivery_note_no;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
@@ -17,7 +18,7 @@ use super::super::dto::{
     DeliveryNoteOut, DeliveryNoteUpdateRequest,
 };
 use super::super::model::{DeliveryNote, DeliveryNoteEventType};
-use super::super::repo::{DeliveryNoteRepo, SortDir};
+use super::super::repo::SortDir;
 use super::inner::{
     add_parts_inner, build_note_outs, get_with_parts, note_not_found, note_version_conflict,
     write_event,
@@ -50,20 +51,20 @@ impl DeliveryNoteService {
             Role::CncProgrammer,
         ])?;
 
-        let rows = DeliveryNoteRepo::list_with_filters(
-            &mut *conn,
-            statuses,
-            customer_id,
-            keyword,
-            sort_by,
-            sort_dir,
-            limit,
-            offset,
-        )
-        .await?;
-        let total =
-            DeliveryNoteRepo::count_with_filters(&mut *conn, statuses, customer_id, keyword)
-                .await?;
+        let rows = conn
+            .note_list_with_filters(
+                statuses,
+                customer_id,
+                keyword,
+                sort_by,
+                sort_dir,
+                limit,
+                offset,
+            )
+            .await?;
+        let total = conn
+            .note_count_with_filters(statuses, customer_id, keyword)
+            .await?;
 
         let items = build_note_outs(conn, &rows).await?;
         Ok(DeliveryNoteListOut {
@@ -83,7 +84,7 @@ impl DeliveryNoteService {
         // 这里不做角色硬限；具体 worker 校验在 pickup/pickup_scan 里。
         let _ = current;
 
-        let rows = DeliveryNoteRepo::list_for_pickup(&mut *conn, customer_id).await?;
+        let rows = conn.note_list_for_pickup(customer_id).await?;
         build_note_outs(conn, &rows).await
     }
 
@@ -137,7 +138,7 @@ impl DeliveryNoteService {
             delivery_group_id: None,
             leaf_customer_id: None,
         };
-        DeliveryNoteRepo::create(&mut *conn, &note).await?;
+        conn.note_create(&note).await?;
 
         // 4. CREATED 事件
         write_event(
@@ -195,7 +196,7 @@ impl DeliveryNoteService {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let heads = DeliveryNoteRepo::list_by_ids(&mut *conn, ids, false).await?;
+        let heads = conn.note_list_by_ids(ids, false).await?;
         if heads.is_empty() {
             return Ok(Vec::new());
         }
@@ -332,7 +333,8 @@ impl DeliveryNoteService {
     ) -> Result<DeliveryNoteOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let mut obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let mut obj = conn
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
 
@@ -373,7 +375,7 @@ impl DeliveryNoteService {
             obj.version += 1;
             obj.updated_at = now;
             obj.updated_by = Some(current.id);
-            let affected = DeliveryNoteRepo::update(&mut *conn, &obj).await?;
+            let affected = conn.note_update(&obj).await?;
             if affected == 0 {
                 return Err(AppError::biz(
                     code::VERSION_CONFLICT,
@@ -381,7 +383,8 @@ impl DeliveryNoteService {
                 ));
             }
             // 立即 reload 让 updated_at 拿到 server 值
-            obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+            obj = conn
+                .note_get_by_id(note_id, false)
                 .await?
                 .ok_or_else(|| note_not_found(note_id))?;
         }
@@ -416,7 +419,8 @@ impl DeliveryNoteService {
     ) -> Result<DeliveryNoteDetailOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let obj = conn
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.version != version {

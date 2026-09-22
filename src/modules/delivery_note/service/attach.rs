@@ -15,11 +15,11 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
+use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{AttachBatchConflict, AttachBatchItem, AttachBatchesOut};
-use super::super::repo::DeliveryNoteRepo;
 use super::inner::note_not_found;
 use super::scan::is_attachable_state;
 
@@ -51,7 +51,8 @@ impl DeliveryNoteService {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
 
         // ===== Step 1: note 必须存在且为 DRAFT =====
-        let note = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let note = conn
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if note.status != STATUS_DRAFT {

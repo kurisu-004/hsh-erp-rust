@@ -8,13 +8,13 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
     DeliveryGroupListOut, DeliveryGroupMemberOut, DeliveryGroupOut, UngroupedCustomerOut,
 };
 use super::super::model::{DeliveryGroup, DeliveryGroupMember};
-use super::super::repo::DeliveryGroupRepo;
 use super::inner::{
     group_not_found, l1_children_lookup, validate_group_name, validate_l2_members, version_conflict,
 };
@@ -44,10 +44,11 @@ impl DeliveryGroupService {
             ));
         }
 
-        let groups = DeliveryGroupRepo::list_by_customer(&mut *conn, l1_id, false).await?;
+        let groups = conn.group_list_by_customer(l1_id, false).await?;
         let group_ids: Vec<i64> = groups.iter().map(|g| g.id).collect();
-        let members =
-            DeliveryGroupRepo::list_members_by_group_ids(&mut *conn, &group_ids, false).await?;
+        let members = conn
+            .group_list_members_by_group_ids(&group_ids, false)
+            .await?;
         let l2_children = CustomerRepo::list_children(&mut *conn, l1_id, false).await?;
 
         let mut groups_out = Vec::with_capacity(groups.len());
@@ -104,7 +105,8 @@ impl DeliveryGroupService {
 
         let name = validate_group_name(&req.name)?;
 
-        if DeliveryGroupRepo::get_by_name(&mut *conn, req.customer_id, &name, false)
+        if conn
+            .group_get_by_name(req.customer_id, &name, false)
             .await?
             .is_some()
         {
@@ -131,7 +133,7 @@ impl DeliveryGroupService {
             updated_by: Some(current.id),
             deleted_at: None,
         };
-        DeliveryGroupRepo::insert(&mut *conn, &group).await?;
+        conn.group_insert(&group).await?;
 
         for customer_id in &validated_members {
             let m = DeliveryGroupMember {
@@ -142,7 +144,7 @@ impl DeliveryGroupService {
                 created_by: Some(current.id),
                 deleted_at: None,
             };
-            DeliveryGroupRepo::insert_member(&mut *conn, &m).await?;
+            conn.group_insert_member(&m).await?;
         }
 
         let mut member_outs: Vec<DeliveryGroupMemberOut> =
@@ -168,7 +170,8 @@ impl DeliveryGroupService {
     ) -> Result<DeliveryGroupOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
 
-        let group = DeliveryGroupRepo::get_by_id(&mut *conn, group_id, false)
+        let group = conn
+            .group_get_by_id(group_id, false)
             .await?
             .ok_or_else(|| group_not_found(group_id))?;
 
@@ -181,7 +184,8 @@ impl DeliveryGroupService {
         if let Some(ref raw) = req.name {
             let new_name = validate_group_name(raw)?;
             if new_name != group.name {
-                if DeliveryGroupRepo::get_by_name(&mut *conn, group.customer_id, &new_name, false)
+                if conn
+                    .group_get_by_name(group.customer_id, &new_name, false)
                     .await?
                     .is_some()
                 {
@@ -209,8 +213,8 @@ impl DeliveryGroupService {
         let now = now_naive();
 
         if name_changed {
-            let affected = DeliveryGroupRepo::update(
-                &mut *conn,
+            let affected = conn
+            .group_update(
                 group_id,
                 group.version,
                 &next_name,
@@ -227,7 +231,7 @@ impl DeliveryGroupService {
         }
 
         if replace_members {
-            DeliveryGroupRepo::soft_delete_members_by_group(&mut *conn, group_id, now).await?;
+            conn.group_soft_delete_members_by_group(group_id, now).await?;
             for cid in &new_member_ids {
                 let m = DeliveryGroupMember {
                     id: snowflake.next_id(),
@@ -237,15 +241,17 @@ impl DeliveryGroupService {
                     created_by: Some(current.id),
                     deleted_at: None,
                 };
-                DeliveryGroupRepo::insert_member(&mut *conn, &m).await?;
+                conn.group_insert_member(&m).await?;
             }
         }
 
-        let updated = DeliveryGroupRepo::get_by_id(&mut *conn, group_id, true)
+        let updated = conn
+            .group_get_by_id(group_id, true)
             .await?
             .ok_or_else(|| group_not_found(group_id))?;
-        let raw_members =
-            DeliveryGroupRepo::list_members_by_group_ids(&mut *conn, &[group_id], false).await?;
+        let raw_members = conn
+            .group_list_members_by_group_ids(&[group_id], false)
+            .await?;
         let mut members: Vec<DeliveryGroupMemberOut> = Vec::with_capacity(raw_members.len());
         for m in raw_members.into_iter().filter(|m| m.group_id == group_id) {
             let name = l1_children_lookup(conn, m.customer_id)
@@ -267,7 +273,8 @@ impl DeliveryGroupService {
     ) -> Result<(), AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
 
-        let group = DeliveryGroupRepo::get_by_id(&mut *conn, group_id, false)
+        let group = conn
+            .group_get_by_id(group_id, false)
             .await?
             .ok_or_else(|| group_not_found(group_id))?;
 
@@ -276,21 +283,16 @@ impl DeliveryGroupService {
         }
 
         let now = now_naive();
-        let affected = DeliveryGroupRepo::soft_delete(
-            &mut *conn,
-            group_id,
-            req.version,
-            now,
-            Some(current.id),
-        )
-        .await?;
+        let affected = conn
+            .group_soft_delete(group_id, req.version, now, Some(current.id))
+            .await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 "concurrent modification detected",
             ));
         }
-        DeliveryGroupRepo::soft_delete_members_by_group(&mut *conn, group_id, now).await?;
+        conn.group_soft_delete_members_by_group(group_id, now).await?;
         Ok(())
     }
 
