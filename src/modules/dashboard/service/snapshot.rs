@@ -24,12 +24,9 @@
 
 use std::collections::HashMap;
 
-use crate::modules::dashboard::dto::{
-    DashboardItem, DashboardSnapshot, OnProductionShelfGroup,
-};
-use crate::modules::dashboard::repo::{
-    BatchLite, DashboardRepoTrait, PartLite,
-};
+use crate::modules::dashboard::dto::{DashboardItem, DashboardSnapshot, OnProductionShelfGroup};
+use crate::modules::dashboard::repo::{BatchLite, DashboardRepoTrait, PartLite};
+use crate::shared::analytics::shelf_grouping::group_by_shelf;
 
 /// 快照 top_n 默认值（远高于合理在持量，仅作防爆兜底）
 pub const DASHBOARD_TOP_N: i64 = 1000;
@@ -84,13 +81,8 @@ impl DashboardService {
             .collect();
         let worker_name_map = repo.snapshot_workers(&worker_ids).await?;
 
-        // 3) 产线架按 current_holder_id 分桶限流
-        let mut rows_by_shelf: HashMap<i64, Vec<(BatchLite, PartLite)>> = HashMap::new();
-        for (b, p) in top.on_prod_pairs {
-            if let Some(sid) = b.holder_id {
-                rows_by_shelf.entry(sid).or_default().push((b, p));
-            }
-        }
+        // 3) 产线架按 current_holder_id 分桶限流（PR3 抽离：纯聚合走 shared::analytics）
+        let rows_by_shelf = group_by_shelf(top.on_prod_pairs, |b: &BatchLite| b.holder_id);
         let prod_groups: Vec<OnProductionShelfGroup> = top
             .active_prod_shelves
             .into_iter()

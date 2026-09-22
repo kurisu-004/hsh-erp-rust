@@ -5,7 +5,7 @@
 //!
 //! 约定：
 //! - 日期统一转 `[date_from, date_to+1)` 半开区间做 `created_at` 比较；
-//! - 贡献度公式隔离在 `_compute_contribution` 单方法中，后续口径调整只改一处；
+//! - 贡献度公式与零填充日计数抽离到 `shared::analytics`（2026-09-22 PR3）；
 //! - statistics 端点**只读**，不写 DB，不广播 dashboard。
 //! - 错误码统一 `BIZ_INVALID_VALUE` / `BIZ_INVALID_QUERY`（与 plan §4.1 决议一致）。
 //! - 权限：handler `require_role(Role::Manager)`。
@@ -19,12 +19,15 @@ use crate::infra::clock::now_naive;
 use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::statistics::dto::{
-    DayCount, DeliveryPerformance, OverviewOut, PickupSkipDetailItem, PickupSkipDetailOut,
+    DeliveryPerformance, OverviewOut, PickupSkipDetailItem, PickupSkipDetailOut,
     PickupSkipSummaryItem, PickupSkipSummaryOut, StatusCount, WorkerBrief, WorkerDetailOut,
     WorkerPartItem, WorkerStatsItem, WorkerStatsListOut,
 };
 use crate::modules::statistics::repo::{
     PickupSkipDetailRow, PickupSkipSummaryRow, StatisticsRepo, WorkerPartRow, WorkerPickupRow,
+};
+use crate::shared::analytics::{
+    daily_buckets::fill_zero_daily_counts, worker_contribution::compute_worker_contribution,
 };
 use crate::shared::error::{AppError, code};
 
@@ -78,8 +81,8 @@ impl StatisticsService {
             StatisticsRepo::daily_completed_counts(conn, date_from, date_to).await?;
         let status_dist = StatisticsRepo::status_distribution(conn).await?;
 
-        let daily_created = zero_fill_day_count(date_from, date_to, &daily_created_raw);
-        let daily_completed = zero_fill_day_count(date_from, date_to, &daily_completed_raw);
+        let daily_created = fill_zero_daily_counts(date_from, date_to, &daily_created_raw);
+        let daily_completed = fill_zero_daily_counts(date_from, date_to, &daily_completed_raw);
 
         // on_time = delivered - orange - red（互斥拆分）
         let on_time = (delivered_count - orange - red).max(0);
@@ -142,7 +145,7 @@ impl StatisticsService {
         let agg_map: HashMap<i64, WorkerPickupRow> =
             rows.iter().map(|r| (r.worker_id, r.clone())).collect();
 
-        let contribution_map = compute_contribution(&rows);
+        let contribution_map = compute_worker_contribution(&rows);
 
         let items = workers_rows
             .into_iter()
@@ -203,7 +206,7 @@ impl StatisticsService {
             StatisticsRepo::worker_daily_pickups(&mut *conn, wid_int, date_from, date_to).await?;
         let parts_rows =
             StatisticsRepo::worker_parts(&mut *conn, wid_int, date_from, date_to).await?;
-        let daily_pickups = zero_fill_day_count(date_from, date_to, &daily_pickups_raw);
+        let daily_pickups = fill_zero_daily_counts(date_from, date_to, &daily_pickups_raw);
 
         // distinct part_id（即便 part 已软删也计数 — 与 parts 列表口径不同）
         let participated_part_count = parts_rows
@@ -301,130 +304,10 @@ impl StatisticsService {
     }
 }
 
-/// 贡献度公式隔离点：公式调整只动这一处。
-///
-/// 公式：`worker.pickup_count / 同工种 total * 100`，保留 2 位小数。
-/// 无工种或工种总领取为 0 → None（前端展示「—」）。
-fn compute_contribution(rows: &[WorkerPickupRow]) -> HashMap<i64, Option<f64>> {
-    // 按 work_type_id 聚合 total
-    let mut totals_by_wt: HashMap<i64, i64> = HashMap::new();
-    let mut workers_by_wt: HashMap<i64, Vec<&WorkerPickupRow>> = HashMap::new();
-    let mut no_work_type: Vec<&WorkerPickupRow> = Vec::new();
-
-    for r in rows {
-        if let Some(wt_id) = r.work_type_id {
-            *totals_by_wt.entry(wt_id).or_insert(0) += r.pickup_count;
-            workers_by_wt.entry(wt_id).or_default().push(r);
-        } else {
-            no_work_type.push(r);
-        }
-    }
-
-    let mut out: HashMap<i64, Option<f64>> = HashMap::new();
-    for r in no_work_type {
-        out.insert(r.worker_id, None);
-    }
-    for (wt_id, total) in totals_by_wt {
-        for r in workers_by_wt.get(&wt_id).cloned().unwrap_or_default() {
-            let pct = if total <= 0 {
-                None
-            } else {
-                let p = r.pickup_count as f64 / total as f64 * 100.0;
-                Some((p * 100.0).round() / 100.0)
-            };
-            out.insert(r.worker_id, pct);
-        }
-    }
-    out
-}
-
-/// 把 `raw: [(NaiveDate, i64)]` 按 `[date_from, date_to]` 闭区间补齐为 0。
-fn zero_fill_day_count(
-    date_from: NaiveDate,
-    date_to: NaiveDate,
-    raw: &[(NaiveDate, i64)],
-) -> Vec<DayCount> {
-    let map: HashMap<NaiveDate, i64> = raw.iter().cloned().collect();
-    let mut out: Vec<DayCount> = Vec::new();
-    let mut cur = date_from;
-    while cur <= date_to {
-        out.push(DayCount {
-            date: cur,
-            count: *map.get(&cur).unwrap_or(&0),
-        });
-        cur = cur
-            .succ_opt()
-            .expect("date overflow in zero_fill_day_count");
-    }
-    out
-}
+// 2026-09-22 PR3：原 `compute_contribution` / `zero_fill_day_count` 两个私有 fn 已抽离到
+// `crate::shared::analytics::{worker_contribution, daily_buckets}`，行为 1:1 保留。
+// 单元测试随抽离搬到各 fn 所在文件，service.rs 此处不再重复。
 
 // ============================================================
 // 2026-09-15 followup-cleanup A7：删除原 `_unused()` 死代码（Role / Decimal 实际由上层 handler 引用）
 // ============================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn zero_fill_missing_dates() {
-        let from = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
-        let to = NaiveDate::from_ymd_opt(2026, 9, 3).unwrap();
-        let raw = vec![(NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), 5i64)];
-        let out = zero_fill_day_count(from, to, &raw);
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0].count, 5);
-        assert_eq!(out[1].count, 0);
-        assert_eq!(out[2].count, 0);
-    }
-
-    #[test]
-    fn zero_fill_full_range() {
-        let from = NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
-        let to = NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
-        let raw = vec![
-            (NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(), 1),
-            (NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(), 2),
-        ];
-        let out = zero_fill_day_count(from, to, &raw);
-        assert_eq!(out[0].count, 1);
-        assert_eq!(out[1].count, 2);
-    }
-
-    #[test]
-    fn compute_contribution_no_work_type_yields_none() {
-        let rows = vec![WorkerPickupRow {
-            worker_id: 1,
-            work_type_id: None,
-            pickup_count: 5,
-            pickup_quantity: 0,
-            participated_part_count: 0,
-        }];
-        let m = compute_contribution(&rows);
-        assert_eq!(m.get(&1), Some(&None));
-    }
-
-    #[test]
-    fn compute_contribution_per_work_type() {
-        let rows = vec![
-            WorkerPickupRow {
-                worker_id: 1,
-                work_type_id: Some(100),
-                pickup_count: 3,
-                pickup_quantity: 0,
-                participated_part_count: 0,
-            },
-            WorkerPickupRow {
-                worker_id: 2,
-                work_type_id: Some(100),
-                pickup_count: 7,
-                pickup_quantity: 0,
-                participated_part_count: 0,
-            },
-        ];
-        let m = compute_contribution(&rows);
-        assert_eq!(m.get(&1).and_then(|x| *x), Some(30.0));
-        assert_eq!(m.get(&2).and_then(|x| *x), Some(70.0));
-    }
-}
