@@ -21,7 +21,6 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::statistics::service::StatisticsService;
 use sqlx::PgPool;
 
-
 async fn setup() -> PgPool {
     ensure_database_exists().await;
     let pool = test_pool().await;
@@ -137,13 +136,14 @@ async fn overview_happy_path() {
     let _ = insert_part(&pool, l2, "p1").await;
 
     let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService::overview(
-        &mut tx,
-        NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-        NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
-    )
-    .await
-    .expect("overview ok");
+    let out = StatisticsService
+        .overview(
+            &mut *tx,
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
+        )
+        .await
+        .expect("overview ok");
     drop(tx);
 
     assert!(out.created_count >= 1);
@@ -157,13 +157,14 @@ async fn overview_happy_path() {
 async fn overview_invalid_date_range_returns_400() {
     let pool = setup().await;
     let mut tx = pool.begin().await.unwrap();
-    let err = StatisticsService::overview(
-        &mut tx,
-        NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
-        NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-    )
-    .await
-    .expect_err("date_from > date_to 应抛错");
+    let err = StatisticsService
+        .overview(
+            &mut *tx,
+            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        )
+        .await
+        .expect_err("date_from > date_to 应抛错");
     drop(tx);
     match err {
         hsh_erp_rust::shared::error::AppError::Biz { code, .. } => {
@@ -215,13 +216,14 @@ async fn workers_stats_happy_path() {
     }
 
     let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService::worker_stats(
-        &mut tx,
-        NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-        NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
-    )
-    .await
-    .expect("worker_stats ok");
+    let out = StatisticsService
+        .worker_stats(
+            &mut *tx,
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
+        )
+        .await
+        .expect("worker_stats ok");
     drop(tx);
 
     assert_eq!(out.items.len(), 2, "应见 2 个工人");
@@ -268,14 +270,15 @@ async fn worker_detail_happy_path() {
         .expect("insert part_event");
     }
     let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService::worker_detail(
-        &mut tx,
-        &w_id.to_string(),
-        NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-        NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
-    )
-    .await
-    .expect("worker_detail ok");
+    let out = StatisticsService
+        .worker_detail(
+            &mut *tx,
+            &w_id.to_string(),
+            NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
+        )
+        .await
+        .expect("worker_detail ok");
     drop(tx);
     assert_eq!(out.worker.id, w_id);
     assert_eq!(out.pickup_count, 2);
@@ -317,7 +320,8 @@ async fn pickup_skips_summary_happy_path() {
         .expect("insert pickup_skip_event");
     }
     let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService::pickup_skip_summary(&mut tx)
+    let out = StatisticsService
+        .pickup_skip_summary(&mut *tx)
         .await
         .expect("summary ok");
     drop(tx);
@@ -363,7 +367,8 @@ async fn pickup_skip_detail_happy_path() {
         .expect("insert pickup_skip_event");
     }
     let mut tx = pool.begin().await.unwrap();
-    let out = StatisticsService::pickup_skip_detail(&mut tx, &w_id.to_string(), 10, 0)
+    let out = StatisticsService
+        .pickup_skip_detail(&mut *tx, &w_id.to_string(), 10, 0)
         .await
         .expect("detail ok");
     drop(tx);
@@ -386,7 +391,7 @@ async fn pickup_skip_detail_happy_path() {
 //   新 SQL 移除该过滤后：A 不在制，B 在制 → 期望 1。
 #[tokio::test]
 async fn count_in_process_at_date_to_boundary() {
-    use hsh_erp_rust::modules::statistics::repo::StatisticsRepo;
+    use hsh_erp_rust::modules::statistics::repo::sql as statistics_sql;
 
     let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户S-6", "F").await;
@@ -450,7 +455,7 @@ async fn count_in_process_at_date_to_boundary() {
 
     let mut tx = pool.begin().await.unwrap();
     let in_process =
-        StatisticsRepo::count_in_process_at(&mut tx, NaiveDate::from_ymd_opt(2026, 9, 20).unwrap())
+        statistics_sql::count_in_process_at(&mut tx, NaiveDate::from_ymd_opt(2026, 9, 20).unwrap())
             .await
             .expect("count_in_process_at ok");
     drop(tx);

@@ -38,6 +38,7 @@ use crate::modules::prod::work_type::service::WorkTypeProcessService;
 use crate::modules::prod::work_type::service::WorkTypeService;
 use crate::modules::prod::worker::service::WorkerService;
 use crate::modules::prod::worker_pool::service::WorkerPoolService;
+use crate::modules::statistics::service::StatisticsService;
 use crate::modules::upload_session::repo::UploadSessionRepo;
 
 pub struct AppState {
@@ -113,7 +114,7 @@ pub struct AppState {
     /// 2026-09-22 D-6 新增：prod/worker_pool service 注入到 AppState。
     /// unit struct（无字段）；handler 借 `&mut *tx` / `&mut *conn` 喂给 service 静态方法。
     pub worker_pool_service: Arc<WorkerPoolService>,
-/// 2026-09-22 Group E 新增：dashboard service（WS-only 大屏）。
+    /// 2026-09-22 Group E 新增：dashboard service（WS-only 大屏）。
     /// unit struct（无字段）；handler 借 `&mut *tx` 喂给 `DashboardRepoTrait` trait
     /// （trait 已直接 `impl for &mut PgConnection`，与 iam 2026-09-22 / shelf 同形）。
     /// dashboard 域只有 snapshot 业务（WS upgrade 拉一次 snapshot + 订阅 ws_hub.broadcast），
@@ -133,6 +134,12 @@ pub struct AppState {
     /// 生产走 `RedisIdempotencyStore`（共用 session 同池 `redis_pool`）；
     /// 测试可换 `InMemoryIdempotencyStore` / `NoopIdempotencyStore`。
     pub idempotency_store: Arc<dyn IdempotencyStore>,
+    /// 2026-09-23 PR8 新增：statistics service（生产统计 5 端点）注入到 AppState。
+    /// unit struct（无字段）；handler 借 `&mut *conn`（读端点 `pool.acquire()` 不开 tx）
+    /// 喂给 `StatisticsRepoTrait` trait（trait 已直接 `impl for &mut PgConnection`），
+    /// 与 iam / dashboard / shelf 同形。跨域 ZST（WorkerRepo / WorkTypeRepo）走
+    /// `repo.conn_mut()` 借位（与 DeliveryNoteRepoTrait::conn_mut 2026-09-22 D-5 引入同形）。
+    pub statistics_service: Arc<StatisticsService>,
 }
 
 impl AppState {
@@ -182,7 +189,7 @@ impl AppState {
         // 静态调用即可（与原 `WorkerPoolService` 调用形态一致，part 域
         // `part/handler/inspection.rs:298` 沿用）。
         let worker_pool_service = Arc::new(WorkerPoolService::new());
-// 2026-09-22 Group E dashboard service 是 unit struct（WS-only，4 个聚合 trait call
+        // 2026-09-22 Group E dashboard service 是 unit struct（WS-only，4 个聚合 trait call
         // 不需要任何字段依赖——雪花 ID 在 snapshot 里无新增，主键全部借用既有数据）。
         let dashboard_service = Arc::new(DashboardService);
         // 2026-09-22 D-5 delivery_note service 装线：仅需 snowflake（事务 / WS
@@ -190,6 +197,9 @@ impl AppState {
         // 装线是 by-value trait 形参的硬性前提）。
         let delivery_note_service = Arc::new(DeliveryNoteService::new(snowflake.clone()));
         let delivery_group_service = Arc::new(DeliveryGroupService::new(snowflake.clone()));
+        // 2026-09-23 PR8：statistics service 是 unit struct（5 端点全只读，事务移交 handler），
+        // 无任何字段依赖——雪花 ID 在统计快照里无新增，主键全部借用既有数据。
+        let statistics_service = Arc::new(StatisticsService);
         Self {
             pool,
             config,
@@ -218,6 +228,7 @@ impl AppState {
             delivery_group_service,
             // 2026-09-23 新增 Idempotency 中间件存储
             idempotency_store,
+            statistics_service,
         }
     }
 }
