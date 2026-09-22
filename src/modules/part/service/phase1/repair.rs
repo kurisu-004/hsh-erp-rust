@@ -11,12 +11,11 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::dto::{
-    InspectionBatchListItemOut, InspectionBatchListOut, InspectionBatchListQuery,
-};
+use crate::modules::part::dto::InspectionBatchListQuery;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::part::vo::{InspectionBatchListItemOut, InspectionBatchListOut};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
@@ -40,7 +39,7 @@ impl PartService {
         part_id: i64,
         req: CompleteRepairRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -136,7 +135,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "complete-repair 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `POST /parts/{id}/repair-dispatch`：一步式返修下发。
@@ -149,7 +148,7 @@ impl PartService {
         part_id: i64,
         req: RepairDispatchRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -270,7 +269,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "repair-dispatch 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `GET /parts/repair-batches`：DELIVERED 批次列表（M+C+I）。

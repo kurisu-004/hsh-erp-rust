@@ -1,37 +1,12 @@
-//! applicant 域 DTO
+//! applicant 域 DTO（仅入参）
 //!
 //! 对应 Python myERP/schema/applicant.py。
 //!
-//! ## id 序列化约定
-//! i64 字段 `id` / `customer_id` 用 `serialize_i64`；Option<i64> 不存在（applicant 表无）。
+//! 出参 VO（`ApplicantOut` / `ApplicantListOut`）已抽离到 `super::vo`，本文件不再 derive Serialize。
+//!
+//! 2026-09-22 PR4：出参结构平移到 `vo/applicant.rs`，对齐 iam 范本。
 
-use chrono::NaiveDateTime;
-use serde::{Deserialize, Serialize};
-
-use crate::shared::types::serialize_i64;
-
-// ---- 出参 ----
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ApplicantOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    pub name: String,
-    #[serde(serialize_with = "serialize_i64")]
-    pub customer_id: i64,
-    pub customer_name: Option<String>, // 由 service 连 t_customer 补
-    pub version: i32,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ApplicantListOut {
-    pub items: Vec<ApplicantOut>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
+use serde::Deserialize;
 
 // ---- 入参 ----
 

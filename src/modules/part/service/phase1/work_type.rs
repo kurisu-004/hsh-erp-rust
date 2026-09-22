@@ -10,10 +10,10 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::part::vo::{PartListItem, PartListOut};
 use crate::shared::error::{AppError, code};
 
 use super::super::super::dto_crud::{ByWorkTypeQuery, ByWorkerQuery, PickUpRequest};
-use super::super::super::dto_crud::{PartListItem, PartListOut};
 use super::super::PartService;
 
 use super::{
@@ -37,7 +37,7 @@ impl PartService {
         part_id: i64,
         req: PickUpRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::ShelfAccount])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -144,7 +144,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "pick-up 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `GET /parts/by-work-type/{work_type_id}`：可领件（按工种过滤）。

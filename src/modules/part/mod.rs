@@ -13,6 +13,7 @@ pub mod model;
 pub mod repo;
 pub mod service;
 pub mod statemachine;
+pub mod vo;
 
 // 2026-09-22 PR2 合并：原 `part_batch` 域（1866 行 helper，无独立 URL，5 域静态
 // 调用）物理合并入 part 域的 `part/batch/` 子目录。访问路径：

@@ -347,7 +347,7 @@ mod c_group_distribution_tests {
 mod attachable_batches_tests {
     use super::super::classify::{build_unresolved_target, classify_invalid_state, classify_outcome, TargetEvaluation};
     use super::super::helpers::{to_attachable_batch_dto, to_available_batch_dto};
-    use crate::modules::delivery_note::dto::{
+    use crate::modules::delivery_note::vo::{
         AttachableBatchDto, AvailableBatchDto, BatchStatusDto, ScanOutcomeDto, UnresolvedTargetDto,
     };
     use crate::modules::part::model::TPart;

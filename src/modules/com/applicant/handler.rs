@@ -38,9 +38,9 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::com::applicant::dto::{
-    ApplicantCreateRequest, ApplicantListOut, ApplicantListQuery, ApplicantOut,
-    ApplicantUpdateRequest,
+    ApplicantCreateRequest, ApplicantListQuery, ApplicantUpdateRequest,
 };
+use crate::modules::com::applicant::vo::{ApplicantListOut, ApplicantOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

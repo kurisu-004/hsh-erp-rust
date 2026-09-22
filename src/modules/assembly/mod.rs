@@ -19,6 +19,7 @@ pub mod model;
 pub mod repo;
 pub mod service;
 pub mod statemachine;
+pub mod vo; // 2026-09-22 PR4：响应 VO（仅 Serialize）从 dto/ 抽出到此目录
 
 use crate::state::AppState;
 use axum::Router;

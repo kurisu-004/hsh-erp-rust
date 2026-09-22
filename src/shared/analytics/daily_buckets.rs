@@ -13,7 +13,7 @@
 use chrono::NaiveDate;
 use std::collections::HashMap;
 
-use crate::modules::statistics::dto::DayCount;
+use crate::modules::statistics::vo::DayCount;
 
 /// 把 `raw: &[(NaiveDate, i64)]` 按 `[date_from, date_to]` 闭区间补齐为 0。
 pub fn fill_zero_daily_counts(

@@ -30,12 +30,12 @@ use serde_json::json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::dto::{BatchToInspectionRequest, BatchToXxxOut};
-use crate::modules::part::dto_crud::{
-    BatchWithPdfsRequest, PartBatchCreateOut, PartBatchCreateRequest, PartDetailOut,
-};
+use crate::modules::part::dto::BatchToInspectionRequest;
+use crate::modules::part::dto_crud::{BatchWithPdfsRequest, PartBatchCreateRequest};
 use crate::modules::part::service::PartService;
-use crate::modules::part_file::dto::{ConfirmFileIn, PartFileOut};
+use crate::modules::part::vo::{BatchToXxxOut, PartBatchCreateOut, PartDetailOut};
+use crate::modules::part_file::dto::ConfirmFileIn;
+use crate::modules::part_file::vo::PartFileOut;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -232,10 +232,6 @@ pub async fn batch_with_pdfs(
     });
     Ok(Json(R::ok(out)))
 }
-
-// 仅为消除未用导入警告（类型由各 handler 签名自然带回）
-#[allow(unused_imports)]
-use crate::modules::part::dto_crud::PartDetailOut as _PartDetailOutShim;
 
 /// `POST /api/v2/parts/batch-to-inspection`
 ///

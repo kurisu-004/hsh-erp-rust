@@ -34,7 +34,7 @@
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::prod::work_type::dto::{WorkTypeProcessMappingItem, WorkTypeProcessMappingOut};
+use crate::modules::prod::work_type::vo::{WorkTypeProcessMappingItem, WorkTypeProcessMappingOut};
 use crate::modules::prod::work_type::repo::WorkTypeRepoTrait;
 use crate::shared::error::{AppError, code};
 

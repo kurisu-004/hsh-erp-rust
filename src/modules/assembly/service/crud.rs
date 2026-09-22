@@ -31,11 +31,14 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::dto::{
-    AssemblyChildOut, AssemblyCreateRequest, AssemblyCreateResult, AssemblyDetail,
-    AssemblyListItem, AssemblyListOut, AssemblyListQuery, AssemblyOut, AssemblyUpdateRequest,
+    AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
 };
 use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::{AssemblyRepoTrait, NewAssembly, AssemblyUpdate};
+use crate::modules::assembly::vo::{
+    AssemblyChildOut, AssemblyCreateResult, AssemblyDetail, AssemblyListItem, AssemblyListOut,
+    AssemblyOut,
+};
 use crate::modules::part::repo::part::ChildInheritFields;
 use crate::shared::error::{AppError, code};
 
@@ -343,10 +346,10 @@ impl AssemblyService {
             .list_part_files_by_owner("ASSEMBLY", asm.id)
             .await
             .map_err(AppError::from)?;
-        let files: Vec<crate::modules::assembly::dto::AssemblyFileRef> = files_t
+        let files: Vec<crate::modules::assembly::vo::AssemblyFileRef> = files_t
             .into_iter()
             .filter(|f| f.kind == "ASSEMBLY_MASTER")
-            .map(|f| crate::modules::assembly::dto::AssemblyFileRef {
+            .map(|f| crate::modules::assembly::vo::AssemblyFileRef {
                 id: f.id,
                 original_filename: f.original_filename,
                 page_count: None,

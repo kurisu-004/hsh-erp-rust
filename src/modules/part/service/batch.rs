@@ -27,7 +27,8 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::part::dto_crud::{FileBindingIn, PartBatchCreateOut, PartBatchCreateRequest};
+use crate::modules::part::dto_crud::{FileBindingIn, PartBatchCreateRequest};
+use crate::modules::part::vo::{PartBatchCreateOut, PartDetailOut};
 use crate::modules::part::repo::NewPartCreate;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
@@ -37,7 +38,6 @@ use crate::shared::error::{AppError, code};
 
 use super::{BATCH_CREATE_PARTS_MAX_ITEMS, PartService};
 
-use super::super::dto_crud::PartDetailOut;
 use super::crud::{lookup_customer_names, map_create_error};
 
 /// 2026-09-16 M2-B 新增：单 item 文件绑定预处理的输出。
@@ -254,7 +254,7 @@ impl PartService {
                             return Err((AppError::from(e), cleanup_tmp_keys));
                         }
                         let mapped = map_create_error(e);
-                        failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
+                        failed.push(crate::modules::part::vo::PartBatchCreateFailure {
                             part_id: None,
                             code: mapped.code(),
                             message: format!("{mapped}"),
@@ -290,7 +290,7 @@ impl PartService {
                                 {
                                     part_files_ok = false;
                                     failed.push(
-                                        crate::modules::part::dto_crud::PartBatchCreateFailure {
+                                        crate::modules::part::vo::PartBatchCreateFailure {
                                             part_id: Some(new_id),
                                             code: code::BIZ_PART_FILE_DUPLICATE,
                                             message: format!(
@@ -305,7 +305,7 @@ impl PartService {
                                 part_files_ok = false;
                                 let mapped = AppError::from(e);
                                 failed.push(
-                                    crate::modules::part::dto_crud::PartBatchCreateFailure {
+                                    crate::modules::part::vo::PartBatchCreateFailure {
                                         part_id: Some(new_id),
                                         code: mapped.code(),
                                         message: format!("{mapped}"),
@@ -357,7 +357,7 @@ impl PartService {
                                 }
                                 _ => {
                                     failed.push(
-                                        crate::modules::part::dto_crud::PartBatchCreateFailure {
+                                        crate::modules::part::vo::PartBatchCreateFailure {
                                             part_id: Some(new_id),
                                             code: code::BIZ_PART_NOT_FOUND,
                                             message: "inserted but detail lookup failed".into(),
@@ -378,7 +378,7 @@ impl PartService {
                         return Err((AppError::from(e), cleanup_tmp_keys));
                     }
                     let mapped = map_create_error(e);
-                    failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
+                    failed.push(crate::modules::part::vo::PartBatchCreateFailure {
                         part_id: None,
                         code: mapped.code(),
                         message: format!("{mapped}"),
@@ -406,7 +406,7 @@ impl PartService {
         snowflake: &SnowflakeIdGenerator,
         req: &PartBatchCreateRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto_crud::PartBatchCreateOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartBatchCreateOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         if req.items.is_empty() {
             return Err(AppError::validation("items 不能为空"));
@@ -470,7 +470,7 @@ impl PartService {
                             .execute(repo.conn_mut())
                             .await?;
                         let mapped = map_create_error(e);
-                        failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
+                        failed.push(crate::modules::part::vo::PartBatchCreateFailure {
                             part_id: None,
                             code: mapped.code(),
                             message: format!("{mapped}"),
@@ -494,7 +494,7 @@ impl PartService {
                             ));
                         }
                         _ => {
-                            failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
+                            failed.push(crate::modules::part::vo::PartBatchCreateFailure {
                                 part_id: Some(new_id),
                                 code: code::BIZ_PART_NOT_FOUND,
                                 message: "inserted but detail lookup failed".into(),
@@ -508,7 +508,7 @@ impl PartService {
                         .execute(repo.conn_mut())
                         .await?;
                     let mapped = map_create_error(e);
-                    failed.push(crate::modules::part::dto_crud::PartBatchCreateFailure {
+                    failed.push(crate::modules::part::vo::PartBatchCreateFailure {
                         part_id: None,
                         code: mapped.code(),
                         message: format!("{mapped}"),
@@ -517,7 +517,7 @@ impl PartService {
                 }
             }
         }
-        Ok(crate::modules::part::dto_crud::PartBatchCreateOut {
+        Ok(crate::modules::part::vo::PartBatchCreateOut {
             created,
             failed,
             // legacy 路径不绑定文件，无 tmp 需清理
@@ -615,13 +615,6 @@ pub(super) async fn prepare_binding_head_copy(
         content_type: binding.content_type.clone(),
     })
 }
-
-// 仅为消除未用导入警告（类型由 impl 块自然带回）
-#[allow(unused_imports)]
-use crate::modules::part::dto_crud::{
-    PartListItem as _PartListItemShim, PartListOut as _PartListOutShim,
-    PartListQuery as _PartListQueryShim,
-};
 
 // 仅为消除未用导入警告（类型由 impl 块自然带回）
 #[allow(unused_imports)]

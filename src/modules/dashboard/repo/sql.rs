@@ -23,7 +23,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::{PgConnection, Row};
 use std::collections::{HashMap, HashSet};
 
-use crate::modules::dashboard::dto::UpcomingDeliveryBucket;
+use crate::modules::dashboard::vo::UpcomingDeliveryBucket;
 
 /// t_part_batch + t_part JOIN 行精简（dashboard 聚合专用，无完整表行）
 ///

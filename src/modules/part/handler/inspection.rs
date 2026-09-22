@@ -17,12 +17,14 @@ use serde_json::json;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::dto::{
-    BatchToShipRequest, BatchToXxxOut, InspectionBatchListOut, InspectionBatchListQuery, PartOut,
-    ToInspectionRequest, ToProcessRequest, ToShipRequest, ToXxxOut, WorkerScanOut,
-    WorkerScanRequest,
+    BatchToShipRequest, InspectionBatchListQuery, ToInspectionRequest, ToProcessRequest,
+    ToShipRequest, WorkerScanRequest,
 };
 use crate::modules::part::dto_crud::{ScanDeliverPartRequest, ScanInspectRequest};
 use crate::modules::part::service::{BATCH_TO_SHIP_MAX_ITEMS, PartService};
+use crate::modules::part::vo::{
+    BatchToXxxOut, InspectionBatchListOut, PartOut, ToXxxOut, WorkerScanOut,
+};
 use crate::modules::prod::worker_pool::service::WorkerPoolService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;

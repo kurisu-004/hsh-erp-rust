@@ -1,8 +1,10 @@
 //! upload_session 域 DTO
 //!
-//! 2026-09-18 新增。
-//!
-//! 7 个端点的请求 / 响应 DTO + `SessionFile` / `UploadSession` 数据结构。
+//! 2026-09-18 新增；2026-09-22 PR4：出参结构（Out / SessionCredentialsOut / CompleteFileOut
+//! type alias）已迁出至 `super::vo`，本文件仅保留：
+//! - 内部数据结构（Redis JSON 值）：`SessionFile` / `SessionCredentials` / `UploadSession`
+//! - 入参 DTO（axum extractor 反序列化目标）：`*In` 系列
+//! - 校验 helper：`is_valid_scope` / `is_valid_kind` / `sanitize_filename` / `check_sha256`
 //!
 //! ## 与 part_file upload-intents 的差异
 //! - **老 upload-intents** 是单次「签 STS + 预生成 tmp_key」无状态 RPC，每次都需要重新签；
@@ -20,15 +22,16 @@ use crate::shared::error::AppError;
 use crate::shared::types::deserialize_i64_opt;
 
 // ============================================================
-// 内部数据结构（Redis JSON 值 + 部分出参复用）
+// 内部数据结构（Redis JSON 值）
 // ============================================================
 
-/// 单条文件状态（Redis JSON `UploadSession.files` 元素 + 部分端点出参）。
+/// 单条文件状态（Redis JSON `UploadSession.files` 元素）。
 ///
 /// 字段命名贴近 front-end 期望；`etag` 是 COS HEAD 返回的 hex md5（带引号 `"..."`，
 /// 与 `head_object` 返回的 `resp.etag` 一致；complete 时按 COS 文档原样保存）。
 ///
-/// 2026-09-18 新增。
+/// 2026-09-18 新增；2026-09-22 PR4：移除 Serialize（改由 vo::SessionFileOut 承担），
+/// 内部结构仅保留 Deserialize 用于 Redis JSON 反序列化。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionFile {
     /// 客户端 reference（UUID 或 0-based seq string）；用于跨端点幂等映射。
@@ -55,14 +58,15 @@ pub struct SessionFile {
     pub uploaded_at: Option<String>,
 }
 
-/// 共享 STS 凭证子集（`UploadSession.credentials` 元素 + 出参 `credentials` 复用）。
+/// 共享 STS 凭证子集（`UploadSession.credentials` 元素）。
 ///
-/// 与 part_file `CosCredentialsOut` 字段一致但类型 / 序列化策略不同：
-/// - 本结构是 Redis 内部 JSON + API 出参；`start_time` / `expired_time` 用 i64 默认
-///   JSON number 序列化（前端拿到的是 number，不是 string；本契约不沿用雪花 id 的
-///   "string 防 JS 精度截断"策略，因为 unix 秒远小于 2^53）。
+/// 字段与 part_file `CosCredentialsOut` 一致；本结构是 Redis 内部 JSON，
+/// `start_time` / `expired_time` 用 i64 默认 JSON number 序列化（前端拿到的是
+/// number，不是 string；本契约不沿用雪花 id 的 "string 防 JS 精度截断"策略，
+/// 因为 unix 秒远小于 2^53）。
 ///
-/// 2026-09-18 新增。
+/// 2026-09-18 新增；2026-09-22 PR4：Serialize 保留（Redis JSON 写回需），仅用于
+/// 内部数据结构序列化，HTTP 出参由 `vo::SessionCredentialsOut` 承担。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionCredentials {
     pub tmp_secret_id: String,
@@ -101,7 +105,7 @@ pub struct UploadSession {
 }
 
 // ============================================================
-// 入参 / 出参 DTO（按 7 个端点）
+// 入参 DTO（按 7 个端点）
 // ============================================================
 
 /// `POST /upload-sessions/get-or-create` 入参。
@@ -110,19 +114,6 @@ pub struct UploadSession {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GetOrCreateIn {
     pub scope: String,
-}
-
-/// `POST /upload-sessions/get-or-create` 出参。
-#[derive(Debug, Clone, Serialize)]
-pub struct GetOrCreateOut {
-    pub session_id: String,
-    pub scope: String,
-    pub tmp_prefix: String,
-    pub bucket: String,
-    pub region: String,
-    pub credentials: SessionCredentialsOut,
-    pub expires_in: i64,
-    pub files: Vec<SessionFile>,
 }
 
 /// `POST /upload-sessions/{session_id}/files:allocate` 入参。
@@ -147,22 +138,6 @@ pub struct AllocateFileItemIn {
     pub content_sha256: String,
 }
 
-/// `POST /upload-sessions/{session_id}/files:allocate` 出参。
-///
-/// `client_ref` 已存在 → 幂等返回原 `tmp_key`；同 sha 不同 client_ref 仍分配新 tmp_key
-/// （防止误用别人 client_ref 锁死自己的 key 分配）。
-#[derive(Debug, Clone, Serialize)]
-pub struct AllocateFilesOut {
-    pub items: Vec<AllocateFileItemOut>,
-}
-
-/// allocate 单条出参。
-#[derive(Debug, Clone, Serialize)]
-pub struct AllocateFileItemOut {
-    pub client_ref: String,
-    pub tmp_key: String,
-}
-
 /// `POST /upload-sessions/{session_id}/files/{client_ref}/complete` 入参。
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompleteFileIn {
@@ -175,9 +150,6 @@ pub struct CompleteFileIn {
     pub file_size: Option<i64>,
 }
 
-/// `POST /upload-sessions/{session_id}/files/{client_ref}/complete` 出参（更新后的 SessionFile）。
-pub type CompleteFileOut = SessionFile;
-
 /// `POST /upload-sessions/{session_id}/files:remove` 入参。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RemoveFilesIn {
@@ -185,25 +157,10 @@ pub struct RemoveFilesIn {
     pub client_refs: Vec<String>,
 }
 
-/// `POST /upload-sessions/{session_id}/files:remove` 出参。
-#[derive(Debug, Clone, Serialize)]
-pub struct RemoveFilesOut {
-    /// 已从 session JSON 移除的 client_ref 列表（顺序按入参，**仅含真实移除的**）。
-    /// 不存在的 client_ref 不计入。
-    pub removed: Vec<String>,
-}
-
 /// `POST /upload-sessions/{session_id}/renew` 入参。
 #[derive(Debug, Clone, Deserialize)]
 pub struct RenewIn {
     pub scope: String,
-}
-
-/// `POST /upload-sessions/{session_id}/renew` 出参。
-#[derive(Debug, Clone, Serialize)]
-pub struct RenewOut {
-    pub credentials: SessionCredentialsOut,
-    pub expires_in: i64,
 }
 
 /// `POST /upload-sessions/{session_id}/consume` 入参（业务消费：从 session 移除条目）。
@@ -213,51 +170,10 @@ pub struct ConsumeFilesIn {
     pub client_refs: Vec<String>,
 }
 
-/// `POST /upload-sessions/{session_id}/consume` 出参。
-#[derive(Debug, Clone, Serialize)]
-pub struct ConsumeFilesOut {
-    pub consumed: Vec<String>,
-}
-
 /// `POST /upload-sessions/{session_id}/discard` 入参。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiscardIn {
     pub scope: String,
-}
-
-/// `POST /upload-sessions/{session_id}/discard` 出参。
-#[derive(Debug, Clone, Serialize)]
-pub struct DiscardOut {
-    pub session_id: String,
-}
-
-// ============================================================
-// 出参专用：`SessionCredentialsOut`
-// ============================================================
-
-/// 客户端拿到的 STS 凭证出参（与 `part_file::CosCredentialsOut` 字段对齐，
-/// 多带 `start_time` 便于前端算剩余有效期；`expired_time` 保持 i64 输出）。
-///
-/// 2026-09-18 新增。
-#[derive(Debug, Clone, Serialize)]
-pub struct SessionCredentialsOut {
-    pub tmp_secret_id: String,
-    pub tmp_secret_key: String,
-    pub session_token: String,
-    pub start_time: i64,
-    pub expired_time: i64,
-}
-
-impl From<&SessionCredentials> for SessionCredentialsOut {
-    fn from(c: &SessionCredentials) -> Self {
-        Self {
-            tmp_secret_id: c.tmp_secret_id.clone(),
-            tmp_secret_key: c.tmp_secret_key.clone(),
-            session_token: c.session_token.clone(),
-            start_time: c.start_time,
-            expired_time: c.expired_time,
-        }
-    }
 }
 
 // ============================================================
@@ -320,6 +236,7 @@ pub fn check_sha256(sha: &str) -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::upload_session::vo::SessionCredentialsOut;
 
     #[test]
     fn scope_whitelist_accepts_parts_new() {

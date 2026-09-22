@@ -21,9 +21,9 @@ use axum::{
 };
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::statistics::dto::{
-    DateRangeQuery, OverviewOut, PickupSkipDetailOut, PickupSkipDetailQuery, PickupSkipSummaryOut,
-    WorkerDetailOut, WorkerStatsListOut,
+use crate::modules::statistics::dto::{DateRangeQuery, PickupSkipDetailQuery};
+use crate::modules::statistics::vo::{
+    OverviewOut, PickupSkipDetailOut, PickupSkipSummaryOut, WorkerDetailOut, WorkerStatsListOut,
 };
 use crate::modules::statistics::service::StatisticsService;
 use crate::shared::response::R;

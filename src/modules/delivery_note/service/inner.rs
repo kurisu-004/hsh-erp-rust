@@ -22,9 +22,8 @@ use crate::modules::part::repo::PartRepo;
 use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::{
-    DeliveryNoteAddItem, DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut,
-};
+use super::super::dto::DeliveryNoteAddItem;
+use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
 use super::super::model::{DeliveryNote, DeliveryNoteEvent, NoteScope};
 
 // ===========================================================================

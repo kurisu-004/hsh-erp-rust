@@ -32,13 +32,15 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::dto::{
-    AttachBatchesOut, AttachBatchesRequest, BatchDeliveryDetailData, DeliveryNoteAddPartsRequest,
-    DeliveryNoteBatchDetailQuery, DeliveryNoteCandidatePartsOut, DeliveryNoteCandidatePartsQuery,
-    DeliveryNoteCreateRequest, DeliveryNoteListQuery, DeliveryNotePickupPendingQuery,
-    DeliveryNotePickupRequest, DeliveryNotePickupScanOut, DeliveryNotePickupScanRequest,
+    AttachBatchesRequest, DeliveryNoteAddPartsRequest, DeliveryNoteBatchDetailQuery,
+    DeliveryNoteCandidatePartsQuery, DeliveryNoteCreateRequest, DeliveryNoteListQuery,
+    DeliveryNotePickupPendingQuery, DeliveryNotePickupRequest, DeliveryNotePickupScanRequest,
     DeliveryNoteRemovePartsRequest, DeliveryNoteUpdateRequest, DeliveryNoteVersionedRequest,
-    PrintDeliveryNoteRequest, PrintLabelsRequest, ScanDeliveryOut, ScanDeliveryRequest,
-    SubmitDeliveryOut,
+    PrintDeliveryNoteRequest, PrintLabelsRequest, ScanDeliveryRequest,
+};
+use super::vo::{
+    AttachBatchesOut, BatchDeliveryDetailData, DeliveryNoteCandidatePartsOut,
+    DeliveryNotePickupScanOut, ScanDeliveryOut, SubmitDeliveryOut,
 };
 
 // ===========================================================================
@@ -123,14 +125,14 @@ pub async fn list_pickup_pending(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(q): Query<DeliveryNotePickupPendingQuery>,
-) -> Result<Json<R<super::dto::DeliveryNotePickupListOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryNotePickupListOut>>, AppError> {
     // 读端点：pool.acquire() → service → drop。
     let mut conn = state.pool.acquire().await?;
     let items = state
         .delivery_note_service
         .list_for_pickup(&mut *conn, q.customer_id, &current)
         .await?;
-    Ok(Json(R::ok(super::dto::DeliveryNotePickupListOut { items })))
+    Ok(Json(R::ok(super::vo::DeliveryNotePickupListOut { items })))
 }
 
 /// GET /api/v2/delivery-notes
@@ -138,7 +140,7 @@ pub async fn list_delivery_notes(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(q): Query<DeliveryNoteListQuery>,
-) -> Result<Json<R<super::dto::DeliveryNoteListOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryNoteListOut>>, AppError> {
     // 读端点：pool.acquire() → service → drop。
 
     // 解析 statuses：query string `?statuses=A,B` → vec!["A","B"]
@@ -187,7 +189,7 @@ pub async fn create_delivery_note(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Json(req): Json<DeliveryNoteCreateRequest>,
-) -> Result<Json<R<super::dto::DeliveryNoteDetailOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryNoteDetailOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_note_service
@@ -215,7 +217,7 @@ pub async fn get_delivery_note(
     State(state): State<Arc<AppState>>,
     _current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
-) -> Result<Json<R<super::dto::DeliveryNoteDetailOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryNoteDetailOut>>, AppError> {
     // 读端点：pool.acquire() → service → drop。
     let mut conn = state.pool.acquire().await?;
     let out = state
@@ -230,7 +232,7 @@ pub async fn list_delivery_note_events(
     State(state): State<Arc<AppState>>,
     _current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
-) -> Result<Json<R<Vec<super::dto::DeliveryNoteEventOut>>>, AppError> {
+) -> Result<Json<R<Vec<super::vo::DeliveryNoteEventOut>>>, AppError> {
     // 读端点：pool.acquire() → service → drop。
     let mut conn = state.pool.acquire().await?;
     let events = state
@@ -246,7 +248,7 @@ pub async fn update_delivery_note(
     current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNoteUpdateRequest>,
-) -> Result<Json<R<super::dto::DeliveryNoteOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryNoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_note_service
@@ -262,7 +264,7 @@ pub async fn add_delivery_note_parts(
     current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNoteAddPartsRequest>,
-) -> Result<Json<R<super::dto::DeliveryNoteDetailOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryNoteDetailOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_note_service
@@ -286,7 +288,7 @@ pub async fn remove_delivery_note_parts(
     current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNoteRemovePartsRequest>,
-) -> Result<Json<R<super::dto::DeliveryNoteDetailOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryNoteDetailOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_note_service
@@ -340,7 +342,7 @@ pub async fn recall_delivery_note(
     current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNoteVersionedRequest>,
-) -> Result<Json<R<super::dto::DeliveryNoteOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryNoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_note_service
@@ -372,7 +374,7 @@ pub async fn pickup_delivery_note(
     current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
     Json(req): Json<DeliveryNotePickupRequest>,
-) -> Result<Json<R<super::dto::DeliveryNoteOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryNoteOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_note_service
@@ -460,14 +462,14 @@ pub async fn scan_delivery_note(
                 "unresolved_count": unresolved_count,
                 "line_count": out.note.line_count,
                 "resolved_kind": match out.resolved.kind {
-                    super::dto::ResolvedKindDto::Part => "PART",
-                    super::dto::ResolvedKindDto::Assembly => "ASSEMBLY",
+                    super::vo::ResolvedKindDto::Part => "PART",
+                    super::vo::ResolvedKindDto::Assembly => "ASSEMBLY",
                 },
                 "outcome": match out.outcome {
-                    super::dto::ScanOutcomeDto::Added => "ADDED",
-                    super::dto::ScanOutcomeDto::AlreadyPresent => "ALREADY_PRESENT",
-                    super::dto::ScanOutcomeDto::CandidatesAvailable => "CANDIDATES_AVAILABLE",
-                    super::dto::ScanOutcomeDto::PartialAdded => "PARTIAL_ADDED",
+                    super::vo::ScanOutcomeDto::Added => "ADDED",
+                    super::vo::ScanOutcomeDto::AlreadyPresent => "ALREADY_PRESENT",
+                    super::vo::ScanOutcomeDto::CandidatesAvailable => "CANDIDATES_AVAILABLE",
+                    super::vo::ScanOutcomeDto::PartialAdded => "PARTIAL_ADDED",
                 },
             }),
         });
@@ -777,7 +779,7 @@ async fn p1_list_delivery_groups(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(q): Query<DeliveryGroupListQuery>,
-) -> Result<Json<R<super::dto::DeliveryGroupListOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryGroupListOut>>, AppError> {
     // 读端点：pool.acquire() → service → drop。
     let mut conn = state.pool.acquire().await?;
     let out = state
@@ -791,7 +793,7 @@ async fn p1_create_delivery_group(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Json(req): Json<super::dto::CreateDeliveryGroupRequest>,
-) -> Result<Json<R<super::dto::DeliveryGroupOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryGroupOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_group_service
@@ -806,7 +808,7 @@ async fn p1_update_delivery_group(
     current: CurrentUser,
     Path(id): Path<i64>,
     Json(req): Json<super::dto::UpdateDeliveryGroupRequest>,
-) -> Result<Json<R<super::dto::DeliveryGroupOut>>, AppError> {
+) -> Result<Json<R<super::vo::DeliveryGroupOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out = state
         .delivery_group_service

@@ -11,19 +11,21 @@
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::part::dto_crud::{
+    BatchUpdateOrderInfoRequest, BatchWithPdfsRequest, MatchByExcelItemsRequest,
+};
 use crate::modules::part::repo::NewPartCreate;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::PartUpdate;
 use crate::modules::part::batch::repo::PartBatchRepo;
+use crate::modules::part::vo::{
+    BatchUpdateOrderInfoOut, LocationTreeNodeOut, LocationTreeOut, MatchByExcelItemResult,
+    PartEventOut,
+};
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::super::dto_crud::{
-    BatchUpdateOrderInfoOut, BatchUpdateOrderInfoRequest, BatchWithPdfsRequest,
-    LocationTreeNodeOut, LocationTreeOut, MatchByExcelItemResult, MatchByExcelItemsRequest,
-    PartEventOut,
-};
 use super::EventListRow;
 use super::super::PartService;
 use super::{HolderCountRow, OutsourceLite};
@@ -259,7 +261,7 @@ impl PartService {
         req: &BatchWithPdfsRequest,
         pdf_files: &[Vec<u8>],
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto_crud::PartDetailOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartDetailOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         if req.customer_id == 0 {
             return Err(AppError::biz(
@@ -415,7 +417,7 @@ impl PartService {
                 .await?
                 .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "create 后查不到"))?;
         Ok(
-            crate::modules::part::dto_crud::PartDetailOut::from_with_customer_extra(
+            crate::modules::part::vo::PartDetailOut::from_with_customer_extra(
                 part, None, None, None,
             ),
         )
@@ -527,7 +529,7 @@ impl PartService {
             return Err(AppError::validation("items 不能为空"));
         }
         let mut updated = 0_i64;
-        let mut failed: Vec<super::super::super::dto_crud::BatchUpdateOrderInfoFailure> =
+        let mut failed: Vec<super::super::super::vo::BatchUpdateOrderInfoFailure> =
             Vec::new();
         for item in &req.items {
             let upd = PartUpdate {
@@ -546,14 +548,14 @@ impl PartService {
             match n {
                 Ok(1) => updated += 1,
                 Ok(_) => failed.push(
-                    super::super::super::dto_crud::BatchUpdateOrderInfoFailure {
+                    super::super::super::vo::BatchUpdateOrderInfoFailure {
                         part_id: item.part_id,
                         code: code::VERSION_CONFLICT,
                         message: "版本冲突或 part 已软删".into(),
                     },
                 ),
                 Err(e) => failed.push(
-                    super::super::super::dto_crud::BatchUpdateOrderInfoFailure {
+                    super::super::super::vo::BatchUpdateOrderInfoFailure {
                         part_id: item.part_id,
                         code: code::DATABASE,
                         message: format!("{e}"),

@@ -43,11 +43,13 @@ use crate::modules::prod::worker_pool::repo::WorkerPoolRepoTrait;
 use crate::shared::error::{AppError, code};
 
 use super::dto::{
-    AdminAssignRequest, AdminRemoveRequest, AssignResult, AutoAllocateMode, AutoAllocateRequest,
-    AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkTypeMaxHeld, WorkerBrief,
-    WorkerFillItem,
+    AdminAssignRequest, AdminRemoveRequest, AutoAllocateMode, AutoAllocateRequest,
 };
 use super::model::{ProcessPoolCount, RefillResult, TakenItem, WorkerPoolState};
+use super::vo::{
+    AssignResult, AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkTypeMaxHeld,
+    WorkerBrief, WorkerFillItem,
+};
 
 /// worker_pool 域 service（2026-09-22 D-2 重构后）
 ///

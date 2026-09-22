@@ -1,56 +1,12 @@
-//! worker 域 DTO
+//! worker 域 DTO（入参 + 校验）
 //!
 //! 对应 Python myERP/schema/worker.py。
 //!
-//! ## id 序列化约定
-//! 裸 `i64` 字段用 `#[serde(serialize_with = "crate::shared::types::serialize_i64")]`。
-//! 可空 id（`work_type_id`）在 service 层就转成 `Option<String>`，避免为 `Option<i64>`
-//! 再写一套 serde helper——出参 JSON 形态与 Python 完全一致（null 仍是 null）。
-//!
-//! ## 入参格式校验
-//! `id_card_no` / `phone` 仅做 trim + 长度上限，不做严格正则（与 Rust 现状对齐；
-//! Python `field_validator` 用正则校验，本域 Rust 实现先做基础校验，业务严格度
-//! 后续可对齐）。空串 / 全空白视为 `None`（与 Python `exclude_unset` + strip 一致）。
+//! ## DTO/VO 边界（2026-09-22 PR4 重构）
+//! 出参结构（`WorkerOut` / `WorkerListOut`）已抽离至 `super::vo`。
+//! 本文件仅含入参（Deserialize）。
 
-use chrono::NaiveDateTime;
-use serde::{Deserialize, Serialize};
-
-use crate::shared::types::serialize_i64;
-
-// ---------------------------------------------------------------------------
-// 出参
-// ---------------------------------------------------------------------------
-
-/// 工人详情出参。`work_type_name` 由 service 层用 `WorkTypeRepo::list_by_ids`
-/// 单条 SQL 批量补全（防 N+1）。
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkerOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    pub badge_code: String,
-    pub name: String,
-    pub id_card_no: Option<String>,
-    pub phone: Option<String>,
-    pub is_active: bool,
-    pub work_type_id: Option<String>,
-    pub work_type_name: Option<String>,
-    pub version: i32,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
-
-/// 工人列表出参（分页）。
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkerListOut {
-    pub items: Vec<WorkerOut>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-// ---------------------------------------------------------------------------
-// 入参
-// ---------------------------------------------------------------------------
+use serde::Deserialize;
 
 /// 校验工牌请求体（扫码台用）。
 #[derive(Debug, Clone, Deserialize)]

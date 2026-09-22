@@ -30,7 +30,7 @@ impl PartService {
         part_id: i64,
         req: ScanInspectRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Inspector])?;
         let part = repo
             .get_part_inspected(part_id)
@@ -143,7 +143,7 @@ impl PartService {
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "scan-inspect 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
     /// `POST /parts/scan/deliver-part`：司机扫码发货。
@@ -154,7 +154,7 @@ impl PartService {
         snowflake: &SnowflakeIdGenerator,
         req: ScanDeliverPartRequest,
         current: &CurrentUser,
-    ) -> Result<crate::modules::part::dto::PartOut, AppError> {
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::ShelfAccount])?;
         // 反查 part
         let part: Option<crate::modules::part::model::TPart> =
@@ -253,6 +253,6 @@ impl PartService {
             .get_part_inspected(part.id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "scan_deliver 后查不到"))?;
-        Ok(crate::modules::part::dto::PartOut::from(fresh))
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 }

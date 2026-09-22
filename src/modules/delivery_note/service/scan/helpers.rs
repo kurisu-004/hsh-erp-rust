@@ -4,7 +4,7 @@
 //! 当前字段同形，但设计上独立——未来字段分叉（status 派生逻辑、OCC version
 //! 来源、扩展字段）时各自演化。强行复用 generic 会导致所有调用点耦合。
 
-use crate::modules::delivery_note::dto::{
+use crate::modules::delivery_note::vo::{
     AttachableBatchDto, AvailableBatchDto, BatchStatusDto,
 };
 use crate::modules::delivery_note::model::NoteScope;

@@ -39,16 +39,17 @@
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::part::dto::{
+    BatchToInspectionRequest, BatchToShipRequest, ToInspectionRequest, ToProcessRequest,
+    ToShipRequest,
+};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::batch::model::TPartBatch;
+use crate::modules::part::vo::{BatchOpFailure, BatchToXxxOut, ToXxxOut};
 use crate::modules::shelf::model::TShelf;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::{
-    BatchOpFailure, BatchToInspectionRequest, BatchToShipRequest, BatchToXxxOut,
-    ToInspectionRequest, ToProcessRequest, ToShipRequest, ToXxxOut,
-};
 use super::PartService;
 
 /// 批量 to-ship 单次请求最大 item 数（handler/service 双层校验）。

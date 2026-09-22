@@ -18,7 +18,7 @@ use sqlx::PgConnection;
 use crate::infra::clock::now_naive;
 use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
-use crate::modules::statistics::dto::{
+use crate::modules::statistics::vo::{
     DeliveryPerformance, OverviewOut, PickupSkipDetailItem, PickupSkipDetailOut,
     PickupSkipSummaryItem, PickupSkipSummaryOut, StatusCount, WorkerBrief, WorkerDetailOut,
     WorkerPartItem, WorkerStatsItem, WorkerStatsListOut,

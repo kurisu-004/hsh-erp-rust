@@ -1,58 +1,14 @@
-//! process 域 DTO
+//! process 域 DTO（入参 + 校验）
 //!
 //! 对应 Python myERP/schema/process.py。
 //!
-//! ## id 序列化约定
-//! 裸 `i64` 字段用 `#[serde(serialize_with = "crate::shared::types::serialize_i64")]`。
-//!
-//! ## 业务枚举
-//! `category` 在 DB 存 `varchar(16)` + CHECK (INHOUSE/OUTSOURCE)；DTO 仍以字符串承载，
-//! service 层负责 trim + 大写规范化 + 范围校验。
-//!
-//! ## `requires_approval` 业务约束
-//! INHOUSE ⇒ service 层强制 `false`；OUTSOURCE ⇒ 保留请求值（默认 `true`）。
+//! ## DTO/VO 边界（2026-09-22 PR4 重构）
+//! 出参结构（`ProcessOut` / `ProcessListOut`）已抽离至 `super::vo`。
+//! 本文件仅含入参（Deserialize）。
 
-use chrono::NaiveDateTime;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use crate::shared::types::{deserialize_some, serialize_i64};
-
-// ---------------------------------------------------------------------------
-// 出参
-// ---------------------------------------------------------------------------
-
-/// 工序详情出参。
-#[derive(Debug, Clone, Serialize)]
-pub struct ProcessOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    pub code: String,
-    pub name: String,
-    pub category: String,
-    pub sort_order: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub requires_approval: bool,
-    /// 前端工序卡片颜色（`#RRGGBBAA`，9 字符含 alpha）。NULL = 未设置。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<String>,
-    pub version: i32,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
-
-/// 工序列表出参。
-#[derive(Debug, Clone, Serialize)]
-pub struct ProcessListOut {
-    pub items: Vec<ProcessOut>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-// ---------------------------------------------------------------------------
-// 入参
-// ---------------------------------------------------------------------------
+use crate::shared::types::deserialize_some;
 
 /// 创建工序。
 ///
@@ -76,11 +32,6 @@ pub struct ProcessCreateRequest {
 }
 
 /// 部分更新：未提供的字段保持原值（与 Python `exclude_unset` 语义对齐）。
-///
-/// - `code` 字段若传一律 20104（业务唯一键不可变）
-/// - `category` 同上：传了即拒
-/// - `description` 三态：`None` ⇒ 缺省不改；`Some(null)` ⇒ 显式清空；`Some(v)` ⇒ 改值
-/// - `color` 三态同上（service 层加 hex 格式校验）
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProcessUpdateRequest {
     /// 仅用作「拒绝」哨兵：客户端若传 `code` 字段一律 20104 BIZ_INVALID_VALUE
@@ -98,15 +49,11 @@ pub struct ProcessUpdateRequest {
     #[serde(default)]
     pub requires_approval: Option<bool>,
     /// 三态：`None` ⇒ 缺省不改；`Some(null)` ⇒ 显式清空；`Some("...")` ⇒ 改值
-    /// （service 层做 `#RRGGBBAA` 格式校验）
     #[serde(default, deserialize_with = "deserialize_some")]
     pub color: Option<Option<String>>,
 }
 
 /// 列表查询参数：`code_like` / `category` 过滤 + 分页。
-///
-/// - `code_like`：ILIKE '%needle%'，trim 后空串视为无过滤
-/// - `category`：精确匹配（INHOUSE / OUTSOURCE）；trim 后空串视为无过滤
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ProcessListQuery {
     #[serde(default)]

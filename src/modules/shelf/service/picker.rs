@@ -30,6 +30,7 @@ use crate::shared::error::{AppError, code};
 
 use super::super::dto::*;
 use super::super::repo::{ShelfRepoTrait, TShelfWithLoad};
+use super::super::vo::*;
 use super::{MAX_LIMIT, ZONE_INSPECTION};
 
 impl super::crud::ShelfService {

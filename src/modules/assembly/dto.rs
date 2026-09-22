@@ -1,118 +1,21 @@
-//! assembly 域 DTO
+//! assembly 域 DTO（HTTP 请求入参）
 //!
 //! 对应 Python myERP/schema/assembly.py。
 //!
-//! ## id 序列化约定
-//! i64 字段 `id` / `customer_id` / `created_children` 用 `serialize_i64` / `serialize_i64_opt`；
-//! 入参 `customer_id` 用 `String`（service 层 parse）。
+//! 2026-09-22 PR4：原 `dto.rs` 中的出参类型（AssemblyOut / AssemblyListItem /
+//! AssemblyListOut / AssemblyChildOut / AssemblyFileRef / AssemblyDetail /
+//! AssemblyCreateResult）已迁移至 `vo/assembly.rs`（仅 Serialize）。本文件仅保留
+//! 入参类型（仅 Deserialize）。
 //!
 //! ## 三态 nullable 字段
 //! `AssemblyUpdateRequest` 中真正可置 NULL 的字段用 `Option<Option<T>>`：
 //!   `None` = 不更新，`Some(None)` = 置 NULL，`Some(Some(v))` = 覆盖。
 //! 普通可空字段（不必置 NULL 的）保持 `Option<T>`。
 
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-
-use crate::shared::types::{serialize_i64, serialize_i64_opt};
-
-// ---------- 出参 ----------
-
-/// 2026-09-16 PR-2 瘦身（migration 027）：t_assembly 删 `actual_delivery_date`
-/// 列，DTO `AssemblyOut` 同步删该字段。实际交付日期由子件批次的
-/// t_part_event DELIVERED 事件派生（前端按需另调 statistics 端点）。
-///
-/// 2026-09-17 PR-4 与 DDL 对齐：`request_date` / `planned_delivery_date`
-/// 改为非 `Option<>`（与 `t_assembly` DDL NOT NULL 一致，model.rs 同步）。
-#[derive(Debug, Clone, Serialize)]
-pub struct AssemblyOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    pub drawing_no: String,
-    pub name: String,
-    pub applicant_name: Option<String>,
-    #[serde(serialize_with = "serialize_i64")]
-    pub customer_id: i64,
-    pub request_date: NaiveDate,
-    pub planned_delivery_date: NaiveDate,
-    pub is_urgent: bool,
-    pub status: String,
-    pub version: i32,
-    pub serial_no: Option<String>,
-    pub quantity: i32,
-    pub unit_price: Option<Decimal>,
-    pub total_price: Option<Decimal>,
-    pub order_no: Option<String>,
-    pub system_delivery_date: Option<NaiveDate>,
-    pub note: Option<String>,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AssemblyListItem {
-    #[serde(flatten)]
-    pub assembly: AssemblyOut,
-    pub customer_name: Option<String>,
-    pub parent_customer_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AssemblyListOut {
-    pub items: Vec<AssemblyListItem>,
-    pub total: i64,
-    pub limit: i64,
-    pub offset: i64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AssemblyChildOut {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    pub serial_no: Option<String>,
-    pub name: String,
-    pub drawing_no: Option<String>,
-    pub status: String,
-    pub version: i32,
-    pub quantity: i32,
-    pub planned_delivery_date: Option<NaiveDate>,
-    // §3.4（2026-09-11）— 子件继承自父件 / update 级联后的 6 个共享信息字段，
-    // 由 service 层从 t_part 行透传。`applicant_name` 在 t_part 是 NOT NULL
-    // VARCHAR(50)；其余可空。
-    pub applicant_name: String,
-    pub request_date: NaiveDate,
-    pub order_no: Option<String>,
-    pub system_delivery_date: Option<NaiveDate>,
-    pub is_urgent: bool,
-    pub note: Option<String>,
-    /// 2026-09-14 Phase 3（deferred #7）— 子件当前激活批次 id。
-    /// 子件无活跃批次（如刚被 CANCELLED）时为 `None`。
-    #[serde(serialize_with = "serialize_i64_opt")]
-    pub current_batch_id: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AssemblyFileRef {
-    #[serde(serialize_with = "serialize_i64")]
-    pub id: i64,
-    pub original_filename: String,
-    pub page_count: Option<i32>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AssemblyDetail {
-    #[serde(flatten)]
-    pub assembly: AssemblyOut,
-    pub children: Vec<AssemblyChildOut>,
-    pub files: Vec<AssemblyFileRef>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct AssemblyCreateResult {
-    pub assembly: AssemblyOut,
-    pub created_children: Vec<AssemblyChildOut>,
-}
+use serde::Deserializer;
+use serde::{Deserialize};
 
 // ---------- 入参 ----------
 
@@ -222,7 +125,6 @@ pub struct AssemblyUpdateRequest {
     pub version: i32,
 }
 
-use serde::Deserializer;
 fn deserialize_optional_optional_str<'de, D: Deserializer<'de>>(
     d: D,
 ) -> Result<Option<Option<String>>, D::Error> {

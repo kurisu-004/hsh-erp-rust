@@ -7,8 +7,9 @@
 //! - Redis 会话存储 `upload_session:{user_id}:{scope}`（24h 滑动 TTL）
 //! - python 后端 STS 转发（替代 rust 直连 `cos_rust_sdk::sts`）
 //!
-//! 文件清单（项目标准六件套 + dto）：
-//! - `dto.rs`：7 端点请求/响应 + 内部数据结构 `UploadSession` / `SessionFile` / `SessionCredentials`
+//! 文件清单（项目标准六件套 + dto/vo）：
+//! - `dto.rs`：7 端点入参 + 内部数据结构 `UploadSession` / `SessionFile` / `SessionCredentials`
+//! - `vo/`：7 端点出参（Serialize-only，PR4 拆出）
 //! - `repo.rs`：`UploadSessionRepo` trait + `RedisUploadSessionRepo` / `NoopUploadSessionRepo` /
 //!   `InMemoryUploadSessionRepo`（测试用）
 //! - `service.rs`：7 端点业务函数（get_or_create / allocate / complete / remove /
@@ -23,6 +24,7 @@ pub mod dto;
 pub mod handler;
 pub mod repo;
 pub mod service;
+pub mod vo;
 
 use std::sync::Arc;
 

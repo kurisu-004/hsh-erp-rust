@@ -21,11 +21,10 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::shared::error::{AppError, code};
 
-use crate::modules::prod::process_chain::dto::{
-    ProcessChainOut, ProcessChainStepOut, UpsertChainRequest,
-};
+use crate::modules::prod::process_chain::dto::UpsertChainRequest;
 use crate::modules::prod::process_chain::model::{NewProcessChainStep, TPartProcessChain};
 use crate::modules::prod::process_chain::repo::ProcessChainRepoTrait;
+use crate::modules::prod::process_chain::vo::{ProcessChainOut, ProcessChainStepOut};
 
 /// process_chain 域 service（2026-09-22 D-1 重构后）
 ///

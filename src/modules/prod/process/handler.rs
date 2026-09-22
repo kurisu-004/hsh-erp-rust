@@ -21,8 +21,9 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::prod::process::dto::{
-    ProcessCreateRequest, ProcessListOut, ProcessListQuery, ProcessOut, ProcessUpdateRequest,
+    ProcessCreateRequest, ProcessListQuery, ProcessUpdateRequest,
 };
+use crate::modules::prod::process::vo::{ProcessListOut, ProcessOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

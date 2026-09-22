@@ -30,6 +30,7 @@ use crate::shared::error::{AppError, code};
 
 use super::super::dto::*;
 use super::super::model::TShelf;
+use super::super::vo::*;
 use super::super::repo::ShelfRepoTrait;
 use super::{DEFAULT_LIMIT, MAX_LIMIT, ZONE_INSPECTION, ZONE_PRODUCTION};
 

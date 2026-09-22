@@ -14,7 +14,7 @@ use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::{
+use super::super::vo::{
     DeliveryGroupListOut, DeliveryGroupMemberOut, DeliveryGroupOut, UngroupedCustomerOut,
 };
 use super::super::model::{DeliveryGroup, DeliveryGroupMember};

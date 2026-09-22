@@ -32,15 +32,15 @@ use serde_json::json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::dto::PartOut;
 use crate::modules::part::dto_crud::{
     ByWorkTypeQuery, ByWorkerQuery, CancelBatchRequest, CancelRequest, CompleteRepairRequest,
-    CompleteRequest, DeliverRequest, PartListOut, PickUpRequest, PlaceOnShelfRequest,
+    CompleteRequest, DeliverRequest, PickUpRequest, PlaceOnShelfRequest,
     RecallToPendingRequest, RecallToProgrammingRequest, ReceiveFromOutsourceToInspectionRequest,
     RepairDispatchRequest, SendToOutsourceRequest, SendToProgrammingRequest, SplitBatchRequest,
     StartRepairRequest,
 };
 use crate::modules::part::service::PartService;
+use crate::modules::part::vo::{PartListOut, PartOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;

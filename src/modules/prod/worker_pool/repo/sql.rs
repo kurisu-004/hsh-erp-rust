@@ -18,7 +18,7 @@ use sqlx::{PgConnection, PgExecutor};
 
 use crate::shared::error::AppError;
 
-use crate::modules::prod::worker_pool::dto::PoolBatchItem;
+use crate::modules::prod::worker_pool::vo::PoolBatchItem;
 use crate::modules::prod::worker_pool::model::{HeldBatchItem, TakenItem};
 
 #[derive(Debug, sqlx::FromRow)]

@@ -12,10 +12,10 @@ use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::batch::model::TPartBatch;
+use crate::modules::part::vo::{PartOut, ToXxxOut};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto::{PartOut, ToXxxOut};
 use super::PartService;
 
 impl PartService {

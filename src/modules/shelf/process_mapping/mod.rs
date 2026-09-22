@@ -29,8 +29,8 @@
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::shelf::dto::{ShelfProcessMappingItem, ShelfProcessMappingOut};
 use crate::modules::shelf::repo::ShelfRepoTrait;
+use crate::modules::shelf::vo::{ShelfProcessMappingItem, ShelfProcessMappingOut};
 use crate::shared::error::{AppError, code};
 
 pub mod sql;

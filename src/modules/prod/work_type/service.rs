@@ -29,9 +29,12 @@ use std::sync::Arc;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::prod::work_type::dto::*;
+use crate::modules::prod::work_type::dto::{
+    WorkTypeCreateRequest, WorkTypeListQuery, WorkTypeUpdateRequest,
+};
 use crate::modules::prod::work_type::model::TWorkType;
 use crate::modules::prod::work_type::repo::WorkTypeRepoTrait;
+use crate::modules::prod::work_type::vo::{WorkTypeListOut, WorkTypeOut};
 use crate::shared::error::{AppError, code};
 
 const DEFAULT_LIMIT: i64 = 50;
