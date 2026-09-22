@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, created_at, updated_at) VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "32d8cc3afe1737197172348cbdc43fd89e642837ecc1c83aaf56b78ee62c0808"
+}

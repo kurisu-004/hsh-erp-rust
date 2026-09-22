@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0ed57e0dd925831dc55c321ef665bb2dc162fb25be48fb800f0820ff29175d52"
+}

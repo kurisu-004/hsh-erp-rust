@@ -28,7 +28,6 @@ use common::{
     test_pool, test_state,
 };
 use hsh_erp_rust::auth::jwt::encode_access;
-use hsh_erp_rust::auth::rbac::{Claims, Role};
 
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -81,21 +80,13 @@ fn json_request(
 
 /// 签发合法 access token 但**不**写 Redis session（用于 case 4）。
 async fn mint_token_no_session(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
-    let claims = Claims {
-        sub: user_id,
-        username: "mw-tester".to_string(),
-        roles: vec![Role::Manager],
-        shelf_ids: vec![],
-        shelf_wildcard: true,
-        ver: 0,
-        typ: "access".into(),
-        iss: state.config.jwt.issuer.clone(),
-        exp: 0,
-    };
+    // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_hours)`，
+    // 不再收 Claims；iat/nbf/jti/aud/typ 由函数内部填。直接调用即可。
     let (token, _exp) = encode_access(
-        &claims,
         &state.config.jwt.secret,
         &state.config.jwt.issuer,
+        &state.config.jwt.audience,
+        user_id,
         state.config.jwt.access_ttl_hours,
     )
     .expect("encode_access");
@@ -108,28 +99,29 @@ async fn mint_token_no_session(state: &Arc<hsh_erp_rust::state::AppState>, user_
 /// 仍在 leeway 内不会触发 ExpiredSignature。120s 才能稳定触发 40102。
 async fn mint_expired_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    /// 2026-09-22 重构：JSON 字段名按 RFC 7519 短码（sub/aud/iat/nbf/exp/iss/jti/typ）；
+    /// 删 username/roles/shelf_ids/shelf_wildcard/ver 业务字段。
     #[derive(serde::Serialize)]
     struct ExpClaims<'a> {
         sub: i64,
-        username: &'a str,
-        roles: Vec<&'a str>,
-        shelf_ids: Vec<i64>,
-        shelf_wildcard: bool,
-        ver: i32,
-        typ: &'a str,
+        aud: &'a str,
+        iat: i64,
+        nbf: i64,
         iss: &'a str,
         exp: i64,
+        jti: String,
+        typ: &'a str,
     }
+    let now = Utc::now().timestamp();
     let c = ExpClaims {
         sub: user_id,
-        username: "mw-tester",
-        roles: vec!["MANAGER"],
-        shelf_ids: vec![],
-        shelf_wildcard: true,
-        ver: 0,
-        typ: "access",
+        aud: &state.config.jwt.audience,
+        iat: now,
+        nbf: now,
         iss: &state.config.jwt.issuer,
-        exp: Utc::now().timestamp() - 120,
+        exp: now - 120,
+        jti: uuid::Uuid::new_v4().to_string(),
+        typ: "access",
     };
     encode(
         &Header::new(Algorithm::HS256),
@@ -137,6 +129,81 @@ async fn mint_expired_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id:
         &EncodingKey::from_secret(state.config.jwt.secret.as_bytes()),
     )
     .expect("encode expired token")
+}
+
+/// 签发 **错误 audience** 的 access token（其它 claim 全部合法）
+///
+/// 2026-09-22 重构：用于验证 `Validation::set_required_spec_claims` + `set_audience`
+/// 双重校验下，aud 不匹配时返回 40100 UNAUTHORIZED（不是 200/40105）。
+async fn mint_wrong_audience_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        sub: i64,
+        aud: &'a str,
+        iat: i64,
+        nbf: i64,
+        iss: &'a str,
+        exp: i64,
+        jti: String,
+        typ: &'a str,
+    }
+    let now = Utc::now().timestamp();
+    // 用错误的 audience（与 state.config.jwt.audience 故意不同）
+    let wrong_aud = "wrong-audience-not-matching-config";
+    let c = Claims {
+        sub: user_id,
+        aud: wrong_aud,
+        iat: now,
+        nbf: now,
+        iss: &state.config.jwt.issuer,
+        exp: now + 3600,
+        jti: uuid::Uuid::new_v4().to_string(),
+        typ: "access",
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &c,
+        &EncodingKey::from_secret(state.config.jwt.secret.as_bytes()),
+    )
+    .expect("encode wrong-aud token")
+}
+
+/// 签发 **缺失 audience** 字段的 access token（其它 claim 全部合法）
+///
+/// 2026-09-22 重构：用于验证 `set_required_spec_claims` 把 `aud` 列为必填——
+/// `set_audience` 单独使用**不**会让缺 `aud` 的 token 被拒；本测试守住
+/// "缺 aud 字段 → 40100" 这个不变量。
+async fn mint_missing_audience_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    // 故意**不**序列化 `aud` 字段
+    #[derive(serde::Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct Claims {
+        sub: i64,
+        iat: i64,
+        nbf: i64,
+        iss: String,
+        exp: i64,
+        jti: String,
+        typ: &'static str,
+    }
+    let now = Utc::now().timestamp();
+    let c = Claims {
+        sub: user_id,
+        iat: now,
+        nbf: now,
+        iss: state.config.jwt.issuer.clone(),
+        exp: now + 3600,
+        jti: uuid::Uuid::new_v4().to_string(),
+        typ: "access",
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &c,
+        &EncodingKey::from_secret(state.config.jwt.secret.as_bytes()),
+    )
+    .expect("encode missing-aud token")
 }
 
 // ===========================================================================
@@ -253,6 +320,69 @@ async fn valid_jwt_without_session_returns_40105() {
     assert_eq!(
         env["code"], 40105,
         "无 Redis session 应返 SESSION_REVOKED (40105)"
+    );
+}
+
+// ===========================================================================
+// 4b. 错误 audience 的 token → 40100 UNAUTHORIZED
+//
+// 2026-09-22 重构：验证 `set_required_spec_claims` + `set_audience` 双重校验
+// 下，aud 不匹配的合法签名 token 被拒。
+// ===========================================================================
+
+#[tokio::test]
+async fn wrong_audience_returns_40100() {
+    let pool = setup().await;
+    let uid = insert_user_with_password(&pool, "wrotaud_admin", "changeme").await;
+    let state = test_state(pool).await;
+    let token = mint_wrong_audience_token(&state, uid).await;
+
+    let app = test_app(state);
+    let (status, env) = send(
+        app,
+        json_request("GET", "/prod/workers", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "错误 aud 应返 401: {env}"
+    );
+    assert_eq!(
+        env["code"], 40100,
+        "错误 aud 应返 UNAUTHORIZED (40100)，不是 40102/40105"
+    );
+}
+
+// ===========================================================================
+// 4c. 缺失 audience 字段的 token → 40100 UNAUTHORIZED
+//
+// 2026-09-22 重构：守住 `set_required_spec_claims` 把 `aud` 列为必填的不变量。
+// 若未来有人误删这行 `set_required_spec_claims(&["exp", "aud", "iss", "sub"])`，
+// 此测试立即失败提醒。
+// ===========================================================================
+
+#[tokio::test]
+async fn missing_audience_returns_40100() {
+    let pool = setup().await;
+    let uid = insert_user_with_password(&pool, "missaud_admin", "changeme").await;
+    let state = test_state(pool).await;
+    let token = mint_missing_audience_token(&state, uid).await;
+
+    let app = test_app(state);
+    let (status, env) = send(
+        app,
+        json_request("GET", "/prod/workers", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "缺 aud 字段应返 401: {env}"
+    );
+    assert_eq!(
+        env["code"], 40100,
+        "缺 aud 字段应返 UNAUTHORIZED (40100)（set_required_spec_claims 守住）"
     );
 }
 
@@ -396,7 +526,7 @@ async fn logout_then_old_token_returns_40105() {
 //
 // 2026-09-20 修复 review #1：`route_layer` 仅作用于已匹配路由（axum 0.8
 // 文档语义：failed routes 不进入 layer）。如果改为 `.layer()`，404 路径
-// 也会走 auth_middleware → middleware 白名单不命中 → 40100，反而掩盖
+// 也会走 authenticate_middleware → middleware 白名单不命中 → 40100，反而掩盖
 // 真实路由错误。本测试用例守住这个不变量：404 应是 404，不是 40100。
 // ===========================================================================
 

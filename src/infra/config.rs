@@ -58,6 +58,9 @@ pub struct RedisConfig {
 pub struct JwtConfig {
     pub secret: String,
     pub issuer: String,
+    /// JWT `aud` 校验目标（2026-09-22 新增：删 Python v1 兼容后 Rust 自签 token 强绑定 audience）。
+    /// 环境变量 `JWT_AUDIENCE`，缺省 `hsh-erp-rust`。
+    pub audience: String,
     pub access_ttl_hours: i64,
     pub refresh_ttl_days: i64,
 }
@@ -182,6 +185,8 @@ impl AppConfig {
             jwt: JwtConfig {
                 secret: env_required("JWT_SECRET")?,
                 issuer: env_or("JWT_ISSUER", "myerp"),
+                // 2026-09-22 新增：audience 强校验（删 Python v1 兼容后改回硬绑定）。
+                audience: env_or("JWT_AUDIENCE", "hsh-erp-rust"),
                 access_ttl_hours: env_parse("JWT_ACCESS_TOKEN_EXPIRE_HOURS", 12)?,
                 refresh_ttl_days: env_parse("JWT_REFRESH_TOKEN_EXPIRE_DAYS", 7)?,
             },

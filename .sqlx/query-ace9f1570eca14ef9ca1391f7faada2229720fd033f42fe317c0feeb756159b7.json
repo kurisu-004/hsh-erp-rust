@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE t_user\n        SET password_hash         = $3,\n            refresh_token_version = refresh_token_version + 1,\n            version               = version + 1,\n            updated_at            = $4,\n            updated_by            = $5\n        WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Varchar",
+        "Timestamp",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ace9f1570eca14ef9ca1391f7faada2229720fd033f42fe317c0feeb756159b7"
+}

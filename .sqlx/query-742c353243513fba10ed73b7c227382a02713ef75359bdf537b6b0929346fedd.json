@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, version, created_at, updated_at) VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "742c353243513fba10ed73b7c227382a02713ef75359bdf537b6b0929346fedd"
+}

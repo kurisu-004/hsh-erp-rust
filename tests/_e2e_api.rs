@@ -26,7 +26,7 @@ use common::{
     clean_business_db, clean_db, clean_redis, ensure_database_exists, insert_user_with_password,
     test_app, test_pool, test_redis_pool, test_state_with_redis,
 };
-use hsh_erp_rust::auth::session::{CachedCurrentUser, RedisSessionStore, SessionStore, TokenKind};
+use hsh_erp_rust::auth::session::{CachedUserProfile, RedisSessionStore, SessionStore, TokenKind};
 
 // ===========================================================================
 //  全局串行化 + helpers
@@ -308,8 +308,9 @@ async fn revoke_session_clears_redis_user_set() {
             uid,
             TokenKind::Access,
             3600,
-            &CachedCurrentUser {
-                id: uid,
+            // 2026-09-22 重构：`CachedCurrentUser` → `CachedUserProfile`（删 id 字段；
+            // user_id 已由外层 `create_session` 第 2 参数承载）。
+            &CachedUserProfile {
                 username: "revoke_target".into(),
                 roles: vec!["MANAGER".into()],
                 shelf_ids: vec![],

@@ -1,7 +1,5 @@
 //! 服务端 session 真相源（Redis）
 //!
-//! 对应方案 `redis-session-deadpool-redis-0-23-https-valiant-raven.md`。
-//!
 //! ## 设计动机
 //! JWT 一旦签发，服务端无法强制吊销短期 access token。本模块在 Redis 中为每个
 //! token 维护一条「session 条目」：登录/refresh 时写入；logout、改密、refresh 时删除；
@@ -14,6 +12,11 @@
 //! ## 兜底
 //! `t_user.refresh_token_version` 的 DB 轮转保留——Redis 数据丢失或被 `FLUSHDB` 时，
 //! refresh 仍会被版本校验挡住，access 则靠自然到期。
+//!
+//! ## 2026-09-22 重构
+//! - `CachedCurrentUser` → `CachedUserProfile`（删除 `id` 字段；user_id 由外层 `CachedSession`
+//!   字段权威锚定，避免内外两个 id 漂移）。
+//! - `CachedSession.cached` → `CachedSession.profile`，与字段语义对齐。
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -33,19 +36,31 @@ pub enum TokenKind {
 }
 
 /// token 对应的会话缓存（含上下文一致性校验字段）
+///
+/// ⚠️ 2026-09-22 部署注意：`profile` 是从旧字段名 `cached` 重命名而来，
+/// 线上已存在的 Redis session entry（JSON 含 `cached` 字段）反序列化会失败，
+/// 上线前需清空 Redis session DB（`FLUSHDB` 或选择性删除 `session:tok:*`），
+/// 否则已登录用户在 session TTL（默认 12h）内持续 5xx（50000 INTERNAL）。
+/// 详见 `docs/api/index.md`「部署顺序」段。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedSession {
     pub user_id: i64,
     pub token_kind: TokenKind,
     pub created_at: i64,
     pub expires_at: i64,
-    pub cached: CachedCurrentUser,
+    /// 2026-09-22 改名：原 `cached: CachedCurrentUser` → `profile: CachedUserProfile`。
+    /// 字段语义与新类型名对齐（profile = 用户业务画像）。
+    pub profile: CachedUserProfile,
 }
 
-/// 与 `CurrentUser` 同形——登录态直接从此构造，不查 DB（`/me` 仍然走 DB 取最新）。
+/// 2026-09-22 重命名 + 删字段：原 `CachedCurrentUser` → `CachedUserProfile`。
+///
+/// 删除 `id` 字段：`user_id` 已在 `CachedSession` 外层作为权威锚点；profile
+/// 不再冗余携带，避免内外两个 id 漂移。
+///
+/// 与 `CurrentUser` 同形（除 `id`）——登录态直接从此构造，不查 DB（`/me` 仍然走 DB 取最新）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CachedCurrentUser {
-    pub id: i64,
+pub struct CachedUserProfile {
     pub username: String,
     /// 大写角色字符串列表（与 `auth::rbac::Role` serde rename 对齐："MANAGER"/"CLERK"/…）
     pub roles: Vec<String>,
@@ -64,7 +79,7 @@ pub trait SessionStore: Send + Sync {
         user_id: i64,
         kind: TokenKind,
         ttl_seconds: u64,
-        cached: &CachedCurrentUser,
+        profile: &CachedUserProfile,
     ) -> Result<(), AppError>;
 
     /// 读一条 session；不存在返回 `Ok(None)`，存在但解码失败走 `AppError::Internal`
@@ -135,7 +150,7 @@ impl SessionStore for RedisSessionStore {
         user_id: i64,
         kind: TokenKind,
         ttl_seconds: u64,
-        cached: &CachedCurrentUser,
+        profile: &CachedUserProfile,
     ) -> Result<(), AppError> {
         let now = now_unix();
         let session = CachedSession {
@@ -143,7 +158,7 @@ impl SessionStore for RedisSessionStore {
             token_kind: kind,
             created_at: now,
             expires_at: now + ttl_seconds as i64,
-            cached: cached.clone(),
+            profile: profile.clone(),
         };
         let payload = serde_json::to_string(&session)
             .map_err(|e| AppError::internal(format!("redis: serialize session: {e}")))?;
@@ -244,11 +259,9 @@ impl SessionStore for RedisSessionStore {
     }
 }
 
-/// No-op 实现：用 Rust 自签 JWT 但借用 Python myERP 用户库的过渡期可关
-/// 闭服务端的 session 真相源（迁移早期，access token 的吊销完全依赖 JWT
-/// 短 TTL + refresh token）。所有写入和读取都是 no-op；extractor 中通过
-/// `state.config.redis.session_check_enabled` gate，**完全不会调到**这些
-/// 实现，但 trait 仍要求实现以保持 `Arc<dyn SessionStore>` 类型一致。
+/// No-op 实现：用 Rust 自签 JWT 但禁用服务端 session 校验时可关闭（迁移早期或临时
+/// 调试用）。所有写入和读取都是 no-op；extractor 中通过 `state.config.redis.session_check_enabled`
+/// gate，**完全不会调到**这些实现，但 trait 仍要求实现以保持 `Arc<dyn SessionStore>` 类型一致。
 pub struct NoopSessionStore;
 
 impl NoopSessionStore {
@@ -272,9 +285,9 @@ impl SessionStore for NoopSessionStore {
         _user_id: i64,
         _kind: TokenKind,
         _ttl_seconds: u64,
-        _cached: &CachedCurrentUser,
+        _profile: &CachedUserProfile,
     ) -> Result<(), AppError> {
-        // 借用 Python JWT 时不该有写入；打 warn 以便误用时可见
+        // 借用 JWT 时不该有写入；打 warn 以便误用时可见
         tracing::warn!(
             "NoopSessionStore::create_session 被调用（REDIS_SESSION_CHECK_ENABLED=false）"
         );

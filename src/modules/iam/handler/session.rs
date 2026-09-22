@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::Json;
 
-use crate::auth::extractor::AuthTokenHash;
+use crate::auth::extractor::AuthenticatedTokenHash;
 use crate::auth::rbac::CurrentUser;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
@@ -51,7 +51,7 @@ pub async fn me(
 pub async fn logout(
     State(state): State<Arc<AppState>>,
     _user: CurrentUser,
-    AuthTokenHash(token_hash): AuthTokenHash,
+    AuthenticatedTokenHash(token_hash): AuthenticatedTokenHash,
 ) -> Result<Json<R<LogoutResponse>>, AppError> {
     state.session_service.logout(&token_hash).await?;
     Ok(Json(R::ok(LogoutResponse { ok: true })))

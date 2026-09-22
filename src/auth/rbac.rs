@@ -1,6 +1,4 @@
-//! RBAC 五角色 + 当前用户结构 + JWT Claims
-//!
-//! 对应 Python myERP/model/enums.py `UserRole` + `CurrentUser` dataclass。
+//! RBAC 五角色 + 当前用户结构 + JWT AccessTokenClaims
 //!
 //! ## 角色
 //! - `Manager`：超级权限（业务层自行判断是否豁免）
@@ -13,20 +11,22 @@
 //! - `shelf_ids`：可访问的具体货架列表
 //! - `shelf_wildcard`：是否对所有货架放行（仅 Manager 标志）
 //!
-//! ## v1/v2 JWT 兼容（2026 docker 编排 Phase 3）
-//! - Python v1 token 把 `sub` 写成字符串（`str(user_id)`），Rust v2 历史期望 `i64`。
-//!   `Claims.sub` 用 `deserialize_sub_or_int` 同时接受数字和数字串。
-//! - Python v1 用 `type` 字段，Rust v2 历史用 `typ`。`Claims.typ` 加 `alias = "type"`
-//!   让解码阶段吃下两种命名；编码仍发 `typ`，无破坏。
+//! ## JWT 字段（2026-09-22 重构）
+//! - access token 业务字段（username/roles/shelf_ids/shelf_wildcard/ver）已从 JWT 中删除，
+//!   全部改走 Redis session 校验 + 服务端缓存；handler/extractor 仍通过 `CurrentUser`
+//!   拿到这些上下文。
+//! - 标准字段（`sub/aud/iat/nbf/exp/iss/jti/typ`）按 RFC 7519 命名，Rust 结构体字段全词化
+//!   （`subject` / `audience` / `issued_at` / `not_before` / `expires_at` / `issuer` / `jwt_id` /
+//!   `token_type`），通过 `#[serde(rename = "...")]` 桥接 JSON 短码。
 
-use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
+use serde::{Deserialize, Serialize};
 
 use crate::shared::error::{AppError, code};
 
 /// 把 DB / Redis 缓存里的大写 role 字符串转回 `Role` 枚举。
 ///
 /// 仅识别 5 种已知值；未知值打 `tracing::warn!` 并返回 `None`，调用方自行决定是否跳过。
-pub fn parse_role_str_or_warn(s: &str) -> Option<Role> {
+pub fn parse_role_string(s: &str) -> Option<Role> {
     Some(match s {
         "MANAGER" => Role::Manager,
         "CLERK" => Role::Clerk,
@@ -54,69 +54,55 @@ pub enum Role {
     ShelfAccount,
 }
 
-/// access token 业务载荷（与 Python JWT payload 对齐）
+/// access token 标准字段 + RFC 7519 claim set（业务字段已全部移到 Redis session）
+///
+/// 2026-09-22 重构：
+/// - Rust 字段全词化（subject / audience / issued_at / not_before / expires_at / issuer /
+///   jwt_id / token_type），JSON 字段名按 RFC 7519 用短码（sub / aud / iat / nbf / exp / iss /
+///   jti / typ），通过 `#[serde(rename = "...")]` 桥接。
+/// - 删除 `username` / `roles` / `shelf_ids` / `shelf_wildcard` / `ver` / `deserialize_sub_or_int` /
+///   `alias = "type"`：Rust 自签 token 不再携带业务字段，业务上下文从 Redis session 取；
+///   `sub` 直接用 `i64`，无须再兼容 Python v1 数字串。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Claims {
-    /// Python v1 token 把 `sub` 写成 `str(user_id)`，Rust v2 历史上期望 `i64`；
-    /// `deserialize_sub_or_int` 同时接受两种形式（数字 / 数字串）。
-    #[serde(deserialize_with = "deserialize_sub_or_int")]
-    pub sub: i64,
-    pub username: String,
-    pub roles: Vec<Role>,
-    pub shelf_ids: Vec<i64>,
-    #[serde(default)]
-    pub shelf_wildcard: bool,
-    #[serde(default)]
-    pub ver: i32,
-    /// Python v1 用 `type` 字段；加 `alias = "type"` 解码时兼容两种命名。
-    /// 编码仍发 `typ`，Rust 自签 token 形态不变。
-    #[serde(default = "default_access_type", alias = "type")]
-    pub typ: String,
-    pub iss: String,
-    pub exp: i64,
+pub struct AccessTokenClaims {
+    /// RFC 7519 `sub`：用户 snowflake id（i64）
+    #[serde(rename = "sub")]
+    pub subject: i64,
+    /// RFC 7519 `aud`：受众；本服务统一用 `JwtConfig::audience`（默认 `hsh-erp-rust`）
+    #[serde(rename = "aud")]
+    pub audience: String,
+    /// RFC 7519 `iat`：issued-at，由签发函数填入 unix 时间
+    #[serde(rename = "iat")]
+    pub issued_at: i64,
+    /// RFC 7519 `nbf`：not-before；默认等于 `issued_at`（签发即生效）
+    #[serde(rename = "nbf", default = "default_not_before")]
+    pub not_before: i64,
+    /// RFC 7519 `exp`：expiration
+    #[serde(rename = "exp")]
+    pub expires_at: i64,
+    /// RFC 7519 `iss`：issuer，对齐 `JwtConfig::issuer`
+    #[serde(rename = "iss")]
+    pub issuer: String,
+    /// RFC 7519 `jti`：JWT ID（UUID v4），防重放审计字段
+    #[serde(rename = "jti", default = "default_jwt_id")]
+    pub jwt_id: String,
+    /// RFC 7519 `typ`：token type；access token 默认 `default_access_token_type`（`"access"`）
+    #[serde(rename = "typ", default = "default_access_token_type")]
+    pub token_type: String,
 }
 
-fn default_access_type() -> String {
+fn default_access_token_type() -> String {
     "access".into()
 }
 
-/// `Claims.sub` 反序列化 helper：
-/// - Rust 自签：`"sub": 123`（i64）
-/// - Python v1：`"sub": "123"`（数字串）
-///
-/// 两种都解析为 `i64`。
-fn deserialize_sub_or_int<'de, D>(deserializer: D) -> Result<i64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct SubVisitor;
+fn default_not_before() -> i64 {
+    // 0 仅作占位；签发时由 encode_access / encode_refresh 覆写
+    0
+}
 
-    impl<'de> Visitor<'de> for SubVisitor {
-        type Value = i64;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("i64 or numeric string for JWT sub")
-        }
-
-        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<i64, E> {
-            Ok(v)
-        }
-
-        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<i64, E> {
-            i64::try_from(v).map_err(|_| E::custom("u64 too large for i64 sub"))
-        }
-
-        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<i64, E> {
-            v.parse::<i64>()
-                .map_err(|_| E::custom(format!("sub is not a numeric string: {v:?}")))
-        }
-
-        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<i64, E> {
-            self.visit_str(&v)
-        }
-    }
-
-    deserializer.deserialize_any(SubVisitor)
+fn default_jwt_id() -> String {
+    // 0 仅作占位；签发时由 encode_access / encode_refresh 填入 UUID v4
+    String::new()
 }
 
 /// Handler 中可用的当前登录用户

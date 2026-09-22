@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE t_part_batch SET delivery_note_id = 88888888 WHERE part_id = $1 AND deleted_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "864ae5c9ee84d78f4f3007dfe40d5d5f62c384d72db34beae56d5f0343a3a45b"
+}

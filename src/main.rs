@@ -222,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
         // 6) Body limit（现状保留）
         .layer(RequestBodyLimitLayer::new(max_body))
         // 2026-09-20 修复 review #1：state 同时是 `Arc<AppState>`（中间件用：
-        // `route_layer(from_fn_with_state(state.clone(), auth_middleware))`）
+        // `route_layer(from_fn_with_state(state.clone(), authenticate_middleware))`）
         // 与 `Router<S = Arc<AppState>>` 的 S（handler extractor 用）的同一 Arc，
         // `state.clone()` 两次仅 bump Arc 引用计数、不做深拷贝。
         .with_state(state.clone());
