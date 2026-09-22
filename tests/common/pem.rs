@@ -11,7 +11,7 @@
 //! 生成后转 PKCS#8 PEM（私钥）+ SPKI PEM（公钥），与 jsonwebtoken 的
 //! `EncodingKey::from_rsa_pem` / `DecodingKey::from_rsa_pem` 配套。
 //!
-//! 缓存策略：进程级 `OnceLock<[String; 3]>` —— 私钥 PEM、公钥 PEM、kid 列表。
+//! 缓存策略：进程级 `OnceLock<KeyMaterial>` —— 私钥 PEM + 多对 (kid, 公钥 PEM)。
 //! 每进程首调用时生成一次，后续调用零成本。**不**写入磁盘（避免密钥泄露到
 //! git 跟踪的 fixture 文件）。
 //!

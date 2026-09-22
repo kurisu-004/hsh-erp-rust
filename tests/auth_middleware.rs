@@ -708,3 +708,82 @@ async fn protected_endpoint_with_alg_none_returns_40100() {
         "alg=none 应返 UNAUTHORIZED (40100)，不是 40102 / 40105"
     );
 }
+
+// ===========================================================================
+// 12. 2026-09-23 review #1 修复：HS256 + 空 secret 在 fallback=false 时必拒 → 40100
+//
+// 背景：fix 之前 `verify_session_token` / `decode_refresh` 无脑 `Some(&secret)`
+// 传 hs256_fallback_secret；当 `JWT_ALLOW_HS256_FALLBACK=false` 时 `from_env`
+// 把 secret 默认 `""`（空串），`decode_access` HS256 分支 `Option::is_some()`
+// → true → `DecodingKey::from_secret(b"")` 走空 HMAC 验签 → 攻击者用空
+// secret 签的 HS256 token 顺利通过（40100 唯一信号仍为 InvalidSignature，
+// 但若其它 claim 全部合法，则会一路跑到 session 真源，鉴权 bypass）。
+//
+// 本测试在 `allow_hs256_fallback=false` 的 JwtConfig 下签一个 HS256 + 空 secret
+// 的 token（issuer/aud/exp/sub 全部合法），断言服务端返 40100（而不是
+// 200 / 40102 / 40105）—— 守住「HS256 fallback 关闭时空 secret bypass
+// 被阻断」不变量。fixture 由 `tests/common/mod.rs::test_state_with_hs256_fallback_off`
+// 构造（与 test_state 唯一差别即 `allow_hs256_fallback: false`）。
+// ===========================================================================
+
+/// HS256 + 空 secret + 合法 claim 的 token。
+///
+/// 调 jsonwebtoken::encode(HS256, EncodingKey::from_secret(b"")) 直接签发
+/// —— 这是攻击者视角的最小 PoC：任意 client 拿到 `Authorization: Bearer <token>`
+/// 后若服务端 fallback 关闭不严，把 secret 视为空就完成 bypass。
+///
+/// header: {"alg":"HS256","typ":"JWT"}（HS256 不带 kid）；payload: 合法 claim
+///（issuer/aud/exp/sub 全部对齐 server config）；signature: HMAC-SHA256(
+/// header_b64.payload_b64, b"")。
+fn mint_hs256_empty_secret_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        sub: i64,
+        aud: &'a str,
+        iat: i64,
+        nbf: i64,
+        iss: &'a str,
+        exp: i64,
+        jti: String,
+        typ: &'a str,
+    }
+    let now = Utc::now().timestamp();
+    let c = Claims {
+        sub: user_id,
+        aud: &state.config.jwt.audience,
+        iat: now,
+        nbf: now,
+        iss: &state.config.jwt.issuer,
+        exp: now + 3600,
+        jti: uuid::Uuid::new_v4().to_string(),
+        typ: "access",
+    };
+    let header = Header::new(Algorithm::HS256);
+    encode(&header, &c, &EncodingKey::from_secret(b"")).expect("encode hs256+empty")
+}
+
+#[tokio::test]
+async fn hs256_rejected_when_fallback_off_returns_40100() {
+    let pool = setup().await;
+    let uid = insert_user_with_password(&pool, "hs256off_admin", "changeme").await;
+    let state = common::test_state_with_hs256_fallback_off(pool).await;
+    let token = mint_hs256_empty_secret_token(&state, uid);
+
+    let app = test_app(state);
+    let (status, env) = send(
+        app,
+        json_request("GET", "/prod/workers", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "HS256 + fallback=off 应返 401: {env}"
+    );
+    assert_eq!(
+        env["code"], 40100,
+        "HS256 + fallback=off 应返 UNAUTHORIZED (40100)，\
+         不是 200 / 40102 / 40105"
+    );
+}

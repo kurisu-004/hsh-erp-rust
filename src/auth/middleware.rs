@@ -104,14 +104,25 @@ pub async fn verify_session_token(
     // 1) JWT 验签（带 iss + aud 校验）
     //
     // 2026-09-23 重构：decode_access 走 RS256 + kid 路由，HS256 仅作 fallback。
-    // 第二个参数 `public_keys` 来自 JwtConfig.public_keys（启动期目录扫描填充），
-    // 第三个参数传 Some(&secret) —— jwt.rs 内部按 JwtConfig::allow_hs256_fallback
-    // 决定是否启用 HS256 fallback 分支（caller 始终传 Some，由 jwt.rs 据 header.alg
-    // 分支判断）。这样 call site 不需要在 middleware 重复读 config。
+    // 第二个参数 `public_keys` 来自 JwtConfig.public_keys（启动期目录扫描填充）。
+    //
+    // 2026-09-23 review #1 修复：第三个参数 HS256 fallback secret 由 caller
+    // 显式按 `JwtConfig::allow_hs256_fallback` 决定传 `Some(&secret)` 还是
+    // `None`。理由：`from_env` 在 `allow_hs256_fallback=false` 时把 `secret`
+    // 默认成 `""`（空串）；如果 caller 无脑传 `Some(&secret)`，`decode_access`
+    // 看到 HS256 header 仍会 `Option::is_some()` → true → 走空 HMAC 验签，
+    // 攻击者用空 secret 签的 HS256 token 即可通过。caller 这里收口：
+    // fallback=false 时 secret 一律 `None`，jwt.rs 内部 `hs256_fallback_secret
+    // .ok_or_else(...)` 报 40100 "HS256 not allowed"，从源头杜绝 bypass。
+    let hs256_fallback_secret: Option<&str> = if state.config.jwt.allow_hs256_fallback {
+        Some(&state.config.jwt.secret)
+    } else {
+        None
+    };
     let claims = decode_access(
         token,
         &state.config.jwt.public_keys,
-        Some(&state.config.jwt.secret),
+        hs256_fallback_secret,
         &state.config.jwt.issuer,
         &state.config.jwt.audience,
     )?;

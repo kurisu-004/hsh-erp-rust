@@ -272,13 +272,23 @@ impl SessionService {
         // 1. 解码 refresh token，取 sub + refresh_version（在 open tx 前即可拒）
         // 2026-09-22 重构：`decode_refresh` 增加 `audience` 参数。
         // 2026-09-23 重构：RS256 + kid —— 第 3 参数 `secret` 拆为 `public_keys` +
-        // `Some(&secret)`（HS256 fallback 开关由 jwt.rs 内部根据
-        // `allow_hs256_fallback` 决定；调用方始终传 Some，让 jwt.rs 据 header.alg
-        // 分支判断是否启用 fallback）。
+        // HS256 fallback secret。
+        //
+        // 2026-09-23 review #1 修复：HS256 fallback secret 由 caller 显式按
+        // `JwtConfig::allow_hs256_fallback` 决定传 `Some(&secret)` 还是 `None`
+        // —— 与 `middleware::verify_session_token` 同形（refresh 路径同样有
+        // 「allow_hs256_fallback=false 时 secret 默认空串导致空 HMAC bypass」
+        // 风险）。fallback=false 时传 `None`，jwt.rs 内部会返 40100
+        // "refresh: HS256 not allowed"。
+        let hs256_fallback_secret: Option<&str> = if self.config.jwt.allow_hs256_fallback {
+            Some(&self.config.jwt.secret)
+        } else {
+            None
+        };
         let claims = decode_refresh(
             &req.refresh_token,
             &self.config.jwt.public_keys,
-            Some(&self.config.jwt.secret),
+            hs256_fallback_secret,
             &self.config.jwt.issuer,
             &self.config.jwt.audience,
         )

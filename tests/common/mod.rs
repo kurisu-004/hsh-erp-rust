@@ -581,6 +581,44 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     ))
 }
 
+/// 2026-09-23 review #1 新增 fixture：构造 `allow_hs256_fallback=false` 的
+/// `AppState`，其它字段与 `test_state_with_redis` 完全一致。
+///
+/// 用法：`tests/auth_middleware.rs::hs256_rejected_when_fallback_off_returns_40100`
+/// —— 验证 `verify_session_token` / `decode_refresh` 在 fallback 关闭时把
+/// hs256_fallback_secret 传 `None`，HS256 + 空 secret 的 token 一律 40100
+/// "HS256 not allowed"（而不是 `DecodingKey::from_secret(b"")` 走空 HMAC bypass）。
+///
+/// 实现：`Arc::make_mut(&mut state.config)` —— 我们是 AppState 的唯一 Arc 持有者，
+/// `config: Arc<AppConfig>` 也只被本 AppState 引用，copy-on-write 安全；
+/// 直接修改 `.jwt.allow_hs256_fallback = false` 即可，不重建 services（service
+/// 字段对 JWT 配置无依赖：JwtConfig 改造只影响 encode/decode，session_service
+/// 只在 login/refresh 时透传给 jwt 函数，重建 service 字段无谓增加复杂度）。
+#[allow(dead_code)]
+pub async fn test_state_with_hs256_fallback_off(pool: PgPool) -> Arc<AppState> {
+    let redis_pool = test_redis_pool().await;
+    let mut state = test_state_with_redis(pool, redis_pool);
+    // state.config 在 SessionService::new 内被 .clone() —— 共享强计数 > 1，
+    // `Arc::get_mut(&mut state.config)` 会 panic。改走「构造新 config 替换」路径：
+    // 1. 拿到唯一 state Arc（Arc::get_mut 在 state 上是 unique 的）
+    // 2. 替换 state_inner.config 为新 Arc<AppConfig>（allow_hs256_fallback=false）
+    // 3. session_service 仍持有旧 config —— 但本 fixture 仅走 auth_middleware 路径
+    //    （不被 login/refresh 调用），不影响测试断言；HS256 fallback 关闸逻辑
+    //    完全由 state.config.jwt.allow_hs256_fallback 控制（见
+    //    `verify_session_token` 与 `iam::service::session::refresh` 的 hs256 分支透传）。
+    let state_inner = Arc::get_mut(&mut state).expect("state Arc 必须 unique");
+    let old_cfg = (*state_inner.config).clone();
+    let new_cfg = Arc::new(AppConfig {
+        jwt: JwtConfig {
+            allow_hs256_fallback: false,
+            ..old_cfg.jwt.clone()
+        },
+        ..old_cfg
+    });
+    state_inner.config = new_cfg;
+    state
+}
+
 /// service 单元测试 fixture：显式注入 `NoopSessionStore` + `NoopUploadSessionRepo`，
 /// 不依赖 Redis 进程存在。
 ///

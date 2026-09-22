@@ -127,6 +127,10 @@ HTTP 状态码：
 - **密钥轮换**：把新公钥（如 `next.pem`）放进公钥目录后，签发端把
   `JWT_SIGNING_KID=next` 即可对外签新 kid；老客户端持有的 `current` kid token
   在公钥字典内仍可验签，直至自然过期。下轮 cleanup PR 补 hot-reload。
+- **从私钥导出公钥（SPKI PEM）**：`openssl rsa -in keys/jwt-current.pem -pubout -out keys/public/current.pem`
+  （`jwt-current.pem` 是 `JWT_PRIVATE_KEY_PATH` 指向的 RS256 私钥；输出文件
+  的文件名去后缀即 `current` = kid，必须与 `JWT_PUBLIC_KEYS_DIR` 内其它
+  `.pem` 文件名不冲突）。
 - **HS256 fallback 段**：服务端保留（仅验签端兼容历史 token，签发端不再产出），
   过渡期结束后 cleanup PR 删除。
 

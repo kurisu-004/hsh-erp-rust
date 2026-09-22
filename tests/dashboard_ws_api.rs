@@ -256,15 +256,8 @@ async fn spawn_ws_server() -> (String, Arc<hsh_erp_rust::state::AppState>) {
 /// 签发合法 access token + 写入 Redis session，使 dashboard WS 握手通过。
 async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
     use hsh_erp_rust::auth::session::{CachedUserProfile, TokenKind};
-    // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_seconds)`，
-    // 不再收 Claims；iat/nbf/jti/aud/typ 由函数内部填。
-    // 2026-09-23 重构：encode_access 返回三元组 `(token, jti, exp)`，jti 即为 Redis session
-    // key 后缀来源（`session:tok:<jti>`），无需再调用 `hash_token`。
-    // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_seconds)`，
-    // 不再收 Claims；iat/nbf/jti/aud/typ 由函数内部填。
-    // 2026-09-23 重构：encode_access 返回三元组 `(token, jti, exp)`，jti 即为 Redis session
-    // key 后缀来源（`session:tok:<jti>`），无需再调用 `hash_token`。
-    // 2026-09-23 重构：encode_access 第 2-7 参数改为 `(private_key, signing_kid, issuer, audience, subject, ttl_seconds)` —— RS256 + kid 多密钥轮换。
+    // 2026-09-23 重构：encode_access 第 2-7 参数改为 `(private_key, signing_kid, issuer, audience, subject, ttl_seconds)` —— RS256 + kid 多密钥轮换；
+    // 返回三元组 `(token, jti, exp)`，jti 即为 Redis session key 后缀来源（`session:tok:<jti>`），无需再调用 `hash_token`。
     let (token, jti, _exp) = encode_access(
         &state.config.jwt.private_key,
         &state.config.jwt.signing_kid,

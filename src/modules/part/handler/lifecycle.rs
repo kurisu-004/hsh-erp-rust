@@ -237,14 +237,15 @@ pub async fn recall_to_programming(
 }
 
 /// `GET /api/v2/parts/pending-programming`
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_pending_programming(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(query): Query<crate::modules::part::dto_crud::PartListQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_pending_programming(&mut *tx, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_pending_programming(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -313,26 +314,28 @@ pub async fn receive_from_outsource_to_inspection(
 }
 
 /// `GET /api/v2/parts/outsource-in-flight`
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_outsource_in_flight(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(query): Query<crate::modules::part::dto_crud::PartListQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_outsource_in_flight(&mut *tx, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_outsource_in_flight(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `GET /api/v2/parts/outsource-sendable`
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_outsource_sendable(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Query(query): Query<crate::modules::part::dto_crud::PartListQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_outsource_sendable(&mut *tx, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_outsource_sendable(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -451,43 +454,46 @@ pub async fn pick_up(
 }
 
 /// `GET /api/v2/parts/by-work-type/{work_type_id}`
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_by_work_type(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(work_type_id): Path<i64>,
     Query(query): Query<ByWorkTypeQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_by_work_type(&mut *tx, work_type_id, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_by_work_type(&mut *conn, work_type_id, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `GET /api/v2/parts/pickable-by-work-type/{work_type_id}`
 ///
 /// 「可领取」列表（与 by-work-type 同形，但限定 shelf.zone=PRODUCTION + active）。
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_pickable_by_work_type(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(work_type_id): Path<i64>,
     Query(query): Query<ByWorkTypeQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
+    let mut conn = state.pool.acquire().await?;
     let out =
-        PartService::list_pickable_by_work_type(&mut *tx, work_type_id, &query, &current).await?;
-    tx.commit().await?;
+        PartService::list_pickable_by_work_type(&mut *conn, work_type_id, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `GET /api/v2/parts/by-worker/{worker_id}`
+///
+/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_by_worker(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(worker_id): Path<i64>,
     Query(query): Query<ByWorkerQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::list_by_worker(&mut *tx, worker_id, &query, &current).await?;
-    tx.commit().await?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::list_by_worker(&mut *conn, worker_id, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
