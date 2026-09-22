@@ -23,6 +23,7 @@ use crate::infra::cos::CosClient;
 use crate::infra::python_sts::PythonSts;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsHub;
+use crate::middleware::idempotency::IdempotencyStore;
 use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
@@ -128,6 +129,10 @@ pub struct AppState {
     /// AppState。字段仅 `snowflake`；handler 借 `&mut *tx` / `&mut *conn`
     /// 喂给 `DeliveryNoteRepoTrait`。
     pub delivery_group_service: Arc<DeliveryGroupService>,
+    /// 2026-09-23 新增 Idempotency 中间件存储：POST/PUT/PATCH 重复请求的响应缓存后端。
+    /// 生产走 `RedisIdempotencyStore`（共用 session 同池 `redis_pool`）；
+    /// 测试可换 `InMemoryIdempotencyStore` / `NoopIdempotencyStore`。
+    pub idempotency_store: Arc<dyn IdempotencyStore>,
 }
 
 impl AppState {
@@ -142,6 +147,8 @@ impl AppState {
         shutdown: CancellationToken,
         session: Arc<dyn SessionStore>,
         upload_session_repo: Arc<dyn UploadSessionRepo>,
+        // 2026-09-23 新增 Idempotency 中间件存储
+        idempotency_store: Arc<dyn IdempotencyStore>,
     ) -> Self {
         // 装线（2026-09-21 事务分层重构后无 IamUowProvider）：
         // AccountService::new(snowflake) → SessionService::new(config, session, account_service)
@@ -209,6 +216,8 @@ impl AppState {
             dashboard_service,
             delivery_note_service,
             delivery_group_service,
+            // 2026-09-23 新增 Idempotency 中间件存储
+            idempotency_store,
         }
     }
 }

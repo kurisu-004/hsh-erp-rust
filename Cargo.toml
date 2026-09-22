@@ -82,6 +82,11 @@ async-trait = "0.1"                                               # CosClient dy
 futures-util = "0.3"                                              # ws StreamExt/SinkExt
 dashmap = "6"                                                     # ws 连接注册表
 
+# 2026-09-23 新增 Idempotency 中间件：`IdempotencyStore` trait 在主二进制也
+# 需要 `#[automock]`（与 `CosClient` / `SessionStore` 模式一致），故 mockall
+# 上移到主依赖而非仅 dev-deps。
+mockall = "0.15"
+
 # Excel 模板（送货单打印，P4）
 # 任务说明强制指定 umya-spreadsheet = "2"；最新 3.x 已移除 get_* 弃用方法，
 # 需重写代码。这里先用 "2" 走通后续 P4 实施；后续可统一升级 + 评估。
@@ -155,7 +160,7 @@ tower = { version = "0.5", features = ["util"] }
 # 2026-09-18 auth+user DI 重构（Wave 1A/T1）：service 单测在 src/modules/{auth,user}/service_tests.rs
 # 用 mockall 对 repo trait / SessionStore / UowProvider 做 automock；测试零数据库依赖。
 # 注：plan v4 §3 写 `mockall = "1"`，实际 crates.io 最新是 0.15.0（无 1.x 发布）；按现行版本落地。
-mockall = "0.15"
+# 2026-09-23 注：mockall 已上移到主依赖（IdempotencyStore automock），dev-deps 仅保留注释。
 
 # 2026-09-15 followup-cleanup A4：dashboard WS E2E 测试用真实 socket 客户端连接
 # ws://127.0.0.1:<random>/ws/dashboard?token=<JWT>。版本对齐 axum 0.8 已传递依赖

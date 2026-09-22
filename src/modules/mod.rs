@@ -103,8 +103,13 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 2026-09-20 新增：JWT 验证统一走中间件（详见 auth::middleware）
         // 2026-09-22 重构：`auth_middleware` → `authenticate_middleware`（全词化）。
         .route_layer(axum::middleware::from_fn_with_state(
-            state,
+            state.clone(),
             crate::auth::middleware::authenticate_middleware,
+        ))
+        // 2026-09-23 新增 Idempotency 中间件挂载
+        .route_layer(axum::middleware::from_fn_with_state(
+            state,
+            crate::middleware::idempotency::idempotency_middleware,
         ))
 }
 

@@ -40,6 +40,10 @@ pub struct AppConfig {
     pub request_timeout_seconds: u64,
     /// 2026-09-18 新增：上传会话域配置（Redis 会话机制 + python STS 转发）。
     pub upload_session: UploadSessionConfig,
+    /// 2026-09-23 新增 Idempotency 中间件 TTL（秒）：POST/PUT/PATCH 带
+    /// `Idempotency-Key` header 的请求，缓存响应在 Redis 中的过期时间。
+    /// 环境变量 `IDEMPOTENCY_TTL_SECONDS`，缺省 `86400`（24h）。
+    pub idempotency_ttl_seconds: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -365,6 +369,8 @@ impl AppConfig {
                     600i64,
                 )?,
             },
+            // 2026-09-23 新增 Idempotency 中间件 TTL（秒）。
+            idempotency_ttl_seconds: env_parse("IDEMPOTENCY_TTL_SECONDS", 86_400u64)?,
         })
     }
 }

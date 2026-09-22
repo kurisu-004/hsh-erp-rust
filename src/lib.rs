@@ -6,6 +6,8 @@
 
 pub mod auth;
 pub mod infra;
+// 2026-09-23 新增 Idempotency 中间件
+pub mod middleware;
 pub mod modules;
 pub mod shared;
 pub mod state;

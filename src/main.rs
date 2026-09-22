@@ -41,6 +41,7 @@ use hsh_erp_rust::infra::python_sts::{HttpPythonSts, NoopPythonSts, PythonSts};
 use hsh_erp_rust::infra::redis;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
+use hsh_erp_rust::middleware::idempotency::{IdempotencyStore, RedisIdempotencyStore};
 use hsh_erp_rust::modules;
 use hsh_erp_rust::modules::upload_session::repo::{RedisUploadSessionRepo, UploadSessionRepo};
 use hsh_erp_rust::state::AppState;
@@ -125,12 +126,18 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 6.5 Redis 连接池 + 服务端 session 存储（生产必走 Redis；NoopSessionStore 仅测试 fixture 用）
-    let (session, upload_session_repo): (Arc<dyn SessionStore>, Arc<dyn UploadSessionRepo>) = {
+    let (session, upload_session_repo, idempotency_store): (
+        Arc<dyn SessionStore>,
+        Arc<dyn UploadSessionRepo>,
+        Arc<dyn IdempotencyStore>,
+    ) = {
         let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
-        info!("Redis session 存储 + upload_session 存储已就绪");
+        info!("Redis session 存储 + upload_session 存储 + idempotency 缓存已就绪");
         (
             Arc::new(RedisSessionStore::new(redis_pool.clone())),
-            Arc::new(RedisUploadSessionRepo::new(redis_pool)),
+            Arc::new(RedisUploadSessionRepo::new(redis_pool.clone())),
+            // 2026-09-23 新增 Idempotency 中间件：与 session 同池共享
+            Arc::new(RedisIdempotencyStore::new(redis_pool)),
         )
     };
 
@@ -155,6 +162,8 @@ async fn main() -> anyhow::Result<()> {
         shutdown.clone(),
         session,
         upload_session_repo,
+        // 2026-09-23 新增 Idempotency 中间件存储
+        idempotency_store.clone(),
     ));
 
     // 9. 启动后台任务
