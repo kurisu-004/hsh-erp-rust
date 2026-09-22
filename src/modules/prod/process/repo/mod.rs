@@ -9,7 +9,8 @@
 //!
 //! ## 为什么 trait 命名为 `ProcessRepoTrait`（带 `Trait` 后缀）
 //! 跨模块静态调用方 `prod::worker_pool/service.rs` /
-//! `prod::work_type/process_mapping.rs` / `shelf::service/picker.rs`（注释）/ 共 3+ 处
+//! `prod::work_type/service.rs`（2026-09-22 PR6 起，process_mapping 合入 service） /
+//! `shelf::service/picker.rs`（注释）/ 共 3+ 处
 //! 直接走 ZST 静态方法 `ProcessRepo::xxx(&mut *conn, ...)`，本任务**不能**破坏
 //! `prod::process::repo::ProcessRepo` 作为 ZST 的对外身份，故 trait 改名
 //! `ProcessRepoTrait`（与 shelf / customer / process_chain / work_type 同形）：

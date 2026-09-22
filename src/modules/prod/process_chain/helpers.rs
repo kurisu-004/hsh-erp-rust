@@ -1,3 +1,5 @@
+//! 2026-09-22 PR6：改名自 `statemachine.rs`（本文件内容非状态机，仅 helper 集合）。
+//!
 //! process_chain 域纯函数（无 DB、无 IO）
 //!
 //! 当前阶段只放 sort_order 间隙检测 / 重排 helper；将来如有 sort 精度耗尽（差值=1）
