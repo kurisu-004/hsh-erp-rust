@@ -43,15 +43,10 @@ pub struct AppConfig {
 pub struct RedisConfig {
     /// 完整 Redis URL（优先 `REDIS_URL`，否则从 `REDIS_HOST/PORT/DB/PASSWORD` 拼接）
     pub url: String,
-    /// session 条目 TTL（秒），对应 JWT `access_ttl_hours` 的预期寿命；滑动窗口
+    /// session 条目 TTL（秒），对应 JWT `access_ttl_seconds` 的预期寿命；滑动窗口
     pub session_ttl_seconds: u64,
     /// 连接池上限
     pub pool_max_size: usize,
-    /// 是否在 extractor 中校验 Redis 服务端 session。
-    /// 关掉后，main.rs 不建连接池；所有 session 写入走 no-op store；
-    /// 适用于 Rust 借 Python JWT 的迁移过渡期。
-    /// 环境变量 `REDIS_SESSION_CHECK_ENABLED`，缺省 `true`。
-    pub session_check_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -61,7 +56,7 @@ pub struct JwtConfig {
     /// JWT `aud` 校验目标（2026-09-22 新增：删 Python v1 兼容后 Rust 自签 token 强绑定 audience）。
     /// 环境变量 `JWT_AUDIENCE`，缺省 `hsh-erp-rust`。
     pub audience: String,
-    pub access_ttl_hours: i64,
+    pub access_ttl_seconds: i64,
     pub refresh_ttl_days: i64,
 }
 
@@ -187,7 +182,7 @@ impl AppConfig {
                 issuer: env_or("JWT_ISSUER", "myerp"),
                 // 2026-09-22 新增：audience 强校验（删 Python v1 兼容后改回硬绑定）。
                 audience: env_or("JWT_AUDIENCE", "hsh-erp-rust"),
-                access_ttl_hours: env_parse("JWT_ACCESS_TOKEN_EXPIRE_HOURS", 12)?,
+                access_ttl_seconds: env_parse("JWT_ACCESS_TOKEN_EXPIRE_SECONDS", 900)?,
                 refresh_ttl_days: env_parse("JWT_REFRESH_TOKEN_EXPIRE_DAYS", 7)?,
             },
 
@@ -264,11 +259,10 @@ impl AppConfig {
 
             redis: RedisConfig {
                 url: build_redis_url(),
-                // 默认 12h，对齐 JWT_ACCESS_TOKEN_EXPIRE_HOURS=24 的常见一半；
+                // 默认 15min（900s），可通过 JWT_ACCESS_TOKEN_EXPIRE_SECONDS 覆盖
                 // Redis 滑动 TTL 在 extractor 中 EXPIRE 续期
-                session_ttl_seconds: env_parse("REDIS_SESSION_TTL_SECONDS", 43_200u64)?,
+                session_ttl_seconds: env_parse("REDIS_SESSION_TTL_SECONDS", 900u64)?,
                 pool_max_size: env_parse("REDIS_POOL_MAX_SIZE", 10usize)?,
-                session_check_enabled: env_bool("REDIS_SESSION_CHECK_ENABLED", true)?,
             },
             delivery_note_template_dir: PathBuf::from(env_or(
                 "DELIVERY_NOTE_TEMPLATE_DIR",

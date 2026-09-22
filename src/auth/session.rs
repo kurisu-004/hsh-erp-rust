@@ -45,7 +45,7 @@ pub enum TokenKind {
 /// ⚠️ 2026-09-22 部署注意：`profile` 是从旧字段名 `cached` 重命名而来，
 /// 线上已存在的 Redis session entry（JSON 含 `cached` 字段）反序列化会失败，
 /// 上线前需清空 Redis session DB（`FLUSHDB` 或选择性删除 `session:tok:*`），
-/// 否则已登录用户在 session TTL（默认 12h）内持续 5xx（50000 INTERNAL）。
+/// 否则已登录用户在 session TTL（默认 15min / 900s）内持续 5xx（50000 INTERNAL）。
 /// 详见 `docs/api/index.md`「部署顺序」段。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedSession {
@@ -262,9 +262,9 @@ impl SessionStore for RedisSessionStore {
     }
 }
 
-/// No-op 实现：用 Rust 自签 JWT 但禁用服务端 session 校验时可关闭（迁移早期或临时
-/// 调试用）。所有写入和读取都是 no-op；extractor 中通过 `state.config.redis.session_check_enabled`
-/// gate，**完全不会调到**这些实现，但 trait 仍要求实现以保持 `Arc<dyn SessionStore>` 类型一致。
+/// No-op 实现：所有写入和读取都是 no-op。服务路径下 extractor 不会调到本实现
+/// （生产已统一走 `RedisSessionStore`）；仅供 service 单元测试 fixture 用，
+/// 但 trait 仍要求实现以保持 `Arc<dyn SessionStore>` 类型一致。
 pub struct NoopSessionStore;
 
 impl NoopSessionStore {
@@ -292,7 +292,7 @@ impl SessionStore for NoopSessionStore {
     ) -> Result<(), AppError> {
         // 借用 JWT 时不该有写入；打 warn 以便误用时可见
         tracing::warn!(
-            "NoopSessionStore::create_session 被调用（REDIS_SESSION_CHECK_ENABLED=false）"
+            "NoopSessionStore::create_session 被调用（仅测试 fixture，生产不应到达）"
         );
         Ok(())
     }

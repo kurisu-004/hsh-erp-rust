@@ -57,8 +57,7 @@ pub struct AppState {
     /// Redis 服务端 session 真相源（access/refresh token 吊销）
     pub session: Arc<dyn SessionStore>,
     /// 2026-09-18 新增：上传会话 Redis 存储（`upload_session:{user_id}:{scope}` 键）。
-    /// 与 `session` 同池（共用 `state.redis_pool`），通过 `cfg.redis.session_check_enabled`
-    /// 决定真实 Redis 实现还是 Noop 占位。
+    /// 与 `session` 同池（共用 `state.redis_pool`）；真实 Redis 实现；上传会话由 Redis TTL 约束。
     pub upload_session_repo: Arc<dyn UploadSessionRepo>,
     /// 2026-09-19 IAM 域合并：原 `user_service` 重命名为 `account_service`，承载
     /// 账号 CRUD + 角色管理 + 改密（service::AccountService，原 UserService）。

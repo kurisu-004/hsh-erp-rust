@@ -130,12 +130,9 @@ impl UploadSessionRepo for RedisUploadSessionRepo {
 
 /// No-op 实现：与 `auth::NoopSessionStore` 同模式。
 ///
-/// 用于 `REDIS_SESSION_CHECK_ENABLED=false` 时（Rust 借 Python JWT 过渡期）；
-/// 此时 `state.session` 已是 NoopSessionStore，`UploadSessionRepo` 也跟随失效。
-///
-/// 但 `upload_session` 域必须依赖 Redis 才能工作，所以 Noop 实现返回 `Ok(None)` /
-/// `Ok(false)` 让所有写入静默成功，**配合上游禁用**（service 层应在 AppState 装配时
-/// 根据 `redis.session_check_enabled` 选择 Redis 或 Noop；本类型仅供 trait 一致性）。
+/// 仅供 service 单元测试 fixture 用（trait 一致性）；生产路径已统一走 `RedisUploadSessionRepo`。
+/// 所有写入 / 读取静默成功 / 返回 `None` / `false`，依赖此实现的 service 调用方需自行
+/// 评估是否能在 no-op 环境下跑通（典型场景：仅测纯逻辑分支的 service）。
 ///
 /// 2026-09-18 新增。
 pub struct NoopUploadSessionRepo;
@@ -153,7 +150,7 @@ impl UploadSessionRepo for NoopUploadSessionRepo {
         tracing::warn!(
             user_id = _session.user_id,
             scope = %_session.scope,
-            "NoopUploadSessionRepo::put 被调用（REDIS_SESSION_CHECK_ENABLED=false），session 未真实写入"
+            "NoopUploadSessionRepo::put 被调用（仅测试 fixture），session 未真实写入"
         );
         Ok(())
     }

@@ -13,6 +13,8 @@
 //!     7. ws_e2e_valid_token_receives_heartbeat_text — ≤ 心跳间隔 + 5s 收 WsHeartbeatMsg text
 //!                                                  （非 protocol-level Ping 帧；
 //!                                                  浏览器 JS `onmessage` 可直接收到）
+//!
+//! 测试栈：必须建 Redis pool，session 写入才算「已吊销」
 
 #[path = "common/mod.rs"]
 mod common;
@@ -254,7 +256,7 @@ async fn spawn_ws_server() -> (String, Arc<hsh_erp_rust::state::AppState>) {
 /// 签发合法 access token + 写入 Redis session，使 dashboard WS 握手通过。
 async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
     use hsh_erp_rust::auth::session::{CachedUserProfile, TokenKind};
-    // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_hours)`，
+    // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_seconds)`，
     // 不再收 Claims；iat/nbf/jti/aud/typ 由函数内部填。
     // 2026-09-23 重构：encode_access 返回三元组 `(token, jti, exp)`，jti 即为 Redis session
     // key 后缀来源（`session:tok:<jti>`），无需再调用 `hash_token`。
@@ -263,10 +265,10 @@ async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i6
         &state.config.jwt.issuer,
         &state.config.jwt.audience,
         user_id,
-        state.config.jwt.access_ttl_hours,
+        state.config.jwt.access_ttl_seconds,
     )
     .expect("encode_access");
-    // 写 Redis session，让 session_check_enabled=true 时 ws_dashboard 不返 40105。
+    // 写 Redis session，让 ws_dashboard 握手时 session 校验通过（不返 40105）。
     // 2026-09-22 重构：`CachedCurrentUser` → `CachedUserProfile`（删 id 字段）。
     let profile = CachedUserProfile {
         username: "ws-tester".to_string(),

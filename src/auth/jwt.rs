@@ -1,7 +1,7 @@
 //! JWT 双 token 编解码（2026-09-22 重构）
 //!
 //! ## token 类型
-//! - `access_token`：短 TTL（默认 12h），payload 仅含 RFC 7519 标准字段（sub/aud/iat/nbf/exp/iss/jti/typ）。
+//! - `access_token`：短 TTL（默认 15min = 900s），payload 仅含 RFC 7519 标准字段（sub/aud/iat/nbf/exp/iss/jti/typ）。
 //!   **不携带**业务字段（username/roles/shelf_ids/...），全部改走 Redis session 校验 +
 //!   服务端缓存。
 //! - `refresh_token`：长 TTL（默认 7d），payload 在 access 字段基础上额外带 `refresh_version`
@@ -126,10 +126,10 @@ pub fn encode_access(
     issuer: &str,
     audience: &str,
     subject: i64,
-    ttl_hours: i64,
+    ttl_seconds: i64,
 ) -> Result<(String, String, i64), AppError> {
     let now = Utc::now().timestamp();
-    let exp = now + ttl_hours * 3600;
+    let exp = now + ttl_seconds;
     let jti = Uuid::new_v4().to_string();
     let claims = AccessTokenClaims {
         subject,
@@ -258,11 +258,11 @@ pub fn issue_token_pair(
     secret: &str,
     issuer: &str,
     audience: &str,
-    access_ttl_hours: i64,
+    access_ttl_seconds: i64,
     refresh_ttl_days: i64,
 ) -> Result<TokenPair, AppError> {
     let (access_token, access_jti, access_exp) =
-        encode_access(secret, issuer, audience, subject, access_ttl_hours)?;
+        encode_access(secret, issuer, audience, subject, access_ttl_seconds)?;
     let (refresh_token, refresh_jti, refresh_exp) = encode_refresh(
         secret,
         issuer,

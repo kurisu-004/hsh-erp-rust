@@ -176,7 +176,7 @@ impl SessionService {
             &self.config.jwt.secret,
             &self.config.jwt.issuer,
             &self.config.jwt.audience,
-            self.config.jwt.access_ttl_hours,
+            self.config.jwt.access_ttl_seconds,
             self.config.jwt.refresh_ttl_days,
         )?;
 
@@ -311,7 +311,7 @@ impl SessionService {
             &self.config.jwt.secret,
             &self.config.jwt.issuer,
             &self.config.jwt.audience,
-            self.config.jwt.access_ttl_hours,
+            self.config.jwt.access_ttl_seconds,
             self.config.jwt.refresh_ttl_days,
         )?;
 
