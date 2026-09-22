@@ -45,7 +45,7 @@ Response 200 `data`：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `token` | string | JWT access token（默认 12h） |
+| `token` | string | JWT access token（默认 15min / 900s） |
 | `refresh_token` | string | JWT refresh token（默认 7d） |
 | `user` | object | 见 [`GET /iam/me`](#get-apiv2iamme) |
 
@@ -139,16 +139,6 @@ Response 200 `data`：同 [`/iam/login`](#post-apiv2iamlogin)
 ### Session 域错误码补充
 
 - 40105 SESSION_REVOKED — 会话已被吊销（Redis 中不存在 / 已失效）。前端应清除本地 token 并跳回登录页。
-
-### 服务端 session 校验开关
-
-环境变量 `REDIS_SESSION_CHECK_ENABLED`（默认 `true`）控制 Rust 后端是否在每次请求中校验 Redis 服务端 session：
-
-- `true`（默认）：登录/refresh 时把 JWT jti 写入 Redis；每次请求查 Redis 校验；
-  logout/change_password 删 Redis 条目强制吊销。40105 SESSION_REVOKED 仍会触发。
-- `false`：不建 Redis 连接池；middleware 直接返 50000 INTERNAL（强制 prod 必须开启 Redis；
-  详见 src/auth/middleware.rs::verify_session_token）。业务场景：仅用于过渡期调试；
-  切回 `true` 后所有已发 token 必须重新登录。
 
 ---
 

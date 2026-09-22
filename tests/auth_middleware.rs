@@ -15,7 +15,7 @@
 //! 测试路径同步更新（PR-2026-09-19 prod 容器聚合）。
 //!
 //! 测试栈：tokio::test + tower::ServiceExt::oneshot + test_state_with_redis
-//! （session_check_enabled=true → 必须建 Redis pool，session 写入才算「已吊销」）
+//! （必须建 Redis pool，session 写入才算「已吊销」）
 
 #[path = "common/mod.rs"]
 mod common;
@@ -80,7 +80,7 @@ fn json_request(
 
 /// 签发合法 access token 但**不**写 Redis session（用于 case 4）。
 async fn mint_token_no_session(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
-    // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_hours)`，
+    // 2026-09-22 重构：encode_access 签名改为 `(secret, issuer, audience, subject, ttl_seconds)`，
     // 不再收 Claims；iat/nbf/jti/aud/typ 由函数内部填。直接调用即可。
     // 2026-09-23 重构：encode_access 返回 `(token, jti, exp)` 三元组；本 helper 不写
     // Redis session，丢弃 jti 即可。
@@ -89,7 +89,7 @@ async fn mint_token_no_session(state: &Arc<hsh_erp_rust::state::AppState>, user_
         &state.config.jwt.issuer,
         &state.config.jwt.audience,
         user_id,
-        state.config.jwt.access_ttl_hours,
+        state.config.jwt.access_ttl_seconds,
     )
     .expect("encode_access");
     token

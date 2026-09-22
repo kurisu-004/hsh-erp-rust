@@ -25,7 +25,7 @@ Request：
 握手流程：
 
 1. 解 JWT + 验签（`iss` 绑定 `config.jwt.issuer`，`exp` 校验）。
-2. 若 `REDIS_SESSION_CHECK_ENABLED=true`：查 Redis `session:tok:<jti>` 必须存在；缺失 → 40105 `SESSION_REVOKED`。
+2. 服务端强制 session 校验：查 Redis `session:tok:<jti>` 必须存在；缺失 → 40105 `SESSION_REVOKED`。
    （2026-09-23 重构：Redis session key 由 sha256(token) 改为 JWT claims.jwt_id（UUID v4），
    直接以 jti 作为 key 后缀，**不**对 token 做哈希。）
 3. `WebSocketUpgrade.on_upgrade` 触发 upgrade；失败（如 token 无效）走 axum normal response（HTTP 4xx + JSON 信封）。

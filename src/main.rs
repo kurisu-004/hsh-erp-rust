@@ -32,7 +32,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use hsh_erp_rust::auth::session::{NoopSessionStore, RedisSessionStore, SessionStore};
+use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::AppConfig;
 use hsh_erp_rust::infra::cos::CosClient;
 use hsh_erp_rust::infra::cos_opendal::build_cos_client;
@@ -42,9 +42,7 @@ use hsh_erp_rust::infra::redis;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::modules;
-use hsh_erp_rust::modules::upload_session::repo::{
-    NoopUploadSessionRepo, RedisUploadSessionRepo, UploadSessionRepo,
-};
+use hsh_erp_rust::modules::upload_session::repo::{RedisUploadSessionRepo, UploadSessionRepo};
 use hsh_erp_rust::state::AppState;
 use hsh_erp_rust::task;
 
@@ -126,25 +124,15 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(NoopPythonSts)
     };
 
-    // 6.5 Redis 连接池 + 服务端 session 存储
-    // 关掉后使用 NoopSessionStore（不连 Redis）；适用于 Rust 借 Python JWT 的过渡期
-    let (session, upload_session_repo): (Arc<dyn SessionStore>, Arc<dyn UploadSessionRepo>) =
-        if config.redis.session_check_enabled {
-            let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
-            info!("Redis session 存储 + upload_session 存储已就绪");
-            (
-                Arc::new(RedisSessionStore::new(redis_pool.clone())),
-                Arc::new(RedisUploadSessionRepo::new(redis_pool)),
-            )
-        } else {
-            info!(
-                "REDIS_SESSION_CHECK_ENABLED=false，跳过 Redis 连接，使用 NoopSessionStore + NoopUploadSessionRepo"
-            );
-            (
-                Arc::new(NoopSessionStore::new()),
-                Arc::new(NoopUploadSessionRepo),
-            )
-        };
+    // 6.5 Redis 连接池 + 服务端 session 存储（生产必走 Redis；NoopSessionStore 仅测试 fixture 用）
+    let (session, upload_session_repo): (Arc<dyn SessionStore>, Arc<dyn UploadSessionRepo>) = {
+        let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
+        info!("Redis session 存储 + upload_session 存储已就绪");
+        (
+            Arc::new(RedisSessionStore::new(redis_pool.clone())),
+            Arc::new(RedisUploadSessionRepo::new(redis_pool)),
+        )
+    };
 
     // 7. 优雅退出令牌
     let shutdown = CancellationToken::new();

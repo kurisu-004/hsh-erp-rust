@@ -89,7 +89,7 @@ HTTP 状态码：
 
 - Header：`Authorization: Bearer <access_token>`
 - 各端点小节里**标注"权限: 公开"**的端点无需登录；其余均需 Bearer JWT
-- access token 默认 12h 过期；refresh token 默认 7d
+- access token 默认 15min（900s）过期；refresh token 默认 7d
 - **JWT 载荷（2026-09-22 重构）**：仅含 RFC 7519 标准字段——
   - `sub`：用户 snowflake id（i64）
   - `aud`：受众，固定 `hsh-erp-rust`
@@ -107,13 +107,7 @@ HTTP 状态码：
   条目才视为有效。`CurrentUser` extractor 在 JWT 验签后额外查 Redis；
   查不到 → 40105 SESSION_REVOKED。登出（删当前 token 条目）、改密 / 管理员停用
   （清整个用户 Set `sessions:user:<id>`）都会触发吊销。前端拿到 40105 应清本地
-  token 并跳回登录页。session 条目默认 TTL 12h，每次成功访问会 EXPIRE 续期（滑动窗口）。
-
-> ⚠️ 当 `REDIS_SESSION_CHECK_ENABLED=false` 时，access token 不再携带业务字段，
-> 服务端无法从 JWT 重建 `CurrentUser` —— middleware 直接返 **50000 INTERNAL**
-> （2026-09-22 重构：原 40105 SESSION_REVOKED 语义已迁；40105 只用于「真源已吊销」
-> 场景）。这是**部署/配置问题**，5xxxx 让运维感知而非用户被踢下线困惑。
-> session 写入也走 no-op store。
+  token 并跳回登录页。session 条目默认 TTL 15min（900s），每次成功访问会 EXPIRE 续期（滑动窗口）。
 
 ### 五角色 RBAC
 
@@ -264,17 +258,14 @@ HTTP 状态码：
 1. **推荐（先清后发版）**：发版前停服务 → `redis-cli -h <host> FLUSHDB`
    （或选择性删除 `session:tok:*` + `sessions:user:*`）→ 起新版本。
 2. **滚动发布（接受短暂 5xx）**：先发版后清 Redis——已登录用户会在
-   `session_check_enabled=true` 路径下持续 5xx（50000 INTERNAL）直到 session TTL
-   自然到期（默认 12h）或主动清 Redis。
-3. **配置错误码**：若部署时 `REDIS_SESSION_CHECK_ENABLED=false`，所有受保护端点
-   都会返 50000 INTERNAL（不再是 40105 SESSION_REVOKED；详见
-   `src/auth/middleware.rs::verify_session_token`）。运维应立即检查 env 配置。
+   session 校验路径下持续 5xx（50000 INTERNAL）直到 session TTL
+   自然到期（默认 15min）或主动清 Redis。
 
 > 2026-09-23 重构：本轮 Redis session key 从 sha256(token) 改为 JWT jti（UUID v4），
 > key 形状由 `session:tok:<sha256>` 变为 `session:tok:<jti>`。本改造**不涉及**
-> `CachedSession` 字段 rename，旧 key 上的 session 在 12h TTL 内自然过期，不需要
+> `CachedSession` 字段 rename，旧 key 上的 session 在 15min TTL 内自然过期，不需要
 > 数据迁移；上线顺序：先发 backend-rust（新代码读写新 jti key，旧 sha256 key 上的
-> session 随 TTL 12h 自然清空），再发 frontend（无协议变化），过渡期所有用户需重新登录。
+> session 随 TTL 15min 自然清空），再发 frontend（无协议变化），过渡期所有用户需重新登录。
 
 ---
 

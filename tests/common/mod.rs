@@ -466,7 +466,7 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             issuer: "hsh-erp-test".to_string(),
             // 2026-09-22 新增 audience 字段（与生产 `hsh-erp-rust` 对齐；测试用独立值便于排查）
             audience: "hsh-erp-rust-test".to_string(),
-            access_ttl_hours: 12,
+            access_ttl_seconds: 900,
             refresh_ttl_days: 7,
         },
         cos: CosConfig {
@@ -499,7 +499,6 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             url: test_redis_url(),
             session_ttl_seconds: 3600,
             pool_max_size: 5,
-            session_check_enabled: true,
         },
         max_request_body_size: 314_572_800,
         auto_complete: AutoCompleteConfig {
@@ -546,13 +545,10 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     ))
 }
 
-/// 构造测试用 AppState：session check **关闭**，**不**建 Redis 池。
+/// service 单元测试 fixture：显式注入 `NoopSessionStore` + `NoopUploadSessionRepo`，
+/// 不依赖 Redis 进程存在。
 ///
-/// 用途：验证 `REDIS_SESSION_CHECK_ENABLED=false` 时，`auth::middleware::verify_session_token`
-/// 的关闭分支直接返 `AppError::internal(...)`（50000 INTERNAL），不依赖 Redis 进程存在；
-/// session check 关闭后走 HTTP middleware 的所有请求会立刻 500，不可用于 HTTP 集成测试。
-///
-/// 仅供 service 层单测用；当前 caller：auto_complete_api / part_crud。
+/// 当前 caller：auto_complete_api / part_crud（service 层单测，不发 HTTP）。
 /// 其它 HTTP integration test 不引用 —— 故 `dead_code` 抑制。
 #[allow(dead_code)]
 pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
@@ -564,7 +560,7 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             issuer: "hsh-erp-test".to_string(),
             // 2026-09-22 新增 audience 字段（与生产 `hsh-erp-rust` 对齐；测试用独立值便于排查）
             audience: "hsh-erp-rust-test".to_string(),
-            access_ttl_hours: 12,
+            access_ttl_seconds: 900,
             refresh_ttl_days: 7,
         },
         cos: CosConfig {
@@ -595,7 +591,6 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             url: test_redis_url(),
             session_ttl_seconds: 3600,
             pool_max_size: 5,
-            session_check_enabled: false,
         },
         max_request_body_size: 314_572_800,
         auto_complete: AutoCompleteConfig {
@@ -675,7 +670,7 @@ pub async fn test_state_with_cos(
             issuer: "hsh-erp-test".to_string(),
             // 2026-09-22 新增 audience 字段（与生产 `hsh-erp-rust` 对齐；测试用独立值便于排查）
             audience: "hsh-erp-rust-test".to_string(),
-            access_ttl_hours: 12,
+            access_ttl_seconds: 900,
             refresh_ttl_days: 7,
         },
         cos: CosConfig {
@@ -704,7 +699,6 @@ pub async fn test_state_with_cos(
             url: test_redis_url(),
             session_ttl_seconds: 3600,
             pool_max_size: 5,
-            session_check_enabled: true,
         },
         max_request_body_size: 314_572_800,
         auto_complete: AutoCompleteConfig {
