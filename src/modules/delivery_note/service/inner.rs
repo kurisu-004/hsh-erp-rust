@@ -2,6 +2,10 @@
 //!
 //! 全部以 `pub(super)` 暴露给 `service/` 下的兄弟模块（`group` / `crud` /
 //! `lifecycle` / `scan` / `print`）。本文件不对外导出。
+//!
+//! 2026-09-22 D-5 重构：保持 `pub(super) async fn xxx(conn: &mut PgConnection, ...)`
+//! 私有 helper 形态——内部 SQL 调用走 trait 方法（`DeliveryNoteRepoTrait`）实现于
+//! `&mut PgConnection`，或走跨域 ZST 静态方法（`CustomerRepo` / `PartBatchRepo` 等）。
 
 use std::collections::{HashMap, HashSet};
 
@@ -13,6 +17,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::com::customer::model::TCustomer;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
@@ -21,7 +26,6 @@ use super::super::dto::{
     DeliveryNoteAddItem, DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut,
 };
 use super::super::model::{DeliveryNote, DeliveryNoteEvent, NoteScope};
-use super::super::repo::{DeliveryGroupRepo, DeliveryNoteEventRepo, DeliveryNoteRepo};
 
 // ===========================================================================
 //  types
@@ -49,6 +53,9 @@ const STATUS_READY_TO_SHIP: &str = "READY_TO_SHIP";
 // ===========================================================================
 
 /// 把 `Vec<DeliveryNote>` 转 `Vec<DeliveryNoteOut>`（批查客户 / 司机 / 范围名）。
+///
+/// 2026-09-22 D-5：内部 SQL 调用通过 trait 方法（`DeliveryNoteRepoTrait::xxx`）+ 跨域
+/// ZST 静态调用（`CustomerRepo::xxx` / `PartBatchRepo::xxx`）混合。
 pub(super) async fn build_note_outs(
     conn: &mut PgConnection,
     rows: &[DeliveryNote],
@@ -183,11 +190,10 @@ pub(super) async fn build_note_outs(
 
 /// `get_with_parts`：单子 + 批次行（行 = 批次）+ 装配件父行字段。
 pub(super) async fn get_with_parts(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     note_id: i64,
 ) -> Result<DeliveryNoteDetailOut, AppError> {
-    let n = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
-        .await?
+    let n = conn.note_get_by_id(note_id, false).await?
         .ok_or_else(|| note_not_found(note_id))?;
 
     let rows = PartBatchRepo::list_with_part_by_delivery_note(&mut *conn, note_id).await?;
@@ -298,7 +304,7 @@ pub(super) async fn get_with_parts(
 /// - `Group(gid)`：part.customer_id ∈ group.member_ids
 /// - `Leaf(cid)`：part.customer_id == leaf_customer_id
 pub(super) async fn check_scope(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     obj: &DeliveryNote,
     part_customer_id: i64,
 ) -> Result<(), AppError> {
@@ -307,7 +313,8 @@ pub(super) async fn check_scope(
         NoteScope::L1Wide => Ok(()),
         NoteScope::Group(gid) => {
             // 加载 group + members
-            let grp = DeliveryGroupRepo::get_by_id(&mut *conn, gid, false)
+            let grp = conn
+                .group_get_by_id(gid, false)
                 .await?
                 .ok_or_else(|| {
                     AppError::biz(
@@ -322,8 +329,9 @@ pub(super) async fn check_scope(
                     "group 与本单 L1 不匹配",
                 ));
             }
-            let members =
-                DeliveryGroupRepo::list_members_by_group_ids(&mut *conn, &[gid], false).await?;
+            let members = conn
+                .group_list_members_by_group_ids(&[gid], false)
+                .await?;
             if !members.iter().any(|m| m.customer_id == part_customer_id) {
                 return Err(AppError::biz(
                     code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH,
@@ -356,15 +364,14 @@ pub(super) fn scope_from_note(n: &DeliveryNote) -> NoteScope {
 
 /// add_parts 内部实现（被 create_draft 与 add_parts handler 复用）。
 pub(super) async fn add_parts_inner(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     snowflake: &SnowflakeIdGenerator,
     note_id: i64,
     items: &[DeliveryNoteAddItem],
     version: i32,
     current: &CurrentUser,
 ) -> Result<(), AppError> {
-    let obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
-        .await?
+    let obj = conn.note_get_by_id(note_id, false).await?
         .ok_or_else(|| note_not_found(note_id))?;
     if obj.version != version {
         return Err(note_version_conflict(note_id, obj.version, version));
@@ -460,7 +467,7 @@ pub(super) async fn add_parts_inner(
         // 批次挂单冲突
         if let Some(other_id) = batch.delivery_note_id
             && other_id != note_id
-            && let Some(other) = DeliveryNoteRepo::get_by_id(&mut *conn, other_id, false).await?
+            && let Some(other) = conn.note_get_by_id(other_id, false).await?
             && (other.status == STATUS_DRAFT || other.status == STATUS_SUBMITTED)
         {
             return Err(AppError::biz(
@@ -544,7 +551,7 @@ pub(super) async fn add_parts_inner(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn write_event(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     snowflake: &SnowflakeIdGenerator,
     note_id: i64,
     event_type: super::super::model::DeliveryNoteEventType,
@@ -564,7 +571,7 @@ pub(super) async fn write_event(
         created_by,
         created_at: now,
     };
-    DeliveryNoteEventRepo::add_event(&mut *conn, &ev).await?;
+    conn.event_add(&ev).await?;
     Ok(())
 }
 
@@ -621,7 +628,7 @@ pub(super) fn validate_group_name(raw: &str) -> Result<String, AppError> {
 }
 
 pub(super) async fn validate_l2_members(
-    conn: &mut PgConnection,
+    mut conn: &mut PgConnection,
     l1_id: &i64,
     ids: &[i64],
 ) -> Result<Vec<i64>, AppError> {
@@ -643,7 +650,8 @@ pub(super) async fn validate_l2_members(
                 ),
             ));
         }
-        if DeliveryGroupRepo::list_active_member_by_customer(&mut *conn, *raw_id)
+        if conn
+            .group_list_active_member_by_customer(*raw_id)
             .await?
             .is_some()
         {

@@ -1,5 +1,10 @@
 //! xlsx save-time XML post-patches（umya 2.3.3 缺失项补齐）。
 //!
+//! ## 2026-09-22 D-5 重构对齐
+//! 本文件不涉及 SQL——纯 XML 处理模块（绕开 umya 缺口的 patch）。不持有事务，
+//! 不调 `sqlx::query!`。设计上仅作为 [`super::print`] 的 helper：写完 xlsx 后
+//! 读 entry → patch → 写回 → 重命名。
+//!
 //! ## 缺口清单（P0 spike 验证）
 //!
 //! 1. **`<pageSetUpPr fitToPage="1"/>`**：umya 不暴露该 setter；Excel 仅当

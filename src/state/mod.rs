@@ -27,6 +27,7 @@ use crate::modules::cnc_program::service::CncProgramService;
 use crate::modules::com::applicant::service::ApplicantService;
 use crate::modules::com::customer::service::CustomerService;
 use crate::modules::dashboard::service::DashboardService;
+use crate::modules::delivery_note::service::{DeliveryGroupService, DeliveryNoteService};
 use crate::modules::iam::service::{AccountService, SessionService};
 use crate::modules::outsource::service::OutsourceService;
 use crate::modules::part_file::service::PartFileService;
@@ -111,12 +112,22 @@ pub struct AppState {
     /// 2026-09-22 D-6 新增：prod/worker_pool service 注入到 AppState。
     /// unit struct（无字段）；handler 借 `&mut *tx` / `&mut *conn` 喂给 service 静态方法。
     pub worker_pool_service: Arc<WorkerPoolService>,
-    /// 2026-09-22 Group E 新增：dashboard service（WS-only 大屏）。
+/// 2026-09-22 Group E 新增：dashboard service（WS-only 大屏）。
     /// unit struct（无字段）；handler 借 `&mut *tx` 喂给 `DashboardRepoTrait` trait
     /// （trait 已直接 `impl for &mut PgConnection`，与 iam 2026-09-22 / shelf 同形）。
     /// dashboard 域只有 snapshot 业务（WS upgrade 拉一次 snapshot + 订阅 ws_hub.broadcast），
     /// handler 三形态 ①（snapshot 单次只读聚合：pool.begin → service → commit）。
     pub dashboard_service: Arc<DashboardService>,
+    /// 2026-09-22 D-5 新增：delivery_note service（CRUD + 提交 / 拣货 / 扫码 /
+    /// 打印 / 分组）注入到 AppState。字段仅 `snowflake`；handler 借 `&mut *tx`
+    /// / `&mut *conn` 喂给 `DeliveryNoteRepoTrait`（trait 已直接 `impl for &mut
+    /// PgConnection`）。与 iam / shelf / customer 严格范本对齐（review 第 1 轮
+    /// D1 修正：service 形参由 `&mut PgConnection` 改 by-value trait）。
+    pub delivery_note_service: Arc<DeliveryNoteService>,
+    /// 2026-09-22 D-5 新增：delivery_note P1 分组 service（CRUD）注入到
+    /// AppState。字段仅 `snowflake`；handler 借 `&mut *tx` / `&mut *conn`
+    /// 喂给 `DeliveryNoteRepoTrait`。
+    pub delivery_group_service: Arc<DeliveryGroupService>,
 }
 
 impl AppState {
@@ -163,9 +174,14 @@ impl AppState {
         // 静态调用即可（与原 `WorkerPoolService` 调用形态一致，part 域
         // `part/handler/inspection.rs:298` 沿用）。
         let worker_pool_service = Arc::new(WorkerPoolService::new());
-        // 2026-09-22 Group E dashboard service 是 unit struct（WS-only，4 个聚合 trait call
+// 2026-09-22 Group E dashboard service 是 unit struct（WS-only，4 个聚合 trait call
         // 不需要任何字段依赖——雪花 ID 在 snapshot 里无新增，主键全部借用既有数据）。
         let dashboard_service = Arc::new(DashboardService);
+        // 2026-09-22 D-5 delivery_note service 装线：仅需 snowflake（事务 / WS
+        // 广播 / session 全部移交 handler；review 第 1 轮 D1 修正后 service
+        // 装线是 by-value trait 形参的硬性前提）。
+        let delivery_note_service = Arc::new(DeliveryNoteService::new(snowflake.clone()));
+        let delivery_group_service = Arc::new(DeliveryGroupService::new(snowflake.clone()));
         Self {
             pool,
             config,
@@ -190,6 +206,8 @@ impl AppState {
             process_service,
             worker_pool_service,
             dashboard_service,
+            delivery_note_service,
+            delivery_group_service,
         }
     }
 }

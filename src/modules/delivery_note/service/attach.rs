@@ -11,15 +11,14 @@
 //! 非法状态 5 类路径。
 
 use axum::http::StatusCode;
-use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
+use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part_batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{AttachBatchConflict, AttachBatchItem, AttachBatchesOut};
-use super::super::repo::DeliveryNoteRepo;
 use super::inner::note_not_found;
 use super::scan::is_attachable_state;
 
@@ -42,8 +41,12 @@ impl DeliveryNoteService {
     /// 3. 返回 `(attached, conflicts)`；handler 始终 200。
     ///
     /// 事务边界：handler `pool.begin()` → 这里 → handler `commit()`。本方法不 commit。
-    pub async fn attach_batches(
-        conn: &mut PgConnection,
+    ///
+    /// 2026-09-22 D-5 + review 第 1 轮：service 形参改 by-value trait（iam 严格范本）；
+    /// 跨域 ZST（`PartBatchRepo::xxx`）走 `&mut *repo.conn_mut()`。
+    pub async fn attach_batches<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
         items: Vec<AttachBatchItem>,
         current: &CurrentUser,
@@ -51,7 +54,8 @@ impl DeliveryNoteService {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
 
         // ===== Step 1: note 必须存在且为 DRAFT =====
-        let note = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let note = repo
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if note.status != STATUS_DRAFT {
@@ -71,7 +75,7 @@ impl DeliveryNoteService {
         let mut conflicts: Vec<AttachBatchConflict> = Vec::new();
 
         for item in items {
-            match PartBatchRepo::get_by_id(&mut *conn, item.batch_id, false).await? {
+            match PartBatchRepo::get_by_id(&mut *repo.conn_mut(), item.batch_id, false).await? {
                 None => conflicts.push(AttachBatchConflict {
                     batch_id: item.batch_id,
                     reason: "BATCH_NOT_FOUND".to_string(),
@@ -93,7 +97,7 @@ impl DeliveryNoteService {
                     }
 
                     let affected = PartBatchRepo::attach_to_note(
-                        &mut *conn,
+                        &mut *repo.conn_mut(),
                         item.batch_id,
                         item.version,
                         note_id,

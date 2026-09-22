@@ -23,6 +23,11 @@
 //! 2) `<alignment shrinkToFit="1"/>`（umya Alignment 没该字段）、
 //! 3) 把路达模板 I2 字符串日期转 `<c t="n" v="<serial>">`、4) 去重
 //! `_xlnm.Print_Aria`。详见 `print_xml_patch` 模块 docstring。
+//!
+//! ## 2026-09-22 D-5 重构对齐
+//! 本文件不涉及 SQL——纯 XML 模板处理模块（xlsx 生成 + 后处理）。事务由调用方
+//!（`service::print::print_xlsx`）持有；handler commit 之后才把 bytes 推给客户端。
+//! 不动 SQL 字符串（本文件无 `sqlx::query!` 调用）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

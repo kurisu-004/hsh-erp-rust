@@ -1,13 +1,27 @@
 //! DeliveryNoteService 状态流转与读视图（提交 / 撤回 / 拣货 / 软删 / 事件 / 候选）。
+//!
+//! ## 2026-09-22 D-5 + review 第 1 轮修正（service by-value trait）
+//! - 所有方法签名从 `pub async fn xxx(conn: &mut PgConnection, snowflake: &SnowflakeIdGenerator, ...)`
+//!   改成 `pub async fn xxx<R: DeliveryNoteRepoTrait>(&self, mut repo: R, ...)`——对齐
+//!   iam / shelf / customer 严格范本。snowflake 改为 `&self.snowflake`（service 装线
+//!   时一次性 set）。
+//! - 跨域 ZST 静态调用（`WorkerRepo::xxx` / `WorkTypeRepo::xxx` / `PartRepo::xxx` /
+//!   `PartBatchRepo::xxx` / `CustomerRepo::xxx`）走 `&mut *repo.conn_mut()` 借位
+//!   传入（与 part 域 D-6 conn_mut 模式一致）。
+//! - 跨域 service 委托（`PartService::sync_from_batch_change_with_conn`）走
+//!   `&mut *repo.conn_mut()` 同样模式。
+//! - 原 sqlx::query! 直调（如 `soft_delete` 的 UPDATE batches）走
+//!   `sqlx::query!(...).execute(&mut *repo.conn_mut())` 替换 `&mut *conn`。
+//! - 私有 helper（`build_note_outs` / `write_event`）签名仍收 `&mut PgConnection`——
+//!   helper 是同态私有 helper，调用方走 `&mut *repo.conn_mut()` 喂入（与 iam
+//!   `AccountService::assemble_user_out` 等私有 helper 一致）。
 
 use std::collections::{HashMap, HashSet};
 
-use sqlx::PgConnection;
-
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
-use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;
@@ -21,7 +35,6 @@ use super::super::dto::{
     DeliveryNotePickupScanOut, SubmitDeliveryOut, SubmitOutcomeDto, UnresolvedTargetDto,
 };
 use super::super::model::DeliveryNoteEventType;
-use super::super::repo::{DeliveryNoteEventRepo, DeliveryNoteRepo};
 use super::inner::{
     build_note_outs, note_not_found, note_version_conflict, scope_from_note, write_event,
 };
@@ -46,16 +59,17 @@ const CANDIDATE_LIMIT: i64 = 2000;
 impl DeliveryNoteService {
     // ---------- submit ----------
 
-    pub async fn submit(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn submit<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
         version: i32,
         current: &CurrentUser,
     ) -> Result<SubmitDeliveryOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let mut obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let mut obj = repo
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.version != version {
@@ -69,7 +83,8 @@ impl DeliveryNoteService {
         }
 
         // 已挂单批次 + part 展示字段（候选返回需要 serial_no / drawing_no / name）
-        let rows = PartBatchRepo::list_with_part_by_delivery_note(&mut *conn, note_id).await?;
+        let rows =
+            PartBatchRepo::list_with_part_by_delivery_note(&mut *repo.conn_mut(), note_id).await?;
         if rows.is_empty() {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_INVALID_VALUE,
@@ -152,8 +167,8 @@ impl DeliveryNoteService {
         obj.updated_by = Some(current.id);
 
         write_event(
-            conn,
-            snowflake,
+            &mut *repo.conn_mut(),
+            &self.snowflake,
             note_id,
             DeliveryNoteEventType::Submitted,
             Some(STATUS_DRAFT.to_string()),
@@ -163,17 +178,17 @@ impl DeliveryNoteService {
         )
         .await?;
 
-        let affected = DeliveryNoteRepo::update(&mut *conn, &obj).await?;
+        let affected = repo.note_update(&obj).await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 "concurrent modification detected",
             ));
         }
-        obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        obj = repo.note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
-        let out = build_note_outs(conn, std::slice::from_ref(&obj)).await?;
+        let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
         Ok(SubmitDeliveryOut {
             outcome: SubmitOutcomeDto::Submitted,
             note: Some(out.into_iter().next().unwrap()),
@@ -183,16 +198,17 @@ impl DeliveryNoteService {
 
     // ---------- recall ----------
 
-    pub async fn recall(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn recall<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
         version: i32,
         current: &CurrentUser,
     ) -> Result<super::super::dto::DeliveryNoteOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let mut obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let mut obj = repo
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.version != version {
@@ -207,13 +223,9 @@ impl DeliveryNoteService {
 
         // 同范围 DRAFT 撞唯一（设计 §3.3 / 21419）：如果存在另一张同范围的活跃 DRAFT 则拒
         let scope = scope_from_note(&obj);
-        if let Some(_other) = DeliveryNoteRepo::find_open_draft_by_scope(
-            &mut *conn,
-            obj.customer_id,
-            scope,
-            Some(note_id),
-        )
-        .await?
+        if let Some(_other) = repo
+            .note_find_open_draft_by_scope(obj.customer_id, scope, Some(note_id))
+            .await?
         {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_DRAFT_SCOPE_CONFLICT,
@@ -230,8 +242,8 @@ impl DeliveryNoteService {
         obj.updated_by = Some(current.id);
 
         write_event(
-            conn,
-            snowflake,
+            &mut *repo.conn_mut(),
+            &self.snowflake,
             note_id,
             DeliveryNoteEventType::Withdrawn,
             Some(STATUS_SUBMITTED.to_string()),
@@ -241,24 +253,25 @@ impl DeliveryNoteService {
         )
         .await?;
 
-        let affected = DeliveryNoteRepo::update(&mut *conn, &obj).await?;
+        let affected = repo.note_update(&obj).await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 "concurrent modification detected",
             ));
         }
-        obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        obj = repo.note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
-        let out = build_note_outs(conn, std::slice::from_ref(&obj)).await?;
+        let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
         Ok(out.into_iter().next().unwrap())
     }
 
     // ---------- pickup_scan ----------
 
-    pub async fn pickup_scan(
-        conn: &mut PgConnection,
+    pub async fn pickup_scan<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
         part_serial: &str,
         _badge_code: Option<&str>,
@@ -266,7 +279,7 @@ impl DeliveryNoteService {
     ) -> Result<DeliveryNotePickupScanOut, AppError> {
         let _ = current;
 
-        let obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let obj = repo.note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.status != STATUS_SUBMITTED {
@@ -276,8 +289,9 @@ impl DeliveryNoteService {
             ));
         }
 
-        let part = PartRepo::get_by_serial(&mut *conn, part_serial, false).await?;
-        let note_batches = PartBatchRepo::list_by_delivery_note(&mut *conn, note_id).await?;
+        let part = PartRepo::get_by_serial(&mut *repo.conn_mut(), part_serial, false).await?;
+        let note_batches =
+            PartBatchRepo::list_by_delivery_note(&mut *repo.conn_mut(), note_id).await?;
         if part.is_none()
             || !note_batches
                 .iter()
@@ -300,9 +314,9 @@ impl DeliveryNoteService {
 
     // ---------- pickup ----------
 
-    pub async fn pickup(
-        conn: &mut PgConnection,
-        snowflake: &SnowflakeIdGenerator,
+    pub async fn pickup<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
         driver_worker_id: i64,
         version: i32,
@@ -312,7 +326,8 @@ impl DeliveryNoteService {
         // 任意已登录账号即可（service 层校验司机）
         let _ = current;
 
-        let mut obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let mut obj = repo
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.version != version {
@@ -326,7 +341,7 @@ impl DeliveryNoteService {
         }
 
         // 司机校验
-        let driver = WorkerRepo::get_by_id(&mut *conn, driver_worker_id, false)
+        let driver = WorkerRepo::get_by_id(&mut *repo.conn_mut(), driver_worker_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -341,7 +356,7 @@ impl DeliveryNoteService {
             ));
         }
         if let Some(wt_id) = driver.work_type_id {
-            let wt = WorkTypeRepo::get_by_id(&mut *conn, wt_id)
+            let wt = WorkTypeRepo::get_by_id(&mut *repo.conn_mut(), wt_id)
                 .await?
                 .ok_or_else(|| {
                     AppError::biz(
@@ -363,7 +378,8 @@ impl DeliveryNoteService {
         }
 
         // 校验所有批次 READY_TO_SHIP + 非空
-        let mut note_batches = PartBatchRepo::list_by_delivery_note(&mut *conn, note_id).await?;
+        let mut note_batches =
+            PartBatchRepo::list_by_delivery_note(&mut *repo.conn_mut(), note_id).await?;
         if note_batches.is_empty() {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_INVALID_VALUE,
@@ -394,7 +410,7 @@ impl DeliveryNoteService {
             b.updated_at = now;
             b.updated_by = Some(current.id);
             let affected = PartBatchRepo::update(
-                &mut *conn,
+                &mut *repo.conn_mut(),
                 b.id,
                 b.version - 1,      // expected_version 是之前的
                 b.delivery_note_id, // 保留 delivery_note_id（PICKED_UP/ARCHIVED 后仍可打印）
@@ -418,7 +434,8 @@ impl DeliveryNoteService {
         let mut seen = std::collections::HashSet::new();
         for pid in affected_part_ids {
             if seen.insert(pid) {
-                PartService::sync_from_batch_change_with_conn(&mut *conn, pid, current).await?;
+                PartService::sync_from_batch_change_with_conn(&mut *repo.conn_mut(), pid, current)
+                    .await?;
             }
         }
 
@@ -432,8 +449,8 @@ impl DeliveryNoteService {
         obj.updated_by = Some(current.id);
 
         write_event(
-            conn,
-            snowflake,
+            &mut *repo.conn_mut(),
+            &self.snowflake,
             note_id,
             DeliveryNoteEventType::PickedUp,
             Some(STATUS_SUBMITTED.to_string()),
@@ -443,31 +460,33 @@ impl DeliveryNoteService {
         )
         .await?;
 
-        let affected = DeliveryNoteRepo::update(&mut *conn, &obj).await?;
+        let affected = repo.note_update(&obj).await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 "concurrent modification detected",
             ));
         }
-        obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        obj = repo.note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
-        let out = build_note_outs(conn, std::slice::from_ref(&obj)).await?;
+        let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
         Ok(out.into_iter().next().unwrap())
     }
 
     // ---------- soft_delete ----------
 
-    pub async fn soft_delete(
-        conn: &mut PgConnection,
+    pub async fn soft_delete<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
         version: i32,
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let obj = DeliveryNoteRepo::get_by_id(&mut *conn, note_id, false)
+        let obj = repo
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.version != version {
@@ -494,17 +513,12 @@ impl DeliveryNoteService {
             now_naive(),
             Some(current.id),
         )
-        .execute(&mut *conn)
+        .execute(&mut *repo.conn_mut())
         .await?;
 
-        let affected = DeliveryNoteRepo::soft_delete(
-            &mut *conn,
-            note_id,
-            obj.version,
-            now_naive(),
-            Some(current.id),
-        )
-        .await?;
+        let affected = repo
+            .note_soft_delete(note_id, obj.version, now_naive(), Some(current.id))
+            .await?;
         if affected == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
@@ -516,12 +530,13 @@ impl DeliveryNoteService {
 
     // ---------- list_events ----------
 
-    pub async fn list_events(
-        conn: &mut PgConnection,
+    pub async fn list_events<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         note_id: i64,
     ) -> Result<Vec<DeliveryNoteEventOut>, AppError> {
         // 任何已登录账号可看；service 不做角色硬限（与 Python 一致）
-        let events = DeliveryNoteEventRepo::list_by_note(&mut *conn, note_id).await?;
+        let events = repo.event_list_by_note(note_id).await?;
         Ok(events
             .into_iter()
             .map(|e| DeliveryNoteEventOut {
@@ -539,14 +554,15 @@ impl DeliveryNoteService {
 
     // ---------- list_candidate_parts ----------
 
-    pub async fn list_candidate_parts(
-        conn: &mut PgConnection,
+    pub async fn list_candidate_parts<R: DeliveryNoteRepoTrait>(
+        &self,
+        mut repo: R,
         customer_id: i64,
         current: &CurrentUser,
     ) -> Result<Vec<DeliveryNoteCandidatePart>, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
-        let cust = CustomerRepo::get_by_id(&mut *conn, customer_id, false)
+        let cust = CustomerRepo::get_by_id(&mut *repo.conn_mut(), customer_id, false)
             .await?
             .ok_or_else(|| super::inner::customer_not_found(customer_id))?;
         if cust.parent_id.is_some() {
@@ -557,7 +573,7 @@ impl DeliveryNoteService {
         }
 
         // L1 根下所有 active 子客户 (L2) + L1 自身
-        let children = CustomerRepo::list_children(&mut *conn, customer_id, false).await?;
+        let children = CustomerRepo::list_children(&mut *repo.conn_mut(), customer_id, false).await?;
         let mut customer_ids: Vec<i64> = children.iter().map(|c| c.id).collect();
         customer_ids.push(customer_id);
         let mut name_by_id: HashMap<i64, String> =
@@ -567,7 +583,7 @@ impl DeliveryNoteService {
 
         let statuses = [STATUS_INSPECTION, STATUS_READY_TO_SHIP];
         let rows = PartBatchRepo::list_batches_with_part_in_customers(
-            &mut *conn,
+            &mut *repo.conn_mut(),
             &statuses,
             &customer_ids,
             CANDIDATE_LIMIT,
@@ -582,12 +598,9 @@ impl DeliveryNoteService {
         let active_note_ids: HashSet<i64> = if linked_note_ids.is_empty() {
             HashSet::new()
         } else {
-            let notes = DeliveryNoteRepo::list_by_ids(
-                &mut *conn,
-                &linked_note_ids.iter().copied().collect::<Vec<_>>(),
-                false,
-            )
-            .await?;
+            let notes = repo
+                .note_list_by_ids(&linked_note_ids.iter().copied().collect::<Vec<_>>(), false)
+                .await?;
             notes
                 .into_iter()
                 .filter(|n| n.status == STATUS_DRAFT || n.status == STATUS_SUBMITTED)
