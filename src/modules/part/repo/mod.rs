@@ -51,10 +51,23 @@
 //! `#[cfg_attr(test, mockall::automock)]` 在 trait 上声明，生成 `MockPartRepoTrait` 供
 //! service 单测注入。part 域当前无内联 mod tests（service 全部走 `tests/part_*_api.rs`
 //! + `tests/worker_scan_api.rs` 等集成测试守护），故未建 `part/service_tests/` 目录——
-//! 按 conventions.md §4.1 含 IO 不强求 100%。
+//!   按 conventions.md §4.1 含 IO 不强求 100%。
 //!
 //! ## 错误类型
 //! repo trait 方法 → `sqlx::Error`（与 `sql.rs` 签名 1:1，零翻译）。
+//!
+//! ## 已知架构债（D-6 阶段过渡）
+//!
+//! `conn_mut()` 暴露 `&mut PgConnection` 让 service 拿连接做 inline SQL / 跨域 repo
+//! 静态调用；这是 D-6 阶段过渡 API，因 part 域 50+ 端点 + 跨 5 域 inline SQL 太多，
+//! 统一 trait 形参成本过高。
+//!
+//! 147 处散点 `repo.conn_mut()` 调用是技术债；D-7/D-8 计划逐方法下沉到 trait helper：
+//! - 首批候选：`enrich_part_list_with_location_and_holder`（M1 已下沉到
+//!   `service/list_enrichment.rs`）+ `sync_from_batch_change`
+//! - Phase1 inline query（inspection/repair 跨域 join）后续逐项下沉
+//!
+//! forward-compat 目标：最终 `conn_mut()` 调用 < 10 处（仅保留必要的极复杂 inline SQL）。
 
 use async_trait::async_trait;
 use sqlx::PgConnection;
@@ -355,8 +368,9 @@ pub trait PartRepoTrait: Send {
 impl PartRepoTrait for &mut PgConnection {
     // ── 连接获取（2026-09-22 D-7 新增）──
     fn conn_mut(&mut self) -> &mut PgConnection {
-        // self: &mut &mut PgConnection → *self: &mut PgConnection（再 reborrow 以延长生命周期）
-        &mut **self
+        // self: &mut &mut PgConnection，函数形参已 reborrow 一次，故直接 `self`
+        // 即可借到内层 `&mut PgConnection`（auto-deref 处理第二层）
+        self
     }
 
     // ── t_part 查询（5）── 一行委托 sql::PartRepo ────────────────────
