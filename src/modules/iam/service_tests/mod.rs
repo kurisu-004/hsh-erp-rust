@@ -39,6 +39,7 @@ use crate::infra::ws_hub::WsHub;
 use crate::modules::iam::model::{Menu, Shelf, User};
 use crate::modules::iam::repo::UserRoleRow;
 use crate::modules::iam::service::{AccountService, SessionService};
+use crate::modules::dashboard::service::DashboardService;
 use crate::modules::upload_session::repo::InMemoryUploadSessionRepo;
 use crate::state::AppState;
 use crate::modules::com::applicant::service::ApplicantService;
@@ -177,6 +178,9 @@ process_chain_service: Arc::new(ProcessChainService::new(snowflake.clone())),
         // 2026-09-22 prod/worker_pool service 是 unit struct，无字段
         // 不装线到 AppState；handler 直接走 ZST 静态调用 `WorkerPoolService::xxx`。
         worker_pool_service: Arc::new(WorkerPoolService::new()),
+        // 2026-09-22 Group E dashboard service 是 unit struct，无字段依赖；
+        // iam service_tests 不直接走 dashboard，传占位实例即可。
+        dashboard_service: Arc::new(DashboardService),
     })
 }
 

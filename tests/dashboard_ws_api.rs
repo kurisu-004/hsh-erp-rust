@@ -64,7 +64,12 @@ async fn build_snapshot_with_workers_basic() {
     .expect("insert t_shelf");
 
     let mut tx = pool.begin().await.unwrap();
-    let snap = DashboardService::build_snapshot_with_workers(&mut tx, None)
+    // 2026-09-22 Group E 重构：`build_snapshot_with_workers` 改 `<R: DashboardRepoTrait>(&self, mut repo: R)`
+    // by-value；`DashboardService` 是 unit struct，`DashboardService::new()` 构造实例；
+    // handler / 直调方都借 `&mut *tx` 喂给 trait（trait 已直接 `impl for &mut PgConnection`，
+    // `Transaction` deref 到 `PgConnection`）。
+    let snap = DashboardService::new()
+        .build_snapshot_with_workers(&mut *tx, None)
         .await
         .expect("snapshot ok");
     drop(tx);
@@ -154,7 +159,10 @@ async fn build_snapshot_with_workers_returns_full_shape() {
     .unwrap();
 
     let mut tx = pool.begin().await.unwrap();
-    let snap = DashboardService::build_snapshot_with_workers(&mut tx, None)
+    // 2026-09-22 Group E 重构：`build_snapshot_with_workers` 改 `<R: DashboardRepoTrait>(&self, mut repo: R)`
+    // by-value；handler / 直调方都借 `&mut *tx` 喂给 trait（trait 已直接 `impl for &mut PgConnection`）。
+    let snap = DashboardService::new()
+        .build_snapshot_with_workers(&mut *tx, None)
         .await
         .expect("snapshot ok");
     drop(tx);
