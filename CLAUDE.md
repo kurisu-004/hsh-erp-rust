@@ -50,13 +50,36 @@ TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo next
 1. **事务边界在 handler（2026-09-21 重构 + 2026-09-22 删 `PgIamRepo` 转发壳后 iam 与其余 20 个 handler 文件一致）**：handler 显式 `state.pool.begin()` / `tx.commit()`，错误路径 tx drop 隐式回滚。service 不知事务——所有跨 repo 操作经 `repo: R`（by-value；`IamRepo` / 域内对应 trait 已直接 `impl for &mut PgConnection`，handler/service 借 `&mut *tx` / `&mut *conn` 即可）参数传入。
    - 例外清单（仍走 handler 边界）：
      - `_e2e` 直调方（测试 fixture 自管 tx）
-     - 既有 `tests/iam_api.rs` 等 HTTP 契约测试（不改测试代码）
+     - 既有 `tests/iam/{api.rs,middleware.rs}`（2026-09-23 PR13 拆分；原 `tests/iam_api.rs` / `tests/auth_middleware.rs` 已合到 `tests/iam/`）等 HTTP 契约测试（不改测试代码）
      - 读端点（`me` / `list_users` / `get_user` 等）`pool.acquire()` 不开事务，service 借 `&mut PgConnection` 跑查询，连接用完即 drop。
 2. **统一响应信封**：handler 返回 `Result<Json<R<T>>, AppError>`。`R { code: 0, message: "ok", data }`；错误由 `AppError::into_response()` 装入同一信封。不做 middleware 后置包装。
 3. **错误码分段契约**（`src/shared/error.rs::code`，与 Python 前端对齐）：0 成功、4xxxx HTTP 语义、5xxxx 系统、2xxxx 业务域（每域一个段，如 201xx 零件/客户、214xx 送货单，新增域错误码先入对应段）。
 5. **状态机不写 DB**：`statemachine.rs` 只做内存 enum + `can_transition_to` 迁移表；事件日志由 service 在事务内统一插入。
 6. **WS 广播在 commit 之后**（对齐 Python 延迟广播模式），用 `state.ws_hub.broadcast(...)`。
 7. **路由挂载**：业务 REST 统一 `/api/v2`（与 Python `/api/v1` 并行），WS 在 `/ws/dashboard`。`/api/mcp` 不在本仓库。
+
+## 集成测试目录结构（2026-09-23 PR13 重构后）
+
+51 个 integration test binary 已重组为 **20 binary**（9 多文件 domain 子目录化 + 11 single-file 保留 + 1 域内拆 3）：
+
+| 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
+|---|---:|---|
+| `tests/delivery/{main,group,attach_batches,print,scan,note}.rs` | 5 | `delivery` |
+| `tests/part/{main,helpers,crud,lifecycle,batch,file,list_enrichment,repair,to_ship,to_inspection,to_process,inspection_batches,serial}.rs` | 12 | `part` |
+| `tests/assembly/{main,api,files,status_sync}.rs` | 3 | `assembly` |
+| `tests/iam/{main,api,middleware}.rs` | 2 | `iam`（redis-flush group）|
+| `tests/shelf/{main,api,deactivate}.rs` | 2 | `shelf` |
+| `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
+| `tests/production/{main,work_type,process,process_chain,worker,worker_pool,worker_pool_auto_allocate}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐）|
+| `tests/outsource/{main,company,quote,send_receive}.rs` | 3 | `outsource` |
+| `tests/user_repo/{main,basic,role,password}.rs` | 1 → 3 sub-file | `user_repo` |
+| 单文件保留：applicant_api / customer_api / _e2e_api / cos_opendal_api / cos_real_smoke / auto_complete_api / dashboard_ws_api / idempotency_api / guard_dn_in_use_api / cnc_program_api | 10 | （各自原 binary 名）|
+| **合计** | 51 → | **20 binary** |
+
+**关键约定**：
+- cargo 1.98.1 **不识别** `tests/<dir>/mod.rs`，只识别 `tests/<dir>/main.rs`（binary 名 = `<dir>`）。新 domain 一律用 `main.rs`。
+- 共享基建从 monolith `tests/common/mod.rs`（1393 行）迁到独立 dev-only crate **`test-support/`**（`hsh-erp-test-support`）；`tests/common/mod.rs` 保留为 facade re-export 兼容期，单文件 binary 通过 `mod common;` 仍可用，未来逐步移除。
+- **修改 tests 内 query! 宏后必须重跑 `./scripts/sqlx_prepare.sh`** 生成 `.sqlx/query-*.json` 并提交；拆分 sub-file 会引入新 cache hash（路径变化）。
 
 
 ## DB 约定（迁移与查询必须沿用）

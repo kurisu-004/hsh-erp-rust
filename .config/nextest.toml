@@ -26,9 +26,11 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # 40105 SESSION_REVOKED flake）。max-threads=1 让这 3 个 binary 的测试串行跑，
 # 跨 binary 仍并行（其余 40 个 binary 全并行）。[test-groups] 必须先声明 group
 # 名才能在 overrides 里引用（nextest 强类型校验）。
+# 2026-09-23 PR13 Phase E：iam_api + auth_middleware 已合为 `tests/iam/`
+# （binary 名 = `iam`）；FLUSHDB binary 从 3 个减为 2 个。
 [test-groups]
 redis-flush = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = "binary(/^(_e2e_api|auth_middleware|iam_api)$/)"
+filter = "binary(/^(_e2e_api|iam)$/)"
 test-group = "redis-flush"

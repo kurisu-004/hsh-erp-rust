@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE t_user SET deleted_at = $2 WHERE id = $1",
+  "query": "UPDATE t_user SET deleted_at = $2, is_active = false WHERE id = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -11,5 +11,5 @@
     },
     "nullable": []
   },
-  "hash": "afc09e1822629e09a8c3e2c2d739d4a8e893f1175dff10606e38938dcc5e2c76"
+  "hash": "38050ca479a5b4eb3bbda00a44c0e9ae0f034cc740ba67b4559c14b2d515b19e"
 }

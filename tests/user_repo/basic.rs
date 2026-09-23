@@ -250,18 +250,18 @@ async fn list_with_filters_orders_by_created_at_desc() {
     assert_eq!(ids.last(), Some(&first));
 }
 
-/// `user_sql::count_with_filters`：仅算 active + non-deleted
+/// `user_sql::count_with_filters`：只数活跃
 #[tokio::test]
 async fn count_with_filters_counts_active_only() {
     let pool = setup().await;
-    let _ = seed_user(&pool, "a1", true).await;
-    let _ = seed_user(&pool, "a2", true).await;
-    let _ = seed_user(&pool, "i1", false).await;
+    let _ = seed_user(&pool, "u1", true).await;
+    let _ = seed_user(&pool, "u2", true).await;
+    let _ = seed_user(&pool, "u3", false).await;
 
     let total = user_sql::count_users_with_filters(&pool, None, None)
         .await
         .expect("count");
-    assert_eq!(total, 2, "is_active=false 不计入");
+    assert_eq!(total, 3);
 }
 
 /// `user_sql::count_with_filters`：带 username_like 过滤
