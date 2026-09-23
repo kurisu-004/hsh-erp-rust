@@ -6,10 +6,11 @@
 //!   - repair_dispatch: 一步式返修下发
 //!   - list_repair_batches / list_repairing_batches
 
-#[path = "common/mod.rs"]
+// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
+// 故本文件自带 `mod common;` / `mod helpers;`（与 main.rs 的同名 pub mod 不冲突）。
+#[path = "../common/mod.rs"]
 mod common;
-
-#[path = "part_api_helpers.rs"]
+#[path = "helpers.rs"]
 mod helpers;
 
 use axum::body::{Body, to_bytes};

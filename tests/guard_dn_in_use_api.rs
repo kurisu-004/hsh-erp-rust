@@ -16,7 +16,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-#[path = "part_api_helpers.rs"]
+#[path = "part/helpers.rs"]
 mod helpers;
 
 use axum::http::StatusCode;

@@ -10,7 +10,9 @@
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），与其它业务测试
 //! 互不干扰（DB 间 schema 完全独立）。
 
-#[path = "common/mod.rs"]
+// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
+// 故本文件自带 `mod common;`（与 main.rs 的同名 pub mod 不冲突）。
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{ensure_database_exists, test_pool};
