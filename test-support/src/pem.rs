@@ -1,8 +1,9 @@
-//! 2026-09-23 重构：测试用 RSA 密钥对（PEM 格式）+ kid 字典
+//! 测试用 RSA 密钥对（PEM 格式）+ kid 字典
 //!
-//! JWT 切 RS256 后，集成测试需在每进程内生一对 RSA 私钥 + 公钥：
-//! - `test_private_pem()` 给 `tests/common/mod.rs` 的 JwtConfig::private_key 字段
-//!   与 auth_middleware.rs 的 `mint_*_token` helper 签 RS256 token
+//! 2026-09-23 重构：JWT 切 RS256 后，集成测试需在每进程内生一对 RSA 私钥 + 公钥：
+//! - `test_private_pem()` 给 `tests/common/mod.rs`（现 `crate::state`）的
+//!   JwtConfig::private_key 字段与 auth_middleware.rs 的 `mint_*_token` helper
+//!   签 RS256 token
 //! - `test_public_pem(kid)` 给 JwtConfig::public_keys 字典 + 测试用例验签
 //! - `test_public_kids()` 公开至少 `("current", pub_pem)` 一对，可扩展
 //!   `("next", ...)` 用于密钥轮换场景
@@ -51,7 +52,8 @@ fn keys() -> &'static KeyMaterial {
 fn generate_key_material() -> KeyMaterial {
     let mut rng = OsRng;
     // 2048-bit RSA 私钥
-    let private_key = RsaPrivateKey::new(&mut rng, KEY_BITS).expect("generate 2048-bit RSA private key");
+    let private_key =
+        RsaPrivateKey::new(&mut rng, KEY_BITS).expect("generate 2048-bit RSA private key");
     let public_key = RsaPublicKey::from(&private_key);
 
     // 私钥：PKCS#8 PEM（PKCS#1 也可，但 PKCS#8 是 jsonwebtoken 的 from_rsa_pem 通用输入）
@@ -83,10 +85,7 @@ fn generate_key_material() -> KeyMaterial {
         "RSA public key size 应与 KEY_BITS 一致"
     );
 
-    KeyMaterial {
-        private_pem,
-        pairs,
-    }
+    KeyMaterial { private_pem, pairs }
 }
 
 /// 测试用 RSA 私钥 PEM（PKCS#8）。
@@ -173,16 +172,18 @@ mod tests {
     /// 关键 roundtrip：拿 test_private_pem 签一个 RS256 token，再用 current kid
     /// 的公钥解码；签名验证必须通过。这是测试 helper 的最小不变量。
     ///
-    /// ⚠️ 早期 bug：tests/auth_middleware.rs 一度用 `#[path = "common/pem.rs"]
+    /// ⚠️ 历史 bug：tests/auth_middleware.rs 一度用 `#[path = "common/pem.rs"]
     /// mod pem;` 引入第二个 pem 实例，与 tests/common/mod.rs 的 `mod pem;`
     /// 各自一套 OnceLock → 签发 / 验签走两套不同 keypair → 40100 InvalidSignature。
-    /// 本 roundtrip 用 top-level `pem::*` + 同模块 PEM，与 test_state 走的
-    /// `common::pem::*` 必须共享同一 OnceLock（`tests/common/mod.rs` 必须 `pub
-    /// mod pem` 让所有 test binary 顶层能 `use common::pem;`）。
+    /// 自 PR13 Phase A 起：唯一 pem 实例在 `hsh_erp_test_support::pem`，
+    /// `tests/common/mod.rs` 保留 `pub mod pem { pub use hsh_erp_test_support::pem::*; }`
+    /// 转发到同一份 OnceLock，签发 / 验签自然共享。
     #[test]
     fn roundtrip_sign_and_verify() {
         use chrono::Utc;
-        use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+        use jsonwebtoken::{
+            Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode,
+        };
         let now = Utc::now().timestamp();
         #[derive(serde::Serialize, serde::Deserialize)]
         struct Claims {

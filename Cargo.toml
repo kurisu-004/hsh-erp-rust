@@ -7,6 +7,21 @@ edition = "2024"
 name = "hsh_erp_rust"
 path = "src/lib.rs"
 
+# 2026-09-23 PR13 Phase A：新增独立 dev-only crate `test-support/` 承载集成测试共享基建。
+#
+# 没有 `[workspace]` 时把 path = "test-support" 列在 dev-deps，cargo 1.98
+# 触发 `features.rs:325 did not find features for ...` resolver panic
+# （path-sibling 包未注册到 workspace context）。处理：把根仓升级为「虚拟 workspace」
+# —— root `[workspace]` 仅声明 members，不在子目录上各放一份，避免 cargo 元数据
+# 重复（保留原 `[package]` 当「根成员」的语义：`cargo build` / `cargo test`
+# 不带 `-p` 时仍以 hsh-erp-rust 为默认入口）。
+[workspace]
+members = [".", "test-support"]
+resolver = "2"
+
+# 2026-09-23 PR13：workspace 已声明 `members = [".", "test-support"]`，
+# cargo 自动从 dev-deps 派生 path dep 关系，无需手工 [workspace.dependencies]。
+
 # ---------------------------------------------------------------------------------
 # 后续业务实现阶段会按需追加（文档见 docs/architecture.md）：
 #   rust_decimal / bigdecimal    —— 金额、数量（Numeric 列）
@@ -135,6 +150,19 @@ uuid = { version = "1", features = ["v4"] }
 # 集成测试用 tower::ServiceExt::oneshot 直接驱动 Router。
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。
 tower = { version = "0.5", features = ["util"] }
+
+# 2026-09-23 PR13 Phase A：集成测试共享基建迁到独立 dev-only crate。
+#
+# 主仓 `tests/common/mod.rs`（1393 行）+ `tests/common/pem.rs`（209 行）按
+# 职责切到 `test-support/src/{pool, pem, redis, state, fixtures}.rs`；
+# `tests/common/mod.rs` 保留为 facade，仅 `pub use hsh_erp_test_support::*;`
+# 把符号透传给现有 51 个 integration test binary（暂不改 import；
+# Phase B/C/D 按 domain 拆 helper 时再统一切到直接 `use hsh_erp_test_support::*;`）。
+#
+# 反向依赖关系：test-support 的 `[dependencies]` 声明 `hsh-erp-rust = { path = ".." }`
+# 是 cargo 允许的常规模式。编译顺序：hsh-erp-rust → hsh-erp-test-support → integration
+# tests，依赖图无环。
+hsh-erp-test-support = { path = "test-support" }
 
 # 2026-09-20 重大重构：去掉 `ephemeral-postgres` 依赖，改用自定义 bash runner 方案。
 # 背景：ephemeral-postgres 0.3 把 Cluster 放在 `static OnceCell<Cluster>`，

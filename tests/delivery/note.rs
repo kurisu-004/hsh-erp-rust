@@ -21,16 +21,13 @@
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
 
-#[path = "common/mod.rs"]
-mod common;
-
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header::AUTHORIZATION};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{
+use hsh_erp_test_support::{
     add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
     test_app, test_pool, test_state,
 };
@@ -1028,7 +1025,7 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
     let _ = rx; // unused
 
     // driver → PICKED_UP
-    let redis_pool = common::test_redis_pool().await;
+    let redis_pool = hsh_erp_test_support::test_redis_pool().await;
     let state = hsh_erp_rust::state::AppState::new(
         pool.clone(),
         std::sync::Arc::new(hsh_erp_rust::infra::config::AppConfig::from_env(".env").unwrap()),

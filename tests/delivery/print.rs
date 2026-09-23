@@ -9,9 +9,6 @@
 //! 之外的数据；当前 Phase P1+P2 fixtures 还未支持「L1 customer + serial_prefix +
 //! DRAFT 单 + READY_TO_SHIP 批次」全套数据，因此这里只做 smoke + 角色校验）。
 
-#[path = "common/mod.rs"]
-mod common;
-
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header::AUTHORIZATION};
 use calamine::{Reader, open_workbook_auto};
@@ -19,7 +16,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{
+use hsh_erp_test_support::{
     add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
     test_app,
 };
@@ -57,7 +54,7 @@ fn json_request(
 
 async fn setup() -> PgPool {
     ensure_database_exists().await;
-    let pool = common::test_pool().await;
+    let pool = hsh_erp_test_support::test_pool().await;
     clean_db(&pool).await;
     clean_business_db(&pool).await;
     pool
@@ -66,7 +63,7 @@ async fn setup() -> PgPool {
 async fn login(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = common::test_state(pool.clone()).await;
+    let state = hsh_erp_test_support::test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env_bytes) = send(
         app,
@@ -87,7 +84,7 @@ async fn login(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
 #[tokio::test]
 async fn print_endpoint_requires_auth() {
     let pool = setup().await;
-    let state = common::test_state(pool.clone()).await;
+    let state = hsh_erp_test_support::test_state(pool.clone()).await;
     let app = test_app(state);
     let req = json_request("POST", "/delivery-notes/1/print", Some(json!({})), None);
     let (status, _body) = send(app, req).await;
