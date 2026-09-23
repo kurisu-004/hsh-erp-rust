@@ -23,7 +23,15 @@
 //!   / `test_ws_app`）
 //! - [`fixtures`]：建最小化世界（admin/MANAGER/货架/菜单/工艺链）的 helper
 //!   + `MockCos` stub（`insert_user_with_password` / `add_role` /
-//!   `clean_db` / `MockCos` 等）
+//!     `clean_db` / `MockCos` 等）
+//! - [`http`]：HTTP 客户端 helper（`send` / `json_request` / `login_token`）
+//!   —— PR13 Phase F 引入，从 27+ 重复实现的 `tests/*` 收敛一份权威版，
+//!   签名与原版逐字一致便于批量迁移（`axum::Router` + `Request<Body>` +
+//!   `Option<Value>` + `Option<&str>`）
+//! - [`fixture`]：按域预制 fixture 加载（`load_process_chain_fixture` +
+//!   `ProcessChainFixture`）。SQL 走 `fixtures/<domain>.sql`，常量 ID 区段
+//!   9_000_000_000_000_000_001+；bcrypt 哈希预生成嵌入 SQL，省 ~250ms×N
+//!   现场 hash 开销
 //!
 //! ## 反向依赖关系
 //! 本 crate 的 `[dependencies]` 声明 `hsh-erp-rust = { path = ".." }`，
@@ -61,13 +69,17 @@
 // pool.rs / fixtures.rs 注释）。
 #![allow(dead_code, clippy::duplicate_mod, clippy::await_holding_lock)]
 
+pub mod fixture;
 pub mod fixtures;
+pub mod http;
 pub mod pem;
 pub mod pool;
 pub mod redis;
 pub mod state;
 
+pub use fixture::*;
 pub use fixtures::*;
+pub use http::*;
 pub use pem::*;
 pub use pool::*;
 pub use redis::*;

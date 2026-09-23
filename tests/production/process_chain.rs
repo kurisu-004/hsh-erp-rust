@@ -15,177 +15,58 @@
 //! ## 串行化
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex / `--test-threads=1` 双保险。
+//!
+//! ## 集成测试范本（PR13 Phase F 引入，2026-09-23）
+//! 本文件是 27+ 重复 helper（本地 `send` / `json_request` / `setup` /
+//! `login_manager` / `insert_part` / `seed_process` / `insert_customer_l2`）的
+//! 收敛目标。所有 HTTP / fixture helper 一律 `use hsh_erp_test_support::{...}`，
+//! **不再保留本地副本**；新增 test binary 时也应照此模式：
+//!
+//! ```ignore
+//! use hsh_erp_test_support::{
+//!     json_request, load_process_chain_fixture, login_token, pool_snowflake,
+//!     send, test_app, test_pool, test_state,
+//!     fixture::ProcessChainFixture,
+//! };
+//! ```
+//!
+//! 强类型 fixture 句柄（`ProcessChainFixture`）由 `load_process_chain_fixture`
+//! 返回，提供 `proc_a` / `part_pending` 等预制常量 ID，避免每测试现场 insert。
 
-#[path = "../common/mod.rs"]
-mod common;
-
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
-use serde_json::{Value, json};
+use axum::http::StatusCode;
+use serde_json::json;
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{add_role, insert_user_with_password, test_app, test_state};
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+use hsh_erp_test_support::{
+    ProcessChainFixture, json_request, load_process_chain_fixture, login_token, pool_snowflake,
+    send, test_app, test_pool, test_state,
+};
 
 // ===========================================================================
-//  全局串行化 + HTTP helpers
+//  Bootstrap helpers（PR13 Phase F 风格 B：抽出公共样板）
 // ===========================================================================
 
-
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body)));
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 process_chain fixture + 以 MANAGER 身份登录。
+///
+/// 返回 `(pool, app, token, fx)`。后续测试可直接 `pool` 跑 query!、
+/// `app.clone()` 多次 `send`、token 直接拼到 bearer header；`fx` 暴露
+/// `manager_username` / `clerk_username` / 预制常量 ID 等强类型句柄。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProcessChainFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_process_chain_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.manager_username, ProcessChainFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
-// ----- 角色登录 helper -----
-
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token, pool)
-}
-
-// ===========================================================================
-//  process_chain fixture helpers
-// ===========================================================================
-
-/// 进程级共享雪花 ID 生成器（同 worker_pool_api 模式）
-fn chain_snowflake() -> &'static SnowflakeIdGenerator {
-    use std::sync::OnceLock;
-    static S: OnceLock<SnowflakeIdGenerator> = OnceLock::new();
-    S.get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
-}
-
-async fn insert_part(pool: &PgPool, customer_id: i64, serial_no: &str) -> i64 {
-    insert_part_with_status(pool, customer_id, serial_no, "PENDING").await
-}
-
-/// 2026-09-16 新增：可指定初始 status 的 part fixture（20705 PENDING 守卫测试用）。
-async fn insert_part_with_status(
-    pool: &PgPool,
-    customer_id: i64,
-    serial_no: &str,
-    status: &str,
-) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let id = chain_snowflake().next_id();
-    let now = now_naive();
-    let today = now.date();
-    // 用 sqlx::query (runtime) 而非 query! 避免每个 fixture 都依赖 .sqlx 缓存重生成。
-    sqlx::query(
-        "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
-         request_date, planned_delivery_date, status, is_urgent, customer_id, \
-         quantity, unit_price, total_price, version, created_at, updated_at) \
-         VALUES ($1, $2, 'test', 'D-PCH', $3, $4, $4, $5, false, $6, \
-         1, 0, 0, 0, $7, $7)",
-    )
-    .bind(id)
-    .bind(serial_no)
-    .bind(serial_no.to_string()) // applicant_name = serial_no
-    .bind(today)
-    .bind(status)
-    .bind(customer_id)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert t_part");
-    id
-}
-
-async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
-    let now = now_naive();
-    let one_char: String = prefix
-        .chars()
-        .next()
-        .unwrap_or('X')
-        .to_ascii_uppercase()
-        .to_string();
-    sqlx::query!(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, updated_at) \
-         VALUES ($1, $2, NULL, $3, 0, $4, $4)",
-        id,
-        prefix,
-        one_char,
-        now,
-    )
-    .execute(pool)
-    .await
-    .expect("insert L1");
-    id
-}
-
-async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
-    let now = now_naive();
-    sqlx::query!(
-        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
-         version, created_at, updated_at) \
-         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
-        id,
-        code,
-        name,
-        now,
-    )
-    .execute(pool)
-    .await
-    .expect("insert t_process");
-    id
+/// 起一份 fresh database + 加载 process_chain fixture + 以 CLERK 身份登录。
+async fn bootstrap_as_clerk() -> (PgPool, axum::Router, String, ProcessChainFixture) {
+    let pool = test_pool().await;
+    let fx = load_process_chain_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.clerk_username, ProcessChainFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
 // ===========================================================================
@@ -195,13 +76,10 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 /// 场景 1: happy path —— 创链 → fetch 拿到 header + steps
 #[tokio::test]
 async fn upsert_then_get_by_part_happy() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH").await;
-    let proc_a = seed_process(&pool, "PROC-A", "工序A").await;
-    let proc_b = seed_process(&pool, "PROC-B", "工序B").await;
-    let part_id = insert_part(&pool, customer, "P-001").await;
-
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr1").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let part_id = ProcessChainFixture::PART_PENDING;
+    let proc_a = ProcessChainFixture::PROC_A;
+    let proc_b = ProcessChainFixture::PROC_B;
 
     // 1. upsert：建链 + 2 步
     let (s, env) = send(
@@ -256,8 +134,6 @@ async fn upsert_then_get_by_part_happy() {
     );
 
     // 2. fetch by part
-    let state = test_state(_pool).await;
-    let app = test_app(state);
     let (s2, env2) = send(
         app,
         json_request(
@@ -276,11 +152,9 @@ async fn upsert_then_get_by_part_happy() {
 /// 场景 2: 找不到链 → 20701 BIZ_PROCESS_CHAIN_NOT_FOUND
 #[tokio::test]
 async fn get_by_part_chain_not_found() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH-NF").await;
-    let part_id = insert_part(&pool, customer, "P-NF").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let part_id = ProcessChainFixture::PART_PENDING;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_nf").await;
     let (s, env) = send(
         app,
         json_request(
@@ -298,13 +172,10 @@ async fn get_by_part_chain_not_found() {
 /// 场景 3: PUT 整组替换：先有 2 步 → 换成 1 步；旧 steps 软删，新 step 新 id
 #[tokio::test]
 async fn upsert_replaces_old_steps() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH-REP").await;
-    let proc_a = seed_process(&pool, "PROC-RA", "工序A").await;
-    let proc_b = seed_process(&pool, "PROC-RB", "工序B").await;
-    let part_id = insert_part(&pool, customer, "P-REP").await;
-
-    let (app, token, pool) = login_manager(pool.clone(), "mgr_rep").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let part_id = ProcessChainFixture::PART_PENDING;
+    let proc_a = ProcessChainFixture::PROC_A;
+    let proc_b = ProcessChainFixture::PROC_B;
 
     // 1. 首次 upsert：2 步
     let (_s, env) = send(
@@ -383,12 +254,10 @@ async fn upsert_replaces_old_steps() {
 /// 场景 4: upsert 时 estimated_minutes < 0 → 40001
 #[tokio::test]
 async fn upsert_rejects_negative_minutes() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH-NEG").await;
-    let proc = seed_process(&pool, "PROC-NEG", "工序").await;
-    let part_id = insert_part(&pool, customer, "P-NEG").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let part_id = ProcessChainFixture::PART_PENDING;
+    let proc = ProcessChainFixture::PROC_A;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_neg").await;
     let (s, env) = send(
         app,
         json_request(
@@ -410,12 +279,10 @@ async fn upsert_rejects_negative_minutes() {
 /// 场景 5: upsert 时 sort_order 重复 → 40001
 #[tokio::test]
 async fn upsert_rejects_duplicate_sort_order() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH-DUP").await;
-    let proc = seed_process(&pool, "PROC-DUP", "工序").await;
-    let part_id = insert_part(&pool, customer, "P-DUP").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let part_id = ProcessChainFixture::PART_PENDING;
+    let proc = ProcessChainFixture::PROC_A;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_dup").await;
     let (s, env) = send(
         app,
         json_request(
@@ -438,28 +305,10 @@ async fn upsert_rejects_duplicate_sort_order() {
 /// 场景 6: 非 Manager 调用 upsert → 40300 FORBIDDEN
 #[tokio::test]
 async fn upsert_forbidden_for_non_manager() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH-FB").await;
-    let proc = seed_process(&pool, "PROC-FB", "工序").await;
-    let part_id = insert_part(&pool, customer, "P-FB").await;
+    let (_pool, app, token, _fx) = bootstrap_as_clerk().await;
+    let part_id = ProcessChainFixture::PART_PENDING;
+    let proc = ProcessChainFixture::PROC_A;
 
-    let uid = insert_user_with_password(&pool, "clerk1", "changeme").await;
-    add_role(&pool, uid, "CLERK", None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": "clerk1", "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-
-    let app = test_app(state);
     let (s, env) = send(
         app,
         json_request(
@@ -484,13 +333,10 @@ async fn upsert_forbidden_for_non_manager() {
 /// 软删（note 也不再被 SELECT 列出），新步骤的 note 独立验证。
 #[tokio::test]
 async fn step_note_round_trip() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH-NOTE").await;
-    let proc_a = seed_process(&pool, "PROC-NA", "工序A").await;
-    let proc_b = seed_process(&pool, "PROC-NB", "工序B").await;
-    let part_id = insert_part(&pool, customer, "P-NOTE").await;
-
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_note").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let part_id = ProcessChainFixture::PART_PENDING;
+    let proc_a = ProcessChainFixture::PROC_A;
+    let proc_b = ProcessChainFixture::PROC_B;
 
     // 1. upsert：2 步，第 1 步有 note，第 2 步无 note
     let (s, env) = send(
@@ -556,13 +402,10 @@ async fn step_note_round_trip() {
 /// 禁止制定 / 修改。
 #[tokio::test]
 async fn upsert_rejects_non_pending_part() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH-NP").await;
-    let proc = seed_process(&pool, "PROC-NP", "工序").await;
-    // 模拟"已下发"零件（IN_PROCESS 即非 PENDING 任一状态）
-    let part_id = insert_part_with_status(&pool, customer, "P-NP", "IN_PROCESS").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let part_id = ProcessChainFixture::PART_IN_PROCESS;
+    let proc = ProcessChainFixture::PROC_A;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_np").await;
     let (s, env) = send(
         app,
         json_request(
@@ -587,12 +430,9 @@ async fn upsert_rejects_non_pending_part() {
 /// 场景 9: GET /process-chains/{chain_id} 命中 / 未命中（2026-09-16 新增端点）
 #[tokio::test]
 async fn get_chain_by_id_hit_and_miss() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH-GI").await;
-    let proc_a = seed_process(&pool, "PROC-GA", "工序A").await;
-    let part_id = insert_part(&pool, customer, "P-GI").await;
-
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_gi").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let part_id = ProcessChainFixture::PART_PENDING;
+    let proc_a = ProcessChainFixture::PROC_A;
 
     // 建链拿 chain_id
     let (s, env) = send(
@@ -631,7 +471,7 @@ async fn get_chain_by_id_hit_and_miss() {
     assert_eq!(env2["data"]["steps"][0]["process_id"], proc_a.to_string());
 
     // 未命中：随机雪花 id → 404 + 20701
-    let missing_id = chain_snowflake().next_id();
+    let missing_id = pool_snowflake().lock().unwrap().next_id();
     let (s3, env3) = send(
         app,
         json_request(
@@ -652,12 +492,9 @@ async fn get_chain_by_id_hit_and_miss() {
 /// 之后 get_chain_by_part / get_chain_by_id 均 20701。
 #[tokio::test]
 async fn soft_delete_part_cascades_chain() {
-    let pool = setup().await;
-    let customer = insert_customer_l2(&pool, "PCH-SD").await;
-    let proc_a = seed_process(&pool, "PROC-SA", "工序A").await;
-    let part_id = insert_part(&pool, customer, "P-SD").await;
-
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_sd").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let part_id = ProcessChainFixture::PART_PENDING;
+    let proc_a = ProcessChainFixture::PROC_A;
 
     // 1. 建链（link 会把 part.version 从 0 推到 1）
     let (s, env) = send(

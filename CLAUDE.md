@@ -81,6 +81,43 @@ TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo next
 - 共享基建从 monolith `tests/common/mod.rs`（1393 行）迁到独立 dev-only crate **`test-support/`**（`hsh-erp-test-support`）；`tests/common/mod.rs` 保留为 facade re-export 兼容期，单文件 binary 通过 `mod common;` 仍可用，未来逐步移除。
 - **修改 tests 内 query! 宏后必须重跑 `./scripts/sqlx_prepare.sh`** 生成 `.sqlx/query-*.json` 并提交；拆分 sub-file 会引入新 cache hash（路径变化）。
 
+## 集成测试 fixture 范本（2026-09-23 PR13 Phase F 引入）
+
+`test-support` 提供三类共享资产，新 integration test binary 一律走下列入口，**禁止在测试文件内重新声明本地 `send` / `json_request` / `setup` / `login_*` / `insert_*` / `seed_*`**：
+
+### `test-support::http` —— HTTP 客户端 helper
+
+| 函数 | 用途 |
+|---|---|
+| `send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value)` | oneshot 驱动 Router 并解析信封 JSON |
+| `json_request(method: &str, uri: &str, body: Option<Value>, bearer: Option<&str>) -> Request<Body>` | 构造带 JSON body / Bearer 头的请求 |
+| `login_token(app: &axum::Router, username: &str, password: &str) -> String` | POST `/iam/login` 拿 bearer token |
+
+签名与原 27+ 重复实现**逐字一致**，便于后续按 binary 批量替换。
+
+### `test-support::fixture` —— 按域预制 fixture 加载
+
+约定三段式（**新域遵循**）：
+1. **SQL 文件**：`test-support/fixtures/<domain>.sql`
+   - 所有 ID 走常量 `9_000_000_000_000_000_001+` 区段（雪花 ID epoch=2020-01-01 × instance≤1023 × 12bit seq ≈ 6×10¹⁶ 上限，物理不相交）
+   - bcrypt 哈希预生成嵌入 SQL（cost=12，明文由 `ProcessChainFixture::PASSWORD` 公开），省每测试现场 hash ~250ms
+   - 时间列：审计字段用 `now()`，业务日期按 fixtures 字面
+2. **Fixture struct**：`test-support/src/fixture.rs::ProcessChainFixture`（字段 + 常量 ID `pub const`），`Default` 实现给出 `manager_username` / `clerk_username` 等字符串常量
+3. **Loader 函数**：`load_<domain>_fixture(pool: &PgPool) -> <Domain>Fixture`，走 `include_str!` 编译期嵌入 + `sqlx::raw_sql` 一次性执行（multi-statement）；与 [`fixtures`](test-support/src/fixtures.rs)（动态 helper）分工：前者批量差异跨域共享，后者单条参数化差异
+
+### 范本文件
+
+`tests/production/process_chain.rs` 是首个按 fixture 范本改写的 integration test binary，10 个场景的字面请求 / 断言**逐字保留**，仅替换本地 helper 为 test-support 引入 + 抽出 `bootstrap_as_manager` / `bootstrap_as_clerk` 两个样板函数。新 binary 改造时可参照此模式。
+
+### 后续 27+ 文件改造顺序（按 cargo test nextest filter）
+
+| 优先级 | 域 | 备注 |
+|---|---|---|
+| Phase F 已完成 | process_chain | 范本 |
+| Phase G | part（11 sub-file）/ delivery（5 sub-file） | 涉及 process_chain / worker_pool 引用最多 |
+| Phase H | production 其余（work_type / process / worker / worker_pool / worker_pool_auto_allocate）/ assembly / shelf / statistics / outsource | worker_pool fixture 复用度高 |
+| Phase I | iam / user_repo / applicant / customer / dashboard_ws / _e2e / cnc_program / auto_complete / guard_dn_in_use / idempotency / cos_opendal / cos_real_smoke | 单 binary 不拆 |
+
 
 ## DB 约定（迁移与查询必须沿用）
 
