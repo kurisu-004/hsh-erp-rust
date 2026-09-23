@@ -10,10 +10,13 @@
 //! ## 批次守恒不变量测试
 //! `Σ(未删批次.quantity) = t_part.quantity` 必须保持 —— 用 `invariant` 命名空间测试。
 
-#[path = "common/mod.rs"]
+// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
+// 故本文件自带 `mod common;` / `mod helpers;`（与 main.rs 的同名 pub mod 不冲突），
+// 每 sub-file 走自己的 `crate::part::<sub>::common` / `::helpers` 模块子树，
+// 路径独立、避免循环引用，与 Phase A 兼容期 facade 保持 `use common::*;` 调用风格不变。
+#[path = "../common/mod.rs"]
 mod common;
-
-#[path = "part_api_helpers.rs"]
+#[path = "helpers.rs"]
 mod helpers;
 
 use axum::body::{Body, to_bytes};

@@ -14,7 +14,9 @@
 //! 不启 axum（避免 JWT/Redis 开销），直接 service 直调；`pool.begin()` 开 tx →
 //! 传 `&mut *tx` 给 service → 显式 `tx.commit()`。
 
-#[path = "common/mod.rs"]
+// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
+// 故本文件自带 `mod common;`（与 main.rs 的同名 pub mod 不冲突）。
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{MockCos, clean_business_db, clean_db, ensure_database_exists, test_pool};

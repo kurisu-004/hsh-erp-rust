@@ -1,14 +1,15 @@
 //! part 域 to-XXX 端点集成测试的共享 fixtures + HTTP helpers
 //!
-//! 由 `tests/part_api_to_ship.rs` / `part_api_to_inspection.rs` /
-//! `part_api_to_process.rs` 通过 `#[path = "part_api_helpers.rs"] mod helpers;`
-//! 共用。所有 helper 都 `pub`，便于跨文件 `use helpers::*`。
+//! 由 `tests/part/{to_ship,to_inspection,to_process}.rs` 通过 `mod helpers;`
+//! 同 subdir 解析共用。所有 helper 都 `pub`，便于跨文件 `use helpers::*`。
 //!
 //! 设计意图：把 `tests/part_api.rs`（原 1337 行）拆成按 to-XXX 端点切分的
 //! 顶层测试文件，每个文件 ≤ 1000 行（CLAUDE.md 单文件行数上限）。
 //!
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
+//!
+//! 2026-09-23 PR13 Phase C：随 part 子目录化，已无 `#[path]` 前缀。
 
 // 跨测试文件共享的 fixtures：每个测试 binary 只用其中一部分（例如
 // part_api_to_ship 用 login_manager / login_clerk / batch_version，
@@ -19,9 +20,16 @@
 // 2026-09-16 PR-3 fix：允许 `clippy::await_holding_lock` —— fixture 模式与
 // common/ 一致（pool_snowflake().lock() 跨 .await 持锁），进程内单 task
 // 不会真实死锁。`unused_imports` 同 worker_pool_api.rs。
+// 2026-09-23 PR13 Phase C：mod.rs 的 inner attr 不向下传播到子 module，
+// helpers.rs 必须自己挂 #![allow(...)] 才能在 guard_dn_in_use_api /
+// assembly_status_sync（也走 `#[path = "part/helpers.rs"]` 引用本文件）
+// 这两个 binary 里免 dead_code warning。
+
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
-#[path = "common/mod.rs"]
+// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
+// 故本文件自带 `mod common;`（与 main.rs 的同名 pub mod 不冲突）。
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};
