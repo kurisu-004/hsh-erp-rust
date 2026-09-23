@@ -19,7 +19,7 @@
 //! 测试**没有**借助 part 域 CRUD（part 域自身不在 Task 3 范围内），而是直接
 //! SQL INSERT 落表 —— 与 `customer_api.rs` / `process_api.rs` 的同形 fixture 思路一致。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};

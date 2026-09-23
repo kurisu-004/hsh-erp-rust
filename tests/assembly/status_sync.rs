@@ -36,10 +36,13 @@
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
-#[path = "part/helpers.rs"]
+// 2026-09-23 PR13 Phase C+D 协调：helpers 从 tests/part_api_helpers.rs 迁到
+// tests/part/helpers.rs（Phase C），本文件同步 Phase D 进 assembly/ 子目录，
+// 相对路径需加 ../ → `../part/helpers.rs`。
+#[path = "../part/helpers.rs"]
 mod helpers;
 
 use axum::http::StatusCode;

@@ -15,7 +15,7 @@
 //!   9. three_state_note_overwrite               — Some(Some(v)) 覆盖
 //!  10. child_current_batch_id_in_detail         — 子件有活跃 batch → current_batch_id 非空
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};

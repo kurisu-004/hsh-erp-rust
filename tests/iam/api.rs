@@ -17,7 +17,7 @@
 //! `/api/v2/iam/*`。原 `tests/auth_api_legacy.rs`（PR-1 兼容期回归 5 用例）随 PR-4
 //! 旧 alias 下线一并删除。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};

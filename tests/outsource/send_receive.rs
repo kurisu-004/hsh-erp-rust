@@ -9,7 +9,7 @@
 //! 注：实际 send/receive 端点在 part 域（part_lifecycle_api.rs 已覆盖 happy path）。
 //! 本测试聚焦 shipment 表的写入正确性。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};

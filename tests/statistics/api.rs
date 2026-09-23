@@ -8,7 +8,7 @@
 //!   5. pickup_skips_summary        — MANAGER 调 pickup-skips summary
 //!   6. pickup_skip_detail          — MANAGER 调 pickup-skips detail（分页）
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use chrono::NaiveDate;

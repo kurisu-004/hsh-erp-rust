@@ -11,7 +11,7 @@
 //! 1. delivered_stats 按事件计数（含 on_time / orange / red 分类）
 //! 2. count_overdue_undelivered 按事件口径判未交付
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use chrono::NaiveDate;

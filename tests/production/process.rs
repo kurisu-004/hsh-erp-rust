@@ -13,7 +13,7 @@
 // ## 认证
 // 用 MANAGER 用户跑通（POST /processes 写路径要求 M-only，按设计 §6.1 用 M 即可）。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};

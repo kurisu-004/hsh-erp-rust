@@ -18,9 +18,10 @@
 //! `insert_worker` / `insert_l2_customer` 等）走 `pool_snowflake().lock()` 跨 .await
 //! 持锁模式，与 common/ + worker_pool_api.rs 一致；`unused_imports` 是顶层
 //! `use SnowflakeIdGenerator` 仅作类型签名引用。
-#![allow(clippy::await_holding_lock, unused_imports)]
+//! 2026-09-23 PR13 Phase D：`#![allow]` 已在 tests/production/mod.rs 集中豁免，
+//! 本文件移除。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};
