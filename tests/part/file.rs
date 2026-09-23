@@ -14,70 +14,31 @@
 //! 不启 axum（避免 JWT/Redis 开销），直接 service 直调；`pool.begin()` 开 tx →
 //! 传 `&mut *tx` 给 service → 显式 `tx.commit()`。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
-// 故本文件自带 `mod common;`（与 main.rs 的同名 pub mod 不冲突）。
-#[path = "../common/mod.rs"]
-mod common;
+// 2026-09-23 PR13 Phase C：edition 2024 下 `mod common;` 在 sub-file 中只查 sibling 目录。
+// 2026-09-23 PR13 Phase G：fixture 由 PartFixture 提供（customers + part）。MockCos /
+// NoopCos 保留；动态 part 插入由 sub-file 内联 helper 完成（每个测试都需要自己的 part）。
+#[path = "helpers.rs"]
+mod helpers;
 
-use common::{MockCos, clean_business_db, clean_db, ensure_database_exists, test_pool};
+use std::sync::Arc;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
-use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::cos::NoopCos;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::part_file::service::PartFileService;
 use hsh_erp_rust::shared::error::AppError;
 use sqlx::PgPool;
-use std::sync::Arc;
+
+use helpers::*;
 
 // ===========================================================================
-//  全局串行化 + setup
+//  动态 customer / part 插入 helper（sub-file 私有，PR-C 末统一迁）
 // ===========================================================================
 
-
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
-    let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
-}
-
-// ===========================================================================
-//  私有 fixture helpers
-// ===========================================================================
-
-fn test_current_user_with_roles(roles: Vec<Role>) -> CurrentUser {
-    CurrentUser {
-        id: 1,
-        username: "tester".into(),
-        roles,
-        shelf_ids: vec![],
-        shelf_wildcard: false,
-    }
-}
-
-async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
-    let id = snowflake.next_id();
-    let now = now_naive();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
-    )
-    .bind(id)
-    .bind(name)
-    .bind(l1_id)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert L2 customer");
-    id
-}
-
+/// 在 fixture 之外另建 1 个 L1 客户（避免污染 fixture）。
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
+    use hsh_erp_rust::infra::clock::now_naive;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -95,8 +56,29 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     id
 }
 
+async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(l1_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert L2 customer");
+    id
+}
+
 async fn insert_part_for_owner(pool: &PgPool, customer_id: i64) -> i64 {
-    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
+    use hsh_erp_rust::infra::clock::now_naive;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
@@ -116,6 +98,30 @@ async fn insert_part_for_owner(pool: &PgPool, customer_id: i64) -> i64 {
     .await
     .expect("insert t_part");
     id
+}
+
+// ===========================================================================
+//  setup helper
+// ===========================================================================
+
+async fn setup() -> PgPool {
+    let pool = test_pool().await;
+    let _fx = load_part_fixture(&pool).await;
+    pool
+}
+
+// ===========================================================================
+//  私有 fixture helpers
+// ===========================================================================
+
+fn test_current_user_with_roles(roles: Vec<Role>) -> CurrentUser {
+    CurrentUser {
+        id: 1,
+        username: "tester".into(),
+        roles,
+        shelf_ids: vec![],
+        shelf_wildcard: false,
+    }
 }
 
 // ===========================================================================
@@ -613,17 +619,7 @@ async fn soft_delete_version_conflict() {
     }
 }
 
-// ===========================================================================
-// 2026-09-18 注释：原 M2-B review 第 1 轮的 upload-intents 集成测试
-// （upload_intents_owner_not_found / upload_intents_dedup_hit）已删除——
-// upload-intents 端点 2026-09-18 删除，迁移至 upload_session 域（Redis 共享
-// STS 凭证机制）。本文件保留 confirm 端点的集成测试（tmp_missing /
-// size_mismatch / replace_old_single 三条），通过 PartFileService::bind_uploaded_file
-// 端到端验证。
-//
-// 2026-09-18 注：原 upload-intents 测试用到的 `infra::sts::NoopSts` 也已删除，
-// 现统一用 `infra::python_sts::NoopPythonSts`（占位 STS 转发到 python 后端）。
-// ===========================================================================
+// ===== 2026-09-18 takeover：confirm 端点测试 =====
 
 use hsh_erp_rust::modules::part_file::dto::ConfirmFileIn;
 use hsh_erp_rust::modules::part_file::repo::PartFileRepo;
@@ -633,7 +629,6 @@ const UPLOAD_UPLOAD_PREFIX: &str = "uploads";
 
 #[tokio::test]
 async fn confirm_tmp_missing_returns_21114() {
-    // 验证 plan T2.6：head_object 返回 NoSuchKey → 21114 TMP_OBJECT_MISSING
     let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-TmpMiss", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-TmpMiss", l1).await;
@@ -687,7 +682,6 @@ async fn confirm_tmp_missing_returns_21114() {
 
 #[tokio::test]
 async fn confirm_size_mismatch_returns_21115() {
-    // 验证 plan T2.6：head size 与声明 size 不一致 → 21115 SIZE_MISMATCH
     let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-SizeMM", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-SizeMM", l1).await;
@@ -737,7 +731,6 @@ async fn confirm_size_mismatch_returns_21115() {
 
 #[tokio::test]
 async fn confirm_replace_old_single_returns_ready() {
-    // 验证 plan T2.6：同 part+kind 二次 confirm → 旧行 deleted_at 已设，新行 READY
     let pool = setup().await;
     let l1 = insert_l1_customer(&pool, "客户PF-Replace", "F").await;
     let l2 = insert_l2_customer(&pool, "子客PF-Replace", l1).await;

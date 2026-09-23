@@ -10,18 +10,91 @@
 //! 完全独立，无需 Mutex 串行化。
 //! 每个用例 INSPECTOR token（白名单）。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
-// 故本文件自带 `mod common;` / `mod helpers;`（与 main.rs 的同名 pub mod 不冲突）。
-#[path = "../common/mod.rs"]
-mod common;
+// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录。
+// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel；fixture 由
+// `hsh_erp_test_support::fixture::PartFixture` 提供；批量 part 插入由
+// `insert_part_with_status` / `insert_batch` / `batch_version` 提供。
 #[path = "helpers.rs"]
 mod helpers;
 
 use axum::http::StatusCode;
 use serde_json::json;
+use sqlx::PgPool;
 
-use common::{create_chain_for_part, create_step};
+use hsh_erp_test_support::fixture::PartFixture;
 use helpers::*;
+
+// ===========================================================================
+//  动态 part/batch 插入 helper（tests/part/ 各 sub-file 私有，PR-C 末统一迁）
+// ===========================================================================
+
+/// 创建一个 part（指定 status）和一个 batch（默认 INSPECTION，qty=5），
+/// 返回 `(part_id, batch_id)`。
+async fn insert_part_with_batch(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    status: &str,
+    batch_status: &str,
+) -> (i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let batch_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, 'D-001', $4, $7, $3, $5, $5, 1, 0, $6, $6)",
+    )
+    .bind(part_id)
+    .bind(serial_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .bind(status)
+    .execute(pool)
+    .await
+    .expect("insert part");
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 1, 5, $3, 0, $4, $4)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(batch_status)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert batch");
+    (part_id, batch_id)
+}
+
+async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
+    sqlx::query_scalar::<_, i32>("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .expect("batch not found")
+}
+
+// ===========================================================================
+//  bootstrap helpers
+// ===========================================================================
+
+async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String, PartFixture) {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.inspector_username, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
+}
 
 // ===========================================================================
 //  Tests
@@ -35,14 +108,17 @@ use helpers::*;
 /// 「非数字」值（"abc"）保留 service 层 20104 校验路径的覆盖。
 #[tokio::test]
 async fn to_process_invalid_shelf_id_rejected() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
-    let (_insp, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
-    let batch_id = insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
-    let v = batch_version(&_pool, batch_id).await;
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0",
+        fx.customer_l2_id,
+        Some("P000"),
+        "INSPECTION",
+        "INSPECTION",
+    )
+    .await;
+    let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -68,14 +144,17 @@ async fn to_process_invalid_shelf_id_rejected() {
 /// to-process 拒绝：next_process_id 非数字 → 20104 BIZ_INVALID_VALUE。
 #[tokio::test]
 async fn to_process_invalid_next_process_id_rejected() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
-    let (_insp, prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
-    let batch_id = insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
-    let v = batch_version(&_pool, batch_id).await;
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0",
+        fx.customer_l2_id,
+        Some("P000"),
+        "INSPECTION",
+        "INSPECTION",
+    )
+    .await;
+    let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -83,7 +162,7 @@ async fn to_process_invalid_next_process_id_rejected() {
             "POST",
             &format!("/parts/{part_id}/to-process"),
             Some(json!({
-                "shelf_id": prod_shelf.to_string(),
+                "shelf_id": fx.production_shelf_id.to_string(),
                 "next_process_id": "abc",
                 "batch_id": batch_id.to_string(),
                 "version": v,
@@ -101,17 +180,20 @@ async fn to_process_invalid_next_process_id_rejected() {
 /// 2026-09-16 PR-3 适配：to-process 入口要求 part 已绑定工艺链（20706）。
 #[tokio::test]
 async fn to_process_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
-    let (_insp, prod_shelf, next_proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0",
+        fx.customer_l2_id,
+        Some("P000"),
+        "INSPECTION",
+        "INSPECTION",
+    )
+    .await;
     // PR-3：建链并把 part 绑到 chain
-    let chain_id = create_chain_for_part(&_pool, part_id).await;
-    let _step_id = create_step(&_pool, chain_id, next_proc, 1).await;
-    let batch_id = insert_batch(&_pool, part_id, 1, 5, "INSPECTION").await;
-    let v = batch_version(&_pool, batch_id).await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -119,8 +201,8 @@ async fn to_process_happy_path() {
             "POST",
             &format!("/parts/{part_id}/to-process"),
             Some(json!({
-                "shelf_id": prod_shelf.to_string(),
-                "next_process_id": next_proc.to_string(),
+                "shelf_id": fx.production_shelf_id.to_string(),
+                "next_process_id": fx.process_id.to_string(),
                 "note": "test fail",
                 "batch_id": batch_id.to_string(),
                 "version": v,
@@ -133,18 +215,26 @@ async fn to_process_happy_path() {
     assert_eq!(body["data"]["part"]["status"], "IN_PROCESS");
 }
 
-/// to-process 拒绝：非 INSPECTION 状态（PENDING） → 400 / 20103。
+/// to-process 拒绝：非 INSPECTION 状态（PENDING）→ 404 / 20109。
+///
+/// 2026-09-16 PR-3 后，state machine 允许 PENDING → IN_PROCESS（place-on-shelf 路径）；
+/// to_process 是品检打回流，要求 part 已绑定工艺链 + 存在 INSPECTION 批次。
+/// PENDING part 没有 INSPECTION 批次 → service 在 step 4 `find_inspection_batch_for_fail`
+/// 抛 20109 BIZ_PART_BATCH_NOT_FOUND（HTTP 404）。
 #[tokio::test]
 async fn to_process_wrong_state_rejected() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
-    let (_insp, prod_shelf, next_proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
     // setup: PENDING part（非 INSPECTION）
-    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "PENDING").await;
-    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
-    let v = batch_version(&_pool, batch_id).await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0",
+        fx.customer_l2_id,
+        Some("P000"),
+        "PENDING",
+        "PENDING",
+    )
+    .await;
+    let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -152,8 +242,8 @@ async fn to_process_wrong_state_rejected() {
             "POST",
             &format!("/parts/{part_id}/to-process"),
             Some(json!({
-                "shelf_id": prod_shelf.to_string(),
-                "next_process_id": next_proc.to_string(),
+                "shelf_id": fx.production_shelf_id.to_string(),
+                "next_process_id": fx.process_id.to_string(),
                 "batch_id": batch_id.to_string(),
                 "version": v,
             })),
@@ -161,8 +251,8 @@ async fn to_process_wrong_state_rejected() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
-    assert_eq!(body["code"], 20103);
+    assert_eq!(status, StatusCode::NOT_FOUND, "body={body}");
+    assert_eq!(body["code"], 20109, "BIZ_PART_BATCH_NOT_FOUND: {body}");
 }
 
 /// to-process partial-split happy path：INSPECTION 批次 qty=10 → quantity=3 → 拆批。
@@ -174,17 +264,21 @@ async fn to_process_wrong_state_rejected() {
 /// - 响应 `part` 投影展示最新 OCC 版本。
 #[tokio::test]
 async fn to_process_partial_split_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool, "inspector1").await;
-    let (_insp, prod_shelf, next_proc) = setup_inspection_and_production_shelves(&_pool).await;
-    let part_id = insert_part_with_status(&_pool, "P0", l2, Some("P000"), None, "INSPECTION").await;
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (part_id, batch_id) = insert_part_with_batch_qty(
+        &pool,
+        "P0",
+        fx.customer_l2_id,
+        Some("P000"),
+        "INSPECTION",
+        "INSPECTION",
+        10,
+    )
+    .await;
     // 2026-09-16 PR-3：to_process 要求 part 已绑定工艺链
-    let chain_id = create_chain_for_part(&_pool, part_id).await;
-    let _step_id = create_step(&_pool, chain_id, next_proc, 1).await;
-    let batch_id = insert_batch(&_pool, part_id, 1, 10, "INSPECTION").await;
-    let v = batch_version(&_pool, batch_id).await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -192,8 +286,8 @@ async fn to_process_partial_split_happy_path() {
             "POST",
             &format!("/parts/{part_id}/to-process"),
             Some(json!({
-                "shelf_id": prod_shelf.to_string(),
-                "next_process_id": next_proc.to_string(),
+                "shelf_id": fx.production_shelf_id.to_string(),
+                "next_process_id": fx.process_id.to_string(),
                 "quantity": 3,
                 "batch_id": batch_id.to_string(),
                 "version": v,
@@ -222,4 +316,56 @@ async fn to_process_partial_split_happy_path() {
         batch_id.to_string(),
         "remainder id 应回填为源批次 id"
     );
+}
+
+// ===========================================================================
+//  内部 helper（qty=10 版本）
+// ===========================================================================
+
+async fn insert_part_with_batch_qty(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    status: &str,
+    batch_status: &str,
+    qty: i32,
+) -> (i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let batch_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, 'D-001', $4, $7, $3, $5, $5, 1, 0, $6, $6)",
+    )
+    .bind(part_id)
+    .bind(serial_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .bind(status)
+    .execute(pool)
+    .await
+    .expect("insert part");
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, $4, 0, $5, $5)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(qty)
+    .bind(batch_status)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert batch");
+    (part_id, batch_id)
 }

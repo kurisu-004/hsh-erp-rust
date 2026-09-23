@@ -10,63 +10,108 @@
 //! ## 批次守恒不变量测试
 //! `Σ(未删批次.quantity) = t_part.quantity` 必须保持 —— 用 `invariant` 命名空间测试。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
-// 故本文件自带 `mod common;` / `mod helpers;`（与 main.rs 的同名 pub mod 不冲突），
-// 每 sub-file 走自己的 `crate::part::<sub>::common` / `::helpers` 模块子树，
-// 路径独立、避免循环引用，与 Phase A 兼容期 facade 保持 `use common::*;` 调用风格不变。
-#[path = "../common/mod.rs"]
-mod common;
+// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录。
+// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel；fixture 由 PartFixture 提供。
 #[path = "helpers.rs"]
 mod helpers;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
-use serde_json::{Value, json};
+use axum::http::StatusCode;
+use serde_json::json;
 use sqlx::PgPool;
-use tower::ServiceExt;
 
-use common::{clean_business_db, clean_db, test_pool};
-
+use hsh_erp_test_support::fixture::PartFixture;
 use helpers::*;
 
+// ===========================================================================
+//  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）
+// ===========================================================================
 
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
+async fn insert_part_with_batch(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    status: &str,
+    qty: i32,
+) -> (i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let batch_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, NULL, $2, 'D-001', $3, $6, $2, $4, $4, 1, 0, $5, $5)",
+    )
+    .bind(part_id)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .bind(status)
+    .execute(pool)
+    .await
+    .expect("insert part");
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, $4, 0, $5, $5)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(qty)
+    .bind(status)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert batch");
+    (part_id, batch_id)
+}
+
+async fn insert_extra_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, status: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let batch_id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 0, $6, $6)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(batch_no)
+    .bind(qty)
+    .bind(status)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert extra batch");
+    batch_id
+}
+
+async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
+    sqlx::query_scalar::<_, i32>("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
         .await
-        .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body)));
-    (status, envelope)
+        .expect("batch not found")
 }
 
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
+// ===========================================================================
+//  bootstrap helpers
+// ===========================================================================
 
-async fn setup() -> PgPool {
-    common::ensure_database_exists().await;
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, PartFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
 // ===========================================================================
@@ -75,13 +120,9 @@ async fn setup() -> PgPool {
 
 #[tokio::test]
 async fn split_batch_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 10, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
@@ -105,13 +146,9 @@ async fn split_batch_happy_path() {
 
 #[tokio::test]
 async fn split_batch_invalid_quantity_rejects() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 10, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     // quantity == batch.quantity (不允许，等于整批)
     let body = json!({
         "batch_id": bid.to_string(),
@@ -134,13 +171,9 @@ async fn split_batch_invalid_quantity_rejects() {
 
 #[tokio::test]
 async fn split_batch_quantity_negative_rejects() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 10, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
@@ -164,13 +197,9 @@ async fn split_batch_quantity_negative_rejects() {
 
 #[tokio::test]
 async fn invariant_split_preserves_total_quantity() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 10, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
-    let (app, token, pool_clone) = login_manager(pool.clone(), "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
@@ -192,7 +221,7 @@ async fn invariant_split_preserves_total_quantity() {
         "SELECT COALESCE(SUM(quantity), 0)::bigint FROM t_part_batch WHERE part_id = $1 AND deleted_at IS NULL",
     )
     .bind(pid)
-    .fetch_one(&pool_clone)
+    .fetch_one(&pool)
     .await
     .expect("sum quantity");
     assert_eq!(total, 10, "拆批前后总件数必须守恒 (10=3+7): {env}");
@@ -200,13 +229,9 @@ async fn invariant_split_preserves_total_quantity() {
 
 #[tokio::test]
 async fn cancel_batch_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "version": version,
     });
@@ -226,13 +251,9 @@ async fn cancel_batch_happy_path() {
 
 #[tokio::test]
 async fn cancel_batch_terminal_protection() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "COMPLETED").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "COMPLETED").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "COMPLETED", 5).await;
     let version = batch_version(&pool, bid).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "version": version,
     });
@@ -252,13 +273,9 @@ async fn cancel_batch_terminal_protection() {
 
 #[tokio::test]
 async fn list_batches_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    insert_batch(&pool, pid, 1, 5, "PENDING").await;
-    insert_batch(&pool, pid, 2, 3, "PENDING").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, _bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
+    insert_extra_batch(&pool, pid, 2, 3, "PENDING").await;
     let (s, env) = send(
         app,
         json_request("GET", &format!("/parts/{pid}/batches"), None, Some(&token)),
@@ -272,11 +289,8 @@ async fn list_batches_happy_path() {
 
 #[tokio::test]
 async fn list_events_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, _bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 1).await;
     let (s, env) = send(
         app,
         json_request("GET", &format!("/parts/{pid}/events"), None, Some(&token)),
@@ -290,8 +304,7 @@ async fn list_events_happy_path() {
 
 #[tokio::test]
 async fn location_tree_happy_path() {
-    let pool = setup().await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
     let (s, env) = send(
         app,
         json_request("GET", "/parts/location-tree", None, Some(&token)),
