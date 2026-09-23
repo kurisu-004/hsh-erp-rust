@@ -21,7 +21,7 @@ use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::serial::next_customer_serial_via_pool;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::shared::error::code;
-use helpers::*;
+use hsh_erp_test_support::*;
 
 /// 清空 `t_serial_counter` + `t_part`（acquire 关联表），保证测试隔离。
 async fn reset_serial_state(pool: &sqlx::PgPool) {

@@ -16,7 +16,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
-use helpers::*;
+use hsh_erp_test_support::*;
 
 // ===========================================================================
 //  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）

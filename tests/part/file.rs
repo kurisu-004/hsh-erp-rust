@@ -29,7 +29,7 @@ use hsh_erp_rust::modules::part_file::service::PartFileService;
 use hsh_erp_rust::shared::error::AppError;
 use sqlx::PgPool;
 
-use helpers::*;
+use hsh_erp_test_support::*;
 
 // ===========================================================================
 //  动态 customer / part 插入 helper（sub-file 私有，PR-C 末统一迁）

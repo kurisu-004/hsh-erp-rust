@@ -25,7 +25,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use helpers::*;
+use hsh_erp_test_support::*;
 use hsh_erp_test_support::fixture::PartFixture;
 
 // ===========================================================================

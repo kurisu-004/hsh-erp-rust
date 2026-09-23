@@ -24,7 +24,7 @@ use hsh_erp_rust::modules::part::service::PartService;
 use hsh_erp_rust::modules::part_file::policy;
 use hsh_erp_rust::modules::part_file::repo::PartFileRepo;
 use hsh_erp_rust::shared::error::code;
-use helpers::*;
+use hsh_erp_test_support::*;
 
 // ===========================================================================
 //  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）
