@@ -27,16 +27,13 @@
 //! 完全独立，无需 Mutex 串行化。
 //! 每个用例 MANAGER token（M/C/I 三角色之一都能用，本系列用 MANAGER）。
 
-#[path = "common/mod.rs"]
-mod common;
-
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header::AUTHORIZATION};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{
+use hsh_erp_test_support::{
     add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
     test_app, test_pool, test_state,
 };

@@ -17,16 +17,13 @@
 //! DB 间 schema 完全独立，无需 Mutex 串行化。
 //! 每个用例 MANAGER token。
 
-#[path = "common/mod.rs"]
-mod common;
-
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header::AUTHORIZATION};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{
+use hsh_erp_test_support::{
     add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
     test_app, test_pool,
 };
@@ -79,7 +76,7 @@ async fn setup() -> PgPool {
 async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
     let uid = insert_user_with_password(&pool, username, "changeme").await;
     add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = common::test_state(pool.clone()).await;
+    let state = hsh_erp_test_support::test_state(pool.clone()).await;
     let app = test_app(state.clone());
     let (_, env) = send(
         app,
