@@ -1401,6 +1401,7 @@ dependencies = [
  "deadpool-redis",
  "dotenvy",
  "futures-util",
+ "hsh-erp-test-support",
  "jsonwebtoken",
  "libc",
  "lopdf",
@@ -1427,6 +1428,37 @@ dependencies = [
  "umya-spreadsheet",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "hsh-erp-test-support"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "dashmap",
+ "deadpool-redis",
+ "dotenvy",
+ "futures-util",
+ "hsh-erp-rust",
+ "jsonwebtoken",
+ "libc",
+ "opendal",
+ "redis",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -1,0 +1,89 @@
+[package]
+name = "hsh-erp-test-support"
+version = "0.1.0"
+edition = "2024"
+description = "集成测试共享基建（PR13 Phase A，2026-09-23 从 tests/common/ 拆出）"
+publish = false
+
+# 2026-09-23 新增（PR13 Phase A）：从主仓 `tests/common/mod.rs` + `pem.rs`
+# 抽到独立 dev-only crate。test-support 反向依赖主 crate `hsh-erp-rust` 是
+# cargo 允许的常规模式——主仓的 integration tests 在 `dev-dependencies` 里
+# 引用 `hsh-erp-test-support`，cargo 会先把 hsh-erp-rust 编译完，再编译
+# hsh-erp-test-support（其依赖关系已冻结），最后编译 integration tests
+# 链上本 crate。反向依赖不会导致循环构建问题。
+#
+# 当前 crate 设计动机：
+# - tests/common/mod.rs 已 1393 行 + pem.rs 209 行（2026-09-23 实测），
+#   主仓一级目录 `tests/` 下不便再分层；独立 crate 能物理隔离后续模块扩展。
+# - 后续 Phase B/C/D 按 domain 拆 helper 时，本 crate 内按职责继续切子模块，
+#   不动主仓 `tests/` 51 个 binary 的 `use common::{...}` 入口（保留 facade）。
+
+[dependencies]
+# 主二进制（cargo 允许 test crate 反向依赖主 crate，依赖图无环）
+hsh-erp-rust = { path = ".." }
+
+# 数据库（fresh_database_url + test_pool 用）
+sqlx = { version = "0.9", features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "chrono",
+    "migrate",
+    "rust_decimal",
+] }
+
+# 异步运行时 + 取消令牌（atexit DROP 不需要 runtime；test_redis_pool / test_pool 用）
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+
+# Redis（session / idempotency 测试用）
+deadpool-redis = "0.23"
+redis = { version = "1", default-features = false, features = ["tokio-comp"] }
+
+# JWT key 编码（test_state_*_with_redis / disabled_session / cos 走 RS256 private key）
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+
+# RSA 密钥对生成（pem module，dev-only）
+rsa = { version = "0.9", features = ["pem"] }
+
+# atexit DROP（tests/common/mod.rs 历史就用，迁来保留）
+libc = "0.2"
+
+# axum router helper（test_app / test_ws_app 用）
+axum = { version = "0.8", features = ["ws", "multipart", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+
+# 序列化 / 时间 / 错误（test fixture + pem roundtrip 测试）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+
+# HTTP 客户端（主仓传递，本 crate 目前不需要直接用——列出来对齐）
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# uuid（fresh_database_url 派生 test_<uuid>）
+uuid = { version = "1", features = ["v4"] }
+
+# sha2（pem / part_file content hash 是主仓用，本 crate 不需要——列出来对齐传递依赖）
+sha2 = "0.10"
+
+# 日志追踪（主仓传递）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 配置加载（主仓传递——本 crate .env 不需要，但列出来防止版本漂移）
+dotenvy = "0.15"
+
+# 异步 + 并发工具
+async-trait = "0.1"            # MockCos::CosClient impl
+futures-util = "0.3"
+dashmap = "6"
+
+# OpenDAL（test_state_with_cos 等不直接用；主仓传递，列出来对齐）
+# 本 crate 用的是 NoopCos / NoopPythonSts 占位，OpenDAL 仅作传递依赖声明。
+opendal = { version = "0.53", default-features = false, features = ["services-memory"] }
+
+# 不包含（按 PR13 Phase A 任务硬约束）：
+# - umya-spreadsheet / zip / quick-xml / tokio-stream / calamine：Excel 打印
+#   与真 COS 集成测试专属，与本测试基建解耦。
