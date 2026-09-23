@@ -9,7 +9,7 @@
 //! - soft-delete 仅 DRAFT / REJECTED 可删
 //! - duplicate 同 (part, company, process) → 409
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};

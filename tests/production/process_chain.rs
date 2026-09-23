@@ -16,7 +16,7 @@
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex / `--test-threads=1` 双保险。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};

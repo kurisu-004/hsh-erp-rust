@@ -17,7 +17,7 @@
 //! 测试栈：tokio::test + tower::ServiceExt::oneshot + test_state_with_redis
 //! （必须建 Redis pool，session 写入才算「已吊销」）
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};

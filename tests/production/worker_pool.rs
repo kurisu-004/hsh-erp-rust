@@ -29,9 +29,10 @@
 //! 一致，豁免 `await_holding_lock`。`unused_imports` 豁免是因为 `use
 //! SnowflakeIdGenerator` 在文件顶层未直接使用（仅作为 `pool_snowflake()` 返回
 //! 类型签名引用）。
-#![allow(clippy::await_holding_lock, unused_imports)]
+//! 2026-09-23 PR13 Phase D：`#![allow]` 已在 tests/production/mod.rs 集中豁免，
+//! 本文件移除。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};

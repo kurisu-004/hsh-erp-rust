@@ -15,7 +15,7 @@
 //! 1. shelf 被活跃 IN_PROCESS 批次持有 → deactivate 拒（20503）
 //! 2. worker 被活跃 IN_PROCESS 批次持有 → deactivate 拒（20203）
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::http::StatusCode;

@@ -9,7 +9,7 @@
 //! - list-by-process: 按 process 反查 active 公司
 //! - set-processes: 整体替换（delete-then-insert）
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use axum::body::{Body, to_bytes};

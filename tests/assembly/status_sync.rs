@@ -36,10 +36,10 @@
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
-#[path = "part_api_helpers.rs"]
+#[path = "../part_api_helpers.rs"]
 mod helpers;
 
 use axum::http::StatusCode;

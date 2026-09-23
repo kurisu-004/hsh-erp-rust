@@ -35,7 +35,7 @@
 //!   - 不走 HTTP 启动（避免 JWT/Redis 开销），直接 service 调用；`pool.begin()`
 //!     开 tx → 传 `&mut *tx` 给 service → 显式 `tx.commit()`。
 
-#[path = "common/mod.rs"]
+#[path = "../common/mod.rs"]
 mod common;
 
 use lopdf::{Document, Object, ObjectId, dictionary};
