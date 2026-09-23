@@ -8,21 +8,34 @@
 //! 真正的端到端 happy-path 在 fixtures 完整时再补（依赖 part / assembly / part_batch 表
 //! 之外的数据；当前 Phase P1+P2 fixtures 还未支持「L1 customer + serial_prefix +
 //! DRAFT 单 + READY_TO_SHIP 批次」全套数据，因此这里只做 smoke + 角色校验）。
+//!
+//! 2026-09-23 PR13 Phase G 改造：
+//! - **保留本地 `fn send` 签名 `-> (StatusCode, Vec<u8>)`**：calamine 回读 xlsx
+//!   路径需要原始字节（不进 JSON 解析），与 `test-support::http::send`
+//!   `(StatusCode, Value)` 签名不一致，**不可统一**。
+//! - 删除本地 `fn json_request`（签名与 test-support 一致），改用
+//!   `hsh_erp_test_support::json_request`。
+//! - 删除本地 `fn setup`（仅做 `ensure_database_exists` + `test_pool` + `clean_db` +
+//!   `clean_business_db`，全是 test-support 入口；`ensure_database_exists` 是 no-op，
+//!   `clean_db` / `clean_business_db` 不在本测试用 —— `test_pool()` 每次已 fresh database）。
+//! - 删除本地 `fn login`（MANAGER 登录走 test-support `login_token` + 本地 `send`，
+//!   维持 Vec<u8> 解析）。其它 helper 全部走 fixture 范本。
 
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use axum::http::Request;
+use axum::http::StatusCode;
 use calamine::{Reader, open_workbook_auto};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
 use hsh_erp_test_support::{
-    add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
-    test_app,
+    DeliveryFixture, json_request, load_delivery_fixture, test_app, test_pool, test_state,
 };
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
-
+/// **保留本地 send**：calamine 回读需要原始字节，进 JSON 解析会丢数据。
+/// 与 `test-support::http::send` 签名不一致，不替换。
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     let response = app.oneshot(req).await.expect("oneshot");
     let status = response.status();
@@ -32,45 +45,23 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     (status, body.to_vec())
 }
 
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
-    let pool = hsh_erp_test_support::test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
-}
-
-async fn login(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = hsh_erp_test_support::test_state(pool.clone()).await;
+/// 起 fresh database + 加载 delivery fixture + 以 MANAGER 身份登录。
+///
+/// 复刻通用 bootstrap 形态但保留 Vec<u8> 解析（parse login response 仍走 JSON，
+/// 但不走 `test-support::login_token` —— 后者内部用 `send` 走 JSON 解析路径，
+/// 本文件必须保留本地 `send`）。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, DeliveryFixture) {
+    let pool = test_pool().await;
+    let fx = load_delivery_fixture(&pool).await;
+    let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
+    // 走 json_request（test-support）+ send（本地）拿登录响应
     let (_, env_bytes) = send(
         app,
         json_request(
             "POST",
             "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
+            Some(json!({"username": &fx.part_manager_username, "password": DeliveryFixture::PASSWORD})),
             None,
         ),
     )
@@ -78,13 +69,13 @@ async fn login(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
     let env: Value = serde_json::from_slice(&env_bytes).expect("parse login response");
     let token = env["data"]["token"].as_str().unwrap().to_string();
     let app2 = test_app(state);
-    (app2, token, pool)
+    (pool, app2, token, fx)
 }
 
 #[tokio::test]
 async fn print_endpoint_requires_auth() {
-    let pool = setup().await;
-    let state = hsh_erp_test_support::test_state(pool.clone()).await;
+    let pool = test_pool().await;
+    let state = test_state(pool.clone()).await;
     let app = test_app(state);
     let req = json_request("POST", "/delivery-notes/1/print", Some(json!({})), None);
     let (status, _body) = send(app, req).await;
@@ -93,8 +84,7 @@ async fn print_endpoint_requires_auth() {
 
 #[tokio::test]
 async fn print_endpoint_passes_role_check_for_manager() {
-    let pool = setup().await;
-    let (app, token, _) = login(pool, "print_mgr").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
     let req = json_request(
         "POST",
         "/delivery-notes/1/print",
@@ -110,8 +100,7 @@ async fn print_endpoint_passes_role_check_for_manager() {
 
 #[tokio::test]
 async fn print_labels_route_exists() {
-    let pool = setup().await;
-    let (app, token, _) = login(pool, "labels_mgr").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
     let req = json_request(
         "POST",
         "/delivery-notes/1/print-labels",

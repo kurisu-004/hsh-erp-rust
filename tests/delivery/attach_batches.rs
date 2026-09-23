@@ -16,99 +16,58 @@
 //! 并行 / 认证：进程级 test_pool 每次 fresh database（plan 2 2026-09-20），
 //! DB 间 schema 完全独立，无需 Mutex 串行化。
 //! 每个用例 MANAGER token。
+//!
+//! 2026-09-23 PR13 Phase G 改造：本地 `fn send` / `fn json_request` / `fn setup` /
+//! `fn login_manager` 全部删除，统一用 `hsh_erp_test_support::{send, json_request,
+//! login_token, test_pool, test_state, test_app, load_delivery_fixture}`。
+//! 新增 `bootstrap_as_manager` 样板；本地 `insert_l1` / `insert_l2` / `insert_part` /
+//! `create_batch` / `create_draft_note` / `create_draft_note_via_api` / `submit_note`
+//! 保留（测试需要特定 part.status / batch.status / note.no / 走 API 创建等业务数据，
+//! fixture 不预置此类业务数据）。
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tower::ServiceExt;
 
 use hsh_erp_test_support::{
-    add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
-    test_app, test_pool,
+    DeliveryFixture, json_request, load_delivery_fixture, login_token, send, test_app, test_pool,
+    test_state,
 };
+
+use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
-//  全局串行化 + helpers
+//  Bootstrap helpers
 // ===========================================================================
 
-
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body)));
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 delivery fixture + 以 MANAGER 身份登录。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, DeliveryFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_delivery_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.part_manager_username, DeliveryFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = hsh_erp_test_support::test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token, pool)
-}
-
-// ---------- fixture helpers（与 delivery_scan_api.rs 同形；独立副本避免测试间耦合） ----------
+// ===========================================================================
+//  Domain fixtures：L1 / L2 客户 + part + batch + 草稿 note + submit
+//  （保留本地 helper：测试需要特定 name / status / 走 API 创建等业务数据）
+// ===========================================================================
 
 async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, NULL, $3, 0, $4, NULL, $4, NULL)",
-        id,
-        name,
-        prefix,
-        now,
     )
+    .bind(id)
+    .bind(name)
+    .bind(prefix)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert L1");
@@ -116,19 +75,18 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 }
 
 async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
-        id,
-        name,
-        l1_id,
-        now,
     )
+    .bind(id)
+    .bind(name)
+    .bind(l1_id)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert L2");
@@ -136,21 +94,25 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 }
 
 async fn insert_part(pool: &PgPool, name: &str, customer_id: i64, serial_no: Option<&str>) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
     // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired` 等 6 列；
     // INSERT 列名与 VALUES 占位符同步移除。
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, \
          quantity, version, created_at, created_by, updated_at, updated_by, \
          assembly_id) \
          VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $6, $6, 1, 0, $5, NULL, $5, NULL, NULL)",
-        id, serial_no, name, customer_id, now, today,
     )
+    .bind(id)
+    .bind(serial_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(now)
+    .bind(today)
     .execute(pool)
     .await
     .expect("insert part");
@@ -182,21 +144,20 @@ async fn create_batch(
 ///
 /// 返回 note.id。
 async fn create_draft_note(pool: &PgPool, customer_id: i64) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     // t_delivery_note.delivery_note_no 是 varchar(16)，截断雪花 id 到末 12 位
     let no_str = format!("DN{}", id % 1_000_000_000_000);
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_delivery_note (id, delivery_note_no, customer_id, status, version, \
          created_at, created_by, updated_at, updated_by, leaf_customer_id) \
          VALUES ($1, $2, $3, 'DRAFT', 0, $4, NULL, $4, NULL, $3)",
-        id,
-        no_str,
-        customer_id,
-        now,
     )
+    .bind(id)
+    .bind(no_str)
+    .bind(customer_id)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert draft note");
@@ -232,11 +193,11 @@ async fn create_draft_note_via_api(
 
 /// 把 note 推到 SUBMITTED：先把所有挂单批次置为 READY_TO_SHIP，再调 submit。
 async fn submit_note(app: axum::Router, token: &str, note_id: i64, pool: &PgPool) -> axum::Router {
-    sqlx::query!(
+    sqlx::query(
         "UPDATE t_part_batch SET status = 'READY_TO_SHIP' \
          WHERE delivery_note_id = $1 AND status <> 'READY_TO_SHIP'",
-        note_id
     )
+    .bind(note_id)
     .execute(pool)
     .await
     .expect("bump batches to READY_TO_SHIP");
@@ -264,22 +225,21 @@ async fn submit_note(app: axum::Router, token: &str, note_id: i64, pool: &PgPool
 /// 这是最基础的 happy path：弹窗勾选后批量 attach 全成功。
 #[tokio::test]
 async fn attach_batches_normal_path() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABN00001")).await;
     let bid = create_batch(&pool, pid, "INSPECTION", None, None).await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     let (app, env) = create_draft_note_via_api(app, &token, l1, bid).await;
     let note_id = env["data"]["id"].as_str().unwrap().to_string();
 
     // detach 后再 attach（create_draft_note_via_api 已自动挂上 bid）
-    sqlx::query!(
+    sqlx::query(
         "UPDATE t_part_batch SET delivery_note_id = NULL, version = version + 1 \
          WHERE id = $1",
-        bid
     )
+    .bind(bid)
     .execute(&pool)
     .await
     .unwrap();
@@ -322,24 +282,21 @@ async fn attach_batches_normal_path() {
 /// 验证乐观锁路径：不影响其它 item（这里只 1 个 item）。
 #[tokio::test]
 async fn attach_batches_occ_conflict_via_wrong_version() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABOCC0001")).await;
     let bid = create_batch(&pool, pid, "INSPECTION", None, None).await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     let (app, env) = create_draft_note_via_api(app, &token, l1, bid).await;
     let note_id = env["data"]["id"].as_str().unwrap().to_string();
 
     // detach 该批次，让 attach-batches 重新挂（带错 version）
-    sqlx::query!(
-        "UPDATE t_part_batch SET delivery_note_id = NULL WHERE id = $1",
-        bid
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE t_part_batch SET delivery_note_id = NULL WHERE id = $1")
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let (s, resp) = send(
         app,
@@ -373,13 +330,12 @@ async fn attach_batches_occ_conflict_via_wrong_version() {
 /// 3. ALREADY_ATTACHED：batch 已挂在别的 note 上 → 200 + conflicts 含 ALREADY_ATTACHED。
 #[tokio::test]
 async fn attach_batches_already_attached_conflict() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABA00001")).await;
     let bid = create_batch(&pool, pid, "INSPECTION", None, None).await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     // 第一个 note：自动挂上 bid
     let (app, env1) = create_draft_note_via_api(app, &token, l1, bid).await;
     let _note1_id = env1["data"]["id"].as_str().unwrap().to_string();
@@ -422,17 +378,16 @@ async fn attach_batches_already_attached_conflict() {
 /// 验证：A 组过滤在 attach 路径同样生效，非 INSPECTION/READY_TO_SHIP 一律拒绝。
 #[tokio::test]
 async fn attach_batches_invalid_state_conflict() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABI00001")).await;
     let bid = create_batch(&pool, pid, "DELIVERED", None, None).await;
     let note_id = create_draft_note(&pool, l1).await;
 
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let ver: i32 = sqlx::query_scalar("SELECT version FROM t_part_batch WHERE id = $1")
         .bind(bid)
-        .fetch_one(&_pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
 
@@ -459,7 +414,7 @@ async fn attach_batches_invalid_state_conflict() {
     let dn_id: Option<i64> =
         sqlx::query_scalar("SELECT delivery_note_id FROM t_part_batch WHERE id = $1")
             .bind(bid)
-            .fetch_one(&_pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
     assert!(dn_id.is_none());
@@ -471,13 +426,12 @@ async fn attach_batches_invalid_state_conflict() {
 /// 状态机进入 SUBMITTED 后整单已对外承诺，不能再 attach。
 #[tokio::test]
 async fn attach_batches_non_draft_note_returns_409() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let pid = insert_part(&pool, "P", l2, Some("ABND00001")).await;
     let bid = create_batch(&pool, pid, "INSPECTION", None, None).await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     let (app, env) = create_draft_note_via_api(app, &token, l1, bid).await;
     let note_id = env["data"]["id"].as_str().unwrap().to_string();
     let note_id_i64: i64 = note_id.parse().unwrap();
@@ -518,12 +472,9 @@ async fn attach_batches_non_draft_note_returns_409() {
 /// 单事务内对每个 item 至少 2 次 DB 调用；上限 200 防恶意请求长期持有连接。
 #[tokio::test]
 async fn attach_batches_too_many_items_returns_400() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let note_id = create_draft_note(&pool, l1).await;
-
-    let (app, token, pool) = login_manager(pool, "admin").await;
-    let _ = pool; // 抑制 unused warning（前置长度校验在 handler，不需访问 DB）
 
     // 构造 201 个虚拟 batch_id（不需真实存在——前置长度校验在 handler 层）
     let items: Vec<Value> = (0..201)
@@ -557,7 +508,7 @@ async fn attach_batches_too_many_items_returns_400() {
 /// 验证：单 item 失败不中断其它 item；`attached` 与 `conflicts.len()` 之和等于总 items。
 #[tokio::test]
 async fn attach_batches_partial_success() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -570,7 +521,6 @@ async fn attach_batches_partial_success() {
     let occ_bid = create_batch(&pool, occ_pid, "INSPECTION", None, None).await;
 
     let note_id = create_draft_note(&pool, l1).await;
-    let (app, token, db_pool) = login_manager(pool, "admin").await;
 
     let (s, resp) = send(
         app,
@@ -601,13 +551,13 @@ async fn attach_batches_partial_success() {
     let ok_dn: Option<i64> =
         sqlx::query_scalar("SELECT delivery_note_id FROM t_part_batch WHERE id = $1")
             .bind(ok_bid)
-            .fetch_one(&db_pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
     let occ_dn: Option<i64> =
         sqlx::query_scalar("SELECT delivery_note_id FROM t_part_batch WHERE id = $1")
             .bind(occ_bid)
-            .fetch_one(&db_pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(ok_dn, Some(note_id), "ok_batch 应挂到 note");

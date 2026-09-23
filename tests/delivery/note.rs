@@ -20,107 +20,61 @@
 //!
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
+//!
+//! 2026-09-23 PR13 Phase G 改造：本地 `fn send` / `fn json_request` / `fn setup` /
+//! `fn login_manager` 全部删除，统一用 `hsh_erp_test_support::{send, json_request,
+//! login_token, test_pool, test_state, test_app, load_delivery_fixture}`。
+//! 新增 `bootstrap_as_manager` 样板；本地 `insert_l1` / `insert_l2` / `insert_part` /
+//! `insert_batch` / `insert_group` / `insert_group_member` / `insert_worker`
+//! 全部保留（测试需要特定 name / status / 业务数据，fixture 不预置此类业务数据；
+//! pickup 测试的 t_work_type / t_worker 走「按 code 查找」路径，硬编码业务
+//! code='送货司机'，不能由 fixture 预制不同 code 的 work_type 替代）。
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tower::ServiceExt;
+use sqlx::Row;
 
 use hsh_erp_test_support::{
-    add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
-    test_app, test_pool, test_state,
+    DeliveryFixture, json_request, load_delivery_fixture, login_token, send, test_app, test_pool,
+    test_state,
 };
+
+use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
-//  全局串行化 + helpers
+//  Bootstrap helpers
 // ===========================================================================
 
-
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!(
-            "parse JSON: {e}; status={status}; content-type={:?}; raw = {}; headers={:?}",
-            headers
-                .get("content-type")
-                .map(|v| v.to_str().unwrap_or("?")),
-            String::from_utf8_lossy(&body),
-            headers
-        )
-    });
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 delivery fixture + 以 MANAGER 身份登录。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, DeliveryFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_delivery_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.part_manager_username, DeliveryFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token, pool)
-}
+// ===========================================================================
+//  Domain fixtures：L1 / L2 客户 + part + batch + 分组 + 成员 + 工人
+//  （保留本地 helper：测试需要特定 name / status / 业务数据）
+// ===========================================================================
 
 /// 直插 L1 客户
 async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, NULL, $3, 0, $4, NULL, $4, NULL)",
-        id,
-        name,
-        prefix,
-        now,
     )
+    .bind(id)
+    .bind(name)
+    .bind(prefix)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert L1");
@@ -129,19 +83,18 @@ async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 
 /// 直插 L2 客户（parent_id = l1_id）
 async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
-        id,
-        name,
-        l1_id,
-        now,
     )
+    .bind(id)
+    .bind(name)
+    .bind(l1_id)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert L2");
@@ -150,25 +103,24 @@ async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 
 /// 直插工单
 async fn insert_part(pool: &PgPool, name: &str, customer_id: i64, serial_no: Option<&str>) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
     // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
     // VALUES 占位符同步移除。
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, \
          quantity, version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $6, $6, 1, 0, $5, NULL, $5, NULL)",
-        id,
-        serial_no,
-        name,
-        customer_id,
-        now,
-        today,
     )
+    .bind(id)
+    .bind(serial_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(now)
+    .bind(today)
     .execute(pool)
     .await
     .expect("insert part");
@@ -183,23 +135,22 @@ async fn insert_batch(
     quantity: i32,
     status: &str,
 ) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
     // 列名与 VALUES 占位符同步移除 `false` 字面量。
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
          version, created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, $6, NULL)",
-        id,
-        part_id,
-        batch_no,
-        quantity,
-        status,
-        now,
     )
+    .bind(id)
+    .bind(part_id)
+    .bind(batch_no)
+    .bind(quantity)
+    .bind(status)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert batch");
@@ -208,19 +159,18 @@ async fn insert_batch(
 
 /// 直插送货分组
 async fn insert_group(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_delivery_group (id, customer_id, name, version, created_at, \
          created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, 0, $4, NULL, $4, NULL)",
-        id,
-        l1_id,
-        name,
-        now,
     )
+    .bind(id)
+    .bind(l1_id)
+    .bind(name)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert group");
@@ -229,18 +179,17 @@ async fn insert_group(pool: &PgPool, l1_id: i64, name: &str) -> i64 {
 
 /// 直插分组成员
 async fn insert_group_member(pool: &PgPool, group_id: i64, l2_id: i64) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_delivery_group_member (id, group_id, customer_id, created_at, created_by) \
          VALUES ($1, $2, $3, $4, NULL)",
-        id,
-        group_id,
-        l2_id,
-        now,
     )
+    .bind(id)
+    .bind(group_id)
+    .bind(l2_id)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert group member");
@@ -255,31 +204,28 @@ async fn insert_worker(
     is_active: bool,
     work_type_code: &str,
 ) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     // 找或插工种
-    let wt_id: i64 = sqlx::query_scalar!(
-        "SELECT id FROM t_work_type WHERE code = $1 LIMIT 1",
-        work_type_code
-    )
-    .fetch_optional(pool)
-    .await
-    .expect("query work_type")
-    .unwrap_or_else(|| panic!("work_type {} not seeded", work_type_code));
+    let wt_id: i64 = sqlx::query_scalar("SELECT id FROM t_work_type WHERE code = $1 LIMIT 1")
+        .bind(work_type_code)
+        .fetch_optional(pool)
+        .await
+        .expect("query work_type")
+        .unwrap_or_else(|| panic!("work_type {} not seeded", work_type_code));
 
     let id = snowflake.next_id();
     let now = now_naive();
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
          created_at, created_by, updated_at, updated_by) \
          VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, $6, NULL)",
-        id,
-        badge,
-        name,
-        is_active,
-        wt_id,
-        now,
     )
+    .bind(id)
+    .bind(badge)
+    .bind(name)
+    .bind(is_active)
+    .bind(wt_id)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert worker");
@@ -293,7 +239,7 @@ async fn insert_worker(
 #[tokio::test]
 async fn counter_acquires_sequential_numbers() {
     use hsh_erp_rust::infra::serial::next_delivery_note_no;
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
 
     let no1 = next_delivery_note_no(&pool, 0).await.expect("acquire 1");
     let no2 = next_delivery_note_no(&pool, 0).await.expect("acquire 2");
@@ -319,11 +265,9 @@ async fn counter_acquires_sequential_numbers() {
 
 #[tokio::test]
 async fn create_draft_for_l1_succeeds_and_for_l2_returns_400_21407() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-
-    let (app, token, _pool) = login_manager(pool, "admin").await;
 
     // L1 草稿 → 200
     let (s1, env1) = send(
@@ -360,9 +304,8 @@ async fn create_draft_for_l1_succeeds_and_for_l2_returns_400_21407() {
 
 #[tokio::test]
 async fn list_with_filters_status_and_pagination() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
 
     // 建 3 张草稿
     for i in 0..3 {
@@ -411,13 +354,12 @@ async fn list_with_filters_status_and_pagination() {
 
 #[tokio::test]
 async fn get_with_parts_with_assembly_fields() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "零件 A", l2, Some("A001")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 5, "INSPECTION").await;
 
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let (cs, env) = send(
         app.clone(),
         json_request(
@@ -473,14 +415,13 @@ async fn get_with_parts_with_assembly_fields() {
 
 #[tokio::test]
 async fn add_parts_same_l1_ok_different_l1_returns_400_21407() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1_a = insert_l1(&pool, "法拉电子", "F").await;
     let l1_b = insert_l1(&pool, "路达电子", "L").await;
     let l2_b = insert_l2(&pool, "路达一厂", l1_b).await;
     let part_id = insert_part(&pool, "X", l2_b, Some("X001")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 3, "INSPECTION").await;
 
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     // l1_a 单
     let (s1, env1) = send(
         app.clone(),
@@ -516,13 +457,12 @@ async fn add_parts_same_l1_ok_different_l1_returns_400_21407() {
 
 #[tokio::test]
 async fn add_parts_already_assigned_returns_409_21406() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X002")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 3, "INSPECTION").await;
 
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     // 第一张单
     let (s1, env1) = send(
         app.clone(),
@@ -576,14 +516,13 @@ async fn add_parts_already_assigned_returns_409_21406() {
 
 #[tokio::test]
 async fn add_parts_invalid_status_returns_400_21405() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X003")).await;
     // 批次在 PROCESSING 状态（不允许 INSPECTION/READY_TO_SHIP 以外）
     let batch_id = insert_batch(&pool, part_id, 1, 3, "PROCESSING").await;
 
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let (cs, cenv) = send(
         app.clone(),
         json_request(
@@ -617,13 +556,12 @@ async fn add_parts_invalid_status_returns_400_21405() {
 
 #[tokio::test]
 async fn add_parts_partial_quantity_splits_batch() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X004")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 10, "INSPECTION").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     let (cs, cenv) = send(
         app.clone(),
         json_request(
@@ -658,19 +596,18 @@ async fn add_parts_partial_quantity_splits_batch() {
     assert_eq!(row["quantity"], 4, "新批次应只剩 quantity=4");
 
     // 原批次 quantity 减到 6、未挂单
-    let original_qty: i32 = sqlx::query_scalar!(
-        "SELECT quantity AS \"qty!\" FROM t_part_batch WHERE id = $1",
-        batch_id
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let original_qty: i32 =
+        sqlx::query_scalar("SELECT quantity FROM t_part_batch WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(original_qty, 6, "源批次 quantity 减 4 → 6");
 }
 
 #[tokio::test]
 async fn add_parts_group_scope_mismatch_returns_400_21416() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2_a = insert_l2(&pool, "二厂", l1).await;
     let l2_b = insert_l2(&pool, "五厂", l1).await; // 组外
@@ -682,7 +619,6 @@ async fn add_parts_group_scope_mismatch_returns_400_21416() {
     insert_group_member(&pool, gid, l2_a).await;
 
     // 建分组单
-    let (app, token, pool) = login_manager(pool, "admin").await;
     let (cs, cenv) = send(
         app.clone(),
         json_request(
@@ -698,14 +634,12 @@ async fn add_parts_group_scope_mismatch_returns_400_21416() {
     let version = cenv["data"]["version"].as_i64().unwrap() as i32;
 
     // 设本单为分组单 delivery_group_id = gid（手工 SQL，因为 P2 API 没暴露）
-    sqlx::query!(
-        "UPDATE t_delivery_note SET delivery_group_id = $1 WHERE id = $2",
-        gid,
-        note_id.parse::<i64>().unwrap(),
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE t_delivery_note SET delivery_group_id = $1 WHERE id = $2")
+        .bind(gid)
+        .bind(note_id.parse::<i64>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
 
     // add 五厂 工单 → 应撞 21416（组外）
     let (s, env) = send(
@@ -727,13 +661,12 @@ async fn add_parts_group_scope_mismatch_returns_400_21416() {
 
 #[tokio::test]
 async fn remove_parts_draft_ok_submitted_returns_409_21412() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X006")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 3, "INSPECTION").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     let (cs, cenv) = send(
         app.clone(),
         json_request(
@@ -784,13 +717,11 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
     )
     .await;
     assert_eq!(s2, StatusCode::OK);
-    sqlx::query!(
-        "UPDATE t_part_batch SET status = 'READY_TO_SHIP' WHERE id = $1",
-        batch_id
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE t_part_batch SET status = 'READY_TO_SHIP' WHERE id = $1")
+        .bind(batch_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let (senv, sbody) = send(
         app.clone(),
@@ -829,14 +760,13 @@ async fn remove_parts_draft_ok_submitted_returns_409_21412() {
 
 #[tokio::test]
 async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X007")).await;
     let batch_id_a = insert_batch(&pool, part_id, 1, 1, "READY_TO_SHIP").await;
     let batch_id_b = insert_batch(&pool, part_id, 2, 1, "READY_TO_SHIP").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     // 第一张单（要走完 submit → recall）
     let (cs, cenv) = send(
         app.clone(),
@@ -900,17 +830,11 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
     assert_eq!(env["code"], 21419);
 
     // 现在软删 note B，再 recall 应成功
-    sqlx::query!(
-        "UPDATE t_part_batch SET delivery_note_id = NULL WHERE delivery_note_id = $1",
-        b_env["data"]["id"]
-            .as_str()
-            .unwrap()
-            .parse::<i64>()
-            .unwrap()
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE t_part_batch SET delivery_note_id = NULL WHERE delivery_note_id = $1")
+        .bind(b_env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
     let (del, _) = send(
         app.clone(),
         json_request(
@@ -942,37 +866,36 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
 
 #[tokio::test]
 async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X008")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 1, "READY_TO_SHIP").await;
 
     // 工种（直接 INSERT；truncate 后表空，不会撞 unique）
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_work_type (id, code, name, version, created_at, updated_at) \
          VALUES ($1, $2, $3, 0, now(), now())",
-        SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id(),
-        "送货司机",
-        "送货司机",
     )
+    .bind(SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id())
+    .bind("送货司机")
+    .bind("送货司机")
     .execute(&pool)
     .await
     .expect("insert work_type 送货司机");
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_work_type (id, code, name, version, created_at, updated_at) \
          VALUES ($1, $2, $3, 0, now(), now())",
-        SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id(),
-        "其他工种",
-        "其他工种",
     )
+    .bind(SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id())
+    .bind("其他工种")
+    .bind("其他工种")
     .execute(&pool)
     .await
     .expect("insert work_type 其他工种");
     let driver_id = insert_worker(&pool, "D001", "张司机", true, "送货司机").await;
     let non_driver_id = insert_worker(&pool, "N001", "王操作员", true, "其他工种").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     // 建单 → submit
     let (cs, cenv) = send(
         app.clone(),
@@ -1067,13 +990,12 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
 
 #[tokio::test]
 async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X009")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 1, "INSPECTION").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     let (cs, cenv) = send(
         app.clone(),
         json_request(
@@ -1148,9 +1070,8 @@ async fn soft_delete_draft_ok_non_draft_returns_400_21403() {
 
 #[tokio::test]
 async fn version_conflict_on_write_returns_409_40901() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
 
     let (cs, cenv) = send(
         app.clone(),
@@ -1186,14 +1107,13 @@ async fn version_conflict_on_write_returns_409_40901() {
 /// 候选里只能出现 INSPECTION 那个；单据必须仍是 DRAFT（零写入）。
 #[tokio::test]
 async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "刹车片", l2, Some("F0001")).await;
     let ready_batch = insert_batch(&pool, part_id, 1, 2, "READY_TO_SHIP").await;
     let insp_batch = insert_batch(&pool, part_id, 2, 3, "INSPECTION").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     let (cs, cenv) = send(
         app.clone(),
         json_request(
@@ -1289,13 +1209,12 @@ async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
 /// 挂单批次被旁路改成 READY_TO_SHIP / INSPECTION 之外的状态 → 21421。
 #[tokio::test]
 async fn submit_with_illegal_batch_state_returns_21421() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X011")).await;
     let batch_id = insert_batch(&pool, part_id, 1, 1, "READY_TO_SHIP").await;
 
-    let (app, token, pool) = login_manager(pool, "admin").await;
     let (cs, cenv) = send(
         app.clone(),
         json_request(
@@ -1348,13 +1267,11 @@ async fn submit_with_illegal_batch_state_returns_21421() {
 
 #[tokio::test]
 async fn list_candidate_parts_l1_returns_fixtures_non_l1_returns_400() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_l1(&pool, "法拉电子", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
     let part_id = insert_part(&pool, "X", l2, Some("X010")).await;
     let _batch = insert_batch(&pool, part_id, 1, 2, "INSPECTION").await;
-
-    let (app, token, _pool) = login_manager(pool, "admin").await;
 
     // L1 → 200 + 至少 1 条
     let (s, env) = send(
@@ -1387,8 +1304,7 @@ async fn list_candidate_parts_l1_returns_fixtures_non_l1_returns_400() {
 
 #[tokio::test]
 async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
-    let pool = setup().await;
-    let (app, token, pool) = login_manager(pool, "admin").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
 
     // 3 张 DRAFT 送货单（最小列插入）
     let note_ids: Vec<i64> = {
@@ -1399,13 +1315,13 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
             // delivery_note_no 是 varchar(16)；雪花 id 17+ 位拼前缀会超 16 字符，
             // 这里手写 14-char 测试单号（DN-TEST-NNNN + i 适配）。
             let no = format!("DN-TEST-{i:04}");
-            sqlx::query!(
+            sqlx::query(
                 "INSERT INTO t_delivery_note \
                  (id, delivery_note_no, customer_id, status, version, created_at, updated_at) \
                  VALUES ($1, $2, 1, 'DRAFT', 0, now(), now())",
-                id,
-                no,
             )
+            .bind(id)
+            .bind(no)
             .execute(&pool)
             .await
             .expect("insert delivery note");
@@ -1457,7 +1373,7 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
         .collect::<Vec<_>>()
         .join(",");
     let uri = format!("/delivery-notes/batch-detail?ids={too_many}");
-    let (status, body) = send(app.clone(), json_request("GET", &uri, None, Some(&token))).await;
+    let (status, body) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], 20104);
 }
@@ -1475,8 +1391,7 @@ async fn batch_get_notes_returns_all_in_order_and_skips_missing() {
 /// GET 详情，断言 line_items[0].{6 字段} 等于 part 原值。
 #[tokio::test]
 async fn test_get_delivery_note_line_items_fields_are_populated() {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
 
     // 1. 建 L1 客户（detail 端点的 customer_id 必须是 L1，service 校验）
     let l1 = insert_l1(&pool, "详情字段客户", "D").await;
@@ -1517,7 +1432,6 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
     let batch_id = insert_batch(&pool, part_id, 1, 5, "READY_TO_SHIP").await;
 
     // 4. 登录 → POST /delivery-notes 建 DRAFT 单并挂批次 → GET 详情
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let (cs, env) = send(
         app.clone(),
         json_request(
