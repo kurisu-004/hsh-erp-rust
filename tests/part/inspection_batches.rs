@@ -7,8 +7,7 @@
 //!   3. 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。brief 原话
 //!      「Worker role」并不存在，本仓库 5 角色中 ShelfAccount 是唯一合法登录、
 //!      但不在 `INSPECTION_LIST_ROLES = [Manager, Inspector]` 内的角色；
-//!      helpers::login_worker 用 ShelfAccount，与既有 part_api_to_inspection 测 8
-//!      同形。
+//!      `PartFixture::SHELF_ACCOUNT_USERNAME` + SHELF_ACCOUNT role 提供该登录态。
 //!   4. 分页：`limit + offset` 正确切分 total / items。
 //!
 //! ## 并行 / 认证
@@ -17,13 +16,75 @@
 
 // 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录，
 // 加 `#[path]` 显式指到 `tests/part/helpers.rs`。
+// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel `pub use hsh_erp_test_support::*;`，
+// 域 fixture 由 `hsh_erp_test_support::fixture::PartFixture` 提供。
 #[path = "helpers.rs"]
 mod helpers;
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
+use sqlx::PgPool;
 
-use helpers::*;
+use hsh_erp_test_support::*;
+use hsh_erp_test_support::fixture::PartFixture;
+
+// ===========================================================================
+//  动态 part/batch 插入 helper（tests/part/ 各 sub-file 私有，Phase G 收敛后
+//  暂保留为 sub-file 内联，PR-C 末统一迁 test-support）
+// ===========================================================================
+
+/// INSPECTION 批次插入（带 holder 指向 insp_shelf_id，便于 to-ship 测试链）。
+async fn insert_part_with_insp_batch(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    insp_shelf_id: i64,
+) -> (i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $5, $5, 1, 0, $6, $6)",
+    )
+    .bind(part_id)
+    .bind(serial_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert INSPECTION part");
+    let batch_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 1, 1, 'INSPECTION', 0, $3, $3)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert INSPECTION batch");
+    sqlx::query(
+        "UPDATE t_part_batch SET location = 'INSPECTION_SHELF', current_holder_id = $1 \
+         WHERE id = $2",
+    )
+    .bind(insp_shelf_id)
+    .bind(batch_id)
+    .execute(pool)
+    .await
+    .expect("set batch holder to inspection shelf");
+    (part_id, batch_id)
+}
 
 // ===========================================================================
 //  Tests
@@ -33,7 +94,7 @@ use helpers::*;
 /// 可直接喂给 `POST /parts/{part_id}/to-ship`（核心验收）。
 ///
 /// 步骤：
-///   1. 插 part A + INSPECTION 批次（qty=5）
+///   1. 插 part A + INSPECTION 批次（qty=5，holder=INSPECTION 货架）
 ///   2. 插 part B + IN_PROCESS 批次（qty=3）—— 必须不出现在 list 中
 ///   3. GET /parts/inspection-batches?limit=10（INSPECTOR token）
 ///   4. 断言：
@@ -48,32 +109,48 @@ use helpers::*;
 ///       前端会基于 holder_name 渲染提示）。
 #[tokio::test]
 async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and_version() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
-
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
     // part A：INSPECTION 状态 + INSPECTION 批次 + 货架 holder 指向品检架
-    let part_a =
-        insert_part_with_status(&pool, "PART_A", l2, Some("P-A-001"), None, "INSPECTION").await;
-    let batch_a = insert_batch(&pool, part_a, 1, 5, "INSPECTION").await;
-    // 2026-09-16 PR-2（migration 027）：t_part 删 `current_holder_id`；「holder 解析」
-    // 改查 t_part_batch（location + current_holder_id）。fixture 同步改写为
-    // 设 t_part_batch.location + current_holder_id。
-    sqlx::query!(
-        "UPDATE t_part_batch SET location = 'INSPECTION_SHELF', current_holder_id = $1 WHERE id = $2",
-        insp_shelf, batch_a
+    let (part_a, batch_a) = insert_part_with_insp_batch(
+        &pool,
+        "PART_A",
+        fx.customer_l2_id,
+        Some("P-A-001"),
+        fx.inspection_shelf_id,
     )
+    .await;
+    // part B：IN_PROCESS 状态 + INPROCESS 批次（必须不出现在 list 中）
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_b_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, 'P-B-001', 'PART_B', 'D-001', $2, 'IN_PROCESS', 'PART_B', $3, $3, 1, 0, $4, $4)",
+    )
+    .bind(part_b_id)
+    .bind(fx.customer_l2_id)
+    .bind(today)
+    .bind(now)
     .execute(&pool)
     .await
-    .unwrap();
-
-    // part B：IN_PROCESS 状态 + IN_PROCESS 批次（必须不出现在 list 中）
-    let _part_b =
-        insert_part_with_status(&pool, "PART_B", l2, Some("P-B-001"), None, "IN_PROCESS").await;
-    let batch_b = insert_batch(&pool, _part_b, 1, 3, "IN_PROCESS").await;
-
-    let (app, token, _pool) = login_inspector(pool, "inspector_list").await;
+    .expect("insert IN_PROCESS part");
+    let batch_b = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 1, 3, 'IN_PROCESS', 0, $3, $3)",
+    )
+    .bind(batch_b)
+    .bind(part_b_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert IN_PROCESS batch");
 
     // Step 3：调 list 端点
     let (status, body) = send(
@@ -129,17 +206,17 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
     );
     assert_eq!(
         hit["customer_name"].as_str().unwrap(),
-        "二厂",
+        "FX 客户 L2",
         "customer_name 应解析为 L2 客户名"
     );
-    // holder_name 由 COALESCE 三表解析，holder = INSPECTION 货架 → 应 = "品检架A"
+    // holder_name 由 COALESCE 三表解析，holder = INSPECTION 货架 → 应 = "FX 检验架"
     assert!(
         hit["holder_name"].is_string(),
         "hit.holder_name 应为 Some（holder 指向 INSPECTION 货架）: body={body}"
     );
     assert_eq!(
         hit["holder_name"].as_str().unwrap(),
-        "品检架A",
+        "FX 检验架",
         "holder_name 应解析为品检架名称"
     );
 
@@ -189,39 +266,43 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
 /// （VALIDATION_ERROR 40001）。关键字用大写字母串（避开 `_` / `%` / `\\`）。
 #[tokio::test]
 async fn inspection_batches_filters_by_keyword_and_customer() {
-    let pool = setup().await;
-    let l1_a = insert_l1(&pool, "ACMEA", "A").await;
-    let l1_b = insert_l1(&pool, "ACMEB", "B").await;
-    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
-
-    // L1_a 下 1 个 part（用 L1_a 自己作为 customer_id：expand_customer_id
-    // 对 L1 返回 [L1_a]，L1_b 不会命中）
-    let part_a =
-        insert_part_with_status(&pool, "PARTA", l1_a, Some("PA001"), None, "INSPECTION").await;
-    let batch_a = insert_batch(&pool, part_a, 1, 2, "INSPECTION").await;
-    sqlx::query!(
-        "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
-        insp_shelf,
-        batch_a
+    let (pool, app, token, _fx) = bootstrap_as_inspector().await;
+    // 建 2 个独立的 L1 客户 + L2（避免污染 fixture 内的 customer_id）
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let l1_a = snowflake.next_id();
+    let l1_b = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, created_at, updated_at) \
+         VALUES ($1, 'ACMEA', NULL, 'A', 0, $2, $2), ($3, 'ACMEB', NULL, 'B', 0, $2, $2)",
     )
+    .bind(l1_a)
+    .bind(now)
+    .bind(l1_b)
     .execute(&pool)
     .await
-    .unwrap();
+    .expect("insert L1 customers");
 
+    // L1_a 下 1 个 part
+    let (part_a, batch_a) = insert_part_with_insp_batch(
+        &pool,
+        "PARTA",
+        l1_a,
+        Some("PA001"),
+        PartFixture::INSPECTION_SHELF_ID,
+    )
+    .await;
     // L1_b 下 1 个 part
-    let part_b =
-        insert_part_with_status(&pool, "PARTB", l1_b, Some("PB001"), None, "INSPECTION").await;
-    let batch_b = insert_batch(&pool, part_b, 1, 2, "INSPECTION").await;
-    sqlx::query!(
-        "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
-        insp_shelf,
-        batch_b
+    let (_part_b, batch_b) = insert_part_with_insp_batch(
+        &pool,
+        "PARTB",
+        l1_b,
+        Some("PB001"),
+        PartFixture::INSPECTION_SHELF_ID,
     )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let (app, token, _pool) = login_inspector(pool, "inspector_filter").await;
+    .await;
 
     // 组合过滤：customer_id=L1_a + keyword="PARTA"
     let (status, body) = send(
@@ -273,29 +354,21 @@ async fn inspection_batches_filters_by_keyword_and_customer() {
 ///
 /// brief 原话「Worker role」并不存在（5 角色：Manager / Clerk / Inspector /
 /// CncProgrammer / ShelfAccount）。`INSPECTION_LIST_ROLES = [Manager, Inspector]`，
-/// `helpers::login_worker` 用 ShelfAccount（合法登录但不在白名单内）模拟。
+/// `PartFixture::SHELF_ACCOUNT_USERNAME` 用 ShelfAccount（合法登录但不在白名单内）
+/// 模拟 SHELF_ACCOUNT 越权。
 #[tokio::test]
 async fn inspection_batches_role_guard_rejects_worker() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
+    let (pool, app, token, _fx) = bootstrap_as_shelf_account().await;
 
     // 准备 1 个 INSPECTION 批次（让 list 在权限通过时返回非空，确保拒绝原因是角色）
-    let part_id =
-        insert_part_with_status(&pool, "PART_RG", l2, Some("P-RG-001"), None, "INSPECTION").await;
-    let batch_id = insert_batch(&pool, part_id, 1, 1, "INSPECTION").await;
-    sqlx::query!(
-        "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
-        insp_shelf,
-        batch_id
+    let (_part_id, _batch_id) = insert_part_with_insp_batch(
+        &pool,
+        "PART_RG",
+        PartFixture::CUSTOMER_L2_ID,
+        Some("P-RG-001"),
+        PartFixture::INSPECTION_SHELF_ID,
     )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // 用 login_worker 拿一个 ShelfAccount 的合法 token
-    let (app, token, _pool) = login_worker(pool, "worker_rg").await;
+    .await;
 
     let (status, body) = send(
         app,
@@ -335,40 +408,40 @@ async fn inspection_batches_role_guard_rejects_worker() {
 /// CHECK `^[A-Z]$`（大写字母单字符）。每个 L1 用不同大写字母当 prefix。
 #[tokio::test]
 async fn inspection_batches_pagination_limit_offset() {
-    let pool = setup().await;
-    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&pool).await;
-    // 3 个 L1 客户（互不关联）；serial_prefix 单字符大写字母（A / C / E，
-    // 故意跳过 B/D 避免与已有 prefix 碰撞 —— 数据库有 UNIQUE 索引约束）。
-    let l1_a = insert_l1(&pool, "PAGA", "A").await;
-    let l1_c = insert_l1(&pool, "PAGC", "C").await;
-    let l1_e = insert_l1(&pool, "PAGE", "E").await;
+    let (pool, app, token, _fx) = bootstrap_as_inspector().await;
+    // 3 个 L1 客户（互不关联）；serial_prefix 单字符大写字母（C / D / E，
+    // 跳过 A/B 避免与已有 prefix 碰撞 —— 数据库有 UNIQUE 索引约束）。
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+    let l1_a = snowflake.next_id();
+    let l1_c = snowflake.next_id();
+    let l1_e = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, created_at, updated_at) \
+         VALUES ($1, 'PAGA', NULL, 'A', 0, $4, $4), ($2, 'PAGC', NULL, 'C', 0, $4, $4), ($3, 'PAGE', NULL, 'E', 0, $4, $4)",
+    )
+    .bind(l1_a)
+    .bind(l1_c)
+    .bind(l1_e)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert L1 customers for pagination");
     let customers = [l1_a, l1_c, l1_e];
 
     // 每个 L1 下 1 个 part + 1 个 INSPECTION 批次（≥3 条活跃批次）
-    let mut part_ids = Vec::new();
     for (i, &cust) in customers.iter().enumerate() {
-        let pid = insert_part_with_status(
+        insert_part_with_insp_batch(
             &pool,
             &format!("PAGPART{i}"),
             cust,
             Some(&format!("PAG{i:03}")),
-            None,
-            "INSPECTION",
+            PartFixture::INSPECTION_SHELF_ID,
         )
         .await;
-        let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
-        sqlx::query!(
-            "UPDATE t_part_batch SET current_holder_id = $1 WHERE id = $2",
-            insp_shelf,
-            bid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        part_ids.push(pid);
     }
-
-    let (app, token, _pool) = login_inspector(pool, "inspector_pag").await;
 
     // limit=2, offset=1
     let (status, body) = send(
@@ -421,4 +494,24 @@ async fn inspection_batches_pagination_limit_offset() {
     assert_eq!(status2, StatusCode::OK, "second page: body={body2}");
     let items2 = body2["data"]["items"].as_array().expect("data.items2");
     assert_eq!(items2.len(), 1, "offset=2, limit=2 应剩 1 条: body={body2}");
+}
+
+// ===========================================================================
+//  bootstrap helpers（PR13 Phase G 风格 B：抽出公共样板）
+// ===========================================================================
+
+async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String, PartFixture) {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.inspector_username, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
+}
+
+async fn bootstrap_as_shelf_account() -> (PgPool, axum::Router, String, PartFixture) {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.shelf_account_username, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }

@@ -10,18 +10,18 @@
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），与其它业务测试
 //! 互不干扰（DB 间 schema 完全独立）。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
-// 故本文件自带 `mod common;`（与 main.rs 的同名 pub mod 不冲突）。
-#[path = "../common/mod.rs"]
-mod common;
-
-use common::{ensure_database_exists, test_pool};
+// 2026-09-23 PR13 Phase C：edition 2024 下 `mod common;` 不自动 fallback 到 crate root。
+// 2026-09-23 PR13 Phase G：serial 域不走 PartFixture（serial 域独立，仅用 fixture 提供
+//! 1 个 L1 客户作为 `occupy_serial` 的 customer_id 即可）。保留 `reset_serial_state` /
+//! `seed_prefix` / `occupy_serial` 为本文件私有 helper（PR-C 末统一迁 test-support）。
+#[path = "helpers.rs"]
+mod helpers;
 
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::serial::next_customer_serial_via_pool;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::shared::error::code;
-
+use hsh_erp_test_support::*;
 
 /// 清空 `t_serial_counter` + `t_part`（acquire 关联表），保证测试隔离。
 async fn reset_serial_state(pool: &sqlx::PgPool) {
@@ -58,8 +58,6 @@ async fn occupy_serial(pool: &sqlx::PgPool, prefix: &str, suffix: i64, customer_
     let serial = format!("{prefix}{suffix:04}");
     let now = now_naive();
     let today = now.date();
-    // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired`；INSERT 列名与
-    // VALUES 占位符同步移除 `false` 字面量。
     sqlx::query(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, quantity, \
@@ -79,8 +77,8 @@ async fn occupy_serial(pool: &sqlx::PgPool, prefix: &str, suffix: i64, customer_
 /// 单次 acquire 返回 `<PREFIX><4位数字>` 格式串。
 #[tokio::test]
 async fn acquire_returns_prefixed_4digit_serial() {
-    ensure_database_exists().await;
     let pool = test_pool().await;
+    let _fx = load_part_fixture(&pool).await;
     reset_serial_state(&pool).await;
     seed_prefix(&pool, "Z").await;
 
@@ -93,8 +91,8 @@ async fn acquire_returns_prefixed_4digit_serial() {
 /// 连续两次 acquire 拿不同且递增号。
 #[tokio::test]
 async fn acquire_two_calls_returns_distinct_serials() {
-    ensure_database_exists().await;
     let pool = test_pool().await;
+    let _fx = load_part_fixture(&pool).await;
     reset_serial_state(&pool).await;
     seed_prefix(&pool, "Y").await;
 
@@ -112,8 +110,8 @@ async fn acquire_two_calls_returns_distinct_serials() {
 /// 未知 prefix → `BIZ_SERIAL_PREFIX_UNKNOWN`。
 #[tokio::test]
 async fn acquire_unknown_prefix_returns_biz_serial_prefix_unknown() {
-    ensure_database_exists().await;
     let pool = test_pool().await;
+    let _fx = load_part_fixture(&pool).await;
     reset_serial_state(&pool).await;
     // 注意：不能 seed "Q9"（单字符限制）
     sqlx::query("DELETE FROM t_serial_counter WHERE prefix = 'Q'")
@@ -130,8 +128,8 @@ async fn acquire_unknown_prefix_returns_biz_serial_prefix_unknown() {
 /// 已存在活跃 serial 时，acquire 跳过占用的号返回下一个空号。
 #[tokio::test]
 async fn acquire_taken_serial_skips_to_next() {
-    ensure_database_exists().await;
     let pool = test_pool().await;
+    let _fx = load_part_fixture(&pool).await;
     reset_serial_state(&pool).await;
     seed_prefix(&pool, "X").await;
 

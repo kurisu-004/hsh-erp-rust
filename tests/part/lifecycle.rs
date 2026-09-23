@@ -18,90 +18,101 @@
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
-// 故本文件自带 `mod common;` / `mod helpers;`（与 main.rs 的同名 pub mod 不冲突）。
-#[path = "../common/mod.rs"]
-mod common;
+// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录。
+// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel；fixture 由 PartFixture 提供。
 #[path = "helpers.rs"]
 mod helpers;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
-use serde_json::{Value, json};
+use axum::http::StatusCode;
+use serde_json::json;
 use sqlx::PgPool;
-use tower::ServiceExt;
 
-use common::{
-    add_role, clean_business_db, clean_db, create_chain_for_part, create_step,
-    insert_user_with_password, link_shelf_to_process, seed_process, test_app, test_pool,
-    test_state,
-};
-
-use helpers::*;
+use hsh_erp_test_support::fixture::PartFixture;
+use hsh_erp_test_support::*;
 
 // ===========================================================================
-//  全局串行化
+//  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）
 // ===========================================================================
 
-
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body)));
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    common::ensure_database_exists().await;
-    let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
-}
-
-/// 创建一个 INSPECTOR 用户 + 登录拿 token。
-async fn login_inspector(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "INSPECTOR", None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
+async fn insert_part_with_batch(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    status: &str,
+    qty: i32,
+) -> (i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let batch_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, NULL, $2, 'D-001', $3, $6, $2, $4, $4, 1, 0, $5, $5)",
     )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token, pool)
+    .bind(part_id)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .bind(status)
+    .execute(pool)
+    .await
+    .expect("insert part");
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, $4, 0, $5, $5)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(qty)
+    .bind(status)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert batch");
+    (part_id, batch_id)
+}
+
+async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
+    sqlx::query_scalar::<_, i32>("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .expect("batch not found")
+}
+
+// ===========================================================================
+//  bootstrap helpers
+// ===========================================================================
+
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, PartFixture) {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
+}
+
+async fn bootstrap_as_clerk() -> (PgPool, axum::Router, String, PartFixture) {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.clerk_username, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
+}
+
+async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String, PartFixture) {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.inspector_username, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
 // ===========================================================================
@@ -110,24 +121,18 @@ async fn login_inspector(pool: PgPool, username: &str) -> (axum::Router, String,
 
 #[tokio::test]
 async fn place_on_shelf_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let prod_shelf = common::insert_shelf(&pool, "P-001", "生产架A", "PRODUCTION").await;
-    let proc_id = seed_process(&pool, "PROC-A", "工序A").await;
     // PR-3: 建链并绑 part
     let chain_id = create_chain_for_part(&pool, pid).await;
-    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
-    link_shelf_to_process(&pool, prod_shelf, proc_id).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    // fixture 已预置映射
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": prod_shelf.to_string(),
-        "next_process_id": proc_id.to_string(),
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -146,24 +151,17 @@ async fn place_on_shelf_happy_path() {
 
 #[tokio::test]
 async fn place_on_shelf_rbac_clerk_ok() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_clerk().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let prod_shelf = common::insert_shelf(&pool, "P-002", "生产架B", "PRODUCTION").await;
-    let proc_id = seed_process(&pool, "PROC-C", "工序C").await;
-    // PR-3: 建链并绑 part
     let chain_id = create_chain_for_part(&pool, pid).await;
-    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
-    link_shelf_to_process(&pool, prod_shelf, proc_id).await;
-    let (app, token, _pool) = login_clerk(pool, "clerk1").await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    // fixture 已预置映射
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": prod_shelf.to_string(),
-        "next_process_id": proc_id.to_string(),
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -181,25 +179,18 @@ async fn place_on_shelf_rbac_clerk_ok() {
 
 #[tokio::test]
 async fn place_on_shelf_invalid_transition_rejects() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
     // 工单 COMPLETED 状态（place-on-shelf 要求 PENDING）
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "COMPLETED").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "COMPLETED").await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "COMPLETED", 5).await;
     let version = batch_version(&pool, bid).await;
-    let prod_shelf = common::insert_shelf(&pool, "P-003", "生产架C", "PRODUCTION").await;
-    let proc_id = seed_process(&pool, "PROC-D", "工序D").await;
-    // PR-3: 建链并绑 part
     let chain_id = create_chain_for_part(&pool, pid).await;
-    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
-    link_shelf_to_process(&pool, prod_shelf, proc_id).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    // fixture 已预置映射
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": prod_shelf.to_string(),
-        "next_process_id": proc_id.to_string(),
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -221,24 +212,23 @@ async fn place_on_shelf_invalid_transition_rejects() {
 
 #[tokio::test]
 async fn place_on_shelf_shelf_process_not_mapped_rejects() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let prod_shelf = common::insert_shelf(&pool, "P-004", "生产架D", "PRODUCTION").await;
-    // 不创建映射 → 20507 BIZ_SHELF_PROCESS_NOT_MAPPED
-    let proc_id = seed_process(&pool, "PROC-E", "工序E").await;
-    // PR-3: 建链并绑 part
+    // 删除 fixture 预置的 shelf↔process 映射 → 20507 BIZ_SHELF_PROCESS_NOT_MAPPED
+    sqlx::query("DELETE FROM t_shelf_process WHERE shelf_id = $1 AND process_id = $2")
+        .bind(fx.production_shelf_id)
+        .bind(fx.process_id)
+        .execute(&pool)
+        .await
+        .expect("delete shelf_process mapping");
     let chain_id = create_chain_for_part(&pool, pid).await;
-    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": prod_shelf.to_string(),
-        "next_process_id": proc_id.to_string(),
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -261,11 +251,8 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
 
 #[tokio::test]
 async fn recall_to_pending_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "IN_PROCESS").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "IN_PROCESS").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
     // 写入 location=PRODUCTION_SHELF（recall-to-pending 要求）
     sqlx::query("UPDATE t_part_batch SET location = 'PRODUCTION_SHELF' WHERE id = $1")
         .bind(bid)
@@ -273,7 +260,6 @@ async fn recall_to_pending_happy_path() {
         .await
         .expect("set location");
     let version = batch_version(&pool, bid).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
@@ -299,13 +285,9 @@ async fn recall_to_pending_happy_path() {
 
 #[tokio::test]
 async fn send_to_programming_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
@@ -326,24 +308,17 @@ async fn send_to_programming_happy_path() {
 
 #[tokio::test]
 async fn release_from_programming_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PROGRAMMING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "PROGRAMMING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PROGRAMMING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let prod_shelf = common::insert_shelf(&pool, "P-005", "生产架E", "PRODUCTION").await;
-    let proc_id = seed_process(&pool, "PROC-F", "工序F").await;
-    // PR-3: 建链并绑 part
     let chain_id = create_chain_for_part(&pool, pid).await;
-    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
-    link_shelf_to_process(&pool, prod_shelf, proc_id).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    // fixture 已预置映射
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": prod_shelf.to_string(),
-        "next_process_id": proc_id.to_string(),
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -361,24 +336,17 @@ async fn release_from_programming_happy_path() {
 
 #[tokio::test]
 async fn release_from_programming_rbac_inspector_rejects() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PROGRAMMING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "PROGRAMMING").await;
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PROGRAMMING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let prod_shelf = common::insert_shelf(&pool, "P-006", "生产架F", "PRODUCTION").await;
-    let proc_id = seed_process(&pool, "PROC-G", "工序G").await;
-    // PR-3: 建链并绑 part
     let chain_id = create_chain_for_part(&pool, pid).await;
-    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
-    link_shelf_to_process(&pool, prod_shelf, proc_id).await;
-    let (app, token, _pool) = login_inspector(pool, "insp1").await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    // fixture 已预置映射
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": prod_shelf.to_string(),
-        "next_process_id": proc_id.to_string(),
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -404,17 +372,12 @@ async fn release_from_programming_rbac_inspector_rejects() {
 
 #[tokio::test]
 async fn scan_inspect_pass_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let insp_shelf = common::insert_shelf(&pool, "I-001", "品检架A", "INSPECTION").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "pass": true,
-        "target_inspection_shelf_id": insp_shelf.to_string(),
+        "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
         "batch_id": bid.to_string(),
         "version": version,
     });
@@ -434,27 +397,26 @@ async fn scan_inspect_pass_happy_path() {
 
 #[tokio::test]
 async fn scan_inspect_fail_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "IN_PROCESS").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "IN_PROCESS").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
     let version = batch_version(&pool, bid).await;
-    let insp_shelf = common::insert_shelf(&pool, "I-002", "品检架B", "INSPECTION").await;
-    // 添加短暂 sleep 避免雪花 ID 复用导致 shelf_id == process_id
-    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    let prod_shelf = common::insert_shelf(&pool, "P-007", "生产架G", "PRODUCTION").await;
-    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-    let proc_id = seed_process(&pool, "PROC-H", "工序H").await;
-    link_shelf_to_process(&pool, prod_shelf, proc_id).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    // 设 location=PRODUCTION_SHELF + current_holder_id=production_shelf
+    sqlx::query(
+        "UPDATE t_part_batch SET location = 'PRODUCTION_SHELF', current_holder_id = $1 \
+         WHERE id = $2",
+    )
+    .bind(fx.production_shelf_id)
+    .bind(bid)
+    .execute(&pool)
+    .await
+    .unwrap();
     let body = json!({
         "pass": false,
-        "target_inspection_shelf_id": insp_shelf.to_string(),
+        "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": prod_shelf.to_string(),
-        "next_process_id": proc_id.to_string(),
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -472,17 +434,12 @@ async fn scan_inspect_fail_happy_path() {
 
 #[tokio::test]
 async fn scan_inspect_invalid_transition_rejects() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "DELIVERED").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "DELIVERED").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "DELIVERED", 5).await;
     let version = batch_version(&pool, bid).await;
-    let insp_shelf = common::insert_shelf(&pool, "I-003", "品检架C", "INSPECTION").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "pass": true,
-        "target_inspection_shelf_id": insp_shelf.to_string(),
+        "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
         "batch_id": bid.to_string(),
         "version": version,
     });
@@ -502,15 +459,40 @@ async fn scan_inspect_invalid_transition_rejects() {
 
 #[tokio::test]
 async fn scan_deliver_part_requires_driver() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
     // 创建 part 带 serial_no
-    let pid =
-        insert_part_with_status(&pool, "P0", l2, Some("B001-001"), None, "READY_TO_SHIP").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "READY_TO_SHIP").await;
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let pid = snowflake.next_id();
+    let bid = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, 'B001-001', 'P0', 'D-001', $2, 'READY_TO_SHIP', 'P0', $3, $3, 1, 0, $4, $4)",
+    )
+    .bind(pid)
+    .bind(fx.customer_l2_id)
+    .bind(today)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert part with serial_no");
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 1, 5, 'READY_TO_SHIP', 0, $3, $3)",
+    )
+    .bind(bid)
+    .bind(pid)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert batch");
     let _version = batch_version(&pool, bid).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     // 不创建任何 worker → 找不到工牌 → 401/404 错
     let body = json!({
         "part_serial_no": "B001-001",

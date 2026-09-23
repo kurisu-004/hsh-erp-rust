@@ -88,7 +88,7 @@ impl Default for ProcessChainFixture {
 /// 重跑都不会撞 ID。bcrypt 哈希预生成嵌入 SQL，省每测试 ~250ms 现场 hash 开销。
 #[allow(dead_code)]
 pub async fn load_process_chain_fixture(pool: &PgPool) -> ProcessChainFixture {
-    let sql = include_str!("../fixtures/process_chain.sql");
+    let sql = include_str!("../../fixtures/process_chain.sql");
     sqlx::raw_sql(sql)
         .execute(pool)
         .await

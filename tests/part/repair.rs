@@ -6,88 +6,104 @@
 //!   - repair_dispatch: 一步式返修下发
 //!   - list_repair_batches / list_repairing_batches
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
-// 故本文件自带 `mod common;` / `mod helpers;`（与 main.rs 的同名 pub mod 不冲突）。
-#[path = "../common/mod.rs"]
-mod common;
+// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录。
+// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel；fixture 由 PartFixture 提供。
 #[path = "helpers.rs"]
 mod helpers;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
-use serde_json::{Value, json};
+use axum::http::StatusCode;
+use serde_json::json;
 use sqlx::PgPool;
-use tower::ServiceExt;
 
-use common::{
-    clean_business_db, clean_db, create_chain_for_part, create_step, link_shelf_to_process,
-    seed_process, test_pool,
-};
+use hsh_erp_test_support::fixture::PartFixture;
+use hsh_erp_test_support::*;
 
-use helpers::*;
+// ===========================================================================
+//  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）
+// ===========================================================================
 
+async fn insert_part_with_batch(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    status: &str,
+    qty: i32,
+) -> (i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let batch_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, NULL, $2, 'D-001', $3, $6, $2, $4, $4, 1, 0, $5, $5)",
+    )
+    .bind(part_id)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .bind(status)
+    .execute(pool)
+    .await
+    .expect("insert part");
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, $4, 0, $5, $5)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(qty)
+    .bind(status)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert batch");
+    (part_id, batch_id)
+}
 
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
+async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
+    sqlx::query_scalar::<_, i32>("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
         .await
-        .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body)));
-    (status, envelope)
+        .expect("batch not found")
 }
 
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
+// ===========================================================================
+//  bootstrap helpers
+// ===========================================================================
 
-async fn setup() -> PgPool {
-    common::ensure_database_exists().await;
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, PartFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
 #[tokio::test]
 async fn complete_repair_to_process_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "REPAIRING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "REPAIRING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "REPAIRING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let prod_shelf = common::insert_shelf(&pool, "P-R01", "生产架R1", "PRODUCTION").await;
-    let proc_id = seed_process(&pool, "PROC-R1", "工序R1").await;
 
     // 2026-09-16 PR-3 批次 step 化：complete-repair / repair-dispatch
     // PRODUCTION 区要求 part 已绑定工艺链
     let chain_id = create_chain_for_part(&pool, pid).await;
-    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
-    link_shelf_to_process(&pool, prod_shelf, proc_id).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    // 注：fixture 已预置 fx.production_shelf_id ↔ fx.process_id 的映射
+    // （t_shelf_process WORK_TYPE_PROCESS_ID），无需 link_shelf_to_process。
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": prod_shelf.to_string(),
-        "next_process_id": proc_id.to_string(),
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -105,18 +121,13 @@ async fn complete_repair_to_process_happy_path() {
 
 #[tokio::test]
 async fn complete_repair_to_inspection_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "REPAIRING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "REPAIRING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "REPAIRING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let insp_shelf = common::insert_shelf(&pool, "I-R01", "品检架R1", "INSPECTION").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": insp_shelf.to_string(),
+        "shelf_id": fx.inspection_shelf_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -134,24 +145,17 @@ async fn complete_repair_to_inspection_happy_path() {
 
 #[tokio::test]
 async fn complete_repair_invalid_source_rejects() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "PENDING").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
-    let prod_shelf = common::insert_shelf(&pool, "P-R02", "生产架R2", "PRODUCTION").await;
-    let proc_id = seed_process(&pool, "PROC-R2", "工序R2").await;
-    link_shelf_to_process(&pool, prod_shelf, proc_id).await;
     // PR-3：repair-dispatch PRODUCTION 区要求 part 已绑定工艺链
     let chain_id = create_chain_for_part(&pool, pid).await;
-    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": prod_shelf.to_string(),
-        "next_process_id": proc_id.to_string(),
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -169,19 +173,14 @@ async fn complete_repair_invalid_source_rejects() {
 
 #[tokio::test]
 async fn repair_dispatch_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
     // 入口：INSPECTION / READY_TO_SHIP / IN_PROCESS / DELIVERED
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "INSPECTION").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "INSPECTION").await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "INSPECTION", 5).await;
     let version = batch_version(&pool, bid).await;
-    let insp_shelf = common::insert_shelf(&pool, "I-R03", "品检架R3", "INSPECTION").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": insp_shelf.to_string(),
+        "shelf_id": fx.inspection_shelf_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -199,18 +198,13 @@ async fn repair_dispatch_happy_path() {
 
 #[tokio::test]
 async fn repair_dispatch_invalid_source_rejects() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "CANCELLED").await;
-    let bid = insert_batch(&pool, pid, 1, 5, "CANCELLED").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "CANCELLED", 5).await;
     let version = batch_version(&pool, bid).await;
-    let insp_shelf = common::insert_shelf(&pool, "I-R04", "品检架R4", "INSPECTION").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
     let body = json!({
         "batch_id": bid.to_string(),
         "version": version,
-        "shelf_id": insp_shelf.to_string(),
+        "shelf_id": fx.inspection_shelf_id.to_string(),
     });
     let (s, env) = send(
         app,
@@ -228,12 +222,8 @@ async fn repair_dispatch_invalid_source_rejects() {
 
 #[tokio::test]
 async fn list_repair_batches_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "DELIVERED").await;
-    insert_batch(&pool, pid, 1, 5, "DELIVERED").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, _bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "DELIVERED", 5).await;
     let (s, env) = send(
         app,
         json_request("GET", "/parts/repair-batches", None, Some(&token)),
@@ -241,16 +231,13 @@ async fn list_repair_batches_happy_path() {
     .await;
     assert_eq!(s, StatusCode::OK, "list-repair-batches: {env}");
     assert_eq!(env["code"], 0);
+    let _ = (pid, fx); // suppress unused
 }
 
 #[tokio::test]
 async fn list_repairing_batches_happy_path() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "REPAIRING").await;
-    insert_batch(&pool, pid, 1, 5, "REPAIRING").await;
-    let (app, token, _pool) = login_manager(pool, "admin").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (_pid, _bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "REPAIRING", 5).await;
     let (s, env) = send(
         app,
         json_request("GET", "/parts/repairing-batches", None, Some(&token)),

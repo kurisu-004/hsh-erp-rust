@@ -14,36 +14,50 @@
 //! 1. 多批次 part（不同 status / location / holder）→ 返回 min-progress 批次的派生字段
 //! 2. 无活跃批次 part → location=null / holder_name=null
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `use common::*;` 不自动 fallback 到 crate root，
-// 故本文件自带 `mod common;` / `mod helpers;`（与 main.rs 的同名 pub mod 不冲突）。
-#[path = "../common/mod.rs"]
-mod common;
+// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录。
+// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel；fixture 由 PartFixture 提供。
 #[path = "helpers.rs"]
 mod helpers;
 
 use axum::http::StatusCode;
 use serde_json::Value;
+use sqlx::PgPool;
 
-use helpers::*;
+use hsh_erp_test_support::fixture::PartFixture;
+use hsh_erp_test_support::*;
 
 // ===========================================================================
-//  全局串行化
+//  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）
 // ===========================================================================
 
-
-async fn setup() -> sqlx::PgPool {
-    common::ensure_database_exists().await;
-    let pool = common::test_pool().await;
-    common::clean_db(&pool).await;
-    common::clean_business_db(&pool).await;
-    pool
+async fn insert_part(pool: &PgPool, name: &str, customer_id: i64, status: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, NULL, $2, 'D-001', $3, $5, $2, $4, $4, 1, 0, $6, $6)",
+    )
+    .bind(part_id)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(status)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert part");
+    part_id
 }
 
 /// 在 part 上追加一个非默认 status / location / holder 的批次。
-///
-/// 返回 `(batch_id, location, holder_id, holder_name_or_code)`，便于测试断言。
 async fn add_batch_with_location(
-    pool: &sqlx::PgPool,
+    pool: &PgPool,
     part_id: i64,
     batch_no: i32,
     qty: i32,
@@ -56,7 +70,6 @@ async fn add_batch_with_location(
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
-    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 has_been_repaired。
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
          current_holder_id, version, created_at, updated_at) \
@@ -76,9 +89,16 @@ async fn add_batch_with_location(
     id
 }
 
-/// 在 t_shelf 插一行；返回 shelf.id。
-async fn insert_insp_shelf(pool: &sqlx::PgPool, code: &str) -> i64 {
-    common::insert_shelf(pool, code, "品检架", "INSPECTION").await
+// ===========================================================================
+//  bootstrap helpers
+// ===========================================================================
+
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, PartFixture) {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
 // ===========================================================================
@@ -86,30 +106,13 @@ async fn insert_insp_shelf(pool: &sqlx::PgPool, code: &str) -> i64 {
 // ===========================================================================
 
 /// 1. 多 batch part（不同 status / location / holder）→ 返回 min-progress 批次的派生字段。
-///
-/// 派生规则（PR-2 § part/service/crud.rs::enrich_part_list_with_location_and_holder）：
-///   - 排除 CANCELLED；非空时再排除 COMPLETED
-///   - 取 part_status_progress 最小的批次
-///   - location = 该批次 location；holder_name = 该批次 current_holder_id 解析名
-///     （按 batch.location 分桶：SHELF → t_shelf.code；WORKER → t_worker.name）
-///
-/// 场景：part P0 3 个批次：
-///   - batch 1: status=PENDING (progress=0) + location=OFFICE + holder=NULL → 应选中
-///   - batch 2: status=IN_PROCESS (progress=2) + location=PRODUCTION_SHELF
-///             + holder=insp_shelf
-///   - batch 3: status=DELIVERED (progress=6) + location=PRODUCTION_SHELF
-///             + holder=insp_shelf
-///
-/// 期望：list 返回 `location="OFFICE"`，`holder_name=null`（PENDING 批次无 holder）。
 #[tokio::test]
 async fn list_returns_min_progress_batch_location_and_holder() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let prod_shelf = insert_insp_shelf(&pool, "PROD-LIST-001").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let prod_shelf = insert_shelf(&pool, "PROD-LIST-001", "FX 检验架", "INSPECTION").await;
 
     // 1 part + 3 batches（part 状态由 rollup 规则决定，但此处不依赖：只看批次）
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, "PENDING").await;
     // batch 1（最小 progress）
     add_batch_with_location(&pool, pid, 1, 1, "PENDING", Some("OFFICE"), None).await;
     // batch 2（IN_PROCESS + shelf holder）
@@ -135,12 +138,11 @@ async fn list_returns_min_progress_batch_location_and_holder() {
     )
     .await;
 
-    let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={l2}&limit=10"),
+            &format!("/parts?customer_id={}&limit=10", fx.customer_l2_id),
             None::<Value>,
             Some(&token),
         ),
@@ -162,30 +164,17 @@ async fn list_returns_min_progress_batch_location_and_holder() {
 }
 
 /// 2. 无任何批次的 part（`list_active_by_part_ids` 返回空）→ location=null / holder_name=null。
-///
-/// 派生规则：`enrich_part_list_with_location_and_holder` 在 `list_active_by_part_ids`
-/// 返回空时，`target_per_part` 为空；caller `list_parts` 走 `(None, None)` 默认值
-///（PR-2 § part/service/crud.rs:247-249）。
-///
-/// 注：「全部批次 CANCELLED」并不触发空 —— service 层会把 CANCELLED 批次作为
-/// fallback 候选（PR-2 § crud.rs:919-921 `bs.iter().collect()`），仍派生 location
-///（值为该 CANCELLED 批次的 location）。要触发 location=null 必须让 part 真正
-/// 没有非软删批次（即 `list_active_by_part_ids` 返回空）。
 #[tokio::test]
 async fn list_returns_null_location_when_no_active_batches() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
+    let _pid = insert_part(&_pool, "P0", fx.customer_l2_id, "PENDING").await;
+    let _ = _pid;
 
-    // 1 part + 0 批次（list_active_by_part_ids 返回空）
-    let _pid = insert_part_with_status(&pool, "P0", l2, None, None, "PENDING").await;
-
-    let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={l2}&limit=10"),
+            &format!("/parts?customer_id={}&limit=10", fx.customer_l2_id),
             None::<Value>,
             Some(&token),
         ),
@@ -207,16 +196,12 @@ async fn list_returns_null_location_when_no_active_batches() {
 }
 
 /// 3. IN_PROCESS 批次 + PRODUCTION_SHELF holder → holder_name = shelf.code。
-///
-/// 直接验证 holder_name 解析路径（PRODUCTION_SHELF → t_shelf.code）。
 #[tokio::test]
 async fn list_resolves_production_shelf_holder_to_shelf_code() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let prod_shelf = insert_insp_shelf(&pool, "SHELF-CODE-XYZ").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let prod_shelf = insert_shelf(&pool, "SHELF-CODE-XYZ", "FX 检验架", "INSPECTION").await;
 
-    let pid = insert_part_with_status(&pool, "P0", l2, None, None, "IN_PROCESS").await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, "IN_PROCESS").await;
     add_batch_with_location(
         &pool,
         pid,
@@ -228,12 +213,11 @@ async fn list_resolves_production_shelf_holder_to_shelf_code() {
     )
     .await;
 
-    let (app, token, _pool) = login_manager(pool, "mgr").await;
     let (s, env) = send(
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={l2}&limit=10"),
+            &format!("/parts?customer_id={}&limit=10", fx.customer_l2_id),
             None::<Value>,
             Some(&token),
         ),
@@ -255,25 +239,19 @@ async fn list_resolves_production_shelf_holder_to_shelf_code() {
 }
 
 // ===== 2026-09-17 PR-4 守卫修复：locations / holder_ids 过滤 =====
-//
-// 背景：前端 `usePartsListQuery.ts:204` 发 `locations` + `holder_ids` 两个 query
-// 参数，被 PartListQuery 静默忽略。本测试验证 PR-4 修复后两端点都按 t_part_batch
-// （PR-2 已删 t_part.location / current_holder_id 列）过滤。
 
 /// `GET /parts?locations=PRODUCTION_SHELF,WORKER` —— 仅返 part 下至少有一个
 /// active batch.location 命中白名单的 part。OFFICE 批次的 part 不应出现。
 #[tokio::test]
 async fn list_filters_by_locations_param() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let prod_shelf = insert_insp_shelf(&pool, "PROD-LOC-001").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let prod_shelf = insert_shelf(&pool, "PROD-LOC-001", "FX 检验架", "INSPECTION").await;
 
     // part_a：唯一批次 location=OFFICE → 不应命中
-    let pid_a = insert_part_with_status(&pool, "PA", l2, None, None, "PENDING").await;
+    let pid_a = insert_part(&pool, "PA", fx.customer_l2_id, "PENDING").await;
     add_batch_with_location(&pool, pid_a, 1, 1, "PENDING", Some("OFFICE"), None).await;
     // part_b：唯一批次 location=PRODUCTION_SHELF → 应命中
-    let pid_b = insert_part_with_status(&pool, "PB", l2, None, None, "IN_PROCESS").await;
+    let pid_b = insert_part(&pool, "PB", fx.customer_l2_id, "IN_PROCESS").await;
     add_batch_with_location(
         &pool,
         pid_b,
@@ -285,12 +263,11 @@ async fn list_filters_by_locations_param() {
     )
     .await;
 
-    let (app, token, _pool) = login_manager(pool, "mgr_loc").await;
     let (s, env) = send(
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={l2}&locations=PRODUCTION_SHELF,WORKER&limit=10"),
+            &format!("/parts?customer_id={}&locations=PRODUCTION_SHELF,WORKER&limit=10", fx.customer_l2_id),
             None::<Value>,
             Some(&token),
         ),
@@ -315,22 +292,13 @@ async fn list_filters_by_locations_param() {
 
 /// `GET /parts?holder_ids=<shelf_id>` —— 多态 holder：t_shelf / t_worker /
 /// t_outsource_company 任一表匹配同一雪花 id 即命中。
-///
-/// 场景：shelves 1 个（PROD-HOLDER-001）→ holder_id 命中其 id；worker 1 个
-/// (W-001) → holder_id 命中其 id（模拟 worker 已接管该 part 批次）。
-/// 构造 3 个 part：
-/// - part_x：批次 1 holder=shelf_id → 命中
-/// - part_y：批次 1 holder=worker_id → 命中（多态：worker 也命中）
-/// - part_z：批次 1 holder=另一个 shelf → 不命中
 #[tokio::test]
 async fn list_filters_by_holder_ids_param_polymorphic() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let shelf_a = insert_insp_shelf(&pool, "PROD-HOLDER-001").await;
-    let shelf_b = insert_insp_shelf(&pool, "PROD-HOLDER-002").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let shelf_a = insert_shelf(&pool, "PROD-HOLDER-001", "FX 检验架A", "INSPECTION").await;
+    let shelf_b = insert_shelf(&pool, "PROD-HOLDER-002", "FX 检验架B", "INSPECTION").await;
 
-    // 建一个 worker（直插 t_worker，复用 common 已有 helper 模式）
+    // 建一个 worker
     let worker_id = {
         use hsh_erp_rust::infra::clock::now_naive;
         use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
@@ -353,7 +321,7 @@ async fn list_filters_by_holder_ids_param_polymorphic() {
     };
 
     // part_x：批次 holder=shelf_a（命中 shelf_a 的 id）
-    let pid_x = insert_part_with_status(&pool, "PX", l2, None, None, "IN_PROCESS").await;
+    let pid_x = insert_part(&pool, "PX", fx.customer_l2_id, "IN_PROCESS").await;
     add_batch_with_location(
         &pool,
         pid_x,
@@ -365,7 +333,7 @@ async fn list_filters_by_holder_ids_param_polymorphic() {
     )
     .await;
     // part_y：批次 holder=worker（命中 worker_id）
-    let pid_y = insert_part_with_status(&pool, "PY", l2, None, None, "IN_PROCESS").await;
+    let pid_y = insert_part(&pool, "PY", fx.customer_l2_id, "IN_PROCESS").await;
     add_batch_with_location(
         &pool,
         pid_y,
@@ -377,7 +345,7 @@ async fn list_filters_by_holder_ids_param_polymorphic() {
     )
     .await;
     // part_z：批次 holder=shelf_b（不在 holder_ids 白名单）
-    let pid_z = insert_part_with_status(&pool, "PZ", l2, None, None, "IN_PROCESS").await;
+    let pid_z = insert_part(&pool, "PZ", fx.customer_l2_id, "IN_PROCESS").await;
     add_batch_with_location(
         &pool,
         pid_z,
@@ -389,12 +357,11 @@ async fn list_filters_by_holder_ids_param_polymorphic() {
     )
     .await;
 
-    let (app, token, _pool) = login_manager(pool, "mgr_holder").await;
     let (s, env) = send(
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={l2}&holder_ids={shelf_a},{worker_id}&limit=10"),
+            &format!("/parts?customer_id={}&holder_ids={},{}&limit=10", fx.customer_l2_id, shelf_a, worker_id),
             None::<Value>,
             Some(&token),
         ),
@@ -422,18 +389,14 @@ async fn list_filters_by_holder_ids_param_polymorphic() {
 }
 
 /// 不传 locations / holder_ids 时与旧行为一致（不过滤这两个维度）。
-/// 场景：3 个 part 各有 OFFICE / PRODUCTION_SHELF / WORKER 三种批次，
-/// 不传过滤 → 应全部返回。
 #[tokio::test]
 async fn list_without_locations_or_holder_ids_returns_all() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-    let prod_shelf = insert_insp_shelf(&pool, "PROD-BASE-001").await;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let prod_shelf = insert_shelf(&pool, "PROD-BASE-001", "FX 检验架", "INSPECTION").await;
 
-    let pid_a = insert_part_with_status(&pool, "PALL-A", l2, None, None, "PENDING").await;
+    let pid_a = insert_part(&pool, "PALL-A", fx.customer_l2_id, "PENDING").await;
     add_batch_with_location(&pool, pid_a, 1, 1, "PENDING", Some("OFFICE"), None).await;
-    let pid_b = insert_part_with_status(&pool, "PALL-B", l2, None, None, "IN_PROCESS").await;
+    let pid_b = insert_part(&pool, "PALL-B", fx.customer_l2_id, "IN_PROCESS").await;
     add_batch_with_location(
         &pool,
         pid_b,
@@ -444,15 +407,14 @@ async fn list_without_locations_or_holder_ids_returns_all() {
         Some(prod_shelf),
     )
     .await;
-    let pid_c = insert_part_with_status(&pool, "PALL-C", l2, None, None, "IN_PROCESS").await;
+    let pid_c = insert_part(&pool, "PALL-C", fx.customer_l2_id, "IN_PROCESS").await;
     add_batch_with_location(&pool, pid_c, 1, 1, "IN_PROCESS", Some("WORKER"), None).await;
 
-    let (app, token, _pool) = login_manager(pool, "mgr_no_filt").await;
     let (s, env) = send(
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={l2}&limit=10"),
+            &format!("/parts?customer_id={}&limit=10", fx.customer_l2_id),
             None::<Value>,
             Some(&token),
         ),
@@ -476,16 +438,12 @@ async fn list_without_locations_or_holder_ids_returns_all() {
 /// holder_ids 包含非法雪花 ID → 返回 40001 VALIDATION_ERROR（service 层 parse 失败兜底）。
 #[tokio::test]
 async fn list_holder_ids_invalid_format_returns_40001() {
-    let pool = setup().await;
-    let l1 = insert_l1(&pool, "F", "F").await;
-    let l2 = insert_l2(&pool, "二厂", l1).await;
-
-    let (app, token, _pool) = login_manager(pool, "mgr_bad_h").await;
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
     let (s, env) = send(
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={l2}&holder_ids=not_a_number"),
+            &format!("/parts?customer_id={}&holder_ids=not_a_number", fx.customer_l2_id),
             None::<Value>,
             Some(&token),
         ),
