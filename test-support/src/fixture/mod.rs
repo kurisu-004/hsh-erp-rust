@@ -20,6 +20,8 @@
 pub mod delivery;
 pub mod part;
 pub mod process_chain;
+pub mod production;
 pub use delivery::*;
 pub use part::*;
 pub use process_chain::*;
+pub use production::*;
