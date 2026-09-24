@@ -14,11 +14,22 @@
 //!   8. three_state_note_clear_to_null           — Some(None) 置 NULL
 //!   9. three_state_note_overwrite               — Some(Some(v)) 覆盖
 //!  10. child_current_batch_id_in_detail         — 子件有活跃 batch → current_batch_id 非空
+//!
+//! PR13 Phase H（2026-09-24）fixture 范本化：
+//! - 删除 `clean_db` / `clean_business_db` / `ensure_database_exists`（from
+//!   tests/common/mod.rs facade，对应 test-support/src/fixtures.rs）——
+//!   nextest 进程级 fresh database 无需 truncate；
+//! - `setup()` 改返 `(PgPool, AssemblyFixture)`，调 `load_assembly_fixture` 复用
+//!   part 域基线 + 加载 assembly 域 canonical L1+L2 + 'F' serial_counter；
+//! - 本 sub-file 仍保留 `insert_l1_customer` / `insert_l2_customer` /
+//!   `insert_serial_counter` / `make_pdf_bytes` / `make_pdf_2_pages` /
+//!   `seed_assembly` / `test_current_user` 等本地 helper：每测试需要
+//!   assembly 的不同生命周期 / 状态 / 附件。
 
 #[path = "../common/mod.rs"]
 mod common;
 
-use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
+use common::test_pool;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
@@ -31,13 +42,24 @@ use lopdf::{Document, Object, ObjectId, dictionary};
 use sqlx::PgPool;
 use std::sync::Arc;
 
+use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture};
 
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
+// ===========================================================================
+//  setup（PR13 Phase H，2026-09-24 fixture 范本化）
+// ===========================================================================
+//
+//  - `test_pool()` 起 fresh database（nextest 进程级隔离，DB 间 schema 完全独立）
+//  - `load_assembly_fixture(&pool)` 复用 part 域基线 + 加载 assembly 域 canonical
+//    L1+L2 + 'F' serial_counter
+//  - 本 sub-file 仍保留 `insert_l1_customer` / `insert_l2_customer` /
+//    `insert_serial_counter` / `make_pdf_bytes` / `make_pdf_2_pages` /
+//    `test_current_user` / `seed_assembly` 等本地 helper
+
+
+async fn setup() -> (PgPool, AssemblyFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_assembly_fixture(&pool).await;
+    (pool, fx)
 }
 
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
@@ -170,7 +192,7 @@ async fn seed_assembly(pool: &PgPool) -> (i64, i64, i64) {
 
 #[tokio::test]
 async fn upload_files_happy_path() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let cos = Arc::new(NoopCos);
@@ -237,7 +259,7 @@ async fn upload_files_happy_path() {
 
 #[tokio::test]
 async fn upload_files_ext_must_be_pdf() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let cos = Arc::new(NoopCos);
@@ -291,7 +313,7 @@ async fn upload_files_ext_must_be_pdf() {
 
 #[tokio::test]
 async fn start_pending_to_in_process() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
@@ -329,7 +351,7 @@ async fn start_pending_to_in_process() {
 
 #[tokio::test]
 async fn soft_delete_has_shipment_returns_20307() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
@@ -398,7 +420,7 @@ async fn soft_delete_has_shipment_returns_20307() {
 
 #[tokio::test]
 async fn three_state_note_clear_to_null() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
@@ -456,7 +478,7 @@ async fn three_state_note_clear_to_null() {
 
 #[tokio::test]
 async fn child_current_batch_id_in_detail() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let (l1, l2, _) = seed_assembly(&pool).await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
