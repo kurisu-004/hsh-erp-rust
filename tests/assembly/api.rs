@@ -36,10 +36,12 @@
 //!   - 不走 HTTP 启动（避免 JWT/Redis 开销），直接 service 调用；`pool.begin()`
 //!     开 tx → 传 `&mut *tx` 给 service → 显式 `tx.commit()`。
 //!   - PR13 Phase H（2026-09-24）fixture 范本化：`setup()` 改返
-//!     `(PgPool, AssemblyFixture)`；`AssemblyFixture.assembly_l2_id`（id=71）
-//!     是 canonical L2 客户，可直接用作 assembly.customer_id 跳过
-//!     `insert_l1_customer` + `insert_l2_customer`，本 sub-file 暂保留两者
-//!     备用（与每 testing 不同的 L1 prefix / counter 初始值场景兼容）。
+//!     `(PgPool, AssemblyFixture)`；`load_assembly_fixture(&pool)` 复用 part
+//!     域基线 + 加载 canonical t_serial_counter('F', 0)。本 sub-file 保留
+//!     `insert_l1_customer` / `insert_l2_customer` / `insert_serial_counter`
+//!     本地 helper，因每用例需要不同 prefix（'F' 18/20 + 'X' 1/20 list 测试）
+//!     或不同初始 counter 值；fixture 故不预置 t_customer（撞
+//!     uq_t_customer_root_prefix 全局唯一约束）。
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -65,8 +67,8 @@ use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture};
 // ===========================================================================
 //
 //  - `test_pool()` 起 fresh database（nextest 进程级隔离，DB 间 schema 完全独立）
-//  - `load_assembly_fixture(&pool)` 复用 part 域基线 + 加载 assembly 域 canonical
-//    L1+L2 + 'F' serial_counter
+//  - `load_assembly_fixture(&pool)` 复用 part 域基线 + 加载 canonical
+//    t_serial_counter('F', 0)
 //  - 本 sub-file 仍保留 `insert_l1_customer` / `insert_l2_customer` /
 //    `insert_serial_counter` / `make_fixture_pdf` / `test_current_user` 等本地
 //    helper：因每种场景需要不同 prefix（'F' 18/20 / 'X' 1/20 list_with_filters

@@ -20,7 +20,8 @@
 //!   tests/common/mod.rs facade，对应 test-support/src/fixtures.rs）——
 //!   nextest 进程级 fresh database 无需 truncate；
 //! - `setup()` 改返 `(PgPool, AssemblyFixture)`，调 `load_assembly_fixture` 复用
-//!   part 域基线 + 加载 assembly 域 canonical L1+L2 + 'F' serial_counter；
+//!   part 域基线 + 加载 canonical t_serial_counter('F', 0)（不预置 t_customer，
+//!   因 uq_t_customer_root_prefix 全局唯一约束与测试自建 L1 冲突）；
 //! - 本 sub-file 仍保留 `insert_l1_customer` / `insert_l2_customer` /
 //!   `insert_serial_counter` / `make_pdf_bytes` / `make_pdf_2_pages` /
 //!   `seed_assembly` / `test_current_user` 等本地 helper：每测试需要
@@ -49,8 +50,8 @@ use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture};
 // ===========================================================================
 //
 //  - `test_pool()` 起 fresh database（nextest 进程级隔离，DB 间 schema 完全独立）
-//  - `load_assembly_fixture(&pool)` 复用 part 域基线 + 加载 assembly 域 canonical
-//    L1+L2 + 'F' serial_counter
+//  - `load_assembly_fixture(&pool)` 复用 part 域基线 + 加载 canonical
+//    t_serial_counter('F', 0)
 //  - 本 sub-file 仍保留 `insert_l1_customer` / `insert_l2_customer` /
 //    `insert_serial_counter` / `make_pdf_bytes` / `make_pdf_2_pages` /
 //    `test_current_user` / `seed_assembly` 等本地 helper
