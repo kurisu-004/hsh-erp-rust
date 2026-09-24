@@ -55,6 +55,11 @@ cleanup() {
         # setup 阶段失败 → 删容器兜底
         docker rm -f "$CID" >/dev/null 2>&1 || true
     fi
+    # 2026-09-24 E1 改造：与 session 容器一起清理 RSA keypair tmpdir（避免每跑一次
+    # 累积一堆 2048-bit 私钥残留；不在 git 但仍有 disk-usage 噪音）。
+    if [ -n "${JWT_KEYS_TMPDIR:-}" ] && [ -d "$JWT_KEYS_TMPDIR" ]; then
+        rm -rf "$JWT_KEYS_TMPDIR" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
 
@@ -72,6 +77,26 @@ if [ "$ready" -ne 1 ]; then
     docker logs "$CID" >&2 || true
     exit 1
 fi
+
+# 2026-09-24 E1 改造：跑迁移到 template 之前，先用 openssl 生成一对 2048-bit RSA
+# keypair 并 export 到环境，test-support/src/pem.rs 会短路读盘，避免 nextest
+# process-per-test 模型下 ~500 进程各自生成两次 RSA keypair（每进程 ~150ms+
+# OsRng entropy）。next 仍生成（与现有 middleware 断言对齐：JwtConfig::public_keys
+# 装载 current + next 两对；test_public_kids() 首次访问会触发 KEYS_NEXT lazy init）。
+#
+# env 短路约定：
+# - JWT_TEST_PRIVATE_PEM_PATH → 私钥 PKCS#8 PEM 文件
+# - JWT_TEST_PUBLIC_PEMS_DIR → 公钥 SPKI PEM 目录，kid = 文件名（current.pem / next.pem）
+# 两 env 都设 → test-support::pem 读盘；任一缺失 → 静默回退 OsRng（unit test 兼容）；
+# 都设但文件缺失 → fast-fail panic（不静默回退）。
+JWT_KEYS_TMPDIR="$(mktemp -d -t hsh_jwt_keys.XXXXXX)"
+mkdir -p "$JWT_KEYS_TMPDIR/pub"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$JWT_KEYS_TMPDIR/priv.pem" 2>/dev/null
+openssl rsa -in "$JWT_KEYS_TMPDIR/priv.pem" -pubout -out "$JWT_KEYS_TMPDIR/pub/current.pem" 2>/dev/null
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$JWT_KEYS_TMPDIR/next_priv.pem" 2>/dev/null
+openssl rsa -in "$JWT_KEYS_TMPDIR/next_priv.pem" -pubout -out "$JWT_KEYS_TMPDIR/pub/next.pem" 2>/dev/null
+export JWT_TEST_PRIVATE_PEM_PATH="$JWT_KEYS_TMPDIR/priv.pem"
+export JWT_TEST_PUBLIC_PEMS_DIR="$JWT_KEYS_TMPDIR/pub"
 
 # 2026-09-20 plan 2：在容器内 CREATE DATABASE hsh_erp_template + 跑 24 个 schema 迁移
 TEMPLATE_DB=hsh_erp_template
