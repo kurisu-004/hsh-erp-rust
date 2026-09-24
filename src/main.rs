@@ -1,15 +1,3 @@
-//! 应用入口
-//!
-//! 组装流程：
-//!   tracing init → 配置 → PgPool → 雪花 ID → WS 广播中枢 → COS 客户端（占位）
-//!   → CancellationToken → AppState → 后台任务 spawn → Router nest (/api/v2 /api/mcp /ws)
-//!   → axum::serve + graceful_shutdown (Ctrl-C → 取消后台任务)
-//!
-//! 2026-09-20 新增：5 个 tower / tower-http 中间件（外层 + nest 内层）：
-//! - 外层：RequestId / PropagateRequestId / CatchPanic / Trace / CORS / Body limit
-//! - 内层（仅 `/api/v2` nest）：Compression（gzip）/ Timeout（默认 30s）
-//!   WS nest **不**挂 Compression 与 Timeout（前者会压 upgrade 响应，后者会杀长连接）。
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +26,7 @@ use hsh_erp_rust::infra::cos::CosClient;
 use hsh_erp_rust::infra::cos_opendal::build_cos_client;
 use hsh_erp_rust::infra::db;
 use hsh_erp_rust::infra::python_sts::{HttpPythonSts, NoopPythonSts, PythonSts};
+use hsh_erp_rust::infra::seed;
 use hsh_erp_rust::infra::redis;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
@@ -71,6 +60,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("执行数据库迁移失败")?;
 
+    // 3.6 应用 seeds（菜单等配置数据，幂等；2026-09-25 sqlx 接管后从 migration 抽出）
+    seed::run_seeds(&pool)
+        .await
+        .context("应用 seeds 失败")?;
+
     // 4. 雪花 ID 生成器（位布局对齐 myERP Python，跨语言 ID 互解）
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -81,22 +75,12 @@ async fn main() -> anyhow::Result<()> {
     let ws_hub = Arc::new(WsHub::new());
 
     // 6. COS 客户端（按 `COS_BACKEND` 二选一：`opendal` / `noop`）
-    // 2026-09-11 修改：原二选一 `if config.cos.enabled` 构造 TencentCos / NoopCos。
-    // 2026-09-20 spike：扩展为三选一（`build_cos_client` 内部按 `CosBackend` enum dispatch）。
-    // 2026-09-20 迁移清理：删 `cos_sdk` 变体后回到二选一（`opendal` / `noop`），缺省
-    // `opendal`。`OpenDalCos::new` 失败时 `?` 终止启动；`NoopOpenDal` 永不失败。
     let cos: Arc<dyn CosClient> = build_cos_client(&config.cos).context("构造 COS 客户端失败")?;
 
     // 6.4 Python STS 凭证转发客户端（2026-09-18 新增；替代原 TencentSts 直连）
     // 走 HTTP 转发到 python 后端内部端点 `/api/v1/files/sts-prefix-credentials`；
     // 本地 cargo run 时如不想启 python 后端，把 `PYTHON_BACKEND_BASE_URL` 设为空
     // 走 Noop 占位（仅供前端骨架调试，业务上不真上传）。
-    //
-    // 2026-09-18 review #5 修复：fail-fast —— COS_ENABLED=true 且 PYTHON_BACKEND_BASE_URL
-    // 为空是典型的生产 misconfiguration（业务要真实上传但 STS 链路未就绪）。原代码
-    // 静默回退到 NoopPythonSts 会让前端拿到"看上去合法"的占位 token 上传，触发
-    // 一连串 403 / 头像丢失等下游问题；现改为直接 bail! 拒绝启动，强制 ops
-    // 修复环境变量。dev / 测试场景显式 `COS_ENABLED=false` 仍走 Noop。
     let python_sts: Arc<dyn PythonSts> = if config.cos.enabled
         && !config.upload_session.python_backend_base_url.is_empty()
     {
@@ -145,12 +129,6 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
 
     // 8. 组装 AppState
-    // 2026-09-14 修复 Bug #1：移除 release profile 硬关 _e2e 的逻辑。
-    // 单一控制点 = env `E2E_HOOKS_ENABLED`（缺省 true）。
-    // docker compose / dev `cargo run` 走默认值（true）→ 启用；prod / staging 必须
-    // 显式 `E2E_HOOKS_ENABLED=false`（ops 责任，不靠编译期二分）。
-    // 2026-09-18：移除 `state.sts`（TencentSts）；改为 `state.python_sts`（HttpPythonSts /
-    // NoopPythonSts）+ `state.upload_session_repo`（RedisUploadSessionRepo / NoopUploadSessionRepo）。
     let config = Arc::new(config);
     let state = Arc::new(AppState::new(
         pool,
@@ -174,22 +152,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 10. 路由组装
-    // 2026-09-20 修复 review #1：axum `.layer()` 语义是「**后加的在外层**」
-    // （tower Layer 的 Service wrapped 顺序：后调用的 Layer 包裹先调用的），
-    // 因此下面按「**内→外**」顺序书写（最先 `.layer` 的是最内层），
-    // request 实际执行顺序（外→内）为：
-    //   BodyLimit → CORS → SetRequestId → PropagateRequestId → CatchPanic
-    //     → TraceLayer(make_span_with) → router
-    // 关键：SetRequestId 必须在 TraceLayer 外侧跑，否则 `make_request_span`
-    // 读不到注入的 `x-request-id` header，所有 span 都退化成 `request_id = "-"`。
-    //
-    // 越外层越先看到 request / 后看到 response；越内层越先看到 response。
-    //
-    // nest 内层（仅 `/api/v2`）：Compression（gzip 响应压缩）+ Timeout（请求超时）。
-    // **TimeoutLayer 是 nest 内最外层（覆盖 Compression）** —— 先超时判定、再 gzip 响应，
-    // 即超时分支直接 408 plain 不会被压缩；超时与压缩均只对 `/api/v2` 子树生效。
-    // WS nest **不**挂这两层：Compression 会压缩 WS upgrade 响应（破坏握手），
-    // Timeout 会杀 WS 心跳长连接。两者都必须局限在 `/api/v2` 子树内。
     let max_body = state.config.max_request_body_size;
     let request_timeout = Duration::from_secs(state.config.request_timeout_seconds);
     let api_v2 = modules::v2_router(state.clone())
@@ -218,10 +180,6 @@ async fn main() -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         // 6) Body limit（现状保留）
         .layer(RequestBodyLimitLayer::new(max_body))
-        // 2026-09-20 修复 review #1：state 同时是 `Arc<AppState>`（中间件用：
-        // `route_layer(from_fn_with_state(state.clone(), authenticate_middleware))`）
-        // 与 `Router<S = Arc<AppState>>` 的 S（handler extractor 用）的同一 Arc，
-        // `state.clone()` 两次仅 bump Arc 引用计数、不做深拷贝。
         .with_state(state.clone());
 
     // 11. 监听
@@ -257,14 +215,6 @@ async fn main() -> anyhow::Result<()> {
 // ===========================================================================
 
 /// Panic 兜底：handler panic → 统一 500 信封（与 AppError::into_response 同形）。
-///
-/// `code: 50000 / INTERNAL` 是系统错误的固定段，HTTP 500。fn pointer 形式满足
-/// `CatchPanicHandler` trait bound（自动实现）。
-///
-/// 2026-09-20 修复 review #1：原实现 `_err` 直接吞掉，运维侧拿不到 panic payload
-/// 难以定位事故现场。现 downcast 出 `&str`（最常见 panic 信息形式）后走
-/// `tracing::error!` 落地日志；`String` payload 也兼容；其它类型退化为类型名。
-/// panic 仍以 500 信封对外 —— 日志仅作运维排查依据，**不**泄漏到客户端。
 #[allow(dead_code)]
 fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
     // 2026-09-20 修复 review #1：downcast payload 落日志（运维排查）

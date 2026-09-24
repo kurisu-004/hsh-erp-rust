@@ -3,6 +3,7 @@
 //! 对应 Python myERP/core/ 下除 security/permission 之外的 infra 模块：
 //! - `config`：应用配置（dotenvy + env 读取）
 //! - `db`：sqlx PgPool 构建
+//! - `seed`：seeds/ 目录声明式种子加载（2026-09-25 sqlx 接管新增）
 //! - `cos`：腾讯云 COS 抽象（trait + NoopCos 占位）
 //! - `cos_opendal`：Apache OpenDAL S3 backend 实现的 COS 客户端（2026-09-20 spike）
 //! - `snowflake`：分布式雪花 ID 生成器
@@ -21,7 +22,8 @@ pub mod cos_opendal; // 2026-09-20 spike：OpenDAL S3 backend 替代 cos-rust-sd
 pub mod db;
 pub mod python_sts; // 2026-09-18 新增：转发 python 后端签发 STS
 pub mod redis;
+pub mod seed; // 2026-09-25 新增：菜单等配置数据声明式种子
 pub mod serial;
 pub mod snowflake;
-pub mod sts; // 2026-09-18 review #2 修复：恢复 NoopSts 占位（TencentSts 已迁至 python_sts）
+pub mod sts; // 2026-09-18 review #2 修复：恢复 NoopSts 占位（TencentSts 已迁到 python_sts）
 pub mod ws_hub;

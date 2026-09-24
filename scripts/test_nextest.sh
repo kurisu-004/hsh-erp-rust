@@ -8,14 +8,16 @@
 #
 # 与 test_runner.sh 的关系：
 # - test_nextest.sh 起 1 个 session 容器 → 在容器内 CREATE DATABASE hsh_erp_template
-#   → 跑 24 个 schema 迁移到 template → 注入 TEST_DATABASE_BASE_URL → cargo nextest run
-#   （不要 exec：exec 会替换 shell 让 EXIT trap 失效）
+#   → 跑 baseline 迁移 + seeds/menu.sql 到 template → 注入 TEST_DATABASE_BASE_URL →
+#   cargo nextest run（不要 exec：exec 会替换 shell 让 EXIT trap 失效）
 # - nextest 调每个测试时 .cargo/config.toml 的 runner (test_runner.sh) 触发转义
 #   口 1（TEST_DATABASE_BASE_URL 已注入）→ 直接 exec binary → 不再起新容器
 # - trap EXIT 在 wrapper 退出时清理 session 容器
 #
-# 跳过 5 个 INSERT 迁移（015/018/021/023/024）—— seed 数据由 test fixture helper
-# 显式插入，避免与 UNIQUE 约束撞键；plan §Phase 1 step 3 决策。
+# 2026-09-25 改造：migrations/ 缩为单文件 baseline.sql + seeds/menu.sql；
+#   旧的 29 个 DDL+菜单 DML 迁移已合并到 baseline，菜单 seed 抽到 seeds/。
+#   旧的 SKIP_RE（015/018/021/023/024）失效：015 DML 在 baseline 中是
+#   CREATE SEQUENCE + 空 INSERT（no-op），其它全在 baseline；菜单种子走 seeds/。
 
 set -euo pipefail
 
@@ -98,33 +100,31 @@ openssl rsa -in "$JWT_KEYS_TMPDIR/next_priv.pem" -pubout -out "$JWT_KEYS_TMPDIR/
 export JWT_TEST_PRIVATE_PEM_PATH="$JWT_KEYS_TMPDIR/priv.pem"
 export JWT_TEST_PUBLIC_PEMS_DIR="$JWT_KEYS_TMPDIR/pub"
 
-# 2026-09-20 plan 2：在容器内 CREATE DATABASE hsh_erp_template + 跑 24 个 schema 迁移
+# 2026-09-20 plan 2 + 2026-09-25 改造：在容器内 CREATE DATABASE hsh_erp_template，
+# 跑 baseline 迁移 + seeds/menu.sql，让测试 DB 共享同一份 schema + 菜单 baseline。
 TEMPLATE_DB=hsh_erp_template
 docker exec -e PGPASSWORD=postgres "$CID" \
     psql -U postgres -c "CREATE DATABASE \"$TEMPLATE_DB\"" \
     >/dev/null
 
-# 跳过的 5 个 INSERT 迁移（plan §Phase 1 step 3）：015/018/021/023/024
-SKIP_RE='^20260[0-9]+_(015|018|021|023|024)_'
-
-# 按文件名顺序逐个跑 schema 迁移到 template；失败立即退出（容器 exit trap 负责清理）
+# 跑 baseline 单文件迁移到 template（2026-09-25 起 migrations/ 只有一个文件）
 shopt -s nullglob
-migrations_run=0
-for f in $(ls migrations/*.sql | sort); do
-    base=$(basename "$f")
-    if [[ "$base" =~ $SKIP_RE ]]; then
-        continue
-    fi
-    docker exec -i -e PGPASSWORD=postgres "$CID" \
-        psql -U postgres -d "$TEMPLATE_DB" -v ON_ERROR_STOP=1 -f - \
-        < "$f" >/dev/null
-    migrations_run=$((migrations_run + 1))
-done
-
-if [ "$migrations_run" -ne 24 ]; then
-    echo "error: 预期跑 24 个 schema 迁移，实际跑了 $migrations_run（INSERT 迁移跳过规则可能有误）" >&2
+baseline_files=(migrations/*.sql)
+if [ "${#baseline_files[@]}" -ne 1 ]; then
+    echo "error: 预期 migrations/ 有且仅有 1 个 .sql 文件，实际找到 ${#baseline_files[@]} 个" >&2
+    ls -la migrations/*.sql >&2
     exit 1
 fi
+docker exec -i -e PGPASSWORD=postgres "$CID" \
+    psql -U postgres -d "$TEMPLATE_DB" -v ON_ERROR_STOP=1 -f - \
+    < "${baseline_files[0]}" >/dev/null
+
+# 跑菜单种子到 template（幂等；test 路径下也走同一份声明式菜单树，
+# 与 production 一致；测试自身的 seed_* helper 不受 seed IDs 干扰，
+# 因为 seed ID 段 9000000000xxx 与 fixture/snowflake 物理不相交）
+docker exec -i -e PGPASSWORD=postgres "$CID" \
+    psql -U postgres -d "$TEMPLATE_DB" -v ON_ERROR_STOP=1 -f - \
+    < seeds/menu.sql >/dev/null
 
 # 注入 TEST_DATABASE_BASE_URL（指向 template；caller 用 TEMPLATE 派生 fresh DB）
 PORT=$(docker port "$CID" 5432/tcp | head -n1 | awk -F: '{print $NF}')

@@ -295,16 +295,25 @@ pub async fn test_pool() -> PgPool {
         .await
         .expect("connect to fresh ephemeral database");
 
-    // 3) 仅兼容路径跑迁移：nextest session 走 TEMPLATE 克隆，schema 已就位。
+    // 3) 仅兼容路径跑迁移 + seed：nextest session 走 TEMPLATE 克隆，schema + 菜单
+    //    baseline 已在 hsh_erp_template 跑好（见 scripts/test_nextest.sh），per-test
+    //    DB 通过 CREATE DATABASE TEMPLATE 继承，无需重跑。
     //    2026-09-23 PR13 Phase A：`sqlx::migrate!` 是过程宏，路径相对调用方
     //    crate 的 CARGO_MANIFEST_DIR 解析。本 crate 在 `test-support/`，没有自己的
     //    `migrations/`，所以绕到主仓 `hsh_erp_rust::infra::db::run_migrations`：
     //    主仓的 `sqlx::migrate!("./migrations")` 在编译时把表结构烘进 crate，
     //    路径相对主仓 manifest dir（= 根仓）解析，命中主仓 `migrations/`。
+    //
+    //    2026-09-25 sqlx 接管新增：seed 同样走主仓 `hsh_erp_rust::infra::seed::run_seeds`，
+    //    让单 binary fallback 路径（test_runner.sh）也能拿到菜单 baseline，与
+    //    production 行为一致。
     if !template_used {
         hsh_erp_rust::infra::db::run_migrations(&pool)
             .await
             .expect("apply migrations on ephemeral test db");
+        hsh_erp_rust::infra::seed::run_seeds(&pool)
+            .await
+            .expect("apply seeds on ephemeral test db");
     }
 
     pool
