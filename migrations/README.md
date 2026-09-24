@@ -1,10 +1,18 @@
 # 数据库迁移规范（sqlx migrate）
 
-本目录由 `sqlx::migrate!()` 宏在编译期与运行时扫描，**只认 `*.sql` 文件**，README 不影响迁移。
+本目录由 `sqlx::migrate!()` 宏在编译期与运行时扫描，**只认顶层 `*.sql`**，子目录（如 `archive/`）不参与扫描。
+
+## 当前状态（2026-09-25 sqlx 接管后）
+
+- `20260925000000_001_baseline.sql` —— 全量 schema baseline（从原 001-029 合并）
+- `archive/` —— 原 29 个 migration 文件归档，仅历史参考，不再演进
+- `seeds/` —— 声明式种子数据（菜单等配置数据），与 migrations/ 分开管理
+
+**新 schema 变更必须追加新 migration**（`<13位时间戳>_<顺序>_<描述>.sql`），**不再修改** 已有文件。修改已应用 migration 会触发 `VersionMismatch` panic。
 
 ## 命名
 
-`<13 位时间戳>_<顺序>_<简短描述>.sql`，例如 `20260710120001_create_part_table.sql`。
+`<13 位时间戳>_<顺序>_<简短描述>.sql`，例如 `20261015120001_add_process_chain_template.sql`。
 
 ## 表设计规范（沿用 myERP Python 项目）
 
@@ -18,53 +26,44 @@
 - **时间字段**：DB 列存 naive `timestamp`（不带时区），应用层用 `crate::infra::clock::now_naive()` 写入
   Asia/Shanghai。
 
+## Baseline 模式（2026-09-25 起）
+
+- `001_baseline.sql` 是 sqlx 接管点，包含完整 final schema
+- 生产重建：`pg_restore prod backup` → 应用 schema delta（015-029 的 schema 部分）
+  → `TRUNCATE _sqlx_migrations` → `INSERT (20260925000000, <baseline_checksum>)`
+  → 跑 `seeds/menu.sql`
+- baseline checksum 改动必须同步更新 DB `_sqlx_migrations.checksum`（同下"修改已迁移文件"流程）
+- 由于 baseline 是单文件，**实际生产中** baseline 一旦应用就**永不修改**；所有 schema 变更走追加
+
 ## 编译期 SQL 检查
 
 业务实现阶段使用 sqlx 编译期宏 `query!` / `query_as!`：
 
 ```bash
-# 1. 起本地 PG（参见 scripts/dev_db.sh）
-./scripts/dev_db.sh
+# 1. 起本地 PG
+docker compose up -d postgres-dev
 
-# 2. 执行迁移
-cargo run -- migrations up   # 或在 main 启动时自动 sqlx::migrate!().run()
+# 2. 跑 baseline 迁移（首次部署；sqlx::migrate!() 启动时也会自动跑）
+psql $DATABASE_URL -v ON_ERROR_STOP=1 -f migrations/20260925000000_001_baseline.sql
 
 # 3. 在开发库上生成离线元数据
 ./scripts/sqlx_prepare.sh
-# 该脚本执行 cargo sqlx prepare -- --lib，结果写入 .sqlx/query-*.json
 
 # 4. CI / Docker 构建时设置
 SQLX_OFFLINE=true cargo build --release
 ```
-
-## 分支策略（可选）
-
-Python 项目原有 alembic `schema` + `prod_data` 双分支。Rust 端如需：
-
-- `migrations/` 放所有 schema 迁移
-- `seeds/` 放初始种子数据（不在 `sqlx::migrate!` 扫描范围内，由独立命令加载）
-
-实施阶段根据需要细化。
 
 ## 修改已迁移文件
 
 `sqlx::migrate!()` 在运行时/编译期都校验 `_sqlx_migrations.checksum` 与迁移文件内容 SHA384 的一致性。
 **任何对已迁移文件的修改**（包括注释、空行、空白）都会改变 SHA384，导致 `VersionMismatch(<version>)` panic。
 
-### 同步 DB checksum
+### baseline 单文件场景（2026-09-25 后）
 
-修改已迁移文件后，必须同步更新对应 DB 行的 checksum（仅测试 DB；dev DB 通过 `cargo run` 启动时 sqlx 自动 migrate 不需手动改）：
+baseline 既然是合并单文件，**绝不修改**。所有变更走追加新 migration。新 migration 必须
+**与已有 schema 兼容**（additive only；如 drop column，写迁移把数据拷到新列 + drop 旧列）。
 
-```bash
-# 1. 算新文件的 SHA384
-sha384sum migrations/<timestamp>_<seq>_<desc>.sql
-
-# 2. 在测试 DB 上 UPDATE 单行（单 row 单 column，严格 scope）
-docker exec test psql -U hsh_test -d postgres_rust_test -c "UPDATE _sqlx_migrations SET checksum = decode('<sha384_hex>', 'hex') WHERE version = <timestamp>"
-# 例：UPDATE 1
-```
-
-### 替代方案：drop + 重建测试 DB
+### 备选方案：drop + 重建测试 DB
 
 若改动影响多个迁移文件或不确定：
 
@@ -73,4 +72,4 @@ docker exec test psql -U hsh_test -d postgres -c 'DROP DATABASE postgres_rust_te
 # 下次 cargo test 会自动重建
 ```
 
-**警告**：drop 会破坏其它 worktree 共享 DB 状态；多 worktree 跑测试时改用方案 1（单行 UPDATE）。
+**警告**：drop 会破坏其它 worktree 共享 DB 状态；多 worktree 跑测试时改用单行 UPDATE。

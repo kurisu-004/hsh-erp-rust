@@ -27,9 +27,22 @@ scripts/test_nextest.sh
 # 单个 binary 调试（runner 自动起容器、用完即删）
 cargo test --test <name>
 
-# 快速路：复用 postgres-test 服务（:5429，跳过容器）
+# 快速路：复用 postgres-test 服务（:5429，跳过容器)
 TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo nextest run
+
+# 手工应用 seeds（菜单等配置数据；通常 app 启动钩子自动跑）
+./scripts/seed_apply.sh
 ```
+
+## Schema 迁移与 seeds 分离（2026-09-25 sqlx 接管后）
+
+- `migrations/20260925000000_001_baseline.sql` —— 全量 schema 基线（合并原 001-029）
+- `migrations/archive/` —— 原 29 个 migration 文件归档，仅历史参考，**不参与** sqlx::migrate! 扫描
+- `seeds/menu.sql` —— 菜单树声明式种子（t_menu + t_role_menu），幂等可反复跑
+- `seeds/README.md` —— seed 编写规范
+
+**新 schema 变更走追加新 migration**（append-only，永不修改已有文件）。
+**菜单变更 = 改 `seeds/menu.sql` + 重启 app**（启动钩子自动跑，无需新 migration）。
 
 ## 领域结构（垂直切片）
 
@@ -128,6 +141,7 @@ TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo next
 - i64 主键序列化为 JSON string（`shared/types.rs` 的 serde helper），防 JS 精度截断
 - 时间列存 naive `timestamp`，写入用 `infra::clock::now_naive()`（Asia/Shanghai）
 - 迁移命名：`<13位时间戳>_<顺序>_<描述>.sql`，见 `migrations/README.md`
+- 菜单 / 角色等配置数据走 `seeds/*.sql`，不走 migration
 
 ## 环境要点
 
