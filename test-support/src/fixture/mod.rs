@@ -3,9 +3,9 @@
 //! 历史：`test-support/src/fixture.rs` 单文件（97 行）随 Phase F 范本引入，
 //! 2026-09-23 PR13 Phase A 拆为目录模块，2026-09-23 PR13 Phase G 新增
 //! `part` 子模块（11 个 sub-file 复用）+ `delivery` 子模块（5 个 sub-file 复用），
-//! 2026-09-24 PR13 Phase H 新增 `production` / `assembly` 子模块，
-//! 未来 Phase H/I 增补 `shelf` / `statistics` / `outsource` / `iam` /
-//! `user_repo` / 10 个单文件 binary 子模块。
+//! 2026-09-24 PR13 Phase H 新增 `production` / `assembly` / `shelf` /
+//! `statistics` 子模块，未来 Phase H/I 增补 `outsource` / `iam` / `user_repo` /
+//! 10 个单文件 binary 子模块。
 //!
 //! ## 子模块命名约定
 //! - 每个子文件名 = 对应 binary 名（如 `part.rs` 服务 `cargo nextest run --filter-binary part`）
@@ -24,9 +24,11 @@ pub mod part;
 pub mod process_chain;
 pub mod production;
 pub mod shelf;
+pub mod statistics;
 pub use assembly::*;
 pub use delivery::*;
 pub use part::*;
 pub use process_chain::*;
 pub use production::*;
 pub use shelf::*;
+pub use statistics::*;

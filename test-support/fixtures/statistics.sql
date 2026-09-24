@@ -1,0 +1,55 @@
+-- ============================================================================
+--  statistics 域集成测试 fixture (PR13 Phase H, 2026-09-24)
+--
+--  加载入口：test-support::fixture::load_statistics_fixture(pool)
+--  加载方式：内部先 load_part_fixture() 复用 part 域基线（ID 段 10-49），
+--           再 raw_sql(include_str!("../../fixtures/statistics.sql")) 加载
+--           本文件（ID 段 90+，仅 1 行：1 工种 baseline）。
+--
+--  ## 设计原则
+--  - 所有 ID 走常量 9_000_000_000_000_000_090+ 区段（process_chain 1-9，
+--    part 10-49，delivery 50-52，production 60-69，assembly 70+ / shelf 80+，
+--    物理不相交）。
+--  - 审计字段 created_at / updated_at 用 now()。
+--  - 不引 trigger / 不调 hsh_erp_rust 函数 —— SQL 仅 INSERT 静态行。
+--  - 无新用户：复用 part 域 MANAGER 用户 fx_part_manager（密码 "changeme"，
+--    bcrypt cost=12 哈希已在 part.sql 内预生成）。statistics 域 API 当前
+--    （2026-09-24）走 service 层直调，无 JWT 登录，不需用户；user 复用仅为
+--    与其它域 fixture 形态对齐，未来若加 HTTP 契约测试可直接复用 fx_part_manager。
+--
+--  ## 不预置 t_customer / t_part / t_part_batch / t_part_event /
+--    t_pickup_skip_event / t_worker
+--  statistics 域测试每个用例都按需造不同 prefix 的 L1 + 不同 status 的 part +
+--    不同 event_type 的 part_event + 不同 worker_id 的 pickup_skip_event /
+--    不同 badge_code 的 worker：
+--  - `uq_t_customer_root_prefix` 唯一索引要求 L1 prefix 全局唯一，测试自建
+--    L1(prefix='F')，fixture 不预置避免冲突。
+--  - 状态机不允许 part 从 IN_PROCESS / COMPLETED 回退 PENDING，预置 PENDING
+--    行会让 count_in_process_at 等「期望空库」断言失败。
+--  - part_event / pickup_skip_event 都是测试现场按 event_type / worker_id /
+--    part_id / created_at 构造，fixture 不预置避免污染。
+--  - **t_worker 不预置**：worker_stats 端点按日期范围列出全部有 / 无事件的
+--    工人，api.rs::workers_stats_happy_path 断言 `out.items.len() == 2`，
+--    预置 1 个 worker 会让 list 出现第 3 行破坏断言；各 sub-file 用本地
+--    `insert_worker(&pool, badge, name, Some(wt))` 按需造 badge / 名称 / 工种。
+--
+--  ## ID 段分配（90+）
+--  WORK_TYPE_ID         90   工种 FX-WT-STAT（baseline 共享）
+--  WORKER_ID            91   （保留位号 —— 当前不预置 worker；2026-09-24
+--                              workers_stats_happy_path 期望 list 严格等于
+--                              测试自建工人数，预置 worker 会破坏断言）
+--
+--  ## 复用 part 域基线（不在本 SQL 内，由 load_statistics_fixture 内部先
+--     load_part_fixture 加载）
+--  CUSTOMER_L1_ID=10, CUSTOMER_L2_ID=11, PROCESS_ID=12, WORK_TYPE_ID=13,
+--  INSPECTION_SHELF_ID=14, PRODUCTION_SHELF_ID=15, MANAGER_USER_ID=16,
+--  INSPECTOR_USER_ID=17, CLERK_USER_ID=18, SHELF_ACCOUNT_USER_ID=19, ...
+-- ============================================================================
+
+-- ---- 工种（FX-WT-STAT；不与 part.sql FX-WT-A / production.sql FX-WTA/FX-WTB 重复）----
+-- 预置 1 工种 baseline：供 `fx.work_type_id` 强类型句柄使用；统计端点的
+-- worker_stats / worker_detail / pickup_skip_* 均按 worker 维度聚合，
+-- 工种存在不引入第 3 个工人，安全。
+INSERT INTO t_work_type (id, code, name, sort_order, max_held_batches, version, created_at, updated_at)
+VALUES
+  (9000000000000000090, 'FX-WT-STAT', 'FX 统计工种', 0, NULL, 0, now(), now());

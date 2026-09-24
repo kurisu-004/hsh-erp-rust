@@ -18,84 +18,45 @@
 //! shelf_id 且 status IN ('IN_PROCESS','INSPECTION','REPAIRING') 的工单。本
 //! 测试**没有**借助 part 域 CRUD（part 域自身不在 Task 3 范围内），而是直接
 //! SQL INSERT 落表 —— 与 `customer_api.rs` / `process_api.rs` 的同形 fixture 思路一致。
+//!
+//! ## 集成测试范本（PR13 Phase H，2026-09-24）
+//! 2026-09-24 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` /
+//! `setup` / 通用 `login_manager` helper，统一走
+//! `use hsh_erp_test_support::{...}` + `bootstrap_as_manager()` +
+//! `load_shelf_fixture(&pool)`。保留：
+//! - `insert_part_held_by_shelf`：shelf 域独享（绕开 part CRUD 直插 t_part +
+//!   t_part_batch；PR-2 已把 `current_holder_id` 等批次依附列迁移到 t_part_batch，
+//!   故同时插 batch 行让 `ShelfRepo::count_in_use_parts` 命中真相源路径）
+//! - `insert_test_process`：shelf 域独享（mapping 端点要校验 process_id 存在；
+//!   测试按需造不同 code / name，不复用 fixtures::seed_process）
 
-#[path = "../common/mod.rs"]
-mod common;
-
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tower::ServiceExt;
 
-use common::{
-    add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
-    test_app, test_pool, test_state,
+use hsh_erp_test_support::{
+    ShelfFixture, json_request, load_shelf_fixture, login_token, send, test_app, test_pool,
+    test_state,
 };
 
 // ===========================================================================
-// 全局串行化 + helpers（与 customer_api.rs / process_api.rs 同形）
+//  Bootstrap helpers（PR13 Phase H 风格）
 // ===========================================================================
 
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let body_str = String::from_utf8_lossy(&body).to_string();
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; status={status}; raw = {body_str:?}"));
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 shelf fixture + 以 MANAGER 身份登录。
+///
+/// 返回 `(pool, app, token, fx)`。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ShelfFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_shelf_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.part_manager_username, ShelfFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token)
-}
+// ===========================================================================
+//  shelf fixture helpers（shelf 域独享，跨 binary 不迁移）
+// ===========================================================================
 
 /// 直插一个 `t_part` + `t_part_batch` 行（批次 `current_holder_id = shelf_id`、
 /// `location = 'PRODUCTION_SHELF'`、`status = IN_PROCESS`）让 `deactivate` 的
@@ -173,8 +134,7 @@ async fn insert_test_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 /// 货架创建 + 详情往返：`location` 字段必须出现在 response 里。
 #[tokio::test]
 async fn create_then_get_shelf_round_trip() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool, "shelf_create").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
 
     let (s_create, env_create) = send(
         app.clone(),
@@ -220,14 +180,14 @@ async fn create_then_get_shelf_round_trip() {
     assert_eq!(env_get["data"]["id"].as_str().unwrap(), shelf_id);
     assert_eq!(env_get["data"]["code"], "S-CRT-01");
     assert_eq!(env_get["data"]["location"].as_str().unwrap(), "Aisle-A-01");
+    let _ = pool;
 }
 
 /// `deactivate` 拒绝被 IN_PROCESS/INSPECTION/REPAIRING 零件引用的货架
 /// → 20503 `BIZ_SHELF_IN_USE`（与 brief Step 1 一致）。
 #[tokio::test]
 async fn create_shelf_then_deactivate_with_in_use_part_fails() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "shelf_in_use").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
 
     // 1. 创建 PRODUCTION 货架（带 location）
     let (s1, env1) = send(
@@ -280,8 +240,7 @@ async fn create_shelf_then_deactivate_with_in_use_part_fails() {
 /// 旧映射 (P1) 软删、新映射 (P2+P3) 在场。
 #[tokio::test]
 async fn set_shelf_processes_replaces_existing_mapping() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "shelf_map").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
 
     // 1. 创建 INSPECTION 货架
     let (s1, env1) = send(
