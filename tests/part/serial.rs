@@ -10,12 +10,9 @@
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），与其它业务测试
 //! 互不干扰（DB 间 schema 完全独立）。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `mod common;` 不自动 fallback 到 crate root。
 // 2026-09-23 PR13 Phase G：serial 域不走 PartFixture（serial 域独立，仅用 fixture 提供
 //! 1 个 L1 客户作为 `occupy_serial` 的 customer_id 即可）。保留 `reset_serial_state` /
 //! `seed_prefix` / `occupy_serial` 为本文件私有 helper（PR-C 末统一迁 test-support）。
-#[path = "helpers.rs"]
-mod helpers;
 
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::serial::next_customer_serial_via_pool;

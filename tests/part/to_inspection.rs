@@ -12,11 +12,6 @@
 //! 完全独立，无需 Mutex 串行化。
 //! 每个用例 INSPECTOR token（白名单）。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录。
-// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel；fixture 由 PartFixture 提供。
-#[path = "helpers.rs"]
-mod helpers;
-
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;

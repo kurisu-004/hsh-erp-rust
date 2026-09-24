@@ -14,11 +14,6 @@
 //! 1. 多批次 part（不同 status / location / holder）→ 返回 min-progress 批次的派生字段
 //! 2. 无活跃批次 part → location=null / holder_name=null
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录。
-// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel；fixture 由 PartFixture 提供。
-#[path = "helpers.rs"]
-mod helpers;
-
 use axum::http::StatusCode;
 use serde_json::Value;
 use sqlx::PgPool;
