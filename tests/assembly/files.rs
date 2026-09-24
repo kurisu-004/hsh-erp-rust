@@ -26,11 +26,10 @@
 //!   `insert_serial_counter` / `make_pdf_bytes` / `make_pdf_2_pages` /
 //!   `seed_assembly` / `test_current_user` 等本地 helper：每测试需要
 //!   assembly 的不同生命周期 / 状态 / 附件。
-
-#[path = "../common/mod.rs"]
-mod common;
-
-use common::test_pool;
+//!
+//! PR-C.Final retry（2026-09-24）：删除 `#[path = "../common/mod.rs"] mod common;`
+//! + `use common::test_pool;`，改走 `use hsh_erp_test_support::test_pool;`
+//! 直接引入。facade `tests/common/mod.rs` 在 3 个 binary 全部迁移后删除。
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
@@ -43,7 +42,7 @@ use lopdf::{Document, Object, ObjectId, dictionary};
 use sqlx::PgPool;
 use std::sync::Arc;
 
-use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture};
+use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture, test_pool};
 
 // ===========================================================================
 //  setup（PR13 Phase H，2026-09-24 fixture 范本化）

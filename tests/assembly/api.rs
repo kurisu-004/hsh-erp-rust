@@ -22,8 +22,6 @@
 //!      cancel_assembly 在终态被拒 (deferred #4 状态机部分)
 //!
 //! ## 与 brief 的差异
-//!   - `use tests::common::...` 在集成测试里**不**能用（每文件是独立 crate）。
-//!     用 `#[path = "common/mod.rs"] mod common;` + `use common::...`。
 //!   - `SnowflakeIdGenerator::new(epoch_ms, instance_id)` 是 2-arg，`next_id()` 返
 //!     `i64`（不返 Result）—— 修正 brief 中的 1-arg `new(1).next_id().unwrap()`。
 //!   - `make_fixture_pdf` 中 page_ids 必须收集并放入 Pages.Kids（用 `Object::Reference`），
@@ -42,14 +40,13 @@
 //!     本地 helper，因每用例需要不同 prefix（'F' 18/20 + 'X' 1/20 list 测试）
 //!     或不同初始 counter 值；fixture 故不预置 t_customer（撞
 //!     uq_t_customer_root_prefix 全局唯一约束）。
-
-#[path = "../common/mod.rs"]
-mod common;
+//!
+//! PR-C.Final retry（2026-09-24）：删除 `#[path = "../common/mod.rs"] mod common;`
+//! + `use common::test_pool;`，改走 `use hsh_erp_test_support::test_pool;`
+//! 直接引入。facade `tests/common/mod.rs` 在 3 个 binary 全部迁移后删除。
 
 use lopdf::{Document, Object, ObjectId, dictionary};
 use sqlx::PgPool;
-
-use common::test_pool;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
@@ -60,7 +57,7 @@ use hsh_erp_rust::modules::assembly::dto::{
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::shared::error::AppError;
 
-use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture};
+use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture, test_pool};
 
 // ===========================================================================
 //  全局串行化 + setup（PR13 Phase H，2026-09-24 fixture 范本化）
