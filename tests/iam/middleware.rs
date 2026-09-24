@@ -15,75 +15,62 @@
 //! 测试路径同步更新（PR-2026-09-19 prod 容器聚合）。
 //!
 //! 测试栈：tokio::test + tower::ServiceExt::oneshot + test_state_with_redis
-//! （必须建 Redis pool，session 写入才算「已吊销」）
+//!（必须建 Redis pool，session 写入才算「已吊销」）
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原重度依赖 `test-support::fixtures::insert_user_with_password /
+//! add_role` 创建测试用户，再调用 `mint_*_token(state, uid)` 自签 JWT。
+//! 改走 `load_iam_fixture(&pool)` + `IamFixture::manager_user_id` 直接拿常量
+//! UID，跳过 fixtures.rs 创建用户逻辑。
 
-#[path = "../common/mod.rs"]
-mod common;
-
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use chrono::Utc;
-use common::{
-    add_role, clean_db, clean_redis, ensure_database_exists, insert_user_with_password, pem,
-    test_app, test_pool, test_state,
-};
 use hsh_erp_rust::auth::jwt::encode_access;
-
-// 2026-09-23 重构：RS256 + kid 多密钥轮换。mint_*_token helper 与负向用例
-// 复用 `tests/common/pem.rs` 的 2048-bit RSA 密钥对（process 级 OnceLock 缓存）。
-//
-// ⚠️ 必须用 `common::pem`（不是顶层 `pem`）—— tests/common/mod.rs 也声明
-// `mod pem;`，两个路径若都声明会得到两个独立模块实例、各自一套 OnceLock，签
-// 发与验签走两套不同 keypair → 40100 InvalidSignature。本文件用 `use common::pem;`
-// 复用 mod.rs 的实例。
-
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+// 2026-09-23 重构：RS256 + kid 多密钥轮换。mint_*_token helper 与负向用例
+// 复用 `test-support::pem` 的 2048-bit RSA 密钥对（process 级 OnceLock 缓存）。
+//
+// ⚠️ 必须用 `hsh_erp_test_support::pem`（不是顶层 `pem`）——
+//   tests/common/mod.rs 也声明 `mod pem;`，两个路径若都声明会得到两个独立
+//   模块实例、各自一套 OnceLock，签发与验签走两套不同 keypair → 40100
+//   InvalidSignature。本文件用 `use hsh_erp_test_support::pem;`
+//   复用 crate 实例（与 test_state 内部 `crate::pem::test_private_pem()` 一致）。
+use hsh_erp_test_support::pem;
+use hsh_erp_test_support::{
+    IamFixture, json_request, load_iam_fixture, login_token,
+    send as ts_send, test_app, test_pool, test_state, test_state_with_hs256_fallback_off,
+};
+
 // ===========================================================================
-// 全局串行化互斥：所有测试共享同一 DB + 同一 Redis db 15，必须串行避免 fixture 冲突。
+// Helpers
 // ===========================================================================
 
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
-    let pool = test_pool().await;
-    let redis_pool = common::test_redis_pool().await;
-    clean_db(&pool).await;
-    clean_redis(&redis_pool).await;
-    pool
-}
-
+/// 把 request 发给 axum app，oneshot 出来，拆 (status, body JSON envelope)。
 async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body)));
-    (status, envelope)
+    ts_send(app, req).await
 }
 
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
+/// 基础 bootstrap：fresh DB + iam fixture 9 行（含 MANAGER 用户 fx.manager_user_id）
+/// + state + app。返回 pool / state / app / fixture 句柄。
+///
+/// JWT mint_*_token helper 全部用 `fx.manager_user_id` 作为 sub claim（fixture
+/// 已预置该用户，验签端的 `t_user` lookup 不要求用户存在也可通过）。
+async fn bootstrap() -> (PgPool, Arc<hsh_erp_rust::state::AppState>, axum::Router, IamFixture) {
+    let pool = test_pool().await;
+    let fx = load_iam_fixture(&pool).await;
+    let state = test_state(pool.clone()).await;
+    let app = test_app(state.clone());
+    (pool, state, app, fx)
+}
+
+/// 构造一次性 app（axum 0.8 oneshot 语义：每次发请求都需新构造）。
+async fn fresh_app(pool: &PgPool) -> axum::Router {
+    test_app(test_state(pool.clone()).await)
 }
 
 /// 签发合法 access token 但**不**写 Redis session（用于 case 4）。
@@ -238,9 +225,7 @@ async fn mint_missing_audience_token(state: &Arc<hsh_erp_rust::state::AppState>,
 
 #[tokio::test]
 async fn protected_endpoint_without_token_returns_40100() {
-    let pool = setup().await;
-    let state = test_state(pool).await;
-    let app = test_app(state);
+    let (_pool, _state, app, _fx) = bootstrap().await;
 
     // GET /api/v2/prod/workers 是 MANAGER-only 受保护端点
     let (status, env) = send(app, json_request("GET", "/prod/workers", None, None)).await;
@@ -261,23 +246,10 @@ async fn protected_endpoint_without_token_returns_40100() {
 
 #[tokio::test]
 async fn forged_signature_returns_40100() {
-    let pool = setup().await;
-    let uid = insert_user_with_password(&pool, "forge_admin", "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-
-    let state = test_state(pool).await;
-    let app = test_app(state.clone());
-    let (_, login_env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": "forge_admin", "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = login_env["data"]["token"].as_str().unwrap().to_string();
+    let (pool, _state, app, fx) = bootstrap().await;
+    // 登录 MANAGER 拿 token
+    let token =
+        login_token(&app, &fx.manager_username, IamFixture::PASSWORD).await;
 
     // 篡改 token 最后一个字符（签名段）
     let mut chars: Vec<char> = token.chars().collect();
@@ -285,7 +257,7 @@ async fn forged_signature_returns_40100() {
     chars[last_idx] = if chars[last_idx] == 'A' { 'B' } else { 'A' };
     let forged: String = chars.into_iter().collect();
 
-    let app2 = test_app(state);
+    let app2 = fresh_app(&pool).await;
     let (status, env) = send(
         app2,
         json_request("GET", "/prod/workers", None, Some(&forged)),
@@ -301,12 +273,10 @@ async fn forged_signature_returns_40100() {
 
 #[tokio::test]
 async fn expired_token_returns_40102() {
-    let pool = setup().await;
-    let uid = insert_user_with_password(&pool, "exp_admin", "changeme").await;
-    let state = test_state(pool).await;
-    let expired = mint_expired_token(&state, uid).await;
+    let (pool, state, _app, fx) = bootstrap().await;
+    let expired = mint_expired_token(&state, fx.manager_user_id).await;
 
-    let app = test_app(state);
+    let app = fresh_app(&pool).await;
     let (status, env) = send(
         app,
         json_request("GET", "/prod/workers", None, Some(&expired)),
@@ -329,13 +299,11 @@ async fn expired_token_returns_40102() {
 
 #[tokio::test]
 async fn valid_jwt_without_session_returns_40105() {
-    let pool = setup().await;
-    let uid = insert_user_with_password(&pool, "nosess_admin", "changeme").await;
-    let state = test_state(pool).await;
+    let (pool, state, _app, fx) = bootstrap().await;
     // 签名合法，但不写 Redis session
-    let token = mint_token_no_session(&state, uid).await;
+    let token = mint_token_no_session(&state, fx.manager_user_id).await;
 
-    let app = test_app(state);
+    let app = fresh_app(&pool).await;
     let (status, env) = send(
         app,
         json_request("GET", "/prod/workers", None, Some(&token)),
@@ -361,12 +329,10 @@ async fn valid_jwt_without_session_returns_40105() {
 
 #[tokio::test]
 async fn wrong_audience_returns_40100() {
-    let pool = setup().await;
-    let uid = insert_user_with_password(&pool, "wrotaud_admin", "changeme").await;
-    let state = test_state(pool).await;
-    let token = mint_wrong_audience_token(&state, uid).await;
+    let (pool, state, _app, fx) = bootstrap().await;
+    let token = mint_wrong_audience_token(&state, fx.manager_user_id).await;
 
-    let app = test_app(state);
+    let app = fresh_app(&pool).await;
     let (status, env) = send(
         app,
         json_request("GET", "/prod/workers", None, Some(&token)),
@@ -393,12 +359,10 @@ async fn wrong_audience_returns_40100() {
 
 #[tokio::test]
 async fn missing_audience_returns_40100() {
-    let pool = setup().await;
-    let uid = insert_user_with_password(&pool, "missaud_admin", "changeme").await;
-    let state = test_state(pool).await;
-    let token = mint_missing_audience_token(&state, uid).await;
+    let (pool, state, _app, fx) = bootstrap().await;
+    let token = mint_missing_audience_token(&state, fx.manager_user_id).await;
 
-    let app = test_app(state);
+    let app = fresh_app(&pool).await;
     let (status, env) = send(
         app,
         json_request("GET", "/prod/workers", None, Some(&token)),
@@ -421,9 +385,7 @@ async fn missing_audience_returns_40100() {
 
 #[tokio::test]
 async fn health_whitelist_no_token_200() {
-    let pool = setup().await;
-    let state = test_state(pool).await;
-    let app = test_app(state);
+    let (_pool, _state, app, _fx) = bootstrap().await;
 
     // 2026-09-20 注：health 端点直接返 `Json<HealthResp>`（不走 envelope `R<T>`），
     // 返回 `{"status":"ok",...}`。白名单命中 → 200；非 401 即白名单生效。
@@ -443,9 +405,7 @@ async fn health_whitelist_no_token_200() {
 
 #[tokio::test]
 async fn login_whitelist_no_token_40101() {
-    let pool = setup().await;
-    let state = test_state(pool).await;
-    let app = test_app(state);
+    let (_pool, _state, app, _fx) = bootstrap().await;
 
     // 不带 token 调 login → 用户不存在走业务码 40101（不是 middleware 的 40100）
     let (status, env) = send(
@@ -475,9 +435,7 @@ async fn login_whitelist_no_token_40101() {
 
 #[tokio::test]
 async fn refresh_whitelist_no_token_40001() {
-    let pool = setup().await;
-    let state = test_state(pool).await;
-    let app = test_app(state);
+    let (_pool, _state, app, _fx) = bootstrap().await;
 
     // 不带 token 调 refresh：middleware 白名单放行（路径是 /iam/refresh），
     // 但 handler 的 `Json<RefreshRequest>` 拿不到 `refresh_token` 字段，
@@ -504,27 +462,13 @@ async fn refresh_whitelist_no_token_40001() {
 
 #[tokio::test]
 async fn logout_then_old_token_returns_40105() {
-    let pool = setup().await;
-    let uid = insert_user_with_password(&pool, "logout_admin", "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
+    let (pool, _state, app, fx) = bootstrap().await;
     // 1) login → 拿 token
-    let (_, login_env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": "logout_admin", "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = login_env["data"]["token"].as_str().unwrap().to_string();
+    let token =
+        login_token(&app, &fx.manager_username, IamFixture::PASSWORD).await;
 
     // 2) logout → 删 Redis session
-    let app2 = test_app(state.clone());
+    let app2 = fresh_app(&pool).await;
     let (logout_status, _) = send(
         app2,
         json_request("POST", "/iam/logout", None, Some(&token)),
@@ -537,7 +481,7 @@ async fn logout_then_old_token_returns_40105() {
     );
 
     // 3) 旧 token 调 /iam/me → 40105 SESSION_REVOKED
-    let app3 = test_app(state);
+    let app3 = fresh_app(&pool).await;
     let (status, env) = send(app3, json_request("GET", "/iam/me", None, Some(&token))).await;
     assert_eq!(
         status,
@@ -561,9 +505,7 @@ async fn logout_then_old_token_returns_40105() {
 
 #[tokio::test]
 async fn nonexistent_route_returns_404_not_40100() {
-    let pool = setup().await;
-    let state = test_state(pool).await;
-    let app = test_app(state);
+    let (_pool, _state, app, _fx) = bootstrap().await;
 
     // 不存在的路径，不带 token。期望：404 NOT_FOUND（route_layer 短路），
     // 而**不是** 401 UNAUTHORIZED（说明 middleware 没误判 404 为受保护端点）。
@@ -627,12 +569,10 @@ async fn mint_unknown_kid_token(state: &Arc<hsh_erp_rust::state::AppState>, user
 
 #[tokio::test]
 async fn protected_endpoint_with_unknown_kid_returns_40100() {
-    let pool = setup().await;
-    let uid = insert_user_with_password(&pool, "ghostkid_admin", "changeme").await;
-    let state = test_state(pool).await;
-    let token = mint_unknown_kid_token(&state, uid).await;
+    let (pool, state, _app, fx) = bootstrap().await;
+    let token = mint_unknown_kid_token(&state, fx.manager_user_id).await;
 
-    let app = test_app(state);
+    let app = fresh_app(&pool).await;
     let (status, env) = send(
         app,
         json_request("GET", "/prod/workers", None, Some(&token)),
@@ -687,12 +627,10 @@ fn mint_alg_none_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64)
 
 #[tokio::test]
 async fn protected_endpoint_with_alg_none_returns_40100() {
-    let pool = setup().await;
-    let uid = insert_user_with_password(&pool, "algnone_admin", "changeme").await;
-    let state = test_state(pool).await;
-    let token = mint_alg_none_token(&state, uid);
+    let (pool, state, _app, fx) = bootstrap().await;
+    let token = mint_alg_none_token(&state, fx.manager_user_id);
 
-    let app = test_app(state);
+    let app = fresh_app(&pool).await;
     let (status, env) = send(
         app,
         json_request("GET", "/prod/workers", None, Some(&token)),
@@ -722,8 +660,8 @@ async fn protected_endpoint_with_alg_none_returns_40100() {
 // 本测试在 `allow_hs256_fallback=false` 的 JwtConfig 下签一个 HS256 + 空 secret
 // 的 token（issuer/aud/exp/sub 全部合法），断言服务端返 40100（而不是
 // 200 / 40102 / 40105）—— 守住「HS256 fallback 关闭时空 secret bypass
-// 被阻断」不变量。fixture 由 `tests/common/mod.rs::test_state_with_hs256_fallback_off`
-// 构造（与 test_state 唯一差别即 `allow_hs256_fallback: false`）。
+// 被阻断」不变量。fixture 由 `test_state_with_hs256_fallback_off` 构造
+//（与 test_state 唯一差别即 `allow_hs256_fallback: false`）。
 // ===========================================================================
 
 /// HS256 + 空 secret + 合法 claim 的 token。
@@ -765,12 +703,12 @@ fn mint_hs256_empty_secret_token(state: &Arc<hsh_erp_rust::state::AppState>, use
 
 #[tokio::test]
 async fn hs256_rejected_when_fallback_off_returns_40100() {
-    let pool = setup().await;
-    let uid = insert_user_with_password(&pool, "hs256off_admin", "changeme").await;
-    let state = common::test_state_with_hs256_fallback_off(pool).await;
-    let token = mint_hs256_empty_secret_token(&state, uid);
+    let pool = test_pool().await;
+    let fx = load_iam_fixture(&pool).await;
+    let state = test_state_with_hs256_fallback_off(pool.clone()).await;
+    let token = mint_hs256_empty_secret_token(&state, fx.manager_user_id);
 
-    let app = test_app(state);
+    let app = fresh_app(&pool).await;
     let (status, env) = send(
         app,
         json_request("GET", "/prod/workers", None, Some(&token)),
