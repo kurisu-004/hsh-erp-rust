@@ -21,13 +21,6 @@
 //! - [`state`]：构造测试 `AppState` 的 helper（`test_state` /
 //!   `test_state_with_cos` / `test_state_with_disabled_session` / `test_app`
 //!   / `test_ws_app`）
-//! - [`fixtures`]：残余 8 个动态 helper（`insert_user_with_password` /
-//!   `add_role` / `seed_process` / `link_work_type_to_process` /
-//!   `link_shelf_to_process` / `insert_shelf` / `create_chain_for_part` /
-//!   `create_step`），主要被 production / outsource sub-file 复用（worker_pool
-//!   需要动态 username + MANAGER role + 多个 production shelf / process；outsource
-//!   send_receive 子测试链需要动态 process_chain）；本子模块为 worker_pool /
-//!   outsource 域独享，不进入 fixture 范本。
 //! - [`http`]：HTTP 客户端 helper（`send` / `json_request` / `login_token`）
 //!   —— PR13 Phase F 引入，从 27+ 重复实现的 `tests/*` 收敛一份权威版，
 //!   签名与原版逐字一致便于批量迁移（`axum::Router` + `Request<Body>` +
@@ -53,7 +46,7 @@
 //! - **Snowflake 隔离**：per-process instance 由 `pid ⊕ startup_nanos` 派生。
 //!
 //! ## 公开入口（crate root re-export）
-//! `pub use pool::*; pub use pem::*; pub use redis::*; pub use fixtures::*;
+//! `pub use pool::*; pub use pem::*; pub use redis::*;
 //! pub use state::*; pub use fixture::*;` —— 让上层
 //! `use hsh_erp_test_support::{test_pool, ...}` 直接拿到全部 helper，无需逐个
 //! `pub use`。
@@ -63,6 +56,21 @@
 //! `assembly/files`）全部从 `mod common;` 切到 `use hsh_erp_test_support::*` 直接引入，
 //! `tests/common/mod.rs` facade + `tests/common/pem.rs` 转发壳 + `tests/part/helpers.rs`
 //! 全部已删除。20 个 binary 直接引用 `hsh_erp_test_support::*`，无 facade 中介。
+//!
+//! ## fixtures.rs 删除（2026-09-24 PR-C.Final retry 第 3 轮）
+//! 原 `fixtures.rs`（9 个动态 helper：insert_user_with_password / add_role /
+//! seed_process / link_work_type_to_process / link_shelf_to_process / insert_shelf /
+//! create_chain_for_part / create_step / 早期遗留的 clean_db / clean_business_db /
+//! insert_inactive_user / insert_menu / add_role_menu / get_refresh_token_version /
+//! seed_test_process）已全部迁出：
+//! - production/{worker_pool,worker_pool_auto_allocate}.rs + production/work_type.rs：
+//!   6 helper 复制为文件底部本地 async fn（PR-B production implementor 当年 grep 漏掉
+//!   `use ... ::{a, b, c}` 分组 import 写法）
+//! - part/{lifecycle,repair,to_process}.rs + part/{to_inspection,list_enrichment}.rs：
+//!   create_chain_for_part / create_step / insert_shelf 复制为文件底部本地 async fn
+//! - 早期 7 helper（clean_db / clean_business_db / insert_inactive_user / insert_menu /
+//!   add_role_menu / get_refresh_token_version / seed_test_process）：grep 零调用，
+//!   上轮已迁出但 fixtures.rs 仍保留 stub，本轮随 fixtures.rs 一起删除。
 
 // 与原 tests/common/mod.rs 同款属性：51 个 binary 共用 helper，未引用项触发
 // `dead_code` warning 噪音；`duplicate_mod` 因为多 binary 用 `#[path]` 共用
@@ -71,7 +79,6 @@
 #![allow(dead_code, clippy::duplicate_mod, clippy::await_holding_lock)]
 
 pub mod fixture;
-pub mod fixtures;
 pub mod http;
 pub mod pem;
 pub mod pool;
@@ -79,7 +86,6 @@ pub mod redis;
 pub mod state;
 
 pub use fixture::*;
-pub use fixtures::*;
 pub use http::*;
 pub use pem::*;
 pub use pool::*;
