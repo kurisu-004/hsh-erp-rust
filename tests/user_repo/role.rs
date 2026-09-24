@@ -34,9 +34,10 @@ use hsh_erp_rust::modules::iam::repo::sql::{
 };
 
 // 2026-09-24 PR13 Phase I：fixture 范本化入口。`load_user_repo_fixture(&pool)` 加载
-// 1 user + 1 role + 1 menu baseline；本文件大部分测试用本地 seed_user / seed_role
-// 等 helper 创建专属测试数据（不同 username / 不同 role 组合），仅在需要 baseline
-// 时取 fx.baseline_user_id 等常量。
+// 1 menu baseline（PR-C.Final 移除 user + role baseline，避免污染
+// count / list_with_filters_* 「期望空库」断言）；本文件大部分测试用本地
+// seed_user / seed_role 等 helper 创建专属测试数据（不同 username / 不同
+// role 组合），仅在需要 baseline 时取 fx.baseline_menu_id 常量。
 use hsh_erp_test_support::{UserRepoFixture, load_user_repo_fixture, test_pool};
 
 // ===========================================================================
@@ -51,8 +52,7 @@ fn snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
     hsh_erp_test_support::pool_snowflake()
 }
 
-/// 基础 bootstrap：fresh DB + user_repo fixture 3 行（含 baseline user / role / menu）
-/// + 返回 pool。
+/// 基础 bootstrap：fresh DB + user_repo fixture 1 行（baseline menu）+ 返回 pool。
 ///
 /// fixture baseline（本文件大多数测试不直接使用，但 setup 加载过程无害）；
 /// 测试现场仍走本地 `seed_user` / `seed_role` 等 helper 创建专属测试数据

@@ -14,23 +14,22 @@
 //! 2. 本文件定义 `UserRepoFixture` struct + 常量 ID const + `load_user_repo_fixture(pool)` 函数；
 //! 3. 测试 binary `use hsh_erp_test_support::fixture::*;` 直接拿到句柄。
 //!
-//! ## 独立加载（不复用 iam / part 域基线）
-//! user_repo 测试不需要 customer / process / work_type / part fixture；
-//! `load_user_repo_fixture` 内部不调 [`load_iam_fixture`](super::iam::load_iam_fixture)
-//! 或 [`load_part_fixture`](super::part::load_part_fixture)，直接
-//! `raw_sql(user_repo.sql)` 加载 3 行（1 user + 1 role + 1 menu）。
+//! ## 2026-09-24 PR13 Phase C.Final：移除 baseline user / role
+//! PR13 Phase C.2 引入的 `fx_user_repo_baseline`（t_user_id=120）+ baseline
+//! MANAGER role（t_user_role_id=120）破坏 4 个 user_repo 测试（count /
+//! list_with_filters_* 系列）。C.Final 移除这两行 INSERT，fixture 仅保留
+//! 1 个 baseline menu（id=121）。多数测试用本地 seed_user / seed_role
+//! 创建专属测试数据。
 //!
 //! ## 字段按域需求聚合
-//! - `t_user` ×1 —— fx_user_repo_baseline（密码 "changeme"，active）
-//! - `t_user_role` ×1 —— MANAGER 角色（属于 baseline user，无 scope）
 //! - `t_menu` ×1 —— baseline menu（不挂 t_role_menu）
 //!
-//! 不预置 `t_shelf` / `t_role_menu`：role.rs 内 ShelfRepo 测试用 seed_shelf
-//! 自建不同 code（避免 uk_t_shelf_code 撞），MenuRepo 测试现场 link_role_menu
-//! 自建关系（避免预置污染「无角色菜单 list」断言）。
+//! 不预置 `t_user` / `t_user_role` / `t_shelf` / `t_role_menu`：baseline
+//! user/role 删除后 fixture 仅提供 menu baseline；其余由各 sub-file 用
+//! seed_user / seed_role / seed_shelf / link_role_menu 自建。
 //!
 //! ## 当前域
-//! - `user_repo`：1 用户 + 1 角色 + 1 菜单（共 3 行静态 INSERT）
+//! - `user_repo`：1 菜单（共 1 行静态 INSERT）
 
 use sqlx::PgPool;
 
@@ -40,35 +39,17 @@ use sqlx::PgPool;
 /// 字段名重构产生 churn；常量 ID 与 SQL INSERT 字面值逐字对应。
 #[allow(dead_code)]
 pub struct UserRepoFixture {
-    /// baseline user id（fx_user_repo_baseline，对应 t_user_id=120）
-    pub baseline_user_id: i64,
-    /// baseline username（fx_user_repo_baseline）
-    pub baseline_username: String,
-    /// baseline MANAGER role id（属于 baseline user，无 scope，对应 t_user_role.id=121）
-    pub baseline_role_id: i64,
-    /// baseline menu id（对应 t_menu.id=122；不挂 t_role_menu）
+    /// baseline menu id（对应 t_menu.id=121；不挂 t_role_menu）
     pub baseline_menu_id: i64,
 }
 
 impl UserRepoFixture {
-    /// fixture 内 baseline 用户的明文密码（bcrypt 哈希嵌入 user_repo.sql）。
-    /// 改此处必须同步更新 fixtures/user_repo.sql 的 password_hash 字面值。
-    pub const PASSWORD: &'static str = "changeme";
-
-    pub const BASELINE_USER_ID: i64 = 9_000_000_000_000_000_120;
-    pub const BASELINE_ROLE_ID: i64 = 9_000_000_000_000_000_121;
-    pub const BASELINE_MENU_ID: i64 = 9_000_000_000_000_000_122;
-
-    /// fixture 内 baseline 用户的 username（与 fixtures/user_repo.sql INSERT 字面对齐）
-    pub const BASELINE_USERNAME: &'static str = "fx_user_repo_baseline";
+    pub const BASELINE_MENU_ID: i64 = 9_000_000_000_000_000_121;
 }
 
 impl Default for UserRepoFixture {
     fn default() -> Self {
         Self {
-            baseline_user_id: UserRepoFixture::BASELINE_USER_ID,
-            baseline_username: UserRepoFixture::BASELINE_USERNAME.to_string(),
-            baseline_role_id: UserRepoFixture::BASELINE_ROLE_ID,
             baseline_menu_id: UserRepoFixture::BASELINE_MENU_ID,
         }
     }
@@ -83,7 +64,7 @@ impl Default for UserRepoFixture {
 /// 重跑都不会撞 ID。
 ///
 /// ## 加载顺序
-/// 1. 直接 `sqlx::raw_sql(user_repo.sql)` —— 加载 3 行（1 user + 1 role + 1 menu）。
+/// 1. 直接 `sqlx::raw_sql(user_repo.sql)` —— 加载 1 行 baseline menu。
 /// 2. **不**调 [`load_iam_fixture`](super::iam::load_iam_fixture) 或
 ///    [`load_part_fixture`](super::part::load_part_fixture) —— user_repo 测试
 ///    不需要 customer / process / work_type / part fixture。
@@ -96,7 +77,7 @@ impl Default for UserRepoFixture {
 /// ## 本地 helper 保留（不走 fixtures.rs）
 /// `tests/user_repo/{basic,role,password}.rs` 内 seed_user / seed_role /
 /// seed_menu / link_role_menu / seed_shelf 是 user_repo 域独享 helper，本来
-/// 就不调 `test-support::fixtures`，本 fixture 只提供 baseline ID 起点；多数
+/// 就不调 `test-support::fixtures`，本 fixture 只提供 baseline menu；多数
 /// 测试仍走本地 helper 创建专属测试数据（特定 username / 多用户 / 多角色组合）。
 #[allow(dead_code)]
 pub async fn load_user_repo_fixture(pool: &PgPool) -> UserRepoFixture {
