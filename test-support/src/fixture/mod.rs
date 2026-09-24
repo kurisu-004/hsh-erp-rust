@@ -5,8 +5,8 @@
 //! `part` 子模块（11 个 sub-file 复用）+ `delivery` 子模块（5 个 sub-file 复用），
 //! 2026-09-24 PR13 Phase H 新增 `production` / `assembly` / `shelf` /
 //! `statistics` / `outsource` 子模块，2026-09-24 PR13 Phase I 新增 `iam`
-//! 子模块（tests/iam/ 3 sub-file 复用）；未来增补 `user_repo` / 10 个
-//! 单文件 binary 子模块。
+//! 子模块（tests/iam/ 3 sub-file 复用）+ `user_repo` 子模块
+//!（tests/user_repo/ 4 sub-file 复用）；未来增补 10 个单文件 binary 子模块。
 //!
 //! ## 子模块命名约定
 //! - 每个子文件名 = 对应 binary 名（如 `part.rs` 服务 `cargo nextest run --filter-binary part`）
@@ -28,6 +28,7 @@ pub mod process_chain;
 pub mod production;
 pub mod shelf;
 pub mod statistics;
+pub mod user_repo;
 pub use assembly::*;
 pub use delivery::*;
 pub use iam::*;
@@ -37,3 +38,4 @@ pub use process_chain::*;
 pub use production::*;
 pub use shelf::*;
 pub use statistics::*;
+pub use user_repo::*;
