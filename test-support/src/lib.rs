@@ -21,20 +21,20 @@
 //! - [`state`]：构造测试 `AppState` 的 helper（`test_state` /
 //!   `test_state_with_cos` / `test_state_with_disabled_session` / `test_app`
 //!   / `test_ws_app`）
-//! - [`fixtures`]：PR13 Phase A-I 完成后残余 3 个动态 helper
-//!   （`insert_shelf` / `create_chain_for_part` / `create_step`），
-//!   用于 4 个 part sub-file（lifecycle / list_enrichment / repair /
-//!   to_inspection / to_process）。原 15 个动态 helper 中 12 个已删除
-//!   （PR-A / B / C 各阶段子模块 + fixture 范本化覆盖）。本子模块待 PR-D
-//!   part binary 全面迁移后删除。
+//! - [`fixtures`]：残余 8 个动态 helper（`insert_user_with_password` /
+//!   `add_role` / `seed_process` / `link_work_type_to_process` /
+//!   `link_shelf_to_process` / `insert_shelf` / `create_chain_for_part` /
+//!   `create_step`），主要被 production / outsource sub-file 复用（worker_pool
+//!   需要动态 username + MANAGER role + 多个 production shelf / process；outsource
+//!   send_receive 子测试链需要动态 process_chain）；本子模块为 worker_pool /
+//!   outsource 域独享，不进入 fixture 范本。
 //! - [`http`]：HTTP 客户端 helper（`send` / `json_request` / `login_token`）
 //!   —— PR13 Phase F 引入，从 27+ 重复实现的 `tests/*` 收敛一份权威版，
 //!   签名与原版逐字一致便于批量迁移（`axum::Router` + `Request<Body>` +
 //!   `Option<Value>` + `Option<&str>`）
-//! - [`fixture`]：按域预制 fixture 加载（`load_process_chain_fixture` +
-//!   `ProcessChainFixture`）。SQL 走 `fixtures/<domain>.sql`，常量 ID 区段
-//!   9_000_000_000_000_000_001+；bcrypt 哈希预生成嵌入 SQL，省 ~250ms×N
-//!   现场 hash 开销
+//! - [`fixture`]：按域预制 fixture 加载。SQL 走 `fixtures/<domain>.sql`，
+//!   常量 ID 区段 9_000_000_000_000_000_001+；bcrypt 哈希预生成嵌入 SQL，
+//!   省 ~250ms×N 现场 hash 开销
 //!
 //! ## 反向依赖关系
 //! 本 crate 的 `[dependencies]` 声明 `hsh-erp-rust = { path = ".." }`，
@@ -54,17 +54,15 @@
 //!
 //! ## 公开入口（crate root re-export）
 //! `pub use pool::*; pub use pem::*; pub use redis::*; pub use fixtures::*;
-//! pub use state::*;` —— 让上层 `use hsh_erp_test_support::{test_pool, ...};`
-//! 直接拿到全部 helper，无需逐个 `pub use`。
+//! pub use state::*; pub use fixture::*;` —— 让上层
+//! `use hsh_erp_test_support::{test_pool, ...}` 直接拿到全部 helper，无需逐个
+//! `pub use`。
 //!
-//! ## 主仓集成测试 facade
-//! `tests/common/mod.rs` 保留为单层 re-export：
-//! ```ignore
-//! pub use hsh_erp_test_support::*;
-//! pub mod pem { pub use hsh_erp_test_support::pem::*; }
-//! ```
-//! 51 个 test binary 不需改 import。后续 Phase 按 domain 切到直接
-//! `use hsh_erp_test_support::*;` 时再清 facade。
+//! ## 主仓集成测试 facade（2026-09-24 PR-C.Final retry 已删除）
+//! 2026-09-24 PR-C.Final retry：3 个 binary（`idempotency_api` / `assembly/api` /
+//! `assembly/files`）全部从 `mod common;` 切到 `use hsh_erp_test_support::*` 直接引入，
+//! `tests/common/mod.rs` facade + `tests/common/pem.rs` 转发壳 + `tests/part/helpers.rs`
+//! 全部已删除。20 个 binary 直接引用 `hsh_erp_test_support::*`，无 facade 中介。
 
 // 与原 tests/common/mod.rs 同款属性：51 个 binary 共用 helper，未引用项触发
 // `dead_code` warning 噪音；`duplicate_mod` 因为多 binary 用 `#[path]` 共用

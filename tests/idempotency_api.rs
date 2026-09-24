@@ -33,10 +33,10 @@
 //! （与 `test-support::http::send` 返 `(StatusCode, Value)` 不一致 —— 本文件用 raw bytes
 //! 字节级断言第二次响应用 request 缓存命中），保留本地版本。
 //!
-//! PR-C.Final retry（2026-09-24）：删除 `#[path = "common/mod.rs"] mod common;`，
-//! 改走 `use hsh_erp_test_support::{test_pool, test_state_with_redis, test_redis_pool, ...}`
-//! 直接引入。本文件 setup 走 `test_pool` + `test_state_with_redis` + `test_redis_pool`，
-//! 均为 fixtures.rs 之外的 helper（test_state 在 state.rs，test_redis_pool 在 redis.rs）。
+//! PR-C.Final retry（2026-09-24）：删除 `mod common;`，改走 `use hsh_erp_test_support::{test_pool,
+//! test_state_with_redis, test_redis_pool, ...}` 直接引入；本文件 setup 走 `test_pool` +
+//! `test_state_with_redis` + `test_redis_pool`，均为 fixtures.rs 之外的 helper（test_state
+//! 在 state.rs，test_redis_pool 在 redis.rs）。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

@@ -41,9 +41,9 @@
 //!     或不同初始 counter 值；fixture 故不预置 t_customer（撞
 //!     uq_t_customer_root_prefix 全局唯一约束）。
 //!
-//! PR-C.Final retry（2026-09-24）：删除 `#[path = "../common/mod.rs"] mod common;`
-//! + `use common::test_pool;`，改走 `use hsh_erp_test_support::test_pool;`
-//! 直接引入。facade `tests/common/mod.rs` 在 3 个 binary 全部迁移后删除。
+//! PR-C.Final retry（2026-09-24）：删除 `mod common;` + `use common::test_pool;`，改走
+//! `use hsh_erp_test_support::test_pool;` 直接引入；facade `tests/common/mod.rs` 在 3 个
+//! binary 全部迁移后删除。
 
 use lopdf::{Document, Object, ObjectId, dictionary};
 use sqlx::PgPool;
