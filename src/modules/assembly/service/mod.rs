@@ -47,11 +47,12 @@ use crate::auth::rbac::CurrentUser;
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::dto::{
-    AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
+    AssemblyChildAddRequest, AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
 };
 use crate::modules::assembly::vo::{
     AssemblyCreateResult, AssemblyDetail, AssemblyListOut, AssemblyOut,
 };
+use crate::modules::part::vo::PartListItem;
 use crate::shared::error::AppError;
 
 /// Sync hook result（service::sync_from_part 回调返回；handler 据此发 ASSEMBLY_UPDATED）。
@@ -170,6 +171,26 @@ impl AssemblyService {
     ) -> Result<Vec<crate::modules::assembly::vo::AssemblyFileRef>, AppError> {
         lifecycle::upload_assembly_files_dispatch(conn, snowflake, cos, assembly_id, files, current)
             .await
+    }
+
+    /// 2026-09-25 新增：单 part 子件追加（`POST /assemblies/{id}/children`）。
+    pub async fn add_assembly_child(
+        conn: &mut sqlx::PgConnection,
+        snowflake: &SnowflakeIdGenerator,
+        assembly_id: i64,
+        req: &AssemblyChildAddRequest,
+        current: &CurrentUser,
+    ) -> Result<PartListItem, AppError> {
+        crud::add_assembly_child_dispatch(conn, snowflake, assembly_id, req, current).await
+    }
+
+    /// 2026-09-25 新增：列出装配体已上传 PDF（`GET /assemblies/{id}/files`）。
+    pub async fn list_assembly_files(
+        conn: &mut sqlx::PgConnection,
+        assembly_id: i64,
+        current: &CurrentUser,
+    ) -> Result<crate::modules::part_file::vo::PartFileListOut, AppError> {
+        lifecycle::list_assembly_files_dispatch(conn, assembly_id, current).await
     }
 
     /// 兼容旧 ZST 静态调用：单 part → assembly sync 钩子。

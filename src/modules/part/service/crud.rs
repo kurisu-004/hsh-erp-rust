@@ -28,12 +28,13 @@ use chrono::NaiveDate;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::assembly::service::AssemblyService;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part::dto::InspectionBatchListQuery;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::{NewPartCreate, PartListFilters, PartUpdate};
-use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part::vo::{
     InspectionBatchListItemOut, InspectionBatchListOut, PartBatchScanOut, PartDetailOut,
     PartListItem, PartListOut, PartScanContextOut, PartScanInfoOut,
@@ -156,6 +157,55 @@ impl PartService {
         // 文件绑定走 `batch_create_parts_with_bindings`（handler 层显式选，
         // 实现已迁出到 `service/batch.rs`）。
         Self::batch_create_parts_legacy(repo, snowflake, req, current).await
+    }
+
+    /// 2026-09-25 新增（D-08 api-drift-fix）：按 part 反查所属装配体。
+    ///
+    /// 行为：
+    /// - 权限：4 角色全开放（与 `get_part` 一致）
+    /// - `part` 不存在 → `40400 NOT_FOUND`
+    /// - `part.assembly_id IS NULL` → 返回 `Ok(None)`（无父装配体）
+    /// - 否则委托 `AssemblyService::get_assembly` 拿 AssemblyDetail
+    ///
+    /// 实现要点：因 `part` service 通过 `&mut PgConnection` 持连接，调用
+    /// `AssemblyService::get_assembly` 时直接传 `&mut conn`（不重新开事务）。
+    /// 跨域读 → `AssemblyRepoTrait` 的 `fetch_part_assembly_id` helper 不在
+    /// PartRepoTrait 上，所以这里走 `repo.conn_mut()` 直接 inline SQL。
+    pub async fn get_assembly_by_part<R: PartRepoTrait>(
+        mut repo: R,
+        part_id: i64,
+        current: &CurrentUser,
+    ) -> Result<Option<crate::modules::assembly::vo::AssemblyDetail>, AppError> {
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
+
+        // 1. 校验 part 存在 + 拿 assembly_id（单条 SQL，避免拿全行 TPart）
+        let part_row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT assembly_id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+                .bind(part_id)
+                .fetch_optional(repo.conn_mut())
+                .await?;
+        let part_row = part_row.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_NOT_FOUND,
+                format!("part {part_id} 不存在或已删除"),
+            )
+        })?;
+        // 2. assembly_id IS NULL → 返回 None（无父装配体）
+        let asm_id = match part_row.0 {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        // 3. 委托 assembly service 拿详情（含 children + files）
+        //    这里直接复用 `AssemblyService::get_assembly` 的 trait 注入形式，
+        //    传 `repo.conn_mut()`（同一连接，避免重复借用）。
+        let conn = repo.conn_mut();
+        let detail = AssemblyService::get_assembly(conn, asm_id, current).await?;
+        Ok(Some(detail))
     }
 
     pub async fn list_parts<R: PartRepoTrait>(
@@ -392,15 +442,12 @@ impl PartService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let part = repo
-            .get_part_detail(part_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_NOT_FOUND,
-                    format!("part {part_id} 不存在或已删除"),
-                )
-            })?;
+        let part = repo.get_part_detail(part_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_NOT_FOUND,
+                format!("part {part_id} 不存在或已删除"),
+            )
+        })?;
         let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), part.customer_id).await?;
         let current_batch_id = repo.find_current_inspection_batch_id(part.id).await?;
         Ok(PartDetailOut::from_with_customer_extra(
@@ -422,15 +469,12 @@ impl PartService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let p = repo
-            .get_by_serial(serial_no, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_NOT_FOUND,
-                    format!("serial_no {serial_no} 不存在"),
-                )
-            })?;
+        let p = repo.get_by_serial(serial_no, false).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_NOT_FOUND,
+                format!("serial_no {serial_no} 不存在"),
+            )
+        })?;
         Self::get_part(repo, p.id, current).await
     }
 
@@ -529,10 +573,7 @@ impl PartService {
         // 「已挂送货单禁删」守卫移出 PartRepo::soft_delete_part UPDATE，
         // 改在 service 层用 PartBatchRepo::has_active_batch_on_delivery_note
         // 预检（批次级真相源）。
-        if repo
-            .part_batch_has_active_on_delivery_note(part_id)
-            .await?
-        {
+        if repo.part_batch_has_active_on_delivery_note(part_id).await? {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_LOCKED_PART,
                 format!("part {part_id} 存在活跃批次已挂送货单，禁 soft-delete"),
@@ -554,7 +595,8 @@ impl PartService {
                 if let Some(chain_id) = chain_id {
                     ProcessChainRepo::soft_delete_all_steps_for_chain(repo.conn_mut(), chain_id)
                         .await?;
-                    ProcessChainRepo::soft_delete_chain(repo.conn_mut(), chain_id, current.id).await?;
+                    ProcessChainRepo::soft_delete_chain(repo.conn_mut(), chain_id, current.id)
+                        .await?;
                     ProcessChainRepo::unlink_part_from_chain(repo.conn_mut(), chain_id, current.id)
                         .await?;
                 }

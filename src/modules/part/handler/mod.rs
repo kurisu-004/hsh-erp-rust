@@ -39,10 +39,10 @@ pub mod lifecycle;
 
 // ----- crud.rs -----
 pub use crud::{
-    batch_update_order_info, create_part, get_by_serial, get_by_serial_part_batches,
-    get_location_tree, get_part_detail, list_inspection_batches, list_part_batches,
-    list_part_events, list_parts, match_by_excel_items, soft_delete_part, update_part,
-    upload_3d_model, upload_drawing,
+    batch_update_order_info, create_part, get_assembly_by_part, get_by_serial,
+    get_by_serial_part_batches, get_location_tree, get_part_detail, list_inspection_batches,
+    list_part_batches, list_part_events, list_parts, match_by_excel_items, soft_delete_part,
+    update_part, upload_3d_model, upload_drawing,
 };
 
 // ----- lifecycle.rs -----

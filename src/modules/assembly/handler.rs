@@ -11,6 +11,8 @@
 //! - `POST /{assembly_id}/cancel`          —— Manager/Clerk 取消
 //! - `POST /{assembly_id}/start`           —— PENDING → IN_PROCESS 状态机守卫
 //! - `POST /{assembly_id}/files`           —— multipart PDF 上传到 COS
+//! - `POST /{assembly_id}/children`        —— 2026-09-25 新增 D-07：追加单个子件（事务）
+//! - `GET  /{assembly_id}/files`           —— 2026-09-25 新增 D-09：列出已上传 PDF
 //!
 //! ## 约定（2026-09-22 Group D-3 重构对齐 iam 范本）
 //! - 事务边界在 handler：`state.pool.begin()` → service（trait 注入式签名
@@ -40,12 +42,14 @@ use serde_json::json;
 use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::assembly::dto::{
-    AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
+    AssemblyChildAddRequest, AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
 };
 use crate::modules::assembly::service::AssemblyService;
 use crate::modules::assembly::vo::{
     AssemblyCreateResult, AssemblyDetail, AssemblyListOut, AssemblyOut,
 };
+use crate::modules::part::vo::PartListItem;
+use crate::modules::part_file::vo::PartFileListOut;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -136,14 +140,9 @@ pub async fn create_assembly(
         .map_err(|e| AppError::biz(code::BIZ_INVALID_VALUE, format!("JSON 解析失败: {e}")))?;
 
     let mut tx = state.pool.begin().await?;
-    let out = AssemblyService::create_assembly(
-        &mut tx,
-        &state.snowflake,
-        &req,
-        pdf_files,
-        &current,
-    )
-    .await?;
+    let out =
+        AssemblyService::create_assembly(&mut tx, &state.snowflake, &req, pdf_files, &current)
+            .await?;
     tx.commit().await?;
     // commit 之后广播（对齐 Python 延迟广播模式）
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
@@ -302,6 +301,61 @@ pub async fn upload_assembly_files(
     Ok((StatusCode::CREATED, Json(R::ok(out))))
 }
 
+/// `POST /api/v2/assemblies/{assembly_id}/children` → 200 OK
+///
+/// 2026-09-25 新增（D-07 api-drift-fix）：在已存在装配体下追加单个 part 子件。
+///
+/// 行为：
+/// - 权限：Manager / Clerk（service 内 `require_any_role`）
+/// - 事务：handler `pool.begin()` → service（trait 注入式）→ 显式 `tx.commit()`
+///   同事务 INSERT `t_part` + INSERT 初始 `t_part_batch`
+/// - 业务流转：service 层
+///   1. 校验 `drawing_no` / `name` 非空，`quantity > 0`
+///   2. 装配体存在性（→ 20301）
+///   3. 子件继承父件 7 个共享字段；`planned_delivery_date` 子件入参优先，缺省继承
+///   4. 子件 `customer_id` = 父件 `customer_id`；`serial_no = NULL`
+/// - WS 广播：commit 后 `ASSEMBLY_UPDATED`（payload `{ assembly_id }`）
+/// - 响应：`PartListItem`（含 `customer_name` / `l1_customer_name` 冗余）
+pub async fn add_assembly_child(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(assembly_id): Path<i64>,
+    Json(req): Json<AssemblyChildAddRequest>,
+) -> Result<Json<R<PartListItem>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out =
+        AssemblyService::add_assembly_child(&mut tx, &state.snowflake, assembly_id, &req, &current)
+            .await?;
+    tx.commit().await?;
+    state.ws_hub.broadcast(WsEvent::DashboardEvent {
+        kind: "ASSEMBLY_UPDATED".into(),
+        payload: json!({ "assembly_id": assembly_id.to_string() }),
+    });
+    Ok(Json(R::ok(out)))
+}
+
+/// `GET /api/v2/assemblies/{assembly_id}/files` → 200 OK
+///
+/// 2026-09-25 新增（D-09 api-drift-fix）：列出装配体已上传 PDF（kind=ASSEMBLY_MASTER）。
+/// 与现有 `POST /{assembly_id}/files` 配套。
+///
+/// 行为：
+/// - 权限：Manager / Clerk / Inspector / CncProgrammer（4 角色全开放，与
+///   `GET /part-files/{id}/url` 一致）
+/// - 读端点：不开事务（`pool.acquire()` 直接拿连接）
+/// - 复用 `part_file` 域 `list_by_owner('ASSEMBLY', asm.id)` 走 `t_part_file`
+/// - 响应：`PartFileListOut { items, total }`（无 limit/offset——list_by_owner 不分页，
+///   与单 owner 视图对齐）
+pub async fn list_assembly_files(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(assembly_id): Path<i64>,
+) -> Result<Json<R<PartFileListOut>>, AppError> {
+    let mut conn = state.pool.acquire().await?;
+    let out = AssemblyService::list_assembly_files(&mut conn, assembly_id, &current).await?;
+    Ok(Json(R::ok(out)))
+}
+
 /// assembly 域 axum 子路由（不含公共前缀；由 `mod.rs::router()` 桥接到 `/assemblies`）。
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -311,5 +365,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{assembly_id}/soft-delete", post(soft_delete_assembly))
         .route("/{assembly_id}/cancel", post(cancel_assembly))
         .route("/{assembly_id}/start", post(start_assembly))
-        .route("/{assembly_id}/files", post(upload_assembly_files))
+        // 静态段 `/files` 在 `/children` 之前注册（与既有 POST /files 不冲突——
+        // POST 与 GET 共享 `/files`，按 method 路由；children 是新增 POST，二者
+        // method 维度不同，注册顺序无 catch-all 歧义）。
+        .route(
+            "/{assembly_id}/files",
+            post(upload_assembly_files).get(list_assembly_files),
+        )
+        .route("/{assembly_id}/children", post(add_assembly_child))
 }

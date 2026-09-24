@@ -4,7 +4,9 @@
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 > 共享 DTO（AssemblyOut / AssemblyListItem / AssemblyListOut / AssemblyChildOut / AssemblyFileRef / AssemblyDetail / AssemblyCreateResult）见 [`./index.md`](./index.md)
 >
-> 范围：本文件覆盖 5 个 CRUD 端点（list / create / get / update / soft-delete）。cancel 见 [`./cancel.md`](./cancel.md)。
+> 范围：本文件覆盖 7 个 CRUD 端点（list / create / get / update / soft-delete / **files-list（D-09）** / **children（D-07）**）+ start / files。cancel 见 [`./cancel.md`](./cancel.md)。
+>
+> 注：跨域端点 `GET /api/v2/parts/{part_id}/assembly`（D-08）虽挂在 parts 路由下但属于本域契约，文档收录在本文件末尾（仅文档归口，不改 frontend 路径）。
 
 ## 本文件目录
 
@@ -14,6 +16,9 @@
 - [GET /api/v2/assemblies/{assembly_id}](#get-apiv2assembliesassembly_id)
 - [POST /api/v2/assemblies/{assembly_id}/update](#post-apiv2assembliesassembly_idupdate)
 - [POST /api/v2/assemblies/{assembly_id}/soft-delete](#post-apiv2assembliesassembly_idsoft-delete)
+- [GET /api/v2/assemblies/{assembly_id}/files](#get-apiv2assembliesassembly_idfiles) （2026-09-25 D-09）
+- [POST /api/v2/assemblies/{assembly_id}/children](#post-apiv2assembliesassembly_idchildren) （2026-09-25 D-07）
+- [GET /api/v2/parts/{part_id}/assembly](#get-apiv2partspart_idassembly) （2026-09-25 D-08）
 
 ---
 
@@ -252,6 +257,126 @@ WS 广播（commit 后下发）：
 - 40300 — 非 Manager（HTTP 403）
 
 > 注：本 pass 的 `soft_delete` 仅校验 `version` + `deleted_at IS NULL`，未对终态（COMPLETED / CANCELLED）做禁删守卫（与分支一致）。后续 PR 可加 `20307 BIZ_ASSEMBLY_HAS_SHIPMENT` 校验。
+
+---
+
+### `GET /api/v2/assemblies/{assembly_id}/files`
+
+权限: **Manager / Clerk / Inspector / CncProgrammer**
+
+2026-09-25 新增（D-09 api-drift-fix）：列出装配体已上传的 PDF 文件（kind=ASSEMBLY_MASTER），与现有 `POST /{id}/files` 配套。
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `assembly_id` | string (i64) | 装配体雪花 ID |
+
+Response 200 `data`：[`PartFileListOut`](../files.md#partfilelistout-字段)
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `items` | [PartFileOut](../files.md#partfileout-字段)[] | `owner_kind='ASSEMBLY'` + `kind='ASSEMBLY_MASTER'` 的文件 |
+| `total` | i64 | 文件总数 |
+
+> 不分页——单 owner 视图，按 `t_part_file.created_at DESC` 排序。
+
+业务流转：service 层走 `AssemblyRepoTrait::list_part_files_by_owner('ASSEMBLY', asm.id)`，再在内存过滤 `kind='ASSEMBLY_MASTER'`（CAS 历史可能有其他 kind 但装配体视图只显示 ASSEMBLY_MASTER）。
+
+错误码：
+
+- 20301 — assembly 不存在 / 已软删（HTTP 404）
+- 40300 — 角色不符（HTTP 403）
+
+---
+
+### `POST /api/v2/assemblies/{assembly_id}/children`
+
+权限: **Manager / Clerk**
+
+2026-09-25 新增（D-07 api-drift-fix）：在已存在的装配体下追加单个 part 子件。子件继承父件 7 个共享信息字段（applicant_name / request_date / order_no / system_delivery_date / is_urgent / note / customer_id）；planned_delivery_date 子件入参优先，缺省继承父件。
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `assembly_id` | string (i64) | 装配体雪花 ID |
+
+Request：`AssemblyChildAddRequest` JSON
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `drawing_no` | string | ✓ | 子件图号（trim 后非空；空 → 40001） |
+| `name` | string | ✓ | 子件名（trim 后非空；空 → 40001） |
+| `planned_delivery_date` | date? | — | 缺省 → 继承父件 |
+| `quantity` | i32 | ✓ | > 0（≤ 0 → 40001） |
+
+业务流转（service 层）：
+
+1. 校验 `drawing_no` / `name` 非空（→ 40001），`quantity > 0`（→ 40001）
+2. 校验 assembly 存在（→ 20301）
+3. 子件字段继承父件（7 个共享字段）；`customer_id` 强制为父件 customer（即便父件是 L2 也透传）
+4. **不**派生 serial_no —— 已存在装配体追加子件属于「补件」语义，不打开序列号派发通道；新子件 `serial_no = NULL`（`uk_t_part_serial_no` 唯一索引允许多 NULL）
+5. 同事务 INSERT `t_part` + INSERT 初始 `t_part_batch`（batch_no=1 / status='PENDING' / location=NULL），与 `PartService::create_part` 对齐
+6. 读回 Part 行 → 渲染 `PartListItem`（含 `customer_name` / `l1_customer_name` 冗余）
+
+WS 广播（commit 后下发）：
+
+- `ASSEMBLY_UPDATED` —— payload `{ assembly_id }`
+
+Response 200 `data`：[`PartListItem`](../parts/index.md#partlistitem-字段)
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part` | TPart 完整列 | 含 `serial_no=null` / `assembly_id=父件 id` |
+| `customer_name` | string? | L2 客户名 |
+| `l1_customer_name` | string? | L1（集团）客户名 |
+| `location` / `holder_name` | null | 本端点不派生（避免引入批次 query） |
+
+错误码：
+
+- 20301 — assembly 不存在 / 已软删（HTTP 404）
+- 40001 — 字段 shape 错 / drawing_no 空 / name 空 / quantity ≤ 0（HTTP 422）
+- 40300 — 角色不符（HTTP 403）
+
+---
+
+### `GET /api/v2/parts/{part_id}/assembly`
+
+> 路由注册在 `part::router()`（`/api/v2/parts/{part_id}/assembly`），但属于 assembly 域契约。frontend API 客户端（`src/api/assembly.ts:30`）走此路径。
+
+权限: **Manager / Clerk / Inspector / CncProgrammer**
+
+2026-09-25 新增（D-08 api-drift-fix）：按 part 反查其所属装配体。响应 `R<Option<AssemblyDetail>>`——`null` 表示 part 不属于任何装配体（独立工单 / 单件 part）。
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `part_id` | string (i64) | 零件雪花 ID |
+
+Response 200 `data`：`Option<AssemblyDetail>`
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `Some(detail)` | [AssemblyDetail](#assemblydetail-字段) | 含 assembly 行 + children parts + files，与 `GET /assemblies/{id}` 同形 |
+| `None` | null | part 存在但无父装配体（assembly_id IS NULL） |
+
+业务流转（service 层走 `PartService::get_assembly_by_part`）：
+
+1. `SELECT assembly_id FROM t_part WHERE id = $1 AND deleted_at IS NULL`
+   - 行不存在 → 40401 PART_NOT_FOUND
+2. `assembly_id IS NULL` → 返回 `Ok(None)`（独立 part）
+3. 否则委托 `AssemblyService::get_assembly(asm_id)` 拿 AssemblyDetail（含 children + files）
+   - 该 asm 已软删 → 20301（AssemblyService::get_assembly 内部校验）
+
+错误码：
+
+- 20101 — part 不存在 / 已软删（HTTP 404）
+- 20301 — part 存在但其父装配体已软删（HTTP 404，传递自 AssemblyService::get_assembly）
+- 40300 — 角色不符（HTTP 403）
+
+> part 存在但 `assembly_id IS NULL` → 返回 `200 { data: null }`（不是 404）。
 
 ---
 

@@ -22,10 +22,10 @@ use std::sync::Arc;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::assembly::vo::AssemblyOut;
 use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::AssemblyRepoTrait;
 use crate::modules::assembly::statemachine::AssemblyStatus;
+use crate::modules::assembly::vo::AssemblyOut;
 use crate::modules::part_file::repo::{NewPartFile, hash_bytes};
 use crate::shared::error::{AppError, code};
 
@@ -44,7 +44,9 @@ pub(crate) async fn start_assembly_dispatch(
     assembly_id: i64,
     current: &CurrentUser,
 ) -> Result<AssemblyOut, AppError> {
-    AssemblyService.start_assembly_inner(conn, assembly_id, current).await
+    AssemblyService
+        .start_assembly_inner(conn, assembly_id, current)
+        .await
 }
 
 pub(crate) async fn upload_assembly_files_dispatch(
@@ -57,6 +59,16 @@ pub(crate) async fn upload_assembly_files_dispatch(
 ) -> Result<Vec<crate::modules::assembly::vo::AssemblyFileRef>, AppError> {
     AssemblyService
         .upload_assembly_files_inner(conn, snowflake, cos, assembly_id, files, current)
+        .await
+}
+
+pub(crate) async fn list_assembly_files_dispatch(
+    conn: &mut sqlx::PgConnection,
+    assembly_id: i64,
+    current: &CurrentUser,
+) -> Result<crate::modules::part_file::vo::PartFileListOut, AppError> {
+    AssemblyService
+        .list_assembly_files_inner(conn, assembly_id, current)
         .await
 }
 
@@ -201,6 +213,73 @@ impl AssemblyService {
             });
         }
         Ok(out)
+    }
+
+    // =======================================================================
+    // 文件列出：list_assembly_files（2026-09-25 新增 D-09 端点）
+    // =======================================================================
+
+    /// `GET /assemblies/{id}/files`：列出装配体已上传 PDF（kind=ASSEMBLY_MASTER）。
+    ///
+    /// 复用 part_file 域 `list_files`（走 `part_file_repo::list_with_filters`
+    /// `owner_kind='ASSEMBLY'`）；与 `PartFileService::list_files` 完全对齐。
+    /// 权限：4 角色全开放（与 `list_part_files_for_part` 一致）。
+    ///
+    /// 设计意图：复用 service 层的 `part_file::PartFileListQuery` DTO，把
+    /// `owner_kind="ASSEMBLY"` 与 `owner_id=asm.id` 写死，handler 仅透传
+    /// kind 过滤（暂未暴露；本端点为简单 list）。
+    pub async fn list_assembly_files_inner<R: AssemblyRepoTrait>(
+        &self,
+        mut repo: R,
+        assembly_id: i64,
+        current: &CurrentUser,
+    ) -> Result<crate::modules::part_file::vo::PartFileListOut, AppError> {
+        current.require_any_role(&[
+            Role::Manager,
+            Role::Clerk,
+            Role::Inspector,
+            Role::CncProgrammer,
+        ])?;
+        // 1. assembly 存在性
+        let _asm = repo
+            .get_by_id(assembly_id, false)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_ASSEMBLY_NOT_FOUND,
+                    format!("assembly {assembly_id} 不存在"),
+                )
+            })?;
+        // 2. 复用 list_by_owner（owner_kind='ASSEMBLY'），仅 kind='ASSEMBLY_MASTER'
+        let rows = repo
+            .list_part_files_by_owner("ASSEMBLY", assembly_id)
+            .await
+            .map_err(AppError::from)?;
+        // 3. 投影到 PartFileOut（kind 过滤在 SQL 后再做，list_by_owner 不带 kind）
+        let total = rows.len() as i64;
+        let items: Vec<crate::modules::part_file::vo::PartFileOut> = rows
+            .into_iter()
+            .filter(|r| r.kind == "ASSEMBLY_MASTER")
+            .map(|r| crate::modules::part_file::vo::PartFileOut {
+                id: r.id,
+                owner_id: r.part_id,
+                owner_kind: "ASSEMBLY".to_string(),
+                kind: r.kind,
+                file_type: r.file_type,
+                object_key: r.object_key,
+                original_filename: r.original_filename,
+                file_size: r.file_size,
+                content_type: r.content_type,
+                upload_status: r.upload_status,
+                content_sha256: r.content_sha256,
+                paired_file_id: r.paired_file_id,
+                version: r.version,
+                created_at: Some(r.created_at),
+                created_by: r.created_by,
+            })
+            .collect();
+        Ok(crate::modules::part_file::vo::PartFileListOut { items, total })
     }
 }
 
