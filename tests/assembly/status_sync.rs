@@ -15,48 +15,190 @@
 //!      那一项返回 `synced_assembly_id: Some(...)`；handler 侧用 HashSet 去重
 //!      保证每个 asm 仅广播一次 `ASSEMBLY_UPDATED`。
 //!
-//! ## 运行方式
-//! ```bash
-//! # 1. 启专用 PG 容器（本 worktree 专用，避免污染 5429 的主测试库）
-//! docker run -d --name assembly-status-auto-sync-pg-test \
-//!   -p 5434:5432 \
-//!   -e POSTGRES_USER=hsh_test \
-//!   -e POSTGRES_PASSWORD=6065161test \
-//!   -e POSTGRES_DB=postgres \
-//!   postgres:18-alpine
-//!
-//! # 2. 跑测试（一次性覆盖 DATABASE_URL 给 sqlx 编译期校验 + TEST_DATABASE_URL）
-//! DATABASE_URL="postgres://hsh_test:6065161test@localhost:5434/hsh_erp_template" \
-//! TEST_DATABASE_URL="postgres://hsh_test:6065161test@localhost:5434/hsh_erp_template" \
-//! ADMIN_DATABASE_URL="postgres://hsh_test:6065161test@localhost:5434/postgres" \
-//!   cargo test --test assembly_status_sync -- --test-threads=1
-//! ```
-//!
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
-
-#[path = "../common/mod.rs"]
-mod common;
-
-// 2026-09-23 PR13 Phase C+D 协调：helpers 从 tests/part_api_helpers.rs 迁到
-// tests/part/helpers.rs（Phase C），本文件同步 Phase D 进 assembly/ 子目录，
-// 相对路径需加 ../ → `../part/helpers.rs`。
-#[path = "../part/helpers.rs"]
-mod helpers;
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase C.Final）
+//! 本文件原 `#[path = "../part/helpers.rs"] mod helpers;` + `use helpers::*;`
+//! 改走 `use hsh_erp_test_support::*` + `load_assembly_fixture(&pool)` +
+//! `AssemblyFixture` + `bootstrap_as_inspector` 样板。
+//!
+//! `load_assembly_fixture` 内部先调 `load_part_fixture`（复用 part 域基线
+//! INSPECTION / PRODUCTION 货架 + INSPECTOR 用户），再加 1 行 `t_serial_counter`
+//! （'F' prefix）。本测试域独享的 helper（`insert_l1` / `insert_l2` /
+//! `insert_part_with_status` / `insert_batch` / `batch_version` /
+//! `setup_inspection_and_production_shelves`）保留为本地函数——这些是 part 域
+//! 测试模式的具体实现，不属于跨域共享资产。字面请求 / 断言逐字保留。
 
 use axum::http::StatusCode;
 use serde_json::json;
+use sqlx::PgPool;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::assembly::service::{AssemblyService, SyncOutcome};
 
-use helpers::*;
+// 2026-09-24 PR13 Phase C.Final：fixture 范本化入口。
+// `load_assembly_fixture(&pool)` 加载 part 域基线（INSPECTOR 用户 +
+// INSPECTION/PRODUCTION 货架）+ 1 行 t_serial_counter(prefix='F'); 多数测试
+// 用本地 `insert_l1` / `insert_l2` 等 helper 创建专属测试数据。
+use hsh_erp_test_support::{
+    AssemblyFixture, PartFixture, json_request, load_assembly_fixture, login_token, pool_snowflake,
+    send, test_app, test_pool, test_state,
+};
 
 // ===========================================================================
-//  私有 fixture helpers
+//  本地 domain helpers（part 域测试模式的具体实现，不属于跨域共享资产）
+// ===========================================================================
+
+/// 插 L1 客户（一级；带 serial_prefix）。原 `tests/part/helpers.rs::insert_l1`。
+async fn insert_l1(pool: &PgPool, name: &str, prefix: &str) -> i64 {
+    let id = pool_snowflake().lock().unwrap().next_id();
+    let now = now_naive();
+    sqlx::query!(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, NULL, $3, 0, $4, NULL, $4, NULL)",
+        id,
+        name,
+        prefix,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert L1");
+    id
+}
+
+/// 插 L2 客户（二级；挂在 L1 下，无 prefix）。原 `tests/part/helpers.rs::insert_l2`。
+async fn insert_l2(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
+    let id = pool_snowflake().lock().unwrap().next_id();
+    let now = now_naive();
+    sqlx::query!(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
+        id,
+        name,
+        l1_id,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert L2");
+    id
+}
+
+/// 带 status 参数的 part 插入。参数化 status 适配 INSPECTION / IN_PROCESS /
+/// PENDING / PROGRAMMING / READY_TO_SHIP（与 to_inspection / to_ship 等端点
+/// 所需起始 status 形状保持一致）。
+async fn insert_part_with_status(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    assembly_id: Option<i64>,
+    status: &str,
+) -> i64 {
+    let id = pool_snowflake().lock().unwrap().next_id();
+    let now = now_naive();
+    let today = now.date();
+    // 2026-09-16 PR-2（migration 027）：t_part 删 `has_been_repaired` 等 6 个批次
+    // 依附列；从 INSERT 列名与 VALUES 占位符同步移除。
+    sqlx::query!(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, \
+         quantity, version, created_at, created_by, updated_at, updated_by, \
+         assembly_id) \
+         VALUES ($1, $2, $3, 'D-001', $4, $8, $3, $6, $6, 1, 0, $5, NULL, $5, NULL, $7)",
+        id,
+        serial_no,
+        name,
+        customer_id,
+        now,
+        today,
+        assembly_id,
+        status,
+    )
+    .execute(pool)
+    .await
+    .expect("insert part");
+    id
+}
+
+/// 插一个 part_batch（带 status 参数，与 part.status 通常对齐）。
+async fn insert_batch(
+    pool: &PgPool,
+    part_id: i64,
+    batch_no: i32,
+    qty: i32,
+    status: &str,
+) -> i64 {
+    let id = pool_snowflake().lock().unwrap().next_id();
+    let now = now_naive();
+    // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；
+    // INSERT 列名与 VALUES 占位符同步移除 `false` 字面量。
+    sqlx::query!(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
+         version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, $5, 0, $6, NULL, $6, NULL)",
+        id,
+        part_id,
+        batch_no,
+        qty,
+        status,
+        now,
+    )
+    .execute(pool)
+    .await
+    .expect("insert batch");
+    id
+}
+
+/// 读取批次当前乐观锁版本（测试构造 to-XXX / batch-to-XXX payload 用）。
+async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
+    sqlx::query_scalar::<_, i32>("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .expect("batch not found")
+}
+
+/// 取 fixture 预置的 INSPECTION / PRODUCTION shelf ID + 关联 process ID。
+///
+/// 原 `tests/part/helpers.rs::setup_inspection_and_production_shelves` 走真实
+/// INSERT（INSP-001 / PROD-001 + process + shelf_process 映射）。AssemblyFixture
+/// 通过 `load_part_fixture` 复用 part 域基线 shelf + process 行，ID 直接
+/// 取 `PartFixture::*_SHELF_ID / PROCESS_ID` 常量。
+fn setup_inspection_and_production_shelves() -> (i64, i64, i64) {
+    (
+        PartFixture::INSPECTION_SHELF_ID,
+        PartFixture::PRODUCTION_SHELF_ID,
+        PartFixture::PROCESS_ID,
+    )
+}
+
+// ===========================================================================
+//  Bootstrap helpers（PR13 Phase F 风格 B：抽出公共样板）
+// ===========================================================================
+
+/// 起一份 fresh database + 加载 assembly fixture（复用 part 域基线）+ 构造
+/// axum Router + 以 INSPECTOR 身份登录。
+///
+/// 返回 `(pool, app, token, fx)`。`fx` 提供 `part_manager_username` 等强类型
+/// 句柄；INSPECTOR 用户走 `PartFixture::INSPECTOR_USERNAME`。
+async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String, AssemblyFixture) {
+    let pool = test_pool().await;
+    let fx = load_assembly_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, PartFixture::INSPECTOR_USERNAME, PartFixture::PASSWORD).await;
+    (pool, app, token, fx)
+}
+
+// ===========================================================================
+//  私有 fixture helpers（assembly 域独有）
 // ===========================================================================
 
 /// 插一个 `t_assembly` 行（PENDING 状态）。
@@ -136,17 +278,16 @@ fn test_current_user() -> CurrentUser {
 /// 期望：`data.synced_assembly_id == Some(asm.id)`；DB `t_assembly.status == 'IN_PROCESS'`。
 #[tokio::test]
 async fn single_part_to_inspection_flips_assembly_to_in_process() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_inspector().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool.clone(), "inspector1").await;
-    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves();
 
-    let asm_id = insert_assembly(&_pool, l2, "D-A1", "总成A1").await;
+    let asm_id = insert_assembly(&pool, l2, "D-A1", "总成A1").await;
     let part_id =
-        insert_part_with_status(&_pool, "P0", l2, Some("PA1-01"), Some(asm_id), "PENDING").await;
-    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
-    let v = batch_version(&_pool, batch_id).await;
+        insert_part_with_status(&pool, "P0", l2, Some("PA1-01"), Some(asm_id), "PENDING").await;
+    let batch_id = insert_batch(&pool, part_id, 1, 5, "PENDING").await;
+    let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -175,7 +316,7 @@ async fn single_part_to_inspection_flips_assembly_to_in_process() {
     );
 
     // DB 端断言父 assembly 已翻转到 IN_PROCESS
-    let (asm_status, asm_version) = get_assembly_status_version(&_pool, asm_id).await;
+    let (asm_status, asm_version) = get_assembly_status_version(&pool, asm_id).await;
     assert_eq!(asm_status, "IN_PROCESS", "父 asm 应已翻转到 IN_PROCESS");
     assert_eq!(asm_version, 1, "version 应自增一次（0 → 1）");
 }
@@ -187,22 +328,21 @@ async fn single_part_to_inspection_flips_assembly_to_in_process() {
 /// `min(progress)` → INSPECTION 的 progress=4 → `IN_PROCESS`。
 #[tokio::test]
 async fn mixed_children_assembly_rolls_up_to_min_progress() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_inspector().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool.clone(), "inspector1").await;
-    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves();
 
-    let asm_id = insert_assembly(&_pool, l2, "D-A2", "总成A2").await;
+    let asm_id = insert_assembly(&pool, l2, "D-A2", "总成A2").await;
     // 子 1：COMPLETED（fixture 直插；COMPLETED 是终态但 rollup 不视作 cancelled）
     let p1 =
-        insert_part_with_status(&_pool, "P1", l2, Some("PA2-01"), Some(asm_id), "COMPLETED").await;
-    insert_batch(&_pool, p1, 1, 5, "COMPLETED").await;
+        insert_part_with_status(&pool, "P1", l2, Some("PA2-01"), Some(asm_id), "COMPLETED").await;
+    insert_batch(&pool, p1, 1, 5, "COMPLETED").await;
     // 子 2：PENDING → INSPECTION（驱动 sync）
     let p2 =
-        insert_part_with_status(&_pool, "P2", l2, Some("PA2-02"), Some(asm_id), "PENDING").await;
-    let b2 = insert_batch(&_pool, p2, 1, 5, "PENDING").await;
-    let v2 = batch_version(&_pool, b2).await;
+        insert_part_with_status(&pool, "P2", l2, Some("PA2-02"), Some(asm_id), "PENDING").await;
+    let b2 = insert_batch(&pool, p2, 1, 5, "PENDING").await;
+    let v2 = batch_version(&pool, b2).await;
 
     let (status, body) = send(
         app,
@@ -226,7 +366,7 @@ async fn mixed_children_assembly_rolls_up_to_min_progress() {
 
     // 子状态应为 [COMPLETED, INSPECTION]；min progress over non-terminal =
     // min(INSPECTION=4) = 4 → IN_PROCESS
-    let (asm_status, _asm_version) = get_assembly_status_version(&_pool, asm_id).await;
+    let (asm_status, _asm_version) = get_assembly_status_version(&pool, asm_id).await;
     assert_eq!(
         asm_status, "IN_PROCESS",
         "子 [COMPLETED, INSPECTION] → 父应 = IN_PROCESS（min progress=4 非 0）"
@@ -246,7 +386,8 @@ async fn mixed_children_assembly_rolls_up_to_min_progress() {
 /// 决策（cancel 不属于「业务流转」范畴），与本测试的算法正确性正交。
 #[tokio::test]
 async fn all_children_cancelled_flips_assembly_to_cancelled() {
-    let pool = setup().await;
+    let pool = test_pool().await;
+    let _fx = load_assembly_fixture(&pool).await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
 
@@ -294,28 +435,27 @@ async fn all_children_cancelled_flips_assembly_to_cancelled() {
 /// 断言：`status` 不变；`version` 不变；响应 `data.synced_assembly_id == null`。
 #[tokio::test]
 async fn terminal_assembly_is_not_modified_by_child_change() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_inspector().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool.clone(), "inspector1").await;
-    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves();
 
-    let asm_id = insert_assembly(&_pool, l2, "D-A4", "总成A4").await;
-    force_assembly_status(&_pool, asm_id, "COMPLETED").await;
+    let asm_id = insert_assembly(&pool, l2, "D-A4", "总成A4").await;
+    force_assembly_status(&pool, asm_id, "COMPLETED").await;
     // 用一次额外 UPDATE 自增 version 模拟「自然流转到 COMPLETED 的版本号」，
     // 这样断言「无 version bump」时起点是 version=1 而不是 0
     sqlx::query("UPDATE t_assembly SET version = version + 1 WHERE id = $1")
         .bind(asm_id)
-        .execute(&_pool)
+        .execute(&pool)
         .await
         .expect("bump version");
-    let (_st, version_before) = get_assembly_status_version(&_pool, asm_id).await;
+    let (_st, version_before) = get_assembly_status_version(&pool, asm_id).await;
     assert!(version_before >= 1);
 
     let part_id =
-        insert_part_with_status(&_pool, "P1", l2, Some("PA4-01"), Some(asm_id), "PENDING").await;
-    let batch_id = insert_batch(&_pool, part_id, 1, 5, "PENDING").await;
-    let v = batch_version(&_pool, batch_id).await;
+        insert_part_with_status(&pool, "P1", l2, Some("PA4-01"), Some(asm_id), "PENDING").await;
+    let batch_id = insert_batch(&pool, part_id, 1, 5, "PENDING").await;
+    let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
         app,
@@ -339,7 +479,7 @@ async fn terminal_assembly_is_not_modified_by_child_change() {
         "父终态时应短路：synced_assembly_id 应为 null；body={body}"
     );
 
-    let (st, version_after) = get_assembly_status_version(&_pool, asm_id).await;
+    let (st, version_after) = get_assembly_status_version(&pool, asm_id).await;
     assert_eq!(
         st, "COMPLETED",
         "父 asm 应保持 COMPLETED，不被子状态变更改写"
@@ -372,27 +512,26 @@ async fn terminal_assembly_is_not_modified_by_child_change() {
 /// handler 侧的 dedup 逻辑通过 service 直调 `sync_from_part_changes` 覆盖（见下）。
 #[tokio::test]
 async fn batch_to_inspection_emits_per_assembly_update() {
-    let pool = setup().await;
+    let (pool, app, token, _fx) = bootstrap_as_inspector().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
-    let (app, token, _pool) = login_inspector(pool.clone(), "inspector1").await;
-    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves(&_pool).await;
+    let (insp_shelf, _prod_shelf, _proc) = setup_inspection_and_production_shelves();
 
-    let asm_a = insert_assembly(&_pool, l2, "D-A5A", "总成A5-A").await;
-    let asm_b = insert_assembly(&_pool, l2, "D-A5B", "总成A5-B").await;
+    let asm_a = insert_assembly(&pool, l2, "D-A5A", "总成A5-A").await;
+    let asm_b = insert_assembly(&pool, l2, "D-A5B", "总成A5-B").await;
     let pa1 =
-        insert_part_with_status(&_pool, "P-A1", l2, Some("PA5-01"), Some(asm_a), "PENDING").await;
+        insert_part_with_status(&pool, "P-A1", l2, Some("PA5-01"), Some(asm_a), "PENDING").await;
     let pa2 =
-        insert_part_with_status(&_pool, "P-A2", l2, Some("PA5-02"), Some(asm_a), "PENDING").await;
+        insert_part_with_status(&pool, "P-A2", l2, Some("PA5-02"), Some(asm_a), "PENDING").await;
     let pb1 =
-        insert_part_with_status(&_pool, "P-B1", l2, Some("PB5-01"), Some(asm_b), "PENDING").await;
-    let ba1 = insert_batch(&_pool, pa1, 1, 5, "PENDING").await;
-    let ba2 = insert_batch(&_pool, pa2, 1, 5, "PENDING").await;
-    let bb1 = insert_batch(&_pool, pb1, 1, 5, "PENDING").await;
+        insert_part_with_status(&pool, "P-B1", l2, Some("PB5-01"), Some(asm_b), "PENDING").await;
+    let ba1 = insert_batch(&pool, pa1, 1, 5, "PENDING").await;
+    let ba2 = insert_batch(&pool, pa2, 1, 5, "PENDING").await;
+    let bb1 = insert_batch(&pool, pb1, 1, 5, "PENDING").await;
     let (va1, va2, vb1) = (
-        batch_version(&_pool, ba1).await,
-        batch_version(&_pool, ba2).await,
-        batch_version(&_pool, bb1).await,
+        batch_version(&pool, ba1).await,
+        batch_version(&pool, ba2).await,
+        batch_version(&pool, bb1).await,
     );
 
     let (status, body) = send(
@@ -440,8 +579,8 @@ async fn batch_to_inspection_emits_per_assembly_update() {
     );
 
     // DB 端：两 asm 均已 = IN_PROCESS
-    let (st_a, _v_a) = get_assembly_status_version(&_pool, asm_a).await;
-    let (st_b, _v_b) = get_assembly_status_version(&_pool, asm_b).await;
+    let (st_a, _v_a) = get_assembly_status_version(&pool, asm_a).await;
+    let (st_b, _v_b) = get_assembly_status_version(&pool, asm_b).await;
     assert_eq!(st_a, "IN_PROCESS");
     assert_eq!(st_b, "IN_PROCESS");
 
