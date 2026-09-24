@@ -19,7 +19,40 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
-use hsh_erp_test_support::*;
+use hsh_erp_test_support::{json_request, load_part_fixture, login_token, send, test_app,
+    test_pool, test_state};
+
+// ===========================================================================
+//  动态 fixture helpers（PR-C.Final retry 第 3 轮，2026-09-24）
+//  原从 `hsh_erp_test_support::fixtures::insert_shelf` 引入，因 fixtures.rs
+//  本轮被删，复制到本地（同形 sqlx::query 直插）。
+// ===========================================================================
+
+/// 插一个 t_shelf 行（code / name / zone）。
+async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_test_support::pool_snowflake;
+
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(name)
+    .bind(zone)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_shelf");
+    id
+}
 
 // ===========================================================================
 //  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）

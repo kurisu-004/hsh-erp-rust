@@ -35,10 +35,170 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    ProductionFixture, add_role, insert_shelf, insert_user_with_password, json_request,
-    link_shelf_to_process, link_work_type_to_process, load_production_fixture, login_token,
-    pool_snowflake, seed_process, send, test_app, test_state, test_pool,
+    ProductionFixture, json_request, load_production_fixture, login_token, pool_snowflake, send,
+    test_app, test_state, test_pool,
 };
+
+// ===========================================================================
+//  动态 fixture helpers（PR-C.Final retry 第 3 轮，2026-09-24）
+//  原从 `hsh_erp_test_support::fixtures::{insert_user_with_password / add_role /
+//  seed_process / link_work_type_to_process / link_shelf_to_process / insert_shelf}`
+//  引入 6 helper，因 fixtures.rs 本轮被删，复制到本地（同形 sqlx::query 直插）。
+// ===========================================================================
+
+/// 插一个 `is_active=true` 的 `t_user` 行（bcrypt 哈希现场生成）。
+async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password: &str) -> i64 {
+    use hsh_erp_rust::auth::password;
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let hash = password::hash(plain_password).expect("bcrypt hash");
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_user (id, username, password_hash, full_name, is_active, \
+         refresh_token_version, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(username.to_lowercase())
+    .bind(hash)
+    .bind(username)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user");
+    id
+}
+
+/// 插一个 `t_user_role` 行（user_id + role + scope）。
+async fn add_role(
+    pool: &PgPool,
+    user_id: i64,
+    role: &str,
+    scope_type: Option<&str>,
+    scope_id: Option<i64>,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_user_role (id, user_id, role, scope_type, scope_id, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 0, $6, $6)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(role)
+    .bind(scope_type)
+    .bind(scope_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user_role");
+    id
+}
+
+/// 插一个 INHOUSE 类别的 `t_process` 工序。
+async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(name)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_process");
+    id
+}
+
+/// `t_work_type_process` 映射（无业务软删：`deleted_at` 留默认 NULL）。
+async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_work_type_process (id, work_type_id, process_id, sort_order, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(wt_id)
+    .bind(p_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_work_type_process");
+}
+
+/// `t_shelf_process` 映射（无业务软删）。
+async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(s_id)
+    .bind(p_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_shelf_process");
+}
+
+/// 插一个 t_shelf 行（code / name / zone）。
+async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(name)
+    .bind(zone)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_shelf");
+    id
+}
 
 // ===========================================================================
 //  Bootstrap helpers（PR13 Phase H 风格）
