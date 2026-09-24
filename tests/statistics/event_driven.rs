@@ -10,24 +10,45 @@
 //! 本测试覆盖：
 //! 1. delivered_stats 按事件计数（含 on_time / orange / red 分类）
 //! 2. count_overdue_undelivered 按事件口径判未交付
-
-#[path = "../common/mod.rs"]
-mod common;
+//!
+//! ## 集成测试范本（PR13 Phase H，2026-09-24）
+//! 本文件按 Phase F 范本收敛：删除 `common::clean_db` /
+//! `common::clean_business_db` / `common::ensure_database_exists` 三件套
+//! 调用（`test_pool()` 走 fresh_database_url，进程级 plan 2 隔离天然给出
+//! 空库，无需手动 clean），统一走
+//! `use hsh_erp_test_support::{...}` + `load_statistics_fixture(&pool)`。
+//! 保留本地 helper `insert_l2_customer` / `insert_part_with_dates` /
+//! `insert_initial_batch` / `insert_delivered_event`：event_driven 用例要
+//! 按需造不同 L1 prefix / 不同 planned_delivery_date / 不同 system_date /
+//! 不同 batch_no 的行，保留本地 fn 直插以避免 fixture 预置污染。
 
 use chrono::NaiveDate;
 use sqlx::PgPool;
+
+use hsh_erp_test_support::{load_statistics_fixture, test_pool};
 
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::statistics::repo::sql as statistics_sql;
 
-async fn setup() -> PgPool {
-    common::ensure_database_exists().await;
-    let pool = common::test_pool().await;
-    common::clean_db(&pool).await;
-    common::clean_business_db(&pool).await;
-    pool
+// ===========================================================================
+//  Bootstrap helpers（PR13 Phase H 风格）
+// ===========================================================================
+
+/// 起一份 fresh database + 加载 statistics fixture，返回 `(pool, fx)`。
+///
+/// event_driven 用例不需要 `app` / `token`（service 层直调），故 bootstrap
+/// 只返 `(pool, fx)`；`fx` 暴露 baseline ID，绝大多数用例仍按场景自建
+/// 不同 prefix / 日期 / 事件类型的行。
+async fn setup() -> (PgPool, hsh_erp_test_support::fixture::StatisticsFixture) {
+    let pool = test_pool().await;
+    let fx = load_statistics_fixture(&pool).await;
+    (pool, fx)
 }
+
+// ===========================================================================
+//  statistics 域独享 helper（按场景造不同 prefix / 日期 / batch_no）
+// ===========================================================================
 
 async fn insert_l2_customer(pool: &PgPool) -> (i64, i64) {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -152,7 +173,7 @@ async fn insert_delivered_event(pool: &PgPool, part_id: i64, batch_id: i64, at_d
 /// 范围取 [2026-09-10, 2026-09-20] 全覆盖 3 个事件日。
 #[tokio::test]
 async fn delivered_stats_counts_via_delivered_events() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let (_l1, l2) = insert_l2_customer(&pool).await;
 
     let p1 = insert_part_with_dates(
@@ -217,7 +238,7 @@ async fn delivered_stats_counts_via_delivered_events() {
 /// 期望：cnt=1（P1）。
 #[tokio::test]
 async fn count_overdue_undelivered_uses_event_absence() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let (_l1, l2) = insert_l2_customer(&pool).await;
     let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
 
@@ -271,7 +292,7 @@ async fn count_overdue_undelivered_uses_event_absence() {
 /// `p.deleted_at IS NULL`）。
 #[tokio::test]
 async fn count_overdue_undelivered_excludes_soft_deleted() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let (_l1, l2) = insert_l2_customer(&pool).await;
     let today = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
 
