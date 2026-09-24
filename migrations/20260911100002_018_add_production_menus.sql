@@ -18,9 +18,9 @@
 --   - UPDATE worker_queue 用 WHERE code='worker_queue' 守卫
 --   - INSERT t_role_menu 用 ON CONFLICT DO NOTHING
 --   - DELETE 用 menu_id 精确匹配（不影响其它菜单的 role 行）
--- 整个变更包在 BEGIN; ... COMMIT; 里，事务化。
-
-BEGIN;
+-- 2026-09-24 清理：无显式事务包裹，由 sqlx::migrate! 默认按文件粒度加事务
+--   （单文件失败自动回滚；嵌套 BEGIN/COMMIT 在 PG 18+ 会从 NOTICE 升级成 ERROR，
+--    且无任何原子性收益）。
 
 -- 临时序列：菜单雪花 id 本由 App 生成；migration 用专用序列生成大 id 兜底。
 -- 与 `t_menu_id_seq` 物理隔离，避免与 App 雪花 id 撞号（同 migration 015 backfill 模式）。
@@ -126,5 +126,3 @@ FROM (
 ) AS r(role)
 WHERE EXISTS (SELECT 1 FROM public.t_menu WHERE code = 'worker_queue' AND deleted_at IS NULL)
 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
-
-COMMIT;

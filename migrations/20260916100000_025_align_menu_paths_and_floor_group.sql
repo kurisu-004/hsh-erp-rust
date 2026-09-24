@@ -23,7 +23,9 @@
 --   - 所有 UPDATE 加 WHERE 守卫（path <> '...' / parent_id IS NOT NULL / parent_id <> ...
 --     / is_active = TRUE）确保重跑不写脏数据
 --   - 乐观锁：每个 UPDATE 都 `version = version + 1, updated_at = now()`
---   - 整个变更包在 BEGIN; ... COMMIT; 里，事务化
+-- 2026-09-24 清理：无显式事务包裹，由 sqlx::migrate! 默认按文件粒度加事务
+--   （单文件失败自动回滚；嵌套 BEGIN/COMMIT 在 PG 18+ 会从 NOTICE 升级成 ERROR，
+--    且无任何原子性收益）。
 --
 -- 角色授权影响：
 --   - parent_id / sort_order / path 变更不影响 t_role_menu（role_menu 只记 role + menu_id，
@@ -31,8 +33,6 @@
 --   - scan_badge 升顶级后：SHELF_ACCOUNT 用户侧栏能看到「扫码台」一级入口，
 --     与 router /scan 段的 allowRoles=['SHELF_ACCOUNT'] 兜底一致
 --   - 无需新增 t_role_menu 行
-
-BEGIN;
 
 -- a. 修复「制定工序」menu.path（router: /production/process-design）
 UPDATE public.t_menu
@@ -84,5 +84,3 @@ SET is_active  = FALSE,
 WHERE code = 'floor_group'
   AND deleted_at IS NULL
   AND is_active = TRUE;
-
-COMMIT;

@@ -35,10 +35,10 @@
 --   - INSERT 菜单按 code 走 WHERE NOT EXISTS（与 018 风格一致）
 --   - INSERT t_role_menu 用 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING
 --     （对齐 018 写法 + t_role_menu 的 partial unique index 语义）
---   - 整个变更包在 BEGIN; ... COMMIT; 里，事务化。
 --   - **禁止 DELETE-then-INSERT**：保留历史，重跑幂等。
-
-BEGIN;
+-- 2026-09-24 清理：无显式事务包裹，由 sqlx::migrate! 默认按文件粒度加事务
+--   （单文件失败自动回滚；嵌套 BEGIN/COMMIT 在 PG 18+ 会从 NOTICE 升级成 ERROR，
+--    且无任何原子性收益）。
 
 -- 1. INSERT 一级菜单 template_management（按 code 幂等；静态 id 100000013）
 INSERT INTO public.t_menu (
@@ -107,5 +107,3 @@ WHERE EXISTS (
     SELECT 1 FROM public.t_menu WHERE code = 'print_templates_designer' AND deleted_at IS NULL
 )
 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
-
-COMMIT;

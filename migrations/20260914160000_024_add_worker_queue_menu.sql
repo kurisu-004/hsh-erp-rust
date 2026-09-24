@@ -25,9 +25,9 @@
 -- 幂等：
 --   - INSERT 菜单按 code 走 WHERE NOT EXISTS
 --   - INSERT t_role_menu 用 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING
--- 整个变更包在 BEGIN; ... COMMIT; 里，事务化。
-
-BEGIN;
+-- 2026-09-24 清理：无显式事务包裹，由 sqlx::migrate! 默认按文件粒度加事务
+--   （单文件失败自动回滚；嵌套 BEGIN/COMMIT 在 PG 18+ 会从 NOTICE 升级成 ERROR，
+--    且无任何原子性收益）。
 
 -- 1. INSERT 二级菜单 worker_queue（挂在 production_group 下；按 code 幂等；静态 id 100000017）
 INSERT INTO public.t_menu (
@@ -88,5 +88,3 @@ WHERE EXISTS (
     SELECT 1 FROM public.t_menu WHERE code = 'worker_queue' AND deleted_at IS NULL
 )
 ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
-
-COMMIT;

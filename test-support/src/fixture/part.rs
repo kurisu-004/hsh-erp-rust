@@ -20,7 +20,10 @@
 //! - `part`：2 客户（L1 + L2）+ 1 INHOUSE 工序 + 1 工种 + 2 货架（检验 + 生产）
 //!   + 2 映射（work_type_process / shelf_process）+ 2 part（PENDING + IN_PROCESS）
 //!   + 2 批次 + 4 用户（MANAGER / INSPECTOR / CLERK / SHELF_ACCOUNT）+ 4 role
-//!   对应 bcrypt cost=12 哈希嵌入 SQL。
+//!     对应 bcrypt cost=12 哈希嵌入 SQL。
+//!
+// 2026-09-24 修复：补 2 空格 doc 缩进让 cargo 1.98.1 clippy::doc_lazy_continuation
+//   通过；本次清理冗余 BEGIN/COMMIT 任务连带触发了 clippy 重跑，顺手修
 
 use sqlx::PgPool;
 
