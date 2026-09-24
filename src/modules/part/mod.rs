@@ -136,6 +136,8 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         // ---- Phase 2 (2026-09-13) 手动 pick-up ----
         .route("/{part_id}/pick-up", post(handler::pick_up))
+        // ---- 2026-09-25 D-08 api-drift-fix：按 part 反查所属装配体 ----
+        .route("/{part_id}/assembly", get(handler::get_assembly_by_part))
         // ---- to-XXX 流（替换 Phase F / F2 inspection）----
         .route("/{part_id}/to-ship", post(handler::to_ship))
         .route("/{part_id}/to-inspection", post(handler::to_inspection))

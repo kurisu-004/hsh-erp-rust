@@ -57,9 +57,10 @@ use async_trait::async_trait;
 use sqlx::PgConnection;
 
 use super::model::TAssembly;
+use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part::model::TPart;
-use crate::modules::part::repo::part::ChildInheritFields;
 use crate::modules::part::repo::PartRepo;
+use crate::modules::part::repo::part::{ChildInheritFields, NewPartCreate};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo};
 
@@ -70,7 +71,12 @@ pub mod sql;
 // 这种路径不破（cross-module 调用方 delivery_note 都依赖 `AssemblyRepo` ZST）。
 pub use sql::{AssemblyListFilters, AssemblyRepo, AssemblyUpdate, NewAssembly};
 
-/// assembly 域数据访问 trait（16 方法 = t_assembly CRUD 9 + sync helper 2 + 跨域 helper 5）。
+/// assembly 域数据访问 trait（20 方法 = t_assembly CRUD 9 + sync helper 2 + 跨域 helper 9）。
+///
+/// 2026-09-25 补 3 端点（api-drift-fix）：新增 4 个跨域 helper
+///（`create_simple_child_part` / `create_initial_part_batch` /
+/// `lookup_customer_names` / `get_part_by_id`）。
+/// `fetch_customer_names_map` 在第 1 轮 review 被标记为死代码，已删除（2026-09-25）。
 ///
 /// 单 trait 而非每实体一个：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有两个 repo（2026-09-22 重构定案；与 iam / shelf 同形）。
@@ -98,10 +104,7 @@ pub trait AssemblyRepoTrait: Send {
     ) -> Result<Option<TAssembly>, sqlx::Error>;
 
     // ── t_assembly writes (3) ──
-    async fn insert<'a>(
-        &mut self,
-        new: NewAssembly<'a>,
-    ) -> Result<i64, sqlx::Error>;
+    async fn insert<'a>(&mut self, new: NewAssembly<'a>) -> Result<i64, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
     async fn update_partial<'a>(
         &mut self,
@@ -117,11 +120,7 @@ pub trait AssemblyRepoTrait: Send {
     ) -> Result<u64, sqlx::Error>;
 
     // ── t_assembly status transitions (1) ──
-    async fn cancel(
-        &mut self,
-        id: i64,
-        current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    async fn cancel(&mut self, id: i64, current_user_id: i64) -> Result<u64, sqlx::Error>;
 
     // ── t_assembly list / count (2) ──
     #[allow(clippy::too_many_arguments)]
@@ -230,10 +229,7 @@ pub trait AssemblyRepoTrait: Send {
     ) -> Result<Option<TPartFile>, sqlx::Error>;
 
     /// part_file INSERT（`PartFileRepo::create_part_file`）。
-    async fn part_file_create<'a>(
-        &mut self,
-        nf: NewPartFile<'a>,
-    ) -> Result<i64, sqlx::Error>;
+    async fn part_file_create<'a>(&mut self, nf: NewPartFile<'a>) -> Result<i64, sqlx::Error>;
 
     /// part_file 列表（`PartFileRepo::list_by_owner`）。
     async fn list_part_files_by_owner<'a>(
@@ -261,10 +257,7 @@ pub trait AssemblyRepoTrait: Send {
     ) -> Result<Option<Option<i64>>, sqlx::Error>;
 
     /// L1 → L2 子节点 + 自身展开（recursive CTE）；若入参是 L2 直接返回 `[customer_id]`。
-    async fn expand_customer_l2_ids(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<Vec<i64>, sqlx::Error>;
+    async fn expand_customer_l2_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error>;
 
     /// customer.serial_prefix（用于 PDF 上传序列号派发）。
     async fn fetch_customer_serial_prefix(
@@ -273,10 +266,7 @@ pub trait AssemblyRepoTrait: Send {
     ) -> Result<Option<String>, sqlx::Error>;
 
     /// customer L1 id（`COALESCE(parent_id, id)`，把 L2 叶子转回 L1）。
-    async fn fetch_customer_l1_id(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<Option<i64>, sqlx::Error>;
+    async fn fetch_customer_l1_id(&mut self, customer_id: i64) -> Result<Option<i64>, sqlx::Error>;
 
     /// customer name + parent_id 批量查（防 N+1，`ids` 为空返回空 HashMap）。
     async fn fetch_customer_names_by_ids<'a>(
@@ -289,6 +279,38 @@ pub trait AssemblyRepoTrait: Send {
         &mut self,
         assembly_id: i64,
     ) -> Result<bool, sqlx::Error>;
+
+    // ── 跨域 helper（追加：2026-09-25 补 3 端点）──
+
+    /// 单 part 子件创建（无 serial 派生；用于
+    /// `POST /api/v2/assemblies/{id}/children`）。委托 `PartRepo::create_part`。
+    #[allow(clippy::too_many_arguments)]
+    async fn create_simple_child_part<'a>(
+        &mut self,
+        new: NewPartCreate<'a>,
+    ) -> Result<i64, sqlx::Error>;
+
+    /// 配套初始 `t_part_batch`（batch_no=1 / status='PENDING' / location=NULL）。
+    /// 委托 `PartBatchRepo::create_initial_batch`。
+    async fn create_initial_part_batch<'a>(
+        &mut self,
+        nf: NewInitialBatch<'a>,
+    ) -> Result<i64, sqlx::Error>;
+
+    /// 取客户名 + L1 名（用于 `PartListItem` 冗余字段）；返回 `(name, l1_name)`。
+    /// 客户不存在 → `(None, None)`；自身是 L1 → l1_name == name。
+    async fn lookup_customer_names(
+        &mut self,
+        customer_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error>;
+
+    /// 读回单条 part（按 id，include_deleted 旗标）—— 给 add_assembly_child
+    /// service 在 INSERT 后做 read-back 用（与 PartService::create_part 同形）。
+    async fn get_part_by_id(
+        &mut self,
+        part_id: i64,
+        include_deleted: bool,
+    ) -> Result<Option<TPart>, sqlx::Error>;
 
     /// 反查 part 的 assembly_id（None = part 不存在；Some(None) = part 无父；Some(Some) = 有父）。
     /// 用于 `sync_from_part_change_inner` 短路判断。
@@ -306,7 +328,10 @@ pub trait AssemblyRepoTrait: Send {
 
     /// 序列号派发（`crate::shared::serial::acquire` 的 trait 包装）。
     /// service 不直接调 serial::acquire（后者要 `&mut PgConnection`），故经 trait 收口。
-    async fn acquire_serial(&mut self, prefix: char) -> Result<String, crate::shared::error::AppError>;
+    async fn acquire_serial(
+        &mut self,
+        prefix: char,
+    ) -> Result<String, crate::shared::error::AppError>;
 }
 
 /// 把 `AssemblyRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借 `&mut *tx` 或
@@ -349,10 +374,7 @@ impl AssemblyRepoTrait for &mut PgConnection {
     }
 
     // ── t_assembly writes (3) ──
-    async fn insert<'b>(
-        &mut self,
-        new: NewAssembly<'b>,
-    ) -> Result<i64, sqlx::Error> {
+    async fn insert<'b>(&mut self, new: NewAssembly<'b>) -> Result<i64, sqlx::Error> {
         AssemblyRepo::insert(&mut **self, new).await
     }
 
@@ -375,11 +397,7 @@ impl AssemblyRepoTrait for &mut PgConnection {
     }
 
     // ── t_assembly status transitions (1) ──
-    async fn cancel(
-        &mut self,
-        id: i64,
-        current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    async fn cancel(&mut self, id: i64, current_user_id: i64) -> Result<u64, sqlx::Error> {
         AssemblyRepo::cancel(&mut **self, id, current_user_id).await
     }
 
@@ -553,10 +571,7 @@ impl AssemblyRepoTrait for &mut PgConnection {
         PartFileRepo::get_by_owner_kind_sha(&mut **self, owner_id, kind, sha).await
     }
 
-    async fn part_file_create<'b>(
-        &mut self,
-        nf: NewPartFile<'b>,
-    ) -> Result<i64, sqlx::Error> {
+    async fn part_file_create<'b>(&mut self, nf: NewPartFile<'b>) -> Result<i64, sqlx::Error> {
         PartFileRepo::create_part_file(&mut **self, nf).await
     }
 
@@ -572,12 +587,11 @@ impl AssemblyRepoTrait for &mut PgConnection {
         &mut self,
         assembly_id: i64,
     ) -> Result<Option<i32>, sqlx::Error> {
-        let row: Option<(i32,)> = sqlx::query_as(
-            "SELECT quantity FROM t_assembly WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(assembly_id)
-        .fetch_optional(&mut **self)
-        .await?;
+        let row: Option<(i32,)> =
+            sqlx::query_as("SELECT quantity FROM t_assembly WHERE id = $1 AND deleted_at IS NULL")
+                .bind(assembly_id)
+                .fetch_optional(&mut **self)
+                .await?;
         Ok(row.map(|(q,)| q))
     }
 
@@ -585,8 +599,7 @@ impl AssemblyRepoTrait for &mut PgConnection {
         &mut self,
         part_ids: &'b [i64],
     ) -> Result<std::collections::HashMap<i64, Option<i64>>, sqlx::Error> {
-        let mut out: std::collections::HashMap<i64, Option<i64>> =
-            std::collections::HashMap::new();
+        let mut out: std::collections::HashMap<i64, Option<i64>> = std::collections::HashMap::new();
         if part_ids.is_empty() {
             return Ok(out);
         }
@@ -612,26 +625,21 @@ impl AssemblyRepoTrait for &mut PgConnection {
         &mut self,
         customer_id: i64,
     ) -> Result<Option<Option<i64>>, sqlx::Error> {
-        let row: Option<(Option<i64>,)> = sqlx::query_as(
-            "SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(customer_id)
-        .fetch_optional(&mut **self)
-        .await?;
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL")
+                .bind(customer_id)
+                .fetch_optional(&mut **self)
+                .await?;
         Ok(row.map(|(p,)| p))
     }
 
-    async fn expand_customer_l2_ids(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<Vec<i64>, sqlx::Error> {
+    async fn expand_customer_l2_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error> {
         // 先看自身是不是 L1（parent_id IS NULL） → 是：收集自身 + 所有 L2 子节点；否：仅自身
-        let row: Option<(Option<i64>,)> = sqlx::query_as(
-            "SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(customer_id)
-        .fetch_optional(&mut **self)
-        .await?;
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL")
+                .bind(customer_id)
+                .fetch_optional(&mut **self)
+                .await?;
         match row {
             Some((None,)) => {
                 // L1：递归取所有 L2（用 recursive CTE 一次拿齐）
@@ -664,10 +672,7 @@ impl AssemblyRepoTrait for &mut PgConnection {
         Ok(row.and_then(|(p,)| p))
     }
 
-    async fn fetch_customer_l1_id(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<Option<i64>, sqlx::Error> {
+    async fn fetch_customer_l1_id(&mut self, customer_id: i64) -> Result<Option<i64>, sqlx::Error> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT COALESCE(parent_id, id) FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
         )
@@ -726,12 +731,11 @@ impl AssemblyRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
     ) -> Result<Option<Option<i64>>, sqlx::Error> {
-        let row: Option<(Option<i64>,)> = sqlx::query_as(
-            "SELECT assembly_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(part_id)
-        .fetch_optional(&mut **self)
-        .await?;
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT assembly_id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+                .bind(part_id)
+                .fetch_optional(&mut **self)
+                .await?;
         Ok(row.map(|(a,)| a))
     }
 
@@ -758,5 +762,57 @@ impl AssemblyRepoTrait for &mut PgConnection {
         prefix: char,
     ) -> Result<String, crate::shared::error::AppError> {
         crate::shared::serial::acquire(&mut **self, prefix).await
+    }
+
+    // ── 跨域 helper（追加：2026-09-25 补 3 端点）──────────────────────────
+
+    async fn create_simple_child_part<'b>(
+        &mut self,
+        new: NewPartCreate<'b>,
+    ) -> Result<i64, sqlx::Error> {
+        PartRepo::create_part(&mut **self, new).await
+    }
+
+    async fn create_initial_part_batch<'b>(
+        &mut self,
+        nf: NewInitialBatch<'b>,
+    ) -> Result<i64, sqlx::Error> {
+        PartBatchRepo::create_initial_batch(&mut **self, nf).await
+    }
+
+    async fn lookup_customer_names(
+        &mut self,
+        customer_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        let row: Option<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT name, parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(customer_id)
+        .fetch_optional(&mut **self)
+        .await?;
+        let (name, parent_id) = match row {
+            Some(r) => r,
+            None => return Ok((None, None)),
+        };
+        let l1_name = match parent_id {
+            Some(pid) => {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT name FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
+                )
+                .bind(pid)
+                .fetch_optional(&mut **self)
+                .await?
+            }
+            None => Some(name.clone()),
+        };
+        Ok((Some(name), l1_name))
+    }
+
+    async fn get_part_by_id(
+        &mut self,
+        part_id: i64,
+        include_deleted: bool,
+    ) -> Result<Option<TPart>, sqlx::Error> {
+        PartRepo::get_by_id(&mut **self, part_id, include_deleted).await
     }
 }

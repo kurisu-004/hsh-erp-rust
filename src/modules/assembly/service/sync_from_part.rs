@@ -117,8 +117,7 @@ async fn sync_assembly_status<R: AssemblyRepoTrait>(
         .aggregate_children_status(assembly_id)
         .await
         .map_err(AppError::from)?;
-    let Some(target) = compute_assembly_target(children_statuses.iter().map(|s| s.as_str()))
-    else {
+    let Some(target) = compute_assembly_target(children_statuses.iter().map(|s| s.as_str())) else {
         return Ok(SyncOutcome::NoChange);
     };
 

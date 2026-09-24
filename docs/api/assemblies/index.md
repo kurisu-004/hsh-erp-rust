@@ -21,6 +21,9 @@
 | POST | `/api/v2/assemblies/{assembly_id}/cancel` | Manager / Clerk | 取消（终态 COMPLETED/CANCELLED 禁 cancel；非终态一律可 cancel） | [`cancel.md`](./cancel.md#post-apiv2assembliesassembly_idcancel) |
 | POST | `/api/v2/assemblies/{assembly_id}/start` | Manager / Clerk | **Phase 3（deferred #4）**：PENDING → IN_PROCESS 状态机守卫 | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idstart) |
 | POST | `/api/v2/assemblies/{assembly_id}/files` | Manager / Clerk | **Phase 3（deferred #1）**：multipart PDF 上传到 COS（kind=ASSEMBLY_MASTER） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idfiles) |
+| GET | `/api/v2/assemblies/{assembly_id}/files` | Manager / Clerk / Inspector / CncProgrammer | **2026-09-25（D-09 api-drift-fix）**：列出装配体已上传 PDF（kind=ASSEMBLY_MASTER） | [`crud.md`](./crud.md#get-apiv2assembliesassembly_idfiles) |
+| POST | `/api/v2/assemblies/{assembly_id}/children` | Manager / Clerk | **2026-09-25（D-07 api-drift-fix）**：在已存在装配体下追加单个 part 子件（事务：INSERT t_part + INSERT 初始 t_part_batch） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idchildren) |
+| GET | `/api/v2/parts/{part_id}/assembly` | Manager / Clerk / Inspector / CncProgrammer | **2026-09-25（D-08 api-drift-fix）**：按 part 反查其所属装配体（None 表示无父装配体） | [`crud.md`](./crud.md#get-apiv2partspart_idassembly) |
 
 > 路由顺序：`/{assembly_id}` 必须在 `/{assembly_id}/{action}` 之前注册；当前 `/{assembly_id}` 仅 `GET`，无静态冲突。
 

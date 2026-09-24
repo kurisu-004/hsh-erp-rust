@@ -25,21 +25,24 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use chrono::NaiveDate;
 use rust_decimal::Decimal;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::dto::{
-    AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
+    AssemblyChildAddRequest, AssemblyCreateRequest, AssemblyListQuery, AssemblyUpdateRequest,
 };
 use crate::modules::assembly::model::TAssembly;
-use crate::modules::assembly::repo::{AssemblyRepoTrait, NewAssembly, AssemblyUpdate};
+use crate::modules::assembly::repo::{AssemblyRepoTrait, AssemblyUpdate, NewAssembly};
 use crate::modules::assembly::vo::{
     AssemblyChildOut, AssemblyCreateResult, AssemblyDetail, AssemblyListItem, AssemblyListOut,
     AssemblyOut,
 };
-use crate::modules::part::repo::part::ChildInheritFields;
+use crate::modules::part::batch::repo::NewInitialBatch;
+use crate::modules::part::repo::part::{ChildInheritFields, NewPartCreate};
+use crate::modules::part::vo::PartListItem;
 use crate::shared::error::{AppError, code};
 
 use super::AssemblyService;
@@ -61,7 +64,9 @@ pub(crate) async fn list_assemblies_dispatch(
     query: &AssemblyListQuery,
     current: &CurrentUser,
 ) -> Result<AssemblyListOut, AppError> {
-    AssemblyService.list_assemblies_inner(conn, query, current).await
+    AssemblyService
+        .list_assemblies_inner(conn, query, current)
+        .await
 }
 
 pub(crate) async fn get_assembly_dispatch(
@@ -69,7 +74,9 @@ pub(crate) async fn get_assembly_dispatch(
     assembly_id: i64,
     current: &CurrentUser,
 ) -> Result<AssemblyDetail, AppError> {
-    AssemblyService.get_assembly_inner(conn, assembly_id, current).await
+    AssemblyService
+        .get_assembly_inner(conn, assembly_id, current)
+        .await
 }
 
 pub(crate) async fn create_assembly_dispatch(
@@ -90,7 +97,9 @@ pub(crate) async fn update_assembly_dispatch(
     req: &AssemblyUpdateRequest,
     current: &CurrentUser,
 ) -> Result<AssemblyOut, AppError> {
-    AssemblyService.update_assembly_inner(conn, assembly_id, req, current).await
+    AssemblyService
+        .update_assembly_inner(conn, assembly_id, req, current)
+        .await
 }
 
 pub(crate) async fn soft_delete_assembly_dispatch(
@@ -109,7 +118,23 @@ pub(crate) async fn cancel_assembly_dispatch(
     assembly_id: i64,
     current: &CurrentUser,
 ) -> Result<AssemblyOut, AppError> {
-    AssemblyService.cancel_assembly_inner(conn, assembly_id, current).await
+    AssemblyService
+        .cancel_assembly_inner(conn, assembly_id, current)
+        .await
+}
+
+/// 兼容旧 ZST 静态调用（虽然本端点没有旧测试，保留范式）：追加单个子件。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn add_assembly_child_dispatch(
+    conn: &mut sqlx::PgConnection,
+    snowflake: &SnowflakeIdGenerator,
+    assembly_id: i64,
+    req: &AssemblyChildAddRequest,
+    current: &CurrentUser,
+) -> Result<PartListItem, AppError> {
+    AssemblyService
+        .add_assembly_child_inner(conn, snowflake, assembly_id, req, current)
+        .await
 }
 
 // ---------- helpers ----------
@@ -442,9 +467,7 @@ impl AssemblyService {
                 .fetch_customer_l1_id(customer_id)
                 .await
                 .map_err(AppError::from)?
-                .ok_or_else(|| {
-                    AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在")
-                })?;
+                .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?;
             let prefix_str = repo
                 .fetch_customer_serial_prefix(l1_id)
                 .await
@@ -779,5 +802,112 @@ impl AssemblyService {
             .map_err(AppError::from)?
             .ok_or_else(|| AppError::biz(code::BIZ_ASSEMBLY_NOT_FOUND, "assembly 不存在"))?;
         Ok(render_assembly_out(asm))
+    }
+
+    // =======================================================================
+    // 单 part 子件追加（2026-09-25 新增 D-07 端点）
+    // =======================================================================
+
+    /// 在已存在的装配体下追加单个子件（`POST /assemblies/{id}/children`）。
+    ///
+    /// 子件继承父件 7 个共享信息字段（applicant_name / request_date /
+    /// order_no / system_delivery_date / is_urgent / note / customer_id）；
+    /// `planned_delivery_date` 缺省继承父件。同事务内配套插入初始
+    /// `t_part_batch`（batch_no=1 / status='PENDING' / location=NULL），
+    /// 与 `PartService::create_part` 同语义。
+    ///
+    /// 注意：本端点**不**派生 serial_no —— 已存在装配体追加子件属于「补件」
+    /// 语义，不重新打开序列号派发通道；新子件 `serial_no = NULL`。
+    /// `serial_no` 全局唯一索引允许多条 NULL，不冲突。
+    pub async fn add_assembly_child_inner<R: AssemblyRepoTrait>(
+        &self,
+        mut repo: R,
+        snowflake: &SnowflakeIdGenerator,
+        assembly_id: i64,
+        req: &AssemblyChildAddRequest,
+        current: &CurrentUser,
+    ) -> Result<PartListItem, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+
+        // 1. 校验字段
+        if req.drawing_no.trim().is_empty() || req.name.trim().is_empty() {
+            return Err(AppError::validation("drawing_no / name 均不可为空"));
+        }
+        if req.quantity <= 0 {
+            return Err(AppError::validation("quantity 必须 > 0"));
+        }
+
+        // 2. 装配体存在性（软删视为不存在）
+        let asm = repo
+            .get_by_id(assembly_id, false)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_ASSEMBLY_NOT_FOUND,
+                    format!("assembly {assembly_id} 不存在"),
+                )
+            })?;
+
+        // 3. 派生子件字段（继承父件；planned_delivery_date 子件入参优先，缺省继承父件）
+        let new_part_id = snowflake.next_id();
+        let initial_batch_id = snowflake.next_id();
+        let applicant_name = asm.applicant_name.as_deref().unwrap_or("");
+        let planned_delivery_date: NaiveDate = req
+            .planned_delivery_date
+            .unwrap_or(asm.planned_delivery_date);
+
+        // 4. INSERT t_part（无 serial_no 派生；assembly_id 指向父件）
+        let new = NewPartCreate {
+            id: new_part_id,
+            name: req.name.trim(),
+            drawing_no: req.drawing_no.trim(),
+            applicant_name,
+            quantity: req.quantity,
+            request_date: asm.request_date,
+            planned_delivery_date,
+            is_urgent: asm.is_urgent,
+            customer_id: asm.customer_id,
+            assembly_id: Some(assembly_id),
+            order_no: asm.order_no.as_deref(),
+            system_delivery_date: asm.system_delivery_date,
+            note: asm.note.as_deref(),
+            created_by: current.id,
+        };
+        repo.create_simple_child_part(new)
+            .await
+            .map_err(AppError::from)?;
+
+        // 5. INSERT 初始 t_part_batch（同事务；与 PartService::create_part 对齐）
+        repo.create_initial_part_batch(NewInitialBatch {
+            id: initial_batch_id,
+            part_id: new_part_id,
+            quantity: req.quantity,
+            location: None,
+            created_by: Some(current.id),
+        })
+        .await
+        .map_err(AppError::from)?;
+
+        // 6. 读回（含 status/version/timestamps）
+        let part_t = repo
+            .get_part_by_id(new_part_id, true)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "新建 part 查不到"))?;
+
+        // 7. customer_name + l1_customer_name 冗余
+        let (cn, l1cn) = repo
+            .lookup_customer_names(asm.customer_id)
+            .await
+            .map_err(AppError::from)?;
+
+        Ok(PartListItem {
+            part: part_t,
+            customer_name: cn,
+            l1_customer_name: l1cn,
+            location: None,
+            holder_name: None,
+        })
     }
 }

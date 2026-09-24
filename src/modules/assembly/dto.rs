@@ -14,8 +14,8 @@
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use serde::Deserializer;
-use serde::{Deserialize};
 
 // ---------- 入参 ----------
 
@@ -54,6 +54,21 @@ pub struct AssemblyChildRequest {
 
 fn default_child_qty() -> Option<i32> {
     Some(1)
+}
+
+/// `POST /api/v2/assemblies/{assembly_id}/children` 入参（2026-09-25 新增）。
+///
+/// 在已存在的装配体下追加单个子件：子件继承父件 7 个共享信息字段
+///（applicant_name / request_date / order_no / system_delivery_date /
+/// is_urgent / note / customer_id），planned_delivery_date 缺省继承父件。
+/// quantity 必填（> 0）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssemblyChildAddRequest {
+    pub drawing_no: String,
+    pub name: String,
+    #[serde(default)]
+    pub planned_delivery_date: Option<NaiveDate>,
+    pub quantity: i32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

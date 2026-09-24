@@ -19,6 +19,7 @@ use serde_json::json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
+use crate::modules::assembly::vo::AssemblyDetail;
 use crate::modules::part::dto::InspectionBatchListQuery;
 use crate::modules::part::dto_crud::{
     BatchUpdateOrderInfoRequest, MatchByExcelItemsRequest, PartCreateRequest, PartListQuery,
@@ -141,6 +142,34 @@ pub async fn get_by_serial_part_batches(
     current.require_any_role(LIST_PART_ROLES)?;
     let mut conn = state.pool.acquire().await?;
     let out = PartService::get_part_batches_by_serial(&mut *conn, &serial_no, &current).await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `GET /api/v2/parts/{part_id}/assembly` → 200 OK
+///
+/// 2026-09-25 新增（D-08 api-drift-fix）：按 part 反查其所属装配体。
+///
+/// 行为：
+/// - 权限：Manager / Clerk / Inspector / CncProgrammer（4 角色全开放，与
+///   `GET /assemblies/{id}` 对齐）
+/// - 读端点：不开事务（`pool.acquire()`）
+/// - 业务流转：service 层 `get_assembly_by_part`：
+///   1. `part` 不存在 → `20101 PART_NOT_FOUND`（HTTP 404）
+///   2. `part.assembly_id IS NULL` → 返回 `null`（无父装配体）
+///   3. 否则委托 assembly service `get_assembly` 拿 AssemblyDetail
+/// - 响应：`R<Option<AssemblyDetail>>` —— 前端拿 `null` 表示 part 不属于任何装配体
+///
+/// 设计意图：路由注册在 `part::router()`（而不是 `part_file` 等其它 nest 下），
+/// 是因为前端 API 客户端（`src/api/assembly.ts:30`）直接走 `parts/{part_id}/assembly`
+/// 路径，避免前端再加一层 `assembly/part/{id}` 的间接寻址。
+pub async fn get_assembly_by_part(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+) -> Result<Json<R<Option<AssemblyDetail>>>, AppError> {
+    current.require_any_role(LIST_PART_ROLES)?;
+    let mut conn = state.pool.acquire().await?;
+    let out = PartService::get_assembly_by_part(&mut *conn, part_id, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
