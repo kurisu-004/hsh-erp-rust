@@ -8,100 +8,68 @@
 //! - submit DRAFT only（SUBMITTED 状态再 submit → 400）
 //! - soft-delete 仅 DRAFT / REJECTED 可删
 //! - duplicate 同 (part, company, process) → 409
+//!
+//! ## 集成测试范本（PR13 Phase H，2026-09-24）
+//! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
+//! 通用 `login_*` helper，统一走
+//! `use hsh_erp_test_support::{...}` + `bootstrap_as_manager()` /
+//! `bootstrap_as_clerk()` + `load_outsource_fixture(&pool)`。保留：
+//! - `seed_outsource_process` / `insert_l1_customer` / `insert_part` /
+//!   `insert_company` / `setup_basic`：quote 域独享（每个测试要按需造不同
+//!   customer prefix / 不同 process code / 不同 company name 的组合；
+//!   fixture 预置的 FX-OPROC-A 仅作 baseline 共享）；
+//! - 域独享 helper 不从 `fixtures` 模块 `use`（Phase H gate 5 禁止）；
+//!   本地 helper 用 `sqlx::query` 直插与 fixtures::* 同形 SQL。
+//!
+//! ## 不预置 t_outsource_quote / t_part / t_part_batch
+//! 状态机不允许从 APPROVED 回退 DRAFT / REJECTED，且每个测试都要按需造不同
+//! (part, company, process) 组合的 quote；预置会污染「期望空库」list 断言。
 
-#[path = "../common/mod.rs"]
-mod common;
-
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
-use serde_json::{Value, json};
+use axum::http::StatusCode;
+use serde_json::json;
 use sqlx::PgPool;
-use tower::ServiceExt;
 
-use common::{
-    add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
-    test_app, test_pool, test_state,
+use hsh_erp_test_support::{
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app,
+    test_pool, test_state,
 };
+use hsh_erp_rust::infra::clock::now_naive;
+use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
-//  Helpers
+//  Bootstrap helpers（PR13 Phase H 风格）
 // ===========================================================================
 
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let uri = req.uri().to_string();
-    let method = req.method().to_string();
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let body_str = String::from_utf8_lossy(&body).to_string();
-    let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!("parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}")
-    });
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 outsource fixture + 以 MANAGER 身份登录。
+///
+/// 返回 `(pool, app, token, fx)`。绝大多数 quote 测试以 MANAGER 身份跑。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, OutsourceFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_outsource_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.part_manager_username, OutsourceFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
-async fn login(pool: PgPool, username: &str, role: &str) -> (axum::Router, String) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, role, None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token)
+/// 起一份 fresh database + 加载 outsource fixture + 以 CLERK 身份登录。
+///
+/// 仅 `approve_quote_clerk_forbidden_40300` 使用，验证 CLERK 拒绝 approve。
+async fn bootstrap_as_clerk() -> (PgPool, axum::Router, String, OutsourceFixture) {
+    let pool = test_pool().await;
+    let fx = load_outsource_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.clerk_username, OutsourceFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
-    login(pool, username, "MANAGER").await
-}
-
-async fn login_clerk(pool: PgPool, username: &str) -> (axum::Router, String) {
-    login(pool, username, "CLERK").await
-}
+// ===========================================================================
+//  quote 域独享 helpers（绕开 fixtures::* 因为 Phase H gate 5 禁止从 `fixtures`
+//  模块 use 任何动态 helper）
+// ===========================================================================
 
 /// 直插客户（L1）—— 绕开 customer CRUD。
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -120,8 +88,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 
 /// 直插 part（PENDING）—— 绕开 part CRUD。
 async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -143,8 +110,7 @@ async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
 
 /// 直插 OUTSOURCE 类别 process。
 async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -164,8 +130,7 @@ async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 
 /// 直插外协公司。
 async fn insert_company(pool: &PgPool, name: &str, is_active: bool) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -198,8 +163,7 @@ async fn setup_basic(pool: &PgPool) -> (i64, i64, i64) {
 
 #[tokio::test]
 async fn create_quote_draft_happy() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "q_admin").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
     let (s, env) = send(
@@ -224,8 +188,7 @@ async fn create_quote_draft_happy() {
 
 #[tokio::test]
 async fn create_quote_duplicate_returns_21303() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "q_dup").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
     let body = json!({
@@ -255,8 +218,7 @@ async fn create_quote_duplicate_returns_21303() {
 
 #[tokio::test]
 async fn quote_full_lifecycle_draft_submit_approve() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "q_life").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
     // create
@@ -311,10 +273,9 @@ async fn quote_full_lifecycle_draft_submit_approve() {
 
 #[tokio::test]
 async fn approve_quote_clerk_forbidden_40300() {
-    let pool = setup().await;
-    let (app_mgr, m_token) = login_manager(pool.clone(), "q_clerk_mgr").await;
-    let (app_clerk, c_token) = login_clerk(pool.clone(), "q_clerk").await;
-    let (pid, cid, proc_id) = setup_basic(&pool).await;
+    let (pool_mgr, app_mgr, m_token, _fx) = bootstrap_as_manager().await;
+    let (_pool_clerk, app_clerk, c_token, _fx_clerk) = bootstrap_as_clerk().await;
+    let (pid, cid, proc_id) = setup_basic(&pool_mgr).await;
 
     // create via manager
     let (_, env_c) = send(
@@ -339,7 +300,7 @@ async fn approve_quote_clerk_forbidden_40300() {
          version=version+1 WHERE id=$1",
     )
     .bind(qid.parse::<i64>().unwrap())
-    .execute(&pool)
+    .execute(&pool_mgr)
     .await
     .unwrap();
 
@@ -360,8 +321,7 @@ async fn approve_quote_clerk_forbidden_40300() {
 
 #[tokio::test]
 async fn reject_quote_requires_review_note() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "q_rej").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
     let (_, env_c) = send(
@@ -420,8 +380,7 @@ async fn reject_quote_requires_review_note() {
 
 #[tokio::test]
 async fn submit_quote_wrong_status_returns_21302() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "q_ws").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
 
     let (_, env_c) = send(
@@ -468,8 +427,7 @@ async fn submit_quote_wrong_status_returns_21302() {
 
 #[tokio::test]
 async fn soft_delete_quote_approved_forbidden() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "q_sd").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let (pid, cid, proc_id) = setup_basic(&pool).await;
     let (_, env_c) = send(
         app.clone(),

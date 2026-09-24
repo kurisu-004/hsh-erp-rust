@@ -15,93 +15,71 @@
 //!
 //! ## clippy allow
 //! 2026-09-16 PR-3：fixture helper（`insert_pool_part` / `insert_work_type` /
-//! `insert_worker` / `insert_l2_customer` 等）走 `pool_snowflake().lock()` 跨 .await
+//!  `insert_worker` / `insert_l2_customer` 等）走 `pool_snowflake().lock()` 跨 .await
 //! 持锁模式，与 common/ + worker_pool_api.rs 一致；`unused_imports` 是顶层
-//! `use SnowflakeIdGenerator` 仅作类型签名引用。
+//!  `use SnowflakeIdGenerator` 仅作类型签名引用。
 //! 2026-09-23 PR13 Phase D：`#![allow]` 已在 tests/production/mod.rs 集中豁免，
 //! 本文件移除。
+//!
+//! ## 集成测试范本（PR13 Phase H，2026-09-24）
+//! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
+//! 通用 `login_manager` helper，统一走 `use hsh_erp_test_support::{...}` +
+//! `bootstrap_as_manager()` + `load_production_fixture(&pool)`。保留：
+//! - `login_manager_with_username`：本 sub-file 独享（每次用不同 username 登入）
+//! - `insert_work_type` / `insert_worker` / `insert_customer_l2` / `insert_pool_part`：
+//!   本 sub-file 独享的 raw SQL 构造（auto_allocate 域 max_held_minutes 字段
+//!   是 worker_pool.rs 的 helper 没覆盖的额外字段，跨 binary 不通用）
 
-#[path = "../common/mod.rs"]
-mod common;
-
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
-use serde_json::{Value, json};
+use axum::http::StatusCode;
+use serde_json::json;
 use sqlx::PgPool;
-use tower::ServiceExt;
 
-use common::{
-    add_role, insert_user_with_password, link_shelf_to_process, link_work_type_to_process,
-    seed_process, test_app, test_state,
+use hsh_erp_test_support::{
+    ProductionFixture, add_role, insert_shelf, insert_user_with_password, json_request,
+    link_shelf_to_process, link_work_type_to_process, load_production_fixture, login_token,
+    pool_snowflake, seed_process, send, test_app, test_state, test_pool,
 };
 
 // ===========================================================================
-//  全局串行化 + HTTP helpers
+//  Bootstrap helpers（PR13 Phase H 风格）
 // ===========================================================================
 
-
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body)));
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 production fixture + 以 MANAGER 身份登录。
+///
+/// 返回 `(pool, app, token, fx)`。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProductionFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_production_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.part_manager_username, ProductionFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
+/// MANAGER user：以新 username 登入 + MANAGER role（不影响 fixture 的 fx_part_manager）。
+///
+/// 本 sub-file 独享：每个测试常需要多次以不同 username 登入。
+async fn login_manager_with_username(
+    pool: &PgPool,
+    username: &str,
+) -> (axum::Router, String) {
+    let uid = insert_user_with_password(pool, username, "changeme").await;
+    add_role(pool, uid, "MANAGER", None, None).await;
     let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
+    let req = json_request(
+        "POST",
+        "/iam/login",
+        Some(json!({"username": username, "password": "changeme"})),
+        None,
+    );
+    let (_, env) = send(app, req).await;
     let token = env["data"]["token"].as_str().unwrap().to_string();
     let app2 = test_app(state);
-    (app2, token, pool)
+    (app2, token)
 }
 
 // ===========================================================================
-//  worker-pool auto_allocate fixture helpers
+//  worker-pool auto_allocate fixture helpers（本 sub-file 独享，跨 binary 不迁移）
 // ===========================================================================
 
 async fn insert_work_type(
@@ -112,7 +90,7 @@ async fn insert_work_type(
     max_held_minutes: Option<i32>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake()
+    let snowflake = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
@@ -141,7 +119,7 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake()
+    let snowflake = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
@@ -162,32 +140,35 @@ async fn insert_worker(
     id
 }
 
-async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
+async fn insert_customer_l2(pool: &PgPool, name: &str) -> i64 {
+    // 2026-09-24 PR13 Phase H：插 L2 叶子客户（parent_id=fx_part_customer_l1_id=10，
+    // serial_prefix=NULL），不再插根客户。原版插根客户（parent_id=NULL + serial_prefix='P'
+    // 之类），与 part fixture 的 CUSTOMER_L1_ID=10 (prefix='P') 撞
+    // `uq_t_customer_root_prefix`（parent_id IS NULL + serial_prefix 全局活跃唯一）。
+    //
+    // 用 `sqlx::query`（runtime）而非 `query!`：SQL 与原版 query! 不同（parent_id 改
+    // 为 fixture L1），改 query! 会触发 sqlx::prepare 重新生成 .sqlx cache（会清掉同
+    // worktree 其它测试文件仍在用的离线 metadata）。
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake()
+    let snowflake = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let id = snowflake.next_id();
+    let l2_id = snowflake.next_id();
     let now = now_naive();
-    let one_char: String = prefix
-        .chars()
-        .next()
-        .unwrap_or('X')
-        .to_ascii_uppercase()
-        .to_string();
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, NULL, $3, 0, $4, $4)",
-        id,
-        prefix,
-        one_char,
-        now,
+         VALUES ($1, $2, $3, NULL, 0, $4, $4)",
     )
+    .bind(l2_id)
+    .bind(name)
+    // PartFixture::CUSTOMER_L1_ID 字面值（来自 part.sql 第 46 行）
+    .bind(9_000_000_000_000_000_010_i64)
+    .bind(now)
     .execute(pool)
     .await
-    .expect("insert L1");
-    id
+    .expect("insert L2 customer under fixture L1");
+    l2_id
 }
 
 async fn insert_pool_part(
@@ -201,14 +182,14 @@ async fn insert_pool_part(
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     let today = now.date();
-    let part_id = common::pool_snowflake()
+    let part_id = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
     // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
     // 且 batch 持有 current_process_step_id（worker.match 走 step.process_id）。
     // helper 现在多走两步：建链 → 建 step → INSERT part/batch。
-    let chain_id = common::pool_snowflake()
+    let chain_id = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
@@ -222,7 +203,7 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert chain");
-    let step_id = common::pool_snowflake()
+    let step_id = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
@@ -257,7 +238,7 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert t_part");
-    let batch_id = common::pool_snowflake()
+    let batch_id = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
@@ -289,12 +270,12 @@ async fn insert_pool_part(
 /// 场景 1: COUNT mode happy —— fill_ratio=1.0 抢满 max_held_batches
 #[tokio::test]
 async fn auto_allocate_count_mode_full_fill() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "AC1").await;
     let proc = seed_process(&pool, "PROC-AC1", "工序").await;
     let wt = insert_work_type(&pool, "WT-AC1", "工种", Some(5), None).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let shelf = common::insert_shelf(&pool, "PROD-AC1", "PROD-AC1", "PRODUCTION").await;
+    let shelf = insert_shelf(&pool, "PROD-AC1", "PROD-AC1", "PRODUCTION").await;
     link_shelf_to_process(&pool, shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC-AC1", "工", Some(wt)).await;
@@ -303,7 +284,7 @@ async fn auto_allocate_count_mode_full_fill() {
         insert_pool_part(&pool, customer, &sn, shelf, proc, 1).await;
     }
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_ac1").await;
+    let (app, token) = login_manager_with_username(&pool, "mgr_ac1").await;
     let (s, env) = send(
         app,
         json_request(
@@ -335,12 +316,12 @@ async fn auto_allocate_count_mode_full_fill() {
 /// 场景 2: COUNT mode fill_ratio=0 → 抢 0 个
 #[tokio::test]
 async fn auto_allocate_count_mode_zero_fill() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "AC2").await;
     let proc = seed_process(&pool, "PROC-AC2", "工序").await;
     let wt = insert_work_type(&pool, "WT-AC2", "工种", Some(10), None).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let shelf = common::insert_shelf(&pool, "PROD-AC2", "PROD-AC2", "PRODUCTION").await;
+    let shelf = insert_shelf(&pool, "PROD-AC2", "PROD-AC2", "PRODUCTION").await;
     link_shelf_to_process(&pool, shelf, proc).await;
 
     let _worker = insert_worker(&pool, "BC-AC2", "工", Some(wt)).await;
@@ -349,7 +330,7 @@ async fn auto_allocate_count_mode_zero_fill() {
         insert_pool_part(&pool, customer, &sn, shelf, proc, 1).await;
     }
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_ac2").await;
+    let (app, token) = login_manager_with_username(&pool, "mgr_ac2").await;
     let (s, env) = send(
         app,
         json_request(
@@ -380,17 +361,17 @@ async fn auto_allocate_count_mode_zero_fill() {
 /// 但本测试场景下池里只放 1 件，pool_empty=true 即可；target 数值仍按 60 验证。）
 #[tokio::test]
 async fn auto_allocate_time_mode_target_calc() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-AC3", "工序").await;
     // TIME 模式需要 max_held_minutes 设置；同时为兼容 take_one_from_pool CTE 也设 max_held_batches
     let wt = insert_work_type(&pool, "WT-AC3", "工种", Some(5), Some(120)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let shelf = common::insert_shelf(&pool, "PROD-AC3", "PROD-AC3", "PRODUCTION").await;
+    let shelf = insert_shelf(&pool, "PROD-AC3", "PROD-AC3", "PRODUCTION").await;
     link_shelf_to_process(&pool, shelf, proc).await;
 
     let _worker = insert_worker(&pool, "BC-AC3", "工", Some(wt)).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_ac3").await;
+    let (app, token) = login_manager_with_username(&pool, "mgr_ac3").await;
     let (s, env) = send(
         app,
         json_request(
@@ -417,19 +398,19 @@ async fn auto_allocate_time_mode_target_calc() {
 /// 场景 4: TIME mode 但 max_held_minutes IS NULL → 20703
 #[tokio::test]
 async fn auto_allocate_time_mode_minutes_not_set() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "AC4").await;
     let proc = seed_process(&pool, "PROC-AC4", "工序").await;
     // max_held_batches 也设，max_held_minutes NULL
     let wt = insert_work_type(&pool, "WT-AC4", "工种", Some(5), None).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let shelf = common::insert_shelf(&pool, "PROD-AC4", "PROD-AC4", "PRODUCTION").await;
+    let shelf = insert_shelf(&pool, "PROD-AC4", "PROD-AC4", "PRODUCTION").await;
     link_shelf_to_process(&pool, shelf, proc).await;
 
     let _worker = insert_worker(&pool, "BC-AC4", "工", Some(wt)).await;
     insert_pool_part(&pool, customer, "AC4-P-001", shelf, proc, 1).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_ac4").await;
+    let (app, token) = login_manager_with_username(&pool, "mgr_ac4").await;
     let (s, env) = send(
         app,
         json_request(
@@ -459,11 +440,11 @@ async fn auto_allocate_time_mode_minutes_not_set() {
 /// 场景 5: fill_ratio > 1.0 → 20704
 #[tokio::test]
 async fn auto_allocate_rejects_ratio_above_one() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-AC5", "工序").await;
-    let shelf = common::insert_shelf(&pool, "PROD-AC5", "PROD-AC5", "PRODUCTION").await;
+    let shelf = insert_shelf(&pool, "PROD-AC5", "PROD-AC5", "PRODUCTION").await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_ac5").await;
+    let (app, token) = login_manager_with_username(&pool, "mgr_ac5").await;
     let (s, env) = send(
         app,
         json_request(
@@ -486,11 +467,11 @@ async fn auto_allocate_rejects_ratio_above_one() {
 /// 场景 5b: fill_ratio < 0.0 → 20704
 #[tokio::test]
 async fn auto_allocate_rejects_negative_ratio() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-AC5B", "工序").await;
-    let shelf = common::insert_shelf(&pool, "PROD-AC5B", "PROD-AC5B", "PRODUCTION").await;
+    let shelf = insert_shelf(&pool, "PROD-AC5B", "PROD-AC5B", "PRODUCTION").await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_ac5b").await;
+    let (app, token) = login_manager_with_username(&pool, "mgr_ac5b").await;
     let (s, env) = send(
         app,
         json_request(
@@ -513,17 +494,17 @@ async fn auto_allocate_rejects_negative_ratio() {
 /// 场景 6: 池空 → pool_empty=true
 #[tokio::test]
 async fn auto_allocate_pool_empty() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-AC6", "工序").await;
     let wt = insert_work_type(&pool, "WT-AC6", "工种", Some(5), None).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let shelf = common::insert_shelf(&pool, "PROD-AC6", "PROD-AC6", "PRODUCTION").await;
+    let shelf = insert_shelf(&pool, "PROD-AC6", "PROD-AC6", "PRODUCTION").await;
     link_shelf_to_process(&pool, shelf, proc).await;
 
     let _worker = insert_worker(&pool, "BC-AC6", "工", Some(wt)).await;
     // 不插任何 pool_part
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_ac6").await;
+    let (app, token) = login_manager_with_username(&pool, "mgr_ac6").await;
     let (s, env) = send(
         app,
         json_request(
@@ -548,11 +529,11 @@ async fn auto_allocate_pool_empty() {
 /// 场景 7: process_id 不存在 → 20801
 #[tokio::test]
 async fn auto_allocate_process_not_found() {
-    let pool = setup().await;
-    let shelf = common::insert_shelf(&pool, "PROD-AC7", "PROD-AC7", "PRODUCTION").await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let shelf = insert_shelf(&pool, "PROD-AC7", "PROD-AC7", "PRODUCTION").await;
     let nonexistent: i64 = 9_999_999_999_999;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "mgr_ac7").await;
+    let (app, token) = login_manager_with_username(&pool, "mgr_ac7").await;
     let (s, env) = send(
         app,
         json_request(

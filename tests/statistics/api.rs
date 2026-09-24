@@ -7,12 +7,25 @@
 //!   4. worker_detail_happy_path    — MANAGER 调 worker detail
 //!   5. pickup_skips_summary        — MANAGER 调 pickup-skips summary
 //!   6. pickup_skip_detail          — MANAGER 调 pickup-skips detail（分页）
-
-#[path = "../common/mod.rs"]
-mod common;
+//!
+//! ## 集成测试范本（PR13 Phase H，2026-09-24）
+//! 本文件按 Phase F 范本收敛：删除 `clean_db` / `clean_business_db` /
+//! `ensure_database_exists` 三件套调用（`test_pool()` 走 fresh_database_url，
+//! 进程级 plan 2 隔离天然给出空库，无需手动 clean），统一走
+//! `use hsh_erp_test_support::{...}` + `load_statistics_fixture(&pool)`。
+//! 保留本地 helper `insert_work_type` / `insert_worker` / `insert_part` /
+//! `insert_l1_customer` / `insert_l2_customer`：statistics 域测试每个用例
+//! 都要按需造不同 code / badge / prefix / name 的行（与 fixture 预置的
+//! FX-WT-STAT / FX-W-STAT baseline 不同），保留本地 fn 直插。
+//!
+//! ## 不预置 part / batch / event / pickup_skip_event
+//! statistics 域状态机不允许从 IN_PROCESS / COMPLETED 回退 PENDING，且事件行
+//! (event_type / worker_id / created_at) 由测试现场按场景构造，fixture 故不
+//! 预置这些行，保留为本地 fn 直插以避免污染「期望空库」断言。
 
 use chrono::NaiveDate;
-use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
+
+use hsh_erp_test_support::{load_statistics_fixture, test_pool};
 
 #[allow(unused_imports)]
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
@@ -21,13 +34,24 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::statistics::service::StatisticsService;
 use sqlx::PgPool;
 
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
+// ===========================================================================
+//  Bootstrap helpers（PR13 Phase H 风格）
+// ===========================================================================
+
+/// 起一份 fresh database + 加载 statistics fixture，返回 `(pool, fx)`。
+///
+/// service 层直调用例不需要 `app` / `token`（不走 HTTP），故 bootstrap 只返
+/// `(pool, fx)`；`fx` 暴露 baseline ID（WORK_TYPE_ID / WORKER_ID 等）供
+/// 偶发复用场景使用，绝大多数用例仍走本地 helper 自建不同 code / prefix。
+async fn setup() -> (PgPool, hsh_erp_test_support::fixture::StatisticsFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_statistics_fixture(&pool).await;
+    (pool, fx)
 }
+
+// ===========================================================================
+//  statistics 域独享 helper（按场景造不同 code / badge / prefix / name）
+// ===========================================================================
 
 async fn insert_work_type(pool: &PgPool, code: &str, name: &str) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -129,7 +153,7 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
 
 #[tokio::test]
 async fn overview_happy_path() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     // 插一条 part 让 created_count > 0
     let l1 = insert_l1_customer(&pool, "客户S-1", "F").await;
     let l2 = insert_l2_customer(&pool, l1, "子客S-1").await;
@@ -155,7 +179,7 @@ async fn overview_happy_path() {
 
 #[tokio::test]
 async fn overview_invalid_date_range_returns_400() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let mut tx = pool.begin().await.unwrap();
     let err = StatisticsService
         .overview(
@@ -176,7 +200,7 @@ async fn overview_invalid_date_range_returns_400() {
 
 #[tokio::test]
 async fn workers_stats_happy_path() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let wt = insert_work_type(&pool, "WT-S", "机加工").await;
     let w1 = insert_worker(&pool, "B001", "张三", Some(wt)).await;
     let w2 = insert_worker(&pool, "B002", "李四", Some(wt)).await;
@@ -247,7 +271,7 @@ async fn workers_stats_happy_path() {
 
 #[tokio::test]
 async fn worker_detail_happy_path() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let wt = insert_work_type(&pool, "WT-D", "焊工").await;
     let w_id = insert_worker(&pool, "B003", "王五", Some(wt)).await;
     let l1 = insert_l1_customer(&pool, "客户S-3", "F").await;
@@ -289,7 +313,7 @@ async fn worker_detail_happy_path() {
 
 #[tokio::test]
 async fn pickup_skips_summary_happy_path() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let wt = insert_work_type(&pool, "WT-SK", "车工").await;
     let w_id = insert_worker(&pool, "B004", "跳序工", Some(wt)).await;
     let l1 = insert_l1_customer(&pool, "客户S-4", "F").await;
@@ -337,7 +361,7 @@ async fn pickup_skips_summary_happy_path() {
 
 #[tokio::test]
 async fn pickup_skip_detail_happy_path() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let wt = insert_work_type(&pool, "WT-SD", "铣工").await;
     let w_id = insert_worker(&pool, "B005", "跳序工D", Some(wt)).await;
     let l1 = insert_l1_customer(&pool, "客户S-5", "F").await;
@@ -393,7 +417,7 @@ async fn pickup_skip_detail_happy_path() {
 async fn count_in_process_at_date_to_boundary() {
     use hsh_erp_rust::modules::statistics::repo::sql as statistics_sql;
 
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let l1 = insert_l1_customer(&pool, "客户S-6", "F").await;
     let l2 = insert_l2_customer(&pool, l1, "子客S-6").await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);

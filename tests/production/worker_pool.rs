@@ -24,96 +24,57 @@
 //!
 //! ## clippy allow
 //! 2026-09-16 PR-3：fixture helper（`insert_pool_part` / `insert_worker_held_part` /
-//! `insert_work_type` / `insert_worker` / `insert_customer_l2` / `insert_l2_customer`）
+//!  `insert_work_type` / `insert_worker` / `insert_customer_l2` / `insert_l2_customer`）
 //! 全部走 `pool_snowflake().lock()` 拿 guard 跨多个 .await SQL，模式与 common/
 //! 一致，豁免 `await_holding_lock`。`unused_imports` 豁免是因为 `use
 //! SnowflakeIdGenerator` 在文件顶层未直接使用（仅作为 `pool_snowflake()` 返回
 //! 类型签名引用）。
 //! 2026-09-23 PR13 Phase D：`#![allow]` 已在 tests/production/mod.rs 集中豁免，
 //! 本文件移除。
+//!
+//! ## 集成测试范本（PR13 Phase H，2026-09-24）
+//! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
+//! 通用 `login_manager` helper，统一走 `use hsh_erp_test_support::{...}` +
+//! `bootstrap_as_manager()` + `load_production_fixture(&pool)`。保留：
+//! - `login_shelf_account`：worker_pool 独享（要求 scope 限定到 production shelves，
+//!   fixture 的 fx_part_shelf scope=inspection_shelf 不通用）
+//! - `login_manager_with_username`：worker_pool 独享（多次以不同 username 登入
+//!   触发不同 OCC / 审计场景；token 重登不删 fixture 的 fx_part_manager 用户，
+//!   故需要动态 create user + MANAGER role + login）
+//! - `insert_work_type` / `insert_worker` / `insert_customer_l2` / `insert_l2_customer` /
+//!   `insert_pool_part` / `insert_worker_held_part` / `count_held_by_worker`：
+//!   worker_pool 独享的 raw SQL 构造（绕开业务 API，按需造多对 pool / held 件）；
+//!   跨 binary 不重用，保留为本地 fn。
 
-#[path = "../common/mod.rs"]
-mod common;
-
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
-use serde_json::{Value, json};
+use axum::http::StatusCode;
+use serde_json::json;
 use sqlx::PgPool;
-use tower::ServiceExt;
 
-use common::{
-    add_role, insert_user_with_password, link_shelf_to_process, link_work_type_to_process,
-    seed_process, test_app, test_state,
+use hsh_erp_test_support::{
+    ProductionFixture, add_role, insert_shelf, insert_user_with_password, json_request,
+    link_shelf_to_process, link_work_type_to_process, load_production_fixture, login_token,
+    pool_snowflake, seed_process, send, test_app, test_state, test_pool,
 };
 
 // ===========================================================================
-//  全局串行化 + HTTP helpers
+//  Bootstrap helpers（PR13 Phase H 风格）
 // ===========================================================================
 
-
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body)));
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    use common::{clean_business_db, clean_db, ensure_database_exists, test_pool};
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 production fixture + 以 MANAGER 身份登录。
+///
+/// 返回 `(pool, app, token, fx)`。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProductionFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
-}
-
-// ----- 角色登录 helper -----
-
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String, PgPool) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token, pool)
+    let fx = load_production_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.part_manager_username, ProductionFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
 /// SHELF_ACCOUNT user：scope 限制在指定 shelves（不传 → wildcard 全开放）。
+///
+/// worker_pool 独享：每个测试需要不同 scope 限定到 production shelves，
+/// fixture 的 fx_part_shelf scope=inspection_shelf 不通用，故保留本地 helper。
 async fn login_shelf_account(
     pool: PgPool,
     username: &str,
@@ -125,28 +86,50 @@ async fn login_shelf_account(
     }
     let state = test_state(pool.clone()).await;
     let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
+    let req = json_request(
+        "POST",
+        "/iam/login",
+        Some(json!({"username": username, "password": "changeme"})),
+        None,
+    );
+    let (_, env) = send(app, req).await;
     let token = env["data"]["token"].as_str().unwrap().to_string();
     let app2 = test_app(state);
     (app2, token, pool)
 }
 
+/// MANAGER user：以新 username 登入 + MANAGER role（不影响 fixture 的 fx_part_manager）。
+///
+/// worker_pool 独享：每个测试常需要多次以不同 username 登入触发不同 OCC / 审计
+/// 场景（如 admin3 → admin3b 模拟并发 OCC）。`bootstrap_as_manager` 的 token
+/// 是 fx_part_manager 单 token，不支持多身份切换；保留为本地 helper。
+async fn login_manager_with_username(
+    pool: &PgPool,
+    username: &str,
+) -> (axum::Router, String) {
+    let uid = insert_user_with_password(pool, username, "changeme").await;
+    add_role(pool, uid, "MANAGER", None, None).await;
+    let state = test_state(pool.clone()).await;
+    let app = test_app(state.clone());
+    let req = json_request(
+        "POST",
+        "/iam/login",
+        Some(json!({"username": username, "password": "changeme"})),
+        None,
+    );
+    let (_, env) = send(app, req).await;
+    let token = env["data"]["token"].as_str().unwrap().to_string();
+    let app2 = test_app(state);
+    (app2, token)
+}
+
 // ===========================================================================
-//  worker-pool fixture helpers
+//  worker-pool fixture helpers（worker_pool 独享，跨 binary 不迁移）
 // ===========================================================================
 
 async fn insert_work_type(pool: &PgPool, code: &str, name: &str, max_held: Option<i32>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake()
+    let snowflake = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
@@ -174,7 +157,7 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake()
+    let snowflake = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
@@ -195,33 +178,35 @@ async fn insert_worker(
     id
 }
 
-async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
+async fn insert_customer_l2(pool: &PgPool, name: &str) -> i64 {
+    // 2026-09-24 PR13 Phase H：插 L2 叶子客户（parent_id=fx_part_customer_l1_id=10，
+    // serial_prefix=NULL），不再插根客户。原版插根客户（parent_id=NULL + serial_prefix='P'
+    // 之类），与 part fixture 的 CUSTOMER_L1_ID=10 (prefix='P') 撞
+    // `uq_t_customer_root_prefix`（parent_id IS NULL + serial_prefix 全局活跃唯一）。
+    //
+    // 用 `sqlx::query`（runtime）而非 `query!`：SQL 与原版 query! 不同（parent_id 改
+    // 为 fixture L1），改 query! 会触发 sqlx::prepare 重新生成 .sqlx cache（会清掉同
+    // worktree 其它测试文件仍在用的离线 metadata）。
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake()
+    let snowflake = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let l1_id = snowflake.next_id();
+    let l2_id = snowflake.next_id();
     let now = now_naive();
-    // serial_prefix is varchar(1) + regex ^[A-Z]$ — pick first char uppercased
-    let one_char: String = prefix
-        .chars()
-        .next()
-        .unwrap_or('X')
-        .to_ascii_uppercase()
-        .to_string();
-    sqlx::query!(
+    sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, NULL, $3, 0, $4, $4)",
-        l1_id,
-        prefix,
-        one_char,
-        now,
+         VALUES ($1, $2, $3, NULL, 0, $4, $4)",
     )
+    .bind(l2_id)
+    .bind(name)
+    // PartFixture::CUSTOMER_L1_ID 字面值（来自 part.sql 第 46 行）
+    .bind(9_000_000_000_000_000_010_i64)
+    .bind(now)
     .execute(pool)
     .await
-    .expect("insert L1");
-    l1_id
+    .expect("insert L2 customer under fixture L1");
+    l2_id
 }
 
 /// 进程级共享雪花 ID 生成器（2026-09-11 PR-B2 后续修复）。
@@ -234,7 +219,7 @@ async fn insert_customer_l2(pool: &PgPool, prefix: &str) -> i64 {
 /// 返回 (part_id, batch_id)。
 ///
 /// 2026-09-11 修复：批量插入时多次独立构造 `SnowflakeIdGenerator` 会在同一毫
-/// 秒内产生重复 id（23505 pkey 冲突）。改用进程级共享生成器 `common::pool_snowflake()`
+/// 秒内产生重复 id（23505 pkey 冲突）。改用进程级共享生成器 `pool_snowflake()`
 /// —— 内部 `next_id()` 自带 sequence 递增，避免重复。
 async fn insert_pool_part(
     pool: &PgPool,
@@ -247,7 +232,7 @@ async fn insert_pool_part(
     use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     let today = now.date();
-    let part_id = common::pool_snowflake()
+    let part_id = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
@@ -257,7 +242,7 @@ async fn insert_pool_part(
     // $3（now 用作 placed_at）。
     // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
     // 且 batch 持有 current_process_step_id。helper 多走两步：建链 → 建 step。
-    let chain_id = common::pool_snowflake()
+    let chain_id = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
@@ -271,7 +256,7 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert chain");
-    let step_id = common::pool_snowflake()
+    let step_id = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
@@ -306,7 +291,7 @@ async fn insert_pool_part(
     .execute(pool)
     .await
     .expect("insert t_part");
-    let batch_id = common::pool_snowflake()
+    let batch_id = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
@@ -340,7 +325,7 @@ async fn insert_pool_part(
 /// 返回 (part_id, batch_id)。
 ///
 /// 2026-09-16 PR-3 fix：复用同一 `snowflake` guard 生成所有 id，不要再
-/// `common::pool_snowflake().lock()` 第二次——`std::sync::Mutex` 非递归，
+/// `pool_snowflake().lock()` 第二次——`std::sync::Mutex` 非递归，
 /// 同线程二次 lock 会永久 hang（PR-3 step3 之前无此问题）。
 async fn insert_worker_held_part(
     pool: &PgPool,
@@ -351,7 +336,7 @@ async fn insert_worker_held_part(
     quantity: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake()
+    let snowflake = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let now = now_naive();
@@ -443,13 +428,13 @@ async fn count_held_by_worker(pool: &PgPool, worker_id: i64) -> i64 {
 /// 场景 1: worker-scan INSPECTED → 自动 refill
 #[tokio::test]
 async fn worker_scan_inspected_triggers_refill() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL").await;
     let proc = seed_process(&pool, "PROC-A", "工序A").await;
     let wt = insert_work_type(&pool, "WT-A", "工种A", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-A", "PROD-A", "PRODUCTION").await;
-    let insp_shelf = common::insert_shelf(&pool, "INSP-A", "INSP-A", "INSPECTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-A", "PROD-A", "PRODUCTION").await;
+    let insp_shelf = insert_shelf(&pool, "INSP-A", "INSP-A", "INSPECTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC001", "工1", Some(wt)).await;
@@ -498,12 +483,12 @@ async fn worker_scan_inspected_triggers_refill() {
 /// 场景 2: worker-scan RETURNED → 自动 refill
 #[tokio::test]
 async fn worker_scan_returned_triggers_refill() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL2").await;
     let proc = seed_process(&pool, "PROC-B", "工序B").await;
     let wt = insert_work_type(&pool, "WT-B", "工种B", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-B", "PROD-B", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-B", "PROD-B", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC002", "工2", Some(wt)).await;
@@ -546,12 +531,12 @@ async fn worker_scan_returned_triggers_refill() {
 /// 场景 3: 池空时 refill 返回 empty + pool_empty=true
 #[tokio::test]
 async fn refill_when_pool_empty_returns_empty() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL3").await;
     let proc = seed_process(&pool, "PROC-C", "工序C").await;
     let wt = insert_work_type(&pool, "WT-C", "工种C", Some(10)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-C", "PROD-C", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-C", "PROD-C", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC003", "工3", Some(wt)).await;
@@ -559,7 +544,7 @@ async fn refill_when_pool_empty_returns_empty() {
     let (_pool_part, _pool_batch) =
         insert_pool_part(&pool, customer, "P-003", prod_shelf, proc, 1).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin3").await;
+    let (app, token) = login_manager_with_username(&pool, "admin3").await;
     let (s, env) = send(
         app,
         json_request(
@@ -581,7 +566,7 @@ async fn refill_when_pool_empty_returns_empty() {
     assert_eq!(env["data"]["pool_empty"], false);
 
     // 第二次 refill 池空 → taken=0 + pool_empty=true
-    let (app, token, _pool) = login_manager(pool.clone(), "admin3b").await;
+    let (app, token) = login_manager_with_username(&pool, "admin3b").await;
     let (s2, env2) = send(
         app,
         json_request(
@@ -604,12 +589,12 @@ async fn refill_when_pool_empty_returns_empty() {
 /// 场景 4: refill 上限 = max_held_batches
 #[tokio::test]
 async fn refill_caps_at_max_held_batches() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL4").await;
     let proc = seed_process(&pool, "PROC-D", "工序D").await;
     let wt = insert_work_type(&pool, "WT-D", "工种D", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-D", "PROD-D", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-D", "PROD-D", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC004", "工4", Some(wt)).await;
@@ -619,7 +604,7 @@ async fn refill_caps_at_max_held_batches() {
         insert_pool_part(&pool, customer, &sn, prod_shelf, proc, 1).await;
     }
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin4").await;
+    let (app, token) = login_manager_with_username(&pool, "admin4").await;
     let (s, env) = send(
         app,
         json_request(
@@ -636,7 +621,7 @@ async fn refill_caps_at_max_held_batches() {
     assert_eq!(s, StatusCode::OK, "admin refill: {env}");
     let taken = env["data"]["taken"].as_array().expect("data.taken");
     assert_eq!(taken.len(), 5, "max=5，应 taken=5: {env}");
-    let held = count_held_by_worker(&_pool, worker).await;
+    let held = count_held_by_worker(&pool, worker).await;
     assert_eq!(held, 5, "worker 持有 = 5");
 }
 
@@ -654,13 +639,13 @@ async fn concurrent_refill_no_double_pick() {
 /// 场景 6: refill 限定 shelf 范围（worker 只能从所绑 shelf 的池里抢）
 #[tokio::test]
 async fn refill_respects_shelf_scope() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL6").await;
     let proc = seed_process(&pool, "PROC-F", "工序F").await;
     let wt = insert_work_type(&pool, "WT-F", "工种F", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let shelf_a = common::insert_shelf(&pool, "PROD-F1", "PROD-F1", "PRODUCTION").await;
-    let shelf_b = common::insert_shelf(&pool, "PROD-F2", "PROD-F2", "PRODUCTION").await;
+    let shelf_a = insert_shelf(&pool, "PROD-F1", "PROD-F1", "PRODUCTION").await;
+    let shelf_b = insert_shelf(&pool, "PROD-F2", "PROD-F2", "PRODUCTION").await;
     link_shelf_to_process(&pool, shelf_a, proc).await;
     link_shelf_to_process(&pool, shelf_b, proc).await;
 
@@ -671,7 +656,7 @@ async fn refill_respects_shelf_scope() {
         insert_pool_part(&pool, customer, &sn, shelf_b, proc, 1).await;
     }
     // refill 时指定 shelf=shelf_a → 池空（shelf_a 上没件）
-    let (app, token, _pool) = login_manager(pool.clone(), "admin6").await;
+    let (app, token) = login_manager_with_username(&pool, "admin6").await;
     let (s, env) = send(
         app,
         json_request(
@@ -703,13 +688,13 @@ async fn refill_skips_concurrently_modified_batch() {
 /// 场景 8: worker-scan 越权 shelf → 40301 SHELF_MISMATCH
 #[tokio::test]
 async fn worker_scan_shelf_scope_violation_403() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL8").await;
     let proc = seed_process(&pool, "PROC-H", "工序H").await;
     let wt = insert_work_type(&pool, "WT-H", "工种H", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let shelf_x = common::insert_shelf(&pool, "PROD-H1", "PROD-H1", "PRODUCTION").await;
-    let shelf_y = common::insert_shelf(&pool, "PROD-H2", "PROD-H2", "PRODUCTION").await;
+    let shelf_x = insert_shelf(&pool, "PROD-H1", "PROD-H1", "PRODUCTION").await;
+    let shelf_y = insert_shelf(&pool, "PROD-H2", "PROD-H2", "PRODUCTION").await;
     link_shelf_to_process(&pool, shelf_x, proc).await;
     link_shelf_to_process(&pool, shelf_y, proc).await;
 
@@ -742,19 +727,19 @@ async fn worker_scan_shelf_scope_violation_403() {
 /// 场景 9: take 更新 t_part.current_holder_id = worker_id
 #[tokio::test]
 async fn take_updates_t_part_holder() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL9").await;
     let proc = seed_process(&pool, "PROC-I", "工序I").await;
     let wt = insert_work_type(&pool, "WT-I", "工种I", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-I", "PROD-I", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-I", "PROD-I", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC009", "工9", Some(wt)).await;
     let (_pool_part, pool_batch) =
         insert_pool_part(&pool, customer, "P-009", prod_shelf, proc, 1).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin9").await;
+    let (app, token) = login_manager_with_username(&pool, "admin9").await;
     let (_s, _env) = send(
         app,
         json_request(
@@ -796,12 +781,12 @@ async fn take_updates_t_part_holder() {
 /// 场景 10: take 不更新 placed_at
 #[tokio::test]
 async fn take_does_not_update_placed_at() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL10").await;
     let proc = seed_process(&pool, "PROC-J", "工序J").await;
     let wt = insert_work_type(&pool, "WT-J", "工种J", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-J", "PROD-J", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-J", "PROD-J", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC010", "工10", Some(wt)).await;
@@ -819,7 +804,7 @@ async fn take_does_not_update_placed_at() {
             .expect("query version");
     let _ = before_version;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin10").await;
+    let (app, token) = login_manager_with_username(&pool, "admin10").await;
     let (_s, _env) = send(
         app,
         json_request(
@@ -855,13 +840,13 @@ async fn take_does_not_update_placed_at() {
 /// 场景 11: t_part_event 持久化 TAKEN_FROM_POOL / RETURNED_TO_SHELF / SENT_TO_INSPECTION
 #[tokio::test]
 async fn events_persisted_to_t_part_event() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL11").await;
     let proc = seed_process(&pool, "PROC-K", "工序K").await;
     let wt = insert_work_type(&pool, "WT-K", "工种K", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-K", "PROD-K", "PRODUCTION").await;
-    let insp_shelf = common::insert_shelf(&pool, "INSP-K", "INSP-K", "INSPECTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-K", "PROD-K", "PRODUCTION").await;
+    let insp_shelf = insert_shelf(&pool, "INSP-K", "INSP-K", "INSPECTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC011", "工11", Some(wt)).await;
@@ -896,7 +881,7 @@ async fn events_persisted_to_t_part_event() {
         FROM t_part_event WHERE part_id = $1 ORDER BY created_at ASC, id ASC"#,
         held_part,
     )
-    .fetch_all(&_pool)
+    .fetch_all(&pool)
     .await
     .expect("query held events");
     assert!(
@@ -909,7 +894,7 @@ async fn events_persisted_to_t_part_event() {
         FROM t_part_event WHERE part_id = $1 ORDER BY created_at ASC, id ASC"#,
         pool_part,
     )
-    .fetch_all(&_pool)
+    .fetch_all(&pool)
     .await
     .expect("query pool events");
     assert!(
@@ -921,12 +906,12 @@ async fn events_persisted_to_t_part_event() {
 /// 场景 12: admin refill 端点
 #[tokio::test]
 async fn admin_refill_endpoint_works() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL12").await;
     let proc = seed_process(&pool, "PROC-L", "工序L").await;
     let wt = insert_work_type(&pool, "WT-L", "工种L", Some(3)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-L", "PROD-L", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-L", "PROD-L", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC012", "工12", Some(wt)).await;
@@ -935,7 +920,7 @@ async fn admin_refill_endpoint_works() {
         insert_pool_part(&pool, customer, &sn, prod_shelf, proc, 1).await;
     }
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin12").await;
+    let (app, token) = login_manager_with_username(&pool, "admin12").await;
     let (s, env) = send(
         app,
         json_request(
@@ -953,26 +938,26 @@ async fn admin_refill_endpoint_works() {
     assert_eq!(env["code"], 0);
     let taken = env["data"]["taken"].as_array().expect("data.taken");
     assert_eq!(taken.len(), 3, "max=3，应 taken=3: {env}");
-    let held = count_held_by_worker(&_pool, worker).await;
+    let held = count_held_by_worker(&pool, worker).await;
     assert_eq!(held, 3);
 }
 
 /// 场景 13: admin_remove 把持有批次放回候选池
 #[tokio::test]
 async fn admin_remove_returns_batch_to_pool() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL13").await;
     let proc = seed_process(&pool, "PROC-M", "工序M").await;
     let wt = insert_work_type(&pool, "WT-M", "工种M", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-M", "PROD-M", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-M", "PROD-M", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC013", "工13", Some(wt)).await;
     let (held_part, held_batch) =
         insert_worker_held_part(&pool, customer, "H-013", worker, proc, 1).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin13").await;
+    let (app, token) = login_manager_with_username(&pool, "admin13").await;
     let (s, env) = send(
         app,
         json_request(
@@ -994,7 +979,7 @@ async fn admin_remove_returns_batch_to_pool() {
     assert_eq!(env["data"]["batch_id"], held_batch.to_string());
 
     // worker 应不再持有该批次（count=0）
-    let held = count_held_by_worker(&_pool, worker).await;
+    let held = count_held_by_worker(&pool, worker).await;
     assert_eq!(held, 0, "admin_remove 后 worker 应释放该批次");
     // batch 应回到 PRODUCTION_SHELF holder=shelf
     // 2026-09-16 PR-3：next_process_id 列已删，改测 step_id
@@ -1033,18 +1018,18 @@ async fn refill_failure_rolls_back_worker_scan() {
 /// 场景 15: work_type.max_held_batches = NULL → 20904 BIZ_WORK_TYPE_MAX_HELD_NOT_SET
 #[tokio::test]
 async fn max_held_null_returns_error() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL15").await;
     let proc = seed_process(&pool, "PROC-O", "工序O").await;
     let wt = insert_work_type(&pool, "WT-O", "工种O", None).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-O", "PROD-O", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-O", "PROD-O", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC015", "工15", Some(wt)).await;
     insert_pool_part(&pool, customer, "P-015", prod_shelf, proc, 1).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin15").await;
+    let (app, token) = login_manager_with_username(&pool, "admin15").await;
     let (s, env) = send(
         app,
         json_request(
@@ -1070,18 +1055,18 @@ async fn max_held_null_returns_error() {
 /// 实际：worker.work_type_id = NULL → BIZ_WORKER_NO_WORK_TYPE (20206)
 #[tokio::test]
 async fn worker_no_work_type_returns_error() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL16").await;
     let proc = seed_process(&pool, "PROC-P", "工序P").await;
     let wt = insert_work_type(&pool, "WT-P", "工种P", Some(5)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-P", "PROD-P", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-P", "PROD-P", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC016", "工16", None).await;
     insert_pool_part(&pool, customer, "P-016", prod_shelf, proc, 1).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin16").await;
+    let (app, token) = login_manager_with_username(&pool, "admin16").await;
     let (s, env) = send(
         app,
         json_request(
@@ -1114,7 +1099,7 @@ async fn worker_no_work_type_returns_error() {
 /// 仍在用的 cache，对其它 worktree 也有干扰）。
 async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = common::pool_snowflake()
+    let snowflake = pool_snowflake()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
@@ -1138,7 +1123,7 @@ async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
 /// 跨货架候选批次列表。排序：system_delivery_date ASC NULLS LAST → is_urgent DESC → id ASC。
 #[tokio::test]
 async fn pool_by_process_happy() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     // L1 + L2 客户（L2.parent_id = L1.id → 触发 "L1 / L2" 路径）
     let l1 = insert_customer_l2(&pool, "L1-NAME").await;
     let l2 = insert_l2_customer(&pool, "L2-NAME", l1).await;
@@ -1148,7 +1133,7 @@ async fn pool_by_process_happy() {
     let wt_b = insert_work_type(&pool, "WT-PBP-B", "工种B", None).await;
     link_work_type_to_process(&pool, wt_a, proc).await;
     link_work_type_to_process(&pool, wt_b, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-PBP", "PROD-PBP", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-PBP", "PROD-PBP", "PRODUCTION").await;
 
     let _w_a = insert_worker(&pool, "BC-PBP-A", "工A", Some(wt_a)).await;
     let _w_b = insert_worker(&pool, "BC-PBP-B", "工B", Some(wt_b)).await;
@@ -1165,7 +1150,7 @@ async fn pool_by_process_happy() {
         .await
         .expect("mark U-001 urgent");
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin_pbp").await;
+    let (app, token) = login_manager_with_username(&pool, "admin_pbp").await;
     // 注意：`tests/common::test_app` 用 `v2_router()`（不带 `/api/v2` nest，
     // 与 main.rs `nest("/api/v2", v2_router())` 不一样），所以测试 URI
     // 是 `/worker-pool/{id}` 而不是 `/api/v2/worker-pool/{id}`。
@@ -1204,10 +1189,10 @@ async fn pool_by_process_happy() {
         "items[1] 应 is_urgent=false: {env}"
     );
     assert_eq!(items[1]["serial_no"], "N-001");
-    // customer_path 应为 "L1-NAME / L2-NAME"
+    // customer_path 应为 "L1-NAME / L2-NAME"（2 级：fixture L1 是祖父，不入 path）
     assert_eq!(
         items[0]["customer_path"], "L1-NAME / L2-NAME",
-        "customer_path 应拼成 L1 / L2: {env}"
+        "customer_path 应拼成 L1-NAME / L2-NAME: {env}"
     );
     // shelf 元数据存在
     assert_eq!(items[0]["shelf_id"], prod_shelf.to_string());
@@ -1218,14 +1203,14 @@ async fn pool_by_process_happy() {
 /// 场景 H2: 不存在的 process_id → 20801 BIZ_PROCESS_NOT_FOUND + 404
 #[tokio::test]
 async fn pool_by_process_process_not_found() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-NF", "工序NF").await;
     let _wt = insert_work_type(&pool, "WT-NF", "工种NF", Some(3)).await;
     link_work_type_to_process(&pool, _wt, proc).await;
     // 一个不存在的 snowflake-style id（远大于实际生成）
     let nonexistent_id: i64 = 9_999_999_999_999;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin_nf").await;
+    let (app, token) = login_manager_with_username(&pool, "admin_nf").await;
     let uri = format!("/prod/worker-pool/{nonexistent_id}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "不存在 process 应 404: {env}");
@@ -1235,11 +1220,11 @@ async fn pool_by_process_process_not_found() {
 /// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（service 守卫：Manager/Clerk/Inspector only）
 #[tokio::test]
 async fn pool_by_process_forbidden_for_shelf_account() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-FB", "工序FB").await;
     let wt = insert_work_type(&pool, "WT-FB", "工种FB", Some(3)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-FB", "PROD-FB", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-FB", "PROD-FB", "PRODUCTION").await;
 
     // ShelfAccount 绑一个 shelf（scope 必须给才能登录；调用端点时仍会被 service 拒绝）
     let (app, token, _pool) =
@@ -1253,13 +1238,13 @@ async fn pool_by_process_forbidden_for_shelf_account() {
 /// 场景 H4: process 存在但无候选批次 → total=0, items=[]，元数据正常返回
 #[tokio::test]
 async fn pool_by_process_no_candidates_when_no_batch() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-EMPTY", "空工序").await;
     let wt = insert_work_type(&pool, "WT-EMPTY", "空工种", Some(3)).await;
     link_work_type_to_process(&pool, wt, proc).await;
     let _w = insert_worker(&pool, "BC-EMPTY", "空工人", Some(wt)).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin_empty").await;
+    let (app, token) = login_manager_with_username(&pool, "admin_empty").await;
     let uri = format!("/prod/worker-pool/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "无 batch 应 200: {env}");
@@ -1297,12 +1282,12 @@ async fn pool_by_process_no_candidates_when_no_batch() {
 /// - TAKEN_FROM_POOL 事件写入（note='admin_assign'）
 #[tokio::test]
 async fn admin_assign_happy_path() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL17").await;
     let proc = seed_process(&pool, "PROC-AA", "工序AA").await;
     let wt = insert_work_type(&pool, "WT-AA", "工种AA", Some(3)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-AA", "PROD-AA", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-AA", "PROD-AA", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC017", "工17", Some(wt)).await;
@@ -1319,7 +1304,7 @@ async fn admin_assign_happy_path() {
     .expect("query before assign loc");
     assert_eq!(before_loc, "PRODUCTION_SHELF");
     let before_ch: Option<i64> = sqlx::query_scalar!(
-        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
         pool_batch,
     )
     .fetch_one(&pool)
@@ -1335,7 +1320,7 @@ async fn admin_assign_happy_path() {
     .expect("query before assign v");
     assert_eq!(before_v, 0, "初始 version 应 0");
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin17").await;
+    let (app, token) = login_manager_with_username(&pool, "admin17").await;
     let (s, env) = send(
         app,
         json_request(
@@ -1369,7 +1354,7 @@ async fn admin_assign_happy_path() {
     .expect("query after assign loc");
     assert_eq!(after_loc, "WORKER", "assign 后 location 应 WORKER");
     let after_ch: Option<i64> = sqlx::query_scalar!(
-        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
         pool_batch,
     )
     .fetch_one(&pool)
@@ -1406,12 +1391,12 @@ async fn admin_assign_happy_path() {
 /// worker max_held=2 已持 2 批，再 assign 第 3 批 → 422 + 20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED
 #[tokio::test]
 async fn admin_assign_capacity_exceeded() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL18").await;
     let proc = seed_process(&pool, "PROC-CAP", "工序CAP").await;
     let wt = insert_work_type(&pool, "WT-CAP", "工种CAP", Some(2)).await;
     link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-CAP", "PROD-CAP", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-CAP", "PROD-CAP", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC018", "工18", Some(wt)).await;
@@ -1425,7 +1410,7 @@ async fn admin_assign_capacity_exceeded() {
     let held = count_held_by_worker(&pool, worker).await;
     assert_eq!(held, 2, "前置：worker 已持 2 批");
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin18").await;
+    let (app, token) = login_manager_with_username(&pool, "admin18").await;
     let (s, env) = send(
         app,
         json_request(
@@ -1456,7 +1441,7 @@ async fn admin_assign_capacity_exceeded() {
     .expect("query after loc");
     assert_eq!(after_loc, "PRODUCTION_SHELF", "批次应仍在候选池");
     let after_ch: Option<i64> = sqlx::query_scalar!(
-        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
         extra_batch,
     )
     .fetch_one(&pool)
@@ -1471,14 +1456,14 @@ async fn admin_assign_capacity_exceeded() {
 /// 422 + 20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER
 #[tokio::test]
 async fn admin_assign_batch_not_in_pool() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL19").await;
     let proc = seed_process(&pool, "PROC-NP", "工序NP").await;
     let wt = insert_work_type(&pool, "WT-NP", "工种NP", Some(3)).await;
     link_work_type_to_process(&pool, wt, proc).await;
     // shelf_a：batch 实际所在；shelf_b：admin 请求的 shelf_id（错的）
-    let shelf_a = common::insert_shelf(&pool, "PROD-A19", "PROD-A19", "PRODUCTION").await;
-    let shelf_b = common::insert_shelf(&pool, "PROD-B19", "PROD-B19", "PRODUCTION").await;
+    let shelf_a = insert_shelf(&pool, "PROD-A19", "PROD-A19", "PRODUCTION").await;
+    let shelf_b = insert_shelf(&pool, "PROD-B19", "PROD-B19", "PRODUCTION").await;
     link_shelf_to_process(&pool, shelf_a, proc).await;
     link_shelf_to_process(&pool, shelf_b, proc).await;
 
@@ -1486,7 +1471,7 @@ async fn admin_assign_batch_not_in_pool() {
     // batch 实际在 shelf_a
     let (_pp, batch_a) = insert_pool_part(&pool, customer, "P-019A", shelf_a, proc, 1).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin19").await;
+    let (app, token) = login_manager_with_username(&pool, "admin19").await;
     let (s, env) = send(
         app,
         json_request(
@@ -1521,7 +1506,7 @@ async fn admin_assign_batch_not_in_pool() {
     .expect("query after loc");
     assert_eq!(after_loc, "PRODUCTION_SHELF", "batch 应仍在原 shelf");
     let after_ch: Option<i64> = sqlx::query_scalar!(
-        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
         batch_a,
     )
     .fetch_one(&pool)
@@ -1536,20 +1521,20 @@ async fn admin_assign_batch_not_in_pool() {
 /// 422 + 20104 BIZ_INVALID_VALUE
 #[tokio::test]
 async fn admin_assign_process_id_mismatch() {
-    let pool = setup().await;
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL20").await;
     let proc1 = seed_process(&pool, "PROC-PM1", "工序PM1").await;
     let proc_other: i64 = 9_999_999_999_998; // 故意一个远大于实际生成的"错误"process
     let wt = insert_work_type(&pool, "WT-PM", "工种PM", Some(3)).await;
     link_work_type_to_process(&pool, wt, proc1).await;
-    let prod_shelf = common::insert_shelf(&pool, "PROD-PM", "PROD-PM", "PRODUCTION").await;
+    let prod_shelf = insert_shelf(&pool, "PROD-PM", "PROD-PM", "PRODUCTION").await;
     link_shelf_to_process(&pool, prod_shelf, proc1).await;
 
     let worker = insert_worker(&pool, "BC020", "工20", Some(wt)).await;
     // batch.next_process_id = proc1；req.process_id = proc_other（不匹配）
     let (_pp, batch) = insert_pool_part(&pool, customer, "P-020", prod_shelf, proc1, 1).await;
 
-    let (app, token, _pool) = login_manager(pool.clone(), "admin20").await;
+    let (app, token) = login_manager_with_username(&pool, "admin20").await;
     let (s, env) = send(
         app,
         json_request(
@@ -1578,7 +1563,7 @@ async fn admin_assign_process_id_mismatch() {
     .expect("query after loc");
     assert_eq!(after_loc, "PRODUCTION_SHELF", "batch 应仍在候选池");
     let after_ch: Option<i64> = sqlx::query_scalar!(
-        r#"SELECT current_holder_id FROM t_part_batch WHERE id = $1"#,
+        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
         batch,
     )
     .fetch_one(&pool)
