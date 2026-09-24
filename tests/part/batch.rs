@@ -10,11 +10,6 @@
 //! ## 批次守恒不变量测试
 //! `Σ(未删批次.quantity) = t_part.quantity` 必须保持 —— 用 `invariant` 命名空间测试。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录。
-// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel；fixture 由 PartFixture 提供。
-#[path = "helpers.rs"]
-mod helpers;
-
 use axum::http::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;

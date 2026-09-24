@@ -23,9 +23,40 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    ProductionFixture, json_request, load_production_fixture, login_token, seed_process, send,
-    test_app, test_pool, test_state,
+    ProductionFixture, json_request, load_production_fixture, login_token, send, test_app,
+    test_pool, test_state,
 };
+
+// ===========================================================================
+//  动态 fixture helper（PR-C.Final retry 第 3 轮，2026-09-24）
+//  原从 `hsh_erp_test_support::fixtures::seed_process` 引入，因 fixtures.rs
+//  本轮被删，复制到本地（同形 SQL：INHOUSE 类别 t_process 直插）。
+// ===========================================================================
+
+/// 插一个 INHOUSE 类别的 `t_process` 工序，返回 process_id。
+async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_test_support::pool_snowflake;
+
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(name)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_process");
+    id
+}
 
 // ===========================================================================
 //  Bootstrap helpers（PR13 Phase H 风格）

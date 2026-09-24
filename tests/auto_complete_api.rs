@@ -7,55 +7,36 @@
 //! 3. `run_once_emits_ws_event_after_commit` —— commit 后 ws_hub 收到 PART_COMPLETED。
 //!
 //! 集成测试运行需要 `tests/common::test_pool` + `ensure_database_exists`。
-
-#[path = "common/mod.rs"]
-mod common;
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原 `#[path = "common/mod.rs"] mod common;` + `use common::{...};` 改走
+//! `use hsh_erp_test_support::*` + `load_auto_complete_fixture(&pool)` +
+//! `AutoCompleteFixture`。fixture 提供 baseline L1+L2 customer（part / batch /
+//! event 由 seed_delivered_batch 现场插，避免 fixture 占用 serial_no 字面）。
+//! 字面断言逐字保留。
 
 use std::time::Duration;
 
 use chrono::Duration as ChronoDuration;
-use tokio::sync::broadcast::error::TryRecvError;
-
-use common::{ensure_database_exists, test_pool, test_state_with_disabled_session};
-
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::task::auto_complete::run_once;
+use hsh_erp_test_support::{AutoCompleteFixture, load_auto_complete_fixture, test_pool, test_state_with_disabled_session};
+use tokio::sync::broadcast::error::TryRecvError;
 
 
-/// 构造 L1 + L2 客户。L1 用唯一前缀（按时间戳后缀）防 `uq_t_customer_root_prefix` 冲突。
+/// 构造 L1 + L2 客户。L1 用 fixture 提供的 baseline customer.id = 180；
+/// L2 走 fixture 提供的 181。
+///
+/// 不再走原本的「snowflake 后 5 位作 prefix 后缀」动态构造 —— fixture 提供
+/// 静态 baseline customer（prefix='F'），测试现场直接用 AutoCompleteFixture
+/// 常量即可。
 async fn seed_customer(pool: &sqlx::PgPool) -> (i64, i64) {
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let now = now_naive();
-    // 用 snowflake 后 5 位作 prefix 后缀，确保唯一（A-Z 仅 26 槽位，并行跑会撞）
-    let suffix_id = snowflake.next_id();
-    let suffix = ((suffix_id % 26) as u8 + b'A') as char;
-    let l1_prefix = suffix.to_string();
-    let l1 = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, updated_at) VALUES ($1, $2, NULL, $3, 0, $4, $4)",
-    )
-    .bind(l1)
-    .bind(format!("AC-L1-{suffix_id}"))
-    .bind(&l1_prefix)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert L1");
-    let l2 = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, updated_at) VALUES ($1, $2, $3, NULL, 0, $4, $4)",
-    )
-    .bind(l2)
-    .bind(format!("AC-L2-{suffix_id}"))
-    .bind(l1)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert L2");
+    let l1 = AutoCompleteFixture::L1_CUSTOMER_ID;
+    let l2 = AutoCompleteFixture::L2_CUSTOMER_ID;
+    // fixture baseline 已存在；此处不重复 INSERT，仅返回 ID 句柄
+    let _ = pool;
     (l1, l2)
 }
 
@@ -130,8 +111,8 @@ async fn seed_delivered_batch(
 /// DELIVERED + placed_at 早于阈值（7 天）→ run_once 翻为 COMPLETED。
 #[tokio::test]
 async fn run_once_completes_overdue_delivered_batch() {
-    ensure_database_exists().await;
     let pool = test_pool().await;
+    let _fx = load_auto_complete_fixture(&pool).await;
     let (_l1, l2) = seed_customer(&pool).await;
     let (_part_id, batch_id) = seed_delivered_batch(&pool, l2, "AC-OLD", 30).await; // 30 天前 ON_SHELF
 
@@ -152,8 +133,8 @@ async fn run_once_completes_overdue_delivered_batch() {
 /// DELIVERED + placed_at 在阈值内（recent）→ run_once 不动。
 #[tokio::test]
 async fn run_once_skips_recent_batch() {
-    ensure_database_exists().await;
     let pool = test_pool().await;
+    let _fx = load_auto_complete_fixture(&pool).await;
     let (_l1, l2) = seed_customer(&pool).await;
     let (_part_id, batch_id) = seed_delivered_batch(&pool, l2, "AC-NEW", 1).await; // 1 天前
 
@@ -174,8 +155,8 @@ async fn run_once_skips_recent_batch() {
 /// commit 后 ws_hub 收到 PART_COMPLETED 事件。
 #[tokio::test]
 async fn run_once_emits_ws_event_after_commit() {
-    ensure_database_exists().await;
     let pool = test_pool().await;
+    let _fx = load_auto_complete_fixture(&pool).await;
     let (_l1, l2) = seed_customer(&pool).await;
     let (part_id, _batch_id) = seed_delivered_batch(&pool, l2, "AC-WS", 30).await;
 

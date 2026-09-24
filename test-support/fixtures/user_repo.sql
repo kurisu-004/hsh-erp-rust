@@ -1,0 +1,57 @@
+-- ============================================================================
+--  user_repo 域集成测试 fixture (PR13 Phase I, 2026-09-24)
+--
+--  加载入口：test-support::fixture::load_user_repo_fixture(pool)
+--  加载方式：sqlx::raw_sql(include_str!("../../fixtures/user_repo.sql")).execute(pool).await
+--
+--  ## 设计原则
+--  - 所有 ID 走常量 9_000_000_000_000_000_120+ 区段（process_chain 1-9 /
+--    part 10-49 / delivery 50-52 / production 60-69 / assembly 70+ /
+--    shelf 80+ / statistics 90+ / outsource 100-104 / iam 110-118，
+--    物理不相交）。
+--  - 时间列：审计字段用 now()。
+--  - 不引 trigger / 不调 hsh_erp_rust 函数 —— SQL 仅 INSERT 静态行。
+--
+--  ## ID 段分配（120+）
+--  BASELINE_ROLE_ID  120   baseline MANAGER role（无 user 归属，独立存在；
+--                             未来扩展用）
+--  BASELINE_MENU_ID  121   baseline t_menu 行（不挂 t_role_menu）
+--
+--  ## 2026-09-24 PR13 Phase C.Final 修正：移除 baseline user
+--  原 PR13 Phase C.2 引入的 `fx_user_repo_baseline`（t_user_id=120）
+--  破坏 4 个 user_repo 测试：
+--  - count_with_filters_counts_active_only（期望 count=3，实际 = 4）
+--  - list_with_filters_empty_returns_empty（期望 []，实际 = [baseline]）
+--  - list_with_filters_is_active_filters（期望 [active]，实际 = [active, baseline]）
+--  - list_with_filters_orders_by_created_at_desc（期望 first 排第二插入，
+--    实际 baseline 排第一）
+--
+--  修复：移除 t_user baseline 行（保留 role / menu baseline）。本 fixture
+--  不再预置用户，多数测试用本地 `seed_user` 创建专属测试数据。
+--
+--  ## 独立加载（不依赖 iam / part 域基线）
+--  user_repo 测试不需要 customer / process / work_type / part fixture；
+--  本 fixture 只覆盖 t_user_role / t_menu 两张表共 2 行（baseline role
+--  + baseline menu）。
+--  load_user_repo_fixture 内部不调 load_iam_fixture / load_part_fixture。
+--
+--  ## 不预置 t_shelf
+--  role.rs 内 ShelfRepo 测试用 seed_shelf 自建不同 code，不预置。
+--
+--  ## 不预置 t_role_menu
+--  MenuRepo 测试只测 list_active_for_roles DISTINCT / 过滤 / 排序逻辑；
+--  baseline menu 不挂 t_role_menu；测试现场 link_role_menu 自建关系。
+-- ============================================================================
+
+-- ---- baseline MANAGER role（无 user 归属；仅占位 ID 段，未来扩展用）----
+-- 不插入：删除 baseline user 后 baseline role 也失去意义（无 user 承载）；
+-- 保留 BASELINE_ROLE_ID 常量段以便未来需要 baseline role 时插入。
+-- 原 baseline role 行：
+--   INSERT INTO t_user_role (id, user_id, role, scope_type, scope_id, ...)
+--   VALUES (120, 120, 'MANAGER', NULL, NULL, ...);
+-- 已删除（v3，2026-09-24 PR-C.Final）。
+
+-- ---- baseline 菜单（不挂 t_role_menu）----
+INSERT INTO t_menu (id, parent_id, code, title, sort_order, is_active, version, created_at, updated_at)
+VALUES
+  (9000000000000000121, NULL, 'fx-user-repo-baseline', 'FX UserRepo Baseline', 0, true, 0, now(), now());

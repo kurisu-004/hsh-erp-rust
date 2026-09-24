@@ -10,19 +10,67 @@
 //! 完全独立，无需 Mutex 串行化。
 //! 每个用例 INSPECTOR token（白名单）。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录。
-// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel；fixture 由
-// `hsh_erp_test_support::fixture::PartFixture` 提供；批量 part 插入由
-// `insert_part_with_status` / `insert_batch` / `batch_version` 提供。
-#[path = "helpers.rs"]
-mod helpers;
-
 use axum::http::StatusCode;
 use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
-use hsh_erp_test_support::*;
+use hsh_erp_test_support::{json_request, load_part_fixture, login_token, send, test_app,
+    test_pool, test_state};
+
+// ===========================================================================
+//  动态 fixture helpers（PR-C.Final retry 第 3 轮，2026-09-24）
+//  原从 `hsh_erp_test_support::fixtures::{create_chain_for_part / create_step}`
+//  引入 2 helper，因 fixtures.rs 本轮被删，复制到本地（同形 sqlx::query 直插）。
+// ===========================================================================
+
+/// 为指定 part 建一个最小工艺链（t_part_process_chain），并把 part.process_chain_id 绑回。
+async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
+    use hsh_erp_test_support::pool_snowflake;
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let chain_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+         updated_at, updated_by) \
+         VALUES ($1, $2, 0, now(), 0, now(), 0)",
+    )
+    .bind(chain_id)
+    .bind(format!("chain-{part_id}"))
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+        .bind(chain_id)
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("bind part to chain");
+    chain_id
+}
+
+/// 在指定 chain 内创建 step（process_id + sort_order）。
+async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
+    use hsh_erp_test_support::pool_snowflake;
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let step_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, 30, 0, now(), 0, now(), 0)",
+    )
+    .bind(step_id)
+    .bind(chain_id)
+    .bind(sort_order)
+    .bind(process_id)
+    .execute(pool)
+    .await
+    .expect("insert chain step");
+    step_id
+}
 
 // ===========================================================================
 //  动态 part/batch 插入 helper（tests/part/ 各 sub-file 私有，PR-C 末统一迁）

@@ -15,21 +15,25 @@
 //!                                                  浏览器 JS `onmessage` 可直接收到）
 //!
 //! 测试栈：必须建 Redis pool，session 写入才算「已吊销」
-
-#[path = "common/mod.rs"]
-mod common;
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原 `#[path = "common/mod.rs"] mod common;` + `use common::{...};` 改走
+//! `use hsh_erp_test_support::*` + `load_dashboard_ws_fixture(&pool)` +
+//! `DashboardWsFixture` + 局部 helper。fixture 提供 1 WS 验签 user baseline；
+//! snapshot 数据（t_customer / t_part / t_part_batch / t_shelf）每个用例现场插，
+//! 避免 fixture 占用 shelf code / customer prefix 字面与测试现场冲突（snapshot
+//! 按 shelf.code 查找）。
 
 use chrono::NaiveDate;
-use common::{
-    clean_business_db, clean_db, ensure_database_exists, test_pool, test_state, test_ws_app,
-};
-
 use futures_util::StreamExt;
 use hsh_erp_rust::auth::jwt::encode_access;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::modules::dashboard::service::DashboardService;
+use hsh_erp_test_support::{
+    DashboardWsFixture, load_dashboard_ws_fixture, test_pool, test_state, test_ws_app,
+};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,10 +42,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 
 async fn setup() -> PgPool {
-    ensure_database_exists().await;
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
+    let _fx = load_dashboard_ws_fixture(&pool).await;
     pool
 }
 
@@ -270,7 +272,7 @@ async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i6
     // 写 Redis session，让 ws_dashboard 握手时 session 校验通过（不返 40105）。
     // 2026-09-22 重构：`CachedCurrentUser` → `CachedUserProfile`（删 id 字段）。
     let profile = CachedUserProfile {
-        username: "ws-tester".to_string(),
+        username: DashboardWsFixture::WS_USERNAME.to_string(),
         roles: vec!["MANAGER".into()],
         shelf_ids: vec![],
         shelf_wildcard: true,

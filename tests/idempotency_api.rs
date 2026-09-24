@@ -23,9 +23,20 @@
 //! 跨用例污染——A.store(0) → A 发 POST counter=1 → B 在 A 校验前 store(0) →
 //! A 看到 0 失败。改后每个用例构造独立 counter，用 Arc 在 handler 闭包内捕获，
 //! 用例结束前断言 local counter 即可，与其它并发用例物理隔离。
-
-#[path = "common/mod.rs"]
-mod common;
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原 `#[path = "common/mod.rs"] mod common;` + `use common::{...};` 改走
+//! `use hsh_erp_test_support::*` + `load_idempotency_fixture(&pool)`（stub）。
+//! fixture 是 stub（`SELECT 1;`），保持「`load_<binary>_fixture`」调用约定一致。
+//!
+//! **保留本地 `fn send`**：本文件 send 返 `(StatusCode, Vec<u8>, Response)` 3 元组
+//! （与 `test-support::http::send` 返 `(StatusCode, Value)` 不一致 —— 本文件用 raw bytes
+//! 字节级断言第二次响应用 request 缓存命中），保留本地版本。
+//!
+//! PR-C.Final retry（2026-09-24）：删除 `mod common;`，改走 `use hsh_erp_test_support::{test_pool,
+//! test_state_with_redis, test_redis_pool, ...}` 直接引入；本文件 setup 走 `test_pool` +
+//! `test_state_with_redis` + `test_redis_pool`，均为 fixtures.rs 之外的 helper（test_state
+//! 在 state.rs，test_redis_pool 在 redis.rs）。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,6 +50,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Json;
 use deadpool_redis::redis::AsyncCommands;
+use hsh_erp_test_support::{
+    load_idempotency_fixture, test_pool, test_redis_pool, test_state_with_redis,
+};
 use serde_json::json;
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -158,12 +172,9 @@ fn make_public_app(state: Arc<AppState>, counter: Arc<AtomicUsize>) -> Router {
 // ===========================================================================
 
 async fn setup() -> PgPool {
-    common::ensure_database_exists().await;
-    let pool = common::test_pool().await;
-    // ⚠️ 不在这里 FLUSHDB：cargo test 并行下（--test-threads=4）多测试并发
-    // 跑 setup()，FLUSHDB 会互相 wipe 对方刚写的 idem: 条目 → 测试 flake。
-    // 替代方案：每个测试用 UUID-based 唯一 key，断言只针对自己 key 做
-    // EXISTS / 不存在 校验，不扫全 db。
+    let pool = test_pool().await;
+    // 加载 stub fixture（保持 `load_<binary>_fixture` 调用约定一致；本 fixture 是空 stub）
+    let _fx = load_idempotency_fixture(&pool).await;
     pool
 }
 
@@ -172,6 +183,10 @@ fn unique_key(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
 
+/// 本地 send 3 元组版本（与 test-support::http::send 2 元组不同）：
+/// 返 `(StatusCode, Vec<u8>, Response)`。Vec<u8> 让用例做字节级断言
+/// （第二次响应与第一次字节级一致 = 缓存命中）；最后 Response 占位参数保留
+/// 原文件签名（不动调用方）。
 async fn send(app: Router, req: Request<Body>) -> (StatusCode, Vec<u8>, Response) {
     let resp = app.oneshot(req).await.expect("oneshot");
     let status = resp.status();
@@ -199,7 +214,7 @@ fn make_request(
 
 /// 检查 Redis 是否存在指定 key（简化 helper：返回 bool）
 async fn redis_has_key(key: &str) -> bool {
-    let redis_pool = common::test_redis_pool().await;
+    let redis_pool = test_redis_pool().await;
     let mut conn = redis_pool.get().await.expect("redis conn");
     let exists: bool = conn.exists(key).await.expect("redis EXISTS");
     exists
@@ -213,7 +228,7 @@ async fn redis_has_key(key: &str) -> bool {
 async fn same_key_returns_cached_response() {
     let _pool = setup().await;
     let counter = Arc::new(AtomicUsize::new(0));
-    let state = common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await);
+    let state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     let key = unique_key("test-key-1");
 
@@ -253,14 +268,14 @@ async fn same_key_returns_cached_response() {
 async fn handler_invoked_only_once() {
     let _pool = setup().await;
     let counter = Arc::new(AtomicUsize::new(0));
-    let _state = common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await);
+    let _state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     let key = unique_key("test-key-2");
 
     // 连发 3 次相同 key POST
     for _ in 0..3 {
         let app = make_test_app(
-            common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+            test_state_with_redis(_pool.clone(), test_redis_pool().await),
             counter.clone(),
         );
         let (s, _, _) = send(
@@ -287,17 +302,17 @@ async fn handler_invoked_only_once() {
 async fn post_without_header_passes_through() {
     let _pool = setup().await;
     let counter = Arc::new(AtomicUsize::new(0));
-    let _state = common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await);
+    let _state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     // 第 1 次 POST 无 header
     let app1 = make_test_app(
-        common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+        test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
     let (s1, _, _) = send(app1, make_request("POST", "/__test/post", None)).await;
     // 第 2 次 POST 无 header
     let app2 = make_test_app(
-        common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+        test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
     let (s2, _, _) = send(app2, make_request("POST", "/__test/post", None)).await;
@@ -320,13 +335,13 @@ async fn post_without_header_passes_through() {
 async fn cross_method_same_key_collides() {
     let _pool = setup().await;
     let counter = Arc::new(AtomicUsize::new(0));
-    let _state = common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await);
+    let _state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     let key = unique_key("cross-method-key");
 
     // 第 1 次：POST /__test/post
     let app1 = make_test_app(
-        common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+        test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
     let (s1, b1, _) = send(
@@ -339,7 +354,7 @@ async fn cross_method_same_key_collides() {
 
     // 第 2 次：PUT /__test/put 同 key
     let app2 = make_test_app(
-        common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+        test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
     let (s2, b2, _) = send(
@@ -366,10 +381,10 @@ async fn cross_method_same_key_collides() {
 async fn get_with_header_is_skipped() {
     let _pool = setup().await;
     let counter = Arc::new(AtomicUsize::new(0));
-    let _state = common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await);
+    let _state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     let app = make_test_app(
-        common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+        test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
     let (s, _, _) = send(
@@ -394,10 +409,10 @@ async fn get_with_header_is_skipped() {
 async fn delete_with_header_is_skipped() {
     let _pool = setup().await;
     let counter = Arc::new(AtomicUsize::new(0));
-    let _state = common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await);
+    let _state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     let app = make_test_app(
-        common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+        test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
     let (s, _, _) = send(
@@ -422,14 +437,14 @@ async fn delete_with_header_is_skipped() {
 async fn header_missing_passes_through() {
     let _pool = setup().await;
     let counter = Arc::new(AtomicUsize::new(0));
-    let _state = common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await);
+    let _state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     let key = unique_key("K1");
     let redis_key = format!("idem:{key}");
 
     // 第 1 次：POST 带 K1（写缓存 + handler 调）
     let app1 = make_test_app(
-        common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+        test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
     let (s1, _, _) = send(app1, make_request("POST", "/__test/post", Some(&key))).await;
@@ -438,7 +453,7 @@ async fn header_missing_passes_through() {
 
     // 第 2 次：POST 不带 header（pass-through，调 handler）
     let app2 = make_test_app(
-        common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+        test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
     let (s2, _, _) = send(app2, make_request("POST", "/__test/post", None)).await;
@@ -446,7 +461,7 @@ async fn header_missing_passes_through() {
 
     // 第 3 次：POST 带 K1（应命中缓存，不调 handler）
     let app3 = make_test_app(
-        common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await),
+        test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
     let (s3, _, _) = send(app3, make_request("POST", "/__test/post", Some(&key))).await;
@@ -475,7 +490,7 @@ async fn ttl_expiry() {
     let counter = Arc::new(AtomicUsize::new(0));
 
     // 改 TTL 为 1 秒；其它字段用测试默认
-    let mut state = common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await);
+    let mut state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
     {
         let state_inner = Arc::get_mut(&mut state).expect("state Arc 必须 unique");
         let old_cfg = (*state_inner.config).clone();
@@ -541,7 +556,7 @@ async fn ttl_expiry() {
 async fn login_with_idempotency_key_does_not_cache_jwt() {
     let _pool = setup().await;
     let counter = Arc::new(AtomicUsize::new(0));
-    let state = common::test_state_with_redis(_pool.clone(), common::test_redis_pool().await);
+    let state = test_state_with_redis(_pool.clone(), test_redis_pool().await);
 
     let key = unique_key("login-idem");
     let redis_key = format!("idem:{key}");

@@ -16,6 +16,12 @@
 //! 4. presigned_get_url → 拿 URL + 浏览器-like 风格 HTTP GET 验证可达
 //! 5. copy_object → 服务端 PUT copy-object（spike memory backend 不支持这条）
 //! 6. delete_object → 幂等清理
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原 `use ...::fixtures::*` 改走 `use hsh_erp_test_support::*` +
+//! `load_cos_real_smoke_fixture(&pool)`（stub）。fixture 是空 stub（`SELECT 1;`），
+//! 保持 `load_<binary>_fixture` 调用约定一致。本测试 opt-in 走真 COS 凭据，
+//! 不依赖 DB / Redis。字面请求 / 断言逐字保留。
 
 use std::env;
 use std::time::Duration;
@@ -23,6 +29,7 @@ use std::time::Duration;
 use hsh_erp_rust::infra::config::{CosBackend, CosConfig};
 use hsh_erp_rust::infra::cos::CosClient;
 use hsh_erp_rust::infra::cos_opendal::OpenDalCos;
+use hsh_erp_test_support::{load_cos_real_smoke_fixture, test_pool};
 
 fn require_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{name} 必须设置（spike 真 COS 验证）"))
@@ -66,6 +73,10 @@ async fn open_dal_round_trip_all_six_methods_against_real_cos() {
         eprintln!("跳过：未设置 RUN_REAL_COS_TESTS=1");
         return;
     }
+
+    // 加载 stub fixture（保持 `load_<binary>_fixture` 调用约定一致）
+    let _pool = test_pool().await;
+    let _fx = load_cos_real_smoke_fixture(&_pool).await;
 
     let cfg = build_cos_config();
     let prefix = unique_prefix();

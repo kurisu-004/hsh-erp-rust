@@ -1,0 +1,21 @@
+-- ============================================================================
+--  idempotency 域集成测试 fixture (PR13 Phase I, 2026-09-24)
+--
+--  加载入口：test-support::fixture::load_idempotency_fixture(pool)
+--  加载方式：sqlx::raw_sql(include_str!("../../fixtures/idempotency.sql")).execute(pool).await
+--
+--  ## 设计原则
+--  - 所有 ID 走常量 9_000_000_000_000_000_200+ 区段（physical 不相交）。
+--
+--  ## ID 段分配（200+）
+--  -- (空 stub)
+--
+--  ## 不预置任何表
+--  idempotency_api.rs 是中间件层集成测试，用 `make_test_app(state, counter)`
+--  自建 mini router + `__test/post` 等路由 + `Arc<AtomicUsize>` 计数器，
+--  走 `idempotency_middleware` 单测。所有用例用 UUID 唯一 idem-key 防止
+--  并行测试间 cache 撞车；本 fixture 是空 stub，仅占位 ID 段 200-209。
+-- ============================================================================
+
+-- （本 fixture 为 stub：idempotency_api 不依赖任何 DB 数据）
+SELECT 1;

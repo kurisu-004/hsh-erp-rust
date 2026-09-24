@@ -16,16 +16,16 @@
 //! 事务由 handler 层 `state.pool.begin()` 管；handler 层语义回归改由
 //! `tests/iam/api.rs`（HTTP 契约测试，强回归网）承担。本文件保留 SQL/repo 层 47 例。
 //!
-//! 复用 `tests/common/mod.rs` 的 fixture（ensure_database_exists / test_pool / clean_db
-//! / insert_user_with_password 等），与既有 tests/* 风格一致。
-
-#[path = "../common/mod.rs"]
-mod common;
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原 `#[path = "../common/mod.rs"] mod common;` + `use common::{...};`
+//! 改走 `use hsh_erp_test_support::*` + `load_user_repo_fixture(&pool)` +
+//! `UserRepoFixture`。fixture 提供 baseline user / role / menu；多数测试
+//! 仍走本地 `seed_user(pool, username, is_active)` helper 创建专属测试数据
+//! （特定 username / 多用户组合），user_repo 域独享 helper 不走 fixtures.rs。
+//! 字面请求 / 断言逐字保留。
 
 use chrono::NaiveDateTime;
 use sqlx::PgPool;
-
-use common::{ensure_database_exists, test_pool};
 
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
@@ -36,21 +36,32 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::iam::repo::{UserInsert, UserPartialUpdate};
 use hsh_erp_rust::modules::iam::repo::sql::user as user_sql;
 
+// 2026-09-24 PR13 Phase I：fixture 范本化入口。`load_user_repo_fixture(&pool)` 加载
+// 1 menu baseline（PR-C.Final 移除 user + role baseline，避免污染
+// count / list_with_filters_* 「期望空库」断言）；多数测试用本地 seed_user
+// 创建专属测试数据，仅在需要 baseline 时取 fx.baseline_menu_id 常量。
+use hsh_erp_test_support::{UserRepoFixture, load_user_repo_fixture, test_pool};
+
 // ===========================================================================
 // 全局串行化互斥：所有用例共享同一 DB。
 // ===========================================================================
 
 /// 进程级共享雪花生成器：每次 `SnowflakeIdGenerator::new(...)` 都把 sequence 重置为 0，
 /// 同一毫秒内多次 seed 会撞 ID。共享同一生成器才能保证每个用例内多 ID 唯一。
-/// 复用 `tests/common/mod.rs::pool_snowflake()` 的实例 + epoch + instance 配置。
+/// 复用 `test-support::pool::pool_snowflake()` 的实例 + epoch + instance 配置
+///（原 tests/common/mod.rs::pool_snowflake 转发路径已收口到 crate root）。
 fn snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
-    common::pool_snowflake()
+    hsh_erp_test_support::pool_snowflake()
 }
 
-/// 用例开头固定两步：建库 → 连池（test_pool 每次 fresh database，无残留，无需清表）。
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
-    test_pool().await
+/// 基础 bootstrap：fresh DB + user_repo fixture 1 行（baseline menu）+ 返回 pool。
+///
+/// fixture baseline（本文件大多数测试不直接使用，但 setup 加载过程无害）；
+/// 测试现场仍走本地 `seed_user` 创建专属测试数据（特定 username / 多用户组合）。
+async fn setup() -> (PgPool, UserRepoFixture) {
+    let pool = test_pool().await;
+    let fx = load_user_repo_fixture(&pool).await;
+    (pool, fx)
 }
 
 // ===========================================================================
@@ -84,7 +95,7 @@ async fn seed_user(pool: &PgPool, username: &str, is_active: bool) -> i64 {
 /// `user_sql::get_by_id`：命中（活跃用户）
 #[tokio::test]
 async fn get_by_id_returns_user_when_active() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
 
     let u = user_sql::get_user_by_id(&pool, id)
@@ -100,7 +111,7 @@ async fn get_by_id_returns_user_when_active() {
 /// `user_sql::get_by_id`：不存在的 id
 #[tokio::test]
 async fn get_by_id_returns_none_for_missing_id() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let u = user_sql::get_user_by_id(&pool, 999_999_999_999)
         .await
         .expect("query");
@@ -110,7 +121,7 @@ async fn get_by_id_returns_none_for_missing_id() {
 /// `user_sql::get_by_id`：软删用户不可见
 #[tokio::test]
 async fn get_by_id_excludes_soft_deleted() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "ghost", true).await;
     sqlx::query!(
         "UPDATE t_user SET deleted_at = $2, is_active = false WHERE id = $1",
@@ -128,7 +139,7 @@ async fn get_by_id_excludes_soft_deleted() {
 /// `user_sql::get_by_username`：命中（活跃）
 #[tokio::test]
 async fn get_by_username_returns_active_user() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let _ = seed_user(&pool, "bob", true).await;
 
     let u = user_sql::get_user_by_username(&pool, "bob")
@@ -142,7 +153,7 @@ async fn get_by_username_returns_active_user() {
 /// `user_sql::get_by_username`：repo 层**不**做大小写归一（落库已 lower，应用层是 LIKE）
 #[tokio::test]
 async fn get_by_username_is_case_sensitive_in_repo() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let _ = seed_user(&pool, "carol", true).await;
 
     // 小写命中
@@ -160,7 +171,7 @@ async fn get_by_username_is_case_sensitive_in_repo() {
 /// `user_sql::get_by_username`：不存在的 username
 #[tokio::test]
 async fn get_by_username_returns_none_for_missing() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let u = user_sql::get_user_by_username(&pool, "no-such")
         .await
         .expect("query");
@@ -170,7 +181,7 @@ async fn get_by_username_returns_none_for_missing() {
 /// `user_sql::list_with_filters`：空库返回空
 #[tokio::test]
 async fn list_with_filters_empty_returns_empty() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let rows = user_sql::list_users_with_filters(&pool, None, None, 50, 0)
         .await
         .expect("list");
@@ -180,7 +191,7 @@ async fn list_with_filters_empty_returns_empty() {
 /// `user_sql::list_with_filters`：username_like 部分匹配
 #[tokio::test]
 async fn list_with_filters_username_like_filters() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let _ = seed_user(&pool, "alice-1", true).await;
     let _ = seed_user(&pool, "alice-2", true).await;
     let _ = seed_user(&pool, "bob", true).await;
@@ -197,7 +208,7 @@ async fn list_with_filters_username_like_filters() {
 /// `user_sql::list_with_filters`：is_active=false 过滤
 #[tokio::test]
 async fn list_with_filters_is_active_filters() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let active = seed_user(&pool, "active", true).await;
     let _inactive = seed_user(&pool, "inactive", false).await;
 
@@ -212,7 +223,7 @@ async fn list_with_filters_is_active_filters() {
 /// `user_sql::list_with_filters`：分页
 #[tokio::test]
 async fn list_with_filters_pagination() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     for i in 0..5 {
         let _ = seed_user(&pool, &format!("u{i}"), true).await;
     }
@@ -236,7 +247,7 @@ async fn list_with_filters_pagination() {
 /// `user_sql::list_with_filters`：默认排序按 created_at DESC
 #[tokio::test]
 async fn list_with_filters_orders_by_created_at_desc() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let first = seed_user(&pool, "first", true).await;
     // 隔一会插第二个
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -253,7 +264,7 @@ async fn list_with_filters_orders_by_created_at_desc() {
 /// `user_sql::count_with_filters`：只数活跃
 #[tokio::test]
 async fn count_with_filters_counts_active_only() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let _ = seed_user(&pool, "u1", true).await;
     let _ = seed_user(&pool, "u2", true).await;
     let _ = seed_user(&pool, "u3", false).await;
@@ -267,7 +278,7 @@ async fn count_with_filters_counts_active_only() {
 /// `user_sql::count_with_filters`：带 username_like 过滤
 #[tokio::test]
 async fn count_with_filters_with_username_filter() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let _ = seed_user(&pool, "alpha-1", true).await;
     let _ = seed_user(&pool, "alpha-2", true).await;
     let _ = seed_user(&pool, "beta", true).await;
@@ -281,7 +292,7 @@ async fn count_with_filters_with_username_filter() {
 /// `user_sql::create_user`：INSERT 成功
 #[tokio::test]
 async fn create_inserts_new_user() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = snowflake().lock().unwrap().next_id();
     let insert = UserInsert {
         id,
@@ -308,7 +319,7 @@ async fn create_inserts_new_user() {
 /// `user_sql::create_user`：username 撞唯一索引 → sqlx::Error
 #[tokio::test]
 async fn create_returns_error_on_duplicate_username() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let _ = seed_user(&pool, "dup", true).await;
 
     let id = snowflake().lock().unwrap().next_id();
@@ -329,7 +340,7 @@ async fn create_returns_error_on_duplicate_username() {
 /// `user_sql::update_user_partial`：更新 full_name
 #[tokio::test]
 async fn update_partial_updates_full_name() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = user_sql::update_user_partial(
         &pool,
@@ -359,7 +370,7 @@ async fn update_partial_updates_full_name() {
 /// `user_sql::update_user_partial`：set_phone=true 清空 phone
 #[tokio::test]
 async fn update_partial_set_phone_flag_clears_phone() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     sqlx::query!(
         "UPDATE t_user SET phone = $2 WHERE id = $1",
@@ -400,7 +411,7 @@ async fn update_partial_set_phone_flag_clears_phone() {
 /// `user_sql::update_user_partial`：set_phone=false 保留 phone
 #[tokio::test]
 async fn update_partial_no_set_phone_keeps_existing() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     sqlx::query!(
         "UPDATE t_user SET phone = $2 WHERE id = $1",
@@ -438,7 +449,7 @@ async fn update_partial_no_set_phone_keeps_existing() {
 /// `user_sql::update_user_partial`：version 不匹配 → 0 行
 #[tokio::test]
 async fn update_partial_zero_rows_for_version_conflict() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = user_sql::update_user_partial(
         &pool,
@@ -462,7 +473,7 @@ async fn update_partial_zero_rows_for_version_conflict() {
 /// `user_sql::soft_delete_user`：软删成功 + 后续 get_by_id 不可见
 #[tokio::test]
 async fn soft_delete_sets_deleted_at_and_is_active_false() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = user_sql::soft_delete_user(&pool, id, 0, now_naive(), None)
         .await
@@ -488,7 +499,7 @@ async fn soft_delete_sets_deleted_at_and_is_active_false() {
 /// `user_sql::soft_delete_user`：version 不匹配 → 0 行
 #[tokio::test]
 async fn soft_delete_zero_rows_for_version_conflict() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = user_sql::soft_delete_user(&pool, id, 99, now_naive(), None)
         .await
@@ -499,7 +510,7 @@ async fn soft_delete_zero_rows_for_version_conflict() {
 /// `user_sql::touch_login`：刷新 last_login_at
 #[tokio::test]
 async fn touch_login_updates_last_login_at() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let when: NaiveDateTime = now_naive() + chrono::Duration::hours(1);
     user_sql::touch_user_last_login_at(&pool, id, when)
@@ -519,7 +530,7 @@ async fn touch_login_updates_last_login_at() {
 /// `user_sql::increment_refresh_token_version`：轮转成功
 #[tokio::test]
 async fn increment_refresh_token_version_rotates_token_version() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = user_sql::increment_user_refresh_token_version(&pool, id, 0, now_naive(), None)
         .await
@@ -539,7 +550,7 @@ async fn increment_refresh_token_version_rotates_token_version() {
 /// `user_sql::increment_refresh_token_version`：version 不匹配 → 0 行
 #[tokio::test]
 async fn increment_refresh_token_version_zero_rows_for_version_conflict() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = user_sql::increment_user_refresh_token_version(&pool, id, 99, now_naive(), None)
         .await
@@ -550,7 +561,7 @@ async fn increment_refresh_token_version_zero_rows_for_version_conflict() {
 /// `user_sql::update_password_and_rotate`：同时改密 + 轮转
 #[tokio::test]
 async fn update_password_and_rotate_updates_hash_and_rotates() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected =
         user_sql::update_user_password_and_rotate(&pool, id, 0, "new-hash", now_naive(), None)
@@ -574,7 +585,7 @@ async fn update_password_and_rotate_updates_hash_and_rotates() {
 /// `user_sql::update_password_and_rotate`：version 不匹配 → 0 行
 #[tokio::test]
 async fn update_password_and_rotate_zero_rows_for_version_conflict() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = user_sql::update_user_password_and_rotate(
         &pool,

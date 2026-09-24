@@ -14,12 +14,6 @@
 //! 不启 axum（避免 JWT/Redis 开销），直接 service 直调；`pool.begin()` 开 tx →
 //! 传 `&mut *tx` 给 service → 显式 `tx.commit()`。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `mod common;` 在 sub-file 中只查 sibling 目录。
-// 2026-09-23 PR13 Phase G：fixture 由 PartFixture 提供（customers + part）。MockCos /
-// NoopCos 保留；动态 part 插入由 sub-file 内联 helper 完成（每个测试都需要自己的 part）。
-#[path = "helpers.rs"]
-mod helpers;
-
 use std::sync::Arc;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};

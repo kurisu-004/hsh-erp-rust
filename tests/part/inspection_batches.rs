@@ -14,13 +14,6 @@
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
 
-// 2026-09-23 PR13 Phase C：edition 2024 下 `mod helpers;` 在 sub-file 中只查 sibling 目录，
-// 加 `#[path]` 显式指到 `tests/part/helpers.rs`。
-// 2026-09-23 PR13 Phase G：helpers.rs 改为 thin barrel `pub use hsh_erp_test_support::*;`，
-// 域 fixture 由 `hsh_erp_test_support::fixture::PartFixture` 提供。
-#[path = "helpers.rs"]
-mod helpers;
-
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;

@@ -16,13 +16,16 @@
 //! ## 测试并行注意
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
-
-#[path = "../common/mod.rs"]
-mod common;
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原 `#[path = "../common/mod.rs"] mod common;` + `use common::{...};`
+//! 改走 `use hsh_erp_test_support::*` + `load_user_repo_fixture(&pool)` +
+//! `UserRepoFixture`。fixture 提供 baseline user / role / menu；本文件 4 例
+//! 事务测试用 `snowflake().next_id()` 现造 user_id（必须用新 ID 走
+//! `create_user(&mut *tx, ...)`），3 例补充测试用本地 seed_user 创建专属测试
+//! 数据。user_repo 域独享 helper 不走 fixtures.rs。字面请求 / 断言逐字保留。
 
 use sqlx::PgPool;
-
-use common::{ensure_database_exists, test_pool};
 
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
@@ -31,21 +34,34 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::modules::iam::repo::{UserInsert, UserPartialUpdate, UserRoleInsert};
 use hsh_erp_rust::modules::iam::repo::sql::{user as user_sql, user_role as user_role_sql};
 
+// 2026-09-24 PR13 Phase I：fixture 范本化入口。`load_user_repo_fixture(&pool)` 加载
+// 1 menu baseline（PR-C.Final 移除 user + role baseline，避免污染
+// count / list_with_filters_* 「期望空库」断言）；本文件事务测试用 snowflake()
+// 现造 user_id（必须新 ID 才能 create_user），补充测试用本地 seed_user 创建
+// 专属测试数据，仅在需要 baseline 时取 fx.baseline_menu_id 常量。
+use hsh_erp_test_support::{UserRepoFixture, load_user_repo_fixture, test_pool};
+
 // ===========================================================================
 // 全局串行化互斥：所有用例共享同一 DB。
 // ===========================================================================
 
 /// 进程级共享雪花生成器：每次 `SnowflakeIdGenerator::new(...)` 都把 sequence 重置为 0，
 /// 同一毫秒内多次 seed 会撞 ID。共享同一生成器才能保证每个用例内多 ID 唯一。
-/// 复用 `tests/common/mod.rs::pool_snowflake()` 的实例 + epoch + instance 配置。
+/// 复用 `test-support::pool::pool_snowflake()` 的实例 + epoch + instance 配置
+///（原 tests/common/mod.rs::pool_snowflake 转发路径已收口到 crate root）。
 fn snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
-    common::pool_snowflake()
+    hsh_erp_test_support::pool_snowflake()
 }
 
-/// 用例开头固定两步：建库 → 连池（test_pool 每次 fresh database，无残留，无需清表）。
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
-    test_pool().await
+/// 基础 bootstrap：fresh DB + user_repo fixture 1 行（baseline menu）+ 返回 pool。
+///
+/// fixture baseline（本文件大多数测试不直接使用，但 setup 加载过程无害）；
+/// 事务测试用 snowflake() 现造 user_id（必须新 ID 才能 create_user），
+/// 补充测试用本地 seed_user 创建专属测试数据。
+async fn setup() -> (PgPool, UserRepoFixture) {
+    let pool = test_pool().await;
+    let fx = load_user_repo_fixture(&pool).await;
+    (pool, fx)
 }
 
 /// seed 一个最小可用的 user 行（不经过 `user_sql::create_user`）。
@@ -108,7 +124,7 @@ async fn seed_role(
 #[tokio::test]
 #[allow(clippy::explicit_auto_deref)] // `&mut *tx` 是 sqlx 借 `&mut PgConnection` 的标准模式
 async fn create_user_then_add_role_then_list_persists_all() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
 
     let mut tx = pool.begin().await.expect("begin");
 
@@ -158,7 +174,7 @@ async fn create_user_then_add_role_then_list_persists_all() {
 #[tokio::test]
 #[allow(clippy::explicit_auto_deref)]
 async fn soft_delete_user_then_list_roles_returns_empty() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
 
     // seed 一个 user + role
     let uid = seed_user(&pool, "toclose", true).await;
@@ -191,7 +207,7 @@ async fn soft_delete_user_then_list_roles_returns_empty() {
 #[tokio::test]
 #[allow(clippy::explicit_auto_deref)]
 async fn transaction_commit_persists_writes() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
 
     let mut tx = pool.begin().await.expect("begin");
     let uid = snowflake().lock().unwrap().next_id();
@@ -221,7 +237,7 @@ async fn transaction_commit_persists_writes() {
 #[tokio::test]
 #[allow(clippy::explicit_auto_deref)]
 async fn transaction_drop_without_commit_rolls_back() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
 
     let mut tx = pool.begin().await.expect("begin");
     let uid = snowflake().lock().unwrap().next_id();
@@ -252,7 +268,7 @@ async fn transaction_drop_without_commit_rolls_back() {
 /// `user_sql::update_user_partial`：同时改 password_hash（管理员重置密码不踢下线路径）
 #[tokio::test]
 async fn update_partial_changes_password_hash_without_rotate() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = user_sql::update_user_partial(
         &pool,
@@ -285,7 +301,7 @@ async fn update_partial_changes_password_hash_without_rotate() {
 /// `user_sql::update_user_partial`：同时改 is_active=false（管理员停用）
 #[tokio::test]
 async fn update_partial_changes_is_active() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let id = seed_user(&pool, "alice", true).await;
     let affected = user_sql::update_user_partial(
         &pool,
@@ -314,7 +330,7 @@ async fn update_partial_changes_is_active() {
 /// `user_role_sql::list_user_roles_by_user_id`：过滤软删的角色
 #[tokio::test]
 async fn list_user_roles_by_user_id_excludes_soft_deleted_roles() {
-    let pool = setup().await;
+    let (pool, _fx) = setup().await;
     let uid = seed_user(&pool, "alice", true).await;
     let active_rid = seed_role(&pool, uid, "MANAGER", None, None).await;
     let deleted_rid = seed_role(&pool, uid, "CLERK", None, None).await;
