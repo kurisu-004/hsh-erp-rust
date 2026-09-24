@@ -14,18 +14,13 @@ use sqlx::PgPool;
 
 /// `fixtures/cos_real_smoke.sql` 加载产物：常量 ID 句柄（本 fixture 为空 stub）。
 #[allow(dead_code)]
+#[derive(Default)]
 pub struct CosRealSmokeFixture {}
 
 impl CosRealSmokeFixture {
     /// fixture ID 段起点（与 fixtures/cos_real_smoke.sql 占位 SELECT 1 对齐）。
     /// 实际无 INSERT 行，调用方不应依赖此值。
     pub const STUB_ID: i64 = 9_000_000_000_000_000_220;
-}
-
-impl Default for CosRealSmokeFixture {
-    fn default() -> Self {
-        Self {}
-    }
 }
 
 /// 加载 cos_real_smoke fixture。

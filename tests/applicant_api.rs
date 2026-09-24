@@ -16,6 +16,7 @@
 //! ## URL 约定
 //! `test_app` 返回 `v2_router()` 直挂，无 `/api/v2` 前缀 —— 故 URL 写 `/com/applicants` 而非
 //! `/api/v2/com/applicants`（与 main.rs 的 `/api/v2` nest 区分；2026-09-19 applicant 聚合至 com nest）。
+//!
 //! 该写法与 worker_pool_api.rs /
 //! part_api.rs / delivery_*_api.rs 等保持一致。
 //!
@@ -24,6 +25,7 @@
 //! `use hsh_erp_test_support::*` + `load_applicant_fixture(&pool)` +
 //! `ApplicantFixture` + `bootstrap_as_manager` 样板。fixture 提供 1 MANAGER user
 //! + 2 customer（L1+L2）+ 1 baseline applicant + 1 part 行（in-use 校验）。
+//!
 //! 测试内的 local helpers（insert_l1 / insert_l2 / insert_part_referencing_applicant）
 //! 仍走 snowflake ID 现场创建特定字面数据（用于 create / L2 校验 / 重名场景）。
 //! 字面请求 / 断言逐字保留。

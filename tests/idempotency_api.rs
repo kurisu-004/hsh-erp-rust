@@ -33,10 +33,10 @@
 //! （与 `test-support::http::send` 返 `(StatusCode, Value)` 不一致 —— 本文件用 raw bytes
 //! 字节级断言第二次响应用 request 缓存命中），保留本地版本。
 //!
-//! **保留本地 `use common::*`**：本文件 setup 走 `common::test_pool`（无 fixture 依赖）
-//! + `common::test_state_with_redis` + `common::test_redis_pool`，均为 fixtures.rs
-//! 之外的 helper（test_state 在 state.rs，test_redis_pool 在 redis.rs），不属
-//! fixtures.rs 风格 helper，无需替换。
+//! **保留本地 `use common::*`**：本文件 setup 走 `common::test_pool` +
+//! `common::test_state_with_redis` + `common::test_redis_pool`，均为 fixtures.rs
+//! 之外的 helper（test_state 在 state.rs，test_redis_pool 在 redis.rs），
+//! 不属 fixtures.rs 风格 helper，无需替换。
 
 #[path = "common/mod.rs"]
 mod common;

@@ -5,7 +5,7 @@
 //!
 //! ## 字段按域需求聚合
 //! - `t_process` ×1 —— fx_e2e_process（hard-delete 引用检测：被
-//! `t_outsource_company_process` 引用 → 触发 21205 守卫）
+//!   `t_outsource_company_process` 引用 → 触发 21205 守卫）
 //!
 //! 不预置 `t_user` / `t_customer` / `t_outsource_company`：所有 9 个测试均走
 //! `/_e2e/seed/*` 端点自建数据；fixture 仅提供 baseline t_process 行
