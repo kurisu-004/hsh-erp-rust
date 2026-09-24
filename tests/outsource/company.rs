@@ -8,92 +8,67 @@
 //! - soft-delete: 仍映射工序时 409
 //! - list-by-process: 按 process 反查 active 公司
 //! - set-processes: 整体替换（delete-then-insert）
+//!
+//! ## 集成测试范本（PR13 Phase H，2026-09-24）
+//! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
+//! `login_manager` 通用 helper，统一走
+//! `use hsh_erp_test_support::{...}` + `bootstrap_as_manager()` +
+//! `load_outsource_fixture(&pool)`。保留：
+//! - `seed_outsource_process`：company 域独享（9 个场景需要不同 OUTSOURCE
+//!   工序 code，按需用 sqlx::query 直插；fixture 预置的 FX-OPROC-A 仅作
+//!   baseline 共享）；
+//! - 域独享 helper 不从 `fixtures` 模块 `use`（Phase H gate 5 禁止）；
+//!   本地 helper 用 `sqlx::query` 直插与 `fixtures::seed_process` 同形 SQL
+//!   （columns / defaults 全部对齐 migration 003 的 t_process schema，
+//!   category='OUTSOURCE'）。
+//!
+//! ## 不预置 t_outsource_company
+//! 各场景需要不同 name / is_active / contact 等字段；预置 1 行 FX-OC-001
+//! 不与测试自建 company 撞（uk_t_outsource_company_name 仅约束 active 同名
+//! 唯一），但绝大多数场景希望公司列表干净从 0 起算，因此各 sub-file 用
+//! 本地 `insert_outsource_company` 插自定义行。
 
-#[path = "../common/mod.rs"]
-mod common;
-
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tower::ServiceExt;
 
-use common::{
-    add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
-    test_app, test_pool, test_state,
+use hsh_erp_test_support::{
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app,
+    test_pool, test_state,
 };
+use hsh_erp_rust::infra::clock::now_naive;
+use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
-//  全局串行化 + helpers
+//  Bootstrap helpers（PR13 Phase H 风格）
 // ===========================================================================
 
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let uri = req.uri().to_string();
-    let method = req.method().to_string();
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let body_str = String::from_utf8_lossy(&body).to_string();
-    let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!("parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}")
-    });
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 outsource fixture + 以 MANAGER 身份登录。
+///
+/// 返回 `(pool, app, token, fx)`。后续测试可直接 `pool` 跑 query!、
+/// `app.clone()` 多次 `send`、token 直接拼到 bearer header；`fx` 暴露
+/// `part_manager_username` / 预制常量 ID 等强类型句柄（绝大多数 company
+/// 域测试用本地 `seed_outsource_process` 自建 OUTSOURCE 工序，仅
+/// `outsource_process_id` / `outsource_company_id` 作为 baseline 句柄备查）。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, OutsourceFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_outsource_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.part_manager_username, OutsourceFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token)
-}
+// ===========================================================================
+//  company 域独享 helpers（绕开 fixtures::seed_process 因为 Phase H gate 5
+//  禁止从 `fixtures` 模块 use 任何动态 helper）
+// ===========================================================================
 
-/// 插一个 OUTSOURCE 类别 process（不走 common::seed_process）
+/// 直插一个 OUTSOURCE 类别 `t_process` 工序。
+///
+/// 与 `fixtures::seed_process` 同形 SQL，但 category='OUTSOURCE'（fixture 版
+/// 走 INHOUSE，company 域必须用 OUTSOURCE）。
 async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -117,8 +92,7 @@ async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 
 #[tokio::test]
 async fn create_outsource_company_happy_path() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool, "oc_admin").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
     let (s, env) = send(
         app.clone(),
@@ -140,8 +114,7 @@ async fn create_outsource_company_happy_path() {
 
 #[tokio::test]
 async fn create_outsource_company_duplicate_returns_21202() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool, "oc_dup").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
     let (s1, _) = send(
         app.clone(),
@@ -176,8 +149,7 @@ async fn create_outsource_company_duplicate_returns_21202() {
 /// 单线程顺序测试通常命中前者，但保证两种路径下都不返 500。
 #[tokio::test]
 async fn create_outsource_company_duplicate_returns_409() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool, "oc_dup409").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
     let (s1, _) = send(
         app.clone(),
@@ -215,8 +187,7 @@ async fn create_outsource_company_duplicate_returns_409() {
 
 #[tokio::test]
 async fn create_outsource_company_with_process_ids_creates_mapping() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "oc_proc").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let p1 = seed_outsource_process(&pool, "PROC-O-1", "外协工序1").await;
     let p2 = seed_outsource_process(&pool, "PROC-O-2", "外协工序2").await;
 
@@ -258,8 +229,7 @@ async fn create_outsource_company_with_process_ids_creates_mapping() {
 
 #[tokio::test]
 async fn update_outsource_company_version_conflict_returns_40901() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool, "oc_vc").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
     let (_, env_c) = send(
         app.clone(),
@@ -290,8 +260,7 @@ async fn update_outsource_company_version_conflict_returns_40901() {
 
 #[tokio::test]
 async fn soft_delete_outsource_company_in_use_returns_21205() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "oc_inuse").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let p1 = seed_outsource_process(&pool, "PROC-INUSE", "外协INUSE").await;
     let (_, env_c) = send(
         app.clone(),
@@ -324,8 +293,7 @@ async fn soft_delete_outsource_company_in_use_returns_21205() {
 
 #[tokio::test]
 async fn list_outsource_companies_name_like_and_is_active_filter() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool, "oc_list").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
     // 3 个公司：A 激活、B 激活、C 停用
     for (n, active) in [("AAAA Inc", true), ("BBBB Co", true), ("CCCC Ltd", false)] {
@@ -342,7 +310,7 @@ async fn list_outsource_companies_name_like_and_is_active_filter() {
         assert_eq!(s, StatusCode::CREATED);
     }
 
-    // name_like=AA → 1
+    // name_like=AA → 1（fixture FX-OC-001 不含 "AA" 子串，命中 0）
     let (_, env1) = send(
         app.clone(),
         json_request(
@@ -355,7 +323,9 @@ async fn list_outsource_companies_name_like_and_is_active_filter() {
     .await;
     assert_eq!(env1["data"]["total"].as_i64().unwrap(), 1);
 
-    // is_active=true → 2
+    // is_active=true → 3（fixture FX-OC-001 active + AAAA/BBBB active 共 3 行）
+    // 2026-09-24 PR13 Phase H：fixture 预置 FX-OC-001（is_active=true），
+    // 与原测试 2 行合计 3 行。原版断言 2 改为 3。
     let (_, env2) = send(
         app.clone(),
         json_request(
@@ -366,13 +336,12 @@ async fn list_outsource_companies_name_like_and_is_active_filter() {
         ),
     )
     .await;
-    assert_eq!(env2["data"]["total"].as_i64().unwrap(), 2);
+    assert_eq!(env2["data"]["total"].as_i64().unwrap(), 3);
 }
 
 #[tokio::test]
 async fn set_outsource_company_processes_replaces_mapping() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "oc_setproc").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let p1 = seed_outsource_process(&pool, "SP-1", "sp1").await;
     let p2 = seed_outsource_process(&pool, "SP-2", "sp2").await;
     let p3 = seed_outsource_process(&pool, "SP-3", "sp3").await;
@@ -416,8 +385,7 @@ async fn set_outsource_company_processes_replaces_mapping() {
 
 #[tokio::test]
 async fn list_outsource_companies_by_process_filters_inactive() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "oc_byp").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let p = seed_outsource_process(&pool, "BYP", "byp").await;
     // active
     let (_, _) = send(

@@ -8,92 +8,62 @@
 //!
 //! 注：实际 send/receive 端点在 part 域（part_lifecycle_api.rs 已覆盖 happy path）。
 //! 本测试聚焦 shipment 表的写入正确性。
+//!
+//! ## 集成测试范本（PR13 Phase H，2026-09-24）
+//! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
+//! `login_manager` 通用 helper，统一走
+//! `use hsh_erp_test_support::{...}` + `bootstrap_as_manager()` +
+//! `load_outsource_fixture(&pool)`。保留：
+//! - `insert_l1_customer` / `insert_part` / `insert_batch` /
+//!   `insert_outsource_company` / `seed_outsource_process` /
+//!   `insert_approved_quote`：send_receive 域独享（每个测试要按需造不同
+//!   customer prefix / 不同 part status / 不同 batch location / 不同
+//!   company name 的组合；fixture 预置仅作 baseline）；
+//! - `create_chain_for_part` / `create_step`：send_receive 域独享（绕开 part
+//!   软删级联 + PR-3 批次 step 化要求 part 已绑定工艺链 + step）；
+//! - 域独享 helper 不从 `fixtures` 模块 `use`（Phase H gate 5 禁止）；
+//!   本地 helper 用 `sqlx::query` 直插与 `fixtures::*` 同形 SQL。
+//!
+//! ## 不预置 t_part / t_part_batch / t_part_process_chain / t_process_chain_step /
+//!  t_outsource_quote / t_outsource_shipment
+//! 状态机不允许 part 从 OUTSOURCE 回退 PENDING；每个测试要按需造不同
+//! (part, batch, company, process, quote) 组合 + 自建 chain/step。预置会污染
+//! list / count 等「期望空库」断言。各 sub-file 用本地 helper 直插。
 
-#[path = "../common/mod.rs"]
-mod common;
-
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
-use serde_json::{Value, json};
+use axum::http::StatusCode;
+use serde_json::json;
 use sqlx::PgPool;
-use tower::ServiceExt;
 
-use common::{
-    add_role, clean_business_db, clean_db, create_chain_for_part, create_step,
-    ensure_database_exists, insert_user_with_password, link_shelf_to_process, seed_process,
-    test_app, test_pool, test_state,
+use hsh_erp_test_support::{
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app,
+    test_pool, test_state,
 };
+use hsh_erp_rust::infra::clock::now_naive;
+use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 // ===========================================================================
-//  Helpers
+//  Bootstrap helpers（PR13 Phase H 风格）
 // ===========================================================================
 
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let uri = req.uri().to_string();
-    let method = req.method().to_string();
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let body_str = String::from_utf8_lossy(&body).to_string();
-    let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!("parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}")
-    });
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 outsource fixture + 以 MANAGER 身份登录。
+///
+/// 返回 `(pool, app, token, fx)`。所有 send_receive 测试以 MANAGER 身份跑。
+async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, OutsourceFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
+    let fx = load_outsource_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.part_manager_username, OutsourceFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token)
-}
+// ===========================================================================
+//  send_receive 域独享 helpers（绕开 fixtures::* 因为 Phase H gate 5 禁止从
+//  `fixtures` 模块 use 任何动态 helper）
+// ===========================================================================
 
+/// 直插 L1 客户（绕开 customer CRUD）。
 async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -110,9 +80,9 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     id
 }
 
+/// 直插 part（任意 status）。
 async fn insert_part(pool: &PgPool, customer_id: i64, status: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -133,9 +103,9 @@ async fn insert_part(pool: &PgPool, customer_id: i64, status: &str) -> i64 {
     id
 }
 
+/// 直插批次（任意 status + 可选 location）。
 async fn insert_batch(pool: &PgPool, part_id: i64, status: &str, location: Option<&str>) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -154,9 +124,9 @@ async fn insert_batch(pool: &PgPool, part_id: i64, status: &str, location: Optio
     id
 }
 
+/// 直插外协公司。
 async fn insert_outsource_company(pool: &PgPool, name: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -172,9 +142,9 @@ async fn insert_outsource_company(pool: &PgPool, name: &str) -> i64 {
     id
 }
 
+/// 直插 OUTSOURCE 类别 process。
 async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -192,14 +162,14 @@ async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     id
 }
 
+/// 直插 APPROVED 状态 quote（绕开 DRAFT→SUBMITTED→APPROVED 状态机）。
 async fn insert_approved_quote(
     pool: &PgPool,
     part_id: i64,
     company_id: i64,
     process_id: i64,
 ) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -219,14 +189,58 @@ async fn insert_approved_quote(
     id
 }
 
+/// 2026-09-16 PR-3 批次 step 化：to_process / place_on_shelf / send_to_outsource /
+/// repair 等"进入生产流"端点要求 part 已绑定工艺链（migration 028 +
+/// error code 20706 BIZ_PROCESS_CHAIN_REQUIRED）。本 helper 帮 part 建链 + 绑 part。
+///
+/// 返回 chain_id；caller 可继续调 `create_step` 加 step。
+async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let chain_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 0, now(), 0, now(), 0)",
+    )
+    .bind(chain_id)
+    .bind(format!("chain-{part_id}"))
+    .execute(pool)
+    .await
+    .expect("insert chain");
+    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+        .bind(chain_id)
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("bind part to chain");
+    chain_id
+}
+
+/// 2026-09-16 PR-3 批次 step 化：在指定 chain 内创建 step（process_id + sort_order）。
+async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let step_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, 30, 0, now(), 0, now(), 0)",
+    )
+    .bind(step_id)
+    .bind(chain_id)
+    .bind(sort_order)
+    .bind(process_id)
+    .execute(pool)
+    .await
+    .expect("insert step");
+    step_id
+}
+
 // ===========================================================================
 //  Tests
 // ===========================================================================
 
 #[tokio::test]
 async fn send_to_outsource_inserts_shipment_out_sourcing() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "send_admin").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "Snd", "S").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
@@ -281,8 +295,7 @@ async fn send_to_outsource_inserts_shipment_out_sourcing() {
 
 #[tokio::test]
 async fn send_to_outsource_duplicate_open_shipment_rejected() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "send_dup").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "Dup", "D").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
@@ -365,8 +378,7 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
 
 #[tokio::test]
 async fn send_to_outsource_direct_returns_internal_error() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "send_direct").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "Dir", "I").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
@@ -400,8 +412,7 @@ async fn send_to_outsource_direct_returns_internal_error() {
 
 #[tokio::test]
 async fn send_to_outsource_quote_not_approved_returns_21307() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "send_qdraft").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "Qd", "Q").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
@@ -413,23 +424,25 @@ async fn send_to_outsource_quote_not_approved_returns_21307() {
     // receive-from-outsource 要求 part 已绑定工艺链
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let qid = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_outsource_quote \
-         (id, part_id, outsource_company_id, process_id, price, status, \
-          version, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, 1, 'DRAFT', 0, $5, $5)",
-    )
-    .bind(qid)
-    .bind(part_id)
-    .bind(company_id)
-    .bind(proc_id)
-    .bind(now_naive())
-    .execute(&pool)
-    .await
-    .unwrap();
+    let qid = {
+        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+        let id = snowflake.next_id();
+        sqlx::query(
+            "INSERT INTO t_outsource_quote \
+             (id, part_id, outsource_company_id, process_id, price, status, \
+              version, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, 1, 'DRAFT', 0, $5, $5)",
+        )
+        .bind(id)
+        .bind(part_id)
+        .bind(company_id)
+        .bind(proc_id)
+        .bind(now_naive())
+        .execute(&pool)
+        .await
+        .unwrap();
+        id
+    };
 
     let (s, env) = send(
         app,
@@ -453,8 +466,7 @@ async fn send_to_outsource_quote_not_approved_returns_21307() {
 
 #[tokio::test]
 async fn receive_from_outsource_marks_shipment_received() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "recv_admin").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "R", "R").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "OUTSOURCE", Some("OUTSOURCE_COMPANY")).await;
@@ -467,7 +479,6 @@ async fn receive_from_outsource_marks_shipment_received() {
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     // 直插一个 OUTSOURCING shipment
-    use hsh_erp_rust::infra::clock::now_naive;
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_outsource_shipment \
@@ -486,9 +497,34 @@ async fn receive_from_outsource_marks_shipment_received() {
     .unwrap();
 
     // 准备接收目标架
-    let prod_shelf = common::insert_shelf(&pool, "REC-1", "Recv", "PRODUCTION").await;
-    let next_proc = seed_process(&pool, "REC-PROC", "recv_proc").await;
-    link_shelf_to_process(&pool, prod_shelf, next_proc).await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let prod_shelf = snowflake.next_id();
+    let recv_shelf_now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) \
+         VALUES ($1, 'REC-1', 'Recv', 'PRODUCTION', true, 0, 0, $2, $2)",
+    )
+    .bind(prod_shelf)
+    .bind(recv_shelf_now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let next_proc = seed_outsource_process(&pool, "REC-PROC", "recv_proc").await;
+    // link shelf to process (via t_shelf_process)
+    let link_id = snowflake.next_id();
+    let link_now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, \
+         created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $4)",
+    )
+    .bind(link_id)
+    .bind(prod_shelf)
+    .bind(next_proc)
+    .bind(link_now)
+    .execute(&pool)
+    .await
+    .unwrap();
     // 2026-09-16 PR-3：receive 路径要把 batch.current_process_step_id 切到
     // (chain_id, next_process_id) 对应的 step，因此 fixture 必须为 next_proc 也建一个 step。
     let next_step_id = create_step(&pool, chain_id, next_proc, 2).await;
@@ -534,14 +570,12 @@ async fn receive_from_outsource_marks_shipment_received() {
 
 #[tokio::test]
 async fn reconcile_update_shipment_unit_price_quantity() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "rec_admin").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "RU", "U").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "RecCo").await;
     let proc_id = seed_outsource_process(&pool, "PRU", "pru").await;
-    use hsh_erp_rust::infra::clock::now_naive;
 
     // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
     // receive-from-outsource 要求 part 已绑定工艺链
@@ -550,8 +584,7 @@ async fn reconcile_update_shipment_unit_price_quantity() {
     let now = now_naive();
     // 直接插一个 shipment
     let shipment_id: i64 = {
-        let snowflake =
-            hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
         let id = snowflake.next_id();
         sqlx::query(
             "INSERT INTO t_outsource_shipment \
