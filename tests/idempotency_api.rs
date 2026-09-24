@@ -23,6 +23,20 @@
 //! 跨用例污染——A.store(0) → A 发 POST counter=1 → B 在 A 校验前 store(0) →
 //! A 看到 0 失败。改后每个用例构造独立 counter，用 Arc 在 handler 闭包内捕获，
 //! 用例结束前断言 local counter 即可，与其它并发用例物理隔离。
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原 `#[path = "common/mod.rs"] mod common;` + `use common::{...};` 改走
+//! `use hsh_erp_test_support::*` + `load_idempotency_fixture(&pool)`（stub）。
+//! fixture 是 stub（`SELECT 1;`），保持「`load_<binary>_fixture`」调用约定一致。
+//!
+//! **保留本地 `fn send`**：本文件 send 返 `(StatusCode, Vec<u8>, Response)` 3 元组
+//! （与 `test-support::http::send` 返 `(StatusCode, Value)` 不一致 —— 本文件用 raw bytes
+//! 字节级断言第二次响应用 request 缓存命中），保留本地版本。
+//!
+//! **保留本地 `use common::*`**：本文件 setup 走 `common::test_pool`（无 fixture 依赖）
+//! + `common::test_state_with_redis` + `common::test_redis_pool`，均为 fixtures.rs
+//! 之外的 helper（test_state 在 state.rs，test_redis_pool 在 redis.rs），不属
+//! fixtures.rs 风格 helper，无需替换。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -39,6 +53,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Json;
 use deadpool_redis::redis::AsyncCommands;
+use hsh_erp_test_support::{load_idempotency_fixture};
 use serde_json::json;
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -158,12 +173,9 @@ fn make_public_app(state: Arc<AppState>, counter: Arc<AtomicUsize>) -> Router {
 // ===========================================================================
 
 async fn setup() -> PgPool {
-    common::ensure_database_exists().await;
     let pool = common::test_pool().await;
-    // ⚠️ 不在这里 FLUSHDB：cargo test 并行下（--test-threads=4）多测试并发
-    // 跑 setup()，FLUSHDB 会互相 wipe 对方刚写的 idem: 条目 → 测试 flake。
-    // 替代方案：每个测试用 UUID-based 唯一 key，断言只针对自己 key 做
-    // EXISTS / 不存在 校验，不扫全 db。
+    // 加载 stub fixture（保持 `load_<binary>_fixture` 调用约定一致；本 fixture 是空 stub）
+    let _fx = load_idempotency_fixture(&pool).await;
     pool
 }
 
@@ -172,6 +184,10 @@ fn unique_key(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
 
+/// 本地 send 3 元组版本（与 test-support::http::send 2 元组不同）：
+/// 返 `(StatusCode, Vec<u8>, Response)`。Vec<u8> 让用例做字节级断言
+/// （第二次响应与第一次字节级一致 = 缓存命中）；最后 Response 占位参数保留
+/// 原文件签名（不动调用方）。
 async fn send(app: Router, req: Request<Body>) -> (StatusCode, Vec<u8>, Response) {
     let resp = app.oneshot(req).await.expect("oneshot");
     let status = resp.status();

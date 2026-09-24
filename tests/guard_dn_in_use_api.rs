@@ -12,6 +12,17 @@
 //! 本测试覆盖 PR-2 改造后的回归点：fixture 直接在 t_part_batch 上挂
 //! delivery_note_id，断言 cancel part → 21420、soft-delete part → 21420、
 //! soft-delete assembly → 20307。
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件保留 `mod helpers;`（依赖 `tests/part/helpers.rs` 的 `insert_l1` /
+//! `insert_l2` / `insert_part_with_status` / `insert_batch` / `login_manager` 等）
+//! —— 本任务不破这一依赖（PR-C.Final 处理）。
+//!
+//! 同时新增 fixture baseline：`load_guard_dn_in_fixture(&pool)` 提供 1 baseline
+//! MANAGER user / role（id 段 190-191）。本测试 3 个用例改用 fixture baseline
+//! MANAGER user 登录（`login_manager(&pool, "mgr")`），
+//! 替换原 `login_manager(&pool, "mgr")` 现场造用户，避免 fixtures.rs 风格 helper
+//! 调用。
 
 #[path = "common/mod.rs"]
 mod common;
@@ -19,8 +30,7 @@ mod common;
 #[path = "part/helpers.rs"]
 mod helpers;
 
-use axum::http::StatusCode;
-use serde_json::json;
+use hsh_erp_test_support::load_guard_dn_in_use_fixture;
 
 use helpers::*;
 
@@ -30,10 +40,8 @@ use helpers::*;
 
 
 async fn setup() -> sqlx::PgPool {
-    common::ensure_database_exists().await;
     let pool = common::test_pool().await;
-    common::clean_db(&pool).await;
-    common::clean_business_db(&pool).await;
+    let _fx = load_guard_dn_in_use_fixture(&pool).await;
     pool
 }
 
@@ -131,12 +139,12 @@ async fn cancel_part_blocked_by_active_batch_on_delivery_note() {
         json_request(
             "POST",
             &format!("/parts/{pid}/cancel"),
-            Some(json!({ "reason": "测试锁定" })),
+            Some(serde_json::json!({ "reason": "测试锁定" })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::CONFLICT, "cancel locked: {env}");
+    assert_eq!(s, axum::http::StatusCode::CONFLICT, "cancel locked: {env}");
     assert_eq!(
         env["code"], 21420,
         "BIZ_DELIVERY_NOTE_LOCKED_PART（PR-2 改查 t_part_batch 后应仍命中）: {env}"
@@ -178,12 +186,12 @@ async fn soft_delete_part_blocked_by_active_batch_on_delivery_note() {
         json_request(
             "POST",
             &format!("/parts/{pid}/soft-delete"),
-            Some(json!({ "version": ver })),
+            Some(serde_json::json!({ "version": ver })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::CONFLICT, "soft-delete locked: {env}");
+    assert_eq!(s, axum::http::StatusCode::CONFLICT, "soft-delete locked: {env}");
     assert_eq!(
         env["code"], 21420,
         "BIZ_DELIVERY_NOTE_LOCKED_PART（PR-2 service 层预检）: {env}"
@@ -230,12 +238,12 @@ async fn soft_delete_assembly_blocked_by_child_batch_on_delivery_note() {
         json_request(
             "POST",
             &format!("/assemblies/{asm_id}/soft-delete"),
-            Some(json!({ "version": asm_version })),
+            Some(serde_json::json!({ "version": asm_version })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "soft-delete asm locked: {env}");
+    assert_eq!(s, axum::http::StatusCode::BAD_REQUEST, "soft-delete asm locked: {env}");
     assert_eq!(
         env["code"], 20307,
         "BIZ_ASSEMBLY_HAS_SHIPMENT（PR-2 JOIN t_part_batch 后应仍命中；HTTP 默认 400）: {env}"

@@ -17,6 +17,13 @@
 //!
 //! 不依赖 PG / Redis，纯单测式集成（虽然在 `tests/` 目录，但避免 docker daemon
 //! 依赖；保留 `--test-threads=4` 兼容默认调度）。
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原 `use ...::fixtures::*` 改走 `use hsh_erp_test_support::*` +
+//! `load_cos_opendal_fixture(&pool)`（stub）。fixture 是空 stub（`SELECT 1;`），
+//! 保持 `load_<binary>_fixture` 调用约定一致。本测试 4 个 AppConfig::from_env 测试
+//! 走 ENV_LOCK 串行，不依赖 DB pool；其它 trait method 测试也不需要 DB。
+//! 字面请求 / 断言逐字保留。
 
 #![allow(clippy::needless_raw_string_hashes)]
 
@@ -25,6 +32,7 @@ use std::sync::Arc;
 use hsh_erp_rust::infra::config::{AppConfig, CosBackend, CosConfig};
 use hsh_erp_rust::infra::cos::CosClient;
 use hsh_erp_rust::infra::cos_opendal::{NoopOpenDal, OpenDalCos, build_cos_client};
+use hsh_erp_test_support::{load_cos_opendal_fixture, test_pool};
 
 // =====================================================================================
 // helper：每个测试用唯一 key 避免 Memory backend namespace 冲突
@@ -41,7 +49,6 @@ fn make_cos_config(backend: CosBackend, enabled: bool) -> CosConfig {
         backend,
         enabled,
         region: "ap-shanghai".to_string(),
-        bucket: "test-bucket-1234567890".to_string(),
         secret_id: "AKID_TEST".to_string(),
         secret_key: "SECRET_TEST".to_string(),
         app_id: "1234567890".to_string(),
@@ -51,6 +58,7 @@ fn make_cos_config(backend: CosBackend, enabled: bool) -> CosConfig {
         presign_expire_seconds: 3600,
         max_file_size: 300 * 1024 * 1024,
         tmp_prefix: "tmp/".to_string(),
+        bucket: "test-bucket-1234567890".to_string(),
     }
 }
 
@@ -60,6 +68,8 @@ fn make_cos_config(backend: CosBackend, enabled: bool) -> CosConfig {
 
 #[tokio::test]
 async fn put_get_roundtrip_via_trait() {
+    let _pool = test_pool().await;
+    let _fx = load_cos_opendal_fixture(&_pool).await;
     let client = fresh_client();
     let key = "spike/it/roundtrip.bin";
     let body = b"integration test body".to_vec();
@@ -74,6 +84,8 @@ async fn put_get_roundtrip_via_trait() {
 
 #[tokio::test]
 async fn delete_nonexistent_is_idempotent_ok() {
+    let _pool = test_pool().await;
+    let _fx = load_cos_opendal_fixture(&_pool).await;
     let client = fresh_client();
     let key = "spike/it/never_exists_DELETE.bin";
     // 反复删 3 次都不应报错（幂等）
@@ -87,6 +99,8 @@ async fn delete_nonexistent_is_idempotent_ok() {
 
 #[tokio::test]
 async fn delete_existing_then_get_returns_error() {
+    let _pool = test_pool().await;
+    let _fx = load_cos_opendal_fixture(&_pool).await;
     let client = fresh_client();
     let key = "spike/it/exists_then_deleted.bin";
     let body = b"to be deleted".to_vec();
@@ -106,6 +120,8 @@ async fn head_object_returns_correct_size() {
     // 2026-09-20 spike 发现：OpenDAL Memory backend 的 head_object **不设置 etag**
     // （返回 None → 转空串）。真 S3 backend 上 etag 由服务端回传（MD5），无此问题。
     // 本测试只断言 size 正确。
+    let _pool = test_pool().await;
+    let _fx = load_cos_opendal_fixture(&_pool).await;
     let client = fresh_client();
     let key = "spike/it/head_size.bin";
     let body = b"x".repeat(123); // 123 bytes
@@ -121,6 +137,8 @@ async fn head_object_returns_correct_size() {
 
 #[tokio::test]
 async fn head_object_nonexistent_returns_error() {
+    let _pool = test_pool().await;
+    let _fx = load_cos_opendal_fixture(&_pool).await;
     let client = fresh_client();
     let key = "spike/it/never_exists_HEAD.bin";
     let result = client.head_object(key).await;
@@ -135,6 +153,8 @@ async fn copy_object_creates_dst_with_same_content() {
     // 2026-09-20 spike 发现：OpenDAL Memory backend 不支持 copy（Unsupported）。
     // 真 S3 backend 上 copy 走服务端 PUT copy-object，spike 无真凭据未实测。
     // 本测试断言：NoopOpenDal（Memory）调用 copy_object 必须返回 Err，**不**绕过。
+    let _pool = test_pool().await;
+    let _fx = load_cos_opendal_fixture(&_pool).await;
     let client = fresh_client();
     let src = "spike/it/copy_SRC.bin";
     let dst = "spike/it/copy_DST.bin";
@@ -153,6 +173,8 @@ async fn copy_object_creates_dst_with_same_content() {
 
 #[tokio::test]
 async fn presigned_get_url_returns_string_containing_key() {
+    let _pool = test_pool().await;
+    let _fx = load_cos_opendal_fixture(&_pool).await;
     let client = fresh_client();
     let key = "spike/it/presign/file.pdf";
     let url = client

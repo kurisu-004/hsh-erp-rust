@@ -7,63 +7,63 @@
 //! 4. `seed_user_with_roles` → 创建 user + 多 role 行
 //! 5. `revoke_session` → 写一条 session，再 revoke，确认 Redis set 清空
 //! 6. `e2e_guard_disabled` → 把 state.config.enable_e2e_hooks 改 false，probe → 404
+//! 7. `hard_delete_outsource_company` 系列 4 个
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化（与 customer_api 等互不影响 t_user / t_customer）。
+//!
+//! ## Fixture 范本化（2026-09-24 PR13 Phase I）
+//! 本文件原 `#[path = "common/mod.rs"] mod common;` + `use common::{...};` 改走
+//! `use hsh_erp_test_support::*` + `load_e2e_fixture(&pool)` + `E2eFixture` 样板。
+//! fixture 提供 1 baseline t_process 行（被 `hard_delete_outsource_company_referenced_returns_409`
+//! 引用，触发 21205 守卫）。
+//!
+//! **保留本地 `fn json_request`**：本文件签名是 `(method, uri, body: Option<Value>)` 3
+//! 参数（**无** bearer 参数），与 `test-support::http::json_request` 4 参数
+//! 不一致。保留本地版本避免修改所有调用方。
+//! 字面请求 / 断言逐字保留。
 
-#[path = "common/mod.rs"]
-mod common;
-
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode};
 use deadpool_redis::redis::AsyncCommands;
-use serde_json::{Value, json};
-use sqlx::PgPool;
-use tower::ServiceExt;
-
-use common::{
-    clean_business_db, clean_db, clean_redis, ensure_database_exists, insert_user_with_password,
-    test_app, test_pool, test_redis_pool, test_state_with_redis,
+use hsh_erp_test_support::{
+    E2eFixture, load_e2e_fixture, send as ts_send, test_app, test_pool, test_redis_pool,
+    test_state_with_redis,
 };
 use hsh_erp_rust::auth::session::{CachedUserProfile, RedisSessionStore, SessionStore, TokenKind};
+use sqlx::PgPool;
 
 // ===========================================================================
-//  全局串行化 + helpers
+//  Helpers
 // ===========================================================================
 
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let body_str = String::from_utf8_lossy(&body).to_string();
-    let envelope: Value = serde_json::from_slice(&body)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; status={status} raw = {body_str:?}"));
-    (status, envelope)
+async fn send(
+    app: axum::Router,
+    req: axum::http::Request<axum::body::Body>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    ts_send(app, req).await
 }
 
-fn json_request(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
+/// 本地 `json_request` 3 参数版本（无 bearer），与原文件字面逐字一致。
+fn json_request(
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> axum::http::Request<axum::body::Body> {
+    let mut builder = axum::http::Request::builder().method(method).uri(uri);
     if body.is_some() {
         builder = builder.header("content-type", "application/json");
     }
     let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
+        Some(v) => axum::body::Body::from(v.to_string()),
+        None => axum::body::Body::empty(),
     };
     builder.body(body).expect("build request")
 }
 
 async fn setup() -> (PgPool, deadpool_redis::Pool) {
-
-    ensure_database_exists().await;
     let pool = test_pool().await;
     let redis = test_redis_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    clean_redis(&redis).await;
+    let _fx = load_e2e_fixture(&pool).await;
     (pool, redis)
 }
 
@@ -79,7 +79,7 @@ async fn probe_returns_ok_when_enabled() {
 
     let (status, env) = send(app, json_request("POST", "/_e2e/probe", None)).await;
 
-    assert_eq!(status, StatusCode::OK, "probe: {env}");
+    assert_eq!(status, axum::http::StatusCode::OK, "probe: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(env["data"]["status"], "ok");
     assert_eq!(env["data"]["enabled"], true);
@@ -101,7 +101,7 @@ async fn reset_clears_seeded_metadata_only() {
         json_request(
             "POST",
             "/_e2e/seed/customer",
-            Some(json!({"name": "ResetTest-L1", "serial_prefix": "R"})),
+            Some(serde_json::json!({"name": "ResetTest-L1", "serial_prefix": "R"})),
         ),
     )
     .await;
@@ -116,7 +116,7 @@ async fn reset_clears_seeded_metadata_only() {
 
     // reset
     let (status, env) = send(app.clone(), json_request("POST", "/_e2e/reset", None)).await;
-    assert_eq!(status, StatusCode::OK, "reset: {env}");
+    assert_eq!(status, axum::http::StatusCode::OK, "reset: {env}");
     assert_eq!(env["code"], 0);
     assert!(
         env["data"]["cleared"].as_i64().unwrap() >= 1,
@@ -157,11 +157,11 @@ async fn seed_customer_l1_then_l2() {
         json_request(
             "POST",
             "/_e2e/seed/customer",
-            Some(json!({"name": "ACME-L1", "serial_prefix": "A"})),
+            Some(serde_json::json!({"name": "ACME-L1", "serial_prefix": "A"})),
         ),
     )
     .await;
-    assert_eq!(s1, StatusCode::OK, "seed L1: {env1}");
+    assert_eq!(s1, axum::http::StatusCode::OK, "seed L1: {env1}");
     assert_eq!(env1["code"], 0);
     let l1_id = env1["data"]["id"]
         .as_str()
@@ -189,14 +189,14 @@ async fn seed_customer_l1_then_l2() {
         json_request(
             "POST",
             "/_e2e/seed/customer",
-            Some(json!({
+            Some(serde_json::json!({
                 "name": "ACME-L2",
                 "parent_id": l1_id.clone(),
             })),
         ),
     )
     .await;
-    assert_eq!(s2, StatusCode::OK, "seed L2: {env2}");
+    assert_eq!(s2, axum::http::StatusCode::OK, "seed L2: {env2}");
     assert_eq!(env2["code"], 0);
     let l2_id = env2["data"]["id"]
         .as_str()
@@ -228,7 +228,7 @@ async fn seed_user_with_roles_inserts_role_rows() {
         json_request(
             "POST",
             "/_e2e/seed/user",
-            Some(json!({
+            Some(serde_json::json!({
                 "username": "e2e_user_a",
                 "role_codes": ["MANAGER", "CLERK"],
                 "full_name": "E2E User A",
@@ -237,7 +237,7 @@ async fn seed_user_with_roles_inserts_role_rows() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "seed user: {env}");
+    assert_eq!(status, axum::http::StatusCode::OK, "seed user: {env}");
     assert_eq!(env["code"], 0);
     let uid: i64 = env["data"]["id"]
         .as_str()
@@ -289,14 +289,14 @@ async fn revoke_session_clears_redis_user_set() {
         json_request(
             "POST",
             "/_e2e/seed/user",
-            Some(json!({
+            Some(serde_json::json!({
                 "username": "revoke_target",
                 "role_codes": ["MANAGER"],
             })),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "seed user: {env}");
+    assert_eq!(status, axum::http::StatusCode::OK, "seed user: {env}");
     let uid: i64 = env["data"]["id"].as_str().unwrap().parse().unwrap();
 
     // 模拟登录：写一条 session 到 Redis
@@ -337,11 +337,11 @@ async fn revoke_session_clears_redis_user_set() {
         json_request(
             "POST",
             "/_e2e/revoke-session",
-            Some(json!({"username": "revoke_target"})),
+            Some(serde_json::json!({"username": "revoke_target"})),
         ),
     )
     .await;
-    assert_eq!(rs, StatusCode::OK, "revoke: {renv}");
+    assert_eq!(rs, axum::http::StatusCode::OK, "revoke: {renv}");
     assert_eq!(renv["code"], 0);
 
     // Redis set 应该被清空
@@ -363,7 +363,7 @@ async fn e2e_guard_returns_404_when_disabled() {
 
     // 临时改 config 关掉 hook —— 需要独占可变访问（Arc<AppConfig> 是只读）
     // 直接修改 AppConfig 不可行（Arc 内层用 Arc::make_mut）
-    let mut new_config: AppConfig = (*state.config).clone();
+    let mut new_config: hsh_erp_rust::infra::config::AppConfig = (*state.config).clone();
     new_config.enable_e2e_hooks = false;
     let new_state = std::sync::Arc::new(hsh_erp_rust::state::AppState::new(
         state.pool.clone(),
@@ -385,19 +385,18 @@ async fn e2e_guard_returns_404_when_disabled() {
 
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
-        "probe with hooks disabled should 404; got env: {env}"
+        axum::http::StatusCode::NOT_FOUND,
+        "probe with hooks disabled state 404; got env: {env}"
     );
     assert_eq!(env["code"], 40400);
 
     // 别忘了确保静态类型 AppConfig 在测试文件里被导入（避免未使用警告）
-    let _ = insert_user_with_password;
+    let _ = E2eFixture::default();
 }
 
 // ===========================================================================
 //  类型导入集中区 —— 避免上面散落 noise
 // ===========================================================================
-use hsh_erp_rust::infra::config::AppConfig;
 
 // ===========================================================================
 //  7) hard_delete_outsource_company — 删除一行 + 清 t_e2e_seeded 元数据
@@ -419,11 +418,11 @@ async fn hard_delete_outsource_company_removes_row_and_seeded_metadata() {
         json_request(
             "POST",
             "/_e2e/seed/outsource_company",
-            Some(json!({"name": "DelTestCo"})),
+            Some(serde_json::json!({"name": "DelTestCo"})),
         ),
     )
     .await;
-    assert_eq!(seed_status, StatusCode::OK, "seed company: {seed_resp}");
+    assert_eq!(seed_status, axum::http::StatusCode::OK, "seed company: {seed_resp}");
     let company_id: i64 = seed_resp["data"]["id"]
         .as_str()
         .expect("company id string")
@@ -440,7 +439,7 @@ async fn hard_delete_outsource_company_removes_row_and_seeded_metadata() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "hard-delete: {env}");
+    assert_eq!(status, axum::http::StatusCode::OK, "hard-delete: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(env["data"]["deleted"], true);
 
@@ -471,8 +470,8 @@ async fn hard_delete_outsource_company_removes_row_and_seeded_metadata() {
 
 #[tokio::test]
 async fn hard_delete_outsource_company_idempotent_when_missing() {
-    let (pool, redis) = setup().await;
-    let state = test_state_with_redis(pool.clone(), redis.clone());
+    let (_pool, redis) = setup().await;
+    let state = test_state_with_redis(_pool.clone(), redis.clone());
     let app = test_app(state);
 
     // 用一个肯定不在表里的 snowflake id（snowflake 永远正，且刚 seed 完表空）
@@ -489,7 +488,7 @@ async fn hard_delete_outsource_company_idempotent_when_missing() {
     .await;
     assert_eq!(
         status,
-        StatusCode::OK,
+        axum::http::StatusCode::OK,
         "idempotent delete should 200; got {env}"
     );
     assert_eq!(env["code"], 0);
@@ -508,10 +507,10 @@ async fn hard_delete_outsource_company_idempotent_when_missing() {
 
 #[tokio::test]
 async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
-    let (pool, redis) = setup().await;
-    let state = test_state_with_redis(pool.clone(), redis.clone());
+    let (_pool, redis) = setup().await;
+    let state = test_state_with_redis(_pool.clone(), redis.clone());
 
-    let mut new_config: AppConfig = (*state.config).clone();
+    let mut new_config: hsh_erp_rust::infra::config::AppConfig = (*state.config).clone();
     new_config.enable_e2e_hooks = false;
     let new_state = std::sync::Arc::new(hsh_erp_rust::state::AppState::new(
         state.pool.clone(),
@@ -536,7 +535,7 @@ async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
     .await;
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
+        axum::http::StatusCode::NOT_FOUND,
         "guard disabled should 404; got env: {env}"
     );
     assert_eq!(env["code"], 40400);
@@ -561,24 +560,14 @@ async fn hard_delete_outsource_company_referenced_returns_409() {
         json_request(
             "POST",
             "/_e2e/seed/outsource_company",
-            Some(json!({"name": "ReferencedCo"})),
+            Some(serde_json::json!({"name": "ReferencedCo"})),
         ),
     )
     .await;
     let company_id: i64 = seed_resp["data"]["id"].as_str().unwrap().parse().unwrap();
 
-    // 2) 直接 INSERT 一个 t_process 行 + t_outsource_company_process 映射
-    //    （不依赖 alembic seed 数据——这些会被 clean_business_db 清掉）
-    let process_id: i64 = sqlx::query_scalar(
-        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
-         version, created_at, updated_at) \
-         VALUES (1, 'E2E_HD_PROC', 'e2e hd proc', 'OUTSOURCE', 0, false, 0, NOW(), NOW()) \
-         RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("insert t_process");
-
+    // 2) 使用 fixture baseline t_process（process_id=160）+ INSERT t_outsource_company_process 映射
+    let process_id = E2eFixture::PROCESS_ID;
     let _mapping_id: i64 = sqlx::query_scalar(
         "INSERT INTO t_outsource_company_process (id, outsource_company_id, process_id, \
          sort_order, version, created_at, updated_at) \
@@ -603,7 +592,7 @@ async fn hard_delete_outsource_company_referenced_returns_409() {
     .await;
     assert_eq!(
         status,
-        StatusCode::CONFLICT,
+        axum::http::StatusCode::CONFLICT,
         "referenced company should 409; got env: {env}"
     );
     assert_eq!(env["code"], 21205);
