@@ -13,86 +13,34 @@
 //!
 //! ## 认证
 //! 用 MANAGER 用户跑通（写路径要求 M-only，按设计 §6.1 用 M 即可）。
+//!
+//! ## 集成测试范本（PR13 Phase H，2026-09-24）
+//! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
+//! `login_manager` 通用 helper，统一走 `use hsh_erp_test_support::{...}` +
+//! `bootstrap_as_manager()` + `load_production_fixture(&pool)`。无独有 helper
+//! （worker 域走 service seed API 创建，测试体本身已无 INSERT）。
 
-#[path = "../common/mod.rs"]
-mod common;
+use axum::http::StatusCode;
+use serde_json::json;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, header::AUTHORIZATION};
-use serde_json::{Value, json};
-use sqlx::PgPool;
-use tower::ServiceExt;
-
-use common::{
-    add_role, clean_business_db, clean_db, ensure_database_exists, insert_user_with_password,
-    test_app, test_pool, test_state,
+use hsh_erp_test_support::{
+    ProductionFixture, json_request, load_production_fixture, login_token, send, test_app,
+    test_pool, test_state,
 };
 
 // ===========================================================================
-// 全局串行化 + helpers（与 customer_api.rs / process_api.rs / shelf_api.rs 同形）
+//  Bootstrap helpers（PR13 Phase H 风格）
 // ===========================================================================
 
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let uri = req.uri().to_string();
-    let method = req.method().to_string();
-    let response = app.oneshot(req).await.expect("oneshot");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let body_str = String::from_utf8_lossy(&body).to_string();
-    let envelope: Value = serde_json::from_slice(&body).unwrap_or_else(|e| {
-        panic!("parse JSON: {e}; method={method} uri={uri} status={status}; raw = {body_str:?}")
-    });
-    (status, envelope)
-}
-
-fn json_request(
-    method: &str,
-    uri: &str,
-    body: Option<Value>,
-    bearer: Option<&str>,
-) -> Request<Body> {
-    let mut builder = Request::builder().method(method).uri(uri);
-    if let Some(t) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {t}"));
-    }
-    if body.is_some() {
-        builder = builder.header("content-type", "application/json");
-    }
-    let body = match body {
-        Some(v) => Body::from(v.to_string()),
-        None => Body::empty(),
-    };
-    builder.body(body).expect("build request")
-}
-
-async fn setup() -> PgPool {
-    ensure_database_exists().await;
+/// 起一份 fresh database + 加载 production fixture + 以 MANAGER 身份登录。
+///
+/// 返回 `(pool, app, token, fx)`。
+async fn bootstrap_as_manager() -> (sqlx::PgPool, axum::Router, String, ProductionFixture) {
     let pool = test_pool().await;
-    clean_db(&pool).await;
-    clean_business_db(&pool).await;
-    pool
-}
-
-async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
-    let uid = insert_user_with_password(&pool, username, "changeme").await;
-    add_role(&pool, uid, "MANAGER", None, None).await;
-    let state = test_state(pool.clone()).await;
-    let app = test_app(state.clone());
-    let (_, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/iam/login",
-            Some(json!({"username": username, "password": "changeme"})),
-            None,
-        ),
-    )
-    .await;
-    let token = env["data"]["token"].as_str().unwrap().to_string();
-    let app2 = test_app(state);
-    (app2, token)
+    let fx = load_production_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, &fx.part_manager_username, ProductionFixture::PASSWORD).await;
+    (pool, app, token, fx)
 }
 
 // ===========================================================================
@@ -101,8 +49,7 @@ async fn login_manager(pool: PgPool, username: &str) -> (axum::Router, String) {
 
 #[tokio::test]
 async fn verify_badge_inactive_returns_20202() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "worker_admin").await;
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
     // Create worker (active by default).
     let (s_create, env_create) = send(
@@ -166,8 +113,7 @@ async fn verify_badge_inactive_returns_20202() {
 /// 是 service 的正确分流必须能处理它。
 #[tokio::test]
 async fn reactivate_worker_version_conflict_returns_40901() {
-    let pool = setup().await;
-    let (app, token) = login_manager(pool.clone(), "worker_admin_vc").await;
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
 
     // 1) 建一个 active 工人
     let (s_create, env_create) = send(
