@@ -21,9 +21,12 @@
 //! - [`state`]：构造测试 `AppState` 的 helper（`test_state` /
 //!   `test_state_with_cos` / `test_state_with_disabled_session` / `test_app`
 //!   / `test_ws_app`）
-//! - [`fixtures`]：建最小化世界（admin/MANAGER/货架/菜单/工艺链）的 helper
-//!   + `MockCos` stub（`insert_user_with_password` / `add_role` /
-//!     `clean_db` / `MockCos` 等）
+//! - [`fixtures`]：PR13 Phase A-I 完成后残余 3 个动态 helper
+//!   （`insert_shelf` / `create_chain_for_part` / `create_step`），
+//!   用于 4 个 part sub-file（lifecycle / list_enrichment / repair /
+//!   to_inspection / to_process）。原 15 个动态 helper 中 12 个已删除
+//!   （PR-A / B / C 各阶段子模块 + fixture 范本化覆盖）。本子模块待 PR-D
+//!   part binary 全面迁移后删除。
 //! - [`http`]：HTTP 客户端 helper（`send` / `json_request` / `login_token`）
 //!   —— PR13 Phase F 引入，从 27+ 重复实现的 `tests/*` 收敛一份权威版，
 //!   签名与原版逐字一致便于批量迁移（`axum::Router` + `Request<Body>` +
@@ -66,7 +69,7 @@
 // 与原 tests/common/mod.rs 同款属性：51 个 binary 共用 helper，未引用项触发
 // `dead_code` warning 噪音；`duplicate_mod` 因为多 binary 用 `#[path]` 共用
 // mod.rs；`await_holding_lock` 因为 fixture 模式锁+await+INSERT（具体见
-// pool.rs / fixtures.rs 注释）。
+// pool.rs 注释）。
 #![allow(dead_code, clippy::duplicate_mod, clippy::await_holding_lock)]
 
 pub mod fixture;
