@@ -15,6 +15,13 @@
 //   * 已存在的雪花 ID 行 ON CONFLICT 后保留原 ID，只更新其他字段
 //!   * 不自动删"未在文件声明的菜单"——菜单下线必须显式列在 soft-delete 区段
 //!
+//! ## 初始管理员 seed（2026-09-26 新增）
+//!
+//! seeds/admin.sql 是**可选**的初始管理员账号（username=admin / password=changeme /
+//! role=MANAGER），由环境变量 `BOOTSTRAP_ADMIN_ENABLED` 门控（默认 false）。首次启用后
+//! **必须**立刻登录并改密，再设回 `BOOTSTRAP_ADMIN_ENABLED=false` 重启（明文密码
+//! 与 `src/modules/iam/service/account.rs::DEFAULT_RESET_PASSWORD` 同源）。
+//!
 //! ## 应用时机
 //!
 //! `run_seeds()` 由 `src/main.rs` 在 `sqlx::migrate!()` 之后调用，启动即跑一次。
@@ -37,13 +44,31 @@ use sqlx::PgPool;
 /// 菜单种子 SQL（编译期嵌入，避免运行时 IO 路径问题）。
 const MENU_SEED: &str = include_str!("../../seeds/menu.sql");
 
+/// 初始管理员账号种子 SQL（编译期嵌入）。
+///
+/// 仅当 `BOOTSTRAP_ADMIN_ENABLED=true` 时执行。详见模块顶部 doc + `seeds/README.md`。
+const ADMIN_SEED: &str = include_str!("../../seeds/admin.sql");
+
 /// 跑全部 seeds。启动时调用，幂等。
 ///
-/// 当前只装载菜单种子（seeds/menu.sql）。后续如需抽离其它配置数据（用户、
-/// 工种、工序等），在此处追加 `include_str!` + `sqlx::raw_sql` 调用即可。
-pub async fn run_seeds(pool: &PgPool) -> Result<(), sqlx::Error> {
+/// 当前装载：
+/// - `seeds/menu.sql` —— 菜单树（无条件加载）
+/// - `seeds/admin.sql` —— 初始管理员账号（仅当 `bootstrap_admin_enabled=true`）
+///
+/// 后续如需抽离其它配置数据（用户、工种、工序等），在此处追加 `include_str!` +
+/// `sqlx::raw_sql` 调用即可。
+pub async fn run_seeds(pool: &PgPool, bootstrap_admin_enabled: bool) -> Result<(), sqlx::Error> {
     tracing::info!("应用 seeds/menu.sql ...");
     sqlx::raw_sql(MENU_SEED).execute(pool).await?;
     tracing::info!("✓ seeds/menu.sql 应用完成");
-    Ok(())
+
+    if bootstrap_admin_enabled {
+        tracing::info!("BOOTSTRAP_ADMIN_ENABLED=true，应用 seeds/admin.sql（初始管理员账号）");
+        sqlx::raw_sql(ADMIN_SEED).execute(pool).await?;
+        tracing::info!("✓ seeds/admin.sql 应用完成；务必登录 admin/changeme 后改密并关闭 env");
+        Ok(())
+    } else {
+        tracing::info!("BOOTSTRAP_ADMIN_ENABLED=false，跳过 seeds/admin.sql");
+        Ok(())
+    }
 }

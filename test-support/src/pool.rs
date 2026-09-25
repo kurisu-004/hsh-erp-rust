@@ -311,7 +311,7 @@ pub async fn test_pool() -> PgPool {
         hsh_erp_rust::infra::db::run_migrations(&pool)
             .await
             .expect("apply migrations on ephemeral test db");
-        hsh_erp_rust::infra::seed::run_seeds(&pool)
+        hsh_erp_rust::infra::seed::run_seeds(&pool, false)
             .await
             .expect("apply seeds on ephemeral test db");
     }

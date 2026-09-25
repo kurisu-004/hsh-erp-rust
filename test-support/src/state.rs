@@ -137,6 +137,9 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         },
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
         idempotency_ttl_seconds: 86400,
+        // 2026-09-26 新增：测试默认禁用初始管理员 seed（与生产配置对齐；调用方
+        // 测试需要时可走 `Arc::make_mut` 局部 patch）。
+        bootstrap_admin_enabled: false,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -293,6 +296,9 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         },
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
         idempotency_ttl_seconds: 86400,
+        // 2026-09-26 新增：测试默认禁用初始管理员 seed（与生产配置对齐；调用方
+        // 测试需要时可走 `Arc::make_mut` 局部 patch）。
+        bootstrap_admin_enabled: false,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -425,6 +431,9 @@ pub async fn test_state_with_cos(
         },
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
         idempotency_ttl_seconds: 86400,
+        // 2026-09-26 新增：测试默认禁用初始管理员 seed（与生产配置对齐；调用方
+        // 测试需要时可走 `Arc::make_mut` 局部 patch）。
+        bootstrap_admin_enabled: false,
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,

@@ -44,6 +44,11 @@ pub struct AppConfig {
     /// `Idempotency-Key` header 的请求，缓存响应在 Redis 中的过期时间。
     /// 环境变量 `IDEMPOTENCY_TTL_SECONDS`，缺省 `86400`（24h）。
     pub idempotency_ttl_seconds: u64,
+    /// 2026-09-26 新增：是否在启动钩子里应用 `seeds/admin.sql`（初始管理员账号）。
+    /// 环境变量 `BOOTSTRAP_ADMIN_ENABLED`，缺省 `false`（生产安全默认）。
+    /// 启用后必须立刻登录 admin/changeme、改密、设回 `false`、重启；详见
+    /// `src/infra/seed.rs` 模块 doc + `seeds/README.md`。
+    pub bootstrap_admin_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -371,6 +376,8 @@ impl AppConfig {
             },
             // 2026-09-23 新增 Idempotency 中间件 TTL（秒）。
             idempotency_ttl_seconds: env_parse("IDEMPOTENCY_TTL_SECONDS", 86_400u64)?,
+            // 2026-09-26 新增：可选初始管理员账号种子开关（生产默认关闭）。
+            bootstrap_admin_enabled: env_bool("BOOTSTRAP_ADMIN_ENABLED", false)?,
         })
     }
 }

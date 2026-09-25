@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
         .context("执行数据库迁移失败")?;
 
     // 3.6 应用 seeds（菜单等配置数据，幂等；2026-09-25 sqlx 接管后从 migration 抽出）
-    seed::run_seeds(&pool)
+    seed::run_seeds(&pool, config.bootstrap_admin_enabled)
         .await
         .context("应用 seeds 失败")?;
 

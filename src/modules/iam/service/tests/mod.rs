@@ -237,6 +237,7 @@ pub fn test_app_config() -> Arc<AppConfig> {
             renew_threshold_seconds: 0,
         },
         idempotency_ttl_seconds: 86400,
+        bootstrap_admin_enabled: false,
     })
 }
 
