@@ -59,6 +59,10 @@ pub struct NewPartCreate<'a> {
 ///
 /// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date`（t_part
 /// 列已删；实际交付日期由 t_part_event DELIVERED 事件派生，不接受手工改）。
+///
+/// 2026-09-27 part 域前后端字段对齐：增 `unit_price` / `total_price` 字段
+/// （NUMERIC(12,2) / NUMERIC(14,2) NOT NULL DEFAULT 0）。Option 语义：
+/// `None` = DB 不动；`Some(v)` = 覆盖为 `v`。
 pub struct PartUpdate<'a> {
     pub name: Option<&'a str>,
     pub drawing_no: Option<&'a str>,
@@ -69,6 +73,10 @@ pub struct PartUpdate<'a> {
     pub planned_delivery_date: Option<chrono::NaiveDate>,
     pub note: Option<&'a str>,
     pub is_urgent: Option<bool>,
+    /// 2026-09-27 新增：单价（NUMERIC(12,2)）。
+    pub unit_price: Option<rust_decimal::Decimal>,
+    /// 2026-09-27 新增：总价（NUMERIC(14,2)）。
+    pub total_price: Option<rust_decimal::Decimal>,
     pub updated_by: i64,
 }
 
@@ -118,6 +126,7 @@ impl PartRepo {
                    customer_id, assembly_id, status,
                    is_urgent, next_process_id,
                    order_no, system_delivery_date, note,
+                   unit_price, total_price,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at, process_chain_id
             FROM t_part
@@ -147,6 +156,7 @@ impl PartRepo {
                    customer_id, assembly_id, status,
                    is_urgent, next_process_id,
                    order_no, system_delivery_date, note,
+                   unit_price, total_price,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at, process_chain_id
             FROM t_part
@@ -177,6 +187,7 @@ impl PartRepo {
                    customer_id, assembly_id, status,
                    is_urgent, next_process_id,
                    order_no, system_delivery_date, note,
+                   unit_price, total_price,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at, process_chain_id
             FROM t_part
@@ -204,6 +215,7 @@ impl PartRepo {
                    customer_id, assembly_id, status,
                    is_urgent, next_process_id,
                    order_no, system_delivery_date, note,
+                   unit_price, total_price,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at, process_chain_id
             FROM t_part
@@ -260,6 +272,7 @@ impl PartRepo {
                    customer_id, assembly_id, status,
                    is_urgent, next_process_id,
                    order_no, system_delivery_date, note,
+                   unit_price, total_price,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at, process_chain_id
             FROM t_part
@@ -357,6 +370,12 @@ impl PartRepo {
         if let Some(v) = upd.is_urgent {
             qb.push(", is_urgent = ").push_bind(v);
         }
+        if let Some(v) = upd.unit_price {
+            qb.push(", unit_price = ").push_bind(v);
+        }
+        if let Some(v) = upd.total_price {
+            qb.push(", total_price = ").push_bind(v);
+        }
         qb.push(" WHERE id = ").push_bind(part_id);
         qb.push(" AND version = ").push_bind(expected_version);
         qb.push(" AND deleted_at IS NULL");
@@ -432,6 +451,7 @@ impl PartRepo {
                     customer_id, assembly_id, status, is_urgent, \
                     next_process_id, \
                     order_no, system_delivery_date, note, \
+                    unit_price, total_price, \
                     version, created_at, created_by, updated_at, updated_by, \
                     deleted_at, process_chain_id \
              FROM t_part WHERE 1=1",
@@ -588,6 +608,7 @@ impl PartRepo {
              customer_id, assembly_id, status, is_urgent, \
              next_process_id, \
              order_no, system_delivery_date, note, \
+             unit_price, total_price, \
              version, created_at, created_by, updated_at, updated_by, \
              deleted_at, process_chain_id \
              FROM t_part WHERE assembly_id = $1 \
@@ -598,6 +619,7 @@ impl PartRepo {
              customer_id, assembly_id, status, is_urgent, \
              next_process_id, \
              order_no, system_delivery_date, note, \
+             unit_price, total_price, \
              version, created_at, created_by, updated_at, updated_by, \
              deleted_at, process_chain_id \
              FROM t_part WHERE assembly_id = $1 AND deleted_at IS NULL \

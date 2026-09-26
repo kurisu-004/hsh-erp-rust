@@ -8,6 +8,7 @@
 //! axum extractor 反序列化目标（`#[derive(Deserialize)]`），VO 仅含 handler
 //! 返回序列化目标（`#[derive(Serialize)]`），二者不再同文件。
 
+use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use crate::shared::types::{deserialize_i64, deserialize_i64_opt};
@@ -110,6 +111,11 @@ pub struct PartBatchCreateRequest {
 /// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date` 入参
 /// （t_part 列已删；实际交付日期由 t_part_event DELIVERED 事件派生，不接
 /// 受手工改）。
+///
+/// 2026-09-27 part 域前后端字段对齐：增 `unit_price?` / `total_price?` 入参
+/// （`Option<Decimal>`）。DB 列 `t_part.unit_price` / `t_part.total_price`
+/// 为 NUMERIC(12,2) / NUMERIC(14,2) NOT NULL DEFAULT 0，由 rust_decimal
+/// 反序列化为 string → Decimal 避免 JS 浮点丢精度。
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartUpdateRequest {
     pub version: i32,
@@ -131,6 +137,13 @@ pub struct PartUpdateRequest {
     pub note: Option<String>,
     #[serde(default)]
     pub is_urgent: Option<bool>,
+    /// 2026-09-27 新增：单价（NUMERIC(12,2)）。`None` = DB 不动，`Some(v)` = 覆盖。
+    /// `Decimal` 由 axum extractor 从 JSON string 反序列化得到。
+    #[serde(default)]
+    pub unit_price: Option<Decimal>,
+    /// 2026-09-27 新增：总价（NUMERIC(14,2)）。`None` = DB 不动，`Some(v)` = 覆盖。
+    #[serde(default)]
+    pub total_price: Option<Decimal>,
 }
 
 // ===== List =====

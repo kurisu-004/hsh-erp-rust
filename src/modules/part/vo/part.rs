@@ -136,14 +136,18 @@ pub struct PartListItem {
 }
 
 /// `GET /parts` 出参（分页）。
+///
+/// 2026-09-27 part 域前后端字段对齐：`total` / `limit` / `offset` 改裸 i64 →
+/// JSON number，对齐其它 9 域（UserListOut / CustomerListOut / WorkerListOut /
+/// OutsourceCompanyListOut / ProcessListOut / ShelfListOut / DeliveryNoteListOut /
+/// DeliveryGroupListOut / OutsourceQuoteListOut）。雪花 ID 仍走 `serialize_i64`
+/// → JSON string 规避 JS `Number.MAX_SAFE_INTEGER` 精度截断，本处分页字段是
+/// 普通 i64，无精度风险，直接 JSON number。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartListOut {
     pub items: Vec<PartListItem>,
-    #[serde(serialize_with = "serialize_i64")]
     pub total: i64,
-    #[serde(serialize_with = "serialize_i64")]
     pub limit: i64,
-    #[serde(serialize_with = "serialize_i64")]
     pub offset: i64,
 }
 

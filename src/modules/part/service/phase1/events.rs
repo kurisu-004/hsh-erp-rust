@@ -542,6 +542,8 @@ impl PartService {
                 planned_delivery_date: None,
                 note: item.note.as_deref(),
                 is_urgent: None,
+                unit_price: None,
+                total_price: None,
                 updated_by: current.id,
             };
             let n = repo.update_part(item.part_id, item.version, upd).await;

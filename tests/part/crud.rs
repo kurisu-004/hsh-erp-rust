@@ -131,7 +131,8 @@ async fn list_parts_basic() {
     assert_eq!(env["code"], 0);
     assert!(env["data"]["items"].is_array());
     assert_eq!(env["data"]["items"].as_array().unwrap().len(), 0);
-    assert_eq!(env["data"]["total"], "0");
+    // 2026-09-27 part 域前后端字段对齐：PartListOut.total 改 JSON number（裸 i64）
+    assert_eq!(env["data"]["total"], 0);
 }
 
 /// GET /parts?customer_id=&status=PENDING —— 3 PENDING + 1 INSPECTION，
@@ -191,7 +192,7 @@ async fn list_parts_filter_status_and_customer() {
     assert_eq!(s, StatusCode::OK, "filter status: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(
-        env["data"]["total"], "3",
+        env["data"]["total"], 3,
         "应 PENDING×3 (1 个 INSPECTION 被过滤掉): {env}"
     );
     for item in env["data"]["items"].as_array().unwrap() {
@@ -240,7 +241,7 @@ async fn list_parts_pagination_limit_offset() {
     .await;
     assert_eq!(s, StatusCode::OK, "pagination: {env}");
     assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["total"], "5", "总 5 件: {env}");
+    assert_eq!(env["data"]["total"], 5, "总 5 件: {env}");
     let items = env["data"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 2, "limit=2 应返回 2 件: {env}");
     let mut pids_sorted = pids.clone();

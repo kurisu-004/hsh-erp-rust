@@ -8,20 +8,29 @@
 //! part 域业务实现阶段再补，避免越权改动本域。
 //!
 //! Phase PR-CRUD 增量：
-//! - TPart 23 列完整投影；不含 `unit_price / total_price`（NUMERIC，待 `rust_decimal`）
+//! - TPart 25 列完整投影（含 NUMERIC 金额列 `unit_price` / `total_price`）
 //! - TPartEvent / NewPartEvent：保持不变（已对齐 migration 010）
 //!
-//! 金额列（`unit_price` / `total_price` 是 NUMERIC）待 `rust_decimal` feature
-//! 上线后再补 —— 缺 feature 时 sqlx 编译期拒收。
+//! 2026-09-27 part 域前后端字段对齐：
+//! - TPart 加 `unit_price` / `total_price`（NUMERIC(12,2) / NUMERIC(14,2) NOT NULL
+//!   DEFAULT 0）—— 通过 `rust_decimal::Decimal` + `serde-with-str` 序列化为
+//!   JSON string，避免 JS `Number` 浮点丢精度
+//! - TPart.next_process_id 加 `#[serde(skip)]`：响应中不再出现该字段，但
+//!   DB 列 / statemachine rollup / batch repo 逻辑保留（2026-09-27 用户决策
+//!   范围 C，仅 /parts 响应隐藏；inspection / dashboard / outsource 域另标
+//!   `/// @deprecated` 注释）
 
 use chrono::NaiveDateTime;
+use rust_decimal::Decimal;
 use serde::Serialize;
 
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
-/// `t_part` 完整行投影（Phase PR-CRUD 2026-08-25；2026-09-16 PR-2 瘦身至 23 列）
+/// `t_part` 完整行投影（Phase PR-CRUD 2026-08-25；2026-09-16 PR-2 瘦身至 23 列；
+/// 2026-09-27 加金额列至 25 列）。
 ///
-/// 23 列；不含 `unit_price` / `total_price`（NUMERIC，待 `rust_decimal` feature 上线）。
+/// 25 列：含 NUMERIC 金额列 `unit_price` / `total_price`（NOT NULL DEFAULT 0，
+/// 通过 `Decimal` + `serde-with-str` 序列化为 JSON string）。
 ///
 /// 2026-09-16 PR-2 瘦身（migration 027）：删除 6 个批次依附列 ——
 /// `actual_delivery_date` / `location` / `current_holder_id` / `placed_at` /
@@ -30,7 +39,9 @@ use crate::shared::types::{serialize_i64, serialize_i64_opt};
 /// DELIVERED 事件派生。列表页位置 / 持有人展示由 service 层按
 /// 「min-progress 活跃批次」派生（见 `PartListItem.location` / `holder_name`）。
 ///
-/// `next_process_id` 保留：作 rollup 读缓存（PR-2 不动）。
+/// `next_process_id` 保留：作 rollup 读缓存（PR-2 不动）；2026-09-27 起对
+/// 响应加 `#[serde(skip)]` 仅 /parts 响应不暴露该字段，DB 列与 batch repo
+/// rollup 派生链路完全不变。
 ///
 /// 2026-09-16 增量（migration 026 FK 翻转）：+`process_chain_id`，
 /// 前端「工序制定」列表按它是否为 NULL 区分已制定 / 未制定。
@@ -51,11 +62,23 @@ pub struct TPart {
     pub assembly_id: Option<i64>,
     pub status: String,
     pub is_urgent: bool,
+    /// 2026-09-27 加 `#[serde(skip)]`：`/parts` 响应不暴露该字段（用户决策
+    /// 范围 C，仅隐藏）。DB 列保留；statemachine rollup / batch repo 派生
+    /// 链路完全不变。
+    #[serde(skip)]
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
     pub order_no: Option<String>,
     pub system_delivery_date: Option<chrono::NaiveDate>,
     pub note: Option<String>,
+    /// 2026-09-27 新增：单价（NUMERIC(12,2) NOT NULL DEFAULT 0）。`Decimal` +
+    /// `serde-with-str` 自动序列化为 JSON string。
+    #[serde(with = "rust_decimal::serde::str")]
+    pub unit_price: Decimal,
+    /// 2026-09-27 新增：总价（NUMERIC(14,2) NOT NULL DEFAULT 0）。`Decimal` +
+    /// `serde-with-str` 自动序列化为 JSON string。
+    #[serde(with = "rust_decimal::serde::str")]
+    pub total_price: Decimal,
     pub version: i32,
     pub created_at: chrono::NaiveDateTime,
     #[serde(serialize_with = "serialize_i64_opt")]
@@ -72,12 +95,13 @@ pub struct TPart {
 
 /// `t_part` 行（to_ship 流专用最小投影）
 ///
-/// 仅含 to_ship 路径与 `PartOut` 响应必需列。完整业务字段
-///（`applicant_name` / `unit_price` / `total_price` 等）待
-/// `rust_decimal` 上线、part 域业务实施时再补全。
-///
-/// 与 `TPart`（Phase P1 投影）字段集不同：本结构服务于批量送检接口，
+/// 仅含 to_ship 路径与 `PartOut` 响应必需列。本结构服务于批量送检接口，
 /// 重点暴露 `status` / `version` / `quantity` / `order_no` 等本流程必需字段。
+/// 完整业务字段（`applicant_name` / `unit_price` / `total_price` 等）由
+/// `TPart` 承载（`PartDetailOut` 用），本最小投影保持精简。
+///
+/// 与 `TPart`（完整投影）字段集不同：本结构服务于批量送检接口，重点暴露
+/// `status` / `version` / `quantity` / `order_no` 等本流程必需字段。
 ///
 /// 2026-09-16 PR-2 瘦身（migration 027）：删 `actual_delivery_date` /
 /// `current_holder_id`（t_part 列已删）。原「IN_PROCESS 组合校验」的 holder

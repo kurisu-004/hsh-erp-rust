@@ -202,6 +202,8 @@ impl PartBatchRepo {
                 p.order_no        AS "p_order_no?",
                 p.system_delivery_date AS "p_system_delivery_date?",
                 p.note            AS "p_note?",
+                p.unit_price      AS "p_unit_price!",
+                p.total_price     AS "p_total_price!",
                 p.process_chain_id AS "p_process_chain_id?"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
@@ -254,6 +256,8 @@ impl PartBatchRepo {
                         order_no: r.p_order_no,
                         system_delivery_date: r.p_system_delivery_date,
                         note: r.p_note,
+                        unit_price: r.p_unit_price,
+                        total_price: r.p_total_price,
                         version: r.p_version,
                         created_at: r.p_created_at,
                         created_by: r.p_created_by,
@@ -328,6 +332,8 @@ impl PartBatchRepo {
                 p.order_no        AS "p_order_no?",
                 p.system_delivery_date AS "p_system_delivery_date?",
                 p.note            AS "p_note?",
+                p.unit_price      AS "p_unit_price!",
+                p.total_price     AS "p_total_price!",
                 p.process_chain_id AS "p_process_chain_id?"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
@@ -380,6 +386,8 @@ impl PartBatchRepo {
                         order_no: r.p_order_no,
                         system_delivery_date: r.p_system_delivery_date,
                         note: r.p_note,
+                        unit_price: r.p_unit_price,
+                        total_price: r.p_total_price,
                         version: r.p_version,
                         created_at: r.p_created_at,
                         created_by: r.p_created_by,
@@ -785,6 +793,8 @@ impl PartBatchRepo {
                 p.order_no AS "p_order_no",
                 p.system_delivery_date AS "p_system_delivery_date",
                 p.note AS "p_note",
+                p.unit_price AS "p_unit_price",
+                p.total_price AS "p_total_price",
                 p.process_chain_id AS "p_process_chain_id"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
@@ -841,6 +851,8 @@ impl PartBatchRepo {
                 order_no: r.try_get("p_order_no")?,
                 system_delivery_date: r.try_get("p_system_delivery_date")?,
                 note: r.try_get("p_note")?,
+                unit_price: r.try_get("p_unit_price")?,
+                total_price: r.try_get("p_total_price")?,
                 version: r.try_get("p_version")?,
                 created_at: r.try_get("p_created_at")?,
                 created_by: r.try_get("p_created_by")?,

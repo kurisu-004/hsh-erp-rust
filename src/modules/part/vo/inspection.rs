@@ -44,6 +44,11 @@ pub struct InspectionBatchListItemOut {
     pub holder_name: Option<String>,
     /// 派生自 current_process_step_id（JOIN step.process_id）；保留字段名以
     /// 兼容前端契约（2026-09-16 PR-3）。
+    ///
+    /// 2026-09-27 part 域前后端字段对齐：/parts 响应已对该字段加 `#[serde(skip)]`
+    /// 仅隐藏（DB 列保留、rollup 派生链路不变），inspection 域本字段**行为不变**
+    /// —— 前端 inspection 视图仍在用 `current_process_step_id` 派生此值。仅
+    /// 标记以备后续清理窗口。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
     pub next_process_name: Option<String>,

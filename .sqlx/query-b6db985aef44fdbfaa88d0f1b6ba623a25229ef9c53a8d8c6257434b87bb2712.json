@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_part_file (id, part_id, kind, file_type, object_key, original_filename, file_size, content_type, upload_status, created_at, created_by, updated_at, updated_by, version) VALUES ($1, $2, $3, 'PDF', $4, $5, 1024, 'application/pdf', 'READY', now(), 1, now(), 1, 0)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b6db985aef44fdbfaa88d0f1b6ba623a25229ef9c53a8d8c6257434b87bb2712"
+}

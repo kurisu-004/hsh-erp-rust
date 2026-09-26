@@ -52,6 +52,10 @@ pub struct OutsourceInFlightItem {
     pub name: Option<String>,
     pub is_urgent: bool,
     pub customer_path: Option<String>,
+    /// @deprecated 2026-09-27 part 域前后端字段对齐：/parts 响应已对
+    /// `TPart.next_process_id` 加 `#[serde(skip)]` 仅隐藏（DB 列保留、rollup
+    /// 派生链路不变）。本字段在 outsource 域**行为不变**，前端 outsource
+    /// 视图仍在用 `current_process_step_id` 派生此值。仅标记以备后续清理窗口。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
     pub next_process_name: Option<String>,
@@ -87,6 +91,10 @@ pub struct ApprovedForSendItem {
     pub planned_delivery_date: Option<String>,
     pub is_urgent: bool,
     pub customer_path: Option<String>,
+    /// @deprecated 2026-09-27 part 域前后端字段对齐：/parts 响应已对
+    /// `TPart.next_process_id` 加 `#[serde(skip)]` 仅隐藏（DB 列保留、rollup
+    /// 派生链路不变）。本字段在 outsource 域**行为不变**，前端 outsource
+    /// 视图仍在用 `current_process_step_id` 派生此值。仅标记以备后续清理窗口。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
     pub next_process_name: Option<String>,

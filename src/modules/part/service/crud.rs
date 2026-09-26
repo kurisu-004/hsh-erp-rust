@@ -548,6 +548,8 @@ impl PartService {
                     planned_delivery_date: req.planned_delivery_date,
                     note: req.note.as_deref(),
                     is_urgent: req.is_urgent,
+                    unit_price: req.unit_price,
+                    total_price: req.total_price,
                     updated_by: current.id,
                 },
             )
