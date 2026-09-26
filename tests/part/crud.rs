@@ -131,7 +131,8 @@ async fn list_parts_basic() {
     assert_eq!(env["code"], 0);
     assert!(env["data"]["items"].is_array());
     assert_eq!(env["data"]["items"].as_array().unwrap().len(), 0);
-    assert_eq!(env["data"]["total"], "0");
+    // 2026-09-27 part 域前后端字段对齐：PartListOut.total 改 JSON number（裸 i64）
+    assert_eq!(env["data"]["total"], 0);
 }
 
 /// GET /parts?customer_id=&status=PENDING —— 3 PENDING + 1 INSPECTION，
@@ -191,11 +192,26 @@ async fn list_parts_filter_status_and_customer() {
     assert_eq!(s, StatusCode::OK, "filter status: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(
-        env["data"]["total"], "3",
+        env["data"]["total"], 3,
         "应 PENDING×3 (1 个 INSPECTION 被过滤掉): {env}"
     );
     for item in env["data"]["items"].as_array().unwrap() {
         assert_eq!(item["status"], "PENDING");
+        // 2026-09-27 review 第 1 轮修复（BF3）：PartListItem 改显式列字段，
+        // 列表响应不应出现 next_process_id（详情端点仍含）。
+        assert!(
+            item.get("next_process_id").is_none(),
+            "list 响应不应含 next_process_id (PartListItem 改显式列字段): {item}"
+        );
+        // 2026-09-27 part 域前后端字段对齐：列表响应应含 NUMERIC 金额列。
+        assert!(
+            item.get("unit_price").is_some(),
+            "list 响应应含 unit_price: {item}"
+        );
+        assert!(
+            item.get("total_price").is_some(),
+            "list 响应应含 total_price: {item}"
+        );
     }
 }
 
@@ -240,7 +256,7 @@ async fn list_parts_pagination_limit_offset() {
     .await;
     assert_eq!(s, StatusCode::OK, "pagination: {env}");
     assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["total"], "5", "总 5 件: {env}");
+    assert_eq!(env["data"]["total"], 5, "总 5 件: {env}");
     let items = env["data"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 2, "limit=2 应返回 2 件: {env}");
     let mut pids_sorted = pids.clone();
@@ -280,6 +296,21 @@ async fn get_part_detail_200() {
     assert_eq!(env["data"]["status"], "PENDING");
     assert_eq!(env["data"]["customer_name"], "FX 客户 L2");
     assert_eq!(env["data"]["l1_customer_name"], "FX 客户 L1");
+    // 2026-09-27 review 第 1 轮修复（BF4）：PartDetailOut 仍 flatten TPart，
+    // 详情响应应保留 next_process_id。TPart 已撤销 `#[serde(skip)]`。
+    assert!(
+        env["data"].get("next_process_id").is_some(),
+        "detail 响应应含 next_process_id (PartDetailOut 仍 flatten TPart): {env}"
+    );
+    // 2026-09-27 part 域前后端字段对齐：detail 响应也应含 NUMERIC 金额列。
+    assert!(
+        env["data"].get("unit_price").is_some(),
+        "detail 响应应含 unit_price: {env}"
+    );
+    assert!(
+        env["data"].get("total_price").is_some(),
+        "detail 响应应含 total_price: {env}"
+    );
 }
 
 /// GET /parts/{nonexistent_id} —— 20101 BIZ_PART_NOT_FOUND（HTTP 404）。

@@ -109,6 +109,10 @@ pub struct DashboardItem {
     pub customer_id: Option<String>,
     pub customer_name: Option<String>,
     pub customer_path: Option<String>,
+    /// @deprecated 2026-09-27 part 域前后端字段对齐：/parts 响应已对
+    /// `TPart.next_process_id` 加 `#[serde(skip)]` 仅隐藏（DB 列保留、rollup
+    /// 派生链路不变）。本字段在 dashboard 域**行为不变**，前端 dashboard 视图
+    /// 仍在用 `current_process_step_id` 派生此值。仅标记以备后续清理窗口。
     pub next_process_id: Option<String>,
     pub next_process_name: Option<String>,
     pub worker_name: Option<String>,

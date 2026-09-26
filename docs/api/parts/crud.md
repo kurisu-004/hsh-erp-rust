@@ -45,10 +45,14 @@ Response 200 `data`：`PartListOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `items` | [PartListItem](./index.md#partlistitem-字段)[] | 含 TPart 完整列 + `customer_name` / `l1_customer_name` 冗余 |
-| `total` | string (i64) | 满足过滤的总数（与 `items` 解耦，便于前端独立显示） |
-| `limit` | string (i64) | 实际生效的 limit |
-| `offset` | string (i64) | 实际生效的 offset |
+| `items` | [PartListItem](./index.md#partlistitem-字段)[] | 含 TPart 完整列（不含 `next_process_id`）+ `customer_name` / `l1_customer_name` 冗余 |
+| `total` | int | 满足过滤的总数（与 `items` 解耦，便于前端独立显示） |
+| `limit` | int | 实际生效的 limit |
+| `offset` | int | 实际生效的 offset |
+
+> **2026-09-27 part 域前后端字段对齐**：`total` / `limit` / `offset` 改为裸 i64
+> → JSON number，对齐其它 9 域；雪花 ID 仍按 `serialize_i64` → JSON string。
+> 详见 [`./index.md#partlistout-字段`](./index.md#partlistout-字段) 备注。
 
 > 2026-09-16（migration 026 FK 翻转）：每行新增 `process_chain_id`（string i64?）——
 > 逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链。前端「工序制定」页
@@ -140,11 +144,18 @@ Request：`PartUpdateRequest` — 字段全部可选（缺省 = DB 不动）；`
 | `planned_delivery_date` | date? | — | |
 | `note` | string? | — | |
 | `is_urgent` | bool? | — | |
+| `unit_price` | string (Decimal)? | — | 2026-09-27 新增：单价（NUMERIC(12,2) NOT NULL DEFAULT 0）。`Decimal` 由 axum extractor 从 JSON string 反序列化 |
+| `total_price` | string (Decimal)? | — | 2026-09-27 新增：总价（NUMERIC(14,2) NOT NULL DEFAULT 0）。同上 |
 
 > 2026-09-16 PR-2（migration 027）：`PartUpdateRequest` 删 `actual_delivery_date`
 > 入参 —— 该列已从 `t_part` 删除；实际交付日期由 `t_part_event.event_type='DELIVERED'`
 > 事件派生，不接受手工改（详见
 > [`../../api/statistics.md`](../../api/statistics.md)）。
+>
+> **2026-09-27 part 域前后端字段对齐**：增 `unit_price?` / `total_price?` 入参
+> （`Option<Decimal>`）。DB 列 `t_part.unit_price` / `t_part.total_price` 为
+> NUMERIC(12,2) / NUMERIC(14,2) NOT NULL DEFAULT 0，由 `rust_decimal::Decimal`
+> 反序列化 JSON string → Decimal 避免 JS 浮点丢精度。OCC 语义不变。
 
 Response 200 `data`：[`PartDetailOut`](./index.md#partdetailout-字段)。
 

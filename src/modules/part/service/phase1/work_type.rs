@@ -185,6 +185,8 @@ impl PartService {
         let items: Vec<PartListItem> = rows
             .into_iter()
             .map(|(id, serial, drawing, qty, bid, worker_name)| {
+                // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段，
+                // 通过 `From<TPart>` 派生基础字段（next_process_id 自动不复制）。
                 let p = crate::modules::part::model::TPart {
                     id,
                     serial_no: Some(serial),
@@ -202,6 +204,8 @@ impl PartService {
                     order_no: None,
                     system_delivery_date: None,
                     note: None,
+                    unit_price: rust_decimal::Decimal::ZERO,
+                    total_price: rust_decimal::Decimal::ZERO,
                     version: 0,
                     created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
                     created_by: None,
@@ -210,17 +214,10 @@ impl PartService {
                     deleted_at: None,
                     process_chain_id: None,
                 };
-                let item: PartListItem = PartListItem {
-                    part: p,
-                    customer_name: None,
-                    l1_customer_name: None,
-                    location: None,
-                    holder_name: None,
-                };
                 // 附加 worker_name（轻量：DTO 上没字段，仅放 batch_id 展示）
                 let _ = bid;
                 let _ = worker_name;
-                item
+                PartListItem::from(p)
             })
             .collect();
         let total: i64 = sqlx::query_scalar(
@@ -282,39 +279,38 @@ impl PartService {
         .await?;
         let items: Vec<PartListItem> = rows
             .into_iter()
-            .map(
-                |(id, serial, drawing, qty, _np)| PartListItem {
-                    part: crate::modules::part::model::TPart {
-                        id,
-                        serial_no: Some(serial),
-                        name: drawing.clone(),
-                        drawing_no: drawing,
-                        applicant_name: String::new(),
-                        quantity: qty,
-                        request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                        planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                        customer_id: 0,
-                        assembly_id: None,
-                        status: "IN_PROCESS".to_string(),
-                        is_urgent: false,
-                        next_process_id: None,
-                        order_no: None,
-                        system_delivery_date: None,
-                        note: None,
-                        version: 0,
-                        created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                        created_by: None,
-                        updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                        updated_by: None,
-                        deleted_at: None,
-                        process_chain_id: None,
-                    },
-                    customer_name: None,
-                    l1_customer_name: None,
-                    location: None,
-                    holder_name: None,
-                },
-            )
+            .map(|(id, serial, drawing, qty, _np)| {
+                // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段，
+                // 通过 `From<TPart>` 派生基础字段（next_process_id 自动不复制）。
+                let p = crate::modules::part::model::TPart {
+                    id,
+                    serial_no: Some(serial),
+                    name: drawing.clone(),
+                    drawing_no: drawing,
+                    applicant_name: String::new(),
+                    quantity: qty,
+                    request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                    planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                    customer_id: 0,
+                    assembly_id: None,
+                    status: "IN_PROCESS".to_string(),
+                    is_urgent: false,
+                    next_process_id: None,
+                    order_no: None,
+                    system_delivery_date: None,
+                    note: None,
+                    unit_price: rust_decimal::Decimal::ZERO,
+                    total_price: rust_decimal::Decimal::ZERO,
+                    version: 0,
+                    created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
+                    created_by: None,
+                    updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
+                    updated_by: None,
+                    deleted_at: None,
+                    process_chain_id: None,
+                };
+                PartListItem::from(p)
+            })
             .collect();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM t_part_batch b \
@@ -370,39 +366,38 @@ impl PartService {
         .await?;
         let items: Vec<PartListItem> = rows
             .into_iter()
-            .map(
-                |(id, serial, drawing, qty)| PartListItem {
-                    part: crate::modules::part::model::TPart {
-                        id,
-                        serial_no: Some(serial),
-                        name: drawing.clone(),
-                        drawing_no: drawing,
-                        applicant_name: String::new(),
-                        quantity: qty,
-                        request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                        planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                        customer_id: 0,
-                        assembly_id: None,
-                        status: "IN_PROCESS".to_string(),
-                        is_urgent: false,
-                        next_process_id: None,
-                        order_no: None,
-                        system_delivery_date: None,
-                        note: None,
-                        version: 0,
-                        created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                        created_by: None,
-                        updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                        updated_by: None,
-                        deleted_at: None,
-                        process_chain_id: None,
-                    },
-                    customer_name: None,
-                    l1_customer_name: None,
-                    location: None,
-                    holder_name: None,
-                },
-            )
+            .map(|(id, serial, drawing, qty)| {
+                // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段，
+                // 通过 `From<TPart>` 派生基础字段（next_process_id 自动不复制）。
+                let p = crate::modules::part::model::TPart {
+                    id,
+                    serial_no: Some(serial),
+                    name: drawing.clone(),
+                    drawing_no: drawing,
+                    applicant_name: String::new(),
+                    quantity: qty,
+                    request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                    planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                    customer_id: 0,
+                    assembly_id: None,
+                    status: "IN_PROCESS".to_string(),
+                    is_urgent: false,
+                    next_process_id: None,
+                    order_no: None,
+                    system_delivery_date: None,
+                    note: None,
+                    unit_price: rust_decimal::Decimal::ZERO,
+                    total_price: rust_decimal::Decimal::ZERO,
+                    version: 0,
+                    created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
+                    created_by: None,
+                    updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
+                    updated_by: None,
+                    deleted_at: None,
+                    process_chain_id: None,
+                };
+                PartListItem::from(p)
+            })
             .collect();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM t_part_batch b \

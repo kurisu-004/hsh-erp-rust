@@ -1,6 +1,13 @@
 //! part 域单件详情 / 列表 / 事件出参 VO（2026-09-22 PR4 重构）
+//!
+//! 2026-09-27 review 第 1 轮修复：`PartListItem` 改显式列字段（不再 flatten
+//! `TPart`），列表响应不再包含 `next_process_id`，但 `PartDetailOut` 仍 flatten
+//! `TPart` —— 详情响应仍含 `next_process_id`。两端语义保持：
+//! - list：不返 next_process_id
+//! - detail：仍返 next_process_id
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
+use rust_decimal::Decimal;
 use serde::Serialize;
 
 use crate::modules::part::model::{TPart, TPartInspected};
@@ -104,7 +111,15 @@ impl PartDetailOut {
     }
 }
 
-/// `GET /parts` 列表行：`TPart` + 客户冗余字段 + 派生位置 / 持有人。
+/// `GET /parts` 列表行：`TPart` 显式列字段 + 客户冗余字段 + 派生位置 / 持有人。
+///
+/// 2026-09-27 review 第 1 轮修复：放弃 `#[serde(flatten)] pub part: TPart`，
+/// 改为显式列字段（22 字段 + 4 派生字段）。目的是「**列表不返 next_process_id** +
+/// **详情仍返 next_process_id**」（`PartDetailOut` 仍 flatten `TPart`，保持响应）。
+///
+/// 字段集对齐 `TPart` 25 列去掉 `next_process_id`（24 列）：含 2026-09-27
+/// 新增 `unit_price` / `total_price` NUMERIC 金额列、`process_chain_id`
+/// 逻辑 FK、2026-09-16 PR-2 瘦身后的 23 列全集。
 ///
 /// 2026-09-16 PR-2 瘦身（migration 027）：t_part 不再持有 `location` /
 /// `current_holder_id`（已删列），前端列表需要的「位置 / 持有人」展示由
@@ -123,8 +138,39 @@ impl PartDetailOut {
 ///   - `OFFICE` / `NULL` / 无活跃批次 → `None`
 #[derive(Debug, Clone, Serialize)]
 pub struct PartListItem {
-    #[serde(flatten)]
-    pub part: TPart,
+    #[serde(serialize_with = "serialize_i64")]
+    pub id: i64,
+    pub serial_no: Option<String>,
+    pub name: String,
+    pub drawing_no: String,
+    pub applicant_name: String,
+    pub quantity: i32,
+    pub request_date: NaiveDate,
+    pub planned_delivery_date: NaiveDate,
+    #[serde(serialize_with = "serialize_i64")]
+    pub customer_id: i64,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub assembly_id: Option<i64>,
+    pub status: String,
+    pub is_urgent: bool,
+    // 注意：next_process_id 不在 list 响应里（2026-09-27 用户决策范围 C）
+    pub order_no: Option<String>,
+    pub system_delivery_date: Option<NaiveDate>,
+    pub note: Option<String>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub unit_price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub total_price: Decimal,
+    pub version: i32,
+    pub created_at: NaiveDateTime,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub created_by: Option<i64>,
+    pub updated_at: NaiveDateTime,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub updated_by: Option<i64>,
+    pub deleted_at: Option<NaiveDateTime>,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub process_chain_id: Option<i64>,
     pub customer_name: Option<String>,
     pub l1_customer_name: Option<String>,
     /// 派生位置（见字段级 doc 注释）。
@@ -135,15 +181,55 @@ pub struct PartListItem {
     pub holder_name: Option<String>,
 }
 
+impl From<TPart> for PartListItem {
+    fn from(p: TPart) -> Self {
+        Self {
+            id: p.id,
+            serial_no: p.serial_no,
+            name: p.name,
+            drawing_no: p.drawing_no,
+            applicant_name: p.applicant_name,
+            quantity: p.quantity,
+            request_date: p.request_date,
+            planned_delivery_date: p.planned_delivery_date,
+            customer_id: p.customer_id,
+            assembly_id: p.assembly_id,
+            status: p.status,
+            is_urgent: p.is_urgent,
+            // 故意不复制 p.next_process_id：列表响应不暴露该字段
+            order_no: p.order_no,
+            system_delivery_date: p.system_delivery_date,
+            note: p.note,
+            unit_price: p.unit_price,
+            total_price: p.total_price,
+            version: p.version,
+            created_at: p.created_at,
+            created_by: p.created_by,
+            updated_at: p.updated_at,
+            updated_by: p.updated_by,
+            deleted_at: p.deleted_at,
+            process_chain_id: p.process_chain_id,
+            customer_name: None, // 由 service 注入
+            l1_customer_name: None, // 由 service 注入
+            location: None, // 由 service 注入
+            holder_name: None, // 由 service 注入
+        }
+    }
+}
+
 /// `GET /parts` 出参（分页）。
+///
+/// 2026-09-27 part 域前后端字段对齐：`total` / `limit` / `offset` 改裸 i64 →
+/// JSON number，对齐其它 9 域（UserListOut / CustomerListOut / WorkerListOut /
+/// OutsourceCompanyListOut / ProcessListOut / ShelfListOut / DeliveryNoteListOut /
+/// DeliveryGroupListOut / OutsourceQuoteListOut）。雪花 ID 仍走 `serialize_i64`
+/// → JSON string 规避 JS `Number.MAX_SAFE_INTEGER` 精度截断，本处分页字段是
+/// 普通 i64，无精度风险，直接 JSON number。
 #[derive(Debug, Clone, Serialize)]
 pub struct PartListOut {
     pub items: Vec<PartListItem>,
-    #[serde(serialize_with = "serialize_i64")]
     pub total: i64,
-    #[serde(serialize_with = "serialize_i64")]
     pub limit: i64,
-    #[serde(serialize_with = "serialize_i64")]
     pub offset: i64,
 }
 

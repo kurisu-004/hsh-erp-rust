@@ -174,21 +174,23 @@ async fn add_child_happy_path() {
     tx.commit().await.unwrap();
 
     // 3. 验证 PartListItem 返回值
-    assert_eq!(child.part.name, "子件1");
-    assert_eq!(child.part.drawing_no, "CH-CHILD-D001");
-    assert_eq!(child.part.quantity, 3);
-    assert_eq!(child.part.customer_id, l2, "子件 customer 继承父件");
+    // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段（不再
+    // flatten TPart），断言访问也改用直接字段。
+    assert_eq!(child.name, "子件1");
+    assert_eq!(child.drawing_no, "CH-CHILD-D001");
+    assert_eq!(child.quantity, 3);
+    assert_eq!(child.customer_id, l2, "子件 customer 继承父件");
     assert_eq!(
-        child.part.assembly_id,
+        child.assembly_id,
         Some(asm_id),
         "子件 assembly_id 指向父件"
     );
-    assert_eq!(child.part.applicant_name, "张三", "applicant_name 继承父件");
-    assert_eq!(child.part.order_no.as_deref(), Some("CH-ORDER-001"));
-    assert_eq!(child.part.note.as_deref(), Some("加急备注"));
-    assert!(!child.part.is_urgent);
+    assert_eq!(child.applicant_name, "张三", "applicant_name 继承父件");
+    assert_eq!(child.order_no.as_deref(), Some("CH-ORDER-001"));
+    assert_eq!(child.note.as_deref(), Some("加急备注"));
+    assert!(!child.is_urgent);
     assert!(
-        child.part.serial_no.is_none(),
+        child.serial_no.is_none(),
         "无 PDF 路径 → serial_no = NULL"
     );
     assert_eq!(
@@ -210,10 +212,10 @@ async fn add_child_happy_path() {
         "SELECT name, order_no, note, quantity, customer_id, assembly_id, is_urgent \
          FROM t_part WHERE id = $1",
     )
-    .bind(child.part.id)
-    .fetch_one(&pool)
-    .await
-    .expect("query child part");
+.bind(child.id)
+        .fetch_one(&pool)
+        .await
+        .expect("query child part");
     assert_eq!(row.0, "子件1");
     assert_eq!(row.1.as_deref(), Some("CH-ORDER-001"));
     assert_eq!(row.2.as_deref(), Some("加急备注"));
@@ -226,10 +228,10 @@ async fn add_child_happy_path() {
     let batch_row: (i32, String) = sqlx::query_as(
         "SELECT batch_no, status FROM t_part_batch WHERE part_id = $1 ORDER BY batch_no ASC LIMIT 1",
     )
-    .bind(child.part.id)
-    .fetch_one(&pool)
-    .await
-    .expect("query initial batch");
+.bind(child.id)
+        .fetch_one(&pool)
+        .await
+        .expect("query initial batch");
     assert_eq!(batch_row.0, 1, "初始 batch batch_no=1");
     assert_eq!(batch_row.1, "PENDING", "初始 batch status=PENDING");
 }
@@ -377,7 +379,7 @@ async fn add_child_inherits_planned_delivery_date_when_omitted() {
     tx.commit().await.unwrap();
 
     assert_eq!(
-        child.part.planned_delivery_date, planned,
+        child.planned_delivery_date, planned,
         "子件 planned_delivery_date 缺省 → 继承父件"
     );
 }

@@ -71,6 +71,8 @@ mod scan_resolve_tests {
             order_no: None,
             system_delivery_date: None,
             note: None,
+            unit_price: rust_decimal::Decimal::ZERO,
+            total_price: rust_decimal::Decimal::ZERO,
             version: 0,
             created_at: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
                 .unwrap()
@@ -393,6 +395,8 @@ mod attachable_batches_tests {
             order_no: None,
             system_delivery_date: None,
             note: None,
+            unit_price: rust_decimal::Decimal::ZERO,
+            total_price: rust_decimal::Decimal::ZERO,
             version: 0,
             created_at: chrono::NaiveDate::from_ymd_opt(2026, 8, 22)
                 .unwrap()

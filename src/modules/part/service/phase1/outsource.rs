@@ -516,16 +516,10 @@ impl PartService {
         };
         let items = repo.list_with_filters(&f).await?;
         let total = repo.count_with_filters(&f).await?;
-        let list_items: Vec<PartListItem> = items
-            .into_iter()
-            .map(|p| PartListItem {
-                part: p,
-                customer_name: None,
-                l1_customer_name: None,
-                location: None,
-                holder_name: None,
-            })
-            .collect();
+        // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段（不再
+        // flatten TPart），用 `From<TPart>` 派生；customer_name / l1_customer_name /
+        // location / holder_name 4 派生字段保持 None（service 层不再 enrich）。
+        let list_items: Vec<PartListItem> = items.into_iter().map(PartListItem::from).collect();
         Ok(PartListOut {
             items: list_items,
             total,
@@ -571,16 +565,10 @@ impl PartService {
         };
         let items = repo.list_with_filters(&f).await?;
         let total = repo.count_with_filters(&f).await?;
-        let list_items: Vec<PartListItem> = items
-            .into_iter()
-            .map(|p| PartListItem {
-                part: p,
-                customer_name: None,
-                l1_customer_name: None,
-                location: None,
-                holder_name: None,
-            })
-            .collect();
+        // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段（不再
+        // flatten TPart），用 `From<TPart>` 派生；customer_name / l1_customer_name /
+        // location / holder_name 4 派生字段保持 None（service 层不再 enrich）。
+        let list_items: Vec<PartListItem> = items.into_iter().map(PartListItem::from).collect();
         Ok(PartListOut {
             items: list_items,
             total,

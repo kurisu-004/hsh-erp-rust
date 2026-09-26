@@ -164,6 +164,7 @@ impl PartService {
              customer_id, assembly_id, status, \
              is_urgent, next_process_id, \
              order_no, system_delivery_date, note, \
+             unit_price, total_price, \
              version, created_at, created_by, updated_at, updated_by, \
              deleted_at, process_chain_id \
              FROM t_part WHERE serial_no = $1 AND deleted_at IS NULL",

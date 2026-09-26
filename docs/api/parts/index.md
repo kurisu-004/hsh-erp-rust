@@ -105,16 +105,40 @@
 
 ### PartListItem 字段
 
-`TPart` 完整 23 列 + `customer_name` / `l1_customer_name` 冗余字段 + 列表项专用派生字段
+`TPart` 完整 25 列（2026-09-27 增 NUMERIC 金额列 `unit_price` / `total_price` 至 23+2=25 列）+
+`customer_name` / `l1_customer_name` 冗余字段 + 列表项专用派生字段
 `location` / `holder_name`；见 [`./index.md#mainconventions`](./index.md#端点约束与-python-一致)
 关于 i64 字段序列化为 string 的约定。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| ... 其它 TPart 列 ... | ... | 见下 |
+| `id` | string (i64) | 雪花 ID（`serialize_i64`） |
+| `serial_no` | string? | 序列号 |
+| `name` | string | 工单名 |
+| `drawing_no` | string | 图号 |
+| `applicant_name` | string | 申请人 |
+| `quantity` | i32 | > 0 |
+| `request_date` | date | 客户请求日 |
+| `planned_delivery_date` | date | 计划交付日 |
+| `customer_id` | string (i64) | 二级客户 id |
+| `assembly_id` | string (i64)? | 父装配体 |
+| `status` | string | part 状态枚举字符串（`INSPECTION` / `READY_TO_SHIP` 等） |
+| `is_urgent` | bool | 紧急标记 |
+| `order_no` | string? | 订单号 |
+| `system_delivery_date` | date? | 系统派工日 |
+| `note` | string? | 备注 |
+| `unit_price` | string (Decimal) | 2026-09-27 新增：单价（NUMERIC(12,2) NOT NULL DEFAULT 0）。`rust_decimal::Decimal` + `serde-with-str` 自动序列化为 string。 |
+| `total_price` | string (Decimal) | 2026-09-27 新增：总价（NUMERIC(14,2) NOT NULL DEFAULT 0）。同上，string 避免 JS 浮点丢精度。 |
+| `version` | i32 | 乐观锁 |
+| `created_at` | naive datetime | |
+| `created_by` | string (i64)? | |
+| `updated_at` | naive datetime | |
+| `updated_by` | string (i64)? | |
+| `deleted_at` | naive datetime? | 软删标记 |
+| `process_chain_id` | string (i64)? | 2026-09-16 migration 026 新增：逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链 |
 | `customer_name` | string? | 冗余（lookup_customer_names） |
 | `l1_customer_name` | string? | 冗余（lookup_customer_names） |
-| `location` | string? | **派生**（2026-09-16 PR-2 § part/service/crud.rs::enrich_part_list_with_location_and_holder）；`min-progress 活跃批次.location`（与 `compute_part_target` 一致）。无活跃批次 → `null`。前端展示文案规范由前端承担（`PRODUCTION_SHELF` → "货架 X" 等）；后端只负责值。 |
+| `location` | string? | **派生**（2026-09-16 PR-2 § part/service/crud.rs::enrich_part_list_with_location_and_holder）；`min-progress 活跃批次.location`（与 `compute_part_target` 一致）。无活跃批次 → `null`。前端展示文案规范化由前端承担（`PRODUCTION_SHELF` → "货架 X" 等）；后端只负责值。 |
 | `holder_name` | string? | **派生**（同上）；按 min-progress 活跃批次的 `current_holder_id` 解析（按 batch.location 分桶：`PRODUCTION_SHELF` / `INSPECTION_SHELF` → `t_shelf.code`；`WORKER` → `t_worker.name`；`OUTSOURCE_COMPANY` → `t_outsource_company.name`；`OFFICE` / `None` → `null`）。 |
 
 > 2026-09-16 PR-2（migration 027）：`t_part` 删 `actual_delivery_date` /
@@ -125,9 +149,25 @@
 > 2026-09-16 PR-3 批次 step 化（migration 028）：`t_part_batch.next_process_id` 列
 > 替换为 `current_process_step_id`（逻辑 FK → `t_process_chain_step.id`）。
 > `t_part_batch.placed_at` 列已删除（不再统计生产时间）。`TPart.next_process_id`
-> 字段保留作派生缓存，由 `sync_from_batch_change` rollup 派生
+> DB 列保留作派生缓存，由 `sync_from_batch_change` rollup 派生
 > （min-progress 活跃 batch 的 step JOIN `t_process_chain_step.process_id`）。
-> 前端如需该信息，按 `current_process_step_id` 自行派生即可。
+>
+> **2026-09-27 part 域前后端字段对齐**：
+> - 响应中**不再出现** `next_process_id` / `next_process_name` —— 但仅 list 端点不
+>   暴露；detail 端点（`PartDetailOut`）仍含 `next_process_id`（`PartListItem`
+>   改显式列字段、不再 flatten `TPart`；`TPart.next_process_id` 撤销
+>   `#[serde(skip)]` 恢复序列化）。DB 列、statemachine rollup、batch repo
+>   派生链路完全不变。inspection / dashboard / outsource 域另标
+>   `/// @deprecated 2026-09-27` 注释（行为不变）。前端如需该信息，按
+>   `current_process_step_id` 派生即可。
+> - 本目录 VOs **从未**包含过 `customer_path` / `parent_customer_name` 字段
+>   —— 前端若仍读取请改读 `l1_customer_name`（2026-09-16 PR-2 24 列对齐后
+>   即稳定）。
+>
+> 2026-09-27 part 域前后端字段对齐：新增 `unit_price` / `total_price` 两个
+> NUMERIC 金额列（NOT NULL DEFAULT 0），后端用 `rust_decimal::Decimal` +
+> `serde-with-str` 序列化为 JSON string，前端按 string 解析（避免 JS
+> `Number.MAX_SAFE_INTEGER` 浮点丢精度）。
 >
 > 2026-09-16（migration 026 FK 翻转）：`TPart` 新增 `process_chain_id`（string i64?）
 > —— 逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链。前端「工序制定」页
@@ -138,13 +178,25 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `items` | [PartListItem](#partlistitem-字段)[] | |
-| `total` | string (i64) | 满足过滤的总数 |
-| `limit` | string (i64) | 实际生效 |
-| `offset` | string (i64) | 实际生效 |
+| `total` | int | 满足过滤的总数 |
+| `limit` | int | 实际生效 |
+| `offset` | int | 实际生效 |
+
+> **2026-09-27 part 域前后端字段对齐**：`total` / `limit` / `offset` 改为裸 i64
+> → JSON number，对齐其它 9 域（UserListOut / CustomerListOut / WorkerListOut /
+> OutsourceCompanyListOut / ProcessListOut / ShelfListOut / DeliveryNoteListOut /
+> DeliveryGroupListOut / OutsourceQuoteListOut）。雪花 ID 仍走 `serialize_i64` →
+> JSON string 规避 JS `Number.MAX_SAFE_INTEGER` 精度截断，本处分页字段是普通
+> i64（远小于 2^53），无精度风险，直接 JSON number。
 
 ### PartDetailOut 字段
 
-`TPart` 完整 29 列（含 2026-09-16 新增 `process_chain_id`）+ `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
+`TPart` 完整 25 列（2026-09-16 PR-2 瘦身后 23 列 + 2026-09-27 新增 `unit_price` / `total_price` 2 列；**含** `next_process_id`——detail 端点保留）+ `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
+
+> 2026-09-27 review 第 1 轮修复语义：`TPart.next_process_id` 撤销
+> `#[serde(skip)]`，detail 端点（`PartDetailOut` 仍 flatten `TPart`）保留
+> `next_process_id` 字段；list 端点（`PartListItem` 改显式列字段）不含
+> `next_process_id`。
 
 ## 端点约束（与 Python 一致）
 
