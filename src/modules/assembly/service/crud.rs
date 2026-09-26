@@ -902,12 +902,13 @@ impl AssemblyService {
             .await
             .map_err(AppError::from)?;
 
-        Ok(PartListItem {
-            part: part_t,
-            customer_name: cn,
-            l1_customer_name: l1cn,
-            location: None,
-            holder_name: None,
-        })
+        // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段（不再 flatten
+        // TPart），用 `From<TPart>` 派生基础字段；customer_name /
+        // l1_customer_name / location / holder_name 4 派生字段由 caller 注入。
+        let mut item: PartListItem = part_t.into();
+        item.customer_name = cn;
+        item.l1_customer_name = l1cn;
+        // location / holder_name 默认 None（装配子件新建，无活跃批次）
+        Ok(item)
     }
 }

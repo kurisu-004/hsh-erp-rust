@@ -325,13 +325,16 @@ impl PartService {
         for p in rows {
             let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), p.customer_id).await?;
             let (loc, holder) = batch_enrichment.get(&p.id).cloned().unwrap_or((None, None));
-            items.push(PartListItem {
-                part: p,
-                customer_name: cn,
-                l1_customer_name: l1cn,
-                location: loc,
-                holder_name: holder,
-            });
+            // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段（不再
+            // flatten TPart），用 `From<TPart>` 派生基础字段；customer_name /
+            // l1_customer_name / location / holder_name 4 个派生字段由 service
+            // 注入（保持旧行为）。
+            let mut item: PartListItem = p.into();
+            item.customer_name = cn;
+            item.l1_customer_name = l1cn;
+            item.location = loc;
+            item.holder_name = holder;
+            items.push(item);
         }
         Ok(PartListOut {
             items,

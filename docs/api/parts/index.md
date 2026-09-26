@@ -152,13 +152,17 @@
 > DB 列保留作派生缓存，由 `sync_from_batch_change` rollup 派生
 > （min-progress 活跃 batch 的 step JOIN `t_process_chain_step.process_id`）。
 >
-> **2026-09-27 part 域前后端字段对齐**：响应中**不再出现** `next_process_id` /
-> `next_process_name` —— `TPart.next_process_id` 加 `#[serde(skip)]` 仅隐藏
-> （用户决策范围 C）。DB 列、statemachine rollup、batch repo 派生链路完全
-> 不变，inspection / dashboard / outsource 域另标 `/// @deprecated 2026-09-27`
-> 注释（行为不变）。前端如需该信息，按 `current_process_step_id` 派生即可。
-> 同时移除历史误出现的 `customer_path` / `parent_customer_name` 字段，前端
-> 应改读 `l1_customer_name`。
+> **2026-09-27 part 域前后端字段对齐**：
+> - 响应中**不再出现** `next_process_id` / `next_process_name` —— 但仅 list 端点不
+>   暴露；detail 端点（`PartDetailOut`）仍含 `next_process_id`（`PartListItem`
+>   改显式列字段、不再 flatten `TPart`；`TPart.next_process_id` 撤销
+>   `#[serde(skip)]` 恢复序列化）。DB 列、statemachine rollup、batch repo
+>   派生链路完全不变。inspection / dashboard / outsource 域另标
+>   `/// @deprecated 2026-09-27` 注释（行为不变）。前端如需该信息，按
+>   `current_process_step_id` 派生即可。
+> - 本目录 VOs **从未**包含过 `customer_path` / `parent_customer_name` 字段
+>   —— 前端若仍读取请改读 `l1_customer_name`（2026-09-16 PR-2 24 列对齐后
+>   即稳定）。
 >
 > 2026-09-27 part 域前后端字段对齐：新增 `unit_price` / `total_price` 两个
 > NUMERIC 金额列（NOT NULL DEFAULT 0），后端用 `rust_decimal::Decimal` +
@@ -187,7 +191,12 @@
 
 ### PartDetailOut 字段
 
-`TPart` 完整 25 列（2026-09-16 PR-2 瘦身后 23 列 + 2026-09-27 新增 `unit_price` / `total_price` 2 列；同样响应不含 `next_process_id`）+ `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
+`TPart` 完整 25 列（2026-09-16 PR-2 瘦身后 23 列 + 2026-09-27 新增 `unit_price` / `total_price` 2 列；**含** `next_process_id`——detail 端点保留）+ `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
+
+> 2026-09-27 review 第 1 轮修复语义：`TPart.next_process_id` 撤销
+> `#[serde(skip)]`，detail 端点（`PartDetailOut` 仍 flatten `TPart`）保留
+> `next_process_id` 字段；list 端点（`PartListItem` 改显式列字段）不含
+> `next_process_id`。
 
 ## 端点约束（与 Python 一致）
 
