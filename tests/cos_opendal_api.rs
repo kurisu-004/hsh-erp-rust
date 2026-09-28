@@ -43,8 +43,8 @@ fn fresh_client() -> NoopOpenDal {
 }
 
 fn make_cos_config(backend: CosBackend, enabled: bool) -> CosConfig {
-    // 2026-09-20 迁移清理：删 `sts_duration_seconds` 字段（STS 链路完全走
-    // `UploadSessionConfig::sts_duration_seconds` + python 后端转发）。
+    // 2026-09-20 迁移清理：删 `sts_duration_seconds` 字段。
+    // 2026-09-28 删除：相关 STS 会话域配置引用（域整体下线）。
     CosConfig {
         backend,
         enabled,

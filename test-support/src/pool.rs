@@ -56,9 +56,12 @@ pub fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
 /// per-process snowflake instance：pid ⊕ 启动时间纳秒低位 → 0-1023。
 ///
 /// 2026-09-20 新增：nextest process-per-test 模型下，同毫秒并行的多个测试进程若
-/// 共享 (epoch, instance=1) 会生成相同 user_id → 撞 redis key（sessions:user:{id} /
-/// upload_session:{id}:{scope}）。pid 与 startup_nanos 的低位异或后 mod 1024 即可在
-/// 1024 个并行进程内几乎无碰撞；实现零依赖（不引入 fnv crate）。
+/// 共享 (epoch, instance=1) 会生成相同 user_id → 撞 redis key（sessions:user:{id}）。
+/// pid 与 startup_nanos 的低位异或后 mod 1024 即可在 1024 个并行进程内几乎无碰撞；
+/// 实现零依赖（不引入 fnv crate）。
+///
+/// 2026-09-28 备注：相关 STS 会话域 redis key 已下线；本函数仍服务于 `sessions:user:{id}`
+/// 防撞；instance 派生逻辑未变。
 ///
 /// pub(crate)：[`state`](super::state) 构造 `AppConfig::snowflake::instance` 也读它，
 /// 必须 crate 内可见。

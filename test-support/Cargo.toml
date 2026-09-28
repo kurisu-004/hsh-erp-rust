@@ -81,7 +81,8 @@ futures-util = "0.3"
 dashmap = "6"
 
 # OpenDAL（test_state_with_cos 等不直接用；主仓传递，列出来对齐）
-# 本 crate 用的是 NoopCos / NoopPythonSts 占位，OpenDAL 仅作传递依赖声明。
+# 2026-09-28 备注：本 crate 用的是 NoopCos 占位（相关 STS 转发模块已下线），
+# OpenDAL 仅作传递依赖声明。
 opendal = { version = "0.53", default-features = false, features = ["services-memory"] }
 
 # 不包含（按 PR13 Phase A 任务硬约束）：

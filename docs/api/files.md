@@ -7,8 +7,10 @@
 > 2026-09-14 Phase 3 落地。
 >
 > 2026-09-18 重大变更：**删除** `POST /api/v2/part-files/upload-intents` 端点——
-> 上传意图机制迁移至 [`upload_session.md`](./upload_session.md)（共享 STS 凭证 +
-> Redis 会话）。本文件保留 confirm 端点与 multipart 上传端点。
+> 上传意图机制迁移至相关 STS 会话域（共享 STS 凭证 + Redis 会话）。
+> 2026-09-28 进一步下线相关 STS 会话域；前端改为单 uploader 触发时单 HTTP 调用 python
+> `POST /api/v1/files/sts-tmp-keys`（数组入参）直签 STS，rust 后端不参与 STS 签发。
+> 本文件保留 confirm 端点与 multipart 上传端点。
 
 ---
 
@@ -23,7 +25,9 @@
 | POST | `/api/v2/part-files/{file_id}/delete` | 按 `kind` 派生（DRAWING / 3D_MODEL / CAD_2D / SETUP_SHEET → M+C；G_CODE → M+CNC） | 软删 + COS 异步清理 |
 | POST | `/api/v2/parts/{part_id}/files/confirm` | Manager / Clerk | 直传 COS 链路绑定：客户端 PUT 到 tmp 区成功后，head 校验 size → copy 到 CAS key → INSERT READY part_file → 异步清理 tmp |
 
-> 2026-09-18 删除：`POST /api/v2/part-files/upload-intents` 端点（迁移至 upload_session 域）。
+> 2026-09-18 删除：`POST /api/v2/part-files/upload-intents` 端点（迁移至相关 STS 会话域）。
+> 2026-09-28 备注：相关 STS 会话域整体下线；前端 STS 申请走 `POST /api/v1/files/sts-tmp-keys`
+> （python 后端），rust 后端不参与 STS 签发。
 
 ### `POST /api/v2/part-files/{file_id}/delete`
 
@@ -52,7 +56,7 @@
 
 直传 COS 链路的"提交绑定"端点：客户端 PUT 到 tmp 区成功后，调用本端点把 tmp 对象 copy 到 CAS key + INSERT `t_part_file` + 异步清理 tmp 对象。
 
-权限：**Manager / Clerk**（与 upload_session.get_or_create 一致）
+权限：**Manager / Clerk**
 
 入参（JSON）：`ConfirmFileIn`
 
@@ -92,7 +96,7 @@
 
 > **HTTP 状态码推导**：`BIZ_PART_FILE_TMP_OBJECT_MISSING` (21114) 走 `AppError::biz` → `status_from_code(21114)` → 未在显式 404 列表 → 落入 `(20000..30000)` 兜底 → `BAD_REQUEST`（400）。语义上 tmp 对象缺失更像 404，但当前错误码表未将其列入显式映射，因此 HTTP=400；后续若需改为 404，可将 21114 加进 `status_from_code` 404 段。
 >
-> 注：本端点**不**返回 21102（kind / content_type 校验走 40001 VALIDATION_ERROR，避开与 multipart 端点 21102 在「客户端没按规范填字段」vs「kind 不匹配」语义重叠）；confirm handler 直接复用 `validate::check_confirm_file_in` 与 upload_session.get_or_create 入口保持一致。
+> 注：本端点**不**返回 21102（kind / content_type 校验走 40001 VALIDATION_ERROR，避开与 multipart 端点 21102 在「客户端没按规范填字段」vs「kind 不匹配」语义重叠）；confirm handler 直接复用 `validate::check_confirm_file_in` 入口。
 
 ---
 
@@ -174,7 +178,7 @@ CAS 命中（已上传过相同内容）→ 跳过 COS PUT，直接复用已有 
 | code | 名称 | HTTP | 触发场景 |
 |---|---|---|---|
 | 21102 | BIZ_PART_FILE_BAD_TYPE | 400 | 扩展名与 kind 不匹配 / content_type 不匹配 |
-| 21103 | BIZ_PART_FILE_TOO_LARGE | 400 | file_size 超过 `COS_MAX_FILE_SIZE`（upload_session.allocate 入参校验） |
+| 21103 | BIZ_PART_FILE_TOO_LARGE | 400 | file_size 超过 `COS_MAX_FILE_SIZE`（直传链路 service 层入参校验） |
 | 21104 | BIZ_PART_FILE_UPLOAD_FAILED | 500 | COS SDK 抛错（put_object / copy_object 失败） |
 | 21105 | BIZ_PART_FILE_OWNER_NOT_FOUND | 404 | polymorphic owner (part / assembly) 不存在 |
 | 21108 | BIZ_PART_FILE_DUPLICATE | 409 | 唯一索引并发兜底（同 owner + kind + sha 撞 23505） |
@@ -184,7 +188,8 @@ CAS 命中（已上传过相同内容）→ 跳过 COS PUT，直接复用已有 
 > 21101（NOT_FOUND）：保留对齐 Python 错误码表，本文档对应端点暂不返回。
 > 21114 当前未列入 `status_from_code` 显式映射段，HTTP 走 `(20000..30000)` 兜底 → BAD_REQUEST；语义上更像 404，若需对齐 HTTP 语义，需在 `src/shared/error.rs::status_from_code` 显式登记。
 >
-> 2026-09-18 注：原 `POST /upload-intents` 文档段（含 21103 / 21116 错误码）已删除——上传意图机制迁移至 upload_session 域，相关错误码（216xx 系列）见 [`upload_session.md`](./upload_session.md#错误码)。
+> 2026-09-18 注：原 `POST /upload-intents` 文档段（含 21103 / 21116 错误码）已删除——上传意图机制迁移至相关 STS 会话域。
+> 2026-09-28 注：相关 STS 会话域已下线（对应 docs 整文件删除）；216xx 错误码段释放，21116 同步释放码段。前端 STS 申请走 `POST /api/v1/files/sts-tmp-keys`（python 后端）。
 
 ---
 
@@ -195,4 +200,4 @@ CAS 命中（已上传过相同内容）→ 跳过 COS PUT，直接复用已有 
 - COS object key 模板：`{owner_kind.to_lowercase()}/{owner_id}/{kind}/{sha[..16]}_{sanitized_filename}`。
 - 权限：service 层 `require_any_role([Manager, Clerk, CncProgrammer])`；列表 / 详情额外允许 Inspector。
 - WS 广播：本域不上报 WS 事件（part_file 是只读资产）。
-- 上传意图机制：2026-09-18 整体迁移至 upload_session 域（共享 STS 凭证 + Redis 会话 + 转发 python 签发）。
+- 上传意图机制：2026-09-18 整体迁移至相关 STS 会话域（共享 STS 凭证 + Redis 会话 + 转发 python 签发）；2026-09-28 进一步下线相关会话域，前端改为单 uploader + python `sts-tmp-keys` 数组入参直签 STS。

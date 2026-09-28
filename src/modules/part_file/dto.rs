@@ -15,10 +15,9 @@ use crate::shared::types::deserialize_i64;
 // ===== 2026-09-16 M2-B 业务层：ConfirmFileIn（保留） =====
 //
 // 2026-09-18 注：原 `UploadIntentsIn` / `UploadIntentsOut` / `UploadIntentItemIn` /
-// `UploadIntentItemOut` / `CosCredentialsOut` 等 DTO 已删除，迁移至
-// `upload_session` 域（共享 STS 凭证 + Redis 会话机制）。
-// - `POST /api/v2/part-files/upload-intents` 端点（删除）
-// - 直传意图分配 tmp_key 的 DTO（删除；由 upload_session.allocate 替代）
+// `UploadIntentItemOut` / `CosCredentialsOut` 等 DTO 已删除，迁移至相关 STS 会话域。
+// 2026-09-28 备注：相关 STS 会话域已下线，前端改为单 uploader 触发时单 HTTP 调用
+// python `sts-tmp-keys` 数组入参直签。本文件不再涉及任何 STS / 会话相关 DTO。
 //
 // confirm 端点（`POST /api/v2/parts/{id}/files/confirm`）仍保留，其入参：
 #[derive(Debug, Clone, Deserialize)]

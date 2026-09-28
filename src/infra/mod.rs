@@ -11,19 +11,18 @@
 //! - `serial`：业务单号/序列号计数（占位）
 //! - `ws_hub`：WebSocket 广播中枢
 //! - `redis`：Redis 连接池构建（deadpool-redis 0.23，session store 用）
-//! - `python_sts`：转发 python 后端签发 STS（2026-09-18 M3-B 新增，替代 `sts::TencentSts`）
-//! - `sts`：STS 临时凭证签发旧模块（2026-09-18 review #2 修复后**仅保留 NoopSts** 占位，
-//!   与 `NoopCos` 对偶；真实签发链路已迁至 `python_sts`）
+//!
+//! 2026-09-28 删除 STS 转发相关模块（转发器与 sts NoopSts 占位）：
+//! 相关上传会话域已下线，前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys`
+//! 数组入参直签，rust 后端不再代为转发 STS 凭证。
 
 pub mod clock;
 pub mod config;
 pub mod cos;
 pub mod cos_opendal; // 2026-09-20 spike：OpenDAL S3 backend 替代 cos-rust-sdk 可行性验证
 pub mod db;
-pub mod python_sts; // 2026-09-18 新增：转发 python 后端签发 STS
 pub mod redis;
 pub mod seed; // 2026-09-25 新增：菜单等配置数据声明式种子
 pub mod serial;
 pub mod snowflake;
-pub mod sts; // 2026-09-18 review #2 修复：恢复 NoopSts 占位（TencentSts 已迁到 python_sts）
 pub mod ws_hub;

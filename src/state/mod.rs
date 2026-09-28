@@ -20,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::session::SessionStore;
 use crate::infra::config::AppConfig;
 use crate::infra::cos::CosClient;
-use crate::infra::python_sts::PythonSts;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsHub;
 use crate::middleware::idempotency::IdempotencyStore;
@@ -39,7 +38,6 @@ use crate::modules::prod::work_type::service::WorkTypeService;
 use crate::modules::prod::worker::service::WorkerService;
 use crate::modules::prod::worker_pool::service::WorkerPoolService;
 use crate::modules::statistics::service::StatisticsService;
-use crate::modules::upload_session::repo::UploadSessionRepo;
 
 pub struct AppState {
     pub pool: PgPool,
@@ -47,20 +45,10 @@ pub struct AppState {
     pub snowflake: Arc<SnowflakeIdGenerator>,
     pub ws_hub: Arc<WsHub>,
     pub cos: Arc<dyn CosClient>,
-    /// 2026-09-18 新增：python STS 签发器（HttpPythonSts / NoopPythonSts）。
-    ///
-    /// 上传会话域 `get_or_create` / `renew` 通过本 trait 调 python 后端
-    /// `POST /api/v1/files/sts-prefix-credentials` 签发 prefix-scoped STS。
-    ///
-    /// 注：原 `state.sts: Arc<dyn StsCredentialIssuer>`（`TencentSts` / `NoopSts`）
-    /// 2026-09-18 已删除——rust 后端不再直连腾讯云 STS，改为转发 python 后端。
-    pub python_sts: Arc<dyn PythonSts>,
     pub shutdown: CancellationToken,
     /// Redis 服务端 session 真相源（access/refresh token 吊销）
     pub session: Arc<dyn SessionStore>,
-    /// 2026-09-18 新增：上传会话 Redis 存储（`upload_session:{user_id}:{scope}` 键）。
-    /// 与 `session` 同池（共用 `state.redis_pool`）；真实 Redis 实现；上传会话由 Redis TTL 约束。
-    pub upload_session_repo: Arc<dyn UploadSessionRepo>,
+    // 2026-09-28 删除：相关上传会话 redis 存储字段（Redis 共享 STS 凭证会话机制已下线）。
     /// 2026-09-19 IAM 域合并：原 `user_service` 重命名为 `account_service`，承载
     /// 账号 CRUD + 角色管理 + 改密（service::AccountService，原 UserService）。
     /// 2026-09-21 事务分层重构：字段仅 `snowflake`；handler 借连接传入 repo。
@@ -150,10 +138,8 @@ impl AppState {
         snowflake: Arc<SnowflakeIdGenerator>,
         ws_hub: Arc<WsHub>,
         cos: Arc<dyn CosClient>,
-        python_sts: Arc<dyn PythonSts>,
         shutdown: CancellationToken,
         session: Arc<dyn SessionStore>,
-        upload_session_repo: Arc<dyn UploadSessionRepo>,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store: Arc<dyn IdempotencyStore>,
     ) -> Self {
@@ -206,10 +192,8 @@ impl AppState {
             snowflake,
             ws_hub,
             cos,
-            python_sts,
             shutdown,
             session,
-            upload_session_repo,
             account_service,
             session_service,
             customer_service,

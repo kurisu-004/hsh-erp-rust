@@ -37,7 +37,9 @@ pub mod part_file;
 pub mod prod;
 pub mod shelf;
 pub mod statistics;
-pub mod upload_session; // 2026-09-18 新增：Redis 共享 STS 凭证会话机制
+// 2026-09-28 删除：相关上传会话域（Redis 共享 STS 凭证会话机制）。
+// 前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys` 数组入参直签，
+// 不再走 rust 转发。
 
 #[derive(Serialize)]
 struct HealthResp {
@@ -95,8 +97,7 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/assemblies", assembly::router())
         .nest("/cnc-programs", cnc_program::router())
         .nest("/part-files", part_file::router())
-        // 2026-09-18 新增：上传会话域（7 个 POST 端点，挂在 /api/v2/upload-sessions）
-        .nest("/upload-sessions", upload_session::router())
+        // 2026-09-28 删除：/api/v2/upload-sessions nest（域整体下线）
         .nest("/outsource-companies", outsource::company_router())
         .nest("/outsource-quotes", outsource::quote_router())
         .nest("/outsource-shipments", outsource::shipment_router())
