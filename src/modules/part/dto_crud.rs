@@ -161,6 +161,16 @@ pub struct PartUpdateRequest {
 /// current_holder_id 列），按 part 下任意 active batch 命中即返。
 /// `sort_by` 白名单（CREATED_AT / UPDATED_AT / PLANNED_DELIVERY_DATE /
 /// REQUEST_DATE / SERIAL_NO / DRAWING_NO / NAME），其它退化为 `CREATED_AT`。
+///
+/// 2026-09-28 新增：行类型筛选矩阵（前端零件一览页 rowType 下拉框）。
+///
+/// | `row_type`         | `include_assemblies` | 行为                                                 |
+/// |--------------------|----------------------|------------------------------------------------------|
+/// | `"PART"`           | 任意                 | 仅零件，`t_part WHERE assembly_id IS NULL`           |
+/// | `"ASSEMBLY"`       | 任意                 | 仅装配件，`t_assembly`（投影为 PartListItem 形态）    |
+/// | absent             | `true` / absent      | ALL：`t_part` UNION `t_assembly`，合并排序           |
+/// | absent             | `false`              | 仅零件（兼容内部 caller，例如 `/parts/pending-programming`）|
+/// | 其它非空字符串      | 任意                 | 40001 VALIDATION_ERROR                              |
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PartListQuery {
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
@@ -184,6 +194,16 @@ pub struct PartListQuery {
     /// t_worker / t_outsource_company 任一匹配即命中）。
     #[serde(default)]
     pub holder_ids: Option<String>,
+    /// 2026-09-28 新增：行类型筛选。`Some("PART")` / `Some("ASSEMBLY")` / `None`(=ALL)。
+    /// 非法值 → `40001 VALIDATION_ERROR`（在 service 层 normalize 阶段校验）。
+    #[serde(default)]
+    pub row_type: Option<String>,
+    /// 2026-09-28 新增：是否合并装配件。仅 `row_type=None`（ALL）时生效：
+    /// - `Some(false)` 强制仅零件（兼容 `/parts/pending-programming` 等内部 caller）。
+    /// - `None` 默认 `true`（ALL 模式）。
+    /// - `row_type` 已设值时本字段被忽略（已强制 PART 或 ASSEMBLY）。
+    #[serde(default)]
+    pub include_assemblies: Option<bool>,
     #[serde(default)]
     pub sort_by: Option<String>,
     #[serde(default)]
