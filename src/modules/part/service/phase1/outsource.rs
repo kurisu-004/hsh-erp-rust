@@ -499,6 +499,9 @@ impl PartService {
             // locations/holder_ids（业务语义固定 OUTSOURCE 状态）
             locations: &[],
             holder_ids: &[],
+            // 2026-09-28 新增：内部 caller（外协在途）不过滤装配体子件（语义
+            // 固定 OUTSOURCE 单件状态），与历史行为一致。
+            part_only: false,
             sort_by: match query.sort_by.as_deref().unwrap_or("PLANNED_DELIVERY_DATE") {
                 "CREATED_AT" => "created_at",
                 "UPDATED_AT" => "updated_at",
@@ -548,6 +551,9 @@ impl PartService {
             // locations/holder_ids（业务语义固定 PENDING+IN_PROCESS 状态）
             locations: &[],
             holder_ids: &[],
+            // 2026-09-28 新增：内部 caller（外协可发）不过滤装配体子件（语义
+            // 固定 PENDING+IN_PROCESS 单件状态），与历史行为一致。
+            part_only: false,
             sort_by: match query.sort_by.as_deref().unwrap_or("PLANNED_DELIVERY_DATE") {
                 "CREATED_AT" => "created_at",
                 "UPDATED_AT" => "updated_at",
