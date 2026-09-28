@@ -86,6 +86,11 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // 2026-09-19 prod 聚合：工人 / 工种 / 工序 / 工艺链 / 工人池 5 支撑域统一挂在 `/prod/*` 下
         .nest("/prod", prod::router())
         .nest("/shelves", shelf::router())
+        // 2026-09-28 新增：dashboard 域 HTTP 全量首取端点（`GET /snapshot`）。
+        // 路径：挂在 `/api/v2/dashboard/*`，与 `/ws/dashboard`（WS-only，不带
+        // `/api/v2` 前缀）并存；前者给前端走「HTTP 首取 + WS 事件 invalidate」
+        // 模式，后者保留供 WS-only 老客户端握手 + snapshot。
+        .nest("/dashboard", dashboard::http_router())
         .nest("/parts", part::router())
         .nest("/assemblies", assembly::router())
         .nest("/cnc-programs", cnc_program::router())
