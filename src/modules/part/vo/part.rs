@@ -179,6 +179,24 @@ pub struct PartListItem {
     /// 派生持有人名称（见字段级 doc 注释）。
     #[serde(default)]
     pub holder_name: Option<String>,
+    /// 2026-09-28 新增：行类型标识（ALL 模式合并列表用）。
+    /// - PART 模式 / ALL 模式零件段 → `Some("PART")`
+    /// - ASSEMBLY 模式 / ALL 模式装配件段 → `Some("ASSEMBLY")`
+    /// - 历史 caller（不传 `row_type` / `include_assemblies` 时旧 PART-only 行为）→ `None`
+    ///   前端按此字段区分渲染（"PART" 走普通行；"ASSEMBLY" 走 Tree 节点 + lazy load）。
+    #[serde(default)]
+    pub row_type: Option<String>,
+    /// 2026-09-28 新增：是否有子件（Tree data lazy mode 必需）。
+    /// - PART 行 → `false`（零件不可展开）
+    /// - ASSEMBLY 行 → `child_count.unwrap_or(0) > 0`
+    ///   仅前端需要据此切换展开/折叠交互；后端不强制走 `GET /assemblies/{id}` 预拉。
+    #[serde(default)]
+    pub has_children: bool,
+    /// 2026-09-28 新增：子件计数（装配体行专用）。PART 行 → `None`。
+    /// 与 `has_children` 配套：`has_children = child_count.unwrap_or(0) > 0`。
+    /// 真相源：`t_part WHERE assembly_id = $1 AND deleted_at IS NULL` 的 COUNT。
+    #[serde(default)]
+    pub child_count: Option<i64>,
 }
 
 impl From<TPart> for PartListItem {
@@ -213,6 +231,10 @@ impl From<TPart> for PartListItem {
             l1_customer_name: None, // 由 service 注入
             location: None, // 由 service 注入
             holder_name: None, // 由 service 注入
+            // 2026-09-28 新增：TPart 派生默认就是 PART 行
+            row_type: Some("PART".to_string()),
+            has_children: false,
+            child_count: None,
         }
     }
 }

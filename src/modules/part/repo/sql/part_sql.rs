@@ -94,6 +94,12 @@ pub struct PartUpdate<'a> {
 ///
 /// 两者均通过 EXISTS 子查询挂到 `t_part`（PR-2 已删 location / current_holder_id
 /// 列），按 part 下任一 active batch 命中即返。空切片 → 不过滤（与旧行为一致）。
+///
+/// 2026-09-28 新增：`part_only: bool` —— 装配体子件（`assembly_id IS NOT NULL`
+/// 的 `t_part` 行）是「装配体的零件条目」，前端零件一览页 `GET /parts` 在 ALL
+/// 模式（或 PART-only 模式）下要排除。`true` 时额外追加 `AND assembly_id IS NULL`
+/// 守卫；`false` 时不追加（兼容旧 caller）。repo 层不做"ALL 合并"，ALL 合并由
+/// service 层在内存里 merge（见 `PartService::list_parts` 三模式分发）。
 #[derive(Debug, Default, Clone)]
 pub struct PartListFilters<'a> {
     pub customer_ids: &'a [i64],
@@ -103,6 +109,10 @@ pub struct PartListFilters<'a> {
     pub keyword: Option<&'a str>,
     pub locations: &'a [String],
     pub holder_ids: &'a [i64],
+    /// 2026-09-28 新增：装配体子件过滤开关。
+    /// - `true`：追加 `AND assembly_id IS NULL`（PART-only 模式 / ALL 模式零件段）
+    /// - `false`：不过滤（兼容旧 caller，如 `pending-programming` / `outsource-*` 等）
+    pub part_only: bool,
     pub sort_by: &'a str,
     pub sort_dir: &'a str,
     pub limit: i64,
@@ -515,6 +525,13 @@ impl PartRepo {
                       AND pb.deleted_at IS NULL)",
             );
         }
+        // 2026-09-28 新增：装配体子件过滤。`part_only=true` 时排除 `assembly_id
+        // IS NOT NULL` 的子件行（这些是装配体的零件条目，前端 `GET /parts` 在
+        // ALL/PART 模式下要隐藏）。ALL 模式走 service 层内存合并；本 repo 守卫
+        // 只在 service 层显式置 `part_only=true` 时生效，零破坏旧行为。
+        if f.part_only {
+            qb.push(" AND assembly_id IS NULL");
+        }
         qb.push(format!(
             " ORDER BY {order_col} {order_dir} NULLS LAST, id DESC"
         ));
@@ -587,6 +604,12 @@ impl PartRepo {
                 ") \
                       AND pb.deleted_at IS NULL)",
             );
+        }
+        // 2026-09-28 新增：装配体子件过滤。`part_only=true` 时排除 `assembly_id
+        // IS NOT NULL` 的子件行（与 list_with_filters 同守卫；保证分页 total
+        // 与 items 计数一致）。
+        if f.part_only {
+            qb.push(" AND assembly_id IS NULL");
         }
         let row: (i64,) = qb.build_query_as().fetch_one(executor).await?;
         Ok(row.0)

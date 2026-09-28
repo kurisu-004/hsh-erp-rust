@@ -36,7 +36,9 @@ Query：
 | `keyword` | string? | 模糊匹配 `name` / `drawing_no` / `serial_no` |
 | `locations` | string? | 2026-09-17 PR-4 新增。位置白名单，逗号分隔（`OFFICE` / `PRODUCTION_SHELF` / `WORKER` / `INSPECTION_SHELF` / `OUTSOURCE_COMPANY`），查 `t_part_batch.location`（多态批次的 `location` 字段） |
 | `holder_ids` | string? | 2026-09-17 PR-4 新增。持有人 ID 列表，逗号分隔雪花字符串（多态：t_shelf / t_worker / t_outsource_company 任一表匹配同雪花 id 即命中）；查 `t_part_batch.current_holder_id`。非法雪花 ID → `40001 VALIDATION_ERROR`（422） |
-| `sort_by` | string? | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它退化为 `CREATED_AT` |
+| `row_type` | string? | 2026-09-28 新增。行类型筛选：`"PART"` / `"ASSEMBLY"` / 缺省（=ALL）。非法值 → `40001 VALIDATION_ERROR`。详见下方「行类型合并规则」。 |
+| `include_assemblies` | bool? | 2026-09-28 新增。是否合并装配件：仅 `row_type` 缺省时生效。`false` 强制仅零件（兼容 `/parts/pending-programming` 等内部 caller）。`true` 或缺省 → 默认 ALL 模式。详见下方「行类型合并规则」。 |
+| `sort_by` | string? | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它退化为 `CREATED_AT`。ALL 模式下 `SERIAL_NO` 不在 t_part / t_assembly 共有列交集 → 降级为 `CREATED_AT`（见下方「SORT 键交互」）。 |
 | `sort_dir` | string? | `ASC` / `DESC`（缺省 `DESC`） |
 | `limit` | int? | 1..=200（缺省 50） |
 | `offset` | int? | ≥ 0（缺省 0） |
@@ -61,6 +63,34 @@ Response 200 `data`：`PartListOut`
 > [`../production/process-chain.md`](../production/process-chain.md)）。
 
 错误码：40001（limit/offset 越界）、40300（角色不符）、50001（DB）。
+
+#### 行类型合并规则（2026-09-28 新增）
+
+`GET /api/v2/parts` 支持三种行类型返回模式，由 `row_type` + `include_assemblies` 组合控制：
+
+| `row_type` | `include_assemblies` | 模式 | 数据源 | `total` 语义 | `items[i].row_type` |
+|---|---|---|---|---|---|
+| `"PART"` | 任意 | **Part** | `t_part WHERE assembly_id IS NULL` | 仅零件计数 | `"PART"` |
+| `"ASSEMBLY"` | 任意 | **Assembly** | `t_assembly`（投影为 `PartListItem`） | 仅装配件计数 | `"ASSEMBLY"` |
+| 缺省 | `false` | **Part**（兼容旧 caller） | `t_part`（无 `assembly_id IS NULL` 守卫；与历史行为一致） | 整张 t_part 计数 | `"PART"` |
+| 缺省 | `true` / 缺省 | **All** | `t_part`（part_only 段） UNION `t_assembly`，内存合并排序 | `parts_count + assemblies_count` | `"PART"` / `"ASSEMBLY"` 混合 |
+| 其它非空字符串 | 任意 | — | — | — | 返回 `40001 VALIDATION_ERROR` |
+
+**All 模式实现要点**：
+- 两次 list：part 段 `limit = (query.limit + query.offset).min(200)`，assembly 段同 cap（最大页宽 200 与单段 list 对齐）。
+- 两次 count → 相加得 `total`。
+- 内存 merge sort by 统一 sort_key（t_part / t_assembly 共有列交集：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `DRAWING_NO` / `NAME`），二级 id DESC 保证稳定。
+- 切 `[offset, offset+limit)`。
+
+**Assembly 模式 / All 模式装配件段专用字段**：
+- `row_type = "ASSEMBLY"`
+- `has_children = child_count.unwrap_or(0) > 0`（前端 Tree lazy mode 判定）
+- `child_count` 一次性 `SELECT assembly_id, COUNT(*) FROM t_part WHERE assembly_id = ANY($1) AND deleted_at IS NULL GROUP BY assembly_id`（≤200 ids / 1 extra query）
+- `location / holder_name / process_chain_id / batch_* / assembly_id` 均为 `null`（t_assembly 不持这些字段；真相源在 t_part / t_part_batch）
+
+**SORT 键交互**：`SERIAL_NO` 仅 t_part 独有，t_assembly 无该列；ALL 模式下 `sort_by=SERIAL_NO` 会被降级为 `CREATED_AT`（不报错；文档标注以便前端解释）。
+
+> 默认行为变更（2026-09-28）：不传 `row_type` / `include_assemblies` 时，`GET /parts` 默认走 **All** 模式（合并装配件）。旧 PART-only caller（如 `/parts/pending-programming` 等内部端点）需显式传 `include_assemblies=false` 才能保留原行为——本次 task 内已对 `list_pending_programming` / `list_outsource_in_flight` / `list_outsource_sendable` 三个内部 endpoint 走 `PartListFilters.part_only=false` 兜底，对外不受影响。
 
 ### `POST /api/v2/parts`
 
