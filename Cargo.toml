@@ -139,8 +139,9 @@ tokio-stream = "0.1"
 
 # reqwest：OpenDAL 传递依赖 + 真 COS 端到端回归测试（tests/cos_real_smoke.rs）。
 # rustls-tls 避免拖入 OpenSSL；`json` feature 是 `RequestBuilder::json()` 必需（真 COS 测试用）。
-# 2026-09-28 备注：STS 转发模块删除后，rust 后端无 `reqwest::json()` 生产调用点；
-# 待子任务 #3 单独 `cargo tree -i reqwest` 校验后决定是否完全移除本依赖。
+# 2026-09-28 备注：`infra::py_backend` 转发 `POST /api/v2/files/sts-tmp-keys`（薄壳鉴权转发
+# 到 python `/api/v1/files/sts-tmp-keys`）是当前 rust 后端 `reqwest::json()` 唯一的生产
+# 调用点；OpenDAL S3 backend 不走 `reqwest::json()`（用自带的签名/序列化）。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # 2026-09-18 M3-B 新增：STS 会话域 tmp_key 派生使用 v4 随机 UUID。

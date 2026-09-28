@@ -47,6 +47,9 @@ pub struct AppConfig {
     /// 启用后必须立刻登录 admin/changeme、改密、设回 `false`、重启；详见
     /// `src/infra/seed.rs` 模块 doc + `seeds/README.md`。
     pub bootstrap_admin_enabled: bool,
+    /// 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发到 python STS 端点）。
+    /// 环境变量 `PYTHON_BACKEND_BASE_URL`（设了就 enabled=true）/ `PYTHON_STS_TIMEOUT_MS`。
+    pub python_backend: PythonBackendConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +183,44 @@ pub struct AutoCompleteConfig {
 }
 
 // 2026-09-28 删除：相关上传会话域配置结构体（域整体下线）。
+
+/// 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发专用）。
+///
+/// ## 触发场景
+/// `POST /api/v2/files/sts-tmp-keys` 强制 JWT 鉴权后，透明转发到 python 后端
+/// `POST /api/v1/files/sts-tmp-keys`（python 端**继续裸开** by design +
+/// 部署层隔离）；rust 端是新的强制鉴权点。
+///
+/// ## env
+/// - `PYTHON_BACKEND_BASE_URL`：python 后端 base URL（如 `http://backend:8000`）；
+///   设置即 `enabled=true`，未设置走 `NoopPyBackend`（本地 `cargo run` 不依赖 python）。
+/// - `PYTHON_STS_TIMEOUT_MS`：单次转发请求超时，缺省 `10_000`（10s）。
+///
+/// ## 与原 `infra::python_sts::PythonStsConfig` 的区别
+/// 原 STS 配置随 `upload_session` 域下线已删除；本配置是新的「rust 鉴权后
+/// 转发到 python」场景，含义更窄、timeout 也对齐 `HttpPyBackend::timeout`。
+#[derive(Clone, Debug)]
+pub struct PythonBackendConfig {
+    /// python 后端 base URL（如 `http://backend:8000`）。空字符串或未设 → 走 `NoopPyBackend`。
+    pub base_url: String,
+    /// 单次转发请求超时（毫秒），传给 `reqwest::Client::timeout`。
+    pub timeout_ms: u64,
+    /// 是否启用真实转发。`false` → `NoopPyBackend`（本地 cargo run 不依赖 python）。
+    pub enabled: bool,
+}
+
+impl Default for PythonBackendConfig {
+    fn default() -> Self {
+        // 与旧 `infra::python_sts::PythonStsConfig::default()` 区分：base_url 默认
+        // 是 dev 本机端口而非 compose 内 backend:8000，便于 `cargo run` 在无 compose
+        // 环境也能跑（仍走 NoopPyBackend；只是参数一致）。
+        Self {
+            base_url: "http://localhost:8000".to_string(),
+            timeout_ms: 10_000,
+            enabled: false,
+        }
+    }
+}
 
 impl AppConfig {
     pub fn from_env(env_file: &str) -> Result<Self> {
@@ -340,6 +381,19 @@ impl AppConfig {
             idempotency_ttl_seconds: env_parse("IDEMPOTENCY_TTL_SECONDS", 86_400u64)?,
             // 2026-09-26 新增：可选初始管理员账号种子开关（生产默认关闭）。
             bootstrap_admin_enabled: env_bool("BOOTSTRAP_ADMIN_ENABLED", false)?,
+            // 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发到 python STS）。
+            // env 沿用既有命名（3 个 compose 文件已带 `PYTHON_BACKEND_BASE_URL=${...:-http://backend:8000}`），
+            // 不重命名。设置 `PYTHON_BACKEND_BASE_URL` 即 `enabled=true`，未设 → Noop。
+            python_backend: {
+                    let base_url = env_or("PYTHON_BACKEND_BASE_URL", "");
+                    let enabled = !base_url.trim().is_empty()
+                        && std::env::var("PYTHON_BACKEND_BASE_URL").is_ok();
+                    PythonBackendConfig {
+                        base_url,
+                        timeout_ms: env_parse("PYTHON_STS_TIMEOUT_MS", 10_000u64)?,
+                        enabled,
+                    }
+                },
         })
     }
 }

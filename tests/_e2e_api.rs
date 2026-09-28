@@ -371,6 +371,8 @@ async fn e2e_guard_returns_404_when_disabled() {
         state.snowflake.clone(),
         state.ws_hub.clone(),
         state.cos.clone(),
+        // 2026-09-28 新增：直接复用原 state 的 python 后端转发客户端（e2e 测试不走 STS 转发）。
+        state.py_backend.clone(),
         state.shutdown.clone(),
         state.session.clone(),
         // 2026-09-23 新增 Idempotency 中间件存储：直接复用原 state 的 store
@@ -515,6 +517,8 @@ async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
         state.snowflake.clone(),
         state.ws_hub.clone(),
         state.cos.clone(),
+        // 2026-09-28 新增：直接复用原 state 的 python 后端转发客户端。
+        state.py_backend.clone(),
         state.shutdown.clone(),
         state.session.clone(),
         // 2026-09-23 新增 Idempotency 中间件存储：直接复用原 state 的 store

@@ -193,6 +193,52 @@ CAS 命中（已上传过相同内容）→ 跳过 COS PUT，直接复用已有 
 
 ---
 
+## BFF 转发端点：`POST /api/v2/files/sts-tmp-keys`
+
+> 2026-09-28 新增：薄壳鉴权转发到 python `/api/v1/files/sts-tmp-keys`。
+> 修复上一轮"删除 STS session 设施"完成后 python 端 STS 端点裸开漏洞——前端
+> 直连 python 绕过了所有 IAM 鉴权。本端点是新的强制鉴权点（rust 端）。
+
+### 鉴权
+
+- 强制 JWT 鉴权（Bearer token），由 `v2_router` 全局 `authenticate_middleware` 处理。
+- 缺 / 坏 / 过期 token → 40100 / 40102 / 40105（同 IAM 域其它端点语义）。
+- Role 检查：仅允许 `Manager / Clerk / CncProgrammer / Inspector` 4 角色之一；
+  其它（含 SHELF_ACCOUNT）→ 40300 FORBIDDEN。
+
+### 行为
+
+请求 body（任意 shape）原样转发到 python `POST /api/v1/files/sts-tmp-keys`；
+python 响应（status + headers + body）原样透传给前端。handler 不解封 body，
+body 由 `envelopeResponseInterceptor` 在前端 axios 层解析。
+
+### Python 错误码透传
+
+python 端的业务错误码（如 `BIZ_PART_NOT_FOUND`、`BIZ_CUSTOMER_NOT_FOUND` 等）
+直接由 rust 端透传，前端 `envelopeResponseInterceptor` 自动按 rust 信封形态
+`{code, message, data}` 解封。rust 端不二次包装。
+
+### rust 端新增错误码
+
+| code | 名称 | HTTP | 触发场景 |
+|---|---|---|---|
+| 20406 | BIZ_STS_FORWARD_FAILED | 502 | rust → python 网络层失败（连接拒 / 超时 / 读 body 失败）；语义同 nginx upstream fail |
+
+### env 配置
+
+| env | 说明 | 缺省 |
+|---|---|---|
+| `PYTHON_BACKEND_BASE_URL` | python 后端 base URL；设置即 `enabled=true`，未设走 `NoopPyBackend` | 空 |
+| `PYTHON_STS_TIMEOUT_MS` | 单次转发超时（毫秒） | `10_000` |
+
+### Header 透传策略
+
+- 透传：`x-request-id` / 自定义业务头（便于 trace 一致性）
+- **不**透传：`Authorization` / `Cookie` / `Host` / `Content-Length` / `Connection` /
+  hop-by-hop 全套——避免把 rust 端 JWT 反向暴露给 python（python 端裸开 by design）。
+
+---
+
 ## 实现要点
 
 - 事务边界：handler 开 tx → service 写 DB → commit。

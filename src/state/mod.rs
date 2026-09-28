@@ -20,6 +20,8 @@ use tokio_util::sync::CancellationToken;
 use crate::auth::session::SessionStore;
 use crate::infra::config::AppConfig;
 use crate::infra::cos::CosClient;
+// 2026-09-28 新增：rust → python 后端转发客户端（薄壳鉴权转发到 python STS）。
+use crate::infra::py_backend::PyBackendClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsHub;
 use crate::middleware::idempotency::IdempotencyStore;
@@ -45,6 +47,10 @@ pub struct AppState {
     pub snowflake: Arc<SnowflakeIdGenerator>,
     pub ws_hub: Arc<WsHub>,
     pub cos: Arc<dyn CosClient>,
+    // 2026-09-28 新增：rust → python 后端转发客户端（薄壳鉴权转发到 python STS）。
+    // 走 `NoopPyBackend`（本地 cargo run）或 `HttpPyBackend`（生产 / 测试）
+    // 由 `infra::py_backend::build_py_backend(&config.python_backend)` 决定。
+    pub py_backend: Arc<dyn PyBackendClient>,
     pub shutdown: CancellationToken,
     /// Redis 服务端 session 真相源（access/refresh token 吊销）
     pub session: Arc<dyn SessionStore>,
@@ -138,6 +144,8 @@ impl AppState {
         snowflake: Arc<SnowflakeIdGenerator>,
         ws_hub: Arc<WsHub>,
         cos: Arc<dyn CosClient>,
+        // 2026-09-28 新增：rust → python 后端转发客户端（薄壳鉴权转发 STS）。
+        py_backend: Arc<dyn PyBackendClient>,
         shutdown: CancellationToken,
         session: Arc<dyn SessionStore>,
         // 2026-09-23 新增 Idempotency 中间件存储
@@ -192,6 +200,8 @@ impl AppState {
             snowflake,
             ws_hub,
             cos,
+            // 2026-09-28 新增：rust → python 后端转发客户端。
+            py_backend,
             shutdown,
             session,
             account_service,

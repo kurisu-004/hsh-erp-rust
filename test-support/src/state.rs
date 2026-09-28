@@ -26,10 +26,12 @@ use tokio_util::sync::CancellationToken;
 
 use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
-    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, RedisConfig as AppRedisConfig,
-    SnowflakeConfig,
+    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig,
+    PythonBackendConfig, RedisConfig as AppRedisConfig, SnowflakeConfig,
 };
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
+// 2026-09-28 新增：rust → python 后端转发客户端（薄壳鉴权转发 STS）。
+use hsh_erp_rust::infra::py_backend::{NoopPyBackend, PyBackendClient};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::shared::error::{AppError, code};
@@ -131,6 +133,10 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         // 2026-09-26 新增：测试默认禁用初始管理员 seed（与生产配置对齐；调用方
         // 测试需要时可走 `Arc::make_mut` 局部 patch）。
         bootstrap_admin_enabled: false,
+        // 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发 STS）。
+        // 测试默认 `enabled=false` 走 Noop；需要 mock 的测试 fixture 走
+        // `Arc::make_mut` 局部 patch 或自构 AppState（详见 `tests/files_sts_tmp_keys.rs`）。
+        python_backend: PythonBackendConfig::default(),
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -138,6 +144,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
+    // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend（不真发 HTTP）。
+    let py_backend: Arc<dyn PyBackendClient> = Arc::new(NoopPyBackend);
     let shutdown = CancellationToken::new();
     let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
     // 2026-09-23 新增 Idempotency 中间件存储：默认走 RedisIdempotencyStore
@@ -150,6 +158,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         snowflake,
         ws_hub,
         cos,
+        // 2026-09-28 新增：python 后端转发客户端。
+        py_backend,
         shutdown,
         session,
         // 2026-09-23 新增 Idempotency 中间件存储
@@ -276,6 +286,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         // 2026-09-26 新增：测试默认禁用初始管理员 seed（与生产配置对齐；调用方
         // 测试需要时可走 `Arc::make_mut` 局部 patch）。
         bootstrap_admin_enabled: false,
+        // 2026-09-28 新增：python 后端转发默认走 Noop。
+        python_backend: PythonBackendConfig::default(),
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -283,6 +295,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
+    // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend。
+    let py_backend: Arc<dyn PyBackendClient> = Arc::new(NoopPyBackend);
     let shutdown = CancellationToken::new();
     // 注意：NoopSessionStore 不需要 Redis 池
     use hsh_erp_rust::auth::session::NoopSessionStore;
@@ -296,6 +310,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         snowflake,
         ws_hub,
         cos,
+        // 2026-09-28 新增：python 后端转发客户端。
+        py_backend,
         shutdown,
         session,
         // 2026-09-23 新增 Idempotency 中间件存储
@@ -399,12 +415,16 @@ pub async fn test_state_with_cos(
         // 2026-09-26 新增：测试默认禁用初始管理员 seed（与生产配置对齐；调用方
         // 测试需要时可走 `Arc::make_mut` 局部 patch）。
         bootstrap_admin_enabled: false,
+        // 2026-09-28 新增：python 后端转发默认走 Noop。
+        python_backend: PythonBackendConfig::default(),
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
         config.snowflake.instance,
     ));
     let ws_hub = Arc::new(WsHub::new());
+    // 2026-09-28 新增：python 后端转发默认走 NoopPyBackend。
+    let py_backend: Arc<dyn PyBackendClient> = Arc::new(NoopPyBackend);
     let shutdown = CancellationToken::new();
     let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
     // 2026-09-23 新增 Idempotency 中间件存储：cos 替换场景同 test_state_with_redis
@@ -416,6 +436,8 @@ pub async fn test_state_with_cos(
         snowflake,
         ws_hub,
         cos, // 注入的 cos（替换默认 NoopCos）
+        // 2026-09-28 新增：python 后端转发客户端。
+        py_backend,
         shutdown,
         session,
         // 2026-09-23 新增 Idempotency 中间件存储

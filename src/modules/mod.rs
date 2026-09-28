@@ -20,6 +20,9 @@ pub mod cnc_program;
 pub mod com;
 pub mod dashboard;
 pub mod delivery_note;
+// 2026-09-28 新增 files 域：薄壳鉴权转发端点（`POST /api/v2/files/sts-tmp-keys` → python `/api/v1/files/sts-tmp-keys`）。
+// 修复 python STS 端口裸开鉴权漏洞：rust 端强制 JWT + Role 鉴权后再转发。
+pub mod files;
 // 2026-09-19 IAM 域合并（PR-1）：合并 `auth` + `user` 为单一 `iam` 业务域；
 // handler 内 14 端点 + 1 个 router 工厂函数 `router()`。auth / user 目录已删除。
 // 2026-09-19 IAM 域收尾（PR-4）：旧 alias `/auth` + `/users` nest 已下线，
@@ -95,6 +98,9 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // `/api/v2` 前缀）并存；前者给前端走「HTTP 首取 + WS 事件 invalidate」
         // 模式，后者保留供 WS-only 老客户端握手 + snapshot。
         .nest("/dashboard", dashboard::http_router())
+        // 2026-09-28 新增：files 域 BFF（薄壳鉴权转发 STS 端点到 python）。
+        // 端点：`POST /api/v2/files/sts-tmp-keys`（详见 `modules/files/mod.rs`）。
+        .nest("/files", files::router())
         .nest("/parts", part::router())
         .nest("/assemblies", assembly::router())
         .nest("/cnc-programs", cnc_program::router())
