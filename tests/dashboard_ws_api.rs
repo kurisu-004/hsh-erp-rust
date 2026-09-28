@@ -32,7 +32,8 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::modules::dashboard::service::DashboardService;
 use hsh_erp_test_support::{
-    DashboardWsFixture, load_dashboard_ws_fixture, test_pool, test_state, test_ws_app,
+    DashboardWsFixture, json_request, load_dashboard_ws_fixture, send as ts_send, test_app,
+    test_pool, test_state, test_ws_app,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -411,5 +412,110 @@ async fn ws_e2e_valid_token_receives_heartbeat_text() {
     assert!(
         got_heartbeat,
         "未在 {wait:?} 内收到 heartbeat text 帧（interval={heartbeat_interval}s）"
+    );
+}
+
+// ===========================================================================
+// 2026-09-28 新增：HTTP `GET /api/v2/dashboard/snapshot` 端点集成测试
+// ===========================================================================
+//
+// 覆盖：
+//   1. http_snapshot_unauthenticated_returns_401   — 无 Bearer token 应返 401（中间件）
+//   2. http_snapshot_happy_path_returns_full_shape  — 登录后 GET 返回 200 + 完整 shape
+//
+// 与 WS 端点共用 `load_dashboard_ws_fixture`（baseline fx_dashboard_ws_user，
+// 密码 "changeme"；fixture 用户的 t_user_role 在 DB 内为空，故走 `mint_test_token`
+// 直接写 Redis session + Manager 角色 profile，绕过 `/iam/login` 业务层 20606
+// 角色校验；与 ws_e2e_* 风格一致）。snapshot 数据每个用例现场插，避免 fixture
+// 占用 shelf code 字面。
+
+/// 局部 send 别名（与 ws_e2e_* 同款，避免 oneshot 消耗 Router 后 caller 无法再发请求）
+async fn send(
+    app: axum::Router,
+    req: axum::http::Request<axum::body::Body>,
+) -> (axum::http::StatusCode, serde_json::Value) {
+    ts_send(app, req).await
+}
+
+#[tokio::test]
+async fn http_snapshot_unauthenticated_returns_401() {
+    // 不登录直接 GET，应被 authenticate_middleware 拦截返 401
+    // 注意：`test_app` 不挂 `/api/v2` 前缀（main.rs 才挂；测试走 v2_router 原生路径）
+    let pool = test_pool().await;
+    let app = test_app(test_state(pool.clone()).await);
+    let (status, _envelope) =
+        send(app, json_request("GET", "/dashboard/snapshot", None, None)).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::UNAUTHORIZED,
+        "无 Bearer token 应返 401"
+    );
+}
+
+#[tokio::test]
+async fn http_snapshot_happy_path_returns_full_shape() {
+    // 走「mint access token + 写 Redis session」路径（与本文件 ws_e2e_* 风格一致，
+    // 跳过 `/iam/login` 业务层 20606 角色校验——dashboard_ws fixture 用户不带角色，
+    // login 路径会返 403）。
+    //
+    // 注意：`test_app` 不挂 `/api/v2` 前缀（main.rs 才挂；测试走 v2_router 原生路径）
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+
+    // 插一个 active 货架，让 snapshot 含该架组
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) \
+         VALUES ($1, 'S-HTTP1', 'HTTP一号架', 'PRODUCTION', true, 0, 0, $2, $2)",
+    )
+    .bind(snowflake.next_id())
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert t_shelf");
+
+    // 走 dashboard_ws fixture 用户的 snowflake id（fixture 写死），mint 合法 token
+    let state = test_state(pool.clone()).await;
+    let user_id = DashboardWsFixture::WS_USER_ID;
+    let token = mint_test_token(&state, user_id).await;
+
+    let app = test_app(state.clone());
+    let (status, envelope) = send(
+        app,
+        json_request("GET", "/dashboard/snapshot", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "登录后 GET 应返 200");
+    assert_eq!(envelope["code"], 0, "信封 code 应为 0；envelope={envelope}");
+    let data = &envelope["data"];
+    assert!(
+        data["on_production_shelves"].is_array(),
+        "data.on_production_shelves 应为数组"
+    );
+    assert!(
+        data["on_inspection_shelves"].is_array(),
+        "data.on_inspection_shelves 应为数组"
+    );
+    assert!(data["in_process"].is_array(), "data.in_process 应为数组");
+    assert!(
+        data["upcoming_delivery"].is_array(),
+        "data.upcoming_delivery 应为数组"
+    );
+    // 未来 7 天固定 7 条（与 WS 端点断言对齐：tests/dashboard_ws_api.rs:85）
+    assert_eq!(
+        data["upcoming_delivery"].as_array().unwrap().len(),
+        7,
+        "未来 7 天固定 7 条"
+    );
+    // S-HTTP1 应在产线组里（即使 items 空也算，因为 fixture 期望该架被 snapshot 选中）
+    let on_prod = data["on_production_shelves"].as_array().unwrap();
+    assert!(
+        on_prod.iter().any(|g| g["shelf_code"] == "S-HTTP1"),
+        "S-HTTP1 应在 on_production_shelves 中；got={on_prod:?}"
+    );
+    assert!(
+        !data["ts"].as_str().unwrap_or("").is_empty(),
+        "data.ts 应非空"
     );
 }

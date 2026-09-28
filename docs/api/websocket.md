@@ -1,6 +1,11 @@
 # WebSocket API
 
 > 本文件须与 `src/infra/ws_hub.rs` + `src/modules/dashboard/{handler,service,dto}.rs` 保持同步
+>
+> **2026-09-28 新增**：v2 前端走 HTTP 全量首取（`GET /api/v2/dashboard/snapshot`，
+> 详见 [`./dashboard.md`](./dashboard.md)），WS 首帧 `WsSnapshotMsg` 保留向后兼容，
+> 新前端可忽略首帧改走「HTTP 首取 + WS 事件 invalidate」模式。
+>
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
 ## 端点列表

@@ -32,14 +32,17 @@ use std::time::Duration;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
+use axum::Json;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::auth::middleware::verify_session_token;
+use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::dashboard::vo::{WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
-use crate::shared::error::{AppError, code};
+use crate::modules::dashboard::vo::{DashboardSnapshot, WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
+use crate::shared::error::{code, AppError};
+use crate::shared::response::R;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -79,6 +82,38 @@ pub async fn ws_dashboard(
     let state_clone = state.clone();
     let resp = ws.on_upgrade(move |socket| handle_socket(socket, state_clone, user_id));
     Ok(resp)
+}
+
+/// `GET /api/v2/dashboard/snapshot`  （2026-09-28 新增）
+///
+/// HTTP 全量首取大屏快照（前端 dashboard 视图走「HTTP 首取 + WS 事件 invalidate」
+/// 模式）。与 `GET /ws/dashboard` 共用同一 service（`DashboardService::build_snapshot_with_workers`），
+/// 返回 `R<DashboardSnapshot>`（HTTP JSON 信封）；WS 端点仍推一次 `WsSnapshotMsg` envelope
+/// 保留向后兼容。
+///
+/// 鉴权：
+/// - HTTP 走 `v2_router` 末尾的 `authenticate_middleware`（Bearer JWT + Redis session）
+/// - handler 用 `CurrentUser` extractor 占位（与 WS 端点权限对齐：任意已登录；不调
+///   `require_role`，原因 2026-09-15 `ws_dashboard` 注释里有说明）
+///
+/// 实现要点（handler 三形态 ①：snapshot 单次只读聚合）：
+/// - `state.pool.begin()` 借 tx 边界
+/// - `state.dashboard_service.build_snapshot_with_workers(&mut *tx, None)` —— 同
+///   `build_snapshot_msg` 内部调用的 service 方法，零新 SQL
+/// - `tx.commit()` 立即结束（service 层内部 SQL 全只读，开 tx 仅作聚合边界）
+/// - 不引入新错误码：DB / SQL 失败走 `AppError::from(sqlx::Error)` 通透 `R<T>` 错误码
+///   段（与现有 handler 一致）
+pub async fn get_snapshot(
+    State(state): State<Arc<AppState>>,
+    _current: CurrentUser,
+) -> Result<Json<R<DashboardSnapshot>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let snap = state
+        .dashboard_service
+        .build_snapshot_with_workers(&mut *tx, None)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(snap)))
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, user_id: i64) {
@@ -220,3 +255,4 @@ async fn send_msg(
         )))
         .await
 }
+

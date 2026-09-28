@@ -214,7 +214,8 @@ HTTP 状态码：
 | delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | _e2e | [`./_e2e.md`](./_e2e.md) | 11 | ✅ 完全上线（2026-09-14，e2e seed hook，dev/test profile） |
-| websocket | [`./websocket.md`](./websocket.md) | 1 | 🟡 WS stub（handler 已搭骨架，待握手实现） |
+| websocket | [`./websocket.md`](./websocket.md) | 1 | ✅ 完全上线（2026-09-15 takeover-fill：握手 + snapshot + 业务事件订阅 + 心跳；2026-09-28 起推荐前端走「HTTP 首取 + WS 事件 invalidate」模式，HTTP 端点见 [`./dashboard.md`](./dashboard.md)） |
+| dashboard（HTTP 首取） | [`./dashboard.md`](./dashboard.md) | 1 | ✅ 完全上线（2026-09-28 新增：`GET /api/v2/dashboard/snapshot` HTTP 全量首取大屏快照，与 WS 端点共用 `DashboardService::build_snapshot_with_workers`） |
 | 其他 1 域 | — | 0 | ⚪ 仅占位（见下） |
 
 ---
