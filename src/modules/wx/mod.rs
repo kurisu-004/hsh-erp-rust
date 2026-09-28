@@ -88,12 +88,12 @@ pub(crate) fn resolve_period(raw: Option<&str>) -> Result<String, AppError> {
 /// 5. `auth::router()`      —— `/iam/wx-login` 占位（本 PR 空 router）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .merge(dashboard::router())
-        .merge(parts::router())
-        .merge(batches::router())
-        .merge(worker::router())
-        // auth 占位（wx-login 后续 PR）
-        .merge(auth::router())
+        .nest("/dashboard", dashboard::router())
+        .nest("/parts", parts::router())
+        .nest("/batches", batches::router())
+        .nest("/worker", worker::router())
+        // auth 占位（wx-login 后续 PR；当前是空 router）
+        .nest("/iam", auth::router())
 }
 
 #[cfg(test)]
