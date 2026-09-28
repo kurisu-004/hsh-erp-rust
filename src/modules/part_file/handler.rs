@@ -12,8 +12,10 @@
 //!   - `POST /{file_id}/delete`            —— 软删 + COS 异步清理（Phase 3 补齐）
 //!
 //! 2026-09-18 重要变更：原 `POST /upload-intents` 端点已**删除** ——
-//! 上传意图机制迁移至 `upload_session` 域（共享 STS 凭证 + Redis 会话）。
-//! confirm 端点 `POST /parts/{part_id}/files/confirm` 仍保留（见 `part::handler::batch`）。
+//! 上传意图机制迁移至相关 STS 会话域（共享 STS 凭证 + Redis 会话）。
+//! 2026-09-28 备注：相关 STS 会话域整体下线，前端改为单 uploader 触发时单 HTTP 调用
+//! python `sts-tmp-keys` 数组入参直签；confirm 端点 `POST /parts/{part_id}/files/confirm`
+//! 仍保留（见 `part::handler::batch`），不依赖 STS 会话存活。
 //!
 //! - 挂在 `/api/v2/part-files/parts/{part_id}`（由 `part_nested_router()` 提供；
 //!   同时也被 `part::router()` 通过 `nest("/parts/{part_id}", ...)` 挂在
@@ -264,7 +266,8 @@ pub fn router() -> Router<Arc<AppState>> {
         // 2026-09-15 followup-cleanup A8：原 part/handler.rs 的 7 个 part 维度
         // 文件路由（`POST /parts/{part_id}/cad-files` 等）也通过 `/part-files/parts/{part_id}`
         // 路径对外暴露，便于前端 / 第三方客户端不依赖 parts 入口也能命中。
-        // 2026-09-18 注：原 `/upload-intents` 路由已删除（迁移至 upload_session 域）。
+        // 2026-09-18 注：原 `/upload-intents` 路由已删除（迁移至相关 STS 会话域）。
+        // 2026-09-28 备注：相关 STS 会话域已下线，前端改走单 uploader + python sts-tmp-keys 直签。
         .nest("/parts/{part_id}", part_nested_router())
 }
 

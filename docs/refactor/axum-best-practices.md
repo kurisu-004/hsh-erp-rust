@@ -126,7 +126,7 @@ WS 内部用 `axum::extract::ws::WebSocket` 处理消息，广播走 `state.ws_h
 
 ## A7 — multipart upload 用 `axum::extract::Multipart`
 
-文件上传域（如 `files` / `upload_session`）走 `axum::extract::Multipart`（已开
+文件上传域（如 `files`）走 `axum::extract::Multipart`（已开
 `multipart` feature），**禁止**手写 `tokio::io::AsyncReadExt` + body parser：
 
 ```rust

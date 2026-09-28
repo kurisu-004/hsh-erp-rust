@@ -195,7 +195,7 @@ pub fn test_app_config() -> Arc<AppConfig> {
         database_url: String::new(),
         listen_addr: "0.0.0.0:0".to_string(),
         jwt: test_jwt_config(),
-        // cos / snowflake / auto_complete / upload_session 等字段 session service 不读
+        // cos / snowflake / auto_complete 等字段 session service 不读
         // 但 AppConfig 字段全填，故用占位零值。详见 config.rs。
         cos: crate::infra::config::CosConfig {
             backend: crate::infra::config::CosBackend::Noop,
@@ -230,12 +230,7 @@ pub fn test_app_config() -> Arc<AppConfig> {
         enable_e2e_hooks: false,
         ws_heartbeat_interval_seconds: 30,
         request_timeout_seconds: 30,
-        upload_session: crate::infra::config::UploadSessionConfig {
-            python_backend_base_url: String::new(),
-            ttl_seconds: 0,
-            sts_duration_seconds: 0,
-            renew_threshold_seconds: 0,
-        },
+        // 2026-09-28 删除：相关上传会话域字段（域整体下线）。
         idempotency_ttl_seconds: 86400,
         bootstrap_admin_enabled: false,
     })

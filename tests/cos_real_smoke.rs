@@ -36,8 +36,8 @@ fn require_env(name: &str) -> String {
 }
 
 fn build_cos_config() -> CosConfig {
-    // 2026-09-20 迁移清理：删 `sts_duration_seconds` 字段（STS 链路完全走
-    // `UploadSessionConfig::sts_duration_seconds` + python 后端转发）。
+    // 2026-09-20 迁移清理：删 `sts_duration_seconds` 字段。
+    // 2026-09-28 删除：相关 STS 会话域配置引用（域整体下线）。
     CosConfig {
         enabled: true,
         region: require_env("COS_REGION"),

@@ -12,8 +12,7 @@
 > - [`./parts/index.md`](./parts/index.md) — part 域（49 端点：to-inspection / to-ship 批量+单件 / to-process / **worker-scan** + Phase 1/2 全套批量与单件状态机扩展，2026-09-14）
 > - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（8 端点：装配体 CRUD + multipart PDF + 子件自动生成 + start + 子件 auto-rollup，2026-09-14 Phase 3）
 > - [`./cnc-programs.md`](./cnc-programs.md) — cnc_program 域（2 端点：配对上传 + 列表，2026-09-14 Phase 3）
-> - [`./files.md`](./files.md) — part_file 域（multipart 上传 + 列表 + 下载 URL + confirm 绑定，2026-09-14 Phase 3；2026-09-18 删除 upload-intents）
-> - [`./upload_session.md`](./upload_session.md) — upload_session 域（7 端点：共享 STS 凭证的 Redis 会话机制，2026-09-18 新增；替代原 `POST /part-files/upload-intents`）
+> - [`./files.md`](./files.md) — part_file 域（multipart 上传 + 列表 + 下载 URL + confirm 绑定，2026-09-14 Phase 3；2026-09-18 删除 upload-intents；2026-09-28 删除相关 STS 会话域，前端改为单 uploader + python `sts-tmp-keys` 数组入参直签）
 > - [`./outsource-companies.md`](./outsource-companies.md) — 外协公司（7 端点，2026-09-13 Phase 2）
 > - [`./outsource-quotes.md`](./outsource-quotes.md) — 外协报价（8 端点，2026-09-13 Phase 2）
 > - [`./outsource-shipments.md`](./outsource-shipments.md) — 外协发货（1 端点：reconcile-update，2026-09-13 Phase 2）
@@ -206,8 +205,7 @@ HTTP 状态码：
 | part | [`./parts/index.md`](./parts/index.md) | **49** | ✅ 完全上线（Phase 1+2 全部状态机 / 批量 / 扫码 / pick-up 端点落地，2026-09-14） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
-| part-files | [`./files.md`](./files.md) | 4 | ✅ 完全上线（2026-09-14，Phase 3；2026-09-18 删除 upload-intents → 改由 upload_session 域承载 STS 共享机制） |
-| upload-sessions | [`./upload_session.md`](./upload_session.md) | 7 | ✅ 完全上线（2026-09-18 新增：共享 STS 凭证 Redis 会话机制，替代原 upload-intents 一次性签发） |
+| part-files | [`./files.md`](./files.md) | 4 | ✅ 完全上线（2026-09-14，Phase 3；2026-09-18 删除 upload-intents → 改由相关 STS 会话域承载 STS 共享机制；2026-09-28 进一步下线相关会话域，前端改单 uploader + python sts-tmp-keys 数组入参直签） |
 | outsource-companies | [`./outsource-companies.md`](./outsource-companies.md) | 7 | ✅ 完全上线（2026-09-14，Phase 2） |
 | outsource-quotes | [`./outsource-quotes.md`](./outsource-quotes.md) | 8 | ✅ 完全上线（2026-09-14，Phase 2） |
 | outsource-shipments | [`./outsource-shipments.md`](./outsource-shipments.md) | 1 | ✅ 完全上线（2026-09-14，Phase 2） |
@@ -278,7 +276,7 @@ HTTP 状态码：
 | 208xx | 工序（PROCESS_NOT_FOUND 20801 / DUPLICATE_CODE 20802 / IN_USE 20803） |
 | 209xx | 工种（WORK_TYPE_NOT_FOUND 20901 / DUPLICATE_CODE 20902 / IN_USE 20903 / **MAX_HELD_NOT_SET 20904 / NO_PROCESS_MAPPING 20905**） |
 | 210xx | 申请人（APPLICANT_NOT_FOUND 21001 / DUPLICATE_NAME 21002 / BAD_CUSTOMER 21003 / IN_USE 21004） |
-| 211xx | 零件文件 / 模板（PART_FILE_NOT_FOUND 21101 / BAD_TYPE 21102 / TOO_LARGE 21103 / UPLOAD_FAILED 21104 / OWNER_NOT_FOUND 21105 / DUPLICATE 21108 / DELIVERY_TEMPLATE_NOT_CONFIGURED 21109 / DELIVERY_PART_STATUS_INVALID 21111 / TEMPLATE_TOO_MANY_PARTS 21112 / PRINT_BAD_ORDER 21113 / **PART_FILE_TMP_OBJECT_MISSING 21114 / PART_FILE_SIZE_MISMATCH 21115 / STS_ISSUE_FAILED 21116**）⚠️ 21110 已 deprecated 别名 = 21407 |
+| 211xx | 零件文件 / 模板（PART_FILE_NOT_FOUND 21101 / BAD_TYPE 21102 / TOO_LARGE 21103 / UPLOAD_FAILED 21104 / OWNER_NOT_FOUND 21105 / DUPLICATE 21108 / DELIVERY_TEMPLATE_NOT_CONFIGURED 21109 / DELIVERY_PART_STATUS_INVALID 21111 / TEMPLATE_TOO_MANY_PARTS 21112 / PRINT_BAD_ORDER 21113 / **PART_FILE_TMP_OBJECT_MISSING 21114 / PART_FILE_SIZE_MISMATCH 21115**）⚠️ 21110 已 deprecated 别名 = 21407 |
 | 212xx | 外协公司（OUTSOURCE_COMPANY_NOT_FOUND 21201 / DUPLICATE 21202 / BAD_PROCESS 21203 / PROCESS_NOT_MAPPED 21204 / IN_USE 21205 / **PART_NOT_OUTSOURCEABLE 21206 / DIRECT_REQUIRES_C2_SHELF 21207 / NO_SHELF 21208**） |
 | 213xx | 外协报价（OUTSOURCE_QUOTE_NOT_FOUND 21301 / INVALID_TRANSITION 21302 / DUPLICATE 21303 / NOT_APPROVED 21307） |
 | 214xx | 送货单（NOT_FOUND 21401 / INVALID_TRANSITION 21402 / NOT_DRAFT 21403 / NOT_SUBMITTED 21404 / PART_NOT_READY 21405 / PART_ALREADY_ASSIGNED 21406 / PARTS_MULTIPLE_CUSTOMERS 21407 / SCAN_MISMATCH 21408 / DRIVER_INVALID 21409 / SCAN_INCOMPLETE 21410 / INVALID_VALUE 21411 / PARTS_LOCKED 21412 / GROUP_NOT_FOUND 21413 / GROUP_DUPLICATE_NAME 21414 / GROUP_MEMBER_CONFLICT 21415 / SCOPE_MISMATCH 21416 / SCAN_UNKNOWN_CODE 21417 / ASSEMBLY_PARTS_NOT_READY 21418 / DRAFT_SCOPE_CONFLICT 21419 / LOCKED_PART 21420 / **BATCH_STATE_INVALID 21421**） |

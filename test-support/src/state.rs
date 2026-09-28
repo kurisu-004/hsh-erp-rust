@@ -9,12 +9,14 @@
 //! ## 设计要点（沿用原 mod.rs 实现）
 //! - `AppConfig.jwt.private_key` 走 RS256 + kid（与 PR9 v2 重构同形）
 //! - 默认 1s WS 心跳、enable_e2e_hooks=true、auto_complete 默认 7d threshold
-//! - `test_state_with_disabled_session` 注入 `NoopSessionStore + NoopUploadSessionRepo +
+//! - `test_state_with_disabled_session` 注入 `NoopSessionStore +
 //!   NoopIdempotencyStore`，跑 service 单元测试无需 Redis 进程
 //! - `test_state_with_cos` 注入 caller 提供的 `Arc<dyn CosClient>` 替换 `NoopCos`
 //!   —— 让 handler 后置 `spawn delete` 在集成测试里可端到端断言
 //! - `MockCos` 给 part_file / batch_create 集成测试用，按 key 查找 head/copy
-//!   响应，驱动 NoopCos 无法触发的 21114/21115/21116 错误码分支
+//!   响应，驱动 NoopCos 无法触发的 21114/21115 错误码分支
+//!
+//! 2026-09-28 删除：所有相关 STS 转发与上传会话域装配（域整体下线）。
 
 use std::sync::Arc;
 
@@ -25,15 +27,11 @@ use tokio_util::sync::CancellationToken;
 use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
     AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, RedisConfig as AppRedisConfig,
-    SnowflakeConfig, UploadSessionConfig,
+    SnowflakeConfig,
 };
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
-use hsh_erp_rust::infra::python_sts::{NoopPythonSts, PythonSts};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
-use hsh_erp_rust::modules::upload_session::repo::{
-    NoopUploadSessionRepo, RedisUploadSessionRepo, UploadSessionRepo,
-};
 use hsh_erp_rust::shared::error::{AppError, code};
 use hsh_erp_rust::state::AppState;
 
@@ -128,13 +126,6 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         ws_heartbeat_interval_seconds: 1,
         // 2026-09-20 新增：HTTP nest 请求超时；30s 默认足够测试用例（<1s）。
         request_timeout_seconds: 30,
-        // 2026-09-18 新增：upload_session 域默认配置（测试场景）
-        upload_session: UploadSessionConfig {
-            python_backend_base_url: "http://backend-test:8000".into(),
-            ttl_seconds: 86400,
-            sts_duration_seconds: 7200,
-            renew_threshold_seconds: 600,
-        },
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
         idempotency_ttl_seconds: 86400,
         // 2026-09-26 新增：测试默认禁用初始管理员 seed（与生产配置对齐；调用方
@@ -147,13 +138,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
-    // 2026-09-18 M3-B：测试场景 STS 转发用 NoopPythonSts 占位（不连真实 python 后端）。
-    // 原 `state.sts` (TencentSts / NoopSts) 2026-09-18 已删除——rust 不再直连腾讯云 STS。
-    let python_sts: Arc<dyn PythonSts> = Arc::new(NoopPythonSts);
     let shutdown = CancellationToken::new();
     let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
-    let upload_session_repo: Arc<dyn UploadSessionRepo> =
-        Arc::new(RedisUploadSessionRepo::new(redis_pool.clone()));
     // 2026-09-23 新增 Idempotency 中间件存储：默认走 RedisIdempotencyStore
     // （与 session 共享同一 redis_pool）。
     let idempotency_store: Arc<dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore> =
@@ -164,10 +150,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         snowflake,
         ws_hub,
         cos,
-        python_sts,
         shutdown,
         session,
-        upload_session_repo,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store,
     ))
@@ -211,7 +195,7 @@ pub async fn test_state_with_hs256_fallback_off(pool: PgPool) -> Arc<AppState> {
     state
 }
 
-/// service 单元测试 fixture：显式注入 `NoopSessionStore` + `NoopUploadSessionRepo`，
+/// service 单元测试 fixture：显式注入 `NoopSessionStore` + `NoopIdempotencyStore`，
 /// 不依赖 Redis 进程存在。
 ///
 /// 当前 caller：auto_complete_api / part_crud（service 层单测，不发 HTTP）。
@@ -287,13 +271,6 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         ws_heartbeat_interval_seconds: 1,
         // 2026-09-20 新增：HTTP nest 请求超时。
         request_timeout_seconds: 30,
-        // 2026-09-18 新增：upload_session 域默认配置（测试场景）
-        upload_session: UploadSessionConfig {
-            python_backend_base_url: "http://backend-test:8000".into(),
-            ttl_seconds: 86400,
-            sts_duration_seconds: 7200,
-            renew_threshold_seconds: 600,
-        },
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
         idempotency_ttl_seconds: 86400,
         // 2026-09-26 新增：测试默认禁用初始管理员 seed（与生产配置对齐；调用方
@@ -306,13 +283,10 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
     ));
     let ws_hub = Arc::new(WsHub::new());
     let cos: Arc<dyn CosClient> = Arc::new(NoopCos);
-    // 2026-09-18 M3-B：测试场景 STS 转发用 NoopPythonSts 占位。
-    let python_sts: Arc<dyn PythonSts> = Arc::new(NoopPythonSts);
     let shutdown = CancellationToken::new();
     // 注意：NoopSessionStore 不需要 Redis 池
     use hsh_erp_rust::auth::session::NoopSessionStore;
     let session: Arc<dyn SessionStore> = Arc::new(NoopSessionStore::new());
-    let upload_session_repo: Arc<dyn UploadSessionRepo> = Arc::new(NoopUploadSessionRepo);
     // 2026-09-23 新增 Idempotency 中间件存储：disabled session 场景走 Noop
     let idempotency_store: Arc<dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore> =
         Arc::new(hsh_erp_rust::middleware::idempotency::NoopIdempotencyStore::new());
@@ -322,10 +296,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         snowflake,
         ws_hub,
         cos,
-        python_sts,
         shutdown,
         session,
-        upload_session_repo,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store,
     ))
@@ -422,13 +394,6 @@ pub async fn test_state_with_cos(
         ws_heartbeat_interval_seconds: 1,
         // 2026-09-20 新增：HTTP nest 请求超时。
         request_timeout_seconds: 30,
-        // 2026-09-18 新增：upload_session 域默认配置（测试场景）
-        upload_session: UploadSessionConfig {
-            python_backend_base_url: "http://backend-test:8000".into(),
-            ttl_seconds: 86400,
-            sts_duration_seconds: 7200,
-            renew_threshold_seconds: 600,
-        },
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
         idempotency_ttl_seconds: 86400,
         // 2026-09-26 新增：测试默认禁用初始管理员 seed（与生产配置对齐；调用方
@@ -440,12 +405,8 @@ pub async fn test_state_with_cos(
         config.snowflake.instance,
     ));
     let ws_hub = Arc::new(WsHub::new());
-    // 2026-09-18 M3-B：测试场景 STS 转发用 NoopPythonSts 占位（与 test_state_with_redis 一致）
-    let python_sts: Arc<dyn PythonSts> = Arc::new(NoopPythonSts);
     let shutdown = CancellationToken::new();
     let session: Arc<dyn SessionStore> = Arc::new(RedisSessionStore::new(redis_pool.clone()));
-    let upload_session_repo: Arc<dyn UploadSessionRepo> =
-        Arc::new(RedisUploadSessionRepo::new(redis_pool.clone()));
     // 2026-09-23 新增 Idempotency 中间件存储：cos 替换场景同 test_state_with_redis
     let idempotency_store: Arc<dyn hsh_erp_rust::middleware::idempotency::IdempotencyStore> =
         Arc::new(hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(redis_pool));
@@ -455,10 +416,8 @@ pub async fn test_state_with_cos(
         snowflake,
         ws_hub,
         cos, // 注入的 cos（替换默认 NoopCos）
-        python_sts,
         shutdown,
         session,
-        upload_session_repo,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store,
     ))

@@ -137,13 +137,15 @@ quick-xml = "0.37"
 # 前端 onDownloadProgress 由浏览器原生 a.download 兜住）。
 tokio-stream = "0.1"
 
-# reqwest：OpenDAL 传递依赖 + python STS HTTP 转发（infra::python_sts.rs）+ 真 COS
-# 端到端回归测试（tests/cos_real_smoke.rs）。rustls-tls 避免拖入 OpenSSL；
-# `json` feature 是 `RequestBuilder::json()` 必需（python_sts.rs 用它序列化请求体）。
+# reqwest：OpenDAL 传递依赖 + 真 COS 端到端回归测试（tests/cos_real_smoke.rs）。
+# rustls-tls 避免拖入 OpenSSL；`json` feature 是 `RequestBuilder::json()` 必需（真 COS 测试用）。
+# 2026-09-28 备注：STS 转发模块删除后，rust 后端无 `reqwest::json()` 生产调用点；
+# 待子任务 #3 单独 `cargo tree -i reqwest` 校验后决定是否完全移除本依赖。
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
-# 2026-09-18 M3-B 新增：upload_session 域 `tmp/sess/<session_uuid>/` 派生。
-# v4 随机 UUID；原 upload-intents batch_uuid 派生已删除（迁移至 upload_session）。
+# 2026-09-18 M3-B 新增：STS 会话域 tmp_key 派生使用 v4 随机 UUID。
+# 2026-09-28 备注：上述 STS 会话域已下线，uuid 当前在本仓库已无生产路径调用方；
+# 保留依赖待子任务 #3 全仓 grep 后统一清理（避免本轮 diff 过大）。
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

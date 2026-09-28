@@ -143,7 +143,8 @@ PUT  /{part_id}                             ⚠️ docs 未列出 PUT 形式（�
 ### 2.6 其他域（小优先级）
 
 - `customers.md` / `applicants.md`：PR4 vo/ 后字段可能漂移（i64 serialize_i64 字符串化）
-- `shelves.md` / `outsource-*.md` / `cnc-programs.md` / `files.md` / `upload_session.md`：PR4 vo/ 抽离后字段名序列化输出未变（仅内部结构调整），docs 不需改
+- `shelves.md` / `outsource-*.md` / `cnc-programs.md` / `files.md`：PR4 vo/ 抽离后字段名序列化输出未变（仅内部结构调整），docs 不需改
+- 相关会话域 docs（2026-09-28 备注）：域整体下线，文档整文件删除；本条仅作历史记录
 - `websocket.md`：dashboard WS 消息，PR3 analytics 抽离未影响事件定义
 
 **drift 风险**：极低

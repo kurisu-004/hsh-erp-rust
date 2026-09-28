@@ -38,8 +38,6 @@ pub struct AppConfig {
     /// （不影响 WS 长连接，也不影响根 Router 的 CORS/Body limit）。环境变量
     /// `REQUEST_TIMEOUT_SECONDS`，缺省 `30`。
     pub request_timeout_seconds: u64,
-    /// 2026-09-18 新增：上传会话域配置（Redis 会话机制 + python STS 转发）。
-    pub upload_session: UploadSessionConfig,
     /// 2026-09-23 新增 Idempotency 中间件 TTL（秒）：POST/PUT/PATCH 带
     /// `Idempotency-Key` header 的请求，缓存响应在 Redis 中的过期时间。
     /// 环境变量 `IDEMPOTENCY_TTL_SECONDS`，缺省 `86400`（24h）。
@@ -160,7 +158,6 @@ pub struct CosConfig {
     pub max_file_size: usize,
     /// COS 临时对象 prefix 模板前缀（默认 `tmp/`，含尾斜杠）。可用于多种场景：
     /// - confirm handler 校验 `tmp_key` 必须以此前缀开头
-    /// - upload_session 域 `tmp/sess/<uuid>/` 派生时也以此前缀为锚
     ///
     /// 可通过 `COS_TMP_PREFIX` env 覆盖，缺省 `tmp/`。
     pub tmp_prefix: String,
@@ -182,31 +179,7 @@ pub struct AutoCompleteConfig {
     pub interval_hours: u64,
 }
 
-/// 上传会话域配置（2026-09-18 新增）
-///
-/// 集中管理 upload_session 域的所有可调参数：
-/// - `python_backend_base_url`：rust → python STS 转发目标地址
-/// - `ttl_seconds`：Redis key TTL（24h 滑动）
-/// - `sts_duration_seconds`：请求 python 签发时的 expire_seconds（python 端可能按
-///   自身配置上下限收敛；此值仅作调用方期望值）
-/// - `renew_threshold_seconds`：get_or_create hit 路径下，凭证 < 此阈值自动 renew
-#[derive(Clone, Debug)]
-pub struct UploadSessionConfig {
-    /// 完整 base URL（含 scheme / host / port），如 `http://backend:8000`。
-    /// 留空 → NoopPythonSts（本地调试用）。
-    /// 环境变量 `PYTHON_BACKEND_BASE_URL`，缺省 `http://backend:8000`。
-    pub python_backend_base_url: String,
-    /// Redis 会话条目 TTL（秒）；每次写都 SET EX 续期。
-    /// 环境变量 `UPLOAD_SESSION_TTL_SECONDS`，缺省 `86400`（24h）。
-    pub ttl_seconds: u64,
-    /// 请求 python 端签发 STS 时的期望有效期（秒）。
-    /// 环境变量 `UPLOAD_SESSION_STS_DURATION_SECONDS`，缺省 `7200`（2h，比 STS
-    /// 默认 900s 长以减少 renew 频率）。
-    pub sts_duration_seconds: u32,
-    /// get_or_create hit 路径下，凭证剩余有效期 < 此阈值 → 自动 renew。
-    /// 环境变量 `UPLOAD_SESSION_RENEW_THRESHOLD_SECONDS`，缺省 `600`（10min）。
-    pub renew_threshold_seconds: i64,
-}
+// 2026-09-28 删除：相关上传会话域配置结构体（域整体下线）。
 
 impl AppConfig {
     pub fn from_env(env_file: &str) -> Result<Self> {
@@ -328,8 +301,7 @@ impl AppConfig {
                     presign_expire_seconds: env_parse("COS_PRESIGN_EXPIRE", 3600)?,
                     max_file_size: env_parse("COS_MAX_FILE_SIZE", 300 * 1024 * 1024)?,
                     // 2026-09-20 迁移：删 `sts_duration_seconds` 字段（spike 已记
-                    // 「未来清理」）；STS 链路完全走 `UploadSessionConfig::sts_duration_seconds`
-                    // + python 后端转发，与 COS 对象存储解耦。
+                    // 「未来清理」）；STS 链路与 COS 对象存储解耦。
                     tmp_prefix: env_or("COS_TMP_PREFIX", "tmp/"),
                 }
             },
@@ -364,16 +336,6 @@ impl AppConfig {
             ws_heartbeat_interval_seconds: env_parse("WS_HEARTBEAT_INTERVAL_SECONDS", 30u64)?,
             // 2026-09-20 新增：HTTP nest 请求超时；与 WS 隔离（挂在内层）。
             request_timeout_seconds: env_parse("REQUEST_TIMEOUT_SECONDS", 30u64)?,
-            // 2026-09-18 新增：upload_session 域配置
-            upload_session: UploadSessionConfig {
-                python_backend_base_url: env_or("PYTHON_BACKEND_BASE_URL", "http://backend:8000"),
-                ttl_seconds: env_parse("UPLOAD_SESSION_TTL_SECONDS", 86_400u64)?,
-                sts_duration_seconds: env_parse("UPLOAD_SESSION_STS_DURATION_SECONDS", 7_200u32)?,
-                renew_threshold_seconds: env_parse(
-                    "UPLOAD_SESSION_RENEW_THRESHOLD_SECONDS",
-                    600i64,
-                )?,
-            },
             // 2026-09-23 新增 Idempotency 中间件 TTL（秒）。
             idempotency_ttl_seconds: env_parse("IDEMPOTENCY_TTL_SECONDS", 86_400u64)?,
             // 2026-09-26 新增：可选初始管理员账号种子开关（生产默认关闭）。

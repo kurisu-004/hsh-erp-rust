@@ -25,14 +25,12 @@ use hsh_erp_rust::infra::config::AppConfig;
 use hsh_erp_rust::infra::cos::CosClient;
 use hsh_erp_rust::infra::cos_opendal::build_cos_client;
 use hsh_erp_rust::infra::db;
-use hsh_erp_rust::infra::python_sts::{HttpPythonSts, NoopPythonSts, PythonSts};
 use hsh_erp_rust::infra::seed;
 use hsh_erp_rust::infra::redis;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::middleware::idempotency::{IdempotencyStore, RedisIdempotencyStore};
 use hsh_erp_rust::modules;
-use hsh_erp_rust::modules::upload_session::repo::{RedisUploadSessionRepo, UploadSessionRepo};
 use hsh_erp_rust::state::AppState;
 use hsh_erp_rust::task;
 
@@ -77,49 +75,16 @@ async fn main() -> anyhow::Result<()> {
     // 6. COS 客户端（按 `COS_BACKEND` 二选一：`opendal` / `noop`）
     let cos: Arc<dyn CosClient> = build_cos_client(&config.cos).context("构造 COS 客户端失败")?;
 
-    // 6.4 Python STS 凭证转发客户端（2026-09-18 新增；替代原 TencentSts 直连）
-    // 走 HTTP 转发到 python 后端内部端点 `/api/v1/files/sts-prefix-credentials`；
-    // 本地 cargo run 时如不想启 python 后端，把 `PYTHON_BACKEND_BASE_URL` 设为空
-    // 走 Noop 占位（仅供前端骨架调试，业务上不真上传）。
-    let python_sts: Arc<dyn PythonSts> = if config.cos.enabled
-        && !config.upload_session.python_backend_base_url.is_empty()
-    {
-        info!(
-            base_url = %config.upload_session.python_backend_base_url,
-            "PYTHON_BACKEND_BASE_URL 已配置，启用 HttpPythonSts（转发 python 后端签发 STS）"
-        );
-        Arc::new(
-            HttpPythonSts::new(config.upload_session.python_backend_base_url.clone())
-                .context("初始化 HttpPythonSts 失败")?,
-        )
-    } else if config.cos.enabled && config.upload_session.python_backend_base_url.is_empty() {
-        // fail-fast：COS_ENABLED=true 但 PYTHON_BACKEND_BASE_URL 缺失 —— 不静默回退
-        anyhow::bail!(
-            "COS_ENABLED=true 但 PYTHON_BACKEND_BASE_URL 未配置；rust 上传会话域必须转发 \
-             python 后端签发 STS。请在 .env 设置 PYTHON_BACKEND_BASE_URL=http://backend:8000 \
-             （或显式 COS_ENABLED=false 走 Noop 占位）。这是 review #5 修复的 fail-fast \
-             防 misconfiguration 静默启用。"
-        );
-    } else {
-        info!(
-            cos_enabled = config.cos.enabled,
-            python_base_url = %config.upload_session.python_backend_base_url,
-            "PYTHON_BACKEND_BASE_URL 未配置或 COS_ENABLED=false，使用 NoopPythonSts（占位，本地调试用）"
-        );
-        Arc::new(NoopPythonSts)
-    };
-
     // 6.5 Redis 连接池 + 服务端 session 存储（生产必走 Redis；NoopSessionStore 仅测试 fixture 用）
-    let (session, upload_session_repo, idempotency_store): (
+    // 2026-09-28 删除：相关上传会话域装配（Redis 共享 STS 凭证会话机制已下线）。
+    let (session, idempotency_store): (
         Arc<dyn SessionStore>,
-        Arc<dyn UploadSessionRepo>,
         Arc<dyn IdempotencyStore>,
     ) = {
         let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
-        info!("Redis session 存储 + upload_session 存储 + idempotency 缓存已就绪");
+        info!("Redis session 存储 + idempotency 缓存已就绪");
         (
             Arc::new(RedisSessionStore::new(redis_pool.clone())),
-            Arc::new(RedisUploadSessionRepo::new(redis_pool.clone())),
             // 2026-09-23 新增 Idempotency 中间件：与 session 同池共享
             Arc::new(RedisIdempotencyStore::new(redis_pool)),
         )
@@ -136,10 +101,8 @@ async fn main() -> anyhow::Result<()> {
         snowflake,
         ws_hub.clone(),
         cos,
-        python_sts,
         shutdown.clone(),
         session,
-        upload_session_repo,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store.clone(),
     ));

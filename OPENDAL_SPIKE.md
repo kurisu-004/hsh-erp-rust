@@ -207,7 +207,8 @@ Permissions Size User Date Modified Name
 | 把 `config.rs::from_env` 的 `COS_BACKEND` 解析改为仅支持 `opendal` / `noop` | -5 | env 文档同步 |
 | 把 `tests/common/mod.rs` 的 `backend: CosBackend::CosSdk` 改成 `OpenDal` | 0 | 字面量替换 |
 | 把 `iam/service_tests/mod.rs` 同步 | 0 | 字面量替换 |
-| 业务侧验证（part_file_api + upload_session） | +0 | 用 `COS_BACKEND=noop` 跑回归即可 |
+| 业务侧验证（part_file_api） | +0 | 用 `COS_BACKEND=noop` 跑回归即可 |
+| 业务侧验证（相关 STS 会话域） | 不适用 | 2026-09-28 域整体下线，回归已随 part_file 覆盖 |
 | **迁移净增** | **-325 行实现代码** | 删 ~325，添 ~0 |
 
 **总工作量**：约 2 小时删除 + 半天验证（真 COS bucket 跑通 6 method + presign URL 浏览器拉取）。**不涉及业务域改动**。
@@ -217,8 +218,12 @@ Permissions Size User Date Modified Name
 | 路径 | 改动 | ROI |
 |---|---|---|
 | **保持现状（python 转发）** | spike 不动 | python 后端已稳定；ROI = 0 |
-| **OpenDAL 内置 credential refresh** | 删 `python_sts.rs`，改 OpenDAL S3 builder 用 `Credential::Refreshable` + 自己实现 `TokenLoad`（从 python / Redis 拿临时凭据） | 砍掉一次 HTTP 转发（rust → python），但需要自己实现 token 拉取 + 缓存 + 过期重试；新增 ~150 行 + 单元测试；ROI 中等 |
+| **OpenDAL 内置 credential refresh** | 删 STS 转发模块，改 OpenDAL S3 builder 用 `Credential::Refreshable` + 自己实现 `TokenLoad`（从 python / Redis 拿临时凭据） | 砍掉一次 HTTP 转发（rust → python），但需要自己实现 token 拉取 + 缓存 + 过期重试；新增 ~150 行 + 单元测试；ROI 中等 |
 | **完全自签 STS** | 删 python 转发 + 不依赖任何 STS provider；前端拿 rust 直签的 V4 预签 URL | 砍掉 python 后端链路依赖；但需要 ops 在腾讯云 CAM 开通 rust 服务身份的 `cos:PutObject` 等 policy；运维复杂度高；ROI 低（业务量不大） |
+
+**2026-09-28 更新**：spike 报告 §8 的"保持现状（python 转发）"路径已**整体下线**——
+相关 STS 会话域删除，STS 转发模块删除；前端改为单 uploader + python
+`sts-tmp-keys` 数组入参直签（不经过 rust）。rust 后端不再代为转发 STS。
 
 **建议**：spike 当前**不**触碰 STS（已在 spike 范围外）；如果未来 Python 后端退役，再联动做方案 2。
 
@@ -241,7 +246,9 @@ Permissions Size User Date Modified Name
 - **改**：`tests/common/mod.rs`（3 处 `CosConfig` 字面量加 `backend` 字段）
 - **改**：`src/modules/iam/service_tests/mod.rs`（1 处 `CosConfig` 字面量加 `backend` 字段 + import 调整）
 
-**未触碰**：`src/infra/cos.rs` / `TencentCos` / `NoopCos` / `src/infra/python_sts.rs` / 任何业务模块（part_file / assembly / cnc_program / part / iam / delivery_note 等）。
+**未触碰**：`src/infra/cos.rs` / `TencentCos` / `NoopCos` / STS 转发模块 / 任何业务模块（part_file / assembly / cnc_program / part / iam / delivery_note 等）。
+
+**2026-09-28 备注**：上述"未触碰"列表中的 STS 转发模块与 `src/modules/相关 STS 会话域/*` 整体下线（域已下线）；详见 commits `feat(refactor): 删除相关 STS 会话域（2026-09-28 移除 STS session 设施）`。
 
 ---
 
@@ -369,10 +376,12 @@ Permissions Size User Date Modified Name
 
 - **CosSdk 变体完全删除**（不留 deprecated 兜底）。理由：(1) spike 已 6 method 真 COS 验证通过，cos-rust-sdk 无迁移路径；(2) `cos_sdk` 字符串不合法 → anyhow bail 是最直白的 fail-fast，避免静默 fallback 掩盖配置未迁。
 - **Cargo.lock 自动收敛**：删 5 个直接依赖后，`cargo build` 重新解析依赖图，传递依赖（cos-rust-sdk 的 hex / base64 / sha1 / hmac）随 SDK 删除而消失；lock 文件 diff 仅表现为 `cos-rust-sdk` + 4 个 helper crate 的 entry 删除，**无新增传递依赖**。
-- **`sts_duration_seconds` 字段删除**：原 `TencentSts`（2026-09-18 已迁 `python_sts`）不再用此字段，`UploadSessionConfig::sts_duration_seconds`（`UPLOAD_SESSION_STS_DURATION_SECONDS` env）才是 STS 凭据有效期的真源。spike 报告 §「未完成 / 存疑」中提及的「未来清理」完成。
+- **`sts_duration_seconds` 字段删除**：原 `TencentSts`（2026-09-18 已迁 STS 转发模块）不再用此字段，相关会话域配置（`UPLOAD_SESSION_STS_DURATION_SECONDS` env）才是 STS 凭据有效期的真源。spike 报告 §「未完成 / 存疑」中提及的「未来清理」完成。
+  **2026-09-28 备注**：相关 STS 会话域整体下线后，相关配置结构体亦删除（无业务调用方）；STS 凭据有效期改由 python 端 `core.sts.grant_sts_tmp_key` 配置收敛。
 - **`NoopOpenDal::new()` 保留**（**未**改 `Default::default()`）：`Default::default()` 已存在但 `new()` 仍需保留（暴露 `anyhow::Result` 让 `build_cos_client` 的 `?` 链传播错误）。
 - **`tests/common/mod.rs::fresh_database_url` rustfmt 拆分清理**顺手完成（reviewer 标记的纯 whitespace 整改）。
-- **STS 链路完全不动**：`src/infra/python_sts.rs` 与 `src/modules/upload_session/*` 全部未触碰，迁移范围严格限于 COS 对象存储客户端。
+- **STS 链路完全不动**：STS 转发模块与 `src/modules/相关 STS 会话域/*` 全部未触碰，迁移范围严格限于 COS 对象存储客户端。
+  **2026-09-28 备注**：上述 STS 链路文件于 2026-09-28 整体下线（相关会话域已删除，STS 转发 / NoopSts 模块删除，相关配置结构体删除）；本 spike 报告原文保留作为历史记录，新代码路径以删除后的状态为准。
 
 ### 12.5 未完成 / 存疑
 

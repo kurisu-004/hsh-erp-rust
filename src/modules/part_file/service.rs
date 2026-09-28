@@ -25,11 +25,16 @@
 //! 装配体 PDF（kind='ASSEMBLY_MASTER'）走相同上传通道，owner_kind='ASSEMBLY'，
 //! 由 assembly 域在创建流程或单独的 `POST /assemblies/{id}/files` 端点调用。
 //!
-//! ## 2026-09-16 M2-B → 2026-09-18 upload_session 拆分
+//! ## 2026-09-16 M2-B → 2026-09-18 STS 会话域拆分
 //! - 原 `upload_intents` 业务函数（场景 A/B 一次性签 STS + CAS 去重命中复用）
-//!   **2026-09-18 已删除**：迁移至 `upload_session` 域（共享 STS 凭证 + Redis 会话）。
+//!   **2026-09-18 已删除**：迁移至相关 STS 会话域（共享 STS 凭证 + Redis 会话）。
 //! - `bind_uploaded_file` 保留：confirm handler + batch_create service 共享的"已上传到
 //!   tmp 区 → 绑定到 owner"逻辑；head/copy 在 tx 之外，事务内只做 soft_delete + INSERT。
+//!
+//! ## 2026-09-28 相关 STS 会话域下线
+//! 相关 STS 会话域整体下线；前端改为单 uploader 触发时单 HTTP 调用 python `sts-tmp-keys`
+//! 数组入参直签 STS 凭证。本文件保持不变（confirm 链路 + bind_uploaded_file 仍依赖
+//! t_part_file + t_part_file_tmp_object 物理表，不受 STS 链路改造影响）。
 //!
 //! ## 事务边界（2026-09-22 重构对齐 iam 范式）
 //! 事务移交 handler（与 20 个 handler 文件现状对齐）：service 仅业务逻辑，所有跨
@@ -356,7 +361,8 @@ pub async fn list_part_files_for_owner(
 
 // ===== 2026-09-16 M2-B 业务层：bind_uploaded_file（confirm + batch_create 共享） ==============
 //
-// 2026-09-18 注：原 `upload_intents` 业务函数已**删除**（迁移至 upload_session 域）。
+// 2026-09-18 注：原 `upload_intents` 业务函数已**删除**（迁移至相关 STS 会话域）。
+// 2026-09-28 备注：相关 STS 会话域整体下线；该函数不再有任何归属。
 // 保留 `bind_uploaded_file` 给 confirm handler + batch_create service 共用：
 // head/copy 在 tx 之外，事务内只做 soft_delete + INSERT。
 //

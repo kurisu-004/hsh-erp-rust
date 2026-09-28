@@ -955,15 +955,10 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
         std::sync::Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1)),
         std::sync::Arc::new(hsh_erp_rust::infra::ws_hub::WsHub::default()),
         std::sync::Arc::new(hsh_erp_rust::infra::cos::NoopCos),
-        // 2026-09-18 M3-B：测试占位 python_sts（不连真实 python 后端）
-        std::sync::Arc::new(hsh_erp_rust::infra::python_sts::NoopPythonSts),
         tokio_util::sync::CancellationToken::new(),
         std::sync::Arc::new(hsh_erp_rust::auth::session::RedisSessionStore::new(
             redis_pool.clone(),
         )),
-        std::sync::Arc::new(
-            hsh_erp_rust::modules::upload_session::repo::RedisUploadSessionRepo::new(redis_pool.clone()),
-        ),
         // 2026-09-23 新增 Idempotency 中间件存储：复用同一 redis_pool
         std::sync::Arc::new(
             hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(redis_pool),
