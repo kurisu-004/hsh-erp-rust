@@ -13,7 +13,6 @@
 //! ## 错误码
 //! - 21114 `BIZ_PART_FILE_TMP_OBJECT_MISSING` — head_object 失败（tmp 不存在）
 //! - 21115 `BIZ_PART_FILE_SIZE_MISMATCH` — head size 与声明 size 不一致
-//! - 21116 `STS_ISSUE_FAILED` — STS 凭证下发失败（confirm 路径暂未使用，留位）
 //! - 21108 `BIZ_PART_FILE_DUPLICATE` — 同 part + kind + sha256 撞唯一索引
 //!
 //! ## 异步清理契约（2026-09-16 M2-B 第 2 轮）
