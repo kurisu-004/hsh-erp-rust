@@ -127,8 +127,8 @@
 | `order_no` | string? | 订单号 |
 | `system_delivery_date` | date? | 系统派工日 |
 | `note` | string? | 备注 |
-| `unit_price` | string (Decimal) | 2026-09-27 新增：单价（NUMERIC(12,2) NOT NULL DEFAULT 0）。`rust_decimal::Decimal` + `serde-with-str` 自动序列化为 string。 |
-| `total_price` | string (Decimal) | 2026-09-27 新增：总价（NUMERIC(14,2) NOT NULL DEFAULT 0）。同上，string 避免 JS 浮点丢精度。 |
+| `unit_price` | string (Decimal) | 2026-09-27 新增：单价（NUMERIC(12,2) NOT NULL DEFAULT 0）。`rust_decimal::Decimal` + `serde-with-str` 自动序列化为 string。<br>**2026-09-28 行类型合并引入**：装配体行（`row_type='ASSEMBLY'`）的 `unit_price` 来自 `t_assembly.unit_price: Option<Decimal>`，service 层用 `unwrap_or(Decimal::ZERO)` 兜底——与 `t_part` DB DEFAULT 0 语义对齐、与 frontend Zod schema `unit_price: z.string()`（non-nullable）契约一致。原 plan §1.3 设想改 `PartListItem` 为 `Option<Decimal>`，经核实前端 Zod 同样 non-nullable，保持现状是两端契约对齐的最佳选择。 |
+| `total_price` | string (Decimal) | 2026-09-27 新增：总价（NUMERIC(14,2) NOT NULL DEFAULT 0）。同上，string 避免 JS 浮点丢精度。<br>**2026-09-28 行类型合并引入**：同 `unit_price`，ASSEMBLY 行由 `t_assembly.total_price: Option<Decimal>` 用 `unwrap_or(Decimal::ZERO)` 兜底。 |
 | `version` | i32 | 乐观锁 |
 | `created_at` | naive datetime | |
 | `created_by` | string (i64)? | |
@@ -138,8 +138,11 @@
 | `process_chain_id` | string (i64)? | 2026-09-16 migration 026 新增：逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链 |
 | `customer_name` | string? | 冗余（lookup_customer_names） |
 | `l1_customer_name` | string? | 冗余（lookup_customer_names） |
-| `location` | string? | **派生**（2026-09-16 PR-2 § part/service/crud.rs::enrich_part_list_with_location_and_holder）；`min-progress 活跃批次.location`（与 `compute_part_target` 一致）。无活跃批次 → `null`。前端展示文案规范化由前端承担（`PRODUCTION_SHELF` → "货架 X" 等）；后端只负责值。 |
-| `holder_name` | string? | **派生**（同上）；按 min-progress 活跃批次的 `current_holder_id` 解析（按 batch.location 分桶：`PRODUCTION_SHELF` / `INSPECTION_SHELF` → `t_shelf.code`；`WORKER` → `t_worker.name`；`OUTSOURCE_COMPANY` → `t_outsource_company.name`；`OFFICE` / `None` → `null`）。 |
+| `location` | string? | **派生**（2026-09-16 PR-2 § part/service/crud.rs::enrich_part_list_with_location_and_holder）；`min-progress 活跃批次.location`（与 `compute_part_target` 一致）。无活跃批次 → `null`。前端展示文案规范化由前端承担（`PRODUCTION_SHELF` → "货架 X" 等）；后端只负责值。**仅 PART 行有值；ALL 模式装配件段恒 `null`**（t_assembly 不持 location 字段；真相源在 t_part_batch）。 |
+| `holder_name` | string? | **派生**（同上）；按 min-progress 活跃批次的 `current_holder_id` 解析（按 batch.location 分桶：`PRODUCTION_SHELF` / `INSPECTION_SHELF` → `t_shelf.code`；`WORKER` → `t_worker.name`；`OUTSOURCE_COMPANY` → `t_outsource_company.name`；`OFFICE` / `None` → `null`）。**仅 PART 行有值；ALL 模式装配件段恒 `null`**（t_assembly 不持 holder_name 派生字段）。 |
+| `row_type` | string? | 2026-09-28 新增。行类型标识：`"PART"`（零件）/ `"ASSEMBLY"`（装配件）/ `null`（历史 caller 旧 PART-only 形态）。ALL 模式混合列表用；前端按此字段切普通行 vs Tree 节点 lazy load。 |
+| `has_children` | bool | 2026-09-28 新增。是否有子件（Tree data lazy mode 必需）：PART 行 → `false`；ASSEMBLY 行 → `child_count.unwrap_or(0) > 0`。后端不强制走 `GET /assemblies/{id}` 预拉，前端按此字段切换展开/折叠交互即可。 |
+| `child_count` | string (i64)? | 2026-09-28 新增。子件计数（装配表行专用）；PART 行 → `null`。真相源：`t_part WHERE assembly_id = $1 AND deleted_at IS NULL` 的 COUNT（≤200 ids / 1 extra query）。 |
 
 > 2026-09-16 PR-2（migration 027）：`t_part` 删 `actual_delivery_date` /
 > `location` / `current_holder_id` / `placed_at` / `delivery_note_id` /
