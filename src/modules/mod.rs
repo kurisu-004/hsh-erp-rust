@@ -38,6 +38,8 @@ pub mod prod;
 pub mod shelf;
 pub mod statistics;
 pub mod upload_session; // 2026-09-18 新增：Redis 共享 STS 凭证会话机制
+// 2026-09-28 新增：微信小程序 BFF 域（`/api/v2/wx/*` 聚合端点）
+pub mod wx;
 
 #[derive(Serialize)]
 struct HealthResp {
@@ -103,6 +105,8 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/delivery-notes", delivery_note::router())
         .nest("/delivery-groups", p1_router())
         .nest("/statistics", statistics::router())
+        // 2026-09-28 新增：微信小程序 BFF 域（聚合端点 + 复用 IAM 鉴权）
+        .nest("/wx", wx::router())
         // 2026-09-14 新增：e2e 测试 seed hook（dev/test 默认启用，release profile 硬关）
         .nest("/_e2e", _e2e::router())
         // 2026-09-20 新增：JWT 验证统一走中间件（详见 auth::middleware）
