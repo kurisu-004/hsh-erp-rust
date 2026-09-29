@@ -36,7 +36,7 @@ impl ProcessRepo {
             r#"
             SELECT id, code, name, category, sort_order, description, version,
                    created_at, created_by, updated_at, updated_by, deleted_at,
-                   requires_approval, color
+                   requires_approval, color, is_cnc
             FROM t_process
             WHERE id = $1
               AND ($2::bool OR deleted_at IS NULL)
@@ -58,7 +58,7 @@ impl ProcessRepo {
             r#"
             SELECT id, code, name, category, sort_order, description, version,
                    created_at, created_by, updated_at, updated_by, deleted_at,
-                   requires_approval, color
+                   requires_approval, color, is_cnc
             FROM t_process
             WHERE code = $1 AND deleted_at IS NULL
             "#,
@@ -84,7 +84,7 @@ impl ProcessRepo {
             r#"
             SELECT id, code, name, category, sort_order, description, version,
                    created_at, created_by, updated_at, updated_by, deleted_at,
-                   requires_approval, color
+                   requires_approval, color, is_cnc
             FROM t_process
             WHERE id = ANY($1)
               AND deleted_at IS NULL
@@ -109,7 +109,7 @@ impl ProcessRepo {
         let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
             "SELECT id, code, name, category, sort_order, description, version, \
              created_at, created_by, updated_at, updated_by, deleted_at, \
-             requires_approval, color \
+             requires_approval, color, is_cnc \
              FROM t_process WHERE deleted_at IS NULL",
         );
         if let Some(cat) = category {
@@ -171,17 +171,18 @@ impl ProcessRepo {
         description: Option<&str>,
         requires_approval: bool,
         color: Option<&str>,
+        is_cnc: bool,
         created_by: i64,
     ) -> Result<TProcess, sqlx::Error> {
         sqlx::query_as!(
             TProcess,
             r#"
             INSERT INTO t_process (id, code, name, category, sort_order, description,
-                                   requires_approval, color, created_by, updated_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
+                                   requires_approval, color, is_cnc, created_by, updated_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
             RETURNING id, code, name, category, sort_order, description, version,
                       created_at, created_by, updated_at, updated_by, deleted_at,
-                      requires_approval, color
+                      requires_approval, color, is_cnc
             "#,
             snowflake_id,
             code,
@@ -191,6 +192,7 @@ impl ProcessRepo {
             description,
             requires_approval,
             color,
+            is_cnc,
             created_by,
         )
         .fetch_one(executor)
@@ -215,6 +217,7 @@ impl ProcessRepo {
         description: Option<Option<&str>>,
         requires_approval: Option<bool>,
         color: Option<Option<&str>>,
+        is_cnc: Option<bool>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error> {
         let set_description = description.is_some();
@@ -229,6 +232,7 @@ impl ProcessRepo {
                 description     = CASE WHEN $5::bool THEN $6::varchar ELSE description END,
                 requires_approval = COALESCE($7::boolean, requires_approval),
                 color           = CASE WHEN $8::bool THEN $9::varchar ELSE color END,
+                is_cnc          = COALESCE($11::boolean, is_cnc),
                 version         = version + 1,
                 updated_at      = now(),
                 updated_by      = $10
@@ -244,6 +248,7 @@ impl ProcessRepo {
             set_color,
             new_color,
             updated_by,
+            is_cnc,
         )
         .execute(executor)
         .await

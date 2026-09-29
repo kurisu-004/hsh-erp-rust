@@ -30,4 +30,7 @@ pub struct TProcess {
     pub requires_approval: bool,
     /// 前端工序卡片颜色（hex 含 alpha）；格式 `#RRGGBBAA`，9 字符。NULL = 未设置。
     pub color: Option<String>,
+    /// 2026-09-29 新增：是否 CNC 工序。用于待编程列表过滤 + worker_pool 候选池的
+    /// has_cnc_program 派生 + 自动分配优先级。详见 migration 002。
+    pub is_cnc: bool,
 }

@@ -57,6 +57,7 @@ fn to_process_out(p: TProcess) -> ProcessOut {
         description: p.description,
         requires_approval: p.requires_approval,
         color: p.color,
+        is_cnc: p.is_cnc,
         version: p.version,
         created_at: p.created_at,
         updated_at: p.updated_at,
@@ -218,6 +219,8 @@ impl ProcessService {
         } else {
             req.requires_approval.unwrap_or(true)
         };
+        // 2026-09-29 新增：is_cnc 默认 false（与 migration DEFAULT 一致），由 caller 显式声明。
+        let is_cnc = req.is_cnc.unwrap_or(false);
 
         let id = self.snowflake.next_id();
         let p = repo
@@ -230,6 +233,7 @@ impl ProcessService {
                 description,
                 requires_approval,
                 color,
+                is_cnc,
                 user.id,
             )
             .await
@@ -335,6 +339,7 @@ impl ProcessService {
                 desc_update,
                 requires_approval_update,
                 color_update,
+                req.is_cnc,
                 user.id,
             )
             .await

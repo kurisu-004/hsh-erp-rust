@@ -16,6 +16,7 @@ use crate::shared::types::deserialize_some;
 /// - `category` ∈ {INHOUSE, OUTSOURCE}；其他值 → 20104
 /// - `requires_approval`：OUTSOURCE 保留请求值（默认 true）；INHOUSE service 层强制 false
 /// - `color`：`#RRGGBBAA` 9 字符；空串/null ⇒ NULL（不设色）；非空但格式不对 ⇒ 20104
+/// - `is_cnc`：2026-09-29 新增；缺省 `false`（与 migration 002 DEFAULT FALSE 对齐）
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProcessCreateRequest {
     pub code: String,
@@ -29,6 +30,9 @@ pub struct ProcessCreateRequest {
     pub requires_approval: Option<bool>,
     #[serde(default)]
     pub color: Option<String>,
+    /// 2026-09-29 新增：是否 CNC 工序。缺省 `false`（即非 CNC）。
+    #[serde(default)]
+    pub is_cnc: Option<bool>,
 }
 
 /// 部分更新：未提供的字段保持原值（与 Python `exclude_unset` 语义对齐）。
@@ -51,6 +55,9 @@ pub struct ProcessUpdateRequest {
     /// 三态：`None` ⇒ 缺省不改；`Some(null)` ⇒ 显式清空；`Some("...")` ⇒ 改值
     #[serde(default, deserialize_with = "deserialize_some")]
     pub color: Option<Option<String>>,
+    /// 2026-09-29 新增：是否 CNC 工序。`None` ⇒ 不改；`Some(b)` ⇒ 覆盖。
+    #[serde(default)]
+    pub is_cnc: Option<bool>,
 }
 
 /// 列表查询参数：`code_like` / `category` 过滤 + 分页。

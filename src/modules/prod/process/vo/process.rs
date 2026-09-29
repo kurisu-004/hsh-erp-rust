@@ -18,6 +18,8 @@ pub struct ProcessOut {
     /// 前端工序卡片颜色（`#RRGGBBAA`，9 字符含 alpha）。NULL = 未设置。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+    /// 2026-09-29 新增：是否 CNC 工序（用于待编程列表过滤与 worker_pool 自动分配优先级）。
+    pub is_cnc: bool,
     pub version: i32,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,

@@ -98,6 +98,8 @@ pub trait ProcessRepoTrait: Send {
         description: Option<&'a str>,
         requires_approval: bool,
         color: Option<&'a str>,
+        // 2026-09-29 新增：是否 CNC 工序。详见 migration 002。
+        is_cnc: bool,
         created_by: i64,
     ) -> Result<TProcess, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
@@ -110,6 +112,8 @@ pub trait ProcessRepoTrait: Send {
         description: Option<Option<&'a str>>,
         requires_approval: Option<bool>,
         color: Option<Option<&'a str>>,
+        // 2026-09-29 新增：是否 CNC 工序。`None` ⇒ 不改；`Some(b)` ⇒ 覆盖。
+        is_cnc: Option<bool>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
     async fn soft_delete(
@@ -185,6 +189,7 @@ impl ProcessRepoTrait for &mut PgConnection {
         description: Option<&'b str>,
         requires_approval: bool,
         color: Option<&'b str>,
+        is_cnc: bool,
         created_by: i64,
     ) -> Result<TProcess, sqlx::Error> {
         ProcessRepo::create(
@@ -197,6 +202,7 @@ impl ProcessRepoTrait for &mut PgConnection {
             description,
             requires_approval,
             color,
+            is_cnc,
             created_by,
         )
         .await
@@ -212,6 +218,7 @@ impl ProcessRepoTrait for &mut PgConnection {
         description: Option<Option<&'b str>>,
         requires_approval: Option<bool>,
         color: Option<Option<&'b str>>,
+        is_cnc: Option<bool>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error> {
         ProcessRepo::update(
@@ -223,6 +230,7 @@ impl ProcessRepoTrait for &mut PgConnection {
             description,
             requires_approval,
             color,
+            is_cnc,
             updated_by,
         )
         .await
