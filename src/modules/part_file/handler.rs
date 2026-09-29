@@ -228,6 +228,9 @@ pub async fn get_part_file_content(
                 .unwrap_or_else(|| "application/octet-stream".to_string()),
         )
         .header(header::CONTENT_LENGTH, out.bytes.len())
+        // 2026-09-29 新增：图纸 / 3D 预览 20 min 缓存语义，与前端 TanStack
+        // usePartFilesListQuery staleTime 对称（浏览器 HTTP 缓存接管重复请求）。
+        .header(header::CACHE_CONTROL, "private, max-age=1200")
         .body(Body::from(out.bytes))
         .map_err(|e| AppError::internal(format!("response build: {e}")))?;
     Ok(resp)
