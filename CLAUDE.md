@@ -13,6 +13,12 @@ docker compose up -d postgres-test   # 测试库（localhost:5429，库 postgres
 cargo check                 # 已有 query! 宏：编译期经 .env 的 DATABASE_URL 连开发库校验；无库时用 SQLX_OFFLINE=true（.sqlx 已提交）
 cargo clippy --all-targets
 cargo test                  # 需先起 postgres-test；跑单个测试：cargo test <name>
+                            # ⚠️ wx 域有一条 access_token 缓存单测用**真 Redis**
+                            # （默认 redis-test:6380，可用 TEST_REDIS_URL 覆盖）；
+                            #   无 Redis 时该测试**自动跳过并打印 [跳过] 提示**，
+                            #   不会 panic、不影响整体结果——但缓存路径（read/write/
+                            #   invalidate）也就**没有被覆盖**，非静默失效。
+                            #   要覆盖它：docker compose up -d redis-test
 cargo run                   # 需先 cp .env.example .env 并起 postgres-dev
 
 ./scripts/sqlx_prepare.sh   # 每次 query! 宏改动后必须重跑，生成 .sqlx/query-*.json 并提交

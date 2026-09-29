@@ -148,6 +148,13 @@ pub enum Code2SessionError {
 ///
 /// ⚠️ 返回的 message **绝不包含** corpsecret / access_token / session_key；
 /// 只带 errcode + 企微原 errmsg（`errmsg` 是企微返回的固定文案，不含凭据）。
+///
+/// 2026-09-29 登记（review 第 3 轮 N6，仅记录不改）：未知 errcode 分支把上游
+/// `errmsg` **原样反射**进 `AppError::internal` 的 message（下方 `format!`），
+/// 而 message 会被 `shared::error::into_response()` 原样写进响应信封回给匿名调用者。
+/// 该反射面已评估为**可接受**——企微 errmsg 是固定文案（`invalid credential` /
+/// `access_token expired` 之类），不含凭据、不含请求参数回显。若将来上游改为
+/// 可注入文案（例如把 query 原文拼进 errmsg），必须重新评估此处。
 pub fn classify_wecom_errcode(errcode: i32, errmsg: &str) -> Code2SessionError {
     debug_assert_ne!(errcode, 0, "errcode=0 不应进入错误分类");
     if errcode == errcode::INVALID_CODE {
@@ -299,8 +306,15 @@ impl HttpWeComClient {
 
         let status = resp.status();
         let body: GetTokenResp = resp.json().await.map_err(|e| {
-            // 2026-09-29 安全修复（review 第 1 轮 R1）：与上面同理，
-            // 响应体读取 / JSON 解析失败同样可能带上含 corpsecret 的 url。
+            // 2026-09-29 安全修复（review 第 1 轮 R1）。
+            // 2026-09-29 校正（review 第 3 轮 N2）：初版注释称「响应体读取 /
+            // JSON 解析失败同样可能带上含 corpsecret 的 url」——**这句是错的**。
+            // 已核 reqwest 0.12.28 源码：`Response::json` 走
+            // `response.rs:269/290` → `crate::error::decode()`，而 `decode` 构造的
+            // `Error` **不附带 url**（只有 `Error::request` 那一族才带）。此处仍然
+            // 脱敏 + 定长文案，是为了防 reqwest 升级后该行为改变；**不要**因为
+            // 「decode 错误不带 url」就在别处放松同类检查（安全注释里的错误论断
+            // 会传染）。
             tracing::error!(
                 error = %e.without_url(),
                 %status,
@@ -442,8 +456,9 @@ impl HttpWeComClient {
             ))));
         }
         let body: Code2SessionResp = resp.json().await.map_err(|e| {
-            // 2026-09-29 安全修复（review 第 1 轮 R1）：与 gettoken 同理，query
-            // 含 access_token，日志脱敏 + message 固定文案。
+            // 2026-09-29 安全修复（review 第 1 轮 R1）：与 gettoken 同处同样处理。
+            // 2026-09-29 校正（review 第 3 轮 N2）：同上，`decode` 错误本身不带 url
+            // （reqwest 0.12.28 已核），此处脱敏 + 定长文案是为防版本升级改变该行为。
             tracing::error!(
                 error = %e.without_url(),
                 %status,
@@ -678,22 +693,77 @@ mod tests {
         client_for_opts(base_url, dead_redis_pool(), 5000)
     }
 
-    /// 指向一个**真 Redis**（`redis-test:6380`）的 client，用于覆盖 access_token
+    /// 指向一个**真 Redis**（默认 `redis-test:6380`）的 client，用于覆盖 access_token
     /// 缓存的 read / write / invalidate 三条路径（review 第 1 轮 Y2）。
-    async fn client_for_redis(base_url: &str) -> (HttpWeComClient, WeComConfig) {
-        let pool = hsh_erp_test_support::test_redis_pool().await;
-        del_token_cache(&pool).await;
-        client_for_opts(base_url, pool, 5000)
+    ///
+    /// 2026-09-29（review 第 3 轮 N1）：返回 `Option` —— **拿不到 Redis 就返回
+    /// `None`**，由调用方打印提示后提前 return，绝不 `.expect()` panic。理由：
+    /// `cargo test --lib` 必须能在**任何**环境跑通，而 `CLAUDE.md` 只要求起
+    /// `postgres-test`、`scripts/test_nextest.sh` 压根不管理 Redis；若某条流水线
+    /// 只跑 `cargo test --lib` 且无 redis-test，panic 会把绿任务变红。
+    async fn client_for_redis(base_url: &str) -> Option<(HttpWeComClient, WeComConfig)> {
+        let pool = try_redis_pool().await?;
+        if !del_token_cache(&pool).await {
+            return None;
+        }
+        Some(client_for_opts(base_url, pool, 5000))
     }
 
-    /// 删掉测试 key `wecom:access_token:C1`（与 `HttpWeComClient::token_cache_key`
-    /// 同格式——该函数是私有的，测试只能按字面量复刻）。
-    async fn del_token_cache(pool: &deadpool_redis::Pool) {
-        let mut conn = pool.get().await.expect("get test redis conn");
-        let _: () = conn
-            .del(HttpWeComClient::token_cache_key(CORP_ID))
-            .await
-            .expect("del wecom token cache key");
+    /// 探测并构造测试用 Redis 连接池；连不上返回 `None`（不打 panic）。
+    ///
+    /// 2026-09-29（review 第 3 轮 N1）：URL 复用
+    /// `hsh_erp_test_support::test_redis_url()`（db index 仍按测试 binary 名派生、
+    /// 可用 `TEST_REDIS_URL` 整体覆盖），但**不走** `test_redis_pool()`——后者内部
+    /// 是 `.expect("create test redis pool")`。deadpool 的 `Config::create_pool`
+    /// 只构造 Manager、**不建连**，所以还必须真的 `pool.get()` 探活一次，
+    /// 死端口才会被识别成「不可用」而不是等到后面的命令超时。
+    async fn try_redis_pool() -> Option<deadpool_redis::Pool> {
+        let url = hsh_erp_test_support::test_redis_url();
+        let pool = match deadpool_redis::Config::from_url(url.clone())
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[跳过] Redis 不可用：无法按 {url} 构造连接池（{e}）");
+                return None;
+            }
+        };
+        match pool.get().await {
+            Ok(c) => {
+                drop(c);
+                Some(pool)
+            }
+            Err(e) => {
+                eprintln!("[跳过] Redis 不可用：连不上 {url}（{e}）");
+                None
+            }
+        }
+    }
+
+    /// 删掉测试 key `wecom:access_token:C1`，返回是否真的删成功。
+    ///
+    /// 2026-09-29（review 第 3 轮 N5-1 校正）：初版 doc 称「`token_cache_key` 是
+    /// 私有的，测试只能按字面量复刻」——**与事实不符**。同模块 `mod tests` 有权访问
+    /// 父模块私有项，故下面直接调 `HttpWeComClient::token_cache_key(CORP_ID)`；
+    /// 按字面量复刻反而会与实现静默漂移。
+    ///
+    /// 2026-09-29（review 第 3 轮 N1）：Redis 中途掉线时返回 `false` 让调用方跳过，
+    /// 不 `.expect()` panic。
+    async fn del_token_cache(pool: &deadpool_redis::Pool) -> bool {
+        let mut conn = match pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[跳过] Redis 不可用：取连接失败（{e}）");
+                return false;
+            }
+        };
+        match conn.del(HttpWeComClient::token_cache_key(CORP_ID)).await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("[跳过] Redis 不可用：DEL 失败（{e}）");
+                false
+            }
+        }
     }
 
     /// 指向「无人监听的 Redis 端口」的连接池：缓存读/写/删全部走「失败即降级」
@@ -884,7 +954,10 @@ mod tests {
             !rendered.contains("SECRET-DO-NOT-LOG"),
             "gettoken 网络错误泄漏 corpsecret 值: {rendered}"
         );
-        assert_eq!(e.code(), code::INTERNAL, "凭据断言后仍须是 50001");
+        // 2026-09-29 校正（review 第 3 轮 N5-2）：初版此处写「仍须是 50001」，
+        // 但断言用的是 `code::INTERNAL` = **50000**（50001 是 `code::DATABASE`），
+        // 文案与断言不符会误导排障。
+        assert_eq!(e.code(), code::INTERNAL, "凭据断言后仍须是 50000");
     }
 
     #[tokio::test]
@@ -920,10 +993,21 @@ mod tests {
     /// 而 `gettoken` 是本实现里唯一有「打爆企微频控」风险的地方——`SETEX` 的
     /// TTL 单位、cache key 前缀、读命中短路任一处写错，测试全绿也发现不了，
     /// 上线表现是「每次登录都换 token」→ 企微频控 → 40106。
+    ///
+    /// 2026-09-29（review 第 3 轮 N1）：**无 Redis 时安静跳过**（`eprintln!` 提示 +
+    /// 提前 return），不再把 `cargo test --lib` 变成必须起 redis-test 容器的硬依赖。
+    /// 有 Redis 时下方 5 条断言**全部真实执行**，末尾会打「Y2 缓存测试已执行」标记。
     #[tokio::test]
     async fn gettoken_is_cached_in_redis_and_reissued_after_invalidate() {
         let srv = MockWeComServer::start().await;
-        let (client, _cfg) = client_for_redis(&srv.base_url).await;
+        let Some((client, _cfg)) = client_for_redis(&srv.base_url).await else {
+            eprintln!(
+                "[跳过] Y2 access_token 缓存测试：无可用 Redis —— 该测试需要真 Redis \
+                 （默认 redis-test:6380，可用 TEST_REDIS_URL 覆盖），\
+                 本次 read/write/invalidate 三条路径未被覆盖"
+            );
+            return;
+        };
 
         // 第 1 次：缓存空 → 真打企微 gettoken
         client
@@ -944,14 +1028,25 @@ mod tests {
         );
         assert_eq!(srv.code2session_calls(), 2, "jscode2session 每次都该被调");
 
-        // 手动 DEL 缓存 → 第 3 次必须重新换取
-        let pool = hsh_erp_test_support::test_redis_pool().await;
-        del_token_cache(&pool).await;
+        // 手动 DEL 缓存 → 第 3 次必须重新换取（invalidate 路径）
+        let pool = match try_redis_pool().await {
+            Some(p) => p,
+            None => {
+                eprintln!("[跳过] Y2 access_token 缓存测试：第 3 步前 Redis 掉线");
+                return;
+            }
+        };
+        assert!(
+            del_token_cache(&pool).await,
+            "测试中途 Redis 掉线，invalidate 路径未被覆盖"
+        );
         client
             .code_to_session("code-3")
             .await
             .expect("第 3 次应成功");
         assert_eq!(srv.gettoken_calls(), 2, "缓存被删后应重新换取 token");
+
+        eprintln!("[已执行] Y2 access_token 缓存测试：read / write / invalidate 三条路径断言全部通过");
     }
 
     /// `token_cache_key` 的字面量契约：格式错会让不同 corpid 串号 / 缓存永不命中。

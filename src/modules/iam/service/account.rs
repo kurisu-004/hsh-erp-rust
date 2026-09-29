@@ -620,11 +620,17 @@ impl AccountService {
     /// 该 user 当前**没有**活跃绑定时重复 DELETE → 成功（`Ok(vec![])`）。
     /// 有多行绑定时全部软删（解绑账号 = 该账号的所有企业微信身份一并失效）。
     ///
-    /// ## 返回值语义（2026-09-29 修，review 第 1 轮 B3）
-    /// 返回的是**软删之后**的行快照：`version` 已 +1（与 SQL 的
-    /// `version = version + 1` 一致），`created_at` 保持原值。初版直接推入删除
-    /// **前**读到的行，`version` 是旧值——将来若有基于 version 的写端点
-    /// （例如「改绑到别的 userid」）消费这个字段，会差一。
+    /// ## 返回值语义（2026-09-29 修，review 第 1 轮 B3；第 3 轮 N4 校正措辞）
+    /// 逐行复核后确认：`WxIdentityOut`（`vo/account.rs`）只有 6 个字段
+    /// （`id` / `corp_id` / `wx_user_id` / `user_id` / `version` / `created_at`），
+    /// `to_wx_identity_out` 也只映射这 6 个。因此下面复刻出来的
+    /// `deleted_at` / `updated_at` / `updated_by` **未纳入 VO，不会出现在 HTTP
+    /// 响应里**（初版注释称「返回软删之后的行快照」，措辞夸大，已校正）。
+    ///
+    /// 真正在响应中生效的只有 `version`：已修正为**软删后的值**（= 旧值 + 1，
+    /// 与 SQL 的 `version = version + 1` 一致）。初版直接推入删除**前**读到的行，
+    /// `version` 是旧值——将来若有基于 version 的写端点（例如「改绑到别的
+    /// userid」）消费这个字段，会差一。`created_at` 保持原值（软删不改它）。
     pub async fn unbind_wx_identity(
         &self,
         conn: &mut PgConnection,
@@ -655,10 +661,22 @@ impl AccountService {
                 return Err(version_conflict());
             }
             // 复刻 soft_delete 的 SQL 写后态（version +1 / deleted_at = when /
-            // updated_* = 本次操作者），保证返回给调用方的 version 是「删除后的值」。
+            // updated_* = 本次操作者）。其中**只有 `version` 会经 `to_wx_identity_out`
+            // 进入 VO / HTTP 响应**（`deleted_at` / `updated_*` 被 VO 丢弃，见上方
+            // 「返回值语义」），保留其余三列是为了让这里的结构体字面量与 SQL 的
+            // 写入列一一对应、便于日后 VO 扩字段时直接生效。
+            //
             // 之所以在 service 层复刻而不是让 SQL `RETURNING`：soft_delete 的返回
             // 类型是 `u64`（影响行数），service 用它判乐观锁冲突；为顺带取行改成
             // 返回结构体反而会模糊「影响行数」这个主语义，且要多一条 .sqlx 元数据。
+            //
+            // ⚠️ **漂移风险（2026-09-29 review 第 3 轮 N4 登记）**：这是一处
+            // **手工复刻**，编译器拦不住。若将来改动
+            // `WxIdentityRepo::soft_delete`（`modules/wx/repo.rs`）的写入列
+            // （例如多加一列 `last_unbind_at`、或把 `version = version + 1` 改成
+            // 别的算法），**必须同步修改这里**，否则返回值会静默失真。
+            // 触发同步的两条判据：① soft_delete 的 `SET` 子句增删列；
+            // ② `version` 的算法变化。
             out.push(to_wx_identity_out(WxIdentity {
                 version: r.version + 1,
                 updated_at: when,
