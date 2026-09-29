@@ -293,10 +293,20 @@ impl CosClient for NoopOpenDal {
     }
 
     async fn copy_object(&self, src_key: &str, dst_key: &str) -> Result<(), AppError> {
-        self.op.copy(src_key, dst_key).await.map_err(|e| {
+        // 2026-09-29 扁平化修复：OpenDAL Memory backend 不支持原生 copy
+        // （`op.copy` 返回 Unsupported），改用 read + write 手动等价。
+        // 仅 NoopOpenDal 走到（生产 OpenDalCos 走 COS 服务端 PUT copy-object），
+        // 故不影响真实 COS 行为。
+        let bytes = self.op.read(src_key).await.map_err(|e| {
             AppError::biz(
                 code::BIZ_PART_FILE_UPLOAD_FAILED,
-                format!("NoopOpenDal copy_object 失败: {e}"),
+                format!("NoopOpenDal copy_object read src 失败 (src={src_key:?}): {e}"),
+            )
+        })?;
+        self.op.write(dst_key, bytes).await.map_err(|e| {
+            AppError::biz(
+                code::BIZ_PART_FILE_UPLOAD_FAILED,
+                format!("NoopOpenDal copy_object write dst 失败 (dst={dst_key:?}): {e}"),
             )
         })?;
         Ok(())

@@ -2035,6 +2035,7 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
                     original_filename: "first.pdf".into(),
                     file_size: 1024,
                     content_type: "application/pdf".into(),
+                    ext: None, // 2026-09-29 新增字段
                 }),
                 model3d_file: None,
             },
@@ -2056,6 +2057,7 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
                     original_filename: "second.pdf".into(),
                     file_size: 1024,
                     content_type: "application/pdf".into(),
+                    ext: None, // 2026-09-29 新增字段
                 }),
                 model3d_file: None,
             },

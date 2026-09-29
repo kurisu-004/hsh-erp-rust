@@ -247,7 +247,10 @@ impl PartService {
         // | absent      | false              | Part（兼容旧 caller）|
         // | absent      | true / absent      | All               |
         // | 其它非空    | 任意               | 40001 VALIDATION_ERROR |
-        let mode = match (query.row_type.as_deref(), query.include_assemblies.unwrap_or(true)) {
+        let mode = match (
+            query.row_type.as_deref(),
+            query.include_assemblies.unwrap_or(true),
+        ) {
             (Some("PART"), _) => RowMode::Part,
             (Some("ASSEMBLY"), _) => RowMode::Assembly,
             (None, false) => RowMode::Part,
@@ -269,9 +272,7 @@ impl PartService {
             RowMode::Assembly => {
                 Self::list_parts_assembly_only(repo, query, limit, offset, current).await
             }
-            RowMode::All => {
-                Self::list_parts_all_merged(repo, query, limit, offset, current).await
-            }
+            RowMode::All => Self::list_parts_all_merged(repo, query, limit, offset, current).await,
         }
     }
 
@@ -369,8 +370,7 @@ impl PartService {
         };
         let asm_rows: Vec<TAssembly> =
             AssemblyRepo::list_with_filters(repo.conn_mut(), &assembly_filters).await?;
-        let total =
-            AssemblyRepo::count_with_filters(repo.conn_mut(), &assembly_filters).await?;
+        let total = AssemblyRepo::count_with_filters(repo.conn_mut(), &assembly_filters).await?;
 
         // 一次性拉子件计数（GROUP BY assembly_id）
         let asm_ids: Vec<i64> = asm_rows.iter().map(|a| a.id).collect();
@@ -426,13 +426,23 @@ impl PartService {
         offset: i64,
         _current: &CurrentUser,
     ) -> Result<PartListOut, AppError> {
-        let (sort_by_raw, sort_dir, customer_ids, statuses_owned, locations_owned, holder_ids_owned) =
-            Self::parse_list_filters(query, &mut repo).await?;
+        let (
+            sort_by_raw,
+            sort_dir,
+            customer_ids,
+            statuses_owned,
+            locations_owned,
+            holder_ids_owned,
+        ) = Self::parse_list_filters(query, &mut repo).await?;
         // ALL 模式 sort 键：t_part / t_assembly 共有列交集。SERIAL_NO 不在
         // t_assembly 上 → 降级 CREATED_AT（见 crud.md 行类型合并规则备注）。
         let sort_by: &'static str = match sort_by_raw.as_str() {
-            "CREATED_AT" | "UPDATED_AT" | "PLANNED_DELIVERY_DATE" | "REQUEST_DATE"
-            | "DRAWING_NO" | "NAME" => match sort_by_raw.as_str() {
+            "CREATED_AT"
+            | "UPDATED_AT"
+            | "PLANNED_DELIVERY_DATE"
+            | "REQUEST_DATE"
+            | "DRAWING_NO"
+            | "NAME" => match sort_by_raw.as_str() {
                 "CREATED_AT" => "CREATED_AT",
                 "UPDATED_AT" => "UPDATED_AT",
                 "PLANNED_DELIVERY_DATE" => "PLANNED_DELIVERY_DATE",
@@ -528,18 +538,16 @@ impl PartService {
         let asc = sort_dir.eq_ignore_ascii_case("ASC");
         all_items.sort_by(|a, b| {
             let ord = match sort_by {
-                    "UPDATED_AT" => {
-                        let (x, y) = (a.updated_at, b.updated_at);
-                        x.cmp(&y)
-                    }
-                    "PLANNED_DELIVERY_DATE" => a
-                        .planned_delivery_date
-                        .cmp(&b.planned_delivery_date),
-                    "REQUEST_DATE" => a.request_date.cmp(&b.request_date),
-                    "DRAWING_NO" => a.drawing_no.cmp(&b.drawing_no),
-                    "NAME" => a.name.cmp(&b.name),
-                    _ => a.created_at.cmp(&b.created_at), // CREATED_AT / 降级
-                };
+                "UPDATED_AT" => {
+                    let (x, y) = (a.updated_at, b.updated_at);
+                    x.cmp(&y)
+                }
+                "PLANNED_DELIVERY_DATE" => a.planned_delivery_date.cmp(&b.planned_delivery_date),
+                "REQUEST_DATE" => a.request_date.cmp(&b.request_date),
+                "DRAWING_NO" => a.drawing_no.cmp(&b.drawing_no),
+                "NAME" => a.name.cmp(&b.name),
+                _ => a.created_at.cmp(&b.created_at), // CREATED_AT / 降级
+            };
             // 统一 sort 方向
             let primary = if asc { ord } else { ord.reverse() };
             // 二级：id DESC（稳定，与单段 repo 层排序保持一致）
@@ -567,17 +575,7 @@ impl PartService {
     async fn parse_list_filters<R: PartRepoTrait>(
         query: &PartListQuery,
         repo: &mut R,
-    ) -> Result<
-        (
-            String,
-            String,
-            Vec<i64>,
-            Vec<String>,
-            Vec<String>,
-            Vec<i64>,
-        ),
-        AppError,
-    > {
+    ) -> Result<(String, String, Vec<i64>, Vec<String>, Vec<String>, Vec<i64>), AppError> {
         let sort_by = [
             "CREATED_AT",
             "UPDATED_AT",
@@ -634,31 +632,28 @@ impl PartService {
                 .split(',')
                 .filter(|x| !x.is_empty())
                 .map(|x| {
-                    x.trim().parse::<i64>().map_err(|_| {
-                        AppError::validation(format!("holder_ids 含非法雪花 ID: {x}"))
-                    })
+                    x.trim()
+                        .parse::<i64>()
+                        .map_err(|_| AppError::validation(format!("holder_ids 含非法雪花 ID: {x}")))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
             _ => Vec::new(),
         };
-        Ok((sort_by, sort_dir, customer_ids, statuses, locations, holder_ids))
+        Ok((
+            sort_by,
+            sort_dir,
+            customer_ids,
+            statuses,
+            locations,
+            holder_ids,
+        ))
     }
 
     /// ASSEMBLY-only 分支专用解析（不走 status 复合）。
     async fn parse_list_filters_for_assembly<R: PartRepoTrait>(
         query: &PartListQuery,
         repo: &mut R,
-    ) -> Result<
-        (
-            String,
-            String,
-            Vec<i64>,
-            Vec<String>,
-            Vec<String>,
-            Vec<i64>,
-        ),
-        AppError,
-    > {
+    ) -> Result<(String, String, Vec<i64>, Vec<String>, Vec<String>, Vec<i64>), AppError> {
         let (sort_by, sort_dir, customer_ids, _statuses, _locations, _holder_ids) =
             Self::parse_list_filters(query, repo).await?;
         // assembly 域不消费 holder_ids / locations（t_assembly 没有 batch 派
@@ -764,8 +759,8 @@ impl PartService {
             location: None,
             holder_name: None,
             row_type: Some("ASSEMBLY".to_string()),
-            has_children: false,           // 由 caller 用 child_count 覆盖
-            child_count: None,             // 由 caller 用 fetch_child_counts 覆盖
+            has_children: false, // 由 caller 用 child_count 覆盖
+            child_count: None,   // 由 caller 用 fetch_child_counts 覆盖
         }
     }
 
@@ -1149,12 +1144,11 @@ impl PartService {
 
         let sha = hash_bytes(bytes);
         let new_file_id = snowflake.next_id();
-        // 2026-09-11 改为 Python 同款 CAS key：`{prefix}{kind}/{id}/{KIND}/{sha16}_{safe_name}`
+        // 2026-09-29 扁平化：CAS key 模板五段→两段
+        // `{prefix}{sha16}_{safe_filename}`，owner/kind 信息已在 t_part_file
+        // DB 行外键索引。prefix 仍走 cfg.upload_prefix 兼容 .env 旧值。
         let real_key = crate::util::cos_key::build_cas_key(
             &state.config.cos.upload_prefix,
-            "part",
-            part_id,
-            kind,
             &sha,
             original_filename,
         );

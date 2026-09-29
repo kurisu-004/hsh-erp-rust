@@ -159,6 +159,16 @@ pub struct CosConfig {
     /// 整体作为 virtual-host 第一段。
     pub endpoint: String,
     pub scheme: String,
+    /// COS 桶内上传前缀（保留兼容 .env 旧值）。
+    ///
+    /// 2026-09-29 扁平化：CAS key 模板已从五段简化为两段
+    /// `{prefix}{sha16}_{safe_filename}`，新模板的 prefix 仅在新 key 写入路径
+    /// (`util::cos_key::build_cas_key`) 使用一次。后续会切到 bin 迁移历史 DB
+    /// 行的 object_key 后彻底删除（迁移 bin 见 §cos_key_migrate.rs）。
+    ///
+    /// 当前阶段：保留 `upload_prefix` 字段以兼容 .env / tests 的 `uploads` 或
+    /// `uploads/` 旧值不报错，标记 `dead_code` 允许编译器跳过 unused 警告。
+    #[allow(dead_code)]
     pub upload_prefix: String,
     pub presign_expire_seconds: u32,
     pub max_file_size: usize,
@@ -474,34 +484,34 @@ impl AppConfig {
             // env 沿用既有命名（3 个 compose 文件已带 `PYTHON_BACKEND_BASE_URL=${...:-http://backend:8000}`），
             // 不重命名。设置 `PYTHON_BACKEND_BASE_URL` 即 `enabled=true`，未设 → Noop。
             python_backend: {
-                    let base_url = env_or("PYTHON_BACKEND_BASE_URL", "");
-                    let enabled = !base_url.trim().is_empty()
-                        && std::env::var("PYTHON_BACKEND_BASE_URL").is_ok();
-                    PythonBackendConfig {
-                        base_url,
-                        timeout_ms: env_parse("PYTHON_STS_TIMEOUT_MS", 10_000u64)?,
-                        enabled,
-                    }
-                },
+                let base_url = env_or("PYTHON_BACKEND_BASE_URL", "");
+                let enabled =
+                    !base_url.trim().is_empty() && std::env::var("PYTHON_BACKEND_BASE_URL").is_ok();
+                PythonBackendConfig {
+                    base_url,
+                    timeout_ms: env_parse("PYTHON_STS_TIMEOUT_MS", 10_000u64)?,
+                    enabled,
+                }
+            },
             // 2026-09-29 新增：企业微信小程序登录（自建应用 jscode2session）。
             // 刻意用 `env_or(.., "")` 而非 `env_required`：未配置 → enabled=false，
             // 后端照常启动，wx-login 干净返 40109（详见 WeComConfig doc 的理由段）。
             wecom: {
-                    let corpid = env_or("WECOM_CORPID", "");
-                    let corpsecret = env_or("WECOM_CORPSECRET", "");
-                    // `enabled` 只看「两者都非空」；不 trim 后再判，避免
-                    // " " 这种纯空格占位被判为已配置（打企微接口必失败）。
-                    WeComConfig {
-                        enabled: !corpid.trim().is_empty() && !corpsecret.trim().is_empty(),
-                        corpid,
-                        corpsecret,
-                        api_base: env_or("WECOM_API_BASE", "https://qyapi.weixin.qq.com"),
-                        // 仅兜底：正常路径用企微返回的 expires_in - 300（安全余量），
-                        // 只有企微没回 expires_in 时才用这个值
-                        token_ttl_seconds: env_parse("WECOM_TOKEN_TTL", 6000u64)?,
-                        http_timeout_ms: env_parse("WECOM_HTTP_TIMEOUT_MS", 5000u64)?,
-                    }
-                },
+                let corpid = env_or("WECOM_CORPID", "");
+                let corpsecret = env_or("WECOM_CORPSECRET", "");
+                // `enabled` 只看「两者都非空」；不 trim 后再判，避免
+                // " " 这种纯空格占位被判为已配置（打企微接口必失败）。
+                WeComConfig {
+                    enabled: !corpid.trim().is_empty() && !corpsecret.trim().is_empty(),
+                    corpid,
+                    corpsecret,
+                    api_base: env_or("WECOM_API_BASE", "https://qyapi.weixin.qq.com"),
+                    // 仅兜底：正常路径用企微返回的 expires_in - 300（安全余量），
+                    // 只有企微没回 expires_in 时才用这个值
+                    token_ttl_seconds: env_parse("WECOM_TOKEN_TTL", 6000u64)?,
+                    http_timeout_ms: env_parse("WECOM_HTTP_TIMEOUT_MS", 5000u64)?,
+                }
+            },
         })
     }
 }
@@ -613,8 +623,8 @@ fn load_public_keys_dir(dir: &str) -> Result<BTreeMap<String, DecodingKey>> {
                 "JWT_PUBLIC_KEYS_DIR={dir} 含重复 kid={stem:?}（文件名去后缀必须唯一）"
             ));
         }
-        let pem_bytes = fs::read(&path)
-            .with_context(|| format!("读取 PEM 文件失败 {}", path.display()))?;
+        let pem_bytes =
+            fs::read(&path).with_context(|| format!("读取 PEM 文件失败 {}", path.display()))?;
         let key = DecodingKey::from_rsa_pem(&pem_bytes).with_context(|| {
             format!(
                 "PEM 解析失败 {}（确认是 RS256 公钥 SPKI 格式）",

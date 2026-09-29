@@ -47,8 +47,8 @@ use serde::Deserialize;
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::cnc_program::vo::{CncPairListOut, CncPairOut};
-use crate::modules::part_file::vo::PartFileWithUrlOut;
 use crate::modules::part_file::handler::DeletePartFileRequest;
+use crate::modules::part_file::vo::PartFileWithUrlOut;
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -138,15 +138,7 @@ pub async fn upload_cnc_pair(
     let out = state
         .cnc_program_service
         .upload_cnc_pair(
-            &mut *tx,
-            part_id,
-            g_bytes,
-            &g_name,
-            &g_ct,
-            s_bytes,
-            &s_name,
-            &s_ct,
-            &current,
+            &mut *tx, part_id, g_bytes, &g_name, &g_ct, s_bytes, &s_name, &s_ct, &current,
         )
         .await?;
     tx.commit().await?;
@@ -180,7 +172,13 @@ pub async fn get_cnc_program_download_url(
     let mut tx = state.pool.begin().await?;
     let out = state
         .part_file_service
-        .get_file_with_url(&mut *tx, state.cos.clone(), file_id, &current)
+        .get_file_with_url(
+            &mut *tx,
+            state.cos.clone(),
+            &state.config.cos.upload_prefix,
+            file_id,
+            &current,
+        )
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
@@ -197,7 +195,13 @@ pub async fn get_cnc_program_content(
     let mut tx = state.pool.begin().await?;
     let out = state
         .part_file_service
-        .get_file_content(&mut *tx, state.cos.clone(), file_id, &current)
+        .get_file_content(
+            &mut *tx,
+            state.cos.clone(),
+            &state.config.cos.upload_prefix,
+            file_id,
+            &current,
+        )
         .await?;
     tx.commit().await?;
     let resp = Response::builder()

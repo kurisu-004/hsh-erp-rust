@@ -54,11 +54,12 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part_file::dto::{PartFileListQuery, validate};
-use crate::modules::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy;
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepoTrait, hash_bytes};
+use crate::modules::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
 use crate::shared::error::{AppError, code};
+use crate::util::cos_key;
 
 pub struct PartFileService {
     snowflake: Arc<SnowflakeIdGenerator>,
@@ -133,23 +134,14 @@ impl PartFileService {
 
         // 5. SHA-256 → CAS 去重（撞唯一索引 → 21108 DUPLICATE）
         let sha = hash_bytes(&bytes);
-        if let Some(existing) =
-            repo.get_by_owner_kind_sha(owner_id, kind, &sha).await?
-        {
+        if let Some(existing) = repo.get_by_owner_kind_sha(owner_id, kind, &sha).await? {
             // CAS 命中：跳过 COS PUT，直接复用已有记录（返回 id / object_key）
             return Ok(Self::render_out(&existing, owner_kind));
         }
 
-        // 6. 上传 COS（key 模板：`{owner_kind.to_lowercase()}/{owner_id}/{kind}/{sha}_{safe_filename}`）
-        let safe_filename = sanitize_filename(original_filename);
-        let object_key = format!(
-            "{}/{}/{}/{}_{}",
-            owner_kind.to_lowercase(),
-            owner_id,
-            kind,
-            &sha[..16],
-            safe_filename,
-        );
+        // 6. 上传 COS（2026-09-29 扁平化：key 模板五段→两段 `{prefix}{sha16}_{safe_filename}`，
+        //    owner_kind/owner_id/KIND 信息已在 t_part_file DB 行外键索引，不再写进 key）。
+        let object_key = cos_key::build_cas_key("", &sha, original_filename);
         self.cos
             .put_object(&object_key, bytes.clone(), content_type)
             .await?;
@@ -169,22 +161,19 @@ impl PartFileService {
             content_sha256: Some(&sha),
             created_by: current.id,
         };
-        let id = repo
-            .create_part_file(nf)
-            .await
-            .map_err(|e| match e {
-                sqlx::Error::Database(db) => {
-                    if db.code().as_deref() == Some("23505") {
-                        AppError::biz(
-                            code::BIZ_PART_FILE_DUPLICATE,
-                            format!("owner {owner_id} / {kind} / sha={} 撞唯一索引", &sha[..16]),
-                        )
-                    } else {
-                        AppError::from(sqlx::Error::Database(db))
-                    }
+        let id = repo.create_part_file(nf).await.map_err(|e| match e {
+            sqlx::Error::Database(db) => {
+                if db.code().as_deref() == Some("23505") {
+                    AppError::biz(
+                        code::BIZ_PART_FILE_DUPLICATE,
+                        format!("owner {owner_id} / {kind} / sha={} 撞唯一索引", &sha[..16]),
+                    )
+                } else {
+                    AppError::from(sqlx::Error::Database(db))
                 }
-                other => AppError::from(other),
-            })?;
+            }
+            other => AppError::from(other),
+        })?;
 
         // 8. 读回（include_deleted=true 兜底 INSERT 可见性）
         let row = repo
@@ -233,11 +222,18 @@ impl PartFileService {
     }
 
     /// 单条详情 + 预签下载 URL。
+    ///
+    /// 2026-09-29 扁平化：DB 历史行 object_key 仍是五段（legacy），但 COS 桶内
+    /// 真实对象可能按新模板存储（同一文件内容 sha16 一致 → 新模板 key 一致）。
+    /// 读端点 fallback：先尝试 `head_object(db_key)`，若 NoSuch 且 db_key 可被
+    /// `parse_legacy_key` 解析，则按新模板重写 key 再 head 一次；若新模板 key
+    /// 存在则用其生成 presigned URL（保证浏览器拿到的 URL 在桶内有效）。
     #[allow(clippy::too_many_arguments)]
     pub async fn get_file_with_url<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
         cos: Arc<dyn CosClient>,
+        cfg_upload_prefix: &str,
         file_id: i64,
         current: &CurrentUser,
     ) -> Result<PartFileWithUrlOut, AppError> {
@@ -247,16 +243,15 @@ impl PartFileService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let row = repo
-            .get_by_id(file_id, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_FILE_NOT_FOUND,
-                    format!("part_file {file_id} 不存在"),
-                )
-            })?;
-        let url = cos.presigned_get_url(&row.object_key, 3600).await?;
+        let row = repo.get_by_id(file_id, false).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_FILE_NOT_FOUND,
+                format!("part_file {file_id} 不存在"),
+            )
+        })?;
+        let effective_key =
+            Self::resolve_effective_key(cos.as_ref(), cfg_upload_prefix, &row.object_key).await?;
+        let url = cos.presigned_get_url(&effective_key, 3600).await?;
         Ok(PartFileWithUrlOut {
             id: row.id.to_string(),
             kind: row.kind,
@@ -269,6 +264,39 @@ impl PartFileService {
             download_url: url,
             url_expires_in_seconds: 3600,
         })
+    }
+
+    /// 2026-09-29 新增：解析 `db_object_key` 的「有效 COS key」。
+    ///
+    /// 逻辑：
+    /// 1. 先 `head_object(db_key)` —— 存在 → 直接返回 `db_key`
+    /// 2. 不存在 + `parse_legacy_key(db_key)` 成功 → 重写成新模板 `new_key`，
+    ///    `head_object(new_key)` —— 存在则返回 `new_key`
+    /// 3. 都不存在 → 返回 `db_key`（调用方后续 get_object 会拿到 NoSuch，由 handler 转 21114）
+    ///
+    /// 设计取舍：head 调用至多 2 次（db_key + 一次 legacy rewrite）；生产冷数据
+    /// 95%+ 应在第 1 次命中。完全 fallback 失败时返回 db_key（保留原行为），不让
+    /// 迁移 bin 之外的因素阻断生产读路径。
+    pub async fn resolve_effective_key(
+        cos: &dyn CosClient,
+        cfg_upload_prefix: &str,
+        db_object_key: &str,
+    ) -> Result<String, AppError> {
+        if cos.head_object(db_object_key).await.is_ok() {
+            return Ok(db_object_key.to_string());
+        }
+        if let Some(lk) = cos_key::parse_legacy_key(db_object_key) {
+            let new_key = cos_key::rewrite_legacy_to_new(cfg_upload_prefix, &lk);
+            if cos.head_object(&new_key).await.is_ok() {
+                tracing::info!(
+                    db_key = %db_object_key,
+                    new_key = %new_key,
+                    "part_file 读端点 legacy → 新模板 fallback 命中"
+                );
+                return Ok(new_key);
+            }
+        }
+        Ok(db_object_key.to_string())
     }
 
     /// 校验 owner 存在性（polymorphic，走 trait helper）。
@@ -327,27 +355,8 @@ impl PartFileService {
     }
 }
 
-/// 把 client-supplied filename 清洗为 COS object key 安全字符串：
-/// - 保留 ASCII 字母 / 数字 / `.` / `-` / `_`
-/// - 其它字符（含中文 / 空格）替换为 `_`
-/// - 长度上限 80 字符（与 Python `re.sub(r'[^\w.-]', '_', name)[:80]` 对齐）
-fn sanitize_filename(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.len() > 80 {
-        out.truncate(80);
-    }
-    if out.is_empty() {
-        out.push_str("file");
-    }
-    out
-}
+// 2026-09-29 扁平化：旧的本地 `sanitize_filename` 函数 + 其单元测试已删除，
+// 统一走 `util::cos_key::safe_filename` 单一真相源。
 
 /// 公开给装配体 upload-files 端点用的辅助：列出某 owner 的 part_file（不限定 kind）。
 #[allow(dead_code)]
@@ -452,20 +461,13 @@ impl PartFileService {
             ));
         }
 
-        // 5. 派生 CAS key（复用 build_cas_key 模板）
+        // 5. 派生 CAS key（2026-09-29 扁平化：模板五段→两段）
         let ext = policy::ext_of(original_filename)
             .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
         let file_type = policy::file_type_for_ext(&ext).ok_or_else(|| {
             AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("未知扩展名 {ext}"))
         })?;
-        let cas_key = crate::util::cos_key::build_cas_key(
-            cfg_upload_prefix,
-            "part",
-            owner_id,
-            kind,
-            sha256,
-            original_filename,
-        );
+        let cas_key = cos_key::build_cas_key(cfg_upload_prefix, sha256, original_filename);
 
         // 6. copy_object（IO，无 DB）
         cos.copy_object(tmp_key, &cas_key).await.map_err(|e| {
@@ -504,10 +506,7 @@ impl PartFileService {
         // （`uk_t_part_file_single` 部分唯一约束）。
         let mut repo: &mut sqlx::PgConnection = &mut tx;
         let _ = PartFileRepoTrait::soft_delete_active_by_part_kind(
-            &mut repo,
-            owner_id,
-            current.id,
-            kind,
+            &mut repo, owner_id, current.id, kind,
         )
         .await?;
         let new_id = snowflake.next_id();
@@ -559,10 +558,14 @@ pub struct PartFileContent {
 
 impl PartFileService {
     /// `GET /api/v2/part-files/{file_id}/content`。
+    ///
+    /// 2026-09-29 扁平化：与 `get_file_with_url` 同款 legacy→新模板 fallback，
+    /// 详见 `resolve_effective_key`。
     pub async fn get_file_content<R: PartFileRepoTrait>(
         &self,
         mut repo: R,
         cos: Arc<dyn CosClient>,
+        cfg_upload_prefix: &str,
         file_id: i64,
         current: &CurrentUser,
     ) -> Result<PartFileContent, AppError> {
@@ -572,16 +575,15 @@ impl PartFileService {
             Role::Inspector,
             Role::CncProgrammer,
         ])?;
-        let row = repo
-            .get_by_id(file_id, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_FILE_NOT_FOUND,
-                    format!("part_file {file_id} 不存在"),
-                )
-            })?;
-        let bytes = cos.get_object(&row.object_key).await?;
+        let row = repo.get_by_id(file_id, false).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_FILE_NOT_FOUND,
+                format!("part_file {file_id} 不存在"),
+            )
+        })?;
+        let effective_key =
+            Self::resolve_effective_key(cos.as_ref(), cfg_upload_prefix, &row.object_key).await?;
+        let bytes = cos.get_object(&effective_key).await?;
         Ok(PartFileContent {
             bytes,
             content_type: Some(row.content_type),
@@ -605,15 +607,12 @@ impl PartFileService {
         version: i32,
         current: &CurrentUser,
     ) -> Result<String, AppError> {
-        let row = repo
-            .get_by_id(file_id, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_FILE_NOT_FOUND,
-                    format!("part_file {file_id} 不存在"),
-                )
-            })?;
+        let row = repo.get_by_id(file_id, false).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_FILE_NOT_FOUND,
+                format!("part_file {file_id} 不存在"),
+            )
+        })?;
         let kind = row.kind.clone();
         let object_key = row.object_key.clone();
         // 按 kind 派生权限
@@ -653,32 +652,6 @@ impl PartFileService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_filename_keeps_safe_chars() {
-        assert_eq!(sanitize_filename("drawing.pdf"), "drawing.pdf");
-        assert_eq!(sanitize_filename("DRAW-001.PDF"), "DRAW-001.PDF");
-        assert_eq!(sanitize_filename("my_drawing_v2.pdf"), "my_drawing_v2.pdf");
-    }
-
-    #[test]
-    fn sanitize_filename_replaces_unsafe() {
-        // 空格 / 中文 → _
-        assert_eq!(sanitize_filename("图纸 v2.pdf"), "___v2.pdf");
-        assert_eq!(sanitize_filename("a b/c.pdf"), "a_b_c.pdf");
-    }
-
-    #[test]
-    fn sanitize_filename_truncates_long_names() {
-        let long = "a".repeat(200);
-        assert_eq!(sanitize_filename(&long).len(), 80);
-    }
-
-    #[test]
-    fn sanitize_filename_empty_fallback() {
-        assert_eq!(sanitize_filename(""), "file");
-        // 中文字符被替换为 `_`（不是 fallback）：保留断言验证替换逻辑
-        assert_eq!(sanitize_filename("中文"), "__");
-    }
+    // 2026-09-29 扁平化：sanitize_filename 已迁至 util::cos_key::safe_filename，
+    // 其单元测试也迁至 util::cos_key::tests。本 mod 暂时无 unit test 残留。
 }

@@ -150,9 +150,11 @@ async fn head_object_nonexistent_returns_error() {
 
 #[tokio::test]
 async fn copy_object_creates_dst_with_same_content() {
-    // 2026-09-20 spike 发现：OpenDAL Memory backend 不支持 copy（Unsupported）。
+    // 2026-09-20 spike 发现：OpenDAL Memory backend 不支持原生 copy（Unsupported）。
     // 真 S3 backend 上 copy 走服务端 PUT copy-object，spike 无真凭据未实测。
-    // 本测试断言：NoopOpenDal（Memory）调用 copy_object 必须返回 Err，**不**绕过。
+    // 2026-09-29 修复：NoopOpenDal::copy_object 改为 read + write 手动等价
+    // （仅 NoopOpenDal 走到，生产 OpenDalCos 走 COS 服务端 PUT copy-object 不受影响）。
+    // 本测试断言：NoopOpenDal（Memory）调用 copy_object 必须 Ok，dst 内容与 src 一致。
     let _pool = test_pool().await;
     let _fx = load_cos_opendal_fixture(&_pool).await;
     let client = fresh_client();
@@ -166,9 +168,13 @@ async fn copy_object_creates_dst_with_same_content() {
         .unwrap();
     let result = client.copy_object(src, dst).await;
     assert!(
-        result.is_err(),
-        "Memory backend copy 必须返回 Err（Unsupported），实际 Ok"
+        result.is_ok(),
+        "Memory backend copy 走 read+write fallback 必须返回 Ok，实际 Err: {:?}",
+        result.err()
     );
+    // 验证 dst 真的写入了 src 的内容
+    let got = client.get_object(dst).await.expect("dst 必须可读");
+    assert_eq!(got, body, "copy_object 后 dst 内容必须等于 src");
 }
 
 #[tokio::test]
@@ -289,10 +295,19 @@ async fn end_to_end_all_six_methods_on_fresh_namespace() {
     // 3. get
     let got = client.get_object(key).await.expect("get");
     assert_eq!(got, body);
-    // 4. copy（Memory backend 不支持，确认返回 Err 而非绕过）
+    // 4. copy（2026-09-29 修复后 NoopOpenDal 走 read+write fallback）
     let copy_dst = "spike/it/e2e/full_COPY.bin";
     let copy_result = client.copy_object(key, copy_dst).await;
-    assert!(copy_result.is_err(), "Memory backend copy 必须 Err");
+    assert!(
+        copy_result.is_ok(),
+        "NoopOpenDal copy_object fallback 必须 Ok，实际: {:?}",
+        copy_result.err()
+    );
+    let copy_got = client
+        .get_object(copy_dst)
+        .await
+        .expect("copy_dst 必须可读");
+    assert_eq!(copy_got, body, "copy_object 后内容必须等于 src");
     // 5. presign（NoopOpenDal 返回 local:// 占位，仅断言非空 + 含 key）
     let url = client.presigned_get_url(key, 60).await.expect("presign");
     assert!(url.contains(key));
@@ -336,10 +351,7 @@ fn test_jwt_pem_paths() -> (&'static str, &'static str) {
 
         // 目录：<tmp>/cos_opendal_test_pem_<uuid>/
         let tmp = std::env::temp_dir();
-        let dir_name = format!(
-            "cos_opendal_test_pem_{}",
-            uuid::Uuid::new_v4().simple()
-        );
+        let dir_name = format!("cos_opendal_test_pem_{}", uuid::Uuid::new_v4().simple());
         let dir = tmp.join(&dir_name);
         std::fs::create_dir_all(&dir).expect("create tmp pem dir");
 
@@ -350,9 +362,7 @@ fn test_jwt_pem_paths() -> (&'static str, &'static str) {
             .to_pkcs8_pem(LineEnding::LF)
             .expect("priv pem")
             .to_string();
-        let pub_pem = pub_key
-            .to_public_key_pem(LineEnding::LF)
-            .expect("pub pem");
+        let pub_pem = pub_key.to_public_key_pem(LineEnding::LF).expect("pub pem");
 
         std::fs::write(&priv_path, priv_pem.as_bytes()).expect("write priv pem");
         std::fs::write(&pub_path, pub_pem.as_bytes()).expect("write pub pem");
