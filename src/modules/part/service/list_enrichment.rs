@@ -11,9 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::batch::model::TPartBatch;
 use crate::modules::part::batch::repo::PartBatchRepo;
+use crate::modules::part::repo::PartRepoTrait;
 use crate::shared::error::AppError;
 
 /// 列表页「位置 / 持有人」派生（按 min-progress 活跃批次，跨 t_shelf /
@@ -36,7 +36,10 @@ use crate::shared::error::AppError;
 /// SQL 数：4 条（与页大小 N 无关）：
 /// 1. 一次性拉所有 part 的活跃批次（`list_active_by_part_ids`）
 ///    2-4. t_shelf / t_worker / t_outsource_company 各 1 条 `WHERE id = ANY(...)`
-pub(super) async fn enrich_part_list_with_location_and_holder<R: PartRepoTrait>(
+///
+/// 2026-09-29 升 `pub(crate)`：com::union_list 域 ALL 模式 PART 段 enrichment 复用。
+/// 函数体零变化；只是把可见性从 part 域内公开到 crate 内，避免重复实现 4 条 SQL 的派生逻辑。
+pub(crate) async fn enrich_part_list_with_location_and_holder<R: PartRepoTrait>(
     repo: &mut R,
     part_ids: &[i64],
 ) -> Result<HashMap<i64, (Option<String>, Option<String>)>, AppError> {

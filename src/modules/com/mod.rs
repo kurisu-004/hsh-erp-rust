@@ -4,6 +4,11 @@
 //! URL 一并迁移到 `/api/v2/com/*`。order 域后续再讨论，本任务不涉及。
 //!
 //! 路由风格保持不变：customer/applicant 各自定义 5 个标准 CRUD 端点。
+//!
+//! 2026-09-29 新增 `union_list` 子模块：跨 `t_part` + `t_assembly` 合并视图端点
+//! `GET /api/v2/com/union-list`，承担原 part 域三态 `row_type` 矩阵（ALL / PART
+//! / ASSEMBLY） + 修分页 bug（plan §1-3）。part 域回退到纯 `t_part WHERE
+//! assembly_id IS NULL` 查询（不再处理装配件）。
 
 use std::sync::Arc;
 
@@ -13,9 +18,11 @@ use crate::state::AppState;
 
 pub mod applicant;
 pub mod customer;
+pub mod union_list;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/customers", customer::router())
         .nest("/applicants", applicant::router())
+        .nest("/union-list", union_list::router())
 }

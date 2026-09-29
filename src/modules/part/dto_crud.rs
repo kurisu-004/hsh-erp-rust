@@ -155,7 +155,7 @@ pub struct PartUpdateRequest {
 
 // ===== List =====
 
-/// `GET /parts` 查询参数。
+/// `GET /parts` 查询参数（2026-09-29 简化：移除 `row_type` / `include_assemblies`）。
 ///
 /// `customer_id`：单值；service 层用 `expand_customer_id` 展开为 L1+L2 ids。
 /// `status` / `statuses`：单值 / 多值互不冲突；service 层二选一传入。
@@ -169,15 +169,10 @@ pub struct PartUpdateRequest {
 /// `sort_by` 白名单（CREATED_AT / UPDATED_AT / PLANNED_DELIVERY_DATE /
 /// REQUEST_DATE / SERIAL_NO / DRAWING_NO / NAME），其它退化为 `CREATED_AT`。
 ///
-/// 2026-09-28 新增：行类型筛选矩阵（前端零件一览页 rowType 下拉框）。
-///
-/// | `row_type`         | `include_assemblies` | 行为                                                 |
-/// |--------------------|----------------------|------------------------------------------------------|
-/// | `"PART"`           | 任意                 | 仅零件，`t_part WHERE assembly_id IS NULL`           |
-/// | `"ASSEMBLY"`       | 任意                 | 仅装配件，`t_assembly`（投影为 PartListItem 形态）    |
-/// | absent             | `true` / absent      | ALL：`t_part` UNION `t_assembly`，合并排序           |
-/// | absent             | `false`              | 仅零件（兼容内部 caller，例如 `/parts/pending-programming`）|
-/// | 其它非空字符串      | 任意                 | 40001 VALIDATION_ERROR                              |
+/// 2026-09-29 简化：原 `row_type` / `include_assemblies` 三态合并矩阵已下沉
+/// 到新端点 `GET /api/v2/com/union-list`（plan §1-3）。本端点（`GET /parts`）
+/// 只查 `t_part WHERE assembly_id IS NULL`，不再承担 ALL/ASSEMBLY 合并。需
+/// 三态筛选的 caller 切换到 `/com/union-list?row_type=ALL|PART|ASSEMBLY`。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PartListQuery {
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
@@ -201,16 +196,6 @@ pub struct PartListQuery {
     /// t_worker / t_outsource_company 任一匹配即命中）。
     #[serde(default)]
     pub holder_ids: Option<String>,
-    /// 2026-09-28 新增：行类型筛选。`Some("PART")` / `Some("ASSEMBLY")` / `None`(=ALL)。
-    /// 非法值 → `40001 VALIDATION_ERROR`（在 service 层 normalize 阶段校验）。
-    #[serde(default)]
-    pub row_type: Option<String>,
-    /// 2026-09-28 新增：是否合并装配件。仅 `row_type=None`（ALL）时生效：
-    /// - `Some(false)` 强制仅零件（兼容 `/parts/pending-programming` 等内部 caller）。
-    /// - `None` 默认 `true`（ALL 模式）。
-    /// - `row_type` 已设值时本字段被忽略（已强制 PART 或 ASSEMBLY）。
-    #[serde(default)]
-    pub include_assemblies: Option<bool>,
     #[serde(default)]
     pub sort_by: Option<String>,
     #[serde(default)]
