@@ -29,9 +29,11 @@ use std::sync::Arc;
 
 use crate::state::AppState;
 
-// 2026-09-15 followup-cleanup A8：part 维度文件路由集中处（cad-files / cnc-programs /
-// setup-sheets / cnc-pair / files）。`part::router()` 把 part_id 段 nest 到这个子路由。
-use crate::modules::part_file;
+// 2026-09-29 修复：移除 2026-09-15 followup-cleanup A8 的兼容 nest。
+// part 维度文件路由（cad-files / cnc-programs / setup-sheets / cnc-pair / files）
+// 仅通过 part_file 域 canonical 第二入口
+// `/api/v2/part-files/parts/{part_id}/<file>...` 对外暴露（见
+// `backend-rust/src/modules/part_file/handler.rs::router()`）。
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -142,10 +144,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/to-ship", post(handler::to_ship))
         .route("/{part_id}/to-inspection", post(handler::to_inspection))
         .route("/{part_id}/to-process", post(handler::to_process))
-        // ---- 2026-09-15 followup-cleanup A8：part 维度文件路由（cad-files / cnc-programs /
-        //      setup-sheets / cnc-pair / files）已迁出到 part_file::part_nested_router()，
-        //      在这里 nest 以保留历史 URL `/api/v2/parts/{part_id}/<file>...`。
+        // ---- 2026-09-29 修复：移除 2026-09-15 followup-cleanup A8 的兼容 nest。
+        //      part 维度文件路由（cad-files / cnc-programs / setup-sheets / cnc-pair / files）
+        //      仅通过 part_file 域 canonical 第二入口
+        //      `/api/v2/part-files/parts/{part_id}/<file>...` 对外暴露（per
+        //      backend-rust/src/modules/part_file/handler.rs::router() 注释）。
         // ---- 2026-09-16 M2-B 新增：直传 COS 链路 confirm 端点（POST /parts/{id}/files/confirm）----
         .route("/{part_id}/files/confirm", post(handler::confirm_part_file))
-        .nest("/{part_id}", part_file::handler::part_nested_router())
 }

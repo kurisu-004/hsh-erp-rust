@@ -223,7 +223,7 @@ impl AssemblyService {
     ///
     /// 复用 part_file 域 `list_files`（走 `part_file_repo::list_with_filters`
     /// `owner_kind='ASSEMBLY'`）；与 `PartFileService::list_files` 完全对齐。
-    /// 权限：4 角色全开放（与 `list_part_files_for_part` 一致）。
+    /// 权限：4 角色全开放（与 part_file 域 owner list 一致）。
     ///
     /// 设计意图：复用 service 层的 `part_file::PartFileListQuery` DTO，把
     /// `owner_kind="ASSEMBLY"` 与 `owner_id=asm.id` 写死，handler 仅透传

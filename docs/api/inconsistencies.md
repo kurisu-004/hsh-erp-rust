@@ -34,6 +34,7 @@
 | GET | `/api/v1/cnc-programs/{file_id}/download-url` | 下载 URL 签发 | ✅ 由 `part_file/{file_id}/url` 提供 |
 | GET | `/api/v1/cnc-programs/{file_id}/content` | 下载二进制 | ⚪ 当前未提供直下（走 COS 预签 URL） |
 | DELETE | `/api/v1/cnc-programs/{file_id}` | 删除 | ⚪ 当前未提供（part_file 域待补） |
+| GET/POST | `/api/v2/parts/{id}/cnc-programs`, `/setup-sheets`, `/cnc-pair`, `/cad-files` | file upload / list | ❌ 已移除兼容（2026-09-29），仅保留 `/api/v2/part-files/parts/{id}/<file>...` canonical 第二入口 |
 
 **Rust 状态**：`src/modules/cnc_program/` 完整 6 文件（model / repo / service / handler / dto / mod）；kind=`G_CODE` + kind=`SETUP_SHEET` 复用 `t_part_file`；详见 [`./cnc-programs.md`](./cnc-programs.md)。
 
