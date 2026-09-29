@@ -40,6 +40,8 @@ use crate::modules::prod::work_type::service::WorkTypeService;
 use crate::modules::prod::worker::service::WorkerService;
 use crate::modules::prod::worker_pool::service::WorkerPoolService;
 use crate::modules::statistics::service::StatisticsService;
+// 2026-09-29 新增：企业微信小程序登录客户端（wx-login 端点）。
+use crate::modules::wx::wecom_client::WeComApiClient;
 
 pub struct AppState {
     pub pool: PgPool,
@@ -134,6 +136,13 @@ pub struct AppState {
     /// 与 iam / dashboard / shelf 同形。跨域 ZST（WorkerRepo / WorkTypeRepo）走
     /// `repo.conn_mut()` 借位（与 DeliveryNoteRepoTrait::conn_mut 2026-09-22 D-5 引入同形）。
     pub statistics_service: Arc<StatisticsService>,
+    /// 2026-09-29 新增：企业微信小程序登录客户端（`POST /api/v2/wx/iam/wx-login`）。
+    /// 依赖：`Arc<WeComConfig>`（corpid / corpsecret / api_base / 超时）+ `deadpool_redis::Pool`
+    /// （access_token 缓存，与 session / idempotency 共用同一池）。两者都在
+    /// `main.rs` 装线时注入，本字段**不**需要额外装配——service 层零依赖。
+    /// 未配置 `WECOM_CORPID` / `WECOM_CORPSECRET` 时为 `NoopWeComClient`，
+    /// wx-login 端点直接返 40109（后端照常启动，不 fail-fast）。
+    pub wecom: Arc<dyn WeComApiClient>,
 }
 
 impl AppState {
@@ -150,6 +159,9 @@ impl AppState {
         session: Arc<dyn SessionStore>,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store: Arc<dyn IdempotencyStore>,
+        // 2026-09-29 新增：企业微信小程序登录客户端（Http / Noop 由
+        // `wecom_client::build_wecom_client` 按 `config.wecom.enabled` 决定）。
+        wecom: Arc<dyn WeComApiClient>,
     ) -> Self {
         // 装线（2026-09-21 事务分层重构后无 IamUowProvider）：
         // AccountService::new(snowflake) → SessionService::new(config, session, account_service)
@@ -223,6 +235,7 @@ impl AppState {
             // 2026-09-23 新增 Idempotency 中间件存储
             idempotency_store,
             statistics_service,
+            wecom,
         }
     }
 }

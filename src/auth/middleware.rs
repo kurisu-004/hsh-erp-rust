@@ -69,11 +69,19 @@ use crate::state::AppState;
 ///
 /// - 精确匹配：`/health` `/iam/login` `/iam/refresh`
 /// - 前缀匹配：`/_e2e` 与 `/_e2e/`（e2e hook 整段子树都免鉴权）
+///
+/// ## 2026-09-29 新增：`/wx/iam/wx-login`
+/// 企业微信小程序登录端点，调用方是小程序（尚无 token），用一次性 code 换身份。
+/// ⚠️ 加公开路径时**必须**同步改 `crate::middleware::idempotency::is_public_idempotency_path`
+/// ——否则登录响应（含 JWT）会被 idempotency 缓存，复用 `Idempotency-Key` 即可
+/// 劫持 session。详见该函数的「对偶副本」说明。
 fn is_public_path(path: &str) -> bool {
     let stripped = path.strip_prefix("/api/v2").unwrap_or(path);
     stripped == "/health"
         || stripped == "/iam/login"
         || stripped == "/iam/refresh"
+        // 2026-09-29：企业微信小程序登录（公开；配对白名单见 middleware::idempotency）
+        || stripped == "/wx/iam/wx-login"
         || stripped == "/_e2e"
         || stripped.starts_with("/_e2e/")
 }
