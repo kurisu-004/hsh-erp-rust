@@ -292,464 +292,6 @@ async fn list_parts_pagination_limit_offset() {
 }
 
 // ===========================================================================
-//  Tests — Part 1.5: row_type 三模式合并（2026-09-28 row-type-merge）
-// ===========================================================================
-
-/// 在测试内联用的 INSERT helper：建一个 `t_part` 行，强制带 `assembly_id`（标
-/// 记为「装配体的子件」；与普通零件的差异字段仅 `assembly_id`）。其它列与
-/// `insert_part` 同形态，仅多一个非空 assembly_id。
-async fn insert_part_under_assembly(
-    pool: &PgPool,
-    name: &str,
-    customer_id: i64,
-    assembly_id: i64,
-    status: &str,
-) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let id = next_test_id();
-    let now = now_naive();
-    let today = now.date();
-    sqlx::query(
-        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
-         applicant_name, request_date, planned_delivery_date, quantity, version, \
-         created_at, updated_at, assembly_id) \
-         VALUES ($1, NULL, $2, 'D-001', $3, $4, $2, $6, $6, 1, 0, $5, $5, $7)",
-    )
-    .bind(id)
-    .bind(name)
-    .bind(customer_id)
-    .bind(status)
-    .bind(now)
-    .bind(today)
-    .bind(assembly_id)
-    .execute(pool)
-    .await
-    .expect("insert part under assembly");
-    id
-}
-
-/// 在测试内联用的 INSERT helper：建一个 `t_assembly` 行（精简列对齐 part 域
-/// status 字符串 "PENDING"，沿用 assembly/status_sync.rs:218-235 的形态）。
-async fn insert_assembly(
-    pool: &PgPool,
-    drawing_no: &str,
-    name: &str,
-    customer_id: i64,
-) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let id = next_test_id();
-    let now = now_naive();
-    let today = now.date();
-    sqlx::query(
-        "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
-         request_date, planned_delivery_date, status, quantity, unit_price, total_price, \
-         version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, $3, '', $4, $5, $5, 'PENDING', 1, 0, 0, 0, $6, NULL, $6, NULL)",
-    )
-    .bind(id)
-    .bind(drawing_no)
-    .bind(name)
-    .bind(customer_id)
-    .bind(today)
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert t_assembly");
-    id
-}
-
-/// `row_type=PART` —— 3 件普通 part + 1 件带 `assembly_id` 的 part +
-/// 2 个装配件；返回仅 2 件（普通 part），`total=2`，全部 `assembly_id IS NULL`。
-#[tokio::test]
-async fn list_parts_row_type_part_excludes_assembly_children() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-
-    // 2 个装配件（父件；行类型 ASSEMBLY 域过滤掉）
-    let asm1 = insert_assembly(&pool, "ASM-001", "A1", fx.customer_l2_id).await;
-    let _asm2 = insert_assembly(&pool, "ASM-002", "A2", fx.customer_l2_id).await;
-
-    // 2 件普通 part（应被返回）+ 1 件子件（应被过滤）
-    let _p0 = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
-    let _p1 = insert_part(&pool, "P1", fx.customer_l2_id, Some("P001"), "PENDING").await;
-    let _pc = insert_part_under_assembly(&pool, "PC", fx.customer_l2_id, asm1, "PENDING").await;
-
-    let (s, env) = send(
-        app,
-        json_request(
-            "GET",
-            &format!("/parts?customer_id={}&row_type=PART", fx.customer_l2_id),
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "row_type=PART: {env}");
-    assert_eq!(env["code"], 0);
-    assert_eq!(
-        env["data"]["total"], 2,
-        "应仅返回 2 件普通 part（子件+装配件被排除）: {env}"
-    );
-    let items = env["data"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 2);
-    for item in items {
-        // PART 行：`assembly_id` 必然 None（装配体子件被守卫排除）
-        assert!(
-            item.get("assembly_id").is_none_or(|v| v.is_null()),
-            "PART 行 assembly_id 必为 None: {item}"
-        );
-        assert_eq!(item["row_type"], "PART", "PART 行 row_type: {item}");
-    }
-}
-
-/// `row_type=ASSEMBLY` —— 2 个装配件（其中一个有 3 子件）；返回 2 件，
-/// `has_children` 和 `child_count` 正确。
-#[tokio::test]
-async fn list_parts_row_type_assembly_returns_unified_shape() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let asm_with_kids = insert_assembly(&pool, "ASM-A", "AA", fx.customer_l2_id).await;
-    let asm_no_kids = insert_assembly(&pool, "ASM-B", "BB", fx.customer_l2_id).await;
-    // 给 asm_with_kids 注入 3 子件
-    for i in 0..3 {
-        insert_part_under_assembly(
-            &pool,
-            &format!("C{i}"),
-            fx.customer_l2_id,
-            asm_with_kids,
-            "PENDING",
-        )
-        .await;
-    }
-    // 1 件普通 part（应被过滤掉）
-    let _p0 = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
-
-    let (s, env) = send(
-        app,
-        json_request(
-            "GET",
-            &format!("/parts?customer_id={}&row_type=ASSEMBLY", fx.customer_l2_id),
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "row_type=ASSEMBLY: {env}");
-    assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["total"], 2);
-    let items = env["data"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 2);
-    let by_id: std::collections::HashMap<i64, &Value> = items
-        .iter()
-        .map(|i| (i["id"].as_str().unwrap().parse().unwrap(), i))
-        .collect();
-    let asm_with = by_id.get(&asm_with_kids).expect("asm_with_kids in list");
-    assert_eq!(asm_with["row_type"], "ASSEMBLY");
-    assert_eq!(asm_with["has_children"], true, "3 子件 → true: {asm_with}");
-    assert_eq!(asm_with["child_count"], 3, "child_count=3: {asm_with}");
-    let asm_no = by_id.get(&asm_no_kids).expect("asm_no_kids in list");
-    assert_eq!(asm_no["row_type"], "ASSEMBLY");
-    assert_eq!(asm_no["has_children"], false);
-    assert_eq!(asm_no["child_count"], 0);
-}
-
-/// 默认 ALL 模式（不传 `row_type`）—— 3 件普通 part + 2 个装配件；
-/// `total=5`，混合 `row_type`。
-#[tokio::test]
-async fn list_parts_include_assemblies_default_is_all() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    for i in 0..3 {
-        insert_part(
-            &pool,
-            &format!("P{i}"),
-            fx.customer_l2_id,
-            Some(&format!("P{i:03}")),
-            "PENDING",
-        )
-        .await;
-    }
-    insert_assembly(&pool, "ASM-001", "A1", fx.customer_l2_id).await;
-    insert_assembly(&pool, "ASM-002", "A2", fx.customer_l2_id).await;
-
-    let (s, env) = send(
-        app,
-        json_request(
-            "GET",
-            &format!("/parts?customer_id={}&limit=200", fx.customer_l2_id),
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "默认 ALL: {env}");
-    assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["total"], 5, "默认 ALL 应合并 5 条: {env}");
-    let items = env["data"]["items"].as_array().unwrap();
-    assert_eq!(items.len(), 5);
-    let mut row_types: std::collections::HashSet<String> = items
-        .iter()
-        .map(|i| i["row_type"].as_str().unwrap().to_string())
-        .collect();
-    assert!(row_types.remove("PART"));
-    assert!(row_types.remove("ASSEMBLY"));
-    assert!(row_types.is_empty(), "应仅含 PART / ASSEMBLY 两类: {row_types:?}");
-}
-
-/// `include_assemblies=false` —— 仅返回 3 件 part。
-#[tokio::test]
-async fn list_parts_include_assemblies_false_is_part_only() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    for i in 0..3 {
-        insert_part(
-            &pool,
-            &format!("P{i}"),
-            fx.customer_l2_id,
-            Some(&format!("P{i:03}")),
-            "PENDING",
-        )
-        .await;
-    }
-    insert_assembly(&pool, "ASM-001", "A1", fx.customer_l2_id).await;
-    insert_assembly(&pool, "ASM-002", "A2", fx.customer_l2_id).await;
-
-    let (s, env) = send(
-        app,
-        json_request(
-            "GET",
-            &format!(
-                "/parts?customer_id={}&include_assemblies=false&limit=200",
-                fx.customer_l2_id
-            ),
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "include_assemblies=false: {env}");
-    assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["total"], 3, "仅 part: {env}");
-    for item in env["data"]["items"].as_array().unwrap() {
-        assert_eq!(item["row_type"], "PART");
-    }
-}
-
-/// ALL 模式分页：5 条（3 part + 2 asm），`limit=3 offset=0` 拿首页 3 条；
-/// `offset=3` 拿余下 2 条；`total=5`。
-#[tokio::test]
-async fn list_parts_all_mode_pagination() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    // 3 part（按 created_at 升序插，最后插入的最「新 → DESC 时排首）
-    for i in 0..3 {
-        insert_part(
-            &pool,
-            &format!("P{i}"),
-            fx.customer_l2_id,
-            Some(&format!("P{i:03}")),
-            "PENDING",
-        )
-        .await;
-    }
-    let asm1 = insert_assembly(&pool, "ASM-A", "AA", fx.customer_l2_id).await;
-    let asm2 = insert_assembly(&pool, "ASM-B", "BB", fx.customer_l2_id).await;
-
-    // 不指定 sort_by → 默认 CREATED_AT DESC。3 part 后插 2 asm，所以首 2 条
-    // 应是 asm（创建更晚），余 3 条是 part。
-    let (s, env) = send(
-        app.clone(),
-        json_request(
-            "GET",
-            &format!(
-                "/parts?customer_id={}&limit=3&offset=0",
-                fx.customer_l2_id
-            ),
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "ALL 模式首页: {env}");
-    assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["total"], 5, "ALL total=5: {env}");
-    let page1: Vec<i64> = env["data"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
-        .collect();
-    assert_eq!(page1.len(), 3);
-
-    let (s, env) = send(
-        app,
-        json_request(
-            "GET",
-            &format!(
-                "/parts?customer_id={}&limit=3&offset=3",
-                fx.customer_l2_id
-            ),
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "ALL 模式第 2 页: {env}");
-    let page2: Vec<i64> = env["data"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
-        .collect();
-    assert_eq!(page2.len(), 2);
-    // 两页 id 集合无交集且总 = 5
-    let mut all = page1.clone();
-    all.extend(page2.iter().copied());
-    assert_eq!(all.len(), 5);
-    let mut uniq = all.clone();
-    uniq.sort();
-    uniq.dedup();
-    assert_eq!(uniq.len(), 5, "两页无重复: {all:?}");
-    // 首 2 条应是 asm（创建更晚）
-    assert!(
-        page1.contains(&asm1) && page1.contains(&asm2),
-        "首页应含两个 asm: {page1:?}"
-    );
-}
-
-/// `row_type=BAD` —— 返回 40001 VALIDATION_ERROR。
-#[tokio::test]
-async fn list_parts_row_type_invalid_rejected() {
-    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
-    let (s, env) = send(
-        app,
-        json_request("GET", "/parts?row_type=BAD", None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(
-        s,
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "非法 row_type → 422: {env}"
-    );
-    assert_eq!(env["code"], 40001, "VALIDATION_ERROR: {env}");
-}
-
-/// ALL 模式 `sort_by=SERIAL_NO` —— 不报错，降级为 CREATED_AT。
-/// 3 part + 1 asm 仍返回 4 条（无 SQL 报错）。
-#[tokio::test]
-async fn list_parts_all_mode_sort_serial_no_falls_back() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    for i in 0..3 {
-        insert_part(
-            &pool,
-            &format!("P{i}"),
-            fx.customer_l2_id,
-            Some(&format!("P{i:03}")),
-            "PENDING",
-        )
-        .await;
-    }
-    insert_assembly(&pool, "ASM-001", "A1", fx.customer_l2_id).await;
-
-    let (s, env) = send(
-        app,
-        json_request(
-            "GET",
-            &format!(
-                "/parts?customer_id={}&sort_by=SERIAL_NO&limit=200",
-                fx.customer_l2_id
-            ),
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "SERIAL_NO 降级 CREATED_AT: {env}");
-    assert_eq!(env["code"], 0);
-    assert_eq!(
-        env["data"]["total"], 4,
-        "SERIAL_NO 降级 CREATED_AT 应仍返回 4 条: {env}"
-    );
-}
-
-/// GET /parts/{id} —— 标准详情返回 200 / status=PENDING / customer_name 冗余。
-#[tokio::test]
-async fn get_part_detail_200() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
-
-    let (s, env) = send(
-        app,
-        json_request("GET", &format!("/parts/{pid}"), None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "detail: {env}");
-    assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["id"], pid.to_string());
-    assert_eq!(env["data"]["status"], "PENDING");
-    assert_eq!(env["data"]["customer_name"], "FX 客户 L2");
-    assert_eq!(env["data"]["l1_customer_name"], "FX 客户 L1");
-    // 2026-09-27 review 第 1 轮修复（BF4）：PartDetailOut 仍 flatten TPart，
-    // 详情响应应保留 next_process_id。TPart 已撤销 `#[serde(skip)]`。
-    assert!(
-        env["data"].get("next_process_id").is_some(),
-        "detail 响应应含 next_process_id (PartDetailOut 仍 flatten TPart): {env}"
-    );
-    // 2026-09-27 part 域前后端字段对齐：detail 响应也应含 NUMERIC 金额列。
-    assert!(
-        env["data"].get("unit_price").is_some(),
-        "detail 响应应含 unit_price: {env}"
-    );
-    assert!(
-        env["data"].get("total_price").is_some(),
-        "detail 响应应含 total_price: {env}"
-    );
-}
-
-/// GET /parts/{nonexistent_id} —— 20101 BIZ_PART_NOT_FOUND（HTTP 404）。
-#[tokio::test]
-async fn get_part_detail_404_not_found() {
-    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
-    let (s, env) = send(
-        app,
-        json_request("GET", "/parts/999999999", None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NOT_FOUND, "404: {env}");
-    assert_eq!(env["code"], 20101, "BIZ_PART_NOT_FOUND: {env}");
-}
-
-/// GET /parts/{id} —— 软删后 GET → 20101 (get_part_detail 不含软删件)。
-#[tokio::test]
-async fn get_part_detail_404_soft_deleted() {
-    let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
-
-    sqlx::query("UPDATE t_part SET deleted_at = now(), version = version + 1 WHERE id = $1")
-        .bind(pid)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    let (s, env) = send(
-        app,
-        json_request("GET", &format!("/parts/{pid}"), None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::NOT_FOUND, "soft-deleted detail: {env}");
-    assert_eq!(env["code"], 20101, "BIZ_PART_NOT_FOUND: {env}");
-}
-
-// ===========================================================================
 //  Tests — Part 2: create / batch_create
 // ===========================================================================
 
@@ -1003,14 +545,7 @@ async fn batch_create_parts_savepoint_recovers_after_failure() {
 #[tokio::test]
 async fn update_part_200() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
 
     let (s, env) = send(
         app,
@@ -1037,14 +572,7 @@ async fn update_part_200() {
 #[tokio::test]
 async fn update_part_version_conflict() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
 
     let (s, env) = send(
         app,
@@ -1067,14 +595,7 @@ async fn update_part_version_conflict() {
 #[tokio::test]
 async fn update_part_404_soft_deleted() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
 
     sqlx::query("UPDATE t_part SET deleted_at = now(), version = version + 1 WHERE id = $1")
         .bind(pid)
@@ -1103,14 +624,7 @@ async fn update_part_404_soft_deleted() {
 #[tokio::test]
 async fn soft_delete_part_manager_ok() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
 
     let (s, env) = send(
         app,
@@ -1142,14 +656,7 @@ async fn soft_delete_part_manager_ok() {
 #[tokio::test]
 async fn soft_delete_part_403_clerk() {
     let (pool, app, token, fx) = bootstrap_as_clerk().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
 
     let (s, env) = send(
         app,
@@ -1169,14 +676,7 @@ async fn soft_delete_part_403_clerk() {
 #[tokio::test]
 async fn soft_delete_part_404_soft_deleted() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
 
     sqlx::query("UPDATE t_part SET deleted_at = now(), version = version + 1 WHERE id = $1")
         .bind(pid)
@@ -1202,14 +702,7 @@ async fn soft_delete_part_404_soft_deleted() {
 #[tokio::test]
 async fn soft_delete_part_409_version_conflict() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
 
     let (s, env) = send(
         app,
@@ -1229,14 +722,7 @@ async fn soft_delete_part_409_version_conflict() {
 #[tokio::test]
 async fn soft_delete_part_409_terminal_status() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "DELIVERED",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "DELIVERED").await;
 
     let (s, env) = send(
         app,
@@ -1263,14 +749,7 @@ async fn soft_delete_part_409_terminal_status() {
 #[tokio::test]
 async fn get_by_serial_200() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("T-LOC-1"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("T-LOC-1"), "PENDING").await;
 
     let (s, env) = send(
         app,
@@ -1347,14 +826,7 @@ async fn deliver_ready_to_ship_200() {
 #[tokio::test]
 async fn deliver_wrong_state_400() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "INSPECTION",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "INSPECTION").await;
     let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
     let bver = batch_version(&pool, bid).await;
 
@@ -1379,14 +851,7 @@ async fn deliver_wrong_state_400() {
 #[tokio::test]
 async fn cancel_pending_200() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
 
     let (s, env) = send(
         app,
@@ -1407,14 +872,7 @@ async fn cancel_pending_200() {
 #[tokio::test]
 async fn cancel_wrong_state_400() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        None,
-        "COMPLETED",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, None, "COMPLETED").await;
 
     let (s, env) = send(
         app,
@@ -1434,14 +892,7 @@ async fn cancel_wrong_state_400() {
 #[tokio::test]
 async fn complete_delivered_200() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "DELIVERED",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "DELIVERED").await;
     let bid = insert_batch(&pool, pid, 1, 1, "DELIVERED").await;
     let bver = batch_version(&pool, bid).await;
 
@@ -1472,14 +923,7 @@ async fn complete_delivered_200() {
 #[tokio::test]
 async fn complete_wrong_state_400() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "INSPECTION",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "INSPECTION").await;
     let bid = insert_batch(&pool, pid, 1, 1, "INSPECTION").await;
     let bver = batch_version(&pool, bid).await;
 
@@ -1504,14 +948,7 @@ async fn complete_wrong_state_400() {
 #[tokio::test]
 async fn start_repair_in_process_200() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "IN_PROCESS",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "IN_PROCESS").await;
     let bid = insert_batch(&pool, pid, 1, 1, "IN_PROCESS").await;
     let bver = batch_version(&pool, bid).await;
 
@@ -1550,14 +987,7 @@ async fn start_repair_in_process_200() {
 #[tokio::test]
 async fn start_repair_wrong_state_400() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
     let bid = insert_batch(&pool, pid, 1, 1, "PENDING").await;
     let bver = batch_version(&pool, bid).await;
 
@@ -1587,14 +1017,7 @@ async fn start_repair_wrong_state_400() {
 #[tokio::test]
 async fn deliver_cancelled_409() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "CANCELLED",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "CANCELLED").await;
     let bid = insert_batch(&pool, pid, 1, 1, "READY_TO_SHIP").await;
     let bver = batch_version(&pool, bid).await;
 
@@ -1686,14 +1109,7 @@ async fn deliver_also_updates_batch() {
 #[tokio::test]
 async fn cancel_also_updates_batch() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
     let _bid = insert_batch(&pool, pid, 1, 1, "PENDING").await;
 
     let (s, env) = send(
@@ -1753,14 +1169,7 @@ async fn deliver_without_source_batch_409() {
 #[tokio::test]
 async fn cancel_delivery_note_locked_409() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-    )
-    .await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING").await;
     let _bid = insert_batch(&pool, pid, 1, 1, "PENDING").await;
 
     sqlx::query!(
@@ -1991,10 +1400,10 @@ async fn upload_content_type_mismatch_rejected() {
 
 #[tokio::test]
 async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
-    use std::sync::Arc;
     use hsh_erp_rust::modules::part::dto_crud::{
         FileBindingIn, PartBatchCreateItem, PartBatchCreateRequest,
     };
+    use std::sync::Arc;
 
     let pool = test_pool().await;
     let fx = load_part_fixture(&pool).await;
