@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_wx_identity\n            SET deleted_at = $3, updated_at = $3, updated_by = $4, version = version + 1\n            WHERE id = $1 AND version = $2 AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Timestamp",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3f52dd9daa135e3fb4f4bd7cfcb488c35c8cb6cddf3d8070b3760376e0de72b5"
+}

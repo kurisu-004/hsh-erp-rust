@@ -50,6 +50,9 @@ pub struct AppConfig {
     /// 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发到 python STS 端点）。
     /// 环境变量 `PYTHON_BACKEND_BASE_URL`（设了就 enabled=true）/ `PYTHON_STS_TIMEOUT_MS`。
     pub python_backend: PythonBackendConfig,
+    /// 2026-09-29 新增：企业微信小程序登录配置（自建应用 `jscode2session`）。
+    /// 环境变量 `WECOM_CORPID` / `WECOM_CORPSECRET`（两者都非空才 enabled）。
+    pub wecom: WeComConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +220,70 @@ impl Default for PythonBackendConfig {
         Self {
             base_url: "http://localhost:8000".to_string(),
             timeout_ms: 10_000,
+            enabled: false,
+        }
+    }
+}
+
+/// 2026-09-29 新增：企业微信小程序登录（自建应用 `jscode2session`）配置。
+///
+/// ## 触发场景
+/// `POST /api/v2/wx/iam/wx-login` 用小程序 `wx.login()` 拿到的**一次性 code**
+/// 换企业微信 `userid`，再按 `t_wx_identity` 预绑定表反查系统账号。
+/// 走企业微信的 `/cgi-bin/miniprogram/jscode2session`（**不是**微信的
+/// `api.weixin.qq.com/sns/jscode2session`），因此 `access_token` 必须用
+/// **该小程序关联的企业微信自建应用**的 Secret 换取，用**企业的 corpid**
+/// （不是小程序 appid）。
+///
+/// ## env
+/// - `WECOM_CORPID`：企业微信管理后台「我的企业 → 企业信息 → 企业ID」。
+/// - `WECOM_CORPSECRET`：「应用管理 → 小程序」下已关联的**自建应用**的 Secret。
+///   第三方应用会返回加密 userid（需 `suite_access_token` + `auth/getuserinfo3rd`），
+///   本方案不适用。
+/// - `WECOM_API_BASE`：企微 API 根地址，缺省 `https://qyapi.weixin.qq.com`
+///   （单测指向本地 mock server）。
+/// - `WECOM_TOKEN_TTL`：access_token 的 Redis 缓存 TTL（秒），缺省 `6000`。
+///   企微 `gettoken` 返回 `expires_in = 7200`，留 1200s 余量避免边界失效。
+/// - `WECOM_HTTP_TIMEOUT_MS`：单次企微 HTTP 请求超时（毫秒），缺省 `5000`。
+///
+/// ## 为什么用 `env_or(.., "")` 而**不是** `env_required`
+/// 降级范式对齐既有 [`PythonBackendConfig`]：未配置时 `enabled=false`，
+/// 后端**照常启动**，只有 `wx-login` 端点返回 `40109 BIZ_WX_NOT_CONFIGURED`。
+/// 若用 `env_required`，运维在还没拿到 corpsecret 之前就无法启动服务（fail-fast
+/// 变成 fail-all）。更关键的反例：若为了「跑得起来」而在占位位置填一个**假
+/// secret**，`enabled` 判定只看「非空」就会被判为 true，此后每次登录都会
+/// 真打企微接口并拿到 `errcode=40001 invalid credential`，最终抛出一个
+/// 40106/40109 都无法直接指向根因的 40106，排查成本极高。**留空**才是正确
+/// 降级：未配置时 40109 一眼看出是配置问题。
+///
+/// ## 安全
+/// `corpsecret` 绝不出现在任何 `tracing` 日志 / `Debug` 输出里；本 struct
+/// 派生 `Debug` 是为便于 `info!` 打 enabled + corpid（脱敏后），调用方
+/// **不要**直接 `{:?}` 打印整个 `WeComConfig`。
+#[derive(Clone, Debug)]
+pub struct WeComConfig {
+    /// 企业 ID。空串 = 未配置。
+    pub corpid: String,
+    /// 自建应用 Secret。空串 = 未配置。**禁止**进日志。
+    pub corpsecret: String,
+    /// 企微 API 根地址（无尾斜杠）。
+    pub api_base: String,
+    /// access_token 缓存 TTL（秒）。
+    pub token_ttl_seconds: u64,
+    /// 单次 HTTP 超时（毫秒）。
+    pub http_timeout_ms: u64,
+    /// 是否启用真实企微调用。`corpid` 与 `corpsecret` **均非空**才 true。
+    pub enabled: bool,
+}
+
+impl Default for WeComConfig {
+    fn default() -> Self {
+        Self {
+            corpid: String::new(),
+            corpsecret: String::new(),
+            api_base: "https://qyapi.weixin.qq.com".to_string(),
+            token_ttl_seconds: 6000,
+            http_timeout_ms: 5000,
             enabled: false,
         }
     }
@@ -392,6 +459,24 @@ impl AppConfig {
                         base_url,
                         timeout_ms: env_parse("PYTHON_STS_TIMEOUT_MS", 10_000u64)?,
                         enabled,
+                    }
+                },
+            // 2026-09-29 新增：企业微信小程序登录（自建应用 jscode2session）。
+            // 刻意用 `env_or(.., "")` 而非 `env_required`：未配置 → enabled=false，
+            // 后端照常启动，wx-login 干净返 40109（详见 WeComConfig doc 的理由段）。
+            wecom: {
+                    let corpid = env_or("WECOM_CORPID", "");
+                    let corpsecret = env_or("WECOM_CORPSECRET", "");
+                    // `enabled` 只看「两者都非空」；不 trim 后再判，避免
+                    // " " 这种纯空格占位被判为已配置（打企微接口必失败）。
+                    WeComConfig {
+                        enabled: !corpid.trim().is_empty() && !corpsecret.trim().is_empty(),
+                        corpid,
+                        corpsecret,
+                        api_base: env_or("WECOM_API_BASE", "https://qyapi.weixin.qq.com"),
+                        // 企微给 expires_in=7200，留 1200s 余量，避免边界取到半死 token
+                        token_ttl_seconds: env_parse("WECOM_TOKEN_TTL", 6000u64)?,
+                        http_timeout_ms: env_parse("WECOM_HTTP_TIMEOUT_MS", 5000u64)?,
                     }
                 },
         })
