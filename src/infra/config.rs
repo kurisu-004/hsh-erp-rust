@@ -50,6 +50,9 @@ pub struct AppConfig {
     /// 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发到 python STS 端点）。
     /// 环境变量 `PYTHON_BACKEND_BASE_URL`（设了就 enabled=true）/ `PYTHON_STS_TIMEOUT_MS`。
     pub python_backend: PythonBackendConfig,
+    /// 2026-09-29 新增：企业微信小程序登录配置（自建应用 `jscode2session`）。
+    /// 环境变量 `WECOM_CORPID` / `WECOM_CORPSECRET`（两者都非空才 enabled）。
+    pub wecom: WeComConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +220,92 @@ impl Default for PythonBackendConfig {
         Self {
             base_url: "http://localhost:8000".to_string(),
             timeout_ms: 10_000,
+            enabled: false,
+        }
+    }
+}
+
+/// 2026-09-29 新增：企业微信小程序登录（自建应用 `jscode2session`）配置。
+///
+/// ## 触发场景
+/// `POST /api/v2/wx/iam/wx-login` 用小程序 `wx.login()` 拿到的**一次性 code**
+/// 换企业微信 `userid`，再按 `t_wx_identity` 预绑定表反查系统账号。
+/// 走企业微信的 `/cgi-bin/miniprogram/jscode2session`（**不是**微信的
+/// `api.weixin.qq.com/sns/jscode2session`），因此 `access_token` 必须用
+/// **该小程序关联的企业微信自建应用**的 Secret 换取，用**企业的 corpid**
+/// （不是小程序 appid）。
+///
+/// ## env
+/// - `WECOM_CORPID`：企业微信管理后台「我的企业 → 企业信息 → 企业ID」。
+/// - `WECOM_CORPSECRET`：「应用管理 → 小程序」下已关联的**自建应用**的 Secret。
+///   第三方应用会返回加密 userid（需 `suite_access_token` + `auth/getuserinfo3rd`），
+///   本方案不适用。
+/// - `WECOM_API_BASE`：企微 API 根地址，缺省 `https://qyapi.weixin.qq.com`
+///   （单测指向本地 mock server）。
+/// - `WECOM_TOKEN_TTL`：access_token 的 Redis 缓存 TTL（秒）**兜底值**，缺省 `6000`。
+///   正常路径用企微 `gettoken` 返回的 `expires_in - 300`（= 6900），只有响应里
+///   **没有** `expires_in` 字段时才回落到这个值（见 `wecom_client::get_token`）。
+/// - `WECOM_HTTP_TIMEOUT_MS`：单次企微 HTTP 请求超时（毫秒），缺省 `5000`。
+///
+/// ## 为什么用 `env_or(.., "")` 而**不是** `env_required`
+/// 降级范式对齐既有 [`PythonBackendConfig`]：未配置时 `enabled=false`，
+/// 后端**照常启动**，只有 `wx-login` 端点返回 `40109 BIZ_WX_NOT_CONFIGURED`。
+/// 若用 `env_required`，运维在还没拿到 corpsecret 之前就无法启动服务（fail-fast
+/// 变成 fail-all）。更关键的反例：若为了「跑得起来」而在占位位置填一个**假
+/// secret**，`enabled` 判定只看「非空」就会被判为 true，此后每次登录都会
+/// 真打企微接口并拿到 `errcode=40001 invalid credential`，最终抛出一个
+/// 40106/40109 都无法直接指向根因的 40106，排查成本极高。**留空**才是正确
+/// 降级：未配置时 40109 一眼看出是配置问题。
+///
+/// ## 安全
+/// `corpsecret` 绝不出现在任何 `tracing` 日志 / `Debug` 输出里。
+///
+/// 2026-09-29 加固（review 第 1 轮 B4）：原先 `#[derive(Debug)]` 让 `{:?}` 会把
+/// `corpsecret` 一起打出去，安全只靠「调用方记得别打印整个 struct」这条**约定**。
+/// 改为手写 `Debug`（见下方 impl）把 `corpsecret` 固定输出成 `***`——不靠约定、
+/// 靠类型。下游 `info!(?cfg)` 之类的排障用法仍可看到 corpid / enabled / api_base。
+#[derive(Clone)]
+pub struct WeComConfig {
+    /// 企业 ID。空串 = 未配置。
+    pub corpid: String,
+    /// 自建应用 Secret。空串 = 未配置。**禁止**进日志。
+    pub corpsecret: String,
+    /// 企微 API 根地址（无尾斜杠）。
+    pub api_base: String,
+    /// access_token 缓存 TTL（秒）。
+    pub token_ttl_seconds: u64,
+    /// 单次 HTTP 超时（毫秒）。
+    pub http_timeout_ms: u64,
+    /// 是否启用真实企微调用。`corpid` 与 `corpsecret` **均非空**才 true。
+    pub enabled: bool,
+}
+
+/// 手写 `Debug`：屏蔽 `corpsecret`（2026-09-29，review 第 1 轮 B4）。
+///
+/// 与 `serde` 无关——这里只管 `{:?}` / `{cfg:?}`。字段顺序与声明顺序一致，
+/// 便于和 derive 版本对照阅读。
+impl std::fmt::Debug for WeComConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeComConfig")
+            .field("corpid", &self.corpid)
+            // ⚠️ 永远输出 `***`，即使 corpsecret 为空串也不回显原值
+            .field("corpsecret", &"***")
+            .field("api_base", &self.api_base)
+            .field("token_ttl_seconds", &self.token_ttl_seconds)
+            .field("http_timeout_ms", &self.http_timeout_ms)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+impl Default for WeComConfig {
+    fn default() -> Self {
+        Self {
+            corpid: String::new(),
+            corpsecret: String::new(),
+            api_base: "https://qyapi.weixin.qq.com".to_string(),
+            token_ttl_seconds: 6000,
+            http_timeout_ms: 5000,
             enabled: false,
         }
     }
@@ -394,6 +483,25 @@ impl AppConfig {
                         enabled,
                     }
                 },
+            // 2026-09-29 新增：企业微信小程序登录（自建应用 jscode2session）。
+            // 刻意用 `env_or(.., "")` 而非 `env_required`：未配置 → enabled=false，
+            // 后端照常启动，wx-login 干净返 40109（详见 WeComConfig doc 的理由段）。
+            wecom: {
+                    let corpid = env_or("WECOM_CORPID", "");
+                    let corpsecret = env_or("WECOM_CORPSECRET", "");
+                    // `enabled` 只看「两者都非空」；不 trim 后再判，避免
+                    // " " 这种纯空格占位被判为已配置（打企微接口必失败）。
+                    WeComConfig {
+                        enabled: !corpid.trim().is_empty() && !corpsecret.trim().is_empty(),
+                        corpid,
+                        corpsecret,
+                        api_base: env_or("WECOM_API_BASE", "https://qyapi.weixin.qq.com"),
+                        // 仅兜底：正常路径用企微返回的 expires_in - 300（安全余量），
+                        // 只有企微没回 expires_in 时才用这个值
+                        token_ttl_seconds: env_parse("WECOM_TOKEN_TTL", 6000u64)?,
+                        http_timeout_ms: env_parse("WECOM_HTTP_TIMEOUT_MS", 5000u64)?,
+                    }
+                },
         })
     }
 }
@@ -546,5 +654,38 @@ fn env_bool(key: &str, default: bool) -> Result<bool> {
             other => Err(anyhow!("环境变量 {key} 无法解析为 bool: {other:?}")),
         },
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 手写 `Debug` 必须屏蔽 `corpsecret`（2026-09-29，review 第 1 轮 B4）。
+    ///
+    /// 这是「不靠约定靠类型」的回归闸：只要有人把 `impl Debug` 删掉改回
+    /// `#[derive(Debug)]`，本测试立刻红。
+    #[test]
+    fn wecom_config_debug_masks_corpsecret() {
+        let cfg = WeComConfig {
+            corpid: "wwCORPID1234".into(),
+            corpsecret: "SUPER-SECRET-VALUE".into(),
+            ..WeComConfig::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-VALUE"),
+            "WeComConfig Debug 泄漏 corpsecret: {dbg}"
+        );
+        // 排障需要的非敏感字段仍应可见
+        assert!(dbg.contains("wwCORPID1234"), "corpid 应可见: {dbg}");
+        assert!(dbg.contains("***"), "corpsecret 应显示为 ***: {dbg}");
+    }
+
+    /// corpsecret 为空（未配置）时也不能因为「反正没值」而改回回显逻辑。
+    #[test]
+    fn wecom_config_debug_masks_corpsecret_even_when_blank() {
+        let dbg = format!("{:?}", WeComConfig::default());
+        assert!(dbg.contains("corpsecret: \"***\""), "{dbg}");
     }
 }

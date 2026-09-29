@@ -26,14 +26,16 @@ use tokio_util::sync::CancellationToken;
 
 use hsh_erp_rust::auth::session::{RedisSessionStore, SessionStore};
 use hsh_erp_rust::infra::config::{
-    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig,
-    PythonBackendConfig, RedisConfig as AppRedisConfig, SnowflakeConfig,
+    AppConfig, AutoCompleteConfig, CosBackend, CosConfig, JwtConfig, PythonBackendConfig,
+    RedisConfig as AppRedisConfig, SnowflakeConfig, WeComConfig,
 };
 use hsh_erp_rust::infra::cos::{CosClient, NoopCos, ObjectMeta};
 // 2026-09-28 新增：rust → python 后端转发客户端（薄壳鉴权转发 STS）。
 use hsh_erp_rust::infra::py_backend::{NoopPyBackend, PyBackendClient};
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
+// 2026-09-29 新增：企业微信登录客户端（默认 Noop；集成测试用 mock 替换）。
+use hsh_erp_rust::modules::wx::wecom_client::{NoopWeComClient, WeComApiClient};
 use hsh_erp_rust::shared::error::{AppError, code};
 use hsh_erp_rust::state::AppState;
 
@@ -137,6 +139,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         // 测试默认 `enabled=false` 走 Noop；需要 mock 的测试 fixture 走
         // `Arc::make_mut` 局部 patch 或自构 AppState（详见 `tests/files_sts_tmp_keys.rs`）。
         python_backend: PythonBackendConfig::default(),
+        // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
+        wecom: WeComConfig::default(),
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -164,6 +168,8 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         session,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store,
+        // 2026-09-29 新增：企业微信登录客户端（默认 Noop → wx-login 返 40109）
+        Arc::new(NoopWeComClient),
     ))
 }
 
@@ -288,6 +294,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         bootstrap_admin_enabled: false,
         // 2026-09-28 新增：python 后端转发默认走 Noop。
         python_backend: PythonBackendConfig::default(),
+        // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
+        wecom: WeComConfig::default(),
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -316,6 +324,8 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         session,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store,
+        // 2026-09-29 新增：企业微信登录客户端（默认 Noop → wx-login 返 40109）
+        Arc::new(NoopWeComClient),
     ))
 }
 
@@ -417,6 +427,8 @@ pub async fn test_state_with_cos(
         bootstrap_admin_enabled: false,
         // 2026-09-28 新增：python 后端转发默认走 Noop。
         python_backend: PythonBackendConfig::default(),
+        // 2026-09-29 新增：企业微信登录配置默认未配置（enabled=false）。
+        wecom: WeComConfig::default(),
     });
     let snowflake = Arc::new(SnowflakeIdGenerator::new(
         config.snowflake.epoch_ms,
@@ -442,7 +454,51 @@ pub async fn test_state_with_cos(
         session,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store,
+        // 2026-09-29 新增：企业微信登录客户端（默认 Noop → wx-login 返 40109）
+        Arc::new(NoopWeComClient),
     ))
+}
+
+/// 2026-09-29 新增：构造测试用 `AppState`，注入自定义的 `WeComApiClient` +
+/// 指定的 `WECOM_CORPID`（供 `tests/wecom_login.rs` 用 `MockWeComApiClient`
+/// 模拟企微返回 / 模拟未配置）。
+///
+/// ## 为什么不用 `Arc::make_mut`
+/// `state.wecom` 是 `Arc<dyn WeComApiClient>`，`Arc::get_mut` 可用（`state` 是
+/// 唯一 Arc 持有者）；`state.config` 不行（`SessionService::new` 内 `.clone()` 过，
+/// 强计数 > 1），必须**整体替换 config Arc**——与 `test_state_with_hs256_fallback_off`
+/// 同一手法。
+///
+/// 注意：替换 config 后 `session_service` 仍持旧 config 的 clone，但本 fixture
+/// 只改 `wecom` 段（JWT / redis / session_ttl 均未变），故无影响。
+///
+/// `corp_id` 传空串可复现「后端未配置企业微信」场景（wx-login 走 40109 分支）。
+#[allow(dead_code)]
+pub async fn test_state_with_wecom(
+    pool: PgPool,
+    wecom: Arc<dyn WeComApiClient>,
+    corp_id: &str,
+) -> Arc<AppState> {
+    let redis_pool = crate::redis::test_redis_pool().await;
+    let mut state = test_state_with_redis(pool, redis_pool);
+    let state_inner = Arc::get_mut(&mut state).expect("state Arc 必须 unique");
+    let old_cfg = (*state_inner.config).clone();
+    let new_cfg = Arc::new(AppConfig {
+        wecom: WeComConfig {
+            corpid: corp_id.to_string(),
+            corpsecret: if corp_id.is_empty() {
+                String::new()
+            } else {
+                "test-wecom-secret".to_string()
+            },
+            enabled: !corp_id.is_empty(),
+            ..WeComConfig::default()
+        },
+        ..old_cfg
+    });
+    state_inner.config = new_cfg;
+    state_inner.wecom = wecom;
+    state
 }
 
 /// axum Router：与 main.rs 中的 `/api/v2` nest 同形。

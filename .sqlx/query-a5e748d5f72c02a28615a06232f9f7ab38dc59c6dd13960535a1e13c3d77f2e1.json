@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                COUNT(DISTINCT batch_id) FILTER (WHERE batch_id IS NOT NULL) AS \"batch_count!\",\n                COALESCE(\n                    SUM(quantity) FILTER (WHERE event_type IN ('PICKED_UP', 'RETURNED')),\n                    0\n                )::bigint AS \"qty_sum!\"\n            FROM t_part_event\n            WHERE worker_id = $1\n              AND created_at::text LIKE $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_count!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "qty_sum!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "a5e748d5f72c02a28615a06232f9f7ab38dc59c6dd13960535a1e13c3d77f2e1"
+}

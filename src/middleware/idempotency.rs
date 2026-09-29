@@ -375,6 +375,12 @@ fn extract_key(headers: &HeaderMap) -> Option<String> {
 /// infra 中间件层，auth 是 modules 之上层；调用方向反了）。两份白名单必须
 /// 同步演化——新增公开路径时同时改这里与 auth 侧 `is_public_path`。
 ///
+/// 2026-09-29 新增 `/wx/iam/wx-login`（企业微信小程序登录）。**这是最容易漏的
+/// 一处**：wx-login 响应体含 `token` / `refresh_token`，若被本中间件缓存，
+/// 攻击者只要复用同一个 `Idempotency-Key` 就能拿到别人的 access token。
+/// 集成测试 `tests/wecom_login.rs::idem_key_does_not_cache_wx_login_response`
+/// 就是为了钉死这条不变量。
+///
 /// 路径形式：生产 nest `/api/v2` + 模块子路径（`/api/v2/iam/login`）；测试
 /// 直接挂 `v2_router` 时为 `/iam/login`。本函数先 strip `/api/v2` 前缀再匹配，
 /// 两种调用模式都放行。
@@ -383,6 +389,8 @@ fn is_public_idempotency_path(path: &str) -> bool {
     stripped == "/health"
         || stripped == "/iam/login"
         || stripped == "/iam/refresh"
+        // 2026-09-29：企业微信小程序登录（响应含 JWT，**不可**缓存）
+        || stripped == "/wx/iam/wx-login"
         || stripped == "/_e2e"
         || stripped.starts_with("/_e2e/")
 }

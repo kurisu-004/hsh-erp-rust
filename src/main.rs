@@ -32,6 +32,7 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsHub;
 use hsh_erp_rust::middleware::idempotency::{IdempotencyStore, RedisIdempotencyStore};
 use hsh_erp_rust::modules;
+use hsh_erp_rust::modules::wx::wecom_client::{WeComApiClient, build_wecom_client};
 use hsh_erp_rust::state::AppState;
 use hsh_erp_rust::task;
 
@@ -86,16 +87,42 @@ async fn main() -> anyhow::Result<()> {
 
     // 6.5 Redis 连接池 + 服务端 session 存储（生产必走 Redis；NoopSessionStore 仅测试 fixture 用）
     // 2026-09-28 删除：相关上传会话域装配（Redis 共享 STS 凭证会话机制已下线）。
-    let (session, idempotency_store): (
+    let (session, idempotency_store, wecom): (
         Arc<dyn SessionStore>,
         Arc<dyn IdempotencyStore>,
+        Arc<dyn WeComApiClient>,
     ) = {
         let redis_pool = redis::create_pool(&config).context("创建 Redis 连接池失败")?;
         info!("Redis session 存储 + idempotency 缓存已就绪");
+        // 2026-09-29 新增：企业微信小程序登录客户端装线。
+        // - `config.wecom.enabled == false`（WECOM_CORPID / WECOM_CORPSECRET 留空）
+        //   → `NoopWeComClient`，wx-login 直接返 40109，**后端照常启动**（不 fail-fast）。
+        // - `enabled == true` → `HttpWeComClient`，access_token 缓存与 session 共用
+        //   同一个 redis_pool（key 前缀 `wecom:access_token:*`，与 `session:tok:*` 互不冲突）。
+        //
+        // ⚠️ 日志只打 enabled 布尔与 corpid 后 4 位——corpsecret 绝不出现在日志里。
+        let wecom = build_wecom_client(&config.wecom, redis_pool.clone())
+            .context("构造企业微信登录客户端失败")?;
+        let corp_tail = config
+            .wecom
+            .corpid
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        info!(
+            wecom_enabled = config.wecom.enabled,
+            wecom_corpid_tail = %corp_tail,
+            "企业微信登录客户端已就绪"
+        );
         (
             Arc::new(RedisSessionStore::new(redis_pool.clone())),
             // 2026-09-23 新增 Idempotency 中间件：与 session 同池共享
             Arc::new(RedisIdempotencyStore::new(redis_pool)),
+            wecom,
         )
     };
 
@@ -116,6 +143,8 @@ async fn main() -> anyhow::Result<()> {
         session,
         // 2026-09-23 新增 Idempotency 中间件存储
         idempotency_store.clone(),
+        // 2026-09-29 新增：企业微信小程序登录客户端
+        wecom,
     ));
 
     // 9. 启动后台任务

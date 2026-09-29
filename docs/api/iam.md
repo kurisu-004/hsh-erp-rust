@@ -25,6 +25,9 @@
 | GET | `/api/v2/iam/users/{id}/roles` | 已登录 | 该用户的角色列表 |
 | POST | `/api/v2/iam/users/{id}/roles` | Manager | 给用户添加角色 |
 | POST | `/api/v2/iam/users/{id}/roles/{role_id}/remove` | Manager | 移除用户角色 |
+| POST | `/api/v2/iam/users/{id}/wx-bind` | Manager | 绑定企业微信 userid（2026-09-29 新增） |
+| GET | `/api/v2/iam/users/{id}/wx-bind` | Manager | 查该用户的企业微信绑定列表（2026-09-29 新增） |
+| DELETE | `/api/v2/iam/users/{id}/wx-bind` | Manager | 解绑该用户的全部企业微信绑定（2026-09-29 新增） |
 
 ---
 
@@ -338,6 +341,84 @@ Response 200 `data`: `null`
 
 ---
 
+## 企业微信绑定端点（2026-09-29 新增）
+
+供 [`POST /api/v2/wx/iam/wx-login`](./wx.md#post-apiv2wxiamwx-login) 使用的预绑定表
+`t_wx_identity`。**仅预绑定，不自动开户**：管理员先把企业微信 userid 绑到某个系统账号，
+该 userid 才能登录成功。
+
+> 三个端点全部要求 **Manager**，权限在 service 层强制（对齐 `list_users` / `add_role`）。
+> 唯一键为 `(corp_id, wx_user_id)` 的 **partial unique**（`WHERE deleted_at IS NULL`），
+> 因此解绑后可重新绑定同一 userid；同一 userid 绑到**别的**系统账号会返回 40108。
+
+### `POST /api/v2/iam/users/{id}/wx-bind`
+
+权限: **Manager**
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `id` | string (i64) | 系统账号 ID |
+
+Request：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `wx_user_id` | string | ✓ | 企业微信 userid；服务端会 trim + **转小写**（企微 userid 不区分大小写）；长度 1..=64 |
+| `corp_id` | string? | — | **保留字段，当前被忽略**（2026-09-29 起一律以后端 `WECOM_CORPID` 为准；传了不一致的值只打服务端 warn）。后端 `WECOM_CORPID` 为空 → 40109 |
+
+Response 200 `data`：`WxIdentity`（见下文共享 DTO）
+
+幂等语义：
+
+- 绑到**同一个** `user_id` 重复调用 → **200 成功**（返回既有绑定行，不新建）
+- 绑到**别的** `user_id` → **40108**（HTTP 409）
+
+错误码：
+
+- 40001 VALIDATION_ERROR — `wx_user_id` 空白 / 超 64 字符；后端 `WECOM_CORPID` 超 64 字符
+- 20601 BIZ_USER_ACCOUNT_NOT_FOUND — 目标账号不存在
+- 40108 BIZ_WX_BINDING_DUPLICATE — 该 userid 已绑到其它系统账号
+- 40109 BIZ_WX_NOT_CONFIGURED — 后端 `WECOM_CORPID` 为空（请求体 `corp_id` 不能绕过）
+- 40300 FORBIDDEN — 非 Manager
+
+### `GET /api/v2/iam/users/{id}/wx-bind`
+
+权限: **Manager**
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `id` | string (i64) | 系统账号 ID |
+
+Response 200 `data`：`[WxIdentity]`。该账号**无绑定**时返回**空数组**（不是 404）。
+不校验目标账号是否存在（语义是「列绑定集合」）。
+
+### `DELETE /api/v2/iam/users/{id}/wx-bind`
+
+权限: **Manager**
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `id` | string (i64) | 系统账号 ID |
+
+Request: 无
+
+Response 200 `data`：`[WxIdentity]` —— 本次**被软删**的绑定行（无绑定时为空数组）。
+
+幂等语义：该账号当前无绑定时重复 DELETE → **200 + 空数组**（不报 404）。
+解绑走 `soft_delete`（`deleted_at` + 乐观锁 `version`），**不物理删除**。
+
+错误码：
+
+- 40300 FORBIDDEN — 非 Manager
+
+---
+
 ## 共享 DTO
 
 ### UserDetail 字段
@@ -366,3 +447,17 @@ Response 200 `data`: `null`
 | `scope_id` | string (i64)? | 绑定的货架 ID（仅 `SHELF_ACCOUNT` 非空） |
 | `shelf_code` | string? | 货架编号（仅 `SHELF_ACCOUNT` 非空） |
 | `shelf_name` | string? | 货架名（仅 `SHELF_ACCOUNT` 非空） |
+
+### WxIdentity 字段（`t_wx_identity`，2026-09-29 新增）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `id` | string (i64) | 绑定行 ID（雪花） |
+| `corp_id` | string | 企业 ID（永远等于后端 `WECOM_CORPID`） |
+| `wx_user_id` | string | 企业微信 userid（已 trim + 转小写） |
+| `user_id` | string (i64) | 系统账号 ID |
+| `version` | i32 | 乐观锁；`DELETE` 响应里是**软删之后**的值（已 +1） |
+| `created_at` | naive datetime | 绑定时间 |
+
+> 不返回 `corpsecret` / `session_key` —— 本表也从不存这两样
+> （`session_key` 拿到即丢，见 `src/modules/wx/wecom_client.rs`）。

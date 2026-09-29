@@ -31,10 +31,19 @@
 //!
 //! ## 反向依赖关系
 //! 本 crate 的 `[dependencies]` 声明 `hsh-erp-rust = { path = ".." }`，
-//! cargo 允许集成测试基建 crate 反向依赖主二进制（无循环构建）。编译顺序：
+//! cargo 允许集成测试基建 crate 反向依赖主二进制。集成测试链路编译顺序：
 //! 1. `hsh-erp-rust`（主二进制）
 //! 2. `hsh-erp-test-support`（依赖主二进制，但仅编译一次，后续 cached）
 //! 3. integration tests（dev-deps 拉入本 crate）
+//!
+//! 2026-09-29 校正（review 第 3 轮 N3）：初版此处写「无循环构建」——对
+//! **非 test 构建**成立，但**不再适用于 `--lib` 单测**：wx 域 access_token 缓存
+//! 单测（`src/modules/wx/wecom_client.rs` 的 `mod tests`）在 `#[cfg(test)]` 里用了
+//! 本 crate 的 `test_redis_url()`，于是主 lib 的 test target 依赖本 crate、本 crate
+//! 又依赖主 lib，构成 cargo 允许的 **dev-dep 环**（生产 `cargo build` 不受影响，
+//! dev-deps 不参与）。主仓 `Cargo.toml` 的 `[dev-dependencies]` 处有同一说明。
+//! 副作用：`cargo test --lib` 会一并构建本 crate——但**不会**因此要求 Redis 在场，
+//! 那条测试无 Redis 时跳过。
 //!
 //! ## 两层隔离模型（沿用原 mod.rs 设计，未变）
 //! - **Layer 1**：容器生命周期由 `.cargo/config.toml` 的 `runner =

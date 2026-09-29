@@ -235,6 +235,8 @@ pub fn test_app_config() -> Arc<AppConfig> {
         bootstrap_admin_enabled: false,
         // 2026-09-28 新增：rust → python 后端转发配置（session service 单测不读，留默认）。
         python_backend: crate::infra::config::PythonBackendConfig::default(),
+        // 2026-09-29 新增：企业微信登录配置（session service 不读，占位默认值）
+        wecom: crate::infra::config::WeComConfig::default(),
     })
 }
 

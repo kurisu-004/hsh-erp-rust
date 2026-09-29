@@ -1,24 +1,34 @@
 use std::sync::Arc;
 
+use sqlx::PgConnection;
+
 use crate::auth::password;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::shared::error::{AppError, code};
+// 2026-09-29 新增：企业微信身份绑定（`t_wx_identity` 的 SQL 真源在 wx 域）
+use crate::modules::wx::repo::{WxIdentity, WxIdentityInsert, WxIdentityRepo};
 
 use super::menu::build_menu_tree;
 // `iam/service/` 子目录中 dto / vo / repo 是 sibling 的兄弟模块 —— 用 `super::super::` 跨级
 use super::super::dto::{
-    UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest,
+    UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest, WxBindRequest,
 };
 use super::super::repo::model::User;
 use super::super::repo::{
     IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow,
 };
-use super::super::vo::{MenuNodeOut, UserListOut, UserOut, UserRoleOut};
+use super::super::repo::sql::user as sqlx_user;
+use super::super::vo::{MenuNodeOut, UserListOut, UserOut, UserRoleOut, WxIdentityOut};
 
 /// 管理员重置密码时写入的默认口令（对齐 Python `DEFAULT_RESET_PASSWORD`）
 pub const DEFAULT_RESET_PASSWORD: &str = "changeme";
+
+/// `t_wx_identity.corp_id` 列宽（DB 侧 varchar(64)，应用层同步守卫）
+const MAX_CORP_ID_LEN: usize = 64;
+/// `t_wx_identity.wx_user_id` 列宽（DB 侧 varchar(64)，应用层同步守卫）
+const MAX_WX_USER_ID_LEN: usize = 64;
 
 /// SHELF_ACCOUNT 角色唯一合法的 scope_type
 const SCOPE_TYPE_SHELF: &str = "shelf";
@@ -485,6 +495,213 @@ impl AccountService {
     }
 
     // =======================================================================
+    // 企业微信身份绑定（2026-09-29 新增）
+    //
+    // `t_wx_identity` 的 SQL 真源在 `modules::wx::repo::WxIdentityRepo`（wx 域是
+    // 本表的 owner：wx-login handler 直接读它做预绑定反查）。iam 域只在 **管理**
+    // 侧写它，故借 `&mut PgConnection` 直调——不为了这 3 个方法在 IamRepoTrait
+    // 上再加 3 个方法（那是给 17 个方法的胖 trait 继续增肥，且这些方法不参与
+    // 既有 service 的单测 mock 面）。
+    //
+    // 权限：三个方法全部 `current.require_role(Role::Manager)?`（对齐
+    // `list_users` / `add_role` 的既有做法——service 层强制，handler 不重复校验）。
+    // =======================================================================
+
+    /// 绑定企业微信 userid 到系统账号（`POST /iam/users/{id}/wx-bind`）。
+    ///
+    /// ## 幂等语义
+    /// - 绑到**同一个** `user_id` → 幂等成功（返回已有绑定，不报错）
+    /// - 绑到**别的** `user_id` → `40108 BIZ_WX_BINDING_DUPLICATE`（409）
+    ///
+    /// ## `default_corp_id` —— 唯一真相源，请求体的 `corp_id` **一律忽略**
+    /// handler 从 `state.config.wecom.corpid` 取值传进来（`AccountService` 只持
+    /// `snowflake`，不注入 config——与既有构造签名保持一致）。为空 → `40109`。
+    ///
+    /// 2026-09-29 收敛（review 第 1 轮 Y3）：初版是「请求体 `corp_id` 优先、
+    /// 省略时才用配置」，与登录侧（`wx/auth.rs` 硬校验「企微返回 corpid ==
+    /// 配置值」，且查询只用配置值）**不对称**。后果是能写出一批永远查不到的死行：
+    /// 管理员绑到 `ww-second-corp`，用户却按 `WECOM_CORPID` 登录 → 40107，
+    /// 且还会在别的企业命名空间占住 `(corp_id, wx_user_id)` 的唯一坑位，将来真做
+    /// 多企业时该 userid 绑不上（撞 40108）。现改为**只认后端配置**：请求体带
+    /// 与配置不一致的 `corp_id` 时打 `warn` 帮管理员定位，但一律以配置落库。
+    pub async fn bind_wx_identity(
+        &self,
+        conn: &mut PgConnection,
+        user_id: i64,
+        req: &WxBindRequest,
+        default_corp_id: &str,
+        current: &CurrentUser,
+    ) -> Result<WxIdentityOut, AppError> {
+        current.require_role(Role::Manager)?;
+
+        // 归一化：userid trim + 转小写（企业微信 userid 不区分大小写；
+        // 不归一会导致 "ZhangSan" 与 "zhangsan" 变成两条绑定）
+        let wx_user_id = req.wx_user_id.trim().to_lowercase();
+        if wx_user_id.is_empty() {
+            return Err(AppError::validation("wx_user_id 不能为空"));
+        }
+        if wx_user_id.chars().count() > MAX_WX_USER_ID_LEN {
+            return Err(AppError::validation(format!(
+                "wx_user_id 长度超限（> {MAX_WX_USER_ID_LEN} 字符）"
+            )));
+        }
+
+        // corp_id：**只认后端配置**（2026-09-29 review 第 1 轮 Y3）。
+        // 请求体 `corp_id` 是保留字段（前端可能已在传），但**一律忽略**：登录侧
+        // 只认 `WECOM_CORPID`，允许请求体另指定企业只会写出永远查不到的死行。
+        let corp_id = default_corp_id.trim();
+        if corp_id.is_empty() {
+            return Err(AppError::biz(
+                code::BIZ_WX_NOT_CONFIGURED,
+                "企业微信登录未配置（WECOM_CORPID 为空），无法绑定",
+            ));
+        }
+        // 请求体带了不一致的 corp_id → warn 帮管理员定位「绑了却登不进来」，
+        // 但不报错、不改落库值（显式忽略 > 静默生效成另一个值）。
+        if let Some(reqd) = req.corp_id.as_deref().map(str::trim)
+            && !reqd.is_empty()
+            && !reqd.eq_ignore_ascii_case(corp_id)
+        {
+            tracing::warn!(
+                requested_corp_id = %reqd,
+                configured_corp_id = %corp_id,
+                user_id,
+                "wx-bind 请求体 corp_id 与 WECOM_CORPID 不符，已忽略并按配置落库"
+            );
+        }
+        if corp_id.chars().count() > MAX_CORP_ID_LEN {
+            return Err(AppError::validation(format!(
+                "corp_id 长度超限（> {MAX_CORP_ID_LEN} 字符）"
+            )));
+        }
+
+        // 目标账号必须存在（防绑到不存在的 user_id）
+        sqlx_user::get_user_by_id(&mut *conn, user_id)
+            .await?
+            .ok_or_else(|| user_not_found(user_id))?;
+
+        // 幂等 / 冲突判定
+        match WxIdentityRepo::get_by_corp_and_user(&mut *conn, corp_id, &wx_user_id).await? {
+            Some(existing) if existing.user_id == user_id => {
+                // 同一账号重复绑 → 幂等成功
+                return Ok(to_wx_identity_out(existing));
+            }
+            Some(_) => {
+                return Err(AppError::biz(
+                    code::BIZ_WX_BINDING_DUPLICATE,
+                    "该企业微信账号已绑定到其他系统账号",
+                ));
+            }
+            None => {}
+        }
+
+        let insert = WxIdentityInsert {
+            id: self.snowflake.next_id(),
+            corp_id: corp_id.to_string(),
+            wx_user_id,
+            user_id,
+            created_at: now_naive(),
+            created_by: Some(current.id),
+        };
+        // 唯一索引兜底：并发插入撞 `uk_wx_identity_corp_user` → 40108 而非 500
+        WxIdentityRepo::create(&mut *conn, &insert)
+            .await
+            .map_err(map_duplicate_wx_identity)?;
+
+        let row = WxIdentityRepo::get_by_corp_and_user(&mut *conn, &insert.corp_id, &insert.wx_user_id)
+            .await?
+            .ok_or_else(|| AppError::internal("创建后回读企业微信绑定失败"))?;
+        Ok(to_wx_identity_out(row))
+    }
+
+    /// 解绑企业微信 userid（`DELETE /iam/users/{id}/wx-bind`）。
+    ///
+    /// ## 幂等语义
+    /// 该 user 当前**没有**活跃绑定时重复 DELETE → 成功（`Ok(vec![])`）。
+    /// 有多行绑定时全部软删（解绑账号 = 该账号的所有企业微信身份一并失效）。
+    ///
+    /// ## 返回值语义（2026-09-29 修，review 第 1 轮 B3；第 3 轮 N4 校正措辞）
+    /// 逐行复核后确认：`WxIdentityOut`（`vo/account.rs`）只有 6 个字段
+    /// （`id` / `corp_id` / `wx_user_id` / `user_id` / `version` / `created_at`），
+    /// `to_wx_identity_out` 也只映射这 6 个。因此下面复刻出来的
+    /// `deleted_at` / `updated_at` / `updated_by` **未纳入 VO，不会出现在 HTTP
+    /// 响应里**（初版注释称「返回软删之后的行快照」，措辞夸大，已校正）。
+    ///
+    /// 真正在响应中生效的只有 `version`：已修正为**软删后的值**（= 旧值 + 1，
+    /// 与 SQL 的 `version = version + 1` 一致）。初版直接推入删除**前**读到的行，
+    /// `version` 是旧值——将来若有基于 version 的写端点（例如「改绑到别的
+    /// userid」）消费这个字段，会差一。`created_at` 保持原值（软删不改它）。
+    pub async fn unbind_wx_identity(
+        &self,
+        conn: &mut PgConnection,
+        user_id: i64,
+        current: &CurrentUser,
+    ) -> Result<Vec<WxIdentityOut>, AppError> {
+        current.require_role(Role::Manager)?;
+
+        let rows = WxIdentityRepo::list_by_user_id(&mut *conn, user_id).await?;
+        if rows.is_empty() {
+            // 幂等：本来就没绑
+            return Ok(Vec::new());
+        }
+
+        let when = now_naive();
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let affected = WxIdentityRepo::soft_delete(
+                &mut *conn,
+                r.id,
+                r.version,
+                when,
+                Some(current.id),
+            )
+            .await?;
+            if affected == 0 {
+                // 乐观锁冲突：并发已被别人解绑 / 改过。整体回滚（handler 未 commit）
+                return Err(version_conflict());
+            }
+            // 复刻 soft_delete 的 SQL 写后态（version +1 / deleted_at = when /
+            // updated_* = 本次操作者）。其中**只有 `version` 会经 `to_wx_identity_out`
+            // 进入 VO / HTTP 响应**（`deleted_at` / `updated_*` 被 VO 丢弃，见上方
+            // 「返回值语义」），保留其余三列是为了让这里的结构体字面量与 SQL 的
+            // 写入列一一对应、便于日后 VO 扩字段时直接生效。
+            //
+            // 之所以在 service 层复刻而不是让 SQL `RETURNING`：soft_delete 的返回
+            // 类型是 `u64`（影响行数），service 用它判乐观锁冲突；为顺带取行改成
+            // 返回结构体反而会模糊「影响行数」这个主语义，且要多一条 .sqlx 元数据。
+            //
+            // ⚠️ **漂移风险（2026-09-29 review 第 3 轮 N4 登记）**：这是一处
+            // **手工复刻**，编译器拦不住。若将来改动
+            // `WxIdentityRepo::soft_delete`（`modules/wx/repo.rs`）的写入列
+            // （例如多加一列 `last_unbind_at`、或把 `version = version + 1` 改成
+            // 别的算法），**必须同步修改这里**，否则返回值会静默失真。
+            // 触发同步的两条判据：① soft_delete 的 `SET` 子句增删列；
+            // ② `version` 的算法变化。
+            out.push(to_wx_identity_out(WxIdentity {
+                version: r.version + 1,
+                updated_at: when,
+                updated_by: Some(current.id),
+                deleted_at: Some(when),
+                ..r
+            }));
+        }
+        Ok(out)
+    }
+
+    /// 查某系统账号的企业微信绑定（`GET /iam/users/{id}/wx-bind`）。无绑定 → 空数组。
+    pub async fn get_wx_identity(
+        &self,
+        conn: &mut PgConnection,
+        user_id: i64,
+        current: &CurrentUser,
+    ) -> Result<Vec<WxIdentityOut>, AppError> {
+        current.require_role(Role::Manager)?;
+
+        let rows = WxIdentityRepo::list_by_user_id(&mut *conn, user_id).await?;
+        Ok(rows.into_iter().map(to_wx_identity_out).collect())
+    }
+
+    // =======================================================================
     // 菜单（helper：对 SessionService（原 AuthService）`/me` 与登录响应开放）
     // =======================================================================
 
@@ -571,6 +788,18 @@ fn to_role_out(r: UserRoleRow) -> UserRoleOut {
     }
 }
 
+/// `t_wx_identity` 行 → `WxIdentityOut`（2026-09-29 新增）
+fn to_wx_identity_out(r: WxIdentity) -> WxIdentityOut {
+    WxIdentityOut {
+        id: r.id,
+        corp_id: r.corp_id,
+        wx_user_id: r.wx_user_id,
+        user_id: r.user_id,
+        version: r.version,
+        created_at: r.created_at,
+    }
+}
+
 /// 唯一索引兜底：并发插入撞上 `uk_t_user_username` 时翻成 409 而非 500
 fn map_duplicate_username(e: sqlx::Error) -> AppError {
     if is_unique_violation(&e) {
@@ -584,6 +813,19 @@ fn map_duplicate_username(e: sqlx::Error) -> AppError {
 fn map_duplicate_role(e: sqlx::Error) -> AppError {
     if is_unique_violation(&e) {
         AppError::biz(code::ROLE_DUPLICATE, "role already assigned to this user")
+    } else {
+        AppError::from(e)
+    }
+}
+
+/// 唯一索引兜底：并发插入撞上 `uk_wx_identity_corp_user` 时翻成 40108 而非 500
+/// （2026-09-29 新增；DB 兜底与应用层预检同码 40108）
+fn map_duplicate_wx_identity(e: sqlx::Error) -> AppError {
+    if is_unique_violation(&e) {
+        AppError::biz(
+            code::BIZ_WX_BINDING_DUPLICATE,
+            "该企业微信账号已绑定到其他系统账号",
+        )
     } else {
         AppError::from(e)
     }

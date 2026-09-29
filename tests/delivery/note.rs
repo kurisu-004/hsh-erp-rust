@@ -965,6 +965,8 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
         std::sync::Arc::new(
             hsh_erp_rust::middleware::idempotency::RedisIdempotencyStore::new(redis_pool),
         ),
+        // 2026-09-29 新增：企业微信登录客户端（pickup 测试不走 wx-login，走 Noop）
+        std::sync::Arc::new(hsh_erp_rust::modules::wx::wecom_client::NoopWeComClient),
     );
     let _ = state; // unused — pickup 测试通过 app 走
 

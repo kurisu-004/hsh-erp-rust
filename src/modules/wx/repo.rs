@@ -5,11 +5,19 @@
 //! 聚合（无业务规则分支、无 OCC、无乐观锁），trait 抽象带来的 mock 收益小于
 //! 维护成本（按 `part/batch/repo.rs` 2026-09-22 PR2 总结的取舍）。
 //!
+//! ## 2026-09-29 扩展：`t_wx_identity` 写侧
+//! 企业微信小程序登录引入**写操作**（admin 绑定 / 解绑）。仍沿用 ZST + 静态方法
+//! 形态（本文件是 wx 域唯一 SQL 真源，形状统一比「为 4 个方法单独开 trait」更重要）。
+//! DB model（`WxIdentity` / `WxIdentityInsert`）也放本文件而非 `vo.rs`——`vo.rs`
+//! 是「HTTP 响应序列化层」，DB model 带 `version` / 审计字段 / 无 `Serialize`，
+//! 语义完全不同。
+//!
 //! ## 命名
 //! - 函数名沿用 `count_xxx` / `list_xxx` / `find_xxx` 三段式
 //! - 返回类型用 `mod vo { ... }` 内的 DTO + 必需的 FromRow 中间结构（避免污染
 //!   `vo.rs` —— 中间结构无 `Serialize`）
 
+use chrono::NaiveDateTime;
 use sqlx::{PgConnection, PgExecutor};
 
 use super::vo::{BatchCounts, CountsByStatus, MonthlyStats, WxBatchSummary, WxPartSummary};
@@ -635,5 +643,145 @@ pub(super) fn row_to_wx_batch(row: WxBatchRow) -> WxBatchSummary {
         finished_date: row.finished_date,
         due_date: row.due_date,
         drawing_url: row.drawing_url,
+    }
+}
+
+// =============================================================================
+// 企业微信身份映射（t_wx_identity，2026-09-29 新增）
+//
+// 仅预绑定：未绑定的 userid 由 handler 拒绝（40107），**不自动开户**。
+// 写入侧由 iam 域的 admin 绑定端点（`/iam/users/{id}/wx-bind`）调用。
+// =============================================================================
+
+/// `t_wx_identity` 行（企业微信 userid → 系统账号 t_user.id 的预绑定）
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct WxIdentity {
+    pub id: i64,
+    /// 企业 ID（来自 `WECOM_CORPID`；多企业部署时同一 userid 在不同企业独立）
+    pub corp_id: String,
+    /// 企业微信 userid（自建应用返回明文；存小写——企微 userid 不区分大小写）
+    pub wx_user_id: String,
+    /// 对应的系统账号雪花 ID
+    pub user_id: i64,
+    /// 乐观锁版本（解绑 soft_delete 时带条件）
+    pub version: i32,
+    pub created_at: NaiveDateTime,
+    pub created_by: Option<i64>,
+    pub updated_at: NaiveDateTime,
+    pub updated_by: Option<i64>,
+    pub deleted_at: Option<NaiveDateTime>,
+}
+
+/// `t_wx_identity` INSERT 入参（id 由调用方用雪花生成，审计字段同批填好）
+#[derive(Debug, Clone)]
+pub struct WxIdentityInsert {
+    pub id: i64,
+    pub corp_id: String,
+    /// 已 trim + 转小写的 userid
+    pub wx_user_id: String,
+    pub user_id: i64,
+    pub created_at: NaiveDateTime,
+    pub created_by: Option<i64>,
+}
+
+/// `t_wx_identity` SQL 真源（ZST + 静态方法，与本文件其余分组同形）
+pub struct WxIdentityRepo;
+
+impl WxIdentityRepo {
+    /// 按 `(corp_id, wx_user_id)` 查活跃绑定（wx-login 主路径）。
+    /// 0 行 → `Ok(None)`，handler 转 `40107 BIZ_WX_NOT_BOUND`。
+    pub async fn get_by_corp_and_user<'e, E: PgExecutor<'e>>(
+        executor: E,
+        corp_id: &str,
+        wx_user_id: &str,
+    ) -> Result<Option<WxIdentity>, sqlx::Error> {
+        sqlx::query_as!(
+            WxIdentity,
+            r#"
+            SELECT id, corp_id, wx_user_id, user_id, version,
+                   created_at, created_by, updated_at, updated_by, deleted_at
+            FROM t_wx_identity
+            WHERE corp_id = $1 AND wx_user_id = $2 AND deleted_at IS NULL
+            "#,
+            corp_id,
+            wx_user_id,
+        )
+        .fetch_optional(executor)
+        .await
+    }
+
+    /// 查某系统账号的全部活跃绑定（`GET /iam/users/{id}/wx-bind` 读端点 +
+    /// admin 界面「该账号绑了谁」展示）。
+    pub async fn list_by_user_id<'e, E: PgExecutor<'e>>(
+        executor: E,
+        user_id: i64,
+    ) -> Result<Vec<WxIdentity>, sqlx::Error> {
+        sqlx::query_as!(
+            WxIdentity,
+            r#"
+            SELECT id, corp_id, wx_user_id, user_id, version,
+                   created_at, created_by, updated_at, updated_by, deleted_at
+            FROM t_wx_identity
+            WHERE user_id = $1 AND deleted_at IS NULL
+            ORDER BY created_at ASC, id ASC
+            "#,
+            user_id,
+        )
+        .fetch_all(executor)
+        .await
+    }
+
+    /// 新增一条绑定。
+    ///
+    /// 唯一索引 `uk_wx_identity_corp_user`（partial unique，soft-deleted 行不参与）
+    /// 是并发下的最终防线：应用层的「先查后插」存在 TOCTOU 窗口，撞唯一索引时
+    /// 由 service 层把 `sqlx::Error::Database(unique_violation)` 翻译成
+    /// `40108 BIZ_WX_BINDING_DUPLICATE`。
+    pub async fn create<'e, E: PgExecutor<'e>>(
+        executor: E,
+        insert: &WxIdentityInsert,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            r#"
+            INSERT INTO t_wx_identity
+                (id, corp_id, wx_user_id, user_id, version, created_at, created_by, updated_at, updated_by)
+            VALUES ($1, $2, $3, $4, 0, $5, $6, $5, $6)
+            "#,
+            insert.id,
+            insert.corp_id,
+            insert.wx_user_id,
+            insert.user_id,
+            insert.created_at,
+            insert.created_by,
+        )
+        .execute(executor)
+        .await?;
+        Ok(())
+    }
+
+    /// 软删一条绑定（解绑）。带乐观锁：影响 0 行 = 并发已被改 / 已解绑。
+    ///
+    /// 返回受影响行数供 service 层判 409（`code::VERSION_CONFLICT`）。
+    pub async fn soft_delete<'e, E: PgExecutor<'e>>(
+        executor: E,
+        id: i64,
+        version: i32,
+        when: NaiveDateTime,
+        updated_by: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query!(
+            r#"
+            UPDATE t_wx_identity
+            SET deleted_at = $3, updated_at = $3, updated_by = $4, version = version + 1
+            WHERE id = $1 AND version = $2 AND deleted_at IS NULL
+            "#,
+            id,
+            version,
+            when,
+            updated_by,
+        )
+        .execute(executor)
+        .await?;
+        Ok(res.rows_affected())
     }
 }

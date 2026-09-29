@@ -14,6 +14,6 @@ pub mod account;
 pub mod menu;
 pub mod session;
 
-pub use account::{UserListOut, UserOut, UserRoleOut};
+pub use account::{UserListOut, UserOut, UserRoleOut, WxIdentityOut};
 pub use menu::MenuNodeOut;
 pub use session::{CurrentUserOut, LoginResponse, LogoutResponse};

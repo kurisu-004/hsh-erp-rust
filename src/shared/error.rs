@@ -5,6 +5,8 @@
 //! - `0`          成功
 //! - `4xxxx`      HTTP 语义（40000 BAD_REQUEST、40001 VALIDATION、40100 UNAUTHORIZED、
 //!   40101 BIZ_AUTH_INVALID、40102 TOKEN_EXPIRED、40103 REFRESH_INVALID、40104 OLD_PASSWORD_MISMATCH、
+//!   40105 SESSION_REVOKED、40106 BIZ_WX_LOGIN_FAILED、40107 BIZ_WX_NOT_BOUND、
+//!   40108 BIZ_WX_BINDING_DUPLICATE、40109 BIZ_WX_NOT_CONFIGURED、
 //!   40300 FORBIDDEN、40301 SHELF_MISMATCH、40400 NOT_FOUND、40901 VERSION_CONFLICT、41301 REQUEST_TOO_LARGE）
 //!   Auth 业务码与通用 UNAUTHORIZED 的区别：业务码携带细分原因。
 //! - `5xxxx`      系统错误（50000 INTERNAL、50001 DATABASE）
@@ -47,6 +49,25 @@ pub mod code {
     pub const REFRESH_INVALID: i32 = 40103; // refresh token 失效/版本不匹配/用户停用
     pub const OLD_PASSWORD_MISMATCH: i32 = 40104; // 修改密码时旧密码错误
     pub const SESSION_REVOKED: i32 = 40105; // 服务端 Redis session 不存在（已 logout/改密/吊销）
+    // 2026-09-29 新增：企业微信小程序登录（`/api/v2/wx/iam/wx-login`）4 个码。
+    //
+    // 槽位选择：40105 之后顺延（401xx = 鉴权语义层，与 iam 登录失败同族）。
+    // 语义边界：40106/40109 是「登录请求本身失败」；40107/40108 是「绑定关系
+    // 状态异常」，其中 40108 仅在 admin 绑定端点出现。
+    //
+    // 40106 = 企微侧 `jscode2session` 失败（code 失效 / 过期 / 换取 access_token
+    // 失败重试后仍失败 / 企微返回未识别 errcode / 网络层失败）。**不重试**
+    //   （code 一次性，重试无意义且会打爆企微频控）。
+    // 40107 = 该 userid 未在 `t_wx_identity` 预绑定（仅预绑定，不自动开户），
+    //   或企微返回的 corpid 与本地 `WECOM_CORPID` 不符（防跨企业串号）。
+    // 40108 = 同一 `(corp_id, wx_user_id)` 已绑到**另一个** `t_user.id`
+    //   （admin 绑定端点；绑到同一个 user_id 是幂等成功，不返此码）。
+    // 40109 = 后端未配置企业微信凭据（`corpid` / `corpsecret` 留空 → enabled=false，
+    //   `NoopWeComClient` 占位），HTTP 503 表示「服务未就绪」而非「调用方无权」。
+    pub const BIZ_WX_LOGIN_FAILED: i32 = 40106;
+    pub const BIZ_WX_NOT_BOUND: i32 = 40107;
+    pub const BIZ_WX_BINDING_DUPLICATE: i32 = 40108;
+    pub const BIZ_WX_NOT_CONFIGURED: i32 = 40109;
 
     pub const FORBIDDEN: i32 = 40300;
 
@@ -382,10 +403,17 @@ fn status_from_code(c: i32) -> StatusCode {
         c if c == code::BIZ_AUTH_INVALID
             || c == code::REFRESH_INVALID
             || c == code::OLD_PASSWORD_MISMATCH
-            || c == code::SESSION_REVOKED =>
+            || c == code::SESSION_REVOKED
+            || c == code::BIZ_WX_LOGIN_FAILED =>
         {
             StatusCode::UNAUTHORIZED
         }
+        // 2026-09-29 新增（企业微信登录）：40107 未绑定 → 403（身份已认证但无权访问
+        // 任何系统账号，是授权决策失败而非认证失败）；40109 未配置 → 503（服务未就绪）。
+        // ⚠️ 必须显式登记：下面 `(40000..50000) => BAD_REQUEST` 的兜底会把它们变成 400。
+        c if c == code::BIZ_WX_NOT_BOUND => StatusCode::FORBIDDEN,
+        c if c == code::BIZ_WX_NOT_CONFIGURED => StatusCode::SERVICE_UNAVAILABLE,
+        c if c == code::BIZ_WX_BINDING_DUPLICATE => StatusCode::CONFLICT,
         c if c == code::SHELF_MISMATCH => StatusCode::FORBIDDEN,
         c if c == code::USER_NOT_FOUND || c == code::ROLE_NOT_FOUND => StatusCode::NOT_FOUND,
         c if c == code::DUPLICATE_USERNAME || c == code::ROLE_DUPLICATE => StatusCode::CONFLICT,
@@ -543,6 +571,11 @@ mod tests {
         (code::REFRESH_INVALID, "REFRESH_INVALID"),
         (code::OLD_PASSWORD_MISMATCH, "OLD_PASSWORD_MISMATCH"),
         (code::SESSION_REVOKED, "SESSION_REVOKED"),
+        // 2026-09-29 新增：企业微信小程序登录 4 码
+        (code::BIZ_WX_LOGIN_FAILED, "BIZ_WX_LOGIN_FAILED"),
+        (code::BIZ_WX_NOT_BOUND, "BIZ_WX_NOT_BOUND"),
+        (code::BIZ_WX_BINDING_DUPLICATE, "BIZ_WX_BINDING_DUPLICATE"),
+        (code::BIZ_WX_NOT_CONFIGURED, "BIZ_WX_NOT_CONFIGURED"),
         (code::FORBIDDEN, "FORBIDDEN"),
         (code::SHELF_MISMATCH, "SHELF_MISMATCH"),
         (code::NOT_FOUND, "NOT_FOUND"),
@@ -931,6 +964,12 @@ mod tests {
         assert_eq!(code::TOKEN_EXPIRED, 40102);
         assert_eq!(code::REFRESH_INVALID, 40103);
         assert_eq!(code::OLD_PASSWORD_MISMATCH, 40104);
+        assert_eq!(code::SESSION_REVOKED, 40105);
+        // 2026-09-29 新增：企业微信小程序登录（Rust 侧新增，Python 端无对应值）
+        assert_eq!(code::BIZ_WX_LOGIN_FAILED, 40106);
+        assert_eq!(code::BIZ_WX_NOT_BOUND, 40107);
+        assert_eq!(code::BIZ_WX_BINDING_DUPLICATE, 40108);
+        assert_eq!(code::BIZ_WX_NOT_CONFIGURED, 40109);
         assert_eq!(code::FORBIDDEN, 40300);
         assert_eq!(code::SHELF_MISMATCH, 40301);
         assert_eq!(code::NOT_FOUND, 40400);
@@ -1133,6 +1172,27 @@ mod tests {
             code::SESSION_REVOKED,
             StatusCode::UNAUTHORIZED,
             "SESSION_REVOKED",
+        ),
+        // 2026-09-29 新增：企业微信小程序登录 4 码（显式登记，绕开 40000 段兜底 400）
+        (
+            code::BIZ_WX_LOGIN_FAILED,
+            StatusCode::UNAUTHORIZED,
+            "BIZ_WX_LOGIN_FAILED",
+        ),
+        (
+            code::BIZ_WX_NOT_BOUND,
+            StatusCode::FORBIDDEN,
+            "BIZ_WX_NOT_BOUND",
+        ),
+        (
+            code::BIZ_WX_BINDING_DUPLICATE,
+            StatusCode::CONFLICT,
+            "BIZ_WX_BINDING_DUPLICATE",
+        ),
+        (
+            code::BIZ_WX_NOT_CONFIGURED,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BIZ_WX_NOT_CONFIGURED",
         ),
         (code::FORBIDDEN, StatusCode::FORBIDDEN, "FORBIDDEN"),
         (

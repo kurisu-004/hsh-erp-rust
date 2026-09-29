@@ -163,8 +163,17 @@ tower = { version = "0.5", features = ["util"] }
 # Phase B/C/D 按 domain 拆 helper 时再统一切到直接 `use hsh_erp_test_support::*;`）。
 #
 # 反向依赖关系：test-support 的 `[dependencies]` 声明 `hsh-erp-rust = { path = ".." }`
-# 是 cargo 允许的常规模式。编译顺序：hsh-erp-rust → hsh-erp-test-support → integration
-# tests，依赖图无环。
+# 是 cargo 允许的常规模式。集成测试链路编译顺序：hsh-erp-rust →
+# hsh-erp-test-support → integration tests。
+#
+# ⚠️ 2026-09-29 校正（review 第 3 轮 N3）：初版此处断言「依赖图无环」——**已失效**。
+# wx 域的 `HttpWeComClient` access_token 缓存单测（`src/modules/wx/wecom_client.rs`
+# 的 `mod tests`）在 `#[cfg(test)]` 里调了 `hsh_erp_test_support::test_redis_url()`，
+# 于是主 lib 的 **test target 依赖 test-support**，而 test-support 又依赖主 lib，
+# 形成 cargo 允许的 **dev-dep 环**（dev-dep 不参与发布/生产构建，故不违反语义）。
+# 准确表述：
+#   - **非 test 构建（`cargo build` / `--release` / Docker）依赖图无环**；
+#   - `--lib` 单测构建会带上 test-support，构成 dev-dep 环（已实测编译/测试全绿）。
 hsh-erp-test-support = { path = "test-support" }
 
 # 2026-09-20 重大重构：去掉 `ephemeral-postgres` 依赖，改用自定义 bash runner 方案。

@@ -377,6 +377,8 @@ async fn e2e_guard_returns_404_when_disabled() {
         state.session.clone(),
         // 2026-09-23 新增 Idempotency 中间件存储：直接复用原 state 的 store
         state.idempotency_store.clone(),
+        // 2026-09-29 新增：直接复用原 state 的企业微信登录客户端（e2e 测试不走 wx-login）。
+        state.wecom.clone(),
     ));
 
     let app = test_app(new_state);
@@ -523,6 +525,8 @@ async fn hard_delete_outsource_company_returns_404_when_guard_disabled() {
         state.session.clone(),
         // 2026-09-23 新增 Idempotency 中间件存储：直接复用原 state 的 store
         state.idempotency_store.clone(),
+        // 2026-09-29 新增：直接复用原 state 的企业微信登录客户端（e2e 测试不走 wx-login）。
+        state.wecom.clone(),
     ));
     let app = test_app(new_state);
 

@@ -7,11 +7,14 @@
 //!   嵌套，避免微信小程序首屏 >4KB 响应（实测单卡片列表 10 条 ~1.5KB JSON）
 //! - **BFF 聚合**：单端点拉多维度数据，减少 mini-program HTTP 请求数
 //!   （如 `/dashboard/home` 一次拉 me + 4 个计数 + 2 个今日事件）
-//! - **复用 IAM 鉴权**：所有端点均需 Bearer JWT，走 `v2_router` 末尾
-//!   `authenticate_middleware` 统一处理（白名单仅排除 `health / login / refresh / _e2e`，
-//!   本模块无公开路径——`auth.rs` 占位的 `wx-login` 后续 PR 会单独加白名单）
+//! - **复用 IAM 鉴权**：绝大多数端点均需 Bearer JWT，走 `v2_router` 末尾
+//!   `authenticate_middleware` 统一处理。**唯一例外**是 `POST /wx/iam/wx-login`
+//!   ——小程序还没有 token，需要匿名换取，故它是白名单里唯一的新增项
+//!   （2026-09-29 加白名单，`auth/middleware.rs::is_public_path` +
+//!   `middleware/idempotency.rs::is_public_idempotency_path` 两处必须同步改）
 //!
-//! ## 端点清单（2026-09-28 本 PR）
+//! ## 端点清单（2026-09-29 更新）
+//! - `POST /wx/iam/wx-login` —— **公开** 企业微信小程序登录（详见 `auth.rs`）
 //! - `GET  /wx/dashboard/home` —— 首页聚合（5 个 BFF 维度）
 //! - `GET  /wx/parts/counts` —— 工单 4 tab 计数
 //! - `GET  /wx/parts` —— 工单卡片分页
@@ -20,16 +23,25 @@
 //! - `GET  /wx/batches?tab=in_progress|done&period=&page=&size=` —— 批次卡片分页
 //! - `GET  /wx/worker/stats?period=YYYY-MM` —— 当月工人工作量
 //!
-//! ## 不在范围内（占位 / 后续 PR）
-//! - `POST /wx/iam/wx-login`（auth.rs 占位，本 PR 不实现）
+//! API 参考见 [`docs/api/wx.md`](../../../docs/api/wx.md)。
+//!
+//! ## 企业微信登录方案（2026-09-29 落地）
+//! - 身份源 = 企业微信 **userid**（不是微信 openid）：小程序只在企业微信客户端内打开
+//! - 走企业微信 `/cgi-bin/miniprogram/jscode2session`（自建应用 → 明文 userid）
+//! - **仅预绑定**：`t_wx_identity` 命中才放行，未绑定直接 40107，不自动开户
+//! - `session_key` 拿到即丢、不落库；不取手机号 / 头像昵称
+//! - 外部 HTTP 调用在事务外；`complete_login` 在 commit 后写 Redis session
 //!
 //! ## 模块布局
-//! - `vo.rs`     —— DTO 响应（仅含 Serialize；不进 axum extractor）
-//! - `repo.rs`   —— SQL 真源（ZST + 静态方法；不开 trait——纯只读聚合无业务规则）
+//! - `dto.rs`     —— 入参 DTO（axum extractor 反序列化目标；2026-09-29 新增）
+//! - `vo.rs`      —— 出参 VO（仅含 Serialize；不进 axum extractor）
+//! - `repo.rs`    —— SQL 真源（ZST + 静态方法；不开 trait——薄聚合无业务规则）
+//! - `wecom_client.rs` —— 企业微信 API 客户端（trait + Http + Noop，2026-09-29 新增）
 //! - `dashboard.rs / parts.rs / batches.rs / worker.rs / auth.rs` —— 各端点 handler
 //!
 //! ## 事务分层
-//! 全部 read-only 端点：`pool.acquire()` 不开事务，与 `part::handler::crud` 范式一致。
+//! 除 `auth.rs::wx_login`（外部 HTTP 必须在事务外）外，全部端点 read-only：
+//! `pool.acquire()` 不开事务，与 `part::handler::crud` 范式一致。
 
 use std::sync::Arc;
 
@@ -41,9 +53,11 @@ use crate::state::AppState;
 pub mod auth;
 pub mod batches;
 pub mod dashboard;
+pub mod dto;
 pub mod parts;
 pub mod repo;
 pub mod vo;
+pub mod wecom_client;
 pub mod worker;
 
 /// 把可选 `period`（YYYY-MM）归一化：`None` → 当前月；`Some(s)` → 严格校验。
@@ -85,14 +99,14 @@ pub(crate) fn resolve_period(raw: Option<&str>) -> Result<String, AppError> {
 /// 2. `parts::router()`     —— `/parts/*`（含 `counts`/`by-serial/{serial_no}`/list）
 /// 3. `batches::router()`   —— `/batches/*`
 /// 4. `worker::router()`    —— `/worker/*`
-/// 5. `auth::router()`      —— `/iam/wx-login` 占位（本 PR 空 router）
+/// 5. `auth::router()`      —— `/iam/wx-login`（2026-09-29 起为真实端点）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .nest("/dashboard", dashboard::router())
         .nest("/parts", parts::router())
         .nest("/batches", batches::router())
         .nest("/worker", worker::router())
-        // auth 占位（wx-login 后续 PR；当前是空 router）
+        // 2026-09-29：企业微信小程序登录（原为空 router 占位）
         .nest("/iam", auth::router())
 }
 

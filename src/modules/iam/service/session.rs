@@ -211,6 +211,83 @@ impl SessionService {
         })
     }
 
+    // =======================================================================
+    // login_by_user_id：wx-login 入口（2026-09-29 新增）
+    // =======================================================================
+
+    /// 「调用方已完成身份认证」后的登录入口（企业微信小程序 wx-login 场景）。
+    ///
+    /// ## 与 `login()` 的差别**仅在凭证校验方式**
+    /// | 步骤 | `login()` | 本方法 |
+    /// |---|---|---|
+    /// | ① username 归一化 | ✅ | ❌ 跳过（调用方已给出 `User`） |
+    /// | ② 查用户 + is_active | ✅ | ✅ 同样校验（停用账号一律拒） |
+    /// | ③ bcrypt 校验 | ✅ | ❌ 跳过（凭证由企微侧承担） |
+    /// | ④ 角色列表（空 → NO_ROLE）| ✅ | ✅ | 
+    /// | ⑤ 角色/shelf 范围 + 菜单 | ✅ | ✅ |
+    /// | ⑥ `issue_token_pair` | ✅ | ✅ |
+    /// | ⑦ `touch_user_last_login_at` | ✅ | ✅ |
+    ///
+    /// ## 为什么不直接在 wx 域重写
+    /// 角色 / shelf 范围 / 菜单解析（`resolve_roles_and_scope` / `menus_for_roles`）
+    /// 是模块私有的。**禁止**在 wx 域重写一份——那会让 RBAC 规则在两处漂移，
+    /// 将来改 SHELF_ACCOUNT zone 白名单时极易漏改一处。本方法在 iam 域内开口，
+    /// wx handler 只需「先验明 userid → 再喂 user」。
+    ///
+    /// ## 调用约定（与 `login()` 完全一致的两阶段）
+    /// 1. handler `pool.begin()` → 本方法 → `tx.commit()`
+    /// 2. handler 调 [`Self::complete_login`]（**必须**，否则 Redis session 缺失，
+    ///    第一个鉴权请求就会拿到 40105 SESSION_REVOKED）
+    pub async fn login_by_user_id<R: IamRepoTrait>(
+        &self,
+        mut repo: R,
+        user: User,
+    ) -> Result<LoginPending, AppError> {
+        // ② 停用账号一律拒绝（与 `login()` 的 40101 文案保持一致，避免泄露
+        // 「账号已存在但被停用」这一额外信息——对外统一「用户名或密码错误」）
+        if !user.is_active {
+            return Err(AppError::biz(code::BIZ_AUTH_INVALID, "用户名或密码错误"));
+        }
+
+        // ④ 角色列表（为空 → 403 NO_ROLE，统一对外不区分原因）
+        let role_rows = repo.list_user_roles_by_user_id(user.id).await?;
+        if role_rows.is_empty() {
+            return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
+        }
+
+        // ⑤ 解析角色枚举 + shelf 范围；委托 account_service 取菜单
+        let (roles, shelf_ids, shelf_wildcard) =
+            resolve_roles_and_scope(&mut repo, &role_rows).await?;
+        if roles.is_empty() {
+            return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
+        }
+        let menus = self.account_service.menus_for_roles(&mut repo, &roles).await?;
+
+        // ⑥ 签发双 token（参数与 `login()` 逐字相同）
+        let pair = issue_token_pair(
+            user.id,
+            user.refresh_token_version,
+            &self.config.jwt.private_key,
+            &self.config.jwt.signing_kid,
+            &self.config.jwt.issuer,
+            &self.config.jwt.audience,
+            self.config.jwt.access_ttl_seconds,
+            self.config.jwt.refresh_ttl_days,
+        )?;
+
+        // ⑦ 戳一下 last_login_at（不动 version，避开与并发业务更新冲突）
+        repo.touch_user_last_login_at(user.id, now_naive()).await?;
+
+        Ok(LoginPending {
+            pair,
+            user,
+            roles,
+            shelf_ids,
+            shelf_wildcard,
+            menus,
+        })
+    }
+
     /// login 第二阶段（commit 之后）：写 Redis session + 组装响应。
     pub async fn complete_login(&self, pending: LoginPending) -> Result<LoginResponse, AppError> {
         let LoginPending {

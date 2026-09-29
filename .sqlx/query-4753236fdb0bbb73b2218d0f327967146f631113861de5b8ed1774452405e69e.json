@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                COUNT(*) FILTER (WHERE event_type = 'PICKED_UP') AS \"picked!\",\n                COUNT(*) FILTER (WHERE event_type = 'DELIVERED') AS \"delivered!\"\n            FROM t_part_event\n            WHERE created_at::date = CURRENT_DATE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "picked!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "delivered!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "4753236fdb0bbb73b2218d0f327967146f631113861de5b8ed1774452405e69e"
+}

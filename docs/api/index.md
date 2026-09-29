@@ -20,6 +20,7 @@
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
 > - [`./_e2e.md`](./_e2e.md) — e2e seed hook（11 端点；dev/test 默认启用，release profile 硬关，2026-09-14）
 > - [`./websocket.md`](./websocket.md) — WebSocket（含 **WORKER_SCAN_* / WORKER_POOL_* / 12+ 业务事件**）
+- [`./wx.md`](./wx.md) — wx 域（**企业微信小程序登录** + 7 个小程序 BFF 聚合端点，2026-09-28/29；身份源为企业微信 userid，仅预绑定不自动开户）
 >
 > **同步流程**：
 > 1. 修改 `src/modules/<mod>/{handler.rs,dto.rs,service.rs}`
@@ -184,7 +185,7 @@ HTTP 状态码：
 | 段 | 含义 |
 |---|---|
 | `0` | 成功 |
-| `4xxxx` | HTTP 语义（400/401/403/404/409/413） + 401xx Auth 业务码 |
+| `4xxxx` | HTTP 语义（400/401/403/404/409/413/503） + 401xx Auth 业务码（含 401xx 企业微信登录 40106–40109） |
 | `5xxxx` | 系统（50000 INTERNAL / 50001 DATABASE） |
 | `2xxxx` | 业务域错误 |
 
@@ -214,6 +215,7 @@ HTTP 状态码：
 | _e2e | [`./_e2e.md`](./_e2e.md) | 11 | ✅ 完全上线（2026-09-14，e2e seed hook，dev/test profile） |
 | websocket | [`./websocket.md`](./websocket.md) | 1 | ✅ 完全上线（2026-09-15 takeover-fill：握手 + snapshot + 业务事件订阅 + 心跳；2026-09-28 起推荐前端走「HTTP 首取 + WS 事件 invalidate」模式，HTTP 端点见 [`./dashboard.md`](./dashboard.md)） |
 | dashboard（HTTP 首取） | [`./dashboard.md`](./dashboard.md) | 1 | ✅ 完全上线（2026-09-28 新增：`GET /api/v2/dashboard/snapshot` HTTP 全量首取大屏快照，与 WS 端点共用 `DashboardService::build_snapshot_with_workers`） |
+| wx（微信小程序 BFF + 企业微信登录） | [`./wx.md`](./wx.md) | **8** | ✅ 完全上线（2026-09-28 新增 7 个 BFF 只读聚合端点；2026-09-29 新增公开端点 `POST /api/v2/wx/iam/wx-login` 企业微信小程序登录 + iam 域 3 个 `wx-bind` 管理端点，绑定信息见 [`./iam.md`](./iam.md)） |
 | 其他 1 域 | — | 0 | ⚪ 仅占位（见下） |
 
 ---
@@ -260,6 +262,10 @@ HTTP 状态码：
 | 40103 | REFRESH_INVALID（refresh 失效/版本不匹配/用户停用） | 401 |
 | 40104 | OLD_PASSWORD_MISMATCH | 401 |
 | 40105 | SESSION_REVOKED（Redis 中 session 不存在 / 已失效） | 401 |
+| 40106 | BIZ_WX_LOGIN_FAILED（企业微信 `jscode2session` 失败：code 失效 / token 失效重取后仍失败 / 未识别 errcode） | 401 |
+| 40107 | BIZ_WX_NOT_BOUND（企业微信 userid 未预绑定 / corpid 与配置不符） | 403 |
+| 40108 | BIZ_WX_BINDING_DUPLICATE（该 userid 已绑到其它系统账号） | 409 |
+| 40109 | BIZ_WX_NOT_CONFIGURED（后端未配置 `WECOM_CORPID` / `WECOM_CORPSECRET`） | 503 |
 
 ### 业务域（2xxxx）
 
