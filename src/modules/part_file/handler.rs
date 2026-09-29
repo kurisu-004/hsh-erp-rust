@@ -17,14 +17,18 @@
 //! python `sts-tmp-keys` 数组入参直签；confirm 端点 `POST /parts/{part_id}/files/confirm`
 //! 仍保留（见 `part::handler::batch`），不依赖 STS 会话存活。
 //!
-//! - 挂在 `/api/v2/part-files/parts/{part_id}`（由 `part_nested_router()` 提供；
-//!   同时也被 `part::router()` 通过 `nest("/parts/{part_id}", ...)` 挂在
-//!   `/api/v2/parts/{part_id}` 下，保留历史 URL `POST /parts/{part_id}/cad-files` 等）：
+//! - 挂在 `/api/v2/part-files/parts/{part_id}`（仅 `part_file::router()` 通过
+//!   `nest("/parts/{part_id}", part_nested_router())` 提供）：
 //!   - `POST /cad-files`                   —— 上传 CAD（kind=CAD_2D）
 //!   - `POST /cnc-programs` / `GET /cnc-programs`  —— 上传 / 列出 G_CODE
 //!   - `POST /setup-sheets` / `GET /setup-sheets`  —— 上传 / 列出 SETUP_SHEET
 //!   - `POST /cnc-pair`                    —— 一次提交 G_CODE + SETUP_SHEET
 //!   - `GET  /files`                       —— 列出 part 全部文件（kind 可选过滤）
+//!
+//! 2026-09-29 修复：移除 `part::router()` 的 nest 兼容 —— 历史 URL
+//! `/api/v2/parts/{part_id}/<file>...`（cad-files / cnc-programs / setup-sheets /
+//! cnc-pair / files）不再可访问；仅保留 part_file 域 canonical 第二入口
+//! `/api/v2/part-files/parts/{part_id}/<file>...`。前端已迁。
 //!
 //! 2026-09-15 followup A8：从 `part/handler.rs` 拆过来，原 1491 行单文件降到 1000 行内。
 //!
@@ -279,9 +283,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{file_id}/url", get(get_part_file_url))
         .route("/{file_id}/content", get(get_part_file_content))
         .route("/{file_id}/delete", post(soft_delete_part_file))
-        // 2026-09-15 followup-cleanup A8：原 part/handler.rs 的 7 个 part 维度
-        // 文件路由（`POST /parts/{part_id}/cad-files` 等）也通过 `/part-files/parts/{part_id}`
-        // 路径对外暴露，便于前端 / 第三方客户端不依赖 parts 入口也能命中。
+        // 2026-09-29 修复：原 2026-09-15 followup-cleanup A8 还在 `part::router()`
+        // nest 一次（保留历史 URL `/api/v2/parts/{part_id}/<file>...`），现已移除。
+        // 当前仅在本 router 内 nest 一次作为 canonical 第二入口
+        // `/api/v2/part-files/parts/{part_id}/<file>...`。
         // 2026-09-18 注：原 `/upload-intents` 路由已删除（迁移至相关 STS 会话域）。
         // 2026-09-28 备注：相关 STS 会话域已下线，前端改走单 uploader + python sts-tmp-keys 直签。
         .nest("/parts/{part_id}", part_nested_router())
@@ -530,8 +535,8 @@ pub async fn list_part_setup_sheets(
     Ok(Json(R::ok(out)))
 }
 
-/// part 维度文件路由：被 `part::router()` 与 `part_file::router()` 各 nest 一次，
-/// 路径前缀分别为 `/parts/{part_id}` 与 `/part-files/parts/{part_id}`。
+/// part 维度文件路由：2026-09-29 起仅被 `part_file::router()` nest 一次，
+/// 路径前缀为 `/part-files/parts/{part_id}`（canonical 第二入口）。
 pub fn part_nested_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/cad-files", post(upload_cad_files))
