@@ -296,7 +296,9 @@ pub fn router() -> Router<Arc<AppState>> {
 // 2026-09-15 followup-cleanup A8：从 part/handler.rs 拆出的 part 维度文件路由
 // ===========================================================================
 
-/// `GET /api/v2/parts/{part_id}/files` —— 列出 part 文件（kind 可选过滤）。
+/// `GET /api/v2/part-files/parts/{part_id}/files` —— 列出 part 文件（kind 可选过滤）。
+///
+/// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 #[derive(Debug, serde::Deserialize)]
 pub struct PartFilesQuery {
     pub kind: Option<String>,
@@ -343,7 +345,9 @@ async fn read_part_file_multipart(
     Ok((data, fname, ct))
 }
 
-/// `POST /parts/{part_id}/cad-files` —— 上传 CAD 文件（kind=CAD_2D）。
+/// `POST /api/v2/part-files/parts/{part_id}/cad-files` —— 上传 CAD 文件（kind=CAD_2D）。
+///
+/// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 pub async fn upload_cad_files(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -363,7 +367,9 @@ pub async fn upload_cad_files(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /parts/{part_id}/cnc-programs` —— 上传 G_CODE（kind=G_CODE；M+CNC）。
+/// `POST /api/v2/part-files/parts/{part_id}/cnc-programs` —— 上传 G_CODE（kind=G_CODE；M+CNC）。
+///
+/// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 pub async fn upload_cnc_program(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -383,7 +389,9 @@ pub async fn upload_cnc_program(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /parts/{part_id}/setup-sheets` —— 上传工艺卡 PDF（kind=SETUP_SHEET；M+CNC）。
+/// `POST /api/v2/part-files/parts/{part_id}/setup-sheets` —— 上传工艺卡 PDF（kind=SETUP_SHEET；M+CNC）。
+///
+/// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 pub async fn upload_setup_sheet(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -410,7 +418,9 @@ pub async fn upload_setup_sheet(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /parts/{part_id}/cnc-pair` —— 一次提交 G_CODE + SETUP_SHEET。
+/// `POST /api/v2/part-files/parts/{part_id}/cnc-pair` —— 一次提交 G_CODE + SETUP_SHEET。
+///
+/// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 ///
 /// 2026-09-22 重构：委托给 `state.cnc_program_service`（与 `cnc-programs/pairs` 同形），
 /// 不再走 `part_file` 的上传逻辑。`part_file::handler` 不直接耦合 cnc_program 业务。
@@ -462,7 +472,9 @@ pub async fn upload_cnc_pair(
     Ok(Json(R::ok(out)))
 }
 
-/// `GET /parts/{part_id}/files` —— 列出 part 全部文件（kind 可选过滤）。
+/// `GET /api/v2/part-files/parts/{part_id}/files` —— 列出 part 全部文件（kind 可选过滤）。
+///
+/// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 pub async fn list_part_files_for_part(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -491,7 +503,9 @@ pub async fn list_part_files_for_part(
     Ok(Json(R::ok(out)))
 }
 
-/// `GET /parts/{part_id}/cnc-programs` —— 列出 part 下 G_CODE 文件。
+/// `GET /api/v2/part-files/parts/{part_id}/cnc-programs` —— 列出 part 下 G_CODE 文件。
+///
+/// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 pub async fn list_part_cnc_programs(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -513,7 +527,9 @@ pub async fn list_part_cnc_programs(
     Ok(Json(R::ok(out)))
 }
 
-/// `GET /parts/{part_id}/setup-sheets` —— 列出 part 下 SETUP_SHEET 文件。
+/// `GET /api/v2/part-files/parts/{part_id}/setup-sheets` —— 列出 part 下 SETUP_SHEET 文件。
+///
+/// 2026-09-29 修复：兼容 nest 移除，统一走 canonical 第二入口。
 pub async fn list_part_setup_sheets(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
