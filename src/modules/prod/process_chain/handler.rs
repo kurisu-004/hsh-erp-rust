@@ -4,7 +4,8 @@
 //!
 //! ## 端点（挂在 `/api/v2/process-chains`，由 `mod.rs::router()` 桥接）
 //! - `GET  /by-part/{part_id}` —— 读 part 绑定的工艺链（404 + 20701）
-//! - `PUT  /by-part/{part_id}` —— 整组 upsert：OCC + 软删旧 steps + INSERT 新 steps
+//! - `POST /by-part/{part_id}` —— 整组 upsert：OCC + 软删旧 steps + INSERT 新 steps
+//!   （2026-09-29 改 PUT → POST 统一全仓库惯例）
 //! - `GET  /{chain_id}` —— 按链 id 读工艺链（2026-09-16 FK 翻转新增；404 + 20701）
 //!
 //! 路由顺序说明：axum 静态段 `by-part` 优先于参数段 `{chain_id}`，
@@ -73,9 +74,9 @@ pub async fn get_by_id(
     Ok(Json(R::ok(out)))
 }
 
-/// PUT /api/v2/process-chains/by-part/{part_id}
+/// POST /api/v2/process-chains/by-part/{part_id}
 ///
-/// 整组 upsert：
+/// 整组 upsert（2026-09-29 改 PUT → POST 统一全仓库惯例）：
 /// - 无链 → INSERT header + link 到 part + INSERT all steps
 /// - 有链 → bump chain version（OCC）→ 软删旧 steps → INSERT 新 steps
 /// - 守卫：part 不存在 → 20101；part.status 非 PENDING → 20705（2026-09-16 新增）

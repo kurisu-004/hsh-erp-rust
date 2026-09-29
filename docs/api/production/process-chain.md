@@ -12,7 +12,7 @@
 >
 > 当前暴露 3 个端点：
 > - `GET /api/v2/prod/process-chains/by-part/{part_id}` —— 读 part 绑定的工艺链（header + steps）
-> - `PUT /api/v2/prod/process-chains/by-part/{part_id}` —— 整组 upsert（替换语义：保留 header id，version++，软删旧 steps，INSERT 新 steps）
+> - `POST /api/v2/prod/process-chains/by-part/{part_id}` —— 整组 upsert（替换语义：保留 header id，version++，软删旧 steps，INSERT 新 steps；2026-09-29 改 PUT → POST 统一全仓库惯例）
 > - `GET /api/v2/prod/process-chains/{chain_id}` —— 按链 id 读工艺链（FK 翻转新增）
 >
 > 实施阶段：part-worker-pool-federated-rocket（2026-09-11）；FK 翻转 PR-1（2026-09-16）
@@ -22,7 +22,7 @@
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
 | GET | `/api/v2/prod/process-chains/by-part/{part_id}` | **Manager+Clerk+Inspector+CncProgrammer**（任意已登录） | 读 part 绑定的工艺链（header + steps）。无链 → 20701 + 404 |
-| PUT | `/api/v2/prod/process-chains/by-part/{part_id}` | **Manager** | 整组 upsert：1:1 binding、OCC、软删旧 steps、INSERT 新 steps、单事务；**PENDING 守卫（20705）** |
+| POST | `/api/v2/prod/process-chains/by-part/{part_id}` | **Manager** | 整组 upsert：1:1 binding、OCC、软删旧 steps、INSERT 新 steps、单事务；**PENDING 守卫（20705）**（2026-09-29 改 PUT → POST） |
 | GET | `/api/v2/prod/process-chains/{chain_id}` | **Manager+Clerk+Inspector+CncProgrammer**（任意已登录） | 按链 id 读工艺链。无链 / 已软删 → 20701 + 404 |
 
 > 路由挂载：`/process-chains` 走 `/api/v2`（见 `src/modules/mod.rs`）。
@@ -80,7 +80,10 @@ Response 200 `data`：[`ProcessChainOut`](#processchainout-字段)
 - 20701 BIZ_PROCESS_CHAIN_NOT_FOUND — 链不存在 / 已软删
 - 40300 FORBIDDEN — 角色不在白名单
 
-### `PUT /api/v2/prod/process-chains/by-part/{part_id}`
+### `POST /api/v2/prod/process-chains/by-part/{part_id}`
+
+**2026-09-29 改 PUT → POST 统一全仓库惯例。** REST 语义上 PUT（整组替换）合理，
+但仓库惯例统一走 POST（21+ 域已统一），保持一致。
 
 权限：**Manager**（service 内 `require_role`）。
 
@@ -220,7 +223,7 @@ helper，`src/modules/part/service/phase1.rs:342`）。错误码 HTTP 409，业�
   `ix_t_part_process_chain_id` + `uq_t_part_process_chain`；`t_part_process_chain` 删 `part_id` 列
 - ✅ 错误码 20701 / 20702 / 20703 / 20704 / 20705（PENDING 守卫）/ **20706（2026-09-16 PR-3 新增，PROCESS_CHAIN_REQUIRED，作用于 7 个生产流端点）**
 - ✅ 模块 6 文件 + repo / service 子模块拆分
-- ✅ 端点：`GET / PUT /by-part/{part_id}` + **`GET /{chain_id}`（2026-09-16 新增）**
+- ✅ 端点：`GET / POST /by-part/{part_id}` + **`GET /{chain_id}`（2026-09-16 新增）**（2026-09-29 改 PUT → POST）
 - ✅ 集成测试 10 场景：happy（含 part 指针回写断言）/ 404 / 替换 steps / negative minutes /
   重复 sort / 非 Manager 403 / step.note 往返 / **非 PENDING 20705** / **by-id 命中+未命中** /
   **part 软删级联**
