@@ -513,10 +513,17 @@ impl AccountService {
     /// - 绑到**同一个** `user_id` → 幂等成功（返回已有绑定，不报错）
     /// - 绑到**别的** `user_id` → `40108 BIZ_WX_BINDING_DUPLICATE`（409）
     ///
-    /// ## `default_corp_id`
+    /// ## `default_corp_id` —— 唯一真相源，请求体的 `corp_id` **一律忽略**
     /// handler 从 `state.config.wecom.corpid` 取值传进来（`AccountService` 只持
-    /// `snowflake`，不注入 config——与既有构造签名保持一致）。请求体 `corp_id`
-    /// 省略时用它；两者都空 → `40109 BIZ_WX_NOT_CONFIGURED`。
+    /// `snowflake`，不注入 config——与既有构造签名保持一致）。为空 → `40109`。
+    ///
+    /// 2026-09-29 收敛（review 第 1 轮 Y3）：初版是「请求体 `corp_id` 优先、
+    /// 省略时才用配置」，与登录侧（`wx/auth.rs` 硬校验「企微返回 corpid ==
+    /// 配置值」，且查询只用配置值）**不对称**。后果是能写出一批永远查不到的死行：
+    /// 管理员绑到 `ww-second-corp`，用户却按 `WECOM_CORPID` 登录 → 40107，
+    /// 且还会在别的企业命名空间占住 `(corp_id, wx_user_id)` 的唯一坑位，将来真做
+    /// 多企业时该 userid 绑不上（撞 40108）。现改为**只认后端配置**：请求体带
+    /// 与配置不一致的 `corp_id` 时打 `warn` 帮管理员定位，但一律以配置落库。
     pub async fn bind_wx_identity(
         &self,
         conn: &mut PgConnection,
@@ -539,18 +546,28 @@ impl AccountService {
             )));
         }
 
-        // corp_id：请求体优先（trim 后非空），否则用后端配置；都空 → 40109
-        let corp_id = req
-            .corp_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| default_corp_id.trim());
+        // corp_id：**只认后端配置**（2026-09-29 review 第 1 轮 Y3）。
+        // 请求体 `corp_id` 是保留字段（前端可能已在传），但**一律忽略**：登录侧
+        // 只认 `WECOM_CORPID`，允许请求体另指定企业只会写出永远查不到的死行。
+        let corp_id = default_corp_id.trim();
         if corp_id.is_empty() {
             return Err(AppError::biz(
                 code::BIZ_WX_NOT_CONFIGURED,
                 "企业微信登录未配置（WECOM_CORPID 为空），无法绑定",
             ));
+        }
+        // 请求体带了不一致的 corp_id → warn 帮管理员定位「绑了却登不进来」，
+        // 但不报错、不改落库值（显式忽略 > 静默生效成另一个值）。
+        if let Some(reqd) = req.corp_id.as_deref().map(str::trim)
+            && !reqd.is_empty()
+            && !reqd.eq_ignore_ascii_case(corp_id)
+        {
+            tracing::warn!(
+                requested_corp_id = %reqd,
+                configured_corp_id = %corp_id,
+                user_id,
+                "wx-bind 请求体 corp_id 与 WECOM_CORPID 不符，已忽略并按配置落库"
+            );
         }
         if corp_id.chars().count() > MAX_CORP_ID_LEN {
             return Err(AppError::validation(format!(
@@ -602,6 +619,12 @@ impl AccountService {
     /// ## 幂等语义
     /// 该 user 当前**没有**活跃绑定时重复 DELETE → 成功（`Ok(vec![])`）。
     /// 有多行绑定时全部软删（解绑账号 = 该账号的所有企业微信身份一并失效）。
+    ///
+    /// ## 返回值语义（2026-09-29 修，review 第 1 轮 B3）
+    /// 返回的是**软删之后**的行快照：`version` 已 +1（与 SQL 的
+    /// `version = version + 1` 一致），`created_at` 保持原值。初版直接推入删除
+    /// **前**读到的行，`version` 是旧值——将来若有基于 version 的写端点
+    /// （例如「改绑到别的 userid」）消费这个字段，会差一。
     pub async fn unbind_wx_identity(
         &self,
         conn: &mut PgConnection,
@@ -631,7 +654,18 @@ impl AccountService {
                 // 乐观锁冲突：并发已被别人解绑 / 改过。整体回滚（handler 未 commit）
                 return Err(version_conflict());
             }
-            out.push(to_wx_identity_out(r));
+            // 复刻 soft_delete 的 SQL 写后态（version +1 / deleted_at = when /
+            // updated_* = 本次操作者），保证返回给调用方的 version 是「删除后的值」。
+            // 之所以在 service 层复刻而不是让 SQL `RETURNING`：soft_delete 的返回
+            // 类型是 `u64`（影响行数），service 用它判乐观锁冲突；为顺带取行改成
+            // 返回结构体反而会模糊「影响行数」这个主语义，且要多一条 .sqlx 元数据。
+            out.push(to_wx_identity_out(WxIdentity {
+                version: r.version + 1,
+                updated_at: when,
+                updated_by: Some(current.id),
+                deleted_at: Some(when),
+                ..r
+            }));
         }
         Ok(out)
     }

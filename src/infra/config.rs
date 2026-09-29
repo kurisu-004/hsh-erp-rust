@@ -242,8 +242,9 @@ impl Default for PythonBackendConfig {
 ///   本方案不适用。
 /// - `WECOM_API_BASE`：企微 API 根地址，缺省 `https://qyapi.weixin.qq.com`
 ///   （单测指向本地 mock server）。
-/// - `WECOM_TOKEN_TTL`：access_token 的 Redis 缓存 TTL（秒），缺省 `6000`。
-///   企微 `gettoken` 返回 `expires_in = 7200`，留 1200s 余量避免边界失效。
+/// - `WECOM_TOKEN_TTL`：access_token 的 Redis 缓存 TTL（秒）**兜底值**，缺省 `6000`。
+///   正常路径用企微 `gettoken` 返回的 `expires_in - 300`（= 6900），只有响应里
+///   **没有** `expires_in` 字段时才回落到这个值（见 `wecom_client::get_token`）。
 /// - `WECOM_HTTP_TIMEOUT_MS`：单次企微 HTTP 请求超时（毫秒），缺省 `5000`。
 ///
 /// ## 为什么用 `env_or(.., "")` 而**不是** `env_required`
@@ -257,10 +258,13 @@ impl Default for PythonBackendConfig {
 /// 降级：未配置时 40109 一眼看出是配置问题。
 ///
 /// ## 安全
-/// `corpsecret` 绝不出现在任何 `tracing` 日志 / `Debug` 输出里；本 struct
-/// 派生 `Debug` 是为便于 `info!` 打 enabled + corpid（脱敏后），调用方
-/// **不要**直接 `{:?}` 打印整个 `WeComConfig`。
-#[derive(Clone, Debug)]
+/// `corpsecret` 绝不出现在任何 `tracing` 日志 / `Debug` 输出里。
+///
+/// 2026-09-29 加固（review 第 1 轮 B4）：原先 `#[derive(Debug)]` 让 `{:?}` 会把
+/// `corpsecret` 一起打出去，安全只靠「调用方记得别打印整个 struct」这条**约定**。
+/// 改为手写 `Debug`（见下方 impl）把 `corpsecret` 固定输出成 `***`——不靠约定、
+/// 靠类型。下游 `info!(?cfg)` 之类的排障用法仍可看到 corpid / enabled / api_base。
+#[derive(Clone)]
 pub struct WeComConfig {
     /// 企业 ID。空串 = 未配置。
     pub corpid: String,
@@ -274,6 +278,24 @@ pub struct WeComConfig {
     pub http_timeout_ms: u64,
     /// 是否启用真实企微调用。`corpid` 与 `corpsecret` **均非空**才 true。
     pub enabled: bool,
+}
+
+/// 手写 `Debug`：屏蔽 `corpsecret`（2026-09-29，review 第 1 轮 B4）。
+///
+/// 与 `serde` 无关——这里只管 `{:?}` / `{cfg:?}`。字段顺序与声明顺序一致，
+/// 便于和 derive 版本对照阅读。
+impl std::fmt::Debug for WeComConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeComConfig")
+            .field("corpid", &self.corpid)
+            // ⚠️ 永远输出 `***`，即使 corpsecret 为空串也不回显原值
+            .field("corpsecret", &"***")
+            .field("api_base", &self.api_base)
+            .field("token_ttl_seconds", &self.token_ttl_seconds)
+            .field("http_timeout_ms", &self.http_timeout_ms)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
 }
 
 impl Default for WeComConfig {
@@ -474,7 +496,8 @@ impl AppConfig {
                         corpid,
                         corpsecret,
                         api_base: env_or("WECOM_API_BASE", "https://qyapi.weixin.qq.com"),
-                        // 企微给 expires_in=7200，留 1200s 余量，避免边界取到半死 token
+                        // 仅兜底：正常路径用企微返回的 expires_in - 300（安全余量），
+                        // 只有企微没回 expires_in 时才用这个值
                         token_ttl_seconds: env_parse("WECOM_TOKEN_TTL", 6000u64)?,
                         http_timeout_ms: env_parse("WECOM_HTTP_TIMEOUT_MS", 5000u64)?,
                     }
@@ -631,5 +654,38 @@ fn env_bool(key: &str, default: bool) -> Result<bool> {
             other => Err(anyhow!("环境变量 {key} 无法解析为 bool: {other:?}")),
         },
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 手写 `Debug` 必须屏蔽 `corpsecret`（2026-09-29，review 第 1 轮 B4）。
+    ///
+    /// 这是「不靠约定靠类型」的回归闸：只要有人把 `impl Debug` 删掉改回
+    /// `#[derive(Debug)]`，本测试立刻红。
+    #[test]
+    fn wecom_config_debug_masks_corpsecret() {
+        let cfg = WeComConfig {
+            corpid: "wwCORPID1234".into(),
+            corpsecret: "SUPER-SECRET-VALUE".into(),
+            ..WeComConfig::default()
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("SUPER-SECRET-VALUE"),
+            "WeComConfig Debug 泄漏 corpsecret: {dbg}"
+        );
+        // 排障需要的非敏感字段仍应可见
+        assert!(dbg.contains("wwCORPID1234"), "corpid 应可见: {dbg}");
+        assert!(dbg.contains("***"), "corpsecret 应显示为 ***: {dbg}");
+    }
+
+    /// corpsecret 为空（未配置）时也不能因为「反正没值」而改回回显逻辑。
+    #[test]
+    fn wecom_config_debug_masks_corpsecret_even_when_blank() {
+        let dbg = format!("{:?}", WeComConfig::default());
+        assert!(dbg.contains("corpsecret: \"***\""), "{dbg}");
     }
 }

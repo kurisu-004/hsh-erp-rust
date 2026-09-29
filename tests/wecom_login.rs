@@ -33,8 +33,7 @@
 
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode, header::AUTHORIZATION, header::HeaderName};
+use axum::http::{StatusCode, header::AUTHORIZATION, header::HeaderName};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
@@ -44,7 +43,7 @@ use hsh_erp_rust::modules::wx::wecom_client::{
 use hsh_erp_rust::shared::error::{AppError, code};
 use hsh_erp_test_support::{
     IamFixture, WecomFixture, json_request, load_iam_fixture, load_wecom_fixture, login_token,
-    send as ts_send, test_app, test_pool,
+    send, test_app, test_pool,
 };
 
 /// wx-login 端点路径（测试直接挂 `v2_router`，无 `/api/v2` 前缀）。
@@ -53,10 +52,6 @@ const WX_LOGIN: &str = "/wx/iam/wx-login";
 // ===========================================================================
 // Helpers
 // ===========================================================================
-
-async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    ts_send(app, req).await
-}
 
 /// 构造一个「成功换身份」的 mock：返回 `(corpid, userid)`。
 fn mock_ok(corp_id: &str, userid: &str) -> MockWeComApiClient {

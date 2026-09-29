@@ -1,10 +1,10 @@
 # wx 域 API（微信小程序 BFF + 企业微信登录）
 
-> 本文件须与 `src/modules/wx/{mod,auth,dashboard,parts,batches,worker,repo,vo,dto}.rs` 保持同步
+> 本文件须与 `src/modules/wx/{mod,auth,dashboard,parts,batches,worker,repo,vo,dto,wecom_client}.rs` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 > IAM 域端点见 [`./iam.md`](./iam.md)
 
-> **2026-09-28 新增**：6 个 BFF 只读聚合端点（首页 / 工单 / 批次 / 工人）。
+> **2026-09-28 新增**：7 个 BFF 只读聚合端点（首页 / 工单 / 批次 / 工人）。
 > **2026-09-29 新增**：`POST /wx/iam/wx-login`（企业微信小程序登录），
 > 以及 iam 域的 3 个绑定管理端点（见 [`./iam.md`](./iam.md)）。此前 wx 域
 > **完全无文档**，本文件一次性补齐全部 8 个端点。
@@ -143,7 +143,7 @@ Response 200 `data`：结构同 `dashboard/home` 的 `part_counts`（`all` /
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `status` | string? | 全部 | 精确过滤；`all` / 省略 = 不过滤 |
+| `status` | string? | 全部 | 精确过滤；`all` / 省略 = 不过滤；其它非法值 → 40001（HTTP 422） |
 | `customer_id` | string (i64)? | — | 按客户过滤 |
 | `page` | i64? | 1 | 页码（从 1 起） |
 | `size` | i64? | 10 | 每页条数，上限 50 |
@@ -185,7 +185,7 @@ Path 参数：
 | `serial_no` | string | 序列号 |
 
 Response 200 `data`：**单个** `WxPartSummary`（字段同上一节）。
-0 行 → 40400 `NOT_FOUND`。
+0 行 → 40400 `NOT_FOUND`（HTTP 404）。
 
 ---
 
@@ -197,7 +197,7 @@ Response 200 `data`：**单个** `WxPartSummary`（字段同上一节）。
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `period` | string? | 当前月 | 严格 `YYYY-MM`；非法 → 40001 |
+| `period` | string? | 当前月 | 严格 `YYYY-MM`；非法 → 40001（HTTP 422） |
 
 ### Response 200 `data`
 
@@ -216,8 +216,8 @@ Response 200 `data`：**单个** `WxPartSummary`（字段同上一节）。
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `tab` | string | — | **必填**；`in_progress`（→ `IN_PROCESS`）或 `done`（→ `DELIVERED`/`COMPLETED`）；其它值 → 空列表 |
-| `period` | string? | 当前月 | 严格 `YYYY-MM` |
+| `tab` | string | — | **必填**；`in_progress`（→ `IN_PROCESS`）或 `done`（→ `DELIVERED`/`COMPLETED`）；其它值 → 40001（HTTP 422） |
+| `period` | string? | 当前月 | 严格 `YYYY-MM`；非法 → 40001（HTTP 422） |
 | `page` | i64? | 1 | 页码 |
 | `size` | i64? | 10 | 每页条数，上限 50 |
 
@@ -253,7 +253,7 @@ Response 200 `data`：**单个** `WxPartSummary`（字段同上一节）。
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `period` | string? | 当前月 | 严格 `YYYY-MM` |
+| `period` | string? | 当前月 | 严格 `YYYY-MM`；非法 → 40001（HTTP 422） |
 
 ### Response 200 `data`
 

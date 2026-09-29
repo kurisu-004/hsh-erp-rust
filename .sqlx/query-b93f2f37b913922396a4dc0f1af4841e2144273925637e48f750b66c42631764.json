@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT deleted_at AS \"d?\", version FROM t_wx_identity WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "d?",
+        "type_info": "Timestamp",
+        "origin": {
+          "Table": {
+            "table": "t_wx_identity",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_wx_identity",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "b93f2f37b913922396a4dc0f1af4841e2144273925637e48f750b66c42631764"
+}

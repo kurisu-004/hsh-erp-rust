@@ -15,6 +15,7 @@
 --  - `version integer NOT NULL DEFAULT 0` 乐观锁（解绑走 soft_delete，带 version 条件）
 --  - `deleted_at timestamp NULL` 软删（查询统一 `WHERE deleted_at IS NULL`）
 --  - 审计字段 created_at / created_by / updated_at / updated_by，naive timestamp
+--    （`DEFAULT now()` 与 t_user 对齐；App 侧仍显式传值，DEFAULT 只是兜底）
 --
 --  ## 唯一索引为何带 `WHERE deleted_at IS NULL`
 --  `uk_wx_identity_corp_user` 是 **partial unique**（与 `uk_t_user_role_scope`、
@@ -31,12 +32,20 @@ CREATE TABLE public.t_wx_identity (
     wx_user_id character varying(64) NOT NULL,
     user_id bigint NOT NULL,
     version integer NOT NULL DEFAULT 0,
-    created_at timestamp without time zone NOT NULL,
+    created_at timestamp without time zone DEFAULT now() NOT NULL,
     created_by bigint,
-    updated_at timestamp without time zone NOT NULL,
+    updated_at timestamp without time zone DEFAULT now() NOT NULL,
     updated_by bigint,
     deleted_at timestamp without time zone
 );
+
+-- 主键：与 baseline 全部 34 张表的 `<table>_pkey PRIMARY KEY (id)` 约定对齐。
+-- 2026-09-29 补（review 第 1 轮 Y1）：初版只建了 partial unique + user_id 索引，
+-- **没有任何索引能定位单行 id** → `WxIdentityRepo::soft_delete` 的
+-- `WHERE id = $1 AND version = $2` 只能走 seq scan。雪花 id 本身唯一，不构成
+-- 正确性 bug，但与全库约定不一致，且解绑路径在绑定量涨起来后会成为慢点。
+ALTER TABLE ONLY public.t_wx_identity
+    ADD CONSTRAINT t_wx_identity_pkey PRIMARY KEY (id);
 
 -- 同一企业内 userid 唯一（软删后释放）；跨企业互不影响（corp_id 参与唯一键）
 CREATE UNIQUE INDEX uk_wx_identity_corp_user

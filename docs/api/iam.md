@@ -366,7 +366,7 @@ Request：
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `wx_user_id` | string | ✓ | 企业微信 userid；服务端会 trim + **转小写**（企微 userid 不区分大小写）；长度 1..=64 |
-| `corp_id` | string? | — | 企业 ID；省略/空串 = 用后端 `WECOM_CORPID`；两者都空 → 40109 |
+| `corp_id` | string? | — | **保留字段，当前被忽略**（2026-09-29 起一律以后端 `WECOM_CORPID` 为准；传了不一致的值只打服务端 warn）。后端 `WECOM_CORPID` 为空 → 40109 |
 
 Response 200 `data`：`WxIdentity`（见下文共享 DTO）
 
@@ -377,10 +377,10 @@ Response 200 `data`：`WxIdentity`（见下文共享 DTO）
 
 错误码：
 
-- 40001 VALIDATION_ERROR — `wx_user_id` 空白 / 超 64 字符；`corp_id` 超 64 字符
+- 40001 VALIDATION_ERROR — `wx_user_id` 空白 / 超 64 字符；后端 `WECOM_CORPID` 超 64 字符
 - 20601 BIZ_USER_ACCOUNT_NOT_FOUND — 目标账号不存在
 - 40108 BIZ_WX_BINDING_DUPLICATE — 该 userid 已绑到其它系统账号
-- 40109 BIZ_WX_NOT_CONFIGURED — 请求未带 `corp_id` 且后端 `WECOM_CORPID` 为空
+- 40109 BIZ_WX_NOT_CONFIGURED — 后端 `WECOM_CORPID` 为空（请求体 `corp_id` 不能绕过）
 - 40300 FORBIDDEN — 非 Manager
 
 ### `GET /api/v2/iam/users/{id}/wx-bind`
@@ -453,10 +453,10 @@ Response 200 `data`：`[WxIdentity]` —— 本次**被软删**的绑定行（�
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `id` | string (i64) | 绑定行 ID（雪花） |
-| `corp_id` | string | 企业 ID |
+| `corp_id` | string | 企业 ID（永远等于后端 `WECOM_CORPID`） |
 | `wx_user_id` | string | 企业微信 userid（已 trim + 转小写） |
 | `user_id` | string (i64) | 系统账号 ID |
-| `version` | i32 | 乐观锁 |
+| `version` | i32 | 乐观锁；`DELETE` 响应里是**软删之后**的值（已 +1） |
 | `created_at` | naive datetime | 绑定时间 |
 
 > 不返回 `corpsecret` / `session_key` —— 本表也从不存这两样

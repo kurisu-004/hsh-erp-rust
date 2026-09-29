@@ -28,6 +28,15 @@
 //! - `AppError` 的 message 字段（会原样回给 HTTP 客户端）
 //! - `WeComSession` / 任何返回给调用方的结构体
 //!
+//! 2026-09-29（review 第 1 轮 R1）补充的两条具体规矩：
+//! 1. **日志里打 `reqwest::Error` 必须先 `.without_url()`**。它的 `Display` 在
+//!    `inner.url` 存在时会追加 ` for url (<完整 URL，含 query>)`，而本模块两个
+//!    请求的 query 分别带 `corpsecret` 与 `access_token`。
+//! 2. **`AppError` 的 message 一律固定文案，绝不带 `{e}`**。wx-login 是公开端点
+//!    （`auth/middleware.rs::is_public_path`），出网被封 / DNS 失败 / 超时在企业
+//!    内网部署里是常态，而 `shared::error::into_response()` 会把 message 原样写进
+//!    响应信封 —— 匿名调用者能从响应体直接读到凭据。
+//!
 //! `session_key` 是小程序会话密钥，本方案只用 userid 做身份映射、不解密任何
 //! 业务数据，因此**拿到即丢**（连内存里的中间字符串都不往上传），更不落库。
 //!
@@ -231,6 +240,16 @@ impl HttpWeComClient {
     /// 取 access_token：先读 Redis 缓存，未命中才调 `gettoken` 并 `SETEX`。
     ///
     /// `force_refresh = true` 时跳过缓存直连企微（`42001` 之类失效后的重取路径）。
+    ///
+    /// ## 已知局限：缓存击穿无 single-flight（2026-09-29 记录，review 第 1 轮 B5）
+    /// 缓存未命中的窗口内，**每个并发登录各打一次 `gettoken`**（Redis 是先读后写
+    /// 的 check-then-act，两次并发都会看到未命中）。企微 gettoken 有频控
+    /// （每企业每分钟上限），当前登录量级（几百 DAU、早高峰集中）无碍；但若将来
+    /// 上量到「瞬时并发登录数 > 企微频控余量」，会退化成：
+    /// 缓存反复写不进去 → 全员实时换取 → 撞企微频控 → errcode 45009 → 40106。
+    /// 届时升级方向：在 `get_token` 里按 `token_cache_key` 加一把进程内
+    /// `tokio::sync::Mutex`（或 single-flight future 池）串行化「未命中 → 换 → 写」
+    /// 这段临界区；多实例部署时进程内锁不够，还需配合 Redis 侧 `SET NX` 分布式锁。
     async fn get_token(&self, force_refresh: bool) -> Result<String, AppError> {
         if !force_refresh
             && let Some(tok) = self.read_token_cache().await?
@@ -251,20 +270,44 @@ impl HttpWeComClient {
             .send()
             .await
             .map_err(|e| {
-                // reqwest::Error 的 Display 不含 query string（只在 `url` 字段里），
-                // 因此这里只打 `%e` 不打 `e.url()`，避免 secret 进日志。
-                tracing::error!(error = %e, corpid = %self.config.corpid, "企业微信 gettoken 请求失败（网络层）");
-                AppError::internal(format!("企业微信 gettoken 网络错误: {e}"))
+                // 2026-09-29 安全修复（review 第 1 轮 R1）：
+                // reqwest::Error 的 `Display` 在 `inner.url` 存在时会追加
+                // ` for url (<完整 URL，含 query>)`——而本请求的 query 里带
+                // `corpsecret`。连接失败 / DNS / TLS / 超时四条路径都会把 url
+                // 塞进错误（`async_impl/client.rs` 的 `if_no_url(|| self.url.clone())`
+                // 与 total/read timeout 分支），所以**必须**先 `without_url()`。
+                // `without_url()` 的官方注释原文就是「if, for example, it contains
+                // sensitive information」。
+                //
+                // ⚠️ `AppError::internal` 的 message 会被
+                // `shared::error::into_response()` **原样**写进响应信封 `message`，
+                // 而 wx-login 是公开端点（`auth/middleware.rs::is_public_path`）——
+                // 出网被封 / DNS 失败 / 超时都是企业内网部署的常态，匿名调用者
+                // 会直接从响应体里读到 corpsecret。故 message 一律**固定文案**，
+                // 绝不带 `{e}`；错误细节只走 `tracing`（已脱敏）。
+                let is_timeout = e.is_timeout();
+                let is_connect = e.is_connect();
+                tracing::error!(
+                    error = %e.without_url(),
+                    is_timeout,
+                    is_connect,
+                    corpid = %self.config.corpid,
+                    "企业微信 gettoken 请求失败（网络层）"
+                );
+                AppError::internal("企业微信 gettoken 网络错误")
             })?;
 
         let status = resp.status();
-        let body: GetTokenResp = resp
-            .json()
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, %status, "企业微信 gettoken 响应解析失败");
-                AppError::internal(format!("企业微信 gettoken 响应解析失败: {e}"))
-            })?;
+        let body: GetTokenResp = resp.json().await.map_err(|e| {
+            // 2026-09-29 安全修复（review 第 1 轮 R1）：与上面同理，
+            // 响应体读取 / JSON 解析失败同样可能带上含 corpsecret 的 url。
+            tracing::error!(
+                error = %e.without_url(),
+                %status,
+                "企业微信 gettoken 响应解析失败"
+            );
+            AppError::internal("企业微信 gettoken 响应解析失败")
+        })?;
 
         if body.errcode != 0 {
             return Err(match classify_wecom_errcode(body.errcode, &body.errmsg) {
@@ -279,7 +322,9 @@ impl HttpWeComClient {
             tracing::error!(corpid = %self.config.corpid, "企业微信 gettoken 返回 errcode=0 但无 access_token");
             AppError::internal("企业微信 gettoken 响应缺 access_token")
         })?;
-        // 幂余量：expires_in 缺省时退回 config.token_ttl_seconds，再减安全余量
+        // 幂余量：expires_in 缺省（或减去余量后 <= 0）时退回 config.token_ttl_seconds
+        // 2026-09-29 澄清（review 第 1 轮 B7）：`WECOM_TOKEN_TTL` **只是兜底**，
+        // 正常路径永远用 `expires_in - 300`（= 6900）。
         let ttl = match body.expires_in {
             Some(e) if e - TOKEN_TTL_SAFETY_MARGIN > 0 => (e - TOKEN_TTL_SAFETY_MARGIN) as u64,
             _ => self.config.token_ttl_seconds,
@@ -372,10 +417,19 @@ impl HttpWeComClient {
             .send()
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "企业微信 jscode2session 请求失败（网络层）");
-                Code2SessionError::Fatal(AppError::internal(format!(
-                    "企业微信 jscode2session 网络错误: {e}"
-                )))
+                // 2026-09-29 安全修复（review 第 1 轮 R1）：本请求的 query 里带
+                // `access_token`，`reqwest::Error` 的 `Display` 会把完整 URL 拼进
+                // 错误文案。日志先 `without_url()`，AppError message 走固定文案
+                // （公开端点会把它原样回给匿名调用者）。详见 `get_token` 同处注释。
+                let is_timeout = e.is_timeout();
+                let is_connect = e.is_connect();
+                tracing::error!(
+                    error = %e.without_url(),
+                    is_timeout,
+                    is_connect,
+                    "企业微信 jscode2session 请求失败（网络层）"
+                );
+                Code2SessionError::Fatal(AppError::internal("企业微信 jscode2session 网络错误"))
             })?;
 
         let status = resp.status();
@@ -388,10 +442,14 @@ impl HttpWeComClient {
             ))));
         }
         let body: Code2SessionResp = resp.json().await.map_err(|e| {
-            tracing::error!(error = %e, %status, "企业微信 jscode2session 响应解析失败");
-            Code2SessionError::Fatal(AppError::internal(format!(
-                "企业微信 jscode2session 响应解析失败: {e}"
-            )))
+            // 2026-09-29 安全修复（review 第 1 轮 R1）：与 gettoken 同理，query
+            // 含 access_token，日志脱敏 + message 固定文案。
+            tracing::error!(
+                error = %e.without_url(),
+                %status,
+                "企业微信 jscode2session 响应解析失败"
+            );
+            Code2SessionError::Fatal(AppError::internal("企业微信 jscode2session 响应解析失败"))
         })?;
 
         if body.errcode != 0 {
@@ -506,8 +564,12 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::routing::get;
+    use deadpool_redis::redis::AsyncCommands;
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 测试用企业 ID（与 `client_for_opts` 里 `WeComConfig.corpid` 一致）。
+    const CORP_ID: &str = "C1";
 
     /// 最小 mock 企微服务端：`WECOM_API_BASE` 指向它。
     ///
@@ -527,7 +589,17 @@ mod tests {
     }
 
     impl MockWeComServer {
+        /// 起一个 jscode2session **不延迟**的 mock server。
         async fn start() -> Self {
+            Self::start_with_code2session_delay(Duration::ZERO).await
+        }
+
+        /// 起一个 jscode2session 响应前 `delay` 的 mock server。
+        ///
+        /// 2026-09-29（review 第 1 轮 R1）：配合 `http_timeout_ms` 更小的 client，
+        /// 可稳定构造出「请求已发出但未响应」的**超时**网络错误——用来证明
+        /// `access_token` 这一段 query 同样会被 reqwest 塞进错误 Display。
+        async fn start_with_code2session_delay(delay: Duration) -> Self {
             let gettoken_body = Arc::new(Mutex::new(serde_json::json!({
                 "errcode": 0, "errmsg": "ok", "access_token": "AT-1", "expires_in": 7200
             })));
@@ -560,6 +632,9 @@ mod tests {
                         let ch = ch.clone();
                         async move {
                             ch.fetch_add(1, Ordering::SeqCst);
+                            if !delay.is_zero() {
+                                tokio::time::sleep(delay).await;
+                            }
                             axum::Json(cb.lock().unwrap().clone())
                         }
                     }),
@@ -600,23 +675,53 @@ mod tests {
     /// `force_token` 只为控制「每次都重取 token」，避免测试依赖 Redis 进程
     /// （本仓单测默认无 Redis；`code_to_session` 的缓存读路径在集成测试里覆盖）。
     fn client_for(base_url: &str) -> (HttpWeComClient, WeComConfig) {
-        let cfg = WeComConfig {
-            corpid: "C1".into(),
-            corpsecret: "SECRET-DO-NOT-LOG".into(),
-            api_base: base_url.to_string(),
-            token_ttl_seconds: 6000,
-            http_timeout_ms: 5000,
-            enabled: true,
-        };
-        // 指向一个无人监听的 Redis 端口：本仓单测不依赖 Redis 进程，
-        // 缓存读/写/删全部走「失败即降级」的 warn 分支，重试路径仍可跑。
-        let redis_pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1/0")
+        client_for_opts(base_url, dead_redis_pool(), 5000)
+    }
+
+    /// 指向一个**真 Redis**（`redis-test:6380`）的 client，用于覆盖 access_token
+    /// 缓存的 read / write / invalidate 三条路径（review 第 1 轮 Y2）。
+    async fn client_for_redis(base_url: &str) -> (HttpWeComClient, WeComConfig) {
+        let pool = hsh_erp_test_support::test_redis_pool().await;
+        del_token_cache(&pool).await;
+        client_for_opts(base_url, pool, 5000)
+    }
+
+    /// 删掉测试 key `wecom:access_token:C1`（与 `HttpWeComClient::token_cache_key`
+    /// 同格式——该函数是私有的，测试只能按字面量复刻）。
+    async fn del_token_cache(pool: &deadpool_redis::Pool) {
+        let mut conn = pool.get().await.expect("get test redis conn");
+        let _: () = conn
+            .del(HttpWeComClient::token_cache_key(CORP_ID))
+            .await
+            .expect("del wecom token cache key");
+    }
+
+    /// 指向「无人监听的 Redis 端口」的连接池：缓存读/写/删全部走「失败即降级」
+    /// 的 warn 分支，其余路径（重试、错误映射）不受影响。
+    fn dead_redis_pool() -> deadpool_redis::Pool {
+        deadpool_redis::Config::from_url("redis://127.0.0.1:1/0")
             .builder()
             .expect("deadpool builder")
             .max_size(1)
             .runtime(deadpool_redis::Runtime::Tokio1)
             .build()
-            .expect("deadpool pool");
+            .expect("deadpool pool")
+    }
+
+    /// 通用构造：可分别覆盖 api_base / Redis 池 / HTTP 超时。
+    fn client_for_opts(
+        base_url: &str,
+        redis_pool: deadpool_redis::Pool,
+        http_timeout_ms: u64,
+    ) -> (HttpWeComClient, WeComConfig) {
+        let cfg = WeComConfig {
+            corpid: CORP_ID.into(),
+            corpsecret: "SECRET-DO-NOT-LOG".into(),
+            api_base: base_url.to_string(),
+            token_ttl_seconds: 6000,
+            http_timeout_ms,
+            enabled: true,
+        };
         let client = HttpWeComClient::new(
             HttpWeComClient::build_http_client(&cfg).expect("build client"),
             redis_pool,
@@ -759,6 +864,103 @@ mod tests {
         let (client, _cfg) = client_for(&format!("http://{addr}"));
         let e = client.code_to_session("code-1").await.expect_err("应失败");
         assert_eq!(e.code(), code::INTERNAL);
+        // 2026-09-29 安全回归（review 第 1 轮 R1）：**只断言 code() 会漏掉泄漏**。
+        // `AppError::Internal` 的 message 会被 `shared::error::into_response()`
+        // 原样写进响应信封回给匿名调用者（wx-login 是公开端点），而
+        // `reqwest::Error` 的 Display 在 connect / DNS / TLS / 超时四条路径上都会
+        // 追加 ` for url (<含 query 的完整 URL>)`——query 里就带着 corpsecret。
+        // 这里对**渲染后**的完整错误文案（AppError Display = code + message，
+        // 与真正回给客户端的字符串同源）做凭据断言。
+        let rendered = e.to_string();
+        assert!(
+            !rendered.contains("corpsecret"),
+            "gettoken 网络错误泄漏 corpsecret: {rendered}"
+        );
+        assert!(
+            !rendered.contains("access_token="),
+            "gettoken 网络错误泄漏 access_token: {rendered}"
+        );
+        assert!(
+            !rendered.contains("SECRET-DO-NOT-LOG"),
+            "gettoken 网络错误泄漏 corpsecret 值: {rendered}"
+        );
+        assert_eq!(e.code(), code::INTERNAL, "凭据断言后仍须是 50001");
+    }
+
+    #[tokio::test]
+    async fn jscode2session_network_error_message_never_contains_access_token() {
+        // gettoken 正常，jscode2session 故意超时（mock server 延迟 3s，client 超时
+        // 200ms）——构造出「请求已发出、未响应」的超时错误。reqwest 的 total
+        // timeout 分支同样 `with_url(self.url.clone())`，而本请求的 query 带
+        // `access_token`（review 第 1 轮 R1）。
+        let srv = MockWeComServer::start_with_code2session_delay(Duration::from_secs(3)).await;
+        let (client, _cfg) = client_for_opts(&srv.base_url, dead_redis_pool(), 200);
+        let e = client
+            .code_to_session("code-1")
+            .await
+            .expect_err("应超时失败");
+        assert_eq!(e.code(), code::INTERNAL);
+        let rendered = e.to_string();
+        assert!(
+            !rendered.contains("access_token"),
+            "jscode2session 网络错误泄漏 access_token: {rendered}"
+        );
+        assert!(
+            !rendered.contains("AT-1"),
+            "jscode2session 网络错误泄漏 token 值: {rendered}"
+        );
+        // 超时属于 Fatal，不重试（jscode2session 只被调 1 次）
+        assert_eq!(srv.code2session_calls(), 1, "超时不应重试");
+    }
+
+    /// access_token 的 Redis 缓存 read / write / invalidate 三条路径（review 第 1 轮 Y2）。
+    ///
+    /// 为什么必须单测覆盖：集成测试注入的是 `MockWeComApiClient`，
+    /// `HttpWeComClient` 的整条缓存路径在有 Redis 的环境下**一次都没跑过**；
+    /// 而 `gettoken` 是本实现里唯一有「打爆企微频控」风险的地方——`SETEX` 的
+    /// TTL 单位、cache key 前缀、读命中短路任一处写错，测试全绿也发现不了，
+    /// 上线表现是「每次登录都换 token」→ 企微频控 → 40106。
+    #[tokio::test]
+    async fn gettoken_is_cached_in_redis_and_reissued_after_invalidate() {
+        let srv = MockWeComServer::start().await;
+        let (client, _cfg) = client_for_redis(&srv.base_url).await;
+
+        // 第 1 次：缓存空 → 真打企微 gettoken
+        client
+            .code_to_session("code-1")
+            .await
+            .expect("第 1 次应成功");
+        assert_eq!(srv.gettoken_calls(), 1, "首次必须实时换取 token");
+
+        // 第 2 次：缓存命中 → 不应再打 gettoken（防打爆企微频控的核心断言）
+        client
+            .code_to_session("code-2")
+            .await
+            .expect("第 2 次应成功");
+        assert_eq!(
+            srv.gettoken_calls(),
+            1,
+            "第 2 次应命中 Redis 缓存，不该再调 gettoken"
+        );
+        assert_eq!(srv.code2session_calls(), 2, "jscode2session 每次都该被调");
+
+        // 手动 DEL 缓存 → 第 3 次必须重新换取
+        let pool = hsh_erp_test_support::test_redis_pool().await;
+        del_token_cache(&pool).await;
+        client
+            .code_to_session("code-3")
+            .await
+            .expect("第 3 次应成功");
+        assert_eq!(srv.gettoken_calls(), 2, "缓存被删后应重新换取 token");
+    }
+
+    /// `token_cache_key` 的字面量契约：格式错会让不同 corpid 串号 / 缓存永不命中。
+    #[test]
+    fn token_cache_key_format_is_stable() {
+        assert_eq!(
+            HttpWeComClient::token_cache_key("wwC1"),
+            "wecom:access_token:wwC1"
+        );
     }
 
     #[tokio::test]
