@@ -46,6 +46,9 @@ pub struct ProductionFixture {
     pub part_manager_user_id: i64,
     /// 复用 PartFixture：MANAGER 用户名（fixture 内含 MANAGER role，用于登录）
     pub part_manager_username: String,
+    /// 复用 PartFixture：INSPECTOR 用户名（fixture 内含 INSPECTOR role，
+    /// 2026-09-29 prod::batch 集成测试用于角色守卫「Inspector 调 dispatch 拒」场景）
+    pub part_inspector_username: String,
     /// 复用 PartFixture：SHELF_ACCOUNT 用户 id（合法登录但用于越权守卫测试）
     pub part_shelf_account_user_id: i64,
     /// 复用 PartFixture：SHELF_ACCOUNT 用户名（fixture 内含 SHELF_ACCOUNT role，
@@ -85,6 +88,7 @@ impl Default for ProductionFixture {
             part_customer_l1_id: PartFixture::CUSTOMER_L1_ID,
             part_manager_user_id: PartFixture::MANAGER_USER_ID,
             part_manager_username: PartFixture::MANAGER_USERNAME.to_string(),
+            part_inspector_username: PartFixture::INSPECTOR_USERNAME.to_string(),
             part_shelf_account_user_id: PartFixture::SHELF_ACCOUNT_USER_ID,
             part_shelf_account_username: PartFixture::SHELF_ACCOUNT_USERNAME.to_string(),
             process_a_id: ProductionFixture::PROCESS_A_ID,

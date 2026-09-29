@@ -120,10 +120,14 @@ Request：
 | ↳ `ASSEMBLY_DELETED` | 装配件软删 | `assembly_id` |
 | ↳ `ASSEMBLY_CANCELLED` | 装配件取消 | `assembly_id` |
 | ↳ `ASSEMBLY_UPDATED` | 父装配件 status 更新（前端主动改字段 / inspection 流 auto-rollup） | `assembly_id` |
+| ↳ `BATCH_PLACED_ON_SHELF` | 车间下发台 PENDING 批次 → IN_PROCESS 成功（2026-09-29 新增，`prod::batch` 单条 dispatch 端点） | `{ batch_id, target_process_id, shelf_id, version }` |
+| ↳ `BATCH_PLACED_ON_SHELF` | 车间下发台多 batch 批量下发成功（2026-09-29 新增，`prod::batch` bulk-dispatch / auto-dispatch 端点，仅 succeeded 部分；skipped 不广播） | `{ batches: [{ batch_id, target_process_id, shelf_id, version }, ...] }` |
 | `Notification` | 通知 | `user_id`, `content` |
 | `Heartbeat` | 心跳 | `ts` |
 
 > **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts/inspection.md#post-apiv2partsworker-scan`](./parts/inspection.md#post-apiv2partsworker-scan) 与 [`./production/worker-pool.md`](./production/worker-pool.md)。
+>
+> **batch 事件说明（2026-09-29 新增）**：`BATCH_PLACED_ON_SHELF` 同样在 HTTP commit 之后广播（沿 worker_pool 范本）；payload 含 4 个字段（batch_id / target_process_id / shelf_id / version）。单条 dispatch 端点发单条形态（payload 顶层字段）；bulk-dispatch / auto-dispatch 端点发批量形态（payload.batches 数组，仅含 succeeded 部分，skipped 不广播）。详见 [`./production/batches.md#ws-事件`](./production/batches.md#ws-事件)。
 >
 > i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
 

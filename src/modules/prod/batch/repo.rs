@@ -1,0 +1,308 @@
+//! prod::batch 子模块 repo 层 —— SQL 真源
+//!
+//! 2026-09-29 新增：本域 SQL 全部集中在本文件（ZST `BatchRepo` + 5 静态方法）；
+//! 不引入胖 trait（与 part/service/phase1/`lifecycle_helpers.rs` 同形 ——
+//! 单 service 不需要 mock 替身，service 收 `&mut PgConnection` 直调 ZST）。
+//!
+//! ## 5 个静态方法
+//! - [`BatchRepo::list_pending_batches`] —— 车间 PENDING 批次列表（JOIN 4 表）
+//! - [`BatchRepo::find_batch_by_id`] —— 按 id 查 batch（含软删过滤开关）
+//! - [`BatchRepo::find_first_shelf_for_process`] —— 按 process_id 取
+//!   `t_shelf_process` 首条 active 货架映射（多结果取 sort_order 最小者）
+//! - [`BatchRepo::update_batch_dispatched`] —— 标记 PENDING 批次已下发
+//!   （status='IN_PROCESS' + location='PRODUCTION_SHELF' + current_holder_id=shelf_id +
+//!   current_process_step_id=NULL），带乐观锁
+//! - [`BatchRepo::first_step_of_chain`] —— 取工艺链首道 step（`ORDER BY step_no LIMIT 1`）
+//!
+//! ## 错误类型
+//! repo 静态方法 → `sqlx::Error`（与项目惯例一致），由 service 层映射 `AppError`。
+
+use chrono::NaiveDate;
+use sqlx::PgConnection;
+
+use crate::modules::part::batch::model::TPartBatch;
+
+/// `prod::batch` ZST 静态方法容器。
+pub struct BatchRepo;
+
+impl BatchRepo {
+    /// PENDING 批次列表（JOIN 4 表）。
+    ///
+    /// 与 `part/batch/repo.rs::list_batches_with_part` 同骨架（基表 + 工单 +
+    /// 客户 L1+L2 + 申请人），但额外 LEFT JOIN `t_part.process_chain_id` 与
+    /// `pb.current_process_step_id`（PR-3 批次 step 化字段），且硬限定
+    /// `pb.status = 'PENDING'`。
+    ///
+    /// 排序：`p.system_delivery_date ASC NULLS LAST, p.is_urgent DESC,
+    /// pb.created_at ASC`（计划交期近 + 加急件优先 + 批次入库时间兜底）。
+    ///
+    /// 默认 `limit=200, offset=0`（由 handler 层 `ListPendingQuery` 默认值兜底）。
+    ///
+    /// 返回 `Vec<PendingBatchRow>` —— service 内转换为 `vo::PendingBatchItem`。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_pending_batches(
+        conn: &mut PgConnection,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<PendingBatchRow>, sqlx::Error> {
+        let rows = sqlx::query_as!(
+            PendingBatchRow,
+            r#"
+            SELECT
+                pb.id              AS "pb_id!",
+                pb.part_id         AS "pb_part_id!",
+                pb.batch_no        AS "pb_batch_no!",
+                pb.quantity        AS "pb_quantity!",
+                pb.status          AS "pb_status!",
+                pb.version         AS "pb_version!",
+                pb.current_process_step_id AS "pb_current_process_step_id?",
+                pb.created_at      AS "pb_created_at!",
+                p.serial_no        AS "p_serial_no?",
+                p.name             AS "p_name!",
+                p.drawing_no       AS "p_drawing_no!",
+                p.planned_delivery_date AS "p_planned_delivery_date!",
+                p.system_delivery_date  AS "p_system_delivery_date?",
+                p.is_urgent        AS "p_is_urgent!",
+                p.note             AS "p_note?",
+                p.process_chain_id AS "p_process_chain_id?",
+                c.name             AS "c_name?",
+                pc.name            AS "pc_name?",
+                a.name             AS "a_name?"
+            FROM t_part_batch pb
+            JOIN t_part p
+              ON p.id = pb.part_id
+            LEFT JOIN t_customer c
+              ON c.id = p.customer_id
+            LEFT JOIN t_customer pc
+              ON pc.id = c.parent_id
+            LEFT JOIN t_applicant a
+              ON a.name = p.applicant_name AND a.deleted_at IS NULL
+            WHERE pb.status = 'PENDING'
+              AND pb.deleted_at IS NULL
+              AND p.deleted_at IS NULL
+            ORDER BY
+                p.system_delivery_date ASC NULLS LAST,
+                p.is_urgent DESC,
+                pb.created_at ASC,
+                pb.id ASC
+            LIMIT $1 OFFSET $2
+            "#,
+            limit,
+            offset,
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// PENDING 列表配套 COUNT（与 `list_pending_batches` 同 WHERE 不同 SELECT）。
+    pub async fn count_pending_batches(conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
+        let n: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) AS "n!"
+            FROM t_part_batch pb
+            JOIN t_part p
+              ON p.id = pb.part_id
+            WHERE pb.status = 'PENDING'
+              AND pb.deleted_at IS NULL
+              AND p.deleted_at IS NULL
+            "#,
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(n)
+    }
+
+    /// 按 batch_id 查 batch（含软删过滤开关）。
+    ///
+    /// dispatch 路径使用 `include_deleted=false`（已软删 batch 视为不存在 →
+    /// 抛 `BIZ_BATCH_NOT_FOUND`）。
+    pub async fn find_batch_by_id(
+        conn: &mut PgConnection,
+        id: i64,
+        include_deleted: bool,
+    ) -> Result<Option<TPartBatch>, sqlx::Error> {
+        sqlx::query_as!(
+            TPartBatch,
+            r#"
+            SELECT id, part_id, batch_no, quantity, status, location,
+                   current_holder_id, current_process_step_id,
+                   delivery_note_id, parent_batch_id,
+                   version, created_at, created_by, updated_at, updated_by, deleted_at
+            FROM t_part_batch
+            WHERE id = $1
+              AND ($2::bool OR deleted_at IS NULL)
+            "#,
+            id,
+            include_deleted,
+        )
+        .fetch_optional(&mut *conn)
+        .await
+    }
+
+    /// 按 `target_process_id` 在 `t_shelf_process` 取首条 active 货架映射。
+    ///
+    /// 多结果取 sort_order 最小者（`ORDER BY sort_order ASC, id ASC`），
+    /// 0 结果 → `Ok(None)`（由 service 层映射 `BIZ_SHELF_PROCESS_NOT_FOUND`）。
+    ///
+    /// 不带 `deleted_at IS NULL` 守卫（车间 active 货架默认软删）；
+    /// 后续如需 `is_active` 守卫再加。
+    pub async fn find_first_shelf_for_process(
+        conn: &mut PgConnection,
+        process_id: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT shelf_id
+            FROM t_shelf_process
+            WHERE process_id = $1 AND deleted_at IS NULL
+            ORDER BY sort_order ASC, id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(process_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row)
+    }
+
+    /// 标记 PENDING 批次已下发（OCC UPDATE）。
+    ///
+    /// 输入：batch_id, expected_version (PENDING batch 当前 version), shelf_id,
+    /// updated_by。
+    /// 输出：affected rows（0 → 40901 `VERSION_CONFLICT` / status 非 PENDING
+    /// / 已软删，由 service 层映射）。
+    /// 副作用：`status='IN_PROCESS'` + `location='PRODUCTION_SHELF'` +
+    /// `current_holder_id=shelf_id` + `current_process_step_id=NULL`（dispatch
+    /// 路径不解析 step，由后续 worker-scan 触发）+ `version += 1`。
+    pub async fn update_batch_dispatched(
+        conn: &mut PgConnection,
+        batch_id: i64,
+        expected_version: i32,
+        shelf_id: i64,
+        updated_by: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE t_part_batch
+            SET status                  = 'IN_PROCESS',
+                location                = 'PRODUCTION_SHELF',
+                current_holder_id       = $3,
+                current_process_step_id = NULL,
+                version                 = version + 1,
+                updated_at              = now(),
+                updated_by              = $4
+            WHERE id = $1
+              AND version = $2
+              AND status = 'PENDING'
+              AND deleted_at IS NULL
+            "#,
+            batch_id,
+            expected_version,
+            shelf_id,
+            updated_by,
+        )
+        .execute(&mut *conn)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// 按 chain_id 取工艺链首道 active step。
+    ///
+    /// `ORDER BY sort_order ASC LIMIT 1`（`sort_order` 是工艺链步骤序号，1-based）。
+    /// 0 结果（链已软删 / 步骤被清空）→ `Ok(None)`，由 service 层映射
+    /// `AutoDispatch skipped reason='NO_PROCESS_STEP'`。
+    pub async fn first_step_of_chain(
+        conn: &mut PgConnection,
+        chain_id: i64,
+    ) -> Result<Option<FirstChainStepRow>, sqlx::Error> {
+        let row: Option<FirstChainStepRow> = sqlx::query_as!(
+            FirstChainStepRow,
+            r#"
+            SELECT id AS "step_id!",
+                   process_id AS "step_process_id!",
+                   sort_order AS "step_sort_order!"
+            FROM t_process_chain_step
+            WHERE chain_id = $1 AND deleted_at IS NULL
+            ORDER BY sort_order ASC, id ASC
+            LIMIT 1
+            "#,
+            chain_id,
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row)
+    }
+
+    /// 按 part_id 取 `process_chain_id`（auto-dispatch 路径解析首道 step 前用）。
+    ///
+    /// 返回 `Ok(None)` 的两种情况：
+    /// 1. part 不存在 / 已软删 → service 层映射 `BIZ_PART_NOT_FOUND`
+    /// 2. part 存在但 `process_chain_id IS NULL` → service 层映射
+    ///    `AutoDispatch skipped reason='NO_PROCESS_CHAIN'`
+    pub async fn part_get_process_chain_id(
+        conn: &mut PgConnection,
+        part_id: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<Option<i64>> = sqlx::query_scalar(
+            r#"
+            SELECT process_chain_id
+            FROM t_part
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(part_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row.flatten())
+    }
+}
+
+// ===== 行结构（SQL FROM 投影） =====
+
+/// `list_pending_batches` JOIN 4 表后的扁平投影（service → vo 转换中间层）。
+///
+/// 字段全部 `pub` 便于 service 直接读；无 `Serialize`（service 内部使用）。
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_field_names)]
+pub struct PendingBatchRow {
+    // —— t_part_batch ——
+    pub pb_id: i64,
+    pub pb_part_id: i64,
+    pub pb_batch_no: i32,
+    pub pb_quantity: i32,
+    pub pb_status: String,
+    pub pb_version: i32,
+    /// `pb_current_process_step_id` PENDING 时通常 NULL；service 投影时用 0
+    /// 兜底（与 process_chain_id 同语义：NULL ≡ 0 表示「未设 step」）。
+    pub pb_current_process_step_id: Option<i64>,
+    pub pb_created_at: chrono::NaiveDateTime,
+    // —— t_part ——
+    pub p_serial_no: Option<String>,
+    pub p_name: String,
+    pub p_drawing_no: String,
+    pub p_planned_delivery_date: NaiveDate,
+    pub p_system_delivery_date: Option<NaiveDate>,
+    pub p_is_urgent: bool,
+    pub p_note: Option<String>,
+    pub p_process_chain_id: Option<i64>,
+    // —— t_customer L2 ——
+    pub c_name: Option<String>,
+    // —— t_customer L1 ——
+    pub pc_name: Option<String>,
+    // —— t_applicant ——
+    pub a_name: Option<String>,
+}
+
+/// `first_step_of_chain` 单行投影。
+///
+/// `t_process_chain_step` 用 `sort_order` 列表示步骤顺序（与 t_shelf_process
+/// / t_work_type_process 同名同义）。
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_field_names)]
+pub struct FirstChainStepRow {
+    pub step_id: i64,
+    pub step_process_id: i64,
+    pub step_sort_order: i32,
+}
