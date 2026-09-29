@@ -135,18 +135,19 @@ async fn upload_pdf_happy_path() {
 
     let pdf_bytes = b"%PDF-1.5\nhello world\n%%EOF".to_vec();
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        part_id,
-        "DRAWING",
-        "drawing.pdf",
-        "application/pdf",
-        pdf_bytes,
-        &current,
-    )
-    .await
-    .expect("upload should succeed");
+    let out = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "drawing.pdf",
+            "application/pdf",
+            pdf_bytes,
+            &current,
+        )
+        .await
+        .expect("upload should succeed");
     tx.commit().await.unwrap();
 
     assert_eq!(out.kind, "DRAWING");
@@ -172,18 +173,19 @@ async fn upload_invalid_kind_returns_21102() {
 
     let bytes = b"some step data".to_vec();
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        part_id,
-        "DRAWING", // DRAWING 不接受 step
-        "drawing.step",
-        "application/octet-stream",
-        bytes,
-        &current,
-    )
-    .await
-    .expect_err("扩展名 step 不在 DRAWING 白名单");
+    let err = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING", // DRAWING 不接受 step
+            "drawing.step",
+            "application/octet-stream",
+            bytes,
+            &current,
+        )
+        .await
+        .expect_err("扩展名 step 不在 DRAWING 白名单");
     drop(tx);
 
     match err {
@@ -207,34 +209,36 @@ async fn upload_cas_dedup_skips_cos() {
 
     // 第一次上传
     let mut tx = pool.begin().await.unwrap();
-    let out1 = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        part_id,
-        "DRAWING",
-        "first.pdf",
-        "application/pdf",
-        pdf_bytes.clone(),
-        &current,
-    )
-    .await
-    .expect("first upload ok");
+    let out1 = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "first.pdf",
+            "application/pdf",
+            pdf_bytes.clone(),
+            &current,
+        )
+        .await
+        .expect("first upload ok");
     tx.commit().await.unwrap();
 
     // 第二次上传同 sha → CAS 命中，复用 object_key，id 不同
     let mut tx = pool.begin().await.unwrap();
-    let out2 = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        part_id,
-        "DRAWING",
-        "second.pdf",
-        "application/pdf",
-        pdf_bytes.clone(),
-        &current,
-    )
-    .await
-    .expect("CAS upload ok");
+    let out2 = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "second.pdf",
+            "application/pdf",
+            pdf_bytes.clone(),
+            &current,
+        )
+        .await
+        .expect("CAS upload ok");
     tx.commit().await.unwrap();
 
     // CAS 命中：返回已有 id，object_key 相同
@@ -252,18 +256,19 @@ async fn upload_owner_not_found_returns_21105() {
 
     let nonexistent = 99_999_999_999_i64;
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        nonexistent,
-        "DRAWING",
-        "drawing.pdf",
-        "application/pdf",
-        b"%PDF-1.5\n".to_vec(),
-        &current,
-    )
-    .await
-    .expect_err("不存在的 owner");
+    let err = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            nonexistent,
+            "DRAWING",
+            "drawing.pdf",
+            "application/pdf",
+            b"%PDF-1.5\n".to_vec(),
+            &current,
+        )
+        .await
+        .expect_err("不存在的 owner");
     drop(tx);
 
     match err {
@@ -284,18 +289,19 @@ async fn rbac_inspector_can_upload_returns_403() {
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        part_id,
-        "DRAWING",
-        "drawing.pdf",
-        "application/pdf",
-        b"%PDF-1.5\n".to_vec(),
-        &inspector,
-    )
-    .await
-    .expect_err("Inspector 无 upload 权限");
+    let err = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "drawing.pdf",
+            "application/pdf",
+            b"%PDF-1.5\n".to_vec(),
+            &inspector,
+        )
+        .await
+        .expect_err("Inspector 无 upload 权限");
     drop(tx);
 
     match err {
@@ -330,18 +336,19 @@ async fn list_filter_by_kind() {
         );
         let body = format!("{}{}", unique_prefix, "x".repeat(1024)).into_bytes();
         let mut tx = pool.begin().await.unwrap();
-        PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-            &mut *tx,
-            "PART",
-            part_id,
-            kind,
-            filename,
-            content_type,
-            body,
-            &current,
-        )
-        .await
-        .expect("seed upload");
+        PartFileService::new(snowflake.clone(), cos.clone())
+            .upload_file_for_owner(
+                &mut *tx,
+                "PART",
+                part_id,
+                kind,
+                filename,
+                content_type,
+                body,
+                &current,
+            )
+            .await
+            .expect("seed upload");
         tx.commit().await.unwrap();
     }
 
@@ -354,7 +361,8 @@ async fn list_filter_by_kind() {
         offset: Some(0),
     };
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone()).list_files(&mut *tx, &query, &current)
+    let out = PartFileService::new(snowflake.clone(), cos.clone())
+        .list_files(&mut *tx, &query, &current)
         .await
         .unwrap();
     drop(tx);
@@ -374,22 +382,30 @@ async fn get_url_returns_presigned_url() {
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        part_id,
-        "DRAWING",
-        "test.pdf",
-        "application/pdf",
-        b"%PDF-1.5\n".to_vec(),
-        &current,
-    )
-    .await
-    .unwrap();
+    let out = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "test.pdf",
+            "application/pdf",
+            b"%PDF-1.5\n".to_vec(),
+            &current,
+        )
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let mut tx = pool.begin().await.unwrap();
-    let detail = PartFileService::new(snowflake.clone(), cos.clone()).get_file_with_url(&mut *tx, cos.clone(), out.id, &current)
+    let detail = PartFileService::new(snowflake.clone(), cos.clone())
+        .get_file_with_url(
+            &mut *tx,
+            cos.clone(),
+            UPLOAD_UPLOAD_PREFIX,
+            out.id,
+            &current,
+        )
         .await
         .unwrap();
     drop(tx);
@@ -457,7 +473,8 @@ async fn list_includes_paired_file_id() {
         offset: Some(0),
     };
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone()).list_files(&mut *tx, &query, &current)
+    let out = PartFileService::new(snowflake.clone(), cos.clone())
+        .list_files(&mut *tx, &query, &current)
         .await
         .unwrap();
     drop(tx);
@@ -498,23 +515,31 @@ async fn content_happy_path() {
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        part_id,
-        "DRAWING",
-        "content.pdf",
-        "application/pdf",
-        b"%PDF-1.5\nhello\n%%EOF".to_vec(),
-        &current,
-    )
-    .await
-    .unwrap();
+    let out = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "content.pdf",
+            "application/pdf",
+            b"%PDF-1.5\nhello\n%%EOF".to_vec(),
+            &current,
+        )
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     // content 端点 — NoopCos.get_object 返空字节，但应正常返回
     let mut tx = pool.begin().await.unwrap();
-    let content = PartFileService::new(snowflake.clone(), cos.clone()).get_file_content(&mut *tx, cos.clone(), out.id, &current)
+    let content = PartFileService::new(snowflake.clone(), cos.clone())
+        .get_file_content(
+            &mut *tx,
+            cos.clone(),
+            UPLOAD_UPLOAD_PREFIX,
+            out.id,
+            &current,
+        )
         .await
         .expect("content ok");
     drop(tx);
@@ -535,27 +560,28 @@ async fn soft_delete_happy_path() {
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        part_id,
-        "DRAWING",
-        "del.pdf",
-        "application/pdf",
-        b"%PDF-1.5\n".to_vec(),
-        &current,
-    )
-    .await
-    .unwrap();
+    let out = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "del.pdf",
+            "application/pdf",
+            b"%PDF-1.5\n".to_vec(),
+            &current,
+        )
+        .await
+        .unwrap();
     let version = out.version;
     tx.commit().await.unwrap();
 
     // delete by Manager（kind=DRAWING → M+C 通行）
     let mut tx = pool.begin().await.unwrap();
-    let object_key =
-        PartFileService::new(snowflake.clone(), cos.clone()).soft_delete_file(&mut *tx, out.id, version, &current)
-            .await
-            .expect("delete ok");
+    let object_key = PartFileService::new(snowflake.clone(), cos.clone())
+        .soft_delete_file(&mut *tx, out.id, version, &current)
+        .await
+        .expect("delete ok");
     tx.commit().await.unwrap();
     // 2026-09-15 review A2：service 应返回 cos object_key 供 handler commit 后清理
     assert!(
@@ -585,23 +611,25 @@ async fn soft_delete_version_conflict() {
     let cos = Arc::new(NoopCos);
 
     let mut tx = pool.begin().await.unwrap();
-    let out = PartFileService::new(snowflake.clone(), cos.clone()).upload_file_for_owner(
-        &mut *tx,
-        "PART",
-        part_id,
-        "DRAWING",
-        "conf.pdf",
-        "application/pdf",
-        b"%PDF-1.5\n".to_vec(),
-        &current,
-    )
-    .await
-    .unwrap();
+    let out = PartFileService::new(snowflake.clone(), cos.clone())
+        .upload_file_for_owner(
+            &mut *tx,
+            "PART",
+            part_id,
+            "DRAWING",
+            "conf.pdf",
+            "application/pdf",
+            b"%PDF-1.5\n".to_vec(),
+            &current,
+        )
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     // 故意 version+999 → 冲突
     let mut tx = pool.begin().await.unwrap();
-    let err = PartFileService::new(snowflake.clone(), cos.clone()).soft_delete_file(&mut *tx, out.id, out.version + 999, &current)
+    let err = PartFileService::new(snowflake.clone(), cos.clone())
+        .soft_delete_file(&mut *tx, out.id, out.version + 999, &current)
         .await
         .expect_err("version 冲突应抛错");
     drop(tx);
@@ -641,6 +669,7 @@ async fn confirm_tmp_missing_returns_21114() {
         original_filename: "drawing.pdf".into(),
         file_size: 1024,
         content_type: "application/pdf".into(),
+        ext: None, // 2026-09-29 新增字段：client 未传走兼容回退
     };
     let err = PartFileService::bind_uploaded_file(
         &pool,
@@ -696,6 +725,7 @@ async fn confirm_size_mismatch_returns_21115() {
         original_filename: "drawing.pdf".into(),
         file_size: 1024, // 客户端声明
         content_type: "application/pdf".into(),
+        ext: None, // 2026-09-29 新增字段
     };
     let err = PartFileService::bind_uploaded_file(
         &pool,
@@ -809,4 +839,101 @@ async fn confirm_replace_old_single_returns_ready() {
     assert_eq!(new.content_sha256.as_deref(), Some(sha_2.as_str()));
     assert_eq!(new.upload_status, "READY");
     assert_eq!(new.file_size, 2048);
+}
+
+// ===== 2026-09-29 扁平化新测试：tmp→parts copy_object + 读端点 legacy fallback =====
+//
+// 不依赖 axum，直接 service 直调：
+// - tmp_to_parts_copy_test：确认 CAS key 模板五段→两段后，bind_uploaded_file
+//   仍走 copy_object(tmp → cas_key)，cas_key 形如 `{prefix}{sha16}_{safe_filename}`。
+// - read_fallback_to_legacy_key_test：模拟 DB 历史行 object_key 是五段格式
+//   但 COS 桶里真实对象按新模板存的场景，验证 `resolve_effective_key` 重写后
+//   能命中。
+
+#[tokio::test]
+async fn tmp_to_parts_copy_test() {
+    // 2026-09-29 新增：bind_uploaded_file 派生 CAS key 走新模板（两段），copy 仍触发
+    let pool = setup().await;
+    let l1 = insert_l1_customer(&pool, "客户PF-Copy2Seg", "F").await;
+    let l2 = insert_l2_customer(&pool, "子客PF-Copy2Seg", l1).await;
+    let part_id = insert_part_for_owner(&pool, l2).await;
+
+    let current = test_current_user_with_roles(vec![Role::Manager]);
+    let snowflake = Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1));
+    let cos = Arc::new(MockCos::new());
+
+    let tmp_key = "tmp/test/copy-2seg.pdf";
+    cos.set_head(tmp_key, 1024);
+    let sha = "f".repeat(64);
+    let (out, _tk) = PartFileService::bind_uploaded_file(
+        &pool,
+        &snowflake,
+        cos.clone(),
+        UPLOAD_UPLOAD_PREFIX,
+        UPLOAD_TMP_PREFIX,
+        part_id,
+        "DRAWING",
+        tmp_key,
+        &sha,
+        "test.pdf",
+        1024,
+        "application/pdf",
+        &current,
+    )
+    .await
+    .expect("bind_uploaded_file 应成功");
+
+    // 2026-09-29 扁平化：新模板两段 `{prefix}{sha16}_{safe_filename}`
+    // 即 `uploads/fffffff...{16chars}_test.pdf`（prefix 兼容 .env `uploads` /
+    // `uploads/` 两种风格 —— 此处传 "uploads"，build_cas_key 自动补尾斜杠）。
+    let expected_cas_key = "uploads/ffffffffffffffff_test.pdf";
+    assert_eq!(
+        out.object_key, expected_cas_key,
+        "新模板 CAS key 必须两段：prefix + sha16_<safe_filename>"
+    );
+
+    // copy_object 应被调用：src=tmp_key, dst=新 cas_key
+    let copy_calls = cos
+        .copy_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(copy_calls.len(), 1, "copy_object 应被调用 1 次");
+    assert_eq!(copy_calls[0].0, tmp_key);
+    assert_eq!(copy_calls[0].1, expected_cas_key);
+}
+
+#[tokio::test]
+async fn read_fallback_to_legacy_key_test() {
+    // 2026-09-29 新增：DB 历史行 object_key 是五段（legacy），但 COS 桶里真实
+    // 对象按新模板存；`resolve_effective_key` 必须能解析 legacy 并按新模板重写
+    // 后 head 命中。
+    let cos = Arc::new(MockCos::new());
+
+    // DB 行 object_key（历史五段）：prefix= uploads/, owner_kind=part, owner_id=123,
+    // kind=DRAWING, sha16=abcdef0123456789, safe_filename=old_drawing.pdf
+    let db_key = "uploads/part/123/DRAWING/abcdef0123456789_old_drawing.pdf";
+    // COS 桶里真实对象（新两段）：prefix + sha16_<safe_filename>
+    let new_key = "uploads/abcdef0123456789_old_drawing.pdf";
+    // 只注册新模板 key 的 head；DB 五段 key 不注册 → resolve_effective_key 走 fallback
+    cos.set_head(new_key, 2048);
+
+    let resolved = PartFileService::resolve_effective_key(cos.as_ref(), "uploads/", db_key)
+        .await
+        .expect("resolve_effective_key 应返回 Ok");
+    assert_eq!(
+        resolved, new_key,
+        "DB 五段 key 找不到 + 新模板 key 存在 → 应回退到新模板 key"
+    );
+
+    // 反向断言：新模板 key 直接传入 resolve，应直接返回（不尝试 fallback）
+    let resolved_direct = PartFileService::resolve_effective_key(cos.as_ref(), "uploads/", new_key)
+        .await
+        .expect("resolve_effective_key 应返回 Ok");
+    assert_eq!(
+        resolved_direct, new_key,
+        "新模板 key 直接命中，无需 fallback"
+    );
 }

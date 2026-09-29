@@ -83,7 +83,11 @@ pub struct PartBatchCreateItem {
 /// upload-intents 返回 `dedup_hit=true`，前端跳过上传，把 `existing_file` 拼
 /// 回 PartFileOut，本字段为 None——即 `binding` 也为 None）。
 ///
-/// 2026-09-16 M2-B 新增。
+/// 2026-09-16 M2-B 新增；2026-09-29 扁平化新增 `ext` 字段（client 声明）。
+/// CAS key 模板五段→两段后，ext 需作为 file_type 推导源随 binding 上行，
+/// 避免 service 端 `policy::ext_of` 在中文 / 多段扩展（.tar.gz）边界上与
+/// client 不一致。`ext` 缺省为空（None），由 service 走兼容回退
+/// `policy::ext_of(original_filename)`。
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileBindingIn {
     pub tmp_key: String,
@@ -92,6 +96,9 @@ pub struct FileBindingIn {
     #[serde(deserialize_with = "deserialize_i64")]
     pub file_size: i64,
     pub content_type: String,
+    /// 2026-09-29 新增：扩展名（小写、不含点）。缺省 None（service 端兼容回退）。
+    #[serde(default)]
+    pub ext: Option<String>,
 }
 
 /// `POST /parts/batch` 入参：批量创建（共享 customer_id）。

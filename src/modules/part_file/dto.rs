@@ -20,6 +20,12 @@ use crate::shared::types::deserialize_i64;
 // python `sts-tmp-keys` 数组入参直签。本文件不再涉及任何 STS / 会话相关 DTO。
 //
 // confirm 端点（`POST /api/v2/parts/{id}/files/confirm`）仍保留，其入参：
+///
+/// 2026-09-29 扁平化：新增 `ext` 字段（client 声明）。CAS key 模板五段→两段后，
+/// key 已不再含 owner_kind / owner_id / KIND 段，kind 信息需 client 在 confirm
+/// 时显式回传（其实 kind 已在 ConfirmFileIn 里，但 ext 是新模板隐式依赖的
+/// 字段——同一 owner + sha + 不同 ext 对应不同 file_type，所以 ext 必须随
+/// confirm 上行，便于 service 校验 file_type 与 ext 一致）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfirmFileIn {
     pub kind: String,
@@ -29,6 +35,11 @@ pub struct ConfirmFileIn {
     #[serde(deserialize_with = "deserialize_i64")]
     pub file_size: i64,
     pub content_type: String,
+    /// 2026-09-29 新增：扩展名（小写、不含点）。由 client 从 `original_filename`
+    /// 提取后随 confirm 提交，避免 server 端 `policy::ext_of` 在中文 / 多段扩展
+    /// 边界（`.tar.gz`）上与 client 不一致。
+    #[serde(default)]
+    pub ext: Option<String>,
 }
 
 // ---------- 入参 ----------
@@ -136,6 +147,26 @@ pub mod validate {
             )));
         }
         Ok(())
+    }
+
+    /// 2026-09-29 新增：客户端声明的 `ext` 与服务端推导（policy::ext_of）一致。
+    ///
+    /// 用途：confirm 端点 client 提交 `ext` 字段（CAS key 模板五段→两段后，
+    /// ext 需作为 file_type 推导源随 confirm 上行，避免 server 端从
+    /// original_filename 二次解析与 client 不一致）。允许 ext 为空（None /
+    /// `""`）走兼容回退，由 service 走 policy::ext_of。
+    pub fn check_ext(client_ext: Option<&str>, filename: &str) -> Result<String, AppError> {
+        let server_ext = policy::ext_of(filename)
+            .ok_or_else(|| AppError::validation(format!("filename {filename:?} 缺少扩展名")))?;
+        if let Some(ce) = client_ext
+            && !ce.is_empty()
+            && !ce.eq_ignore_ascii_case(&server_ext)
+        {
+            return Err(AppError::validation(format!(
+                "client ext {ce:?} 与 server 推导 ext {server_ext:?} 不一致"
+            )));
+        }
+        Ok(server_ext)
     }
 
     /// 一站式校验 `ConfirmFileIn`（bind_uploaded_file 用）。
@@ -253,6 +284,7 @@ mod tests {
             original_filename: "model.step".into(),
             file_size: 2048,
             content_type: "application/step".into(),
+            ext: None, // 2026-09-29 新增字段（unit test 兼容回退 None）
         };
         assert!(validate::check_confirm_file_in(&req, max_file_size()).is_ok());
     }

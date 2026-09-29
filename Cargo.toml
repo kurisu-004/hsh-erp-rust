@@ -149,6 +149,18 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # 保留依赖待子任务 #3 全仓 grep 后统一清理（避免本轮 diff 过大）。
 uuid = { version = "1", features = ["v4"] }
 
+# 2026-09-29 CAS key 扁平化迁移 bin 用：解析历史五段 object_key 时 bin 内手动
+# regex 校验 sha16 hex 字符。pin 到 1.10 与项目其它 regex 使用一致（crates.io
+# 最新 1.x 仍为 1.10.x）。`[[bin]]` 块**不接受** dev-deps，所以 regex 必须上移
+# 到主依赖（即便主程序 lib 实际不引用，仅 bin 编译用）。
+regex = "1.10"
+
+# 2026-09-29 CAS key 扁平化迁移 bin：从 src/bin/cos_key_migrate.rs 暴露
+# `cargo run --bin cos-key-migrate -- --dry-run` / `--apply` 入口。
+[[bin]]
+name = "cos-key-migrate"
+path = "src/bin/cos_key_migrate.rs"
+
 [dev-dependencies]
 # 集成测试用 tower::ServiceExt::oneshot 直接驱动 Router。
 # 主依赖已有 tower = "0.5"，rustc 会 union features（"util" 仅 dev 启用，发布构建不携带）。

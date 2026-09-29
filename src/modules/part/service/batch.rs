@@ -27,11 +27,11 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::cos::CosClient;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part::dto_crud::{FileBindingIn, PartBatchCreateRequest};
-use crate::modules::part::vo::{PartBatchCreateOut, PartDetailOut};
 use crate::modules::part::repo::NewPartCreate;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
+use crate::modules::part::vo::{PartBatchCreateOut, PartDetailOut};
 use crate::modules::part_file::policy;
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo};
 use crate::shared::error::{AppError, code};
@@ -289,29 +289,25 @@ impl PartService {
                                     && db.code().as_deref() == Some("23505")
                                 {
                                     part_files_ok = false;
-                                    failed.push(
-                                        crate::modules::part::vo::PartBatchCreateFailure {
-                                            part_id: Some(new_id),
-                                            code: code::BIZ_PART_FILE_DUPLICATE,
-                                            message: format!(
-                                                "drawing_file / model3d_file sha={} 撞唯一索引",
-                                                &pb.sha256[..16]
-                                            ),
-                                            item_index: idx,
-                                        },
-                                    );
+                                    failed.push(crate::modules::part::vo::PartBatchCreateFailure {
+                                        part_id: Some(new_id),
+                                        code: code::BIZ_PART_FILE_DUPLICATE,
+                                        message: format!(
+                                            "drawing_file / model3d_file sha={} 撞唯一索引",
+                                            &pb.sha256[..16]
+                                        ),
+                                        item_index: idx,
+                                    });
                                     break;
                                 }
                                 part_files_ok = false;
                                 let mapped = AppError::from(e);
-                                failed.push(
-                                    crate::modules::part::vo::PartBatchCreateFailure {
-                                        part_id: Some(new_id),
-                                        code: mapped.code(),
-                                        message: format!("{mapped}"),
-                                        item_index: idx,
-                                    },
-                                );
+                                failed.push(crate::modules::part::vo::PartBatchCreateFailure {
+                                    part_id: Some(new_id),
+                                    code: mapped.code(),
+                                    message: format!("{mapped}"),
+                                    item_index: idx,
+                                });
                                 break;
                             }
                         }
@@ -339,15 +335,14 @@ impl PartService {
                             // DB 结果无关）。
                             match repo.get_part_detail(new_id).await {
                                 Ok(Some(p)) => {
-                                    let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), p.customer_id)
-                                        .await
-                                        .map_err(|e| (e, cleanup_tmp_keys.clone()))?;
-                                    let current_batch_id =
-                                        repo.find_current_inspection_batch_id(p.id)
+                                    let (cn, l1cn) =
+                                        lookup_customer_names(repo.conn_mut(), p.customer_id)
                                             .await
-                                            .map_err(|e| {
-                                                (AppError::from(e), cleanup_tmp_keys.clone())
-                                            })?;
+                                            .map_err(|e| (e, cleanup_tmp_keys.clone()))?;
+                                    let current_batch_id =
+                                        repo.find_current_inspection_batch_id(p.id).await.map_err(
+                                            |e| (AppError::from(e), cleanup_tmp_keys.clone()),
+                                        )?;
                                     created.push(PartDetailOut::from_with_customer_extra(
                                         p,
                                         current_batch_id,
@@ -356,14 +351,12 @@ impl PartService {
                                     ));
                                 }
                                 _ => {
-                                    failed.push(
-                                        crate::modules::part::vo::PartBatchCreateFailure {
-                                            part_id: Some(new_id),
-                                            code: code::BIZ_PART_NOT_FOUND,
-                                            message: "inserted but detail lookup failed".into(),
-                                            item_index: idx,
-                                        },
-                                    );
+                                    failed.push(crate::modules::part::vo::PartBatchCreateFailure {
+                                        part_id: Some(new_id),
+                                        code: code::BIZ_PART_NOT_FOUND,
+                                        message: "inserted but detail lookup failed".into(),
+                                        item_index: idx,
+                                    });
                                 }
                             }
                         }
@@ -483,7 +476,8 @@ impl PartService {
                         .await?;
                     match repo.get_part_detail(new_id).await {
                         Ok(Some(p)) => {
-                            let (cn, l1cn) = lookup_customer_names(repo.conn_mut(), p.customer_id).await?;
+                            let (cn, l1cn) =
+                                lookup_customer_names(repo.conn_mut(), p.customer_id).await?;
                             let current_batch_id =
                                 repo.find_current_inspection_batch_id(p.id).await?;
                             created.push(PartDetailOut::from_with_customer_extra(
@@ -542,6 +536,8 @@ pub(super) async fn prepare_binding_head_copy(
     cos: Arc<dyn CosClient>,
     cfg_upload_prefix: &str,
     cfg_tmp_prefix: &str,
+    #[allow(unused_variables)]
+    // 2026-09-29 扁平化：CAS key 已不带 owner_id，参数保留以匹配 caller 签名
     future_owner_id: i64,
     kind: &str,
     binding: &FileBindingIn,
@@ -584,11 +580,10 @@ pub(super) async fn prepare_binding_head_copy(
         .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, "缺少扩展名"))?;
     let file_type = policy::file_type_for_ext(&ext)
         .ok_or_else(|| AppError::biz(code::BIZ_PART_FILE_BAD_TYPE, format!("未知扩展名 {ext}")))?;
+    // 2026-09-29 扁平化：模板五段→两段，owner/kind 信息已在 t_part_file DB 行外键索引。
+    // 注：此处仍传 cfg_upload_prefix（保留兼容 .env 旧值；迁移 bin 不在本 worktree 范围）。
     let cas_key = crate::util::cos_key::build_cas_key(
         cfg_upload_prefix,
-        "part",
-        future_owner_id,
-        kind,
         &binding.content_sha256,
         &binding.original_filename,
     );

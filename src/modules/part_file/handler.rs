@@ -64,9 +64,7 @@ use serde::Deserialize;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::part_file::dto::PartFileListQuery;
-use crate::modules::part_file::vo::{
-    PartFileListOut, PartFileOut, PartFileWithUrlOut,
-};
+use crate::modules::part_file::vo::{PartFileListOut, PartFileOut, PartFileWithUrlOut};
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -186,7 +184,13 @@ pub async fn get_part_file_url(
     let mut tx = state.pool.begin().await?;
     let out = state
         .part_file_service
-        .get_file_with_url(&mut *tx, state.cos.clone(), file_id, &current)
+        .get_file_with_url(
+            &mut *tx,
+            state.cos.clone(),
+            &state.config.cos.upload_prefix,
+            file_id,
+            &current,
+        )
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))
@@ -196,6 +200,9 @@ pub async fn get_part_file_url(
 ///
 /// 拉 `t_part_file.object_key` + COS `get_object`，透传 `content_type` 头。
 /// 权限：与 `get_part_file_url` 一致（任意已登录可读）。
+///
+/// 2026-09-29 扁平化：service 内部走 legacy→新模板 fallback（见
+/// `resolve_effective_key`），handler 仅透传 `cfg.upload_prefix`。
 pub async fn get_part_file_content(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -204,7 +211,13 @@ pub async fn get_part_file_content(
     let mut tx = state.pool.begin().await?;
     let out = state
         .part_file_service
-        .get_file_content(&mut *tx, state.cos.clone(), file_id, &current)
+        .get_file_content(
+            &mut *tx,
+            state.cos.clone(),
+            &state.config.cos.upload_prefix,
+            file_id,
+            &current,
+        )
         .await?;
     tx.commit().await?;
     let resp = Response::builder()
@@ -335,14 +348,7 @@ pub async fn upload_cad_files(
     let out = state
         .part_file_service
         .upload_file_for_owner(
-            &mut *tx,
-            "PART",
-            part_id,
-            "CAD_2D",
-            &fname,
-            &ct,
-            data,
-            &current,
+            &mut *tx, "PART", part_id, "CAD_2D", &fname, &ct, data, &current,
         )
         .await?;
     tx.commit().await?;
@@ -362,14 +368,7 @@ pub async fn upload_cnc_program(
     let out = state
         .part_file_service
         .upload_file_for_owner(
-            &mut *tx,
-            "PART",
-            part_id,
-            "G_CODE",
-            &fname,
-            &ct,
-            data,
-            &current,
+            &mut *tx, "PART", part_id, "G_CODE", &fname, &ct, data, &current,
         )
         .await?;
     tx.commit().await?;
@@ -448,15 +447,7 @@ pub async fn upload_cnc_pair(
     let out = state
         .cnc_program_service
         .upload_cnc_pair(
-            &mut *tx,
-            part_id,
-            g_bytes,
-            &g_name,
-            &g_ct,
-            s_bytes,
-            &s_name,
-            &s_ct,
-            &current,
+            &mut *tx, part_id, g_bytes, &g_name, &g_ct, s_bytes, &s_name, &s_ct, &current,
         )
         .await?;
     tx.commit().await?;

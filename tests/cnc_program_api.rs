@@ -269,17 +269,29 @@ async fn alias_download_url_returns_part_file_with_url() {
 
     // /download-url alias 应等于 part-files/{id}/url
     let mut tx = pool.begin().await.unwrap();
-    let dl_url = PartFileService::new(snowflake.clone(), cos.clone()).get_file_with_url(&mut *tx, cos.clone(), g_id, &current)
-        .await
-        .expect("alias download-url ok");
+    let dl_url = PartFileService::new(snowflake.clone(), cos.clone()).get_file_with_url(
+        &mut *tx,
+        cos.clone(),
+        "uploads",
+        g_id,
+        &current,
+    )
+    .await
+    .expect("alias download-url ok");
     tx.commit().await.unwrap();
     assert_eq!(dl_url.id, g_id.to_string());
     assert_eq!(dl_url.kind, "G_CODE");
 
     let mut tx = pool.begin().await.unwrap();
-    let dl_url_s = PartFileService::new(snowflake.clone(), cos.clone()).get_file_with_url(&mut *tx, cos.clone(), s_id, &current)
-        .await
-        .expect("alias download-url setup ok");
+    let dl_url_s = PartFileService::new(snowflake.clone(), cos.clone()).get_file_with_url(
+        &mut *tx,
+        cos.clone(),
+        "uploads",
+        s_id,
+        &current,
+    )
+    .await
+    .expect("alias download-url setup ok");
     tx.commit().await.unwrap();
     assert_eq!(dl_url_s.id, s_id.to_string());
     assert_eq!(dl_url_s.kind, "SETUP_SHEET");
@@ -311,9 +323,15 @@ async fn alias_content_returns_bytes() {
 
     // alias content
     let mut tx = pool.begin().await.unwrap();
-    let content = PartFileService::new(snowflake.clone(), cos.clone()).get_file_content(&mut *tx, cos.clone(), out.g_code.id, &current)
-        .await
-        .expect("alias content ok");
+    let content = PartFileService::new(snowflake.clone(), cos.clone()).get_file_content(
+        &mut *tx,
+        cos.clone(),
+        "uploads",
+        out.g_code.id,
+        &current,
+    )
+    .await
+    .expect("alias content ok");
     drop(tx);
     // NoopCos.get_object 返空
     assert!(content.bytes.is_empty());
