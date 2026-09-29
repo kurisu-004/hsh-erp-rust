@@ -3,10 +3,10 @@
 //! 覆盖场景：
 //!   1. happy path：建链 → fetch 拿到 header + steps；part.process_chain_id 已回写（026 翻转）
 //!   2. fetch 找不到链 → 20701 BIZ_PROCESS_CHAIN_NOT_FOUND (HTTP 404)
-//!   3. PUT upsert 替换步骤（清空旧 steps + 插新 steps，chain.version++；part 指针不变）
-//!   4. PUT upsert 创建全新链（part 之前无链）
-//!   5. PUT upsert 校验：estimated_minutes < 0 → 40001 VALIDATION_ERROR
-//!   6. PUT upsert 校验：sort_order 重复 → 40001 VALIDATION_ERROR
+//!   3. POST upsert 替换步骤（清空旧 steps + 插新 steps，chain.version++；part 指针不变）
+//!   4. POST upsert 创建全新链（part 之前无链）
+//!   5. POST upsert 校验：estimated_minutes < 0 → 40001 VALIDATION_ERROR
+//!   6. POST upsert 校验：sort_order 重复 → 40001 VALIDATION_ERROR
 //!   7. step.note 字段往返：建链时填 note → fetch 拿回原文（migration 019）
 //!   8. 非 PENDING part upsert → 20705 BIZ_PROCESS_CHAIN_PART_NOT_PENDING (HTTP 409)
 //!   9. GET /process-chains/{chain_id} 命中 / 未命中（2026-09-16 FK 翻转新增端点）
@@ -169,7 +169,7 @@ async fn get_by_part_chain_not_found() {
     assert_eq!(env["code"], 20701, "BIZ_PROCESS_CHAIN_NOT_FOUND: {env}");
 }
 
-/// 场景 3: PUT 整组替换：先有 2 步 → 换成 1 步；旧 steps 软删，新 step 新 id
+/// 场景 3: POST 整组替换：先有 2 步 → 换成 1 步；旧 steps 软删，新 step 新 id
 #[tokio::test]
 async fn upsert_replaces_old_steps() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -329,7 +329,7 @@ async fn upsert_forbidden_for_non_manager() {
 
 /// 场景 7: step.note 字段往返（migration 019）
 ///
-/// 建链时为每步填 `note` 字段；fetch 应原样返回；后续 PUT 替换步骤时旧步骤
+/// 建链时为每步填 `note` 字段；fetch 应原样返回；后续 POST 替换步骤时旧步骤
 /// 软删（note 也不再被 SELECT 列出），新步骤的 note 独立验证。
 #[tokio::test]
 async fn step_note_round_trip() {
