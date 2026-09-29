@@ -52,7 +52,14 @@ pub struct PendingBatchItem {
     pub note: Option<String>,
     pub version: i32,
     /// `current_process_step_id`（PENDING 时通常 NULL；PART 自动下发时
-    /// 已写入首道 step）。i64 兜底：None → 0，Some(n) → n。
+    /// 已写入首道 step）。
+    ///
+    /// **NULL 兜底语义**：DB 列 NULL 时 row → vo 投影为 0（`Option<i64> → i64`
+    /// 走 `.unwrap_or(0)`）；前端按 `0 == "未设 step"`、`> 0 == "已设 step"`
+    /// 区分。dispatch 路径写入 batch 时显式 `NULL`（见
+    /// `BatchRepo::update_batch_dispatched`），符合「PENDING 尚未挂 step」语义。
+    /// 注：本字段未走 `Option<i64>` 是为了对齐本 VO 整体扁平数字风格（与
+    /// `process_chain_id` 同形态）；语义差异由前端按 status 区分。
     #[serde(serialize_with = "serialize_i64")]
     pub current_process_step_id: i64,
     /// `t_part.process_chain_id`（PR-3 step 化后新字段；PENDING 列表透传

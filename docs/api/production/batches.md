@@ -148,7 +148,7 @@ Request：`AutoDispatchRequest`
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `batch_ids` | `Vec<i64>` | ✗ | 待自动推导下发的 batch_id 列表；空数组 → 40001 |
+| `batch_ids` | `Vec<i64>` (字符串数组) | ✗ | 待自动推导下发的 batch_id 列表；空数组 / `null` → 40001；`deserialize_i64_vec_opt` 反序列化（前端可发字符串数组） |
 
 业务流转（service `auto_dispatch`）：
 

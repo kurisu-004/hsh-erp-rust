@@ -4,12 +4,13 @@
 //! 仅入参（`Serialize` + 反序列化兜底由 axum `Json` extractor 处理）。
 //! 出参结构见 [`super::vo`]。
 //!
-//! i64 反序列化兜底走 `deserialize_i64`（与其它域惯例一致，前端允许
-//! 数字 / 字符串两种形态），业务字段用 `Option<&str>` / `Option<i64>`。
+//! i64 反序列化兜底走 `deserialize_i64` / `deserialize_i64_vec_opt`（与其它域
+//! 惯例一致，前端允许 数字 / 字符串 两种形态，雪花 ID 一律 string 避免 JS
+//! `Number.MAX_SAFE_INTEGER` 精度截断）。
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::types::deserialize_i64;
+use crate::shared::types::{deserialize_i64, deserialize_i64_vec_opt};
 
 /// `GET /api/v2/prod/batches/pending` Query 参数。
 ///
@@ -79,12 +80,12 @@ pub struct BulkDispatchTarget {
 ///
 /// 全成功提交；任一硬错误（非 skipped）→ 全回滚。
 ///
-/// 注意：向量元素按 serde 默认 i64 反序列化（即 JSON 数字）；如需字符串 ID
-/// 兼容，可后续扩展为 `Vec<serde_json::Value>` 自定义转换。当前约定批量下发
-/// 走 bulk-dispatch；auto-dispatch 适合 UI 一键全选少量批次场景。
+/// `batch_ids` 用 `deserialize_i64_vec_opt` 反序列化（与本域其它 i64 字段一致）：
+/// 字段缺省 → `None`；JSON 数组 → 元素按字符串逐个解析为 `i64`（前端发 `"123"`
+/// 字符串形态不会触发 422）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AutoDispatchRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_i64_vec_opt")]
     pub batch_ids: Option<Vec<i64>>,
 }
 

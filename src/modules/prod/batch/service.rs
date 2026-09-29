@@ -86,10 +86,8 @@ impl BatchService {
     /// 4. `find_first_shelf_for_process(target_process_id)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND`
     /// 5. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT`
     /// 6. `PartRepo::insert_part_event('PLACED_ON_SHELF')` —— 写 `t_part_event`
-    ///    （event id 由 `snowflake.next_id()` 生成；handler 端 `&state.snowflake`，
-    ///    单测 `pool_snowflake().lock().unwrap_or_else(|p| p.into_inner())` 持锁
-    ///    单测 scope，service 内 `next_id()` 同步调用且不跨锁。clippy 标记的
-    ///    `await_holding_lock` 在 in-source tests 上 `#[allow]` 抑制。）
+    ///    （event id 由 `snowflake.next_id()` 生成；handler 端持 `&SnowflakeIdGenerator`
+    ///    引用，service 内 `next_id()` 同步调用）。
     ///
     /// 返回 `DispatchResult { batch_id, current_process_step_id (NULL),
     /// target_process_id, shelf_id, version }`。
@@ -205,8 +203,9 @@ impl BatchService {
     /// 空 `targets` → `AppError::Validation`（HTTP 422，沿用 `BIZ_DELIVERY_PRINT_BAD_ORDER`
     /// 同形「显式 422」约束）。
     ///
-    /// `next_event_id` 闭包：批量内部每条 PLACED_ON_SHELF 事件 id 由其生成；handler
-    /// 端用 `state.snowflake` 包 closure，单测用 `pool_snowflake()` 包 closure。
+    /// `snowflake` 形参：批量内部每条 PLACED_ON_SHELF 事件 id 由
+    /// `&SnowflakeIdGenerator::next_id()` 生成；handler 端 `&state.snowflake`，
+    /// 单测 `SnowflakeIdGenerator::new(...)` 同步调用。
     pub async fn bulk_dispatch(
         conn: &mut PgConnection,
         batch_ids_targets: Vec<(i64, i64)>,

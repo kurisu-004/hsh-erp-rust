@@ -14,12 +14,14 @@
 //! - worker_pool.rs            ← 原 worker_pool_api.rs（1587 行）
 //! - worker_pool_auto_allocate.rs ← 原 worker_pool_auto_allocate_api.rs
 //! - worker.rs                 ← 原 worker_api.rs
+//! - batch.rs                  ← 2026-09-29 新增（prod::batch 4 端点端到端 + 错误码 + 角色守卫）
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
-mod work_type;
+mod batch;
 mod process;
 mod process_chain;
+mod work_type;
+mod worker;
 mod worker_pool;
 mod worker_pool_auto_allocate;
-mod worker;
