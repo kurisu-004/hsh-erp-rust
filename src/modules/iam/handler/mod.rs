@@ -14,7 +14,8 @@ mod session;
 ///
 /// 端点拆分：
 /// - session 端点（`session.rs`，5 个）：挂在 `/iam` 根
-/// - account 端点（`account.rs`，9 个）：挂在 `/iam/users`
+/// - account 端点（`account.rs`，12 个）：挂在 `/iam/users`
+///   （9 个账号 CRUD/角色 + 3 个企业微信绑定，2026-09-29 新增）
 ///
 /// 2026-09-19 IAM 域收尾（PR-4）：`auth_router` / `users_router` 旧 alias 已下线；
 /// 新路径 `/api/v2/iam/*` 是 IAM 域唯一对外接口。
@@ -35,6 +36,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/{id}/roles/{role_id}/remove",
             post(account::remove_role),
+        )
+        // 2026-09-29 新增：企业微信身份预绑定（GET/POST/DELETE 同一路径）
+        // 注意 axum 0.8 的 `MethodRouter` 组合顺序：先 get 再 post 再 delete。
+        .route(
+            "/{id}/wx-bind",
+            get(account::get_wx_identity)
+                .post(account::bind_wx_identity)
+                .delete(account::unbind_wx_identity),
         );
     Router::new()
         .merge(session)

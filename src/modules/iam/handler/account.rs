@@ -11,9 +11,9 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::super::dto::{
-    UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest,
+    UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest, WxBindRequest,
 };
-use super::super::vo::{UserListOut, UserOut, UserRoleOut};
+use super::super::vo::{UserListOut, UserOut, UserRoleOut, WxIdentityOut};
 
 /// GET /api/v2/iam/users —— 读端点，acquire 不开事务
 pub async fn list_users(
@@ -151,4 +151,55 @@ pub async fn remove_role(
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok_empty()))
+}
+/// POST /api/v2/iam/users/{id}/wx-bind —— 写端点（`state.pool.begin()`）
+///
+/// 2026-09-29 新增：把企业微信 userid 预绑定到系统账号（`t_wx_identity`）。
+/// 权限守卫（`require_role(Role::Manager)`）在 service 层——与 `list_users` /
+/// `add_role` 同一做法，handler 不重复校验。
+/// 幂等：绑到同一 user_id 重复调用 → 200；绑到别的 user_id → 40108。
+pub async fn bind_wx_identity(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(id): Path<i64>,
+    Json(req): Json<WxBindRequest>,
+) -> Result<Json<R<WxIdentityOut>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = state
+        .account_service
+        .bind_wx_identity(&mut tx, id, &req, &state.config.wecom.corpid, &current)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// GET /api/v2/iam/users/{id}/wx-bind —— 读端点（`state.pool.acquire()`，不开事务）
+pub async fn get_wx_identity(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<R<Vec<WxIdentityOut>>>, AppError> {
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .account_service
+        .get_wx_identity(&mut conn, id, &current)
+        .await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// DELETE /api/v2/iam/users/{id}/wx-bind —— 写端点（`state.pool.begin()`）
+///
+/// 幂等：该账号当前无绑定时重复 DELETE → 200 + 空数组。
+pub async fn unbind_wx_identity(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<R<Vec<WxIdentityOut>>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = state
+        .account_service
+        .unbind_wx_identity(&mut tx, id, &current)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
 }

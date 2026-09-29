@@ -8,6 +8,6 @@ pub mod login;
 
 pub use account::{
     ChangePasswordRequest, UserAddRoleRequest, UserCreateRequest, UserListQuery,
-    UserUpdateRequest,
+    UserUpdateRequest, WxBindRequest,
 };
 pub use login::{LoginRequest, RefreshRequest};

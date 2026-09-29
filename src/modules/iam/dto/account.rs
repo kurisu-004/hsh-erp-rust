@@ -57,3 +57,16 @@ pub struct ChangePasswordRequest {
     pub old_password: String,
     pub new_password: String,
 }
+
+/// `POST /api/v2/iam/users/{id}/wx-bind` 入参（2026-09-29 新增）
+///
+/// `wx_user_id` = 企业微信 userid（自建应用 `jscode2session` 返回的明文）。
+/// `corp_id` 省略时取 `config.wecom.corpid`；若配置也为空 → 40109。
+#[derive(Debug, Clone, Deserialize)]
+pub struct WxBindRequest {
+    /// 企业微信 userid；service 层会 trim + 转小写（企微 userid 不区分大小写）
+    pub wx_user_id: String,
+    /// 企业 ID；`None` / 空串 = 用后端配置的 `WECOM_CORPID`
+    #[serde(default)]
+    pub corp_id: Option<String>,
+}
