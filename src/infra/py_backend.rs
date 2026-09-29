@@ -108,8 +108,13 @@ impl HttpPyBackend {
     }
 }
 
-/// 过滤后的 header 透传：去掉 hop-by-hop + 鉴权头，避免把 rust 端 JWT / Cookie
-/// 反向暴露给 python 端。
+/// 过滤敏感 header：去掉鉴权头 + hop-by-hop，避免把 rust 端 JWT / Cookie 反向
+/// 暴露给 python 端。
+///
+/// ## 2026-09-28 review 第 1 轮修复：从 `filter_request_headers` 抽出
+/// 原 filter_request_headers 是 `axum::http::HeaderMap → reqwest::header::HeaderMap`
+/// 的"no-op 类型转换 + 过滤"合一体；reviewer 指 axum/reqwest 的 HeaderMap 是
+/// 同一类型（`http::HeaderMap`），转换冗余。本函数只做过滤，签名直接走原类型。
 ///
 /// ## 2026-09-28 过滤清单
 /// - `Authorization` —— 不能让 python 端"借"rust 的 JWT 上下文
@@ -117,8 +122,8 @@ impl HttpPyBackend {
 /// - `Host` / `Content-Length` —— reqwest 会自己处理
 /// - `Connection` / `Keep-Alive` / `Transfer-Encoding` / `Upgrade` —— hop-by-hop
 /// - `X-Request-Id` —— 透传（trace id 透传，前端 Nginx → rust → python 一致）
-fn filter_request_headers(src: &HeaderMap) -> reqwest::header::HeaderMap {
-    let mut out = reqwest::header::HeaderMap::new();
+fn filter_request_headers(src: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
     const SKIP: &[&str] = &[
         "authorization",
         "cookie",
@@ -136,26 +141,7 @@ fn filter_request_headers(src: &HeaderMap) -> reqwest::header::HeaderMap {
         if SKIP.contains(&name.as_str()) {
             continue;
         }
-        if let (Ok(nk), Ok(nv)) = (
-            reqwest::header::HeaderName::from_bytes(k.as_str().as_bytes()),
-            reqwest::header::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            out.append(nk, nv);
-        }
-    }
-    out
-}
-
-/// 把 `axum::http::HeaderMap` 复制到 `axum::http::HeaderMap`（同类型，handler 透传）
-fn copy_response_headers(src: &reqwest::header::HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for (k, v) in src.iter() {
-        if let (Ok(nk), Ok(nv)) = (
-            axum::http::HeaderName::from_bytes(k.as_str().as_bytes()),
-            axum::http::HeaderValue::from_bytes(v.as_bytes()),
-        ) {
-            out.append(nk, nv);
-        }
+        out.append(k.clone(), v.clone());
     }
     out
 }
@@ -190,6 +176,9 @@ impl PyBackendClient for HttpPyBackend {
             })?;
         let status = StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
+        // 2026-09-28 review 第 1 轮修复：去掉 copy_response_headers no-op 转换，
+        // reqwest::header::HeaderMap 与 axum::http::HeaderMap 是同一类型（http::HeaderMap），
+        // .clone() 即可。
         let resp_headers = resp.headers().clone();
         let body_bytes = resp.bytes().await.map_err(|e| {
             warn!(error = %e, url = %url, "读取 python 响应 body 失败");
@@ -200,7 +189,7 @@ impl PyBackendClient for HttpPyBackend {
         })?;
         Ok(PyBackendResponse {
             status,
-            headers: copy_response_headers(&resp_headers),
+            headers: resp_headers,
             body: body_bytes,
         })
     }
@@ -211,8 +200,11 @@ impl PyBackendClient for HttpPyBackend {
 /// ## 2026-09-28 设计
 /// - 与生产 `HttpPyBackend` 行为完全不一致（不会真发 HTTP 请求）；仅供
 ///   本地 `cargo run` 不依赖 python 后端时调试用。
-/// - 返回 `501 Not Implemented` + 占位 body（与 `local://` URL 同语义），便于
-///   前端联调时快速识别「未配 python base url」。
+///
+/// ## 2026-09-28 review 第 1 轮修复：返回 BIZ_STS_FORWARD_FAILED (20406) 而非 50001
+/// 原返回 `501 + 50001`（系统码），语义上是「配置缺失」（业务层）而非系统错误。
+/// 改返 `BIZ_STS_FORWARD_FAILED=20406` + 明确「未配置」消息，与上游转发失败
+/// 语义统一，前端可统一提示「STS 服务暂不可用 / 未配置 python base url」。
 pub struct NoopPyBackend;
 
 impl Default for NoopPyBackend {
@@ -229,16 +221,12 @@ impl PyBackendClient for NoopPyBackend {
         _headers: HeaderMap,
     ) -> Result<PyBackendResponse, AppError> {
         warn!("[NoopPyBackend] 跳过真实转发（PYTHON_BACKEND_ENABLED=false，本地调试）");
-        let body = serde_json::json!({
-            "code": 50001,
-            "message": "NoopPyBackend 未配置 PYTHON_BACKEND_BASE_URL（本地调试占位）",
-            "data": null,
-        });
-        Ok(PyBackendResponse {
-            status: StatusCode::NOT_IMPLEMENTED,
-            headers: HeaderMap::new(),
-            body: Bytes::from(serde_json::to_vec(&body).unwrap_or_default()),
-        })
+        // 直接返回业务错误，让 handler 走 `AppError::into_response()` 自动装信封；
+        // 不手拼 R { code, message, data } —— 与 HttpPyBackend 错误路径同源。
+        Err(AppError::biz(
+            code::BIZ_STS_FORWARD_FAILED,
+            "PYTHON_BACKEND_BASE_URL 未配置（NoopPyBackend 占位）",
+        ))
     }
 }
 

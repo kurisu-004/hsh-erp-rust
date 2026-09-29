@@ -204,7 +204,7 @@ CAS 命中（已上传过相同内容）→ 跳过 COS PUT，直接复用已有 
 - 强制 JWT 鉴权（Bearer token），由 `v2_router` 全局 `authenticate_middleware` 处理。
 - 缺 / 坏 / 过期 token → 40100 / 40102 / 40105（同 IAM 域其它端点语义）。
 - Role 检查：仅允许 `Manager / Clerk / CncProgrammer / Inspector` 4 角色之一；
-  其它（含 SHELF_ACCOUNT）→ 40300 FORBIDDEN。
+  其它 → 40300 FORBIDDEN。
 
 ### 行为
 
