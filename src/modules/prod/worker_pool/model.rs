@@ -43,6 +43,12 @@ pub struct TakenItem {
 /// `system_delivery_date` 在 `TakenItem` 已存在（语义重写：来自 t_part 而非业务字段），
 /// 不计为新字段。`drawing_no` 字段不变。
 ///
+/// 2026-09-29 新增 `has_cnc_program` 字段（与 `TakenItem` / `PoolBatchItem` 同源
+/// EXISTS 子查询：`t_part_file.kind='G_CODE' AND part_id=pb.part_id AND
+/// deleted_at IS NULL`）。前端 `WorkerQueueBoard.vue`「已编程」tag 渲染依赖本字段；
+/// 与候选池视图 / take_one_from_pool 优先级排序共用同一 EXISTS，保证三处口径一致。
+/// 序列化兼容性：服务端永远序列化（追加字段，旧客户端不报错）。
+///
 /// JOIN 拓扑（见 `worker_pool/repo.rs::list_held_by_worker_with_part`）：
 /// - `t_part_batch pb`         主表
 /// - `t_part p`                INNER JOIN（pb.part_id）
@@ -84,6 +90,11 @@ pub struct HeldBatchItem {
     /// 工单级备注（t_part.note）
     pub note: Option<String>,
     pub version: i32,
+    /// 2026-09-29 新增：是否已上传 G_CODE 数控程序（与候选池视图 / take_one_from_pool
+    /// 优先级排序同源 EXISTS：t_part_file.kind='G_CODE' AND part_id=pb.part_id AND
+    /// deleted_at IS NULL）。WorkerQueueBoard「已编程」tag 透传源。
+    #[serde(default)]
+    pub has_cnc_program: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

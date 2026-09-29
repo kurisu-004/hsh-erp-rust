@@ -1683,6 +1683,8 @@ async fn admin_assign_batch_not_in_pool() {
 //       同货架两个 batch（一个有 G_CODE 一个无），应优先 take 已编程 batch
 //   - list_candidates_includes_has_cnc_program
 //       PoolBatchItem 返回 has_cnc_program 字段
+//   - held_batch_includes_has_cnc_program
+//       HeldBatchItem 返回 has_cnc_program 字段（worker-pool state 端点）
 // ===========================================================================
 
 /// 为 part 插一个 t_part_file.kind='G_CODE' 行（worker_pool 候选池视图测试）。
@@ -1843,6 +1845,79 @@ async fn list_candidates_includes_has_cnc_program() {
         }
     }
     assert!(found_a && found_b, "应同时找到 A 与 B: {env}");
+}
+
+/// `GET /prod/worker-pool/state` 应在 `held_batches[*].has_cnc_program` 透传实际值。
+///
+/// 2026-09-29 review 第 1 轮补漏：前端 `WorkerQueueBoard.vue`「已编程」tag 渲染依赖
+/// `HeldBatchItem.has_cnc_program` 字段。后端 model 与 SQL 必须真实返回 EXISTS(G_CODE) 值，
+/// 否则 Zod strip 模式下前端静默丢字段会触发 schema 校验异常（`has_cnc_program` 必填）。
+/// 场景：worker 持有 2 个 batch（A 有 G_CODE，B 无），断言 `held_batches[*].has_cnc_program`
+/// 分别为 true / false。
+#[tokio::test]
+async fn held_batch_includes_has_cnc_program() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-CNC-HELD").await;
+    let proc = seed_process(&pool, "PROC-CNC-HELD", "工序-CNC-held").await;
+    let wt = insert_work_type(&pool, "WT-CNC-HELD", "工种-CNC-held", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-CNC-HELD", "PROD-CNC-HELD", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC-CNC-HELD", "工CNC-held", Some(wt)).await;
+    // 两个 held batch：A 有 G_CODE，B 无
+    let (_part_a, _batch_a) =
+        insert_worker_held_part(&pool, customer, "H-CNC-A", worker, proc, 1).await;
+    let (_part_b, _batch_b) =
+        insert_worker_held_part(&pool, customer, "H-CNC-B", worker, proc, 1).await;
+    let part_a_id: i64 = sqlx::query_scalar("SELECT id FROM t_part WHERE serial_no = 'H-CNC-A'")
+        .fetch_one(&pool)
+        .await
+        .expect("lookup part A");
+    seed_g_code_for_part(&pool, part_a_id).await;
+
+    // 调 state 端点：worker 当前持有 2 个 batch（无需 manager role，登录任意 user 即可）
+    let (app, token) = login_manager_with_username(&pool, "admin_cnc_held").await;
+    let uri = format!(
+        "/prod/worker-pool/state?worker_id={worker}&shelf_id={prod_shelf}"
+    );
+    let (s, env) = send(
+        app,
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "state: {env}");
+    let held = env["data"]["held_batches"].as_array().expect("held_batches array");
+    assert_eq!(held.len(), 2, "应 2 个 held batch: {env}");
+    let mut found_a = false;
+    let mut found_b = false;
+    for it in held {
+        let serial = sqlx::query_scalar::<_, String>(
+            "SELECT serial_no FROM t_part WHERE id = $1",
+        )
+        .bind(it["part_id"].as_str().unwrap().parse::<i64>().unwrap())
+        .fetch_one(&pool)
+        .await
+        .expect("lookup serial");
+        match serial.as_str() {
+            "H-CNC-A" => {
+                found_a = true;
+                assert_eq!(
+                    it["has_cnc_program"], true,
+                    "A 应有 has_cnc_program=true（已上传 G_CODE）: {env}"
+                );
+            }
+            "H-CNC-B" => {
+                found_b = true;
+                assert_eq!(
+                    it["has_cnc_program"], false,
+                    "B 应有 has_cnc_program=false（未上传 G_CODE）: {env}"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(found_a && found_b, "应同时找到 H-CNC-A 与 H-CNC-B: {env}");
 }
 
 /// 场景 20: admin_assign process_id 不匹配

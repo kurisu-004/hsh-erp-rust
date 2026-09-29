@@ -415,6 +415,11 @@ impl WorkerPoolRepo {
     /// 同时导致 part_batch/repo.rs 行数越过 conventions.md 1000 行上限。
     /// 下沉到本域 repo，与 `take_one_from_pool` / `take_specific_from_pool` 同级。
     ///
+    /// 2026-09-29 review 第 1 轮补漏：SELECT 增 `EXISTS (t_part_file kind='G_CODE')`
+    /// 子查询透传 `has_cnc_program` → `HeldBatchItem.has_cnc_program`。
+    /// 与 `take_one_from_pool` / `list_candidates_by_process_all_shelves` 同源 EXISTS，
+    /// 保证 worker-pool state / 候选池视图 / 自动分配优先级三处口径一致。
+    ///
     /// JOIN 拓扑（与 `list_candidates_by_process_all_shelves` 的 5 表 JOIN 同形；
     /// t_applicant 用 `name = p.applicant_name` 因 t_part 无 applicant_id FK 字段）：
     /// - `t_part_batch pb`            主表
@@ -431,7 +436,8 @@ impl WorkerPoolRepo {
     ///
     /// 索引命中：`ix_t_part_batch_holder_location` 覆盖 `(current_holder_id,
     /// location)` 谓词；JOIN t_part 走主键 `t_part.id`；JOIN t_customer / t_applicant
-    /// 走各自的 `id` / `name` 索引。
+    /// 走各自的 `id` / `name` 索引；EXISTS 子查询走 `ix_t_part_file_part_kind`
+    /// (part_id, kind) 索引。
     pub async fn list_held_by_worker_with_part<'e, E: PgExecutor<'e>>(
         executor: E,
         worker_id: i64,
@@ -455,7 +461,15 @@ impl WorkerPoolRepo {
                 c2.name                AS "customer_name?",
                 c1.name                AS "parent_customer_name?",
                 a.name                 AS "applicant_name?",
-                s.code                 AS "shelf_code?"
+                s.code                 AS "shelf_code?",
+                -- 2026-09-29 新增：与候选池视图 / take_one_from_pool 同源 EXISTS
+                --   （t_part_file.kind='G_CODE' AND part_id=pb.part_id AND deleted_at IS NULL）。
+                --   worker-pool state 端点的「held_batches[*].has_cnc_program」真相源；
+                --   前端 WorkerQueueBoard「已编程」tag 依赖本字段。
+                EXISTS (SELECT 1 FROM t_part_file pf
+                        WHERE pf.part_id = pb.part_id
+                          AND pf.kind = 'G_CODE'
+                          AND pf.deleted_at IS NULL) AS "has_cnc_program!"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL
             LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL
@@ -493,6 +507,8 @@ impl WorkerPoolRepo {
                 shelf_code: r.shelf_code,
                 note: r.p_note,
                 version: r.batch_version,
+                // 2026-09-29 新增：透传 has_cnc_program 到 HeldBatchItem 出参
+                has_cnc_program: r.has_cnc_program,
             })
             .collect())
     }

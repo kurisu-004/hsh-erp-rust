@@ -272,7 +272,7 @@ WS 广播（commit 后下发）：
 |---|---|---|
 | `batch_id` | string (i64) | 批次雪花 ID |
 | `part_id` | string (i64) | 工单雪花 ID |
-| `batch_no` | i32 | 批次序号（同一 part 下从 1 开始） |
+| `batch_no` | i32 | 批次序号 |
 | `quantity` | i32 | 批次数量 |
 | `serial_no` | string? | 工单序列号 |
 | `drawing_no` | string | 图号 |
@@ -281,6 +281,33 @@ WS 广播（commit 后下发）：
 | `is_urgent` | bool | 是否加急 |
 | `version` | i32 | 乐观锁（admin_remove 返回 `batch.version + 1`） |
 | `has_cnc_program` | bool | **2026-09-29 新增**。`refill_for_worker` / `assign_batch_to_worker` / `take_specific_from_pool` 透传 worker_pool 候选池视图同源 EXISTS；admin_remove 路径默认 `false`（admin_remove 不开 candidate EXISTS）。详见下文「§自动分配优先级」 |
+
+### HeldBatchItem 字段
+
+`WorkerPoolState.held_batches` 单条结构。在 `TakenItem` 字段基础上多 `name / customer_name /
+parent_customer_name / applicant_name / location / shelf_code / note` 7 个展示字段，
+JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉全。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string (i64) | 批次雪花 ID |
+| `part_id` | string (i64) | 工单雪花 ID |
+| `batch_no` | i32 | 批次序号 |
+| `quantity` | i32 | 批次数量 |
+| `serial_no` | string? | 工单序列号（手工工单可空） |
+| `drawing_no` | string | 图号 |
+| `name` | string | 工单 / 零件名称（t_part.name） |
+| `system_delivery_date` | date? | 系统交付日期（t_part） |
+| `planned_delivery_date` | date? | 计划交付日期（t_part） |
+| `is_urgent` | bool | 是否加急（t_part.is_urgent） |
+| `customer_name` | string? | L2 叶子客户名 |
+| `parent_customer_name` | string? | L1 一级集团名 |
+| `applicant_name` | string? | 申请人姓名（LEFT JOIN t_applicant.name，applicant 软删 / 不存在时为 None） |
+| `location` | string | 当前 holder 位置 enum（`"WORKER"`） |
+| `shelf_code` | string? | 当前货架编码（WORKER 持有时 `current_holder_id = worker_id` 非 shelf_id，故通常为 None） |
+| `note` | string? | 工单级备注（t_part.note） |
+| `version` | i32 | 乐观锁（t_part_batch.version） |
+| `has_cnc_program` | bool | **2026-09-29 新增**：是否已上传 G_CODE 数控程序（与候选池视图 / take_one_from_pool 同源 EXISTS 子查询）。前端 `WorkerQueueBoard.vue`「已编程」tag 渲染依赖本字段。
 
 ### RefillResult 字段
 
@@ -313,7 +340,7 @@ WS 广播（commit 后下发）：
 | `current_held` | i64 | worker 当前持有批次数（`t_part_batch` 中 `status='IN_PROCESS' AND location='WORKER' AND current_holder_id = worker_id`） |
 | `capacity_remaining` | i32 | `max(0, max_held - current_held)` |
 | `pool_count_by_process` | [ProcessPoolCount](#processpoolcount-字段) | 各工序候选池计数（仅含 work_type 映射到的工序） |
-| `held_batches` | [TakenItem](#takenitem-字段)[] | **2026-09-14 follow-up-ux 新增**：worker 当前持有的完整 batch 列表（JOIN t_part），按 `t_part_batch.id ASC` 排序。避免前端按 worker 轮询 K 次单 batch 详情接口的 N+1；UI sink `WorkerQueueBoard.vue` 已对接 `:batches="workerHeld[w.id] ?? []"` |
+| `held_batches` | [HeldBatchItem](#heldbatchitem-字段)[] | **2026-09-14 follow-up-ux 新增**：worker 当前持有的完整 batch 列表（JOIN t_part），按 `t_part_batch.id ASC` 排序。避免前端按 worker 轮询 K 次单 batch 详情接口的 N+1；UI sink `WorkerQueueBoard.vue` 已对接 `:batches="workerHeld[w.id] ?? []"` |
 
 ### PoolBatchItem 字段
 

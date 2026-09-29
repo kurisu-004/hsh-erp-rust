@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                pb.id                  AS \"batch_id!\",\n                pb.part_id             AS \"part_id!\",\n                pb.batch_no            AS \"batch_no!\",\n                pb.quantity            AS \"quantity!\",\n                pb.location            AS \"pb_location!\",\n                pb.version             AS \"batch_version!\",\n                p.serial_no            AS \"p_serial_no?\",\n                p.drawing_no           AS \"p_drawing_no!\",\n                p.name                 AS \"p_name!\",\n                p.system_delivery_date AS \"p_system_delivery_date?\",\n                p.planned_delivery_date AS \"p_planned_delivery_date!\",\n                p.is_urgent            AS \"p_is_urgent!\",\n                p.note                 AS \"p_note?\",\n                c2.name                AS \"customer_name?\",\n                c1.name                AS \"parent_customer_name?\",\n                a.name                 AS \"applicant_name?\",\n                s.code                 AS \"shelf_code?\"\n            FROM t_part_batch pb\n            JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL\n            LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL\n            LEFT JOIN t_customer c1 ON c1.id = c2.parent_id AND c1.deleted_at IS NULL\n            LEFT JOIN t_applicant a ON a.name = p.applicant_name AND a.deleted_at IS NULL\n            LEFT JOIN t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL\n            WHERE pb.status = 'IN_PROCESS'\n              AND pb.location = 'WORKER'\n              AND pb.current_holder_id = $1\n              AND pb.deleted_at IS NULL\n            ORDER BY pb.id ASC\n            ",
+  "query": "\n            SELECT\n                pb.id                  AS \"batch_id!\",\n                pb.part_id             AS \"part_id!\",\n                pb.batch_no            AS \"batch_no!\",\n                pb.quantity            AS \"quantity!\",\n                pb.location            AS \"pb_location!\",\n                pb.version             AS \"batch_version!\",\n                p.serial_no            AS \"p_serial_no?\",\n                p.drawing_no           AS \"p_drawing_no!\",\n                p.name                 AS \"p_name!\",\n                p.system_delivery_date AS \"p_system_delivery_date?\",\n                p.planned_delivery_date AS \"p_planned_delivery_date!\",\n                p.is_urgent            AS \"p_is_urgent!\",\n                p.note                 AS \"p_note?\",\n                c2.name                AS \"customer_name?\",\n                c1.name                AS \"parent_customer_name?\",\n                a.name                 AS \"applicant_name?\",\n                s.code                 AS \"shelf_code?\",\n                -- 2026-09-29 新增：与候选池视图 / take_one_from_pool 同源 EXISTS\n                --   （t_part_file.kind='G_CODE' AND part_id=pb.part_id AND deleted_at IS NULL）。\n                --   worker-pool state 端点的「held_batches[*].has_cnc_program」真相源；\n                --   前端 WorkerQueueBoard「已编程」tag 依赖本字段。\n                EXISTS (SELECT 1 FROM t_part_file pf\n                        WHERE pf.part_id = pb.part_id\n                          AND pf.kind = 'G_CODE'\n                          AND pf.deleted_at IS NULL) AS \"has_cnc_program!\"\n            FROM t_part_batch pb\n            JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL\n            LEFT JOIN t_customer c2 ON c2.id = p.customer_id AND c2.deleted_at IS NULL\n            LEFT JOIN t_customer c1 ON c1.id = c2.parent_id AND c1.deleted_at IS NULL\n            LEFT JOIN t_applicant a ON a.name = p.applicant_name AND a.deleted_at IS NULL\n            LEFT JOIN t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL\n            WHERE pb.status = 'IN_PROCESS'\n              AND pb.location = 'WORKER'\n              AND pb.current_holder_id = $1\n              AND pb.deleted_at IS NULL\n            ORDER BY pb.id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -189,6 +189,12 @@
             "name": "code"
           }
         }
+      },
+      {
+        "ordinal": 17,
+        "name": "has_cnc_program!",
+        "type_info": "Bool",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -213,8 +219,9 @@
       false,
       false,
       false,
-      false
+      false,
+      null
     ]
   },
-  "hash": "250ae79e08c74acac315748c15e99a9fda689d38b9c04be1263197cfb9e99fbb"
+  "hash": "d4de2c99869fdda5fb58ffee89dcf9ac35e6e5be4429f95344e5f3829476166c"
 }
