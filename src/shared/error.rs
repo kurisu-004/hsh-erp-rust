@@ -103,6 +103,12 @@ pub mod code {
     pub const BIZ_PART_NOT_READY_TO_SHIP: i32 = 20117; // deliver 操作要求零件当前为 READY_TO_SHIP
     pub const BIZ_PART_REPAIR_NOT_TRIGGERED: i32 = 20118; // start-repair 操作要求零件当前为 IN_PROCESS
     pub const BIZ_PART_NOT_DELETABLE: i32 = 20119; // 零件处于终态 (DELIVERED/COMPLETED) 或已挂送货单，禁 soft-delete
+    // 2026-09-29 新增：prod/batch 下发（dispatch）阶段专用错误码。
+    // - 20120 BIZ_BATCH_INVALID_STATUS：批次当前 status 不允许 dispatch（非 PENDING）
+    // - 20121 BIZ_BATCH_NOT_FOUND：dispatch 时按 batch_id 查不到（与 20109 BIZ_PART_BATCH_NOT_FOUND
+    //   语义近似但属于 prod/batch 上下文独立槽位，方便前端按 code 区分场景）
+    pub const BIZ_BATCH_INVALID_STATUS: i32 = 20120;
+    pub const BIZ_BATCH_NOT_FOUND: i32 = 20121;
 
     // 202xx 工人
     pub const BIZ_WORKER_NOT_FOUND: i32 = 20201;
@@ -141,6 +147,10 @@ pub mod code {
     pub const BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND: i32 = 20505; // 工序不存在
     pub const BIZ_SHELF_NO_MATCH_FOR_PROCESS: i32 = 20506; // 没有 active 货架映射指定 process
     pub const BIZ_SHELF_PROCESS_NOT_MAPPED: i32 = 20507; // 货架未映射该工序
+    // 2026-09-29 新增：prod/batch 下发（dispatch）阶段——按 target_process_id 在
+    // t_shelf_process 找不到任何 active 货架映射。dispatch 路径不要求 picker
+    // 风格（用户传 bookId 自己挑 shelf），但服务端兜底要给出明确错误码。
+    pub const BIZ_SHELF_PROCESS_NOT_FOUND: i32 = 20508;
     // to-inspection 一键送检新增
     pub const BIZ_SHELF_NOT_INSPECTION_ZONE: i32 = 20511; // target_inspection_shelf.zone ≠ 'INSPECTION'
     pub const BIZ_SHELF_INACTIVE: i32 = 20512; // target_inspection_shelf.is_active = false
@@ -436,6 +446,7 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_SHELF_NOT_FOUND
             || c == code::BIZ_SHELF_PROCESS_SHELF_NOT_FOUND
             || c == code::BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND
+            || c == code::BIZ_SHELF_PROCESS_NOT_FOUND
             || c == code::BIZ_PROCESS_NOT_FOUND
             || c == code::BIZ_WORK_TYPE_NOT_FOUND
             || c == code::BIZ_APPLICANT_NOT_FOUND
@@ -448,7 +459,8 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_DELIVERY_SCAN_UNKNOWN_CODE
             || c == code::BIZ_OUTSOURCE_SHIPMENT_NOT_FOUND
             || c == code::BIZ_PROCESS_CHAIN_NOT_FOUND
-            || c == code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND =>
+            || c == code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND
+            || c == code::BIZ_BATCH_NOT_FOUND =>
         {
             StatusCode::NOT_FOUND
         }
@@ -485,15 +497,14 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER
             || c == code::BIZ_PART_NOT_DELETABLE
             || c == code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING
-            || c == code::BIZ_PROCESS_CHAIN_REQUIRED =>
+            || c == code::BIZ_PROCESS_CHAIN_REQUIRED
+            || c == code::BIZ_BATCH_INVALID_STATUS =>
         {
             StatusCode::CONFLICT
         }
 
         // ---- 2xxxx 业务码：422 (校验类，Python 显式声明 21113 → 422) ----
-        c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER
-            || c == code::BIZ_SHELF_PROCESS_NOT_MAPPED =>
-        {
+        c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER || c == code::BIZ_SHELF_PROCESS_NOT_MAPPED => {
             StatusCode::UNPROCESSABLE_ENTITY
         }
 
@@ -637,6 +648,9 @@ mod tests {
             "BIZ_PART_REPAIR_NOT_TRIGGERED",
         ),
         (code::BIZ_PART_NOT_DELETABLE, "BIZ_PART_NOT_DELETABLE"),
+        // 2026-09-29 新增：prod/batch dispatch 专用错误码
+        (code::BIZ_BATCH_INVALID_STATUS, "BIZ_BATCH_INVALID_STATUS"),
+        (code::BIZ_BATCH_NOT_FOUND, "BIZ_BATCH_NOT_FOUND"),
         // 202xx
         (code::BIZ_WORKER_NOT_FOUND, "BIZ_WORKER_NOT_FOUND"),
         (code::BIZ_WORKER_INACTIVE, "BIZ_WORKER_INACTIVE"),
@@ -694,6 +708,12 @@ mod tests {
         (
             code::BIZ_SHELF_PROCESS_NOT_MAPPED,
             "BIZ_SHELF_PROCESS_NOT_MAPPED",
+        ),
+        // 2026-09-29 新增：prod/batch dispatch —— 按 target_process_id 在 t_shelf_process
+        // 找不到任何 active 货架映射
+        (
+            code::BIZ_SHELF_PROCESS_NOT_FOUND,
+            "BIZ_SHELF_PROCESS_NOT_FOUND",
         ),
         (
             code::BIZ_SHELF_NOT_INSPECTION_ZONE,
@@ -1001,6 +1021,9 @@ mod tests {
         assert_eq!(code::BIZ_PART_NOT_READY_TO_SHIP, 20117);
         assert_eq!(code::BIZ_PART_REPAIR_NOT_TRIGGERED, 20118);
         assert_eq!(code::BIZ_PART_NOT_DELETABLE, 20119);
+        // 2026-09-29 新增：prod/batch dispatch 专用错误码
+        assert_eq!(code::BIZ_BATCH_INVALID_STATUS, 20120);
+        assert_eq!(code::BIZ_BATCH_NOT_FOUND, 20121);
 
         // 202xx
         assert_eq!(code::BIZ_WORKER_NOT_FOUND, 20201);
@@ -1033,6 +1056,8 @@ mod tests {
         assert_eq!(code::BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND, 20505);
         assert_eq!(code::BIZ_SHELF_NO_MATCH_FOR_PROCESS, 20506);
         assert_eq!(code::BIZ_SHELF_PROCESS_NOT_MAPPED, 20507);
+        // 2026-09-29 新增：prod/batch dispatch —— t_shelf_process 找不到映射
+        assert_eq!(code::BIZ_SHELF_PROCESS_NOT_FOUND, 20508);
         assert_eq!(code::BIZ_SHELF_NOT_INSPECTION_ZONE, 20511);
         assert_eq!(code::BIZ_SHELF_INACTIVE, 20512);
 
@@ -1284,6 +1309,12 @@ mod tests {
             StatusCode::NOT_FOUND,
             "BIZ_SHELF_NOT_FOUND",
         ),
+        // 2026-09-29 新增：prod/batch dispatch —— t_shelf_process 找不到映射
+        (
+            code::BIZ_SHELF_PROCESS_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_SHELF_PROCESS_NOT_FOUND",
+        ),
         (
             code::BIZ_PROCESS_NOT_FOUND,
             StatusCode::NOT_FOUND,
@@ -1353,6 +1384,18 @@ mod tests {
             code::BIZ_PROCESS_CHAIN_REQUIRED,
             StatusCode::CONFLICT,
             "BIZ_PROCESS_CHAIN_REQUIRED",
+        ),
+        // 2026-09-29 新增：prod/batch dispatch 阶段 status 守卫（409）
+        (
+            code::BIZ_BATCH_INVALID_STATUS,
+            StatusCode::CONFLICT,
+            "BIZ_BATCH_INVALID_STATUS",
+        ),
+        // 2026-09-29 新增：prod/batch dispatch 按 batch_id 查不到（404）
+        (
+            code::BIZ_BATCH_NOT_FOUND,
+            StatusCode::NOT_FOUND,
+            "BIZ_BATCH_NOT_FOUND",
         ),
         // 2026-09-28 删除：相关会话域 HTTP 表覆盖（域下线，码段释放）。
         // 2xxxx 显式 409
