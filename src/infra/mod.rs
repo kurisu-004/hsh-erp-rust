@@ -21,6 +21,8 @@ pub mod config;
 pub mod cos;
 pub mod cos_opendal; // 2026-09-20 spike：OpenDAL S3 backend 替代 cos-rust-sdk 可行性验证
 pub mod db;
+// 2026-09-28 新增：rust → python 后端转发 HTTP 客户端抽象（薄壳鉴权转发到 python STS 端点）。
+pub mod py_backend;
 pub mod redis;
 pub mod seed; // 2026-09-25 新增：菜单等配置数据声明式种子
 pub mod serial;

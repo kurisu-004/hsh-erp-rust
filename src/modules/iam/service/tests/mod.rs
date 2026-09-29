@@ -233,6 +233,8 @@ pub fn test_app_config() -> Arc<AppConfig> {
         // 2026-09-28 删除：相关上传会话域字段（域整体下线）。
         idempotency_ttl_seconds: 86400,
         bootstrap_admin_enabled: false,
+        // 2026-09-28 新增：rust → python 后端转发配置（session service 单测不读，留默认）。
+        python_backend: crate::infra::config::PythonBackendConfig::default(),
     })
 }
 

@@ -955,6 +955,8 @@ async fn pickup_non_driver_returns_400_21409_and_happy_path_picks_up() {
         std::sync::Arc::new(SnowflakeIdGenerator::new(1_577_836_800_000, 1)),
         std::sync::Arc::new(hsh_erp_rust::infra::ws_hub::WsHub::default()),
         std::sync::Arc::new(hsh_erp_rust::infra::cos::NoopCos),
+        // 2026-09-28 新增：rust → python 后端转发客户端（pickup 测试不走 STS 转发，走 Noop）。
+        std::sync::Arc::new(hsh_erp_rust::infra::py_backend::NoopPyBackend),
         tokio_util::sync::CancellationToken::new(),
         std::sync::Arc::new(hsh_erp_rust::auth::session::RedisSessionStore::new(
             redis_pool.clone(),

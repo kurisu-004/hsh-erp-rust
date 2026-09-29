@@ -105,6 +105,12 @@ pub mod code {
     pub const BIZ_DRAWING_FILE_BAD_TYPE: i32 = 20402; // 扩展名不在 COS_ALLOWED_TYPES 白名单
     pub const BIZ_DRAWING_FILE_TOO_LARGE: i32 = 20403; // 文件大小 ≤0 或 > cos_max_file_size_bytes
     pub const BIZ_DRAWING_UPLOAD_FAILED: i32 = 20404; // COS SDK 抛错
+    // 2026-09-28 新增：rust → python 薄壳鉴权转发 STS 失败。
+    // 触发场景：`POST /api/v2/files/sts-tmp-keys` 鉴权通过后调
+    // `HttpPyBackend::forward_sts_tmp_keys` 失败（网络层超时 / 连接拒 / 读取 body 失败）。
+    // HTTP 502 BAD_GATEWAY；语义与 nginx upstream 失败同形（"上传相关资源失败"）。
+    // 槽位选择：204xx 图纸文件/上传段，与 `BIZ_DRAWING_UPLOAD_FAILED=20404` 同形；20406 与上1下20405 同段连续。
+    pub const BIZ_STS_FORWARD_FAILED: i32 = 20406;
 
     // 205xx 货架（t_shelf）
     pub const BIZ_SHELF_NOT_FOUND: i32 = 20501;
@@ -463,6 +469,11 @@ fn status_from_code(c: i32) -> StatusCode {
             StatusCode::UNPROCESSABLE_ENTITY
         }
 
+        // ---- 2xxxx 业务码：502 (上游网关失败，nginx upstream 同形) ----
+        // 2026-09-28 新增：rust → python 薄壳鉴权转发 STS 失败 = 502 BAD_GATEWAY。
+        // 与 nginx upstream fail 的语义一致（"上游 python 后端不可达 / 读 body 失败"）。
+        c if c == code::BIZ_STS_FORWARD_FAILED => StatusCode::BAD_GATEWAY,
+
         // ---- 2xxxx 兜底：Python BizError 默认 400 ----
         c if c == code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH
             || c == code::BIZ_DELIVERY_ASSEMBLY_PARTS_NOT_READY
@@ -629,6 +640,8 @@ mod tests {
             "BIZ_DRAWING_FILE_TOO_LARGE",
         ),
         (code::BIZ_DRAWING_UPLOAD_FAILED, "BIZ_DRAWING_UPLOAD_FAILED"),
+        // 2026-09-28 新增：rust → python STS 转发失败
+        (code::BIZ_STS_FORWARD_FAILED, "BIZ_STS_FORWARD_FAILED"),
         // 205xx
         (code::BIZ_SHELF_NOT_FOUND, "BIZ_SHELF_NOT_FOUND"),
         (code::BIZ_SHELF_DUPLICATE_CODE, "BIZ_SHELF_DUPLICATE_CODE"),
@@ -970,6 +983,8 @@ mod tests {
         assert_eq!(code::BIZ_DRAWING_FILE_BAD_TYPE, 20402);
         assert_eq!(code::BIZ_DRAWING_FILE_TOO_LARGE, 20403);
         assert_eq!(code::BIZ_DRAWING_UPLOAD_FAILED, 20404);
+        // 2026-09-28 新增：rust → python STS 转发失败
+        assert_eq!(code::BIZ_STS_FORWARD_FAILED, 20406);
 
         // 205xx
         assert_eq!(code::BIZ_SHELF_NOT_FOUND, 20501);
@@ -1482,6 +1497,12 @@ mod tests {
             code::BIZ_PART_NOT_DELETABLE,
             StatusCode::CONFLICT,
             "BIZ_PART_NOT_DELETABLE",
+        ),
+        // 2026-09-28 新增：rust → python STS 转发失败 → 502 BAD_GATEWAY
+        (
+            code::BIZ_STS_FORWARD_FAILED,
+            StatusCode::BAD_GATEWAY,
+            "BIZ_STS_FORWARD_FAILED",
         ),
     ];
 

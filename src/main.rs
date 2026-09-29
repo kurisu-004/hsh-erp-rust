@@ -25,6 +25,7 @@ use hsh_erp_rust::infra::config::AppConfig;
 use hsh_erp_rust::infra::cos::CosClient;
 use hsh_erp_rust::infra::cos_opendal::build_cos_client;
 use hsh_erp_rust::infra::db;
+use hsh_erp_rust::infra::py_backend::{PyBackendClient, build_py_backend};
 use hsh_erp_rust::infra::seed;
 use hsh_erp_rust::infra::redis;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
@@ -75,6 +76,14 @@ async fn main() -> anyhow::Result<()> {
     // 6. COS 客户端（按 `COS_BACKEND` 二选一：`opendal` / `noop`）
     let cos: Arc<dyn CosClient> = build_cos_client(&config.cos).context("构造 COS 客户端失败")?;
 
+    // 6.6 python 后端转发客户端（薄壳鉴权转发到 python STS 端点）。
+    // 2026-09-28 新增：修复 python `/api/v1/files/sts-tmp-keys` 裸开漏洞——本 rust 端
+    // 是新的强制鉴权点（详见 plan `/Users/ren/.claude/plans/sts-session-uploader-sts-sts-sequential-globe.md`）。
+    // `enabled=false`（未设 `PYTHON_BACKEND_BASE_URL`）→ `NoopPyBackend` 占位；
+    // `enabled=true` → `HttpPyBackend` 走真实转发。
+    let py_backend: Arc<dyn PyBackendClient> =
+        build_py_backend(&config.python_backend).context("构造 python 后端转发客户端失败")?;
+
     // 6.5 Redis 连接池 + 服务端 session 存储（生产必走 Redis；NoopSessionStore 仅测试 fixture 用）
     // 2026-09-28 删除：相关上传会话域装配（Redis 共享 STS 凭证会话机制已下线）。
     let (session, idempotency_store): (
@@ -101,6 +110,8 @@ async fn main() -> anyhow::Result<()> {
         snowflake,
         ws_hub.clone(),
         cos,
+        // 2026-09-28 新增：rust → python 后端转发客户端。
+        py_backend,
         shutdown.clone(),
         session,
         // 2026-09-23 新增 Idempotency 中间件存储
