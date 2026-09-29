@@ -22,19 +22,19 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::PartService;
-use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::prod::work_type::repo::WorkTypeRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
+use super::super::model::DeliveryNoteEventType;
 use super::super::vo::{
     AvailableBatchDto, BatchStatusDto, DeliveryNoteCandidatePart, DeliveryNoteEventOut,
     DeliveryNotePickupScanOut, SubmitDeliveryOut, SubmitOutcomeDto, UnresolvedTargetDto,
 };
-use super::super::model::DeliveryNoteEventType;
 use super::inner::{
     build_note_outs, note_not_found, note_version_conflict, scope_from_note, write_event,
 };
@@ -185,7 +185,8 @@ impl DeliveryNoteService {
                 "concurrent modification detected",
             ));
         }
-        obj = repo.note_get_by_id(note_id, false)
+        obj = repo
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
@@ -260,7 +261,8 @@ impl DeliveryNoteService {
                 "concurrent modification detected",
             ));
         }
-        obj = repo.note_get_by_id(note_id, false)
+        obj = repo
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
@@ -279,7 +281,8 @@ impl DeliveryNoteService {
     ) -> Result<DeliveryNotePickupScanOut, AppError> {
         let _ = current;
 
-        let obj = repo.note_get_by_id(note_id, false)
+        let obj = repo
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         if obj.status != STATUS_SUBMITTED {
@@ -467,7 +470,8 @@ impl DeliveryNoteService {
                 "concurrent modification detected",
             ));
         }
-        obj = repo.note_get_by_id(note_id, false)
+        obj = repo
+            .note_get_by_id(note_id, false)
             .await?
             .ok_or_else(|| note_not_found(note_id))?;
         let out = build_note_outs(&mut *repo.conn_mut(), std::slice::from_ref(&obj)).await?;
@@ -573,7 +577,8 @@ impl DeliveryNoteService {
         }
 
         // L1 根下所有 active 子客户 (L2) + L1 自身
-        let children = CustomerRepo::list_children(&mut *repo.conn_mut(), customer_id, false).await?;
+        let children =
+            CustomerRepo::list_children(&mut *repo.conn_mut(), customer_id, false).await?;
         let mut customer_ids: Vec<i64> = children.iter().map(|c| c.id).collect();
         customer_ids.push(customer_id);
         let mut name_by_id: HashMap<i64, String> =

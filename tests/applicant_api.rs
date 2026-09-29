@@ -351,7 +351,11 @@ async fn create_get_update_soft_delete_applicant_happy_path() {
         json_request("GET", &format!("/com/applicants/{id}"), None, Some(&token)),
     )
     .await;
-    assert_eq!(s, axum::http::StatusCode::NOT_FOUND, "软删后 GET 应 404: {env}");
+    assert_eq!(
+        s,
+        axum::http::StatusCode::NOT_FOUND,
+        "软删后 GET 应 404: {env}"
+    );
     assert_eq!(env["code"], 21001, "BIZ_APPLICANT_NOT_FOUND: {env}");
 }
 
@@ -385,7 +389,9 @@ async fn duplicate_name_under_same_customer_returns_21002() {
         json_request(
             "POST",
             "/com/applicants",
-            Some(serde_json::json!({"name": "重复名", "customer_id": fx.l1_customer_id.to_string()})),
+            Some(
+                serde_json::json!({"name": "重复名", "customer_id": fx.l1_customer_id.to_string()}),
+            ),
             Some(&token),
         ),
     )
@@ -398,7 +404,9 @@ async fn duplicate_name_under_same_customer_returns_21002() {
         json_request(
             "POST",
             "/com/applicants",
-            Some(serde_json::json!({"name": "重复名", "customer_id": fx.l1_customer_id.to_string()})),
+            Some(
+                serde_json::json!({"name": "重复名", "customer_id": fx.l1_customer_id.to_string()}),
+            ),
             Some(&token),
         ),
     )
@@ -438,8 +446,18 @@ async fn update_with_stale_version_returns_409() {
 
     // 两个并发 update（不同名字）—— 一个会成功 V=0→1，另一个会撞 stale version → 40901
     let uri = format!("/com/applicants/{id}/update");
-    let req_a = json_request("POST", &uri, Some(serde_json::json!({"name": "name-A"})), Some(&token_a));
-    let req_b = json_request("POST", &uri, Some(serde_json::json!({"name": "name-B"})), Some(&token_b));
+    let req_a = json_request(
+        "POST",
+        &uri,
+        Some(serde_json::json!({"name": "name-A"})),
+        Some(&token_a),
+    );
+    let req_b = json_request(
+        "POST",
+        &uri,
+        Some(serde_json::json!({"name": "name-B"})),
+        Some(&token_b),
+    );
     let app_a = fresh_app(&pool).await;
     let app_b = fresh_app(&pool).await;
     let (r1, r2) = tokio::join!(send(app_a, req_a), send(app_b, req_b));
@@ -448,7 +466,10 @@ async fn update_with_stale_version_returns_409() {
 
     // 期望：恰好一个 200，一个 409
     let pair = [(s_a, &e_a), (s_b, &e_b)];
-    let ok_count = pair.iter().filter(|(s, _)| *s == axum::http::StatusCode::OK).count();
+    let ok_count = pair
+        .iter()
+        .filter(|(s, _)| *s == axum::http::StatusCode::OK)
+        .count();
     let conflict_count = pair
         .iter()
         .filter(|(s, _)| *s == axum::http::StatusCode::CONFLICT)

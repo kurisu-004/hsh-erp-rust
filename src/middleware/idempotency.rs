@@ -30,8 +30,8 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::Pool as RedisPool;
+use deadpool_redis::redis::AsyncCommands;
 // `automock` 仅在测试 build（`#[cfg_attr(test, automock)]`）时解析为 proc-macro
 // 属性；非测试 build 编译器看到的是未识别符号，allow 静默之。
 #[allow(unused_imports)]
@@ -152,12 +152,7 @@ impl IdempotencyStore for InMemoryIdempotencyStore {
         }
     }
 
-    async fn put(
-        &self,
-        key: &str,
-        value: &CachedResponse,
-        ttl_seconds: u64,
-    ) -> anyhow::Result<()> {
+    async fn put(&self, key: &str, value: &CachedResponse, ttl_seconds: u64) -> anyhow::Result<()> {
         let mut guard = self.entries.lock().await;
         guard.insert(
             key.to_string(),
@@ -218,12 +213,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
         }
     }
 
-    async fn put(
-        &self,
-        key: &str,
-        value: &CachedResponse,
-        ttl_seconds: u64,
-    ) -> anyhow::Result<()> {
+    async fn put(&self, key: &str, value: &CachedResponse, ttl_seconds: u64) -> anyhow::Result<()> {
         let payload = serde_json::to_string(value)
             .with_context(|| format!("serialize CachedResponse for {key}"))?;
         let mut conn = self.conn().await?;
@@ -256,10 +246,10 @@ pub async fn idempotency_middleware(
     next: Next,
 ) -> Response {
     // 1) method 过滤：只对 POST/PUT/PATCH 起作用
-    if !matches!(req.method(), &axum::http::Method::POST
-        | &axum::http::Method::PUT
-        | &axum::http::Method::PATCH)
-    {
+    if !matches!(
+        req.method(),
+        &axum::http::Method::POST | &axum::http::Method::PUT | &axum::http::Method::PATCH
+    ) {
         return next.run(req).await;
     }
 
@@ -419,7 +409,11 @@ fn build_cached_response(cached: CachedResponse) -> Response {
         }
     }
     // 兜底 content-type：没有显式 header 时补 application/json（业务响应都是 JSON）
-    if !cached.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
+    if !cached
+        .headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("content-type"))
+    {
         builder = builder.header(CONTENT_TYPE, "application/json");
     }
     builder

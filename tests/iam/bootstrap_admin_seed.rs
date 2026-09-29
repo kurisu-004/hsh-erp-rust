@@ -206,13 +206,12 @@ async fn bootstrap_admin_seed_idempotent_preserves_manual_hash() {
         .expect("second admin seed re-apply");
 
     // 4. 断言 hash **未被** seed 字面值覆盖（ON CONFLICT DO NOTHING 生效）
-    let current_hash: String = sqlx::query_scalar(
-        "SELECT password_hash FROM t_user WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(ADMIN_USER_ID)
-    .fetch_one(&pool)
-    .await
-    .expect("read password_hash");
+    let current_hash: String =
+        sqlx::query_scalar("SELECT password_hash FROM t_user WHERE id = $1 AND deleted_at IS NULL")
+            .bind(ADMIN_USER_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read password_hash");
     assert_eq!(
         current_hash, manual_hash,
         "ON CONFLICT (username) WHERE deleted_at IS NULL DO NOTHING 必须保留手工改过的 hash \
@@ -264,10 +263,5 @@ async fn bootstrap_admin_seed_coexists_with_iam_fixture() {
     let _token = login_token(&app, ADMIN_USERNAME, ADMIN_PASSWORD).await;
 
     // 额外 sanity：fixture MANAGER 用户（仍是 fx_iam_manager / changeme）也能登录
-    let _fx_token = login_token(
-        &app,
-        IamFixture::MANAGER_USERNAME,
-        IamFixture::PASSWORD,
-    )
-    .await;
+    let _fx_token = login_token(&app, IamFixture::MANAGER_USERNAME, IamFixture::PASSWORD).await;
 }

@@ -312,10 +312,7 @@ async fn mark_batch_status_only<'e, E: PgExecutor<'e>>(
 ///
 /// 返回：chain_id（已校验非空）。caller 继续用 `process_id` 经
 /// `ProcessChainRepo::resolve_step_id_by_process` 解析为 step_id。
-async fn require_process_chain(
-    conn: &mut PgConnection,
-    part_id: i64,
-) -> Result<i64, AppError> {
+async fn require_process_chain(conn: &mut PgConnection, part_id: i64) -> Result<i64, AppError> {
     let row: Option<(Option<i64>,)> =
         sqlx::query_as("SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
             .bind(part_id)

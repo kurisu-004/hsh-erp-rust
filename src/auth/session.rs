@@ -259,10 +259,7 @@ impl SessionStore for RedisSessionStore {
             .map_err(map_redis)?;
 
         if let Some(uid) = user_id {
-            let _: () = conn
-                .srem(key_user_set(uid), jti)
-                .await
-                .map_err(map_redis)?;
+            let _: () = conn.srem(key_user_set(uid), jti).await.map_err(map_redis)?;
         }
         Ok(())
     }
@@ -351,9 +348,7 @@ impl SessionStore for NoopSessionStore {
         _profile: &CachedUserProfile,
     ) -> Result<(), AppError> {
         // 借用 JWT 时不该有写入；打 warn 以便误用时可见
-        tracing::warn!(
-            "NoopSessionStore::create_session 被调用（仅测试 fixture，生产不应到达）"
-        );
+        tracing::warn!("NoopSessionStore::create_session 被调用（仅测试 fixture，生产不应到达）");
         Ok(())
     }
 
@@ -375,9 +370,7 @@ impl SessionStore for NoopSessionStore {
 
     async fn revoke_jti(&self, _jti: &str, _ttl_seconds: u64) -> Result<bool, AppError> {
         // Noop 实现：生产不该走到这里（已统一 RedisSessionStore）。打 warn 以便误用时可见。
-        tracing::warn!(
-            "NoopSessionStore::revoke_jti 被调用（仅测试 fixture，生产不应到达）"
-        );
+        tracing::warn!("NoopSessionStore::revoke_jti 被调用（仅测试 fixture，生产不应到达）");
         Ok(false)
     }
 

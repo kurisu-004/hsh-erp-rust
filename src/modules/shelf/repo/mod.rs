@@ -103,8 +103,7 @@ pub trait ShelfRepoTrait: Send {
         zone: Option<&'a str>,
         is_active: Option<bool>,
     ) -> Result<i64, sqlx::Error>;
-    async fn list_active_production_ordered(&mut self)
-        -> Result<Vec<TShelfWithLoad>, sqlx::Error>;
+    async fn list_active_production_ordered(&mut self) -> Result<Vec<TShelfWithLoad>, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
     async fn create<'a>(
         &mut self,
@@ -147,10 +146,7 @@ pub trait ShelfRepoTrait: Send {
     async fn proc_list_all_active_mappings(
         &mut self,
     ) -> Result<Vec<(i64, i64, String, String)>, sqlx::Error>;
-    async fn proc_soft_delete_all_for_shelf(
-        &mut self,
-        shelf_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    async fn proc_soft_delete_all_for_shelf(&mut self, shelf_id: i64) -> Result<u64, sqlx::Error>;
     async fn proc_bulk_insert(
         &mut self,
         rows: &[NewShelfProcessRow],
@@ -179,17 +175,11 @@ pub trait ShelfRepoTrait: Send {
 #[async_trait]
 impl ShelfRepoTrait for &mut PgConnection {
     // ── t_shelf（8）── 一行委托 sql::ShelfRepo ────────────────────
-    async fn get_active_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<TShelf>, sqlx::Error> {
+    async fn get_active_by_id(&mut self, id: i64) -> Result<Option<TShelf>, sqlx::Error> {
         ShelfRepo::get_active_by_id(&mut **self, id).await
     }
 
-    async fn get_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<TShelf>, sqlx::Error> {
+    async fn get_by_id(&mut self, id: i64) -> Result<Option<TShelf>, sqlx::Error> {
         ShelfRepo::get_by_id(&mut **self, id).await
     }
 
@@ -209,8 +199,7 @@ impl ShelfRepoTrait for &mut PgConnection {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<TShelf>, sqlx::Error> {
-        ShelfRepo::list_with_filters(&mut **self, code_like, zone, is_active, limit, offset)
-            .await
+        ShelfRepo::list_with_filters(&mut **self, code_like, zone, is_active, limit, offset).await
     }
 
     async fn count_with_filters<'b>(
@@ -222,9 +211,7 @@ impl ShelfRepoTrait for &mut PgConnection {
         ShelfRepo::count_with_filters(&mut **self, code_like, zone, is_active).await
     }
 
-    async fn list_active_production_ordered(
-        &mut self,
-    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
+    async fn list_active_production_ordered(&mut self) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
         ShelfRepo::list_active_production_ordered(&mut **self).await
     }
 
@@ -283,10 +270,7 @@ impl ShelfRepoTrait for &mut PgConnection {
         ShelfRepo::soft_delete(&mut **self, id, version, updated_by).await
     }
 
-    async fn count_in_use_parts(
-        &mut self,
-        shelf_id: i64,
-    ) -> Result<i64, sqlx::Error> {
+    async fn count_in_use_parts(&mut self, shelf_id: i64) -> Result<i64, sqlx::Error> {
         ShelfRepo::count_in_use_parts(&mut **self, shelf_id).await
     }
 
@@ -311,10 +295,7 @@ impl ShelfRepoTrait for &mut PgConnection {
         ShelfProcessRepo::list_all_active_mappings(&mut **self).await
     }
 
-    async fn proc_soft_delete_all_for_shelf(
-        &mut self,
-        shelf_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    async fn proc_soft_delete_all_for_shelf(&mut self, shelf_id: i64) -> Result<u64, sqlx::Error> {
         ShelfProcessRepo::soft_delete_all_for_shelf(&mut **self, shelf_id).await
     }
 
@@ -328,10 +309,7 @@ impl ShelfRepoTrait for &mut PgConnection {
     }
 
     // ── 跨域 helper（2）── 委托 prod 域 ProcessRepo 静态方法 ──────────
-    async fn proc_check_process_exists(
-        &mut self,
-        process_id: i64,
-    ) -> Result<bool, sqlx::Error> {
+    async fn proc_check_process_exists(&mut self, process_id: i64) -> Result<bool, sqlx::Error> {
         use crate::modules::prod::process::repo::ProcessRepo;
         Ok(ProcessRepo::get_by_id(&mut **self, process_id, false)
             .await?

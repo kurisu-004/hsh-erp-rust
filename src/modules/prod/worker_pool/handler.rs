@@ -38,9 +38,7 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use super::dto::{
-    AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AutoAllocateRequest,
-};
+use super::dto::{AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AutoAllocateRequest};
 use super::model::RefillResult;
 use super::model::WorkerPoolState;
 use super::service::WorkerPoolService;
@@ -146,8 +144,7 @@ pub async fn pool_by_process(
     axum::extract::Path(process_id): axum::extract::Path<i64>,
 ) -> Result<Json<R<ProcessPoolDetail>>, AppError> {
     let mut conn = state.pool.acquire().await?;
-    let detail =
-        WorkerPoolService::pool_by_process(&mut conn, &current, process_id).await?;
+    let detail = WorkerPoolService::pool_by_process(&mut conn, &current, process_id).await?;
     Ok(Json(R::ok(detail)))
 }
 
@@ -165,13 +162,9 @@ pub async fn auto_allocate(
     Json(req): Json<AutoAllocateRequest>,
 ) -> Result<Json<R<AutoAllocateResult>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let result = WorkerPoolService::auto_allocate_for_process(
-        &mut tx,
-        &state.snowflake,
-        req,
-        &current,
-    )
-    .await?;
+    let result =
+        WorkerPoolService::auto_allocate_for_process(&mut tx, &state.snowflake, req, &current)
+            .await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "WORKER_POOL_AUTO_ALLOCATE_DONE".into(),
@@ -194,13 +187,8 @@ pub async fn admin_assign(
     Json(req): Json<AdminAssignRequest>,
 ) -> Result<Json<R<AssignResult>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let result = WorkerPoolService::assign_batch_to_worker(
-        &mut tx,
-        &state.snowflake,
-        req,
-        &current,
-    )
-    .await?;
+    let result =
+        WorkerPoolService::assign_batch_to_worker(&mut tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "WORKER_POOL_ASSIGN_DONE".into(),

@@ -22,9 +22,10 @@ use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::task::auto_complete::run_once;
-use hsh_erp_test_support::{AutoCompleteFixture, load_auto_complete_fixture, test_pool, test_state_with_disabled_session};
+use hsh_erp_test_support::{
+    AutoCompleteFixture, load_auto_complete_fixture, test_pool, test_state_with_disabled_session,
+};
 use tokio::sync::broadcast::error::TryRecvError;
-
 
 /// 构造 L1 + L2 客户。L1 用 fixture 提供的 baseline customer.id = 180；
 /// L2 走 fixture 提供的 181。

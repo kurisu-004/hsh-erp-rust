@@ -42,9 +42,7 @@ use crate::modules::part::service::PartService;
 use crate::modules::prod::worker_pool::repo::WorkerPoolRepoTrait;
 use crate::shared::error::{AppError, code};
 
-use super::dto::{
-    AdminAssignRequest, AdminRemoveRequest, AutoAllocateMode, AutoAllocateRequest,
-};
+use super::dto::{AdminAssignRequest, AdminRemoveRequest, AutoAllocateMode, AutoAllocateRequest};
 use super::model::{ProcessPoolCount, RefillResult, TakenItem, WorkerPoolState};
 use super::vo::{
     AssignResult, AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkTypeMaxHeld,
@@ -92,7 +90,8 @@ impl WorkerPoolService {
         operator_user_id: i64,
         current: &CurrentUser,
     ) -> Result<RefillResult, AppError> {
-        let worker = (&mut *conn).worker_get_by_id( worker_id, false)
+        let worker = (&mut *conn)
+            .worker_get_by_id(worker_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -143,7 +142,8 @@ impl WorkerPoolService {
         operator_user_id: i64,
         current: &CurrentUser,
     ) -> Result<RefillResult, AppError> {
-        let work_type = (&mut *conn).work_type_get_by_id( work_type_id)
+        let work_type = (&mut *conn)
+            .work_type_get_by_id(work_type_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -159,8 +159,9 @@ impl WorkerPoolService {
             )
         })?;
 
-        let process_ids =
-            (&mut *conn).work_type_list_process_ids( work_type_id).await?;
+        let process_ids = (&mut *conn)
+            .work_type_list_process_ids(work_type_id)
+            .await?;
         if process_ids.is_empty() {
             return Err(AppError::biz(
                 code::BIZ_WORK_TYPE_NO_PROCESS_MAPPING,
@@ -169,30 +170,27 @@ impl WorkerPoolService {
         }
 
         let mut taken = Vec::new();
-        while let Some(t) = (&mut *conn).take_one_from_pool(
-            worker_id,
-            shelf_id,
-            &process_ids,
-            operator_user_id,
-        )
-        .await?
+        while let Some(t) = (&mut *conn)
+            .take_one_from_pool(worker_id, shelf_id, &process_ids, operator_user_id)
+            .await?
         {
             // part_event.id 用 snowflake 生成（与既有 `PartRepo::insert_part_event` 调用约定一致）
             let event_id = snowflake.next_id();
-            (&mut *conn).part_insert_part_event(
-                event_id,
-                t.part_id,
-                "TAKEN_FROM_POOL",
-                Some("IN_PROCESS"),
-                Some("IN_PROCESS"),
-                Some(t.batch_id),
-                Some(t.quantity),
-                Some(&t.drawing_no),
-                Some(badge_code),
-                None,
-                Some(operator_user_id),
-            )
-            .await?;
+            (&mut *conn)
+                .part_insert_part_event(
+                    event_id,
+                    t.part_id,
+                    "TAKEN_FROM_POOL",
+                    Some("IN_PROCESS"),
+                    Some("IN_PROCESS"),
+                    Some(t.batch_id),
+                    Some(t.quantity),
+                    Some(&t.drawing_no),
+                    Some(badge_code),
+                    None,
+                    Some(operator_user_id),
+                )
+                .await?;
             // PR-B2：part 派生列（location/holder）由 sync_from_batch_change 统一
             // 回填（worker_id → worker holder，location → 'WORKER'）。
             PartService::sync_from_batch_change_with_conn(&mut *conn, t.part_id, current).await?;
@@ -221,11 +219,12 @@ impl WorkerPoolService {
         worker_id: i64,
         shelf_id: i64,
     ) -> Result<WorkerPoolState, AppError> {
-        let worker = (&mut *conn).worker_get_by_id( worker_id, false)
+        let worker = (&mut *conn)
+            .worker_get_by_id(worker_id, false)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_WORKER_NOT_FOUND, "worker 不存在"))?;
         let work_type = if let Some(wt_id) = worker.work_type_id {
-            (&mut *conn).work_type_get_by_id( wt_id).await?
+            (&mut *conn).work_type_get_by_id(wt_id).await?
         } else {
             None
         };
@@ -233,19 +232,21 @@ impl WorkerPoolService {
             .as_ref()
             .and_then(|w| w.max_held_batches)
             .unwrap_or(0);
-        let current_held =
-            (&mut *conn).part_batch_count_held_by_worker( worker_id).await?;
+        let current_held = (&mut *conn)
+            .part_batch_count_held_by_worker(worker_id)
+            .await?;
         let capacity_remaining = (max_held as i64 - current_held).max(0) as i32;
 
         let process_ids = if let Some(wt_id) = worker.work_type_id {
-            (&mut *conn).work_type_list_process_ids( wt_id).await?
+            (&mut *conn).work_type_list_process_ids(wt_id).await?
         } else {
             vec![]
         };
 
         let mut pool_count_by_process = Vec::with_capacity(process_ids.len());
         for pid in &process_ids {
-            let n = (&mut *conn).count_pool_by_shelf_and_process( shelf_id, *pid)
+            let n = (&mut *conn)
+                .count_pool_by_shelf_and_process(shelf_id, *pid)
                 .await?;
             pool_count_by_process.push(ProcessPoolCount {
                 process_id: *pid,
@@ -258,8 +259,9 @@ impl WorkerPoolService {
         // t_customer L1+L2 + t_applicant + t_shelf）。命中 ix_t_part_batch_holder_location。
         // 2026-09-14 review 第 1 轮下沉：本查询已从 part_batch/repo.rs 迁到
         // worker_pool/repo.rs（owner 同域 + part_batch 行数 ≤1000）。
-        let held_batches =
-            (&mut *conn).list_held_by_worker_with_part( worker_id).await?;
+        let held_batches = (&mut *conn)
+            .list_held_by_worker_with_part(worker_id)
+            .await?;
 
         Ok(WorkerPoolState {
             worker_id,
@@ -292,51 +294,51 @@ impl WorkerPoolService {
         current: &CurrentUser,
     ) -> Result<TakenItem, AppError> {
         // 1. 取 worker（带 work_type）
-        let worker = (&mut *conn).worker_get_by_id( req.worker_id, false)
+        let worker = (&mut *conn)
+            .worker_get_by_id(req.worker_id, false)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_WORKER_NOT_FOUND, "worker 不存在"))?;
         // 2. 找 batch（必须是该 worker 持有）
-        let batch = (&mut *conn).part_find_inprocess_batch_by_id_and_holder(
-            req.batch_id,
-            req.worker_id,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
-                format!("batch {} 不是 worker {} 持有", req.batch_id, req.worker_id),
-            )
-        })?;
+        let batch = (&mut *conn)
+            .part_find_inprocess_batch_by_id_and_holder(req.batch_id, req.worker_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
+                    format!("batch {} 不是 worker {} 持有", req.batch_id, req.worker_id),
+                )
+            })?;
         // 3. 切 holder 到 shelf + 改 current_process_step_id（OCC，batch 级）
         //    PR-3 批次 step 化：admin_remove 路径下 step_id 由 caller
         //    （前端 admin UI）解析或由 service 兜底；这里先按 process_id
         //    查 chain step（admin_remove 前要求 part 已绑定链）
-        let chain_id_opt =
-            (&mut *conn).part_get_process_chain_id( batch.part_id).await?;
+        let chain_id_opt = (&mut *conn)
+            .part_get_process_chain_id(batch.part_id)
+            .await?;
         let step_id_opt = if let Some(chain_id) = chain_id_opt {
-            (&mut *conn).process_chain_resolve_step_id_by_process(
-                chain_id,
-                req.next_process_id,
-            )
-            .await?
+            (&mut *conn)
+                .process_chain_resolve_step_id_by_process(chain_id, req.next_process_id)
+                .await?
         } else {
             None
         };
-        let batch_rows = (&mut *conn).part_mark_batch_returned(
-            batch.id,
-            batch.version,
-            req.shelf_id,
-            step_id_opt,
-            Some(current.id),
-        )
-        .await?;
+        let batch_rows = (&mut *conn)
+            .part_mark_batch_returned(
+                batch.id,
+                batch.version,
+                req.shelf_id,
+                step_id_opt,
+                Some(current.id),
+            )
+            .await?;
         if batch_rows == 0 {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 format!("batch {} 版本冲突或状态非 IN_PROCESS+WORKER", batch.id),
             ));
         }
-        let part = (&mut *conn).part_get_by_id( batch.part_id, false)
+        let part = (&mut *conn)
+            .part_get_by_id(batch.part_id, false)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         // 4. PR-B2：part 派生列由 sync_from_batch_change 统一回填
@@ -344,20 +346,21 @@ impl WorkerPoolService {
         PartService::sync_from_batch_change_with_conn(&mut *conn, part.id, current).await?;
         // 5. event
         let event_id = snowflake.next_id();
-        (&mut *conn).part_insert_part_event(
-            event_id,
-            part.id,
-            "ADMIN_REMOVED_FROM_WORKER",
-            Some("IN_PROCESS"),
-            Some("IN_PROCESS"),
-            Some(batch.id),
-            Some(batch.quantity),
-            Some(&part.drawing_no),
-            Some(&worker.badge_code),
-            Some("admin_remove"),
-            Some(current.id),
-        )
-        .await?;
+        (&mut *conn)
+            .part_insert_part_event(
+                event_id,
+                part.id,
+                "ADMIN_REMOVED_FROM_WORKER",
+                Some("IN_PROCESS"),
+                Some("IN_PROCESS"),
+                Some(batch.id),
+                Some(batch.quantity),
+                Some(&part.drawing_no),
+                Some(&worker.badge_code),
+                Some("admin_remove"),
+                Some(current.id),
+            )
+            .await?;
         // 6. 返回
         Ok(TakenItem {
             batch_id: batch.id,
@@ -397,7 +400,8 @@ impl WorkerPoolService {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
 
         // 1. process 元数据
-        let process = (&mut *conn).process_get_by_id( process_id, false)
+        let process = (&mut *conn)
+            .process_get_by_id(process_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -407,9 +411,9 @@ impl WorkerPoolService {
             })?;
 
         // 2. work_types
-        let work_types =
-            (&mut *conn).work_type_list_work_types_by_process_id( process_id)
-                .await?;
+        let work_types = (&mut *conn)
+            .work_type_list_work_types_by_process_id(process_id)
+            .await?;
         let work_types = work_types
             .into_iter()
             .map(|(id, code, name, max_held_batches)| WorkTypeMaxHeld {
@@ -421,8 +425,9 @@ impl WorkerPoolService {
             .collect();
 
         // 3. workers
-        let worker_rows =
-            (&mut *conn).worker_list_active_by_process_id( process_id).await?;
+        let worker_rows = (&mut *conn)
+            .worker_list_active_by_process_id(process_id)
+            .await?;
         let workers = worker_rows
             .into_iter()
             .map(
@@ -436,9 +441,9 @@ impl WorkerPoolService {
             .collect();
 
         // 4. candidates
-        let items: Vec<PoolBatchItem> =
-            (&mut *conn).list_candidates_by_process_all_shelves( process_id)
-                .await?;
+        let items: Vec<PoolBatchItem> = (&mut *conn)
+            .list_candidates_by_process_all_shelves(process_id)
+            .await?;
         let total = items.len() as i64;
 
         Ok(ProcessPoolDetail {
@@ -472,7 +477,8 @@ impl WorkerPoolService {
         }
 
         // 2. process 存在性
-        let _process = (&mut *conn).process_get_by_id( req.process_id, false)
+        let _process = (&mut *conn)
+            .process_get_by_id(req.process_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -482,9 +488,9 @@ impl WorkerPoolService {
             })?;
 
         // 3. process 映射的 work_types
-        let work_types =
-            (&mut *conn).work_type_list_work_types_by_process_id( req.process_id)
-                .await?;
+        let work_types = (&mut *conn)
+            .work_type_list_work_types_by_process_id(req.process_id)
+            .await?;
         if work_types.is_empty() {
             return Err(AppError::biz(
                 code::BIZ_WORK_TYPE_NO_PROCESS_MAPPING,
@@ -495,15 +501,14 @@ impl WorkerPoolService {
         let mut wt_max: std::collections::HashMap<i64, (Option<i32>, Option<i32>)> =
             std::collections::HashMap::new();
         for (wt_id, _code, _name, max_held_batches) in work_types {
-            let max_minutes =
-                (&mut *conn).work_type_get_max_held_minutes( wt_id).await?;
+            let max_minutes = (&mut *conn).work_type_get_max_held_minutes(wt_id).await?;
             wt_max.insert(wt_id, (max_held_batches, max_minutes));
         }
 
         // 4. 货架上的 active worker 列表（含 work_type_id）
-        let worker_rows =
-            (&mut *conn).worker_list_active_by_process_id( req.process_id)
-                .await?;
+        let worker_rows = (&mut *conn)
+            .worker_list_active_by_process_id(req.process_id)
+            .await?;
 
         let mut filled = Vec::with_capacity(worker_rows.len());
         let mut pool_empty_any = false;
@@ -523,9 +528,7 @@ impl WorkerPoolService {
                 None => continue,
             };
 
-            let worker = match (&mut *conn).worker_get_by_id( worker_id, false)
-                .await?
-            {
+            let worker = match (&mut *conn).worker_get_by_id(worker_id, false).await? {
                 Some(w) => w,
                 None => continue,
             };
@@ -560,39 +563,40 @@ impl WorkerPoolService {
                 }
             };
 
-            let process_ids =
-                (&mut *conn).work_type_list_process_ids( work_type_id).await?;
+            let process_ids = (&mut *conn)
+                .work_type_list_process_ids(work_type_id)
+                .await?;
             if process_ids.is_empty() {
                 continue;
             }
 
             let mut filled_count = 0i32;
             for _ in 0..target {
-                match (&mut *conn).take_one_from_pool(
-                    worker_id,
-                    req.shelf_id,
-                    &process_ids,
-                    current.id,
-                )
-                .await?
+                match (&mut *conn)
+                    .take_one_from_pool(worker_id, req.shelf_id, &process_ids, current.id)
+                    .await?
                 {
                     Some(t) => {
                         let event_id = snowflake.next_id();
-                        (&mut *conn).part_insert_part_event(
-                            event_id,
-                            t.part_id,
-                            "TAKEN_FROM_POOL",
-                            Some("IN_PROCESS"),
-                            Some("IN_PROCESS"),
-                            Some(t.batch_id),
-                            Some(t.quantity),
-                            Some(&t.drawing_no),
-                            Some(&worker.badge_code),
-                            Some("auto_allocate"),
-                            Some(current.id),
+                        (&mut *conn)
+                            .part_insert_part_event(
+                                event_id,
+                                t.part_id,
+                                "TAKEN_FROM_POOL",
+                                Some("IN_PROCESS"),
+                                Some("IN_PROCESS"),
+                                Some(t.batch_id),
+                                Some(t.quantity),
+                                Some(&t.drawing_no),
+                                Some(&worker.badge_code),
+                                Some("auto_allocate"),
+                                Some(current.id),
+                            )
+                            .await?;
+                        PartService::sync_from_batch_change_with_conn(
+                            &mut *conn, t.part_id, current,
                         )
                         .await?;
-                        PartService::sync_from_batch_change_with_conn(&mut *conn, t.part_id, current).await?;
                         filled_count += 1;
                     }
                     None => {
@@ -629,7 +633,8 @@ impl WorkerPoolService {
     ) -> Result<AssignResult, AppError> {
         current.require_role(Role::Manager)?;
 
-        let worker = (&mut *conn).worker_get_by_id( req.worker_id, false)
+        let worker = (&mut *conn)
+            .worker_get_by_id(req.worker_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -649,7 +654,8 @@ impl WorkerPoolService {
                 format!("worker {} 未分配工种", req.worker_id),
             )
         })?;
-        let work_type = (&mut *conn).work_type_get_by_id( work_type_id)
+        let work_type = (&mut *conn)
+            .work_type_get_by_id(work_type_id)
             .await?
             .ok_or_else(|| {
                 AppError::biz(
@@ -664,10 +670,9 @@ impl WorkerPoolService {
             )
         })?;
 
-        let current_held_before = (&mut *conn).part_batch_count_held_by_worker(
-            req.worker_id,
-        )
-        .await?;
+        let current_held_before = (&mut *conn)
+            .part_batch_count_held_by_worker(req.worker_id)
+            .await?;
         if current_held_before >= max_held as i64 {
             return Err(AppError::biz(
                 code::BIZ_WORKER_HOLD_LIMIT_EXCEEDED,
@@ -679,17 +684,19 @@ impl WorkerPoolService {
         }
 
         if let Some(pid) = req.process_id {
-            let batch =
-                (&mut *conn).part_batch_get_by_id( req.batch_id, false)
-                    .await?
-                    .ok_or_else(|| {
-                        AppError::biz(
-                            code::BIZ_PART_BATCH_NOT_FOUND,
-                            format!("batch {} 不存在", req.batch_id),
-                        )
-                    })?;
+            let batch = (&mut *conn)
+                .part_batch_get_by_id(req.batch_id, false)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_PART_BATCH_NOT_FOUND,
+                        format!("batch {} 不存在", req.batch_id),
+                    )
+                })?;
             let step_process_id = if let Some(step_id) = batch.current_process_step_id {
-                (&mut *conn).process_chain_step_get_process_id( step_id).await?
+                (&mut *conn)
+                    .process_chain_step_get_process_id(step_id)
+                    .await?
             } else {
                 None
             };
@@ -707,40 +714,37 @@ impl WorkerPoolService {
             }
         }
 
-        let taken = (&mut *conn).take_specific_from_pool(
-            req.worker_id,
-            req.shelf_id,
-            req.batch_id,
-            current.id,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
-                format!(
-                    "batch {} 不在候选池（status/location/holder 不符或已软删）",
-                    req.batch_id
-                ),
-            )
-        })?;
+        let taken = (&mut *conn)
+            .take_specific_from_pool(req.worker_id, req.shelf_id, req.batch_id, current.id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PART_BATCH_NOT_HELD_BY_WORKER,
+                    format!(
+                        "batch {} 不在候选池（status/location/holder 不符或已软删）",
+                        req.batch_id
+                    ),
+                )
+            })?;
 
         PartService::sync_from_batch_change_with_conn(&mut *conn, taken.part_id, current).await?;
 
         let event_id = snowflake.next_id();
-        (&mut *conn).part_insert_part_event(
-            event_id,
-            taken.part_id,
-            "TAKEN_FROM_POOL",
-            Some("IN_PROCESS"),
-            Some("IN_PROCESS"),
-            Some(taken.batch_id),
-            Some(taken.quantity),
-            Some(&taken.drawing_no),
-            Some(&worker.badge_code),
-            Some("admin_assign"),
-            Some(current.id),
-        )
-        .await?;
+        (&mut *conn)
+            .part_insert_part_event(
+                event_id,
+                taken.part_id,
+                "TAKEN_FROM_POOL",
+                Some("IN_PROCESS"),
+                Some("IN_PROCESS"),
+                Some(taken.batch_id),
+                Some(taken.quantity),
+                Some(&taken.drawing_no),
+                Some(&worker.badge_code),
+                Some("admin_assign"),
+                Some(current.id),
+            )
+            .await?;
 
         let current_held_after = current_held_before + 1;
         Ok(AssignResult {

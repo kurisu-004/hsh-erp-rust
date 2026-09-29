@@ -28,14 +28,11 @@ use axum::http::{HeaderMap, Request, StatusCode};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use hsh_erp_rust::infra::py_backend::{
-    MockPyBackendClient, PyBackendClient, PyBackendResponse,
-};
+use hsh_erp_rust::infra::py_backend::{MockPyBackendClient, PyBackendClient, PyBackendResponse};
 use hsh_erp_rust::modules::files;
 use hsh_erp_rust::shared::error::AppError;
 use hsh_erp_test_support::{
-    IamFixture, json_request, load_iam_fixture, login_token, send as ts_send, test_pool,
-    test_state,
+    IamFixture, json_request, load_iam_fixture, login_token, send as ts_send, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -315,15 +312,17 @@ async fn forward_sts_tmp_keys_does_not_leak_auth_header() {
     let (pool, _app, _fx, token) = bootstrap().await;
 
     // 共享槽：mock server 把 headers 写进来，测试主体读出去断言
-    let captured: Arc<Mutex<Option<axum::http::HeaderMap>>> =
-        Arc::new(Mutex::new(None));
+    let captured: Arc<Mutex<Option<axum::http::HeaderMap>>> = Arc::new(Mutex::new(None));
 
-    let mock_app = axum::Router::new().route(
-        "/api/v1/files/sts-tmp-keys",
-        axum::routing::post(mock_py_capture_headers),
-    )
-    .with_state(captured.clone());
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind random port");
+    let mock_app = axum::Router::new()
+        .route(
+            "/api/v1/files/sts-tmp-keys",
+            axum::routing::post(mock_py_capture_headers),
+        )
+        .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind random port");
     let addr = listener.local_addr().expect("local_addr");
     tokio::spawn(async move {
         let _ = axum::serve(listener, mock_app).await;
@@ -384,10 +383,7 @@ async fn forward_sts_tmp_keys_does_not_leak_auth_header() {
         .expect("x-forwarded-user-id 必须存在（鉴权身份透传）")
         .to_str()
         .expect("x-forwarded-user-id 必须是 ASCII");
-    assert!(
-        !fwd_uid.is_empty(),
-        "x-forwarded-user-id 不能为空字符串"
-    );
+    assert!(!fwd_uid.is_empty(), "x-forwarded-user-id 不能为空字符串");
 }
 
 /// mock python 服务端 handler（独立 async fn，便于 axum Handler trait 推断）。

@@ -114,7 +114,9 @@ pub async fn deactivate_shelf(
     Path(id): Path<i64>,
 ) -> Result<Json<R<()>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    ShelfService.soft_delete_shelf(&mut *tx, id, &current).await?;
+    ShelfService
+        .soft_delete_shelf(&mut *tx, id, &current)
+        .await?;
     tx.commit().await?;
     Ok(Json(R::ok(())))
 }

@@ -17,8 +17,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
-use hsh_erp_test_support::{json_request, load_part_fixture, login_token, send, test_app,
-    test_pool, test_state};
+use hsh_erp_test_support::{
+    json_request, load_part_fixture, login_token, send, test_app, test_pool, test_state,
+};
 
 // ===========================================================================
 //  动态 fixture helpers（PR-C.Final retry 第 3 轮，2026-09-24）
@@ -31,9 +32,7 @@ async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_test_support::pool_snowflake;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -147,15 +146,8 @@ async fn bootstrap_as_clerk() -> (PgPool, axum::Router, String, PartFixture) {
 #[tokio::test]
 async fn to_inspection_from_pending_succeeds() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-        5,
-    )
-    .await;
+    let (part_id, batch_id) =
+        insert_part_with_batch(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING", 5).await;
     let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
@@ -351,15 +343,8 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
 #[tokio::test]
 async fn to_inspection_target_shelf_wrong_zone_rejected() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-        5,
-    )
-    .await;
+    let (part_id, batch_id) =
+        insert_part_with_batch(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING", 5).await;
     let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
@@ -392,15 +377,8 @@ async fn to_inspection_target_shelf_inactive_rejected() {
     .execute(&pool)
     .await
     .unwrap();
-    let (part_id, batch_id) = insert_part_with_batch(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-        5,
-    )
-    .await;
+    let (part_id, batch_id) =
+        insert_part_with_batch(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING", 5).await;
     let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
@@ -475,15 +453,8 @@ async fn batch_to_inspection_mixed_partial_success() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
 
     // 第 1 件：PENDING → 应成功（status=INSPECTION）
-    let (_p1, b1) = insert_part_with_batch(
-        &pool,
-        "P1",
-        fx.customer_l2_id,
-        Some("P001"),
-        "PENDING",
-        5,
-    )
-    .await;
+    let (_p1, b1) =
+        insert_part_with_batch(&pool, "P1", fx.customer_l2_id, Some("P001"), "PENDING", 5).await;
     // 第 2 件：PROGRAMMING → 应成功
     let (_p2, b2) = insert_part_with_batch(
         &pool,
@@ -568,15 +539,8 @@ async fn batch_to_inspection_clerk_forbidden() {
 #[tokio::test]
 async fn to_inspection_partial_split_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
-        &pool,
-        "P0",
-        fx.customer_l2_id,
-        Some("P000"),
-        "PENDING",
-        10,
-    )
-    .await;
+    let (part_id, batch_id) =
+        insert_part_with_batch(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING", 10).await;
     let v = batch_version(&pool, batch_id).await;
 
     let (status, body) = send(
@@ -667,12 +631,7 @@ async fn part_batches_returns_narrow_part_and_batches_with_holder() {
 
     // Step 2：复用同一 pool + fixture + app，直接换 MANAGER token
     // （再调 bootstrap_as_manager 会建新 DB，前面的 part 丢失）
-    let mgr_token = login_token(
-        &app,
-        PartFixture::MANAGER_USERNAME,
-        PartFixture::PASSWORD,
-    )
-    .await;
+    let mgr_token = login_token(&app, PartFixture::MANAGER_USERNAME, PartFixture::PASSWORD).await;
     let (status2, body2) = send(
         app.clone(),
         json_request(

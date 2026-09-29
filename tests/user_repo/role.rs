@@ -126,7 +126,9 @@ async fn list_user_roles_by_user_id_returns_active_roles() {
     let _ = seed_role(&pool, uid, "MANAGER", None, None).await;
     let _ = seed_role(&pool, uid, "CLERK", None, None).await;
 
-    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid).await.expect("list");
+    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid)
+        .await
+        .expect("list");
     assert_eq!(rows.len(), 2);
     let roles: Vec<_> = rows.iter().map(|r| r.role.as_str()).collect();
     assert!(roles.contains(&"MANAGER") && roles.contains(&"CLERK"));
@@ -137,7 +139,9 @@ async fn list_user_roles_by_user_id_returns_active_roles() {
 async fn list_user_roles_by_user_id_returns_empty_when_no_roles() {
     let (pool, _fx) = setup().await;
     let uid = seed_user(&pool, "lonely", true).await;
-    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid).await.expect("list");
+    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid)
+        .await
+        .expect("list");
     assert!(rows.is_empty());
 }
 
@@ -160,7 +164,9 @@ async fn list_user_roles_by_user_id_includes_shelf_code_and_name() {
 
     let _ = seed_role(&pool, uid, "SHELF_ACCOUNT", Some("shelf"), Some(shelf_id)).await;
 
-    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid).await.expect("list");
+    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid)
+        .await
+        .expect("list");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].shelf_code.as_deref(), Some("S-001"));
     assert_eq!(rows[0].shelf_name.as_deref(), Some("Shelf One"));
@@ -245,7 +251,9 @@ async fn create_inserts_new_role() {
         created_at: now_naive(),
         created_by: Some(uid),
     };
-    user_role_sql::create_user_role(&pool, &insert).await.expect("create");
+    user_role_sql::create_user_role(&pool, &insert)
+        .await
+        .expect("create");
 
     let r = user_role_sql::get_user_role_by_id(&pool, rid)
         .await
@@ -266,7 +274,9 @@ async fn soft_delete_marks_deleted_at() {
         .expect("soft_delete");
     assert_eq!(affected, 1);
 
-    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid).await.expect("list");
+    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid)
+        .await
+        .expect("list");
     assert_eq!(rows.len(), 0, "软删后 list_user_roles_by_user_id 应过滤");
 }
 

@@ -66,8 +66,8 @@
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
-use crate::modules::part::model::{NewPartEvent, TPart};
 use crate::modules::part::batch::model::TPartBatch;
+use crate::modules::part::model::{NewPartEvent, TPart};
 use crate::modules::prod::process::model::TProcess;
 use crate::modules::prod::work_type::model::TWorkType;
 use crate::modules::prod::worker::model::TWorker;
@@ -128,10 +128,7 @@ pub trait WorkerPoolRepoTrait: Send {
 
     // ── work_type 域 helper（3）──
     /// 单条查 work_type（`WorkTypeRepo::get_by_id`）。
-    async fn work_type_get_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<TWorkType>, sqlx::Error>;
+    async fn work_type_get_by_id(&mut self, id: i64) -> Result<Option<TWorkType>, sqlx::Error>;
 
     /// 列工种映射工序 id 列表（`WorkTypeRepo::list_process_ids`）。
     async fn work_type_list_process_ids(
@@ -149,10 +146,8 @@ pub trait WorkerPoolRepoTrait: Send {
 
     /// 单条查 work_type 的 max_held_minutes（auto-allocate TIME 模式用）。
     /// 原 `service.rs:509` 的 `sqlx::query_as` 内联 SQL 下沉。
-    async fn work_type_get_max_held_minutes(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<i32>, sqlx::Error>;
+    async fn work_type_get_max_held_minutes(&mut self, id: i64)
+    -> Result<Option<i32>, sqlx::Error>;
 
     // ── process 域 helper（1）──
     /// 单条查 process（`ProcessRepo::get_by_id`）。
@@ -179,10 +174,8 @@ pub trait WorkerPoolRepoTrait: Send {
 
     // ── part_batch 域 helper（3）──
     /// 统计 worker 持有批次数（`PartBatchRepo::count_held_by_worker`）。
-    async fn part_batch_count_held_by_worker(
-        &mut self,
-        worker_id: i64,
-    ) -> Result<i64, sqlx::Error>;
+    async fn part_batch_count_held_by_worker(&mut self, worker_id: i64)
+    -> Result<i64, sqlx::Error>;
 
     /// 按 id 查 batch（`PartBatchRepo::get_by_id`）。
     async fn part_batch_get_by_id(
@@ -256,10 +249,8 @@ pub trait WorkerPoolRepoTrait: Send {
     // ── 跨域 inline SQL helper（1，admin_remove 内联下沉）──
     /// 取 part 的 process_chain_id（admin_remove 路径解析 step 用）。
     /// 原 `service.rs:304` 的 `sqlx::query_scalar` 内联 SQL 下沉。
-    async fn part_get_process_chain_id(
-        &mut self,
-        part_id: i64,
-    ) -> Result<Option<i64>, sqlx::Error>;
+    async fn part_get_process_chain_id(&mut self, part_id: i64)
+    -> Result<Option<i64>, sqlx::Error>;
 }
 
 /// 把 `WorkerPoolRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借
@@ -360,10 +351,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
     }
 
     // ── work_type helper ──
-    async fn work_type_get_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<TWorkType>, sqlx::Error> {
+    async fn work_type_get_by_id(&mut self, id: i64) -> Result<Option<TWorkType>, sqlx::Error> {
         crate::modules::prod::work_type::repo::WorkTypeRepo::get_by_id(&mut **self, id).await
     }
 
@@ -383,11 +371,13 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         &mut self,
         process_id: i64,
     ) -> Result<Vec<(i64, String, String, Option<i32>)>, crate::shared::error::AppError> {
-        Ok(crate::modules::prod::work_type::repo::WorkTypeRepo::list_work_types_by_process_id(
-            &mut **self,
-            process_id,
+        Ok(
+            crate::modules::prod::work_type::repo::WorkTypeRepo::list_work_types_by_process_id(
+                &mut **self,
+                process_id,
+            )
+            .await?,
         )
-        .await?)
     }
 
     async fn work_type_get_max_held_minutes(
@@ -449,8 +439,11 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         &mut self,
         worker_id: i64,
     ) -> Result<i64, sqlx::Error> {
-        crate::modules::part::batch::repo::PartBatchRepo::count_held_by_worker(&mut **self, worker_id)
-            .await
+        crate::modules::part::batch::repo::PartBatchRepo::count_held_by_worker(
+            &mut **self,
+            worker_id,
+        )
+        .await
     }
 
     async fn part_batch_get_by_id(
@@ -458,8 +451,12 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         id: i64,
         include_deleted: bool,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        crate::modules::part::batch::repo::PartBatchRepo::get_by_id(&mut **self, id, include_deleted)
-            .await
+        crate::modules::part::batch::repo::PartBatchRepo::get_by_id(
+            &mut **self,
+            id,
+            include_deleted,
+        )
+        .await
     }
 
     #[allow(dead_code)]

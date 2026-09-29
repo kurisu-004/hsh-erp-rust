@@ -29,10 +29,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Json;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
-use axum::Json;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -41,7 +41,7 @@ use crate::auth::middleware::verify_session_token;
 use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::dashboard::vo::{DashboardSnapshot, WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
-use crate::shared::error::{code, AppError};
+use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::state::AppState;
 
@@ -255,4 +255,3 @@ async fn send_msg(
         )))
         .await
 }
-

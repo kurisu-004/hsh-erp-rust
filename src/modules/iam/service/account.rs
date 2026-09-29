@@ -16,10 +16,10 @@ use super::super::dto::{
     UserAddRoleRequest, UserCreateRequest, UserListQuery, UserUpdateRequest, WxBindRequest,
 };
 use super::super::repo::model::User;
+use super::super::repo::sql::user as sqlx_user;
 use super::super::repo::{
     IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow,
 };
-use super::super::repo::sql::user as sqlx_user;
 use super::super::vo::{MenuNodeOut, UserListOut, UserOut, UserRoleOut, WxIdentityOut};
 
 /// 管理员重置密码时写入的默认口令（对齐 Python `DEFAULT_RESET_PASSWORD`）
@@ -183,7 +183,9 @@ impl AccountService {
             created_by: Some(current.id),
         };
 
-        repo.create_user(&insert).await.map_err(map_duplicate_username)?;
+        repo.create_user(&insert)
+            .await
+            .map_err(map_duplicate_username)?;
 
         let u = repo
             .get_user_by_id(insert.id)
@@ -449,7 +451,9 @@ impl AccountService {
             created_at: now_naive(),
             created_by: Some(current.id),
         };
-        repo.create_user_role(&insert).await.map_err(map_duplicate_role)?;
+        repo.create_user_role(&insert)
+            .await
+            .map_err(map_duplicate_role)?;
 
         let rows = repo.list_user_roles_by_user_id(user_id).await?;
         let out = rows
@@ -608,9 +612,10 @@ impl AccountService {
             .await
             .map_err(map_duplicate_wx_identity)?;
 
-        let row = WxIdentityRepo::get_by_corp_and_user(&mut *conn, &insert.corp_id, &insert.wx_user_id)
-            .await?
-            .ok_or_else(|| AppError::internal("创建后回读企业微信绑定失败"))?;
+        let row =
+            WxIdentityRepo::get_by_corp_and_user(&mut *conn, &insert.corp_id, &insert.wx_user_id)
+                .await?
+                .ok_or_else(|| AppError::internal("创建后回读企业微信绑定失败"))?;
         Ok(to_wx_identity_out(row))
     }
 
@@ -648,14 +653,9 @@ impl AccountService {
         let when = now_naive();
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            let affected = WxIdentityRepo::soft_delete(
-                &mut *conn,
-                r.id,
-                r.version,
-                when,
-                Some(current.id),
-            )
-            .await?;
+            let affected =
+                WxIdentityRepo::soft_delete(&mut *conn, r.id, r.version, when, Some(current.id))
+                    .await?;
             if affected == 0 {
                 // 乐观锁冲突：并发已被别人解绑 / 改过。整体回滚（handler 未 commit）
                 return Err(version_conflict());

@@ -25,11 +25,11 @@
 //! 字面请求 / 断言逐字保留。
 
 use deadpool_redis::redis::AsyncCommands;
+use hsh_erp_rust::auth::session::{CachedUserProfile, RedisSessionStore, SessionStore, TokenKind};
 use hsh_erp_test_support::{
     E2eFixture, load_e2e_fixture, send as ts_send, test_app, test_pool, test_redis_pool,
     test_state_with_redis,
 };
-use hsh_erp_rust::auth::session::{CachedUserProfile, RedisSessionStore, SessionStore, TokenKind};
 use sqlx::PgPool;
 
 // ===========================================================================
@@ -423,7 +423,11 @@ async fn hard_delete_outsource_company_removes_row_and_seeded_metadata() {
         ),
     )
     .await;
-    assert_eq!(seed_status, axum::http::StatusCode::OK, "seed company: {seed_resp}");
+    assert_eq!(
+        seed_status,
+        axum::http::StatusCode::OK,
+        "seed company: {seed_resp}"
+    );
     let company_id: i64 = seed_resp["data"]["id"]
         .as_str()
         .expect("company id string")

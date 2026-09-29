@@ -268,7 +268,13 @@ pub async fn approve_quote(
     let mut tx = state.pool.begin().await?;
     let out = state
         .outsource_service
-        .approve_quote(&mut *tx, id, req.review_note.as_deref(), req.version, &current)
+        .approve_quote(
+            &mut *tx,
+            id,
+            req.review_note.as_deref(),
+            req.version,
+            &current,
+        )
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(out)))

@@ -134,8 +134,7 @@ async fn get_user_returns_user_when_found() {
 async fn get_user_returns_not_found_when_repo_yields_none() {
     // Arrange
     let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(|_| Ok(None));
+    mock.expect_get_user_by_id().returning(|_| Ok(None));
     let svc = make_account_service();
 
     // Act
@@ -161,13 +160,11 @@ async fn create_user_happy_path_returns_user_with_roles() {
     // （service 仅当 user.id == insert.id 才继续，故只要 mock 返回同一 id 就好，
     //  此处用 `with(eq(any))` 不约束，依赖 capture）。
     use std::sync::{Arc, Mutex};
-    let u_holder: Arc<Mutex<Option<crate::modules::iam::repo::User>>> =
-        Arc::new(Mutex::new(None));
+    let u_holder: Arc<Mutex<Option<crate::modules::iam::repo::User>>> = Arc::new(Mutex::new(None));
     let u_for_create = u_holder.clone();
     let u_for_get = u_holder.clone();
     let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_username()
-        .returning(|_| Ok(None));
+    mock.expect_get_user_by_username().returning(|_| Ok(None));
     mock.expect_create_user()
         .returning(move |user: &crate::modules::iam::repo::UserInsert| {
             // mock 模拟「INSERT 后回读」：返回带 insert.id 的完整行
@@ -320,8 +317,8 @@ async fn update_user_happy_path_returns_updated_user() {
     // Arrange — service 调 2 次 get_user_by_id：第 1 次拿原 user，第 2 次拿更新后 user。
     // mockall 0.15 不支持同名 method 多次注册 expectation，故用 Arc<AtomicUsize>
     // 在闭包里按调用计数分发。
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let u = sample_user(101, "alice");
     let u_updated = crate::modules::iam::repo::User {
         full_name: "Alice New".into(),
@@ -333,17 +330,15 @@ async fn update_user_happy_path_returns_updated_user() {
     let u_updated_clone = u_updated.clone();
     let call_count = Arc::new(AtomicUsize::new(0));
     let cc_clone = call_count.clone();
-    mock.expect_get_user_by_id()
-        .returning(move |_| {
-            let n = cc_clone.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
-                Ok(Some(u_clone1.clone()))
-            } else {
-                Ok(Some(u_updated_clone.clone()))
-            }
-        });
-    mock.expect_update_user_partial()
-        .returning(|_, _, _| Ok(1));
+    mock.expect_get_user_by_id().returning(move |_| {
+        let n = cc_clone.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Ok(Some(u_clone1.clone()))
+        } else {
+            Ok(Some(u_updated_clone.clone()))
+        }
+    });
+    mock.expect_update_user_partial().returning(|_, _, _| Ok(1));
     mock.expect_list_user_roles_by_user_id()
         .returning(|_| Ok(vec![]));
     let svc = make_account_service();
@@ -369,8 +364,7 @@ async fn update_user_happy_path_returns_updated_user() {
 async fn update_user_not_found_when_user_missing() {
     // Arrange
     let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(|_| Ok(None));
+    mock.expect_get_user_by_id().returning(|_| Ok(None));
     let svc = make_account_service();
     let req = UserUpdateRequest {
         full_name: Some("Alice".into()),
@@ -399,8 +393,7 @@ async fn update_user_version_conflict_returns_409() {
     let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
-    mock.expect_update_user_partial()
-        .returning(|_, _, _| Ok(0)); // 0 行 → version_conflict
+    mock.expect_update_user_partial().returning(|_, _, _| Ok(0)); // 0 行 → version_conflict
     let svc = make_account_service();
     let req = UserUpdateRequest {
         full_name: Some("Alice".into()),
@@ -455,8 +448,7 @@ async fn admin_reset_password_happy_path_returns_user() {
 async fn admin_reset_password_not_found() {
     // Arrange
     let mut mock = MockIamRepoTrait::new();
-    mock.expect_get_user_by_id()
-        .returning(|_| Ok(None));
+    mock.expect_get_user_by_id().returning(|_| Ok(None));
     let svc = make_account_service();
 
     // Act
@@ -502,8 +494,7 @@ async fn deactivate_user_happy_path_returns_deactivated_user() {
     let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
-    mock.expect_soft_delete_user()
-        .returning(|_, _, _, _| Ok(1));
+    mock.expect_soft_delete_user().returning(|_, _, _, _| Ok(1));
     mock.expect_list_user_roles_by_user_id()
         .returning(|_| Ok(vec![]));
     let svc = make_account_service();
@@ -526,8 +517,7 @@ async fn deactivate_user_already_inactive_returns_version_conflict() {
     let mut mock = MockIamRepoTrait::new();
     mock.expect_get_user_by_id()
         .returning(move |_| Ok(Some(u.clone())));
-    mock.expect_soft_delete_user()
-        .returning(|_, _, _, _| Ok(0)); // 0 行 → 已并发被改
+    mock.expect_soft_delete_user().returning(|_, _, _, _| Ok(0)); // 0 行 → 已并发被改
     let svc = make_account_service();
 
     // Act
@@ -611,11 +601,12 @@ async fn add_role_happy_path_returns_role() {
         .returning(move |_| Ok(Some(u.clone())));
     mock.expect_has_user_role_with_scope()
         .returning(|_, _, _, _| Ok(false));
-    mock.expect_create_user_role()
-        .returning(move |role: &crate::modules::iam::repo::UserRoleInsert| {
+    mock.expect_create_user_role().returning(
+        move |role: &crate::modules::iam::repo::UserRoleInsert| {
             *cap_for_create.lock().unwrap() = role.id;
             Ok(())
-        });
+        },
+    );
     mock.expect_list_user_roles_by_user_id()
         .returning(move |uid| {
             let id = *cap_for_list.lock().unwrap();
@@ -692,10 +683,7 @@ async fn add_role_invalid_role_string_returns_validation_error() {
     // Assert
     match err {
         AppError::Validation(msg) => {
-            assert!(
-                msg.contains("scope"),
-                "expected scope 错误信息，got: {msg}"
-            );
+            assert!(msg.contains("scope"), "expected scope 错误信息，got: {msg}");
         }
         other => panic!("expected Validation, got {:?}", other),
     }
@@ -775,7 +763,7 @@ fn make_user_role_dummy(id: i64) -> crate::modules::iam::repo::UserRole {
         .unwrap();
     crate::modules::iam::repo::UserRole {
         id,
-        user_id: 0,        // 由具体 case 覆盖
+        user_id: 0, // 由具体 case 覆盖
         role: String::new(),
         scope_type: None,
         scope_id: None,

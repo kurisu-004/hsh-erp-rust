@@ -51,9 +51,9 @@ pub use crud::{
 pub use lifecycle::{
     cancel, cancel_batch, complete, complete_repair, deliver, list_by_work_type, list_by_worker,
     list_outsource_in_flight, list_outsource_sendable, list_pending_programming,
-    list_pickable_by_work_type, pick_up, place_on_shelf, recall_to_pending,
-    receive_from_outsource, receive_from_outsource_to_inspection, release_from_programming,
-    repair_dispatch, send_to_outsource, split_batch, start_repair,
+    list_pickable_by_work_type, pick_up, place_on_shelf, recall_to_pending, receive_from_outsource,
+    receive_from_outsource_to_inspection, release_from_programming, repair_dispatch,
+    send_to_outsource, split_batch, start_repair,
 };
 
 // ----- inspection.rs -----

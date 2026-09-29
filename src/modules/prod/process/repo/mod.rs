@@ -66,14 +66,8 @@ pub trait ProcessRepoTrait: Send {
         id: i64,
         include_deleted: bool,
     ) -> Result<Option<TProcess>, sqlx::Error>;
-    async fn get_by_code<'a>(
-        &mut self,
-        code: &'a str,
-    ) -> Result<Option<TProcess>, sqlx::Error>;
-    async fn list_by_ids<'a>(
-        &mut self,
-        ids: &'a [i64],
-    ) -> Result<Vec<TProcess>, sqlx::Error>;
+    async fn get_by_code<'a>(&mut self, code: &'a str) -> Result<Option<TProcess>, sqlx::Error>;
+    async fn list_by_ids<'a>(&mut self, ids: &'a [i64]) -> Result<Vec<TProcess>, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
     async fn list_with_filters<'a>(
         &mut self,
@@ -122,10 +116,7 @@ pub trait ProcessRepoTrait: Send {
         version: i32,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
-    async fn count_process_references(
-        &mut self,
-        process_id: i64,
-    ) -> Result<i64, sqlx::Error>;
+    async fn count_process_references(&mut self, process_id: i64) -> Result<i64, sqlx::Error>;
 }
 
 /// 把 `ProcessRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借
@@ -145,17 +136,11 @@ impl ProcessRepoTrait for &mut PgConnection {
         ProcessRepo::get_by_id(&mut **self, id, include_deleted).await
     }
 
-    async fn get_by_code<'b>(
-        &mut self,
-        code: &'b str,
-    ) -> Result<Option<TProcess>, sqlx::Error> {
+    async fn get_by_code<'b>(&mut self, code: &'b str) -> Result<Option<TProcess>, sqlx::Error> {
         ProcessRepo::get_by_code(&mut **self, code).await
     }
 
-    async fn list_by_ids<'b>(
-        &mut self,
-        ids: &'b [i64],
-    ) -> Result<Vec<TProcess>, sqlx::Error> {
+    async fn list_by_ids<'b>(&mut self, ids: &'b [i64]) -> Result<Vec<TProcess>, sqlx::Error> {
         ProcessRepo::list_by_ids(&mut **self, ids).await
     }
 
@@ -245,10 +230,7 @@ impl ProcessRepoTrait for &mut PgConnection {
         ProcessRepo::soft_delete(&mut **self, id, version, updated_by).await
     }
 
-    async fn count_process_references(
-        &mut self,
-        process_id: i64,
-    ) -> Result<i64, sqlx::Error> {
+    async fn count_process_references(&mut self, process_id: i64) -> Result<i64, sqlx::Error> {
         ProcessRepo::count_process_references(&mut **self, process_id).await
     }
 }

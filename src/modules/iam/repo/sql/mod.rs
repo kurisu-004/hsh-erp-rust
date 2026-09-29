@@ -27,7 +27,9 @@ use chrono::NaiveDateTime;
 use sqlx::PgConnection;
 
 use crate::modules::iam::repo::model::{Menu, Shelf, User, UserRole};
-use crate::modules::iam::repo::{IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow};
+use crate::modules::iam::repo::{
+    IamRepoTrait, UserInsert, UserPartialUpdate, UserRoleInsert, UserRoleRow,
+};
 
 /// 统一 `IamRepoTrait for &mut PgConnection` 实现（按实体分组，零业务逻辑）
 ///
@@ -122,10 +124,7 @@ impl IamRepoTrait for &mut PgConnection {
     ) -> Result<Vec<UserRoleRow>, sqlx::Error> {
         user_role::list_user_roles_by_user_id(&mut **self, user_id).await
     }
-    async fn get_user_role_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<UserRole>, sqlx::Error> {
+    async fn get_user_role_by_id(&mut self, id: i64) -> Result<Option<UserRole>, sqlx::Error> {
         user_role::get_user_role_by_id(&mut **self, id).await
     }
     async fn has_user_role_with_scope<'b>(
@@ -159,10 +158,7 @@ impl IamRepoTrait for &mut PgConnection {
     }
 
     // ── t_shelf（1）──
-    async fn get_shelf_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<Shelf>, sqlx::Error> {
+    async fn get_shelf_by_id(&mut self, id: i64) -> Result<Option<Shelf>, sqlx::Error> {
         shelf::get_shelf_by_id(&mut **self, id).await
     }
 }

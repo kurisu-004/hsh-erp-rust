@@ -175,10 +175,7 @@ impl CustomerService {
             .ok_or_else(customer_not_found)?;
 
         let parent_name = match c.parent_id {
-            Some(pid) => repo
-                .get_by_id(pid, true)
-                .await?
-                .map(|p| p.name),
+            Some(pid) => repo.get_by_id(pid, true).await?.map(|p| p.name),
             None => None,
         };
 

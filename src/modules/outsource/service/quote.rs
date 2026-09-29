@@ -28,10 +28,12 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::outsource::dto::{
     OutsourceQuoteCreateRequest, OutsourceQuoteListQuery, OutsourceQuoteUpdateRequest,
 };
-use crate::modules::outsource::vo::{OutsourceQuoteListOut, OutsourceQuoteOut};
-use crate::modules::outsource::model::{NewOutsourceQuote, NewOutsourceQuoteEvent, TOutsourceQuote};
+use crate::modules::outsource::model::{
+    NewOutsourceQuote, NewOutsourceQuoteEvent, TOutsourceQuote,
+};
 use crate::modules::outsource::repo::OutsourceRepoTrait;
 use crate::modules::outsource::statemachine::OutsourceQuoteStatus;
+use crate::modules::outsource::vo::{OutsourceQuoteListOut, OutsourceQuoteOut};
 use crate::shared::error::{AppError, code};
 
 use super::{
@@ -51,10 +53,7 @@ async fn quote_out_many<R: OutsourceRepoTrait>(
     let company_ids: Vec<i64> = quotes.iter().map(|q| q.outsource_company_id).collect();
     let process_ids: Vec<i64> = quotes.iter().map(|q| q.process_id).collect();
 
-    let part_map: HashMap<
-        i64,
-        (Option<String>, String, String, bool, Option<String>),
-    > = {
+    let part_map: HashMap<i64, (Option<String>, String, String, bool, Option<String>)> = {
         let rows = repo.part_map_for_quote(&part_ids).await?;
         rows.into_iter()
             .map(|r| (r.0, (r.1, r.2, r.3, r.4, r.5)))
@@ -141,13 +140,14 @@ impl OutsourceService {
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            let _cid = if let Some(s) = query.customer_id.as_deref().filter(|s| !s.is_empty()) {
-                Some(s.parse::<i64>().map_err(|_| {
-                    AppError::biz(code::BIZ_INVALID_VALUE, "customer_id 非整数")
-                })?)
-            } else {
-                None
-            };
+            let _cid =
+                if let Some(s) = query.customer_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(s.parse::<i64>().map_err(|_| {
+                        AppError::biz(code::BIZ_INVALID_VALUE, "customer_id 非整数")
+                    })?)
+                } else {
+                    None
+                };
             // 仅按 keyword（忽略 customer_id 展开以避免跨表依赖）
             if let Some(k) = kw {
                 repo.part_keyword_search(k).await?
@@ -166,15 +166,15 @@ impl OutsourceService {
                 offset,
             });
         }
-        let part_id: Option<i64> = if let Some(s) = query.part_id.as_deref().filter(|s| !s.is_empty())
-        {
-            Some(
-                s.parse::<i64>()
-                    .map_err(|_| AppError::biz(code::BIZ_INVALID_VALUE, "part_id 非整数"))?,
-            )
-        } else {
-            None
-        };
+        let part_id: Option<i64> =
+            if let Some(s) = query.part_id.as_deref().filter(|s| !s.is_empty()) {
+                Some(
+                    s.parse::<i64>()
+                        .map_err(|_| AppError::biz(code::BIZ_INVALID_VALUE, "part_id 非整数"))?,
+                )
+            } else {
+                None
+            };
         let company_id: Option<i64> = if let Some(s) = query
             .outsource_company_id
             .as_deref()
@@ -256,12 +256,15 @@ impl OutsourceService {
             .await?
             .ok_or_else(|| not_found_company(company_id))?;
         // 工序存在 + OUTSOURCE 类别
-        let proc_category = repo.process_get_category(process_id).await?.ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PROCESS_NOT_FOUND,
-                format!("process {process_id} 不存在"),
-            )
-        })?;
+        let proc_category = repo
+            .process_get_category(process_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_PROCESS_NOT_FOUND,
+                    format!("process {process_id} 不存在"),
+                )
+            })?;
         if proc_category != "OUTSOURCE" {
             return Err(AppError::biz(
                 code::BIZ_OUTSOURCE_COMPANY_BAD_PROCESS,
@@ -449,13 +452,7 @@ impl OutsourceService {
         }
         // 自动拒绝同 (part_id, process_id) 的其他 SUBMITTED/APPROVED
         let _ = repo
-            .quote_reject_competitors(
-                q.part_id,
-                q.process_id,
-                id,
-                "被新批准报价取代",
-                current.id,
-            )
+            .quote_reject_competitors(q.part_id, q.process_id, id, "被新批准报价取代", current.id)
             .await?;
         let from = OutsourceQuoteStatus::SUBMITTED;
         let to = OutsourceQuoteStatus::APPROVED;

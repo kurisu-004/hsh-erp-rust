@@ -48,7 +48,7 @@ mod classify_tests {
 
 #[cfg(test)]
 mod scan_resolve_tests {
-    use super::super::resolve_scan_kind::{resolve_scan_kind, ScanKind};
+    use super::super::resolve_scan_kind::{ScanKind, resolve_scan_kind};
     use crate::modules::assembly::model::TAssembly;
     use crate::modules::part::model::TPart;
 
@@ -347,13 +347,15 @@ mod c_group_distribution_tests {
 
 #[cfg(test)]
 mod attachable_batches_tests {
-    use super::super::classify::{build_unresolved_target, classify_invalid_state, classify_outcome, TargetEvaluation};
+    use super::super::classify::{
+        TargetEvaluation, build_unresolved_target, classify_invalid_state, classify_outcome,
+    };
     use super::super::helpers::{to_attachable_batch_dto, to_available_batch_dto};
     use crate::modules::delivery_note::vo::{
         AttachableBatchDto, AvailableBatchDto, BatchStatusDto, ScanOutcomeDto, UnresolvedTargetDto,
     };
-    use crate::modules::part::model::TPart;
     use crate::modules::part::batch::model::TPartBatch;
+    use crate::modules::part::model::TPart;
 
     /// 紧凑 mock：仅暴露本测试关注的字段，其余用 None / 0 / false 占位。
     fn b(id: i64, part_id: i64, status: &str, location: Option<&str>, version: i32) -> TPartBatch {

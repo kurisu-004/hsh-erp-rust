@@ -26,12 +26,14 @@ use crate::modules::outsource::dto::{
     OutsourceCompanyCreateRequest, OutsourceCompanyListQuery, OutsourceCompanyUpdateRequest,
     SetOutsourceCompanyProcessRequest,
 };
+use crate::modules::outsource::model::{
+    NewOutsourceCompany, NewOutsourceCompanyProcess, TOutsourceCompany,
+};
+use crate::modules::outsource::repo::OutsourceRepoTrait;
 use crate::modules::outsource::vo::{
     OutsourceCompanyListOut, OutsourceCompanyOut, OutsourceCompanyProcessLinkOut,
     OutsourceCompanyWithProcessesOut,
 };
-use crate::modules::outsource::model::{NewOutsourceCompany, NewOutsourceCompanyProcess, TOutsourceCompany};
-use crate::modules::outsource::repo::OutsourceRepoTrait;
 use crate::shared::error::{AppError, code};
 
 use super::{
@@ -58,9 +60,7 @@ async fn build_with_processes<R: OutsourceRepoTrait>(
     repo: &mut R,
     company: TOutsourceCompany,
 ) -> Result<OutsourceCompanyWithProcessesOut, AppError> {
-    let junctions = repo
-        .junction_list_by_company(company.id, false)
-        .await?;
+    let junctions = repo.junction_list_by_company(company.id, false).await?;
     let process_ids: Vec<i64> = junctions.iter().map(|j| j.process_id).collect();
     let mut process_map: HashMap<i64, (String, String, String)> = HashMap::new();
     if !process_ids.is_empty() {
@@ -254,7 +254,9 @@ impl OutsourceService {
             Role::CncProgrammer,
             Role::Inspector,
         ])?;
-        let ids = repo.junction_list_company_ids_by_process(process_id).await?;
+        let ids = repo
+            .junction_list_company_ids_by_process(process_id)
+            .await?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }

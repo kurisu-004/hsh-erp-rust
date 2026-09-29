@@ -180,19 +180,12 @@ async fn add_child_happy_path() {
     assert_eq!(child.drawing_no, "CH-CHILD-D001");
     assert_eq!(child.quantity, 3);
     assert_eq!(child.customer_id, l2, "子件 customer 继承父件");
-    assert_eq!(
-        child.assembly_id,
-        Some(asm_id),
-        "子件 assembly_id 指向父件"
-    );
+    assert_eq!(child.assembly_id, Some(asm_id), "子件 assembly_id 指向父件");
     assert_eq!(child.applicant_name, "张三", "applicant_name 继承父件");
     assert_eq!(child.order_no.as_deref(), Some("CH-ORDER-001"));
     assert_eq!(child.note.as_deref(), Some("加急备注"));
     assert!(!child.is_urgent);
-    assert!(
-        child.serial_no.is_none(),
-        "无 PDF 路径 → serial_no = NULL"
-    );
+    assert!(child.serial_no.is_none(), "无 PDF 路径 → serial_no = NULL");
     assert_eq!(
         child.customer_name.as_deref(),
         Some("子客CH-1"),
@@ -212,10 +205,10 @@ async fn add_child_happy_path() {
         "SELECT name, order_no, note, quantity, customer_id, assembly_id, is_urgent \
          FROM t_part WHERE id = $1",
     )
-.bind(child.id)
-        .fetch_one(&pool)
-        .await
-        .expect("query child part");
+    .bind(child.id)
+    .fetch_one(&pool)
+    .await
+    .expect("query child part");
     assert_eq!(row.0, "子件1");
     assert_eq!(row.1.as_deref(), Some("CH-ORDER-001"));
     assert_eq!(row.2.as_deref(), Some("加急备注"));

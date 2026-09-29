@@ -21,7 +21,9 @@ pub mod scan;
 pub mod submit;
 
 pub use attach::{AttachBatchConflict, AttachBatchesOut};
-pub use delivery_group::{DeliveryGroupListOut, DeliveryGroupMemberOut, DeliveryGroupOut, UngroupedCustomerOut};
+pub use delivery_group::{
+    DeliveryGroupListOut, DeliveryGroupMemberOut, DeliveryGroupOut, UngroupedCustomerOut,
+};
 pub use delivery_note::{
     BatchDeliveryDetailData, DeliveryNoteCandidatePart, DeliveryNoteCandidatePartsOut,
     DeliveryNoteDetailOut, DeliveryNoteEventOut, DeliveryNoteLineItem, DeliveryNoteListOut,
@@ -29,7 +31,7 @@ pub use delivery_note::{
 };
 pub use scan::{
     AddedBatchDto, AttachableBatchDto, AvailableBatchDto, BatchStatusDto, RecentItemDto,
-    ResolvedEntityDto, ResolvedKindDto, ScanDeliveryNoteSummaryDto, ScanDeliveryOut, ScanOutcomeDto,
-    UnresolvedTargetDto,
+    ResolvedEntityDto, ResolvedKindDto, ScanDeliveryNoteSummaryDto, ScanDeliveryOut,
+    ScanOutcomeDto, UnresolvedTargetDto,
 };
 pub use submit::{SubmitDeliveryOut, SubmitOutcomeDto};

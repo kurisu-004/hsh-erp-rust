@@ -104,10 +104,7 @@ pub trait ProcessChainRepoTrait: Send {
         note: Option<Option<&'a str>>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
-    async fn soft_delete_all_steps_for_chain(
-        &mut self,
-        chain_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    async fn soft_delete_all_steps_for_chain(&mut self, chain_id: i64) -> Result<u64, sqlx::Error>;
     async fn get_chain_by_part(
         &mut self,
         part_id: i64,
@@ -219,10 +216,7 @@ impl ProcessChainRepoTrait for &mut PgConnection {
         .await
     }
 
-    async fn soft_delete_all_steps_for_chain(
-        &mut self,
-        chain_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    async fn soft_delete_all_steps_for_chain(&mut self, chain_id: i64) -> Result<u64, sqlx::Error> {
         ProcessChainRepo::soft_delete_all_steps_for_chain(&mut **self, chain_id).await
     }
 

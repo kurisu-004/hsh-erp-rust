@@ -137,10 +137,7 @@ pub trait DeliveryNoteRepoTrait: Send {
         when: chrono::NaiveDateTime,
         deleted_by: Option<i64>,
     ) -> Result<u64, sqlx::Error>;
-    async fn group_insert_member(
-        &mut self,
-        m: &DeliveryGroupMember,
-    ) -> Result<(), sqlx::Error>;
+    async fn group_insert_member(&mut self, m: &DeliveryGroupMember) -> Result<(), sqlx::Error>;
     async fn group_soft_delete_members_by_group(
         &mut self,
         group_id: i64,
@@ -293,10 +290,7 @@ impl DeliveryNoteRepoTrait for &mut PgConnection {
         DeliveryGroupRepo::soft_delete(&mut **self, id, version, when, deleted_by).await
     }
 
-    async fn group_insert_member(
-        &mut self,
-        m: &DeliveryGroupMember,
-    ) -> Result<(), sqlx::Error> {
+    async fn group_insert_member(&mut self, m: &DeliveryGroupMember) -> Result<(), sqlx::Error> {
         DeliveryGroupRepo::insert_member(&mut **self, m).await
     }
 

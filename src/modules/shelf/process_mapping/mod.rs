@@ -69,15 +69,12 @@ impl ShelfProcessService {
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         // 1. shelf 存在性 + 软删校验（已软删 → 404）
-        let shelf = repo
-            .get_by_id(shelf_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_SHELF_NOT_FOUND,
-                    format!("shelf {shelf_id} 不存在"),
-                )
-            })?;
+        let shelf = repo.get_by_id(shelf_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_SHELF_NOT_FOUND,
+                format!("shelf {shelf_id} 不存在"),
+            )
+        })?;
 
         // 2. 解析 + 校验所有 process_id 存在
         let mut process_ids: Vec<i64> = Vec::with_capacity(items.len());
@@ -120,7 +117,8 @@ impl ShelfProcessService {
                 sort_order: it.sort_order,
             })
             .collect();
-        repo.proc_bulk_insert(&new_rows, snowflake, current.id).await?;
+        repo.proc_bulk_insert(&new_rows, snowflake, current.id)
+            .await?;
 
         Ok(())
     }
@@ -142,15 +140,12 @@ impl ShelfProcessService {
         ])?;
 
         // shelf 存在性 / scope 校验
-        let shelf = repo
-            .get_by_id(shelf_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_SHELF_NOT_FOUND,
-                    format!("shelf {shelf_id} 不存在"),
-                )
-            })?;
+        let shelf = repo.get_by_id(shelf_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_SHELF_NOT_FOUND,
+                format!("shelf {shelf_id} 不存在"),
+            )
+        })?;
         if !current.can_access_shelf(shelf.id) {
             return Err(AppError::biz(
                 code::SHELF_MISMATCH,

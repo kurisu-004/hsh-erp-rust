@@ -16,5 +16,5 @@
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
 mod basic;
-mod role;
 mod password;
+mod role;

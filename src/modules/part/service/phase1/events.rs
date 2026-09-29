@@ -11,13 +11,13 @@
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::part::dto_crud::{
     BatchUpdateOrderInfoRequest, BatchWithPdfsRequest, MatchByExcelItemsRequest,
 };
 use crate::modules::part::repo::NewPartCreate;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::PartUpdate;
-use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::part::vo::{
     BatchUpdateOrderInfoOut, LocationTreeNodeOut, LocationTreeOut, MatchByExcelItemResult,
     PartEventOut,
@@ -26,8 +26,8 @@ use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
-use super::EventListRow;
 use super::super::PartService;
+use super::EventListRow;
 use super::{HolderCountRow, OutsourceLite};
 
 impl PartService {
@@ -280,7 +280,7 @@ impl PartService {
                     AppError::biz(code::BIZ_ASSEMBLY_PDF_INVALID, format!("PDF 解析失败: {e}"))
                 })?;
                 page_count += doc.get_pages().len() as i32;
-        }
+            }
         }
         // 子件数量上限 99（page2..N 共 99 个）
         let child_count = std::cmp::max(0, page_count - 1);
@@ -412,10 +412,10 @@ impl PartService {
         }
 
         // 重读 master
-        let part: crate::modules::part::model::TPart =
-            repo.get_by_id(new_id, false)
-                .await?
-                .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "create 后查不到"))?;
+        let part: crate::modules::part::model::TPart = repo
+            .get_by_id(new_id, false)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "create 后查不到"))?;
         Ok(
             crate::modules::part::vo::PartDetailOut::from_with_customer_extra(
                 part, None, None, None,
@@ -529,8 +529,7 @@ impl PartService {
             return Err(AppError::validation("items 不能为空"));
         }
         let mut updated = 0_i64;
-        let mut failed: Vec<super::super::super::vo::BatchUpdateOrderInfoFailure> =
-            Vec::new();
+        let mut failed: Vec<super::super::super::vo::BatchUpdateOrderInfoFailure> = Vec::new();
         for item in &req.items {
             let upd = PartUpdate {
                 name: None,
@@ -549,20 +548,16 @@ impl PartService {
             let n = repo.update_part(item.part_id, item.version, upd).await;
             match n {
                 Ok(1) => updated += 1,
-                Ok(_) => failed.push(
-                    super::super::super::vo::BatchUpdateOrderInfoFailure {
-                        part_id: item.part_id,
-                        code: code::VERSION_CONFLICT,
-                        message: "版本冲突或 part 已软删".into(),
-                    },
-                ),
-                Err(e) => failed.push(
-                    super::super::super::vo::BatchUpdateOrderInfoFailure {
-                        part_id: item.part_id,
-                        code: code::DATABASE,
-                        message: format!("{e}"),
-                    },
-                ),
+                Ok(_) => failed.push(super::super::super::vo::BatchUpdateOrderInfoFailure {
+                    part_id: item.part_id,
+                    code: code::VERSION_CONFLICT,
+                    message: "版本冲突或 part 已软删".into(),
+                }),
+                Err(e) => failed.push(super::super::super::vo::BatchUpdateOrderInfoFailure {
+                    part_id: item.part_id,
+                    code: code::DATABASE,
+                    message: format!("{e}"),
+                }),
             }
         }
         Ok(BatchUpdateOrderInfoOut { updated, failed })

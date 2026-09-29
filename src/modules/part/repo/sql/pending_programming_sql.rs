@@ -127,14 +127,21 @@ impl PartRepo {
         // has_cnc_program 过滤：Option<bool> 三态
         qb.push(" AND (");
         qb.push_bind(f.has_cnc_program);
-        qb.push("::bool IS NULL OR EXISTS (SELECT 1 FROM t_part_file pf \
+        qb.push(
+            "::bool IS NULL OR EXISTS (SELECT 1 FROM t_part_file pf \
                 WHERE pf.part_id = p.id AND pf.kind = 'G_CODE' \
-                  AND pf.deleted_at IS NULL) = ");
+                  AND pf.deleted_at IS NULL) = ",
+        );
         qb.push_bind(f.has_cnc_program);
         qb.push(")");
 
         // keyword 模糊匹配
-        if let Some(kw) = f.keyword.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(kw) = f
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let pat = format!("%{}%", kw);
             qb.push(" AND (p.name ILIKE ")
                 .push_bind(pat.clone())
@@ -152,8 +159,10 @@ impl PartRepo {
         qb.push(" OFFSET ");
         qb.push_bind(f.offset);
 
-        let rows: Vec<PendingProgrammingItemRow> =
-            qb.build_query_as::<PendingProgrammingItemRow>().fetch_all(conn).await?;
+        let rows: Vec<PendingProgrammingItemRow> = qb
+            .build_query_as::<PendingProgrammingItemRow>()
+            .fetch_all(conn)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -219,13 +228,20 @@ impl PartRepo {
 
         qb.push(" AND (");
         qb.push_bind(f.has_cnc_program);
-        qb.push("::bool IS NULL OR EXISTS (SELECT 1 FROM t_part_file pf \
+        qb.push(
+            "::bool IS NULL OR EXISTS (SELECT 1 FROM t_part_file pf \
                 WHERE pf.part_id = p.id AND pf.kind = 'G_CODE' \
-                  AND pf.deleted_at IS NULL) = ");
+                  AND pf.deleted_at IS NULL) = ",
+        );
         qb.push_bind(f.has_cnc_program);
         qb.push(")");
 
-        if let Some(kw) = f.keyword.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(kw) = f
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let pat = format!("%{}%", kw);
             qb.push(" AND (p.name ILIKE ")
                 .push_bind(pat.clone())

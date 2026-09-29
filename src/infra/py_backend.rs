@@ -174,8 +174,8 @@ impl PyBackendClient for HttpPyBackend {
                     format!("转发 STS 请求到 python 失败: {e}"),
                 )
             })?;
-        let status = StatusCode::from_u16(resp.status().as_u16())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         // 2026-09-28 review 第 1 轮修复：去掉 copy_response_headers no-op 转换，
         // reqwest::header::HeaderMap 与 axum::http::HeaderMap 是同一类型（http::HeaderMap），
         // .clone() 即可。

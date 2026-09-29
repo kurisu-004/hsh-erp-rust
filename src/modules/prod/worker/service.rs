@@ -164,9 +164,7 @@ impl WorkerService {
         let items = repo
             .list_with_filters(name_like, query.is_active, limit, offset)
             .await?;
-        let total = repo
-            .count_with_filters(name_like, query.is_active)
-            .await?;
+        let total = repo.count_with_filters(name_like, query.is_active).await?;
 
         // work_type_name 一次性批量补全（防 N+1）—— 走 trait 跨域 helper
         // `work_type_list_by_ids`，impl 一行委托到 `WorkTypeRepo::list_by_ids`。
@@ -206,10 +204,7 @@ impl WorkerService {
 
         // work_type_name 补全（trait 跨域 helper）
         let work_type_name = match w.work_type_id {
-            Some(wt_id) => repo
-                .work_type_get_by_id(wt_id)
-                .await?
-                .map(|wt| wt.name),
+            Some(wt_id) => repo.work_type_get_by_id(wt_id).await?.map(|wt| wt.name),
             None => None,
         };
         Ok(to_worker_out(w, work_type_name))
@@ -240,11 +235,7 @@ impl WorkerService {
         }
 
         // 服务端再查一次唯一性（业务即时反馈）；DB uk_t_worker_badge_code 兜底
-        if repo
-            .get_by_badge_code(badge_code, false)
-            .await?
-            .is_some()
-        {
+        if repo.get_by_badge_code(badge_code, false).await?.is_some() {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 format!("badge_code '{badge_code}' 已被占用"),
@@ -280,10 +271,7 @@ impl WorkerService {
 
         // 回读时再补 work_type_name（与 list 一致）
         let work_type_name = match w.work_type_id {
-            Some(wt_id) => repo
-                .work_type_get_by_id(wt_id)
-                .await?
-                .map(|wt| wt.name),
+            Some(wt_id) => repo.work_type_get_by_id(wt_id).await?.map(|wt| wt.name),
             None => None,
         };
         Ok(to_worker_out(w, work_type_name))

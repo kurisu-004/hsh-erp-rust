@@ -141,10 +141,7 @@ pub trait WorkerRepoTrait: Send {
     // ── 跨域 helper（2）── 委托到 work_type 域 ZST 静态方法 ───────────
     /// 单条查 work_type（活跃行）。供本域 `get_worker` / `create_worker` /
     /// `update_worker` 校验 `work_type_id` 存在性 + 补 `work_type_name`。
-    async fn work_type_get_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<TWorkType>, sqlx::Error>;
+    async fn work_type_get_by_id(&mut self, id: i64) -> Result<Option<TWorkType>, sqlx::Error>;
     /// 批量查 work_type（活跃行）。空切片短路返回空 Vec。供本域 `list_workers`
     /// 一次性补齐 `work_type_name`，防 N+1。
     async fn work_type_list_by_ids<'a>(
@@ -275,10 +272,7 @@ impl WorkerRepoTrait for &mut PgConnection {
     }
 
     // ── 跨域 helper（2）── 一行委托 work_type 域 ZST 静态方法 ──────
-    async fn work_type_get_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<TWorkType>, sqlx::Error> {
+    async fn work_type_get_by_id(&mut self, id: i64) -> Result<Option<TWorkType>, sqlx::Error> {
         use crate::modules::prod::work_type::repo::WorkTypeRepo;
         WorkTypeRepo::get_by_id(&mut **self, id).await
     }

@@ -41,6 +41,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Extension, Request};
@@ -48,7 +49,6 @@ use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
-use axum::Json;
 use deadpool_redis::redis::AsyncCommands;
 use hsh_erp_test_support::{
     load_idempotency_fixture, test_pool, test_redis_pool, test_state_with_redis,
@@ -71,41 +71,25 @@ use hsh_erp_rust::state::AppState;
 /// 影响 State extractor）。
 async fn counted_post(Extension(counter): Extension<Arc<AtomicUsize>>) -> Response {
     counter.fetch_add(1, Ordering::SeqCst);
-    (
-        StatusCode::OK,
-        Json(json!({"echo": "post", "ok": true})),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({"echo": "post", "ok": true}))).into_response()
 }
 
 /// PUT handler 计数器。
 async fn counted_put(Extension(counter): Extension<Arc<AtomicUsize>>) -> Response {
     counter.fetch_add(1, Ordering::SeqCst);
-    (
-        StatusCode::OK,
-        Json(json!({"echo": "put", "ok": true})),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({"echo": "put", "ok": true}))).into_response()
 }
 
 /// GET handler 计数器。
 async fn counted_get(Extension(counter): Extension<Arc<AtomicUsize>>) -> Response {
     counter.fetch_add(1, Ordering::SeqCst);
-    (
-        StatusCode::OK,
-        Json(json!({"echo": "get", "ok": true})),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({"echo": "get", "ok": true}))).into_response()
 }
 
 /// DELETE handler 计数器。
 async fn counted_delete(Extension(counter): Extension<Arc<AtomicUsize>>) -> Response {
     counter.fetch_add(1, Ordering::SeqCst);
-    (
-        StatusCode::OK,
-        Json(json!({"echo": "delete", "ok": true})),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({"echo": "delete", "ok": true}))).into_response()
 }
 
 /// 自建 mini router：仅挂 idempotency_middleware，不挂 auth_middleware。
@@ -121,18 +105,17 @@ fn make_test_app(state: Arc<AppState>, counter: Arc<AtomicUsize>) -> Router {
         .route("/__test/get", get(counted_get))
         .route("/__test/delete", delete(counted_delete))
         // idempotency_middleware 在外层（route_layer 语义：先调 = 内层）
-        .layer(from_fn_with_state(
-            state.clone(),
-            idempotency_middleware,
-        ))
+        .layer(from_fn_with_state(state.clone(), idempotency_middleware))
         // typed 闭包：显式标注 req: Request / next: Next 让编译器推断，
         // 把 counter 塞到 req.extensions_mut() 供 handler 用 Extension 取。
         // ⚠️ 不能用 `async move {}`——会移动 counter 让闭包退化成 FnOnce，
         // 破坏 tower Service 多次调用契约；用普通 `async {}` 借用即可。
-        .layer(axum::middleware::from_fn(move |mut req: Request, next: Next| {
-            req.extensions_mut().insert(counter.clone());
-            async move { next.run(req).await }
-        }))
+        .layer(axum::middleware::from_fn(
+            move |mut req: Request, next: Next| {
+                req.extensions_mut().insert(counter.clone());
+                async move { next.run(req).await }
+            },
+        ))
         .with_state(state)
 }
 
@@ -156,14 +139,13 @@ fn make_public_app(state: Arc<AppState>, counter: Arc<AtomicUsize>) -> Router {
     }
     Router::new()
         .route("/iam/login", post(login_handler))
-        .layer(from_fn_with_state(
-            state.clone(),
-            idempotency_middleware,
+        .layer(from_fn_with_state(state.clone(), idempotency_middleware))
+        .layer(axum::middleware::from_fn(
+            move |mut req: Request, next: Next| {
+                req.extensions_mut().insert(counter.clone());
+                async move { next.run(req).await }
+            },
         ))
-        .layer(axum::middleware::from_fn(move |mut req: Request, next: Next| {
-            req.extensions_mut().insert(counter.clone());
-            async move { next.run(req).await }
-        }))
         .with_state(state)
 }
 
@@ -200,11 +182,7 @@ async fn send(app: Router, req: Request<Body>) -> (StatusCode, Vec<u8>, Response
     (status, body, axum::response::Response::new(Body::empty()))
 }
 
-fn make_request(
-    method: &str,
-    uri: &str,
-    idem_key: Option<&str>,
-) -> Request<Body> {
+fn make_request(method: &str, uri: &str, idem_key: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(k) = idem_key {
         builder = builder.header("idempotency-key", k);
@@ -234,30 +212,18 @@ async fn same_key_returns_cached_response() {
 
     // 第 1 次 POST：handler 调，缓存
     let app1 = make_test_app(state.clone(), counter.clone());
-    let (s1, b1, _) = send(
-        app1,
-        make_request("POST", "/__test/post", Some(&key)),
-    )
-    .await;
+    let (s1, b1, _) = send(app1, make_request("POST", "/__test/post", Some(&key))).await;
     // 给 spawn 的 put 一个机会跑完
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // 第 2 次 POST：应命中缓存
     let app2 = make_test_app(state, counter.clone());
-    let (s2, b2, _) = send(
-        app2,
-        make_request("POST", "/__test/post", Some(&key)),
-    )
-    .await;
+    let (s2, b2, _) = send(app2, make_request("POST", "/__test/post", Some(&key))).await;
 
     assert_eq!(s1, StatusCode::OK);
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(b1, b2, "第二次响应应与第一次字节级一致");
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        1,
-        "handler 应只被调一次"
-    );
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "handler 应只被调一次");
 }
 
 // ===========================================================================
@@ -278,11 +244,7 @@ async fn handler_invoked_only_once() {
             test_state_with_redis(_pool.clone(), test_redis_pool().await),
             counter.clone(),
         );
-        let (s, _, _) = send(
-            app,
-            make_request("POST", "/__test/post", Some(&key)),
-        )
-        .await;
+        let (s, _, _) = send(app, make_request("POST", "/__test/post", Some(&key))).await;
         assert_eq!(s, StatusCode::OK);
     }
 
@@ -344,11 +306,7 @@ async fn cross_method_same_key_collides() {
         test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
-    let (s1, b1, _) = send(
-        app1,
-        make_request("POST", "/__test/post", Some(&key)),
-    )
-    .await;
+    let (s1, b1, _) = send(app1, make_request("POST", "/__test/post", Some(&key))).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(s1, StatusCode::OK);
 
@@ -357,11 +315,7 @@ async fn cross_method_same_key_collides() {
         test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
-    let (s2, b2, _) = send(
-        app2,
-        make_request("PUT", "/__test/put", Some(&key)),
-    )
-    .await;
+    let (s2, b2, _) = send(app2, make_request("PUT", "/__test/put", Some(&key))).await;
 
     // 第 1 次 POST 调 post handler；第 2 次 PUT 应命中第 1 次的缓存，不调 put handler
     assert_eq!(s1, s2, "PUT 应返 POST 的 status");
@@ -387,17 +341,9 @@ async fn get_with_header_is_skipped() {
         test_state_with_redis(_pool.clone(), test_redis_pool().await),
         counter.clone(),
     );
-    let (s, _, _) = send(
-        app,
-        make_request("GET", "/__test/get", Some("any-key")),
-    )
-    .await;
+    let (s, _, _) = send(app, make_request("GET", "/__test/get", Some("any-key"))).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        1,
-        "GET handler 应被调一次"
-    );
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "GET handler 应被调一次");
     // 不扫全 db 断言：counter==1 即证明 method 过滤生效，handler 被调即调用 middleware。
 }
 
@@ -505,11 +451,7 @@ async fn ttl_expiry() {
     let redis_key = format!("idem:{key}");
 
     let app1 = make_test_app(state.clone(), counter.clone());
-    let (s1, _, _) = send(
-        app1,
-        make_request("POST", "/__test/post", Some(&key)),
-    )
-    .await;
+    let (s1, _, _) = send(app1, make_request("POST", "/__test/post", Some(&key))).await;
     assert_eq!(s1, StatusCode::OK);
 
     // 给 spawn 一点时间把缓存写入 Redis（避免与 TTL 竞态）
@@ -531,11 +473,7 @@ async fn ttl_expiry() {
     );
 
     let app2 = make_test_app(state, counter.clone());
-    let (s2, _, _) = send(
-        app2,
-        make_request("POST", "/__test/post", Some(&key)),
-    )
-    .await;
+    let (s2, _, _) = send(app2, make_request("POST", "/__test/post", Some(&key))).await;
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(
         counter.load(Ordering::SeqCst),
@@ -563,14 +501,9 @@ async fn login_with_idempotency_key_does_not_cache_jwt() {
 
     // 第 1 次：POST /iam/login 带 key（闸门放行 → handler 调）
     let app1 = make_public_app(state.clone(), counter.clone());
-    let (s1, b1, _) = send(
-        app1,
-        make_request("POST", "/iam/login", Some(&key)),
-    )
-    .await;
+    let (s1, b1, _) = send(app1, make_request("POST", "/iam/login", Some(&key))).await;
     assert_eq!(s1, StatusCode::OK);
-    let body1: serde_json::Value =
-        serde_json::from_slice(&b1).expect("login body should be JSON");
+    let body1: serde_json::Value = serde_json::from_slice(&b1).expect("login body should be JSON");
     assert_eq!(body1["access_token"], "TOKEN-call1");
 
     // 等足够时间让 spawn put 有机会跑（如果闸门失效，缓存会写入）
@@ -578,14 +511,9 @@ async fn login_with_idempotency_key_does_not_cache_jwt() {
 
     // 第 2 次：POST /iam/login 同 key（闸门再次放行 → handler 调，counter+=1）
     let app2 = make_public_app(state.clone(), counter.clone());
-    let (s2, b2, _) = send(
-        app2,
-        make_request("POST", "/iam/login", Some(&key)),
-    )
-    .await;
+    let (s2, b2, _) = send(app2, make_request("POST", "/iam/login", Some(&key))).await;
     assert_eq!(s2, StatusCode::OK);
-    let body2: serde_json::Value =
-        serde_json::from_slice(&b2).expect("login body should be JSON");
+    let body2: serde_json::Value = serde_json::from_slice(&b2).expect("login body should be JSON");
 
     // 闸门生效：两次都走 handler，counter=2，access_token marker 序号递增。
     // 闸门失效（缓存命中）：counter=1，b2 == b1（拿到第一次的 token）。

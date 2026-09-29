@@ -21,7 +21,7 @@
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
 /// Build an `axum::http::Request<Body>` with an optional JSON body and an optional
@@ -58,16 +58,17 @@ pub fn json_request(
 /// genuine test infrastructure bug, not a 4xx/5xx the SUT should produce.
 #[allow(dead_code)]
 pub async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
-    let response = app
-        .oneshot(req)
-        .await
-        .expect("oneshot");
+    let response = app.oneshot(req).await.expect("oneshot");
     let status = response.status();
     let body_bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("read body");
-    let envelope: Value = serde_json::from_slice(&body_bytes)
-        .unwrap_or_else(|e| panic!("parse JSON: {e}; raw = {}", String::from_utf8_lossy(&body_bytes)));
+    let envelope: Value = serde_json::from_slice(&body_bytes).unwrap_or_else(|e| {
+        panic!(
+            "parse JSON: {e}; raw = {}",
+            String::from_utf8_lossy(&body_bytes)
+        )
+    });
     (status, envelope)
 }
 
@@ -86,17 +87,13 @@ pub async fn login_token(app: &axum::Router, username: &str, password: &str) -> 
     );
     let (status, body) = send(app.clone(), req).await;
     if status != StatusCode::OK {
-        panic!(
-            "login_token: expected 200 OK for user '{username}', got {status} body={body}"
-        );
+        panic!("login_token: expected 200 OK for user '{username}', got {status} body={body}");
     }
     body.get("data")
         .and_then(|d| d.get("token"))
         .and_then(|t| t.as_str())
         .map(String::from)
         .unwrap_or_else(|| {
-            panic!(
-                "login_token: response missing data.token for user '{username}', body={body}"
-            )
+            panic!("login_token: response missing data.token for user '{username}', body={body}")
         })
 }

@@ -38,9 +38,7 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_test_support::pool_snowflake;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(

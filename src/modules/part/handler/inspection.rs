@@ -161,7 +161,8 @@ pub async fn to_inspection(
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
     current.require_any_role(TO_XXX_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::to_inspection(&mut *tx, &state.snowflake, part_id, req, &current).await?;
+    let out =
+        PartService::to_inspection(&mut *tx, &state.snowflake, part_id, req, &current).await?;
     tx.commit().await?;
     if let Some(aid) = out.synced_assembly_id {
         ws_broadcast_assembly_updated(&state, aid);
@@ -302,12 +303,12 @@ pub async fn worker_scan(
         &state.snowflake,
         scan_out.worker_id,
         scan_out.work_type_id,
-            req.shelf_id,
-            &scan_out.badge_code,
-            current.id,
-            &current,
-        )
-        .await?;
+        req.shelf_id,
+        &scan_out.badge_code,
+        current.id,
+        &current,
+    )
+    .await?;
     tx.commit().await?;
     // commit 之后广播（对齐 Python 延迟广播模式）
     if let Some(aid) = scan_out.synced_assembly_id {

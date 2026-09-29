@@ -25,8 +25,9 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
-use hsh_erp_test_support::{json_request, load_part_fixture, login_token, send, test_app,
-    test_pool, test_state};
+use hsh_erp_test_support::{
+    json_request, load_part_fixture, login_token, send, test_app, test_pool, test_state,
+};
 
 // ===========================================================================
 //  动态 fixture helpers（PR-C.Final retry 第 3 轮，2026-09-24）
@@ -37,9 +38,7 @@ use hsh_erp_test_support::{json_request, load_part_fixture, login_token, send, t
 /// 为指定 part 建一个最小工艺链（t_part_process_chain），并把 part.process_chain_id 绑回。
 async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
     use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let chain_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
@@ -63,9 +62,7 @@ async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
 /// 在指定 chain 内创建 step（process_id + sort_order）。
 async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
     use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let step_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
@@ -561,9 +558,7 @@ async fn scan_deliver_part_requires_driver() {
 async fn seed_cnc_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -586,9 +581,7 @@ async fn seed_cnc_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 async fn seed_cnc_shelf(pool: &PgPool, code: &str, name: &str, cnc_process_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let shelf_id = snowflake.next_id();
     let sp_id = snowflake.next_id();
     let now = now_naive();
@@ -624,9 +617,7 @@ async fn seed_cnc_shelf(pool: &PgPool, code: &str, name: &str, cnc_process_id: i
 async fn attach_chain_cnc_step(pool: &PgPool, chain_id: i64, cnc_process_id: i64, sort_order: i32) {
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let step_id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -648,9 +639,7 @@ async fn attach_chain_cnc_step(pool: &PgPool, chain_id: i64, cnc_process_id: i64
 async fn seed_g_code_file(pool: &PgPool, part_id: i64, owner_user_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     let object_key = format!("uploads/part/{part_id}/G_CODE/test_{id}.nc");
@@ -696,7 +685,9 @@ async fn list_pending_programming_includes_parts_with_cnc_step_in_chain() {
     let items = env["data"]["items"].as_array().expect("items array");
     let pid_str = pid.to_string();
     assert!(
-        items.iter().any(|it| it["id"].as_str() == Some(pid_str.as_str())),
+        items
+            .iter()
+            .any(|it| it["id"].as_str() == Some(pid_str.as_str())),
         "链上 CNC step 的 part 应出现在列表中: {env}"
     );
 }
@@ -707,8 +698,7 @@ async fn list_pending_programming_includes_parts_on_cnc_shelf_without_cnc_step_i
     let cnc_proc = seed_cnc_process(&pool, "CNC-TEST2", "CNC-2").await;
     let cnc_shelf = seed_cnc_shelf(&pool, "CNC-SHELF-TEST", "CNC 货架", cnc_proc).await;
     // part 状态 = IN_PROCESS，链上无 CNC step，但 batch 在 CNC 货架
-    let (pid, bid) =
-        insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 1).await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 1).await;
     let chain_id = create_chain_for_part(&pool, pid).await;
     // chain 上挂 fx.process_id（INHOUSE，非 CNC）—— 验证条件 A 不命中
     let _step = create_step(&pool, chain_id, fx.process_id, 1).await;
@@ -736,7 +726,9 @@ async fn list_pending_programming_includes_parts_on_cnc_shelf_without_cnc_step_i
     let items = env["data"]["items"].as_array().expect("items array");
     let pid_str = pid.to_string();
     assert!(
-        items.iter().any(|it| it["id"].as_str() == Some(pid_str.as_str())),
+        items
+            .iter()
+            .any(|it| it["id"].as_str() == Some(pid_str.as_str())),
         "批次位于 CNC 货架的 part 应出现在列表中（条件 B）: {env}"
     );
 }
@@ -746,13 +738,11 @@ async fn list_pending_programming_has_cnc_program_tab_filter() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     let cnc_proc = seed_cnc_process(&pool, "CNC-TEST3", "CNC-3").await;
     // part A：链上有 CNC step，但**未**上传 G_CODE
-    let (pid_a, _bid_a) =
-        insert_part_with_batch(&pool, "A", fx.customer_l2_id, "PENDING", 1).await;
+    let (pid_a, _bid_a) = insert_part_with_batch(&pool, "A", fx.customer_l2_id, "PENDING", 1).await;
     let chain_a = create_chain_for_part(&pool, pid_a).await;
     attach_chain_cnc_step(&pool, chain_a, cnc_proc, 1).await;
     // part B：链上有 CNC step，且**已**上传 G_CODE
-    let (pid_b, _bid_b) =
-        insert_part_with_batch(&pool, "B", fx.customer_l2_id, "PENDING", 1).await;
+    let (pid_b, _bid_b) = insert_part_with_batch(&pool, "B", fx.customer_l2_id, "PENDING", 1).await;
     let chain_b = create_chain_for_part(&pool, pid_b).await;
     attach_chain_cnc_step(&pool, chain_b, cnc_proc, 1).await;
     seed_g_code_file(&pool, pid_b, fx.manager_user_id).await;

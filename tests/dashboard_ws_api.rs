@@ -41,7 +41,6 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-
 async fn setup() -> PgPool {
     let pool = test_pool().await;
     let _fx = load_dashboard_ws_fixture(&pool).await;

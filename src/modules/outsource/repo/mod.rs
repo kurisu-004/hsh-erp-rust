@@ -284,10 +284,7 @@ pub trait OutsourceRepoTrait: Send {
     /// `t_part` 按 id 查存在性（仅未软删）。供 create_quote 校验 part_id。
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error>;
     /// `t_part` 按关键字模糊搜（drawing_no OR name）。供 list_quotes 关键字过滤。
-    async fn part_keyword_search<'a>(
-        &mut self,
-        keyword: &'a str,
-    ) -> Result<Vec<i64>, sqlx::Error>;
+    async fn part_keyword_search<'a>(&mut self, keyword: &'a str) -> Result<Vec<i64>, sqlx::Error>;
     /// `t_process` 按 id 查 category。供 create_quote 校验 OUTSOURCE 类别。
     async fn process_get_category(
         &mut self,
@@ -485,8 +482,13 @@ impl OutsourceRepoTrait for &mut PgConnection {
         process_id: i64,
         exclude_id: i64,
     ) -> Result<Vec<TOutsourceQuote>, sqlx::Error> {
-        OutsourceQuoteRepo::list_active_by_part_process(&mut **self, part_id, process_id, exclude_id)
-            .await
+        OutsourceQuoteRepo::list_active_by_part_process(
+            &mut **self,
+            part_id,
+            process_id,
+            exclude_id,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -698,19 +700,15 @@ impl OutsourceRepoTrait for &mut PgConnection {
 
     // ── 跨域 helper（11）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(part_id)
-        .fetch_optional(&mut **self)
-        .await?;
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+                .bind(part_id)
+                .fetch_optional(&mut **self)
+                .await?;
         Ok(row.is_some())
     }
 
-    async fn part_keyword_search<'b>(
-        &mut self,
-        keyword: &'b str,
-    ) -> Result<Vec<i64>, sqlx::Error> {
+    async fn part_keyword_search<'b>(&mut self, keyword: &'b str) -> Result<Vec<i64>, sqlx::Error> {
         let rows: Vec<(i64,)> = sqlx::query_as(
             "SELECT id FROM t_part WHERE deleted_at IS NULL AND \
              (drawing_no ILIKE $1 OR name ILIKE $1) LIMIT 10000",
@@ -725,12 +723,11 @@ impl OutsourceRepoTrait for &mut PgConnection {
         &mut self,
         process_id: i64,
     ) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT category FROM t_process WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(process_id)
-        .fetch_optional(&mut **self)
-        .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT category FROM t_process WHERE id = $1 AND deleted_at IS NULL")
+                .bind(process_id)
+                .fetch_optional(&mut **self)
+                .await?;
         Ok(row.map(|r| r.0))
     }
 
@@ -776,8 +773,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
     async fn part_map_for_quote<'b>(
         &mut self,
         part_ids: &'b [i64],
-    ) -> Result<Vec<(i64, Option<String>, String, String, bool, Option<String>)>, sqlx::Error>
-    {
+    ) -> Result<Vec<(i64, Option<String>, String, String, bool, Option<String>)>, sqlx::Error> {
         sqlx::query_as(
             "SELECT id, serial_no, drawing_no, name, is_urgent, unit_price::text \
              FROM t_part WHERE id = ANY($1) AND deleted_at IS NULL",

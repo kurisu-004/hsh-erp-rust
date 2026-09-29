@@ -127,4 +127,3 @@ pub struct InspectionBatchListRow {
     pub customer_name: Option<String>,
     pub l1_customer_name: Option<String>,
 }
-

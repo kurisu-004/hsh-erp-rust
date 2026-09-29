@@ -29,10 +29,10 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
+use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
     DeliveryFixture, json_request, load_delivery_fixture, test_app, test_pool, test_state,
 };
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 
 /// **保留本地 send**：calamine 回读需要原始字节，进 JSON 解析会丢数据。
 /// 与 `test-support::http::send` 签名不一致，不替换。

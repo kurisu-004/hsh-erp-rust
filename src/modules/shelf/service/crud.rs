@@ -30,8 +30,8 @@ use crate::shared::error::{AppError, code};
 
 use super::super::dto::*;
 use super::super::model::TShelf;
-use super::super::vo::*;
 use super::super::repo::ShelfRepoTrait;
+use super::super::vo::*;
 use super::{DEFAULT_LIMIT, MAX_LIMIT, ZONE_INSPECTION, ZONE_PRODUCTION};
 
 fn shelf_not_found() -> AppError {
@@ -148,10 +148,7 @@ impl ShelfService {
             Role::Inspector,
         ])?;
 
-        let s = repo
-            .get_by_id(id)
-            .await?
-            .ok_or_else(shelf_not_found)?;
+        let s = repo.get_by_id(id).await?.ok_or_else(shelf_not_found)?;
 
         if !current.can_access_shelf(s.id) {
             return Err(AppError::biz(
@@ -220,10 +217,7 @@ impl ShelfService {
     ) -> Result<ShelfOut, AppError> {
         current.require_role(Role::Manager)?;
 
-        let current_shelf = repo
-            .get_by_id(id)
-            .await?
-            .ok_or_else(shelf_not_found)?;
+        let current_shelf = repo.get_by_id(id).await?.ok_or_else(shelf_not_found)?;
 
         // name: Some("") ⇒ 显式拒；None ⇒ 不修改
         let name_update: Option<&str> = match req.name.as_deref() {
@@ -288,10 +282,7 @@ impl ShelfService {
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
 
-        let shelf = repo
-            .get_by_id(id)
-            .await?
-            .ok_or_else(shelf_not_found)?;
+        let shelf = repo.get_by_id(id).await?.ok_or_else(shelf_not_found)?;
 
         let in_use = repo.count_in_use_parts(id).await?;
         if in_use > 0 {

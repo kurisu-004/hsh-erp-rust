@@ -151,9 +151,7 @@ impl ProcessService {
         let items = repo
             .list_with_filters(code_like, category, limit, offset)
             .await?;
-        let total = repo
-            .count_with_filters(code_like, category)
-            .await?;
+        let total = repo.count_with_filters(code_like, category).await?;
 
         Ok(ProcessListOut {
             items: items.into_iter().map(to_process_out).collect(),

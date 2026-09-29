@@ -191,8 +191,12 @@ impl PartService {
                 .fetch_optional(repo.conn_mut())
                 .await?;
                 let step_id_opt: Option<i64> = if let Some(chain_id) = chain_id_opt {
-                    ProcessChainRepo::resolve_step_id_by_process(repo.conn_mut(), chain_id, next_pid)
-                        .await?
+                    ProcessChainRepo::resolve_step_id_by_process(
+                        repo.conn_mut(),
+                        chain_id,
+                        next_pid,
+                    )
+                    .await?
                 } else {
                     // chain 已删：保留 batch 旧的 current_process_step_id（fallback
                     // 到入参快照，避免 chain 被软删时 RETURNED 把 step 上下文置 NULL）
@@ -277,14 +281,11 @@ impl PartService {
                 }
                 // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
                 // 变化时级联调 AssemblyService::sync_from_part_change 闭合链路。
-                synced_assembly_id = match PartService::sync_from_batch_change(
-                    &mut repo, part.id, current,
-                )
-                .await?
-                {
-                    SyncOutcome::Changed(aid) => Some(aid),
-                    SyncOutcome::NoChange => None,
-                };
+                synced_assembly_id =
+                    match PartService::sync_from_batch_change(&mut repo, part.id, current).await? {
+                        SyncOutcome::Changed(aid) => Some(aid),
+                        SyncOutcome::NoChange => None,
+                    };
                 repo.insert_part_event(NewPartEvent {
                     id: snowflake.next_id(),
                     part_id: part.id,

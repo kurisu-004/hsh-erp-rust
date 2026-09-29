@@ -226,7 +226,11 @@ impl HttpWeComClient {
         redis: deadpool_redis::Pool,
         config: Arc<WeComConfig>,
     ) -> Self {
-        Self { http, redis, config }
+        Self {
+            http,
+            redis,
+            config,
+        }
     }
 
     /// 构造一个按 `config.http_timeout_ms` 配好超时的 `reqwest::Client`。
@@ -258,9 +262,7 @@ impl HttpWeComClient {
     /// `tokio::sync::Mutex`（或 single-flight future 池）串行化「未命中 → 换 → 写」
     /// 这段临界区；多实例部署时进程内锁不够，还需配合 Redis 侧 `SET NX` 分布式锁。
     async fn get_token(&self, force_refresh: bool) -> Result<String, AppError> {
-        if !force_refresh
-            && let Some(tok) = self.read_token_cache().await?
-        {
+        if !force_refresh && let Some(tok) = self.read_token_cache().await? {
             return Ok(tok);
         }
 
@@ -357,9 +359,8 @@ impl HttpWeComClient {
             }
         };
         use redis::AsyncCommands;
-        let res: redis::RedisResult<Option<String>> = conn
-            .get(Self::token_cache_key(&self.config.corpid))
-            .await;
+        let res: redis::RedisResult<Option<String>> =
+            conn.get(Self::token_cache_key(&self.config.corpid)).await;
         match res {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -399,9 +400,8 @@ impl HttpWeComClient {
             }
         };
         use redis::AsyncCommands;
-        let res: redis::RedisResult<()> = conn
-            .del(Self::token_cache_key(&self.config.corpid))
-            .await;
+        let res: redis::RedisResult<()> =
+            conn.del(Self::token_cache_key(&self.config.corpid)).await;
         if let Err(e) = res {
             tracing::warn!(error = %e, "企业微信 access_token 缓存：DEL 失败");
         }
@@ -508,13 +508,15 @@ impl WeComApiClient for HttpWeComClient {
                 tracing::info!("企业微信 access_token 疑似失效，删除缓存后重取 1 次");
                 self.invalidate_token_cache().await;
                 let token2 = self.get_token(true).await?;
-                self.call_code2session(&token2, code).await.map_err(|e| match e {
-                    Code2SessionError::TokenInvalid => AppError::biz(
-                        code::BIZ_WX_LOGIN_FAILED,
-                        "企业微信登录失败：access_token 失效，重取后仍失败",
-                    ),
-                    Code2SessionError::Fatal(e) => e,
-                })
+                self.call_code2session(&token2, code)
+                    .await
+                    .map_err(|e| match e {
+                        Code2SessionError::TokenInvalid => AppError::biz(
+                            code::BIZ_WX_LOGIN_FAILED,
+                            "企业微信登录失败：access_token 失效，重取后仍失败",
+                        ),
+                        Code2SessionError::Fatal(e) => e,
+                    })
             }
         }
     }
@@ -544,7 +546,9 @@ impl Default for NoopWeComClient {
 #[async_trait]
 impl WeComApiClient for NoopWeComClient {
     async fn code_to_session(&self, _code: &str) -> Result<WeComSession, AppError> {
-        tracing::warn!("[NoopWeComClient] 企业微信登录未配置（WECOM_CORPID / WECOM_CORPSECRET 留空）");
+        tracing::warn!(
+            "[NoopWeComClient] 企业微信登录未配置（WECOM_CORPID / WECOM_CORPSECRET 留空）"
+        );
         Err(AppError::biz(
             code::BIZ_WX_NOT_CONFIGURED,
             "企业微信登录未配置，请联系管理员设置 WECOM_CORPID / WECOM_CORPSECRET",
@@ -564,7 +568,11 @@ pub fn build_wecom_client(
 ) -> anyhow::Result<Arc<dyn WeComApiClient>> {
     if cfg.enabled && !cfg.corpid.trim().is_empty() {
         let http = HttpWeComClient::build_http_client(cfg)?;
-        Ok(Arc::new(HttpWeComClient::new(http, redis, Arc::new(cfg.clone()))))
+        Ok(Arc::new(HttpWeComClient::new(
+            http,
+            redis,
+            Arc::new(cfg.clone()),
+        )))
     } else {
         Ok(Arc::new(NoopWeComClient))
     }
@@ -580,8 +588,8 @@ mod tests {
     use axum::Router;
     use axum::routing::get;
     use deadpool_redis::redis::AsyncCommands;
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// 测试用企业 ID（与 `client_for_opts` 里 `WeComConfig.corpid` 一致）。
     const CORP_ID: &str = "C1";
@@ -884,7 +892,9 @@ mod tests {
     async fn code_to_session_42001_retries_exactly_once() {
         let srv = MockWeComServer::start().await;
         // 第一次 jscode2session 报 42001（token 过期），后续返回成功
-        srv.set_code2session(serde_json::json!({"errcode": 42001, "errmsg": "access_token expired"}));
+        srv.set_code2session(
+            serde_json::json!({"errcode": 42001, "errmsg": "access_token expired"}),
+        );
         let (client, _cfg) = client_for(&srv.base_url);
         // Redis 不可用（端口 1）→ 缓存读写全降级 warn，重取路径仍可跑
         let res = client.code_to_session("code-1").await;
@@ -1046,7 +1056,9 @@ mod tests {
             .expect("第 3 次应成功");
         assert_eq!(srv.gettoken_calls(), 2, "缓存被删后应重新换取 token");
 
-        eprintln!("[已执行] Y2 access_token 缓存测试：read / write / invalidate 三条路径断言全部通过");
+        eprintln!(
+            "[已执行] Y2 access_token 缓存测试：read / write / invalidate 三条路径断言全部通过"
+        );
     }
 
     /// `token_cache_key` 的字面量契约：格式错会让不同 corpid 串号 / 缓存永不命中。
@@ -1063,9 +1075,6 @@ mod tests {
         let noop = NoopWeComClient;
         let e = noop.code_to_session("x").await.expect_err("应失败");
         assert_eq!(e.code(), code::BIZ_WX_NOT_CONFIGURED);
-        assert_eq!(
-            e.http_status(),
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(e.http_status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }

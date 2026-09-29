@@ -32,11 +32,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{id}/update", post(account::update_user))
         .route("/{id}/reset-password", post(account::admin_reset_password))
         .route("/{id}/deactivate", post(account::deactivate_user))
-        .route("/{id}/roles", get(account::list_user_roles).post(account::add_role))
         .route(
-            "/{id}/roles/{role_id}/remove",
-            post(account::remove_role),
+            "/{id}/roles",
+            get(account::list_user_roles).post(account::add_role),
         )
+        .route("/{id}/roles/{role_id}/remove", post(account::remove_role))
         // 2026-09-29 新增：企业微信身份预绑定（GET/POST/DELETE 同一路径）
         // 注意 axum 0.8 的 `MethodRouter` 组合顺序：先 get 再 post 再 delete。
         .route(
@@ -45,7 +45,5 @@ pub fn router() -> Router<Arc<AppState>> {
                 .post(account::bind_wx_identity)
                 .delete(account::unbind_wx_identity),
         );
-    Router::new()
-        .merge(session)
-        .nest("/users", users)
+    Router::new().merge(session).nest("/users", users)
 }

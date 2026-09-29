@@ -596,12 +596,11 @@ async fn add_parts_partial_quantity_splits_batch() {
     assert_eq!(row["quantity"], 4, "新批次应只剩 quantity=4");
 
     // 原批次 quantity 减到 6、未挂单
-    let original_qty: i32 =
-        sqlx::query_scalar("SELECT quantity FROM t_part_batch WHERE id = $1")
-            .bind(batch_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let original_qty: i32 = sqlx::query_scalar("SELECT quantity FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(original_qty, 6, "源批次 quantity 减 4 → 6");
 }
 
@@ -831,7 +830,13 @@ async fn submit_and_recall_draft_scope_conflict_returns_409_21419() {
 
     // 现在软删 note B，再 recall 应成功
     sqlx::query("UPDATE t_part_batch SET delivery_note_id = NULL WHERE delivery_note_id = $1")
-        .bind(b_env["data"]["id"].as_str().unwrap().parse::<i64>().unwrap())
+        .bind(
+            b_env["data"]["id"]
+                .as_str()
+                .unwrap()
+                .parse::<i64>()
+                .unwrap(),
+        )
         .execute(&pool)
         .await
         .unwrap();

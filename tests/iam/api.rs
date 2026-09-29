@@ -34,8 +34,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    IamFixture, json_request, load_iam_fixture, login_token,
-    send as ts_send, test_app, test_pool, test_state,
+    IamFixture, json_request, load_iam_fixture, login_token, send as ts_send, test_app, test_pool,
+    test_state,
 };
 
 // ===========================================================================
@@ -93,8 +93,7 @@ async fn fresh_app(pool: &PgPool) -> axum::Router {
 async fn login_success_returns_token_pair_and_stamps_last_login() {
     let (pool, app, fx) = bootstrap().await;
 
-    let (_, env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     assert_eq!(env["code"], 0, "envelope.code = 0; full = {env}");
 
     let data = &env["data"];
@@ -131,8 +130,7 @@ async fn login_unknown_user_returns_40101() {
 async fn login_wrong_password_returns_40101() {
     let (_pool, app, fx) = bootstrap().await;
 
-    let (status, env) =
-        login_admin(app, &fx.manager_username, "wrong").await;
+    let (status, env) = login_admin(app, &fx.manager_username, "wrong").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(env["code"], 40101);
 }
@@ -141,8 +139,7 @@ async fn login_wrong_password_returns_40101() {
 async fn login_inactive_user_returns_40101() {
     let (_pool, app, fx) = bootstrap().await;
 
-    let (status, env) =
-        login_admin(app, &fx.inactive_username, IamFixture::PASSWORD).await;
+    let (status, env) = login_admin(app, &fx.inactive_username, IamFixture::PASSWORD).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(env["code"], 40101);
 }
@@ -151,8 +148,7 @@ async fn login_inactive_user_returns_40101() {
 async fn login_user_with_no_roles_returns_403_20606() {
     let (_pool, app, fx) = bootstrap().await;
 
-    let (status, env) =
-        login_admin(app, &fx.lonely_username, IamFixture::PASSWORD).await;
+    let (status, env) = login_admin(app, &fx.lonely_username, IamFixture::PASSWORD).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(env["code"], 20606);
 }
@@ -164,8 +160,7 @@ async fn login_user_with_no_roles_returns_403_20606() {
 #[tokio::test]
 async fn me_success_returns_full_user_view() {
     let (pool, app, fx) = bootstrap().await;
-    let (_, login_env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let token = login_env["data"]["token"].as_str().unwrap().to_string();
 
     let app2 = fresh_app(&pool).await;
@@ -197,8 +192,7 @@ async fn me_without_authorization_returns_401() {
 async fn refresh_rotates_token_and_bumps_version() {
     let (pool, app, fx) = bootstrap().await;
 
-    let (_, login_env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let refresh_token = login_env["data"]["refresh_token"]
         .as_str()
         .unwrap()
@@ -250,8 +244,7 @@ async fn refresh_reusing_old_token_returns_40105() {
     // 详见 `refresh_reuse_detection_triggers_force_logout_and_40105` 端到端覆盖。
     let (pool, app, fx) = bootstrap().await;
 
-    let (_, login_env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let old_refresh = login_env["data"]["refresh_token"]
         .as_str()
         .unwrap()
@@ -307,8 +300,7 @@ async fn refresh_reuse_detection_triggers_force_logout_and_40105() {
     let (pool, app, fx) = bootstrap().await;
 
     // 1) login → J1 (old_refresh)
-    let (_, login_env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let j1 = login_env["data"]["refresh_token"]
         .as_str()
         .unwrap()
@@ -318,7 +310,12 @@ async fn refresh_reuse_detection_triggers_force_logout_and_40105() {
     let app2 = fresh_app(&pool).await;
     let (s1, refresh_env) = send(
         app2,
-        json_request("POST", "/iam/refresh", Some(json!({"refresh_token": j1.clone()})), None),
+        json_request(
+            "POST",
+            "/iam/refresh",
+            Some(json!({"refresh_token": j1.clone()})),
+            None,
+        ),
     )
     .await;
     assert_eq!(s1, StatusCode::OK, "第一次 refresh 应成功: {refresh_env}");
@@ -327,7 +324,10 @@ async fn refresh_reuse_detection_triggers_force_logout_and_40105() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_ne!(j1, j2_refresh, "新 refresh 必须与旧 refresh 不同（rotation 换了 jti）");
+    assert_ne!(
+        j1, j2_refresh,
+        "新 refresh 必须与旧 refresh 不同（rotation 换了 jti）"
+    );
 
     // 3) GET /me 用 J2_access → 200
     let app3 = fresh_app(&pool).await;
@@ -342,7 +342,12 @@ async fn refresh_reuse_detection_triggers_force_logout_and_40105() {
     let app4 = fresh_app(&pool).await;
     let (s3, reuse_env) = send(
         app4,
-        json_request("POST", "/iam/refresh", Some(json!({"refresh_token": j1})), None),
+        json_request(
+            "POST",
+            "/iam/refresh",
+            Some(json!({"refresh_token": j1})),
+            None,
+        ),
     )
     .await;
     assert_eq!(
@@ -357,11 +362,8 @@ async fn refresh_reuse_detection_triggers_force_logout_and_40105() {
 
     // 5) GET /me 用 J2_access → 40105（force_logout 已清空所有 session）
     let app5 = fresh_app(&pool).await;
-    let (s4, me_after_env) = send(
-        app5,
-        json_request("GET", "/iam/me", None, Some(&j2_access)),
-    )
-    .await;
+    let (s4, me_after_env) =
+        send(app5, json_request("GET", "/iam/me", None, Some(&j2_access))).await;
     assert_eq!(
         s4,
         StatusCode::UNAUTHORIZED,
@@ -381,8 +383,7 @@ async fn refresh_reuse_detection_triggers_force_logout_and_40105() {
 async fn change_password_invalidates_old_refresh_token() {
     let (pool, app, fx) = bootstrap().await;
 
-    let (_, login_env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let access_token = login_env["data"]["token"].as_str().unwrap().to_string();
     let old_refresh = login_env["data"]["refresh_token"]
         .as_str()
@@ -423,8 +424,7 @@ async fn change_password_invalidates_old_refresh_token() {
 async fn change_password_wrong_old_password_returns_40104() {
     let (pool, app, fx) = bootstrap().await;
 
-    let (_, login_env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let token = login_env["data"]["token"].as_str().unwrap().to_string();
 
     let app2 = fresh_app(&pool).await;
@@ -449,8 +449,7 @@ async fn change_password_wrong_old_password_returns_40104() {
 #[tokio::test]
 async fn list_users_without_manager_role_returns_403() {
     let (pool, app, fx) = bootstrap().await;
-    let (_, login_env) =
-        login_admin(app, &fx.clerk_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.clerk_username, IamFixture::PASSWORD).await;
     let clerk_token = login_env["data"]["token"].as_str().unwrap().to_string();
 
     let app2 = fresh_app(&pool).await;
@@ -470,8 +469,7 @@ async fn list_users_without_manager_role_returns_403() {
 #[tokio::test]
 async fn add_shelf_account_role_succeeds_for_manager() {
     let (pool, app, fx) = bootstrap().await;
-    let (_, login_env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let admin_token = login_env["data"]["token"].as_str().unwrap().to_string();
 
     let app2 = fresh_app(&pool).await;
@@ -499,8 +497,7 @@ async fn add_shelf_account_role_succeeds_for_manager() {
 #[tokio::test]
 async fn add_duplicate_role_returns_409() {
     let (pool, app, fx) = bootstrap().await;
-    let (_, login_env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let admin_token = login_env["data"]["token"].as_str().unwrap().to_string();
 
     let uri = format!("/iam/users/{}/roles", fx.target_user_id);
@@ -539,8 +536,7 @@ async fn logout_kills_current_session() {
     let (pool, app, fx) = bootstrap().await;
 
     // 1) login → token A
-    let (_, login_env) =
-        login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let (_, login_env) = login_admin(app, &fx.manager_username, IamFixture::PASSWORD).await;
     let token_a = login_env["data"]["token"].as_str().unwrap().to_string();
 
     // 2) /iam/me(A) 200

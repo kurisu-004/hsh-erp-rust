@@ -6,10 +6,10 @@
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::super::dto_crud::{CancelBatchRequest, SplitBatchRequest};
@@ -89,21 +89,19 @@ impl PartService {
             other => AppError::from(other),
         })?;
         // SPLIT 事件
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "SPLIT",
-                from_status: Some(&batch.status),
-                to_status: Some(&batch.status),
-                batch_id: Some(new_id),
-                quantity: Some(qty),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref().or(Some("manual split")),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "SPLIT",
+            from_status: Some(&batch.status),
+            to_status: Some(&batch.status),
+            batch_id: Some(new_id),
+            quantity: Some(qty),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref().or(Some("manual split")),
+            created_by: Some(current.id),
+        })
         .await?;
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         Ok(new_id)
@@ -137,27 +135,31 @@ impl PartService {
                 format!("batch 当前状态 {} 不允许取消", from.as_str()),
             ));
         }
-        let n = mark_batch_status_only(repo.conn_mut(), batch.id, req.version, "CANCELLED", current.id)
-            .await?;
+        let n = mark_batch_status_only(
+            repo.conn_mut(),
+            batch.id,
+            req.version,
+            "CANCELLED",
+            current.id,
+        )
+        .await?;
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "BATCH_CANCELLED",
-                from_status: Some(from.as_str()),
-                to_status: Some("CANCELLED"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.reason.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "BATCH_CANCELLED",
+            from_status: Some(from.as_str()),
+            to_status: Some("CANCELLED"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.reason.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)

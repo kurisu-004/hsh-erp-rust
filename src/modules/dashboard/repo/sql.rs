@@ -269,10 +269,8 @@ impl DashboardRepo {
         let cust_map = Self::fetch_customer_path(&mut *conn, &cust_ids).await?;
 
         // 3) 批取 PICKED_UP 最近时间
-        let worker_batch_ids: Vec<i64> =
-            worker_pairs.iter().map(|(b, _)| b.batch_id).collect();
-        let picked_at_map =
-            Self::fetch_picked_up_at_map(&mut *conn, &worker_batch_ids).await?;
+        let worker_batch_ids: Vec<i64> = worker_pairs.iter().map(|(b, _)| b.batch_id).collect();
+        let picked_at_map = Self::fetch_picked_up_at_map(&mut *conn, &worker_batch_ids).await?;
 
         Ok(RecentBatchesData {
             worker_pairs,

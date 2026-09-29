@@ -40,7 +40,11 @@ pub fn make_session_service(mock_session: MockSessionStore) -> SessionService {
 
 /// 构造一个最小化的 User 行（与 tests/mod.rs sample_user 类似但 password_hash 用真实 bcrypt）。
 #[allow(dead_code)]
-pub fn sample_user_with_hash(id: i64, username: &str, plain_password: &str) -> crate::modules::iam::repo::User {
+pub fn sample_user_with_hash(
+    id: i64,
+    username: &str,
+    plain_password: &str,
+) -> crate::modules::iam::repo::User {
     let hash = password::hash(plain_password).expect("bcrypt hash");
     crate::modules::iam::repo::User {
         id,
@@ -154,7 +158,10 @@ async fn login_wrong_password_returns_invalid() {
     };
 
     // Act
-    let err = svc.login(mock_repo, req).await.expect_err("login 密码错应 Err");
+    let err = svc
+        .login(mock_repo, req)
+        .await
+        .expect_err("login 密码错应 Err");
 
     // Assert
     match err {
@@ -185,7 +192,10 @@ async fn login_inactive_user_returns_invalid() {
     };
 
     // Act
-    let err = svc.login(mock_repo, req).await.expect_err("login 停用应 Err");
+    let err = svc
+        .login(mock_repo, req)
+        .await
+        .expect_err("login 停用应 Err");
 
     // Assert
     match err {
@@ -215,7 +225,10 @@ async fn login_bcrypt_error_returns_internal() {
     };
 
     // Act
-    let err = svc.login(mock_repo, req).await.expect_err("login bcrypt 错误应 Err");
+    let err = svc
+        .login(mock_repo, req)
+        .await
+        .expect_err("login bcrypt 错误应 Err");
 
     // Assert
     match err {
@@ -384,8 +397,8 @@ async fn change_password_forbidden_for_other_user() {
 async fn refresh_happy_returns_pending_with_new_pair() {
     // Arrange — 先 login 拿到一对合法 token，再用 refresh_token 调 refresh
     // 这里简化：直接构造一个合法 refresh token（用 test_jwt_config 同套 RSA 私钥签发）
-    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use crate::auth::jwt::{RefreshTokenClaims, decode_refresh};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
     let now = now_unix();
     let claims = RefreshTokenClaims {
@@ -402,10 +415,8 @@ async fn refresh_happy_returns_pending_with_new_pair() {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some("current".to_string());
     let config = test_jwt_config();
-    let private_key = EncodingKey::from_rsa_pem(
-        get_test_keys().private_pem.as_bytes()
-    )
-    .expect("test private key");
+    let private_key = EncodingKey::from_rsa_pem(get_test_keys().private_pem.as_bytes())
+        .expect("test private key");
     let refresh_token = encode(&header, &claims, &private_key).expect("encode refresh");
     // 触发 decode_refresh 走 RS256 + kid
     let _ = decode_refresh(
@@ -480,7 +491,9 @@ async fn refresh_invalid_token_returns_refresh_invalid() {
     let mock_repo = MockIamRepoTrait::new();
     // refresh 失败在 decode_refresh 阶段，不会调用 mock_repo
     let mut mock_session = MockSessionStore::new();
-    mock_session.expect_is_jti_revoked().returning(|_| Ok(false));
+    mock_session
+        .expect_is_jti_revoked()
+        .returning(|_| Ok(false));
 
     let svc = make_session_service(mock_session);
     let req = crate::modules::iam::dto::RefreshRequest {
@@ -488,7 +501,10 @@ async fn refresh_invalid_token_returns_refresh_invalid() {
     };
 
     // Act
-    let err = svc.refresh(mock_repo, req).await.expect_err("refresh 非法 token 应 Err");
+    let err = svc
+        .refresh(mock_repo, req)
+        .await
+        .expect_err("refresh 非法 token 应 Err");
 
     // Assert
     match err {
@@ -533,15 +549,11 @@ async fn complete_refresh_happy_writes_sessions() {
 
     // Mock session store：delete_session + create_session(access) + create_session(refresh) + revoke_jti
     let mut mock_session = MockSessionStore::new();
-    mock_session
-        .expect_delete_session()
-        .returning(|_| Ok(()));
+    mock_session.expect_delete_session().returning(|_| Ok(()));
     mock_session
         .expect_create_session()
         .returning(|_, _, _, _, _| Ok(()));
-    mock_session
-        .expect_revoke_jti()
-        .returning(|_, _| Ok(true));
+    mock_session.expect_revoke_jti().returning(|_, _| Ok(true));
 
     let svc = make_session_service(mock_session);
 
@@ -586,9 +598,7 @@ async fn complete_refresh_revoke_jti_redis_fail_succeeds_best_effort() {
     };
 
     let mut mock_session = MockSessionStore::new();
-    mock_session
-        .expect_delete_session()
-        .returning(|_| Ok(()));
+    mock_session.expect_delete_session().returning(|_| Ok(()));
     mock_session
         .expect_create_session()
         .returning(|_, _, _, _, _| Ok(()));

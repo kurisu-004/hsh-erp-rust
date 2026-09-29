@@ -18,13 +18,13 @@ use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::com::customer::model::TCustomer;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
-use crate::modules::part::repo::PartRepo;
 use crate::modules::part::batch::repo::PartBatchRepo;
+use crate::modules::part::repo::PartRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::DeliveryNoteAddItem;
-use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
 use super::super::model::{DeliveryNote, DeliveryNoteEvent, NoteScope};
+use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
 
 // ===========================================================================
 //  types
@@ -192,7 +192,9 @@ pub(super) async fn get_with_parts(
     mut conn: &mut PgConnection,
     note_id: i64,
 ) -> Result<DeliveryNoteDetailOut, AppError> {
-    let n = conn.note_get_by_id(note_id, false).await?
+    let n = conn
+        .note_get_by_id(note_id, false)
+        .await?
         .ok_or_else(|| note_not_found(note_id))?;
 
     let rows = PartBatchRepo::list_with_part_by_delivery_note(&mut *conn, note_id).await?;
@@ -312,15 +314,12 @@ pub(super) async fn check_scope(
         NoteScope::L1Wide => Ok(()),
         NoteScope::Group(gid) => {
             // 加载 group + members
-            let grp = conn
-                .group_get_by_id(gid, false)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_DELIVERY_GROUP_NOT_FOUND,
-                        format!("delivery group {gid} not found"),
-                    )
-                })?;
+            let grp = conn.group_get_by_id(gid, false).await?.ok_or_else(|| {
+                AppError::biz(
+                    code::BIZ_DELIVERY_GROUP_NOT_FOUND,
+                    format!("delivery group {gid} not found"),
+                )
+            })?;
             // 必须仍是同一 L1 客户
             if grp.customer_id != obj.customer_id {
                 return Err(AppError::biz(
@@ -328,9 +327,7 @@ pub(super) async fn check_scope(
                     "group 与本单 L1 不匹配",
                 ));
             }
-            let members = conn
-                .group_list_members_by_group_ids(&[gid], false)
-                .await?;
+            let members = conn.group_list_members_by_group_ids(&[gid], false).await?;
             if !members.iter().any(|m| m.customer_id == part_customer_id) {
                 return Err(AppError::biz(
                     code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH,
@@ -370,7 +367,9 @@ pub(super) async fn add_parts_inner(
     version: i32,
     current: &CurrentUser,
 ) -> Result<(), AppError> {
-    let obj = conn.note_get_by_id(note_id, false).await?
+    let obj = conn
+        .note_get_by_id(note_id, false)
+        .await?
         .ok_or_else(|| note_not_found(note_id))?;
     if obj.version != version {
         return Err(note_version_conflict(note_id, obj.version, version));

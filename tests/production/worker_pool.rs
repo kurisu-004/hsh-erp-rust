@@ -52,7 +52,7 @@ use sqlx::PgPool;
 
 use hsh_erp_test_support::{
     ProductionFixture, json_request, load_production_fixture, login_token, pool_snowflake, send,
-    test_app, test_state, test_pool,
+    test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -68,9 +68,7 @@ async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password
     use hsh_erp_rust::infra::clock::now_naive;
 
     let hash = password::hash(plain_password).expect("bcrypt hash");
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -99,9 +97,7 @@ async fn add_role(
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -125,9 +121,7 @@ async fn add_role(
 async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -149,9 +143,7 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -172,9 +164,7 @@ async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
 async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -195,9 +185,7 @@ async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
 async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -263,10 +251,7 @@ async fn login_shelf_account(
 /// worker_pool 独享：每个测试常需要多次以不同 username 登入触发不同 OCC / 审计
 /// 场景（如 admin3 → admin3b 模拟并发 OCC）。`bootstrap_as_manager` 的 token
 /// 是 fx_part_manager 单 token，不支持多身份切换；保留为本地 helper。
-async fn login_manager_with_username(
-    pool: &PgPool,
-    username: &str,
-) -> (axum::Router, String) {
+async fn login_manager_with_username(pool: &PgPool, username: &str) -> (axum::Router, String) {
     let uid = insert_user_with_password(pool, username, "changeme").await;
     add_role(pool, uid, "MANAGER", None, None).await;
     let state = test_state(pool.clone()).await;
@@ -289,9 +274,7 @@ async fn login_manager_with_username(
 
 async fn insert_work_type(pool: &PgPool, code: &str, name: &str, max_held: Option<i32>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -317,9 +300,7 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -348,9 +329,7 @@ async fn insert_customer_l2(pool: &PgPool, name: &str) -> i64 {
     // 为 fixture L1），改 query! 会触发 sqlx::prepare 重新生成 .sqlx cache（会清掉同
     // worktree 其它测试文件仍在用的离线 metadata）。
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let l2_id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -496,9 +475,7 @@ async fn insert_worker_held_part(
     quantity: i32,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let now = now_naive();
     let today = now.date();
     let part_id = snowflake.next_id();
@@ -1259,9 +1236,7 @@ async fn worker_no_work_type_returns_error() {
 /// 仍在用的 cache，对其它 worktree 也有干扰）。
 async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -1691,9 +1666,7 @@ async fn admin_assign_batch_not_in_pool() {
 async fn seed_g_code_for_part(pool: &PgPool, part_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     let object_key = format!("uploads/part/{part_id}/G_CODE/test_{id}.nc");
@@ -1733,10 +1706,8 @@ async fn take_one_from_pool_prefers_programmed_batch() {
 
     let worker = insert_worker(&pool, "BC-CNC-PREF", "工CNC-优先级", Some(wt)).await;
     // 两个 part A/B 同交期 / 同加急 / 同货架（同 process_id），但 A 有 G_CODE，B 无
-    let (_part_a, _batch_a) =
-        insert_pool_part(&pool, customer, "A-CNC", prod_shelf, proc, 1).await;
-    let (_part_b, _batch_b) =
-        insert_pool_part(&pool, customer, "B-CNC", prod_shelf, proc, 1).await;
+    let (_part_a, _batch_a) = insert_pool_part(&pool, customer, "A-CNC", prod_shelf, proc, 1).await;
+    let (_part_b, _batch_b) = insert_pool_part(&pool, customer, "B-CNC", prod_shelf, proc, 1).await;
     // 给 A 插 G_CODE
     let part_a_id: i64 = sqlx::query_scalar("SELECT id FROM t_part WHERE serial_no = 'A-CNC'")
         .fetch_one(&pool)
@@ -1767,13 +1738,11 @@ async fn take_one_from_pool_prefers_programmed_batch() {
         .expect("part_id is string")
         .parse()
         .expect("parse i64");
-    let taken_serial: String = sqlx::query_scalar(
-        "SELECT serial_no FROM t_part WHERE id = $1",
-    )
-    .bind(taken_part_id)
-    .fetch_one(&pool)
-    .await
-    .expect("lookup serial");
+    let taken_serial: String = sqlx::query_scalar("SELECT serial_no FROM t_part WHERE id = $1")
+        .bind(taken_part_id)
+        .fetch_one(&pool)
+        .await
+        .expect("lookup serial");
     assert_eq!(
         taken_serial, "A-CNC",
         "应优先 take 已上传 G_CODE 的 part (A-CNC): {env}"
@@ -1808,24 +1777,18 @@ async fn list_candidates_includes_has_cnc_program() {
 
     let (app, token) = login_manager_with_username(&pool, "admin_cnc_list").await;
     let uri = format!("/prod/worker-pool/{proc}");
-    let (s, env) = send(
-        app,
-        json_request("GET", &uri, None::<Value>, Some(&token)),
-    )
-    .await;
+    let (s, env) = send(app, json_request("GET", &uri, None::<Value>, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "pool_by_process: {env}");
     let items = env["data"]["items"].as_array().expect("items array");
     assert_eq!(items.len(), 2, "应 2 个候选: {env}");
     let mut found_a = false;
     let mut found_b = false;
     for it in items {
-        let serial = sqlx::query_scalar::<_, String>(
-            "SELECT serial_no FROM t_part WHERE id = $1",
-        )
-        .bind(it["part_id"].as_str().unwrap().parse::<i64>().unwrap())
-        .fetch_one(&pool)
-        .await
-        .expect("lookup serial");
+        let serial = sqlx::query_scalar::<_, String>("SELECT serial_no FROM t_part WHERE id = $1")
+            .bind(it["part_id"].as_str().unwrap().parse::<i64>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("lookup serial");
         match serial.as_str() {
             "A-LIST" => {
                 found_a = true;
@@ -1878,27 +1841,21 @@ async fn held_batch_includes_has_cnc_program() {
 
     // 调 state 端点：worker 当前持有 2 个 batch（无需 manager role，登录任意 user 即可）
     let (app, token) = login_manager_with_username(&pool, "admin_cnc_held").await;
-    let uri = format!(
-        "/prod/worker-pool/state?worker_id={worker}&shelf_id={prod_shelf}"
-    );
-    let (s, env) = send(
-        app,
-        json_request("GET", &uri, None::<Value>, Some(&token)),
-    )
-    .await;
+    let uri = format!("/prod/worker-pool/state?worker_id={worker}&shelf_id={prod_shelf}");
+    let (s, env) = send(app, json_request("GET", &uri, None::<Value>, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "state: {env}");
-    let held = env["data"]["held_batches"].as_array().expect("held_batches array");
+    let held = env["data"]["held_batches"]
+        .as_array()
+        .expect("held_batches array");
     assert_eq!(held.len(), 2, "应 2 个 held batch: {env}");
     let mut found_a = false;
     let mut found_b = false;
     for it in held {
-        let serial = sqlx::query_scalar::<_, String>(
-            "SELECT serial_no FROM t_part WHERE id = $1",
-        )
-        .bind(it["part_id"].as_str().unwrap().parse::<i64>().unwrap())
-        .fetch_one(&pool)
-        .await
-        .expect("lookup serial");
+        let serial = sqlx::query_scalar::<_, String>("SELECT serial_no FROM t_part WHERE id = $1")
+            .bind(it["part_id"].as_str().unwrap().parse::<i64>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("lookup serial");
         match serial.as_str() {
             "H-CNC-A" => {
                 found_a = true;

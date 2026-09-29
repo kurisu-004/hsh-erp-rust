@@ -14,10 +14,10 @@ use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::shared::error::{AppError, code};
 
+use super::super::model::{DeliveryGroup, DeliveryGroupMember};
 use super::super::vo::{
     DeliveryGroupListOut, DeliveryGroupMemberOut, DeliveryGroupOut, UngroupedCustomerOut,
 };
-use super::super::model::{DeliveryGroup, DeliveryGroupMember};
 use super::inner::{
     group_not_found, l1_children_lookup, validate_group_name, validate_l2_members, version_conflict,
 };
@@ -220,13 +220,7 @@ impl DeliveryGroupService {
 
         if name_changed {
             let affected = repo
-                .group_update(
-                    group_id,
-                    group.version,
-                    &next_name,
-                    now,
-                    Some(current.id),
-                )
+                .group_update(group_id, group.version, &next_name, now, Some(current.id))
                 .await?;
             if affected == 0 {
                 return Err(AppError::biz(
@@ -237,7 +231,8 @@ impl DeliveryGroupService {
         }
 
         if replace_members {
-            repo.group_soft_delete_members_by_group(group_id, now).await?;
+            repo.group_soft_delete_members_by_group(group_id, now)
+                .await?;
             for cid in &new_member_ids {
                 let m = DeliveryGroupMember {
                     id: self.snowflake.next_id(),
@@ -299,7 +294,8 @@ impl DeliveryGroupService {
                 "concurrent modification detected",
             ));
         }
-        repo.group_soft_delete_members_by_group(group_id, now).await?;
+        repo.group_soft_delete_members_by_group(group_id, now)
+            .await?;
         Ok(())
     }
 

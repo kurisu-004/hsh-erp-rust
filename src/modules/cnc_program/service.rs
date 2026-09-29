@@ -182,7 +182,8 @@ impl CncProgramService {
                 )
                 .await?;
                 // 互写 paired_file_id（走 trait helper）
-                repo.set_paired_file_id(g_id_new, s_id_new, current.id).await?;
+                repo.set_paired_file_id(g_id_new, s_id_new, current.id)
+                    .await?;
                 (g_id_new, s_id_new)
             }
         };

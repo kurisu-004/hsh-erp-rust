@@ -24,8 +24,8 @@
 
 use std::collections::HashMap;
 
-use crate::modules::dashboard::vo::{DashboardItem, DashboardSnapshot, OnProductionShelfGroup};
 use crate::modules::dashboard::repo::{BatchLite, DashboardRepoTrait, PartLite};
+use crate::modules::dashboard::vo::{DashboardItem, DashboardSnapshot, OnProductionShelfGroup};
 use crate::shared::analytics::shelf_grouping::group_by_shelf;
 
 /// 快照 top_n 默认值（远高于合理在持量，仅作防爆兜底）

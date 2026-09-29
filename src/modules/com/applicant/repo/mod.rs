@@ -111,15 +111,9 @@ pub trait ApplicantRepoTrait: Send {
     // ── t_customer 跨域 helper（2）──
     /// 单值读 `t_customer.name`（仅未软删）。用于 applicant `get` / `create` /
     /// `update` 后回填单条 `customer_name`（区别于批量 `CustomerRepo::lookup_names`）。
-    async fn customer_name(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<Option<String>, sqlx::Error>;
+    async fn customer_name(&mut self, customer_id: i64) -> Result<Option<String>, sqlx::Error>;
     /// 校验 `customer_id` 是否指向 L1 客户（`parent_id IS NULL`）。`true` ⇒ 是 L1。
-    async fn l1_customer_exists(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<bool, sqlx::Error>;
+    async fn l1_customer_exists(&mut self, customer_id: i64) -> Result<bool, sqlx::Error>;
 
     // ── t_part 跨域校验（1）──
     /// 软删前「被 part 引用」校验：返回未软删 part 数。
@@ -206,17 +200,11 @@ impl ApplicantRepoTrait for &mut PgConnection {
     }
 
     // ── t_customer 跨域 helper（2）── 一行委托 sql::ApplicantRepo ──
-    async fn customer_name(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<Option<String>, sqlx::Error> {
+    async fn customer_name(&mut self, customer_id: i64) -> Result<Option<String>, sqlx::Error> {
         ApplicantRepo::customer_name(&mut **self, customer_id).await
     }
 
-    async fn l1_customer_exists(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<bool, sqlx::Error> {
+    async fn l1_customer_exists(&mut self, customer_id: i64) -> Result<bool, sqlx::Error> {
         ApplicantRepo::l1_customer_exists(&mut **self, customer_id).await
     }
 

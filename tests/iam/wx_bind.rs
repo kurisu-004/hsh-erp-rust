@@ -18,8 +18,8 @@ use sqlx::PgPool;
 
 use hsh_erp_rust::modules::wx::wecom_client::NoopWeComClient;
 use hsh_erp_test_support::{
-    IamFixture, WecomFixture, json_request, load_iam_fixture, load_wecom_fixture,
-    login_token, send, test_app, test_pool,
+    IamFixture, WecomFixture, json_request, load_iam_fixture, load_wecom_fixture, login_token,
+    send, test_app, test_pool,
 };
 
 /// 基础 bootstrap：fresh DB + iam/wecom fixture + state + app + MANAGER token

@@ -145,15 +145,12 @@ impl ProcessChainService {
         // 2. 加载 part（FK 翻转后 part 是归属关系的载体，必须先校验存在性）
         //    2026-09-22 D-1 重构：跨域调用 PartRepo::get_by_id 封装为 trait helper
         //    `part_get_by_id`，service 不再直接借 `&mut PgConnection`。
-        let part = repo
-            .part_get_by_id(part_id, false)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_NOT_FOUND,
-                    format!("part {part_id} 不存在或已删除"),
-                )
-            })?;
+        let part = repo.part_get_by_id(part_id, false).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_NOT_FOUND,
+                format!("part {part_id} 不存在或已删除"),
+            )
+        })?;
 
         // 3. PENDING 守卫（2026-09-16 新增）：零件一旦下发（离开 PENDING），
         //    工艺链冻结，禁止制定 / 修改。
@@ -190,13 +187,7 @@ impl ProcessChainService {
                 }
             };
             let affected = repo
-                .bump_chain_version(
-                    c.id,
-                    c.version,
-                    new_name,
-                    note_update,
-                    current.id,
-                )
+                .bump_chain_version(c.id, c.version, new_name, note_update, current.id)
                 .await?;
             if affected == 0 {
                 return Err(AppError::biz(
@@ -213,8 +204,10 @@ impl ProcessChainService {
             } else {
                 req.name.trim()
             };
-            repo.insert_chain(id, name, req.note.as_deref(), current.id).await?;
-            let linked = repo.link_chain_to_part(part_id, id, current.id)
+            repo.insert_chain(id, name, req.note.as_deref(), current.id)
+                .await?;
+            let linked = repo
+                .link_chain_to_part(part_id, id, current.id)
                 .await
                 .map_err(
                     |e| match e.as_database_error().and_then(|d| d.code()).as_deref() {
@@ -240,24 +233,16 @@ impl ProcessChainService {
         repo.soft_delete_all_steps_for_chain(chain_id).await?;
 
         // 7. INSERT 新 steps
-        repo.bulk_insert_steps(
-            chain_id,
-            &parsed_steps,
-            &self.snowflake,
-            current.id,
-        )
-        .await?;
+        repo.bulk_insert_steps(chain_id, &parsed_steps, &self.snowflake, current.id)
+            .await?;
 
         // 8. 回读 header（version 已 +1）+ steps
-        let refreshed = repo
-            .get_chain_by_part(part_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PROCESS_CHAIN_NOT_FOUND,
-                    "工艺链 upsert 后回读失败",
-                )
-            })?;
+        let refreshed = repo.get_chain_by_part(part_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PROCESS_CHAIN_NOT_FOUND,
+                "工艺链 upsert 后回读失败",
+            )
+        })?;
         let steps = repo.list_steps_by_chain(chain_id).await?;
         Ok(chain_to_out(refreshed, steps))
     }

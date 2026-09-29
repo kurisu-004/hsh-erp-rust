@@ -19,8 +19,9 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
-use hsh_erp_test_support::{json_request, load_part_fixture, login_token, send, test_app,
-    test_pool, test_state};
+use hsh_erp_test_support::{
+    json_request, load_part_fixture, login_token, send, test_app, test_pool, test_state,
+};
 
 // ===========================================================================
 //  动态 fixture helpers（PR-C.Final retry 第 3 轮，2026-09-24）
@@ -33,9 +34,7 @@ async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_test_support::pool_snowflake;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -295,7 +294,10 @@ async fn list_filters_by_locations_param() {
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={}&locations=PRODUCTION_SHELF,WORKER&limit=10", fx.customer_l2_id),
+            &format!(
+                "/parts?customer_id={}&locations=PRODUCTION_SHELF,WORKER&limit=10",
+                fx.customer_l2_id
+            ),
             None::<Value>,
             Some(&token),
         ),
@@ -389,7 +391,10 @@ async fn list_filters_by_holder_ids_param_polymorphic() {
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={}&holder_ids={},{}&limit=10", fx.customer_l2_id, shelf_a, worker_id),
+            &format!(
+                "/parts?customer_id={}&holder_ids={},{}&limit=10",
+                fx.customer_l2_id, shelf_a, worker_id
+            ),
             None::<Value>,
             Some(&token),
         ),
@@ -471,7 +476,10 @@ async fn list_holder_ids_invalid_format_returns_40001() {
         app,
         json_request(
             "GET",
-            &format!("/parts?customer_id={}&holder_ids=not_a_number", fx.customer_l2_id),
+            &format!(
+                "/parts?customer_id={}&holder_ids=not_a_number",
+                fx.customer_l2_id
+            ),
             None::<Value>,
             Some(&token),
         ),

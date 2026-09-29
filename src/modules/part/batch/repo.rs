@@ -1345,10 +1345,8 @@ pub trait PartBatchRepoTrait: Send {
         id: i64,
         include_deleted: bool,
     ) -> Result<Option<TPartBatch>, sqlx::Error>;
-    async fn list_by_delivery_note(
-        &mut self,
-        note_id: i64,
-    ) -> Result<Vec<TPartBatch>, sqlx::Error>;
+    async fn list_by_delivery_note(&mut self, note_id: i64)
+    -> Result<Vec<TPartBatch>, sqlx::Error>;
     async fn list_with_part_by_delivery_note(
         &mut self,
         note_id: i64,
@@ -1404,14 +1402,9 @@ pub trait PartBatchRepoTrait: Send {
         note_id: i64,
         limit: i64,
     ) -> Result<Vec<RecentBatchRow>, sqlx::Error>;
-    async fn count_held_by_worker(
-        &mut self,
-        worker_id: i64,
-    ) -> Result<i64, sqlx::Error>;
-    async fn list_held_by_worker(
-        &mut self,
-        worker_id: i64,
-    ) -> Result<Vec<TPartBatch>, sqlx::Error>;
+    async fn count_held_by_worker(&mut self, worker_id: i64) -> Result<i64, sqlx::Error>;
+    async fn list_held_by_worker(&mut self, worker_id: i64)
+    -> Result<Vec<TPartBatch>, sqlx::Error>;
     async fn find_delivered_older_than(
         &mut self,
         threshold: NaiveDateTime,
@@ -1558,8 +1551,13 @@ impl PartBatchRepoTrait for &mut PgConnection {
         customer_ids: &'c [i64],
         limit: i64,
     ) -> Result<Vec<(TPartBatch, crate::modules::part::model::TPart)>, sqlx::Error> {
-        PartBatchRepo::list_batches_with_part_in_customers(&mut **self, statuses, customer_ids, limit)
-            .await
+        PartBatchRepo::list_batches_with_part_in_customers(
+            &mut **self,
+            statuses,
+            customer_ids,
+            limit,
+        )
+        .await
     }
 
     async fn list_recent_by_note(
@@ -1570,10 +1568,7 @@ impl PartBatchRepoTrait for &mut PgConnection {
         PartBatchRepo::list_recent_by_note(&mut **self, note_id, limit).await
     }
 
-    async fn count_held_by_worker(
-        &mut self,
-        worker_id: i64,
-    ) -> Result<i64, sqlx::Error> {
+    async fn count_held_by_worker(&mut self, worker_id: i64) -> Result<i64, sqlx::Error> {
         PartBatchRepo::count_held_by_worker(&mut **self, worker_id).await
     }
 

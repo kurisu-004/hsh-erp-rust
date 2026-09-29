@@ -16,5 +16,9 @@ pub mod pickup_skip;
 pub mod worker;
 
 pub use overview::{DayCount, DeliveryPerformance, OverviewOut, StatusCount};
-pub use pickup_skip::{PickupSkipDetailItem, PickupSkipDetailOut, PickupSkipSummaryItem, PickupSkipSummaryOut};
-pub use worker::{WorkerBrief, WorkerDetailOut, WorkerPartItem, WorkerStatsItem, WorkerStatsListOut};
+pub use pickup_skip::{
+    PickupSkipDetailItem, PickupSkipDetailOut, PickupSkipSummaryItem, PickupSkipSummaryOut,
+};
+pub use worker::{
+    WorkerBrief, WorkerDetailOut, WorkerPartItem, WorkerStatsItem, WorkerStatsListOut,
+};

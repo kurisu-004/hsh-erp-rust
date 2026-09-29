@@ -12,6 +12,6 @@
 pub mod worker_pool;
 
 pub use worker_pool::{
-    AssignResult, AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkerBrief,
-    WorkerFillItem, WorkTypeMaxHeld,
+    AssignResult, AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkTypeMaxHeld,
+    WorkerBrief, WorkerFillItem,
 };

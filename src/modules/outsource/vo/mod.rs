@@ -14,7 +14,10 @@ pub mod company;
 pub mod quote;
 pub mod shipment;
 
-pub use company::{OutsourceCompanyListOut, OutsourceCompanyOut, OutsourceCompanyProcessLinkOut, OutsourceCompanyWithProcessesOut};
+pub use company::{
+    OutsourceCompanyListOut, OutsourceCompanyOut, OutsourceCompanyProcessLinkOut,
+    OutsourceCompanyWithProcessesOut,
+};
 pub use quote::{OutsourceQuoteListOut, OutsourceQuoteOut};
 pub use shipment::{
     ApprovedForSendItem, ApprovedForSendListOut, OutsourceInFlightItem, OutsourceInFlightListOut,

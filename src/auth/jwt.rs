@@ -66,7 +66,9 @@
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -212,9 +214,10 @@ pub fn decode_access(
     match header.alg {
         Algorithm::RS256 => {
             // 2026-09-23 重构：按 header.kid 在公钥字典里查；缺失 → 40100
-            let kid = header.kid.as_deref().ok_or_else(|| {
-                AppError::biz(code::UNAUTHORIZED, "jwt: missing kid for RS256")
-            })?;
+            let kid = header
+                .kid
+                .as_deref()
+                .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "jwt: missing kid for RS256"))?;
             let decoding_key = public_keys.get(kid).ok_or_else(|| {
                 AppError::biz(code::UNAUTHORIZED, format!("jwt: unknown kid={kid}"))
             })?;
@@ -253,18 +256,14 @@ pub fn decode_access(
             v.set_audience(&[audience]);
             v.set_required_spec_claims(&["exp", "aud", "iss"]);
             v.leeway = 30;
-            decode::<AccessTokenClaims>(
-                token,
-                &DecodingKey::from_secret(secret.as_bytes()),
-                &v,
-            )
-            .map(|d| d.claims)
-            .map_err(|e| match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                    AppError::biz(code::TOKEN_EXPIRED, "token expired")
-                }
-                _ => AppError::biz(code::UNAUTHORIZED, format!("jwt: {e}")),
-            })
+            decode::<AccessTokenClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &v)
+                .map(|d| d.claims)
+                .map_err(|e| match e.kind() {
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
+                        AppError::biz(code::TOKEN_EXPIRED, "token expired")
+                    }
+                    _ => AppError::biz(code::UNAUTHORIZED, format!("jwt: {e}")),
+                })
         }
         // 2026-09-23 重构：其它算法（含 none）一律 40100，规避 algorithm confusion 攻击面
         other => Err(AppError::biz(
@@ -358,13 +357,9 @@ pub fn decode_refresh(
             v.set_audience(&[audience]);
             v.set_required_spec_claims(&["exp", "aud", "iss"]);
             v.leeway = 30;
-            decode::<RefreshTokenClaims>(
-                token,
-                &DecodingKey::from_secret(secret.as_bytes()),
-                &v,
-            )
-            .map(|d| d.claims)
-            .map_err(|e| AppError::biz(code::UNAUTHORIZED, format!("refresh: {e}")))
+            decode::<RefreshTokenClaims>(token, &DecodingKey::from_secret(secret.as_bytes()), &v)
+                .map(|d| d.claims)
+                .map_err(|e| AppError::biz(code::UNAUTHORIZED, format!("refresh: {e}")))
         }
         other => Err(AppError::biz(
             code::UNAUTHORIZED,

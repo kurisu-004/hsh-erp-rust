@@ -63,7 +63,7 @@ use crate::shared::response::R;
 use crate::state::AppState;
 
 use super::dto::WxLoginRequest;
-use super::repo::{WxIdentityRepo, WxIdentity};
+use super::repo::{WxIdentity, WxIdentityRepo};
 
 /// `/api/v2/wx/iam/*` 入口 router 工厂。
 pub fn router() -> Router<Arc<AppState>> {
@@ -125,12 +125,8 @@ pub async fn wx_login(
     let mut tx = state.pool.begin().await?;
 
     // 3a. 预绑定查询（仅预绑定，未绑定即拒）
-    let identity: Option<WxIdentity> = WxIdentityRepo::get_by_corp_and_user(
-        &mut *tx,
-        expected_corp,
-        &wx_user_id,
-    )
-    .await?;
+    let identity: Option<WxIdentity> =
+        WxIdentityRepo::get_by_corp_and_user(&mut *tx, expected_corp, &wx_user_id).await?;
     let Some(identity) = identity else {
         return Err(AppError::biz(
             code::BIZ_WX_NOT_BOUND,
@@ -150,7 +146,10 @@ pub async fn wx_login(
         })?;
 
     // 3c. 复用 iam 登录流水线（is_active → 角色 → shelf 范围 → 菜单 → 签双 token）
-    let pending = state.session_service.login_by_user_id(&mut *tx, user).await?;
+    let pending = state
+        .session_service
+        .login_by_user_id(&mut *tx, user)
+        .await?;
     tx.commit().await?;
 
     // ---- 4. commit 后：写 Redis session（access_jti + refresh_jti）--------

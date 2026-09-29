@@ -71,7 +71,6 @@ use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture, test_pool};
 //    helper：因每种场景需要不同 prefix（'F' 18/20 / 'X' 1/20 list_with_filters
 //    测试）或不同初始 counter 值
 
-
 async fn setup() -> (PgPool, AssemblyFixture) {
     let pool = test_pool().await;
     let fx = load_assembly_fixture(&pool).await;

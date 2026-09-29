@@ -129,13 +129,7 @@ async fn insert_part_with_status(
 }
 
 /// 插一个 part_batch（带 status 参数，与 part.status 通常对齐）。
-async fn insert_batch(
-    pool: &PgPool,
-    part_id: i64,
-    batch_no: i32,
-    qty: i32,
-    status: &str,
-) -> i64 {
+async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, status: &str) -> i64 {
     let id = pool_snowflake().lock().unwrap().next_id();
     let now = now_naive();
     // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；

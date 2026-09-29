@@ -235,10 +235,10 @@ impl From<TPart> for PartListItem {
             updated_by: p.updated_by,
             deleted_at: p.deleted_at,
             process_chain_id: p.process_chain_id,
-            customer_name: None, // 由 service 注入
+            customer_name: None,    // 由 service 注入
             l1_customer_name: None, // 由 service 注入
-            location: None, // 由 service 注入
-            holder_name: None, // 由 service 注入
+            location: None,         // 由 service 注入
+            holder_name: None,      // 由 service 注入
             // 2026-09-28 新增：TPart 派生默认就是 PART 行
             row_type: Some("PART".to_string()),
             has_children: false,

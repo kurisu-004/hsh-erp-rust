@@ -52,12 +52,9 @@ impl PartService {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         // 1. 读 part（仅 need drawing_no 用于事件日志 + 终态守卫；其它派生列
         //    由 rollup 在 batch 翻转后回填）。
-        let part = repo
-            .get_part_inspected(part_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
-            })?;
+        let part = repo.get_part_inspected(part_id).await?.ok_or_else(|| {
+            AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
+        })?;
         if PartStatus::from_str(&part.status) == Some(PartStatus::CANCELLED) {
             return Err(AppError::biz(
                 code::BIZ_PART_ALREADY_CANCELLED,
@@ -65,15 +62,12 @@ impl PartService {
             ));
         }
         // 2. 定位 batch（必须属于 part + READY_TO_SHIP + 未软删）。
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    format!("batch {} 不存在", req.batch_id),
-                )
-            })?;
+        let batch = repo.find_batch_by_id(req.batch_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {} 不存在", req.batch_id),
+            )
+        })?;
         if batch.part_id != part_id {
             return Err(AppError::biz(
                 code::BIZ_PART_BATCH_NOT_FOUND,
@@ -162,12 +156,9 @@ impl PartService {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         // 取完整 TPart（含 delivery_note_id）—— Finding D 要求 service 层守
         // 已挂送货单的 part 不能取消。
-        let part: TPart = repo
-            .get_part_detail(part_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
-            })?;
+        let part: TPart = repo.get_part_detail(part_id).await?.ok_or_else(|| {
+            AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
+        })?;
         let from = PartStatus::from_str(&part.status).ok_or_else(|| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,
@@ -183,10 +174,7 @@ impl PartService {
         // Finding D：cancel 锁定守护 — part 任一活跃批次已挂送货单 → 拒。
         // 2026-09-16 PR-2 瘦身（migration 027）：t_part.delivery_note_id 列已删，
         // 改查 t_part_batch.delivery_note_id 真相源。
-        if repo
-            .part_batch_has_active_on_delivery_note(part_id)
-            .await?
-        {
+        if repo.part_batch_has_active_on_delivery_note(part_id).await? {
             return Err(AppError::biz(
                 code::BIZ_DELIVERY_NOTE_LOCKED_PART,
                 format!("part {part_id} 存在活跃批次已挂送货单，禁 cancel"),
@@ -246,12 +234,9 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        let part = repo
-            .get_part_inspected(part_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
-            })?;
+        let part = repo.get_part_inspected(part_id).await?.ok_or_else(|| {
+            AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
+        })?;
         if PartStatus::from_str(&part.status) == Some(PartStatus::CANCELLED) {
             return Err(AppError::biz(
                 code::BIZ_PART_ALREADY_CANCELLED,
@@ -259,15 +244,12 @@ impl PartService {
             ));
         }
         // 1. 定位 batch。
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    format!("batch {} 不存在", req.batch_id),
-                )
-            })?;
+        let batch = repo.find_batch_by_id(req.batch_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {} 不存在", req.batch_id),
+            )
+        })?;
         if batch.part_id != part_id {
             return Err(AppError::biz(
                 code::BIZ_PART_BATCH_NOT_FOUND,
@@ -347,12 +329,9 @@ impl PartService {
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-        let part = repo
-            .get_part_inspected(part_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
-            })?;
+        let part = repo.get_part_inspected(part_id).await?.ok_or_else(|| {
+            AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
+        })?;
         if PartStatus::from_str(&part.status) == Some(PartStatus::CANCELLED) {
             return Err(AppError::biz(
                 code::BIZ_PART_ALREADY_CANCELLED,
@@ -360,15 +339,12 @@ impl PartService {
             ));
         }
         // 1. 定位 batch。
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    format!("batch {} 不存在", req.batch_id),
-                )
-            })?;
+        let batch = repo.find_batch_by_id(req.batch_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {} 不存在", req.batch_id),
+            )
+        })?;
         if batch.part_id != part_id {
             return Err(AppError::biz(
                 code::BIZ_PART_BATCH_NOT_FOUND,

@@ -116,9 +116,7 @@ impl WorkTypeService {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let items = repo
-            .list_with_filters(code_like, limit, offset)
-            .await?;
+        let items = repo.list_with_filters(code_like, limit, offset).await?;
         let total = repo.count_with_filters(code_like).await?;
 
         // process_ids 单条 SQL 批量算（防 N+1）—— 走胖 trait 方法
@@ -165,10 +163,7 @@ impl WorkTypeService {
             Role::Inspector,
         ])?;
 
-        let wt = repo
-            .get_by_id(id)
-            .await?
-            .ok_or_else(work_type_not_found)?;
+        let wt = repo.get_by_id(id).await?.ok_or_else(work_type_not_found)?;
 
         // process_ids 单条批量查（防 N+1：get 不必有 mapping 时也走同一函数）
         let mapping_rows = repo.worktypeproc_list_by_work_types_batch(&[wt.id]).await?;
@@ -259,10 +254,7 @@ impl WorkTypeService {
             ));
         }
 
-        let existing = repo
-            .get_by_id(id)
-            .await?
-            .ok_or_else(work_type_not_found)?;
+        let existing = repo.get_by_id(id).await?.ok_or_else(work_type_not_found)?;
 
         // name: Some("") ⇒ 显式拒；None ⇒ 不修改
         let name_update: Option<&str> = match req.name.as_deref() {
@@ -334,10 +326,7 @@ impl WorkTypeService {
     ) -> Result<(), AppError> {
         current.require_role(Role::Manager)?;
 
-        let wt = repo
-            .get_by_id(id)
-            .await?
-            .ok_or_else(work_type_not_found)?;
+        let wt = repo.get_by_id(id).await?.ok_or_else(work_type_not_found)?;
 
         let ref_count = repo.count_work_type_references(id).await?;
         if ref_count > 0 {
@@ -519,15 +508,12 @@ impl WorkTypeProcessService {
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         // 1. work_type 存在性 + 软删校验（已软删 → 404）
-        let wt = repo
-            .get_by_id(work_type_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_WORK_TYPE_NOT_FOUND,
-                    format!("work_type {work_type_id} 不存在"),
-                )
-            })?;
+        let wt = repo.get_by_id(work_type_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_WORK_TYPE_NOT_FOUND,
+                format!("work_type {work_type_id} 不存在"),
+            )
+        })?;
 
         // 2. 解析 + 校验所有 process_id 存在
         let mut process_ids: Vec<i64> = Vec::with_capacity(items.len());
@@ -593,15 +579,12 @@ impl WorkTypeProcessService {
         ])?;
 
         // work_type 存在性校验
-        let wt = repo
-            .get_by_id(work_type_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_WORK_TYPE_NOT_FOUND,
-                    format!("work_type {work_type_id} 不存在"),
-                )
-            })?;
+        let wt = repo.get_by_id(work_type_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_WORK_TYPE_NOT_FOUND,
+                format!("work_type {work_type_id} 不存在"),
+            )
+        })?;
 
         let rows = repo.worktypeproc_list_by_work_type(wt.id).await?;
         let items = rows

@@ -32,17 +32,17 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::com::customer::repo::CustomerRepo;
+use crate::modules::delivery_note::model::NoteScope;
+use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
 use crate::modules::delivery_note::vo::{
     AddedBatchDto, RecentItemDto, ResolvedEntityDto, ResolvedKindDto, ScanDeliveryNoteSummaryDto,
     ScanDeliveryOut, ScanOutcomeDto,
 };
-use crate::modules::delivery_note::model::NoteScope;
-use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
-use crate::modules::part::repo::PartRepo;
 use crate::modules::part::batch::repo::PartBatchRepo;
+use crate::modules::part::repo::PartRepo;
 use crate::shared::error::{AppError, code};
 
-use super::inner::{note_not_found, GroupWithMemberIds};
+use super::inner::{GroupWithMemberIds, note_not_found};
 
 use super::DeliveryNoteService;
 mod classify;
@@ -54,10 +54,10 @@ mod resolve_scan_kind;
 mod tests;
 
 use classify::{
-    build_unresolved_target, classify_outcome, has_fully_invalid_target, is_all_conflict,
-    is_inspectable_state, TargetEvaluation,
+    TargetEvaluation, build_unresolved_target, classify_outcome, has_fully_invalid_target,
+    is_all_conflict, is_inspectable_state,
 };
-use resolve_scan_kind::{resolve_scan_kind, ScanKind};
+use resolve_scan_kind::{ScanKind, resolve_scan_kind};
 
 // 暴露给 sibling 模块（attach.rs）+ 本 mod 内部（生产 `scan_add` + 单元测试）
 // 的 re-export。`pub(crate)` 同时覆盖两种用途，避免 `use classify::xxx` +
@@ -214,13 +214,13 @@ impl DeliveryNoteService {
 
         // ===== Step 4: 加载 target 全部活跃 batch → C 组短路 → 5 组分类 =====
         let target_part_ids: Vec<i64> = targets.iter().map(|p| p.id).collect();
-        let all_batches: Vec<crate::modules::part::batch::model::TPartBatch> =
-            if target_part_ids.is_empty() {
-                Vec::new()
-            } else {
-                PartBatchRepo::list_active_by_part_ids(&mut *repo.conn_mut(), &target_part_ids)
-                    .await?
-            };
+        let all_batches: Vec<crate::modules::part::batch::model::TPartBatch> = if target_part_ids
+            .is_empty()
+        {
+            Vec::new()
+        } else {
+            PartBatchRepo::list_active_by_part_ids(&mut *repo.conn_mut(), &target_part_ids).await?
+        };
 
         // C 组分布判定：
         // 仅当存在「target 加载到批次但全部为 C 组」时硬错误（21421）。
@@ -369,9 +369,10 @@ impl DeliveryNoteService {
             .len();
 
         // 重新取一次 L1 客户名（scope_label L1Wide 路径要用）
-        let l1_cust_name = CustomerRepo::get_by_id(&mut *repo.conn_mut(), fresh_note.customer_id, false)
-            .await?
-            .map(|c| c.name);
+        let l1_cust_name =
+            CustomerRepo::get_by_id(&mut *repo.conn_mut(), fresh_note.customer_id, false)
+                .await?
+                .map(|c| c.name);
 
         // scope_label / customer_path 由 scope 列确定（与 note 自身保持一致）
         let (group_name, leaf_name) = match scope {
@@ -470,4 +471,3 @@ impl DeliveryNoteService {
         })
     }
 }
-

@@ -21,9 +21,9 @@ use crate::shared::error::{AppError, code};
 use super::super::dto::{
     DeliveryNoteAddItem, DeliveryNoteCreateRequest, DeliveryNoteUpdateRequest,
 };
-use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut};
 use super::super::model::{DeliveryNote, DeliveryNoteEventType};
 use super::super::repo::SortDir;
+use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteListOut, DeliveryNoteOut};
 use super::inner::{
     add_parts_inner, build_note_outs, get_with_parts, note_not_found, note_version_conflict,
     write_event,
@@ -220,11 +220,9 @@ impl DeliveryNoteService {
         }
         let head_ids: Vec<i64> = heads.iter().map(|n| n.id).collect();
 
-        let rows = PartBatchRepo::list_with_part_by_delivery_note_ids(
-            &mut *repo.conn_mut(),
-            &head_ids,
-        )
-        .await?;
+        let rows =
+            PartBatchRepo::list_with_part_by_delivery_note_ids(&mut *repo.conn_mut(), &head_ids)
+                .await?;
 
         let leaf_ids: HashSet<i64> = rows.iter().map(|(_b, p)| p.customer_id).collect();
         let leaf_list = CustomerRepo::list_by_ids(

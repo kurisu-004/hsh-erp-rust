@@ -133,13 +133,7 @@ impl super::crud::ShelfService {
 
         // 直接复用 list_with_filters，zone='INSPECTION' AND is_active=true
         let shelves = repo
-            .list_with_filters(
-                None,
-                Some(ZONE_INSPECTION),
-                Some(true),
-                MAX_LIMIT,
-                0,
-            )
+            .list_with_filters(None, Some(ZONE_INSPECTION), Some(true), MAX_LIMIT, 0)
             .await?;
         let items = shelves
             .into_iter()

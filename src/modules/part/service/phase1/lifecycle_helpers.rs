@@ -23,8 +23,8 @@ use super::super::super::dto_crud::{
 use super::super::PartService;
 
 use super::{
-    assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
-    require_process_chain, validate_batch_ownership, validate_shelf_zone, BatchListRow,
+    BatchListRow, assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
+    require_process_chain, validate_batch_ownership, validate_shelf_zone,
 };
 
 impl PartService {
@@ -63,18 +63,21 @@ impl PartService {
         // shelf ↔ process 映射
         assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, req.next_process_id).await?;
         // PR-3：解析 step_id（chain 内 process_id → step_id）
-        let step_id =
-            ProcessChainRepo::resolve_step_id_by_process(repo.conn_mut(), chain_id, req.next_process_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                        format!(
-                            "chain {} 内找不到 process_id={} 的活跃 step",
-                            chain_id, req.next_process_id
-                        ),
-                    )
-                })?;
+        let step_id = ProcessChainRepo::resolve_step_id_by_process(
+            repo.conn_mut(),
+            chain_id,
+            req.next_process_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                format!(
+                    "chain {} 内找不到 process_id={} 的活跃 step",
+                    chain_id, req.next_process_id
+                ),
+            )
+        })?;
         // 翻状态
         let n = mark_batch_with_status_and_meta(
             repo.conn_mut(),
@@ -93,21 +96,19 @@ impl PartService {
         // rollup
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         // 事件日志
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "PLACED_ON_SHELF",
-                from_status: Some(from.as_str()),
-                to_status: Some("IN_PROCESS"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "PLACED_ON_SHELF",
+            from_status: Some(from.as_str()),
+            to_status: Some("IN_PROCESS"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)
@@ -160,21 +161,19 @@ impl PartService {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "RECALLED",
-                from_status: Some(from.as_str()),
-                to_status: Some("PENDING"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "RECALLED",
+            from_status: Some(from.as_str()),
+            to_status: Some("PENDING"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)

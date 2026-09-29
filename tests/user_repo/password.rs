@@ -31,8 +31,8 @@ use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 // 2026-09-19 IAM 域合并：原 `user::repo` 重定向到 `iam::repo`，方法零 diff。
 // 2026-09-22 重构 #2：sql.rs 拆为 sql/{user,user_role,menu,shelf}.rs free fn。
-use hsh_erp_rust::modules::iam::repo::{UserInsert, UserPartialUpdate, UserRoleInsert};
 use hsh_erp_rust::modules::iam::repo::sql::{user as user_sql, user_role as user_role_sql};
+use hsh_erp_rust::modules::iam::repo::{UserInsert, UserPartialUpdate, UserRoleInsert};
 
 // 2026-09-24 PR13 Phase I：fixture 范本化入口。`load_user_repo_fixture(&pool)` 加载
 // 1 menu baseline（PR-C.Final 移除 user + role baseline，避免污染
@@ -130,30 +130,36 @@ async fn create_user_then_add_role_then_list_persists_all() {
 
     // 写 user
     let uid = snowflake().lock().unwrap().next_id();
-    user_sql::create_user(&mut *tx, &UserInsert {
-        id: uid,
-        username: "atomic-user".to_string(),
-        password_hash: "h".to_string(),
-        full_name: "Atomic User".to_string(),
-        phone: None,
-        is_active: true,
-        created_at: now_naive(),
-        created_by: None,
-    })
+    user_sql::create_user(
+        &mut *tx,
+        &UserInsert {
+            id: uid,
+            username: "atomic-user".to_string(),
+            password_hash: "h".to_string(),
+            full_name: "Atomic User".to_string(),
+            phone: None,
+            is_active: true,
+            created_at: now_naive(),
+            created_by: None,
+        },
+    )
     .await
     .expect("create user");
 
     // 写 role
     let rid = snowflake().lock().unwrap().next_id();
-    user_role_sql::create_user_role(&mut *tx, &UserRoleInsert {
-        id: rid,
-        user_id: uid,
-        role: "MANAGER".to_string(),
-        scope_type: None,
-        scope_id: None,
-        created_at: now_naive(),
-        created_by: None,
-    })
+    user_role_sql::create_user_role(
+        &mut *tx,
+        &UserRoleInsert {
+            id: rid,
+            user_id: uid,
+            role: "MANAGER".to_string(),
+            scope_type: None,
+            scope_id: None,
+            created_at: now_naive(),
+            created_by: None,
+        },
+    )
     .await
     .expect("create role");
 
@@ -165,7 +171,9 @@ async fn create_user_then_add_role_then_list_persists_all() {
         .expect("query")
         .expect("hit");
     assert_eq!(u.username, "atomic-user");
-    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid).await.expect("list");
+    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid)
+        .await
+        .expect("list");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].role, "MANAGER");
 }
@@ -189,7 +197,9 @@ async fn soft_delete_user_then_list_roles_returns_empty() {
     tx.commit().await.expect("commit");
 
     // 软删后再 list_user_roles_by_user_id —— 角色还在（list_user_roles_by_user_id 不 JOIN t_user），但 user 不可见
-    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid).await.expect("list");
+    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid)
+        .await
+        .expect("list");
     assert_eq!(
         rows.len(),
         1,
@@ -211,16 +221,19 @@ async fn transaction_commit_persists_writes() {
 
     let mut tx = pool.begin().await.expect("begin");
     let uid = snowflake().lock().unwrap().next_id();
-    user_sql::create_user(&mut *tx, &UserInsert {
-        id: uid,
-        username: "committed".to_string(),
-        password_hash: "h".to_string(),
-        full_name: "Committed".to_string(),
-        phone: None,
-        is_active: true,
-        created_at: now_naive(),
-        created_by: None,
-    })
+    user_sql::create_user(
+        &mut *tx,
+        &UserInsert {
+            id: uid,
+            username: "committed".to_string(),
+            password_hash: "h".to_string(),
+            full_name: "Committed".to_string(),
+            phone: None,
+            is_active: true,
+            created_at: now_naive(),
+            created_by: None,
+        },
+    )
     .await
     .expect("create");
     tx.commit().await.expect("commit");
@@ -241,16 +254,19 @@ async fn transaction_drop_without_commit_rolls_back() {
 
     let mut tx = pool.begin().await.expect("begin");
     let uid = snowflake().lock().unwrap().next_id();
-    user_sql::create_user(&mut *tx, &UserInsert {
-        id: uid,
-        username: "rolledback".to_string(),
-        password_hash: "h".to_string(),
-        full_name: "RolledBack".to_string(),
-        phone: None,
-        is_active: true,
-        created_at: now_naive(),
-        created_by: None,
-    })
+    user_sql::create_user(
+        &mut *tx,
+        &UserInsert {
+            id: uid,
+            username: "rolledback".to_string(),
+            password_hash: "h".to_string(),
+            full_name: "RolledBack".to_string(),
+            phone: None,
+            is_active: true,
+            created_at: now_naive(),
+            created_by: None,
+        },
+    )
     .await
     .expect("create");
 
@@ -344,7 +360,9 @@ async fn list_user_roles_by_user_id_excludes_soft_deleted_roles() {
     .await
     .expect("soft delete role");
 
-    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid).await.expect("list");
+    let rows = user_role_sql::list_user_roles_by_user_id(&pool, uid)
+        .await
+        .expect("list");
     assert_eq!(rows.len(), 1, "软删的角色应被过滤");
     assert_eq!(rows[0].id, active_rid);
 }

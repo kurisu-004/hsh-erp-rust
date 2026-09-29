@@ -19,14 +19,14 @@
 // 2026-09-23 PR13 Phase C：`common` / `helpers` 由各 sub-file 自带 `#[path]`
 // 引入（edition 2024 下 `mod foo;` 在 sub-file 中只查 sibling 目录、不向上到 crate root），
 // main.rs 仅列 sub-file 入口，不重复声明。
-mod crud;
-mod lifecycle;
 mod batch;
+mod crud;
 mod file;
+mod inspection_batches;
+mod lifecycle;
 mod list_enrichment;
 mod repair;
-mod to_ship;
+mod serial;
 mod to_inspection;
 mod to_process;
-mod inspection_batches;
-mod serial;
+mod to_ship;

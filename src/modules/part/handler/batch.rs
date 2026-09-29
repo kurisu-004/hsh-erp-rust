@@ -222,8 +222,8 @@ pub async fn batch_with_pdfs(
     }
     let req = json_body.ok_or_else(|| AppError::validation("multipart 缺少 'json' 字段"))?;
     let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::batch_with_pdfs(&mut *tx, &state.snowflake, &req, &pdf_files, &current).await?;
+    let out = PartService::batch_with_pdfs(&mut *tx, &state.snowflake, &req, &pdf_files, &current)
+        .await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "PART_BATCH_WITH_PDFS_CREATED".into(),

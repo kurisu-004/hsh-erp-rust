@@ -5,8 +5,6 @@
 //!
 //! 2026-09-22 D-6：从原 `phase1.rs` 按业务动作拆出。共享 helper 在 `phase1/mod.rs` 同 crate 内可见。
 
-
-
 use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
@@ -24,8 +22,8 @@ use super::super::super::dto_crud::{CompleteRepairRequest, RepairDispatchRequest
 use super::super::PartService;
 
 use super::{
-    assert_shelf_maps_process, mark_batch_with_status_and_meta, require_process_chain,
-    validate_batch_ownership, InspectionRepairRow,
+    InspectionRepairRow, assert_shelf_maps_process, mark_batch_with_status_and_meta,
+    require_process_chain, validate_batch_ownership,
 };
 
 impl PartService {
@@ -115,21 +113,19 @@ impl PartService {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "REPAIR_COMPLETED",
-                from_status: Some("REPAIRING"),
-                to_status: Some(new_status),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "REPAIR_COMPLETED",
+            from_status: Some("REPAIRING"),
+            to_status: Some(new_status),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)
@@ -233,37 +229,33 @@ impl PartService {
         // 追溯（REPAIR_STARTED + REPAIR_COMPLETED）。
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         // 两条事件
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "REPAIR_STARTED",
-                from_status: Some(from.as_str()),
-                to_status: Some("REPAIRING"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.reason.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "REPAIR_STARTED",
+            from_status: Some(from.as_str()),
+            to_status: Some("REPAIRING"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.reason.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "REPAIR_COMPLETED",
-                from_status: Some("REPAIRING"),
-                to_status: Some(new_status),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "REPAIR_COMPLETED",
+            from_status: Some("REPAIRING"),
+            to_status: Some(new_status),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)

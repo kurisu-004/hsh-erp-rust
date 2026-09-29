@@ -50,11 +50,11 @@ use crate::shared::error::{AppError, code};
 // `iam/service/` 子目录中 dto / vo / repo 是 sibling 的兄弟模块 —— 用 `super::super::` 跨级
 // account 是同 parent 下的兄弟 service 文件，用 `super::account::`（与 account.rs 的
 // `super::menu::` 同形）
-use super::account::{AccountService, role_as_str};
 use super::super::dto::{ChangePasswordRequest, LoginRequest, RefreshRequest};
 use super::super::repo::model::User;
 use super::super::repo::{IamRepoTrait, UserRoleRow};
 use super::super::vo::{CurrentUserOut, LoginResponse, MenuNodeOut};
+use super::account::{AccountService, role_as_str};
 
 /// SHELF_ACCOUNT 角色唯一合法的 scope_type
 const SCOPE_TYPE_SHELF: &str = "shelf";
@@ -182,7 +182,10 @@ impl SessionService {
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let menus = self.account_service.menus_for_roles(&mut repo, &roles).await?;
+        let menus = self
+            .account_service
+            .menus_for_roles(&mut repo, &roles)
+            .await?;
 
         // 6. 签发双 token（2026-09-22 重构：删业务字段参数，新增 audience；
         // 2026-09-23 重构：RS256 + kid —— 第 3 参数 `secret` 拆为
@@ -223,7 +226,7 @@ impl SessionService {
     /// | ① username 归一化 | ✅ | ❌ 跳过（调用方已给出 `User`） |
     /// | ② 查用户 + is_active | ✅ | ✅ 同样校验（停用账号一律拒） |
     /// | ③ bcrypt 校验 | ✅ | ❌ 跳过（凭证由企微侧承担） |
-    /// | ④ 角色列表（空 → NO_ROLE）| ✅ | ✅ | 
+    /// | ④ 角色列表（空 → NO_ROLE）| ✅ | ✅ |
     /// | ⑤ 角色/shelf 范围 + 菜单 | ✅ | ✅ |
     /// | ⑥ `issue_token_pair` | ✅ | ✅ |
     /// | ⑦ `touch_user_last_login_at` | ✅ | ✅ |
@@ -261,7 +264,10 @@ impl SessionService {
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let menus = self.account_service.menus_for_roles(&mut repo, &roles).await?;
+        let menus = self
+            .account_service
+            .menus_for_roles(&mut repo, &roles)
+            .await?;
 
         // ⑥ 签发双 token（参数与 `login()` 逐字相同）
         let pair = issue_token_pair(
@@ -313,13 +319,7 @@ impl SessionService {
             .create_session(&pair.access_jti, u.id, TokenKind::Access, ttl, &profile)
             .await?;
         self.session
-            .create_session(
-                &pair.refresh_jti,
-                u.id,
-                TokenKind::Refresh,
-                ttl,
-                &profile,
-            )
+            .create_session(&pair.refresh_jti, u.id, TokenKind::Refresh, ttl, &profile)
             .await?;
 
         let user_out = build_current_user_out(&u, &roles, &shelf_ids, menus);
@@ -429,7 +429,10 @@ impl SessionService {
         if roles.is_empty() {
             return Err(AppError::biz(code::NO_ROLE, "账号未分配角色"));
         }
-        let menus = self.account_service.menus_for_roles(&mut repo, &roles).await?;
+        let menus = self
+            .account_service
+            .menus_for_roles(&mut repo, &roles)
+            .await?;
 
         // 4. 轮转 refresh_token_version（带乐观锁；0 行 → 409）
         let user_id = u.id;
@@ -541,13 +544,7 @@ impl SessionService {
             .create_session(&pair.access_jti, u.id, TokenKind::Access, ttl, &profile)
             .await?;
         self.session
-            .create_session(
-                &pair.refresh_jti,
-                u.id,
-                TokenKind::Refresh,
-                ttl,
-                &profile,
-            )
+            .create_session(&pair.refresh_jti, u.id, TokenKind::Refresh, ttl, &profile)
             .await?;
 
         let user_out = build_current_user_out(&u, &roles, &shelf_ids, menus);
@@ -581,9 +578,11 @@ impl SessionService {
 
         // 2. 重查角色 + shelf 范围 + 菜单（不走 JWT 里的 stale 数据）
         let role_rows = repo.list_user_roles_by_user_id(u.id).await?;
-        let (roles, shelf_ids, _wildcard) =
-            resolve_roles_and_scope(&mut repo, &role_rows).await?;
-        let menus = self.account_service.menus_for_roles(&mut repo, &roles).await?;
+        let (roles, shelf_ids, _wildcard) = resolve_roles_and_scope(&mut repo, &role_rows).await?;
+        let menus = self
+            .account_service
+            .menus_for_roles(&mut repo, &roles)
+            .await?;
 
         Ok(build_current_user_out(&u, &roles, &shelf_ids, menus))
     }

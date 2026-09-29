@@ -70,6 +70,9 @@ pub async fn forward_sts_tmp_keys(
     if let Ok(value) = current.id.to_string().parse() {
         fwd_headers.insert("x-forwarded-user-id", value);
     }
-    let resp = state.py_backend.forward_sts_tmp_keys(body, fwd_headers).await?;
+    let resp = state
+        .py_backend
+        .forward_sts_tmp_keys(body, fwd_headers)
+        .await?;
     Ok((resp.status, resp.headers, resp.body).into_response())
 }

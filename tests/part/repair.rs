@@ -11,8 +11,9 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::fixture::PartFixture;
-use hsh_erp_test_support::{json_request, load_part_fixture, login_token, send, test_app,
-    test_pool, test_state};
+use hsh_erp_test_support::{
+    json_request, load_part_fixture, login_token, send, test_app, test_pool, test_state,
+};
 
 // ===========================================================================
 //  动态 fixture helpers（PR-C.Final retry 第 3 轮，2026-09-24）
@@ -23,9 +24,7 @@ use hsh_erp_test_support::{json_request, load_part_fixture, login_token, send, t
 /// 为指定 part 建一个最小工艺链（t_part_process_chain），并把 part.process_chain_id 绑回。
 async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
     use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let chain_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
@@ -49,9 +48,7 @@ async fn create_chain_for_part(pool: &PgPool, part_id: i64) -> i64 {
 /// 在指定 chain 内创建 step（process_id + sort_order）。
 async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
     use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let step_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \

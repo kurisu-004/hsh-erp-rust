@@ -99,12 +99,9 @@ impl PartService {
 
         // 4. 读 part 当前 rollup 状态（status + next_process_id，2 列）。
         //    2026-09-16 PR-2 瘦身：location / current_holder_id / placed_at 列已删。
-        let cur = repo
-            .get_part_rollup_state(part_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
-            })?;
+        let cur = repo.get_part_rollup_state(part_id).await?.ok_or_else(|| {
+            AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
+        })?;
 
         // 5. PR-3 派生：把 target.next_process_id（实际为 step_id）经 step JOIN
         //    转回 process_id，作为 t_part.next_process_id 缓存写入值。

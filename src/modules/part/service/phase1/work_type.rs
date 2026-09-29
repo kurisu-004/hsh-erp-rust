@@ -16,9 +16,7 @@ use crate::shared::error::{AppError, code};
 use super::super::super::dto_crud::{ByWorkTypeQuery, ByWorkerQuery, PickUpRequest};
 use super::super::PartService;
 
-use super::{
-    mark_batch_with_status_and_meta, validate_batch_ownership, validate_shelf_zone,
-};
+use super::{mark_batch_with_status_and_meta, validate_batch_ownership, validate_shelf_zone};
 
 impl PartService {
     // ===== Phase 2 (2026-09-13) — 领取链路 (B 方案：手动 pick-up 兜底) =====
@@ -124,21 +122,19 @@ impl PartService {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "PICKED_UP",
-                from_status: Some(from.as_str()),
-                to_status: Some("IN_PROCESS"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "PICKED_UP",
+            from_status: Some(from.as_str()),
+            to_status: Some("IN_PROCESS"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)

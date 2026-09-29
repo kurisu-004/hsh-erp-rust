@@ -86,14 +86,8 @@ pub trait CustomerRepoTrait: Send {
         parent_id: i64,
         include_deleted: bool,
     ) -> Result<Vec<TCustomer>, sqlx::Error>;
-    async fn list_roots(
-        &mut self,
-        include_deleted: bool,
-    ) -> Result<Vec<TCustomer>, sqlx::Error>;
-    async fn list_all(
-        &mut self,
-        include_deleted: bool,
-    ) -> Result<Vec<TCustomer>, sqlx::Error>;
+    async fn list_roots(&mut self, include_deleted: bool) -> Result<Vec<TCustomer>, sqlx::Error>;
+    async fn list_all(&mut self, include_deleted: bool) -> Result<Vec<TCustomer>, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
     async fn list_with_filters<'a>(
         &mut self,
@@ -137,15 +131,10 @@ pub trait CustomerRepoTrait: Send {
     // ── 跨域 helper（3）──
     /// 批量查 `(id, name)`（仅未软删）。供 `applicant` 域 `list_applicants` 批量补
     /// `customer_name` 用。空 `ids` 短路返回 `Vec::new()`。
-    async fn lookup_names<'a>(
-        &mut self,
-        ids: &'a [i64],
-    ) -> Result<Vec<(i64, String)>, sqlx::Error>;
+    async fn lookup_names<'a>(&mut self, ids: &'a [i64])
+    -> Result<Vec<(i64, String)>, sqlx::Error>;
     /// `t_part` 引用本 customer 的非软删计数。供本域 `soft_delete_customer` 校验用。
-    async fn count_parts_using_customer(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<i64, sqlx::Error>;
+    async fn count_parts_using_customer(&mut self, customer_id: i64) -> Result<i64, sqlx::Error>;
     /// `t_assembly` 引用本 customer 的非软删计数。供本域 `soft_delete_customer` 校验用。
     async fn count_assemblies_using_customer(
         &mut self,
@@ -186,17 +175,11 @@ impl CustomerRepoTrait for &mut PgConnection {
         CustomerRepo::list_children(&mut **self, parent_id, include_deleted).await
     }
 
-    async fn list_roots(
-        &mut self,
-        include_deleted: bool,
-    ) -> Result<Vec<TCustomer>, sqlx::Error> {
+    async fn list_roots(&mut self, include_deleted: bool) -> Result<Vec<TCustomer>, sqlx::Error> {
         CustomerRepo::list_roots(&mut **self, include_deleted).await
     }
 
-    async fn list_all(
-        &mut self,
-        include_deleted: bool,
-    ) -> Result<Vec<TCustomer>, sqlx::Error> {
+    async fn list_all(&mut self, include_deleted: bool) -> Result<Vec<TCustomer>, sqlx::Error> {
         CustomerRepo::list_all(&mut **self, include_deleted).await
     }
 
@@ -209,15 +192,8 @@ impl CustomerRepoTrait for &mut PgConnection {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<TCustomer>, sqlx::Error> {
-        CustomerRepo::list_with_filters(
-            &mut **self,
-            name_like,
-            parent_id,
-            is_root,
-            limit,
-            offset,
-        )
-        .await
+        CustomerRepo::list_with_filters(&mut **self, name_like, parent_id, is_root, limit, offset)
+            .await
     }
 
     async fn count_with_filters<'b>(
@@ -278,10 +254,7 @@ impl CustomerRepoTrait for &mut PgConnection {
         CustomerRepo::lookup_names(&mut **self, ids).await
     }
 
-    async fn count_parts_using_customer(
-        &mut self,
-        customer_id: i64,
-    ) -> Result<i64, sqlx::Error> {
+    async fn count_parts_using_customer(&mut self, customer_id: i64) -> Result<i64, sqlx::Error> {
         CustomerRepo::count_parts_using_customer(&mut **self, customer_id).await
     }
 

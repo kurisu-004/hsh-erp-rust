@@ -42,8 +42,8 @@ use tower::ServiceExt;
 //   复用 crate 实例（与 test_state 内部 `crate::pem::test_private_pem()` 一致）。
 use hsh_erp_test_support::pem;
 use hsh_erp_test_support::{
-    IamFixture, json_request, load_iam_fixture, login_token,
-    send as ts_send, test_app, test_pool, test_state, test_state_with_hs256_fallback_off,
+    IamFixture, json_request, load_iam_fixture, login_token, send as ts_send, test_app, test_pool,
+    test_state, test_state_with_hs256_fallback_off,
 };
 
 // ===========================================================================
@@ -60,7 +60,12 @@ async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) {
 ///
 /// JWT mint_*_token helper 全部用 `fx.manager_user_id` 作为 sub claim（fixture
 /// 已预置该用户，验签端的 `t_user` lookup 不要求用户存在也可通过）。
-async fn bootstrap() -> (PgPool, Arc<hsh_erp_rust::state::AppState>, axum::Router, IamFixture) {
+async fn bootstrap() -> (
+    PgPool,
+    Arc<hsh_erp_rust::state::AppState>,
+    axum::Router,
+    IamFixture,
+) {
     let pool = test_pool().await;
     let fx = load_iam_fixture(&pool).await;
     let state = test_state(pool.clone()).await;
@@ -129,8 +134,8 @@ async fn mint_expired_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id:
     };
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(state.config.jwt.signing_kid.clone());
-    let ek = EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
-        .expect("test private pem");
+    let ek =
+        EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes()).expect("test private pem");
     encode(&header, &c, &ek).expect("encode expired token")
 }
 
@@ -140,7 +145,10 @@ async fn mint_expired_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id:
 /// 双重校验下，aud 不匹配时返回 40100 UNAUTHORIZED（不是 200/40105）。
 ///
 /// 2026-09-23 重构：HS256 → RS256 + kid（与 mint_expired_token 同模式）。
-async fn mint_wrong_audience_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
+async fn mint_wrong_audience_token(
+    state: &Arc<hsh_erp_rust::state::AppState>,
+    user_id: i64,
+) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     #[derive(serde::Serialize)]
     struct Claims<'a> {
@@ -171,8 +179,7 @@ async fn mint_wrong_audience_token(state: &Arc<hsh_erp_rust::state::AppState>, u
     encode(
         &header,
         &c,
-        &EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
-            .expect("test private pem"),
+        &EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes()).expect("test private pem"),
     )
     .expect("encode wrong-aud token")
 }
@@ -184,7 +191,10 @@ async fn mint_wrong_audience_token(state: &Arc<hsh_erp_rust::state::AppState>, u
 /// "缺 aud 字段 → 40100" 这个不变量。
 ///
 /// 2026-09-23 重构：HS256 → RS256 + kid。
-async fn mint_missing_audience_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
+async fn mint_missing_audience_token(
+    state: &Arc<hsh_erp_rust::state::AppState>,
+    user_id: i64,
+) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     // 故意**不**序列化 `aud` 字段
     #[derive(serde::Serialize)]
@@ -213,8 +223,7 @@ async fn mint_missing_audience_token(state: &Arc<hsh_erp_rust::state::AppState>,
     encode(
         &header,
         &c,
-        &EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
-            .expect("test private pem"),
+        &EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes()).expect("test private pem"),
     )
     .expect("encode missing-aud token")
 }
@@ -248,8 +257,7 @@ async fn protected_endpoint_without_token_returns_40100() {
 async fn forged_signature_returns_40100() {
     let (pool, _state, app, fx) = bootstrap().await;
     // 登录 MANAGER 拿 token
-    let token =
-        login_token(&app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let token = login_token(&app, &fx.manager_username, IamFixture::PASSWORD).await;
 
     // 篡改 token 最后一个字符（签名段）
     let mut chars: Vec<char> = token.chars().collect();
@@ -338,11 +346,7 @@ async fn wrong_audience_returns_40100() {
         json_request("GET", "/prod/workers", None, Some(&token)),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "错误 aud 应返 401: {env}"
-    );
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "错误 aud 应返 401: {env}");
     assert_eq!(
         env["code"], 40100,
         "错误 aud 应返 UNAUTHORIZED (40100)，不是 40102/40105"
@@ -464,8 +468,7 @@ async fn refresh_whitelist_no_token_40001() {
 async fn logout_then_old_token_returns_40105() {
     let (pool, _state, app, fx) = bootstrap().await;
     // 1) login → 拿 token
-    let token =
-        login_token(&app, &fx.manager_username, IamFixture::PASSWORD).await;
+    let token = login_token(&app, &fx.manager_username, IamFixture::PASSWORD).await;
 
     // 2) logout → 删 Redis session
     let app2 = fresh_app(&pool).await;
@@ -532,7 +535,10 @@ async fn nonexistent_route_returns_404_not_40100() {
 /// 在公钥字典查询；kid 不在字典 → 40100 UNAUTHORIZED "unknown kid=ghost"。
 /// 用 pem 模块的真实 RSA 私钥签发（kid = "ghost" 与公钥 dict 中 current / next
 /// 均不匹配），断言被服务端拒。
-async fn mint_unknown_kid_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
+async fn mint_unknown_kid_token(
+    state: &Arc<hsh_erp_rust::state::AppState>,
+    user_id: i64,
+) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     #[derive(serde::Serialize)]
     struct Claims<'a> {
@@ -561,8 +567,7 @@ async fn mint_unknown_kid_token(state: &Arc<hsh_erp_rust::state::AppState>, user
     encode(
         &header,
         &c,
-        &EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes())
-            .expect("test private pem"),
+        &EncodingKey::from_rsa_pem(pem::test_private_pem().as_bytes()).expect("test private pem"),
     )
     .expect("encode unknown-kid token")
 }
@@ -578,11 +583,7 @@ async fn protected_endpoint_with_unknown_kid_returns_40100() {
         json_request("GET", "/prod/workers", None, Some(&token)),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "未知 kid 应返 401: {env}"
-    );
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "未知 kid 应返 401: {env}");
     assert_eq!(
         env["code"], 40100,
         "未知 kid 应返 UNAUTHORIZED (40100)，不是 40102 / 40105"
@@ -636,11 +637,7 @@ async fn protected_endpoint_with_alg_none_returns_40100() {
         json_request("GET", "/prod/workers", None, Some(&token)),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::UNAUTHORIZED,
-        "alg=none 应返 401: {env}"
-    );
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "alg=none 应返 401: {env}");
     assert_eq!(
         env["code"], 40100,
         "alg=none 应返 UNAUTHORIZED (40100)，不是 40102 / 40105"
@@ -673,7 +670,10 @@ async fn protected_endpoint_with_alg_none_returns_40100() {
 /// header: {"alg":"HS256","typ":"JWT"}（HS256 不带 kid）；payload: 合法 claim
 ///（issuer/aud/exp/sub 全部对齐 server config）；signature: HMAC-SHA256(
 /// header_b64.payload_b64, b"")。
-fn mint_hs256_empty_secret_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
+fn mint_hs256_empty_secret_token(
+    state: &Arc<hsh_erp_rust::state::AppState>,
+    user_id: i64,
+) -> String {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     #[derive(serde::Serialize)]
     struct Claims<'a> {

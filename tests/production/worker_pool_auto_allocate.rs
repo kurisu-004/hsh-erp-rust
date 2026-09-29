@@ -36,7 +36,7 @@ use sqlx::PgPool;
 
 use hsh_erp_test_support::{
     ProductionFixture, json_request, load_production_fixture, login_token, pool_snowflake, send,
-    test_app, test_state, test_pool,
+    test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -52,9 +52,7 @@ async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password
     use hsh_erp_rust::infra::clock::now_naive;
 
     let hash = password::hash(plain_password).expect("bcrypt hash");
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -83,9 +81,7 @@ async fn add_role(
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -109,9 +105,7 @@ async fn add_role(
 async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -133,9 +127,7 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -156,9 +148,7 @@ async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
 async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -179,9 +169,7 @@ async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
 async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
@@ -218,10 +206,7 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProductionFixt
 /// MANAGER user：以新 username 登入 + MANAGER role（不影响 fixture 的 fx_part_manager）。
 ///
 /// 本 sub-file 独享：每个测试常需要多次以不同 username 登入。
-async fn login_manager_with_username(
-    pool: &PgPool,
-    username: &str,
-) -> (axum::Router, String) {
+async fn login_manager_with_username(pool: &PgPool, username: &str) -> (axum::Router, String) {
     let uid = insert_user_with_password(pool, username, "changeme").await;
     add_role(pool, uid, "MANAGER", None, None).await;
     let state = test_state(pool.clone()).await;
@@ -250,9 +235,7 @@ async fn insert_work_type(
     max_held_minutes: Option<i32>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -279,9 +262,7 @@ async fn insert_worker(
     work_type_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query!(
@@ -310,9 +291,7 @@ async fn insert_customer_l2(pool: &PgPool, name: &str) -> i64 {
     // 为 fixture L1），改 query! 会触发 sqlx::prepare 重新生成 .sqlx cache（会清掉同
     // worktree 其它测试文件仍在用的离线 metadata）。
     use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let l2_id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(

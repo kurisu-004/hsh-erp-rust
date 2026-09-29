@@ -110,42 +110,42 @@ impl PartStatus {
         }
     }
 
-/// 迁移白名单（2026-09-29：19 条合法迁移，PROGRAMMING 两条入口已废弃）。
-///
-/// to-XXX 流放行：
-/// - `INSPECTION → READY_TO_SHIP`：to_ship 路径
-/// - `INSPECTION → IN_PROCESS`：to_process 路径
-/// - `PROGRAMMING / PENDING / IN_PROCESS → INSPECTION`：to_inspection 路径（任意源状态）
-///
-/// PR-CRUD 新增：
-/// - `READY_TO_SHIP → DELIVERED` (deliver)
-/// - `DELIVERED → COMPLETED` (complete)
-/// - `PENDING/PROGRAMMING/INSPECTION/READY_TO_SHIP/DELIVERED → CANCELLED` (cancel)
-/// - `IN_PROCESS → REPAIRING` (start-repair)
-///
-/// 扫描返修新增（scan-route B 组 to-inspection）：
-/// - `REPAIRING → INSPECTION` (to-inspection：返修完成 → 重新送检)
-///
-/// Phase 1（2026-09-13）补齐 14 端点：
-/// - `PENDING → IN_PROCESS`：place-on-shelf（ON_SHELF 在 DB 是 status=IN_PROCESS +
-///   location=PRODUCTION_SHELF，service 层守 location；状态机仅做 status 白名单）
-/// - `IN_PROCESS → PENDING`：recall-to-pending（service 层要求 location=PRODUCTION_SHELF）
-/// - `PROGRAMMING → PENDING`：recall-to-pending
-/// - `PROGRAMMING → IN_PROCESS`：release-from-programming
-/// - `REPAIRING → IN_PROCESS`：complete-repair（落回生产架）
-/// - `OUTSOURCE → IN_PROCESS`：receive-from-outsource（回生产架）
-/// - `OUTSOURCE → INSPECTION`：receive-from-outsource-to-inspection
-/// - `PENDING → OUTSOURCE`：send-to-outsource（service 层也允许 IN_PROCESS 源走 OUTSOURCE；
-///   状态机放行 PENDING → OUTSOURCE，service 层另守 IN_PROCESS→OUTSOURCE）
-/// - `INSPECTION → REPAIRING`：scan-inspect FAIL
-/// - `REPAIRING → CANCELLED`：cancel 路径
-/// - `OUTSOURCE → CANCELLED`：cancel 路径
-///
-/// 2026-09-29 废弃：
-/// - 删除 `PENDING → PROGRAMMING`（原 send-to-programming；端点已下线）
-/// - 删除 `IN_PROCESS → PROGRAMMING`（原 recall-to-programming；端点已下线）
-/// - 保留 `PROGRAMMING → PENDING/IN_PROCESS/INSPECTION/CANCELLED` 共 4 条出口供
-///   历史数据消化
+    /// 迁移白名单（2026-09-29：19 条合法迁移，PROGRAMMING 两条入口已废弃）。
+    ///
+    /// to-XXX 流放行：
+    /// - `INSPECTION → READY_TO_SHIP`：to_ship 路径
+    /// - `INSPECTION → IN_PROCESS`：to_process 路径
+    /// - `PROGRAMMING / PENDING / IN_PROCESS → INSPECTION`：to_inspection 路径（任意源状态）
+    ///
+    /// PR-CRUD 新增：
+    /// - `READY_TO_SHIP → DELIVERED` (deliver)
+    /// - `DELIVERED → COMPLETED` (complete)
+    /// - `PENDING/PROGRAMMING/INSPECTION/READY_TO_SHIP/DELIVERED → CANCELLED` (cancel)
+    /// - `IN_PROCESS → REPAIRING` (start-repair)
+    ///
+    /// 扫描返修新增（scan-route B 组 to-inspection）：
+    /// - `REPAIRING → INSPECTION` (to-inspection：返修完成 → 重新送检)
+    ///
+    /// Phase 1（2026-09-13）补齐 14 端点：
+    /// - `PENDING → IN_PROCESS`：place-on-shelf（ON_SHELF 在 DB 是 status=IN_PROCESS +
+    ///   location=PRODUCTION_SHELF，service 层守 location；状态机仅做 status 白名单）
+    /// - `IN_PROCESS → PENDING`：recall-to-pending（service 层要求 location=PRODUCTION_SHELF）
+    /// - `PROGRAMMING → PENDING`：recall-to-pending
+    /// - `PROGRAMMING → IN_PROCESS`：release-from-programming
+    /// - `REPAIRING → IN_PROCESS`：complete-repair（落回生产架）
+    /// - `OUTSOURCE → IN_PROCESS`：receive-from-outsource（回生产架）
+    /// - `OUTSOURCE → INSPECTION`：receive-from-outsource-to-inspection
+    /// - `PENDING → OUTSOURCE`：send-to-outsource（service 层也允许 IN_PROCESS 源走 OUTSOURCE；
+    ///   状态机放行 PENDING → OUTSOURCE，service 层另守 IN_PROCESS→OUTSOURCE）
+    /// - `INSPECTION → REPAIRING`：scan-inspect FAIL
+    /// - `REPAIRING → CANCELLED`：cancel 路径
+    /// - `OUTSOURCE → CANCELLED`：cancel 路径
+    ///
+    /// 2026-09-29 废弃：
+    /// - 删除 `PENDING → PROGRAMMING`（原 send-to-programming；端点已下线）
+    /// - 删除 `IN_PROCESS → PROGRAMMING`（原 recall-to-programming；端点已下线）
+    /// - 保留 `PROGRAMMING → PENDING/IN_PROCESS/INSPECTION/CANCELLED` 共 4 条出口供
+    ///   历史数据消化
     ///
     /// IN_PROCESS+WORKER 拒绝 / IN_PROCESS+非 PRODUCTION_SHELF 拒绝走
     /// service 层组合校验（仿 myERP `service/part.py:4140-4164`），不污染

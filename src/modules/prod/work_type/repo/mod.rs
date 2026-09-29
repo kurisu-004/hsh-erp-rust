@@ -85,18 +85,9 @@ pub use sql::WorkTypeRepo;
 pub trait WorkTypeRepoTrait: Send {
     // ── t_work_type（9）──
     async fn get_by_id(&mut self, id: i64) -> Result<Option<TWorkType>, sqlx::Error>;
-    async fn get_by_code<'a>(
-        &mut self,
-        code: &'a str,
-    ) -> Result<Option<TWorkType>, sqlx::Error>;
-    async fn list_process_ids(
-        &mut self,
-        work_type_id: i64,
-    ) -> Result<Vec<i64>, sqlx::Error>;
-    async fn list_by_ids<'a>(
-        &mut self,
-        ids: &'a [i64],
-    ) -> Result<Vec<TWorkType>, sqlx::Error>;
+    async fn get_by_code<'a>(&mut self, code: &'a str) -> Result<Option<TWorkType>, sqlx::Error>;
+    async fn list_process_ids(&mut self, work_type_id: i64) -> Result<Vec<i64>, sqlx::Error>;
+    async fn list_by_ids<'a>(&mut self, ids: &'a [i64]) -> Result<Vec<TWorkType>, sqlx::Error>;
     async fn list_with_filters<'a>(
         &mut self,
         code_like: Option<&'a str>,
@@ -135,10 +126,7 @@ pub trait WorkTypeRepoTrait: Send {
         version: i32,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
-    async fn count_work_type_references(
-        &mut self,
-        work_type_id: i64,
-    ) -> Result<i64, sqlx::Error>;
+    async fn count_work_type_references(&mut self, work_type_id: i64) -> Result<i64, sqlx::Error>;
 
     /// 保留 `Result<_, AppError>` 返回类型（与原 `repo.rs` 一致），让跨模块静态
     /// 调用方 `prod::worker_pool::service` 走 ZST 调用路径时 `?` 自动转换。
@@ -151,10 +139,7 @@ pub trait WorkTypeRepoTrait: Send {
     // ── 跨域 helper（2）── 委托到 process 域 ZST 静态方法 ────────────
     /// 单条查 process（活跃行）。供本域 `WorkTypeProcessService::set_work_type_processes`
     /// 校验 `process_id` 存在性。
-    async fn process_get_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<TProcess>, sqlx::Error>;
+    async fn process_get_by_id(&mut self, id: i64) -> Result<Option<TProcess>, sqlx::Error>;
     /// 批量查 process（活跃行）。空切片短路返回空 Vec。供本域
     /// `WorkTypeProcessService::set_work_type_processes` 一次性校验 items 里所有
     /// `process_id` 存在性，防 N+1。
@@ -202,10 +187,7 @@ impl WorkTypeRepoTrait for &mut PgConnection {
         WorkTypeRepo::get_by_id(&mut **self, id).await
     }
 
-    async fn get_by_code<'b>(
-        &mut self,
-        code: &'b str,
-    ) -> Result<Option<TWorkType>, sqlx::Error> {
+    async fn get_by_code<'b>(&mut self, code: &'b str) -> Result<Option<TWorkType>, sqlx::Error> {
         WorkTypeRepo::get_by_code(&mut **self, code).await
     }
 
@@ -213,10 +195,7 @@ impl WorkTypeRepoTrait for &mut PgConnection {
         WorkTypeRepo::list_process_ids(&mut **self, work_type_id).await
     }
 
-    async fn list_by_ids<'b>(
-        &mut self,
-        ids: &'b [i64],
-    ) -> Result<Vec<TWorkType>, sqlx::Error> {
+    async fn list_by_ids<'b>(&mut self, ids: &'b [i64]) -> Result<Vec<TWorkType>, sqlx::Error> {
         WorkTypeRepo::list_by_ids(&mut **self, ids).await
     }
 
@@ -293,10 +272,7 @@ impl WorkTypeRepoTrait for &mut PgConnection {
         WorkTypeRepo::soft_delete(&mut **self, id, version, updated_by).await
     }
 
-    async fn count_work_type_references(
-        &mut self,
-        work_type_id: i64,
-    ) -> Result<i64, sqlx::Error> {
+    async fn count_work_type_references(&mut self, work_type_id: i64) -> Result<i64, sqlx::Error> {
         WorkTypeRepo::count_work_type_references(&mut **self, work_type_id).await
     }
 
@@ -308,10 +284,7 @@ impl WorkTypeRepoTrait for &mut PgConnection {
     }
 
     // ── 跨域 helper（2）── 一行委托 process 域 ZST 静态方法 ─────────
-    async fn process_get_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<TProcess>, sqlx::Error> {
+    async fn process_get_by_id(&mut self, id: i64) -> Result<Option<TProcess>, sqlx::Error> {
         use crate::modules::prod::process::repo::ProcessRepo;
         ProcessRepo::get_by_id(&mut **self, id, false).await
     }

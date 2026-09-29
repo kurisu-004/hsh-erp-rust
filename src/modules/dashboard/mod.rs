@@ -30,8 +30,8 @@ pub mod service;
 pub mod vo;
 
 use crate::state::AppState;
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use std::sync::Arc;
 
 /// `/ws/*` 入口（WebSocket）：当前唯一端点 `/ws/dashboard`

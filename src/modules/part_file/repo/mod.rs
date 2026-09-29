@@ -92,10 +92,7 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
 #[async_trait]
 pub trait PartFileRepoTrait: Send {
     // ── sql.rs 6 方法 trait 化 ──
-    async fn create_part_file<'a>(
-        &mut self,
-        nf: NewPartFile<'a>,
-    ) -> Result<i64, sqlx::Error>;
+    async fn create_part_file<'a>(&mut self, nf: NewPartFile<'a>) -> Result<i64, sqlx::Error>;
     async fn get_by_id(
         &mut self,
         id: i64,
@@ -130,10 +127,7 @@ pub trait PartFileRepoTrait: Send {
     /// `SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL`。
     async fn part_owner_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error>;
     /// `SELECT id FROM t_assembly WHERE id = $1 AND deleted_at IS NULL`。
-    async fn assembly_owner_exists(
-        &mut self,
-        assembly_id: i64,
-    ) -> Result<bool, sqlx::Error>;
+    async fn assembly_owner_exists(&mut self, assembly_id: i64) -> Result<bool, sqlx::Error>;
 
     // ── 软删 helper（2）── 从原 service `soft_delete_file` / `bind_uploaded_file` 迁来
     /// 单条软删（带版本号 OCC）：原 `soft_delete_file` 的 UPDATE 语句。
@@ -191,10 +185,7 @@ pub trait PartFileRepoTrait: Send {
 #[async_trait]
 impl PartFileRepoTrait for &mut PgConnection {
     // ── sql.rs 6 方法一行委托 ──
-    async fn create_part_file<'b>(
-        &mut self,
-        nf: NewPartFile<'b>,
-    ) -> Result<i64, sqlx::Error> {
+    async fn create_part_file<'b>(&mut self, nf: NewPartFile<'b>) -> Result<i64, sqlx::Error> {
         PartFileRepo::create_part_file(&mut **self, nf).await
     }
 
@@ -231,7 +222,8 @@ impl PartFileRepoTrait for &mut PgConnection {
         limit: i64,
         offset: i64,
     ) -> Result<(Vec<TPartFile>, i64), sqlx::Error> {
-        PartFileRepo::list_with_filters(&mut **self, owner_kind, owner_id, kind, limit, offset).await
+        PartFileRepo::list_with_filters(&mut **self, owner_kind, owner_id, kind, limit, offset)
+            .await
     }
 
     async fn list_by_owner<'b>(
@@ -243,29 +235,21 @@ impl PartFileRepoTrait for &mut PgConnection {
     }
 
     // ── 跨域 owner 校验（2）── inline SQL（迁自原 service `assert_owner_exists`）
-    async fn part_owner_exists(
-        &mut self,
-        part_id: i64,
-    ) -> Result<bool, sqlx::Error> {
-        let exists: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(part_id)
-        .fetch_optional(&mut **self)
-        .await?;
+    async fn part_owner_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error> {
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
+                .bind(part_id)
+                .fetch_optional(&mut **self)
+                .await?;
         Ok(exists.is_some())
     }
 
-    async fn assembly_owner_exists(
-        &mut self,
-        assembly_id: i64,
-    ) -> Result<bool, sqlx::Error> {
-        let exists: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM t_assembly WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(assembly_id)
-        .fetch_optional(&mut **self)
-        .await?;
+    async fn assembly_owner_exists(&mut self, assembly_id: i64) -> Result<bool, sqlx::Error> {
+        let exists: Option<(i64,)> =
+            sqlx::query_as("SELECT id FROM t_assembly WHERE id = $1 AND deleted_at IS NULL")
+                .bind(assembly_id)
+                .fetch_optional(&mut **self)
+                .await?;
         Ok(exists.is_some())
     }
 

@@ -13,8 +13,8 @@
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
-mod group;
 mod attach_batches;
+mod group;
+mod note;
 mod print;
 mod scan;
-mod note;

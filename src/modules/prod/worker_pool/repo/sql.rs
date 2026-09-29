@@ -18,8 +18,8 @@ use sqlx::{PgConnection, PgExecutor};
 
 use crate::shared::error::AppError;
 
-use crate::modules::prod::worker_pool::vo::PoolBatchItem;
 use crate::modules::prod::worker_pool::model::{HeldBatchItem, TakenItem};
+use crate::modules::prod::worker_pool::vo::PoolBatchItem;
 
 #[derive(Debug, sqlx::FromRow)]
 struct TakenRow {

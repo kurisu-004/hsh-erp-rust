@@ -55,7 +55,6 @@ use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture, test_pool};
 //    `insert_serial_counter` / `make_pdf_bytes` / `make_pdf_2_pages` /
 //    `test_current_user` / `seed_assembly` 等本地 helper
 
-
 async fn setup() -> (PgPool, AssemblyFixture) {
     let pool = test_pool().await;
     let fx = load_assembly_fixture(&pool).await;

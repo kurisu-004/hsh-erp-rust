@@ -41,9 +41,7 @@ pub mod sql;
 // 重导出 sql.rs 中的 ZST struct / 中间聚合结构 / 行精简类型。
 // `super::repo::{DashboardRepo, TopPartsData, RecentBatchesData, BatchLite, PartLite}`
 // 路径不破（service 装配层会用到）。
-pub use sql::{
-    BatchLite, DashboardRepo, PartLite, RecentBatchesData, TopPartsData,
-};
+pub use sql::{BatchLite, DashboardRepo, PartLite, RecentBatchesData, TopPartsData};
 
 /// dashboard 域数据访问 trait（4 个聚合方法，对应 dashboard snapshot 的 4 个维度）。
 ///
@@ -61,22 +59,24 @@ pub use sql::{
 #[async_trait]
 pub trait DashboardRepoTrait: Send {
     /// 未来 N 天交付分桶（counter buckets）。0 计数天也填充（保证 7 天固定 7 条）。
-    async fn snapshot_counters(&mut self, days: i64)
-        -> Result<Vec<crate::modules::dashboard::vo::UpcomingDeliveryBucket>, sqlx::Error>;
+    async fn snapshot_counters(
+        &mut self,
+        days: i64,
+    ) -> Result<Vec<crate::modules::dashboard::vo::UpcomingDeliveryBucket>, sqlx::Error>;
 
     /// 产线架 + IN_PROCESS 批次 + 品检区批次 + 客户 / 工序 名字查表。
     /// 一次调用拉全量，返回 `TopPartsData` 富结构；service 内部聚合 → `OnProductionShelfGroup`。
-    async fn snapshot_top_parts(&mut self, top_n: i64)
-        -> Result<TopPartsData, sqlx::Error>;
+    async fn snapshot_top_parts(&mut self, top_n: i64) -> Result<TopPartsData, sqlx::Error>;
 
     /// 工人持有 IN_PROCESS + 客户路径 + PICKED_UP 时间。
     /// 返回 `RecentBatchesData` 富结构；service 内部聚合 → `in_process` items。
-    async fn snapshot_recent_batches(&mut self, top_n: i64)
-        -> Result<RecentBatchesData, sqlx::Error>;
+    async fn snapshot_recent_batches(
+        &mut self,
+        top_n: i64,
+    ) -> Result<RecentBatchesData, sqlx::Error>;
 
     /// 工人 id → name 映射（worker-held items 用），service 二次装配时按 holder_id 查名字。
-    async fn snapshot_workers(&mut self, ids: &[i64])
-        -> Result<HashMap<i64, String>, sqlx::Error>;
+    async fn snapshot_workers(&mut self, ids: &[i64]) -> Result<HashMap<i64, String>, sqlx::Error>;
 }
 
 /// 把 `DashboardRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借
@@ -95,10 +95,7 @@ impl DashboardRepoTrait for &mut PgConnection {
         DashboardRepo::snapshot_counters(&mut **self, days).await
     }
 
-    async fn snapshot_top_parts(
-        &mut self,
-        top_n: i64,
-    ) -> Result<TopPartsData, sqlx::Error> {
+    async fn snapshot_top_parts(&mut self, top_n: i64) -> Result<TopPartsData, sqlx::Error> {
         DashboardRepo::snapshot_top_parts(&mut **self, top_n).await
     }
 
@@ -109,10 +106,7 @@ impl DashboardRepoTrait for &mut PgConnection {
         DashboardRepo::snapshot_recent_batches(&mut **self, top_n).await
     }
 
-    async fn snapshot_workers(
-        &mut self,
-        ids: &[i64],
-    ) -> Result<HashMap<i64, String>, sqlx::Error> {
+    async fn snapshot_workers(&mut self, ids: &[i64]) -> Result<HashMap<i64, String>, sqlx::Error> {
         DashboardRepo::snapshot_workers(&mut **self, ids).await
     }
 }

@@ -91,7 +91,10 @@ async fn bootstrap_with_wecom(
 /// 成功路径的 bootstrap（mock 返回 fixture 的 MANAGER 绑定）
 async fn bootstrap() -> (PgPool, axum::Router, IamFixture, WecomFixture) {
     bootstrap_with_wecom(
-        Arc::new(mock_ok(WecomFixture::CORP_ID, WecomFixture::MANAGER_WX_USER_ID)),
+        Arc::new(mock_ok(
+            WecomFixture::CORP_ID,
+            WecomFixture::MANAGER_WX_USER_ID,
+        )),
         WecomFixture::CORP_ID,
     )
     .await
@@ -111,7 +114,10 @@ async fn fresh_app(pool: &PgPool) -> axum::Router {
     test_app(
         hsh_erp_test_support::test_state_with_wecom(
             pool.clone(),
-            Arc::new(mock_ok(WecomFixture::CORP_ID, WecomFixture::MANAGER_WX_USER_ID)),
+            Arc::new(mock_ok(
+                WecomFixture::CORP_ID,
+                WecomFixture::MANAGER_WX_USER_ID,
+            )),
             WecomFixture::CORP_ID,
         )
         .await,
@@ -133,9 +139,7 @@ async fn wx_login_success_returns_token_pair_with_correct_roles() {
     let data = &env["data"];
     let token = data["token"].as_str().expect("data.token");
     assert!(token.len() > 20, "access token 不应为空：{token}");
-    assert!(
-        data["refresh_token"].as_str().expect("refresh").len() > 20
-    );
+    assert!(data["refresh_token"].as_str().expect("refresh").len() > 20);
     assert_eq!(data["user"]["username"], fx.manager_username);
     assert_eq!(data["user"]["roles"][0], "MANAGER");
     assert_eq!(
@@ -258,8 +262,7 @@ async fn fresh_app_with_userid_from_corp(
 
 #[tokio::test]
 async fn wx_login_inactive_bound_user_returns_40101() {
-    let app =
-        fresh_app_with_userid(WecomFixture::INACTIVE_WX_USER_ID).await;
+    let app = fresh_app_with_userid(WecomFixture::INACTIVE_WX_USER_ID).await;
 
     let (status, env) = wx_login(app, "valid-code").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "envelope = {env}");
@@ -290,12 +293,8 @@ async fn wx_login_not_configured_returns_40109() {
     let pool = test_pool().await;
     let _fx = load_iam_fixture(&pool).await;
     let _wfx = load_wecom_fixture(&pool).await;
-    let state = hsh_erp_test_support::test_state_with_wecom(
-        pool,
-        Arc::new(NoopWeComClient),
-        "",
-    )
-    .await;
+    let state =
+        hsh_erp_test_support::test_state_with_wecom(pool, Arc::new(NoopWeComClient), "").await;
     let app = test_app(state);
 
     let (status, env) = wx_login(app, "valid-code").await;
@@ -313,7 +312,12 @@ async fn wx_login_without_authorization_header_is_not_401() {
     let app = fresh_app(&_pool).await;
 
     // 请求体里**没有** Authorization 头（`wx_login` helper 不加）
-    let req = json_request("POST", WX_LOGIN, Some(json!({ "code": "valid-code" })), None);
+    let req = json_request(
+        "POST",
+        WX_LOGIN,
+        Some(json!({ "code": "valid-code" })),
+        None,
+    );
     assert!(
         req.headers().get(AUTHORIZATION).is_none(),
         "本用例前提：请求不带 Authorization 头"
@@ -351,10 +355,16 @@ async fn wx_login_idempotency_key_does_not_cache_jwt_response() {
         )
         .await;
         let app = test_app(state);
-        let mut req =
-            json_request("POST", WX_LOGIN, Some(json!({ "code": "valid-code" })), None);
-        req.headers_mut()
-            .insert(HeaderName::from_static("idempotency-key"), key.parse().unwrap());
+        let mut req = json_request(
+            "POST",
+            WX_LOGIN,
+            Some(json!({ "code": "valid-code" })),
+            None,
+        );
+        req.headers_mut().insert(
+            HeaderName::from_static("idempotency-key"),
+            key.parse().unwrap(),
+        );
         let (status, env) = send(app, req).await;
         assert_eq!(status, StatusCode::OK, "envelope = {env}");
         tokens.push(env["data"]["token"].as_str().unwrap().to_string());
@@ -382,7 +392,10 @@ async fn bind_bootstrap() -> (PgPool, IamFixture, WecomFixture, String, String) 
     let wfx = load_wecom_fixture(&pool).await;
     let state = hsh_erp_test_support::test_state_with_wecom(
         pool.clone(),
-        Arc::new(mock_ok(WecomFixture::CORP_ID, WecomFixture::CLERK_WX_USER_ID)),
+        Arc::new(mock_ok(
+            WecomFixture::CORP_ID,
+            WecomFixture::CLERK_WX_USER_ID,
+        )),
         WecomFixture::CORP_ID,
     )
     .await;

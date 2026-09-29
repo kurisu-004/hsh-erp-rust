@@ -215,21 +215,19 @@ impl PartService {
             .await?;
         }
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "SENT_TO_OUTSOURCE",
-                from_status: Some(from.as_str()),
-                to_status: Some("OUTSOURCE"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "SENT_TO_OUTSOURCE",
+            from_status: Some(from.as_str()),
+            to_status: Some("OUTSOURCE"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)
@@ -275,18 +273,21 @@ impl PartService {
         validate_shelf_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION").await?;
         assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, req.next_process_id).await?;
         // PR-3：解析 step_id
-        let step_id =
-            ProcessChainRepo::resolve_step_id_by_process(repo.conn_mut(), chain_id, req.next_process_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                        format!(
-                            "chain {} 内找不到 process_id={} 的活跃 step",
-                            chain_id, req.next_process_id
-                        ),
-                    )
-                })?;
+        let step_id = ProcessChainRepo::resolve_step_id_by_process(
+            repo.conn_mut(),
+            chain_id,
+            req.next_process_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                format!(
+                    "chain {} 内找不到 process_id={} 的活跃 step",
+                    chain_id, req.next_process_id
+                ),
+            )
+        })?;
         let n = mark_batch_with_status_and_meta(
             repo.conn_mut(),
             batch.id,
@@ -342,21 +343,19 @@ impl PartService {
             }
         }
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "RECEIVED_FROM_OUTSOURCE",
-                from_status: Some("OUTSOURCE"),
-                to_status: Some("IN_PROCESS"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "RECEIVED_FROM_OUTSOURCE",
+            from_status: Some("OUTSOURCE"),
+            to_status: Some("IN_PROCESS"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)
@@ -454,21 +453,19 @@ impl PartService {
             }
         }
         let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
-        repo.insert_part_event(
-            NewPartEvent {
-                id: snowflake.next_id(),
-                part_id,
-                event_type: "RECEIVED_FROM_OUTSOURCE_INSPECTED",
-                from_status: Some("OUTSOURCE"),
-                to_status: Some("INSPECTION"),
-                batch_id: Some(batch.id),
-                quantity: Some(batch.quantity),
-                drawing_code: Some(&part.drawing_no),
-                badge_code: None,
-                note: req.note.as_deref(),
-                created_by: Some(current.id),
-            },
-        )
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "RECEIVED_FROM_OUTSOURCE_INSPECTED",
+            from_status: Some("OUTSOURCE"),
+            to_status: Some("INSPECTION"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
         .await?;
         let fresh = repo
             .get_part_inspected(part_id)

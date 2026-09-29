@@ -32,12 +32,12 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-use hsh_erp_test_support::{
-    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app,
-    test_pool, test_state,
-};
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+use hsh_erp_test_support::{
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app, test_pool,
+    test_state,
+};
 
 // ===========================================================================
 //  Bootstrap helpers（PR13 Phase H 风格）

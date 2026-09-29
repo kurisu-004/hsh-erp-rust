@@ -22,6 +22,6 @@
 pub mod snapshot;
 
 pub use snapshot::{
-    DashboardItem, DashboardSnapshot, OnProductionShelfGroup, UpcomingDeliveryBucket,
-    WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg,
+    DashboardItem, DashboardSnapshot, OnProductionShelfGroup, UpcomingDeliveryBucket, WsEventMsg,
+    WsHeartbeatMsg, WsSnapshotMsg,
 };

@@ -17,9 +17,9 @@ use std::sync::{Arc, OnceLock};
 use chrono::Utc;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+use rsa::rand_core::OsRng;
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
-use rsa::rand_core::OsRng;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::config::{AppConfig, JwtConfig, RedisConfig};
@@ -103,7 +103,11 @@ pub fn sample_user(id: i64, username: &str) -> crate::modules::iam::repo::User {
 }
 
 /// 构造一个最小化的 `UserRoleRow`（用于 `list_user_roles_by_user_id` mock 返回）。
-pub fn sample_user_role(id: i64, user_id: i64, role: &str) -> crate::modules::iam::repo::UserRoleRow {
+pub fn sample_user_role(
+    id: i64,
+    user_id: i64,
+    role: &str,
+) -> crate::modules::iam::repo::UserRoleRow {
     let now = chrono::NaiveDate::from_ymd_opt(2026, 9, 23)
         .unwrap()
         .and_hms_opt(0, 0, 0)

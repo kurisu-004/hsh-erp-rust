@@ -39,12 +39,12 @@
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::part::batch::model::TPartBatch;
 use crate::modules::part::dto::{
     BatchToInspectionRequest, BatchToShipRequest, ToInspectionRequest, ToProcessRequest,
     ToShipRequest,
 };
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::batch::model::TPartBatch;
 use crate::modules::part::vo::{BatchOpFailure, BatchToXxxOut, ToXxxOut};
 use crate::modules::shelf::model::TShelf;
 use crate::modules::shelf::repo::ShelfRepo;
@@ -178,14 +178,12 @@ impl PartService {
         repo: &mut R,
         batch_id: i64,
     ) -> Result<TPartBatch, AppError> {
-        repo.find_batch_by_id(batch_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    format!("batch {batch_id} 不存在"),
-                )
-            })
+        repo.find_batch_by_id(batch_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {batch_id} 不存在"),
+            )
+        })
     }
 
     /// caller 侧乐观锁守卫：比对目标批次的 `version` 与请求携带的期望值。

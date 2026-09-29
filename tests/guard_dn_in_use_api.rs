@@ -32,8 +32,8 @@ use sqlx::PgPool;
 // `load_guard_dn_in_use_fixture(&pool)` 加载 baseline MANAGER user / role
 // （id 段 190-191）；part 域独享 helper 保留为本地函数。
 use hsh_erp_test_support::{
-    GuardDnFixture, json_request, load_guard_dn_in_use_fixture,
-    login_token, pool_snowflake, send, test_app, test_pool, test_state,
+    GuardDnFixture, json_request, load_guard_dn_in_use_fixture, login_token, pool_snowflake, send,
+    test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -117,13 +117,7 @@ async fn insert_part_with_status(
 }
 
 /// 插一个 part_batch（带 status 参数）。
-async fn insert_batch(
-    pool: &PgPool,
-    part_id: i64,
-    batch_no: i32,
-    qty: i32,
-    status: &str,
-) -> i64 {
+async fn insert_batch(pool: &PgPool, part_id: i64, batch_no: i32, qty: i32, status: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let id = pool_snowflake().lock().unwrap().next_id();
     let now = now_naive();
@@ -225,7 +219,12 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, GuardDnFixture
     let pool = test_pool().await;
     let fx = load_guard_dn_in_use_fixture(&pool).await;
     let app = test_app(test_state(pool.clone()).await);
-    let token = login_token(&app, GuardDnFixture::MANAGER_USERNAME, GuardDnFixture::PASSWORD).await;
+    let token = login_token(
+        &app,
+        GuardDnFixture::MANAGER_USERNAME,
+        GuardDnFixture::PASSWORD,
+    )
+    .await;
     (pool, app, token, fx)
 }
 
@@ -304,7 +303,11 @@ async fn soft_delete_part_blocked_by_active_batch_on_delivery_note() {
         ),
     )
     .await;
-    assert_eq!(s, axum::http::StatusCode::CONFLICT, "soft-delete locked: {env}");
+    assert_eq!(
+        s,
+        axum::http::StatusCode::CONFLICT,
+        "soft-delete locked: {env}"
+    );
     assert_eq!(
         env["code"], 21420,
         "BIZ_DELIVERY_NOTE_LOCKED_PART（PR-2 service 层预检）: {env}"
@@ -355,7 +358,11 @@ async fn soft_delete_assembly_blocked_by_child_batch_on_delivery_note() {
         ),
     )
     .await;
-    assert_eq!(s, axum::http::StatusCode::BAD_REQUEST, "soft-delete asm locked: {env}");
+    assert_eq!(
+        s,
+        axum::http::StatusCode::BAD_REQUEST,
+        "soft-delete asm locked: {env}"
+    );
     assert_eq!(
         env["code"], 20307,
         "BIZ_ASSEMBLY_HAS_SHIPMENT（PR-2 JOIN t_part_batch 后应仍命中；HTTP 默认 400）: {env}"

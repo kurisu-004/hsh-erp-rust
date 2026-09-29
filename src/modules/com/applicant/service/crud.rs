@@ -38,7 +38,9 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::applicant::dto::*;
 use crate::modules::com::applicant::model::TApplicant;
-use crate::modules::com::applicant::repo::{ApplicantRepo as ApplicantRepoImpl, ApplicantRepoTrait};
+use crate::modules::com::applicant::repo::{
+    ApplicantRepo as ApplicantRepoImpl, ApplicantRepoTrait,
+};
 use crate::modules::com::applicant::vo::{ApplicantListOut, ApplicantOut};
 use crate::modules::com::customer::repo::CustomerRepo as CustomerRepoImpl;
 use crate::shared::error::{AppError, code};
@@ -135,14 +137,9 @@ impl ApplicantService {
         // `count_with_filters` 同名方法，UFCS / method-call 都会触发 E0034 歧义；
         // 改走 `ApplicantRepoImpl::xxx(&mut *conn, ...)` 静态调用完美避歧义。
         // 顺序 reborrow 每次都是新的一次性借用窗口，borrow checker 接受。
-        let rows = ApplicantRepoImpl::list_with_filters(
-            &mut *conn,
-            customer_id,
-            name_like,
-            limit,
-            offset,
-        )
-        .await?;
+        let rows =
+            ApplicantRepoImpl::list_with_filters(&mut *conn, customer_id, name_like, limit, offset)
+                .await?;
         let total =
             ApplicantRepoImpl::count_with_filters(&mut *conn, customer_id, name_like).await?;
 
@@ -219,7 +216,8 @@ impl ApplicantService {
         }
 
         let new_id = self.snowflake.next_id();
-        repo.create(new_id, name, customer_id, Some(current.id)).await?;
+        repo.create(new_id, name, customer_id, Some(current.id))
+            .await?;
 
         // 重读一次拿 server-side defaults（version / created_at / updated_at）
         let row = repo
@@ -303,9 +301,7 @@ impl ApplicantService {
             return Err(in_use());
         }
 
-        let affected = repo
-            .soft_delete(id, row.version, Some(current.id))
-            .await?;
+        let affected = repo.soft_delete(id, row.version, Some(current.id)).await?;
         if affected == 0 {
             return Err(version_conflict());
         }

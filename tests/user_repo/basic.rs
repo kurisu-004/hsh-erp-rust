@@ -33,8 +33,8 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 // 2026-09-22 重构 #2：sql.rs 拆为 sql/{user,user_role,menu,shelf}.rs free fn；
 // 原 `user_sql::xxx` → `sql::user::xxx`（`UserInsert` / `UserPartialUpdate` 等入参 DTO 仍从
 // `repo` re-export 取，与 handler 层 `state.pool.begin()` + `&mut *tx` 路径同构。
-use hsh_erp_rust::modules::iam::repo::{UserInsert, UserPartialUpdate};
 use hsh_erp_rust::modules::iam::repo::sql::user as user_sql;
+use hsh_erp_rust::modules::iam::repo::{UserInsert, UserPartialUpdate};
 
 // 2026-09-24 PR13 Phase I：fixture 范本化入口。`load_user_repo_fixture(&pool)` 加载
 // 1 menu baseline（PR-C.Final 移除 user + role baseline，避免污染
@@ -212,10 +212,9 @@ async fn list_with_filters_is_active_filters() {
     let active = seed_user(&pool, "active", true).await;
     let _inactive = seed_user(&pool, "inactive", false).await;
 
-    let rows =
-        user_sql::list_users_with_filters(&pool, None, Some(true), 50, 0)
-            .await
-            .expect("list");
+    let rows = user_sql::list_users_with_filters(&pool, None, Some(true), 50, 0)
+        .await
+        .expect("list");
     let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
     assert_eq!(ids, vec![active]);
 }
@@ -428,7 +427,7 @@ async fn update_partial_no_set_phone_keeps_existing() {
         0,
         &UserPartialUpdate {
             full_name: None,
-            set_phone: false, // 不动 phone
+            set_phone: false,           // 不动 phone
             phone: Some("13900139000"), // 即使传 phone 也不更新
             password_hash: None,
             is_active: None,

@@ -84,8 +84,8 @@ pub use crate::modules::part::model::{
     NewPartEvent, TPart, TPartEvent, TPartInspected, TPartRollupState,
 };
 pub use sql::{
-    scale_qty, ChildInheritFields, NewPartCreate, PartListFilters, PartRepo, PartUpdate,
-    PendingProgrammingFilters, PendingProgrammingItem,
+    ChildInheritFields, NewPartCreate, PartListFilters, PartRepo, PartUpdate,
+    PendingProgrammingFilters, PendingProgrammingItem, scale_qty,
 };
 
 /// part 域数据访问 trait（37 方法 = t_part 16 + t_part_batch 17 + t_part_event 1 + 跨域 helper 3）。
@@ -135,10 +135,7 @@ pub trait PartRepoTrait: Send {
     ) -> Result<Option<TPartInspected>, sqlx::Error>;
 
     // ── t_part CRUD（6）──
-    async fn get_part_detail(
-        &mut self,
-        part_id: i64,
-    ) -> Result<Option<TPart>, sqlx::Error>;
+    async fn get_part_detail(&mut self, part_id: i64) -> Result<Option<TPart>, sqlx::Error>;
     async fn create_part<'a>(&mut self, new: NewPartCreate<'a>) -> Result<i64, sqlx::Error>;
     async fn update_part<'a>(
         &mut self,
@@ -156,10 +153,8 @@ pub trait PartRepoTrait: Send {
         &mut self,
         f: &PartListFilters<'a>,
     ) -> Result<Vec<TPart>, sqlx::Error>;
-    async fn count_with_filters<'a>(
-        &mut self,
-        f: &PartListFilters<'a>,
-    ) -> Result<i64, sqlx::Error>;
+    async fn count_with_filters<'a>(&mut self, f: &PartListFilters<'a>)
+    -> Result<i64, sqlx::Error>;
 
     // ── t_part assembly 子件（4）──
     async fn list_by_assembly_id(
@@ -340,10 +335,7 @@ pub trait PartRepoTrait: Send {
     ) -> Result<i64, sqlx::Error>;
 
     // ── t_part_event 事件日志（1）──
-    async fn insert_part_event<'a>(
-        &mut self,
-        e: NewPartEvent<'a>,
-    ) -> Result<(), sqlx::Error>;
+    async fn insert_part_event<'a>(&mut self, e: NewPartEvent<'a>) -> Result<(), sqlx::Error>;
 
     // ── 跨域 helper（2）── 委托 part_batch 静态方法，避免 service 收第二个 conn
     /// part 任一活跃批次是否已挂送货单（委托 `PartBatchRepo::has_active_batch_on_delivery_note`）。
@@ -425,17 +417,11 @@ impl PartRepoTrait for &mut PgConnection {
     }
 
     // ── t_part CRUD（6）── 一行委托 sql::PartRepo ────────────────────
-    async fn get_part_detail(
-        &mut self,
-        part_id: i64,
-    ) -> Result<Option<TPart>, sqlx::Error> {
+    async fn get_part_detail(&mut self, part_id: i64) -> Result<Option<TPart>, sqlx::Error> {
         PartRepo::get_part_detail(&mut **self, part_id).await
     }
 
-    async fn create_part<'b>(
-        &mut self,
-        new: NewPartCreate<'b>,
-    ) -> Result<i64, sqlx::Error> {
+    async fn create_part<'b>(&mut self, new: NewPartCreate<'b>) -> Result<i64, sqlx::Error> {
         PartRepo::create_part(&mut **self, new).await
     }
 
@@ -633,8 +619,13 @@ impl PartRepoTrait for &mut PgConnection {
         worker_id: i64,
         expected_batch_id: Option<i64>,
     ) -> Result<Option<crate::modules::part::batch::model::TPartBatch>, sqlx::Error> {
-        PartRepo::find_worker_held_batch_for_part(&mut **self, part_id, worker_id, expected_batch_id)
-            .await
+        PartRepo::find_worker_held_batch_for_part(
+            &mut **self,
+            part_id,
+            worker_id,
+            expected_batch_id,
+        )
+        .await
     }
 
     // ── t_part_batch mark_*（4）──
@@ -644,8 +635,13 @@ impl PartRepoTrait for &mut PgConnection {
         expected_version: i32,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
-        PartRepo::mark_batch_passed_inspection(&mut **self, batch_id, expected_version, current_user_id)
-            .await
+        PartRepo::mark_batch_passed_inspection(
+            &mut **self,
+            batch_id,
+            expected_version,
+            current_user_id,
+        )
+        .await
     }
 
     async fn mark_batch_inspected(
@@ -655,8 +651,14 @@ impl PartRepoTrait for &mut PgConnection {
         shelf_id: i64,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
-        PartRepo::mark_batch_inspected(&mut **self, batch_id, expected_version, shelf_id, current_user_id)
-            .await
+        PartRepo::mark_batch_inspected(
+            &mut **self,
+            batch_id,
+            expected_version,
+            shelf_id,
+            current_user_id,
+        )
+        .await
     }
 
     async fn mark_batch_failed_inspection(
@@ -734,8 +736,7 @@ impl PartRepoTrait for &mut PgConnection {
         expected_version: i32,
         current_user_id: i64,
     ) -> Result<u64, sqlx::Error> {
-        PartRepo::mark_part_cancelled(&mut **self, part_id, expected_version, current_user_id)
-            .await
+        PartRepo::mark_part_cancelled(&mut **self, part_id, expected_version, current_user_id).await
     }
 
     async fn mark_batch_repairing(
@@ -782,10 +783,7 @@ impl PartRepoTrait for &mut PgConnection {
     }
 
     // ── t_part_event 事件日志（1）──
-    async fn insert_part_event<'b>(
-        &mut self,
-        e: NewPartEvent<'b>,
-    ) -> Result<(), sqlx::Error> {
+    async fn insert_part_event<'b>(&mut self, e: NewPartEvent<'b>) -> Result<(), sqlx::Error> {
         PartRepo::insert_part_event(&mut **self, e).await
     }
 

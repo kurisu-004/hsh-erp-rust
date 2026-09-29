@@ -80,10 +80,7 @@ pub trait IamRepoTrait: Send {
         &mut self,
         user_id: i64,
     ) -> Result<Vec<UserRoleRow>, sqlx::Error>;
-    async fn get_user_role_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<UserRole>, sqlx::Error>;
+    async fn get_user_role_by_id(&mut self, id: i64) -> Result<Option<UserRole>, sqlx::Error>;
     async fn has_user_role_with_scope<'a>(
         &mut self,
         user_id: i64,
@@ -107,8 +104,5 @@ pub trait IamRepoTrait: Send {
     ) -> Result<Vec<Menu>, sqlx::Error>;
 
     // ── t_shelf（1）──
-    async fn get_shelf_by_id(
-        &mut self,
-        id: i64,
-    ) -> Result<Option<Shelf>, sqlx::Error>;
+    async fn get_shelf_by_id(&mut self, id: i64) -> Result<Option<Shelf>, sqlx::Error>;
 }
