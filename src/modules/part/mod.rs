@@ -103,16 +103,8 @@ pub fn router() -> Router<Arc<AppState>> {
             post(handler::recall_to_pending),
         )
         .route(
-            "/{part_id}/send-to-programming",
-            post(handler::send_to_programming),
-        )
-        .route(
             "/{part_id}/release-from-programming",
             post(handler::release_from_programming),
-        )
-        .route(
-            "/{part_id}/recall-to-programming",
-            post(handler::recall_to_programming),
         )
         .route(
             "/{part_id}/send-to-outsource",

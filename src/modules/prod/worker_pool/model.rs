@@ -5,6 +5,10 @@ use serde::Serialize;
 ///
 /// 既有 `refill_for_worker` 与 `assign_batch_to_worker` 复用此结构。**2026-09-14
 /// follow-up-round2 不修改本结构**，避免 break 既有 API 契约。
+///
+/// 2026-09-29 新增 `has_cnc_program` 字段：透传 worker_pool `take_one_from_pool`
+/// 的 EXISTS 子查询结果（与候选池视图 `PoolBatchItem.has_cnc_program` 同源）。
+/// 非破坏性追加（`#[serde(default)]` 兼容历史 caller）。
 #[derive(Debug, Clone, Serialize)]
 pub struct TakenItem {
     #[serde(serialize_with = "serialize_i64")]
@@ -19,6 +23,10 @@ pub struct TakenItem {
     pub planned_delivery_date: Option<chrono::NaiveDate>,
     pub is_urgent: bool,
     pub version: i32,
+    /// 2026-09-29 新增：是否已上传 G_CODE 数控程序（与候选池视图同源）。
+    /// 序列化兼容性：服务端永远序列化（追加字段，旧客户端不报错）。
+    #[serde(default)]
+    pub has_cnc_program: bool,
 }
 
 /// `WorkerPoolState.held_batches` 单条结构。

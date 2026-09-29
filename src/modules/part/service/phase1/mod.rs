@@ -3,8 +3,10 @@
 //! 2026-09-22 D-6 重构：原 `phase1.rs`（3084 行超限）按业务动作拆为子模块：
 //! - `lifecycle_helpers` 1.1 上架 / 召回 + 1.5 批次列表（place_on_shelf /
 //!   recall_to_pending / list_pending_programming / list_batches）
-//! - `programming` 1.2 CNC 编程流转（send_to_programming /
-//!   release_from_programming / recall_to_programming）
+//! - `programming` 1.2 CNC 编程流转（`release_from_programming`）。
+//!   2026-09-29 端点下线：`send_to_programming` 与 `recall_to_programming` 整体
+//!   删除（PROGRAMMING 状态废弃进入路径；新进入路径是工艺链 + CNC step +
+//!   待编程一览由 `t_process.is_cnc` 列驱动）
 //! - `outsource` 1.3 外协流转（send_to_outsource / receive_from_outsource /
 //!   receive_from_outsource_to_inspection / list_outsource_in_flight /
 //!   list_outsource_sendable）
@@ -19,8 +21,7 @@
 //!   list_pickable_by_work_type / list_by_worker）
 //!
 //! - 1.1 上架 / 召回（`place_on_shelf` / `recall_to_pending`）
-//! - 1.2 CNC 编程流转（`send_to_programming` / `release_from_programming` /
-//!   `recall_to_programming` / `pending_programming`）
+//! - 1.2 CNC 编程流转（`release_from_programming` / `pending_programming`）
 //! - 1.3 外协流转（`send_to_outsource` / `receive_from_outsource` /
 //!   `receive_from_outsource_to_inspection` / `outsource_in_flight` /
 //!   `outsource_sendable`）
@@ -32,7 +33,7 @@
 //! - 1.8 批量创建增强（`batch_with_pdfs` / `match_by_excel_items` /
 //!   `batch_update_order_info`）
 //!
-//! 状态机扩展见 `part/statemachine.rs`（共 21 个合法迁移）。
+//! 状态机扩展见 `part/statemachine.rs`（2026-09-29 缩至 19 个合法迁移）。
 //! 错误码全部沿用 `shared/error.rs::code` 已声明常量（201xx / 205xx）。
 //!
 //! ## 批次守恒不变量
@@ -296,38 +297,6 @@ async fn mark_batch_status_only<'e, E: PgExecutor<'e>>(
     .bind(batch_id)
     .bind(expected_version)
     .bind(new_status)
-    .bind(updated_by)
-    .execute(executor)
-    .await?;
-    Ok(r.rows_affected())
-}
-
-/// mark_batch 给 PROGRAMMING/OUTSOURCE 等特殊 location 转换用。
-///
-/// 2026-09-16 PR-3：删 placed_at 写入（列已删）；PENDING/PROGRAMMING 起点
-/// batch 的 current_process_step_id 通常为 NULL（不在生产流），由 caller
-/// 在调本函数前决定。
-#[allow(clippy::too_many_arguments)]
-async fn mark_batch_for_programming<'e, E: PgExecutor<'e>>(
-    executor: E,
-    batch_id: i64,
-    expected_version: i32,
-    new_status: &str,
-    new_location: &str,
-    new_holder_id: Option<i64>,
-    updated_by: i64,
-) -> Result<u64, sqlx::Error> {
-    let r = sqlx::query(
-        "UPDATE t_part_batch SET status = $3, location = $4, current_holder_id = $5, \
-         version = version + 1, updated_at = now(), updated_by = $6 \
-         WHERE id = $1 AND version = $2 AND status NOT IN ('CANCELLED', 'COMPLETED') \
-         AND deleted_at IS NULL",
-    )
-    .bind(batch_id)
-    .bind(expected_version)
-    .bind(new_status)
-    .bind(new_location)
-    .bind(new_holder_id)
     .bind(updated_by)
     .execute(executor)
     .await?;

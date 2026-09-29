@@ -2,8 +2,8 @@
 //!
 //! 对应 Phase 1（2026-09-13）+ 4 个终态流转 + Phase 2（2026-09-13）pick-up：
 //! - 1.1 上架 / 召回（place-on-shelf / recall-to-pending）
-//! - 1.2 CNC 编程流转（send-to-programming / release-from-programming /
-//!   recall-to-programming / pending-programming 列表）
+//! - 1.2 CNC 编程流转（release-from-programming / pending-programming 列表）；
+//!   2026-09-29 端点下线：send-to-programming / recall-to-programming 已删除
 //! - 1.3 外协流转（send-to-outsource / receive-from-outsource /
 //!   receive-from-outsource-to-inspection / outsource-in-flight /
 //!   outsource-sendable 列表）
@@ -17,8 +17,8 @@
 //!
 //! ## 权限模式
 //! - deliver / cancel / complete / place-on-shelf / recall-to-pending /
-//!   send-to-programming / split-batch / cancel-batch：Manager + Clerk
-//! - release-from-programming / recall-to-programming：Manager + CncProgrammer
+//!   split-batch / cancel-batch：Manager + Clerk
+//! - release-from-programming：Manager + CncProgrammer
 //! - send-to-outsource / receive-from-outsource /
 //!   receive-from-outsource-to-inspection / complete-repair / repair-dispatch：
 //!   Manager + Clerk + Inspector
@@ -35,9 +35,8 @@ use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::dto_crud::{
     ByWorkTypeQuery, ByWorkerQuery, CancelBatchRequest, CancelRequest, CompleteRepairRequest,
     CompleteRequest, DeliverRequest, PickUpRequest, PlaceOnShelfRequest,
-    RecallToPendingRequest, RecallToProgrammingRequest, ReceiveFromOutsourceToInspectionRequest,
-    RepairDispatchRequest, SendToOutsourceRequest, SendToProgrammingRequest, SplitBatchRequest,
-    StartRepairRequest,
+    RecallToPendingRequest, ReceiveFromOutsourceToInspectionRequest,
+    RepairDispatchRequest, SendToOutsourceRequest, SplitBatchRequest, StartRepairRequest,
 };
 use crate::modules::part::service::PartService;
 use crate::modules::part::vo::{PartListOut, PartOut};
@@ -179,24 +178,12 @@ pub async fn recall_to_pending(
 }
 
 /// `POST /api/v2/parts/{part_id}/send-to-programming`
-pub async fn send_to_programming(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<SendToProgrammingRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::send_to_programming(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_SENT_TO_PROGRAMMING",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
+/// 2026-09-29 端点下线 —— 删除（PROGRAMMING 状态废弃进入路径）。
+///
+/// 旧行为：`PENDING → PROGRAMMING`（location='OFFICE'）。由编程员通过
+/// 工艺链 + CNC step 直接进入生产流替代；待编程一览由 `t_process.is_cnc`
+/// 列驱动。`POST /parts/{part_id}/send-to-programming` 已返回 404。
+///
 /// `POST /api/v2/parts/{part_id}/release-from-programming`
 pub async fn release_from_programming(
     State(state): State<Arc<AppState>>,
@@ -217,32 +204,17 @@ pub async fn release_from_programming(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/parts/{part_id}/recall-to-programming`
-pub async fn recall_to_programming(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<RecallToProgrammingRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::recall_to_programming(&mut *tx, &state.snowflake, part_id, req, &current)
-        .await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_RECALLED_TO_PROGRAMMING",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
 /// `GET /api/v2/parts/pending-programming`
 ///
 /// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
+///
+/// 2026-09-29：基于 `t_process.is_cnc` 列的新过滤规则 + `has_cnc_program?` query 参数
+/// （Tab 切换）；详见 service `PartService::list_pending_programming` 与 docs
+/// `docs/api/parts/lifecycle.md`。
 pub async fn list_pending_programming(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
-    Query(query): Query<crate::modules::part::dto_crud::PartListQuery>,
+    Query(query): Query<crate::modules::part::dto_crud::PendingProgrammingQuery>,
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = PartService::list_pending_programming(&mut *conn, &query, &current).await?;

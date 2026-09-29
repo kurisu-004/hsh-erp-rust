@@ -33,6 +33,9 @@ struct TakenRow {
     planned_delivery_date: Option<chrono::NaiveDate>,
     is_urgent: bool,
     version: i32,
+    /// 2026-09-29 新增：是否已上传 G_CODE 数控程序。
+    /// 真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`
+    has_cnc_program: bool,
 }
 
 /// `list_candidates_by_process_all_shelves` 行结构（JOIN 5 表后的扁平投影）。
@@ -68,6 +71,8 @@ struct CandidateRow {
     shelf_id: i64,
     shelf_code: String,
     shelf_name: String,
+    /// 2026-09-29 新增：是否已上传 G_CODE 数控程序。
+    has_cnc_program: bool,
 }
 
 pub struct WorkerPoolRepo;
@@ -106,7 +111,14 @@ impl WorkerPoolRepo {
                 WHERE w.id = $1
             ),
             candidate AS (
-                SELECT pb.id, pb.version, pb.part_id
+                SELECT pb.id, pb.version, pb.part_id,
+                       -- 2026-09-29 新增：has_cnc_program!（已上传 G_CODE → TRUE）。
+                       -- 见 ORDER BY 第 1 键：已编程 batch 优先 take（编程员已完成
+                       -- G_CODE 上传，下一步即可上机）。
+                       EXISTS (SELECT 1 FROM t_part_file pf
+                               WHERE pf.part_id = pb.part_id
+                                 AND pf.kind = 'G_CODE'
+                                 AND pf.deleted_at IS NULL) AS "has_cnc_program!"
                 FROM t_part_batch pb
                 JOIN t_part p ON p.id = pb.part_id
                 -- 2026-09-16 PR-3 批次 step 化：next_process_id 列已删，
@@ -121,6 +133,13 @@ impl WorkerPoolRepo {
                   AND s.deleted_at IS NULL
                   AND (SELECT n FROM held) < (SELECT max_held FROM max_batches)
                 ORDER BY
+                    -- 2026-09-29 新增：已编程 batch 优先（has_cnc_program DESC）。
+                    -- 同交期同加急时，先把已上传 G_CODE 的工件派给工人，省
+                    -- 「工人拿到手 → 还要等编程员传程序」这段等待。
+                    EXISTS (SELECT 1 FROM t_part_file pf
+                            WHERE pf.part_id = pb.part_id
+                              AND pf.kind = 'G_CODE'
+                              AND pf.deleted_at IS NULL) DESC,
                     p.system_delivery_date ASC NULLS LAST,
                     p.planned_delivery_date ASC NULLS LAST,
                     p.is_urgent DESC,
@@ -147,7 +166,9 @@ impl WorkerPoolRepo {
             SELECT ub.id AS batch_id, ub.part_id, ub.batch_no, ub.quantity,
                    sp.serial_no, sp.drawing_no,
                    sp.system_delivery_date, sp.planned_delivery_date,
-                   sp.is_urgent, ub.version
+                   sp.is_urgent, ub.version,
+                   -- 2026-09-29 新增：从 candidate 透传 has_cnc_program
+                   (SELECT "has_cnc_program!" FROM candidate WHERE candidate.id = ub.id) AS "has_cnc_program!"
             FROM upd_batch ub JOIN sel_part sp ON sp.id = ub.part_id
             "#,
             worker_id,
@@ -169,6 +190,8 @@ impl WorkerPoolRepo {
             planned_delivery_date: r.planned_delivery_date,
             is_urgent: r.is_urgent,
             version: r.version,
+            // 2026-09-29 新增：透传 has_cnc_program 到 TakenItem 出参（taken 部分）
+            has_cnc_program: r.has_cnc_program,
         }))
     }
 
@@ -209,7 +232,12 @@ impl WorkerPoolRepo {
             r#"
             WITH
             candidate AS (
-                SELECT pb.id, pb.version, pb.part_id
+                SELECT pb.id, pb.version, pb.part_id,
+                       -- 2026-09-29 新增：与 take_one_from_pool 同源 EXISTS（admin_assign 不走优先级，但透传 has_cnc_program 给前端）
+                       EXISTS (SELECT 1 FROM t_part_file pf
+                               WHERE pf.part_id = pb.part_id
+                                 AND pf.kind = 'G_CODE'
+                                 AND pf.deleted_at IS NULL) AS "has_cnc_program!"
                 FROM t_part_batch pb
                 JOIN t_part p ON p.id = pb.part_id
                 WHERE pb.id = $3
@@ -239,7 +267,8 @@ impl WorkerPoolRepo {
             SELECT ub.id AS batch_id, ub.part_id, ub.batch_no, ub.quantity,
                    sp.serial_no, sp.drawing_no,
                    sp.system_delivery_date, sp.planned_delivery_date,
-                   sp.is_urgent, ub.version
+                   sp.is_urgent, ub.version,
+                   (SELECT "has_cnc_program!" FROM candidate WHERE candidate.id = ub.id) AS "has_cnc_program!"
             FROM upd_batch ub JOIN sel_part sp ON sp.id = ub.part_id
             "#,
             worker_id,
@@ -261,6 +290,8 @@ impl WorkerPoolRepo {
             planned_delivery_date: r.planned_delivery_date,
             is_urgent: r.is_urgent,
             version: r.version,
+            // 2026-09-29 新增：透传 has_cnc_program
+            has_cnc_program: r.has_cnc_program,
         }))
     }
 
@@ -301,7 +332,13 @@ impl WorkerPoolRepo {
                 cp.name AS "parent_customer_name?",
                 s.id AS "shelf_id!",
                 s.code AS "shelf_code!",
-                s.name AS "shelf_name!"
+                s.name AS "shelf_name!",
+                -- 2026-09-29 新增：是否已上传 G_CODE 数控程序（与 take_one_from_pool 同源 EXISTS 子查询）。
+                --   候选池视图（admin 端点）展示该字段便于运营筛选"待编程 vs 待上机"。
+                EXISTS (SELECT 1 FROM t_part_file pf
+                        WHERE pf.part_id = pb.part_id
+                          AND pf.kind = 'G_CODE'
+                          AND pf.deleted_at IS NULL) AS "has_cnc_program!"
             FROM t_part_batch pb
             JOIN t_part p ON p.id = pb.part_id
             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL
@@ -357,6 +394,8 @@ impl WorkerPoolRepo {
                     note: r.note,
                     // PR-3 批次 step 化：placed_at 列已删，不再展示
                     version: r.batch_version,
+                    // 2026-09-29 新增：透传 has_cnc_program 到 PoolBatchItem 出参
+                    has_cnc_program: r.has_cnc_program,
                 }
             })
             .collect())

@@ -370,6 +370,11 @@ impl WorkerPoolService {
             planned_delivery_date: Some(part.planned_delivery_date),
             is_urgent: part.is_urgent,
             version: batch.version + 1,
+            // 2026-09-29 新增：admin_remove 透传 has_cnc_program（与候选池视图同源 EXISTS 子查询）；
+            //   此处走 PartRepo::get_part_inspected / mark_batch_returned 等不开销 EXISTS，
+            //   但 admin_remove 的输入已经过 take_specific_from_pool 验证了候选池范围；
+            //   若需展示给前端可后续接入；当前 default=false 即可。
+            has_cnc_program: false,
         })
     }
 

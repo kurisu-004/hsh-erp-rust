@@ -197,6 +197,14 @@ pub struct PartListItem {
     /// 真相源：`t_part WHERE assembly_id = $1 AND deleted_at IS NULL` 的 COUNT。
     #[serde(default)]
     pub child_count: Option<i64>,
+    /// 2026-09-29 新增：是否已上传 G_CODE（数控程序）。
+    /// - 真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`
+    /// - 用途：`GET /parts/pending-programming` 的 Tab 切换 (`has_cnc_program` query 参数) +
+    ///   worker_pool 候选池的自动分配优先级（已上传 G_CODE 的批次优先 take）
+    /// - 其它列表端点（`GET /parts`）默认 `false`（service 层不再 enrich；前端如需，
+    ///   走 `GET /parts/pending-programming` 即可拿到此字段）
+    #[serde(default)]
+    pub has_cnc_program: bool,
 }
 
 impl From<TPart> for PartListItem {
@@ -235,6 +243,11 @@ impl From<TPart> for PartListItem {
             row_type: Some("PART".to_string()),
             has_children: false,
             child_count: None,
+            // 2026-09-29 新增：默认 false；`From<TPart>` 不做 EXISTS enrich
+            // （避免 N+1）；service 层在 `list_pending_programming` / `list_parts`
+            // 调用 repo 时通过 EXISTS 子查询填充。其它 list caller 不填 → 默认 false
+            // （前端无影响，因为这些 caller 不暴露此字段语义）。
+            has_cnc_program: false,
         }
     }
 }
@@ -316,4 +329,9 @@ pub struct PartBatchListItemOut {
 }
 
 /// `GET /parts/pending-programming` 出参：PROGRAMMING 状态工单一览（复用 PartListOut）。
+///
+/// 2026-09-29 改造：基于 `t_process.is_cnc` 列的新过滤规则（链上含 CNC step 或
+/// 当前批次位于 CNC 货架）+ 新增 `has_cnc_program` 字段（按 `t_part_file.kind='G_CODE'`
+/// 派生）+ 新 query 参数 `has_cnc_program?: bool`（Tab 切换）。详见
+/// [`PartListItem`](Self#structfield.has_cnc_program)。
 pub type PendingProgrammingOut = PartListOut;

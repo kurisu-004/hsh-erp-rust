@@ -11,14 +11,15 @@
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
-use crate::modules::part::repo::PartListFilters;
-use crate::modules::part::repo::PartRepoTrait;
+use crate::modules::part::repo::{PartRepoTrait, PendingProgrammingFilters};
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::{PartBatchListItemOut, PartListItem, PartListOut};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::super::dto_crud::{PartListQuery, PlaceOnShelfRequest, RecallToPendingRequest};
+use super::super::super::dto_crud::{
+    PendingProgrammingQuery, PlaceOnShelfRequest, RecallToPendingRequest,
+};
 use super::super::PartService;
 
 use super::{
@@ -182,10 +183,21 @@ impl PartService {
         Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
-    /// `GET /parts/pending-programming`：status=PROGRAMMING 一览（复用 PartListOut）。
+    /// `GET /parts/pending-programming`：基于 `t_process.is_cnc` 的待编程一览。
+    ///
+    /// 2026-09-29 改造：
+    /// - 谓词集：`(PENDING | IN_PROCESS | PROGRAMMING)` × 链上含 CNC step 或
+    ///   批次在 CNC 货架
+    /// - 新 query 参数 `has_cnc_program?: bool`（Tab 切换）：
+    ///   - `Some(true)` 仅已上传 G_CODE
+    ///   - `Some(false)` 仅未上传
+    ///   - `None` 全部
+    /// - 出参 `PartListItem` 新增 `has_cnc_program: bool`（由 repo EXISTS 派生）
+    ///
+    /// 旧实现（status=PROGRAMMING 一览）已废弃，参见 commit 历史。
     pub async fn list_pending_programming<R: PartRepoTrait>(
         mut repo: R,
-        query: &PartListQuery,
+        query: &PendingProgrammingQuery,
         current: &CurrentUser,
     ) -> Result<PartListOut, AppError> {
         current.require_any_role(&[
@@ -196,41 +208,34 @@ impl PartService {
         ])?;
         let limit = query.limit.unwrap_or(50).clamp(1, 500);
         let offset = query.offset.unwrap_or(0).max(0);
-        // 强制 status=PROGRAMMING
-        let f = PartListFilters {
-            customer_ids: &[],
-            status: Some("PROGRAMMING"),
-            statuses: &[],
-            is_urgent: query.is_urgent,
-            keyword: Some(query.keyword.as_deref().unwrap_or("")),
-            // 2026-09-17 PR-4 守卫修复：list_pending_programming 不透传
-            // locations/holder_ids（业务语义固定 PROGRAMMING 状态）
-            locations: &[],
-            holder_ids: &[],
-            // 2026-09-28 新增：内部 caller（pending-programming）不暴露装配件
-            // 子件（语义固定 PROGRAMMING 单件状态），与历史行为一致：不过滤。
-            part_only: false,
-            sort_by: match query.sort_by.as_deref().unwrap_or("PLANNED_DELIVERY_DATE") {
-                "CREATED_AT" => "created_at",
-                "UPDATED_AT" => "updated_at",
-                "PLANNED_DELIVERY_DATE" => "planned_delivery_date",
-                "REQUEST_DATE" => "request_date",
-                "SERIAL_NO" => "serial_no",
-                "DRAWING_NO" => "drawing_no",
-                "NAME" => "name",
-                _ => "planned_delivery_date",
-            },
-            sort_dir: query.sort_dir.as_deref().unwrap_or("ASC"),
+        let sort_by = match query.sort_by.as_deref().unwrap_or("PLANNED_DELIVERY_DATE") {
+            "CREATED_AT" => "created_at",
+            "UPDATED_AT" => "updated_at",
+            "PLANNED_DELIVERY_DATE" => "planned_delivery_date",
+            "REQUEST_DATE" => "request_date",
+            "SERIAL_NO" => "serial_no",
+            "DRAWING_NO" => "drawing_no",
+            "NAME" => "name",
+            _ => "planned_delivery_date",
+        };
+        let sort_dir = query.sort_dir.as_deref().unwrap_or("ASC");
+        let f = PendingProgrammingFilters {
+            keyword: query.keyword.clone(),
+            sort_by: sort_by.to_string(),
+            sort_dir: sort_dir.to_string(),
             limit,
             offset,
-            include_deleted: false,
+            has_cnc_program: query.has_cnc_program,
         };
-        let items = repo.list_with_filters(&f).await?;
-        let total = repo.count_with_filters(&f).await?;
-        // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段（不再
-        // flatten TPart），用 `From<TPart>` 派生；customer_name / l1_customer_name /
-        // location / holder_name 4 派生字段保持 None（service 层不再 enrich）。
-        let list_items: Vec<PartListItem> = items.into_iter().map(PartListItem::from).collect();
+        let items = repo.list_pending_programming_with_cnc_filter(&f).await?;
+        let total = repo.count_pending_programming_with_cnc_filter(&f).await?;
+        let list_items: Vec<PartListItem> = items
+            .into_iter()
+            .map(|item| PartListItem {
+                has_cnc_program: item.has_cnc_program,
+                ..PartListItem::from(item.part)
+            })
+            .collect();
         Ok(PartListOut {
             items: list_items,
             total,

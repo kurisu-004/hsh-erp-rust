@@ -47,7 +47,7 @@
 //!   跨 binary 不重用，保留为本地 fn。
 
 use axum::http::StatusCode;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
@@ -1673,6 +1673,176 @@ async fn admin_assign_batch_not_in_pool() {
     .await
     .expect("query after ch");
     assert_eq!(after_ch, Some(shelf_a));
+}
+
+// ===========================================================================
+//  2026-09-29 CNC 重构 5 任务：has_cnc_program 字段 + 自动分配优先级测试
+//
+//  覆盖：
+//   - take_one_from_pool_prefers_programmed_batch
+//       同货架两个 batch（一个有 G_CODE 一个无），应优先 take 已编程 batch
+//   - list_candidates_includes_has_cnc_program
+//       PoolBatchItem 返回 has_cnc_program 字段
+// ===========================================================================
+
+/// 为 part 插一个 t_part_file.kind='G_CODE' 行（worker_pool 候选池视图测试）。
+async fn seed_g_code_for_part(pool: &PgPool, part_id: i64) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_test_support::pool_snowflake;
+    let snowflake = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    let object_key = format!("uploads/part/{part_id}/G_CODE/test_{id}.nc");
+    sqlx::query(
+        "INSERT INTO t_part_file (id, part_id, kind, file_type, object_key, \
+         original_filename, file_size, content_type, upload_status, content_sha256, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 'G_CODE', 'NC', $3, $4, 1024, 'text/plain', 'CONFIRMED', \
+         'aabbccdd' || repeat('0', 56), $5, 0, $5, 0)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(object_key)
+    .bind(format!("test_{id}.nc"))
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("seed g_code for part");
+    id
+}
+
+/// take_one_from_pool 自动分配优先级：同货架两个 batch，一个有 G_CODE 一个无，
+/// 应优先 take 已编程的（has_cnc_program DESC）。
+///
+/// 2026-09-29 新增：用 max_held_batches=1 限制 worker 持有数，refill 后取恰好 1 批；
+/// 验证 taken[0] 是已上传 G_CODE 的 part（A-CNC）。
+#[tokio::test]
+async fn take_one_from_pool_prefers_programmed_batch() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-CNC-PREF").await;
+    let proc = seed_process(&pool, "PROC-CNC-PREF", "工序-CNC-优先级").await;
+    // max_held_batches=1 限制 refill 只抢 1 批（避免后续断言失稳）
+    let wt = insert_work_type(&pool, "WT-CNC-PREF", "工种-CNC", Some(1)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-CNC-PREF", "PROD-CNC-PREF", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC-CNC-PREF", "工CNC-优先级", Some(wt)).await;
+    // 两个 part A/B 同交期 / 同加急 / 同货架（同 process_id），但 A 有 G_CODE，B 无
+    let (_part_a, _batch_a) =
+        insert_pool_part(&pool, customer, "A-CNC", prod_shelf, proc, 1).await;
+    let (_part_b, _batch_b) =
+        insert_pool_part(&pool, customer, "B-CNC", prod_shelf, proc, 1).await;
+    // 给 A 插 G_CODE
+    let part_a_id: i64 = sqlx::query_scalar("SELECT id FROM t_part WHERE serial_no = 'A-CNC'")
+        .fetch_one(&pool)
+        .await
+        .expect("lookup part A");
+    seed_g_code_for_part(&pool, part_a_id).await;
+    // 触发 admin refill；返回 taken 应是 A（有 G_CODE）
+    let (app, token) = login_manager_with_username(&pool, "admin_cnc_pref").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/admin/worker-pool/refill",
+            Some(json!({
+                "worker_id": worker.to_string(),
+                "shelf_id": prod_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "refill: {env}");
+    let taken = env["data"]["taken"].as_array().expect("taken array");
+    assert_eq!(taken.len(), 1, "应 taken=1（max_held=1）: {env}");
+    // 验证：taken[0] 对应的 part serial_no 应是 'A-CNC'（已上传 G_CODE 优先）
+    let taken_part_id: i64 = taken[0]["part_id"]
+        .as_str()
+        .expect("part_id is string")
+        .parse()
+        .expect("parse i64");
+    let taken_serial: String = sqlx::query_scalar(
+        "SELECT serial_no FROM t_part WHERE id = $1",
+    )
+    .bind(taken_part_id)
+    .fetch_one(&pool)
+    .await
+    .expect("lookup serial");
+    assert_eq!(
+        taken_serial, "A-CNC",
+        "应优先 take 已上传 G_CODE 的 part (A-CNC): {env}"
+    );
+    // has_cnc_program 字段透传
+    assert_eq!(
+        taken[0]["has_cnc_program"], true,
+        "已上传 G_CODE 应透传 has_cnc_program=true: {env}"
+    );
+}
+
+/// list_candidates_by_process_all_shelves 应在 items[*].has_cnc_program 透传实际值。
+#[tokio::test]
+async fn list_candidates_includes_has_cnc_program() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-CNC-LIST").await;
+    let proc = seed_process(&pool, "PROC-CNC-LIST", "工序-CNC-list").await;
+    let wt = insert_work_type(&pool, "WT-CNC-LIST", "工种-CNC-list", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-CNC-LIST", "PROD-CNC-LIST", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+    // part A 有 G_CODE，B 无
+    let (_part_a, _batch_a) =
+        insert_pool_part(&pool, customer, "A-LIST", prod_shelf, proc, 1).await;
+    let (_part_b, _batch_b) =
+        insert_pool_part(&pool, customer, "B-LIST", prod_shelf, proc, 1).await;
+    let part_a_id: i64 = sqlx::query_scalar("SELECT id FROM t_part WHERE serial_no = 'A-LIST'")
+        .fetch_one(&pool)
+        .await
+        .expect("lookup part A");
+    seed_g_code_for_part(&pool, part_a_id).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin_cnc_list").await;
+    let uri = format!("/prod/worker-pool/{proc}");
+    let (s, env) = send(
+        app,
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "pool_by_process: {env}");
+    let items = env["data"]["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 2, "应 2 个候选: {env}");
+    let mut found_a = false;
+    let mut found_b = false;
+    for it in items {
+        let serial = sqlx::query_scalar::<_, String>(
+            "SELECT serial_no FROM t_part WHERE id = $1",
+        )
+        .bind(it["part_id"].as_str().unwrap().parse::<i64>().unwrap())
+        .fetch_one(&pool)
+        .await
+        .expect("lookup serial");
+        match serial.as_str() {
+            "A-LIST" => {
+                found_a = true;
+                assert_eq!(
+                    it["has_cnc_program"], true,
+                    "A 应有 has_cnc_program=true: {env}"
+                );
+            }
+            "B-LIST" => {
+                found_b = true;
+                assert_eq!(
+                    it["has_cnc_program"], false,
+                    "B 应有 has_cnc_program=false: {env}"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(found_a && found_b, "应同时找到 A 与 B: {env}");
 }
 
 /// 场景 20: admin_assign process_id 不匹配

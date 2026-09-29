@@ -85,6 +85,7 @@ pub use crate::modules::part::model::{
 };
 pub use sql::{
     scale_qty, ChildInheritFields, NewPartCreate, PartListFilters, PartRepo, PartUpdate,
+    PendingProgrammingFilters, PendingProgrammingItem,
 };
 
 /// part 域数据访问 trait（37 方法 = t_part 16 + t_part_batch 17 + t_part_event 1 + 跨域 helper 3）。
@@ -355,6 +356,16 @@ pub trait PartRepoTrait: Send {
         &mut self,
         part_id: i64,
     ) -> Result<Vec<crate::modules::part::batch::model::TPartBatch>, sqlx::Error>;
+
+    // ── pending-programming 列表（2026-09-29 新增）──
+    async fn list_pending_programming_with_cnc_filter(
+        &mut self,
+        f: &PendingProgrammingFilters,
+    ) -> Result<Vec<PendingProgrammingItem>, sqlx::Error>;
+    async fn count_pending_programming_with_cnc_filter(
+        &mut self,
+        f: &PendingProgrammingFilters,
+    ) -> Result<i64, sqlx::Error>;
 }
 
 /// 把 `PartRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借 `&mut *tx` 或
@@ -793,5 +804,20 @@ impl PartRepoTrait for &mut PgConnection {
     ) -> Result<Vec<crate::modules::part::batch::model::TPartBatch>, sqlx::Error> {
         use crate::modules::part::batch::repo::PartBatchRepo;
         PartBatchRepo::list_active_by_part_id(&mut **self, part_id).await
+    }
+
+    // ── pending-programming 列表（2026-09-29 新增）──
+    async fn list_pending_programming_with_cnc_filter(
+        &mut self,
+        f: &PendingProgrammingFilters,
+    ) -> Result<Vec<PendingProgrammingItem>, sqlx::Error> {
+        PartRepo::list_pending_programming_with_cnc_filter(&mut **self, f).await
+    }
+
+    async fn count_pending_programming_with_cnc_filter(
+        &mut self,
+        f: &PendingProgrammingFilters,
+    ) -> Result<i64, sqlx::Error> {
+        PartRepo::count_pending_programming_with_cnc_filter(&mut **self, f).await
     }
 }

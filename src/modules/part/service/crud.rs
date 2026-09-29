@@ -761,6 +761,8 @@ impl PartService {
             row_type: Some("ASSEMBLY".to_string()),
             has_children: false, // 由 caller 用 child_count 覆盖
             child_count: None,   // 由 caller 用 fetch_child_counts 覆盖
+            // 2026-09-29 新增：t_assembly 不存在 G_CODE 程序概念；ALL 模式下默认 false。
+            has_cnc_program: false,
         }
     }
 

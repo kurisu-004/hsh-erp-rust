@@ -329,35 +329,11 @@ pub struct RecallToPendingRequest {
     pub note: Option<String>,
 }
 
-/// `POST /parts/{id}/send-to-programming` 入参。
-///
-/// PENDING → PROGRAMMING（`location='OFFICE'`）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct SendToProgrammingRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
 /// `POST /parts/{id}/release-from-programming` 入参。
 ///
 /// PROGRAMMING → IN_PROCESS（`location='PRODUCTION_SHELF'`）。复用
 /// `PlaceOnShelfRequest`（shelf_id + next_process_id + 校验 shelf↔process 映射）。
 pub type ReleaseFromProgrammingRequest = PlaceOnShelfRequest;
-
-/// `POST /parts/{id}/recall-to-programming` 入参。
-///
-/// IN_PROCESS+PRODUCTION_SHELF → PROGRAMMING（召回已下发未领的工件至编程）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct RecallToProgrammingRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(default)]
-    pub note: Option<String>,
-}
 
 /// `POST /parts/{id}/send-to-outsource` 入参。
 ///
@@ -501,6 +477,29 @@ pub struct ByWorkerQuery {
     pub limit: Option<i64>,
     #[serde(default)]
     pub offset: Option<i64>,
+}
+
+/// `GET /parts/pending-programming` 入参（query，2026-09-29 扩展）。
+///
+/// 沿用 [`PartListQuery`] 的所有分页 / 排序字段；新增 `has_cnc_program` 过滤
+/// （Tab 切换）：`true` = 已上传 G_CODE 的工单；`false` = 待编程（G_CODE 未上传）；
+/// 缺省 / `None` = 全部。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PendingProgrammingQuery {
+    #[serde(default)]
+    pub keyword: Option<String>,
+    #[serde(default)]
+    pub sort_by: Option<String>,
+    #[serde(default)]
+    pub sort_dir: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub limit: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub offset: Option<i64>,
+    /// 2026-09-29 新增：是否已上传 G_CODE 数控程序。`None` 不限；`Some(true)` 仅已上传；
+    /// `Some(false)` 仅未上传。Tab 切换用。
+    #[serde(default)]
+    pub has_cnc_program: Option<bool>,
 }
 
 /// `POST /parts/{id}/batches/{batch_id}/cancel` 入参。

@@ -45,6 +45,10 @@ pub struct PoolBatchItem {
     pub note: Option<String>,
     /// 2026-09-16 PR-3 批次 step 化：删 `placed_at`
     pub version: i32,
+    /// 2026-09-29 新增：是否已上传 G_CODE 数控程序。
+    /// 真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`
+    /// 与 `take_one_from_pool` 的优先级排序同源 EXISTS 子查询（已编程 batch 优先 take）。
+    pub has_cnc_program: bool,
 }
 
 /// 「可执行该工序的工人」单条记录
