@@ -233,3 +233,178 @@ async fn with_manager_token_and_502_returns_sts_forward_failed() {
         "BIZ_STS_FORWARD_FAILED 应返 20406，不是 50001: {env}"
     );
 }
+
+// ===========================================================================
+// 4. (2026-09-29 新增) handler 注入 X-Forwarded-User-Id = CurrentUser.id
+// ===========================================================================
+
+/// 构造 python STS 端点期望的合法 body（content_sha256 64 hex + filename + ext）。
+///
+/// 任何 shape 都会被 rust 端透传给 python，故此处用 python 端校验 schema 命名
+/// (content_sha256 / original_filename / content_type) 以与生产路径一致。
+fn sample_sts_body() -> Value {
+    json!({
+        "content_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "original_filename": "drawing.pdf",
+        "content_type": "application/pdf",
+        "size": 1024,
+    })
+}
+
+/// 验证 handler 在转发前注入 `X-Forwarded-User-Id` header，
+/// 值 = 当前 MANAGER 登录用户的 snowflake ID（`IamFixture::MANAGER_USER_ID`）。
+#[tokio::test]
+async fn forward_sts_tmp_keys_injects_user_id_header() {
+    let (pool, _app, fx, token) = bootstrap().await;
+
+    // mock：捕获第二个参数（headers），断言 X-Forwarded-User-Id 等于 MANAGER_USER_ID
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_sts_tmp_keys()
+        .times(1)
+        .returning(move |_body, captured_headers| {
+            let fwd_uid = captured_headers
+                .get("x-forwarded-user-id")
+                .expect("handler 必须注入 x-forwarded-user-id header")
+                .to_str()
+                .expect("x-forwarded-user-id 必须是 ASCII")
+                .to_owned();
+            assert_eq!(
+                fwd_uid,
+                fx.manager_user_id.to_string(),
+                "x-forwarded-user-id 应等于当前登录 MANAGER 的 id"
+            );
+            // mockall 要求返回 owned，故简单回一个 200 + 空 body
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert("content-type", "application/json".parse().unwrap());
+            Ok(PyBackendResponse {
+                status: StatusCode::OK,
+                headers: resp_headers,
+                body: Bytes::from_static(b"{\"code\":0,\"message\":\"ok\",\"data\":{}}"),
+            })
+        });
+
+    let (app2, _state) = make_app_with_mock(&pool, mock).await;
+
+    let req = json_request(
+        "POST",
+        "/files/sts-tmp-keys",
+        Some(sample_sts_body()),
+        Some(&token),
+    );
+    let (status, env) = send(app2, req).await;
+    assert_eq!(status, StatusCode::OK, "mock 200 应透传: {env}");
+}
+
+/// 反向验证：handler + `HttpPyBackend` 端到端不把 Authorization 漏给 python。
+///
+/// ## 2026-09-29 实现要点
+/// 与上一条不同：本用例**不**走 `MockPyBackendClient`（mock 在
+/// `forward_sts_tmp_keys` 入口截胡，绕过真实 `filter_request_headers` 过滤），
+/// 而是用真实 `HttpPyBackend` + 本地 axum mock 服务端，端到端验证「python
+/// 实际收到的 request 没有 `Authorization` / `Cookie`」+ 「保留
+/// `X-Forwarded-User-Id`」。
+///
+/// 跨进程消息通道：mock 服务端把 headers 写入共享 `Arc<Mutex<Option<HeaderMap>>>`，
+/// 测试主体在响应返回后读出做断言。
+#[tokio::test]
+async fn forward_sts_tmp_keys_does_not_leak_auth_header() {
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    let (pool, _app, _fx, token) = bootstrap().await;
+
+    // 共享槽：mock server 把 headers 写进来，测试主体读出去断言
+    let captured: Arc<Mutex<Option<axum::http::HeaderMap>>> =
+        Arc::new(Mutex::new(None));
+
+    let mock_app = axum::Router::new().route(
+        "/api/v1/files/sts-tmp-keys",
+        axum::routing::post(mock_py_capture_headers),
+    )
+    .with_state(captured.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind random port");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_app).await;
+    });
+    let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+    // 用真实 HttpPyBackend 替换 state.py_backend
+    let real_py_backend: Arc<dyn PyBackendClient> = Arc::new(
+        hsh_erp_rust::infra::py_backend::HttpPyBackend::new(
+            base_url.clone(),
+            Duration::from_millis(2000),
+        )
+        .expect("构造 HttpPyBackend"),
+    );
+    let mut state = test_state(pool.clone()).await;
+    {
+        let state_mut = Arc::get_mut(&mut state).expect("state Arc 必须 unique");
+        state_mut.py_backend = real_py_backend;
+    }
+    let app = build_minimal_app(state.clone()).await;
+
+    let req = json_request(
+        "POST",
+        "/files/sts-tmp-keys",
+        Some(sample_sts_body()),
+        Some(&token),
+    );
+    let (status, _env) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK, "真实 HttpPyBackend 200 应透传");
+
+    // 等 mock server 把 headers 写进来（轮询短间隔）
+    let mut tries = 0;
+    let captured_headers = loop {
+        tries += 1;
+        if let Some(h) = captured.lock().unwrap().clone() {
+            break h;
+        }
+        if tries > 100 {
+            panic!("mock server 未在 100 次轮询内写入 headers");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    // 核心：python 端实际收到的 headers 不含 Authorization / Cookie
+    assert!(
+        captured_headers.get("authorization").is_none(),
+        "Authorization 不应透传到 python（避免 JWT 反向泄露）；got headers={:?}",
+        captured_headers
+    );
+    assert!(
+        captured_headers.get("cookie").is_none(),
+        "Cookie 不应透传到 python；got headers={:?}",
+        captured_headers
+    );
+    // 反向断言：x-forwarded-user-id 必须存在（与上一条用例互为补集）
+    let fwd_uid = captured_headers
+        .get("x-forwarded-user-id")
+        .expect("x-forwarded-user-id 必须存在（鉴权身份透传）")
+        .to_str()
+        .expect("x-forwarded-user-id 必须是 ASCII");
+    assert!(
+        !fwd_uid.is_empty(),
+        "x-forwarded-user-id 不能为空字符串"
+    );
+}
+
+/// mock python 服务端 handler（独立 async fn，便于 axum Handler trait 推断）。
+///
+/// 第一个参数是 `Arc<Mutex<Option<HeaderMap>>>`，handler 把请求头存进去；
+/// 返回 200 + python 信封（与真实 STS 端点响应形态一致）。
+async fn mock_py_capture_headers(
+    axum::extract::State(captured): axum::extract::State<
+        Arc<std::sync::Mutex<Option<axum::http::HeaderMap>>>,
+    >,
+    headers: axum::http::HeaderMap,
+    _body: axum::Json<Value>,
+) -> impl axum::response::IntoResponse {
+    *captured.lock().unwrap() = Some(headers);
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        axum::Json(json!({"code": 0, "message": "ok", "data": {}})),
+    )
+}
