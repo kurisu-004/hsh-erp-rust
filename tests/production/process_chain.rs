@@ -85,7 +85,7 @@ async fn upsert_then_get_by_part_happy() {
     let (s, env) = send(
         app.clone(),
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "默认工艺",
@@ -181,7 +181,7 @@ async fn upsert_replaces_old_steps() {
     let (_s, env) = send(
         app.clone(),
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "原链",
@@ -201,7 +201,7 @@ async fn upsert_replaces_old_steps() {
     let (s2, env2) = send(
         app,
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "新链",
@@ -261,7 +261,7 @@ async fn upsert_rejects_negative_minutes() {
     let (s, env) = send(
         app,
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [
@@ -286,7 +286,7 @@ async fn upsert_rejects_duplicate_sort_order() {
     let (s, env) = send(
         app,
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [
@@ -312,7 +312,7 @@ async fn upsert_forbidden_for_non_manager() {
     let (s, env) = send(
         app,
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [
@@ -342,7 +342,7 @@ async fn step_note_round_trip() {
     let (s, env) = send(
         app.clone(),
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "含备注工艺",
@@ -409,7 +409,7 @@ async fn upsert_rejects_non_pending_part() {
     let (s, env) = send(
         app,
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [
@@ -438,7 +438,7 @@ async fn get_chain_by_id_hit_and_miss() {
     let (s, env) = send(
         app.clone(),
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "name": "按 id 读取链",
@@ -500,7 +500,7 @@ async fn soft_delete_part_cascades_chain() {
     let (s, env) = send(
         app.clone(),
         json_request(
-            "PUT",
+            "POST",
             &format!("/prod/process-chains/by-part/{part_id}"),
             Some(json!({
                 "steps": [

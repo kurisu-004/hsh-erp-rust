@@ -46,7 +46,7 @@
 | GET | `/api/v2/prod/work-types/{id}/processes` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 该工种已映射工序列表 | [`work-type-process-mapping.md`](./work-type-process-mapping.md#get-apiv2prodwork-typesidprocesses) |
 | POST | `/api/v2/prod/work-types/{id}/processes` | MANAGER | 整组替换工种工序映射 | [`work-type-process-mapping.md`](./work-type-process-mapping.md#post-apiv2prodwork-typesidprocesses) |
 | GET | `/api/v2/prod/process-chains/by-part/{part_id}` | 已登录（任意角色，不含 ShelfAccount） | 读 part 绑定的工艺链（header + steps） | [`process-chain.md`](./process-chain.md#get-apiv2prodprocess-chainsby-partpart_id) |
-| PUT | `/api/v2/prod/process-chains/by-part/{part_id}` | MANAGER | 整组 upsert 工艺链 + steps（PENDING 守卫 20705） | [`process-chain.md`](./process-chain.md#put-apiv2prodprocess-chainsby-partpart_id) |
+| POST | `/api/v2/prod/process-chains/by-part/{part_id}` | MANAGER | 整组 upsert 工艺链 + steps（PENDING 守卫 20705；2026-09-29 改 PUT → POST 统一全仓库惯例） | [`process-chain.md`](./process-chain.md#post-apiv2prodprocess-chainsby-partpart_id) |
 | GET | `/api/v2/prod/process-chains/{chain_id}` | 已登录（任意角色，不含 ShelfAccount） | 按链 id 读工艺链（2026-09-16 FK 翻转新增） | [`process-chain.md`](./process-chain.md#get-apiv2prodprocess-chainschain_id) |
 
 ### 工人池（5 端点）

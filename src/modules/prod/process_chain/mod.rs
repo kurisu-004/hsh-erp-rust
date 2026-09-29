@@ -7,7 +7,8 @@
 //! ## 当前阶段（part-worker-pool-federated-rocket MVP + 2026-09-16 FK 翻转）
 //! 3 端点挂在 `/api/v2/process-chains`：
 //! - `GET  /by-part/{part_id}`  —— 读 part 绑定的工艺链（404 + 20701）
-//! - `PUT  /by-part/{part_id}`  —— 整组 upsert：OCC + 软删旧 steps + INSERT 新 steps
+//! - `POST /by-part/{part_id}`  —— 整组 upsert：OCC + 软删旧 steps + INSERT 新 steps
+//!   （2026-09-29 改 PUT → POST 统一全仓库惯例）
 //! - `GET  /{chain_id}`         —— 按链 id 读工艺链（FK 翻转新增；404 + 20701）
 //!
 //! ## 子模块结构
@@ -38,7 +39,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
             "/by-part/{part_id}",
-            get(handler::get_by_part).put(handler::upsert),
+            get(handler::get_by_part).post(handler::upsert),
         )
         .route("/{chain_id}", get(handler::get_by_id))
 }
