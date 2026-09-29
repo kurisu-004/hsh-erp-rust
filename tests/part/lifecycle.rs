@@ -673,38 +673,6 @@ async fn seed_g_code_file(pool: &PgPool, part_id: i64, owner_user_id: i64) -> i6
     id
 }
 
-/// 把 part 的 batch 放到指定 shelf 上（location='PRODUCTION_SHELF' +
-/// current_holder_id=shelf_id + current_process_step_id=chain 上的某个 step）。
-/// 注：当前 4 个测试中只有 1 个需要此 helper，但保留以便后续 CNC shelf 场景复用。
-#[allow(dead_code)]
-async fn move_batch_to_shelf(pool: &PgPool, batch_id: i64, shelf_id: i64, chain_id: i64, process_id: i64) {
-    use hsh_erp_test_support::pool_snowflake;
-    let snowflake = pool_snowflake()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let step_id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM t_process_chain_step WHERE chain_id = $1 AND process_id = $2 \
-         AND deleted_at IS NULL ORDER BY sort_order ASC LIMIT 1",
-    )
-    .bind(chain_id)
-    .bind(process_id)
-    .fetch_optional(pool)
-    .await
-    .expect("resolve step_id");
-    let step_id = step_id.expect("chain should have a step for the given process");
-    let _ = snowflake.next_id(); // touch guard
-    sqlx::query(
-        "UPDATE t_part_batch SET location = 'PRODUCTION_SHELF', current_holder_id = $1, \
-         current_process_step_id = $2, version = version + 1 WHERE id = $3",
-    )
-    .bind(shelf_id)
-    .bind(step_id)
-    .bind(batch_id)
-    .execute(pool)
-    .await
-    .expect("move batch to shelf");
-}
-
 #[tokio::test]
 async fn list_pending_programming_includes_parts_with_cnc_step_in_chain() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;

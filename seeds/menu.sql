@@ -122,8 +122,9 @@ INSERT INTO t_menu (
     (9000000000000601, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'process_work_type',         '工序工种',      '/production/process-work-type','Operation',     5, true, 0, now(), 0, now(), 0),
     (9000000000000602, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'part_process_chain',        '制定工序',      '/production/process-design',   'SetUp',        10, true, 0, now(), 0, now(), 0),
     -- 2026-09-29 新增：待编程（原顶级菜单 id=6，title 改「待编程」）挂在 production_group 下；
-    -- 用原 id（9000000000000006）保证 ON CONFLICT 命中；sort_order=25（在 process_work_type / part_process_chain 之后、worker_queue 之前）。
-    (9000000000000006, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'pending_programming',       '待编程',        '/cnc/pending',                'Cpu',          25, true, 0, now(), 0, now(), 0),
+    -- 用原 id（9000000000000006）保证 ON CONFLICT 命中；sort_order=15（在 process_work_type=5 / part_process_chain=10 之后、worker_queue=20 之前）。
+    -- 2026-09-29 review 修复：原 sort_order=25 会让 worker_queue(20) → pending_programming(25) → inspection_pending(30) 渲染错位。
+    (9000000000000006, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'pending_programming',       '待编程',        '/cnc/pending',                'Cpu',          15, true, 0, now(), 0, now(), 0),
     (9000000000000603, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'worker_queue',              '生产队列',      '/workers/queue',              'Operation',    20, true, 0, now(), 0, now(), 0),
     -- 2026-09-29 新增：待品检（inspection_pending）从 order_group 移到 production_group；
     -- 原 id（9000000000000105）保留；sort_order 从 50 改为 30（在 worker_queue 之后）。
