@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH\n            candidate AS (\n                SELECT pb.id, pb.version, pb.part_id\n                FROM t_part_batch pb\n                JOIN t_part p ON p.id = pb.part_id\n                WHERE pb.id = $3\n                  AND pb.status = 'IN_PROCESS'\n                  AND pb.location = 'PRODUCTION_SHELF'\n                  AND pb.current_holder_id = $2\n                  AND pb.deleted_at IS NULL\n                  AND p.deleted_at IS NULL\n                FOR UPDATE OF pb\n            ),\n            upd_batch AS (\n                UPDATE t_part_batch pb\n                SET current_holder_id = $1, location = 'WORKER',\n                    version = pb.version + 1,\n                    updated_at = NOW(), updated_by = $4\n                FROM candidate\n                WHERE pb.id = candidate.id\n                  AND pb.version = candidate.version\n                RETURNING pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.version\n            ),\n            sel_part AS (\n                SELECT p.id, p.serial_no, p.drawing_no,\n                       p.system_delivery_date, p.planned_delivery_date, p.is_urgent\n                FROM t_part p\n                JOIN upd_batch ub ON ub.part_id = p.id\n            )\n            SELECT ub.id AS batch_id, ub.part_id, ub.batch_no, ub.quantity,\n                   sp.serial_no, sp.drawing_no,\n                   sp.system_delivery_date, sp.planned_delivery_date,\n                   sp.is_urgent, ub.version\n            FROM upd_batch ub JOIN sel_part sp ON sp.id = ub.part_id\n            ",
+  "query": "\n            WITH\n            candidate AS (\n                SELECT pb.id, pb.version, pb.part_id,\n                       -- 2026-09-29 新增：与 take_one_from_pool 同源 EXISTS（admin_assign 不走优先级，但透传 has_cnc_program 给前端）\n                       EXISTS (SELECT 1 FROM t_part_file pf\n                               WHERE pf.part_id = pb.part_id\n                                 AND pf.kind = 'G_CODE'\n                                 AND pf.deleted_at IS NULL) AS \"has_cnc_program!\"\n                FROM t_part_batch pb\n                JOIN t_part p ON p.id = pb.part_id\n                WHERE pb.id = $3\n                  AND pb.status = 'IN_PROCESS'\n                  AND pb.location = 'PRODUCTION_SHELF'\n                  AND pb.current_holder_id = $2\n                  AND pb.deleted_at IS NULL\n                  AND p.deleted_at IS NULL\n                FOR UPDATE OF pb\n            ),\n            upd_batch AS (\n                UPDATE t_part_batch pb\n                SET current_holder_id = $1, location = 'WORKER',\n                    version = pb.version + 1,\n                    updated_at = NOW(), updated_by = $4\n                FROM candidate\n                WHERE pb.id = candidate.id\n                  AND pb.version = candidate.version\n                RETURNING pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.version\n            ),\n            sel_part AS (\n                SELECT p.id, p.serial_no, p.drawing_no,\n                       p.system_delivery_date, p.planned_delivery_date, p.is_urgent\n                FROM t_part p\n                JOIN upd_batch ub ON ub.part_id = p.id\n            )\n            SELECT ub.id AS batch_id, ub.part_id, ub.batch_no, ub.quantity,\n                   sp.serial_no, sp.drawing_no,\n                   sp.system_delivery_date, sp.planned_delivery_date,\n                   sp.is_urgent, ub.version,\n                   (SELECT \"has_cnc_program!\" FROM candidate WHERE candidate.id = ub.id) AS \"has_cnc_program!\"\n            FROM upd_batch ub JOIN sel_part sp ON sp.id = ub.part_id\n            ",
   "describe": {
     "columns": [
       {
@@ -112,6 +112,12 @@
             "name": "version"
           }
         }
+      },
+      {
+        "ordinal": 10,
+        "name": "has_cnc_program!",
+        "type_info": "Bool",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -132,8 +138,9 @@
       true,
       false,
       false,
-      false
+      false,
+      null
     ]
   },
-  "hash": "c5732f0d99b71d71ec886cda0bdf08b61294d38cbb1b360e8a2c918d14c65f47"
+  "hash": "3a4c796ef214c4cc3b63883c3fe7a655d08f586ed96e6366a732dc1dd6b7c11d"
 }

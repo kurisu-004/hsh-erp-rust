@@ -5,7 +5,9 @@
 > 共享 DTO（PartOut / 端点约束）见 [`./index.md`](./index.md)
 > 状态机 / 错误码见 [`./inspection.md`](./inspection.md#状态机can_transition_to-白名单)
 >
-> 范围：本文件覆盖 4 个 lifecycle 端点（deliver / cancel / complete / start-repair）。CRUD / inspection 见 [`./crud.md`](./crud.md) / [`./inspection.md`](./inspection.md)。
+> 范围：本文件覆盖 4 个 lifecycle 端点（deliver / cancel / complete / start-repair） +
+> 待编程一览列表（基于 `t_process.is_cnc` 列的新过滤规则）。CRUD / inspection 见
+> [`./crud.md`](./crud.md) / [`./inspection.md`](./inspection.md)。
 
 ## 本文件目录
 
@@ -14,6 +16,7 @@
 - [POST /api/v2/parts/{part_id}/cancel](#post-apiv2partspart_idcancel)
 - [POST /api/v2/parts/{part_id}/complete](#post-apiv2partspart_idcomplete)
 - [POST /api/v2/parts/{part_id}/start-repair](#post-apiv2partspart_idstart-repair)
+- [GET /api/v2/parts/pending-programming](#get-apiv2partspending-programming)（2026-09-29 新过滤规则）
 
 ---
 
@@ -281,3 +284,87 @@ Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 ---
 
 > **2026-09-23 PR12 同步说明**：本节 8 个端点（pick-up / place-on-shelf / complete-repair / repair-dispatch / 4 个 GET 列表）原 docs/api/parts/lifecycle.md 未覆盖，本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。
+
+---
+
+### `GET /api/v2/parts/pending-programming`
+
+权限: **Manager / Clerk / CncProgrammer / Inspector**
+
+> **2026-09-29 BREAKING CHANGE**（CNC 重构 5 任务之一）：编程流转入口改造。
+>
+> 旧实现：`status = 'PROGRAMMING'` 一览 + `POST /parts/{id}/send-to-programming` /
+> `POST /parts/{id}/recall-to-programming` 两个端点。新实现：**取消状态机
+> `PROGRAMMING` 进入路径**（`PENDING → PROGRAMMING` 与 `IN_PROCESS → PROGRAMMING`
+> 两条迁移已从 `part/statemachine.rs::can_transition_to` 删除），待编程一览改为
+> 基于 `t_process.is_cnc` 列的链上 / 货架过滤，配合前端 Tab 切换
+> `has_cnc_program?: bool`。
+>
+> 编程员现在通过工艺链 + CNC step 直接进入生产流；`POST /parts/{id}/send-to-programming`
+> 与 `POST /parts/{id}/recall-to-programming` 端点已下线（返回 404）。
+> `POST /parts/{id}/release-from-programming` 仍保留（PROGRAMMING → IN_PROCESS）。
+
+Query：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `keyword` | string? | — | 模糊匹配 `name` / `drawing_no` / `serial_no` |
+| `sort_by` | string? | — | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它退化为 `PLANNED_DELIVERY_DATE` |
+| `sort_dir` | string? | — | `ASC` / `DESC`（缺省 `ASC`） |
+| `limit` | int? | — | 1..=500（缺省 50） |
+| `offset` | int? | — | ≥ 0（缺省 0） |
+| `has_cnc_program` | bool? | — | **2026-09-29 新增**：Tab 切换。`true` 仅已上传 G_CODE；`false` 仅未上传；缺省全部 |
+
+**新过滤规则**（取代旧 `status = 'PROGRAMMING'`）：
+
+```sql
+status IN ('PENDING','IN_PROCESS','PROGRAMMING')  -- 历史 PROGRAMMING 状态仍允许消化
+AND (
+  -- 条件 A：工艺链上含 CNC step
+  EXISTS (
+    SELECT 1 FROM t_process_chain_step s
+    JOIN t_process pr ON pr.id = s.process_id AND pr.deleted_at IS NULL
+    WHERE s.chain_id = p.process_chain_id
+      AND s.deleted_at IS NULL
+      AND pr.is_cnc = TRUE
+  )
+  -- 条件 B：当前 active 批次所在货架关联 CNC 工序
+  OR EXISTS (
+    SELECT 1 FROM t_part_batch pb
+    JOIN t_shelf_process sp
+      ON sp.shelf_id = pb.current_holder_id AND sp.deleted_at IS NULL
+    JOIN t_process pr
+      ON pr.id = sp.process_id AND pr.deleted_at IS NULL
+    WHERE pb.part_id = p.id
+      AND pb.deleted_at IS NULL
+      AND pb.status IN ('PENDING','IN_PROCESS','PROGRAMMING')
+      AND pr.is_cnc = TRUE
+  )
+)
+```
+
+外加可选 `has_cnc_program` 过滤：`EXISTS t_part_file.kind = 'G_CODE'`。
+
+Response 200 `data`：[`PartListOut`](./index.md#partlistout-字段)。**2026-09-29 新增**：
+[`PartListItem`](./index.md#partlistitem-字段) 含 `has_cnc_program: bool` 派生字段
+（由 repo EXISTS 子查询填充）。
+
+错误码：40001（limit/offset 越界）、40300（角色不符）、50001（DB）。
+
+#### 业务场景
+
+- **Tab = 待编程**（`has_cnc_program=false`）：未上传 G_CODE 的 CNC 工单（链上有 CNC
+  step 或当前批次在 CNC 货架 + 未上传程序）。编程员先在 list 内点"上传 G_CODE"→
+  后端走 `POST /part-files/upload-intents` + 直传 COS + `confirm`。
+- **Tab = 已编程**（`has_cnc_program=true`）：已上传 G_CODE 的 CNC 工单，编程员
+  确认无误后通知车间 release（走 `POST /parts/{id}/release-from-programming`）。
+- **Tab = 全部**（`has_cnc_program` 缺省）：所有 CNC 相关工单（含历史 PROGRAMMING
+  状态可消化的批次）。
+
+---
+
+> **2026-09-29 同步说明**：本节 `GET /parts/pending-programming` 端点 + 新 query 参数
+> `has_cnc_program` + `PartListItem.has_cnc_program` 字段新增；旧端点
+> `POST /parts/{id}/send-to-programming` 与 `POST /parts/{id}/recall-to-programming`
+> 下线（返回 404），state machine 同步删除
+> `PENDING → PROGRAMMING` 与 `IN_PROCESS → PROGRAMMING` 两条入口迁移。

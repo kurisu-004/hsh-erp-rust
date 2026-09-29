@@ -84,6 +84,7 @@ Request：
 | `description` | string? | — | trim 后空串视为 NULL |
 | `requires_approval` | bool? | — | OUTSOURCE：缺省 = true；INHOUSE：**忽略请求值**，强制 false |
 | `color` | string? | — | 格式 `#RRGGBBAA`（9 字符，含 `#` 前缀）；空串/null ⇒ NULL；格式错 → 20104。前端 `el-color-picker color-format="hex8"` 默认输出 |
+| `is_cnc` | bool? | — | 2026-09-29 新增。是否 CNC 工序；缺省 `false`（与 migration 002 DEFAULT FALSE 对齐）。修改走 `POST /prod/processes/{id}/update` 三态编码 |
 
 Response 201 `data`：`ProcessOut`
 
@@ -123,6 +124,7 @@ Request（部分更新；与 Python `exclude_unset` 语义一致）：
 | `description` | string? \| null? | — | 字段缺省 = 不改；`Some(null)` = 显式清空；`Some(value)` = 改值（trim 后写） |
 | `requires_approval` | bool? | — | INHOUSE 强制 false（无视 Some 内的任何值）；OUTSOURCE 保留请求值；None = 不改 |
 | `color` | string? \| null? | — | 三态同 `description`：字段缺省 = 不改；`Some(null)` = 显式清空；`Some(value)` = 改值（须匹配 `#RRGGBBAA`，否则 20104） |
+| `is_cnc` | bool? | — | 2026-09-29 新增。字段缺省 = 不改；`Some(b)` = 覆盖。无 `null` 三态（业务上不允许"清空" CNC 标记） |
 
 Response 200 `data`：`ProcessOut`（回读最新版本）
 
@@ -168,6 +170,7 @@ Response 200 `data`：`null`
 | `description` | string? | |
 | `requires_approval` | bool | INHOUSE 永远 false；OUTSOURCE 由请求决定 |
 | `color` | string? | 前端工序卡片颜色（`#RRGGBBAA`，9 字符含 alpha）；`Option::is_none` ⇒ 序列化时省略 |
+| `is_cnc` | bool | 2026-09-29 新增（CNC 重构 5 任务之一）。是否 CNC 工序，用于待编程一览的链上/货架过滤 + worker_pool 候选池自动分配优先级。详见 [`../../migrations/20260929100000_002_add_is_cnc_to_process.sql`](../../migrations/20260929100000_002_add_is_cnc_to_process.sql)。 |
 | `version` | i32 | 乐观锁；每次写操作 +1 |
 | `created_at` | naive datetime | Asia/Shanghai |
 | `updated_at` | naive datetime | Asia/Shanghai |

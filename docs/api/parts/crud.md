@@ -39,6 +39,12 @@ Query：
 | `row_type` | string? | 2026-09-28 新增。行类型筛选：`"PART"` / `"ASSEMBLY"` / 缺省（=ALL）。非法值 → `40001 VALIDATION_ERROR`。详见下方「行类型合并规则」。 |
 | `include_assemblies` | bool? | 2026-09-28 新增。是否合并装配件：仅 `row_type` 缺省时生效。`false` 强制仅零件（兼容 `/parts/pending-programming` 等内部 caller）。`true` 或缺省 → 默认 ALL 模式。详见下方「行类型合并规则」。 |
 | `sort_by` | string? | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它退化为 `CREATED_AT`。ALL 模式下 `SERIAL_NO` 不在 t_part / t_assembly 共有列交集 → 降级为 `CREATED_AT`（见下方「SORT 键交互」）。 |
+
+> **2026-09-29 新增字段**（CNC 重构 5 任务之一）：响应 [`PartListItem`](./index.md#partlistitem-字段)
+> 含 `has_cnc_program: bool` 派生字段。`GET /parts/pending-programming` 通过
+> repo EXISTS 子查询填充真实值（已上传 G_CODE → true）；其它 list 端点默认
+> `false`（service 层不在那里 enrich，避免 N+1）。详见
+> [`./lifecycle.md#get-apiv2partspending-programming`](./lifecycle.md#get-apiv2partspending-programming)。
 | `sort_dir` | string? | `ASC` / `DESC`（缺省 `DESC`） |
 | `limit` | int? | 1..=200（缺省 50） |
 | `offset` | int? | ≥ 0（缺省 0） |

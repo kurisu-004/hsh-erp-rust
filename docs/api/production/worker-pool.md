@@ -55,6 +55,16 @@ Request：`AdminRefillRequest`
 | `worker_id` | string (i64) | ✓ | 工人雪花 ID（`deserialize_i64` 反序列化） |
 | `shelf_id` | string (i64) | ✓ | 候选池货架 ID |
 
+#### 自动分配优先级（2026-09-29 新增）
+
+`take_one_from_pool` SQL `ORDER BY` 第 1 键为 **`has_cnc_program DESC`**
+（与候选池视图 `PoolBatchItem.has_cnc_program` 同源 EXISTS 子查询）；后续键位：
+`system_delivery_date ASC NULLS LAST → planned_delivery_date ASC NULLS LAST →
+is_urgent DESC → id ASC`。
+
+业务意图：同交期同加急时优先 take 已上传 G_CODE 的 batch，省
+"工人拿到手 → 还要等编程员传程序"的等待。
+
 业务流转（service `refill_for_worker`）：
 
 1. 取 worker（带 `work_type_id`）；`is_active=false` → `20202 BIZ_WORKER_INACTIVE`；`work_type_id IS NULL` → `20206 BIZ_WORKER_NO_WORK_TYPE`
@@ -270,6 +280,7 @@ WS 广播（commit 后下发）：
 | `planned_delivery_date` | date? | 计划交付日期 |
 | `is_urgent` | bool | 是否加急 |
 | `version` | i32 | 乐观锁（admin_remove 返回 `batch.version + 1`） |
+| `has_cnc_program` | bool | **2026-09-29 新增**。`refill_for_worker` / `assign_batch_to_worker` / `take_specific_from_pool` 透传 worker_pool 候选池视图同源 EXISTS；admin_remove 路径默认 `false`（admin_remove 不开 candidate EXISTS）。详见下文「§自动分配优先级」 |
 
 ### RefillResult 字段
 
@@ -330,6 +341,13 @@ WS 广播（commit 后下发）：
 
 > **2026-09-16 PR-3 字段下线**：`placed_at` 字段已移除（t_part_batch 列已删）。
 > 前端如需展示积压时长，由前端按 `PICKED_UP` 事件 `created_at` 自派生；或后端后续补字段。
+>
+> **2026-09-29 新增字段**：`has_cnc_program: bool`（CNC 重构 5 任务之一）。
+> 真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`
+> — 与 `GET /parts/pending-programming` Tab 切换同源 EXISTS。
+> 用于前端 admin 候选池视图区分"待编程 vs 待上机"（已上传程序但还在候选池 = 等车间 release）。
+> **自动分配优先级**（见下文 §自动分配优先级小节）：`take_one_from_pool` 在同交期同加急
+> 时优先 take 已编程 batch（节省"工人拿到手 → 还要等编程员传程序"的等待）。
 
 ### WorkerBrief 字段
 

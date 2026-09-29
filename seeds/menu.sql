@@ -42,7 +42,7 @@ WHERE deleted_at IS NOT NULL
   AND code IN (
     -- 顶级菜单
     'home', 'production_stats', 'scan_badge',
-    'customer_management', 'order_group', 'pending_programming',
+    'customer_management', 'order_group',
     'production_group', 'template_management', 'auth_group',
     'outsource_list', 'floor_group', 'settings_root',
     -- 子菜单
@@ -52,7 +52,10 @@ WHERE deleted_at IS NOT NULL
     'customers_list', 'applicants_list',
     'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
     'process_work_type', 'part_process_chain', 'worker_queue',
-    'print_templates_designer'
+    'print_templates_designer',
+    -- 2026-09-29 新增：复活待编程（pending_programming）和待品检（inspection_pending）子项，
+    -- 它们从顶级/order_group 移到 production_group 下；软删态要复活才能命中 ON CONFLICT。
+    'pending_programming'
   );
 
 -- ============================================================================
@@ -67,7 +70,8 @@ INSERT INTO t_menu (
     (9000000000000003, NULL, 'scan_badge',           '扫码台',     '/scan/badge',         'Promotion',      13, true, 0, now(), 0, now(), 0),
     (9000000000000004, NULL, 'customer_management',  '客户管理',   NULL,                  'OfficeBuilding', 15, true, 0, now(), 0, now(), 0),
     (9000000000000005, NULL, 'order_group',          '订单管理',   NULL,                  'Tickets',        20, true, 0, now(), 0, now(), 0),
-    (9000000000000006, NULL, 'pending_programming',  '待编程一览', '/cnc/pending',        'Cpu',            25, true, 0, now(), 0, now(), 0),
+    -- 2026-09-29 移除：pending_programming（id=6）从顶级菜单移到 production_group 子菜单；
+    -- 旧行保留 id（9000000000000006），ON CONFLICT 走 sub-menu 段更新 parent_id + title。
     (9000000000000007, NULL, 'production_group',     '生产管理',   NULL,                  'Operation',      27, true, 0, now(), 0, now(), 0),
     (9000000000000008, NULL, 'template_management',  '模板管理',   NULL,                  'Document',       28, true, 0, now(), 0, now(), 0),
     (9000000000000009, NULL, 'auth_group',           '权限管理',   NULL,                  'Key',            30, true, 0, now(), 0, now(), 0),
@@ -96,7 +100,7 @@ INSERT INTO t_menu (
     (9000000000000102, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'parts_new',                 '新建零件',      '/parts/new',                   'Plus',         20, true, 0, now(), 0, now(), 0),
     (9000000000000103, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'assemblies_list',           '装配件一览',    '/assemblies',                  'Connection',   30, true, 0, now(), 0, now(), 0),
     (9000000000000104, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'delivery_notes_manage',     '送货单',        '/delivery-notes',              'Document',     30, true, 0, now(), 0, now(), 0),
-    (9000000000000105, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'inspection_pending',        '待品检',        '/inspection/pending',          'CircleCheck',  50, true, 0, now(), 0, now(), 0),
+    -- 2026-09-29 移除：inspection_pending 从 order_group 移到 production_group 下；sort_order 50 → 30。
     (9000000000000106, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'delivery_dispatch',         '送货',          '/delivery-dispatch',           'Van',          60, true, 0, now(), 0, now(), 0),
     (9000000000000107, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'repair_receive',            '返修接收',      '/repair/receive',              'Tools',        65, true, 0, now(), 0, now(), 0),
 
@@ -114,10 +118,16 @@ INSERT INTO t_menu (
     (9000000000000502, (SELECT id FROM t_menu WHERE code = 'outsource_list'    AND deleted_at IS NULL), 'outsource_quotes_list',     '报价一览',      '/outsource/quotes',            'Document',     20, true, 0, now(), 0, now(), 0),
     (9000000000000503, (SELECT id FROM t_menu WHERE code = 'outsource_list'    AND deleted_at IS NULL), 'outsource_send_receive_list','外协发送/接收','/outsource/send-receive',       'Promotion',    30, true, 0, now(), 0, now(), 0),
 
-    -- production_group 下（018/021/024 累计）
+    -- production_group 下（018/021/024 累计 + 2026-09-29 新增 pending_programming / inspection_pending）
     (9000000000000601, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'process_work_type',         '工序工种',      '/production/process-work-type','Operation',     5, true, 0, now(), 0, now(), 0),
     (9000000000000602, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'part_process_chain',        '制定工序',      '/production/process-design',   'SetUp',        10, true, 0, now(), 0, now(), 0),
+    -- 2026-09-29 新增：待编程（原顶级菜单 id=6，title 改「待编程」）挂在 production_group 下；
+    -- 用原 id（9000000000000006）保证 ON CONFLICT 命中；sort_order=25（在 process_work_type / part_process_chain 之后、worker_queue 之前）。
+    (9000000000000006, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'pending_programming',       '待编程',        '/cnc/pending',                'Cpu',          25, true, 0, now(), 0, now(), 0),
     (9000000000000603, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'worker_queue',              '生产队列',      '/workers/queue',              'Operation',    20, true, 0, now(), 0, now(), 0),
+    -- 2026-09-29 新增：待品检（inspection_pending）从 order_group 移到 production_group；
+    -- 原 id（9000000000000105）保留；sort_order 从 50 改为 30（在 worker_queue 之后）。
+    (9000000000000105, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'inspection_pending',        '待品检',        '/inspection/pending',          'CircleCheck',  30, true, 0, now(), 0, now(), 0),
 
     -- template_management 下（023）
     (9000000000000701, (SELECT id FROM t_menu WHERE code = 'template_management' AND deleted_at IS NULL), 'print_templates_designer','模板编辑',     '/print-templates',             'Document',     10, true, 0, now(), 0, now(), 0)
