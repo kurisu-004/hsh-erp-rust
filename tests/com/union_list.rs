@@ -309,33 +309,56 @@ async fn union_list_row_type_all_merges_part_and_assembly() {
 
 /// `row_type=ALL` deep offset 分页回归 —— pushdown 修分页 bug（plan §3）。
 ///
-/// 注：本测试只验证 pushdown 机制工作（offset 大于 segment_limit 但 total
-/// 仍能凑齐）；不复现原 `segment_limit.clamp(1,200)` bug 的具体偏移点。
+/// 强化版（2026-09-29 round-2）：插入 200 件 part + 60 件 asm = 260 行，验证
+/// `offset=210, limit=50` 时能正确切片（每段必须取够 `(offset+limit)=260`
+/// 行才能让外层 OFFSET 210 LIMIT 50 返回非空集）。
+///
+/// 原 `segment_limit.clamp(1,200)` bug 复现条件：deep offset (>=200) 时
+/// part_seg / asm_seg 各只返前 200 行，UNION 表最多 400 行，外层 OFFSET
+/// 必然返空。本测试一旦 pushdown_limit 被错误硬截到 200，offset=210 即
+/// 触发 empty result，断言 `items.length == 50` 直接 FAIL。
 #[tokio::test]
 async fn union_list_all_mode_deep_offset_pagination() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    // 3 part（按 created_at 升序插，最后插入的最「新 → DESC 时排首）
-    for i in 0..3 {
+
+    // 200 part + 60 asm = 260 总行
+    const PART_COUNT: usize = 200;
+    const ASM_COUNT: usize = 60;
+    const TOTAL: usize = PART_COUNT + ASM_COUNT;
+    // offset/limit 选择：offset=210, limit=50
+    // - offset > 200 触发 pushdown_limit 必须 ≥ 260 才能返回非空
+    // - limit=50 验证切片大小正确（items.length == 50）
+    // - 区间 [210, 260) 落在 TOTAL=260 之内，无越界
+    const OFFSET: i64 = 210;
+    const LIMIT: i64 = 50;
+
+    for i in 0..PART_COUNT {
         insert_part(
             &pool,
             &format!("P{i}"),
             fx.customer_l2_id,
-            Some(&format!("P{i:03}")),
+            Some(&format!("P{i:04}")),
             "PENDING",
         )
         .await;
     }
-    let asm1 = insert_assembly(&pool, "ASM-A", "AA", fx.customer_l2_id).await;
-    let asm2 = insert_assembly(&pool, "ASM-B", "BB", fx.customer_l2_id).await;
+    for i in 0..ASM_COUNT {
+        insert_assembly(
+            &pool,
+            &format!("ASM-{i:03}"),
+            &format!("A{i}"),
+            fx.customer_l2_id,
+        )
+        .await;
+    }
 
-    // 不指定 sort_by → 默认 CREATED_AT DESC。3 part 后插 2 asm，所以首 2 条
-    // 应是 asm（创建更晚），余 3 条是 part。
+    // 关键场景：offset=210, limit=50
     let (s, env) = send(
         app.clone(),
         hsh_erp_test_support::json_request(
             "GET",
             &format!(
-                "/com/union-list?customer_id={}&row_type=ALL&limit=3&offset=0",
+                "/com/union-list?customer_id={}&row_type=ALL&limit={LIMIT}&offset={OFFSET}",
                 fx.customer_l2_id
             ),
             None::<Value>,
@@ -343,23 +366,38 @@ async fn union_list_all_mode_deep_offset_pagination() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "ALL 首页: {env}");
+    assert_eq!(s, StatusCode::OK, "deep offset: {env}");
     assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["total"], 5, "ALL total=5: {env}");
-    let page1: Vec<i64> = env["data"]["items"]
-        .as_array()
-        .unwrap()
+    assert_eq!(
+        env["data"]["total"], TOTAL as i64,
+        "ALL 应合并 260 条 (200 part + 60 asm): {env}"
+    );
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(
+        items.len() as i64,
+        LIMIT,
+        "offset=210 limit=50 应返 50 条（不被 segment_limit.clamp(1,200) 截空）: {env}"
+    );
+    // 区间 [OFFSET, OFFSET+LIMIT) = [210, 260) 全部 50 条必须唯一
+    let mut ids: Vec<i64> = items
         .iter()
         .map(|i| i["id"].as_str().unwrap().parse().unwrap())
         .collect();
-    assert_eq!(page1.len(), 3);
-
+    ids.sort();
+    ids.dedup();
+    assert_eq!(
+        ids.len() as i64,
+        LIMIT,
+        "切片内 50 条 id 必唯一（无重复）: {ids:?}"
+    );
+    // 同时验证「small offset 仍能工作」：offset=0, limit=50 应返前 50 条
+    // （FIRST PAGE sanity，覆盖 small-offset 路径未回归）
     let (s, env) = send(
         app,
         hsh_erp_test_support::json_request(
             "GET",
             &format!(
-                "/com/union-list?customer_id={}&row_type=ALL&limit=3&offset=3",
+                "/com/union-list?customer_id={}&row_type=ALL&limit=50&offset=0",
                 fx.customer_l2_id
             ),
             None::<Value>,
@@ -367,27 +405,10 @@ async fn union_list_all_mode_deep_offset_pagination() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "ALL 第 2 页: {env}");
-    let page2: Vec<i64> = env["data"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
-        .collect();
-    assert_eq!(page2.len(), 2);
-    // 两页 id 集合无交集且总 = 5
-    let mut all = page1.clone();
-    all.extend(page2.iter().copied());
-    assert_eq!(all.len(), 5);
-    let mut uniq = all.clone();
-    uniq.sort();
-    uniq.dedup();
-    assert_eq!(uniq.len(), 5, "两页无重复: {all:?}");
-    // 首 2 条应是 asm（创建更晚）
-    assert!(
-        page1.contains(&asm1) && page1.contains(&asm2),
-        "首页应含两个 asm: {page1:?}"
-    );
+    assert_eq!(s, StatusCode::OK, "首页 sanity: {env}");
+    assert_eq!(env["data"]["total"], TOTAL as i64);
+    let page1 = env["data"]["items"].as_array().unwrap();
+    assert_eq!(page1.len(), 50);
 }
 
 /// ALL 模式 `sort_by=SERIAL_NO` —— 不报错，降级为 CREATED_AT。

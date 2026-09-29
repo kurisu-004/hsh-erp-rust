@@ -215,7 +215,16 @@ impl UnionListService {
     ) -> Result<PartListOut, AppError> {
         let parsed = parse_filters(&mut *conn, query).await?;
 
-        let pushdown_limit = (limit + offset).clamp(1, 200);
+        // 2026-09-29 修复：移除原 segment_limit.clamp(1,200) 硬截——deep offset (>=200)
+        // 时 part_seg / asm_seg 各只返前 200 行，UNION 表最多 400 行，外层 OFFSET
+        // 必然返空（与原 list_parts_all_merged bug 完全同形）。
+        // 现在按 plan §3 直接用 offset+limit：每段保证取够全局排序 [offset,
+        // offset+limit) 区间所需的行。offset/limit 来自入参，已在外层校验（见
+        // 上方 `limit = query.limit.unwrap_or(50).clamp(1, 200)` /
+        // `offset = query.offset.unwrap_or(0).max(0)`）。
+        //
+        // 保守上限：避免 caller 误传巨大 offset 时 UNION 表膨胀（每段最多 1 万行）。
+        let pushdown_limit = (limit + offset).min(10_000);
 
         // ----- ALL 段 UNION ALL + pushdown -----
         let rows = UnionListRepo::list_union_all_with_filters(
