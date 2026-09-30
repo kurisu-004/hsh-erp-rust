@@ -295,7 +295,10 @@ async fn list_batches_happy_path() {
             pid.to_string(),
             "items[{i}].part_id matches URL"
         );
-        assert!(item["batch_label"].is_string(), "items[{i}].batch_label is string");
+        assert!(
+            item["batch_label"].is_string(),
+            "items[{i}].batch_label is string"
+        );
         assert_eq!(
             item["batch_label"].as_str().unwrap(),
             format!("L{}", item["id"].as_str().unwrap()),
@@ -317,8 +320,14 @@ async fn list_batches_happy_path() {
             item["delivery_note_no"].is_null(),
             "items[{i}].delivery_note_no present (null ok)"
         );
-        assert!(item["created_at"].is_string(), "items[{i}].created_at is ISO string");
-        assert!(item["updated_at"].is_string(), "items[{i}].updated_at is ISO string");
+        assert!(
+            item["created_at"].is_string(),
+            "items[{i}].created_at is ISO string"
+        );
+        assert!(
+            item["updated_at"].is_string(),
+            "items[{i}].updated_at is ISO string"
+        );
         assert!(item["version"].is_number(), "items[{i}].version is number");
         // 2026-09-30 Phase 2：验证旧字段 holder_name 不应再出现在响应里
         assert!(
