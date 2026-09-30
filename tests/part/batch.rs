@@ -286,6 +286,46 @@ async fn list_batches_happy_path() {
     assert_eq!(env["code"], 0);
     let items = env["data"].as_array().expect("data is array");
     assert_eq!(items.len(), 2);
+    // 2026-09-30 Phase 2 dashboard 二次调整：验证 7 新字段（含 holder_name → current_holder_display 重命名）
+    for (i, item) in items.iter().enumerate() {
+        assert!(item["id"].is_string(), "items[{i}].id is string");
+        assert!(item["part_id"].is_string(), "items[{i}].part_id is string");
+        assert_eq!(
+            item["part_id"].as_str().unwrap(),
+            pid.to_string(),
+            "items[{i}].part_id matches URL"
+        );
+        assert!(item["batch_label"].is_string(), "items[{i}].batch_label is string");
+        assert_eq!(
+            item["batch_label"].as_str().unwrap(),
+            format!("L{}", item["id"].as_str().unwrap()),
+            "items[{i}].batch_label is L{{id}}"
+        );
+        assert!(
+            item["current_holder_display"].is_null(),
+            "items[{i}].current_holder_display present (null ok)"
+        );
+        assert!(
+            item["current_process_step_id"].is_null(),
+            "items[{i}].current_process_step_id present (null ok)"
+        );
+        assert!(
+            item["next_process_name"].is_null(),
+            "items[{i}].next_process_name present (null ok)"
+        );
+        assert!(
+            item["delivery_note_no"].is_null(),
+            "items[{i}].delivery_note_no present (null ok)"
+        );
+        assert!(item["created_at"].is_string(), "items[{i}].created_at is ISO string");
+        assert!(item["updated_at"].is_string(), "items[{i}].updated_at is ISO string");
+        assert!(item["version"].is_number(), "items[{i}].version is number");
+        // 2026-09-30 Phase 2：验证旧字段 holder_name 不应再出现在响应里
+        assert!(
+            item.get("holder_name").is_none(),
+            "items[{i}].holder_name should be renamed to current_holder_display"
+        );
+    }
 }
 
 #[tokio::test]

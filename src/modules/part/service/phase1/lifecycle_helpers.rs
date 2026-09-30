@@ -244,6 +244,11 @@ impl PartService {
     }
 
     /// `GET /parts/{id}/batches`：工单全部活跃批次。
+    ///
+    /// 2026-09-30 Phase 2 dashboard 二次调整：扩展 PartBatchListItemOut 7 字段
+    /// （`part_id` / `batch_label` / `current_holder_display` / `current_process_step_id` /
+    /// `next_process_name` / `delivery_note_no` / `created_at` / `updated_at`），
+    /// 修复前端 dashboard PartPreviewDialog Zod 校验 `received undefined` 报错。
     pub async fn list_batches<R: PartRepoTrait>(
         mut repo: R,
         part_id: i64,
@@ -260,7 +265,23 @@ impl PartService {
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         let rows: Vec<BatchListRow> = sqlx::query_as::<_, BatchListRow>(
-            "SELECT b.id AS id, b.batch_no, b.quantity, b.status, b.location,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, b.current_process_step_id,              b.delivery_note_id, b.parent_batch_id,              b.version              FROM t_part_batch b              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              WHERE b.part_id = $1 AND b.deleted_at IS NULL              ORDER BY b.batch_no ASC",
+            "SELECT b.id, b.part_id, b.batch_no, b.quantity, b.status, b.location, \
+             b.current_holder_id, b.current_process_step_id, \
+             b.delivery_note_id, b.parent_batch_id, \
+             b.created_at, b.updated_at, b.version, \
+             COALESCE(s.name, w.name, oc.name) AS current_holder_display, \
+             s2.process_id AS next_process_id, \
+             p2.name AS next_process_name, \
+             dn.delivery_note_no AS delivery_note_no \
+             FROM t_part_batch b \
+             LEFT JOIN t_shelf s ON s.id = b.current_holder_id \
+             LEFT JOIN t_worker w ON w.id = b.current_holder_id \
+             LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id \
+             LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id \
+             LEFT JOIN t_process p2 ON p2.id = s2.process_id \
+             LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id \
+             WHERE b.part_id = $1 AND b.deleted_at IS NULL \
+             ORDER BY b.batch_no ASC",
         )
         .bind(part_id)
         .fetch_all(repo.conn_mut())
@@ -269,19 +290,32 @@ impl PartService {
             .into_iter()
             .map(|r| PartBatchListItemOut {
                 id: r.id,
+                part_id: r.part_id,
                 batch_no: r.batch_no,
+                // 2026-09-30 Phase 2：沿 delivery_note L{id} 命名风格在 mapper 派生
+                batch_label: format!("L{}", r.id),
                 quantity: r.quantity,
                 status: r.status,
                 location: r.location,
                 current_holder_id: r.current_holder_id,
-                holder_name: r.holder_name,
+                // 2026-09-30 Phase 2：holder_name 重命名为 current_holder_display
+                current_holder_display: r.current_holder_display,
+                // 2026-09-30 Phase 2：SQL 已选该字段，原 DTO 漏投
+                current_process_step_id: r.current_process_step_id,
                 // 2026-09-16 PR-3 批次 step 化：next_process_id 由 step.process_id 派生；
                 // DTO 保留字段（兼容前端），但 PartBatchListItemOut 当前**总是 None**
                 // —— 见 dto_crud.rs 字段说明。如需该信息请前端改为读
                 // current_process_step_id 后端按需派生。
                 next_process_id: r.next_process_id,
+                // 2026-09-30 Phase 2：LEFT JOIN t_process 派生
+                next_process_name: r.next_process_name,
                 delivery_note_id: r.delivery_note_id,
+                // 2026-09-30 Phase 2：LEFT JOIN t_delivery_note 派生
+                delivery_note_no: r.delivery_note_no,
                 parent_batch_id: r.parent_batch_id,
+                // 2026-09-30 Phase 2：t_part_batch 时间戳
+                created_at: r.created_at,
+                updated_at: r.updated_at,
                 version: r.version,
             })
             .collect())

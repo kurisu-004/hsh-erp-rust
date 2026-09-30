@@ -4,16 +4,20 @@
 > 通用约定见 [`../index.md`](../index.md)
 > 共享 DTO 见 [`./index.md`](./index.md)
 >
-> 范围：本文件覆盖 3 个 batch 端点（batch-with-pdfs / `/{part_id}/batches` /
-> `/{part_id}/batches/split`）。CRUD / lifecycle / inspection 见
+> 范围：本文件覆盖 4 个 batch 端点（batch-with-pdfs / `GET /{part_id}/batches` /
+> `POST /{part_id}/batches` / `/{part_id}/batches/split`）。CRUD / lifecycle / inspection 见
 > [`./crud.md`](./crud.md) / [`./lifecycle.md`](./lifecycle.md) / [`./inspection.md`](./inspection.md)。
 
 > **2026-09-23 PR12 新增文件**：本节 3 个端点原 docs/api/parts/ 未覆盖，
 > 本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。
 
+> **2026-09-30 Phase 2 dashboard 二次调整**：新增 `GET /api/v2/parts/{part_id}/batches`
+> 文档章节，`PartBatchListItemOut` 字段从 11 扩展到 18（详见后文）。
+
 ## 本文件目录
 
 - [POST /api/v2/parts/batch-with-pdfs](#post-apiv2partsbatch-with-pdfs)
+- [GET /api/v2/parts/{part_id}/batches](#get-apiv2partspart_idbatches)
 - [POST /api/v2/parts/{part_id}/batches](#post-apiv2partspart_idbatches)
 - [POST /api/v2/parts/{part_id}/batches/split](#post-apiv2partspart_idbatchessplit)
 
@@ -38,6 +42,47 @@ Request (multipart/form-data)：
 Response 201 `data`：`PartBatchCreateOut`（见 [`./crud.md#partbatchcreateout-字段`](./crud.md#partbatchcreateout-字段)）
 
 错误码：20102 / 20104 / 40001 / 40300。
+
+### `GET /api/v2/parts/{part_id}/batches`
+
+工单全部活跃批次列表（含 holder 名称 / 下一工序 / 父批次 / 送货单号 / 时间戳等元信息）。
+
+**权限**：Manager / Clerk / Inspector / CncProgrammer（2026-09-30 Phase 2 与 list 端点对齐，沿用 PartListQuery 权限层级）。
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `part_id` | path `i64` | 工单雪花 ID |
+
+Response 200 `data`：`PartBatchListItemOut[]`，数组按 `batch_no ASC` 升序。
+
+错误码：20101 / 40001 / 40300。
+
+#### `PartBatchListItemOut` 字段（2026-09-30 Phase 2 dashboard 二次调整扩展）
+
+| 字段 | 类型 | nullable | 说明 |
+|---|---|---|---|
+| `id` | string | no | 批次雪花 ID |
+| `part_id` | string | no | 所属工单 ID |
+| `batch_no` | number | no | 批次序号（同 part 内递增） |
+| `batch_label` | string | no | 展示标签，格式 `L{id}`（与 delivery_note 一致） |
+| `quantity` | number | no | 批次数量 |
+| `status` | string | no | `OrderStatus` 枚举字符串 |
+| `location` | string | yes | `OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF / OUTSOURCE_COMPANY` |
+| `current_holder_id` | string | yes | 当前持有者 ID |
+| `current_holder_display` | string | yes | 当前持有者解析名（货架 code / 工人姓名 / 外协公司名） |
+| `current_process_step_id` | string | yes | 当前工艺链步骤 ID |
+| `next_process_id` | string | yes | 下一工艺链步骤的 process_id（DTO 兼容保留，2026-09-16 PR-3 之后与 `current_process_step_id` 同源） |
+| `next_process_name` | string | yes | 下一工序名称 |
+| `delivery_note_id` | string | yes | 关联送货单 ID |
+| `delivery_note_no` | string | yes | 关联送货单号 |
+| `parent_batch_id` | string | yes | 父批次 ID（拆分场景） |
+| `created_at` | string | no | ISO 8601 timestamp |
+| `updated_at` | string | no | ISO 8601 timestamp |
+| `version` | number | no | 乐观锁版本号 |
+
+> **2026-09-30 Phase 2 更新**：相比此前 11 字段版本，新增 `part_id` / `batch_label` / `current_holder_display`（重命名自 `holder_name`） / `current_process_step_id` / `next_process_name` / `delivery_note_no` / `created_at` / `updated_at`。前端 dashboard PartPreviewDialog Zod schema 已对齐 18 字段。
 
 ### `POST /api/v2/parts/{part_id}/batches`
 
