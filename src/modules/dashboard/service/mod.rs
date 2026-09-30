@@ -3,7 +3,8 @@
 //! 拆分依据（Group E 重构 + 单文件职责 / 1000 行上限）：把单文件 `service.rs`
 //! 拆为
 //! - `snapshot` —— `build_snapshot_with_workers` 装配大屏完整快照（含工人持有的
-//!   PICKED_UP 时间戳、产线架每架 top-10 截流、worker 名称查表、未来 7 天交付分桶）
+//!   PICKED_UP 时间戳、产线架每架 top-10 截流、worker 名称查表、未来 N 天交付分桶
+//!   （N 来自 `?upcoming_days=` / WS 路径默认 14；2026-09-30 同步））
 //!
 //! `DashboardSnapshot` / `OnProductionShelfGroup` / `DashboardItem` /
 //! `UpcomingDeliveryBucket` 等数据结构在 `dto.rs`（2026-09-22 从 service.rs 平移），

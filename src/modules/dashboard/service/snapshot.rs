@@ -2,7 +2,7 @@
 //!
 //! 对应 Python myERP/service/dashboard.py 的 `build_snapshot_with_workers`：
 //! 大屏实时推送的完整快照，包含生产货架分组 + 品检区扁平 + 工人持有件 +
-//! 未来 N 天交付分桶。
+//! 未来 N 天交付分桶（N 来自 `?upcoming_days=` / WS 路径默认 14；2026-09-30 同步）。
 //!
 //! ## 设计要点（2026-09-22 Group E 重构后）
 //! - 4 次 trait call 拉全量数据（`snapshot_counters` / `snapshot_top_parts` /

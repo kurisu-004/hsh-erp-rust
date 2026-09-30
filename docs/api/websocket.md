@@ -57,7 +57,7 @@ Request：
     "on_production_shelves": [...],
     "on_inspection_shelves": [...],
     "in_process": [...],
-    "upcoming_delivery": [{"date":"2026-09-15","count":0}, ...7 条],
+    "upcoming_delivery": [{"date":"2026-09-15","count":0,"status":"PENDING"}, ...N 条（N 来自 service 默认值 14，与 HTTP `/snapshot` 端点对齐；2026-09-30 同步）],
     "ts": "2026-09-15T10:00:00+08:00"
   },
   "ts": "..."

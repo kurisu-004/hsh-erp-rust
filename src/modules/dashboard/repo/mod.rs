@@ -58,7 +58,7 @@ pub use sql::{BatchLite, DashboardRepo, PartLite, RecentBatchesData, TopPartsDat
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait DashboardRepoTrait: Send {
-    /// 未来 N 天交付分桶（counter buckets）。0 计数天也填充（保证 7 天固定 7 条）。
+    /// 未来 N 天交付分桶（counter buckets）。0 计数天也填充（保证 N 天固定 N 条，`days` 形参驱动；2026-09-30 同步）。
     async fn snapshot_counters(
         &mut self,
         days: i64,

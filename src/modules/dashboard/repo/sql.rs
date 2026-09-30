@@ -118,10 +118,11 @@ impl DashboardRepo {
     ) -> Result<Vec<UpcomingDeliveryBucket>, sqlx::Error> {
         // 2026-09-30 修改：原 `GROUP BY planned_delivery_date` 扩为
         // `GROUP BY planned_delivery_date, status`，让每个桶返回按 OrderStatus
-        // 细分的计数（dashboard 柱状图分层堆叠底座）。7 天 × ≤8 状态最多 56 行
-        // 聚合，远低于原 7 行；既有 `idx_parts_planned_delivery_date` 索引覆盖，
-        // 不需新索引。WHERE 仍排除 COMPLETED / CANCELLED，故 by_status 不会含
-        // 这两个 key（沿 frontend `z.record(z.string(), z.number())` 必填契约）。
+        // 细分的计数（dashboard 柱状图分层堆叠底座）。N 天 × ≤8 状态最多 8N 行
+        // 聚合（N = `days` 形参；2026-09-30 同步），远低于原 7 行；既有
+        // `idx_parts_planned_delivery_date` 索引覆盖，不需新索引。WHERE 仍排除
+        // COMPLETED / CANCELLED，故 by_status 不会含这两个 key（沿 frontend
+        // `z.record(z.string(), z.number())` 必填契约）。
         let rows = sqlx::query(
             "SELECT planned_delivery_date AS d, status AS s, COUNT(*)::bigint AS cnt \
              FROM t_part \
