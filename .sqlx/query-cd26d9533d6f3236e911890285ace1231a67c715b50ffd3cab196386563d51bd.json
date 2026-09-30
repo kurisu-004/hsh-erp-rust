@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT id, part_id, batch_no, quantity, status, location,\n                       current_holder_id, current_process_step_id,\n                       delivery_note_id, parent_batch_id,\n                       version, created_at, created_by, updated_at, updated_by,\n                       deleted_at\n                FROM t_part_batch\n                WHERE id = $1 AND part_id = $2\n                  AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')\n                  AND deleted_at IS NULL\n                ",
+  "query": "\n            SELECT id, part_id, batch_no, quantity, status, location,\n                   current_holder_id, current_process_id, current_process_step_id,\n                   delivery_note_id, parent_batch_id,\n                   version, created_at, created_by, updated_at, updated_by, deleted_at\n            FROM t_part_batch\n            WHERE delivery_note_id = $1\n              AND deleted_at IS NULL\n            ORDER BY id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -82,6 +82,17 @@
       },
       {
         "ordinal": 7,
+        "name": "current_process_id",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "current_process_id"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
         "name": "current_process_step_id",
         "type_info": "Int8",
         "origin": {
@@ -92,7 +103,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "delivery_note_id",
         "type_info": "Int8",
         "origin": {
@@ -103,7 +114,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "parent_batch_id",
         "type_info": "Int8",
         "origin": {
@@ -114,7 +125,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "version",
         "type_info": "Int4",
         "origin": {
@@ -125,7 +136,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "created_at",
         "type_info": "Timestamp",
         "origin": {
@@ -136,7 +147,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "created_by",
         "type_info": "Int8",
         "origin": {
@@ -147,7 +158,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "updated_at",
         "type_info": "Timestamp",
         "origin": {
@@ -158,7 +169,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 15,
         "name": "updated_by",
         "type_info": "Int8",
         "origin": {
@@ -169,7 +180,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 16,
         "name": "deleted_at",
         "type_info": "Timestamp",
         "origin": {
@@ -182,7 +193,6 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
         "Int8"
       ]
     },
@@ -197,6 +207,7 @@
       true,
       true,
       true,
+      true,
       false,
       false,
       true,
@@ -205,5 +216,5 @@
       true
     ]
   },
-  "hash": "e83e51ee3d2672f991b79e179d57ee285edda088aad5e0e3fa444b3185f3368d"
+  "hash": "cd26d9533d6f3236e911890285ace1231a67c715b50ffd3cab196386563d51bd"
 }

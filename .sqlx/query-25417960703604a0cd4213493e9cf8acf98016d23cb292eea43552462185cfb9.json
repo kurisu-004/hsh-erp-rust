@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part_batch\n            SET status                  = 'IN_PROCESS',\n                location                = 'PRODUCTION_SHELF',\n                current_holder_id       = $3,\n                -- 2026-09-30 新增：池归属权威依据（见函数 doc）\n                current_process_id      = $5,\n                -- 进度指针：dispatch 路径不解析 step，有意置 NULL\n                current_process_step_id = NULL,\n                version                 = version + 1,\n                updated_at              = now(),\n                updated_by              = $4\n            WHERE id = $1\n              AND version = $2\n              AND status = 'PENDING'\n              AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "25417960703604a0cd4213493e9cf8acf98016d23cb292eea43552462185cfb9"
+}

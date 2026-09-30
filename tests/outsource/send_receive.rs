@@ -527,6 +527,10 @@ async fn receive_from_outsource_marks_shipment_received() {
     .unwrap();
     // 2026-09-16 PR-3：receive 路径要把 batch.current_process_step_id 切到
     // (chain_id, next_process_id) 对应的 step，因此 fixture 必须为 next_proc 也建一个 step。
+    // 2026-09-30：入池归属判定已改走 `current_process_id`（不需要 step 行），
+    // 但 `ProcessChainRepo::resolve_step_id_by_process` 守卫仍要求 chain 内存在
+    // 活跃 step，否则端点会以 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND 422 拒绝，
+    // 故本 fixture 的 create_step 必须保留。
     let next_step_id = create_step(&pool, chain_id, next_proc, 2).await;
     let _ = next_step_id; // 确认 step 已落库；service 内自行解析
 

@@ -554,8 +554,8 @@ mod tests {
 
     /// 构造一个最小化的 `TPartInspected` 行（status 参数化）。
     fn sample_part_inspected(part_id: i64, status: &str) -> TPartInspected {
-        let now = NaiveDateTime::parse_from_str("2026-09-30 12:00:00", "%Y-%m-%d %H:%M:%S")
-            .unwrap();
+        let now =
+            NaiveDateTime::parse_from_str("2026-09-30 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
         TPartInspected {
             id: part_id,
             serial_no: Some(format!("SN-{part_id}")),

@@ -132,6 +132,7 @@ Request：`MoveRequest`
 #### 关键不变量（保证工序链不被破坏）
 
 - 所有 move SQL **不写** `current_process_step_id`（move 不推进工序链；step 仅由 worker-scan RETURNED/INSPECTED 推进）
+- 所有 move SQL 同样 **不写** `current_process_id`（2026-09-30 写入不变式：池内移动工序不变，批次归还货架后仍属原工序候选池）
 - 批次必须 `status='IN_PROCESS'` 且 `deleted_at IS NULL`；否则 `20120 BIZ_BATCH_INVALID_STATUS`
 - OCC：`UPDATE ... WHERE version = $expected`；0 行 → `40901 VERSION_CONFLICT`
 - `from` 必与 batch 当前 `(location, current_holder_id)` 匹配：
@@ -223,8 +224,8 @@ Query：无（按现有 per-process 端点惯例，不指定 shelf_id，返回�
 2. 调 `WorkerPoolRepo::group_count_by_process_all_shelves` 单 SQL GROUP BY 取
    `(process_id, count)`：跨 `t_part_batch` 中
    `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL`
-   的批次数（按 `next_process_id` 维度聚合，PR-3 批次 step 化后改走
-   `t_process_chain_step.process_id` JOIN 取值）
+   的批次数（2026-09-30 起按 `current_process_id` 维度聚合，工序池归属的
+   权威依据，不再 JOIN `t_process_chain_step`）
 3. 二次调 `ProcessRepo::list_by_ids` 取 `process_code / process_name` 元数据
 4. 装 `WorkerPoolCountsOut` 返回（`total = counts.iter().map(|c| c.count).sum()`）
 
@@ -389,7 +390,7 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `process_id` | string (i64) | 工序雪花 ID |
-| `pool_count` | i64 | 该工序在 shelf 上的候选批次数（`t_part_batch` 中 `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND current_holder_id = shelf_id AND next_process_id = process_id`） |
+| `pool_count` | i64 | 该工序在 shelf 上的候选批次数（`t_part_batch` 中 `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND current_holder_id = shelf_id AND current_process_id = process_id`） |
 
 ### WorkerPoolState 字段
 

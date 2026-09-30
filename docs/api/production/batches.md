@@ -28,7 +28,9 @@
 `target_process_id` → service 查 `t_shelf_process WHERE process_id = $1 AND deleted_at IS NULL ORDER BY sort_order ASC, id ASC LIMIT 1` 解析货架。多结果取 `sort_order` 最小者；0 结果 → `20508 BIZ_SHELF_PROCESS_NOT_FOUND`。
 
 ### 状态机与事件
-dispatch 路径：`PENDING → IN_PROCESS`，`location='PRODUCTION_SHELF'`，`current_holder_id=shelf_id`，`current_process_step_id=NULL`（dispatch 路径不解析 step，由 worker-scan / 后续流转触发）。同事务写 `t_part_event.kind='PLACED_ON_SHELF'`（from='PENDING', to='IN_PROCESS'）。
+dispatch 路径：`PENDING → IN_PROCESS`，`location='PRODUCTION_SHELF'`，`current_holder_id=shelf_id`，**`current_process_id=target_process_id`**（2026-09-30 新增；工序候选池归属的权威依据），`current_process_step_id=NULL`（**有意的**：dispatch 路径不解析 step，该列已降级为可选的进度指针，NULL 不影响入池；由 worker-scan / 后续流转写入）。同事务写 `t_part_event.kind='PLACED_ON_SHELF'`（from='PENDING', to='IN_PROCESS'）。
+
+> **2026-09-30 bug 修复说明**：此前 dispatch 只写 `current_process_step_id=NULL`，而 `GET /prod/pool/{process_id}` / `/prod/pool/counts` / `take_one_from_pool` 三条 SQL 全部 `INNER JOIN t_process_chain_step ON s.id = pb.current_process_step_id` —— `s.id = NULL` 匹配不到任何行，下发成功的批次对所有工序池查询隐身（前端表现为「下发成功但工序池里没有」），且因唯一推进 step 的 worker-scan 路径又要求批次先在池里，形成死状态。现三条 SQL 均改为按 `current_process_id` 普通过滤，并新增 `t_part_batch.current_process_id`（逻辑 FK → `t_process.id`）写入。**目标**：让没有工序链的工单，其批次也能正常入池。
 
 ### 事务 + WS 广播（沿 worker_pool 范本）
 - 读（pending）：`pool.acquire()` 不开事务
@@ -98,9 +100,9 @@ Request：`DispatchRequest`
 1. 取 batch（`find_batch_by_id(include_deleted=false)`）→ `None` → `20121 BIZ_BATCH_NOT_FOUND`
 2. 校验 `batch.status == 'PENDING'` → 否则 `20120 BIZ_BATCH_INVALID_STATUS`
 3. 解析货架（`find_first_shelf_for_process`）→ `None` → `20508 BIZ_SHELF_PROCESS_NOT_FOUND`
-4. `update_batch_dispatched`（OCC，WHERE `version = current_version AND status='PENDING'`）→ 0 行 → `40901 VERSION_CONFLICT`
+4. `update_batch_dispatched`（OCC，WHERE `version = current_version AND status='PENDING'`；SET 写 `current_process_id = target_process_id`、`current_process_step_id = NULL`）→ 0 行 → `40901 VERSION_CONFLICT`
 5. 写 `t_part_event(kind='PLACED_ON_SHELF', from='PENDING', to='IN_PROCESS')`
-6. 返回 `DispatchSuccessItem { batch_id, current_process_step_id=None, target_process_id, shelf_id, version=batch.version+1 }`
+6. 返回 `DispatchSuccessItem { batch_id, current_process_step_id=None, current_process_id=Some(target_process_id), target_process_id, shelf_id, version=batch.version+1 }`
 
 Response 200 `data`：[`DispatchResult`](#dispatchresult-字段)
 
@@ -211,7 +213,8 @@ Response 200 `data`：[`AutoDispatchResult`](#autodispatchresult-字段)
 ```jsonc
 {
   "batch_id": "1001",
-  "current_process_step_id": null,    // Option<i64>，dispatch 路径不解析 step → null
+  "current_process_step_id": null,    // Option<i64>，dispatch 路径不解析 step → null（有意，可选进度指针）
+  "current_process_id": "2001",       // Option<i64>，2026-09-30 新增：下发后写入的工序池归属（= target_process_id）
   "target_process_id": "2001",
   "shelf_id": "3001",                  // string(i64)，t_shelf_process 解析
   "version": 4                        // i32，batch.version + 1

@@ -382,17 +382,20 @@ async fn insert_pool_part(
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
     // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
-    // 改为 `current_process_step_id`。worker_pool 候选池匹配改为
-    // `s.process_id = ANY(worker.process_ids)`（JOIN t_process_chain_step）。
+    // 改为 `current_process_step_id`。
+    // 2026-09-30：worker_pool 候选池匹配改回
+    // `pb.current_process_id = ANY(worker.process_ids)`（不再 JOIN
+    // t_process_chain_step），helper 必须补该列否则批次对池隐身。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, current_process_step_id, version, \
+         current_holder_id, current_process_id, current_process_step_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, 0, $7, $7)",
         batch_id,
         part_id,
         quantity,
         shelf_id,
+        process_id,
         step_id,
         now,
     )

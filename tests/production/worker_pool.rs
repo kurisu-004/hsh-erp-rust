@@ -436,15 +436,18 @@ async fn insert_pool_part(
         .next_id();
     // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
     // 改为 `current_process_step_id`。
+    // 2026-09-30：候选池归属改按 `current_process_id` 普通过滤
+    // （不再 JOIN t_process_chain_step），helper 必须同时写这两列。
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, current_process_step_id, version, \
+         current_holder_id, current_process_id, current_process_step_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'PRODUCTION_SHELF', $4, $5, $6, 0, $7, $7)",
         batch_id,
         part_id,
         quantity,
         shelf_id,
+        process_id,
         step_id,
         now,
     )
@@ -527,15 +530,18 @@ async fn insert_worker_held_part(
     let batch_id = snowflake.next_id();
     // 2026-09-16 PR-2（migration 027）：t_part_batch 删 `has_been_repaired`；INSERT
     // 列名与 VALUES 占位符同步移除 `false` 字面量。
+    // 2026-09-30：同 insert_pool_batch —— 补 `current_process_id`
+    // （RETURNED 归还货架后要能落回原工序候选池）
     sqlx::query!(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, current_process_step_id, version, \
+         current_holder_id, current_process_id, current_process_step_id, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'WORKER', $4, $5, 0, $6, $6)",
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'WORKER', $4, $5, $6, 0, $7, $7)",
         batch_id,
         part_id,
         quantity,
         worker_id,
+        next_process_id,
         step_id,
         now,
     )
@@ -958,12 +964,16 @@ async fn take_does_not_update_placed_at() {
 
     // PR-3 批次 step 化：t_part_batch.placed_at 列已删；改测 take 后 batch
     // 状态保持原状（IN_PROCESS + current_process_step_id 不变）。
-    let (status_after, step_after): (String, Option<i64>) =
-        sqlx::query_as("SELECT status, current_process_step_id FROM t_part_batch WHERE id = $1")
-            .bind(pool_batch)
-            .fetch_one(&pool)
-            .await
-            .expect("query after");
+    // 2026-09-30：同样断言 current_process_id 不变（池内移动工序不变）。
+    let (status_after, step_after, process_after): (String, Option<i64>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT status, current_process_step_id, current_process_id \
+             FROM t_part_batch WHERE id = $1",
+        )
+        .bind(pool_batch)
+        .fetch_one(&pool)
+        .await
+        .expect("query after");
     assert_eq!(
         status_after, "IN_PROCESS",
         "take 后 batch status 仍为 IN_PROCESS（fixture 起点）"
@@ -971,6 +981,11 @@ async fn take_does_not_update_placed_at() {
     assert!(
         step_after.is_some(),
         "take 后 batch 仍持有 step（fixture 起点有 step_id）"
+    );
+    assert_eq!(
+        process_after,
+        Some(proc),
+        "take 不应改变 current_process_id（池内移动工序不变）"
     );
 }
 
@@ -1100,14 +1115,14 @@ async fn move_worker_to_pool_returns_batch_to_pool() {
     let (_held_part, held_batch) =
         insert_worker_held_part(&pool, customer, "H-013", worker, proc, 1).await;
 
-    // 取 move 前的 step_id（move 后应保持不变）
-    let step_before: Option<i64> = sqlx::query_scalar!(
-        "SELECT current_process_step_id FROM t_part_batch WHERE id = $1",
-        held_batch,
+    // 取 move 前的 step_id / current_process_id（move 后都应保持不变）
+    let (step_before, process_before): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT current_process_step_id, current_process_id FROM t_part_batch WHERE id = $1",
     )
+    .bind(held_batch)
     .fetch_one(&pool)
     .await
-    .expect("query step before");
+    .expect("query step/process before");
 
     let (app, token) = login_manager_with_username(&pool, "admin13").await;
     let (s, env) = send(
@@ -1139,7 +1154,7 @@ async fn move_worker_to_pool_returns_batch_to_pool() {
     // batch 应回到 PRODUCTION_SHELF holder=shelf
     let row = sqlx::query!(
         r#"SELECT location AS "loc!", current_holder_id AS "ch?",
-                  current_process_step_id AS "step?"
+                  current_process_step_id AS "step?", current_process_id AS "pid?"
         FROM t_part_batch WHERE id = $1"#,
         held_batch,
     )
@@ -1153,6 +1168,12 @@ async fn move_worker_to_pool_returns_batch_to_pool() {
         row.step, step_before,
         "move 不应改变 current_process_step_id（step_before={step_before:?} step_after={:?}",
         row.step
+    );
+    // 2026-09-30 镜像断言：move 是池内移动 → 工序不变
+    assert_eq!(
+        row.pid, process_before,
+        "move 不应改变 current_process_id（process_before={process_before:?} process_after={:?}",
+        row.pid
     );
 }
 

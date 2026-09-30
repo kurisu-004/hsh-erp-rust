@@ -34,8 +34,10 @@ use sqlx::PgPool;
 ///
 /// **不预置 part / batch / chain / step / worker**：fixture 只放「不可变共享」
 /// 基线（process / work_type / 映射）。多数 production 域测试需要特定 code /
-/// status / quantity（如 worker_pool 候选池要求 batch 持有 current_process_step_id），
-/// 状态机不允许从这些状态回退；预置行会让 list / count 等「期望空库」断言失败。
+/// status / quantity（如 worker_pool 候选池要求 batch 同时持有
+/// `current_process_id`（2026-09-30 起的池归属权威依据）与
+/// `current_process_step_id`（可选进度指针）），状态机不允许从这些状态回退；
+/// 预置行会让 list / count 等「期望空库」断言失败。
 /// 各 sub-file 按需用 sqlx::query 直插 part / batch / chain / step / worker。
 #[allow(dead_code)]
 pub struct ProductionFixture {
