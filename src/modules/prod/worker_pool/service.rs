@@ -517,14 +517,19 @@ impl WorkerPoolService {
                 }
 
                 // take_specific_from_pool（OCC + WHERE version = candidate.version）
+                // 0 行 → 与 WORKER→POOL / WORKER→WORKER 分支统一返 40901 VERSION_CONFLICT
+                // （plan §2.3「OCC 0 行 → 40901 VERSION_CONFLICT」）；
+                // from 已在 §4 校验过 holder 匹配，故此处 0 行只能是被并发改版本。
+                // 2026-09-30 review 第 1 轮：原返 BIZ_BATCH_LOCATION_MISMATCH (20122)，
+                // 与同函数其它 0 行分支语义不一致，统一回滚为 VERSION_CONFLICT。
                 let taken = (&mut *conn)
                     .take_specific_from_pool(*worker_id, *shelf_id, batch.id, current.id)
                     .await?
                     .ok_or_else(|| {
                         AppError::biz(
-                            code::BIZ_BATCH_LOCATION_MISMATCH,
+                            code::VERSION_CONFLICT,
                             format!(
-                                "take_specific_from_pool 0 行：batch {} 已被并发改动或 holder 不匹配",
+                                "take_specific_from_pool 0 行：batch {} 已被并发改动",
                                 batch.id
                             ),
                         )
@@ -1088,5 +1093,703 @@ impl WorkerPoolService {
 impl Default for WorkerPoolService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ===== in-source 单测 =====
+//
+// 2026-09-30 review 第 1 轮补漏：plan §5.6 要求 move_batch 的核心方向 + 校验失败
+// 路径在 service.rs 末尾 in-source 覆盖。原 plan 第 1 轮实现仅写了集成测试
+// （tests/production/worker_pool.rs::move_*_transfers_batch 等），未在 service
+// 内做精细单测。本文件补 7 个场景：
+// - 三方向 happy path：POOL→WORKER / WORKER→POOL / WORKER→WORKER
+// - from 与 batch 实际 (location, holder) 不一致 → 40904 LOCATION_MISMATCH
+// - 目标 worker 工种不含 batch 当前 step.process_id → 20104 BIZ_INVALID_VALUE
+// - 目标 shelf 未映射工序 → 20507 BIZ_SHELF_PROCESS_NOT_MAPPED
+// - POOL→POOL 同 kind 移动 → 40001 VALIDATION_ERROR
+//
+// helper 沿用 batch/service.rs::mod tests 风格：直接 raw INSERT，避免引
+// repo trait 而膨胀测试体积。
+//
+// `hsh-erp-test-support` 是 dev-only crate（仅 `[dev-dependencies]` 引入），
+// 故 mod tests 必须 `#[cfg(test)]`，否则普通 `cargo check` 会报 unresolved import。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::rbac::Role;
+    use crate::infra::clock::now_naive;
+    use hsh_erp_test_support::test_pool;
+
+    /// 进程级共享雪花 ID 生成器（与 tests/production/worker_pool.rs 同源设计）。
+    /// 多个 in-source test 在同一毫秒内连发 helper，独立构造会拿到相同 id
+    /// （23505 pkey 冲突）。
+    fn pool_snowflake() -> &'static std::sync::Mutex<SnowflakeIdGenerator> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<SnowflakeIdGenerator>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(SnowflakeIdGenerator::new(1_577_836_800_000, 7)))
+    }
+
+    // ===== helper =====
+
+    async fn insert_user_with_role(
+        pool: &sqlx::PgPool,
+        username: &str,
+        plain_password: &str,
+        role: &str,
+    ) -> i64 {
+        use crate::auth::password;
+        let hash = password::hash(plain_password).expect("bcrypt");
+        // 一次性取两个 id 后立即 drop MutexGuard（避免跨 .await 持锁触发
+        // `clippy::await_holding_lock`）。
+        let (user_id, role_id) = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            (s.next_id(), s.next_id())
+        };
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_user (id, username, password_hash, full_name, is_active, \
+             refresh_token_version, version, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+        )
+        .bind(user_id)
+        .bind(username.to_lowercase())
+        .bind(hash)
+        .bind(username)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_user");
+        sqlx::query(
+            "INSERT INTO t_user_role (id, user_id, role, version, created_at, updated_at) \
+             VALUES ($1, $2, $3, 0, $4, $4)",
+        )
+        .bind(role_id)
+        .bind(user_id)
+        .bind(role)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_user_role");
+        user_id
+    }
+
+    /// 写一个 INHOUSE 工序。
+    async fn insert_process(pool: &sqlx::PgPool, code: &str, name: &str) -> i64 {
+        let id = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            s.next_id()
+        };
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
+             version, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
+        )
+        .bind(id)
+        .bind(code)
+        .bind(name)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_process");
+        id
+    }
+
+    /// 写一个工种（可指定 max_held_batches）。
+    async fn insert_work_type(
+        pool: &sqlx::PgPool,
+        code: &str,
+        name: &str,
+        max_held: Option<i32>,
+    ) -> i64 {
+        let id = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            s.next_id()
+        };
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_work_type (id, code, name, sort_order, max_held_batches, version, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 0, $4, 0, $5, $5)",
+        )
+        .bind(id)
+        .bind(code)
+        .bind(name)
+        .bind(max_held)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_work_type");
+        id
+    }
+
+    async fn link_work_type_to_process(pool: &sqlx::PgPool, wt_id: i64, p_id: i64) {
+        let id = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            s.next_id()
+        };
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_work_type_process (id, work_type_id, process_id, sort_order, version, \
+             created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $4)",
+        )
+        .bind(id)
+        .bind(wt_id)
+        .bind(p_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_work_type_process");
+    }
+
+    /// 写一个 PRODUCTION 货架。
+    async fn insert_shelf(pool: &sqlx::PgPool, code: &str, zone: &str) -> i64 {
+        let id = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            s.next_id()
+        };
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $2, $3, true, 0, 0, $4, $4)",
+        )
+        .bind(id)
+        .bind(code)
+        .bind(zone)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_shelf");
+        id
+    }
+
+    async fn link_shelf_to_process(pool: &sqlx::PgPool, shelf_id: i64, process_id: i64) {
+        let id = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            s.next_id()
+        };
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, \
+             created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $4)",
+        )
+        .bind(id)
+        .bind(shelf_id)
+        .bind(process_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_shelf_process");
+    }
+
+    /// 写一个 worker（active）。
+    async fn insert_worker(
+        pool: &sqlx::PgPool,
+        badge_code: &str,
+        work_type_id: Option<i64>,
+    ) -> i64 {
+        let id = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            s.next_id()
+        };
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $2, true, $3, 0, $4, $4)",
+        )
+        .bind(id)
+        .bind(badge_code)
+        .bind(work_type_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_worker");
+        id
+    }
+
+    /// 写一个 L2 customer（parent_id NULL 表示 L1 叶子）。
+    async fn insert_customer(pool: &sqlx::PgPool, name: &str) -> i64 {
+        let id = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            s.next_id()
+        };
+        let now = now_naive();
+        sqlx::query(
+            "INSERT INTO t_customer (id, name, version, created_at, updated_at) \
+             VALUES ($1, $2, 0, $3, $3)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_customer");
+        id
+    }
+
+    /// 写一个 part + chain + step（首道指向 process_id）。返回 part_id。
+    /// 2026-09-16 PR-3：move 路径要求 part 绑定工艺链 + batch 持有
+    /// current_process_step_id（与 worker_pool 集成测试 helper 同形态）。
+    async fn insert_pool_batch(
+        pool: &sqlx::PgPool,
+        customer_id: i64,
+        process_id: i64,
+        shelf_id: i64,
+    ) -> (i64, i64) {
+        let now = now_naive();
+        let today = now.date();
+        // 一次性取 4 个 id（chain / step / part / batch），drop guard 后再 await。
+        let (chain_id, step_id, part_id, batch_id) = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            (s.next_id(), s.next_id(), s.next_id(), s.next_id())
+        };
+
+        sqlx::query(
+            "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, \
+             updated_by) VALUES ($1, 0, $2, 1, $2, 1)",
+        )
+        .bind(chain_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert chain");
+
+        sqlx::query(
+            "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+             estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, $2, 1, $3, 30, 0, $4, 0, $4, 0)",
+        )
+        .bind(step_id)
+        .bind(chain_id)
+        .bind(process_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert chain step");
+
+        sqlx::query(
+            "INSERT INTO t_part (id, name, drawing_no, applicant_name, request_date, \
+             planned_delivery_date, status, customer_id, quantity, version, created_at, \
+             updated_at, process_chain_id) \
+             VALUES ($1, 'pool-item', 'DWG-POOL', '', $2, $2, 'IN_PROCESS', $3, 1, 0, $4, $4, $5)",
+        )
+        .bind(part_id)
+        .bind(today)
+        .bind(customer_id)
+        .bind(now)
+        .bind(chain_id)
+        .execute(pool)
+        .await
+        .expect("insert t_part");
+
+        sqlx::query(
+            "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+             current_holder_id, current_process_step_id, version, created_at, updated_at) \
+             VALUES ($1, $2, 1, 1, 'IN_PROCESS', 'PRODUCTION_SHELF', $3, $4, 0, $5, $5)",
+        )
+        .bind(batch_id)
+        .bind(part_id)
+        .bind(shelf_id)
+        .bind(step_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_part_batch POOL");
+        (part_id, batch_id)
+    }
+
+    /// 写一个 part + chain + step + IN_PROCESS+WORKER 批次（被 worker 持有）。
+    async fn insert_worker_held_batch(
+        pool: &sqlx::PgPool,
+        customer_id: i64,
+        process_id: i64,
+        worker_id: i64,
+    ) -> (i64, i64) {
+        let now = now_naive();
+        let today = now.date();
+        let (chain_id, step_id, part_id, batch_id) = {
+            let s = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+            (s.next_id(), s.next_id(), s.next_id(), s.next_id())
+        };
+
+        sqlx::query(
+            "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, \
+             updated_by) VALUES ($1, 0, $2, 1, $2, 1)",
+        )
+        .bind(chain_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert chain");
+
+        sqlx::query(
+            "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+             estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, $2, 1, $3, 30, 0, $4, 0, $4, 0)",
+        )
+        .bind(step_id)
+        .bind(chain_id)
+        .bind(process_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert chain step");
+
+        sqlx::query(
+            "INSERT INTO t_part (id, name, drawing_no, applicant_name, request_date, \
+             planned_delivery_date, status, customer_id, quantity, version, created_at, \
+             updated_at, process_chain_id) \
+             VALUES ($1, 'held-item', 'DWG-HELD', '', $2, $2, 'IN_PROCESS', $3, 1, 0, $4, $4, $5)",
+        )
+        .bind(part_id)
+        .bind(today)
+        .bind(customer_id)
+        .bind(now)
+        .bind(chain_id)
+        .execute(pool)
+        .await
+        .expect("insert t_part");
+
+        sqlx::query(
+            "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+             current_holder_id, current_process_step_id, version, created_at, updated_at) \
+             VALUES ($1, $2, 1, 1, 'IN_PROCESS', 'WORKER', $3, $4, 0, $5, $5)",
+        )
+        .bind(batch_id)
+        .bind(part_id)
+        .bind(worker_id)
+        .bind(step_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_part_batch WORKER");
+        (part_id, batch_id)
+    }
+
+    fn make_current(user_id: i64, role: Role) -> CurrentUser {
+        CurrentUser {
+            id: user_id,
+            username: "test".to_string(),
+            roles: vec![role],
+            shelf_ids: vec![],
+            shelf_wildcard: false,
+        }
+    }
+
+    // ===== 测试 =====
+
+    #[tokio::test]
+    async fn move_batch_pool_to_worker_succeeds() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager_pool", "password", "MANAGER").await;
+        let customer = insert_customer(&pool, "ACME-PTW").await;
+        let proc = insert_process(&pool, "PROC-PTW", "工序PTW").await;
+        let wt = insert_work_type(&pool, "WT-PTW", "工种PTW", Some(3)).await;
+        link_work_type_to_process(&pool, wt, proc).await;
+        let prod_shelf = insert_shelf(&pool, "SH-PTW", "PRODUCTION").await;
+        link_shelf_to_process(&pool, prod_shelf, proc).await;
+        let worker = insert_worker(&pool, "BC-PTW", Some(wt)).await;
+        let (_part, batch) = insert_pool_batch(&pool, customer, proc, prod_shelf).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let snowflake = pool_snowflake()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .next_id();
+        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let _ = snowflake; // 占位避免 unused warning
+        let req = MoveRequest {
+            batch_id: batch,
+            from: MoveLocation::Pool {
+                shelf_id: prod_shelf,
+            },
+            to: MoveLocation::Worker { worker_id: worker },
+            note: Some("in-source pool→worker".to_string()),
+        };
+        let r = WorkerPoolService::move_batch(
+            &mut conn,
+            &snowflake_obj,
+            req,
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect("move_batch OK");
+        assert_eq!(r.from_kind, "POOL");
+        assert_eq!(r.to_kind, "WORKER");
+        assert_eq!(r.new_holder_id, worker);
+        assert_eq!(r.new_location, "WORKER");
+        assert_eq!(r.current_held, Some(1));
+        assert_eq!(r.max_held, Some(3));
+        assert_eq!(r.shelf_id, Some(prod_shelf));
+
+        // DB 验证：batch 已切到 WORKER + holder=worker；step 不变
+        let row: (String, Option<i64>) =
+            sqlx::query_as("SELECT location, current_holder_id FROM t_part_batch WHERE id = $1")
+                .bind(batch)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "WORKER");
+        assert_eq!(row.1, Some(worker));
+    }
+
+    #[tokio::test]
+    async fn move_batch_worker_to_pool_succeeds() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager_wtp", "password", "MANAGER").await;
+        let customer = insert_customer(&pool, "ACME-WTP").await;
+        let proc = insert_process(&pool, "PROC-WTP", "工序WTP").await;
+        let wt = insert_work_type(&pool, "WT-WTP", "工种WTP", Some(3)).await;
+        link_work_type_to_process(&pool, wt, proc).await;
+        let prod_shelf = insert_shelf(&pool, "SH-WTP", "PRODUCTION").await;
+        link_shelf_to_process(&pool, prod_shelf, proc).await;
+        let worker = insert_worker(&pool, "BC-WTP", Some(wt)).await;
+        let (_part, batch) = insert_worker_held_batch(&pool, customer, proc, worker).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let req = MoveRequest {
+            batch_id: batch,
+            from: MoveLocation::Worker { worker_id: worker },
+            to: MoveLocation::Pool {
+                shelf_id: prod_shelf,
+            },
+            note: Some("in-source worker→pool".to_string()),
+        };
+        let r = WorkerPoolService::move_batch(
+            &mut conn,
+            &snowflake_obj,
+            req,
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect("move_batch OK");
+        assert_eq!(r.from_kind, "WORKER");
+        assert_eq!(r.to_kind, "POOL");
+        assert_eq!(r.new_holder_id, prod_shelf);
+        assert_eq!(r.new_location, "PRODUCTION_SHELF");
+        assert_eq!(r.shelf_id, Some(prod_shelf));
+
+        // DB 验证：batch 回到 PRODUCTION_SHELF + holder=shelf
+        let row: (String, Option<i64>) =
+            sqlx::query_as("SELECT location, current_holder_id FROM t_part_batch WHERE id = $1")
+                .bind(batch)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "PRODUCTION_SHELF");
+        assert_eq!(row.1, Some(prod_shelf));
+    }
+
+    #[tokio::test]
+    async fn move_batch_worker_to_worker_succeeds() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager_wtw", "password", "MANAGER").await;
+        let customer = insert_customer(&pool, "ACME-WTW").await;
+        let proc = insert_process(&pool, "PROC-WTW", "工序WTW").await;
+        let wt = insert_work_type(&pool, "WT-WTW", "工种WTW", Some(3)).await;
+        link_work_type_to_process(&pool, wt, proc).await;
+        let prod_shelf = insert_shelf(&pool, "SH-WTW", "PRODUCTION").await;
+        link_shelf_to_process(&pool, prod_shelf, proc).await;
+        let worker_src = insert_worker(&pool, "BC-WTW-SRC", Some(wt)).await;
+        let worker_dst = insert_worker(&pool, "BC-WTW-DST", Some(wt)).await;
+        let (_part, batch) = insert_worker_held_batch(&pool, customer, proc, worker_src).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let req = MoveRequest {
+            batch_id: batch,
+            from: MoveLocation::Worker {
+                worker_id: worker_src,
+            },
+            to: MoveLocation::Worker {
+                worker_id: worker_dst,
+            },
+            note: Some("in-source worker→worker".to_string()),
+        };
+        let r = WorkerPoolService::move_batch(
+            &mut conn,
+            &snowflake_obj,
+            req,
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect("move_batch OK");
+        assert_eq!(r.from_kind, "WORKER");
+        assert_eq!(r.to_kind, "WORKER");
+        assert_eq!(r.new_holder_id, worker_dst);
+        assert_eq!(r.new_location, "WORKER");
+        assert_eq!(r.current_held, Some(1));
+        assert_eq!(r.max_held, Some(3));
+
+        // DB 验证：batch 切到 worker_dst
+        let row: Option<i64> =
+            sqlx::query_scalar("SELECT current_holder_id FROM t_part_batch WHERE id = $1")
+                .bind(batch)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, Some(worker_dst));
+    }
+
+    /// 场景：from.kind=WORKER 但 batch 实际在 POOL → 40904 LOCATION_MISMATCH。
+    #[tokio::test]
+    async fn move_batch_from_mismatch_returns_40904() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager_mm", "password", "MANAGER").await;
+        let customer = insert_customer(&pool, "ACME-MM").await;
+        let proc = insert_process(&pool, "PROC-MM", "工序MM").await;
+        let wt = insert_work_type(&pool, "WT-MM", "工种MM", Some(3)).await;
+        link_work_type_to_process(&pool, wt, proc).await;
+        let prod_shelf = insert_shelf(&pool, "SH-MM", "PRODUCTION").await;
+        link_shelf_to_process(&pool, prod_shelf, proc).await;
+        let (_part, batch) = insert_pool_batch(&pool, customer, proc, prod_shelf).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let req = MoveRequest {
+            batch_id: batch,
+            // from 谎报成 WORKER（实际在 POOL），期望 40904
+            from: MoveLocation::Worker {
+                worker_id: 999_999_999,
+            },
+            to: MoveLocation::Pool {
+                shelf_id: prod_shelf,
+            },
+            note: None,
+        };
+        let err = WorkerPoolService::move_batch(
+            &mut conn,
+            &snowflake_obj,
+            req,
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect_err("from 不匹配应 Err");
+        assert_eq!(err.code(), code::BIZ_BATCH_LOCATION_MISMATCH);
+    }
+
+    /// 场景：目标 worker 工种不含 batch 当前 step.process_id → 20104 BIZ_INVALID_VALUE。
+    #[tokio::test]
+    async fn move_batch_target_worker_ineligible_returns_biz_invalid_value() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager_tw", "password", "MANAGER").await;
+        let customer = insert_customer(&pool, "ACME-TW").await;
+        // batch 当前工序 = PROC-X（写入 step）
+        let proc_x = insert_process(&pool, "PROC-X", "工序X").await;
+        let wt_src = insert_work_type(&pool, "WT-X", "工种X", Some(5)).await;
+        link_work_type_to_process(&pool, wt_src, proc_x).await;
+        let prod_shelf = insert_shelf(&pool, "SH-X", "PRODUCTION").await;
+        link_shelf_to_process(&pool, prod_shelf, proc_x).await;
+        let worker_src = insert_worker(&pool, "BC-X-SRC", Some(wt_src)).await;
+        let (_part, batch) = insert_worker_held_batch(&pool, customer, proc_x, worker_src).await;
+
+        // 目标 worker 工种仅含 PROC-Y（不含 PROC-X）
+        let proc_y = insert_process(&pool, "PROC-Y", "工序Y").await;
+        let wt_dst = insert_work_type(&pool, "WT-Y", "工种Y", Some(5)).await;
+        link_work_type_to_process(&pool, wt_dst, proc_y).await;
+        let worker_dst = insert_worker(&pool, "BC-X-DST", Some(wt_dst)).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let req = MoveRequest {
+            batch_id: batch,
+            from: MoveLocation::Worker {
+                worker_id: worker_src,
+            },
+            to: MoveLocation::Worker {
+                worker_id: worker_dst,
+            },
+            note: None,
+        };
+        let err = WorkerPoolService::move_batch(
+            &mut conn,
+            &snowflake_obj,
+            req,
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect_err("工序不合格应 Err");
+        assert_eq!(err.code(), code::BIZ_INVALID_VALUE);
+    }
+
+    /// 场景：目标 shelf 未映射 batch 当前 step.process_id → 20507 SHELF_PROCESS_NOT_MAPPED。
+    /// 走 WORKER→POOL 分支（to=POOL 时会校验 shelf 映射）。
+    #[tokio::test]
+    async fn move_batch_target_shelf_unmapped_returns_20507() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager_ts", "password", "MANAGER").await;
+        let customer = insert_customer(&pool, "ACME-TS").await;
+        // batch 当前工序 = PROC-P
+        let proc_p = insert_process(&pool, "PROC-P", "工序P").await;
+        let wt = insert_work_type(&pool, "WT-P", "工种P", Some(5)).await;
+        link_work_type_to_process(&pool, wt, proc_p).await;
+        // 源 shelf 映射 PROC-P
+        let src_shelf = insert_shelf(&pool, "SH-P-SRC", "PRODUCTION").await;
+        link_shelf_to_process(&pool, src_shelf, proc_p).await;
+        // 目标 shelf 映射另一个 PROC-Q（不映射 PROC-P）
+        let proc_q = insert_process(&pool, "PROC-Q", "工序Q").await;
+        let dst_shelf = insert_shelf(&pool, "SH-Q-DST", "PRODUCTION").await;
+        link_shelf_to_process(&pool, dst_shelf, proc_q).await;
+
+        let worker = insert_worker(&pool, "BC-P", Some(wt)).await;
+        let (_part, batch) = insert_worker_held_batch(&pool, customer, proc_p, worker).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let req = MoveRequest {
+            batch_id: batch,
+            from: MoveLocation::Worker { worker_id: worker },
+            to: MoveLocation::Pool {
+                shelf_id: dst_shelf,
+            },
+            note: None,
+        };
+        let err = WorkerPoolService::move_batch(
+            &mut conn,
+            &snowflake_obj,
+            req,
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect_err("shelf 未映射应 Err");
+        assert_eq!(err.code(), code::BIZ_SHELF_PROCESS_NOT_MAPPED);
+    }
+
+    /// 场景：POOL→POOL 同 kind 移动 → 40001 VALIDATION_ERROR。
+    #[tokio::test]
+    async fn move_batch_same_kind_returns_validation_error() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager_sk", "password", "MANAGER").await;
+        let customer = insert_customer(&pool, "ACME-SK").await;
+        let proc = insert_process(&pool, "PROC-SK", "工序SK").await;
+        let prod_shelf = insert_shelf(&pool, "SH-SK", "PRODUCTION").await;
+        link_shelf_to_process(&pool, prod_shelf, proc).await;
+        let (_part, batch) = insert_pool_batch(&pool, customer, proc, prod_shelf).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let snowflake_obj = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let req = MoveRequest {
+            batch_id: batch,
+            from: MoveLocation::Pool {
+                shelf_id: prod_shelf,
+            },
+            to: MoveLocation::Pool {
+                shelf_id: prod_shelf,
+            },
+            note: None,
+        };
+        let err = WorkerPoolService::move_batch(
+            &mut conn,
+            &snowflake_obj,
+            req,
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect_err("同 kind 应 Err");
+        // 40001 VALIDATION_ERROR 在 AppError::validation 路径生成
+        assert_eq!(err.code(), 40001);
     }
 }

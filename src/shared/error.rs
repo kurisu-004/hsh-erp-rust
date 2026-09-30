@@ -471,12 +471,10 @@ fn status_from_code(c: i32) -> StatusCode {
             StatusCode::NOT_FOUND
         }
 
-        // ---- 2xxxx 业务码：move path from/holder 不一致（409） ----
-        // 2026-09-30 新增：prod/pool/move 时 from 与 batch 当前 (location, holder)
-        // 不一致。前端按 code 区分 40904 vs 40901/40903。
-        c if c == code::BIZ_BATCH_LOCATION_MISMATCH => StatusCode::CONFLICT,
-
         // ---- 2xxxx 业务码：409 (状态冲突 / 重复 / 占用 / 锁) ----
+        // 2026-09-30 新增：prod/pool/move 的 from/holder 不一致也归到 409 段，
+        // 与 worker→worker/worker→pool 的版本冲突并列。前端按 code 区分
+        // 40904 (LOCATION_MISMATCH) vs 40901 (VERSION_CONFLICT)。
         c if c == code::BIZ_USER_DUPLICATE
             || c == code::BIZ_USER_DUPLICATE_USERNAME
             || c == code::BIZ_USER_ROLE_DUPLICATE
@@ -509,13 +507,13 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_PART_NOT_DELETABLE
             || c == code::BIZ_PROCESS_CHAIN_PART_NOT_PENDING
             || c == code::BIZ_PROCESS_CHAIN_REQUIRED
-            || c == code::BIZ_BATCH_INVALID_STATUS =>
+            || c == code::BIZ_BATCH_INVALID_STATUS
+            // 2026-09-30 新增：move 路径 from/holder 不一致 → 409（与 VERSION_CONFLICT
+            // 并列；前端按 code 区分 40904 vs 40901）。
+            || c == code::BIZ_BATCH_LOCATION_MISMATCH =>
         {
             StatusCode::CONFLICT
         }
-
-        // 2026-09-30 新增：move 路径 from/holder 不一致 → 409
-        c if c == code::BIZ_BATCH_LOCATION_MISMATCH => StatusCode::CONFLICT,
 
         // ---- 2xxxx 业务码：422 (校验类，Python 显式声明 21113 → 422) ----
         c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER || c == code::BIZ_SHELF_PROCESS_NOT_MAPPED => {

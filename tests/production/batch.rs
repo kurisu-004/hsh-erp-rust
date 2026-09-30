@@ -469,6 +469,15 @@ async fn auto_dispatch_preview_no_chain_returns_skip_reason() {
     let items = env["data"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["skip_reason"], "NO_PROCESS_CHAIN");
+    // 2026-09-30 review 第 1 轮：NO_PROCESS_CHAIN 时 process_chain_id 必为 JSON null
+    // （不再输出字符串 "0"）。
+    assert!(
+        items[0]["process_chain_id"].is_null(),
+        "NO_PROCESS_CHAIN 时 process_chain_id 应为 null，实际: {}",
+        items[0]["process_chain_id"]
+    );
+    assert!(items[0]["first_process_id"].is_null());
+    assert!(items[0]["first_shelf_id"].is_null());
 
     // DB 验证：batch 应保持 PENDING（preview 不写库）
     let row: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
@@ -563,6 +572,8 @@ async fn auto_dispatch_preview_with_chain_returns_first_process_and_shelf() {
     assert_eq!(items.len(), 1);
     let item = &items[0];
     assert!(item["skip_reason"].is_null(), "完整链路不应 skip: {env}");
+    // 2026-09-30 review 第 1 轮：OK 路径三个 ID 必为字符串（雪花 ID 序列化）。
+    assert_eq!(item["process_chain_id"], chain_id.to_string());
     assert_eq!(item["first_process_id"], process_a.to_string());
     assert_eq!(item["first_shelf_id"], shelf_a.to_string());
 
@@ -593,6 +604,10 @@ async fn auto_dispatch_preview_unknown_batch_returns_not_found() {
     let items = env["data"]["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["skip_reason"], "NOT_FOUND");
+    // 2026-09-30 review 第 1 轮：NOT_FOUND 时三个 ID 必为 null。
+    assert!(items[0]["process_chain_id"].is_null());
+    assert!(items[0]["first_process_id"].is_null());
+    assert!(items[0]["first_shelf_id"].is_null());
 }
 
 /// 场景 8 (2026-09-30 重构): auto-dispatch_preview 空 batch_ids → 40001 VALIDATION_ERROR (HTTP 422)

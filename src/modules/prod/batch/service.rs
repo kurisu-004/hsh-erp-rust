@@ -279,48 +279,39 @@ impl BatchService {
                 } else {
                     None
                 };
+                // 2026-09-30 review 第 1 轮：Option<i64> 透传（plan §3.2），
+                // 不再 `.unwrap_or(0)`；None → JSON `null` 由 vo.rs `serialize_i64_opt` 兜底。
                 AutoDispatchItem {
                     batch_id: p.batch_id,
                     part_id: p.part_id,
-                    process_chain_id: p.process_chain_id.unwrap_or(0),
-                    first_process_id: p.first_process_id.unwrap_or(0),
+                    process_chain_id: p.process_chain_id,
+                    first_process_id: p.first_process_id,
                     first_process_code: p.first_process_code.unwrap_or_default(),
                     first_process_name: p.first_process_name.unwrap_or_default(),
-                    first_shelf_id: p.first_shelf_id.unwrap_or(0),
+                    first_shelf_id: p.first_shelf_id,
                     skip_reason,
                 }
             })
             .collect();
 
         // 兜底：不在 preview 结果里的 batch_id（已软删 / 非 PENDING / 不存在）
-        // → 单独补一行 + skip_reason='NOT_FOUND'
+        // → 单独补一行 + skip_reason='NOT_FOUND'。该路径无法取到 chain/step/shelf，
+        // 全部 Option 置 None（→ JSON `null`），对齐上游 OK 路径的 Option 语义。
         for batch_id in &batch_ids {
             if !preview_ids.contains(batch_id) {
                 let part_id_opt =
                     BatchRepo::find_part_id_by_batch_id(&mut *conn, *batch_id).await?;
-                if let Some(part_id) = part_id_opt {
-                    items.push(AutoDispatchItem {
-                        batch_id: *batch_id,
-                        part_id,
-                        process_chain_id: 0,
-                        first_process_id: 0,
-                        first_process_code: String::new(),
-                        first_process_name: String::new(),
-                        first_shelf_id: 0,
-                        skip_reason: Some("NOT_FOUND".to_string()),
-                    });
-                } else {
-                    items.push(AutoDispatchItem {
-                        batch_id: *batch_id,
-                        part_id: 0,
-                        process_chain_id: 0,
-                        first_process_id: 0,
-                        first_process_code: String::new(),
-                        first_process_name: String::new(),
-                        first_shelf_id: 0,
-                        skip_reason: Some("NOT_FOUND".to_string()),
-                    });
-                }
+                let part_id = part_id_opt.unwrap_or(0);
+                items.push(AutoDispatchItem {
+                    batch_id: *batch_id,
+                    part_id,
+                    process_chain_id: None,
+                    first_process_id: None,
+                    first_process_code: String::new(),
+                    first_process_name: String::new(),
+                    first_shelf_id: None,
+                    skip_reason: Some("NOT_FOUND".to_string()),
+                });
             }
         }
 
@@ -1121,6 +1112,11 @@ mod tests {
         .expect("preview OK");
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.items[0].skip_reason.as_deref(), Some("NO_PROCESS_CHAIN"));
+        // 2026-09-30 review 第 1 轮：NO_PROCESS_CHAIN 时 process_chain_id 必为 None
+        // （→ JSON `null`）；first_process_id / first_shelf_id 因上游不存在联动 None。
+        assert!(r.items[0].process_chain_id.is_none());
+        assert!(r.items[0].first_process_id.is_none());
+        assert!(r.items[0].first_shelf_id.is_none());
     }
 
     #[tokio::test]
@@ -1167,6 +1163,10 @@ mod tests {
         .expect("preview OK");
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.items[0].skip_reason.as_deref(), Some("NO_PROCESS_STEP"));
+        // 2026-09-30 review 第 1 轮：NO_PROCESS_STEP 时 chain 已知但首道工序/货架 None。
+        assert!(r.items[0].process_chain_id.is_some());
+        assert!(r.items[0].first_process_id.is_none());
+        assert!(r.items[0].first_shelf_id.is_none());
     }
 
     #[tokio::test]
@@ -1235,8 +1235,10 @@ mod tests {
         .expect("preview OK");
         assert_eq!(r.items.len(), 1);
         assert!(r.items[0].skip_reason.is_none());
-        assert_eq!(r.items[0].first_process_id, process_first);
-        assert_eq!(r.items[0].first_shelf_id, shelf_first);
+        // 2026-09-30 review 第 1 轮：OK 路径三个 ID 必 Some（→ JSON 字符串）。
+        assert_eq!(r.items[0].process_chain_id, Some(chain_id));
+        assert_eq!(r.items[0].first_process_id, Some(process_first));
+        assert_eq!(r.items[0].first_shelf_id, Some(shelf_first));
         assert_eq!(r.items[0].first_process_code, "P-AUTO-1");
 
         // DB 验证：batch 仍 PENDING（preview 不写库）
@@ -1263,6 +1265,10 @@ mod tests {
         .expect("preview OK");
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.items[0].skip_reason.as_deref(), Some("NOT_FOUND"));
+        // 2026-09-30 review 第 1 轮：NOT_FOUND 时三个 ID 必 None。
+        assert!(r.items[0].process_chain_id.is_none());
+        assert!(r.items[0].first_process_id.is_none());
+        assert!(r.items[0].first_shelf_id.is_none());
     }
 
     #[tokio::test]
@@ -1323,5 +1329,9 @@ mod tests {
         .expect("preview OK");
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.items[0].skip_reason.as_deref(), Some("NO_SHELF"));
+        // 2026-09-30 review 第 1 轮：NO_SHELF 时 chain + first_process 已知，shelf None。
+        assert!(r.items[0].process_chain_id.is_some());
+        assert!(r.items[0].first_process_id.is_some());
+        assert!(r.items[0].first_shelf_id.is_none());
     }
 }

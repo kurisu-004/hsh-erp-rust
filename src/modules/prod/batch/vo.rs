@@ -9,7 +9,7 @@
 use chrono::NaiveDate;
 use serde::Serialize;
 
-use crate::shared::types::serialize_i64;
+use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 // ===== pending list =====
 
@@ -150,14 +150,31 @@ pub struct AutoDispatchItem {
     pub batch_id: i64,
     #[serde(serialize_with = "serialize_i64")]
     pub part_id: i64,
-    #[serde(serialize_with = "serialize_i64")]
-    pub process_chain_id: i64,
-    #[serde(serialize_with = "serialize_i64")]
-    pub first_process_id: i64,
+    /// `t_part.process_chain_id`（PR-3 step 化后新字段）
+    ///
+    /// **Option 语义**：当 `skip_reason = NO_PROCESS_CHAIN` 时为 None；其余情形透传 part 实际
+    /// 值（即便其它上层查不到也保持原值不动——避免误导 frontend）。None → JSON `null`，避免
+    /// 前端拿 `"0"` 误判为合法 chain。
+    ///
+    /// 2026-09-30 review 第 1 轮：原为 `i64 + serialize_i64` + service `unwrap_or(0)` 兜底，
+    /// 导致 NO_PROCESS_CHAIN 时输出 `"process_chain_id": "0"`；改为 Option 与 plan §3.2 对齐。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub process_chain_id: Option<i64>,
+    /// 首道工序 id（`t_process_chain_step` sort_order=1 行的 process_id）
+    ///
+    /// **Option 语义**：当 `skip_reason = NO_PROCESS_CHAIN / NO_PROCESS_STEP` 时为 None；
+    /// OK 时为 Some(process_id)；NO_SHELF 时仍 Some（首道工序存在但未映射货架）。
+    /// None → JSON `null`。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub first_process_id: Option<i64>,
     pub first_process_code: String,
     pub first_process_name: String,
-    #[serde(serialize_with = "serialize_i64")]
-    pub first_shelf_id: i64,
+    /// 首道工序对应的候选货架（按 `t_shelf_process.sort_order ASC`）
+    ///
+    /// **Option 语义**：当 `skip_reason = NO_PROCESS_CHAIN / NO_PROCESS_STEP / NO_SHELF`
+    /// 时为 None；其余情形为 Some(shelf_id)。None → JSON `null`。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub first_shelf_id: Option<i64>,
     /// 取不到任一上游数据时的原因：NOT_FOUND / NO_PROCESS_CHAIN / NO_PROCESS_STEP / NO_SHELF
     /// （OK 时为 None）
     pub skip_reason: Option<String>,
