@@ -211,6 +211,16 @@ pub fn compute_assembly_target<'a>(
         0 => PENDING,
         1 => IN_PROCESS,
         2 => IN_PROCESS,
+        // 2026-10-01 加固注释：`3 => IN_PROCESS` 这一条**不是**随手写的兜底，
+        // 而是「子件 OUTSOURCE ⇒ 父装配件 IN_PROCESS」的显式契约。
+        // 背景：assembly 域**刻意没有 OUTSOURCE 状态**（装配件本体不外发，
+        // 外发的是它的子件），而 part 域有 `t_part_batch.status='OUTSOURCE'`。
+        // 于是 rollup 时子件 progress=3（OUTSOURCE 是 IN_PROCESS 的延伸，
+        // 独立 rank，见 `part_status_progress`）必须映射到父的 IN_PROCESS
+        // —— 「子件还在外协加工中」对装配件而言就是「还在生产中」。
+        // 若误改成 `3 => INSPECTION` 或新增 assembly OUTSOURCE 变体，
+        // 装配件会在子件外协期间被推成待检/外发态，父级流转直接错位。
+        // 该契约由单测 `min_progress_three_maps_to_in_process` 锁死。
         3 => IN_PROCESS,
         4 => INSPECTION,
         5 => READY_TO_SHIP,
@@ -323,6 +333,18 @@ mod rollup_tests {
         assert_eq!(
             compute_assembly_target(["DELIVERED", "DELIVERED"]),
             Some(AssemblyStatus::DELIVERED)
+        )
+    }
+
+    /// 2026-10-01 新增：锁死「子件 OUTSOURCE（progress 3）⇒ 父 IN_PROCESS」契约。
+    ///
+    /// assembly 域刻意没有 OUTSOURCE 状态（外发的是子件），若有人把 `3` 改成
+    /// 别的目标态，装配件会在子件外协期间被推错状态。本测试是该契约的护栏。
+    #[test]
+    fn min_progress_three_maps_to_in_process() {
+        assert_eq!(
+            compute_assembly_target(["OUTSOURCE", "DELIVERED"]),
+            Some(AssemblyStatus::IN_PROCESS)
         );
     }
 }

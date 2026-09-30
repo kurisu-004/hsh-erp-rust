@@ -140,6 +140,18 @@ pub struct TPartBatch {
     pub current_process_step_id: Option<i64>,
     pub delivery_note_id: Option<i64>,
     pub parent_batch_id: Option<i64>,
+    /// 2026-10-01 新增（migration 005）：本批次**当前**是否处于返修中。
+    ///
+    /// REPAIRING 已从 `PartStatus` 降级为标记（flag），`status` 保持
+    /// `IN_PROCESS`（返修仍在生产中，progress 与 IN_PROCESS 同档）；
+    /// 返修事实改由本列承载。写入路径**唯一**：`repo::status_gate::
+    /// apply_batch_status_change`（`is_repairing: Some(bool)`），caller 无
+    /// 「要不要顺手写一下」的选择权。
+    ///
+    /// 与 2026-09-16 已删的 `has_been_repaired` 区别：那是「**曾经**返修过」
+    /// （历史事实，拆批后失真而废弃），本列是「**当前**返修中」（当前态，
+    /// 批次粒度，不受拆批影响）。
+    pub is_repairing: bool,
     pub version: i32,
     pub created_at: NaiveDateTime,
     pub created_by: Option<i64>,

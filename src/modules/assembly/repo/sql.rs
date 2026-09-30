@@ -665,4 +665,36 @@ impl AssemblyRepo {
         .await?;
         Ok(res.rows_affected())
     }
+
+    /// 2026-10-01 新增：父装配件进入终态（COMPLETED / CANCELLED）时清空
+    /// `serial_no`，让序列号可被新工单复用。
+    ///
+    /// **不写归档事件**：`t_assembly` 没有事件表，而它的 `note` 列是**用户可
+    /// 编辑的业务备注**，拿它记系统动作会污染用户数据且事后无法区分系统写入
+    /// 与用户输入。对比：子件（`t_part`）走 `t_part_event` 归档，见
+    /// `part/repo/status_gate.rs::release_part_serial_no`。
+    ///
+    /// 谓词自带 `status IN ('COMPLETED','CANCELLED') AND serial_no IS NOT NULL`
+    /// → 天然幂等，重复调用 0 行、无副作用。
+    pub async fn clear_serial_no_if_terminal<'e, E: PgExecutor<'e>>(
+        executor: E,
+        id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            UPDATE t_assembly
+            SET serial_no = NULL, version = version + 1, updated_at = NOW(), updated_by = $2
+            WHERE id = $1
+              AND deleted_at IS NULL
+              AND serial_no IS NOT NULL
+              AND status IN ('COMPLETED', 'CANCELLED')
+            "#,
+        )
+        .bind(id)
+        .bind(updated_by)
+        .execute(executor)
+        .await?;
+        Ok(res.rows_affected())
+    }
 }

@@ -455,7 +455,19 @@ async fn scan_inspect_fail_happy_path() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "scan-inspect FAIL: {env}");
-    assert_eq!(env["data"]["status"], "REPAIRING");
+    // 2026-10-01：REPAIRING 降级为 t_part_batch.is_repairing 标记，
+    // t_part.status 保持 IN_PROCESS（返修仍在生产中，progress 同档）。
+    assert_eq!(env["data"]["status"], "IN_PROCESS");
+    let is_repairing: bool =
+        sqlx::query_scalar("SELECT is_repairing FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .expect("read is_repairing");
+    assert!(
+        is_repairing,
+        "scan-inspect FAIL 应置 t_part_batch.is_repairing = true"
+    );
 }
 
 #[tokio::test]
@@ -846,5 +858,243 @@ async fn list_pending_programming_excludes_completed_or_cancelled() {
     assert!(
         !ids.iter().any(|s| s == &pid_cancel.to_string()),
         "CANCELLED 不应出现: {env}"
+    );
+}
+
+// ===========================================================================
+//  2026-10-01：status_gate 单一写入口 + 终态序列号释放
+// ===========================================================================
+
+/// 造一个「两条 DELIVERED 批次 + 带 serial_no」的工单。
+///
+/// 返回 (part_id, batch1_id, batch2_id, serial_no)。
+async fn insert_part_with_two_delivered_batches(
+    pool: &PgPool,
+    customer_id: i64,
+    serial_no: &str,
+) -> (i64, i64, i64, String) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 11);
+    let part_id = snowflake.next_id();
+    let b1 = snowflake.next_id();
+    let b2 = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 'P-MULTI', 'D-001', $3, 'DELIVERED', 'P-MULTI', $4, $4, 2, 0, $5, $5)",
+    )
+    .bind(part_id)
+    .bind(serial_no)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert part");
+    for (idx, bid) in [b1, b2].iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 1, 'DELIVERED', 0, $4, $4)",
+        )
+        .bind(bid)
+        .bind(part_id)
+        .bind(idx as i32 + 1)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert batch");
+    }
+    (part_id, b1, b2, serial_no.to_string())
+}
+
+async fn part_serial_no(pool: &PgPool, part_id: i64) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT serial_no FROM t_part WHERE id = $1")
+        .bind(part_id)
+        .fetch_one(pool)
+        .await
+        .expect("read serial_no")
+}
+
+async fn part_status(pool: &PgPool, part_id: i64) -> String {
+    sqlx::query_scalar::<_, String>("SELECT status FROM t_part WHERE id = $1")
+        .bind(part_id)
+        .fetch_one(pool)
+        .await
+        .expect("read part status")
+}
+
+/// 2026-10-01 回归测试：多批次工单的序列号释放时机。
+///
+/// 覆盖本次修的核心缺陷（`clear_part_serial_no_when_completed` 的 WHERE 是
+/// **part 级** `status='COMPLETED'`，而 `complete` 一次只翻**一条**批次，
+/// 于是该 UPDATE 命中 0 行并被 `let _ =` 静默吞掉 → 序列号被
+/// `uk_t_part_serial_no` 永久占住）：
+///
+/// 1. 完成第 1 条批次 → part 仍 DELIVERED（min-progress 还是有别的批次）→
+///    **序列号必须仍在**（货还在厂里，唯一索引继续占用是**正确**行为）；
+/// 2. 完成第 2 条批次 → part 被 rollup 进 COMPLETED → 序列号**必须被释放**，
+///    且 `t_part_event` 留下一条 `SERIAL_RELEASED` 归档（note 含原序列号）；
+/// 3. 释放后同一序列号可被新工单复用（`uk_t_part_serial_no` 不再拦）。
+#[tokio::test]
+async fn multi_batch_complete_releases_serial_only_when_part_terminates() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, b1, b2, serial) =
+        insert_part_with_two_delivered_batches(&pool, fx.customer_l2_id, "SN-MULTI-0001").await;
+
+    // ---- 第 1 步：完成批次 1（part 还没到终态）----
+    let v1 = batch_version(&pool, b1).await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/complete"),
+            Some(json!({ "batch_id": b1.to_string(), "version": v1 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "complete batch1: {env}");
+    assert_eq!(
+        part_status(&pool, pid).await,
+        "DELIVERED",
+        "还有一条 DELIVERED 批次，part 不应到 COMPLETED"
+    );
+    assert_eq!(
+        part_serial_no(&pool, pid).await,
+        Some(serial.clone()),
+        "part 未到终态，序列号必须仍被占用（唯一索引 uk_t_part_serial_no 继续占坑）"
+    );
+
+    // ---- 第 2 步：完成批次 2（part 派生到 COMPLETED → 释放）----
+    let v2 = batch_version(&pool, b2).await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/complete"),
+            Some(json!({ "batch_id": b2.to_string(), "version": v2 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "complete batch2: {env}");
+    assert_eq!(part_status(&pool, pid).await, "COMPLETED");
+    assert_eq!(
+        part_serial_no(&pool, pid).await,
+        None,
+        "part 到 COMPLETED，序列号必须被释放（原实现在这里永久泄漏）"
+    );
+
+    // 归档事件：note 必须含原序列号
+    let note: Option<String> = sqlx::query_scalar(
+        "SELECT note FROM t_part_event \
+         WHERE part_id = $1 AND event_type = 'SERIAL_RELEASED'",
+    )
+    .bind(pid)
+    .fetch_optional(&pool)
+    .await
+    .expect("query SERIAL_RELEASED")
+    .flatten();
+    let note = note.expect("应有 1 条 SERIAL_RELEASED 归档事件");
+    assert!(
+        note.contains(&serial),
+        "归档 note 应含原序列号 {serial}，实际 {note}"
+    );
+
+    // 释放后可被新工单复用（唯一索引不再拦）
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let sf = SnowflakeIdGenerator::new(1_577_836_800_000, 12);
+    let new_part = sf.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 'P-REUSE', 'D-001', $3, 'PENDING', 'P-REUSE', $4, $4, 1, 0, $5, $5)",
+    )
+    .bind(new_part)
+    .bind(&serial)
+    .bind(fx.customer_l2_id)
+    .bind(now.date())
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("释放后同序列号应可被新工单复用（uk_t_part_serial_no 不再拦）");
+}
+
+/// 2026-10-01 回归测试：最后一条活跃批次被**取消**（不是完成）导致 part
+/// 派生到 CANCELLED 时，序列号也必须被释放。
+///
+/// 覆盖改造前的**永久泄漏**路径：`PartService::cancel_batch`
+/// （`POST /parts/{id}/batches/{batch_id}/cancel`）只翻批次、调 rollup，
+/// 从不调 `clear_part_serial_no_when_completed`（那个函数的 WHERE 只认
+/// `status='COMPLETED'`）。于是 part 已 CANCELLED、`serial_no` 却还挂着，
+/// 被 `uk_t_part_serial_no` 永久占住，同序列号再也无法被新工单复用，
+/// 且**没有任何报错或告警**。
+#[tokio::test]
+async fn cancel_last_batch_releases_serial_when_part_becomes_cancelled() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, b1, b2, serial) =
+        insert_part_with_two_delivered_batches(&pool, fx.customer_l2_id, "SN-CANCEL-0001").await;
+
+    // 取消第 1 条：part 还有一条 DELIVERED 批次 → 不是终态 → 序列号继续占用
+    let v1 = batch_version(&pool, b1).await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/batches/{b1}/cancel"),
+            Some(json!({ "version": v1 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "cancel batch1: {env}");
+    assert_eq!(part_status(&pool, pid).await, "DELIVERED");
+    assert_eq!(
+        part_serial_no(&pool, pid).await,
+        Some(serial.clone()),
+        "part 未到终态，序列号应仍被占用"
+    );
+
+    // 取消第 2 条：全部批次 CANCELLED → part 派生到 CANCELLED → 必须释放
+    let v2 = batch_version(&pool, b2).await;
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/batches/{b2}/cancel"),
+            Some(json!({ "version": v2 })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "cancel batch2: {env}");
+    assert_eq!(part_status(&pool, pid).await, "CANCELLED");
+    assert_eq!(
+        part_serial_no(&pool, pid).await,
+        None,
+        "part 到 CANCELLED，序列号必须被释放（改造前永久泄漏）"
+    );
+
+    let note: Option<String> = sqlx::query_scalar(
+        "SELECT note FROM t_part_event \
+         WHERE part_id = $1 AND event_type = 'SERIAL_RELEASED'",
+    )
+    .bind(pid)
+    .fetch_optional(&pool)
+    .await
+    .expect("query SERIAL_RELEASED")
+    .flatten();
+    let note = note.expect("应有 1 条 SERIAL_RELEASED 归档事件");
+    assert!(
+        note.contains(&serial),
+        "归档 note 应含原序列号 {serial}，实际 {note}"
     );
 }

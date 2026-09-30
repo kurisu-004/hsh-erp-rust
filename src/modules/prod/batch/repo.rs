@@ -21,6 +21,9 @@ use chrono::NaiveDate;
 use sqlx::PgConnection;
 
 use crate::modules::part::batch::model::TPartBatch;
+// 2026-10-01：`update_batch_dispatched` 改走 status_gate（唯一批次状态写入口）。
+use crate::modules::part::repo::status_gate::{self, StatusChange};
+use crate::shared::error::AppError;
 
 /// `prod::batch` ZST 静态方法容器。
 pub struct BatchRepo;
@@ -129,6 +132,7 @@ impl BatchRepo {
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
+                   is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE id = $1
@@ -199,6 +203,14 @@ impl BatchRepo {
     /// （place_on_shelf / release_from_programming / outsource 收发 /
     /// complete_repair / to_process），对多工序链工单它永远停在**首次定位**的
     /// 那一步，故不可当「当前走到第几步」用。
+    ///
+    /// ## 2026-10-01：改为 status_gate 薄包装（全仓唯一 `t_part_batch.status`
+    /// 写入口）——写完状态自动补做 part → assembly 派生。
+    ///
+    /// ⚠️ 签名两处变更（调用方零改动，见 `part::repo::sql::batch_sql.rs`
+    /// 同批改造的说明）：`Result<u64, sqlx::Error>` → `Result<u64, AppError>`
+    /// （status_gate 用 `VERSION_CONFLICT` 表达「没写成」，转 `sqlx::Error`
+    /// 会把 409 降级成 500）。
     pub async fn update_batch_dispatched(
         conn: &mut PgConnection,
         batch_id: i64,
@@ -206,34 +218,28 @@ impl BatchRepo {
         shelf_id: i64,
         updated_by: Option<i64>,
         current_process_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query!(
-            r#"
-            UPDATE t_part_batch
-            SET status                  = 'IN_PROCESS',
-                location                = 'PRODUCTION_SHELF',
-                current_holder_id       = $3,
-                -- 2026-09-30 新增：池归属权威依据（见函数 doc）
-                current_process_id      = $5,
-                -- 显示用定位信息：dispatch 路径不解析 step，有意置 NULL
-                current_process_step_id = NULL,
-                version                 = version + 1,
-                updated_at              = now(),
-                updated_by              = $4
-            WHERE id = $1
-              AND version = $2
-              AND status = 'PENDING'
-              AND deleted_at IS NULL
-            "#,
-            batch_id,
-            expected_version,
-            shelf_id,
-            updated_by,
-            current_process_id,
+    ) -> Result<u64, AppError> {
+        status_gate::apply_batch_status_change(
+            conn,
+            StatusChange {
+                batch_id,
+                new_status: "IN_PROCESS",
+                new_location: Some("PRODUCTION_SHELF"),
+                new_holder_id: Some(shelf_id),
+                new_process_id: Some(current_process_id),
+                // 显示用定位信息：dispatch 路径不解析 step，**有意保持 NULL**
+                //（`new_process_step_id: None` 在 status_gate 里是「不改」，
+                //  而该批次从未写过 step，等价于 NULL）。
+                new_process_step_id: None,
+                is_repairing: None,
+                expected_version: Some(expected_version),
+                allowed_from: &["PENDING"],
+                updated_by: updated_by.unwrap_or(0),
+                clear_process_id: false,
+            },
         )
-        .execute(&mut *conn)
-        .await?;
-        Ok(result.rows_affected())
+        .await
+        .map(|_| 1u64)
     }
 
     /// 按 chain_id 取工艺链首道 active step。

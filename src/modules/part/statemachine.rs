@@ -61,8 +61,6 @@ pub enum PartStatus {
     READY_TO_SHIP,
     #[serde(rename = "DELIVERED")]
     DELIVERED,
-    #[serde(rename = "REPAIRING")]
-    REPAIRING,
     #[serde(rename = "OUTSOURCE")]
     OUTSOURCE,
     #[serde(rename = "COMPLETED")]
@@ -86,7 +84,13 @@ impl PartStatus {
             "INSPECTION" => Self::INSPECTION,
             "READY_TO_SHIP" => Self::READY_TO_SHIP,
             "DELIVERED" => Self::DELIVERED,
-            "REPAIRING" => Self::REPAIRING,
+            // 2026-10-01 过渡兼容：REPAIRING 已从枚举删除（降级为
+            // t_part_batch.is_repairing 标记列，migration 005/006）。保留这条
+            // 容忍分支，使「在途未洗白的行 / 未跑 migration 的环境 / 外部系统
+            // 直写的老数据」不会被当成 `None`（caller 会抛 BIZ_INVALID_VALUE
+            // 直接 500）。语义等价：REPAIRING 的 progress 与 IN_PROCESS 同档。
+            // 待全环境 migration 006 apply 完毕且无遗留后，可删本分支。
+            "REPAIRING" => Self::IN_PROCESS,
             "OUTSOURCE" => Self::OUTSOURCE,
             "COMPLETED" => Self::COMPLETED,
             "CANCELLED" => Self::CANCELLED,
@@ -103,14 +107,13 @@ impl PartStatus {
             Self::INSPECTION => "INSPECTION",
             Self::READY_TO_SHIP => "READY_TO_SHIP",
             Self::DELIVERED => "DELIVERED",
-            Self::REPAIRING => "REPAIRING",
             Self::OUTSOURCE => "OUTSOURCE",
             Self::COMPLETED => "COMPLETED",
             Self::CANCELLED => "CANCELLED",
         }
     }
 
-    /// 迁移白名单（2026-09-29：19 条合法迁移，PROGRAMMING 两条入口已废弃）。
+    /// 迁移白名单（2026-10-01：15 条合法迁移；REPAIRING 相关 5 条已删）。
     ///
     /// to-XXX 流放行：
     /// - `INSPECTION → READY_TO_SHIP`：to_ship 路径
@@ -121,10 +124,6 @@ impl PartStatus {
     /// - `READY_TO_SHIP → DELIVERED` (deliver)
     /// - `DELIVERED → COMPLETED` (complete)
     /// - `PENDING/PROGRAMMING/INSPECTION/READY_TO_SHIP/DELIVERED → CANCELLED` (cancel)
-    /// - `IN_PROCESS → REPAIRING` (start-repair)
-    ///
-    /// 扫描返修新增（scan-route B 组 to-inspection）：
-    /// - `REPAIRING → INSPECTION` (to-inspection：返修完成 → 重新送检)
     ///
     /// Phase 1（2026-09-13）补齐 14 端点：
     /// - `PENDING → IN_PROCESS`：place-on-shelf（ON_SHELF 在 DB 是 status=IN_PROCESS +
@@ -132,14 +131,25 @@ impl PartStatus {
     /// - `IN_PROCESS → PENDING`：recall-to-pending（service 层要求 location=PRODUCTION_SHELF）
     /// - `PROGRAMMING → PENDING`：recall-to-pending
     /// - `PROGRAMMING → IN_PROCESS`：release-from-programming
-    /// - `REPAIRING → IN_PROCESS`：complete-repair（落回生产架）
     /// - `OUTSOURCE → IN_PROCESS`：receive-from-outsource（回生产架）
     /// - `OUTSOURCE → INSPECTION`：receive-from-outsource-to-inspection
     /// - `PENDING → OUTSOURCE`：send-to-outsource（service 层也允许 IN_PROCESS 源走 OUTSOURCE；
     ///   状态机放行 PENDING → OUTSOURCE，service 层另守 IN_PROCESS→OUTSOURCE）
-    /// - `INSPECTION → REPAIRING`：scan-inspect FAIL
-    /// - `REPAIRING → CANCELLED`：cancel 路径
     /// - `OUTSOURCE → CANCELLED`：cancel 路径
+    ///
+    /// 2026-10-01 删除（REPAIRING 降级为 `t_part_batch.is_repairing` 标记列，
+    /// migration 005/006；返修流转不再改变 `status`，故**不再是状态迁移**）：
+    /// - `IN_PROCESS → REPAIRING`（start-repair / scan-inspect FAIL）
+    /// - `INSPECTION → REPAIRING`（scan-inspect FAIL）
+    /// - `REPAIRING → INSPECTION`（返修完成重新送检）
+    /// - `REPAIRING → IN_PROCESS`（complete-repair 落回生产架）
+    /// - `REPAIRING → CANCELLED`（cancel 路径）
+    ///
+    /// 返修相关端点改为「改 `is_repairing` 标记 + 按目标状态走既有迁移边」：
+    /// start-repair = `IN_PROCESS` + `is_repairing=true`；complete-repair =
+    /// `IN_PROCESS`（清标记）+ `location='PRODUCTION_SHELF'`。守卫从
+    /// 「枚举迁移」改为「service 层读 `is_repairing` 列」，
+    /// 见 `src/modules/part/repo/status_gate.rs`。
     ///
     /// 2026-09-29 废弃：
     /// - 删除 `PENDING → PROGRAMMING`（原 send-to-programming；端点已下线）
@@ -168,20 +178,14 @@ impl PartStatus {
                 | (INSPECTION, CANCELLED)
                 | (READY_TO_SHIP, CANCELLED)
                 | (DELIVERED, CANCELLED)
-                | (IN_PROCESS, REPAIRING)           // start-repair
-            // 扫描返修新增（scan-route B 组走 to-inspection）
-                | (REPAIRING, INSPECTION)            // 返修完成 → 重新送检（B 组走 to-inspection）
             // Phase 1（2026-09-13）补齐
                 | (PENDING, IN_PROCESS)              // place-on-shelf
                 | (IN_PROCESS, PENDING)              // recall-to-pending（service 层守 location=PRODUCTION_SHELF）
                 | (PROGRAMMING, PENDING)             // recall-to-pending
                 | (PROGRAMMING, IN_PROCESS)          // release-from-programming
-                | (REPAIRING, IN_PROCESS)            // complete-repair（落回生产架）
                 | (OUTSOURCE, IN_PROCESS)            // receive-from-outsource（回生产架）
                 | (OUTSOURCE, INSPECTION)            // receive-from-outsource-to-inspection
                 | (PENDING, OUTSOURCE)               // send-to-outsource（DIRECT 路径从 PENDING 发）
-                | (INSPECTION, REPAIRING)            // scan-inspect FAIL
-                | (REPAIRING, CANCELLED)             // cancel 路径
                 | (OUTSOURCE, CANCELLED) // cancel 路径
         )
     }
@@ -200,7 +204,6 @@ mod tests {
             PartStatus::INSPECTION,
             PartStatus::READY_TO_SHIP,
             PartStatus::DELIVERED,
-            PartStatus::REPAIRING,
             PartStatus::OUTSOURCE,
             PartStatus::COMPLETED,
             PartStatus::CANCELLED,
@@ -252,18 +255,15 @@ mod tests {
         assert!(!PartStatus::IN_PROCESS.can_transition_to(PartStatus::READY_TO_SHIP));
     }
 
+    /// 2026-10-01：REPAIRING 降级为 `t_part_batch.is_repairing` 标记列后，
+    /// `from_str` 仍保留 `"REPAIRING" => IN_PROCESS` 的过渡兼容分支，
+    /// 使在途 / 未洗白的存量行不会被判成非法状态（`None`）。
     #[test]
-    fn allowed_transitions_repairing_to_inspection() {
-        assert!(PartStatus::REPAIRING.can_transition_to(PartStatus::INSPECTION));
-    }
-
-    #[test]
-    fn disallowed_transitions_repairing_rejects() {
-        assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::READY_TO_SHIP));
-        assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::COMPLETED));
-        // Phase 1 (2026-09-13): REPAIRING → IN_PROCESS 现在允许（complete-repair 落回生产架）
-        // 由 `allowed_phase1_complete_repair_to_process` 单独断言；
-        // 本测试仅保留 READY_TO_SHIP / COMPLETED 两个明确拒绝的断言。
+    fn from_str_repairing_is_transitional_alias_of_in_process() {
+        assert_eq!(
+            PartStatus::from_str("REPAIRING"),
+            Some(PartStatus::IN_PROCESS)
+        );
     }
 
     #[test]
@@ -276,7 +276,6 @@ mod tests {
             PartStatus::INSPECTION,
             PartStatus::READY_TO_SHIP,
             PartStatus::DELIVERED,
-            PartStatus::REPAIRING, // Phase 1 新增
             PartStatus::OUTSOURCE, // Phase 1 新增
         ] {
             assert!(
@@ -284,7 +283,6 @@ mod tests {
                 "from {s:?} should be cancellable"
             );
         }
-        assert!(PartStatus::IN_PROCESS.can_transition_to(PartStatus::REPAIRING));
     }
 
     #[test]
@@ -293,9 +291,6 @@ mod tests {
         assert!(!PartStatus::COMPLETED.can_transition_to(PartStatus::CANCELLED));
         assert!(!PartStatus::COMPLETED.can_transition_to(PartStatus::DELIVERED));
         assert!(!PartStatus::CANCELLED.can_transition_to(PartStatus::PENDING));
-        assert!(!PartStatus::PENDING.can_transition_to(PartStatus::REPAIRING));
-        // Phase 1 (2026-09-13): INSPECTION → REPAIRING 现在允许（scan-inspect FAIL）；
-        // 由 `allowed_phase1_scan_inspect_fail` 单独断言。
         assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::DELIVERED));
         assert!(!PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::COMPLETED));
     }
@@ -320,12 +315,6 @@ mod tests {
     fn allowed_phase1_release_from_programming() {
         // PROGRAMMING → IN_PROCESS（release-from-programming）
         assert!(PartStatus::PROGRAMMING.can_transition_to(PartStatus::IN_PROCESS));
-    }
-
-    #[test]
-    fn allowed_phase1_complete_repair_to_process() {
-        // REPAIRING → IN_PROCESS（complete-repair 落回生产架）
-        assert!(PartStatus::REPAIRING.can_transition_to(PartStatus::IN_PROCESS));
     }
 
     #[test]
@@ -367,15 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn allowed_phase1_scan_inspect_fail() {
-        // INSPECTION → REPAIRING（scan-inspect FAIL：品检打回返修）
-        assert!(PartStatus::INSPECTION.can_transition_to(PartStatus::REPAIRING));
-    }
-
-    #[test]
-    fn allowed_phase1_cancel_repairing_outsource() {
-        // REPAIRING / OUTSOURCE 也允许 → CANCELLED
-        assert!(PartStatus::REPAIRING.can_transition_to(PartStatus::CANCELLED));
+    fn allowed_phase1_cancel_outsource() {
         assert!(PartStatus::OUTSOURCE.can_transition_to(PartStatus::CANCELLED));
     }
 
@@ -389,7 +370,6 @@ mod tests {
             PartStatus::INSPECTION,
             PartStatus::READY_TO_SHIP,
             PartStatus::DELIVERED,
-            PartStatus::REPAIRING,
             PartStatus::OUTSOURCE,
             PartStatus::COMPLETED,
             PartStatus::CANCELLED,
@@ -404,7 +384,6 @@ mod tests {
             PartStatus::INSPECTION,
             PartStatus::READY_TO_SHIP,
             PartStatus::DELIVERED,
-            PartStatus::REPAIRING,
             PartStatus::OUTSOURCE,
             PartStatus::CANCELLED,
         ] {
@@ -421,7 +400,6 @@ mod tests {
             PartStatus::INSPECTION,
             PartStatus::READY_TO_SHIP,
             PartStatus::DELIVERED,
-            PartStatus::REPAIRING,
             PartStatus::OUTSOURCE,
             PartStatus::COMPLETED,
         ] {
@@ -432,20 +410,24 @@ mod tests {
         }
         // OUTSOURCE → DELIVERED 非法（必须先经 READY_TO_SHIP）
         assert!(!PartStatus::OUTSOURCE.can_transition_to(PartStatus::DELIVERED));
-        // REPAIRING → READY_TO_SHIP 非法（必须先经 INSPECTION → READY_TO_SHIP）
-        assert!(!PartStatus::REPAIRING.can_transition_to(PartStatus::READY_TO_SHIP));
         // PROGRAMMING → OUTSOURCE 非法（必须先经 IN_PROCESS）
         assert!(!PartStatus::PROGRAMMING.can_transition_to(PartStatus::OUTSOURCE));
         // INSPECTION → OUTSOURCE 非法（不能跳过 IN_PROCESS）
         assert!(!PartStatus::INSPECTION.can_transition_to(PartStatus::OUTSOURCE));
         // DELIVERED → INSPECTION 非法（不可回退）
         assert!(!PartStatus::DELIVERED.can_transition_to(PartStatus::INSPECTION));
-        // DELIVERED → REPAIRING 非法（不允许从 DELIVERED 直接进 REPAIRING）
-        assert!(!PartStatus::DELIVERED.can_transition_to(PartStatus::REPAIRING));
-        // READY_TO_SHIP → REPAIRING 非法
-        assert!(!PartStatus::READY_TO_SHIP.can_transition_to(PartStatus::REPAIRING));
-        // OUTSOURCE → REPAIRING 非法（必须先经 IN_PROCESS）
-        assert!(!PartStatus::OUTSOURCE.can_transition_to(PartStatus::REPAIRING));
+        // DELIVERED → IN_PROCESS 非法（必须先经 INSPECTION → IN_PROCESS）
+        assert!(!PartStatus::DELIVERED.can_transition_to(PartStatus::IN_PROCESS));
+    }
+
+    /// 2026-10-01：REPAIRING 相关 5 条迁移边已从白名单删除
+    /// （`IN_PROCESS→REPAIRING` / `INSPECTION→REPAIRING` / `REPAIRING→INSPECTION` /
+    /// `REPAIRING→IN_PROCESS` / `REPAIRING→CANCELLED`），返修改由
+    /// `t_part_batch.is_repairing` 标记列承载。本测试锁死该决策不再回潮。
+    #[test]
+    fn disallowed_2026_10_01_repairing_edges_removed() {
+        // IN_PROCESS 自环（start-repair 现在是「同状态 + 置标记」）
+        assert!(!PartStatus::IN_PROCESS.can_transition_to(PartStatus::IN_PROCESS));
     }
 }
 
@@ -456,7 +438,8 @@ mod tests {
 /// 序值：
 /// - PENDING     = 0
 /// - PROGRAMMING = 1
-/// - IN_PROCESS  = 2（REPAIRING 同值，因返修仍在生产中）
+/// - IN_PROCESS  = 2（2026-10-01：原 `IN_PROCESS | REPAIRING` 合并为单值，
+///   返修由 `t_part_batch.is_repairing` 标记承载、状态本身留在 IN_PROCESS）
 /// - OUTSOURCE   = 3（外包是 IN_PROCESS 的延伸，独立 rank）
 /// - INSPECTION  = 4
 /// - READY_TO_SHIP = 5
@@ -470,7 +453,7 @@ pub fn part_status_progress(s: &str) -> u8 {
     match s {
         "PENDING" => 0,
         "PROGRAMMING" => 1,
-        "IN_PROCESS" | "REPAIRING" => 2,
+        "IN_PROCESS" => 2,
         "OUTSOURCE" => 3,
         "INSPECTION" => 4,
         "READY_TO_SHIP" => 5,
@@ -582,9 +565,21 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         .copied()
         .unwrap(); // safety: non_terminal 至少有一条
     Some(PartRollupTarget {
-        status: min.status.clone(),
+        // 2026-10-01：归一化存量 'REPAIRING' → 'IN_PROCESS'。REPAIRING 已从
+        // PartStatus 降级为 `t_part_batch.is_repairing` 标记列（migration
+        // 005/006），本函数的返回值会被原样写进 `t_part.status`；若不在此
+        // 归一化，未跑 migration 006 的环境会把 'REPAIRING' 重新写回派生列，
+        // 让「枚举已无该值」的读侧只能靠 `from_str` 兼容分支兜底。
+        status: normalize_legacy_repairing(&min.status).to_string(),
         current_process_id: min.current_process_id,
     })
+}
+
+/// 2026-10-01 新增：rollup 输出归一化（`'REPAIRING'` → `'IN_PROCESS'`）。
+///
+/// 纯字符串映射，不改 progress 档位（两者同档 2，见 `part_status_progress`）。
+fn normalize_legacy_repairing(s: &str) -> &str {
+    if s == "REPAIRING" { "IN_PROCESS" } else { s }
 }
 
 #[cfg(test)]
@@ -698,6 +693,10 @@ mod rollup_tests {
         assert_eq!(r.status, "DELIVERED");
     }
 
+    /// 2026-10-01：`IN_PROCESS | REPAIRING` 合并为单档 `IN_PROCESS` => 2。
+    /// `REPAIRING` 字面量现在走 `_ => 2` 兜底分支（progress 值不变），
+    /// 但 `compute_part_target` 的返回值已**归一化**为 `IN_PROCESS`，
+    /// 见 `min_progress_normalizes_legacy_repairing_to_in_process`。
     #[test]
     fn repairing_maps_to_in_process_progress() {
         assert_eq!(part_status_progress("REPAIRING"), 2);
@@ -715,13 +714,15 @@ mod rollup_tests {
         assert_eq!(part_status_progress(""), 2);
     }
 
+    /// 2026-10-01：存量 'REPAIRING' 批次（migration 006 未 apply 的环境）参与
+    /// rollup 时，**输出归一化为 IN_PROCESS**，绝不让 'REPAIRING' 字符串
+    /// 再被写回 `t_part.status` —— 否则 Rust 枚举已无该变体，读侧只能靠
+    /// `from_str` 的过渡兼容分支兜。
     #[test]
-    fn min_progress_picks_repairing_over_in_process() {
-        // REPAIRING 与 IN_PROCESS 同 progress (2)；min_by_key 在相等时取先出现者。
-        // 这里验证混合情况下 REPAIRING 不会被错误地排除：
+    fn min_progress_normalizes_legacy_repairing_to_in_process() {
         let v = vec![batch("REPAIRING"), batch("DELIVERED")];
         let r = compute_part_target(&v).unwrap();
-        assert_eq!(r.status, "REPAIRING");
+        assert_eq!(r.status, "IN_PROCESS");
     }
 
     #[test]

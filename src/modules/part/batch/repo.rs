@@ -65,6 +65,9 @@ use sqlx::{PgConnection, PgExecutor};
 
 use super::model::{InspectionBatchListRow, PartBatchScanRow, RecentBatchRow, TPartBatch};
 use crate::modules::part::model::TPart;
+// 2026-10-01：`PartBatchRepo::update` 的 status 半边改走 status_gate（唯一写入口）。
+use crate::modules::part::repo::status_gate::{self, StatusChange};
+use crate::shared::error::AppError;
 
 /// SQL 真源 ZST。trait 名为 `PartBatchRepoTrait`（公共接口），
 /// ZST 仍名 `PartBatchRepo`（跨模块静态调用方依赖此名）。
@@ -106,6 +109,7 @@ impl PartBatchRepo {
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
+                   is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE id = $1
@@ -134,6 +138,7 @@ impl PartBatchRepo {
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
+                   is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE delivery_note_id = $1
@@ -175,6 +180,8 @@ impl PartBatchRepo {
                 pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
+                -- 2026-10-01 新增（migration 005）：返修标记随批次一同返回
+                pb.is_repairing AS "pb_is_repairing!",
                 pb.version       AS "pb_version!",
                 pb.created_at    AS "pb_created_at!",
                 pb.created_by    AS "pb_created_by?",
@@ -234,6 +241,7 @@ impl PartBatchRepo {
                         current_process_step_id: r.pb_current_process_step_id,
                         delivery_note_id: r.pb_delivery_note_id,
                         parent_batch_id: r.pb_parent_batch_id,
+                        is_repairing: r.pb_is_repairing,
                         version: r.pb_version,
                         created_at: r.pb_created_at,
                         created_by: r.pb_created_by,
@@ -307,6 +315,8 @@ impl PartBatchRepo {
                 pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
+                -- 2026-10-01 新增（migration 005）：返修标记随批次一同返回
+                pb.is_repairing AS "pb_is_repairing!",
                 pb.version       AS "pb_version!",
                 pb.created_at    AS "pb_created_at!",
                 pb.created_by    AS "pb_created_by?",
@@ -366,6 +376,7 @@ impl PartBatchRepo {
                         current_process_step_id: r.pb_current_process_step_id,
                         delivery_note_id: r.pb_delivery_note_id,
                         parent_batch_id: r.pb_parent_batch_id,
+                        is_repairing: r.pb_is_repairing,
                         version: r.pb_version,
                         created_at: r.pb_created_at,
                         created_by: r.pb_created_by,
@@ -423,6 +434,7 @@ impl PartBatchRepo {
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
+                   is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE part_id = ANY($1)
@@ -440,36 +452,70 @@ impl PartBatchRepo {
     /// 用于 Phase P3 扫码入单（写 delivery_note_id）和 Phase P2 手工 add_parts
     /// 同步推进 status。caller 必须已在事务内先读 version。
     /// 返回影响行数（0 行 → 由 service 转 `VERSION_CONFLICT` 409）。
+    ///
+    /// ## 2026-10-01：`status` 那一半改走 status_gate
+    ///
+    /// 改造前本函数是「一处 UPDATE 同时写 `delivery_note_id` + `status`」，
+    /// 于是它本身就是一个**绕过 rollup 的状态写点**（`status` 列在
+    /// `t_part_batch` 上，是全链路真源）。现拆成两步：
+    ///
+    /// 1. `status` 非 None → [`status_gate::apply_batch_status_change`]
+    ///    （写状态 + part/assembly 派生 + 终态序列号释放一体）。
+    /// 2. `delivery_note_id` 非 None → 独立的「只挂送货单」UPDATE。
+    ///
+    /// **为什么第 2 步不 bump version**：第 1 步已经在**同一事务、同一行**
+    /// 上做过一次带 `WHERE version = $n` 的 OCC 校验并持有了该行的行锁，
+    /// 在 READ COMMITTED 下并发写者会阻塞到本事务结束 —— 第 2 步再做一次
+    /// OCC 校验并不能再拦住任何冲突，只会为**一次业务动作**把审计计数器
+    /// `version` 加 2，让 `t_part_batch.version` 增长速度与业务动作数脱钩。
+    /// 故第 2 步只写列、不动 `version` / `updated_at` / `updated_by`
+    /// （审计时间戳由第 1 步给出，语义上更准确：业务动作发生在那一刻）。
     #[allow(clippy::too_many_arguments)]
-    pub async fn update<'e, E: PgExecutor<'e>>(
-        executor: E,
+    pub async fn update(
+        conn: &mut PgConnection,
         batch_id: i64,
         version: i32,
         delivery_note_id: Option<i64>,
-        status: Option<&str>,
-        when: chrono::NaiveDateTime,
+        status: Option<&'static str>,
+        _when: chrono::NaiveDateTime,
         updated_by: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query!(
-            r#"
-            UPDATE t_part_batch
-            SET delivery_note_id = COALESCE($3::bigint, delivery_note_id),
-                status           = COALESCE($4::varchar, status),
-                version          = version + 1,
-                updated_at       = $5,
-                updated_by       = $6
-            WHERE id = $1 AND version = $2 AND deleted_at IS NULL
-            "#,
-            batch_id,
-            version,
-            delivery_note_id,
-            status,
-            when,
-            updated_by,
-        )
-        .execute(executor)
-        .await?;
-        Ok(res.rows_affected())
+    ) -> Result<u64, AppError> {
+        let updated_by = updated_by.unwrap_or(0);
+        // 1) status → status_gate（唯一写入口；0 行 = VERSION_CONFLICT）
+        if let Some(target) = status {
+            status_gate::apply_batch_status_change(
+                conn,
+                StatusChange {
+                    batch_id,
+                    new_status: target,
+                    new_location: None,
+                    new_holder_id: None,
+                    new_process_id: None,
+                    new_process_step_id: None,
+                    is_repairing: None,
+                    expected_version: Some(version),
+                    // 唯一生产调用方是 `delivery_note::pickup`，源恒为
+                    // READY_TO_SHIP（service 层逐批守过）。
+                    allowed_from: &["READY_TO_SHIP"],
+                    updated_by,
+                    clear_process_id: false,
+                },
+            )
+            .await?;
+        }
+        // 2) delivery_note_id → 只挂单，不动 version（理由见上方 doc）
+        if let Some(note_id) = delivery_note_id {
+            sqlx::query(
+                "UPDATE t_part_batch SET delivery_note_id = $2 \
+                 WHERE id = $1 AND deleted_at IS NULL \
+                   AND delivery_note_id IS DISTINCT FROM $2::bigint",
+            )
+            .bind(batch_id)
+            .bind(note_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        Ok(1)
     }
 
     /// version-checked 「仅写 delivery_note_id」更新（attach_to_note 用）。
@@ -553,7 +599,10 @@ impl PartBatchRepo {
 
         // 2. INSERT 新批次（继承源 location / current_holder_id /
         //    current_process_step_id / **current_process_id**（2026-09-30 池归属
-        //    权威依据，拆批不改变批次所属工序）；quantity = qty；
+        //    权威依据，拆批不改变批次所属工序）/ **is_repairing**（2026-10-01
+        //    migration 005：返修是**当前态**，拆批切走的是「同一批实物里的一部分」，
+        //    其返修上下文与源批次同源，故随源继承，避免拆批把返修中批次悄悄
+        //    洗成非返修）；quantity = qty；
         //    status = new_batch_status；不继承 delivery_note_id；写 parent_batch_id）。
         sqlx::query!(
             r#"
@@ -561,11 +610,13 @@ impl PartBatchRepo {
                 id, part_id, batch_no, quantity, status, location,
                 current_holder_id, current_process_id, current_process_step_id,
                 delivery_note_id, parent_batch_id,
+                is_repairing,
                 version, created_at, created_by, updated_at, updated_by
             )
             SELECT $1, part_id, $2, $3, $4, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    NULL, $5,
+                   is_repairing,
                    0, now(), $6, now(), $6
             FROM t_part_batch
             WHERE id = $7 AND deleted_at IS NULL
@@ -681,6 +732,7 @@ impl PartBatchRepo {
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
+                   is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE part_id = $1 AND deleted_at IS NULL
@@ -749,6 +801,7 @@ impl PartBatchRepo {
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
+                   is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE part_id = ANY($1) AND deleted_at IS NULL
@@ -783,6 +836,8 @@ impl PartBatchRepo {
                 pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.status, pb.location,
                 pb.current_holder_id, pb.current_process_id, pb.current_process_step_id,
                 pb.delivery_note_id, pb.parent_batch_id,
+                -- 2026-10-01 新增（migration 005）
+                pb.is_repairing,
                 pb.version, pb.created_at, pb.created_by, pb.updated_at, pb.updated_by, pb.deleted_at,
                 p.id AS "p_id", p.serial_no AS "p_serial_no", p.name AS "p_name",
                 p.drawing_no AS "p_drawing_no", p.customer_id AS "p_customer_id",
@@ -834,6 +889,7 @@ impl PartBatchRepo {
                 current_process_step_id: r.try_get("current_process_step_id")?,
                 delivery_note_id: r.try_get("delivery_note_id")?,
                 parent_batch_id: r.try_get("parent_batch_id")?,
+                is_repairing: r.try_get("is_repairing")?,
                 version: r.try_get("version")?,
                 created_at: r.try_get("created_at")?,
                 created_by: r.try_get("created_by")?,
@@ -962,6 +1018,7 @@ impl PartBatchRepo {
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
+                   is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE current_holder_id = $1
@@ -1397,15 +1454,15 @@ pub trait PartBatchRepoTrait: Send {
         include_deleted: bool,
     ) -> Result<Vec<TPartBatch>, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
-    async fn update<'a>(
+    async fn update(
         &mut self,
         batch_id: i64,
         version: i32,
         delivery_note_id: Option<i64>,
-        status: Option<&'a str>,
+        status: Option<&'static str>,
         when: NaiveDateTime,
         updated_by: Option<i64>,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     #[allow(clippy::too_many_arguments)]
     async fn attach_to_note(
         &mut self,
@@ -1519,15 +1576,15 @@ impl PartBatchRepoTrait for &mut PgConnection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn update<'b>(
+    async fn update(
         &mut self,
         batch_id: i64,
         version: i32,
         delivery_note_id: Option<i64>,
-        status: Option<&'b str>,
+        status: Option<&'static str>,
         when: NaiveDateTime,
         updated_by: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartBatchRepo::update(
             &mut **self,
             batch_id,

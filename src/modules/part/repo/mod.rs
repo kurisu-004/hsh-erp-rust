@@ -72,10 +72,16 @@
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
+use crate::shared::error::AppError;
+
 pub mod batch;
 pub mod event;
 pub mod part;
 pub mod sql;
+// 2026-10-01 新增：batch → part → assembly 单一写入口（status_gate）。
+// 全仓**唯一**允许写 `t_part_batch.status` 的实现都收口在本模块的
+// `apply_batch_status_change` / `apply_bulk_batch_status_change_for_part`。
+pub mod status_gate;
 
 // 重导出 sql.rs 中的 ZST struct / builder / row 与 model 表行类型，让上层继续用
 // `super::repo::{TPart, TPartInspected, TPartEvent, NewPartEvent, PartUpdate, PartListFilters,
@@ -254,19 +260,24 @@ pub trait PartRepoTrait: Send {
     ) -> Result<Option<crate::modules::part::batch::model::TPartBatch>, sqlx::Error>;
 
     // ── t_part_batch mark_*（6）──
+    //
+    // 2026-10-01：除 `mark_batch_returned`（不改 status）外，全部
+    // `t_part_batch.status` 写点已收口到 `repo::status_gate`。
+    // 返回类型由 `sqlx::Error` 改 `AppError`：status_gate 的契约是
+    // 「没写成 = `VERSION_CONFLICT`」，转 `sqlx::Error` 会把 409 降级成 500。
     async fn mark_batch_passed_inspection(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     async fn mark_batch_inspected(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     async fn mark_batch_failed_inspection(
         &mut self,
         batch_id: i64,
@@ -275,7 +286,7 @@ pub trait PartRepoTrait: Send {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     async fn mark_batch_returned(
         &mut self,
         batch_id: i64,
@@ -292,19 +303,19 @@ pub trait PartRepoTrait: Send {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     async fn mark_batch_completed(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     async fn mark_batch_cancelled(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     async fn mark_part_cancelled(
         &mut self,
         part_id: i64,
@@ -316,19 +327,19 @@ pub trait PartRepoTrait: Send {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     async fn cancel_all_active_batches_for_part(
         &mut self,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     // 2026-09-30 新增：force-complete 端点 — 单 SQL 强推 part 下所有非
     // CANCELLED 活跃批次到 COMPLETED（绕状态机 + 不走 OCC）。
     async fn force_complete_all_batches_for_part(
         &mut self,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
 
     // ── t_part_batch split（1）──
     #[allow(clippy::too_many_arguments)]
@@ -643,7 +654,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::mark_batch_passed_inspection(
             &mut **self,
             batch_id,
@@ -659,7 +670,7 @@ impl PartRepoTrait for &mut PgConnection {
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::mark_batch_inspected(
             &mut **self,
             batch_id,
@@ -678,7 +689,7 @@ impl PartRepoTrait for &mut PgConnection {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::mark_batch_failed_inspection(
             &mut **self,
             batch_id,
@@ -718,7 +729,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::mark_batch_delivered(&mut **self, batch_id, expected_version, current_user_id)
             .await
     }
@@ -728,7 +739,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::mark_batch_completed(&mut **self, batch_id, expected_version, current_user_id)
             .await
     }
@@ -738,7 +749,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::mark_batch_cancelled(&mut **self, batch_id, expected_version, current_user_id)
             .await
     }
@@ -757,7 +768,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::mark_batch_repairing(&mut **self, batch_id, expected_version, current_user_id)
             .await
     }
@@ -766,7 +777,7 @@ impl PartRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::cancel_all_active_batches_for_part(&mut **self, part_id, current_user_id).await
     }
 
@@ -775,7 +786,7 @@ impl PartRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::force_complete_all_batches_for_part(&mut **self, part_id, current_user_id).await
     }
 

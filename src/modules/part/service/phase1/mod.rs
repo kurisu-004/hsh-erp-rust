@@ -43,8 +43,9 @@
 
 #![allow(deprecated, clippy::too_many_arguments, clippy::type_complexity)]
 
-use sqlx::{PgConnection, PgExecutor};
+use sqlx::PgConnection;
 
+use crate::modules::part::repo::status_gate::{self, StatusChange};
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
@@ -291,9 +292,29 @@ async fn assert_shelf_maps_process(
 ///
 /// 初始批次 / 子批次仍为严格 NULL（见 `part/batch/repo.rs::create_initial_batch`
 /// 与 `part/repo/sql/part_sql.rs::insert_child_for_assembly`，两者都不写该列）。
+///
+/// 2026-10-01：改为 `status_gate::apply_batch_status_change` 的薄包装
+/// （全仓唯一的 `t_part_batch.status` 写入口）。
+///
+/// 语义映射（保持与改造前逐条等价）：
+/// - WHERE 的 `status NOT IN ('CANCELLED','COMPLETED')` 换成 status_gate 的
+///   **正向** `allowed_from` 白名单（= 全状态减两个终态）。之所以改成正向：
+///   status_gate 的白名单是「本次允许的源状态」，反向排除无法直接表达，
+///   而正向表多写 9 个状态值换来的是「新增状态时若忘了加进白名单会被拒」
+///   ——fail-safe 方向正确。
+/// - `new_current_process_id = None` 在原语义里是「**写 NULL**」（出池），
+///   而 status_gate 的 `None` 是「保持原值」。故额外置
+///   `clear_process_id: new_current_process_id.is_none()`。
+/// - `new_location` / `new_holder_id` / `new_current_process_step_id` 的
+///   `None` 语义两边一致（SQL 直写 NULL vs COALESCE 保持原值）——
+///   ⚠️ **这里有一处刻意的不等价**：原实现直写 NULL，本实现是「保持原值」。
+///   全部 8 个调用点（work_type / programming / lifecycle_helpers / outsource
+///   ×3 / repair ×2 / scan）传的 location / holder / step 均非 None 或与
+///   「保持原值」等价，故行为不变；后续若要传 None 表达「清空」，
+///   需先在 status_gate 补对应 flag。
 #[allow(clippy::too_many_arguments)]
-async fn mark_batch_with_status_and_meta<'e, E: PgExecutor<'e>>(
-    executor: E,
+async fn mark_batch_with_status_and_meta(
+    conn: &mut PgConnection,
     batch_id: i64,
     expected_version: i32,
     new_status: &str,
@@ -302,47 +323,134 @@ async fn mark_batch_with_status_and_meta<'e, E: PgExecutor<'e>>(
     new_current_process_step_id: Option<i64>,
     new_current_process_id: Option<i64>,
     updated_by: i64,
-) -> Result<u64, sqlx::Error> {
-    let r = sqlx::query(
-        "UPDATE t_part_batch SET status = $3, location = $4, current_holder_id = $5, \
-         current_process_step_id = $6, current_process_id = $8, \
-         version = version + 1, updated_at = now(), updated_by = $7 \
-         WHERE id = $1 AND version = $2 AND status NOT IN ('CANCELLED', 'COMPLETED') \
-         AND deleted_at IS NULL",
+) -> Result<u64, AppError> {
+    status_gate::apply_batch_status_change(
+        conn,
+        StatusChange {
+            batch_id,
+            new_status,
+            new_location,
+            new_holder_id,
+            new_process_id: new_current_process_id,
+            new_process_step_id: new_current_process_step_id,
+            // 2026-10-01：本漏斗 = 「批次离开返修态」的清零点。
+            //
+            // 规则依据：设 `is_repairing=true` 的入口只有 2 个 ——
+            // `mark_batch_repairing`（start-repair）与 `mark_batch_status_only`
+            // （scan-inspect FAIL），二者都**不走**本漏斗的返修分支；本漏斗的
+            // 8 个调用点（place_on_shelf / recall_to_pending /
+            // release_from-programming / outsource 收发 ×3 / complete_repair /
+            // repair_dispatch / scan-inspect 第一步）全部表示「批次回到了正常
+            // 生产流 / 送检 / 完成返修」，此刻必须清标记，否则返修态永远挂着。
+            // 其中 `complete_repair` 与 `repair_dispatch` 正是最关键的两个
+            // 清除点（前者=返修完成，后者=一步式起修并直接到位）。
+            is_repairing: Some(false),
+            expected_version: Some(expected_version),
+            // 终态不可流转：COMPLETED / CANCELLED 之外的全部状态。
+            //
+            // 末尾的 "REPAIRING" 是**过渡期源状态别名**：REPAIRING 已从
+            // PartStatus 删除，但 migration 006 之前的存量行、以及
+            // 直接写库的历史数据仍可能是该值。把它列进白名单是
+            // `PartStatus::from_str` 里 `"REPAIRING" => IN_PROCESS`
+            // 兼容分支在 SQL 层的对应物（两侧容忍度必须一致，否则会出现
+            // 「service 层放行、SQL 守卫拒掉」的诡异 409）。
+            allowed_from: &[
+                "PENDING",
+                "PROGRAMMING",
+                "IN_PROCESS",
+                "INSPECTION",
+                "READY_TO_SHIP",
+                "DELIVERED",
+                "OUTSOURCE",
+                "REPAIRING",
+            ],
+            updated_by,
+            clear_process_id: new_current_process_id.is_none(),
+        },
     )
-    .bind(batch_id)
-    .bind(expected_version)
-    .bind(new_status)
-    .bind(new_location)
-    .bind(new_holder_id)
-    .bind(new_current_process_step_id)
-    .bind(updated_by)
-    .bind(new_current_process_id)
-    .execute(executor)
-    .await?;
-    Ok(r.rows_affected())
+    .await
+    .map(|_| 1u64)
 }
 
 /// mark_batch 的轻量版本（不写 location/holder/process；用于状态机迁移但保持原 holder 的场景，如 CANCELLED）。
-async fn mark_batch_status_only<'e, E: PgExecutor<'e>>(
-    executor: E,
+///
+/// 2026-10-01：改为 `status_gate::apply_batch_status_change` 的薄包装。
+///
+/// 3 个调用点传入的目标状态是 `READY_TO_SHIP`（scan-inspect pass）/
+/// `"REPAIRING"`（scan-inspect FAIL）/ `CANCELLED`（cancel-batch）。
+/// 其中 **`"REPAIRING"` 是过渡别名**（2026-10-01 REPAIRING 降级为标记列）：
+/// 本函数把它翻译成 `status='IN_PROCESS' + is_repairing=true`，这样
+/// `phase1/scan.rs` 这个属于 REPAIRING 下游消费方改造范围的调用点**本轮零改动**。
+/// 后续那一轮应让 scan 显式传标记、删掉本别名分支。
+///
+/// `allowed_from` 由目标状态反查（`status_guard_for_target`）——原实现
+/// 「无源状态守卫」，本实现补上；等价性由该函数的 doc 逐目标状态论证。
+async fn mark_batch_status_only(
+    conn: &mut PgConnection,
     batch_id: i64,
     expected_version: i32,
     new_status: &str,
     updated_by: i64,
-) -> Result<u64, sqlx::Error> {
-    let r = sqlx::query(
-        "UPDATE t_part_batch SET status = $3, version = version + 1, \
-         updated_at = now(), updated_by = $4 \
-         WHERE id = $1 AND version = $2 AND deleted_at IS NULL",
+) -> Result<u64, AppError> {
+    let (real_status, is_repairing) = resolve_status_alias(new_status);
+    status_gate::apply_batch_status_change(
+        conn,
+        StatusChange {
+            batch_id,
+            new_status: real_status,
+            new_location: None,
+            new_holder_id: None,
+            new_process_id: None,
+            new_process_step_id: None,
+            is_repairing,
+            expected_version: Some(expected_version),
+            allowed_from: status_guard_for_target(real_status),
+            updated_by,
+            clear_process_id: false,
+        },
     )
-    .bind(batch_id)
-    .bind(expected_version)
-    .bind(new_status)
-    .bind(updated_by)
-    .execute(executor)
-    .await?;
-    Ok(r.rows_affected())
+    .await
+    .map(|_| 1u64)
+}
+
+/// 2026-10-01 新增：目标状态别名翻译（过渡期）。
+///
+/// `"REPAIRING"` → `("IN_PROCESS", Some(true))`；其余原样返回、
+/// 标记不写（`None` = 保持原值）。REPAIRING 降级为 `is_repairing` 标记列
+/// （migration 005/006）后它已不是合法 `PartStatus`，但仍有 1 个调用点
+/// （`phase1/scan.rs`）按老词汇传字符串。
+#[inline]
+fn resolve_status_alias(target: &str) -> (&str, Option<bool>) {
+    if target == "REPAIRING" {
+        ("IN_PROCESS", Some(true))
+    } else {
+        (target, None)
+    }
+}
+
+/// 2026-10-01 新增：由**目标**状态反查 `mark_batch_status_only` 的源状态白名单。
+///
+/// 等价性论证（原实现 WHERE 无 status 守卫，调用点各自在 service 层守）：
+/// - `READY_TO_SHIP`：唯一调用点是 `scan_inspect` 的 pass 分支，源恒为上一步
+///   刚写下的 `INSPECTION`（同一函数前半段写死）→ 白名单 `["INSPECTION"]` 等价。
+/// - `IN_PROCESS`（由 `"REPAIRING"` 翻译）：唯一调用点是 `scan_inspect` 的
+///   FAIL 分支，源恒为 `INSPECTION` → 等价。
+/// - `CANCELLED`：调用点 `batch_ops::cancel_batch` 在 service 层已守
+///   `from != COMPLETED && from != CANCELLED`，故白名单取
+///   「全状态减两个终态」→ 等价。
+fn status_guard_for_target(target: &str) -> &'static [&'static str] {
+    match target {
+        "READY_TO_SHIP" | "IN_PROCESS" => &["INSPECTION"],
+        _ => &[
+            "PENDING",
+            "PROGRAMMING",
+            "IN_PROCESS",
+            "INSPECTION",
+            "READY_TO_SHIP",
+            "DELIVERED",
+            "OUTSOURCE",
+        ],
+    }
 }
 
 /// 2026-09-16 PR-3 批次 step 化：part 进入生产流（place_on_shelf /
@@ -385,9 +493,7 @@ mod tests {
         ensure_transition(PartStatus::IN_PROCESS, PartStatus::PENDING, "test").unwrap();
         ensure_transition(PartStatus::PROGRAMMING, PartStatus::PENDING, "test").unwrap();
         ensure_transition(PartStatus::PROGRAMMING, PartStatus::IN_PROCESS, "test").unwrap();
-        ensure_transition(PartStatus::REPAIRING, PartStatus::IN_PROCESS, "test").unwrap();
         ensure_transition(PartStatus::OUTSOURCE, PartStatus::IN_PROCESS, "test").unwrap();
-        ensure_transition(PartStatus::INSPECTION, PartStatus::REPAIRING, "test").unwrap();
     }
 
     #[test]

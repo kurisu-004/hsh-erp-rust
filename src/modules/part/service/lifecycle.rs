@@ -113,10 +113,10 @@ impl PartService {
                 format!("batch {} 版本冲突", batch.id),
             ));
         }
-        // 6. PR-B2 rollup：翻 batch → 物化 part 派生列 + 级联 assembly sync。
-        //    （status 由 NoChange → DELIVERED 时 part 跟随；多批次场景下
-        //    rollup 会按 min-progress 决定 part 状态。）
-        let _ = PartService::sync_from_batch_change(&mut repo, part_id, current).await?;
+        // 6. 2026-10-01：`mark_batch_delivered` 走 status_gate，part → assembly
+        //    派生已在同一事务内完成（多批次场景下按 min-progress 决定 part 状态），
+        //    **不再**手工调 `sync_from_batch_change`（原 `let _ =` 既冗余，又会把
+        //    rollup 错误静默丢弃）。
         // 7. 事件日志：batch_id + quantity 来自操作的批次。
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
@@ -203,6 +203,10 @@ impl PartService {
         // PR-B2 §4.2 cancel 改造：级联取消**全部活跃批次**（不只「最近一条
         // source-status」），单条 UPDATE 即覆盖。无活跃批次 → 影响行数 0，
         // 视为合法（新建工单未拆批场景）。
+        //
+        // 2026-10-01：该 bulk 写点走 status_gate 批量模式（并补上了它原先缺失的
+        // `status NOT IN ('COMPLETED','CANCELLED')` 白名单 —— 原实现会把已完成
+        // 批次一起拖成 CANCELLED），part → assembly 派生已在其内部完成。
         let _batches_cancelled = repo
             .cancel_all_active_batches_for_part(part_id, current.id)
             .await?;
@@ -286,20 +290,18 @@ impl PartService {
             ));
         }
         // 4. UPDATE batch: DELIVERED → COMPLETED（OCC）。
-        let bn = repo
+        //    ⚠️ `mark_batch_completed` 经 status_gate 写，0 行已由 status_gate
+        //    转成 `VERSION_CONFLICT` 抛出，不再重复判 0。
+        //
+        //    2026-10-01：**序列号释放已下沉进 status_gate 的 rollup**
+        //    （step 4）。原实现在这里调 `clear_part_serial_no_when_completed`，
+        //    而它的 WHERE 是 **part 级**的 `status='COMPLETED'`，本方法一次只翻
+        //    **一条批次** —— 多批次工单完成其中一条时 part 仍是 DELIVERED，该
+        //    UPDATE 命中 0 行，再被 `let _ =` 静默吞掉，序列号被
+        //    `uk_t_part_serial_no` **永久**占住（无任何告警）。现在
+        //    「part 被 rollup 进终态」即释放，与「是否所有批次都完成」彻底解耦。
+        let _bn = repo
             .mark_batch_completed(batch.id, batch.version, current.id)
-            .await?;
-        if bn == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("batch {} 版本冲突", batch.id),
-            ));
-        }
-        // 5. PR-B2 rollup：翻 batch → 物化 part 派生列 + 级联 assembly sync。
-        let _ = PartService::sync_from_batch_change(&mut repo, part_id, current).await?;
-        // 6. part 进入 COMPLETED 时清空 serial_no（序列号已转交送货单）。
-        let _ = repo
-            .clear_part_serial_no_when_completed(part_id, current.id)
             .await?;
         // 7. 事件日志：batch_id + quantity 来自操作的批次。
         repo.insert_part_event(NewPartEvent {
@@ -360,7 +362,13 @@ impl PartService {
                 format!("batch {} status 非法: {}", batch.id, batch.status),
             )
         })?;
-        if !from.can_transition_to(PartStatus::REPAIRING) {
+        // 2026-10-01：REPAIRING 降级为 `t_part_batch.is_repairing` 标记后，
+        // start-repair **不再是一次状态迁移**（status 保持 IN_PROCESS），
+        // 守卫从「枚举迁移白名单」改为「源状态必须是 IN_PROCESS」。
+        // ⚠️ 精确判定（「该批次当前确实不在返修中」）应查 `batch.is_repairing`
+        // 列 —— 那一列属 REPAIRING 下游消费方改造的范围（并行任务），本轮
+        // 不在此引入，以免与其抢同一批文件。
+        if from != PartStatus::IN_PROCESS {
             return Err(AppError::biz(
                 code::BIZ_PART_REPAIR_NOT_TRIGGERED,
                 format!(
@@ -380,22 +388,19 @@ impl PartService {
                 ),
             ));
         }
-        // 4. UPDATE batch: IN_PROCESS → REPAIRING（OCC）。
+        // 4. UPDATE batch（OCC）：2026-10-01 起**不改 status**（仍 IN_PROCESS），
+        //    只置 `is_repairing = true`（见 `mark_batch_repairing` 的 doc）。
         //    2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
-        //    `has_been_repaired` 列，mark_batch_repairing 不再写该列；t_part
-        //    同步删 `has_been_repaired` 列，mark_part_repairing_flag_only 整
-        //    个函数删除。返修事实由下方 REPAIR_STARTED 事件日志追溯。
-        let bn = repo
+        //    `has_been_repaired` 列；返修事实由下方 REPAIR_STARTED 事件日志 +
+        //    `is_repairing` 标记列共同追溯。
+        //    ⚠️ `mark_batch_repairing` 经 status_gate 写，0 行已由 status_gate
+        //    转成 `VERSION_CONFLICT` 抛出，故不再重复判 0。
+        let _bn = repo
             .mark_batch_repairing(batch.id, batch.version, current.id)
             .await?;
-        if bn == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("batch {} 版本冲突", batch.id),
-            ));
-        }
-        // 5. PR-B2 rollup：翻 batch → 物化 part 派生列（status=REPAIRING）。
-        let _ = PartService::sync_from_batch_change(&mut repo, part_id, current).await?;
+        // 5. 2026-10-01：`mark_batch_repairing` 走 status_gate，part → assembly
+        //    派生已在同一事务内完成，**不再**手工调 `sync_from_batch_change`
+        //    （原 `let _ =` 既冗余，又把 rollup 错误降级成「静默丢弃」）。
         // 6. 事件日志。
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
@@ -465,15 +470,13 @@ impl PartService {
             ));
         }
         // 5. 单 SQL 强推所有非 CANCELLED 活跃批次 → COMPLETED（绕 OCC）。
+        //    2026-10-01：该 bulk 写点走 status_gate 的批量模式，因此
+        //    part → assembly 派生（part 自动派生到 COMPLETED）与终态序列号
+        //    归档 / 释放**都已在同一事务内完成**。原第 6/7 步
+        //    （`sync_from_batch_change` + `clear_part_serial_no_when_completed`，
+        //    两者都被 `let _ =` 静默吞掉）整体删除。
         let _n = repo
             .force_complete_all_batches_for_part(part_id, current.id)
-            .await?;
-        // 6. 复用 rollup：sync_from_batch_change → compute_part_target 自动派生
-        //    part.status='COMPLETED'（非 CANCELLED 活跃批次全推到 COMPLETED）。
-        let _ = PartService::sync_from_batch_change(&mut repo, part_id, current).await?;
-        // 7. 复用终态清理：清空 serial_no（与常规 complete 一致）。
-        let _ = repo
-            .clear_part_serial_no_when_completed(part_id, current.id)
             .await?;
         // 8. 事件日志：FORCE_COMPLETED 区分常规 COMPLETED；note 加 [FORCE] 前缀。
         let note_owned = req.note.unwrap_or_default();

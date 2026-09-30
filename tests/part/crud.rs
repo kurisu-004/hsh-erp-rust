@@ -944,7 +944,12 @@ async fn complete_wrong_state_400() {
     assert_eq!(env["code"], 20116, "BIZ_PART_NOT_DELIVERED: {env}");
 }
 
-/// POST /parts/{id}/start-repair —— batch IN_PROCESS → REPAIRING (200 + status)。
+/// POST /parts/{id}/start-repair —— batch IN_PROCESS + is_repairing=true (200 + status)。
+///
+/// 2026-10-01 契约变更：REPAIRING 从 `PartStatus` 降级为
+/// `t_part_batch.is_repairing` 标记列（migration 005/006），故
+/// `t_part.status` 不再出现 'REPAIRING'（rollup 恒为 'IN_PROCESS'）。
+/// 断言同时覆盖「状态保持 IN_PROCESS」+「标记已置位」两件事。
 #[tokio::test]
 async fn start_repair_in_process_200() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -968,7 +973,18 @@ async fn start_repair_in_process_200() {
     .await;
     assert_eq!(s, StatusCode::OK, "start-repair 200: {env}");
     assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["status"], "REPAIRING");
+    // 2026-10-01：状态保持 IN_PROCESS，返修语义由 is_repairing 承载
+    assert_eq!(env["data"]["status"], "IN_PROCESS");
+    let is_repairing: bool =
+        sqlx::query_scalar("SELECT is_repairing FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .expect("read is_repairing");
+    assert!(
+        is_repairing,
+        "start-repair 应置 t_part_batch.is_repairing = true"
+    );
     let event_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM t_part_event \
          WHERE part_id = $1 AND event_type = 'REPAIR_STARTED'",

@@ -50,10 +50,16 @@ impl PartService {
         validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
-        if from != PartStatus::REPAIRING {
+        // 2026-10-01：REPAIRING 已从 PartStatus 删除（降级为
+        // `t_part_batch.is_repairing` 标记列），`from_str` 的过渡兼容分支把
+        // 历史 'REPAIRING' 字符串也解析成 IN_PROCESS，故本守卫改为判 IN_PROCESS。
+        // ⚠️ 精确判定应查 `batch.is_repairing`（「确实在返修中」）—— 属 REPAIRING
+        // 下游消费方改造的范围（并行任务），本轮不引入。副作用：非返修态的
+        // IN_PROCESS 批次也能过本守卫（比改造前宽），由该任务收紧。
+        if from != PartStatus::IN_PROCESS {
             return Err(AppError::biz(
                 code::BIZ_PART_REPAIR_NOT_TRIGGERED,
-                "complete-repair: 源状态必须是 REPAIRING",
+                "complete-repair: 源状态必须是 IN_PROCESS（返修中）",
             ));
         }
         // shelf 区决定目标状态

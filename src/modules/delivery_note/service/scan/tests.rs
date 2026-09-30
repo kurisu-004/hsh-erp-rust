@@ -181,6 +181,9 @@ mod classify_5groups_tests {
             current_process_step_id: None,
             delivery_note_id: None,
             parent_batch_id: None,
+            // 2026-10-01 新增（migration 005）：本文件测的是扫码分类逻辑，
+            // 与返修标记无关，固定 false。
+            is_repairing: false,
             version: 0,
             created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
             created_by: None,
@@ -272,6 +275,9 @@ mod c_group_distribution_tests {
             current_process_step_id: None,
             delivery_note_id: None,
             parent_batch_id: None,
+            // 2026-10-01 新增（migration 005）：本文件测的是扫码分类逻辑，
+            // 与返修标记无关，固定 false。
+            is_repairing: false,
             version: 0,
             created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
             created_by: None,
@@ -373,6 +379,9 @@ mod attachable_batches_tests {
             current_process_step_id: None,
             delivery_note_id: None,
             parent_batch_id: None,
+            // 2026-10-01 新增（migration 005）：本文件测的是扫码分类逻辑，
+            // 与返修标记无关，固定 false。
+            is_repairing: false,
             version,
             created_at: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
             created_by: None,

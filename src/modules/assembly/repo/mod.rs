@@ -160,6 +160,13 @@ pub trait AssemblyRepoTrait: Send {
         new_status: &'a str,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
+    /// 2026-10-01 新增：终态清空 `serial_no`（父装配件无事件表，故不归档；
+    /// 详见 `AssemblyRepo::clear_serial_no_if_terminal` 的 doc）。
+    async fn clear_serial_no_if_terminal(
+        &mut self,
+        id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error>;
 
     // ── 跨域 helper（5）── 委托 part / part_file / t_customer / t_part_batch 的 SQL ──
     //
@@ -510,6 +517,14 @@ impl AssemblyRepoTrait for &mut PgConnection {
             updated_by,
         )
         .await
+    }
+
+    async fn clear_serial_no_if_terminal(
+        &mut self,
+        id: i64,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        AssemblyRepo::clear_serial_no_if_terminal(&mut **self, id, updated_by).await
     }
 
     // ── 跨域 helper（5）── 一行委托 PartRepo / PartFileRepo / inline sqlx ──
