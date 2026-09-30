@@ -95,6 +95,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/deliver", post(handler::deliver))
         .route("/{part_id}/cancel", post(handler::cancel))
         .route("/{part_id}/complete", post(handler::complete))
+        .route(
+            "/{part_id}/force-complete",
+            post(handler::force_complete),
+        ) // 2026-09-30 新增：MANAGER 单角色强推工单 + 所有活跃批次为 COMPLETED（绕状态机）
         .route("/{part_id}/start-repair", post(handler::start_repair))
         // ---- Phase 1 单件端点 ----
         .route("/{part_id}/place-on-shelf", post(handler::place_on_shelf))

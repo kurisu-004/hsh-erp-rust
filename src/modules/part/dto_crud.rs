@@ -260,6 +260,17 @@ pub struct CompleteRequest {
     pub note: Option<String>,
 }
 
+/// `POST /parts/{id}/force-complete` 入参（2026-09-30 新增）。
+///
+/// MANAGER 单角色守卫；完全绕状态机把 part + 所有活跃批次强推到 COMPLETED。
+/// 仅可填 `note`（会拼 `[FORCE]` 前缀写入事件日志追溯），不收 `batch_id` /
+/// `version`（逃生通道不走 OCC，依赖 SQL 行锁串行化）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ForceCompleteRequest {
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 /// `POST /parts/{id}/start-repair` 入参。
 ///
 /// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) BREAKING CHANGE：

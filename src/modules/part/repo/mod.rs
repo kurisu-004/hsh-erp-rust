@@ -320,6 +320,13 @@ pub trait PartRepoTrait: Send {
         part_id: i64,
         current_user_id: i64,
     ) -> Result<u64, sqlx::Error>;
+    // 2026-09-30 新增：force-complete 端点 — 单 SQL 强推 part 下所有非
+    // CANCELLED 活跃批次到 COMPLETED（绕状态机 + 不走 OCC）。
+    async fn force_complete_all_batches_for_part(
+        &mut self,
+        part_id: i64,
+        current_user_id: i64,
+    ) -> Result<u64, sqlx::Error>;
 
     // ── t_part_batch split（1）──
     #[allow(clippy::too_many_arguments)]
@@ -755,6 +762,15 @@ impl PartRepoTrait for &mut PgConnection {
         current_user_id: i64,
     ) -> Result<u64, sqlx::Error> {
         PartRepo::cancel_all_active_batches_for_part(&mut **self, part_id, current_user_id).await
+    }
+
+    // 2026-09-30 新增：force-complete 端点（MANAGER 单角色强推 part + 批次）。
+    async fn force_complete_all_batches_for_part(
+        &mut self,
+        part_id: i64,
+        current_user_id: i64,
+    ) -> Result<u64, sqlx::Error> {
+        PartRepo::force_complete_all_batches_for_part(&mut **self, part_id, current_user_id).await
     }
 
     // ── t_part_batch split（1）──

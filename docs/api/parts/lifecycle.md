@@ -16,6 +16,7 @@
 - [POST /api/v2/parts/{part_id}/cancel](#post-apiv2partspart_idcancel)
 - [POST /api/v2/parts/{part_id}/complete](#post-apiv2partspart_idcomplete)
 - [POST /api/v2/parts/{part_id}/start-repair](#post-apiv2partspart_idstart-repair)
+- [POST /api/v2/parts/{part_id}/force-complete](#post-apiv2partspart_idforce-complete)（2026-09-30 新增：MANAGER 单角色强推逃生通道）
 - [GET /api/v2/parts/pending-programming](#get-apiv2partspending-programming)（2026-09-29 新过滤规则）
 
 ---
@@ -133,6 +134,41 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
 - 20118 — batch 当前状态非 IN_PROCESS（状态机白名单拒绝）
 - 40901 — 乐观锁失败
 
+### `POST /api/v2/parts/{part_id}/force-complete`（2026-09-30 新增）
+
+权限: **Manager 单角色**（明确不下放 Clerk —— 强改逃生通道）
+
+> ⚠️ **强改语义**：
+> - **完全绕状态机**：非 `CANCELLED` / 非 `COMPLETED` 状态可被强推到 `COMPLETED`。
+> - **不走 OCC**：force-complete 是逃生通道，依赖 SQL 行锁串行化（`t_part_batch` 行锁
+>   + `t_part` 行锁），不收 `version`、不要求 caller 侧 batch_id 选择。
+> - **批次处理**：单 SQL 强推该 part 下所有活跃批次（非 `CANCELLED`、非软删）→
+>   `COMPLETED`，复用 `sync_from_batch_change` rollup 让 `compute_part_target`
+>   自动派生 `part.status='COMPLETED'`。
+> - **终态清理**：复用现有 `clear_part_serial_no_when_completed` 清空 `serial_no`。
+> - **事件日志**：`t_part_event.event_type='FORCE_COMPLETED'`（区别常规 `COMPLETED`），
+>   `note` 自动加 `[FORCE]` 前缀（即便用户未传 note 也会写入 `[FORCE] ` 空字符串）以便审计追溯。
+> - **WS 广播**：`PART_FORCE_COMPLETED`（区别 `PART_COMPLETED`），前端订阅 dashboard
+>   可监听。
+
+Request：
+
+```json
+{
+  "note": "string (可选；将自动加 [FORCE] 前缀写入事件日志)"
+}
+```
+
+Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 强推后的工单。
+
+错误码：
+
+- 20101 — part 不存在 / 软删
+- 20104 — status 字符串非法
+- 20115 — part 已 CANCELLED（终态不可被强推，语义对称 20123）
+- 20123 — part 已 COMPLETED（幂等拒绝，避免重复强推副作用）
+- 40300 — 无权限（仅 MANAGER 单角色）
+
 ---
 
 ## Lifecycle 专属 DTO
@@ -147,6 +183,13 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
 
 仅含可选 `reason` / `note`（cancel 走 part 级 + 级联取消全部活跃批次，详见
 [重构方案 §4.2](../../refactor-part-assembly-batch.md#42-rollup-回调核心-新增-partservicesync_from_batch_change)）。
+
+### ForceCompleteRequest 字段（2026-09-30 新增，MANAGER 单角色强推逃生通道）
+
+仅含可选 `note`（≤ 500 字符建议；服务端自动加 `[FORCE] ` 前缀写入事件日志）。
+不收 `batch_id` / `version`（绕 OCC）；service 层收尾时会复用现有
+`complete` 路径的 `clear_part_serial_no_when_completed` + `sync_from_batch_change`
+rollup 让 `part.status='COMPLETED'` 自动落地。
 
 ---
 
