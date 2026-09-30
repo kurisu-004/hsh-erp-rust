@@ -15,6 +15,7 @@
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
 | GET | `/api/v2/prod/worker-pool/state` | 已登录（无 role guard） | worker 当前持有（含完整 held_batches）+ 工序池候选数（按工序分组） |
+| GET | `/api/v2/prod/worker-pool/counts` | **Manager+Clerk+Inspector** | **2026-09-30 新增**：全工序候选批次聚合计数（GROUP BY process_id），跨所有货架 |
 | GET | `/api/v2/prod/worker-pool/{process_id}` | **Manager+Clerk+Inspector** | 按工序返回候选池详情（workers + work_types + 跨货架批次列表） |
 | POST | `/api/v2/prod/admin/worker-pool/refill` | **Manager** | 为指定 worker 抢满 `max_held_batches`（同事务） |
 | POST | `/api/v2/prod/admin/worker-pool/remove` | **Manager** | 把 worker 持有批次按 RETURNED 语义放回候选池 |
@@ -153,6 +154,48 @@ Response 200 `data`：[`ProcessPoolDetail`](#processpooldetail-字段)
 
 - 20801 BIZ_PROCESS_NOT_FOUND — process_id 不存在 / 已软删
 - 40300 FORBIDDEN — 角色不在 Manager+Clerk+Inspector 集合内
+
+### `GET /api/v2/prod/worker-pool/counts`
+
+**2026-09-30 新增**：admin 视角的全工序候选批次聚合（dashboard 快照型查询）。
+前端 `WorkerQueueBoard.vue` 用 `counts[].count` 给各 tab 标题加 `(N)` 徽标，
+不再依赖每 tab 的 worker-pool 详情是否已加载（早期方案是 N+1 轮询 per-process 端点）。
+
+权限：**Manager + Clerk + Inspector**（与 `GET /api/v2/prod/worker-pool/{process_id}` 同集
+—— `current.require_any_role(&[Role::Manager, Role::Clerk, Inspector])`，
+admin 视角但不止 Manager）。
+
+Query：无（按现有 per-process 端点惯例，不指定 shelf_id，返回所有货架）
+
+业务流转（service `pool_counts_all_shelves`）：
+
+1. 角色守卫：`Manager + Clerk + Inspector`（service 内 `require_any_role`）
+2. 调 `WorkerPoolRepo::group_count_by_process_all_shelves` 单 SQL GROUP BY 取
+   `(process_id, count)`：跨 `t_part_batch` 中
+   `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL`
+   的批次数（按 `next_process_id` 维度聚合，PR-3 批次 step 化后改走
+   `t_process_chain_step.process_id` JOIN 取值）
+3. 二次调 `ProcessRepo::list_by_ids` 取 `process_code / process_name` 元数据
+4. 装 `WorkerPoolCountsOut` 返回（`total = counts.iter().map(|c| c.count).sum()`）
+
+> 业务口径与 `list_candidates_by_process_all_shelves`（per-process 候选池详情）完全一致：
+> 两者都限定 `status + location + deleted_at` 三态，唯一区别是本端点只 GROUP BY 计次，
+> 不返回批次明细。
+>
+> 含 0 候选批次的 process 不出现在 `counts` 中（SQL `GROUP BY` 不输出 0 行，
+> 与前端 tab 数量语义对齐——admin 不关心"无候选"的工序）。
+>
+> 排序按 `process_id ASC` 稳定（repo SQL `ORDER BY s.process_id ASC` 保证），
+> 二次查元数据按 `list_by_ids` 的 `ORDER BY id ASC` 同序返回。
+
+Response 200 `data`：[`WorkerPoolCountsOut`](#workerpoolcountsout-字段)
+
+错误码：
+
+- 40300 FORBIDDEN — 角色不在 Manager+Clerk+Inspector 集合内
+
+WS 广播：无（counts 是 dashboard 快照型查询，无业务流转；与 `GET /state` 同形态
+的轻量端点）。
 
 ### `POST /api/v2/prod/admin/worker-pool/auto-allocate`
 
@@ -454,6 +497,28 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 | `taken` | [TakenItem](#takenitem-字段) | 新持有的批次（JOIN t_part 元数据） |
 | `current_held` | i32 | 分配后 worker 持有数（含本批次） |
 | `max_held` | i32 | 分配后 worker 工种的 `max_held_batches` |
+
+### ProcessBatchCount 字段
+
+`WorkerPoolCountsOut.counts` 单条结构（**2026-09-30 新增**）。
+对应后端 `src/modules/prod/worker_pool/dto.rs::ProcessBatchCount`。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `process_id` | string (i64) | 工序雪花 ID |
+| `process_code` | string | 工序代号 |
+| `process_name` | string | 工序名 |
+| `count` | i64 | 该工序候选批次数（cross-shelf 聚合；`t_part_batch` 中 `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL`） |
+
+### WorkerPoolCountsOut 字段
+
+**2026-09-30 新增**：admin 视角的全工序候选批次聚合顶层响应。
+对应后端 `src/modules/prod/worker_pool/dto.rs::WorkerPoolCountsOut`。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `counts` | [ProcessBatchCount](#processbatchcount-字段) | 各工序候选批次数（仅含 count > 0 的工序；按 `process_id ASC` 稳定排序） |
+| `total` | i64 | 候选批次总数（`counts.iter().map(|c| c.count).sum()`；与 `counts[].count` 求和对齐） |
 
 ---
 

@@ -111,6 +111,10 @@ pub trait WorkerPoolRepoTrait: Send {
         worker_id: i64,
     ) -> Result<Vec<super::model::HeldBatchItem>, sqlx::Error>;
 
+    /// 全工序候选批次聚合计数（2026-09-30 新增）。
+    /// 单 SQL GROUP BY next_process_id，service 层二次查 process 元数据。
+    async fn group_count_by_process_all_shelves(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error>;
+
     // ── worker 域 helper（2）──
     /// 单条查 worker（`WorkerRepo::get_by_id`）。
     async fn worker_get_by_id(
@@ -156,6 +160,10 @@ pub trait WorkerPoolRepoTrait: Send {
         process_id: i64,
         include_deleted: bool,
     ) -> Result<Option<TProcess>, sqlx::Error>;
+
+    /// 批量查 process（`ProcessRepo::list_by_ids`）。
+    /// `pool_counts_all_shelves` 二次取 process_code/name 元数据用。
+    async fn process_list_by_ids(&mut self, ids: &[i64]) -> Result<Vec<TProcess>, sqlx::Error>;
 
     // ── process_chain 域 helper（2）──
     /// 解析 chain 上 process 对应的 step_id（`ProcessChainRepo::resolve_step_id_by_process`）。
@@ -325,6 +333,10 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         WorkerPoolRepo::list_held_by_worker_with_part(&mut **self, worker_id).await
     }
 
+    async fn group_count_by_process_all_shelves(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error> {
+        WorkerPoolRepo::group_count_by_process_all_shelves(&mut **self).await
+    }
+
     // ── worker helper ──
     async fn worker_get_by_id(
         &mut self,
@@ -404,6 +416,10 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
             include_deleted,
         )
         .await
+    }
+
+    async fn process_list_by_ids(&mut self, ids: &[i64]) -> Result<Vec<TProcess>, sqlx::Error> {
+        crate::modules::prod::process::repo::ProcessRepo::list_by_ids(&mut **self, ids).await
     }
 
     // ── process_chain helper ──

@@ -512,4 +512,46 @@ impl WorkerPoolRepo {
             })
             .collect())
     }
+
+    /// 全工序候选批次聚合计数（2026-09-30 新增）。
+    ///
+    /// 单 SQL `GROUP BY next_process_id`：跨所有生产货架聚合 `t_part_batch` 中
+    /// `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL`
+    /// 的批次数（按 next_process_id 维度统计）。
+    ///
+    /// 业务口径与 `list_candidates_by_process_all_shelves`（per-process 候选池详情）
+    /// 完全一致：两者都限定 `status + location + deleted_at` 三态，唯一区别是本方法
+    /// 只 GROUP BY 计次，不返回批次明细。复用了 PR-3 批次 step 化后
+    /// `next_process_id` 改走 `t_process_chain_step.process_id` JOIN 取值。
+    ///
+    /// 返回 `Vec<(i64, i64)>` 形态 `(process_id, count)`：service 层二次调
+    /// `ProcessRepo::list_by_ids` 取 process_code / process_name 元数据后组装
+    /// `WorkerPoolCountsOut`。repo 不做 process 元数据 JOIN 是有意为之——
+    /// 与「本币 count GROUP BY」SQL 隔离，service 层负责 DTO 拼装，与
+    /// `pool_by_process` service 路径同形态（先 GROUP BY 再二次查元数据）。
+    ///
+    /// 索引命中：`ix_t_part_batch_location`（`location`）+ `pb.deleted_at` 过滤；
+    /// JOIN t_process_chain_step 走 `t_process_chain_step.id` 主键
+    /// （`current_process_step_id` 外键约束保证）。本端点为 dashboard 快照型
+    /// 轻量查询（前端 WorkerQueueBoard tab 标题徽标），无分页。
+    pub async fn group_count_by_process_all_shelves<'e, E: PgExecutor<'e>>(
+        executor: E,
+    ) -> Result<Vec<(i64, i64)>, sqlx::Error> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            r#"
+            SELECT s.process_id, COUNT(*) AS "count!"
+            FROM t_part_batch pb
+            JOIN t_process_chain_step s ON s.id = pb.current_process_step_id
+            WHERE pb.status = 'IN_PROCESS'
+              AND pb.location = 'PRODUCTION_SHELF'
+              AND pb.deleted_at IS NULL
+              AND s.deleted_at IS NULL
+            GROUP BY s.process_id
+            ORDER BY s.process_id ASC
+            "#,
+        )
+        .fetch_all(executor)
+        .await?;
+        Ok(rows)
+    }
 }

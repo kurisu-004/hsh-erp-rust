@@ -5,6 +5,9 @@
 //! ## 端点
 //! - `GET  /api/v2/worker-pool/state?worker_id=&shelf_id=`  —— worker 当前持有 +
 //!   池候选数（按工序分组）。无 role guard（worker 自查 + admin 监控共用）。
+//! - `GET  /api/v2/worker-pool/counts`               —— **2026-09-30 新增**：
+//!   全工序候选批次聚合计数（GROUP BY process_id），跨所有货架，admin 视图。
+//!   Manager+Clerk+Inspector 可调；service 内守卫。响应 `WorkerPoolCountsOut`。
 //! - `GET  /api/v2/worker-pool/{process_id}`        —— 按工序返回候选池详情
 //!   （process 元数据 + workers + work_types.max_held + 跨货架候选批次）。
 //!   Manager+Clerk+Inspector 可调；service 内守卫。
@@ -38,7 +41,10 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use super::dto::{AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AutoAllocateRequest};
+use super::dto::{
+    AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AutoAllocateRequest,
+    WorkerPoolCountsOut,
+};
 use super::model::RefillResult;
 use super::model::WorkerPoolState;
 use super::service::WorkerPoolService;
@@ -146,6 +152,26 @@ pub async fn pool_by_process(
     let mut conn = state.pool.acquire().await?;
     let detail = WorkerPoolService::pool_by_process(&mut conn, &current, process_id).await?;
     Ok(Json(R::ok(detail)))
+}
+
+/// GET /api/v2/worker-pool/counts
+///
+/// 2026-09-30 新增：admin 视角的全工序候选批次聚合（dashboard 快照型查询）。
+/// 返回 `WorkerPoolCountsOut { counts: Vec<ProcessBatchCount>, total: i64 }`，
+/// 跨所有生产货架（不指定 shelf_id，按现有 per-process 端点惯例）。
+///
+/// Manager + Clerk + Inspector（admin 视角但不止 Manager）；service 内守卫。
+///
+/// 不发 WS 广播（counts 是 dashboard 快照型查询，无业务流转）。
+///
+/// 读端点（③ 形态）：`pool.acquire()` 不开事务。
+pub async fn pool_counts(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+) -> Result<Json<R<WorkerPoolCountsOut>>, AppError> {
+    let mut conn = state.pool.acquire().await?;
+    let out = WorkerPoolService::pool_counts_all_shelves(&mut conn, &current).await?;
+    Ok(Json(R::ok(out)))
 }
 
 /// POST /api/v2/admin/worker-pool/auto-allocate

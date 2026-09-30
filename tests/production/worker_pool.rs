@@ -1933,3 +1933,192 @@ async fn admin_assign_process_id_mismatch() {
     .expect("query after ch");
     assert_eq!(after_ch, Some(prod_shelf));
 }
+
+// ===========================================================================
+//  GET /api/v2/prod/worker-pool/counts —— 全工序候选批次聚合计数
+//  （2026-09-30 新增，db78bba4 spec）
+//
+//  覆盖场景：
+//   21. pool_counts_returns_aggregate_by_process   happy path: 3 个 process,
+//       各塞不同数量的 IN_PROCESS+PRODUCTION_SHELF 批次，断言 counts[*].count
+//       总和与 per-process 都对得上，total = sum(counts[].count)
+// ===========================================================================
+
+/// 场景 21: pool_counts 端点 happy path —— 返回全工序聚合。
+///
+/// - 3 个 process：A / B / C 各塞 1 / 2 / 3 批 IN_PROCESS+PRODUCTION_SHELF 批次
+/// - 共 6 批；期望 counts[*].count = {A:1, B:2, C:3}，total = 6
+/// - process_code / process_name 元数据透传
+/// - counts 按 process_id ASC 稳定排序（repo GROUP BY ORDER BY 保证）
+#[tokio::test]
+async fn pool_counts_returns_aggregate_by_process() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-COUNTS").await;
+
+    // 3 个 process（互不映射，专注 process 维度聚合）
+    let proc_a = seed_process(&pool, "PROC-CA", "工序A").await;
+    let proc_b = seed_process(&pool, "PROC-CB", "工序B").await;
+    let proc_c = seed_process(&pool, "PROC-CC", "工序C").await;
+
+    let prod_a = insert_shelf(&pool, "PROD-CA", "PROD-CA", "PRODUCTION").await;
+    let prod_b = insert_shelf(&pool, "PROD-CB", "PROD-CB", "PRODUCTION").await;
+    let prod_c = insert_shelf(&pool, "PROD-CC", "PROD-CC", "PRODUCTION").await;
+
+    // A: 1 件，B: 2 件，C: 3 件（每件用不同 serial_no 避免 pkey 冲突）
+    insert_pool_part(&pool, customer, "PA-001", prod_a, proc_a, 1).await;
+    insert_pool_part(&pool, customer, "PB-001", prod_b, proc_b, 1).await;
+    insert_pool_part(&pool, customer, "PB-002", prod_b, proc_b, 1).await;
+    insert_pool_part(&pool, customer, "PC-001", prod_c, proc_c, 1).await;
+    insert_pool_part(&pool, customer, "PC-002", prod_c, proc_c, 1).await;
+    insert_pool_part(&pool, customer, "PC-003", prod_c, proc_c, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin_counts").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            "/prod/worker-pool/counts",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "pool_counts happy: {env}");
+    assert_eq!(env["code"], 0, "code 应 0: {env}");
+
+    let counts = env["data"]["counts"].as_array().expect("counts array");
+    assert_eq!(
+        counts.len(),
+        3,
+        "应 3 个 process（含候选批次的 process）: {env}"
+    );
+    // counts 按 process_id ASC 排序（repo GROUP BY ORDER BY 保证）
+    assert_eq!(
+        counts[0]["process_id"],
+        proc_a.to_string(),
+        "counts[0] 应为 proc_a: {env}"
+    );
+    assert_eq!(counts[0]["process_code"], "PROC-CA");
+    assert_eq!(counts[0]["process_name"], "工序A");
+    assert_eq!(counts[0]["count"], 1, "A 应 1 件: {env}");
+
+    assert_eq!(
+        counts[1]["process_id"],
+        proc_b.to_string(),
+        "counts[1] 应为 proc_b: {env}"
+    );
+    assert_eq!(counts[1]["process_code"], "PROC-CB");
+    assert_eq!(counts[1]["count"], 2, "B 应 2 件: {env}");
+
+    assert_eq!(
+        counts[2]["process_id"],
+        proc_c.to_string(),
+        "counts[2] 应为 proc_c: {env}"
+    );
+    assert_eq!(counts[2]["process_code"], "PROC-CC");
+    assert_eq!(counts[2]["count"], 3, "C 应 3 件: {env}");
+
+    // total = sum(counts[].count) = 1 + 2 + 3 = 6
+    assert_eq!(env["data"]["total"], 6, "total 应 6: {env}");
+}
+
+/// pool_counts：含 0 候选批次的 process 不出现在 counts 中（GROUP BY 不输出 0 行）。
+#[tokio::test]
+async fn pool_counts_excludes_zero_count_processes() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-COUNTS-EMPTY").await;
+
+    // proc_empty：只有 process 定义，无任何 pool 批次
+    let _proc_empty = seed_process(&pool, "PROC-EMPTY", "空工序").await;
+    // proc_one：1 件候选批次
+    let proc_one = seed_process(&pool, "PROC-ONE", "单件工序").await;
+    let prod_one = insert_shelf(&pool, "PROD-ONE", "PROD-ONE", "PRODUCTION").await;
+    insert_pool_part(&pool, customer, "P-ONE-001", prod_one, proc_one, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin_counts_empty").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            "/prod/worker-pool/counts",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "pool_counts empty: {env}");
+    let counts = env["data"]["counts"].as_array().expect("counts array");
+    assert_eq!(
+        counts.len(),
+        1,
+        "应仅 1 个 process（含候选批次的 proc_one）: {env}"
+    );
+    assert_eq!(counts[0]["process_id"], proc_one.to_string());
+    assert_eq!(counts[0]["count"], 1);
+    assert_eq!(env["data"]["total"], 1);
+}
+
+/// pool_counts：跨多个货架聚合（同 process 在多个 shelf 上都有候选）。
+#[tokio::test]
+async fn pool_counts_aggregates_across_shelves() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-COUNTS-MULTI").await;
+
+    let proc = seed_process(&pool, "PROC-MULTI", "跨货架工序").await;
+    // 2 个货架各自映射同一 process
+    let shelf_x = insert_shelf(&pool, "PROD-MX", "PROD-MX", "PRODUCTION").await;
+    let shelf_y = insert_shelf(&pool, "PROD-MY", "PROD-MY", "PRODUCTION").await;
+    link_shelf_to_process(&pool, shelf_x, proc).await;
+    link_shelf_to_process(&pool, shelf_y, proc).await;
+
+    // shelf_x: 2 件，shelf_y: 3 件 → 该 process 应聚合为 5 件
+    insert_pool_part(&pool, customer, "MX-001", shelf_x, proc, 1).await;
+    insert_pool_part(&pool, customer, "MX-002", shelf_x, proc, 1).await;
+    insert_pool_part(&pool, customer, "MY-001", shelf_y, proc, 1).await;
+    insert_pool_part(&pool, customer, "MY-002", shelf_y, proc, 1).await;
+    insert_pool_part(&pool, customer, "MY-003", shelf_y, proc, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin_counts_multi").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            "/prod/worker-pool/counts",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "pool_counts multi: {env}");
+    let counts = env["data"]["counts"].as_array().expect("counts array");
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0]["process_id"], proc.to_string());
+    assert_eq!(counts[0]["count"], 5, "应聚合跨货架 2 + 3 = 5 件: {env}");
+    assert_eq!(env["data"]["total"], 5);
+}
+
+/// pool_counts：ShelfAccount 角色 → 40300 FORBIDDEN（service 守卫：Manager/Clerk/Inspector only）。
+#[tokio::test]
+async fn pool_counts_forbidden_for_shelf_account() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let proc = seed_process(&pool, "PROC-FB-C", "工序FB-C").await;
+    let _wt = insert_work_type(&pool, "WT-FB-C", "工种FB-C", Some(3)).await;
+    link_work_type_to_process(&pool, _wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-FB-C", "PROD-FB-C", "PRODUCTION").await;
+
+    // ShelfAccount 绑一个 shelf（scope 必须给才能登录；调用端点时仍会被 service 拒绝）
+    let (app, token, _pool) =
+        login_shelf_account(pool.clone(), "shelf_user_counts", &[prod_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "GET",
+            "/prod/worker-pool/counts",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
+    assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
+}

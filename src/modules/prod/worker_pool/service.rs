@@ -42,7 +42,10 @@ use crate::modules::part::service::PartService;
 use crate::modules::prod::worker_pool::repo::WorkerPoolRepoTrait;
 use crate::shared::error::{AppError, code};
 
-use super::dto::{AdminAssignRequest, AdminRemoveRequest, AutoAllocateMode, AutoAllocateRequest};
+use super::dto::{
+    AdminAssignRequest, AdminRemoveRequest, AutoAllocateMode, AutoAllocateRequest,
+    ProcessBatchCount, WorkerPoolCountsOut,
+};
 use super::model::{ProcessPoolCount, RefillResult, TakenItem, WorkerPoolState};
 use super::vo::{
     AssignResult, AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkTypeMaxHeld,
@@ -455,6 +458,69 @@ impl WorkerPoolService {
             total,
             items,
         })
+    }
+
+    /// `GET /api/v2/prod/worker-pool/counts` 业务逻辑。
+    ///
+    /// 2026-09-30 新增：admin 视角的全工序候选批次聚合（dashboard 快照型查询）。
+    /// 流程：
+    /// 1. 角色守卫：`Manager + Clerk + Inspector`（与 `pool_by_process` 同集
+    ///    —— admin 视角但不止 Manager；service 内守卫）；
+    /// 2. 调 `group_count_by_process_all_shelves` 单 SQL GROUP BY 取
+    ///    `(process_id, count)`；
+    /// 3. 二次调 `process_list_by_ids` 取 process_code / process_name 元数据；
+    /// 4. 装 `WorkerPoolCountsOut` 返回（total = `counts.iter().map(|c| c.count).sum()`）。
+    ///
+    /// 全部读操作，单事务只读，无 WS 广播（counts 是 dashboard 快照型查询，
+    /// 无业务流转，2026-09-30 spec 明确不发 WS）。process_id 顺序沿用 repo
+    /// GROUP BY `ORDER BY s.process_id ASC`（稳定排序，前端按 id 稳定展示）。
+    pub async fn pool_counts_all_shelves(
+        conn: &mut PgConnection,
+        current: &CurrentUser,
+    ) -> Result<WorkerPoolCountsOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+
+        // 1. 单 SQL GROUP BY 取 (process_id, count)
+        let counts_raw: Vec<(i64, i64)> = (&mut *conn).group_count_by_process_all_shelves().await?;
+
+        if counts_raw.is_empty() {
+            return Ok(WorkerPoolCountsOut {
+                counts: vec![],
+                total: 0,
+            });
+        }
+
+        // 2. 二次取 process 元数据
+        let process_ids: Vec<i64> = counts_raw.iter().map(|(pid, _)| *pid).collect();
+        let processes = (&mut *conn).process_list_by_ids(&process_ids).await?;
+        // process_id → (code, name) 索引（list_by_ids 已 ORDER BY id ASC）
+        let mut meta: std::collections::HashMap<i64, (String, String)> = processes
+            .into_iter()
+            .map(|p| (p.id, (p.code, p.name)))
+            .collect();
+
+        // 3. 装 ProcessBatchCount（保留 repo GROUP BY 的 process_id ASC 顺序）
+        let mut total = 0i64;
+        let counts: Vec<ProcessBatchCount> = counts_raw
+            .into_iter()
+            .map(|(pid, count)| {
+                total += count;
+                let (code, name) = meta.remove(&pid).unwrap_or_else(|| {
+                    // 防御：repo GROUP BY 返回的 process_id 在 t_process 已软删
+                    // → 退化为空串 + 显式 id（前端「process 已删除」占位）。
+                    // 业务流不会撞（候选批次 step_id 必指向 active step）。
+                    (String::new(), format!("(deleted#{pid})"))
+                });
+                ProcessBatchCount {
+                    process_id: pid,
+                    process_code: code,
+                    process_name: name,
+                    count,
+                }
+            })
+            .collect();
+
+        Ok(WorkerPoolCountsOut { counts, total })
     }
 
     /// `POST /api/v2/admin/worker-pool/auto-allocate` 业务逻辑。

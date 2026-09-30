@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::types::{deserialize_i64, deserialize_i64_opt};
+use crate::shared::types::{deserialize_i64, deserialize_i64_opt, serialize_i64};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -80,4 +80,37 @@ pub struct AdminAssignRequest {
     #[serde(default)]
     #[serde(deserialize_with = "deserialize_i64_opt")]
     pub process_id: Option<i64>,
+}
+
+/// `GET /api/v2/prod/worker-pool/counts` —— 单工序候选批次聚合计数条目。
+///
+/// 2026-09-30 新增：跨所有生产货架聚合 `t_part_batch` 中
+/// `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL`
+/// 的批次数（按 `next_process_id` 维度 GROUP BY）。前端
+/// `WorkerQueueBoard.vue` 用 `counts[].count` 给各 tab 标题加 `(N)` 徽标，
+/// 不再依赖每 tab 的 worker-pool 详情是否已加载。
+///
+/// i64 主键走 `serialize_i64` 序列化为字符串（雪花 ID 全链路 string 约定）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessBatchCount {
+    #[serde(serialize_with = "serialize_i64")]
+    pub process_id: i64,
+    pub process_code: String,
+    pub process_name: String,
+    /// 该工序候选批次数（cross-shelf 聚合）
+    pub count: i64,
+}
+
+/// `GET /api/v2/prod/worker-pool/counts` 顶层响应。
+///
+/// 2026-09-30 新增：admin 视角的全工序候选批次聚合（dashboard 快照型查询）。
+/// 仅做 `GROUP BY next_process_id` 单 SQL + service 层二次取 process 元数据，
+/// 不分页、不带 WS 广播（与 `GET /state` 同形态的轻量端点）。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerPoolCountsOut {
+    pub counts: Vec<ProcessBatchCount>,
+    /// `counts.iter().map(|c| c.count).sum()`，前端可与 `counts.len()` 区分：
+    /// - `total`：候选批次总数（worker 视角有意义）
+    /// - `counts.len()`：含候选批次的工序数（dashboard tab 数量）
+    pub total: i64,
 }
