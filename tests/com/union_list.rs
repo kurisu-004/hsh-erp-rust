@@ -93,6 +93,66 @@ async fn insert_part(
     id
 }
 
+/// 直插一个 `t_part` 行，自定义 `planned_delivery_date`（2026-09-30 新增，
+/// 用于 `planned_delivery_date_from/to` 过滤测试）。
+async fn insert_part_with_planned_date(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    planned_delivery_date: chrono::NaiveDate,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_test_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, NULL, $2, 'D-001', $3, 'PENDING', $2, $4, $5, 1, 0, $6, $6)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(customer_id)
+    .bind(planned_delivery_date) // request_date
+    .bind(planned_delivery_date) // planned_delivery_date
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert part with planned date");
+    id
+}
+
+/// 直插一个 `t_assembly` 行，自定义 `planned_delivery_date`（2026-09-30 新增，
+/// 用于 `planned_delivery_date_from/to` 过滤测试）。
+async fn insert_assembly_with_planned_date(
+    pool: &PgPool,
+    drawing_no: &str,
+    name: &str,
+    customer_id: i64,
+    planned_delivery_date: chrono::NaiveDate,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_test_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
+         request_date, planned_delivery_date, status, quantity, unit_price, total_price, \
+         version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, '', $4, $5, $6, 'PENDING', 1, 0, 0, 0, $7, NULL, $7, NULL)",
+    )
+    .bind(id)
+    .bind(drawing_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(planned_delivery_date) // request_date
+    .bind(planned_delivery_date) // planned_delivery_date
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert assembly with planned date");
+    id
+}
+
 /// 直插一个 `t_part` 行（带非空 assembly_id，标记为「装配体的子件」）。
 async fn insert_part_under_assembly(
     pool: &PgPool,
@@ -516,4 +576,161 @@ async fn union_list_row_type_absent_is_all_default() {
         .collect();
     assert!(row_types.remove("PART"));
     assert!(row_types.remove("ASSEMBLY"));
+}
+
+/// 2026-09-30 新增：`planned_delivery_date_from/to` 日期窗口过滤回归。
+///
+/// 隐藏 bug 修后 —— 前端 dashboard UpcomingDeliveryListDrawer 早已传这俩
+/// 参数，但本端点之前未消费，参数被静默丢弃；本测试断言日期参数生效：
+///
+/// 排布（以 today 为基准）：
+/// - 3 件 part + 1 件 asm planned_delivery_date = today
+/// - 2 件 part + 1 件 asm planned_delivery_date = today + 5d
+/// - 1 件 part     planned_delivery_date = today + 10d
+///
+/// 三组断言：
+/// 1. `from=today&to=today` → 仅命中 today 4 条
+/// 2. `from=today+3d&to=today+7d` → 仅命中 today+5d 3 条
+/// 3. `from=today&to=today+10d`（含两端）→ 全 8 条
+///
+/// 同时验证非法日期格式 → 40001 VALIDATION_ERROR。
+#[tokio::test]
+async fn list_union_items_filters_by_planned_delivery_date() {
+    use chrono::{Duration, NaiveDate};
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+
+    // today: 3 part + 1 asm
+    let mut today_part_ids: Vec<i64> = Vec::with_capacity(3);
+    for i in 0..3 {
+        let id =
+            insert_part_with_planned_date(&pool, &format!("TODAY-P{i}"), fx.customer_l2_id, today)
+                .await;
+        today_part_ids.push(id);
+    }
+    let today_asm_id =
+        insert_assembly_with_planned_date(&pool, "TODAY-A", "TODAY-A", fx.customer_l2_id, today)
+            .await;
+
+    // today+5d: 2 part + 1 asm
+    let plus5 = today + Duration::days(5);
+    let mut plus5_part_ids: Vec<i64> = Vec::with_capacity(2);
+    for i in 0..2 {
+        let id =
+            insert_part_with_planned_date(&pool, &format!("PLUS5-P{i}"), fx.customer_l2_id, plus5)
+                .await;
+        plus5_part_ids.push(id);
+    }
+    let plus5_asm_id =
+        insert_assembly_with_planned_date(&pool, "PLUS5-A", "PLUS5-A", fx.customer_l2_id, plus5)
+            .await;
+
+    // today+10d: 1 part
+    let plus10 = today + Duration::days(10);
+    let _plus10_part_id =
+        insert_part_with_planned_date(&pool, "PLUS10-P", fx.customer_l2_id, plus10).await;
+
+    // -------- 场景 1：from=today, to=today → 4 条（3 part + 1 asm） --------
+    let url1 = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200\
+         &planned_delivery_date_from={}&planned_delivery_date_to={}",
+        fx.customer_l2_id, today, today
+    );
+    let (s, env) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request("GET", &url1, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "[from=today to=today]: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 4,
+        "[today only] 应仅命中 4 条（3 part + 1 asm）: {env}"
+    );
+    let items1: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    let mut expected1: Vec<i64> = today_part_ids.clone();
+    expected1.push(today_asm_id);
+    let mut got1 = items1.clone();
+    got1.sort();
+    let mut exp1 = expected1.clone();
+    exp1.sort();
+    assert_eq!(got1, exp1, "[today only] ids 集合应一致");
+
+    // -------- 场景 2：from=today+3d, to=today+7d → 3 条（2 part + 1 asm） --------
+    let url2 = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200\
+         &planned_delivery_date_from={}&planned_delivery_date_to={}",
+        fx.customer_l2_id, plus5, plus5
+    );
+    let (s, env) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request("GET", &url2, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "[from=+5 to=+5]: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 3,
+        "[+5 only] 应仅命中 3 条（2 part + 1 asm）: {env}"
+    );
+    let items2: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    let mut expected2: Vec<i64> = plus5_part_ids.clone();
+    expected2.push(plus5_asm_id);
+    let mut got2 = items2.clone();
+    got2.sort();
+    let mut exp2 = expected2.clone();
+    exp2.sort();
+    assert_eq!(got2, exp2, "[+5 only] ids 集合应一致");
+
+    // -------- 场景 3：from=today, to=today+10d（两端含）→ 8 条 --------
+    let url3 = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200\
+         &planned_delivery_date_from={}&planned_delivery_date_to={}",
+        fx.customer_l2_id, today, plus10
+    );
+    let (s, env) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request("GET", &url3, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "[from=today to=+10]: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 8,
+        "[today..+10] 应命中全部 8 条: {env}"
+    );
+
+    // -------- 场景 4：非法 from 格式 → 40001 VALIDATION_ERROR --------
+    let url4 = format!(
+        "/com/union-list?customer_id={}&row_type=ALL\
+         &planned_delivery_date_from=not-a-date",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url4, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "非法日期 → 422: {env}");
+    assert_eq!(env["code"], 40001, "VALIDATION_ERROR: {env}");
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("planned_delivery_date_from"),
+        "错误消息应包含字段名: {env}"
+    );
+
+    // 静默 NaiveDate 引用避免 unused 警告
+    let _ = NaiveDate::from_ymd_opt(2026, 9, 30);
 }

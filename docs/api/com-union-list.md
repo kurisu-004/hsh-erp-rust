@@ -46,6 +46,8 @@ GET /api/v2/com/union-list
 | `keyword` | `string` | 否 | — | 模糊匹配（name / drawing_no / serial_no 三列 ILIKE OR） |
 | `locations` | `string` | 否 | — | 逗号分隔位置白名单（OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF / OUTSOURCE_COMPANY）。**PART / ALL 模式生效**，ASSEMBLY 模式忽略（`t_assembly` 无 batch 派生字段） |
 | `holder_ids` | `string` | 否 | — | 逗号分隔雪花 ID。**PART / ALL 模式生效**；ASSEMBLY 模式忽略 |
+| `planned_delivery_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口下界 `planned_delivery_date >= $from`。**PART / ALL / ASSEMBLY 三模式全部生效**。非法格式 → `40001 VALIDATION_ERROR` |
+| `planned_delivery_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口上界 `planned_delivery_date <= $to`。**PART / ALL / ASSEMBLY 三模式全部生效**。非法格式 → `40001 VALIDATION_ERROR`。任一端缺失 → 对应 NULL 短路 |
 | `sort_by` | `string` | 否 | `CREATED_AT` | 排序键白名单：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `DRAWING_NO` / `NAME`。**注意**：`SERIAL_NO` 仅 `t_part` 独有 → ALL 模式降级 `CREATED_AT` |
 | `sort_dir` | `string` | 否 | `DESC` | `"ASC"` / `"DESC"` |
 | `limit` | `i64` | 否 | `50` | `[1, 200]` |
@@ -288,11 +290,49 @@ curl -G "http://localhost:3000/api/v2/com/union-list" \
 }
 ```
 
+### 日期窗口过滤（2026-09-30 新增）
+
+修前端 dashboard UpcomingDeliveryListDrawer 隐藏 bug —— 该 Drawer 早传 `planned_delivery_date_from/to`
+但本端点 DTO 之前无对应字段，参数被静默丢弃。本切片把两字段正式纳入 DTO + service
+parse（`YYYY-MM-DD` → `NaiveDate`，非法 → 40001）+ repo SQL 段内 `>=`/`<=` 过滤。
+
+```bash
+curl -G "http://localhost:3000/api/v2/com/union-list" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "row_type=ALL" \
+  --data-urlencode "planned_delivery_date_from=2026-09-30" \
+  --data-urlencode "planned_delivery_date_to=2026-10-07"
+```
+
+响应（仅返回 `planned_delivery_date ∈ [2026-09-30, 2026-10-07]` 的行）：
+```json
+{
+  "code": 0,
+  "data": {
+    "items": [
+      {"id": "1111", "row_type": "PART", "planned_delivery_date": "2026-10-01", ...},
+      {"id": "2222", "row_type": "ASSEMBLY", "planned_delivery_date": "2026-10-05", "has_children": true, ...}
+    ],
+    "total": 2,
+    "limit": 50,
+    "offset": 0
+  }
+}
+```
+
+非法日期格式（HTTP 422）：
+```json
+{
+  "code": 40001,
+  "message": "planned_delivery_date_from 非法: not-a-date（必须是 YYYY-MM-DD: ...）"
+}
+```
+
 ## 引用
 
 - 前端对应：`src/api/com/unionList.ts`（前端子模块另开 PR 接入；本端点路由
   自身即可工作）
-- 集成测试：`tests/com/union_list.rs`（7 用例覆盖 PART / ASSEMBLY / ALL /
-  SERIAL_NO 降级 / 非法值 / 缺省默认值 / deep offset 分页）
+- 集成测试：`tests/com/union_list.rs`（8 用例覆盖 PART / ASSEMBLY / ALL /
+  SERIAL_NO 降级 / 非法 row_type / 缺省默认值 / deep offset 分页 / **日期窗口过滤**）
 - API 设计文档：`docs/api/com-union-list.md`（本文件）
 - 实现参考：`docs/plans/com-get-part-union-all-t-assembly-t-par-graceful-mitten.md`
