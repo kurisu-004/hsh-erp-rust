@@ -4,10 +4,11 @@
 //! （`Deserialize`）。出参结构见 [`super::vo`]。
 //!
 //! ## 反序列化兜底
-//! - `limit` / `offset` 走本文件私有 `deserialize_i64_opt_lenient` —— 前端可能发数字
-//!   也可能发字符串，统一按字符串 `parse` 成 `i64`；**空串 / 全空白按缺省（None）**
-//!   处理（2026-10-01 review 第 1 轮 E 项），与 `has_cnc_program` 的宽容度对齐，
-//!   避免 `?limit=` 落到 axum `Query` 层 400 纯文本。真正的解析逻辑仍复用
+//! - `limit` / `offset` 走本文件私有 `deserialize_i64_opt_lenient` —— URL query 没有
+//!   类型之分，数字一律以字符串到达，统一按字符串 `parse` 成 `i64`（**带引号的 `"50"`
+//!   属非法字面量 → 400**）；**空串 / 全空白 / 数字两侧空白按缺省（None）** 处理
+//!   （2026-10-01 review 第 2 轮确认口径并写进文档），与 `has_cnc_program` 的宽容度
+//!   对齐，避免 `?limit=` 落到 axum `Query` 层 400 纯文本。真正的解析逻辑仍复用
 //!   `crate::shared::types::deserialize_i64`，两处 parse 语义不会漂移。
 //! - `has_cnc_program` 走本文件私有 `deserialize_bool_opt` —— query string 里只有
 //!   字面量 `true` / `false`，且前端可能发 `has_cnc_program=`（空串）表示

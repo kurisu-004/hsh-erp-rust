@@ -1191,11 +1191,13 @@ async fn soft_delete_filters_exclude_rows() {
 /// 修复前：`?limit=` 经 `deserialize_i64_opt` 得到 `Some("")` → `"".parse::<i64>()`
 /// 失败 → axum `Query` extractor 拒成 HTTP 400 **纯文本**（不走 `R` 包络），
 /// 与 `?has_cnc_program=` 被兜成 `None` 的宽容度不一致。修复后两者对齐。
+/// 2026-10-01 review 第 2 轮补钉「数字两侧空白被 trim」这一条放宽口径
+/// （`?limit=%2012%20` → 12）。
 ///
-/// 注：`?limit=abc`（真正无法解析）仍 → 400，此处不断言 —— `test_support::send`
-/// 强制把响应体当 JSON 解析，axum 的 `QueryRejection` 是纯文本会 panic；
-/// 该行为已在 `docs/api/production/pending-programming.md` 的「关于 query 解析失败」
-/// 段记录。
+/// 注：`?limit=abc`（真正无法解析）与带引号的 `?limit="50"` 仍 → 400，此处不断言
+/// —— `test_support::send` 强制把响应体当 JSON 解析，axum 的 `QueryRejection` 是
+/// 纯文本会 panic；该行为已在 `docs/api/production/pending-programming.md` 的
+/// 「`limit` / `offset` 的取值容错」脚注 + 「关于 query 解析失败」段记录。
 #[tokio::test]
 async fn limit_offset_empty_string_falls_back_to_defaults() {
     let (pool, app, token, _fx, cfx) = bootstrap().await;
@@ -1226,6 +1228,12 @@ async fn limit_offset_empty_string_falls_back_to_defaults() {
     let env = get_pending(&app, &token, "limit=%20%20&offset=%20").await;
     assert_eq!(env["data"]["limit"], 50, "全空白 limit → 缺省 50: {env}");
     assert_eq!(env["data"]["offset"], 0, "全空白 offset → 缺省 0: {env}");
+
+    // 数字两侧空白被 trim（2026-10-01 review 第 2 轮口径钉住）：`" 12 "` → 12，
+    // 而全空白的 offset 仍走缺省 0
+    let env = get_pending(&app, &token, "limit=%2012%20&offset=%20%20").await;
+    assert_eq!(env["data"]["limit"], 12, "数字两侧空白被 trim → 12: {env}");
+    assert_eq!(env["data"]["offset"], 0, "offset 全空白 → 缺省 0: {env}");
 
     // 正常值仍生效（确认兜底没把真值也吃掉）
     let env = get_pending(&app, &token, "limit=2&offset=1").await;

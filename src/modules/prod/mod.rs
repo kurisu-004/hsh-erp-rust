@@ -56,6 +56,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/pool", worker_pool::router())
         // 2026-09-29 新增：prod::batch（PENDING 批次 + 下发）
         .nest("/batches", batch::router())
-        // 2026-10-01 新增：prod::programming（待编程一览，三规则并集口径）
+        // 2026-10-01 新增：prod::programming（待编程一览，part 状态闸门 + 三规则并集口径）
         .nest("/programming", programming::router())
 }

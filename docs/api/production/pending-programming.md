@@ -48,8 +48,14 @@ Query：
 | `serial_no` | string? | ✗ | 工单序列号**精确**匹配（`p.serial_no = $n`）；trim 后为空按缺省处理 |
 | `sort_by` | string? | ✗ | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它值**退化**为 `PLANNED_DELIVERY_DATE`（不报错，大小写敏感） |
 | `sort_dir` | string? | ✗ | `ASC` / `DESC`（缺省 `ASC`；非 `DESC` 一律按 `ASC` 处理，大小写不敏感） |
-| `limit` | int? | ✗ | 缺省 50；service 层 `clamp(1, 500)`。允许字符串形态（`"50"`）；**空串 / 全空白按缺省处理** |
-| `offset` | int? | ✗ | 缺省 0；service 层 `max(0)`。允许字符串形态；**空串 / 全空白按缺省处理** |
+| `limit` | int? | ✗ | 缺省 50；service 层 `clamp(1, 500)`。值以 URL query 形态到达（`?limit=50`），**带引号的 `"50"` 不接受**（400）；**空串 / 全空白按缺省处理** |
+| `offset` | int? | ✗ | 缺省 0；service 层 `max(0)`。值以 URL query 形态到达（`?offset=0`），带引号的 `"0"` 不接受（400）；**空串 / 全空白按缺省处理** |
+
+> **`limit` / `offset` 的取值容错**（2026-10-01）：① query string 无类型之分，
+> 数字一律以字符串到达，统一 `parse` 成 `i64` —— 带引号的 `"50"` 属非法字面量 → 400；
+> ② **数字两侧的空白会被 trim**（`?limit=%2012%20` → `12`）；
+> ③ 空串 / 全空白按**缺省**处理（`?limit=&offset=` → `50` / `0`），与
+> `?has_cnc_program=` 的宽容度一致；④ 非数字（`abc`）/ 小数（`50.5`）/ 溢出仍 → 400。
 
 Response 200 `data`：[`ProgrammingListOut`](#programminglistout-字段)
 
@@ -142,7 +148,6 @@ LIMIT $limit OFFSET $offset
 （返回给前端的 `has_cnc_program` 值）与 WHERE 的三态过滤复用 —— 改 `kind` / 软删
 条件时只需改一处，不存在「返回值与过滤口径漂移」的可能。
 
-
 ---
 
 ## 业务场景
@@ -190,9 +195,10 @@ LIMIT $limit OFFSET $offset
 ```
 
 > `total` / `limit` / `offset` 是**分页计数类 i64，序列化为 JSON number**（非 string）——
-> 它们远小于 `2^53` 无 JS 精度风险，形态与
-> [`../parts/index.md#partlistout-字段`](../parts/index.md)（`PartListOut`，part 域旧端点
-> 的出参）**逐字一致**，前端从旧端点切到本端点时该层零改动。只有雪花 ID
+> 它们远小于 `2^53` 无 JS 精度风险，形态与 part 域 `PartListOut`（本端点所替换的
+> `GET /parts/pending-programming` 的出参，定义见
+> [`../parts/lifecycle.md`](../parts/lifecycle.md#get-apiv2partspending-programming)）
+> **逐字一致**，前端从旧端点切到本端点时该层零改动。只有雪花 ID
 > （`ProgrammingItemOut.id`）序列化为 string。
 
 ---

@@ -1,4 +1,4 @@
-//! prod::programming 子模块 —— 待编程一览（三规则并集口径）
+//! prod::programming 子模块 —— 待编程一览（part 状态闸门 + 三规则并集口径）
 //!
 //! 2026-10-01 新增：前端「待编程一览」页从 part 域
 //! `GET /api/v2/parts/pending-programming` 切到本域
