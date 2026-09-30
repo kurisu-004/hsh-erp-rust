@@ -15,15 +15,23 @@
 #   DUMP_FILE=db_backup/foo.dump ./scripts/restore_from_backup.sh
 #   RESET=1 ./scripts/restore_from_backup.sh                  # TRUNCATE 已恢复表后重建
 #   SKIP_COLUMNS=1 ./scripts/restore_from_backup.sh           # 不补缺失列（schema 已是最新）
+#   INCLUDE_MENU=1 ./scripts/restore_from_backup.sh            # 同时灌 dump 里的 t_menu/t_role_menu（默认跳过）
 #   POSTGRES_CONTAINER=dev_pg ./scripts/restore_from_backup.sh  # 自定义容器名
 #
 # 前置：postgres-dev 容器已起（docker compose up -d postgres-dev），
 #       baseline migration 已应用（cargo run 一次会自动跑或 sqlx migrate run）。
 #
 # 已知可忽略错误（脚本已自动吞掉）：
-#   - "alembic_version 不存在"  — alembic 是 python 端迁移表，rust 不需要
-#   - "t_menu duplicate key"     — app 启动钩子已灌，seed 用 ON CONFLICT
-#   - 缺列错误                   — 本脚本先 ADD COLUMN 再 restore
+#   - "alembic_version 不存在"        — alembic 是 python 端迁移表，rust 不需要
+#   - 其它表的 "duplicate key"        — 上次残留数据，RESET 后干净；非 RESET 模式按现逻辑吞
+#   - 缺列错误                         — 本脚本先 ADD COLUMN 再 restore
+#   - t_menu duplicate key            — INCLUDE_MENU=1 与 seeds/menu.sql 冲突时按现逻辑吞
+#                                       （默认 INCLUDE_MENU=0 不应再出现，menu 数据由 seed 重建）
+#
+# 关于 t_menu / t_role_menu：
+#   seeds/menu.sql 是 t_menu / t_role_menu 的权威源（走 ON CONFLICT (code) DO UPDATE 幂等 upsert）。
+#   默认从 dump 跳过这两张表的 DATA 行，restore 后由第 6 步应用 seeds/menu.sql 重建。
+#   应急时可用 INCLUDE_MENU=1 灌 dump 原数据。
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -163,6 +171,26 @@ echo "→ pg_restore --data-only --no-owner --no-privileges ..."
 DUMP_BASENAME="$(basename "$DUMP_FILE")"
 docker cp "$DUMP_FILE" "$POSTGRES_CONTAINER:/tmp/$DUMP_BASENAME"
 
+# 2026-09-30 新增：默认跳过 t_menu / t_role_menu 的 DATA 行（seeds/menu.sql 是权威源）。
+# pg_restore -l 输出格式示例：
+#   4030; 0 16401 TABLE DATA public t_menu postgres
+# 这里精确匹配 `TABLE DATA public <table>` 行，注释行以 `;` 开头不会被误删。
+TOC_LIST_HOST="$(mktemp)"
+docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
+    pg_restore -l "/tmp/$DUMP_BASENAME" > "$TOC_LIST_HOST"
+
+if [ "${INCLUDE_MENU:-0}" != "1" ]; then
+    grep -vE ' TABLE DATA public (t_menu|t_role_menu) ' "$TOC_LIST_HOST" \
+        > "${TOC_LIST_HOST}.filtered"
+    mv "${TOC_LIST_HOST}.filtered" "$TOC_LIST_HOST"
+    echo "→ 默认跳过 t_menu / t_role_menu DATA 行（seeds/menu.sql 会重建；INCLUDE_MENU=1 恢复 dump 数据）"
+else
+    echo "→ INCLUDE_MENU=1：同时灌 dump 里的 t_menu / t_role_menu（可能与 seeds/menu.sql 冲突）"
+fi
+
+# 过滤后的 TOC 列表拷进容器，pg_restore -L 应用
+docker cp "$TOC_LIST_HOST" "$POSTGRES_CONTAINER:/tmp/toc.list"
+
 # 跑 restore，过滤已知可忽略错误
 RESTORE_LOG="$(mktemp)"
 set +e
@@ -174,13 +202,16 @@ docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" pg_restore \
     --no-publications \
     --no-subscriptions \
     --no-security-labels \
+    -L /tmp/toc.list \
     -h localhost -U "$PG_USER" -d "$PG_DB" \
     "/tmp/$DUMP_BASENAME" 2>"$RESTORE_LOG"
 RESTORE_RC=$?
 set -e
 
-# 容器里清理临时 dump
-docker exec "$POSTGRES_CONTAINER" rm -f "/tmp/$DUMP_BASENAME"
+# 容器里清理临时 dump / toc.list
+docker exec "$POSTGRES_CONTAINER" rm -f "/tmp/$DUMP_BASENAME" "/tmp/toc.list"
+# 主机 mktemp 清理
+rm -f "$TOC_LIST_HOST"
 
 # 过滤已知错误后剩余的算致命
 FILTERED_LOG="$(mktemp)"
@@ -237,6 +268,11 @@ echo "$FINAL_COUNTS" | sed 's/^/    /'
 
 # ---------------------------------------------------------------------------- 6) 补灌 menu seed（idempotent；RESET 之后 seed 也被清了）
 # seeds/menu.sql 走 ON CONFLICT (code) DO UPDATE，反复跑无副作用
+# 2026-09-30 新增：默认（INCLUDE_MENU=0）情况下 pg_restore 已跳过 t_menu / t_role_menu DATA 行，
+# 此时 t_menu / t_role_menu 行数 = 0 + seed 量；INCLUDE_MENU=1 时 seed 的 ON CONFLICT 仍兜底。
+if [ "${INCLUDE_MENU:-0}" != "1" ]; then
+    echo "→ 跳过 dump 里的 t_menu / t_role_menu（已在上一步 TOC 过滤）；由下方 seeds/menu.sql 重建"
+fi
 SEED_FILE="${SEED_FILE:-seeds/menu.sql}"
 if [ -f "$SEED_FILE" ]; then
     echo "-> apply seed: $SEED_FILE (idempotent)"
