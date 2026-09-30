@@ -215,7 +215,12 @@ async fn dispatch_happy_path() {
     .await;
     assert_eq!(s2, StatusCode::OK, "dispatch: {env2}");
     assert_eq!(env2["data"]["succeeded"].as_array().unwrap().len(), 1);
-    assert_eq!(env2["data"]["failed"].as_array().unwrap().len(), 0);
+    // failed 字段在空数组时 skip_serializing_if 省略（partial commit 预留字段）
+    let failed_len = env2["data"]["failed"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0);
+    assert_eq!(failed_len, 0);
     let succeeded = &env2["data"]["succeeded"][0];
     assert_eq!(succeeded["batch_id"], batch_id.to_string());
     assert_eq!(succeeded["target_process_id"], process_a.to_string());
