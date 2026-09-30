@@ -747,4 +747,40 @@ impl PartRepo {
         .await?;
         Ok(r.rows_affected())
     }
+
+    /// 2026-09-30 新增（force-complete 端点）：part 域 MANAGER 单角色强推工单 +
+    /// 所有批次为 COMPLETED 的单 SQL 路径。
+    ///
+    /// 策略：**绕状态机** —— 所有非 CANCELLED、非软删的活跃批次一键推到
+    /// COMPLETED（不走 OCC；version += 1；写 updated_by）。与
+    /// `cancel_all_active_batches_for_part` 同形，但白名单排除 CANCELLED
+    /// （终态不可被强推；CANCELLED 由 service 层守 `BIZ_PART_ALREADY_CANCELLED`）。
+    ///
+    /// 并发串行化由 SQL 行锁（part_id 索引 + 行锁）承担；无需 caller 侧
+    /// `version` 校验（force-complete 是逃生通道，明确放弃 OCC 兜底）。
+    ///
+    /// 返回影响行数（0 表示 part 下无非 CANCELLED 活跃批次 —— 仍合法，由 caller
+    /// 决定；如新建工单未拆批就是 0 行）。
+    pub async fn force_complete_all_batches_for_part<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        current_user_id: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            r#"
+            UPDATE t_part_batch
+            SET status     = 'COMPLETED',
+                version    = version + 1,
+                updated_at = now(),
+                updated_by = $2
+            WHERE part_id = $1 AND deleted_at IS NULL
+              AND status <> 'CANCELLED'
+            "#,
+        )
+        .bind(part_id)
+        .bind(current_user_id)
+        .execute(executor)
+        .await?;
+        Ok(r.rows_affected())
+    }
 }

@@ -23,6 +23,7 @@
 //!   receive-from-outsource-to-inspection / complete-repair / repair-dispatch：
 //!   Manager + Clerk + Inspector
 //! - start-repair：Manager + Clerk + Inspector
+//! - force-complete（2026-09-30 新增）：**Manager 单角色** —— 逃生通道，明确不下放 Clerk
 
 use std::sync::Arc;
 
@@ -34,9 +35,9 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::dto_crud::{
     ByWorkTypeQuery, ByWorkerQuery, CancelBatchRequest, CancelRequest, CompleteRepairRequest,
-    CompleteRequest, DeliverRequest, PickUpRequest, PlaceOnShelfRequest, RecallToPendingRequest,
-    ReceiveFromOutsourceToInspectionRequest, RepairDispatchRequest, SendToOutsourceRequest,
-    SplitBatchRequest, StartRepairRequest,
+    CompleteRequest, DeliverRequest, ForceCompleteRequest, PickUpRequest, PlaceOnShelfRequest,
+    RecallToPendingRequest, ReceiveFromOutsourceToInspectionRequest, RepairDispatchRequest,
+    SendToOutsourceRequest, SplitBatchRequest, StartRepairRequest,
 };
 use crate::modules::part::service::PartService;
 use crate::modules::part::vo::{PartListOut, PartOut};
@@ -111,6 +112,30 @@ pub async fn complete(
     ws_broadcast(
         &state,
         "PART_COMPLETED",
+        json!({ "part_id": part_id.to_string() }),
+    );
+    Ok(Json(R::ok(out)))
+}
+
+/// `POST /api/v2/parts/{part_id}/force-complete`（2026-09-30 新增）
+///
+/// MANAGER **单角色** 强推工单 + 该工单下所有活跃批次为 COMPLETED（绕状态机）。
+/// 事件日志 `FORCE_COMPLETED` 区别常规 COMPLETED；commit 后广播
+/// `PART_FORCE_COMPLETED`。
+pub async fn force_complete(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(part_id): Path<i64>,
+    Json(req): Json<ForceCompleteRequest>,
+) -> Result<Json<R<PartOut>>, AppError> {
+    current.require_role(Role::Manager)?;
+    let mut tx = state.pool.begin().await?;
+    let out =
+        PartService::force_complete(&mut *tx, &state.snowflake, part_id, req, &current).await?;
+    tx.commit().await?;
+    ws_broadcast(
+        &state,
+        "PART_FORCE_COMPLETED",
         json!({ "part_id": part_id.to_string() }),
     );
     Ok(Json(R::ok(out)))

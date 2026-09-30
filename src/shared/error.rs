@@ -115,6 +115,12 @@ pub mod code {
     // 实际在 WORKER 持有）。槽位选择：20122 顺延 201xx 段（parts/batch 段），HTTP 409
     // 由 status_from_code 表驱动映射。
     pub const BIZ_BATCH_LOCATION_MISMATCH: i32 = 20122;
+    // 2026-09-30 新增：part 域 MANAGER 单角色强推工单为 COMPLETED 端点（force-complete）。
+    // 触发场景：`POST /api/v2/parts/{part_id}/force-complete` 撞 part 已是
+    // COMPLETED（不可重复强推）。槽位选择：20123 顺延 201xx 段（parts 段），
+    // HTTP 409 由 status_from_code 表驱动映射。语义与 `BIZ_PART_ALREADY_CANCELLED=20115`
+    // 对称（CAN/COMPLETED 互为幂等拒绝码）。
+    pub const BIZ_PART_ALREADY_COMPLETED: i32 = 20123;
 
     // 202xx 工人
     pub const BIZ_WORKER_NOT_FOUND: i32 = 20201;
@@ -510,7 +516,10 @@ fn status_from_code(c: i32) -> StatusCode {
             || c == code::BIZ_BATCH_INVALID_STATUS
             // 2026-09-30 新增：move 路径 from/holder 不一致 → 409（与 VERSION_CONFLICT
             // 并列；前端按 code 区分 40904 vs 40901）。
-            || c == code::BIZ_BATCH_LOCATION_MISMATCH =>
+            || c == code::BIZ_BATCH_LOCATION_MISMATCH
+            // 2026-09-30 新增：force-complete 端点已 COMPLETED 幂等拒绝 → 409
+            // （与 BIZ_PART_ALREADY_CANCELLED=20115 语义对称；前端按 code 区分）。
+            || c == code::BIZ_PART_ALREADY_COMPLETED =>
         {
             StatusCode::CONFLICT
         }
@@ -667,6 +676,11 @@ mod tests {
         (
             code::BIZ_BATCH_LOCATION_MISMATCH,
             "BIZ_BATCH_LOCATION_MISMATCH",
+        ),
+        // 2026-09-30 新增：force-complete 端点已 COMPLETED 幂等拒绝（409）
+        (
+            code::BIZ_PART_ALREADY_COMPLETED,
+            "BIZ_PART_ALREADY_COMPLETED",
         ),
         // 202xx
         (code::BIZ_WORKER_NOT_FOUND, "BIZ_WORKER_NOT_FOUND"),
@@ -1043,6 +1057,8 @@ mod tests {
         assert_eq!(code::BIZ_BATCH_NOT_FOUND, 20121);
         // 2026-09-30 新增：move 路径 from/holder 不一致 → 409
         assert_eq!(code::BIZ_BATCH_LOCATION_MISMATCH, 20122);
+        // 2026-09-30 新增：force-complete 端点已 COMPLETED 幂等拒绝 → 409
+        assert_eq!(code::BIZ_PART_ALREADY_COMPLETED, 20123);
 
         // 202xx
         assert_eq!(code::BIZ_WORKER_NOT_FOUND, 20201);
@@ -1421,6 +1437,12 @@ mod tests {
             code::BIZ_BATCH_LOCATION_MISMATCH,
             StatusCode::CONFLICT,
             "BIZ_BATCH_LOCATION_MISMATCH",
+        ),
+        // 2026-09-30 新增：force-complete 端点已 COMPLETED 幂等拒绝 → 409
+        (
+            code::BIZ_PART_ALREADY_COMPLETED,
+            StatusCode::CONFLICT,
+            "BIZ_PART_ALREADY_COMPLETED",
         ),
         // 2026-09-28 删除：相关会话域 HTTP 表覆盖（域下线，码段释放）。
         // 2xxxx 显式 409
