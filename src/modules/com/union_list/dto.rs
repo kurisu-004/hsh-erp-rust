@@ -82,6 +82,16 @@ pub struct UnionListQuery {
     /// 逗号分隔雪花 ID 字符串。PART / ALL 模式生效。
     #[serde(default)]
     pub holder_ids: Option<String>,
+    // 2026-09-30 新增：`planned_delivery_date_from/to` 日期窗口（`YYYY-MM-DD`）。
+    // 修隐藏 bug —— 前端 dashboard UpcomingDeliveryListDrawer 当前已传这俩
+    // 参数，但本 DTO 之前没有对应字段，参数被静默丢弃；表现「看似只显示当天」
+    // 实为 7 天分桶 + limit 500 凑出来的。PART / ALL / ASSEMBLY 三模式全部生效
+    // （t_part.planned_delivery_date / t_assembly.planned_delivery_date 都是
+    // NOT NULL NaiveDate，SQL `>=`/`<=` 对 NULL 直接 false 即可）。
+    #[serde(default)]
+    pub planned_delivery_date_from: Option<String>,
+    #[serde(default)]
+    pub planned_delivery_date_to: Option<String>,
     #[serde(default)]
     pub sort_by: Option<String>,
     #[serde(default)]

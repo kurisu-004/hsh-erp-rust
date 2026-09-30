@@ -47,6 +47,12 @@
 //! | 8    | `&[i64]`              | holder_ids     | 仅 part 段 EXISTS                |
 //! | 9    | `i64`                 | limit          | 外层                              |
 //! | 10   | `i64`                 | offset         | 外层                              |
+//! | 11   | `Option<NaiveDate>`   | planned_delivery_date_from   | 2026-09-30 新增（part/asm 段 `>=`，外层 SQL 不引用）|
+//! | 12   | `Option<NaiveDate>`   | planned_delivery_date_to     | 2026-09-30 新增（part/asm 段 `<=`，外层 SQL 不引用）|
+//!
+//! 2026-09-30 修订：日期 from/to 用 `$11`/`$12` 占位共享给 part/asm 段（PG 允
+//! 许同 `$N` 在 SQL 文本内多处引用；外层 SQL 不消费这两个 placeholder，故不
+//! 影响 `$9`/`$10` 语义）。
 //!
 //! ## 正确性论证
 //! 每段内部按各自 sort_key 取前 `pushdown_limit = offset + limit` 行；外层
@@ -102,11 +108,14 @@ impl UnionListRepo {
     /// `pushdown_limit` = `offset + limit`（service 层算好传入），保证每段取够
     /// 全局排序所需的行。
     ///
-    /// ## SQL 写法（2026-09-29 round-1 修复后）
+    /// ## SQL 写法（2026-09-29 round-1 修复后；2026-09-30 增 date 过滤）
     ///
     /// 单一固定 SQL（`format!` 仅替换 `order_col` / `order_dir`，已白名单），
-    /// 配 10 次 `.bind()` 链；每 placeholder 在 SQL 文本内可多次引用，PG 接受
-    /// 同一 `$N` 多处出现，bind 次数仅与 placeholder 总数对应（10 个）。
+    /// 配 12 次 `.bind()` 链；每 placeholder 在 SQL 文本内可多次引用，PG 接
+    /// 受同一 `$N` 多处出现，bind 次数与 placeholder 总数对应（12 个）。
+    ///
+    /// 2026-09-30 增 `planned_delivery_date_from/to: Option<NaiveDate>` 段内
+    /// 过滤；两段（part_seg / asm_seg）共享 `$11`/`$12`，外层 SQL 不消费。
     #[allow(clippy::too_many_arguments)]
     pub async fn list_union_all_with_filters<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -122,6 +131,9 @@ impl UnionListRepo {
         pushdown_limit: i64,
         limit: i64,
         offset: i64,
+        // 2026-09-30 新增：日期窗口过滤（仅 part/asm 段内消费）。
+        planned_delivery_date_from: Option<chrono::NaiveDate>,
+        planned_delivery_date_to: Option<chrono::NaiveDate>,
     ) -> Result<Vec<UnionListRow>, sqlx::Error> {
         let order_col = union_sort_col(sort_by);
         let order_dir = if sort_dir.eq_ignore_ascii_case("ASC") {
@@ -142,6 +154,7 @@ impl UnionListRepo {
         // - keyword 在两段都用 name / drawing_no / serial_no 三列 ILIKE OR
         //   （与 PartRepo / AssemblyRepo::list_with_filters 同形 —— review
         //   round-1 MODERATE-4 已统一三列匹配语义）
+        // - 2026-09-30 新增：`$11`/`$12` 日期窗口（part/asm 两段共享，外层不消费）
         let sql = format!(
             "WITH \
              part_seg AS ( \
@@ -172,6 +185,8 @@ impl UnionListRepo {
                      AND pb.current_holder_id = ANY($8) \
                      AND pb.deleted_at IS NULL \
                  )) \
+                 AND ($11::date IS NULL OR planned_delivery_date >= $11) \
+                 AND ($12::date IS NULL OR planned_delivery_date <= $12) \
                ORDER BY {order_col} {order_dir} NULLS LAST, id DESC \
                LIMIT $1 OFFSET 0 \
              ), \
@@ -192,6 +207,8 @@ impl UnionListRepo {
                  AND (cardinality($4::text[]) = 0 OR status = ANY($4)) \
                  AND ($5::bool IS NULL OR is_urgent = $5) \
                  AND ($6::text IS NULL OR (drawing_no ILIKE $6 OR name ILIKE $6 OR serial_no ILIKE $6)) \
+                 AND ($11::date IS NULL OR planned_delivery_date >= $11) \
+                 AND ($12::date IS NULL OR planned_delivery_date <= $12) \
                ORDER BY {order_col} {order_dir} NULLS LAST, id DESC \
                LIMIT $1 OFFSET 0 \
              ) \
@@ -227,6 +244,8 @@ impl UnionListRepo {
             .bind(holder_ids) // $8
             .bind(limit) // $9
             .bind(offset) // $10
+            .bind(planned_delivery_date_from) // $11 (2026-09-30 新增)
+            .bind(planned_delivery_date_to) // $12 (2026-09-30 新增)
             .fetch_all(executor)
             .await?;
         rows.into_iter().map(row_to_union_list_row).collect()

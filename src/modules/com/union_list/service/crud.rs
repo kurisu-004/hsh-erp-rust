@@ -24,11 +24,18 @@
 //! - `parse_list_filters` 留在 part 域：本端点复用其等价的内联版本（字段解析 +
 //!   `expand_customer_id`），避免跨域 pub 暴露内部 helper。
 //!
+//! ## 2026-09-30 新增：`planned_delivery_date_from/to` 日期窗口过滤
+//! 修前端 dashboard UpcomingDeliveryListDrawer 的隐藏 bug —— 前端已传这俩参数
+//! 但本 DTO 之前没有对应字段，参数被静默丢弃。本 service 层在 `parse_filters`
+//! 解析 `YYYY-MM-DD` → `chrono::NaiveDate`，非法格式 → 40001 VALIDATION_ERROR。
+//! PART / ALL / ASSEMBLY 三模式全部生效。
+//!
 //! ## SQL 引用
 //! - PART 段：`part/repo/sql/part_sql.rs::list_with_filters`（part_only=true）
 //! - ASSEMBLY 段：`assembly/repo/sql.rs::list_with_filters`
 //! - ALL 段：本域 `repo/sql.rs::list_union_all_with_filters`
 
+use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use sqlx::PgConnection;
 
@@ -110,6 +117,9 @@ impl UnionListService {
             keyword: query.keyword.as_deref(),
             locations: &parsed.locations,
             holder_ids: &parsed.holder_ids,
+            // 2026-09-30 新增：日期窗口过滤（与 SQL WHERE `>=` / `<=` 一致）。
+            planned_delivery_date_from: parsed.planned_delivery_date_from,
+            planned_delivery_date_to: parsed.planned_delivery_date_to,
             part_only: true, // PART-only 模式强制打开装配体子件守卫
             sort_by: &parsed.sort_by,
             sort_dir: &parsed.sort_dir,
@@ -167,6 +177,9 @@ impl UnionListService {
             statuses: &parsed.statuses, // 与 assembly 域 list_assemblies 同语义
             is_urgent: query.is_urgent,
             keyword: query.keyword.as_deref(),
+            // 2026-09-30 新增：日期窗口过滤（与 SQL WHERE `>=` / `<=` 一致）。
+            planned_delivery_date_from: parsed.planned_delivery_date_from,
+            planned_delivery_date_to: parsed.planned_delivery_date_to,
             sort_by: Some(&parsed.sort_by),
             sort_dir: Some(&parsed.sort_dir),
             limit,
@@ -241,6 +254,9 @@ impl UnionListService {
             pushdown_limit,
             limit,
             offset,
+            // 2026-09-30 新增：日期窗口过滤下推到 part_seg / asm_seg 段 WHERE。
+            parsed.planned_delivery_date_from,
+            parsed.planned_delivery_date_to,
         )
         .await?;
 
@@ -253,6 +269,9 @@ impl UnionListService {
             keyword: query.keyword.as_deref(),
             locations: &parsed.locations,
             holder_ids: &parsed.holder_ids,
+            // 2026-09-30 新增：日期窗口过滤。
+            planned_delivery_date_from: parsed.planned_delivery_date_from,
+            planned_delivery_date_to: parsed.planned_delivery_date_to,
             part_only: true, // part 段排除装配体子件
             sort_by: &parsed.sort_by,
             sort_dir: &parsed.sort_dir,
@@ -269,6 +288,9 @@ impl UnionListService {
                 statuses: &parsed.statuses,
                 is_urgent: query.is_urgent,
                 keyword: query.keyword.as_deref(),
+                // 2026-09-30 新增：日期窗口过滤。
+                planned_delivery_date_from: parsed.planned_delivery_date_from,
+                planned_delivery_date_to: parsed.planned_delivery_date_to,
                 sort_by: Some(&parsed.sort_by),
                 sort_dir: Some(&parsed.sort_dir),
                 limit: 0,
@@ -331,6 +353,9 @@ impl UnionListService {
 
 /// `UnionListQuery` 解析结果。全部 String / Vec 在 helper 内持有，借给下游
 /// `PartListFilters` / `AssemblyListFilters` 时取 ref。
+///
+/// 2026-09-30 新增：`planned_delivery_date_from/to` —— `YYYY-MM-DD` 解析后的
+/// `NaiveDate`（已校验），None 表示该端不参与 SQL 过滤。
 struct ParsedFilters {
     sort_by: String,
     sort_dir: String,
@@ -338,6 +363,8 @@ struct ParsedFilters {
     statuses: Vec<String>,
     locations: Vec<String>,
     holder_ids: Vec<i64>,
+    planned_delivery_date_from: Option<NaiveDate>,
+    planned_delivery_date_to: Option<NaiveDate>,
 }
 
 /// 解析 `UnionListQuery` 为内部变量（`parse_list_filters` 在 part 域的镜像）。
@@ -412,6 +439,16 @@ async fn parse_filters(
             .collect::<Result<Vec<_>, _>>()?,
         _ => Vec::new(),
     };
+    // 2026-09-30 新增：日期窗口解析（`YYYY-MM-DD`）。非法格式 → 40001 VALIDATION_ERROR。
+    // 任一端缺失 → 对应 None（与日期窗口 `<` / `>` NULL 短路语义一致）。
+    let planned_delivery_date_from = parse_optional_date(
+        query.planned_delivery_date_from.as_deref(),
+        "planned_delivery_date_from",
+    )?;
+    let planned_delivery_date_to = parse_optional_date(
+        query.planned_delivery_date_to.as_deref(),
+        "planned_delivery_date_to",
+    )?;
     Ok(ParsedFilters {
         sort_by,
         sort_dir,
@@ -419,7 +456,28 @@ async fn parse_filters(
         statuses,
         locations,
         holder_ids,
+        planned_delivery_date_from,
+        planned_delivery_date_to,
     })
+}
+
+/// 解析可选日期 query 字段为 `NaiveDate`（2026-09-30 新增）。
+///
+/// - `None` / `Some("")` → `Ok(None)`（不参与过滤）
+/// - `Some(s)` → `NaiveDate::parse_from_str(s, "%Y-%m-%d")`，失败 → `40001`
+///   VALIDATION_ERROR，带字段名 + 原值便于前端定位。
+fn parse_optional_date(
+    raw: Option<&str>,
+    field_name: &'static str,
+) -> Result<Option<NaiveDate>, AppError> {
+    match raw {
+        Some(s) if !s.trim().is_empty() => NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+            .map(Some)
+            .map_err(|e| {
+                AppError::validation(format!("{field_name} 非法: {s}（必须是 YYYY-MM-DD: {e}）"))
+            }),
+        _ => Ok(None),
+    }
 }
 
 /// 展开 `customer_id` 为 `[id]`（含自身 + 子节点）。

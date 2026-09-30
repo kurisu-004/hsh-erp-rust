@@ -74,6 +74,9 @@ pub trait UnionListRepoTrait: Send {
     /// - `filters`：跨段共享筛选（customer_ids / status / statuses / is_urgent /
     ///   keyword / locations / holder_ids）；part 段 `assembly_id IS NULL` 守卫
     ///   在 SQL 内固定追加。
+    /// - `planned_delivery_date_from` / `planned_delivery_date_to`（2026-09-30
+    ///   新增）：日期窗口（`YYYY-MM-DD`），段内 `WHERE planned_delivery_date >=
+    ///   $X AND <= $Y`；`None` 端不参与。
     /// - `pushdown_limit`：每段 SQL 内 `LIMIT (pushdown_limit) OFFSET 0`；用户
     ///   输入 = `offset + limit`。
     /// - `limit` / `offset`：外层分页切片。
@@ -95,6 +98,9 @@ pub trait UnionListRepoTrait: Send {
         pushdown_limit: i64,
         limit: i64,
         offset: i64,
+        // 2026-09-30 新增：日期窗口过滤（part/asm 段内 WHERE）。
+        planned_delivery_date_from: Option<chrono::NaiveDate>,
+        planned_delivery_date_to: Option<chrono::NaiveDate>,
     ) -> Result<Vec<UnionListRow>, sqlx::Error>;
 }
 
@@ -119,6 +125,9 @@ impl UnionListRepoTrait for &mut PgConnection {
         pushdown_limit: i64,
         limit: i64,
         offset: i64,
+        // 2026-09-30 新增：日期窗口过滤透传。
+        planned_delivery_date_from: Option<chrono::NaiveDate>,
+        planned_delivery_date_to: Option<chrono::NaiveDate>,
     ) -> Result<Vec<UnionListRow>, sqlx::Error> {
         UnionListRepo::list_union_all_with_filters(
             &mut **self,
@@ -134,6 +143,8 @@ impl UnionListRepoTrait for &mut PgConnection {
             pushdown_limit,
             limit,
             offset,
+            planned_delivery_date_from,
+            planned_delivery_date_to,
         )
         .await
     }
