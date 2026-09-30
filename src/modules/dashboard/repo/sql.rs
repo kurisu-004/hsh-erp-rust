@@ -34,6 +34,10 @@ pub struct BatchLite {
     pub batch_id: i64,
     pub batch_no: Option<i32>,
     pub holder_id: Option<i64>,
+    /// 2026-09-30：取值来源改为直读 `t_part_batch.current_process_id`
+    /// （migration 004），不再是 `t_process_chain_step.process_id` JOIN 的
+    /// 中转结果。**字段名 `next_process_id` 保持不变**（`BatchLite` 是
+    /// repo 内部结构，dashboard VO 侧字段名同步不动）。
     pub next_process_id: Option<i64>,
 }
 
@@ -188,13 +192,14 @@ impl DashboardRepo {
             Vec::new()
         } else {
             let rows = sqlx::query(
-                // 2026-09-16 PR-3 批次 step 化：next_process_id 列已删，JOIN step 取 process_id
+                // 2026-09-30 改直读 b.current_process_id（migration 004）：删掉
+                // LEFT JOIN t_process_chain_step，新下发批次（step 为 NULL）也能显示工序
                 "SELECT b.id            AS batch_id, \
                         b.part_id       AS part_id, \
                         b.batch_no      AS batch_no, \
                         b.quantity      AS quantity, \
                         b.current_holder_id AS holder_id, \
-                        s.process_id      AS next_process_id, \
+                        b.current_process_id AS next_process_id, \
                         p.id           AS p_id, \
                         p.serial_no    AS serial_no, \
                         p.name         AS p_name, \
@@ -204,7 +209,6 @@ impl DashboardRepo {
                         p.customer_id  AS customer_id \
                  FROM t_part_batch b \
                  JOIN t_part p ON p.id = b.part_id \
-                 LEFT JOIN t_process_chain_step s ON s.id = b.current_process_step_id \
                  WHERE b.status = 'IN_PROCESS' \
                    AND b.deleted_at IS NULL \
                    AND p.deleted_at IS NULL \
@@ -320,7 +324,8 @@ impl DashboardRepo {
     ) -> Result<Vec<(BatchLite, PartLite)>, sqlx::Error> {
         let status_value = status.unwrap_or("IN_PROCESS");
         let rows = sqlx::query(
-            // 2026-09-16 PR-3 批次 step 化：next_process_id 列已删，JOIN step 取 process_id
+            // 2026-09-30 改直读 b.current_process_id（migration 004）：删掉
+            // LEFT JOIN t_process_chain_step，新下发批次（step 为 NULL）也能显示工序
             "WITH active_shelves AS ( \
                 SELECT id FROM t_shelf \
                 WHERE zone = $1 AND deleted_at IS NULL AND is_active = TRUE \
@@ -330,7 +335,7 @@ impl DashboardRepo {
                     b.batch_no      AS batch_no, \
                     b.quantity      AS quantity, \
                     b.current_holder_id AS holder_id, \
-                    s.process_id      AS next_process_id, \
+                    b.current_process_id AS next_process_id, \
                     p.id           AS p_id, \
                     p.serial_no    AS serial_no, \
                     p.name         AS p_name, \
@@ -340,7 +345,6 @@ impl DashboardRepo {
                     p.customer_id  AS customer_id \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
-             LEFT JOIN t_process_chain_step s ON s.id = b.current_process_step_id \
              WHERE b.status = $2 \
                AND b.deleted_at IS NULL \
                AND p.deleted_at IS NULL \
@@ -363,13 +367,14 @@ impl DashboardRepo {
         top_n: i64,
     ) -> Result<Vec<(BatchLite, PartLite)>, sqlx::Error> {
         let rows = sqlx::query(
-            // 2026-09-16 PR-3 批次 step 化：next_process_id 列已删，JOIN step 取 process_id
+            // 2026-09-30 改直读 b.current_process_id（migration 004）：删掉
+            // LEFT JOIN t_process_chain_step，新下发批次（step 为 NULL）也能显示工序
             "SELECT b.id            AS batch_id, \
                     b.part_id       AS part_id, \
                     b.batch_no      AS batch_no, \
                     b.quantity      AS quantity, \
                     b.current_holder_id AS holder_id, \
-                    s.process_id      AS next_process_id, \
+                    b.current_process_id AS next_process_id, \
                     p.id           AS p_id, \
                     p.serial_no    AS serial_no, \
                     p.name         AS p_name, \
@@ -379,7 +384,6 @@ impl DashboardRepo {
                     p.customer_id  AS customer_id \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
-             LEFT JOIN t_process_chain_step s ON s.id = b.current_process_step_id \
              WHERE b.status = 'IN_PROCESS' \
                AND b.location = 'WORKER' \
                AND b.deleted_at IS NULL \

@@ -1031,11 +1031,16 @@ impl PartRepo {
 // 删除（t_part 已无该列；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
 //
 // 2026-09-16 PR-3 批次 step 化（migration 028）：rollup 派生规则不变，
-// `t_part.next_process_id` 仍保留为派生缓存，但**派生源**改为
-// `min-progress 活跃 batch.current_process_step_id JOIN t_process_chain_step.process_id`。
-// `compute_part_target` 在 service 层读 `BatchForRollup` 时同步改为读 step_id
-// （详见 `part/service/rollup.rs::sync_from_batch_change` 的派生逻辑）。
-// `t_part_batch.next_process_id` 列已删，rollup 取 `process_id` 需经 step JOIN。
+// `t_part.next_process_id` 仍保留为派生缓存。
+//
+// 2026-09-30 改直读 `t_part_batch.current_process_id`（migration 004）：
+// **派生源**从 `min-progress 活跃 batch.current_process_step_id JOIN
+// t_process_chain_step.process_id` 换成 `min-progress 活跃
+// batch.current_process_id` 直读。`compute_part_target` 在 service 层读
+// `BatchForRollup` 时同步改读 `current_process_id`，并删掉
+// `part/service/rollup.rs::sync_from_batch_change` 里的 step JOIN 转译。
+// 本块（`get_part_rollup_state` / `update_part_rollup`）读写的是
+// `t_part.next_process_id` 本身，**列名与语义均不变**，无需改动。
 //
 // 注：本块位于 `mod tests` 之后，触发 clippy::items_after_test_module 警告。
 // 与 `worker_scan.rs::needless_late_init` 同类 pre-existing 例外，合并期不便重构

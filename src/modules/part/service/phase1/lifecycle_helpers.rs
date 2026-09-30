@@ -270,6 +270,28 @@ impl PartService {
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         let rows: Vec<BatchListRow> = sqlx::query_as::<_, BatchListRow>(
+            // 2026-09-30（rebase 冲突解决）：`next_process_id` / `next_process_name`
+            // **继续**从 `current_process_step_id` 经 `LEFT JOIN t_process_chain_step
+            // s2` 派生，`s2` JOIN 保留、`t_process p2` 继续挂 `s2.process_id`。
+            //
+            // 本分支 6ecdf2c 一度把两列改直读 `b.current_process_id`（migration 004），
+            // 本冲突处**不采纳**该改法，理由与 2026-09-30 review 第 3 轮 M3 对
+            // `GET /parts/inspection-batches` 的回退完全同形：
+            //   - 本查询 WHERE **无 status 过滤**，会同时返回 PENDING / IN_PROCESS /
+            //     INSPECTION / REPAIRING 等各状态批次；
+            //   - 而所有进 INSPECTION 的写点都按「出池 → `current_process_id = NULL`」
+            //     不变式把该列清空（`phase1::scan` / `outsource::
+            //     receive_to_inspection` / `repair::complete_repair` /
+            //     `mark_batch_inspected`）→ 直读会让 INSPECTION 批次的
+            //     `next_process_id` / `next_process_name` **恒为 null**。
+            //
+            // 读取方分工（勿越界）：`current_process_id` 的读取方严格限定为 5 条
+            // 工序池 SQL + `list_pickable_by_work_type` + rollup 派生；
+            // **展示类列表一律走 step 派生**。
+            //
+            // 2026-09-30 Phase 2（master 6be7531）：投影同时补齐 `b.part_id` /
+            // `b.created_at` / `b.updated_at` / `b.current_process_step_id`（修复原
+            // DTO 漏投 bug）+ `p2.name` / `dn.delivery_note_no` 两处 LEFT JOIN。
             "SELECT b.id, b.part_id, b.batch_no, b.quantity, b.status, b.location, \
              b.current_holder_id, b.current_process_step_id, \
              b.delivery_note_id, b.parent_batch_id, \
@@ -308,9 +330,8 @@ impl PartService {
                 // 2026-09-30 Phase 2：SQL 已选该字段，原 DTO 漏投
                 current_process_step_id: r.current_process_step_id,
                 // 2026-09-16 PR-3 批次 step 化：next_process_id 由 step.process_id 派生；
-                // DTO 保留字段（兼容前端），但 PartBatchListItemOut 当前**总是 None**
-                // —— 见 dto_crud.rs 字段说明。如需该信息请前端改为读
-                // current_process_step_id 后端按需派生。
+                // 2026-09-30 rebase 冲突解决复核后**维持 step 派生**（不直读
+                // b.current_process_id），理由见上方 SQL 注释（review 第 3 轮 M3 同形）。
                 next_process_id: r.next_process_id,
                 // 2026-09-30 Phase 2：LEFT JOIN t_process 派生
                 next_process_name: r.next_process_name,

@@ -299,7 +299,8 @@ impl WorkerPoolService {
     ///    - WORKER → `(location='WORKER', current_holder_id=worker_id)`
     ///    - 不一致 → `20122 BIZ_BATCH_LOCATION_MISMATCH`
     /// 5. 校验 `to`：
-    ///    - POOL → shelf 必须映射 `batch.current_process_step.process_id`
+    ///    - POOL → shelf 必须映射 `batch.current_process_id`（2026-09-30：直读
+    ///      工序归属新列，不再经 `current_process_step_id` → step JOIN 中转）
     ///    - WORKER → worker is_active 且工序资格 + 容量（`held < max_held`）
     /// 6. 按 (from, to) 选 SQL：
     ///    - POOL → WORKER：复用 `take_specific_from_pool`（service 入口已 fetch batch，
@@ -424,14 +425,13 @@ impl WorkerPoolService {
                 )
             })?;
 
-        // 取 batch 当前 step.process_id（POOL→WORKER 与 WORKER→POOL 的 target 校验都需要）
-        let step_process_id: Option<i64> = if let Some(step_id) = batch.current_process_step_id {
-            (&mut *conn)
-                .process_chain_step_get_process_id(step_id)
-                .await?
-        } else {
-            None
-        };
+        // 取 batch 当前所属工序（POOL→WORKER 与 WORKER→POOL 的 target 校验都需要）
+        //
+        // 2026-09-30 修复（migration 004）：原先是
+        // `batch.current_process_step_id → process_chain_step_get_process_id(step_id)`，
+        // 即**一次额外的 DB 往返**只为把 step_id 翻成 process_id。改直读
+        // `batch.current_process_id`（工序池归属的权威列），查询整段删掉。
+        let step_process_id: Option<i64> = batch.current_process_id;
 
         // 取 worker 元数据（事件日志 badge_code；POOL→WORKER / WORKER→WORKER 需要源 worker）
         let src_worker_badge: Option<String> = if let MoveLocation::Worker { worker_id } = &req.from
@@ -492,7 +492,7 @@ impl WorkerPoolService {
                     )
                 })?;
 
-                // 工序资格校验：worker 的 work_type 必须包含 batch 当前 step.process_id
+                // 工序资格校验：worker 的 work_type 必须包含 batch 当前所属工序
                 if let Some(spid) = step_process_id {
                     let process_ids = (&mut *conn)
                         .work_type_list_process_ids(work_type_id)
@@ -500,9 +500,7 @@ impl WorkerPoolService {
                     if !process_ids.contains(&spid) {
                         return Err(AppError::biz(
                             code::BIZ_INVALID_VALUE,
-                            format!(
-                                "worker {worker_id} 工种不含工序 {spid}（batch 当前 step.process_id）"
-                            ),
+                            format!("worker {worker_id} 工种不含工序 {spid}（batch 当前工序）"),
                         ));
                     }
                 }
@@ -574,7 +572,7 @@ impl WorkerPoolService {
                 MoveLocation::Pool { shelf_id },
             ) => {
                 // WORKER → POOL：复用 part_mark_batch_returned（不写 step）
-                // shelf 映射校验：shelf 必须映射 batch 当前 step.process_id
+                // shelf 映射校验：shelf 必须映射 batch 当前所属工序
                 if let Some(spid) = step_process_id {
                     let mapped: Option<i64> = sqlx::query_scalar(
                         r#"SELECT shelf_id FROM t_shelf_process
@@ -588,9 +586,7 @@ impl WorkerPoolService {
                     if mapped.is_none() {
                         return Err(AppError::biz(
                             code::BIZ_SHELF_PROCESS_NOT_MAPPED,
-                            format!(
-                                "shelf {shelf_id} 未映射工序 {spid}（batch 当前 step.process_id）"
-                            ),
+                            format!("shelf {shelf_id} 未映射工序 {spid}（batch 当前工序）"),
                         ));
                     }
                 }
@@ -697,9 +693,7 @@ impl WorkerPoolService {
                     if !process_ids.contains(&spid) {
                         return Err(AppError::biz(
                             code::BIZ_INVALID_VALUE,
-                            format!(
-                                "worker {dst_worker_id} 工种不含工序 {spid}（batch 当前 step.process_id）"
-                            ),
+                            format!("worker {dst_worker_id} 工种不含工序 {spid}（batch 当前工序）"),
                         ));
                     }
                 }
@@ -1107,7 +1101,7 @@ impl Default for WorkerPoolService {
 // 内做精细单测。本文件补 7 个场景：
 // - 三方向 happy path：POOL→WORKER / WORKER→POOL / WORKER→WORKER
 // - from 与 batch 实际 (location, holder) 不一致 → 40904 LOCATION_MISMATCH
-// - 目标 worker 工种不含 batch 当前 step.process_id → 20104 BIZ_INVALID_VALUE
+// - 目标 worker 工种不含 batch 当前工序（current_process_id）→ 20104 BIZ_INVALID_VALUE
 // - 目标 shelf 未映射工序 → 20507 BIZ_SHELF_PROCESS_NOT_MAPPED
 // - POOL→POOL 同 kind 移动 → 40001 VALIDATION_ERROR
 //
@@ -1679,13 +1673,13 @@ mod tests {
         assert_eq!(err.code(), code::BIZ_BATCH_LOCATION_MISMATCH);
     }
 
-    /// 场景：目标 worker 工种不含 batch 当前 step.process_id → 20104 BIZ_INVALID_VALUE。
+    /// 场景：目标 worker 工种不含 batch 当前工序（current_process_id）→ 20104 BIZ_INVALID_VALUE。
     #[tokio::test]
     async fn move_batch_target_worker_ineligible_returns_biz_invalid_value() {
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager_tw", "password", "MANAGER").await;
         let customer = insert_customer(&pool, "ACME-TW").await;
-        // batch 当前工序 = PROC-X（写入 step）
+        // batch 当前工序 = PROC-X（同时写 current_process_id 与 step）
         let proc_x = insert_process(&pool, "PROC-X", "工序X").await;
         let wt_src = insert_work_type(&pool, "WT-X", "工种X", Some(5)).await;
         link_work_type_to_process(&pool, wt_src, proc_x).await;
@@ -1723,7 +1717,7 @@ mod tests {
         assert_eq!(err.code(), code::BIZ_INVALID_VALUE);
     }
 
-    /// 场景：目标 shelf 未映射 batch 当前 step.process_id → 20507 SHELF_PROCESS_NOT_MAPPED。
+    /// 场景：目标 shelf 未映射 batch 当前工序（current_process_id）→ 20507 SHELF_PROCESS_NOT_MAPPED。
     /// 走 WORKER→POOL 分支（to=POOL 时会校验 shelf 映射）。
     #[tokio::test]
     async fn move_batch_target_shelf_unmapped_returns_20507() {

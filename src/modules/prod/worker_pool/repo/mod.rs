@@ -39,15 +39,16 @@
 //!   `work_type_list_work_types_by_process_id`
 //! - process (1)：`process_get_by_id`
 //! - process_chain (1)：`process_chain_resolve_step_id_by_process`
-//! - process_chain_step (1)：`process_chain_step_get_process_id`（assign 路径校验用）
+//! - process_chain_step (1)：`process_chain_step_get_process_id`（2026-09-30 起
+//!   `move_batch` 无调用方，改直读 `batch.current_process_id`；保留备用）
 //! - part_batch (3)：`part_batch_count_held_by_worker` / `part_batch_get_by_id` /
 //!   `part_batch_list_active_by_part_id`
 //! - part (3)：`part_get_by_id` / `part_find_inprocess_batch_by_id_and_holder` /
 //!   `part_mark_batch_returned`
 //! - part_event (1)：`part_insert_part_event`
 //! - inline SQL helper (1)：`count_pool_by_shelf_and_process`（service 中
-//!   `compute_state` 内的 `sqlx::query_scalar!` 块下沉到本 trait；t_part_batch +
-//!   t_process_chain_step JOIN）
+//!   `compute_state` 内的 `sqlx::query_scalar!` 块下沉到本 trait；2026-09-30 起
+//!   按 `t_part_batch.current_process_id` 普通过滤，已无 t_process_chain_step JOIN）
 //!
 //! ## 为什么 trait 可以直接对 `&mut PgConnection` 实现
 //! `Transaction<'_, Postgres>` 与 `PoolConnection<Postgres>` 都 `DerefMut<Target = PgConnection>`，
@@ -188,6 +189,11 @@ pub trait WorkerPoolRepoTrait: Send {
 
     /// 解析 step_id 对应的 process_id（assign 路径校验 batch 当前 step）。
     /// 原 `service.rs:739` 的 `sqlx::query_scalar` 内联 SQL 下沉。
+    ///
+    /// 2026-09-30：`move_batch` 的唯一调用点已删（改为直读
+    /// `batch.current_process_id`，少一次 DB 往返），本方法当前无调用方，
+    /// 保留供后续「按 step 维度」校验路径复用（如返修/派工的 step 推进）。
+    #[allow(dead_code)]
     async fn process_chain_step_get_process_id(
         &mut self,
         step_id: i64,

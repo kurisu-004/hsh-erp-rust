@@ -144,7 +144,7 @@ Request：`MoveRequest`
 
 | `to.kind` | 校验 |
 |---|---|
-| `POOL`   | `t_shelf_process WHERE shelf_id = $x AND process_id = $batch.current_process_step.process_id` 必须 ≥1 条（货架必须映射到 batch 当前工序） |
+| `POOL`   | `t_shelf_process WHERE shelf_id = $x AND process_id = $batch.current_process_id` 必须 ≥1 条（货架必须映射到 batch 当前工序；**2026-09-30 改直读 `current_process_id`**，原先是 `current_process_step_id` → step JOIN） |
 | `WORKER` | worker 必须 `is_active=true`；worker 的工种必须含 batch 当前工序；`held < work_type.max_held_batches`（容量上限） |
 
 业务流转（service `move_batch`）：
@@ -236,7 +236,7 @@ Query：无（按现有 per-process 端点惯例，不指定 shelf_id，返回�
 > 含 0 候选批次的 process 不出现在 `counts` 中（SQL `GROUP BY` 不输出 0 行，
 > 与前端 tab 数量语义对齐——admin 不关心"无候选"的工序）。
 >
-> 排序按 `process_id ASC` 稳定（repo SQL `ORDER BY s.process_id ASC` 保证），
+> 排序按 `process_id ASC` 稳定（repo SQL `ORDER BY pb.current_process_id ASC` 保证），
 > 二次查元数据按 `list_by_ids` 的 `ORDER BY id ASC` 同序返回。
 
 Response 200 `data`：[`WorkerPoolCountsOut`](#workerpoolcountsout-字段)
@@ -525,7 +525,7 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 | `process_id` | string (i64) | 工序雪花 ID |
 | `process_code` | string | 工序代号 |
 | `process_name` | string | 工序名 |
-| `count` | i64 | 该工序候选批次数（cross-shelf 聚合；`t_part_batch` 中 `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL`） |
+| `count` | i64 | 该工序候选批次数（cross-shelf 聚合；`t_part_batch` 中 `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL AND current_process_id = process_id`；**2026-09-30 起按 `current_process_id` 维度聚合**，工序池归属的权威列） |
 
 ### WorkerPoolCountsOut 字段
 

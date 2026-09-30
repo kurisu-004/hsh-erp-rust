@@ -22,10 +22,23 @@
 //! - 派生列实际写入：service 层用 step JOIN 取 process_id 后写入 t_part.next_process_id
 //! - 多个 batch 共享同一 step 时去重（典型场景：拆分前的同一 step 上下文）
 //!
+//! （**以上 2026-09-30 起全部作废，见下条**）
+//!
+//! 2026-09-30 改直读 `t_part_batch.current_process_id`（migration 004）：
+//! 派生源换成批次所属工序的新权威列，**删掉整块 step_id → process_id 转译
+//! SELECT**。原先的转译有两个问题：
+//! 1. 每次 rollup 多一次 DB 往返（batch 状态每变一次就多一次）；
+//! 2. 「最慢批次」只按 status 挑、不看工序，若它 `current_process_step_id`
+//!    为 NULL（无工序链工单的常态）就会把整个工单的 `t_part.next_process_id`
+//!    抹成 NULL —— 而该列是删工序的保护条件之一，等于防线静默失效。
+//!
 //! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
-//! `impl for &mut PgConnection`）。inline sqlx 查询（`t_process_chain_step` 不属于
-//! PartRepoTrait 范围）经 `repo.conn_mut()` 走——trait 自带 `conn_mut()` 方法
-//! 返回 `&mut PgConnection`（sqlx Executor）。
+//! `impl for &mut PgConnection`）。
+//!
+//! 2026-09-30 备注：D-6 时代遗留的「inline sqlx 查询（`t_process_chain_step`
+//! 不属于 PartRepoTrait 范围）经 `repo.conn_mut()` 走」在本文件已无实际调用点
+//! —— 那是 step_id → process_id 转译 SELECT 用的，2026-09-30 随转译一起删除。
+//! `repo.conn_mut()` 仍用于步骤 8 的 `AssemblyService::sync_from_part_change`。
 
 use sqlx::PgConnection;
 
@@ -56,17 +69,26 @@ impl PartService {
     /// - `BatchForRollup.next_process_id` → `current_process_step_id`
     /// - 本方法在写入 `t_part.next_process_id` 缓存前一步：取 min-progress
     ///   批次的 step_id，经 `t_process_chain_step.process_id` 派生后写入
-    /// - step_id 与 process_id 1:1 对应（同 chain 内 step.process_id 唯一），
-    ///   故纯函数 `compute_part_target` 搬运 step_id 再做语义对齐；
-    ///   实际写入时已转回 process_id（caller 透传）
+    ///
+    /// （**2026-09-30 起作废，见下条**）
+    ///
+    /// 2026-09-30 改直读 `current_process_id`（migration 004）：
+    /// - `BatchForRollup.current_process_step_id` → `current_process_id`
+    /// - `PartRollupTarget.next_process_id` → `current_process_id`（这次名实相符）
+    /// - 删掉「step_id → 额外 SELECT t_process_chain_step → process_id」转译；
+    ///   `derived_next_process_id` 直接取 `target.current_process_id`
+    /// - 顺带修掉「最慢批次 step 为 NULL → 整个工单 `t_part.next_process_id`
+    ///   被抹 NULL」的隐患（该列是删工序保护条件之一）
+    /// - `t_part.next_process_id` **列名与对外 DTO 字段名均不变**，只改派生源
     ///
     /// 签名收 `&mut R: PartRepoTrait`（而非 `R` by-value）——本方法是 service 层
     /// helper（lifecycle / worker_scan 在 mid-method 调用后仍需继续用 repo），不
     /// 对 handler 暴露。caller 借 `&mut repo` 传入即可继续使用。
     ///
-    /// inline sqlx 查询（`t_process_chain_step` 不属于 PartRepoTrait 范围）经
-    /// `repo.conn_mut()` 走——生产 `R = &mut PgConnection` 时 `repo: &mut &mut PgConnection`，
-    /// `repo.conn_mut()` 由 Rust auto-deref + reborrow 得到 `&mut PgConnection`（sqlx Executor）。
+    /// 2026-09-22 D-6 备注：`repo.conn_mut()` 仍用于步骤 8 调
+    /// `AssemblyService::sync_from_part_change`（生产 `R = &mut PgConnection` 时
+    /// `repo: &mut &mut PgConnection`，由 Rust auto-deref + reborrow 得到
+    /// `&mut PgConnection`（sqlx Executor））。
     pub async fn sync_from_batch_change<R: PartRepoTrait>(
         repo: &mut R,
         part_id: i64,
@@ -78,16 +100,15 @@ impl PartService {
         // 2. 投影到 `BatchForRollup`（仅 rollup 所需 4 列；避免引入完整
         //    `TPartBatch` 让纯函数测试受阻）。
         //
-        //    2026-09-16 PR-3 批次 step 化：删 placed_at，next_process_id 改为
-        //    current_process_step_id（语义对齐：service 层在写入 t_part 时再
-        //    经 step JOIN 转回 process_id）。
+        //    2026-09-30 改直读 `current_process_id`（migration 004）：删掉原
+        //    `current_process_step_id`，直接取批次所属工序（工单行的权威依据）。
         let rows: Vec<BatchForRollup> = batches
             .iter()
             .map(|b| BatchForRollup {
                 status: b.status.clone(),
                 location: b.location.clone(),
                 current_holder_id: b.current_holder_id,
-                current_process_step_id: b.current_process_step_id,
+                current_process_id: b.current_process_id,
             })
             .collect();
 
@@ -103,27 +124,21 @@ impl PartService {
             AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
         })?;
 
-        // 5. PR-3 派生：把 target.next_process_id（实际为 step_id）经 step JOIN
-        //    转回 process_id，作为 t_part.next_process_id 缓存写入值。
+        // 5. 2026-09-30 派生：`target.current_process_id` 已是 process_id，
+        //    **直接**作为 `t_part.next_process_id` 缓存写入值。
         //
-        //    与原 PR-2 行为对齐：当无活跃 step 时返回 NULL（与 part PENDING 时
-        //    next_process_id NULL 语义一致）。
-        let derived_next_process_id: Option<i64> = if let Some(step_id) = target.next_process_id {
-            // 取 step.process_id；step 已软删 / 不存在 → None（防御）
-            let row: Option<(i64,)> = sqlx::query_as(
-                "SELECT process_id FROM t_process_chain_step \
-                 WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(step_id)
-            .fetch_optional(repo.conn_mut())
-            .await?;
-            row.map(|(pid,)| pid)
-        } else {
-            None
-        };
+        //    2026-09-30 之前这里是「target.next_process_id（实为 step_id）→ 一次
+        //    额外 SELECT t_process_chain_step → process_id」的转译。删掉后有两个
+        //    收益：(a) 少一次 DB 往返；(b) 修掉「最慢批次 step_id 为 NULL → 整个
+        //    工单 t_part.next_process_id 被抹成 NULL」的隐患 —— 该列是删工序的
+        //    保护条件之一（`prod/process/repo/sql.rs::count_referencing` 5 个子
+        //    查询之一），被抹成 NULL 等于该防线静默失效。
+        //
+        //    语义与原 PR-2 行为一致：当批次无所属工序时写 NULL（与 part PENDING
+        //    时 next_process_id NULL 语义一致）。
+        let derived_next_process_id: Option<i64> = target.current_process_id;
 
-        // 6. target == 当前 → NoChange（注意：cur.next_process_id 是 process_id，
-        //    target.next_process_id 是 step_id 比较后再转换；这里比 process_id）
+        // 6. target == 当前 → NoChange（两侧都是 process_id，可直接比较）
         if cur.status == target.status && cur.next_process_id == derived_next_process_id {
             return Ok(SyncOutcome::NoChange);
         }

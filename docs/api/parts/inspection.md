@@ -495,6 +495,12 @@ Response 200 `data`：`InspectionBatchListOut`
 > —— `t_part_batch.placed_at` 列已删（不再统计生产时间）。
 > 新增 `current_process_step_id`（逻辑 FK → 工艺链步骤）。
 >
+> **2026-09-30（migration 004）**：`t_part_batch` 新增 `current_process_id`
+> （逻辑 FK → `t_process.id`），作为批次工序池归属的权威依据；本端点的
+> `next_process_id` / `next_process_name` 改直读该列（原先经
+> `LEFT JOIN t_process_chain_step` 中转，新下发批次会显示 `null` 工序）。
+> `current_process_step_id` 降级为可选的进度指针，**本 DTO 字段名不变**。
+>
 > 2026-09-16 PR-2（migration 027）：`InspectionBatchListItemOut` 删 `has_been_repaired`
 > 字段 —— `t_part_batch.has_been_repaired` 列已删；返修事实由
 > `t_part_event.event_type='REPAIR_STARTED'` 事件日志追溯（详见
@@ -506,8 +512,8 @@ holder 解析段（LEFT JOIN `t_worker` / `t_shelf` 一次拼齐）：
 |---|---|---|
 | `current_holder_id` | string (i64)? | 当前持有人 id（worker.id 或 shelf.id） |
 | `holder_name` | string? | 当前持有人名称（worker 真名 / 货架 code / null） |
-| `next_process_id` | string (i64)? | 下一道工序 id（INSPECTION 状态下非 NULL，对应 `t_process`） |
-| `next_process_name` | string? | 下一道工序名称（`t_process.name`，LEFT JOIN 拼齐） |
+| `next_process_id` | string (i64)? | 下一道工序 id（对应 `t_process`）。**2026-09-30 改直读 `t_part_batch.current_process_id`**（migration 004，工序池归属权威列），不再经 `LEFT JOIN t_process_chain_step` 中转 |
+| `next_process_name` | string? | 下一道工序名称（`t_process.name`，`LEFT JOIN ON t_process.id = t_part_batch.current_process_id` 拼齐） |
 
 delivery_note 解析段（LEFT JOIN `t_delivery_note` 一次拼齐）：
 

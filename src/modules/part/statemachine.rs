@@ -488,15 +488,22 @@ pub fn part_status_progress(s: &str) -> u8 {
 /// 2026-09-16 PR-3 批次 step 化（migration 028）：
 /// - 删 `placed_at`（t_part_batch 列已删）
 /// - `next_process_id` → `current_process_step_id`（t_part_batch 新列，逻辑 FK → step.id）
-/// - `BatchForRollup.current_process_step_id` 保留语义：service 层
-///   `sync_from_batch_change` 读后通过 `t_process_chain_step.process_id`
-///   派生 `t_part.next_process_id` 缓存（与 Python 行为对齐）
+///
+/// 2026-09-30 改直读 `current_process_id`（migration 004，逻辑 FK → t_process.id）：
+/// 字段由 `current_process_step_id` 改名。原先 rollup 派生只拿 step_id，再由
+/// service 层**额外发一次 SELECT** 去 `t_process_chain_step` 翻 `process_id`；
+/// 且「最慢批次」（min progress）只按 status 挑、不看工序，若它 step_id 为 NULL
+/// （无工序链工单的常态）就会把整个工单的 `t_part.next_process_id` 抹成 NULL，
+/// 而该列是删工序的保护条件之一（`prod/process` 的 `count_referencing` 5 个
+/// 子查询之一）。新列 `current_process_id` 是批次工序池归属的**权威依据**，
+/// 直读它即可，无需 step 中转。
 #[derive(Debug, Clone, Default)]
 pub struct BatchForRollup {
     pub status: String,
     pub location: Option<String>,
     pub current_holder_id: Option<i64>,
-    pub current_process_step_id: Option<i64>,
+    /// 逻辑 FK → `t_process.id`；2026-09-30 改直读新列（migration 004）。
+    pub current_process_id: Option<i64>,
 }
 
 /// `compute_part_target` 的输出：目标 status + 派生列（从最慢批次物化）。
@@ -510,10 +517,16 @@ pub struct BatchForRollup {
 /// `sync_from_batch_change` JOIN `t_process_chain_step` 取 `process_id` 写入）。
 /// 本函数只搬运 step_id → next_process_id（语义对齐：step 进程维度 1:1，
 /// rollup 派生保留同一 process_id）。
+///
+/// 2026-09-30 改直读 `current_process_id`（migration 004）：字段名同步改为
+/// `current_process_id`，且**这次名实相符**——承载的确实是 `t_process.id`
+/// （原 `next_process_id` 名下装的是 step_id，误导性命名）。DB 列名与对外
+/// DTO 字段名 `t_part.next_process_id` 不动，仅内部 struct 改名。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartRollupTarget {
     pub status: String,
-    pub next_process_id: Option<i64>,
+    /// 2026-09-30：由「实装 step_id 的 next_process_id」改为真正的 process_id。
+    pub current_process_id: Option<i64>,
 }
 
 /// batch 集 → part rollup target（part/assembly/batch 重构方案 §4.2 步骤 1–6）。
@@ -525,17 +538,18 @@ pub struct PartRollupTarget {
 /// 2. 全部 CANCELLED → `status='CANCELLED'`
 /// 3. 非 CANCELLED 全部 COMPLETED → `status='COMPLETED'`
 /// 4. 否则取「最慢批次」（min progress over non-terminal, non-cancelled）的
-///    `status` + `current_process_step_id`（语义对齐 `next_process_id`）；
+///    `status` + `current_process_id`（`t_part.next_process_id` 派生缓存）；
 ///    progress 表见 `part_status_progress`
 ///
 /// 2026-09-16 PR-2 瘦身：返回值只剩 `status` + `next_process_id`；其它派
 /// 生列（`location` / `current_holder_id` / `placed_at`）真相源在
 /// `t_part_batch`，由 `sync_from_batch_change` 的 caller 在需要时另查。
 ///
-/// 2026-09-16 PR-3：返回值字段名 `next_process_id` 不变（DTO 兼容），但内部
-/// 直接搬运 `current_process_step_id`（语义上「next_process_id」等价于
-/// `current_process_step_id.process_id`，由 caller 在写入 t_part 时经 step JOIN
-/// 派生）。本函数保持纯函数性质（不引入 SQL）。
+/// 2026-09-30 改直读 `current_process_id`（migration 004）：本函数保持纯函数
+/// 性质（不引入 SQL、不查 `t_process_chain_step`）。caller
+/// `sync_from_batch_change` 直接把 `current_process_id` 写进
+/// `t_part.next_process_id`，省掉原先「step_id → 一次 SELECT → process_id」的
+/// 转译往返。
 pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarget> {
     if batches.is_empty() {
         return None;
@@ -546,7 +560,7 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         let r = &batches[0];
         return Some(PartRollupTarget {
             status: "CANCELLED".to_string(),
-            next_process_id: r.current_process_step_id,
+            current_process_id: r.current_process_id,
         });
     }
     let non_terminal: Vec<&BatchForRollup> = non_cancelled
@@ -558,7 +572,7 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         let r = non_cancelled[0];
         return Some(PartRollupTarget {
             status: "COMPLETED".to_string(),
-            next_process_id: r.current_process_step_id,
+            current_process_id: r.current_process_id,
         });
     }
     // 取 min-progress 批次
@@ -569,7 +583,7 @@ pub fn compute_part_target(batches: &[BatchForRollup]) -> Option<PartRollupTarge
         .unwrap(); // safety: non_terminal 至少有一条
     Some(PartRollupTarget {
         status: min.status.clone(),
-        next_process_id: min.current_process_step_id,
+        current_process_id: min.current_process_id,
     })
 }
 
@@ -582,7 +596,7 @@ mod rollup_tests {
             status: status.to_string(),
             location: None,
             current_holder_id: None,
-            current_process_step_id: None,
+            current_process_id: None,
         }
     }
 
@@ -591,7 +605,7 @@ mod rollup_tests {
             status: status.to_string(),
             location: loc.map(str::to_string),
             current_holder_id: None,
-            current_process_step_id: None,
+            current_process_id: None,
         }
     }
 
@@ -722,19 +736,19 @@ mod rollup_tests {
         // 2026-09-16 PR-2 瘦身：rollup 只物化 status + next_process_id。
         // 验证 next_process_id 从 min-progress 批次派生（其它派生列忽略）。
         //
-        // 2026-09-16 PR-3 批次 step 化：BatchForRollup.next_process_id 字段删除，
-        // 改用 current_process_step_id（service 层在写入 t_part.next_process_id
-        // 时经 step JOIN 取 process_id）；本函数保持纯函数性质，直接搬运 step_id。
+        // 2026-09-30 改直读 current_process_id（migration 004）：本函数纯搬运
+        // t_part_batch.current_process_id（真 process_id），caller 直接写
+        // t_part.next_process_id，不再经 t_process_chain_step 中转。
         let mut b_in_process = batch_with_loc("IN_PROCESS", Some("PRODUCTION_SHELF"));
         b_in_process.current_holder_id = Some(42);
-        b_in_process.current_process_step_id = Some(7);
+        b_in_process.current_process_id = Some(7);
         let v = vec![
             b_in_process,
             batch_with_loc("DELIVERED", Some("OUTSOURCE_COMPANY")),
         ];
         let r = compute_part_target(&v).unwrap();
         assert_eq!(r.status, "IN_PROCESS");
-        assert_eq!(r.next_process_id, Some(7));
+        assert_eq!(r.current_process_id, Some(7));
     }
 
     #[test]
@@ -745,7 +759,7 @@ mod rollup_tests {
         ];
         let r = compute_part_target(&v).unwrap();
         assert_eq!(r.status, "CANCELLED");
-        // next_process_id 默认 None，无 active 派生
-        assert_eq!(r.next_process_id, None);
+        // current_process_id 默认 None，无 active 派生
+        assert_eq!(r.current_process_id, None);
     }
 }

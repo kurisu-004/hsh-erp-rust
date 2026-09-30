@@ -17,7 +17,8 @@
 //!   指向所属 part 的工艺链步骤（t_process_chain_step.id）
 //! - 删 `placed_at`（不再统计生产时间）
 //!
-//! 真实 process_id 由 service 层 JOIN t_process_chain_step 按需派生。
+//! 真实 process_id 原先由 service 层 JOIN t_process_chain_step 按需派生
+//! （2026-09-30 起不再需要，见下条）。
 //!
 //! 2026-09-30 新增 `current_process_id`（migration 004）：
 //! - `current_process_id`（逻辑 FK → `t_process.id`）是**判断批次是否属于某
@@ -116,8 +117,12 @@ pub struct PartBatchScanRow {
 ///
 /// 2026-09-16 PR-3 批次 step 化：
 /// - 删 `placed_at`（t_part_batch 列已删）
-/// - `next_process_id` 改为派生：`step.process_id`（JOIN t_process_chain_step 取），
-///   保留字段名以兼容 DTO 与前端
+/// - `next_process_id` 改为派生
+///
+/// 2026-09-30 改直读 `pb.current_process_id`（migration 004）：`next_process_id`
+/// 不再经 `t_process_chain_step` 中转，直接取批次所属工序（权威列），
+/// `next_process_name` 的 `t_process` JOIN 改挂该列。字段名保留以兼容 DTO
+/// 与前端。
 #[derive(Debug, Clone)]
 pub struct InspectionBatchListRow {
     // 批次
@@ -134,8 +139,9 @@ pub struct InspectionBatchListRow {
     // holder / process / delivery_note 解析
     pub current_holder_id: Option<i64>,
     pub holder_name: Option<String>,
-    /// 派生自 current_process_step_id（JOIN step.process_id）；保留字段名以
-    /// 兼容下游 DTO 与前端。
+    /// 直读 `t_part_batch.current_process_id`（2026-09-30；原先经
+    /// `current_process_step_id` → step JOIN 派生）；保留字段名以兼容下游
+    /// DTO 与前端。
     pub next_process_id: Option<i64>,
     pub next_process_name: Option<String>,
     pub delivery_note_id: Option<i64>,

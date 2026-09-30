@@ -153,8 +153,22 @@
 > 2026-09-16 PR-3 批次 step 化（migration 028）：`t_part_batch.next_process_id` 列
 > 替换为 `current_process_step_id`（逻辑 FK → `t_process_chain_step.id`）。
 > `t_part_batch.placed_at` 列已删除（不再统计生产时间）。`TPart.next_process_id`
-> DB 列保留作派生缓存，由 `sync_from_batch_change` rollup 派生
-> （min-progress 活跃 batch 的 step JOIN `t_process_chain_step.process_id`）。
+> DB 列保留作派生缓存。
+>
+> **2026-09-30 rollup 改直读 `t_part_batch.current_process_id`（migration 004）**：
+> `TPart.next_process_id`（DB 列名与对外 DTO 字段名均**不变**）的派生源从
+> 「min-progress 活跃 batch 的 `current_process_step_id` → JOIN
+> `t_process_chain_step.process_id`」改为「min-progress 活跃 batch 的
+> **`current_process_id` 直读**」。同时 `t_part_batch` 新增
+> `current_process_id`（逻辑 FK → `t_process.id`），作为批次**工序池归属的唯一
+> 权威依据**；`current_process_step_id` 降级为可选的**进度指针**（仅当工单有
+> 工序链时才有值，允许 NULL）。
+> - 修掉隐患：原派生只看「最慢批次」的 step_id，而该值对无工序链工单恒为 NULL，
+>   会把整个工单的 `t_part.next_process_id` 抹成 NULL —— 该列是**删工序的保护
+>   条件之一**（`t_process` 软删前 `count_referencing` 的 5 个子查询之一），
+>   被抹成 NULL 等于这道防线静默失效。
+> - 少一次 DB 往返：原先每次 rollup 都要额外 SELECT 一次
+>   `t_process_chain_step` 把 step_id 翻成 process_id。
 >
 > **2026-09-27 part 域前后端字段对齐**：
 > - 响应中**不再出现** `next_process_id` / `next_process_name` —— 但仅 list 端点不

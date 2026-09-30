@@ -135,7 +135,7 @@ HTTP request
 | `data.on_production_shelves[].items[].customer_id` | string \| null | 否 | 客户 id（i64 → 字符串） |
 | `data.on_production_shelves[].items[].customer_name` | string \| null | 否 | L2 客户名 |
 | `data.on_production_shelves[].items[].customer_path` | string \| null | 否 | L1 / L2 客户路径 |
-| `data.on_production_shelves[].items[].next_process_id` | string \| null | 否 | 下一道工序 id（deprecated 标记保留，2026-09-27 part 域字段对齐影响） |
+| `data.on_production_shelves[].items[].next_process_id` | string \| null | 否 | 下一道工序 id（deprecated 标记保留，2026-09-27 part 域字段对齐影响）。**2026-09-30 改直读 `t_part_batch.current_process_id`**（migration 004）——原先经 `LEFT JOIN t_process_chain_step` 取 `s.process_id`，新下发批次（step 为 NULL）会显示 `null` 工序；**字段名不变** |
 | `data.on_production_shelves[].items[].next_process_name` | string \| null | 否 | 下一道工序名 |
 | `data.on_production_shelves[].items[].worker_name` | string \| null | 否 | 当前持有工人姓名 |
 | `data.upcoming_delivery[].date` | string | 是 | 日期 `YYYY-MM-DD` |
@@ -179,6 +179,8 @@ HTTP request
   - **snowflake ID 类**（`shelf_id` / `id` / `batch_id` / `customer_id` /
     `current_holder_id` / `next_process_id`）在 JSON 中序列化为**字符串**，
     与现有 HTTP `R<T>` 风格一致（避免 JS `Number.MAX_SAFE_INTEGER` 精度截断）。
+    其中 `next_process_id` 的**取值来源**为 `t_part_batch.current_process_id`
+    （2026-09-30 起直读，migration 004），字段名与序列化形态均不变。
   - **数值类**（`data.upcoming_delivery[].count`）保留 JSON integer（小整数，
     不会触发精度问题）。
 - WS handshake 仍推一次 `WsSnapshotMsg`（保留向后兼容），不动 `ws_dashboard`

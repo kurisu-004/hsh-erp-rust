@@ -18,6 +18,23 @@
 #   旧的 29 个 DDL+菜单 DML 迁移已合并到 baseline，菜单 seed 抽到 seeds/。
 #   旧的 SKIP_RE（015/018/021/023/024）失效：015 DML 在 baseline 中是
 #   CREATE SEQUENCE + 空 INSERT（no-op），其它全在 baseline；菜单种子走 seeds/。
+#
+# 2026-09-30 修复：template 库迁移从「断言 migrations/ 有且仅有 1 个 .sql」改成
+#   「按字典序逐个 apply」。原断言自第 2 个迁移文件（2026-09-29 wx identity）加入
+#   起就必然失败（master 上同样坏），导致本脚本从没人能跑通——集成测试实际一直
+#   靠 CLAUDE.md:37 的 `TEST_DATABASE_BASE_URL=... cargo nextest run` 快速路兜底。
+#   根因是脚本把「baseline 单文件」这一 2026-09-25 的**阶段性**状态写成了断言；
+#   但 migrations/README.md 明确「新 schema 变更走 append-only 追加新迁移」，
+#   文件数必然增长。
+#
+#   字典序 == 时间序的前提：迁移命名规范是 `<13位时间戳>_<顺序>_<描述>.sql`
+#   （migrations/README.md「命名」节），13 位时间戳定长且十进制零填充，13 位上限
+#   远超现有值（2026 年 ≈ 2.0e12 < 1e13），故定长前缀的字典序等价于时间序。
+#   追加新迁移时只要继续遵守该命名规范，apply 顺序就与 sqlx::migrate! 扫描序一致。
+#
+#   仍用裸 `psql` apply（**不写** `_sqlx_migrations` 账本）：template 库只作
+#   CREATE DATABASE ... TEMPLATE 的模板，账本缺失不影响派生库；改成调
+#   `cargo sqlx migrate run` 反而会因为账本缺失而重跑 baseline 并失败。
 
 set -euo pipefail
 
@@ -101,23 +118,27 @@ export JWT_TEST_PRIVATE_PEM_PATH="$JWT_KEYS_TMPDIR/priv.pem"
 export JWT_TEST_PUBLIC_PEMS_DIR="$JWT_KEYS_TMPDIR/pub"
 
 # 2026-09-20 plan 2 + 2026-09-25 改造：在容器内 CREATE DATABASE hsh_erp_template，
-# 跑 baseline 迁移 + seeds/menu.sql，让测试 DB 共享同一份 schema + 菜单 baseline。
+# 跑全部迁移 + seeds/menu.sql，让测试 DB 共享同一份 schema + 菜单 baseline。
 TEMPLATE_DB=hsh_erp_template
 docker exec -e PGPASSWORD=postgres "$CID" \
     psql -U postgres -c "CREATE DATABASE \"$TEMPLATE_DB\"" \
     >/dev/null
 
-# 跑 baseline 单文件迁移到 template（2026-09-25 起 migrations/ 只有一个文件）
+# 2026-09-30 修复：按字典序逐个 apply migrations/*.sql（原先断言「有且仅有 1 个
+# 文件」，从第 2 个迁移加入起就必然失败）。字典序 == 时间序的前提见文件头注释
+# （迁移命名规范 `<13位时间戳>_<顺序>_<描述>.sql`，见 migrations/README.md）。
 shopt -s nullglob
-baseline_files=(migrations/*.sql)
-if [ "${#baseline_files[@]}" -ne 1 ]; then
-    echo "error: 预期 migrations/ 有且仅有 1 个 .sql 文件，实际找到 ${#baseline_files[@]} 个" >&2
-    ls -la migrations/*.sql >&2
+migration_files=(migrations/*.sql)
+if [ "${#migration_files[@]}" -eq 0 ]; then
+    echo "error: migrations/ 下没有任何 .sql 文件" >&2
     exit 1
 fi
-docker exec -i -e PGPASSWORD=postgres "$CID" \
-    psql -U postgres -d "$TEMPLATE_DB" -v ON_ERROR_STOP=1 -f - \
-    < "${baseline_files[0]}" >/dev/null
+for f in "${migration_files[@]}"; do
+    echo "[migrate] $f" >&2
+    docker exec -i -e PGPASSWORD=postgres "$CID" \
+        psql -U postgres -d "$TEMPLATE_DB" -v ON_ERROR_STOP=1 -f - \
+        < "$f" >/dev/null
+done
 
 # 跑菜单种子到 template（幂等；test 路径下也走同一份声明式菜单树，
 # 与 production 一致；测试自身的 seed_* helper 不受 seed IDs 干扰，
