@@ -25,7 +25,11 @@
 Request：
 
 - Header：`Authorization: Bearer <access_token>`（必填，走 `v2_router` 中间件）
-- 无 query 参数、无 body
+- Query（可选，2026-09-30 新增）：
+  - `upcoming_days` — 未来 N 天交付分桶的天数，i64 字符串形式（沿仓内 part 域 DTO
+    `deserialize_i64_opt` 解析规则）；缺省 / 非法 → service 层兜底为 14；
+    取值范围 `1..=60`（service 层 `clamp` 防御恶意大数 / 拼写错把日期塞成 10000）。
+- 无 body
 
 调用链：
 
@@ -34,8 +38,10 @@ HTTP request
   → v2_router authenticate_middleware (Bearer JWT + Redis session)
   → CurrentUser extractor
   → handler::get_snapshot
+    → Query<SnapshotQuery> 解析 upcoming_days（缺省 None）
     → state.pool.begin()
-    → state.dashboard_service.build_snapshot_with_workers(&mut *tx, None)
+    → state.dashboard_service.build_snapshot_with_workers(&mut *tx, None, q.upcoming_days)
+       // service 层 days.unwrap_or(14).clamp(1, 60) 兜底
     → tx.commit()
   → Json(R<DashboardSnapshot>)
 ```
@@ -92,7 +98,7 @@ HTTP request
         "count": 6,
         "by_status": { "DELIVERED": 1, "INSPECTION": 2, "PENDING": 3 }
       }
-      // 固定 7 条（今天 + 未来 6 天），每条都含 by_status（必填，空对象 = 当日 0 件）
+      // 固定 N 条（N = ?upcoming_days；缺省 14，service 层 clamp(1, 60)）；每条都含 by_status（必填，空对象 = 当日 0 件）
     ],
     "ts": "2026-09-28T15:00:00+08:00"
   }
@@ -106,7 +112,7 @@ HTTP request
 | `data.on_production_shelves` | array | 是 | 生产区货架分组（每架 `OnProductionShelfGroup`） |
 | `data.on_inspection_shelves` | array | 是 | 待品检货架上的 part 项（`DashboardItem`） |
 | `data.in_process` | array | 是 | 加工中的 part（`DashboardItem`，holder 类别为 `WORKER` / `WORKER_POOL`） |
-| `data.upcoming_delivery` | array | 是 | 未来 7 天交付分桶（`UpcomingDeliveryBucket`），固定 7 条 |
+| `data.upcoming_delivery` | array | 是 | 未来 N 天交付分桶（`UpcomingDeliveryBucket`），固定 N 条；N 来自 `?upcoming_days=`，缺省 14，service 层 `clamp(1, 60)` 兜底（2026-09-30 新增） |
 | `data.ts` | string | 是 | 快照构建本地时间戳（`YYYY-MM-DDTHH:MM:SS.fff+08:00`） |
 | `data.on_production_shelves[].shelf_id` | string | 是 | 货架 snowflake id（**i64 → 字符串**） |
 | `data.on_production_shelves[].shelf_code` | string | 是 | 货架代号 |
