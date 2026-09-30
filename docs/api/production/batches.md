@@ -1,35 +1,39 @@
-# prod::batch 域 API —— 车间 PENDING 批次列表 + 下发
+# prod::batch 域 API —— 车间 PENDING 批次列表 + 下发（2026-09-30 重构）
 
 > 本文件须与 `src/modules/prod/batch/{handler.rs,dto.rs,service.rs,repo.rs,vo.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
-> 范围：**车间下发** PENDING 批次专用域 —— UI「待下发队列」展示 + 一键 / 批量 / 自动下发 3 路径。
-> 2026-09-29 新增；URL 挂 `/api/v2/prod/batches/*`；零 schema 变更（复用既有 `t_shelf_process`）。
+> 范围：**车间下发** PENDING 批次专用域 —— UI「待下发队列」展示 + 一键 / 批量 / 自动预览 3 路径。
+> 2026-09-29 新增 + 2026-09-30 重构：
+> - dispatch 统一 bulk-only（单条下发即 `targets.length == 1`）
+> - auto-dispatch 改为只读 preview（不再真下发，返回首道工序 + 首货架 + skip_reason）
+> - bulk-dispatch 端点删除（路由层不再挂载）
 
 ## 端点列表
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
 | GET | `/api/v2/prod/batches/pending` | **Manager+Clerk+Inspector** | 车间 PENDING 批次列表（JOIN 工单 + 客户 L1+L2 + 申请人） |
-| POST | `/api/v2/prod/batches/dispatch` | **Manager+Clerk** | 单 batch 下发（PENDING → IN_PROCESS + 上架 + 写事件） |
-| POST | `/api/v2/prod/batches/bulk-dispatch` | **Manager+Clerk** | 批量下发（单事务；任一失败 → 全回滚） |
-| POST | `/api/v2/prod/batches/auto-dispatch` | **Manager+Clerk** | 自动下发（按 part.process_chain 首道 step 推导 target_process；NO_PROCESS_CHAIN / NO_PROCESS_STEP 跳过不报错） |
+| POST | `/api/v2/prod/batches/dispatch` | **Manager+Clerk** | bulk-only 下发：`targets` 数组顺序执行，单批即 `targets.length==1`；任一失败 → 全回滚 |
+| POST | `/api/v2/prod/batches/auto-dispatch` | **Manager+Clerk** | **只读预览**：返回每个 batch 的首道工序 + 首货架 + `skip_reason`；前端据此构造 dispatch 请求 |
 
 > 路由挂载：`prod::mod::router().nest("/batches", batch::router())` —— 见 `src/modules/prod/mod.rs`。
+> 旧 `/batches/bulk-dispatch` 端点 404（router 层不再挂载）。
 
 ---
 
 ## 共同设计要点
 
 ### 货架解析（零 schema 变更）
-`target_process_id` → service 查 `t_shelf_process WHERE process_id = $1 AND deleted_at IS NULL ORDER BY sort_order ASC, id ASC LIMIT 1` 解析货架。多结果取 `sort_order` 最小者；0 结果 → `40402 BIZ_SHELF_PROCESS_NOT_FOUND`。
+`target_process_id` → service 查 `t_shelf_process WHERE process_id = $1 AND deleted_at IS NULL ORDER BY sort_order ASC, id ASC LIMIT 1` 解析货架。多结果取 `sort_order` 最小者；0 结果 → `20508 BIZ_SHELF_PROCESS_NOT_FOUND`。
 
 ### 状态机与事件
 dispatch 路径：`PENDING → IN_PROCESS`，`location='PRODUCTION_SHELF'`，`current_holder_id=shelf_id`，`current_process_step_id=NULL`（dispatch 路径不解析 step，由 worker-scan / 后续流转触发）。同事务写 `t_part_event.kind='PLACED_ON_SHELF'`（from='PENDING', to='IN_PROCESS'）。
 
 ### 事务 + WS 广播（沿 worker_pool 范本）
-- 读（pending）：`pool.acquire()` 不开事务。
-- 写（dispatch / bulk / auto）：handler `state.pool.begin()` → service → handler `tx.commit()` → 成功 commit 后 broadcast `BATCH_PLACED_ON_SHELF`（payload 含 batch_id / target_process_id / shelf_id / version）。
+- 读（pending）：`pool.acquire()` 不开事务
+- 写（dispatch）：handler `state.pool.begin()` → service → handler `tx.commit()` → 成功 commit 后 broadcast `BATCH_PLACED_ON_SHELF`（payload 含 batch_id / target_process_id / shelf_id / version）
+- 只读（auto-dispatch）：`pool.acquire()` 不开事务，**不发** WS 广播（无业务流转）
 
 ### 角色守卫
 下沉到 service（沿 `WorkerPoolService::pool_by_process` 范本），service 入口第一行 `current.require_any_role(...)`。
@@ -61,7 +65,7 @@ Response 200 `data`：[`PendingBatchListOut`](#pendingbatchlistout-字段)
 
 ---
 
-### `POST /api/v2/prod/batches/dispatch`
+### `POST /api/v2/prod/batches/dispatch`（2026-09-30 重构：bulk-only）
 
 权限：**Manager + Clerk**（service 内守卫）
 
@@ -69,78 +73,53 @@ Request：`DispatchRequest`
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `batch_id` | string (i64) | ✓ | 批次雪花 ID（`deserialize_i64` 反序列化） |
-| `target_process_id` | string (i64) | ✓ | 目标工序 ID（service 按 `t_shelf_process` 解析货架） |
-| `note` | string | ✗ | 落到 `t_part_event.note` |
-
-业务流转（service `dispatch_batch`）：
-
-1. 角色守卫：Manager + Clerk
-2. 取 batch（`find_batch_by_id(include_deleted=false)`）→ `None` → `20121 BIZ_BATCH_NOT_FOUND`
-3. 校验 `batch.status == 'PENDING'` → 否则 `20120 BIZ_BATCH_INVALID_STATUS`
-4. 解析货架（`find_first_shelf_for_process`）→ `None` → `20508 BIZ_SHELF_PROCESS_NOT_FOUND`
-5. `update_batch_dispatched`（OCC，WHERE `version = current_version AND status='PENDING'`）→ 0 行 → `40901 VERSION_CONFLICT`
-6. 写 `t_part_event(kind='PLACED_ON_SHELF', from='PENDING', to='IN_PROCESS')`
-7. 返回 `DispatchResult { batch_id, current_process_step_id=None, target_process_id, shelf_id, version=batch.version+1 }`
-
-Response 200 `data`：[`DispatchResult`](#dispatchresult-字段)
-
-错误码：
-
-- 20120 BIZ_BATCH_INVALID_STATUS —— 批次当前 status 非 PENDING（已被下发 / 已 IN_PROCESS）
-- 20121 BIZ_BATCH_NOT_FOUND —— batch_id 不存在 / 已软删
-- 20508 BIZ_SHELF_PROCESS_NOT_FOUND —— `target_process_id` 在 `t_shelf_process` 无任何 active 货架映射
-- 40901 VERSION_CONFLICT —— 并发事务已成功提交过本批次（OCC）
-- 40300 FORBIDDEN —— 非 Manager/Clerk
-- 40001 VALIDATION_ERROR —— payload shape 错误
-
-WS 广播（commit 后下发）：
-
-- `BATCH_PLACED_ON_SHELF`（payload = `{ batch_id, target_process_id, shelf_id, version }`）
-
----
-
-### `POST /api/v2/prod/batches/bulk-dispatch`
-
-权限：**Manager + Clerk**（service 内守卫）
-
-Request：`BulkDispatchRequest`
-
-| 字段 | 类型 | 必填 | 说明 |
-|---|---|---|---|
-| `targets` | `Vec<BulkDispatchTarget>` | ✓ | 每条 target 一个 `batch_id + target_process_id`；元素至少 1 条（空数组 → 40001） |
+| `targets` | `Vec<DispatchTarget>` | ✓ | 每条 target 一个 `batch_id + target_process_id`；空数组 → 40001 |
+| `note` | string? | ✗ | 落到所有 `t_part_event.note`（bulk 共享 note） |
 
 ```jsonc
 {
   "targets": [
     { "batch_id": "1001", "target_process_id": "2001" },
     { "batch_id": "1002", "target_process_id": "2002" }
-  ]
+  ],
+  "note": "批量下发"
 }
 ```
 
-业务流转（service `bulk_dispatch`）：
+业务流转（service `dispatch_batch` bulk-only，handler tx 边界）：
 
 1. 角色守卫：Manager + Clerk
 2. 校验 `targets` 非空 → 否则 `40001 VALIDATION_ERROR`（HTTP 422）
-3. 顺序循环执行 `dispatch_batch` 核心逻辑；任一失败 → 直接抛 AppError（caller 通过 `code()` 区分 20120 / 20121 / 20508 / 40901 等）
-4. handler 的 `Transaction` Drop 自动回滚（事务边界在 handler）
+3. 顺序循环执行 `dispatch_single` 内部 helper；任一硬失败 → **service 抛 AppError**，handler 的 `Transaction` Drop 自动回滚全部 succeeded 写入
+4. 全成功 commit → 广播 `BATCH_PLACED_ON_SHELF`（payload = `{ batches: [...] }`，含 succeeded 列表）
 
-Response 200 `data`：[`BulkDispatchResult`](#bulkdispatchresult-字段)
+`dispatch_single` 内部 helper 步骤：
 
-错误码：
+1. 取 batch（`find_batch_by_id(include_deleted=false)`）→ `None` → `20121 BIZ_BATCH_NOT_FOUND`
+2. 校验 `batch.status == 'PENDING'` → 否则 `20120 BIZ_BATCH_INVALID_STATUS`
+3. 解析货架（`find_first_shelf_for_process`）→ `None` → `20508 BIZ_SHELF_PROCESS_NOT_FOUND`
+4. `update_batch_dispatched`（OCC，WHERE `version = current_version AND status='PENDING'`）→ 0 行 → `40901 VERSION_CONFLICT`
+5. 写 `t_part_event(kind='PLACED_ON_SHELF', from='PENDING', to='IN_PROCESS')`
+6. 返回 `DispatchSuccessItem { batch_id, current_process_step_id=None, target_process_id, shelf_id, version=batch.version+1 }`
+
+Response 200 `data`：[`DispatchResult`](#dispatchresult-字段)
+
+错误码（任一硬失败顶层响应）：
 
 - 40001 VALIDATION_ERROR —— `targets` 为空
-- 20120 / 20121 / 20508 / 40901 —— 同 dispatch 端点，任一失败透传
+- 20120 BIZ_BATCH_INVALID_STATUS —— 批次当前 status 非 PENDING
+- 20121 BIZ_BATCH_NOT_FOUND —— batch_id 不存在 / 已软删
+- 20508 BIZ_SHELF_PROCESS_NOT_FOUND —— `target_process_id` 在 `t_shelf_process` 无任何 active 货架映射
+- 40901 VERSION_CONFLICT —— 并发事务已成功提交过本批次（OCC）
 - 40300 FORBIDDEN —— 非 Manager/Clerk
 
-WS 广播（commit 后下发）：
+WS 广播（commit 后下发；仅 succeeded 时广播）：
 
 - `BATCH_PLACED_ON_SHELF`（payload = `{ batches: [{ batch_id, target_process_id, shelf_id, version }, ...] }`）
 
 ---
 
-### `POST /api/v2/prod/batches/auto-dispatch`
+### `POST /api/v2/prod/batches/auto-dispatch`（2026-09-30 重构：只读 preview）
 
 权限：**Manager + Clerk**（service 内守卫）
 
@@ -148,32 +127,35 @@ Request：`AutoDispatchRequest`
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `batch_ids` | `Vec<i64>` (字符串数组) | ✗ | 待自动推导下发的 batch_id 列表；空数组 / `null` → 40001；`deserialize_i64_vec_opt` 反序列化（前端可发字符串数组） |
+| `batch_ids` | `Vec<i64>` (字符串数组) | ✗ | 待预览的 batch_id 列表；空数组 / `null` → 40001；`deserialize_i64_vec_opt` 反序列化（前端可发字符串数组） |
 
-业务流转（service `auto_dispatch`）：
+业务流转（service `auto_dispatch_preview`，**只读不开事务**）：
 
 1. 角色守卫：Manager + Clerk
 2. 校验 `batch_ids` 非空 → 否则 `40001 VALIDATION_ERROR`（HTTP 422）
-3. 对每个 `batch_id`：
-   - 取 batch；`None` → `20121 BIZ_BATCH_NOT_FOUND`（硬错误，全回滚）
-   - 查 `t_part.process_chain_id`；`NULL` → skipped（reason='NO_PROCESS_CHAIN'，不影响事务）
-   - 查 `t_process_chain_step WHERE chain_id = $1 ORDER BY sort_order ASC, id ASC LIMIT 1`；
-     `None` → skipped（reason='NO_PROCESS_STEP'，不影响事务）
-   - 否则以 `step.process_id` 作为 `target_process_id` 调 `dispatch_batch` 核心逻辑
-4. 全成功提交；任一硬错误（非 skipped）→ service 抛 AppError，handler 事务回滚
-5. skipped 与 succeeded 互不影响（skipped 是合法的「该 batch 跳过」语义）
+3. 调 `preview_auto_dispatch` **单 SQL**（`BatchRepo::preview_auto_dispatch`）拉所有 PENDING batch 的 preview 元数据
+4. 对每个 preview 行计算 `skip_reason`：
+   - `process_chain_id` 为 None → `"NO_PROCESS_CHAIN"`
+   - `first_process_id` 为 None → `"NO_PROCESS_STEP"`
+   - `first_shelf_id` 为 None → `"NO_SHELF"`
+   - 全有 → `None`（可下发）
+5. 对不在 preview 结果里的 `batch_id`（已软删 / 非 PENDING / 不存在）→ 兜底查 `part_id` + `skip_reason='NOT_FOUND'`
+6. 按 `batch_ids` 入参顺序排序返回（保持 caller 视角稳定）
+
+> **不写库、不发 WS**（只读查询，无业务流转）。
 
 Response 200 `data`：[`AutoDispatchResult`](#autodispatchresult-字段)
 
 错误码：
 
 - 40001 VALIDATION_ERROR —— `batch_ids` 为空
-- 20120 / 20121 / 20508 / 40901 —— 同 dispatch 端点，硬错误透传
 - 40300 FORBIDDEN —— 非 Manager/Clerk
 
-WS 广播（commit 后下发）：
+### 前端使用流
 
-- `BATCH_PLACED_ON_SHELF`（payload = `{ batches: [...] }`，仅 succeeded 部分；skipped 不广播）
+1. `GET /batches/pending` 拿到 PENDING 列表
+2. `POST /batches/auto-dispatch {batch_ids: [...]}` 拿到每个 batch 的 `first_process_id` / `first_shelf_id` / `skip_reason`
+3. 用户确认后 `POST /batches/dispatch {targets: [{batch_id, target_process_id}, ...]}` 真正下发
 
 ---
 
@@ -214,7 +196,17 @@ WS 广播（commit 后下发）：
 }
 ```
 
-### `DispatchResult` 字段
+### `DispatchResult` 字段（2026-09-30 重构：bulk-only 形态）
+
+```jsonc
+{
+  "succeeded": [DispatchSuccessItem, ...],  // 顺序与 req.targets 一致
+  "failed": []                              // 当前实现「任一失败 → 全回滚」（service 抛 AppError），
+                                            //   failed 字段恒空；预留 partial commit 未来扩展
+}
+```
+
+### `DispatchSuccessItem` 字段
 
 ```jsonc
 {
@@ -226,25 +218,27 @@ WS 广播（commit 后下发）：
 }
 ```
 
-### `BulkDispatchResult` 字段
+### `AutoDispatchResult` 字段（2026-09-30 重构：只读 preview）
 
 ```jsonc
 {
-  "succeeded": [DispatchResult, ...], // 全部成功的明细
-  "failed": []                        // 当前实现「任一失败 → 全回滚」，失败数组恒空；
-                                       //   失败码经 AppError.code() 抛给 caller
+  "items": [AutoDispatchItem, ...]    // 按 req.batch_ids 入参顺序稳定排序
 }
 ```
 
-### `AutoDispatchResult` 字段
+### `AutoDispatchItem` 字段
 
 ```jsonc
 {
-  "succeeded": [DispatchResult, ...],    // 成功下发
-  "skipped": [                            // 跳过（不影响 succeeded / 不全回滚）
-    { "batch_id": "1002", "reason": "NO_PROCESS_CHAIN" },
-    { "batch_id": "1003", "reason": "NO_PROCESS_STEP" }
-  ]
+  "batch_id": "1001",
+  "part_id": "2001",
+  "process_chain_id": "3001",         // 0 表示 part 无 chain
+  "first_process_id": "4001",         // 0 表示无可用 step
+  "first_process_code": "PROC-A",
+  "first_process_name": "工序A",
+  "first_shelf_id": "5001",           // 0 表示首道工序无货架映射
+  "skip_reason": null                 // Option<String>：NOT_FOUND / NO_PROCESS_CHAIN /
+                                      //   NO_PROCESS_STEP / NO_SHELF；null 表示可下发
 }
 ```
 
@@ -259,7 +253,7 @@ WS 广播（commit 后下发）：
 | 20508 | BIZ_SHELF_PROCESS_NOT_FOUND | 404 | target_process_id 在 t_shelf_process 无任何 active 映射 |
 | 40901 | VERSION_CONFLICT | 409 | 并发事务抢回本批次（OCC） |
 | 40300 | FORBIDDEN | 403 | 角色守卫失败 |
-| 40001 | VALIDATION_ERROR | 422 | bulk/auto-dispatch targets / batch_ids 为空 |
+| 40001 | VALIDATION_ERROR | 422 | dispatch targets / auto-dispatch batch_ids 为空 |
 
 > 完整错误码定义见 [`../index.md`](../index.md#跨域错误码速查) 与 `src/shared/error.rs::code`。
 
