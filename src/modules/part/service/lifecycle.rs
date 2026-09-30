@@ -430,9 +430,12 @@ impl PartService {
     ///
     /// 不走 OCC（force-complete 是逃生通道，依赖 SQL 行锁串行化）；
     /// `force_complete_all_batches_for_part` 单 SQL 强推 part 下所有非
-    /// CANCELLED 活跃批次 → COMPLETED，复用 `sync_from_batch_change` 让
-    /// `compute_part_target` 自动派生 `part.status='COMPLETED'`，再复用
-    /// `clear_part_serial_no_when_completed` 收尾清空 `serial_no`。
+    /// CANCELLED 活跃批次 → COMPLETED。
+    ///
+    /// 2026-10-01：该 bulk 写点已改走 `status_gate` 的批量模式，故
+    /// `compute_part_target` 派生 `part.status='COMPLETED'`、级联 assembly
+    /// 同步、终态序列号归档 / 释放**全部在同一事务内自动完成**，
+    /// 本方法不再手工调 `sync_from_batch_change` / `clear_part_serial_no_when_completed`。
     ///
     /// 事件日志 `event_type='FORCE_COMPLETED'`（区别常规 COMPLETED），note 加
     /// `[FORCE]` 前缀以便审计追溯；WS 广播 `PART_FORCE_COMPLETED`。
