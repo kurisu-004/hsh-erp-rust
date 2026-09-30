@@ -421,6 +421,11 @@ impl AssemblyRepoTrait for &mut PgConnection {
             statuses,
             is_urgent,
             keyword,
+            // 2026-09-30 新增：trait 层 list_with_filters 不带日期过滤形态（trait
+            // 形参上限已达 10），固定 None 维持旧行为。仅 com::union_list 端点
+            // 直接构造 AssemblyListFilters 时传实际日期值。
+            planned_delivery_date_from: None,
+            planned_delivery_date_to: None,
             sort_by,
             sort_dir,
             limit,
@@ -446,6 +451,9 @@ impl AssemblyRepoTrait for &mut PgConnection {
             statuses,
             is_urgent,
             keyword,
+            // 2026-09-30 新增：与 list_with_filters trait 方法同理，固定 None。
+            planned_delivery_date_from: None,
+            planned_delivery_date_to: None,
             sort_by: None,
             sort_dir: None,
             limit: 0,

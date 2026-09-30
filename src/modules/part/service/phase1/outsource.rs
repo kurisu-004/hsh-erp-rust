@@ -496,6 +496,10 @@ impl PartService {
             // locations/holder_ids（业务语义固定 OUTSOURCE 状态）
             locations: &[],
             holder_ids: &[],
+            // 2026-09-30 新增：外协 endpoint 不暴露日期窗口过滤（仅 com::union_list
+            // 使用），固定 None 维持旧行为。
+            planned_delivery_date_from: None,
+            planned_delivery_date_to: None,
             // 2026-09-28 新增：内部 caller（外协在途）不过滤装配体子件（语义
             // 固定 OUTSOURCE 单件状态），与历史行为一致。
             part_only: false,
@@ -548,6 +552,10 @@ impl PartService {
             // locations/holder_ids（业务语义固定 PENDING+IN_PROCESS 状态）
             locations: &[],
             holder_ids: &[],
+            // 2026-09-30 新增：外协 endpoint 不暴露日期窗口过滤（仅 com::union_list
+            // 使用），固定 None 维持旧行为。
+            planned_delivery_date_from: None,
+            planned_delivery_date_to: None,
             // 2026-09-28 新增：内部 caller（外协可发）不过滤装配体子件（语义
             // 固定 PENDING+IN_PROCESS 单件状态），与历史行为一致。
             part_only: false,

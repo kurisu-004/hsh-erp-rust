@@ -100,6 +100,13 @@ pub struct PartUpdate<'a> {
 /// 模式（或 PART-only 模式）下要排除。`true` 时额外追加 `AND assembly_id IS NULL`
 /// 守卫；`false` 时不追加（兼容旧 caller）。repo 层不做"ALL 合并"，ALL 合并由
 /// service 层在内存里 merge（见 `PartService::list_parts` 三模式分发）。
+///
+/// 2026-09-30 新增：`planned_delivery_date_from/to: Option<chrono::NaiveDate>`
+/// 日期窗口过滤。`None` 端不参与过滤；`Some(d)` 端追加 `AND planned_delivery_date
+/// >= $d` 或 `<= $d`。`t_part.planned_delivery_date` 是 NOT NULL（DDL
+/// migrations/005:18-19），无 NULL 短路必要。当前仅 com::union_list 端点（dashboard
+/// UpcomingDeliveryListDrawer）使用，其它 caller（part 服务层 / 外协 endpoint）
+/// 默认传 `None`，零破坏行为。
 #[derive(Debug, Default, Clone)]
 pub struct PartListFilters<'a> {
     pub customer_ids: &'a [i64],
@@ -109,6 +116,10 @@ pub struct PartListFilters<'a> {
     pub keyword: Option<&'a str>,
     pub locations: &'a [String],
     pub holder_ids: &'a [i64],
+    /// 2026-09-30 新增：`planned_delivery_date >= from` 过滤。`None` → 不过滤。
+    pub planned_delivery_date_from: Option<chrono::NaiveDate>,
+    /// 2026-09-30 新增：`planned_delivery_date <= to` 过滤。`None` → 不过滤。
+    pub planned_delivery_date_to: Option<chrono::NaiveDate>,
     /// 2026-09-28 新增：装配体子件过滤开关。
     /// - `true`：追加 `AND assembly_id IS NULL`（PART-only 模式 / ALL 模式零件段）
     /// - `false`：不过滤（兼容旧 caller，如 `pending-programming` / `outsource-*` 等）
@@ -525,6 +536,13 @@ impl PartRepo {
                       AND pb.deleted_at IS NULL)",
             );
         }
+        // 2026-09-30 新增：日期窗口过滤（与 com::union_list 段内消费同语义）。
+        if let Some(d) = f.planned_delivery_date_from {
+            qb.push(" AND planned_delivery_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.planned_delivery_date_to {
+            qb.push(" AND planned_delivery_date <= ").push_bind(d);
+        }
         // 2026-09-28 新增：装配体子件过滤。`part_only=true` 时排除 `assembly_id
         // IS NOT NULL` 的子件行（这些是装配体的零件条目，前端 `GET /parts` 在
         // ALL/PART 模式下要隐藏）。ALL 模式走 service 层内存合并；本 repo 守卫
@@ -604,6 +622,14 @@ impl PartRepo {
                 ") \
                       AND pb.deleted_at IS NULL)",
             );
+        }
+        // 2026-09-30 新增：日期窗口过滤（与 list_with_filters 同守卫；保证分
+        // 页 total 与 items 计数一致）。
+        if let Some(d) = f.planned_delivery_date_from {
+            qb.push(" AND planned_delivery_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.planned_delivery_date_to {
+            qb.push(" AND planned_delivery_date <= ").push_bind(d);
         }
         // 2026-09-28 新增：装配体子件过滤。`part_only=true` 时排除 `assembly_id
         // IS NOT NULL` 的子件行（与 list_with_filters 同守卫；保证分页 total

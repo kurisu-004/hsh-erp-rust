@@ -374,6 +374,12 @@ pub struct AssemblyListFilters<'a> {
     pub statuses: &'a [String],
     pub is_urgent: Option<bool>,
     pub keyword: Option<&'a str>,
+    // 2026-09-30 新增：`planned_delivery_date_from/to` 日期窗口过滤。
+    // com::union_list 端点（dashboard UpcomingDeliveryListDrawer）使用。
+    // `None` 端不参与过滤。`t_assembly.planned_delivery_date` 是 NOT NULL
+    // （DDL migrations/005:20-21），SQL `>=`/`<=` 直接生效。
+    pub planned_delivery_date_from: Option<NaiveDate>,
+    pub planned_delivery_date_to: Option<NaiveDate>,
     pub sort_by: Option<&'a str>,
     pub sort_dir: Option<&'a str>,
     pub limit: i64,
@@ -434,6 +440,13 @@ impl AssemblyRepo {
                 .push_bind(format!("%{}%", k.trim()))
                 .push(")");
         }
+        // 2026-09-30 新增：日期窗口过滤（与 com::union_list 段内消费同语义）。
+        if let Some(d) = f.planned_delivery_date_from {
+            qb.push(" AND planned_delivery_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.planned_delivery_date_to {
+            qb.push(" AND planned_delivery_date <= ").push_bind(d);
+        }
         let col = assembly_sort_col(f.sort_by);
         let dir = if f
             .sort_dir
@@ -490,6 +503,14 @@ impl AssemblyRepo {
                 .push(" OR serial_no ILIKE ")
                 .push_bind(format!("%{}%", k.trim()))
                 .push(")");
+        }
+        // 2026-09-30 新增：日期窗口过滤（与 list_with_filters 同守卫；保证分
+        // 页 total 与 items 计数一致）。
+        if let Some(d) = f.planned_delivery_date_from {
+            qb.push(" AND planned_delivery_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.planned_delivery_date_to {
+            qb.push(" AND planned_delivery_date <= ").push_bind(d);
         }
         let row: (i64,) = qb.build_query_as().fetch_one(executor).await?;
         Ok(row.0)

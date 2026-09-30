@@ -251,6 +251,10 @@ impl PartService {
             keyword: query.keyword.as_deref(),
             locations: &locations_owned,
             holder_ids: &holder_ids_owned,
+            // 2026-09-30 新增：part 域 list 端点暂不暴露日期窗口（仅 com::union_list
+            // 使用），固定 None 维持旧行为。
+            planned_delivery_date_from: None,
+            planned_delivery_date_to: None,
             // 2026-09-28 新增：PART-only 模式强制打开装配体子件守卫
             part_only: true,
             sort_by: &sort_by,
