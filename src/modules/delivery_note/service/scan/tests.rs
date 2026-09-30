@@ -239,7 +239,6 @@ mod classify_5groups_tests {
     fn b_group_inspectable_includes_idle_in_process() {
         assert!(is_inspectable_state(&b("PENDING", None, None)));
         assert!(is_inspectable_state(&b("PROGRAMMING", None, None)));
-        assert!(is_inspectable_state(&b("REPAIRING", None, None)));
         assert!(is_inspectable_state(&b("IN_PROCESS", None, None)));
         // 货架持有的 IN_PROCESS 也可送检（回归：多态 holder 误判）
         assert!(is_inspectable_state(&b(
@@ -253,6 +252,34 @@ mod classify_5groups_tests {
             Some(7),
             Some("WORKER")
         )));
+    }
+
+    /// 2026-10-01 新增：REPAIRING 降级为 `is_repairing` 标记列后的 B 组归类。
+    ///
+    /// 返修中批次的 `status` 就是 `'IN_PROCESS'`，因此它**走 IN_PROCESS 臂**：
+    /// - 在货架上（`scan-inspect` FAIL 后停在送检架、待 `complete-repair` 落回
+    ///   生产架的典型形态）⇒ B 组可送检（与改造前 REPAIRING 单独臂同结果）；
+    /// - 在工人手上 ⇒ C 组 `IN_PROCESS_HELD_BY_WORKER`（相对改造前**唯一**的
+    ///   行为变化，理由见 `classify.rs`「返修批次的归类」小节）。
+    ///
+    /// 本测试**不构造** `'REPAIRING'` 字面量行：migration 006 已把存量洗白、
+    /// status_gate 永不写它，该字面量在 DB 层已不可达。
+    #[test]
+    fn b_group_repairing_batch_follows_in_process_arm() {
+        // 送检架上的返修批次 → B 组（is_repairing 标记不参与判定，只看 status）
+        let mut on_inspection_shelf = b("IN_PROCESS", Some(7), Some("INSPECTION_SHELF"));
+        on_inspection_shelf.is_repairing = true;
+        assert!(is_inspectable_state(&on_inspection_shelf));
+        assert_eq!(classify_invalid_state(&on_inspection_shelf), None);
+
+        // 工人手上的返修批次 → C 组
+        let mut held_by_worker = b("IN_PROCESS", Some(7), Some("WORKER"));
+        held_by_worker.is_repairing = true;
+        assert!(!is_inspectable_state(&held_by_worker));
+        assert_eq!(
+            classify_invalid_state(&held_by_worker),
+            Some("IN_PROCESS_HELD_BY_WORKER")
+        );
     }
 }
 

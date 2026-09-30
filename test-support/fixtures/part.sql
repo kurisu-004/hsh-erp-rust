@@ -32,7 +32,7 @@
 --  SHELF_PROCESS_ID        25   shelf（生产） ↔ process 映射
 --
 --  ## 注意：fixture 不含 t_part / t_part_batch 行
---  多数 part 域测试需要 status=READY_TO_SHIP / DELIVERED / REPAIRING / COMPLETED
+--  多数 part 域测试需要 status=READY_TO_SHIP / DELIVERED / COMPLETED
 --  等特定状态；状态机不允许从这些状态转回 PENDING。若 fixture 预置 2 行
 --  PENDING/IN_PROCESS，会让 list_parts_basic 等「期望空库」测试失败，也会
 --  出现在 unfiltered list 中干扰其它断言。因此 fixture 仅预置「不可变共享」

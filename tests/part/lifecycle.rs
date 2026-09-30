@@ -7,7 +7,9 @@
 //!   - send-to-outsource: PENDING → OUTSOURCE
 //!   - receive-from-outsource: OUTSOURCE → IN_PROCESS
 //!   - receive-from-outsource-to-inspection: OUTSOURCE → INSPECTION
-//!   - complete-repair: REPAIRING → IN_PROCESS / INSPECTION
+//!   - complete-repair: 返修中 → IN_PROCESS / INSPECTION
+//!     （2026-10-01：REPAIRING 降级为 `t_part_batch.is_repairing` 标记列，
+//!     返修中批次 = `status='IN_PROCESS' + is_repairing=true`）
 //!   - repair-dispatch: 一步式返修下发
 //!   - scan-inspect: 一步式扫码品检（PASS/FAIL）
 //!   - scan-deliver-part: 司机扫码发货

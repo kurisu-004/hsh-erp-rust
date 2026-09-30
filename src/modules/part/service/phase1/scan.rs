@@ -25,8 +25,10 @@ impl PartService {
 
     /// `POST /parts/{id}/scan-inspect`：扫码快捷品检（一步式）。
     ///
-    /// `{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION（target_shelf）→ READY_TO_SHIP（pass=true）
-    /// 或 → REPAIRING（pass=false + shelf_id + next_process_id）。
+    /// `{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION（target_shelf）→
+    /// READY_TO_SHIP（pass=true）或 IN_PROCESS + `is_repairing = true`
+    /// （pass=false，批次停在送检架等 `complete-repair` 落回生产架；shelf_id +
+    /// next_process_id 由 DTO 承载，作用于后续那次 complete-repair）。
     pub async fn scan_inspect<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -81,13 +83,27 @@ impl PartService {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
         let mid_version = batch.version + 1;
-        // 第二步：pass=true → READY_TO_SHIP；pass=false → REPAIRING
+        // 第二步：pass=true → READY_TO_SHIP（清返修标记）；pass=false → 起返修
+        //
+        // 2026-10-01（REPAIRING 降级为 `t_part_batch.is_repairing` 标记列，
+        // migration 005/006）：两个分支都**显式**写标记。
+        // - FAIL 分支写 `Some(true)`：这正是「开始返修」的唯一写点（另一处是
+        //   `start_repair` 端点的 `mark_batch_repairing`），status 保持
+        //   IN_PROCESS —— 返修仍在生产中，progress 与原 REPAIRING 同档 2，
+        //   rollup 派生结果与改造前逐字相同。
+        // - pass 分支写 `Some(false)`：品检**通过**意味着这批货不再是「返修中」
+        //   （哪怕它上一轮确实返修过 —— 「曾经返修」的历史事实由
+        //   `t_part_event` 的 INSPECTION_FAILED 事件追溯，不需要靠标记位留住）。
+        //   ⚠️ 事实上第一步（转 INSPECTION）已经经 `mark_batch_with_status_and_meta`
+        //   把标记清成 false 了，这里再显式写一次是**冗余但显式**：让每个分支的
+        //   不变式在本行自证，不依赖「上一步恰好清了」这种跨函数推理。
         if req.pass {
             let n2 = mark_batch_status_only(
                 repo.conn_mut(),
                 batch.id,
                 mid_version,
                 "READY_TO_SHIP",
+                Some(false),
                 current.id,
             )
             .await?;
@@ -98,21 +114,22 @@ impl PartService {
                 ));
             }
         } else {
-            // FAIL：INSPECTION → REPAIRING；保留 shelf 为 INSPECTION_SHELF（carry 状态由下一步 complete_repair 接管）
-            // 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
-            // `has_been_repaired` 列；返修事实由下方 INSPECTION_FAILED 事件日志追溯。
+            // FAIL：INSPECTION → IN_PROCESS + is_repairing=true；location 仍是
+            // INSPECTION_SHELF（返修期间的物理位置由 complete_repair 接管，它把
+            // 批次落到生产架或送检架并清标记）。
             let n2 = mark_batch_status_only(
                 repo.conn_mut(),
                 batch.id,
                 mid_version,
-                "REPAIRING",
+                "IN_PROCESS",
+                Some(true),
                 current.id,
             )
             .await?;
             if n2 == 0 {
                 return Err(AppError::biz(
                     code::VERSION_CONFLICT,
-                    "batch 版本冲突（INSPECTION→REPAIRING）",
+                    "batch 版本冲突（INSPECTION→IN_PROCESS，置返修标记）",
                 ));
             }
         }
@@ -132,10 +149,16 @@ impl PartService {
             created_by: Some(current.id),
         })
         .await?;
+        // 2026-10-01：`to_status` 写**真实**状态，不再写 'REPAIRING'。
+        // `t_part_event.to_status` 是时间线上展示的「这一步走到了哪个状态」，
+        // 而 REPAIRING 已不是任何一列会取到的值 —— 写它会让同一条批次在
+        // `GET /parts/{id}/events` 里显示的状态与 `GET /parts/{id}` 的
+        // `status` 互相矛盾。返修语义由 `event_type='INSPECTION_FAILED'` +
+        // `t_part_batch.is_repairing` 承载。
         let (to_status, event_type) = if req.pass {
             ("READY_TO_SHIP", "BATCH_PASSED")
         } else {
-            ("REPAIRING", "INSPECTION_FAILED")
+            ("IN_PROCESS", "INSPECTION_FAILED")
         };
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),

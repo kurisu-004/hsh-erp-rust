@@ -40,13 +40,15 @@
 //!   完整清单（改动前请逐条对照，勿凭端点名想当然）：
 //!   1. `part/batch/repo.rs::list_batches_with_part`
 //!      —— `GET /parts/inspection-batches`（M3 已回退）
-//!   2. `part/service/phase1/repair.rs::list_batches_with_status`
+//!   2. `part/service/phase1/repair.rs::list_batches_matching`
 //!      —— `GET /parts/repair-batches`（DELIVERED）+ `GET /parts/repairing-batches`
-//!      （REPAIRING）。**M3 当时漏网**（它与第 1 条是两条独立 SQL，M3 只回退了
+//!      （`is_repairing = true`，2026-10-01 由 `status='REPAIRING'` 改判据）。
+//!      **M3 当时漏网**（它与第 1 条是两条独立 SQL，M3 只回退了
 //!      第 1 条），2026-09-30 follow-up 补齐。
 //!   3. `part/service/phase1/lifecycle_helpers.rs::list_batches`
 //!      —— `GET /parts/{id}/batches`（工单批次明细，**无 status 过滤**，同时返回
-//!      PENDING / IN_PROCESS / INSPECTION / REPAIRING 各状态批次）
+//!      PENDING / IN_PROCESS / INSPECTION / READY_TO_SHIP 等各状态批次；返修中的
+//!      批次按 `IN_PROCESS` 一并返回）
 //!
 //!   理由：上述端点都不是**工序池**端点，判据是 `status`，与
 //!   `current_process_id` 无关；而 `INSPECTION` 批次按出池不变式该列恒为 NULL
@@ -114,12 +116,13 @@ pub struct TPartBatch {
     /// INSPECTION / OFFICE 等）。
     ///
     /// **残留写点（2026-09-30 review 第 3 轮 M4，已接受债务）**：`cancel_batch` /
-    /// `cancel_all_active_batches_for_part` / `force_complete_all_batches_for_part` /
-    /// `mark_batch_repairing` 这 4 个出池写点既不写也不清本列。功能上无影响（5 条池
+    /// `cancel_all_active_batches_for_part` / `force_complete_all_batches_for_part`
+    /// 这 3 个出池写点既不写也不清本列。功能上无影响（5 条池
     /// SQL 全部 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'` 双重限定）。
-    /// 其中 `mark_batch_repairing`（IN_PROCESS → REPAIRING）**已决策**：
-    /// 正常业务流不存在该转换，且 `REPAIRING` 将降级为纯标记（flag），
-    /// 届时相关状态判定整体重做，本写点在**那次重构中一并处理**。
+    /// 第 4 个写点 `mark_batch_repairing` **已于 2026-10-01 消解**：REPAIRING
+    /// 降级为 `is_repairing` 标记列后，它不再把批次翻出 `IN_PROCESS`
+    /// （status 保持不变），于是「该清未清」的问题不复存在 ——
+    /// 返修中的批次继续留在原工序池中（工人才可能把它领走去修）。
     /// 完整记录见 `migrations/20260930000000_004_add_batch_current_process_id.sql`
     /// 「已知局限 (4)」—— 做写点穷举时不必重新提这两条。
     pub current_process_id: Option<i64>,

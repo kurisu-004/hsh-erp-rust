@@ -6,7 +6,10 @@
 //! - `verify_badge` 命中但 `is_active=false` → 20202 `BIZ_WORKER_INACTIVE`（HTTP 400）；
 //!   未命中 → 20201 `BIZ_WORKER_NOT_FOUND`（HTTP 404）。
 //! - `deactivate` 前查 `t_part_batch.current_holder_id = worker_id` 且
-//!   `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 引用，>0 ⇒ 20203 拒
+//!   `status IN ('IN_PROCESS','INSPECTION','RETURNED')` 引用，>0 ⇒ 20203 拒
+//!   （2026-10-01：REPAIRING 降级为 `is_repairing` 标记后，返修批次 status 即
+//!   IN_PROCESS，仍被本守卫覆盖；`RETURNED` 是非 `PartStatus` 的历史遗留
+//!   字面量，刻意保留，理由见 `repo::sql::WorkerRepo::count_in_use_parts`）
 //! - `create_worker` 时 `work_type_id` 校验（如果非空）—— `WorkTypeRepo::get_by_id`
 //! - `id_card_no` 部分唯一索引由 DB 兜底，捕获 `UniqueViolation`（23505）→ 40901
 //!   `VERSION_CONFLICT`（与 Python 一致；统一用 40901 而非单独的 duplicate 业务码）
@@ -391,7 +394,7 @@ impl WorkerService {
 
     /// 停用：`is_active=false` 同时 `deleted_at=now()`。
     /// 停用前查 `t_part_batch.current_holder_id = worker_id` 且
-    /// `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 引用，
+    /// `status IN ('IN_PROCESS','INSPECTION','RETURNED')` 引用，
     /// >0 ⇒ 20203 `BIZ_WORKER_IN_USE` 拒。
     pub async fn deactivate_worker<R: WorkerRepoTrait>(
         &self,
@@ -411,7 +414,7 @@ impl WorkerService {
             return Err(AppError::biz(
                 code::BIZ_WORKER_IN_USE,
                 format!(
-                    "工人 {} (badge={}) 仍被 {in_use} 个 IN_PROCESS/INSPECTION/REPAIRING/RETURNED 零件引用，无法停用",
+                    "工人 {} (badge={}) 仍被 {in_use} 个 IN_PROCESS/INSPECTION/RETURNED 零件引用，无法停用",
                     current.id, current.badge_code
                 ),
             ));

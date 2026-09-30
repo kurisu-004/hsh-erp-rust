@@ -143,7 +143,9 @@ pub async fn force_complete(
 
 /// `POST /api/v2/parts/{part_id}/start-repair`
 ///
-/// IN_PROCESS → REPAIRING；commit 后广播 `PART_REPAIR_STARTED`。
+/// 源状态必须 `IN_PROCESS` **且** `is_repairing = false`（2026-10-01：REPAIRING
+/// 降级为 `t_part_batch.is_repairing` 标记列，本端点**不再发生 status 迁移**，
+/// 只把标记置 true）。commit 后广播 `PART_REPAIR_STARTED`。
 pub async fn start_repair(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -338,7 +340,9 @@ pub async fn list_outsource_sendable(
 
 /// `POST /api/v2/parts/{part_id}/complete-repair`
 ///
-/// REPAIRING → IN_PROCESS（落回生产架）或 REPAIRING → INSPECTION（送检区）。
+/// 要求批次 `is_repairing = true`（确实在返修中）。按 shelf.zone 决定去向：
+/// PRODUCTION → `IN_PROCESS`（落回生产架、重新入池）或 INSPECTION →
+/// `INSPECTION`（送检区）。两条路径都把 `is_repairing` 清回 false。
 pub async fn complete_repair(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,

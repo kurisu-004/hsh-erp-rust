@@ -11,7 +11,7 @@
 //!   receive_from_outsource_to_inspection / list_outsource_in_flight /
 //!   list_outsource_sendable）
 //! - `repair` 1.4 返修闭环（complete_repair / repair_dispatch /
-//!   list_repair_batches / list_repairing_batches + 共享 list_batches_with_status）
+//!   list_repair_batches / list_repairing_batches + 共享 list_batches_matching）
 //! - `batch_ops` 1.5 批次拆分 / 取消（split_batch / cancel_batch）
 //! - `scan` 1.7 扫码检 / 司机扫码（scan_inspect / scan_deliver_part）
 //! - `events` 1.6 事件历史 + 位置树 + 1.8 批量创建增强（list_events /
@@ -336,10 +336,11 @@ async fn mark_batch_with_status_and_meta(
             // 2026-10-01：本漏斗 = 「批次离开返修态」的清零点。
             //
             // 规则依据：设 `is_repairing=true` 的入口只有 2 个 ——
-            // `mark_batch_repairing`（start-repair）与 `mark_batch_status_only`
-            // （scan-inspect FAIL），二者都**不走**本漏斗的返修分支；本漏斗的
-            // 8 个调用点（place_on_shelf / recall_to_pending /
-            // release_from-programming / outsource 收发 ×3 / complete_repair /
+            // `mark_batch_repairing`（start-repair，只置标记不改 status）与
+            // `mark_batch_status_only`（scan-inspect FAIL，形参
+            // `is_repairing = Some(true)`），二者都**不走**本漏斗的返修分支；
+            // 本漏斗的 8 个调用点（place_on_shelf / recall_to_pending /
+            // release_from_programming / outsource 收发 ×3 / complete_repair /
             // repair_dispatch / scan-inspect 第一步）全部表示「批次回到了正常
             // 生产流 / 送检 / 完成返修」，此刻必须清标记，否则返修态永远挂着。
             // 其中 `complete_repair` 与 `repair_dispatch` 正是最关键的两个
@@ -377,11 +378,12 @@ async fn mark_batch_with_status_and_meta(
 /// 2026-10-01：改为 `status_gate::apply_batch_status_change` 的薄包装。
 ///
 /// 3 个调用点传入的目标状态是 `READY_TO_SHIP`（scan-inspect pass）/
-/// `"REPAIRING"`（scan-inspect FAIL）/ `CANCELLED`（cancel-batch）。
-/// 其中 **`"REPAIRING"` 是过渡别名**（2026-10-01 REPAIRING 降级为标记列）：
-/// 本函数把它翻译成 `status='IN_PROCESS' + is_repairing=true`，这样
-/// `phase1/scan.rs` 这个属于 REPAIRING 下游消费方改造范围的调用点**本轮零改动**。
-/// 后续那一轮应让 scan 显式传标记、删掉本别名分支。
+/// `IN_PROCESS`（scan-inspect FAIL，**同时置 `is_repairing=true`**）/
+/// `CANCELLED`（cancel-batch）。返修标记由形参 `is_repairing` 显式传入，
+/// 本函数不做任何别名翻译 —— 上一轮为兼容老调用点留的
+/// `resolve_status_alias("REPAIRING")` 过渡分支已在本轮删除（REPAIRING 已从
+/// `PartStatus` 删除，DB 层也不再产生该 status，别名只会让读代码的人以为它
+/// 还是合法状态）。
 ///
 /// `allowed_from` 由目标状态反查（`status_guard_for_target`）——原实现
 /// 「无源状态守卫」，本实现补上；等价性由该函数的 doc 逐目标状态论证。
@@ -390,21 +392,21 @@ async fn mark_batch_status_only(
     batch_id: i64,
     expected_version: i32,
     new_status: &str,
+    is_repairing: Option<bool>,
     updated_by: i64,
 ) -> Result<u64, AppError> {
-    let (real_status, is_repairing) = resolve_status_alias(new_status);
     status_gate::apply_batch_status_change(
         conn,
         StatusChange {
             batch_id,
-            new_status: real_status,
+            new_status,
             new_location: None,
             new_holder_id: None,
             new_process_id: None,
             new_process_step_id: None,
             is_repairing,
             expected_version: Some(expected_version),
-            allowed_from: status_guard_for_target(real_status),
+            allowed_from: status_guard_for_target(new_status),
             updated_by,
             clear_process_id: false,
         },
@@ -413,27 +415,12 @@ async fn mark_batch_status_only(
     .map(|_| 1u64)
 }
 
-/// 2026-10-01 新增：目标状态别名翻译（过渡期）。
-///
-/// `"REPAIRING"` → `("IN_PROCESS", Some(true))`；其余原样返回、
-/// 标记不写（`None` = 保持原值）。REPAIRING 降级为 `is_repairing` 标记列
-/// （migration 005/006）后它已不是合法 `PartStatus`，但仍有 1 个调用点
-/// （`phase1/scan.rs`）按老词汇传字符串。
-#[inline]
-fn resolve_status_alias(target: &str) -> (&str, Option<bool>) {
-    if target == "REPAIRING" {
-        ("IN_PROCESS", Some(true))
-    } else {
-        (target, None)
-    }
-}
-
-/// 2026-10-01 新增：由**目标**状态反查 `mark_batch_status_only` 的源状态白名单。
+/// 2026-10-01：由**目标**状态反查 `mark_batch_status_only` 的源状态白名单。
 ///
 /// 等价性论证（原实现 WHERE 无 status 守卫，调用点各自在 service 层守）：
 /// - `READY_TO_SHIP`：唯一调用点是 `scan_inspect` 的 pass 分支，源恒为上一步
 ///   刚写下的 `INSPECTION`（同一函数前半段写死）→ 白名单 `["INSPECTION"]` 等价。
-/// - `IN_PROCESS`（由 `"REPAIRING"` 翻译）：唯一调用点是 `scan_inspect` 的
+/// - `IN_PROCESS`：唯一调用点是 `scan_inspect` 的
 ///   FAIL 分支，源恒为 `INSPECTION` → 等价。
 /// - `CANCELLED`：调用点 `batch_ops::cancel_batch` 在 service 层已守
 ///   `from != COMPLETED && from != CANCELLED`，故白名单取

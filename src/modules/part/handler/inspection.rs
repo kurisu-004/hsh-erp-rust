@@ -201,7 +201,8 @@ pub async fn to_process(
 /// `POST /api/v2/parts/{part_id}/scan-inspect`
 ///
 /// 扫码快捷品检：一步式 `{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION →
-/// READY_TO_SHIP（pass=true）或 REPAIRING（pass=false）。
+/// READY_TO_SHIP（pass=true）或 `IN_PROCESS + is_repairing=true`（pass=false，
+/// 批次停在送检架等 `complete-repair` 落回生产架）。
 pub async fn scan_inspect(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -356,7 +357,9 @@ pub async fn list_repair_batches(
 
 /// `GET /api/v2/parts/repairing-batches`
 ///
-/// REPAIRING 批次列表（Manager + Clerk + Inspector）。
+/// 返修中批次列表（`t_part_batch.is_repairing = true`，Manager + Clerk +
+/// Inspector）。2026-10-01：判据由 `status = 'REPAIRING'` 改为
+/// `is_repairing = true`（REPAIRING 降级为标记列）。
 ///
 /// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
 pub async fn list_repairing_batches(

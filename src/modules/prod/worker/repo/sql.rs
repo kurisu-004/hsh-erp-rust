@@ -279,7 +279,7 @@ impl WorkerRepo {
     }
 
     /// 停用前查引用：单条 `UNION ALL` 统计 `t_part_batch.current_holder_id = worker_id` 且
-    /// `status IN ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')` 的非软删批次数。
+    /// `status IN ('IN_PROCESS','INSPECTION','RETURNED')` 的非软删批次数。
     ///
     /// 任一分支 > 0 ⇒ 20203 `BIZ_WORKER_IN_USE`。
     ///
@@ -288,6 +288,15 @@ impl WorkerRepo {
     /// 三个独立维度同时核对：当前活跃 + 持有人为该 worker + location='WORKER'
     /// —— 比 v2 rollup 时期的纯 holder 引用更精确，与 Python
     /// `_assert_not_holding_parts` 同语义）。
+    ///
+    /// 2026-10-01：删掉 REPAIRING 子查询（REPAIRING 降级为
+    /// `t_part_batch.is_repairing` 标记后，返修批次 status 即 IN_PROCESS，
+    /// 与第 1 个子查询同一行命中，守卫强度不变）。
+    /// ⚠️ `'RETURNED'` **不是** `PartStatus` 的变体（worker-scan 的
+    /// `mark_batch_returned` 的 WHERE 硬限定 `status='IN_PROCESS' AND
+    /// location='WORKER'`，见 `part/repo/sql/batch_sql.rs`，该分支根本不改
+    /// status），它是历史遗留字面量，本轮**刻意不动** —— 删掉它会放宽
+    /// 「工人持有待回交批次」的停用守卫。遗留清理需单独一轮。
     pub async fn count_in_use_parts<'e, E: PgExecutor<'e>>(
         executor: E,
         worker_id: i64,
@@ -306,12 +315,6 @@ impl WorkerRepo {
                      WHERE current_holder_id = $1
                        AND location = 'WORKER'
                        AND status = 'INSPECTION'
-                       AND deleted_at IS NULL)
-                    +
-                    (SELECT COUNT(*) FROM t_part_batch
-                     WHERE current_holder_id = $1
-                       AND location = 'WORKER'
-                       AND status = 'REPAIRING'
                        AND deleted_at IS NULL)
                     +
                     (SELECT COUNT(*) FROM t_part_batch

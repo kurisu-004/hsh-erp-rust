@@ -35,7 +35,7 @@ Response 200 `data`：`ScanDeliveryOut`
 > | 组 | 状态 | 行为 |
 > |---|---|---|
 > | **A 可直接 attach** | `READY_TO_SHIP` / `INSPECTION`（且 `delivery_note_id IS NULL`） | 装配件全 A 时自动入 `added_batches[]`；混合场景下随 `unresolved_targets[i].attachable_batches[]` 携带，前端弹窗勾选后调 [`POST /{id}/attach-batches`](#post-apiv2delivery-notesidattach-batches--2026-08-31-新增) 显式 attach |
-> | **B 候选→一键送检** | `PENDING` / `PROGRAMMING` / `IN_PROCESS`（未被工人持有）/ `REPAIRING` | 进 `unresolved_targets[i].available_batches[]`，前端调 `to-inspection` 后 re-scan |
+> | **B 候选→一键送检** | `PENDING` / `PROGRAMMING` / `IN_PROCESS`（未被工人持有）| 进 `unresolved_targets[i].available_batches[]`，前端调 `to-inspection` 后 re-scan |
 > | **C 静默过滤 / 仅全 C 触发 21421** | `DELIVERED` / `OUTSOURCE` / `COMPLETED` / `CANCELLED` / `IN_PROCESS`（工人持有） | 混合场景下静默过滤，不入任何 Vec；**仅当某 target 的全部 batch 都为 C 组时**才硬报错 `21421` |
 >
 > 「工人持有」指 `t_part_batch.location = 'WORKER'`（2026-08-28 修正：原按 `current_holder_id IS NOT NULL` 判定，但该列多态——放货架时存 `t_shelf.id`，会把货架上的工件误判为工人持有）。
@@ -164,10 +164,10 @@ Response 200 `data`：`ScanDeliveryOut`
 
 `BatchStatusDto`（`t_part_batch.status` 强类型投影，序列化沿用 DB 列值）：
 
-`PENDING` / `PROGRAMMING` / `IN_PROCESS` / `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` / `REPAIRING` / `OUTSOURCE` / `COMPLETED` / `CANCELLED`
+`PENDING` / `PROGRAMMING` / `IN_PROCESS` / `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` / `OUTSOURCE` / `COMPLETED` / `CANCELLED`（**2026-10-01**：REPAIRING 已降级为 `t_part_batch.is_repairing` 标记列，DB 不再产生该 status）
 
 > 前端可基于 `unresolved_targets[i].available_batches[].status` 区分触发端点：
-> - `status ∈ {PENDING, PROGRAMMING, IN_PROCESS, REPAIRING}` → 触发一键送检（`to-inspection` / `POST /parts/batch-scan-inspect`），成功后 re-scan 同一 code 完成入单
+> - `status ∈ {PENDING, PROGRAMMING, IN_PROCESS}`（IN_PROCESS 需未被工人持有）→ 触发一键送检（`to-inspection` / `POST /parts/batch-scan-inspect`），成功后 re-scan 同一 code 完成入单
 
 错误码：
 
@@ -397,13 +397,13 @@ Response 200 `data`: `null`
 | 组 | 状态 | 行为 |
 |---|---|---|
 | **A 可直接 attach** | `READY_TO_SHIP`, `INSPECTION`（且 `delivery_note_id IS NULL`） | 进 `added_batches[]` 或 `unresolved_targets[i].attachable_batches[]` |
-| **B 候选→一键送检** | `PENDING`, `PROGRAMMING`, `IN_PROCESS`（非工人持有）, `REPAIRING` | 进 `unresolved_targets[i].available_batches[]`；前端调 `to-inspection` 后 re-scan |
+| **B 候选→一键送检** | `PENDING`, `PROGRAMMING`, `IN_PROCESS`（非工人持有）| 进 `unresolved_targets[i].available_batches[]`；前端调 `to-inspection` 后 re-scan |
 | **C 静默过滤 / 仅全 C 触发 21421** | `DELIVERED`, `OUTSOURCE`, `COMPLETED`, `CANCELLED`, `IN_PROCESS`（工人持有） | 混合场景下静默过滤；**任一 target 全 C 才报 21421** |
 
 **分组边界条件**：
 
 - `IN_PROCESS` 是否「被工人持有」——以 `t_part_batch.location = 'WORKER'` 判定（**2026-08-28 修正**：`current_holder_id` 是多态列——放货架时存 `t_shelf.id`，工人取件时才存 worker id，不能用作判据；按 `current_holder_id IS NOT NULL` 判定会把货架上的工件误判为工人持有）。
-- B 组送检需通过状态机白名单：原 `REPAIRING → INSPECTION` 不在白名单，本次新增（详见 `src/modules/part/statemachine.rs`）。
+- B 组送检需通过状态机白名单：2026-10-01 起 REPAIRING 降级为 `is_repairing` 标记，返修中批次按 `IN_PROCESS → INSPECTION` 这条**已在白名单内**的边流转（该边此前为 `to-inspection` 服务）。
 
 #### 错误码迁移
 
@@ -431,6 +431,6 @@ Response 200 `data`: `null`
 | service | `src/modules/delivery_note/service/attach.rs` (2026-08-31 新建) | `attach_batches`（弹窗提交专用，与 `scan_add` 共用 `is_attachable_state`） |
 | handler | `src/modules/delivery_note/handler.rs` | `scan_delivery_note`, `attach_batches` (2026-08-31), WS 广播 |
 | 错误码 | `src/shared/error.rs` | `BIZ_DELIVERY_BATCH_STATE_INVALID = 21421` |
-| 状态机 | `src/modules/part/statemachine.rs` | `PartStatus::can_transition_to` 新增 `REPAIRING → INSPECTION` |
+| 状态机 | `src/modules/part/statemachine.rs` | `PartStatus::can_transition_to` 新增 `REPAIRING → INSPECTION`（**2026-10-01 已删**：REPAIRING 不再是状态）|
 | 单测 | `src/modules/delivery_note/service/scan.rs` 末尾 | `classify_5groups_tests`, `outcome_tests`, `c_group_distribution_tests` (2026-08-31), `attachable_batches_tests` (2026-08-31) |
 | 单测 | `src/modules/delivery_note/service/attach.rs` 末尾 | `attach_batches_logic_tests` |

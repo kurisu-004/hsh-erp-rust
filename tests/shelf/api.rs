@@ -2,7 +2,9 @@
 //!
 //! ## 覆盖（Task 3 shelf CRUD + picker + mapping）
 //! 1. `create_shelf_then_deactivate_with_in_use_part_fails` — `deactivate` 拒绝
-//!    被 IN_PROCESS/INSPECTION/REPAIRING 零件引用的货架 → 20503 BIZ_SHELF_IN_USE。
+//!    被 IN_PROCESS/INSPECTION 零件引用的货架 → 20503 BIZ_SHELF_IN_USE。
+//!    （2026-10-01：REPAIRING 降级为 `t_part_batch.is_repairing` 标记列，返修
+//!    批次 status 即 IN_PROCESS，仍被本守卫覆盖。）
 //! 2. `create_then_get_shelf_round_trip` — happy path：create → get → 含 location 字段。
 //! 3. `set_shelf_processes_replaces_existing_mapping` — mapping 端点整组替换。
 //!
@@ -15,7 +17,7 @@
 //!
 //! ## 直插 t_part 的说明
 //! brief 的 20503 测试需要在 deactivate 前插一个 t_part.current_holder_id =
-//! shelf_id 且 status IN ('IN_PROCESS','INSPECTION','REPAIRING') 的工单。本
+//! shelf_id 且 status IN ('IN_PROCESS','INSPECTION') 的工单。本
 //! 测试**没有**借助 part 域 CRUD（part 域自身不在 Task 3 范围内），而是直接
 //! SQL INSERT 落表 —— 与 `customer_api.rs` / `process_api.rs` 的同形 fixture 思路一致。
 //!
@@ -60,7 +62,7 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ShelfFixture) 
 
 /// 直插一个 `t_part` + `t_part_batch` 行（批次 `current_holder_id = shelf_id`、
 /// `location = 'PRODUCTION_SHELF'`、`status = IN_PROCESS`）让 `deactivate` 的
-/// 「被 IN_PROCESS/INSPECTION/REPAIRING 批次引用」分支触发 20503
+/// 「被 IN_PROCESS/INSPECTION 批次引用」分支触发 20503
 /// `BIZ_SHELF_IN_USE`。绕开 part 域 CRUD（part CRUD 不是本任务范畴）。
 ///
 /// 2026-09-16 PR-2（migration 027）：t_part 删 `current_holder_id`，「该 shelf 持有」
@@ -183,7 +185,9 @@ async fn create_then_get_shelf_round_trip() {
     let _ = pool;
 }
 
-/// `deactivate` 拒绝被 IN_PROCESS/INSPECTION/REPAIRING 零件引用的货架
+/// `deactivate` 拒绝被 IN_PROCESS/INSPECTION 零件引用的货架
+/// （2026-10-01：REPAIRING 已降级为 `is_repairing` 标记列，返修批次 status 即
+/// IN_PROCESS，守卫强度不变）
 /// → 20503 `BIZ_SHELF_IN_USE`（与 brief Step 1 一致）。
 #[tokio::test]
 async fn create_shelf_then_deactivate_with_in_use_part_fails() {

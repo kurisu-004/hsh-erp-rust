@@ -11,7 +11,7 @@
 | POST | `/api/v2/shelves` | MANAGER | 创建货架（PRODUCTION / INSPECTION） |
 | GET | `/api/v2/shelves/{id}` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 货架详情（SHELF_ACCOUNT scope 校验） |
 | POST | `/api/v2/shelves/{id}/update` | MANAGER | 部分更新（OCC） |
-| POST | `/api/v2/shelves/{id}/deactivate` | MANAGER | 软删 + 停用（OCC，被 IN_PROCESS/INSPECTION/REPAIRING 零件引用时拒） |
+| POST | `/api/v2/shelves/{id}/deactivate` | MANAGER | 软删 + 停用（OCC，被 IN_PROCESS/INSPECTION 零件引用时拒；**2026-10-01**：返修批次 status 即 IN_PROCESS，仍被覆盖）|
 | GET | `/api/v2/shelves/{id}/processes` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 该货架的工序映射列表（按 sort_order） |
 | GET | `/api/v2/shelves/for-return?next_process_id=` | 已登录（M/C/CNC/SHELF） | PRODUCTION 区 picker（按 current_load 升序，标 `is_recommended`） |
 | GET | `/api/v2/shelves/for-inspection` | 已登录（M/C/CNC/SHELF/INSPECTOR） | INSPECTION 区 picker（仅 `zone='INSPECTION' AND is_active=true`） |
@@ -41,7 +41,7 @@
 | 更新 `name` | None = 不改；Some(空串) = 20104；Some(非空) = 改 |
 | 更新 `location` | 三态：`None` 不改；`Some(null)` 清空；`Some(v)` 改 |
 | 更新 `display_order` | None = 不改；Some(v) = 改 |
-| 软删 | `t_part_batch.current_holder_id = shelf_id` 且 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` 且 `status IN ('IN_PROCESS','INSPECTION','REPAIRING')` 仍有非软删引用 → 20503 拒（**2026-09-16 PR-2**：`t_part.current_holder_id` 列已删，「被该 shelf 持有」改查 `t_part_batch` 真相源） |
+| 软删 | `t_part_batch.current_holder_id = shelf_id` 且 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` 且 `status IN ('IN_PROCESS','INSPECTION')` 仍有非软删引用 → 20503 拒（**2026-09-16 PR-2**：`t_part.current_holder_id` 列已删；**2026-10-01**：REPAIRING 降级为 `is_repairing` 标记，返修批次 status 即 IN_PROCESS，守卫强度不变）|
 | 映射 `set_shelf_processes` | 整组替换：先软删全部旧 mapping → INSERT 新（带 sort_order） |
 
 ---
@@ -142,7 +142,7 @@ Request：空 body
 Response 200 `data`：`null`
 
 语义：等同 soft-delete —— `is_active = false` 同时 `deleted_at = now()`（Python pattern）。
-软删前查 `t_part_batch.current_holder_id = shelf_id` 且 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` 且 `status IN ('IN_PROCESS','INSPECTION','REPAIRING')` 引用数（单条 `UNION ALL` 累加 3 个 sub-SELECT）。
+软删前查 `t_part_batch.current_holder_id = shelf_id` 且 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` 且 `status IN ('IN_PROCESS','INSPECTION')` 引用数（单条 SQL 累加 2 个 sub-SELECT；**2026-10-01** 删掉原第 3 个 REPAIRING 子查询 —— 返修批次已被 IN_PROCESS 覆盖）。
 
 > 2026-09-16 PR-2（migration 027）：`t_part.current_holder_id` 列已删；该守卫改查 `t_part_batch` 真相源（PR-2 § `shelf/repo.rs::count_in_use_parts`）。
 
@@ -171,7 +171,7 @@ Response 200 `data`：`ShelfForReturnOut`
 | `items[].name` | string | |
 | `items[].zone` | string | |
 | `items[].location` | string? | |
-| `items[].current_load` | i64 | LEFT JOIN t_part_batch 聚合（status IN (PENDING/IN_PROCESS/INSPECTION/REPAIRING/OUTSOURCE) 的批次 quantity 总和） |
+| `items[].current_load` | i64 | LEFT JOIN t_part_batch 聚合（status IN (PENDING/IN_PROCESS/INSPECTION/OUTSOURCE) 的批次 quantity 总和；**2026-10-01** 删掉 REPAIRING 字面量 —— 返修批次 status 即 IN_PROCESS，负载口径不变）|
 | `items[].is_recommended` | bool | `current_load` 最小的第一条 = `true`，其余 `false` |
 
 业务规则：

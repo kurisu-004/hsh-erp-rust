@@ -274,12 +274,15 @@ pub struct ForceCompleteRequest {
 /// `POST /parts/{id}/start-repair` 入参。
 ///
 /// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) BREAKING CHANGE：
-/// 收 `batch_id` + `version`。状态机守卫读 batch 当前状态
-/// `IN_PROCESS → REPAIRING`。
+/// 收 `batch_id` + `version`。
 ///
-/// 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 `has_been_repaired` 列；
-/// 返修事实改由 `t_part_event.event_type='REPAIR_STARTED'` +
-/// `t_part_batch.status='REPAIRING'` 承担（part 派生列无需同步）。
+/// 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 `has_been_repaired` 列。
+///
+/// 2026-10-01（REPAIRING 降级为标记列，migration 005/006）：守卫从「状态机
+/// `IN_PROCESS → REPAIRING`」改为「batch 当前 `status='IN_PROCESS'` **且**
+/// `is_repairing = false`」；本端点**不再改 status**，只把 `is_repairing` 置
+/// true。返修事实改由 `t_part_batch.is_repairing` 列 +
+/// `t_part_event.event_type='REPAIR_STARTED'` 事件共同承载（part 派生列无需同步）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StartRepairRequest {
     #[serde(deserialize_with = "deserialize_i64")]
@@ -385,8 +388,11 @@ pub struct ReceiveFromOutsourceToInspectionRequest {
 
 /// `POST /parts/{id}/complete-repair` 入参。
 ///
-/// REPAIRING → IN_PROCESS（落回生产架）或 REPAIRING → INSPECTION（送检区）。
-/// shelf.zone=PRODUCTION 时 next_process_id 必填且需校验 shelf↔process 映射。
+/// 要求 batch `is_repairing = true`（确实在返修中）。去向由 shelf.zone 决定：
+/// PRODUCTION → `IN_PROCESS`（落回生产架、重新入池，写 `next_process_id` +
+/// step）或 INSPECTION → `INSPECTION`（送检区、出池）。两条路径都清
+/// `is_repairing`。shelf.zone=PRODUCTION 时 next_process_id 必填且需校验
+/// shelf↔process 映射。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CompleteRepairRequest {
     #[serde(deserialize_with = "deserialize_i64")]
@@ -511,10 +517,11 @@ pub struct CancelBatchRequest {
 /// `POST /parts/{id}/scan-inspect` 入参。
 ///
 /// 扫码快捷品检（一步式：`{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION →
-/// READY_TO_SHIP 或 REPAIRING，由 `pass` 字段决定）。
+/// READY_TO_SHIP 或「返修中」，由 `pass` 字段决定）。
 /// `target_inspection_shelf_id` 必填（INSPECTION 区 active）。
-/// `pass=true`：READY_TO_SHIP；`pass=false`：REPAIRING + 需要 `shelf_id` +
-/// `next_process_id`（落回生产架用）。
+/// `pass=true`：READY_TO_SHIP；`pass=false`：`status='IN_PROCESS'` +
+/// `is_repairing=true`（批次停在送检架，`shelf_id` + `next_process_id` 供随后
+/// 的 `complete-repair` 落回生产架用）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ScanInspectRequest {
     pub pass: bool,

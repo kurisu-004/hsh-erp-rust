@@ -3,11 +3,12 @@
 //! worker/repo.rs::count_in_use_parts）。
 //!
 //! PR-2 之前：「被 X 引用」查 `t_part.current_holder_id`（已删列）。
-//! PR-2 之后：改查 `t_part_batch.current_holder_id + location + status`：
-//!   - shelf：location IN ('PRODUCTION_SHELF','INSPECTION_SHELF') + status IN
-//!     ('IN_PROCESS','INSPECTION','REPAIRING')
-//!   - worker：location='WORKER' + status IN
-//!     ('IN_PROCESS','INSPECTION','REPAIRING','RETURNED')
+//! PR-2 之后：改查 `t_part_batch.current_holder_id + location + status` ——
+//! shelf 守卫是 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` +
+//! `status IN ('IN_PROCESS','INSPECTION')`（**2026-10-01** 删掉 `'REPAIRING'`：
+//! 它已降级为 `t_part_batch.is_repairing` 标记列，返修批次 status 即
+//! `IN_PROCESS`，守卫强度不变）；worker 守卫是 `location='WORKER'` +
+//! `status IN ('IN_PROCESS','INSPECTION','RETURNED')`。
 //!
 //! 任一 >0 ⇒ 20503 BIZ_SHELF_IN_USE / 20203 BIZ_WORKER_IN_USE。
 //!

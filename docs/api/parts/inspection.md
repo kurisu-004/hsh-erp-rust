@@ -535,9 +535,16 @@ Response 200 `data`：`InspectionBatchListOut`
 > step 派生**。两个 DTO 字段名（`next_process_id` / `next_process_name`）始终不变。
 >
 > 2026-09-16 PR-2（migration 027）：`InspectionBatchListItemOut` 删 `has_been_repaired`
-> 字段 —— `t_part_batch.has_been_repaired` 列已删；返修事实由
-> `t_part_event.event_type='REPAIR_STARTED'` 事件日志追溯（详见
+> 字段 —— `t_part_batch.has_been_repaired` 列已删。
+>
+> **2026-10-01**：返修事实改由 `t_part_batch.is_repairing` 标记列 +
+> `t_part_event.event_type='REPAIR_STARTED'` 事件日志共同追溯（详见
 > [`../../api/parts/lifecycle.md`](../../api/parts/lifecycle.md) § start-repair）。
+> 本 VO 的 3 个共用端点（`inspection-batches` / `repair-batches` /
+> `repairing-batches`）**都不新增** `is_repairing` 字段 —— 前端从
+> `status` + 端点语义即可判断（返修中批次的 `status` 是 `IN_PROCESS`）；
+> 若前端需要区分「返修中」，走 `GET /api/v2/parts/repairing-batches`
+> （判据即 `is_repairing = true`）。
 
 holder 解析段（LEFT JOIN `t_worker` / `t_shelf` 一次拼齐）：
 
@@ -871,7 +878,7 @@ pub struct WorkerScanCoreOut {
 | IN_PROCESS | IN_PROCESS | worker-scan RETURNED（holder worker → shelf，状态不变） |
 | READY_TO_SHIP | DELIVERED | `deliver`（同事务翻最近一条 source-status 批次） |
 | DELIVERED | COMPLETED | `complete`（同事务；清空 `serial_no`） |
-| IN_PROCESS | REPAIRING | `start-repair`（同事务翻最近一条 IN_PROCESS 批次；置 `has_been_repaired=true`） |
+| IN_PROCESS | IN_PROCESS | **2026-10-01**：REPAIRING 降级为标记列 `t_part_batch.is_repairing`（migration 005/006），`start-repair` **不再是状态迁移** —— 只把标记置 `true`（`status` 保持 IN_PROCESS，progress 同档 2）；重复起修（标记已 true）→ 20118。`scan-inspect` `pass=false` 同理（INSPECTION → IN_PROCESS + 标记 true）|
 | PENDING / PROGRAMMING / INSPECTION / READY_TO_SHIP / DELIVERED | CANCELLED | `cancel`（同事务翻最近一条 source-status 批次；delivery_note 锁禁） |
 
 INSPECTION → IN_PROCESS 由 `POST /parts/{id}/to-process`（to_process 流）走 service 流程：
@@ -886,7 +893,7 @@ INSPECTION → IN_PROCESS 由 `POST /parts/{id}/to-process`（to_process 流）�
 | code | 名称 | HTTP | 触发场景 |
 |---|---|---|---|
 | 20101 | BIZ_PART_NOT_FOUND | 404 | 工单不存在 / 已软删 |
-| 20103 | BIZ_INVALID_TRANSITION | 400 | 状态机白名单拒绝（cancel 时 COMPLETED/REPAIRING 等；to-XXX 时起点状态不匹配；IN_PROCESS 但 holder 是 worker） |
+| 20103 | BIZ_INVALID_TRANSITION | 400 | 状态机白名单拒绝（cancel 时 COMPLETED / CANCELLED 等终态；to-XXX 时起点状态不匹配；IN_PROCESS 但 holder 是 worker） |
 | 20104 | BIZ_INVALID_VALUE | 400 | DB status 字符串不在 enum 白名单；或 shelf 不在 PRODUCTION 区 |
 | 20109 | BIZ_PART_BATCH_NOT_FOUND | 404 | `batch_id` 反查失败：不存在 / 不属于该 part / 已划掉 / 状态不符（单件端点 `batch_id` 已必填，不再有「多批次歧义」分支；worker-scan 仍可能因缺省匹配歧义触发） |
 | 20111 | BIZ_PART_BATCH_INVALID_QUANTITY | 400 | **`quantity ≤ 0`**（拆批语义收紧：`quantity > batch.quantity` 不再报 20111，等价于整批操作） |

@@ -58,12 +58,18 @@ pub struct InspectionBatchListItemOut {
     /// `RepairBatchesOut`），**3 个都不是工序池端点**，判据都是 `status`：
     /// - `GET /parts/inspection-batches`（`status='INSPECTION'`，M3 已回退）
     /// - `GET /parts/repair-batches`（`DELIVERED`，2026-09-30 follow-up 补齐）
-    /// - `GET /parts/repairing-batches`（`REPAIRING`，同上）
+    /// - `GET /parts/repairing-batches`（`is_repairing = true`，2026-10-01 由
+    ///   `status='REPAIRING'` 改为标记列过滤）
     ///
-    /// 三者的 `current_process_id` 分别为「按出池不变式恒 NULL」「DELIVERED 必经
-    /// INSPECTION 故同样恒 NULL」「`mark_batch_repairing` 既不写也不清 → 残留
-    /// 上一道工序的陈旧值」⇒ 直读一律得不到正确值，故 3 条查询**全部**走 step
-    /// 派生。`current_process_step_id` 在送检期间被刻意保留
+    /// 前两者（三者中的 2 个 status 判据端点）的 `current_process_id` 分别为
+    /// 「按出池不变式恒 NULL」「DELIVERED 必经 INSPECTION 故同样恒 NULL」⇒
+    /// 直读一律得不到正确值，故这 2 条查询走 step 派生。
+    /// 第三个端点（返修中）：2026-10-01 起 `mark_batch_repairing` **不再把批次
+    /// 翻出 IN_PROCESS**（status 保持不变），故该列对返修批次不再有「残留
+    /// 陈旧值」问题 —— 但本 VO 仍统一走 step 派生，理由是「展示类列表一律走
+    /// step 派生」这条分工（见 `part/batch/model.rs` 模块 doc 的读取方清单），
+    /// 不因单个端点的判据变化而分叉。
+    /// `current_process_step_id` 在送检期间被刻意保留
     /// （`mark_batch_inspected` 不写它），正是「INSPECTION 期间显示批次走到
     /// 工艺链第几步」这条产品需求的数据来源。
     ///

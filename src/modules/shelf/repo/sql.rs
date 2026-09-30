@@ -187,8 +187,14 @@ impl ShelfRepo {
     ///
     /// 用途：`list_for_return` picker —— worker 把成品零件送回时找空货架。
     /// `current_load` 用 `LEFT JOIN t_part_batch` 聚合（status IN ('PENDING',
-    /// 'IN_PROCESS', 'INSPECTION', 'REPAIRING', 'OUTSOURCE')）的批次总
-    /// quantity；LEFT JOIN 保留 0-负载货架（current_load = 0）。
+    /// 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')）的批次总 quantity；
+    /// LEFT JOIN 保留 0-负载货架（current_load = 0）。
+    ///
+    /// 2026-10-01：聚合条件删掉 `'REPAIRING'` 字面量。REPAIRING 已从
+    /// `PartStatus` 降级为 `t_part_batch.is_repairing` 标记列（migration
+    /// 005/006），返修中的批次 `status` 就是 `'IN_PROCESS'`，已被本 IN 列表的
+    /// IN_PROCESS 臂覆盖 —— **负载口径不变**（返修批次仍占着货架），只是不再
+    /// 需要第二个字面量。
     pub async fn list_active_production_ordered<'e, E: PgExecutor<'e>>(
         executor: E,
     ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
@@ -203,7 +209,7 @@ impl ShelfRepo {
                 SELECT current_holder_id AS shelf_id,
                        SUM(quantity)::bigint AS cnt
                 FROM t_part_batch
-                WHERE status IN ('PENDING', 'IN_PROCESS', 'INSPECTION', 'REPAIRING', 'OUTSOURCE')
+                WHERE status IN ('PENDING', 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')
                 GROUP BY current_holder_id
             ) load ON load.shelf_id = s.id
             WHERE s.zone = 'PRODUCTION'
@@ -320,7 +326,7 @@ impl ShelfRepo {
     }
 
     /// 软删前查引用：单条 `UNION ALL` 统计 `t_part_batch.current_holder_id = shelf_id` 且
-    /// `status IN ('IN_PROCESS', 'INSPECTION', 'REPAIRING')` 的非软删批次数。
+    /// `status IN ('IN_PROCESS', 'INSPECTION')` 的非软删批次数。
     ///
     /// 任一分支 > 0 ⇒ 20503 BIZ_SHELF_IN_USE。
     ///
@@ -328,6 +334,11 @@ impl ShelfRepo {
     /// 「该 shelf 持有」改查 t_part_batch 真相源（status + holder + location
     /// 三维核对：活跃 + 持有人为该 shelf + location='PRODUCTION_SHELF' 或
     /// 'INSPECTION_SHELF'）。
+    ///
+    /// 2026-10-01：删掉第 3 个（REPAIRING）子查询。REPAIRING 降级为
+    /// `t_part_batch.is_repairing` 标记列后，返修中批次的 `status` 就是
+    /// `'IN_PROCESS'`，与第 1 个子查询**同一行**命中 —— 守卫强度不变（返修
+    /// 批次仍被算作「在用」，货架仍不可软删），只是少扫一次表。
     pub async fn count_in_use_parts<'e, E: PgExecutor<'e>>(
         executor: E,
         shelf_id: i64,
@@ -346,12 +357,6 @@ impl ShelfRepo {
                      WHERE current_holder_id = $1
                        AND location IN ('PRODUCTION_SHELF', 'INSPECTION_SHELF')
                        AND status = 'INSPECTION'
-                       AND deleted_at IS NULL)
-                    +
-                    (SELECT COUNT(*) FROM t_part_batch
-                     WHERE current_holder_id = $1
-                       AND location IN ('PRODUCTION_SHELF', 'INSPECTION_SHELF')
-                       AND status = 'REPAIRING'
                        AND deleted_at IS NULL)
                 )::bigint AS total
             "#,

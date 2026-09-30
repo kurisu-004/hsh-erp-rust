@@ -1093,7 +1093,9 @@ async fn test_scan_recent_items_caps_at_8_and_includes_required_fields() {
 //
 // 5 类状态分组语义（详见 `src/modules/delivery_note/service/scan.rs:36-64`）：
 //   A 组（attachable）：INSPECTION + READY_TO_SHIP          → 直接挂单
-//   B 组（inspectable）：PENDING / PROGRAMMING / REPAIRING / IN_PROCESS(无 holder)
+//   B 组（inspectable）：PENDING / PROGRAMMING / IN_PROCESS(无 holder)
+//   2026-10-01：REPAIRING 降级为 t_part_batch.is_repairing 标记列，返修中批次
+//   按 IN_PROCESS 归类（未被工人持有 → B 组；被工人持有 → C 组）
 //                                                              → 走 candidates 列表
 //   C 组（短路报错）：DELIVERED / OUTSOURCE / COMPLETED / CANCELLED /
 //                      IN_PROCESS(有 holder)                 → 21421 硬错误

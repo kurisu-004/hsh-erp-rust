@@ -4,7 +4,9 @@
 //! - `deliver` —— READY_TO_SHIP → DELIVERED
 //! - `complete` —— DELIVERED → COMPLETED
 //! - `cancel` —— 5 状态白名单 → CANCELLED
-//! - `start_repair` —— IN_PROCESS → REPAIRING
+//! - `start_repair` —— 2026-10-01 起**不是状态迁移**：源状态 IN_PROCESS +
+//!   `is_repairing = false` 时把标记置 true（REPAIRING 已降级为标记列，
+//!   migration 005/006）
 //!
 //! 同步策略：每个生命周期方法在事务内同时翻转 `t_part` 与最近一条匹配的
 //! `t_part_batch`（status 白名单匹配 + id DESC）。无 source-status 批次时仅翻
@@ -13,7 +15,7 @@
 //! 错误码契约（与 `statemachine.rs` 对齐）：
 //! - 20101 `BIZ_PART_NOT_FOUND` —— part 不存在 / 软删
 //! - 20104 `BIZ_INVALID_VALUE` —— DB 中 status 字符串不在 enum 白名单
-//! - 20103 `BIZ_INVALID_TRANSITION` —— 状态机白名单拒绝（cancel 时 COMPLETED/REPAIRING 等）
+//! - 20103 `BIZ_INVALID_TRANSITION` —— 状态机白名单拒绝（cancel 时 COMPLETED / CANCELLED 等）
 //! - 20115 `BIZ_PART_ALREADY_CANCELLED` —— 工单已 CANCELLED
 //! - 20116 `BIZ_PART_NOT_DELIVERED` —— complete 要求 DELIVERED
 //! - 20117 `BIZ_PART_NOT_READY_TO_SHIP` —— deliver 要求 READY_TO_SHIP
@@ -186,7 +188,7 @@ impl PartService {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,
                 format!(
-                    "工单状态 {} 不允许取消（COMPLETED/REPAIRING 等不可取消）",
+                    "工单状态 {} 不允许取消（COMPLETED / CANCELLED 等终态不可取消）",
                     from.as_str()
                 ),
             ));
@@ -364,10 +366,22 @@ impl PartService {
         })?;
         // 2026-10-01：REPAIRING 降级为 `t_part_batch.is_repairing` 标记后，
         // start-repair **不再是一次状态迁移**（status 保持 IN_PROCESS），
-        // 守卫从「枚举迁移白名单」改为「源状态必须是 IN_PROCESS」。
-        // ⚠️ 精确判定（「该批次当前确实不在返修中」）应查 `batch.is_repairing`
-        // 列 —— 那一列属 REPAIRING 下游消费方改造的范围（并行任务），本轮
-        // 不在此引入，以免与其抢同一批文件。
+        // 守卫从「枚举迁移白名单」改为「源状态必须是 IN_PROCESS」+「尚未处于
+        // 返修中」。
+        //
+        // `is_repairing` 这条守卫是本轮补齐的**精确判定**：`is_repairing`
+        // 语义是「已进入 / 正在返修」，重复起修要么是前端重复提交，要么是用户
+        // 对同一批次连点两次 —— 两种都会白白多写一条 REPAIR_STARTED 事件、让
+        // 统计域的「期内返修工单数」（`statistics::count_repair_parts` 按
+        // distinct part_id 计，同 part 重复起修不会重复计，但换批次就会）失真，
+        // 更重要的是会让「已起修 → complete_repair」的配对关系变得不可推。
+        // 错误码沿用 `BIZ_PART_REPAIR_NOT_TRIGGERED`（20118）：该码的语义是
+        // 「返修流转的前置条件不满足」，重复起修同属此类，无需新增错误码。
+        //
+        // ⚠️ `PartStatus::from_str` 的 `"REPAIRING" => IN_PROCESS` 过渡兼容
+        // 分支让 migration 006 之前的存量行能通过状态守卫（其标记由 006 洗成
+        // `is_repairing = true`），故存量返修批次会落进下面这条「已在返修中」
+        // 的拒绝 —— 属预期：它本来就已在返修中，不需要再起一次。
         if from != PartStatus::IN_PROCESS {
             return Err(AppError::biz(
                 code::BIZ_PART_REPAIR_NOT_TRIGGERED,
@@ -376,6 +390,12 @@ impl PartService {
                     batch.id,
                     from.as_str()
                 ),
+            ));
+        }
+        if batch.is_repairing {
+            return Err(AppError::biz(
+                code::BIZ_PART_REPAIR_NOT_TRIGGERED,
+                format!("batch {} 已处于返修中，无需重复 start-repair", batch.id),
             ));
         }
         // 3. caller 侧乐观锁：锚定 batch.version。
@@ -402,12 +422,19 @@ impl PartService {
         //    派生已在同一事务内完成，**不再**手工调 `sync_from_batch_change`
         //    （原 `let _ =` 既冗余，又把 rollup 错误降级成「静默丢弃」）。
         // 6. 事件日志。
+        //
+        // 2026-10-01：`to_status` 由 `'REPAIRING'` 改为 `'IN_PROCESS'` —— 本端点
+        // 不改 status，只翻 `is_repairing` 标记，而 REPAIRING 已不是任何一列会
+        // 取到的值（写它会让时间线与 `t_part_batch.status` 矛盾）。形如
+        // `IN_PROCESS → IN_PROCESS` 的事件是**真实**轨迹：状态未变、位置未变、
+        // 变的是标记位与「已起修」这一事实。返修语义由 `event_type='REPAIR_
+        // STARTED'` + `is_repairing` 列承载。
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
             part_id,
             event_type: "REPAIR_STARTED",
             from_status: Some("IN_PROCESS"),
-            to_status: Some("REPAIRING"),
+            to_status: Some("IN_PROCESS"),
             batch_id: Some(batch.id),
             quantity: Some(batch.quantity),
             drawing_code: Some(&part.drawing_no),

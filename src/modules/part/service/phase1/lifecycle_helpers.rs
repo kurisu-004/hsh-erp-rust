@@ -278,7 +278,8 @@ impl PartService {
             // 本冲突处**不采纳**该改法，理由与 2026-09-30 review 第 3 轮 M3 对
             // `GET /parts/inspection-batches` 的回退完全同形：
             //   - 本查询 WHERE **无 status 过滤**，会同时返回 PENDING / IN_PROCESS /
-            //     INSPECTION / REPAIRING 等各状态批次；
+            //     INSPECTION / READY_TO_SHIP 等各状态批次（返修中的批次按
+            //     IN_PROCESS 一并返回）；
             //   - 而所有进 INSPECTION 的写点都按「出池 → `current_process_id = NULL`」
             //     不变式把该列清空（`phase1::scan` / `outsource::
             //     receive_to_inspection` / `repair::complete_repair` /

@@ -22,8 +22,12 @@ use crate::shared::types::{serialize_i64, serialize_i64_opt};
 // =============================================================================
 
 /// 批次状态字符串形态（t_part_batch.status 取值：PENDING / IN_PROCESS /
-/// INSPECTION / READY_TO_SHIP / DELIVERED / REPAIRING / OUTSOURCE /
+/// INSPECTION / READY_TO_SHIP / DELIVERED / OUTSOURCE /
 /// COMPLETED / CANCELLED）。
+///
+/// 2026-10-01：删掉 `REPAIRING` —— REPAIRING 已降级为
+/// `t_part_batch.is_repairing` 标记列（migration 005/006），DB 层不再产生该
+/// status，返修中的批次 status 就是 `IN_PROCESS`。
 ///
 /// 暂用 `String` 不抽 enum：与 part/vo/part_batch.rs 同形，handler / DTO 不做
 /// 反序列化（只 SQL → DTO 单向），无需 typed enum。如未来 mini-program 改严
@@ -51,8 +55,12 @@ pub enum WxPartKind {
 ///
 /// 设计取舍：4 个 tab（pending_production / in_production / pending_inspection /
 /// delivered）按"用户视角"映射（工单创建 → 待投产 → 生产中 → 待检 → 出货）；
-/// `PROGRAMMING` / `OUTSOURCE` / `REPAIRING` / `COMPLETED` / `CANCELLED` 仅计
+/// `PROGRAMMING` / `OUTSOURCE` / `COMPLETED` / `CANCELLED` 仅计
 /// 入 `all`，不单独 tab 化。
+///
+/// 2026-10-01：删掉 `REPAIRING`（已降级为 `t_part_batch.is_repairing` 标记列）。
+/// 返修中的工单 status 为 `IN_PROCESS`，**自动计入 `in_production`** —— 返修
+/// 仍在生产中，从「生产中」里扣掉它会让该 tab 少算在厂量。
 ///
 /// `delivered` = `READY_TO_SHIP + DELIVERED`（"已完工可出货"二合一），与
 /// 现有 dashboard 域 `item.shelf_code` 判定的"待出"口径一致。

@@ -999,6 +999,45 @@ async fn start_repair_in_process_200() {
     );
 }
 
+/// POST /parts/{id}/start-repair —— batch 已在返修中（is_repairing=true）→ 20118。
+///
+/// 2026-10-01 新增：start-repair 不再改 status，故「重复起修」无法靠状态守卫
+/// 拦住 —— 必须查 `is_repairing` 标记。重复起修会多写一条 REPAIR_STARTED
+/// 事件、让「已起修 → complete_repair」的配对关系失真。
+#[tokio::test]
+async fn start_repair_already_repairing_400() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let pid = insert_part(&pool, "P0", fx.customer_l2_id, Some("P000"), "IN_PROCESS").await;
+    let bid = insert_batch(&pool, pid, 1, 1, "IN_PROCESS").await;
+    sqlx::query("UPDATE t_part_batch SET is_repairing = true WHERE id = $1")
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .expect("mark repairing");
+    let bver = batch_version(&pool, bid).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/start-repair"),
+            Some(json!({
+                "batch_id": bid.to_string(),
+                "version": bver,
+                "reason": "重复起修"
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "已在返修中不允许重复 start-repair: {env}"
+    );
+    assert_eq!(env["code"], 20118, "BIZ_PART_REPAIR_NOT_TRIGGERED: {env}");
+}
+
 /// POST /parts/{id}/start-repair —— batch PENDING → 20118。
 #[tokio::test]
 async fn start_repair_wrong_state_400() {

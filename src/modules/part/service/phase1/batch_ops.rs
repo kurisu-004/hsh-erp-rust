@@ -135,11 +135,25 @@ impl PartService {
                 format!("batch 当前状态 {} 不允许取消", from.as_str()),
             ));
         }
+        // 2026-10-01：显式清返修标记（`Some(false)`）。
+        //
+        // 之前走 `resolve_status_alias` 时 CANCELLED 分支拿到的是 `None`（保持
+        // 原值），于是「返修中被取消」的批次会带着 `is_repairing = true` 落到
+        // 终态 —— 而 `GET /parts/repairing-batches`（判据就是
+        // `is_repairing = true`）会把已作废的批次列成「待返修」，用户点进去
+        // 才发现批次早没了。终态就该清干净。
+        //
+        // ⚠️ 遗留（同轮未修，见 `repair.rs::list_repairing_batches` 的说明）：
+        // part 级批量取消走 `status_gate::apply_bulk_batch_status_change_for_part`，
+        // 而 bulk 模式**只写 status**，不带 `is_repairing` —— 故那条路径上被
+        // 一并取消的返修批次仍留 `is_repairing = true`。status_gate 本轮不改，
+        // 改由「返修中列表」SQL 排除终态兜底。
         let n = mark_batch_status_only(
             repo.conn_mut(),
             batch.id,
             req.version,
             "CANCELLED",
+            Some(false),
             current.id,
         )
         .await?;

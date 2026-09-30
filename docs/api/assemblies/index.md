@@ -197,7 +197,7 @@
   |---|---|---|
   | `PENDING` | 0 | `PENDING` |
   | `PROGRAMMING` | 1 | `IN_PROCESS` |
-  | `IN_PROCESS` / `REPAIRING` | 2 | `IN_PROCESS` |
+  | `IN_PROCESS`（含返修中，**2026-10-01** REPAIRING 降级为 `is_repairing` 标记列）| 2 | `IN_PROCESS` |
   | `OUTSOURCE` | 3 | `IN_PROCESS` |
   | `INSPECTION` | 4 | `INSPECTION` |
   | `READY_TO_SHIP` | 5 | `READY_TO_SHIP` |

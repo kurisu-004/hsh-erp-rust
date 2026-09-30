@@ -66,7 +66,7 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段)。同步翻转最�
 错误码：
 
 - 20101 — part 不存在 / 软删
-- 20103 — 当前状态不在 cancel 白名单（COMPLETED / REPAIRING / OUTSOURCE 等）
+- 20103 — 当前状态不在 cancel 白名单（COMPLETED / CANCELLED 等终态）
 - 20104 — status 字符串非法
 - 20115 — part 已 CANCELLED
 - 21420 — part 已挂送货单，禁 cancel
@@ -106,12 +106,23 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
 权限: **Manager / Clerk / Inspector**
 
 > ⚠️ **2026-09-11 BREAKING CHANGE (PR-B3)**：收 `batch_id` + `version`，锚定
-> `t_part_batch.version`。状态机守卫读 batch 当前状态 `IN_PROCESS → REPAIRING`。
+> `t_part_batch.version`。
+>
+> **2026-10-01 BREAKING CHANGE**：REPAIRING 降级为布尔标记列
+> `t_part_batch.is_repairing`（migration 005/006）。本端点**不再发生 status
+> 迁移** —— 守卫条件由「状态机 `IN_PROCESS → REPAIRING`」改为
+> **「`status='IN_PROCESS'` 且 `is_repairing = false`」**，命中后只把
+> `is_repairing` 置 `true`（`status` 保持 `IN_PROCESS`）。
+>
+> - 重复起修（`is_repairing` 已为 `true`）→ 20118 `BIZ_PART_REPAIR_NOT_TRIGGERED`。
+> - `t_part.status` 恒为 `IN_PROCESS`（返修仍在生产中，progress 与原 REPAIRING
+>   同档 2），**不再出现 `'REPAIRING'`**。
 >
 > 2026-09-16 PR-2（migration 027）：`has_been_repaired` 列已从 `t_part` 与
 > `t_part_batch` 双删 —— 拆批后无法确定是哪一个批次返修，列语义失真整体废弃。
-> 返修事实改由 `t_part_event.event_type='REPAIR_STARTED'` 事件日志追溯（PR-2 §
-> part/service/lifecycle.rs:422）。
+> 返修事实改由 `t_part_batch.is_repairing` 列 + `t_part_event.event_type=
+> 'REPAIR_STARTED'` 事件日志共同追溯。事件 `from_status` / `to_status` 均写
+> 真实值 `IN_PROCESS`（status 未变，变的是标记位）。
 
 Request：
 
@@ -241,7 +252,14 @@ Response 200 `data`：`PartOut`。
 权限: **Manager / Inspector**
 
 > 2026-09-22 起 P3 repair 收尾。`version` 锚 `t_part_batch.version`。
-> 状态机：`REPAIRING → IN_PROCESS`。
+>
+> **2026-10-01 BREAKING CHANGE**：守卫条件由「状态机 `REPAIRING → …`」改为
+> **「`is_repairing = true`（确实在返修中）」**（REPAIRING 已降级为标记列）。
+> 源状态非 `IN_PROCESS` 或 `is_repairing = false` → 20118
+> `BIZ_PART_REPAIR_NOT_TRIGGERED`。
+> 去向由 `shelf.zone` 决定：`PRODUCTION` → `IN_PROCESS`（落回生产架、重新入池
+> 并写 `next_process_id`）/ `INSPECTION` → `INSPECTION`（送检区、出池）；
+> 两条路径都把 `is_repairing` 清回 `false`。
 
 Request：
 
@@ -262,7 +280,13 @@ Response 200 `data`：`PartOut`。
 权限: **Manager**
 
 > 2026-09-22 起 P3 repair 起始（与 `start-repair` 类似但用于派工而非自检）。
-> 状态机：`IN_PROCESS → REPAIRING`。
+> 入口状态：IN_PROCESS / INSPECTION / READY_TO_SHIP / DELIVERED；去向由
+> `shelf.zone` 决定（PRODUCTION → `IN_PROCESS` / INSPECTION → `INSPECTION`）。
+>
+> **2026-10-01**：一步式下发（一次调用完成「起修 + 到位」），故不写
+> `is_repairing = true` 再清，而是**直接保持 `false`**。事件仍记两条
+> （`REPAIR_STARTED` + `REPAIR_COMPLETED`），状态字段写真实值：
+> `S → IN_PROCESS`（起修）`→ T`（到位）。
 
 Request：
 
@@ -310,7 +334,8 @@ Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
 
 权限: **Manager / Inspector**
 
-> 2026-09-22 起 P3 list。返回所有 REPAIRING 状态的 batch 汇总。
+> 2026-09-22 起 P3 list。返回所有 `status='DELIVERED'` 的 batch 汇总
+> （历史文档误写为 REPAIRING，2026-10-01 订正：REPAIRING 已降级为标记列）。
 
 Query：`worker_id?` / `process_id?` / `limit?` / `offset?`。
 
@@ -320,7 +345,12 @@ Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 
 权限: **Manager / Inspector**
 
-> 2026-09-22 起 P3 list（与 `repair-batches` 同语义，区别：含 worker 在制中）。
+> 2026-09-22 起 P3 list（与 `repair-batches` 同形状，区别：判据不同）。
+>
+> **2026-10-01 BREAKING CHANGE**：判据由 `status = 'REPAIRING'` 改为
+> **`t_part_batch.is_repairing = true`**，并额外排除 `status IN
+> ('COMPLETED','CANCELLED')`（兜底 part 级批量取消只写 status、不清标记的遗留）。
+> 返回项的 `status` 字段恒为 `IN_PROCESS`。
 
 Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 
