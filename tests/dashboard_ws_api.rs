@@ -14,6 +14,12 @@
 //!                                                  （非 protocol-level Ping 帧；
 //!                                                  浏览器 JS `onmessage` 可直接收到）
 //!
+//!   HTTP `GET /api/v2/dashboard/snapshot` 集成测试（2026-09-28 新增 + 2026-09-30 扩 query）：
+//!     8. http_snapshot_unauthenticated_returns_401   — 无 Bearer token 应返 401（中间件）
+//!     9. http_snapshot_happy_path_returns_full_shape  — 登录后 GET 返回 200 + 完整 shape（默认 14 天）
+//!    10. http_snapshot_default_14_days_returns_14_buckets — 缺省 ?upcoming_days → 14 条桶
+//!    11. http_snapshot_custom_7_days_returns_7_buckets   — ?upcoming_days=7 → 7 条桶（向后兼容老契约）
+//!
 //! 测试栈：必须建 Redis pool，session 写入才算「已吊销」
 //!
 //! ## Fixture 范本化（2026-09-24 PR13 Phase I）
@@ -70,8 +76,10 @@ async fn build_snapshot_with_workers_basic() {
     // by-value；`DashboardService` 是 unit struct，`DashboardService::new()` 构造实例；
     // handler / 直调方都借 `&mut *tx` 喂给 trait（trait 已直接 `impl for &mut PgConnection`，
     // `Transaction` deref 到 `PgConnection`）。
+    // 2026-09-30 新增 days 形参（默认 14）：service 层兜底 unwrap_or(14).clamp(1, 60)；
+    // service-level 直调沿用 `None` 走默认 14 天，与 HTTP 端点缺省值对齐。
     let snap = DashboardService::new()
-        .build_snapshot_with_workers(&mut *tx, None)
+        .build_snapshot_with_workers(&mut *tx, None, None)
         .await
         .expect("snapshot ok");
     drop(tx);
@@ -82,7 +90,8 @@ async fn build_snapshot_with_workers_basic() {
             .iter()
             .any(|g| g.shelf_code == "S-001")
     );
-    assert_eq!(snap.upcoming_delivery.len(), 7, "未来 7 天固定 7 条");
+    // 2026-09-30 修改：原 7 天写死改为 service 默认 14 天（None → 14）
+    assert_eq!(snap.upcoming_delivery.len(), 14, "默认 14 天固定 14 条");
     assert!(!snap.ts.is_empty());
 }
 
@@ -163,8 +172,10 @@ async fn build_snapshot_with_workers_returns_full_shape() {
     let mut tx = pool.begin().await.unwrap();
     // 2026-09-22 Group E 重构：`build_snapshot_with_workers` 改 `<R: DashboardRepoTrait>(&self, mut repo: R)`
     // by-value；handler / 直调方都借 `&mut *tx` 喂给 trait（trait 已直接 `impl for &mut PgConnection`）。
+    // 2026-09-30 新增 days 形参：本用例继续 None 走默认 14 天（保持 JSON shape / by_status
+    // 断言沿用 build_snapshot_with_workers_basic 同形）。
     let snap = DashboardService::new()
-        .build_snapshot_with_workers(&mut *tx, None)
+        .build_snapshot_with_workers(&mut *tx, None, None)
         .await
         .expect("snapshot ok");
     drop(tx);
@@ -255,13 +266,13 @@ async fn snapshot_counters_by_status_returns_per_status_breakdown() {
 
     let mut tx = pool.begin().await.unwrap();
     let snap = DashboardService::new()
-        .build_snapshot_with_workers(&mut *tx, None)
+        .build_snapshot_with_workers(&mut *tx, None, None)
         .await
         .expect("snapshot ok");
     drop(tx);
 
-    // 必有 7 桶
-    assert_eq!(snap.upcoming_delivery.len(), 7);
+    // 必有 14 桶（默认 14 天；2026-09-30 原 7 改 14）
+    assert_eq!(snap.upcoming_delivery.len(), 14);
 
     // today 桶：count=6，by_status 三 key
     let today_bucket = &snap.upcoming_delivery[0];
@@ -283,7 +294,7 @@ async fn snapshot_counters_by_status_returns_per_status_breakdown() {
     assert_eq!(d2_bucket.by_status.get("PROGRAMMING"), Some(&1));
     assert_eq!(d2_bucket.by_status.len(), 1);
 
-    // 其它 5 天桶：count=0，by_status 空 map
+    // 其它 12 天桶（默认 14 - today/today+2 = 12）：count=0，by_status 空 map
     for (idx, b) in snap.upcoming_delivery.iter().enumerate() {
         if idx == 0 || idx == 2 {
             continue;
@@ -605,11 +616,11 @@ async fn http_snapshot_happy_path_returns_full_shape() {
         data["upcoming_delivery"].is_array(),
         "data.upcoming_delivery 应为数组"
     );
-    // 未来 7 天固定 7 条（与 WS 端点断言对齐：tests/dashboard_ws_api.rs:85）
+    // 默认 14 天固定 14 条（2026-09-30 新增：原 7 改 14，与 service 默认天数对齐）
     assert_eq!(
         data["upcoming_delivery"].as_array().unwrap().len(),
-        7,
-        "未来 7 天固定 7 条"
+        14,
+        "默认 14 天固定 14 条"
     );
     // S-HTTP1 应在产线组里（即使 items 空也算，因为 fixture 期望该架被 snapshot 选中）
     let on_prod = data["on_production_shelves"].as_array().unwrap();
@@ -620,5 +631,108 @@ async fn http_snapshot_happy_path_returns_full_shape() {
     assert!(
         !data["ts"].as_str().unwrap_or("").is_empty(),
         "data.ts 应非空"
+    );
+}
+
+// ===========================================================================
+// 2026-09-30 新增：HTTP `GET /api/v2/dashboard/snapshot?upcoming_days=` query 参数
+// ===========================================================================
+//
+// 覆盖 service 层 DASHBOARD_DEFAULT_DAYS=14 + clamp(1, 60) + handler 层
+// SnapshotQuery.deserialize_i64_opt 解析：
+//   - default_14_days_returns_14_buckets — 缺省 query 走 14 天
+//   - custom_7_days_returns_7_buckets   — ?upcoming_days=7 显式 7 天（向后兼容老契约）
+//
+// 注意：`test_app` 不挂 `/api/v2` 前缀（main.rs 才挂；测试走 v2_router 原生路径）；
+// 走 `mint_test_token` 直接写 Redis session 跳过 `/iam/login` 业务层 20606 角色校验，
+// 与同文件 ws_e2e_* / http_snapshot_* 风格一致。
+
+#[tokio::test]
+async fn http_snapshot_default_14_days_returns_14_buckets() {
+    // 缺省 query（无 `?upcoming_days=`）：service 层 DASHBOARD_DEFAULT_DAYS=14 兜底，
+    // 响应 `data.upcoming_delivery` 应含 14 条桶（today + 未来 13 天）。
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+    let app = test_app(state.clone());
+
+    let (status, envelope) = send(
+        app,
+        json_request("GET", "/dashboard/snapshot", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(envelope["code"], 0);
+    let buckets = envelope["data"]["upcoming_delivery"]
+        .as_array()
+        .expect("upcoming_delivery 必为 array");
+    assert_eq!(
+        buckets.len(),
+        14,
+        "缺省 query 走 service DASHBOARD_DEFAULT_DAYS=14，应返 14 条桶"
+    );
+
+    // 第 0 条 date = today（YYYY-MM-DD，与 Local::now().date_naive() 对齐）
+    let today_str = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        buckets[0]["date"].as_str(),
+        Some(today_str.as_str()),
+        "首桶日期应为今天"
+    );
+    // 每条都含 by_status 字段（必填；空对象 = 当日 0 件）
+    for (idx, b) in buckets.iter().enumerate() {
+        assert!(
+            b["by_status"].is_object(),
+            "第 {idx} 桶 by_status 应为 object"
+        );
+        assert!(
+            b["count"].is_number(),
+            "第 {idx} 桶 count 应为 number（JSON wire 不走字符串化）"
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_snapshot_custom_7_days_returns_7_buckets() {
+    // `?upcoming_days=7`：service 层 unwrap_or(14) 路径不触发，clamp(1,60) 命中
+    // 7，响应 `data.upcoming_delivery` 应含 7 条桶（向后兼容原 Python v1 dashboard 契约）。
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+    let app = test_app(state.clone());
+
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "GET",
+            "/dashboard/snapshot?upcoming_days=7",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(envelope["code"], 0);
+    let buckets = envelope["data"]["upcoming_delivery"]
+        .as_array()
+        .expect("upcoming_delivery 必为 array");
+    assert_eq!(
+        buckets.len(),
+        7,
+        "?upcoming_days=7 显式应返 7 条桶（向后兼容 v1 Python 契约）"
+    );
+
+    // 第 6 条 date = today + 6 天（与 SQL 内 CURRENT_DATE + $1 days 对齐）
+    let today = chrono::Local::now().date_naive();
+    let day6_str = (today + chrono::Duration::days(6))
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        buckets[6]["date"].as_str(),
+        Some(day6_str.as_str()),
+        "末桶日期应为 today+6 天"
     );
 }

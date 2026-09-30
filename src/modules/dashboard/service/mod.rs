@@ -36,4 +36,7 @@ pub mod snapshot;
 // 把 DashboardService 类型 + snapshot 子模块定义的所有方法重新汇出，
 // 让 handler.rs 仍走 `crate::modules::dashboard::service::DashboardService::*`
 // 路径访问（路径稳定，零调用方修改）。
-pub use snapshot::{DASHBOARD_TOP_N, DashboardService};
+pub use snapshot::{
+    DASHBOARD_DEFAULT_DAYS, DASHBOARD_MAX_DAYS, DASHBOARD_MIN_DAYS, DASHBOARD_TOP_N,
+    DashboardService,
+};

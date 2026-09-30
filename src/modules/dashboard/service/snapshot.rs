@@ -2,7 +2,7 @@
 //!
 //! 对应 Python myERP/service/dashboard.py 的 `build_snapshot_with_workers`：
 //! 大屏实时推送的完整快照，包含生产货架分组 + 品检区扁平 + 工人持有件 +
-//! 未来 7 天交付分桶。
+//! 未来 N 天交付分桶。
 //!
 //! ## 设计要点（2026-09-22 Group E 重构后）
 //! - 4 次 trait call 拉全量数据（`snapshot_counters` / `snapshot_top_parts` /
@@ -11,6 +11,10 @@
 //! - `repo/sql.rs::DashboardRepo` ZST 提供 4 个聚合静态方法，每个方法内部已做完
 //!   「多表 JOIN + 防 N+1」（批量查名字、批量查客户路径、批量查 PICKED_UP 时间）
 //! - `top_n` 默认 1000：远高于合理在持量，仅作防爆兜底
+//! - 2026-09-30 新增 `days: Option<i64>` 形参：未来交付分桶天数；None → 14
+//!   默认值（与前端 dashboard 视图默认横轴宽度对齐），clamp(1, 60) 防御
+//!   恶意大数；trait / SQL 层早已参数化（`planned_delivery_date < CURRENT_DATE +
+//   ($1::bigint || ' days')::interval`），本轮只把天数从写死 7 提到 query-driven
 //! - service 不持 repo / pool——handler 借 `&mut *tx` 喂给 trait 即可
 //!
 //! ## 事务分层
@@ -30,6 +34,14 @@ use crate::shared::analytics::shelf_grouping::group_by_shelf;
 
 /// 快照 top_n 默认值（远高于合理在持量，仅作防爆兜底）
 pub const DASHBOARD_TOP_N: i64 = 1000;
+
+/// 未来交付分桶默认天数（2026-09-30 新增，对齐前端 dashboard 视图横轴默认宽度）
+pub const DASHBOARD_DEFAULT_DAYS: i64 = 14;
+
+/// 未来交付分桶最大天数（防御恶意大数 / 拼写错把日期塞成 10000）
+pub const DASHBOARD_MAX_DAYS: i64 = 60;
+/// 未来交付分桶最小天数（防御 0 / 负数 / 拼写错）
+pub const DASHBOARD_MIN_DAYS: i64 = 1;
 
 /// 大屏 snapshot 装配 service（2026-09-22 Group E 重构）
 ///
@@ -59,15 +71,28 @@ impl DashboardService {
     ///
     /// 流程：4 次 trait call 拉全量数据 → 装配成 4 个 DTO 子结构 → 包装进
     /// `DashboardSnapshot`。service 内零 SQL——所有 SQL 在 `repo/sql.rs`。
+    ///
+    /// 形参（2026-09-30 新增 days 形参）：
+    /// - `top_n`：产线 + 工人持有 IN_PROCESS 批次每 holder 的 top-N 截流；None →
+    ///   `DASHBOARD_TOP_N`（1000，防爆兜底）
+    /// - `days`：未来 N 天交付分桶天数；None → `DASHBOARD_DEFAULT_DAYS`（14，与
+    ///   前端 dashboard 视图横轴默认宽度对齐）；clamp(1, 60) 防御恶意大数 /
+    ///   拼写错（0 / 负数 / 巨大日期）
     pub async fn build_snapshot_with_workers<R: DashboardRepoTrait>(
         &self,
         mut repo: R,
         top_n: Option<i64>,
+        days: Option<i64>,
     ) -> Result<DashboardSnapshot, sqlx::Error> {
         let top_n = top_n.unwrap_or(DASHBOARD_TOP_N);
+        // 2026-09-30 新增：原写死 7 改为 query-driven；None → 14 默认值
+        // （沿前端 dashboard 视图横轴默认宽度）；clamp(1, 60) 防御恶意大数 / 拼写错。
+        let days = days
+            .unwrap_or(DASHBOARD_DEFAULT_DAYS)
+            .clamp(DASHBOARD_MIN_DAYS, DASHBOARD_MAX_DAYS);
 
         // 1) 4 次聚合 trait call
-        let upcoming = repo.snapshot_counters(7).await?;
+        let upcoming = repo.snapshot_counters(days).await?;
         let top = repo.snapshot_top_parts(top_n).await?;
         let recent = repo.snapshot_recent_batches(top_n).await?;
 
