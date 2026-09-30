@@ -112,11 +112,13 @@ pub trait WorkerPoolRepoTrait: Send {
     ) -> Result<Vec<super::model::HeldBatchItem>, sqlx::Error>;
 
     /// 全工序候选批次聚合计数（2026-09-30 新增）。
-    /// 单 SQL GROUP BY next_process_id，service 层二次查 process 元数据。
+    /// 单 SQL GROUP BY current_process_id，service 层二次查 process 元数据。
     async fn group_count_by_process_all_shelves(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error>;
 
     /// worker ↔ worker 移动 SQL（2026-09-30 新增）。把 batch 从 src 切到 dst，
-    /// 不写 `current_process_step_id`（move 不推进工序链）。详见 sql.rs 同名函数。
+    /// 不写 `current_process_step_id`（move 不推进工序链）**也不写
+    /// `current_process_id`**（池内移动工序不变 —— 2026-09-30 写入不变式）。
+    /// 详见 sql.rs 同名函数。
     async fn move_worker_to_worker(
         &mut self,
         batch_id: i64,
@@ -599,16 +601,15 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         shelf_id: i64,
         process_id: i64,
     ) -> Result<i64, sqlx::Error> {
-        // PR-3 批次 step 化：next_process_id 列已删，JOIN step 取 process_id
+        // 2026-09-30：池归属改按 pb.current_process_id 普通过滤（删 JOIN
+        //   t_process_chain_step，见 sql.rs take_one_from_pool 同名说明）
         let n: i64 = sqlx::query_scalar!(
             r#"SELECT COUNT(*) AS "n!" FROM t_part_batch pb
-            JOIN t_process_chain_step s ON s.id = pb.current_process_step_id
             WHERE pb.status = 'IN_PROCESS'
               AND pb.location = 'PRODUCTION_SHELF'
               AND pb.current_holder_id = $1
-              AND s.process_id = $2
-              AND pb.deleted_at IS NULL
-              AND s.deleted_at IS NULL"#,
+              AND pb.current_process_id = $2
+              AND pb.deleted_at IS NULL"#,
             shelf_id,
             process_id
         )

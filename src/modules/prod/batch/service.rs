@@ -180,12 +180,15 @@ impl BatchService {
             })?;
 
         // 4. UPDATE OCC（带当前 version）
+        // 2026-09-30：透传 target_process_id 作为 current_process_id —— 池归属
+        // 的权威依据，缺了它批次会对所有工序池查询隐身（见 repo 同名函数 doc）
         let rows_affected = BatchRepo::update_batch_dispatched(
             &mut *conn,
             batch.id,
             batch.version,
             shelf_id,
             Some(current.id),
+            target_process_id,
         )
         .await?;
         if rows_affected == 0 {
@@ -230,7 +233,10 @@ impl BatchService {
 
         Ok(DispatchSuccessItem {
             batch_id: batch.id,
+            // 2026-09-30：dispatch 路径仍不解析 step（诚实置 None），
+            // current_process_id 才是入池的权威依据 —— 填真实写入值
             current_process_step_id: None,
+            current_process_id: Some(target_process_id),
             target_process_id,
             shelf_id,
             version: batch.version + 1,
@@ -777,17 +783,29 @@ mod tests {
         assert_eq!(r.succeeded[0].target_process_id, process_id);
         assert_eq!(r.succeeded[0].shelf_id, shelf_id);
         assert_eq!(r.succeeded[0].version, 1);
-        assert!(r.succeeded[0].current_process_step_id.is_none());
+        // 2026-09-30 翻转：原断言只锁 step=NULL（把 bug 编码进了测试）。
+        // 真正的池归属权威依据是 current_process_id，必须等于目标工序。
+        assert!(
+            r.succeeded[0].current_process_step_id.is_none(),
+            "dispatch 路径仍不解析 step，step 应为 None（可选进度指针）"
+        );
+        assert_eq!(
+            r.succeeded[0].current_process_id,
+            Some(process_id),
+            "下发后 current_process_id 必须等于 target_process_id（入池依据）"
+        );
 
-        // DB 验证：batch 应 IN_PROCESS + holder=shelf_id
-        let row: (String, Option<i64>) =
-            sqlx::query_as("SELECT status, current_holder_id FROM t_part_batch WHERE id = $1")
-                .bind(b_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        // DB 验证：batch 应 IN_PROCESS + holder=shelf_id + current_process_id=目标工序
+        let row: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT status, current_holder_id, current_process_id FROM t_part_batch WHERE id = $1",
+        )
+        .bind(b_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(row.0, "IN_PROCESS");
         assert_eq!(row.1, Some(shelf_id));
+        assert_eq!(row.2, Some(process_id), "DB 层也要写入 current_process_id");
 
         // event 验证
         let n: i64 = sqlx::query_scalar(

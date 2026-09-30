@@ -84,11 +84,18 @@ impl WorkerPoolRepo {
     /// - `conn`：调用方持有事务（handler 的 `state.pool.begin()`），repo 不 commit。
     /// - `worker_id`：目标工人 snowflake id（`t_worker.id`）。
     /// - `shelf_id`：工人所属货架（`t_shelf.id`），候选池按 `t_part_batch.current_holder_id = shelf_id` 过滤。
-    /// - `process_ids`：工人可加工工序 id 列表（`t_process.id`），候选池按 `t_part_batch.next_process_id = ANY($3)` 过滤。
+    /// - `process_ids`：工人可加工工序 id 列表（`t_process.id`），候选池按 `t_part_batch.current_process_id = ANY($3)` 过滤。
     /// - `operator_user_id`：审计字段 `updated_by`，由 service 透传（一般是 manager 自己）。
     ///
     /// 返回 `Ok(None)` 当且仅当：候选池为空 / 工人已达 `max_held_batches`。
     /// 不映射为 VersionConflict（其它并发抢同一批的事务会被 SKIP LOCKED 跳过，本事务拿到 0 行视为池空）。
+    ///
+    /// 2026-09-30 修复「下发后不入池」bug：候选 CTE 原本 INNER JOIN
+    /// `t_process_chain_step s ON s.id = pb.current_process_step_id` 再按
+    /// `s.process_id = ANY($3)` 过滤。dispatch 写 `step=NULL` → `s.id = NULL`
+    /// 匹配不到任何行 → 批次对候选池隐身。现改为按
+    /// `pb.current_process_id`（池归属权威依据）直接过滤，删掉 JOIN（顺带省
+    /// 一次主键查找）。
     pub async fn take_one_from_pool(
         conn: &mut PgConnection,
         worker_id: i64,
@@ -121,16 +128,14 @@ impl WorkerPoolRepo {
                                  AND pf.deleted_at IS NULL) AS "has_cnc_program!"
                 FROM t_part_batch pb
                 JOIN t_part p ON p.id = pb.part_id
-                -- 2026-09-16 PR-3 批次 step 化：next_process_id 列已删，
-                -- 改为 JOIN t_process_chain_step s 取 process_id
-                JOIN t_process_chain_step s ON s.id = pb.current_process_step_id
+                -- 2026-09-30：候选池归属改按 pb.current_process_id 普通过滤
+                --   （删 JOIN t_process_chain_step，见函数 doc 的 bug 修复说明）
                 WHERE pb.status = 'IN_PROCESS'
                   AND pb.location = 'PRODUCTION_SHELF'
                   AND pb.current_holder_id = $2
-                  AND s.process_id = ANY($3)
+                  AND pb.current_process_id = ANY($3)
                   AND pb.deleted_at IS NULL
                   AND p.deleted_at IS NULL
-                  AND s.deleted_at IS NULL
                   AND (SELECT n FROM held) < (SELECT max_held FROM max_batches)
                 ORDER BY
                     -- 2026-09-29 新增：已编程 batch 优先（has_cnc_program DESC）。
@@ -296,15 +301,21 @@ impl WorkerPoolRepo {
     }
 
     /// 列出某工序在所有生产货架上的候选批次（status=IN_PROCESS + location=PRODUCTION_SHELF
-    /// + next_process_id=process_id）。
+    /// + current_process_id=process_id）。
     ///
-    /// 跨 5 表 JOIN：t_part_batch + t_part + t_customer L2 + t_customer L1 (LEFT JOIN)
+    /// 跨 4 表 JOIN：t_part_batch + t_part + t_customer L2 + t_customer L1 (LEFT JOIN)
     /// + t_shelf；service 在同事务内调用，repo 不 commit。
     ///
     /// 排序与 `take_one_from_pool` 对齐：admin 视图与工人抢一批用同一优先级，
     /// 业务上语义一致（先看交期，再看加急，最后看 id 稳定）。
     ///
     /// 不分页：admin 视角全量，前端按 shelf_id 客户端筛选。
+    ///
+    /// 2026-09-30 修复「下发后不入池」bug：`GET /prod/pool/{process_id}` 原本
+    /// INNER JOIN `t_process_chain_step s2 ON s2.id = pb.current_process_step_id`
+    /// 并按 `s2.process_id = $1` 过滤。dispatch 写 `step=NULL` → 批次隐身。
+    /// 现改为 `pb.current_process_id = $1` 普通过滤，删掉 JOIN（顺带省一次
+    /// 主键查找，`current_process_id` 有部分索引兜底）。
     pub async fn list_candidates_by_process_all_shelves(
         conn: &mut PgConnection,
         process_id: i64,
@@ -344,14 +355,13 @@ impl WorkerPoolRepo {
             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL
             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL
             JOIN t_shelf s ON s.id = pb.current_holder_id AND s.deleted_at IS NULL
-            -- 2026-09-16 PR-3 批次 step 化：JOIN step 取 process_id（替代列）
-            JOIN t_process_chain_step s2 ON s2.id = pb.current_process_step_id
+            -- 2026-09-30：候选池归属改按 pb.current_process_id 普通过滤
+            --   （删 JOIN t_process_chain_step，见函数 doc 的 bug 修复说明）
             WHERE pb.status = 'IN_PROCESS'
               AND pb.location = 'PRODUCTION_SHELF'
-              AND s2.process_id = $1
+              AND pb.current_process_id = $1
               AND pb.deleted_at IS NULL
               AND p.deleted_at IS NULL
-              AND s2.deleted_at IS NULL
             ORDER BY
                 p.system_delivery_date ASC NULLS LAST,
                 p.planned_delivery_date ASC NULLS LAST,
@@ -515,14 +525,13 @@ impl WorkerPoolRepo {
 
     /// 全工序候选批次聚合计数（2026-09-30 新增）。
     ///
-    /// 单 SQL `GROUP BY next_process_id`：跨所有生产货架聚合 `t_part_batch` 中
+    /// 单 SQL `GROUP BY current_process_id`：跨所有生产货架聚合 `t_part_batch` 中
     /// `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND deleted_at IS NULL`
-    /// 的批次数（按 next_process_id 维度统计）。
+    /// 的批次数（按工序维度统计）。
     ///
     /// 业务口径与 `list_candidates_by_process_all_shelves`（per-process 候选池详情）
     /// 完全一致：两者都限定 `status + location + deleted_at` 三态，唯一区别是本方法
-    /// 只 GROUP BY 计次，不返回批次明细。复用了 PR-3 批次 step 化后
-    /// `next_process_id` 改走 `t_process_chain_step.process_id` JOIN 取值。
+    /// 只 GROUP BY 计次，不返回批次明细。
     ///
     /// 返回 `Vec<(i64, i64)>` 形态 `(process_id, count)`：service 层二次调
     /// `ProcessRepo::list_by_ids` 取 process_code / process_name 元数据后组装
@@ -530,24 +539,32 @@ impl WorkerPoolRepo {
     /// 与「本币 count GROUP BY」SQL 隔离，service 层负责 DTO 拼装，与
     /// `pool_by_process` service 路径同形态（先 GROUP BY 再二次查元数据）。
     ///
-    /// 索引命中：`ix_t_part_batch_location`（`location`）+ `pb.deleted_at` 过滤；
-    /// JOIN t_process_chain_step 走 `t_process_chain_step.id` 主键
-    /// （`current_process_step_id` 外键约束保证）。本端点为 dashboard 快照型
-    /// 轻量查询（前端 WorkerQueueBoard tab 标题徽标），无分页。
+    /// 索引命中：`ix_t_part_batch_current_process_id`（current_process_id 部分
+    /// 索引）+ `ix_t_part_batch_location`（`location`）+ `pb.deleted_at` 过滤。
+    /// 本端点为 dashboard 快照型轻量查询（前端 WorkerQueueBoard tab 标题徽标），
+    /// 无分页。
+    ///
+    /// 2026-09-30 修复「下发后不入池」bug：原本
+    /// `JOIN t_process_chain_step s ON s.id = pb.current_process_step_id` +
+    /// `GROUP BY s.process_id`，dispatch 写 `step=NULL` → 计数恒为 0。现改为
+    /// `GROUP BY pb.current_process_id`，删掉 JOIN。
     pub async fn group_count_by_process_all_shelves<'e, E: PgExecutor<'e>>(
         executor: E,
     ) -> Result<Vec<(i64, i64)>, sqlx::Error> {
+        // 2026-09-30：`pb.current_process_id` 列可空，但 WHERE 已限定
+        // `status='IN_PROCESS'` + `location='PRODUCTION_SHELF'`（业务不变式：
+        // 进池必写该列），故 SQL 层用 `pb.current_process_id AS "process_id!"`
+        // 显式断言非空，rust 侧保持 `i64` 不退化为 `Option<i64>`。
         let rows: Vec<(i64, i64)> = sqlx::query_as(
             r#"
-            SELECT s.process_id, COUNT(*) AS "count!"
+            SELECT pb.current_process_id AS "process_id!", COUNT(*) AS "count!"
             FROM t_part_batch pb
-            JOIN t_process_chain_step s ON s.id = pb.current_process_step_id
             WHERE pb.status = 'IN_PROCESS'
               AND pb.location = 'PRODUCTION_SHELF'
               AND pb.deleted_at IS NULL
-              AND s.deleted_at IS NULL
-            GROUP BY s.process_id
-            ORDER BY s.process_id ASC
+              AND pb.current_process_id IS NOT NULL
+            GROUP BY pb.current_process_id
+            ORDER BY pb.current_process_id ASC
             "#,
         )
         .fetch_all(executor)
@@ -560,6 +577,8 @@ impl WorkerPoolRepo {
     /// `POST /api/v2/prod/pool/move` 当 from.kind=WORKER 且 to.kind=WORKER 时调此 SQL。
     /// - **不写 `current_process_step_id`**：move worker→worker 不推进工序链
     ///   （与 worker→pool 同原则；step 只在 worker-scan RETURNED/INSPECTED 推进）
+    /// - **不写 `current_process_id`**：2026-09-30 写入不变式「池内移动工序不变」，
+    ///   批次归还货架后仍属原工序候选池
     /// - WHERE 守卫：
     ///   - `current_holder_id = $4`：源 worker 必须当前持有该 batch
     ///   - `location = 'WORKER'`：与 holder 守卫配合限定状态机
@@ -586,6 +605,7 @@ impl WorkerPoolRepo {
                 location          = 'WORKER',
                 -- 2026-09-30 重构：worker↔worker move 不写 step
                 --   （move 不推进工序链，与 worker→pool 同原则）
+                -- 2026-09-30：同理不写 current_process_id（池内移动工序不变）
                 version           = version + 1,
                 updated_at        = NOW(),
                 updated_by        = $5

@@ -11,7 +11,8 @@
 //! ## 2026-09-30 move 重构
 //! - 原 `admin_remove_held_batch`（WORKER→POOL 单边）+ `assign_batch_to_worker`（POOL→WORKER
 //!   单边）合并为 `move_batch`（POOL ↔ WORKER + WORKER ↔ WORKER 三方向通用移动）；
-//!   - `move_batch` 不写 `current_process_step_id`（move 不推进工序链）；
+//!   - `move_batch` 不写 `current_process_step_id`（move 不推进工序链），
+//!     同样不写 `current_process_id`（2026-09-30 写入不变式：池内移动工序不变）；
 //!   - `from` / `to` 必须与 batch 当前 `(location, current_holder_id)` 状态一致
 //!     → 不一致抛 `20122 BIZ_BATCH_LOCATION_MISMATCH`；
 //!   - 同 kind 移动（POOL→POOL / WORKER→WORKER 仅源 ≠ 目标）抛 `40001 VALIDATION_ERROR`。
@@ -313,6 +314,8 @@ impl WorkerPoolService {
     ///
     /// 关键不变量（plan §2.3）：
     /// - 所有 move SQL **不写** `current_process_step_id`（工序链不被破坏）
+    /// - 所有 move SQL **不写** `current_process_id`（2026-09-30 写入不变式：
+    ///   池内移动工序不变，批次归还货架后仍属原工序候选池）
     /// - OCC：`UPDATE ... WHERE version = $exp`，0 行 → `40901 VERSION_CONFLICT`
     /// - `from` 必与 batch 当前状态匹配（→ 40904）
     #[allow(clippy::too_many_arguments)]
@@ -1332,6 +1335,7 @@ mod tests {
     /// 写一个 part + chain + step（首道指向 process_id）。返回 part_id。
     /// 2026-09-16 PR-3：move 路径要求 part 绑定工艺链 + batch 持有
     /// current_process_step_id（与 worker_pool 集成测试 helper 同形态）。
+    /// 2026-09-30：候选池归属改按 `current_process_id` 过滤，helper 同步补该列。
     async fn insert_pool_batch(
         pool: &sqlx::PgPool,
         customer_id: i64,
@@ -1386,12 +1390,14 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-             current_holder_id, current_process_step_id, version, created_at, updated_at) \
-             VALUES ($1, $2, 1, 1, 'IN_PROCESS', 'PRODUCTION_SHELF', $3, $4, 0, $5, $5)",
+             current_holder_id, current_process_id, current_process_step_id, version, \
+             created_at, updated_at) \
+             VALUES ($1, $2, 1, 1, 'IN_PROCESS', 'PRODUCTION_SHELF', $3, $4, $5, 0, $6, $6)",
         )
         .bind(batch_id)
         .bind(part_id)
         .bind(shelf_id)
+        .bind(process_id)
         .bind(step_id)
         .bind(now)
         .execute(pool)
@@ -1454,12 +1460,14 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-             current_holder_id, current_process_step_id, version, created_at, updated_at) \
-             VALUES ($1, $2, 1, 1, 'IN_PROCESS', 'WORKER', $3, $4, 0, $5, $5)",
+             current_holder_id, current_process_id, current_process_step_id, version, \
+             created_at, updated_at) \
+             VALUES ($1, $2, 1, 1, 'IN_PROCESS', 'WORKER', $3, $4, $5, 0, $6, $6)",
         )
         .bind(batch_id)
         .bind(part_id)
         .bind(worker_id)
+        .bind(process_id)
         .bind(step_id)
         .bind(now)
         .execute(pool)

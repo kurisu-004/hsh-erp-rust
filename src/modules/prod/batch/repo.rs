@@ -11,7 +11,7 @@
 //!   `t_shelf_process` 首条 active 货架映射（多结果取 sort_order 最小者）
 //! - [`BatchRepo::update_batch_dispatched`] —— 标记 PENDING 批次已下发
 //!   （status='IN_PROCESS' + location='PRODUCTION_SHELF' + current_holder_id=shelf_id +
-//!   current_process_step_id=NULL），带乐观锁
+//!   **current_process_id=target_process_id** + current_process_step_id=NULL），带乐观锁
 //! - [`BatchRepo::first_step_of_chain`] —— 取工艺链首道 step（`ORDER BY step_no LIMIT 1`）
 //!
 //! ## 错误类型
@@ -127,7 +127,7 @@ impl BatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -170,18 +170,33 @@ impl BatchRepo {
     /// 标记 PENDING 批次已下发（OCC UPDATE）。
     ///
     /// 输入：batch_id, expected_version (PENDING batch 当前 version), shelf_id,
-    /// updated_by。
+    /// updated_by, current_process_id（= target_process_id）。
     /// 输出：affected rows（0 → 40901 `VERSION_CONFLICT` / status 非 PENDING
     /// / 已软删，由 service 层映射）。
+    ///
     /// 副作用：`status='IN_PROCESS'` + `location='PRODUCTION_SHELF'` +
-    /// `current_holder_id=shelf_id` + `current_process_step_id=NULL`（dispatch
-    /// 路径不解析 step，由后续 worker-scan 触发）+ `version += 1`。
+    /// `current_holder_id=shelf_id` + `current_process_id=target_process_id` +
+    /// `version += 1`。
+    ///
+    /// 2026-09-30 新增 `current_process_id` 写入（用户报告 bug 修复）：本列是
+    /// **判断批次是否属于某工序池的唯一权威依据**（worker_pool 候选池 3 条 SQL
+    /// 与 count 全部按它普通过滤）。此前 dispatch 只写
+    /// `current_process_step_id=NULL`，而候选池 SQL 全部 INNER JOIN
+    /// `t_process_chain_step ON s.id = pb.current_process_step_id`：
+    /// `s.id = NULL` 匹配不到任何行，批次对所有池查询隐身（前端看到
+    /// 「下发成功但工序池里没有」），且因唯一推进 step 的 worker-scan 路径又
+    /// 要求批次先在池里，形成死状态。
+    ///
+    /// `current_process_step_id` 仍写 NULL 是**有意的**：本次不解析 step
+    /// （工单无工序链时本就解析不出）。该列已降级为**可选的进度指针**，
+    /// NULL 不影响入池；由 worker-scan RETURNED / INSPECTED 等后续流转写入。
     pub async fn update_batch_dispatched(
         conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
         updated_by: Option<i64>,
+        current_process_id: i64,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query!(
             r#"
@@ -189,6 +204,9 @@ impl BatchRepo {
             SET status                  = 'IN_PROCESS',
                 location                = 'PRODUCTION_SHELF',
                 current_holder_id       = $3,
+                -- 2026-09-30 新增：池归属权威依据（见函数 doc）
+                current_process_id      = $5,
+                -- 进度指针：dispatch 路径不解析 step，有意置 NULL
                 current_process_step_id = NULL,
                 version                 = version + 1,
                 updated_at              = now(),
@@ -202,6 +220,7 @@ impl BatchRepo {
             expected_version,
             shelf_id,
             updated_by,
+            current_process_id,
         )
         .execute(&mut *conn)
         .await?;

@@ -104,7 +104,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -132,7 +132,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -171,6 +171,7 @@ impl PartBatchRepo {
                 pb.status        AS "pb_status!",
                 pb.location      AS "pb_location?",
                 pb.current_holder_id AS "pb_current_holder_id?",
+                pb.current_process_id AS "pb_current_process_id?",
                 pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
@@ -229,6 +230,7 @@ impl PartBatchRepo {
                         status: r.pb_status,
                         location: r.pb_location,
                         current_holder_id: r.pb_current_holder_id,
+                        current_process_id: r.pb_current_process_id,
                         current_process_step_id: r.pb_current_process_step_id,
                         delivery_note_id: r.pb_delivery_note_id,
                         parent_batch_id: r.pb_parent_batch_id,
@@ -301,6 +303,7 @@ impl PartBatchRepo {
                 pb.status        AS "pb_status!",
                 pb.location      AS "pb_location?",
                 pb.current_holder_id AS "pb_current_holder_id?",
+                pb.current_process_id AS "pb_current_process_id?",
                 pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
@@ -359,6 +362,7 @@ impl PartBatchRepo {
                         status: r.pb_status,
                         location: r.pb_location,
                         current_holder_id: r.pb_current_holder_id,
+                        current_process_id: r.pb_current_process_id,
                         current_process_step_id: r.pb_current_process_step_id,
                         delivery_note_id: r.pb_delivery_note_id,
                         parent_batch_id: r.pb_parent_batch_id,
@@ -417,7 +421,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -548,18 +552,19 @@ impl PartBatchRepo {
         .await?;
 
         // 2. INSERT 新批次（继承源 location / current_holder_id /
-        //    current_process_step_id；quantity = qty；status = new_batch_status；
-        //    不继承 delivery_note_id；写 parent_batch_id）。
+        //    current_process_step_id / **current_process_id**（2026-09-30 池归属
+        //    权威依据，拆批不改变批次所属工序）；quantity = qty；
+        //    status = new_batch_status；不继承 delivery_note_id；写 parent_batch_id）。
         sqlx::query!(
             r#"
             INSERT INTO t_part_batch (
                 id, part_id, batch_no, quantity, status, location,
-                current_holder_id, current_process_step_id,
+                current_holder_id, current_process_id, current_process_step_id,
                 delivery_note_id, parent_batch_id,
                 version, created_at, created_by, updated_at, updated_by
             )
             SELECT $1, part_id, $2, $3, $4, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    NULL, $5,
                    0, now(), $6, now(), $6
             FROM t_part_batch
@@ -616,6 +621,7 @@ impl PartBatchRepo {
     /// 2026-09-16 PR-3 批次 step 化（migration 028）：
     /// - `next_process_id` / `placed_at` 参数删除（t_part_batch 列已删）
     /// - `current_process_step_id` 由内部 `_split_batch_inner` 走 SELECT 继承源
+    /// - 2026-09-30：`current_process_id`（池归属权威依据）同样由 SELECT 继承
     ///
     /// 2026-09-17 PR-4 卫生项 B2：薄包装委托到 `_split_batch_inner`。
     #[allow(clippy::too_many_arguments)]
@@ -673,7 +679,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -741,7 +747,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -775,7 +781,7 @@ impl PartBatchRepo {
         let sql = r#"
             SELECT
                 pb.id, pb.part_id, pb.batch_no, pb.quantity, pb.status, pb.location,
-                pb.current_holder_id, pb.current_process_step_id,
+                pb.current_holder_id, pb.current_process_id, pb.current_process_step_id,
                 pb.delivery_note_id, pb.parent_batch_id,
                 pb.version, pb.created_at, pb.created_by, pb.updated_at, pb.updated_by, pb.deleted_at,
                 p.id AS "p_id", p.serial_no AS "p_serial_no", p.name AS "p_name",
@@ -824,6 +830,7 @@ impl PartBatchRepo {
                 status: r.try_get("status")?,
                 location: r.try_get("location")?,
                 current_holder_id: r.try_get("current_holder_id")?,
+                current_process_id: r.try_get("current_process_id")?,
                 current_process_step_id: r.try_get("current_process_step_id")?,
                 delivery_note_id: r.try_get("delivery_note_id")?,
                 parent_batch_id: r.try_get("parent_batch_id")?,
@@ -953,7 +960,7 @@ impl PartBatchRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -1158,6 +1165,7 @@ impl PartBatchRepo {
                 pb.status          AS "pb_status!",
                 pb.location        AS "pb_location?",
                 pb.version         AS "pb_version!",
+                pb.current_process_id AS "pb_current_process_id?",
                 pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
                 pb.current_holder_id AS "pb_current_holder_id?",

@@ -262,6 +262,16 @@ async fn assert_shelf_maps_process(
 /// - `new_next_process_id` 参数改名为 `new_current_process_step_id`
 ///   （DTO / worker / frontend 仍传 process_id，由 caller 在调本函数前
 ///   经 `ProcessChainRepo::resolve_step_id_by_process` 解析）
+///
+/// 2026-09-30 新增第 8 个 bind 参数 `new_current_process_id: Option<i64>`，
+/// 写入 `t_part_batch.current_process_id`。两者语义**必须分清**：
+/// - `new_current_process_id` —— **池归属的权威依据**（逻辑 FK → t_process.id）。
+///   写入不变式：进池（`status='IN_PROCESS'` + `location='PRODUCTION_SHELF'`）
+///   写目标 `process_id`；出池（转 PENDING / INSPECTION / INSPECTION_SHELF）
+///   传 `None`；池内移动不经过本函数，故无「不动」分支。
+/// - `new_current_process_step_id` —— **可选的进度指针**（逻辑 FK →
+///   t_process_chain_step.id），仅当工单已绑定工序链时才写，允许 NULL。
+///   NULL 不影响入池（旧设计的死状态已由 `current_process_id` 打破）。
 #[allow(clippy::too_many_arguments)]
 async fn mark_batch_with_status_and_meta<'e, E: PgExecutor<'e>>(
     executor: E,
@@ -271,11 +281,12 @@ async fn mark_batch_with_status_and_meta<'e, E: PgExecutor<'e>>(
     new_location: Option<&str>,
     new_holder_id: Option<i64>,
     new_current_process_step_id: Option<i64>,
+    new_current_process_id: Option<i64>,
     updated_by: i64,
 ) -> Result<u64, sqlx::Error> {
     let r = sqlx::query(
         "UPDATE t_part_batch SET status = $3, location = $4, current_holder_id = $5, \
-         current_process_step_id = $6, \
+         current_process_step_id = $6, current_process_id = $8, \
          version = version + 1, updated_at = now(), updated_by = $7 \
          WHERE id = $1 AND version = $2 AND status NOT IN ('CANCELLED', 'COMPLETED') \
          AND deleted_at IS NULL",
@@ -287,6 +298,7 @@ async fn mark_batch_with_status_and_meta<'e, E: PgExecutor<'e>>(
     .bind(new_holder_id)
     .bind(new_current_process_step_id)
     .bind(updated_by)
+    .bind(new_current_process_id)
     .execute(executor)
     .await?;
     Ok(r.rows_affected())

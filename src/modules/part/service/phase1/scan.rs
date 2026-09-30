@@ -63,6 +63,8 @@ impl PartService {
         )
         .await?;
         // 第一步：到 INSPECTION
+        // 2026-09-30：出池（转 INSPECTION）→ current_process_id 置 NULL，
+        // 否则 INSPECTION 批次会混进工序候选池
         let n1 = mark_batch_with_status_and_meta(
             repo.conn_mut(),
             batch.id,
@@ -70,6 +72,7 @@ impl PartService {
             "INSPECTION",
             Some("INSPECTION_SHELF"),
             Some(req.target_inspection_shelf_id),
+            None,
             None,
             current.id,
         )

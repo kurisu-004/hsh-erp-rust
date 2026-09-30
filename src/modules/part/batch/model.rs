@@ -18,14 +18,27 @@
 //! - 删 `placed_at`（不再统计生产时间）
 //!
 //! 真实 process_id 由 service 层 JOIN t_process_chain_step 按需派生。
+//!
+//! 2026-09-30 新增 `current_process_id`（migration 004）：
+//! - `current_process_id`（逻辑 FK → `t_process.id`）是**判断批次是否属于某
+//!   工序池的唯一权威依据**：worker_pool 候选池 3 条 SQL + count 全部按本列
+//!   普通过滤（不再 JOIN `t_process_chain_step`）
+//! - `current_process_step_id` 相应**降级为可选的进度指针**：仅当工单已绑定
+//!   工序链时才写，允许 NULL
+//! - 目的：让**没有工序链的工单，其批次也能正常入池**（旧设计下 dispatch 写
+//!   `step=NULL` + 候选池 SQL INNER JOIN step → 批次对所有池查询隐身，形成
+//!   「要推进 step 先进池、要进池先有 step」的死状态）
 
 use chrono::{NaiveDate, NaiveDateTime};
 
-/// `t_part_batch` 行（Phase P1 投影；2026-09-16 PR-3 适配 step 化）
+/// `t_part_batch` 行（Phase P1 投影；2026-09-16 PR-3 适配 step 化；
+/// 2026-09-30 加 `current_process_id`）
 ///
 /// 字段变化：
 /// - `current_process_step_id: Option<i64>` —— 替代 `next_process_id`（已删），
 ///   逻辑 FK → `t_process_chain_step.id`；NULL = 批次尚未进入生产流或 part 无链
+/// - `current_process_id: Option<i64>` —— 2026-09-30 新增，逻辑 FK →
+///   `t_process.id`；工序池归属的**权威依据**
 /// - `next_process_id` / `placed_at` 字段删除（t_part_batch 列已删）
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TPartBatch {
@@ -36,8 +49,23 @@ pub struct TPartBatch {
     pub status: String,
     pub location: Option<String>,
     pub current_holder_id: Option<i64>,
-    /// 逻辑 FK → `t_process_chain_step.id`；NULL = 批次尚未进入生产流
-    /// （PENDING/PROGRAMMING/OUTSOURCE 起点）或所属 part 无工艺链。
+    /// 逻辑 FK → `t_process.id`；**工序候选池归属的权威依据**。
+    ///
+    /// 写入不变式（2026-09-30）：
+    /// - 进池（`status='IN_PROCESS'` + `location='PRODUCTION_SHELF'`）→ 目标 `process_id`
+    /// - 出池（转 PENDING / INSPECTION / INSPECTION_SHELF）→ NULL
+    /// - 池内移动（worker→货架归还、move 端点）→ 不动
+    /// - 非生产流（初始批次、子批次）→ NULL
+    ///
+    /// NULL = 批次不在生产工序池中（PENDING / PROGRAMMING / OUTSOURCE /
+    /// INSPECTION / OFFICE 等）。
+    pub current_process_id: Option<i64>,
+    /// 逻辑 FK → `t_process_chain_step.id`；**可选的进度指针**。
+    ///
+    /// NULL = 批次尚未进入生产流（PENDING/PROGRAMMING/OUTSOURCE 起点）、
+    /// 所属 part 无工艺链，或 step 已软删。允许 NULL 是本设计的核心：池归属
+    /// 判定已改由 `current_process_id` 承担，本列退化为「批次走到工艺链第几步」
+    /// 的可选进度信息。
     /// 2026-09-16 PR-3 替代 `next_process_id`（已删）。
     pub current_process_step_id: Option<i64>,
     pub delivery_note_id: Option<i64>,

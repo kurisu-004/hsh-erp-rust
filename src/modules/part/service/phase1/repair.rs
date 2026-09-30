@@ -63,7 +63,9 @@ impl PartService {
         if !shelf.is_active {
             return Err(AppError::biz(code::BIZ_SHELF_INACTIVE, "shelf 已停用"));
         }
-        let (new_status, new_location, step_id_opt) = match shelf.zone.as_str() {
+        // 2026-09-30：新增 current_process_id（池归属权威依据）—— 返修完成
+        // 回生产架即重新入池（写目标工序）；回送检区则出池（置 NULL）
+        let (new_status, new_location, step_id_opt, process_id_opt) = match shelf.zone.as_str() {
             "PRODUCTION" => {
                 let np = req.next_process_id.ok_or_else(|| {
                     AppError::biz(code::BIZ_INVALID_VALUE, "PRODUCTION 区需要 next_process_id")
@@ -84,12 +86,18 @@ impl PartService {
                                 ),
                             )
                         })?;
-                ("IN_PROCESS", Some("PRODUCTION_SHELF"), Some(step_id))
+                (
+                    "IN_PROCESS",
+                    Some("PRODUCTION_SHELF"),
+                    Some(step_id),
+                    Some(np),
+                )
             }
             "INSPECTION" => {
                 // INSPECTION 区不带 step（送检区不需要 process 上下文）；
-                // 检验完成后 to_process / to_ship 再设 step
-                ("INSPECTION", Some("INSPECTION_SHELF"), None)
+                // 检验完成后 to_process / to_ship 再设 step。
+                // 2026-09-30：同理不带 current_process_id（出池 → NULL）
+                ("INSPECTION", Some("INSPECTION_SHELF"), None, None)
             }
             other => {
                 return Err(AppError::biz(
@@ -106,6 +114,7 @@ impl PartService {
             new_location,
             Some(req.shelf_id),
             step_id_opt,
+            process_id_opt,
             current.id,
         )
         .await?;
@@ -176,7 +185,9 @@ impl PartService {
         if !shelf.is_active {
             return Err(AppError::biz(code::BIZ_SHELF_INACTIVE, "shelf 已停用"));
         }
-        let (new_status, new_location, step_id_opt) = match shelf.zone.as_str() {
+        // 2026-09-30：新增 current_process_id（池归属权威依据）—— 返修下发
+        // 到生产架即入池（写目标工序）；下发到送检区则出池（置 NULL）
+        let (new_status, new_location, step_id_opt, process_id_opt) = match shelf.zone.as_str() {
             "PRODUCTION" => {
                 let np = req.next_process_id.ok_or_else(|| {
                     AppError::biz(code::BIZ_INVALID_VALUE, "PRODUCTION 区需要 next_process_id")
@@ -197,9 +208,14 @@ impl PartService {
                                 ),
                             )
                         })?;
-                ("IN_PROCESS", Some("PRODUCTION_SHELF"), Some(step_id))
+                (
+                    "IN_PROCESS",
+                    Some("PRODUCTION_SHELF"),
+                    Some(step_id),
+                    Some(np),
+                )
             }
-            "INSPECTION" => ("INSPECTION", Some("INSPECTION_SHELF"), None),
+            "INSPECTION" => ("INSPECTION", Some("INSPECTION_SHELF"), None, None),
             other => {
                 return Err(AppError::biz(
                     code::BIZ_INVALID_VALUE,
@@ -218,6 +234,7 @@ impl PartService {
             new_location,
             Some(req.shelf_id),
             step_id_opt,
+            process_id_opt,
             current.id,
         )
         .await?;

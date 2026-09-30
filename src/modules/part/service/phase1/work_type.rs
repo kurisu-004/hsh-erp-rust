@@ -89,6 +89,8 @@ impl PartService {
         validate_shelf_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION").await?;
         // 翻状态：PENDING → IN_PROCESS+WORKER；IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER
         // PR-3：保留 batch.current_process_step_id（pick-up 不改 step，只换 holder）
+        // 2026-09-30：同理透传 batch.current_process_id（池归属权威依据；
+        // pick-up 不改工序，只换 holder）
         let n = if from == PartStatus::PENDING {
             mark_batch_with_status_and_meta(
                 repo.conn_mut(),
@@ -98,6 +100,7 @@ impl PartService {
                 Some("WORKER"),
                 Some(req.worker_id),
                 batch.current_process_step_id,
+                batch.current_process_id,
                 current.id,
             )
             .await?

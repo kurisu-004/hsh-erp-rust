@@ -163,6 +163,9 @@ impl PartService {
             Some("OUTSOURCE_COMPANY"),
             Some(req.outsource_company_id),
             Some(step_id),
+            // 2026-09-30：记录批次所属工序（外协加工的就是这道工序），
+            // 收回时按 next_process_id 重新入池即可
+            Some(req.process_id),
             current.id,
         )
         .await?;
@@ -296,6 +299,8 @@ impl PartService {
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
             Some(step_id),
+            // 2026-09-30：进池 → current_process_id 写目标工序
+            Some(req.next_process_id),
             current.id,
         )
         .await?;
@@ -406,6 +411,8 @@ impl PartService {
             "INSPECTION",
             Some("INSPECTION_SHELF"),
             Some(req.shelf_id),
+            None,
+            // 2026-09-30：出池（转 INSPECTION）→ current_process_id 置 NULL
             None,
             current.id,
         )

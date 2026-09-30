@@ -92,6 +92,8 @@ pub struct PendingBatchListOut {
 /// 是为未来启用 partial commit 时向前兼容，**当前总是空**。
 ///
 /// `current_process_step_id` 是 `Option<i64>`（dispatch 路径不解析 step，存 NULL）。
+/// `current_process_id`（2026-09-30 新增）是 `Option<i64>`，值恒为
+/// `Some(target_process_id)` —— 池归属的权威依据。
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchResult {
     /// 成功下发的 batch 列表（顺序与 req.targets 一致）。
@@ -103,12 +105,22 @@ pub struct DispatchResult {
 
 /// `DispatchResult.succeeded` 单条（每条 target 对应一个）。
 ///
+/// 2026-09-30 新增 `current_process_id`（工序池归属权威依据）；原
 /// `current_process_step_id` 走 `Option<i64>`（dispatch 不解析 step → None）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchSuccessItem {
     #[serde(serialize_with = "serialize_i64")]
     pub batch_id: i64,
     pub current_process_step_id: Option<i64>,
+    /// 下发后写入 `t_part_batch.current_process_id` 的值（逻辑 FK → `t_process.id`），
+    /// 恒等于本次 `target_process_id`。
+    ///
+    /// **Option 语义**：当前 dispatch 路径恒为 `Some(target_process_id)`；保留
+    /// `Option` 是为了与 `current_process_step_id` 对齐并为将来「下发不到指定
+    /// 工序」的分支留出 `null` 表达。None → JSON `null`，避免前端拿 `"0"` 误判
+    /// 为合法工序 id。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub current_process_id: Option<i64>,
     #[serde(serialize_with = "serialize_i64")]
     pub target_process_id: i64,
     #[serde(serialize_with = "serialize_i64")]

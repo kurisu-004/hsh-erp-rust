@@ -79,6 +79,7 @@ impl PartService {
             )
         })?;
         // 翻状态
+        // 2026-09-30：进池 → current_process_id 写目标工序（池归属权威依据）
         let n = mark_batch_with_status_and_meta(
             repo.conn_mut(),
             batch.id,
@@ -87,6 +88,7 @@ impl PartService {
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
             Some(step_id),
+            Some(req.next_process_id),
             current.id,
         )
         .await?;
@@ -146,11 +148,14 @@ impl PartService {
             ));
         }
         // 翻状态
+        // 2026-09-30：出池（转 PENDING）→ current_process_id 置 NULL，
+        // 否则 PENDING 批次会混进工序候选池
         let n = mark_batch_with_status_and_meta(
             repo.conn_mut(),
             batch.id,
             req.version,
             "PENDING",
+            None,
             None,
             None,
             None,

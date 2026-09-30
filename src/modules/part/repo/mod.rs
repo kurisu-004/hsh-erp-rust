@@ -273,6 +273,7 @@ pub trait PartRepoTrait: Send {
         expected_version: i32,
         shelf_id: i64,
         current_process_step_id: Option<i64>,
+        current_process_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error>;
     async fn mark_batch_returned(
@@ -674,6 +675,7 @@ impl PartRepoTrait for &mut PgConnection {
         expected_version: i32,
         shelf_id: i64,
         current_process_step_id: Option<i64>,
+        current_process_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         PartRepo::mark_batch_failed_inspection(
@@ -682,6 +684,7 @@ impl PartRepoTrait for &mut PgConnection {
             expected_version,
             shelf_id,
             current_process_step_id,
+            current_process_id,
             current_user_id,
         )
         .await

@@ -56,7 +56,7 @@ impl PartRepo {
                     TPartBatch,
                     r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, current_process_step_id,
+                       current_holder_id, current_process_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -88,7 +88,7 @@ impl PartRepo {
                             TPartBatch,
                             r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
-                               current_holder_id, current_process_step_id,
+                               current_holder_id, current_process_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
@@ -122,7 +122,7 @@ impl PartRepo {
                     TPartBatch,
                     r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, current_process_step_id,
+                       current_holder_id, current_process_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -157,7 +157,7 @@ impl PartRepo {
                             TPartBatch,
                             r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
-                               current_holder_id, current_process_step_id,
+                               current_holder_id, current_process_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
@@ -193,7 +193,7 @@ impl PartRepo {
                     TPartBatch,
                     r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, current_process_step_id,
+                       current_holder_id, current_process_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -225,7 +225,7 @@ impl PartRepo {
                             TPartBatch,
                             r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
-                               current_holder_id, current_process_step_id,
+                               current_holder_id, current_process_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
@@ -278,7 +278,7 @@ impl PartRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
@@ -355,12 +355,17 @@ impl PartRepo {
     /// - 参数 `next_process_id: i64` 改 `current_process_step_id: Option<i64>`
     /// - 写入列：t_part_batch.next_process_id（已删）→ t_part_batch.current_process_step_id
     /// - step_id 由 phase1 service 在调用本函数前按 `chain_id + process_id` 解析后传入
+    ///
+    /// 2026-09-30 新增 `current_process_id: Option<i64>`：检验不合格打回生产架
+    /// = **进池**，故写入目标工序（池归属权威依据）；`current_process_step_id`
+    /// 仍是可选进度指针，允许 NULL。
     pub async fn mark_batch_failed_inspection<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
         current_process_step_id: Option<i64>,
+        current_process_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query!(
@@ -370,6 +375,7 @@ impl PartRepo {
                 location                = 'PRODUCTION_SHELF',
                 current_holder_id       = $3,
                 current_process_step_id = $4,
+                current_process_id      = $6,
                 version                 = version + 1,
                 updated_at              = now(),
                 updated_by              = $5
@@ -381,6 +387,7 @@ impl PartRepo {
             shelf_id,
             current_process_step_id,
             current_user_id,
+            current_process_id,
         )
         .execute(executor)
         .await?;
@@ -405,7 +412,7 @@ impl PartRepo {
             TPartBatch,
             r#"
             SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_step_id,
+                   current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at
@@ -440,6 +447,8 @@ impl PartRepo {
     ///   主动退回只是把 holder 切回 pool，step 不变。
     /// - 形参 `current_process_step_id` 保留 `_` 前缀以兼容既有调用方（worker-scan
     ///   路径传 `None`），sqlx 仍要求参数占位（`$4`），SET 子句不再写该列。
+    /// - 2026-09-30 补充：本函数**也不写 `current_process_id`** —— 归还货架是
+    ///   池内移动，工序不变（写入不变式），批次仍属原工序候选池。
     pub async fn mark_batch_returned<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -499,7 +508,7 @@ impl PartRepo {
                     TPartBatch,
                     r#"
                 SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, current_process_step_id,
+                       current_holder_id, current_process_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
@@ -536,7 +545,7 @@ impl PartRepo {
                             TPartBatch,
                             r#"
                         SELECT id, part_id, batch_no, quantity, status, location,
-                               current_holder_id, current_process_step_id,
+                               current_holder_id, current_process_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at

@@ -85,6 +85,8 @@ impl PartService {
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
             Some(step_id),
+            // 2026-09-30：进池 → current_process_id 写目标工序
+            Some(req.next_process_id),
             current.id,
         )
         .await?;

@@ -277,6 +277,8 @@ impl PartService {
                 operated_version,
                 shelf_id,
                 Some(step_id),
+                // 2026-09-30：检验不合格打回生产架 = 进池 → 写目标工序
+                Some(next_process_id),
                 Some(current.id),
             )
             .await?;
