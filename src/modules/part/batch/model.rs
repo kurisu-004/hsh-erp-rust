@@ -36,10 +36,38 @@
 //! - `current_process_id` 的读取方严格限定为 **5 条工序池 SQL**（take_one /
 //!   take_specific / list_candidates / group_count / count_pool_by_shelf）
 //!   + `list_pickable_by_work_type` + rollup 派生 `t_part.next_process_id`。
-//! - **展示类列表**（inspection-batches / repair-batches / part 批次明细）
-//!   一律继续从 `current_process_step_id` → step JOIN 派生工序名。理由：
-//!   `INSPECTION` 批次按出池不变式 `current_process_id` 恒为 NULL，直读会让
-//!   这些端点的 `next_process_id` 恒 null（用户可见回归）。
+//! - **展示类列表一律继续从 `current_process_step_id` → step JOIN 派生工序名**。
+//!   完整清单（改动前请逐条对照，勿凭端点名想当然）：
+//!   1. `part/batch/repo.rs::list_batches_with_part`
+//!      —— `GET /parts/inspection-batches`（M3 已回退）
+//!   2. `part/service/phase1/repair.rs::list_batches_with_status`
+//!      —— `GET /parts/repair-batches`（DELIVERED）+ `GET /parts/repairing-batches`
+//!      （REPAIRING）。**M3 当时漏网**（它与第 1 条是两条独立 SQL，M3 只回退了
+//!      第 1 条），2026-09-30 follow-up 补齐。
+//!   3. `part/service/phase1/lifecycle_helpers.rs::list_batches`
+//!      —— `GET /parts/{id}/batches`（工单批次明细，**无 status 过滤**，同时返回
+//!      PENDING / IN_PROCESS / INSPECTION / REPAIRING 各状态批次）
+//!
+//!   理由：上述端点都不是**工序池**端点，判据是 `status`，与
+//!   `current_process_id` 无关；而 `INSPECTION` 批次按出池不变式该列恒为 NULL
+//!   （DELIVERED 更进一步 —— 进 `READY_TO_SHIP` 的边只有 `INSPECTION →
+//!   READY_TO_SHIP`，故 DELIVERED 批次也**必经 INSPECTION**、该列同样恒 NULL），
+//!   直读会让这些端点的 `next_process_id` / `next_process_name` 结构性恒 null
+//!   （用户可见回归）。
+//!
+//! - ⚠️ **dashboard 不在此清单内，且不可一刀切**（2026-09-30 复核修正）：
+//!   `dashboard/repo/sql.rs` 的 3 条查询性质**不同**，勿套用上条：
+//!   - `on_prod_rows`（`status='IN_PROCESS'` + holder 在生产架）与
+//!     `fetch_worker_rows`（`status='IN_PROCESS' AND location='WORKER'`）
+//!     —— 判据是 `current_process_id` **本身**（在池归属），直读**正确且必要**，
+//!     正是本迁移要修的旗舰场景（step 为 NULL 的已下发批次也要能显示工序）。
+//!   - `fetch_zone_rows("INSPECTION", Some("INSPECTION"))`
+//!     —— 品检区批次，cpid 按出池不变式恒 NULL，直读会让 `next_process_id` 为
+//!     null，**与上条 1-3 同形**。⚠️ 疑似 M3 同形漏网项，**尚未甄别修复**，
+//!     留作独立 follow-up（本次未动，避免扩大 scope）。
+//!
+//!   迁移 004 注释里「展示类列表 … / dashboard 继续走 step 派生」的措辞对
+//!   dashboard 这 3 条**不准确**，以本清单为准。
 //!
 //! 5 条池 SQL 全部硬限定 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'`
 //! —— 这是「出池必须置 NULL」这条不变式的兜底，也是为什么残留脏值不会污染候选池。

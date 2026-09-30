@@ -312,11 +312,42 @@ impl PartService {
         let limit = query.limit.unwrap_or(200).clamp(1, 500);
         let offset = query.offset.unwrap_or(0).max(0);
         let keyword = query.keyword.as_deref().unwrap_or("");
-        // 2026-09-30 改直读 b.current_process_id（migration 004）：next_process_id
-        // 不再经 `LEFT JOIN t_process_chain_step s2` 中转；`t_process p2` JOIN 改挂
-        // `b.current_process_id`。step JOIN 删掉后新下发批次（step 为 NULL）也能显示工序。
+        // 2026-09-30（review 第 3 轮 M3 补漏）：`next_process_id` /
+        // `next_process_name` **继续**从 `current_process_step_id` 经
+        // `LEFT JOIN t_process_chain_step s2` 派生，`t_process p2` 的 JOIN 条件
+        // 同步挂 `s2.process_id`。
+        //
+        // 本分支 d8f5788（原 6ecdf2c，migration 004）一度把两列改直读
+        // `b.current_process_id`（并删掉 s2 JOIN），**该改法已回退**，理由：
+        //
+        // 本函数服务 `GET /parts/repair-batches`（`statuses = ['DELIVERED']`）与
+        // `GET /parts/repairing-batches`（`statuses = ['REPAIRING']`），两个端点
+        // 都**不是工序池端点**，判据是 `status`，与 `current_process_id` 无关。
+        //
+        // - **DELIVERED**：`can_transition_to` 中进 `READY_TO_SHIP` 的边**只有**
+        //   `INSPECTION → READY_TO_SHIP`，进 `DELIVERED` 的边**只有**
+        //   `READY_TO_SHIP → DELIVERED`（无 `OUTSOURCE → READY_TO_SHIP`、无
+        //   `PENDING → READY_TO_SHIP`）⇒ DELIVERED 批次**必经 INSPECTION**；而
+        //   所有进 INSPECTION 的写点都把 `current_process_id` 置 NULL
+        //   （`phase1::scan` / `outsource::receive_to_inspection` /
+        //   `repair::complete_repair` / `mark_batch_inspected`），其后
+        //   `mark_batch_passed_inspection` 与 `mark_batch_delivered` 都**不写该列**
+        //   ⇒ 直读会让本端点的 `next_process_id` / `next_process_name`
+        //   **结构性恒 null**（用户可见回归，与 M3 修掉的 inspection-batches
+        //   回归完全同形）。
+        // - **REPAIRING**：`mark_batch_repairing`（迁移 004「已知局限 (4d)」）连同
+        //   `set status='REPAIRING'` 既不写也不清 `current_process_id` ⇒ 直读会
+        //   显示批次**进返修前所在的那道工序的陈旧值**，而非「首次定位」的那一步。
+        //
+        // 读取方分工（勿越界）：`current_process_id` 的读取方严格限定为 5 条工序池
+        // SQL + `list_pickable_by_work_type` + rollup 派生；**展示类列表一律走
+        // step 派生**。完整清单见 `part/batch/model.rs` 模块 doc。
+        //
+        // ⚠️ 本函数与 `part/batch/repo.rs::list_batches_with_part`（服务
+        // `GET /parts/inspection-batches`）是**两条独立 SQL**，M3 只回退了后者；
+        // 本条当时漏网，本次补齐。
         let rows: Vec<InspectionRepairRow> = sqlx::query_as::<_, InspectionRepairRow>(
-            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status,              b.location, b.version, b.current_process_step_id, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              b.current_process_id AS next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process p2 ON p2.id = b.current_process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND b.status = ANY($1)              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
+            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status,              b.location, b.version, b.current_process_step_id, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              LEFT JOIN t_process p2 ON p2.id = s2.process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND b.status = ANY($1)              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
         )
         .bind(statuses)
         .bind(keyword)
@@ -341,6 +372,10 @@ impl PartService {
                 parent_batch_id: r.parent_batch_id,
                 current_holder_id: r.current_holder_id,
                 holder_name: r.holder_name,
+                // 2026-09-30（review 第 3 轮 M3 补漏）：派生自 `s2.process_id`
+                // （LEFT JOIN t_process_chain_step），**刻意不直读
+                // `b.current_process_id`** —— 理由见上方 SQL 注释。字段名保留以
+                // 兼容 `InspectionBatchListItemOut` DTO 与前端。
                 next_process_id: r.next_process_id,
                 next_process_name: r.next_process_name,
                 delivery_note_id: r.delivery_note_id,

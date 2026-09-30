@@ -51,9 +51,19 @@ pub struct InspectionBatchListItemOut {
     /// `s.process_id` 派生；保留字段名以兼容前端契约。
     ///
     /// 2026-09-30 一度改直读 `t_part_batch.current_process_id`（migration 004），
-    /// **2026-09-30 review 第 3 轮 M3 已回退**。原因：送检 = 出池，该列被置 NULL，
-    /// 而本端点只查 `status='INSPECTION'` → 直读会让本字段**恒为 null**
-    /// （用户可见回归）。`current_process_step_id` 在送检期间被刻意保留
+    /// **2026-09-30 review 第 3 轮 M3 已回退**（follow-up 于 2026-09-30 补齐
+    /// repair 两端点的漏网项）。原因：送检 = 出池，该列被置 NULL。
+    ///
+    /// 本字段由 3 个端点共用（`InspectionBatchListItemOut`，别名
+    /// `RepairBatchesOut`），**3 个都不是工序池端点**，判据都是 `status`：
+    /// - `GET /parts/inspection-batches`（`status='INSPECTION'`，M3 已回退）
+    /// - `GET /parts/repair-batches`（`DELIVERED`，2026-09-30 follow-up 补齐）
+    /// - `GET /parts/repairing-batches`（`REPAIRING`，同上）
+    ///
+    /// 三者的 `current_process_id` 分别为「按出池不变式恒 NULL」「DELIVERED 必经
+    /// INSPECTION 故同样恒 NULL」「`mark_batch_repairing` 既不写也不清 → 残留
+    /// 上一道工序的陈旧值」⇒ 直读一律得不到正确值，故 3 条查询**全部**走 step
+    /// 派生。`current_process_step_id` 在送检期间被刻意保留
     /// （`mark_batch_inspected` 不写它），正是「INSPECTION 期间显示批次走到
     /// 工艺链第几步」这条产品需求的数据来源。
     ///
