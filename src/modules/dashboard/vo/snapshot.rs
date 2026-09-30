@@ -13,6 +13,7 @@
 //! - `UpcomingDeliveryBucket`   —— 未来 N 天交付分桶（counter）
 
 use serde::Serialize;
+use std::collections::BTreeMap; // 2026-09-30 新增：upcoming_delivery 桶按状态细分（按 OrderStatus 字面 → 件数；字母序保证 key 顺序确定，前端按 key 精确查）
 
 // `DashboardSnapshot` 在本文件内定义（2026-09-22 Group E 重构从 service.rs 平移过来），
 // 不需要再从 service 模块导入。
@@ -122,4 +123,9 @@ pub struct DashboardItem {
 pub struct UpcomingDeliveryBucket {
     pub date: String,
     pub count: i64,
+    /// OrderStatus → 件数（2026-09-30 新增：dashboard 柱状图分层堆叠底座）。
+    /// 用 `BTreeMap` 保证 JSON key 字母序确定（前端 `LAYERS` 表自带 statuses 数组按 key 精确查，
+    /// 不依赖 JSON key 顺序）。空 map 序列化为 `{}`（不 skip，与 frontend
+    /// `z.record(z.string(), z.number())` 必填契约对齐）。
+    pub by_status: BTreeMap<String, i64>,
 }

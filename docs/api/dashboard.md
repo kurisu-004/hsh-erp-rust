@@ -87,8 +87,12 @@ HTTP request
     "on_inspection_shelves": [...],
     "in_process": [...],
     "upcoming_delivery": [
-      { "date": "2026-09-15", "count": 0 }
-      // 固定 7 条（今天 + 未来 6 天）
+      {
+        "date": "2026-09-15",
+        "count": 6,
+        "by_status": { "DELIVERED": 1, "INSPECTION": 2, "PENDING": 3 }
+      }
+      // 固定 7 条（今天 + 未来 6 天），每条都含 by_status（必填，空对象 = 当日 0 件）
     ],
     "ts": "2026-09-28T15:00:00+08:00"
   }
@@ -130,6 +134,10 @@ HTTP request
 | `data.on_production_shelves[].items[].worker_name` | string \| null | 否 | 当前持有工人姓名 |
 | `data.upcoming_delivery[].date` | string | 是 | 日期 `YYYY-MM-DD` |
 | `data.upcoming_delivery[].count` | integer | 是 | 当天预计交付 part 数（i64，JSON wire 保留 number；非 snowflake ID 故不走字符串化） |
+| `data.upcoming_delivery[].by_status` | object<string, integer> | 是 | 当天按 `OrderStatus` 细分的件数（2026-09-30 新增；供 dashboard 分层堆叠柱状图用）。**COMPLETED / CANCELLED 已 WHERE 排除，by_status 不会含这两个 key**；空对象 `{}` 表示当日 0 件。key 字母序排列（BTreeMap 序列化保证），但前端按 key 直接查，不依赖顺序。 |
+
+> `data.upcoming_delivery[].by_status` 与 `data.upcoming_delivery[].count` 的关系：
+> `count = by_status 所有 value 之和`（service 端求和，VO 与 SQL 二次一致性由 SQL 单次聚合保证）。
 
 错误码：
 

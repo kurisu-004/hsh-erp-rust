@@ -21,7 +21,7 @@
 
 use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::{PgConnection, Row};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::modules::dashboard::vo::UpcomingDeliveryBucket;
 
@@ -110,37 +110,54 @@ pub struct DashboardRepo;
 
 impl DashboardRepo {
     // ──────────────────────────────────────────────────────────────────────
-    // 1) snapshot_counters —— 未来 N 天交付分桶（COUNT + GROUP BY）
+    // 1) snapshot_counters —— 未来 N 天交付分桶（COUNT + GROUP BY date+status）
     // ──────────────────────────────────────────────────────────────────────
     pub async fn snapshot_counters(
         conn: &mut PgConnection,
         days: i64,
     ) -> Result<Vec<UpcomingDeliveryBucket>, sqlx::Error> {
+        // 2026-09-30 修改：原 `GROUP BY planned_delivery_date` 扩为
+        // `GROUP BY planned_delivery_date, status`，让每个桶返回按 OrderStatus
+        // 细分的计数（dashboard 柱状图分层堆叠底座）。7 天 × ≤8 状态最多 56 行
+        // 聚合，远低于原 7 行；既有 `idx_parts_planned_delivery_date` 索引覆盖，
+        // 不需新索引。WHERE 仍排除 COMPLETED / CANCELLED，故 by_status 不会含
+        // 这两个 key（沿 frontend `z.record(z.string(), z.number())` 必填契约）。
         let rows = sqlx::query(
-            "SELECT planned_delivery_date AS d, COUNT(*)::bigint AS cnt \
+            "SELECT planned_delivery_date AS d, status AS s, COUNT(*)::bigint AS cnt \
              FROM t_part \
              WHERE deleted_at IS NULL \
                AND status NOT IN ('COMPLETED', 'CANCELLED') \
                AND planned_delivery_date >= CURRENT_DATE \
                AND planned_delivery_date < CURRENT_DATE + ($1::bigint || ' days')::interval \
-             GROUP BY planned_delivery_date",
+             GROUP BY planned_delivery_date, status",
         )
         .bind(days)
         .fetch_all(&mut *conn)
         .await?;
-        let mut bucket: HashMap<NaiveDate, i64> = HashMap::new();
+        // (date, status) → 件数
+        let mut bucket: HashMap<(NaiveDate, String), i64> = HashMap::new();
         for r in rows {
             let d: NaiveDate = r.get("d");
+            let s: String = r.get("s");
             let n: i64 = r.get("cnt");
-            bucket.insert(d, n);
+            bucket.insert((d, s), n);
         }
+        // 先按 date 二维 groupby → BTreeMap（按状态字母序），便于 JSON key 顺序确定
+        let mut by_date: HashMap<NaiveDate, BTreeMap<String, i64>> = HashMap::new();
+        for ((d, s), n) in bucket {
+            by_date.entry(d).or_default().insert(s, n);
+        }
+        // 装配：固定 N 桶（today → today+N-1），缺失日期补空 by_status；count = 求和
         let today = chrono::Local::now().date_naive();
-        let mut out: Vec<UpcomingDeliveryBucket> = Vec::new();
+        let mut out: Vec<UpcomingDeliveryBucket> = Vec::with_capacity(days as usize);
         for offset in 0..days {
             let d = today + chrono::Duration::days(offset);
+            let by_status = by_date.remove(&d).unwrap_or_default();
+            let count: i64 = by_status.values().sum();
             out.push(UpcomingDeliveryBucket {
                 date: d.format("%Y-%m-%d").to_string(),
-                count: *bucket.get(&d).unwrap_or(&0),
+                count,
+                by_status,
             });
         }
         Ok(out)

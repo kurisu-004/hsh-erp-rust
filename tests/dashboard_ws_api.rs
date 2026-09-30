@@ -189,6 +189,110 @@ async fn build_snapshot_with_workers_returns_full_shape() {
     );
 }
 
+// 2026-09-30 新增：dashboard upcoming_delivery 桶按 OrderStatus 细分计数集成测试
+// （覆盖 plan §1.2 SQL `GROUP BY (date, status)` + §1.1 VO `by_status` 字段）。
+#[tokio::test]
+async fn snapshot_counters_by_status_returns_per_status_breakdown() {
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+    // 沿 SQL 内 `CURRENT_DATE`（= Local::now().date_naive()）口径，避免本地日期漂移
+    let today = chrono::Local::now().date_naive();
+    let day_after_2 = today + chrono::Duration::days(2);
+
+    // 1 个 customer（t_part.customer_id NOT NULL 强制；serial_prefix varchar(1) 限 1 字符）
+    let cust_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, updated_at) VALUES ($1, 'by_status_cust', NULL, 'B', 0, $2, $2)",
+    )
+    .bind(cust_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert t_customer");
+
+    // today：3 PENDING + 2 INSPECTION + 1 DELIVERED（count=6）
+    for status in &[
+        "PENDING",
+        "PENDING",
+        "PENDING",
+        "INSPECTION",
+        "INSPECTION",
+        "DELIVERED",
+    ] {
+        sqlx::query(
+            "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
+             request_date, planned_delivery_date, status, version, \
+             created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, 'p-bs', 'DWG-BS', 'tester', $2, $3, $3, $4, 0, $5, NULL, $5, NULL)",
+        )
+        .bind(snowflake.next_id())
+        .bind(cust_id)
+        .bind(today)
+        .bind(*status)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert t_part today");
+    }
+
+    // today+2：1 PROGRAMMING（count=1）
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
+         request_date, planned_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'p-bs', 'DWG-BS', 'tester', $2, $3, $4, 'PROGRAMMING', 0, $5, NULL, $5, NULL)",
+    )
+    .bind(snowflake.next_id())
+    .bind(cust_id)
+    .bind(today)
+    .bind(day_after_2)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert t_part day+2");
+
+    let mut tx = pool.begin().await.unwrap();
+    let snap = DashboardService::new()
+        .build_snapshot_with_workers(&mut *tx, None)
+        .await
+        .expect("snapshot ok");
+    drop(tx);
+
+    // 必有 7 桶
+    assert_eq!(snap.upcoming_delivery.len(), 7);
+
+    // today 桶：count=6，by_status 三 key
+    let today_bucket = &snap.upcoming_delivery[0];
+    assert_eq!(today_bucket.date, today.format("%Y-%m-%d").to_string());
+    assert_eq!(today_bucket.count, 6);
+    assert_eq!(today_bucket.by_status.get("PENDING"), Some(&3));
+    assert_eq!(today_bucket.by_status.get("INSPECTION"), Some(&2));
+    assert_eq!(today_bucket.by_status.get("DELIVERED"), Some(&1));
+    assert_eq!(
+        today_bucket.by_status.len(),
+        3,
+        "today 桶仅 3 个状态 key 入库（COMPLETED/CANCELLED 已被 SQL WHERE 排除）"
+    );
+
+    // today+2 桶：count=1，by_status = {"PROGRAMMING": 1}
+    let d2_bucket = &snap.upcoming_delivery[2];
+    assert_eq!(d2_bucket.date, day_after_2.format("%Y-%m-%d").to_string());
+    assert_eq!(d2_bucket.count, 1);
+    assert_eq!(d2_bucket.by_status.get("PROGRAMMING"), Some(&1));
+    assert_eq!(d2_bucket.by_status.len(), 1);
+
+    // 其它 5 天桶：count=0，by_status 空 map
+    for (idx, b) in snap.upcoming_delivery.iter().enumerate() {
+        if idx == 0 || idx == 2 {
+            continue;
+        }
+        assert_eq!(b.count, 0, "day idx={idx} count 应为 0");
+        assert!(b.by_status.is_empty(), "day idx={idx} by_status 应为空 map");
+    }
+}
+
 #[tokio::test]
 async fn ws_hub_broadcast_subscription_receives_event() {
     // 业务事件订阅通路：subscribe 后调 broadcast，新接收方应收到。
