@@ -1,19 +1,19 @@
 # production 域 API — 生产管理
 
-> 本目录须与 `src/modules/prod/{work_type,process,process_chain,worker_pool,worker,batch}/{handler.rs,dto.rs,service.rs}` 保持同步
+> 本目录须与 `src/modules/prod/{work_type,process,process_chain,worker_pool,worker,batch,programming}/{handler.rs,dto.rs,service.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
 > 范围：**生产管理**菜单（前端 `production_group` 一级 + `process_work_type` / `part_process_chain` / `worker_queue` 三个子菜单）下挂的全部后端域。本目录按前端菜单 + 工人档案 + 待下发批次拆分 7 个文件 + 1 个入口。
 >
-> 实施阶段：part-worker-pool-federated-rocket（2026-09-11 起），整合自 settings/process_chain/worker_pool 三批 PR，2026-09-12 落盘为 production/ 子目录。2026-09-19 prod 容器聚合（PR-N）：worker / work_type / process / process_chain / worker_pool 五个支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias；工人档案 worker（7 端点）一并并入。2026-09-29 新增 `prod::batch`（车间 PENDING 待下发批次列表 + 单条 / 批量 / 自动下发 4 端点，URL `/api/v2/prod/batches/*`）。2026-09-30 prod 域 9 端点重构：worker-pool → pool 路径收敛（`/pool/*` 单 nest，5 端点；新增通用 move 取代 assign+remove；移除 admin nest）；batches dispatch 统一 bulk-only（`/dispatch` 单端点，`targets` 数组；移除 bulk-dispatch）；auto-dispatch 改为只读 preview。
+> 实施阶段：part-worker-pool-federated-rocket（2026-09-11 起），整合自 settings/process_chain/worker_pool 三批 PR，2026-09-12 落盘为 production/ 子目录。2026-09-19 prod 容器聚合（PR-N）：worker / work_type / process / process_chain / worker_pool 五个支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias；工人档案 worker（7 端点）一并并入。2026-09-29 新增 `prod::batch`（车间 PENDING 待下发批次列表 + 单条 / 批量 / 自动下发 4 端点，URL `/api/v2/prod/batches/*`）。2026-09-30 prod 域 9 端点重构：worker-pool → pool 路径收敛（`/pool/*` 单 nest，5 端点；新增通用 move 取代 assign+remove；移除 admin nest）；batches dispatch 统一 bulk-only（`/dispatch` 单端点，`targets` 数组；移除 bulk-dispatch）；auto-dispatch 改为只读 preview。2026-10-01 新增 `prod::programming`（待编程一览 1 只读端点，URL `/api/v2/prod/programming/pending`，part 状态白名单闸门 + 三规则并集口径；前端「待编程一览」页从 part 域 `GET /api/v2/parts/pending-programming` 切过来，part 域旧端点保留兼容）。
 
 ## 目录
 
-> **导航**：[**`index.md`**](./index.md) · [`work-types.md`](./work-types.md) · [`processes.md`](./processes.md) · [`work-type-process-mapping.md`](./work-type-process-mapping.md) · [`process-chain.md`](./process-chain.md) · [`worker-pool.md`](./worker-pool.md) · [`workers.md`](./workers.md) · [`batches.md`](./batches.md)
+> **导航**：[**`index.md`**](./index.md) · [`work-types.md`](./work-types.md) · [`processes.md`](./processes.md) · [`work-type-process-mapping.md`](./work-type-process-mapping.md) · [`process-chain.md`](./process-chain.md) · [`worker-pool.md`](./worker-pool.md) · [`workers.md`](./workers.md) · [`batches.md`](./batches.md) · [`pending-programming.md`](./pending-programming.md)
 
 ---
 
-## 端点列表（30 个 = 17 + 5 工序映射/链 + 5 pool + 3 batch）
+## 端点列表（31 个 = 17 + 5 工序映射/链 + 5 pool + 3 batch + 1 programming）
 
 > 2026-09-19 prod 聚合：原 19 端点 + worker 7 端点（详见 [`workers.md`](./workers.md)）+ worker_pool 的 admin/assign 1 端点。2026-09-29 新增 4 端点（详见 [`batches.md`](./batches.md)）：1 个 PENDING 列表 + 3 个下发（单条 / 批量 / 自动）。
 > 2026-09-30 prod 域 9 端点重构（worker-pool + batches 合并）：
@@ -21,6 +21,7 @@
 > - batches 端点合并：原 `dispatch`（单条）+ `bulk-dispatch`（批量）合并为统一 bulk-only `dispatch`（4 → 3 端点；移除 bulk-dispatch）。
 > - batches auto-dispatch 改为只读 preview（不再真下发）。
 > - 净变化：原 31 → 30 端点（-1 net）。
+> 2026-10-01 新增 1 端点（详见 [`pending-programming.md`](./pending-programming.md)）：`prod::programming` 待编程一览 → 净变化 30 → 31 端点（+1）。
 
 ### worker / work_type / process 主数据（17 端点）
 
@@ -76,6 +77,18 @@
 | POST | `/api/v2/prod/batches/auto-dispatch` | Manager+Clerk | **2026-09-30 改为只读预览**：返回每个 batch 的首道工序 + 首货架 + skip_reason；前端据此构造 dispatch 请求 | [`batches.md`](./batches.md#post-apiv2prodbatchesauto-dispatch) |
 
 > 旧 `/api/v2/prod/batches/bulk-dispatch` 端点 404（router 层不再挂载；bulk 走统一 dispatch 的 targets 数组）。
+
+### 待编程一览（1 端点，2026-10-01 新增）
+
+| Method | Path | 权限 | 说明 | 详情 |
+|---|---|---|---|---|
+| GET | `/api/v2/prod/programming/pending` | Manager+Clerk+Inspector+CNC_PROGRAMMER | 待编程工单列表（part 状态白名单闸门 + 三规则并集，part 级去重：⓿ `status IN ('PENDING','IN_PROCESS','PROGRAMMING')`（约束全部三规则） ① `status='PROGRAMMING'` ② 链含 `is_cnc` 工序 ③ 批次 `current_process_id` 指向 `is_cnc` 工序） | [`pending-programming.md`](./pending-programming.md#get-apiv2prodprogrammingpending) |
+
+> 归属说明：前端「待编程一览」页 2026-10-01 从 part 域 `GET /api/v2/parts/pending-programming`
+> 切到本端点 —— part 域旧端点走「批次货架 → 工序」间接链路（开发库恒返空），本端点规则 3
+> 直接读 migration 004 确立的权威列 `t_part_batch.current_process_id`。**part 域一行未改**，
+> 旧端点保留兼容（仅 [`../parts/lifecycle.md`](../parts/lifecycle.md) 追加弃用说明）。
+> ⚠️ `CNC_PROGRAMMER` 必须在角色白名单内（编程员账号进本页的主路径）。
 
 ---
 
@@ -177,9 +190,11 @@ part / assembly 是 ERP 核心实体（跨生产 + 编程 + 外协 + 质检 + �
 | `worker_queue` | `/workers/queue` | `WorkerQueueBoard.vue`（**实际挂在生产管理菜单下**） | `prod::worker_pool` | [`worker-pool.md`](./worker-pool.md) |
 | 工人档案管理（**菜单归属非 production_group**） | `/workers` 等 | （前端视图目录 `frontend/src/views/workers/`） | `prod::worker` | [`workers.md`](./workers.md) |
 | （**前端 menuCode 待定 2026-09-29**） | `/production/pending-dispatch` | `ProductionPendingDispatchPage.vue`（**新前端页面 2026-09-29**） | `prod::batch` | [`batches.md`](./batches.md) |
+| （**前端 menuCode 待定 2026-10-01**） | 「待编程一览」页（沿用 part 域路由） | 待编程 tab（`has_cnc_program` 三态） | `prod::programming` | [`pending-programming.md`](./pending-programming.md)（口径：状态白名单闸门 + 三规则并集，与 part 域旧端点的差异见该页「过滤谓词」段） |
 
 > 上述 `process_work_type` / `part_process_chain` / `worker_queue` 3 个 menuCode 的授权（MANAGER + CLERK + INSPECTOR）由后端 migration 018 + 021 写入 `t_role_menu`。
 > `prod::batch` 4 端点走 service 内 `require_any_role(...)` 守卫（list=Manager+Clerk+Inspector；写=Manager+Clerk），无需新增 `t_role_menu` 行（沿用 production_group 既有授权）。
+> `prod::programming` 1 端点同样走 service 内守卫（Manager+Clerk+Inspector+**CNC_PROGRAMMER**），同样无需新增 `t_role_menu` 行。
 > 前端 `process_work_type` tabbed shell 替代了原 `settings_root` 下的 3 个旧菜单（`work_types_list` / `processes_list` / `work_type_processes_list`，migration 021 软删）。
 
 ---
@@ -193,6 +208,7 @@ part / assembly 是 ERP 核心实体（跨生产 + 编程 + 外协 + 质检 + �
 - **WS 广播在 commit 之后**：避免慢 WS 拖慢 HTTP 响应；本目录 6 个子模块内，
   - `prod::worker_pool` —— 5 个 `WORKER_*` 事件（详见 [`worker-pool.md#ws-事件清单`](./worker-pool.md#ws-事件清单worker-pool-相关)）
   - `prod::batch` —— 1 个 `BATCH_PLACED_ON_SHELF` 事件（详见 [`batches.md#ws-事件`](./batches.md#ws-事件)）
+  - `prod::programming` —— 纯读端点，**不发**任何 WS 事件
 
 ---
 
@@ -225,13 +241,14 @@ part / assembly 是 ERP 核心实体（跨生产 + 编程 + 外协 + 质检 + �
 - ✅ **`prod::worker_pool`**（**2026-09-30 重构 → pool**）：state + counts + refill + auto-allocate COUNT/TIME + 通用 move 取代 admin_remove + admin_assign（POOL ↔ WORKER + WORKER ↔ WORKER 三方向，5 端点）；路径收敛为 `/pool/*` 单 nest
 - ✅ **`prod::worker`**（2026-09-19 聚合新增）：CRUD + verify-badge + deactivate/reactivate（2026-08-26；移至 `src/modules/prod/worker/`，URL `/api/v2/prod/workers`）
 - ✅ **`prod::batch`**（2026-09-29 新增 + 2026-09-30 重构）：PENDING 批次列表 + bulk-only dispatch（`targets` 数组，单批即 `targets.length==1`）+ 只读 auto-dispatch preview（首道工序 + 首货架 + skip_reason），3 端点（URL `/api/v2/prod/batches/*`）；复用既有 `t_shelf_process` 解析货架，零 schema 变更；commit 后广播 `BATCH_PLACED_ON_SHELF` WS 事件
+- ✅ **`prod::programming`**（2026-10-01 新增）：待编程一览 1 只读端点（part 状态白名单闸门 + 三规则并集 + part 级去重；`has_cnc_program` 三态 Tab；`keyword`（`%`/`_` 已转义）/ `serial_no` 过滤；`limit` / `offset` 空串走缺省 + `clamp(1,500)` / `max(0)`；角色 Manager+Clerk+Inspector+CNC_PROGRAMMER），URL `/api/v2/prod/programming/pending`；零 schema 变更；集成测试 `tests/production/pending_programming.rs` **14 场景**
 - ✅ **菜单整合**：migration 018 建 `production_group` + `part_process_chain` + 迁移 `worker_queue`；migration 021 软删 settings_root + 3 子菜单 + 新增 `process_work_type`（2026-09-12）
 - ✅ **API 文档整合**：本目录（2026-09-12；2026-09-29 增 `batches.md`；2026-09-30 增 move + 重构 pool/batches）
 - ✅ **prod 容器聚合**（2026-09-19）：5 支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步
 
 ## 参考
 
-- 集成测试：`tests/work_type_api.rs` / `tests/work_type_process_mapping_api.rs` / `tests/process_api.rs` / `tests/process_chain_api.rs` / `tests/worker_pool_api.rs` / `tests/worker_pool_auto_allocate_api.rs` / `tests/worker_api.rs` / `tests/worker_shelf_deactivate_api.rs` / `tests/production/batch.rs`（2026-09-29 新增）
+- 集成测试：`tests/work_type_api.rs` / `tests/work_type_process_mapping_api.rs` / `tests/process_api.rs` / `tests/process_chain_api.rs` / `tests/worker_pool_api.rs` / `tests/worker_pool_auto_allocate_api.rs` / `tests/worker_api.rs` / `tests/worker_shelf_deactivate_api.rs` / `tests/production/batch.rs`（2026-09-29 新增）/ `tests/production/pending_programming.rs`（2026-10-01 新增）
 - 模块 README：见各子模块顶层
 - 错误码：`src/shared/error.rs::code`
 - 前端模块文档：`frontend/docs/03-modules/production/README.md`

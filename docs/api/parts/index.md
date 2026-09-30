@@ -37,7 +37,7 @@
 | POST | `/api/v2/parts/{part_id}/to-ship` | Manager / Inspector | 单件通过品检（INSPECTION → READY_TO_SHIP） | [`inspection.md`](./inspection.md#post-apiv2partspart_idto-ship) |
 | POST | `/api/v2/parts/{part_id}/to-process` | Manager / Inspector | 单件指定下一工序（INSPECTION → IN_PROCESS） | [`inspection.md`](./inspection.md#post-apiv2partspart_idto-process) |
 | POST | `/api/v2/parts/worker-scan` | **Manager** / **ShelfAccount** | 工人扫码归还 / 送检；成功后同事务触发 worker-pool refill | [`inspection.md`](./inspection.md#post-apiv2partsworker-scan) |
-| GET | `/api/v2/parts/pending-programming` | Manager / Clerk / Inspector / CncProgrammer | 待编程列表（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
+| GET | `/api/v2/parts/pending-programming` | Manager / Clerk / Inspector / CncProgrammer | 待编程列表（Phase 1）—— **2026-10-01 起前端请改用 [`GET /api/v2/prod/programming/pending`](../production/pending-programming.md#get-apiv2prodprogrammingpending)**（本端点保留兼容，规则2 走「批次货架 → 工序」间接链路、开发库恒返空） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
 | GET | `/api/v2/parts/outsource-in-flight` | Manager / Clerk / Inspector / CncProgrammer | 外协在途列表（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
 | GET | `/api/v2/parts/outsource-sendable` | Manager / Clerk / Inspector / CncProgrammer | 可发外协列表（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
 | GET | `/api/v2/parts/repair-batches` | Manager / Inspector | 维修批次列表（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
