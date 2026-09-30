@@ -103,6 +103,7 @@ fn union_sort_col(sort_by: &str) -> &'static str {
         "UPDATED_AT" => "updated_at",
         "PLANNED_DELIVERY_DATE" => "planned_delivery_date",
         "REQUEST_DATE" => "request_date",
+        "SYSTEM_DELIVERY_DATE" => "system_delivery_date", // 2026-09-30 dashboard 配套
         "DRAWING_NO" => "drawing_no",
         "NAME" => "name",
         _ => "id",

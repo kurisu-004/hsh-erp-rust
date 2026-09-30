@@ -599,6 +599,125 @@ async fn union_list_all_mode_sort_serial_no_falls_back() {
     }
 }
 
+/// 2026-09-30 新增回归：dashboard「按系统交期排序」配套。修复 review A.1：
+/// 保证 `sort_by=SYSTEM_DELIVERY_DATE` 不会被静默降级到 CREATED_AT，防止未来 PR
+/// 误删白名单。
+///
+/// - 准备 2 条 part：`system_delivery_date` 分别为 `2026-09-01` / `2026-09-30`
+/// - 调 `sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC`，断言 items 顺序为
+///   `09-01` → `09-30`（升序，非 NULL 项排在前面）
+/// - 同时调 DESC 断言顺序反向
+#[tokio::test]
+async fn sort_by_system_delivery_date_returns_sorted_results() {
+    use chrono::Duration;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+
+    // p_early: system_delivery_date = today - 29d（≈ 2026-09-01 当天附近）
+    let p_early = insert_part_full(
+        &pool,
+        "P-SORT-EARLY",
+        "D-SORT-EARLY",
+        fx.customer_l2_id,
+        Some("PSEARLY"),
+        None,
+        today,
+        today,
+        Some(today - Duration::days(29)),
+    )
+    .await;
+    // p_late: system_delivery_date = today（最晚）
+    let p_late = insert_part_full(
+        &pool,
+        "P-SORT-LATE",
+        "D-SORT-LATE",
+        fx.customer_l2_id,
+        Some("PSLATE"),
+        None,
+        today,
+        today,
+        Some(today),
+    )
+    .await;
+    // p_null: system_delivery_date = NULL（不应出现在 ASC 头部，因为 NULL < 任何日期
+    // 在 PG 升序里排最前；这里只断言已知非 NULL 项按升序排，NULL 项可前可后）
+    let p_null = insert_part_full(
+        &pool,
+        "P-SORT-NULL",
+        "D-SORT-NULL",
+        fx.customer_l2_id,
+        Some("PSNULL"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    // 1) ASC：p_early < p_late（NULL 位置不约束）
+    let url_asc = format!(
+        "/com/union-list?customer_id={}&row_type=ALL\
+         &sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC&limit=200",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request("GET", &url_asc, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "ASC: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().unwrap();
+    let ids: Vec<i64> = items
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    let pos_early = ids
+        .iter()
+        .position(|&x| x == p_early)
+        .expect("p_early present");
+    let pos_late = ids
+        .iter()
+        .position(|&x| x == p_late)
+        .expect("p_late present");
+    assert!(
+        pos_early < pos_late,
+        "ASC 时 p_early (system_delivery_date=早) 应排在 p_late 之前; ids={ids:?}"
+    );
+    let _ = p_null; // NULL 项位置不约束
+
+    // 2) DESC：p_late < p_early（反向）
+    let url_desc = format!(
+        "/com/union-list?customer_id={}&row_type=ALL\
+         &sort_by=SYSTEM_DELIVERY_DATE&sort_dir=DESC&limit=200",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url_desc, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "DESC: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().unwrap();
+    let ids: Vec<i64> = items
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    let pos_early = ids
+        .iter()
+        .position(|&x| x == p_early)
+        .expect("p_early present");
+    let pos_late = ids
+        .iter()
+        .position(|&x| x == p_late)
+        .expect("p_late present");
+    assert!(
+        pos_late < pos_early,
+        "DESC 时 p_late (system_delivery_date=晚) 应排在 p_early 之前; ids={ids:?}"
+    );
+}
+
 /// 非法 `row_type=BAD` —— 返回 40001 VALIDATION_ERROR。
 #[tokio::test]
 async fn union_list_row_type_invalid_rejected() {

@@ -58,7 +58,7 @@ GET /api/v2/com/union-list
 | `system_delivery_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：系统交期窗口上界 `system_delivery_date <= $to`。**PART / ALL / ASSEMBLY 三模式全部生效**。任一端缺失 → 对应 NULL 短路 |
 | `order_no_is_null` | `bool` | 否 | — | 2026-09-30 新增：订单号 IS NULL 三态过滤。`true` → `order_no IS NULL OR order_no = ''`（含空串语义对齐 PR-F 2026-08-11『空串视为未填』）；`false` → `order_no IS NOT NULL AND order_no <> ''`；省略 → 不参与。**PART / ALL / ASSEMBLY 三模式全部生效** |
 | `system_delivery_date_is_null` | `bool` | 否 | — | 2026-09-30 新增：系统交期 IS NULL 三态过滤。`true` → `system_delivery_date IS NULL`；`false` → `system_delivery_date IS NOT NULL`；省略 → 不参与。**PART / ALL / ASSEMBLY 三模式全部生效** |
-| `sort_by` | `string` | 否 | `CREATED_AT` | 排序键白名单：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `DRAWING_NO` / `NAME`。**注意**：`SERIAL_NO` 仅 `t_part` 独有 → ALL 模式降级 `CREATED_AT` |
+| `sort_by` | `string` | 否 | `CREATED_AT` | 排序键白名单：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SYSTEM_DELIVERY_DATE` / `DRAWING_NO` / `NAME`。**注意**：`SERIAL_NO` 仅 `t_part` 独有 → ALL 模式降级 `CREATED_AT` |
 | `sort_dir` | `string` | 否 | `DESC` | `"ASC"` / `"DESC"` |
 | `limit` | `i64` | 否 | `50` | `[1, 200]` |
 | `offset` | `i64` | 否 | `0` | `>= 0` |
@@ -385,7 +385,7 @@ curl -G "http://localhost:3000/api/v2/com/union-list" \
 PART / ALL / ASSEMBLY 三模式全部生效（UNION ALL SQL `part_seg` / `asm_seg` 两段
 都追加同 `$13..$20` 守卫，外层 SQL 不消费这两个 placeholder 故不影响 `$9`/`$10`）。
 
-测试覆盖：11 个新增 union-list 用例（4 文本 + 4 日期 + 2 IS NULL + 1 combined smoke）+ 1
+测试覆盖：11 个新增 union-list 用例（4 文本 + 2 日期 + 4 IS NULL + 1 combined smoke）+ 1
 非法日期格式 + 2 老端点兼容回归（`/parts` + `/assemblies`）= 共 14 个新增测试。
 
 ```bash
