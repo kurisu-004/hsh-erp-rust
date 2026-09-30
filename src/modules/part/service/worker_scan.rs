@@ -184,6 +184,19 @@ impl PartService {
                 // 防御性：part 后续 chain 被运维软删时，chain_id_opt=None → 不能
                 // 静默抹除 batch.current_process_step_id（否则 part 持有件从
                 // worker 归还到货架后丢失 step 上下文）。此时保留旧 step_id 值。
+                //
+                // ⚠️ 2026-09-30（review H1）**已知缺口**：下面算出的 `step_id_opt`
+                // 传给 `mark_batch_returned` 后**被丢弃** —— 该函数的
+                // `current_process_step_id` SET 子句在 2026-09-30 prod/pool move
+                // 重构中被移除（admin 主动退回不推进工序链），RETURNED 复用了同一
+                // 函数，于是进度指针在 RETURNED 时也不再推进。
+                //
+                // 本轮**刻意不修**（避免与 H1 的 `current_process_id` 改动混在一次
+                // 变更里扩大 review 面）：影响面仅限显示 —— 池归属已由
+                // `current_process_id` 承担且本次已正确写入；step 现在是「批次走到
+                // 工艺链第几步」的可选进度指针，不是状态机依赖。
+                // 后续单独一轮处理（届时 `mark_batch_returned` 需按调用方决定是否
+                // 写 step，语义与 `advance_to_process_id` 同形）。
                 let chain_id_opt: Option<i64> = sqlx::query_scalar(
                     "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
                 )
@@ -203,12 +216,26 @@ impl PartService {
                     batch.current_process_step_id
                 };
                 // 切 holder worker → shelf（OCC）
+                //
+                // 2026-09-30（review H1 修复）：RETURNED 是全仓唯一**推进工序**的
+                // 路径 —— 工人在 P1 完工、扫 RETURNED 传 next_process_id=P2，批次
+                // 归还货架后必须落进 **P2** 的候选池。此前 `mark_batch_returned` 不写
+                // `current_process_id`，批次会带着 P1 落回 P1 池（migration 004 确立
+                // 的「唯一权威依据」在主干流程上说谎）。
+                //
+                // 传 `Some(next_pid)` 而非「chain 软删时 fallback 旧值」：`next_pid`
+                // 已在上方通过 `t_shelf_process WHERE shelf_id=$1 AND process_id=$2`
+                // 校验（真实映射到该货架的 t_process.id），且 RETURNED 的业务语义就是
+                // 「这批要进 P2 池」。chain 被软删只导致解析不出 P2 对应的 step
+                // （**进度指针**写不了），不影响**池归属**该写成 P2 —— 若此时
+                // fallback 旧值，恰好会把 H1 要修的 bug 换个条件复现。
                 let n = repo
                     .mark_batch_returned(
                         batch.id,
                         batch.version,
                         req.shelf_id,
                         step_id_opt,
+                        Some(next_pid),
                         Some(current.id),
                     )
                     .await?;

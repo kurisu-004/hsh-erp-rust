@@ -2,7 +2,8 @@
 //!
 //! 覆盖 16 个场景：
 //!   1. worker_scan INSPECTED → 自动 refill
-//!   2. worker_scan RETURNED → 自动 refill
+//!   2. worker_scan RETURNED → 自动 refill；RETURNED 推进 `current_process_id`
+//!      （2026-09-30 review 第 1 轮 H1 回归：批次落进**下一道**工序池而非原池）
 //!   3. refill_when_pool_empty_returns_empty
 //!   4. refill_caps_at_max_held_batches
 //!   5. concurrent_refill_no_double_pick       [`#[ignore]`：需 app-level 并发基建]
@@ -668,6 +669,113 @@ async fn worker_scan_returned_triggers_refill() {
         taken.len(),
         2,
         "refill 应抢到 2 件（returned 1 + pool 1）: {env}"
+    );
+}
+
+/// 场景 2b（2026-09-30 review 第 1 轮 H1 回归测试）: worker-scan RETURNED 推进工序
+/// → 批次落进**下一道**工序的候选池，而不是落回原工序池。
+///
+/// 背景：`mark_batch_returned` 此前既不写 `current_process_id` 也不写
+/// `current_process_step_id`，而 RETURNED 是全仓唯一的**工序推进**路径 ——
+/// 工人在 PROC-B 完工、扫 RETURNED 传 `next_process_id=PROC-C`，批次归还货架后
+/// 仍带 `current_process_id=PROC-B` → 落回 **PROC-B** 池。这正是 migration 004
+/// 确立的「唯一权威依据」在主干流程上说谎。
+///
+/// 本测试直接打用户报告的那个症状面：扫完后分别查 PROC-B / PROC-C 两个池，
+/// 断言批次只在 PROC-C 池里。
+#[tokio::test]
+async fn worker_scan_returned_advances_current_process_id() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL2B").await;
+    // 工序 B（起点）→ 工序 C（RETURNED 传的目标）
+    let proc_b = seed_process(&pool, "PROC-B2", "工序B2").await;
+    let proc_c = seed_process(&pool, "PROC-C2", "工序C2").await;
+    let wt = insert_work_type(&pool, "WT-B2", "工种B2", Some(5)).await;
+    // 工种**只**映射 proc_b（起点工序）。
+    //
+    // 关键：RETURNED 成功后同事务会调 `refill_for_worker`，而 refill 按
+    // 「工种可加工工序池」抢批。若工种也映射 proc_c，refill 会立刻把刚归还的
+    // 批次再抢回工人（location=WORKER）→ 断言「批次在 proc_c 池」必然失败。
+    // 工种不含 proc_c → refill 抢不动它，批次留在 proc_c 候选池里可被端点查到。
+    // RETURNED 本身不校验工种资格（只校验 `t_shelf_process` 货架映射，见下）。
+    link_work_type_to_process(&pool, wt, proc_b).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-B2", "PROD-B2", "PRODUCTION").await;
+    // 同一货架同时映射 B / C —— RETURNED 的 t_shelf_process 校验要求 shelf 映射 next_process_id
+    link_shelf_to_process(&pool, prod_shelf, proc_b).await;
+    link_shelf_to_process(&pool, prod_shelf, proc_c).await;
+
+    let worker = insert_worker(&pool, "BC002B", "工2B", Some(wt)).await;
+    // 工人持有 1 件 IN_PROCESS+WORKER 批次，current_process_id = proc_b（起点工序）
+    let (_held_part, held_batch) =
+        insert_worker_held_part(&pool, customer, "H-002B", worker, proc_b, 1).await;
+
+    let (app, token, _pool) = login_shelf_account(pool.clone(), "user2b", &[prod_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/parts/worker-scan",
+            Some(json!({
+                "serial_no": "H-002B",
+                "badge_code": "BC002B",
+                "event_type": "RETURNED",
+                "shelf_id": prod_shelf.to_string(),
+                "next_process_id": proc_c.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "scan RETURNED: {env}");
+    assert_eq!(env["code"], 0);
+
+    // DB 层：权威列必须被推进到目标工序
+    let process_after: Option<i64> =
+        sqlx::query_scalar("SELECT current_process_id FROM t_part_batch WHERE id = $1")
+            .bind(held_batch)
+            .fetch_one(&pool)
+            .await
+            .expect("query current_process_id after RETURNED");
+    assert_eq!(
+        process_after,
+        Some(proc_c),
+        "RETURNED 应把 current_process_id 推进到 next_process_id（{proc_c}），\
+         实际 {process_after:?} —— 不推进会让批次落回原工序池"
+    );
+
+    // 端点层：批次只应出现在 PROC-C 池，不应再出现在 PROC-B 池
+    // （login_manager_with_username 会 INSERT t_user，只能调一次，后续复用 token）
+    let (app, mgr) = login_manager_with_username(&pool, "admin_pool2b").await;
+    let (sb, eb) = send(
+        app.clone(),
+        json_request("GET", &format!("/prod/pool/{proc_b}"), None, Some(&mgr)),
+    )
+    .await;
+    assert_eq!(sb, StatusCode::OK, "GET pool/{proc_b}: {eb}");
+    let in_b = eb["data"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .any(|it| it["batch_id"] == json!(held_batch.to_string()));
+    assert!(
+        !in_b,
+        "RETURNED 推进到 {proc_c} 后，批次不应再出现在原工序 {proc_b} 池: {eb}"
+    );
+
+    let (sc, ec) = send(
+        app,
+        json_request("GET", &format!("/prod/pool/{proc_c}"), None, Some(&mgr)),
+    )
+    .await;
+    assert_eq!(sc, StatusCode::OK, "GET pool/{proc_c}: {ec}");
+    let in_c = ec["data"]["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .any(|it| it["batch_id"] == json!(held_batch.to_string()));
+    assert!(
+        in_c,
+        "RETURNED 推进后批次应出现在目标工序 {proc_c} 池: {ec}"
     );
 }
 

@@ -235,7 +235,14 @@ pub trait WorkerPoolRepoTrait: Send {
         worker_id: i64,
     ) -> Result<Option<TPartBatch>, sqlx::Error>;
 
-    /// 切 holder 到 shelf + 改 step_id（`PartRepo::mark_batch_returned`）。
+    /// 切 holder 到 shelf（`PartRepo::mark_batch_returned`）。
+    ///
+    /// 2026-09-30（review H1）：本转发器**恒传 `None`** 作
+    /// `advance_to_process_id` —— move WORKER→POOL 是池内移动、工序不变
+    /// （写入不变式），批次归还货架后仍属原工序候选池。推进工序是 worker-scan
+    /// RETURNED 的职责，它直连 `PartRepo::mark_batch_returned` 不经本转发器。
+    /// `step_id` 形参保持存在（转发给 `current_process_step_id`，被 SQL 丢弃，
+    /// 属已知缺口，见 `PartRepo::mark_batch_returned` doc）。
     async fn part_mark_batch_returned(
         &mut self,
         batch_id: i64,
@@ -563,6 +570,9 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
             expected_version,
             shelf_id,
             step_id,
+            // 2026-09-30（review H1）：move WORKER→POOL = 池内移动，工序不变 →
+            // 传 None（= 不推进），SQL 侧 COALESCE 保留原值
+            None,
             updated_by,
         )
         .await

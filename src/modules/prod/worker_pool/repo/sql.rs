@@ -551,10 +551,19 @@ impl WorkerPoolRepo {
     pub async fn group_count_by_process_all_shelves<'e, E: PgExecutor<'e>>(
         executor: E,
     ) -> Result<Vec<(i64, i64)>, sqlx::Error> {
-        // 2026-09-30：`pb.current_process_id` 列可空，但 WHERE 已限定
-        // `status='IN_PROCESS'` + `location='PRODUCTION_SHELF'`（业务不变式：
-        // 进池必写该列），故 SQL 层用 `pb.current_process_id AS "process_id!"`
-        // 显式断言非空，rust 侧保持 `i64` 不退化为 `Option<i64>`。
+        // 2026-09-30（review L1 澄清）：`pb.current_process_id` 列可空。
+        //
+        // 非空保证来自 WHERE 的 `AND pb.current_process_id IS NOT NULL` ——
+        // **不是**来自 SELECT 里的 `AS "process_id!"`。本查询走 runtime
+        // `sqlx::query_as` + `Vec<(i64, i64)>`，tuple 的 FromRow 按**位置**映射，
+        // 列别名完全不参与类型解析，别名里的 `!` 只是被双引号包起来的普通标识符
+        // （`!` 的「非空覆盖」语义只在编译期 `query!` 宏里才有）。删掉 `!` 行为
+        // 不变，保留只是为了与同文件其它 `AS "xxx!"` 风格一致。
+        //
+        // `IS NOT NULL` 的语义（review 已核验，无静默丢数据风险）：丢弃的是
+        // 「池归属为空的批次」——它们不属任何工序，与改动前 INNER JOIN step 的
+        // 行为完全一致（INNER JOIN 同样丢 NULL 组）。反过来，若不写这条过滤，
+        // GROUP BY 会产出一个 NULL 组，解码进 `i64` 直接报错。
         let rows: Vec<(i64, i64)> = sqlx::query_as(
             r#"
             SELECT pb.current_process_id AS "process_id!", COUNT(*) AS "count!"

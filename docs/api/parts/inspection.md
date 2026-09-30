@@ -110,6 +110,15 @@ Request：`ToInspectionRequest`
 - 起点状态：`PENDING` / `PROGRAMMING` / `IN_PROCESS`
   - `IN_PROCESS` 必须 `location='PRODUCTION_SHELF'` + `current_holder_id` 命中 `t_shelf`（service 启发式区分 worker 持有 vs shelf 持有；worker 持有 → 20103 / "工人持有件请先归还或送检"）
 - 终点状态：`INSPECTION`（`location='INSPECTION_SHELF'` + `current_holder_id=target_shelf.id`）
+- **2026-09-30（review H2 修复）：`current_process_id` 置 NULL**（送检 = **出池**，
+  写入不变式第 2 行）。此前本端点只翻 `status` / `location` / `current_holder_id`，
+  批次会带着上一道工序的 `current_process_id` 停在 `INSPECTION` 状态，与 migration 004
+  的列定义「NULL 表示批次不在生产工序池中」矛盾。
+  - 不会造成池污染：4 条工序池 SQL 与 `list_pickable_by_work_type` 均硬限定
+    `status='IN_PROCESS'` + `location='PRODUCTION_SHELF'`。
+  - `current_process_step_id` **仍保留**（`INSPECTION` 期间前端用它显示批次走到工艺链
+    第几步）。它已是**可选的显示用进度指针**，不再是状态机依赖 —— 检验不合格打回
+    （`to-process`）会按 `chain_id + next_process_id` 重新解析并写入，不会真的丢上下文。
 - 事件日志：`event_type='INSPECTED'`
 
 WS 广播（commit 后下发）：
@@ -322,11 +331,18 @@ Request：`WorkerScanRequest`
 - **RETURNED**：worker 把 IN_PROCESS+WORKER 批次放回生产架
   - `shelf_id` 必须映射 `next_process_id`（service 校验 `t_shelf_process`）→ 不匹配 `20507 BIZ_SHELF_PROCESS_NOT_MAPPED`
   - `part_batch` 与 `part` 状态切回 IN_PROCESS+PRODUCTION_SHELF+holder=shelf（OCC）
+  - **2026-09-30（review H1 修复）：写 `current_process_id = next_process_id`** ——
+    RETURNED 是全仓唯一的**工序推进**路径，批次归还货架后落进**下一道工序**的候选池。
+    此前该列不写，批次带着旧工序 id 落回**原工序**池（权威列在主干流程上说谎）。
+    另：RETURNED 仍**不推进** `current_process_step_id`（可选的显示用进度指针），
+    这是已知缺口，影响仅限显示，池归属不受影响。
   - 写 `RETURNED_TO_SHELF` 事件日志
 - **INSPECTED**：worker 把持有件直接送检
   - `target_inspection_shelf_id` 必须属于 INSPECTION 区且 active
   - 不符合 → `20511 BIZ_SHELF_NOT_INSPECTION_ZONE` / `20512 BIZ_SHELF_INACTIVE`
   - 内部走 `to_inspection_core`：状态机 `IN_PROCESS → INSPECTION` + holder worker → target_shelf + 写 `SENT_TO_INSPECTION` 事件日志
+  - **2026-09-30（review H2 修复）：`current_process_id` 置 NULL**（送检 = 出池），
+    与单件送检 `to-inspection` 口径一致
   - 不带 quantity 拆批（worker-scan 是单件持有件流转，不涉及批次拆分）
 - **任一成功后**同事务调用 `WorkerPoolService::refill_for_worker`：
   - 工人当前工种可加工工序池有候选 → 自动抢满 `work_type.max_held_batches`（或池空为止）

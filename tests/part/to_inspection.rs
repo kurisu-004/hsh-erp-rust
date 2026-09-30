@@ -6,6 +6,7 @@
 //!   - to-inspection：target shelf zone≠INSPECTION / is_active=false 拒绝
 //!   - batch-to-inspection：items 空 / 超 200 / 3 件混合 / CLERK 越权
 //!   - to-inspection partial-split：PENDING 批次 qty=10 → quantity=3，拆批
+//!   - to-inspection：送检出池清 `current_process_id`（2026-09-30 review H2 回归）
 //!
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -246,6 +247,73 @@ async fn to_inspection_from_in_process_production_shelf_succeeds() {
     .await;
     assert_eq!(status, StatusCode::OK, "body={body}");
     assert_eq!(body["data"]["part"]["status"], "INSPECTION");
+}
+
+/// to-inspection 回归（2026-09-30 review 第 1 轮 H2）：送检 = **出池**，
+/// `current_process_id` 必须被置 NULL。
+///
+/// 背景：`mark_batch_inspected`（to-inspection 第一步）此前只翻
+/// `status` / `location` / `current_holder_id`，不碰 `current_process_id` ——
+/// 批次会带着上一道工序的 id 停在 `INSPECTION` 状态，与 migration 004 的列定义
+/// 「NULL 表示批次不在生产工序池中」矛盾。
+///
+/// 不会造成池污染（4 条池 SQL 与 `list_pickable_by_work_type` 都硬限定
+/// `IN_PROCESS` + `PRODUCTION_SHELF`），但那条 DB 级不变量必须成立。
+#[tokio::test]
+async fn to_inspection_clears_current_process_id() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0-CLEAR",
+        fx.customer_l2_id,
+        Some("P000-CLEAR"),
+        "IN_PROCESS",
+        5,
+    )
+    .await;
+    // 起手：批次在 P1 工序池里（IN_PROCESS + PRODUCTION_SHELF + current_process_id=P1）
+    sqlx::query(
+        "UPDATE t_part_batch SET location = 'PRODUCTION_SHELF', current_holder_id = $1, \
+         current_process_id = 987654321 \
+         WHERE id = $2",
+    )
+    .bind(fx.production_shelf_id)
+    .bind(batch_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/to-inspection"),
+            Some(json!({
+                "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(body["data"]["part"]["status"], "INSPECTION");
+
+    // 出池不变式第 2 行：送检后 current_process_id 必须为 NULL
+    let (loc, pid): (Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT location, current_process_id FROM t_part_batch WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query after to-inspection");
+    assert_eq!(loc.as_deref(), Some("INSPECTION_SHELF"));
+    assert_eq!(
+        pid, None,
+        "送检 = 出池，current_process_id 必须置 NULL；\
+         残留值会让「NULL ⟺ 不在生产工序池中」这条 DB 级不变量失效"
+    );
 }
 
 /// to-inspection 拒绝：IN_PROCESS + WORKER holder → 20103。

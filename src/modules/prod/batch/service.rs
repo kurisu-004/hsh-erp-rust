@@ -690,15 +690,24 @@ mod tests {
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let b_ip = snowflake.next_id();
         let now = now_naive();
+        // 2026-09-30（review L2）：补 `current_process_id` —— 写入不变式第 1 行要求
+        // 「进池（IN_PROCESS + PRODUCTION_SHELF）必写目标 process_id」。此前本
+        // helper 只写 status/location 而把该列留 NULL，造出的正是本次要消灭的
+        // 「在池但无工序」数据形态。本测试只验 list_pending 的软删过滤、不触发池
+        // 查询，所以过去不炸；但复用该 helper 测池时会踩坑。故先建一条真实
+        // t_process 行（逻辑 FK 虽无物理约束，仍按 service 层存在性校验的约定走）。
+        let pool_process_id = insert_process(&pool, "PROC-INPOOL", "在池工序").await;
         sqlx::query(
             "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-             current_holder_id, current_process_step_id, delivery_note_id, parent_batch_id, \
+             current_holder_id, current_process_id, current_process_step_id, \
+             delivery_note_id, parent_batch_id, \
              version, created_at, updated_at) \
-             VALUES ($1, $2, 1, 1, 'IN_PROCESS', 'PRODUCTION_SHELF', NULL, NULL, NULL, NULL, 0, \
-             $3, $3)",
+             VALUES ($1, $2, 1, 1, 'IN_PROCESS', 'PRODUCTION_SHELF', NULL, $3, NULL, NULL, NULL, \
+             0, $4, $4)",
         )
         .bind(b_ip)
         .bind(p_in_process)
+        .bind(pool_process_id)
         .bind(now)
         .execute(&pool)
         .await

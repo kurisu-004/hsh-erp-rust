@@ -317,6 +317,29 @@ impl PartRepo {
     }
 
     /// to-inspection 第一步：批次状态同步（OCC UPDATE t_part_batch）。
+    ///
+    /// 2026-09-30（review 第 1 轮 H2 修复）本函数补写 `current_process_id = NULL`：
+    /// 送检是**出池**（写入不变式第 2 行：出池 → 置 NULL）。此前本函数只翻
+    /// `status` / `location` / `current_holder_id`，批次会带着上一道工序的
+    /// `current_process_id` 停在 `INSPECTION` 状态 —— 与 migration 004 的
+    /// COLUMN COMMENT「NULL 表示批次不在生产工序池中」矛盾。
+    ///
+    /// 之所以**不会**立刻造成池污染：全部 4 条工序池 SQL
+    /// （`take_one_from_pool` / `list_candidates_by_process_all_shelves` /
+    /// `group_count_by_process_all_shelves` / `count_pool_by_shelf_and_process`）
+    /// 与 `work_type::list_pickable_by_work_type` 都同时限定
+    /// `status='IN_PROCESS' AND location='PRODUCTION_SHELF'`。但那条 DB 级不变量
+    /// 必须成立，否则将来任何「只按 `current_process_id` 过滤、不带
+    /// status/location」的查询都会把送检批次错当池内批次捞出来。
+    ///
+    /// 关于 `current_process_step_id`：**本函数仍不写它**（沿用 2026-09-16 PR-3
+    /// 行为）。原先的注释理由是「保留被打回的那一步，让 INSPECTION→to_process
+    /// 时不丢 step 上下文」—— 该理由在 step 降级为**可选进度指针**后已不成立：
+    /// `mark_batch_failed_inspection`（检验不合格打回生产架）会按
+    /// `chain_id + next_process_id` **重新解析** step_id 写入
+    /// （`inspection_core.rs::to_process`），所以上下文不会真的丢。现在保留 step
+    /// 的实际价值是「送检期间前端能显示批次走到工艺链第几步」，属**显示用进度
+    /// 信息**，不再是状态机依赖。
     pub async fn mark_batch_inspected<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -330,8 +353,12 @@ impl PartRepo {
             SET status            = 'INSPECTION',
                 location          = 'INSPECTION_SHELF',
                 current_holder_id = $3,
-                -- 2026-09-16 PR-3：to_inspection 第一步保留 current_process_step_id
-                -- （即被打回的那一步，让 INSPECTION→to_process 时不丢 step 上下文）
+                -- 2026-09-30（review H2）：出池 → 池归属权威列置 NULL
+                --   （不置 NULL 会让 INSPECTION 批次带着上一道工序 id 停留）
+                current_process_id = NULL,
+                -- 2026-09-16 PR-3：to_inspection 保留 current_process_step_id，
+                --   但其定位已降级为「可选的显示用进度指针」；to_process 会重新
+                --   解析 step 写入，故此处不写不丢状态机上下文
                 version           = version + 1,
                 updated_at        = now(),
                 updated_by        = $4
@@ -437,24 +464,60 @@ impl PartRepo {
     ///
     /// `current_user_id` 写入 `updated_by`（nullable 与既有路径一致）。
     ///
-    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
+    /// ## 2026-09-16 PR-3 批次 step 化（migration 028）
+    ///
     /// - 参数 `next_process_id: i64` 改 `current_process_step_id: Option<i64>`
     /// - 写入列改为 t_part_batch.current_process_step_id
     ///
-    /// 2026-09-30 重构（prod/pool move 合并 remove 路径）：
-    /// - 移除 `current_process_step_id` SET 子句；move worker→pool 不应破坏工序链——
-    ///   `current_process_step_id` 由 worker-scan RETURNED/INSPECTED 推进，admin
-    ///   主动退回只是把 holder 切回 pool，step 不变。
-    /// - 形参 `current_process_step_id` 保留 `_` 前缀以兼容既有调用方（worker-scan
-    ///   路径传 `None`），sqlx 仍要求参数占位（`$4`），SET 子句不再写该列。
-    /// - 2026-09-30 补充：本函数**也不写 `current_process_id`** —— 归还货架是
-    ///   池内移动，工序不变（写入不变式），批次仍属原工序候选池。
+    /// ## 2026-09-30 重构（prod/pool move 合并 remove 路径）
+    ///
+    /// - 移除 `current_process_step_id` SET 子句；admin 主动退回只是把 holder
+    ///   切回 pool，不推进工序链。
+    /// - 形参 `current_process_step_id` 保留 `_` 前缀 —— **它被丢弃**（根本没进
+    ///   `query!` 的 bind 列表）。详见下面「已知缺口」段。
+    ///
+    /// ## 2026-09-30（review 第 1 轮 H1 修复）新增 `advance_to_process_id`
+    ///
+    /// 本函数此前**既不写** `current_process_step_id` **也不写**
+    /// `current_process_id`，但它有两个语义相反的调用方：
+    ///
+    /// | 调用方 | 语义 | `advance_to_process_id` |
+    /// |---|---|---|
+    /// | `worker_scan.rs::worker_scan` RETURNED | **推进工序**：工人在 P1 完工、扫 RETURNED 传 `next_process_id=P2`，批次应落进 **P2** 池 | `Some(P2)` |
+    /// | `prod/worker_pool/service.rs::move_batch` WORKER→POOL | **池内移动**：工种不变，批次归还货架后仍属原工序候选池 | `None` |
+    ///
+    /// 修复前 RETURNED 路径不写该列 → 批次带着 `current_process_id=P1` 归还货架
+    /// → 落回 **P1** 池而非 P2 池。这正是 migration 004 要确立的「唯一权威依据」
+    /// 在主干流程（完工归还）上说谎；且本次修复打破了「要推进 step 先进池、要进池
+    /// 先有 step」的死锁后，RETURNED 从不可达变为可达，该路径的问题会立刻暴露。
+    ///
+    /// **采用 `None` = 不改（COALESCE）而非拆两个函数**，理由：
+    /// 1. WHERE 守卫（`status='IN_PROCESS' AND location='WORKER'` + OCC
+    ///    `version=$2`）是安全关键，拆两份就变成两份必须手工保持同步的守卫，
+    ///    漂移即等于状态机被绕过；
+    /// 2. 仓内已有同形先例：`PartRepo::update_batch_fields` 的
+    ///    `COALESCE($3::bigint, delivery_note_id)`；
+    /// 3. 两个调用点各只有 1 处，可读性收益小，而 SQL 守卫重复的收益为负。
+    ///
+    /// 语义靠形参名 + 本 doc 锁定：`None` 是「**不推进**」，**不是**「清空为
+    /// NULL」。本函数没有任何调用方需要「清空」—— 清空属于出池，走
+    /// `mark_batch_with_status_and_meta`（漏斗）或 `mark_batch_inspected`。
+    ///
+    /// ## 已知缺口（2026-09-30 记录，本轮不扩 scope）
+    ///
+    /// `current_process_step_id`（可选进度指针，用于显示批次走到工艺链第几步）
+    /// **在 RETURNED 时不推进**：`worker_scan.rs:193-204` 已经把
+    /// `chain_id + next_pid` 解析成 `step_id_opt`，却传给一个被丢弃的形参。
+    /// 影响面仅限显示：池归属已由 `current_process_id` 承担且本函数已正确写入。
+    /// 待后续单独一轮处理（届时 `mark_batch_returned` 需要按调用方决定是否写
+    /// step，语义与 `advance_to_process_id` 同形）。
     pub async fn mark_batch_returned<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
         _current_process_step_id: Option<i64>,
+        advance_to_process_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query!(
@@ -462,8 +525,14 @@ impl PartRepo {
             UPDATE t_part_batch
             SET current_holder_id       = $3,
                 location                = 'PRODUCTION_SHELF',
-                -- 2026-09-30 重构：移除 current_process_step_id 写入
-                --   （move worker→pool 路径不推进工序链；形参不再占位）
+                -- 2026-09-30（review H1）：条件写入 —— Some(目标 process_id) 推进
+                --   工序（worker-scan RETURNED，批次落进下一道工序的候选池）；
+                --   None 表示「不推进」（prod/pool move 池内移动，工序不变）。
+                --   用 COALESCE 而非直接 `= $5`，是因为直接赋值会在 move 路径
+                --   把 current_process_id 抹成 NULL（那会让归还的批次对所有池隐身）。
+                current_process_id      = COALESCE($5::bigint, current_process_id),
+                -- 2026-09-30：current_process_step_id 仍不写（可选显示用进度指针，
+                --   RETURNED 不推进是已知缺口，见函数 doc「已知缺口」段）
                 version                 = version + 1,
                 updated_at              = now(),
                 updated_by              = $4
@@ -475,6 +544,7 @@ impl PartRepo {
             expected_version,
             shelf_id,
             current_user_id as Option<i64>,
+            advance_to_process_id,
         )
         .execute(executor)
         .await?;

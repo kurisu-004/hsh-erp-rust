@@ -43,7 +43,7 @@
 | 更新 `description` | 三态：`None` 不改；`Some(null)` 清空；`Some(v)` 改（trim 后写） |
 | 更新 `requires_approval` | INHOUSE 强制 false（无视 Some/None 内的任何值）；OUTSOURCE 保留请求值，None = 不改 |
 | 更新 `sort_order` | None = 不改；Some(v) = 改 |
-| 软删 | `t_work_type_process` / `t_outsource_company_process` / `t_shelf_process` / `t_part.next_process_id` 任何一处有非软删引用 → 20803 拒 |
+| 软删 | `t_work_type_process` / `t_outsource_company_process` / `t_shelf_process` / `t_part.next_process_id` / `t_process_chain_step.process_id` 任何一处有非软删引用 → 20803 拒（详见 [软删引用查询](#软删引用查询best-effort)，含 2026-09-30 行为收紧说明） |
 
 ---
 
@@ -179,14 +179,36 @@ Response 200 `data`：`null`
 
 ## 软删引用查询（best-effort）
 
-`ProcessRepo::count_process_references` 一次 `UNION ALL` 累加以下 4 张表的非软删计数：
+`ProcessRepo::count_process_references` 单条 SQL 加法累加以下 5 张表的非软删计数：
 
 | 引用表 | 用途 | 是否筛 deleted_at |
 |---|---|---|
 | `t_work_type_process` | 工种可执行工序白名单 | 否（mapping 表无业务软删） |
 | `t_outsource_company_process` | 外协公司能力清单 | 否（mapping 表无业务软删） |
 | `t_shelf_process` | 货架支持的工序 | 否（mapping 表无业务软删） |
-| `t_part` (`next_process_id`) | 工单下一工序 | **是**（part 表带软删） |
+| `t_part` (`next_process_id`) | 工单下一工序（rollup 派生缓存） | **是**（part 表带软删） |
+| `t_process_chain_step` (`process_id`) | 工艺链步骤所属工序 | **是**（step 表带软删） |
 
-任一总数 > 0 ⇒ 20803 `BIZ_PROCESS_IN_USE`。当前阶段（Phase P2）4 张表都已迁移到位，
+任一总数 > 0 ⇒ 20803 `BIZ_PROCESS_IN_USE`。5 张表都已迁移到位，
 无 junction repo 缺口；后续如需按 junction 拆分 repo，可保留 best-effort 注释。
+
+> #### ⚠️ 2026-09-30（review 第 1 轮 M3）两点说明
+>
+> **(1) 软删会比以前更容易被 20803 拒（行为收紧）**
+>
+> `t_part.next_process_id` 是 rollup 派生缓存，2026-09-30 起派生源改为直读
+> `t_part_batch.current_process_id`（migration 004）。此前**没有工序链**的工单，
+> 其批次 `current_process_step_id` 恒为 NULL → rollup 把 `t_part.next_process_id`
+> 抹成 NULL；现在这类工单会被**正常填上**真实 process_id。因此「有在池/在制批次
+> 的工单」现在会真实计入引用计数，**软删该工序会被拒**。这是修正（原先防线静默失效），
+> 但既有运维流程可能开始收到 20803。
+>
+> **(2) `t_part_batch.current_process_id` 未纳入本计数 —— 隐式依赖，非显式不变量**
+>
+> `t_part_batch.current_process_id`（migration 004）是到 `t_process` 的**新引用通道**，
+> 但不在上表 5 张表里。实际风险低：所有写入该列的路径都先过工序存在性校验
+> （`assert_shelf_maps_process` / `find_first_shelf_for_process` / worker-scan 的
+> `t_shelf_process` 映射校验），而 `t_shelf_process` **已在计数内**，间接兜住。
+> 但这是隐式依赖 —— 若将来新增不经货架映射直接写该列的路径，本守卫会漏判。
+> 后续若要显式化，应在 `count_process_references` 补一条
+> `t_part_batch WHERE current_process_id = $1 AND deleted_at IS NULL`。

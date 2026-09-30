@@ -8,16 +8,18 @@
 #
 # 与 test_runner.sh 的关系：
 # - test_nextest.sh 起 1 个 session 容器 → 在容器内 CREATE DATABASE hsh_erp_template
-#   → 跑 baseline 迁移 + seeds/menu.sql 到 template → 注入 TEST_DATABASE_BASE_URL →
+#   → 按字典序逐个 apply migrations/*.sql + seeds/menu.sql 到 template
+#   → 注入 TEST_DATABASE_BASE_URL →
 #   cargo nextest run（不要 exec：exec 会替换 shell 让 EXIT trap 失效）
 # - nextest 调每个测试时 .cargo/config.toml 的 runner (test_runner.sh) 触发转义
 #   口 1（TEST_DATABASE_BASE_URL 已注入）→ 直接 exec binary → 不再起新容器
 # - trap EXIT 在 wrapper 退出时清理 session 容器
 #
-# 2026-09-25 改造：migrations/ 缩为单文件 baseline.sql + seeds/menu.sql；
-#   旧的 29 个 DDL+菜单 DML 迁移已合并到 baseline，菜单 seed 抽到 seeds/。
-#   旧的 SKIP_RE（015/018/021/023/024）失效：015 DML 在 baseline 中是
-#   CREATE SEQUENCE + 空 INSERT（no-op），其它全在 baseline；菜单种子走 seeds/。
+# 2026-09-25 改造历史：旧的 29 个 DDL+菜单 DML 迁移曾合并进 baseline 单文件、
+#   菜单 seed 抽到 seeds/。当时的 SKIP_RE（015/018/021/023/024）随之失效：
+#   015 DML 在 baseline 中是 CREATE SEQUENCE + 空 INSERT（no-op），其它全在
+#   baseline；菜单种子走 seeds/。**注意：baseline 早已不是唯一文件** —— 之后按
+#   append-only 又追加了 4 个迁移（见下方 2026-09-30 修复）。
 #
 # 2026-09-30 修复：template 库迁移从「断言 migrations/ 有且仅有 1 个 .sql」改成
 #   「按字典序逐个 apply」。原断言自第 2 个迁移文件（2026-09-29 wx identity）加入
@@ -35,6 +37,15 @@
 #   仍用裸 `psql` apply（**不写** `_sqlx_migrations` 账本）：template 库只作
 #   CREATE DATABASE ... TEMPLATE 的模板，账本缺失不影响派生库；改成调
 #   `cargo sqlx migrate run` 反而会因为账本缺失而重跑 baseline 并失败。
+#
+#   已知竞态（review 第 1 轮记录，本轮不修）：`pg_isready` 轮询可能在
+#   docker-entrypoint 的 initdb 阶段命中**只监听 unix socket 的临时 server**，
+#   随后 `psql` 走同一 socket 时可能报
+#   `connection to server on socket ... No such file or directory`。影响仅限
+#   首跑偶发失败（重跑即过），且是 fail-loud —— `set -e` + EXIT trap 下
+#   NEXTEST_FAILED 未赋值会走「setup 失败 → 删容器」分支并 exit 1，不会产生假
+#   PASS。低成本修法：把轮询探针换成真连接（`psql -c 'SELECT 1'`）或给
+#   CREATE DATABASE 包一层重试。
 
 set -euo pipefail
 

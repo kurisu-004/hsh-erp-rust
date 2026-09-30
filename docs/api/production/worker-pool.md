@@ -125,20 +125,49 @@ Request：`MoveRequest`
 | from       | to         | 旧端点（2026-09-30 前） | SQL（位于 `src/modules/prod/worker_pool/repo/sql.rs`） |
 |------------|------------|------|------|
 | `POOL`     | `WORKER`   | `admin/worker-pool/assign` | `take_specific_from_pool`（OCC） |
-| `WORKER`   | `POOL`     | `admin/worker-pool/remove` | `part_mark_batch_returned`（**2026-09-30 重构去掉 step 写入**） |
+| `WORKER`   | `POOL`     | `admin/worker-pool/remove` | `part_mark_batch_returned`（**2026-09-30 重构去掉 step 写入**；`advance_to_process_id` 恒传 `None` = 不推进） |
 | `WORKER`   | `WORKER`   | （新增） | `move_worker_to_worker`（**2026-09-30 新增，不写 step**） |
 | `POOL`     | `POOL`     | （非法） | — |
 
 #### 关键不变量（保证工序链不被破坏）
 
-- 所有 move SQL **不写** `current_process_step_id`（move 不推进工序链；step 仅由 worker-scan RETURNED/INSPECTED 推进）
-- 所有 move SQL 同样 **不写** `current_process_id`（2026-09-30 写入不变式：池内移动工序不变，批次归还货架后仍属原工序候选池）
+- 所有 **move** SQL **不写** `current_process_step_id`（move 不推进工序链）
+- 所有 **move** SQL 同样 **不写** `current_process_id`（2026-09-30 写入不变式：池内移动工序不变，批次归还货架后仍属原工序候选池）
+  - 实现：`part_mark_batch_returned` 的 `advance_to_process_id` 形参**恒传 `None`**，
+    SQL 侧 `current_process_id = COALESCE($5::bigint, current_process_id)` 保留原值
 - 批次必须 `status='IN_PROCESS'` 且 `deleted_at IS NULL`；否则 `20120 BIZ_BATCH_INVALID_STATUS`
 - OCC：`UPDATE ... WHERE version = $expected`；0 行 → `40901 VERSION_CONFLICT`
 - `from` 必与 batch 当前 `(location, current_holder_id)` 匹配：
   - POOL → `(location='PRODUCTION_SHELF', current_holder_id=shelf_id)`
   - WORKER → `(location='WORKER', current_holder_id=worker_id)`
   - 不匹配 → `20122 BIZ_BATCH_LOCATION_MISMATCH`（**新增**，HTTP 409）
+
+> #### ⚠️ 2026-09-30（review 第 1 轮）两处行为变化
+>
+> **(1) move 的 `to` 校验从「静默跳过」变为「强制执行」**（breaking behavior）
+>
+> `move_batch` 的工序资格来源已从 `current_process_step_id` → step JOIN 改为直读
+> `current_process_id`。此前 dispatch 下发的批次 `current_process_step_id=NULL`
+> → 工序取值为 `None` → 下表两条校验被 `if let Some(spid)` **整块跳过**：
+>
+> | 校验 | 此前（对 dispatch 批次） | 现在 |
+> |---|---|---|
+> | `to.kind=WORKER` 的「工种必须含 batch 当前工序」 | 跳过 | **执行** → 不含则 `20104 BIZ_INVALID_VALUE` |
+> | `to.kind=POOL` 的「货架必须映射 batch 当前工序」 | 跳过 | **执行** → 未映射则 `20507 BIZ_SHELF_PROCESS_NOT_MAPPED` |
+>
+> 这是**修正漏检**（原本应校验而未校验），但既有前端流程可能因此开始收到上述两个错误码。
+
+> **(2) worker-scan RETURNED 现在会推进 `current_process_id`（H1 修复）**
+>
+> `part/service/worker_scan.rs` 的 RETURNED 事件是全仓唯一的**工序推进**路径。
+> 它此前不写 `current_process_id`，导致工人在 P1 完工、扫 RETURNED 传
+> `next_process_id=P2` 后，批次归还货架仍带 P1 → **落回 P1 池而非 P2 池**。
+> 现已传 `advance_to_process_id = Some(next_process_id)`，批次正确落进 P2 池。
+>
+> 注意：RETURNED **仍不推进** `current_process_step_id`（该列的 step SET 子句在
+> 2026-09-30 prod/pool move 重构中被移除，RETURNED 复用了同一函数）。这是**已知缺口**，
+> 影响面仅限显示（进度指针不更新），池归属不受影响。后续单独一轮处理。
+
 
 #### `to` 校验
 

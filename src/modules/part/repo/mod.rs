@@ -282,6 +282,7 @@ pub trait PartRepoTrait: Send {
         expected_version: i32,
         shelf_id: i64,
         current_process_step_id: Option<i64>,
+        advance_to_process_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error>;
 
@@ -696,6 +697,7 @@ impl PartRepoTrait for &mut PgConnection {
         expected_version: i32,
         shelf_id: i64,
         current_process_step_id: Option<i64>,
+        advance_to_process_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         PartRepo::mark_batch_returned(
@@ -704,6 +706,7 @@ impl PartRepoTrait for &mut PgConnection {
             expected_version,
             shelf_id,
             current_process_step_id,
+            advance_to_process_id,
             current_user_id,
         )
         .await

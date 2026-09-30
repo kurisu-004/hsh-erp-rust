@@ -296,6 +296,19 @@ impl ProcessRepo {
     /// 迁移 003/004/005/017 已建），本函数会被 PostgreSQL 拒绝，service 层把 sqlx
     /// 错误转 `BIZ_PROCESS_IN_USE`（保守：宁可误拒也不放过真引用）。当前阶段所有
     /// 5 张表均已迁移到位，best-effort 注释仅留给后续 junction repo 拆分时回看。
+    ///
+    /// 2026-09-30（review 第 1 轮 M3）两点补充：
+    /// - **行为收紧**：`t_part.next_process_id` 的 rollup 派生源已改为直读
+    ///   `t_part_batch.current_process_id`（migration 004）。此前无工序链的工单该列
+    ///   恒为 NULL（被抹掉），现在会被正常填上真实 process_id → **软删该工序会比
+    ///   以前更容易被 `BIZ_PROCESS_IN_USE`（20803）拒**。这是修正（原防线静默失效）。
+    /// - **`t_part_batch.current_process_id` 不在本查询的 5 张表里**（它是新增的
+    ///   到 `t_process` 的引用通道）。实际风险低：所有写入该列的路径都先过工序
+    ///   存在性校验（`assert_shelf_maps_process` / `find_first_shelf_for_process` /
+    ///   worker-scan 的 `t_shelf_process` 映射校验），而 `t_shelf_process` 已在计数内
+    ///   间接兜住。但这是**隐式依赖而非显式不变量** —— 若将来新增不经货架映射直接写
+    ///   该列的路径，本守卫会漏判，届时应在此补一条
+    ///   `t_part_batch WHERE current_process_id = $1 AND deleted_at IS NULL`。
     pub async fn count_process_references<'e, E: PgExecutor<'e>>(
         executor: E,
         process_id: i64,

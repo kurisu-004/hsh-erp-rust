@@ -272,6 +272,22 @@ async fn assert_shelf_maps_process(
 /// - `new_current_process_step_id` —— **可选的进度指针**（逻辑 FK →
 ///   t_process_chain_step.id），仅当工单已绑定工序链时才写，允许 NULL。
 ///   NULL 不影响入池（旧设计的死状态已由 `current_process_id` 打破）。
+///
+/// 写入不变式第 4 行「非生产流 → NULL」的**唯一例外**（2026-09-30 review 第 1 轮
+/// M1 补记，勿按表机械核对后误判为 bug）：
+///
+/// `send_to_outsource`（`outsource.rs:158`，`status='OUTSOURCE'` +
+/// `location='OUTSOURCE_COMPANY'`）传 `Some(req.process_id)` 而非 NULL。三条理由：
+///
+/// 1. 外协加工的就是这道工序，rollup 派生 `t_part.next_process_id` 需要它；
+/// 2. 与本次改动**前**的行为一致（旧代码写 `Some(step_id)`，rollup 再翻成
+///    process_id），不写才是行为变更；
+/// 3. `status='OUTSOURCE'` + `location='OUTSOURCE_COMPANY'` 使其**不可能**被任何
+///    工序池查询命中（4 条池 SQL 与 `list_pickable_by_work_type` 均硬限定
+///    `status='IN_PROCESS'` 叠加 `location='PRODUCTION_SHELF'`）。
+///
+/// 初始批次 / 子批次仍为严格 NULL（见 `part/batch/repo.rs::create_initial_batch`
+/// 与 `part/repo/sql/part_sql.rs::insert_child_for_assembly`，两者都不写该列）。
 #[allow(clippy::too_many_arguments)]
 async fn mark_batch_with_status_and_meta<'e, E: PgExecutor<'e>>(
     executor: E,

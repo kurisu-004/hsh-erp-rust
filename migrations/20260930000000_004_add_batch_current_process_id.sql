@@ -32,19 +32,50 @@
 --   非生产流（初始批次、子批次）                             → NULL
 --   拆分批次 `_split_batch_inner`                           → 从源行同 SELECT 列表继承
 --
+-- 例外（2026-09-30 review 第 1 轮 M1 记录，勿按表机械核对后误判为 bug）：
+--   `send_to_outsource`（status='OUTSOURCE' + location='OUTSOURCE_COMPANY'）写
+--   `Some(req.process_id)` 而非 NULL —— 外协加工的就是这道工序，rollup 派生
+--   `t_part.next_process_id` 需要它；且与本迁移**前**的行为一致（旧代码写
+--   `Some(step_id)`，rollup 再翻成 process_id），不写才是行为变更。它不可能被
+--   任何工序池查询命中（池 SQL 硬限定 IN_PROCESS + PRODUCTION_SHELF）。
+--
 -- 数据回填顺序（同一事务内完成）：
 --   1. 加新列 current_process_id bigint（可空、无默认值）
 --   2. 回填：从已有的 current_process_step_id 反查 process_id
 --      （s.id = pb.current_process_step_id AND s.deleted_at IS NULL）
 --   3. 建部分索引 ix_t_part_batch_current_process_id（WHERE 列非空）
 --
+-- 执行成本（2026-09-30 review 第 1 轮 L5 补充）：
+--   ADD COLUMN **不带 DEFAULT** → PG 11+ 只改系统目录、不重写表、不取
+--   ACCESS EXCLUSIVE 长锁，代价可忽略。真正的成本在第 2 步的 UPDATE：它全表
+--   扫 t_part_batch，并对命中的行加行锁（命中行数 = 「有 step_id 且 step 未软删」
+--   的批次，通常远小于全表）。生产库若 t_part_batch 达百万级，建议低峰期执行。
+--   仓内无分批迁移先例（archive/ 的 29 个迁移都是单文件全量），故本次同样单事务。
+--
 -- 已知局限（本次不处理，2026-09-30 记录）：
---   回填**覆盖不到历史死数据** —— 已下发但 `current_process_step_id IS NULL`
---   的批次无法反推 process_id：`t_part_event` 的 `PLACED_ON_SHELF` 事件里没有
---   target_process_id 字段可回捞。这类批次仍是「status=IN_PROCESS +
---   location=PRODUCTION_SHELF 但池归属为空」的死状态，只能由运营手工 recall
---   （recall-to-pending 会把列置 NULL）后重新下发才能恢复。生产库脏数据量与
---   是否需要一次性修复脚本，待后续按实际数据量另行决策。
+--   (1) 回填**覆盖不到历史死数据** —— 已下发但 `current_process_step_id IS NULL`
+--       的批次无法反推 process_id：`t_part_event` 的 `PLACED_ON_SHELF` 事件里没有
+--       target_process_id 字段可回捞。这类批次仍是「status=IN_PROCESS +
+--       location=PRODUCTION_SHELF 但池归属为空」的死状态，只能由运营手工 recall
+--       （recall-to-pending 会把列置 NULL）后重新下发才能恢复。生产库脏数据量与
+--       是否需要一次性修复脚本，待后续按实际数据量另行决策。
+--
+--   (2) 存在一条**持续生产新死数据**的路径（review L3）：`work_type.rs::pick_up`
+--       的 PENDING 分支把批次从 PENDING 直送工人（status=IN_PROCESS +
+--       location='WORKER'），此时 PENDING 批次的 `current_process_id` 恒为 NULL
+--       （recall-to-pending 已按出池不变式置 NULL），该分支只换 holder、不写工序；
+--       之后 worker-scan RETURNED / prod/pool move 归还货架时也不会补写（归还
+--       属「池内移动 → 不动」不变式）→ 得到 IN_PROCESS + PRODUCTION_SHELF +
+--       池归属为空的批次，即本迁移要消灭的同一形态。
+--       **非本次引入**（旧设计下 `current_process_step_id` 同样为 NULL，行为一致），
+--       但它是活水不是存量。修法需产品决策：要么 pick_up 要求调用方传
+--       `next_process_id` 补归属，要么归还路径对「池归属为空的批次」做守卫/告警。
+--
+--   (3) `current_process_step_id`（可选的显示用进度指针）在 worker-scan RETURNED
+--       时**不推进**（review H1 附带决策，本轮刻意不扩 scope）：RETURNED 已解析
+--       出目标 step_id，但 `mark_batch_returned` 的 step SET 子句在 2026-09-30
+--       prod/pool move 重构中被移除，RETURNED 复用该函数后进度指针同步失效。
+--       影响面仅限显示 —— 池归属已由 `current_process_id` 承担且已正确写入。
 --
 -- 幂等：ADD COLUMN / CREATE INDEX 均带 IF NOT EXISTS；UPDATE 为普通回填
 -- （重复执行结果幂等：已回填行再次 UPDATE 得到同值）。列刻意保持**可空、无
