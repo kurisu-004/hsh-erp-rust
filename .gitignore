@@ -17,3 +17,7 @@
 .claude/plans/
 keys/
 db_backup/
+
+# worktree 专属服务状态文件（worktree 起 PG/Redis 容器时生成的端口/项目名记录，
+# 随 worktree 生命周期变化，不入版本库）
+.wt-services

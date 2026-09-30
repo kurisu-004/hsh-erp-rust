@@ -46,6 +46,13 @@ pub struct ProgrammingItemOut {
 }
 
 /// `GET /api/v2/prod/programming/pending` 顶层响应。
+///
+/// ⚠️ `total` / `limit` / `offset` 是**分页计数类 `i64`，故意不走
+/// `serialize_i64`**（2026-10-01 review 第 1 轮 C 项确认）：它们是行数 / 偏移量，
+/// 远小于 `2^53`，不存在 JS 精度截断风险；序列化形态与
+/// `part/vo/part.rs::PartListOut`（以及被替换的 part 域旧端点）**逐字一致**，
+/// 前端从旧端点切到本端点时该层无需改动。只有雪花 ID 字段（`ProgrammingItemOut::id`）
+/// 需要 `serialize_i64` → JSON string。
 #[derive(Debug, Clone, Serialize)]
 pub struct ProgrammingListOut {
     pub items: Vec<ProgrammingItemOut>,

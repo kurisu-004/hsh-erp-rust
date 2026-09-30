@@ -14,7 +14,13 @@
 //! **part 域一行未改**：旧端点保留兼容（仅 `docs/api/parts/lifecycle.md` 追加
 //! 弃用说明），新增前端调用方一律走本域。
 //!
-//! ## 过滤谓词（三规则并集，part 级去重）
+//! ## 过滤谓词（part 状态闸门 + 三规则并集，part 级去重）
+//! 0. **状态闸门**：`p.status IN ('PENDING','IN_PROCESS','PROGRAMMING')` —— 写在
+//!    最外层，**约束全部三条规则**（2026-10-01 review 第 1 轮 A 项拍板）。因为
+//!    `t_part.process_chain_id` 从不清空，若规则2 不受状态约束，历史上挂过 CNC 链的
+//!    `COMPLETED` / `CANCELLED` / `DELIVERED` 工单会永久命中本页。旧 part 域端点
+//!    本来就有这条闸门（`tests/part/lifecycle.rs::
+//!    list_pending_programming_excludes_completed_or_cancelled` 锁住），新端点不得更宽。
 //! 1. `p.status = 'PROGRAMMING'` —— 兼容旧筛选（历史 PROGRAMMING 状态仍允许消化）
 //! 2. 工单工艺链上存在 `is_cnc = TRUE` 的工序 step
 //! 3. 工单存在批次，其 `current_process_id` 指向 `is_cnc = TRUE` 的工序

@@ -44,12 +44,12 @@ Query：
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `has_cnc_program` | bool? | ✗ | Tab 切换三态：`true` 仅已上传 G_CODE；`false` 仅未上传；缺省（`null` 或空串）全部 |
-| `keyword` | string? | ✗ | 模糊匹配 `name` / `drawing_no` / `serial_no`（`ILIKE '%kw%'`）；trim 后为空按缺省处理 |
+| `keyword` | string? | ✗ | 模糊匹配 `name` / `drawing_no` / `serial_no`（`ILIKE '%kw%' ESCAPE '\'`）；trim 后为空按缺省处理。**`%` / `_` / `\` 按字面量转义**（`keyword=50%` 只命中字面量含 `50%` 的行，不做通配全扫） |
 | `serial_no` | string? | ✗ | 工单序列号**精确**匹配（`p.serial_no = $n`）；trim 后为空按缺省处理 |
-| `sort_by` | string? | ✗ | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它值**退化**为 `PLANNED_DELIVERY_DATE`（不报错） |
+| `sort_by` | string? | ✗ | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它值**退化**为 `PLANNED_DELIVERY_DATE`（不报错，大小写敏感） |
 | `sort_dir` | string? | ✗ | `ASC` / `DESC`（缺省 `ASC`；非 `DESC` 一律按 `ASC` 处理，大小写不敏感） |
-| `limit` | int? | ✗ | 缺省 50；service 层 `clamp(1, 500)`。允许字符串形态（`"50"`） |
-| `offset` | int? | ✗ | 缺省 0；service 层 `max(0)`。允许字符串形态 |
+| `limit` | int? | ✗ | 缺省 50；service 层 `clamp(1, 500)`。允许字符串形态（`"50"`）；**空串 / 全空白按缺省处理** |
+| `offset` | int? | ✗ | 缺省 0；service 层 `max(0)`。允许字符串形态；**空串 / 全空白按缺省处理** |
 
 Response 200 `data`：[`ProgrammingListOut`](#programminglistout-字段)
 
@@ -63,7 +63,7 @@ Response 200 `data`：[`ProgrammingListOut`](#programminglistout-字段)
 
 ---
 
-## 过滤谓词（三规则并集，part 级去重）
+## 过滤谓词（part 状态闸门 + 三规则并集，part 级去重）
 
 ```sql
 SELECT p.id, p.version, p.serial_no, p.name, p.drawing_no, p.quantity,
@@ -76,6 +76,7 @@ FROM t_part p
 LEFT JOIN t_customer c  ON c.id = p.customer_id          -- L2 叶子客户
 LEFT JOIN t_customer pc ON pc.id = c.parent_id           -- L1 一级集团
 WHERE p.deleted_at IS NULL
+  AND p.status IN ('PENDING','IN_PROCESS','PROGRAMMING')   -- ⚠️ 状态闸门，约束全部三规则
   AND (
        -- 规则1：兼容旧筛选
        p.status = 'PROGRAMMING'
@@ -94,17 +95,35 @@ WHERE p.deleted_at IS NULL
                  AND pr.is_cnc = TRUE)
   )
   AND ( <$has_cnc IS NULL> OR EXISTS (…kind='G_CODE'…) = <$has_cnc> )   -- Tab 切换三态
-  [AND (p.name ILIKE $kw OR p.drawing_no ILIKE $kw OR p.serial_no ILIKE $kw)]
+  [AND (p.name ILIKE $kw ESCAPE '\' OR p.drawing_no ILIKE $kw ESCAPE '\' OR p.serial_no ILIKE $kw ESCAPE '\')]
   [AND p.serial_no = $serial_no]
 ORDER BY <白名单列> <ASC|DESC> NULLS LAST, p.id DESC
 LIMIT $limit OFFSET $offset
 ```
+
+> **客户侧故意不过滤 `deleted_at`**：`c` / `pc` 两个 `LEFT JOIN` 刻意不加软删条件
+> —— 历史工单需要显示其原客户名（客户软删后名字不能变空）。这与其余 5 处严格软删
+> 过滤（`p` / `pb` / `pr` / `s` / `t_part_file`）的差异是**有意的**。
 
 每条规则一句话业务解释：
 
 - **规则1（`p.status = 'PROGRAMMING'`）**：工单状态仍停在 PROGRAMMING 的历史数据仍允许消化，避免旧在制品在新口径下消失。
 - **规则2（链含 CNC 工序）**：工单绑定的工艺链上有任一 `is_cnc = TRUE` 工序 step —— 编程员按工艺链判断该编哪道程序。
 - **规则3（批次在 CNC 工序）**：工单至少有一个在制批次（`PENDING` / `IN_PROCESS` / `PROGRAMMING`），其 `current_process_id` 指向 `is_cnc = TRUE` 工序 —— 链还没建时，批次本身就是工序归属依据。
+
+> **⚠️ 三条规则全部受 part 状态白名单约束**（2026-10-01 加固）：状态闸门
+> `p.status IN ('PENDING','IN_PROCESS','PROGRAMMING')` 写在 WHERE 最外层
+> （与 `p.deleted_at IS NULL` 同级、在三规则括号**之外**），因此**规则2 / 规则3 同样
+> 受其约束**。已交付（`DELIVERED`）/ 已完成（`COMPLETED`）/ 已取消（`CANCELLED`）
+> 的工单**即使挂过 CNC 工序也不出现**。
+>
+> 加固原因：`t_part.process_chain_id` **从不清空**，而规则2 本身不看 part 状态
+> → 历史上挂过 CNC 链的已交付/已完成工单会**永久**命中本页。
+> [`../parts/lifecycle.md`](../parts/lifecycle.md) 描述的 part 域旧端点本来就有这条
+> 闸门（回归测试 `tests/part/lifecycle.rs::list_pending_programming_excludes_completed_or_cancelled`
+> 锁住），**新端点不允许比旧端点更宽**。本端点无 `status` query 参数，前端无法在
+> 客户端二次过滤。
+> 回归测试：`tests/production/pending_programming.rs::part_status_gate_excludes_completed_and_delivered`。
 
 > **三规则是并集，且按 part 去重**：同一工单同时命中多条规则时**只出现一行**
 > （谓词写在 `WHERE` 里而非 JOIN 里，天然不产生行放大），`total` 同样按 part 计数。
@@ -118,6 +137,11 @@ LIMIT $limit OFFSET $offset
 
 `EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`
 —— 与 part 域旧端点、`prod::worker_pool` 候选池判定「已编程」同源，软删文件不算已上传。
+
+该表达式在 `repo.rs` 里是**唯一常量 `G_CODE_EXISTS`**，同时供 list 的 SELECT 列表
+（返回给前端的 `has_cnc_program` 值）与 WHERE 的三态过滤复用 —— 改 `kind` / 软删
+条件时只需改一处，不存在「返回值与过滤口径漂移」的可能。
+
 
 ---
 
@@ -165,6 +189,12 @@ LIMIT $limit OFFSET $offset
 }
 ```
 
+> `total` / `limit` / `offset` 是**分页计数类 i64，序列化为 JSON number**（非 string）——
+> 它们远小于 `2^53` 无 JS 精度风险，形态与
+> [`../parts/index.md#partlistout-字段`](../parts/index.md)（`PartListOut`，part 域旧端点
+> 的出参）**逐字一致**，前端从旧端点切到本端点时该层零改动。只有雪花 ID
+> （`ProgrammingItemOut.id`）序列化为 string。
+
 ---
 
 ## 关键错误码速查
@@ -182,6 +212,8 @@ LIMIT $limit OFFSET $offset
 **关于 query 解析失败**：`limit=abc` 这类**无法反序列化为 i64** 的请求由 axum
 `Query` extractor 直接拒绝 → HTTP 400 + 纯文本 body（**不走 R 包络**，全仓无自定义
 rejection handler）。前端只需按 HTTP 400 兜底展示。
+**空串不算失败**：`?limit=&offset=`（以及全空白 `?limit=%20%20`）与
+`?has_cnc_program=` 一样按**缺省**处理（`limit=50` / `offset=0`）并返回 200。
 
 > 完整错误码见 [`../index.md`](../index.md#跨域错误码速查) 与 `src/shared/error.rs::code`。
 
@@ -192,10 +224,16 @@ rejection handler）。前端只需按 HTTP 400 兜底展示。
 - ✅ **`prod::programming`**（2026-10-01 新增）：1 只读端点
   - 5 文件子模块（`mod/dto/vo/repo/service/handler`），零 schema 变更
   - repo 2 静态方法（`list` / `count`）+ 私有 `push_where`（list/count 共用谓词）
+  - 单一常量 `G_CODE_EXISTS` 供 SELECT 列表与 WHERE 过滤复用
+  - `keyword` 的 `%` / `_` / `\` 走 `escape_like` 转义 + `ESCAPE '\'`
+  - part 状态闸门 `status IN (PENDING, IN_PROCESS, PROGRAMMING)` 约束全部三规则
   - 角色守卫含 `CNC_PROGRAMMER`
-- ✅ 集成测试：`tests/production/pending_programming.rs` —— 10 场景（三规则各自单独命中 /
-  并集去重 / 反例 / `has_cnc_program` 三态 / keyword+serial_no / 排序默认+DESC+非法退化 /
-  分页边界 / 角色守卫含 CNC_PROGRAMMER 与 SHELF_ACCOUNT 403）
+- ✅ 集成测试：`tests/production/pending_programming.rs` —— **14 场景**
+  （1-10 三规则各自单独命中 / 并集去重 / 反例 / `has_cnc_program` 三态 /
+  keyword+serial_no / 排序默认+DESC+非法退化 / 分页边界 / 角色守卫含 CNC_PROGRAMMER
+  与 SHELF_ACCOUNT 403；11 part 状态闸门排除 COMPLETED+DELIVERED；
+  12 五处软删过滤（含 G_CODE 软删后 `has_cnc_program` 翻回 false）；
+  13 `?limit=&offset=` 空串走缺省；14 keyword 通配符按字面量匹配）
 
 ## 参考
 
