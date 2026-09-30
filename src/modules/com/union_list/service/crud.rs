@@ -30,6 +30,17 @@
 //! 解析 `YYYY-MM-DD` → `chrono::NaiveDate`，非法格式 → 40001 VALIDATION_ERROR。
 //! PART / ALL / ASSEMBLY 三模式全部生效。
 //!
+//! ## 2026-09-30 新增：10 字段筛选（4 文本 ILIKE + 4 日期窗口 + 2 IS NULL 三态）
+//! 修零件一览页面（frontend `PartsTable.vue` / `usePartsListQuery.ts::buildParams()`）
+//! 照常发出的 10 个字段全部被静默丢弃的隐藏 bug：
+//! - 文本：`drawing_no` / `name` / `order_no` / `serial_no`（ILIKE %x%）
+//! - 日期：`request_date_from/to` / `system_delivery_date_from/to`（闭区间）
+//! - IS NULL 三态：`order_no_is_null` / `system_delivery_date_is_null`
+//!   （`order_no` 含空串语义对齐 PR-F 2026-08-11）
+//!
+//! 三层修复：DTO 声明（避免 axum Query 静默丢弃）→ service 解析 + 预格式化
+//!   → repo SQL 段内消费。PART / ALL / ASSEMBLY 三模式全部生效。
+//!
 //! ## SQL 引用
 //! - PART 段：`part/repo/sql/part_sql.rs::list_with_filters`（part_only=true）
 //! - ASSEMBLY 段：`assembly/repo/sql.rs::list_with_filters`
@@ -120,6 +131,19 @@ impl UnionListService {
             // 2026-09-30 新增：日期窗口过滤（与 SQL WHERE `>=` / `<=` 一致）。
             planned_delivery_date_from: parsed.planned_delivery_date_from,
             planned_delivery_date_to: parsed.planned_delivery_date_to,
+            // 2026-09-30 新增：4 文本 ILIKE 模式（已 %x% 预格式化）
+            drawing_no_pat: parsed.drawing_no_pat.as_deref(),
+            name_pat: parsed.name_pat.as_deref(),
+            order_no_pat: parsed.order_no_pat.as_deref(),
+            serial_no_pat: parsed.serial_no_pat.as_deref(),
+            // 2026-09-30 新增：4 日期窗口
+            request_date_from: parsed.request_date_from,
+            request_date_to: parsed.request_date_to,
+            system_delivery_date_from: parsed.system_delivery_date_from,
+            system_delivery_date_to: parsed.system_delivery_date_to,
+            // 2026-09-30 新增：2 IS NULL 三态
+            order_no_is_null: parsed.order_no_is_null,
+            system_delivery_date_is_null: parsed.system_delivery_date_is_null,
             part_only: true, // PART-only 模式强制打开装配体子件守卫
             sort_by: &parsed.sort_by,
             sort_dir: &parsed.sort_dir,
@@ -180,6 +204,19 @@ impl UnionListService {
             // 2026-09-30 新增：日期窗口过滤（与 SQL WHERE `>=` / `<=` 一致）。
             planned_delivery_date_from: parsed.planned_delivery_date_from,
             planned_delivery_date_to: parsed.planned_delivery_date_to,
+            // 2026-09-30 新增：4 文本 ILIKE 模式
+            drawing_no_pat: parsed.drawing_no_pat.as_deref(),
+            name_pat: parsed.name_pat.as_deref(),
+            order_no_pat: parsed.order_no_pat.as_deref(),
+            serial_no_pat: parsed.serial_no_pat.as_deref(),
+            // 2026-09-30 新增：4 日期窗口
+            request_date_from: parsed.request_date_from,
+            request_date_to: parsed.request_date_to,
+            system_delivery_date_from: parsed.system_delivery_date_from,
+            system_delivery_date_to: parsed.system_delivery_date_to,
+            // 2026-09-30 新增：2 IS NULL 三态
+            order_no_is_null: parsed.order_no_is_null,
+            system_delivery_date_is_null: parsed.system_delivery_date_is_null,
             sort_by: Some(&parsed.sort_by),
             sort_dir: Some(&parsed.sort_dir),
             limit,
@@ -257,6 +294,19 @@ impl UnionListService {
             // 2026-09-30 新增：日期窗口过滤下推到 part_seg / asm_seg 段 WHERE。
             parsed.planned_delivery_date_from,
             parsed.planned_delivery_date_to,
+            // 2026-09-30 新增：4 文本 ILIKE pattern
+            parsed.drawing_no_pat.as_deref(),
+            parsed.name_pat.as_deref(),
+            parsed.order_no_pat.as_deref(),
+            parsed.serial_no_pat.as_deref(),
+            // 2026-09-30 新增：4 日期窗口
+            parsed.request_date_from,
+            parsed.request_date_to,
+            parsed.system_delivery_date_from,
+            parsed.system_delivery_date_to,
+            // 2026-09-30 新增：2 IS NULL 三态
+            parsed.order_no_is_null,
+            parsed.system_delivery_date_is_null,
         )
         .await?;
 
@@ -272,6 +322,19 @@ impl UnionListService {
             // 2026-09-30 新增：日期窗口过滤。
             planned_delivery_date_from: parsed.planned_delivery_date_from,
             planned_delivery_date_to: parsed.planned_delivery_date_to,
+            // 2026-09-30 新增：4 文本 ILIKE 模式
+            drawing_no_pat: parsed.drawing_no_pat.as_deref(),
+            name_pat: parsed.name_pat.as_deref(),
+            order_no_pat: parsed.order_no_pat.as_deref(),
+            serial_no_pat: parsed.serial_no_pat.as_deref(),
+            // 2026-09-30 新增：4 日期窗口
+            request_date_from: parsed.request_date_from,
+            request_date_to: parsed.request_date_to,
+            system_delivery_date_from: parsed.system_delivery_date_from,
+            system_delivery_date_to: parsed.system_delivery_date_to,
+            // 2026-09-30 新增：2 IS NULL 三态
+            order_no_is_null: parsed.order_no_is_null,
+            system_delivery_date_is_null: parsed.system_delivery_date_is_null,
             part_only: true, // part 段排除装配体子件
             sort_by: &parsed.sort_by,
             sort_dir: &parsed.sort_dir,
@@ -291,6 +354,19 @@ impl UnionListService {
                 // 2026-09-30 新增：日期窗口过滤。
                 planned_delivery_date_from: parsed.planned_delivery_date_from,
                 planned_delivery_date_to: parsed.planned_delivery_date_to,
+                // 2026-09-30 新增：4 文本 ILIKE 模式
+                drawing_no_pat: parsed.drawing_no_pat.as_deref(),
+                name_pat: parsed.name_pat.as_deref(),
+                order_no_pat: parsed.order_no_pat.as_deref(),
+                serial_no_pat: parsed.serial_no_pat.as_deref(),
+                // 2026-09-30 新增：4 日期窗口
+                request_date_from: parsed.request_date_from,
+                request_date_to: parsed.request_date_to,
+                system_delivery_date_from: parsed.system_delivery_date_from,
+                system_delivery_date_to: parsed.system_delivery_date_to,
+                // 2026-09-30 新增：2 IS NULL 三态
+                order_no_is_null: parsed.order_no_is_null,
+                system_delivery_date_is_null: parsed.system_delivery_date_is_null,
                 sort_by: Some(&parsed.sort_by),
                 sort_dir: Some(&parsed.sort_dir),
                 limit: 0,
@@ -356,6 +432,16 @@ impl UnionListService {
 ///
 /// 2026-09-30 新增：`planned_delivery_date_from/to` —— `YYYY-MM-DD` 解析后的
 /// `NaiveDate`（已校验），None 表示该端不参与 SQL 过滤。
+///
+/// 2026-09-30 新增：10 字段分组。
+/// - 4 文本 ILIKE pattern（`Option<String>`，已预格式化 `%x%`）：覆盖 DTO
+///   `drawing_no` / `name` / `order_no` / `serial_no`。None 表示该端不参与
+///   SQL 过滤。
+/// - 4 日期 `Option<NaiveDate>`：覆盖 DTO `request_date_from/to` +
+///   `system_delivery_date_from/to`（YYYY-MM-DD 已校验）。
+/// - 2 IS NULL 三态 `Option<bool>`：覆盖 DTO `order_no_is_null` +
+///   `system_delivery_date_is_null`。`order_no` 含空串语义对齐 PR-F
+///   2026-08-11（空串视为『未填』/NULL 同义）。
 struct ParsedFilters {
     sort_by: String,
     sort_dir: String,
@@ -365,6 +451,19 @@ struct ParsedFilters {
     holder_ids: Vec<i64>,
     planned_delivery_date_from: Option<NaiveDate>,
     planned_delivery_date_to: Option<NaiveDate>,
+    // 2026-09-30 新增：4 文本 ILIKE pattern（已 %x% 预格式化）
+    drawing_no_pat: Option<String>,
+    name_pat: Option<String>,
+    order_no_pat: Option<String>,
+    serial_no_pat: Option<String>,
+    // 2026-09-30 新增：4 日期窗口（已 YYYY-MM-DD 校验 → NaiveDate）
+    request_date_from: Option<NaiveDate>,
+    request_date_to: Option<NaiveDate>,
+    system_delivery_date_from: Option<NaiveDate>,
+    system_delivery_date_to: Option<NaiveDate>,
+    // 2026-09-30 新增：2 IS NULL 三态
+    order_no_is_null: Option<bool>,
+    system_delivery_date_is_null: Option<bool>,
 }
 
 /// 解析 `UnionListQuery` 为内部变量（`parse_list_filters` 在 part 域的镜像）。
@@ -449,6 +548,24 @@ async fn parse_filters(
         query.planned_delivery_date_to.as_deref(),
         "planned_delivery_date_to",
     )?;
+    // 2026-09-30 新增：4 文本 ILIKE pattern（None / Some("") / 纯空白 → None；
+    // 其它 → `Some(format!("%{}%", raw.trim()))`）。
+    let drawing_no_pat = parse_optional_ilike_pattern(query.drawing_no.as_deref());
+    let name_pat = parse_optional_ilike_pattern(query.name.as_deref());
+    let order_no_pat = parse_optional_ilike_pattern(query.order_no.as_deref());
+    let serial_no_pat = parse_optional_ilike_pattern(query.serial_no.as_deref());
+    // 2026-09-30 新增：4 日期窗口（复用 `parse_optional_date`）
+    let request_date_from =
+        parse_optional_date(query.request_date_from.as_deref(), "request_date_from")?;
+    let request_date_to = parse_optional_date(query.request_date_to.as_deref(), "request_date_to")?;
+    let system_delivery_date_from = parse_optional_date(
+        query.system_delivery_date_from.as_deref(),
+        "system_delivery_date_from",
+    )?;
+    let system_delivery_date_to = parse_optional_date(
+        query.system_delivery_date_to.as_deref(),
+        "system_delivery_date_to",
+    )?;
     Ok(ParsedFilters {
         sort_by,
         sort_dir,
@@ -458,6 +575,16 @@ async fn parse_filters(
         holder_ids,
         planned_delivery_date_from,
         planned_delivery_date_to,
+        drawing_no_pat,
+        name_pat,
+        order_no_pat,
+        serial_no_pat,
+        request_date_from,
+        request_date_to,
+        system_delivery_date_from,
+        system_delivery_date_to,
+        order_no_is_null: query.order_no_is_null,
+        system_delivery_date_is_null: query.system_delivery_date_is_null,
     })
 }
 
@@ -477,6 +604,20 @@ fn parse_optional_date(
                 AppError::validation(format!("{field_name} 非法: {s}（必须是 YYYY-MM-DD: {e}）"))
             }),
         _ => Ok(None),
+    }
+}
+
+/// 解析可选文本 query 字段为 ILIKE pattern（2026-09-30 新增）。
+///
+/// - `None` / `Some("")` / 纯空白 → `None`（不参与过滤）
+/// - 其它 → `Some(format!("%{}%", raw.trim()))`（前后缀 `%` + trim）
+///
+/// 与 `parse_optional_date` 不同：本 helper 永不返回 `Err`（文本非法 format
+/// 不会发生；空串/空白与『不传』同义视为不过滤，对齐前端表单用户清空输入的语义）。
+fn parse_optional_ilike_pattern(raw: Option<&str>) -> Option<String> {
+    match raw {
+        Some(s) if !s.trim().is_empty() => Some(format!("%{}%", s.trim())),
+        _ => None,
     }
 }
 

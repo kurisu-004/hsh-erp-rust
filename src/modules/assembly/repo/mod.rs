@@ -426,6 +426,19 @@ impl AssemblyRepoTrait for &mut PgConnection {
             // 直接构造 AssemblyListFilters 时传实际日期值。
             planned_delivery_date_from: None,
             planned_delivery_date_to: None,
+            // 2026-09-30 新增：trait 层不暴露 10 字段（4 文本 + 4 日期 + 2
+            // IS NULL）形态（trait 形参上限已达 10），固定 None 维持旧行为。
+            // com::union_list 端点直接构造 AssemblyListFilters 时传实际值。
+            drawing_no_pat: None,
+            name_pat: None,
+            order_no_pat: None,
+            serial_no_pat: None,
+            request_date_from: None,
+            request_date_to: None,
+            system_delivery_date_from: None,
+            system_delivery_date_to: None,
+            order_no_is_null: None,
+            system_delivery_date_is_null: None,
             sort_by,
             sort_dir,
             limit,
@@ -454,6 +467,17 @@ impl AssemblyRepoTrait for &mut PgConnection {
             // 2026-09-30 新增：与 list_with_filters trait 方法同理，固定 None。
             planned_delivery_date_from: None,
             planned_delivery_date_to: None,
+            // 2026-09-30 新增：10 字段 trait 层不暴露，固定 None 维持旧行为。
+            drawing_no_pat: None,
+            name_pat: None,
+            order_no_pat: None,
+            serial_no_pat: None,
+            request_date_from: None,
+            request_date_to: None,
+            system_delivery_date_from: None,
+            system_delivery_date_to: None,
+            order_no_is_null: None,
+            system_delivery_date_is_null: None,
             sort_by: None,
             sort_dir: None,
             limit: 0,

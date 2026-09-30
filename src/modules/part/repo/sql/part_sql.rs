@@ -107,6 +107,18 @@ pub struct PartUpdate<'a> {
 /// migrations/005:18-19），无 NULL 短路必要。当前仅 com::union_list 端点（dashboard
 /// UpcomingDeliveryListDrawer）使用，其它 caller（part 服务层 / 外协 endpoint）
 /// 默认传 `None`，零破坏行为。
+///
+/// 2026-09-30 新增：10 字段对齐 com::union_list 端点（`PartsTable.vue` / `usePartsListQuery.ts::buildParams()`）。
+/// - 4 文本 ILIKE pattern（`Option<&str>`，已 `%x%` 预格式化）：`drawing_no_pat` /
+///   `name_pat` / `order_no_pat` / `serial_no_pat`。`None` → 不参与；`Some(s)`
+///   → `AND <col> ILIKE $s`。
+/// - 4 日期窗口（`Option<NaiveDate>`）：`request_date_from/to` /
+///   `system_delivery_date_from/to`。`request_date` NOT NULL；`system_delivery_date`
+///   nullable（DDL migrations/005），`None` → 不参与，`Some(d)` → `>=` / `<=`。
+/// - 2 IS NULL 三态（`Option<bool>`）：`order_no_is_null` /
+///   `system_delivery_date_is_null`。`order_no` 含空串语义对齐 PR-F 2026-08-11
+///   （空串视为『未填』/NULL 同义）；`system_delivery_date` 仅 NULL / NOT NULL。
+///   其它 caller 固定 `None`，零破坏行为。
 #[derive(Debug, Default, Clone)]
 pub struct PartListFilters<'a> {
     pub customer_ids: &'a [i64],
@@ -120,6 +132,29 @@ pub struct PartListFilters<'a> {
     pub planned_delivery_date_from: Option<chrono::NaiveDate>,
     /// 2026-09-30 新增：`planned_delivery_date <= to` 过滤。`None` → 不过滤。
     pub planned_delivery_date_to: Option<chrono::NaiveDate>,
+    // 2026-09-30 新增：4 文本 ILIKE pattern（None / Some("") → None 由 service 层归一化）
+    /// 图号 ILIKE pattern（已 `%x%` 预格式化）。`None` → 不过滤。
+    pub drawing_no_pat: Option<&'a str>,
+    /// 名称 ILIKE pattern。`None` → 不过滤。
+    pub name_pat: Option<&'a str>,
+    /// 订单号 ILIKE pattern。`None` → 不过滤。
+    pub order_no_pat: Option<&'a str>,
+    /// 序列号 ILIKE pattern。`None` → 不过滤。
+    pub serial_no_pat: Option<&'a str>,
+    // 2026-09-30 新增：4 日期窗口
+    /// `request_date >= from`。`None` → 不过滤。
+    pub request_date_from: Option<chrono::NaiveDate>,
+    /// `request_date <= to`。`None` → 不过滤。
+    pub request_date_to: Option<chrono::NaiveDate>,
+    /// `system_delivery_date >= from`。`None` → 不过滤。
+    pub system_delivery_date_from: Option<chrono::NaiveDate>,
+    /// `system_delivery_date <= to`。`None` → 不过滤。
+    pub system_delivery_date_to: Option<chrono::NaiveDate>,
+    // 2026-09-30 新增：2 IS NULL 三态
+    /// 订单号 IS NULL 三态（None=不参与 / Some(true)=IS NULL OR ='' / Some(false)=IS NOT NULL AND <>''）
+    pub order_no_is_null: Option<bool>,
+    /// 系统交期 IS NULL 三态（None=不参与 / Some(true)=IS NULL / Some(false)=IS NOT NULL）
+    pub system_delivery_date_is_null: Option<bool>,
     /// 2026-09-28 新增：装配体子件过滤开关。
     /// - `true`：追加 `AND assembly_id IS NULL`（PART-only 模式 / ALL 模式零件段）
     /// - `false`：不过滤（兼容旧 caller，如 `pending-programming` / `outsource-*` 等）
@@ -543,6 +578,47 @@ impl PartRepo {
         if let Some(d) = f.planned_delivery_date_to {
             qb.push(" AND planned_delivery_date <= ").push_bind(d);
         }
+        // 2026-09-30 新增：10 字段对齐 com::union_list 端点（4 文本 ILIKE +
+        // 4 日期窗口 + 2 IS NULL 三态）。所有 caller 传 None 时此块零 SQL 拼接，
+        // 不破坏旧行为。`order_no_is_null=true` 含空串语义对齐 PR-F 2026-08-11。
+        if let Some(p) = f.drawing_no_pat {
+            qb.push(" AND drawing_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.name_pat {
+            qb.push(" AND name ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.order_no_pat {
+            qb.push(" AND order_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.serial_no_pat {
+            qb.push(" AND serial_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(d) = f.request_date_from {
+            qb.push(" AND request_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.request_date_to {
+            qb.push(" AND request_date <= ").push_bind(d);
+        }
+        if let Some(d) = f.system_delivery_date_from {
+            qb.push(" AND system_delivery_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.system_delivery_date_to {
+            qb.push(" AND system_delivery_date <= ").push_bind(d);
+        }
+        if let Some(b) = f.order_no_is_null {
+            qb.push(if b {
+                " AND (order_no IS NULL OR order_no = '')"
+            } else {
+                " AND order_no IS NOT NULL AND order_no <> ''"
+            });
+        }
+        if let Some(b) = f.system_delivery_date_is_null {
+            qb.push(if b {
+                " AND system_delivery_date IS NULL"
+            } else {
+                " AND system_delivery_date IS NOT NULL"
+            });
+        }
         // 2026-09-28 新增：装配体子件过滤。`part_only=true` 时排除 `assembly_id
         // IS NOT NULL` 的子件行（这些是装配体的零件条目，前端 `GET /parts` 在
         // ALL/PART 模式下要隐藏）。ALL 模式走 service 层内存合并；本 repo 守卫
@@ -630,6 +706,48 @@ impl PartRepo {
         }
         if let Some(d) = f.planned_delivery_date_to {
             qb.push(" AND planned_delivery_date <= ").push_bind(d);
+        }
+        // 2026-09-30 新增：10 字段对齐 com::union_list 端点（4 文本 ILIKE +
+        // 4 日期窗口 + 2 IS NULL 三态），与 list_with_filters 同守卫；保证分
+        // 页 total 与 items 计数一致。所有 caller 传 None 时此块零 SQL 拼接，
+        // 不破坏旧行为。`order_no_is_null=true` 含空串语义对齐 PR-F 2026-08-11。
+        if let Some(p) = f.drawing_no_pat {
+            qb.push(" AND drawing_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.name_pat {
+            qb.push(" AND name ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.order_no_pat {
+            qb.push(" AND order_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.serial_no_pat {
+            qb.push(" AND serial_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(d) = f.request_date_from {
+            qb.push(" AND request_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.request_date_to {
+            qb.push(" AND request_date <= ").push_bind(d);
+        }
+        if let Some(d) = f.system_delivery_date_from {
+            qb.push(" AND system_delivery_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.system_delivery_date_to {
+            qb.push(" AND system_delivery_date <= ").push_bind(d);
+        }
+        if let Some(b) = f.order_no_is_null {
+            qb.push(if b {
+                " AND (order_no IS NULL OR order_no = '')"
+            } else {
+                " AND order_no IS NOT NULL AND order_no <> ''"
+            });
+        }
+        if let Some(b) = f.system_delivery_date_is_null {
+            qb.push(if b {
+                " AND system_delivery_date IS NULL"
+            } else {
+                " AND system_delivery_date IS NOT NULL"
+            });
         }
         // 2026-09-28 新增：装配体子件过滤。`part_only=true` 时排除 `assembly_id
         // IS NOT NULL` 的子件行（与 list_with_filters 同守卫；保证分页 total

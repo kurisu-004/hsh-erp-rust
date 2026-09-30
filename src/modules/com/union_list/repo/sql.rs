@@ -49,10 +49,24 @@
 //! | 10   | `i64`                 | offset         | 外层                              |
 //! | 11   | `Option<NaiveDate>`   | planned_delivery_date_from   | 2026-09-30 新增（part/asm 段 `>=`，外层 SQL 不引用）|
 //! | 12   | `Option<NaiveDate>`   | planned_delivery_date_to     | 2026-09-30 新增（part/asm 段 `<=`，外层 SQL 不引用）|
+//! | 13   | `Option<String>`      | drawing_no_pat  | 2026-09-30 新增（part/asm 段 `ILIKE`，外层 SQL 不引用）|
+//! | 14   | `Option<String>`      | name_pat        | 2026-09-30 新增（part/asm 段 `ILIKE`，外层 SQL 不引用）|
+//! | 15   | `Option<String>`      | order_no_pat    | 2026-09-30 新增（part/asm 段 `ILIKE`，外层 SQL 不引用）|
+//! | 16   | `Option<String>`      | serial_no_pat   | 2026-09-30 新增（part/asm 段 `ILIKE`，外层 SQL 不引用）|
+//! | 17   | `Option<NaiveDate>`   | request_date_from        | 2026-09-30 新增（part/asm 段 `>=`，外层 SQL 不引用）|
+//! | 18   | `Option<NaiveDate>`   | request_date_to          | 2026-09-30 新增（part/asm 段 `<=`，外层 SQL 不引用）|
+//! | 19   | `Option<NaiveDate>`   | system_delivery_date_from | 2026-09-30 新增（part/asm 段 `>=`，外层 SQL 不引用）|
+//! | 20   | `Option<NaiveDate>`   | system_delivery_date_to   | 2026-09-30 新增（part/asm 段 `<=`，外层 SQL 不引用）|
+//! | -    | (pre-gen string)      | order_no_is_null         | 2026-09-30 新增（条件拼字符串：true → `IS NULL OR =''`；false → `IS NOT NULL AND <>''`；None → 空串）|
+//! | -    | (pre-gen string)      | system_delivery_date_is_null | 2026-09-30 新增（同上：`IS [NOT] NULL` 片段）|
 //!
 //! 2026-09-30 修订：日期 from/to 用 `$11`/`$12` 占位共享给 part/asm 段（PG 允
 //! 许同 `$N` 在 SQL 文本内多处引用；外层 SQL 不消费这两个 placeholder，故不
 //! 影响 `$9`/`$10` 语义）。
+//!
+//! 2026-09-30 续订：新增 `$13..$20` 10 个绑定占位（4 ILIKE + 4 日期）+ 2 个
+//! 条件预生成字符串片段（2 IS NULL 三态）。`order_no` 含空串语义对齐 PR-F
+//! 2026-08-11（空串视为『未填』/NULL 同义）。
 //!
 //! ## 正确性论证
 //! 每段内部按各自 sort_key 取前 `pushdown_limit = offset + limit` 行；外层
@@ -108,14 +122,19 @@ impl UnionListRepo {
     /// `pushdown_limit` = `offset + limit`（service 层算好传入），保证每段取够
     /// 全局排序所需的行。
     ///
-    /// ## SQL 写法（2026-09-29 round-1 修复后；2026-09-30 增 date 过滤）
+    /// ## SQL 写法（2026-09-29 round-1 修复后；2026-09-30 增 date 过滤 + 10 字段）
     ///
-    /// 单一固定 SQL（`format!` 仅替换 `order_col` / `order_dir`，已白名单），
-    /// 配 12 次 `.bind()` 链；每 placeholder 在 SQL 文本内可多次引用，PG 接
-    /// 受同一 `$N` 多处出现，bind 次数与 placeholder 总数对应（12 个）。
+    /// 单一固定 SQL（`format!` 仅替换 `order_col` / `order_dir` / `order_no_is_null_sql` /
+    /// `system_delivery_date_is_null_sql`，已白名单），配 20 次 `.bind()` 链；
+    /// 每 placeholder 在 SQL 文本内可多次引用，PG 接受同一 `$N` 多处出现，
+    /// bind 次数与 placeholder 总数对应（20 个）。
     ///
     /// 2026-09-30 增 `planned_delivery_date_from/to: Option<NaiveDate>` 段内
     /// 过滤；两段（part_seg / asm_seg）共享 `$11`/`$12`，外层 SQL 不消费。
+    ///
+    /// 2026-09-30 续：新增 `$13..$20` 10 字段（4 文本 ILIKE + 4 日期窗口）
+    /// + 2 个 IS NULL 三态字符串片段（条件预生成 `""` / `" AND (...)"`），
+    ///   不增加占位（避免 `$N::bool` 多占位污染 plan cache）。
     #[allow(clippy::too_many_arguments)]
     pub async fn list_union_all_with_filters<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -134,6 +153,27 @@ impl UnionListRepo {
         // 2026-09-30 新增：日期窗口过滤（仅 part/asm 段内消费）。
         planned_delivery_date_from: Option<chrono::NaiveDate>,
         planned_delivery_date_to: Option<chrono::NaiveDate>,
+        // 2026-09-30 新增：4 文本 ILIKE pattern（已 `%x%` 预格式化；None
+        // → NULL，被 `($N::text IS NULL OR ...)` 短路）。
+        drawing_no_pat: Option<&str>,
+        name_pat: Option<&str>,
+        order_no_pat: Option<&str>,
+        serial_no_pat: Option<&str>,
+        // 2026-09-30 新增：4 日期窗口（None → NULL 短路）。
+        request_date_from: Option<chrono::NaiveDate>,
+        request_date_to: Option<chrono::NaiveDate>,
+        system_delivery_date_from: Option<chrono::NaiveDate>,
+        system_delivery_date_to: Option<chrono::NaiveDate>,
+        // 2026-09-30 新增：2 IS NULL 三态（条件拼字符串，不 bind）：
+        // - order_no_is_null=true  → " AND (order_no IS NULL OR order_no = '')"
+        // - order_no_is_null=false → " AND order_no IS NOT NULL AND order_no <> ''"
+        // - order_no_is_null=None  → ""（不参与过滤）
+        // - system_delivery_date_is_null=true  → " AND system_delivery_date IS NULL"
+        // - system_delivery_date_is_null=false → " AND system_delivery_date IS NOT NULL"
+        // - system_delivery_date_is_null=None  → ""
+        // 含空串语义对齐 PR-F 2026-08-11。
+        order_no_is_null: Option<bool>,
+        system_delivery_date_is_null: Option<bool>,
     ) -> Result<Vec<UnionListRow>, sqlx::Error> {
         let order_col = union_sort_col(sort_by);
         let order_dir = if sort_dir.eq_ignore_ascii_case("ASC") {
@@ -145,7 +185,20 @@ impl UnionListRepo {
         // 预格式化 keyword 为 ILIKE pattern；None → bind 为 NULL（被 `$6::text IS NULL` 短路）
         let keyword_pat: Option<String> = keyword.map(|k| format!("%{}%", k.trim()));
 
-        // 单一固定 SQL（`{order_col}` / `{order_dir}` 已白名单校验，无注入风险）：
+        // 2026-09-30 新增：2 IS NULL 三态条件拼字符串（不 bind，不增加 `$N`）。
+        let order_no_is_null_sql: &'static str = match order_no_is_null {
+            Some(true) => " AND (order_no IS NULL OR order_no = '')",
+            Some(false) => " AND order_no IS NOT NULL AND order_no <> ''",
+            None => "",
+        };
+        let system_delivery_date_is_null_sql: &'static str = match system_delivery_date_is_null {
+            Some(true) => " AND system_delivery_date IS NULL",
+            Some(false) => " AND system_delivery_date IS NOT NULL",
+            None => "",
+        };
+
+        // 单一固定 SQL（`{order_col}` / `{order_dir}` / `{order_no_is_null_sql}` /
+        // `{system_delivery_date_is_null_sql}` 已白名单校验，无注入风险）：
         // - part_seg / asm_seg 各自 WHERE；外层 UNION ALL + 排序 + 分页
         // - 段内共用 `$2` (customer_ids) / `$3` (status) / `$4` (statuses) /
         //   `$5` (is_urgent) / `$6` (keyword)；PG 允许同一 `$N` 多处引用
@@ -154,7 +207,8 @@ impl UnionListRepo {
         // - keyword 在两段都用 name / drawing_no / serial_no 三列 ILIKE OR
         //   （与 PartRepo / AssemblyRepo::list_with_filters 同形 —— review
         //   round-1 MODERATE-4 已统一三列匹配语义）
-        // - 2026-09-30 新增：`$11`/`$12` 日期窗口（part/asm 两段共享，外层不消费）
+        // - 2026-09-30 新增：`$11`/`$12` 日期窗口 + `$13..$20` 10 字段
+        //   （4 文本 ILIKE + 4 日期窗口）+ 2 个 IS NULL 三态字符串片段。
         let sql = format!(
             "WITH \
              part_seg AS ( \
@@ -187,6 +241,16 @@ impl UnionListRepo {
                  )) \
                  AND ($11::date IS NULL OR planned_delivery_date >= $11) \
                  AND ($12::date IS NULL OR planned_delivery_date <= $12) \
+                 AND ($13::text IS NULL OR drawing_no ILIKE $13) \
+                 AND ($14::text IS NULL OR name ILIKE $14) \
+                 AND ($15::text IS NULL OR order_no ILIKE $15) \
+                 AND ($16::text IS NULL OR serial_no ILIKE $16) \
+                 AND ($17::date IS NULL OR request_date >= $17) \
+                 AND ($18::date IS NULL OR request_date <= $18) \
+                 AND ($19::date IS NULL OR system_delivery_date >= $19) \
+                 AND ($20::date IS NULL OR system_delivery_date <= $20) \
+                 {order_no_is_null_sql} \
+                 {system_delivery_date_is_null_sql} \
                ORDER BY {order_col} {order_dir} NULLS LAST, id DESC \
                LIMIT $1 OFFSET 0 \
              ), \
@@ -209,6 +273,16 @@ impl UnionListRepo {
                  AND ($6::text IS NULL OR (drawing_no ILIKE $6 OR name ILIKE $6 OR serial_no ILIKE $6)) \
                  AND ($11::date IS NULL OR planned_delivery_date >= $11) \
                  AND ($12::date IS NULL OR planned_delivery_date <= $12) \
+                 AND ($13::text IS NULL OR drawing_no ILIKE $13) \
+                 AND ($14::text IS NULL OR name ILIKE $14) \
+                 AND ($15::text IS NULL OR order_no ILIKE $15) \
+                 AND ($16::text IS NULL OR serial_no ILIKE $16) \
+                 AND ($17::date IS NULL OR request_date >= $17) \
+                 AND ($18::date IS NULL OR request_date <= $18) \
+                 AND ($19::date IS NULL OR system_delivery_date >= $19) \
+                 AND ($20::date IS NULL OR system_delivery_date <= $20) \
+                 {order_no_is_null_sql} \
+                 {system_delivery_date_is_null_sql} \
                ORDER BY {order_col} {order_dir} NULLS LAST, id DESC \
                LIMIT $1 OFFSET 0 \
              ) \
@@ -231,8 +305,10 @@ impl UnionListRepo {
         // bind 顺序与 SQL 中 `$N` 编号一一对应；同一 `$N` 在 SQL 内多处引用
         // 只算一次 bind（PG 支持）。`sqlx 0.9` 的 `query` 仅 impl `SqlSafeStr`
         // for `&'static str`，动态 String 必须 `AssertSqlSafe(...)` 包一层
-        // —— 安全审计：此处 `format!` 仅替换 `order_col` / `order_dir`（两者
-        // 已在 `union_sort_col` / 上面 if-else 内白名单校验），零注入风险。
+        // —— 安全审计：此处 `format!` 仅替换 `order_col` / `order_dir` /
+        // `order_no_is_null_sql` / `system_delivery_date_is_null_sql`（前两
+        // 项已在 `union_sort_col` / 上面 if-else 内白名单校验；后两项是常量
+        // 字面量），零注入风险。
         let rows = sqlx::query(AssertSqlSafe(sql))
             .bind(pushdown_limit) // $1
             .bind(customer_ids) // $2
@@ -246,6 +322,14 @@ impl UnionListRepo {
             .bind(offset) // $10
             .bind(planned_delivery_date_from) // $11 (2026-09-30 新增)
             .bind(planned_delivery_date_to) // $12 (2026-09-30 新增)
+            .bind(drawing_no_pat) // $13 (2026-09-30 新增)
+            .bind(name_pat) // $14 (2026-09-30 新增)
+            .bind(order_no_pat) // $15 (2026-09-30 新增)
+            .bind(serial_no_pat) // $16 (2026-09-30 新增)
+            .bind(request_date_from) // $17 (2026-09-30 新增)
+            .bind(request_date_to) // $18 (2026-09-30 新增)
+            .bind(system_delivery_date_from) // $19 (2026-09-30 新增)
+            .bind(system_delivery_date_to) // $20 (2026-09-30 新增)
             .fetch_all(executor)
             .await?;
         rows.into_iter().map(row_to_union_list_row).collect()

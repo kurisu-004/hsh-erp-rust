@@ -380,6 +380,22 @@ pub struct AssemblyListFilters<'a> {
     // （DDL migrations/005:20-21），SQL `>=`/`<=` 直接生效。
     pub planned_delivery_date_from: Option<NaiveDate>,
     pub planned_delivery_date_to: Option<NaiveDate>,
+    // 2026-09-30 新增：10 字段对齐 com::union_list 端点（同 PartListFilters）。
+    // - 4 文本 ILIKE pattern（已 `%x%` 预格式化）：drawing_no_pat / name_pat /
+    //   order_no_pat / serial_no_pat。t_assembly.drawing_no / name NOT NULL；
+    //   t_assembly.serial_no / order_no nullable。
+    // - 4 日期窗口：request_date_from/to（NOT NULL）/ system_delivery_date_from/to（nullable）。
+    // - 2 IS NULL 三态：order_no_is_null（含空串语义）/ system_delivery_date_is_null。
+    pub drawing_no_pat: Option<&'a str>,
+    pub name_pat: Option<&'a str>,
+    pub order_no_pat: Option<&'a str>,
+    pub serial_no_pat: Option<&'a str>,
+    pub request_date_from: Option<NaiveDate>,
+    pub request_date_to: Option<NaiveDate>,
+    pub system_delivery_date_from: Option<NaiveDate>,
+    pub system_delivery_date_to: Option<NaiveDate>,
+    pub order_no_is_null: Option<bool>,
+    pub system_delivery_date_is_null: Option<bool>,
     pub sort_by: Option<&'a str>,
     pub sort_dir: Option<&'a str>,
     pub limit: i64,
@@ -447,6 +463,48 @@ impl AssemblyRepo {
         if let Some(d) = f.planned_delivery_date_to {
             qb.push(" AND planned_delivery_date <= ").push_bind(d);
         }
+        // 2026-09-30 新增：10 字段对齐 com::union_list 端点（4 文本 ILIKE +
+        // 4 日期窗口 + 2 IS NULL 三态）。所有 caller 传 None 时此块零 SQL 拼
+        // 接，不破坏旧行为。`order_no_is_null=true` 含空串语义对齐 PR-F
+        // 2026-08-11。
+        if let Some(p) = f.drawing_no_pat {
+            qb.push(" AND drawing_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.name_pat {
+            qb.push(" AND name ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.order_no_pat {
+            qb.push(" AND order_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.serial_no_pat {
+            qb.push(" AND serial_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(d) = f.request_date_from {
+            qb.push(" AND request_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.request_date_to {
+            qb.push(" AND request_date <= ").push_bind(d);
+        }
+        if let Some(d) = f.system_delivery_date_from {
+            qb.push(" AND system_delivery_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.system_delivery_date_to {
+            qb.push(" AND system_delivery_date <= ").push_bind(d);
+        }
+        if let Some(b) = f.order_no_is_null {
+            qb.push(if b {
+                " AND (order_no IS NULL OR order_no = '')"
+            } else {
+                " AND order_no IS NOT NULL AND order_no <> ''"
+            });
+        }
+        if let Some(b) = f.system_delivery_date_is_null {
+            qb.push(if b {
+                " AND system_delivery_date IS NULL"
+            } else {
+                " AND system_delivery_date IS NOT NULL"
+            });
+        }
         let col = assembly_sort_col(f.sort_by);
         let dir = if f
             .sort_dir
@@ -511,6 +569,49 @@ impl AssemblyRepo {
         }
         if let Some(d) = f.planned_delivery_date_to {
             qb.push(" AND planned_delivery_date <= ").push_bind(d);
+        }
+        // 2026-09-30 新增：10 字段对齐 com::union_list 端点（4 文本 ILIKE +
+        // 4 日期窗口 + 2 IS NULL 三态），与 list_with_filters 同守卫；保证分
+        // 页 total 与 items 计数一致。所有 caller 传 None 时此块零 SQL 拼
+        // 接，不破坏旧行为。`order_no_is_null=true` 含空串语义对齐 PR-F
+        // 2026-08-11。
+        if let Some(p) = f.drawing_no_pat {
+            qb.push(" AND drawing_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.name_pat {
+            qb.push(" AND name ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.order_no_pat {
+            qb.push(" AND order_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(p) = f.serial_no_pat {
+            qb.push(" AND serial_no ILIKE ").push_bind(p.to_string());
+        }
+        if let Some(d) = f.request_date_from {
+            qb.push(" AND request_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.request_date_to {
+            qb.push(" AND request_date <= ").push_bind(d);
+        }
+        if let Some(d) = f.system_delivery_date_from {
+            qb.push(" AND system_delivery_date >= ").push_bind(d);
+        }
+        if let Some(d) = f.system_delivery_date_to {
+            qb.push(" AND system_delivery_date <= ").push_bind(d);
+        }
+        if let Some(b) = f.order_no_is_null {
+            qb.push(if b {
+                " AND (order_no IS NULL OR order_no = '')"
+            } else {
+                " AND order_no IS NOT NULL AND order_no <> ''"
+            });
+        }
+        if let Some(b) = f.system_delivery_date_is_null {
+            qb.push(if b {
+                " AND system_delivery_date IS NULL"
+            } else {
+                " AND system_delivery_date IS NOT NULL"
+            });
         }
         let row: (i64,) = qb.build_query_as().fetch_one(executor).await?;
         Ok(row.0)

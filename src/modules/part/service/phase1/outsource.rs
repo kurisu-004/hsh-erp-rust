@@ -500,6 +500,18 @@ impl PartService {
             // 使用），固定 None 维持旧行为。
             planned_delivery_date_from: None,
             planned_delivery_date_to: None,
+            // 2026-09-30 新增：外协 endpoint 不暴露 10 字段（4 文本 + 4 日期
+            // + 2 IS NULL），固定 None 维持旧行为；com::union_list 专用。
+            drawing_no_pat: None,
+            name_pat: None,
+            order_no_pat: None,
+            serial_no_pat: None,
+            request_date_from: None,
+            request_date_to: None,
+            system_delivery_date_from: None,
+            system_delivery_date_to: None,
+            order_no_is_null: None,
+            system_delivery_date_is_null: None,
             // 2026-09-28 新增：内部 caller（外协在途）不过滤装配体子件（语义
             // 固定 OUTSOURCE 单件状态），与历史行为一致。
             part_only: false,
@@ -556,6 +568,18 @@ impl PartService {
             // 使用），固定 None 维持旧行为。
             planned_delivery_date_from: None,
             planned_delivery_date_to: None,
+            // 2026-09-30 新增：外协 endpoint 不暴露 10 字段（4 文本 + 4 日期
+            // + 2 IS NULL），固定 None 维持旧行为；com::union_list 专用。
+            drawing_no_pat: None,
+            name_pat: None,
+            order_no_pat: None,
+            serial_no_pat: None,
+            request_date_from: None,
+            request_date_to: None,
+            system_delivery_date_from: None,
+            system_delivery_date_to: None,
+            order_no_is_null: None,
+            system_delivery_date_is_null: None,
             // 2026-09-28 新增：内部 caller（外协可发）不过滤装配体子件（语义
             // 固定 PENDING+IN_PROCESS 单件状态），与历史行为一致。
             part_only: false,

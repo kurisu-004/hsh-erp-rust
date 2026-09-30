@@ -255,6 +255,18 @@ impl PartService {
             // 使用），固定 None 维持旧行为。
             planned_delivery_date_from: None,
             planned_delivery_date_to: None,
+            // 2026-09-30 新增：part 域 list 端点暂不暴露 10 字段（4 文本 +
+            // 4 日期 + 2 IS NULL），固定 None 维持旧行为；com::union_list 专用。
+            drawing_no_pat: None,
+            name_pat: None,
+            order_no_pat: None,
+            serial_no_pat: None,
+            request_date_from: None,
+            request_date_to: None,
+            system_delivery_date_from: None,
+            system_delivery_date_to: None,
+            order_no_is_null: None,
+            system_delivery_date_is_null: None,
             // 2026-09-28 新增：PART-only 模式强制打开装配体子件守卫
             part_only: true,
             sort_by: &sort_by,
