@@ -1131,15 +1131,33 @@ impl PartBatchRepo {
     ///
     /// 2026-09-16 PR-3 批次 step 化（migration 028）：
     /// - 删 `pb.placed_at`（t_part_batch 列已删）
-    /// - `pb.next_process_id` / `np.name` 改为派生
+    /// - `pb.next_process_id` / `np.name` 改为派生：`LEFT JOIN t_process_chain_step s
+    ///   ON s.id = pb.current_process_step_id` 后取 `s.process_id` / `t_process.name`
     /// - `pb.current_process_step_id` 新增
     ///
-    /// 2026-09-30 改直读 `pb.current_process_id`（migration 004）：
-    /// - `step_process_id` 不再取 `s.process_id`（step 中转），直接取
-    ///   `pb.current_process_id`；同时删掉 `LEFT JOIN t_process_chain_step s`
-    /// - `t_process np` 的 JOIN 条件由 `np.id = s.process_id` 改为
-    ///   `np.id = pb.current_process_id`
-    /// - 对外 DTO 字段名（`next_process_id` / `next_process_name`）不变
+    /// 2026-09-30（review 第 3 轮 M3）**回退**该查询到 step 派生，理由：
+    ///
+    /// 本函数服务的两个端点 —— `GET /parts/inspection-batches`（`statuses =
+    /// ['INSPECTION']`）与 `GET /parts/{id}/repair-batches` / `repairing-batches`
+    /// （`RepairBatchesOut` 是本行结构的类型别名）—— 都不是**工序池**端点，判据是
+    /// `status`，与 `current_process_id` 无关。
+    ///
+    /// 而 review 第 2 轮 H2 修复把「送检 = 出池 → `current_process_id = NULL`」
+    /// 落实后，**所有进 INSPECTION 的写点都把该列清成 NULL**
+    /// （`mark_batch_inspected` / `phase1::scan` / `outsource::receive_to_inspection` /
+    /// `repair::complete_repair` 的 INSPECTION 分支）。若本查询改直读 cpid，则
+    /// `next_process_id` / `next_process_name` 在 INSPECTION 列表里**恒为 null**
+    /// —— 用户可见回归，且 `tests/part/inspection_batches.rs` 原本不断言该字段，
+    /// 无人能发现。
+    ///
+    /// 处置：`current_process_id` 是**池归属权威列**，其读取方严格限定为 5 条池
+    /// SQL + rollup 派生；**展示类列表**继续从 `current_process_step_id`
+    /// （可选的显示用定位信息）派生，与本分支之前的字节级行为一致。
+    ///
+    /// 顺带删掉 `pb_current_process_id` 投影 —— 它在 2026-09-30 改直读时加进来，
+    /// 但行映射从未消费，属死列。
+    ///
+    /// 对外 DTO 字段名（`next_process_id` / `next_process_name`）始终不变。
     #[allow(clippy::too_many_arguments)]
     pub async fn list_batches_with_part<'e, E: PgExecutor<'e>>(
         executor: E,
@@ -1171,12 +1189,14 @@ impl PartBatchRepo {
                 pb.status          AS "pb_status!",
                 pb.location        AS "pb_location?",
                 pb.version         AS "pb_version!",
-                pb.current_process_id AS "pb_current_process_id?",
                 pb.current_process_step_id AS "pb_current_process_step_id?",
                 pb.parent_batch_id AS "pb_parent_batch_id?",
                 pb.current_holder_id AS "pb_current_holder_id?",
-                -- 2026-09-30 改直读 current_process_id（替代 step.process_id 中转）
-                pb.current_process_id AS "step_process_id?",
+                -- next_process_id 派生自 step.process_id（LEFT JOIN
+                -- t_process_chain_step）。**刻意不直读 pb.current_process_id**：
+                -- INSPECTION 批次按出池不变式该列恒为 NULL，直读会让本字段恒
+                -- null —— 详见本函数 doc 的 review 第 3 轮 M3 段。
+                s.process_id       AS "step_process_id?",
                 np.name            AS "np_name?",
                 pb.delivery_note_id AS "pb_delivery_note_id?",
                 dn.delivery_note_no AS "dn_no?",
@@ -1207,10 +1227,12 @@ impl PartBatchRepo {
               ON w.id = pb.current_holder_id
             LEFT JOIN t_outsource_company oc
               ON oc.id = pb.current_holder_id
-            -- 2026-09-30 改直读 current_process_id：t_process JOIN 直接挂新列，
-            -- 不再经 t_process_chain_step 中转
+            -- step JOIN 取 process_id：next_process_id / next_process_name 由此派生
+            -- （review 第 3 轮 M3 回退，理由见本函数 doc）
+            LEFT JOIN t_process_chain_step s
+              ON s.id = pb.current_process_step_id
             LEFT JOIN t_process np
-              ON np.id = pb.current_process_id
+              ON np.id = s.process_id
             LEFT JOIN t_delivery_note dn
               ON dn.id = pb.delivery_note_id
             WHERE pb.status = ANY($1)
@@ -1264,7 +1286,8 @@ impl PartBatchRepo {
                     parent_batch_id: r.pb_parent_batch_id,
                     current_holder_id: r.pb_current_holder_id,
                     holder_name: r.holder_name,
-                    // 2026-09-30 改直读 pb.current_process_id（替代 step 中转）
+                    // 派生自 step.process_id（LEFT JOIN t_process_chain_step，
+                    // review 第 3 轮 M3 恢复）；保留 DTO 字段名兼容前端
                     next_process_id: r.step_process_id,
                     next_process_name: r.np_name,
                     delivery_note_id: r.pb_delivery_note_id,

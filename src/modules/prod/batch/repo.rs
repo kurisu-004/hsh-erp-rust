@@ -188,8 +188,17 @@ impl BatchRepo {
     /// 要求批次先在池里，形成死状态。
     ///
     /// `current_process_step_id` 仍写 NULL 是**有意的**：本次不解析 step
-    /// （工单无工序链时本就解析不出）。该列已降级为**可选的进度指针**，
-    /// NULL 不影响入池；由 worker-scan RETURNED / INSPECTED 等后续流转写入。
+    /// （工单无工序链时本就解析不出）。该列已降级为**可选的显示用定位信息**，
+    /// NULL 不影响入池。
+    ///
+    /// ⚠️ **措辞订正（2026-09-30 review 第 3 轮附带发现）**：本函数原注释写
+    /// 「由 worker-scan RETURNED / INSPECTED 等后续流转写入」—— **这已不成立**。
+    /// `mark_batch_returned` 与 `mark_batch_inspected` 都不写 step
+    /// （见 `PartRepo::mark_batch_returned` doc「已知缺口」段），worker-scan
+    /// 两条分支都**不**推进该列。step 只在其它「首次定位工序」的写点被写入
+    /// （place_on_shelf / release_from_programming / outsource 收发 /
+    /// complete_repair / to_process），对多工序链工单它永远停在**首次定位**的
+    /// 那一步，故不可当「当前走到第几步」用。
     pub async fn update_batch_dispatched(
         conn: &mut PgConnection,
         batch_id: i64,
@@ -206,7 +215,7 @@ impl BatchRepo {
                 current_holder_id       = $3,
                 -- 2026-09-30 新增：池归属权威依据（见函数 doc）
                 current_process_id      = $5,
-                -- 进度指针：dispatch 路径不解析 step，有意置 NULL
+                -- 显示用定位信息：dispatch 路径不解析 step，有意置 NULL
                 current_process_step_id = NULL,
                 version                 = version + 1,
                 updated_at              = now(),

@@ -334,12 +334,18 @@ impl PartRepo {
     ///
     /// 关于 `current_process_step_id`：**本函数仍不写它**（沿用 2026-09-16 PR-3
     /// 行为）。原先的注释理由是「保留被打回的那一步，让 INSPECTION→to_process
-    /// 时不丢 step 上下文」—— 该理由在 step 降级为**可选进度指针**后已不成立：
+    /// 时不丢 step 上下文」—— 该理由在 step 降级为**可选的显示用定位信息**后已不成立：
     /// `mark_batch_failed_inspection`（检验不合格打回生产架）会按
     /// `chain_id + next_process_id` **重新解析** step_id 写入
-    /// （`inspection_core.rs::to_process`），所以上下文不会真的丢。现在保留 step
-    /// 的实际价值是「送检期间前端能显示批次走到工艺链第几步」，属**显示用进度
-    /// 信息**，不再是状态机依赖。
+    /// （`inspection_core.rs::to_process`），所以上下文不会真的丢。
+    ///
+    /// 现在保留 step 的实际价值：它是 `GET /parts/inspection-batches` 的
+    /// `next_process_id` / `next_process_name` 的**唯一数据来源**（step JOIN 派生），
+    /// 供送检期间前端显示批次**首次定位**在工艺链的哪一步。属**显示用信息**，
+    /// 不是状态机依赖。
+    /// ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现）：**不是**「当前走到第
+    /// 几步」—— 本列只在首次定位工序时写、之后一律不再推进（worker-scan
+    /// RETURNED / INSPECTED 都不写），对多工序链工单永远停在首次定位那一步。
     pub async fn mark_batch_inspected<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -357,8 +363,8 @@ impl PartRepo {
                 --   （不置 NULL 会让 INSPECTION 批次带着上一道工序 id 停留）
                 current_process_id = NULL,
                 -- 2026-09-16 PR-3：to_inspection 保留 current_process_step_id，
-                --   但其定位已降级为「可选的显示用进度指针」；to_process 会重新
-                --   解析 step 写入，故此处不写不丢状态机上下文
+                --   但其定位已降级为「可选的显示用定位信息」（首次定位后不再推进）；
+                --   to_process 会重新解析 step 写入，故此处不写不丢状态机上下文
                 version           = version + 1,
                 updated_at        = now(),
                 updated_by        = $4
@@ -385,7 +391,7 @@ impl PartRepo {
     ///
     /// 2026-09-30 新增 `current_process_id: Option<i64>`：检验不合格打回生产架
     /// = **进池**，故写入目标工序（池归属权威依据）；`current_process_step_id`
-    /// 仍是可选进度指针，允许 NULL。
+    /// 仍是可选的显示用定位信息（首次定位后不再推进），允许 NULL。
     pub async fn mark_batch_failed_inspection<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -505,12 +511,19 @@ impl PartRepo {
     ///
     /// ## 已知缺口（2026-09-30 记录，本轮不扩 scope）
     ///
-    /// `current_process_step_id`（可选进度指针，用于显示批次走到工艺链第几步）
-    /// **在 RETURNED 时不推进**：`worker_scan.rs:193-204` 已经把
-    /// `chain_id + next_pid` 解析成 `step_id_opt`，却传给一个被丢弃的形参。
+    /// `current_process_step_id`（可选的显示用定位信息）**在 RETURNED 时不推进**：
+    /// `worker_scan.rs:193-204` 已经把 `chain_id + next_pid` 解析成 `step_id_opt`，
+    /// 却传给一个被丢弃的形参。
     /// 影响面仅限显示：池归属已由 `current_process_id` 承担且本函数已正确写入。
     /// 待后续单独一轮处理（届时 `mark_batch_returned` 需要按调用方决定是否写
     /// step，语义与 `advance_to_process_id` 同形）。
+    ///
+    /// ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现）：本列**不是会随流转推进的
+    /// 「进度指针」**，它只在**首次定位**工序时被写入（dispatch 刻意写 NULL；其余
+    /// 由 place_on_shelf / release_from_programming / outsource 收发 /
+    /// complete_repair / to_process 写），**之后一律不再推进**。对多工序链工单它
+    /// 永远停在首次定位那一步。修这一缺口时应把它当「一次性定位 + 可选重定位」看，
+    /// 而不是「每流转一步就前进一步」。
     pub async fn mark_batch_returned<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
@@ -531,7 +544,7 @@ impl PartRepo {
                 --   用 COALESCE 而非直接 `= $5`，是因为直接赋值会在 move 路径
                 --   把 current_process_id 抹成 NULL（那会让归还的批次对所有池隐身）。
                 current_process_id      = COALESCE($5::bigint, current_process_id),
-                -- 2026-09-30：current_process_step_id 仍不写（可选显示用进度指针，
+                -- 2026-09-30：current_process_step_id 仍不写（可选的显示用定位信息，
                 --   RETURNED 不推进是已知缺口，见函数 doc「已知缺口」段）
                 version                 = version + 1,
                 updated_at              = now(),

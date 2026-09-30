@@ -19,9 +19,14 @@ use crate::shared::types::{serialize_i64, serialize_i64_opt};
 /// 2026-09-16 PR-3 批次 step 化（migration 028）：
 /// - 删 `placed_at`（t_part_batch 列已删，不再统计生产时间）
 /// - 新增 `current_process_step_id`：逻辑 FK → t_process_chain_step.id
-///   （批次当前所处的工艺链步骤；NULL = 批次尚未进入生产流或 part 无链）
+///   （批次**首次定位**的工艺链步骤；NULL = 批次尚未进入生产流或 part 无链）
 /// - `next_process_id` / `next_process_name` 字段保留，由 repo JOIN step 派生
 ///   （保持 DTO 兼容，不破坏前端）
+///
+/// 2026-09-30（review 第 3 轮 M3）：本 VO 的 `next_process_id` 保持**从
+/// `current_process_step_id` 经 step JOIN 派生**，不改直读新列
+/// `current_process_id`。后者是**池归属权威列**，只服务 5 条工序池 SQL + rollup；
+/// INSPECTION 批次按出池不变式该列恒为 NULL，直读会让本 VO 的工序字段恒 null。
 #[derive(Debug, Clone, Serialize)]
 pub struct InspectionBatchListItemOut {
     // ===== 批次字段 =====
@@ -42,12 +47,19 @@ pub struct InspectionBatchListItemOut {
     #[serde(serialize_with = "serialize_i64_opt")]
     pub current_holder_id: Option<i64>,
     pub holder_name: Option<String>,
-    /// 直读 `t_part_batch.current_process_id`（2026-09-30 改；原先经
-    /// `current_process_step_id` → step JOIN 派生）；保留字段名以兼容前端契约。
+    /// 由 `current_process_step_id` 经 `LEFT JOIN t_process_chain_step` 取
+    /// `s.process_id` 派生；保留字段名以兼容前端契约。
     ///
-    /// 2026-09-27 part 域前后端字段对齐：/parts 响应已对该字段加 `#[serde(skip)]`
-    /// 仅隐藏（DB 列保留、rollup 派生链路不变），inspection 域本字段**行为不变**
-    /// —— inspection 视图仍在用此值。仅标记以备后续清理窗口。
+    /// 2026-09-30 一度改直读 `t_part_batch.current_process_id`（migration 004），
+    /// **2026-09-30 review 第 3 轮 M3 已回退**。原因：送检 = 出池，该列被置 NULL，
+    /// 而本端点只查 `status='INSPECTION'` → 直读会让本字段**恒为 null**
+    /// （用户可见回归）。`current_process_step_id` 在送检期间被刻意保留
+    /// （`mark_batch_inspected` 不写它），正是「INSPECTION 期间显示批次走到
+    /// 工艺链第几步」这条产品需求的数据来源。
+    ///
+    /// 2026-09-27 part 域前后端字段对齐：`/parts` 响应已对该字段加
+    /// `#[serde(skip)]` 仅隐藏（DB 列保留、rollup 派生链路不变）。inspection /
+    /// repair 域**不做 skip**，字段照常序列化。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
     pub next_process_name: Option<String>,

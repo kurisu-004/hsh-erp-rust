@@ -796,7 +796,7 @@ mod tests {
         // 真正的池归属权威依据是 current_process_id，必须等于目标工序。
         assert!(
             r.succeeded[0].current_process_step_id.is_none(),
-            "dispatch 路径仍不解析 step，step 应为 None（可选进度指针）"
+            "dispatch 路径仍不解析 step，step 应为 None（可选的显示用定位信息）"
         );
         assert_eq!(
             r.succeeded[0].current_process_id,

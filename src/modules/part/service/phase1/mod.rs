@@ -269,9 +269,12 @@ async fn assert_shelf_maps_process(
 ///   写入不变式：进池（`status='IN_PROCESS'` + `location='PRODUCTION_SHELF'`）
 ///   写目标 `process_id`；出池（转 PENDING / INSPECTION / INSPECTION_SHELF）
 ///   传 `None`；池内移动不经过本函数，故无「不动」分支。
-/// - `new_current_process_step_id` —— **可选的进度指针**（逻辑 FK →
+/// - `new_current_process_step_id` —— **可选的显示用定位信息**（逻辑 FK →
 ///   t_process_chain_step.id），仅当工单已绑定工序链时才写，允许 NULL。
 ///   NULL 不影响入池（旧设计的死状态已由 `current_process_id` 打破）。
+///   ⚠️ 措辞（2026-09-30 review 第 3 轮附带发现）：该列**只在首次定位工序时写、
+///   之后不再推进**（worker-scan RETURNED / 送检都不写），故**不是**「当前走到
+///   第几步」的进度指针。
 ///
 /// 写入不变式第 4 行「非生产流 → NULL」的**唯一例外**（2026-09-30 review 第 1 轮
 /// M1 补记，勿按表机械核对后误判为 bug）：

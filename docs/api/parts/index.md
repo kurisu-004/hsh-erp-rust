@@ -161,8 +161,10 @@
 > `t_process_chain_step.process_id`」改为「min-progress 活跃 batch 的
 > **`current_process_id` 直读**」。同时 `t_part_batch` 新增
 > `current_process_id`（逻辑 FK → `t_process.id`），作为批次**工序池归属的唯一
-> 权威依据**；`current_process_step_id` 降级为可选的**进度指针**（仅当工单有
-> 工序链时才有值，允许 NULL）。
+> 权威依据**；`current_process_step_id` 降级为**可选的显示用定位信息**（仅当工单
+> 有工序链时才有值，允许 NULL；且**只在首次定位工序时写、之后不再推进**，
+> 不是「当前走到第几步」的进度指针 —— 见
+> [`inspection.md`](./inspection.md#inspectionbatchlistitemout-字段)）。
 > - 修掉隐患：原派生只看「最慢批次」的 step_id，而该值对无工序链工单恒为 NULL，
 >   会把整个工单的 `t_part.next_process_id` 抹成 NULL —— 该列是**删工序的保护
 >   条件之一**（`t_process` 软删前 `count_referencing` 的 5 个子查询之一），

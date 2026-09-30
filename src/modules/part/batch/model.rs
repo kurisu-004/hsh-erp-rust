@@ -24,11 +24,25 @@
 //! - `current_process_id`（逻辑 FK → `t_process.id`）是**判断批次是否属于某
 //!   工序池的唯一权威依据**：worker_pool 候选池 3 条 SQL + count 全部按本列
 //!   普通过滤（不再 JOIN `t_process_chain_step`）
-//! - `current_process_step_id` 相应**降级为可选的进度指针**：仅当工单已绑定
-//!   工序链时才写，允许 NULL
+//! - `current_process_step_id` 相应**降级为可选的显示用定位信息**：仅当工单已
+//!   绑定工序链时才写，允许 NULL；且**只在首次定位工序时写、之后不再推进**
+//!   （2026-09-30 review 第 3 轮订正措辞，详见 `TPartBatch` 字段 doc）
 //! - 目的：让**没有工序链的工单，其批次也能正常入池**（旧设计下 dispatch 写
 //!   `step=NULL` + 候选池 SQL INNER JOIN step → 批次对所有池查询隐身，形成
 //!   「要推进 step 先进池、要进池先有 step」的死状态）
+//!
+//! **读取方分工**（2026-09-30 review 第 3 轮 M3 确立，勿越界）：
+//!
+//! - `current_process_id` 的读取方严格限定为 **5 条工序池 SQL**（take_one /
+//!   take_specific / list_candidates / group_count / count_pool_by_shelf）
+//!   + `list_pickable_by_work_type` + rollup 派生 `t_part.next_process_id`。
+//! - **展示类列表**（inspection-batches / repair-batches / part 批次明细）
+//!   一律继续从 `current_process_step_id` → step JOIN 派生工序名。理由：
+//!   `INSPECTION` 批次按出池不变式 `current_process_id` 恒为 NULL，直读会让
+//!   这些端点的 `next_process_id` 恒 null（用户可见回归）。
+//!
+//! 5 条池 SQL 全部硬限定 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'`
+//! —— 这是「出池必须置 NULL」这条不变式的兜底，也是为什么残留脏值不会污染候选池。
 
 use chrono::{NaiveDate, NaiveDateTime};
 
@@ -52,21 +66,38 @@ pub struct TPartBatch {
     pub current_holder_id: Option<i64>,
     /// 逻辑 FK → `t_process.id`；**工序候选池归属的权威依据**。
     ///
-    /// 写入不变式（2026-09-30）：
+    /// 写入不变式（2026-09-30，2026-09-30 review 第 3 轮 M1 订正第 3 行）：
     /// - 进池（`status='IN_PROCESS'` + `location='PRODUCTION_SHELF'`）→ 目标 `process_id`
     /// - 出池（转 PENDING / INSPECTION / INSPECTION_SHELF）→ NULL
-    /// - 池内移动（worker→货架归还、move 端点）→ 不动
+    /// - **工序推进**（worker-scan RETURNED：工人在 P1 完工、传
+    ///   `next_process_id=P2`）→ 写 `Some(P2)`，批次落进**下一道**工序池。
+    ///   ⚠️ 这条**也是**「worker → 生产架归还」，但语义是**推进工序**而非池内
+    ///   移动，别与下一行混淆
+    /// - **池内移动**（`move` 端点 POOL↔WORKER / WORKER↔WORKER；
+    ///   `pick_up` 的 IN_PROCESS+PRODUCTION_SHELF 分支；`take_*_from_pool`
+    ///   派发）→ **不动**
     /// - 非生产流（初始批次、子批次）→ NULL
+    ///
+    /// 唯一显式例外：`send_to_outsource` 写 `Some(req.process_id)`
+    /// （`status='OUTSOURCE'` + `location='OUTSOURCE_COMPANY'`，池 SQL 硬限定
+    /// IN_PROCESS + PRODUCTION_SHELF 故不可能命中；rollup 派生需要）。
     ///
     /// NULL = 批次不在生产工序池中（PENDING / PROGRAMMING / OUTSOURCE /
     /// INSPECTION / OFFICE 等）。
     pub current_process_id: Option<i64>,
-    /// 逻辑 FK → `t_process_chain_step.id`；**可选的进度指针**。
+    /// 逻辑 FK → `t_process_chain_step.id`；**可选的显示用定位信息**。
+    ///
+    /// 2026-09-30 review 第 3 轮订正措辞：本列**不是会随流转推进的「进度指针」**
+    /// —— 它只在**首次定位**工序时被写入（dispatch 路径刻意写 NULL；其余由
+    /// `place_on_shelf` / `release_from_programming` / `send_to_outsource` /
+    /// `receive_from_outsource` / `complete_repair` / `to_process` 写），
+    /// 之后**不再推进**：worker-scan RETURNED、send_to_inspection、
+    /// `mark_batch_returned`、`mark_batch_inspected` 都不写它。对多工序链工单，
+    /// 它永远停在首次定位的那一步，故**不可**当「当前走到第几步」用。
     ///
     /// NULL = 批次尚未进入生产流（PENDING/PROGRAMMING/OUTSOURCE 起点）、
     /// 所属 part 无工艺链，或 step 已软删。允许 NULL 是本设计的核心：池归属
-    /// 判定已改由 `current_process_id` 承担，本列退化为「批次走到工艺链第几步」
-    /// 的可选进度信息。
+    /// 判定已改由 `current_process_id` 承担，本列退化为可选的显示用信息。
     /// 2026-09-16 PR-3 替代 `next_process_id`（已删）。
     pub current_process_step_id: Option<i64>,
     pub delivery_note_id: Option<i64>,
@@ -117,12 +148,15 @@ pub struct PartBatchScanRow {
 ///
 /// 2026-09-16 PR-3 批次 step 化：
 /// - 删 `placed_at`（t_part_batch 列已删）
-/// - `next_process_id` 改为派生
+/// - `next_process_id` 改为派生：`LEFT JOIN t_process_chain_step s
+///   ON s.id = pb.current_process_step_id` 后取 `s.process_id`，
+///   `next_process_name` 由 `t_process np ON np.id = s.process_id` 拼齐
 ///
-/// 2026-09-30 改直读 `pb.current_process_id`（migration 004）：`next_process_id`
-/// 不再经 `t_process_chain_step` 中转，直接取批次所属工序（权威列），
-/// `next_process_name` 的 `t_process` JOIN 改挂该列。字段名保留以兼容 DTO
-/// 与前端。
+/// 2026-09-30（migration 004）一度改直读 `pb.current_process_id`，**2026-09-30
+/// review 第 3 轮 M3 已回退**到 step 派生：INSPECTION 批次按出池不变式该列恒为
+/// NULL，直读会让 `next_process_id` / `next_process_name` 在
+/// `GET /parts/inspection-batches` 恒 null（用户可见回归）。字段名始终保留，
+/// 兼容 DTO 与前端。
 #[derive(Debug, Clone)]
 pub struct InspectionBatchListRow {
     // 批次
@@ -139,9 +173,10 @@ pub struct InspectionBatchListRow {
     // holder / process / delivery_note 解析
     pub current_holder_id: Option<i64>,
     pub holder_name: Option<String>,
-    /// 直读 `t_part_batch.current_process_id`（2026-09-30；原先经
-    /// `current_process_step_id` → step JOIN 派生）；保留字段名以兼容下游
-    /// DTO 与前端。
+    /// 派生自 `current_process_step_id`（LEFT JOIN `t_process_chain_step` 取
+    /// `s.process_id`）；保留字段名以兼容下游 DTO 与前端。
+    ///
+    /// **刻意不直读 `current_process_id`**：见本结构 doc 的 review 第 3 轮 M3 段。
     pub next_process_id: Option<i64>,
     pub next_process_name: Option<String>,
     pub delivery_note_id: Option<i64>,

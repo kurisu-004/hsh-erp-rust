@@ -189,14 +189,18 @@ impl PartService {
                 // 传给 `mark_batch_returned` 后**被丢弃** —— 该函数的
                 // `current_process_step_id` SET 子句在 2026-09-30 prod/pool move
                 // 重构中被移除（admin 主动退回不推进工序链），RETURNED 复用了同一
-                // 函数，于是进度指针在 RETURNED 时也不再推进。
+                // 函数，于是该显示用列在 RETURNED 时也不再更新。
                 //
                 // 本轮**刻意不修**（避免与 H1 的 `current_process_id` 改动混在一次
                 // 变更里扩大 review 面）：影响面仅限显示 —— 池归属已由
-                // `current_process_id` 承担且本次已正确写入；step 现在是「批次走到
-                // 工艺链第几步」的可选进度指针，不是状态机依赖。
-                // 后续单独一轮处理（届时 `mark_batch_returned` 需按调用方决定是否
-                // 写 step，语义与 `advance_to_process_id` 同形）。
+                // `current_process_id` 承担且本次已正确写入；step 现在是「批次
+                // **首次定位**在工艺链哪一步」的可选显示用信息，不是状态机依赖。
+                //
+                // ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现）：step **不是**
+                // 「会随流转推进的进度指针」—— 它只在首次定位工序时写、之后一律
+                // 不再推进（RETURNED / INSPECTED 都不写），对多工序链工单永远停在
+                // 首次定位那一步。后续单独一轮处理（届时 `mark_batch_returned` 需按
+                // 调用方决定是否写 step，语义与 `advance_to_process_id` 同形）。
                 let chain_id_opt: Option<i64> = sqlx::query_scalar(
                     "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
                 )
@@ -227,7 +231,7 @@ impl PartService {
                 // 已在上方通过 `t_shelf_process WHERE shelf_id=$1 AND process_id=$2`
                 // 校验（真实映射到该货架的 t_process.id），且 RETURNED 的业务语义就是
                 // 「这批要进 P2 池」。chain 被软删只导致解析不出 P2 对应的 step
-                // （**进度指针**写不了），不影响**池归属**该写成 P2 —— 若此时
+                // （**显示用定位信息**写不了），不影响**池归属**该写成 P2 —— 若此时
                 // fallback 旧值，恰好会把 H1 要修的 bug 换个条件复现。
                 let n = repo
                     .mark_batch_returned(

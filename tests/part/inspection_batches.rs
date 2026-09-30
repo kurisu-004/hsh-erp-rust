@@ -9,6 +9,9 @@
 //!      但不在 `INSPECTION_LIST_ROLES = [Manager, Inspector]` 内的角色；
 //!      `PartFixture::SHELF_ACCOUNT_USERNAME` + SHELF_ACCOUNT role 提供该登录态。
 //!   4. 分页：`limit + offset` 正确切分 total / items。
+//!   5. 回归（2026-09-30 review 第 3 轮 M3）：`next_process_id` / `next_process_name`
+//!      由 `current_process_step_id` → step JOIN 派生，**不直读** `current_process_id`
+//!      （送检=出池后后者恒 NULL，直读会让这两个字段恒 null）。
 //!
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -77,6 +80,107 @@ async fn insert_part_with_insp_batch(
     .await
     .expect("set batch holder to inspection shelf");
     (part_id, batch_id)
+}
+
+/// 造一条「真实送检后状态」的 INSPECTION 批次：**`current_process_step_id` 非空
+/// （首次定位的 step）、`current_process_id` 为 NULL**。
+///
+/// 后者正是 review 第 2 轮 H2 修复（送检 = 出池 → 置 NULL）之后所有 INSPECTION
+/// 批次的真实形态：5 个进 INSPECTION 的写点无一例外清该列。
+/// 返回 (part_id, batch_id, step 所属 process_id, process_name)。
+async fn insert_part_with_step_located_insp_batch(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    serial_no: &str,
+    insp_shelf_id: i64,
+    process_code: &str,
+    process_name: &str,
+) -> (i64, i64, i64, String) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+    let today = now.date();
+
+    // 1. 工序（逻辑 FK 目标；本测试不建 t_shelf_process 映射 —— 列表查询不需要）
+    let process_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
+    )
+    .bind(process_id)
+    .bind(process_code)
+    .bind(process_name)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_process");
+
+    // 2. 工艺链 + step（step 指向该工序）
+    let chain_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+         updated_at, updated_by) VALUES ($1, $2, 0, $3, 0, $3, 0)",
+    )
+    .bind(chain_id)
+    .bind(format!("chain-{process_code}"))
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_process_chain");
+    let step_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, $3, 30, 0, $4, 0, $4, 0)",
+    )
+    .bind(step_id)
+    .bind(chain_id)
+    .bind(process_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_process_chain_step");
+
+    // 3. INSPECTION part（绑上 chain，与真实数据一致）
+    let part_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at, process_chain_id) \
+         VALUES ($1, $2, $3, 'D-001', $4, 'INSPECTION', $3, $5, $5, 1, 0, $6, $6, $7)",
+    )
+    .bind(part_id)
+    .bind(serial_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .bind(chain_id)
+    .execute(pool)
+    .await
+    .expect("insert INSPECTION part with chain");
+
+    // 4. INSPECTION 批次：step 有值、cpid **显式置 NULL**（模拟 H2 修复后的真实形态）
+    let batch_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, current_process_id, current_process_step_id, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 1, 1, 'INSPECTION', 'INSPECTION_SHELF', $3, NULL, $4, 0, $5, $5)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(insp_shelf_id)
+    .bind(step_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert step-located INSPECTION batch");
+
+    (part_id, batch_id, process_id, process_name.to_string())
 }
 
 // ===========================================================================
@@ -487,6 +591,94 @@ async fn inspection_batches_pagination_limit_offset() {
     assert_eq!(status2, StatusCode::OK, "second page: body={body2}");
     let items2 = body2["data"]["items"].as_array().expect("data.items2");
     assert_eq!(items2.len(), 1, "offset=2, limit=2 应剩 1 条: body={body2}");
+}
+
+/// **回归测试（2026-09-30 review 第 3 轮 M3）**：`next_process_id` /
+/// `next_process_name` 必须由 `current_process_step_id` → step JOIN 派生，
+/// **不得**改直读 `current_process_id`。
+///
+/// 背景（本文件此前完全没有断言这两个字段，所以回归能溜过去）：
+/// - review 第 2 轮 H2 修复把「送检 = 出池 → `current_process_id = NULL`」落实后，
+///   **所有**进 INSPECTION 的写点都清该列（`mark_batch_inspected` /
+///   `phase1::scan` / `outsource::receive_to_inspection` / `repair::complete_repair`
+///   的 INSPECTION 分支）。
+/// - 而本端点只查 `status='INSPECTION'`。若 `list_batches_with_part` 改直读 cpid，
+///   `next_process_id` / `next_process_name` 就**恒为 null** —— 用户可见回归
+///   （前端 inspection 视图靠它显示「这批走到工艺链第几步」）。
+///
+/// 本测试用 `insert_part_with_step_located_insp_batch` 造出**真实送检后形态**
+/// （step 非空 + cpid 显式 NULL），断言端点仍能解析出工序 id 与名称。
+/// 若有人把查询改回直读 cpid，本测试必红。
+#[tokio::test]
+async fn inspection_batches_derives_next_process_from_step_not_cpid() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (_part_id, batch_id, process_id, process_name) = insert_part_with_step_located_insp_batch(
+        &pool,
+        "PART_STEP",
+        fx.customer_l2_id,
+        "P-STEP-001",
+        fx.inspection_shelf_id,
+        "PROC-STEP",
+        "打样工序",
+    )
+    .await;
+
+    // 前置断言：DB 层确实是「step 有值 + cpid 为 NULL」的真实送检形态
+    let (step_opt, cpid): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT current_process_step_id, current_process_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read batch process columns");
+    assert!(
+        step_opt.is_some(),
+        "前置条件：current_process_step_id 应非空（送检时保留），实际 {step_opt:?}"
+    );
+    assert_eq!(
+        cpid, None,
+        "前置条件：current_process_id 应为 NULL（送检 = 出池），实际 {cpid:?}；\
+         若本断言失败说明 H2 修复被回退，测试前提已变"
+    );
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "GET",
+            "/parts/inspection-batches?limit=50",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "list: body={body}");
+    assert_eq!(body["code"], 0);
+
+    let items = body["data"]["items"].as_array().expect("data.items");
+    let batch_id_str = batch_id.to_string();
+    let process_id_str = process_id.to_string();
+    let hit = items
+        .iter()
+        .find(|i| i["batch_id"] == batch_id_str)
+        .unwrap_or_else(|| panic!("items 应含 batch_id={batch_id}: body={body}"));
+
+    assert_eq!(
+        hit["next_process_id"], process_id_str,
+        "next_process_id 必须由 current_process_step_id → step JOIN 派生为该 step 的 \
+         process_id（{process_id}）。实际 {:?} —— 若为 null 说明查询被改成直读 \
+         current_process_id，而送检=出池已把该列置 NULL（review M3 回归）",
+        hit["next_process_id"]
+    );
+    assert_eq!(
+        hit["next_process_name"].as_str(),
+        Some(process_name.as_str()),
+        "next_process_name 应由同一条 step JOIN 链解析出 {process_name}: body={body}"
+    );
+    assert_eq!(
+        hit["current_process_step_id"],
+        step_opt.unwrap().to_string(),
+        "current_process_step_id 原样透出（它是 next_process_id 的派生源）: body={body}"
+    );
 }
 
 // ===========================================================================

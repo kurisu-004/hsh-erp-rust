@@ -166,7 +166,11 @@ Request：`MoveRequest`
 >
 > 注意：RETURNED **仍不推进** `current_process_step_id`（该列的 step SET 子句在
 > 2026-09-30 prod/pool move 重构中被移除，RETURNED 复用了同一函数）。这是**已知缺口**，
-> 影响面仅限显示（进度指针不更新），池归属不受影响。后续单独一轮处理。
+> 影响面仅限显示（`current_process_step_id` 不更新），池归属不受影响。后续单独一轮处理。
+>
+> ⚠️ 措辞（2026-09-30 review 第 3 轮附带发现）：`current_process_step_id` **不是**
+> 「会随流转推进的进度指针」—— 它只在**首次定位**工序时写、之后一律不再推进
+> （worker-scan 两条分支都不写），对多工序链工单永远停在首次定位那一步。
 
 
 #### `to` 校验

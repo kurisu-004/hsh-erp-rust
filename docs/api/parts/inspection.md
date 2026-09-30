@@ -116,9 +116,13 @@ Request：`ToInspectionRequest`
   的列定义「NULL 表示批次不在生产工序池中」矛盾。
   - 不会造成池污染：4 条工序池 SQL 与 `list_pickable_by_work_type` 均硬限定
     `status='IN_PROCESS'` + `location='PRODUCTION_SHELF'`。
-  - `current_process_step_id` **仍保留**（`INSPECTION` 期间前端用它显示批次走到工艺链
-    第几步）。它已是**可选的显示用进度指针**，不再是状态机依赖 —— 检验不合格打回
-    （`to-process`）会按 `chain_id + next_process_id` 重新解析并写入，不会真的丢上下文。
+  - `current_process_step_id` **仍保留**，它是 `next_process_id` 的唯一数据来源
+    （`LEFT JOIN t_process_chain_step` 派生），供 `INSPECTION` 期间前端显示批次
+    **首次定位**在工艺链的哪一步。它**不是会随流转推进的「进度指针」** ——
+    送检（以及 worker-scan RETURNED / `send_to_inspection` 等）都不写它，
+    对多工序链工单它永远停在首次定位的那一步。
+    它也不再是状态机依赖：检验不合格打回（`to-process`）会按
+    `chain_id + next_process_id` **重新解析** step_id 写入，不会真的丢上下文。
 - 事件日志：`event_type='INSPECTED'`
 
 WS 广播（commit 后下发）：
@@ -334,7 +338,7 @@ Request：`WorkerScanRequest`
   - **2026-09-30（review H1 修复）：写 `current_process_id = next_process_id`** ——
     RETURNED 是全仓唯一的**工序推进**路径，批次归还货架后落进**下一道工序**的候选池。
     此前该列不写，批次带着旧工序 id 落回**原工序**池（权威列在主干流程上说谎）。
-    另：RETURNED 仍**不推进** `current_process_step_id`（可选的显示用进度指针），
+    另：RETURNED 仍**不更新** `current_process_step_id`（可选的显示用定位信息），
     这是已知缺口，影响仅限显示，池归属不受影响。
   - 写 `RETURNED_TO_SHELF` 事件日志
 - **INSPECTED**：worker 把持有件直接送检
@@ -512,10 +516,23 @@ Response 200 `data`：`InspectionBatchListOut`
 > 新增 `current_process_step_id`（逻辑 FK → 工艺链步骤）。
 >
 > **2026-09-30（migration 004）**：`t_part_batch` 新增 `current_process_id`
-> （逻辑 FK → `t_process.id`），作为批次工序池归属的权威依据；本端点的
-> `next_process_id` / `next_process_name` 改直读该列（原先经
-> `LEFT JOIN t_process_chain_step` 中转，新下发批次会显示 `null` 工序）。
-> `current_process_step_id` 降级为可选的进度指针，**本 DTO 字段名不变**。
+> （逻辑 FK → `t_process.id`），作为批次**工序池归属的权威依据**。
+> `current_process_step_id` 相应降级为**可选的显示用定位信息**
+> （**只在首次定位工序时写、之后不再推进**）。
+>
+> **2026-09-30 review 第 3 轮 M3 —— 本 DTO 的工序字段仍走 step 派生，未改直读**
+> 一度把 `next_process_id` / `next_process_name` 改直读 `current_process_id`，
+> 但送检 = 出池、该列对 `INSPECTION` 批次**恒为 NULL**，而本端点只查
+> `status='INSPECTION'` → 改直读会让这两个字段**恒 null**（用户可见回归，且原有
+> 集成测试不断言该字段，无人发现）。已回退到 `current_process_step_id` →
+> step JOIN 派生。
+>
+> **读取方分工（勿越界）**：`current_process_id` 只服务 5 条工序池 SQL
+> （`/prod/pool/{process_id}` / `/prod/pool/counts` / `take_one_from_pool` /
+> `take_specific_from_pool` / `count_pool_by_shelf_and_process`）+
+> `list_pickable_by_work_type` + rollup 派生 `t_part.next_process_id`；
+> **展示类列表（本端点 / repair-batches / part 批次明细 / dashboard）一律继续走
+> step 派生**。两个 DTO 字段名（`next_process_id` / `next_process_name`）始终不变。
 >
 > 2026-09-16 PR-2（migration 027）：`InspectionBatchListItemOut` 删 `has_been_repaired`
 > 字段 —— `t_part_batch.has_been_repaired` 列已删；返修事实由
@@ -528,8 +545,8 @@ holder 解析段（LEFT JOIN `t_worker` / `t_shelf` 一次拼齐）：
 |---|---|---|
 | `current_holder_id` | string (i64)? | 当前持有人 id（worker.id 或 shelf.id） |
 | `holder_name` | string? | 当前持有人名称（worker 真名 / 货架 code / null） |
-| `next_process_id` | string (i64)? | 下一道工序 id（对应 `t_process`）。**2026-09-30 改直读 `t_part_batch.current_process_id`**（migration 004，工序池归属权威列），不再经 `LEFT JOIN t_process_chain_step` 中转 |
-| `next_process_name` | string? | 下一道工序名称（`t_process.name`，`LEFT JOIN ON t_process.id = t_part_batch.current_process_id` 拼齐） |
+| `next_process_id` | string (i64)? | 下一道工序 id（对应 `t_process`）。由 `current_process_step_id` 经 `LEFT JOIN t_process_chain_step` 取 `s.process_id` 派生（**不直读 `current_process_id`**，理由见上方 review M3 段） |
+| `next_process_name` | string? | 下一道工序名称（`t_process.name`，`LEFT JOIN t_process np ON np.id = s.process_id` 拼齐） |
 
 delivery_note 解析段（LEFT JOIN `t_delivery_note` 一次拼齐）：
 

@@ -12,6 +12,8 @@
 //!   9. OCC 40901 VERSION_CONFLICT（双事务并发，A 持有 tx 占用 batch 行，B 调 dispatch 应 40901）
 //!  10. 角色守卫：Inspector 调 dispatch → 40300 FORBIDDEN
 //!  11. GET pending：unauth → 40100
+//!  12. 回归（2026-09-30 review 第 3 轮 L5）：**无工序链工单** dispatch 后出现在
+//!      `GET /prod/pool/{process_id}` + `/prod/pool/counts`（用户报告的原始 bug）
 //!
 //! 2026-09-30 重构：
 //! - dispatch 统一 bulk-only（targets 数组）；响应 `DispatchResult { succeeded, failed }`
@@ -771,4 +773,150 @@ async fn list_pending_unauth_returns_401() {
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "未登录应 401: {env}");
     assert_eq!(env["code"], 40100, "UNAUTHORIZED: {env}");
+}
+
+/// 场景 12（2026-09-30 review 第 3 轮 L5）**旗舰场景端到端回归**：
+/// **无工序链工单**的批次 dispatch 到某工序后，必须出现在该工序的候选池里
+/// （`GET /prod/pool/{process_id}` 的 items + `GET /prod/pool/counts` 的 count）。
+///
+/// 这就是用户报告的原始 bug（「拖批次下发到工序后，工序池不显示该批次」），
+/// 也是本次改动的核心目标：**让没有工序链的工单，其批次也能正常入池**。
+///
+/// 旧设计下之所以入不了池：dispatch 写 `current_process_step_id = NULL`（无 chain
+/// 解析不出 step），而 3 条候选池 SQL 全部 `INNER JOIN t_process_chain_step
+/// ON s.id = pb.current_process_step_id` → `s.id = NULL` 匹配不到任何行 → 批次对
+/// 所有池查询隐身。
+///
+/// 修复后 dispatch 写 `current_process_id = target_process_id`，池 SQL 改为按该列
+/// 普通过滤。**回退 `update_batch_dispatched` 的 `current_process_id = $5` 即会让本
+/// 测试必红** —— 此前 `prod/batch/service.rs` 只在单测里断言该列、worker_pool 的
+/// helper 又都建了 chain + step，没有任何端到端测试覆盖这个组合。
+#[tokio::test]
+async fn dispatch_part_without_process_chain_appears_in_pool() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let process_a = fx.process_a_id;
+
+    let customer_id = insert_customer_l2(&pool, "ACME-NOCHAIN").await;
+    let part_id = insert_part(&pool, customer_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+    let _shelf_id = insert_shelf_process_mapping(&pool, process_a).await;
+
+    // 前置断言：本场景的关键前提是「工单没有工序链」
+    let chain_id: Option<i64> =
+        sqlx::query_scalar("SELECT process_chain_id FROM t_part WHERE id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read t_part.process_chain_id");
+    assert_eq!(
+        chain_id, None,
+        "前置条件：part 应**无工序链**（process_chain_id IS NULL），\
+         否则本测试退化成有链场景、验不到本分支要支持的那条路径"
+    );
+
+    // 1. dispatch 到 process_a
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/batches/dispatch",
+            Some(json!({
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }]
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "dispatch: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["succeeded"].as_array().unwrap().len(),
+        1,
+        "dispatch 应成功: {env}"
+    );
+    // 响应体也回显池归属权威列
+    assert_eq!(
+        env["data"]["succeeded"][0]["current_process_id"],
+        process_a.to_string(),
+        "DispatchSuccessItem.current_process_id 应 = target_process_id: {env}"
+    );
+    // step 仍为 null（无链解析不出）—— 刻意如此，且不影响入池
+    assert_eq!(
+        env["data"]["succeeded"][0]["current_process_step_id"],
+        serde_json::Value::Null,
+        "无工序链时 step 应为 null（可选显示用定位信息，不影响入池）: {env}"
+    );
+
+    // 2. DB 层：IN_PROCESS + PRODUCTION_SHELF + holder=shelf + cpid=目标工序
+    let (status, location, holder, cpid, step): (
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT status, location, current_holder_id, current_process_id, \
+         current_process_step_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(batch_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read dispatched batch");
+    assert_eq!(status, "IN_PROCESS", "dispatched batch 应 IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
+    assert_eq!(holder, Some(_shelf_id), "holder 应为解析出的货架");
+    assert_eq!(
+        cpid,
+        Some(process_a),
+        "current_process_id 应 = target_process_id（入池权威依据）"
+    );
+    assert_eq!(step, None, "无工序链 → step 恒 NULL");
+
+    // 3. 端点层：批次出现在目标工序池（这是用户报告症状的正脸）
+    let (ps, pool_env) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/prod/pool/{process_a}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(ps, StatusCode::OK, "GET pool/{process_a}: {pool_env}");
+    let items = pool_env["data"]["items"].as_array().expect("data.items");
+    let batch_id_str = batch_id.to_string();
+    assert!(
+        items.iter().any(|i| i["batch_id"] == batch_id_str),
+        "无工序链工单的批次下发后应出现在工序 {process_a} 候选池: {pool_env}"
+    );
+
+    // 4. 计数端点同样应计入（前端 tab 徽标）
+    let (cs, counts_env) = send(
+        app,
+        json_request("GET", "/prod/pool/counts", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "GET pool/counts: {counts_env}");
+    let counts = counts_env["data"]["counts"]
+        .as_array()
+        .expect("data.counts");
+    let process_a_str = process_a.to_string();
+    let hit = counts
+        .iter()
+        .find(|c| c["process_id"] == process_a_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "counts 应含 process_id={process_a}（否则 tab 徽标为 0，\
+                 与用户报告的症状一致）: {counts_env}"
+            )
+        });
+    let count: i64 = hit["count"].as_i64().expect("count 应为 JSON integer");
+    assert!(
+        count >= 1,
+        "process {process_a} 的候选批次数应 ≥ 1，实际 {count}: {counts_env}"
+    );
 }

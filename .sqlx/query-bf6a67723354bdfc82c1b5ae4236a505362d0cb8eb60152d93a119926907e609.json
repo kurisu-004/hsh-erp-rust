@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                pb.id              AS \"pb_id!\",\n                pb.part_id         AS \"pb_part_id!\",\n                pb.batch_no        AS \"pb_batch_no!\",\n                pb.quantity        AS \"pb_quantity!\",\n                pb.status          AS \"pb_status!\",\n                pb.location        AS \"pb_location?\",\n                pb.version         AS \"pb_version!\",\n                pb.current_process_id AS \"pb_current_process_id?\",\n                pb.current_process_step_id AS \"pb_current_process_step_id?\",\n                pb.parent_batch_id AS \"pb_parent_batch_id?\",\n                pb.current_holder_id AS \"pb_current_holder_id?\",\n                -- 2026-09-30 改直读 current_process_id（替代 step.process_id 中转）\n                pb.current_process_id AS \"step_process_id?\",\n                np.name            AS \"np_name?\",\n                pb.delivery_note_id AS \"pb_delivery_note_id?\",\n                dn.delivery_note_no AS \"dn_no?\",\n                p.serial_no        AS \"p_serial_no?\",\n                p.drawing_no       AS \"p_drawing_no!\",\n                p.name             AS \"p_name!\",\n                p.order_no         AS \"p_order_no?\",\n                p.planned_delivery_date AS \"p_planned_delivery_date!\",\n                p.is_urgent        AS \"p_is_urgent!\",\n                p.version          AS \"p_version!\",\n                p.created_at       AS \"p_created_at!\",\n                p.updated_at       AS \"p_updated_at!\",\n                p.customer_id      AS \"p_customer_id!\",\n                c.name             AS \"c_name?\",\n                c.parent_id        AS \"c_parent_id?\",\n                pc.name            AS \"pc_name?\",\n                COALESCE(sh.name, w.name, oc.name) AS \"holder_name?\"\n            FROM t_part_batch pb\n            JOIN t_part p\n              ON p.id = pb.part_id\n            JOIN t_customer c\n              ON c.id = p.customer_id\n            LEFT JOIN t_customer pc\n              ON pc.id = c.parent_id\n            LEFT JOIN t_shelf sh\n              ON sh.id = pb.current_holder_id\n            LEFT JOIN t_worker w\n              ON w.id = pb.current_holder_id\n            LEFT JOIN t_outsource_company oc\n              ON oc.id = pb.current_holder_id\n            -- 2026-09-30 改直读 current_process_id：t_process JOIN 直接挂新列，\n            -- 不再经 t_process_chain_step 中转\n            LEFT JOIN t_process np\n              ON np.id = pb.current_process_id\n            LEFT JOIN t_delivery_note dn\n              ON dn.id = pb.delivery_note_id\n            WHERE pb.status = ANY($1)\n              AND pb.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n              -- customer_id 是可选过滤项：空数组 → 命中全部客户；\n              -- 非空 → 限定到展开后的 L1+L2 ids。\n              AND (cardinality($2::bigint[]) = 0 OR p.customer_id = ANY($2))\n              AND ($3::text IS NULL\n                   OR p.drawing_no ILIKE $3\n                   OR p.name       ILIKE $3\n                   OR p.serial_no  ILIKE $3\n                   OR p.order_no   ILIKE $3)\n              AND ($4::text IS NULL OR p.serial_no ILIKE $4)\n              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)\n              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)\n            ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, pb.id ASC\n            LIMIT $7 OFFSET $8\n            ",
+  "query": "\n            SELECT\n                pb.id              AS \"pb_id!\",\n                pb.part_id         AS \"pb_part_id!\",\n                pb.batch_no        AS \"pb_batch_no!\",\n                pb.quantity        AS \"pb_quantity!\",\n                pb.status          AS \"pb_status!\",\n                pb.location        AS \"pb_location?\",\n                pb.version         AS \"pb_version!\",\n                pb.current_process_step_id AS \"pb_current_process_step_id?\",\n                pb.parent_batch_id AS \"pb_parent_batch_id?\",\n                pb.current_holder_id AS \"pb_current_holder_id?\",\n                -- next_process_id 派生自 step.process_id（LEFT JOIN\n                -- t_process_chain_step）。**刻意不直读 pb.current_process_id**：\n                -- INSPECTION 批次按出池不变式该列恒为 NULL，直读会让本字段恒\n                -- null —— 详见本函数 doc 的 review 第 3 轮 M3 段。\n                s.process_id       AS \"step_process_id?\",\n                np.name            AS \"np_name?\",\n                pb.delivery_note_id AS \"pb_delivery_note_id?\",\n                dn.delivery_note_no AS \"dn_no?\",\n                p.serial_no        AS \"p_serial_no?\",\n                p.drawing_no       AS \"p_drawing_no!\",\n                p.name             AS \"p_name!\",\n                p.order_no         AS \"p_order_no?\",\n                p.planned_delivery_date AS \"p_planned_delivery_date!\",\n                p.is_urgent        AS \"p_is_urgent!\",\n                p.version          AS \"p_version!\",\n                p.created_at       AS \"p_created_at!\",\n                p.updated_at       AS \"p_updated_at!\",\n                p.customer_id      AS \"p_customer_id!\",\n                c.name             AS \"c_name?\",\n                c.parent_id        AS \"c_parent_id?\",\n                pc.name            AS \"pc_name?\",\n                COALESCE(sh.name, w.name, oc.name) AS \"holder_name?\"\n            FROM t_part_batch pb\n            JOIN t_part p\n              ON p.id = pb.part_id\n            JOIN t_customer c\n              ON c.id = p.customer_id\n            LEFT JOIN t_customer pc\n              ON pc.id = c.parent_id\n            LEFT JOIN t_shelf sh\n              ON sh.id = pb.current_holder_id\n            LEFT JOIN t_worker w\n              ON w.id = pb.current_holder_id\n            LEFT JOIN t_outsource_company oc\n              ON oc.id = pb.current_holder_id\n            -- step JOIN 取 process_id：next_process_id / next_process_name 由此派生\n            -- （review 第 3 轮 M3 回退，理由见本函数 doc）\n            LEFT JOIN t_process_chain_step s\n              ON s.id = pb.current_process_step_id\n            LEFT JOIN t_process np\n              ON np.id = s.process_id\n            LEFT JOIN t_delivery_note dn\n              ON dn.id = pb.delivery_note_id\n            WHERE pb.status = ANY($1)\n              AND pb.deleted_at IS NULL\n              AND p.deleted_at IS NULL\n              -- customer_id 是可选过滤项：空数组 → 命中全部客户；\n              -- 非空 → 限定到展开后的 L1+L2 ids。\n              AND (cardinality($2::bigint[]) = 0 OR p.customer_id = ANY($2))\n              AND ($3::text IS NULL\n                   OR p.drawing_no ILIKE $3\n                   OR p.name       ILIKE $3\n                   OR p.serial_no  ILIKE $3\n                   OR p.order_no   ILIKE $3)\n              AND ($4::text IS NULL OR p.serial_no ILIKE $4)\n              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)\n              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)\n            ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, pb.id ASC\n            LIMIT $7 OFFSET $8\n            ",
   "describe": {
     "columns": [
       {
@@ -82,17 +82,6 @@
       },
       {
         "ordinal": 7,
-        "name": "pb_current_process_id?",
-        "type_info": "Int8",
-        "origin": {
-          "Table": {
-            "table": "t_part_batch",
-            "name": "current_process_id"
-          }
-        }
-      },
-      {
-        "ordinal": 8,
         "name": "pb_current_process_step_id?",
         "type_info": "Int8",
         "origin": {
@@ -103,7 +92,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 8,
         "name": "pb_parent_batch_id?",
         "type_info": "Int8",
         "origin": {
@@ -114,7 +103,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "pb_current_holder_id?",
         "type_info": "Int8",
         "origin": {
@@ -125,18 +114,18 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "step_process_id?",
         "type_info": "Int8",
         "origin": {
           "Table": {
-            "table": "t_part_batch",
-            "name": "current_process_id"
+            "table": "t_process_chain_step",
+            "name": "process_id"
           }
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 11,
         "name": "np_name?",
         "type_info": "Varchar",
         "origin": {
@@ -147,7 +136,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 12,
         "name": "pb_delivery_note_id?",
         "type_info": "Int8",
         "origin": {
@@ -158,7 +147,7 @@
         }
       },
       {
-        "ordinal": 14,
+        "ordinal": 13,
         "name": "dn_no?",
         "type_info": "Varchar",
         "origin": {
@@ -169,7 +158,7 @@
         }
       },
       {
-        "ordinal": 15,
+        "ordinal": 14,
         "name": "p_serial_no?",
         "type_info": "Varchar",
         "origin": {
@@ -180,7 +169,7 @@
         }
       },
       {
-        "ordinal": 16,
+        "ordinal": 15,
         "name": "p_drawing_no!",
         "type_info": "Varchar",
         "origin": {
@@ -191,7 +180,7 @@
         }
       },
       {
-        "ordinal": 17,
+        "ordinal": 16,
         "name": "p_name!",
         "type_info": "Varchar",
         "origin": {
@@ -202,7 +191,7 @@
         }
       },
       {
-        "ordinal": 18,
+        "ordinal": 17,
         "name": "p_order_no?",
         "type_info": "Varchar",
         "origin": {
@@ -213,7 +202,7 @@
         }
       },
       {
-        "ordinal": 19,
+        "ordinal": 18,
         "name": "p_planned_delivery_date!",
         "type_info": "Date",
         "origin": {
@@ -224,7 +213,7 @@
         }
       },
       {
-        "ordinal": 20,
+        "ordinal": 19,
         "name": "p_is_urgent!",
         "type_info": "Bool",
         "origin": {
@@ -235,7 +224,7 @@
         }
       },
       {
-        "ordinal": 21,
+        "ordinal": 20,
         "name": "p_version!",
         "type_info": "Int4",
         "origin": {
@@ -246,7 +235,7 @@
         }
       },
       {
-        "ordinal": 22,
+        "ordinal": 21,
         "name": "p_created_at!",
         "type_info": "Timestamp",
         "origin": {
@@ -257,7 +246,7 @@
         }
       },
       {
-        "ordinal": 23,
+        "ordinal": 22,
         "name": "p_updated_at!",
         "type_info": "Timestamp",
         "origin": {
@@ -268,7 +257,7 @@
         }
       },
       {
-        "ordinal": 24,
+        "ordinal": 23,
         "name": "p_customer_id!",
         "type_info": "Int8",
         "origin": {
@@ -279,7 +268,7 @@
         }
       },
       {
-        "ordinal": 25,
+        "ordinal": 24,
         "name": "c_name?",
         "type_info": "Varchar",
         "origin": {
@@ -290,7 +279,7 @@
         }
       },
       {
-        "ordinal": 26,
+        "ordinal": 25,
         "name": "c_parent_id?",
         "type_info": "Int8",
         "origin": {
@@ -301,7 +290,7 @@
         }
       },
       {
-        "ordinal": 27,
+        "ordinal": 26,
         "name": "pc_name?",
         "type_info": "Varchar",
         "origin": {
@@ -312,7 +301,7 @@
         }
       },
       {
-        "ordinal": 28,
+        "ordinal": 27,
         "name": "holder_name?",
         "type_info": "Varchar",
         "origin": "Expression"
@@ -341,8 +330,7 @@
       true,
       true,
       true,
-      true,
-      true,
+      false,
       false,
       true,
       false,
@@ -362,5 +350,5 @@
       null
     ]
   },
-  "hash": "e5802135e88690d5b0ff677cb5d6be2c8fb831de8dddf3894e64274232d58d6b"
+  "hash": "bf6a67723354bdfc82c1b5ae4236a505362d0cb8eb60152d93a119926907e609"
 }
