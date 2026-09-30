@@ -77,6 +77,16 @@ pub trait UnionListRepoTrait: Send {
     /// - `planned_delivery_date_from` / `planned_delivery_date_to`（2026-09-30
     ///   新增）：日期窗口（`YYYY-MM-DD`），段内 `WHERE planned_delivery_date >=
     ///   $X AND <= $Y`；`None` 端不参与。
+    /// - 4 文本 ILIKE pattern（2026-09-30 新增）：`drawing_no_pat` / `name_pat`
+    ///   / `order_no_pat` / `serial_no_pat`（已 `%x%` 预格式化），段内
+    ///   `WHERE <col> ILIKE $X`；`None` 端不参与。
+    /// - 4 日期窗口（2026-09-30 新增）：`request_date_from/to` +
+    ///   `system_delivery_date_from/to`，段内 `WHERE <col> >= $X AND <= $Y`；
+    ///   `None` 端不参与。
+    /// - 2 IS NULL 三态（2026-09-30 新增）：`order_no_is_null` /
+    ///   `system_delivery_date_is_null`，段内 `WHERE <col> IS [NOT] NULL`
+    ///   或 `order_no` 含空串语义对齐 PR-F 2026-08-11（空串视为『未填』/
+    ///   NULL 同义）；`None` 端不参与。
     /// - `pushdown_limit`：每段 SQL 内 `LIMIT (pushdown_limit) OFFSET 0`；用户
     ///   输入 = `offset + limit`。
     /// - `limit` / `offset`：外层分页切片。
@@ -101,6 +111,20 @@ pub trait UnionListRepoTrait: Send {
         // 2026-09-30 新增：日期窗口过滤（part/asm 段内 WHERE）。
         planned_delivery_date_from: Option<chrono::NaiveDate>,
         planned_delivery_date_to: Option<chrono::NaiveDate>,
+        // 2026-09-30 新增：4 文本 ILIKE pattern（part/asm 段内 ILIKE）。
+        drawing_no_pat: Option<&'a str>,
+        name_pat: Option<&'a str>,
+        order_no_pat: Option<&'a str>,
+        serial_no_pat: Option<&'a str>,
+        // 2026-09-30 新增：4 日期窗口（part/asm 段内 `>=`/`<=`）。
+        request_date_from: Option<chrono::NaiveDate>,
+        request_date_to: Option<chrono::NaiveDate>,
+        system_delivery_date_from: Option<chrono::NaiveDate>,
+        system_delivery_date_to: Option<chrono::NaiveDate>,
+        // 2026-09-30 新增：2 IS NULL 三态（part/asm 段内 `IS [NOT] NULL`；
+        // `order_no` 含空串语义对齐 PR-F 2026-08-11）。
+        order_no_is_null: Option<bool>,
+        system_delivery_date_is_null: Option<bool>,
     ) -> Result<Vec<UnionListRow>, sqlx::Error>;
 }
 
@@ -128,6 +152,19 @@ impl UnionListRepoTrait for &mut PgConnection {
         // 2026-09-30 新增：日期窗口过滤透传。
         planned_delivery_date_from: Option<chrono::NaiveDate>,
         planned_delivery_date_to: Option<chrono::NaiveDate>,
+        // 2026-09-30 新增：4 文本 ILIKE pattern 透传。
+        drawing_no_pat: Option<&'b str>,
+        name_pat: Option<&'b str>,
+        order_no_pat: Option<&'b str>,
+        serial_no_pat: Option<&'b str>,
+        // 2026-09-30 新增：4 日期窗口透传。
+        request_date_from: Option<chrono::NaiveDate>,
+        request_date_to: Option<chrono::NaiveDate>,
+        system_delivery_date_from: Option<chrono::NaiveDate>,
+        system_delivery_date_to: Option<chrono::NaiveDate>,
+        // 2026-09-30 新增：2 IS NULL 三态透传。
+        order_no_is_null: Option<bool>,
+        system_delivery_date_is_null: Option<bool>,
     ) -> Result<Vec<UnionListRow>, sqlx::Error> {
         UnionListRepo::list_union_all_with_filters(
             &mut **self,
@@ -145,6 +182,16 @@ impl UnionListRepoTrait for &mut PgConnection {
             offset,
             planned_delivery_date_from,
             planned_delivery_date_to,
+            drawing_no_pat,
+            name_pat,
+            order_no_pat,
+            serial_no_pat,
+            request_date_from,
+            request_date_to,
+            system_delivery_date_from,
+            system_delivery_date_to,
+            order_no_is_null,
+            system_delivery_date_is_null,
         )
         .await
     }

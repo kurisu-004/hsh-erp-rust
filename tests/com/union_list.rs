@@ -208,6 +208,91 @@ async fn insert_assembly(pool: &PgPool, drawing_no: &str, name: &str, customer_i
     id
 }
 
+/// 2026-09-30 新增：通用 `t_part` 行构造（10 字段筛选测试用）。
+///
+/// 自定义 drawing_no / name / order_no / serial_no / request_date /
+/// planned_delivery_date / system_delivery_date。其余列（status / quantity /
+/// version 等）固定字面 PENDING / 1 / 0；与既有 `insert_part` 家族同语义。
+#[allow(clippy::too_many_arguments)]
+async fn insert_part_full(
+    pool: &PgPool,
+    name: &str,
+    drawing_no: &str,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    order_no: Option<&str>,
+    request_date: chrono::NaiveDate,
+    planned_delivery_date: chrono::NaiveDate,
+    system_delivery_date: Option<chrono::NaiveDate>,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_test_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         order_no, system_delivery_date, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 'PENDING', $3, $6, $7, 1, 0, $8, $9, $10, $10)",
+    )
+    .bind(id)
+    .bind(serial_no)
+    .bind(name)
+    .bind(drawing_no)
+    .bind(customer_id)
+    .bind(request_date)
+    .bind(planned_delivery_date)
+    .bind(order_no)
+    .bind(system_delivery_date)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert part full");
+    id
+}
+
+/// 2026-09-30 新增：通用 `t_assembly` 行构造（10 字段筛选测试用）。
+///
+/// 自定义 drawing_no / name / order_no / serial_no / request_date /
+/// planned_delivery_date / system_delivery_date。其余列固定字面 PENDING / 1 / 0。
+#[allow(clippy::too_many_arguments)]
+async fn insert_assembly_full(
+    pool: &PgPool,
+    drawing_no: &str,
+    name: &str,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    order_no: Option<&str>,
+    request_date: chrono::NaiveDate,
+    planned_delivery_date: chrono::NaiveDate,
+    system_delivery_date: Option<chrono::NaiveDate>,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_test_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
+         request_date, planned_delivery_date, status, quantity, unit_price, total_price, \
+         version, serial_no, order_no, system_delivery_date, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, '', $4, $5, $6, 'PENDING', 1, 0, 0, 0, $7, $8, $9, \
+                 $10, NULL, $10, NULL)",
+    )
+    .bind(id)
+    .bind(drawing_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(request_date)
+    .bind(planned_delivery_date)
+    .bind(serial_no)
+    .bind(order_no)
+    .bind(system_delivery_date)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert assembly full");
+    id
+}
+
 // `hsh_erp_test_support::test_state` 直接套用（不引入 list_enrichment cos mock），
 // 因为 union_list 不走 COS 文件路径；直接走 test_state。
 async fn test_state(pool: PgPool) -> std::sync::Arc<hsh_erp_rust::state::AppState> {
@@ -514,6 +599,125 @@ async fn union_list_all_mode_sort_serial_no_falls_back() {
     }
 }
 
+/// 2026-09-30 新增回归：dashboard「按系统交期排序」配套。修复 review A.1：
+/// 保证 `sort_by=SYSTEM_DELIVERY_DATE` 不会被静默降级到 CREATED_AT，防止未来 PR
+/// 误删白名单。
+///
+/// - 准备 2 条 part：`system_delivery_date` 分别为 `2026-09-01` / `2026-09-30`
+/// - 调 `sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC`，断言 items 顺序为
+///   `09-01` → `09-30`（升序，非 NULL 项排在前面）
+/// - 同时调 DESC 断言顺序反向
+#[tokio::test]
+async fn sort_by_system_delivery_date_returns_sorted_results() {
+    use chrono::Duration;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+
+    // p_early: system_delivery_date = today - 29d（≈ 2026-09-01 当天附近）
+    let p_early = insert_part_full(
+        &pool,
+        "P-SORT-EARLY",
+        "D-SORT-EARLY",
+        fx.customer_l2_id,
+        Some("PSEARLY"),
+        None,
+        today,
+        today,
+        Some(today - Duration::days(29)),
+    )
+    .await;
+    // p_late: system_delivery_date = today（最晚）
+    let p_late = insert_part_full(
+        &pool,
+        "P-SORT-LATE",
+        "D-SORT-LATE",
+        fx.customer_l2_id,
+        Some("PSLATE"),
+        None,
+        today,
+        today,
+        Some(today),
+    )
+    .await;
+    // p_null: system_delivery_date = NULL（不应出现在 ASC 头部，因为 NULL < 任何日期
+    // 在 PG 升序里排最前；这里只断言已知非 NULL 项按升序排，NULL 项可前可后）
+    let p_null = insert_part_full(
+        &pool,
+        "P-SORT-NULL",
+        "D-SORT-NULL",
+        fx.customer_l2_id,
+        Some("PSNULL"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    // 1) ASC：p_early < p_late（NULL 位置不约束）
+    let url_asc = format!(
+        "/com/union-list?customer_id={}&row_type=ALL\
+         &sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC&limit=200",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request("GET", &url_asc, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "ASC: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().unwrap();
+    let ids: Vec<i64> = items
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    let pos_early = ids
+        .iter()
+        .position(|&x| x == p_early)
+        .expect("p_early present");
+    let pos_late = ids
+        .iter()
+        .position(|&x| x == p_late)
+        .expect("p_late present");
+    assert!(
+        pos_early < pos_late,
+        "ASC 时 p_early (system_delivery_date=早) 应排在 p_late 之前; ids={ids:?}"
+    );
+    let _ = p_null; // NULL 项位置不约束
+
+    // 2) DESC：p_late < p_early（反向）
+    let url_desc = format!(
+        "/com/union-list?customer_id={}&row_type=ALL\
+         &sort_by=SYSTEM_DELIVERY_DATE&sort_dir=DESC&limit=200",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url_desc, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "DESC: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().unwrap();
+    let ids: Vec<i64> = items
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    let pos_early = ids
+        .iter()
+        .position(|&x| x == p_early)
+        .expect("p_early present");
+    let pos_late = ids
+        .iter()
+        .position(|&x| x == p_late)
+        .expect("p_late present");
+    assert!(
+        pos_late < pos_early,
+        "DESC 时 p_late (system_delivery_date=晚) 应排在 p_early 之前; ids={ids:?}"
+    );
+}
+
 /// 非法 `row_type=BAD` —— 返回 40001 VALIDATION_ERROR。
 #[tokio::test]
 async fn union_list_row_type_invalid_rejected() {
@@ -733,4 +937,1226 @@ async fn list_union_items_filters_by_planned_delivery_date() {
 
     // 静默 NaiveDate 引用避免 unused 警告
     let _ = NaiveDate::from_ymd_opt(2026, 9, 30);
+}
+
+// ===========================================================================
+//  2026-09-30 新增：10 字段筛选端到端测试（4 文本 ILIKE + 4 日期窗口 + 2 IS NULL）
+// ===========================================================================
+
+/// 2026-09-30 新增：`drawing_no` ILIKE 模糊回归（隐藏 bug —— 此前 DTO 无字段，
+/// 参数被 axum 静默丢弃，筛选全部失效）。
+///
+/// 排布（全部 `today` 日期，无 custom order_no/system_delivery_date）：
+/// - 1 part drawing_no=DRW-UNI / 1 asm drawing_no=DRW-UNI → 命中 "UNI"
+/// - 1 part drawing_no=DRW-OTH / 1 asm drawing_no=DRW-OTH → 不命中 "UNI"
+/// - `drawing_no=UNI` 应仅命中前 2 条
+#[tokio::test]
+async fn list_union_items_filters_by_drawing_no() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let hit_part = insert_part_full(
+        &pool,
+        "P-DRW-UNI",
+        "DRW-UNI",
+        fx.customer_l2_id,
+        Some("PDU"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let hit_asm = insert_assembly_full(
+        &pool,
+        "DRW-UNI",
+        "A-DRW-UNI",
+        fx.customer_l2_id,
+        Some("ADU"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _miss_part = insert_part_full(
+        &pool,
+        "P-DRW-OTH",
+        "DRW-OTH",
+        fx.customer_l2_id,
+        Some("PDO"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _miss_asm = insert_assembly_full(
+        &pool,
+        "DRW-OTH",
+        "A-DRW-OTH",
+        fx.customer_l2_id,
+        Some("ADO"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200&drawing_no=UNI",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "drawing_no=UNI: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 2,
+        "应仅命中 drawing_no ILIKE %UNI% 的 2 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = vec![hit_part, hit_asm];
+    exp.sort();
+    assert_eq!(got_ids, exp, "ids 集合应一致");
+}
+
+/// 2026-09-30 新增：`name` ILIKE 模糊回归。
+///
+/// 排布：
+/// - 1 part name=Widget-A / 1 asm name=Widget-B → 命中
+/// - 1 part name=Gear   / 1 asm name=Gear      → 不命中
+/// - `name=Wid` → 仅 2 条
+#[tokio::test]
+async fn list_union_items_filters_by_name() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let hit_part = insert_part_full(
+        &pool,
+        "Part-UNI",
+        "D-N1",
+        fx.customer_l2_id,
+        Some("PNU"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let hit_asm = insert_assembly_full(
+        &pool,
+        "D-N2",
+        "Asm-UNI",
+        fx.customer_l2_id,
+        Some("ANU"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _miss_part = insert_part_full(
+        &pool,
+        "Part-OTH",
+        "D-N3",
+        fx.customer_l2_id,
+        Some("PNO"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _miss_asm = insert_assembly_full(
+        &pool,
+        "D-N4",
+        "Asm-OTH",
+        fx.customer_l2_id,
+        Some("ANO"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200&name=UNI",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "name=UNI: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 2,
+        "应仅命中 name ILIKE %UNI% 的 2 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = vec![hit_part, hit_asm];
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：`order_no` ILIKE 模糊回归（order_no 是 nullable varchar(30)）。
+///
+/// 排布：
+/// - 1 part order_no=ORD-UNI / 1 asm order_no=ORD-UNI → 命中 "UNI"
+/// - 1 part order_no=ORD-OTH / 1 asm order_no=ORD-OTH → 不命中 "UNI"
+/// - 1 part order_no=NULL     / 1 asm order_no=NULL     → 不命中 "UNI"
+/// - `order_no=UNI` → 仅 2 条
+#[tokio::test]
+async fn list_union_items_filters_by_order_no() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let hit_part = insert_part_full(
+        &pool,
+        "P-OP1",
+        "D-OP1",
+        fx.customer_l2_id,
+        Some("PU1"),
+        Some("ORD-UNI"),
+        today,
+        today,
+        None,
+    )
+    .await;
+    let hit_asm = insert_assembly_full(
+        &pool,
+        "D-OP2",
+        "A-OP2",
+        fx.customer_l2_id,
+        Some("AU1"),
+        Some("ORD-UNI"),
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _miss_part = insert_part_full(
+        &pool,
+        "P-OP3",
+        "D-OP3",
+        fx.customer_l2_id,
+        Some("PU2"),
+        Some("ORD-OTH"),
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _miss_asm = insert_assembly_full(
+        &pool,
+        "D-OP4",
+        "A-OP4",
+        fx.customer_l2_id,
+        Some("AU2"),
+        Some("ORD-OTH"),
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _null_part = insert_part_full(
+        &pool,
+        "P-OP5",
+        "D-OP5",
+        fx.customer_l2_id,
+        Some("PU3"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _null_asm = insert_assembly_full(
+        &pool,
+        "D-OP6",
+        "A-OP6",
+        fx.customer_l2_id,
+        Some("AU3"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200&order_no=UNI",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "order_no=UNI: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 2,
+        "应仅命中 order_no ILIKE %UNI% 的 2 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = vec![hit_part, hit_asm];
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：`serial_no` ILIKE 模糊回归（serial_no 是 nullable varchar(15)）。
+///
+/// 排布：
+/// - 1 part serial_no=SN-UNI-P / 1 asm serial_no=SN-UNI-A → 命中 "UNI"
+/// - 1 part serial_no=SN-OTH-P / 1 asm serial_no=SN-OTH-A → 不命中 "UNI"
+/// - 1 part serial_no=NULL                              → 不命中 "UNI"
+/// - `serial_no=UNI` → 仅 2 条
+#[tokio::test]
+async fn list_union_items_filters_by_serial_no() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let hit_part = insert_part_full(
+        &pool,
+        "P-SN1",
+        "D-SN1",
+        fx.customer_l2_id,
+        Some("SN-UNI-P"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let hit_asm = insert_assembly_full(
+        &pool,
+        "D-SN2",
+        "A-SN2",
+        fx.customer_l2_id,
+        Some("SN-UNI-A"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _miss_part = insert_part_full(
+        &pool,
+        "P-SN3",
+        "D-SN3",
+        fx.customer_l2_id,
+        Some("SN-OTH-P"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _miss_asm = insert_assembly_full(
+        &pool,
+        "D-SN4",
+        "A-SN4",
+        fx.customer_l2_id,
+        Some("SN-OTH-A"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _null_part = insert_part_full(
+        &pool,
+        "P-SN5",
+        "D-SN5",
+        fx.customer_l2_id,
+        None,
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200&serial_no=UNI",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "serial_no=UNI: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 2,
+        "应仅命中 serial_no ILIKE %UNI% 的 2 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = vec![hit_part, hit_asm];
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：`request_date_from/to` 日期窗口过滤（闭区间，request_date NOT NULL）。
+///
+/// 排布（以 today 为基准）：
+/// - 1 part req=today-3d / 1 asm req=today-3d → 不在 [today, today+5d]
+/// - 1 part req=today    / 1 asm req=today    → 命中
+/// - 1 part req=today+2d / 1 asm req=today+2d → 命中
+/// - 1 part req=today+5d / 1 asm req=today+5d → 命中（闭区间含 to）
+/// - 1 part req=today+6d / 1 asm req=today+6d → 不在区间
+/// 期望命中 6 条（3 part + 3 asm）
+#[tokio::test]
+async fn list_union_items_filters_by_request_date_from_to() {
+    use chrono::Duration;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let mut hit_ids: Vec<i64> = Vec::new();
+
+    // [-3d, -1d]：不在区间（to=today+5d）
+    let _p = insert_part_full(
+        &pool,
+        "P-RD-N3",
+        "D-RD-N3",
+        fx.customer_l2_id,
+        Some("PR3"),
+        None,
+        today - Duration::days(3),
+        today,
+        None,
+    )
+    .await;
+    let _a = insert_assembly_full(
+        &pool,
+        "D-RD-N3A",
+        "A-RD-N3",
+        fx.customer_l2_id,
+        Some("AR3"),
+        None,
+        today - Duration::days(3),
+        today,
+        None,
+    )
+    .await;
+
+    // today / +2d / +5d：命中
+    for (i, offset) in [(0i64, 0), (1, 2), (2, 5)] {
+        let d = today + Duration::days(offset);
+        let pid = insert_part_full(
+            &pool,
+            &format!("P-RD-{i}"),
+            &format!("D-RD-{i}"),
+            fx.customer_l2_id,
+            Some(&format!("PR{i}")),
+            None,
+            d,
+            d,
+            None,
+        )
+        .await;
+        let aid = insert_assembly_full(
+            &pool,
+            &format!("D-RD-{i}A"),
+            &format!("A-RD-{i}"),
+            fx.customer_l2_id,
+            Some(&format!("AR{i}")),
+            None,
+            d,
+            d,
+            None,
+        )
+        .await;
+        hit_ids.push(pid);
+        hit_ids.push(aid);
+    }
+
+    // +6d：不在区间
+    let _p = insert_part_full(
+        &pool,
+        "P-RD-P6",
+        "D-RD-P6",
+        fx.customer_l2_id,
+        Some("PR6"),
+        None,
+        today + Duration::days(6),
+        today,
+        None,
+    )
+    .await;
+    let _a = insert_assembly_full(
+        &pool,
+        "D-RD-P6A",
+        "A-RD-P6",
+        fx.customer_l2_id,
+        Some("AR6"),
+        None,
+        today + Duration::days(6),
+        today,
+        None,
+    )
+    .await;
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200\
+         &request_date_from={}&request_date_to={}",
+        fx.customer_l2_id,
+        today,
+        today + Duration::days(5)
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "request_date [today, +5d]: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 6,
+        "应仅命中 request_date ∈ [today, +5d] 的 6 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = hit_ids.clone();
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：`system_delivery_date_from/to` 日期窗口过滤。
+///
+/// 排布（系统交期 nullable；以 today+5d 为基准）：
+/// - 2 件 sd=today+3d → 不在 [+5d, +10d] 闭区间外
+/// - 4 件 sd=today+5d / +7d / +10d → 命中（含两端）
+/// - 1 件 sd=today+11d → 不在
+/// - 2 件 sd=NULL     → 不在（IS NULL 才会命中；普通日期过滤 NULL 短路）
+#[tokio::test]
+async fn list_union_items_filters_by_system_delivery_date_from_to() {
+    use chrono::Duration;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let mut hit_ids: Vec<i64> = Vec::new();
+
+    // +3d（part + asm）：不在 [+5d, +10d] 闭区间
+    let _p3 = insert_part_full(
+        &pool,
+        "P-SD-3",
+        "D-SD-3",
+        fx.customer_l2_id,
+        Some("PSD3"),
+        None,
+        today,
+        today,
+        Some(today + Duration::days(3)),
+    )
+    .await;
+    let _a3 = insert_assembly_full(
+        &pool,
+        "D-SD-3A",
+        "A-SD-3",
+        fx.customer_l2_id,
+        Some("ASD3"),
+        None,
+        today,
+        today,
+        Some(today + Duration::days(3)),
+    )
+    .await;
+
+    // +5d / +7d / +10d（每点 1 part + 1 asm）：命中
+    for (i, offset) in [(0i64, 5), (1, 7), (2, 10)] {
+        let d = today + Duration::days(offset);
+        let pid = insert_part_full(
+            &pool,
+            &format!("P-SD-{i}"),
+            &format!("D-SD-{i}"),
+            fx.customer_l2_id,
+            Some(&format!("PSD{i}")),
+            None,
+            today,
+            today,
+            Some(d),
+        )
+        .await;
+        let aid = insert_assembly_full(
+            &pool,
+            &format!("D-SD-{i}A"),
+            &format!("A-SD-{i}"),
+            fx.customer_l2_id,
+            Some(&format!("ASD{i}")),
+            None,
+            today,
+            today,
+            Some(d),
+        )
+        .await;
+        hit_ids.push(pid);
+        hit_ids.push(aid);
+    }
+
+    // +11d（part + asm）：不在
+    let _p11 = insert_part_full(
+        &pool,
+        "P-SD-11",
+        "D-SD-11",
+        fx.customer_l2_id,
+        Some("PSD11"),
+        None,
+        today,
+        today,
+        Some(today + Duration::days(11)),
+    )
+    .await;
+    let _a11 = insert_assembly_full(
+        &pool,
+        "D-SD-11A",
+        "A-SD-11",
+        fx.customer_l2_id,
+        Some("ASD11"),
+        None,
+        today,
+        today,
+        Some(today + Duration::days(11)),
+    )
+    .await;
+
+    // 2 件 sd=NULL：不在（普通日期过滤 NULL 短路）
+    let _pn = insert_part_full(
+        &pool,
+        "P-SD-N",
+        "D-SD-PN",
+        fx.customer_l2_id,
+        Some("PSDN"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _an = insert_assembly_full(
+        &pool,
+        "D-SD-NA",
+        "A-SD-NA",
+        fx.customer_l2_id,
+        Some("ASDN"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200\
+         &system_delivery_date_from={}&system_delivery_date_to={}",
+        fx.customer_l2_id,
+        today + Duration::days(5),
+        today + Duration::days(10)
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "sd [+5d, +10d]: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 6,
+        "应仅命中 system_delivery_date ∈ [+5d, +10d] 的 6 条（NULL 被短路）: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = hit_ids.clone();
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：`order_no_is_null=true` 三态回归（对齐 PR-F 2026-08-11
+/// 空串语义，IS NULL OR =''）。
+///
+/// 排布：
+/// - 1 part order_no=NULL  / 1 asm order_no=NULL  → 命中
+/// - 1 part order_no=""    / 1 asm order_no=""    → 命中（空串 = NULL 语义）
+/// - 1 part order_no=ORD-X / 1 asm order_no=ORD-X → 不命中
+/// 期望命中 4 条（2 part + 2 asm）
+#[tokio::test]
+async fn list_union_items_filters_by_order_no_is_null_true() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let mut hit_ids: Vec<i64> = Vec::new();
+
+    let pn = insert_part_full(
+        &pool,
+        "P-OP-N",
+        "D-OP-N",
+        fx.customer_l2_id,
+        Some("PN"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let an = insert_assembly_full(
+        &pool,
+        "D-OP-NA",
+        "A-OP-NA",
+        fx.customer_l2_id,
+        Some("AN"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    hit_ids.push(pn);
+    hit_ids.push(an);
+
+    let pe = insert_part_full(
+        &pool,
+        "P-OP-E",
+        "D-OP-E",
+        fx.customer_l2_id,
+        Some("PE"),
+        Some(""),
+        today,
+        today,
+        None,
+    )
+    .await;
+    let ae = insert_assembly_full(
+        &pool,
+        "D-OP-EA",
+        "A-OP-EA",
+        fx.customer_l2_id,
+        Some("AE"),
+        Some(""),
+        today,
+        today,
+        None,
+    )
+    .await;
+    hit_ids.push(pe);
+    hit_ids.push(ae);
+
+    let _pf = insert_part_full(
+        &pool,
+        "P-OP-F",
+        "D-OP-F",
+        fx.customer_l2_id,
+        Some("PF"),
+        Some("ORD-F"),
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _af = insert_assembly_full(
+        &pool,
+        "D-OP-FA",
+        "A-OP-FA",
+        fx.customer_l2_id,
+        Some("AF"),
+        Some("ORD-F"),
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200&order_no_is_null=true",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "order_no_is_null=true: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 4,
+        "应仅命中 order_no IS NULL OR ='' 的 4 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = hit_ids.clone();
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：`order_no_is_null=false` 三态回归（IS NOT NULL AND <>''）。
+///
+/// 同上的 fixture，但反向断言：仅命中 order_no='ORD-F' 的 2 条。
+#[tokio::test]
+async fn list_union_items_filters_by_order_no_is_null_false() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let mut hit_ids: Vec<i64> = Vec::new();
+
+    let _pn = insert_part_full(
+        &pool,
+        "P-OF-N",
+        "D-OF-N",
+        fx.customer_l2_id,
+        Some("PNF"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _an = insert_assembly_full(
+        &pool,
+        "D-OF-NA",
+        "A-OF-NA",
+        fx.customer_l2_id,
+        Some("ANF"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _pe = insert_part_full(
+        &pool,
+        "P-OF-E",
+        "D-OF-E",
+        fx.customer_l2_id,
+        Some("PEF"),
+        Some(""),
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _ae = insert_assembly_full(
+        &pool,
+        "D-OF-EA",
+        "A-OF-EA",
+        fx.customer_l2_id,
+        Some("AEF"),
+        Some(""),
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    let pf = insert_part_full(
+        &pool,
+        "P-OF-F",
+        "D-OF-F",
+        fx.customer_l2_id,
+        Some("PFF"),
+        Some("ORD-F"),
+        today,
+        today,
+        None,
+    )
+    .await;
+    let af = insert_assembly_full(
+        &pool,
+        "D-OF-FA",
+        "A-OF-FA",
+        fx.customer_l2_id,
+        Some("AFF"),
+        Some("ORD-F"),
+        today,
+        today,
+        None,
+    )
+    .await;
+    hit_ids.push(pf);
+    hit_ids.push(af);
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200&order_no_is_null=false",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "order_no_is_null=false: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 2,
+        "应仅命中 order_no IS NOT NULL AND <>'' 的 2 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = hit_ids.clone();
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：`system_delivery_date_is_null=true` 三态回归（IS NULL）。
+///
+/// 排布：
+/// - 1 part sd=NULL / 1 asm sd=NULL → 命中
+/// - 1 part sd=today / 1 asm sd=today → 不命中
+/// 期望命中 2 条
+#[tokio::test]
+async fn list_union_items_filters_by_system_delivery_date_is_null_true() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let mut hit_ids: Vec<i64> = Vec::new();
+
+    let pn = insert_part_full(
+        &pool,
+        "P-SI-N",
+        "D-SI-N",
+        fx.customer_l2_id,
+        Some("PIN"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let an = insert_assembly_full(
+        &pool,
+        "D-SI-NA",
+        "A-SI-NA",
+        fx.customer_l2_id,
+        Some("AIN"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    hit_ids.push(pn);
+    hit_ids.push(an);
+
+    let _pf = insert_part_full(
+        &pool,
+        "P-SI-F",
+        "D-SI-F",
+        fx.customer_l2_id,
+        Some("PIF"),
+        None,
+        today,
+        today,
+        Some(today),
+    )
+    .await;
+    let _af = insert_assembly_full(
+        &pool,
+        "D-SI-FA",
+        "A-SI-FA",
+        fx.customer_l2_id,
+        Some("AIF"),
+        None,
+        today,
+        today,
+        Some(today),
+    )
+    .await;
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200\
+         &system_delivery_date_is_null=true",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "sd_is_null=true: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 2,
+        "应仅命中 system_delivery_date IS NULL 的 2 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = hit_ids.clone();
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：`system_delivery_date_is_null=false` 三态回归（IS NOT NULL）。
+///
+/// 同上 fixture，反向断言：仅命中 sd=today 的 2 条。
+#[tokio::test]
+async fn list_union_items_filters_by_system_delivery_date_is_null_false() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+    let mut hit_ids: Vec<i64> = Vec::new();
+
+    let _pn = insert_part_full(
+        &pool,
+        "P-SF-N",
+        "D-SF-N",
+        fx.customer_l2_id,
+        Some("PFN"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+    let _an = insert_assembly_full(
+        &pool,
+        "D-SF-NA",
+        "A-SF-NA",
+        fx.customer_l2_id,
+        Some("AFN"),
+        None,
+        today,
+        today,
+        None,
+    )
+    .await;
+
+    let pf = insert_part_full(
+        &pool,
+        "P-SF-F",
+        "D-SF-F",
+        fx.customer_l2_id,
+        Some("PFF"),
+        None,
+        today,
+        today,
+        Some(today),
+    )
+    .await;
+    let af = insert_assembly_full(
+        &pool,
+        "D-SF-FA",
+        "A-SF-FA",
+        fx.customer_l2_id,
+        Some("AFF"),
+        None,
+        today,
+        today,
+        Some(today),
+    )
+    .await;
+    hit_ids.push(pf);
+    hit_ids.push(af);
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200\
+         &system_delivery_date_is_null=false",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "sd_is_null=false: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 2,
+        "应仅命中 system_delivery_date IS NOT NULL 的 2 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = hit_ids.clone();
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：10 字段联合筛选 smoke（4 文本 + 4 日期 + 2 IS NULL 全开）。
+///
+/// 故意用全部 10 个字段同时给一个唯一命中的 fixture，断言只剩 2 条
+/// （1 part + 1 asm）。
+/// 验证 SQL 段内多个守卫 AND 拼接 + 计划缓存稳定（10 字段混合 bind + 2 字
+/// 符串片段预生成）。
+///
+/// 注：t_part.serial_no 有 `uk_t_part_serial_no` 唯一索引（partial unique
+/// `WHERE serial_no IS NOT NULL`），所以每行必须用独立 serial_no；为简化
+/// 噪声 fixture，本测试仅插 1 个 part 噪声 + 1 个 asm 噪声做『9 字段不同
+/// 单一不命中』验证，不重复造同样 serial_no 的多个噪音行。
+#[tokio::test]
+async fn list_union_items_combined_10_filters_smoke() {
+    use chrono::Duration;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+
+    // 唯一命中：drawing_no=D-COMB / name=P-COMB / order_no=ORD-COMB /
+    // serial_no=SN-COMB / request_date=today / system_delivery_date=today+2d
+    //
+    // 注：part 与 asm 是不同表，各自有独立 uk_t_*_serial_no 唯一索引；同名
+    // serial_no 在 part/asm 间不冲突。共用 SN-COMB 让 serial_no=COMB 同
+    // 时命中 part + asm。
+    let hit_part = insert_part_full(
+        &pool,
+        "P-COMB",
+        "D-COMB",
+        fx.customer_l2_id,
+        Some("SN-COMB-P"),
+        Some("ORD-COMB"),
+        today,
+        today,
+        Some(today + Duration::days(2)),
+    )
+    .await;
+    let hit_asm = insert_assembly_full(
+        &pool,
+        "D-COMB",
+        "A-P-COMB", // asm 的 name 必须含 "P-COMB" 才能匹配 name=P-COMB
+        fx.customer_l2_id,
+        Some("SN-COMB-A"),
+        Some("ORD-COMB"),
+        today,
+        today,
+        Some(today + Duration::days(2)),
+    )
+    .await;
+
+    // 噪音 part：drawing_no 不同（=D-NOISE），其它字段全对齐 → 唯一字段不
+    // 命中；其余字段分别被对应过滤器排除。本条足以证明 10 字段 AND 拼接
+    // 生效（任意一字段不匹配 → 全过滤）。
+    let _ = insert_part_full(
+        &pool,
+        "P-COMB",
+        "D-NOISE",
+        fx.customer_l2_id,
+        Some("PNOISE"),
+        Some("ORD-COMB"),
+        today,
+        today,
+        Some(today + Duration::days(2)),
+    )
+    .await;
+    let _ = insert_assembly_full(
+        &pool,
+        "D-NOISE",
+        "A-COMB",
+        fx.customer_l2_id,
+        Some("ANOISE"),
+        Some("ORD-COMB"),
+        today,
+        today,
+        Some(today + Duration::days(2)),
+    )
+    .await;
+
+    // 全部 10 字段开火（serial_no=COMB 同时匹配 part 的 "SN-COMB-P" 和
+    // asm 的 "SN-COMB-A" —— ILIKE %COMB% 均命中）
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200\
+         &drawing_no=D-COMB&name=P-COMB&order_no=ORD-COMB&serial_no=COMB\
+         &request_date_from={}&request_date_to={}\
+         &system_delivery_date_from={}&system_delivery_date_to={}\
+         &order_no_is_null=false&system_delivery_date_is_null=false",
+        fx.customer_l2_id,
+        today,
+        today + Duration::days(3),
+        today,
+        today + Duration::days(3),
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "10 字段 smoke: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["total"], 2,
+        "10 字段全开应仅命中 1 part + 1 asm = 2 条: {env}"
+    );
+    let mut got_ids: Vec<i64> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    got_ids.sort();
+    let mut exp = vec![hit_part, hit_asm];
+    exp.sort();
+    assert_eq!(got_ids, exp);
+}
+
+/// 2026-09-30 新增：`request_date_from` 非法格式 → 40001 VALIDATION_ERROR。
+///
+/// 与 9-30 commit `429be79` 的 `planned_delivery_date_from=not-a-date` 同形，
+/// 但字段换成本次新增的 `request_date_from`。
+#[tokio::test]
+async fn list_union_items_filters_by_request_date_from_invalid_format() {
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&request_date_from=not-a-date",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "非法日期 → 422: {env}");
+    assert_eq!(env["code"], 40001, "VALIDATION_ERROR: {env}");
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("request_date_from"),
+        "错误消息应包含字段名: {env}"
+    );
 }

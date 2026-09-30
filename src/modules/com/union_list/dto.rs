@@ -92,6 +92,53 @@ pub struct UnionListQuery {
     pub planned_delivery_date_from: Option<String>,
     #[serde(default)]
     pub planned_delivery_date_to: Option<String>,
+    // 2026-09-30 新增：4 个文本 ILIKE 模糊字段。零件一览页面（frontend
+    // PartsTable.vue / usePartsListQuery.ts::buildParams）照常发出这 4 个
+    // 字段，但本 DTO 之前无对应字段，参数被 axum `Query<T>` 静默丢弃；隐藏
+    // bug 表现：用户输入图号/名称/订单号/序列号筛选全部失效。
+    // - `drawing_no` / `name` 命中 NOT NULL 列；`order_no` / `serial_no` 命
+    //   中 t_part 的 nullable 列与 t_assembly 的 nullable 列；ILIKE pattern
+    //   在 service 层预格式化为 `%x%`。
+    // - PART / ALL / ASSEMBLY 三模式全部生效。
+    /// 2026-09-30 新增：图号 ILIKE 模糊（已 trim + 预格式化 %x%）
+    #[serde(default)]
+    pub drawing_no: Option<String>,
+    /// 2026-09-30 新增：名称 ILIKE 模糊
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 2026-09-30 新增：订单号 ILIKE 模糊
+    #[serde(default)]
+    pub order_no: Option<String>,
+    /// 2026-09-30 新增：序列号 ILIKE 模糊
+    #[serde(default)]
+    pub serial_no: Option<String>,
+    // 2026-09-30 新增：4 个日期窗口字段。`request_date` NOT NULL；`system_delivery_date`
+    // 在 t_part / t_assembly 都是 nullable date，故 SQL `IS NULL OR =` 用短
+    // 路占位保证 `system_delivery_date_is_null=false` 时 NULL 行被排除。
+    // 解析 `YYYY-MM-DD` → `chrono::NaiveDate`，非法 → 40001 VALIDATION_ERROR。
+    /// 2026-09-30 新增：请求日期起（YYYY-MM-DD，service 解析 NaiveDate）
+    #[serde(default)]
+    pub request_date_from: Option<String>,
+    /// 2026-09-30 新增：请求日期止
+    #[serde(default)]
+    pub request_date_to: Option<String>,
+    /// 2026-09-30 新增：系统交期起
+    #[serde(default)]
+    pub system_delivery_date_from: Option<String>,
+    /// 2026-09-30 新增：系统交期止
+    #[serde(default)]
+    pub system_delivery_date_to: Option<String>,
+    // 2026-09-30 新增：2 个三态布尔过滤。
+    // - `None`：不参与过滤
+    // - `Some(true)`：仅命中 NULL 行（含 `order_no = ''` 空串语义，对齐 PR-F
+    //   2026-08-11 既有 `order_no` 空串视为『未填』的语义）
+    // - `Some(false)`：仅命中非 NULL 非空串行
+    /// 2026-09-30 新增：订单号 IS NULL 三态（None=不参与 / Some(true)=IS NULL OR ='' / Some(false)=IS NOT NULL AND <>''）
+    #[serde(default)]
+    pub order_no_is_null: Option<bool>,
+    /// 2026-09-30 新增：系统交期 IS NULL 三态
+    #[serde(default)]
+    pub system_delivery_date_is_null: Option<bool>,
     #[serde(default)]
     pub sort_by: Option<String>,
     #[serde(default)]

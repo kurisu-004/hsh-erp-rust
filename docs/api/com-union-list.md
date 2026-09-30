@@ -49,6 +49,16 @@ GET /api/v2/com/union-list
 | `planned_delivery_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口下界 `planned_delivery_date >= $from`。**PART / ALL / ASSEMBLY 三模式全部生效**。非法格式 → `40001 VALIDATION_ERROR` |
 | `planned_delivery_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口上界 `planned_delivery_date <= $to`。**PART / ALL / ASSEMBLY 三模式全部生效**。非法格式 → `40001 VALIDATION_ERROR`。任一端缺失 → 对应 NULL 短路 |
 | `sort_by` | `string` | 否 | `CREATED_AT` | 排序键白名单：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `DRAWING_NO` / `NAME` / `SYSTEM_DELIVERY_DATE`。**注意**：`SERIAL_NO` 仅 `t_part` 独有 → ALL 模式降级 `CREATED_AT` |
+| `drawing_no` | `string` | 否 | — | 2026-09-30 新增：图号 ILIKE 模糊（`%x%`，已 trim + 预格式化）。**PART / ALL / ASSEMBLY 三模式全部生效**。空串 / 纯空白 → 不参与过滤 |
+| `name` | `string` | 否 | — | 2026-09-30 新增：名称 ILIKE 模糊（`%x%`）。**PART / ALL / ASSEMBLY 三模式全部生效** |
+| `order_no` | `string` | 否 | — | 2026-09-30 新增：订单号 ILIKE 模糊（`%x%`，t_part.order_no / t_assembly.order_no 均为 nullable varchar(30)）。**PART / ALL / ASSEMBLY 三模式全部生效** |
+| `serial_no` | `string` | 否 | — | 2026-09-30 新增：序列号 ILIKE 模糊（`%x%`，t_part.serial_no / t_assembly.serial_no 均为 nullable varchar(15)）。**PART / ALL / ASSEMBLY 三模式全部生效** |
+| `request_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：请求日期窗口下界 `request_date >= $from`。**PART / ALL / ASSEMBLY 三模式全部生效**（t_part.request_date / t_assembly.request_date 均 NOT NULL）。非法格式 → `40001 VALIDATION_ERROR` |
+| `request_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：请求日期窗口上界 `request_date <= $to`。**PART / ALL / ASSEMBLY 三模式全部生效**。任一端缺失 → 对应 NULL 短路 |
+| `system_delivery_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：系统交期窗口下界 `system_delivery_date >= $from`。**PART / ALL / ASSEMBLY 三模式全部生效**（t_part.system_delivery_date / t_assembly.system_delivery_date 均为 nullable date，普通 `>=`/`<=` 对 NULL 直接 false） |
+| `system_delivery_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：系统交期窗口上界 `system_delivery_date <= $to`。**PART / ALL / ASSEMBLY 三模式全部生效**。任一端缺失 → 对应 NULL 短路 |
+| `order_no_is_null` | `bool` | 否 | — | 2026-09-30 新增：订单号 IS NULL 三态过滤。`true` → `order_no IS NULL OR order_no = ''`（含空串语义对齐 PR-F 2026-08-11『空串视为未填』）；`false` → `order_no IS NOT NULL AND order_no <> ''`；省略 → 不参与。**PART / ALL / ASSEMBLY 三模式全部生效** |
+| `system_delivery_date_is_null` | `bool` | 否 | — | 2026-09-30 新增：系统交期 IS NULL 三态过滤。`true` → `system_delivery_date IS NULL`；`false` → `system_delivery_date IS NOT NULL`；省略 → 不参与。**PART / ALL / ASSEMBLY 三模式全部生效** |
 | `sort_dir` | `string` | 否 | `DESC` | `"ASC"` / `"DESC"` |
 | `limit` | `i64` | 否 | `50` | `[1, 200]` |
 | `offset` | `i64` | 否 | `0` | `>= 0` |
@@ -328,11 +338,81 @@ curl -G "http://localhost:3000/api/v2/com/union-list" \
 }
 ```
 
+### 文本+日期+IS NULL 三态筛选（2026-09-30 新增）
+
+修零件一览页面（frontend `PartsTable.vue` / `usePartsListQuery.ts::buildParams()`）
+隐藏 bug —— 该页面照常发出 10 个字段（4 文本 ILIKE + 4 日期窗口 + 2 IS NULL
+三态），但本端点 DTO 之前无对应字段，参数被 axum `Query<T>` 静默丢弃；表现：
+用户在图号/名称/订单号/序列号筛选框输入值、请求日期/系统交期选区间、『订单号
+是否为空』『系统交期是否为空』下拉切换 —— 全部失效。
+
+本切片把 10 字段正式纳入 DTO + service parse + repo SQL 段内 WHERE，三层修复：
+1. **DTO 声明**（`src/modules/com/union_list/dto.rs::UnionListQuery`）：加 10 字段
+   `#[serde(default)]` 防止 axum `Query<T>` 静默丢弃（这部分就是 bug 根因）。
+2. **service 解析**（`parse_filters`）：4 文本走 `parse_optional_ilike_pattern`
+   helper（None / Some("") / 纯空白 → None；其它 → `Some(format!("%{}%", raw.trim()))`）；
+   4 日期复用 `parse_optional_date` helper（YYYY-MM-DD → NaiveDate，非法 →
+   40001）；2 IS NULL bool 直传。
+3. **repo SQL 段内消费**（UNION ALL SQL format!）：4 文本扩 `$13..$16` 占位 +
+   段内 `WHERE <col> ILIKE $N`；4 日期扩 `$17..$20` 占位 + 段内 `WHERE <col> >= / <= $N`；
+   2 IS NULL 三态条件预生成 SQL 字符串片段（`""` / `" AND (...)"`）拼到 format!
+   字符串里，**不增加 `$N` 占位**（避免 `$N::bool` 多占位污染 plan cache）。
+
+字段语义：
+- **4 文本 ILIKE 模糊**：`drawing_no` / `name` / `order_no` / `serial_no`。
+  t_part.drawing_no / name NOT NULL；t_assembly 同列 NOT NULL；
+  t_part.order_no / serial_no 与 t_assembly 同列均为 nullable。
+  None / 空串 / 纯空白 → 不参与过滤。
+- **4 日期窗口**：`request_date_from/to` + `system_delivery_date_from/to`。
+  t_part.request_date / t_assembly.request_date 均 NOT NULL（SQL `>=`/`<=`
+  直接生效）；t_part.system_delivery_date / t_assembly.system_delivery_date 均为
+  nullable date，普通 `>=`/`<=` 对 NULL 直接 false 故 NULL 被短路排除；如要命中
+  NULL 行用 `system_delivery_date_is_null=true` 显式筛。
+- **2 IS NULL 三态**：`order_no_is_null` + `system_delivery_date_is_null`。
+  - `None`：不参与过滤
+  - `Some(true)`：`order_no` → `IS NULL OR = ''`（含空串语义对齐 PR-F
+    2026-08-11『空串视为未填/与 NULL 同义』）；`system_delivery_date` → `IS NULL`
+  - `Some(false)`：`order_no` → `IS NOT NULL AND <> ''`；
+    `system_delivery_date` → `IS NOT NULL`
+
+破坏性变更（仅内域）：
+- `PartListFilters` / `AssemblyListFilters` 各加 10 字段（与日期窗口同位置追加）；
+  所有 caller（part 域 list / 外协 / assembly 域 trait impl）固定传 `None` 维持
+  旧行为，零破坏。
+- `UnionListRepo::list_union_all_with_filters` / `UnionListRepoTrait::list_union_all_with_filters`
+  各加 10 扁平形参；仅 com::union_list 端点直接调用，零破坏。
+
+PART / ALL / ASSEMBLY 三模式全部生效（UNION ALL SQL `part_seg` / `asm_seg` 两段
+都追加同 `$13..$20` 守卫，外层 SQL 不消费这两个 placeholder 故不影响 `$9`/`$10`）。
+
+测试覆盖：11 个新增 union-list 用例（4 文本 + 2 日期 + 4 IS NULL + 1 combined smoke）+ 1
+非法日期格式 + 2 老端点兼容回归（`/parts` + `/assemblies`）= 共 14 个新增测试。
+
+```bash
+# 4 文本 + 4 日期 + 2 IS NULL 三态全开（11 个新增用例之一：combined smoke）
+curl -G "http://localhost:3000/api/v2/com/union-list" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "row_type=ALL" \
+  --data-urlencode "drawing_no=D-COMB" \
+  --data-urlencode "name=P-COMB" \
+  --data-urlencode "order_no=ORD-COMB" \
+  --data-urlencode "serial_no=SN-COMB" \
+  --data-urlencode "request_date_from=2026-09-30" \
+  --data-urlencode "request_date_to=2026-10-03" \
+  --data-urlencode "system_delivery_date_from=2026-09-30" \
+  --data-urlencode "system_delivery_date_to=2026-10-03" \
+  --data-urlencode "order_no_is_null=false" \
+  --data-urlencode "system_delivery_date_is_null=false"
+```
+
 ## 引用
 
 - 前端对应：`src/api/com/unionList.ts`（前端子模块另开 PR 接入；本端点路由
   自身即可工作）
-- 集成测试：`tests/com/union_list.rs`（8 用例覆盖 PART / ASSEMBLY / ALL /
-  SERIAL_NO 降级 / 非法 row_type / 缺省默认值 / deep offset 分页 / **日期窗口过滤**）
+- 集成测试：`tests/com/union_list.rs`（20 用例覆盖 PART / ASSEMBLY / ALL /
+  SERIAL_NO 降级 / 非法 row_type / 缺省默认值 / deep offset 分页 / 日期窗口过滤
+  / **10 字段筛选（4 文本 ILIKE + 4 日期 + 2 IS NULL）+ combined smoke + 非法
+  日期格式**）+ `tests/part/crud.rs::list_parts_old_endpoint_ignores_new_union_list_fields`
+  + `tests/assembly/api.rs::list_assemblies_with_compat_union_list_fields` 兼容回归
 - API 设计文档：`docs/api/com-union-list.md`（本文件）
 - 实现参考：`docs/plans/com-get-part-union-all-t-assembly-t-par-graceful-mitten.md`

@@ -1706,3 +1706,58 @@ async fn batch_create_parts_handler_spawn_delete_on_err() {
         "second_tmp_key 因 head 失败未进 COS，不应被 delete: got {delete_calls:?}"
     );
 }
+
+/// 2026-09-30 新增：`/parts` 老端点对 10 字段 union-list 参数的兼容回归。
+///
+/// 背景：com::union_list 端点新增 10 字段（drawing_no / name / order_no /
+/// serial_no / request_date_* / order_no_is_null / system_delivery_date_* /
+/// system_delivery_date_is_null），part 域 `PartListQuery` 故意保持原字段集
+/// 不扩展。本测试断言：URL 带全套 10 字段（值乱填）时 `/parts` 老端点仍返
+/// 200 + 不报错（axum `Query<T>` 静默丢弃未知字段 = 设计如此），结果与不
+/// 带这些参数完全一致。
+#[tokio::test]
+async fn list_parts_old_endpoint_ignores_new_union_list_fields() {
+    let (_pool, app, token, fx) = bootstrap_as_manager().await;
+
+    // ---- baseline：不带 union-list 字段 ----
+    let url_base = format!("/parts?customer_id={}&limit=10", fx.customer_l2_id);
+    let (s_base, env_base) = send(
+        app.clone(),
+        json_request("GET", &url_base, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s_base, StatusCode::OK, "baseline: {env_base}");
+    let total_base = env_base["data"]["total"].as_i64().unwrap_or(-1);
+    let n_items_base = env_base["data"]["items"].as_array().unwrap().len();
+
+    // ---- 兼容：URL 带全套 10 字段（值乱填） ----
+    let url_with_union_fields = format!(
+        "/parts?customer_id={}&limit=10\
+         &drawing_no=IGNORED&name=IGNORED&order_no=IGNORED&serial_no=IGNORED\
+         &request_date_from=2026-01-01&request_date_to=2026-12-31\
+         &system_delivery_date_from=2026-01-01&system_delivery_date_to=2026-12-31\
+         &order_no_is_null=true&system_delivery_date_is_null=false",
+        fx.customer_l2_id
+    );
+    let (s_full, env_full) = send(
+        app,
+        json_request("GET", &url_with_union_fields, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        s_full,
+        StatusCode::OK,
+        "/parts 应兼容未知 query 字段（axum 静默丢弃 = 设计）: {env_full}"
+    );
+    assert_eq!(env_full["code"], 0);
+    assert_eq!(
+        env_full["data"]["total"].as_i64().unwrap_or(-1),
+        total_base,
+        "带/不带 10 字段 total 应一致: baseline={total_base}, full={env_full}"
+    );
+    assert_eq!(
+        env_full["data"]["items"].as_array().unwrap().len(),
+        n_items_base,
+        "items 数量应一致"
+    );
+}
