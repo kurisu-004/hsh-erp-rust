@@ -1876,9 +1876,6 @@ async fn held_batch_includes_has_cnc_program() {
     assert!(found_a && found_b, "应同时找到 H-CNC-A 与 H-CNC-B: {env}");
 }
 
-/// 场景 20: admin_assign process_id 不匹配
-///
-/// 调 assign 带 process_id=9999999999998（不存在且 ≠ batch.next_process_id）→
 // 2026-09-30 重构：原 `admin_assign_process_id_mismatch` 端点已删除，被 move 端点取代。
 // 通过 from/to 显式校验状态而非 process_id；功能已合并到 move_pool_to_worker_assigns_batch（场景 13b）。
 

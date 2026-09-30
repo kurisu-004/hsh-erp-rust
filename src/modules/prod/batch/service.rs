@@ -771,7 +771,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let _r = BatchService::dispatch_batch(
+        let r = BatchService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             Some("dispatch test"),
@@ -979,7 +979,7 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let _r = BatchService::dispatch_batch(
+        let r = BatchService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
