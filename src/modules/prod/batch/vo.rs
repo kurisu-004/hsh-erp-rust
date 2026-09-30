@@ -83,17 +83,21 @@ pub struct PendingBatchListOut {
 /// `succeeded.len() == 1`）。
 ///
 /// 2026-09-30 重构：原 `DispatchResult`（单条）+ `BulkDispatchResult`（succeeded/failed）
-/// 合并为统一 bulk 形态 `DispatchResult { succeeded, failed }`：
-/// - 单条下发 = 1 元素 succeeded + 0 failed
-/// - 多批下发 = N 元素 succeeded + 0 failed（全成功）或 0 succeeded + 1 failed
-///   （任一硬错误全回滚，response 给失败明细）
+/// 合并为统一 bulk 形态 `DispatchResult { succeeded }`：
+/// - 单条下发 = 1 元素 succeeded
+/// - 多批下发 = N 元素 succeeded（全成功）或 service 抛 AppError（任一硬错误全回滚，
+///   响应为顶层 4xx/5xx，failed 数组废弃）
+///
+/// 当前实现走「任一失败 → 全回滚」语义；`failed` 字段保留为 `Vec<DispatchFailureItem>`
+/// 是为未来启用 partial commit 时向前兼容，**当前总是空**。
 ///
 /// `current_process_step_id` 是 `Option<i64>`（dispatch 路径不解析 step，存 NULL）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchResult {
     /// 成功下发的 batch 列表（顺序与 req.targets 一致）。
     pub succeeded: Vec<DispatchSuccessItem>,
-    /// 失败明细（任一硬错误全回滚时由 caller 重试；partial commit 当前不暴露）。
+    /// 失败明细（当前总为空；预留 partial commit 启用）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<DispatchFailureItem>,
 }
 
@@ -112,8 +116,10 @@ pub struct DispatchSuccessItem {
     pub version: i32,
 }
 
-/// `DispatchResult.failed` 单条（与 `BulkDispatchResult` 旧版 `DispatchFailureItem`
-/// 同源；用于 partial commit 暴露给前端做 retry UI）。
+/// `DispatchResult.failed` 单条（当前总为空；为 partial commit 启用预留）。
+///
+/// 注：本类型当前未被任何 service 代码生成，但保留作为 VO schema 的稳定部分；
+/// 未来 partial commit 启用时，service 在每条失败处 push `DispatchFailureItem` 而非抛错。
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchFailureItem {
     #[serde(serialize_with = "serialize_i64")]

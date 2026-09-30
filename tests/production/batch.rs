@@ -263,17 +263,9 @@ async fn dispatch_nonexistent_batch_returns_not_found() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::OK,
-        "dispatch 应 200（failed 数组含 40404）: {env}"
-    );
-    assert_eq!(env["data"]["succeeded"].as_array().unwrap().len(), 0);
-    assert_eq!(env["data"]["failed"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        env["data"]["failed"][0]["code"], 20121,
-        "BIZ_BATCH_NOT_FOUND: {env}"
-    );
+    // 2026-09-30 重构：service 任一失败抛 AppError → handler 不 commit → 响应顶层 code
+    assert_eq!(s, StatusCode::NOT_FOUND, "不存在 batch 应 404: {env}");
+    assert_eq!(env["code"], 20121, "BIZ_BATCH_NOT_FOUND: {env}");
 }
 
 /// 场景 3: dispatch 二次调用同 batch → 20120 BIZ_BATCH_INVALID_STATUS (HTTP 409)
@@ -322,17 +314,9 @@ async fn dispatch_second_call_returns_invalid_status() {
         ),
     )
     .await;
-    assert_eq!(
-        s2,
-        StatusCode::OK,
-        "第 2 次 dispatch 应 200（failed 数组含 40903）: {env2}"
-    );
-    assert_eq!(env2["data"]["succeeded"].as_array().unwrap().len(), 0);
-    assert_eq!(env2["data"]["failed"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        env2["data"]["failed"][0]["code"], 20120,
-        "BIZ_BATCH_INVALID_STATUS: {env2}"
-    );
+    // 2026-09-30 重构：service 抛 AppError → 顶层响应 code = 20120
+    assert_eq!(s2, StatusCode::CONFLICT, "第 2 次 dispatch 应 409: {env2}");
+    assert_eq!(env2["code"], 20120, "BIZ_BATCH_INVALID_STATUS: {env2}");
 }
 
 /// 场景 4: dispatch 时 target_process_id 在 t_shelf_process 0 结果 → 20508 (HTTP 404)
@@ -361,17 +345,9 @@ async fn dispatch_no_shelf_for_process_returns_not_found() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::OK,
-        "dispatch 应 200（failed 数组含 404）: {env}"
-    );
-    assert_eq!(env["data"]["succeeded"].as_array().unwrap().len(), 0);
-    assert_eq!(env["data"]["failed"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        env["data"]["failed"][0]["code"], 20508,
-        "BIZ_SHELF_PROCESS_NOT_FOUND: {env}"
-    );
+    // 2026-09-30 重构：service 抛 AppError → 顶层响应 code = 20508
+    assert_eq!(s, StatusCode::NOT_FOUND, "无货架映射应 404: {env}");
+    assert_eq!(env["code"], 20508, "BIZ_SHELF_PROCESS_NOT_FOUND: {env}");
 
     // 验证 batch 仍是 PENDING（事务回滚）
     let row: (String,) = sqlx::query_as("SELECT status FROM t_part_batch WHERE id = $1")
@@ -445,21 +421,9 @@ async fn dispatch_bulk_full_rollback_on_one_failure() {
         ),
     )
     .await;
-    // 当前实现（重构后）：service 把每条失败放入 failed 数组，事务由 caller（handler）管理
-    // 一次 dispatch 调用内部全回滚（Transaction Drop），所以全批都没改 status。
-    assert_eq!(s, StatusCode::OK, "dispatch bulk 应 200: {env}");
-    assert_eq!(env["data"]["succeeded"].as_array().unwrap().len(), 0);
-    assert_eq!(env["data"]["failed"].as_array().unwrap().len(), 2);
-    let codes: Vec<i64> = env["data"]["failed"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| f["code"].as_i64().unwrap())
-        .collect();
-    assert!(
-        codes.contains(&20121),
-        "应有 batch_bad → BIZ_BATCH_NOT_FOUND 20121: {env}"
-    );
+    // 2026-09-30 重构：service 任一失败抛 AppError，handler tx Drop 全回滚 → 顶层 code
+    assert_eq!(s, StatusCode::NOT_FOUND, "batch_bad 已软删应 404: {env}");
+    assert_eq!(env["code"], 20121, "BIZ_BATCH_NOT_FOUND: {env}");
 
     // DB 验证：batch_ok 应保持 PENDING（事务回滚）
     let row_ok: (String,) = sqlx::query_as("SELECT status FROM t_part_batch WHERE id = $1")
@@ -693,17 +657,8 @@ async fn dispatch_after_concurrent_status_change_returns_invalid_status() {
         ),
     )
     .await;
-    assert_eq!(
-        s,
-        StatusCode::OK,
-        "并发前置 mutate 后应 200（failed 数组含 40903）: {env}"
-    );
-    assert_eq!(env["data"]["succeeded"].as_array().unwrap().len(), 0);
-    assert_eq!(env["data"]["failed"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        env["data"]["failed"][0]["code"], 20120,
-        "BIZ_BATCH_INVALID_STATUS: {env}"
-    );
+    assert_eq!(s, StatusCode::CONFLICT, "并发前置 mutate 后应 409: {env}");
+    assert_eq!(env["code"], 20120, "BIZ_BATCH_INVALID_STATUS: {env}");
 }
 
 /// 场景 9b: 外部 version bump → dispatch_batch 仍成功（version 自适应）

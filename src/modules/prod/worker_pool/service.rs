@@ -333,8 +333,8 @@ impl WorkerPoolService {
             MoveLocation::Worker { .. } => "WORKER",
         };
 
-        // 2. 同 kind 移动 → 非法
-        if from_kind == to_kind {
+        // 2. POOL→POOL 同 kind 移动 → 非法（WORKER→WORKER 是合法方向，需走 §5 三方向分支）
+        if from_kind == "POOL" && to_kind == "POOL" {
             return Err(AppError::validation(format!(
                 "move 同 kind 移动非法（from={from_kind} to={to_kind}）；应跨 kind 移动"
             )));

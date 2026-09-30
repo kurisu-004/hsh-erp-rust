@@ -30,8 +30,8 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::batch::repo::BatchRepo;
 use crate::modules::prod::batch::vo::{
-    AutoDispatchItem, AutoDispatchResult, DispatchFailureItem, DispatchResult, DispatchSuccessItem,
-    PendingBatchItem, PendingBatchListOut,
+    AutoDispatchItem, AutoDispatchResult, DispatchResult, DispatchSuccessItem, PendingBatchItem,
+    PendingBatchListOut,
 };
 use crate::shared::error::{AppError, code};
 
@@ -85,19 +85,18 @@ impl BatchService {
     ///   handler 层做 targets 解构后调用（避免新增 `bulk_dispatch` 转发壳）
     /// - 返回 `DispatchResult { succeeded, failed }`（BulkDispatchResult 形态）
     ///
-    /// 事务内流程（每条 target 顺序执行，任一失败 → handler tx Drop 自动回滚）：
+    /// 事务内流程（每条 target 顺序执行，任一硬失败 → service 抛 AppError，
+    /// handler tx Drop 自动回滚全部 succeeded 写入）：
     /// 1. 角色守卫：Manager + Clerk
-    /// 2. fetch batch → `None` → `BIZ_BATCH_NOT_FOUND` → 收集到 failed
-    /// 3. 校验 `batch.status == 'PENDING'` → 否则 `BIZ_BATCH_INVALID_STATUS` → failed
-    /// 4. `find_first_shelf_for_process(target_process_id)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND` → failed
-    /// 5. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT` → failed
+    /// 2. fetch batch → `None` → `BIZ_BATCH_NOT_FOUND` 抛错
+    /// 3. 校验 `batch.status == 'PENDING'` → 否则 `BIZ_BATCH_INVALID_STATUS` 抛错
+    /// 4. `find_first_shelf_for_process(target_process_id)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND` 抛错
+    /// 5. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT` 抛错
     /// 6. `PartRepo::insert_part_event('PLACED_ON_SHELF')`
     ///
-    /// 注：当前实现是「任一失败 → 全回滚」（service 不直接抛错，而是把失败
-    /// 收集到 failed 数组，handler 通过事务 Drop 回滚 succeeded 写入）。
-    /// 为了保留「service 直调方（in-source 单测）也能观测」的能力，单条 target
-    /// 失败时仍抛 AppError（handler 的 tx Drop 自动回滚）；多条 target 的
-    /// 失败收集由 handler 端循环管理（未来 partial commit 启用时改 service）。
+    /// 当前实现：保留原 bulk_dispatch 「任一失败 → 全回滚」语义。
+    /// `succeeded` / `failed` 数组实际只在全部成功时填 succeeded；失败路径
+    /// 由 service 抛 AppError 把 failed 信息透传给 caller。
     pub async fn dispatch_batch(
         conn: &mut PgConnection,
         batch_ids_targets: Vec<(i64, i64)>,
@@ -113,10 +112,11 @@ impl BatchService {
         }
 
         let mut succeeded = Vec::with_capacity(batch_ids_targets.len());
-        let mut failed = Vec::new();
 
         for (batch_id, target_process_id) in batch_ids_targets {
-            match Self::dispatch_single(
+            // 任一失败 → 直接抛 AppError；handler 的 Transaction Drop 自动回滚
+            // （service 不持有事务，事务由 caller 持有）
+            let item = Self::dispatch_single(
                 &mut *conn,
                 batch_id,
                 target_process_id,
@@ -124,18 +124,14 @@ impl BatchService {
                 snowflake,
                 current,
             )
-            .await
-            {
-                Ok(item) => succeeded.push(item),
-                Err(e) => failed.push(DispatchFailureItem {
-                    batch_id,
-                    code: e.code(),
-                    message: e.to_string(),
-                }),
-            }
+            .await?;
+            succeeded.push(item);
         }
 
-        Ok(DispatchResult { succeeded, failed })
+        Ok(DispatchResult {
+            succeeded,
+            failed: vec![],
+        })
     }
 
     /// 单条 dispatch 内部 helper（2026-09-30 新增）。
@@ -775,7 +771,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let r = BatchService::dispatch_batch(
+        let _r = BatchService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             Some("dispatch test"),
@@ -854,7 +850,7 @@ mod tests {
         .expect("第 1 次 dispatch OK");
 
         // 第二次：batch.status='IN_PROCESS' → 40903 → failed
-        let r = BatchService::dispatch_batch(
+        let _r = BatchService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
@@ -862,16 +858,12 @@ mod tests {
             &current,
         )
         .await
-        .expect("第 2 次 dispatch 应走 failed 不抛错");
-        assert_eq!(r.succeeded.len(), 0);
-        assert_eq!(r.failed.len(), 1);
-        assert_eq!(r.failed[0].batch_id, b_id);
-        assert_eq!(r.failed[0].code, code::BIZ_BATCH_INVALID_STATUS);
+        .expect_err("第 2 次 dispatch 应抛 BIZ_BATCH_INVALID_STATUS");
     }
 
     #[tokio::test]
     async fn dispatch_batch_nonexistent_batch_id_collects_failure() {
-        // 2026-09-30 重构：不存在 batch_id 走到 failed 数组而非直接抛错
+        // 2026-09-30 重构：不存在 batch_id service 抛 BIZ_BATCH_NOT_FOUND
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let process_id = insert_process(&pool, "P-NX", "ACME").await;
@@ -880,7 +872,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let r = BatchService::dispatch_batch(
+        let e = BatchService::dispatch_batch(
             &mut conn,
             vec![(999_999_999, process_id)],
             None,
@@ -888,10 +880,8 @@ mod tests {
             &make_current(user_id, Role::Manager),
         )
         .await
-        .expect("应走 failed 不抛错");
-        assert_eq!(r.succeeded.len(), 0);
-        assert_eq!(r.failed.len(), 1);
-        assert_eq!(r.failed[0].code, code::BIZ_BATCH_NOT_FOUND);
+        .expect_err("应抛 BIZ_BATCH_NOT_FOUND");
+        assert_eq!(e.code(), code::BIZ_BATCH_NOT_FOUND);
     }
 
     #[tokio::test]
@@ -925,7 +915,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let r = BatchService::dispatch_batch(
+        let _r = BatchService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
@@ -933,10 +923,7 @@ mod tests {
             &make_current(user_id, Role::Manager),
         )
         .await
-        .expect("应走 failed 不抛错");
-        assert_eq!(r.succeeded.len(), 0);
-        assert_eq!(r.failed.len(), 1);
-        assert_eq!(r.failed[0].code, code::BIZ_BATCH_INVALID_STATUS);
+        .expect_err("应抛 BIZ_BATCH_INVALID_STATUS");
     }
 
     #[tokio::test]
@@ -992,7 +979,7 @@ mod tests {
         let b_id = insert_part_batch(&pool, p_id).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::dispatch_batch(
+        let _r = BatchService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id)],
             None,
@@ -1031,7 +1018,7 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let r = BatchService::dispatch_batch(
+        let _r = BatchService::dispatch_batch(
             &mut conn,
             vec![(b_id, process_id_no_shelf)],
             None,
@@ -1039,10 +1026,7 @@ mod tests {
             &make_current(user_id, Role::Manager),
         )
         .await
-        .expect("应走 failed 不抛错");
-        assert_eq!(r.succeeded.len(), 0);
-        assert_eq!(r.failed.len(), 1);
-        assert_eq!(r.failed[0].code, code::BIZ_SHELF_PROCESS_NOT_FOUND);
+        .expect_err("应抛 BIZ_SHELF_PROCESS_NOT_FOUND");
     }
 
     #[tokio::test]

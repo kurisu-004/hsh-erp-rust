@@ -1279,7 +1279,7 @@ async fn move_from_mismatch_returns_location_mismatch_error() {
             Some(json!({
                 "batch_id": pool_batch.to_string(),
                 // from 谎报成 WORKER（实际在 POOL），期望 40904
-                "from": { "kind": "WORKER", "worker_id": 999_999_999 },
+                "from": { "kind": "WORKER", "worker_id": "999999999" },
                 "to":   { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
             })),
             Some(&token),
