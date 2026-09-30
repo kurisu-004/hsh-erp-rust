@@ -376,7 +376,7 @@ async fn parse_filters(
     conn: &mut PgConnection,
     query: &UnionListQuery,
 ) -> Result<ParsedFilters, AppError> {
-    // 排序键白名单：6 键（去掉 SERIAL_NO，因 t_assembly 上无对应列）。
+    // 排序键白名单：7 键（去掉 SERIAL_NO，因 t_assembly 上无对应列）。
     let sort_by = [
         "CREATED_AT",
         "UPDATED_AT",
@@ -384,6 +384,7 @@ async fn parse_filters(
         "REQUEST_DATE",
         "DRAWING_NO",
         "NAME",
+        "SYSTEM_DELIVERY_DATE", // 2026-09-30 新增（dashboard「最紧急工单」按系统交期排序）
     ]
     .iter()
     .find(|&&s| Some(s) == query.sort_by.as_deref())

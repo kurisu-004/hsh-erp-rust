@@ -91,6 +91,7 @@ fn union_sort_col(sort_by: &str) -> &'static str {
         "REQUEST_DATE" => "request_date",
         "DRAWING_NO" => "drawing_no",
         "NAME" => "name",
+        "SYSTEM_DELIVERY_DATE" => "system_delivery_date", // 2026-09-30 新增
         _ => "id",
     }
 }

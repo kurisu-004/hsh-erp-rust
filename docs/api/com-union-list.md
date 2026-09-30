@@ -48,7 +48,7 @@ GET /api/v2/com/union-list
 | `holder_ids` | `string` | 否 | — | 逗号分隔雪花 ID。**PART / ALL 模式生效**；ASSEMBLY 模式忽略 |
 | `planned_delivery_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口下界 `planned_delivery_date >= $from`。**PART / ALL / ASSEMBLY 三模式全部生效**。非法格式 → `40001 VALIDATION_ERROR` |
 | `planned_delivery_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口上界 `planned_delivery_date <= $to`。**PART / ALL / ASSEMBLY 三模式全部生效**。非法格式 → `40001 VALIDATION_ERROR`。任一端缺失 → 对应 NULL 短路 |
-| `sort_by` | `string` | 否 | `CREATED_AT` | 排序键白名单：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `DRAWING_NO` / `NAME`。**注意**：`SERIAL_NO` 仅 `t_part` 独有 → ALL 模式降级 `CREATED_AT` |
+| `sort_by` | `string` | 否 | `CREATED_AT` | 排序键白名单：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `DRAWING_NO` / `NAME` / `SYSTEM_DELIVERY_DATE`。**注意**：`SERIAL_NO` 仅 `t_part` 独有 → ALL 模式降级 `CREATED_AT` |
 | `sort_dir` | `string` | 否 | `DESC` | `"ASC"` / `"DESC"` |
 | `limit` | `i64` | 否 | `50` | `[1, 200]` |
 | `offset` | `i64` | 否 | `0` | `>= 0` |
