@@ -257,6 +257,94 @@ impl BatchRepo {
         .await?;
         Ok(row.flatten())
     }
+
+    /// 2026-09-30 新增：`auto_dispatch_preview` 单 SQL（取代旧 3 步 SQL）。
+    ///
+    /// 对每个 `batch_id`：
+    /// - 查 part.process_chain_id
+    /// - LEFT JOIN LATERAL 取 chain 首道 step（sort_order ASC LIMIT 1）
+    /// - LEFT JOIN LATERAL 取该工序的首个货架映射（sort_order ASC LIMIT 1）
+    ///
+    /// 返回 `Vec<AutoDispatchPreviewRow>`（含 batch_id / part_id / chain_id /
+    /// first_process_id / first_process_code / first_process_name / first_shelf_id）。
+    ///
+    /// 不在结果中的 batch_id 走 service 二次补行 + `skip_reason='NOT_FOUND'`。
+    ///
+    /// 业务口径：
+    /// - 只取 PENDING + 未软删 的 batch（与 pending list 端点一致）
+    /// - 不写库，纯只读查询
+    /// - 单 SQL 一次扫表，service 主路径不再分 3 步
+    ///
+    /// 索引命中：`ix_t_part_batch_status`（`status`）+ `pb.deleted_at` 过滤；
+    /// LEFT JOIN LATERAL t_process_chain_step 走 `(chain_id, sort_order)` 索引；
+    /// LEFT JOIN LATERAL t_shelf_process 走 `(process_id, sort_order)` 索引。
+    pub async fn preview_auto_dispatch(
+        conn: &mut PgConnection,
+        batch_ids: &[i64],
+    ) -> Result<Vec<AutoDispatchPreviewRow>, sqlx::Error> {
+        if batch_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let rows: Vec<AutoDispatchPreviewRow> = sqlx::query_as!(
+            AutoDispatchPreviewRow,
+            r#"
+            SELECT
+                pb.id            AS "batch_id!",
+                p.id             AS "part_id!",
+                p.process_chain_id AS "process_chain_id?",
+                pcs.process_id   AS "first_process_id?",
+                pr.code          AS "first_process_code?",
+                pr.name          AS "first_process_name?",
+                sp.shelf_id      AS "first_shelf_id?"
+            FROM t_part_batch pb
+            JOIN t_part p
+                ON p.id = pb.part_id AND p.deleted_at IS NULL
+            LEFT JOIN LATERAL (
+                SELECT process_id
+                FROM t_process_chain_step pcs
+                WHERE pcs.chain_id = p.process_chain_id
+                  AND pcs.deleted_at IS NULL
+                ORDER BY pcs.sort_order ASC, pcs.id ASC
+                LIMIT 1
+            ) pcs ON TRUE
+            LEFT JOIN t_process pr
+                ON pr.id = pcs.process_id
+            LEFT JOIN LATERAL (
+                SELECT shelf_id
+                FROM t_shelf_process sp
+                WHERE sp.process_id = pcs.process_id
+                  AND sp.deleted_at IS NULL
+                ORDER BY sp.sort_order ASC, sp.id ASC
+                LIMIT 1
+            ) sp ON TRUE
+            WHERE pb.id = ANY($1)
+              AND pb.status = 'PENDING'
+              AND pb.deleted_at IS NULL
+            "#,
+            batch_ids as &[i64],
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(rows)
+    }
+
+    /// 按 batch_id 查 part_id（preview_auto_dispatch NOT_FOUND 兜底用）。
+    pub async fn find_part_id_by_batch_id(
+        conn: &mut PgConnection,
+        batch_id: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT pb.part_id
+            FROM t_part_batch pb
+            WHERE pb.id = $1
+            "#,
+        )
+        .bind(batch_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row)
+    }
 }
 
 // ===== 行结构（SQL FROM 投影） =====
@@ -305,4 +393,24 @@ pub struct FirstChainStepRow {
     pub step_id: i64,
     pub step_process_id: i64,
     pub step_sort_order: i32,
+}
+
+/// `preview_auto_dispatch` 单行投影（2026-09-30 新增）。
+///
+/// 字段全为 Option：service 层根据组合判断 skip_reason：
+/// - process_chain_id = None → NO_PROCESS_CHAIN
+/// - first_process_id = None → NO_PROCESS_STEP
+/// - first_shelf_id = None → NO_SHELF（首道工序未映射货架）
+/// - 全部齐全 → None（可下发）
+#[derive(Debug, sqlx::FromRow)]
+pub struct AutoDispatchPreviewRow {
+    #[allow(dead_code)]
+    pub batch_id: i64,
+    #[allow(dead_code)]
+    pub part_id: i64,
+    pub process_chain_id: Option<i64>,
+    pub first_process_id: Option<i64>,
+    pub first_process_code: Option<String>,
+    pub first_process_name: Option<String>,
+    pub first_shelf_id: Option<i64>,
 }

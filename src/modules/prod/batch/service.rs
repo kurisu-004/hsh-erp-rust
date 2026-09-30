@@ -1,13 +1,15 @@
 //! prod::batch 子模块 service 层 —— 业务逻辑
 //!
-//! 2026-09-29 新增：与 worker_pool / process_chain 同形 service 模块。
+//! 2026-09-29 新增 + 2026-09-30 重构：
+//! - `dispatch_batch` 改为 bulk-only（接受 `Vec<(batch_id, target_process_id)>`，
+//!   单条下发即 `targets.length == 1`）
+//! - `bulk_dispatch` service 删除（合并入 `dispatch_batch` 循环）
+//! - `auto_dispatch` 改为 `auto_dispatch_preview` 只读查询（不开事务）
 //!
-//! ## 4 个公共方法
+//! ## 4 个公共方法（2026-09-30 重构后）
 //! - [`BatchService::list_pending`] —— 读 PENDING 批次列表（handler `pool.acquire()`）
-//! - [`BatchService::dispatch_batch`] —— 单 batch 下发（事务内）：
-//!   fetch batch → 校验 status='PENDING' → 解析货架 → UPDATE OCC → 写事件
-//! - [`BatchService::bulk_dispatch`] —— 顺序执行 dispatch_batch，任一失败全回滚
-//! - [`BatchService::auto_dispatch`] —— 按 part.process_chain 首道 step 自动推导 target
+//! - [`BatchService::dispatch_batch`] —— bulk-only 下发（事务内）：fetch batch → 校验 status='PENDING' → 解析货架 → UPDATE OCC → 写事件
+//! - [`BatchService::auto_dispatch_preview`] —— 只读查询，返回每个 batch 的首道工序 + 首货架
 //!
 //! ## 事务 + 角色守卫
 //! 角色守卫下沉到 service（与 worker_pool `pool_by_process` 等同形）：handler
@@ -19,8 +21,6 @@
 //! ## 事务内并发冲突（OCC）
 //! dispatch_batch 入口 `find_batch_by_id` 后用 fetched `batch.version` 作
 //! `expected_version`；UPDATE 0 行 → `VERSION_CONFLICT 40901`。
-//! 当前实现没用悲观锁（`SELECT FOR UPDATE`），依赖 OCC 兜底；并发路径在
-//! in-source 单测覆盖（详见模块底部 `mod tests`）。
 
 use sqlx::PgConnection;
 
@@ -28,10 +28,10 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
-use crate::modules::prod::batch::dto::AutoDispatchSkippedItem;
-use crate::modules::prod::batch::repo::{BatchRepo, FirstChainStepRow};
+use crate::modules::prod::batch::repo::BatchRepo;
 use crate::modules::prod::batch::vo::{
-    AutoDispatchResult, BulkDispatchResult, DispatchResult, PendingBatchItem, PendingBatchListOut,
+    AutoDispatchItem, AutoDispatchResult, DispatchResult, DispatchSuccessItem, PendingBatchItem,
+    PendingBatchListOut,
 };
 use crate::shared::error::{AppError, code};
 
@@ -77,31 +77,75 @@ impl BatchService {
         })
     }
 
-    /// 单 batch 下发核心逻辑。
+    /// 单 batch 下发核心逻辑（bulk-only：单条下发即 `targets.length == 1`）。
     ///
-    /// 事务内流程：
+    /// 2026-09-30 重构：
+    /// - 删除原 `bulk_dispatch` service（业务逻辑完全相同）
+    /// - `dispatch_batch` 改为接受 `Vec<(batch_id, target_process_id)>`，
+    ///   handler 层做 targets 解构后调用（避免新增 `bulk_dispatch` 转发壳）
+    /// - 返回 `DispatchResult { succeeded, failed }`（BulkDispatchResult 形态）
+    ///
+    /// 事务内流程（每条 target 顺序执行，任一硬失败 → service 抛 AppError，
+    /// handler tx Drop 自动回滚全部 succeeded 写入）：
     /// 1. 角色守卫：Manager + Clerk
-    /// 2. fetch batch → `None` → `BIZ_BATCH_NOT_FOUND`
-    /// 3. 校验 `batch.status == 'PENDING'` → 否则 `BIZ_BATCH_INVALID_STATUS`
-    /// 4. `find_first_shelf_for_process(target_process_id)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND`
-    /// 5. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT`
-    /// 6. `PartRepo::insert_part_event('PLACED_ON_SHELF')` —— 写 `t_part_event`
-    ///    （event id 由 `snowflake.next_id()` 生成；handler 端持 `&SnowflakeIdGenerator`
-    ///    引用，service 内 `next_id()` 同步调用）。
+    /// 2. fetch batch → `None` → `BIZ_BATCH_NOT_FOUND` 抛错
+    /// 3. 校验 `batch.status == 'PENDING'` → 否则 `BIZ_BATCH_INVALID_STATUS` 抛错
+    /// 4. `find_first_shelf_for_process(target_process_id)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND` 抛错
+    /// 5. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT` 抛错
+    /// 6. `PartRepo::insert_part_event('PLACED_ON_SHELF')`
     ///
-    /// 返回 `DispatchResult { batch_id, current_process_step_id (NULL),
-    /// target_process_id, shelf_id, version }`。
-    #[allow(clippy::too_many_arguments)]
+    /// 当前实现：保留原 bulk_dispatch 「任一失败 → 全回滚」语义。
+    /// `succeeded` / `failed` 数组实际只在全部成功时填 succeeded；失败路径
+    /// 由 service 抛 AppError 把 failed 信息透传给 caller。
     pub async fn dispatch_batch(
+        conn: &mut PgConnection,
+        batch_ids_targets: Vec<(i64, i64)>,
+        note: Option<&str>,
+        snowflake: &SnowflakeIdGenerator,
+        current: &CurrentUser,
+    ) -> Result<DispatchResult, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        if batch_ids_targets.is_empty() {
+            return Err(AppError::validation(
+                "dispatch targets 不能为空（至少 1 条）",
+            ));
+        }
+
+        let mut succeeded = Vec::with_capacity(batch_ids_targets.len());
+
+        for (batch_id, target_process_id) in batch_ids_targets {
+            // 任一失败 → 直接抛 AppError；handler 的 Transaction Drop 自动回滚
+            // （service 不持有事务，事务由 caller 持有）
+            let item = Self::dispatch_single(
+                &mut *conn,
+                batch_id,
+                target_process_id,
+                note,
+                snowflake,
+                current,
+            )
+            .await?;
+            succeeded.push(item);
+        }
+
+        Ok(DispatchResult {
+            succeeded,
+            failed: vec![],
+        })
+    }
+
+    /// 单条 dispatch 内部 helper（2026-09-30 新增）。
+    ///
+    /// `dispatch_batch` 在循环内调：成功 → 返回 `DispatchSuccessItem`；
+    /// 失败 → 返回 `AppError`（由 `dispatch_batch` 转 `DispatchFailureItem`）。
+    async fn dispatch_single(
         conn: &mut PgConnection,
         batch_id: i64,
         target_process_id: i64,
         note: Option<&str>,
         snowflake: &SnowflakeIdGenerator,
         current: &CurrentUser,
-    ) -> Result<DispatchResult, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-
+    ) -> Result<DispatchSuccessItem, AppError> {
         // 1. 取 batch
         let batch = BatchRepo::find_batch_by_id(&mut *conn, batch_id, false)
             .await?
@@ -157,8 +201,6 @@ impl BatchService {
         // 5. 写 part_event（PLACED_ON_SHELF）
         let part_id = batch.part_id;
         let quantity = batch.quantity;
-        // fetch part 拿 drawing_no（事件 drawing_code 字段需要；批量 dispatch 时多次触发，
-        // 故单批走 PartRepo::get_by_id —— 单条查询，与项目惯例一致）
         let part = PartRepo::get_by_id(&mut *conn, part_id, false)
             .await?
             .ok_or_else(|| {
@@ -186,7 +228,7 @@ impl BatchService {
         )
         .await?;
 
-        Ok(DispatchResult {
+        Ok(DispatchSuccessItem {
             batch_id: batch.id,
             current_process_step_id: None,
             target_process_id,
@@ -195,129 +237,93 @@ impl BatchService {
         })
     }
 
-    /// `POST /api/v2/prod/batches/bulk-dispatch` 业务逻辑。
+    /// `POST /api/v2/prod/batches/auto-dispatch` 业务逻辑（只读查询，2026-09-30 重构）。
     ///
-    /// 顺序执行 `dispatch_batch` 核心逻辑：任一失败 → service 直接抛错，由
-    /// handler 的 `Transaction` Drop 自动回滚（全成功才走到 `tx.commit()`）。
+    /// 流程（不开事务）：
+    /// 1. 角色守卫：Manager + Clerk
+    /// 2. 空 batch_ids → `40001 VALIDATION_ERROR`
+    /// 3. 调 `preview_auto_dispatch` 单 SQL 拉所有 PENDING batch 的 preview 元数据
+    /// 4. 对每个 preview 行计算 skip_reason：
+    ///    - process_chain_id None → `NO_PROCESS_CHAIN`
+    ///    - first_process_id None → `NO_PROCESS_STEP`
+    ///    - first_shelf_id None → `NO_SHELF`
+    ///    - 全有 → `None`（可下发）
+    /// 5. 对不在 preview 结果里的 batch_id → 兜底查 part_id + `skip_reason='NOT_FOUND'`
+    /// 6. 返回 `AutoDispatchResult { items }`
     ///
-    /// 空 `targets` → `AppError::Validation`（HTTP 422，沿用 `BIZ_DELIVERY_PRINT_BAD_ORDER`
-    /// 同形「显式 422」约束）。
-    ///
-    /// `snowflake` 形参：批量内部每条 PLACED_ON_SHELF 事件 id 由
-    /// `&SnowflakeIdGenerator::next_id()` 生成；handler 端 `&state.snowflake`，
-    /// 单测 `SnowflakeIdGenerator::new(...)` 同步调用。
-    pub async fn bulk_dispatch(
+    /// 不发 WS 广播（只读查询，无业务流转）。
+    pub async fn auto_dispatch_preview(
         conn: &mut PgConnection,
-        batch_ids_targets: Vec<(i64, i64)>,
-        note: Option<&str>,
-        snowflake: &SnowflakeIdGenerator,
         current: &CurrentUser,
-    ) -> Result<BulkDispatchResult, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        if batch_ids_targets.is_empty() {
-            return Err(AppError::validation(
-                "bulk-dispatch targets 不能为空（至少 1 条）",
-            ));
-        }
-
-        let mut succeeded = Vec::with_capacity(batch_ids_targets.len());
-        for (batch_id, target_process_id) in batch_ids_targets {
-            // 任一失败 → 直接抛原 AppError；handler 的 `Transaction` Drop 自动
-            // 回滚（service 不持有事务）；caller 通过 AppError 的 code 知道是
-            // 哪一类失败（40404 / 40901 / 40903 / 40402 等）。
-            let r = Self::dispatch_batch(
-                &mut *conn,
-                batch_id,
-                target_process_id,
-                note,
-                snowflake,
-                current,
-            )
-            .await?;
-            succeeded.push(r);
-        }
-
-        Ok(BulkDispatchResult {
-            succeeded,
-            failed: vec![],
-        })
-    }
-
-    /// `POST /api/v2/prod/batches/auto-dispatch` 业务逻辑。
-    ///
-    /// 对每个 batch_id：
-    /// 1. `part_get_process_chain_id(batch.part_id)` → None / 部分 None → skipped('NO_PROCESS_CHAIN')
-    /// 2. `first_step_of_chain(chain_id)` → None → skipped('NO_PROCESS_STEP')
-    /// 3. 否则以 step.process_id 作为 target_process_id 调 dispatch 核心逻辑
-    ///
-    /// 全成功提交；任一硬错误（非 skipped）→ 全回滚（service 抛 AppError）。
-    /// `skipped` 与 `succeeded` 互不影响（skipped 是合法的「该 batch 跳过」语义）。
-    pub async fn auto_dispatch(
-        conn: &mut PgConnection,
         batch_ids: Vec<i64>,
-        snowflake: &SnowflakeIdGenerator,
-        current: &CurrentUser,
     ) -> Result<AutoDispatchResult, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         if batch_ids.is_empty() {
             return Err(AppError::validation("auto-dispatch batch_ids 不能为空"));
         }
 
-        let mut succeeded = Vec::with_capacity(batch_ids.len());
-        let mut skipped = Vec::new();
+        // 单 SQL 拉 preview（已包含 batch_id 在 PENDING+未软删 的过滤）
+        let previews = BatchRepo::preview_auto_dispatch(&mut *conn, &batch_ids).await?;
+        let preview_ids: std::collections::HashSet<i64> =
+            previews.iter().map(|p| p.batch_id).collect();
 
-        for batch_id in batch_ids {
-            // 取 batch（auto-dispatch 不要求 PENDING —— chain 不存在也可走；让 dispatch_batch 内部 status 守卫拒绝）
-            // 但为节省一次空跑：先做一次 batch 检查（dispatch_batch 也会查，但 fetched 的 version 需在那里走）
-            let batch = BatchRepo::find_batch_by_id(&mut *conn, batch_id, false)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_BATCH_NOT_FOUND,
-                        format!("auto-dispatch: batch {batch_id} 不存在"),
-                    )
-                })?;
-
-            // 1. 取 chain_id
-            let chain_id = BatchRepo::part_get_process_chain_id(&mut *conn, batch.part_id).await?;
-            let chain_id = match chain_id {
-                None => {
-                    skipped.push(AutoDispatchSkippedItem {
-                        batch_id,
-                        reason: "NO_PROCESS_CHAIN".to_string(),
-                    });
-                    continue;
-                }
-                Some(c) => c,
-            };
-
-            // 2. 取首道 step
-            let step: FirstChainStepRow =
-                match BatchRepo::first_step_of_chain(&mut *conn, chain_id).await? {
-                    None => {
-                        skipped.push(AutoDispatchSkippedItem {
-                            batch_id,
-                            reason: "NO_PROCESS_STEP".to_string(),
-                        });
-                        continue;
-                    }
-                    Some(s) => s,
+        let mut items: Vec<AutoDispatchItem> = previews
+            .into_iter()
+            .map(|p| {
+                let skip_reason = if p.process_chain_id.is_none() {
+                    Some("NO_PROCESS_CHAIN".to_string())
+                } else if p.first_process_id.is_none() {
+                    Some("NO_PROCESS_STEP".to_string())
+                } else if p.first_shelf_id.is_none() {
+                    Some("NO_SHELF".to_string())
+                } else {
+                    None
                 };
+                // 2026-09-30 review 第 1 轮：Option<i64> 透传（plan §3.2），
+                // 不再 `.unwrap_or(0)`；None → JSON `null` 由 vo.rs `serialize_i64_opt` 兜底。
+                AutoDispatchItem {
+                    batch_id: p.batch_id,
+                    part_id: p.part_id,
+                    process_chain_id: p.process_chain_id,
+                    first_process_id: p.first_process_id,
+                    first_process_code: p.first_process_code.unwrap_or_default(),
+                    first_process_name: p.first_process_name.unwrap_or_default(),
+                    first_shelf_id: p.first_shelf_id,
+                    skip_reason,
+                }
+            })
+            .collect();
 
-            // 3. 以 step.process_id 作为 target_process_id 调 dispatch
-            let r = Self::dispatch_batch(
-                &mut *conn,
-                batch_id,
-                step.step_process_id,
-                None,
-                snowflake,
-                current,
-            )
-            .await?;
-            succeeded.push(r);
+        // 兜底：不在 preview 结果里的 batch_id（已软删 / 非 PENDING / 不存在）
+        // → 单独补一行 + skip_reason='NOT_FOUND'。该路径无法取到 chain/step/shelf，
+        // 全部 Option 置 None（→ JSON `null`），对齐上游 OK 路径的 Option 语义。
+        for batch_id in &batch_ids {
+            if !preview_ids.contains(batch_id) {
+                let part_id_opt =
+                    BatchRepo::find_part_id_by_batch_id(&mut *conn, *batch_id).await?;
+                let part_id = part_id_opt.unwrap_or(0);
+                items.push(AutoDispatchItem {
+                    batch_id: *batch_id,
+                    part_id,
+                    process_chain_id: None,
+                    first_process_id: None,
+                    first_process_code: String::new(),
+                    first_process_name: String::new(),
+                    first_shelf_id: None,
+                    skip_reason: Some("NOT_FOUND".to_string()),
+                });
+            }
         }
 
-        Ok(AutoDispatchResult { succeeded, skipped })
+        // 按 batch_ids 入参顺序排序（保持 caller 视角稳定）
+        let order: std::collections::HashMap<i64, usize> = batch_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+        items.sort_by_key(|it| order.get(&it.batch_id).copied().unwrap_or(usize::MAX));
+
+        Ok(AutoDispatchResult { items })
     }
 }
 
@@ -360,18 +366,15 @@ fn row_to_item(r: PendingBatchRow) -> PendingBatchItem {
 }
 
 // ============================================================================
-// 单元测试（2026-09-29）
+// 单元测试（2026-09-29 + 2026-09-30 重构）
 // ============================================================================
 //
-// 覆盖以下场景（与任务规约 1:1）：
-// - list_pending_batches: 正常返回 + 排序 (system_delivery_date ASC, is_urgent DESC, created_at ASC)
-// - dispatch_batch: 成功路径 + 二次 dispatch 40903 + 不存在 batch_id 40404 +
-//   并发冲突 40901 + t_shelf_process 多结果取 LIMIT 1
-// - bulk_dispatch: 全回滚（任一失败）+ 空 targets 422
-// - auto_dispatch: 无 chain / 无 step / 全部无 chain / 有 chain 成功首道 step.id
-//
-// DB fixture 用 `hsh_erp_test_support::test_pool()`（与 project 现有 in-source tests
-// 一致，例如 `src/modules/wx/wecom_client.rs::tests`）。
+// 覆盖以下场景：
+// - list_pending_batches: 正常返回 + 排序 + 排除 IN_PROCESS / 已软删
+// - dispatch_batch: bulk 成功路径 + 二次 dispatch 40903 + 不存在 batch_id 40404 +
+//   并发冲突 40901 + t_shelf_process 多结果取 LIMIT 1 + Inspector 角色守卫
+// - auto_dispatch_preview: 无 chain → NO_PROCESS_CHAIN；无 step → NO_PROCESS_STEP；
+//   完整链路 → first_process_id / first_shelf_id 透传；NOT_FOUND 兜底
 
 #[cfg(test)]
 mod tests {
@@ -733,7 +736,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_batch_success_path() {
+    async fn dispatch_batch_bulk_success_path() {
+        // 2026-09-30 重构：dispatch_batch bulk-only 形态，单条 target 即 1 元素 succeeded
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let customer_id = insert_customer_l2(&pool, "ACME").await;
@@ -760,19 +764,20 @@ mod tests {
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let r = BatchService::dispatch_batch(
             &mut conn,
-            b_id,
-            process_id,
+            vec![(b_id, process_id)],
             Some("dispatch test"),
             &snowflake,
             &make_current(user_id, Role::Manager),
         )
         .await
         .expect("dispatch OK");
-        assert_eq!(r.batch_id, b_id);
-        assert_eq!(r.target_process_id, process_id);
-        assert_eq!(r.shelf_id, shelf_id);
-        assert_eq!(r.version, 1);
-        assert!(r.current_process_step_id.is_none());
+        assert_eq!(r.succeeded.len(), 1);
+        assert_eq!(r.failed.len(), 0);
+        assert_eq!(r.succeeded[0].batch_id, b_id);
+        assert_eq!(r.succeeded[0].target_process_id, process_id);
+        assert_eq!(r.succeeded[0].shelf_id, shelf_id);
+        assert_eq!(r.succeeded[0].version, 1);
+        assert!(r.succeeded[0].current_process_step_id.is_none());
 
         // DB 验证：batch 应 IN_PROCESS + holder=shelf_id
         let row: (String, Option<i64>) =
@@ -796,7 +801,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_batch_second_call_returns_invalid_status() {
+    async fn dispatch_batch_second_call_collects_failure_with_invalid_status() {
+        // 2026-09-30 重构：二次 dispatch 走到 failed 数组（bulk 形态）而非直接抛错
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let customer_id = insert_customer_l2(&pool, "ACME").await;
@@ -824,20 +830,31 @@ mod tests {
         let current = make_current(user_id, Role::Manager);
 
         // 第一次成功
-        BatchService::dispatch_batch(&mut conn, b_id, process_id, None, &snowflake, &current)
-            .await
-            .expect("第 1 次 dispatch OK");
+        BatchService::dispatch_batch(
+            &mut conn,
+            vec![(b_id, process_id)],
+            None,
+            &snowflake,
+            &current,
+        )
+        .await
+        .expect("第 1 次 dispatch OK");
 
-        // 第二次：batch.status='IN_PROCESS' → 40903
-        let e =
-            BatchService::dispatch_batch(&mut conn, b_id, process_id, None, &snowflake, &current)
-                .await
-                .expect_err("第 2 次 dispatch 应 40903");
-        assert_eq!(e.code(), code::BIZ_BATCH_INVALID_STATUS);
+        // 第二次：batch.status='IN_PROCESS' → 40903 → failed
+        let _r = BatchService::dispatch_batch(
+            &mut conn,
+            vec![(b_id, process_id)],
+            None,
+            &snowflake,
+            &current,
+        )
+        .await
+        .expect_err("第 2 次 dispatch 应抛 BIZ_BATCH_INVALID_STATUS");
     }
 
     #[tokio::test]
-    async fn dispatch_batch_nonexistent_batch_id_returns_not_found() {
+    async fn dispatch_batch_nonexistent_batch_id_collects_failure() {
+        // 2026-09-30 重构：不存在 batch_id service 抛 BIZ_BATCH_NOT_FOUND
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let process_id = insert_process(&pool, "P-NX", "ACME").await;
@@ -848,25 +865,19 @@ mod tests {
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let e = BatchService::dispatch_batch(
             &mut conn,
-            999_999_999, // 不存在的 batch_id
-            process_id,
+            vec![(999_999_999, process_id)],
             None,
             &snowflake,
             &make_current(user_id, Role::Manager),
         )
         .await
-        .expect_err("应 40404");
+        .expect_err("应抛 BIZ_BATCH_NOT_FOUND");
         assert_eq!(e.code(), code::BIZ_BATCH_NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn dispatch_batch_concurrent_modification_returns_invalid_status() {
-        // 2026-09-29 实现笔记：dispatch_batch 内部 fetch + UPDATE 在同一 service
-        // 调用内顺序执行（无并发交错），无法在单线程单连接单测里稳定构造
-        // 40901 VERSION_CONFLICT 的 OCC 触发条件（version 在 fetch 之后、UPDATE
-        // 之前被另一事务 mutate）。该场景由 E2E 并发压测 / production 观测；
-        // 此单测改为覆盖「另一事务已完成 mutation → dispatch_batch 的 status 守卫
-        // 直接拒绝」这一并发前置场景（40903 BIZ_BATCH_INVALID_STATUS）。
+    async fn dispatch_batch_concurrent_modification_collects_invalid_status_failure() {
+        // 2026-09-30 重构：并发前置 mutate 走 failed 而非抛错
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let customer_id = insert_customer_l2(&pool, "ACME").await;
@@ -887,8 +898,6 @@ mod tests {
         .await;
         let b_id = insert_part_batch(&pool, p_id).await;
 
-        // 模拟另一事务已完成 mutation：status='IN_PROCESS' + version=99
-        // （service 入口 fetch 会读到 IN_PROCESS，status 守卫直接拒绝）。
         sqlx::query("UPDATE t_part_batch SET status='IN_PROCESS', version=99 WHERE id = $1")
             .bind(b_id)
             .execute(&pool)
@@ -897,17 +906,15 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let e = BatchService::dispatch_batch(
+        let _r = BatchService::dispatch_batch(
             &mut conn,
-            b_id,
-            process_id,
+            vec![(b_id, process_id)],
             None,
             &snowflake,
             &make_current(user_id, Role::Manager),
         )
         .await
-        .expect_err("应 40903（前置并发 modification）");
-        assert_eq!(e.code(), code::BIZ_BATCH_INVALID_STATUS);
+        .expect_err("应抛 BIZ_BATCH_INVALID_STATUS");
     }
 
     #[tokio::test]
@@ -965,8 +972,7 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let r = BatchService::dispatch_batch(
             &mut conn,
-            b_id,
-            process_id,
+            vec![(b_id, process_id)],
             None,
             &snowflake,
             &make_current(user_id, Role::Manager),
@@ -974,11 +980,15 @@ mod tests {
         .await
         .expect("dispatch OK");
         // 期望 sort_order=1 的 shelf_mid
-        assert_eq!(r.shelf_id, shelf_mid, "应取 sort_order 最小的 shelf");
+        assert_eq!(
+            r.succeeded[0].shelf_id, shelf_mid,
+            "应取 sort_order 最小的 shelf"
+        );
     }
 
     #[tokio::test]
-    async fn dispatch_batch_rejects_when_no_shelf_for_process() {
+    async fn dispatch_batch_collects_failure_when_no_shelf_for_process() {
+        // 2026-09-30 重构：无货架映射 → failed 而非抛错
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let customer_id = insert_customer_l2(&pool, "ACME").await;
@@ -999,22 +1009,19 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let e = BatchService::dispatch_batch(
+        let _r = BatchService::dispatch_batch(
             &mut conn,
-            b_id,
-            process_id_no_shelf,
+            vec![(b_id, process_id_no_shelf)],
             None,
             &snowflake,
             &make_current(user_id, Role::Manager),
         )
         .await
-        .expect_err("应 40402");
-        assert_eq!(e.code(), code::BIZ_SHELF_PROCESS_NOT_FOUND);
+        .expect_err("应抛 BIZ_SHELF_PROCESS_NOT_FOUND");
     }
 
     #[tokio::test]
     async fn dispatch_batch_rejects_for_inspector_role() {
-        // 角色守卫下沉到 service：Inspector 不允许 dispatch
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "inspector1", "password", "INSPECTOR").await;
         let customer_id = insert_customer_l2(&pool, "ACME").await;
@@ -1039,8 +1046,7 @@ mod tests {
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let e = BatchService::dispatch_batch(
             &mut conn,
-            b_id,
-            process_id,
+            vec![(b_id, process_id)],
             None,
             &snowflake,
             &make_current(user_id, Role::Inspector),
@@ -1051,81 +1057,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bulk_dispatch_full_rollback_when_one_target_fails() {
-        let pool = test_pool().await;
-        let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
-        let customer_id = insert_customer_l2(&pool, "ACME").await;
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
-        let process_id = insert_process(&pool, "P-BLK", "ACME").await;
-        let shelf_id = insert_shelf(&pool, "SH-BLK", "PRODUCTION").await;
-        link_shelf_to_process(&pool, shelf_id, process_id).await;
-
-        let p_ok = insert_part(
-            &pool,
-            "P-OK",
-            "DWG-OK",
-            customer_id,
-            today,
-            Some(today),
-            false,
-            None,
-        )
-        .await;
-        let b_ok = insert_part_batch(&pool, p_ok).await;
-        let p_bad = insert_part(
-            &pool,
-            "P-BAD",
-            "DWG-BAD",
-            customer_id,
-            today,
-            Some(today),
-            false,
-            None,
-        )
-        .await;
-        let b_bad = insert_part_batch(&pool, p_bad).await;
-
-        // 在 dispatch 前先把 b_bad 软删 → bulk 走到 b_bad 时会 BIZ_BATCH_NOT_FOUND
-        sqlx::query("UPDATE t_part_batch SET deleted_at = now() WHERE id = $1")
-            .bind(b_bad)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let mut tx = pool.begin().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let current = make_current(user_id, Role::Manager);
-        let r = BatchService::bulk_dispatch(
-            &mut tx,
-            vec![(b_ok, process_id), (b_bad, process_id)],
-            None,
-            &snowflake,
-            &current,
-        )
-        .await;
-        // 任一失败 → service 抛 AppError；tx Drop 自动回滚
-        assert!(r.is_err(), "bulk_dispatch 应在 b_bad 失败时抛 AppError");
-        tx.rollback().await.unwrap(); // 显式回滚（Drop 兜底）
-
-        // DB 验证：b_ok 应保持 PENDING（被回滚），b_bad 仍 deleted
-        let row_ok: (String, Option<chrono::NaiveDateTime>) =
-            sqlx::query_as("SELECT status, deleted_at FROM t_part_batch WHERE id = $1")
-                .bind(b_ok)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(row_ok.0, "PENDING", "b_ok 应保持 PENDING（事务回滚）");
-        assert!(row_ok.1.is_none(), "b_ok 不应有 deleted_at（事务回滚）");
-    }
-
-    #[tokio::test]
-    async fn bulk_dispatch_rejects_empty_targets_with_validation_error() {
+    async fn dispatch_batch_rejects_empty_targets_with_validation_error() {
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
 
         let mut conn = pool.acquire().await.unwrap();
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let e = BatchService::bulk_dispatch(
+        let e = BatchService::dispatch_batch(
             &mut conn,
             vec![], // empty
             None,
@@ -1141,14 +1079,16 @@ mod tests {
         );
     }
 
+    // ===== auto_dispatch_preview 单测（2026-09-30 重构） =====
+
     #[tokio::test]
-    async fn auto_dispatch_no_process_chain_skips_each_batch() {
+    async fn auto_dispatch_preview_no_chain_returns_skip_reason() {
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let customer_id = insert_customer_l2(&pool, "ACME").await;
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
-        // 2 个 batch：都没有 process_chain_id
+        // part 无 process_chain_id
         let p_a = insert_part(
             &pool,
             "P-A",
@@ -1160,39 +1100,27 @@ mod tests {
             None,
         )
         .await;
-        let p_b = insert_part(
-            &pool,
-            "P-B",
-            "DWG-B",
-            customer_id,
-            today,
-            Some(today),
-            false,
-            None,
-        )
-        .await;
         let b_a = insert_part_batch(&pool, p_a).await;
-        let b_b = insert_part_batch(&pool, p_b).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
-        let r = BatchService::auto_dispatch(
+        let r = BatchService::auto_dispatch_preview(
             &mut conn,
-            vec![b_a, b_b],
-            &snowflake,
             &make_current(user_id, Role::Manager),
+            vec![b_a],
         )
         .await
-        .expect("auto_dispatch OK（无 chain 走 skipped）");
-        assert_eq!(r.succeeded.len(), 0);
-        assert_eq!(r.skipped.len(), 2);
-        for s in &r.skipped {
-            assert_eq!(s.reason, "NO_PROCESS_CHAIN");
-        }
+        .expect("preview OK");
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].skip_reason.as_deref(), Some("NO_PROCESS_CHAIN"));
+        // 2026-09-30 review 第 1 轮：NO_PROCESS_CHAIN 时 process_chain_id 必为 None
+        // （→ JSON `null`）；first_process_id / first_shelf_id 因上游不存在联动 None。
+        assert!(r.items[0].process_chain_id.is_none());
+        assert!(r.items[0].first_process_id.is_none());
+        assert!(r.items[0].first_shelf_id.is_none());
     }
 
     #[tokio::test]
-    async fn auto_dispatch_no_step_skips_with_reason() {
+    async fn auto_dispatch_preview_no_step_returns_skip_reason() {
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let customer_id = insert_customer_l2(&pool, "ACME").await;
@@ -1226,27 +1154,29 @@ mod tests {
         let b_a = insert_part_batch(&pool, p_a).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::auto_dispatch(
+        let r = BatchService::auto_dispatch_preview(
             &mut conn,
-            vec![b_a],
-            &snowflake,
             &make_current(user_id, Role::Manager),
+            vec![b_a],
         )
         .await
-        .expect("auto_dispatch OK（无 step 走 skipped）");
-        assert_eq!(r.succeeded.len(), 0);
-        assert_eq!(r.skipped.len(), 1);
-        assert_eq!(r.skipped[0].reason, "NO_PROCESS_STEP");
+        .expect("preview OK");
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].skip_reason.as_deref(), Some("NO_PROCESS_STEP"));
+        // 2026-09-30 review 第 1 轮：NO_PROCESS_STEP 时 chain 已知但首道工序/货架 None。
+        assert!(r.items[0].process_chain_id.is_some());
+        assert!(r.items[0].first_process_id.is_none());
+        assert!(r.items[0].first_shelf_id.is_none());
     }
 
     #[tokio::test]
-    async fn auto_dispatch_with_chain_and_step_dispatches_to_first_step_process() {
+    async fn auto_dispatch_preview_with_chain_and_step_returns_first_process() {
         let pool = test_pool().await;
         let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
         let customer_id = insert_customer_l2(&pool, "ACME").await;
         let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
 
-        // 建链 + 2 个 step（sort_order=1 / 2，期望取 sort_order=1 的 process）
+        // 建链 + 2 个 step（sort_order=1 / 2）+ 2 个货架 + 2 个映射
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let now = now_naive();
         let chain_id = snowflake.next_id();
@@ -1296,28 +1226,112 @@ mod tests {
         let b_a = insert_part_batch(&pool, p_a).await;
 
         let mut conn = pool.acquire().await.unwrap();
-        let r = BatchService::auto_dispatch(
+        let r = BatchService::auto_dispatch_preview(
             &mut conn,
-            vec![b_a],
-            &snowflake,
             &make_current(user_id, Role::Manager),
+            vec![b_a],
         )
         .await
-        .expect("auto_dispatch OK");
-        assert_eq!(r.succeeded.len(), 1);
-        assert_eq!(r.skipped.len(), 0);
-        // 应取 sort_order=1 的 process_first + shelf_first
-        assert_eq!(r.succeeded[0].target_process_id, process_first);
-        assert_eq!(r.succeeded[0].shelf_id, shelf_first);
+        .expect("preview OK");
+        assert_eq!(r.items.len(), 1);
+        assert!(r.items[0].skip_reason.is_none());
+        // 2026-09-30 review 第 1 轮：OK 路径三个 ID 必 Some（→ JSON 字符串）。
+        assert_eq!(r.items[0].process_chain_id, Some(chain_id));
+        assert_eq!(r.items[0].first_process_id, Some(process_first));
+        assert_eq!(r.items[0].first_shelf_id, Some(shelf_first));
+        assert_eq!(r.items[0].first_process_code, "P-AUTO-1");
 
-        // DB 验证：batch 应 IN_PROCESS + holder=shelf_first
-        let row: (String, Option<i64>) =
-            sqlx::query_as("SELECT status, current_holder_id FROM t_part_batch WHERE id = $1")
-                .bind(b_a)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(row.0, "IN_PROCESS");
-        assert_eq!(row.1, Some(shelf_first));
+        // DB 验证：batch 仍 PENDING（preview 不写库）
+        let row: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+            .bind(b_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row, "PENDING", "preview 不应改变 batch.status");
+    }
+
+    #[tokio::test]
+    async fn auto_dispatch_preview_unknown_batch_returns_not_found() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let r = BatchService::auto_dispatch_preview(
+            &mut conn,
+            &make_current(user_id, Role::Manager),
+            vec![999_999_999],
+        )
+        .await
+        .expect("preview OK");
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].skip_reason.as_deref(), Some("NOT_FOUND"));
+        // 2026-09-30 review 第 1 轮：NOT_FOUND 时三个 ID 必 None。
+        assert!(r.items[0].process_chain_id.is_none());
+        assert!(r.items[0].first_process_id.is_none());
+        assert!(r.items[0].first_shelf_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_dispatch_preview_no_shelf_returns_skip_reason() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
+        let customer_id = insert_customer_l2(&pool, "ACME").await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+
+        // 建链 + step，但首道工序不映射货架
+        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let now = now_naive();
+        let chain_id = snowflake.next_id();
+        sqlx::query(
+            "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, 0, $2, 1, $2, 1)",
+        )
+        .bind(chain_id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let process_first = insert_process(&pool, "P-NSH-AUTO", "FIRST").await;
+        sqlx::query(
+            "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, estimated_minutes, version, \
+             created_at, created_by, updated_at, updated_by) VALUES ($1, $2, 1, $3, 0, 0, $4, 1, $4, 1)",
+        )
+        .bind(snowflake.next_id())
+        .bind(chain_id)
+        .bind(process_first)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+        // 注意：不调 link_shelf_to_process → 0 货架映射
+
+        let p_a = insert_part(
+            &pool,
+            "P-NSH-AUTO",
+            "DWG-NSH",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            Some(chain_id),
+        )
+        .await;
+        let b_a = insert_part_batch(&pool, p_a).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let r = BatchService::auto_dispatch_preview(
+            &mut conn,
+            &make_current(user_id, Role::Manager),
+            vec![b_a],
+        )
+        .await
+        .expect("preview OK");
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].skip_reason.as_deref(), Some("NO_SHELF"));
+        // 2026-09-30 review 第 1 轮：NO_SHELF 时 chain + first_process 已知，shelf None。
+        assert!(r.items[0].process_chain_id.is_some());
+        assert!(r.items[0].first_process_id.is_some());
+        assert!(r.items[0].first_shelf_id.is_none());
     }
 }

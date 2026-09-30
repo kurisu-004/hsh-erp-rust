@@ -686,7 +686,7 @@ async fn refill_when_pool_empty_returns_empty() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -708,7 +708,7 @@ async fn refill_when_pool_empty_returns_empty() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -746,7 +746,7 @@ async fn refill_caps_at_max_held_batches() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -798,7 +798,7 @@ async fn refill_respects_shelf_scope() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": shelf_a.to_string(),
@@ -881,7 +881,7 @@ async fn take_updates_t_part_holder() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -946,7 +946,7 @@ async fn take_does_not_update_placed_at() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1062,7 +1062,7 @@ async fn admin_refill_endpoint_works() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1079,9 +1079,15 @@ async fn admin_refill_endpoint_works() {
     assert_eq!(held, 3);
 }
 
-/// 场景 13: admin_remove 把持有批次放回候选池
+/// 场景 13 (2026-09-30 重构): move WORKER → POOL 把持有批次放回候选池。
+///
+/// 2026-09-30 之前：原 `admin_remove` 端点。重构后走统一 `POST /prod/pool/move`
+/// 端点，`from.kind=WORKER, to.kind=POOL` 方向。验证：
+/// - batch 回到 PRODUCTION_SHELF + holder=shelf
+/// - **current_process_step_id 不变**（move 不推进工序链）
+/// - 响应 `MoveResult { from_kind=WORKER, to_kind=POOL, new_location="PRODUCTION_SHELF" }`
 #[tokio::test]
-async fn admin_remove_returns_batch_to_pool() {
+async fn move_worker_to_pool_returns_batch_to_pool() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let customer = insert_customer_l2(&pool, "POOL13").await;
     let proc = seed_process(&pool, "PROC-M", "工序M").await;
@@ -1091,35 +1097,46 @@ async fn admin_remove_returns_batch_to_pool() {
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC013", "工13", Some(wt)).await;
-    let (held_part, held_batch) =
+    let (_held_part, held_batch) =
         insert_worker_held_part(&pool, customer, "H-013", worker, proc, 1).await;
+
+    // 取 move 前的 step_id（move 后应保持不变）
+    let step_before: Option<i64> = sqlx::query_scalar!(
+        "SELECT current_process_step_id FROM t_part_batch WHERE id = $1",
+        held_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query step before");
 
     let (app, token) = login_manager_with_username(&pool, "admin13").await;
     let (s, env) = send(
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/remove",
+            "/prod/pool/move",
             Some(json!({
-                "worker_id": worker.to_string(),
                 "batch_id": held_batch.to_string(),
-                "shelf_id": prod_shelf.to_string(),
-                "next_process_id": proc.to_string(),
+                "from": { "kind": "WORKER", "worker_id": worker.to_string() },
+                "to":   { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "note": "退换料"
             })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "admin remove: {env}");
+    assert_eq!(s, StatusCode::OK, "move WORKER→POOL: {env}");
     assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["part_id"], held_part.to_string());
+    assert_eq!(env["data"]["from_kind"], "WORKER");
+    assert_eq!(env["data"]["to_kind"], "POOL");
+    assert_eq!(env["data"]["new_location"], "PRODUCTION_SHELF");
+    assert_eq!(env["data"]["new_holder_id"], prod_shelf.to_string());
     assert_eq!(env["data"]["batch_id"], held_batch.to_string());
 
     // worker 应不再持有该批次（count=0）
     let held = count_held_by_worker(&pool, worker).await;
-    assert_eq!(held, 0, "admin_remove 后 worker 应释放该批次");
+    assert_eq!(held, 0, "move WORKER→POOL 后 worker 应释放该批次");
     // batch 应回到 PRODUCTION_SHELF holder=shelf
-    // 2026-09-16 PR-3：next_process_id 列已删，改测 step_id
     let row = sqlx::query!(
         r#"SELECT location AS "loc!", current_holder_id AS "ch?",
                   current_process_step_id AS "step?"
@@ -1131,7 +1148,230 @@ async fn admin_remove_returns_batch_to_pool() {
     .expect("query batch");
     assert_eq!(row.loc, "PRODUCTION_SHELF");
     assert_eq!(row.ch, Some(prod_shelf));
-    assert!(row.step.is_some(), "PR-3: held batch 应持有 step_id");
+    // 关键不变量：move 不推进工序链
+    assert_eq!(
+        row.step, step_before,
+        "move 不应改变 current_process_step_id（step_before={step_before:?} step_after={:?}",
+        row.step
+    );
+}
+
+/// 场景 13b (2026-09-30 新增): move POOL → WORKER 把候选批次分配给 worker。
+///
+/// 验证：
+/// - batch 移到 worker (location=WORKER + current_holder_id=worker_id)
+/// - response 含 `current_held` / `max_held` 字段
+/// - TAKEN_FROM_POOL / MOVED 事件写入
+#[tokio::test]
+async fn move_pool_to_worker_assigns_batch() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL13B").await;
+    let proc = seed_process(&pool, "PROC-MB", "工序MB").await;
+    let wt = insert_work_type(&pool, "WT-MB", "工种MB", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-MB", "PROD-MB", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC013B", "工13B", Some(wt)).await;
+    let (_pool_part, pool_batch) =
+        insert_pool_part(&pool, customer, "P-013B", prod_shelf, proc, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin13B").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/pool/move",
+            Some(json!({
+                "batch_id": pool_batch.to_string(),
+                "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "move POOL→WORKER: {env}");
+    assert_eq!(env["data"]["from_kind"], "POOL");
+    assert_eq!(env["data"]["to_kind"], "WORKER");
+    assert_eq!(env["data"]["new_location"], "WORKER");
+    assert_eq!(env["data"]["new_holder_id"], worker.to_string());
+    assert_eq!(env["data"]["current_held"], 1);
+    assert_eq!(env["data"]["max_held"], 3);
+
+    // DB 验证
+    let row = sqlx::query!(
+        r#"SELECT location AS "loc!", current_holder_id AS "ch?" FROM t_part_batch WHERE id = $1"#,
+        pool_batch,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(row.loc, "WORKER");
+    assert_eq!(row.ch, Some(worker));
+    let held = count_held_by_worker(&pool, worker).await;
+    assert_eq!(held, 1);
+}
+
+/// 场景 13c (2026-09-30 新增): move WORKER → WORKER 把批次从一个工人切到另一个。
+#[tokio::test]
+async fn move_worker_to_worker_transfers_batch() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL13C").await;
+    let proc = seed_process(&pool, "PROC-MC", "工序MC").await;
+    let wt = insert_work_type(&pool, "WT-MC", "工种MC", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-MC", "PROD-MC", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker_src = insert_worker(&pool, "BC013C1", "工13C1", Some(wt)).await;
+    let worker_dst = insert_worker(&pool, "BC013C2", "工13C2", Some(wt)).await;
+    let (_held_part, held_batch) =
+        insert_worker_held_part(&pool, customer, "H-013C", worker_src, proc, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin13C").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/pool/move",
+            Some(json!({
+                "batch_id": held_batch.to_string(),
+                "from": { "kind": "WORKER", "worker_id": worker_src.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker_dst.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "move WORKER→WORKER: {env}");
+    assert_eq!(env["data"]["from_kind"], "WORKER");
+    assert_eq!(env["data"]["to_kind"], "WORKER");
+    assert_eq!(env["data"]["new_holder_id"], worker_dst.to_string());
+
+    // 源 worker 不再持有
+    assert_eq!(count_held_by_worker(&pool, worker_src).await, 0);
+    // 目标 worker 持有 1 批
+    assert_eq!(count_held_by_worker(&pool, worker_dst).await, 1);
+}
+
+/// 场景 13d (2026-09-30 新增): move from 与 batch 实际状态不一致 → 40904。
+#[tokio::test]
+async fn move_from_mismatch_returns_location_mismatch_error() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL13D").await;
+    let proc = seed_process(&pool, "PROC-MD", "工序MD").await;
+    let wt = insert_work_type(&pool, "WT-MD", "工种MD", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-MD", "PROD-MD", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    // batch 在 pool（不是 worker 持有）
+    let (_pool_part, pool_batch) =
+        insert_pool_part(&pool, customer, "P-013D", prod_shelf, proc, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin13D").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/pool/move",
+            Some(json!({
+                "batch_id": pool_batch.to_string(),
+                // from 谎报成 WORKER（实际在 POOL），期望 40904
+                "from": { "kind": "WORKER", "worker_id": "999999999" },
+                "to":   { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "from 不匹配应 409: {env}");
+    assert_eq!(
+        env["code"], 20122,
+        "BIZ_BATCH_LOCATION_MISMATCH 应 20122: {env}"
+    );
+}
+
+/// 场景 13e (2026-09-30 新增): move 目标 worker 容量超限 → 409。
+#[tokio::test]
+async fn move_target_worker_capacity_exceeded() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL13E").await;
+    let proc = seed_process(&pool, "PROC-ME", "工序ME").await;
+    let wt = insert_work_type(&pool, "WT-ME", "工种ME", Some(1)).await; // max=1
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-ME", "PROD-ME", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker_dst = insert_worker(&pool, "BC013E-DST", "工13E-DST", Some(wt)).await;
+    // 目标 worker 已持 1 批（触顶）
+    let (_held_part_dst, _held_batch_dst) =
+        insert_worker_held_part(&pool, customer, "H-DST", worker_dst, proc, 1).await;
+
+    let worker_src = insert_worker(&pool, "BC013E-SRC", "工13E-SRC", Some(wt)).await;
+    let (_held_part_src, held_batch_src) =
+        insert_worker_held_part(&pool, customer, "H-SRC", worker_src, proc, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin13E").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/pool/move",
+            Some(json!({
+                "batch_id": held_batch_src.to_string(),
+                "from": { "kind": "WORKER", "worker_id": worker_src.to_string() },
+                "to":   { "kind": "WORKER", "worker_id": worker_dst.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "容量超限应 409: {env}");
+    assert_eq!(
+        env["code"], 20204,
+        "BIZ_WORKER_HOLD_LIMIT_EXCEEDED 应 20204: {env}"
+    );
+
+    // 源 worker 应仍持有（事务回滚）
+    assert_eq!(count_held_by_worker(&pool, worker_src).await, 1);
+}
+
+/// 场景 13f (2026-09-30 新增): move 同 kind 移动（POOL→POOL）→ 422 VALIDATION_ERROR。
+#[tokio::test]
+async fn move_same_kind_rejected_with_validation_error() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL13F").await;
+    let proc = seed_process(&pool, "PROC-MF", "工序MF").await;
+    let wt = insert_work_type(&pool, "WT-MF", "工种MF", Some(3)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-MF", "PROD-MF", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let (_pp, batch) = insert_pool_part(&pool, customer, "P-013F", prod_shelf, proc, 1).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin13F").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/pool/move",
+            Some(json!({
+                "batch_id": batch.to_string(),
+                "from": { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
+                "to":   { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "同 kind 移动应 422: {env}"
+    );
+    assert_eq!(env["code"], 40001, "VALIDATION_ERROR: {env}");
 }
 
 /// 场景 14: refill 失败回滚 worker-scan（`#[ignore]`：DB 故障注入缺基建）
@@ -1171,7 +1411,7 @@ async fn max_held_null_returns_error() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1208,7 +1448,7 @@ async fn worker_no_work_type_returns_error() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1289,7 +1529,7 @@ async fn pool_by_process_happy() {
     // 注意：`tests/common::test_app` 用 `v2_router()`（不带 `/api/v2` nest，
     // 与 main.rs `nest("/api/v2", v2_router())` 不一样），所以测试 URI
     // 是 `/worker-pool/{id}` 而不是 `/api/v2/worker-pool/{id}`。
-    let uri = format!("/prod/worker-pool/{proc}");
+    let uri = format!("/prod/pool/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "pool_by_process happy: {env}");
     assert_eq!(env["code"], 0, "code 应 0: {env}");
@@ -1346,7 +1586,7 @@ async fn pool_by_process_process_not_found() {
     let nonexistent_id: i64 = 9_999_999_999_999;
 
     let (app, token) = login_manager_with_username(&pool, "admin_nf").await;
-    let uri = format!("/prod/worker-pool/{nonexistent_id}");
+    let uri = format!("/prod/pool/{nonexistent_id}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "不存在 process 应 404: {env}");
     assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
@@ -1364,7 +1604,7 @@ async fn pool_by_process_forbidden_for_shelf_account() {
     // ShelfAccount 绑一个 shelf（scope 必须给才能登录；调用端点时仍会被 service 拒绝）
     let (app, token, _pool) =
         login_shelf_account(pool.clone(), "shelf_user_fb", &[prod_shelf]).await;
-    let uri = format!("/prod/worker-pool/{proc}");
+    let uri = format!("/prod/pool/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
@@ -1380,7 +1620,7 @@ async fn pool_by_process_no_candidates_when_no_batch() {
     let _w = insert_worker(&pool, "BC-EMPTY", "空工人", Some(wt)).await;
 
     let (app, token) = login_manager_with_username(&pool, "admin_empty").await;
-    let uri = format!("/prod/worker-pool/{proc}");
+    let uri = format!("/prod/pool/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "无 batch 应 200: {env}");
     assert_eq!(env["code"], 0, "code 应 0: {env}");
@@ -1401,254 +1641,13 @@ async fn pool_by_process_no_candidates_when_no_batch() {
 }
 
 // ===========================================================================
-//  admin/worker-pool/assign 端点集成测试（2026-09-14 follow-up-round2 新增）
-//
-// 覆盖 4 个场景：
-//  17. admin_assign_happy_path
-//  18. admin_assign_capacity_exceeded
-//  19. admin_assign_batch_not_in_pool
-//  20. admin_assign_process_id_mismatch
+// 2026-09-30 重构：原 `admin/worker-pool/assign` 4 个端点已删除，被
+// `POST /api/v2/prod/pool/move` 取代。覆盖：
+//  - move_pool_to_worker_assigns_batch（场景 13b）：assign happy 路径
+//  - move_target_worker_capacity_exceeded（场景 13e）：assign capacity 超限
+//  - move_from_mismatch_returns_location_mismatch_error（场景 13d）：assign batch 不在池
+//  - admin_assign_process_id_mismatch → 已废弃（move 端点显式校验 from/to 状态而非 process_id）
 // ===========================================================================
-
-/// 场景 17: admin_assign 端点 happy path
-///
-/// - 200 + AssignResult
-/// - t_part_batch.location='WORKER' + current_holder_id=worker_id + version+1
-/// - TAKEN_FROM_POOL 事件写入（note='admin_assign'）
-#[tokio::test]
-async fn admin_assign_happy_path() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let customer = insert_customer_l2(&pool, "POOL17").await;
-    let proc = seed_process(&pool, "PROC-AA", "工序AA").await;
-    let wt = insert_work_type(&pool, "WT-AA", "工种AA", Some(3)).await;
-    link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = insert_shelf(&pool, "PROD-AA", "PROD-AA", "PRODUCTION").await;
-    link_shelf_to_process(&pool, prod_shelf, proc).await;
-
-    let worker = insert_worker(&pool, "BC017", "工17", Some(wt)).await;
-    let (_pool_part, pool_batch) =
-        insert_pool_part(&pool, customer, "P-017", prod_shelf, proc, 1).await;
-
-    // 记录 assign 前 batch 状态（version=0）
-    let before_loc: String = sqlx::query_scalar!(
-        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
-        pool_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query before assign loc");
-    assert_eq!(before_loc, "PRODUCTION_SHELF");
-    let before_ch: Option<i64> = sqlx::query_scalar!(
-        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
-        pool_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query before assign ch");
-    assert_eq!(before_ch, Some(prod_shelf));
-    let before_v: i32 = sqlx::query_scalar!(
-        r#"SELECT version AS "v!" FROM t_part_batch WHERE id = $1"#,
-        pool_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query before assign v");
-    assert_eq!(before_v, 0, "初始 version 应 0");
-
-    let (app, token) = login_manager_with_username(&pool, "admin17").await;
-    let (s, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/prod/admin/worker-pool/assign",
-            Some(json!({
-                "worker_id": worker.to_string(),
-                "batch_id": pool_batch.to_string(),
-                "shelf_id": prod_shelf.to_string(),
-            })),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "admin_assign happy: {env}");
-    assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["worker_id"], worker.to_string());
-    assert_eq!(env["data"]["batch_id"], pool_batch.to_string());
-    assert_eq!(env["data"]["shelf_id"], prod_shelf.to_string());
-    assert_eq!(env["data"]["current_held"], 1);
-    assert_eq!(env["data"]["max_held"], 3);
-    assert_eq!(env["data"]["taken"]["batch_id"], pool_batch.to_string());
-
-    // t_part_batch 应：location=WORKER + current_holder_id=worker + version+1
-    let after_loc: String = sqlx::query_scalar!(
-        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
-        pool_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query after assign loc");
-    assert_eq!(after_loc, "WORKER", "assign 后 location 应 WORKER");
-    let after_ch: Option<i64> = sqlx::query_scalar!(
-        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
-        pool_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query after assign ch");
-    assert_eq!(after_ch, Some(worker), "assign 后 holder 应 worker");
-    let after_v: i32 = sqlx::query_scalar!(
-        r#"SELECT version AS "v!" FROM t_part_batch WHERE id = $1"#,
-        pool_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query after assign v");
-    assert_eq!(after_v, before_v + 1, "version 应 +1");
-
-    // t_part_event 应有 TAKEN_FROM_POOL（note=admin_assign）
-    let event_note: Option<String> = sqlx::query_scalar!(
-        r#"SELECT note AS "n?" FROM t_part_event
-           WHERE batch_id = $1 AND event_type = 'TAKEN_FROM_POOL' ORDER BY id ASC LIMIT 1"#,
-        pool_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query event");
-    assert_eq!(
-        event_note.as_deref(),
-        Some("admin_assign"),
-        "TAKEN_FROM_POOL 事件 note 应 admin_assign"
-    );
-}
-
-/// 场景 18: admin_assign capacity 超限
-///
-/// worker max_held=2 已持 2 批，再 assign 第 3 批 → 422 + 20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED
-#[tokio::test]
-async fn admin_assign_capacity_exceeded() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let customer = insert_customer_l2(&pool, "POOL18").await;
-    let proc = seed_process(&pool, "PROC-CAP", "工序CAP").await;
-    let wt = insert_work_type(&pool, "WT-CAP", "工种CAP", Some(2)).await;
-    link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = insert_shelf(&pool, "PROD-CAP", "PROD-CAP", "PRODUCTION").await;
-    link_shelf_to_process(&pool, prod_shelf, proc).await;
-
-    let worker = insert_worker(&pool, "BC018", "工18", Some(wt)).await;
-    // worker 已持 2 批（触顶）
-    for i in 0..2 {
-        let sn = format!("H-{:03}", i);
-        insert_worker_held_part(&pool, customer, &sn, worker, proc, 1).await;
-    }
-    // pool 里再放 1 批待分配
-    let (_pp, extra_batch) = insert_pool_part(&pool, customer, "P-018", prod_shelf, proc, 1).await;
-    let held = count_held_by_worker(&pool, worker).await;
-    assert_eq!(held, 2, "前置：worker 已持 2 批");
-
-    let (app, token) = login_manager_with_username(&pool, "admin18").await;
-    let (s, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/prod/admin/worker-pool/assign",
-            Some(json!({
-                "worker_id": worker.to_string(),
-                "batch_id": extra_batch.to_string(),
-                "shelf_id": prod_shelf.to_string(),
-            })),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::CONFLICT, "capacity 触顶应 409: {env}");
-    assert_eq!(
-        env["code"], 20204,
-        "BIZ_WORKER_HOLD_LIMIT_EXCEEDED 应 20204: {env}"
-    );
-
-    // 候选池批次不应被移动
-    let after_loc: String = sqlx::query_scalar!(
-        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
-        extra_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query after loc");
-    assert_eq!(after_loc, "PRODUCTION_SHELF", "批次应仍在候选池");
-    let after_ch: Option<i64> = sqlx::query_scalar!(
-        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
-        extra_batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query after ch");
-    assert_eq!(after_ch, Some(prod_shelf));
-}
-
-/// 场景 19: admin_assign batch 不在候选池
-///
-/// 调 assign 一个不属于该 shelf 的 batch（属于另一 shelf 的候选）→
-/// 422 + 20114 BIZ_PART_BATCH_NOT_HELD_BY_WORKER
-#[tokio::test]
-async fn admin_assign_batch_not_in_pool() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let customer = insert_customer_l2(&pool, "POOL19").await;
-    let proc = seed_process(&pool, "PROC-NP", "工序NP").await;
-    let wt = insert_work_type(&pool, "WT-NP", "工种NP", Some(3)).await;
-    link_work_type_to_process(&pool, wt, proc).await;
-    // shelf_a：batch 实际所在；shelf_b：admin 请求的 shelf_id（错的）
-    let shelf_a = insert_shelf(&pool, "PROD-A19", "PROD-A19", "PRODUCTION").await;
-    let shelf_b = insert_shelf(&pool, "PROD-B19", "PROD-B19", "PRODUCTION").await;
-    link_shelf_to_process(&pool, shelf_a, proc).await;
-    link_shelf_to_process(&pool, shelf_b, proc).await;
-
-    let worker = insert_worker(&pool, "BC019", "工19", Some(wt)).await;
-    // batch 实际在 shelf_a
-    let (_pp, batch_a) = insert_pool_part(&pool, customer, "P-019A", shelf_a, proc, 1).await;
-
-    let (app, token) = login_manager_with_username(&pool, "admin19").await;
-    let (s, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/prod/admin/worker-pool/assign",
-            Some(json!({
-                "worker_id": worker.to_string(),
-                "batch_id": batch_a.to_string(),
-                "shelf_id": shelf_b.to_string(),  // 错的 shelf
-            })),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(
-        s,
-        StatusCode::CONFLICT,
-        "batch 不在请求 shelf 的池应 409: {env}"
-    );
-    assert_eq!(
-        env["code"], 20114,
-        "BIZ_PART_BATCH_NOT_HELD_BY_WORKER 应 20114: {env}"
-    );
-
-    // 候选池批次应未动
-    let after_loc: String = sqlx::query_scalar!(
-        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
-        batch_a,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query after loc");
-    assert_eq!(after_loc, "PRODUCTION_SHELF", "batch 应仍在原 shelf");
-    let after_ch: Option<i64> = sqlx::query_scalar!(
-        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
-        batch_a,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query after ch");
-    assert_eq!(after_ch, Some(shelf_a));
-}
 
 // ===========================================================================
 //  2026-09-29 CNC 重构 5 任务：has_cnc_program 字段 + 自动分配优先级测试
@@ -1720,7 +1719,7 @@ async fn take_one_from_pool_prefers_programmed_batch() {
         app,
         json_request(
             "POST",
-            "/prod/admin/worker-pool/refill",
+            "/prod/pool/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1776,7 +1775,7 @@ async fn list_candidates_includes_has_cnc_program() {
     seed_g_code_for_part(&pool, part_a_id).await;
 
     let (app, token) = login_manager_with_username(&pool, "admin_cnc_list").await;
-    let uri = format!("/prod/worker-pool/{proc}");
+    let uri = format!("/prod/pool/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None::<Value>, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "pool_by_process: {env}");
     let items = env["data"]["items"].as_array().expect("items array");
@@ -1810,7 +1809,7 @@ async fn list_candidates_includes_has_cnc_program() {
     assert!(found_a && found_b, "应同时找到 A 与 B: {env}");
 }
 
-/// `GET /prod/worker-pool/state` 应在 `held_batches[*].has_cnc_program` 透传实际值。
+/// `GET /prod/pool/state` 应在 `held_batches[*].has_cnc_program` 透传实际值。
 ///
 /// 2026-09-29 review 第 1 轮补漏：前端 `WorkerQueueBoard.vue`「已编程」tag 渲染依赖
 /// `HeldBatchItem.has_cnc_program` 字段。后端 model 与 SQL 必须真实返回 EXISTS(G_CODE) 值，
@@ -1841,7 +1840,7 @@ async fn held_batch_includes_has_cnc_program() {
 
     // 调 state 端点：worker 当前持有 2 个 batch（无需 manager role，登录任意 user 即可）
     let (app, token) = login_manager_with_username(&pool, "admin_cnc_held").await;
-    let uri = format!("/prod/worker-pool/state?worker_id={worker}&shelf_id={prod_shelf}");
+    let uri = format!("/prod/pool/state?worker_id={worker}&shelf_id={prod_shelf}");
     let (s, env) = send(app, json_request("GET", &uri, None::<Value>, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "state: {env}");
     let held = env["data"]["held_batches"]
@@ -1877,65 +1876,11 @@ async fn held_batch_includes_has_cnc_program() {
     assert!(found_a && found_b, "应同时找到 H-CNC-A 与 H-CNC-B: {env}");
 }
 
-/// 场景 20: admin_assign process_id 不匹配
-///
-/// 调 assign 带 process_id=9999999999998（不存在且 ≠ batch.next_process_id）→
-/// 422 + 20104 BIZ_INVALID_VALUE
-#[tokio::test]
-async fn admin_assign_process_id_mismatch() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let customer = insert_customer_l2(&pool, "POOL20").await;
-    let proc1 = seed_process(&pool, "PROC-PM1", "工序PM1").await;
-    let proc_other: i64 = 9_999_999_999_998; // 故意一个远大于实际生成的"错误"process
-    let wt = insert_work_type(&pool, "WT-PM", "工种PM", Some(3)).await;
-    link_work_type_to_process(&pool, wt, proc1).await;
-    let prod_shelf = insert_shelf(&pool, "PROD-PM", "PROD-PM", "PRODUCTION").await;
-    link_shelf_to_process(&pool, prod_shelf, proc1).await;
-
-    let worker = insert_worker(&pool, "BC020", "工20", Some(wt)).await;
-    // batch.next_process_id = proc1；req.process_id = proc_other（不匹配）
-    let (_pp, batch) = insert_pool_part(&pool, customer, "P-020", prod_shelf, proc1, 1).await;
-
-    let (app, token) = login_manager_with_username(&pool, "admin20").await;
-    let (s, env) = send(
-        app,
-        json_request(
-            "POST",
-            "/prod/admin/worker-pool/assign",
-            Some(json!({
-                "worker_id": worker.to_string(),
-                "batch_id": batch.to_string(),
-                "shelf_id": prod_shelf.to_string(),
-                "process_id": proc_other.to_string(),
-            })),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST, "process_id 不匹配应 400: {env}");
-    assert_eq!(env["code"], 20104, "BIZ_INVALID_VALUE 应 20104: {env}");
-
-    // 候选池批次应未动
-    let after_loc: String = sqlx::query_scalar!(
-        r#"SELECT location AS "loc!" FROM t_part_batch WHERE id = $1"#,
-        batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query after loc");
-    assert_eq!(after_loc, "PRODUCTION_SHELF", "batch 应仍在候选池");
-    let after_ch: Option<i64> = sqlx::query_scalar!(
-        "SELECT current_holder_id FROM t_part_batch WHERE id = $1",
-        batch,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("query after ch");
-    assert_eq!(after_ch, Some(prod_shelf));
-}
+// 2026-09-30 重构：原 `admin_assign_process_id_mismatch` 端点已删除，被 move 端点取代。
+// 通过 from/to 显式校验状态而非 process_id；功能已合并到 move_pool_to_worker_assigns_batch（场景 13b）。
 
 // ===========================================================================
-//  GET /api/v2/prod/worker-pool/counts —— 全工序候选批次聚合计数
+//  GET /api/v2/prod/pool/counts —— 全工序候选批次聚合计数
 //  （2026-09-30 新增，db78bba4 spec）
 //
 //  覆盖场景：
@@ -1975,12 +1920,7 @@ async fn pool_counts_returns_aggregate_by_process() {
     let (app, token) = login_manager_with_username(&pool, "admin_counts").await;
     let (s, env) = send(
         app,
-        json_request(
-            "GET",
-            "/prod/worker-pool/counts",
-            None::<Value>,
-            Some(&token),
-        ),
+        json_request("GET", "/prod/pool/counts", None::<Value>, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "pool_counts happy: {env}");
@@ -2038,12 +1978,7 @@ async fn pool_counts_excludes_zero_count_processes() {
     let (app, token) = login_manager_with_username(&pool, "admin_counts_empty").await;
     let (s, env) = send(
         app,
-        json_request(
-            "GET",
-            "/prod/worker-pool/counts",
-            None::<Value>,
-            Some(&token),
-        ),
+        json_request("GET", "/prod/pool/counts", None::<Value>, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "pool_counts empty: {env}");
@@ -2081,12 +2016,7 @@ async fn pool_counts_aggregates_across_shelves() {
     let (app, token) = login_manager_with_username(&pool, "admin_counts_multi").await;
     let (s, env) = send(
         app,
-        json_request(
-            "GET",
-            "/prod/worker-pool/counts",
-            None::<Value>,
-            Some(&token),
-        ),
+        json_request("GET", "/prod/pool/counts", None::<Value>, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "pool_counts multi: {env}");
@@ -2111,12 +2041,7 @@ async fn pool_counts_forbidden_for_shelf_account() {
         login_shelf_account(pool.clone(), "shelf_user_counts", &[prod_shelf]).await;
     let (s, env) = send(
         app,
-        json_request(
-            "GET",
-            "/prod/worker-pool/counts",
-            None::<Value>,
-            Some(&token),
-        ),
+        json_request("GET", "/prod/pool/counts", None::<Value>, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");

@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part_batch\n            SET current_holder_id = $3,\n                location          = 'WORKER',\n                -- 2026-09-30 重构：worker↔worker move 不写 step\n                --   （move 不推进工序链，与 worker→pool 同原则）\n                version           = version + 1,\n                updated_at        = NOW(),\n                updated_by        = $5\n            WHERE id = $1\n              AND version = $2\n              AND status = 'IN_PROCESS'\n              AND location = 'WORKER'\n              AND current_holder_id = $4\n              AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f9b91cb3b9cd3c563a9ba536b93f000d16bb29a87db856fa150ac3e31b095e59"
+}

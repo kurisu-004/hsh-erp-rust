@@ -5,7 +5,7 @@
 >
 > 范围：**生产管理**菜单（前端 `production_group` 一级 + `process_work_type` / `part_process_chain` / `worker_queue` 三个子菜单）下挂的全部后端域。本目录按前端菜单 + 工人档案 + 待下发批次拆分 7 个文件 + 1 个入口。
 >
-> 实施阶段：part-worker-pool-federated-rocket（2026-09-11 起），整合自 settings/process_chain/worker_pool 三批 PR，2026-09-12 落盘为 production/ 子目录。2026-09-19 prod 容器聚合（PR-N）：worker / work_type / process / process_chain / worker_pool 五个支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias；工人档案 worker（7 端点）一并并入。2026-09-29 新增 `prod::batch`（车间 PENDING 待下发批次列表 + 单条 / 批量 / 自动下发 4 端点，URL `/api/v2/prod/batches/*`）。
+> 实施阶段：part-worker-pool-federated-rocket（2026-09-11 起），整合自 settings/process_chain/worker_pool 三批 PR，2026-09-12 落盘为 production/ 子目录。2026-09-19 prod 容器聚合（PR-N）：worker / work_type / process / process_chain / worker_pool 五个支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias；工人档案 worker（7 端点）一并并入。2026-09-29 新增 `prod::batch`（车间 PENDING 待下发批次列表 + 单条 / 批量 / 自动下发 4 端点，URL `/api/v2/prod/batches/*`）。2026-09-30 prod 域 9 端点重构：worker-pool → pool 路径收敛（`/pool/*` 单 nest，5 端点；新增通用 move 取代 assign+remove；移除 admin nest）；batches dispatch 统一 bulk-only（`/dispatch` 单端点，`targets` 数组；移除 bulk-dispatch）；auto-dispatch 改为只读 preview。
 
 ## 目录
 
@@ -13,9 +13,14 @@
 
 ---
 
-## 端点列表（31 个 = 19 + 7 worker + 1 admin/assign + 4 batch）
+## 端点列表（30 个 = 17 + 5 工序映射/链 + 5 pool + 3 batch）
 
 > 2026-09-19 prod 聚合：原 19 端点 + worker 7 端点（详见 [`workers.md`](./workers.md)）+ worker_pool 的 admin/assign 1 端点。2026-09-29 新增 4 端点（详见 [`batches.md`](./batches.md)）：1 个 PENDING 列表 + 3 个下发（单条 / 批量 / 自动）。
+> 2026-09-30 prod 域 9 端点重构（worker-pool + batches 合并）：
+> - worker-pool → pool 路径收敛：原 `/worker-pool/*` + `/admin/worker-pool/*` 双 nest 合并为 `/pool/*` 单 nest（6 → 5 端点；移除 admin/assign 1 端点 + 新增通用 move 1 端点）。
+> - batches 端点合并：原 `dispatch`（单条）+ `bulk-dispatch`（批量）合并为统一 bulk-only `dispatch`（4 → 3 端点；移除 bulk-dispatch）。
+> - batches auto-dispatch 改为只读 preview（不再真下发）。
+> - 净变化：原 31 → 30 端点（-1 net）。
 
 ### worker / work_type / process 主数据（17 端点）
 
@@ -49,25 +54,28 @@
 | POST | `/api/v2/prod/process-chains/by-part/{part_id}` | MANAGER | 整组 upsert 工艺链 + steps（PENDING 守卫 20705；2026-09-29 改 PUT → POST 统一全仓库惯例） | [`process-chain.md`](./process-chain.md#post-apiv2prodprocess-chainsby-partpart_id) |
 | GET | `/api/v2/prod/process-chains/{chain_id}` | 已登录（任意角色，不含 ShelfAccount） | 按链 id 读工艺链（2026-09-16 FK 翻转新增） | [`process-chain.md`](./process-chain.md#get-apiv2prodprocess-chainschain_id) |
 
-### 工人池（5 端点）
+### 工人池（5 端点，2026-09-30 重构：worker-pool → pool 路径收敛）
 
 | Method | Path | 权限 | 说明 | 详情 |
 |---|---|---|---|---|
-| GET | `/api/v2/prod/worker-pool/state` | 已登录（无 role guard） | worker 当前持有 + 工序池候选数 | [`worker-pool.md`](./worker-pool.md#get-apiv2prodworker-poolstate) |
-| GET | `/api/v2/prod/worker-pool/{process_id}` | Manager+Clerk+Inspector | 按工序返回候选池详情（admin 视角） | [`worker-pool.md`](./worker-pool.md#get-apiv2prodworker-poolprocess_id) |
-| POST | `/api/v2/prod/admin/worker-pool/refill` | MANAGER | 为指定 worker 抢满 `max_held_batches` | [`worker-pool.md`](./worker-pool.md#post-apiv2prodadminworker-poolrefill) |
-| POST | `/api/v2/prod/admin/worker-pool/remove` | MANAGER | 把 worker 持有批次按 RETURNED 语义放回候选池 | [`worker-pool.md`](./worker-pool.md#post-apiv2prodadminworker-poolremove) |
-| POST | `/api/v2/prod/admin/worker-pool/auto-allocate` | MANAGER | 按 process + shelf 自动为多个 worker 抢批次/工时（COUNT/TIME × fill_ratio） | [`worker-pool.md`](./worker-pool.md#post-apiv2prodadminworker-poolauto-allocate) |
-| POST | `/api/v2/prod/admin/worker-pool/assign` | MANAGER | 单 batch 拖拽分配（不循环触顶 max_held；用于 UI 单 batch 拖拽场景） | [`worker-pool.md`](./worker-pool.md#post-apiv2prodadminworker-poolassign) |
+| GET | `/api/v2/prod/pool/state` | 已登录（无 role guard） | worker 当前持有 + 工序池候选数 | [`worker-pool.md`](./worker-pool.md#get-apiv2prodpoolstate) |
+| GET | `/api/v2/prod/pool/counts` | Manager+Clerk+Inspector | **2026-09-30 新增**：全工序候选批次聚合计数（dashboard 快照） | [`worker-pool.md`](./worker-pool.md#get-apiv2prodpoolcounts) |
+| GET | `/api/v2/prod/pool/{process_id}` | Manager+Clerk+Inspector | 按工序返回候选池详情（admin 视角） | [`worker-pool.md`](./worker-pool.md#get-apiv2prodpoolprocess_id) |
+| POST | `/api/v2/prod/pool/refill` | MANAGER | 为指定 worker 抢满 `max_held_batches` | [`worker-pool.md`](./worker-pool.md#post-apiv2prodpoolrefill) |
+| POST | `/api/v2/prod/pool/move` | MANAGER | **2026-09-30 新增**：通用移动端点（POOL ↔ WORKER + WORKER ↔ WORKER 三方向） | [`worker-pool.md`](./worker-pool.md#post-apiv2prodpoolmove) |
+| POST | `/api/v2/prod/pool/auto-allocate` | MANAGER | 按 process + shelf 自动为多个 worker 抢批次/工时（COUNT/TIME × fill_ratio） | [`worker-pool.md`](./worker-pool.md#post-apiv2prodpoolauto-allocate) |
 
-### 待下发批次（4 端点，2026-09-29 新增）
+> 旧 `/api/v2/prod/worker-pool/*` 与 `/api/v2/prod/admin/worker-pool/*` 路径 404（router 层不再挂载）。
+
+### 待下发批次（3 端点，2026-09-29 新增 + 2026-09-30 重构）
 
 | Method | Path | 权限 | 说明 | 详情 |
 |---|---|---|---|---|
 | GET | `/api/v2/prod/batches/pending` | Manager+Clerk+Inspector | 车间 PENDING 批次列表（JOIN 4 表扁平投影） | [`batches.md`](./batches.md#get-apiv2prodbatchespending) |
-| POST | `/api/v2/prod/batches/dispatch` | Manager+Clerk | 单 batch 下发（事务内 fetch + 货架解析 + UPDATE OCC + 写 PLACED_ON_SHELF 事件 + WS 广播） | [`batches.md`](./batches.md#post-apiv2prodbatchesdispatch) |
-| POST | `/api/v2/prod/batches/bulk-dispatch` | Manager+Clerk | 批量下发（单事务顺序执行 dispatch；任一失败全回滚） | [`batches.md`](./batches.md#post-apiv2prodbatchesbulk-dispatch) |
-| POST | `/api/v2/prod/batches/auto-dispatch` | Manager+Clerk | 自动下发（按 part.process_chain 首道 step 推导 target；NO_PROCESS_CHAIN/NO_PROCESS_STEP 走 skipped） | [`batches.md`](./batches.md#post-apiv2prodbatchesauto-dispatch) |
+| POST | `/api/v2/prod/batches/dispatch` | Manager+Clerk | bulk-only 下发（targets 数组；单批即 targets.length==1；任一失败 → 全回滚） | [`batches.md`](./batches.md#post-apiv2prodbatchesdispatch) |
+| POST | `/api/v2/prod/batches/auto-dispatch` | Manager+Clerk | **2026-09-30 改为只读预览**：返回每个 batch 的首道工序 + 首货架 + skip_reason；前端据此构造 dispatch 请求 | [`batches.md`](./batches.md#post-apiv2prodbatchesauto-dispatch) |
+
+> 旧 `/api/v2/prod/batches/bulk-dispatch` 端点 404（router 层不再挂载；bulk 走统一 dispatch 的 targets 数组）。
 
 ---
 
@@ -81,19 +89,19 @@
 [排工序]                       [待下发]                       [下发]                            [报工]                          [完成]
    |                              |                              |                                |                                |
    ▼                              ▼                              ▼                                ▼                                ▼
-prod/process-chains/by-part/*   prod/batches/pending          prod/worker-pool/{process_id}   parts/worker-scan (part域)       parts/{part_id}/complete (part域)
-prod/process-chains/{chain_id}  prod/batches/dispatch         prod/admin/worker-pool/refill    parts/{part_id}/pick-up (part域)  parts/{id}/to-process (part域)
-                                prod/batches/bulk-dispatch    prod/admin/worker-pool/assign    parts/{part_id}/to-process (part域) parts/{id}/to-inspection (part域)
-                                prod/batches/auto-dispatch    prod/admin/worker-pool/auto-allocate                              parts/{id}/scan-inspect (part域)
-                                                               prod/admin/worker-pool/remove
-                                                               prod/worker-pool/state
+prod/process-chains/by-part/*   prod/batches/pending          prod/pool/{process_id}          parts/worker-scan (part域)       parts/{part_id}/complete (part域)
+prod/process-chains/{chain_id}  prod/batches/dispatch         prod/pool/refill                parts/{part_id}/pick-up (part域)  parts/{id}/to-process (part域)
+                                prod/batches/auto-dispatch    prod/pool/move                  parts/{part_id}/to-process (part域) parts/{id}/to-inspection (part域)
+                                                               prod/pool/auto-allocate                                      parts/{id}/scan-inspect (part域)
+                                                               prod/pool/state
+                                                               prod/pool/counts
 ```
 
 **核心入口**：
-- **车间下发台**：浏览器打开「待下发 Tab」先 `GET /api/v2/prod/batches/pending` 拿列表，再点批次 → `POST /api/v2/prod/batches/dispatch`（或一次选多行 `bulk-dispatch` / 全选 `auto-dispatch`）。提交后 batch 状态 `PENDING → IN_PROCESS`，自动触发 `BATCH_PLACED_ON_SHELF` WS 广播让其他客户端刷新候选池。
+- **车间下发台**：浏览器打开「待下发 Tab」先 `GET /api/v2/prod/batches/pending` 拿列表，UI 自动 `POST /api/v2/prod/batches/auto-dispatch {batch_ids: [...]}` 预览每批的首道工序 + 首货架，用户确认后 `POST /api/v2/prod/batches/dispatch {targets: [{batch_id, target_process_id}, ...]}` 真正下发。提交后 batch 状态 `PENDING → IN_PROCESS`，自动触发 `BATCH_PLACED_ON_SHELF` WS 广播让其他客户端刷新候选池。
 - **扫码台**（工人报工唯一入口）：`POST /api/v2/parts/worker-scan`（part 域）。扫描成功后同事务触发 `refill_for_worker`（→ 详见 [`worker-pool.md#worker-scan-与-refill-的联动`](./worker-pool.md#worker-scan-与-refill-的联动)）。
-- **大屏候选池**：`GET /api/v2/prod/worker-pool/state`（无 role guard，worker 自查 + admin 监控共用）。
-- **管理员拖拽分配**：UI 走 `POST /api/v2/prod/admin/worker-pool/assign`（单 batch，不循环）；批量按 COUNT/TIME 走 `auto-allocate`。
+- **大屏候选池**：`GET /api/v2/prod/pool/state`（无 role guard，worker 自查 + admin 监控共用）。
+- **管理员拖拽 / 转移批次**：UI 走 `POST /api/v2/prod/pool/move {from, to}`（POOL ↔ WORKER + WORKER ↔ WORKER 三方向通用移动端点）；批量按 COUNT/TIME 走 `pool/auto-allocate`。
 
 **为何报工端点留在 part 域**：
 part / assembly 是 ERP 核心实体（跨生产 + 编程 + 外协 + 质检 + 交付 + 返修），CLAUDE.md 明确标记为「跨域枢纽」。
@@ -214,11 +222,11 @@ part / assembly 是 ERP 核心实体（跨生产 + 编程 + 外协 + 质检 + �
 - ✅ **`prod::work_type`**：CRUD + 工序 mapping 整组替换 + 三态更新 + 引用校验（2026-08-26；2026-09-19 移至 `src/modules/prod/work_type/`）
 - ✅ **`prod::process`**：CRUD + INHOUSE/OUTSOURCE + 引用校验（2026-08-26；color 字段 2026-09-11；2026-09-19 移至 `src/modules/prod/process/`）
 - ✅ **`prod::process_chain`**：1:1 part 工艺链 + 整组 upsert（2026-09-11；2026-09-16 FK 翻转；2026-09-19 移至 `src/modules/prod/process_chain/`，2026-09-29 PUT→POST 统一惯例）
-- ✅ **`prod::worker_pool`**：state + admin refill/remove + auto-allocate COUNT/TIME 模式 + admin/assign（2026-09-11 + 2026-09-14；2026-09-19 移至 `src/modules/prod/worker_pool/`）
+- ✅ **`prod::worker_pool`**（**2026-09-30 重构 → pool**）：state + counts + refill + auto-allocate COUNT/TIME + 通用 move 取代 admin_remove + admin_assign（POOL ↔ WORKER + WORKER ↔ WORKER 三方向，5 端点）；路径收敛为 `/pool/*` 单 nest
 - ✅ **`prod::worker`**（2026-09-19 聚合新增）：CRUD + verify-badge + deactivate/reactivate（2026-08-26；移至 `src/modules/prod/worker/`，URL `/api/v2/prod/workers`）
-- ✅ **`prod::batch`**（2026-09-29 新增）：PENDING 批次列表 + 单条 / 批量 / 自动下发 4 端点（URL `/api/v2/prod/batches/*`）；复用既有 `t_shelf_process` 解析货架，零 schema 变更；commit 后广播 `BATCH_PLACED_ON_SHELF` WS 事件
+- ✅ **`prod::batch`**（2026-09-29 新增 + 2026-09-30 重构）：PENDING 批次列表 + bulk-only dispatch（`targets` 数组，单批即 `targets.length==1`）+ 只读 auto-dispatch preview（首道工序 + 首货架 + skip_reason），3 端点（URL `/api/v2/prod/batches/*`）；复用既有 `t_shelf_process` 解析货架，零 schema 变更；commit 后广播 `BATCH_PLACED_ON_SHELF` WS 事件
 - ✅ **菜单整合**：migration 018 建 `production_group` + `part_process_chain` + 迁移 `worker_queue`；migration 021 软删 settings_root + 3 子菜单 + 新增 `process_work_type`（2026-09-12）
-- ✅ **API 文档整合**：本目录（2026-09-12；2026-09-29 增 `batches.md`）
+- ✅ **API 文档整合**：本目录（2026-09-12；2026-09-29 增 `batches.md`；2026-09-30 增 move + 重构 pool/batches）
 - ✅ **prod 容器聚合**（2026-09-19）：5 支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步
 
 ## 参考

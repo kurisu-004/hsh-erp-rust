@@ -1,6 +1,6 @@
 //! prod::batch 子模块 VO —— 出参（handler 响应序列化层）
 //!
-//! 2026-09-29 新增：与 worker_pool / process_chain 同形 VO 模块，
+//! 2026-09-29 新增 + 2026-09-30 重构：与 worker_pool / process_chain 同形 VO 模块，
 //! 仅 `Serialize` 不 `Deserialize`（禁止出现在 axum extractor 反序列化侧）。
 //!
 //! i64 一律走 `serialize_i64` → JSON string（雪花 ID > 2^53，JS `Number`
@@ -9,7 +9,7 @@
 use chrono::NaiveDate;
 use serde::Serialize;
 
-use crate::shared::types::serialize_i64;
+use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 // ===== pending list =====
 
@@ -79,13 +79,33 @@ pub struct PendingBatchListOut {
 
 // ===== dispatch result =====
 
-/// `POST /api/v2/prod/batches/dispatch` 单条结果（dispatch / bulk-dispatch
-/// 列表项通用）。
+/// `POST /api/v2/prod/batches/dispatch` 单条结果（bulk-only：单条下发即
+/// `succeeded.len() == 1`）。
 ///
-/// `current_process_step_id` 是 `String`（"null" 或 64 位串）以对齐其它域
-/// 序列化习惯（雪花 ID 一律 string）。
+/// 2026-09-30 重构：原 `DispatchResult`（单条）+ `BulkDispatchResult`（succeeded/failed）
+/// 合并为统一 bulk 形态 `DispatchResult { succeeded }`：
+/// - 单条下发 = 1 元素 succeeded
+/// - 多批下发 = N 元素 succeeded（全成功）或 service 抛 AppError（任一硬错误全回滚，
+///   响应为顶层 4xx/5xx，failed 数组废弃）
+///
+/// 当前实现走「任一失败 → 全回滚」语义；`failed` 字段保留为 `Vec<DispatchFailureItem>`
+/// 是为未来启用 partial commit 时向前兼容，**当前总是空**。
+///
+/// `current_process_step_id` 是 `Option<i64>`（dispatch 路径不解析 step，存 NULL）。
 #[derive(Debug, Clone, Serialize)]
 pub struct DispatchResult {
+    /// 成功下发的 batch 列表（顺序与 req.targets 一致）。
+    pub succeeded: Vec<DispatchSuccessItem>,
+    /// 失败明细（当前总为空；预留 partial commit 启用）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<DispatchFailureItem>,
+}
+
+/// `DispatchResult.succeeded` 单条（每条 target 对应一个）。
+///
+/// `current_process_step_id` 走 `Option<i64>`（dispatch 不解析 step → None）。
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchSuccessItem {
     #[serde(serialize_with = "serialize_i64")]
     pub batch_id: i64,
     pub current_process_step_id: Option<i64>,
@@ -96,24 +116,72 @@ pub struct DispatchResult {
     pub version: i32,
 }
 
-/// `POST /api/v2/prod/batches/bulk-dispatch` 顶层响应。
+/// `DispatchResult.failed` 单条（当前总为空；为 partial commit 启用预留）。
 ///
-/// 设计：partial commit 失败时通过 `failed` 数组携带明细；当前实现是
-/// 「任一失败 → 全回滚」，故事务失败时 `succeeded=[]` / `failed=[...]`。
+/// 注：本类型当前未被任何 service 代码生成，但保留作为 VO schema 的稳定部分；
+/// 未来 partial commit 启用时，service 在每条失败处 push `DispatchFailureItem` 而非抛错。
 #[derive(Debug, Clone, Serialize)]
-pub struct BulkDispatchResult {
-    pub succeeded: Vec<DispatchResult>,
-    pub failed: Vec<super::dto::DispatchFailureItem>,
+pub struct DispatchFailureItem {
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    pub code: i32,
+    pub message: String,
+}
+
+// ===== auto-dispatch preview (2026-09-30 重构为只读查询) =====
+
+/// `POST /api/v2/prod/batches/auto-dispatch` 单条预览项。
+///
+/// 2026-09-30 重构：原 `auto_dispatch` 改为只读 `auto_dispatch_preview`，
+/// 不再真正下发批次，仅返回每个 batch 的「首道工序 + 首货架」+ skip_reason。
+/// 实际下发仍走 `POST /api/v2/prod/batches/dispatch`，caller 据此构造
+/// `targets: [{batch_id, target_process_id}]` 发起真正下发。
+///
+/// 字段语义：
+/// - `batch_id` / `part_id` —— 必填
+/// - `process_chain_id` / `first_process_id` / `first_process_code` / `first_process_name`
+///   —— 当 `skip_reason = NO_PROCESS_CHAIN / NO_PROCESS_STEP` 时为 None
+/// - `first_shelf_id` —— 当首道工序未映射货架时为 None（skip_reason=NO_SHELF）
+/// - `skip_reason` —— NOT_FOUND / NO_PROCESS_CHAIN / NO_PROCESS_STEP / NO_SHELF 之一
+///   或 None（一切就绪可下发）
+#[derive(Debug, Clone, Serialize)]
+pub struct AutoDispatchItem {
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    /// `t_part.process_chain_id`（PR-3 step 化后新字段）
+    ///
+    /// **Option 语义**：当 `skip_reason = NO_PROCESS_CHAIN` 时为 None；其余情形透传 part 实际
+    /// 值（即便其它上层查不到也保持原值不动——避免误导 frontend）。None → JSON `null`，避免
+    /// 前端拿 `"0"` 误判为合法 chain。
+    ///
+    /// 2026-09-30 review 第 1 轮：原为 `i64 + serialize_i64` + service `unwrap_or(0)` 兜底，
+    /// 导致 NO_PROCESS_CHAIN 时输出 `"process_chain_id": "0"`；改为 Option 与 plan §3.2 对齐。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub process_chain_id: Option<i64>,
+    /// 首道工序 id（`t_process_chain_step` sort_order=1 行的 process_id）
+    ///
+    /// **Option 语义**：当 `skip_reason = NO_PROCESS_CHAIN / NO_PROCESS_STEP` 时为 None；
+    /// OK 时为 Some(process_id)；NO_SHELF 时仍 Some（首道工序存在但未映射货架）。
+    /// None → JSON `null`。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub first_process_id: Option<i64>,
+    pub first_process_code: String,
+    pub first_process_name: String,
+    /// 首道工序对应的候选货架（按 `t_shelf_process.sort_order ASC`）
+    ///
+    /// **Option 语义**：当 `skip_reason = NO_PROCESS_CHAIN / NO_PROCESS_STEP / NO_SHELF`
+    /// 时为 None；其余情形为 Some(shelf_id)。None → JSON `null`。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub first_shelf_id: Option<i64>,
+    /// 取不到任一上游数据时的原因：NOT_FOUND / NO_PROCESS_CHAIN / NO_PROCESS_STEP / NO_SHELF
+    /// （OK 时为 None）
+    pub skip_reason: Option<String>,
 }
 
 /// `POST /api/v2/prod/batches/auto-dispatch` 顶层响应。
-///
-/// 全成功：succeeded.len() == batch_ids.len()，skipped=[]。
-/// 任一 batch 因 NO_PROCESS_CHAIN / NO_PROCESS_STEP 被跳过：不影响事务，
-/// 落入 skipped 数组；其余 succeeded 仍正常 commit。
-/// 任一硬错误（非 skipped）：全回滚，由 caller 重新发起请求。
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoDispatchResult {
-    pub succeeded: Vec<DispatchResult>,
-    pub skipped: Vec<super::dto::AutoDispatchSkippedItem>,
+    pub items: Vec<AutoDispatchItem>,
 }

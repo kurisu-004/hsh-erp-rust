@@ -2,7 +2,7 @@
 //!
 //! ## DTO/VO 边界（2026-09-22 PR4 重构）
 //! 出参结构（`PoolBatchItem` / `WorkerBrief` / `WorkTypeMaxHeld` /
-//! `ProcessPoolDetail` / `WorkerFillItem` / `AutoAllocateResult` / `AssignResult`）
+//! `ProcessPoolDetail` / `WorkerFillItem` / `AutoAllocateResult` / `MoveResult`）
 //! 已抽离至 `super::vo`。
 //!
 //! ## `AutoAllocateMode` 双向 derive 说明
@@ -12,10 +12,19 @@
 //! 「同一 struct 同时 derive Serialize + Deserialize 被禁，但按业务确实需要的
 //! 跨方向 enum 在 doc comment 注明」即视作合理偏离，本域 `AutoAllocateMode`
 //! 是这种 enum 模式。
+//!
+//! ## `MoveLocation` tagged enum（2026-09-30 重构）
+//! 原 `admin_remove` / `admin_assign` 合并为通用 `POST /api/v2/prod/pool/move`，
+//! 端点接受 `from` / `to` 两个 tagged enum 标识 batch 当前位置与目标位置。
+//! 序列化形态：
+//! - `{"kind":"POOL",  "shelf_id":100}`
+//! - `{"kind":"WORKER","worker_id":50}`
+//!
+//! 不支持 `POOL → POOL`（视为非法，service 返回 `40001 VALIDATION_ERROR`）。
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::types::{deserialize_i64, deserialize_i64_opt, serialize_i64};
+use crate::shared::types::{deserialize_i64, serialize_i64};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -24,26 +33,13 @@ pub enum WorkerScanEvent {
     INSPECTED,
 }
 
-/// POST /api/v2/admin/worker-pool/refill
+/// POST /api/v2/prod/pool/refill
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdminRefillRequest {
     #[serde(deserialize_with = "deserialize_i64")]
     pub worker_id: i64,
     #[serde(deserialize_with = "deserialize_i64")]
     pub shelf_id: i64,
-}
-
-/// POST /api/v2/admin/worker-pool/remove —— 把指定 batch 从 worker 持有中按 RETURNED 语义放回 pool
-#[derive(Debug, Clone, Deserialize)]
-pub struct AdminRemoveRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub worker_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub next_process_id: i64,
 }
 
 /// 自动分配模式：`COUNT` 按批次数填满；`TIME` 按累计预估工时填满。
@@ -56,7 +52,7 @@ pub enum AutoAllocateMode {
     Time,
 }
 
-/// `POST /api/v2/admin/worker-pool/auto-allocate`
+/// `POST /api/v2/prod/pool/auto-allocate`
 #[derive(Debug, Clone, Deserialize)]
 pub struct AutoAllocateRequest {
     #[serde(deserialize_with = "deserialize_i64")]
@@ -67,19 +63,44 @@ pub struct AutoAllocateRequest {
     pub fill_ratio: f64,
 }
 
-/// `POST /api/v2/admin/worker-pool/assign`
+/// `POST /api/v2/prod/pool/move` —— 通用移动端点。
+///
+/// 把 batch 在 `from` → `to` 之间移动，覆盖 pool ↔ worker（worker ↔ worker 也支持）。
+/// 该 enum 取代原 `AdminAssignRequest`（POOL→WORKER 单边）与 `AdminRemoveRequest`
+/// （WORKER→POOL 单边）。`POOL → POOL` / `WORKER → WORKER` 同 kind 视为非法
+/// （service 抛 `40001 VALIDATION_ERROR`）。
+///
+/// 序列化形态：
+/// ```jsonc
+/// {"kind":"POOL",   "shelf_id": 100}
+/// {"kind":"WORKER", "worker_id": 50}
+/// ```
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "UPPERCASE")]
+pub enum MoveLocation {
+    /// batch 当前在生产货架（候选池）。`shelf_id` 必须与 batch.current_holder_id 一致。
+    Pool {
+        #[serde(deserialize_with = "deserialize_i64")]
+        shelf_id: i64,
+    },
+    /// batch 当前被 worker 持有。`worker_id` 必须与 batch.current_holder_id 一致。
+    Worker {
+        #[serde(deserialize_with = "deserialize_i64")]
+        worker_id: i64,
+    },
+}
+
+/// `POST /api/v2/prod/pool/move` 入参。
+///
+/// 字段顺序与 plan §2.1 一致：`batch_id → from → to → note?`。
 #[derive(Debug, Clone, Deserialize)]
-pub struct AdminAssignRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub worker_id: i64,
+pub struct MoveRequest {
     #[serde(deserialize_with = "deserialize_i64")]
     pub batch_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
-    /// 可选；若提供则校验 batch.next_process_id 必须匹配
+    pub from: MoveLocation,
+    pub to: MoveLocation,
     #[serde(default)]
-    #[serde(deserialize_with = "deserialize_i64_opt")]
-    pub process_id: Option<i64>,
+    pub note: Option<String>,
 }
 
 /// `GET /api/v2/prod/worker-pool/counts` —— 单工序候选批次聚合计数条目。
