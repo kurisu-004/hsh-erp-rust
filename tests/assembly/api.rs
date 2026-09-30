@@ -45,7 +45,9 @@
 //! `use hsh_erp_test_support::test_pool;` 直接引入；facade `tests/common/mod.rs` 在 3 个
 //! binary 全部迁移后删除。
 
+use axum::http::StatusCode;
 use lopdf::{Document, Object, ObjectId, dictionary};
+use serde_json::Value;
 use sqlx::PgPool;
 
 use hsh_erp_rust::auth::rbac::{CurrentUser, Role};
@@ -57,7 +59,10 @@ use hsh_erp_rust::modules::assembly::dto::{
 use hsh_erp_rust::modules::assembly::service::AssemblyService;
 use hsh_erp_rust::shared::error::AppError;
 
-use hsh_erp_test_support::{AssemblyFixture, load_assembly_fixture, test_pool};
+use hsh_erp_test_support::{
+    AssemblyFixture, PartFixture, json_request, load_assembly_fixture, login_token, send, test_app,
+    test_pool, test_state,
+};
 
 // ===========================================================================
 //  全局串行化 + setup（PR13 Phase H，2026-09-24 fixture 范本化）
@@ -1532,5 +1537,103 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
         child_qtys3,
         vec![1, 1, 1],
         "3→1：GREATEST(1, round(...))=1（下限命中；child2 round(2/3)=1）"
+    );
+}
+
+/// 2026-09-30 新增：`/assemblies` 端点对 10 字段 union-list 参数的兼容回归。
+///
+/// 背景：com::union_list 端点新增 10 字段（drawing_no / name / order_no /
+/// serial_no / request_date_* / system_delivery_date_* / order_no_is_null /
+/// system_delivery_date_is_null），assembly 域 `AssemblyListQuery` 故意保持
+/// 原字段集不扩展。本测试断言：URL 带全套 10 字段（值乱填）时 `/assemblies`
+/// 端点仍返 200 + 不报错（axum `Query<T>` 静默丢弃未知字段 = 设计如此），
+/// 结果与不带这些参数完全一致。
+///
+/// 注：本文件其它测试走 service 直调（不开 axum HTTP）；本测试走 HTTP 是因
+/// 为要断言的是 URL query 解析的兼容行为（service 直调无法验证 Query<T> 的
+/// 字段丢弃语义）。
+#[tokio::test]
+async fn list_assemblies_with_compat_union_list_fields() {
+    use serde_json::Value;
+    let pool = test_pool().await;
+    let _fx = load_assembly_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(&app, PartFixture::CLERK_USERNAME, PartFixture::PASSWORD).await;
+    // 注入 1 行 asm，避免返回 0 条干扰断言（同时确认确实命中 DB 而非空集）
+    let asm_id = {
+        use hsh_erp_rust::infra::clock::now_naive;
+        use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+        let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+        let now = now_naive();
+        let today = now.date();
+        sqlx::query(
+            "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
+             request_date, planned_delivery_date, status, quantity, unit_price, total_price, \
+             version, created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, 'COMPAT-A', 'COMPAT-A', '', $2, $3, $3, 'PENDING', 1, 0, 0, 0, $4, NULL, $4, NULL)",
+        )
+        .bind(id)
+        .bind(PartFixture::CUSTOMER_L2_ID) // t_assembly.customer_id NOT NULL；用 part fixture 的 L2
+        .bind(today)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert compat asm");
+        id
+    };
+
+    // ---- baseline：不带 union-list 字段 ----
+    let url_base = "/assemblies?limit=10";
+    let (s_base, env_base) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request("GET", url_base, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s_base, StatusCode::OK, "baseline: {env_base}");
+    let total_base = env_base["data"]["total"].as_i64().unwrap_or(-1);
+    let n_items_base = env_base["data"]["items"].as_array().unwrap().len();
+
+    // ---- 兼容：URL 带全套 10 字段（值乱填） ----
+    let url_with_union_fields = "/assemblies?limit=10\
+         &drawing_no=IGNORED&name=IGNORED&order_no=IGNORED&serial_no=IGNORED\
+         &request_date_from=2026-01-01&request_date_to=2026-12-31\
+         &system_delivery_date_from=2026-01-01&system_delivery_date_to=2026-12-31\
+         &order_no_is_null=true&system_delivery_date_is_null=false";
+    let (s_full, env_full) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            url_with_union_fields,
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s_full,
+        StatusCode::OK,
+        "/assemblies 应兼容未知 query 字段（axum 静默丢弃 = 设计）: {env_full}"
+    );
+    assert_eq!(env_full["code"], 0);
+    assert_eq!(
+        env_full["data"]["total"].as_i64().unwrap_or(-1),
+        total_base,
+        "带/不带 10 字段 total 应一致: baseline={total_base}, full={env_full}"
+    );
+    assert_eq!(
+        env_full["data"]["items"].as_array().unwrap().len(),
+        n_items_base,
+        "items 数量应一致"
+    );
+    // 确认注入的 asm_id 仍在结果里（= 排除全空集歧义）
+    let got_ids: Vec<i64> = env_full["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert!(
+        got_ids.contains(&asm_id),
+        "注入的 asm_id 应仍在结果中: {got_ids:?}"
     );
 }
