@@ -109,6 +109,12 @@ pub mod code {
     //   语义近似但属于 prod/batch 上下文独立槽位，方便前端按 code 区分场景）
     pub const BIZ_BATCH_INVALID_STATUS: i32 = 20120;
     pub const BIZ_BATCH_NOT_FOUND: i32 = 20121;
+    // 2026-09-30 新增：prod/pool/move 路径专用错误码（prod 域工人池 9 端点重构）。
+    // 触发场景：caller 在 `POST /api/v2/prod/pool/move` 给的 `from.{kind, holder_id}`
+    // 与 batch 当前 `(location, current_holder_id)` 不一致（如 from=POOL 但 batch
+    // 实际在 WORKER 持有）。槽位选择：20122 顺延 201xx 段（parts/batch 段），HTTP 409
+    // 由 status_from_code 表驱动映射。
+    pub const BIZ_BATCH_LOCATION_MISMATCH: i32 = 20122;
 
     // 202xx 工人
     pub const BIZ_WORKER_NOT_FOUND: i32 = 20201;
@@ -465,6 +471,11 @@ fn status_from_code(c: i32) -> StatusCode {
             StatusCode::NOT_FOUND
         }
 
+        // ---- 2xxxx 业务码：move path from/holder 不一致（409） ----
+        // 2026-09-30 新增：prod/pool/move 时 from 与 batch 当前 (location, holder)
+        // 不一致。前端按 code 区分 40904 vs 40901/40903。
+        c if c == code::BIZ_BATCH_LOCATION_MISMATCH => StatusCode::CONFLICT,
+
         // ---- 2xxxx 业务码：409 (状态冲突 / 重复 / 占用 / 锁) ----
         c if c == code::BIZ_USER_DUPLICATE
             || c == code::BIZ_USER_DUPLICATE_USERNAME
@@ -502,6 +513,9 @@ fn status_from_code(c: i32) -> StatusCode {
         {
             StatusCode::CONFLICT
         }
+
+        // 2026-09-30 新增：move 路径 from/holder 不一致 → 409
+        c if c == code::BIZ_BATCH_LOCATION_MISMATCH => StatusCode::CONFLICT,
 
         // ---- 2xxxx 业务码：422 (校验类，Python 显式声明 21113 → 422) ----
         c if c == code::BIZ_DELIVERY_PRINT_BAD_ORDER || c == code::BIZ_SHELF_PROCESS_NOT_MAPPED => {
@@ -651,6 +665,11 @@ mod tests {
         // 2026-09-29 新增：prod/batch dispatch 专用错误码
         (code::BIZ_BATCH_INVALID_STATUS, "BIZ_BATCH_INVALID_STATUS"),
         (code::BIZ_BATCH_NOT_FOUND, "BIZ_BATCH_NOT_FOUND"),
+        // 2026-09-30 新增：prod/pool/move from/holder 不一致（409）
+        (
+            code::BIZ_BATCH_LOCATION_MISMATCH,
+            "BIZ_BATCH_LOCATION_MISMATCH",
+        ),
         // 202xx
         (code::BIZ_WORKER_NOT_FOUND, "BIZ_WORKER_NOT_FOUND"),
         (code::BIZ_WORKER_INACTIVE, "BIZ_WORKER_INACTIVE"),
@@ -1024,6 +1043,8 @@ mod tests {
         // 2026-09-29 新增：prod/batch dispatch 专用错误码
         assert_eq!(code::BIZ_BATCH_INVALID_STATUS, 20120);
         assert_eq!(code::BIZ_BATCH_NOT_FOUND, 20121);
+        // 2026-09-30 新增：move 路径 from/holder 不一致 → 409
+        assert_eq!(code::BIZ_BATCH_LOCATION_MISMATCH, 20122);
 
         // 202xx
         assert_eq!(code::BIZ_WORKER_NOT_FOUND, 20201);
@@ -1396,6 +1417,12 @@ mod tests {
             code::BIZ_BATCH_NOT_FOUND,
             StatusCode::NOT_FOUND,
             "BIZ_BATCH_NOT_FOUND",
+        ),
+        // 2026-09-30 新增：move 路径 from/holder 不一致 → 409
+        (
+            code::BIZ_BATCH_LOCATION_MISMATCH,
+            StatusCode::CONFLICT,
+            "BIZ_BATCH_LOCATION_MISMATCH",
         ),
         // 2026-09-28 删除：相关会话域 HTTP 表覆盖（域下线，码段释放）。
         // 2xxxx 显式 409

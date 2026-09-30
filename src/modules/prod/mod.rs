@@ -9,6 +9,14 @@
 //! 下发 4 端点，URL 挂 `/api/v2/prod/batches/*`），复用既有 `t_shelf_process` 解析货架，
 //! 零 schema 变更。
 //!
+//! 2026-09-30 prod 域 9 端点重构（worker-pool + batches 合并）：
+//! - worker-pool → pool 路径收敛：原 `/worker-pool` + `/admin/worker-pool` 双 nest
+//!   合并为单一 `/pool` nest，5 个端点全部挂 `/api/v2/prod/pool/*`（`/state`、
+//!   `/counts`、`/{process_id}`、`/refill`、`/move`、`/auto-allocate`）。
+//! - 旧 `/admin/worker-pool/{remove,assign}` 路径 404（前端调用统一走 `/pool/move`）。
+//! - batches 端点合并：原 `/batches/dispatch`（单条）+ `/batches/bulk-dispatch`（批量）
+//!   合并为单一 bulk-only `/batches/dispatch`，原 `/bulk-dispatch` 路径 404。
+//!
 //! part / assembly 是全仓库核心实体（生产只是其生命周期一段），不进 prod。
 //! 报工端点（worker-scan / pick-up / to-* / complete）留在 part 域；
 //! 文档层「生产全流程端点地图」在 `docs/api/production/index.md` 兜底串联。
@@ -34,8 +42,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/work-types", work_type::router())
         .nest("/processes", process::router())
         .nest("/process-chains", process_chain::router())
-        .nest("/worker-pool", worker_pool::router())
-        .nest("/admin/worker-pool", worker_pool::admin_router())
+        // 2026-09-30 重构：worker-pool → pool 路径收敛，原双 nest（/worker-pool +
+        // /admin/worker-pool）合并为单一 /pool nest。
+        .nest("/pool", worker_pool::router())
         // 2026-09-29 新增：prod::batch（PENDING 批次 + 下发）
         .nest("/batches", batch::router())
 }

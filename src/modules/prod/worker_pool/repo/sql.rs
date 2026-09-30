@@ -554,4 +554,57 @@ impl WorkerPoolRepo {
         .await?;
         Ok(rows)
     }
+
+    /// worker ↔ worker 移动：把 batch 从源 worker 切到目标 worker（OCC，2026-09-30 新增）。
+    ///
+    /// `POST /api/v2/prod/pool/move` 当 from.kind=WORKER 且 to.kind=WORKER 时调此 SQL。
+    /// - **不写 `current_process_step_id`**：move worker→worker 不推进工序链
+    ///   （与 worker→pool 同原则；step 只在 worker-scan RETURNED/INSPECTED 推进）
+    /// - WHERE 守卫：
+    ///   - `current_holder_id = $4`：源 worker 必须当前持有该 batch
+    ///   - `location = 'WORKER'`：与 holder 守卫配合限定状态机
+    ///   - `status = 'IN_PROCESS'`：必须是加工中状态
+    ///   - `version = $2`：乐观锁
+    ///   - `deleted_at IS NULL`：排除软删
+    /// - SET：current_holder_id = $3（dst）、location='WORKER'、version+1
+    /// - 0 行 → `40901 VERSION_CONFLICT`（含 location/holder/status 不匹配）
+    ///
+    /// 注：handler 层 `tx.commit()` 之后会发 WS `WORKER_POOL_MOVE_DONE` 广播，
+    /// 前端订阅统一事件名即可推断 from/to 方向（payload 含 src/dst worker id）。
+    pub async fn move_worker_to_worker(
+        conn: &mut PgConnection,
+        batch_id: i64,
+        src_worker_id: i64,
+        dst_worker_id: i64,
+        expected_version: i32,
+        operator_user_id: Option<i64>,
+    ) -> Result<u64, AppError> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE t_part_batch
+            SET current_holder_id = $3,
+                location          = 'WORKER',
+                -- 2026-09-30 重构：worker↔worker move 不写 step
+                --   （move 不推进工序链，与 worker→pool 同原则）
+                version           = version + 1,
+                updated_at        = NOW(),
+                updated_by        = $5
+            WHERE id = $1
+              AND version = $2
+              AND status = 'IN_PROCESS'
+              AND location = 'WORKER'
+              AND current_holder_id = $4
+              AND deleted_at IS NULL
+            "#,
+            batch_id,
+            expected_version,
+            dst_worker_id,
+            src_worker_id,
+            operator_user_id,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(AppError::from)?;
+        Ok(result.rows_affected())
+    }
 }

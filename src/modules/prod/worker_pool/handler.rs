@@ -2,28 +2,31 @@
 //!
 //! 对应 Python myERP/api/v1/worker_pool.py（设计 §6.3 — worker-pool）。
 //!
-//! ## 端点
-//! - `GET  /api/v2/worker-pool/state?worker_id=&shelf_id=`  —— worker 当前持有 +
-//!   池候选数（按工序分组）。无 role guard（worker 自查 + admin 监控共用）。
-//! - `GET  /api/v2/worker-pool/counts`               —— **2026-09-30 新增**：
-//!   全工序候选批次聚合计数（GROUP BY process_id），跨所有货架，admin 视图。
-//!   Manager+Clerk+Inspector 可调；service 内守卫。响应 `WorkerPoolCountsOut`。
-//! - `GET  /api/v2/worker-pool/{process_id}`        —— 按工序返回候选池详情
-//!   （process 元数据 + workers + work_types.max_held + 跨货架候选批次）。
+//! ## 端点（2026-09-30 重构：worker-pool → pool 路径收敛 + 5 个端点挂 pool/*）
+//! - `GET  /api/v2/prod/pool/state?worker_id=&shelf_id=` —— worker 当前持有 +
+//!   池候选数（按工序分组）。无 role guard。
+//! - `GET  /api/v2/prod/pool/counts`               —— 2026-09-30 新增：全工序
+//!   候选批次聚合计数（GROUP BY process_id），跨所有货架，admin 视图。
 //!   Manager+Clerk+Inspector 可调；service 内守卫。
-//! - `POST /api/v2/admin/worker-pool/refill`                —— admin 触发
+//! - `GET  /api/v2/prod/pool/{process_id}`        —— 按工序返回候选池详情。
+//!   Manager+Clerk+Inspector 可调；service 内守卫。
+//! - `POST /api/v2/prod/pool/refill`              —— Manager 触发
 //!   `refill_for_worker`。Manager role 守卫。
-//! - `POST /api/v2/admin/worker-pool/remove`                —— admin 把 worker
-//!   持有的批次按 RETURNED 语义放回候选池。Manager role 守卫。
+//! - `POST /api/v2/prod/pool/move`                —— Manager 通用移动端点
+//!   （覆盖 POOL ↔ WORKER + WORKER ↔ WORKER 三方向，取代旧 `admin_remove` /
+//!   `admin_assign`）。Manager role 守卫。Commit 后广播 `WORKER_POOL_MOVE_DONE`。
+//! - `POST /api/v2/prod/pool/auto-allocate`       —— 按 `process_id + shelf_id`
+//!   范围自动为每个匹配 worker 抢批次数 / 累计工时。Manager role 守卫。
 //!
 //! ## 事务 + WS 广播（2026-09-22 D-2 重构对齐 iam 范本）
 //! 事务边界在 handler：`state.pool.begin()` → 传 `&mut tx` 给 service → 显式
 //! `tx.commit()`；提前 return 时 `Transaction` 的 Drop 自动回滚。读端点走
 //! `pool.acquire()` 不开事务。
 //!
-//! - ① 纯写端点（admin_refill / admin_remove / auto_allocate / admin_assign）：
+//! - ① 纯写端点（admin_refill / move / auto_allocate）：
 //!   `pool.begin() → service → commit`，commit 后发 WS 广播。
-//! - ③ 读端点（state / pool_by_process）：`pool.acquire() → service`，不开事务。
+//! - ③ 读端点（state / pool_by_process / pool_counts）：`pool.acquire() → service`，
+//!   不开事务。
 //!
 //! service 公共方法收 `&mut PgConnection`（生产），service 内部 reborrow `&mut *conn`
 //! 喂 `WorkerPoolRepoTrait`（trait 已直接 `impl for &mut PgConnection`，2026-09-22
@@ -34,6 +37,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
@@ -41,14 +45,11 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use super::dto::{
-    AdminAssignRequest, AdminRefillRequest, AdminRemoveRequest, AutoAllocateRequest,
-    WorkerPoolCountsOut,
-};
+use super::dto::{AdminRefillRequest, AutoAllocateRequest, MoveRequest, WorkerPoolCountsOut};
 use super::model::RefillResult;
 use super::model::WorkerPoolState;
 use super::service::WorkerPoolService;
-use super::vo::{AssignResult, AutoAllocateResult, ProcessPoolDetail};
+use super::vo::{AutoAllocateResult, MoveResult, ProcessPoolDetail};
 
 #[derive(Debug, Deserialize)]
 pub struct StateQuery {
@@ -56,7 +57,7 @@ pub struct StateQuery {
     pub shelf_id: i64,
 }
 
-/// GET /api/v2/worker-pool/state?worker_id=&shelf_id=
+/// GET /api/v2/prod/pool/state?worker_id=&shelf_id=
 ///
 /// 无 role guard —— worker 自查 / admin 监控共用。
 ///
@@ -70,7 +71,7 @@ pub async fn state(
     Ok(Json(R::ok(s)))
 }
 
-/// POST /api/v2/admin/worker-pool/refill
+/// POST /api/v2/prod/pool/refill
 ///
 /// Manager role 守卫。Commit 后：
 /// - `taken.len() > 0` → 广播 `WORKER_POOL_REFILL_DONE`
@@ -102,7 +103,7 @@ pub async fn admin_refill(
     } else if r.pool_empty {
         state.ws_hub.broadcast(WsEvent::DashboardEvent {
             kind: "WORKER_POOL_EMPTY".into(),
-            payload: serde_json::json!({
+            payload: json!({
                 "worker_id": req.worker_id.to_string(),
                 "shelf_id": req.shelf_id.to_string(),
                 "pool_empty": true,
@@ -112,30 +113,7 @@ pub async fn admin_refill(
     Ok(Json(R::ok(r)))
 }
 
-/// POST /api/v2/admin/worker-pool/remove
-///
-/// Manager role 守卫。把 worker 持有的指定 batch 按 RETURNED 语义放回候选池。
-/// Commit 后广播 `WORKER_POOL_ADMIN_REMOVED`。
-///
-/// 纯写端点（① 形态）：`pool.begin() → service → commit`。
-pub async fn admin_remove(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Json(req): Json<AdminRemoveRequest>,
-) -> Result<Json<R<super::model::TakenItem>>, AppError> {
-    current.require_role(Role::Manager)?;
-    let mut tx = state.pool.begin().await?;
-    let t = WorkerPoolService::admin_remove_held_batch(&mut tx, &state.snowflake, req, &current)
-        .await?;
-    tx.commit().await?;
-    state.ws_hub.broadcast(WsEvent::DashboardEvent {
-        kind: "WORKER_POOL_ADMIN_REMOVED".into(),
-        payload: serde_json::to_value(&t).unwrap_or_default(),
-    });
-    Ok(Json(R::ok(t)))
-}
-
-/// GET /api/v2/worker-pool/{process_id}
+/// GET /api/v2/prod/pool/{process_id}
 ///
 /// Manager + Clerk + Inspector。返回 process 元数据 + 可执行该工序的工人 +
 /// 映射工种的 max_held + 跨生产货架的候选批次全量列表。
@@ -154,7 +132,7 @@ pub async fn pool_by_process(
     Ok(Json(R::ok(detail)))
 }
 
-/// GET /api/v2/worker-pool/counts
+/// GET /api/v2/prod/pool/counts
 ///
 /// 2026-09-30 新增：admin 视角的全工序候选批次聚合（dashboard 快照型查询）。
 /// 返回 `WorkerPoolCountsOut { counts: Vec<ProcessBatchCount>, total: i64 }`，
@@ -174,7 +152,7 @@ pub async fn pool_counts(
     Ok(Json(R::ok(out)))
 }
 
-/// POST /api/v2/admin/worker-pool/auto-allocate
+/// POST /api/v2/prod/pool/auto-allocate
 ///
 /// 按 `process_id + shelf_id` 范围自动为每个匹配 worker 抢批次数 / 累计工时。
 ///
@@ -199,25 +177,25 @@ pub async fn auto_allocate(
     Ok(Json(R::ok(result)))
 }
 
-/// POST /api/v2/admin/worker-pool/assign
+/// POST /api/v2/prod/pool/move（2026-09-30 新增）。
 ///
-/// 2026-09-14 follow-up-ux 新增：单 batch 拖拽分配（不循环触顶 max_held）。
+/// 通用移动端点：覆盖 POOL ↔ WORKER + WORKER ↔ WORKER 三方向。
+/// 取代原 `admin_remove`（WORKER→POOL 单边）+ `admin_assign`（POOL→WORKER 单边）。
 ///
-/// Manager 角色守卫下沉到 service（`assign_batch_to_worker` 内部 `require_role`）。
-/// Commit 后广播 `WORKER_POOL_ASSIGN_DONE`（payload = `AssignResult`）。
+/// Manager 角色守卫下沉到 service（`move_batch` 内部 `require_role`）。
+/// Commit 后统一广播 `WORKER_POOL_MOVE_DONE`（payload 含 from/to 让前端推断方向）。
 ///
 /// 纯写端点（① 形态）：`pool.begin() → service → commit`。
-pub async fn admin_assign(
+pub async fn move_batch(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
-    Json(req): Json<AdminAssignRequest>,
-) -> Result<Json<R<AssignResult>>, AppError> {
+    Json(req): Json<MoveRequest>,
+) -> Result<Json<R<MoveResult>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let result =
-        WorkerPoolService::assign_batch_to_worker(&mut tx, &state.snowflake, req, &current).await?;
+    let result = WorkerPoolService::move_batch(&mut tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
-        kind: "WORKER_POOL_ASSIGN_DONE".into(),
+        kind: "WORKER_POOL_MOVE_DONE".into(),
         payload: serde_json::to_value(&result).unwrap_or_default(),
     });
     Ok(Json(R::ok(result)))

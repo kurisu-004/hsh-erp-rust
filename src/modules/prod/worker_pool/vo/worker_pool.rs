@@ -115,18 +115,38 @@ pub struct AutoAllocateResult {
     pub pool_empty: bool,
 }
 
-/// `POST /api/v2/admin/worker-pool/assign` 响应。
+/// `POST /api/v2/prod/pool/move` 响应（2026-09-30 重构）。
+///
+/// 取代原 `AssignResult`（POOL→WORKER 单边返回）。MoveResult 通用：
+/// - 移动方向从 `from_kind` / `to_kind` 透传，前端按需渲染
+/// - `new_holder_id` 透传目标位置的 id（POOL=shelf_id，WORKER=worker_id）
+/// - `current_held` 仅在 to_kind=WORKER 时有意义（POOL→WORKER 才增减）
+/// - `max_held` 同上（仅 WORKER 维度有 max_held 上限）
 #[derive(Debug, Clone, Serialize)]
-pub struct AssignResult {
-    #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub worker_id: i64,
+pub struct MoveResult {
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
     pub batch_id: i64,
+    /// from.kind 的字面（`POOL` / `WORKER`）
+    pub from_kind: String,
+    /// to.kind 的字面（`POOL` / `WORKER`）
+    pub to_kind: String,
+    /// 移动后 batch 的 `current_holder_id`（shelf_id 或 worker_id）
     #[serde(serialize_with = "crate::shared::types::serialize_i64")]
-    pub shelf_id: i64,
-    pub taken: TakenItem,
-    /// 分配后 worker 的 current_held（含本批次）
-    pub current_held: i32,
-    /// 分配后 worker 工种的 max_held_batches
-    pub max_held: i32,
+    pub new_holder_id: i64,
+    /// 移动后 batch 的 location（`PRODUCTION_SHELF` 或 `WORKER`）
+    pub new_location: String,
+    pub version: i32,
+    /// 仅 to_kind=WORKER 时填：移动后 worker 的 current_held（含本批次）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_held: Option<i32>,
+    /// 仅 to_kind=WORKER 时填：worker 工种的 max_held_batches
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_held: Option<i32>,
+    /// 仅 to_kind=POOL 时填：候选池货架 id（from.shelf_id 与 to.shelf_id 一致时跳过校验）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shelf_id: Option<i64>,
+    /// 仅 POOL→WORKER 移动时填：从 pool 取出的 batch 详情（含 part 元数据）；
+    /// 与 `assign_batch_to_worker` 旧 `taken` 字段同源 TakenItem。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub taken: Option<TakenItem>,
 }

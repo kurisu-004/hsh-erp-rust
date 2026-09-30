@@ -115,6 +115,17 @@ pub trait WorkerPoolRepoTrait: Send {
     /// 单 SQL GROUP BY next_process_id，service 层二次查 process 元数据。
     async fn group_count_by_process_all_shelves(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error>;
 
+    /// worker ↔ worker 移动 SQL（2026-09-30 新增）。把 batch 从 src 切到 dst，
+    /// 不写 `current_process_step_id`（move 不推进工序链）。详见 sql.rs 同名函数。
+    async fn move_worker_to_worker(
+        &mut self,
+        batch_id: i64,
+        src_worker_id: i64,
+        dst_worker_id: i64,
+        expected_version: i32,
+        operator_user_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error>;
+
     // ── worker 域 helper（2）──
     /// 单条查 worker（`WorkerRepo::get_by_id`）。
     async fn worker_get_by_id(
@@ -335,6 +346,29 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
 
     async fn group_count_by_process_all_shelves(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error> {
         WorkerPoolRepo::group_count_by_process_all_shelves(&mut **self).await
+    }
+
+    async fn move_worker_to_worker(
+        &mut self,
+        batch_id: i64,
+        src_worker_id: i64,
+        dst_worker_id: i64,
+        expected_version: i32,
+        operator_user_id: Option<i64>,
+    ) -> Result<u64, sqlx::Error> {
+        WorkerPoolRepo::move_worker_to_worker(
+            &mut **self,
+            batch_id,
+            src_worker_id,
+            dst_worker_id,
+            expected_version,
+            operator_user_id,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::shared::error::AppError::Database(db_err) => db_err,
+            other => sqlx::Error::Protocol(other.to_string()),
+        })
     }
 
     // ── worker helper ──

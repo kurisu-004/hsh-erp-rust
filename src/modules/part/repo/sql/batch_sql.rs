@@ -426,19 +426,26 @@ impl PartRepo {
     /// 0 行 → 40901 VERSION_CONFLICT / 状态非 IN_PROCESS / location 非 WORKER / 已软删
     ///   —— 由 service 层映射。
     /// 成功 → `current_holder_id = shelf_id`，`location = 'PRODUCTION_SHELF'`，
-    ///   `current_process_step_id = $4`，`version += 1`。
+    ///   `version += 1`。
     ///
     /// `current_user_id` 写入 `updated_by`（nullable 与既有路径一致）。
     ///
     /// 2026-09-16 PR-3 批次 step 化（migration 028）：
     /// - 参数 `next_process_id: i64` 改 `current_process_step_id: Option<i64>`
     /// - 写入列改为 t_part_batch.current_process_step_id
+    ///
+    /// 2026-09-30 重构（prod/pool move 合并 remove 路径）：
+    /// - 移除 `current_process_step_id` SET 子句；move worker→pool 不应破坏工序链——
+    ///   `current_process_step_id` 由 worker-scan RETURNED/INSPECTED 推进，admin
+    ///   主动退回只是把 holder 切回 pool，step 不变。
+    /// - 形参 `current_process_step_id` 保留 `_` 前缀以兼容既有调用方（worker-scan
+    ///   路径传 `None`），sqlx 仍要求参数占位（`$4`），SET 子句不再写该列。
     pub async fn mark_batch_returned<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
-        current_process_step_id: Option<i64>,
+        _current_process_step_id: Option<i64>,
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query!(
@@ -446,7 +453,8 @@ impl PartRepo {
             UPDATE t_part_batch
             SET current_holder_id       = $3,
                 location                = 'PRODUCTION_SHELF',
-                current_process_step_id = $4,
+                -- 2026-09-30 重构：移除 current_process_step_id 写入
+                --   （move worker→pool 路径不推进工序链；形参仍占 $4）
                 version                 = version + 1,
                 updated_at              = now(),
                 updated_by              = $5
@@ -457,7 +465,7 @@ impl PartRepo {
             batch_id,
             expected_version,
             shelf_id,
-            current_process_step_id,
+            _current_process_step_id,
             current_user_id,
         )
         .execute(executor)

@@ -1,4 +1,4 @@
-//! worker_pool 域响应 VO（2026-09-22 PR4 重构）
+//! worker_pool 域响应 VO（2026-09-22 PR4 重构 + 2026-09-30 move 重构）
 //!
 //! 仅含 handler 返回的 output 类型；入参类型见 `super::dto`。
 //!
@@ -8,10 +8,13 @@
 //!
 //! `AutoAllocateMode` 同时含 Deserialize+Serialize（按 mode 字段读+写），
 //! 留在 `dto/` 中——本域不强行拆为 vo。
+//!
+//! 2026-09-30 重构：移除 `AssignResult`，新增 `MoveResult`（覆盖 pool ↔ worker
+//! + worker ↔ worker 三方向；前端按 from_kind / to_kind 推断移动方向）。
 
 pub mod worker_pool;
 
 pub use worker_pool::{
-    AssignResult, AutoAllocateResult, PoolBatchItem, ProcessPoolDetail, WorkTypeMaxHeld,
-    WorkerBrief, WorkerFillItem,
+    AutoAllocateResult, MoveResult, PoolBatchItem, ProcessPoolDetail, WorkTypeMaxHeld, WorkerBrief,
+    WorkerFillItem,
 };
