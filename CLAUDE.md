@@ -9,6 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 docker compose up -d postgres-dev    # 开发库（localhost:5430，库 hsh）：cargo run 与 query! 编译期校验依赖
 docker compose up -d postgres-test   # 测试库（localhost:5429，库 postgres_rust_test）：集成测试依赖，首次自动建库+迁移
+                                    # ⚠️ 2026-09-30 起 5429 被一个已删除 worktree 的孤儿
+                                    #    容器占着（见「worktree 服务」），此命令会失败；
+                                    #    集成测试请直接走 scripts/test_nextest.sh（自带容器）
 
 cargo check                 # 已有 query! 宏：编译期经 .env 的 DATABASE_URL 连开发库校验；无库时用 SQLX_OFFLINE=true（.sqlx 已提交）
 cargo clippy --all-targets
@@ -34,10 +37,21 @@ scripts/test_nextest.sh
 cargo test --test <name>
 
 # 快速路：复用 postgres-test 服务（:5429，跳过容器)
+# ⚠️ 2026-09-30 起 5429 被孤儿容器占着，此路当前不可用 → 走 scripts/test_nextest.sh
 TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo nextest run
 
 # 手工应用 seeds（菜单等配置数据；通常 app 启动钩子自动跑）
 ./scripts/seed_apply.sh
+
+# 从 db_backup/*.dump 恢复生产数据（见「从备份恢复」一节）
+./scripts/restore_from_backup.sh                    # 重建 schema + 灌数据（默认）
+DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策表，不改库
+
+# worktree 的独立容器（见「worktree 服务」一节；日常无需手工调用，skill 自动调）
+./scripts/wt_services.sh up <slug>    # 建/复用该 worktree 的 PG+Redis 容器并改写其 .env
+./scripts/wt_services.sh down <slug>  # 销毁容器 + 卷
+./scripts/wt_services.sh ps           # 列出所有受管 worktree 的服务
+./scripts/wt_services.sh doctor       # 体检：孤儿 compose project / 端口冲突 / .env 与状态不一致
 ```
 
 ## Schema 迁移与 seeds 分离（2026-09-25 sqlx 接管后）
@@ -53,6 +67,37 @@ TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo next
 ### 初始管理员账号（2026-09-26 新增）
 
 `seeds/admin.sql` 是**可选**初始管理员 seed（`username=admin / password=changeme / role=MANAGER`），由环境变量 `BOOTSTRAP_ADMIN_ENABLED` 门控（默认 `false`）。在 `src/main.rs` 启动钩子、`src/infra/seed.rs::run_seeds(pool, bootstrap_admin_enabled)` 处执行。开启流程：env=`true` → cargo run / docker compose up → 用 admin/changeme 登录 `/api/v2/iam/login` → 改密 → env=`false` → 重启。生产默认关，避免无意中创建初始账号。明文密码与 `src/modules/iam/service/account.rs::DEFAULT_RESET_PASSWORD` 同源，bcrypt 哈希复用 `test-support/fixtures/iam.sql` 同款字面值。
+
+## 从备份恢复（scripts/restore_from_backup.sh，2026-10-01 重写）
+
+**铁律：restore 绝不修改 `public` schema。** dump 是 Python 端老 schema 的快照，与 `migrations/` 有列漂移（027 删了 `t_part` 的 6 个批次依附列 / 028 删了 `t_part_batch` 的 2 列 / 004 改了 `next_process_id` 语义）。2026-09-25 的老脚本靠「先 `ADD COLUMN` 把老列补回来」让 `pg_restore` 不报错 —— 于是那 10 个已废弃的列**永久留在 schema 里**，就是「重建后字段又恢复了」的根因。
+
+现在的流程：
+
+1. **`REBUILD_SCHEMA=1`（默认）** —— `DROP SCHEMA public CASCADE` + `sqlx migrate run`（需 sqlx-cli），目标 schema 严格等于 `migrations/` HEAD，顺带补上从未应用的 004。
+2. **漂移自动检测** —— 从 `pg_restore --data-only` 的 `COPY` 表头拿 dump 列清单，与 `information_schema` 比对，输出 `直灌 / stage 投影 / 目标新列置 NULL` 决策表（`DRY_RUN=1` 只打印）。
+3. **stage 投影** —— 漂移表先进 `restore_stage`（用 dump 自己的 DDL 原样建表），再 `INSERT INTO public.<t> (交集列) SELECT ... FROM restore_stage.<t>`，逐张对账行数。
+4. **schema 快照 diff** —— 灌数据前后各存一份 `information_schema`，diff 非空即失败（永久堵死「列被复活」这类回归）。
+5. **`_sqlx_migrations` / `alembic_version` 从 TOC 排除** —— dump 里带的是 Python 端 15 条旧迁移记录，灌进去会让 sqlx 报 `VersionMissing`，之后 `cargo run` 起不来。
+6. `t_menu` / `t_role_menu` 默认跳过（`seeds/menu.sql` 是权威源），最后幂等补灌。
+
+**改 schema 契约时先改脚本顶部的两张表**（不在其中 → 脚本硬失败，不会静默丢数据）：
+
+| 表 | 格式 | 含义 |
+|---|---|---|
+| `RENAME_MAP` | `table\|dump_col\|target_col\|出处` | 老列 → 新列的语义延续（如 `t_part_batch.next_process_id` → `current_process_id`，依据 004） |
+| `KNOWN_DROP` | `table\|dump_col\|出处` | baseline 已删、允许丢弃的历史列（027/028 留下的） |
+
+| 开关 | 默认 | 说明 |
+|---|---|---|
+| `REBUILD_SCHEMA` | `1` | `0` = 原地只灌数据（配 `RESET=1`），且会警告目标 schema 落后于 HEAD |
+| `DRY_RUN` | `0` | `1` = 只做漂移检测 |
+| `INCLUDE_MENU` | `0` | `1` = 同时灌 dump 的 `t_menu`/`t_role_menu`（应急） |
+| `ALLOW_UNKNOWN_DROP` | `0` | `1` = 放行未登记历史列（会丢数据） |
+| `DUMP_FILE` | 最新 `.dump` | 指定 dump |
+| `POSTGRES_CONTAINER` / `RESTORE_DATABASE_URL` | `dev` / 由 `DATABASE_URL` 派生 | 换容器（如验证用 `hsh-restore-test:5433`） |
+
+**已知数据缺口（正常，脚本会打印告警）**：dump 早于工艺链特性，缺 `t_part_process_chain` / `t_process_chain_step` / `t_e2e_seeded` / `t_wx_identity` 四张表的数据 → 恢复后 `t_part.process_chain_id` 全 NULL、无任何工艺链步骤；`t_part_batch.current_process_step_id`、`t_process.color` / `is_cnc`、`t_work_type.max_held_minutes` 同为空。但 `t_part_batch.next_process_id` 已映射进 `current_process_id`（004 的权威列），池内批次可正常定位。
 
 ## 领域结构（垂直切片）
 
@@ -153,8 +198,42 @@ TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo next
 - 迁移命名：`<13位时间戳>_<顺序>_<描述>.sql`，见 `migrations/README.md`
 - 菜单 / 角色等配置数据走 `seeds/*.sql`，不走 migration
 
+## worktree 服务（2026-09-30 起每分支一套容器）
+
+**要解决的问题**：`src/main.rs` 的 `sqlx::migrate!("./migrations")` 路径相对 `CARGO_MANIFEST_DIR`（= 各 worktree 自己的目录），所以每个分支天然只 apply 自己的 migrations；但所有 worktree 的 `.env` 此前都写死同一个 `DATABASE_URL`（`postgres://hsh:6065161@localhost:5430/hsh`）。两者叠加 → 任一 worktree 跑一次 app 就往**共用**的 `_sqlx_migrations` 写一行，别的 worktree 立刻启动失败：
+
+```
+Error: 执行数据库迁移失败
+Caused by: migration 20260930000000 was previously applied but is missing in the resolved migrations
+```
+
+**机制**：`scripts/wt_services.sh` 给每个 worktree 分配独立的 `postgres-dev` + `redis-dev` 容器、命名卷与端口，并把该 worktree 的 `.env` 三行（`DATABASE_URL` / `REDIS_URL` / `LISTEN_ADDR`）定点改写为容器专属值。
+
+| 项 | 约定 |
+|---|---|
+| compose project | `hshwt-<slug>`（`docker compose -p hshwt-<slug>`，命名卷随 project 自动隔离） |
+| 容器名 | `wt-<slug>-dev` / `wt-<slug>-redis-dev`（`docker-compose.yml` 里 `container_name` 已参数化为 `${CONTAINER_PREFIX:-}dev`，主 checkout 不注入变量 → 行为与改造前逐字一致） |
+| 端口保留段 | PG `5431-5499`、Redis `6381-6449`、App HTTP `3001-3099`；起点按 `cksum(slug)` 取模确定性定位，再线性探测首个空闲端口 |
+| 状态文件 | `<worktree>/.wt-services`（`.claude/` 已 gitignore），兼作「受管」标记 —— `up` 靠它复用端口，`doctor` 靠它识别受管 worktree |
+| 生命周期 | 由 orchestrator skill 自动驱动：`setup-worktree.sh` 复制 `.env` 之后调 `up`，`teardown-worktree.sh` 移除 worktree **之前**调 `down`（`down -v` 连卷一起删，数据一次性） |
+
+**手工调用**：`./scripts/wt_services.sh {up|down|ps|doctor} <slug>`，见「常用命令」。
+
+**两条约定**：
+
+1. `docker compose` 一律从**主 checkout 根**执行、靠 shell 环境变量注入插值（compose 插值优先级 shell env > `.env` 文件）。**切勿手工 export `CONTAINER_PREFIX` / `POSTGRES_PORT` / `REDIS_PORT` 后跑全量 `docker compose up -d`** —— 那会用 worktree 的参数重建主 checkout 的容器。
+2. 端口在 worktree 生命周期内稳定（容器 restart 不变），可写死给前端联调；`down && up` 会按状态文件复用原端口，不变。
+
+**已知限制 / 遗留**：
+
+- **存量 worktree 未迁移**（2026-09-30 决策）。`fix-batch-current-process-id` 等仍指向共享的 5430/6379/3000。它们跑 app 仍会污染主 checkout 的 `_sqlx_migrations`，`wt_services.sh doctor` 的第 3 节只作信息项列出、不报错。
+- **孤儿 compose project**：`worker-pool-counts-endpoint` 的 worktree 目录已删，但它的 `postgres-test` 容器仍活着并占着 **5429** → `docker compose up -d postgres-test` 与测试「快速路」当前不可用。清理：`docker compose -p worker-pool-counts-endpoint down -v`。
+- `docker-compose.yml` 写 `redis:7-alpine` 而在跑的 `redis-dev`/`redis-test` 实为 `redis:8-alpine`（仓库里无 `8-alpine` 字样）。因此 `wt_services.sh up` **刻意逐服务 up**、不用全量 `up -d`：全量会把 redis 重建回 7-alpine。这个分歧建议单独对齐一次。
+- `setup-worktree.sh` 把 `target` 软链到主 checkout，故两个 worktree **无法真正并发** `cargo run`（共享 target 锁）。`LISTEN_ADDR` 隔离的价值在于避开残留进程 / 前后脚启动的撞端口，不是为了支持同时跑两个后端。
+
 ## 环境要点
 
-- 双 PG 容器（docker compose 分服务启动）：开发库 `postgres-dev` 在 **5430**（库 `hsh`），测试库 `postgres-test` 在 **5429**（库 `postgres_rust_test`）
-- 配置全部走 `.env`（`infra/config.rs`）：`DATABASE_URL` 优先，缺省回退 `POSTGRES_*` 拆分变量拼接；测试库 URL 由 `build_test_database_url()` 构建（`DATABASE_TEST_URL` / `POSTGRES_TEST_*`）
+- 主 checkout 三个容器（docker compose 分服务启动）：`postgres-dev` 在 **5430**（库 `hsh`）、`redis-dev` 在 **6379**；测试库 `postgres-test` 在 **5429**（库 `postgres_rust_test`，⚠️ 当前被孤儿容器占着）、`redis-test` 在 **6380**
+- 每个 worktree 另有自己的一套（PG 5431+ / Redis 6381+ / App 3001+），见「worktree 服务」
+- 配置全部走 `.env`（`infra/config.rs`）：`DATABASE_URL` 优先，缺省回退 `POSTGRES_*` 拆分变量拼接；测试库 URL 由 `build_test_database_url()` 构建（`DATABASE_TEST_URL` / `POSTGRES_TEST_*`）。`dotenvy::from_filename(".env")` **不覆盖**已存在的环境变量，故临时覆盖用 `DATABASE_URL=... cargo run` 即可，无需改文件
 - 优雅退出：`AppState.shutdown`（CancellationToken）同时通知 axum serve 与 `task/auto_complete` 后台循环

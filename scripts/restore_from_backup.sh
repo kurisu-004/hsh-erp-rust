@@ -1,37 +1,65 @@
 #!/usr/bin/env bash
 # 从 db_backup/ 的 .dump 还原数据到本地 dev DB（postgres-dev 容器）
 #
-# 2026-09-25 sqlx 接管后问题：
-#   baseline 合并 schema 时把 dump 老 schema 里的几列删/改名了
-#   （t_part.actual_delivery_date 等），裸 pg_restore 会因 COPY 撞缺失列
-#   而整张表 rollback = 空表。本脚本自动：
-#     1. 补缺失列（nullable + IF NOT EXISTS，幂等）
-#     2. 跑 pg_restore --data-only，过滤 owner/privileges/comments
-#     3. 过滤已知可忽略错误（alembic_version / t_menu 冲突）
-#     4. 统计前后行数，对账
+# ============================ 设计原则（2026-10-01 重写）============================
+#   **restore 绝不修改 public schema。**
 #
-# 用法：
-#   ./scripts/restore_from_backup.sh                          # 用 db_backup/ 最新 .dump
+#   2026-09-25 sqlx 接管后的老做法：dump 是 Python 端老 schema 的快照，与 baseline
+#   有列漂移（027 删过 t_part 的 6 个批次依附列 / 028 删过 t_part_batch 的 2 列 /
+#   004 改了列语义），于是脚本先 `ADD COLUMN IF NOT EXISTS` 把老列补回 public，
+#   再 `pg_restore --data-only`。数据是灌进去了，但那 10 个已废弃的列从此永久留在
+#   schema 里 —— 这就是「重建后字段又恢复了」的根因（业务代码早已不读它们，
+#   全仓只剩注释提及）。
+#
+#   现在改为**数据投影**：dump 独有的历史列先进临时 schema `restore_stage`
+#   （用 dump 自己的 DDL 原样建表），再按列投影 `INSERT ... SELECT` 回 public；
+#   public 全程零 DDL。已删除的列不再复活，需要语义延续的走显式 rename 映射。
+#
+# ============================ 配套保障 ============================================
+#   1. REBUILD_SCHEMA=1（默认）→ `DROP SCHEMA public CASCADE` + `sqlx migrate run`，
+#      目标 schema 严格等于 migrations HEAD（顺带补上从未应用的 004）。
+#   2. 漂移自动检测 + 白名单：dump 里出现「未登记的历史列」→ 硬失败，防静默丢数据。
+#   3. 灌数据前后对 information_schema 做快照 diff → 断言 restore 零 schema 变更。
+#   4. `_sqlx_migrations` / `alembic_version` 从 TOC 排除：dump 里带的是 Python 端
+#      旧版本迁移记录，灌进来会让 sqlx 报 VersionMissing，之后 `cargo run` 起不来。
+#   5. stage 表逐张对账：灌入行数必须等于 INSERT 后 public 的增量。
+#
+# ============================ 用法 =================================================
+#   ./scripts/restore_from_backup.sh                              # 重建 schema + 灌数据
+#   DRY_RUN=1 ./scripts/restore_from_backup.sh                    # 只打印漂移决策表
+#   REBUILD_SCHEMA=0 RESET=1 ./scripts/restore_from_backup.sh     # 原地模式（只灌数据）
+#   INCLUDE_MENU=1 ./scripts/restore_from_backup.sh               # 同时灌 dump 的 t_menu
+#   ALLOW_UNKNOWN_DROP=1 ./scripts/restore_from_backup.sh         # 放行未登记历史列（会丢数据）
 #   DUMP_FILE=db_backup/foo.dump ./scripts/restore_from_backup.sh
-#   RESET=1 ./scripts/restore_from_backup.sh                  # TRUNCATE 已恢复表后重建
-#   SKIP_COLUMNS=1 ./scripts/restore_from_backup.sh           # 不补缺失列（schema 已是最新）
-#   INCLUDE_MENU=1 ./scripts/restore_from_backup.sh            # 同时灌 dump 里的 t_menu/t_role_menu（默认跳过）
-#   POSTGRES_CONTAINER=dev_pg ./scripts/restore_from_backup.sh  # 自定义容器名
+#   POSTGRES_CONTAINER=hsh-restore-test \
+#   RESTORE_DATABASE_URL=postgres://hsh:6065161@localhost:5433/hsh \
+#       ./scripts/restore_from_backup.sh                         # 非默认端口的验证容器
 #
-# 前置：postgres-dev 容器已起（docker compose up -d postgres-dev），
-#       baseline migration 已应用（cargo run 一次会自动跑或 sqlx migrate run）。
+# 前置：目标容器已起；REBUILD_SCHEMA=1 需要 sqlx-cli（brew install sqlx）；
+#       REBUILD_SCHEMA=0 需要 public 已是 migrations HEAD 的 schema。
 #
-# 已知可忽略错误（脚本已自动吞掉）：
-#   - "alembic_version 不存在"        — alembic 是 python 端迁移表，rust 不需要
-#   - 其它表的 "duplicate key"        — 上次残留数据，RESET 后干净；非 RESET 模式按现逻辑吞
-#   - 缺列错误                         — 本脚本先 ADD COLUMN 再 restore
-#   - t_menu duplicate key            — INCLUDE_MENU=1 与 seeds/menu.sql 冲突时按现逻辑吞
-#                                       （默认 INCLUDE_MENU=0 不应再出现，menu 数据由 seed 重建）
+# ============================ 已知可忽略错误 ======================================
+#   - 其它表的 "duplicate key"  — 上次残留数据，RESET 后干净；仅原地模式容忍
+#   - t_menu duplicate key      — 仅 INCLUDE_MENU=1 且与 seeds/menu.sql 冲突时
+#   关于 t_menu / t_role_menu：seeds/menu.sql 是权威源（ON CONFLICT (code) DO UPDATE
+#   幂等 upsert）。默认从 dump 跳过这两张表的 DATA 行，由第 9 步 seed 重建。
 #
-# 关于 t_menu / t_role_menu：
-#   seeds/menu.sql 是 t_menu / t_role_menu 的权威源（走 ON CONFLICT (code) DO UPDATE 幂等 upsert）。
-#   默认从 dump 跳过这两张表的 DATA 行，restore 后由第 6 步应用 seeds/menu.sql 重建。
-#   应急时可用 INCLUDE_MENU=1 灌 dump 原数据。
+# ============================ 显式列映射表（改 schema 契约先改这里）=================
+# ① rename 映射（dump 老列 → baseline 新列；老列因此**不算**丢失）
+#    格式：<table>|<dump_col>|<target_col>|<出处>
+RENAME_MAP='t_part_batch|next_process_id|current_process_id|004：判断批次属于哪道工序池的唯一权威列'
+
+# ② 已删除列白名单（dump 里还在、baseline 已删；允许丢弃，超出白名单即失败）
+#    格式：<table>|<dump_col>|<出处>
+KNOWN_DROP='t_part|actual_delivery_date|027 part 瘦身：交付日改由 t_part_event DELIVERED 事件派生
+t_part|location|027 part 瘦身：位置真相源是 t_part_batch.location
+t_part|current_holder_id|027 part 瘦身：持位真相源是 t_part_batch.current_holder_id
+t_part|placed_at|027 part 瘦身：上架时间改由 t_part_event 派生
+t_part|delivery_note_id|027 part 瘦身：送货单真相源是 t_part_batch.delivery_note_id
+t_part|has_been_repaired|027 part 瘦身：拆批后语义已失真
+t_part_batch|placed_at|028 batch step 化：placed_at 随 step 化一并移除
+t_part_batch|has_been_repaired|027 part 瘦身：拆批后无法确定哪一批返修
+t_assembly|actual_delivery_date|027 part 瘦身：装配体交付日改由事件派生'
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -39,8 +67,10 @@ cd "$(dirname "$0")/.."
 # ---------------------------------------------------------------------------- env
 if [ -z "${DATABASE_URL:-}" ]; then
     if [ -f .env ]; then
+        set -a
         # shellcheck disable=SC1091
-        set -a; . ./.env; set +a
+        . ./.env
+        set +a
     fi
 fi
 if [ -z "${DATABASE_URL:-}" ]; then
@@ -50,21 +80,138 @@ fi
 
 POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-dev}"
 
-# 容器内 PG 凭据（与 backend-rust/docker-compose.yml 的 POSTGRES_* 默认值对齐）
+# 容器内 PG 凭据（与 docker-compose.yml 的 POSTGRES_* 默认值对齐）
 PG_USER="${POSTGRES_USER:-hsh}"
 PG_PASSWORD="${POSTGRES_PASSWORD:-6065161}"
 PG_DB="${POSTGRES_DB:-hsh}"
 
+# sqlx migrate 走「主机可达」的 URL：默认沿用 DATABASE_URL 的 host:port，只换凭据与库名。
+# 跑在非默认端口的容器上（如验证用 hsh-restore-test:5433）时用 RESTORE_DATABASE_URL 覆盖。
+if [ -n "${RESTORE_DATABASE_URL:-}" ]; then
+    HOST_DB_URL="$RESTORE_DATABASE_URL"
+else
+    _sch_cred_host="${DATABASE_URL%/*}"        # postgres://user:pass@host:port
+    _hostport="${_sch_cred_host#*://}"         # user:pass@host:port
+    _hostport="${_hostport#*@}"                # host:port
+    HOST_DB_URL="postgres://${PG_USER}:${PG_PASSWORD}@${_hostport}/${PG_DB}"
+fi
+
+INCLUDE_MENU="${INCLUDE_MENU:-0}"
+REBUILD_SCHEMA="${REBUILD_SCHEMA:-1}"
+DRY_RUN="${DRY_RUN:-0}"
+ALLOW_UNKNOWN_DROP="${ALLOW_UNKNOWN_DROP:-0}"
+
+# ---------------------------------------------------------------------------- helpers
+# PGOPTIONS 压掉 NOTICE（DROP SCHEMA ... CASCADE 会刷几十行 "drop cascades to ..."）
+psql_q() {  # 单条查询（-tA 紧凑输出）
+    docker exec -e PGPASSWORD="$PG_PASSWORD" -e PGOPTIONS="-c client_min_messages=warning" \
+        "$POSTGRES_CONTAINER" \
+        psql -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 -tAc "$1"
+}
+psql_in() {  # 从 stdin 读 SQL 执行（-c 由调用方追加）
+    docker exec -i -e PGPASSWORD="$PG_PASSWORD" -e PGOPTIONS="-c client_min_messages=warning" \
+        "$POSTGRES_CONTAINER" \
+        psql -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 "$@"
+}
+
+csv_has() {  # csv_has <item> <csv>：item 是否在逗号分隔串内
+    case ",$2," in
+        *",$1,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+csv_pick() {  # csv_pick <src csv> <other csv> <keep|drop>
+    local src="$1" other="$2" mode="$3" out="" item hit old_ifs="$IFS"
+    IFS=','
+    # shellcheck disable=SC2086
+    for item in $src; do
+        if [ -n "$item" ]; then
+            if csv_has "$item" "$other"; then hit=1; else hit=0; fi
+            if { [ "$mode" = "keep" ] && [ "$hit" = 1 ]; } ||
+               { [ "$mode" = "drop" ] && [ "$hit" = 0 ]; }; then
+                out="${out:+$out,}$item"
+            fi
+        fi
+    done
+    IFS="$old_ifs"
+    printf '%s' "$out"
+}
+
+rename_target() {  # rename_target <table> <dump_col> → 命中的 target 列名（无则空）
+    local a b tgt
+    while IFS='|' read -r a b tgt _rest; do
+        if [ -n "$a" ] && [ "$a" = "$1" ] && [ "$b" = "$2" ]; then
+            printf '%s' "$tgt"
+            return 0
+        fi
+    done <<EOF
+$RENAME_MAP
+EOF
+    return 0
+}
+
+known_drop_reason() {  # known_drop_reason <table> <dump_col> → 出处（未登记则空）
+    local a b reason
+    while IFS='|' read -r a b reason; do
+        if [ -n "$a" ] && [ "$a" = "$1" ] && [ "$b" = "$2" ]; then
+            printf '%s' "$reason"
+            return 0
+        fi
+    done <<EOF
+$KNOWN_DROP
+EOF
+    return 0
+}
+
+classify_table() {  # classify_table <table> <dump cols csv> <target cols csv>
+    # 输出：table|common|insert_cols|select_cols|dropped|target_only|unknown
+    local tbl="$1" dcols="$2" tcols="$3"
+    local common="" insert="" select="" dropped="" newonly="" unknown=""
+    local mapped="" mapped_targets=""
+    local dc tgt reason old_ifs="$IFS"
+    IFS=','
+    # shellcheck disable=SC2086
+    for dc in $dcols; do
+        if [ -n "$dc" ]; then
+            if csv_has "$dc" "$tcols"; then
+                common="${common:+$common,}$dc"
+                insert="${insert:+$insert,}$dc"
+                select="${select:+$select,}$dc"
+            else
+                tgt="$(rename_target "$tbl" "$dc")"
+                reason="$(known_drop_reason "$tbl" "$dc")"
+                if [ -n "$tgt" ] && csv_has "$tgt" "$tcols"; then
+                    insert="${insert:+$insert,}$tgt"
+                    select="${select:+$select,}$dc"
+                    mapped="${mapped:+$mapped,}${dc}→$tgt"
+                    mapped_targets="${mapped_targets:+$mapped_targets,}$tgt"
+                elif [ -n "$reason" ]; then
+                    dropped="${dropped:+$dropped,}$dc"
+                else
+                    unknown="${unknown:+$unknown,}$dc"
+                fi
+            fi
+        fi
+    done
+    IFS="$old_ifs"
+    newonly="$(csv_pick "$tcols" "$dcols" drop)"
+    if [ -n "$mapped_targets" ]; then
+        newonly="$(csv_pick "$newonly" "$mapped_targets" drop)"
+    fi
+    printf '%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$tbl" "$common" "$insert" "$select" "$dropped" "$newonly" "$unknown" "$mapped"
+}
+
 # ---------------------------------------------------------------------------- dump
 DUMP_FILE="${DUMP_FILE:-}"
 if [ -z "$DUMP_FILE" ]; then
-    # 自动选 db_backup/ 下最新的 .dump
     if [ -d db_backup ]; then
         DUMP_FILE="$(ls -t db_backup/*.dump 2>/dev/null | head -1 || true)"
     fi
 fi
 if [ -z "$DUMP_FILE" ] || [ ! -f "$DUMP_FILE" ]; then
-    echo "✗ 找不到 .dump 文件（DUMP_FILE=$DUMP_FILE，db_backup/ 也无 .dump）" >&2
+    echo "✗ 找不到 .dump 文件（DUMP_FILE=${DUMP_FILE}，db_backup/ 也无 .dump）" >&2
     exit 1
 fi
 echo "→ dump: $DUMP_FILE ($(du -h "$DUMP_FILE" | cut -f1))"
@@ -75,124 +222,269 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 if ! docker ps --format '{{.Names}}' | grep -qx "$POSTGRES_CONTAINER"; then
-    echo "✗ 容器 $POSTGRES_CONTAINER 没在跑（docker compose up -d postgres-dev）" >&2
+    echo "✗ 容器 $POSTGRES_CONTAINER 没在跑" >&2
     exit 1
 fi
-
 docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
     psql -U "$PG_USER" -d "$PG_DB" -tAc "SELECT 1" >/dev/null
 
-# baseline 检查：t_user 必须存在（baseline 创建的核心表）
-if ! docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
-    psql -U "$PG_USER" -d "$PG_DB" -tAc \
-    "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='t_user'" \
-    | grep -q 1; then
-    echo "✗ $PG_DB 还没建表（baseline migration 未跑，先 cargo run 或 sqlx migrate run）" >&2
-    exit 1
+RESTORE_LOG="$(mktemp)"
+TMP_FILES="$RESTORE_LOG"
+cleanup() {
+    docker exec "$POSTGRES_CONTAINER" rm -f "/tmp/$DUMP_BASENAME" >/dev/null 2>&1 || true
+    # shellcheck disable=SC2086
+    rm -f $TMP_FILES
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------- 1) 重建 schema
+if [ "$REBUILD_SCHEMA" = "1" ]; then
+    echo "→ REBUILD_SCHEMA=1：DROP SCHEMA public CASCADE，按 migrations/ 重建"
+    echo "  ⚠ 会清空库内全部数据；请确认没有 app 正连着这个库"
+    psql_q "DROP SCHEMA IF EXISTS public CASCADE" >/dev/null
+    psql_q "CREATE SCHEMA public" >/dev/null
+    psql_q "GRANT ALL ON SCHEMA public TO public" >/dev/null
+    if ! command -v sqlx >/dev/null 2>&1; then
+        echo "✗ 找不到 sqlx-cli，无法跑 migrations（brew install sqlx）；" >&2
+        echo "  或改用 REBUILD_SCHEMA=0 + 手工 cargo run 一次让应用自己迁移" >&2
+        exit 1
+    fi
+    sqlx migrate run --source migrations --database-url "$HOST_DB_URL"
+    MIG_FILES=$(ls migrations/*.sql 2>/dev/null | wc -l | tr -d ' ')
+    APPLIED=$(psql_q "SELECT count(*) FROM _sqlx_migrations WHERE success")
+    if [ "$MIG_FILES" != "$APPLIED" ]; then
+        echo "✗ migration 应用数不符：migrations/ 下 $MIG_FILES 个，" \
+             "_sqlx_migrations 记 $APPLIED 条" >&2
+        exit 1
+    fi
+    echo "  ✓ $APPLIED 个 migration 全部应用，目标 schema == migrations HEAD"
+else
+    echo "→ REBUILD_SCHEMA=0：沿用当前 schema（只灌数据，不动 DDL）"
+    if [ "$(psql_q "SELECT count(*) FROM information_schema.tables
+                   WHERE table_schema='public' AND table_name='t_user'")" != "1" ]; then
+        echo "✗ $PG_DB 还没建表（先 cargo run 或 sqlx migrate run）" >&2
+        exit 1
+    fi
+    APPLIED=$(psql_q "SELECT count(*) FROM _sqlx_migrations WHERE success")
+    MIG_FILES=$(ls migrations/*.sql 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$APPLIED" != "$MIG_FILES" ]; then
+        echo "⚠ REBUILD_SCHEMA=0 但 migration 只应用了 $APPLIED/$MIG_FILES 个，" \
+             "目标 schema 落后于 HEAD（建议 REBUILD_SCHEMA=1）"
+    fi
 fi
 
-# 已恢复检测：关键表非空 → 大概率是再次运行
-HAS_DATA=$(docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
-    psql -U "$PG_USER" -d "$PG_DB" -tAc \
-    "SELECT (SELECT count(*) FROM t_user) + (SELECT count(*) FROM t_part) + (SELECT count(*) FROM t_customer)")
-if [ "${HAS_DATA:-0}" -gt 0 ] && [ "${RESET:-0}" != "1" ]; then
-    echo "⚠ 检测到 DB 已有数据（t_user + t_part + t_customer 共 $HAS_DATA 行）"
-    echo "  → 想重新灌一遍：RESET=1 $0"
-    echo "  → 想跳过已存在的表：脚本会自动忽略 duplicate key 错误，仅恢复空表"
-fi
-
-# ---------------------------------------------------------------------------- 1) 补缺失列
-if [ "${SKIP_COLUMNS:-0}" != "1" ]; then
-    echo "→ 补 baseline 与 dump 之间的 schema 漂移列（IF NOT EXISTS，幂等）"
-
-    ALTER_SQL=$(cat <<'SQL'
--- 2026-09-25 sqlx 接管：baseline 把 dump 老 schema 里的几列删/改名了。
--- 这里只 ADD（nullable），不破坏 baseline 契约；新增列不进任何业务查询。
-ALTER TABLE t_assembly ADD COLUMN IF NOT EXISTS actual_delivery_date date;
-ALTER TABLE t_part ADD COLUMN IF NOT EXISTS actual_delivery_date date;
-ALTER TABLE t_part ADD COLUMN IF NOT EXISTS location varchar(20);
-ALTER TABLE t_part ADD COLUMN IF NOT EXISTS current_holder_id bigint;
-ALTER TABLE t_part ADD COLUMN IF NOT EXISTS placed_at timestamp;
-ALTER TABLE t_part ADD COLUMN IF NOT EXISTS delivery_note_id bigint;
-ALTER TABLE t_part ADD COLUMN IF NOT EXISTS has_been_repaired boolean;
-ALTER TABLE t_part_batch ADD COLUMN IF NOT EXISTS next_process_id bigint;
-ALTER TABLE t_part_batch ADD COLUMN IF NOT EXISTS placed_at timestamp;
-ALTER TABLE t_part_batch ADD COLUMN IF NOT EXISTS has_been_repaired boolean;
-SQL
-)
-
-    echo "$ALTER_SQL" | docker exec -i -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
-        psql -U "$PG_USER" -d "$PG_DB" --set ON_ERROR_STOP=1 -v ON_ERROR_STOP=1 >/dev/null
-fi
-
-# ---------------------------------------------------------------------------- 2) RESET（可选）
-if [ "${RESET:-0}" = "1" ]; then
-    echo "→ RESET=1：TRUNCATE 待恢复的表后重建"
-    RESET_TABLES=(t_user t_role_menu t_user_role t_customer t_applicant t_delivery_note
-                  t_delivery_group t_delivery_group_member t_delivery_note_event
-                  t_delivery_note_counter t_process t_work_type t_work_type_process
-                  t_worker t_shelf t_shelf_process t_part t_part_batch t_part_event
-                  t_part_file t_assembly t_drawing_file t_cnc_program t_outsource_company
-                  t_outsource_company_process t_outsource_quote t_outsource_quote_event
-                  t_outsource_shipment)
-    TBL_LIST=$(printf '%s,' "${RESET_TABLES[@]}")
-    TBL_LIST="${TBL_LIST%,}"
-    docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
-        psql -U "$PG_USER" -d "$PG_DB" -c "TRUNCATE ${TBL_LIST} RESTART IDENTITY CASCADE" >/dev/null
-fi
-
-# ---------------------------------------------------------------------------- 3) 取 baseline 行数（对账用）
-BASELINE_COUNTS=$(docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
-    psql -U "$PG_USER" -d "$PG_DB" -tAc "
-SELECT 't_user='||count(*) FROM t_user
-UNION ALL SELECT 't_role_menu='||count(*) FROM t_role_menu
-UNION ALL SELECT 't_user_role='||count(*) FROM t_user_role
-UNION ALL SELECT 't_customer='||count(*) FROM t_customer
-UNION ALL SELECT 't_applicant='||count(*) FROM t_applicant
-UNION ALL SELECT 't_delivery_note='||count(*) FROM t_delivery_note
-UNION ALL SELECT 't_process='||count(*) FROM t_process
-UNION ALL SELECT 't_work_type='||count(*) FROM t_work_type
-UNION ALL SELECT 't_worker='||count(*) FROM t_worker
-UNION ALL SELECT 't_shelf='||count(*) FROM t_shelf
-UNION ALL SELECT 't_part='||count(*) FROM t_part
-UNION ALL SELECT 't_part_batch='||count(*) FROM t_part_batch
-UNION ALL SELECT 't_assembly='||count(*) FROM t_assembly
-UNION ALL SELECT 't_part_event='||count(*) FROM t_part_event
-UNION ALL SELECT 't_part_file='||count(*) FROM t_part_file
-UNION ALL SELECT 't_menu='||count(*) FROM t_menu;")
-
-echo "→ 恢复前："
-echo "$BASELINE_COUNTS" | sed 's/^/    /'
-
-# ---------------------------------------------------------------------------- 4) pg_restore
-echo "→ pg_restore --data-only --no-owner --no-privileges ..."
-
-# 把 dump 拷进容器（容器内 pg_restore 才能直接读）
+# ---------------------------------------------------------------------------- 2) dump 进容器
 DUMP_BASENAME="$(basename "$DUMP_FILE")"
 docker cp "$DUMP_FILE" "$POSTGRES_CONTAINER:/tmp/$DUMP_BASENAME"
 
-# 2026-09-30 新增：默认跳过 t_menu / t_role_menu 的 DATA 行（seeds/menu.sql 是权威源）。
-# pg_restore -l 输出格式示例：
-#   4030; 0 16401 TABLE DATA public t_menu postgres
-# 这里精确匹配 `TABLE DATA public <table>` 行，注释行以 `;` 开头不会被误删。
-TOC_LIST_HOST="$(mktemp)"
+if [ "$REBUILD_SCHEMA" != "1" ] && [ "${RESET:-0}" != "1" ]; then
+    HAS_DATA=$(psql_q "SELECT (SELECT count(*) FROM t_user) + (SELECT count(*) FROM t_part)
+                       + (SELECT count(*) FROM t_customer)")
+    if [ "${HAS_DATA:-0}" -gt 0 ]; then
+        echo "⚠ 检测到 DB 已有数据（t_user + t_part + t_customer 共 $HAS_DATA 行）"
+        echo "  → 想重新灌一遍：REBUILD_SCHEMA=1 $0"
+        echo "  → 想原地重灌：RESET=1 REBUILD_SCHEMA=0 $0"
+    fi
+fi
+
+# ---------------------------------------------------------------------------- 3) 漂移检测
+echo "→ 检测 dump 与目标 schema 的列漂移"
+COPY_HEADERS="$(mktemp)"; TMP_FILES="$TMP_FILES $COPY_HEADERS"
+docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
+    pg_restore --data-only --file=- "/tmp/$DUMP_BASENAME" 2>/dev/null \
+    | grep -E '^COPY public\.[A-Za-z0-9_]+ \(' > "$COPY_HEADERS" || true
+if [ ! -s "$COPY_HEADERS" ]; then
+    echo "✗ dump 里没解析出任何 COPY 表头（pg_restore 输出格式异常？）" >&2
+    exit 1
+fi
+
+TARGET_SCHEMA="$(psql_q "SELECT table_name || '|' ||
+                               string_agg(column_name, ',' ORDER BY ordinal_position)
+                          FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                          GROUP BY table_name")"
+
+lookup_target_cols() {
+    local want="$1" tn tc
+    while IFS='|' read -r tn tc; do
+        if [ "$tn" = "$want" ]; then printf '%s' "$tc"; return 0; fi
+    done <<EOF
+$TARGET_SCHEMA
+EOF
+    return 0
+}
+
+DECISIONS="$(mktemp)"; TMP_FILES="$TMP_FILES $DECISIONS"
+SKIP_TABLES=""      # dump 有、目标库无（不进 restore）
+STAGE_TABLES=""      # 有历史列 / rename 映射 → 必须走 stage 投影
+DROPPED_ASSERT=""    # "tbl:col,col" —— restore 后断言这些列**不存在**
+UNKNOWN_TABLES=""
+
+while IFS= read -r line; do
+    # pg_dump 写成 `COPY public.x (a, b, c) FROM stdin;`（逗号后有空格），先归一化
+    tbl="${line#COPY public.}"; tbl="${tbl%% (*}"
+    dcols="${line#*\(}"; dcols="${dcols%\) FROM stdin;}"; dcols="${dcols// /}"
+    case "$tbl" in
+        _sqlx_migrations|alembic_version) continue ;;   # 见文件头说明④
+    esac
+    tcols="$(lookup_target_cols "$tbl")"
+    if [ -z "$tcols" ]; then
+        SKIP_TABLES="${SKIP_TABLES}${SKIP_TABLES:+ }$tbl"
+        continue
+    fi
+    classify_table "$tbl" "$dcols" "$tcols" >> "$DECISIONS"
+done < "$COPY_HEADERS"
+
+echo "  表 / 处理方式："
+while IFS='|' read -r tbl common insert select dropped newonly unknown mapped; do
+    if [ -n "$dropped" ] || [ -n "$mapped" ]; then
+        STAGE_TABLES="${STAGE_TABLES}${STAGE_TABLES:+ }$tbl"
+        DROPPED_ASSERT="${DROPPED_ASSERT}${DROPPED_ASSERT:+ }$tbl:$dropped"
+        if [ -n "$unknown" ]; then
+            UNKNOWN_TABLES="${UNKNOWN_TABLES}${UNKNOWN_TABLES:+ }$tbl"
+        fi
+        printf '    %-24s stage 投影：丢弃历史列 [%s]' "$tbl" "$dropped"
+        if [ -n "$mapped" ]; then printf '；映射 %s' "$mapped"; fi
+        printf '\n'
+        if [ -z "$select" ]; then
+            echo "✗ $tbl 没有可映射的公共列" >&2
+            exit 1
+        fi
+    else
+        printf '    %-24s 直灌' "$tbl"
+        if [ -n "$newonly" ]; then printf '（目标新列置 NULL: %s）' "$newonly"; fi
+        printf '\n'
+    fi
+done < "$DECISIONS"
+
+if [ -n "$SKIP_TABLES" ]; then
+    echo "  目标库无此表、跳过：$(printf '%s ' $SKIP_TABLES)"
+fi
+if [ -n "$UNKNOWN_TABLES" ]; then
+    if [ "$ALLOW_UNKNOWN_DROP" = "1" ]; then
+        echo "  ⚠ ALLOW_UNKNOWN_DROP=1：未登记的历史列将被丢弃，涉及 $UNKNOWN_TABLES"
+    else
+        echo "✗ 以下表含未登记的历史列（不在脚本顶部 KNOWN_DROP / RENAME_MAP 里），" >&2
+        echo "  无法判定该丢弃还是该映射，已中止。确认后三选一：" >&2
+        echo "    1) 在 KNOWN_DROP 登记为「027/028 已删，允许丢弃」" >&2
+        echo "    2) 在 RENAME_MAP 登记为「老列 → 新列」" >&2
+        echo "    3) 确实要丢：ALLOW_UNKNOWN_DROP=1 重跑" >&2
+        awk -F'|' 'BEGIN{OFS=""} $7 != "" { print "    " $1 ": " $7 "\n" }' "$DECISIONS" >&2
+        exit 1
+    fi
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+    echo "→ DRY_RUN=1：只做检测，不改库"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------- 4) schema 快照（restore 前）
+psql_q "DROP SCHEMA IF EXISTS _restore_verify CASCADE" >/dev/null
+psql_q "CREATE SCHEMA _restore_verify" >/dev/null
+psql_q "CREATE TABLE _restore_verify.columns_before AS
+        SELECT table_name, column_name, data_type
+        FROM information_schema.columns WHERE table_schema = 'public'" >/dev/null
+
+# ---------------------------------------------------------------------------- 5) RESET（原地模式可选）
+if [ "${RESET:-0}" = "1" ]; then
+    echo "→ RESET=1：TRUNCATE 待恢复的表后重建"
+    RESET_TABLES=$(psql_q "SELECT coalesce(string_agg(table_name, ',' ORDER BY table_name), '')
+                           FROM information_schema.tables
+                           WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                             AND table_name <> '_sqlx_migrations'")
+    if [ -n "$RESET_TABLES" ]; then
+        psql_q "TRUNCATE $RESET_TABLES RESTART IDENTITY CASCADE" >/dev/null
+    fi
+fi
+
+# ---------------------------------------------------------------------------- 6) stage 投影
+if [ -n "$STAGE_TABLES" ]; then
+    psql_q "DROP SCHEMA IF EXISTS restore_stage CASCADE" >/dev/null
+    psql_q "CREATE SCHEMA restore_stage" >/dev/null
+    for tbl in $STAGE_TABLES; do
+        row="$(awk -F'|' -v t="$tbl" '$1 == t { print; exit }' "$DECISIONS")"
+        insert_cols="$(printf '%s' "$row" | cut -d'|' -f3)"
+        select_cols="$(printf '%s' "$row" | cut -d'|' -f4)"
+        echo "  → ${tbl}：建 restore_stage.${tbl}（用 dump 自己的 DDL 原样建）"
+        DDL="$(docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
+                 pg_restore --schema-only --file=- -t "$tbl" "/tmp/$DUMP_BASENAME" 2>/dev/null \
+               | sed -n "/^CREATE TABLE public\\.$tbl (/,/^);/p" \
+               | sed "s/^CREATE TABLE public\\.$tbl (/CREATE TABLE restore_stage.$tbl (/")"
+        if [ "$(printf '%s\n' "$DDL" | grep -c "^CREATE TABLE restore_stage\\.$tbl (")" != "1" ]; then
+            echo "✗ 没能从 dump 里切出 $tbl 的 CREATE TABLE（-t 匹配到 0 或多张表）" >&2
+            exit 1
+        fi
+        printf '%s\n' "$DDL" | psql_in >/dev/null
+
+        echo "  → ${tbl}：灌 restore_stage 数据"
+        docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
+            pg_restore --data-only --file=- -t "$tbl" "/tmp/$DUMP_BASENAME" 2>>"$RESTORE_LOG" \
+          | sed -e "s/^COPY public\\.$tbl (/COPY restore_stage.$tbl (/" \
+                 -e '/^SELECT pg_catalog\.setval(/d' \
+          | psql_in >/dev/null
+
+        stage_n=$(psql_q "SELECT count(*) FROM restore_stage.$tbl")
+        before_n=$(psql_q "SELECT count(*) FROM public.$tbl")
+        psql_in -c "INSERT INTO public.$tbl ($insert_cols) SELECT $select_cols FROM restore_stage.$tbl" \
+                >/dev/null
+        after_n=$(psql_q "SELECT count(*) FROM public.$tbl")
+        if [ $((after_n - before_n)) -ne "$stage_n" ]; then
+            echo "✗ $tbl 行数对不上：stage $stage_n 行，public 增量 $((after_n - before_n)) 行" >&2
+            exit 1
+        fi
+        echo "    ✓ ${tbl}：投影 $stage_n 行（public ← ${select_cols}）"
+        psql_q "DROP TABLE restore_stage.$tbl" >/dev/null
+    done
+    psql_q "DROP SCHEMA IF EXISTS restore_stage CASCADE" >/dev/null
+fi
+
+# ---------------------------------------------------------------------------- 7) pg_restore 主流程
+echo "→ pg_restore --data-only --no-owner --no-privileges ..."
+TOC_LIST_HOST="$(mktemp)"; TMP_FILES="$TMP_FILES $TOC_LIST_HOST"
 docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
     pg_restore -l "/tmp/$DUMP_BASENAME" > "$TOC_LIST_HOST"
 
-if [ "${INCLUDE_MENU:-0}" != "1" ]; then
-    grep -vE ' TABLE DATA public (t_menu|t_role_menu) ' "$TOC_LIST_HOST" \
-        > "${TOC_LIST_HOST}.filtered"
-    mv "${TOC_LIST_HOST}.filtered" "$TOC_LIST_HOST"
-    echo "→ 默认跳过 t_menu / t_role_menu DATA 行（seeds/menu.sql 会重建；INCLUDE_MENU=1 恢复 dump 数据）"
-else
-    echo "→ INCLUDE_MENU=1：同时灌 dump 里的 t_menu / t_role_menu（可能与 seeds/menu.sql 冲突）"
+# 7a) 排除目标库不存在的 sequence（否则 setval 报 relation does not exist）
+seq_list="$(sed -n 's/.* SEQUENCE SET public \([A-Za-z0-9_]*\).*/\1/p' "$TOC_LIST_HOST" \
+           | sort -u | tr '\n' ',')"
+seq_list="${seq_list%,}"
+if [ -n "$seq_list" ]; then
+    seq_array=""
+    IFS=','; for s in $seq_list; do
+        if [ -n "$s" ]; then seq_array="${seq_array}${seq_array:+,}'$s'"; fi
+    done; unset IFS
+    missing_seqs=$(psql_q "SELECT coalesce(string_agg(s, ','), '') FROM unnest(ARRAY[$seq_array]) AS s
+                            WHERE NOT EXISTS (SELECT 1 FROM information_schema.sequences
+                                              WHERE sequence_schema = 'public'
+                                                AND sequence_name = s)")
+    if [ -n "$missing_seqs" ]; then
+        echo "  → 目标库没有的 sequence，TOC 里跳过：$(echo "$missing_seqs" | tr ',' ' ')"
+        grep -vE " SEQUENCE SET public (${missing_seqs})( |$)" "$TOC_LIST_HOST" \
+            > "$TOC_LIST_HOST.f"
+        mv "$TOC_LIST_HOST.f" "$TOC_LIST_HOST"
+    fi
 fi
 
-# 过滤后的 TOC 列表拷进容器，pg_restore -L 应用
+# 7b) 排除不进 restore 的表：迁移表 / dump 有目标无 / 已走 stage / t_menu（可选）
+if [ "$INCLUDE_MENU" = "1" ]; then
+    EXCLUDE_DATA="_sqlx_migrations alembic_version $SKIP_TABLES $STAGE_TABLES"
+    echo "  → INCLUDE_MENU=1：同时灌 dump 里的 t_menu / t_role_menu（可能与 seeds/menu.sql 冲突）"
+else
+    EXCLUDE_DATA="_sqlx_migrations alembic_version t_menu t_role_menu $SKIP_TABLES $STAGE_TABLES"
+    echo "  → 默认跳过 t_menu / t_role_menu DATA 行（seeds/menu.sql 会重建）"
+fi
+data_group=""
+for t in $EXCLUDE_DATA; do
+    if [ -n "$t" ]; then data_group="${data_group:+$data_group|}$t"; fi
+done
+if [ -n "$data_group" ]; then
+    grep -vE " TABLE DATA public ($data_group)( |$)" "$TOC_LIST_HOST" > "$TOC_LIST_HOST.f"
+    mv "$TOC_LIST_HOST.f" "$TOC_LIST_HOST"
+fi
+
 docker cp "$TOC_LIST_HOST" "$POSTGRES_CONTAINER:/tmp/toc.list"
 
-# 跑 restore，过滤已知可忽略错误
-RESTORE_LOG="$(mktemp)"
 set +e
 docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" pg_restore \
     --data-only \
@@ -204,20 +496,15 @@ docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" pg_restore \
     --no-security-labels \
     -L /tmp/toc.list \
     -h localhost -U "$PG_USER" -d "$PG_DB" \
-    "/tmp/$DUMP_BASENAME" 2>"$RESTORE_LOG"
-RESTORE_RC=$?
+    "/tmp/$DUMP_BASENAME" 2>>"$RESTORE_LOG"
 set -e
-
-# 容器里清理临时 dump / toc.list
 docker exec "$POSTGRES_CONTAINER" rm -f "/tmp/$DUMP_BASENAME" "/tmp/toc.list"
-# 主机 mktemp 清理
 rm -f "$TOC_LIST_HOST"
 
 # 过滤已知错误后剩余的算致命
-FILTERED_LOG="$(mktemp)"
+FILTERED_LOG="$(mktemp)"; TMP_FILES="$TMP_FILES $FILTERED_LOG"
 grep -Ev \
     -e 'relation "public.alembic_version" does not exist' \
-    -e 'COPY failed for table "t_menu".*duplicate key' \
     -e 'COPY failed for table "[^"]+": ERROR:  duplicate key value violates unique constraint' \
     -e '^DETAIL:  Key .* already exists\.$' \
     -e '^CONTEXT:  COPY .*, line [0-9]+$' \
@@ -226,26 +513,74 @@ grep -Ev \
     "$RESTORE_LOG" > "$FILTERED_LOG" || true
 
 if [ -s "$FILTERED_LOG" ]; then
-    echo "✗ pg_restore 出现未预期错误（已过滤 alembic_version / t_menu / duplicate key）：" >&2
+    echo "✗ pg_restore 出现未预期错误（已过滤 alembic_version / duplicate key）：" >&2
     cat "$FILTERED_LOG" >&2
-    rm -f "$RESTORE_LOG" "$FILTERED_LOG"
     exit 1
 fi
 
-# 把被吞掉的已知错误数算出来给用户看
-IGNORED=$(grep -cE \
-    -e 'COPY failed for table "[^"]+": ERROR:  duplicate key value violates unique constraint' \
-    -e 'relation "public.alembic_version" does not exist' \
-    "$RESTORE_LOG" 2>/dev/null || echo 0)
+IGNORED=$(grep -cE 'duplicate key value violates unique constraint' "$RESTORE_LOG" 2>/dev/null || true)
 if [ "${IGNORED:-0}" -gt 0 ]; then
-    echo "  (ignored ${IGNORED} known errors: alembic_version / duplicate key, see comments)"
+    echo "  (ignored ${IGNORED} duplicate key：上次残留数据；RESET=1 可避免)"
 fi
 
-rm -f "$RESTORE_LOG" "$FILTERED_LOG"
+# ---------------------------------------------------------------------------- 8) 校验
+psql_q "CREATE TABLE _restore_verify.columns_after AS
+        SELECT table_name, column_name, data_type
+        FROM information_schema.columns WHERE table_schema = 'public'" >/dev/null
+COL_DIFF=$(psql_q "
+    SELECT coalesce(string_agg(x, ' ; '), '') FROM (
+        (SELECT table_name||'.'||column_name||' '||data_type AS x FROM _restore_verify.columns_before
+         EXCEPT ALL
+         SELECT table_name||'.'||column_name||' '||data_type FROM _restore_verify.columns_after)
+        UNION ALL
+        (SELECT table_name||'.'||column_name||' '||data_type FROM _restore_verify.columns_after
+         EXCEPT ALL
+         SELECT table_name||'.'||column_name||' '||data_type FROM _restore_verify.columns_before)
+    ) d")
+if [ -n "$COL_DIFF" ]; then
+    echo "✗ restore 过程改动了 public schema（违反设计原则）：$COL_DIFF" >&2
+    exit 1
+fi
+echo "  ✓ schema 快照 diff 为空：restore 未改动 public 的任何列"
 
-# ---------------------------------------------------------------------------- 5) 对账
-FINAL_COUNTS=$(docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
-    psql -U "$PG_USER" -d "$PG_DB" -tAc "
+# 判定为「丢弃」的已删除列，必须仍然不存在
+if [ -n "$DROPPED_ASSERT" ]; then
+    values_sql=""
+    for pair in $DROPPED_ASSERT; do
+        t="${pair%%:*}"
+        for c in $(echo "${pair#*:}" | tr ',' ' '); do
+            values_sql="${values_sql}${values_sql:+,}('$t','$c')"
+        done
+    done
+    RESURRECTED=$(psql_q "SELECT coalesce(string_agg(t||'.'||c, ' '), '')
+                           FROM (VALUES $values_sql) AS v(t,c)
+                           WHERE EXISTS (SELECT 1 FROM information_schema.columns
+                                         WHERE table_schema='public'
+                                           AND table_name=v.t AND column_name=v.c)")
+    if [ -n "$RESURRECTED" ]; then
+        echo "✗ 已删除的列又被建回来了：$RESURRECTED" >&2
+        exit 1
+    fi
+    echo "  ✓ 已删除列仍不存在：$(printf '%s\n' $DROPPED_ASSERT \
+                                 | awk -F: '{ printf "%s(%s) ", $1, $2 }')"
+fi
+
+# 目标库存在但 dump 里没有的表 → 恢复后必然为空，明确告警（别静默当成"本来就没数据"）
+dump_tables=""
+while IFS= read -r line; do
+    t="${line#COPY public.}"; t="${t%% (*}"
+    dump_tables="${dump_tables}${dump_tables:+,}'$t'"
+done < "$COPY_HEADERS"
+NO_DUMP_TABLES=$(psql_q "SELECT coalesce(string_agg(table_name, ' '), '') FROM information_schema.tables
+                         WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                           AND table_name <> '_sqlx_migrations'
+                           AND table_name NOT IN ($dump_tables)")
+if [ -n "$NO_DUMP_TABLES" ]; then
+    echo "  ⚠ dump 里没有这些表的数据（恢复后为空）：$(echo "$NO_DUMP_TABLES" | tr ' ' ' ')"
+fi
+
+echo "→ 恢复后行数："
+psql_q "
 SELECT 't_user='||count(*) FROM t_user
 UNION ALL SELECT 't_role_menu='||count(*) FROM t_role_menu
 UNION ALL SELECT 't_user_role='||count(*) FROM t_user_role
@@ -261,28 +596,24 @@ UNION ALL SELECT 't_part_batch='||count(*) FROM t_part_batch
 UNION ALL SELECT 't_assembly='||count(*) FROM t_assembly
 UNION ALL SELECT 't_part_event='||count(*) FROM t_part_event
 UNION ALL SELECT 't_part_file='||count(*) FROM t_part_file
-UNION ALL SELECT 't_menu='||count(*) FROM t_menu;")
+UNION ALL SELECT 't_menu='||count(*) FROM t_menu;" | sed 's/^/    /'
 
-echo "→ 恢复后："
-echo "$FINAL_COUNTS" | sed 's/^/    /'
-
-# ---------------------------------------------------------------------------- 6) 补灌 menu seed（idempotent；RESET 之后 seed 也被清了）
-# seeds/menu.sql 走 ON CONFLICT (code) DO UPDATE，反复跑无副作用
-# 2026-09-30 新增：默认（INCLUDE_MENU=0）情况下 pg_restore 已跳过 t_menu / t_role_menu DATA 行，
-# 此时 t_menu / t_role_menu 行数 = 0 + seed 量；INCLUDE_MENU=1 时 seed 的 ON CONFLICT 仍兜底。
-if [ "${INCLUDE_MENU:-0}" != "1" ]; then
-    echo "→ 跳过 dump 里的 t_menu / t_role_menu（已在上一步 TOC 过滤）；由下方 seeds/menu.sql 重建"
-fi
+# ---------------------------------------------------------------------------- 9) menu seed
 SEED_FILE="${SEED_FILE:-seeds/menu.sql}"
 if [ -f "$SEED_FILE" ]; then
     echo "-> apply seed: $SEED_FILE (idempotent)"
-    docker exec -i -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
-        psql -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 < "$SEED_FILE" >/dev/null
-    FINAL_TMENU=$(docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
-        psql -U "$PG_USER" -d "$PG_DB" -tAc "SELECT count(*) FROM t_menu")
-    FINAL_RMENU=$(docker exec -e PGPASSWORD="$PG_PASSWORD" "$POSTGRES_CONTAINER" \
-        psql -U "$PG_USER" -d "$PG_DB" -tAc "SELECT count(*) FROM t_role_menu")
-    echo "   t_menu=$FINAL_TMENU, t_role_menu=$FINAL_RMENU"
+    psql_in -f - < "$SEED_FILE" >/dev/null
+    echo "   t_menu=$(psql_q 'SELECT count(*) FROM t_menu'), t_role_menu=$(psql_q 'SELECT count(*) FROM t_role_menu')"
 fi
 
-echo "✓ restore 完成"
+# ---------------------------------------------------------------------------- 10) 目标新列告警 + 清理
+GAPS=$(awk -F'|' '$6 != "" { printf "    %-24s %s\n", $1, $6 }' "$DECISIONS")
+if [ -n "$GAPS" ]; then
+    echo "⚠ dump 早于这些列，恢复后为空（正常，非故障）："
+    printf '%s\n' "$GAPS"
+fi
+
+psql_q "DROP SCHEMA IF EXISTS restore_stage CASCADE" >/dev/null
+psql_q "DROP SCHEMA IF EXISTS _restore_verify CASCADE" >/dev/null
+
+echo "✓ restore 完成（public schema 未被改动；已删除的列保持删除）"

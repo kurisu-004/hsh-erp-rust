@@ -5,12 +5,28 @@
 #   - 5429：测试库 PG（`postgres_rust_test`）；
 #   - 6379：开发库 Redis（session store）；
 #   - 6380：测试库 Redis（session store；测试用 FLUSHDB，不挂卷）
-
+#
+# 2026-09-30 每 worktree 一套容器（scripts/wt_services.sh）：
+#   全部 container_name 与 published port 改为 ${VAR:-默认值} 插值。
+#   - 主 checkout：不注入任何变量 → 渲染结果与改造前逐字一致
+#     （容器名 dev/test/redis-dev/redis-test，端口 5430/5429/6379/6380）；
+#   - worktree：scripts/wt_services.sh 导出 CONTAINER_PREFIX / POSTGRES_PORT /
+#     REDIS_PORT 后以 `docker compose -p hshwt-<slug> up -d` 启动。
+#     compose 的插值优先级 shell env > .env 文件，故不会被 worktree 自己
+#     那个正待改写的 .env 干扰；命名卷随 project 名自动隔离
+#     （hsh-pdata → hshwt-<slug>_hsh-pdata）。
+#
+#   ⚠️ 这些变量只在 wt_services.sh 内注入。切勿手工 export 后跑全量
+#      `docker compose up -d`——会用 worktree 的参数重建主 checkout 的容器。
+#      wt_services.sh 刻意逐服务 up（postgres-dev / redis-dev），一是避开全量
+#      重建，二是绕开下方 redis 镜像版本的历史分歧（文件写 7-alpine，
+#      而当前在跑的 redis-dev/redis-test 实为 8-alpine，全量 up 会造成降级）。
+#
 
 services:
   postgres-dev:
     image: postgres:18-alpine
-    container_name: dev
+    container_name: ${CONTAINER_PREFIX:-}dev
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-hsh}
@@ -18,7 +34,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-hsh}
       TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "5430:5432"
+      - "${POSTGRES_PORT:-5430}:5432"
     volumes:
       - hsh-pdata:/var/lib/postgresql
     healthcheck:
@@ -29,7 +45,7 @@ services:
 
   postgres-test:
     image: postgres:18-alpine
-    container_name: test
+    container_name: ${CONTAINER_PREFIX:-}test
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_TEST_USER:-hsh_test}
@@ -37,7 +53,7 @@ services:
       POSTGRES_DB: ${POSTGRES_TEST_DB:-postgres_rust_test}
       TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "5429:5432"
+      - "${POSTGRES_TEST_PORT:-5429}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_TEST_USER:-hsh_test} -d ${POSTGRES_TEST_DB:-postgres_rust_test}"]
       interval: 5s
@@ -46,10 +62,10 @@ services:
 
   redis-dev:
     image: redis:7-alpine
-    container_name: redis-dev
+    container_name: ${CONTAINER_PREFIX:-}redis-dev
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-pdata:/data
     healthcheck:
@@ -60,10 +76,10 @@ services:
 
   redis-test:
     image: redis:7-alpine
-    container_name: redis-test
+    container_name: ${CONTAINER_PREFIX:-}redis-test
     restart: unless-stopped
     ports:
-      - "6380:6379"
+      - "${REDIS_TEST_PORT:-6380}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
