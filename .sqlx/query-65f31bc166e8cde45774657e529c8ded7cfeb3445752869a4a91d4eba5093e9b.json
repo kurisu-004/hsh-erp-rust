@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                pb.id            AS \"batch_id!\",\n                p.id             AS \"part_id!\",\n                p.process_chain_id AS \"process_chain_id?\",\n                pcs.process_id   AS \"first_process_id?\",\n                pr.code          AS \"first_process_code?\",\n                pr.name          AS \"first_process_name?\",\n                sp.shelf_id      AS \"first_shelf_id?\"\n            FROM t_part_batch pb\n            JOIN t_part p\n                ON p.id = pb.part_id AND p.deleted_at IS NULL\n            LEFT JOIN LATERAL (\n                SELECT process_id\n                FROM t_process_chain_step pcs\n                WHERE pcs.chain_id = p.process_chain_id\n                  AND pcs.deleted_at IS NULL\n                ORDER BY pcs.sort_order ASC, pcs.id ASC\n                LIMIT 1\n            ) pcs ON TRUE\n            LEFT JOIN t_process pr\n                ON pr.id = pcs.process_id\n            LEFT JOIN LATERAL (\n                SELECT shelf_id\n                FROM t_shelf_process sp\n                WHERE sp.process_id = pcs.process_id\n                  AND sp.deleted_at IS NULL\n                ORDER BY sp.sort_order ASC, sp.id ASC\n                LIMIT 1\n            ) sp ON TRUE\n            WHERE pb.id = ANY($1)\n              AND pb.status = 'PENDING'\n              AND pb.deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "batch_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "part_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "process_chain_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part",
+            "name": "process_chain_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "first_process_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_process_chain_step",
+            "name": "process_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "first_process_code?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "code"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "first_process_name?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "first_shelf_id?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_shelf_process",
+            "name": "shelf_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "65f31bc166e8cde45774657e529c8ded7cfeb3445752869a4a91d4eba5093e9b"
+}

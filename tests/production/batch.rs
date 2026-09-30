@@ -1,17 +1,22 @@
-//! prod::batch 域端到端集成测试（2026-09-29）
+//! prod::batch 域端到端集成测试（2026-09-29 + 2026-09-30 重构）
 //!
 //! 覆盖场景：
-//!   1. happy path：建 1 个 PENDING batch → `GET pending` 拿到 → `POST dispatch` 成功
-//!   2. dispatch 不存在 batch_id → 20121 BIZ_BATCH_NOT_FOUND (HTTP 404)
-//!   3. dispatch 二次调用同 batch → 20120 BIZ_BATCH_INVALID_STATUS (HTTP 409)
-//!   4. dispatch 时 target_process_id 在 t_shelf_process 0 结果 → 20508 (HTTP 404)
-//!   5. bulk-dispatch 空 targets → 40001 VALIDATION_ERROR (HTTP 422)
-//!   6. bulk-dispatch 全回滚：一条 OK + 一条已软删 → 全失败，b_ok 保持 PENDING
-//!   7. auto-dispatch 无 chain 的 batch → skipped(reason=NO_PROCESS_CHAIN)
-//!   8. auto-dispatch 空 batch_ids → 40001 VALIDATION_ERROR (HTTP 422)
+//!   1. happy path：建 1 个 PENDING batch → `GET pending` 拿到 → `POST dispatch`（targets.length==1）成功
+//!   2. dispatch 不存在 batch_id → 20121 BIZ_BATCH_NOT_FOUND (HTTP 404) → failed 数组
+//!   3. dispatch 二次调用同 batch → 20120 BIZ_BATCH_INVALID_STATUS (HTTP 409) → failed 数组
+//!   4. dispatch 时 target_process_id 在 t_shelf_process 0 结果 → 20508 (HTTP 404) → failed 数组
+//!   5. dispatch 空 targets → 40001 VALIDATION_ERROR (HTTP 422)
+//!   6. dispatch 一条 OK + 一条已软删 → succeeded=[], failed=[40404]；OK batch 保持 PENDING（事务回滚）
+//!   7. auto-dispatch_preview 无 chain 的 batch → skip_reason=NO_PROCESS_CHAIN（只读，不写库）
+//!   8. auto-dispatch_preview 空 batch_ids → 40001 VALIDATION_ERROR (HTTP 422)
 //!   9. OCC 40901 VERSION_CONFLICT（双事务并发，A 持有 tx 占用 batch 行，B 调 dispatch 应 40901）
 //!  10. 角色守卫：Inspector 调 dispatch → 40300 FORBIDDEN
 //!  11. GET pending：unauth → 40100
+//!
+//! 2026-09-30 重构：
+//! - dispatch 统一 bulk-only（targets 数组）；响应 `DispatchResult { succeeded, failed }`
+//! - auto-dispatch 改为只读 `auto_dispatch_preview`；不再真实下发，仅返回 preview
+//! - bulk-dispatch 端点已删除（路由层不再挂载）
 //!
 //! ## 串行化
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -191,15 +196,17 @@ async fn dispatch_happy_path() {
     assert_eq!(env1["data"]["total"], 1);
     assert_eq!(env1["data"]["items"][0]["batch_id"], batch_id.to_string());
 
-    // 2. POST dispatch
+    // 2. POST dispatch（2026-09-30 bulk-only 形态：targets 数组）
     let (s2, env2) = send(
         app,
         json_request(
             "POST",
             "/prod/batches/dispatch",
             Some(json!({
-                "batch_id": batch_id.to_string(),
-                "target_process_id": process_a.to_string(),
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }],
                 "note": "happy path test",
             })),
             Some(&token),
@@ -207,11 +214,13 @@ async fn dispatch_happy_path() {
     )
     .await;
     assert_eq!(s2, StatusCode::OK, "dispatch: {env2}");
-    let data = &env2["data"];
-    assert_eq!(data["batch_id"], batch_id.to_string());
-    assert_eq!(data["target_process_id"], process_a.to_string());
+    assert_eq!(env2["data"]["succeeded"].as_array().unwrap().len(), 1);
+    assert_eq!(env2["data"]["failed"].as_array().unwrap().len(), 0);
+    let succeeded = &env2["data"]["succeeded"][0];
+    assert_eq!(succeeded["batch_id"], batch_id.to_string());
+    assert_eq!(succeeded["target_process_id"], process_a.to_string());
     // version 应从 0 → 1
-    assert_eq!(data["version"], 1);
+    assert_eq!(succeeded["version"], 1);
 
     // 3. DB 验证：batch 应 IN_PROCESS
     let row: (String, Option<i64>) =
@@ -245,15 +254,26 @@ async fn dispatch_nonexistent_batch_returns_not_found() {
             "POST",
             "/prod/batches/dispatch",
             Some(json!({
-                "batch_id": "9999999999999",
-                "target_process_id": process_a.to_string(),
+                "targets": [{
+                    "batch_id": "9999999999999",
+                    "target_process_id": process_a.to_string(),
+                }]
             })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_FOUND, "不存在 batch 应 404: {env}");
-    assert_eq!(env["code"], 20121, "BIZ_BATCH_NOT_FOUND: {env}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "dispatch 应 200（failed 数组含 40404）: {env}"
+    );
+    assert_eq!(env["data"]["succeeded"].as_array().unwrap().len(), 0);
+    assert_eq!(env["data"]["failed"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        env["data"]["failed"][0]["code"], 20121,
+        "BIZ_BATCH_NOT_FOUND: {env}"
+    );
 }
 
 /// 场景 3: dispatch 二次调用同 batch → 20120 BIZ_BATCH_INVALID_STATUS (HTTP 409)
@@ -274,31 +294,45 @@ async fn dispatch_second_call_returns_invalid_status() {
             "POST",
             "/prod/batches/dispatch",
             Some(json!({
-                "batch_id": batch_id.to_string(),
-                "target_process_id": process_a.to_string(),
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }]
             })),
             Some(&token),
         ),
     )
     .await;
     assert_eq!(s1, StatusCode::OK, "第 1 次 dispatch: {env1}");
+    assert_eq!(env1["data"]["succeeded"].as_array().unwrap().len(), 1);
 
-    // 2. 第 2 次 dispatch：batch.status='IN_PROCESS' → 20120
+    // 2. 第 2 次 dispatch：batch.status='IN_PROCESS' → 20120 → failed
     let (s2, env2) = send(
         app,
         json_request(
             "POST",
             "/prod/batches/dispatch",
             Some(json!({
-                "batch_id": batch_id.to_string(),
-                "target_process_id": process_a.to_string(),
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }]
             })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s2, StatusCode::CONFLICT, "第 2 次 dispatch 应 409: {env2}");
-    assert_eq!(env2["code"], 20120, "BIZ_BATCH_INVALID_STATUS: {env2}");
+    assert_eq!(
+        s2,
+        StatusCode::OK,
+        "第 2 次 dispatch 应 200（failed 数组含 40903）: {env2}"
+    );
+    assert_eq!(env2["data"]["succeeded"].as_array().unwrap().len(), 0);
+    assert_eq!(env2["data"]["failed"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        env2["data"]["failed"][0]["code"], 20120,
+        "BIZ_BATCH_INVALID_STATUS: {env2}"
+    );
 }
 
 /// 场景 4: dispatch 时 target_process_id 在 t_shelf_process 0 结果 → 20508 (HTTP 404)
@@ -318,15 +352,26 @@ async fn dispatch_no_shelf_for_process_returns_not_found() {
             "POST",
             "/prod/batches/dispatch",
             Some(json!({
-                "batch_id": batch_id.to_string(),
-                "target_process_id": process_a.to_string(),
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }]
             })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_FOUND, "无货架映射应 404: {env}");
-    assert_eq!(env["code"], 20508, "BIZ_SHELF_PROCESS_NOT_FOUND: {env}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "dispatch 应 200（failed 数组含 404）: {env}"
+    );
+    assert_eq!(env["data"]["succeeded"].as_array().unwrap().len(), 0);
+    assert_eq!(env["data"]["failed"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        env["data"]["failed"][0]["code"], 20508,
+        "BIZ_SHELF_PROCESS_NOT_FOUND: {env}"
+    );
 
     // 验证 batch 仍是 PENDING（事务回滚）
     let row: (String,) = sqlx::query_as("SELECT status FROM t_part_batch WHERE id = $1")
@@ -337,16 +382,19 @@ async fn dispatch_no_shelf_for_process_returns_not_found() {
     assert_eq!(row.0, "PENDING", "dispatch 失败后 batch 应保持 PENDING");
 }
 
-/// 场景 5: bulk-dispatch 空 targets → 40001 VALIDATION_ERROR (HTTP 422)
+/// 场景 5 (2026-09-30 重构): dispatch 空 targets → 40001 VALIDATION_ERROR (HTTP 422)
+///
+/// 2026-09-30 之前：bulk-dispatch 端点专用测试；重构后 dispatch 统一 bulk-only 形态，
+/// 「bulk-only」=「targets 数组」，空 targets 仍触发 validation。
 #[tokio::test]
-async fn bulk_dispatch_empty_targets_returns_validation_error() {
+async fn dispatch_empty_targets_returns_validation_error() {
     let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
     let (s, env) = send(
         app,
         json_request(
             "POST",
-            "/prod/batches/bulk-dispatch",
+            "/prod/batches/dispatch",
             Some(json!({ "targets": [] })),
             Some(&token),
         ),
@@ -360,9 +408,11 @@ async fn bulk_dispatch_empty_targets_returns_validation_error() {
     assert_eq!(env["code"], 40001, "VALIDATION_ERROR: {env}");
 }
 
-/// 场景 6: bulk-dispatch 全回滚：一条 OK + 一条已软删 → 全失败
+/// 场景 6 (2026-09-30 重构): dispatch bulk 形态：一条 OK + 一条已软删 → succeeded=[], failed=[40404]
+///
+/// 2026-09-30 之前：bulk-dispatch 端点专用测试。重构后走统一 dispatch 端点（bulk-only）。
 #[tokio::test]
-async fn bulk_dispatch_full_rollback_on_one_failure() {
+async fn dispatch_bulk_full_rollback_on_one_failure() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     let process_a = fx.process_a_id;
 
@@ -384,7 +434,7 @@ async fn bulk_dispatch_full_rollback_on_one_failure() {
         app,
         json_request(
             "POST",
-            "/prod/batches/bulk-dispatch",
+            "/prod/batches/dispatch",
             Some(json!({
                 "targets": [
                     { "batch_id": batch_ok.to_string(), "target_process_id": process_a.to_string() },
@@ -395,9 +445,21 @@ async fn bulk_dispatch_full_rollback_on_one_failure() {
         ),
     )
     .await;
-    // 任一失败 → 全回滚（404 BIZ_BATCH_NOT_FOUND）
-    assert_eq!(s, StatusCode::NOT_FOUND, "batch_bad 已软删应 404: {env}");
-    assert_eq!(env["code"], 20121, "BIZ_BATCH_NOT_FOUND: {env}");
+    // 当前实现（重构后）：service 把每条失败放入 failed 数组，事务由 caller（handler）管理
+    // 一次 dispatch 调用内部全回滚（Transaction Drop），所以全批都没改 status。
+    assert_eq!(s, StatusCode::OK, "dispatch bulk 应 200: {env}");
+    assert_eq!(env["data"]["succeeded"].as_array().unwrap().len(), 0);
+    assert_eq!(env["data"]["failed"].as_array().unwrap().len(), 2);
+    let codes: Vec<i64> = env["data"]["failed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_i64().unwrap())
+        .collect();
+    assert!(
+        codes.contains(&20121),
+        "应有 batch_bad → BIZ_BATCH_NOT_FOUND 20121: {env}"
+    );
 
     // DB 验证：batch_ok 应保持 PENDING（事务回滚）
     let row_ok: (String,) = sqlx::query_as("SELECT status FROM t_part_batch WHERE id = $1")
@@ -408,9 +470,12 @@ async fn bulk_dispatch_full_rollback_on_one_failure() {
     assert_eq!(row_ok.0, "PENDING", "batch_ok 应保持 PENDING（事务回滚）");
 }
 
-/// 场景 7: auto-dispatch 无 chain 的 batch → skipped(reason=NO_PROCESS_CHAIN)
+/// 场景 7 (2026-09-30 重构): auto-dispatch_preview 无 chain → skip_reason=NO_PROCESS_CHAIN
+///
+/// 2026-09-30 之前：auto-dispatch 真下发并返回 succeeded/skipped 数组。
+/// 重构后改为只读查询，返回 items[*].skip_reason，前端据此构造 dispatch 请求。
 #[tokio::test]
-async fn auto_dispatch_no_process_chain_returns_skipped() {
+async fn auto_dispatch_preview_no_chain_returns_skip_reason() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     let _ = fx;
 
@@ -431,16 +496,139 @@ async fn auto_dispatch_no_process_chain_returns_skipped() {
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "auto-dispatch OK: {env}");
-    assert_eq!(env["data"]["succeeded"].as_array().unwrap().len(), 0);
-    let skipped = env["data"]["skipped"].as_array().unwrap();
-    assert_eq!(skipped.len(), 1);
-    assert_eq!(skipped[0]["reason"], "NO_PROCESS_CHAIN");
+    assert_eq!(s, StatusCode::OK, "auto-dispatch preview OK: {env}");
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["skip_reason"], "NO_PROCESS_CHAIN");
+
+    // DB 验证：batch 应保持 PENDING（preview 不写库）
+    let row: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row, "PENDING", "preview 不应改变 batch.status");
 }
 
-/// 场景 8: auto-dispatch 空 batch_ids → 40001 VALIDATION_ERROR (HTTP 422)
+/// 场景 7b (2026-09-30 新增): auto-dispatch_preview 完整链路 → first_process_id/first_shelf_id 透传
 #[tokio::test]
-async fn auto_dispatch_empty_batch_ids_returns_validation_error() {
+async fn auto_dispatch_preview_with_chain_returns_first_process_and_shelf() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let process_a = fx.process_a_id;
+
+    // 手动建一个货架 + 映射到 process_a（fixture 不预置 shelf_a_id）
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+    let now = now_naive();
+    let shelf_a = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) VALUES ($1, 'PREVIEW-SH', 'PREVIEW-SH', 'PRODUCTION', true, 0, 0, $2, $2)",
+    )
+    .bind(shelf_a)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, \
+         created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $4)",
+    )
+    .bind(snowflake.next_id())
+    .bind(shelf_a)
+    .bind(process_a)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 插入一个 PENDING batch
+    let customer_id = insert_customer_l2(&pool, "ACME-PREVIEW").await;
+    let part_id = insert_part(&pool, customer_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+
+    // 构造 part.process_chain_id + chain step + 工艺链首道指向 process_a
+    let chain_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 0, $2, 1, $2, 1)",
+    )
+    .bind(chain_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+        .bind(chain_id)
+        .bind(part_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, estimated_minutes, version, \
+         created_at, created_by, updated_at, updated_by) VALUES ($1, $2, 1, $3, 0, 0, $4, 1, $4, 1)",
+    )
+    .bind(snowflake.next_id())
+    .bind(chain_id)
+    .bind(process_a)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/batches/auto-dispatch",
+            Some(json!({
+                "batch_ids": [batch_id.to_string()],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "preview OK: {env}");
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert!(item["skip_reason"].is_null(), "完整链路不应 skip: {env}");
+    assert_eq!(item["first_process_id"], process_a.to_string());
+    assert_eq!(item["first_shelf_id"], shelf_a.to_string());
+
+    // DB 验证：batch 仍 PENDING
+    let row: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row, "PENDING");
+}
+
+/// 场景 7c (2026-09-30 新增): auto-dispatch_preview 不存在的 batch_id → skip_reason=NOT_FOUND
+#[tokio::test]
+async fn auto_dispatch_preview_unknown_batch_returns_not_found() {
+    let (_pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/batches/auto-dispatch",
+            Some(json!({ "batch_ids": ["9999999999999"] })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "preview OK: {env}");
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["skip_reason"], "NOT_FOUND");
+}
+
+/// 场景 8 (2026-09-30 重构): auto-dispatch_preview 空 batch_ids → 40001 VALIDATION_ERROR (HTTP 422)
+#[tokio::test]
+async fn auto_dispatch_preview_empty_batch_ids_returns_validation_error() {
     let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
     let (s, env) = send(
@@ -496,15 +684,26 @@ async fn dispatch_after_concurrent_status_change_returns_invalid_status() {
             "POST",
             "/prod/batches/dispatch",
             Some(json!({
-                "batch_id": batch_id.to_string(),
-                "target_process_id": process_a.to_string(),
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }]
             })),
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::CONFLICT, "并发前置 mutate 后应 409: {env}");
-    assert_eq!(env["code"], 20120, "BIZ_BATCH_INVALID_STATUS: {env}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "并发前置 mutate 后应 200（failed 数组含 40903）: {env}"
+    );
+    assert_eq!(env["data"]["succeeded"].as_array().unwrap().len(), 0);
+    assert_eq!(env["data"]["failed"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        env["data"]["failed"][0]["code"], 20120,
+        "BIZ_BATCH_INVALID_STATUS: {env}"
+    );
 }
 
 /// 场景 9b: 外部 version bump → dispatch_batch 仍成功（version 自适应）
@@ -538,15 +737,20 @@ async fn dispatch_after_external_version_bump_succeeds_with_new_version() {
             "POST",
             "/prod/batches/dispatch",
             Some(json!({
-                "batch_id": batch_id.to_string(),
-                "target_process_id": process_a.to_string(),
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }]
             })),
             Some(&token),
         ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "version 7 时 dispatch 应 OK: {env}");
-    assert_eq!(env["data"]["version"], 8, "version 应 7 → 8");
+    assert_eq!(
+        env["data"]["succeeded"][0]["version"], 8,
+        "version 应 7 → 8"
+    );
 }
 
 /// 场景 10: 角色守卫 —— Inspector 调 dispatch → 40300 FORBIDDEN
@@ -567,8 +771,10 @@ async fn dispatch_forbidden_for_inspector() {
             "POST",
             "/prod/batches/dispatch",
             Some(json!({
-                "batch_id": batch_id.to_string(),
-                "target_process_id": process_a.to_string(),
+                "targets": [{
+                    "batch_id": batch_id.to_string(),
+                    "target_process_id": process_a.to_string(),
+                }]
             })),
             Some(&token),
         ),

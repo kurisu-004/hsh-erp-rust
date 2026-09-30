@@ -454,10 +454,10 @@ impl PartRepo {
             SET current_holder_id       = $3,
                 location                = 'PRODUCTION_SHELF',
                 -- 2026-09-30 重构：移除 current_process_step_id 写入
-                --   （move worker→pool 路径不推进工序链；形参仍占 $4）
+                --   （move worker→pool 路径不推进工序链；形参不再占位）
                 version                 = version + 1,
                 updated_at              = now(),
-                updated_by              = $5
+                updated_by              = $4
             WHERE id = $1 AND version = $2
               AND status = 'IN_PROCESS' AND location = 'WORKER'
               AND deleted_at IS NULL
@@ -465,8 +465,7 @@ impl PartRepo {
             batch_id,
             expected_version,
             shelf_id,
-            _current_process_step_id,
-            current_user_id,
+            current_user_id as Option<i64>,
         )
         .execute(executor)
         .await?;

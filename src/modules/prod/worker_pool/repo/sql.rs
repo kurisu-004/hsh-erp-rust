@@ -600,7 +600,7 @@ impl WorkerPoolRepo {
             expected_version,
             dst_worker_id,
             src_worker_id,
-            operator_user_id,
+            operator_user_id as Option<i64>,
         )
         .execute(&mut *conn)
         .await

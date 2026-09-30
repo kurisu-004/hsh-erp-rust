@@ -751,7 +751,13 @@ impl WorkerPoolService {
                 new_location = "WORKER";
                 current_held = Some((current_held_val + 1) as i32);
                 max_held = Some(max_held_val);
-            } // 同 kind 已在前面 ② 拦截，编译器通过穷尽性匹配保证不可达
+            }
+            // 同 kind 已在前面 ② 拦截；显式 unreachable 分支让编译器穷尽性检查通过
+            #[allow(unreachable_patterns)]
+            (MoveLocation::Pool { .. }, MoveLocation::Pool { .. })
+            | (MoveLocation::Worker { .. }, MoveLocation::Worker { .. }) => {
+                unreachable!("同 kind 移动已在 ② 拦截")
+            }
         }
 
         Ok(MoveResult {
