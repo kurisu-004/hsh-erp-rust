@@ -74,16 +74,27 @@ struct OutsourceLite {
 #[allow(dead_code)] // current_process_step_id: 通过 service 层需要，但本 struct 仅 DTO 转换使用
 struct BatchListRow {
     id: i64,
+    /// 2026-09-30 新增（来自 b.part_id，对齐 PartBatchListItemOut 新字段）
+    part_id: i64,
     batch_no: i32,
     quantity: i32,
     status: String,
     location: Option<String>,
     version: i32,
+    /// 2026-09-30 新增（来自 b.created_at，对齐 PartBatchListItemOut 新字段）
+    created_at: chrono::NaiveDateTime,
+    /// 2026-09-30 新增（来自 b.updated_at，对齐 PartBatchListItemOut 新字段）
+    updated_at: chrono::NaiveDateTime,
     current_process_step_id: Option<i64>,
     parent_batch_id: Option<i64>,
     current_holder_id: Option<i64>,
-    holder_name: Option<String>,
+    /// 2026-09-30 重命名（原 `holder_name`）—— 与 SQL alias `current_holder_display` 对齐
+    current_holder_display: Option<String>,
     next_process_id: Option<i64>,
+    /// 2026-09-30 新增（来自 LEFT JOIN t_process p2）
+    next_process_name: Option<String>,
+    /// 2026-09-30 新增（来自 LEFT JOIN t_delivery_note dn）
+    delivery_note_no: Option<String>,
     delivery_note_id: Option<i64>,
 }
 

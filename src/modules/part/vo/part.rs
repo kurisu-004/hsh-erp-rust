@@ -295,6 +295,14 @@ pub struct PartEventOut {
 
 /// `GET /parts/{id}/batches` 出参：工单全部活跃批次 + holder 名称解析。
 ///
+/// 2026-09-30 Phase 2 dashboard 二次调整（fix Zod 报错）：
+/// - 新增 7 字段：`batch_label`（mapper 内 `format!("L{}", id)` 派生）/ `part_id` /
+///   `current_holder_display`（重命名原 `holder_name`）/ `current_process_step_id` /
+///   `next_process_name`（LEFT JOIN t_process 派生）/ `delivery_note_no`（LEFT JOIN
+///   t_delivery_note 派生）/ `created_at` / `updated_at`
+/// - 修复前端 dashboard PartPreviewDialog 运行时 Zod 校验报错（`received undefined`
+///   for these fields, since frontend schema declares them but backend wire 不投）
+///
 /// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` 字段
 /// （t_part_batch 列已删；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
 ///
@@ -306,25 +314,47 @@ pub struct PartEventOut {
 pub struct PartBatchListItemOut {
     #[serde(serialize_with = "serialize_i64")]
     pub id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64, // 2026-09-30 新增（来自 b.part_id）
     pub batch_no: i32,
+    /// 2026-09-30 新增（沿 delivery_note L{id} 命名约定，mapper 内 format! 生成）
+    pub batch_label: String,
     pub quantity: i32,
     pub status: String,
     #[serde(default)]
     pub location: Option<String>,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub current_holder_id: Option<i64>,
+    /// 2026-09-30 重命名（原 `holder_name`）—— 前端 usePartDetail.ts:441 已读
+    /// `current_holder_display`，rename 为正本。
     #[serde(default)]
-    pub holder_name: Option<String>,
+    pub current_holder_display: Option<String>,
+    /// 2026-09-30 新增（2026-09-16 PR-3 后 SQL 已选 b.current_process_step_id 但 DTO 未投）
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub current_process_step_id: Option<i64>,
     /// 2026-09-16 PR-3：DTO 保留字段名（兼容前端），但当前**全部为 None**——
     /// 业务上「下一步工序」概念已迁移到 step（current_process_step_id →
     /// JOIN step.process_id 派生）；新端点不应依赖该字段。如前端仍需该信息，
     /// 由 frontend 自行 JOIN current_process_step_id → step.process_id。
+    ///
+    /// 2026-09-30 Phase 2 调整：mapper 内填 next_process_id 同源值（LEFT JOIN
+    /// t_process_chain_step.process_id 派生）。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
+    /// 2026-09-30 新增（LEFT JOIN t_process 派生）
+    #[serde(default)]
+    pub next_process_name: Option<String>,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub delivery_note_id: Option<i64>,
+    /// 2026-09-30 新增（LEFT JOIN t_delivery_note 派生）
+    #[serde(default)]
+    pub delivery_note_no: Option<String>,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub parent_batch_id: Option<i64>,
+    /// 2026-09-30 新增（t_part_batch.created_at NOT NULL TIMESTAMP）
+    pub created_at: NaiveDateTime,
+    /// 2026-09-30 新增（t_part_batch.updated_at NOT NULL TIMESTAMP）
+    pub updated_at: NaiveDateTime,
     pub version: i32,
 }
 
