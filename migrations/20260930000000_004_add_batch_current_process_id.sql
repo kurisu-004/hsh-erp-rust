@@ -135,10 +135,27 @@
 --              （仅排除 CANCELLED，会命中在池批次）
 --         (4d) `part/repo/sql/batch_sql.rs::mark_batch_repairing`
 --              （IN_PROCESS → REPAIRING，location 仍 PRODUCTION_SHELF）
+--              **已决策、待 REPAIRING 降级重构时处理 → 见下方 (4d) 小节**
 --       修 (4a)~(4c) 只需在对应 SQL 加 `current_process_id = NULL`。
---       **(4d) 需产品拍板**：REPAIRING 是否仍算「在 P 加工中」？若算，则本列
---       保留非 NULL 是正确的，应把 REPAIRING 显式列为不变式的例外写进本文件
---       头部；若无归属则同 (4a)~(4c) 处理。此项**未定**。
+--
+--       **(4d) 已决策（2026-09-30，用户拍板）—— 本次不改 SQL**：
+--       1. **正常业务流不存在 `IN_PROCESS → REPAIRING` 转换**。用户判断：现实中不会
+--          走到这条迁移（返修的正常起点是 `INSPECTION` / `READY_TO_SHIP` 一侧，
+--          见 `repair.rs` 的 `complete_repair` / `repair_dispatch`），故本写点实际
+--          不产生「带残留 cpid 的非 IN_PROCESS 批次」。
+--       2. **`REPAIRING` 将从状态机状态降级为纯标记（flag）**。届时
+--          `part_status_progress()` 的 `IN_PROCESS | REPAIRING => 2` 同档、
+--          `PartStatus::can_transition_to` 里所有以 REPAIRING 为端点的迁移、
+--          以及 `mark_batch_repairing` 本身都需要重新梳理（`REPAIRING` 不再是
+--          `status` 取值，而是与 `status` 正交的一个标记位）。相关状态判定届时
+--          要整体重做一遍。
+--       3. **本次因此不改 SQL**：既无实际转换发生（无数据后果），且 `REPAIRING`
+--          语义即将变更，此刻加 `current_process_id = NULL` 等于给一个即将被重构
+--          的写点做一次性修补 —— 改了也是白改，还会在降级重构时产生一次无谓的
+--          冲突/回改。
+--       4. **收敛时机**：本写点（连同上面第 2 条列出的全部 REPAIRING 相关判定）
+--          在 **`REPAIRING` 降级为标记的那次重构中一并处理**。届时按降级后的
+--          真实语义决定 cpid 归属，不在本次补。
 --
 -- 幂等：ADD COLUMN / CREATE INDEX 均带 IF NOT EXISTS；UPDATE 为普通回填
 -- （重复执行结果幂等：已回填行再次 UPDATE 得到同值）。列刻意保持**可空、无

@@ -84,6 +84,16 @@ pub struct TPartBatch {
     ///
     /// NULL = 批次不在生产工序池中（PENDING / PROGRAMMING / OUTSOURCE /
     /// INSPECTION / OFFICE 等）。
+    ///
+    /// **残留写点（2026-09-30 review 第 3 轮 M4，已接受债务）**：`cancel_batch` /
+    /// `cancel_all_active_batches_for_part` / `force_complete_all_batches_for_part` /
+    /// `mark_batch_repairing` 这 4 个出池写点既不写也不清本列。功能上无影响（5 条池
+    /// SQL 全部 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'` 双重限定）。
+    /// 其中 `mark_batch_repairing`（IN_PROCESS → REPAIRING）**已决策**：
+    /// 正常业务流不存在该转换，且 `REPAIRING` 将降级为纯标记（flag），
+    /// 届时相关状态判定整体重做，本写点在**那次重构中一并处理**。
+    /// 完整记录见 `migrations/20260930000000_004_add_batch_current_process_id.sql`
+    /// 「已知局限 (4)」—— 做写点穷举时不必重新提这两条。
     pub current_process_id: Option<i64>,
     /// 逻辑 FK → `t_process_chain_step.id`；**可选的显示用定位信息**。
     ///

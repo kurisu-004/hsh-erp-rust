@@ -790,6 +790,25 @@ impl PartRepo {
     /// 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 `has_been_repaired`
     /// 列；返修事实由 `t_part_event` REPAIR_STARTED 事件追溯，本函数不再
     /// 写返修标。
+    ///
+    /// **已知局限（2026-09-30 review 第 3 轮 M4 (4d)，已决策，本次不改 SQL）**：
+    /// 本函数把批次翻出 `IN_PROCESS`（按出池不变式应清 `current_process_id`）却
+    /// **既不写也不清**该列，location 仍是 `PRODUCTION_SHELF`。
+    ///
+    /// 已决策（用户拍板，2026-09-30）：
+    /// 1. **正常业务流不存在 `IN_PROCESS → REPAIRING` 转换** —— 现实中走不到，
+    ///    故不产生残留脏数据；
+    /// 2. `REPAIRING` 后续**不再作为状态机状态，仅作标记（flag）**，`status`
+    ///    取值与相关状态判定届时整体重做；
+    /// 3. 故**本次不改 SQL**：无实际数据后果，且 `REPAIRING` 语义即将变更，
+    ///    此刻补 `current_process_id = NULL` 属白改，还会在降级重构时造成一次
+    ///    无谓回改；
+    /// 4. 本写点连同 `part_status_progress()`（`IN_PROCESS | REPAIRING => 2`
+    ///    同档）与 `PartStatus::can_transition_to` 中以 REPAIRING 为端点的迁移，
+    ///    在 `REPAIRING` 降级为标记的那次重构中**一并处理**。
+    ///
+    /// 详见 `migrations/20260930000000_004_add_batch_current_process_id.sql`
+    /// 「已知局限 (4)」小节。
     pub async fn mark_batch_repairing<'e, E: PgExecutor<'e>>(
         executor: E,
         batch_id: i64,
