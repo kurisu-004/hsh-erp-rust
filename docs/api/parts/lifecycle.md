@@ -404,6 +404,16 @@ Response 200 `data`：[`PartListOut`](./index.md#partlistout-字段)。**2026-09
 - **Tab = 全部**（`has_cnc_program` 缺省）：所有 CNC 相关工单（含历史 PROGRAMMING
   状态可消化的批次）。
 
+> **2026-10-01 弃用说明**：前端「待编程一览」页已切到 prod 域
+> `GET /api/v2/prod/programming/pending`（三规则并集口径，见
+> [`../production/pending-programming.md`](../production/pending-programming.md)）。
+> 切换原因：① 本端点规则 B 走「批次货架 `current_holder_id` → `t_shelf_process` →
+> `t_process.is_cnc`」间接链路，开发库 `t_process.is_cnc` 全 false 且
+> `t_process_chain_step` 0 行 → 谓词恒返空；② migration 004 起
+> `t_part_batch.current_process_id` 才是批次工序归属的**唯一权威依据**，新端点规则 3
+> 直接读该列。**本端点保留兼容，不删除、行为不变，不再新增前端调用方**（part 域
+> 代码一行未改）。
+
 ---
 
 > **2026-09-29 同步说明**：本节 `GET /parts/pending-programming` 端点 + 新 query 参数

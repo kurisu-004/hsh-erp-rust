@@ -17,6 +17,13 @@
 //! - batches 端点合并：原 `/batches/dispatch`（单条）+ `/batches/bulk-dispatch`（批量）
 //!   合并为单一 bulk-only `/batches/dispatch`，原 `/bulk-dispatch` 路径 404。
 //!
+//! 2026-10-01 新增 `prod::programming` 子模块（待编程一览，1 端点，URL 挂
+//! `/api/v2/prod/programming/pending`）：前端「待编程一览」页从 part 域
+//! `GET /api/v2/parts/pending-programming` 切过来。谓词按三规则并集（part 级去重）：
+//! ① `p.status = 'PROGRAMMING'` 兼容旧筛选 ② 工单工艺链含 `is_cnc` 工序
+//! ③ 批次 `current_process_id` 指向 `is_cnc` 工序（migration 004 确立的唯一
+//! 权威列）。part 域旧端点**保留兼容、一行未改**，仅追加弃用文档说明。
+//!
 //! part / assembly 是全仓库核心实体（生产只是其生命周期一段），不进 prod。
 //! 报工端点（worker-scan / pick-up / to-* / complete）留在 part 域；
 //! 文档层「生产全流程端点地图」在 `docs/api/production/index.md` 兜底串联。
@@ -32,6 +39,7 @@ use crate::state::AppState;
 pub mod batch;
 pub mod process;
 pub mod process_chain;
+pub mod programming;
 pub mod work_type;
 pub mod worker;
 pub mod worker_pool;
@@ -47,4 +55,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/pool", worker_pool::router())
         // 2026-09-29 新增：prod::batch（PENDING 批次 + 下发）
         .nest("/batches", batch::router())
+        // 2026-10-01 新增：prod::programming（待编程一览，三规则并集口径）
+        .nest("/programming", programming::router())
 }
