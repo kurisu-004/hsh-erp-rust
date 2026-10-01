@@ -4,20 +4,17 @@
 //!
 //! ## 事务边界（2026-09-22 重构对齐 iam 范本）
 //! handler 负责 `pool.begin()` / `tx.commit()`，按读写分三形态：
-//! - ① **纯写端点**（create_shelf / update_shelf / deactivate_shelf /
-//!   set_shelf_processes）：`pool.begin()` → service call → `tx.commit()`，
-//!   错误路径 tx drop 隐式回滚。
+//! - ① **纯写端点**（create_shelf / update_shelf / deactivate_shelf）：
+//!   `pool.begin()` → service call → `tx.commit()`，错误路径 tx drop 隐式回滚。
 //! - ② **写 + post-commit 副作用**：shelf 域当前无 Redis / WS 副作用需求，故
 //!   全部写端点走形态 ①。
-//! - ③ **读端点**（list_shelves / get_shelf / list_for_return / list_for_inspection /
-//!   list_all_process_mappings / list_shelf_processes）：`pool.acquire()` 不开
-//!   事务，service 借 `&mut *conn` 执行查询，用完即 drop。
+//! - ③ **读端点**（list_shelves / get_shelf / list_for_return / list_for_inspection）：
+//!   `pool.acquire()` 不开事务，service 借 `&mut *conn` 执行查询，用完即 drop。
 //!
 //! service 形参：`repo: R: ShelfRepoTrait`（by-value）。生产路径
 //! `R = &mut PgConnection`，trait `ShelfRepoTrait` 已直接对 `&mut PgConnection`
-//! 实现（见 `repo/mod.rs`）。service 方法**不**收第二个 conn 参数——跨域
-//! `ProcessRepo` 静态调用由 trait helper（`proc_check_process_exists` /
-//! `proc_list_existing_process_ids`）封装。
+//! 实现（见 `repo/mod.rs`）。service 方法**不**收第二个 conn 参数——service 内已无
+//! 跨域调用（`list_for_return` 的 `next_process_id` 占位校验 2026-10-02 删除）。
 //!
 //! ## 统一响应信封
 //! handler 返回 `Result<Json<R<T>>, AppError>`，错误由 `AppError::into_response()`
@@ -27,10 +24,13 @@
 //! 权限守卫在 service 层（`current.require_any_role` / `require_role`），handler
 //! 不重复校验。
 //!
-//! ## 11 端点
-//! 读 3：list_shelves / get_shelf / list_shelf_processes
-//! picker 3：list_for_return / list_for_inspection / list_all_process_mappings
-//! 写 5 (MANAGER)：create_shelf / update_shelf / soft_delete_shelf / set_shelf_processes
+//! ## 7 端点（2026-10-02 域拆分：3 个 mapping 端点搬到 prod::shelf_process）
+//! 读 2：list_shelves / get_shelf
+//! picker 2：list_for_return / list_for_inspection
+//! 写 3 (MANAGER)：create_shelf / update_shelf / soft_delete_shelf
+//!
+//! 旧路径 `GET|POST /api/v2/shelves/{id}/processes` 与 `GET /api/v2/shelves/processes`
+//! 已删除（404，无 alias），新路径见 `docs/api/production/shelf-process-mapping.md`。
 
 use std::sync::Arc;
 
@@ -41,15 +41,10 @@ use axum::{Json, Router};
 
 use crate::auth::rbac::CurrentUser;
 use crate::modules::shelf::dto::{
-    SetShelfProcessesRequest, ShelfCreateRequest, ShelfForReturnQuery, ShelfListQuery,
-    ShelfUpdateRequest,
+    ShelfCreateRequest, ShelfForReturnQuery, ShelfListQuery, ShelfUpdateRequest,
 };
-use crate::modules::shelf::process_mapping::ShelfProcessService;
 use crate::modules::shelf::service::ShelfService;
-use crate::modules::shelf::vo::{
-    AllShelfProcessMappingOut, ShelfForInspectionOut, ShelfForReturnOut, ShelfListOut, ShelfOut,
-    ShelfProcessMappingOut,
-};
+use crate::modules::shelf::vo::{ShelfForInspectionOut, ShelfForReturnOut, ShelfListOut, ShelfOut};
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -146,58 +141,13 @@ pub async fn list_for_inspection(
     Ok(Json(R::ok(out)))
 }
 
-/// GET /api/v2/shelves/processes —— 读端点，acquire 不开事务
-pub async fn list_all_process_mappings(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-) -> Result<Json<R<AllShelfProcessMappingOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = ShelfService
-        .list_all_process_mappings(&mut *conn, &current)
-        .await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// GET /api/v2/shelves/{id}/processes —— 读端点，acquire 不开事务
-pub async fn list_shelf_processes(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(id): Path<i64>,
-) -> Result<Json<R<ShelfProcessMappingOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = ShelfProcessService
-        .list_shelf_processes(&mut *conn, id, &current)
-        .await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// POST /api/v2/shelves/{id}/processes → 整组替换 mapping —— 纯写端点
-pub async fn set_shelf_processes(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(id): Path<i64>,
-    Json(req): Json<SetShelfProcessesRequest>,
-) -> Result<Json<R<()>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    ShelfProcessService
-        .set_shelf_processes(&mut *tx, &state.snowflake, id, &req.items, &current)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(R::ok(())))
-}
-
 /// 本域路由表（挂载点 `/api/v2/shelves`，见 `modules::v2_router`）
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_shelves).post(create_shelf))
         .route("/for-return", get(list_for_return))
         .route("/for-inspection", get(list_for_inspection))
-        .route("/processes", get(list_all_process_mappings))
         .route("/{id}", get(get_shelf))
         .route("/{id}/update", post(update_shelf))
         .route("/{id}/deactivate", post(deactivate_shelf))
-        .route(
-            "/{id}/processes",
-            get(list_shelf_processes).post(set_shelf_processes),
-        )
 }

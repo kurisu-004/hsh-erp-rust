@@ -5,10 +5,13 @@ use serde::Serialize;
 
 use crate::shared::types::serialize_i64;
 
-/// 货架详情出参。`account_count` 由 service 层用 `count_accounts_by_shelf`
-/// 单条 GROUP BY SQL 批量补全（防 N+1）。
+/// 货架详情出参。
 ///
 /// 2026-09-22 PR4：迁移到 vo/，仅 Serialize。
+/// 2026-10-02 域拆分：原 `account_count` 字段删除 —— 货架域对账号的唯一耦合就是它
+/// （喂 `t_user_role WHERE scope_type='shelf'` 的 GROUP BY 计数），而绑定真源本来
+/// 就在 iam 域（`t_user_role`）。用户决定舍弃该字段、前端不再显示，故连同
+/// `ShelfRepo::count_accounts_by_shelf` 一并移除，**本任务零 iam 模块改动**。
 #[derive(Debug, Clone, Serialize)]
 pub struct ShelfOut {
     #[serde(serialize_with = "serialize_i64")]
@@ -19,7 +22,6 @@ pub struct ShelfOut {
     pub location: Option<String>,
     pub is_active: bool,
     pub display_order: i32,
-    pub account_count: i64,
     pub version: i32,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,

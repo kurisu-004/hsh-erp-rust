@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/index.md)（[index.md](docs/api/index.md) 为总入口，含通用约定 + 跨域错误码速查；按模块拆分为 `iam.md` / `applicants.md` / `customers.md` / `shelves.md` / `websocket.md` / `delivery-groups.md` / `cnc-programs.md` / `files.md` / `outsource-companies.md` / `outsource-quotes.md` / `outsource-shipments.md` / `_e2e.md`，`parts` 因端点 ≥49 已拆为 `docs/api/parts/` 子目录（`index.md` / `crud.md` / `lifecycle.md` / `inspection.md`），`assemblies` 拆为 `docs/api/assemblies/`，`production` 拆为 `docs/api/production/`（`index.md` + 6 子页：work-types / processes / work-type-process-mapping / process-chain / worker-pool / workers），`delivery-notes` 拆为 `docs/api/delivery-notes/`（4 子页）；2026-09-19 IAM 域合并：原 `auth.md` + `users.md` → `iam.md`；2026-09-19 prod 容器聚合：原 `workers.md` → `production/workers.md`，工种/工序/工艺链/工人池/工人 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`）；2026-09-28/29 wx 域：原 7 个小程序 BFF 聚合端点 + 新增 `POST /api/v2/wx/iam/wx-login`（企业微信小程序登录）→ `docs/api/wx.md`，配套 iam 域 3 个 `/iam/users/{id}/wx-bind` 端点见 `docs/api/iam.md`。**后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须立即同步更新对应模块文件**。
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/index.md)（[index.md](docs/api/index.md) 为总入口，含通用约定 + 跨域错误码速查；按模块拆分为 `iam.md` / `applicants.md` / `customers.md` / `shelves.md` / `websocket.md` / `delivery-groups.md` / `cnc-programs.md` / `files.md` / `outsource-companies.md` / `outsource-quotes.md` / `outsource-shipments.md` / `_e2e.md`，`parts` 因端点 ≥49 已拆为 `docs/api/parts/` 子目录（`index.md` / `crud.md` / `lifecycle.md` / `inspection.md`），`assemblies` 拆为 `docs/api/assemblies/`，`production` 拆为 `docs/api/production/`（`index.md` + 子页：work-types / processes / work-type-process-mapping / **shelf-process-mapping（2026-10-02 新增，货架↔工序映射自 shelves 域搬入）** / process-chain / worker-pool / workers / batches / pending-programming），`delivery-notes` 拆为 `docs/api/delivery-notes/`（4 子页）；2026-09-19 IAM 域合并：原 `auth.md` + `users.md` → `iam.md`；2026-09-19 prod 容器聚合：原 `workers.md` → `production/workers.md`，工种/工序/工艺链/工人池/工人 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`）；2026-09-28/29 wx 域：原 7 个小程序 BFF 聚合端点 + 新增 `POST /api/v2/wx/iam/wx-login`（企业微信小程序登录）→ `docs/api/wx.md`，配套 iam 域 3 个 `/iam/users/{id}/wx-bind` 端点见 `docs/api/iam.md`。**后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须立即同步更新对应模块文件**。
 
 ## 常用命令
 
@@ -113,6 +113,47 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 
 **part 是跨域枢纽**（delivery_note、assembly、outsource、part_file、statistics、shelf 均依赖它），实施顺序见 architecture.md 第 7 节。
 
+### `src/modules/prod/*` 子模块清单（prod 域 = 生产调度容器，2026-09-19 聚合）
+
+| 子模块 | 端点数 | URL 前缀 | 表 | 说明 |
+|---|---:|---|---|---|
+| `prod::worker` | 7 | `/api/v2/prod/workers` | `t_worker` | 工人档案主数据 |
+| `prod::work_type` | 7 | `/api/v2/prod/work-types` | `t_work_type` + `t_work_type_process` | 工种 CRUD 5 + 工种↔工序映射 2 |
+| `prod::process` | 5 | `/api/v2/prod/processes` | `t_process` | 工序主数据（INHOUSE/OUTSOURCE）；**2026-10-02 订正**：文档原写 6，逐 router 复核为 5（`/` 的 GET+POST 算 2 条 route） |
+| `prod::process_chain` | 3 | `/api/v2/prod/process-chains` | `t_part_process_chain` + `t_process_chain_step` | 工单工艺链 |
+| `prod::shelf_process` | 3 | `/api/v2/prod/shelf-processes` | `t_shelf_process` | **2026-10-02 新增**：货架 ↔ 工序映射，自 `src/modules/shelf/process_mapping/` 搬入（`t_shelf_process` 关联的是 prod 域实体 `t_process`）。旧路径 `GET|POST /api/v2/shelves/{id}/processes` + `GET /api/v2/shelves/processes` 已删除（**无 alias**），这 3 个端点请求 / 响应契约逐字不变；但同 commit 删的 `account_count` 出参会打爆前端 Zod 必填字段，**前端配套改动清单见 `docs/api/production/shelf-process-mapping.md#前端配套改动清单`** |
+| `prod::worker_pool` | 6 | `/api/v2/prod/pool` | `t_part_batch`（候选池视图） | 工人候选池（2026-09-30 `/worker-pool` + `/admin/worker-pool` 双 nest 合并为 `/pool`；**2026-10-02 订正**：文档原写 5，实际 6 条 route） |
+| `prod::batch` | 3 | `/api/v2/prod/batches` | `t_part_batch` | 待下发批次（2026-09-29 新增） |
+| `prod::programming` | 1 | `/api/v2/prod/programming` | `t_part` + `t_part_batch` + chain | 待编程一览（2026-10-01 新增） |
+
+> 表内 8 个子模块端点求和 = 7 + 7 + 5 + 3 + 3 + 6 + 3 + 1 = **35**，与
+> `docs/api/production/index.md` 的 prod 总数一致。
+
+**2026-10-02 shelf 域拆分**（依据「货架自身包括了账号的部分和工序映射相关的部分，
+应拆分到 iam 域和 prod 域」）：
+- **账号部分 = 消除**：`ShelfOut.account_count` + `ShelfRepo::count_accounts_by_shelf`
+  删除。货架域对账号的唯一耦合就是这一个字段，而绑定真源本来就在 iam 域
+  `t_user_role`（`scope_type='shelf'`）→ **零 iam 模块改动**
+- **工序映射 = 搬进 prod**：依赖方向由 shelf → prod **翻转为** prod → shelf
+  （新 `ShelfProcessService` 只读 `ShelfRepo::get_by_id` 校验货架存在 / scope）；
+  shelf 侧 2 个反向 helper（`proc_check_process_exists` /
+  `proc_list_existing_process_ids`）删除，`ShelfRepoTrait` 17 → **10** 方法
+  （全部 `t_shelf`）
+- 端点数：shelf **10 → 7**；prod 32 → **35**（+3）。⚠️ 两条基线均系旧文档计数
+  残留，本次逐 router 复核后顺带订正：
+  - shelf 侧：文档原写「11」，实为 **10**（`/` 的 GET+POST 算 2 条 route，master 上
+    `handler.rs` 自己的 doc 写「写 5」却只列了 4 个 write handler，两处都对不上）；
+  - prod 侧：文档原写「31」，系 `prod::worker_pool` 计数残留（标题写 5、router
+    实为 6 route），实为 **32**；
+  - 故 prod 的净变化是 32 → 35（+3），而非按旧账记的 31 → 34。
+  订正后的 prod 35 端点与本节上表求和一致（7+7+5+3+6+3+1+3）
+- `t_shelf_process` 的 SQL 真源**只在** `prod::shelf_process::repo::ShelfProcessRepo`
+  （6 个静态方法 = 平移 4 + 从 `prod::batch` / `prod::worker_pool` 各收 1 处）。
+  故意保留 inline 的 3 处见 `docs/api/production/shelf-process-mapping.md#维护约定`
+- `MockShelfRepoTrait` 全仓零引用，trait 收缩不影响任何单测
+- 文档：`docs/api/shelves.md` / `docs/api/production/shelf-process-mapping.md` /
+  `docs/api/production/index.md` / `docs/api/index.md` 已同步
+
 ## 必须遵守的架构约定
 
 1. **事务边界在 handler（2026-09-21 重构 + 2026-09-22 删 `PgIamRepo` 转发壳后 iam 与其余 20 个 handler 文件一致）**：handler 显式 `state.pool.begin()` / `tx.commit()`，错误路径 tx drop 隐式回滚。service 不知事务——所有跨 repo 操作经 `repo: R`（by-value；`IamRepo` / 域内对应 trait 已直接 `impl for &mut PgConnection`，handler/service 借 `&mut *tx` / `&mut *conn` 即可）参数传入。
@@ -138,7 +179,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | `tests/iam/{main,api,middleware}.rs` | 2 | `iam`（redis-flush group）|
 | `tests/shelf/{main,api,deactivate}.rs` | 2 | `shelf` |
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
-| `tests/production/{main,work_type,process,process_chain,worker,worker_pool,worker_pool_auto_allocate}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐）|
+| `tests/production/{main,work_type,process,process_chain,worker,worker_pool,worker_pool_auto_allocate,batch,pending_programming,shelf_process}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自 `tests/shelf/api.rs` 迁入）|
 | `tests/outsource/{main,company,quote,send_receive}.rs` | 3 | `outsource` |
 | `tests/user_repo/{main,basic,role,password}.rs` | 1 → 3 sub-file | `user_repo` |
 | 单文件保留：applicant_api / customer_api / _e2e_api / cos_opendal_api / cos_real_smoke / auto_complete_api / dashboard_ws_api / idempotency_api / guard_dn_in_use_api / cnc_program_api | 10 | （各自原 binary 名）|

@@ -1,4 +1,4 @@
-//! shelf ↔ process 映射（`t_shelf_process`）SQL 真源
+//! shelf ↔ process 映射（`t_shelf_process`）SQL 真源 —— 物理在 `prod` 子模块
 //!
 //! 对应 Python myERP（无单独 shelf_process 仓储；逻辑在 shelf_repository 内部）。
 //! 函数签名接收 `impl PgExecutor<'_>`，兼容 `&PgPool` / `&mut PgConnection` /
@@ -10,14 +10,22 @@
 //! - 读查询一律带 `deleted_at IS NULL`
 //! - 软删 `deleted_at = now()`，无乐观锁（mapping 由 set_shelf_processes 整组替换）
 //!
-//! ## 2026-09-22 重构
-//! 原 `process_mapping.rs`（平级文件）拆分到 `process_mapping/{mod.rs, sql.rs}`，
-//! 本文件 SQL 与方法签名零 diff，`.sqlx/query-*.json` 哈希不变。
+//! ## 2026-10-02 域归属反转（shelf 域拆分）
+//! 自 `src/modules/shelf/process_mapping/sql.rs` **整文件平移**到本文件（本仓内
+//! 平级单文件形态，不是 `sql.rs`/`mod.rs` 目录拆分的继任者）：
+//! - 4 个「平移」方法（`list_by_shelf` / `list_all_active_mappings` /
+//!   `soft_delete_all_for_shelf` / `bulk_insert`）SQL 与方法签名**零 diff**
+//! - 新增 2 个「收口」方法（`find_first_shelf_for_process` /
+//!   `exists_for_shelf_process`）供 prod 域内部调用方改调，消灭手写 `t_shelf_process`
+//!   SQL（`prod::batch` / `prod::worker_pool` 各 1 处）
 //!
-//! ## 与 `shelf/repo` 的协作
-//! `t_shelf_process` 的方法**也**在胖 trait `ShelfRepo`（`shelf/repo/mod.rs`）里
-//! 重新声明——handler/service 借 `&mut *tx` / `&mut *conn` 直接调胖 trait，
-//! trait impl 一行委托到本文件的 `ShelfProcessRepo` 静态方法。
+//! ## 本仓内保留 inline 的 `t_shelf_process` SQL（2026-10-02 判定，不要硬抽）
+//! - `prod::batch::repo::preview_auto_dispatch` —— `LEFT JOIN LATERAL t_shelf_process`
+//!   在大复合查询里，拆出来是性能回退
+//! - `prod::process::repo::count_process_references` —— 5 张表 sub-select 求和，
+//!   拆出来多 5 次往返
+//! - part 域 3 处（`worker_scan.rs` / `phase1/mod.rs` /
+//!   `pending_programming_sql.rs`）—— 属 part 域，不在本次拆分范围
 
 use sqlx::PgExecutor;
 
@@ -32,7 +40,7 @@ pub struct NewShelfProcessRow {
 }
 
 // ---------------------------------------------------------------------------
-// ShelfProcessRepo（t_shelf_process，4 方法）
+// ShelfProcessRepo（t_shelf_process，6 方法 = 平移 4 + 新增 2）
 // ---------------------------------------------------------------------------
 
 pub struct ShelfProcessRepo;
@@ -133,5 +141,63 @@ impl ShelfProcessRepo {
             .execute(executor)
             .await
             .map(|r| r.rows_affected())
+    }
+
+    /// 按 `process_id` 取首条 active 货架映射（多结果取 sort_order 最小者）。
+    ///
+    /// 2026-10-02 新增：原为 `prod::batch::repo::find_first_shelf_for_process`
+    /// （`src/modules/prod/batch/repo.rs`）的手写 SQL，随 shelf↔process 映射搬到本
+    /// 文件作为 SQL 真源，调用方 `prod::batch::service::dispatch_single` 改调本方法。
+    /// SQL 逐字保留，0 结果 → `Ok(None)`（由 service 层映射 `BIZ_SHELF_PROCESS_NOT_FOUND`）。
+    ///
+    /// 不带 `is_active` 守卫（车间 active 货架默认软删）；后续如需守卫再加。
+    pub async fn find_first_shelf_for_process<'e, E: PgExecutor<'e>>(
+        executor: E,
+        process_id: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let row: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT shelf_id
+            FROM t_shelf_process
+            WHERE process_id = $1 AND deleted_at IS NULL
+            ORDER BY sort_order ASC, id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(process_id)
+        .fetch_optional(executor)
+        .await?;
+        Ok(row)
+    }
+
+    /// 存在性检查：该 shelf 是否映射了该 process。
+    ///
+    /// 2026-10-02 新增：原为 `prod::worker_pool::service::move_batch` WORKER→POOL
+    /// 分支里的内联 SQL
+    /// `SELECT shelf_id FROM t_shelf_process WHERE shelf_id=$1 AND process_id=$2
+    ///  AND deleted_at IS NULL ORDER BY sort_order ASC, id ASC LIMIT 1` +
+    /// `mapped.is_none()` 判定 —— 该写法是**恒真式**（只 SELECT 一列后判空，实际只判
+    /// 「是否存在」，拿到的 `shelf_id` 恒等于入参 `$1`，`ORDER BY … LIMIT 1` 也是
+    /// 冗余）。本方法改用 `SELECT EXISTS(…)` 把「存在性」语义显式化，与原逻辑
+    /// **语义等价**（同一组 WHERE 谓词 + 同一 `deleted_at IS NULL` 守卫），20507
+    /// `BIZ_SHELF_PROCESS_NOT_MAPPED` 的触发条件与文案保持不变。
+    pub async fn exists_for_shelf_process<'e, E: PgExecutor<'e>>(
+        executor: E,
+        shelf_id: i64,
+        process_id: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM t_shelf_process
+                WHERE shelf_id = $1 AND process_id = $2 AND deleted_at IS NULL
+            )
+            "#,
+        )
+        .bind(shelf_id)
+        .bind(process_id)
+        .fetch_one(executor)
+        .await?;
+        Ok(exists)
     }
 }

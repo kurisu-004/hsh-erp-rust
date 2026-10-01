@@ -6,7 +6,8 @@
 > - [`./iam.md`](./iam.md) — iam 域（auth + user 合并，2026-09-19；PR-4 收尾后 `/api/v2/iam/*` 为唯一对外接口，旧 alias `/auth` + `/users` 已下线）
 > - [`./applicants.md`](./applicants.md) — applicant 域（申请人 CRUD，2026-08-26；2026-09-19 聚合于 com 模块 → `/api/v2/com/applicants`）
 > - [`./customers.md`](./customers.md) — customers 域（L1/L2 CRUD，2026-08-26；2026-09-19 聚合于 com 模块 → `/api/v2/com/customers`）
-> - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker + mapping，2026-08-26）
+> - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker，2026-08-26；**2026-10-02 端点 10 → 7（文档原写 11，实为 10），货架↔工序映射搬到 prod 域，`account_count` 出参取消**）
+> - [`./production/shelf-process-mapping.md`](./production/shelf-process-mapping.md) — shelf ↔ process 工序映射（**2026-10-02 自 shelves 域搬入 prod**，3 端点，URL `/api/v2/prod/shelf-processes/*`，旧路径 404 无 alias —— `GET /shelves/processes` 例外为 400 纯文本；**前端配套改动清单见该页同名小节**）
 > - [`./production/workers.md`](./production/workers.md) — worker 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文件从顶层迁入 `production/`）
 > - [`./production/index.md`](./production/index.md) — **生产管理** 域（工种/工序/工序映射/工艺链/工人候选池 + 工人档案；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias）
 > - [`./parts/index.md`](./parts/index.md) — part 域（49 端点：to-inspection / to-ship 批量+单件 / to-process / **worker-scan** + Phase 1/2 全套批量与单件状态机扩展，2026-09-14）
@@ -200,9 +201,9 @@ HTTP 状态码：
 | auth + users | [`./iam.md`](./iam.md) | 14 | ✅ 完全上线（2026-09-19 合并为单一 iam 域；PR-4 收尾后 `/api/v2/iam/*` 为唯一对外接口） |
 | applicants | [`./applicants.md`](./applicants.md) | 5 | ✅ 完全上线（CRUD + L1 customer 校验 + OCC，2026-08-26；聚合于 com 模块，2026-09-19） |
 | customers | [`./customers.md`](./customers.md) | 5 | ✅ 完全上线（CRUD + L1/L2 + OCC，2026-08-26；聚合于 com 模块，2026-09-19） |
-| shelves | [`./shelves.md`](./shelves.md) | 11 | ✅ 完全上线（CRUD + picker + mapping，2026-08-26） |
+| shelves | [`./shelves.md`](./shelves.md) | 7 | ✅ 完全上线（CRUD + picker，2026-08-26；**2026-10-02 域拆分：端点 10 → 7（文档原写 11，逐 router 复核实为 10）—— 3 个货架↔工序映射端点搬到 [`production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)（prod 域，无 alias）；货架↔账号部分**消除**（`ShelfOut.account_count` 删除，绑定真源在 iam `t_user_role`，零 iam 改动）**） |
 | workers（已并入 prod） | [`./production/workers.md`](./production/workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文档从顶层迁入 `production/`） |
-| **生产管理** | [`./production/index.md`](./production/index.md) | **31** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池 + 工人档案 + 待下发批次 + 待编程一览；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步；2026-10-01 增 `prod::programming` 待编程一览 1 端点） |
+| **生产管理** | [`./production/index.md`](./production/index.md) | **35** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池 + 工人档案 + 待下发批次 + 待编程一览；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步；2026-10-01 增 `prod::programming` 待编程一览 1 端点；**2026-10-02 增 `prod::shelf_process` 货架↔工序映射 3 端点，自 shelves 域搬入**） |
 | part | [`./parts/index.md`](./parts/index.md) | **49** | ✅ 完全上线（Phase 1+2 全部状态机 / 批量 / 扫码 / pick-up 端点落地，2026-09-14） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
@@ -276,7 +277,7 @@ HTTP 状态码：
 | 202xx | 工人（WORKER_NOT_FOUND 20201 / WORKER_INACTIVE 20202 / WORKER_IN_USE 20203 / WORKER_HOLD_LIMIT_EXCEEDED 20204 / **WORKER_POOL_EMPTY 20205 / NO_WORK_TYPE 20206**） |
 | 203xx | 装配体（ASSEMBLY_NOT_FOUND 20301 / BAD_CUSTOMER 20302 / TOO_MANY_CHILDREN 20303 / **PDF_INVALID 20305 / CHILD_PRICE_LOCKED 20306 / HAS_SHIPMENT 20307 / CUSTOMER_NO_SERIAL_PREFIX 20308**） |
 | 204xx | 图纸文件（DRAWING_FILE_NOT_FOUND 20401 / BAD_TYPE 20402 / TOO_LARGE 20403 / UPLOAD_FAILED 20404） |
-| 205xx | 货架（SHELF_NOT_FOUND 20501 / DUPLICATE_CODE 20502 / IN_USE 20503 / **PROCESS_SHELF_NOT_FOUND 20504 / PROCESS_PROCESS_NOT_FOUND 20505 / NO_MATCH_FOR_PROCESS 20506** / PROCESS_NOT_MAPPED 20507 / NOT_INSPECTION_ZONE 20511 / INACTIVE 20512） |
+| 205xx | **货架域**（20501 SHELF_NOT_FOUND / 20502 DUPLICATE_CODE / 20503 IN_USE / NOT_INSPECTION_ZONE 20511 / INACTIVE 20512）；**货架↔工序映射端点物理在 prod 子模块** —— 20504 PROCESS_SHELF_NOT_FOUND / 20505 PROCESS_PROCESS_NOT_FOUND（[`prod::shelf_process`](./production/shelf-process-mapping.md)，2026-10-02 自 shelves 域搬入）/ 20506 NO_MATCH_FOR_PROCESS / 20507 PROCESS_NOT_MAPPED（`prod::worker_pool` + `part::worker_scan` + delivery print 复用）/ 20508 PROCESS_NOT_FOUND（`prod::batch` dispatch 复用） |
 | 206xx | 账号（USER_ACCOUNT_NOT_FOUND 20601 / DUPLICATE_USERNAME 20602 / INACTIVE 20603 / ROLE_DUPLICATE 20604 / ROLE_NOT_FOUND 20605 / NO_ROLE 20606） |
 | 207xx | 工艺链（**PROCESS_CHAIN_NOT_FOUND 20701 / PROCESS_CHAIN_STEP_NOT_FOUND 20702 / WORK_TYPE_MAX_HELD_MINUTES_NOT_SET 20703 / AUTO_ALLOCATE_INVALID_RATIO 20704 / PROCESS_CHAIN_PART_NOT_PENDING 20705 / PROCESS_CHAIN_REQUIRED 20706**） |
 | 208xx | 工序（PROCESS_NOT_FOUND 20801 / DUPLICATE_CODE 20802 / IN_USE 20803） |

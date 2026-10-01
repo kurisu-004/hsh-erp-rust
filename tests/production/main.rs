@@ -16,6 +16,8 @@
 //! - worker.rs                 ← 原 worker_api.rs
 //! - batch.rs                  ← 2026-09-29 新增（prod::batch 4 端点端到端 + 错误码 + 角色守卫）
 //! - pending_programming.rs     ← 2026-10-01 新增（prod::programming 待编程一览 1 端点，10 场景）
+//! - shelf_process.rs          ← 2026-10-02 新增（prod::shelf_process 3 端点；自
+//!   tests/shelf/api.rs 迁入整组替换场景 + 补全集查询 / 20505 / 旧路径 404 场景）
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
@@ -23,6 +25,7 @@ mod batch;
 mod pending_programming;
 mod process;
 mod process_chain;
+mod shelf_process;
 mod work_type;
 mod worker;
 mod worker_pool;

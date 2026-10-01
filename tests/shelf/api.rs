@@ -1,10 +1,15 @@
 //! shelf 域端到端集成测试
 //!
-//! ## 覆盖（Task 3 shelf CRUD + picker + mapping）
+//! ## 覆盖（Task 3 shelf CRUD + picker）
 //! 1. `create_shelf_then_deactivate_with_in_use_part_fails` — `deactivate` 拒绝
 //!    被 IN_PROCESS/INSPECTION/REPAIRING 零件引用的货架 → 20503 BIZ_SHELF_IN_USE。
 //! 2. `create_then_get_shelf_round_trip` — happy path：create → get → 含 location 字段。
-//! 3. `set_shelf_processes_replaces_existing_mapping` — mapping 端点整组替换。
+//!
+//! 2026-10-02 域拆分：原第 3 个测试 `set_shelf_processes_replaces_existing_mapping`
+//! 连同 `insert_test_process` helper 一起迁到
+//! `tests/production/shelf_process.rs`（3 个 mapping 端点搬到 `prod::shelf_process`
+//! 子模块，URL 硬切 `/api/v2/prod/shelf-processes/*`，无 alias）。`insert_test_process`
+//! 在本域已无其它调用方，故随迁走、不保留副本。
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -14,8 +19,8 @@
 //! 用 MANAGER 用户跑通（POST /shelves 写路径要求 M-only，按设计 §6.1 用 M 即可）。
 //!
 //! ## 直插 t_part 的说明
-//! brief 的 20503 测试需要在 deactivate 前插一个 t_part.current_holder_id =
-//! shelf_id 且 status IN ('IN_PROCESS','INSPECTION','REPAIRING') 的工单。本
+//! brief 的 20503 测试需要在 deactivate 前插一个 t_part_batch.current_holder_id =
+//! shelf_id 且 status IN ('IN_PROCESS','INSPECTION','REPAIRING') 的批次。本
 //! 测试**没有**借助 part 域 CRUD（part 域自身不在 Task 3 范围内），而是直接
 //! SQL INSERT 落表 —— 与 `customer_api.rs` / `process_api.rs` 的同形 fixture 思路一致。
 //!
@@ -27,11 +32,9 @@
 //! - `insert_part_held_by_shelf`：shelf 域独享（绕开 part CRUD 直插 t_part +
 //!   t_part_batch；PR-2 已把 `current_holder_id` 等批次依附列迁移到 t_part_batch，
 //!   故同时插 batch 行让 `ShelfRepo::count_in_use_parts` 命中真相源路径）
-//! - `insert_test_process`：shelf 域独享（mapping 端点要校验 process_id 存在；
-//!   测试按需造不同 code / name，不复用 fixtures::seed_process）
 
 use axum::http::StatusCode;
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
@@ -103,27 +106,6 @@ async fn insert_part_held_by_shelf(pool: &PgPool, shelf_id: i64, status: &str) -
     .execute(pool)
     .await
     .expect("insert t_part_batch held by shelf");
-    id
-}
-
-/// 直插一个 INHOUSE t_process 工序（mapping 端点要校验 process_id 存在）。
-async fn insert_test_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
-    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
-    let now = now_naive();
-    sqlx::query!(
-        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
-         version, created_at, updated_at) \
-         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
-        id,
-        code,
-        name,
-        now,
-    )
-    .execute(pool)
-    .await
-    .expect("insert t_process");
     id
 }
 
@@ -233,113 +215,5 @@ async fn create_shelf_then_deactivate_with_in_use_part_fails() {
         env2["code"].as_i64().unwrap(),
         20503,
         "expected BIZ_SHELF_IN_USE; got: {env2}"
-    );
-}
-
-/// `set_shelf_processes` 整组替换映射：先 set [P1]，再 set [P2, P3] 后
-/// 旧映射 (P1) 软删、新映射 (P2+P3) 在场。
-#[tokio::test]
-async fn set_shelf_processes_replaces_existing_mapping() {
-    let (pool, app, token, _fx) = bootstrap_as_manager().await;
-
-    // 1. 创建 INSPECTION 货架
-    let (s1, env1) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            "/shelves",
-            Some(json!({
-                "code": "S-INSP-01",
-                "name": "Inspection-01",
-                "zone": "INSPECTION",
-            })),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s1, StatusCode::CREATED, "create shelf: {env1}");
-    let shelf_id_str = env1["data"]["id"].as_str().unwrap().to_string();
-    let shelf_id: i64 = shelf_id_str.parse().unwrap();
-
-    // 2. 准备 3 个工序
-    let p1 = insert_test_process(&pool, "P-MAP-1", "Map-Process-1").await;
-    let p2 = insert_test_process(&pool, "P-MAP-2", "Map-Process-2").await;
-    let p3 = insert_test_process(&pool, "P-MAP-3", "Map-Process-3").await;
-
-    // 3. 第一次 set_shelf_processes —— 仅含 [P1]
-    let (s2, env2) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            &format!("/shelves/{shelf_id_str}/processes"),
-            Some(json!({
-                "items": [
-                    { "process_id": p1.to_string(), "sort_order": 0 },
-                ],
-            })),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s2, StatusCode::OK, "first set processes: {env2}");
-    assert_eq!(env2["code"], 0);
-
-    // 4. 第二次 set_shelf_processes —— 替换为 [P2, P3]
-    let (s3, env3) = send(
-        app.clone(),
-        json_request(
-            "POST",
-            &format!("/shelves/{shelf_id_str}/processes"),
-            Some(json!({
-                "items": [
-                    { "process_id": p2.to_string(), "sort_order": 0 },
-                    { "process_id": p3.to_string(), "sort_order": 1 },
-                ],
-            })),
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s3, StatusCode::OK, "second set processes: {env3}");
-    assert_eq!(env3["code"], 0);
-
-    // 5. 读 `GET /shelves/{id}/processes` —— 应只剩 P2, P3 (按 sort_order)
-    let (s4, env4) = send(
-        app,
-        json_request(
-            "GET",
-            &format!("/shelves/{shelf_id_str}/processes"),
-            None,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(s4, StatusCode::OK, "list per-shelf processes: {env4}");
-    let items = env4["data"]["items"].as_array().expect("items[]");
-    assert_eq!(
-        items.len(),
-        2,
-        "after replace, mapping should have exactly 2 entries; got: {env4}"
-    );
-    // sort_order: P2=0, P3=1
-    let pids: Vec<String> = items
-        .iter()
-        .map(|it| it["process_id"].as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(pids, vec![p2.to_string(), p3.to_string()]);
-
-    // 6. DB 侧：P1 mapping 行已软删
-    let row: Option<(Option<chrono::NaiveDateTime>,)> = sqlx::query_as(
-        "SELECT deleted_at FROM t_shelf_process WHERE shelf_id = $1 AND process_id = $2",
-    )
-    .bind(shelf_id)
-    .bind(p1)
-    .fetch_optional(&pool)
-    .await
-    .expect("query old mapping deleted_at");
-    let deleted_at = row.expect("old mapping row exists").0;
-    assert!(
-        deleted_at.is_some(),
-        "old mapping row should be soft-deleted; got None"
     );
 }

@@ -7,12 +7,16 @@
 //! ## 5 个静态方法
 //! - [`BatchRepo::list_pending_batches`] —— 车间 PENDING 批次列表（JOIN 4 表）
 //! - [`BatchRepo::find_batch_by_id`] —— 按 id 查 batch（含软删过滤开关）
-//! - [`BatchRepo::find_first_shelf_for_process`] —— 按 process_id 取
-//!   `t_shelf_process` 首条 active 货架映射（多结果取 sort_order 最小者）
 //! - [`BatchRepo::update_batch_dispatched`] —— 标记 PENDING 批次已下发
 //!   （status='IN_PROCESS' + location='PRODUCTION_SHELF' + current_holder_id=shelf_id +
 //!   **current_process_id=target_process_id** + current_process_step_id=NULL），带乐观锁
 //! - [`BatchRepo::first_step_of_chain`] —— 取工艺链首道 step（`ORDER BY step_no LIMIT 1`）
+//!
+//! 2026-10-02 域拆分：本文件原有第 3 个方法 `find_first_shelf_for_process`（读
+//! `t_shelf_process`）已删除，SQL 真源搬到
+//! `crate::modules::prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
+//! （`t_shelf_process` 归 prod::shelf_process 域），调用方 `dispatch_single` 改调该处。
+//! 本文件现为 5 个静态方法。
 //!
 //! ## 错误类型
 //! repo 静态方法 → `sqlx::Error`（与项目惯例一致），由 service 层映射 `AppError`。
@@ -141,32 +145,6 @@ impl BatchRepo {
         .await
     }
 
-    /// 按 `target_process_id` 在 `t_shelf_process` 取首条 active 货架映射。
-    ///
-    /// 多结果取 sort_order 最小者（`ORDER BY sort_order ASC, id ASC`），
-    /// 0 结果 → `Ok(None)`（由 service 层映射 `BIZ_SHELF_PROCESS_NOT_FOUND`）。
-    ///
-    /// 不带 `deleted_at IS NULL` 守卫（车间 active 货架默认软删）；
-    /// 后续如需 `is_active` 守卫再加。
-    pub async fn find_first_shelf_for_process(
-        conn: &mut PgConnection,
-        process_id: i64,
-    ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT shelf_id
-            FROM t_shelf_process
-            WHERE process_id = $1 AND deleted_at IS NULL
-            ORDER BY sort_order ASC, id ASC
-            LIMIT 1
-            "#,
-        )
-        .bind(process_id)
-        .fetch_optional(&mut *conn)
-        .await?;
-        Ok(row)
-    }
-
     /// 标记 PENDING 批次已下发（OCC UPDATE）。
     ///
     /// 输入：batch_id, expected_version (PENDING batch 当前 version), shelf_id,
@@ -287,6 +265,14 @@ impl BatchRepo {
     }
 
     /// 2026-09-30 新增：`auto_dispatch_preview` 单 SQL（取代旧 3 步 SQL）。
+    ///
+    /// ⚠️ 2026-10-02 域拆分判定：**保留 inline `t_shelf_process` SQL，不抽到
+    /// `prod::shelf_process::repo::ShelfProcessRepo`**。该表在下面是
+    /// `LEFT JOIN LATERAL` 大复合查询的一部分（与 `t_process_chain_step` 的 LATERAL
+    /// 同层），拆成独立子查询会退化成 N+1 往返，是性能回退。`t_shelf_process` 的
+    /// SQL 真源已搬到 `prod::shelf_process::repo`，此处仅为 LATERAL 复合查询的
+    /// 一处特例内联，谓词（`process_id` + `deleted_at IS NULL` + `sort_order ASC, id
+    /// ASC LIMIT 1`）与 `ShelfProcessRepo::find_first_shelf_for_process` 对齐。
     ///
     /// 对每个 `batch_id`：
     /// - 查 part.process_chain_id

@@ -4,10 +4,11 @@
 //!
 //! 2026-09-22 PR4：原 `dto.rs` 中的出参类型（ShelfOut / ShelfListOut /
 //! ShelfForReturnItem / ShelfForReturnOut / ShelfForInspectionItem /
-//! ShelfForInspectionOut / ShelfProcessMappingItem / ShelfProcessMappingOut /
-//! AllShelfProcessMappingItem / AllShelfProcessMappingOut）已迁移至 `vo/` 下：
-//! - 主货架端点 → `vo/shelf.rs`
-//! - shelf↔process 映射 → `vo/process_mapping.rs`
+//! ShelfForInspectionOut）已迁移至 `vo/shelf.rs`。
+//!
+//! 2026-10-02 域拆分：`SetShelfProcessesRequest` / `SetShelfProcessesItem` 与
+//! 仓内 `all mapping` VO 一并迁出到 `src/modules/prod/shelf_process/{dto,vo}.rs`
+//! （工序映射随端点搬到 prod 域），本文件只剩纯 `t_shelf` 入参。
 //!
 //! ## `zone` 业务约束
 //! `PRODUCTION` / `INSPECTION`（DB varchar，应用层用 enum 校验）。
@@ -72,25 +73,12 @@ pub struct ShelfListQuery {
 
 /// for-return picker 查询参数：`next_process_id` 必填（worker 当前持有
 /// 批次的下一道工序，决定哪些货架可用 —— 仅映射了该工序的货架候选）。
+///
+/// 2026-10-02：`next_process_id` 的「process 存在性占位校验」已从 service 删除
+/// （校验结果被立刻丢弃、且是一次跨域多余查询；该语义本就由 worker-scan 后端强
+/// 校验）。字段保留：picker 前端仍会把它与候选 shelf 一并提交给 worker-scan。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ShelfForReturnQuery {
     #[serde(default)]
     pub next_process_id: Option<String>,
-}
-
-/// set shelf processes 入参：整组替换（先软删全部旧 mapping → INSERT 新列表）。
-///
-/// `items` 可为空数组（= 清空映射）。每个 `{process_id, sort_order}` 的
-/// `process_id` 必须现存，否则 service 层抛 20505。
-#[derive(Debug, Clone, Deserialize)]
-pub struct SetShelfProcessesRequest {
-    pub items: Vec<SetShelfProcessesItem>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SetShelfProcessesItem {
-    #[serde(default)]
-    pub process_id: String,
-    #[serde(default)]
-    pub sort_order: i32,
 }

@@ -20,9 +20,22 @@
 //! 不同步。
 //!
 //! ## 为什么 fixture 预置 1 货架 + 1 工序 + 1 映射
-//! shelf 域 API（POST /shelves、POST /shelves/{id}/processes 等）允许现场
-//! 创建，但预置 1 货架 + 1 映射给「已有映射时替换 / list 时已存在 1 行」等场景
-//! 提供 fixture 起点；测试仍按需用 POST /shelves 创建更多货架。
+//! shelf 域 API（POST /shelves 等）允许现场创建，但预置 1 货架 + 1 映射给
+//! 「已有映射时替换 / list 时已存在 1 行」等场景提供 fixture 起点；测试仍按需用
+//! POST /shelves 创建更多货架。
+//!
+//! ## 2026-10-02 域拆分：映射行保留不动
+//! 货架↔工序映射的 3 个端点已搬到 `src/modules/prod/shelf_process/`
+//! （`GET|POST /api/v2/shelves/{id}/processes` + `GET /api/v2/shelves/processes`
+//! → `/api/v2/prod/shelf-processes/*`，无 alias），但本 fixture 的
+//! `t_shelf_process` 行（`SHELF_PROCESS_MAPPING_ID`）与 `shelf_process_mapping_id`
+//! 字段**一律保留**，理由是：① 删掉会改变 fixture 的映射行数，影响任何依赖
+//! 「该 fixture 库里有 N 条 mapping」这一前提的测试；② 保留是零成本的 ——
+//! `shelf_process_mapping_id` 字段目前全仓无读取方（`#[allow(dead_code)]` 的
+//! `ShelfFixture` 允许未用字段），常量与 SQL 也在同一 crate 内自洽。
+//! ⚠️ 2026-10-02 review 第 1 轮 M-5 订正：此前流传的保留理由是「删 fixture 行会让
+//! 常量悬空」，经全仓 grep 不成立（该常量仅被本文件 `Default` impl 引用一次，
+//! 删行 + 删字段 + 删常量三者同删即可）。现理由改为上面两条可验证的。
 //!
 //! ## 当前域
 //! - `shelf`：1 INHOUSE 工序（FX-SHP）加 1 INSPECTION 货架（FX-SH-NEW1）加

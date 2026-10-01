@@ -10,15 +10,18 @@
 //!   `status IN ('IN_PROCESS','INSPECTION','REPAIRING')` 引用，>0 ⇒ 20503 拒
 //!
 //! ## picker 端点
-//! 见同级 `service::picker`（for-return / for-inspection / 全集 process 映射）。
+//! 见同级 `service::picker`（for-return / for-inspection）。
 //!
-//! ## mapping 端点
-//! 见 `crate::modules::shelf::process_mapping`（per-shelf set/list）。
+//! ## 2026-10-02 域拆分
+//! 工序映射端点（`set_shelf_processes` / `list_shelf_processes` /
+//! `list_all_process_mappings`）搬到 `src/modules/prod/shelf_process/`；本文件的
+//! `to_shelf_out` 随之去掉第 2 参数 `account_count`（`ShelfOut.account_count` 出参
+//! 取消，账号绑定真源在 iam 域）。
 //!
 //! ## 事务边界（2026-09-22 重构对齐 iam 范本）
 //! 事务移交 handler（与 20 个 handler 文件现状对齐）：service 仅业务逻辑，所有
-//! 跨 repo 操作经 `repo: R`（by-value；`R: ShelfRepo`）参数传入——handler/service
-//! 借 `&mut *tx` / `&mut *conn` 喂给 `ShelfRepo` trait（trait 已直接
+//! 跨 repo 操作经 `repo: R`（by-value；`R: ShelfRepoTrait`）参数传入——handler/service
+//! 借 `&mut *tx` / `&mut *conn` 喂给 `ShelfRepoTrait`（trait 已直接
 //! `impl for &mut PgConnection`）。service 不知事务——handler `pool.begin()` +
 //! `tx.commit()` 包外。
 //!
@@ -42,9 +45,11 @@ fn version_conflict() -> AppError {
     AppError::biz(code::VERSION_CONFLICT, "数据已被他人修改，请刷新后重试")
 }
 
-/// 把 `TShelf` 转 `ShelfOut`。`account_count` 由 caller 在 list 时统一 GROUP BY
-/// 批量补全；单条 get 不查 account_count（默认 0）。
-fn to_shelf_out(s: TShelf, account_count: i64) -> ShelfOut {
+/// 把 `TShelf` 转 `ShelfOut`。
+///
+/// 2026-10-02：原签名带第 2 参数 `account_count`（由 caller 在 list 时统一 GROUP BY
+/// 批量补全、get 时恒传 0）。`ShelfOut.account_count` 出参取消后该参数无意义，一并删除。
+fn to_shelf_out(s: TShelf) -> ShelfOut {
     ShelfOut {
         id: s.id,
         code: s.code,
@@ -53,7 +58,6 @@ fn to_shelf_out(s: TShelf, account_count: i64) -> ShelfOut {
         location: s.location,
         is_active: s.is_active,
         display_order: s.display_order,
-        account_count,
         version: s.version,
         created_at: s.created_at,
         updated_at: s.updated_at,
@@ -113,18 +117,7 @@ impl ShelfService {
             .count_with_filters(code_like, zone, query.is_active)
             .await?;
 
-        // account_count 单条 GROUP BY 批量算（防 N+1）
-        let ids: Vec<i64> = items.iter().map(|s| s.id).collect();
-        let account_rows = repo.count_accounts_by_shelf(&ids).await?;
-        let account_map: std::collections::HashMap<i64, i64> = account_rows.into_iter().collect();
-
-        let out_items = items
-            .into_iter()
-            .map(|s| {
-                let count = account_map.get(&s.id).copied().unwrap_or(0);
-                to_shelf_out(s, count)
-            })
-            .collect();
+        let out_items = items.into_iter().map(to_shelf_out).collect();
 
         Ok(ShelfListOut {
             items: out_items,
@@ -157,8 +150,8 @@ impl ShelfService {
             ));
         }
 
-        // 单条 get 不批量算 account_count（默认 0）。若 caller 需要，由 list 端点补全。
-        Ok(to_shelf_out(s, 0))
+        // 2026-10-02：`account_count` 出参取消，单条 get 不再做额外查询
+        Ok(to_shelf_out(s))
     }
 
     // =======================================================================
@@ -205,7 +198,7 @@ impl ShelfService {
                 },
             )?;
 
-        Ok(to_shelf_out(s, 0))
+        Ok(to_shelf_out(s))
     }
 
     pub async fn update_shelf<R: ShelfRepoTrait>(

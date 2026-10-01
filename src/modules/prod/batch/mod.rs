@@ -12,9 +12,9 @@
 //! - `vo.rs` —— 出参（`PendingBatchListOut` / `PendingBatchItem` / `DispatchResult`
 //!   / `AutoDispatchResult` / `AutoDispatchItem`）
 //! - `repo.rs` —— SQL 真源（`list_pending_batches` / `find_batch_by_id` /
-//!   `find_first_shelf_for_process` / `update_batch_dispatched` /
-//!   `first_step_of_chain` / `part_get_process_chain_id` /
-//!   `preview_auto_dispatch` / `find_part_id_by_batch_id`）
+//!   `update_batch_dispatched` / `first_step_of_chain` /
+//!   `part_get_process_chain_id` / `preview_auto_dispatch` /
+//!   `find_part_id_by_batch_id`）
 //! - `service.rs` —— 业务逻辑（`list_pending` / `dispatch_batch` bulk-only /
 //!   `auto_dispatch_preview`），事务边界下沉到 handler
 //! - `handler.rs` —— HTTP 路由 + 角色守卫 + WS 广播
@@ -23,6 +23,11 @@
 //! 沿用车间 `t_shelf_process` 表（已存在，零 schema 变更），按
 //! `target_process_id` 取 `LIMIT 1` 解析货架；多结果取 sort_order 最小者
 //! （`ORDER BY sort_order ASC, id ASC` 兜底）。
+//!
+//! 2026-10-02：`t_shelf_process` 的 SQL 真源已归 `prod::shelf_process::repo`
+//! （`ShelfProcessRepo::find_first_shelf_for_process`），本域 dispatch 路径改调该处；
+//! `preview_auto_dispatch` 因是 `LEFT JOIN LATERAL` 大复合查询**保留 inline**
+//! （见 `repo.rs` 同名函数 doc）。
 //!
 //! ## 事务 / WS 广播
 //! - 写端点（dispatch）：handler `state.pool.begin()` → service →

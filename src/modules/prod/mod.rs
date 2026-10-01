@@ -25,6 +25,16 @@
 //! `is_cnc` 工序 ③ 批次 `current_process_id` 指向 `is_cnc` 工序（migration 004
 //! 确立的唯一权威列）。part 域旧端点**保留兼容、一行未改**，仅追加弃用文档说明。
 //!
+//! 2026-10-02 新增 `prod::shelf_process` 子模块（货架 ↔ 工序映射 `t_shelf_process`，
+//! 3 端点，URL 挂 `/api/v2/prod/shelf-processes/*`）：原 `src/modules/shelf/
+//! process_mapping/` 整体搬入。域规约依据「货架自身包括账号部分和工序映射部分，
+//! 应拆分到 iam 域和 prod 域」——账号部分**消除**（`ShelfOut.account_count` 字段与
+//! `count_accounts_by_shelf` 一并删除，绑定真源本来就在 iam），工序映射**搬进 prod**
+//! （`t_shelf_process` 关联的是 prod 域实体 `t_process`）。旧路径
+//! `GET|POST /api/v2/shelves/{id}/processes` 与 `GET /api/v2/shelves/processes`
+//! 404（**无 alias**，沿 2026-09-19 prod 聚合先例），请求 / 响应契约逐字不变。
+//! 跨域依赖方向由 shelf→prod 翻转为 prod→shelf（只读 `ShelfRepo::get_by_id`）。
+//!
 //! part / assembly 是全仓库核心实体（生产只是其生命周期一段），不进 prod。
 //! 报工端点（worker-scan / pick-up / to-* / complete）留在 part 域；
 //! 文档层「生产全流程端点地图」在 `docs/api/production/index.md` 兜底串联。
@@ -41,6 +51,7 @@ pub mod batch;
 pub mod process;
 pub mod process_chain;
 pub mod programming;
+pub mod shelf_process;
 pub mod work_type;
 pub mod worker;
 pub mod worker_pool;
@@ -58,4 +69,6 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/batches", batch::router())
         // 2026-10-01 新增：prod::programming（待编程一览，part 状态闸门 + 三规则并集口径）
         .nest("/programming", programming::router())
+        // 2026-10-02 新增：prod::shelf_process（货架 ↔ 工序映射，3 端点，自 shelf 域硬切）
+        .nest("/shelf-processes", shelf_process::router())
 }
