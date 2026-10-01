@@ -210,7 +210,8 @@ impl WorkerPoolService {
                 .await?;
             // PR-B2：part 派生列（location/holder）由 sync_from_batch_change 统一
             // 回填（worker_id → worker holder，location → 'WORKER'）。
-            PartService::sync_from_batch_change_with_conn(&mut *conn, t.part_id, current).await?;
+            PartService::sync_from_batch_change_with_conn(&mut *conn, t.part_id, current, None)
+                .await?;
             taken.push(t);
         }
 
@@ -544,8 +545,13 @@ impl WorkerPoolService {
                         )
                     })?;
 
-                PartService::sync_from_batch_change_with_conn(&mut *conn, taken.part_id, current)
-                    .await?;
+                PartService::sync_from_batch_change_with_conn(
+                    &mut *conn,
+                    taken.part_id,
+                    current,
+                    None,
+                )
+                .await?;
 
                 // 写 part_event
                 let event_id = snowflake.next_id();
@@ -620,7 +626,8 @@ impl WorkerPoolService {
                     ));
                 }
 
-                PartService::sync_from_batch_change_with_conn(&mut *conn, part.id, current).await?;
+                PartService::sync_from_batch_change_with_conn(&mut *conn, part.id, current, None)
+                    .await?;
 
                 let event_id = snowflake.next_id();
                 let badge = src_worker_badge.as_deref().unwrap_or("");
@@ -739,7 +746,8 @@ impl WorkerPoolService {
                     ));
                 }
 
-                PartService::sync_from_batch_change_with_conn(&mut *conn, part.id, current).await?;
+                PartService::sync_from_batch_change_with_conn(&mut *conn, part.id, current, None)
+                    .await?;
 
                 let event_id = snowflake.next_id();
                 let badge = src_worker_badge.as_deref().unwrap_or("");
@@ -1062,7 +1070,7 @@ impl WorkerPoolService {
                             )
                             .await?;
                         PartService::sync_from_batch_change_with_conn(
-                            &mut *conn, t.part_id, current,
+                            &mut *conn, t.part_id, current, None,
                         )
                         .await?;
                         filled_count += 1;

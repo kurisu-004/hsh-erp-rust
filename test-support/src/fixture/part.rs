@@ -34,7 +34,7 @@ use sqlx::PgPool;
 ///
 /// **不预置 part / batch**：fixture 只放「不可变共享」基线（customer / process /
 /// shelf / user / role / 映射）。多数 part 域测试需要特定 status（READY_TO_SHIP /
-/// DELIVERED / REPAIRING / COMPLETED 等），状态机不允许从这些状态转回 PENDING；
+/// DELIVERED / COMPLETED 等），状态机不允许从这些状态转回 PENDING；
 /// 预置 PENDING/IN_PROCESS 行会让「期望空库」测试失败。各 sub-file 按需用
 /// `sqlx::query` 直插 part / batch（PR-C 末统一迁 test-support）。
 #[allow(dead_code)]

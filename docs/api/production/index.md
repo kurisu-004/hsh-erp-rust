@@ -207,7 +207,7 @@ part / assembly 是 ERP 核心实体（跨生产 + 编程 + 外协 + 质检 + �
   worker 持 `work_type` 决定可抢范围；详见 [`worker-pool.md`](./worker-pool.md)
 - **worker ↔ work_type**（N:1）：`t_worker.work_type_id` 决定该 worker 可抢的工种能力
 - **worker ↔ part_batch**（N:持有）：`t_part_batch.current_holder_id`（part 域；PR-2 后从 `t_part` 真相源迁出）
-- **worker.deactivate** 反查 `t_part_batch.current_holder_id = worker_id AND status IN (IN_PROCESS, INSPECTION, REPAIRING, RETURNED)` → 20203 拒
+- **worker.deactivate** 反查 `t_part_batch.current_holder_id = worker_id AND status IN (IN_PROCESS, INSPECTION, RETURNED)` → 20203 拒（**2026-10-01**：REPAIRING 已降级为 `is_repairing` 标记，返修批次 status 即 IN_PROCESS，守卫强度不变）
 
 ### menuCode 映射
 

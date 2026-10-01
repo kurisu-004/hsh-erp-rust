@@ -986,6 +986,23 @@ async fn state_machine_transitions() {
         "cancel 后 status 应为 CANCELLED"
     );
 
+    // 2026-10-01 review 第 1 轮 M3：cancel 必须顺带释放 `serial_no`。
+    //
+    // `uk_t_assembly_serial_no` 的谓词是 `deleted_at IS NULL AND serial_no IS
+    // NOT NULL`（**不含 status 条件**）→ 只翻状态的实现里，一个作废的装配件会
+    // 永久占着它的序列号，别的单再也用不了；migration 007 只清存量行，
+    // 新增量会继续漏。
+    let serial_after: Option<String> =
+        sqlx::query_scalar("SELECT serial_no FROM t_assembly WHERE id = $1")
+            .bind(asm_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read t_assembly.serial_no");
+    assert_eq!(
+        serial_after, None,
+        "cancel 后 t_assembly.serial_no 必须被清空（否则序列号被永久占用）"
+    );
+
     // CANCELLED → 再 cancel 应被拒（终态禁 cancel）
     let mut tx = pool.begin().await.unwrap();
     let err = AssemblyService::cancel_assembly(&mut tx, asm_id, &current)

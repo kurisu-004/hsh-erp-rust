@@ -130,8 +130,12 @@ Response 200 `data`：
 Response 200 `data`：结构同 `dashboard/home` 的 `part_counts`（`all` /
 `pending_production` / `in_production` / `pending_inspection` / `delivered`）。
 
-> `PROGRAMMING` / `OUTSOURCE` / `REPAIRING` / `COMPLETED` / `CANCELLED` 仅计入
+> `PROGRAMMING` / `OUTSOURCE` / `COMPLETED` / `CANCELLED` 仅计入
 > `all`，不单独 tab 化。
+>
+> **2026-10-01**：`REPAIRING` 从该列表移除（降级为 `t_part_batch.is_repairing`
+> 标记列）。返修中的工单 `status` 为 `IN_PROCESS`，**自动计入
+> `in_production`**。
 
 ---
 
@@ -143,7 +147,7 @@ Response 200 `data`：结构同 `dashboard/home` 的 `part_counts`（`all` /
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `status` | string? | 全部 | 精确过滤；`all` / 省略 = 不过滤；其它非法值 → 40001（HTTP 422） |
+| `status` | string? | 全部 | 精确过滤；`all` / 省略 = 不过滤；其它非法值 → 40001（HTTP 422）。**2026-10-01**：`REPAIRING` 已不在取值域内（降级为 `t_part_batch.is_repairing` 标记列）—— 返修中的工单按 `IN_PROCESS` 过滤 |
 | `customer_id` | string (i64)? | — | 按客户过滤 |
 | `page` | i64? | 1 | 页码（从 1 起） |
 | `size` | i64? | 10 | 每页条数，上限 50 |

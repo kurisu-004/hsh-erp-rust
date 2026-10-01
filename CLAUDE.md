@@ -154,6 +154,67 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 - 文档：`docs/api/shelves.md` / `docs/api/production/shelf-process-mapping.md` /
   `docs/api/production/index.md` / `docs/api/index.md` 已同步
 
+### 状态派生契约（2026-10-01）
+
+三层状态**单向**派生（子件 = `t_part` 中 `assembly_id` 非空的行）：
+
+```
+t_part_batch.status            ← 唯一真源
+   │  status_gate::rollup_part_derived（min-progress）
+   ▼
+t_part.status / next_process_id   ← 派生缓存
+   │  assembly::compute_assembly_target
+   ▼
+t_assembly.status               ← 派生缓存
+```
+
+- **写 `t_part_batch.status` 只能走 `src/modules/part/service/status_gate.rs`**
+  （`apply_batch_status_change` / `apply_bulk_batch_status_change_for_part`）。
+  它一函数内完成「写批次（OCC + SQL 层源状态白名单）→ 回填 part 派生列 →
+  级联 assembly → 终态序列号归档 / 释放」，所以 **caller 没有「要不要顺手调
+  sync」这个选项**（13 个历史 `mark_batch_*` 写点已改写为其上的薄包装）。
+  ⚠️ 手工补调 `PartService::sync_from_batch_change` 是**反模式**：第二次派生必为
+  `NoChange`，会把响应的 `synced_assembly_id` 吞成 `null`、连带 WS 的
+  `ASSEMBLY_UPDATED` 永不发。
+- **CI 强制**：`cargo test --lib` 的
+  `part::service::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
+  扫全 `src/**/*.rs`，除 `status_gate.rs` 外任何文件写
+  `UPDATE t_part_batch SET status …` 即失败（注释 / `#[cfg(test)]` 块 / 只改其它列
+  的 UPDATE 不在判定范围）。改动 `mark_batch_*` 后请顺手跑一次。
+- **派生层不得否决主操作**：派生写不抛错，`sync_assembly_status` 的 OCC 冲突降级为
+  「跳过 + `tracing::warn!`」。
+- **派生层不得覆盖主操作**（2026-10-01 review 第 1 轮 B1 补齐，两条都要守）：
+  - `PartRepo::update_part_rollup` 的 WHERE 带
+    `AND status NOT IN ('COMPLETED','CANCELLED')`。`POST /parts/{id}/cancel` 先把
+    part 打成 CANCELLED（主操作），随后的批次级联若按 min-progress 算出 COMPLETED
+    （「已完成批次 + 其余被批量取消」），**不许**写回去；
+  - bulk 入口传 `PartDerivation::KeepPartTerminalAsIs`：显式「跳过 part 写、继续派生
+    父装配件」，否则跳过 part 写的同时父件也会与子件长期不一致。
+  - 回归测试：`tests/part/lifecycle.rs::cancel_part_is_not_overwritten_by_rollup_completed`。
+  - 已知代价：**已终态**的 part 不再被 rollup / admin 对账改写（那需要一次人工决策）。
+- **`StatusChange` 的三态约定**：`Option` 的 `None` 一律是「保持原值」，「清 NULL」
+  由同名 `clear_location` / `clear_holder_id` / `clear_process_id` /
+  `clear_process_step_id` 显式表达。出池（召回 / 送检 / 外协收回 / 返修出池）
+  必须同时清 `location` + `current_holder_id` + `current_process_id` +
+  `current_process_step_id`，否则 UI 会显示「待投产的工单还压在生产架上」。
+- **终态序列号归档事件的 id 必须是真实雪花**（`StatusChange::event_id`，由 caller 从
+  `SnowflakeIdGenerator` 透传）：`GET /parts/{id}/events` 是 `ORDER BY id DESC`，
+  拿 `part_id` 之类的建单期 id 顶替会把归档事件排到时间线最底部，且二次进终态时
+  pkey 冲突 → 事务 500。
+- **兜底对账**：`POST /api/v2/admin/recompute-rollup`（Manager）复用上述 rollup
+  函数重跑并回报 before→after，**幂等**；新增派生算法时**不要**在对账端点重写一遍。
+  全量对账靠**分表游标**续扫（2026-10-01 review 第 2 轮 MAJOR-2：`t_part` 与
+  `t_assembly` 的 id 来自同一个雪花流、按时间序交错，共用一个游标会永久跳过
+  `(assembly_max, part_max]` 那段装配件）——把响应里非 null 的
+  `next_part_after_id` / `next_assembly_after_id` 回传为请求的 `part_after_id` /
+  `assembly_after_id`，直到 `truncated=false`。
+  ⚠️ 报告里 `parts_skipped_terminal > 0` 表示「该 part 已终态、派生被守卫跳过」，
+  **不是**「数据已一致」；这类行只能靠 force-complete / cancel 或业务流修
+  （见 `docs/api/admin.md`）。
+- 词汇：batch/part 8 态 + `is_repairing` 标记（`REPAIRING` 已于 2026-10-01 降级为
+  boolean 列，DB 不再产生该 status）；assembly 7 态（无 `OUTSOURCE`，子件
+  `OUTSOURCE` ⇒ 父 `IN_PROCESS`）。详见 [`docs/api/parts/index.md#状态派生契约2026-10-01`](docs/api/parts/index.md)。
+
 ## 必须遵守的架构约定
 
 1. **事务边界在 handler（2026-09-21 重构 + 2026-09-22 删 `PgIamRepo` 转发壳后 iam 与其余 20 个 handler 文件一致）**：handler 显式 `state.pool.begin()` / `tx.commit()`，错误路径 tx drop 隐式回滚。service 不知事务——所有跨 repo 操作经 `repo: R`（by-value；`IamRepo` / 域内对应 trait 已直接 `impl for &mut PgConnection`，handler/service 借 `&mut *tx` / `&mut *conn` 即可）参数传入。

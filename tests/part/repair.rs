@@ -1,10 +1,16 @@
 //! part 域 Phase 1（2026-09-13）返修闭环集成测试：1.4 端点。
 //!
 //! 覆盖：
-//!   - complete_repair: REPAIRING → IN_PROCESS（PRODUCTION 区）
-//!   - complete_repair: REPAIRING → INSPECTION（INSPECTION 区）
+//!   - complete_repair: 返修中 → IN_PROCESS（PRODUCTION 区）
+//!   - complete_repair: 返修中 → INSPECTION（INSPECTION 区）
+//!   - complete_repair: 非返修态 IN_PROCESS 批次被拒（20118，2026-10-01 新增）
 //!   - repair_dispatch: 一步式返修下发
 //!   - list_repair_batches / list_repairing_batches
+//!
+//! 2026-10-01 契约变更：REPAIRING 降级为 `t_part_batch.is_repairing` 标记列
+//! （migration 005/006）—— 「返修中」批次的形态是
+//! `status='IN_PROCESS' + is_repairing=true`，本文件所有「返修中」数据均由
+//! `insert_repairing_part_batch` 造出，不再有任何一列取到 `'REPAIRING'`。
 
 use axum::http::StatusCode;
 use serde_json::json;
@@ -69,12 +75,20 @@ async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: 
 //  动态 part/batch 插入 helper（sub-file 私有，PR-C 末统一迁）
 // ===========================================================================
 
-async fn insert_part_with_batch(
+/// 插入 part + 单批次（status 同步写到两列）。
+///
+/// 2026-10-01：新增 `is_repairing` 形参 —— REPAIRING 已从 `PartStatus` 降级为
+/// `t_part_batch.is_repairing` 标记列（migration 005/006），「返修中」的批次
+/// 形态是 `status='IN_PROCESS' + is_repairing=true`，**不再**有任何一列取到
+/// `'REPAIRING'`。`insert_part_with_batch` 保留为「非返修」快捷入口。
+#[allow(clippy::too_many_arguments)]
+async fn insert_part_with_batch_flagged(
     pool: &PgPool,
     name: &str,
     customer_id: i64,
     status: &str,
     qty: i32,
+    is_repairing: bool,
 ) -> (i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
@@ -99,19 +113,41 @@ async fn insert_part_with_batch(
     .await
     .expect("insert part");
     sqlx::query(
-        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
-         created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, $4, 0, $5, $5)",
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, is_repairing, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, $4, $5, 0, $6, $6)",
     )
     .bind(batch_id)
     .bind(part_id)
     .bind(qty)
     .bind(status)
+    .bind(is_repairing)
     .bind(now)
     .execute(pool)
     .await
     .expect("insert batch");
     (part_id, batch_id)
+}
+
+async fn insert_part_with_batch(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    status: &str,
+    qty: i32,
+) -> (i64, i64) {
+    insert_part_with_batch_flagged(pool, name, customer_id, status, qty, false).await
+}
+
+/// 插入「返修中」批次：`status='IN_PROCESS'` + `is_repairing=true`
+/// （2026-10-01 起的返修中唯一形态）。
+async fn insert_repairing_part_batch(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    qty: i32,
+) -> (i64, i64) {
+    insert_part_with_batch_flagged(pool, name, customer_id, "IN_PROCESS", qty, true).await
 }
 
 async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
@@ -137,7 +173,7 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, PartFixture) {
 #[tokio::test]
 async fn complete_repair_to_process_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "REPAIRING", 5).await;
+    let (pid, bid) = insert_repairing_part_batch(&pool, "P0", fx.customer_l2_id, 5).await;
     let version = batch_version(&pool, bid).await;
 
     // 2026-09-16 PR-3 批次 step 化：complete-repair / repair-dispatch
@@ -164,12 +200,24 @@ async fn complete_repair_to_process_happy_path() {
     .await;
     assert_eq!(s, StatusCode::OK, "complete-repair: {env}");
     assert_eq!(env["data"]["status"], "IN_PROCESS");
+    // 2026-10-01：返修完成必须清 `is_repairing` —— 否则「待返修列表」会把已经
+    // 落回生产架的批次继续列成待返修。
+    let is_repairing: bool =
+        sqlx::query_scalar("SELECT is_repairing FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .expect("read is_repairing");
+    assert!(
+        !is_repairing,
+        "complete-repair 完成后 is_repairing 应为 false"
+    );
 }
 
 #[tokio::test]
 async fn complete_repair_to_inspection_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "REPAIRING", 5).await;
+    let (pid, bid) = insert_repairing_part_batch(&pool, "P0", fx.customer_l2_id, 5).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
         "batch_id": bid.to_string(),
@@ -188,6 +236,17 @@ async fn complete_repair_to_inspection_happy_path() {
     .await;
     assert_eq!(s, StatusCode::OK, "complete-repair INSPECTION: {env}");
     assert_eq!(env["data"]["status"], "INSPECTION");
+    // 2026-10-01：送检区去向同样清标记（否则「待返修列表」会列出已送检批次）
+    let is_repairing: bool =
+        sqlx::query_scalar("SELECT is_repairing FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .expect("read is_repairing");
+    assert!(
+        !is_repairing,
+        "complete-repair（送检区）后 is_repairing 应为 false"
+    );
 }
 
 #[tokio::test]
@@ -216,6 +275,62 @@ async fn complete_repair_invalid_source_rejects() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "PENDING 起点不允许: {env}");
     assert_eq!(env["code"], 20118);
+}
+
+/// 2026-10-01 新增：非返修态的 IN_PROCESS 批次必须被 `complete-repair` 拒。
+///
+/// 这是本轮最重要的一条收口：REPAIRING 降级为 `is_repairing` 标记列后，
+/// 「返修中」与「正常生产中」的 `status` **完全相同**（都是 IN_PROCESS）。
+/// 若守卫只判 status（上一轮任务 #1 的过渡形态），任意在产批次都能调
+/// complete-repair 改位置 / 改工序 —— 等于绕开 start-repair / scan-inspect
+/// 两个起修入口任意搬运在产批次。守卫必须落到 `is_repairing` 列上。
+#[tokio::test]
+async fn complete_repair_non_repairing_in_process_rejects() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    // 正常在产批次：IN_PROCESS + is_repairing = false
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
+    let version = batch_version(&pool, bid).await;
+    let chain_id = create_chain_for_part(&pool, pid).await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    let body = json!({
+        "batch_id": bid.to_string(),
+        "version": version,
+        "shelf_id": fx.production_shelf_id.to_string(),
+        "next_process_id": fx.process_id.to_string(),
+    });
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/complete-repair"),
+            Some(body),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "非返修态 IN_PROCESS 批次不允许 complete-repair: {env}"
+    );
+    assert_eq!(
+        env["code"], 20118,
+        "错误码应为 BIZ_PART_REPAIR_NOT_TRIGGERED"
+    );
+    assert!(
+        env["message"].as_str().unwrap_or_default().contains("返修"),
+        "错误信息应说明「未处于返修中」: {env}"
+    );
+    // 批次必须原封不动（守卫发生在任何写之前）
+    let (status, is_repairing, location): (String, bool, Option<String>) =
+        sqlx::query_as("SELECT status, is_repairing, location FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .expect("read batch");
+    assert_eq!(status, "IN_PROCESS");
+    assert!(!is_repairing);
+    assert_eq!(location, None, "守卫失败时不得写 location");
 }
 
 #[tokio::test]
@@ -281,10 +396,15 @@ async fn list_repair_batches_happy_path() {
     let _ = (pid, fx); // suppress unused
 }
 
+/// 2026-10-01 契约变更：判据由 `status='REPAIRING'` 改为 `is_repairing = true`。
+/// 本测试因此**同时**断言正反两面 —— 返修中批次在列、非返修批次（DELIVERED）
+/// 不在列：只断言「返修批次在列」的话，判据退化成「不过滤」时也会通过。
 #[tokio::test]
 async fn list_repairing_batches_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (_pid, _bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "REPAIRING", 5).await;
+    let (_pid, bid) = insert_repairing_part_batch(&pool, "P0", fx.customer_l2_id, 5).await;
+    let (_pid2, delivered_bid) =
+        insert_part_with_batch(&pool, "P1", fx.customer_l2_id, "DELIVERED", 5).await;
     let (s, env) = send(
         app,
         json_request("GET", "/parts/repairing-batches", None, Some(&token)),
@@ -292,6 +412,19 @@ async fn list_repairing_batches_happy_path() {
     .await;
     assert_eq!(s, StatusCode::OK, "list-repairing-batches: {env}");
     assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().expect("data.items");
+    let ids: Vec<String> = items
+        .iter()
+        .map(|i| i["batch_id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        ids.contains(&bid.to_string()),
+        "返修中批次（is_repairing=true）应出现在列表: {env}"
+    );
+    assert!(
+        !ids.contains(&delivered_bid.to_string()),
+        "非返修批次（DELIVERED）不应出现在返修中列表: {env}"
+    );
 }
 
 // ===========================================================================
@@ -405,7 +538,7 @@ async fn insert_step_located_delivered_part_batch(
 /// `GET /parts/repair-batches`：`next_process_id` / `next_process_name` 必须由
 /// `current_process_step_id` → step JOIN 派生，**不直读** `current_process_id`。
 ///
-/// 若有人把 `list_batches_with_status` 改回直读 cpid，本测试必红
+/// 若有人把 `list_batches_matching` 改回直读 cpid，本测试必红
 /// （DELIVERED 必经 INSPECTION → cpid 恒 NULL → 两字段变 null）。
 #[tokio::test]
 async fn repair_batches_derives_next_process_from_step_not_cpid() {
@@ -474,11 +607,23 @@ async fn repair_batches_derives_next_process_from_step_not_cpid() {
     );
 }
 
-/// `GET /parts/repairing-batches` 走的是**同一条** SQL（`statuses = ['REPAIRING']`），
-/// 故也需 guard。与 DELIVERED 的差别在 cpid 语义：`mark_batch_repairing` 既不写
-/// 也不清该列（迁移 004「已知局限 4d」），真实 REPAIRING 批次带的是**进返修前
-/// 那道工序的陈旧值**。本测试显式造出「step 有值 + cpid 为陈旧非空值」的形态，
-/// 断言端点仍返回 step 派生的工序（而非那个陈旧值）—— 若改回直读必红。
+/// `GET /parts/repairing-batches` 走的是**同一条** SQL（2026-10-01 起判据是
+/// `is_repairing = true`），故同样不直读 `current_process_id`。
+///
+/// ## 2026-10-01：测试前提随语义变更重写
+///
+/// 原前提是「`mark_batch_repairing` 把批次翻出 IN_PROCESS 却不清 cpid
+/// ⇒ 返修批次带进返修前的陈旧 cpid」（迁移 004「已知局限 4d」）。REPAIRING
+/// 降级为 `is_repairing` 标记列后该写点**不再翻 status**（保持 IN_PROCESS、
+/// 不动 cpid），这个前提在生产数据里**已不可能出现**（返修批次要么停在送检架
+/// → 出池、cpid 按不变式为 NULL；要么留在原池 → cpid 是它**当前**池归属、
+/// 不是陈旧值）。
+///
+/// 因此本测试改为**故意造出不一致行**（cpid 指向另一道工序），断言端点**仍然**
+/// 返回 step 派生的工序 —— 它现在守的是「展示类列表一律走 step 派生」这条
+/// 统一分工（见 `part/batch/model.rs` 模块 doc 的读取方清单）：若有人把
+/// `next_process_id` 改回直读 cpid，本测试必红。数据形态的来源在注释里说明
+/// 为「迁移 006 之前的存量 / 人工订正」，而不是声称生产路径会产生它。
 #[tokio::test]
 async fn repairing_batches_derives_next_process_from_step_not_stale_cpid() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -492,7 +637,8 @@ async fn repairing_batches_derives_next_process_from_step_not_stale_cpid() {
     )
     .await;
 
-    // 改造成 REPAIRING，并写入一个**陈旧的 cpid**（模拟 4d：进返修不清该列）
+    // 改造成「返修中」形态（status=IN_PROCESS + is_repairing=true），并写入一个
+    // 与 step **不一致**的 cpid（模拟脏数据：迁移 006 之前的存量 / 人工订正）
     let stale_cpid = sqlx::query_scalar::<_, i64>(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
          version, created_at, updated_at) \
@@ -503,13 +649,14 @@ async fn repairing_batches_derives_next_process_from_step_not_stale_cpid() {
     .await
     .expect("insert stale process");
     sqlx::query(
-        "UPDATE t_part_batch SET status = 'REPAIRING', current_process_id = $2 WHERE id = $1",
+        "UPDATE t_part_batch SET status = 'IN_PROCESS', is_repairing = true, \
+         current_process_id = $2 WHERE id = $1",
     )
     .bind(batch_id)
     .bind(stale_cpid)
     .execute(&pool)
     .await
-    .expect("flip batch to REPAIRING with stale cpid");
+    .expect("flip batch to repairing with inconsistent cpid");
 
     let (s, env) = send(
         app,
@@ -532,16 +679,20 @@ async fn repairing_batches_derives_next_process_from_step_not_stale_cpid() {
         .unwrap_or_else(|| panic!("items 应含 batch_id={batch_id}: {env}"));
 
     assert_eq!(
+        hit["status"], "IN_PROCESS",
+        "返修中批次的 status 应为 IN_PROCESS（返修事实在 is_repairing 标记上）: {env}"
+    );
+    assert_eq!(
         hit["next_process_id"],
         process_id.to_string(),
-        "next_process_id 必须由 step JOIN 派生（{process_id}），而非 REPAIRING \
-         批次残留的陈旧 cpid（{stale_cpid}）。实际 {:?}",
+        "next_process_id 必须由 step JOIN 派生（{process_id}），而非与 step 不一致的 \
+         cpid（{stale_cpid}）。实际 {:?}",
         hit["next_process_id"]
     );
     assert_eq!(
         hit["next_process_name"].as_str(),
         Some(process_name.as_str()),
-        "next_process_name 应为 step 派生的 {process_name}，而非陈旧的「陈旧工序」: {env}"
+        "next_process_name 应为 step 派生的 {process_name}，而非「陈旧工序」: {env}"
     );
     let _ = part_id;
 }

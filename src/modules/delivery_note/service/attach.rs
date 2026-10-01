@@ -148,7 +148,13 @@ mod attach_batches_logic_tests {
 
     #[test]
     fn attachable_state_excludes_pending_programming_repairing_in_process() {
-        // B 组：送检候选，非 attach 候选
+        // B 组：送检候选，非 attach 候选。
+        //
+        // 2026-10-01：仍保留 `'REPAIRING'` 字面量断言，作为「A 组（可直接
+        // attach）绝不因遗留脏值而放行」的回归护栏 —— REPAIRING 已降级为
+        // `is_repairing` 标记、DB 不再产生该 status，但 A 组判定是纯字符串
+        // 白名单，存量行（migration 006 未 apply 的环境）仍可能带这个值。
+        // 返修批次真正的 B/C 组归类见 `scan::classify` 及其单测。
         for s in ["PENDING", "PROGRAMMING", "REPAIRING", "IN_PROCESS"] {
             assert!(!is_attachable_state(s), "{s} should NOT be attachable");
         }

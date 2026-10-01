@@ -36,12 +36,16 @@ impl AssemblyService {
     /// 2. 父已是 COMPLETED/CANCELLED → NoChange（Python 短路 L92）
     /// 3. 拉子件 status → `compute_assembly_target` → Some(target)
     /// 4. 取父当前 version + status；target == 当前 → NoChange
-    /// 5. `update_status_if_not_terminal`；0 行 → VERSION_CONFLICT（事务回滚）
+    /// 5. `update_status_if_not_terminal`；0 行 → **降级为 `NoChange`**（不抛错、
+    ///    不回滚，2026-10-01，见下方「派生层冲突降级」段）
     /// 6. 返回 `Changed(assembly_id)`
     ///
     /// 2026-09-22 D-3 决策：方法签名为 `(&self, repo: R, part_id, current)`；
     /// service 不再持 `&mut PgConnection`，所有 SQL 经 `repo` 调用。`SyncOutcome::Changed(assembly_id)`
     /// 由 handler 据此发 WS 广播。
+    ///
+    /// 2026-10-01：本函数只把 `current.id` 往下传（见 `sync_assembly_status` 签名），
+    /// 形参保留 `&CurrentUser` 是为了不打穿 20+ 个调用点。
     pub async fn sync_from_part_change_inner<R: AssemblyRepoTrait>(
         &self,
         mut repo: R,
@@ -53,7 +57,27 @@ impl AssemblyService {
         let Some(Some(assembly_id)) = row else {
             return Ok(SyncOutcome::NoChange);
         };
-        sync_assembly_status(&mut repo, assembly_id, current).await
+        sync_assembly_status(&mut repo, assembly_id, current.id).await
+    }
+
+    /// 2026-10-01 新增：只收 `updated_by` 的反向同步入口（无登录用户上下文）。
+    ///
+    /// 存在的理由：新的 batch → part → assembly 单一写入口
+    /// （`part::service::status_gate`）在整条派生链路上只有 `updated_by`（一个 i64），
+    /// 没有完整的 `CurrentUser`。本函数把 `sync_assembly_status` 直接暴露出来，
+    /// 而**不是**在 status_gate 里伪造一个 `CurrentUser`（伪造身份迟早会被
+    /// 下游的 `username` / `roles` 依赖带出真实 bug）。
+    pub async fn sync_from_part_change_by_id_inner<R: AssemblyRepoTrait>(
+        &self,
+        mut repo: R,
+        part_id: i64,
+        updated_by: i64,
+    ) -> Result<SyncOutcome, AppError> {
+        let row = repo.fetch_part_assembly_id(part_id).await?;
+        let Some(Some(assembly_id)) = row else {
+            return Ok(SyncOutcome::NoChange);
+        };
+        sync_assembly_status(&mut repo, assembly_id, updated_by).await
     }
 
     /// 批量版本：传入本次批量成功的 part_id 列表；
@@ -73,7 +97,7 @@ impl AssemblyService {
             .map_err(AppError::from)?;
         let mut out = Vec::with_capacity(assembly_ids.len());
         for aid in assembly_ids {
-            out.push(sync_assembly_status(&mut repo, aid, current).await?);
+            out.push(sync_assembly_status(&mut repo, aid, current.id).await?);
         }
         Ok(out)
     }
@@ -83,10 +107,13 @@ impl AssemblyService {
 ///
 /// 2026-09-22 D-3 决策：保持 module-private 自由函数（不挂在 `impl AssemblyService`），避免
 /// 跨 impl 块调用路径复杂化；签名与 `crud.rs::fetch_current_batch_ids` 同形。
+///
+/// 2026-10-01：第三个形参由 `current: &CurrentUser` 收窄为 `updated_by: i64`
+/// —— 本函数只把它写进 `t_assembly.updated_by`，用不上 username / roles。
 async fn sync_assembly_status<R: AssemblyRepoTrait>(
     repo: &mut R,
     assembly_id: i64,
-    current: &CurrentUser,
+    updated_by: i64,
 ) -> Result<SyncOutcome, AppError> {
     // 父存在性 + 终态短路
     let asm = repo
@@ -128,17 +155,36 @@ async fn sync_assembly_status<R: AssemblyRepoTrait>(
 
     // OCC 翻转
     let affected = repo
-        .update_status_if_not_terminal(assembly_id, asm.version, target.as_str(), current.id)
+        .update_status_if_not_terminal(assembly_id, asm.version, target.as_str(), updated_by)
         .await
         .map_err(AppError::from)?;
+
+    // ==========================================================================
+    // 2026-10-01 派生层冲突降级（本函数最关键的一处行为修正）
+    // ==========================================================================
+    // 改造前：`affected == 0` 直接 `Err(VERSION_CONFLICT)`。该错误会沿
+    // `PartService::sync_from_batch_change` 一路上抛到 handler，把**整个事务**
+    // 回滚 —— 包括用户真正请求的那次批次状态变更。于是出现一个语义上完全
+    // 倒挂的故障：用户点了「送检 / 完成」，却被一个**派生缓存**（父装配件
+    // 的 `t_assembly.status`）的并发写否决，主操作什么都没发生，还收到一个
+    // 指向完全无关实体的 409。
+    //
+    // 判据：**派生层不允许否决主操作**。`t_assembly.status` 是缓存，缓存写失败
+    // 最多导致它短暂偏旧（下次任意 part 状态变化时由 `sync_assembly_status`
+    // 自动追平），代价远小于「用户的主操作被回滚」。故此处降级为
+    // `Ok(SyncOutcome::NoChange)` + `tracing::warn!`（留下可观测痕迹），
+    // 绝不返回 Err。
+    //
+    // 同理，`t_part.status`（`status_gate` step 2）本来就是**不走 OCC 的派生写**，
+    // 冲突由行锁串行化而非报错 —— 两层派生的冲突策略现在是一致的。
     if affected == 0 {
-        return Err(AppError::biz(
-            code::VERSION_CONFLICT,
-            format!(
-                "assembly {assembly_id} version {} 已变化或已终态",
-                asm.version
-            ),
-        ));
+        tracing::warn!(
+            assembly_id,
+            version = asm.version,
+            target = target.as_str(),
+            "assembly 派生写降级：version 已变化或已终态，跳过本次派生（不回滚主操作）"
+        );
+        return Ok(SyncOutcome::NoChange);
     }
     Ok(SyncOutcome::Changed(assembly_id))
 }
@@ -161,6 +207,20 @@ pub async fn sync_from_part_change(
         .await
 }
 
+/// 2026-10-01 新增：只收 `updated_by` 的 ZST 静态入口（part::service::status_gate 用）。
+///
+/// 见 `AssemblyService::sync_from_part_change_by_id_inner` 的 rationale。
+pub async fn sync_from_part_change_by_id(
+    self_svc: &AssemblyService,
+    conn: &mut sqlx::PgConnection,
+    part_id: i64,
+    updated_by: i64,
+) -> Result<SyncOutcome, AppError> {
+    self_svc
+        .sync_from_part_change_by_id_inner::<&mut sqlx::PgConnection>(conn, part_id, updated_by)
+        .await
+}
+
 /// 兼容旧 ZST 静态调用（`AssemblyService::sync_from_part_changes(&mut tx, ...)`）。
 ///
 /// 详见 [`AssemblyService::sync_from_part_changes`]（impl 块定义）。
@@ -172,4 +232,24 @@ pub(crate) async fn sync_from_part_changes_dispatch(
     AssemblyService
         .sync_from_part_changes_inner::<&mut sqlx::PgConnection>(conn, part_ids, current)
         .await
+}
+
+/// 2026-10-01 新增：按 `assembly_id` 直接重算一次聚合状态（admin 对账逃生口用）。
+///
+/// 暴露本模块私有 [`sync_assembly_status`] 的唯一理由是
+/// `POST /api/v2/admin/recompute-rollup` 需要「**从装配件出发**」跑一次聚合 ——
+/// 正常业务流永远是从 part 出发的（`sync_from_part_change*`），而对账场景要修的
+/// 恰恰是「part 侧派生已正确、但父装配件没跟上」这种反向漂移。
+///
+/// 仍然走同一段聚合实现（`compute_assembly_target` + OCC + 终态守卫），因此
+/// 对账端点与业务流**不可能**算出两个结果。
+pub async fn recompute_assembly_status_by_id(
+    conn: &mut sqlx::PgConnection,
+    assembly_id: i64,
+    updated_by: i64,
+) -> Result<SyncOutcome, AppError> {
+    // `sync_assembly_status` 收 `&mut R`（trait 注入式），生产路径的 R 是
+    // `&mut PgConnection`；这里借用一次以凑出那个 `&mut R` 借位。
+    let mut repo: &mut sqlx::PgConnection = conn;
+    sync_assembly_status::<&mut sqlx::PgConnection>(&mut repo, assembly_id, updated_by).await
 }

@@ -418,11 +418,18 @@ impl DeliveryNoteService {
                 b.version - 1,      // expected_version 是之前的
                 b.delivery_note_id, // 保留 delivery_note_id（PICKED_UP/ARCHIVED 后仍可打印）
                 Some("DELIVERED"),
-                now,
                 Some(current.id),
             )
             .await?;
             if affected == 0 {
+                // TODO(2026-10-01 review 第 2 轮 MINOR-5，follow-up PR)：本分支
+                // 是**死代码**。`PartBatchRepo::update` 在 `status = Some(..)` 时恒
+                // `return Ok(1)`（0 行已由 `status_gate::apply_batch_status_change`
+                // 转成 `VERSION_CONFLICT` 抛出），而本处必然传 `Some("DELIVERED")`。
+                // 保留它无害（将来 `update` 改回「可能 0 行」时它又是对的），但
+                // 读代码的人会误以为这里还能拦下并发。修法二选一：删掉本分支，或
+                // 把 `update` 的 `Ok(1)` 改成真实的 `rows_affected()` 并在此处
+                // 重新变成活代码（后者更符合函数名语义）。
                 return Err(AppError::biz(
                     code::VERSION_CONFLICT,
                     "concurrent modification detected",
@@ -437,8 +444,15 @@ impl DeliveryNoteService {
         let mut seen = std::collections::HashSet::new();
         for pid in affected_part_ids {
             if seen.insert(pid) {
-                PartService::sync_from_batch_change_with_conn(&mut *repo.conn_mut(), pid, current)
-                    .await?;
+                // `event_id=None`（M4）：pickup 把批次推到 DELIVERED（非终态），
+                // min-progress 推不出 part 终态，归档事件分支不可达。
+                PartService::sync_from_batch_change_with_conn(
+                    &mut *repo.conn_mut(),
+                    pid,
+                    current,
+                    None,
+                )
+                .await?;
             }
         }
 

@@ -72,10 +72,18 @@
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
+use crate::modules::part::service::status_gate;
+use crate::shared::error::AppError;
+
 pub mod batch;
 pub mod event;
 pub mod part;
 pub mod sql;
+// 2026-10-01 review 第 1 轮 M8：`status_gate` 已从 `repo/` 移到
+// `src/modules/part/service/status_gate.rs` —— 它承载的是「写批次 + 派生
+// part/assembly + 终态序列号释放」这套**业务策略**（终态判定、归档/释放、
+// 跨域调用 `AssemblyService`），按 CLAUDE.md 六件套分层属 service 层职责；
+// repo 层只留纯 SQL。
 
 // 重导出 sql.rs 中的 ZST struct / builder / row 与 model 表行类型，让上层继续用
 // `super::repo::{TPart, TPartInspected, TPartEvent, NewPartEvent, PartUpdate, PartListFilters,
@@ -254,19 +262,31 @@ pub trait PartRepoTrait: Send {
     ) -> Result<Option<crate::modules::part::batch::model::TPartBatch>, sqlx::Error>;
 
     // ── t_part_batch mark_*（6）──
+    //
+    // 2026-10-01：除 `mark_batch_returned`（不改 status）外，全部
+    // `t_part_batch.status` 写点已收口到 `service::status_gate`。
+    // 返回类型由 `sqlx::Error` 改 `AppError`：status_gate 的契约是
+    // 「没写成 = `VERSION_CONFLICT`」，转 `sqlx::Error` 会把 409 降级成 500。
+    //
+    // 2026-10-01 追加：下面 3 个方法返回 `status_gate::RollupOutcome` 而非
+    // `u64`。status_gate 在同一个函数里已经做完 part 派生 + assembly 反向
+    // 同步，而这三个方法的调用点要拿 `SyncOutcome` 填响应里的
+    // `synced_assembly_id`（并据此发 `ASSEMBLY_UPDATED` 广播）。若让 service
+    // 再补调一次 `PartService::sync_from_batch_change`，第二次派生必然
+    // `NoChange`，那个字段就会被**恒为 null** 吞掉（2026-10-01 修掉的真实回归）。
     async fn mark_batch_passed_inspection(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<status_gate::RollupOutcome, AppError>;
     async fn mark_batch_inspected(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<status_gate::RollupOutcome, AppError>;
     async fn mark_batch_failed_inspection(
         &mut self,
         batch_id: i64,
@@ -275,7 +295,7 @@ pub trait PartRepoTrait: Send {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<status_gate::RollupOutcome, AppError>;
     async fn mark_batch_returned(
         &mut self,
         batch_id: i64,
@@ -292,19 +312,26 @@ pub trait PartRepoTrait: Send {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
+    /// `event_id`（2026-10-01 review 第 1 轮 M4）：本方法能让 part 新进
+    /// COMPLETED（最后一条批次完成时），故 caller 必须传真实雪花 id 供终态序列号
+    /// 归档事件（`SERIAL_RELEASED`）使用。
     async fn mark_batch_completed(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+        event_id: Option<i64>,
+    ) -> Result<u64, AppError>;
+    /// `event_id`：同 [`Self::mark_batch_completed`]（本方法能让 part 新进
+    /// CANCELLED）。
     async fn mark_batch_cancelled(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+        event_id: Option<i64>,
+    ) -> Result<u64, AppError>;
     async fn mark_part_cancelled(
         &mut self,
         part_id: i64,
@@ -316,19 +343,23 @@ pub trait PartRepoTrait: Send {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     async fn cancel_all_active_batches_for_part(
         &mut self,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+    ) -> Result<u64, AppError>;
     // 2026-09-30 新增：force-complete 端点 — 单 SQL 强推 part 下所有非
     // CANCELLED 活跃批次到 COMPLETED（绕状态机 + 不走 OCC）。
+    //
+    // `event_id`（2026-10-01 review 第 1 轮 M4）：本方法**必定**让 part 派生进
+    // COMPLETED，故 caller 必须传真实雪花 id 供终态序列号归档事件使用。
     async fn force_complete_all_batches_for_part(
         &mut self,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error>;
+        event_id: Option<i64>,
+    ) -> Result<u64, AppError>;
 
     // ── t_part_batch split（1）──
     #[allow(clippy::too_many_arguments)]
@@ -643,7 +674,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<status_gate::RollupOutcome, AppError> {
         PartRepo::mark_batch_passed_inspection(
             &mut **self,
             batch_id,
@@ -659,7 +690,7 @@ impl PartRepoTrait for &mut PgConnection {
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<status_gate::RollupOutcome, AppError> {
         PartRepo::mark_batch_inspected(
             &mut **self,
             batch_id,
@@ -678,7 +709,7 @@ impl PartRepoTrait for &mut PgConnection {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<status_gate::RollupOutcome, AppError> {
         PartRepo::mark_batch_failed_inspection(
             &mut **self,
             batch_id,
@@ -718,7 +749,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::mark_batch_delivered(&mut **self, batch_id, expected_version, current_user_id)
             .await
     }
@@ -728,9 +759,16 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        PartRepo::mark_batch_completed(&mut **self, batch_id, expected_version, current_user_id)
-            .await
+        event_id: Option<i64>,
+    ) -> Result<u64, AppError> {
+        PartRepo::mark_batch_completed(
+            &mut **self,
+            batch_id,
+            expected_version,
+            current_user_id,
+            event_id,
+        )
+        .await
     }
 
     async fn mark_batch_cancelled(
@@ -738,9 +776,16 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        PartRepo::mark_batch_cancelled(&mut **self, batch_id, expected_version, current_user_id)
-            .await
+        event_id: Option<i64>,
+    ) -> Result<u64, AppError> {
+        PartRepo::mark_batch_cancelled(
+            &mut **self,
+            batch_id,
+            expected_version,
+            current_user_id,
+            event_id,
+        )
+        .await
     }
 
     async fn mark_part_cancelled(
@@ -757,7 +802,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::mark_batch_repairing(&mut **self, batch_id, expected_version, current_user_id)
             .await
     }
@@ -766,7 +811,7 @@ impl PartRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
+    ) -> Result<u64, AppError> {
         PartRepo::cancel_all_active_batches_for_part(&mut **self, part_id, current_user_id).await
     }
 
@@ -775,8 +820,15 @@ impl PartRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        PartRepo::force_complete_all_batches_for_part(&mut **self, part_id, current_user_id).await
+        event_id: Option<i64>,
+    ) -> Result<u64, AppError> {
+        PartRepo::force_complete_all_batches_for_part(
+            &mut **self,
+            part_id,
+            current_user_id,
+            event_id,
+        )
+        .await
     }
 
     // ── t_part_batch split（1）──

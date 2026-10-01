@@ -796,6 +796,22 @@ impl AssemblyService {
                 "终态禁 cancel 或已删除",
             ));
         }
+        // 2026-10-01 review 第 1 轮 M3：cancel 后**必须**清 `serial_no`。
+        //
+        // `uk_t_assembly_serial_no` 的谓词是 `deleted_at IS NULL AND serial_no IS
+        // NOT NULL`，**不含 status 条件** —— 只写 `status='CANCELLED'` 的话，一个
+        // 作废的装配件会**永久占着**它的序列号，别的单再也用不了。migration 007
+        // 只会清掉存量行，新增量继续漏，故这里是唯一正确的收口点。
+        //
+        // 为什么不并进 `AssemblyRepo::cancel` 的同一条 UPDATE：那条 SQL 的
+        // `status NOT IN (...)` 守卫与本方法的 `affected == 0 → BIZ_INVALID_
+        // TRANSITION` 语义绑定，加 `serial_no = NULL` 会让它在「已终态但序列号
+        // 未清」的存量行上命中并把 version 再加 1（用户视角是「重复点了一次
+        // cancel 却成功了」）。拆成两步后第 2 步自带 `status IN ('COMPLETED',
+        // 'CANCELLED') AND serial_no IS NOT NULL` 谓词，天然幂等。
+        repo.clear_serial_no_if_terminal(assembly_id, current.id)
+            .await
+            .map_err(AppError::from)?;
         let asm = repo
             .get_by_id(assembly_id, false)
             .await

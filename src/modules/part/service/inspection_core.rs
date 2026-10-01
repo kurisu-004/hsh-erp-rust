@@ -103,15 +103,17 @@ impl PartService {
             Self::_split_for_partial_op(repo, snowflake, &target, quantity, current).await?;
 
         // 5. UPDATE t_part_batch: INSPECTION → READY_TO_SHIP（OCC + 写 updated_by）
-        let n = repo
+        //
+        // 2026-10-01：写与派生已焊在 `status_gate` 一个函数里（见
+        // `service/status_gate.rs`，NIT-1 订正：注释原写成 `repo/status_gate.rs`，
+        // 该文件在 REPAIRING 标记列化那轮已从 `part/repo/` 移到 `part/service/`），
+        // 故这里拿到的 `rollup` **就是** batch → part →
+        // assembly 的最终结果：0 行由 gate 直接抛 40901 `VERSION_CONFLICT`
+        // （原先 `if n == 0` 那层判断已是死代码 —— 包装函数恒返回 1）；
+        // `rollup.sync` 供下方第 7 步填 `synced_assembly_id`。
+        let rollup = repo
             .mark_batch_passed_inspection(operated_id, operated_version, Some(current.id))
             .await?;
-        if n == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("batch {operated_id} 版本冲突"),
-            ));
-        }
 
         // 6. 写 t_part_event 事件日志（无条件）
         let event_id = snowflake.next_id();
@@ -130,11 +132,14 @@ impl PartService {
         })
         .await?;
 
-        // 7. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
-        //    内部走 min-progress 规则（多条 INSPECTION 批次时 part 维持
-        //    INSPECTION，单条时升 READY_TO_SHIP）；status 变化时级联调
-        //    AssemblyService::sync_from_part_change 闭合链路。
-        let synced = PartService::sync_from_batch_change(repo, part_id, current).await?;
+        // 7. batch → part → assembly rollup：**已在第 5 步的 status_gate 内完成**
+        //    （min-progress 规则：多条 INSPECTION 批次时 part 维持 INSPECTION，
+        //    单条时升 READY_TO_SHIP；part.status 真变了才级联
+        //    `AssemblyService::sync_from_part_change`）。
+        //    2026-10-01：此处**不再**补调 `PartService::sync_from_batch_change`
+        //    —— 那会跑第二次派生、必然 `NoChange`，把 `synced_assembly_id`
+        //    恒吞成 null（连带 WS 的 `ASSEMBLY_UPDATED` 永不发）。
+        let synced = rollup.sync;
         let synced_assembly_id = match synced {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
@@ -168,6 +173,8 @@ impl PartService {
     /// - 20104 `BIZ_INVALID_VALUE` —— shelf 不在 PRODUCTION 区 / 缺 shelf_id
     /// - 20109 `BIZ_PART_BATCH_NOT_FOUND`
     /// - 20111 `BIZ_PART_BATCH_INVALID_QUANTITY`
+    /// - 20118 `BIZ_PART_REPAIR_NOT_TRIGGERED` —— 目标批次**处于返修中**
+    ///   （`is_repairing = true`），应改用 `complete-repair`（step 4.6 的守卫）
     /// - 20501 `BIZ_SHELF_NOT_FOUND`
     /// - 20512 `BIZ_SHELF_INACTIVE`
     /// - 40901 `VERSION_CONFLICT`
@@ -228,6 +235,52 @@ impl PartService {
         };
         // 4.5 caller 侧乐观锁：锚定 batch 而非 part
         Self::_assert_batch_version(&target, expected_batch_version)?;
+        // 4.6 返修守卫（2026-10-01 review 第 2 轮 MAJOR-3）
+        //
+        // **为什么 to-process 不能碰返修中的批次**：`is_repairing = true` 的批次
+        // 走的是**返修闭环**（`scan-inspect(pass=false)` / `start-repair` 起修 →
+        // `complete-repair` 落回生产架 / 送检架并清标记，见
+        // `phase1::scan` 与 `phase1::repair`），它与本端点表达的是**两件不同的
+        // 事**：
+        // - to-process = 「检验不合格，回**正常生产流**继续做」；
+        // - complete-repair = 「返修完成 / 到位」，是**唯一**被授权清 `is_repairing`
+        //   的动作（`mark_batch_with_status_and_meta` 的 `is_repairing: Some(false)`
+        //   漏斗，见 `phase1/mod.rs` 的「本漏斗 = 批次离开返修态的清零点」）。
+        //
+        // 若放行，`mark_batch_failed_inspection`（`is_repairing: None` = 保持）会把
+        // 批次落到生产架却仍挂着 `is_repairing = true`：它在
+        // `GET /parts/repairing-batches` 里**长期显示「返修中」**（实际是普通在制品），
+        // `complete-repair` 还会继续接受它 → 用户可把在制品当「完成返修」搬走。
+        // 这是**标记列化新引入**的洞：改造前返修批次 `status='REPAIRING'`，而
+        // `allowed_from = ["INSPECTION"]` 根本不让它进入本端点。
+        //
+        // 可达链（2026-10-01 复核，reviewer 给的 scan-inspect 链**不成立**）：
+        // `scan-inspect(pass=false)` 的第二步把批次写成 `status='IN_PROCESS'` +
+        // `is_repairing=true`（`phase1/scan.rs` 的 else 分支），而本端点的
+        // `find_inspection_batch_for_fail` 只捞 `status='INSPECTION'`，故它捞不到；
+        // 真正的可达链是「起修后送检」：
+        // `start-repair`（`status=IN_PROCESS` + `is_repairing=true`，loc 可为
+        // PRODUCTION_SHELF）→ `POST /parts/{id}/to-inspection`
+        // （`mark_batch_inspected` 的 `is_repairing: None` = **保持**）→ 批次变
+        // `INSPECTION` + `is_repairing=true` → 本端点捞得到它。
+        // （worker-scan INSPECTED 同样只保持标记，是第二条同类入口。）
+        //
+        // 为什么不改成「清标记放行」：业务上 `to-process` 在这条链上的含义恰恰是
+        // 「返修件的返修后重投」——检验不合格说明**返修没通过**，货还需要继续返修，
+        // 清掉标记等于把「还没修好」静默改写成「正常在制品」。正确动作是让用户
+        // 改调 `complete-repair`（它做的是同一件事：落生产架 + 写目标工序 +
+        // 清标记），错误码沿用 20118（与「重复起修」同族的「返修流转前置条件
+        // 不满足」），文案写明改调哪个端点。
+        if target.is_repairing {
+            return Err(AppError::biz(
+                code::BIZ_PART_REPAIR_NOT_TRIGGERED,
+                format!(
+                    "to-process: batch {} 处于返修中（is_repairing = true），\
+                     请改用 complete-repair 落回生产架（它同时清返修标记）",
+                    target.id
+                ),
+            ));
+        }
         // 5. 部分通过拆批
         let (operated_id, operated_version, new_batch_id_out) =
             Self::_split_for_partial_op(repo, snowflake, &target, quantity, current).await?;
@@ -271,7 +324,10 @@ impl PartService {
                 ),
             )
         })?;
-        let n = repo
+        // 2026-10-01：写与派生已焊在 status_gate 内（0 行由 gate 抛 40901，
+        // 原 `if n == 0` 是死代码）；`rollup.sync` 供第 8 步填
+        // `synced_assembly_id`。
+        let rollup = repo
             .mark_batch_failed_inspection(
                 operated_id,
                 operated_version,
@@ -282,12 +338,6 @@ impl PartService {
                 Some(current.id),
             )
             .await?;
-        if n == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("batch {operated_id} 版本冲突"),
-            ));
-        }
         // 7. 写事件日志
         let event_id = snowflake.next_id();
         repo.insert_part_event(NewPartEvent {
@@ -304,11 +354,11 @@ impl PartService {
             created_by: Some(current.id),
         })
         .await?;
-        // 8. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
-        //    内部走 min-progress 规则；status 变化时级联调
-        //    AssemblyService::sync_from_part_change 闭合链路。
-        let synced = PartService::sync_from_batch_change(repo, part_id, current).await?;
-        let synced_assembly_id = match synced {
+        // 8. batch → part → assembly rollup：**已在上面那次
+        //    `mark_batch_failed_inspection`（status_gate）内完成**，不再补调
+        //    `PartService::sync_from_batch_change`（2026-10-01：第二次派生必然
+        //    `NoChange`，会把 `synced_assembly_id` 恒吞成 null）。
+        let synced_assembly_id = match rollup.sync {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
         };
@@ -436,10 +486,12 @@ impl PartService {
         // 7. UPDATE t_part_batch: {PENDING, PROGRAMMING, IN_PROCESS} → INSPECTION
         //
         // 隐式多批次 rollup：前置状态守卫（step 3）已限定 from ∈ {PENDING, PROGRAMMING,
-        // IN_PROCESS}，该状态下不可能存在 INSPECTION 批次，翻转 `t_part.status` 安全；
-        // 翻 batch 后调 `PartService::sync_from_batch_change`（下方 step 8）按
-        // min-progress 规则回填 part 派生列。
-        let n = repo
+        // IN_PROCESS}，该状态下不可能存在 INSPECTION 批次，翻转 `t_part.status` 安全。
+        //
+        // 2026-10-01：min-progress 回填与 assembly 级联**已收进** status_gate
+        // 一函数内（下方 step 8 直接取 `rollup.sync`，不再二次派生）；
+        // 0 行由 gate 抛 40901 `VERSION_CONFLICT`，原 `if n == 0` 是死代码。
+        let rollup = repo
             .mark_batch_inspected(
                 operated_id,
                 operated_version,
@@ -447,17 +499,8 @@ impl PartService {
                 Some(current.id),
             )
             .await?;
-        if n == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("batch {operated_id} 版本冲突"),
-            ));
-        }
-        // 8. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
-        //    内部走 min-progress 规则；status 变化时级联调
-        //    AssemblyService::sync_from_part_change 闭合链路。
-        let synced = PartService::sync_from_batch_change(repo, part_id, current).await?;
-        let synced_assembly_id = match synced {
+        // 8. batch → part → assembly rollup 结果：已在 step 7 的 status_gate 内完成
+        let synced_assembly_id = match rollup.sync {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
         };

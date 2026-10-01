@@ -19,7 +19,9 @@
 #   菜单 seed 抽到 seeds/。当时的 SKIP_RE（015/018/021/023/024）随之失效：
 #   015 DML 在 baseline 中是 CREATE SEQUENCE + 空 INSERT（no-op），其它全在
 #   baseline；菜单种子走 seeds/。**注意：baseline 早已不是唯一文件** —— 之后按
-#   append-only 又追加了 4 个迁移（见下方 2026-09-30 修复）。
+#   append-only 又追加了 7 个迁移（2026-09-29 wx identity / is_cnc / gcode index /
+#   2026-09-30 batch current_process_id，以及 2026-10-01 的 is_repairing /
+#   REPAIRING→IN_PROCESS / 序列号释放；见下方 2026-09-30 修复）。
 #
 # 2026-09-30 修复：template 库迁移从「断言 migrations/ 有且仅有 1 个 .sql」改成
 #   「按字典序逐个 apply」。原断言自第 2 个迁移文件（2026-09-29 wx identity）加入

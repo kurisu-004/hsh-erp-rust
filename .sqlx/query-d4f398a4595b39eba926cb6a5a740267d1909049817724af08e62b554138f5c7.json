@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE t_part\n            SET status          = $2,\n                next_process_id = $3,\n                version         = version + 1,\n                updated_at      = now(),\n                updated_by      = $4\n            WHERE id = $1 AND deleted_at IS NULL\n              AND status NOT IN ('COMPLETED', 'CANCELLED')\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d4f398a4595b39eba926cb6a5a740267d1909049817724af08e62b554138f5c7"
+}

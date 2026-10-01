@@ -13,6 +13,7 @@
 //! - to_process.rs         ← 原 part_api_to_process.rs
 //! - inspection_batches.rs ← 原 part_api_inspection_batches.rs
 //! - serial.rs             ← 原 serial_api.rs
+//! - rollup_recompute.rs   ← 2026-10-01 新增：admin 对账端点（POST /admin/recompute-rollup）定点修正 + 幂等断言
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
@@ -26,6 +27,7 @@ mod inspection_batches;
 mod lifecycle;
 mod list_enrichment;
 mod repair;
+mod rollup_recompute;
 mod serial;
 mod to_inspection;
 mod to_process;

@@ -95,8 +95,10 @@ impl PartService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
-        // rollup
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
+        // 2026-10-01 review 第 1 轮 m4：原此处有一行
+        // `let _ = Self::sync_from_batch_change(...)`。status_gate 收口后它是
+        // 无害空跑（派生已在 `mark_batch_with_status_and_meta` 内做完），且会让
+        // 下一个读代码的人以为「调它」是必须的 —— 已删。
         // 事件日志
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
@@ -165,7 +167,6 @@ impl PartService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
             part_id,
@@ -278,7 +279,8 @@ impl PartService {
             // 本冲突处**不采纳**该改法，理由与 2026-09-30 review 第 3 轮 M3 对
             // `GET /parts/inspection-batches` 的回退完全同形：
             //   - 本查询 WHERE **无 status 过滤**，会同时返回 PENDING / IN_PROCESS /
-            //     INSPECTION / REPAIRING 等各状态批次；
+            //     INSPECTION / READY_TO_SHIP 等各状态批次（返修中的批次按
+            //     IN_PROCESS 一并返回）；
             //   - 而所有进 INSPECTION 的写点都按「出池 → `current_process_id = NULL`」
             //     不变式把该列清空（`phase1::scan` / `outsource::
             //     receive_to_inspection` / `repair::complete_repair` /
@@ -292,8 +294,8 @@ impl PartService {
             // 2026-09-30 Phase 2（master 6be7531）：投影同时补齐 `b.part_id` /
             // `b.created_at` / `b.updated_at` / `b.current_process_step_id`（修复原
             // DTO 漏投 bug）+ `p2.name` / `dn.delivery_note_no` 两处 LEFT JOIN。
-            "SELECT b.id, b.part_id, b.batch_no, b.quantity, b.status, b.location, \
-             b.current_holder_id, b.current_process_step_id, \
+            "SELECT b.id, b.part_id, b.batch_no, b.quantity, b.status, b.is_repairing, \
+             b.location, b.current_holder_id, b.current_process_step_id, \
              b.delivery_note_id, b.parent_batch_id, \
              b.created_at, b.updated_at, b.version, \
              COALESCE(s.name, w.name, oc.name) AS current_holder_display, \
@@ -323,6 +325,9 @@ impl PartService {
                 batch_label: format!("L{}", r.id),
                 quantity: r.quantity,
                 status: r.status,
+                // 2026-10-01 review 第 1 轮 M5：REPAIRING 已降级为标记列，
+                // 列表必须投出它，否则前端拿不到「返修中」信号
+                is_repairing: r.is_repairing,
                 location: r.location,
                 current_holder_id: r.current_holder_id,
                 // 2026-09-30 Phase 2：holder_name 重命名为 current_holder_display

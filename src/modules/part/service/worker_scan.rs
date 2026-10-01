@@ -248,7 +248,11 @@ impl PartService {
                 }
                 // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
                 // 未变化（IN_PROCESS→IN_PROCESS）但 location/holder/process 物化。
-                PartService::sync_from_batch_change(&mut repo, part.id, current).await?;
+                //
+                // 2026-10-01 review 第 1 轮 M4：RETURNED 不改 status，该批次仍
+                // 非终态 → min-progress 推不出 part 终态，`event_id` 传 `None`
+                // （归档事件分支不可达）。
+                PartService::sync_from_batch_change(&mut repo, part.id, current, None).await?;
                 repo.insert_part_event(NewPartEvent {
                     id: snowflake.next_id(),
                     part_id: part.id,
@@ -304,19 +308,18 @@ impl PartService {
                     ));
                 }
                 // 切 holder worker → target_shelf + 状态 IN_PROCESS → INSPECTION（OCC）
-                let n = repo
+                // 2026-10-01：写 + part 派生 + assembly 级联已在 status_gate 内完成，
+                // 0 行由 gate 抛 40901（原 `if n == 0` 是死代码）。
+                let rollup = repo
                     .mark_batch_inspected(batch.id, batch.version, target_id, Some(current.id))
                     .await?;
-                if n == 0 {
-                    return Err(AppError::biz(code::VERSION_CONFLICT, "乐观锁失败"));
-                }
-                // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
-                // 变化时级联调 AssemblyService::sync_from_part_change 闭合链路。
-                synced_assembly_id =
-                    match PartService::sync_from_batch_change(&mut repo, part.id, current).await? {
-                        SyncOutcome::Changed(aid) => Some(aid),
-                        SyncOutcome::NoChange => None,
-                    };
+                // PR-B2：直接取 gate 的派生结果（不再补调
+                // `PartService::sync_from_batch_change` —— 第二次派生必然
+                // `NoChange`，会把 `synced_assembly_id` 恒吞成 null）。
+                synced_assembly_id = match rollup.sync {
+                    SyncOutcome::Changed(aid) => Some(aid),
+                    SyncOutcome::NoChange => None,
+                };
                 repo.insert_part_event(NewPartEvent {
                     id: snowflake.next_id(),
                     part_id: part.id,

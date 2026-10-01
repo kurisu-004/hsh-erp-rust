@@ -35,6 +35,13 @@ pub struct InspectionBatchListItemOut {
     pub batch_no: i32,
     pub quantity: i32,
     pub status: String, // 必为 "INSPECTION"
+    /// 2026-10-01 review 第 1 轮 M5 新增（migration 005，**BREAKING**）：
+    /// `REPAIRING` 已从 `PartStatus` 降级为 `t_part_batch.is_repairing` 标记列，
+    /// 本 VO 的 `status` 因此**恒为** `IN_PROCESS`（`GET /parts/repairing-batches`
+    /// 的过滤判据已是 `is_repairing = true`）。改造前前端靠
+    /// `status === 'REPAIRING'` 标「返修中」，现在任何端点都拿不到该值 ——
+    /// 除非读本字段。
+    pub is_repairing: bool,
     pub location: Option<String>,
     pub version: i32,
     /// 逻辑 FK → t_process_chain_step.id（2026-09-16 PR-3；替代 next_process_id 列）
@@ -58,12 +65,18 @@ pub struct InspectionBatchListItemOut {
     /// `RepairBatchesOut`），**3 个都不是工序池端点**，判据都是 `status`：
     /// - `GET /parts/inspection-batches`（`status='INSPECTION'`，M3 已回退）
     /// - `GET /parts/repair-batches`（`DELIVERED`，2026-09-30 follow-up 补齐）
-    /// - `GET /parts/repairing-batches`（`REPAIRING`，同上）
+    /// - `GET /parts/repairing-batches`（`is_repairing = true`，2026-10-01 由
+    ///   `status='REPAIRING'` 改为标记列过滤）
     ///
-    /// 三者的 `current_process_id` 分别为「按出池不变式恒 NULL」「DELIVERED 必经
-    /// INSPECTION 故同样恒 NULL」「`mark_batch_repairing` 既不写也不清 → 残留
-    /// 上一道工序的陈旧值」⇒ 直读一律得不到正确值，故 3 条查询**全部**走 step
-    /// 派生。`current_process_step_id` 在送检期间被刻意保留
+    /// 前两者（三者中的 2 个 status 判据端点）的 `current_process_id` 分别为
+    /// 「按出池不变式恒 NULL」「DELIVERED 必经 INSPECTION 故同样恒 NULL」⇒
+    /// 直读一律得不到正确值，故这 2 条查询走 step 派生。
+    /// 第三个端点（返修中）：2026-10-01 起 `mark_batch_repairing` **不再把批次
+    /// 翻出 IN_PROCESS**（status 保持不变），故该列对返修批次不再有「残留
+    /// 陈旧值」问题 —— 但本 VO 仍统一走 step 派生，理由是「展示类列表一律走
+    /// step 派生」这条分工（见 `part/batch/model.rs` 模块 doc 的读取方清单），
+    /// 不因单个端点的判据变化而分叉。
+    /// `current_process_step_id` 在送检期间被刻意保留
     /// （`mark_batch_inspected` 不写它），正是「INSPECTION 期间显示批次走到
     /// 工艺链第几步」这条产品需求的数据来源。
     ///
@@ -106,6 +119,7 @@ impl From<InspectionBatchListRow> for InspectionBatchListItemOut {
             batch_no: r.batch_no,
             quantity: r.quantity,
             status: r.status,
+            is_repairing: r.is_repairing,
             location: r.location,
             version: r.version,
             current_process_step_id: r.current_process_step_id,

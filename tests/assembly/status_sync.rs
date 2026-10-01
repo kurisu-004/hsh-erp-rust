@@ -1,10 +1,10 @@
 //! 父装配件 status 自动聚合（auto-rollup）集成测试
 //!
 //! 覆盖 `assembly-status-auto-sync` 特性 Task 6 验收点：
-//!   1. `single_part_to_inspection_flips_assembly_to_in_process`
-//!      —— 单件 PENDING → INSPECTION 触发父 asm PENDING → IN_PROCESS
+//!   1. `single_part_to_inspection_flips_assembly_to_inspection`
+//!      —— 单件 PENDING → INSPECTION 触发父 asm PENDING → **INSPECTION**
 //!   2. `mixed_children_assembly_rolls_up_to_min_progress`
-//!      —— 一子 COMPLETED + 一子 INSPECTION → 父 = IN_PROCESS（min progress 非 0）
+//!      —— 一子 COMPLETED + 一子 INSPECTION → 父 = **INSPECTION**（min progress = 4）
 //!   3. `all_children_cancelled_flips_assembly_to_cancelled`
 //!      —— 2 件子全部 CANCELLED → 父 = CANCELLED（cancel 端点不触发 sync，所以用
 //!      `AssemblyService::sync_from_part_change` 直接驱动 sync 来覆盖该路径）
@@ -14,6 +14,38 @@
 //!      —— 批量 to-inspection 跨两个 assembly，每个 assembly 仅在「target ≠ current」
 //!      那一项返回 `synced_assembly_id: Some(...)`；handler 侧用 HashSet 去重
 //!      保证每个 asm 仅广播一次 `ASSEMBLY_UPDATED`。
+//!
+//! ## 2026-10-01 订正：期望值按 7 态聚合重算（此前 3 个用例自 2026-09-24 起一直是红的）
+//!
+//! assembly 状态机在 `eaec9d4`（2026-09-02）由 4 态扩到 **7 态**（对齐 Python
+//! `AssemblyStatus`），`compute_assembly_target` 的 min-progress 映射随之变成
+//! `0→PENDING / 1..3→IN_PROCESS / 4→INSPECTION / 5→READY_TO_SHIP / 6→DELIVERED`。
+//! 但本文件在 `8f62b7e`（2026-09-24）拆分迁移时**只搬了代码、没搬期望**：3 个用例
+//! 仍断言「子件 INSPECTION ⇒ 父 IN_PROCESS」，实际跑出来是 INSPECTION。
+//! 7 态映射是**正确且有意**的设计（父装配件跟随子件跨越待检 / 待发 / 已交付），
+//! 故本轮订正**断言与注释**，不回退映射。
+//!
+//! ## 另一处顺带修掉的真回归（2026-10-01）
+//!
+//! 这 3 个用例最初在**更早一行**就红了（`synced_assembly_id` 为 null）——那是
+//! status_gate 收口时引入的：写 batch 与 batch → part → assembly 派生已焊进同一个
+//! 函数，而 service 在写完又补调一次 `PartService::sync_from_batch_change`，
+//! 第二次派生必然 `NoChange`，把 `synced_assembly_id` 恒吞成 null（连带 handler 的
+//! `ASSEMBLY_UPDATED` 广播永不发）。修法见
+//! `src/modules/part/service/inspection_core.rs` / `worker_scan.rs` 里
+//! 「2026-10-01：不再补调」的注释。本文件的用例同时是那条回归的护栏。
+//!
+//! ## 派生写可以跨状态机边（重要语义，勿误读为 bug）
+//!
+//! 用例 1 会让父件从 `PENDING` 直接跳到 `INSPECTION`，而
+//! `AssemblyStatus::can_transition_to` **并不允许** `PENDING → INSPECTION`。
+//! 这不是漏洞：`can_transition_to` 管的是**操作员主动发起的单步流转**
+//! （cancel / start 端点），而 rollup 是**派生写**——它把「所有子件的 min progress」
+//! 原样映射上去，子件一夜之间全送检 / 全发货时父件自然会被跨档推走，
+//! 对操作员而言这仍然是「一件一件真实流转过」的等价物。
+//! 派生写路径是 `AssemblyRepo::update_status_if_not_terminal`（只带 OCC +
+//! 终态守卫，不查状态机），故 `PENDING → INSPECTION` / `PENDING → READY_TO_SHIP`
+//! 这类跨度一律放行。
 //!
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -267,11 +299,20 @@ fn test_current_user() -> CurrentUser {
 //  Tests
 // ===========================================================================
 
-/// 1. 单件 PENDING → INSPECTION 触发父 asm PENDING → IN_PROCESS。
+/// 1. 单件 PENDING → INSPECTION 触发父 asm PENDING → **INSPECTION**。
 ///
-/// 期望：`data.synced_assembly_id == Some(asm.id)`；DB `t_assembly.status == 'IN_PROCESS'`。
+/// 2026-10-01 订正（用例名同步改，7 态聚合下「翻到 IN_PROCESS」不再成立）：
+/// 只有一个子件、它翻成 INSPECTION，于是
+/// `compute_assembly_target(["INSPECTION"])`：
+/// - `non_cancelled` = `[INSPECTION]`（1 条，非空 → 不走 ALL_CANCELLED 分支）
+/// - `non_terminal`  = `[INSPECTION]`（INSPECTION 不是 COMPLETED，非空 → 不走全完成分支）
+/// - `min_progress`  = `part_status_progress("INSPECTION")` = **4**
+/// - 映射 `4 => INSPECTION`（`assembly/statemachine.rs::compute_assembly_target`）
+///
+/// 期望：`data.synced_assembly_id == Some(asm.id)`（PENDING ≠ INSPECTION 真翻转）；
+/// DB `t_assembly.status == 'INSPECTION'`；`version` 0 → 1。
 #[tokio::test]
-async fn single_part_to_inspection_flips_assembly_to_in_process() {
+async fn single_part_to_inspection_flips_assembly_to_inspection() {
     let (pool, app, token, _fx) = bootstrap_as_inspector().await;
     let l1 = insert_l1(&pool, "F", "F").await;
     let l2 = insert_l2(&pool, "二厂", l1).await;
@@ -309,17 +350,29 @@ async fn single_part_to_inspection_flips_assembly_to_in_process() {
         "data.synced_assembly_id 应等于父 asm.id"
     );
 
-    // DB 端断言父 assembly 已翻转到 IN_PROCESS
+    // DB 端断言父 assembly 已翻转到 INSPECTION（min progress = 4 → INSPECTION）
     let (asm_status, asm_version) = get_assembly_status_version(&pool, asm_id).await;
-    assert_eq!(asm_status, "IN_PROCESS", "父 asm 应已翻转到 IN_PROCESS");
+    assert_eq!(
+        asm_status, "INSPECTION",
+        "父 asm 应已翻转到 INSPECTION（7 态聚合：min progress 4 → INSPECTION）"
+    );
     assert_eq!(asm_version, 1, "version 应自增一次（0 → 1）");
 }
 
-/// 2. 混合子件：1 子 COMPLETED + 1 子 INSPECTION → 父 = IN_PROCESS。
+/// 2. 混合子件：1 子 COMPLETED + 1 子 INSPECTION → 父 = **INSPECTION**。
 ///
-/// 期望：父 asm 起 PENDING，第二个子 INSPECTION 后聚合算法
-/// （`compute_assembly_target`）取 `non_terminal_non_cancelled` 的
-/// `min(progress)` → INSPECTION 的 progress=4 → `IN_PROCESS`。
+/// 2026-10-01 订正：原断言写「父 = IN_PROCESS（min progress 非 0）」，那是 4 态
+/// 时代的残留 —— 5 态/7 态下 progress 4 有独立落点（INSPECTION），不是 IN_PROCESS。
+///
+/// 推导（`compute_assembly_target(["COMPLETED", "INSPECTION"])`）：
+/// - `non_cancelled`  = `[COMPLETED, INSPECTION]`（无 CANCELLED）
+/// - `non_terminal`   = `[INSPECTION]` —— **COMPLETED 被滤掉**（终态不参与
+///   min-progress，否则「最慢的那个已完成的子件」会把父件永远钉在 COMPLETED）
+/// - `min_progress`   = `part_status_progress("INSPECTION")` = **4**
+/// - 映射 `4 => INSPECTION`
+///
+/// 期望：父 asm 起 PENDING，PENDING ≠ INSPECTION → 真翻转，
+/// `synced_assembly_id = Some(asm_id)`。
 #[tokio::test]
 async fn mixed_children_assembly_rolls_up_to_min_progress() {
     let (pool, app, token, _fx) = bootstrap_as_inspector().await;
@@ -355,15 +408,15 @@ async fn mixed_children_assembly_rolls_up_to_min_progress() {
     assert_eq!(status, StatusCode::OK, "body={body}");
     let synced_aid = body["data"]["synced_assembly_id"]
         .as_str()
-        .expect("synced_assembly_id 应为非 null：父 PENDING → IN_PROCESS 真发生了 flip");
+        .expect("synced_assembly_id 应为非 null：父 PENDING → INSPECTION 真发生了 flip");
     assert_eq!(synced_aid, asm_id.to_string());
 
-    // 子状态应为 [COMPLETED, INSPECTION]；min progress over non-terminal =
-    // min(INSPECTION=4) = 4 → IN_PROCESS
+    // 子状态 [COMPLETED, INSPECTION]：COMPLETED 是终态、不参与 min-progress，
+    // 故 min = part_status_progress("INSPECTION") = 4 → 父 = INSPECTION
     let (asm_status, _asm_version) = get_assembly_status_version(&pool, asm_id).await;
     assert_eq!(
-        asm_status, "IN_PROCESS",
-        "子 [COMPLETED, INSPECTION] → 父应 = IN_PROCESS（min progress=4 非 0）"
+        asm_status, "INSPECTION",
+        "子 [COMPLETED, INSPECTION] → 父应 = INSPECTION（min progress = 4）"
     );
 }
 
@@ -488,18 +541,28 @@ async fn terminal_assembly_is_not_modified_by_child_change() {
 ///
 /// 3 件子：2 件在 asm-A、1 件在 asm-B；全部 PENDING → INSPECTION。
 ///
-/// sync 语义：每个 item 调一次 `sync_from_part_change`。
-/// - asm-A 子：[PENDING, PENDING]，item 1 后 [INSPECTION, PENDING]，target=PENDING
-///   （asm-A 是 PENDING）→ NoChange。item 2 后 [INSPECTION, INSPECTION]，target=IN_PROCESS
-///   ≠ PENDING → Changed(asm-A)。
-/// - asm-B 子：[PENDING]，item 3 后 [INSPECTION]，target=IN_PROCESS ≠ PENDING
-///   → Changed(asm-B)。
+/// sync 语义：每个 item 落批后派生一次（2026-10-01 起「写 + 派生」同在 status_gate
+/// 内，见文件头「另一处顺带修掉的真回归」）。逐 item 按
+/// `compute_assembly_target` 重算（7 态映射，`progress(INSPECTION) = 4`）：
+/// - **item 1（pa1@asm-A）**：asm-A 子件变 `[INSPECTION, PENDING]` →
+///   `min_progress = min(4, 0) = 0` → `PENDING`；asm-A 当前就是 `PENDING`
+///   → target == current → `NoChange` → `synced_assembly_id = null`
+///   （「只要还有一个子件没动，父件就不许动」正是 min-progress 的意义）
+/// - **item 2（pa2@asm-A）**：asm-A 子件变 `[INSPECTION, INSPECTION]` →
+///   `min_progress = 4` → `INSPECTION` ≠ `PENDING` → `Changed(asm-A)`
+/// - **item 3（pb1@asm-B）**：asm-B 子件变 `[INSPECTION]` → `min_progress = 4`
+///   → `INSPECTION` ≠ `PENDING` → `Changed(asm-B)`
 ///
 /// 期望：
-///   - `submitted[0].synced_assembly_id == null`（asm-A 还未到 IN_PROCESS）
+///   - `submitted[0].synced_assembly_id == null`（asm-A 还有一个 PENDING 子件）
 ///   - `submitted[1].synced_assembly_id == Some(asm-A)`（asm-A 翻转）
 ///   - `submitted[2].synced_assembly_id == Some(asm-B)`（asm-B 翻转）
-///   - 两个 asm 在 DB 端均 = IN_PROCESS
+///   - 两个 asm 在 DB 端均 = **INSPECTION**（2026-10-01 订正，原断言写 IN_PROCESS）
+///
+/// 三个 item 的 `synced_assembly_id` 期望值与 4 态时代**相同** —— 变的只是
+/// 「target 具体落在哪个状态」：4 态时 `0..3` 一律 IN_PROCESS 且 4 无落点，
+/// 7 态把 4/5/6 各自拆出 INSPECTION / READY_TO_SHIP / DELIVERED。
+/// 「target ≠ current ⇒ Changed、target == current ⇒ NoChange」这条判据没变。
 ///
 /// handler 侧：`let mut seen = HashSet::new(); for item in submitted { if Some(aid) && seen.insert(aid) { broadcast } }`
 /// → asm-A / asm-B 各广播一次。本测试**不**验 WS 通道（WS 需独立订阅路径）；
@@ -550,33 +613,33 @@ async fn batch_to_inspection_emits_per_assembly_update() {
     let submitted = body["data"]["submitted"].as_array().expect("submitted");
     assert_eq!(submitted.len(), 3, "3 件全部成功 → submitted=3");
 
-    // per-item synced_assembly_id 断言：
-    //   - item 1 (asm-A 子)：target=PENDING，asm-A=PENDING → NoChange → null
-    //   - item 2 (asm-A 子)：target=IN_PROCESS ≠ PENDING → Changed(asm-A)
-    //   - item 3 (asm-B 子)：target=IN_PROCESS ≠ PENDING → Changed(asm-B)
+    // per-item synced_assembly_id 断言（7 态映射，progress(INSPECTION)=4）：
+    //   - item 1 (asm-A 子)：子 [INSPECTION, PENDING] → min=0 → PENDING == current → NoChange → null
+    //   - item 2 (asm-A 子)：子 [INSPECTION, INSPECTION] → min=4 → INSPECTION ≠ PENDING → Changed(asm-A)
+    //   - item 3 (asm-B 子)：子 [INSPECTION] → min=4 → INSPECTION ≠ PENDING → Changed(asm-B)
     let s0_sid = submitted[0]["synced_assembly_id"].as_str();
     let s1_sid = submitted[1]["synced_assembly_id"].as_str();
     let s2_sid = submitted[2]["synced_assembly_id"].as_str();
     assert!(
         s0_sid.is_none(),
-        "item 1 (asm-A) 父还在 PENDING（target=PENDING==current），synced_assembly_id 应为 null"
+        "item 1 (asm-A) 还有一个 PENDING 子件（min progress=0），父停在 PENDING，synced_assembly_id 应为 null"
     );
     assert_eq!(
         s1_sid.expect("item 2 应 Some"),
         asm_a.to_string(),
-        "item 2 (asm-A) 父翻到 IN_PROCESS，synced_assembly_id 应 = asm-A"
+        "item 2 (asm-A) 父翻到 INSPECTION，synced_assembly_id 应 = asm-A"
     );
     assert_eq!(
         s2_sid.expect("item 3 应 Some"),
         asm_b.to_string(),
-        "item 3 (asm-B) 父翻到 IN_PROCESS，synced_assembly_id 应 = asm-B"
+        "item 3 (asm-B) 父翻到 INSPECTION，synced_assembly_id 应 = asm-B"
     );
 
-    // DB 端：两 asm 均已 = IN_PROCESS
+    // DB 端：两 asm 均已 = INSPECTION（7 态映射 min progress 4 的落点）
     let (st_a, _v_a) = get_assembly_status_version(&pool, asm_a).await;
     let (st_b, _v_b) = get_assembly_status_version(&pool, asm_b).await;
-    assert_eq!(st_a, "IN_PROCESS");
-    assert_eq!(st_b, "IN_PROCESS");
+    assert_eq!(st_a, "INSPECTION");
+    assert_eq!(st_b, "INSPECTION");
 
     // handler 侧 dedup 证据：用 service `sync_from_part_changes` 模拟再次批量驱动；
     // 应返回 `Vec<SyncOutcome>`，且全部 = NoChange（target 已 == current）。

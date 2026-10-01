@@ -70,7 +70,15 @@ pub fn map_counts_by_status(rows: Vec<(String, i64)>) -> CountsByStatus {
             "IN_PROCESS" => out.in_production += c,
             "INSPECTION" => out.pending_inspection += c,
             "READY_TO_SHIP" | "DELIVERED" => out.delivered += c,
-            // PROGRAMMING / OUTSOURCE / REPAIRING / COMPLETED / CANCELLED 仅计入 all
+            // PROGRAMMING / OUTSOURCE / COMPLETED / CANCELLED 仅计入 all
+            //
+            // 2026-10-01：删掉 `REPAIRING`。REPAIRING 已从 `PartStatus` 降级为
+            // `t_part_batch.is_repairing` 标记列（migration 005/006），
+            // `t_part.status` 里不再出现该值（rollup 输出恒为 `IN_PROCESS`）。
+            // 返修中的工单**自动**由上面 `"IN_PROCESS"` 臂计入
+            // `in_production` —— 这正是期望口径：返修仍在生产中，与
+            // 「生产中」tab 同属用户视角下的在厂货，拆出去单列 tab 反而会
+            // 让「生产中」少算正在返修的量。
             _ => {}
         }
     }
@@ -104,8 +112,14 @@ impl PartList {
     /// mini-program `GET /wx/parts?status=&page=&size=`：
     ///
     /// - status 过滤：可选 `PENDING` / `PROGRAMMING` / `IN_PROCESS` / `INSPECTION` /
-    ///   `READY_TO_SHIP` / `DELIVERED` / `REPAIRING` / `OUTSOURCE` / `COMPLETED` /
+    ///   `READY_TO_SHIP` / `DELIVERED` / `OUTSOURCE` / `COMPLETED` /
     ///   `CANCELLED`；None 或 `"all"` 返回全部非软删件。
+    ///   2026-10-01：删掉 `REPAIRING` —— REPAIRING 已降级为
+    ///   `t_part_batch.is_repairing` 标记列（migration 005/006），
+    ///   `t_part.status` 里不再出现该值；返修中的工单按 `IN_PROCESS` 过滤即可
+    ///   （注意：小程序端**没有**按 `is_repairing` 单独过滤的口径，返修态对
+    ///   用户可见性等价于生产中）。本 SQL 的过滤是 `$1::text` 直传（无白名单
+    ///   校验），传 `REPAIRING` 只会得到空列表而非报错。
     /// - 排序：`is_urgent DESC, planned_delivery_date ASC, id ASC`（紧急 + 交期近
     ///   优先；与 `part::batch::repo.rs::list_batches_with_part` 同形）。
     /// - JOIN：`t_customer`（取客户名）+ 层级 LEFT JOIN `t_part_batch` / `t_shelf` /

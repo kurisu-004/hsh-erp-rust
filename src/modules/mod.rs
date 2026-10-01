@@ -13,6 +13,9 @@ use serde::Serialize;
 use crate::state::AppState;
 
 pub mod _e2e;
+// 2026-10-01 新增 admin 域：对账 / 修数据逃生口（`POST /api/v2/admin/recompute-rollup`，
+// Manager 单角色）。域内不含任何新派生算法，只复用 part / assembly 域的 rollup 函数。
+pub mod admin;
 pub mod assembly;
 pub mod cnc_program;
 // 2026-09-19 新增 com 模块聚合：customer + applicant 平移至 `com::customer` / `com::applicant`，
@@ -86,6 +89,9 @@ async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResp> {
 pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/health", get(health))
+        // 2026-10-01 新增 admin 域（对账逃生口）：`POST /api/v2/admin/recompute-rollup`。
+        // Manager 单角色守卫写在 handler 内（`require_role`），此处不挂 role layer。
+        .nest("/admin", admin::router())
         // 2026-09-19 IAM 域：新路径 `/iam` 14 端点（PR-1 起开放，PR-4 收尾后唯一）
         .nest("/iam", iam::router())
         // 2026-09-19 com 聚合：customer + applicant 统一挂在 `/com/*` 下

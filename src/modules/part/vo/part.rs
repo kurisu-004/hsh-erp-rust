@@ -321,6 +321,10 @@ pub struct PartBatchListItemOut {
     pub batch_label: String,
     pub quantity: i32,
     pub status: String,
+    /// 2026-10-01 review 第 1 轮 M5 新增（migration 005）：`REPAIRING` 已从
+    /// `PartStatus` 降级为 `t_part_batch.is_repairing` 标记列，故返修中的批次
+    /// `status` 恒为 `IN_PROCESS` —— 「是否返修中」只能由本字段表达。
+    pub is_repairing: bool,
     #[serde(default)]
     pub location: Option<String>,
     #[serde(serialize_with = "serialize_i64_opt")]

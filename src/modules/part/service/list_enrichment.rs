@@ -169,11 +169,21 @@ pub(crate) async fn enrich_part_list_with_location_and_holder<R: PartRepoTrait>(
 
 /// 与 `crate::modules::part::statemachine::part_status_progress` 同逻辑的
 /// 内联副本（避免在 service 层引一圈 statemachine 依赖）。PR-2 增列同步。
+///
+/// 2026-10-01：删掉 `"IN_PROCESS" | "REPAIRING" => 2` 的合并臂，改回单值
+/// `"IN_PROCESS" => 2`。REPAIRING 降级为 `t_part_batch.is_repairing` 标记列
+/// 后，`t_part.status` 里不会再出现该字面量（migration 006 已把存量洗白，
+/// status_gate 也永不写它）。
+///
+/// ⚠️ 存量兼容：migration 006 未 apply 的环境里仍可能读到 `'REPAIRING'`，此时
+/// 落到 `_ => 2` 兜底臂 —— 恰好与原 REPAIRING 档位（2）相同，故本函数对
+/// 两种数据形态**返回值一致**（与 `statemachine::part_status_progress` 的
+/// 同款兜底同构）。
 fn part_status_progress_inline(s: &str) -> u8 {
     match s {
         "PENDING" => 0,
         "PROGRAMMING" => 1,
-        "IN_PROCESS" | "REPAIRING" => 2,
+        "IN_PROCESS" => 2,
         "OUTSOURCE" => 3,
         "INSPECTION" => 4,
         "READY_TO_SHIP" => 5,

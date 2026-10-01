@@ -6,8 +6,10 @@
 //! - `zone` ∈ {PRODUCTION, INSPECTION}
 //! - `code` 业务唯一键，update 不允许改
 //! - `deactivate` 等价于 soft-delete：同时 `is_active = false` + `deleted_at = now()`
-//! - `deactivate` 前查 `t_part.current_holder_id = shelf_id` 且
-//!   `status IN ('IN_PROCESS','INSPECTION','REPAIRING')` 引用，>0 ⇒ 20503 拒
+//! - `deactivate` 前查 `t_part_batch.current_holder_id = shelf_id` 且
+//!   `status IN ('IN_PROCESS','INSPECTION')` 引用，>0 ⇒ 20503 拒
+//!   （2026-10-01：REPAIRING 降级为 `is_repairing` 标记后，返修批次 status 即
+//!   IN_PROCESS，仍被本守卫覆盖）
 //!
 //! ## picker 端点
 //! 见同级 `service::picker`（for-return / for-inspection）。
@@ -265,8 +267,8 @@ impl ShelfService {
     }
 
     /// 软删 + 停用（`is_active = false` 同时 `deleted_at = now()`）。
-    /// 软删前查 `t_part.current_holder_id = shelf_id` 且
-    /// `status IN ('IN_PROCESS','INSPECTION','REPAIRING')` 引用，>0 ⇒ 20503 拒。
+    /// 软删前查 `t_part_batch.current_holder_id = shelf_id` 且
+    /// `status IN ('IN_PROCESS','INSPECTION')` 引用，>0 ⇒ 20503 拒。
     pub async fn soft_delete_shelf<R: ShelfRepoTrait>(
         &self,
         mut repo: R,
@@ -282,7 +284,7 @@ impl ShelfService {
             return Err(AppError::biz(
                 code::BIZ_SHELF_IN_USE,
                 format!(
-                    "货架 {} (id={}) 仍被 {in_use} 个 IN_PROCESS/INSPECTION/REPAIRING 零件引用，无法软删",
+                    "货架 {} (id={}) 仍被 {in_use} 个 IN_PROCESS/INSPECTION 零件引用，无法软删",
                     shelf.code, shelf.id
                 ),
             ));

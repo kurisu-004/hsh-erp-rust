@@ -28,15 +28,39 @@ pub(crate) fn is_attachable_state(status: &str) -> bool {
 /// 全部查询一致）。**不能用 `current_holder_id`**：该列多态——批次放货架时
 /// 存 `t_shelf.id`（`location = 'PRODUCTION_SHELF' / 'INSPECTION_SHELF'`），
 /// 只有工人取件时才存 worker id（`location = 'WORKER'`）。
+///
+/// 2026-10-01：删掉 `"REPAIRING"` 臂。REPAIRING 降级为
+/// `t_part_batch.is_repairing` 标记列（migration 005/006）后，返修中批次的
+/// `status` 就是 `'IN_PROCESS'`，已被下一臂接管 —— **判定口径与改造前保持
+/// 「非工人持有即可送检」完全一致**（细节与唯一的例外见本函数下方的注释块）。
 pub(super) fn is_inspectable_state(b: &TPartBatch) -> bool {
     match b.status.as_str() {
-        "PENDING" | "PROGRAMMING" | "REPAIRING" => true,
+        "PENDING" | "PROGRAMMING" => true,
         "IN_PROCESS" => b.location.as_deref() != Some("WORKER"),
         _ => false,
     }
 }
 
+// 返修批次（`is_repairing = true`）的归类复核（2026-10-01 记录，供后续改分类时对照）：
+//
+// - **在货架上**（`PRODUCTION_SHELF` / `INSPECTION_SHELF`，含
+//   `scan-inspect` FAIL 后停在送检架、尚未 `complete-repair` 落回生产架的
+//   批次）→ `location != 'WORKER'` ⇒ B 组可送检。与改造前 REPAIRING 单独
+//   一臂的结果**相同**。
+// - **在工人手上**（`location = 'WORKER'`）→ 落 C 组
+//   `IN_PROCESS_HELD_BY_WORKER`。⚠️ 这是相对改造前**唯一的行为变化**：老实现
+//   的 REPAIRING 臂不看 location，故「工人持有的返修批次」被判 B 组可送检。
+//   新行为更严也更自洽 —— `complete_repair` 要求批次经由货架流转
+//   （`shelf_id` 必填、校验 zone），工人手上的批次本就不该被一键送检。
+//   该变化与 REPAIRING 降级无关（老实现下若该批次按 status 判也会落进
+//   IN_PROCESS 臂），只是老实现的字面量豁免把它遮住了。
+
 /// C 组：直接报错的非法状态。`IN_PROCESS` 被工人持有（`location = 'WORKER'`）归此类。
+///
+/// 2026-10-01：无字面量改动，但归类范围**随 B 组一并复核**：REPAIRING 降级为
+/// `is_repairing` 标记后，返修批次走 `IN_PROCESS` 分支 —— 故「工人持有的返修
+/// 批次」现在也落 C 组（改造前被 REPAIRING 的 B 组豁免遮住）。语义理由见上方
+/// 「返修批次的归类」注释块。
 pub(crate) fn classify_invalid_state(b: &TPartBatch) -> Option<&'static str> {
     match b.status.as_str() {
         "DELIVERED" => Some("DELIVERED"),
@@ -53,7 +77,7 @@ pub(crate) fn classify_invalid_state(b: &TPartBatch) -> Option<&'static str> {
 /// 单 target（part）的 batch 4 类分组结果（A/B/D）。
 ///
 /// A 组：attachable（INSPECTION + READY_TO_SHIP）
-/// B 组：inspectable（PENDING/PROGRAMMING/REPAIRING/IN_PROCESS 非工人持有）
+/// B 组：inspectable（PENDING/PROGRAMMING/IN_PROCESS 非工人持有）
 /// D 组：conflict（已挂别的 active 单，由 service 层后续判定 21406）
 ///
 /// C 组（DELIVERED/OUTSOURCE/COMPLETED/CANCELLED/IN_PROCESS 工人持有）由前置

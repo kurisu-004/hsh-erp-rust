@@ -35,26 +35,46 @@
 //! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
 //! `impl for &mut PgConnection`）。
 //!
-//! 2026-09-30 备注：D-6 时代遗留的「inline sqlx 查询（`t_process_chain_step`
+//! ============================================================================
+//! 2026-10-01：本文件收敛为「只做派生」的单行委托
+//! ============================================================================
+//!
+//! 派生逻辑（步骤 1–5 + 终态序列号归档 / 释放）已下沉到
+//! [`crate::modules::part::service::status_gate::rollup_part_derived`]，与
+//! 「写状态」合成同一个函数 `status_gate::apply_batch_status_change`。
+//! 本方法保留为**纯派生入口**：
+//!
+//! - 新写路径一律经 status_gate（写 + 派生一体，caller 无「要不要调 sync」
+//!   这个选项）；本方法只剩历史调用方在用。
+//! - 两条路径共用同一段实现，因此行为**完全一致** —— 经 status_gate 写完
+//!   状态后再调本方法是安全的冗余（第二次 target == 当前 → NoChange），
+//!   不会出现两次释放序列号。
+//! - 未来（独立一轮）把剩余的「写完再调 sync」调用点删干净后，本方法即可
+//!   删除；2026-10-01（REPAIRING 下游消费方改造那一轮）刻意不删 —— 删它要动
+//!   的是 service 层的历史调用方与本文件的全部调用点，与本轮「消费
+//!   `is_repairing` 新列」的正交，混在一起会让 diff 失去可读性。
+//!
+//! 2026-10-01 备注：D-6 时代遗留的「inline sqlx 查询（`t_process_chain_step`
 //! 不属于 PartRepoTrait 范围）经 `repo.conn_mut()` 走」在本文件已无实际调用点
 //! —— 那是 step_id → process_id 转译 SELECT 用的，2026-09-30 随转译一起删除。
-//! `repo.conn_mut()` 仍用于步骤 8 的 `AssemblyService::sync_from_part_change`。
 
 use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
-use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
+use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::statemachine::{BatchForRollup, compute_part_target};
-use crate::shared::error::{AppError, code};
+use crate::modules::part::service::status_gate;
+use crate::shared::error::AppError;
 
 use super::PartService;
 
 impl PartService {
-    /// batch 集变化 → 回流 part 物化列 + 级联 assembly rollup（PR-B2 核心）。
+    /// batch 集变化 → 回流 part 物化列 + 级联 assembly rollup。
     ///
-    /// 与 `AssemblyService::sync_from_part_change` 同构，但本方法聚合的是
-    /// `t_part_batch.status`（part 与 batch 状态词汇相同，直接取字符串）。
+    /// **2026-10-01 起本方法是纯派生入口**：实现一行委托
+    /// `status_gate::rollup_part_derived`（与 status_gate 的 step 2–5 同一段
+    /// 代码）。新写点请直接用
+    /// `status_gate::apply_batch_status_change`（写 + 派生一体）。
     ///
     /// 错误码：
     /// - 20101 `BIZ_PART_NOT_FOUND` —— part 不存在或已软删
@@ -65,103 +85,26 @@ impl PartService {
     /// `current_holder_id` / `placed_at` 真相源在 t_part_batch，列表页
     /// 按需另查（见 `PartService::list_parts` enrichment）。
     ///
-    /// 2026-09-16 PR-3 批次 step 化（migration 028）：
-    /// - `BatchForRollup.next_process_id` → `current_process_step_id`
-    /// - 本方法在写入 `t_part.next_process_id` 缓存前一步：取 min-progress
-    ///   批次的 step_id，经 `t_process_chain_step.process_id` 派生后写入
-    ///
-    /// （**2026-09-30 起作废，见下条**）
-    ///
-    /// 2026-09-30 改直读 `current_process_id`（migration 004）：
-    /// - `BatchForRollup.current_process_step_id` → `current_process_id`
-    /// - `PartRollupTarget.next_process_id` → `current_process_id`（这次名实相符）
-    /// - 删掉「step_id → 额外 SELECT t_process_chain_step → process_id」转译；
-    ///   `derived_next_process_id` 直接取 `target.current_process_id`
-    /// - 顺带修掉「最慢批次 step 为 NULL → 整个工单 `t_part.next_process_id`
-    ///   被抹 NULL」的隐患（该列是删工序保护条件之一）
-    /// - `t_part.next_process_id` **列名与对外 DTO 字段名均不变**，只改派生源
+    /// 2026-09-30 改直读 `current_process_id`（migration 004）：随实现下沉到
+    /// `status_gate::rollup_part_derived`。
     ///
     /// 签名收 `&mut R: PartRepoTrait`（而非 `R` by-value）——本方法是 service 层
     /// helper（lifecycle / worker_scan 在 mid-method 调用后仍需继续用 repo），不
     /// 对 handler 暴露。caller 借 `&mut repo` 传入即可继续使用。
     ///
-    /// 2026-09-22 D-6 备注：`repo.conn_mut()` 仍用于步骤 8 调
-    /// `AssemblyService::sync_from_part_change`（生产 `R = &mut PgConnection` 时
-    /// `repo: &mut &mut PgConnection`，由 Rust auto-deref + reborrow 得到
-    /// `&mut PgConnection`（sqlx Executor））。
+    /// `event_id`（2026-10-01 review 第 1 轮 M4）：终态序列号归档事件
+    /// （`SERIAL_RELEASED`）的主键。传 `None` 时派生层只清序列号、不写归档并打
+    /// `error!` —— 故**能让 part 新进终态**的调用点必须传 `Some(snowflake.next_id())`。
     pub async fn sync_from_batch_change<R: PartRepoTrait>(
         repo: &mut R,
         part_id: i64,
         current: &CurrentUser,
+        event_id: Option<i64>,
     ) -> Result<SyncOutcome, AppError> {
-        // 1. 拉 part 全部活跃批次（rollup 只看活跃行）。
-        let batches = repo.part_batch_list_active_by_part_id(part_id).await?;
-
-        // 2. 投影到 `BatchForRollup`（仅 rollup 所需 4 列；避免引入完整
-        //    `TPartBatch` 让纯函数测试受阻）。
-        //
-        //    2026-09-30 改直读 `current_process_id`（migration 004）：删掉原
-        //    `current_process_step_id`，直接取批次所属工序（工单行的权威依据）。
-        let rows: Vec<BatchForRollup> = batches
-            .iter()
-            .map(|b| BatchForRollup {
-                status: b.status.clone(),
-                location: b.location.clone(),
-                current_holder_id: b.current_holder_id,
-                current_process_id: b.current_process_id,
-            })
-            .collect();
-
-        // 3. 空集 → NoChange（防御；正常创建路径不会触发，因为 PR-B1 已保
-        //    证每 part 至少有 1 条活跃批次）。
-        let Some(target) = compute_part_target(&rows) else {
-            return Ok(SyncOutcome::NoChange);
-        };
-
-        // 4. 读 part 当前 rollup 状态（status + next_process_id，2 列）。
-        //    2026-09-16 PR-2 瘦身：location / current_holder_id / placed_at 列已删。
-        let cur = repo.get_part_rollup_state(part_id).await?.ok_or_else(|| {
-            AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
-        })?;
-
-        // 5. 2026-09-30 派生：`target.current_process_id` 已是 process_id，
-        //    **直接**作为 `t_part.next_process_id` 缓存写入值。
-        //
-        //    2026-09-30 之前这里是「target.next_process_id（实为 step_id）→ 一次
-        //    额外 SELECT t_process_chain_step → process_id」的转译。删掉后有两个
-        //    收益：(a) 少一次 DB 往返；(b) 修掉「最慢批次 step_id 为 NULL → 整个
-        //    工单 t_part.next_process_id 被抹成 NULL」的隐患 —— 该列是删工序的
-        //    保护条件之一（`prod/process/repo/sql.rs::count_referencing` 5 个子
-        //    查询之一），被抹成 NULL 等于该防线静默失效。
-        //
-        //    语义与原 PR-2 行为一致：当批次无所属工序时写 NULL（与 part PENDING
-        //    时 next_process_id NULL 语义一致）。
-        let derived_next_process_id: Option<i64> = target.current_process_id;
-
-        // 6. target == 当前 → NoChange（两侧都是 process_id，可直接比较）
-        if cur.status == target.status && cur.next_process_id == derived_next_process_id {
-            return Ok(SyncOutcome::NoChange);
-        }
-
-        // 7. 派生写：`WHERE id=$1 AND deleted_at IS NULL`（**不走 OCC 冲突**，
-        //    并发 rollup 由 SQL 行锁串行化；version 仍 += 1）。
-        let affected = repo
-            .update_part_rollup(part_id, &target.status, derived_next_process_id, current.id)
-            .await?;
-        if affected == 0 {
-            // 防御：part 在两次 select 之间被并发软删（极端并发）。整体事务回滚
-            // 由 caller 决定 —— 此处返回 NoChange 让 caller 不重试。
-            return Ok(SyncOutcome::NoChange);
-        }
-
-        // 8. part.status 实际变化 → 调 AssemblyService::sync_from_part_change
-        //    闭合链路；返回其 SyncOutcome（可能 Changed/ NoChange）。
-        if cur.status != target.status {
-            return AssemblyService::sync_from_part_change(repo.conn_mut(), part_id, current).await;
-        }
-        // status 没变但 next_process_id 物化了 —— 仍算派生写成功，返回
-        // Changed(part_id) 供 handler 决定是否广播。
-        Ok(SyncOutcome::Changed(part_id))
+        let outcome =
+            status_gate::rollup_part_derived(repo.conn_mut(), part_id, current.id, event_id)
+                .await?;
+        Ok(outcome.sync)
     }
 
     /// 跨域 / 旧路径兼容入口（`conn: &mut PgConnection` → `<&mut PgConnection as PartRepoTrait>`）。
@@ -173,12 +116,18 @@ impl PartService {
     ///
     /// part 域内部 lifecycle / worker_scan / phase1 全部走主入口（`repo: &mut R`），
     /// 借 `&mut *tx` 继续使用同一 tx 即可，无需本壳。
+    ///
+    /// `event_id`：同 [`Self::sync_from_batch_change`]。跨域调用点
+    /// （worker_pool 的换 holder / delivery_note 的 pickup）派生的批次一定还
+    /// 处在非终态（DELIVERED / IN_PROCESS），min-progress 推不出终态，故一律
+    /// 传 `None`，该分支不可达。
     pub async fn sync_from_batch_change_with_conn(
         conn: &mut PgConnection,
         part_id: i64,
         current: &CurrentUser,
+        event_id: Option<i64>,
     ) -> Result<SyncOutcome, AppError> {
-        let mut conn = conn;
-        Self::sync_from_batch_change::<&mut PgConnection>(&mut conn, part_id, current).await
+        let outcome = status_gate::rollup_part_derived(conn, part_id, current.id, event_id).await?;
+        Ok(outcome.sync)
     }
 }

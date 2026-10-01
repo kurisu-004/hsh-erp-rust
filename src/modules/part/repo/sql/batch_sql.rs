@@ -31,6 +31,11 @@
 use sqlx::{PgConnection, PgExecutor};
 
 use super::PartRepo;
+// 2026-10-01：本文件除 `mark_batch_returned`（只写 holder/location，不改
+// status）外，所有 `t_part_batch.status` 写点均已收口为
+// `status_gate` 之上的薄包装 —— 全仓唯一的批次状态写入口。
+use crate::modules::part::service::status_gate::{self, StatusChange};
+use crate::shared::error::AppError;
 // PR2 合并后，`TPartBatch` 与 `PartBatchRepo` 都已搬到 `crate::modules::part::batch::*`。
 // 本文件继续走新路径（与 PR2 「合并 part_batch → part/batch」约束一致）。
 use crate::modules::part::batch::model::TPartBatch;
@@ -58,6 +63,7 @@ impl PartRepo {
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
+                       is_repairing,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
@@ -90,6 +96,7 @@ impl PartRepo {
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
+                               is_repairing,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
                         FROM t_part_batch
@@ -124,6 +131,7 @@ impl PartRepo {
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
+                       is_repairing,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
@@ -159,6 +167,7 @@ impl PartRepo {
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
+                               is_repairing,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
                         FROM t_part_batch
@@ -195,6 +204,7 @@ impl PartRepo {
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
+                       is_repairing,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
@@ -227,6 +237,7 @@ impl PartRepo {
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
+                               is_repairing,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
                         FROM t_part_batch
@@ -280,6 +291,7 @@ impl PartRepo {
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
+                   is_repairing,
                    version, created_at, created_by, updated_at, updated_by, deleted_at
             FROM t_part_batch
             WHERE id = $1 AND deleted_at IS NULL
@@ -290,30 +302,55 @@ impl PartRepo {
         .await
     }
 
-    /// 批量通过（OCC UPDATE）。
-    pub async fn mark_batch_passed_inspection<'e, E: PgExecutor<'e>>(
-        executor: E,
+    /// 批量通过（OCC UPDATE）—— **2026-10-01 起为 status_gate 薄包装**。
+    ///
+    /// 签名两处变更（调用方零改动，全部经 `&mut **self` 传连接）：
+    /// - `executor: E` → `conn: &mut PgConnection`：status_gate 的派生步骤
+    ///   需要可变的 `PgConnection`（D-6 架构：service 不持连接，跨域调用经
+    ///   `repo.conn_mut()`），泛型 `PgExecutor` 表达不了。
+    /// - `Result<u64, sqlx::Error>` → `Result<RollupOutcome, AppError>`：
+    ///   ① `sqlx::Error` → `AppError`：status_gate 的契约是「没写成 =
+    ///   `VERSION_CONFLICT`」，转成 `sqlx::Error` 会把 409 降级成 500；
+    ///   ② `u64` → `RollupOutcome`：**2026-10-01 修正**。status_gate 一函数内
+    ///   已完成 part 派生 + assembly 反向同步，而调用点（`inspection_core.rs`
+    ///   的 3 处）需要 `SyncOutcome` 填响应的 `synced_assembly_id`、并据此发
+    ///   `ASSEMBLY_UPDATED` 广播。若这里只回 `u64`、让 service 再调一次
+    ///   `PartService::sync_from_batch_change`，第二次派生必然 `NoChange`
+    ///   （target 已 == 当前），`synced_assembly_id` 会被**恒为 null** 吞掉。
+    ///   故把 gate 的派生结果原样透出；0 行仍由 gate 直接抛 `VERSION_CONFLICT`。
+    pub async fn mark_batch_passed_inspection(
+        conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query!(
-            r#"
-            UPDATE t_part_batch
-            SET status     = 'READY_TO_SHIP',
-                version    = version + 1,
-                updated_at = now(),
-                updated_by = $3
-            WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
-              AND deleted_at IS NULL
-            "#,
-            batch_id,
-            expected_version,
-            current_user_id,
+    ) -> Result<status_gate::RollupOutcome, AppError> {
+        status_gate::apply_batch_status_change_detailed(
+            conn,
+            StatusChange {
+                batch_id,
+                new_status: "READY_TO_SHIP",
+                new_location: None,
+                new_holder_id: None,
+                new_process_id: None,
+                new_process_step_id: None,
+                is_repairing: None,
+                expected_version: Some(expected_version),
+                allowed_from: &["INSPECTION"],
+                // 全部生产调用方都传 `Some(current.id)`（`inspection_core.rs`
+                // 的 3 处）；`None` 分支保留为 0，与 `update_batch_fields` 的
+                // `COALESCE($3, ...)` 历史容忍度一致。
+                updated_by: current_user_id.unwrap_or(0),
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
+                clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：归档事件 id 由 caller 透传。
+                event_id: None,
+            },
         )
-        .execute(executor)
-        .await?;
-        Ok(result.rows_affected())
+        .await
     }
 
     /// to-inspection 第一步：批次状态同步（OCC UPDATE t_part_batch）。
@@ -346,40 +383,43 @@ impl PartRepo {
     /// ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现）：**不是**「当前走到第
     /// 几步」—— 本列只在首次定位工序时写、之后一律不再推进（worker-scan
     /// RETURNED / INSPECTED 都不写），对多工序链工单永远停在首次定位那一步。
-    pub async fn mark_batch_inspected<'e, E: PgExecutor<'e>>(
-        executor: E,
+    pub async fn mark_batch_inspected(
+        conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query!(
-            r#"
-            UPDATE t_part_batch
-            SET status            = 'INSPECTION',
-                location          = 'INSPECTION_SHELF',
-                current_holder_id = $3,
-                -- 2026-09-30（review H2）：出池 → 池归属权威列置 NULL
-                --   （不置 NULL 会让 INSPECTION 批次带着上一道工序 id 停留）
-                current_process_id = NULL,
-                -- 2026-09-16 PR-3：to_inspection 保留 current_process_step_id，
-                --   但其定位已降级为「可选的显示用定位信息」（首次定位后不再推进）；
-                --   to_process 会重新解析 step 写入，故此处不写不丢状态机上下文
-                version           = version + 1,
-                updated_at        = now(),
-                updated_by        = $4
-            WHERE id = $1 AND version = $2
-              AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')
-              AND deleted_at IS NULL
-            "#,
-            batch_id,
-            expected_version,
-            shelf_id,
-            current_user_id,
+    ) -> Result<status_gate::RollupOutcome, AppError> {
+        status_gate::apply_batch_status_change_detailed(
+            conn,
+            StatusChange {
+                batch_id,
+                new_status: "INSPECTION",
+                new_location: Some("INSPECTION_SHELF"),
+                new_holder_id: Some(shelf_id),
+                new_process_id: None,
+                // 2026-09-16 PR-3：to_inspection 保留 current_process_step_id，
+                //   但其定位已降级为「可选的显示用定位信息」（首次定位后不再推进）；
+                //   to_process 会重新解析 step 写入，故此处不写不丢状态机上下文。
+                new_process_step_id: None,
+                is_repairing: None,
+                expected_version: Some(expected_version),
+                allowed_from: &["PENDING", "PROGRAMMING", "IN_PROCESS"],
+                updated_by: current_user_id.unwrap_or(0),
+                // 2026-09-30（review H2）：出池 → 池归属权威列必须置 NULL
+                //   （不置 NULL 会让 INSPECTION 批次带着上一道工序 id 停留）。
+                clear_process_id: true,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」；送检刻意**保留** `current_process_step_id`
+                //（INSPECTION 期间要显示批次走到工艺链第几步，见
+                //  `part/vo/inspection.rs`），故 step 的 clear 为 false。
+                clear_location: false,
+                clear_holder_id: false,
+                clear_process_step_id: false,
+                event_id: None,
+            },
         )
-        .execute(executor)
-        .await?;
-        Ok(result.rows_affected())
+        .await
     }
 
     /// to-process：批次打回生产架（OCC UPDATE t_part_batch）。
@@ -392,39 +432,51 @@ impl PartRepo {
     /// 2026-09-30 新增 `current_process_id: Option<i64>`：检验不合格打回生产架
     /// = **进池**，故写入目标工序（池归属权威依据）；`current_process_step_id`
     /// 仍是可选的显示用定位信息（首次定位后不再推进），允许 NULL。
-    pub async fn mark_batch_failed_inspection<'e, E: PgExecutor<'e>>(
-        executor: E,
+    ///
+    /// ## `is_repairing: None`（保持）的合法性前提（2026-10-01 review 第 2 轮 MAJOR-3）
+    ///
+    /// 唯一 caller 是 `inspection_core::to_process_core`，它在 step 4.6 **拒绝**
+    /// `is_repairing = true` 的批次（返修件走 `complete-repair` 闭环）。故本函数
+    /// 看到的批次恒为 `is_repairing = false`，「保持」与「清 false」等价。
+    ///
+    /// 之所以仍写 `None`（保持）而不是 `Some(false)`：若将来新增 caller 忘了那条
+    /// 守卫，`Some(false)` 会**静默**把返修件挪出返修流（正是 MAJOR-3 的失败类别），
+    /// 而 `None` 会让同一个洞以「标记与状态矛盾」的形式暴露在
+    /// `GET /parts/repairing-batches` 上，更容易被发现。
+    pub async fn mark_batch_failed_inspection(
+        conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query!(
-            r#"
-            UPDATE t_part_batch
-            SET status                  = 'IN_PROCESS',
-                location                = 'PRODUCTION_SHELF',
-                current_holder_id       = $3,
-                current_process_step_id = $4,
-                current_process_id      = $6,
-                version                 = version + 1,
-                updated_at              = now(),
-                updated_by              = $5
-            WHERE id = $1 AND version = $2 AND status = 'INSPECTION'
-              AND deleted_at IS NULL
-            "#,
-            batch_id,
-            expected_version,
-            shelf_id,
-            current_process_step_id,
-            current_user_id,
-            current_process_id,
+    ) -> Result<status_gate::RollupOutcome, AppError> {
+        status_gate::apply_batch_status_change_detailed(
+            conn,
+            StatusChange {
+                batch_id,
+                new_status: "IN_PROCESS",
+                new_location: Some("PRODUCTION_SHELF"),
+                new_holder_id: Some(shelf_id),
+                new_process_id: current_process_id,
+                new_process_step_id: current_process_step_id,
+                is_repairing: None,
+                expected_version: Some(expected_version),
+                allowed_from: &["INSPECTION"],
+                updated_by: current_user_id.unwrap_or(0),
+                // 进池 → 写目标工序；`current_process_id` 为 None 时即「不进任何
+                // 工序池」，清 NULL 是本路径的既有语义。
+                clear_process_id: current_process_id.is_none(),
+                // 2026-10-01 review 第 1 轮 M2：location / holder 都有实参，
+                // step 为 `None` 时是「保持原值」（本路径的既有语义）。
+                clear_location: false,
+                clear_holder_id: false,
+                clear_process_step_id: false,
+                event_id: None,
+            },
         )
-        .execute(executor)
-        .await?;
-        Ok(result.rows_affected())
+        .await
     }
 
     /// worker-pool admin_remove 用：按 `id + current_holder_id` 定位 IN_PROCESS+WORKER 批次。
@@ -447,6 +499,7 @@ impl PartRepo {
             SELECT id, part_id, batch_no, quantity, status, location,
                    current_holder_id, current_process_id, current_process_step_id,
                    delivery_note_id, parent_batch_id,
+                   is_repairing,
                    version, created_at, created_by, updated_at, updated_by,
                    deleted_at
             FROM t_part_batch
@@ -593,6 +646,7 @@ impl PartRepo {
                 SELECT id, part_id, batch_no, quantity, status, location,
                        current_holder_id, current_process_id, current_process_step_id,
                        delivery_note_id, parent_batch_id,
+                       is_repairing,
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
@@ -630,6 +684,7 @@ impl PartRepo {
                         SELECT id, part_id, batch_no, quantity, status, location,
                                current_holder_id, current_process_id, current_process_step_id,
                                delivery_note_id, parent_batch_id,
+                               is_repairing,
                                version, created_at, created_by, updated_at, updated_by,
                                deleted_at
                         FROM t_part_batch
@@ -700,48 +755,101 @@ impl PartRepo {
 
     // ===== Phase PR-CRUD 新增：8 个 lifecycle mark_* =====
 
-    /// 批次 READY_TO_SHIP → DELIVERED（OCC UPDATE t_part_batch）。
-    pub async fn mark_batch_delivered<'e, E: PgExecutor<'e>>(
-        executor: E,
+    /// 批次 READY_TO_SHIP → DELIVERED —— **2026-10-01 起为 status_gate 薄包装**。
+    pub async fn mark_batch_delivered(
+        conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query!(
-            r#"UPDATE t_part_batch SET status='DELIVERED', version=version+1,
-                updated_at=now(), updated_by=$3
-               WHERE id=$1 AND version=$2 AND status='READY_TO_SHIP' AND deleted_at IS NULL"#,
-            batch_id,
-            expected_version,
-            current_user_id,
+    ) -> Result<u64, AppError> {
+        status_gate::apply_batch_status_change(
+            conn,
+            StatusChange {
+                batch_id,
+                new_status: "DELIVERED",
+                new_location: None,
+                new_holder_id: None,
+                new_process_id: None,
+                new_process_step_id: None,
+                is_repairing: None,
+                expected_version: Some(expected_version),
+                allowed_from: &["READY_TO_SHIP"],
+                updated_by: current_user_id,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
+                clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：归档事件 id 由 caller 透传。
+                event_id: None,
+            },
         )
-        .execute(executor)
-        .await?;
-        Ok(r.rows_affected())
+        .await
+        .map(|_| 1u64)
     }
 
-    /// 批次 DELIVERED → COMPLETED。
-    pub async fn mark_batch_completed<'e, E: PgExecutor<'e>>(
-        executor: E,
+    /// 批次 DELIVERED → COMPLETED —— **2026-10-01 起为 status_gate 薄包装**。
+    ///
+    /// 本函数是「part 被 rollup 进 COMPLETED → 归档并释放 `serial_no`」这条
+    /// 新链路的**最常见触发点**：part 只有在所有非取消批次都 COMPLETED 时才会
+    /// 派生到 COMPLETED，故多批次工单完成最后一条时自动释放，无需 service 层
+    /// 再记得调 `clear_part_serial_no_when_completed`。
+    ///
+    /// `event_id`（2026-10-01 review 第 1 轮 M4）：本函数是**能让 part 新进
+    /// COMPLETED** 的写点之一，故必须由 caller 传一个真实雪花 id 供终态序列号
+    /// 归档事件（`SERIAL_RELEASED`）使用。
+    pub async fn mark_batch_completed(
+        conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query!(
-            r#"UPDATE t_part_batch SET status='COMPLETED', version=version+1,
-                updated_at=now(), updated_by=$3
-               WHERE id=$1 AND version=$2 AND status='DELIVERED' AND deleted_at IS NULL"#,
-            batch_id,
-            expected_version,
-            current_user_id,
+        event_id: Option<i64>,
+    ) -> Result<u64, AppError> {
+        status_gate::apply_batch_status_change(
+            conn,
+            StatusChange {
+                batch_id,
+                new_status: "COMPLETED",
+                new_location: None,
+                new_holder_id: None,
+                new_process_id: None,
+                new_process_step_id: None,
+                is_repairing: None,
+                expected_version: Some(expected_version),
+                allowed_from: &["DELIVERED"],
+                updated_by: current_user_id,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
+                clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：终态归档事件 id 由 caller 透传。
+                event_id,
+            },
         )
-        .execute(executor)
-        .await?;
-        Ok(r.rows_affected())
+        .await
+        .map(|_| 1u64)
     }
 
     /// 工单取消（OCC UPDATE t_part）：白名单 5 状态（PENDING / PROGRAMMING /
     /// INSPECTION / READY_TO_SHIP / DELIVERED），清空 `serial_no`。
+    ///
+    /// ## 2026-10-01：**本函数刻意不走 status_gate**
+    ///
+    /// status_gate 的写入口是 `t_part_batch.status`（**批次**是状态的真源，
+    /// part / assembly 是派生缓存）。本函数写的是 `t_part.status` —— 它是
+    /// 「用户取消工单」这个**主操作**本身，不是派生写：cancel 的合法源状态
+    /// 白名单与批次流无关（一个未拆批的工单也要能取消），且必须在**批次级联
+    /// 取消之前**先把 part 打成终态，才能挡住并发的批次流转。
+    ///
+    /// `serial_no = NULL` 同理是**故意不归档**：cancel 是「作废」，序列号就此
+    /// 退役，不是「转交送货单后释放复用」。子件的归档释放只发生在
+    /// COMPLETED（见 `status_gate::release_part_serial_no`）。
+    ///
+    /// 级联取消全部活跃批次由 `cancel_all_active_batches_for_part` 走
+    /// status_gate 的 bulk 模式完成（会自动补做 part → assembly 派生）。
     pub async fn mark_part_cancelled<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -763,26 +871,49 @@ impl PartRepo {
         Ok(r.rows_affected())
     }
 
-    /// 批次取消（OCC UPDATE t_part_batch）：白名单 5 状态。
-    pub async fn mark_batch_cancelled<'e, E: PgExecutor<'e>>(
-        executor: E,
+    /// 批次取消（OCC UPDATE t_part_batch）：白名单 5 状态
+    /// —— **2026-10-01 起为 status_gate 薄包装**。
+    ///
+    /// `event_id`：本函数能让 part 新进 CANCELLED（它是该 part 最后一条活跃
+    /// 批次时），故按 M4 由 caller 透传归档事件雪花 id。
+    pub async fn mark_batch_cancelled(
+        conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query!(
-            r#"UPDATE t_part_batch SET status='CANCELLED', version=version+1,
-                updated_at=now(), updated_by=$3
-               WHERE id=$1 AND version=$2
-                 AND status IN ('PENDING','PROGRAMMING','INSPECTION','READY_TO_SHIP','DELIVERED')
-                 AND deleted_at IS NULL"#,
-            batch_id,
-            expected_version,
-            current_user_id,
+        event_id: Option<i64>,
+    ) -> Result<u64, AppError> {
+        status_gate::apply_batch_status_change(
+            conn,
+            StatusChange {
+                batch_id,
+                new_status: "CANCELLED",
+                new_location: None,
+                new_holder_id: None,
+                new_process_id: None,
+                new_process_step_id: None,
+                is_repairing: None,
+                expected_version: Some(expected_version),
+                allowed_from: &[
+                    "PENDING",
+                    "PROGRAMMING",
+                    "INSPECTION",
+                    "READY_TO_SHIP",
+                    "DELIVERED",
+                ],
+                updated_by: current_user_id,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
+                clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：终态归档事件 id 由 caller 透传。
+                event_id,
+            },
         )
-        .execute(executor)
-        .await?;
-        Ok(r.rows_affected())
+        .await
+        .map(|_| 1u64)
     }
 
     /// 批次 IN_PROCESS → REPAIRING。
@@ -809,54 +940,98 @@ impl PartRepo {
     ///
     /// 详见 `migrations/20260930000000_004_add_batch_current_process_id.sql`
     /// 「已知局限 (4)」小节。
-    pub async fn mark_batch_repairing<'e, E: PgExecutor<'e>>(
-        executor: E,
+    ///
+    /// ## 2026-10-01 语义变更：不再改 status，改置 `is_repairing` 标记
+    ///
+    /// REPAIRING 已从 `PartStatus` 降级为标记（migration 005/006）：返修仍在
+    /// 生产中，故 `status` 保持 `IN_PROCESS`（progress 与原 REPAIRING 同档
+    /// 2，rollup 结果不变），「是否在返修」改由 `is_repairing` 承载。
+    ///
+    /// 这同时**消掉了** migration 004「已知局限 (4d)」记的那个残留写点：本函数
+    /// 不再把批次翻出 `IN_PROCESS`，`current_process_id` 也就没有「该清未清」
+    /// 的问题（`new_process_id: None` + `clear_process_id: false` = 不动）。
+    pub async fn mark_batch_repairing(
+        conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query!(
-            r#"UPDATE t_part_batch SET status='REPAIRING', version=version+1,
-                updated_at=now(), updated_by=$3
-               WHERE id=$1 AND version=$2 AND status='IN_PROCESS' AND deleted_at IS NULL"#,
-            batch_id,
-            expected_version,
-            current_user_id,
+    ) -> Result<u64, AppError> {
+        status_gate::apply_batch_status_change(
+            conn,
+            StatusChange {
+                batch_id,
+                new_status: "IN_PROCESS",
+                new_location: None,
+                new_holder_id: None,
+                new_process_id: None,
+                new_process_step_id: None,
+                is_repairing: Some(true),
+                expected_version: Some(expected_version),
+                allowed_from: &["IN_PROCESS"],
+                updated_by: current_user_id,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
+                clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：归档事件 id 由 caller 透传。
+                event_id: None,
+            },
         )
-        .execute(executor)
-        .await?;
-        Ok(r.rows_affected())
+        .await
+        .map(|_| 1u64)
     }
 
     /// 2026-09-11 part/assembly/batch 重构方案 §4.2 (PR-B2)：part cancel 时
     /// 级联取消**全部活跃批次**（不只「最近一条 source-status」）。
     ///
-    /// 单条 UPDATE：`WHERE part_id = $1 AND deleted_at IS NULL` 把 part 下所有
-    /// 活跃 batch → CANCELLED（不走 OCC；version += 1；写 updated_by）。
-    /// 不在 SQL 上做 status 白名单过滤：cancel 5 状态白名单由 service 层
-    /// `can_transition_to` 守；此处只管「part 已决定 cancel，批量同步 batch」。
+    /// ## 2026-10-01：两处修正
     ///
-    /// 返回影响行数（0 表示 part 下无活跃批次 —— 不视为错误，由 caller 决定）。
-    pub async fn cancel_all_active_batches_for_part<'e, E: PgExecutor<'e>>(
-        executor: E,
+    /// **修正 1 —— 补状态白名单（真 bug）**：改造前的 WHERE 只有
+    /// `part_id=$1 AND deleted_at IS NULL`，**没有 status 过滤**，会把 part 下
+    /// 已经 COMPLETED 的批次一起拖成 CANCELLED。已完成的货被改写成「已作废」，
+    /// 之后按序列号 / 送货单回溯全都对不上，且该行不可逆（终态被改写）。此处补
+    /// `NOT (status IN ('COMPLETED','CANCELLED'))`。
+    ///
+    /// **修正 2 —— 走 status_gate bulk 模式**：改写完自动对受影响的每个 part
+    /// 补做**父装配件**派生（改造前 `PartService::cancel` 压根不调任何 sync，
+    /// 父装配件的派生状态靠下一次任意 part 流转才追平）。
+    ///
+    /// **修正 3 —— `PartDerivation::KeepPartTerminalAsIs`**（2026-10-01
+    /// review 第 1 轮 B1）：本函数在 `mark_part_cancelled` **之后**调用，此时
+    /// `t_part.status` 已由主操作写成 CANCELLED。而 min-progress 在「已完成批次
+    /// 而「其余被批量取消」时会算出 COMPLETED —— 若放任派生写，用户的「作废工单」
+    /// 会被静默改回 COMPLETED（接口 200、事件流水记 CANCELLED、界面显示已完成、
+    /// 序列号已清空可被复用），父装配件还会被级联推成 COMPLETED。故这里显式
+    /// 声明「part 已是终态，一个字都不许碰」，只继续派生父层。
+    ///
+    /// 终态守卫（`update_part_rollup` 的 `status NOT IN (...)`）是同一不变式的
+    /// SQL 层兜底，两处都要在：守卫拦住的是「派生写覆盖终态」，本策略额外保证
+    /// 「跳过 part 写的同时父装配件仍被派生追平」。
+    ///
+    /// 返回影响行数（0 表示 part 下无可取消的活跃批次 —— 不视为错误，由 caller 决定）。
+    pub async fn cancel_all_active_batches_for_part(
+        conn: &mut PgConnection,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
-            r#"
-            UPDATE t_part_batch
-            SET status     = 'CANCELLED',
-                version    = version + 1,
-                updated_at = now(),
-                updated_by = $2
-            WHERE part_id = $1 AND deleted_at IS NULL
-            "#,
+    ) -> Result<u64, AppError> {
+        let out = status_gate::apply_bulk_batch_status_change_for_part(
+            conn,
+            status_gate::BulkStatusChange {
+                part_id,
+                new_status: "CANCELLED",
+                excluded_statuses: &["COMPLETED", "CANCELLED"],
+                // 终态批次不可能还在返修（review 第 1 轮 m10）
+                is_repairing: Some(false),
+                updated_by: current_user_id,
+                derivation: status_gate::PartDerivation::KeepPartTerminalAsIs,
+                // part 已是终态，派生层不会再写它 → 不需要归档事件 id
+                event_id: None,
+            },
         )
-        .bind(part_id)
-        .bind(current_user_id)
-        .execute(executor)
         .await?;
-        Ok(r.rows_affected())
+        Ok(out.affected_rows)
     }
 
     /// 2026-09-30 新增（force-complete 端点）：part 域 MANAGER 单角色强推工单 +
@@ -872,26 +1047,35 @@ impl PartRepo {
     ///
     /// 返回影响行数（0 表示 part 下无非 CANCELLED 活跃批次 —— 仍合法，由 caller
     /// 决定；如新建工单未拆批就是 0 行）。
-    pub async fn force_complete_all_batches_for_part<'e, E: PgExecutor<'e>>(
-        executor: E,
+    ///
+    /// `event_id`（2026-10-01 review 第 1 轮 M4）：与 cancel 不同，本路径
+    /// **必须**让 part 派生进 COMPLETED（escape hatch 的全部意义所在），故
+    /// 终态序列号归档事件需要 caller 提供的雪花 id。
+    ///
+    /// `derivation = Rollup`（而非 cancel 那条路径的 `KeepPartTerminalAsIs`）：
+    /// service 层已守「part 不得是 COMPLETED / CANCELLED」，故此处 part 一定
+    /// 处于非终态，派生层可以正常写。
+    pub async fn force_complete_all_batches_for_part(
+        conn: &mut PgConnection,
         part_id: i64,
         current_user_id: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
-            r#"
-            UPDATE t_part_batch
-            SET status     = 'COMPLETED',
-                version    = version + 1,
-                updated_at = now(),
-                updated_by = $2
-            WHERE part_id = $1 AND deleted_at IS NULL
-              AND status <> 'CANCELLED'
-            "#,
+        event_id: Option<i64>,
+    ) -> Result<u64, AppError> {
+        // 终态保护只守 CANCELLED（COMPLETED 幂等重写无副作用，与改造前一致）。
+        let out = status_gate::apply_bulk_batch_status_change_for_part(
+            conn,
+            status_gate::BulkStatusChange {
+                part_id,
+                new_status: "COMPLETED",
+                excluded_statuses: &["CANCELLED"],
+                // 终态批次不可能还在返修（review 第 1 轮 m10）
+                is_repairing: Some(false),
+                updated_by: current_user_id,
+                derivation: status_gate::PartDerivation::Rollup,
+                event_id,
+            },
         )
-        .bind(part_id)
-        .bind(current_user_id)
-        .execute(executor)
         .await?;
-        Ok(r.rows_affected())
+        Ok(out.affected_rows)
     }
 }

@@ -29,8 +29,8 @@
 | POST | `/api/v2/parts/{part_id}/upload-3d-model` | Manager / Clerk | Multipart 3D 模型上传到 COS（STEP/STP/IGES/IGS/STL/OBJ/3MF）+ 落 `t_part_file`（2026-09-11 新增） | [`crud.md`](./crud.md#post-apiv2partspart_idupload-3d-model) |
 | POST | `/api/v2/parts/{part_id}/deliver` | Manager / Clerk | READY_TO_SHIP → DELIVERED | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_iddeliver) |
 | POST | `/api/v2/parts/{part_id}/cancel` | Manager / Clerk | 5 状态白名单 → CANCELLED（拒 delivery_note 锁） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idcancel) |
-| POST | `/api/v2/parts/{part_id}/complete` | Manager / Clerk | DELIVERED → COMPLETED（清空 serial_no） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idcomplete) |
-| POST | `/api/v2/parts/{part_id}/start-repair` | Manager / Clerk / Inspector | IN_PROCESS → REPAIRING | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idstart-repair) |
+| POST | `/api/v2/parts/{part_id}/complete` | Manager / Clerk | DELIVERED → COMPLETED（**part 派生到终态时**才清空 serial_no：先写 `SERIAL_RELEASED` 归档事件再清列） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idcomplete) |
+| POST | `/api/v2/parts/{part_id}/start-repair` | Manager / Clerk / Inspector | **2026-10-01**：置 `is_repairing=true`（status 不变，仍 IN_PROCESS） | [`lifecycle.md`](./lifecycle.md#post-apiv2partspart_idstart-repair) |
 | POST | `/api/v2/parts/batch-to-inspection` | Manager / Inspector | 批量送检（PENDING/PROGRAMMING/IN_PROCESS → INSPECTION） | [`inspection.md`](./inspection.md#post-apiv2partsbatch-to-inspection) |
 | POST | `/api/v2/parts/{part_id}/to-inspection` | Manager / Inspector | 单件送检 | [`inspection.md`](./inspection.md#post-apiv2partspart_idto-inspection) |
 | POST | `/api/v2/parts/batch-to-ship` | Manager / Inspector | 批量通过品检（INSPECTION → READY_TO_SHIP） | [`inspection.md`](./inspection.md#post-apiv2partsbatch-to-ship) |
@@ -225,13 +225,121 @@
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → `20101`
 - **状态机**：详见 [状态机（can_transition_to 白名单）](./inspection.md#状态机can_transition_to-白名单)；不在白名单内的 source / target 组合返回 `20103 BIZ_INVALID_TRANSITION`（迁移表见 `src/modules/part/statemachine.rs`）
 - **事件日志**：状态迁移在 service 内事务内统一插入对应事件，service 提交后由 WS 中枢广播
-- **part↔batch 同步（PR-B2/B3 改写，2026-09-11）**：
-  part.status 不再直接 UPDATE，而是由 `PartService::sync_from_batch_change`
-  按"最慢批次"规则 rollup（min-progress）。lifecycle 终态 / 翻转（deliver / cancel /
-  complete / start-repair）只在最近一条 source-status 批次上翻状态；装配体子件
-  rollup 同步触发（见 [`../assemblies/index.md#子件状态聚合`](../assemblies/index.md#子件状态聚合auto-rollup)）。
-  详见 [`docs/refactor-part-assembly-batch.md`](../../refactor-part-assembly-batch.md)。
+- **part↔batch 同步（PR-B2/B3 改写 2026-09-11；2026-10-01 收口为 status_gate 单一写入口）**：
+  part.status 不再直接 UPDATE，而是由「写批次状态」那一个函数一并在事务内派生
+  （`part::service::status_gate::apply_batch_status_change`，min-progress 规则）。
+  lifecycle 终态 / 翻转（deliver / cancel / complete / start-repair）只在最近一条
+  source-status 批次上翻状态；装配体子件 rollup 同步触发（见
+  [`../assemblies/index.md#子件状态聚合`](../assemblies/index.md#子件状态聚合auto-rollup)）。
+  详见 [`docs/refactor-part-assembly-batch.md`](../../refactor-part-assembly-batch.md) 与
+  [状态派生契约](#状态派生契约2026-10-01)。
 ---
+
+## 状态派生契约（2026-10-01）
+
+### 状态词汇（batch 与 part 共用同一套 8 个值）
+
+| status | progress | 说明 |
+|---|---|---|
+| `PENDING` | 0 | 待下发 / 待加工 |
+| `PROGRAMMING` | 1 | **已废弃的进入路径**（2026-09-29）：枚举、`as_str`、`from_str` 映射与 4 条出口边（`→ PENDING` / `→ IN_PROCESS` / `→ INSPECTION` / `→ CANCELLED`）保留，**只为消化历史数据**；新流程不产生该状态（待编程一览改由 `t_process.is_cnc` 列驱动） |
+| `IN_PROCESS` | 2 | 生产中（含**返修中**） |
+| `OUTSOURCE` | 3 | 外协加工中 |
+| `INSPECTION` | 4 | 待品检 |
+| `READY_TO_SHIP` | 5 | 待发货 |
+| `DELIVERED` | 6 | 已交付 |
+| `COMPLETED` / `CANCELLED` | 终态 | 终态（`part_status_progress` 不给终态定档，由 `compute_*_target` 单独短路处理） |
+
+**返修不再是状态**（2026-10-01 BREAKING CHANGE，migration 005/006）：批次返修中时
+`status` 保持 `IN_PROCESS`（progress 同档 2），返修事实改由
+**`t_part_batch.is_repairing`（boolean，默认 false）** 承载。所有「返修中」的查询 /
+守卫一律读该列，不再判 `status = 'REPAIRING'`（DB 里不再产生该字面量；
+`PartStatus::from_str("REPAIRING")` 保留 → `IN_PROCESS` 的过渡兼容分支）。
+
+### 三层单向派生 + 单一写入口
+
+```
+t_part_batch.status            ← 唯一真源
+   │  status_gate::rollup_part_derived（min-progress）
+   ▼
+t_part.status / next_process_id   ← 派生缓存
+   │  assembly::compute_assembly_target
+   ▼
+t_assembly.status               ← 派生缓存
+```
+
+- **所有 `t_part_batch.status` 写入必须走
+  `src/modules/part/service/status_gate.rs`**（`apply_batch_status_change` 单行 /
+  `apply_bulk_batch_status_change_for_part` 批量）。它在一事务内完成
+  「写批次（OCC + 源状态白名单）→ 回填 part 派生列 → 级联 assembly →
+  终态序列号归档 / 释放」。
+- **caller 不需要、也不应该自己再调 sync**：13 个历史 `mark_batch_*` 写点已全部
+  改写为 status_gate 之上的薄包装，函数名与参数不变。
+- 改造动因：收口前有 3 个写点漏调 sync，派生缓存长期与真源不一致且**不报任何错**
+  （只是列表页显示错状态）。
+- **CI 强制**：`cargo test --lib` 里的
+  `part::service::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
+  扫描全 `src/**/*.rs`，除 `status_gate.rs` 外任何文件写
+  `UPDATE t_part_batch SET status …` 即测试失败（注释 / `#[cfg(test)]` 块 /
+  只改其它列的 UPDATE 不在判定范围，细则见该测试文档注释）。
+- 派生层的 OCC 冲突**一律降级为「跳过 + `tracing::warn!`」**，绝不让派生缓存否决
+  用户的主操作（详见 [`../assemblies/index.md#子件状态聚合`](../assemblies/index.md#子件状态聚合auto-rollup)）。
+- **派生层也不得覆盖主操作**（2026-10-01 review 第 1 轮 B1）：`POST /parts/{id}/cancel`
+  先把 part 打成 CANCELLED，随后的批次级联若算出 COMPLETED（「已完成批次 + 其余被批量
+  取消」）**不许**写回。`update_part_rollup` 的 `status NOT IN ('COMPLETED','CANCELLED')`
+  是 SQL 层兜底，bulk 入口的 `PartDerivation::KeepPartTerminalAsIs` 是显式表达
+  （跳过 part 写的同时**继续**派生父装配件）。已知代价：已终态的 part 不再被 rollup /
+  对账端点改写。
+- **`StatusChange` 的三态**：`Option` 的 `None` = 「保持原值」，「清 NULL」由
+  `clear_location` / `clear_holder_id` / `clear_process_id` /
+  `clear_process_step_id` 显式表达。出池写点（召回 / 送检 / 外协收回 / 返修出池）
+  必须同时清这 4 列。
+- **终态序列号归档事件的 id 取自 `SnowflakeIdGenerator`**（`StatusChange::event_id`
+  由 caller 透传）：`GET /parts/{id}/events` 是 `ORDER BY id DESC`，用建单期的
+  `part_id` 顶替会把归档事件排到时间线最底部，且 part 二次进终态时 pkey 冲突。
+- 兜底修正入口：`POST /api/v2/admin/recompute-rollup`（Manager）—— **复用**上述
+  派生函数重跑一遍并回报 before→after，幂等；全量对账用**分表游标**续扫
+  （响应回 `next_part_after_id` / `next_assembly_after_id`，回传为请求的
+  `part_after_id` / `assembly_after_id`）直到 `truncated=false`。两表 id 来自同一
+  个雪花流且按时间序交错，**必须分表推进**（review 第 2 轮 MAJOR-2：共用一个游标会
+  永久跳过 `(assembly_max, part_max]` 那段装配件却仍报 `truncated=false`）。
+  报告里 `parts_skipped_terminal > 0` = 「已终态、派生被守卫跳过」，≠「数据已一致」。
+  见 [`../admin.md`](../admin.md)。
+
+> **migration 007 注释订正（2026-10-01 review 第 1 轮 m1）**：007 里「
+> `t_part_event.id` 无默认值、SQL 里无法生成雪花 ID」这句是**错的** ——
+> baseline 已有 `SET DEFAULT nextval('t_part_event_id_seq')`（reviewer 已在
+> information_schema 确认）。007 选 `MAX(id)+ROW_NUMBER()` 的**结论**仍然可用
+> （运行时那条路径拿不到雪花生成器），但理由是「不与运行时生成的 id 抢空间 /
+> 排到时间线顶部」而不是「无默认值」。运行时路径已改为由 caller 透传真实雪花
+> （见上一条），故 migration 007 本身按 append-only 约定**保持原样不改**
+> （改它会变更 sqlx 记录的 checksum，让已 apply 过该迁移的库启动失败）。
+>
+> **TODO(2026-10-01 review 第 2 轮 MINOR-4，follow-up PR —— 上线窗口需人工评估)**：
+> `migrations/20261001000200_007_serial_release.sql:113-118` 是
+> `DROP INDEX` + **非并发** `CREATE UNIQUE INDEX` + 全表 `UPDATE`。在生产级
+> `t_part` 上，事务内的 `CREATE INDEX` 会持 `ACCESS EXCLUSIVE` 锁**贯穿整个构建**，
+> 部署即阻塞全部 part 写（读写一起停），且全表 UPDATE 耗时与表大小线性相关。
+> 正确做法是 `-- no-transaction` 迁移 + `CREATE UNIQUE INDEX CONCURRENTLY`
+> （并发建索引不持写锁；失败会留 INVALID 索引，需手工 DROP 重建）。
+> **本轮不改**：append-only 铁律禁止修改已存在的 migration 文件（改内容会变更
+> sqlx 记录的 checksum，让已 apply 过该迁移的库启动失败），而新增一个「重建索引」
+> 的 migration 属于另一个 PR 的范围。上线前请人工评估该迁移的锁窗口，必要时改在
+> 低峰期执行，或用「新 migration + CONCURRENTLY」补建。
+
+### 序列号（`serial_no`）生命周期
+
+| 阶段 | 行为 |
+|---|---|
+| 派发 | 建件时由 `t_serial_counter` 按 L1 客户 `serial_prefix` 生成；`uk_t_part_serial_no` 唯一索引保证不重复 |
+| 流转中 | 序列号在 part 的**整个非终态期**持续占用该唯一索引（货还在厂里，正确） |
+| 进入终态（`COMPLETED` / `CANCELLED`） | 由 rollup step 4 自动释放：**先**归档一条 `t_part_event`（`event_type='SERIAL_RELEASED'`，`note` 记原序列号）**再**清 `t_part.serial_no`。每个 part 至多 1 条归档事件（终态不可重复进入） |
+| 父装配件进终态 | 直接清 `t_assembly.serial_no`（不归档：`t_assembly` 无事件表，其 `note` 是用户可编辑业务备注，拿它记系统动作会污染用户数据） |
+| 取消（`CANCELLED`） | 同样释放（2026-10-01：唯一索引谓词已补 `deleted_at IS NULL AND status <> 'CANCELLED'`，软删 / 作废工单不再占坑） |
+
+调用方**不需要**为序列号做任何事：释放是 rollup 的一步，`deliver` / `complete` /
+`cancel` / `force-complete` 等端点都自动带上（2026-10-01 起 `force-complete`
+也不再单独调清理函数）。
 
 ## 状态机
 
