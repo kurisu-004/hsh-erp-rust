@@ -50,10 +50,22 @@ pub struct AppConfig {
     /// 已死 → 发 `1011 pong timeout` Close 帧并断开（清理半开 TCP 连接 / 死标签页）。
     /// 环境变量 `WS_PONG_TIMEOUT_SECONDS`，缺省 `60`（= 3× ping 间隔，容忍连续丢 2 次）。
     ///
-    /// 启动期强制校验 `pong_timeout > ping_interval`（见 `ws_liveness_config`）：
-    /// 反之（`pong_timeout <= ping_interval`）会在客户端还没来得及回 `Pong` 的窗口内
-    /// 就判死，**误杀健康连接**。
+    /// 2026-10-02 修复（review 第 1 轮 Major-2）：启动期强制校验由 `> ping_interval`
+    /// 收紧为 **`>= 2 × ping_interval`**（见 `validate_ws_liveness`）。原校验只挡
+    /// `pong_timeout <= ping_interval`，于是 `ping=20 / pong=21` 这种只有 **1s 余量**
+    /// 的配置能通过启动校验，而 1s 余量在 RTT + tokio 调度抖动下极易被击穿 → 健康连接
+    /// 被误判为已死。2× 是「连续丢 1 次 Pong 仍不判死」的下限；缺省 3×（60/20）。
     pub ws_pong_timeout_seconds: u64,
+    /// 2026-10-02 新增：每 N 次 text 心跳做一次周期性 re-auth（发 `4001` 的前置闸）。
+    ///
+    /// 为什么做成配置项而不是 `const`：原 `WS_REAUTH_EVERY_N_HEARTBEATS` 是硬编码
+    /// `const 10`，而测试配置的 text 心跳是 1s → 触发一次要跑 >10s，CI 上根本没法
+    /// 验证「re-auth 失败 → 4001」这条**安全核心路径**（review 第 1 轮 Minor 7）。
+    /// 可注入后 E2E 用例传 `2`，两秒内即可验到。
+    ///
+    /// 环境变量 `WS_REAUTH_EVERY_N_HEARTBEATS`，缺省 `10`（生产 30s × 10 ≈ 5min）。
+    /// 启动期强制校验 `>= 1`（0 会让 `is_multiple_of(0)` panic）。
+    pub ws_reauth_every_n_heartbeats: u32,
     /// 2026-09-20 新增：HTTP `/api/v2/*` nest 请求超时（秒）。仅挂在 nest 内层
     /// （不影响 WS 长连接，也不影响根 Router 的 CORS/Body limit）。环境变量
     /// `REQUEST_TIMEOUT_SECONDS`，缺省 `30`。
@@ -347,9 +359,11 @@ impl AppConfig {
         let _ = dotenvy::from_filename(env_file);
 
         // 2026-10-01 新增：WS 存活检测两个参数**成对解析 + 成对校验**。提前于 struct
-        // literal 是因为 `pong_timeout > ping_interval` 是跨字段约束，struct literal
+        // literal 是因为 `pong_timeout >= 2 × ping_interval` 是跨字段约束，struct literal
         // 的字段之间无法互相引用。
         let (ws_ping_interval_seconds, ws_pong_timeout_seconds) = ws_liveness_config()?;
+        // 2026-10-02 新增：re-auth 周期同样在启动期校验（0 会 panic）。
+        let ws_reauth_every_n_heartbeats = ws_reauth_config()?;
 
         Ok(Self {
             database_url: build_database_url()?,
@@ -503,6 +517,8 @@ impl AppConfig {
             // `ws_liveness_config` 的交叉校验。text 心跳与协议层 Ping 职责分离，两者并存。
             ws_ping_interval_seconds,
             ws_pong_timeout_seconds,
+            // 2026-10-02 新增：周期性 re-auth 的心跳周期（可注入，便于 CI 覆盖 4001 路径）。
+            ws_reauth_every_n_heartbeats,
             // 2026-09-20 新增：HTTP nest 请求超时；与 WS 隔离（挂在内层）。
             request_timeout_seconds: env_parse("REQUEST_TIMEOUT_SECONDS", 30u64)?,
             // 2026-09-23 新增 Idempotency 中间件 TTL（秒）。
@@ -604,32 +620,65 @@ fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// 2026-10-01 新增：解析 + 交叉校验 WS 存活检测的两个参数
-/// （`WS_PING_INTERVAL_SECONDS` / `WS_PONG_TIMEOUT_SECONDS`）。
+/// 2026-10-01 新增：解析 WS 存活检测的两个环境变量
+/// （`WS_PING_INTERVAL_SECONDS` / `WS_PONG_TIMEOUT_SECONDS`）后交给纯函数交叉校验。
+///
+/// 拆成「读 env」+「纯校验」两层的理由（2026-10-02 review 第 1 轮 Major-2）：`env_parse`
+/// 读的是**进程级全局 env**，同进程内并行单测互相覆盖会 flaky；而交叉校验本身零 IO，
+/// 拆开后单测直接喂字面量即可确定性地覆盖边界。
+fn ws_liveness_config() -> Result<(u64, u64)> {
+    let ping_interval = env_parse("WS_PING_INTERVAL_SECONDS", 20u64)?;
+    let pong_timeout = env_parse("WS_PONG_TIMEOUT_SECONDS", 60u64)?;
+    validate_ws_liveness(ping_interval, pong_timeout)
+}
+
+/// WS 存活检测交叉校验（**纯函数、零 IO**，便于单测直接喂字面量）。
 ///
 /// 校验规则（任一不满足即 bail，**fail-fast**：宁可不启动，也不要带病上线误杀连接）：
 /// 1. `ping_interval >= 1`（0 会让 Ping 定时器每轮 select 立刻 ready，空转打满 CPU）；
 /// 2. `pong_timeout >= 1`（0 意味着一连接上就判死）；
-/// 3. `pong_timeout > ping_interval`（**最关键**）：反之会在客户端还没来得及按
-///    RFC 6455 §5.5.2 回 `Pong` 的窗口内就把健康连接判死。
+/// 3. `pong_timeout >= 2 × ping_interval`（**最关键**）。
 ///
-/// 默认 20 / 60（3× 容忍连续丢 2 次 `Pong`）。
-fn ws_liveness_config() -> Result<(u64, u64)> {
-    let ping_interval = env_parse("WS_PING_INTERVAL_SECONDS", 20u64)?;
-    let pong_timeout = env_parse("WS_PONG_TIMEOUT_SECONDS", 60u64)?;
+/// ## 为什么第 3 条是 2× 而不是 1×（2026-10-02 修复 review 第 1 轮 Major-2）
+/// 判定用的 deadline 是「最后一次入站帧时刻 + pong_timeout」，而入站帧的**唯一常规来源**
+/// 是对 `Message::Ping` 的 `Pong` 回声（周期 = ping_interval）。所以
+/// `pong_timeout - ping_interval` 就是留给「RTT + 客户端处理 + 回程 + tokio 调度抖动 +
+/// 服务端 30s text 心跳分支里的 `select!` 排队」的**总余量**。
+///
+/// 原校验只挡 `pong_timeout <= ping_interval`，于是 `ping=20 / pong=21`（余量 **1s**）
+/// 能过启动校验——1s 在跨网 RTT 或 CI/生产调度抖动下极易被击穿，结果是**健康连接被判死**
+/// （而这条判死恰好会踢掉真正在用的大屏）。2× 是「连续丢 1 次 Pong 仍不判死」的下限；
+/// 缺省 60/20 = 3×（容忍连续丢 2 次）。
+fn validate_ws_liveness(ping_interval: u64, pong_timeout: u64) -> Result<(u64, u64)> {
     if ping_interval == 0 || pong_timeout == 0 {
         return Err(anyhow!(
             "WS_PING_INTERVAL_SECONDS / WS_PONG_TIMEOUT_SECONDS 必须 ≥ 1 \
              （当前 ping_interval={ping_interval} pong_timeout={pong_timeout}）"
         ));
     }
-    if pong_timeout <= ping_interval {
+    if pong_timeout < ping_interval.saturating_mul(2) {
         return Err(anyhow!(
-            "WS_PONG_TIMEOUT_SECONDS({pong_timeout}) 必须 > WS_PING_INTERVAL_SECONDS({ping_interval})：\
-             否则客户端还没来得及回 Pong 就会被判死，健康连接会被误杀"
+            "WS_PONG_TIMEOUT_SECONDS({pong_timeout}) 必须 ≥ 2 × WS_PING_INTERVAL_SECONDS({ping_interval})：\
+             1~2 倍余量扛不住 RTT + 调度抖动，会误杀健康连接（缺省 60/20 = 3×）"
         ));
     }
     Ok((ping_interval, pong_timeout))
+}
+
+/// 2026-10-02 新增：解析周期性 re-auth 的心跳周期 `WS_REAUTH_EVERY_N_HEARTBEATS`。
+///
+/// 独立于 `ws_liveness_config`：它不属于「存活检测」而是「鉴权刷新」，但同样需要
+/// 启动期校验——0 会让 handler 里的 `is_multiple_of(0)` panic（tokio/rust 的
+/// `is_multiple_of` 对 0 会 panic，不是返回 false）。
+fn ws_reauth_config() -> Result<u32> {
+    let every_n = env_parse("WS_REAUTH_EVERY_N_HEARTBEATS", 10u32)?;
+    if every_n == 0 {
+        return Err(anyhow!(
+            "WS_REAUTH_EVERY_N_HEARTBEATS 必须 ≥ 1（当前 0：会让 is_multiple_of(0) panic，\
+             且语义上等于永不 re-auth）"
+        ));
+    }
+    Ok(every_n)
 }
 
 /// 从 PEM 文件加载 RS256 私钥 → `jsonwebtoken::EncodingKey`。
@@ -754,5 +803,51 @@ mod tests {
     fn wecom_config_debug_masks_corpsecret_even_when_blank() {
         let dbg = format!("{:?}", WeComConfig::default());
         assert!(dbg.contains("corpsecret: \"***\""), "{dbg}");
+    }
+
+    // =======================================================================
+    // 2026-10-02 新增（review 第 1 轮 Major-2）：`validate_ws_liveness` 的边界闸。
+    //
+    // 原实现只挡 `pong_timeout <= ping_interval`，`ping=20 / pong=21`（1s 余量）
+    // 能过启动校验，而 1s 余量扛不住 RTT + 调度抖动 → 误杀健康连接。
+    // 改为 `pong_timeout >= 2 × ping_interval` 后这两个用例分别是
+    // 「1s 余量必须被拒」与「缺省 3× 必须放行」两侧的钉子。
+    //
+    // 直接调纯函数（不设 env）：`env_parse` 读进程级 env，同进程并行单测会互相覆盖。
+    // =======================================================================
+
+    /// 回归闸：`ping=20 / pong=21`（余量 1s）必须 **bail**，不能放行。
+    #[test]
+    fn ws_liveness_rejects_one_second_headroom() {
+        let err = validate_ws_liveness(20, 21).expect_err("余量仅 1s，应被拒绝");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("必须 ≥ 2 × WS_PING_INTERVAL_SECONDS(20)"),
+            "报错文案应说明 2× 约束，实际：{msg}"
+        );
+    }
+
+    /// 缺省 20 / 60（3×）必须放行。
+    #[test]
+    fn ws_liveness_accepts_three_times_default() {
+        assert_eq!(
+            validate_ws_liveness(20, 60).expect("3× 缺省应放行"),
+            (20, 60)
+        );
+    }
+
+    /// 2× 边界本身必须放行（`>=` 而非 `>`），且 0 值仍被拒（`is_multiple_of` 无关、
+    /// 但 interval 周期为 0 会 panic）。
+    #[test]
+    fn ws_liveness_boundary_two_times_is_ok_and_zero_rejected() {
+        assert_eq!(validate_ws_liveness(20, 40).expect("2× 应放行"), (20, 40));
+        assert!(
+            validate_ws_liveness(0, 60).is_err(),
+            "ping=0 必须 bail（interval 周期为 0 会 panic）"
+        );
+        assert!(
+            validate_ws_liveness(20, 0).is_err(),
+            "pong=0 必须 bail（一连接上就判死）"
+        );
     }
 }

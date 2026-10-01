@@ -21,6 +21,8 @@
 //!    13. ws_e2e_pong_timeout_closes_dead_peer  — 不回任何帧 → 1011 pong timeout Close 帧
 //!    14. ws_e2e_conn_registry_counts           — 连接表 register/unregister 计数
 //!    15. ws_e2e_server_shutdown_sends_1012     — shutdown.cancel() → 1012 server restart
+//!    16. ws_e2e_reauth_failure_sends_4001_close — 2026-10-02 新增（Minor 7）：
+//!         吊销 session → 周期性 re-auth 失败 → 4001 auth expired Close 帧
 //!
 //!   HTTP `GET /api/v2/dashboard/snapshot` 集成测试（2026-09-28 新增 + 2026-09-30 扩 query）：
 //!     8. http_snapshot_unauthenticated_returns_401   — 无 Bearer token 应返 401（中间件）
@@ -446,7 +448,23 @@ async fn wait_for_close(
 }
 
 /// 签发合法 access token + 写入 Redis session，使 dashboard WS 握手通过。
+/// 只返回 token（多数用例只需要它）。
 async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
+    mint_test_token_with_jti(state, user_id).await.0
+}
+
+/// 2026-10-02 新增：同上，但**一并返回 jti**（= Redis session key 后缀）。
+///
+/// 为什么需要 jti：本文件所有用例的 snowflake generator 都写死 `instance = 1`
+/// （`SnowflakeIdGenerator::new(1_577_836_800_000, 1)`），所以**并行执行的用例之间
+/// user_id 会撞**。`ws_e2e_reauth_failure_sends_4001_close` 若用
+/// `delete_all_user_sessions(user_id)` 吊销 session，会把并发用例（撞到同一 user_id）
+/// 的 session 一起删掉 → 那些用例的 re-auth 无端失败，表现为莫名其妙的 flake。
+/// 精确到 jti 的 `delete_session(&jti)` 没有这个副作用。
+async fn mint_test_token_with_jti(
+    state: &Arc<hsh_erp_rust::state::AppState>,
+    user_id: i64,
+) -> (String, String) {
     use hsh_erp_rust::auth::session::{CachedUserProfile, TokenKind};
     // 2026-09-23 重构：encode_access 第 2-7 参数改为 `(private_key, signing_kid, issuer, audience, subject, ttl_seconds)` —— RS256 + kid 多密钥轮换；
     // 返回三元组 `(token, jti, exp)`，jti 即为 Redis session key 后缀来源（`session:tok:<jti>`），无需再调用 `hash_token`。
@@ -478,7 +496,7 @@ async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i6
         )
         .await
         .expect("create_session");
-    token
+    (token, jti)
 }
 
 #[tokio::test]
@@ -763,6 +781,58 @@ async fn ws_e2e_conn_registry_counts() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(state.ws_hub.conn_count(), 0, "连接关闭后应已出表");
+}
+
+/// B4 + Minor-7：周期性 re-auth 失败（session 被吊销）→ 服务端发 `4001 auth expired`
+/// Close 帧（前端契约：清本地 token 跳登录页，**不要**重连）。
+///
+/// 依赖「re-auth 周期可注入」（`AppConfig::ws_reauth_every_n_heartbeats`，review 第 1 轮
+/// Minor 7 改动）：test-support 默认 `2` + text 心跳 1s → 每 2s 验一次，~2s 内即可验到。
+/// 改之前是硬编码 `const 10`，触发一次要跑 >10s，这条**安全核心路径**在 CI 上永远覆盖不到。
+///
+/// 对应的另一半契约（基础设施故障 → `1011 re-auth unavailable`，而不是 4001）由
+/// `src/modules/dashboard/handler.rs` 的单测 `reauth_infra_failure_maps_to_1011_not_4001`
+/// 钉死（要端到端造「Redis 故障」需自定义 `SessionStore` 实现，代价远大于收益）。
+#[tokio::test]
+async fn ws_e2e_reauth_failure_sends_4001_close() {
+    let (base, state) = spawn_ws_server().await;
+    let reauth_every = state.config.ws_reauth_every_n_heartbeats;
+    let heartbeat = state.config.ws_heartbeat_interval_seconds;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let user_id = snowflake.next_id();
+    let (token, jti) = mint_test_token_with_jti(&state, user_id).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed for valid token");
+    // 收首条 snapshot，确保 handler 已进主循环（否则吊销可能赶在 subscribe 之前）
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("snapshot 超时")
+        .expect("ws stream closed")
+        .expect("ws frame err");
+
+    // 精确吊销**本条** session（等价于「用户登出 / 管理员踢」）→ 下一轮 re-auth 的
+    // `get_session` 返 None → `verify_session_token` 返 40105 SESSION_REVOKED。
+    //
+    // ⚠️ 必须按 jti 删，不能用 `delete_all_user_sessions(user_id)`：本文件所有用例的
+    // snowflake generator 都写死 instance=1，并行用例之间 user_id 会撞，用 user_id
+    // 删会把并发用例的 session 一起干掉 → 那些用例的 re-auth 无端失败（见 helper 注释）。
+    state
+        .session
+        .delete_session(&jti)
+        .await
+        .expect("delete_session（模拟登出）");
+
+    let wait = Duration::from_secs(heartbeat * u64::from(reauth_every) + 8);
+    let reason = wait_for_close(&mut ws, 4001, wait).await;
+    assert_eq!(
+        reason.as_deref(),
+        Some("auth expired"),
+        "session 被吊销后应在 ~{}s 内收到 4001 / reason=auth expired（heartbeat={heartbeat}s × reauth_every={reauth_every}）",
+        heartbeat * u64::from(reauth_every)
+    );
 }
 
 /// B2 + B4：`state.shutdown.cancel()`（生产 = Ctrl-C 优雅退出）→ 服务端发

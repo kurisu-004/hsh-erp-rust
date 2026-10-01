@@ -133,6 +133,10 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         // 验到 Ping 回声 / 死连接被踢。
         ws_ping_interval_seconds: 1,
         ws_pong_timeout_seconds: 3,
+        // 2026-10-02 新增：周期性 re-auth 的心跳周期。测试默认 2 —— 心跳 1s，
+        // 即每 2s 验一次 session，让「re-auth 失败 → 4001」这条安全核心路径
+        // 在 CI 上可被 E2E 覆盖（缺省 10 需要 >10s，见 review 第 1 轮 Minor 7）。
+        ws_reauth_every_n_heartbeats: 2,
         // 2026-09-20 新增：HTTP nest 请求超时；30s 默认足够测试用例（<1s）。
         request_timeout_seconds: 30,
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
@@ -295,6 +299,10 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         // 验到 Ping 回声 / 死连接被踢。
         ws_ping_interval_seconds: 1,
         ws_pong_timeout_seconds: 3,
+        // 2026-10-02 新增：周期性 re-auth 的心跳周期。测试默认 2 —— 心跳 1s，
+        // 即每 2s 验一次 session，让「re-auth 失败 → 4001」这条安全核心路径
+        // 在 CI 上可被 E2E 覆盖（缺省 10 需要 >10s，见 review 第 1 轮 Minor 7）。
+        ws_reauth_every_n_heartbeats: 2,
         // 2026-09-20 新增：HTTP nest 请求超时。
         request_timeout_seconds: 30,
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
@@ -433,6 +441,10 @@ pub async fn test_state_with_cos(
         // 验到 Ping 回声 / 死连接被踢。
         ws_ping_interval_seconds: 1,
         ws_pong_timeout_seconds: 3,
+        // 2026-10-02 新增：周期性 re-auth 的心跳周期。测试默认 2 —— 心跳 1s，
+        // 即每 2s 验一次 session，让「re-auth 失败 → 4001」这条安全核心路径
+        // 在 CI 上可被 E2E 覆盖（缺省 10 需要 >10s，见 review 第 1 轮 Minor 7）。
+        ws_reauth_every_n_heartbeats: 2,
         // 2026-09-20 新增：HTTP nest 请求超时。
         request_timeout_seconds: 30,
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）

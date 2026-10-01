@@ -237,6 +237,8 @@ pub fn test_app_config() -> Arc<AppConfig> {
         // 且需满足 `pong_timeout > ping_interval` 的语义约束）。
         ws_ping_interval_seconds: 20,
         ws_pong_timeout_seconds: 60,
+        // 2026-10-02 新增：周期性 re-auth 周期（与生产缺省一致）。
+        ws_reauth_every_n_heartbeats: 10,
         request_timeout_seconds: 30,
         // 2026-09-28 删除：相关上传会话域字段（域整体下线）。
         idempotency_ttl_seconds: 86400,
