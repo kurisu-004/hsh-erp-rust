@@ -22,7 +22,7 @@ use sqlx::PgConnection;
 
 use crate::modules::part::batch::model::TPartBatch;
 // 2026-10-01：`update_batch_dispatched` 改走 status_gate（唯一批次状态写入口）。
-use crate::modules::part::repo::status_gate::{self, StatusChange};
+use crate::modules::part::service::status_gate::{self, StatusChange};
 use crate::shared::error::AppError;
 
 /// `prod::batch` ZST 静态方法容器。
@@ -235,7 +235,14 @@ impl BatchRepo {
                 expected_version: Some(expected_version),
                 allowed_from: &["PENDING"],
                 updated_by: updated_by.unwrap_or(0),
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
                 clear_process_id: false,
+                clear_process_step_id: false,
+                // 目标状态 IN_PROCESS 不是终态 → 终态归档事件分支不可达（M4）
+                event_id: None,
             },
         )
         .await

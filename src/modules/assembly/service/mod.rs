@@ -206,7 +206,7 @@ impl AssemblyService {
 
     /// 2026-10-01 新增：只收 `updated_by` 的单 part → assembly sync 钩子。
     ///
-    /// 唯一调用方是 `part::repo::status_gate`（batch → part → assembly 单一写
+    /// 唯一调用方是 `part::service::status_gate`（batch → part → assembly 单一写
     /// 入口）—— 该链路上只有 `updated_by`，没有登录用户上下文。
     pub async fn sync_from_part_change_by_id(
         conn: &mut sqlx::PgConnection,

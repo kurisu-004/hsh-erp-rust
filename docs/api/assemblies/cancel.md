@@ -29,6 +29,13 @@ Request：无 body（cancel 是单向状态翻转，无 OCC）。
 Response 200 `data`：[`AssemblyOut`](./index.md#assemblyout-字段)
 
 > 业务流转：repo 按 `status NOT IN ('COMPLETED','CANCELLED')` 守卫；命中 0 行 → `BIZ_INVALID_TRANSITION`（终态禁 cancel 或已删除）。
+>
+> **2026-10-01 review 第 1 轮 M3**：cancel 成功后**同事务**补一次
+> `clear_serial_no_if_terminal` 清空 `t_assembly.serial_no` ——
+> `uk_t_assembly_serial_no` 的谓词是 `deleted_at IS NULL AND serial_no IS NOT NULL`，
+> **不含 status 条件**，只翻状态的话一个作废的装配件会**永久占着**它的序列号，
+> 同序列号再也无法被新工单复用。migration 007 只清存量行，新增量原本会继续漏。
+> 父装配件由子件派生进终态时（rollup step 5）也走同一条清理，二者幂等。
 
 WS 广播（commit 后下发）：
 

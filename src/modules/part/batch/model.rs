@@ -147,7 +147,7 @@ pub struct TPartBatch {
     ///
     /// REPAIRING 已从 `PartStatus` 降级为标记（flag），`status` 保持
     /// `IN_PROCESS`（返修仍在生产中，progress 与 IN_PROCESS 同档）；
-    /// 返修事实改由本列承载。写入路径**唯一**：`repo::status_gate::
+    /// 返修事实改由本列承载。写入路径**唯一**：`service::status_gate::
     /// apply_batch_status_change`（`is_repairing: Some(bool)`），caller 无
     /// 「要不要顺手写一下」的选择权。
     ///
@@ -218,6 +218,11 @@ pub struct InspectionBatchListRow {
     pub batch_no: i32,
     pub quantity: i32,
     pub status: String,
+    /// 2026-10-01 review 第 1 轮 M5 新增（migration 005）：REPAIRING 已从
+    /// `PartStatus` 降级为标记列，**必须**随列表一起投出 —— 否则前端在
+    /// `GET /parts/repairing-batches` 上拿到的 `status` 恒为 `IN_PROCESS`，
+    /// 「返修中」这个信号彻底消失。
+    pub is_repairing: bool,
     pub location: Option<String>,
     pub version: i32,
     /// 逻辑 FK → t_process_chain_step.id（2026-09-16 PR-3 替代 next_process_id）

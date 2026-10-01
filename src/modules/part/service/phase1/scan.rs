@@ -97,43 +97,36 @@ impl PartService {
         //   ⚠️ 事实上第一步（转 INSPECTION）已经经 `mark_batch_with_status_and_meta`
         //   把标记清成 false 了，这里再显式写一次是**冗余但显式**：让每个分支的
         //   不变式在本行自证，不依赖「上一步恰好清了」这种跨函数推理。
+        //
+        // 2026-10-01 review 第 1 轮 m6：包装函数恒返回 1（0 行已由 status_gate
+        // 转成 `VERSION_CONFLICT` 抛出），原 `if n2 == 0` 是死代码，已删。
+        // 两个目标状态都不是终态 → `event_id` 传 `None`。
         if req.pass {
-            let n2 = mark_batch_status_only(
+            mark_batch_status_only(
                 repo.conn_mut(),
                 batch.id,
                 mid_version,
                 "READY_TO_SHIP",
                 Some(false),
                 current.id,
+                None,
             )
             .await?;
-            if n2 == 0 {
-                return Err(AppError::biz(
-                    code::VERSION_CONFLICT,
-                    "batch 版本冲突（INSPECTION→READY_TO_SHIP）",
-                ));
-            }
         } else {
             // FAIL：INSPECTION → IN_PROCESS + is_repairing=true；location 仍是
             // INSPECTION_SHELF（返修期间的物理位置由 complete_repair 接管，它把
             // 批次落到生产架或送检架并清标记）。
-            let n2 = mark_batch_status_only(
+            mark_batch_status_only(
                 repo.conn_mut(),
                 batch.id,
                 mid_version,
                 "IN_PROCESS",
                 Some(true),
                 current.id,
+                None,
             )
             .await?;
-            if n2 == 0 {
-                return Err(AppError::biz(
-                    code::VERSION_CONFLICT,
-                    "batch 版本冲突（INSPECTION→IN_PROCESS，置返修标记）",
-                ));
-            }
         }
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         // 事件日志（两条：INSPECTED + INSPECTION_RESULT）
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
@@ -267,7 +260,6 @@ impl PartService {
         // 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `actual_delivery_date` 列；
         // 实际交付日期由下方 DELIVERED 事件日志写入 t_part_event，统计口径
         // 按事件派生（见 statistics 域）。
-        let _ = Self::sync_from_batch_change(&mut repo, part.id, current).await?;
         // 事件
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),

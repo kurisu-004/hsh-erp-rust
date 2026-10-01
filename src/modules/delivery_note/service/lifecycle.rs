@@ -418,7 +418,6 @@ impl DeliveryNoteService {
                 b.version - 1,      // expected_version 是之前的
                 b.delivery_note_id, // 保留 delivery_note_id（PICKED_UP/ARCHIVED 后仍可打印）
                 Some("DELIVERED"),
-                now,
                 Some(current.id),
             )
             .await?;
@@ -437,8 +436,15 @@ impl DeliveryNoteService {
         let mut seen = std::collections::HashSet::new();
         for pid in affected_part_ids {
             if seen.insert(pid) {
-                PartService::sync_from_batch_change_with_conn(&mut *repo.conn_mut(), pid, current)
-                    .await?;
+                // `event_id=None`（M4）：pickup 把批次推到 DELIVERED（非终态），
+                // min-progress 推不出 part 终态，归档事件分支不可达。
+                PartService::sync_from_batch_change_with_conn(
+                    &mut *repo.conn_mut(),
+                    pid,
+                    current,
+                    None,
+                )
+                .await?;
             }
         }
 

@@ -103,7 +103,6 @@ impl PartService {
             created_by: Some(current.id),
         })
         .await?;
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         Ok(new_id)
     }
 
@@ -143,24 +142,26 @@ impl PartService {
         // `is_repairing = true`）会把已作废的批次列成「待返修」，用户点进去
         // 才发现批次早没了。终态就该清干净。
         //
-        // ⚠️ 遗留（同轮未修，见 `repair.rs::list_repairing_batches` 的说明）：
-        // part 级批量取消走 `status_gate::apply_bulk_batch_status_change_for_part`，
-        // 而 bulk 模式**只写 status**，不带 `is_repairing` —— 故那条路径上被
-        // 一并取消的返修批次仍留 `is_repairing = true`。status_gate 本轮不改，
-        // 改由「返修中列表」SQL 排除终态兜底。
-        let n = mark_batch_status_only(
+        // 2026-10-01 review 第 1 轮 m10：part 级批量取消
+        // （`status_gate::apply_bulk_batch_status_change_for_part`）现在也带
+        // `is_repairing = Some(false)`，故「返修中被连带取消的批次仍留
+        // is_repairing = true」这个遗留已消除。
+        //
+        // `event_id`（M4）：本路径能让 part **新进 CANCELLED**（它是该 part 最后
+        // 一条活跃批次时），故传真实雪花 id 供终态序列号归档事件使用。
+        //
+        // 2026-10-01 review 第 1 轮 m6：包装函数恒返回 1（0 行已由 status_gate
+        // 转成 `VERSION_CONFLICT` 抛出），原 `if n == 0` 是死代码，已删。
+        mark_batch_status_only(
             repo.conn_mut(),
             batch.id,
             req.version,
             "CANCELLED",
             Some(false),
             current.id,
+            Some(snowflake.next_id()),
         )
         .await?;
-        if n == 0 {
-            return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
-        }
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
             part_id,

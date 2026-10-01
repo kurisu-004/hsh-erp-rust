@@ -217,7 +217,6 @@ impl PartService {
             .execute(repo.conn_mut())
             .await?;
         }
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
             part_id,
@@ -347,7 +346,6 @@ impl PartService {
                 .await?;
             }
         }
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
             part_id,
@@ -459,7 +457,6 @@ impl PartService {
                 .await?;
             }
         }
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
             part_id,

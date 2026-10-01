@@ -61,7 +61,22 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 流转后工单
 
 Request：`{ "reason"?: string, "note"?: string }`（`reason` 优先作为事件 note）
 
-Response 200 `data`：[`PartOut`](./index.md#partout-字段)。同步翻转最近一条 source-status 批次（同事务）。
+Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
+
+**2026-10-01 订正**：cancel 级联的是该 part 下**全部非终态活跃批次**（不再只是
+「最近一条 source-status 批次」），`status = 'COMPLETED' | 'CANCELLED'` 的批次不在
+级联范围内。作废同时清空 `t_part.serial_no`（作废即退役，序列号**不**归档）；
+父装配件 `t_assembly` 会被派生追平（唯一子件作废 → 父件 CANCELLED，父件序列号
+同步释放）。
+
+> **不变式（2026-10-01 review 第 1 轮 B1）**：`t_part.status` 由本端点的主操作
+> 写下，级联批次的派生**不得**覆盖它。若该 part 存在已 COMPLETED 的批次，
+> min-progress 会算出 COMPLETED —— 实现靠两道闸拦住：bulk 入口的
+> `PartDerivation::KeepPartTerminalAsIs`（显式跳过 part 写）+ `update_part_rollup`
+> 的 `status NOT IN ('COMPLETED','CANCELLED')` 终态守卫（SQL 层兜底）。
+> 回归测试：`tests/part/lifecycle.rs::cancel_part_is_not_overwritten_by_rollup_completed`。
+> 副作用：已终态的 part 不再被 rollup / admin 对账改写（见
+> [`../admin.md`](../admin.md)）。
 
 错误码：
 
@@ -348,9 +363,16 @@ Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 > 2026-09-22 起 P3 list（与 `repair-batches` 同形状，区别：判据不同）。
 >
 > **2026-10-01 BREAKING CHANGE**：判据由 `status = 'REPAIRING'` 改为
-> **`t_part_batch.is_repairing = true`**，并额外排除 `status IN
-> ('COMPLETED','CANCELLED')`（兜底 part 级批量取消只写 status、不清标记的遗留）。
-> 返回项的 `status` 字段恒为 `IN_PROCESS`。
+> **`t_part_batch.is_repairing = true`**。返回项的 `status` 字段恒为
+> `IN_PROCESS`（REPAIRING 已不是任何列会取到的值）。
+>
+> 2026-10-01 review 第 1 轮 M5 补齐：返修标记已随
+> `BatchOut`（= `InspectionBatchListItemOut`）的**新字段 `is_repairing: bool`**
+> 一起返回。此前「只有 status」的端点让前端彻底失去「返修中」信号 ——
+> 改造前靠 `status === 'REPAIRING'` 判定，改造后任何接口都拿不到该值。
+> 影响端点：`GET /parts/repairing-batches`、`GET /parts/repair-batches`、
+> `GET /parts/inspection-batches`，以及 `GET /parts/{id}/batches`
+> （`PartBatchListItemOut` 同样新增 `is_repairing: bool`）。
 
 Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 

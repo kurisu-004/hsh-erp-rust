@@ -872,7 +872,7 @@ pub struct WorkerScanCoreOut {
 > 见 [`./index.md#状态派生契约2026-10-01`](./index.md#状态派生契约2026-10-01)。
 >
 > 2026-10-01 起本表的**所有 `t_part_batch.status` 写入**都由
-> `part::repo::status_gate::apply_batch_status_change` 承担，源状态白名单
+> `part::service::status_gate::apply_batch_status_change` 承担，源状态白名单
 > （`allowed_from`）在 **SQL 层**与写入同属一条语句，不存在「service 校验通过 →
 > 另一个人改掉状态 → 我的 UPDATE 照写」的 TOCTOU 窗口。0 行 → `40901`。
 > 派生（part / assembly / 序列号释放）也在同一个函数里，故**调用方不需要也不应该

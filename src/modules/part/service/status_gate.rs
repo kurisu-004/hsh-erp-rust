@@ -13,7 +13,7 @@
 //! ```text
 //! apply_batch_status_change(conn, StatusChange { .. })
 //!   ├─ step 1  UPDATE t_part_batch（OCC + 源状态白名单）  ← 唯一写 status 的地方
-//!   ├─ step 2  compute_part_target → UPDATE t_part（派生写，不走 OCC）
+//!   ├─ step 2  compute_part_target → UPDATE t_part（派生写，不走 OCC、**带终态守卫**）
 //!   ├─ step 3  part.status 真变了 → AssemblyService 反向同步
 //!   ├─ step 4  part 进入 COMPLETED/CANCELLED → 先归档 t_part_event 再清 serial_no
 //!   └─ step 5  assembly 进入 COMPLETED/CANCELLED → 直接清 serial_no（不归档）
@@ -24,6 +24,17 @@
 //! `update_batch_dispatched` / 两个 bulk 写点）全部改成本模块之上的**薄包装**，
 //! 函数名与签名逐字保留，service 层调用点零改动 —— 于是「写状态」这件事在
 //! 类型层面就只剩一个入口，caller 没有「要不要调 sync」这个选项可选。
+//!
+//! ## 两条派生层铁律（2026-10-01 review 第 1 轮 B1 补齐）
+//!
+//! 1. **派生层不得否决主操作**：派生写不抛错，冲突 / 守卫命中一律降级为
+//!    `NoChange`（见 `sync_assembly_status` 的 OCC 降级段）。
+//! 2. **派生层不得覆盖主操作**（B1 的教训）：`t_part` 已由主操作
+//!    （`PartService::cancel` → `mark_part_cancelled`）写成终态时，min-progress
+//!    再算出别的状态也**不许写进去**。SQL 层的终态守卫
+//!    （`update_part_rollup` 的 `status NOT IN ('COMPLETED','CANCELLED')`）是
+//!    兜底，bulk 入口的 [`PartDerivation::KeepPartTerminalAsIs`] 是显式表达 ——
+//!    后者保证「跳过 part 写」的同时**继续**派生父装配件。
 //!
 //! ## 唯一签名例外：3 个 `mark_batch_*` 返回 `RollupOutcome`（2026-10-01 补记）
 //!
@@ -67,25 +78,24 @@ use crate::shared::error::{AppError, code};
 
 /// 一次批次状态变更的完整意图（status_gate 的唯一入参形状）。
 ///
-/// 2026-10-01 新增。所有可选列的 `None` 语义统一为 **「保持原值」**
-/// （SQL `COALESCE($n, col)`），**唯一例外**是 `new_process_id` + `clear_process_id`
-/// 组合（见 `clear_process_id` 字段说明）—— 出池（转 PENDING / INSPECTION）
-/// 必须把 `current_process_id` 清 NULL，而「清 NULL」与「保持原值」用单个
-/// `Option<i64>` 无法区分。
+/// 2026-10-01 新增。**所有可选列的 `None` 语义统一为「保持原值」**
+/// （SQL `COALESCE($n, col)`），「清 NULL」一律由同名 `clear_*` 标志显式表达。
+/// 单个 `Option` 表达不了「保持 / 写值 / 清空」三态，把「清」混进 `None`
+/// 会让同一个 `None` 在不同调用点有两种含义 —— 2026-10-01 review 第 1 轮 M2
+/// 就是这么把「出池清 `current_process_step_id`」悄悄改成「保持原值」的。
 #[derive(Debug, Clone)]
 pub struct StatusChange<'a> {
     /// 目标批次 id。
     pub batch_id: i64,
     /// 目标状态（`PartStatus::as_str()` 字面量）。
     pub new_status: &'a str,
-    /// `None` = 保持原值；`Some(loc)` = 写该 location。
+    /// `None` = 保持原值（除非 `clear_location`）；`Some(loc)` = 写该 location。
     pub new_location: Option<&'a str>,
-    /// `None` = 保持原值；`Some(hid)` = 写该 holder（货架 / 工人 / 外协公司）。
+    /// `None` = 保持原值（除非 `clear_holder_id`）；`Some(hid)` = 写该 holder。
     pub new_holder_id: Option<i64>,
-    /// `None` = 保持原值（除非 `clear_process_id = true`，此时清 NULL）。
+    /// `None` = 保持原值（除非 `clear_process_id`）。
     pub new_process_id: Option<i64>,
-    /// `None` = 保持原值。**刻意不提供「清 NULL」语义**：本列是「可选的显示用
-    /// 定位信息」（只在首次定位工序时写、之后不推进），全仓没有任何写点需要清它。
+    /// `None` = 保持原值（除非 `clear_process_step_id`）。
     pub new_process_step_id: Option<i64>,
     /// `None` = 保持原值；`Some(b)` = 写返修标记（migration 005）。
     pub is_repairing: Option<bool>,
@@ -101,17 +111,81 @@ pub struct StatusChange<'a> {
     pub allowed_from: &'a [&'a str],
     /// 写 `updated_by`（同时作为派生列 `t_part.updated_by` / 事件 `created_by`）。
     pub updated_by: i64,
-    /// 2026-10-01 新增：`true` 表示本次流转**出池**，`current_process_id`
-    /// 必须清 NULL（写不变式第 2 行，见
+    /// `true` = `location` 必须清 NULL。
+    ///
+    /// **2026-10-01 review 第 1 轮 M2 新增**：出池 / 召回等流转必须把
+    /// 「压在哪个架子上」一起清掉，否则 UI 上「待投产」的工单仍显示
+    /// `PRODUCTION_SHELF` + `current_holder_id`（改造前 `mark_batch_with_status_
+    /// and_meta` 的 `location = $4` 传 None 就是**写 NULL**，本轮一度被误改成
+    /// 「保持原值」）。
+    pub clear_location: bool,
+    /// `true` = `current_holder_id` 必须清 NULL（同 M2，理由见上）。
+    pub clear_holder_id: bool,
+    /// `true` = `current_process_id` 必须清 NULL（写不变式第 2 行，见
     /// `migrations/20260930000000_004_add_batch_current_process_id.sql`）。
     ///
-    /// 为什么不塞进 `new_process_id`：出池的两个真实写点
-    /// （`mark_batch_inspected` / `mark_batch_with_status_and_meta`）语义相反 ——
-    /// 前者要**清** `current_process_id` 却要**保留** `current_process_step_id`，
-    /// 后者两者都由 caller 显式给定（含「传 None 即清 NULL」的既有约定）。
-    /// 一个 `Option` 表达不了三态，独立一个 flag 是这里最省事且不改 13 个包装
-    /// 函数签名的做法。
+    /// 为什么单独一个 flag 而不是塞进 `new_process_id`：出池要**清**
+    /// `current_process_id` 却要**保留** `current_process_step_id`（后者是展示用
+    /// 定位信息），两者由 caller 独立决定，一个 `Option` 表达不了三态。
     pub clear_process_id: bool,
+    /// `true` = `current_process_step_id` 必须清 NULL。
+    ///
+    /// **2026-10-01 review 第 1 轮 M2 新增**：送检（`INSPECTION`）/ 外协收回 /
+    /// 召回等**出池**写点在改造前都把该列清成 NULL。展示用的 `next_process_id`
+    /// 正是由它经 `t_process_chain_step JOIN` 派生，不清会让「已出池的批次仍
+    /// 显示上一道工序」。
+    pub clear_process_step_id: bool,
+    /// `SERIAL_RELEASED` 归档事件（step 4）的主键。`None` = 调用方拿不到雪花
+    /// 生成器（见 [`rollup_part_derived`] 的说明），此时**只清序列号、不写归档
+    /// 事件**并打 `error!`。
+    ///
+    /// 2026-10-01 review 第 1 轮 M4 新增：此前实现直接拿 `part_id` 当事件 id，
+    /// 而 `GET /parts/{id}/events` 按 `id DESC` 排序 —— `part_id` 是**建单时**的
+    /// 雪花，比该 part 后续所有事件小若干个数量级，归档事件会被排到时间线
+    /// **最底部**，看起来像建单时就发生过；且一旦 part 离开终态再回来，第二次
+    /// 插入就是 pkey 冲突 → 整个事务 500。
+    pub event_id: Option<i64>,
+}
+
+/// 批量入口对 `t_part.status` 这层**派生缓存**的处置策略。
+///
+/// 2026-10-01 review 第 1 轮 B1 新增。存在理由：`PartService::cancel` 的
+/// 「取消工单」是**主操作**（`mark_part_cancelled` 直接把 `t_part.status`
+/// 写成 CANCELLED），紧随其后的批次级联**不允许**再按 min-progress 把它推回去。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartDerivation {
+    /// 正常：批次是真源，`t_part.status` 按 min-progress 派生。
+    Rollup,
+    /// `t_part.status` 已由**主操作**打成终态，一个字都不许碰；
+    /// 本次只写批次，**并继续向下派生父装配件**（否则父件会与子件长期不一致）。
+    ///
+    /// 为什么还需要它（而不是只靠 [`PartRepo::update_part_rollup`] 的终态守卫）：
+    /// 终态守卫会把整段 part 派生短路成 `NoChange`，连带 step 3 的父装配件同步
+    /// 也不跑 —— 于是「子件被取消、父件还停在 IN_PROCESS」这种漂移会一直留着
+    /// （改造前的 `cancel` 正是这个 bug）。本策略把「跳过 part 写」与「继续派生
+    /// 父层」拆开表达，两个需求互不干扰。
+    KeepPartTerminalAsIs,
+}
+
+/// 批量模式的一次性意图包（参数成组演进，且已超 clippy 的 7 参阈值）。
+#[derive(Debug, Clone)]
+pub struct BulkStatusChange<'a> {
+    /// 目标 part id（级联范围 = 该 part 下的全部活跃批次）。
+    pub part_id: i64,
+    /// 批次目标状态。
+    pub new_status: &'a str,
+    /// **反向**白名单（终态保护）：不在此列的批次才被改写。
+    pub excluded_statuses: &'a [&'a str],
+    /// `Some(b)` = 同时写返修标记。批量推入终态时必须给 `Some(false)`，
+    /// 否则会留下 `status='CANCELLED' AND is_repairing=true` 的矛盾行
+    /// （2026-10-01 review 第 1 轮 m10）。
+    pub is_repairing: Option<bool>,
+    /// 审计列 `updated_by`。
+    pub updated_by: i64,
+    /// 对 `t_part.status` 的处置（见 [`PartDerivation`]）。
+    pub derivation: PartDerivation,
+    /// 终态序列号归档事件的主键（见 [`StatusChange::event_id`]）。
+    pub event_id: Option<i64>,
 }
 
 /// 批量模式的结果（两个 bulk 写点用）。
@@ -169,7 +243,7 @@ pub async fn apply_batch_status_change_detailed(
     ch: StatusChange<'_>,
 ) -> Result<RollupOutcome, AppError> {
     let part_id = write_batch_status_row(conn, &ch).await?;
-    let outcome = rollup_part_derived(conn, part_id, ch.updated_by).await?;
+    let outcome = rollup_part_derived(conn, part_id, ch.updated_by, ch.event_id).await?;
     Ok(outcome)
 }
 
@@ -179,8 +253,44 @@ pub async fn apply_batch_status_change_detailed(
 ///
 /// 用 `sqlx::query`（运行时）而非 `query!`（编译期）的原因：这条 SQL 的
 /// SET 子句与 WHERE 守卫都随 `StatusChange` 的 `Option` 动态变化
-/// （5 个可选列、可选 OCC、`= ANY($n)` 数组白名单），编译期宏无法定型。
+/// （6 个可选列、可选 OCC、`= ANY($n)` 数组白名单），编译期宏无法定型。
 /// 运行时 query 是本仓既有做法（见 `phase1/mod.rs::mark_batch_with_status_and_meta`）。
+/// 单行写的 SQL。占位符编号与下方 `.bind()` 顺序**成对**。
+///
+/// 抽成 const 只为一件事：让 `bind_placeholders_are_contiguous` 单测能断言
+/// 「SQL 里出现的最大占位符号 == bind 个数且 1..=N 无空洞」。2026-10-01
+/// review 第 1 轮就在这里踩过一次：占位符写到 `$15` 而只 bind 了 14 个，
+/// PG 在 Bind 阶段报
+/// `bind message supplies 14 parameters, but prepared statement "sqlx_s_7" requires 15`，
+/// 且 sqlx 的 statement cache 被污染 —— 同一连接上后续**所有**查询跟着一起炸，
+/// 报错点离真凶十万八千里。
+const BATCH_STATUS_UPDATE_SQL: &str = r#"
+        UPDATE t_part_batch
+           SET status                  = $2::varchar,
+               location                = CASE WHEN $11::bool THEN NULL
+                                           ELSE COALESCE($3::varchar, location) END,
+               current_holder_id       = CASE WHEN $12::bool THEN NULL
+                                           ELSE COALESCE($4::bigint, current_holder_id) END,
+               current_process_id      = CASE WHEN $13::bool THEN NULL
+                                           ELSE COALESCE($5::bigint, current_process_id) END,
+               current_process_step_id = CASE WHEN $14::bool THEN NULL
+                                           ELSE COALESCE($6::bigint, current_process_step_id) END,
+               is_repairing            = COALESCE($7::boolean, is_repairing),
+               version                 = version + 1,
+               updated_at              = now(),
+               updated_by              = $8::bigint
+         WHERE id = $1::bigint
+           AND deleted_at IS NULL
+           AND status = ANY($9::varchar[])
+           AND ($10::int IS NULL OR version = $10::int)
+        RETURNING part_id
+        "#;
+
+/// 与 [`BATCH_STATUS_UPDATE_SQL`] 的占位符个数严格相等（= 下方 `.bind()` 的个数）。
+/// 只被 `#[cfg(test)]` 的 `bind_placeholders_are_contiguous` 读。
+#[cfg_attr(not(test), allow(dead_code))]
+const BATCH_STATUS_UPDATE_BIND_COUNT: usize = 14;
+
 pub(crate) async fn write_batch_status_row(
     conn: &mut PgConnection,
     ch: &StatusChange<'_>,
@@ -194,39 +304,23 @@ pub(crate) async fn write_batch_status_row(
             ),
         ));
     }
-    let row: Option<(i64,)> = sqlx::query_as(
-        r#"
-        UPDATE t_part_batch
-           SET status                  = $2::varchar,
-               location                = COALESCE($3::varchar, location),
-               current_holder_id       = COALESCE($4::bigint, current_holder_id),
-               current_process_id      = CASE WHEN $8::bool THEN NULL
-                                              ELSE COALESCE($5::bigint, current_process_id) END,
-               current_process_step_id = COALESCE($6::bigint, current_process_step_id),
-               is_repairing            = COALESCE($7::boolean, is_repairing),
-               version                 = version + 1,
-               updated_at              = now(),
-               updated_by              = $9::bigint
-         WHERE id = $1::bigint
-           AND deleted_at IS NULL
-           AND status = ANY($10::varchar[])
-           AND ($11::int IS NULL OR version = $11::int)
-        RETURNING part_id
-        "#,
-    )
-    .bind(ch.batch_id)
-    .bind(ch.new_status)
-    .bind(ch.new_location)
-    .bind(ch.new_holder_id)
-    .bind(ch.new_process_id)
-    .bind(ch.new_process_step_id)
-    .bind(ch.is_repairing)
-    .bind(ch.clear_process_id)
-    .bind(ch.updated_by)
-    .bind(ch.allowed_from)
-    .bind(ch.expected_version)
-    .fetch_optional(&mut *conn)
-    .await?;
+    let row: Option<(i64,)> = sqlx::query_as(BATCH_STATUS_UPDATE_SQL)
+        .bind(ch.batch_id) // $1
+        .bind(ch.new_status) // $2
+        .bind(ch.new_location) // $3
+        .bind(ch.new_holder_id) // $4
+        .bind(ch.new_process_id) // $5
+        .bind(ch.new_process_step_id) // $6
+        .bind(ch.is_repairing) // $7
+        .bind(ch.updated_by) // $8
+        .bind(ch.allowed_from) // $9
+        .bind(ch.expected_version) // $10
+        .bind(ch.clear_location) // $11
+        .bind(ch.clear_holder_id) // $12
+        .bind(ch.clear_process_id) // $13
+        .bind(ch.clear_process_step_id) // $14
+        .fetch_optional(&mut *conn)
+        .await?;
 
     row.map(|(pid,)| pid).ok_or_else(|| {
         AppError::biz(
@@ -243,10 +337,22 @@ pub(crate) async fn write_batch_status_row(
 ///
 /// `PartService::sync_from_batch_change` 与 status_gate 共用本函数，两者行为
 /// 完全一致（前者是「只做派生」的历史入口，后者是「写 + 派生」的合并入口）。
+///
+/// ## `event_id`（2026-10-01 review 第 1 轮 M4）
+///
+/// `Some(id)` = 终态序列号释放时用该雪花 id 写 `SERIAL_RELEASED` 归档事件。
+/// `None` = 调用方拿不到雪花生成器，此时**只清序列号、不写归档事件**并打
+/// `error!` —— 理由是「宁可少一条审计行，也不能塞一个假 id」：曾经用
+/// `part_id` 顶替，结果是归档事件在 `ORDER BY id DESC` 的时间线上被排到最底部，
+/// 且 part 二次进终态时直接 pkey 冲突、整个事务 500。
+/// 能让 part **新进**终态的写点全部传 `Some(snowflake.next_id())`；纯重算 /
+/// 换 holder 类的 `sync_from_batch_change` 调用点传 `None`（它们的批次一定还
+/// 处在非终态，min-progress 推不出终态，该分支不可达）。
 pub async fn rollup_part_derived(
     conn: &mut PgConnection,
     part_id: i64,
     updated_by: i64,
+    event_id: Option<i64>,
 ) -> Result<RollupOutcome, AppError> {
     // ---- step 2.1：拉 part 全部活跃批次（rollup 只看活跃行）----
     let batches = PartBatchRepo::list_active_by_part_id(&mut *conn, part_id).await?;
@@ -288,6 +394,17 @@ pub async fn rollup_part_derived(
 
     // ---- step 2.3：派生写 `t_part`（**不走 OCC**：派生写，由行锁串行化；
     //      `version += 1` 仍写以保证审计字段单调）----
+    //
+    // 2026-10-01 review 第 1 轮 B1：SQL 里带**终态守卫**
+    // （`status NOT IN ('COMPLETED','CANCELLED')`，见 `PartRepo::update_part_rollup`）。
+    // 守卫命中 0 行有两种原因，处理方式不同：
+    // - part 已是终态 → **派生层不得覆盖主操作**。`PartService::cancel` 先把
+    //   part 打成 CANCELLED（主操作），紧接着的批次级联按 min-progress 会算出
+    //   COMPLETED（「已完成批次 + 其余被批量取消」时 non_terminal 为空），若无守卫
+    //   就会把用户的「作废工单」静默改回 COMPLETED、连带把父装配件也推成
+    //   COMPLETED，而接口仍返回 200、事件流水记的是 INSPECTION→CANCELLED。
+    // - part 被并发软删 → 原有防御路径。
+    // 两种都降级为 `NoChange`（派生层不否决、不报错），区别只在可观测性。
     let affected = PartRepo::update_part_rollup(
         &mut *conn,
         part_id,
@@ -297,6 +414,14 @@ pub async fn rollup_part_derived(
     )
     .await?;
     if affected == 0 {
+        if is_terminal(&cur.status) {
+            tracing::warn!(
+                part_id,
+                current = %cur.status,
+                target = %target.status,
+                "part 派生写被终态守卫拦下：派生层不覆盖主操作写下的终态（cancel 路径）"
+            );
+        }
         // 防御：part 在两次 select 之间被并发软删。返回 NoChange 让 caller
         // 不重试（与改造前一致）。
         return Ok(RollupOutcome {
@@ -308,10 +433,16 @@ pub async fn rollup_part_derived(
     let part_status_changed = cur.status != target.status;
 
     // ---- step 3：part.status 真变了 → assembly 反向同步 ----
+    //
+    // ⚠️ 2026-10-01 review 第 1 轮 m8：`part_status_changed == false`（只物化了
+    // `next_process_id`）时**必须**回 `NoChange`。旧实现回 `Changed(part_id)`，
+    // 而 `inspection_core.rs` / `worker_scan.rs` 把它当 `assembly_id` 塞进
+    // 响应的 `synced_assembly_id` 并据此广播 `ASSEMBLY_UPDATED` —— WS payload
+    // 里会出现一个 part id 冒充 assembly_id。
     let sync = if part_status_changed {
         AssemblyService::sync_from_part_change_by_id(conn, part_id, updated_by).await?
     } else {
-        SyncOutcome::Changed(part_id)
+        SyncOutcome::NoChange
     };
 
     // ---- step 4：part 进入终态 → 先归档 `t_part_event`，再清 `t_part.serial_no` ----
@@ -323,10 +454,10 @@ pub async fn rollup_part_derived(
     // 改造前那样因「part 级条件命中 0 行 + `let _ =` 静默吞掉」而永久泄漏。
     //
     // 触发条件是 `part_status_changed && 目标终态`（而非「当前是终态」），
-    // 保证「每个 part 最多 1 条 SERIAL_RELEASED」—— 这也是归档事件 id 取
-    // `part_id` 的前提（见 `release_part_serial_no`）。
+    // 保证「每个 part 最多 1 条 SERIAL_RELEASED」（step 2.3 的终态守卫保证
+    // part 不会再被派生推出终态，故该不变量在库层面成立）。
     if part_status_changed && is_terminal(&target.status) {
-        release_part_serial_no(conn, part_id, &target.status, updated_by).await?;
+        release_part_serial_no(conn, part_id, &target.status, updated_by, event_id).await?;
     }
 
     // ---- step 5：assembly 进入终态 → 直接清 `t_assembly.serial_no` ----
@@ -343,6 +474,25 @@ pub async fn rollup_part_derived(
         sync,
         part_status_changed,
     })
+}
+
+/// step 3 + step 5：只派生**父装配件**（`t_part` 一律不碰）。
+///
+/// 2026-10-01 review 第 1 轮 B1 新增。给「part 已被主操作打成终态、派生层不得
+/// 覆盖」的场景用（`PartDerivation::KeepPartTerminalAsIs`）：批次照常级联写，
+/// 但 part 的终态一个字都不动，同时**继续**把父装配件追平 —— 否则
+/// 「子件作废、父件还停在 IN_PROCESS」这种漂移会一直留着（改造前的 cancel
+/// 正是如此：它压根不调任何 sync）。
+pub(crate) async fn rollup_assembly_derived(
+    conn: &mut PgConnection,
+    part_id: i64,
+    updated_by: i64,
+) -> Result<SyncOutcome, AppError> {
+    let sync = AssemblyService::sync_from_part_change_by_id(conn, part_id, updated_by).await?;
+    if let SyncOutcome::Changed(assembly_id) = sync {
+        clear_assembly_serial_no_if_terminal(conn, assembly_id, updated_by).await?;
+    }
+    Ok(sync)
 }
 
 /// 批量模式：**唯一**允许一次改写多条 `t_part_batch.status` 的入口。
@@ -366,30 +516,33 @@ pub async fn rollup_part_derived(
 /// `["COMPLETED", "CANCELLED"]`，force-complete 传 `["CANCELLED"]`。
 /// 用反向而非正向，是因为 force-complete 的语义就是「除终态外全部强推」，
 /// 写成正向白名单需要枚举 9 个非终态值，新增状态时必然漏改。
+///
+/// `is_repairing`：2026-10-01 review 第 1 轮 m10 —— 批量推入终态时**必须**同时
+/// 清返修标记，否则会留下 `status='CANCELLED'/'COMPLETED' AND is_repairing=true`
+/// 的自相矛盾行（终态批次不可能还在返修）。
 pub async fn apply_bulk_batch_status_change_for_part(
     conn: &mut PgConnection,
-    part_id: i64,
-    new_status: &str,
-    excluded_statuses: &[&str],
-    updated_by: i64,
+    ch: BulkStatusChange<'_>,
 ) -> Result<BulkSyncOutcome, AppError> {
     let rows: Vec<(i64,)> = sqlx::query_as(
         r#"
         UPDATE t_part_batch
-           SET status     = $2::varchar,
-               version    = version + 1,
-               updated_at = now(),
-               updated_by = $3::bigint
+           SET status       = $2::varchar,
+               is_repairing = COALESCE($5::boolean, is_repairing),
+               version      = version + 1,
+               updated_at   = now(),
+               updated_by   = $3::bigint
          WHERE part_id = $1::bigint
            AND deleted_at IS NULL
            AND NOT (status = ANY($4::varchar[]))
         RETURNING part_id
         "#,
     )
-    .bind(part_id)
-    .bind(new_status)
-    .bind(updated_by)
-    .bind(excluded_statuses)
+    .bind(ch.part_id)
+    .bind(ch.new_status)
+    .bind(ch.updated_by)
+    .bind(ch.excluded_statuses)
+    .bind(ch.is_repairing)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -399,7 +552,16 @@ pub async fn apply_bulk_batch_status_change_for_part(
     part_ids.dedup();
 
     for pid in &part_ids {
-        rollup_part_derived(&mut *conn, *pid, updated_by).await?;
+        match ch.derivation {
+            PartDerivation::Rollup => {
+                rollup_part_derived(&mut *conn, *pid, ch.updated_by, ch.event_id).await?;
+            }
+            PartDerivation::KeepPartTerminalAsIs => {
+                // 2026-10-01 review 第 1 轮 B1：part 的终态由主操作写下，
+                // 派生层只负责把**父装配件**追平（详见 `PartDerivation`）。
+                rollup_assembly_derived(&mut *conn, *pid, ch.updated_by).await?;
+            }
+        }
     }
 
     Ok(BulkSyncOutcome {
@@ -415,18 +577,38 @@ pub async fn apply_bulk_batch_status_change_for_part(
 /// 归档而非直接清的理由：序列号转交送货单后要从工单上消失，直接清会丢失
 /// 「这个工单曾经用过哪个序列号」这条审计链。`t_part_event` 正是为此存在。
 ///
-/// 事件 id 用 `part_id`（不是雪花）：repo 层没有雪花生成器（`SnowflakeIdGenerator`
-/// 由 `main.rs` 持有并逐层透传，repo 方法一律收显式 id，见
-/// `insert_child_for_assembly`），而本事件**每个 part 最多 1 条**
-/// （COMPLETED / CANCELLED 都是终态，不可能重复进入）。`part_id` 本身就是一个
-/// 真实雪花值、由同一套分配流发出，永不等于任何运行时生成的 `t_part_event.id`
-/// （同一分配流内不重复、跨 instance 由 10 位 instance_id 隔离），
-/// 且让整段逻辑**确定性、可重放**。
+/// ## 事件 id（2026-10-01 review 第 1 轮 M4 修正）
+///
+/// 由 caller 经 [`StatusChange::event_id`] / [`BulkStatusChange::event_id`] 传一个
+/// **真实雪花 id**。改造前直接拿 `part_id` 当事件 id，有两个硬伤：
+/// 1. `GET /parts/{id}/events` 是 `ORDER BY id DESC`，而 `part_id` 是**建单时**的
+///    雪花，比该 part 后续所有事件小若干个数量级 → 归档事件被排到时间线
+///    **最底部**，看起来像建单时就发生过，而不是释放发生的那一刻；
+/// 2. part 离开终态再回来时（数据修复 / admin 干预）第二次插入就是 pkey 冲突，
+///    整个事务 500。
+///
+/// `event_id = None`（caller 拿不到生成器）时**只清序列号、不写归档**并打
+/// `error!`：序列号泄漏是硬故障（`uk_t_part_serial_no` 永久占位），少一条审计行
+/// 只是可观测性缺口，两害相权取轻。
+///
+/// ## 为什么不用「让 DB 自己发 id」（2026-10-01 review 第 1 轮 m1 订正）
+///
+/// `t_part_event.id` 其实**有** `DEFAULT nextval('t_part_event_id_seq')`
+/// （baseline 已声明），所以「SQL 里发不出 id」这个常见理由不成立 —— 本轮
+/// migration 007 的注释就是这么写的（结论仍可用，理由错）。仍然不采用
+/// 「省略 id 让序列接管」的两条硬理由：
+/// 1. **排序**：`GET /parts/{id}/events` 是 `ORDER BY id DESC`，序列值（1, 2, 3…）
+///    会被排到全部雪花事件**最底部**，等于把归档事件藏起来；改读侧排序为
+///    `created_at` 又会让 id 空间异质（同毫秒内序列 id 与雪花 id 混排）。
+/// 2. **冲突**：该序列在生产里 `is_called = false`（Python 端一直显式传雪花），
+///    首个 `nextval` 返回 1；若历史数据里存在序列期的小 id，就是一次 pkey 冲突
+///    → 整个事务 500，而**消除它需要一个新 migration**（`setval`）。
 async fn release_part_serial_no(
     conn: &mut PgConnection,
     part_id: i64,
     new_status: &str,
     updated_by: i64,
+    event_id: Option<i64>,
 ) -> Result<(), AppError> {
     // 先读原值（归档内容需要它）
     let serial: Option<(Option<String>,)> =
@@ -442,23 +624,34 @@ async fn release_part_serial_no(
     // step 4.1：归档（先写事件，再清列 —— 顺序不能反：反了万一清列成功、
     // 事件写失败，事务虽回滚但语义上「已释放却无记录」的窗口更难推理）
     let note = format!("序列号释放归档：{original}");
-    PartRepo::insert_part_event(
-        &mut *conn,
-        NewPartEvent {
-            id: part_id,
-            part_id,
-            event_type: EVENT_SERIAL_RELEASED,
-            from_status: None,
-            to_status: Some(new_status),
-            batch_id: None,
-            quantity: None,
-            drawing_code: None,
-            badge_code: None,
-            note: Some(&note),
-            created_by: Some(updated_by),
-        },
-    )
-    .await?;
+    match event_id {
+        Some(id) => {
+            PartRepo::insert_part_event(
+                &mut *conn,
+                NewPartEvent {
+                    id,
+                    part_id,
+                    event_type: EVENT_SERIAL_RELEASED,
+                    from_status: None,
+                    to_status: Some(new_status),
+                    batch_id: None,
+                    quantity: None,
+                    drawing_code: None,
+                    badge_code: None,
+                    note: Some(&note),
+                    created_by: Some(updated_by),
+                },
+            )
+            .await?;
+        }
+        None => {
+            tracing::error!(
+                part_id,
+                new_status,
+                "终态序列号已释放但未写 SERIAL_RELEASED 归档事件：调用方未提供 event_id（M4）"
+            );
+        }
+    }
 
     // step 4.2：清列（谓词含 `serial_no IS NOT NULL` + 终态，天然幂等）
     sqlx::query(
@@ -534,6 +727,60 @@ fn is_terminal(status: &str) -> bool {
 ///   10 处，分布在 worker_pool 抢占 / move 归还 / 批次挂送货单 / 拆批扣量 /
 ///   `mark_batch_returned` 归还货架 / part 发料台定位）——它们命中条件 1 但不命中
 ///   条件 2，不该被拦。
+///
+/// ============================================================================
+/// 另一条 CI 闸门：单行 UPDATE 的占位符 ↔ bind 个数必须一致
+/// ============================================================================
+///
+/// 见 [`BATCH_STATUS_UPDATE_BIND_COUNT`] 的 rationale（review 第 1 轮踩过的坑）。
+#[cfg(test)]
+mod bind_guard_tests {
+    use super::{BATCH_STATUS_UPDATE_BIND_COUNT, BATCH_STATUS_UPDATE_SQL};
+
+    /// SQL 里出现的最大 `$n`。
+    fn max_placeholder(sql: &str) -> usize {
+        let bytes = sql.as_bytes();
+        let mut max = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'$' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+                let mut j = i + 1;
+                let mut n = 0usize;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    n = n * 10 + (bytes[j] - b'0') as usize;
+                    j += 1;
+                }
+                max = max.max(n);
+                i = j;
+                continue;
+            }
+            i += 1;
+        }
+        max
+    }
+
+    #[test]
+    fn bind_placeholders_are_contiguous() {
+        let max = max_placeholder(BATCH_STATUS_UPDATE_SQL);
+        assert_eq!(
+            max, BATCH_STATUS_UPDATE_BIND_COUNT,
+            "status_gate 单行 UPDATE：SQL 最大占位符 ${max}，但 bind 了 \
+             {BATCH_STATUS_UPDATE_BIND_COUNT} 个 —— PG 会在 Bind 阶段报 \
+             `bind message supplies N parameters, but prepared statement requires M`，\
+             且 sqlx 的 statement cache 被污染，同连接后续所有查询一起失败。\
+             请同步改 SQL 占位符与 `.bind()` 链（每个 `.bind()` 后已标注它对应哪个 $n）。"
+        );
+        // 1..=N 每个占位符都必须真的被用到（避免「跳号」导致 bind 顺序错位）
+        for n in 1..=max {
+            let needle = format!("${n}::");
+            assert!(
+                BATCH_STATUS_UPDATE_SQL.contains(&needle),
+                "占位符 ${n} 在 SQL 里没有以 `{needle}` 形式出现（跳号会让 bind 顺序错位）"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod write_guard_tests {
     use std::path::{Path, PathBuf};
@@ -542,7 +789,7 @@ mod write_guard_tests {
     ///
     /// 写死成字面量而不是 `file!()`：`file!()` 只能证明「本文件自己干净」，
     /// 而这条规则要表达的是「**别的**文件不许写」，两者不是一回事。
-    const SANCTIONED: &str = "src/modules/part/repo/status_gate.rs";
+    const SANCTIONED: &str = "src/modules/part/service/status_gate.rs";
 
     /// 扫描用的字面量。
     ///
@@ -955,6 +1202,20 @@ mod write_guard_tests {
     ///     还绕。护栏要防的是**生产写路径**漏派生，不是禁止单测造数据。
     ///
     /// (c) **只读语句 / 只改其它列的 UPDATE** —— 排除，规则只看 SET 子句。
+    ///
+    /// ## 已知绕过口（2026-10-01 review 第 1 轮 m3 记录在案，尚未修）
+    ///
+    /// 1. `UPDATE ONLY t_part_batch SET status …` / `UPDATE public.t_part_batch SET …`
+    ///    —— 规则要求「`update` 与表名之间只有空白」，这两种写法匹配不上；
+    /// 2. `INSERT … ON CONFLICT … DO UPDATE SET status = …` 的 upsert；
+    /// 3. 覆盖面只有 **batch 层**：`t_part.status` / `t_assembly.status` 没有同类
+    ///    护栏，而 B1 那个 bug 恰恰就发生在 part 层。
+    ///
+    /// 修 1/2 是探测器的小改（多认两个关键字），修 3 需要给「文件 × 表」配一张
+    /// 白名单（`mark_part_cancelled` / `update_part_rollup` / `AssemblyRepo::
+    /// update_status_if_not_terminal` / `AssemblyRepo::cancel` 是合法写点），
+    /// 两者都会让本测试的误报面显著变大，宜单独一轮改动 + 全量跑测试确认，
+    /// 不适合混在「修 review」这一轮里做。
     ///     `SELECT ... FOR UPDATE` 没有 SET 子句；`SET delivery_note_id` /
     ///     `SET quantity` / `SET current_holder_id` / `SET current_process_id`
     ///     虽命中 `UPDATE t_part_batch` 但 SET 子句里没有对 `status` 的赋值，
@@ -991,7 +1252,7 @@ mod write_guard_tests {
         assert!(
             violations.is_empty(),
             "以下 {} 处直接写了 `t_part_batch.status`，绕过了 part 域唯一状态写入口 \
-             `src/modules/part/repo/status_gate.rs`：\n{}\n\
+             `src/modules/part/service/status_gate.rs`：\n{}\n\
              \n\
              规则（见 `status_gate.rs` 末尾 `mod write_guard_tests`）：\n\
              \x20 * 判定 = 同一语句里既有对批次表的 UPDATE、其 SET 子句又对 `status` 列赋值；\n\

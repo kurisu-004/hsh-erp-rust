@@ -31,7 +31,7 @@ t_assembly.status     ← 派生缓存
 ```
 
 两层派生的正常触发点是「写批次状态」那一个函数
-（`part::repo::status_gate::apply_batch_status_change`），它在同一个事务里做完
+（`part::service::status_gate::apply_batch_status_change`），它在同一个事务里做完
 写 + 派生 + 级联 + 终态序列号释放。**所以新代码不该再用本端点**——本端点只解决
 两类派生缓存与真源不一致的情况：
 
@@ -58,6 +58,7 @@ t_assembly.status     ← 派生缓存
 | `part_ids` | string[]? | ❌ | 指定要重算的 `t_part.id` 列表（i64 → JSON 字符串）。**不给 = 不重算 part**（除非整体走全量简写） |
 | `assembly_ids` | string[]? | ❌ | 指定要重算的 `t_assembly.id` 列表。**不给 = 不重算装配件**（同上） |
 | `limit` | int? | ❌ | 「不限 id」时每个列表最多处理多少行。默认 `1000`，上限 `10000`；`≤0` 或超上限 → `20104` |
+| `after_id` | string? | ❌ | **续扫游标**（i64 → JSON 字符串）：只处理 `id > after_id` 的行。缺省 = 从最小 id 开始 |
 
 作用域（`scope`）由「给了哪些 id 列表」决定，**缺一个不等于全量**：
 
@@ -74,6 +75,18 @@ t_assembly.status     ← 派生缓存
 反序会让本轮刚修正的 part 不被计进父件聚合（要等下一次调用才对齐，破坏
 「调一次就收敛」的直觉）。
 
+**全量对账如何扫完整表**（2026-10-01 review 第 1 轮 M7 新增）：响应里
+`truncated = true` 时，把 `data.next_after_id` **原样回传**为下一次请求的
+`after_id`，重复调用直到 `truncated = false` 即已覆盖全表。
+
+> 此前本端点只有 `ORDER BY id LIMIT n+1`、**既无游标也无 offset** ——
+> `truncated = true` 时运维再调一次仍然从最小的 `limit` 行开始扫，**永远收敛不了**，
+> 一个兜底端点在生产数据量下兜不住底，只能靠手工分页查 id 再显式贴回来。
+>
+> 已知取舍：`t_part` 与 `t_assembly` 的 id 空间互不相交但共用一个 `after_id`
+> 字段，故 `next_after_id` 取两段窗口里**较大**的那个 —— 严格覆盖请对两段分别用
+> `part_ids` / `assembly_ids` 定点跑（端点本就支持）。
+
 ### Response 200
 
 标准 `R<T>` 信封，`data` 形状：
@@ -87,6 +100,7 @@ t_assembly.status     ← 派生缓存
 | `assemblies_examined` | int | 本次跑过聚合的装配件数 |
 | `assemblies_changed` | int | `t_assembly.status` 真变了的数 |
 | `truncated` | bool | 命中 `limit` 上限、**还有行没扫到** |
+| `next_after_id` | string? (i64) | 续扫游标：本轮已处理的最大 id。仅 `truncated = true` 时非 null，回传为下次请求的 `after_id` |
 | `changes` | object[] | 逐条 before → after（**只含真变了的**） |
 
 `changes[]` 元素：
@@ -112,6 +126,7 @@ t_assembly.status     ← 派生缓存
     "assemblies_examined": 0,
     "assemblies_changed": 0,
     "truncated": false,
+    "next_after_id": null,
     "changes": [
       { "level": "PART", "id": "9000000000000101", "from": "PENDING", "to": "COMPLETED" }
     ]
@@ -129,6 +144,14 @@ t_assembly.status     ← 派生缓存
   note 记原序列号）再清 `t_part.serial_no`。即对账也补做序列号释放。
   与业务流完全同一段代码，故不会重复释放（每个 part 至多 1 条归档事件）。
 - 父装配件进终态时清 `t_assembly.serial_no`（不归档，`t_assembly` 无事件表）。
+- **已终态的 part 不参与对账**（2026-10-01 review 第 1 轮 B1）：
+  `update_part_rollup` 带 `status NOT IN ('COMPLETED','CANCELLED')` 守卫 ——
+  「派生层不得覆盖主操作」在 SQL 层的兜底（`POST /parts/{id}/cancel` 会先把
+  part 打成 CANCELLED，随后批次的级联派生不许把它推回 COMPLETED）。
+  代价：一个**本来就错了**的终态 part（例如历史脏数据里 `t_part.status='COMPLETED'`
+  而批次还在 INSPECTION）无法靠本端点自动纠正 —— 那需要一次人工决策（究竟哪个是
+  真的），由派生算法替运营做决定比不做更危险。这类行请用 `part_ids` 定点排查
+  `t_part_event` 事件流水后人工修正。
 
 ### 事务 / 并发
 
@@ -176,9 +199,17 @@ Manager 单角色，口径一致。
   序列号释放归档 / assembly 反向漂移修正 + 幂等 / RBAC 403 且不改数据 /
   无 body = 全量 + `limit` 超上限 400）
 - 复用的既有派生实现（**一行算法都没重写**）：
-  - part：`src/modules/part/repo/status_gate.rs::rollup_part_derived`
+  - part：`src/modules/part/service/status_gate.rs::rollup_part_derived`
   - assembly：`src/modules/assembly/service/sync_from_part.rs::sync_assembly_status`
     （经 `recompute_assembly_status_by_id` 暴露「从 assembly_id 出发」的入口）
-- 守门单测：`src/modules/part/repo/status_gate.rs::write_guard_tests`
-  （`cargo test --lib` 跑；扫全 `src/**/*.rs`，除 `status_gate.rs` 外任何人
-  写 `t_part_batch.status` 即 CI 失败）
+- 守门单测（均在 `cargo test --lib` 跑）：
+  - `src/modules/part/service/status_gate.rs::write_guard_tests`：扫全
+    `src/**/*.rs`，除 `status_gate.rs` 外任何人写 `t_part_batch.status` 即 CI 失败。
+    已知绕过口（2026-10-01 review 第 1 轮 m3 记录在案，尚未修）：
+    `UPDATE ONLY t_part_batch` / `UPDATE public.t_part_batch`（schema 限定）/
+    `INSERT … ON CONFLICT … DO UPDATE SET status=…`（upsert）；且只覆盖 batch 层，
+    `t_part.status` / `t_assembly.status` 尚无同类护栏。
+  - `src/modules/part/service/status_gate.rs::bind_guard_tests`：单行 UPDATE 的
+    SQL 占位符 ↔ bind 个数必须一致且无跳号（2026-10-01 曾因 `$15` / 14 binds
+    的错位让 PG 报 `bind message supplies 14 parameters …`，并污染 sqlx 的
+    statement cache 使同连接后续查询连环失败）。

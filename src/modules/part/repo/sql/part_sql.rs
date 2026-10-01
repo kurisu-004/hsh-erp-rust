@@ -1074,8 +1074,26 @@ impl PartRepo {
     /// 2026-09-16 PR-2 瘦身：只写 `status` + `next_process_id`（其它列已从
     /// `t_part` 删除，真相源在 `t_part_batch`）。**不走 OCC**（派生写）：
     /// `WHERE id=$1 AND deleted_at IS NULL`。并发 rollup 由 SQL 行锁串行化；
-    /// `version += 1` 仍写入（保证审计字段单调）。0 行 → part 已被并发软删
-    /// （防御性 caller 走 NoChange）。
+    /// `version += 1` 仍写入（保证审计字段单调）。
+    ///
+    /// ## 终态守卫（2026-10-01 review 第 1 轮 B1 新增，**勿删**）
+    ///
+    /// `AND status NOT IN ('COMPLETED','CANCELLED')` 是「派生层不得覆盖主操作」
+    /// 的最后一道闸。故障现场：`PartService::cancel` 先把 part 打成 CANCELLED
+    /// （主操作 + 事件流水 + 清序列号），紧接着的批次级联按 min-progress 算出
+    /// `COMPLETED`（「已完成批次 + 其余被批量取消」→ `non_terminal` 为空），原
+    /// WHERE 没有终态守卫，于是派生写把 CANCELLED 覆盖成 COMPLETED，接口仍返回
+    /// 200、界面显示「已完成」而 `serial_no` 已被清空可被复用，父装配件还被
+    /// 级联推成 COMPLETED。
+    ///
+    /// 守卫命中 → 0 行 → caller（`rollup_part_derived`）降级 `NoChange` +
+    /// `tracing::warn!`，**不回滚用户的主操作**。
+    ///
+    /// 代价（已知并接受）：一个**已经错了**的终态 part（例如历史脏数据里
+    /// `t_part.status='COMPLETED'` 而批次还在 INSPECTION）无法再靠 rollup /
+    /// admin 对账端点自动纠正 —— 那需要一次人工决策（究竟哪个是真的），
+    /// 由派生算法替运营做决定比不做更危险。admin 对账端点的文档已同步声明
+    /// 「终态行不参与对账」。
     pub async fn update_part_rollup<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -1092,6 +1110,7 @@ impl PartRepo {
                 updated_at      = now(),
                 updated_by      = $4
             WHERE id = $1 AND deleted_at IS NULL
+              AND status NOT IN ('COMPLETED', 'CANCELLED')
             "#,
             part_id,
             status,

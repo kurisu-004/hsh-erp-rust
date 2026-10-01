@@ -35,6 +35,13 @@ pub struct InspectionBatchListItemOut {
     pub batch_no: i32,
     pub quantity: i32,
     pub status: String, // 必为 "INSPECTION"
+    /// 2026-10-01 review 第 1 轮 M5 新增（migration 005，**BREAKING**）：
+    /// `REPAIRING` 已从 `PartStatus` 降级为 `t_part_batch.is_repairing` 标记列，
+    /// 本 VO 的 `status` 因此**恒为** `IN_PROCESS`（`GET /parts/repairing-batches`
+    /// 的过滤判据已是 `is_repairing = true`）。改造前前端靠
+    /// `status === 'REPAIRING'` 标「返修中」，现在任何端点都拿不到该值 ——
+    /// 除非读本字段。
+    pub is_repairing: bool,
     pub location: Option<String>,
     pub version: i32,
     /// 逻辑 FK → t_process_chain_step.id（2026-09-16 PR-3；替代 next_process_id 列）
@@ -112,6 +119,7 @@ impl From<InspectionBatchListRow> for InspectionBatchListItemOut {
             batch_no: r.batch_no,
             quantity: r.quantity,
             status: r.status,
+            is_repairing: r.is_repairing,
             location: r.location,
             version: r.version,
             current_process_step_id: r.current_process_step_id,

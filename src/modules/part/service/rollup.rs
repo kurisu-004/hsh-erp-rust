@@ -40,7 +40,7 @@
 //! ============================================================================
 //!
 //! 派生逻辑（步骤 1–5 + 终态序列号归档 / 释放）已下沉到
-//! [`crate::modules::part::repo::status_gate::rollup_part_derived`]，与
+//! [`crate::modules::part::service::status_gate::rollup_part_derived`]，与
 //! 「写状态」合成同一个函数 `status_gate::apply_batch_status_change`。
 //! 本方法保留为**纯派生入口**：
 //!
@@ -63,7 +63,7 @@ use sqlx::PgConnection;
 use crate::auth::rbac::CurrentUser;
 use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::repo::status_gate;
+use crate::modules::part::service::status_gate;
 use crate::shared::error::AppError;
 
 use super::PartService;
@@ -91,13 +91,19 @@ impl PartService {
     /// 签名收 `&mut R: PartRepoTrait`（而非 `R` by-value）——本方法是 service 层
     /// helper（lifecycle / worker_scan 在 mid-method 调用后仍需继续用 repo），不
     /// 对 handler 暴露。caller 借 `&mut repo` 传入即可继续使用。
+    ///
+    /// `event_id`（2026-10-01 review 第 1 轮 M4）：终态序列号归档事件
+    /// （`SERIAL_RELEASED`）的主键。传 `None` 时派生层只清序列号、不写归档并打
+    /// `error!` —— 故**能让 part 新进终态**的调用点必须传 `Some(snowflake.next_id())`。
     pub async fn sync_from_batch_change<R: PartRepoTrait>(
         repo: &mut R,
         part_id: i64,
         current: &CurrentUser,
+        event_id: Option<i64>,
     ) -> Result<SyncOutcome, AppError> {
         let outcome =
-            status_gate::rollup_part_derived(repo.conn_mut(), part_id, current.id).await?;
+            status_gate::rollup_part_derived(repo.conn_mut(), part_id, current.id, event_id)
+                .await?;
         Ok(outcome.sync)
     }
 
@@ -110,12 +116,18 @@ impl PartService {
     ///
     /// part 域内部 lifecycle / worker_scan / phase1 全部走主入口（`repo: &mut R`），
     /// 借 `&mut *tx` 继续使用同一 tx 即可，无需本壳。
+    ///
+    /// `event_id`：同 [`Self::sync_from_batch_change`]。跨域调用点
+    /// （worker_pool 的换 holder / delivery_note 的 pickup）派生的批次一定还
+    /// 处在非终态（DELIVERED / IN_PROCESS），min-progress 推不出终态，故一律
+    /// 传 `None`，该分支不可达。
     pub async fn sync_from_batch_change_with_conn(
         conn: &mut PgConnection,
         part_id: i64,
         current: &CurrentUser,
+        event_id: Option<i64>,
     ) -> Result<SyncOutcome, AppError> {
-        let outcome = status_gate::rollup_part_derived(conn, part_id, current.id).await?;
+        let outcome = status_gate::rollup_part_derived(conn, part_id, current.id, event_id).await?;
         Ok(outcome.sync)
     }
 }

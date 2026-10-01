@@ -248,7 +248,11 @@ impl PartService {
                 }
                 // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
                 // 未变化（IN_PROCESS→IN_PROCESS）但 location/holder/process 物化。
-                PartService::sync_from_batch_change(&mut repo, part.id, current).await?;
+                //
+                // 2026-10-01 review 第 1 轮 M4：RETURNED 不改 status，该批次仍
+                // 非终态 → min-progress 推不出 part 终态，`event_id` 传 `None`
+                // （归档事件分支不可达）。
+                PartService::sync_from_batch_change(&mut repo, part.id, current, None).await?;
                 repo.insert_part_event(NewPartEvent {
                     id: snowflake.next_id(),
                     part_id: part.id,

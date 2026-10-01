@@ -45,7 +45,7 @@
 
 use sqlx::PgConnection;
 
-use crate::modules::part::repo::status_gate::{self, StatusChange};
+use crate::modules::part::service::status_gate::{self, StatusChange};
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
@@ -80,6 +80,8 @@ struct BatchListRow {
     batch_no: i32,
     quantity: i32,
     status: String,
+    /// 2026-10-01 review 第 1 轮 M5 新增（migration 005）：返修标记随列表投出
+    is_repairing: bool,
     location: Option<String>,
     version: i32,
     /// 2026-09-30 新增（来自 b.created_at，对齐 PartBatchListItemOut 新字段）
@@ -121,6 +123,8 @@ struct InspectionRepairRow {
     batch_no: i32,
     quantity: i32,
     status: String,
+    /// 2026-10-01 review 第 1 轮 M5 新增（migration 005）：返修标记随列表投出
+    is_repairing: bool,
     location: Option<String>,
     version: i32,
     current_process_step_id: Option<i64>,
@@ -302,16 +306,30 @@ async fn assert_shelf_maps_process(
 ///   status_gate 的白名单是「本次允许的源状态」，反向排除无法直接表达，
 ///   而正向表多写 9 个状态值换来的是「新增状态时若忘了加进白名单会被拒」
 ///   ——fail-safe 方向正确。
-/// - `new_current_process_id = None` 在原语义里是「**写 NULL**」（出池），
-///   而 status_gate 的 `None` 是「保持原值」。故额外置
-///   `clear_process_id: new_current_process_id.is_none()`。
-/// - `new_location` / `new_holder_id` / `new_current_process_step_id` 的
-///   `None` 语义两边一致（SQL 直写 NULL vs COALESCE 保持原值）——
-///   ⚠️ **这里有一处刻意的不等价**：原实现直写 NULL，本实现是「保持原值」。
-///   全部 8 个调用点（work_type / programming / lifecycle_helpers / outsource
-///   ×3 / repair ×2 / scan）传的 location / holder / step 均非 None 或与
-///   「保持原值」等价，故行为不变；后续若要传 None 表达「清空」，
-///   需先在 status_gate 补对应 flag。
+/// - 其余 3 个可选列的 `None` 在原语义里**同样是「写 NULL」**（SQL 是
+///   `location = $4, current_holder_id = $5, current_process_step_id = $6`），
+///   而 status_gate 的 `None` 是「保持原值」。故本包装函数对 4 列一律
+///   `clear_*: 形参.is_none()`，把「传 None = 清 NULL」这一**既有约定**如实
+///   翻译过去。
+///
+///   ⚠️ 2026-10-01 review 第 1 轮 M2：上一轮（本改造的首版）只给
+///   `clear_process_id` 做了翻译，并在注释里断言「全部 8 个调用点传的
+///   location / holder / step 均非 None 或与保持原值等价」——**该断言是错的**，
+///   实际有 5 个调用点靠 `None` 表达「清空」，被误改成「保持原值」后：
+///   - `lifecycle_helpers.rs`（recall-to-pending，`None,None,None,None`）：
+///     PENDING 批次仍留着 `location='PRODUCTION_SHELF'` + `current_holder_id`
+///     + 陈旧 step，UI 上「待投产」的工单显示还压在生产架上；
+///   - `outsource.rs`（外协收回 → INSPECTION）、`scan.rs`（scan-inspect 第一步）、
+///     `repair.rs` ×2（complete-repair / repair-dispatch 的 INSPECTION 分支）：
+///     `current_process_step_id` 不再清，而展示用的 `next_process_id` 正是由它
+///     经 `t_process_chain_step` JOIN 派生 → 出池批次显示上一道工序。
+///
+///   依赖该约定的 5 个调用点（改任何一处都要连带复核这 5 行）：
+///   `lifecycle_helpers.rs:153`（recall）、`outsource.rs:407`、
+///   `scan.rs:70`、`repair.rs:159`、`repair.rs:308`。
+///   其余 5 个调用点（共 **10** 个调用点，place_on_shelf / release_from_programming /
+///   send_to_outsource / receive_from_outsource / work_type pick-up）4 列全传
+///   `Some(..)`，走不到 clear 分支。
 #[allow(clippy::too_many_arguments)]
 async fn mark_batch_with_status_and_meta(
     conn: &mut PgConnection,
@@ -366,7 +384,18 @@ async fn mark_batch_with_status_and_meta(
                 "REPAIRING",
             ],
             updated_by,
+            // 2026-10-01 review 第 1 轮 M2：本包装函数沿用「形参 None = 写 NULL」
+            // 的**既有约定**（改造前 SQL 是 4 列直写），故 4 列一律
+            // `clear_* = 形参.is_none()`，把旧语义如实翻译进 status_gate 的
+            // 「None = 保持原值」三态模型。理由与受影响调用点清单见本函数 doc。
+            clear_location: new_location.is_none(),
+            clear_holder_id: new_holder_id.is_none(),
             clear_process_id: new_current_process_id.is_none(),
+            clear_process_step_id: new_current_process_step_id.is_none(),
+            // 本漏斗的目标状态没有一个是终态（COMPLETED 走
+            // `mark_batch_completed`、CANCELLED 走 `mark_batch_status_only`），
+            // 故永远不会触发 step 4 的终态序列号归档。
+            event_id: None,
         },
     )
     .await
@@ -394,6 +423,7 @@ async fn mark_batch_status_only(
     new_status: &str,
     is_repairing: Option<bool>,
     updated_by: i64,
+    event_id: Option<i64>,
 ) -> Result<u64, AppError> {
     status_gate::apply_batch_status_change(
         conn,
@@ -408,7 +438,14 @@ async fn mark_batch_status_only(
             expected_version: Some(expected_version),
             allowed_from: status_guard_for_target(new_status),
             updated_by,
+            clear_location: false,
+            clear_holder_id: false,
             clear_process_id: false,
+            clear_process_step_id: false,
+            // 2026-10-01 review 第 1 轮 M4：只有 `new_status='CANCELLED'` 会让
+            // part 新进终态（cancel-batch），caller 需在那种情况下传雪花 id；
+            // `READY_TO_SHIP` / `IN_PROCESS` 两个目标传 `None` 即可。
+            event_id,
         },
     )
     .await

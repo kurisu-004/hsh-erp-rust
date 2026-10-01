@@ -66,7 +66,7 @@ use sqlx::{PgConnection, PgExecutor};
 use super::model::{InspectionBatchListRow, PartBatchScanRow, RecentBatchRow, TPartBatch};
 use crate::modules::part::model::TPart;
 // 2026-10-01：`PartBatchRepo::update` 的 status 半边改走 status_gate（唯一写入口）。
-use crate::modules::part::repo::status_gate::{self, StatusChange};
+use crate::modules::part::service::status_gate::{self, StatusChange};
 use crate::shared::error::AppError;
 
 /// SQL 真源 ZST。trait 名为 `PartBatchRepoTrait`（公共接口），
@@ -466,18 +466,33 @@ impl PartBatchRepo {
     /// **为什么第 2 步不 bump version**：第 1 步已经在**同一事务、同一行**
     /// 上做过一次带 `WHERE version = $n` 的 OCC 校验并持有了该行的行锁，
     /// 在 READ COMMITTED 下并发写者会阻塞到本事务结束 —— 第 2 步再做一次
-    /// OCC 校验并不能再拦住任何冲突，只会为**一次业务动作**把审计计数器
-    /// `version` 加 2，让 `t_part_batch.version` 增长速度与业务动作数脱钩。
-    /// 故第 2 步只写列、不动 `version` / `updated_at` / `updated_by`
-    /// （审计时间戳由第 1 步给出，语义上更准确：业务动作发生在那一刻）。
+    /// OCC 校验并不能再拦住任何冲突（只会误伤：第 1 步刚把 version 加了 1），
+    /// 只会为**一次业务动作**把审计计数器 `version` 加 2，让
+    /// `t_part_batch.version` 增长速度与业务动作数脱钩。故第 2 步只写列、
+    /// 不动 `version` / `updated_at` / `updated_by`（审计时间戳由第 1 步给出，
+    /// 语义上更准确：业务动作发生在那一刻）。
+    ///
+    /// ## 返回值契约（2026-10-01 review 第 1 轮 M6 修正）
+    ///
+    /// 返回**真实影响行数**，而不是恒 1：
+    /// - `status = Some(..)` → 走 status_gate，0 行已由 gate 抛 `VERSION_CONFLICT`，
+    ///   走到这里必然是 1；第 2 步是「值没变就不写」，可能 0 行，但**不**把它
+    ///   计入返回值（那会让唯一生产调用方 `delivery_note::pickup` 在「送货单 id
+    ///   本来就一样」时误报并发冲突）。
+    /// - `status = None` → 只有第 2 步，返回它的真实行数；此时第 2 步**带 OCC**
+    ///   （`AND version = $3`），故 0 行确实意味着版本冲突，caller 转 409 是对的。
+    ///
+    /// 上一版恒返回 `Ok(1)` 且在 `status = None` 时完全没有 OCC（`version` 形参
+    /// 被忽略），使 trait 声明里「0 行 → 由 service 转 `VERSION_CONFLICT` 409」
+    /// 变成一句谎言、`delivery_note/service/lifecycle.rs` 的 `if affected == 0`
+    /// 变成死代码。
     #[allow(clippy::too_many_arguments)]
     pub async fn update(
         conn: &mut PgConnection,
         batch_id: i64,
         version: i32,
         delivery_note_id: Option<i64>,
-        status: Option<&'static str>,
-        _when: chrono::NaiveDateTime,
+        status: Option<&str>,
         updated_by: Option<i64>,
     ) -> Result<u64, AppError> {
         let updated_by = updated_by.unwrap_or(0);
@@ -498,24 +513,47 @@ impl PartBatchRepo {
                     // READY_TO_SHIP（service 层逐批守过）。
                     allowed_from: &["READY_TO_SHIP"],
                     updated_by,
+                    clear_location: false,
+                    clear_holder_id: false,
                     clear_process_id: false,
+                    clear_process_step_id: false,
+                    // 目标状态 DELIVERED 不是终态 → 终态归档事件分支不可达（M4）
+                    event_id: None,
                 },
             )
             .await?;
+            // 2) delivery_note_id → 只挂单，不动 version（理由见上方 doc）
+            if let Some(note_id) = delivery_note_id {
+                sqlx::query(
+                    "UPDATE t_part_batch SET delivery_note_id = $2 \
+                     WHERE id = $1 AND deleted_at IS NULL \
+                       AND delivery_note_id IS DISTINCT FROM $2::bigint",
+                )
+                .bind(batch_id)
+                .bind(note_id)
+                .execute(&mut *conn)
+                .await?;
+            }
+            return Ok(1);
         }
-        // 2) delivery_note_id → 只挂单，不动 version（理由见上方 doc）
+        // 仅挂送货单（`status = None`）：带 OCC，0 行 → version 冲突。
+        // 语义上等价于 `attach_to_note`，但保留本函数是为了不破坏
+        // 「一次调用同时给两列赋值」的既有调用点签名。
+        let mut affected = 0u64;
         if let Some(note_id) = delivery_note_id {
-            sqlx::query(
+            let r = sqlx::query(
                 "UPDATE t_part_batch SET delivery_note_id = $2 \
-                 WHERE id = $1 AND deleted_at IS NULL \
+                 WHERE id = $1 AND version = $3 AND deleted_at IS NULL \
                    AND delivery_note_id IS DISTINCT FROM $2::bigint",
             )
             .bind(batch_id)
             .bind(note_id)
+            .bind(version)
             .execute(&mut *conn)
             .await?;
+            affected = r.rows_affected();
         }
-        Ok(1)
+        Ok(affected)
     }
 
     /// version-checked 「仅写 delivery_note_id」更新（attach_to_note 用）。
@@ -1244,6 +1282,9 @@ impl PartBatchRepo {
                 pb.batch_no        AS "pb_batch_no!",
                 pb.quantity        AS "pb_quantity!",
                 pb.status          AS "pb_status!",
+                -- 2026-10-01 review 第 1 轮 M5：随列表投出返修标记（REPAIRING
+                -- 已不是 status，见 vo/inspection.rs 的 BREAKING 标注）
+                pb.is_repairing    AS "pb_is_repairing!",
                 pb.location        AS "pb_location?",
                 pb.version         AS "pb_version!",
                 pb.current_process_step_id AS "pb_current_process_step_id?",
@@ -1337,6 +1378,7 @@ impl PartBatchRepo {
                     batch_no: r.pb_batch_no,
                     quantity: r.pb_quantity,
                     status: r.pb_status,
+                    is_repairing: r.pb_is_repairing,
                     location: r.pb_location,
                     version: r.pb_version,
                     current_process_step_id: r.pb_current_process_step_id,
@@ -1453,14 +1495,15 @@ pub trait PartBatchRepoTrait: Send {
         part_ids: &'a [i64],
         include_deleted: bool,
     ) -> Result<Vec<TPartBatch>, sqlx::Error>;
+    /// 返回真实影响行数：0 行 → 由 service 转 `VERSION_CONFLICT` 409。
+    /// 详见 impl 处的「返回值契约」（2026-10-01 review 第 1 轮 M6）。
     #[allow(clippy::too_many_arguments)]
-    async fn update(
+    async fn update<'a>(
         &mut self,
         batch_id: i64,
         version: i32,
         delivery_note_id: Option<i64>,
-        status: Option<&'static str>,
-        when: NaiveDateTime,
+        status: Option<&'a str>,
         updated_by: Option<i64>,
     ) -> Result<u64, AppError>;
     #[allow(clippy::too_many_arguments)]
@@ -1576,13 +1619,12 @@ impl PartBatchRepoTrait for &mut PgConnection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn update(
+    async fn update<'a>(
         &mut self,
         batch_id: i64,
         version: i32,
         delivery_note_id: Option<i64>,
-        status: Option<&'static str>,
-        when: NaiveDateTime,
+        status: Option<&'a str>,
         updated_by: Option<i64>,
     ) -> Result<u64, AppError> {
         PartBatchRepo::update(
@@ -1591,7 +1633,6 @@ impl PartBatchRepoTrait for &mut PgConnection {
             version,
             delivery_note_id,
             status,
-            when,
             updated_by,
         )
         .await

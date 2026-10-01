@@ -17,6 +17,9 @@
 //!   outsource / repair / batch 操作 / 事件历史 / 位置树 / scan / match /
 //!   batch-with-pdfs / batch-update-order-info）
 //! - `rollup.rs`：rollup 工具（sync_from_batch_change）
+//! - `status_gate.rs`：batch → part → assembly 单一写入口（2026-10-01 新增，
+//!   2026-10-01 review 第 1 轮 M8 从 `repo/` 移来：它承载终态判定、序列号
+//!   归档/释放与跨域 service 调用，属业务策略而非 SQL）
 //! - `list_enrichment.rs`：list_parts 派生层「位置 / 持有人」跨三表解析
 //!   helper（2026-09-22 review 第 2 轮从 crud.rs 抽出，原 1054 行超限）
 
@@ -28,6 +31,7 @@ pub mod lifecycle;
 pub mod list_enrichment;
 pub mod phase1;
 pub mod rollup;
+pub mod status_gate;
 pub mod worker_scan;
 
 // 重导出子模块内的 `pub const`（impl 块里的方法由 `PartService` 自身承载，

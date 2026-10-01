@@ -1100,3 +1100,269 @@ async fn cancel_last_batch_releases_serial_when_part_becomes_cancelled() {
         "归档 note 应含原序列号 {serial}，实际 {note}"
     );
 }
+
+// ===========================================================================
+//  2026-10-01 review 第 1 轮 B1：派生层不得覆盖主操作（cancel 路径）
+// ===========================================================================
+
+/// 造一个「父装配件 + 单子件 + 两条批次（COMPLETED / INSPECTION）」的场景。
+///
+/// 形状与 B1 故障现场逐字一致：part 停在 INSPECTION，批次一条已 COMPLETED、
+/// 一条还在 INSPECTION。
+async fn insert_assembly_with_mixed_batches(
+    pool: &PgPool,
+    customer_id: i64,
+    asm_serial: &str,
+    part_serial: &str,
+) -> (i64, i64, i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    // instance=13 独占：与文件内其它 helper 的 instance 段不重叠
+    let sf = SnowflakeIdGenerator::new(1_577_836_800_000, 13);
+    let asm_id = sf.next_id();
+    let part_id = sf.next_id();
+    let b_done = sf.next_id();
+    let b_live = sf.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, serial_no, drawing_no, name, applicant_name, \
+         customer_id, request_date, planned_delivery_date, status, quantity, unit_price, \
+         total_price, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 'DA-001', '总成', '', $3, $4, $4, 'INSPECTION', 1, 0, 0, 0, $5, NULL, $5, NULL)",
+    )
+    .bind(asm_id)
+    .bind(asm_serial)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert assembly");
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at, assembly_id) \
+         VALUES ($1, $2, 'P-B1', 'D-001', $3, 'INSPECTION', 'P-B1', $4, $4, 1, 0, $5, $5, $6)",
+    )
+    .bind(part_id)
+    .bind(part_serial)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .bind(asm_id)
+    .execute(pool)
+    .await
+    .expect("insert part");
+    for (idx, (bid, st)) in [(b_done, "COMPLETED"), (b_live, "INSPECTION")]
+        .into_iter()
+        .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 1, $4, 0, $5, $5)",
+        )
+        .bind(bid)
+        .bind(part_id)
+        .bind(idx as i32 + 1)
+        .bind(st)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert batch");
+    }
+    (asm_id, part_id, b_done, b_live)
+}
+
+/// **B1 回归测试**：`POST /parts/{id}/cancel` 后 part 必须停在 CANCELLED，
+/// 父装配件绝不能被级联推成 COMPLETED。
+///
+/// 故障机制（review 第 1 轮已复现并 ROLLBACK 验证）：`PartService::cancel`
+/// 先跑 `mark_part_cancelled`（**主操作**：part → CANCELLED、清 `serial_no`），
+/// 紧接着 `cancel_all_active_batches_for_part` 走 status_gate 的 bulk 模式。
+/// 该 part 下存在一条 **已 COMPLETED** 的批次，于是 min-progress 算出
+/// `non_cancelled=[COMPLETED]` / `non_terminal=[]` → target = **COMPLETED**。
+/// 改造前 `update_part_rollup` 的 WHERE 没有终态守卫，派生写直接把 CANCELLED
+/// 覆盖回 COMPLETED，随后 step 3 把父装配件也推成 COMPLETED —— 而接口返回 200、
+/// 事件流水记的是 `INSPECTION → CANCELLED`、界面显示「已完成」、序列号已被清空
+/// 可被复用。
+#[tokio::test]
+async fn cancel_part_is_not_overwritten_by_rollup_completed() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (asm_id, pid, b_done, b_live) =
+        insert_assembly_with_mixed_batches(&pool, fx.customer_l2_id, "ASM-B1-0001", "SN-B1-0001")
+            .await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/cancel"),
+            Some(json!({ "reason": "客户作废" })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "cancel 200: {env}");
+    assert_eq!(env["code"], 0, "信封 code 应为 0");
+    assert_eq!(
+        env["data"]["status"], "CANCELLED",
+        "响应体应报 CANCELLED（= 主操作的结果）"
+    );
+
+    // ---- 1. part 状态：必须停在 CANCELLED（不是 COMPLETED）----
+    assert_eq!(
+        part_status(&pool, pid).await,
+        "CANCELLED",
+        "派生层不得把主操作写下的 CANCELLED 覆盖成 COMPLETED（review B1）"
+    );
+    assert_eq!(
+        part_serial_no(&pool, pid).await,
+        None,
+        "cancel 走 `mark_part_cancelled` 的 `serial_no = NULL`（作废即退役，不归档）"
+    );
+
+    // ---- 2. 批次：已完成的不许被拖成 CANCELLED，活跃的被级联取消 ----
+    let done_status: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(b_done)
+        .fetch_one(&pool)
+        .await
+        .expect("read batch");
+    assert_eq!(
+        done_status, "COMPLETED",
+        "已完成的批次是终态，级联取消的白名单必须排除它"
+    );
+    let live_status: String = sqlx::query_scalar("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(b_live)
+        .fetch_one(&pool)
+        .await
+        .expect("read batch");
+    assert_eq!(live_status, "CANCELLED", "活跃批次应被级联取消");
+
+    // ---- 3. 父装配件：绝不能是 COMPLETED ----
+    let asm_status: String = sqlx::query_scalar("SELECT status FROM t_assembly WHERE id = $1")
+        .bind(asm_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read assembly");
+    assert_ne!(
+        asm_status, "COMPLETED",
+        "父装配件绝不能被级联推成 COMPLETED（子件是作废不是完成）"
+    );
+    // 它唯一的孩子已 CANCELLED → min-progress 规则算出父件 CANCELLED；
+    // 这一步靠 bulk 入口的 `PartDerivation::KeepPartTerminalAsIs`
+    // 「跳过 part 写、继续派生父层」实现。
+    assert_eq!(
+        asm_status, "CANCELLED",
+        "唯一子件已作废，父装配件应被派生追平成 CANCELLED（不是留着 INSPECTION 漂着）"
+    );
+    // 父件进终态 → 序列号必须被释放（否则 uk_t_assembly_serial_no 永久占位）
+    let asm_serial: Option<String> =
+        sqlx::query_scalar("SELECT serial_no FROM t_assembly WHERE id = $1")
+            .bind(asm_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read assembly serial");
+    assert_eq!(
+        asm_serial, None,
+        "父装配件进终态后序列号必须释放（uk_t_assembly_serial_no 不含 status 条件）"
+    );
+
+    // ---- 4. 事件流水：记的是用户的主操作 ----
+    let cancel_events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM t_part_event \
+         WHERE part_id = $1 AND event_type = 'CANCELLED' AND to_status = 'CANCELLED'",
+    )
+    .bind(pid)
+    .fetch_one(&pool)
+    .await
+    .expect("count CANCELLED events");
+    assert_eq!(
+        cancel_events, 1,
+        "应有且仅有 1 条 `→ CANCELLED` 事件（此前 DB 状态与事件流水互相矛盾）"
+    );
+}
+
+// ===========================================================================
+//  2026-10-01 review 第 1 轮 M2：出池 / 召回必须真的把「位置」清空
+// ===========================================================================
+
+/// **M2 回归测试**：`recall-to-pending` 必须把 `location` /
+/// `current_holder_id` / `current_process_step_id` 一起清成 NULL。
+///
+/// 改造前 `mark_batch_with_status_and_meta` 的 SQL 是
+/// `SET location=$4, current_holder_id=$5, current_process_step_id=$6`，
+/// 传 `None` 就是**写 NULL**。收口成 status_gate 时若把 `None` 一律当成
+/// 「保持原值」，PENDING 批次就会留着 `location='PRODUCTION_SHELF'` +
+/// `current_holder_id=<货架>` + 陈旧 step —— UI 上「待投产」的工单显示还压在
+/// 生产架上，且展示用的 `next_process_id`（由 step JOIN 派生）仍指着上一道工序。
+#[tokio::test]
+async fn recall_to_pending_clears_location_holder_and_step() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
+    // 池内状态：压在生产架上、挂着 holder、记着工序 step
+    sqlx::query(
+        "UPDATE t_part_batch \
+         SET location = 'PRODUCTION_SHELF', \
+             current_holder_id = $2, \
+             current_process_id = $3, \
+             current_process_step_id = $3 \
+         WHERE id = $1",
+    )
+    .bind(bid)
+    .bind(fx.production_shelf_id)
+    .bind(fx.process_id)
+    .execute(&pool)
+    .await
+    .expect("seed 池内状态");
+    // 先自证：此刻这 3 列确实非空（否则断言「被清空」是空转）
+    let (loc, holder, step): (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT location, current_holder_id, current_process_step_id \
+         FROM t_part_batch WHERE id = $1",
+    )
+    .bind(bid)
+    .fetch_one(&pool)
+    .await
+    .expect("read before recall");
+    assert_eq!(loc.as_deref(), Some("PRODUCTION_SHELF"));
+    assert_eq!(holder, Some(fx.production_shelf_id));
+    assert_eq!(step, Some(fx.process_id));
+
+    let version = batch_version(&pool, bid).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{pid}/recall-to-pending"),
+            Some(json!({
+                "batch_id": bid.to_string(),
+                "version": version,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "recall: {env}");
+    assert_eq!(env["data"]["status"], "PENDING");
+
+    let (loc, holder, pid_col, step): (Option<String>, Option<i64>, Option<i64>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT location, current_holder_id, current_process_id, current_process_step_id \
+             FROM t_part_batch WHERE id = $1",
+        )
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .expect("read after recall");
+    assert_eq!(loc, None, "recall 出池后 location 必须清 NULL（review M2）");
+    assert_eq!(holder, None, "recall 出池后 current_holder_id 必须清 NULL");
+    assert_eq!(
+        pid_col, None,
+        "出池后 current_process_id 必须清 NULL（池归属不变式）"
+    );
+    assert_eq!(
+        step, None,
+        "recall 出池后 current_process_step_id 必须清 NULL（review M2）"
+    );
+}

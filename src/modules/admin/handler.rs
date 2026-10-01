@@ -23,8 +23,8 @@ use crate::state::AppState;
 
 use super::dto::{RecomputeRollupReport, RecomputeRollupRequest};
 use super::service::{
-    PartRecompute, list_assembly_ids, list_part_ids, recompute_assembly, recompute_part,
-    resolve_limit, validate_scope_ids,
+    PartRecompute, list_assembly_ids, list_part_ids, next_cursor, recompute_assembly,
+    recompute_part, resolve_limit, validate_scope_ids,
 };
 
 /// 逐块处理的大小（**每块一个事务**）。
@@ -92,16 +92,33 @@ pub async fn recompute_rollup(
     let mut conn = state.pool.acquire().await?;
     let (mut part_targets, part_truncated) = match (part_ids.clone(), full_scope) {
         (Some(ids), _) => (ids, false),
-        (None, true) => list_part_ids(&mut conn, limit).await?,
+        (None, true) => list_part_ids(&mut conn, limit, req.after_id).await?,
         (None, false) => (Vec::new(), false),
     };
     let (mut assembly_targets, asm_truncated) = match (assembly_ids.clone(), full_scope) {
         (Some(ids), _) => (ids, false),
-        (None, true) => list_assembly_ids(&mut conn, limit).await?,
+        (None, true) => list_assembly_ids(&mut conn, limit, req.after_id).await?,
         (None, false) => (Vec::new(), false),
     };
     drop(conn);
     report.truncated = part_truncated || asm_truncated;
+    // 2026-10-01 review 第 1 轮 M7：把续扫游标回给调用方。
+    //
+    // 两段窗口各自推进到哪由各自的最大 id 决定；`t_assembly` 的 id 空间与
+    // `t_part` **不相交**（各自独立的雪花流），但两个游标共用一个 `after_id`
+    // 字段会互相干扰 —— 故取**两段里较大的**那个作为续扫游标：它保证本轮
+    // 已处理的两段都不会被下一轮重复处理（幂等重复处理只是浪费，不正确）；
+    // 代价是下一轮会跳过 id 介于两者之间的少量行，运维若要严格覆盖可对两段
+    // 分别用 `part_ids` / `assembly_ids` 定点跑（端点本就支持）。
+    if report.truncated {
+        let p = next_cursor(&part_targets);
+        let a = next_cursor(&assembly_targets);
+        report.next_after_id = match (p, a) {
+            (Some(p), Some(a)) => Some(p.max(a)),
+            (Some(p), None) | (None, Some(p)) => Some(p),
+            (None, None) => None,
+        };
+    }
 
     // ---- part 段：batch → part（父装配件由 status_gate 内部级联）----
     for chunk in part_targets.chunks(CHUNK_SIZE) {
@@ -110,7 +127,13 @@ pub async fn recompute_rollup(
             let PartRecompute {
                 entry,
                 next_process_fixed,
-            } = recompute_part(&mut tx, *part_id, current.id).await?;
+            } = recompute_part(
+                &mut tx,
+                *part_id,
+                current.id,
+                Some(state.snowflake.next_id()),
+            )
+            .await?;
             report.parts_examined += 1;
             if next_process_fixed {
                 report.parts_next_process_id_fixed += 1;

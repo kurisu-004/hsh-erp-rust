@@ -15,6 +15,10 @@
 //!    —— 完全不带 body（无 `Content-Type` 头）→ `scope="ALL"` 且 200。
 //! 5. `recompute_rollup_rejects_limit_over_cap`
 //!    —— `limit` 超上限 → 400 / `20104`（防止单请求锁住全表）。
+//! 6. `recompute_rollup_full_scope_advances_by_after_id_cursor`
+//!    —— 全量对账的 `after_id` 游标续扫：单轮 `limit=1` + 回传 `next_after_id`
+//!    直到 `truncated=false`，必须**单调推进**且把所有漂移各修正一次
+//!    （2026-10-01 review 第 1 轮 M7：改造前没有游标，重复调用永远从最小 id 重扫）。
 //!
 //! ## 为什么这组测试重要
 //!
@@ -403,4 +407,97 @@ async fn recompute_rollup_rejects_limit_over_cap() {
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "body={body}");
     assert_eq!(body["code"], code::BIZ_INVALID_VALUE);
+}
+
+/// 6. 全量对账的**游标续扫**（2026-10-01 review 第 1 轮 M7）。
+///
+/// 改造前 `list_part_ids` 只有 `ORDER BY id LIMIT limit+1`、**既无游标也无
+/// offset**：`truncated = true` 时运维再调一次仍然从最小的 `limit` 行开始扫 ——
+/// 一个兜底端点在生产数据量下永远兜不住底。
+///
+/// 断言链：
+/// 1. `limit=1` → `truncated=true` 且 `next_after_id` 非 null；
+/// 2. 把 `next_after_id` 回传为 `after_id` → `parts_examined` 落在**下一批** id 上
+///    （与第 1 轮不重叠）；
+/// 3. 一直续扫到 `truncated=false`，所有漂移都被修正（真收敛，不是原地打转）。
+#[tokio::test]
+async fn recompute_rollup_full_scope_advances_by_after_id_cursor() {
+    let (pool, app, token, _inspector, fx) = bootstrap().await;
+    // 造 3 条漂移，id 递增（next_test_id 单调）
+    let mut drifted = Vec::new();
+    for i in 0..3 {
+        let pid = insert_drifted_part(
+            &pool,
+            fx.customer_l2_id,
+            &format!("漂移件-游标-{i}"),
+            None,
+            "PENDING",
+            None,
+        )
+        .await;
+        insert_batch_with_status(&pool, pid, "INSPECTION").await;
+        drifted.push(pid);
+    }
+    drifted.sort_unstable();
+
+    let mut after_id: Option<String> = None;
+    let mut rounds = 0usize;
+    let mut seen: Vec<i64> = Vec::new();
+    loop {
+        rounds += 1;
+        assert!(rounds <= 20, "续扫 20 轮仍未收敛 = 游标没生效");
+        let body_json = match &after_id {
+            Some(a) => json!({ "limit": 1, "after_id": a }),
+            None => json!({ "limit": 1 }),
+        };
+        let (st, body) = send(
+            app.clone(),
+            json_request("POST", URL, Some(body_json), Some(&token)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "round {rounds}: {body}");
+        assert_eq!(body["code"], 0);
+        let data = &body["data"];
+        assert_eq!(data["scope"], "ALL", "round {rounds}");
+        assert_eq!(
+            data["parts_examined"], 1,
+            "round {rounds}: limit=1 每轮只查 1 行"
+        );
+        for c in data["changes"].as_array().expect("changes") {
+            if c["level"] == "PART" {
+                seen.push(c["id"].as_str().unwrap().parse().unwrap());
+            }
+        }
+        if data["truncated"] == false {
+            assert!(
+                data["next_after_id"].is_null(),
+                "末轮（truncated=false）不应再给续扫游标"
+            );
+            break;
+        }
+        let next = data["next_after_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("round {rounds}: truncated=true 必须回 next_after_id"))
+            .to_string();
+        if let Some(prev) = &after_id {
+            assert!(
+                next > *prev,
+                "游标必须单调推进：{prev} → {next}（否则永远收敛不了）"
+            );
+        }
+        after_id = Some(next);
+    }
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(
+        seen, drifted,
+        "续扫若干轮后，3 条漂移必须都被修正且各只报一次（真收敛而非原地打转）"
+    );
+    for pid in &drifted {
+        assert_eq!(
+            part_status_str(&pool, *pid).await,
+            "INSPECTION",
+            "part {pid} 应已被对账修正"
+        );
+    }
 }

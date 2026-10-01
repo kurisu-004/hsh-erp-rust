@@ -208,7 +208,14 @@ impl PartService {
         //
         // 2026-10-01：该 bulk 写点走 status_gate 批量模式（并补上了它原先缺失的
         // `status NOT IN ('COMPLETED','CANCELLED')` 白名单 —— 原实现会把已完成
-        // 批次一起拖成 CANCELLED），part → assembly 派生已在其内部完成。
+        // 批次一起拖成 CANCELLED），**父装配件**派生已在其内部完成。
+        //
+        // ⚠️ 2026-10-01 review 第 1 轮 B1：`t_part` 的派生在本路径上**被显式
+        // 关掉**（`PartDerivation::KeepPartTerminalAsIs`）。上面 `mark_part_cancelled`
+        // 才是 part 状态的主操作；若放任级联再按 min-progress 派生，「已完成批次
+        // + 其余被批量取消」会算出 COMPLETED 并把用户的「作废工单」静默改回去
+        // （接口 200、事件流水记 CANCELLED、界面显示已完成、父装配件被级联推成
+        // COMPLETED）。SQL 层另有终态守卫兜底（`update_part_rollup`），两处都要在。
         let _batches_cancelled = repo
             .cancel_all_active_batches_for_part(part_id, current.id)
             .await?;
@@ -303,7 +310,12 @@ impl PartService {
         //    `uk_t_part_serial_no` **永久**占住（无任何告警）。现在
         //    「part 被 rollup 进终态」即释放，与「是否所有批次都完成」彻底解耦。
         let _bn = repo
-            .mark_batch_completed(batch.id, batch.version, current.id)
+            .mark_batch_completed(
+                batch.id,
+                batch.version,
+                current.id,
+                Some(snowflake.next_id()),
+            )
             .await?;
         // 7. 事件日志：batch_id + quantity 来自操作的批次。
         repo.insert_part_event(NewPartEvent {
@@ -506,7 +518,7 @@ impl PartService {
         //    （`sync_from_batch_change` + `clear_part_serial_no_when_completed`，
         //    两者都被 `let _ =` 静默吞掉）整体删除。
         let _n = repo
-            .force_complete_all_batches_for_part(part_id, current.id)
+            .force_complete_all_batches_for_part(part_id, current.id, Some(snowflake.next_id()))
             .await?;
         // 8. 事件日志：FORCE_COMPLETED 区分常规 COMPLETED；note 加 [FORCE] 前缀。
         let note_owned = req.note.unwrap_or_default();

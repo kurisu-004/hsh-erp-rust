@@ -34,7 +34,7 @@ use super::PartRepo;
 // 2026-10-01：本文件除 `mark_batch_returned`（只写 holder/location，不改
 // status）外，所有 `t_part_batch.status` 写点均已收口为
 // `status_gate` 之上的薄包装 —— 全仓唯一的批次状态写入口。
-use crate::modules::part::repo::status_gate::{self, StatusChange};
+use crate::modules::part::service::status_gate::{self, StatusChange};
 use crate::shared::error::AppError;
 // PR2 合并后，`TPartBatch` 与 `PartBatchRepo` 都已搬到 `crate::modules::part::batch::*`。
 // 本文件继续走新路径（与 PR2 「合并 part_batch → part/batch」约束一致）。
@@ -340,7 +340,14 @@ impl PartRepo {
                 // 的 3 处）；`None` 分支保留为 0，与 `update_batch_fields` 的
                 // `COALESCE($3, ...)` 历史容忍度一致。
                 updated_by: current_user_id.unwrap_or(0),
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
                 clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：归档事件 id 由 caller 透传。
+                event_id: None,
             },
         )
         .await
@@ -402,6 +409,14 @@ impl PartRepo {
                 // 2026-09-30（review H2）：出池 → 池归属权威列必须置 NULL
                 //   （不置 NULL 会让 INSPECTION 批次带着上一道工序 id 停留）。
                 clear_process_id: true,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」；送检刻意**保留** `current_process_step_id`
+                //（INSPECTION 期间要显示批次走到工艺链第几步，见
+                //  `part/vo/inspection.rs`），故 step 的 clear 为 false。
+                clear_location: false,
+                clear_holder_id: false,
+                clear_process_step_id: false,
+                event_id: None,
             },
         )
         .await
@@ -442,6 +457,12 @@ impl PartRepo {
                 // 进池 → 写目标工序；`current_process_id` 为 None 时即「不进任何
                 // 工序池」，清 NULL 是本路径的既有语义。
                 clear_process_id: current_process_id.is_none(),
+                // 2026-10-01 review 第 1 轮 M2：location / holder 都有实参，
+                // step 为 `None` 时是「保持原值」（本路径的既有语义）。
+                clear_location: false,
+                clear_holder_id: false,
+                clear_process_step_id: false,
+                event_id: None,
             },
         )
         .await
@@ -743,7 +764,14 @@ impl PartRepo {
                 expected_version: Some(expected_version),
                 allowed_from: &["READY_TO_SHIP"],
                 updated_by: current_user_id,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
                 clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：归档事件 id 由 caller 透传。
+                event_id: None,
             },
         )
         .await
@@ -756,11 +784,16 @@ impl PartRepo {
     /// 新链路的**最常见触发点**：part 只有在所有非取消批次都 COMPLETED 时才会
     /// 派生到 COMPLETED，故多批次工单完成最后一条时自动释放，无需 service 层
     /// 再记得调 `clear_part_serial_no_when_completed`。
+    ///
+    /// `event_id`（2026-10-01 review 第 1 轮 M4）：本函数是**能让 part 新进
+    /// COMPLETED** 的写点之一，故必须由 caller 传一个真实雪花 id 供终态序列号
+    /// 归档事件（`SERIAL_RELEASED`）使用。
     pub async fn mark_batch_completed(
         conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
+        event_id: Option<i64>,
     ) -> Result<u64, AppError> {
         status_gate::apply_batch_status_change(
             conn,
@@ -775,7 +808,14 @@ impl PartRepo {
                 expected_version: Some(expected_version),
                 allowed_from: &["DELIVERED"],
                 updated_by: current_user_id,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
                 clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：终态归档事件 id 由 caller 透传。
+                event_id,
             },
         )
         .await
@@ -822,11 +862,15 @@ impl PartRepo {
 
     /// 批次取消（OCC UPDATE t_part_batch）：白名单 5 状态
     /// —— **2026-10-01 起为 status_gate 薄包装**。
+    ///
+    /// `event_id`：本函数能让 part 新进 CANCELLED（它是该 part 最后一条活跃
+    /// 批次时），故按 M4 由 caller 透传归档事件雪花 id。
     pub async fn mark_batch_cancelled(
         conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
+        event_id: Option<i64>,
     ) -> Result<u64, AppError> {
         status_gate::apply_batch_status_change(
             conn,
@@ -847,7 +891,14 @@ impl PartRepo {
                     "DELIVERED",
                 ],
                 updated_by: current_user_id,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
                 clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：终态归档事件 id 由 caller 透传。
+                event_id,
             },
         )
         .await
@@ -907,7 +958,14 @@ impl PartRepo {
                 expected_version: Some(expected_version),
                 allowed_from: &["IN_PROCESS"],
                 updated_by: current_user_id,
+                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
+                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                clear_location: false,
+                clear_holder_id: false,
                 clear_process_id: false,
+                clear_process_step_id: false,
+                // 2026-10-01 review 第 1 轮 M4：归档事件 id 由 caller 透传。
+                event_id: None,
             },
         )
         .await
@@ -926,9 +984,20 @@ impl PartRepo {
     /// `NOT (status IN ('COMPLETED','CANCELLED'))`。
     ///
     /// **修正 2 —— 走 status_gate bulk 模式**：改写完自动对受影响的每个 part
-    /// 补做 part → assembly 派生（改造前 `PartService::cancel` 压根不调
-    /// `sync_from_batch_change`，父装配件的派生状态靠下一次任意 part 流转
-    /// 才追平）。
+    /// 补做**父装配件**派生（改造前 `PartService::cancel` 压根不调任何 sync，
+    /// 父装配件的派生状态靠下一次任意 part 流转才追平）。
+    ///
+    /// **修正 3 —— `PartDerivation::KeepPartTerminalAsIs`**（2026-10-01
+    /// review 第 1 轮 B1）：本函数在 `mark_part_cancelled` **之后**调用，此时
+    /// `t_part.status` 已由主操作写成 CANCELLED。而 min-progress 在「已完成批次
+    /// 而「其余被批量取消」时会算出 COMPLETED —— 若放任派生写，用户的「作废工单」
+    /// 会被静默改回 COMPLETED（接口 200、事件流水记 CANCELLED、界面显示已完成、
+    /// 序列号已清空可被复用），父装配件还会被级联推成 COMPLETED。故这里显式
+    /// 声明「part 已是终态，一个字都不许碰」，只继续派生父层。
+    ///
+    /// 终态守卫（`update_part_rollup` 的 `status NOT IN (...)`）是同一不变式的
+    /// SQL 层兜底，两处都要在：守卫拦住的是「派生写覆盖终态」，本策略额外保证
+    /// 「跳过 part 写的同时父装配件仍被派生追平」。
     ///
     /// 返回影响行数（0 表示 part 下无可取消的活跃批次 —— 不视为错误，由 caller 决定）。
     pub async fn cancel_all_active_batches_for_part(
@@ -938,10 +1007,17 @@ impl PartRepo {
     ) -> Result<u64, AppError> {
         let out = status_gate::apply_bulk_batch_status_change_for_part(
             conn,
-            part_id,
-            "CANCELLED",
-            &["COMPLETED", "CANCELLED"],
-            current_user_id,
+            status_gate::BulkStatusChange {
+                part_id,
+                new_status: "CANCELLED",
+                excluded_statuses: &["COMPLETED", "CANCELLED"],
+                // 终态批次不可能还在返修（review 第 1 轮 m10）
+                is_repairing: Some(false),
+                updated_by: current_user_id,
+                derivation: status_gate::PartDerivation::KeepPartTerminalAsIs,
+                // part 已是终态，派生层不会再写它 → 不需要归档事件 id
+                event_id: None,
+            },
         )
         .await?;
         Ok(out.affected_rows)
@@ -960,18 +1036,33 @@ impl PartRepo {
     ///
     /// 返回影响行数（0 表示 part 下无非 CANCELLED 活跃批次 —— 仍合法，由 caller
     /// 决定；如新建工单未拆批就是 0 行）。
+    ///
+    /// `event_id`（2026-10-01 review 第 1 轮 M4）：与 cancel 不同，本路径
+    /// **必须**让 part 派生进 COMPLETED（escape hatch 的全部意义所在），故
+    /// 终态序列号归档事件需要 caller 提供的雪花 id。
+    ///
+    /// `derivation = Rollup`（而非 cancel 那条路径的 `KeepPartTerminalAsIs`）：
+    /// service 层已守「part 不得是 COMPLETED / CANCELLED」，故此处 part 一定
+    /// 处于非终态，派生层可以正常写。
     pub async fn force_complete_all_batches_for_part(
         conn: &mut PgConnection,
         part_id: i64,
         current_user_id: i64,
+        event_id: Option<i64>,
     ) -> Result<u64, AppError> {
         // 终态保护只守 CANCELLED（COMPLETED 幂等重写无副作用，与改造前一致）。
         let out = status_gate::apply_bulk_batch_status_change_for_part(
             conn,
-            part_id,
-            "COMPLETED",
-            &["CANCELLED"],
-            current_user_id,
+            status_gate::BulkStatusChange {
+                part_id,
+                new_status: "COMPLETED",
+                excluded_statuses: &["CANCELLED"],
+                // 终态批次不可能还在返修（review 第 1 轮 m10）
+                is_repairing: Some(false),
+                updated_by: current_user_id,
+                derivation: status_gate::PartDerivation::Rollup,
+                event_id,
+            },
         )
         .await?;
         Ok(out.affected_rows)

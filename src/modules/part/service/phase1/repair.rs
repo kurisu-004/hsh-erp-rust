@@ -171,7 +171,6 @@ impl PartService {
         if n == 0 {
             return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
         }
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         // 2026-10-01：`from_status` 由 `'REPAIRING'` 改为**真实**源状态
         // `'IN_PROCESS'`。
         //
@@ -323,7 +322,6 @@ impl PartService {
         // 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删
         // `has_been_repaired` 列；返修事实由下方两条 t_part_event 事件日志
         // 追溯（REPAIR_STARTED + REPAIR_COMPLETED）。
-        let _ = Self::sync_from_batch_change(&mut repo, part_id, current).await?;
         // 两条事件
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
@@ -457,7 +455,7 @@ impl PartService {
         // `GET /parts/inspection-batches`）是**两条独立 SQL**，M3 只回退了后者；
         // 本条当时漏网，本次补齐。
         let rows: Vec<InspectionRepairRow> = sqlx::query_as::<_, InspectionRepairRow>(
-            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status,              b.location, b.version, b.current_process_step_id, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              LEFT JOIN t_process p2 ON p2.id = s2.process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND (CASE WHEN $9::bool THEN b.is_repairing = true ELSE b.status = ANY($1) END)              AND (NOT $9::bool OR b.status NOT IN ('COMPLETED', 'CANCELLED'))              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
+            "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status, b.is_repairing,              b.location, b.version, b.current_process_step_id, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              LEFT JOIN t_process p2 ON p2.id = s2.process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND (CASE WHEN $9::bool THEN b.is_repairing = true ELSE b.status = ANY($1) END)              AND (NOT $9::bool OR b.status NOT IN ('COMPLETED', 'CANCELLED'))              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",
         )
         .bind(statuses)
         .bind(keyword)
@@ -478,6 +476,9 @@ impl PartService {
                 batch_no: r.batch_no,
                 quantity: r.quantity,
                 status: r.status,
+                // 2026-10-01 review 第 1 轮 M5：REPAIRING 已降级为标记列，
+                // `status` 恒为 IN_PROCESS，「返修中」只能由本字段表达
+                is_repairing: r.is_repairing,
                 location: r.location,
                 version: r.version,
                 current_process_step_id: r.current_process_step_id,

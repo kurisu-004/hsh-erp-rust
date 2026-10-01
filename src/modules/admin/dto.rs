@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::shared::types::{deserialize_i64_vec_opt, serialize_i64};
+use crate::shared::types::{
+    deserialize_i64_opt, deserialize_i64_vec_opt, serialize_i64, serialize_i64_opt,
+};
 
 /// `POST /api/v2/admin/recompute-rollup` 请求体（**可省略**）。
 ///
@@ -28,10 +30,20 @@ pub struct RecomputeRollupRequest {
     ///
     /// 为什么要上限：全量对账是**全表扫描 + 每行派生写**，不限量的话一个请求就能
     /// 把整张 `t_part` / `t_assembly` 锁在长事务里，与线上业务抢行锁。给了上限
-    /// 再配合「按 `id` 升序取窗口」，运维可以重复调用若干轮把全表扫完
+    /// 之后，运维用 `after_id` 游标重复调用若干轮即可把全表扫完
     /// （每轮都是幂等的），而单次请求的影响面有界。
     #[serde(default)]
     pub limit: Option<i64>,
+    /// 续扫游标（字符串 id）：**只**处理 `id > after_id` 的行。
+    ///
+    /// 缺省 = 从最小 id 开始（首轮）。后续轮次把上一轮响应里的
+    /// `next_after_id` 原样回传即可。
+    ///
+    /// 2026-10-01 review 第 1 轮 M7 新增：原实现只有 `ORDER BY id LIMIT n+1`、
+    /// 没有游标也没有 offset —— `truncated = true` 时运维再调一次仍然从最小的
+    /// `limit` 行开始扫，**永远收敛不了**，一个兜底端点在生产数据量下兜不住底。
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub after_id: Option<i64>,
 }
 
 /// 一次状态变化（`before → after`）的明细。
@@ -63,9 +75,14 @@ pub struct RecomputeRollupReport {
     pub parts_next_process_id_fixed: u64,
     pub assemblies_examined: u64,
     pub assemblies_changed: u64,
-    /// 命中 `limit` 上限、**还有行没扫到**。`true` 时运维应继续调本端点
-    /// （窗口按 `id` 升序，重调会从头再扫，故需靠 `scope` 显式传 id 才能续扫）。
+    /// 命中 `limit` 上限、**还有行没扫到**。`true` 时运维应把
+    /// [`Self::next_after_id`] 原样回传为请求体的 `after_id` 再调一次
+    /// （窗口按 `id` 升序推进，直到 `truncated = false` 即扫完整表）。
     pub truncated: bool,
+    /// 续扫游标：本轮**已处理**的最大 id。仅在 `truncated = true` 时有意义
+    /// （`false` 时已是末轮，置 `null`）。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub next_after_id: Option<i64>,
     /// 逐条 before → after。
     pub changes: Vec<StatusChangeEntry>,
 }

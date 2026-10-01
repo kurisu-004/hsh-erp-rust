@@ -5,8 +5,8 @@
 //! ## 这个域解决什么问题
 //!
 //! `t_part_batch.status` → `t_part.status` → `t_assembly.status` 是三层单向派生，
-//! 写入口已收口到 `part::repo::status_gate`（单测
-//! `part::repo::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
+//! 写入口已收口到 `part::service::status_gate`（单测
+//! `part::service::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
 //! 守住「只有它能写批次状态」）。但派生**缓存**仍可能与真源不一致：
 //!
 //! 1. **历史漂移**：status_gate 收口之前有 3 个写点漏调 sync，线上/备份库里已经存在
@@ -37,7 +37,7 @@ use sqlx::PgConnection;
 
 use crate::modules::assembly::service::sync_from_part::recompute_assembly_status_by_id;
 use crate::modules::part::repo::sql::PartRepo;
-use crate::modules::part::repo::status_gate;
+use crate::modules::part::service::status_gate;
 use crate::shared::error::AppError;
 
 use super::dto::StatusChangeEntry;
@@ -85,37 +85,56 @@ pub fn validate_scope_ids(kind: &str, ids: &[i64]) -> Result<(), AppError> {
 
 /// 取待对账的 `t_part.id`（`limit + 1` 条，多取一条用来判断是否 `truncated`）。
 ///
-/// 按 `id` 升序：让「限量」语义是**确定性的前缀窗口**，而不是随机抽样，
-/// 重复调用的可预期性才够运维用。
+/// 按 `id` 升序：让「限量」语义是**确定性的窗口**，而不是随机抽样，运维续扫
+/// 的可预期性才够用。
+///
+/// `after_id` = **游标**（2026-10-01 review 第 1 轮 M7 新增）：只取 `id > after_id`
+/// 的行。原实现没有游标 / offset，`truncated = true` 时运维再调一次还是从最小的
+/// `limit` 行开始扫 —— 一个「兜底对账」端点在生产数据量下永远兜不住底。
+/// 游标由调用方从上一轮响应的 `next_after_id` 原样回传。
 pub async fn list_part_ids(
     conn: &mut PgConnection,
     limit: i64,
+    after_id: Option<i64>,
 ) -> Result<(Vec<i64>, bool), AppError> {
-    let rows: Vec<(i64,)> =
-        sqlx::query_as("SELECT id FROM t_part WHERE deleted_at IS NULL ORDER BY id LIMIT $1")
-            .bind(limit + 1)
-            .fetch_all(&mut *conn)
-            .await?;
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT id FROM t_part WHERE deleted_at IS NULL AND id > $1 ORDER BY id LIMIT $2",
+    )
+    .bind(after_id.unwrap_or(0))
+    .bind(limit + 1)
+    .fetch_all(&mut *conn)
+    .await?;
     Ok(split_truncated(
         rows.into_iter().map(|(i,)| i).collect(),
         limit,
     ))
 }
 
-/// 取待对账的 `t_assembly.id`（同 [`list_part_ids`] 的语义）。
+/// 取待对账的 `t_assembly.id`（同 [`list_part_ids`] 的语义，含同一个游标）。
 pub async fn list_assembly_ids(
     conn: &mut PgConnection,
     limit: i64,
+    after_id: Option<i64>,
 ) -> Result<(Vec<i64>, bool), AppError> {
-    let rows: Vec<(i64,)> =
-        sqlx::query_as("SELECT id FROM t_assembly WHERE deleted_at IS NULL ORDER BY id LIMIT $1")
-            .bind(limit + 1)
-            .fetch_all(&mut *conn)
-            .await?;
+    let rows: Vec<(i64,)> = sqlx::query_as(
+        "SELECT id FROM t_assembly WHERE deleted_at IS NULL AND id > $1 ORDER BY id LIMIT $2",
+    )
+    .bind(after_id.unwrap_or(0))
+    .bind(limit + 1)
+    .fetch_all(&mut *conn)
+    .await?;
     Ok(split_truncated(
         rows.into_iter().map(|(i,)| i).collect(),
         limit,
     ))
+}
+
+/// 本轮窗口的续扫游标（`truncated = true` 时 = 最后一个已处理的 id）。
+///
+/// 没有它，运维就只能靠「显式传 id 列表」续扫 —— 那要求先把全表 id 查出来
+/// 再分批贴回来，一个「兜底」端点不该长这样。
+pub fn next_cursor(processed_ids: &[i64]) -> Option<i64> {
+    processed_ids.iter().copied().max()
 }
 
 fn split_truncated(mut ids: Vec<i64>, limit: i64) -> (Vec<i64>, bool) {
@@ -134,14 +153,23 @@ fn split_truncated(mut ids: Vec<i64>, limit: i64) -> (Vec<i64>, bool) {
 /// 批次状态没变、但批次被挂到了新工序（`current_process_id` 变了）时，
 /// `t_part.next_process_id` 会漂，而 status 不动。两者都会导致业务错误
 /// （后者会让派工指到上一道工序），所以都要报。
+///
+/// `event_id`（2026-10-01 review 第 1 轮 M4）：本端点**有可能**把一个 part 从
+/// 非终态推成终态（例如脏数据里批次全 COMPLETED 而 part 还停在 INSPECTION），
+/// 那一步会释放并归档序列号，故 handler 必须传一个真实雪花 id。
+///
+/// ⚠️ 已终态（COMPLETED / CANCELLED）的 part **不参与**对账：`update_part_rollup`
+/// 带终态守卫（B1），派生层不会覆盖主操作写下的终态。详见
+/// `docs/api/admin.md`。
 pub async fn recompute_part(
     conn: &mut PgConnection,
     part_id: i64,
     updated_by: i64,
+    event_id: Option<i64>,
 ) -> Result<PartRecompute, AppError> {
     let before = PartRepo::get_part_rollup_state(&mut *conn, part_id).await?;
     // 返回值里的 `sync` 是给 status_gate 内部级联装配件用的，对账报告不消费
-    status_gate::rollup_part_derived(conn, part_id, updated_by).await?;
+    status_gate::rollup_part_derived(conn, part_id, updated_by, event_id).await?;
     let after = PartRepo::get_part_rollup_state(&mut *conn, part_id).await?;
     let Some((before, after)) = before.zip(after) else {
         return Ok(PartRecompute::unchanged());
