@@ -331,7 +331,7 @@ Caused by: migration 20260930000000 was previously applied but is missing in the
 - **存量 worktree 未迁移**（2026-09-30 决策）。`fix-batch-current-process-id` 等仍指向共享的 5430/6379/3000。它们跑 app 仍会污染主 checkout 的 `_sqlx_migrations`，`wt_services.sh doctor` 的第 3 节只作信息项列出、不报错。
 - **孤儿 compose project**：`worker-pool-counts-endpoint` 的 worktree 目录已删，但它的 `postgres-test` 容器仍活着并占着 **5429** → `docker compose up -d postgres-test` 与测试「快速路」当前不可用。清理：`docker compose -p worker-pool-counts-endpoint down -v`。
 - `docker-compose.yml` 写 `redis:7-alpine` 而在跑的 `redis-dev`/`redis-test` 实为 `redis:8-alpine`（仓库里无 `8-alpine` 字样）。因此 `wt_services.sh up` **刻意逐服务 up**、不用全量 `up -d`：全量会把 redis 重建回 7-alpine。这个分歧建议单独对齐一次。
-- `setup-worktree.sh` 把 `target` 软链到主 checkout，故两个 worktree **无法真正并发** `cargo run`（共享 target 锁）。`LISTEN_ADDR` 隔离的价值在于避开残留进程 / 前后脚启动的撞端口，不是为了支持同时跑两个后端。
+- `target` **不再软链到主 checkout**（2026-10-02 改）。原先所有 worktree 的 `cargo` 产物落在同一个 `target/`，而测试二进制名**不含路径区分**（如 `part-de11122605098f0b`）：并发 agent 重新构建会把它的二进制写进同一目录，于是 `cargo nextest` 可能跑到**别人源码**编译出的产物，报出一批与本 diff 无关的假失败（实测见过 172 个 `50001 数据库错误`）。这是正确性问题不是性能问题，故没采用「约定 export `CARGO_TARGET_DIR`」——约定已经漏过一次。`setup-worktree.sh` 的 `OWN_BUILD_DIRS` 现在让每个 worktree 自建真实 `target/`，代价是每 worktree 占 ~6.5GB，**用完必须走 `teardown-worktree.sh`**（它会先删 `target/`，否则 `git worktree remove` 会因「含未跟踪文件」拒绝）。副作用：两个 worktree 现在**可以真正并发** `cargo build` / `cargo test`（不再有共享 target 锁）。`LISTEN_ADDR` 隔离的价值仍只是避开残留进程 / 前后脚启动的撞端口，不为并发跑两个后端服务。
 
 ## 环境要点
 
