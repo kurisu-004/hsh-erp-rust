@@ -10,9 +10,19 @@
 //!   真实 socket E2E（followup-cleanup A4）：
 //!     5. ws_e2e_invalid_token_rejected        — 40101（JWT 验签失败）/ 40100（缺 token）
 //!     6. ws_e2e_valid_token_receives_snapshot — 握手后 ≤ 5s 收首条 snapshot text
-//!     7. ws_e2e_valid_token_receives_heartbeat_text — ≤ 心跳间隔 + 5s 收 WsHeartbeatMsg text
-//!                                                  （非 protocol-level Ping 帧；
-//!                                                  浏览器 JS `onmessage` 可直接收到）
+//!     7. ws_e2e_valid_token_receives_heartbeat_text — ≤ 心跳间隔 + 5s 同时收齐
+//!                                                  ① `WsHeartbeatMsg` text 帧（前端 JS
+//!                                                  `onmessage` 感知）② 服务端 protocol-level
+//!                                                  Ping（2026-10-01 B4：服务端判活用，JS 不可见）
+//!                                                  ③ 客户端 Ping 的 Pong 回声
+//!
+//!   WS 健壮性加固 E2E（2026-10-01 B1-B4）：
+//!    12. ws_e2e_lagged_client_gets_4003_close  — 慢消费方 Lagged → 4003 lagged Close 帧
+//!    13. ws_e2e_pong_timeout_closes_dead_peer  — 不回任何帧 → 1011 pong timeout Close 帧
+//!    14. ws_e2e_conn_registry_counts           — 连接表 register/unregister 计数
+//!    15. ws_e2e_server_shutdown_sends_1012     — shutdown.cancel() → 1012 server restart
+//!    16. ws_e2e_reauth_failure_sends_4001_close — 2026-10-02 新增（Minor 7）：
+//!         吊销 session → 周期性 re-auth 失败 → 4001 auth expired Close 帧
 //!
 //!   HTTP `GET /api/v2/dashboard/snapshot` 集成测试（2026-09-28 新增 + 2026-09-30 扩 query）：
 //!     8. http_snapshot_unauthenticated_returns_401   — 无 Bearer token 应返 401（中间件）
@@ -31,7 +41,7 @@
 //! 按 shelf.code 查找）。
 
 use chrono::NaiveDate;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use hsh_erp_rust::auth::jwt::encode_access;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
@@ -44,8 +54,12 @@ use hsh_erp_test_support::{
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
+// 2026-10-02（review 第 2 轮 Major-A）：`ws_e2e_pong_timeout_closes_dead_peer` 绕开
+// tungstenite、直接读裸 socket 断言 Close 帧线路字节，需要 `read_to_end`。
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 async fn setup() -> PgPool {
     let pool = test_pool().await;
@@ -355,6 +369,41 @@ async fn ws_hub_broadcast_snapshot_subscription_receives_snapshot() {
 async fn spawn_ws_server() -> (String, Arc<hsh_erp_rust::state::AppState>) {
     let pool = setup().await;
     let state = test_state(pool.clone()).await;
+    (serve_ws(state.clone()).await, state)
+}
+
+/// 2026-10-01 新增：起一个**自定义广播容量** hub 的 WS 服务端
+/// （`ws_e2e_lagged_client_gets_4003_close` 用——`WsHub::new()` 硬编码容量 1024，
+/// 灌 1025 条才复现慢消费方太丑，故测试侧用 `WsHub::with_capacity(1)` 造小环）。
+///
+/// 实现取舍：`AppState::new` 的 10 个入参与 `AppState` 的**全部字段都是 `pub`**，
+/// 所以这里直接拿 `test_state` 的产物「换掉 `ws_hub` 重装一份」——**不必改 test-support**
+/// （改动面最小的方案：只在测试文件内多一个局部 helper）。
+async fn spawn_ws_server_with_hub_cap(
+    broadcast_cap: usize,
+) -> (String, Arc<hsh_erp_rust::state::AppState>) {
+    use hsh_erp_rust::infra::ws_hub::WsHub;
+    use hsh_erp_rust::state::AppState;
+
+    let pool = setup().await;
+    let base = test_state(pool).await;
+    let state = Arc::new(AppState::new(
+        base.pool.clone(),
+        base.config.clone(),
+        base.snowflake.clone(),
+        Arc::new(WsHub::with_capacity(broadcast_cap)),
+        base.cos.clone(),
+        base.py_backend.clone(),
+        base.shutdown.clone(),
+        base.session.clone(),
+        base.idempotency_store.clone(),
+        base.wecom.clone(),
+    ));
+    (serve_ws(state.clone()).await, state)
+}
+
+/// 2026-10-01 抽出：把 `test_ws_app` 挂到随机端口真跑起来（两个 spawn helper 共用）。
+async fn serve_ws(state: Arc<hsh_erp_rust::state::AppState>) -> String {
     let app = test_ws_app(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -367,11 +416,89 @@ async fn spawn_ws_server() -> (String, Arc<hsh_erp_rust::state::AppState>) {
             .with_graceful_shutdown(async move { shutdown.cancelled().await })
             .await;
     });
-    (format!("ws://127.0.0.1:{}", addr.port()), state)
+    format!("ws://127.0.0.1:{}", addr.port())
+}
+
+/// 2026-10-01 新增：轮询直到服务端发来带指定 code 的 Close 帧（跳过其间的 text/Ping 等帧）。
+///
+/// B2 之后 Close 帧是**主动**发的，带业务 code；测试要的就是这个 code。
+///
+/// 返回 `Ok(reason)` = 读到了目标 code 的 Close 帧，附 reason 文案（调用方再断言文案）；
+/// 返回 `Err(诊断)` = 没拿到，诊断串说明**是哪一类**没拿到。
+///
+/// ## 2026-10-02（review 第 2 轮 Major-A）：为什么读帧出错不再 `panic!`
+/// 旧实现是 `Ok(Some(Err(e))) => panic!("ws frame err: {e}")`。在「**服务端判对端已死**」
+/// 这一类用例里，读帧出错是**预期内**的：服务端发完 Close 帧就 drop socket，而客户端
+/// tungstenite 读到队列里的 Ping 会**自动回 Pong**（`tungstenite` `protocol/mod.rs` 的
+/// `read()` 在读下一帧前先 flush `additional_send`）⇒ 往已关闭的 socket 写 → `EPIPE`；
+/// `tokio-tungstenite` `lib.rs::poll_next` 随即把 `ended = true`，**之后所有 poll 返 `None`**，
+/// Close 帧再也读不到。旧 `panic!` 抛出的 `ws frame err: Broken pipe` 看起来像
+/// 「服务端把 socket 写坏了」的产品 bug，实际是测试自己的客户端在写自动 Pong，
+/// **会误导将来 on-call**。
+///
+/// 故改为：把「超时未读到」与「流提前结束/报错」分别写进 `Err`，由调用方断言。
+/// 真正的产品故障（服务端该发的 Close 帧没发）依然会红，只是报错信息不再撒谎。
+async fn wait_for_close(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    want_code: u16,
+    wait: Duration,
+) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + wait;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Close(Some(frame))))) => {
+                // tungstenite 会把 u16 归类成 `CloseCode::{Normal,Error,Restart,…}`（IANA 段）
+                // 或 `CloseCode::Library(code)`（4000-4999 应用私有段），故两侧都走
+                // `From` 转换后比较，不能直接拿 `CloseCode::Library(..)` 硬套。
+                if frame.code == CloseCode::from(want_code) {
+                    return Ok(frame.reason.to_string());
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            // 2026-10-02：不再 panic，见上方 doc。`Some(Err)` 与 `None` 合并成「流结束」。
+            Ok(Some(Err(e))) => {
+                return Err(format!(
+                    "读帧报错后流终止（{e}）——**对端已死时读到 I/O 错误属预期**：\
+                     tungstenite 读到 Ping 会自动回 Pong，往服务端已 drop 的 socket 写会 EPIPE，\
+                     且 poll_next 置 ended=true 后 Close 帧无法再读到。\
+                     也就是说本用例的 {want_code} Close 帧**没被客户端读到**（服务端是否真的发了，\
+                     要看服务端日志或改用裸 socket 断言）"
+                ));
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "流在读到 {want_code} Close 帧之前就结束（无更多帧）——\
+                     同上，服务端已关闭连接，本用例没读到 {want_code} Close 帧"
+                ));
+            }
+            Err(_) => continue, // 500ms 内无帧 → 继续轮询直到 deadline
+        }
+    }
+    Err(format!(
+        "在 {wait:?} 内没读到 {want_code} Close 帧（其间只收到别的帧）"
+    ))
 }
 
 /// 签发合法 access token + 写入 Redis session，使 dashboard WS 握手通过。
+/// 只返回 token（多数用例只需要它）。
 async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i64) -> String {
+    mint_test_token_with_jti(state, user_id).await.0
+}
+
+/// 2026-10-02 新增：同上，但**一并返回 jti**（= Redis session key 后缀）。
+///
+/// 为什么需要 jti：本文件所有用例的 snowflake generator 都写死 `instance = 1`
+/// （`SnowflakeIdGenerator::new(1_577_836_800_000, 1)`），所以**并行执行的用例之间
+/// user_id 会撞**。`ws_e2e_reauth_failure_sends_4001_close` 若用
+/// `delete_all_user_sessions(user_id)` 吊销 session，会把并发用例（撞到同一 user_id）
+/// 的 session 一起删掉 → 那些用例的 re-auth 无端失败，表现为莫名其妙的 flake。
+/// 精确到 jti 的 `delete_session(&jti)` 没有这个副作用。
+async fn mint_test_token_with_jti(
+    state: &Arc<hsh_erp_rust::state::AppState>,
+    user_id: i64,
+) -> (String, String) {
     use hsh_erp_rust::auth::session::{CachedUserProfile, TokenKind};
     // 2026-09-23 重构：encode_access 第 2-7 参数改为 `(private_key, signing_kid, issuer, audience, subject, ttl_seconds)` —— RS256 + kid 多密钥轮换；
     // 返回三元组 `(token, jti, exp)`，jti 即为 Redis session key 后缀来源（`session:tok:<jti>`），无需再调用 `hash_token`。
@@ -403,7 +530,7 @@ async fn mint_test_token(state: &Arc<hsh_erp_rust::state::AppState>, user_id: i6
         )
         .await
         .expect("create_session");
-    token
+    (token, jti)
 }
 
 #[tokio::test]
@@ -493,14 +620,31 @@ async fn ws_e2e_valid_token_receives_heartbeat_text() {
         .expect("ws stream closed")
         .expect("ws frame err");
 
+    // 2026-10-01 B4 改：原用例在收到 protocol-level Ping 时 panic，理由是
+    // 「心跳应走 text、不用 Ping（followup A6）」。该判断**已被 B4 推翻**——Ping 现在
+    // 承担**服务端存活检测**职责（浏览器协议栈自动回 Pong，服务端据此续 `last_seen`），
+    // 与 text 心跳**并存、职责分离、互不替代**：
+    // - text 心跳帧 → 浏览器 JS `onmessage` 收得到，给**前端**感知用（原判断依然成立，保留断言）；
+    // - `Message::Ping` → JS 完全不可见，给**服务端**判活对端用（新增）。
+    // 故本用例改为同时断言三者：text 心跳仍在、服务端 Ping 在、客户端 Ping 收到 Pong 回声。
+    let probe = b"probe-pong".to_vec();
+    ws.send(WsMessage::Ping(probe.clone().into()))
+        .await
+        .expect("send client ping");
+
     // 等心跳：测试 config 把 ws_heartbeat_interval_seconds 设为 1；
-    // 给 1s + 5s slack 总 6s 上限避免 CI 抖动。期望收到 `WsHeartbeatMsg` text 帧
-    // （**不是** protocol-level Ping 帧）。
+    // 给 1s + 5s slack 总 6s 上限避免 CI 抖动。
     let heartbeat_interval = state.config.ws_heartbeat_interval_seconds;
     let wait = Duration::from_secs(heartbeat_interval + 5);
     let mut got_heartbeat = false;
+    let mut got_server_ping = false;
+    let mut got_pong_echo = false;
     let deadline = tokio::time::Instant::now() + wait;
-    while tokio::time::Instant::now() < deadline {
+    // 三项全齐才退出（text 心跳 / 服务端 Ping / 客户端 Ping 的 Pong 回声）——text 心跳与
+    // Ping 都从 1s 起发，若只等前两项会在同一轮 poll 里提前退出、漏读同一批的 Ping 帧。
+    while tokio::time::Instant::now() < deadline
+        && !(got_heartbeat && got_pong_echo && got_server_ping)
+    {
         match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
             Ok(Some(Ok(WsMessage::Text(text)))) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
@@ -508,13 +652,18 @@ async fn ws_e2e_valid_token_receives_heartbeat_text() {
                     && v["ts"].is_number()
                 {
                     got_heartbeat = true;
-                    break;
                 }
             }
+            // 服务端 protocol-level Ping：2026-10-01 B4 起合法（存活检测）。
+            // 客户端 tungstenite 会在协议栈自动回 Pong（JS 侧不可见的同款机制）。
             Ok(Some(Ok(WsMessage::Ping(_)))) => {
-                panic!("不应再收到 protocol-level Ping 帧；心跳应走 text（followup A6）");
+                got_server_ping = true;
             }
-            Ok(Some(Ok(WsMessage::Pong(_)))) => continue,
+            Ok(Some(Ok(WsMessage::Pong(p)))) => {
+                if p.as_ref() == probe.as_slice() {
+                    got_pong_echo = true;
+                }
+            }
             Ok(Some(Ok(WsMessage::Close(_)))) => break,
             Ok(Some(Ok(_))) => continue, // binary / 其它
             Ok(Some(Err(e))) => panic!("ws frame err: {e}"),
@@ -526,6 +675,268 @@ async fn ws_e2e_valid_token_receives_heartbeat_text() {
     assert!(
         got_heartbeat,
         "未在 {wait:?} 内收到 heartbeat text 帧（interval={heartbeat_interval}s）"
+    );
+    assert!(
+        got_pong_echo,
+        "客户端 Ping 未收到服务端 Pong 回声（handler.rs 的 Ping→Pong 分支）"
+    );
+    assert!(
+        got_server_ping,
+        "未在 {wait:?} 内收到服务端 protocol-level Ping（B4 存活检测 ping_interval={}s）",
+        state.config.ws_ping_interval_seconds
+    );
+}
+
+// ===========================================================================
+// 2026-10-01 WS 健壮性加固 E2E（B1 Lagged / B2 Close 帧 / B3 连接表 / B4 存活检测）
+// ===========================================================================
+
+/// B1 + B2：慢消费方导致 `broadcast::RecvError::Lagged(n)` → 服务端发 `4003 lagged`
+/// Close 帧并断开（前端据此重连 + 全量 HTTP 重取）。
+#[tokio::test]
+async fn ws_e2e_lagged_client_gets_4003_close() {
+    // 容量 1 的广播环：连发 3 条必然溢出（tokio ring buffer 覆盖最旧值 → 下次 recv 返 Lagged）。
+    let (base, state) = spawn_ws_server_with_hub_cap(1).await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let user_id = snowflake.next_id();
+    let token = mint_test_token(&state, user_id).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed for valid token");
+
+    // 消耗首条 snapshot（顺带确保服务端已进主循环、已 subscribe）
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("snapshot 超时")
+        .expect("ws stream closed")
+        .expect("ws frame err");
+
+    // 2026-10-01：`broadcast::Sender::send` 是**同步**的，这里是 `#[tokio::test]`
+    // （current_thread runtime）的紧循环 —— 循环内不让出执行权，服务端 handler 根本没
+    // 机会 poll `rx.recv()`，因此 3 条必溢出（Lagged）。`broadcast_tx` 本就是 `pub` 字段，
+    // 无需新增只读 accessor。
+    let tx = state.ws_hub.broadcast_tx.clone();
+    for i in 0..3i64 {
+        tx.send(WsEvent::DashboardEvent {
+            kind: "PART_TO_SHIP".into(),
+            payload: serde_json::json!({ "part_id": i.to_string() }),
+        })
+        .expect("broadcast send");
+    }
+
+    let reason = wait_for_close(&mut ws, 4003, Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| panic!("慢消费方应收到 4003/lagged Close 帧，但：{e}"));
+    assert_eq!(reason, "lagged", "4003 Close 帧的 reason 应为 lagged");
+}
+
+/// B2 + B4：连上后**一个帧都不发**（连服务端 protocol-level Ping 的 Pong 都不回），
+/// 超过 `ws_pong_timeout_seconds`（测试配置 3s）没等到任何入站帧 → 判定对端已死，
+/// 发 `1011 pong timeout` Close 帧。
+///
+/// ## 2026-10-02（review 第 2 轮 Major-A）：这里读**裸 socket**，不用 tungstenite 读帧
+/// 本用例约 1/8 概率红，报 `ws frame err: Broken pipe`——看起来像产品 bug，实际是测试自己
+/// 的客户端在写自动 Pong。链路（reviewer 已核 tungstenite 源码）：
+///
+/// 1. 不变式强制 `pong_timeout >= 2 × ping_interval`，所以任何「沉默客户端」在被判死之前
+///    **必定至少收到 1 个服务端 Ping**；
+/// 2. tungstenite 收到 Ping 会 `set_additional(Frame::pong(..))`，而 `read()` 在**读下一帧
+///    之前**先 flush `additional_send`（`protocol/mod.rs:449-470`）⇒ 客户端必然向 socket
+///    写一次 Pong；
+/// 3. 但服务端在 t≈`pong_timeout` 已发完 Close 帧并 drop 了 socket ⇒ 该 Pong 写进黑洞，
+///    对端回 RST ⇒ `EPIPE`；
+/// 4. `tokio-tungstenite` `lib.rs::poll_next` 把错误映射成 `Poll::Ready(Some(Err(e)))` 并
+///    **置 `ended = true`**，之后所有 poll 返 `None` ⇒ **Close 帧再也读不到**。
+///
+/// 即：这不是运气问题，而是结构性必然（步骤 1 保证 Ping 必到，步骤 4 保证读到就废）。
+/// 本用例真正要验的只是「服务端确实发了带 1011 + `pong timeout` 的 Close 帧」，而
+/// sleep 盲等期间该帧已静静躺在**内核接收缓冲**里 —— 故 `into_inner()` 取裸 socket 直接读，
+/// 彻底绕开 tungstenite 的自动 Pong / `ended` 逻辑，且顺带**同时断言 code 与 reason**
+/// （比原来只断言 reason 更强）。
+#[tokio::test]
+async fn ws_e2e_pong_timeout_closes_dead_peer() {
+    let (base, state) = spawn_ws_server().await;
+    let pong_timeout = state.config.ws_pong_timeout_seconds;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let user_id = snowflake.next_id();
+    let token = mint_test_token(&state, user_id).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    // 不加 `mut`：本用例**一次都不 poll**（`mut` 会因未使用告警）。
+    let (ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed for valid token");
+
+    // 关键：接下来**绝不 poll `ws.next()`**。tokio-tungstenite 是拉驱动（没有后台读任务），
+    // 不 poll 就不会读 socket、也就不会自动回 Pong —— 等价于浏览器/客户端掉线（半开连接）。
+    // 只 sleep 让服务端推进自己的定时器（timeout 分支走绝对 deadline，与 text 心跳共存）。
+    tokio::time::sleep(Duration::from_secs(pong_timeout + 2)).await;
+
+    // `into_inner()` 是同步的（tokio-tungstenite 0.29：`pub fn into_inner(self) -> S`），
+    // 只取回底层 stream，**不动内核接收缓冲** —— 未 poll 过的数据完好无损。
+    // 返回的 `MaybeTlsStream` 直接实现 `AsyncRead`（本用例是 `ws://` ⇒ `Plain`），
+    // 故 `read_to_end` 拿到的就是原始线路字节（含 WS 帧头）。
+    let mut sock = ws.into_inner();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf))
+        .await
+        .expect("读裸 socket 超时：服务端应已发完 Close 帧并关闭连接")
+        .expect("读裸 socket 失败");
+
+    // Close 帧线路字节：`0x88` = FIN|Close(opcode 8)、`0x0e` = payload 14 字节
+    // （= 2 字节 code + reason 12 字节；注意 reason "pong timeout" 是 **12** 个字符：
+    // pong(4) + 空格(1) + timeout(7)）、`0x03f3` = 1011（大端 u16）。
+    let want: &[u8] = b"\x88\x0e\x03\xf3pong timeout";
+    assert!(
+        buf.windows(want.len()).any(|w| w == want),
+        "裸字节里未找到 1011 / reason=pong timeout 的 Close 帧；共读到 {} 字节。         （{pong_timeout}s 无入站帧应触发该 Close 帧）末尾 48 字节十六进制：{:02X?}",
+        buf.len(),
+        &buf[buf.len().saturating_sub(48)..]
+    );
+}
+
+/// B3：连接表登记 / 注销计数正确。
+/// 前半段直接打 `WsHub` accessor（含「同一用户 2 条连接」这个 `user_sinks` 时代的老坑）；
+/// 后半段走真实 socket 验 `handle_socket` 真的在两端维护了连接表。
+#[tokio::test]
+async fn ws_e2e_conn_registry_counts() {
+    use hsh_erp_rust::infra::ws_hub::WsHub;
+
+    // --- 前半段：accessor 语义（无需 DB / socket） ---
+    let hub = WsHub::new();
+    assert_eq!(hub.conn_count(), 0, "初始无连接");
+    let c1 = hub.register_conn(1, "alice");
+    let c2 = hub.register_conn(1, "bob");
+    let _c3 = hub.register_conn(2, "carol");
+    assert_eq!(hub.conn_count(), 3, "3 条连接");
+    assert_eq!(
+        hub.user_conn_count(1),
+        2,
+        "同一用户 2 条连接不能互相覆盖（user_sinks 单槽的老坑）"
+    );
+    assert_eq!(hub.user_conn_count(2), 1);
+    assert_ne!(c1, c2, "conn_id 必须互异");
+    assert!(hub.unregister_conn(c1).is_some());
+    assert_eq!(hub.conn_count(), 2);
+    assert!(hub.unregister_conn(c1).is_none(), "重复注销返回 None");
+    assert_eq!(hub.user_conn_count(1), 1);
+
+    // --- 后半段：真实连接进 / 出表 ---
+    let (base, state) = spawn_ws_server().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let user_id = snowflake.next_id();
+    let token = mint_test_token(&state, user_id).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed for valid token");
+    // 收首条 snapshot：此时 handle_socket 必然已 register_conn（register 在推快照之前）
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("snapshot 超时")
+        .expect("ws stream closed")
+        .expect("ws frame err");
+    assert_eq!(state.ws_hub.conn_count(), 1, "连接建立后应在连接表内");
+    assert_eq!(state.ws_hub.user_conn_count(user_id), 1);
+
+    // 客户端主动关 → 服务端读到 Close 后 break → unregister_conn
+    let _ = ws.close(None).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && state.ws_hub.conn_count() != 0 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(state.ws_hub.conn_count(), 0, "连接关闭后应已出表");
+}
+
+/// B4 + Minor-7：周期性 re-auth 失败（session 被吊销）→ 服务端发 `4001 auth expired`
+/// Close 帧（前端契约：清本地 token 跳登录页，**不要**重连）。
+///
+/// 依赖「re-auth 周期可注入」（`AppConfig::ws_reauth_every_n_heartbeats`，review 第 1 轮
+/// Minor 7 改动）：test-support 默认 `2` + text 心跳 1s → 每 2s 验一次，~2s 内即可验到。
+/// 改之前是硬编码 `const 10`，触发一次要跑 >10s，这条**安全核心路径**在 CI 上永远覆盖不到。
+///
+/// 对应的另一半契约（基础设施故障 → `1011 re-auth unavailable`，而不是 4001）由
+/// `src/modules/dashboard/handler.rs` 的单测 `reauth_infra_failure_maps_to_1011_not_4001`
+/// 钉死（要端到端造「Redis 故障」需自定义 `SessionStore` 实现，代价远大于收益）。
+#[tokio::test]
+async fn ws_e2e_reauth_failure_sends_4001_close() {
+    let (base, state) = spawn_ws_server().await;
+    let reauth_every = state.config.ws_reauth_every_n_heartbeats;
+    let heartbeat = state.config.ws_heartbeat_interval_seconds;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let user_id = snowflake.next_id();
+    let (token, jti) = mint_test_token_with_jti(&state, user_id).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed for valid token");
+    // 收首条 snapshot，确保 handler 已进主循环（否则吊销可能赶在 subscribe 之前）
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("snapshot 超时")
+        .expect("ws stream closed")
+        .expect("ws frame err");
+
+    // 精确吊销**本条** session（等价于「用户登出 / 管理员踢」）→ 下一轮 re-auth 的
+    // `get_session` 返 None → `verify_session_token` 返 40105 SESSION_REVOKED。
+    //
+    // ⚠️ 必须按 jti 删，不能用 `delete_all_user_sessions(user_id)`：本文件所有用例的
+    // snowflake generator 都写死 instance=1，并行用例之间 user_id 会撞，用 user_id
+    // 删会把并发用例的 session 一起干掉 → 那些用例的 re-auth 无端失败（见 helper 注释）。
+    state
+        .session
+        .delete_session(&jti)
+        .await
+        .expect("delete_session（模拟登出）");
+
+    let wait = Duration::from_secs(heartbeat * u64::from(reauth_every) + 8);
+    let reason = wait_for_close(&mut ws, 4001, wait)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "session 被吊销后应在 ~{}s 内收到 4001/auth expired Close 帧（heartbeat={heartbeat}s \
+                 × reauth_every={reauth_every}），但：{e}",
+                heartbeat * u64::from(reauth_every)
+            )
+        });
+    assert_eq!(
+        reason, "auth expired",
+        "4001 Close 帧的 reason 应为 auth expired"
+    );
+}
+
+/// B2 + B4：`state.shutdown.cancel()`（生产 = Ctrl-C 优雅退出）→ 服务端发
+/// `1012 server restart` Close 帧，让前端立刻重连而不是干等 TCP 超时。
+#[tokio::test]
+async fn ws_e2e_server_shutdown_sends_1012() {
+    let (base, state) = spawn_ws_server().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let user_id = snowflake.next_id();
+    let token = mint_test_token(&state, user_id).await;
+    let url = format!("{base}/dashboard?token={token}");
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WS upgrade must succeed for valid token");
+    // 先收快照，确保 handler 已进 select 主循环（否则 cancel 可能赶在 subscribe 之前）
+    let _ = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("snapshot 超时")
+        .expect("ws stream closed")
+        .expect("ws frame err");
+
+    state.shutdown.cancel();
+
+    let reason = wait_for_close(&mut ws, 1012, Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| panic!("优雅退出应发 1012/server restart Close 帧，但：{e}"));
+    assert_eq!(
+        reason, "server restart",
+        "1012 Close 帧的 reason 应为 server restart"
     );
 }
 
