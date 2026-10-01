@@ -54,6 +54,9 @@ use hsh_erp_test_support::{
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
+// 2026-10-02（review 第 2 轮 Major-A）：`ws_e2e_pong_timeout_closes_dead_peer` 绕开
+// tungstenite、直接读裸 socket 断言 Close 帧线路字节，需要 `read_to_end`。
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -419,14 +422,29 @@ async fn serve_ws(state: Arc<hsh_erp_rust::state::AppState>) -> String {
 /// 2026-10-01 新增：轮询直到服务端发来带指定 code 的 Close 帧（跳过其间的 text/Ping 等帧）。
 ///
 /// B2 之后 Close 帧是**主动**发的，带业务 code；测试要的就是这个 code。
-/// 返回 `reason` 便于断言 message 文本。超时（`wait` 用尽）返回 `None` 由调用方断言失败。
+///
+/// 返回 `Ok(reason)` = 读到了目标 code 的 Close 帧，附 reason 文案（调用方再断言文案）；
+/// 返回 `Err(诊断)` = 没拿到，诊断串说明**是哪一类**没拿到。
+///
+/// ## 2026-10-02（review 第 2 轮 Major-A）：为什么读帧出错不再 `panic!`
+/// 旧实现是 `Ok(Some(Err(e))) => panic!("ws frame err: {e}")`。在「**服务端判对端已死**」
+/// 这一类用例里，读帧出错是**预期内**的：服务端发完 Close 帧就 drop socket，而客户端
+/// tungstenite 读到队列里的 Ping 会**自动回 Pong**（`tungstenite` `protocol/mod.rs` 的
+/// `read()` 在读下一帧前先 flush `additional_send`）⇒ 往已关闭的 socket 写 → `EPIPE`；
+/// `tokio-tungstenite` `lib.rs::poll_next` 随即把 `ended = true`，**之后所有 poll 返 `None`**，
+/// Close 帧再也读不到。旧 `panic!` 抛出的 `ws frame err: Broken pipe` 看起来像
+/// 「服务端把 socket 写坏了」的产品 bug，实际是测试自己的客户端在写自动 Pong，
+/// **会误导将来 on-call**。
+///
+/// 故改为：把「超时未读到」与「流提前结束/报错」分别写进 `Err`，由调用方断言。
+/// 真正的产品故障（服务端该发的 Close 帧没发）依然会红，只是报错信息不再撒谎。
 async fn wait_for_close(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     want_code: u16,
     wait: Duration,
-) -> Option<String> {
+) -> Result<String, String> {
     let deadline = tokio::time::Instant::now() + wait;
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
@@ -435,16 +453,32 @@ async fn wait_for_close(
                 // 或 `CloseCode::Library(code)`（4000-4999 应用私有段），故两侧都走
                 // `From` 转换后比较，不能直接拿 `CloseCode::Library(..)` 硬套。
                 if frame.code == CloseCode::from(want_code) {
-                    return Some(frame.reason.to_string());
+                    return Ok(frame.reason.to_string());
                 }
             }
             Ok(Some(Ok(_))) => continue,
-            Ok(Some(Err(e))) => panic!("ws frame err: {e}"),
-            Ok(None) => return None,
+            // 2026-10-02：不再 panic，见上方 doc。`Some(Err)` 与 `None` 合并成「流结束」。
+            Ok(Some(Err(e))) => {
+                return Err(format!(
+                    "读帧报错后流终止（{e}）——**对端已死时读到 I/O 错误属预期**：\
+                     tungstenite 读到 Ping 会自动回 Pong，往服务端已 drop 的 socket 写会 EPIPE，\
+                     且 poll_next 置 ended=true 后 Close 帧无法再读到。\
+                     也就是说本用例的 {want_code} Close 帧**没被客户端读到**（服务端是否真的发了，\
+                     要看服务端日志或改用裸 socket 断言）"
+                ));
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "流在读到 {want_code} Close 帧之前就结束（无更多帧）——\
+                     同上，服务端已关闭连接，本用例没读到 {want_code} Close 帧"
+                ));
+            }
             Err(_) => continue, // 500ms 内无帧 → 继续轮询直到 deadline
         }
     }
-    None
+    Err(format!(
+        "在 {wait:?} 内没读到 {want_code} Close 帧（其间只收到别的帧）"
+    ))
 }
 
 /// 签发合法 access token + 写入 Redis session，使 dashboard WS 握手通过。
@@ -692,17 +726,35 @@ async fn ws_e2e_lagged_client_gets_4003_close() {
         .expect("broadcast send");
     }
 
-    let reason = wait_for_close(&mut ws, 4003, Duration::from_secs(10)).await;
-    assert_eq!(
-        reason.as_deref(),
-        Some("lagged"),
-        "慢消费方应收到 4003 / reason=lagged"
-    );
+    let reason = wait_for_close(&mut ws, 4003, Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| panic!("慢消费方应收到 4003/lagged Close 帧，但：{e}"));
+    assert_eq!(reason, "lagged", "4003 Close 帧的 reason 应为 lagged");
 }
 
 /// B2 + B4：连上后**一个帧都不发**（连服务端 protocol-level Ping 的 Pong 都不回），
 /// 超过 `ws_pong_timeout_seconds`（测试配置 3s）没等到任何入站帧 → 判定对端已死，
 /// 发 `1011 pong timeout` Close 帧。
+///
+/// ## 2026-10-02（review 第 2 轮 Major-A）：这里读**裸 socket**，不用 tungstenite 读帧
+/// 本用例约 1/8 概率红，报 `ws frame err: Broken pipe`——看起来像产品 bug，实际是测试自己
+/// 的客户端在写自动 Pong。链路（reviewer 已核 tungstenite 源码）：
+///
+/// 1. 不变式强制 `pong_timeout >= 2 × ping_interval`，所以任何「沉默客户端」在被判死之前
+///    **必定至少收到 1 个服务端 Ping**；
+/// 2. tungstenite 收到 Ping 会 `set_additional(Frame::pong(..))`，而 `read()` 在**读下一帧
+///    之前**先 flush `additional_send`（`protocol/mod.rs:449-470`）⇒ 客户端必然向 socket
+///    写一次 Pong；
+/// 3. 但服务端在 t≈`pong_timeout` 已发完 Close 帧并 drop 了 socket ⇒ 该 Pong 写进黑洞，
+///    对端回 RST ⇒ `EPIPE`；
+/// 4. `tokio-tungstenite` `lib.rs::poll_next` 把错误映射成 `Poll::Ready(Some(Err(e)))` 并
+///    **置 `ended = true`**，之后所有 poll 返 `None` ⇒ **Close 帧再也读不到**。
+///
+/// 即：这不是运气问题，而是结构性必然（步骤 1 保证 Ping 必到，步骤 4 保证读到就废）。
+/// 本用例真正要验的只是「服务端确实发了带 1011 + `pong timeout` 的 Close 帧」，而
+/// sleep 盲等期间该帧已静静躺在**内核接收缓冲**里 —— 故 `into_inner()` 取裸 socket 直接读，
+/// 彻底绕开 tungstenite 的自动 Pong / `ended` 逻辑，且顺带**同时断言 code 与 reason**
+/// （比原来只断言 reason 更强）。
 #[tokio::test]
 async fn ws_e2e_pong_timeout_closes_dead_peer() {
     let (base, state) = spawn_ws_server().await;
@@ -712,7 +764,8 @@ async fn ws_e2e_pong_timeout_closes_dead_peer() {
     let token = mint_test_token(&state, user_id).await;
     let url = format!("{base}/dashboard?token={token}");
 
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+    // 不加 `mut`：本用例**一次都不 poll**（`mut` 会因未使用告警）。
+    let (ws, _resp) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("WS upgrade must succeed for valid token");
 
@@ -721,11 +774,26 @@ async fn ws_e2e_pong_timeout_closes_dead_peer() {
     // 只 sleep 让服务端推进自己的定时器（timeout 分支走绝对 deadline，与 text 心跳共存）。
     tokio::time::sleep(Duration::from_secs(pong_timeout + 2)).await;
 
-    let reason = wait_for_close(&mut ws, 1011, Duration::from_secs(10)).await;
-    assert_eq!(
-        reason.as_deref(),
-        Some("pong timeout"),
-        "超过 {pong_timeout}s 无入站帧应收到 1011 / reason=pong timeout"
+    // `into_inner()` 是同步的（tokio-tungstenite 0.29：`pub fn into_inner(self) -> S`），
+    // 只取回底层 stream，**不动内核接收缓冲** —— 未 poll 过的数据完好无损。
+    // 返回的 `MaybeTlsStream` 直接实现 `AsyncRead`（本用例是 `ws://` ⇒ `Plain`），
+    // 故 `read_to_end` 拿到的就是原始线路字节（含 WS 帧头）。
+    let mut sock = ws.into_inner();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf))
+        .await
+        .expect("读裸 socket 超时：服务端应已发完 Close 帧并关闭连接")
+        .expect("读裸 socket 失败");
+
+    // Close 帧线路字节：`0x88` = FIN|Close(opcode 8)、`0x0e` = payload 14 字节
+    // （= 2 字节 code + reason 12 字节；注意 reason "pong timeout" 是 **12** 个字符：
+    // pong(4) + 空格(1) + timeout(7)）、`0x03f3` = 1011（大端 u16）。
+    let want: &[u8] = b"\x88\x0e\x03\xf3pong timeout";
+    assert!(
+        buf.windows(want.len()).any(|w| w == want),
+        "裸字节里未找到 1011 / reason=pong timeout 的 Close 帧；共读到 {} 字节。         （{pong_timeout}s 无入站帧应触发该 Close 帧）末尾 48 字节十六进制：{:02X?}",
+        buf.len(),
+        &buf[buf.len().saturating_sub(48)..]
     );
 }
 
@@ -826,12 +894,18 @@ async fn ws_e2e_reauth_failure_sends_4001_close() {
         .expect("delete_session（模拟登出）");
 
     let wait = Duration::from_secs(heartbeat * u64::from(reauth_every) + 8);
-    let reason = wait_for_close(&mut ws, 4001, wait).await;
+    let reason = wait_for_close(&mut ws, 4001, wait)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "session 被吊销后应在 ~{}s 内收到 4001/auth expired Close 帧（heartbeat={heartbeat}s \
+                 × reauth_every={reauth_every}），但：{e}",
+                heartbeat * u64::from(reauth_every)
+            )
+        });
     assert_eq!(
-        reason.as_deref(),
-        Some("auth expired"),
-        "session 被吊销后应在 ~{}s 内收到 4001 / reason=auth expired（heartbeat={heartbeat}s × reauth_every={reauth_every}）",
-        heartbeat * u64::from(reauth_every)
+        reason, "auth expired",
+        "4001 Close 帧的 reason 应为 auth expired"
     );
 }
 
@@ -857,11 +931,12 @@ async fn ws_e2e_server_shutdown_sends_1012() {
 
     state.shutdown.cancel();
 
-    let reason = wait_for_close(&mut ws, 1012, Duration::from_secs(10)).await;
+    let reason = wait_for_close(&mut ws, 1012, Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| panic!("优雅退出应发 1012/server restart Close 帧，但：{e}"));
     assert_eq!(
-        reason.as_deref(),
-        Some("server restart"),
-        "优雅退出应发 1012 / reason=server restart"
+        reason, "server restart",
+        "1012 Close 帧的 reason 应为 server restart"
     );
 }
 

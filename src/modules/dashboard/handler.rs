@@ -28,8 +28,8 @@
 //!    一次全量 HTTP 重取，比补发 n 条后续事件更便宜也更正确）；`Closed` → `info!` + 断开。
 //! 2. **B2 补 Close 帧**：此前全仓零 `sender.send(Message::Close(..))`，全部退出路径都是
 //!    裸 drop，浏览器只见 1006，无法区分「服务端主动踢 / 网络断 / session 失效」。
-//!    见本文件底部 `close_with`（review 第 1 轮后：写侧已失败的那几条路径不再重复发，
-//!    故 Close 帧调用点为 6 处、退出路径 14 条——逐条见本文件末尾的表）。
+//!    见本文件底部 `close_with`（review 第 1~2 轮后：写侧已失败的那几条路径不再重复发，
+//!    故 Close 帧调用点为 5 处、退出路径 14 条——逐条见本文件末尾的表）。
 //! 3. **B3 接真连接表**：`handle_socket` 入口 `ws_hub.register_conn`、退出前
 //!    `unregister_conn`（返回值用于打「连接存活时长」日志），并在两端 `info!` 当前连接数。
 //! 4. **B4 存活检测**：新增协议层 `Message::Ping`（`ws_ping_interval_seconds`）+ 空闲
@@ -53,18 +53,35 @@
 //! - **Minor-2 re-auth 套 5s `timeout`**：`verify_session_token` 有 Redis 往返，卡住会
 //!   阻塞整个 `select!`（`shutdown.cancelled()` 无法响应）。超时按「本轮跳过」处理，不判死。
 //! - **Minor-3 写侧已失败的 5 条路径不再重复 `close_with`**（回 Pong / 广播快照 / 广播事件
-//!   / text 心跳 / 协议层 Ping 写失败；reviewer 数成 4 条，实为 5 条——漏算了广播快照那处）。
-//!   见末尾「退出路径全景」表。
+//!   / text 心跳 / 协议层 Ping 写失败；reviewer 数成 4 条，实为 5 条——漏算了广播快照那处；
+//!   第 2 轮 Nit-2 又补上「推初始快照」那条，共 6 条）。见末尾「退出路径全景」表。
 //! - **Minor-4/5** 修正 `close_with` 与 `Closed` 分支的注释（行为不变，reviewer 已核实
 //!   `close()` 不等 Close 回声、只做收尾 flush；且 `is_allowed` 对本仓 5 个 code 全 true）。
 //! - **Minor-7 re-auth 周期从 `const` 改为配置项** `WS_REAUTH_EVERY_N_HEARTBEATS`，
 //!   使「re-auth 失败 → 4001」这条安全核心路径能被 E2E 覆盖。
 //!
-//! ### 退出路径全景（14 条，其中 6 条发 Close 帧）
+//! ### 2026-10-02 review 第 2 轮修复（1 Major-A + 1 Minor + 1 Nit，产品代码只动 2 处）
+//! - **Minor-1 订正 `select!` 分支顺序**：`shutdown.cancelled()` 提到**第一**，入站分支第二。
+//!   `biased` 下「持续 Ready 的高优先级分支会永久饿死低优先级分支」，上一轮把入站排第一
+//!   等于让「入站洪流 → 心跳停发 / Lagged 检测不到 / **1012 发不出**」。排序不变式：
+//!   `shutdown` → 入站（仍须在 pong 超时之前）→ 其余。
+//! - **Minor-2 订正 `close_with` 的选型理由**：`select!` 与 `timeout` 在这里**行为等价**
+//!   （tokio `Timeout::poll` 先 poll inner），上一版「timeout 会一次都不 poll 就丢帧」
+//!   +「这在 CI 上真实发生过」两句均不成立，已删。选型理由改为「让顺序在代码里可见」。
+//! - **Nit-2 退出路径 2 也改裸 break**：`send_msg` 失败后 `close_with` 属同类情形
+//!   （写端已不可用 → Close 帧物理上发不出去），故 Close 帧路径 6 → 5。
+//! - 另订正两处「`is_multiple_of(0)` 会 panic」的**错误注释**（已核 std 源码：不 panic，
+//!   恒返 `self == 0` ⇒ 真后果是 re-auth 静默永不触发）。
+//! - Major-A（`ws_e2e_pong_timeout_closes_dead_peer` 1/8 红）属**测试侧**问题，
+//!   产品代码未动：根因是 tungstenite 读到 Ping 会自动回 Pong、往已被服务端 drop 的
+//!   socket 写 → EPIPE，且 `poll_next` 置 `ended = true` 后 Close 帧再也读不到。
+//!   修法见 `tests/dashboard_ws_api.rs` 同名用例。
+//!
+//! ### 退出路径全景（14 条，其中 5 条发 Close 帧）
 //! | # | 触发 | 动作 | Close code |
 //! |---|---|---|---|
 //! | 1 | 首次快照构建失败 | close_with + return | `1011` |
-//! | 2 | 推初始快照失败 | close_with + return | `1011` |
+//! | 2 | 推初始快照失败 | 裸 return | —（写侧已死，见 Nit-2） |
 //! | 3 | 客户端 `Close` / 流结束 | 裸 break | —（客户端已发起关闭） |
 //! | 4 | 入站帧解码错误 | 裸 break | — |
 //! | 5 | 回 `Pong` 写失败 | 裸 break | —（写侧已死，见 Minor-3） |
@@ -78,10 +95,13 @@
 //! | 13 | 超过 `pong_timeout` 无入站帧 | close_with + break | `1011` |
 //! | 14 | 服务优雅退出 | close_with + break | `1012` |
 //!
-//! （心跳序列化失败与 re-auth 超时是 `continue` 而非退出路径，不计入。）
+//! （心跳序列化失败与 re-auth 超时是 `continue` 而非退出路径，不计入。写侧已失败的
+//! 共 **6 条**（#2 #5 #6 #7 #8 #9），它们一律裸断：tokio-tungstenite 的
+//! `max_write_buffer_size` 缺省 `usize::MAX` ⇒ 写缓冲不主动限流，`Sink::send` 唯一
+//! 可能的失败就是 socket 级致命错，此时 Close 帧**物理上**发不出去。）
 //!
-//! 实际发出的 Close code 共 **4 个**：`1011`（4 条路径：首次快照构建失败 / 推初始快照失败 /
-//! re-auth 基础设施失败 / pong 超时）、`1012`（服务重启）、`4001`（re-auth 鉴权失败）、
+//! 实际发出的 Close code 共 **4 个**：`1011`（3 条路径：首次快照构建失败 / re-auth
+//! 基础设施失败 / pong 超时）、`1012`（服务重启）、`4001`（re-auth 鉴权失败）、
 //! `4003`（慢消费方）。`1001` 自 Minor-3 起**无路径发出**。详见
 //! `docs/api/websocket.md`「连接关闭码」。
 //!
@@ -304,9 +324,18 @@ async fn run_socket(
     let mut rx = state.ws_hub.subscribe();
 
     // 写初始快照
+    //
+    // 2026-10-02（review 第 2 轮 Nit-2）：这里**不再** `close_with(1011, ...)`。
+    // 上一轮把「写侧已失败」的 5 条路径改成裸 break，本条是**同类情形**（`send_msg` 已
+    // 返回 Err），却仍发 Close 帧，自相矛盾：既然写端已不可用，紧接着的 `send(Close)`
+    // 必然再失败一次（每条死连接多一条 `warn!` 噪音），且「6 条发 Close 帧」这个
+    // 数字本身也站不住。
+    //
+    // 论证（与那 5 条同源）：tokio-tungstenite 的 `max_write_buffer_size` 缺省
+    // `usize::MAX` ⇒ 写缓冲永不主动限流，`Sink::send` 唯一可能的失败就是 socket 级
+    // 致命错（对端已关 / EPIPE）⇒ 此时 Close 帧**物理上**发不出去。
     if let Err(e) = send_msg(&mut sender, &snapshot_msg).await {
-        warn!(user_id = user_id, conn_id = conn_id, error = %e, "ws dashboard: 推初始快照失败，关闭连接");
-        close_with(&mut sender, 1011, "send snapshot failed").await;
+        warn!(user_id = user_id, conn_id = conn_id, error = %e, "ws dashboard: 推初始快照失败，关闭连接（写侧已不可用）");
         return;
     }
 
@@ -366,18 +395,35 @@ async fn run_socket(
     let shutdown = state.shutdown.clone();
 
     loop {
-        // 2026-10-02（review 第 1 轮 Minor-1）：`biased;` 让分支按**书写顺序**优先，
-        // 而不是 tokio 随机挑。必须这么做的原因：pong deadline 与 socket 可读
-        // **同时** ready（对端的 Pong 恰好在 deadline 那一刻到达）时，随机选会有一小
-        // 概率先命中超时分支 → 把**健康**连接判死。入站分支排第一即解决。
+        // 2026-10-02（review 第 1 轮 Minor-1 加、第 2 轮 Minor-1 订正顺序）：`biased;`
+        // 让分支按**书写顺序**取第一个 Ready ⇒ **分支顺序本身是契约**，改顺序前先读这段。
         //
-        // 会不会饿死其它分支：dashboard WS 的入站流量只有客户端自动回的 Pong
-        // （1 个 / ping_interval，且随收随走），达不到「持续 ready」的程度；
-        // 广播分支同理（每个事件消费一次就绪）。真被灌满时最坏结果是延迟另外几个
-        // 定时器的处理，而 ping/heartbeat 定时器是 `MissedTickBehavior::Delay`，
-        // 不会补发一堆积压 tick。
+        // 1) `shutdown.cancelled()` 排**第一**。它只在真正关闭时才 Ready（平时是「一次
+        //    waker 检查」级别的空转，不消耗 IO），放最前保证**入站洪流也饿不死优雅退出
+        //    信号**——否则对端持续以 ≥ 处理速度灌帧时 `receiver.next()` 永远 Ready，
+        //    1012 永远发不出去（前端只能干等 TCP 超时）。
+        // 2) 入站分支第二，**必须仍在 pong 超时之前**：pong deadline 与 socket 可读
+        //    **同时** ready（对端的 Pong 恰在 deadline 那一刻到达）时，取入站以刷新
+        //    `last_seen`，否则会有一小概率先命中超时分支 → 把**健康**连接判死。
+        // 3) 其余分支（广播 / text 心跳 / 协议层 Ping / pong 超时）顺序无要求。
+        //
+        // 代价（如实记录，不粉饰）：`biased` 下**持续 Ready 的高优先级分支会永久饿死
+        // 低优先级分支**（tokio 语义，不是本文件的实现缺陷）。上面的排序之所以安全，
+        // 靠的是「排前面的两个分支不会持续 Ready」：`shutdown` 见 1)；入站侧 dashboard
+        // 协议只回自动 Pong（1 个 / ping_interval，随收随走），真正灌帧的客户端属于
+        // 异常流量——那种情况下丢掉的恰好是下面这 3 类分支：心跳停发（前端无感知）、
+        // `Lagged` 检测不到（前端少刷新，靠下次事件补）、`pong timeout` 判定不了
+        // （但此时入站帧一直在来，本来也不该判死）。真正不可接受的是 1012 丢失，已由 1) 解决。
         tokio::select! {
             biased;
+            // 服务优雅退出 → 1012，让前端立刻重连而不是等 TCP 超时。
+            // 排第一的理由见上方 1)：入站洪流不能把「服务端要重启了」这个信号饿死。
+            // 2026-10-01 B4。
+            _ = shutdown.cancelled() => {
+                info!(user_id = user_id, conn_id = conn_id, "ws dashboard: 服务关闭中，发 1012 通知前端重连");
+                close_with(&mut sender, 1012, "server restart").await;
+                break;
+            }
             // 客户端发来的消息（text/binary/ping/pong/close）
             ws_msg = receiver.next() => {
                 // 2026-10-01 B4：**任何**入站帧都算存活证据（业务帧 / Pong / Close），
@@ -504,8 +550,18 @@ async fn run_socket(
                 // 2026-10-02（Minor-2）：整个调用套 `WS_REAUTH_CALL_TIMEOUT`。
                 heartbeat_ticks = heartbeat_ticks.wrapping_add(1);
                 // `reauth_every > 0` 由启动期 `ws_reauth_config` 保证；此处再挡一道是
-                // 为「绕开 from_env 的 struct literal」兜底——`is_multiple_of(0)` 会 panic，
-                // 写成显式比较而不是 `.max(1)` 静默改写，语义更清楚。
+                // 为「绕开 from_env 的 struct literal」兜底。
+                //
+                // 2026-10-02 订正（review 第 2 轮 Minor-2 同类问题）：上一版注释写
+                // 「`is_multiple_of(0)` 会 panic」——**错的**。已核 rust std
+                // `core/src/num/uint_macros.rs`：`is_multiple_of` 的实现是
+                // `match rhs { 0 => self == 0, _ => self % rhs == 0 }`，**永不 panic**。
+                // 真正的后果是：计数器非 0 时 `is_multiple_of(0)` 恒为 `false`
+                // ⇒ re-auth **静默永不触发**，即「session 吊销后不再踢 4001」这条安全闸
+                // 被无声关掉。启动期 bail（`ws_reauth_config`）拦的就是这个。
+                //
+                // 写成显式 `> 0` 比较而不是 `.max(1)` 静默改写：`0 → 1` 会把「配错」
+                // 伪装成「每心跳都验」（对 Redis 是无谓压力），语义不如直说清楚。
                 if reauth_every > 0 && heartbeat_ticks.is_multiple_of(reauth_every) {
                     match tokio::time::timeout(
                         WS_REAUTH_CALL_TIMEOUT,
@@ -568,12 +624,6 @@ async fn run_socket(
                 close_with(&mut sender, 1011, "pong timeout").await;
                 break;
             }
-            // 2026-10-01 B4：服务优雅退出 → 1012，让前端立刻重连而不是等 TCP 超时。
-            _ = shutdown.cancelled() => {
-                info!(user_id = user_id, conn_id = conn_id, "ws dashboard: 服务关闭中，发 1012 通知前端重连");
-                close_with(&mut sender, 1012, "server restart").await;
-                break;
-            }
         }
     }
 }
@@ -596,6 +646,13 @@ async fn run_socket(
 ///
 /// `_ =>` 兜底到 `1011`（可重试）而非 `4001`（终止）：新出现的错误码默认「先当服务端问题
 /// 处理」，宁可多几次重连，也不要因为一个没见过的状态把用户踢去登录页。
+///
+/// ⚠️ **维护须知**：`src/shared/error.rs::code` 里**新增任何鉴权类错误码**（即「这次
+/// re-auth 失败确实是因为 session 没了」）时，**必须**同步把它加进上面的白名单。
+/// 漏加的后果不是崩溃而是**静默降级**：该码会落到 `_ => 1011`，前端只重连不登出，
+/// 于是一个已被吊销的 session 会被无限重连下去 —— 恰好是 B4 周期性 re-auth 要堵的洞。
+/// 反向风险（误把基础设施故障的码加进白名单）会退回上一轮的 fail-closed 误伤，故宁可漏加
+/// 也不要乱加；加之前先确认该码的 `AppError` 变体确实由「鉴权判定」产生。
 fn reauth_close_code(err_code: i32) -> (u16, &'static str) {
     match err_code {
         code::UNAUTHORIZED | code::TOKEN_EXPIRED | code::SESSION_REVOKED => (4001, "auth expired"),
@@ -646,8 +703,8 @@ async fn send_msg(
 /// - `4000-4999` 应用私有段：`4001` auth expired（session 失效）/ `4003` lagged（慢消费方）。
 ///   与后端错误码段（`40100` 等 HTTP 信封码）刻意分开——WS Close code 是 2 字节 u16，
 ///   与 HTTP 信封是两套协议。
-/// - tungstenite 的 `CloseCode::is_allowed` 对本仓这 5 个 code（`1001` / `1011` / `1012` /
-///   `4001` / `4003`）均为 true，故服务端发的 code 不会被客户端改写（不会变成
+/// - tungstenite 的 `CloseCode::is_allowed` 对**协议段候选码 `1001` / `1011` / `1012` +
+///   私有段 `4001` / `4003`** 均为 true，故服务端发的 code 不会被客户端改写（不会变成
 ///   1002 protocol error）。review 第 1 轮 Minor-4 已核实。
 ///
 /// ## 为什么「`send(带 code 的 Close 帧)` + 再 `close()`」两步
@@ -670,8 +727,22 @@ async fn send_msg(
 /// 改动前这些路径是裸 `break`（立即 drop），故这是本次加固引入的新阻塞点。
 /// 超时后无条件放弃 flush 直接断：丢掉一个 Close 帧 ≫ 泄漏一条连接表条目。
 ///
-/// 实现上用 `select!` + `biased;` 而非 `tokio::time::timeout`，理由见函数体末尾注释
-/// （`timeout` 会在 runtime 被饿死时**一次都不 poll** 就判超时，导致 Close 帧丢失）。
+/// `CLOSE_FLUSH_TIMEOUT = 2s` **刻意硬编码、不做成配置项**：它要覆盖的是「把几十字节
+/// Close 帧推进内核发送缓冲」这一个动作，2s 是绰绰有余的量级下限；做成 env 只会多一个
+/// 能被配错的旋钮（配成 <1s 就会在跨网 RTT 下把唯一带业务语义的信息帧丢掉，且症状是
+/// 「前端随机看到 1006」，极难归因）。
+///
+/// ## 为什么用 `select!` 而不是 `tokio::time::timeout`（2026-10-02 review 第 2 轮 Minor-2 订正）
+/// 两者在这里**行为等价**（已核 tokio-1.53.1 `time/timeout.rs:211-222`：`Timeout::poll`
+/// **先** poll inner future，只有 inner 返回 `Pending` 之后才去看 deadline），所以选
+/// `select!` 不是为了修任何 bug，而是让「**先推 Close 帧、再看 deadline**」这个顺序
+/// 在代码里显式可见，读代码的人不必去翻 tokio 内部实现来确认「帧到底有没有被试过」。
+///
+/// 2026-10-02 订正：上一版注释里「`timeout` 会在 task 被饿死时一次都不 poll inner 就判
+/// 超时、导致 Close 帧丢失」以及「这在 CI 上真实发生过」两句**均不成立**（前者已被上面
+/// 的源码证伪，后者是当时对一条测试失败原因的误判——真因见
+/// `tests/dashboard_ws_api.rs::ws_e2e_pong_timeout_closes_dead_peer` 的注释）。
+/// 留着会让后来者以为 `timeout` 有坑而绕开它。
 async fn close_with(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     code: u16,
@@ -691,12 +762,8 @@ async fn close_with(
             warn!(error = %e, code = code, reason = reason, "ws dashboard: Close 帧收尾 flush 失败");
         }
     };
-    // ⚠️ 这里刻意用 `select!` + `biased;` 而**不是** `tokio::time::timeout`（2026-10-02 修复）：
-    // `timeout` 在「task 被饿死 > 2s 后重新被 poll」时会**直接判超时**（deadline 已过），
-    // inner future 可能**一次都没被 poll 过** → Close 帧根本没写出去，客户端只看到 1006。
-    // 这在 CI 上真实发生过（冷编译 + 并行建库把 runtime 饿几秒 → `ws_e2e_pong_timeout_
-    // closes_dead_peer` 拿不到 1011）。`biased` 保证**先 poll flush**：socket 可写时
-    // 无论 sleep 是否已过期都先把帧发出去，只有「确实 Pending」才落到超时分支。
+    // `biased` 把「先推 Close 帧、再看 deadline」这个顺序写死在代码里（语义上与
+    // `tokio::time::timeout` 等价，理由与订正见上方 doc）。
     tokio::select! {
         biased;
         _ = send_and_flush => {}

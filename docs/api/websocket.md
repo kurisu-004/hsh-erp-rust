@@ -129,16 +129,18 @@ Request：
 握手成功**之后**，服务端在**能发出 Close 帧的路径**上都主动发（此前全仓零主动发送，退出路径
 全是裸 drop，浏览器只能看到 1006，无法区分「服务端主动踢 / 网络断 / session 失效」）。
 
-2026-10-02 起有两处**不发** Close 帧（2026-10-02 修复 Minor-3 / Minor-5）：
+2026-10-02 起有两处**不发** Close 帧（2026-10-02 修复 Minor-3 / Minor-5 / Nit-2）：
 
-- **写侧已失败的 5 条路径**（回 Pong / 广播快照 / 广播事件 / text 心跳 / 协议层 Ping 写失败）：
-  `send` 已返回 Err，写端与 socket 已不可用，再发 Close 帧必然再失败一次（只会多一条 `warn!`
-  噪音），故改为只记原始错误即断开 → 浏览器看到 1006，走通用重连。
+- **写侧已失败的 6 条路径**（推初始快照 / 回 Pong / 广播快照 / 广播事件 / text 心跳 /
+  协议层 Ping 写失败）：`send` 已返回 Err，写端与 socket 已不可用，再发 Close 帧必然再失败一次
+  （只会多一条 `warn!` 噪音），故改为只记原始错误即断开 → 浏览器看到 1006，走通用重连。
+  判据是 tokio-tungstenite 的 `max_write_buffer_size` 缺省 `usize::MAX` ⇒ 写缓冲永不主动限流，
+  `Sink::send` 唯一可能的失败就是 socket 级致命错，此时 Close 帧**物理上**发不出去。
 - **广播通道 `Closed`**：这是「hub 已被整体 drop」的全局信号，前端该做的是重连（新连接会重新
   建立订阅），语义等同 1006；「进程收尾」由下面的 `1012` 分支专门负责。
 
 `run_socket` 共有 **14 条退出路径**（逐条表见 `src/modules/dashboard/handler.rs` module doc
-末尾的「退出路径全景」），其中 **6 条**发 Close 帧、**8 条**裸断。`close_with` 内部有 **2s 收尾
+末尾的「退出路径全景」），其中 **5 条**发 Close 帧、**9 条**裸断。`close_with` 内部有 **2s 收尾
 超时**：半开 TCP + 发送缓冲满时 `send`/`poll_close` 会长时间 `Pending`，那会把
 `unregister_conn` 一起卡住导致连接表条目泄漏（正是存活检测要回收的那类连接），超时即放弃
 flush 直接断。
@@ -148,7 +150,7 @@ flush 直接断。
 | 1000 | normal closure | —（客户端通常不带 reason） | **服务端当前不主动发 1000**；只会在客户端 `close(1000)` 的回声里出现 | 正常关闭，无需动作 |
 | 1001 | going away | — | **服务端当前不主动发 1001**（2026-10-02 起写失败路径改为裸断，见上文） | 走通用重连 |
 | 1011 | internal error | `snapshot build failed` | 首次快照构建失败（DB 故障等） | **可重试但应退避**（服务端侧问题，连续重试无意义 → 提示用户稍后再试） |
-| 1011 | internal error | `send snapshot failed` | 推初始快照写失败 | 走通用重连 |
+| 1011 | internal error | `send snapshot failed` | **服务端当前不主动发此 reason**（2026-10-02 Nit-2 起「推初始快照写失败」也改为裸断，见上文） | 无需动作（不会出现） |
 | 1011 | internal error | `re-auth unavailable` | **2026-10-02 新增**：周期性 re-auth 失败但**不是**鉴权问题（典型：Redis 挂 / 连接池耗尽 → `50000`） | 走通用重连（**不要**清 token —— 重连后 re-auth 大概率就恢复了） |
 | 1011 | internal error | `pong timeout` | 超过 `ws_pong_timeout_seconds` 未收到任何入站帧（对端已死 / 半开连接） | 走通用重连（**必须**重连：旧连接不会再有数据） |
 | 1012 | service restart | `server restart` | 服务优雅退出（Ctrl-C / 发布重启） | **立即重连**（可能需退避，避免重启风暴期打满） |

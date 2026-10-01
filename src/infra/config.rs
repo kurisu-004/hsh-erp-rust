@@ -64,7 +64,7 @@ pub struct AppConfig {
     /// 可注入后 E2E 用例传 `2`，两秒内即可验到。
     ///
     /// 环境变量 `WS_REAUTH_EVERY_N_HEARTBEATS`，缺省 `10`（生产 30s × 10 ≈ 5min）。
-    /// 启动期强制校验 `>= 1`（0 会让 `is_multiple_of(0)` panic）。
+    /// 启动期强制校验 `>= 1`（0 ⇒ re-auth 静默永不触发，见 `ws_reauth_config`）。
     pub ws_reauth_every_n_heartbeats: u32,
     /// 2026-09-20 新增：HTTP `/api/v2/*` nest 请求超时（秒）。仅挂在 nest 内层
     /// （不影响 WS 长连接，也不影响根 Router 的 CORS/Body limit）。环境变量
@@ -668,14 +668,23 @@ fn validate_ws_liveness(ping_interval: u64, pong_timeout: u64) -> Result<(u64, u
 /// 2026-10-02 新增：解析周期性 re-auth 的心跳周期 `WS_REAUTH_EVERY_N_HEARTBEATS`。
 ///
 /// 独立于 `ws_liveness_config`：它不属于「存活检测」而是「鉴权刷新」，但同样需要
-/// 启动期校验——0 会让 handler 里的 `is_multiple_of(0)` panic（tokio/rust 的
-/// `is_multiple_of` 对 0 会 panic，不是返回 false）。
+/// 启动期校验。
+///
+/// ## 为什么 0 必须 bail（2026-10-02 订正，review 第 2 轮 Minor-2 同类问题）
+/// 上一版注释写「0 会让 handler 里的 `is_multiple_of(0)` panic」——**错的**，已核 rust std
+/// `core/src/num/uint_macros.rs`：`is_multiple_of` 的实现是
+/// `match rhs { 0 => self == 0, _ => self % rhs == 0 }`，文档明确「never panic」。
+/// 真实后果更阴险：handler 的计数器 `heartbeat_ticks` 非 0，故 `is_multiple_of(0)`
+/// **恒为 `false`** ⇒ re-auth **静默永不触发** ⇒ 「session 在连接期间被吊销 → 发 4001」
+/// 这条**安全闸被无声关掉**，而服务看起来完全正常。这类「不崩、只是把安全检查关掉」的
+/// 配置错误正是启动期 fail-fast 该拦的。
 fn ws_reauth_config() -> Result<u32> {
     let every_n = env_parse("WS_REAUTH_EVERY_N_HEARTBEATS", 10u32)?;
     if every_n == 0 {
         return Err(anyhow!(
-            "WS_REAUTH_EVERY_N_HEARTBEATS 必须 ≥ 1（当前 0：会让 is_multiple_of(0) panic，\
-             且语义上等于永不 re-auth）"
+            "WS_REAUTH_EVERY_N_HEARTBEATS 必须 ≥ 1（当前 0：is_multiple_of(0) 恒为 false \
+             ——不会 panic，但会让周期性 re-auth 静默永不触发，等于关掉「session 吊销 → \
+             4001」这条安全闸）"
         ));
     }
     Ok(every_n)
@@ -836,8 +845,8 @@ mod tests {
         );
     }
 
-    /// 2× 边界本身必须放行（`>=` 而非 `>`），且 0 值仍被拒（`is_multiple_of` 无关、
-    /// 但 interval 周期为 0 会 panic）。
+    /// 2× 边界本身必须放行（`>=` 而非 `>`），且 0 值仍被拒
+    /// （`interval_at` 的 period 为 0 会 panic，见 tokio `time/interval.rs`）。
     #[test]
     fn ws_liveness_boundary_two_times_is_ok_and_zero_rejected() {
         assert_eq!(validate_ws_liveness(20, 40).expect("2× 应放行"), (20, 40));
