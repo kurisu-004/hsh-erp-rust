@@ -68,6 +68,41 @@ TEST_DATABASE_BASE_URL=postgres://hsh_test:6065161test@localhost:5429 cargo next
 
 **part 是跨域枢纽**（delivery_note、assembly、outsource、part_file、statistics、shelf 均依赖它），实施顺序见 architecture.md 第 7 节。
 
+### 状态派生契约（2026-10-01）
+
+三层状态**单向**派生（子件 = `t_part` 中 `assembly_id` 非空的行）：
+
+```
+t_part_batch.status            ← 唯一真源
+   │  status_gate::rollup_part_derived（min-progress）
+   ▼
+t_part.status / next_process_id   ← 派生缓存
+   │  assembly::compute_assembly_target
+   ▼
+t_assembly.status               ← 派生缓存
+```
+
+- **写 `t_part_batch.status` 只能走 `src/modules/part/repo/status_gate.rs`**
+  （`apply_batch_status_change` / `apply_bulk_batch_status_change_for_part`）。
+  它一函数内完成「写批次（OCC + SQL 层源状态白名单）→ 回填 part 派生列 →
+  级联 assembly → 终态序列号归档 / 释放」，所以 **caller 没有「要不要顺手调
+  sync」这个选项**（13 个历史 `mark_batch_*` 写点已改写为其上的薄包装）。
+  ⚠️ 手工补调 `PartService::sync_from_batch_change` 是**反模式**：第二次派生必为
+  `NoChange`，会把响应的 `synced_assembly_id` 吞成 `null`、连带 WS 的
+  `ASSEMBLY_UPDATED` 永不发。
+- **CI 强制**：`cargo test --lib` 的
+  `part::repo::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
+  扫全 `src/**/*.rs`，除 `status_gate.rs` 外任何文件写
+  `UPDATE t_part_batch SET status …` 即失败（注释 / `#[cfg(test)]` 块 / 只改其它列
+  的 UPDATE 不在判定范围）。改动 `mark_batch_*` 后请顺手跑一次。
+- **派生层不得否决主操作**：派生写不抛错，`sync_assembly_status` 的 OCC 冲突降级为
+  「跳过 + `tracing::warn!`」。
+- **兜底对账**：`POST /api/v2/admin/recompute-rollup`（Manager）复用上述 rollup
+  函数重跑并回报 before→after，**幂等**；新增派生算法时**不要**在对账端点重写一遍。
+- 词汇：batch/part 8 态 + `is_repairing` 标记（`REPAIRING` 已于 2026-10-01 降级为
+  boolean 列，DB 不再产生该 status）；assembly 7 态（无 `OUTSOURCE`，子件
+  `OUTSOURCE` ⇒ 父 `IN_PROCESS`）。详见 [`docs/api/parts/index.md#状态派生契约2026-10-01`](docs/api/parts/index.md)。
+
 ## 必须遵守的架构约定
 
 1. **事务边界在 handler（2026-09-21 重构 + 2026-09-22 删 `PgIamRepo` 转发壳后 iam 与其余 20 个 handler 文件一致）**：handler 显式 `state.pool.begin()` / `tx.commit()`，错误路径 tx drop 隐式回滚。service 不知事务——所有跨 repo 操作经 `repo: R`（by-value；`IamRepo` / 域内对应 trait 已直接 `impl for &mut PgConnection`，handler/service 借 `&mut *tx` / `&mut *conn` 即可）参数传入。

@@ -868,6 +868,17 @@ pub struct WorkerScanCoreOut {
 
 ## 状态机（can_transition_to 白名单）
 
+> 状态**词汇**（8 值 + `is_repairing` 标记）与「三层派生 + status_gate 单一写入口」
+> 见 [`./index.md#状态派生契约2026-10-01`](./index.md#状态派生契约2026-10-01)。
+>
+> 2026-10-01 起本表的**所有 `t_part_batch.status` 写入**都由
+> `part::repo::status_gate::apply_batch_status_change` 承担，源状态白名单
+> （`allowed_from`）在 **SQL 层**与写入同属一条语句，不存在「service 校验通过 →
+> 另一个人改掉状态 → 我的 UPDATE 照写」的 TOCTOU 窗口。0 行 → `40901`。
+> 派生（part / assembly / 序列号释放）也在同一个函数里，故**调用方不需要也不应该
+> 再手工调任何 sync**（手工补调会因第二次派生必为 `NoChange` 而把响应的
+> `synced_assembly_id` 吞成 `null`）。
+
 | from | to | 触发场景 |
 |---|---|---|
 | INSPECTION | READY_TO_SHIP | `POST /parts/{id}/to-ship`（单件）或 `POST /parts/batch-to-ship`（批量） |

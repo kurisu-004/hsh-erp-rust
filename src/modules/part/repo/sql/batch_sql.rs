@@ -308,16 +308,23 @@ impl PartRepo {
     /// - `executor: E` → `conn: &mut PgConnection`：status_gate 的派生步骤
     ///   需要可变的 `PgConnection`（D-6 架构：service 不持连接，跨域调用经
     ///   `repo.conn_mut()`），泛型 `PgExecutor` 表达不了。
-    /// - `Result<u64, sqlx::Error>` → `Result<u64, AppError>`：status_gate 的
-    ///   契约是「没写成 = `VERSION_CONFLICT`」，转成 `sqlx::Error` 会把
-    ///   409 降级成 500。返回值恒为 `Ok(1)`（0 行已是 Err）。
+    /// - `Result<u64, sqlx::Error>` → `Result<RollupOutcome, AppError>`：
+    ///   ① `sqlx::Error` → `AppError`：status_gate 的契约是「没写成 =
+    ///   `VERSION_CONFLICT`」，转成 `sqlx::Error` 会把 409 降级成 500；
+    ///   ② `u64` → `RollupOutcome`：**2026-10-01 修正**。status_gate 一函数内
+    ///   已完成 part 派生 + assembly 反向同步，而调用点（`inspection_core.rs`
+    ///   的 3 处）需要 `SyncOutcome` 填响应的 `synced_assembly_id`、并据此发
+    ///   `ASSEMBLY_UPDATED` 广播。若这里只回 `u64`、让 service 再调一次
+    ///   `PartService::sync_from_batch_change`，第二次派生必然 `NoChange`
+    ///   （target 已 == 当前），`synced_assembly_id` 会被**恒为 null** 吞掉。
+    ///   故把 gate 的派生结果原样透出；0 行仍由 gate 直接抛 `VERSION_CONFLICT`。
     pub async fn mark_batch_passed_inspection(
         conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<u64, AppError> {
-        status_gate::apply_batch_status_change(
+    ) -> Result<status_gate::RollupOutcome, AppError> {
+        status_gate::apply_batch_status_change_detailed(
             conn,
             StatusChange {
                 batch_id,
@@ -337,7 +344,6 @@ impl PartRepo {
             },
         )
         .await
-        .map(|_| 1u64)
     }
 
     /// to-inspection 第一步：批次状态同步（OCC UPDATE t_part_batch）。
@@ -376,8 +382,8 @@ impl PartRepo {
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<u64, AppError> {
-        status_gate::apply_batch_status_change(
+    ) -> Result<status_gate::RollupOutcome, AppError> {
+        status_gate::apply_batch_status_change_detailed(
             conn,
             StatusChange {
                 batch_id,
@@ -399,7 +405,6 @@ impl PartRepo {
             },
         )
         .await
-        .map(|_| 1u64)
     }
 
     /// to-process：批次打回生产架（OCC UPDATE t_part_batch）。
@@ -420,8 +425,8 @@ impl PartRepo {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<u64, AppError> {
-        status_gate::apply_batch_status_change(
+    ) -> Result<status_gate::RollupOutcome, AppError> {
+        status_gate::apply_batch_status_change_detailed(
             conn,
             StatusChange {
                 batch_id,
@@ -440,7 +445,6 @@ impl PartRepo {
             },
         )
         .await
-        .map(|_| 1u64)
     }
 
     /// worker-pool admin_remove 用：按 `id + current_holder_id` 定位 IN_PROCESS+WORKER 批次。

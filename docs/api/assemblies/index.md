@@ -174,9 +174,30 @@
 - WS 广播在 `tx.commit().await?` **之后**（对齐 Python 延迟广播模式）。
 ---
 
+## 状态词汇（7 态，唯一权威）
+
+`PENDING` / `IN_PROCESS` / `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` /
+`COMPLETED` / `CANCELLED`（2026-09 由 4 态扩展为 7 态，对齐 Python
+`AssemblyStatus`；2026-09-02 `eaec9d4`）。
+
+> ⚠️ **DB 注释是历史快照，不是权威**：`migrations/20260925000000_001_baseline.sql`
+> 里 `t_assembly.status` 的 `COMMENT` 仍写「PENDING（默认）/ IN_PROCESS /
+> COMPLETED / CANCELLED」（4 态）。该文件是**冻结的 append-only 基线，不得修改**
+> （改它会让已 apply 过的环境出现校验和不一致）。**本页 + `src/modules/assembly/statemachine.rs`
+> 的 7 态才是权威**；如需让 DB 侧注释同步，只能**追加一个新 migration** 的
+> `COMMENT ON COLUMN`，本轮（2026-10-01）刻意**未**加——纯注释变更对应用无行为
+> 影响，而每加一个 migration 就多一份跨环境 apply 成本与漂移面，收益不抵。
+
+**assembly 域刻意没有 `OUTSOURCE` 状态**：外发的是**子件**，装配件本体不外发。
+所以子件 `OUTSOURCE`（progress 3）映射为父件 `IN_PROCESS`——这是**显式契约**，
+由单测 `min_progress_three_maps_to_in_process` 锁死。
+
+---
+
 ## 子件状态聚合（auto-rollup）
 
-父装配件 `t_assembly.status` 由 service 在 part inspection 流（同事务）自动同步，**前端无需主动调用**。
+父装配件 `t_assembly.status` 是**派生缓存**（真源是 `t_part_batch.status`），
+由 part 侧的 status_gate 在同一事务内自动同步，**前端无需主动调用**。
 
 **触发点（PR-B3 后扩展）**：
 
@@ -203,11 +224,35 @@
   | `READY_TO_SHIP` | 5 | `READY_TO_SHIP` |
   | `DELIVERED` | 6 | `DELIVERED` |
 
-3. 目标 == 当前 → noop；否则 `UPDATE t_assembly SET status = $target, version = version + 1`，带 OCC + 终态守卫，0 行 → `40901 VERSION_CONFLICT`（事务回滚）。
+3. 目标 == 当前 → noop；否则 `UPDATE t_assembly SET status = $target, version = version + 1`，带 OCC + 终态守卫。
+
+   > **2026-10-01 行为订正**：0 行（version 已被并发改动 / 已进终态）**不再**抛
+   > `40901 VERSION_CONFLICT` 回滚整个事务，而是**降级为「跳过本次派生 +
+   > `tracing::warn!` 留痕」**。理由：派生层不允许否决主操作 —— 用户点了「送检 /
+   > 完成」却被一个**派生缓存**的并发写否决，主操作什么都没发生，还收到一个指向
+   > 完全无关实体的 409。缓存写失败最多短暂偏旧（下次任意 part 流转自动追平），
+   > 代价远小于主操作被回滚。`t_part.status` 的派生写本来就**不走 OCC**（靠行锁
+   > 串行化），两层策略现在一致。响应里的 `synced_assembly_id` 在这种降级下为
+   > `null`（未翻转），但**用户的主操作成功**。
+
+4. **派生写可以跨越状态机边**（重要语义，勿当 bug）：上表的状态机（见下节）管的是
+   **操作员主动发起的单步流转**（`cancel` / `start` 端点），而 rollup 是**派生写**，
+   走 `AssemblyRepo::update_status_if_not_terminal`（只带 OCC + 终态守卫，不查状态机）。
+   因此「所有子件一夜之间全送检」会把父件从 `PENDING` **直接推到 `INSPECTION`**
+   （`PENDING → INSPECTION` 不在 `can_transition_to` 白名单里）——这在业务上等价于
+   「每个子件都真实流转过」，是对子件进度的如实映射。
 
 涉及的 part inspection 端点：`POST /parts/{id}/{to-inspection,to-ship,to-process}`、`POST /parts/{batch-to-inspection,batch-to-ship}`、`POST /parts/worker-scan`（仅 `INSPECTED` 分支；`RETURNED` 不动 part.status）。
 
 WS 广播：每次实际翻状态 → commit 后下发 `ASSEMBLY_UPDATED`（payload `{ assembly_id }`），与 assembly update endpoint 复用同一 kind。
+
+**序列号**：父装配件进入终态时由 rollup 顺带**直接清** `t_assembly.serial_no`
+（不归档 —— `t_assembly` 没有事件表，其 `note` 是用户可编辑的业务备注）。
+子件侧的「先归档到 `t_part_event` 再清」见 [`../parts/index.md#序列号serial_no生命周期`](../parts/index.md#序列号serial_no生命周期)。
+
+**对账兜底**：派生缓存仍可能与真源不一致（历史漏调 sync / 手工改库等）。修复入口是
+`POST /api/v2/admin/recompute-rollup`（Manager，可传 `assembly_ids` 定点重算）——
+**复用**本节这段聚合实现，不会与业务流算出两个结果。见 [`../admin.md`](../admin.md)。
 
 ---
 

@@ -265,19 +265,26 @@ pub trait PartRepoTrait: Send {
     // `t_part_batch.status` 写点已收口到 `repo::status_gate`。
     // 返回类型由 `sqlx::Error` 改 `AppError`：status_gate 的契约是
     // 「没写成 = `VERSION_CONFLICT`」，转 `sqlx::Error` 会把 409 降级成 500。
+    //
+    // 2026-10-01 追加：下面 3 个方法返回 `status_gate::RollupOutcome` 而非
+    // `u64`。status_gate 在同一个函数里已经做完 part 派生 + assembly 反向
+    // 同步，而这三个方法的调用点要拿 `SyncOutcome` 填响应里的
+    // `synced_assembly_id`（并据此发 `ASSEMBLY_UPDATED` 广播）。若让 service
+    // 再补调一次 `PartService::sync_from_batch_change`，第二次派生必然
+    // `NoChange`，那个字段就会被**恒为 null** 吞掉（2026-10-01 修掉的真实回归）。
     async fn mark_batch_passed_inspection(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<u64, AppError>;
+    ) -> Result<status_gate::RollupOutcome, AppError>;
     async fn mark_batch_inspected(
         &mut self,
         batch_id: i64,
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<u64, AppError>;
+    ) -> Result<status_gate::RollupOutcome, AppError>;
     async fn mark_batch_failed_inspection(
         &mut self,
         batch_id: i64,
@@ -286,7 +293,7 @@ pub trait PartRepoTrait: Send {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<u64, AppError>;
+    ) -> Result<status_gate::RollupOutcome, AppError>;
     async fn mark_batch_returned(
         &mut self,
         batch_id: i64,
@@ -654,7 +661,7 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<u64, AppError> {
+    ) -> Result<status_gate::RollupOutcome, AppError> {
         PartRepo::mark_batch_passed_inspection(
             &mut **self,
             batch_id,
@@ -670,7 +677,7 @@ impl PartRepoTrait for &mut PgConnection {
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<u64, AppError> {
+    ) -> Result<status_gate::RollupOutcome, AppError> {
         PartRepo::mark_batch_inspected(
             &mut **self,
             batch_id,
@@ -689,7 +696,7 @@ impl PartRepoTrait for &mut PgConnection {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<u64, AppError> {
+    ) -> Result<status_gate::RollupOutcome, AppError> {
         PartRepo::mark_batch_failed_inspection(
             &mut **self,
             batch_id,

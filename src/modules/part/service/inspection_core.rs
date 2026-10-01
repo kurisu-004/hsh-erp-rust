@@ -103,15 +103,15 @@ impl PartService {
             Self::_split_for_partial_op(repo, snowflake, &target, quantity, current).await?;
 
         // 5. UPDATE t_part_batch: INSPECTION → READY_TO_SHIP（OCC + 写 updated_by）
-        let n = repo
+        //
+        // 2026-10-01：写与派生已焊在 `status_gate` 一个函数里（见
+        // `repo/status_gate.rs`），故这里拿到的 `rollup` **就是** batch → part →
+        // assembly 的最终结果：0 行由 gate 直接抛 40901 `VERSION_CONFLICT`
+        // （原先 `if n == 0` 那层判断已是死代码 —— 包装函数恒返回 1）；
+        // `rollup.sync` 供下方第 7 步填 `synced_assembly_id`。
+        let rollup = repo
             .mark_batch_passed_inspection(operated_id, operated_version, Some(current.id))
             .await?;
-        if n == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("batch {operated_id} 版本冲突"),
-            ));
-        }
 
         // 6. 写 t_part_event 事件日志（无条件）
         let event_id = snowflake.next_id();
@@ -130,11 +130,14 @@ impl PartService {
         })
         .await?;
 
-        // 7. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
-        //    内部走 min-progress 规则（多条 INSPECTION 批次时 part 维持
-        //    INSPECTION，单条时升 READY_TO_SHIP）；status 变化时级联调
-        //    AssemblyService::sync_from_part_change 闭合链路。
-        let synced = PartService::sync_from_batch_change(repo, part_id, current).await?;
+        // 7. batch → part → assembly rollup：**已在第 5 步的 status_gate 内完成**
+        //    （min-progress 规则：多条 INSPECTION 批次时 part 维持 INSPECTION，
+        //    单条时升 READY_TO_SHIP；part.status 真变了才级联
+        //    `AssemblyService::sync_from_part_change`）。
+        //    2026-10-01：此处**不再**补调 `PartService::sync_from_batch_change`
+        //    —— 那会跑第二次派生、必然 `NoChange`，把 `synced_assembly_id`
+        //    恒吞成 null（连带 WS 的 `ASSEMBLY_UPDATED` 永不发）。
+        let synced = rollup.sync;
         let synced_assembly_id = match synced {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
@@ -271,7 +274,10 @@ impl PartService {
                 ),
             )
         })?;
-        let n = repo
+        // 2026-10-01：写与派生已焊在 status_gate 内（0 行由 gate 抛 40901，
+        // 原 `if n == 0` 是死代码）；`rollup.sync` 供第 8 步填
+        // `synced_assembly_id`。
+        let rollup = repo
             .mark_batch_failed_inspection(
                 operated_id,
                 operated_version,
@@ -282,12 +288,6 @@ impl PartService {
                 Some(current.id),
             )
             .await?;
-        if n == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("batch {operated_id} 版本冲突"),
-            ));
-        }
         // 7. 写事件日志
         let event_id = snowflake.next_id();
         repo.insert_part_event(NewPartEvent {
@@ -304,11 +304,11 @@ impl PartService {
             created_by: Some(current.id),
         })
         .await?;
-        // 8. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
-        //    内部走 min-progress 规则；status 变化时级联调
-        //    AssemblyService::sync_from_part_change 闭合链路。
-        let synced = PartService::sync_from_batch_change(repo, part_id, current).await?;
-        let synced_assembly_id = match synced {
+        // 8. batch → part → assembly rollup：**已在上面那次
+        //    `mark_batch_failed_inspection`（status_gate）内完成**，不再补调
+        //    `PartService::sync_from_batch_change`（2026-10-01：第二次派生必然
+        //    `NoChange`，会把 `synced_assembly_id` 恒吞成 null）。
+        let synced_assembly_id = match rollup.sync {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
         };
@@ -436,10 +436,12 @@ impl PartService {
         // 7. UPDATE t_part_batch: {PENDING, PROGRAMMING, IN_PROCESS} → INSPECTION
         //
         // 隐式多批次 rollup：前置状态守卫（step 3）已限定 from ∈ {PENDING, PROGRAMMING,
-        // IN_PROCESS}，该状态下不可能存在 INSPECTION 批次，翻转 `t_part.status` 安全；
-        // 翻 batch 后调 `PartService::sync_from_batch_change`（下方 step 8）按
-        // min-progress 规则回填 part 派生列。
-        let n = repo
+        // IN_PROCESS}，该状态下不可能存在 INSPECTION 批次，翻转 `t_part.status` 安全。
+        //
+        // 2026-10-01：min-progress 回填与 assembly 级联**已收进** status_gate
+        // 一函数内（下方 step 8 直接取 `rollup.sync`，不再二次派生）；
+        // 0 行由 gate 抛 40901 `VERSION_CONFLICT`，原 `if n == 0` 是死代码。
+        let rollup = repo
             .mark_batch_inspected(
                 operated_id,
                 operated_version,
@@ -447,17 +449,8 @@ impl PartService {
                 Some(current.id),
             )
             .await?;
-        if n == 0 {
-            return Err(AppError::biz(
-                code::VERSION_CONFLICT,
-                format!("batch {operated_id} 版本冲突"),
-            ));
-        }
-        // 8. PR-B2 batch → part rollup：翻 batch 后调 sync_from_batch_change，
-        //    内部走 min-progress 规则；status 变化时级联调
-        //    AssemblyService::sync_from_part_change 闭合链路。
-        let synced = PartService::sync_from_batch_change(repo, part_id, current).await?;
-        let synced_assembly_id = match synced {
+        // 8. batch → part → assembly rollup 结果：已在 step 7 的 status_gate 内完成
+        let synced_assembly_id = match rollup.sync {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,
         };

@@ -233,3 +233,23 @@ pub(crate) async fn sync_from_part_changes_dispatch(
         .sync_from_part_changes_inner::<&mut sqlx::PgConnection>(conn, part_ids, current)
         .await
 }
+
+/// 2026-10-01 新增：按 `assembly_id` 直接重算一次聚合状态（admin 对账逃生口用）。
+///
+/// 暴露本模块私有 [`sync_assembly_status`] 的唯一理由是
+/// `POST /api/v2/admin/recompute-rollup` 需要「**从装配件出发**」跑一次聚合 ——
+/// 正常业务流永远是从 part 出发的（`sync_from_part_change*`），而对账场景要修的
+/// 恰恰是「part 侧派生已正确、但父装配件没跟上」这种反向漂移。
+///
+/// 仍然走同一段聚合实现（`compute_assembly_target` + OCC + 终态守卫），因此
+/// 对账端点与业务流**不可能**算出两个结果。
+pub async fn recompute_assembly_status_by_id(
+    conn: &mut sqlx::PgConnection,
+    assembly_id: i64,
+    updated_by: i64,
+) -> Result<SyncOutcome, AppError> {
+    // `sync_assembly_status` 收 `&mut R`（trait 注入式），生产路径的 R 是
+    // `&mut PgConnection`；这里借用一次以凑出那个 `&mut R` 借位。
+    let mut repo: &mut sqlx::PgConnection = conn;
+    sync_assembly_status::<&mut sqlx::PgConnection>(&mut repo, assembly_id, updated_by).await
+}

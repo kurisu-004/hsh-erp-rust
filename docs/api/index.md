@@ -21,6 +21,7 @@
 > - [`./_e2e.md`](./_e2e.md) — e2e seed hook（11 端点；dev/test 默认启用，release profile 硬关，2026-09-14）
 > - [`./websocket.md`](./websocket.md) — WebSocket（含 **WORKER_SCAN_* / WORKER_POOL_* / 12+ 业务事件**）
 - [`./wx.md`](./wx.md) — wx 域（**企业微信小程序登录** + 7 个小程序 BFF 聚合端点，2026-09-28/29；身份源为企业微信 userid，仅预绑定不自动开户）
+- [`./admin.md`](./admin.md) — admin 域（**对账 / 修数据逃生口**：2026-10-01 新增 `POST /api/v2/admin/recompute-rollup`，重跑 batch → part → assembly 派生算法；Manager 单角色）
 >
 > **同步流程**：
 > 1. 修改 `src/modules/<mod>/{handler.rs,dto.rs,service.rs}`
@@ -203,7 +204,8 @@ HTTP 状态码：
 | shelves | [`./shelves.md`](./shelves.md) | 11 | ✅ 完全上线（CRUD + picker + mapping，2026-08-26） |
 | workers（已并入 prod） | [`./production/workers.md`](./production/workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文档从顶层迁入 `production/`） |
 | **生产管理** | [`./production/index.md`](./production/index.md) | **27** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池 + 工人档案；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步） |
-| part | [`./parts/index.md`](./parts/index.md) | **49** | ✅ 完全上线（Phase 1+2 全部状态机 / 批量 / 扫码 / pick-up 端点落地，2026-09-14） |
+| part | [`./parts/index.md`](./parts/index.md) | **49** | ✅ 完全上线（Phase 1+2 全部状态机 / 批量 / 扫码 / pick-up 端点落地，2026-09-14；2026-10-01 `t_part_batch.status` 收口为 `status_gate` 单一写入口） |
+| admin（对账） | [`./admin.md`](./admin.md) | 1 | ✅ 完全上线（2026-10-01 新增 `POST /api/v2/admin/recompute-rollup`；Manager 单角色；**复用**既有 rollup 实现，不新增派生算法） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
 | part-files | [`./files.md`](./files.md) | 4 | ✅ 完全上线（2026-09-14，Phase 3；2026-09-18 删除 upload-intents → 改由相关 STS 会话域承载 STS 共享机制；2026-09-28 进一步下线相关会话域，前端改单 uploader + python sts-tmp-keys 数组入参直签） |

@@ -225,13 +225,81 @@
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → `20101`
 - **状态机**：详见 [状态机（can_transition_to 白名单）](./inspection.md#状态机can_transition_to-白名单)；不在白名单内的 source / target 组合返回 `20103 BIZ_INVALID_TRANSITION`（迁移表见 `src/modules/part/statemachine.rs`）
 - **事件日志**：状态迁移在 service 内事务内统一插入对应事件，service 提交后由 WS 中枢广播
-- **part↔batch 同步（PR-B2/B3 改写，2026-09-11）**：
-  part.status 不再直接 UPDATE，而是由 `PartService::sync_from_batch_change`
-  按"最慢批次"规则 rollup（min-progress）。lifecycle 终态 / 翻转（deliver / cancel /
-  complete / start-repair）只在最近一条 source-status 批次上翻状态；装配体子件
-  rollup 同步触发（见 [`../assemblies/index.md#子件状态聚合`](../assemblies/index.md#子件状态聚合auto-rollup)）。
-  详见 [`docs/refactor-part-assembly-batch.md`](../../refactor-part-assembly-batch.md)。
+- **part↔batch 同步（PR-B2/B3 改写 2026-09-11；2026-10-01 收口为 status_gate 单一写入口）**：
+  part.status 不再直接 UPDATE，而是由「写批次状态」那一个函数一并在事务内派生
+  （`part::repo::status_gate::apply_batch_status_change`，min-progress 规则）。
+  lifecycle 终态 / 翻转（deliver / cancel / complete / start-repair）只在最近一条
+  source-status 批次上翻状态；装配体子件 rollup 同步触发（见
+  [`../assemblies/index.md#子件状态聚合`](../assemblies/index.md#子件状态聚合auto-rollup)）。
+  详见 [`docs/refactor-part-assembly-batch.md`](../../refactor-part-assembly-batch.md) 与
+  [状态派生契约](#状态派生契约2026-10-01)。
 ---
+
+## 状态派生契约（2026-10-01）
+
+### 状态词汇（batch 与 part 共用同一套 8 个值）
+
+| status | progress | 说明 |
+|---|---|---|
+| `PENDING` | 0 | 待下发 / 待加工 |
+| `PROGRAMMING` | 1 | **已废弃的进入路径**（2026-09-29）：枚举、`as_str`、`from_str` 映射与 4 条出口边（`→ PENDING` / `→ IN_PROCESS` / `→ INSPECTION` / `→ CANCELLED`）保留，**只为消化历史数据**；新流程不产生该状态（待编程一览改由 `t_process.is_cnc` 列驱动） |
+| `IN_PROCESS` | 2 | 生产中（含**返修中**） |
+| `OUTSOURCE` | 3 | 外协加工中 |
+| `INSPECTION` | 4 | 待品检 |
+| `READY_TO_SHIP` | 5 | 待发货 |
+| `DELIVERED` | 6 | 已交付 |
+| `COMPLETED` / `CANCELLED` | 终态 | 终态（`part_status_progress` 不给终态定档，由 `compute_*_target` 单独短路处理） |
+
+**返修不再是状态**（2026-10-01 BREAKING CHANGE，migration 005/006）：批次返修中时
+`status` 保持 `IN_PROCESS`（progress 同档 2），返修事实改由
+**`t_part_batch.is_repairing`（boolean，默认 false）** 承载。所有「返修中」的查询 /
+守卫一律读该列，不再判 `status = 'REPAIRING'`（DB 里不再产生该字面量；
+`PartStatus::from_str("REPAIRING")` 保留 → `IN_PROCESS` 的过渡兼容分支）。
+
+### 三层单向派生 + 单一写入口
+
+```
+t_part_batch.status            ← 唯一真源
+   │  status_gate::rollup_part_derived（min-progress）
+   ▼
+t_part.status / next_process_id   ← 派生缓存
+   │  assembly::compute_assembly_target
+   ▼
+t_assembly.status               ← 派生缓存
+```
+
+- **所有 `t_part_batch.status` 写入必须走
+  `src/modules/part/repo/status_gate.rs`**（`apply_batch_status_change` 单行 /
+  `apply_bulk_batch_status_change_for_part` 批量）。它在一事务内完成
+  「写批次（OCC + 源状态白名单）→ 回填 part 派生列 → 级联 assembly →
+  终态序列号归档 / 释放」。
+- **caller 不需要、也不应该自己再调 sync**：13 个历史 `mark_batch_*` 写点已全部
+  改写为 status_gate 之上的薄包装，函数名与参数不变。
+- 改造动因：收口前有 3 个写点漏调 sync，派生缓存长期与真源不一致且**不报任何错**
+  （只是列表页显示错状态）。
+- **CI 强制**：`cargo test --lib` 里的
+  `part::repo::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
+  扫描全 `src/**/*.rs`，除 `status_gate.rs` 外任何文件写
+  `UPDATE t_part_batch SET status …` 即测试失败（注释 / `#[cfg(test)]` 块 /
+  只改其它列的 UPDATE 不在判定范围，细则见该测试文档注释）。
+- 派生层的 OCC 冲突**一律降级为「跳过 + `tracing::warn!`」**，绝不让派生缓存否决
+  用户的主操作（详见 [`../assemblies/index.md#子件状态聚合`](../assemblies/index.md#子件状态聚合auto-rollup)）。
+- 兜底修正入口：`POST /api/v2/admin/recompute-rollup`（Manager）—— **复用**上述
+  派生函数重跑一遍并回报 before→after，幂等。见 [`../admin.md`](../admin.md)。
+
+### 序列号（`serial_no`）生命周期
+
+| 阶段 | 行为 |
+|---|---|
+| 派发 | 建件时由 `t_serial_counter` 按 L1 客户 `serial_prefix` 生成；`uk_t_part_serial_no` 唯一索引保证不重复 |
+| 流转中 | 序列号在 part 的**整个非终态期**持续占用该唯一索引（货还在厂里，正确） |
+| 进入终态（`COMPLETED` / `CANCELLED`） | 由 rollup step 4 自动释放：**先**归档一条 `t_part_event`（`event_type='SERIAL_RELEASED'`，`note` 记原序列号）**再**清 `t_part.serial_no`。每个 part 至多 1 条归档事件（终态不可重复进入） |
+| 父装配件进终态 | 直接清 `t_assembly.serial_no`（不归档：`t_assembly` 无事件表，其 `note` 是用户可编辑业务备注，拿它记系统动作会污染用户数据） |
+| 取消（`CANCELLED`） | 同样释放（2026-10-01：唯一索引谓词已补 `deleted_at IS NULL AND status <> 'CANCELLED'`，软删 / 作废工单不再占坑） |
+
+调用方**不需要**为序列号做任何事：释放是 rollup 的一步，`deliver` / `complete` /
+`cancel` / `force-complete` 等端点都自动带上（2026-10-01 起 `force-complete`
+也不再单独调清理函数）。
 
 ## 状态机
 

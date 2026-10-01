@@ -122,6 +122,7 @@ Request：
 | ↳ `ASSEMBLY_UPDATED` | 父装配件 status 更新（前端主动改字段 / inspection 流 auto-rollup） | `assembly_id` |
 | ↳ `BATCH_PLACED_ON_SHELF` | 车间下发台 PENDING 批次 → IN_PROCESS 成功（2026-09-29 新增，`prod::batch` 单条 dispatch 端点） | `{ batch_id, target_process_id, shelf_id, version }` |
 | ↳ `BATCH_PLACED_ON_SHELF` | 车间下发台多 batch 批量下发成功（2026-09-29 新增，`prod::batch` bulk-dispatch / auto-dispatch 端点，仅 succeeded 部分；skipped 不广播） | `{ batches: [{ batch_id, target_process_id, shelf_id, version }, ...] }` |
+| ↳ `ROLLUP_RECOMPUTED` | 2026-10-01 新增：admin 对账端点修正了派生缓存（**仅真有变化时**发，幂等空跑不发） | `{ scope, parts_changed, assemblies_changed, operator_id }` |
 | `Notification` | 通知 | `user_id`, `content` |
 | `Heartbeat` | 心跳 | `ts` |
 
@@ -140,4 +141,11 @@ Request：
  - `POST /api/v2/parts/batch-to-inspection` / `batch-to-ship`
  - `POST /api/v2/parts/worker-scan`（仅 `INSPECTED` 分支，**实际翻状态时**才下发；dedup by assembly_id）
 - **频率**：每个 inspection 调用最多 1 次（per unique parent assembly）。
+
+### `ROLLUP_RECOMPUTED`
+
+- **Payload**: `{ "scope": "ALL|PART_IDS|ASSEMBLY_IDS|PART_IDS+ASSEMBLY_IDS", "parts_changed": <int>, "assemblies_changed": <int>, "operator_id": "<stringified i64>" }`
+- **触发端点**: `POST /api/v2/admin/recompute-rollup`（Manager 单角色；见 [`./admin.md`](./admin.md)）
+- **时机**: 全部分块事务 commit **之后**广播一次（该端点内部按 200 行分块提交，故这是**汇总**事件，不是逐行事件）
+- **频率**: 每次调用最多 1 次；**0 变化时不发**（幂等空跑不该刷新大屏）
 
