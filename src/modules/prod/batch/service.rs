@@ -21,6 +21,11 @@
 //! ## 事务内并发冲突（OCC）
 //! dispatch_batch 入口 `find_batch_by_id` 后用 fetched `batch.version` 作
 //! `expected_version`；UPDATE 0 行 → `VERSION_CONFLICT 40901`。
+//!
+//! ## 2026-10-02 `t_shelf_process` SQL 收口
+//! 解析货架改调同域 `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
+//! （原为 `BatchRepo::find_first_shelf_for_process` 内联 SQL），两处 inline 保留见
+//! `repo.rs::preview_auto_dispatch` 注释。
 
 use sqlx::PgConnection;
 
@@ -33,6 +38,7 @@ use crate::modules::prod::batch::vo::{
     AutoDispatchItem, AutoDispatchResult, DispatchResult, DispatchSuccessItem, PendingBatchItem,
     PendingBatchListOut,
 };
+use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::shared::error::{AppError, code};
 
 use super::repo::PendingBatchRow;
@@ -168,16 +174,21 @@ impl BatchService {
         }
 
         // 3. 解析货架
-        let shelf_id = BatchRepo::find_first_shelf_for_process(&mut *conn, target_process_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_SHELF_PROCESS_NOT_FOUND,
-                    format!(
-                        "process {target_process_id} 未配置任何 active 货架映射（t_shelf_process 0 结果）"
-                    ),
-                )
-            })?;
+        // 2026-10-02 域拆分：原调 `BatchRepo::find_first_shelf_for_process`（本域手写
+        // `t_shelf_process` SQL），现改调 SQL 真源
+        // `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
+        // （executor 泛型直接接住 `&mut PgConnection`，无需改事务上下文）。
+        let shelf_id =
+            ShelfProcessRepo::find_first_shelf_for_process(&mut *conn, target_process_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_SHELF_PROCESS_NOT_FOUND,
+                        format!(
+                            "process {target_process_id} 未配置任何 active 货架映射（t_shelf_process 0 结果）"
+                        ),
+                    )
+                })?;
 
         // 4. UPDATE OCC（带当前 version）
         // 2026-09-30：透传 target_process_id 作为 current_process_id —— 池归属

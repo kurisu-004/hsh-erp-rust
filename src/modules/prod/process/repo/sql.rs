@@ -70,8 +70,10 @@ impl ProcessRepo {
 
     /// 批量按 id 查（活跃行）。空切片短路返回空 Vec。
     ///
-    /// 用于 `ShelfProcessService::set_shelf_processes` 校验 items 里的所有
-    /// process_id 都存在；走 `WHERE id = ANY($1)` 单次往返（防 N+1）。
+    /// 用于 `prod::shelf_process::service::ShelfProcessService::set_shelf_processes`
+    /// 校验 items 里的所有 process_id 都存在；走 `WHERE id = ANY($1)` 单次往返
+    /// （防 N+1）。2026-10-02 域拆分后调用方从 `shelf::process_mapping` 换到同域
+    /// `prod::shelf_process`（shelf 侧的两个反向 helper 已删），本方法零改动。
     pub async fn list_by_ids<'e, E: PgExecutor<'e>>(
         executor: E,
         ids: &[i64],
@@ -291,11 +293,22 @@ impl ProcessRepo {
     /// 保留作为 rollup 派生缓存（migration 027 不动），继续纳入计数。
     ///
     /// **best-effort**：mapping 表（work_type_process / outsource_company_process /
-    /// shelf_process / process_chain_step）目前 Rust 端没有专门的 repo 暴露，
-    /// 本查询用单条 sub-select 加法一次往返；若对应表当前不存在（理论上不应发生，
-    /// 迁移 003/004/005/017 已建），本函数会被 PostgreSQL 拒绝，service 层把 sqlx
+    /// process_chain_step）目前 Rust 端没有专门的 repo 暴露，本查询用单条
+    /// sub-select 加法一次往返；若对应表当前不存在（理论上不应发生，迁移
+    /// 003/004/005/017 已建），本函数会被 PostgreSQL 拒绝，service 层把 sqlx
     /// 错误转 `BIZ_PROCESS_IN_USE`（保守：宁可误拒也不放过真引用）。当前阶段所有
     /// 5 张表均已迁移到位，best-effort 注释仅留给后续 junction repo 拆分时回看。
+    ///
+    /// 2026-10-02 域拆分：原注释「后续 junction repo 拆分时回看」已兑现一处 ——
+    /// `t_shelf_process` 的 SQL 真源搬到
+    /// `crate::modules::prod::shelf_process::repo::ShelfProcessRepo`（见同目录
+    /// `shelf-process-mapping.md`）。但本函数**仍保留 inline `t_shelf_process`
+    /// sub-select，不抽出去**：它是 5 张表 sub-select 加法，拆出来要多 5 次往返
+    /// （其中 `t_shelf_process` 那次还是纯计数）。剩余
+    /// `t_work_type_process`（归 `prod::work_type`）/ `t_outsource_company_process`
+    /// （归 `outsource` 域）/ `t_process_chain_step`（归 `prod::process_chain`）3 张
+    /// 表同样保持 inline —— 拆 junction repo 的收益是「写路径有单一入口」，而本函数
+    /// 是**只读计数**，不存在写路径分叉问题。
     ///
     /// 2026-09-30（review 第 1 轮 M3）两点补充：
     /// - **行为收紧**：`t_part.next_process_id` 的 rollup 派生源已改为直读

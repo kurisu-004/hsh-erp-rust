@@ -2,13 +2,14 @@
 //!
 //! 拆分依据（crud-five-domains plan）：把单文件 `service.rs` 按职责拆为
 //! - `crud`     —— list/get/create/update/soft_delete（含 `ShelfService` struct）
-//! - `picker`   —— for-return / for-inspection / 全集 process 映射
+//! - `picker`   —— for-return / for-inspection
 //!
 //! 让每个文件都落在 < 800 行（conventions.md §2）。
 //!
-//! per-shelf mapping（`set_shelf_processes` / `list_shelf_processes`）单独在
-//! `crate::modules::shelf::process_mapping`，与本 service 平级，调用方走
-//! `ShelfProcessService::*`。
+//! 2026-10-02 域拆分：per-shelf mapping（`set_shelf_processes` /
+//! `list_shelf_processes` / `list_all_process_mappings`）整体搬到
+//! `crate::modules::prod::shelf_process`，与本 service 不再平级；本 service 收敛为
+//! 纯 `t_shelf` 的 7 端点业务逻辑。
 //!
 //! ## 调用方契约
 //! `handler.rs` 仅引 `crate::modules::shelf::service::ShelfService::*`，

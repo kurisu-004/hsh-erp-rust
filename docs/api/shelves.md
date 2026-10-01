@@ -1,24 +1,29 @@
 # shelves 域 API
 
-> 本文件须与 `src/modules/shelf/{handler.rs,dto.rs,service.rs,process_mapping.rs}` 保持同步
+> 本文件须与 `src/modules/shelf/{handler.rs,dto.rs,service/mod.rs,service/crud.rs,service/picker.rs,repo/mod.rs,repo/sql.rs,vo/shelf.rs}` 保持同步
+> **货架 ↔ 工序映射端点已搬到 prod 域**，见 [`./production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
 ## 端点列表
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/shelves` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 列表（过滤 + 分页，含 `account_count`） |
+| GET | `/api/v2/shelves` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 列表（过滤 + 分页） |
 | POST | `/api/v2/shelves` | MANAGER | 创建货架（PRODUCTION / INSPECTION） |
 | GET | `/api/v2/shelves/{id}` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 货架详情（SHELF_ACCOUNT scope 校验） |
 | POST | `/api/v2/shelves/{id}/update` | MANAGER | 部分更新（OCC） |
 | POST | `/api/v2/shelves/{id}/deactivate` | MANAGER | 软删 + 停用（OCC，被 IN_PROCESS/INSPECTION/REPAIRING 零件引用时拒） |
-| GET | `/api/v2/shelves/{id}/processes` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 该货架的工序映射列表（按 sort_order） |
 | GET | `/api/v2/shelves/for-return?next_process_id=` | 已登录（M/C/CNC/SHELF） | PRODUCTION 区 picker（按 current_load 升序，标 `is_recommended`） |
 | GET | `/api/v2/shelves/for-inspection` | 已登录（M/C/CNC/SHELF/INSPECTOR） | INSPECTION 区 picker（仅 `zone='INSPECTION' AND is_active=true`） |
-| GET | `/api/v2/shelves/processes` | 已登录（M/C/CNC/SHELF/INSPECTOR） | 所有 active shelf 的 mapping 批量查询（防 N+1） |
-| POST | `/api/v2/shelves/{id}/processes` | MANAGER | 整组替换 mapping（先软删全部旧 → INSERT 新） |
 
 挂载点：`/api/v2/shelves`（见 `src/modules/mod.rs::v2_router`）。
+
+> **2026-10-02 端点数 10 → 7**：3 个货架↔工序映射端点（`GET|POST /shelves/{id}/processes`
+> + `GET /shelves/processes`）已搬到 `src/modules/prod/shelf_process/`，URL 硬切
+> `/api/v2/prod/shelf-processes/*`（**无 alias**），详见
+> [`./production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)。
+> ⚠️ `GET /shelves/processes` 例外：现在落到本域 `/{id}` 路由，`processes` 非 i64 被
+> axum 拒为 400 纯文本（非 `R` 信封），而非 404。
 
 ---
 
@@ -29,7 +34,6 @@
 - **is_active**: 是否启用。`deactivate` 同时把 `is_active = false` + `deleted_at = now()`
   写回（同事务）；`activate`（re-enable）不在本域实现（Python 没有此端点）。
 - **display_order**: 物理顺序（0 = 未设置；manager 在 ShelfList 后台手填）。
-- **account_count**: 绑定的 SHELF_ACCOUNT 角色数；`list_shelves` 单条 GROUP BY 批量补全。
 
 业务约束（service 层 enforce）：
 
@@ -42,7 +46,6 @@
 | 更新 `location` | 三态：`None` 不改；`Some(null)` 清空；`Some(v)` 改 |
 | 更新 `display_order` | None = 不改；Some(v) = 改 |
 | 软删 | `t_part_batch.current_holder_id = shelf_id` 且 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` 且 `status IN ('IN_PROCESS','INSPECTION','REPAIRING')` 仍有非软删引用 → 20503 拒（**2026-09-16 PR-2**：`t_part.current_holder_id` 列已删，「被该 shelf 持有」改查 `t_part_batch` 真相源） |
-| 映射 `set_shelf_processes` | 整组替换：先软删全部旧 mapping → INSERT 新（带 sort_order） |
 
 ---
 
@@ -64,7 +67,7 @@ Response 200 `data`：`ShelfListOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `items` | [ShelfOut] | 含 `account_count`（GROUP BY 单条批量算，防 N+1） |
+| `items` | [ShelfOut] | |
 | `total` | i64 | 全量命中行数 |
 | `limit` | i64 | 回显 |
 | `offset` | i64 | 回显 |
@@ -160,7 +163,7 @@ Query：
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `next_process_id` | string (i64) | — | 候选的下一道工序 id；若传必须现存（否则 20801） |
+| `next_process_id` | string (i64) | — | 候选的下一道工序 id；**2026-10-02 起本端点不再做服务端存在性校验**（原占位校验结果被立刻丢弃、且是一次跨域多余查询），语义由 worker-scan 后端强校验承担 |
 
 Response 200 `data`：`ShelfForReturnOut`
 
@@ -179,11 +182,8 @@ Response 200 `data`：`ShelfForReturnOut`
 - 仅返回 `zone='PRODUCTION' AND is_active=true AND deleted_at IS NULL`
 - SHELF_ACCOUNT 用户仅看到 `user.shelf_ids` 绑定的架（用 `can_access_shelf`）；Manager 见全集
 - `current_load` LEFT JOIN 聚合：空载货架 = 0（保留在结果中）
-
-错误码：
-
-- 20104 `BIZ_INVALID_VALUE` — next_process_id 非整数
-- 20801 `BIZ_PROCESS_NOT_FOUND` — next_process_id 不存在
+- 2026-10-02：`next_process_id` 的存在性占位校验（原 20104 / 20801 两条错误码）已
+  删除 —— 结果立刻被 `let _ = …` 丢弃。Query 字段保留，前端继续传即可。
 
 ### `GET /api/v2/shelves/for-inspection`
 
@@ -200,74 +200,33 @@ Response 200 `data`：`ShelfForInspectionOut`
 - 仅 `zone='INSPECTION' AND is_active=true AND deleted_at IS NULL`
 - 不过滤 SHELF_ACCOUNT scope（品检架全员可见）
 
-### `GET /api/v2/shelves/processes`
+---
 
-权限：已登录（M/C/CNC/SHELF/INSPECTOR）
+## 跨模块引用
 
-Response 200 `data`：`AllShelfProcessMappingOut`
+- `part::service` 用 `ShelfRepo::get_by_id` / `get_active_by_id` / `get_by_id_zone`
+  做品检架/生产架校验 —— `TShelf` 已扩展 `location` 字段，但 part 域不读，不影响。
+- `prod::process::service::soft_delete_process` 的 `count_process_references` 用
+  `t_shelf_process` 查引用（5 张表 sub-select 加法，故意保留 inline，见
+  [`./production/shelf-process-mapping.md#维护约定`](./production/shelf-process-mapping.md#维护约定)）。
+- `prod::shelf_process::service` 反向**只读** `ShelfRepo::get_by_id` 校验货架存在 /
+  scope（2026-10-02 依赖方向翻转；本域不再依赖任何 prod 模块）。
+- `user::repo::ShelfRepo::get_by_id` 是 user 域自带的只读投影，与本域并存；不共享代码。
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `items[].shelf_id` | string (i64) | |
-| `items[].shelf_code` | string | |
-| `items[].process_id` | string (i64) | |
-| `items[].process_code` | string | |
+---
 
-业务规则：
+## 2026-10-02 域拆分小结
 
-- 单条 JOIN 返回所有 active shelf ↔ process 行（防 N+1）
-- SHELF_ACCOUNT 用户仅看到 `user.shelf_ids` 命中的映射
-- 用途：part_batch / worker_pool 创建批次/工人时一次性拿全货架工序映射
-
-### `GET /api/v2/shelves/{id}/processes`
-
-权限：已登录（M/C/CNC/SHELF/INSPECTOR）+ SHELF_ACCOUNT scope 校验
-
-Response 200 `data`：`ShelfProcessMappingOut`
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `items[].shelf_id` | string (i64) | |
-| `items[].shelf_code` | string | |
-| `items[].process_id` | string (i64) | |
-| `items[].process_code` | string | |
-| `items[].sort_order` | i32 | |
-
-错误码：
-
-- 20501 `BIZ_SHELF_NOT_FOUND`
-- 40301 `SHELF_MISMATCH` — SHELF_ACCOUNT 越界
-
-### `POST /api/v2/shelves/{id}/processes`
-
-权限：MANAGER
-
-Request：`SetShelfProcessesRequest`
-
-```jsonc
-{
-  "items": [
-    { "process_id": "1001", "sort_order": 0 },
-    { "process_id": "1002", "sort_order": 1 }
-  ]
-}
-```
-
-语义：整组替换 —— 事务内：
-
-1. 校验 shelf 存在（20501）+ items 里所有 process_id 存在（20505）
-2. 软删该 shelf 的全部 active mapping（清 deleted_at）
-3. `bulk_insert` 新 mapping（带 sort_order）
-
-`items` 可为 `[]`（清空映射）。
-
-Response 200 `data`：`null`
-
-错误码：
-
-- 20501 `BIZ_SHELF_NOT_FOUND` —— shelf 不存在 / 已软删
-- 20505 `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND` —— items 里有 process_id 不存在
-- 20104 `BIZ_INVALID_VALUE` —— process_id 非整数
+| 项 | 变化 |
+|---|---|
+| 端点数 | 10 → **7**（3 个 mapping 端点搬到 `prod::shelf_process`） |
+| 货架↔工序映射 | → [`./production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)（URL `/api/v2/prod/shelf-processes/*`，无 alias） |
+| 货架↔账号部分 | **消除**：`ShelfOut.account_count` + `ShelfRepo::count_accounts_by_shelf` 删除；绑定真源本来就在 iam 域 `t_user_role`，**本任务零 iam 改动** |
+| `ShelfRepoTrait` | 17 → **10** 方法（全部 `t_shelf`）；2 个反向跨域 helper（`proc_check_process_exists` / `proc_list_existing_process_ids`）与 4 个 `proc_*` 一并删除 |
+| `MockShelfRepoTrait` | 全仓零引用（仅本文件 doc 提及），收缩无影响 |
+| `list_for_return` | `next_process_id` 占位校验删除（20104 / 20801 两条错误码随之消失） |
+| 205xx 错误码 | 数字一律不动：20501~20503 归货架本体；**20504~20508 的「货架↔工序映射」归属改判给 `prod::shelf_process` / `prod::worker_pool` / `prod::batch`**，详见 [`./production/shelf-process-mapping.md#错误码归属2026-10-02-调整说明数字不动`](./production/shelf-process-mapping.md#错误码归属2026-10-02-调整说明数字不动) |
+| 零变更 | `t_shelf` 表结构、迁移、iam 模块、前端 body 形态 |
 
 ---
 
@@ -284,16 +243,8 @@ Response 200 `data`：`null`
 | `location` | string? | 物理位置；可空 |
 | `is_active` | bool | 启用 / 停用 |
 | `display_order` | i32 | 物理顺序 |
-| `account_count` | i64 | 绑定的 SHELF_ACCOUNT 角色数；`get_shelf` 单条默认 0，list 批量 GROUP BY 补 |
 | `version` | i32 | 乐观锁；每次写操作 +1 |
 | `created_at` | naive datetime | Asia/Shanghai |
 | `updated_at` | naive datetime | Asia/Shanghai |
 
 ---
-
-## 跨模块引用
-
-- `part::service` 用 `ShelfRepo::get_by_id` / `get_active_by_id` / `get_by_id_zone`
-  做品检架/生产架校验 —— `TShelf` 已扩展 `location` 字段，但 part 域不读，不影响。
-- `process::service::soft_delete_process` 的 `count_process_references` 用 `t_shelf_process` 查引用。
-- `user::repo::ShelfRepo::get_by_id` 是 user 域自带的只读投影，与本域并存；不共享代码。

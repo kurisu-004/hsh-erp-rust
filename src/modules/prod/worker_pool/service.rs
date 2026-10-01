@@ -39,12 +39,20 @@
 //! PartService 仍是旧 `&mut PgConnection` 形参（part 域 D-6 未做），是关联函数
 //! `PartService::sync_from_batch_change(&mut PgConnection, ...)`，service 公共
 //! 方法签名收 `&mut PgConnection`，与 PartService 形参直接匹配。
+//!
+//! ## 2026-10-02 `t_shelf_process` SQL 收口
+//! `move_batch` WORKER→POOL 分支的货架映射存在性检查由内联 SQL 改调
+//! `prod::shelf_process::repo::ShelfProcessRepo::exists_for_shelf_process`
+//! （`SELECT EXISTS(…)`，与原恒真式写法语义等价；20507 `BIZ_SHELF_PROCESS_NOT_MAPPED`
+//! 的触发条件与文案不变）。下方 `#[cfg(test)]` 集成测试 fixture helper 里的
+//! `INSERT INTO t_shelf_process` 保持原样（测试数据落库，不属 SQL 真源收口范围）。
 
 use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::service::PartService;
+use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::modules::prod::worker_pool::repo::WorkerPoolRepoTrait;
 use crate::shared::error::{AppError, code};
 
@@ -574,16 +582,17 @@ impl WorkerPoolService {
                 // WORKER → POOL：复用 part_mark_batch_returned（不写 step）
                 // shelf 映射校验：shelf 必须映射 batch 当前所属工序
                 if let Some(spid) = step_process_id {
-                    let mapped: Option<i64> = sqlx::query_scalar(
-                        r#"SELECT shelf_id FROM t_shelf_process
-                           WHERE shelf_id = $1 AND process_id = $2 AND deleted_at IS NULL
-                           ORDER BY sort_order ASC, id ASC LIMIT 1"#,
-                    )
-                    .bind(*shelf_id)
-                    .bind(spid)
-                    .fetch_optional(&mut *conn)
-                    .await?;
-                    if mapped.is_none() {
+                    // 2026-10-02 SQL 收口：原内联
+                    // `SELECT shelf_id FROM t_shelf_process WHERE shelf_id=$1 AND
+                    //  process_id=$2 AND deleted_at IS NULL ORDER BY … LIMIT 1` +
+                    // `is_none()` 判定（恒真式写法），改调 SQL 真源
+                    // `prod::shelf_process::repo::ShelfProcessRepo::exists_for_shelf_process`
+                    // 的 `SELECT EXISTS(…)` 显式存在性检查（语义等价，错误码 20507
+                    // 与文案不变）。
+                    let mapped =
+                        ShelfProcessRepo::exists_for_shelf_process(&mut *conn, *shelf_id, spid)
+                            .await?;
+                    if !mapped {
                         return Err(AppError::biz(
                             code::BIZ_SHELF_PROCESS_NOT_MAPPED,
                             format!("shelf {shelf_id} 未映射工序 {spid}（batch 当前工序）"),

@@ -9,7 +9,7 @@
 //! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
 //! - `list_active_production_ordered` 通过 LEFT JOIN `t_part_batch` 聚合 current_load
 //!
-//! ## Phase P3+ shelf CRUD 暴露给 service 的能力
+//! ## Phase P3+ shelf CRUD 暴露给 service 的能力（2026-10-02 起 9 静态方法）
 //! - 读：`get_active_by_id` / `get_by_id` / `get_by_id_zone`
 //!   / `list_with_filters` / `count_with_filters` / `list_active_production_ordered`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder）
@@ -18,9 +18,13 @@
 //!   + location + status 三维核对，PR-2 真相源迁移后已不再读 t_part）
 //!
 //! 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff，
-//! `.sqlx/query-*.json` 哈希不变；新增的 `ShelfRepo` 胖 trait 在 `repo/mod.rs`。
-//! 胖 trait 含 t_shelf + t_shelf_process 全部方法（决策方案 A），t_shelf_process 的 SQL
-//! 真源放在同级 `crate::modules::shelf::process_mapping::sql::ShelfProcessRepo`。
+//! `.sqlx/query-*.json` 哈希不变；新增的 `ShelfRepoTrait` 胖 trait 在 `repo/mod.rs`。
+//!
+//! 2026-10-02 域拆分：`t_shelf_process` 的 4 个方法与账号计数
+//! `count_accounts_by_shelf` 一并移出本文件 —— 前者搬到
+//! `crate::modules::prod::shelf_process::repo::ShelfProcessRepo`（工序映射归 prod
+//! 域），后者随 `ShelfOut.account_count` 出参取消而删除（账号绑定真源在 iam 域）。
+//! 本文件现在只负责 `t_shelf` 单表。
 
 use sqlx::{PgExecutor, QueryBuilder};
 
@@ -360,32 +364,5 @@ impl ShelfRepo {
         .fetch_one(executor)
         .await?;
         Ok(row.0)
-    }
-
-    /// 计算一组 shelf 各自的 SHELF_ACCOUNT 角色数（GROUP BY）。单条 SQL 批量算。
-    ///
-    /// 用法：`ShelfService::list_shelves` 把 items 的 id 一次性查 account_count，
-    /// 防 N+1。
-    pub async fn count_accounts_by_shelf<'e, E: PgExecutor<'e>>(
-        executor: E,
-        shelf_ids: &[i64],
-    ) -> Result<Vec<(i64, i64)>, sqlx::Error> {
-        if shelf_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<(i64, i64)> = sqlx::query_as(
-            r#"
-            SELECT scope_id, COUNT(*)::bigint
-            FROM t_user_role
-            WHERE scope_type = 'shelf'
-              AND scope_id = ANY($1)
-              AND deleted_at IS NULL
-            GROUP BY scope_id
-            "#,
-        )
-        .bind(shelf_ids)
-        .fetch_all(executor)
-        .await?;
-        Ok(rows)
     }
 }
