@@ -20,7 +20,10 @@
 
 > **2026-10-02 硬切（无 alias）**：旧路径 `GET /api/v2/shelves/processes`、
 > `GET|POST /api/v2/shelves/{id}/processes` 已从 `src/modules/shelf/handler.rs` 彻底删除
-> 并 404。请求 / 响应契约**逐字不变**，前端只需改 URL（沿 2026-09-19 prod 聚合先例）。
+> 并 404。**这 3 个端点本身**请求 / 响应契约逐字不变，前端只需改 URL（沿 2026-09-19
+> prod 聚合先例）。⚠️ 但**整个后端 commit 的前端配套改动不止改 URL** —— 同 commit
+> 删除的 `ShelfOut.account_count` 会打爆前端 Zod 必填字段，完整清单见下方
+> [前端配套改动清单](#前端配套改动清单)，**合入本后端 commit 前必须先落前端 PR**。
 > ⚠️ 例外：`GET /shelves/processes` 现在落到 shelf 域的 `/{id}` 路由上，因 `processes`
 > 非 i64 会被 axum 拒为 **400 纯文本**（非 `R` 信封），而非 404。
 
@@ -130,6 +133,53 @@ Response 200 `data`：`null`
 - 20501 `BIZ_SHELF_NOT_FOUND` —— shelf 不存在 / 已软删
 - 20505 `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND` —— items 里有 process_id 不存在
 - 20104 `BIZ_INVALID_VALUE` —— process_id 非整数
+
+---
+
+## 前端配套改动清单
+
+> ⚠️ 2026-10-02 新增小节。本节纠正此前文档里「前端只改 URL」的说法：**该说法只对
+> 本文档 3 个 mapping 端点成立，对同 commit 删除的 `ShelfOut.account_count`
+> 不成立** —— 后端删字段后前端若不同步，**每次货架列表 / 详情响应都会 Zod 硬失败**
+> （`shelfSchema.account_count` 是必填字段，`useProductionShelvesQuery` 对每个
+> 响应做 `shelfListResultSchema.parse(...)`），不是降级展示而是直接报错。
+
+### A. 3 个 URL 硬切（写路径现在 404）
+
+`src/api/shelves.ts`：
+
+| 前端函数 | 旧 URL | 新 URL | 备注 |
+|---|---|---|---|
+| `getShelfProcesses(id)` | `GET /shelves/{id}/processes` | `GET /prod/shelf-processes/{shelf_id}` | 响应 `ShelfWithProcesses` 逐字不变 |
+| `setShelfProcesses(id, payload)` | `POST /shelves/{id}/processes` | `POST /prod/shelf-processes/{shelf_id}` | **写路径，旧 URL 现在 404**；入参 `items[].process_id` / `items[].sort_order` 逐字不变 |
+| `getAllShelfProcessMappings()` | `GET /shelves/processes` | `GET /prod/shelf-processes` | ⚠️ 旧 URL **不是 404 而是 400 纯文本**（落进 shelf 域 `/{id}` 路由，`processes` 非 i64 被 axum Path 解析拒），前端 axios 侧会拿到非 `R` 信封的裸错误 |
+
+**已知消费者（7 处，需一并核对）**：`src/views/shelves/ShelfList.vue`（`getShelfProcesses`
+/ `setShelfProcesses` 两处）、`src/composables/useShelfProcessFilter.ts`（`getAllShelfProcessMappings`）、
+`src/views/cnc/composables/usePendingProgrammingStore.ts`、
+`src/views/inspection/InspectionPending.vue`、
+`src/views/outsource/composables/useOutsourceReceivingList.ts`、
+`src/views/parts/detail/PartDetail.vue`、`src/views/parts/detail/components/PartCncCard.vue`
+（后 4 处经 `useShelfProcessFilter` / `ShelfWithProcesses` 类型间接消费），
+另有 2 个测试 mock 点（`src/views/cnc/composables/__tests__/usePendingProgrammingStore.spec.ts`）。
+
+### B. `account_count` 出参删除（4 处前端落点 + 1 条回归用例）
+
+| # | 文件 | 现状 | 必改原因 |
+|---|---|---|---|
+| 1 | `src/composables/queries/schemas.ts` | `shelfSchema.account_count: z.number()`（**必填**） | 后端不再下发该字段 → `shelfListResultSchema.parse(...)` 每次抛 `ZodError`，**所有走共享 query 的货架列表/详情页面硬失败**（`ShelfList.vue`、待编程 store、inspection picker 等） |
+| 2 | `src/types/shelf.ts` | `Shelf.account_count: number`（必填字段） | 类型层与后端契约脱节，须删字段并同步 11 字段注释 |
+| 3 | `src/views/shelves/ShelfList.vue` | 表格列 `{ key: 'account_count', label: '账号数' }` | 列渲染恒 `undefined`，须删列 |
+| 4 | `src/composables/queries/schemas.ts` 头部注释 | 列举 `Shelf` 11 字段含 `account_count` | 注释失真，须同步 |
+
+**回归用例**：`src/composables/queries/__tests__/schemas.spec.ts` 的 **S30** 用例断言
+「缺 `account_count` 必抛 ZodError」—— 这条原本把**即将废除的契约**钉成了回归基线。
+前端 PR 必须改写 S30（改为断言「缺 `account_count` **不**抛错」或直接改为针对其它
+必填字段的 strip 陷阱 guard），否则改完 `schemas.ts` 测试必红。
+
+> 后端侧说明：`account_count` 的真源是 iam 域 `t_user_role`（`scope_type='shelf'`），
+> 前端若仍需展示「账号数」，应另走 iam 域用户列表按 `scope_type='shelf'` 聚合，
+> **不要**指望货架域继续下发该字段。
 
 ---
 

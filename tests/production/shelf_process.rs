@@ -9,8 +9,8 @@
 //!    全集查询（新 URL，原 shelf 域 `GET /shelves/processes` 从未被集成测试覆盖）
 //! 3. `set_shelf_processes_rejects_unknown_process` —— items 里 process_id 不存在
 //!    → 20505 `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND`（HTTP 404）
-//! 4. `old_shelf_process_paths_are_gone` —— 硬切验证：3 个旧路径全部 4xx
-//!    （`GET|POST /shelves/{id}/processes` + `GET /shelves/processes`）
+//! 4. `old_shelf_process_paths_are_gone` —— 硬切验证：3 个旧路径按 URI 钉死状态码
+//!    （`GET /shelves/processes` → 400；`GET|POST /shelves/{id}/processes` → 404）
 //!
 //! ## fixture 选择（2026-10-02 判定）
 //! 用 **production fixture**（`load_production_fixture`）而非 shelf fixture：
@@ -281,32 +281,47 @@ async fn set_shelf_processes_rejects_unknown_process() {
     );
 }
 
-/// 硬切验证：3 个旧路径全部不再返回成功（无 alias，沿 2026-09-19 prod 聚合先例）。
+/// 硬切验证：3 个旧路径按 URI **逐个钉死**期望状态码（无 alias，沿 2026-09-19
+/// prod 聚合先例）。
 ///
-/// 注意响应体**不是** `R` 信封：`GET /shelves/processes` 现在落到 shelf 域的
-/// `/{id}` 路由上（`Path<i64>` 解析失败 → axum 返 400 纯文本）；另两个路径无任何
-/// 路由匹配 → 404 空体。故本测试绕过 `send()`（它会 `serde_json::from_str` 解析信封
-/// 而 panic），直接 `app.oneshot(req)` 断言 `!= 200`。
+/// 注意响应体**不是** `R` 信封，故本测试绕过 `send()`（它会
+/// `serde_json::from_str` 解析信封而 panic），直接 `app.oneshot(req)` 断状态码。
+///
+/// 期望值（2026-10-02 review 第 1 轮 M-4 加固：原先只断 `4xx`，误加 403 角色守卫
+/// 或误返 405 也会绿，故按 URI 钉死具体码）：
+/// - `GET /shelves/processes` → **400**：`processes` 落到 shelf 域 `/{id}` 路由，
+///   `Path<i64>` 解析失败被 axum 拒为 400 纯文本（**不是** 404）
+/// - `GET|POST /shelves/{id}/processes` → **404**：该 route 已从 router 整体删除，
+///   无任何匹配
 #[tokio::test]
 async fn old_shelf_process_paths_are_gone() {
     let (_pool, app, token, _fx) = bootstrap_as_manager().await;
 
     let shelf_id_str = PartFixture::PRODUCTION_SHELF_ID.to_string();
-    for (method, uri) in [
-        ("GET", "/shelves/processes".to_string()),
-        ("GET", format!("/shelves/{shelf_id_str}/processes")),
-        ("POST", format!("/shelves/{shelf_id_str}/processes")),
-    ] {
+    let cases: [(&str, String, StatusCode); 3] = [
+        (
+            "GET",
+            "/shelves/processes".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "GET",
+            format!("/shelves/{shelf_id_str}/processes"),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "POST",
+            format!("/shelves/{shelf_id_str}/processes"),
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (method, uri, expected) in cases {
         let req = json_request(method, &uri, Some(json!({ "items": [] })), Some(&token));
         let resp = app.clone().oneshot(req).await.expect("oneshot");
         let status = resp.status();
-        assert!(
-            status != StatusCode::OK,
-            "old path {method} {uri} must be gone (no alias); got: {status}"
-        );
-        assert!(
-            status.is_client_error(),
-            "old path {method} {uri} should be 4xx; got: {status}"
+        assert_eq!(
+            status, expected,
+            "old path {method} {uri} must be gone (no alias) and return {expected}; got: {status}"
         );
     }
 }

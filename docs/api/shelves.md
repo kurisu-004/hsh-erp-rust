@@ -18,7 +18,8 @@
 
 挂载点：`/api/v2/shelves`（见 `src/modules/mod.rs::v2_router`）。
 
-> **2026-10-02 端点数 10 → 7**：3 个货架↔工序映射端点（`GET|POST /shelves/{id}/processes`
+> **2026-10-02 端点数 10 → 7**（⚠️ 文档原写「11」，逐 router 复核后订正为 10：
+> `/` 的 GET+POST 算 2 条 route，合计 2+1+1+1+1+1+1+2 = 10）：3 个货架↔工序映射端点（`GET|POST /shelves/{id}/processes`
 > + `GET /shelves/processes`）已搬到 `src/modules/prod/shelf_process/`，URL 硬切
 > `/api/v2/prod/shelf-processes/*`（**无 alias**），详见
 > [`./production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)。
@@ -226,7 +227,8 @@ Response 200 `data`：`ShelfForInspectionOut`
 | `MockShelfRepoTrait` | 全仓零引用（仅本文件 doc 提及），收缩无影响 |
 | `list_for_return` | `next_process_id` 占位校验删除（20104 / 20801 两条错误码随之消失） |
 | 205xx 错误码 | 数字一律不动：20501~20503 归货架本体；**20504~20508 的「货架↔工序映射」归属改判给 `prod::shelf_process` / `prod::worker_pool` / `prod::batch`**，详见 [`./production/shelf-process-mapping.md#错误码归属2026-10-02-调整说明数字不动`](./production/shelf-process-mapping.md#错误码归属2026-10-02-调整说明数字不动) |
-| 零变更 | `t_shelf` 表结构、迁移、iam 模块、前端 body 形态 |
+| 零变更 | `t_shelf` 表结构、迁移、iam 模块、本域端点的**请求 body** 形态 |
+| ⚠️ **前端配套改动 ≠ 只改 URL** | 删 `account_count` 出参会打爆前端 Zod 必填字段（`shelfSchema.account_count` 必填 → 每次货架列表/详情响应 `parse` 抛 `ZodError`）。完整清单（3 个 URL + `account_count` 4 处落点 + S30 回归用例）见 [`./production/shelf-process-mapping.md#前端配套改动清单`](./production/shelf-process-mapping.md#前端配套改动清单) |
 
 ---
 

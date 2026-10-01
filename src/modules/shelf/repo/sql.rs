@@ -9,13 +9,18 @@
 //! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
 //! - `list_active_production_ordered` 通过 LEFT JOIN `t_part_batch` 聚合 current_load
 //!
-//! ## Phase P3+ shelf CRUD 暴露给 service 的能力（2026-10-02 起 9 静态方法）
+//! ## Phase P3+ shelf CRUD 暴露给 service 的能力（2026-10-02 起 10 静态方法）
 //! - 读：`get_active_by_id` / `get_by_id` / `get_by_id_zone`
 //!   / `list_with_filters` / `count_with_filters` / `list_active_production_ordered`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder）
 //! - 写：`create` / `update` / `soft_delete`（同时 `is_active = false`）
 //! - 引用计数：`count_in_use_parts`（deactivate 前查 t_part_batch.current_holder_id
 //!   + location + status 三维核对，PR-2 真相源迁移后已不再读 t_part）
+//!
+//! 数字依据（2026-10-02 订正）：`repo/mod.rs` 的 `ShelfRepoTrait` 恰好 10 个方法，
+//! impl 逐个一行委托到本文件的同名静态方法，故本文件 `pub async fn` 也是 10 个，
+//! 一一对应无遗漏。master 原写「8」是 `t_shelf_process` 4 方法尚在时对 `t_shelf`
+//! 部分的旧计数，本次随方法搬移一并订正为 10。
 //!
 //! 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff，
 //! `.sqlx/query-*.json` 哈希不变；新增的 `ShelfRepoTrait` 胖 trait 在 `repo/mod.rs`。

@@ -27,7 +27,10 @@
 //!   `<R: ShelfRepoTrait>(&self, mut repo: R, ...)`。
 //! - `repo/{mod, sql}.rs` —— 胖 trait `ShelfRepoTrait`（10 方法 = t_shelf 全部）
 //!   + `impl for &mut PgConnection`（reborrow `&mut **self`）+ `#[cfg_attr(test,
-//!   mockall::automock)]` + `sql.rs` SQL 真源（ZST struct `ShelfRepo` + 9 静态方法）。
+//!   mockall::automock)]` + `sql.rs` SQL 真源（ZST struct `ShelfRepo` + 10 静态方法）。
+//!
+//! 2026-10-02 订正：`ShelfRepo` 静态方法数 master 原写 8，实为 10（随
+//! `t_shelf_process` 4 方法搬出后与 trait 方法数重新对齐）。
 //!
 //! ## 实施约定
 //! - 事务由 handler `pool.begin()` + `tx.commit()` 收（与 20 个 handler 文件现状对齐）；

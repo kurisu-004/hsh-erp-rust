@@ -95,7 +95,6 @@ pub trait ShelfRepoTrait: Send {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<TShelf>, sqlx::Error>;
-    #[allow(clippy::too_many_arguments)]
     async fn count_with_filters<'a>(
         &mut self,
         code_like: Option<&'a str>,
@@ -124,7 +123,6 @@ pub trait ShelfRepoTrait: Send {
         display_order: Option<i32>,
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
-    #[allow(clippy::too_many_arguments)]
     async fn soft_delete(
         &mut self,
         id: i64,
@@ -229,7 +227,6 @@ impl ShelfRepoTrait for &mut PgConnection {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn soft_delete(
         &mut self,
         id: i64,

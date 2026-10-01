@@ -10,13 +10,9 @@
 //! - 读查询一律带 `deleted_at IS NULL`
 //! - 软删 `deleted_at = now()`，无乐观锁（mapping 由 set_shelf_processes 整组替换）
 //!
-//! ## 2026-09-22 重构
-//! 原 `process_mapping.rs`（平级文件）拆分到 `process_mapping/{mod.rs, sql.rs}`，
-//! 本文件 SQL 与方法签名零 diff，`.sqlx/query-*.json` 哈希不变。
-//!
 //! ## 2026-10-02 域归属反转（shelf 域拆分）
-//! 原路径 `src/modules/shelf/process_mapping/sql.rs` —— 货架自身不含工序概念，
-//! 按后端域规约搬到 `src/modules/prod/shelf_process/repo.rs`：
+//! 自 `src/modules/shelf/process_mapping/sql.rs` **整文件平移**到本文件（本仓内
+//! 平级单文件形态，不是 `sql.rs`/`mod.rs` 目录拆分的继任者）：
 //! - 4 个「平移」方法（`list_by_shelf` / `list_all_active_mappings` /
 //!   `soft_delete_all_for_shelf` / `bulk_insert`）SQL 与方法签名**零 diff**
 //! - 新增 2 个「收口」方法（`find_first_shelf_for_process` /

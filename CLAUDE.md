@@ -119,12 +119,15 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 |---|---:|---|---|---|
 | `prod::worker` | 7 | `/api/v2/prod/workers` | `t_worker` | 工人档案主数据 |
 | `prod::work_type` | 7 | `/api/v2/prod/work-types` | `t_work_type` + `t_work_type_process` | 工种 CRUD 5 + 工种↔工序映射 2 |
-| `prod::process` | 6 | `/api/v2/prod/processes` | `t_process` | 工序主数据（INHOUSE/OUTSOURCE） |
+| `prod::process` | 5 | `/api/v2/prod/processes` | `t_process` | 工序主数据（INHOUSE/OUTSOURCE）；**2026-10-02 订正**：文档原写 6，逐 router 复核为 5（`/` 的 GET+POST 算 2 条 route） |
 | `prod::process_chain` | 3 | `/api/v2/prod/process-chains` | `t_part_process_chain` + `t_process_chain_step` | 工单工艺链 |
+| `prod::shelf_process` | 3 | `/api/v2/prod/shelf-processes` | `t_shelf_process` | **2026-10-02 新增**：货架 ↔ 工序映射，自 `src/modules/shelf/process_mapping/` 搬入（`t_shelf_process` 关联的是 prod 域实体 `t_process`）。旧路径 `GET|POST /api/v2/shelves/{id}/processes` + `GET /api/v2/shelves/processes` 已删除（**无 alias**），这 3 个端点请求 / 响应契约逐字不变；但同 commit 删的 `account_count` 出参会打爆前端 Zod 必填字段，**前端配套改动清单见 `docs/api/production/shelf-process-mapping.md#前端配套改动清单`** |
 | `prod::worker_pool` | 6 | `/api/v2/prod/pool` | `t_part_batch`（候选池视图） | 工人候选池（2026-09-30 `/worker-pool` + `/admin/worker-pool` 双 nest 合并为 `/pool`；**2026-10-02 订正**：文档原写 5，实际 6 条 route） |
 | `prod::batch` | 3 | `/api/v2/prod/batches` | `t_part_batch` | 待下发批次（2026-09-29 新增） |
 | `prod::programming` | 1 | `/api/v2/prod/programming` | `t_part` + `t_part_batch` + chain | 待编程一览（2026-10-01 新增） |
-| `prod::shelf_process` | 3 | `/api/v2/prod/shelf-processes` | `t_shelf_process` | **2026-10-02 新增**：货架 ↔ 工序映射，自 `src/modules/shelf/process_mapping/` 搬入（`t_shelf_process` 关联的是 prod 域实体 `t_process`）。旧路径 `GET|POST /api/v2/shelves/{id}/processes` + `GET /api/v2/shelves/processes` 已删除（**无 alias**），请求 / 响应契约逐字不变 |
+
+> 表内 8 个子模块端点求和 = 7 + 7 + 5 + 3 + 3 + 6 + 3 + 1 = **35**，与
+> `docs/api/production/index.md` 的 prod 总数一致。
 
 **2026-10-02 shelf 域拆分**（依据「货架自身包括了账号的部分和工序映射相关的部分，
 应拆分到 iam 域和 prod 域」）：
@@ -136,7 +139,14 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
   shelf 侧 2 个反向 helper（`proc_check_process_exists` /
   `proc_list_existing_process_ids`）删除，`ShelfRepoTrait` 17 → **10** 方法
   （全部 `t_shelf`）
-- 端点数：shelf 11 → **7**；prod 32 → **35**（+3）。⚠️ 文档原写 prod「31」，系 `prod::worker_pool` 计数残留（标题写 5、router 实为 6 route），本次顺带订正；按旧账记为 31 → 34，实际 +3 后为 35
+- 端点数：shelf **10 → 7**；prod 32 → **35**（+3）。⚠️ 两条基线均系旧文档计数
+  残留，本次逐 router 复核后顺带订正：
+  - shelf 侧：文档原写「11」，实为 **10**（`/` 的 GET+POST 算 2 条 route，master 上
+    `handler.rs` 自己的 doc 写「写 5」却只列了 4 个 write handler，两处都对不上）；
+  - prod 侧：文档原写「31」，系 `prod::worker_pool` 计数残留（标题写 5、router
+    实为 6 route），实为 **32**；
+  - 故 prod 的净变化是 32 → 35（+3），而非按旧账记的 31 → 34。
+  订正后的 prod 35 端点与本节上表求和一致（7+7+5+3+6+3+1+3）
 - `t_shelf_process` 的 SQL 真源**只在** `prod::shelf_process::repo::ShelfProcessRepo`
   （6 个静态方法 = 平移 4 + 从 `prod::batch` / `prod::worker_pool` 各收 1 处）。
   故意保留 inline 的 3 处见 `docs/api/production/shelf-process-mapping.md#维护约定`
