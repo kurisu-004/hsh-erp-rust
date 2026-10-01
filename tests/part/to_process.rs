@@ -414,3 +414,76 @@ async fn insert_part_with_batch_qty(
     .expect("insert batch");
     (part_id, batch_id)
 }
+
+/// to-process 拒绝**返修中**的批次 → 400 / 20118（2026-10-01 review 第 2 轮 MAJOR-3）。
+///
+/// 背景：REPAIRING 降级为 `is_repairing` 标记列后，返修批次的 `status` 就是
+/// `IN_PROCESS` / `INSPECTION`，`to-process` 的 `allowed_from = ["INSPECTION"]`
+/// 拦不住它了。可达链：`start-repair` → `to-inspection`（送检**保持**标记，
+/// `mark_batch_inspected` 的 `is_repairing: None`）→ 本端点。放行的话批次会落到
+/// 生产架却仍挂「返修中」标记（`GET /parts/repairing-batches` 长期显示异常、
+/// `complete-repair` 仍接受它）。
+///
+/// 断言三件事：
+/// 1. HTTP 400 + `code == 20118`（与「重复起修」同族的「返修流转前置条件不满足」）；
+/// 2. 消息点名 `complete-repair`（前端据此引导用户改调哪个端点）；
+/// 3. **零副作用**：批次仍是 `INSPECTION` + `is_repairing = true` + 未挂生产架。
+#[tokio::test]
+async fn to_process_rejects_repairing_batch() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0",
+        fx.customer_l2_id,
+        Some("P000"),
+        "INSPECTION",
+        "INSPECTION",
+    )
+    .await;
+    // 造「送检中的返修件」形态：status='INSPECTION' + is_repairing=true
+    // （与 `tests/part/repair.rs` 里直插标记列的做法同形）。
+    sqlx::query("UPDATE t_part_batch SET is_repairing = true WHERE id = $1")
+        .bind(batch_id)
+        .execute(&pool)
+        .await
+        .expect("flag batch as repairing");
+    // part 绑工艺链 + step：保证**唯一**的拒绝理由是返修守卫（若守卫被删，
+    // 本请求会一路成功 → 测试红）。
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/parts/{part_id}/to-process"),
+            Some(json!({
+                "shelf_id": fx.production_shelf_id.to_string(),
+                "next_process_id": fx.process_id.to_string(),
+                "batch_id": batch_id.to_string(),
+                "version": v,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body={body}");
+    assert_eq!(body["code"], 20118, "BIZ_PART_REPAIR_NOT_TRIGGERED: {body}");
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("complete-repair"),
+        "消息必须点名改调 complete-repair（前端据此引导）: {msg}"
+    );
+
+    // 零副作用
+    let (bstatus, is_repairing, location): (String, bool, Option<String>) =
+        sqlx::query_as("SELECT status, is_repairing, location FROM t_part_batch WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read batch");
+    assert_eq!(bstatus, "INSPECTION", "被拒的请求不得改批次状态");
+    assert!(is_repairing, "被拒的请求不得清/改返修标记");
+    assert_eq!(location, None, "被拒的请求不得把批次挂到生产架");
+}

@@ -57,8 +57,9 @@ t_assembly.status     ← 派生缓存
 |---|---|---|---|
 | `part_ids` | string[]? | ❌ | 指定要重算的 `t_part.id` 列表（i64 → JSON 字符串）。**不给 = 不重算 part**（除非整体走全量简写） |
 | `assembly_ids` | string[]? | ❌ | 指定要重算的 `t_assembly.id` 列表。**不给 = 不重算装配件**（同上） |
-| `limit` | int? | ❌ | 「不限 id」时每个列表最多处理多少行。默认 `1000`，上限 `10000`；`≤0` 或超上限 → `20104` |
-| `after_id` | string? | ❌ | **续扫游标**（i64 → JSON 字符串）：只处理 `id > after_id` 的行。缺省 = 从最小 id 开始 |
+| `limit` | int? | ❌ | 「不限 id」时**每张表**最多处理多少行。默认 `1000`，上限 `10000`；`≤0` 或超上限 → `20104` |
+| `part_after_id` | string? | ❌ | `t_part` 段的**续扫游标**（i64 → JSON 字符串）：只处理 `t_part.id > part_after_id` 的行。缺省 = 从最小 id 开始 |
+| `assembly_after_id` | string? | ❌ | `t_assembly` 段的**续扫游标**：只处理 `t_assembly.id > assembly_after_id` 的行。缺省 = 从最小 id 开始 |
 
 作用域（`scope`）由「给了哪些 id 列表」决定，**缺一个不等于全量**：
 
@@ -75,17 +76,35 @@ t_assembly.status     ← 派生缓存
 反序会让本轮刚修正的 part 不被计进父件聚合（要等下一次调用才对齐，破坏
 「调一次就收敛」的直觉）。
 
-**全量对账如何扫完整表**（2026-10-01 review 第 1 轮 M7 新增）：响应里
-`truncated = true` 时，把 `data.next_after_id` **原样回传**为下一次请求的
-`after_id`，重复调用直到 `truncated = false` 即已覆盖全表。
+**全量对账如何扫完整表**（2026-10-01 review 第 1 轮 M7 新增游标，第 2 轮 MAJOR-2
+拆成两个）：响应里 `truncated = true` 时，把 `data.next_part_after_id` /
+`data.next_assembly_after_id` 中**非 null** 的值**原样回传**为下一次请求的
+`part_after_id` / `assembly_after_id`，重复调用直到 `truncated = false` 即两段都扫完：
 
-> 此前本端点只有 `ORDER BY id LIMIT n+1`、**既无游标也无 offset** ——
-> `truncated = true` 时运维再调一次仍然从最小的 `limit` 行开始扫，**永远收敛不了**，
-> 一个兜底端点在生产数据量下兜不住底，只能靠手工分页查 id 再显式贴回来。
+```text
+p = a = null
+loop {
+  r = POST { part_after_id: p, assembly_after_id: a, limit }
+  if r.truncated == false: break            # 两段都扫完
+  p = r.next_part_after_id      ?? p        # null = 该段本轮无可处理行 → 游标不动
+  a = r.next_assembly_after_id  ?? a
+}
+```
+
+> 收敛性保证：`truncated = true` 至少意味着有一段取满了 `limit + 1` 行，即该段本轮
+> 处理了 `limit ≥ 1` 行、游标必然推进 ⇒ 循环必然终止。
+
+> **为什么必须是两个游标**（review 第 2 轮 MAJOR-2）：`t_part` 与 `t_assembly` 的
+> id 来自**同一个** `state.snowflake`（建父装配件与建子件都用它），两表 id 在时间序
+> 上**交错**。第 1 轮的实现让两段共用一个 `after_id`、回一个
+> `next_after_id = max(part_max, assembly_max)`：当两表行数都 `> limit` 时，
+> 第 2 轮起 assembly 窗口从 `part_max` 起步，`(assembly_max, part_max]` 区间那一段
+> 装配件**永远扫不到**，而循环仍以 `truncated = false` 收尾 —— 报告谎称「已覆盖
+> 全表」。现在两段各自推进，交错 id 不再互相吞窗口。
 >
-> 已知取舍：`t_part` 与 `t_assembly` 的 id 空间互不相交但共用一个 `after_id`
-> 字段，故 `next_after_id` 取两段窗口里**较大**的那个 —— 严格覆盖请对两段分别用
-> `part_ids` / `assembly_ids` 定点跑（端点本就支持）。
+> 回归测试：`tests/part/rollup_recompute.rs::
+> recompute_rollup_full_scope_covers_interleaved_part_and_assembly_ids`
+> （两表 id 交错造数据，断言续扫到收敛后**两条**漂移都被修正）。
 
 ### Response 200
 
@@ -97,10 +116,13 @@ t_assembly.status     ← 派生缓存
 | `parts_examined` | int | 本次实际跑过派生的 part 数 |
 | `parts_changed` | int | `t_part.status` 真变了的 part 数 |
 | `parts_next_process_id_fixed` | int | `t_part.next_process_id` 被修正的 part 数（status 没变、只有工序指针漂移也计入——那会让派工指到上一道工序） |
+| `parts_skipped_terminal` | int | **已终态**（`COMPLETED`/`CANCELLED`）而派生写被终态守卫跳过的 part 数（≠「数据已一致」，见下方「终态守卫」） |
+| `skipped_terminal` | object[] | 上一条的逐条明细，元素 = `{ id, current, derived }` |
 | `assemblies_examined` | int | 本次跑过聚合的装配件数 |
 | `assemblies_changed` | int | `t_assembly.status` 真变了的数 |
-| `truncated` | bool | 命中 `limit` 上限、**还有行没扫到** |
-| `next_after_id` | string? (i64) | 续扫游标：本轮已处理的最大 id。仅 `truncated = true` 时非 null，回传为下次请求的 `after_id` |
+| `truncated` | bool | 命中 `limit` 上限、**至少一张表**还有行没扫到 |
+| `next_part_after_id` | string? (i64) | `t_part` 段续扫游标 = 本轮该段已处理的最大 id；`null` = 该段本轮无可处理行。回传为下次请求的 `part_after_id` |
+| `next_assembly_after_id` | string? (i64) | `t_assembly` 段续扫游标，语义同上；回传为 `assembly_after_id` |
 | `changes` | object[] | 逐条 before → after（**只含真变了的**） |
 
 `changes[]` 元素：
@@ -120,13 +142,18 @@ t_assembly.status     ← 派生缓存
   "message": "ok",
   "data": {
     "scope": "PART_IDS",
-    "parts_examined": 1,
+    "parts_examined": 2,
     "parts_changed": 1,
     "parts_next_process_id_fixed": 0,
+    "parts_skipped_terminal": 1,
+    "skipped_terminal": [
+      { "id": "9000000000000102", "current": "COMPLETED", "derived": "INSPECTION" }
+    ],
     "assemblies_examined": 0,
     "assemblies_changed": 0,
     "truncated": false,
-    "next_after_id": null,
+    "next_part_after_id": null,
+    "next_assembly_after_id": null,
     "changes": [
       { "level": "PART", "id": "9000000000000101", "from": "PENDING", "to": "COMPLETED" }
     ]
@@ -137,6 +164,8 @@ t_assembly.status     ← 派生缓存
 **什么都不需要改时仍返回 200**（不是错误）：`parts_changed = 0`、
 `changes = []`。幂等是**成功**语义，前端据此把按钮置灰 / 展示「数据已一致」。
 
+⚠️ 但「数据已一致」的判据必须**同时**看 `parts_skipped_terminal == 0`：见下节。
+
 ### 附带效果
 
 - part 被推进到终态（`COMPLETED` / `CANCELLED`）时，`rollup_part_derived` 的
@@ -144,14 +173,30 @@ t_assembly.status     ← 派生缓存
   note 记原序列号）再清 `t_part.serial_no`。即对账也补做序列号释放。
   与业务流完全同一段代码，故不会重复释放（每个 part 至多 1 条归档事件）。
 - 父装配件进终态时清 `t_assembly.serial_no`（不归档，`t_assembly` 无事件表）。
+### 终态守卫：被跳过的行**必须**单独上报（2026-10-01 review 第 2 轮 MAJOR-1）
+
 - **已终态的 part 不参与对账**（2026-10-01 review 第 1 轮 B1）：
   `update_part_rollup` 带 `status NOT IN ('COMPLETED','CANCELLED')` 守卫 ——
   「派生层不得覆盖主操作」在 SQL 层的兜底（`POST /parts/{id}/cancel` 会先把
   part 打成 CANCELLED，随后批次的级联派生不许把它推回 COMPLETED）。
-  代价：一个**本来就错了**的终态 part（例如历史脏数据里 `t_part.status='COMPLETED'`
+- 代价：一个**本来就错了**的终态 part（例如历史脏数据里 `t_part.status='COMPLETED'`
   而批次还在 INSPECTION）无法靠本端点自动纠正 —— 那需要一次人工决策（究竟哪个是
-  真的），由派生算法替运营做决定比不做更危险。这类行请用 `part_ids` 定点排查
-  `t_part_event` 事件流水后人工修正。
+  真的），由派生算法替运营做决定比不做更危险。
+- **报告口径**：这类行既不进 `changes`（守卫命中时一个字节都没写），也**不等于**
+  「数据已一致」。故第 2 轮把 `status_gate::RollupOutcome::terminal_skip` 上抛，
+  报告给出 `parts_skipped_terminal` + `skipped_terminal[{id, current, derived}]`。
+  此前这里只有一条 `tracing::warn!`，运维从报告里看到的
+  `parts_examined=1 / parts_changed=0` 与「数据本来就一致」**不可区分** ——
+  即「兜底修数工具给假干净报告」，与本端点要消灭的失败类别同类。
+- **人工怎么修**（订正第 1 轮文档里那条不可能成立的建议）：守卫对**定点路径同样
+  生效**，所以「用 `part_ids` 定点跑一遍」**不可能**改掉终态行。可行路径只有两条：
+  1. 若 `derived`（min-progress 派生值）**就是**你想要的终态 → 用
+     `POST /parts/{id}/force-complete`（Manager 逃生通道，明确绕过状态机）或
+     `POST /parts/{id}/cancel` 重写一次 `t_part.status`；
+  2. 若批次侧才是错的一方（批次还在 INSPECTION 而 part 已 COMPLETED）→ 走业务流把
+     批次推到终态（`scan-inspect` / `to-ship` / `worker-scan` …），下一次对账时
+     part 已是终态、派生值自洽，该行自然不再被计入 `parts_skipped_terminal`。
+  `t_part_event` 事件流水可用于判断「哪一边是历史真相」。
 
 ### 事务 / 并发
 
@@ -170,7 +215,8 @@ t_assembly.status     ← 派生缓存
 |---|---|
 | `ROLLUP_RECOMPUTED` | `{ scope, parts_changed, assemblies_changed, operator_id }` |
 
-幂等空跑**不发**广播（避免大屏无意义刷新）。
+幂等空跑**不发**广播（避免大屏无意义刷新）。`parts_skipped_terminal > 0` 同样
+**不发**：守卫命中时没有任何数据被改，发「已重算」事件会让大屏误以为数据变了。
 
 ### 错误码
 
@@ -195,9 +241,11 @@ Manager 单角色，口径一致。
 
 ## 参考
 
-- 集成测试：`tests/part/rollup_recompute.rs`（5 用例：part 定点修正 + 幂等 +
+- 集成测试：`tests/part/rollup_recompute.rs`（8 用例：part 定点修正 + 幂等 +
   序列号释放归档 / assembly 反向漂移修正 + 幂等 / RBAC 403 且不改数据 /
-  无 body = 全量 + `limit` 超上限 400）
+  无 body = 全量 / `limit` 超上限 400 / `part_after_id` 游标续扫收敛 /
+  **两表 id 交错的续扫收敛**（MAJOR-2 回归）/ 终态守卫跳过时 `parts_skipped_terminal`
+  与 `skipped_terminal` 明细上抛（MAJOR-1 回归））
 - 复用的既有派生实现（**一行算法都没重写**）：
   - part：`src/modules/part/service/status_gate.rs::rollup_part_derived`
   - assembly：`src/modules/assembly/service/sync_from_part.rs::sync_assembly_status`

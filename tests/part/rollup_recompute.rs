@@ -16,9 +16,17 @@
 //! 5. `recompute_rollup_rejects_limit_over_cap`
 //!    —— `limit` 超上限 → 400 / `20104`（防止单请求锁住全表）。
 //! 6. `recompute_rollup_full_scope_advances_by_after_id_cursor`
-//!    —— 全量对账的 `after_id` 游标续扫：单轮 `limit=1` + 回传 `next_after_id`
-//!    直到 `truncated=false`，必须**单调推进**且把所有漂移各修正一次
-//!    （2026-10-01 review 第 1 轮 M7：改造前没有游标，重复调用永远从最小 id 重扫）。
+//!    —— 全量对账的 `part_after_id` 游标续扫：单轮 `limit=1` + 回传
+//!    `next_part_after_id` 直到 `truncated=false`，必须**单调推进**且把所有漂移
+//!    各修正一次（2026-10-01 review 第 1 轮 M7：改造前没有游标，重复调用永远从
+//!    最小 id 重扫）。
+//! 7. `recompute_rollup_full_scope_covers_interleaved_part_and_assembly_ids`
+//!    —— **两表 id 交错**的续扫（2026-10-01 review 第 2 轮 MAJOR-2）：`t_part` 与
+//!    `t_assembly` 的 id 来自同一个雪花流、按时间序交错，共用一个游标会永久跳过
+//!    `(assembly_max, part_max]` 那段装配件却仍报 `truncated=false`。
+//! 8. `recompute_rollup_reports_parts_skipped_by_terminal_guard`
+//!    —— 终态守卫跳过必须**显式上报**（第 2 轮 MAJOR-1）：`parts_skipped_terminal`
+//!    + `skipped_terminal[{id,current,derived}]`，与「数据已一致」可区分。
 //!
 //! ## 为什么这组测试重要
 //!
@@ -409,16 +417,16 @@ async fn recompute_rollup_rejects_limit_over_cap() {
     assert_eq!(body["code"], code::BIZ_INVALID_VALUE);
 }
 
-/// 6. 全量对账的**游标续扫**（2026-10-01 review 第 1 轮 M7）。
+/// 6. 全量对账的**游标续扫**（2026-10-01 review 第 1 轮 M7，第 2 轮改名分表）。
 ///
 /// 改造前 `list_part_ids` 只有 `ORDER BY id LIMIT limit+1`、**既无游标也无
 /// offset**：`truncated = true` 时运维再调一次仍然从最小的 `limit` 行开始扫 ——
 /// 一个兜底端点在生产数据量下永远兜不住底。
 ///
 /// 断言链：
-/// 1. `limit=1` → `truncated=true` 且 `next_after_id` 非 null；
-/// 2. 把 `next_after_id` 回传为 `after_id` → `parts_examined` 落在**下一批** id 上
-///    （与第 1 轮不重叠）；
+/// 1. `limit=1` → `truncated=true` 且 `next_part_after_id` 非 null；
+/// 2. 把 `next_part_after_id` 回传为 `part_after_id` → `parts_examined` 落在**下一批**
+///    id 上（与第 1 轮不重叠）；
 /// 3. 一直续扫到 `truncated=false`，所有漂移都被修正（真收敛，不是原地打转）。
 #[tokio::test]
 async fn recompute_rollup_full_scope_advances_by_after_id_cursor() {
@@ -440,14 +448,14 @@ async fn recompute_rollup_full_scope_advances_by_after_id_cursor() {
     }
     drifted.sort_unstable();
 
-    let mut after_id: Option<String> = None;
+    let mut part_after_id: Option<String> = None;
     let mut rounds = 0usize;
     let mut seen: Vec<i64> = Vec::new();
     loop {
         rounds += 1;
         assert!(rounds <= 20, "续扫 20 轮仍未收敛 = 游标没生效");
-        let body_json = match &after_id {
-            Some(a) => json!({ "limit": 1, "after_id": a }),
+        let body_json = match &part_after_id {
+            Some(a) => json!({ "limit": 1, "part_after_id": a }),
             None => json!({ "limit": 1 }),
         };
         let (st, body) = send(
@@ -469,23 +477,21 @@ async fn recompute_rollup_full_scope_advances_by_after_id_cursor() {
             }
         }
         if data["truncated"] == false {
-            assert!(
-                data["next_after_id"].is_null(),
-                "末轮（truncated=false）不应再给续扫游标"
-            );
             break;
         }
-        let next = data["next_after_id"]
+        let next = data["next_part_after_id"]
             .as_str()
-            .unwrap_or_else(|| panic!("round {rounds}: truncated=true 必须回 next_after_id"))
+            .unwrap_or_else(|| {
+                panic!("round {rounds}: truncated=true 必须回 next_part_after_id（本段取满了 limit 行）")
+            })
             .to_string();
-        if let Some(prev) = &after_id {
+        if let Some(prev) = &part_after_id {
             assert!(
                 next > *prev,
                 "游标必须单调推进：{prev} → {next}（否则永远收敛不了）"
             );
         }
-        after_id = Some(next);
+        part_after_id = Some(next);
     }
     seen.sort_unstable();
     seen.dedup();
@@ -500,4 +506,210 @@ async fn recompute_rollup_full_scope_advances_by_after_id_cursor() {
             "part {pid} 应已被对账修正"
         );
     }
+}
+
+/// 7. **两表 id 交错**的全量续扫（2026-10-01 review 第 2 轮 MAJOR-2 回归）。
+///
+/// `t_part` 与 `t_assembly` 的 id 来自**同一个** `state.snowflake`（建父装配件与
+/// 建子件都用它），两表 id 在时间序上**交错**。第 1 轮的实现让两段共用一个
+/// `after_id`、回一个 `next_after_id = max(part_max, assembly_max)`：本用例的
+/// id 布局是 `A1 < A2 < P1 < P2 < P3`，第 1 轮的单游标会直接跳到 `P1`，
+/// 于是 **`A2` 永远扫不到**，而循环仍以 `truncated=false` 收尾 —— 报告谎称
+/// 「已覆盖全表」。
+///
+/// 断言：
+/// 1. 两个游标**独立**推进（响应同时给 `next_part_after_id` / `next_assembly_after_id`）；
+/// 2. 续扫到 `truncated=false` 后，`A1`/`A2` 两条装配件漂移**都**被修正
+///    （旧实现下 `A2` 仍是 PENDING ⇒ 本用例红）；
+/// 3. 3 条 part 漂移也都被修正。
+#[tokio::test]
+async fn recompute_rollup_full_scope_covers_interleaved_part_and_assembly_ids() {
+    let (pool, app, token, _inspector, fx) = bootstrap().await;
+    // ⚠️ 插入顺序 = id 顺序（`next_test_id` 单调）：先两个**父装配件**，再它们的
+    // 子件（子件要引用父件 id，DB 无物理外键，故 id 可以先于父件分配）。
+    let asm1 = insert_drifted_assembly(&pool, fx.customer_l2_id, "PENDING").await;
+    let asm2 = insert_drifted_assembly(&pool, fx.customer_l2_id, "PENDING").await;
+    // 子件侧自洽（part 与 batch 都 INSPECTION）→ 父件派生值 = INSPECTION
+    for (asm, tag) in [(asm1, "A1"), (asm2, "A2")] {
+        let pid = insert_drifted_part(
+            &pool,
+            fx.customer_l2_id,
+            &format!("自洽子件-{tag}"),
+            None,
+            "INSPECTION",
+            Some(asm),
+        )
+        .await;
+        insert_batch_with_status(&pool, pid, "INSPECTION").await;
+    }
+    // 第 3 条 part 自身漂移（part PENDING / batch INSPECTION）
+    let drifted_part = insert_drifted_part(
+        &pool,
+        fx.customer_l2_id,
+        "漂移件-交错",
+        None,
+        "PENDING",
+        None,
+    )
+    .await;
+    insert_batch_with_status(&pool, drifted_part, "INSPECTION").await;
+
+    // 续扫：每轮 limit=1，两个游标各自推进
+    let mut part_cursor: Option<String> = None;
+    let mut asm_cursor: Option<String> = None;
+    let mut rounds = 0usize;
+    let mut seen_assemblies: Vec<i64> = Vec::new();
+    loop {
+        rounds += 1;
+        assert!(rounds <= 20, "续扫 20 轮仍未收敛 = 游标没生效");
+        let mut body_json = json!({ "limit": 1 });
+        if let Some(c) = &part_cursor {
+            body_json["part_after_id"] = json!(c);
+        }
+        if let Some(c) = &asm_cursor {
+            body_json["assembly_after_id"] = json!(c);
+        }
+        let (st, body) = send(
+            app.clone(),
+            json_request("POST", URL, Some(body_json), Some(&token)),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "round {rounds}: {body}");
+        let data = &body["data"];
+        for c in data["changes"].as_array().expect("changes") {
+            if c["level"] == "ASSEMBLY" {
+                seen_assemblies.push(c["id"].as_str().unwrap().parse().unwrap());
+            }
+        }
+        if data["truncated"] == false {
+            break;
+        }
+        // 至少一段本轮取满了 limit 行 ⇒ 至少一个游标必须非 null 且前进
+        let mut advanced = false;
+        for (field, cursor) in [
+            ("next_part_after_id", &mut part_cursor),
+            ("next_assembly_after_id", &mut asm_cursor),
+        ] {
+            if let Some(next) = data[field].as_str() {
+                if cursor.as_deref() != Some(next) {
+                    advanced = true;
+                }
+                *cursor = Some(next.to_string());
+            }
+        }
+        assert!(
+            advanced,
+            "round {rounds}: truncated=true 但两个游标都没前进 = 死循环"
+        );
+    }
+    seen_assemblies.sort_unstable();
+    seen_assemblies.dedup();
+    let mut expected = vec![asm1, asm2];
+    expected.sort_unstable();
+    assert_eq!(
+        seen_assemblies, expected,
+        "两条装配件漂移都必须被修正（MAJOR-2：旧单游标会永久跳过 A2）"
+    );
+    assert_eq!(assembly_status_str(&pool, asm1).await, "INSPECTION");
+    assert_eq!(
+        assembly_status_str(&pool, asm2).await,
+        "INSPECTION",
+        "A2 的 id 落在 (asm1, part_max] 区间：共用游标时它永远扫不到"
+    );
+    assert_eq!(part_status_str(&pool, drifted_part).await, "INSPECTION");
+}
+
+/// 8. 终态守卫跳过的行必须**显式上报**（2026-10-01 review 第 2 轮 MAJOR-1 回归）。
+///
+/// 守卫命中时库里的值一个字节都没动，报告若不区分，运维看到的就是
+/// `parts_examined=1 / parts_changed=0` —— 与「数据本来就一致」完全同形，
+/// 即「兜底修数工具给假干净报告」。
+///
+/// 本用例一次调用里放两行：
+/// - `terminal_part`：`t_part.status='COMPLETED'` 而批次还在 INSPECTION
+///   （历史脏数据）→ 派生值 INSPECTION 被终态守卫拦下；
+/// - `fixable_part`：part PENDING / 批次 INSPECTION → 正常被修正。
+///
+/// 断言：`parts_changed=1`（只有可修的那行）、`parts_skipped_terminal=1`、
+/// `skipped_terminal[0] = {id, current: COMPLETED, derived: INSPECTION}`、
+/// `changes` 里**只有**可修那条，且终态行的库值没被改。
+#[tokio::test]
+async fn recompute_rollup_reports_parts_skipped_by_terminal_guard() {
+    let (pool, app, token, _inspector, fx) = bootstrap().await;
+    let terminal_part = insert_drifted_part(
+        &pool,
+        fx.customer_l2_id,
+        "终态但错-对账",
+        Some("RC-T1"),
+        "COMPLETED",
+        None,
+    )
+    .await;
+    insert_batch_with_status(&pool, terminal_part, "INSPECTION").await;
+    let fixable_part = insert_drifted_part(
+        &pool,
+        fx.customer_l2_id,
+        "可修-对账",
+        Some("RC-T2"),
+        "PENDING",
+        None,
+    )
+    .await;
+    insert_batch_with_status(&pool, fixable_part, "INSPECTION").await;
+
+    let (st, body) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            URL,
+            Some(json!({
+                "part_ids": [terminal_part.to_string(), fixable_part.to_string()],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "body={body}");
+    let data = &body["data"];
+    assert_eq!(data["parts_examined"], 2);
+    assert_eq!(data["parts_changed"], 1, "只有非终态那行可被修正");
+    assert_eq!(
+        data["parts_skipped_terminal"], 1,
+        "终态被守卫跳过必须单独计数：{data}"
+    );
+    let skipped = data["skipped_terminal"]
+        .as_array()
+        .expect("skipped_terminal");
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0]["id"], terminal_part.to_string());
+    assert_eq!(skipped[0]["current"], "COMPLETED");
+    assert_eq!(
+        skipped[0]["derived"], "INSPECTION",
+        "min-progress 派生值应上抛"
+    );
+    // changes 里**只有**真被改的那行（被守卫跳过的行不进 changes）
+    assert_single_change(data, "PART", fixable_part, "PENDING", "INSPECTION");
+    // 终态行的值没被动过（守卫仍生效）
+    assert_eq!(part_status_str(&pool, terminal_part).await, "COMPLETED");
+
+    // 幂等：重跑仍是同一份报告（终态行仍被跳过、仍显式计数）
+    let (st, body) = send(
+        app,
+        json_request(
+            "POST",
+            URL,
+            Some(json!({
+                "part_ids": [terminal_part.to_string(), fixable_part.to_string()],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "重复对账不得报错；body={body}");
+    let data = &body["data"];
+    assert_eq!(data["parts_changed"], 0, "幂等契约");
+    assert_eq!(
+        data["parts_skipped_terminal"], 1,
+        "被守卫跳过的行不因重跑而消失（它需要人工决策）"
+    );
 }

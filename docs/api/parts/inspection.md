@@ -283,6 +283,17 @@ Request：`ToProcessRequest`
 - 终点状态：`IN_PROCESS`（`location='PRODUCTION_SHELF'` + `current_holder_id=shelf.id` + `next_process_id`）
 - 多轮 rollup 守卫：同 `to-ship` —— 若 part 下还有其它 INSPECTION 批次，**part.status 保持 `INSPECTION`**
 - 事件日志：`event_type='INSPECTION_FAILED'`
+- ⚠️ **返修守卫（2026-10-01 review 第 2 轮 MAJOR-3）**：目标批次
+  `is_repairing = true`（返修中）→ **20118** 拒绝，请改调
+  [`POST /parts/{part_id}/complete-repair`](./lifecycle.md#post-apiv2partspart_idcomplete-repair)。
+  理由：to-process 表达「检验不合格、回**正常生产流**继续做」，而 complete-repair
+  才是**唯一**被授权清 `is_repairing` 的动作（它同样把批次落到生产架 + 写目标工序）。
+  放行的话批次会停在生产架却仍挂「返修中」标记，在 `GET /parts/repairing-batches`
+  里长期显示异常，且 complete-repair 仍会接受它（用户可把普通在制品当「完成返修」
+  搬走）。可达链：`start-repair` → `to-inspection`（送检**保持**标记）→ 本端点；
+  `scan-inspect(pass=false)` 那条链**不成立**（它的第二步把批次写成
+  `status='IN_PROCESS'`，而本端点只捞 `status='INSPECTION'` 的批次）。
+  改造前不可能发生：返修批次 `status='REPAIRING'`，不在 `allowed_from=["INSPECTION"]` 里。
 
 WS 广播（commit 后下发）：
 
@@ -303,6 +314,7 @@ Response 200 `data`：`ToXxxOut`
 - 20104 BIZ_INVALID_VALUE — part 状态字段不在 enum 白名单；或 shelf 不在 PRODUCTION 区
 - 20109 BIZ_PART_BATCH_NOT_FOUND — `batch_id` 不存在 / 不属于该工单 / 已划掉；或其状态不是 `INSPECTION`
 - 20111 BIZ_PART_BATCH_INVALID_QUANTITY — `quantity ≤ 0`
+- 20118 BIZ_PART_REPAIR_NOT_TRIGGERED — 目标批次**处于返修中**（`is_repairing = true`）；应改调 `complete-repair`（HTTP 400）
 - 20501 BIZ_SHELF_NOT_FOUND — `shelf_id` 不存在
 - 20507 BIZ_SHELF_PROCESS_NOT_MAPPED — `shelf_id` ↔ `next_process_id` 未映射（shelf 域 2026-08-26 已上线，**现已在 service 内触发**）
 - 20512 BIZ_SHELF_INACTIVE — `shelf.is_active = false`

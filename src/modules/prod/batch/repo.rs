@@ -227,9 +227,9 @@ impl BatchRepo {
                 new_location: Some("PRODUCTION_SHELF"),
                 new_holder_id: Some(shelf_id),
                 new_process_id: Some(current_process_id),
-                // 显示用定位信息：dispatch 路径不解析 step，**有意保持 NULL**
-                //（`new_process_step_id: None` 在 status_gate 里是「不改」，
-                //  而该批次从未写过 step，等价于 NULL）。
+                // 显示用定位信息：dispatch 路径不解析 step，step 写 NULL
+                //（由下方 `clear_process_step_id: true` 表达；`new_process_step_id:
+                // None` 在 status_gate 里是「不改」，与「清 NULL」是两件事）。
                 new_process_step_id: None,
                 is_repairing: None,
                 expected_version: Some(expected_version),
@@ -240,7 +240,14 @@ impl BatchRepo {
                 clear_location: false,
                 clear_holder_id: false,
                 clear_process_id: false,
-                clear_process_step_id: false,
+                // 2026-10-01 review 第 2 轮 MINOR-1：**还原**改造前 SQL 的语义
+                // —— 原语句是 `current_process_step_id = NULL`（直写），本轮一度
+                // 按「dispatch 的批次从未写过 step，等价于 NULL」改成「保持原值」。
+                // 那个等价性依赖一条**没有任何约束保证**的不变式「`status='PENDING'`
+                // ⇒ step IS NULL」（allowed_from 之外的旁路写点、手工 SQL、历史
+                // 脏数据都能破坏它）。这是 M2 同类语义漂移，且落在另一个漏斗上，
+                // 故按「faithful translation」原则还原为显式清 NULL。
+                clear_process_step_id: true,
                 // 目标状态 IN_PROCESS 不是终态 → 终态归档事件分支不可达（M4）
                 event_id: None,
             },

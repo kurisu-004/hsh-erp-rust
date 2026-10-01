@@ -432,6 +432,17 @@ impl PartRepo {
     /// 2026-09-30 新增 `current_process_id: Option<i64>`：检验不合格打回生产架
     /// = **进池**，故写入目标工序（池归属权威依据）；`current_process_step_id`
     /// 仍是可选的显示用定位信息（首次定位后不再推进），允许 NULL。
+    ///
+    /// ## `is_repairing: None`（保持）的合法性前提（2026-10-01 review 第 2 轮 MAJOR-3）
+    ///
+    /// 唯一 caller 是 `inspection_core::to_process_core`，它在 step 4.6 **拒绝**
+    /// `is_repairing = true` 的批次（返修件走 `complete-repair` 闭环）。故本函数
+    /// 看到的批次恒为 `is_repairing = false`，「保持」与「清 false」等价。
+    ///
+    /// 之所以仍写 `None`（保持）而不是 `Some(false)`：若将来新增 caller 忘了那条
+    /// 守卫，`Some(false)` 会**静默**把返修件挪出返修流（正是 MAJOR-3 的失败类别），
+    /// 而 `None` 会让同一个洞以「标记与状态矛盾」的形式暴露在
+    /// `GET /parts/repairing-batches` 上，更容易被发现。
     pub async fn mark_batch_failed_inspection(
         conn: &mut PgConnection,
         batch_id: i64,

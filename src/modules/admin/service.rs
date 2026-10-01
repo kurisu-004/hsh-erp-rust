@@ -91,7 +91,8 @@ pub fn validate_scope_ids(kind: &str, ids: &[i64]) -> Result<(), AppError> {
 /// `after_id` = **游标**（2026-10-01 review 第 1 轮 M7 新增）：只取 `id > after_id`
 /// 的行。原实现没有游标 / offset，`truncated = true` 时运维再调一次还是从最小的
 /// `limit` 行开始扫 —— 一个「兜底对账」端点在生产数据量下永远兜不住底。
-/// 游标由调用方从上一轮响应的 `next_after_id` 原样回传。
+/// 游标由调用方从上一轮响应的 `next_part_after_id` 原样回传（**本表独立**的游标，
+/// 见 [`list_assembly_ids`] 的 MAJOR-2 说明）。
 pub async fn list_part_ids(
     conn: &mut PgConnection,
     limit: i64,
@@ -110,7 +111,14 @@ pub async fn list_part_ids(
     ))
 }
 
-/// 取待对账的 `t_assembly.id`（同 [`list_part_ids`] 的语义，含同一个游标）。
+/// 取待对账的 `t_assembly.id`（同 [`list_part_ids`] 的语义，**但用独立游标**）。
+///
+/// 2026-10-01 review 第 2 轮 MAJOR-2：两表 id 来自**同一个**雪花流
+/// （`assembly::crud` 建父件与建子件都用 `state.snowflake`），id 在时间序上
+/// **交错**。原实现让两段共用一个 `after_id` 字段、续扫游标取两段最大值的
+/// `max(part_max, assembly_max)`，于是 `assembly_max..part_max]` 区间的装配件
+/// **永远扫不到**，而循环仍以 `truncated=false` 收尾 —— 报告谎称「已覆盖全表」。
+/// 故游标必须**分表**（`part_after_id` / `assembly_after_id`）。
 pub async fn list_assembly_ids(
     conn: &mut PgConnection,
     limit: i64,
@@ -129,10 +137,13 @@ pub async fn list_assembly_ids(
     ))
 }
 
-/// 本轮窗口的续扫游标（`truncated = true` 时 = 最后一个已处理的 id）。
+/// 本轮窗口的续扫游标（= 该窗口内已处理的最后一个 id；窗口为空时 `None`）。
 ///
 /// 没有它，运维就只能靠「显式传 id 列表」续扫 —— 那要求先把全表 id 查出来
 /// 再分批贴回来，一个「兜底」端点不该长这样。
+///
+/// 2026-10-01 review 第 2 轮 MAJOR-2：**每个表一个**（`next_part_after_id` /
+/// `next_assembly_after_id`），不再是「两段取最大」的单游标。
 pub fn next_cursor(processed_ids: &[i64]) -> Option<i64> {
     processed_ids.iter().copied().max()
 }
@@ -159,8 +170,9 @@ fn split_truncated(mut ids: Vec<i64>, limit: i64) -> (Vec<i64>, bool) {
 /// 那一步会释放并归档序列号，故 handler 必须传一个真实雪花 id。
 ///
 /// ⚠️ 已终态（COMPLETED / CANCELLED）的 part **不参与**对账：`update_part_rollup`
-/// 带终态守卫（B1），派生层不会覆盖主操作写下的终态。详见
-/// `docs/api/admin.md`。
+/// 带终态守卫（B1），派生层不会覆盖主操作写下的终态。这种行**不是**「已一致」，
+/// 而是被守卫**跳过** —— 故经 [`PartRecompute::terminal_skip`] 上抛，由报告显式
+/// 计数（2026-10-01 review 第 2 轮 MAJOR-1）。详见 `docs/api/admin.md`。
 pub async fn recompute_part(
     conn: &mut PgConnection,
     part_id: i64,
@@ -169,7 +181,7 @@ pub async fn recompute_part(
 ) -> Result<PartRecompute, AppError> {
     let before = PartRepo::get_part_rollup_state(&mut *conn, part_id).await?;
     // 返回值里的 `sync` 是给 status_gate 内部级联装配件用的，对账报告不消费
-    status_gate::rollup_part_derived(conn, part_id, updated_by, event_id).await?;
+    let outcome = status_gate::rollup_part_derived(conn, part_id, updated_by, event_id).await?;
     let after = PartRepo::get_part_rollup_state(&mut *conn, part_id).await?;
     let Some((before, after)) = before.zip(after) else {
         return Ok(PartRecompute::unchanged());
@@ -182,10 +194,19 @@ pub async fn recompute_part(
         from: before.status.clone(),
         to: after.status.clone(),
     });
+    // 2026-10-01 review 第 2 轮 MAJOR-1：终态守卫跳过的行必须**显式上抛**。
+    // 守卫拦下时库里的值没动（`after == before`），所以 `status_changed` 必为
+    // false —— 不看这个字段的话，「终态但错」与「数据一致」在报告里完全同形。
+    let terminal_skip = outcome.terminal_skip.map(|s| PartTerminalSkip {
+        id: part_id,
+        current: s.current,
+        derived: s.derived,
+    });
     Ok(PartRecompute {
         // `outcome.sync` 已被 `rollup_part_derived` 内部用于级联装配件，这里不重复播报
         entry: change,
         next_process_fixed,
+        terminal_skip,
     })
 }
 
@@ -196,6 +217,18 @@ pub struct PartRecompute {
     pub entry: Option<StatusChangeEntry>,
     /// `next_process_id` 派生指针是否被修正。
     pub next_process_fixed: bool,
+    /// `Some` = 该 part 已是终态、派生写被终态守卫**跳过**（≠ 数据一致）。
+    pub terminal_skip: Option<PartTerminalSkip>,
+}
+
+/// 终态守卫跳过的单条明细（2026-10-01 review 第 2 轮 MAJOR-1）。
+#[derive(Debug, Clone)]
+pub struct PartTerminalSkip {
+    pub id: i64,
+    /// `t_part.status` 当前值（COMPLETED / CANCELLED，保持不变）。
+    pub current: String,
+    /// min-progress 派生值（未被写入）。
+    pub derived: String,
 }
 
 impl PartRecompute {
@@ -203,6 +236,7 @@ impl PartRecompute {
         Self {
             entry: None,
             next_process_fixed: false,
+            terminal_skip: None,
         }
     }
 }

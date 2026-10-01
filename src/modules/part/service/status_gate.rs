@@ -210,6 +210,25 @@ pub struct RollupOutcome {
     /// `t_part.status` 本次是否**真的**变了（`next_process_id` 单独物化不算）。
     /// 终态序列号释放只在此为 `true` 且新状态是终态时触发。
     pub part_status_changed: bool,
+    /// 派生写被「终态守卫」拦下时的诊断信息（`None` = 未被拦）。
+    ///
+    /// 2026-10-01 review 第 2 轮 MAJOR-1 新增。之前这条路径只留一条
+    /// `tracing::warn!`：对调用方而言「part 已终态、派生被跳过」与「数据本来就
+    /// 一致」都是 `NoChange`，**完全无法区分** —— admin 对账端点会因此对
+    /// 「终态但错的 part」报出一份「已覆盖全表、0 变化」的假干净报告
+    /// （`docs/api/admin.md` 旧版还建议运维用 `part_ids` 定点排查，而终态守卫
+    /// 对定点路径同样生效，那条建议物理上不可能成功）。本字段把「被拦 + 拦前
+    /// 状态 + 派生值」上抛，让调用方能显式计数与逐条上报。
+    pub terminal_skip: Option<TerminalSkip>,
+}
+
+/// 终态守卫命中时的诊断信息（见 [`RollupOutcome::terminal_skip`]）。
+#[derive(Debug, Clone)]
+pub struct TerminalSkip {
+    /// `t_part.status` 的**当前**值（= 保持不变的值，必为 COMPLETED / CANCELLED）。
+    pub current: String,
+    /// min-progress **派生**出的值（因终态守卫未被写入）。
+    pub derived: String,
 }
 
 /// `SERIAL_RELEASED` 事件类型字面量（`t_part_event.event_type`，varchar(30)）。
@@ -371,6 +390,7 @@ pub async fn rollup_part_derived(
         return Ok(RollupOutcome {
             sync: SyncOutcome::NoChange,
             part_status_changed: false,
+            terminal_skip: None,
         });
     };
 
@@ -389,6 +409,7 @@ pub async fn rollup_part_derived(
         return Ok(RollupOutcome {
             sync: SyncOutcome::NoChange,
             part_status_changed: false,
+            terminal_skip: None,
         });
     }
 
@@ -414,19 +435,30 @@ pub async fn rollup_part_derived(
     )
     .await?;
     if affected == 0 {
-        if is_terminal(&cur.status) {
+        // 2026-10-01 review 第 2 轮 MAJOR-1：终态守卫命中**必须上抛**诊断信息。
+        // 降级语义不变（`NoChange`，派生层不否决主操作），但此前只留一条
+        // `tracing::warn!`，调用方无法把它与「数据本来就一致」区分开 ——
+        // admin 对账端点因此会对「终态但错的 part」报出假干净报告。
+        let terminal_skip = if is_terminal(&cur.status) {
             tracing::warn!(
                 part_id,
                 current = %cur.status,
                 target = %target.status,
                 "part 派生写被终态守卫拦下：派生层不覆盖主操作写下的终态（cancel 路径）"
             );
-        }
+            Some(TerminalSkip {
+                current: cur.status.clone(),
+                derived: target.status.clone(),
+            })
+        } else {
+            None
+        };
         // 防御：part 在两次 select 之间被并发软删。返回 NoChange 让 caller
         // 不重试（与改造前一致）。
         return Ok(RollupOutcome {
             sync: SyncOutcome::NoChange,
             part_status_changed: false,
+            terminal_skip,
         });
     }
 
@@ -473,6 +505,7 @@ pub async fn rollup_part_derived(
     Ok(RollupOutcome {
         sync,
         part_status_changed,
+        terminal_skip: None,
     })
 }
 
@@ -551,6 +584,15 @@ pub async fn apply_bulk_batch_status_change_for_part(
     part_ids.sort_unstable();
     part_ids.dedup();
 
+    // TODO(2026-10-01 review 第 2 轮 MINOR-3，follow-up PR)：父装配件的派生只覆盖
+    // `RETURNING` 回来的 part_id。UPDATE 命中 0 行时（part 下无可覆盖的活跃批次
+    // —— 新建工单未拆批、或全部批次已在 `excluded_statuses` 里）循环体一次都不跑，
+    // 父装配件**不派生**。对 force-complete（逃生通道）这没问题：part 必然已被
+    // 强推；对 cancel，part 刚被主操作打成终态，父件的追平也由
+    // `KeepPartTerminalAsIs` 分支承担。真正的缺口是「0 行但父装配件该追平」的其它
+    // 组合（当前无此 caller）。修法：0 行时按 `ch.part_id` 兜底派生一次父件，
+    // 或在 `BulkStatusChange` 上让 caller 显式给出「必须派生的 part_id」。
+
     for pid in &part_ids {
         match ch.derivation {
             PartDerivation::Rollup => {
@@ -559,6 +601,17 @@ pub async fn apply_bulk_batch_status_change_for_part(
             PartDerivation::KeepPartTerminalAsIs => {
                 // 2026-10-01 review 第 1 轮 B1：part 的终态由主操作写下，
                 // 派生层只负责把**父装配件**追平（详见 `PartDerivation`）。
+                //
+                // TODO(2026-10-01 review 第 2 轮 MINOR-2，follow-up PR)：本分支
+                // **无条件**跳过 part 写，既不校验该 part 是否真为终态、也不 warn。
+                // 现状之所以安全，纯粹是因为唯一 caller
+                // （`cancel_all_active_batches_for_part`）保证 part 刚被
+                // `mark_part_cancelled` 打成 CANCELLED —— 这是一条**调用顺序**
+                // 不变式，无类型 / 无 SQL 约束。将来误选本策略到非终态 part 上，
+                // 会让该 part 的派生被无声跳过（业务流与库值长期不一致，且无任何
+                // 日志）。修法：分支内先 `get_part_rollup_state` 读一次，非终态则
+                // `tracing::warn!` 并降级为 `PartDerivation::Rollup` 的行为
+                // （或直接返回错误，因为这是**编程错误**而非并发冲突）。
                 rollup_assembly_derived(&mut *conn, *pid, ch.updated_by).await?;
             }
         }
@@ -733,6 +786,17 @@ fn is_terminal(status: &str) -> bool {
 /// ============================================================================
 ///
 /// 见 [`BATCH_STATUS_UPDATE_BIND_COUNT`] 的 rationale（review 第 1 轮踩过的坑）。
+///
+/// TODO(2026-10-01 review 第 2 轮 NIT-3，follow-up PR)：覆盖面目前**只有**
+/// `BATCH_STATUS_UPDATE_SQL` 这一条单行 UPDATE。bulk 入口
+/// （`apply_bulk_batch_status_change_for_part` 里那条内联 `UPDATE … RETURNING`，
+/// `$1..$5`）与新增的 `t_assembly` 状态写 SQL（`AssemblyRepo::
+/// update_status_if_not_terminal` / `AssemblyRepo::cancel`）**都没有**纳入。
+/// 它们同样是「占位符编号 ↔ bind 顺序」的手工对齐点，写错时报的是
+/// `bind message supplies N parameters …` 这种与业务毫无关系的 PG 错误，
+/// 定位成本高。修法：把两条 SQL 也提成 const（与 `BATCH_STATUS_UPDATE_SQL`
+/// 同款），在本 mod 内对每条跑同一个 `max_placeholder == bind 数` +
+/// `1..=N 无跳号` 的断言。
 #[cfg(test)]
 mod bind_guard_tests {
     use super::{BATCH_STATUS_UPDATE_BIND_COUNT, BATCH_STATUS_UPDATE_SQL};
@@ -1208,14 +1272,19 @@ mod write_guard_tests {
     /// 1. `UPDATE ONLY t_part_batch SET status …` / `UPDATE public.t_part_batch SET …`
     ///    —— 规则要求「`update` 与表名之间只有空白」，这两种写法匹配不上；
     /// 2. `INSERT … ON CONFLICT … DO UPDATE SET status = …` 的 upsert；
-    /// 3. 覆盖面只有 **batch 层**：`t_part.status` / `t_assembly.status` 没有同类
+    /// 3. **覆盖面只有 batch 层**：`t_part.status` / `t_assembly.status` 没有同类
     ///    护栏，而 B1 那个 bug 恰恰就发生在 part 层。
     ///
-    /// 修 1/2 是探测器的小改（多认两个关键字），修 3 需要给「文件 × 表」配一张
-    /// 白名单（`mark_part_cancelled` / `update_part_rollup` / `AssemblyRepo::
-    /// update_status_if_not_terminal` / `AssemblyRepo::cancel` 是合法写点），
-    /// 两者都会让本测试的误报面显著变大，宜单独一轮改动 + 全量跑测试确认，
-    /// 不适合混在「修 review」这一轮里做。
+    ///    TODO(2026-10-01 review 第 2 轮，follow-up PR)：给「文件 × 表」配一张
+    ///    白名单，把规则扩到 `t_part` / `t_assembly`（合法写点已知且有限：
+    ///    `mark_part_cancelled` / `PartRepo::update_part_rollup` /
+    ///    `AssemblyRepo::update_status_if_not_terminal` / `AssemblyRepo::cancel`）。
+    ///    现状的风险是**双向**的：part / assembly 层的派生写既可能漏（无人调
+    ///    sync，漂移长期留着），也可能越界（派生层覆盖主操作写下的终态 = B1）。
+    ///
+    /// 修 1/2 是探测器的小改（多认两个关键字），修 3 需要白名单，两者都会让本测试
+    /// 的误报面显著变大，宜单独一轮改动 + 全量跑测试确认，不适合混在「修 review」
+    /// 这一轮里做。
     ///     `SELECT ... FOR UPDATE` 没有 SET 子句；`SET delivery_note_id` /
     ///     `SET quantity` / `SET current_holder_id` / `SET current_process_id`
     ///     虽命中 `UPDATE t_part_batch` 但 SET 子句里没有对 `status` 的赋值，

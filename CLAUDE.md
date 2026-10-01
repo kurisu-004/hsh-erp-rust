@@ -117,7 +117,14 @@ t_assembly.status               ← 派生缓存
   pkey 冲突 → 事务 500。
 - **兜底对账**：`POST /api/v2/admin/recompute-rollup`（Manager）复用上述 rollup
   函数重跑并回报 before→after，**幂等**；新增派生算法时**不要**在对账端点重写一遍。
-  全量对账靠 `after_id` 游标续扫（响应回 `next_after_id`）直到 `truncated=false`。
+  全量对账靠**分表游标**续扫（2026-10-01 review 第 2 轮 MAJOR-2：`t_part` 与
+  `t_assembly` 的 id 来自同一个雪花流、按时间序交错，共用一个游标会永久跳过
+  `(assembly_max, part_max]` 那段装配件）——把响应里非 null 的
+  `next_part_after_id` / `next_assembly_after_id` 回传为请求的 `part_after_id` /
+  `assembly_after_id`，直到 `truncated=false`。
+  ⚠️ 报告里 `parts_skipped_terminal > 0` 表示「该 part 已终态、派生被守卫跳过」，
+  **不是**「数据已一致」；这类行只能靠 force-complete / cancel 或业务流修
+  （见 `docs/api/admin.md`）。
 - 词汇：batch/part 8 态 + `is_repairing` 标记（`REPAIRING` 已于 2026-10-01 降级为
   boolean 列，DB 不再产生该 status）；assembly 7 态（无 `OUTSOURCE`，子件
   `OUTSOURCE` ⇒ 父 `IN_PROCESS`）。详见 [`docs/api/parts/index.md#状态派生契约2026-10-01`](docs/api/parts/index.md)。

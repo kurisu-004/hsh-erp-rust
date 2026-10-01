@@ -298,8 +298,13 @@ t_assembly.status               ← 派生缓存
   由 caller 透传）：`GET /parts/{id}/events` 是 `ORDER BY id DESC`，用建单期的
   `part_id` 顶替会把归档事件排到时间线最底部，且 part 二次进终态时 pkey 冲突。
 - 兜底修正入口：`POST /api/v2/admin/recompute-rollup`（Manager）—— **复用**上述
-  派生函数重跑一遍并回报 before→after，幂等；全量对账用 `after_id` 游标续扫
-  （响应回 `next_after_id`）直到 `truncated=false`。见 [`../admin.md`](../admin.md)。
+  派生函数重跑一遍并回报 before→after，幂等；全量对账用**分表游标**续扫
+  （响应回 `next_part_after_id` / `next_assembly_after_id`，回传为请求的
+  `part_after_id` / `assembly_after_id`）直到 `truncated=false`。两表 id 来自同一
+  个雪花流且按时间序交错，**必须分表推进**（review 第 2 轮 MAJOR-2：共用一个游标会
+  永久跳过 `(assembly_max, part_max]` 那段装配件却仍报 `truncated=false`）。
+  报告里 `parts_skipped_terminal > 0` = 「已终态、派生被守卫跳过」，≠「数据已一致」。
+  见 [`../admin.md`](../admin.md)。
 
 > **migration 007 注释订正（2026-10-01 review 第 1 轮 m1）**：007 里「
 > `t_part_event.id` 无默认值、SQL 里无法生成雪花 ID」这句是**错的** ——
@@ -309,6 +314,18 @@ t_assembly.status               ← 派生缓存
 > 排到时间线顶部」而不是「无默认值」。运行时路径已改为由 caller 透传真实雪花
 > （见上一条），故 migration 007 本身按 append-only 约定**保持原样不改**
 > （改它会变更 sqlx 记录的 checksum，让已 apply 过该迁移的库启动失败）。
+>
+> **TODO(2026-10-01 review 第 2 轮 MINOR-4，follow-up PR —— 上线窗口需人工评估)**：
+> `migrations/20261001000200_007_serial_release.sql:113-118` 是
+> `DROP INDEX` + **非并发** `CREATE UNIQUE INDEX` + 全表 `UPDATE`。在生产级
+> `t_part` 上，事务内的 `CREATE INDEX` 会持 `ACCESS EXCLUSIVE` 锁**贯穿整个构建**，
+> 部署即阻塞全部 part 写（读写一起停），且全表 UPDATE 耗时与表大小线性相关。
+> 正确做法是 `-- no-transaction` 迁移 + `CREATE UNIQUE INDEX CONCURRENTLY`
+> （并发建索引不持写锁；失败会留 INVALID 索引，需手工 DROP 重建）。
+> **本轮不改**：append-only 铁律禁止修改已存在的 migration 文件（改内容会变更
+> sqlx 记录的 checksum，让已 apply 过该迁移的库启动失败），而新增一个「重建索引」
+> 的 migration 属于另一个 PR 的范围。上线前请人工评估该迁移的锁窗口，必要时改在
+> 低峰期执行，或用「新 migration + CONCURRENTLY」补建。
 
 ### 序列号（`serial_no`）生命周期
 

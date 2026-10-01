@@ -21,7 +21,7 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use super::dto::{RecomputeRollupReport, RecomputeRollupRequest};
+use super::dto::{RecomputeRollupReport, RecomputeRollupRequest, TerminalSkipEntry};
 use super::service::{
     PartRecompute, list_assembly_ids, list_part_ids, next_cursor, recompute_assembly,
     recompute_part, resolve_limit, validate_scope_ids,
@@ -92,33 +92,34 @@ pub async fn recompute_rollup(
     let mut conn = state.pool.acquire().await?;
     let (mut part_targets, part_truncated) = match (part_ids.clone(), full_scope) {
         (Some(ids), _) => (ids, false),
-        (None, true) => list_part_ids(&mut conn, limit, req.after_id).await?,
+        (None, true) => list_part_ids(&mut conn, limit, req.part_after_id).await?,
         (None, false) => (Vec::new(), false),
     };
     let (mut assembly_targets, asm_truncated) = match (assembly_ids.clone(), full_scope) {
         (Some(ids), _) => (ids, false),
-        (None, true) => list_assembly_ids(&mut conn, limit, req.after_id).await?,
+        (None, true) => list_assembly_ids(&mut conn, limit, req.assembly_after_id).await?,
         (None, false) => (Vec::new(), false),
     };
-    drop(conn);
-    report.truncated = part_truncated || asm_truncated;
-    // 2026-10-01 review 第 1 轮 M7：把续扫游标回给调用方。
+    // 2026-10-01 review 第 2 轮 MAJOR-2：**分表**游标。
     //
-    // 两段窗口各自推进到哪由各自的最大 id 决定；`t_assembly` 的 id 空间与
-    // `t_part` **不相交**（各自独立的雪花流），但两个游标共用一个 `after_id`
-    // 字段会互相干扰 —— 故取**两段里较大的**那个作为续扫游标：它保证本轮
-    // 已处理的两段都不会被下一轮重复处理（幂等重复处理只是浪费，不正确）；
-    // 代价是下一轮会跳过 id 介于两者之间的少量行，运维若要严格覆盖可对两段
-    // 分别用 `part_ids` / `assembly_ids` 定点跑（端点本就支持）。
-    if report.truncated {
-        let p = next_cursor(&part_targets);
-        let a = next_cursor(&assembly_targets);
-        report.next_after_id = match (p, a) {
-            (Some(p), Some(a)) => Some(p.max(a)),
-            (Some(p), None) | (None, Some(p)) => Some(p),
-            (None, None) => None,
-        };
+    // 此前两段共用一个 `after_id` 字段、回一个 `next_after_id = max(part_max,
+    // assembly_max)`，而 `t_part` / `t_assembly` 的 id 来自**同一个**
+    // `state.snowflake`（建父装配件与建子件都用它），两表 id 在时间序上**交错**
+    // → 第 2 轮起 assembly 窗口从 part_max 起步，`assembly_max..part_max]` 区间
+    // 的装配件**永远扫不到**，而循环仍以 `truncated=false` 收尾，报告谎称
+    // 「已覆盖全表」。故两段各自推进、各自回传（请求侧 `part_after_id` /
+    // `assembly_after_id`）。
+    //
+    // `null` = 本轮该段无可处理行（表已扫完 / 显式 id 模式 / 空表）——调用方
+    // 在续扫循环里对 `null` **保持原游标不动**（见 `docs/api/admin.md` 的伪码）：
+    // 只要 `truncated = true`，至少有一段本轮处理了 `limit` 行并推进了游标，
+    // 故循环必然收敛。
+    report.truncated = part_truncated || asm_truncated;
+    if full_scope {
+        report.next_part_after_id = next_cursor(&part_targets);
+        report.next_assembly_after_id = next_cursor(&assembly_targets);
     }
+    drop(conn);
 
     // ---- part 段：batch → part（父装配件由 status_gate 内部级联）----
     for chunk in part_targets.chunks(CHUNK_SIZE) {
@@ -127,6 +128,7 @@ pub async fn recompute_rollup(
             let PartRecompute {
                 entry,
                 next_process_fixed,
+                terminal_skip,
             } = recompute_part(
                 &mut tx,
                 *part_id,
@@ -137,6 +139,16 @@ pub async fn recompute_rollup(
             report.parts_examined += 1;
             if next_process_fixed {
                 report.parts_next_process_id_fixed += 1;
+            }
+            // 2026-10-01 review 第 2 轮 MAJOR-1：终态守卫跳过的行**显式上报**，
+            // 绝不混进「0 变化」里冒充「数据已一致」。
+            if let Some(skip) = terminal_skip {
+                report.parts_skipped_terminal += 1;
+                report.skipped_terminal.push(TerminalSkipEntry {
+                    id: skip.id,
+                    current: skip.current,
+                    derived: skip.derived,
+                });
             }
             if let Some(entry) = entry {
                 report.parts_changed += 1;
