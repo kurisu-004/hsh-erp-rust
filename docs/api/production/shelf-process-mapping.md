@@ -22,10 +22,24 @@
 > `GET|POST /api/v2/shelves/{id}/processes` 已从 `src/modules/shelf/handler.rs` 彻底删除
 > 并 404。**这 3 个端点本身**请求 / 响应契约逐字不变，前端只需改 URL（沿 2026-09-19
 > prod 聚合先例）。⚠️ 但**整个后端 commit 的前端配套改动不止改 URL** —— 同 commit
-> 删除的 `ShelfOut.account_count` 会打爆前端 Zod 必填字段，完整清单见下方
-> [前端配套改动清单](#前端配套改动清单)，**合入本后端 commit 前必须先落前端 PR**。
+> 删除的 `ShelfOut.account_count` 会打爆前端 Zod 必填字段。
+>
+> **状态（2026-10-02 已回填）**：后端 `f01acd0` + `bb75fce` 已随 merge commit `3384926`
+> 合入 `master`；前端配套已全部落在 `feat/shelf-domain-split`（3 commit，见下方
+> [前端配套改动清单](#前端配套改动清单)的状态声明）。
+>
+> ⚠️ **留作一般性警示（对未来任何一次「后端加 / 删 `ShelfOut` 字段」都成立）**：
+> `ShelfOut` 是**前端 Zod 守门的对象**（`shelfSchema`，`useProductionShelvesQuery` 对
+> 每个响应做 `shelfListResultSchema.parse(...)`）。Zod 默认 strip 模式下**声明为必填
+> 而后端不返**的字段会让 parse 每次抛 `ZodError` —— 不是降级展示、不是 `undefined`，
+> 是整个货架列表 / 详情页面**硬失败**。所以后端改 `ShelfOut` 字段时，前端
+> `shelfSchema`（`src/composables/queries/schemas.ts`）、`@/types/shelf::Shelf`、
+> 展示列三处必须同一次改动里一起动。字段级同步清单见下方 B 节。
+>
 > ⚠️ 例外：`GET /shelves/processes` 现在落到 shelf 域的 `/{id}` 路由上，因 `processes`
 > 非 i64 会被 axum 拒为 **400 纯文本**（非 `R` 信封），而非 404。
+> 旧路径状态码由集成测试 `tests/production/shelf_process.rs::old_shelf_process_paths_are_gone`
+> 按 URI 逐个钉死。
 
 ---
 
@@ -138,44 +152,138 @@ Response 200 `data`：`null`
 
 ## 前端配套改动清单
 
-> ⚠️ 2026-10-02 新增小节。本节纠正此前文档里「前端只改 URL」的说法：**该说法只对
-> 本文档 3 个 mapping 端点成立，对同 commit 删除的 `ShelfOut.account_count`
-> 不成立** —— 后端删字段后前端若不同步，**每次货架列表 / 详情响应都会 Zod 硬失败**
-> （`shelfSchema.account_count` 是必填字段，`useProductionShelvesQuery` 对每个
-> 响应做 `shelfListResultSchema.parse(...)`），不是降级展示而是直接报错。
+> ⚠️ 2026-10-02 新增小节（2026-10-02 已回填落地状态）。本节纠正此前文档里「前端只改 URL」
+> 的说法：**该说法只对本文档 3 个 mapping 端点成立，对同 commit 删除的
+> `ShelfOut.account_count` 不成立** —— 后端删字段而前端不同步，会让
+> `useProductionShelvesQuery` 的 `shelfListResultSchema.parse(...)` 每次抛
+> `ZodError`，货架列表 / 详情页面**硬失败**（不是降级展示）。机制说明见顶部警示块，
+> 逐条落点见下方 A、B 两节。
 
-### A. 3 个 URL 硬切（写路径现在 404）
+### 落地状态（2026-10-02 回填）
+
+**A、B 两节全部条目已落地，本节从「待办清单」转为「已完成的改动记录」**。
+保留本节而非删除，是因为它同时承担两个仍有效的职责：① 记录硬切前后的 URL 对照，
+方便日后排查旧路径残留；② 记录 `ShelfOut` 字段变更的前端同步面（见顶部警示块）。
+
+| | commit | 内容 |
+|---|---|---|
+| 后端 | `f01acd0` | 工序映射搬进 prod 域 + 账号部分消除（原始拆分） |
+| 后端 | `bb75fce` | review 第 1 轮修复：端点数订正 + 本清单 + 测试加固 |
+| 后端合并 | `3384926` | `merge: 货架域拆分 —— 工序映射搬进 prod/shelf_process + 账号部分消除`，已入 `master` |
+| 前端 | `5e5a551` | 端点契约对齐 v2 后端（422 根因 + 3 处静默数据损坏） |
+| 前端 | `3ef1a35` | review 第 1 轮修复：保存闸门堵死静默清空 + 5 项准确性订正 |
+| 前端 | `7685876` | 3 端点 URL 硬切到 prod 域 |
+
+- **后端**：已在 `master`（`git merge-base --is-ancestor bb75fce master` 为真）。
+- **前端**：在 `feat/shelf-domain-split` 分支，**截至 2026-10-02 尚未合入前端 `main`**
+  （`main..feat/shelf-domain-split` = 3 commit，反向为空）。部署 / 联调以外部分支
+  `main` 为准的环境仍会打旧路径。
+- **联调方式**：后端在本仓 worktree 起 app（`cargo run`），前端 `npm run dev`，
+  用浏览器直接打 3 个端点核对：
+  - `GET /api/v2/prod/shelf-processes`
+  - `GET /api/v2/prod/shelf-processes/{shelf_id}`
+  - `POST /api/v2/prod/shelf-processes/{shelf_id}`（body `{"items":[{"process_id":"…","sort_order":0}]}`）
+
+  前端侧对应走 `src/api/shelves.ts` 的 `getAllShelfProcessMappings` /
+  `getShelfProcesses` / `setShelfProcesses` 三个函数，无第二个 URL 拼装点（见 A 节核实结论）。
+
+### A. 3 个 URL 硬切（写路径现在 404）—— ✅ 已落地（`7685876`）
 
 `src/api/shelves.ts`：
 
 | 前端函数 | 旧 URL | 新 URL | 备注 |
 |---|---|---|---|
-| `getShelfProcesses(id)` | `GET /shelves/{id}/processes` | `GET /prod/shelf-processes/{shelf_id}` | 响应 `ShelfWithProcesses` 逐字不变 |
-| `setShelfProcesses(id, payload)` | `POST /shelves/{id}/processes` | `POST /prod/shelf-processes/{shelf_id}` | **写路径，旧 URL 现在 404**；入参 `items[].process_id` / `items[].sort_order` 逐字不变 |
+| `getShelfProcesses(id)` | `GET /shelves/{id}/processes` | `GET /prod/shelf-processes/{shelf_id}` | 返回类型由 v1 影子类型 `ShelfWithProcesses` 改为 `ShelfProcessesResult`（`{items:[…]}`） |
+| `setShelfProcesses(id, payload)` | `POST /shelves/{id}/processes` | `POST /prod/shelf-processes/{shelf_id}` | **写路径，旧 URL 现在 404**；返回类型由 `ShelfWithProcesses` 改为 `Promise<void>`（后端 `data` 为 `null`） |
 | `getAllShelfProcessMappings()` | `GET /shelves/processes` | `GET /prod/shelf-processes` | ⚠️ 旧 URL **不是 404 而是 400 纯文本**（落进 shelf 域 `/{id}` 路由，`processes` 非 i64 被 axum Path 解析拒），前端 axios 侧会拿到非 `R` 信封的裸错误 |
 
-**已知消费者（7 处，需一并核对）**：`src/views/shelves/ShelfList.vue`（`getShelfProcesses`
-/ `setShelfProcesses` 两处）、`src/composables/useShelfProcessFilter.ts`（`getAllShelfProcessMappings`）、
-`src/views/cnc/composables/usePendingProgrammingStore.ts`、
-`src/views/inspection/InspectionPending.vue`、
-`src/views/outsource/composables/useOutsourceReceivingList.ts`、
-`src/views/parts/detail/PartDetail.vue`、`src/views/parts/detail/components/PartCncCard.vue`
-（后 4 处经 `useShelfProcessFilter` / `ShelfWithProcesses` 类型间接消费），
-另有 2 个测试 mock 点（`src/views/cnc/composables/__tests__/usePendingProgrammingStore.spec.ts`）。
+**URL 硬切本身是本次最小的一层**，但同一次前端改动顺带修了 3 个**独立的**、与域拆分
+无关的 v1(Python)→v2(Rust) 迁移遗留契约 bug（都不属于后端本次改动，故从未进过本清单）：
 
-### B. `account_count` 出参删除（4 处前端落点 + 1 条回归用例）
-
-| # | 文件 | 现状 | 必改原因 |
+| # | 症状 | 根因 | 前端落点 |
 |---|---|---|---|
-| 1 | `src/composables/queries/schemas.ts` | `shelfSchema.account_count: z.number()`（**必填**） | 后端不再下发该字段 → `shelfListResultSchema.parse(...)` 每次抛 `ZodError`，**所有走共享 query 的货架列表/详情页面硬失败**（`ShelfList.vue`、待编程 store、inspection picker 等） |
-| 2 | `src/types/shelf.ts` | `Shelf.account_count: number`（必填字段） | 类型层与后端契约脱节，须删字段并同步 11 字段注释 |
-| 3 | `src/views/shelves/ShelfList.vue` | 表格列 `{ key: 'account_count', label: '账号数' }` | 列渲染恒 `undefined`，须删列 |
-| 4 | `src/composables/queries/schemas.ts` 头部注释 | 列举 `Shelf` 11 字段含 `account_count` | 注释失真，须同步 |
+| BUG-1 | 保存工序映射报 **HTTP 422** | `setShelfProcesses` 发 `{process_ids: string[]}`，后端 `SetShelfProcessesRequest.items` 必填且无 `#[serde(default)]` → 40001。**该功能自 v1 迁 v2 起从未成功过一次** | `toShelfProcessesPayload()` 收口 payload 形态（`sort_order` 取数组下标 + 去重防撞 partial unique index） |
+| BUG-2 | 打开编辑弹窗已选工序被清空，点保存即**静默清空整组映射** | `getShelfProcesses` 读 `sp.processes`，后端实际返 `{items:[…]}` → `undefined.map` 抛 TypeError → 被裸 `catch` 吞掉 | `toShelfProcessIds()` 收口读形态；`catch` 不再清空而是置 `processLoadFailed` 硬拦整个保存动作（`ShelfList.vue` review I-1） |
+| BUG-3 | 多个页面的货架 / 工序下拉被**静默清空** | `getAllShelfProcessMappings` 按 v1 的「一架子集一行」读 `item.process_ids`；v2 返**扁平行**（一行一个 (货架, 工序) 对）→ `new Set(undefined)` = 空集 | `useShelfProcessFilter` 改按 `shelf_id` regroup 扁平行 |
 
-**回归用例**：`src/composables/queries/__tests__/schemas.spec.ts` 的 **S30** 用例断言
-「缺 `account_count` 必抛 ZodError」—— 这条原本把**即将废除的契约**钉成了回归基线。
-前端 PR 必须改写 S30（改为断言「缺 `account_count` **不**抛错」或直接改为针对其它
-必填字段的 strip 陷阱 guard），否则改完 `schemas.ts` 测试必红。
+> 顺带修正的**纯前端类型谎言**（后端从未返过这些字段，非本次后端改动引起）：
+> `@/types/shelf::ShelfForReturn` 摘除 `display_order` / `mapped_process_codes`、
+> `ShelfForReturnResult` 摘除 `recommended_shelf_id`，并补上后端 VO 里本就有的 `zone`。
+> 连带落点 `src/views/scan/components/ShelfPickerDialog.vue`（去掉 `:mapped-process-codes`）
+> 与 `src/views/scan/components/HmiPickerCard.vue`（标注该分支当前不可达、保留待后端补字段复活）。
+
+**消费者核实（2026-10-02 逐个 `git grep` 核对 `feat/shelf-domain-split@7685876`）**：
+
+| 消费方 | 调用点 | 是否需改 | 实际状态 |
+|---|---|---|---|
+| `src/views/shelves/ShelfList.vue` | 直调 `getShelfProcesses` / `setShelfProcesses` 各 1 | 需改 | ✅ 已改 |
+| `src/composables/useShelfProcessFilter.ts` | 直调 `getAllShelfProcessMappings` | 需改 | ✅ 已改（BUG-3 regroup） |
+| `src/views/cnc/composables/usePendingProgrammingStore.ts` | `useShelfProcessFilter` ×1 | **不需改** | ✅ 未改（对外 API 零变更，见下） |
+| `src/views/inspection/InspectionPending.vue` | `useShelfProcessFilter` ×2 | **不需改** | ✅ 未改（同上） |
+| `src/views/outsource/composables/useOutsourceReceivingList.ts` | `useShelfProcessFilter` ×1 | **不需改** | ✅ 未改（同上） |
+| `src/views/parts/detail/PartDetail.vue` | `useShelfProcessFilter` ×2 | **不需改** | ✅ 未改（同上） |
+| `src/views/parts/detail/components/PartCncCard.vue` | `useShelfProcessFilter` ×1 | **不需改** | ✅ 未改（同上） |
+| `src/views/parts/list/composables/usePartDispatch.ts` | `useShelfProcessFilter` ×2 | **不需改** | ✅ 未改（同上）**← 本节此前漏列** |
+| `src/views/repair/RepairStartDialog.vue` | `useShelfProcessFilter` ×1 | **不需改** | ✅ 未改（同上）**← 本节此前漏列** |
+
+**订正此前清单的三处计数 / 表述错误**（`bb75fce` 原写法）：
+
+1. **原写「已知消费者（7 处，需一并核对）」→ 实际是 8 个文件 / 12 个调用点**
+   （7 个文件经 `useShelfProcessFilter`，共 10 个调用点；`ShelfList.vue` 直调 2 处）。
+   原清单只列了 5 个经 composable 的文件，**漏了 `usePartDispatch.ts` 和
+   `RepairStartDialog.vue`** —— 这两处是 BUG-3「下拉被静默清空」的实际受害面。
+2. **原写「需一并核对」措辞误导**：`useShelfProcessFilter` 的对外 API 本次
+   **零变更**（经它的 7 个文件 / 10 个调用点一个都不用改），需要改的只有
+   `ShelfList.vue` 那 2 处直调。把两者混列成「7 处需一并核对」会让后来者
+   以为要逐个去改 7 个文件。
+3. **原写「另有 2 个测试 mock 点（`usePendingProgrammingStore.spec.ts`）」→ 只有 1 个文件**。
+
+**新增测试文件（原清单未提）**：`src/api/shelfProcesses.spec.ts`（3 函数 URL +
+payload / 响应形态逐字钉死 + 旧路径不出现）、`src/composables/__tests__/useShelfProcessFilter.spec.ts`
+（扁平行 regroup + 失败态）、`src/views/shelves/__tests__/ShelfList.processMapping.spec.ts`
+（BUG-2 保存闸门 P1~P4）。**漏网核查结论：全仓 `src/**` 已无任何拼装旧路径字符串的地方**
+（`git grep '/shelves/processes' feat/shelf-domain-split` 的命中全在注释里，
+且都是解释「旧路径已废」用的）；3 个 URL 只在 `src/api/shelves.ts` 一处拼装，
+ 无页面绕过 api 层自拼路径。
+
+### B. `account_count` 出参删除 —— ✅ 已落地（`5e5a551`，`3ef1a35` 补齐）
+
+后端侧已删：`master` 的 `src/modules/shelf/vo/shelf.rs::ShelfOut` 现为 **10 字段**，
+无 `account_count`（连同 `ShelfRepo::count_accounts_by_shelf` 一并移除）。
+
+| # | 文件 | 原状态 | 已落地动作 |
+|---|---|---|---|
+| 1 | `src/composables/queries/schemas.ts` | `shelfSchema.account_count: z.number()`（**必填**） | ✅ 删除该行 |
+| 2 | `src/types/shelf.ts` | `Shelf.account_count: number`（必填字段） | ✅ 删除字段 + 就地留决策说明注释 |
+| 3 | `src/views/shelves/ShelfList.vue` | 表格列 `{ key: 'account_count', label: '账号数' }` | ✅ 删除该列（`useColumnVisibility` 的 lenient 恢复会忽略 localStorage 里的残留项，**无需清浏览器缓存**） |
+| 4 | `src/composables/queries/schemas.ts` 头部注释 | 列举 `Shelf` 11 字段含 `account_count` | ✅ 改为 10 字段 |
+
+**原清单漏列、但确实改了的落点**：
+
+- `src/composables/queries/useProductionShelvesQuery.ts` —— 头部注释 11 → 10 字段（守门点说明）
+- `src/composables/queries/__tests__/schemas.spec.ts` —— 除 S30 外，**S29 的 fixture 与
+  用例名也一起从 11 字段改到 10 字段**（断言 `parsed.account_count` 换成 `parsed.display_order`）
+- `src/views/cnc/composables/usePendingProgrammingStore.ts` —— 注释记「两侧同步摘除」
+- `src/api/shelves.ts` 文件头注释 —— 记「`account_count` 摘除已在前一个 commit 落地」
+
+**回归用例 S30 的处置 —— 原清单的处方已订正**：
+
+`bb75fce` 原写「前端 PR 必须改写 S30（改为断言『缺 `account_count` **不**抛错』或
+直接改为针对其它必填字段的 strip 陷阱 guard）」。**实际采用第二种：guard 字段从
+`account_count` 换成同为必填的 `zone`**，用例改名「S30：shelfSchema 缺 zone → 抛
+ZodError；shelfListResultSchema 缺 items → 抛 ZodError」。
+
+**为什么「换字段」优于「改成不抛错」**：S30 这条用例的**设计意图不是守
+`account_count` 这个具体字段，而是守「必填字段缺失必须抛 `ZodError`」** —— 它是
+CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃，必填字段必须显式声明」
+的 regression guard。若按原清单的「不抛错」处方改，这条 guard 就被**反向**了：
+它会从「缺字段必须报错」变成「缺字段不报错」正是允许的，与被守护的架构条目背道而驰，
+等于用删需求的方式让测试变绿。换 `zone` 则保留了原意图（`zone` 是 `ShelfOut` 至今
+仍返的必填字段，且类型上不适合可选），并顺带证明 guard 机制本身与具体字段解耦。
+
+> 因果方向备注（前端已在 `src/types/shelf.ts` / `schemas.ts` 就地注释）：前端摘该字段的
+> 起因是**用户决定货架列表页不再展示账号数**，后端同 PR 删该字段是**另一次独立决策**，
+> 不是「后端删了前端才跟删」。
 
 > 后端侧说明：`account_count` 的真源是 iam 域 `t_user_role`（`scope_type='shelf'`），
 > 前端若仍需展示「账号数」，应另走 iam 域用户列表按 `scope_type='shelf'` 聚合，
