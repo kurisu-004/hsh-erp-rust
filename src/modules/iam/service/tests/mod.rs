@@ -233,6 +233,10 @@ pub fn test_app_config() -> Arc<AppConfig> {
         delivery_note_template_dir: std::path::PathBuf::new(),
         enable_e2e_hooks: false,
         ws_heartbeat_interval_seconds: 30,
+        // 2026-10-01 新增：WS 存活检测（session service 单测不读 WS，占位默认值，
+        // 且需满足 `pong_timeout > ping_interval` 的语义约束）。
+        ws_ping_interval_seconds: 20,
+        ws_pong_timeout_seconds: 60,
         request_timeout_seconds: 30,
         // 2026-09-28 删除：相关上传会话域字段（域整体下线）。
         idempotency_ttl_seconds: 86400,

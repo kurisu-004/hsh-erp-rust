@@ -34,6 +34,26 @@ pub struct AppConfig {
     /// 生产 30s；测试可调小到 1s 以便在 CI 内验证 heartbeat text 帧。
     /// 环境变量 `WS_HEARTBEAT_INTERVAL_SECONDS`，缺省 `30`。
     pub ws_heartbeat_interval_seconds: u64,
+    /// 2026-10-01 新增：服务端 protocol-level `Ping` 间隔（秒）。与上面的 text 心跳
+    /// **职责分离、两者并存**（勿合并）：
+    /// - text 心跳帧 `{"type":"heartbeat",ts}` → 浏览器 JS `onmessage` 收得到，给**前端**感知用；
+    /// - `Message::Ping` → 浏览器按 RFC 6455 §5.5.2 在**协议栈**自动回 `Pong`（JS 完全不可见），
+    ///   给**服务端**存活检测用（`ws_pong_timeout_seconds` 靠它续命）。
+    ///
+    /// 缺这个的原因：`sender.send()` 一个几十字节的心跳帧**不会报错**（TCP 写只要内核
+    /// 发送缓冲收下就返回 Ok），写成功不能证明对端活着——可能要等缓冲写满触发 EPIPE
+    /// 才现形，可能是几小时；而 `TimeoutLayer` 只挂在 `/api/v2` nest 内，碰不到 `/ws`。
+    ///
+    /// 环境变量 `WS_PING_INTERVAL_SECONDS`，缺省 `20`。
+    pub ws_ping_interval_seconds: u64,
+    /// 2026-10-01 新增：`Pong` 超时阈值（秒）。超过此时长**没收到任何入站帧**即判定对端
+    /// 已死 → 发 `1011 pong timeout` Close 帧并断开（清理半开 TCP 连接 / 死标签页）。
+    /// 环境变量 `WS_PONG_TIMEOUT_SECONDS`，缺省 `60`（= 3× ping 间隔，容忍连续丢 2 次）。
+    ///
+    /// 启动期强制校验 `pong_timeout > ping_interval`（见 `ws_liveness_config`）：
+    /// 反之（`pong_timeout <= ping_interval`）会在客户端还没来得及回 `Pong` 的窗口内
+    /// 就判死，**误杀健康连接**。
+    pub ws_pong_timeout_seconds: u64,
     /// 2026-09-20 新增：HTTP `/api/v2/*` nest 请求超时（秒）。仅挂在 nest 内层
     /// （不影响 WS 长连接，也不影响根 Router 的 CORS/Body limit）。环境变量
     /// `REQUEST_TIMEOUT_SECONDS`，缺省 `30`。
@@ -326,6 +346,11 @@ impl AppConfig {
         // 加载 .env（不存在不报错）
         let _ = dotenvy::from_filename(env_file);
 
+        // 2026-10-01 新增：WS 存活检测两个参数**成对解析 + 成对校验**。提前于 struct
+        // literal 是因为 `pong_timeout > ping_interval` 是跨字段约束，struct literal
+        // 的字段之间无法互相引用。
+        let (ws_ping_interval_seconds, ws_pong_timeout_seconds) = ws_liveness_config()?;
+
         Ok(Self {
             database_url: build_database_url()?,
             listen_addr: env_or("LISTEN_ADDR", "0.0.0.0:3000"),
@@ -474,6 +499,10 @@ impl AppConfig {
             enable_e2e_hooks: env_bool("E2E_HOOKS_ENABLED", true)?,
             // 2026-09-15 followup-cleanup A5/A6：dashboard WS 心跳间隔（秒）；生产 30，测试可调小。
             ws_heartbeat_interval_seconds: env_parse("WS_HEARTBEAT_INTERVAL_SECONDS", 30u64)?,
+            // 2026-10-01 新增：WS 存活检测（协议层 Ping + Pong 超时），见字段 doc 与
+            // `ws_liveness_config` 的交叉校验。text 心跳与协议层 Ping 职责分离，两者并存。
+            ws_ping_interval_seconds,
+            ws_pong_timeout_seconds,
             // 2026-09-20 新增：HTTP nest 请求超时；与 WS 隔离（挂在内层）。
             request_timeout_seconds: env_parse("REQUEST_TIMEOUT_SECONDS", 30u64)?,
             // 2026-09-23 新增 Idempotency 中间件 TTL（秒）。
@@ -573,6 +602,34 @@ pub fn build_redis_url() -> String {
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// 2026-10-01 新增：解析 + 交叉校验 WS 存活检测的两个参数
+/// （`WS_PING_INTERVAL_SECONDS` / `WS_PONG_TIMEOUT_SECONDS`）。
+///
+/// 校验规则（任一不满足即 bail，**fail-fast**：宁可不启动，也不要带病上线误杀连接）：
+/// 1. `ping_interval >= 1`（0 会让 Ping 定时器每轮 select 立刻 ready，空转打满 CPU）；
+/// 2. `pong_timeout >= 1`（0 意味着一连接上就判死）；
+/// 3. `pong_timeout > ping_interval`（**最关键**）：反之会在客户端还没来得及按
+///    RFC 6455 §5.5.2 回 `Pong` 的窗口内就把健康连接判死。
+///
+/// 默认 20 / 60（3× 容忍连续丢 2 次 `Pong`）。
+fn ws_liveness_config() -> Result<(u64, u64)> {
+    let ping_interval = env_parse("WS_PING_INTERVAL_SECONDS", 20u64)?;
+    let pong_timeout = env_parse("WS_PONG_TIMEOUT_SECONDS", 60u64)?;
+    if ping_interval == 0 || pong_timeout == 0 {
+        return Err(anyhow!(
+            "WS_PING_INTERVAL_SECONDS / WS_PONG_TIMEOUT_SECONDS 必须 ≥ 1 \
+             （当前 ping_interval={ping_interval} pong_timeout={pong_timeout}）"
+        ));
+    }
+    if pong_timeout <= ping_interval {
+        return Err(anyhow!(
+            "WS_PONG_TIMEOUT_SECONDS({pong_timeout}) 必须 > WS_PING_INTERVAL_SECONDS({ping_interval})：\
+             否则客户端还没来得及回 Pong 就会被判死，健康连接会被误杀"
+        ));
+    }
+    Ok((ping_interval, pong_timeout))
 }
 
 /// 从 PEM 文件加载 RS256 私钥 → `jsonwebtoken::EncodingKey`。

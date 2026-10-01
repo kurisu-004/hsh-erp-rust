@@ -2,17 +2,29 @@
 
 > 本文件须与 `src/infra/ws_hub.rs` + `src/modules/dashboard/{handler,service,dto}.rs` 保持同步
 >
+> **2026-10-01 WS 健壮性加固**：Lagged 不再静默吞（→ `4003` 踢出重连）+ 全部退出路径补主动
+> Close 帧（关闭码表见下方「连接关闭码」）+ Ping/Pong 存活检测 + 周期性 re-auth（→ `4001`）。
+> 实现说明见 `src/modules/dashboard/handler.rs` 的 module-level doc「2026-10-01 WS 健壮性加固（4 项）」。
+>
 > **2026-09-28 新增**：v2 前端走 HTTP 全量首取（`GET /api/v2/dashboard/snapshot`，
 > 详见 [`./dashboard.md`](./dashboard.md)），WS 首帧 `WsSnapshotMsg` 保留向后兼容，
 > 新前端可忽略首帧改走「HTTP 首取 + WS 事件 invalidate」模式。
 >
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
+## 环境变量
+
+| env | 缺省 | 含义 |
+|---|---|---|
+| `WS_HEARTBEAT_INTERVAL_SECONDS` | 30 | text 心跳帧间隔（前端 JS 感知） |
+| `WS_PING_INTERVAL_SECONDS` | 20 | protocol-level `Ping` 间隔（服务端存活检测） |
+| `WS_PONG_TIMEOUT_SECONDS` | 60 | Pong 超时阈值；启动期强制校验 `> ping_interval` |
+
 ## 端点列表
 
 | Method | Path | 权限 | 状态 |
 |---|---|---|---|
-| GET | `/ws/dashboard` | 任意已登录（*） | ✅ 2026-09-15 takeover-fill：真实握手 + 快照推送 + 业务事件订阅 |
+| GET | `/ws/dashboard` | 任意已登录（*） | ✅ 2026-09-15 takeover-fill：真实握手 + 快照推送 + 业务事件订阅<br>✅ 2026-10-01：关闭码 + 存活检测 + 周期性 re-auth |
 
 > 路径：挂在 `modules::ws_router()` 下 `/ws` 前缀（**不带** `/api/v2`，与前端 nginx `/ws/*` → `rust-backend:3000` 反代一致）。
 
@@ -44,9 +56,24 @@ Request：
 5. 订阅 `state.ws_hub.broadcast`：
    - `WsEvent::DashboardSnapshot { data }` → 转发 `{"type":"snapshot","data":data,"ts":...}`
    - `WsEvent::DashboardEvent { kind, payload }` → 转发 `WsEventMsg { type:"event", event_type, data, ts }`
-   - `WsEvent::Notification` / `WsEvent::Heartbeat` → 丢弃（dashboard 不消费）
-6. 心跳：30s `WsHeartbeatMsg { type:"heartbeat", ts }`，**作为 text 帧下发**（浏览器 JS `onmessage` 可直接监听；不是 protocol-level Ping）。
-7. 客户端 `Ping` → `Pong`；`Close` / `None` / 错误 → 清理连接。
+   - `Err(Lagged(n))` → 广播队列溢出，本连接**永久丢了 n 条事件** → 记 `warn!` + 发
+     `4003 lagged` Close 帧断开（见下方「连接关闭码」）
+   - `Err(Closed)` → 广播通道已关闭（所有 Sender 都 drop 了）→ 记 `info!` 断开
+6. 心跳（**两套并存、职责分离，勿合并**）：
+   - `ws_heartbeat_interval_seconds`（缺省 30s）周期发 `WsHeartbeatMsg { type:"heartbeat", ts }`
+     作为 **text 帧**下发（浏览器 JS `onmessage` 可直接监听；**不是** protocol-level Ping）；
+   - `ws_ping_interval_seconds`（缺省 20s）周期发 protocol-level `Message::Ping`（空 payload）：
+     浏览器按 RFC 6455 §5.5.2 在**协议栈**自动回 `Pong`（JS 完全不可见），**给服务端存活检测用**。
+7. 空闲超时（存活检测）：`ws_pong_timeout_seconds`（缺省 60s = 3× ping 间隔，容忍连续丢 2 次 Pong）
+   内没收到**任何入站帧**（Pong / 业务帧 / Close 都算）→ 判定对端已死 → 发 `1011 pong timeout`
+   断开。启动期强制校验 `pong_timeout > ping_interval`，否则会误杀健康连接。
+8. 周期性 re-auth：每 10 次 text 心跳（生产 ≈ 5min）调一次 `verify_session_token` 重验 session；
+   失败（session 吊销 / access jti 进黑名单）→ 记 `warn!` + 发 `4001 auth expired` 断开。
+   ⚠️ 该调用内部会 `touch_session` **滑动续期** Redis session TTL：只要大屏页开着，session 就不会
+   自然过期（与 HTTP 路径「每次请求滑动 TTL」语义一致）；用户关掉页面后不再续期才开始走向过期。
+9. 客户端 `Ping` → `Pong`；`Close` / `None` / 错误 → 清理连接（无需发 Close 帧，客户端已发起关闭）。
+10. 服务优雅退出（Ctrl-C / `state.shutdown.cancel()`）→ 发 `1012 server restart` 断开，
+    前端应立即重连（而不是干等 TCP 超时）。
 
 响应（连接建立后服务端首发）：
 
@@ -57,12 +84,16 @@ Request：
     "on_production_shelves": [...],
     "on_inspection_shelves": [...],
     "in_process": [...],
-    "upcoming_delivery": [{"date":"2026-09-15","count":0,"status":"PENDING"}, ...N 条（N 来自 service 默认值 14，与 HTTP `/snapshot` 端点对齐；2026-09-30 同步）],
+    "upcoming_delivery": [{"date":"2026-09-15","count":3,"by_status":{"PENDING":2,"INSPECTION":1}}, ...N 条（N 来自 service 默认值 14，与 HTTP `/snapshot` 端点对齐；2026-09-30 同步）],
     "ts": "2026-09-15T10:00:00+08:00"
   },
   "ts": "..."
 }
 ```
+
+> 2026-10-01 订正：本节原写 `upcoming_delivery[]` 的状态字段是 `status`，与实现漂移
+> （`src/modules/dashboard/vo/snapshot.rs::UpcomingDeliveryBucket` 的字段是 **`by_status`**：
+> `BTreeMap<OrderStatus 字面, i64>`，即「按状态细分的件数」；`count` 是当日合计）。
 
 错误码（握手阶段，HTTP 响应）：
 
@@ -74,11 +105,46 @@ Request：
 
 > 错误码段说明：本端点用通用 `UNAUTHORIZED`（非业务码），与 `BIZ_AUTH_INVALID 40101`（登录失败）刻意区分。
 
+## 连接关闭码（2026-10-01 新增）
+
+握手成功**之后**的所有断开，服务端都**主动发 Close 帧**（此前全仓零主动发送，6 条退出路径全是裸
+drop，浏览器只能看到 1006，无法区分「服务端主动踢 / 网络断 / session 失效」）。
+
+| code | 名称 | reason | 触发场景 | 前端应采取的动作 |
+|---|---|---|---|---|
+| 1000 | normal closure | —（客户端通常不带 reason） | **服务端当前不主动发 1000**；只会在客户端 `close(1000)` 的回声里出现 | 正常关闭，无需动作 |
+| 1001 | going away | `write failed` / `heartbeat write failed` | 写帧失败（连接已断 / 内核缓冲写满） | 走通用重连；通常无需额外处理 |
+| 1011 | internal error | `snapshot build failed` | 首次快照构建失败（DB 故障等） | **可重试但应退避**（服务端侧问题，连续重试无意义 → 提示用户稍后再试） |
+| 1011 | internal error | `send snapshot failed` | 推初始快照写失败 | 走通用重连 |
+| 1011 | internal error | `pong timeout` | 超过 `ws_pong_timeout_seconds` 未收到任何入站帧（对端已死 / 半开连接） | 走通用重连（**必须**重连：旧连接不会再有数据） |
+| 1012 | service restart | `server restart` | 服务优雅退出（Ctrl-C / 发布重启） | **立即重连**（可能需退避，避免重启风暴期打满） |
+| 4001 | auth expired | `auth expired` | 周期性 re-auth 失败：session 被吊销 / access jti 进黑名单（也含 Redis 瞬时故障，fail-closed） | **清本地 token 并跳登录页**（不要重连——重连会被 40105 拒） |
+| 4003 | lagged | `lagged` | 慢消费方：广播队列（容量 1024）溢出，永久丢了 n 条事件 | **重连 + 全量 HTTP 重取**（`GET /api/v2/dashboard/snapshot`）；重连时自然重新收到首帧 snapshot |
+
+约定：
+
+- `1000-2999` 是 RFC 6455 §7.4.2 协议保留段，`4000-4999` 是应用私有段；WS Close code 是 2 字节
+  u16，与 HTTP 信封错误码（`40100` 等）**是两套协议**，不要混用。
+- 浏览器侧统一从 `event.code` / `event.reason` 取；`1006` 仍然表示「没有任何 Close 帧的异常断开」
+  （纯网络问题），此时照常重连即可。
+- 前端不应依赖具体 reason 文案（可能后续调整），**只依赖 code**。
+
 ## 实现要点
 
 - 快照构造：`DashboardService::build_snapshot_with_workers`（service 内部 `pool.begin()` + `commit()`）。
-- 业务事件订阅：`tokio::sync::broadcast::Sender` 多生产者多消费者；客户端 buffer 受 `WsHub::new()` 的 channel 容量（1024）约束，慢消费方会丢消息——dashboard 不消费 Notification/Heartbeat 故影响可控。
-- 心跳：服务端 30s 周期发 `WsHeartbeatMsg` **text 帧**（浏览器 JS `onmessage` 可直接监听）；客户端 `Ping` → axum 协议层自动 `Pong`（与心跳 text 帧是两件事，不要混用）。
+- 业务事件订阅：`tokio::sync::broadcast::Sender` 多生产者多消费者；客户端 buffer 受
+  `WsHub::new()` 的 channel 容量（1024）约束。**慢消费方会丢的是 `DashboardEvent`**（不是
+  Notification/Heartbeat——那两个变体 2026-10-01 已作为死代码删除），而前端更新语义是
+  「WS 事件 → invalidate → HTTP 重取」**不是**增量 patch：所以**丢 1 个事件 = 对应区块永不刷新**
+  （服务端此前连日志都没有）。处理是 `Lagged` → `warn!(missed=n)` + 发 `4003` 踢出 → 前端重连 +
+  全量 HTTP 重取（比补发 n 条后续事件更便宜也更正确）。
+- 心跳 / 存活检测：text 心跳（前端感知）与 protocol-level Ping（服务端判活）**两套并存**，
+  间隔独立配置（`WS_HEARTBEAT_INTERVAL_SECONDS` / `WS_PING_INTERVAL_SECONDS` /
+  `WS_PONG_TIMEOUT_SECONDS`）。超时判定必须用「最后一次入站帧 + 固定时长」的**绝对 deadline**，
+  不能用相对 `sleep`——`select!` 每轮迭代都重建 future，相对时长会被 30s 的 text 心跳不断重置。
+- 在线连接表：`WsHub::conns`（`conn_id` 维度，同一用户可多条）+ `conn_count()` /
+  `user_conn_count(user_id)` accessor；`handle_socket` 入口 register、退出前 unregister，
+  两端各打一行 `info!` 连接数日志。**当前无统计端点**（后续独立任务）。
 - 鉴权镜像 HTTP `CurrentUser::from_request_parts` extractor 的 Redis 校验语义（含 TTL 滑动）。
 - i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
 
@@ -123,8 +189,11 @@ Request：
 | ↳ `BATCH_PLACED_ON_SHELF` | 车间下发台 PENDING 批次 → IN_PROCESS 成功（2026-09-29 新增，`prod::batch` 单条 dispatch 端点） | `{ batch_id, target_process_id, shelf_id, version }` |
 | ↳ `BATCH_PLACED_ON_SHELF` | 车间下发台多 batch 批量下发成功（2026-09-29 新增，`prod::batch` bulk-dispatch / auto-dispatch 端点，仅 succeeded 部分；skipped 不广播） | `{ batches: [{ batch_id, target_process_id, shelf_id, version }, ...] }` |
 | ↳ `ROLLUP_RECOMPUTED` | 2026-10-01 新增：admin 对账端点修正了派生缓存（**仅真有变化时**发，幂等空跑不发） | `{ scope, parts_changed, assemblies_changed, operator_id }` |
-| `Notification` | 通知 | `user_id`, `content` |
-| `Heartbeat` | 心跳 | `ts` |
+
+> **2026-10-01 变更**：`Notification` / `Heartbeat` 两个 `WsEvent` 变体已**删除**（全仓无任何
+> 生产方，只有 dashboard handler 的消费侧匹配，属于永远走不到的死分支）。`WsEvent` 现在只有
+> `DashboardSnapshot` 与 `DashboardEvent` 两个变体；「心跳」走独立的 `WsHeartbeatMsg` text 帧 +
+> protocol-level `Ping`（见「握手流程」第 6 条），不再占用 `WsEvent` 变体。
 
 > **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts/inspection.md#post-apiv2partsworker-scan`](./parts/inspection.md#post-apiv2partsworker-scan) 与 [`./production/worker-pool.md`](./production/worker-pool.md)。
 >

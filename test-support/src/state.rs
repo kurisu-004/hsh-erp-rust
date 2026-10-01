@@ -128,6 +128,11 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
         enable_e2e_hooks: true,
         // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳，E2E WS 用例可在 2s 内验到 text 帧。
         ws_heartbeat_interval_seconds: 1,
+        // 2026-10-01 新增：WS 存活检测（协议层 Ping + Pong 超时）。测试取秒级：
+        // ping 1s 一帧，pong 超时 3s（> ping，且 3× 容忍）——E2E 用例可在数秒内
+        // 验到 Ping 回声 / 死连接被踢。
+        ws_ping_interval_seconds: 1,
+        ws_pong_timeout_seconds: 3,
         // 2026-09-20 新增：HTTP nest 请求超时；30s 默认足够测试用例（<1s）。
         request_timeout_seconds: 30,
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
@@ -285,6 +290,11 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
         enable_e2e_hooks: true,
         // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳。
         ws_heartbeat_interval_seconds: 1,
+        // 2026-10-01 新增：WS 存活检测（协议层 Ping + Pong 超时）。测试取秒级：
+        // ping 1s 一帧，pong 超时 3s（> ping，且 3× 容忍）——E2E 用例可在数秒内
+        // 验到 Ping 回声 / 死连接被踢。
+        ws_ping_interval_seconds: 1,
+        ws_pong_timeout_seconds: 3,
         // 2026-09-20 新增：HTTP nest 请求超时。
         request_timeout_seconds: 30,
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
@@ -418,6 +428,11 @@ pub async fn test_state_with_cos(
         delivery_note_template_dir: std::path::PathBuf::from("template"),
         enable_e2e_hooks: true,
         ws_heartbeat_interval_seconds: 1,
+        // 2026-10-01 新增：WS 存活检测（协议层 Ping + Pong 超时）。测试取秒级：
+        // ping 1s 一帧，pong 超时 3s（> ping，且 3× 容忍）——E2E 用例可在数秒内
+        // 验到 Ping 回声 / 死连接被踢。
+        ws_ping_interval_seconds: 1,
+        ws_pong_timeout_seconds: 3,
         // 2026-09-20 新增：HTTP nest 请求超时。
         request_timeout_seconds: 30,
         // 2026-09-23 新增 Idempotency 中间件 TTL（测试默认 24h，与生产对齐）
