@@ -37,8 +37,9 @@ use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
     CancelBatchRequest, CompleteRepairRequest, CompleteRequest, DeliverRequest, PickUpRequest,
-    PlaceOnShelfRequest, RecallToPendingRequest, ReceiveFromOutsourceToInspectionRequest,
-    RepairDispatchRequest, SendToOutsourceRequest, SplitBatchRequest, StartRepairRequest,
+    PlaceOnShelfRequest, RecallToPendingRequest, ReceiveFromOutsourceRequest,
+    ReceiveFromOutsourceToInspectionRequest, RepairDispatchRequest, SendToOutsourceRequest,
+    SplitBatchRequest, StartRepairRequest,
 };
 use crate::modules::prod::batch::service::BatchService;
 use crate::shared::error::AppError;
@@ -198,11 +199,15 @@ pub async fn send_to_outsource(
 }
 
 /// `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource`
+///
+/// 2026-10-03 入参由 `PlaceOnShelfRequest` 换成 `ReceiveFromOutsourceRequest`
+/// （多一个 `quantity` 支持部分接收；`PlaceOnShelfRequest` 仍被 place-on-shelf /
+/// release-from-programming 共用，不受影响）。
 pub async fn receive_from_outsource(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(batch_id): Path<i64>,
-    Json(req): Json<PlaceOnShelfRequest>,
+    Json(req): Json<ReceiveFromOutsourceRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =

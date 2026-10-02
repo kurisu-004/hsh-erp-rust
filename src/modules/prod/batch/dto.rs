@@ -293,21 +293,74 @@ pub struct RecallToPendingRequest {
 
 /// `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` 入参。
 ///
-/// PENDING / IN_PROCESS+PRODUCTION_SHELF → OUTOURCE（`location='OUTSOURCE_COMPANY'`）。
-/// `outsource_company_id` + `process_id` 必填；`quote_id` 必填（APPROVED 报价，
-/// service 在同事务内 INSERT `t_outsource_shipment`）；`direct=true` 跳过 quote
-/// 校验（DIRECT 免审批占位；Phase 2 stub：返回 501 NOT_IMPLEMENTED）。
+/// PENDING / IN_PROCESS+PRODUCTION_SHELF → OUTSOURCE（`location='OUTSOURCE_COMPANY'`）。
+/// `outsource_company_id` + `process_id` 必填。
+///
+/// ## 价来源：APPROVAL 与 DIRECT 二选一（2026-10-03 起强制）
+///
+/// - APPROVAL 模式：传 `quote_id`（APPROVED 报价）；service 在同事务内 INSERT
+///   `t_outsource_shipment`，`unit_price = quote.price`。
+/// - DIRECT 模式（免审批直发）：传 `direct = true`。service 先按
+///   `(part_id, outsource_company_id, process_id)` 找活跃 APPROVED 报价复用；找不到
+///   则自动建一条 `price = 0` 的 APPROVED 占位报价（`is_direct = true`），
+///   shipment 的 `unit_price` 因而可能是 0 —— 对账时靠该报价的 `note` 识别。
+/// - 两者都不传 / 同时传 → `400 BIZ_INVALID_VALUE`（service 层显式校验）。
+///   此前两者都不传是**允许**的，shipment 单价恒落 0 且无人察觉（外协对账单价
+///   恒为 0 的根因）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SendToOutsourceRequest {
     pub version: i32,
     #[serde(deserialize_with = "deserialize_i64")]
     pub outsource_company_id: i64,
+    /// 外协加工的**工序** id（`t_process.category` 必须为 `'OUTSOURCE'`，且该公司
+    /// 必须映射该工序）。
+    ///
+    /// 2026-10-03 保留本名不改：前端此前发的是 `next_process_id`（它一直按「下一道
+    /// 工序」的措辞建模），但该字段名与已上线的 Python v1 客户端绑定，改名会破坏
+    /// 它；由前端去对齐后端。契约见
+    /// `docs/api/production/batches.md#外协流转send--receive`。
     #[serde(deserialize_with = "deserialize_i64")]
     pub process_id: i64,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
     pub quote_id: Option<i64>,
     #[serde(default)]
     pub direct: Option<bool>,
+    /// 部分发送数量（2026-10-03 新增）。
+    ///
+    /// - `None` 或 `== 批次量` = 整批发送（不拆批）。
+    /// - `0 < q < 批次量` = **部分发送**：先把源批次按 `q` 拆出新子批次，只把子
+    ///   批次发出（源批次留在原货架、状态不变、量减少 `q`），shipment 的
+    ///   `quantity` 记 `q`。
+    /// - `q <= 0` 或 `q > 批次量` → `400 BIZ_INVALID_VALUE`。
+    #[serde(default)]
+    pub quantity: Option<i32>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource` 入参。
+///
+/// OUTSOURCE → IN_PROCESS（`location='PRODUCTION_SHELF'`，`next_process_id` 为收回后
+/// 重新入池的工序）。
+///
+/// 2026-10-03 从 `PlaceOnShelfRequest` 独立出来：外协收回要支持**部分接收**
+/// （`quantity`），而 `PlaceOnShelfRequest` 仍被 `place-on-shelf` /
+/// `release-from-programming` 两个端点共用，加字段会污染它们的契约。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ReceiveFromOutsourceRequest {
+    pub version: i32,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub shelf_id: i64,
+    #[serde(deserialize_with = "deserialize_i64")]
+    pub next_process_id: i64,
+    /// 部分接收数量（2026-10-03 新增），语义同
+    /// [`SendToOutsourceRequest::quantity`]。
+    ///
+    /// ⚠️ 记账口径：部分接收**只拆批**、不动 shipment —— 源批次保留余量且**开口
+    /// shipment 保持 `OUTSOURCING`**，`received_at` / `status='RECEIVED'` 只在
+    /// 整批回收时才落。故 `shipment.quantity` 与当前批次余量可能不相等，这是有意的。
+    #[serde(default)]
+    pub quantity: Option<i32>,
     #[serde(default)]
     pub note: Option<String>,
 }

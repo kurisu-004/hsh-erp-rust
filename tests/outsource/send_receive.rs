@@ -1,13 +1,13 @@
 //! outsource shipment 集成测试（Phase 2 2026-09-13）
 //!
-//! 覆盖（基于 part 域端点的 shipment 写入 + reconcile 端点）：
+//! 覆盖（基于 prod 域批次的 shipment 写入 + reconcile 端点）：
 //! - send-to-outsource INSERT shipment + quote event SENT
 //! - receive-from-outsource 标 shipment RECEIVED + quote event RECEIVED
 //! - reconcile-update OCC 守
-//! - DIRECT 模式 stub → 501
-//!
-//! 注：实际 send/receive 端点在 part 域（part_lifecycle_api.rs 已覆盖 happy path）。
-//! 本测试聚焦 shipment 表的写入正确性。
+//! - DIRECT 免审批直发（2026-10-03：复用活跃报价 / 自动建 0 元占位报价 / 与
+//!   quote_id 互斥 / 必须给价来源）
+//! - 部分发送 / 部分接收（2026-10-03：拆批语义 + shipment 记账口径）
+//! - 补齐后的守卫（process 类别必须 OUTSOURCE / 公司必须映射该工序）
 //!
 //! ## 集成测试范本（PR13 Phase H，2026-09-24）
 //! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
@@ -29,6 +29,12 @@
 //! 状态机不允许 part 从 OUTSOURCE 回退 PENDING；每个测试要按需造不同
 //! (part, batch, company, process, quote) 组合 + 自建 chain/step。预置会污染
 //! list / count 等「期望空库」断言。各 sub-file 用本地 helper 直插。
+//!
+//! ## 2026-10-03：发外协用例必须先映射 company↔process
+//! `send-to-outsource` 新增「公司必须映射该外协工序」守卫（`t_outsource_
+//! company_process` 存在未软删行），所以每个发外协用例都要调
+//! `map_company_process()` —— 守卫本身由
+//! `send_to_outsource_rejects_company_without_process_mapping` 单独锁住。
 
 use axum::http::StatusCode;
 use serde_json::json;
@@ -103,18 +109,30 @@ async fn insert_part(pool: &PgPool, customer_id: i64, status: &str) -> i64 {
     id
 }
 
-/// 直插批次（任意 status + 可选 location）。
+/// 直插批次（任意 status + 可选 location），`quantity` 固定 5。
 async fn insert_batch(pool: &PgPool, part_id: i64, status: &str, location: Option<&str>) -> i64 {
+    insert_batch_with_qty(pool, part_id, status, location, 5).await
+}
+
+/// 同 [`insert_batch`]，但数量可指定（部分收发的断言需要知道源批次余量）。
+async fn insert_batch_with_qty(
+    pool: &PgPool,
+    part_id: i64,
+    status: &str,
+    location: Option<&str>,
+    qty: i32,
+) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part_batch \
          (id, part_id, batch_no, quantity, status, location, version, created_at, updated_at) \
-         VALUES ($1, $2, 1, 5, $3, $4, 0, $5, $5)",
+         VALUES ($1, $2, 1, $3, $4, $5, 0, $6, $6)",
     )
     .bind(id)
     .bind(part_id)
+    .bind(qty)
     .bind(status)
     .bind(location)
     .bind(now)
@@ -142,23 +160,52 @@ async fn insert_outsource_company(pool: &PgPool, name: &str) -> i64 {
     id
 }
 
-/// 直插 OUTSOURCE 类别 process。
-async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+/// 直插任意 category 的 process。
+async fn seed_process(pool: &PgPool, code: &str, name: &str, category: &str) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
          version, created_at, updated_at) \
-         VALUES ($1, $2, $3, 'OUTSOURCE', 0, true, 0, $4, $4)",
+         VALUES ($1, $2, $3, $4, 0, true, 0, $5, $5)",
     )
     .bind(id)
     .bind(code)
     .bind(name)
+    .bind(category)
     .bind(now)
     .execute(pool)
     .await
-    .expect("insert OUTSOURCE process");
+    .expect("insert t_process");
+    id
+}
+
+/// 直插 OUTSOURCE 类别 process。
+async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+    seed_process(pool, code, name, "OUTSOURCE").await
+}
+
+/// 2026-10-03 新增：直插 `t_outsource_company_process`（公司 ↔ 工序映射）。
+///
+/// `send-to-outsource` 新增守卫：该公司必须映射该外协工序，否则 400。
+async fn map_company_process(pool: &PgPool, company_id: i64, process_id: i64) -> i64 {
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_outsource_company_process \
+         (id, outsource_company_id, process_id, sort_order, version, created_at, created_by, \
+          updated_at, updated_by) \
+         VALUES ($1, $2, $3, 0, 0, $4, 0, $4, 0)",
+    )
+    .bind(id)
+    .bind(company_id)
+    .bind(process_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_outsource_company_process");
     id
 }
 
@@ -169,6 +216,17 @@ async fn insert_approved_quote(
     company_id: i64,
     process_id: i64,
 ) -> i64 {
+    insert_quote_with_price(pool, part_id, company_id, process_id, "12.50").await
+}
+
+/// 同 [`insert_approved_quote`]，单价可指定（DIRECT 复用要断言单价透传）。
+async fn insert_quote_with_price(
+    pool: &PgPool,
+    part_id: i64,
+    company_id: i64,
+    process_id: i64,
+    price: &str,
+) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
@@ -176,12 +234,14 @@ async fn insert_approved_quote(
         "INSERT INTO t_outsource_quote \
          (id, part_id, outsource_company_id, process_id, price, status, submitted_at, \
           reviewed_at, review_note, version, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, 12.50, 'APPROVED', $5, $5, 'OK', 0, $5, $5)",
+         VALUES ($1, $2, $3, $4, $5::numeric, 'APPROVED', $6, \
+                 $6, 'OK', 0, $6, $6)",
     )
     .bind(id)
     .bind(part_id)
     .bind(company_id)
     .bind(process_id)
+    .bind(price)
     .bind(now)
     .execute(pool)
     .await
@@ -234,6 +294,129 @@ async fn create_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: 
     step_id
 }
 
+/// 直插一张货架（`zone` = `PRODUCTION` / `INSPECTION`）。
+async fn insert_shelf(pool: &PgPool, code: &str, zone: &str) -> i64 {
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 'Recv', $3, true, 0, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(zone)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_shelf");
+    id
+}
+
+/// 直插 `t_shelf_process`（货架 ↔ 工序映射）。
+async fn map_shelf_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, \
+         created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(shelf_id)
+    .bind(process_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_shelf_process");
+}
+
+/// 外协回收侧（回生产架）的成套 fixture：PRODUCTION 货架 + 映射「下一道工序」+
+/// 在 part 的 chain 里为该工序建 step。
+///
+/// `resolve_step_id_by_process` 守的就是那条 step：缺了端点会以
+/// `BIZ_PROCESS_CHAIN_STEP_NOT_FOUND` 422 拒绝，故 create_step 不能省。
+///
+/// 返回 `(shelf_id, next_process_id)`。
+async fn setup_receive_side(
+    pool: &PgPool,
+    chain_id: i64,
+    shelf_code: &str,
+    next_proc_code: &str,
+) -> (i64, i64) {
+    let shelf_id = insert_shelf(pool, shelf_code, "PRODUCTION").await;
+    let next_proc = seed_outsource_process(pool, next_proc_code, "recv_proc").await;
+    map_shelf_process(pool, shelf_id, next_proc).await;
+    create_step(pool, chain_id, next_proc, 2).await;
+    (shelf_id, next_proc)
+}
+
+/// 外协在途态的成套 fixture：OUTSOURCE 批次（`location='OUTSOURCE_COMPANY'`）+
+/// 开口 `OUTSOURCING` shipment（数量 = 发出时的全量 = `batch_qty`）+ 回收目标架。
+///
+/// 返回 `(batch_id, quote_id, shelf_id, next_process_id)`。
+#[allow(clippy::too_many_arguments)]
+async fn setup_inflight(
+    pool: &PgPool,
+    name: &str,
+    prefix: &str,
+    proc_code: &str,
+    shelf_code: &str,
+    next_proc_code: &str,
+    batch_qty: i32,
+) -> (i64, i64, i64, i64) {
+    let customer_id = insert_l1_customer(pool, name, prefix).await;
+    let part_id = insert_part(pool, customer_id, "PENDING").await;
+    let bid = insert_batch_with_qty(
+        pool,
+        part_id,
+        "OUTSOURCE",
+        Some("OUTSOURCE_COMPANY"),
+        batch_qty,
+    )
+    .await;
+    let company_id = insert_outsource_company(pool, &format!("{name}Co")).await;
+    let proc_id = seed_outsource_process(pool, proc_code, "proc").await;
+    let quote_id = insert_approved_quote(pool, part_id, company_id, proc_id).await;
+    let chain_id = create_chain_for_part(pool, part_id).await;
+    create_step(pool, chain_id, proc_id, 1).await;
+    let now = now_naive();
+    let shipment_id: i64 = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    sqlx::query(
+        "INSERT INTO t_outsource_shipment \
+         (id, quote_id, part_id, batch_id, outsource_company_id, process_id, \
+          quantity, unit_price, status, sent_at, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 12.50, 'OUTSOURCING', $8, 0, $8, $8)",
+    )
+    .bind(shipment_id)
+    .bind(quote_id)
+    .bind(part_id)
+    .bind(bid)
+    .bind(company_id)
+    .bind(proc_id)
+    .bind(batch_qty)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_outsource_shipment");
+    let (shelf_id, next_proc) =
+        setup_receive_side(pool, chain_id, shelf_code, next_proc_code).await;
+    (bid, quote_id, shelf_id, next_proc)
+}
+
+/// 查某 part 名下全部活跃批次的 `(id, quantity, status, location, version)`。
+async fn list_batches(pool: &PgPool, part_id: i64) -> Vec<(i64, i32, String, Option<String>, i32)> {
+    sqlx::query_as(
+        "SELECT id, quantity, status, location, version FROM t_part_batch \
+         WHERE part_id = $1 AND deleted_at IS NULL ORDER BY batch_no",
+    )
+    .bind(part_id)
+    .fetch_all(pool)
+    .await
+    .expect("list t_part_batch")
+}
+
 // ===========================================================================
 //  Tests
 // ===========================================================================
@@ -249,6 +432,8 @@ async fn send_to_outsource_inserts_shipment_out_sourcing() {
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+    // 2026-10-03 新增守卫：公司必须映射该外协工序
+    map_company_process(&pool, company_id, proc_id).await;
 
     let (s, env) = send(
         app.clone(),
@@ -303,6 +488,8 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+    // 2026-10-03 新增守卫：公司必须映射该外协工序
+    map_company_process(&pool, company_id, proc_id).await;
 
     // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
     // receive-from-outsource 要求 part 已绑定工艺链
@@ -373,19 +560,22 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
     assert_eq!(count, 2);
 }
 
+/// 2026-10-03：DIRECT 免审批直发 —— 无可用报价时自动建 `price=0` 的 APPROVED
+/// 占位报价（`is_direct=true`），shipment 单价落 0 且请求成功。
+///
+/// 这条锁的是「原 501 stub 已下线」+「占位报价可被对账页识别」两件事。
 #[tokio::test]
-async fn send_to_outsource_direct_returns_internal_error() {
+async fn send_to_outsource_direct_creates_zero_price_placeholder_quote() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "Dir", "I").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "DirCo").await;
     let proc_id = seed_outsource_process(&pool, "PDIR", "dir").await;
-
-    // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
-    // receive-from-outsource 要求 part 已绑定工艺链
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+
     let (s, env) = send(
         app,
         json_request(
@@ -401,9 +591,461 @@ async fn send_to_outsource_direct_returns_internal_error() {
         ),
     )
     .await;
-    // DIRECT 模式 stub → INTERNAL 500
-    assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR, "direct: {env}");
-    assert_eq!(env["code"].as_i64().unwrap(), 50000);
+    assert_eq!(s, StatusCode::OK, "direct 直发: {env}");
+    assert_eq!(env["data"]["status"], "OUTSOURCE");
+
+    // 自动建的占位报价：APPROVED + price 0 + is_direct=true + note 标明来源
+    let quote: (String, String, String, bool) = sqlx::query_as(
+        "SELECT status, price::text, note, is_direct FROM t_outsource_quote \
+         WHERE part_id = $1 AND outsource_company_id = $2 AND process_id = $3",
+    )
+    .bind(part_id)
+    .bind(company_id)
+    .bind(proc_id)
+    .fetch_one(&pool)
+    .await
+    .expect("DIRECT 占位报价");
+    assert_eq!(quote.0, "APPROVED");
+    assert_eq!(
+        quote.1, "0.00",
+        "占位报价单价必须为 0（numeric(12,2) 文本化）"
+    );
+    assert!(
+        quote.2.contains("DIRECT"),
+        "占位报价 note 应写明来源便于对账识别，实际：{}",
+        quote.2
+    );
+    assert!(
+        quote.3,
+        "占位报价必须标 is_direct=true 以避开审批报价唯一索引"
+    );
+
+    // shipment 引用该占位报价、单价 0
+    let row: (i64, i32, String, String) = sqlx::query_as(
+        "SELECT quote_id, quantity, status, unit_price::text FROM t_outsource_shipment \
+         WHERE batch_id = $1",
+    )
+    .bind(bid)
+    .fetch_one(&pool)
+    .await
+    .expect("shipment row");
+    let placeholder_id: i64 =
+        sqlx::query_scalar("SELECT id FROM t_outsource_quote WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, placeholder_id, "shipment 必须引用占位报价");
+    assert_eq!(row.1, 5);
+    assert_eq!(row.2, "OUTSOURCING");
+    assert_eq!(row.3, "0.00");
+}
+
+/// 2026-10-03：DIRECT 命中活跃 APPROVED 报价时**复用**它（不新建占位），
+/// shipment 单价等于该报价单价。
+#[tokio::test]
+async fn send_to_outsource_direct_reuses_active_approved_quote() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "DirR", "J").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "DirReuseCo").await;
+    let proc_id = seed_outsource_process(&pool, "PDIRREUSE", "dirreuse").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    // 已审批报价（单价 8.80，与 helper 默认 12.50 不同以示区分）
+    let quote_id = insert_quote_with_price(&pool, part_id, company_id, proc_id, "8.80").await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "direct": true,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "direct 复用: {env}");
+
+    // 不得新建报价：整个 part 下仍只有那 1 条
+    let quote_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_quote WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(quote_count, 1, "DIRECT 命中活跃报价时不得另建占位报价");
+    let (shipment_quote_id, unit_price): (i64, String) = sqlx::query_as(
+        "SELECT quote_id, unit_price::text FROM t_outsource_shipment WHERE batch_id = $1",
+    )
+    .bind(bid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        shipment_quote_id, quote_id,
+        "shipment 应引用既有 APPROVED 报价"
+    );
+    assert_eq!(unit_price, "8.80");
+}
+
+/// 2026-10-03：`direct=true` 与 `quote_id` 互斥（两种价来源不能同时给）。
+#[tokio::test]
+async fn send_to_outsource_direct_with_quote_id_rejected() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "DirX", "K").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "DirXCo").await;
+    let proc_id = seed_outsource_process(&pool, "PDIRX", "dirx").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "quote_id": quote_id.to_string(),
+                "direct": true,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "direct+quote_id: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 20104);
+    // 批次未被改动
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "PENDING");
+}
+
+/// 2026-10-03：既不给 `direct` 也不给 `quote_id` → 400。
+///
+/// 这是「外协对账单价恒为 0」的根因守卫：此前不传价来源会被静默接受，shipment
+/// 的 `unit_price` 落 0 且无人察觉。
+#[tokio::test]
+async fn send_to_outsource_without_price_source_rejected() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "NoP", "N").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "NoPCo").await;
+    let proc_id = seed_outsource_process(&pool, "PNOP", "nop").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "无价来源: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 20104);
+    let shipment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_shipment WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shipment_count, 0, "被拒请求不得留下 shipment");
+}
+
+/// 2026-10-03 新增守卫：process 类别不是 `OUTSOURCE` → 400。
+///
+/// 守卫前把货派给内部工序也照样成功，批次随后被标成 OUTSOURCE + 挂外协公司。
+#[tokio::test]
+async fn send_to_outsource_rejects_non_outsource_process_category() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "Cat", "G").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "CatCo").await;
+    // 内部工序（category='INHOUSE' —— t_process 的合法类别只有 INHOUSE / OUTSOURCE）
+    let proc_id = seed_process(&pool, "PASM", "asm", "INHOUSE").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "quote_id": quote_id.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "非外协工序: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 20104);
+}
+
+/// 2026-10-03 新增守卫：公司未映射该工序 → 400（公司在册 ≠ 有该工序能力）。
+#[tokio::test]
+async fn send_to_outsource_rejects_company_without_process_mapping() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "Map", "M").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "MapCo").await;
+    let proc_id = seed_outsource_process(&pool, "PMAP", "map").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    // 刻意不调 map_company_process
+    let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "quote_id": quote_id.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "公司未映射工序: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 20104);
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "PENDING", "被拒请求不得改批次状态");
+}
+
+/// 2026-10-03 部分发送：`quantity = 批次量的一半` → 源批次留在原处（量减半、
+/// 状态/货架不变），新子批次 OUTSOURCE，shipment 记本次发送量。
+///
+/// 锁住的是「拆批而不是静默整批」——此前 DTO 无 `quantity` 字段，serde 静默忽略，
+/// 用户选 5 件实际整批发出。
+#[tokio::test]
+async fn send_to_outsource_partial_quantity_splits_batch() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "Psend", "B").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    // 源状态只能 PENDING：状态机白名单（`PartStatus::can_transition_to`）没有
+    // `IN_PROCESS → OUTSOURCE` 边，故 service 里那段「IN_PROCESS 必须在
+    // PRODUCTION_SHELF」的守恒在当前代码里不可达（见 docs/api/production/batches.md
+    // 「已知不一致」节）。部分发送的拆批语义与源状态无关，故用 PENDING 覆盖。
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "PsendCo").await;
+    let proc_id = seed_outsource_process(&pool, "PPSEND", "psend2").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "quote_id": quote_id.to_string(),
+                "quantity": 2,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "部分发送: {env}");
+
+    let batches = list_batches(&pool, part_id).await;
+    assert_eq!(batches.len(), 2, "部分发送应拆出 1 个子批次：{batches:?}");
+    let source = batches.iter().find(|b| b.0 == bid).expect("源批次仍在");
+    assert_eq!(source.1, 3, "源批次余量 = 5 - 2");
+    assert_eq!(source.2, "PENDING", "源批次状态不变（没被发出去）");
+    assert_eq!(source.3, None, "源批次 location 不变（仍留在原处）");
+    let child = batches.iter().find(|b| b.0 != bid).expect("子批次");
+    assert_eq!(child.1, 2);
+    assert_eq!(child.2, "OUTSOURCE");
+    assert_eq!(child.3.as_deref(), Some("OUTSOURCE_COMPANY"));
+
+    // shipment 挂在**子批次**上、quantity = 本次发送量
+    let (ship_batch, ship_qty, ship_price): (i64, i32, String) = sqlx::query_as(
+        "SELECT batch_id, quantity, unit_price::text FROM t_outsource_shipment \
+         WHERE part_id = $1",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ship_batch, child.0, "shipment 应挂在发出去的子批次上");
+    assert_eq!(ship_qty, 2);
+    assert_eq!(ship_price, "12.50");
+
+    // part_event 记本次发送量与子批次
+    let (ev_batch, ev_qty): (i64, i32) = sqlx::query_as(
+        "SELECT batch_id, quantity FROM t_part_event \
+         WHERE part_id = $1 AND event_type = 'SENT_TO_OUTSOURCE'",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ev_batch, child.0);
+    assert_eq!(ev_qty, 2);
+}
+
+/// 2026-10-03：`quantity == 批次量` 视为整批，**不产生**子批次。
+#[tokio::test]
+async fn send_to_outsource_quantity_equal_batch_is_whole_batch() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "EqAll", "E").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "EqAllCo").await;
+    let proc_id = seed_outsource_process(&pool, "PEQALL", "eqall").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "quote_id": quote_id.to_string(),
+                "quantity": 5,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "整批发送: {env}");
+    let batches = list_batches(&pool, part_id).await;
+    assert_eq!(batches.len(), 1, "quantity == 批次量不得拆批：{batches:?}");
+    assert_eq!(batches[0].0, bid);
+    assert_eq!(batches[0].1, 5);
+    assert_eq!(batches[0].2, "OUTSOURCE");
+}
+
+/// 2026-10-03：部分发送的 3 类数量非法（超量 / 0 / 负数）一律 400。
+#[tokio::test]
+async fn send_to_outsource_invalid_quantity_rejected() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "BadQ", "X").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "BadQCo").await;
+    let proc_id = seed_outsource_process(&pool, "PBADQ", "badq").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    for bad in [6, 0, -1] {
+        let (s, env) = send(
+            app.clone(),
+            json_request(
+                "POST",
+                &format!("/prod/batches/{bid}/send-to-outsource"),
+                Some(json!({
+                    "version": 0,
+                    "outsource_company_id": company_id.to_string(),
+                    "process_id": proc_id.to_string(),
+                    "quote_id": quote_id.to_string(),
+                    "quantity": bad,
+                })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "quantity={bad}: {env}");
+        assert_eq!(env["code"].as_i64().unwrap(), 20104);
+    }
+    let (status, qty): (String, i32) =
+        sqlx::query_as("SELECT status, quantity FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "PENDING");
+    assert_eq!(qty, 5, "被拒请求不得拆批改量");
+}
+
+/// 2026-10-03：部分发送的乐观锁仍锚在**源批次**上（过期 version → 409）。
+#[tokio::test]
+async fn send_to_outsource_partial_stale_version_conflicts() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "Stale", "T").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "StaleCo").await;
+    let proc_id = seed_outsource_process(&pool, "PSTALE", "stale").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 99,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "quote_id": quote_id.to_string(),
+                "quantity": 2,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "过期 version: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 40901);
+    let batches = list_batches(&pool, part_id).await;
+    assert_eq!(batches.len(), 1, "OCC 失败不得留下子批次");
 }
 
 #[tokio::test]
@@ -420,6 +1062,8 @@ async fn send_to_outsource_quote_not_approved_returns_21307() {
     // receive-from-outsource 要求 part 已绑定工艺链
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    // 2026-10-03 新增守卫：公司必须映射该外协工序
+    map_company_process(&pool, company_id, proc_id).await;
     let qid = {
         let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
         let id = snowflake.next_id();
@@ -547,13 +1191,16 @@ async fn receive_from_outsource_marks_shipment_received() {
     assert_eq!(env["data"]["status"], "IN_PROCESS");
 
     // 验证 shipment → RECEIVED + received_at 写入
-    let (status, _received_at): (String, Option<chrono::NaiveDateTime>) =
+    // 2026-10-03 补断言：整批回收必须落 received_at（部分接收**不**落，
+    // 见 receive_from_outsource_partial_quantity_keeps_shipment_open）
+    let (status, received_at): (String, Option<chrono::NaiveDateTime>) =
         sqlx::query_as("SELECT status, received_at FROM t_outsource_shipment WHERE batch_id = $1")
             .bind(bid)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(status, "RECEIVED");
+    assert!(received_at.is_some(), "整批回收必须写 received_at");
     // 验证 quote_event 写了 RECEIVED
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM t_outsource_quote_event \
@@ -564,6 +1211,215 @@ async fn receive_from_outsource_marks_shipment_received() {
     .await
     .unwrap();
     assert_eq!(count, 1);
+}
+
+/// 2026-10-03 部分接收：子批次回生产架、源批次保留余量且**仍 OUTSOURCE**，
+/// 开口 shipment 保持 `OUTSOURCING` / `received_at` 仍 NULL，且不写 quote
+/// event RECEIVED。
+///
+/// 这是本任务最容易被"顺手改成整批"的一处语义，锁死它。
+#[tokio::test]
+async fn receive_from_outsource_partial_quantity_keeps_shipment_open() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (bid, quote_id, shelf_id, next_proc) =
+        setup_inflight(&pool, "PRec", "Y", "PPRec", "REC-P", "REC-PROC-P", 5).await;
+    let part_id: i64 = sqlx::query_scalar("SELECT part_id FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/receive-from-outsource"),
+            Some(json!({
+                "version": 0,
+                "shelf_id": shelf_id.to_string(),
+                "next_process_id": next_proc.to_string(),
+                "quantity": 2,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "部分接收: {env}");
+
+    let batches = list_batches(&pool, part_id).await;
+    assert_eq!(batches.len(), 2, "部分接收应拆出 1 个子批次：{batches:?}");
+    let source = batches.iter().find(|b| b.0 == bid).expect("源批次");
+    assert_eq!(source.1, 3, "源批次余量 = 5 - 2");
+    assert_eq!(source.2, "OUTSOURCE", "源批次仍在外协厂");
+    assert_eq!(source.3.as_deref(), Some("OUTSOURCE_COMPANY"));
+    let child = batches.iter().find(|b| b.0 != bid).expect("子批次");
+    assert_eq!(child.1, 2);
+    assert_eq!(child.2, "IN_PROCESS");
+    assert_eq!(child.3.as_deref(), Some("PRODUCTION_SHELF"));
+
+    // 记账口径：shipment 仍开口
+    let (status, received_at, qty, batch_id): (
+        String,
+        Option<chrono::NaiveDateTime>,
+        i32,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT status, received_at, quantity, batch_id FROM t_outsource_shipment \
+         WHERE part_id = $1",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "OUTSOURCING", "部分接收不得关 shipment");
+    assert!(received_at.is_none(), "部分接收不得写 received_at");
+    assert_eq!(qty, 5, "shipment 记的是发出时的全量");
+    assert_eq!(batch_id, Some(bid), "shipment 仍挂在源批次上");
+
+    // 不写 quote event RECEIVED
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM t_outsource_quote_event \
+         WHERE quote_id = $1 AND event_type = 'RECEIVED'",
+    )
+    .bind(quote_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event_count, 0, "部分接收不得写 RECEIVED 事件");
+
+    // part_event 记本次回收量与子批次
+    let (ev_batch, ev_qty): (i64, i32) = sqlx::query_as(
+        "SELECT batch_id, quantity FROM t_part_event \
+         WHERE part_id = $1 AND event_type = 'RECEIVED_FROM_OUTSOURCE'",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ev_batch, child.0);
+    assert_eq!(ev_qty, 2);
+}
+
+/// 2026-10-03：部分接收的 3 类数量非法（超量 / 0 / 负数）一律 400 且不动批次。
+#[tokio::test]
+async fn receive_from_outsource_invalid_quantity_rejected() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (bid, _q, shelf_id, next_proc) =
+        setup_inflight(&pool, "BadR", "W", "PBADR", "REC-B", "REC-PROC-B", 5).await;
+
+    for bad in [6, 0, -1] {
+        let (s, env) = send(
+            app.clone(),
+            json_request(
+                "POST",
+                &format!("/prod/batches/{bid}/receive-from-outsource"),
+                Some(json!({
+                    "version": 0,
+                    "shelf_id": shelf_id.to_string(),
+                    "next_process_id": next_proc.to_string(),
+                    "quantity": bad,
+                })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "quantity={bad}: {env}");
+        assert_eq!(env["code"].as_i64().unwrap(), 20104);
+    }
+    let (status, qty): (String, i32) =
+        sqlx::query_as("SELECT status, quantity FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "OUTSOURCE");
+    assert_eq!(qty, 5, "被拒请求不得拆批改量");
+}
+
+/// 2026-10-03：部分接收的乐观锁同样锚在源批次上（过期 version → 409）。
+#[tokio::test]
+async fn receive_from_outsource_partial_stale_version_conflicts() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (bid, _q, shelf_id, next_proc) =
+        setup_inflight(&pool, "StaleR", "V", "PSTALER", "REC-S", "REC-PROC-S", 5).await;
+    let part_id: i64 = sqlx::query_scalar("SELECT part_id FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/receive-from-outsource"),
+            Some(json!({
+                "version": 99,
+                "shelf_id": shelf_id.to_string(),
+                "next_process_id": next_proc.to_string(),
+                "quantity": 2,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT, "过期 version: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 40901);
+    assert_eq!(
+        list_batches(&pool, part_id).await.len(),
+        1,
+        "OCC 失败不得拆批"
+    );
+}
+
+/// 回归：`receive-from-outsource-to-inspection`（整批直送品检）不受本次改动影响
+/// —— 仍落 `INSPECTION` + 送检架，并把开口 shipment 标 RECEIVED。
+#[tokio::test]
+async fn receive_from_outsource_to_inspection_closes_shipment() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (bid, quote_id, _shelf, _next_proc) =
+        setup_inflight(&pool, "Insp", "Z", "PINSP", "REC-I", "REC-PROC-I", 5).await;
+    let insp_shelf = insert_shelf(&pool, "INS-1", "INSPECTION").await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/receive-from-outsource-to-inspection"),
+            Some(json!({
+                "version": 0,
+                "shelf_id": insp_shelf.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "直送品检: {env}");
+    assert_eq!(env["data"]["status"], "INSPECTION");
+    let (status, location, received_at): (String, Option<String>, Option<chrono::NaiveDateTime>) =
+        sqlx::query_as(
+            "SELECT b.status, b.location, s.received_at FROM t_part_batch b \
+             JOIN t_outsource_shipment s ON s.batch_id = b.id WHERE b.id = $1",
+        )
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "INSPECTION");
+    assert_eq!(location.as_deref(), Some("INSPECTION_SHELF"));
+    assert!(
+        received_at.is_some(),
+        "整批直送品检应关 shipment 并写 received_at"
+    );
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM t_outsource_quote_event \
+         WHERE quote_id = $1 AND event_type = 'RECEIVED'",
+    )
+    .bind(quote_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event_count, 1);
 }
 
 #[tokio::test]
