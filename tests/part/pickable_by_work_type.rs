@@ -307,3 +307,175 @@ async fn pickable_shelf_filter_keeps_per_batch_anchor() {
         "shelf_id 过滤不影响 batch_id: {env}"
     );
 }
+
+// ===========================================================================
+//  2026-10-03 review 第 1 轮 Major-2：`serial_no IS NULL` 不得整页 500
+// ===========================================================================
+//
+// `t_part.serial_no` 是 nullable（手工工单无序列号；baseline 里是
+// `serial_no character varying(15)`，无 NOT NULL）。本文件三个同族端点的取行 SQL
+// 此前都把 `p.serial_no` 按 `String` 解码，遇任一 `serial_no IS NULL` 的 part 就
+// `ColumnDecode` → 整页 500（`unexpected null; try decoding as an Option`）。
+// 手工工单是常态 ⇒ 这是必经路径而非边角。
+//
+// 本轮（独立 commit）一次清完 `part/service/phase1/work_type.rs` 的全部 3 处：
+//   · `list_pickable_by_work_type`（`GET /parts/pickable-by-work-type/{id}`）
+//   · `list_by_work_type`（`GET /parts/by-work-type/{id}`）  ← 本节用例 1
+//   · `list_by_worker`（`GET /parts/by-worker/{id}`）        ← 本节用例 2
+
+/// 插一个 active 且已绑 work_type 的工人（`by-work-type` 走 `t_worker` JOIN，
+/// `by-worker` 以 worker_id 为过滤锚点）。
+async fn insert_active_worker(pool: &PgPool, work_type_id: i64, code: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let id = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
+         created_at, updated_at) VALUES ($1, $2, $3, true, $4, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(format!("{code}-NAME"))
+    .bind(work_type_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_worker");
+    id
+}
+
+/// 插一个「工人持有中」的批次（`IN_PROCESS` + `location='WORKER'` + holder=worker），
+/// 这是 `by-work-type` / `by-worker` 两个端点的硬过滤条件。
+async fn insert_worker_held_batch(pool: &PgPool, part_id: i64, worker_id: i64, qty: i32) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let id = pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, $3, 'IN_PROCESS', 'WORKER', $4, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(qty)
+    .bind(worker_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch (WORKER-held)");
+    id
+}
+
+/// 2026-10-03 review 第 1 轮 Major-2 用例 1：`GET /parts/by-work-type/{id}` 遇
+/// `serial_no IS NULL` 的手工工单必须 200 且该行 `serial_no` 为 `null`。
+///
+/// 修复前本端点整页 500（`by-work-type` 是 `pickable-by-work-type` 的同族兄弟，
+/// 扫码台两个列表页挨着）。用例刻意造 `serial_no: None` 的行。
+#[tokio::test]
+async fn by_work_type_tolerates_null_serial_no() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WT-SERIAL-NULL").await;
+    let manual_part = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "无序列号件",
+        "D-SERIAL-NULL",
+        None,
+    )
+    .await;
+    let _manual_batch = insert_worker_held_batch(&pool, manual_part, worker_id, 3).await;
+
+    // 同工种再放一个**有**序列号的行：证明 null 行不是「整页空」而是「与有值行共存」
+    let normal_part = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "有序列号件",
+        "D-SERIAL-OK",
+        Some("WT-OK-001"),
+    )
+    .await;
+    let _normal_batch = insert_worker_held_batch(&pool, normal_part, worker_id, 5).await;
+
+    let uri = format!("/parts/by-work-type/{}", fx.work_type_a_id);
+    let (status, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "serial_no=NULL 不应 500: {env}");
+    assert_eq!(env["code"], 0, "{uri}: {env}");
+
+    let ids = part_ids(&env);
+    assert_eq!(
+        ids.len(),
+        2,
+        "null 行与有值行都应上榜（修复前整页 500、一行都拿不到）: {env}"
+    );
+    let null_item = item_by_part_id(&env, manual_part);
+    assert!(
+        null_item["serial_no"].is_null(),
+        "手工工单的 serial_no 应序列化为 null 而非整页炸掉: {env}"
+    );
+    assert_eq!(
+        item_by_part_id(&env, normal_part)["serial_no"],
+        "WT-OK-001",
+        "同页有序列号的行不受影响: {env}"
+    );
+}
+
+/// 2026-10-03 review 第 1 轮 Major-2 用例 2：`GET /parts/by-worker/{id}` 同款。
+#[tokio::test]
+async fn by_worker_tolerates_null_serial_no() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-SERIAL-NULL").await;
+    let manual_part = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "持有中无序列号件",
+        "D-WK-SERIAL-NULL",
+        None,
+    )
+    .await;
+    let _manual_batch = insert_worker_held_batch(&pool, manual_part, worker_id, 7).await;
+
+    // 另一个工人工种下也放一个有序列号的行，验证 worker_id 过滤仍生效
+    let other_worker = insert_active_worker(&pool, fx.work_type_a_id, "WK-OTHER").await;
+    let other_part = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "他人持有件",
+        "D-WK-OTHER",
+        Some("WK-OTHER-001"),
+    )
+    .await;
+    let _other_batch = insert_worker_held_batch(&pool, other_part, other_worker, 2).await;
+
+    let uri = format!("/parts/by-worker/{worker_id}");
+    let (status, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "serial_no=NULL 不应 500: {env}");
+    assert_eq!(env["code"], 0, "{uri}: {env}");
+
+    assert_eq!(
+        part_ids(&env),
+        vec![manual_part.to_string()],
+        "只返该工人持有的行（修复前整页 500）: {env}"
+    );
+    let item = item_by_part_id(&env, manual_part);
+    assert!(
+        item["serial_no"].is_null(),
+        "手工工单的 serial_no 应序列化为 null: {env}"
+    );
+    assert_eq!(item["quantity"], 7, "quantity 取自批次: {env}");
+}

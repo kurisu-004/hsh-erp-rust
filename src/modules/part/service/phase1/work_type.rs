@@ -37,7 +37,15 @@ impl PartService {
         let limit = query.limit.unwrap_or(50).clamp(1, 200);
         let offset = query.offset.unwrap_or(0).max(0);
         // 直接列出该工种所有 worker 当前持有的件（IN_PROCESS + location=WORKER）
-        let rows: Vec<(i64, String, String, i32, i64, Option<String>)> = sqlx::query_as(
+        //
+        // ⚠️ `p.serial_no` 按 `Option<String>` 收（2026-10-03 review 第 1 轮
+        // Major-2 修）：`t_part.serial_no` 是 nullable（手工工单无序列号，见
+        // baseline `serial_no character varying(15)` 无 NOT NULL），原先按
+        // `String` 解码 → 遇到任一 `serial_no IS NULL` 的 part 就整页 500
+        // （`unexpected null; try decoding as an Option`）。手工工单是常态，
+        // 故这是真会触发的路径。同一缺陷的第三处见 `list_pickable_by_work_type`
+        // （2026-10-03 已修）与本文件 `list_by_worker`（同批已修）。
+        let rows: Vec<(i64, Option<String>, String, i32, i64, Option<String>)> = sqlx::query_as(
             "SELECT p.id, p.serial_no, p.drawing_no, b.quantity, b.id AS bid, w.name AS worker_name \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
@@ -60,7 +68,7 @@ impl PartService {
                 // 通过 `From<TPart>` 派生基础字段（next_process_id 自动不复制）。
                 let p = crate::modules::part::model::TPart {
                     id,
-                    serial_no: Some(serial),
+                    serial_no: serial,
                     name: drawing.clone(),
                     drawing_no: drawing,
                     applicant_name: String::new(),
@@ -259,7 +267,12 @@ impl PartService {
         ])?;
         let limit = query.limit.unwrap_or(50).clamp(1, 200);
         let offset = query.offset.unwrap_or(0).max(0);
-        let rows: Vec<(i64, String, String, i32)> = sqlx::query_as(
+        // ⚠️ `p.serial_no` 按 `Option<String>` 收（2026-10-03 review 第 1 轮
+        // Major-2 修）：同 `list_by_work_type` / `list_pickable_by_work_type`，
+        // `t_part.serial_no` nullable，原先按 `String` 解码会让
+        // `serial_no IS NULL` 的手工工单把整页打成 500。这是本文件同款写法的
+        // 最后一处。
+        let rows: Vec<(i64, Option<String>, String, i32)> = sqlx::query_as(
             "SELECT p.id, p.serial_no, p.drawing_no, b.quantity \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
@@ -280,7 +293,7 @@ impl PartService {
                 // 通过 `From<TPart>` 派生基础字段（next_process_id 自动不复制）。
                 let p = crate::modules::part::model::TPart {
                     id,
-                    serial_no: Some(serial),
+                    serial_no: serial,
                     name: drawing.clone(),
                     drawing_no: drawing,
                     applicant_name: String::new(),
