@@ -20,7 +20,7 @@
 //! ## 与 `mod.rs::sync_from_part_change` 静态 wrapper 的关系
 //! 2026-09-22 D-3 决策：本模块暴露 `pub async fn sync_from_part_change(self, ...)`（收
 //! `&self` + `repo: R`）；`mod.rs::AssemblyService::sync_from_part_change` 是 ZST 静态
-//! 入口（兼容 `part/service/rollup.rs:140` 的旧调用点），内部一行委托本函数。
+//! 入口（供 `prod::batch::status_gate` 的 ZST 调用点使用），内部一行委托本函数。
 //! 这样既保留 trait 注入式新路径（单测用），又不破坏生产跨模块 ZST 调用。
 
 use crate::auth::rbac::CurrentUser;
@@ -192,7 +192,7 @@ async fn sync_assembly_status<R: AssemblyRepoTrait>(
 // ---------- ZST 静态入口的兼容 wrapper ----------
 //
 // 2026-09-22 D-3 决策：`mod.rs::AssemblyService::sync_from_part_change` 是 ZST 静态入口
-// （兼容 `part/service/rollup.rs:140` 的旧调用点），内部一行委托本文件的
+// （供 `prod::batch::status_gate` 的 ZST 调用点使用），内部一行委托本文件的
 // `sync_from_part_change_inner`。本文件暴露 `pub async fn sync_from_part_change`
 // 作为 `mod.rs` wrapper 的直接实现点（避免 mod.rs 仅做 4 行 wrapper 而失去内聚性）。
 pub async fn sync_from_part_change(

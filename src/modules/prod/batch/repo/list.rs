@@ -47,8 +47,8 @@ impl PartBatchRepo {
     ///
     /// 2026-09-30（review 第 3 轮 M3）**回退**该查询到 step 派生，理由：
     ///
-    /// 本函数服务的两个端点 —— `GET /prod/batches/inspection`（`statuses =
-    /// ['INSPECTION']`）与 `GET /parts/{id}/repair-batches` / `repairing-batches`
+    /// 本函数服务的三个集合读端点 —— `GET /prod/batches/inspection`（`statuses =
+    /// ['INSPECTION']`）与 `GET /prod/batches/repair` / `GET /prod/batches/repairing`
     /// （`RepairBatchesOut` 是本行结构的类型别名）—— 都不是**工序池**端点，判据是
     /// `status`，与 `current_process_id` 无关。
     ///

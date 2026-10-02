@@ -23,7 +23,7 @@
 //! `PartFileRepo::xxx` ZST 静态方法。
 //!
 //! 反向：part → assembly 由 `AssemblyService::sync_from_part_change`（mod.rs 内
-//! ZST 静态入口）暴露，兼容 `part/service/rollup.rs:140` 的 ZST 调用点。
+//! ZST 静态入口）暴露，供 `prod::batch::status_gate` 的 ZST 调用点使用。
 //!
 //! ## 兼容旧测试的 ZST 静态 wrapper（2026-09-22 D-3 决策）
 //! 既存集成测试（`tests/assembly_api.rs` / `tests/assembly_files_api.rs` /
@@ -195,7 +195,7 @@ impl AssemblyService {
 
     /// 兼容旧 ZST 静态调用：单 part → assembly sync 钩子。
     ///
-    /// `part/service/rollup.rs:140` 仍走 ZST 静态调用。详见 [`sync_from_part::sync_from_part_change`]。
+    /// `prod::batch::status_gate` 走 ZST 静态调用。详见 [`sync_from_part::sync_from_part_change`]。
     pub async fn sync_from_part_change(
         conn: &mut sqlx::PgConnection,
         part_id: i64,

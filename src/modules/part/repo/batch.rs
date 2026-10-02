@@ -1,16 +1,12 @@
-//! `t_part_batch` 批次查询 + 状态机 UPDATE（2026-09-22 D-6 重构后**重导出壳**）
+//! `t_part_batch` repo 的**空壳** —— 仅保留模块路径，无任何代码项。
 //!
-//! ## 历史背景
-//! 2026-09-22 D-6 重构把原 `repo/part.rs` + `repo/batch.rs` + `repo/event.rs`
-//! 三文件 SQL 全部合并到 `repo/sql.rs` 的单 ZST `PartRepo`，并新增胖 trait
-//! `PartRepoTrait`（在 `mod.rs`）。
+//! 2026-10-02 域迁移：`t_part_batch` 的 repo 层已整体归 `prod::batch`。批次查询与
+//! 状态机写点的真源是 `prod::batch::repo::PartBatchRepo`（通用方法见
+//! `repo/queries.rs`、流转写点见 `repo/sql.rs`、8-JOIN 集合读见 `repo/list.rs`），
+//! 「PENDING 下发」专用查询见 `prod::batch::repo::BatchRepo`。
+//! `part::repo::PartRepo` **不再持有任何批次方法**。
 //!
-//! 本文件保留为**重导出壳**，让跨模块调用方（delivery_note / shelf /
-//! prod::worker_pool 等 7 域）的 `use crate::modules::part::repo::batch::*`（如有）
-//! 路径仍可解析。
-//!
-//! ## 本任务不修改 SQL 字符串
-//! 所有 SQL 字符串都在 `sql.rs` 内（ZST `PartRepo` 固有静态方法），保持原样。
+//! 本文件既不重导出也不引用上述符号，只让 `crate::modules::part::repo::batch`
+//! 路径继续可解析；新增批次 SQL 一律加在 `prod::batch::repo`，不要在此复活。
 
-// `t_part_batch` 查询 / mark 方法全部在 `PartRepo` 内（SQL 字符串已合并）。
-// 此模块当前为空（保留模块路径兼容），如未来需要拆 `BatchRepo` ZST 再启用。
+// 空模块：`t_part_batch` 的查询 / mark 方法全部在 `prod::batch::repo::PartBatchRepo`。

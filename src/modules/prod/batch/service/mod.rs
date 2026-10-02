@@ -27,8 +27,24 @@
 //! 形参一律 `<R: PartRepoTrait>(mut repo: R, ...)`：handler 开 tx 并 commit，
 //! 生产 `R = &mut PgConnection`；跨域 repo 与 inline sqlx 走 `repo.conn_mut()`。
 //! 用例读写 part 行（`get_part_inspected` / `insert_part_event`）与派生
-//! （`part::statemachine`）都经 part 域 trait，本模块对 part 的依赖是**单向**的；
-//! 反向（part → prod）只剩 `status_gate` + `PartBatchRepo` 两处数据依赖。
+//! （`part::statemachine`）都经 part 域 trait。
+//!
+//! ## 依赖方向：过渡期，**尚未单向**
+//! 本模块的批次方法（`mark_batch_*` / `find_*batch*` / `split_batch_for_partial_pass`
+//! 共 13 个，全目录 46 处 `PartRepoTrait` 引用）**经 part 域的 `PartRepoTrait` 调用**，
+//! 而这些 trait 的默认体在 `part::repo::PartRepoTrait` 内直接回调
+//! `PartBatchRepo` + `status_gate`。即调用链是
+//! `prod::batch::service → part::repo::PartRepoTrait → prod::batch::repo`：
+//! **prod 域的 service 借 part 域的 trait 写 prod 域自己的表**，这是当前真实存在的
+//! 反向依赖，不是单向。part → prod 方向另有 `status_gate` + `PartBatchRepo` 两处
+//! 数据依赖（`part::service` 的 `batch` / `crud` / `rollup` / `list_enrichment` /
+//! `phase1::events`）。
+//!
+//! 收敛目标（分两步，本轮只做标注，未动代码）：
+//! 1. prod service 改直调 `PartBatchRepo` / `status_gate`，不再借 part 域 trait；
+//! 2. part 域的 `POST /api/v2/parts/{part_id}/cancel` 与 `/force-complete`
+//!    改走 `prod::batch::service` / `status_gate` —— **前提是先把这 2 条端点重路由
+//!    到 prod 域**，否则 part 域无法在不自建反向依赖的前提下完成多批次动作。
 //!
 //! ## 事务 / 角色守卫
 //! 事务边界在 handler；角色守卫在 handler 与 service 双层（handler 做权限分发，

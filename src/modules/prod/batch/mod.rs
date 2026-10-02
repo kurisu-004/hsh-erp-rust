@@ -10,8 +10,11 @@
 //! `GET /{part_id}/batches` 与全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。
 //!
 //! 依赖方向：prod → part 单向（本模块引用 `PartOut` / `PartRepoTrait` /
-//! `part::statemachine` 等 part 域实体）；反向 part → prod 只剩
-//! `status_gate` + `PartBatchRepo` 两处数据依赖。
+//! `part::statemachine` 等 part 域实体）；但 `prod::batch::service` 的批次方法经
+//! part 域 `PartRepoTrait` 的默认体回调本模块 `PartBatchRepo` + `status_gate`，
+//! **构成反向依赖，尚未单向**。part → prod 方向另有 `status_gate` +
+//! `PartBatchRepo` 两处数据依赖。过渡期成因与收敛步骤见
+//! [`service`] 模块 doc。
 //!
 //! ## 模块结构
 //! - `model.rs` —— `TPartBatch` / `RecentBatchRow` / `PartBatchScanRow` /
