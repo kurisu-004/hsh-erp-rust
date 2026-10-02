@@ -424,13 +424,14 @@ Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 > `IN_PROCESS`」；判「返修中」一律读 `is_repairing`，可达链（起修后送检 /
 > 送检通过 / 发货的保持标记链）见 [`./inspection.md`](./inspection.md) 订正段。
 >
-> 2026-10-01 review 第 1 轮 M5 补齐：返修标记已随
-> `BatchOut`（= `InspectionBatchListItemOut`）的**新字段 `is_repairing: bool`**
-> 一起返回。此前「只有 status」的端点让前端彻底失去「返修中」信号 ——
-> 改造前靠 `status === 'REPAIRING'` 判定，改造后任何接口都拿不到该值。
-> 影响端点：`GET /prod/batches/repairing`、`GET /prod/batches/repair`、
-> `GET /prod/batches/inspection`，以及 `GET /parts/{id}/batches`
-> （`PartBatchListItemOut` 同样新增 `is_repairing: bool`）。
+> 返修标记随 `BatchOut`（= `InspectionBatchListItemOut`）的字段
+> `is_repairing: bool` 一起返回 —— 「只有 status」的端点会让前端彻底失去
+> 「返修中」信号（改造前靠 `status === 'REPAIRING'` 判定，改造后任何接口都拿不到
+> 该值）。影响端点：`GET /prod/batches/repairing`、`GET /prod/batches/repair`、
+> 以及 `GET /parts/{id}/batches`（`PartBatchListItemOut` 同样有 `is_repairing`）。
+> ⚠️ `GET /prod/batches/inspection` **不在此列**：该端点 2026-10-03 VO 收口成
+> `InspectionQueueItemOut`（13 字段），不投 `is_repairing`；待品检页不按返修标记
+> 分流，返修件与普通送检件在该页混排（同页原语义）。
 
 Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 

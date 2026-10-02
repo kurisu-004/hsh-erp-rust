@@ -24,7 +24,7 @@
 | GET | `/api/v2/parts/{part_id}` | Manager / Clerk / Inspector / CncProgrammer | 工单详情（含 customer_name / current_batch_id 冗余） | [`crud.md`](./crud.md#get-apiv2partspart_id) |
 | GET | `/api/v2/parts/by-serial/{serial_no}` | Manager / Clerk / Inspector / CncProgrammer | 通过序列号查详情 | [`crud.md`](./crud.md#get-apiv2partsby-serialserial_no) |
 | GET | `/api/v2/parts/by-serial/{serial_no}/part-batches` | Manager / Clerk / Inspector / CncProgrammer | 扫码快捷品检上下文（工单窄字段 + 全部活跃批次含 holder 名称） | [`inspection.md`](./inspection.md#get-apiv2partsby-serialserial_nopart-batches) |
-| GET | `/api/v2/prod/batches/inspection` | Manager / Inspector | 待品检批次列表（status=INSPECTION；含 batch_id + version + 工单 + holder/process/delivery_note/customer 名称一次解析）—— **2026-10-02 自 part 域迁入** | [`inspection.md`](./inspection.md#get-apiv2prodbatchesinspection) |
+| GET | `/api/v2/prod/batches/inspection` | Manager / Inspector | 待品检批次列表（判据 `status=INSPECTION`；**2026-10-03 VO 收口为 13 字段 `InspectionQueueItemOut` + 表头筛选 / 服务端排序**，与 repair / repairing 不再共用 VO）—— 2026-10-02 自 part 域迁入 | [`inspection.md`](./inspection.md#get-apiv2prodbatchesinspection) |
 | POST | `/api/v2/parts/{part_id}/update` | Manager / Clerk | 字段可选 UPDATE（OCC + 软删守卫） | [`crud.md`](./crud.md#post-apiv2partspart_idupdate) |
 | POST | `/api/v2/parts/{part_id}/soft-delete` | **Manager** | 软删（OCC + 终态禁 + delivery_note 锁禁） | [`crud.md`](./crud.md#post-apiv2partspart_idsoft-delete) |
 | POST | `/api/v2/parts/{part_id}/upload-drawing` | Manager / Clerk | Multipart PDF 上传到 COS + 落 `t_part_file`（CAS key 格式 2026-09-11 变更） | [`crud.md`](./crud.md#post-apiv2partspart_idupload-drawing) |
