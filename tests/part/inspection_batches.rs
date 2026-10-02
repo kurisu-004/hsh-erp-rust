@@ -3,19 +3,25 @@
 //! 覆盖：
 //!   1. happy path：list 仅返回 INSPECTION 批次，返回的 `batch_id + version`
 //!      可直接拼 `POST /prod/batches/{batch_id}/to-ship` 请求体（核心验收）。
-//!   2. keyword + customer_id 过滤：组合筛选命中预期行（其余行被过滤）。
-//!   3. 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。brief 原话
+//!   2. VO 收口守门（2026-10-03）：`items[*]` 的 key 集合**恰好** 13 个，多一个
+//!      少一个都失败（前端 Zod schema 依赖这份契约）。
+//!   3. 表头筛选：`drawing_no` / `name` / `system_delivery_date_from|to` /
+//!      `customer_id`（L1 展开）各自命中预期行。
+//!   4. 服务端排序：`sort_by` 白名单 7 值 + `sort_dir` + 非法值退化。
+//!   5. 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。brief 原话
 //!      「Worker role」并不存在，本仓库 5 角色中 ShelfAccount 是唯一合法登录、
 //!      但不在 `INSPECTION_LIST_ROLES = [Manager, Inspector]` 内的角色；
 //!      `PartFixture::SHELF_ACCOUNT_USERNAME` + SHELF_ACCOUNT role 提供该登录态。
-//!   4. 分页：`limit + offset` 正确切分 total / items。
-//!   5. 回归（2026-09-30 review 第 3 轮 M3）：`next_process_id` / `next_process_name`
-//!      由 `current_process_step_id` → step JOIN 派生，**不直读** `current_process_id`
-//!      （送检=出池后后者恒 NULL，直读会让这两个字段恒 null）。
+//!   6. 分页：`limit + offset` 正确切分 total / items。
 //!
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex 串行化。
+//!
+//! 2026-10-03 VO 收口：`holder_name` / `next_process_*` / `current_process_step_id`
+//! / `status` 等 15 个字段随本 VO 一并下线（待品检页只渲染 7 个数据列），相关
+//! 断言已随之删除。返修两条端点（`/repair` / `/repairing`）仍用宽 VO，其字段
+//! 守门测试在 `tests/part/repair.rs`。
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -187,6 +193,104 @@ async fn insert_part_with_step_located_insp_batch(
 //  Tests
 // ===========================================================================
 
+/// INSPECTION part + 批次的插入规格（表头筛选 / 排序测试用）。
+///
+/// 收 struct 而非 9 个位置参数：`clippy::too_many_arguments` + 免得调用处数错位。
+#[derive(Debug, Clone)]
+struct InspBatchSpec<'a> {
+    name: &'a str,
+    drawing_no: &'a str,
+    serial_no: Option<&'a str>,
+    customer_id: i64,
+    quantity: i32,
+    batch_no: i32,
+    /// `None` → 该工单不填系统交期（用于验证 `null` 投影与 `NULLS LAST`）。
+    system_delivery_date: Option<chrono::NaiveDate>,
+}
+
+/// 按规格插入一条 INSPECTION part + 批次（holder = 品检架），返回 (part_id, batch_id)。
+async fn insert_insp_batch_with_spec(
+    pool: &PgPool,
+    insp_shelf_id: i64,
+    spec: &InspBatchSpec<'_>,
+) -> (i64, i64) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, system_delivery_date, \
+         quantity, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, 'INSPECTION', $3, $6, $6, $7, $8, 0, $9, $9)",
+    )
+    .bind(part_id)
+    .bind(spec.serial_no)
+    .bind(spec.name)
+    .bind(spec.drawing_no)
+    .bind(spec.customer_id)
+    .bind(today)
+    .bind(spec.system_delivery_date)
+    .bind(spec.quantity)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert INSPECTION part");
+    let batch_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'INSPECTION', 'INSPECTION_SHELF', $5, 0, $6, $6)",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(spec.batch_no)
+    .bind(spec.quantity)
+    .bind(insp_shelf_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert INSPECTION batch");
+    (part_id, batch_id)
+}
+
+/// 造一个 L1 客户（`serial_prefix` 单个大写字母，全库唯一）。
+async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, created_at, updated_at) \
+         VALUES ($1, $2, NULL, $3, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(prefix)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert L1 customer");
+    id
+}
+
+/// 取响应 `data.items[*].batch_id` 的字符串列表（雪花 id 走 `serialize_i64`）。
+fn item_batch_ids(body: &Value) -> Vec<String> {
+    body["data"]["items"]
+        .as_array()
+        .expect("data.items")
+        .iter()
+        .map(|i| {
+            i["batch_id"]
+                .as_str()
+                .expect("batch_id 应为 string")
+                .to_string()
+        })
+        .collect()
+}
+
 /// happy path：list 仅返回 INSPECTION 状态的批次；返回的 `batch_id + version`
 /// 可直接喂给 `POST /prod/batches/{batch_id}/to-ship`（核心验收）。
 ///
@@ -284,7 +388,6 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
         .iter()
         .find(|i| i["batch_id"] == batch_a_str)
         .unwrap_or_else(|| panic!("items 应含 part A 的 batch_id={batch_a}: body={body}"));
-    assert_eq!(hit["status"], "INSPECTION", "hit.status 应为 INSPECTION");
     assert_eq!(
         hit["batch_id"], batch_a_str,
         "hit.batch_id 应等于 part A 的 batch_id"
@@ -306,15 +409,10 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
         "FX 客户 L2",
         "customer_name 应解析为 L2 客户名"
     );
-    // holder_name 由 COALESCE 三表解析，holder = INSPECTION 货架 → 应 = "FX 检验架"
-    assert!(
-        hit["holder_name"].is_string(),
-        "hit.holder_name 应为 Some（holder 指向 INSPECTION 货架）: body={body}"
-    );
     assert_eq!(
-        hit["holder_name"].as_str().unwrap(),
-        "FX 检验架",
-        "holder_name 应解析为品检架名称"
+        hit["l1_customer_name"].as_str(),
+        Some("FX 客户 L1"),
+        "l1_customer_name 应解析到 L1 客户名（L2.parent_id → pc.name）: body={body}"
     );
 
     // 不应包含 part B 的 IN_PROCESS 批次
@@ -349,128 +447,151 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
     assert_eq!(ship_body["data"]["part"]["status"], "READY_TO_SHIP");
 }
 
-/// keyword + customer_id 组合过滤：仅 L1_a 的 part 命中，其余被过滤。
-///
-/// 步骤：
-///   1. 2 个 L1 客户 L1_a / L1_b（互不关联）
-///   2. 每个 L1 下挂 1 个 part，名字不同（带唯一关键字）
-///   3. 每个 part 都有 INSPECTION 批次
-///   4. GET /prod/batches/inspection?customer_id=L1_a&keyword=<L1_a part name>
-///      → items 仅含 L1_a 的 batch（L1_b 的被过滤）
-///
-/// **keyword 字符约束**：service 层拒绝 `%` / `_` / `\\` 通配符特殊字符
-/// （VALIDATION_ERROR 40001）。关键字用大写字母串（避开 `_` / `%` / `\\`）。
+/// 表头筛选（2026-10-03）：`drawing_no` / `name` / `serial_no` 各一个独立 ILIKE
+/// 参数，且**与 `customer_id` 正交**（不再共用跨字段 `keyword`）。
 #[tokio::test]
-async fn inspection_batches_filters_by_keyword_and_customer() {
+async fn inspection_batches_filters_by_header_columns() {
     let (pool, app, token, _fx) = bootstrap_as_inspector().await;
-    // 建 2 个独立的 L1 客户 + L2（避免污染 fixture 内的 customer_id）
-    use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let l1_a = snowflake.next_id();
-    let l1_b = snowflake.next_id();
-    let now = now_naive();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, created_at, updated_at) \
-         VALUES ($1, 'ACMEA', NULL, 'A', 0, $2, $2), ($3, 'ACMEB', NULL, 'B', 0, $2, $2)",
-    )
-    .bind(l1_a)
-    .bind(now)
-    .bind(l1_b)
-    .execute(&pool)
-    .await
-    .expect("insert L1 customers");
+    let l1_a = insert_l1_customer(&pool, "ACMEA", "A").await;
+    let l1_b = insert_l1_customer(&pool, "ACMEB", "B").await;
 
-    // L1_a 下 1 个 part
-    let (part_a, batch_a) = insert_part_with_insp_batch(
+    let (part_a, batch_a) = insert_insp_batch_with_spec(
         &pool,
-        "PARTA",
-        l1_a,
-        Some("PA001"),
         PartFixture::INSPECTION_SHELF_ID,
+        &InspBatchSpec {
+            name: "PARTA",
+            drawing_no: "DWG-A-001",
+            serial_no: Some("PA001"),
+            customer_id: l1_a,
+            quantity: 5,
+            batch_no: 1,
+            system_delivery_date: None,
+        },
     )
     .await;
-    // L1_b 下 1 个 part
-    let (_part_b, batch_b) = insert_part_with_insp_batch(
+    let (_part_b, batch_b) = insert_insp_batch_with_spec(
         &pool,
-        "PARTB",
-        l1_b,
-        Some("PB001"),
         PartFixture::INSPECTION_SHELF_ID,
+        &InspBatchSpec {
+            name: "PARTB",
+            drawing_no: "DWG-B-001",
+            serial_no: Some("PB001"),
+            customer_id: l1_b,
+            quantity: 3,
+            batch_no: 1,
+            system_delivery_date: None,
+        },
     )
     .await;
 
-    // 组合过滤：customer_id=L1_a + keyword="PARTA"
-    let (status, body) = send(
-        app,
-        json_request(
-            "GET",
-            &format!("/prod/batches/inspection?customer_id={l1_a}&keyword=PARTA"),
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "filtered list: body={body}");
-    assert_eq!(body["code"], 0);
-    let items = body["data"]["items"].as_array().expect("data.items");
-
-    // 应仅含 L1_a 的 batch
-    // 预拼 id 字符串（避免 `or_fun_call` lint 警告）
+    // 预拼 id 字符串（避免 `.to_string()` 在比较时被 `or_fun_call` lint 警告）
     let batch_a_str = batch_a.to_string();
     let batch_b_str = batch_b.to_string();
     let part_a_str = part_a.to_string();
     let l1_a_str = l1_a.to_string();
 
-    // 应仅含 L1_a 的 batch
-    let contains_a = items.iter().any(|i| i["batch_id"] == batch_a_str);
-    assert!(
-        contains_a,
-        "items 应含 L1_a 的 batch_id={batch_a}: body={body}"
-    );
-    let contains_b = items.iter().any(|i| i["batch_id"] == batch_b_str);
-    assert!(
-        !contains_b,
-        "items 不应含 L1_b 的 batch_id={batch_b}（被 customer_id 过滤）: body={body}"
-    );
-    // 进一步断言：所有命中项的 part_id 都是 part_a
-    for item in items {
-        assert_eq!(
-            item["part_id"], part_a_str,
-            "所有命中项 part_id 都应 = part_a: body={body}"
-        );
-        assert_eq!(
-            item["customer_id"], l1_a_str,
-            "所有命中项 customer_id 都应 = L1_a: body={body}"
-        );
-    }
-}
-
-/// 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。
-///
-/// brief 原话「Worker role」并不存在（5 角色：Manager / Clerk / Inspector /
-/// CncProgrammer / ShelfAccount）。`INSPECTION_LIST_ROLES = [Manager, Inspector]`，
-/// `PartFixture::SHELF_ACCOUNT_USERNAME` 用 ShelfAccount（合法登录但不在白名单内）
-/// 模拟 SHELF_ACCOUNT 越权。
-#[tokio::test]
-async fn inspection_batches_role_guard_rejects_worker() {
-    let (pool, app, token, _fx) = bootstrap_as_shelf_account().await;
-
-    // 准备 1 个 INSPECTION 批次（让 list 在权限通过时返回非空，确保拒绝原因是角色）
-    let (_part_id, _batch_id) = insert_part_with_insp_batch(
-        &pool,
-        "PART_RG",
-        PartFixture::CUSTOMER_L2_ID,
-        Some("P-RG-001"),
-        PartFixture::INSPECTION_SHELF_ID,
+    // 1) drawing_no 独立筛选
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?drawing_no=DWG-A-001",
+            None::<Value>,
+            Some(&token),
+        ),
     )
     .await;
+    assert_eq!(status, StatusCode::OK, "drawing_no filter: body={body}");
+    assert_eq!(
+        item_batch_ids(&body),
+        vec![batch_a_str.clone()],
+        "drawing_no=DWG-A-001 应只命中 A: body={body}"
+    );
 
+    // 2) name 独立筛选（值取自 B）
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?name=PARTB",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "name filter: body={body}");
+    assert_eq!(
+        item_batch_ids(&body),
+        vec![batch_b_str.clone()],
+        "name=PARTB 应只命中 B: body={body}"
+    );
+
+    // 3) serial_no 独立筛选
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?serial_no=PB001",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "serial_no filter: body={body}");
+    assert_eq!(
+        item_batch_ids(&body),
+        vec![batch_b_str.clone()],
+        "serial_no=PB001 应只命中 B: body={body}"
+    );
+
+    // 4) customer_id + name 组合
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/prod/batches/inspection?customer_id={l1_a}&name=PARTA"),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "combined filter: body={body}");
+    let items = body["data"]["items"].as_array().expect("data.items");
+    assert_eq!(items.len(), 1, "组合筛选应只命中 1 行: body={body}");
+    assert_eq!(items[0]["batch_id"], batch_a_str);
+    assert_eq!(
+        items[0]["customer_id"], l1_a_str,
+        "所有命中项 customer_id 都应 = L1_a: body={body}"
+    );
+    assert_eq!(
+        items[0]["part_id"], part_a_str,
+        "所有命中项 part_id 都应 = part_a: body={body}"
+    );
+
+    // 5) 空串筛选值 = 不筛选（表头筛选框清空态）
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?name=",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "blank filter: body={body}");
+    assert_eq!(
+        item_batch_ids(&body).len(),
+        2,
+        "空串筛选不应过滤掉任何行: body={body}"
+    );
+
+    // 6) 通配符 → 40001 VALIDATION_ERROR（HTTP 422），不是 500
     let (status, body) = send(
         app,
         json_request(
             "GET",
-            "/prod/batches/inspection",
+            "/prod/batches/inspection?name=PART%25",
             None::<Value>,
             Some(&token),
         ),
@@ -478,167 +599,48 @@ async fn inspection_batches_role_guard_rejects_worker() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "ShelfAccount 越权应 403: body={body}"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "含 % 的筛选值应 422: body={body}"
     );
-    assert_eq!(
-        body["code"], 40300,
-        "白名单外角色应得 40300 FORBIDDEN: body={body}"
-    );
-    // message 形态由 require_any_role 决定，含「无权限」
-    let msg = body["message"].as_str().expect("message 应为 string");
-    assert!(
-        msg.contains("无权限") || msg.contains("40300") || msg.contains("forbidden"),
-        "message 应含权限拒绝语义（无权限 / 40300 / forbidden）: msg={msg}"
-    );
+    assert_eq!(body["code"], 40001, "应报 VALIDATION_ERROR: body={body}");
 }
 
-/// 分页：`limit + offset` 正确切分 total / items / 透传 limit / offset。
+/// **VO 收口守门（2026-10-03）**：`items[*]` 的 key 集合必须**恰好** 13 个。
 ///
-/// 步骤：
-///   1. 3 个 L1 客户各下 1 个 part，每个 part 有 INSPECTION 批次（≥3 条活跃批次）
-///   2. GET /prod/batches/inspection?limit=2&offset=1
-///   3. 断言：items.len() == 2；total >= 3；limit == 2；offset == 1
-///
-/// **L1 prefix 约束**：`t_customer.serial_prefix` 是 `varchar(1)` +
-/// CHECK `^[A-Z]$`（大写字母单字符）。每个 L1 用不同大写字母当 prefix。
+/// 前端待品检页按这 13 个字段建 Zod schema，VO 多投一个字段就是无用负载，
+/// 少投一个则前端渲染缺列 —— 故做「集合相等」断言（而非逐字段存在性）。
 #[tokio::test]
-async fn inspection_batches_pagination_limit_offset() {
-    let (pool, app, token, _fx) = bootstrap_as_inspector().await;
-    // 3 个 L1 客户（互不关联）；serial_prefix 单字符大写字母（C / D / E，
-    // 跳过 A/B 避免与已有 prefix 碰撞 —— 数据库有 UNIQUE 索引约束）。
-    use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let now = now_naive();
-    let l1_a = snowflake.next_id();
-    let l1_c = snowflake.next_id();
-    let l1_e = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, created_at, updated_at) \
-         VALUES ($1, 'PAGA', NULL, 'A', 0, $4, $4), ($2, 'PAGC', NULL, 'C', 0, $4, $4), ($3, 'PAGE', NULL, 'E', 0, $4, $4)",
-    )
-    .bind(l1_a)
-    .bind(l1_c)
-    .bind(l1_e)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("insert L1 customers for pagination");
-    let customers = [l1_a, l1_c, l1_e];
-
-    // 每个 L1 下 1 个 part + 1 个 INSPECTION 批次（≥3 条活跃批次）
-    for (i, &cust) in customers.iter().enumerate() {
-        insert_part_with_insp_batch(
-            &pool,
-            &format!("PAGPART{i}"),
-            cust,
-            Some(&format!("PAG{i:03}")),
-            PartFixture::INSPECTION_SHELF_ID,
-        )
-        .await;
-    }
-
-    // limit=2, offset=1
-    let (status, body) = send(
-        app.clone(),
-        json_request(
-            "GET",
-            "/prod/batches/inspection?limit=2&offset=1",
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "paginated list: body={body}");
-    assert_eq!(body["code"], 0);
-
-    let items = body["data"]["items"].as_array().expect("data.items");
-    assert_eq!(items.len(), 2, "limit=2 时 items.len() 应 = 2: body={body}");
-    let total = body["data"]["total"]
-        .as_str()
-        .expect("data.total 应为 string (i64 serialize)")
-        .parse::<i64>()
-        .expect("data.total 应可解析为 i64");
-    assert!(
-        total >= 3,
-        "total 应 ≥ 3（插了 3 条 INSPECTION 批次）: body={body}"
-    );
-    // limit / offset 在响应里也是 i64 经 serialize_i64 → JSON string
-    assert_eq!(
-        body["data"]["limit"].as_str().unwrap(),
-        "2",
-        "响应 limit 应透传 = 2: body={body}"
-    );
-    assert_eq!(
-        body["data"]["offset"].as_str().unwrap(),
-        "1",
-        "响应 offset 应透传 = 1: body={body}"
-    );
-
-    // 二次校验：第二页（offset=2, limit=2）应只剩 ≤ 1 条（3 - 2 = 1）
-    let (status2, body2) = send(
-        app.clone(),
-        json_request(
-            "GET",
-            "/prod/batches/inspection?limit=2&offset=2",
-            None::<Value>,
-            Some(&token),
-        ),
-    )
-    .await;
-    assert_eq!(status2, StatusCode::OK, "second page: body={body2}");
-    let items2 = body2["data"]["items"].as_array().expect("data.items2");
-    assert_eq!(items2.len(), 1, "offset=2, limit=2 应剩 1 条: body={body2}");
-}
-
-/// **回归测试（2026-09-30 review 第 3 轮 M3）**：`next_process_id` /
-/// `next_process_name` 必须由 `current_process_step_id` → step JOIN 派生，
-/// **不得**改直读 `current_process_id`。
-///
-/// 背景（本文件此前完全没有断言这两个字段，所以回归能溜过去）：
-/// - review 第 2 轮 H2 修复把「送检 = 出池 → `current_process_id = NULL`」落实后，
-///   **所有**进 INSPECTION 的写点都清该列（`mark_batch_inspected` /
-///   `phase1::scan` / `outsource::receive_to_inspection` / `repair::complete_repair`
-///   的 INSPECTION 分支）。
-/// - 而本端点只查 `status='INSPECTION'`。若 `list_batches_with_part` 改直读 cpid，
-///   `next_process_id` / `next_process_name` 就**恒为 null** —— 用户可见回归
-///   （前端 inspection 视图靠它显示「这批走到工艺链第几步」）。
-///
-/// 本测试用 `insert_part_with_step_located_insp_batch` 造出**真实送检后形态**
-/// （step 非空 + cpid 显式 NULL），断言端点仍能解析出工序 id 与名称。
-/// 若有人把查询改回直读 cpid，本测试必红。
-#[tokio::test]
-async fn inspection_batches_derives_next_process_from_step_not_cpid() {
+async fn inspection_batches_item_keys_exactly_thirteen() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (_part_id, batch_id, process_id, process_name) = insert_part_with_step_located_insp_batch(
+    // 一条有系统交期 + 一条无（NULL 投影 case）
+    let (_p1, b1) = insert_insp_batch_with_spec(
         &pool,
-        "PART_STEP",
-        fx.customer_l2_id,
-        "P-STEP-001",
         fx.inspection_shelf_id,
-        "PROC-STEP",
-        "打样工序",
+        &InspBatchSpec {
+            name: "PART_DATE",
+            drawing_no: "DWG-DATE-1",
+            serial_no: Some("P-DATE-1"),
+            customer_id: fx.customer_l2_id,
+            quantity: 7,
+            batch_no: 1,
+            system_delivery_date: chrono::NaiveDate::from_ymd_opt(2026, 3, 1),
+        },
     )
     .await;
-
-    // 前置断言：DB 层确实是「step 有值 + cpid 为 NULL」的真实送检形态
-    let (step_opt, cpid): (Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT current_process_step_id, current_process_id FROM t_part_batch WHERE id = $1",
+    let (_p2, b2) = insert_insp_batch_with_spec(
+        &pool,
+        fx.inspection_shelf_id,
+        &InspBatchSpec {
+            name: "PART_NODATE",
+            drawing_no: "DWG-DATE-2",
+            serial_no: None,
+            customer_id: fx.customer_l2_id,
+            quantity: 2,
+            batch_no: 1,
+            system_delivery_date: None,
+        },
     )
-    .bind(batch_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read batch process columns");
-    assert!(
-        step_opt.is_some(),
-        "前置条件：current_process_step_id 应非空（送检时保留），实际 {step_opt:?}"
-    );
-    assert_eq!(
-        cpid, None,
-        "前置条件：current_process_id 应为 NULL（送检 = 出池），实际 {cpid:?}；\
-         若本断言失败说明 H2 修复被回退，测试前提已变"
-    );
+    .await;
 
     let (status, body) = send(
         app,
@@ -651,32 +653,449 @@ async fn inspection_batches_derives_next_process_from_step_not_cpid() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "list: body={body}");
-    assert_eq!(body["code"], 0);
-
     let items = body["data"]["items"].as_array().expect("data.items");
-    let batch_id_str = batch_id.to_string();
-    let process_id_str = process_id.to_string();
-    let hit = items
-        .iter()
-        .find(|i| i["batch_id"] == batch_id_str)
-        .unwrap_or_else(|| panic!("items 应含 batch_id={batch_id}: body={body}"));
 
+    let mut expected: Vec<&str> = vec![
+        "batch_id",
+        "batch_no",
+        "quantity",
+        "version",
+        "part_id",
+        "serial_no",
+        "drawing_no",
+        "name",
+        "system_delivery_date",
+        "is_urgent",
+        "customer_id",
+        "customer_name",
+        "l1_customer_name",
+    ];
+    expected.sort_unstable();
+    assert_eq!(expected.len(), 13, "白名单本身应是 13 个");
+    for item in items {
+        let obj = item.as_object().expect("item 应为 object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys, expected,
+            "item key 集合应恰好 13 个（多一个 / 少一个都失败）: body={body}"
+        );
+    }
+
+    // system_delivery_date / serial_no 的「有值」与「null」两种 case
+    let b1_str = b1.to_string();
+    let b2_str = b2.to_string();
+    let hit1 = items
+        .iter()
+        .find(|i| i["batch_id"] == b1_str)
+        .unwrap_or_else(|| panic!("应含 b1: body={body}"));
     assert_eq!(
-        hit["next_process_id"], process_id_str,
-        "next_process_id 必须由 current_process_step_id → step JOIN 派生为该 step 的 \
-         process_id（{process_id}）。实际 {:?} —— 若为 null 说明查询被改成直读 \
-         current_process_id，而送检=出池已把该列置 NULL（review M3 回归）",
-        hit["next_process_id"]
+        hit1["system_delivery_date"].as_str(),
+        Some("2026-03-01"),
+        "有系统交期时应投出该日期: body={body}"
+    );
+    assert_eq!(hit1["quantity"], 7, "数量列应透传: body={body}");
+    assert_eq!(hit1["batch_no"], 1);
+    assert_eq!(hit1["serial_no"].as_str(), Some("P-DATE-1"));
+    assert_eq!(hit1["drawing_no"].as_str(), Some("DWG-DATE-1"));
+    assert_eq!(hit1["name"].as_str(), Some("PART_DATE"));
+    assert_eq!(hit1["is_urgent"], false);
+    assert_eq!(hit1["customer_name"].as_str(), Some("FX 客户 L2"));
+    assert_eq!(hit1["l1_customer_name"].as_str(), Some("FX 客户 L1"));
+    let hit2 = items
+        .iter()
+        .find(|i| i["batch_id"] == b2_str)
+        .unwrap_or_else(|| panic!("应含 b2: body={body}"));
+    assert!(
+        hit2["system_delivery_date"].is_null(),
+        "无系统交期时应投影 JSON null: body={body}"
+    );
+    assert!(
+        hit2["serial_no"].is_null(),
+        "无序列号时应投影 JSON null（手工工单形态）: body={body}"
+    );
+}
+
+/// 服务端排序（2026-10-03）：`sort_by` 白名单 7 值 + `sort_dir` + 非法值退化。
+///
+/// 4 行数据刻意让**所有排序列的升序结果一致**（`A < B < C < Z`），故一张表即可
+/// 覆盖 7 个 `sort_by`；`Z` 行系统交期为 NULL，用来验证 `NULLS LAST`
+/// （PG 默认 DESC → NULLS FIRST，不显式指定的话未填交期的行会顶到最前）。
+#[tokio::test]
+async fn inspection_batches_sorts_by_whitelisted_columns() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    // 4 个 L1 客户（客户名与 A/B/C/Z 同序）
+    let cust_a = insert_l1_customer(&pool, "AAA Corp", "K").await;
+    let cust_b = insert_l1_customer(&pool, "BBB Corp", "L").await;
+    let cust_c = insert_l1_customer(&pool, "CCC Corp", "M").await;
+    let cust_z = insert_l1_customer(&pool, "ZZZ Corp", "N").await;
+
+    let rows: Vec<(i64, InspBatchSpec<'_>)> = vec![
+        (
+            1,
+            InspBatchSpec {
+                name: "AAA",
+                drawing_no: "A-001",
+                serial_no: Some("S-001"),
+                customer_id: cust_a,
+                quantity: 1,
+                batch_no: 1,
+                system_delivery_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1),
+            },
+        ),
+        (
+            2,
+            InspBatchSpec {
+                name: "BBB",
+                drawing_no: "B-001",
+                serial_no: Some("S-002"),
+                customer_id: cust_b,
+                quantity: 2,
+                batch_no: 2,
+                system_delivery_date: chrono::NaiveDate::from_ymd_opt(2026, 6, 1),
+            },
+        ),
+        (
+            3,
+            InspBatchSpec {
+                name: "CCC",
+                drawing_no: "C-001",
+                serial_no: Some("S-003"),
+                customer_id: cust_c,
+                quantity: 3,
+                batch_no: 3,
+                system_delivery_date: chrono::NaiveDate::from_ymd_opt(2026, 12, 1),
+            },
+        ),
+        (
+            4,
+            InspBatchSpec {
+                name: "ZZZ",
+                drawing_no: "Z-001",
+                serial_no: Some("S-004"),
+                customer_id: cust_z,
+                quantity: 4,
+                batch_no: 4,
+                system_delivery_date: None,
+            },
+        ),
+    ];
+    let mut ids: Vec<String> = Vec::new();
+    for (_n, spec) in &rows {
+        let (_part_id, batch_id) =
+            insert_insp_batch_with_spec(&pool, fx.inspection_shelf_id, spec).await;
+        ids.push(batch_id.to_string());
+    }
+    let (a, b, c, z) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+    let asc = vec![a.clone(), b.clone(), c.clone(), z.clone()];
+    let desc = vec![z.clone(), c.clone(), b.clone(), a.clone()];
+
+    // 7 个 sort_by：升序结果一致；降序仅系统交期列因 NULLS LAST 而不同
+    for sort_by in [
+        "SERIAL_NO",
+        "DRAWING_NO",
+        "NAME",
+        "BATCH_NO",
+        "QUANTITY",
+        "CUSTOMER_NAME",
+    ] {
+        let (status, body) = send(
+            app.clone(),
+            json_request(
+                "GET",
+                &format!("/prod/batches/inspection?sort_by={sort_by}&sort_dir=ASC&limit=50"),
+                None::<Value>,
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "sort_by={sort_by}: body={body}");
+        assert_eq!(
+            item_batch_ids(&body),
+            asc,
+            "sort_by={sort_by} 的升序结果应与统一期望一致: body={body}"
+        );
+
+        let (status, body) = send(
+            app.clone(),
+            json_request(
+                "GET",
+                &format!("/prod/batches/inspection?sort_by={sort_by}&sort_dir=DESC&limit=50"),
+                None::<Value>,
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "sort_by={sort_by} DESC: body={body}"
+        );
+        assert_eq!(
+            item_batch_ids(&body),
+            desc,
+            "sort_by={sort_by} 的降序结果应与统一期望一致: body={body}"
+        );
+    }
+
+    // 系统交期列：ASC → NULL 兜底；DESC → NULLS LAST（不是 PG 默认的 NULLS FIRST）
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC&limit=50",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "date ASC: body={body}");
+    assert_eq!(
+        item_batch_ids(&body),
+        asc,
+        "系统交期升序应 NULL 兜底在末尾: body={body}"
+    );
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?sort_by=SYSTEM_DELIVERY_DATE&sort_dir=DESC&limit=50",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "date DESC: body={body}");
+    let date_desc = vec![c.clone(), b.clone(), a.clone(), z.clone()];
+    assert_eq!(
+        item_batch_ids(&body),
+        date_desc,
+        "系统交期降序必须 NULLS LAST（未填交期不顶到最前）: body={body}"
+    );
+
+    // 非法 sort_by / sort_dir → 退化为「系统交期 ASC」，绝不 500
+    let (status, body) = send(
+        app,
+        json_request(
+            "GET",
+            "/prod/batches/inspection\
+             ?sort_by=pb.id%3B%20DROP%20TABLE%20t_part_batch&sort_dir=sideways&limit=50",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "非法 sort_by / sort_dir 应退化而非报错: body={body}"
     );
     assert_eq!(
-        hit["next_process_name"].as_str(),
-        Some(process_name.as_str()),
-        "next_process_name 应由同一条 step JOIN 链解析出 {process_name}: body={body}"
+        item_batch_ids(&body),
+        asc,
+        "退化排序应等同系统交期 ASC: body={body}"
     );
+}
+
+/// 系统交期区间筛选（2026-10-03：日期筛选从计划交期改筛系统交期）。
+#[tokio::test]
+async fn inspection_batches_filters_by_system_delivery_date_range() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let d = |m: u32, day: u32| chrono::NaiveDate::from_ymd_opt(2026, m, day);
+    let mk =
+        |name: &'static str, sn: &'static str, date: Option<chrono::NaiveDate>| InspBatchSpec {
+            name,
+            drawing_no: sn,
+            serial_no: Some(sn),
+            customer_id: fx.customer_l2_id,
+            quantity: 1,
+            batch_no: 1,
+            system_delivery_date: date,
+        };
+    let (_p1, b_early) = insert_insp_batch_with_spec(
+        &pool,
+        fx.inspection_shelf_id,
+        &mk("RANGE-EARLY", "RG-EARLY", d(2, 1)),
+    )
+    .await;
+    let (_p2, b_mid) = insert_insp_batch_with_spec(
+        &pool,
+        fx.inspection_shelf_id,
+        &mk("RANGE-MID", "RG-MID", d(6, 15)),
+    )
+    .await;
+    let (_p3, b_late) = insert_insp_batch_with_spec(
+        &pool,
+        fx.inspection_shelf_id,
+        &mk("RANGE-LATE", "RG-LATE", d(11, 20)),
+    )
+    .await;
+    // 无系统交期（NULL）行：任一区间筛选都应排除（NULL 比较恒不成立）
+    let (_p4, b_null) = insert_insp_batch_with_spec(
+        &pool,
+        fx.inspection_shelf_id,
+        &mk("RANGE-NULL", "RG-NULL", None),
+    )
+    .await;
+    let (early, mid, late, null) = (
+        b_early.to_string(),
+        b_mid.to_string(),
+        b_late.to_string(),
+        b_null.to_string(),
+    );
+
+    // 闭区间 [2026-06-15, 2026-11-20] → 只命中中 + 晚
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?system_delivery_date_from=2026-06-15\
+             &system_delivery_date_to=2026-11-20&limit=50",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "range filter: body={body}");
+    let got = item_batch_ids(&body);
+    assert!(
+        got.contains(&mid) && got.contains(&late),
+        "区间内应命中: body={body}"
+    );
+    assert!(!got.contains(&early), "区间下界之前应被排除: body={body}");
+    assert!(
+        !got.contains(&null),
+        "NULL 系统交期不被区间命中: body={body}"
+    );
+
+    // 单边：只给 from → 命中晚（6-15 与 11-20）
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?system_delivery_date_from=2026-06-15&limit=50",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "from only: body={body}");
+    let got = item_batch_ids(&body);
+    assert!(
+        got.contains(&late),
+        "from=2026-06-15 应含 11-20: body={body}"
+    );
+    assert!(
+        !got.contains(&early),
+        "from=2026-06-15 不应含 02-01: body={body}"
+    );
+
+    // 单边：只给 to → 命中早 + 中
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?system_delivery_date_to=2026-06-15&limit=50",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "to only: body={body}");
+    let got = item_batch_ids(&body);
+    assert!(
+        got.contains(&early) && got.contains(&mid),
+        "to=2026-06-15 应含 02-01 与 06-15: body={body}"
+    );
+    assert!(
+        !got.contains(&late),
+        "to=2026-06-15 不应含 11-20: body={body}"
+    );
+}
+
+/// `customer_id` 走 L1 展开：传 L1 应同时命中其下 L2 的批次。
+#[tokio::test]
+async fn inspection_batches_customer_filter_expands_l1_to_l2() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    // fixture 的 L2 下的批次（customer_id = L2）
+    let (_p_l2, b_l2) = insert_insp_batch_with_spec(
+        &pool,
+        fx.inspection_shelf_id,
+        &InspBatchSpec {
+            name: "CUSTL2",
+            drawing_no: "DWG-C-1",
+            serial_no: Some("CUSTL2"),
+            customer_id: fx.customer_l2_id,
+            quantity: 1,
+            batch_no: 1,
+            system_delivery_date: None,
+        },
+    )
+    .await;
+    // 另一个独立 L1 客户下的批次（该 L1 无子客户）
+    let other_l1 = insert_l1_customer(&pool, "CUSTOTHER", "Z").await;
+    let (_p_other, b_other) = insert_insp_batch_with_spec(
+        &pool,
+        fx.inspection_shelf_id,
+        &InspBatchSpec {
+            name: "CUSTOTHER",
+            drawing_no: "DWG-C-2",
+            serial_no: Some("CUSTOTH"),
+            customer_id: other_l1,
+            quantity: 1,
+            batch_no: 1,
+            system_delivery_date: None,
+        },
+    )
+    .await;
+
+    // 传 L1 → 展开出 [L1, L2...] → 命中 fixture L2 的批次
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!(
+                "/prod/batches/inspection?customer_id={}&limit=50",
+                fx.customer_l1_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "customer L1 filter: body={body}");
+    let got = item_batch_ids(&body);
+    let l2_str = b_l2.to_string();
+    let other_str = b_other.to_string();
+    assert!(
+        got.contains(&l2_str),
+        "传 L1 应展开命中其下 L2 的批次 {l2_str}: body={body}"
+    );
+    assert!(
+        !got.contains(&other_str),
+        "别家客户的批次不应命中: body={body}"
+    );
+
+    // 传 L2 本身 → 只命中该 L2 的批次
+    let (status, body) = send(
+        app,
+        json_request(
+            "GET",
+            &format!(
+                "/prod/batches/inspection?customer_id={}&limit=50",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "customer L2 filter: body={body}");
+    let got = item_batch_ids(&body);
     assert_eq!(
-        hit["current_process_step_id"],
-        step_opt.unwrap().to_string(),
-        "current_process_step_id 原样透出（它是 next_process_id 的派生源）: body={body}"
+        got,
+        vec![l2_str],
+        "传 L2 应只命中 L2 自己的批次: body={body}"
     );
 }
 
