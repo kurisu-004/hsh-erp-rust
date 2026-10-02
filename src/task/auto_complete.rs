@@ -18,7 +18,7 @@
 //! `t_part_batch.placed_at`（列已删）改为 `t_part_event` 中 DELIVERED 事件的
 //! `created_at`，与 Python `_run_once` 的 latest-event-derived 口径对齐（避免
 //! `placed_at` 首次 ON_SHELF 时间与 DELIVERED 时间不对齐的偏差）。SQL 见
-//! `PartBatchRepo::find_delivered_older_than`（src/modules/part_batch/repo.rs:858）。
+//! `PartBatchRepo::find_delivered_older_than`（`prod::batch::repo::queries`）。
 
 use std::sync::Arc;
 use std::time::Duration;

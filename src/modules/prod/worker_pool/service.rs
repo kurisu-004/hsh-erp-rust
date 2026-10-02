@@ -29,7 +29,7 @@
 //! ## Service 形态（2026-09-22 D-2 决策）
 //! `WorkerPoolService` 保持 unit struct（**不**持字段依赖）。snowflake 由每个写方法
 //! 形参显式收（与原 `pub struct WorkerPoolService;` + 旧方法签名兼容）——
-//! 既有跨模块调用点（`part/handler/inspection.rs:298` 的 worker-scan 路径）以
+//! 既有跨模块调用点（`prod::batch::service::worker_scan` 的 worker-scan 路径）以
 //! `WorkerPoolService::refill_for_worker_with_work_type(&mut tx, &state.snowflake, ...)`
 //! 形式直调 service，本任务**不修改 part 域代码**，故保留 ZST 静态 + 显式 snowflake
 //! 形参的旧形态。后续 D-6 part 重构时再统一改 trait 注入式 + `Arc<WorkerPoolService>`
@@ -76,7 +76,7 @@ use super::vo::{
 /// 这种"无字段 service + 显式 snowflake 形参"的形态与 iam / shelf / customer /
 /// worker 等其它域不同——本域**唯一**需要 snowflake 的点是 part_event.id 生成
 /// （其它域的事件 id 都用 caller 提供的 id）；为了保留跨模块 ZST 静态调用点
-/// 兼容（`part/handler/inspection.rs:298`），暂保持显式 snowflake 形参。
+/// 兼容（`prod::batch::service::worker_scan`），暂保持显式 snowflake 形参。
 ///
 /// 后续 D-6 part 重构时一并改用 `Arc<WorkerPoolService>` 持 snowflake 字段。
 pub struct WorkerPoolService;
@@ -146,7 +146,7 @@ impl WorkerPoolService {
     /// 直接接受 `work_type_id` + `badge_code`，跳过 `worker_get_by_id` 重复查询。
     ///
     /// 由 [`refill_for_worker`]（admin 路径：自己 fetch）与
-    /// `part/handler/inspection.rs:298`（worker-scan 路径：service 已在 scan 步骤
+    /// `prod::batch::service::worker_scan`（worker-scan 路径：service 已在 scan 步骤
     /// fetch 过 worker）共用。
     #[allow(clippy::too_many_arguments)]
     pub async fn refill_for_worker_with_work_type(

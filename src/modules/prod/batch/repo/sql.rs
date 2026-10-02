@@ -551,7 +551,8 @@ impl PartBatchRepo {
     /// ## 已知缺口（2026-09-30 记录，本轮不扩 scope）
     ///
     /// `current_process_step_id`（可选的显示用定位信息）**在 RETURNED 时不推进**：
-    /// `worker_scan.rs:193-204` 已经把 `chain_id + next_pid` 解析成 `step_id_opt`，
+    /// `prod::batch::service::worker_scan::worker_scan_event` 已经把
+    /// `chain_id + next_pid` 解析成 `step_id_opt`，
     /// 却传给一个被丢弃的形参。
     /// 影响面仅限显示：池归属已由 `current_process_id` 承担且本函数已正确写入。
     /// 待后续单独一轮处理（届时 `mark_batch_returned` 需要按调用方决定是否写

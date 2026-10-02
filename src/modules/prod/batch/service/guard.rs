@@ -177,7 +177,7 @@ pub(crate) async fn assert_shelf_maps_process(
 /// 写入不变式第 4 行「非生产流 → NULL」的**唯一例外**（2026-09-30 review 第 1 轮
 /// M1 补记，勿按表机械核对后误判为 bug）：
 ///
-/// `send_to_outsource`（`outsource.rs:158`，`status='OUTSOURCE'` +
+/// `outsource::send_to_outsource`（`status='OUTSOURCE'` +
 /// `location='OUTSOURCE_COMPANY'`）传 `Some(req.process_id)` 而非 NULL。三条理由：
 ///
 /// 1. 外协加工的就是这道工序，rollup 派生 `t_part.next_process_id` 需要它；
@@ -209,17 +209,19 @@ pub(crate) async fn assert_shelf_maps_process(
 ///   `clear_process_id` 做了翻译，并在注释里断言「全部 8 个调用点传的
 ///   location / holder / step 均非 None 或与保持原值等价」——**该断言是错的**，
 ///   实际有 5 个调用点靠 `None` 表达「清空」，被误改成「保持原值」后：
-///   - `lifecycle_helpers.rs`（recall-to-pending，`None,None,None,None`）：
+///   - `shelf::recall_to_pending`（`None,None,None,None`）：
 ///     PENDING 批次仍留着 `location='PRODUCTION_SHELF'` + `current_holder_id`
 ///     + 陈旧 step，UI 上「待投产」的工单显示还压在生产架上；
-///   - `outsource.rs`（外协收回 → INSPECTION）、`scan.rs`（scan-inspect 第一步）、
-///     `repair.rs` ×2（complete-repair / repair-dispatch 的 INSPECTION 分支）：
+///   - `outsource::receive_from_outsource_to_inspection`（外协收回 → INSPECTION）、
+///     `scan::scan_inspect`（第一步）、`repair::complete_repair` /
+///     `repair::repair_dispatch` 的 INSPECTION 分支：
 ///     `current_process_step_id` 不再清，而展示用的 `next_process_id` 正是由它
 ///     经 `t_process_chain_step` JOIN 派生 → 出池批次显示上一道工序。
 ///
-///   依赖该约定的 5 个调用点（改任何一处都要连带复核这 5 行）：
-///   `lifecycle_helpers.rs:153`（recall）、`outsource.rs:407`、
-///   `scan.rs:70`、`repair.rs:159`、`repair.rs:308`。
+///   依赖该约定的 5 个调用点（改任何一处都要连带复核这 5 处）：
+///   `shelf::recall_to_pending`、`outsource::receive_from_outsource_to_inspection`、
+///   `scan::scan_inspect`、`repair::complete_repair`、
+///   `repair::repair_dispatch`。
 ///   其余 5 个调用点（共 **10** 个调用点，place_on_shelf / release_from_programming /
 ///   send_to_outsource / receive_from_outsource / work_type pick-up）4 列全传
 ///   `Some(..)`，走不到 clear 分支。
