@@ -142,11 +142,85 @@ pub struct MoveResult {
     /// 仅 to_kind=WORKER 时填：worker 工种的 max_held_batches
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_held: Option<i32>,
-    /// 仅 to_kind=POOL 时填：候选池货架 id（from.shelf_id 与 to.shelf_id 一致时跳过校验）
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// 涉及的候选池货架 id（雪花 ID 序列化成 JSON 字符串）：
+    /// - POOL→WORKER：填 `from.shelf_id`（批次离开的货架）
+    /// - WORKER→POOL：填 `to.shelf_id`（批次落回的货架）
+    /// - WORKER→WORKER：不填
+    ///
+    /// 2026-10-03 修复：此前漏标序列化器，序列化成 JSON number，前端 Zod 守门
+    /// 抛 `expected string, received number`。取 `Option<i64>` +
+    /// `serialize_i64_opt` 而非 `Option<String>`：与本 struct 其余雪花字段
+    /// （`batch_id` / `new_holder_id`）及内嵌 `TakenItem` 风格一致，service 侧
+    /// 只需一个 serde 属性、不必为单一字段改类型。
+    #[serde(
+        serialize_with = "crate::shared::types::serialize_i64_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub shelf_id: Option<i64>,
     /// 仅 POOL→WORKER 移动时填：从 pool 取出的 batch 详情（含 part 元数据）；
     /// 与 `assign_batch_to_worker` 旧 `taken` 字段同源 TakenItem。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub taken: Option<TakenItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// POOL→WORKER：service 必填 `shelf_id`（值 = `from.shelf_id`），
+    /// 故「方向为 POOL→WORKER 且 `shelf_id` 为 None」不是现实可出现的组合。
+    fn move_result_pool_to_worker(shelf_id: Option<i64>) -> MoveResult {
+        MoveResult {
+            batch_id: 1590000000000000002,
+            from_kind: "POOL".to_string(),
+            to_kind: "WORKER".to_string(),
+            new_holder_id: 1590000000000000003,
+            new_location: "WORKER".to_string(),
+            version: 2,
+            current_held: Some(1),
+            max_held: Some(5),
+            shelf_id,
+            taken: None,
+        }
+    }
+
+    /// WORKER→WORKER：唯一 `shelf_id` 现实为 `None` 的方向（`to_kind=WORKER`
+    /// 故 `current_held` / `max_held` 照填）。
+    fn move_result_worker_to_worker() -> MoveResult {
+        MoveResult {
+            batch_id: 1590000000000000002,
+            from_kind: "WORKER".to_string(),
+            to_kind: "WORKER".to_string(),
+            new_holder_id: 1590000000000000003,
+            new_location: "WORKER".to_string(),
+            version: 2,
+            current_held: Some(1),
+            max_held: Some(5),
+            shelf_id: None,
+            taken: None,
+        }
+    }
+
+    /// 雪花 ID 走 `serialize_i64_opt` ⇒ JSON string，且十进制内容与传入值一致。
+    #[test]
+    fn move_result_shelf_id_serializes_as_string() {
+        let value =
+            serde_json::to_value(move_result_pool_to_worker(Some(1590000000000000001))).unwrap();
+        assert_eq!(
+            value["shelf_id"],
+            serde_json::Value::String("1590000000000000001".into())
+        );
+    }
+
+    /// `skip_serializing_if` 优先于 `serialize_i64_opt` ⇒ None 时 key 不出现。
+    #[test]
+    fn move_result_omits_shelf_id_when_none() {
+        let value = serde_json::to_value(move_result_worker_to_worker()).unwrap();
+        // 先断言是 object：`Value::get` 对非 object 同样返回 None，
+        // 直接 get 会让「序列化结果不是 object」这条异常路径静默通过。
+        let object = value
+            .as_object()
+            .expect("MoveResult 应序列化为 JSON object");
+        assert!(object.get("shelf_id").is_none());
+    }
 }
