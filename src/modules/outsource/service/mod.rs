@@ -51,8 +51,11 @@ const MAX_LIMIT: i64 = 500;
 /// `list_outsource_in_flight` / `list_outsource_sendable` 的分页上限）。
 const LIST_MAX_LIMIT: i64 = 200;
 
-/// 拼客户路径：有 L1 给 `L1 / L2`，L1 自指（无 parent）时只给 L2 名，两侧都缺
-/// 返回 `None`。
+/// 拼客户路径：有 L1 给 `L1 / L2`，无 L1 时只给 L2 名，两侧都缺返回 `None`。
+///
+/// 2026-10-03 review 第 1 轮 m9：原文写「L1 自指（无 parent）时只给 L2 名」是
+/// 错的措辞 —— `t_customer` 有 `ck_t_customer_no_self_parent` CHECK，自指不可能。
+/// 该分支的真义就是「**没有 L1（`parent_id IS NULL` 或 L1 已软删）**」。
 ///
 /// 2026-10-03 新增：此前 outsource 域全部 VO 的 `customer_path` 都是硬编码
 /// `None`（前端 4 个外协视图「客户」列恒 `—`）。范式抄

@@ -25,7 +25,9 @@
 //!   （`sendable.rs`），repo 增 2 ZST（`OutsourceQuotableRepo` / `OutsourceSendableRepo`）。
 //! - 删除 part 域两个**错形状**的同义端点（返回通用 `PartListItem`，与前端字段
 //!   需求不匹配）：`/parts/outsource-in-flight`、`/parts/outsource-sendable`
-//!   （2026-10-03 硬切，无 alias；旧 URL 现为 404）。
+//!   （2026-10-03 硬切，无 alias；旧 URL 实际返回 **400** 而非 404 —— part 域
+//!   `/{part_id}`（`Path<i64>`）catch-all 兜住任何未注册的 1 段静态路径，再由
+//!   `Path` extractor 拒绝非数字段；成因见 `docs/api/inconsistencies.md` § 9.2）。
 
 pub mod dto;
 pub mod handler;

@@ -408,13 +408,19 @@ Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
 | `GET /api/v2/parts/outsource-sendable` | **`GET /api/v2/outsource-sendable`** | [`../outsource-sendable.md`](../outsource-sendable.md) |
 
 > ⚠️ 旧路径的**实际 HTTP 状态码是 400 而非 404**：part 域 `Router` 注册了
-> `/{part_id}`（`Path<i64>`）catch-all，任何单段路径都先匹配到它，再由 `Path`
-> extractor 拒绝非数字段（`Invalid URL: Cannot parse '...' to a 'i64'`）——
-> 任意不存在的静态段（如 `/api/v2/parts/zzz-not-a-real-endpoint`）行为完全相同。
+> `/{part_id}`（`Path<i64>`）catch-all，matchit 静态段优先、参数段兜底 ⇒ 任何
+> 未注册的 1 段静态路径都先落到 `/{part_id}`，再由 `Path` extractor 拒绝非数字段
+> （`Invalid URL: Cannot parse '...' to a 'i64'`）—— 任意不存在的静态段（如
+> `/api/v2/parts/zzz-not-a-real-endpoint`）行为完全相同。
 > 旧 handler 已彻底删除，不再有任何 outsource 专用处理。
 >
-> 端点数影响：part 域 50 → **48**。完整变更登记见
-> [`../inconsistencies.md`](../inconsistencies.md) § 9.2。
+> 端点数影响：part 域 25 → **23**（25 是 2026-10-02 把 25 条「以单个批次为操作
+> 对象」的路由迁往 prod 域**之后**的基数；本次下线 2 条 → 23。以
+> `src/modules/part/mod.rs` 的 23 个 method 级注册为准 —— 更早文档里出现的
+> 「50 / 48」是 2026-09-23 扫描基线的数字，未扣除 2026-10-02 的 25 条，
+> 已同步订正到 [`../DRIFT_REPORT.md`](../DRIFT_REPORT.md) 与
+> [`../inconsistencies.md`](../inconsistencies.md) § 2。
+> 完整变更登记见 [`../inconsistencies.md`](../inconsistencies.md) § 9.2。
 
 ### `GET /api/v2/prod/batches/repair`
 

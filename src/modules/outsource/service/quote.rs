@@ -186,6 +186,23 @@ impl OutsourceService {
                 offset,
             });
         }
+        // 2026-10-03 review 第 1 轮 BLOCKER-1（与 `list_company_sent_parts` 同源）：
+        // 给了 keyword 却零命中时必须早返回。SQL 谓词
+        // `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 让空数组把整个
+        // keyword 条件短路掉 —— 不在这里兜住，「不存在的关键词」会返回全量报价。
+        let kw_given = query
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if kw_given && part_ids_in.is_empty() {
+            return Ok(OutsourceQuoteListOut {
+                items: vec![],
+                total: 0,
+                limit,
+                offset,
+            });
+        }
         let part_id: Option<i64> =
             if let Some(s) = query.part_id.as_deref().filter(|s| !s.is_empty()) {
                 Some(

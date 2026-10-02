@@ -48,12 +48,17 @@
 |---|---:|---:|---:|
 | `outsource_company` | 8 | **8** | 0（2026-10-03 补 `GET /{id}/sent-parts` 对账页读侧；list-companies-by-process 实现位置不同） |
 | `outsource_quote` | 10 | **9** | -1（统计 / 批量查暂未暴露；2026-10-03 补 `GET /quotable-parts` picker） |
-| `outsource_shipment` | 1 | **1** | 0（2026-10-03 在 `shipment_router` 上另加 `GET /in-flight`，属 Rust-only 读侧） |
+| `outsource_shipment` | 1 | **2** | +1（2026-10-03 在 `shipment_router` 上另加 `GET /in-flight`，属 Rust-only 读侧） |
 | `outsource_sendable`（Rust-only） | 0 | **1** | +1（`GET /api/v2/outsource-sendable`，独立顶层前缀，APPROVAL / DIRECT 双模式） |
-| **合计** | **19** | **19** | **0**（Rust 另有 1 条 Python 没有的 `sendable`） |
+| **合计** | **19** | **20** | **+1**（Rust 另有 sendable 与 shipment `in-flight` 两条 Python 没有的） |
 
-**Rust 状态**：`src/modules/outsource/` 完整 10 文件（handler / dto / model / statemachine /
-repo/{mod,sql} / service/{mod,company,quote,shipment,sendable} / vo/{mod,company,quote,quotable,sendable,shipment}）；
+> Rust 侧计数口径：`src/modules/outsource/handler.rs` 的 4 个 router 工厂逐条点
+> method 级注册（`"/"` 路径的 `get(...).post(...)` 记 2）= company 8 + quote 9
+> + shipment 2 + sendable 1 = **20**。
+
+**Rust 状态**：`src/modules/outsource/` 完整 18 个 `.rs`（模块自身 `mod.rs` +
+handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quote,shipment,sendable}
+/ vo/{mod,company,quote,quotable,sendable,shipment}）；
 详见 [`./outsource-companies.md`](./outsource-companies.md) / [`./outsource-quotes.md`](./outsource-quotes.md) /
 [`./outsource-shipments.md`](./outsource-shipments.md) / [`./outsource-sendable.md`](./outsource-sendable.md)。
 
@@ -105,8 +110,8 @@ repo/{mod,sql} / service/{mod,company,quote,shipment,sendable} / vo/{mod,company
 | Method | Path | Python | Rust |
 |---|---|---|---|
 | GET | `/api/v1/parts/pending-programming` | `pending_programming` | ✅ `/api/v2/parts/pending-programming` |
-| GET | `/api/v1/parts/outsource-in-flight` | `outsource_in_flight` | ✅ 2026-10-03 迁往 outsource 域 → `/api/v2/outsource-shipments/in-flight`（旧 `/api/v2/parts/outsource-in-flight` **已下线，404 无 alias**：旧实现返回通用 `PartListItem`，与前端外协域字段需求不匹配） |
-| GET | `/api/v1/parts/outsource-sendable` | `outsource_sendable` | ✅ 2026-10-03 迁往 outsource 域 → `/api/v2/outsource-sendable`（旧 `/api/v2/parts/outsource-sendable` **已下线，404 无 alias**：旧实现返回通用 `PartListItem`，缺 `send_mode` / `company_options` / `quote_id`） |
+| GET | `/api/v1/parts/outsource-in-flight` | `outsource_in_flight` | ✅ 2026-10-03 迁往 outsource 域 → `/api/v2/outsource-shipments/in-flight`（旧 `/api/v2/parts/outsource-in-flight` **已下线、无 alias，实际返回 400**：旧实现返回通用 `PartListItem`，与前端外协域字段需求不匹配；成因见 § 9.2 的 catch-all 说明） |
+| GET | `/api/v1/parts/outsource-sendable` | `outsource_sendable` | ✅ 2026-10-03 迁往 outsource 域 → `/api/v2/outsource-sendable`（旧 `/api/v2/parts/outsource-sendable` **已下线、无 alias，实际返回 400**：旧实现返回通用 `PartListItem`，缺 `send_mode` / `company_options` / `quote_id`；成因见 § 9.2 的 catch-all 说明） |
 | GET | `/api/v1/parts/inspection-batches` | `inspection_batches` | ✅ `/api/v2/prod/batches/inspection` |
 | GET | `/api/v1/parts/repair-batches` | `repair_batches` | ✅ `/api/v2/prod/batches/repair` |
 | GET | `/api/v1/parts/repairing-batches` | `repairing_batches` | ✅ `/api/v2/prod/batches/repairing` |
@@ -345,10 +350,14 @@ repo/{mod,sql} / service/{mod,company,quote,shipment,sendable} / vo/{mod,company
 | `GET /api/v2/parts/outsource-sendable` | `GET /api/v2/outsource-sendable` | 旧实现返回通用 `PartListItem`，缺 `send_mode` / `company_options` / `quote_id` / `source_status`，无法表达 DIRECT 模式 |
 
 ⚠️ 旧路径的**实际 HTTP 状态码是 400 而非 404**：part 域的 `Router` 注册了
-`/{part_id}`（`Path<i64>`）catch-all，任何单段路径都先匹配到它，再由 `Path` extractor
-拒绝非数字段 —— 任意不存在的静态段（如 `/api/v2/parts/zzz-not-a-real-endpoint`）
-行为完全相同。旧 handler 已彻底删除（`part/service/phase1/outsource.rs` 整文件移除），
-不再有任何 outsource 专用处理。
+`/{part_id}`（`Path<i64>`）catch-all，matchit 静态段优先、参数段兜底 ⇒ 任何
+未注册的 1 段静态路径都先落到 `/{part_id}`，再由 `Path` extractor 拒绝非数字段
+（axum 0.8 的 `ErrorKind::ParseError` → 400，body 形如
+`Invalid URL: Cannot parse '...' to a i64`）。这与「任意从不存在的单段路径」
+（如 `/api/v2/parts/zzz-not-a-real-endpoint`）的行为**完全一致** —— 即 400 无法
+区分「端点被删」与「端点从不存在」，比 404 信息量更少但也不泄漏更多信息，
+故本轮不改跨域路由语义。旧 handler 已彻底删除
+（`part/service/phase1/outsource.rs` 整文件移除），不再有任何 outsource 专用处理。
 
 **其它契约变更**：
 
@@ -363,8 +372,11 @@ repo/{mod,sql} / service/{mod,company,quote,shipment,sendable} / vo/{mod,company
 - `customer_path` 失真修复：`OutsourceQuoteOut.customer_path` 与
   `OutsourceShipmentOut.customer_path` 此前**恒为硬编码 `None`** → 前端 4 个外协视图
   「客户」列全 `—`。`OutsourceQuoteOut` 已改为真算（`part_map_for_quote` 扩 2 列带 L1/L2
-  客户名）；`OutsourceShipmentOut`（仅 reconcile-update 写端点出参，前端不读其客户列）
-  维持 `None`。
+  客户名）；`OutsourceShipmentOut`（`reconcile-update` 写端点出参）**2026-10-03 review
+  第 1 轮 A8 一并改为真算** —— 新增 repo 方法 `part_customer_names`，两条
+  `LEFT JOIN t_customer` 与 list 侧 `OutsourceSentPartRow` 逐条一致，故同一条 shipment
+  经写端点回读与经 `sent-parts` 读到的 `customer_path` 恒相同（此前是「列表有值、
+  编辑回读变空」的不一致）。
 
 > 归口文档：[`./outsource-companies.md`](./outsource-companies.md) /
 > [`./outsource-quotes.md`](./outsource-quotes.md) /

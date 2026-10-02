@@ -992,9 +992,11 @@ impl OutsourceQuotableRepo {
         keyword_pat: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
         // 口径必须与 list 一致（含 DISTINCT ON 去重后的行粒度），否则分页 total 对不上。
+        // 2026-10-03 review 第 1 轮 m3：keyword 过滤与 list 统一停在外层 `d`
+        // （此前 count 下推到最内层、`list` 停在外层，两侧漂移）。
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM ( \
-               SELECT DISTINCT p.id, pr.id \
+               SELECT DISTINCT p.id, pr.id, p.drawing_no, p.name \
                FROM t_part_batch pb \
                JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
                JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
@@ -1003,12 +1005,11 @@ impl OutsourceQuotableRepo {
                  AND pr.category = 'OUTSOURCE' \
                JOIN t_process_chain_step pcs ON pcs.chain_id = p.process_chain_id \
                  AND pcs.process_id = pr.id AND pcs.deleted_at IS NULL \
-               LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
                WHERE pb.deleted_at IS NULL \
                  AND (pb.status = 'PENDING' \
                       OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF')) \
-                 AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1) \
-             ) d",
+             ) d \
+             WHERE ($1::text IS NULL OR d.drawing_no ILIKE $1 OR d.name ILIKE $1)",
         )
         .bind(keyword_pat)
         .fetch_one(executor)
@@ -1034,6 +1035,10 @@ impl OutsourceQuotableRepo {
 ///    审批 / 历史数据仍可能出现多条；此时取最早批准的那条，语义上是「先批准的
 ///    报价优先」且结果稳定（不会随查询计划变化）。
 /// 3. 外层：keyword / customer_id 过滤 + 展示序 + LIMIT/OFFSET。
+///
+/// **count 的过滤位置必须与 list 一致**（2026-10-03 review 第 1 轮 m3）：两者都把
+/// keyword / customer_id 停在**外层** `d` 上，内层不重复过滤、不重复投影。
+/// 谓词改动只有一个落点，不会出现「改了 list 忘了 count」。
 ///
 /// **DIRECT 且 `company_options` 为空的行保留返回**（前端 `canSend()` 据
 /// `company_options.length >= 1` 置灰），count 口径同样保留。
@@ -1128,12 +1133,17 @@ impl OutsourceSendableRepo {
         customer_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
         // 与 list 的 WHERE + DISTINCT ON 口径逐条一致（含 DIRECT 空 options 行）。
-        // keyword / customer_id 过滤下推到最内层（都作用在 part 列上，与外层
-        // 等价），这样外层只需 `SELECT DISTINCT ON ... FROM (...) x`，省一层包裹。
+        // 2026-10-03 review 第 1 轮 m3：keyword / customer_id 此前被下推到**最内层**
+        // （list 留在外层 WHERE），两侧过滤位置不一致 —— 今天语义等价（分组键
+        // `(batch_id, next_process_id)` 内 part 列恒定），但改动时容易只改一侧。
+        // 现与 list 统一停在外层，过滤谓词只剩一个落点；内层也不再需要投影
+        // `part_drawing_no` / `part_name` / `customer_id`（此前是为下推的过滤备的，
+        // 改到外层后是死投影）。
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM ( \
                SELECT DISTINCT ON (x.batch_id, x.next_process_id) \
-                 x.batch_id, x.next_process_id, x.part_drawing_no, x.part_name, x.customer_id \
+                 x.batch_id, x.next_process_id, \
+                 x.part_drawing_no, x.part_name, x.customer_id \
                FROM ( \
                  SELECT pb.id AS batch_id, \
                         p.drawing_no AS part_drawing_no, p.name AS part_name, p.customer_id, \
@@ -1152,12 +1162,12 @@ impl OutsourceSendableRepo {
                  WHERE pb.deleted_at IS NULL \
                    AND (pb.status = 'PENDING' \
                         OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF')) \
-                   AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1) \
-                   AND ($2::bigint IS NULL OR p.customer_id = $2) \
                ) x \
                ORDER BY x.batch_id, x.next_process_id, x.sp_id, x.step_id, \
                         x.quote_id ASC NULLS LAST \
-             ) d",
+             ) d \
+             WHERE ($1::text IS NULL OR d.part_drawing_no ILIKE $1 OR d.part_name ILIKE $1) \
+               AND ($2::bigint IS NULL OR d.customer_id = $2)",
         )
         .bind(keyword_pat)
         .bind(customer_id)

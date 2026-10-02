@@ -5,7 +5,8 @@
 //!
 //! 取代 part 域旧 `list_outsource_sendable`（后者返回通用 `PartListItem`，与前端
 //! 外协域字段需求完全不匹配 → 页面全灰）。旧端点已删除（`/parts/outsource-sendable`
-//! 现为 404），无 alias。
+//! 实际返回 400 —— part 域 `/{part_id}` `Path<i64>` catch-all 兜底，非 404，
+//! 见 `docs/api/inconsistencies.md` § 9.2），无 alias。
 //!
 //! ## 判定逻辑全在 SQL
 //! `APPROVAL` / `DIRECT` 的判定、`quote_id` 的选取、`company_options` 的
@@ -89,8 +90,8 @@ impl OutsourceService {
                         r.customer_name.as_deref(),
                     ),
                     next_process_id: r.next_process_id,
-                    next_process_name: r.next_process_name,
-                    shelf_code: r.shelf_code,
+                    next_process_name: Some(r.next_process_name),
+                    shelf_code: Some(r.shelf_code),
                     outsource_company_id: r.outsource_company_id,
                     outsource_company_name: r.outsource_company_name,
                     quote_id: r.quote_id,

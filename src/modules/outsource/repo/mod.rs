@@ -162,10 +162,19 @@ pub struct OutsourceSendableRow {
     pub is_urgent: bool,
     pub customer_name: Option<String>,
     pub parent_customer_name: Option<String>,
+    /// **只服务 SQL 层的过滤，Rust 侧不消费**：`OutsourceSendableRepo::list` 的
+    /// 外层 `WHERE ($2::bigint IS NULL OR d.customer_id = $2)` 要投影出这一列才能
+    /// 引用它。VO 不暴露客户 id（前端只拿 `customer_path`），故 `service/sendable.rs`
+    /// 从不读这个字段 —— 保留投影是为了让 list / count 的过滤位置保持同构（见
+    /// `repo/sql.rs::OutsourceSendableRepo` 头注释）。
     pub customer_id: Option<i64>,
-    pub shelf_code: Option<String>,
+    /// `t_shelf.code`，驱动表是 `JOIN t_shelf`（INNER）⇒ DB 层 NOT NULL。
+    /// 与 quotable 侧 `OutsourceQuotableRow.shelf_code` 同一写法。
+    pub shelf_code: String,
     pub next_process_id: i64,
-    pub next_process_name: Option<String>,
+    /// `t_process.name`，`JOIN t_process pr`（INNER）⇒ DB 层 NOT NULL。
+    /// 与 quotable 侧 `OutsourceQuotableRow.next_process_name` 同一写法。
+    pub next_process_name: String,
     pub quote_id: Option<i64>,
     pub price: Option<String>,
     pub outsource_company_id: Option<i64>,
@@ -508,6 +517,14 @@ pub trait OutsourceRepoTrait: Send {
         &mut self,
         part_id: i64,
     ) -> Result<Option<(String, String)>, sqlx::Error>;
+    /// `t_part` 按 id 查 `(L2 客户名, L1 客户名)`，供 `shipment_out` 真算
+    /// `customer_path`。两条 JOIN 与 list 侧 `OutsourceSentPartRow` 的
+    /// `t_customer` / `t_customer.parent_id` 逐条一致（各自 `deleted_at IS NULL`
+    /// 才给名，part 软删不影响取名 —— list 侧是 `LEFT JOIN t_part`）。
+    async fn part_customer_names(
+        &mut self,
+        part_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error>;
     /// `t_process` 按 id 查 name。供 shipment_out 单条拼装。
     async fn process_get_name(&mut self, process_id: i64) -> Result<Option<String>, sqlx::Error>;
     /// `t_part_batch` 按 id 查 batch_no。供 shipment_out 单条拼装。
@@ -1085,6 +1102,25 @@ impl OutsourceRepoTrait for &mut PgConnection {
             .bind(part_id)
             .fetch_optional(&mut **self)
             .await
+    }
+
+    async fn part_customer_names(
+        &mut self,
+        part_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        // LEFT JOIN 出 L2 / L1 两个可空名（都可能是 NULL：未挂客户 / 客户已软删）；
+        // part 行不存在时 fetch_optional 返 None，塌成 (None, None)。
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT c.name, cp.name \
+             FROM t_part p \
+             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
+             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
+             WHERE p.id = $1",
+        )
+        .bind(part_id)
+        .fetch_optional(&mut **self)
+        .await?;
+        Ok(row.unwrap_or((None, None)))
     }
 
     async fn process_get_name(&mut self, process_id: i64) -> Result<Option<String>, sqlx::Error> {

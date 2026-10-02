@@ -124,7 +124,7 @@
 | `customer_id` | string (i64)? | **2026-10-03 订正**：代码 `OutsourceQuoteListQuery` 里一直有这个字段，但本文档此前漏记。当前实现只在「同时给了 `customer_id`」时生效，且**必须同时给 `keyword`**：只给 `customer_id` 不给 `keyword` 时端点直接返回空列表（`total=0`）——已知简化实现，见 service `list_quotes` 注释 |
 | `status` | string? | 单状态过滤 |
 | `statuses` | string? | 多状态过滤（逗号分隔）；**2026-10-03 订正**：DTO 里没有该字段，service 恒传空数组给 repo（等价不过滤） |
-| `keyword` | string? | **2026-10-03 订正**：代码里已有（走 `part_keyword_search` 展开成 `part_id = ANY(...)`），本文档此前漏记 |
+| `keyword` | string? | **2026-10-03 订正**：代码里已有（走 `part_keyword_search` 展开成 `part_id = ANY(...)`），本文档此前漏记。trim 后空串视为无过滤；**零命中返回 `items: []` / `total: 0`**（2026-10-03 review 第 1 轮 BLOCKER-1 修复：与 `sent-parts` 同源 —— SQL 的 `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 让空 id 数组短路掉 keyword 条件，「不存在的词」曾返回全量报价） |
 | `sort_by` | string? | **2026-10-03 订正**：代码里已有。`PRICE` / `REVIEWED_AT` / `CREATED_AT`，默认 `CREATED_AT`；非法值静默回落 |
 | `sort_dir` | string? | **2026-10-03 订正**：代码里已有。`ASC` / `DESC`，默认 `DESC` |
 | `limit` | i64? | 默认 50，clamp(1, 500) |
@@ -241,5 +241,5 @@ planned_delivery_date ASC NULLS LAST, id ASC, next_process_id ASC`）排序。
 
 ## 集成测试
 
-- `tests/outsource/quote.rs`（8+ 用例：create DRAFT / 唯一性 21303 / update DRAFT happy / update SUBMITTED 21302 / submit / approve MANAGER-only / reject review_note 必填 / soft-delete 仅 DRAFT/REJECTED）
+- `tests/outsource/quote.rs`（9+ 用例：create DRAFT / 唯一性 21303 / update DRAFT happy / update SUBMITTED 21302 / submit / approve MANAGER-only / reject review_note 必填 / soft-delete 仅 DRAFT/REJECTED / **list keyword 零命中返 0 行**（带「无 keyword 返全量」对照组））
 - `tests/outsource/quotable.rs`（7 用例：happy path（含 `next_process_id`）/ 货架未绑 OUTSOURCE 工序 / **工序不在工艺链内** / 多批次去重 / 未上架 PENDING 排除 / keyword+分页 / 路由不被 `/{id}` 吞掉）

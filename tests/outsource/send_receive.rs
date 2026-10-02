@@ -621,6 +621,13 @@ async fn reconcile_update_shipment_unit_price_quantity() {
     assert_eq!(env["data"]["unit_price"], "15.50");
     assert_eq!(env["data"]["quantity"], 8);
     assert_eq!(env["data"]["is_billed"], true);
+    // 2026-10-03 review 第 1 轮 A8：OutsourceShipmentOut.customer_path 此前恒
+    // null（"前端不读其客户列"）。现真算，口径与 sent-parts list 一致 ——
+    // 这条 L1 客户无 parent，故只给 L2 名。
+    assert_eq!(
+        env["data"]["customer_path"], "RU",
+        "reconcile-update 出参的 customer_path 必须真算: {env}"
+    );
 
     // OCC：传错 version → 409
     let (s2, env2) = send(

@@ -167,9 +167,38 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 - `sendable_direct_row_kept_when_no_active_company` — 空 options 行仍返回且计入 `total`
 - `sendable_source_status_and_batch_version` — `source_status` 区分 PENDING / IN_PROCESS，WORKER 上的批次不出现
 - `sendable_customer_id_filter_and_keyword` — 两个 query 过滤生效
-- `sendable_total_matches_items_and_pagination` — `total` 与实际行数一致（含 DIRECT 空 options 行）+ 分页
+- `sendable_total_matches_items_and_pagination` — `total` 与实际行数一致 + 分页（**不含 DIRECT 空 options 行** —— 本用例的 2 个 DIRECT 行各有 1 个 option；空 options 行由 `sendable_direct_row_kept_when_no_active_company` 单独覆盖）
 - `sendable_orders_urgent_first_then_planned_delivery` — 排序
 - `sendable_excludes_process_not_in_part_chain` — 工序不在工艺链内不出现
 - `sendable_one_row_per_batch_process_even_with_many_batches` — 行粒度是「批次 × 工序」（多批次出多行）
 
 单测：`service/sendable.rs::mod tests` 3 个（`company_options` JSON 解码：空数组 / 正常 / 畸形降级不 500）。
+
+---
+
+## 前端配套改动清单
+
+> ⚠️ 2026-10-03 新增小节（口径同
+> [`./production/shelf-process-mapping.md#前端配套改动清单`](./production/shelf-process-mapping.md#前端配套改动清单)）。
+> **前端配套改动不止改 URL**：本批 4 个读端点里，2 个换了前缀、2 个换了返回形状
+> （分页信封），另有 1 个出参新增字段、1 个类型声明与实际返回不符。只改 URL 的话
+> 页面仍会「能请求但不显示 / 显示错」。
+
+> 核实基准：前端仓 `hsh-erp/frontend`（`src/api/` / `src/types/` / `src/views/outsource/composables/`），
+> 2026-10-03 逐个打开确认。
+
+| 前端位置 | 现状 | 后端新契约 |
+|---|---|---|
+| `frontend/src/api/outsource.ts` 的 `listOutsourceInFlight` | 打 `/parts/outsource-in-flight` | URL 已下线（实际 400）→ 改 `/outsource-shipments/in-flight`；返回也从 `OutsourceInFlightItem[]` 变 `{items,total,limit,offset}` |
+| `frontend/src/api/parts/crud.ts` 的 sendable helper | 打 `/parts/outsource-sendable` | URL 已下线（实际 400）→ 改 `/outsource-sendable`；**函数应迁到 `api/outsource.ts`**（可发送外协已不是 part 域概念，`api/parts/*` 里留着会误导） |
+| `frontend/src/api/outsource.ts` 的 `listQuotableParts` 返回类型 | 声明 `Promise<PartListItem[]>` | 实际是 `{items,total,limit,offset}` 分页信封 → 改返回类型；`OutsourceQuoteList.vue:83` 的 `raw` 消费方同步改成 `raw.items` |
+| `frontend/src/views/outsource/composables/useOutsourceReceivingList.ts` 的 `receivingFetcher` | `return { items, total: items.length }` | 实际分页信封 → `return { items: r.items, total: r.total }`（`total: items.length` 会让翻页器只有 1 页） |
+| `frontend/src/types/outsource.ts` 的 `OutsourceSendableItem` | **无 `quote_id`** | 后端已加 `quote_id: string \| null`（`send-to-outsource` 靠它决定传哪个报价）→ 补字段 |
+
+### 已知限制（不在本轮修）
+
+- **`keyword` 不转义 SQL LIKE 通配符**：`service/mod.rs::keyword_pattern` 直接
+  `%{kw}%`，不拒 `%` / `_` / `\`。注入面为 0（纯 bind 参数），但
+  `?keyword=%` 等价于「不过滤」、`?keyword=_` 匹配任意单字符。仓库正在形成
+  「service 层拒通配符」的约定（见 [`./parts/lifecycle.md`](./parts/lifecycle.md)
+  里 `pending-programming` 的转义说明），本端点尚未跟进。

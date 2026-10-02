@@ -2,7 +2,8 @@
 //!
 //! 覆盖：
 //! - `GET /outsource-companies/{id}/sent-parts`：happy path（OUTSOURCING + RECEIVED
-//!   都出现）/ keyword 过滤 / sent_at 日期窗 / 3 种 sort_by / 非法 sort_by 回落 /
+//!   都出现）/ keyword 过滤（命中 + **零命中返回 0 行**）/ sent_at 日期窗 /
+//!   3 种 sort_by / sort 白名单大小写不敏感 / 非法 sort_by 回落并**验序** /
 //!   分页 total+offset
 //! - `GET /outsource-shipments/in-flight`：只返 OUTSOURCING；**`version` 取
 //!   `t_part_batch.version` 而非 `t_outsource_shipment.version`**（专门用两个不同值
@@ -429,18 +430,42 @@ async fn sent_parts_sort_by_price_sent_at_received_at() {
     );
 }
 
+/// 2026-10-03 review 第 1 轮 BLOCKER-1：给了 keyword 却**零命中**时必须返回 0 行。
+///
+/// 回归的 bug：SQL 谓词是
+/// `AND (cardinality($2::bigint[]) = 0 OR s.part_id = ANY($2))`，
+/// `part_keyword_search` 零命中时给出空数组 → `cardinality = 0` 成立 →
+/// 整个 keyword 条件被短路掉 → 返回该公司的**全部** shipment（list 与 count
+/// 同时错，`total` 也一起错）。
 #[tokio::test]
-async fn sent_parts_illegal_sort_by_falls_back_without_injection() {
+async fn sent_parts_keyword_zero_match_returns_empty_not_all_rows() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let cid = insert_l1_customer(&pool, "InjCo", "Y").await;
-    let pid = insert_part(&pool, cid, "INJ").await;
+    let cid = insert_l1_customer(&pool, "ZeroCo", "Z").await;
+    // 两台零件 / 两条 shipment，都不含 keyword 里那个词
+    let p1 = insert_part(&pool, cid, "ONE").await;
+    let p2 = insert_part(&pool, cid, "TWO").await;
     let company = OutsourceFixture::OUTSOURCE_COMPANY_ID;
-    let proc_id = seed_outsource_process(&pool, "IJPROC").await;
-    let qid = insert_quote(&pool, pid, company, proc_id).await;
+    let proc_id = seed_outsource_process(&pool, "ZOPROC").await;
+    let q1 = insert_quote(&pool, p1, company, proc_id).await;
+    let q2 = insert_quote(&pool, p2, company, proc_id).await;
     insert_shipment(
         &pool,
-        qid,
-        pid,
+        q1,
+        p1,
+        None,
+        company,
+        proc_id,
+        1,
+        "1.00",
+        "OUTSOURCING",
+        "2026-09-01 10:00:00",
+        None,
+    )
+    .await;
+    insert_shipment(
+        &pool,
+        q2,
+        p2,
         None,
         company,
         proc_id,
@@ -452,6 +477,118 @@ async fn sent_parts_illegal_sort_by_falls_back_without_injection() {
     )
     .await;
 
+    // 无 keyword → 全量 2 条（对照组：证明"全量"本身是可达的，不是断言写错）
+    let (s, env) = get_sent_parts(&app, &token, company, "").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 2, "无 keyword 应返回全量: {env}");
+
+    // 零命中 keyword → 0 条。**空 items 是本用例的全部断言**，删掉 service 层的
+    // 早返回就会拿到 2 条 → 红。
+    let (s, env) = get_sent_parts(&app, &token, company, "?keyword=NOSUCHTOKENZZ").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 0,
+        "零命中 keyword 必须 total=0（曾返回全量 2）: {env}"
+    );
+    assert!(
+        env["data"]["items"].as_array().unwrap().is_empty(),
+        "零命中 keyword 必须 items 为空: {env}"
+    );
+}
+
+/// 2026-10-03 review 第 1 轮 m5：`sort_by` / `sort_dir` 白名单**大小写不敏感**
+/// （此前 `?sort_by=price` 静默回落成 `SENT_AT`，前端小写传参时排序不生效且不报错）。
+#[tokio::test]
+async fn sent_parts_sort_whitelist_is_case_insensitive() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_l1_customer(&pool, "CaseCo", "C").await;
+    let company = OutsourceFixture::OUTSOURCE_COMPANY_ID;
+    let proc_id = seed_outsource_process(&pool, "CSPROC").await;
+    for (tag, price) in [("HI", "9.00"), ("LO", "1.00"), ("MID", "5.00")] {
+        let pid = insert_part(&pool, cid, tag).await;
+        let qid = insert_quote(&pool, pid, company, proc_id).await;
+        insert_shipment(
+            &pool,
+            qid,
+            pid,
+            None,
+            company,
+            proc_id,
+            1,
+            price,
+            "RECEIVED",
+            "2026-09-01 10:00:00",
+            Some("2026-09-02 10:00:00"),
+        )
+        .await;
+    }
+
+    let draw_names = |env: &serde_json::Value| -> Vec<String> {
+        env["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["part_name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // 小写 price + asc → LO(1.00) MID(5.00) HI(9.00)。
+    // 大小写敏感时 `price` 回落 `SENT_AT DESC` → HI MID LO（sent_at 相同则按 id DESC，
+    // 插入序逆序），断言必红。
+    let (s, env) = get_sent_parts(&app, &token, company, "?sort_by=price&sort_dir=asc").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        draw_names(&env),
+        vec!["NAME-LO", "NAME-MID", "NAME-HI"],
+        "sort_by/sort_dir 必须大小写不敏感: {env}"
+    );
+}
+
+/// 2026-10-03 review 第 1 轮 m1：补 2 条不同 `sent_at` 的行并**断言降序**。
+///
+/// 原用例只种 1 行 —— 1 行无法验序，只能证明"回落没注入、没报错、没删数据"，
+/// 不能证明真的回落到 `SENT_AT` / `DESC`。
+#[tokio::test]
+async fn sent_parts_illegal_sort_by_falls_back_to_sent_at_desc_without_injection() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_l1_customer(&pool, "InjCo", "Y").await;
+    let company = OutsourceFixture::OUTSOURCE_COMPANY_ID;
+    let proc_id = seed_outsource_process(&pool, "IJPROC").await;
+    // 3 行的 `sent_at` 升序、`received_at` **降序**、`unit_price` 与 `sent_at`
+    // **不同向**（9 / 1 / 5）。这样 4 种可能的回落 / 误映射给出的行序两两不同：
+    //   SENT_AT DESC（期望）  → LATE, MID, EARLY
+    //   PRICE ASC             → MID, LATE, EARLY
+    //   PRICE DESC            → EARLY, LATE, MID
+    //   RECEIVED_AT DESC      → EARLY, MID, LATE
+    // 只种 1 行时这 4 种全同，断言无法区分 —— 这是原用例的根本缺口。
+    for (tag, price, sent, recv) in [
+        (
+            "EARLY",
+            "9.00",
+            "2026-09-01 10:00:00",
+            "2026-09-20 10:00:00",
+        ),
+        ("MID", "1.00", "2026-09-02 10:00:00", "2026-09-15 10:00:00"),
+        ("LATE", "5.00", "2026-09-03 10:00:00", "2026-09-10 10:00:00"),
+    ] {
+        let pid = insert_part(&pool, cid, tag).await;
+        let qid = insert_quote(&pool, pid, company, proc_id).await;
+        insert_shipment(
+            &pool,
+            qid,
+            pid,
+            None,
+            company,
+            proc_id,
+            1,
+            price,
+            "RECEIVED",
+            sent,
+            Some(recv),
+        )
+        .await;
+    }
+
     // 注入串 + 未知列名 + 非法方向：必须回落 sent_at / DESC，且不报错、表还在
     let (s, env) = get_sent_parts(
         &app,
@@ -461,12 +598,25 @@ async fn sent_parts_illegal_sort_by_falls_back_without_injection() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    assert_eq!(env["data"]["total"], 1, "{env}");
+    assert_eq!(env["data"]["total"], 3, "{env}");
+    // ★ 回落语义本体：3 行按 sent_at 降序。删掉这两行断言，本用例就退化成
+    // "没注入、没报错"而不再验序（review 第 1 轮 m1 点的正是这个缺口）。
+    let names: Vec<&str> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["part_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["NAME-LATE", "NAME-MID", "NAME-EARLY"],
+        "非法 sort_by / sort_dir 必须回落到 SENT_AT / DESC: {env}"
+    );
     let still_there: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_shipment")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(still_there, 1, "注入串不得影响 SQL");
+    assert_eq!(still_there, 3, "注入串不得影响 SQL");
 }
 
 #[tokio::test]

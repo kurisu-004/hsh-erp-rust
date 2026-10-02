@@ -112,20 +112,27 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `keyword` | string? | part 的 `drawing_no` / `name` ILIKE `%needle%`（复用 `part_keyword_search` 语义）；trim 后空串视为无过滤 |
+| `keyword` | string? | part 的 `drawing_no` / `name` ILIKE `%needle%`（复用 `part_keyword_search` 语义）；trim 后空串视为无过滤。**零命中返回 `items: []` / `total: 0`**（2026-10-03 review 第 1 轮 BLOCKER-1 修复：此前 SQL 的 `AND (cardinality($2::bigint[]) = 0 OR part_id = ANY($2))` 让空 id 数组把 keyword 条件短路掉，「不存在的词」返回该公司的**全部** shipment） |
 | `sent_from` | naive datetime? | `sent_at` 闭区间下界（含），ISO 串如 `2026-09-01T00:00:00` |
 | `sent_to` | naive datetime? | `sent_at` 闭区间上界（含） |
 | `received_from` | naive datetime? | `received_at` 闭区间下界（含） |
 | `received_to` | naive datetime? | `received_at` 闭区间上界（含） |
-| `sort_by` | string? | 白名单 `PRICE` / `SENT_AT` / `RECEIVED_AT`；**非法值回落 `SENT_AT`（不报错）** |
-| `sort_dir` | string? | `ASC` / `DESC`；**非法值回落 `DESC`** |
+| `sort_by` | string? | 白名单 `PRICE` / `SENT_AT` / `RECEIVED_AT`，**大小写不敏感**（`price` 与 `PRICE` 等价）；**非法值回落 `SENT_AT`（不报错）** |
+| `sort_dir` | string? | `ASC` / `DESC`，**大小写不敏感**；**非法值回落 `DESC`** |
 | `limit` | i64? | 默认 50，clamp(1, 200) |
 | `offset` | i64? | 默认 0，max(0) |
 
-> ⚠️ `sort_by` / `sort_dir` **绝不拼进 SQL 文本**：service 先把用户输入映射成上表
-> 3 个 + 2 个白名单 token 之一，再 bind 进 SQL 的 `CASE WHEN $7::text = 'PRICE' …`。
-> 传 `'; DROP TABLE --` 一类注入串只会静默回落到默认值（见 `tests/outsource/shipment.rs`
-> 的 `sent_parts_illegal_sort_by_falls_back_without_injection`）。
+> ⚠️ `sort_by` / `sort_dir` **绝不拼进 SQL 文本**：service 先 `trim` +
+> `to_ascii_uppercase`，再把用户输入映射成上表 3 个 + 2 个白名单 token 之一，
+> bind 进 SQL 的 `CASE WHEN $7::text = 'PRICE' …`。传 `'; DROP TABLE --` 一类
+> 注入串只会静默回落到默认值（见 `tests/outsource/shipment.rs` 的
+> `sent_parts_illegal_sort_by_falls_back_to_sent_at_desc_without_injection`
+> —— 该用例断言**行序**，不只是「没报错」）。
+
+> **已知限制（不在本轮修）**：`keyword` 不转义 SQL LIKE 通配符。
+> `service::keyword_pattern` 直接 `%{kw}%`，不拒 `%` / `_` / `\`。注入面为 0
+> （纯 bind），但 `?keyword=%` 等价于「不过滤」、`?keyword=_` 匹配任意单字符。
+> 仓库正在形成「service 层拒通配符」的约定，本端点尚未跟进。
 
 ### OutsourceSentPartOut 字段
 
@@ -197,7 +204,9 @@
 - `list_companies_for_process` 走 `t_outsource_company_process` 反向 JOIN，O(1)。
 - `list_company_sent_parts` **一条 SQL** 把 part / 客户(L2+L1) / 工序 / 批次号 / 加急标记
   全部 JOIN 出来，service 只做 Decimal 乘法与 VO 组装；`total` 走第二条同 WHERE 的
-  `COUNT(*)`。全程 2 次往返，与 `limit`/`offset` 无关。
+  `COUNT(*)`。**不带 `keyword` 时全程 2 次往返**（list + count），与 `limit`/`offset`
+  无关；**带 `keyword` 时是 3 次** —— `part_keyword_search`（`t_part` 上
+  `drawing_no OR name ILIKE`，取回命中 part 的 id 列表）+ list + count。
 
 ---
 
@@ -216,5 +225,8 @@
 ## 集成测试
 
 - `tests/outsource/company.rs`（6+ 用例：CRUD happy / OCC 40901 / 软删被引用 21205 / by-process / set-processes 替换语义）
-- `tests/outsource/shipment.rs`（7 用例：`sent-parts` happy path / keyword / 日期窗 /
-  3 种 sort_by / 注入串回落 / 分页 total+offset，以及 in-flight 端点）
+- `tests/outsource/shipment.rs`（9 用例：`sent-parts` happy path / keyword 命中 /
+  **keyword 零命中返 0 行**（带「无 keyword 返全量」对照组，证明断言没写死）/
+  日期窗 / 3 种 sort_by / **sort 白名单大小写不敏感** / 注入串回落**并验行序**（3 行，
+  `sent_at` 升 / `received_at` 降 / `unit_price` 与 `sent_at` 不同向，4 种可能的
+  排序结果两两不同，单行或同向数据都验不出来）/ 分页 total+offset，以及 in-flight 2 用例）
