@@ -190,8 +190,10 @@ Response 200 `data`：`null`
 | `t_process_chain_step` (`process_id`) | 工艺链步骤所属工序 | **是**（step 表带软删） |
 
 3 张 junction 表的子查询不过滤 `deleted_at`：它们按整组替换语义写入（整组替换 = 软删旧行
-+ 插新行），引用计数若只算 active 行，用户清空一次映射就能让工序 / 工种绕过
-`BIZ_PROCESS_IN_USE` / `BIZ_WORK_TYPE_IN_USE` 被软删。
++ 插新行），引用计数若只算 active 行，用户清空一次映射就能绕过 20803 把仍在历史映射里的
+工序软删掉。本函数只产出 20803；工种侧同规则的计数与 20903 见
+[`./work-types.md`](./work-types.md) 与
+[`./work-type-process-mapping.md`](./work-type-process-mapping.md)。
 
 任一总数 > 0 ⇒ 20803 `BIZ_PROCESS_IN_USE`。5 张表都已迁移到位，
 无 junction repo 缺口；后续如需按 junction 拆分 repo，可保留 best-effort 注释。
