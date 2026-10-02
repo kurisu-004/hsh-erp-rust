@@ -140,7 +140,7 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     id
 }
 
-/// `t_work_type_process` 映射（无业务软删：`deleted_at` 留默认 NULL）。
+/// 直插一条 **active** 的 `t_work_type_process` 映射（`deleted_at` 留默认 NULL）。
 async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -161,7 +161,7 @@ async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
     .expect("insert t_work_type_process");
 }
 
-/// `t_shelf_process` 映射（无业务软删）。
+/// 直插一条 **active** 的 `t_shelf_process` 映射（`deleted_at` 留默认 NULL）。
 async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 

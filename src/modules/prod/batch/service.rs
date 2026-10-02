@@ -501,7 +501,7 @@ mod tests {
         id
     }
 
-    /// 写一个 `t_shelf_process` 映射（无业务软删）。
+    /// 写一条 **active** 的 `t_shelf_process` 映射（`deleted_at` 留默认 NULL）。
     async fn link_shelf_to_process(pool: &sqlx::PgPool, shelf_id: i64, process_id: i64) {
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let id = snowflake.next_id();

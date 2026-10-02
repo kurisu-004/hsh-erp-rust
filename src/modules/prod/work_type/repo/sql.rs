@@ -71,7 +71,7 @@ impl WorkTypeRepo {
     }
 
     /// 工种可执行的工序 id 列表（worker-pool 校验 worker 操作的 process 是否属于其工种）。
-    /// `t_work_type_process` 无业务软删（mapping 表通常保留历史），不筛 `deleted_at`。
+    /// 2026-10-02 修：整组替换软删旧行，读路径筛 `deleted_at IS NULL`。
     pub async fn list_process_ids<'e, E: PgExecutor<'e>>(
         executor: E,
         work_type_id: i64,
@@ -80,7 +80,7 @@ impl WorkTypeRepo {
             r#"
             SELECT process_id AS "process_id!"
             FROM t_work_type_process
-            WHERE work_type_id = $1
+            WHERE work_type_id = $1 AND deleted_at IS NULL
             "#,
             work_type_id,
         )
@@ -279,8 +279,9 @@ impl WorkTypeRepo {
     ///
     /// 任一分支 > 0 ⇒ 20903 `BIZ_WORK_TYPE_IN_USE`。
     ///
-    /// 注：`t_work_type_process` 无业务软删（mapping 表保留历史），不筛 `deleted_at`；
-    /// 这与 `ProcessRepo::count_process_references` 的 junction 处理一致。
+    /// 注：`t_work_type_process` 子查询**不过滤** `deleted_at` —— 引用计数要算历史，
+    /// 否则「整组替换后映射已软删」的历史行会让工种永远删不掉（与
+    /// `ProcessRepo::count_process_references` 的 junction 处理一致）。
     pub async fn count_work_type_references<'e, E: PgExecutor<'e>>(
         executor: E,
         work_type_id: i64,
@@ -307,7 +308,7 @@ impl WorkTypeRepo {
     /// SELECT wt.id, wt.code, wt.name, wt.max_held_batches
     ///   FROM t_work_type wt
     ///   JOIN t_work_type_process wtp ON wtp.work_type_id = wt.id
-    ///  WHERE wtp.process_id = $1 AND wt.deleted_at IS NULL
+    ///  WHERE wtp.process_id = $1 AND wt.deleted_at IS NULL AND wtp.deleted_at IS NULL
     ///  ORDER BY wt.sort_order ASC, wt.id ASC
     ///
     /// 返回元组，service 层负责构造 DTO。
@@ -324,7 +325,7 @@ impl WorkTypeRepo {
             r#"SELECT wt.id, wt.code, wt.name, wt.max_held_batches
                FROM t_work_type wt
                JOIN t_work_type_process wtp ON wtp.work_type_id = wt.id
-               WHERE wtp.process_id = $1 AND wt.deleted_at IS NULL
+               WHERE wtp.process_id = $1 AND wt.deleted_at IS NULL AND wtp.deleted_at IS NULL
                ORDER BY wt.sort_order ASC, wt.id ASC"#,
         )
         .bind(process_id)

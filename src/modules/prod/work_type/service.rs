@@ -375,7 +375,8 @@ pub struct WorkTypeProcessRepo;
 
 impl WorkTypeProcessRepo {
     /// 按 `work_type_id` 取所有 active mapping（按 sort_order ASC）。
-    /// `t_work_type_process` 无业务软删（mapping 表通常保留历史），不筛 `deleted_at`。
+    /// 2026-10-02 修：整组替换走「软删旧行 + 插新行」，读路径必须筛
+    /// `wtp.deleted_at IS NULL`，否则已取消勾选的工序会随软删行一起返回。
     pub async fn list_by_work_type<'e, E: PgExecutor<'e>>(
         executor: E,
         work_type_id: i64,
@@ -386,7 +387,7 @@ impl WorkTypeProcessRepo {
             SELECT wtp.process_id, wtp.sort_order, p.code AS process_code
             FROM t_work_type_process wtp
             JOIN t_process p ON p.id = wtp.process_id AND p.deleted_at IS NULL
-            WHERE wtp.work_type_id = $1
+            WHERE wtp.work_type_id = $1 AND wtp.deleted_at IS NULL
             ORDER BY wtp.sort_order ASC, wtp.id ASC
             "#,
         )
@@ -398,6 +399,7 @@ impl WorkTypeProcessRepo {
     /// 批量取一组工种的全部 process_id 列表（防 N+1）：
     /// 单条 SQL 返回 `[work_type_id, process_id, process_code, sort_order]`
     /// 用于 `WorkTypeService::list_work_types` 一次性补齐 `process_ids` 字段。
+    /// 2026-10-02 修：同 `list_by_work_type`，筛 `deleted_at IS NULL`。
     pub async fn list_by_work_types_batch<'e, E: PgExecutor<'e>>(
         executor: E,
         work_type_ids: &[i64],
@@ -409,7 +411,7 @@ impl WorkTypeProcessRepo {
             r#"
             SELECT work_type_id, process_id
             FROM t_work_type_process
-            WHERE work_type_id = ANY($1)
+            WHERE work_type_id = ANY($1) AND deleted_at IS NULL
             ORDER BY work_type_id, sort_order, id
             "#,
         )

@@ -20,13 +20,17 @@
 
 ## 业务模型
 
-`t_work_type_process` 是无业务软删的 mapping 表（worker-pool / worker-scan 校验依赖），
-记录「某工种可执行哪些工序」及其显示顺序。
+`t_work_type_process` 记录「某工种可执行哪些工序」及其显示顺序（worker-pool /
+worker-scan 校验依赖）。**整组替换 = 软删旧行 + 插新行**（`set` 端点），
+因此读路径一律带 `deleted_at IS NULL`。
 
 - **无外键**：`work_type_id` / `process_id` 为 bigint 逻辑引用，DB 层无 FK 约束
-- **无软删**：mapping 行无 `deleted_at` 字段；update 走「整组替换」语义（先清空再 bulk_insert）
+- **软删**：`deleted_at` 列 + `uk_t_work_type_process` 部分唯一索引（`WHERE deleted_at IS NULL`）；
+  `set` 走整组替换语义（先软删全部再 bulk_insert），所有读（`GET` 端点、`process_ids` 出参、
+  worker-pool / 工种可领批次查询）都只返回 active 行
 - **业务软删检测**：删除工种时（见 [work-types.md](./work-types.md) `POST /work-types/{id}/soft-delete`），
-  service 用 `count_work_type_references` 查 `t_work_type_process.work_type_id` 任一 > 0 ⇒ 20903 拒
+  service 用 `count_work_type_references` 查 `t_work_type_process.work_type_id` 任一 > 0 ⇒ 20903 拒。
+  该计数**不过滤** `deleted_at`（要算历史，否则整组替换后工种再也删不掉，理由见「维护约定」第 3 条）
 - **`process_ids` 出参**：工种 list / detail 接口会通过 `WorkTypeProcessRepo::list_by_work_types_batch`
   单条 SQL 批量补全 `WorkTypeOut.process_ids`（防 N+1）
 
@@ -34,7 +38,7 @@
 
 | 操作 | 约束 |
 |---|---|
-| `GET /processes` | 工种不存在 → 20901；按 `sort_order ASC, id ASC` 返回 |
+| `GET /processes` | 工种不存在 → 20901；按 `sort_order ASC, id ASC` 返回**仅 active 行** |
 | `POST /processes` | 工种不存在 → 20901；items 里有 process_id 不存在或已软删 → 20801；整组替换语义 |
 
 ---
@@ -121,5 +125,8 @@ Response 200 `data`：`null`
 2. `set_work_type_processes` 走「整组替换」语义：先 `soft_delete_all_for_work_type` →
    `bulk_insert`。空 `items` = 清空全部 mapping（仍走事务）。
 3. 软删引用计数（`count_work_type_references`）单条 `UNION ALL` 查
-   `t_worker.work_type_id`（活跃行）+ `t_work_type_process.work_type_id`（mapping 表
-   无业务软删，不筛 `deleted_at`）；任一分支 > 0 ⇒ 20903 拒（**该逻辑在 work_types 域 soft-delete 端点，详见 [`./work-types.md`](./work-types.md#post-apiv2work-typesidsoft-delete)**）。
+   `t_worker.work_type_id`（活跃行）+ `t_work_type_process.work_type_id`；
+   **junction 分支不过滤 `deleted_at`** —— 引用计数要算历史，否则整组替换软删掉的
+   映射行会让该工种永远删不掉（与 `ProcessRepo::count_process_references` 的 junction
+   处理一致）。任一分支 > 0 ⇒ 20903 拒（**该逻辑在 work_types 域 soft-delete 端点，
+   详见 [`./work-types.md`](./work-types.md#post-apiv2work-typesidsoft-delete)**）。
