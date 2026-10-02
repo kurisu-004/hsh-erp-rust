@@ -32,9 +32,26 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    PartFixture, ProductionFixture, json_request, load_production_fixture, login_token, send,
-    test_app, test_pool, test_state,
+    PartFixture, ProductionFixture, json_request, load_production_fixture, login_token,
+    pool_snowflake, send, test_app, test_pool, test_state,
 };
+
+/// 从 test-support 的**进程级共享**雪花生成器取下一个 id。
+///
+/// 2026-10-03（review 第 1 轮 Minor-3）改用共享生成器：本文件原先在三处 helper 里
+/// 自建 `SnowflakeIdGenerator::new(1_577_836_800_000, 1)`，instance 硬编码为 1。
+/// `test-support/src/pool.rs` 已明确记载 2026-09-20 把 `pool_snowflake()` 的
+/// instance 从固定 `1` 改为 `test_snowflake_instance()`（pid ⊕ 启动纳秒）派生，
+/// 理由是 nextest process-per-test 模型下跨进程并行共享 instance=1 会撞
+/// redis session key（`sessions:user:{id}` 等）。当前每测试独立 database、本文件
+/// 不碰 redis，故固定 instance=1 不会立刻炸，但那是已被明确移除的模式，且与同批
+/// `tests/part/pickable_by_work_type.rs` 的做法不一致 —— 统一回共享生成器。
+fn next_id() -> i64 {
+    pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id()
+}
 
 /// 一次测试的公共上下文：pool / app / 三种身份的 token / fixture。
 struct Ctx {
@@ -87,9 +104,7 @@ async fn bootstrap() -> Ctx {
 /// 直插一个最小 `t_part` 行（status='PENDING'，数量 = `quantity`）。
 async fn insert_part(pool: &PgPool, quantity: i32) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, request_date, \
@@ -119,9 +134,7 @@ async fn insert_part_batch(
     holder_id: Option<i64>,
 ) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     let location = if status == "IN_PROCESS" {
         Some("PRODUCTION_SHELF")
@@ -149,9 +162,7 @@ async fn insert_part_batch(
 /// 直插一个 active 且已绑 work_type 的工人（pick-up 的两个硬性前置）。
 async fn insert_active_worker(pool: &PgPool, work_type_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let id = snowflake.next_id();
+    let id = next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
@@ -330,8 +341,7 @@ async fn pick_up_partial_splits_batch_and_delivers_new_batch() {
     );
 
     // 源批次：数量递减、**位置不动**（余量仍在生产架上）
-    let (src_qty, src_status, src_loc, src_holder, _src_ver) =
-        read_batch(&ctx.pool, batch_id).await;
+    let (src_qty, src_status, src_loc, src_holder, src_ver) = read_batch(&ctx.pool, batch_id).await;
     assert_eq!(src_qty, 6, "源批次应剩 10 - 4 = 6");
     assert_eq!(src_status, "IN_PROCESS");
     assert_eq!(
@@ -340,6 +350,20 @@ async fn pick_up_partial_splits_batch_and_delivers_new_batch() {
         "源批次应仍在生产架上（余量可再被领）"
     );
     assert_eq!(src_holder, Some(shelf_id), "源批次 holder 仍是货架");
+    // 2026-10-03（review 第 1 轮 Minor-2）新增断言：拆批对源批次做了
+    // `version = version + 1`（`PartBatchRepo::_split_batch_inner`），故源批次
+    // 最终 version 必须是 1（初始 0 + 拆批 +1；**不再**被翻状态，因为翻的是
+    // 新批次 —— 源批次只有拆批这一次写入）。
+    //
+    // 为什么必须钉住：这是前端「领走一部分后再领余量」时唯一需要的 OCC 锚点。
+    // `_split_batch_inner` 里那行 `version = version + 1` 看起来像多余的写入
+    // （同一条 UPDATE 已经在改 quantity），将来有人清理「冗余字段」时把它删掉，
+    // 不会有任何测试变红，而前端会拿着 `batch_version = 0`（已过期）去打下一次
+    // pick-up，表现为莫名其妙的 409。
+    assert_eq!(
+        src_ver, 1,
+        "部分领取后源批次 version 必须 +1（拆批 OCC 写），前端据此重拉列表拿新锚点"
+    );
 
     // 新批次：由拆分产生，quantity=4 且已交到工人手上
     let new_id: i64 = sqlx::query_scalar(
@@ -350,11 +374,16 @@ async fn pick_up_partial_splits_batch_and_delivers_new_batch() {
     .fetch_one(&ctx.pool)
     .await
     .expect("部分领取应拆出一个新批次");
-    let (new_qty, new_status, new_loc, new_holder, _new_ver) = read_batch(&ctx.pool, new_id).await;
+    let (new_qty, new_status, new_loc, new_holder, new_ver) = read_batch(&ctx.pool, new_id).await;
     assert_eq!(new_qty, 4, "新批次数量 = 拆走量");
     assert_eq!(new_status, "IN_PROCESS");
     assert_eq!(new_loc.as_deref(), Some("WORKER"));
     assert_eq!(new_holder, Some(worker_id));
+    // 新批次由 INSERT 建出时 version 恒 0，随后被翻到 IN_PROCESS+WORKER 再 +1
+    assert_eq!(
+        new_ver, 1,
+        "新批次 version = INSERT 的 0 + 翻状态 +1（与源批次的 +1 是两笔独立写入）"
+    );
     assert_eq!(count_batches(&ctx.pool, part_id).await, 2);
 
     // parent_batch_id：新批次 → 源批次
@@ -428,9 +457,15 @@ async fn pick_up_partial_from_pending_batch_succeeds() {
     .await;
     assert_eq!(s, StatusCode::OK, "PENDING 源部分领取应 200: {env}");
 
-    let (src_qty, src_status, _src_loc, _src_holder, _v) = read_batch(&ctx.pool, batch_id).await;
+    let (src_qty, src_status, _src_loc, _src_holder, src_ver) =
+        read_batch(&ctx.pool, batch_id).await;
     assert_eq!(src_qty, 4);
     assert_eq!(src_status, "PENDING", "源批次状态不变（拆批只动数量）");
+    // 与 IN_PROCESS 源那条用例同款断言：源批次只被拆批写过一次，version 必为 1
+    assert_eq!(
+        src_ver, 1,
+        "PENDING 源部分领取后 version 同样 +1（拆批 OCC 写，与起点状态无关）"
+    );
 
     let new_id: i64 = sqlx::query_scalar(
         "SELECT id FROM t_part_batch WHERE part_id = $1 AND deleted_at IS NULL AND id <> $2",

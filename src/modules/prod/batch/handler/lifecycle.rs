@@ -356,8 +356,11 @@ pub async fn pick_up(
     // 2026-10-03：部分领取发生了拆批 → 补发 PART_BATCH_SPLIT。
     // 必须发：拆批把源批次的 quantity 静默扣减、并新建了一个批次行，其它端的
     // 批次视图不收到这条事件就永远看不到「源批次余量变了 / 多了一个批次」。
-    // payload 字段与 `split_batch` 端点的 PART_BATCH_SPLIT 保持同形（消费方
-    // 按 event type 分派，两处字段名必须一致）。
+    //
+    // ⚠️ 2026-10-03 订正：本事件**不是**「与 split_batch 端点同形」。两处共用
+    // `part_id` / `new_batch_id` 两个字段名（消费方唯一可无条件依赖的部分），
+    // 后两个是本处的增量字段。同一事件名两种 payload 的完整对照见
+    // `docs/api/websocket.md#part_batch_split-双-payload2026-10-03-订正`。
     if let Some(split) = outcome.split.as_ref() {
         ws_broadcast(
             &state,
