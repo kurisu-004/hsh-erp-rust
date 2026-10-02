@@ -238,6 +238,8 @@ pub struct RepairBatchListQuery {
 /// `sort_by` 白名单（SERIAL_NO / DRAWING_NO / NAME / BATCH_NO / QUANTITY /
 /// SYSTEM_DELIVERY_DATE / CUSTOMER_NAME），非法值退化为 SYSTEM_DELIVERY_DATE；
 /// `sort_dir` 非法退化为 ASC。
+/// 3 个文本筛选值含 `%` / `_` / `\` 时在 service 层拒（40001）—— 那是防 `%…%`
+/// 被当通配符放大成全表扫描的**语义**约束，注入面由 repo 的 `push_bind` 保证。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct InspectionQueueQuery {
     #[serde(default)]

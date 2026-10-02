@@ -259,11 +259,11 @@
 事实改由 **`t_part_batch.is_repairing`（boolean，默认 false）** 承载。所有「返修中」
 的查询 / 守卫一律读该列，不再判 `status = 'REPAIRING'`（DB 里不再产生该字面量；
 `PartStatus::from_str("REPAIRING")` 保留 → `IN_PROCESS` 的过渡兼容分支）。
-**2026-10-02 review 第 2 轮订正**：原文「批次返修中时 `status` 保持 `IN_PROCESS`」
+**2026-10-02 订正**：原文「批次返修中时 `status` 保持 `IN_PROCESS`」
 字面读成了「返修中 ⇒ `IN_PROCESS`」的不变式，**不成立** —— 标记与 `status`
 **正交**：起修后送检 / 送检通过 / 发货都只保持标记，故返修件的 `status` 也可能是
 `INSPECTION` / `READY_TO_SHIP` / `DELIVERED`（可达链见
-[`./inspection.md`](./inspection.md) 订正段）。
+[`./lifecycle.md` § GET /api/v2/prod/batches/repairing](./lifecycle.md#get-apiv2prodbatchesrepairing)）。
 
 ### 三层单向派生 + 单一写入口
 

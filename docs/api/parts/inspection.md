@@ -511,12 +511,12 @@ Query：
 
 | 参数 | 类型 | 必填 | 默认值 | 校验 / 说明 |
 |---|---|---|---|---|
-| `drawing_no` | string | — | — | ILIKE 匹配 `t_part.drawing_no`（表头「图号」列）；含 `%` / `_` / `\\` → `40001 VALIDATION_ERROR`；空串 = 不过滤 |
+| `drawing_no` | string | — | — | ILIKE 匹配 `t_part.drawing_no`（表头「图号」列）；含 `%` / `_` / `\\` → `40001 VALIDATION_ERROR`；空串 = 不过滤。**拒通配符是语义约束**（防 `%…%` 被当通配符放大成全表扫描），不是注入防护 —— 注入面由 repo 侧 `push_bind` 参数化保证 |
 | `name` | string | — | — | ILIKE 匹配 `t_part.name`（表头「名称」列）；通配符校验同上 |
 | `serial_no` | string | — | — | ILIKE 匹配 `t_part.serial_no`（表头「序列号」列）；通配符校验同上 |
 | `customer_id` | string (i64) | — | — | 单值；service 用 `expand_customer_id` 展开为 L1+L2 ids（关联 `t_customer.parent_id`） |
-| `system_delivery_date_from` | date | — | — | 范围下界（含），匹配 `t_part.system_delivery_date`；**NULL 交期不被命中** |
-| `system_delivery_date_to` | date | — | — | 范围上界（含），匹配 `t_part.system_delivery_date` |
+| `system_delivery_date_from` | date | — | — | 范围下界（含），匹配 `t_part.system_delivery_date`；**NULL 交期不被命中**。格式非法 → 400（axum Query 层，非 R 信封，见错误码段） |
+| `system_delivery_date_to` | date | — | — | 范围上界（含），匹配 `t_part.system_delivery_date`；格式非法同上 |
 | `sort_by` | string | — | `SYSTEM_DELIVERY_DATE` | 白名单（见下方排序表）；**非法值退化为 `SYSTEM_DELIVERY_DATE`，不报错** |
 | `sort_dir` | string | — | `ASC` | 仅 `DESC`（忽略大小写）被接受，其余（含缺省）→ `ASC` |
 | `limit` | string (i64) | — | `200` | clamp 到 `[1, 200]`（`0` / 负数 → `1`；超过 `200` → `200`；非法 → `200`） |
@@ -543,6 +543,11 @@ Query：
   顶到最前。
 - `pb.id ASC` 兜底：排序列可重复（同名不同批次），无兜底键时翻页会漏行 / 重复行。
 - 列名白名单在 service 层映射后才进 repo，故外部输入不可能成为 SQL 片段。
+- **2026-10-03：`is_urgent` 不再参与排序**。改 VO 之前服务端硬编码
+  `ORDER BY is_urgent DESC, planned_delivery_date ASC, pb.id ASC`，即「紧急件优先」
+  自动置顶；现改为仿照零件一览页的表头点列排序，`is_urgent` **降级为纯展示字段**
+  （前端自行标红），不再是任何 `sort_by` 的排序键。接入方注意：默认序下加急件
+  **不会**自动置顶，要置顶需前端按 `is_urgent` 自行排。
 
 Response 200 `data`：`InspectionQueueListOut`
 
@@ -587,6 +592,11 @@ WHERE 判据固定：`pb.status = 'INSPECTION'` + 双方未软删 + 上述可选
 - 40001 VALIDATION_ERROR（HTTP 422）— `drawing_no` / `name` / `serial_no` 含通配符 `%` / `_` / `\\`
 - 40100 UNAUTHORIZED — 未登录 / token 过期 / session 失效
 - 40300 FORBIDDEN — 非 Manager / 非 Inspector
+- 400 BAD_REQUEST — `system_delivery_date_from` / `system_delivery_date_to` 格式非法
+  （如 `not-a-date`）。这一条走 **axum `Query` 反序列化层**，早于 service：返回的是
+  **非 `R` 信封**的纯文本 body（`Failed to deserialize query string`），不走本仓统一
+  响应信封。属全仓既有模式（所有带日期 query 参数的 list 端点同此），本端点只是
+  新增了 2 个日期参数。
 
 实现位置：
 
@@ -828,7 +838,7 @@ pub struct BatchToXxxOut {
 // id (i64 string) / serial_no / name / drawing_no / status / version /
 // quantity / order_no / updated_at / updated_by
 // （详见 [`./index.md`](./index.md#partout-字段)；
-// 2026-09-16 PR-2 删 `actual_delivery_date`，由 t_part_event DELIVERED 事件派生）
+// 2026-09-16（migration 027）删 `actual_delivery_date`，由 t_part_event DELIVERED 事件派生）
 ```
 
 ---

@@ -1,29 +1,29 @@
-//! 胖 trait `PartBatchRepoTrait`（21 方法）+ `impl for &mut PgConnection`。
+//! 胖 trait `PartBatchRepoTrait`（15 方法）+ `impl for &mut PgConnection`。
 //!
 //! 2026-10-02 随 `t_part_batch` 归属迁入 prod 域，从单文件 `prod/batch/repo/queries.rs`
 //! 拆出（单文件已超 conventions.md §2 的 1000 行上限）。签名零变化。
 //!
-//! 2026-10-03 追加 2 条待品检队列方法（`list_inspection_queue` /
-//! `count_inspection_queue`），供 `GET /prod/batches/inspection` 用。
+//! 2026-10-03 集合读收口：删掉 4 条 `list.rs` 的镜像声明与转发 —— 原
+//! `list_batches_with_part` / `count_batches_with_part`（待品检端点迁移后零调用方）
+//! 与 `list_inspection_queue` / `count_inspection_queue`（service 走固有方法
+//! `PartBatchRepo::yyy`，从不经 trait）。trait 只镜像**确有 trait 侧调用方**的
+//! 方法；集合读一律走 `PartBatchRepo` 固有方法，不进胖 trait。
 //!
 //! ## 为什么是胖 trait
 //! `&mut PgConnection` 同一作用域只能借给一个 repo 实例；service 同时需要
-//! `list_active_by_part_id_with_holder` 与 `list_batches_with_part` 时无法表达
-//! 「同连接两次借用」。胖 trait 是单借位。
+//! `list_active_by_part_id_with_holder` 与 `list_batches_with_part_in_customers` 时
+//! 无法表达「同连接两次借用」。胖 trait 是单借位。
 //!
 //! ## automock
 //! `#[cfg_attr(test, mockall::automock)]` 生成 `MockPartBatchRepoTrait` 供
 //! service 单测注入。
 
 use async_trait::async_trait;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 use sqlx::PgConnection;
 
-use super::list::InspectionQueueFilters;
 use super::queries::{NewInitialBatch, PartBatchRepo};
-use crate::modules::prod::batch::model::{
-    InspectionBatchListRow, InspectionQueueRow, PartBatchScanRow, RecentBatchRow, TPartBatch,
-};
+use crate::modules::prod::batch::model::{PartBatchScanRow, RecentBatchRow, TPartBatch};
 use crate::shared::error::AppError;
 
 /// 把 `PartBatchRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借
@@ -116,40 +116,6 @@ pub trait PartBatchRepoTrait: Send {
         &mut self,
         part_id: i64,
     ) -> Result<bool, sqlx::Error>;
-
-    // ── 待检批次列表 / COUNT（2）── 来自 list.rs
-    #[allow(clippy::too_many_arguments)]
-    async fn list_batches_with_part<'a, 'b>(
-        &mut self,
-        statuses: &'a [&'a str],
-        customer_ids: &'b [i64],
-        keyword: Option<&'b str>,
-        serial_no: Option<&'b str>,
-        date_from: Option<NaiveDate>,
-        date_to: Option<NaiveDate>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<InspectionBatchListRow>, sqlx::Error>;
-    #[allow(clippy::too_many_arguments)]
-    async fn count_batches_with_part<'a, 'b>(
-        &mut self,
-        statuses: &'a [&'a str],
-        customer_ids: &'b [i64],
-        keyword: Option<&'b str>,
-        serial_no: Option<&'b str>,
-        date_from: Option<NaiveDate>,
-        date_to: Option<NaiveDate>,
-    ) -> Result<i64, sqlx::Error>;
-
-    // ── 待品检队列列表 / COUNT（2，2026-10-03 VO 收口新增）── 来自 list.rs
-    async fn list_inspection_queue<'a, 'b>(
-        &mut self,
-        f: &'b InspectionQueueFilters<'a>,
-    ) -> Result<Vec<InspectionQueueRow>, sqlx::Error>;
-    async fn count_inspection_queue<'a, 'b>(
-        &mut self,
-        f: &'b InspectionQueueFilters<'a>,
-    ) -> Result<i64, sqlx::Error>;
 }
 
 #[async_trait]
@@ -305,69 +271,5 @@ impl PartBatchRepoTrait for &mut PgConnection {
         part_id: i64,
     ) -> Result<bool, sqlx::Error> {
         PartBatchRepo::has_active_batch_on_delivery_note(&mut **self, part_id).await
-    }
-
-    // ── list.rs（2）──
-    #[allow(clippy::too_many_arguments)]
-    async fn list_batches_with_part<'b, 'c>(
-        &mut self,
-        statuses: &'b [&'b str],
-        customer_ids: &'c [i64],
-        keyword: Option<&'c str>,
-        serial_no: Option<&'c str>,
-        date_from: Option<NaiveDate>,
-        date_to: Option<NaiveDate>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<InspectionBatchListRow>, sqlx::Error> {
-        PartBatchRepo::list_batches_with_part(
-            &mut **self,
-            statuses,
-            customer_ids,
-            keyword,
-            serial_no,
-            date_from,
-            date_to,
-            limit,
-            offset,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn count_batches_with_part<'b, 'c>(
-        &mut self,
-        statuses: &'b [&'b str],
-        customer_ids: &'c [i64],
-        keyword: Option<&'c str>,
-        serial_no: Option<&'c str>,
-        date_from: Option<NaiveDate>,
-        date_to: Option<NaiveDate>,
-    ) -> Result<i64, sqlx::Error> {
-        PartBatchRepo::count_batches_with_part(
-            &mut **self,
-            statuses,
-            customer_ids,
-            keyword,
-            serial_no,
-            date_from,
-            date_to,
-        )
-        .await
-    }
-
-    // ── list.rs（待品检队列 2 条）──
-    async fn list_inspection_queue<'a, 'b>(
-        &mut self,
-        f: &'b InspectionQueueFilters<'a>,
-    ) -> Result<Vec<InspectionQueueRow>, sqlx::Error> {
-        PartBatchRepo::list_inspection_queue(&mut **self, f).await
-    }
-
-    async fn count_inspection_queue<'a, 'b>(
-        &mut self,
-        f: &'b InspectionQueueFilters<'a>,
-    ) -> Result<i64, sqlx::Error> {
-        PartBatchRepo::count_inspection_queue(&mut **self, f).await
     }
 }

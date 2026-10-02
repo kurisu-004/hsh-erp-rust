@@ -9,14 +9,16 @@
 //! - 限流：`limit ∈ [1, 200]`，默认 200；`offset` 默认 0
 //! - `customer_id`：单值 → `expand_customer_id` 展开为 L1+L2 ids（与 `list_parts` 同逻辑）
 //! - `drawing_no` / `name` / `serial_no`：表头筛选各一个独立 ILIKE 参数，service 层拼
-//!   `%...%` 加通配符；为防 SQL 注入风险，拒绝 `%` / `_` / `\` 等通配符特殊字符
-//!   （含任一 → VALIDATION_ERROR 40001）
+//!   `%...%` 加通配符；**拒绝** `%` / `_` / `\` 等通配符（含任一 → VALIDATION_ERROR
+//!   40001）。拒通配符是**语义**约束 —— 防止用户输入的 `%…%` 被 PG 当通配符放大成
+//!   跨全表的 ILIKE 扫描（表头筛选框输个 `%` 就能把全表捞出来）；**注入面**由 repo
+//!   侧 `QueryBuilder::push_bind` 参数化保证，与本校验无关。
 //! - `system_delivery_date_from/to`：筛**系统交期**（页面已不显示计划交期）
 //! - `sort_by` / `sort_dir`：服务端排序，白名单映射在本层完成，repo 只收列名字面量
 //!
-//! 2026-10-03 VO 收口：原实现复用 `list_batches_with_part`（8 JOIN 宽投影）+ 跨字段
-//! `keyword` + 计划交期筛选；现改为本文件末尾的窄投影查询（3 JOIN / 13 字段），
-//! 排序列白名单见下表。
+//! 2026-10-03 VO 收口：改用 `repo/list.rs` 的 3-JOIN 窄投影 + 表头独立筛选 +
+//! 服务端排序；`is_urgent` **不再**参与服务端排序（仅作展示字段供前端标红），
+//! 白名单映射在本层完成。
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::part::repo::PartRepoTrait;
@@ -58,9 +60,12 @@ fn resolve_order_dir(sort_dir: Option<&str>) -> &'static str {
     }
 }
 
-/// 文本筛选参数 → ILIKE pattern：拒绝 SQL 通配符（`%` / `_` / `\`）后拼 `%...%`。
+/// 文本筛选参数 → ILIKE pattern：拒绝 `%` / `_` / `\` 后拼 `%...%`。
 ///
-/// 空白串视为「不筛选」（表头筛选框清空态传空串比传缺省更常见）。
+/// 拒绝通配符是**语义**约束，不是注入防护：注入面由 repo 侧 `push_bind` 参数化保证。
+/// 拒它的理由是 `%…%` 会被 PG 当通配符放大 —— 表头筛选框只输一个 `%` 就能把整张
+/// 表捞出来，1 次请求退化成全表 ILIKE 扫描。空白串视为「不筛选」（筛选框清空态
+/// 传空串比传缺省更常见）。
 fn to_ilike_pat(field: &str, raw: Option<&str>) -> Result<Option<String>, AppError> {
     let Some(v) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);

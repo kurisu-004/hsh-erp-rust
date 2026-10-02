@@ -479,6 +479,13 @@ impl PartRepo {
     /// PLANNED_DELIVERY_DATE / REQUEST_DATE / SERIAL_NO / DRAWING_NO / NAME，
     /// 其它值退化为 `id`。方向仅接受 `ASC`，其它视为 `DESC`。
     ///
+    /// 2026-10-03：待品检队列的排序列白名单是**另一套**，在 service 层
+    /// （`prod/batch/service/list.rs::resolve_order_col` / `resolve_order_dir`），
+    /// 缺省 `p.system_delivery_date` + `ASC`（本处是 `id` + `DESC`）。**不要**把两者
+    /// 「统一」—— 白名单放 service 层时 repo 收不到任何外部输入，比放在 repo 内
+    /// 更安全，但两个端点的缺省语义本就不同（零件一览按 id 倒序 = 最新在前，
+    /// 待品检按交期正序 = 最急在前）。两套并存是有意的。
+    ///
     /// 2026-09-17 PR-4 守卫修复：`locations` / `holder_ids` 走 EXISTS 子查询
     /// 关联 `t_part_batch`（PR-2 已删 t_part.location / current_holder_id）。
     pub async fn list_with_filters<'e, E: PgExecutor<'e>>(

@@ -8,11 +8,13 @@
 //!   3. 表头筛选：`drawing_no` / `name` / `system_delivery_date_from|to` /
 //!      `customer_id`（L1 展开）各自命中预期行。
 //!   4. 服务端排序：`sort_by` 白名单 7 值 + `sort_dir` + 非法值退化。
-//!   5. 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。brief 原话
-//!      「Worker role」并不存在，本仓库 5 角色中 ShelfAccount 是唯一合法登录、
-//!      但不在 `INSPECTION_LIST_ROLES = [Manager, Inspector]` 内的角色；
+//!   5. 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN（**本文件是该守卫的唯一
+//!      覆盖**，守卫在 `service/list.rs::list_inspection_batches` 第一行）。
+//!      brief 原话「Worker role」并不存在，本仓库 5 角色中 ShelfAccount 是唯一合法
+//!      登录、但不在 `INSPECTION_LIST_ROLES = [Manager, Inspector]` 内的角色；
 //!      `PartFixture::SHELF_ACCOUNT_USERNAME` + SHELF_ACCOUNT role 提供该登录态。
-//!   6. 分页：`limit + offset` 正确切分 total / items。
+//!   6. 分页：`limit + offset` 切分 items，且 `total` 恒等于**过滤后**的实际条数
+//!      （锁住「list / count 共用同一 WHERE 拼装器」这个核心主张）。
 //!
 //! ## 并行 / 认证
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -1010,6 +1012,294 @@ async fn inspection_batches_filters_by_system_delivery_date_range() {
     assert!(
         !got.contains(&late),
         "to=2026-06-15 不应含 11-20: body={body}"
+    );
+}
+
+/// 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。
+///
+/// brief 原话「Worker role」并不存在（本仓库 5 角色：Manager / Clerk / Inspector /
+/// CncProgrammer / ShelfAccount）。`INSPECTION_LIST_ROLES = [Manager, Inspector]`，
+/// ShelfAccount 是「能登录但在白名单外」的唯一角色，故用它模拟越权。
+/// 守卫在 service 层第一行（`require_any_role`），**本文件是该守卫的唯一覆盖**。
+#[tokio::test]
+async fn inspection_batches_role_guard_rejects_shelf_account() {
+    let (pool, app, token, _fx) = bootstrap_as_shelf_account().await;
+
+    // 造 1 条 INSPECTION 批次：让 list 在权限通过时返回非空，确保拒绝原因确实是角色
+    let (_part_id, _batch_id) = insert_part_with_insp_batch(
+        &pool,
+        "PART_RG",
+        PartFixture::CUSTOMER_L2_ID,
+        Some("P-RG-001"),
+        PartFixture::INSPECTION_SHELF_ID,
+    )
+    .await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "GET",
+            "/prod/batches/inspection",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "ShelfAccount 越权应 403: body={body}"
+    );
+    assert_eq!(
+        body["code"], 40300,
+        "白名单外角色应得 40300 FORBIDDEN: body={body}"
+    );
+    // message 形态由 require_any_role 决定，含「无权限」
+    let msg = body["message"].as_str().expect("message 应为 string");
+    assert!(
+        msg.contains("无权限") || msg.contains("40300") || msg.contains("forbidden"),
+        "message 应含权限拒绝语义（无权限 / 40300 / forbidden）: msg={msg}"
+    );
+}
+
+/// 分页（2026-10-03 补回）：`limit + offset` 切分 items，且 **`total` 恒等于过滤后
+/// 的实际条数**。
+///
+/// 这条用例锁的是本次改造的核心正确性主张 —— `list_inspection_queue` 与
+/// `count_inspection_queue` 共用同一个 WHERE 拼装器（`push_inspection_queue_where`），
+/// 判据只此一份。本文件在改写前删掉了分页用例、也没有任何一处断言 `total` 等于实际
+/// 条数，于是「count 与 items 各说各话」这类 bug 无处可卡（master 上被删的
+/// `count_batches_with_part` 漏了 `JOIN t_customer c`，正是这样一只真实存在过的
+/// count/list 不一致实现）。
+///
+/// 数据：4 行 INSPECTION 批次，全部客户 id 相同（`customer_id` 筛选留空 ⇒ 不过滤），
+/// 系统交期刻意不同（1/2/3 月 + 一行 NULL），故 `sort_by=SYSTEM_DELIVERY_DATE` 升序
+/// 下的 4 行顺序确定。
+#[tokio::test]
+async fn inspection_batches_pagination_splits_items_and_total_matches() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let d = |m: u32| chrono::NaiveDate::from_ymd_opt(2026, m, 1);
+    // 4 行，全部挂 fixture 的 L2 客户；交期 1/2/3 月 + NULL（NULL 在 ASC 下兜底末尾）
+    let specs = [
+        ("PAGE-1", "PG-001", 1, d(1)),
+        ("PAGE-2", "PG-002", 2, d(2)),
+        ("PAGE-3", "PG-003", 3, d(3)),
+        ("PAGE-4", "PG-004", 4, None),
+    ];
+    let mut ids: Vec<String> = Vec::new();
+    for (name, sn, qty, date) in specs {
+        let (_p, batch_id) = insert_insp_batch_with_spec(
+            &pool,
+            fx.inspection_shelf_id,
+            &InspBatchSpec {
+                name,
+                drawing_no: sn,
+                serial_no: Some(sn),
+                customer_id: fx.customer_l2_id,
+                quantity: qty,
+                batch_no: qty,
+                system_delivery_date: date,
+            },
+        )
+        .await;
+        ids.push(batch_id.to_string());
+    }
+    let (p1, p2, p3, p4) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+
+    // 整页（limit=50）：items 与 total 必须都是 4，且顺序 = 交期 ASC、NULL 兜底末位
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?limit=50&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "full page: body={body}");
+    let full = item_batch_ids(&body);
+    assert_eq!(
+        full,
+        vec![p1.clone(), p2.clone(), p3.clone(), p4.clone()],
+        "整页应按交期升序、NULL 兜底末位: body={body}"
+    );
+    let total = body["data"]["total"]
+        .as_str()
+        .expect("data.total 应为 string (i64 serialize)")
+        .parse::<i64>()
+        .expect("data.total 应可解析为 i64");
+    assert_eq!(
+        total,
+        full.len() as i64,
+        "total 应等于 items 实际条数（list / count 共用同一 WHERE）: body={body}"
+    );
+
+    // 第 1 页：limit=2&offset=0 → 前 2 行；total 仍是 4（total 不随分页变）
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?limit=2&offset=0&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "page 1: body={body}");
+    assert_eq!(
+        item_batch_ids(&body),
+        vec![p1.clone(), p2.clone()],
+        "limit=2&offset=0 应切出前 2 行: body={body}"
+    );
+    assert_eq!(
+        body["data"]["limit"].as_str(),
+        Some("2"),
+        "响应 limit 应透传生效值: body={body}"
+    );
+    assert_eq!(
+        body["data"]["offset"].as_str(),
+        Some("0"),
+        "响应 offset 应透传生效值: body={body}"
+    );
+    let total_p1 = body["data"]["total"]
+        .as_str()
+        .expect("data.total 应为 string")
+        .parse::<i64>()
+        .expect("data.total 应可解析为 i64");
+    assert_eq!(total_p1, 4, "total 不随 offset 变化: body={body}");
+
+    // 第 2 页：limit=2&offset=2 → 后 2 行，**无重复无漏行**（兜底键 pb.id ASC 有效）
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?limit=2&offset=2&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "page 2: body={body}");
+    assert_eq!(
+        item_batch_ids(&body),
+        vec![p3.clone(), p4.clone()],
+        "limit=2&offset=2 应切出后 2 行: body={body}"
+    );
+    let total_p2 = body["data"]["total"]
+        .as_str()
+        .expect("data.total 应为 string")
+        .parse::<i64>()
+        .expect("data.total 应可解析为 i64");
+    assert_eq!(total_p2, 4, "total 不随 offset 变化: body={body}");
+
+    // 切到超尾页：items 空、total 仍 4
+    let (status, body) = send(
+        app,
+        json_request(
+            "GET",
+            "/prod/batches/inspection?limit=2&offset=4&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "page 3: body={body}");
+    assert!(
+        item_batch_ids(&body).is_empty(),
+        "offset=4（恰好超尾）应返回空 items: body={body}"
+    );
+    let total_p3 = body["data"]["total"]
+        .as_str()
+        .expect("data.total 应为 string")
+        .parse::<i64>()
+        .expect("data.total 应可解析为 i64");
+    assert_eq!(total_p3, 4, "越界翻页 total 仍是全量条数: body={body}");
+}
+
+/// 筛选 + 分页 + 排序三者叠加：`total` 必须等于**过滤后**的条数，不是全表条数。
+///
+/// 与上一条的「无过滤翻页」互补 —— 上一条证明翻页不重复不漏，本条证明
+/// `count` 用的是同一份 WHERE（若 count 漏了某个过滤条件，`total` 会虚高）。
+/// 另带一个 `limit × sort_by` 组合：按 `QUANTITY DESC` 排 + `limit=1`，
+/// 断言「第 1 行是最大数量」+ `total` 不受排序/limit 影响。
+#[tokio::test]
+async fn inspection_batches_pagination_total_respects_filter_and_sort() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    let cust_hit = fx.customer_l2_id;
+    // 3 行命中 `name=PAGECLIENT`（数量 1 / 5 / 9），2 行不命中（name 其它值）
+    // serial_no 有唯一约束 ⇒ 逐行唯一（filter 走 name，不依赖 serial_no）
+    for (name, qty) in [
+        ("PAGECLIENT-1", 1),
+        ("PAGECLIENT-5", 5),
+        ("PAGECLIENT-9", 9),
+        ("PAGEXOTHER-3", 3),
+        ("PAGEXOTHER-7", 7),
+    ] {
+        insert_insp_batch_with_spec(
+            &pool,
+            fx.inspection_shelf_id,
+            &InspBatchSpec {
+                name,
+                drawing_no: "PGCL-001",
+                serial_no: Some(name),
+                customer_id: cust_hit,
+                quantity: qty,
+                batch_no: qty,
+                system_delivery_date: None,
+            },
+        )
+        .await;
+    }
+
+    // 1) name 过滤 + limit=1 + QUANTITY DESC：命中 3 行中的最大数量那条
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?name=PAGECLIENT&sort_by=QUANTITY&sort_dir=DESC&limit=1",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "filtered+sorted+limit: body={body}");
+    let items = body["data"]["items"].as_array().expect("data.items");
+    assert_eq!(items.len(), 1, "limit=1 应只返回 1 行: body={body}");
+    assert_eq!(
+        items[0]["quantity"], 9,
+        "QUANTITY DESC 的第 1 行应是最大数量: body={body}"
+    );
+    let total = body["data"]["total"]
+        .as_str()
+        .expect("data.total 应为 string (i64 serialize)")
+        .parse::<i64>()
+        .expect("data.total 应可解析为 i64");
+    assert_eq!(
+        total, 3,
+        "total 应是过滤后的条数（3），既不是全表 5 也不受 limit/排序影响: body={body}"
+    );
+
+    // 2) 不加 name 过滤 → total 回到 5（证明 1) 的 3 是过滤生效，不是巧合）
+    let (status, body) = send(
+        app,
+        json_request(
+            "GET",
+            "/prod/batches/inspection?sort_by=QUANTITY&sort_dir=DESC&limit=1",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "unfiltered: body={body}");
+    let total_all = body["data"]["total"]
+        .as_str()
+        .expect("data.total 应为 string (i64 serialize)")
+        .parse::<i64>()
+        .expect("data.total 应可解析为 i64");
+    assert_eq!(
+        total_all, 5,
+        "无过滤时 total 应是全表 INSPECTION 条数: body={body}"
     );
 }
 

@@ -80,7 +80,7 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
 父装配件 `t_assembly` 会被派生追平（唯一子件作废 → 父件 CANCELLED，父件序列号
 同步释放）。
 
-> **不变式（2026-10-01 review 第 1 轮 B1）**：`t_part.status` 由本端点的主操作
+> **不变式（2026-10-01）**：`t_part.status` 由本端点的主操作
 > 写下，级联批次的派生**不得**覆盖它。若该 part 存在已 COMPLETED 的批次，
 > min-progress 会算出 COMPLETED —— 实现靠两道闸拦住：bulk 入口的
 > `PartDerivation::KeepPartTerminalAsIs`（显式跳过 part 写）+ `update_part_rollup`
@@ -154,10 +154,9 @@ Path：
 >   REPAIRING 同档 2）；派生列 `t_part.status` 按 min-progress 取活跃批次里最慢的
 >   那条（`compute_part_target`，见 `src/modules/part/statemachine.rs`），故
 >   **不再出现 `'REPAIRING'`**，但**不保证恒为** `IN_PROCESS`（同 part 下存在更慢的
->   活跃批次时取那条）。**2026-10-02 review 第 2 轮订正**：原文「`t_part.status`
->   恒为 `IN_PROCESS`」的「恒为」不成立。
+>   活跃批次时取那条）—— 不可写成「恒为 `IN_PROCESS`」的不变式。
 >
-> 2026-09-16 PR-2（migration 027）：`has_been_repaired` 列已从 `t_part` 与
+> 2026-09-16（migration 027）：`has_been_repaired` 列已从 `t_part` 与
 > `t_part_batch` 双删 —— 拆批后无法确定是哪一个批次返修，列语义失真整体废弃。
 > 返修事实改由 `t_part_batch.is_repairing` 列 + `t_part_event.event_type=
 > 'REPAIR_STARTED'` 事件日志共同追溯。事件 `from_status` / `to_status` 均写
@@ -404,7 +403,17 @@ Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
 
 > P3 list。返回所有 `status='DELIVERED'` 的 batch 汇总（判据 `status='DELIVERED'`；REPAIRING 已降级为 `is_repairing` 标记列）。
 
-Query：`worker_id?` / `process_id?` / `limit?` / `offset?`。
+Query（`RepairBatchListQuery`）：`keyword?`（跨字段 ILIKE，匹配图号 / 名称）/
+`customer_id?`（**不**做 L1 展开，与待品检端点不同）/ `serial_no?` /
+`planned_delivery_date_from?` / `planned_delivery_date_to?` / `limit?`（默认 200，
+clamp `[1,500]`）/ `offset?`（默认 0）。
+
+> ⚠️ **已知差距（2026-10-03 记录，待单独 issue）**：`keyword` 走
+> `p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%'`，
+> **不拒** SQL 通配符 —— 传 `keyword=%` 会命中全表（注入面由 bind 参数化保证，
+> 但「通配符放大」这条语义约束缺失）。待品检端点
+> `GET /prod/batches/inspection` 已在 service 层拒 `%` / `_` / `\`（40001），
+> 返修两条端点尚未跟进。本次未改，避免把返修 VO 收口混进待品检 VO 收口。
 
 Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 
@@ -419,10 +428,10 @@ Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 > `COMPLETED` / `CANCELLED`）⇒ 返回项的 `status` **不固定**：起修时为
 > `IN_PROCESS`，但起修后送检 / 送检通过 / 发货三步都**只保持标记**、不改判据，
 > 故本端点也可能返回 `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` 的返修件。
-> **2026-10-02 review 第 2 轮订正**：原文「返回项的 `status` 字段恒为
-> `IN_PROCESS`」**不成立** —— 「DB 不再产生 `REPAIRING` 字面量」≠「`status` 恒为
-> `IN_PROCESS`」；判「返修中」一律读 `is_repairing`，可达链（起修后送检 /
-> 送检通过 / 发货的保持标记链）见 [`./inspection.md`](./inspection.md) 订正段。
+> **2026-10-02 订正**：原文「返回项的 `status` 字段恒为 `IN_PROCESS`」
+> **不成立** —— 「DB 不再产生 `REPAIRING` 字面量」≠「`status` 恒为 `IN_PROCESS`」；
+> 判「返修中」一律读 `is_repairing`。标记与 `status` **正交**的完整推导见本节末
+> 「返修标记与 status 正交 —— 可达链」。
 >
 > 返修标记随 `BatchOut`（= `InspectionBatchListItemOut`）的字段
 > `is_repairing: bool` 一起返回 —— 「只有 status」的端点会让前端彻底失去
@@ -434,6 +443,44 @@ Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 > 分流，返修件与普通送检件在该页混排（同页原语义）。
 
 Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
+
+#### 返修标记与 status 正交 —— 可达链
+
+本节是「为什么必须有 `is_repairing` 字段」的权威推导（原先放在
+`inspection.md` 的端点 VO 段，2026-10-03 待品检 VO 收口时随该段一并删除，
+现搬回本主题下）。
+
+**可达链**（`start-repair` 之后标记为 `true`，三步都**只保持标记**、不改判据）：
+
+1. `POST /prod/batches/{batch_id}/start-repair` → `status` 保持 `IN_PROCESS`，
+   `is_repairing = true`。
+2. 走 `POST /prod/batches/{batch_id}/to-inspection` 或 worker-scan `INSPECTED`
+   → 两条路都经 `mark_batch_inspected`，它对 `is_repairing` 传 `None` =
+   **保持**标记，`allowed_from` 含 `IN_PROCESS` ⇒ 落到
+   `status = 'INSPECTION'` + `is_repairing = true`。
+   该状态可达的反证是 `to-process` 对它有 20118 守卫
+   （`src/modules/part/service/inspection_core.rs` step 4.6）。
+3. `mark_batch_passed_inspection` → `status = 'READY_TO_SHIP'`，标记仍保持。
+4. `mark_batch_delivered`（`to-ship`）→ `status = 'DELIVERED'`，标记仍保持。
+   `to-ship` **无**返修守卫（只有 `to-process` 有），故 DELIVERED 批次同样可能带标记。
+
+**由此得出三条不能省的结论**：
+
+- `REPAIRING` 降级为标记列后，DB 不再产生 `REPAIRING` 字面量 ⇒ 前端的老判据
+  `status === 'REPAIRING'` 在**任何**端点都取不到值，「是否返修中」只能读
+  `is_repairing`。
+- **端点语义推不出每一行是否返修中**：`status='INSPECTION'` 的列表里返修件与
+  普通送检件混排（上表第 2 步），`status='DELIVERED'` 的列表里同样混排
+  （第 4 步）。
+- **只调 `GET /api/v2/prod/batches/repairing` 也不是答案**：该端点只返回
+  `is_repairing = true` 的批次，覆盖不了「同一个列表里既有返修件又有普通在制品」
+  的展示场景，而后者才是队列类页面的常态。
+
+字段形态：`bool`（**非** `Option`、**无** `#[serde(default)]`、**无**
+`skip_serializing_if`）⇒ **恒定出现在 JSON 里**，前端 Zod schema 必须按必填
+`boolean` 声明，不能 `.optional()`。同批新增的另一个 VO `PartBatchListItemOut`
+（`GET /api/v2/parts/{id}/batches`）同样有 `is_repairing: bool`，见
+[`./batch.md`](./batch.md)。
 
 ---
 
