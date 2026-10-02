@@ -15,9 +15,10 @@
 > - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（8 端点：装配体 CRUD + multipart PDF + 子件自动生成 + start + 子件 auto-rollup，2026-09-14 Phase 3）
 > - [`./cnc-programs.md`](./cnc-programs.md) — cnc_program 域（2 端点：配对上传 + 列表，2026-09-14 Phase 3）
 > - [`./files.md`](./files.md) — part_file 域（multipart 上传 + 列表 + 下载 URL + confirm 绑定，2026-09-14 Phase 3；2026-09-18 删除 upload-intents；2026-09-28 删除相关 STS 会话域，前端改为单 uploader + python `sts-tmp-keys` 数组入参直签）
-> - [`./outsource-companies.md`](./outsource-companies.md) — 外协公司（7 端点，2026-09-13 Phase 2）
-> - [`./outsource-quotes.md`](./outsource-quotes.md) — 外协报价（8 端点，2026-09-13 Phase 2）
-> - [`./outsource-shipments.md`](./outsource-shipments.md) — 外协发货（1 端点：reconcile-update，2026-09-13 Phase 2）
+> - [`./outsource-companies.md`](./outsource-companies.md) — 外协公司（**8 端点**，2026-09-13 Phase 2 + 2026-10-03 补 `sent-parts` 对账页读侧）
+> - [`./outsource-quotes.md`](./outsource-quotes.md) — 外协报价（**9 端点**，2026-09-13 Phase 2 + 2026-10-03 补 `quotable-parts` picker）
+> - [`./outsource-shipments.md`](./outsource-shipments.md) — 外协发货对账（1 端点：reconcile-update，2026-09-13 Phase 2）
+> - [`./outsource-sendable.md`](./outsource-sendable.md) — 可发送外协一览（**1 端点**，**2026-10-03 新增**；独立顶层前缀 `/api/v2/outsource-sendable`，取代形状不匹配的 `/parts/outsource-sendable`）
 > - [`./delivery-notes/index.md`](./delivery-notes/index.md) — delivery_notes 域（已拆为子目录：[queries](./delivery-notes/queries.md) / [drafts](./delivery-notes/drafts.md) / [workflow](./delivery-notes/workflow.md) / [print](./delivery-notes/print.md)）
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
 > - [`./_e2e.md`](./_e2e.md) — e2e seed hook（11 端点；dev/test 默认启用，release profile 硬关，2026-09-14）
@@ -211,9 +212,10 @@ HTTP 状态码：
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
 | part-files | [`./files.md`](./files.md) | 4 | ✅ 完全上线（2026-09-14，Phase 3；2026-09-18 删除 upload-intents → 改由相关 STS 会话域承载 STS 共享机制；2026-09-28 进一步下线相关会话域，前端改单 uploader + python sts-tmp-keys 数组入参直签） |
-| outsource-companies | [`./outsource-companies.md`](./outsource-companies.md) | 7 | ✅ 完全上线（2026-09-14，Phase 2） |
-| outsource-quotes | [`./outsource-quotes.md`](./outsource-quotes.md) | 8 | ✅ 完全上线（2026-09-14，Phase 2） |
+| outsource-companies | [`./outsource-companies.md`](./outsource-companies.md) | 8 | ✅ 完全上线（2026-09-14，Phase 2；2026-10-03 补 `GET /{id}/sent-parts`） |
+| outsource-quotes | [`./outsource-quotes.md`](./outsource-quotes.md) | 9 | ✅ 完全上线（2026-09-14，Phase 2；2026-10-03 补 `GET /quotable-parts`） |
 | outsource-shipments | [`./outsource-shipments.md`](./outsource-shipments.md) | 1 | ✅ 完全上线（2026-09-14，Phase 2） |
+| outsource-sendable | [`./outsource-sendable.md`](./outsource-sendable.md) | 1 | ✅ 完全上线（2026-10-03；取代 `/parts/outsource-sendable`，旧路径 404 无 alias） |
 | delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | _e2e | [`./_e2e.md`](./_e2e.md) | 11 | ✅ 完全上线（2026-09-14，e2e seed hook，dev/test profile） |
