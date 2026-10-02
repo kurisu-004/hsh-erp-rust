@@ -154,7 +154,7 @@ async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String, PartFixture)
 #[tokio::test]
 async fn to_process_invalid_shelf_id_rejected() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -169,11 +169,10 @@ async fn to_process_invalid_shelf_id_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-process"),
+            &format!("/prod/batches/{batch_id}/to-process"),
             Some(json!({
                 "shelf_id": "abc",
                 "next_process_id": "1",
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -190,7 +189,7 @@ async fn to_process_invalid_shelf_id_rejected() {
 #[tokio::test]
 async fn to_process_invalid_next_process_id_rejected() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -205,11 +204,10 @@ async fn to_process_invalid_next_process_id_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-process"),
+            &format!("/prod/batches/{batch_id}/to-process"),
             Some(json!({
                 "shelf_id": fx.production_shelf_id.to_string(),
                 "next_process_id": "abc",
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -244,12 +242,11 @@ async fn to_process_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-process"),
+            &format!("/prod/batches/{batch_id}/to-process"),
             Some(json!({
                 "shelf_id": fx.production_shelf_id.to_string(),
                 "next_process_id": fx.process_id.to_string(),
                 "note": "test fail",
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -264,13 +261,13 @@ async fn to_process_happy_path() {
 ///
 /// 2026-09-16 PR-3 后，state machine 允许 PENDING → IN_PROCESS（place-on-shelf 路径）；
 /// to_process 是品检打回流，要求 part 已绑定工艺链 + 存在 INSPECTION 批次。
-/// PENDING part 没有 INSPECTION 批次 → service 在 step 4 `find_inspection_batch_for_fail`
+/// 锚定批次不是 INSPECTION 状态 → service 在 step 4 `find_inspection_batch_by_id`
 /// 抛 20109 BIZ_PART_BATCH_NOT_FOUND（HTTP 404）。
 #[tokio::test]
 async fn to_process_wrong_state_rejected() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
     // setup: PENDING part（非 INSPECTION）
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -285,11 +282,10 @@ async fn to_process_wrong_state_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-process"),
+            &format!("/prod/batches/{batch_id}/to-process"),
             Some(json!({
                 "shelf_id": fx.production_shelf_id.to_string(),
                 "next_process_id": fx.process_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -329,12 +325,11 @@ async fn to_process_partial_split_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-process"),
+            &format!("/prod/batches/{batch_id}/to-process"),
             Some(json!({
                 "shelf_id": fx.production_shelf_id.to_string(),
                 "next_process_id": fx.process_id.to_string(),
                 "quantity": 3,
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -457,11 +452,10 @@ async fn to_process_rejects_repairing_batch() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-process"),
+            &format!("/prod/batches/{batch_id}/to-process"),
             Some(json!({
                 "shelf_id": fx.production_shelf_id.to_string(),
                 "next_process_id": fx.process_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),

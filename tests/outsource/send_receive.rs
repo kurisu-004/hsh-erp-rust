@@ -254,9 +254,8 @@ async fn send_to_outsource_inserts_shipment_out_sourcing() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{part_id}/send-to-outsource"),
+            &format!("/prod/batches/{bid}/send-to-outsource"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": 0,
                 "outsource_company_id": company_id.to_string(),
                 "process_id": proc_id.to_string(),
@@ -314,9 +313,8 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{part_id}/send-to-outsource"),
+            &format!("/prod/batches/{bid}/send-to-outsource"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": 0,
                 "outsource_company_id": company_id.to_string(),
                 "process_id": proc_id.to_string(),
@@ -354,9 +352,8 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/send-to-outsource"),
+            &format!("/prod/batches/{bid}/send-to-outsource"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": 1,
                 "outsource_company_id": company_id.to_string(),
                 "process_id": proc_id.to_string(),
@@ -393,9 +390,8 @@ async fn send_to_outsource_direct_returns_internal_error() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/send-to-outsource"),
+            &format!("/prod/batches/{bid}/send-to-outsource"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": 0,
                 "outsource_company_id": company_id.to_string(),
                 "process_id": proc_id.to_string(),
@@ -448,9 +444,8 @@ async fn send_to_outsource_quote_not_approved_returns_21307() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/send-to-outsource"),
+            &format!("/prod/batches/{bid}/send-to-outsource"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": 0,
                 "outsource_company_id": company_id.to_string(),
                 "process_id": proc_id.to_string(),
@@ -538,9 +533,8 @@ async fn receive_from_outsource_marks_shipment_received() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{part_id}/receive-from-outsource"),
+            &format!("/prod/batches/{bid}/receive-from-outsource"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": 0,
                 "shelf_id": prod_shelf.to_string(),
                 "next_process_id": next_proc.to_string(),

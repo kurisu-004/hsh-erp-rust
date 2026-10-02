@@ -8,11 +8,11 @@
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::SyncOutcome;
-use crate::modules::part::batch::model::TPartBatch;
 use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::{PartOut, ToXxxOut};
+use crate::modules::prod::batch::model::TPartBatch;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
@@ -42,12 +42,15 @@ impl PartService {
     pub async fn to_ship_core<R: PartRepoTrait>(
         repo: &mut R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
         batch_id: i64,
         expected_batch_version: i32,
         quantity: Option<i32>,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
+        // 0. 反查批次 → part_id（2026-10-02 去 part 化：batch_id 是 URL 路径参数，
+        //    批次 id 全局唯一即锚点，part_id 只能由批次行反查得到）。
+        let anchor = Self::_lookup_batch_by_id(repo, batch_id).await?;
+        let part_id = anchor.part_id;
         // 1. 读 part
         let part: TPartInspected = repo.get_part_inspected(part_id).await?.ok_or_else(|| {
             AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -71,17 +74,17 @@ impl PartService {
             ));
         }
 
-        // 3. 定位目标 INSPECTION 批次
-        let bid_hint = Some(batch_id);
-        let target: TPartBatch = match repo.find_inprocess_batch_for_part(part_id, bid_hint).await {
+        // 3. 校验锚定批次处于 INSPECTION 状态（2026-10-02：`batch_id` 路径参数
+        //    必填，SQL 里的 `AND part_id = $2` 恒真已删；状态不符即 20109）
+        let target: TPartBatch = match repo
+            .find_inprocess_batch_for_part(part_id, Some(batch_id))
+            .await
+        {
             Ok(Some(b)) => b,
             Ok(None) => {
                 return Err(AppError::biz(
                     code::BIZ_PART_BATCH_NOT_FOUND,
-                    format!(
-                        "part {part_id} 找不到 INSPECTION 批次（requested={:?}）",
-                        bid_hint
-                    ),
+                    format!("batch {batch_id} 不是 INSPECTION 状态的批次"),
                 ));
             }
             Err(sqlx::Error::RowNotFound) => {
@@ -182,7 +185,6 @@ impl PartService {
     pub async fn to_process_core<R: PartRepoTrait>(
         repo: &mut R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
         shelf_id: i64,
         next_process_id: i64,
         note: Option<&str>,
@@ -191,6 +193,9 @@ impl PartService {
         quantity: Option<i32>,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
+        // 0. 反查批次 → part_id（2026-10-02 去 part 化，理由同 `to_ship_core`）
+        let anchor = Self::_lookup_batch_by_id(repo, batch_id).await?;
+        let part_id = anchor.part_id;
         // 1. 读 part
         let part: TPartInspected = repo.get_part_inspected(part_id).await?.ok_or_else(|| {
             AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
@@ -214,21 +219,14 @@ impl PartService {
         }
         // 3. 校验 shelf（PRODUCTION 区 + active）
         Self::_validate_production_shelf_and_process(repo, shelf_id, next_process_id).await?;
-        // 4. 定位目标 INSPECTION 批次
-        let bid_hint = Some(batch_id);
-        let target: TPartBatch = match repo.find_inspection_batch_for_fail(part_id, bid_hint).await
-        {
+        // 4. 校验锚定批次处于 INSPECTION 状态（2026-10-02：改为纯按 id 定位，
+        //    `part_id` 形参与 `AND part_id = $2` 断言一并删除）
+        let target: TPartBatch = match repo.find_inspection_batch_by_id(batch_id).await {
             Ok(Some(b)) => b,
             Ok(None) => {
                 return Err(AppError::biz(
                     code::BIZ_PART_BATCH_NOT_FOUND,
-                    format!("part {part_id} 找不到 INSPECTION 批次（hint={bid_hint:?}）"),
-                ));
-            }
-            Err(sqlx::Error::RowNotFound) => {
-                return Err(AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    "multiple INSPECTION batches; specify batch_id".to_string(),
+                    format!("batch {batch_id} 不是 INSPECTION 状态的批次"),
                 ));
             }
             Err(e) => return Err(AppError::from(e)),
@@ -257,10 +255,10 @@ impl PartService {
         // 可达链（2026-10-01 复核，reviewer 给的 scan-inspect 链**不成立**）：
         // `scan-inspect(pass=false)` 的第二步把批次写成 `status='IN_PROCESS'` +
         // `is_repairing=true`（`phase1/scan.rs` 的 else 分支），而本端点的
-        // `find_inspection_batch_for_fail` 只捞 `status='INSPECTION'`，故它捞不到；
+        // `find_inspection_batch_by_id` 只捞 `status='INSPECTION'`，故它捞不到；
         // 真正的可达链是「起修后送检」：
         // `start-repair`（`status=IN_PROCESS` + `is_repairing=true`，loc 可为
-        // PRODUCTION_SHELF）→ `POST /parts/{id}/to-inspection`
+        // PRODUCTION_SHELF）→ `POST /prod/batches/{batch_id}/to-inspection`
         // （`mark_batch_inspected` 的 `is_repairing: None` = **保持**）→ 批次变
         // `INSPECTION` + `is_repairing=true` → 本端点捞得到它。
         // （worker-scan INSPECTED 同样只保持标记，是第二条同类入口。）
@@ -419,7 +417,6 @@ impl PartService {
     pub async fn to_inspection_core<R: PartRepoTrait>(
         repo: &mut R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
         target_inspection_shelf_id: i64,
         batch_id: i64,
         expected_batch_version: i32,
@@ -430,7 +427,9 @@ impl PartService {
         // 1. 校验品检架（target_inspection_shelf）
         let target_shelf =
             Self::_validate_inspection_shelf(repo, target_inspection_shelf_id).await?;
-        // 2. 读 part
+        // 2. 反查批次 → part_id 并读 part（2026-10-02 去 part 化，理由同 `to_ship_core`）
+        let anchor = Self::_lookup_batch_by_id(repo, batch_id).await?;
+        let part_id = anchor.part_id;
         let part: TPartInspected = repo.get_part_inspected(part_id).await?.ok_or_else(|| {
             AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
         })?;

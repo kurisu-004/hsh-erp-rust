@@ -35,10 +35,9 @@ use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
 use crate::shared::error::{AppError, code};
 
-use super::super::dto_crud::{
-    CancelRequest, CompleteRequest, DeliverRequest, ForceCompleteRequest, StartRepairRequest,
-};
 use super::PartService;
+use crate::modules::part::dto_crud::{CancelRequest, ForceCompleteRequest};
+use crate::modules::prod::batch::dto::{CompleteRequest, DeliverRequest, StartRepairRequest};
 
 impl PartService {
     /// deliver (PR-B3 batch 级)：锚定 `t_part_batch.version`，状态机守卫读
@@ -49,11 +48,20 @@ impl PartService {
     pub async fn deliver<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: DeliverRequest,
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查；原先的 `batch.part_id != part_id` 断言恒真，已删。
+        let batch = repo.find_batch_by_id(batch_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {batch_id} 不存在"),
+            )
+        })?;
+        let part_id = batch.part_id;
         // 1. 读 part（仅 need drawing_no 用于事件日志 + 终态守卫；其它派生列
         //    由 rollup 在 batch 翻转后回填）。
         let part = repo.get_part_inspected(part_id).await?.ok_or_else(|| {
@@ -66,18 +74,6 @@ impl PartService {
             ));
         }
         // 2. 定位 batch（必须属于 part + READY_TO_SHIP + 未软删）。
-        let batch = repo.find_batch_by_id(req.batch_id).await?.ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("batch {} 不存在", req.batch_id),
-            )
-        })?;
-        if batch.part_id != part_id {
-            return Err(AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("batch {} 不属于 part {}", req.batch_id, part_id),
-            ));
-        }
         // 3. 状态机守卫：读 batch 当前状态（不是 part 派生列）。
         let from = PartStatus::from_str(&batch.status).ok_or_else(|| {
             AppError::biz(
@@ -244,11 +240,20 @@ impl PartService {
     pub async fn complete<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: CompleteRequest,
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查；原先的 `batch.part_id != part_id` 断言恒真，已删。
+        let batch = repo.find_batch_by_id(batch_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {batch_id} 不存在"),
+            )
+        })?;
+        let part_id = batch.part_id;
         let part = repo.get_part_inspected(part_id).await?.ok_or_else(|| {
             AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
         })?;
@@ -259,18 +264,6 @@ impl PartService {
             ));
         }
         // 1. 定位 batch。
-        let batch = repo.find_batch_by_id(req.batch_id).await?.ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("batch {} 不存在", req.batch_id),
-            )
-        })?;
-        if batch.part_id != part_id {
-            return Err(AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("batch {} 不属于 part {}", req.batch_id, part_id),
-            ));
-        }
         // 2. 状态机守卫：读 batch 当前状态。
         let from = PartStatus::from_str(&batch.status).ok_or_else(|| {
             AppError::biz(
@@ -342,11 +335,20 @@ impl PartService {
     pub async fn start_repair<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: StartRepairRequest,
         current: &CurrentUser,
     ) -> Result<PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查；原先的 `batch.part_id != part_id` 断言恒真，已删。
+        let batch = repo.find_batch_by_id(batch_id).await?.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PART_BATCH_NOT_FOUND,
+                format!("batch {batch_id} 不存在"),
+            )
+        })?;
+        let part_id = batch.part_id;
         let part = repo.get_part_inspected(part_id).await?.ok_or_else(|| {
             AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
         })?;
@@ -357,18 +359,6 @@ impl PartService {
             ));
         }
         // 1. 定位 batch。
-        let batch = repo.find_batch_by_id(req.batch_id).await?.ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("batch {} 不存在", req.batch_id),
-            )
-        })?;
-        if batch.part_id != part_id {
-            return Err(AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("batch {} 不属于 part {}", req.batch_id, part_id),
-            ));
-        }
         // 2. 状态机守卫：读 batch 当前状态。
         let from = PartStatus::from_str(&batch.status).ok_or_else(|| {
             AppError::biz(

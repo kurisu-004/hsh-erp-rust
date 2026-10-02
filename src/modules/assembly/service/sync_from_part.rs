@@ -63,7 +63,7 @@ impl AssemblyService {
     /// 2026-10-01 新增：只收 `updated_by` 的反向同步入口（无登录用户上下文）。
     ///
     /// 存在的理由：新的 batch → part → assembly 单一写入口
-    /// （`part::service::status_gate`）在整条派生链路上只有 `updated_by`（一个 i64），
+    /// （`prod::batch::status_gate`）在整条派生链路上只有 `updated_by`（一个 i64），
     /// 没有完整的 `CurrentUser`。本函数把 `sync_assembly_status` 直接暴露出来，
     /// 而**不是**在 status_gate 里伪造一个 `CurrentUser`（伪造身份迟早会被
     /// 下游的 `username` / `roles` 依赖带出真实 bug）。
@@ -207,7 +207,7 @@ pub async fn sync_from_part_change(
         .await
 }
 
-/// 2026-10-01 新增：只收 `updated_by` 的 ZST 静态入口（part::service::status_gate 用）。
+/// 2026-10-01 新增：只收 `updated_by` 的 ZST 静态入口（prod::batch::status_gate 用）。
 ///
 /// 见 `AssemblyService::sync_from_part_change_by_id_inner` 的 rationale。
 pub async fn sync_from_part_change_by_id(

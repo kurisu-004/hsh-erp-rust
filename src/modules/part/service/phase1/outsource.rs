@@ -16,21 +16,21 @@ use crate::modules::part::vo::{PartListItem, PartListOut};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::super::dto_crud::{
-    PartListQuery, PlaceOnShelfRequest, ReceiveFromOutsourceToInspectionRequest,
-    SendToOutsourceRequest,
-};
 use super::super::PartService;
+use crate::modules::part::dto_crud::PartListQuery;
+use crate::modules::prod::batch::dto::{
+    PlaceOnShelfRequest, ReceiveFromOutsourceToInspectionRequest, SendToOutsourceRequest,
+};
 
 use super::{
     assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
-    require_process_chain, validate_batch_ownership, validate_shelf_zone,
+    require_process_chain, validate_batch_version, validate_shelf_zone,
 };
 
 impl PartService {
     // ===== 1.3 外协流转 =====
 
-    /// `POST /parts/{id}/send-to-outsource`：PENDING / IN_PROCESS+PRODUCTION_SHELF → OUTSOURCE。
+    /// `POST /prod/batches/{batch_id}/send-to-outsource`：PENDING / IN_PROCESS+PRODUCTION_SHELF → OUTSOURCE。
     ///
     /// Phase 2（2026-09-13）扩展：
     /// - 同事务 INSERT t_outsource_shipment（status=OUTSOURCING，quantity=batch.quantity）
@@ -39,7 +39,7 @@ impl PartService {
     pub async fn send_to_outsource<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: SendToOutsourceRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
@@ -51,15 +51,18 @@ impl PartService {
                 "DIRECT 模式发外协尚未实现（Phase 2 stub；follow-up: 自动建 APPROVED quote 占位）",
             ));
         }
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
         let part = repo
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         ensure_transition(from, PartStatus::OUTSOURCE, "send-to-outsource")?;
@@ -238,7 +241,7 @@ impl PartService {
         Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
-    /// `POST /parts/{id}/receive-from-outsource`：OUTSOURCE → IN_PROCESS（PRODUCTION_SHELF）。
+    /// `POST /prod/batches/{batch_id}/receive-from-outsource`：OUTSOURCE → IN_PROCESS（PRODUCTION_SHELF）。
     ///
     /// Phase 2（2026-09-13）扩展：同事务把批次开口 shipment 标 RECEIVED + 写 RECEIVED 事件。
     ///
@@ -247,20 +250,23 @@ impl PartService {
     pub async fn receive_from_outsource<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: PlaceOnShelfRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
         let part = repo
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         ensure_transition(from, PartStatus::IN_PROCESS, "receive-from-outsource")?;
@@ -367,27 +373,30 @@ impl PartService {
         Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
-    /// `POST /parts/{id}/receive-from-outsource-to-inspection`：OUTSOURCE → INSPECTION。
+    /// `POST /prod/batches/{batch_id}/receive-from-outsource-to-inspection`：OUTSOURCE → INSPECTION。
     ///
     /// Phase 2（2026-09-13）扩展：同事务把批次对应开口 shipment 标 RECEIVED（与
     /// `receive_from_outsource` 同样的"整批接收"语义）。
     pub async fn receive_from_outsource_to_inspection<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: ReceiveFromOutsourceToInspectionRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
         let part = repo
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         ensure_transition(

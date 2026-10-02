@@ -40,7 +40,7 @@
 //! ============================================================================
 //!
 //! 派生逻辑（步骤 1–5 + 终态序列号归档 / 释放）已下沉到
-//! [`crate::modules::part::service::status_gate::rollup_part_derived`]，与
+//! [`crate::modules::prod::batch::status_gate::rollup_part_derived`]，与
 //! 「写状态」合成同一个函数 `status_gate::apply_batch_status_change`。
 //! 本方法保留为**纯派生入口**：
 //!
@@ -63,7 +63,7 @@ use sqlx::PgConnection;
 use crate::auth::rbac::CurrentUser;
 use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::service::status_gate;
+use crate::modules::prod::batch::status_gate;
 use crate::shared::error::AppError;
 
 use super::PartService;

@@ -807,9 +807,8 @@ async fn deliver_ready_to_ship_200() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{bid}/deliver"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "note": "发货"
             })),
@@ -834,9 +833,8 @@ async fn deliver_wrong_state_400() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{bid}/deliver"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
             })),
             Some(&token),
@@ -900,9 +898,8 @@ async fn complete_delivered_200() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete"),
+            &format!("/prod/batches/{bid}/complete"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "note": "归档"
             })),
@@ -931,9 +928,8 @@ async fn complete_wrong_state_400() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete"),
+            &format!("/prod/batches/{bid}/complete"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
             })),
             Some(&token),
@@ -961,9 +957,8 @@ async fn start_repair_in_process_200() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/start-repair"),
+            &format!("/prod/batches/{bid}/start-repair"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "reason": "尺寸偏大"
             })),
@@ -1020,9 +1015,8 @@ async fn start_repair_already_repairing_400() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/start-repair"),
+            &format!("/prod/batches/{bid}/start-repair"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "reason": "重复起修"
             })),
@@ -1050,9 +1044,8 @@ async fn start_repair_wrong_state_400() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/start-repair"),
+            &format!("/prod/batches/{bid}/start-repair"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "reason": "no-op"
             })),
@@ -1080,9 +1073,8 @@ async fn deliver_cancelled_409() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{bid}/deliver"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
             })),
             Some(&token),
@@ -1137,9 +1129,8 @@ async fn deliver_also_updates_batch() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{bid}/deliver"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "note": "发货"
             })),
@@ -1193,7 +1184,7 @@ async fn cancel_also_updates_batch() {
 #[tokio::test]
 async fn deliver_without_source_batch_409() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
+    let _pid = insert_part(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -1207,9 +1198,8 @@ async fn deliver_without_source_batch_409() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{fake_bid}/deliver"),
             Some(json!({
-                "batch_id": fake_bid.to_string(),
                 "version": 0,
             })),
             Some(&token),

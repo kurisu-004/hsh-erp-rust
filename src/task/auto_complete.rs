@@ -33,10 +33,10 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::batch::repo::PartBatchRepo;
-use crate::modules::part::dto_crud::CompleteRequest;
 use crate::modules::part::service::PartService;
 use crate::modules::part::vo::PartOut;
+use crate::modules::prod::batch::dto::CompleteRequest;
+use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::AppError;
 use crate::state::AppState;
 
@@ -108,11 +108,12 @@ pub async fn run_once(state: &Arc<AppState>, threshold_days: u32) -> anyhow::Res
     let mut completed: Vec<(i64, i64)> = Vec::with_capacity(candidates.len());
     for (batch_id, part_id, version) in candidates {
         let req = CompleteRequest {
-            batch_id,
             version,
             note: Some("auto_complete".to_string()),
         };
-        match complete_one(&mut tx, &state.snowflake, part_id, req, &system_user).await {
+        // 2026-10-02：complete 端点以批次为锚（`POST /prod/batches/{batch_id}/complete`），
+        // part_id 由 service 从批次行反查 —— `candidates` 里的 part_id 只用于日志。
+        match complete_one(&mut tx, &state.snowflake, batch_id, req, &system_user).await {
             Ok(_) => {
                 completed.push((batch_id, part_id));
                 info!(batch_id, part_id, "auto_complete: completed batch");
@@ -166,14 +167,17 @@ pub(crate) fn system_current_user() -> CurrentUser {
 }
 
 /// 包装 `PartService::complete`：在事务（`&mut PgConnection`）内调用。
+///
+/// 2026-10-02：`batch_id` 是唯一入参（complete 端点以批次为锚），part_id 由
+/// service 从批次行反查。
 async fn complete_one(
     conn: &mut PgConnection,
     snowflake: &SnowflakeIdGenerator,
-    part_id: i64,
+    batch_id: i64,
     req: CompleteRequest,
     current: &CurrentUser,
 ) -> Result<PartOut, AppError> {
-    PartService::complete(conn, snowflake, part_id, req, current).await
+    PartService::complete(conn, snowflake, batch_id, req, current).await
 }
 
 #[cfg(test)]

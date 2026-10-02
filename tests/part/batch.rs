@@ -122,10 +122,9 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, PartFixture) {
 #[tokio::test]
 async fn split_batch_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "quantity": "3",
     });
@@ -133,7 +132,7 @@ async fn split_batch_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/batches/split"),
+            &format!("/prod/batches/{bid}/split"),
             Some(body),
             Some(&token),
         ),
@@ -148,7 +147,7 @@ async fn split_batch_happy_path() {
 #[tokio::test]
 async fn split_batch_invalid_quantity_rejects() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
     // quantity == batch.quantity (不允许，等于整批)
     let body = json!({
@@ -160,7 +159,7 @@ async fn split_batch_invalid_quantity_rejects() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/batches/split"),
+            &format!("/prod/batches/{bid}/split"),
             Some(body),
             Some(&token),
         ),
@@ -173,7 +172,7 @@ async fn split_batch_invalid_quantity_rejects() {
 #[tokio::test]
 async fn split_batch_quantity_negative_rejects() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
         "batch_id": bid.to_string(),
@@ -184,7 +183,7 @@ async fn split_batch_quantity_negative_rejects() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/batches/split"),
+            &format!("/prod/batches/{bid}/split"),
             Some(body),
             Some(&token),
         ),
@@ -202,7 +201,6 @@ async fn invariant_split_preserves_total_quantity() {
     let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 10).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "quantity": "3",
     });
@@ -210,7 +208,7 @@ async fn invariant_split_preserves_total_quantity() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/batches/split"),
+            &format!("/prod/batches/{bid}/split"),
             Some(body),
             Some(&token),
         ),
@@ -231,7 +229,7 @@ async fn invariant_split_preserves_total_quantity() {
 #[tokio::test]
 async fn cancel_batch_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
         "version": version,
@@ -240,7 +238,7 @@ async fn cancel_batch_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/batches/{bid}/cancel"),
+            &format!("/prod/batches/{bid}/cancel"),
             Some(body),
             Some(&token),
         ),
@@ -253,7 +251,7 @@ async fn cancel_batch_happy_path() {
 #[tokio::test]
 async fn cancel_batch_terminal_protection() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "COMPLETED", 5).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "COMPLETED", 5).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
         "version": version,
@@ -262,7 +260,7 @@ async fn cancel_batch_terminal_protection() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/batches/{bid}/cancel"),
+            &format!("/prod/batches/{bid}/cancel"),
             Some(body),
             Some(&token),
         ),

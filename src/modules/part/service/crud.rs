@@ -30,8 +30,6 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::AssemblyService;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
-use crate::modules::part::dto::InspectionBatchListQuery;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::{NewPartCreate, PartListFilters, PartUpdate};
@@ -42,15 +40,17 @@ use crate::modules::part::vo::{
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
+use crate::modules::prod::batch::dto::InspectionBatchListQuery;
+use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
-use super::super::dto_crud::{
-    PartBatchCreateRequest, PartCreateRequest, PartListQuery, PartUpdateRequest,
-};
 use super::PartService;
 use super::list_enrichment::enrich_part_list_with_location_and_holder;
+use crate::modules::part::dto_crud::{
+    PartBatchCreateRequest, PartCreateRequest, PartListQuery, PartUpdateRequest,
+};
 
 /// 扫码快捷品检上下文内部 FromRow 结构。
 ///
@@ -533,7 +533,7 @@ impl PartService {
     ///
     /// 权限与 `get_part_by_serial` 一致（Manager / Clerk / Inspector / CncProgrammer）。
     /// 用于前端扫码弹窗，让用户直接看到批次（id + quantity + status + holder +
-    /// version）并据此拼出 `POST /parts/{part_id}/to-ship` 的 `{ batch_id, version }`
+    /// version）并据此拼出 `POST /prod/batches/{batch_id}/to-ship` 的 `{ version }`
     /// 入参。
     pub async fn get_part_batches_by_serial<R: PartRepoTrait>(
         mut repo: R,

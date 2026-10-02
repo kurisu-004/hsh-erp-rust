@@ -18,36 +18,39 @@ use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::super::dto_crud::PlaceOnShelfRequest;
 use super::super::PartService;
+use crate::modules::prod::batch::dto::PlaceOnShelfRequest;
 
 use super::{
     assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
-    require_process_chain, validate_batch_ownership, validate_shelf_zone,
+    require_process_chain, validate_batch_version, validate_shelf_zone,
 };
 
 impl PartService {
-    /// `POST /parts/{id}/release-from-programming`：PROGRAMMING → IN_PROCESS（PRODUCTION_SHELF）。
+    /// `POST /prod/batches/{batch_id}/release-from-programming`：PROGRAMMING → IN_PROCESS（PRODUCTION_SHELF）。
     ///
     /// 2026-09-16 PR-3 批次 step 化：chain 必须性守卫 + req.next_process_id
     /// 解析为 step_id 写入 current_process_step_id。
     pub async fn release_from_programming<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: PlaceOnShelfRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::CncProgrammer])?;
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
         let part = repo
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         ensure_transition(from, PartStatus::IN_PROCESS, "release-from-programming")?;

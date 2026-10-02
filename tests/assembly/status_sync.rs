@@ -328,10 +328,9 @@ async fn single_part_to_inspection_flips_assembly_to_inspection() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -395,10 +394,9 @@ async fn mixed_children_assembly_rolls_up_to_min_progress() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{p2}/to-inspection"),
+            &format!("/prod/batches/{b2}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
-                "batch_id": b2.to_string(),
                 "version": v2,
             })),
             Some(&token),
@@ -508,10 +506,9 @@ async fn terminal_assembly_is_not_modified_by_child_change() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -595,7 +592,7 @@ async fn batch_to_inspection_emits_per_assembly_update() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-inspection",
+            "/prod/batches/to-inspection",
             Some(json!({
                 "target_inspection_shelf_id": insp_shelf.to_string(),
                 "items": [

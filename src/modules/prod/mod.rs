@@ -35,11 +35,19 @@
 //! 404（**无 alias**，沿 2026-09-19 prod 聚合先例），请求 / 响应契约逐字不变。
 //! 跨域依赖方向由 shelf→prod 翻转为 prod→shelf（只读 `ShelfRepo::get_by_id`）。
 //!
-//! part / assembly 是全仓库核心实体（生产只是其生命周期一段），不进 prod。
-//! 报工端点（worker-scan / pick-up / to-* / complete）留在 part 域；
-//! 文档层「生产全流程端点地图」在 `docs/api/production/index.md` 兜底串联。
+//! `t_part_batch`（批次）是生产执行单元，**归 prod 域**：它的 repo / model /
+//! `status_gate` 状态写入口与 25 条批次路由（`worker-scan` / `pick-up` / `to-*` /
+//! `complete` / `split` / `cancel` / `scan-inspect` / 3 条集合读）整体在本域
+//! `prod::batch`，URL 挂 `/api/v2/prod/batches/*`。
 //!
-//! URL 硬切换（无 alias）：前端配套 PR 锁步迁移。
+//! part 域只留「多批次动作 + 非批次动作」：`POST /parts/{part_id}/cancel`（翻转该
+//! part 全部活跃批次）、`POST /parts/{part_id}/force-complete`（全部非 CANCELLED
+//! 批次）、`POST /parts/{part_id}/soft-delete`、`GET /parts/{part_id}/batches`，
+//! 以及全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。assembly 仍不进 prod
+//! （生产只是其生命周期一段）。
+//!
+//! URL 硬切换（无 alias）：前端配套 PR 锁步迁移。文档层「生产全流程端点地图」在
+//! `docs/api/production/index.md` 兜底串联。
 
 use std::sync::Arc;
 

@@ -6,42 +6,49 @@
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::super::dto_crud::{CancelBatchRequest, SplitBatchRequest};
 use super::super::PartService;
+use crate::modules::prod::batch::dto::{CancelBatchRequest, SplitBatchRequest};
 
-use super::{mark_batch_status_only, validate_batch_ownership};
+use super::{mark_batch_status_only, validate_batch_version};
 
 impl PartService {
     // ===== 1.5 批次拆分 / 取消 =====
 
-    /// `POST /parts/{id}/batches/split`：拆出部分量为新批次。
+    /// `POST /api/v2/prod/batches/{batch_id}/split`：拆出部分量为新批次。
     ///
     /// 不变量 `Σ(未删批次.quantity) = t_part.quantity` 由
     /// `PartBatchRepo::split_batch` 强制（同一事务内连发 max+1 / INSERT / UPDATE 三条 SQL，
     /// OCC 守源批次）。`quantity` ∈ [1, source.quantity - 1]（split_batch 内部守）。
+    ///
+    /// 返回 `(new_batch_id, part_id)`：2026-10-02 起 part_id 由批次行反查，handler
+    /// 需要它填 WS `PART_BATCH_SPLIT` payload（原 payload 的 `part_id` 取自 URL 的
+    /// `part_id` 路径参数，那个值已不存在）。
     pub async fn split_batch<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: SplitBatchRequest,
         current: &CurrentUser,
-    ) -> Result<i64, AppError> {
+    ) -> Result<(i64, i64), AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
         let part = repo
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
         // 数量校验
         let qty: i32 = req.quantity.try_into().map_err(|_| {
             AppError::biz(
@@ -103,28 +110,30 @@ impl PartService {
             created_by: Some(current.id),
         })
         .await?;
-        Ok(new_id)
+        Ok((new_id, part_id))
     }
 
-    /// `POST /parts/{id}/batches/{batch_id}/cancel`：批次级取消。
+    /// `POST /prod/batches/{batch_id}/cancel`：批次级取消。
     pub async fn cancel_batch<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
         batch_id: i64,
         req: CancelBatchRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
-        let part = repo
-            .get_part_inspected(part_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
         let batch = repo
             .find_batch_by_id(batch_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
+        let part = repo
+            .get_part_inspected(part_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
         // 终态保护
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;

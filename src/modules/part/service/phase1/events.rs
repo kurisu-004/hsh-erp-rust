@@ -11,7 +11,6 @@
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::com::customer::repo::CustomerRepo;
-use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::part::dto_crud::{
     BatchUpdateOrderInfoRequest, BatchWithPdfsRequest, MatchByExcelItemsRequest,
 };
@@ -22,6 +21,7 @@ use crate::modules::part::vo::{
     BatchUpdateOrderInfoOut, LocationTreeNodeOut, LocationTreeOut, MatchByExcelItemResult,
     PartEventOut,
 };
+use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
@@ -354,7 +354,7 @@ impl PartService {
         let initial_batch_id = snowflake.next_id();
         PartBatchRepo::create_initial_batch(
             repo.conn_mut(),
-            crate::modules::part::batch::repo::NewInitialBatch {
+            crate::modules::prod::batch::repo::NewInitialBatch {
                 id: initial_batch_id,
                 part_id: new_id,
                 quantity: 1,
@@ -399,7 +399,7 @@ impl PartService {
                 // 初始批次
                 PartBatchRepo::create_initial_batch(
                     repo.conn_mut(),
-                    crate::modules::part::batch::repo::NewInitialBatch {
+                    crate::modules::prod::batch::repo::NewInitialBatch {
                         id: snowflake.next_id(),
                         part_id: child_id,
                         quantity: 1,

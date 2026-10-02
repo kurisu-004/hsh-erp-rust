@@ -254,7 +254,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
         app.clone(),
         json_request(
             "GET",
-            "/parts/inspection-batches?limit=10",
+            "/prod/batches/inspection?limit=10",
             None::<Value>,
             Some(&token),
         ),
@@ -332,9 +332,8 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_a}/to-ship"),
+            &format!("/prod/batches/{to_ship_batch_id}/to-ship"),
             Some(json!({
-                "batch_id": to_ship_batch_id,
                 "version": to_ship_version,
             })),
             Some(&token),
@@ -406,7 +405,7 @@ async fn inspection_batches_filters_by_keyword_and_customer() {
         app,
         json_request(
             "GET",
-            &format!("/parts/inspection-batches?customer_id={l1_a}&keyword=PARTA"),
+            &format!("/prod/batches/inspection?customer_id={l1_a}&keyword=PARTA"),
             None::<Value>,
             Some(&token),
         ),
@@ -471,7 +470,7 @@ async fn inspection_batches_role_guard_rejects_worker() {
         app,
         json_request(
             "GET",
-            "/parts/inspection-batches",
+            "/prod/batches/inspection",
             None::<Value>,
             Some(&token),
         ),
@@ -545,7 +544,7 @@ async fn inspection_batches_pagination_limit_offset() {
         app.clone(),
         json_request(
             "GET",
-            "/parts/inspection-batches?limit=2&offset=1",
+            "/prod/batches/inspection?limit=2&offset=1",
             None::<Value>,
             Some(&token),
         ),
@@ -582,7 +581,7 @@ async fn inspection_batches_pagination_limit_offset() {
         app.clone(),
         json_request(
             "GET",
-            "/parts/inspection-batches?limit=2&offset=2",
+            "/prod/batches/inspection?limit=2&offset=2",
             None::<Value>,
             Some(&token),
         ),
@@ -645,7 +644,7 @@ async fn inspection_batches_derives_next_process_from_step_not_cpid() {
         app,
         json_request(
             "GET",
-            "/parts/inspection-batches?limit=50",
+            "/prod/batches/inspection?limit=50",
             None::<Value>,
             Some(&token),
         ),

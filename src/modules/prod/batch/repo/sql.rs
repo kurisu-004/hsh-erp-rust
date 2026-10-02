@@ -1,14 +1,14 @@
-//! part 域 SQL 真源 —— `t_part_batch` 表相关查询（2026-09-22 PR2 拆分原 sql.rs）
+//! `t_part_batch` inspection / lifecycle 流转的定位 + 写点（`impl PartBatchRepo`）。
 //!
-//! ## 文件拆分原则（PR2 约定）
-//! 按"主表归属"切分；函数体、签名、可见性、async 修饰全部保留；
-//! **零 SQL 文本变化**（sqlx prepare 哈希一致）。
+//! 2026-10-02 随 `t_part_batch` 归属迁入 prod 域：文件自
+//! `part/repo/sql/batch_sql.rs` 搬来，impl 目标由 part 域 ZST `PartRepo` 改为
+//! 本域 ZST `PartBatchRepo`（`t_part_batch` 的 SQL 真源在 `queries.rs`）。
 //!
 //! ## 承载方法（19 个）
 //!
 //! ### find_*（7）
 //! - `find_inprocess_batch_for_part` / `find_scan_target_batch`
-//! - `find_inspection_batch_for_fail` / `find_current_inspection_batch_id`
+//! - `find_inspection_batch_by_id` / `find_current_inspection_batch_id`
 //! - `find_batch_by_id` / `find_inprocess_batch_by_id_and_holder`
 //! - `find_worker_held_batch_for_part`
 //!
@@ -20,36 +20,43 @@
 //! - `mark_batch_delivered` / `mark_batch_completed`
 //! - `mark_part_cancelled` / `mark_batch_cancelled`
 //! - `mark_batch_repairing` / `cancel_all_active_batches_for_part`
+//! - （另有 `force_complete_all_batches_for_part`）
 //!
 //! ### split（1）
 //! - `split_batch_for_partial_pass`（薄包装 `PartBatchRepo::_split_batch_inner`）
 //!
-//! ## ZST `PartRepo`
-//! ZST struct 在 `super`（sql/mod.rs）定义，本文件 `impl PartRepo { ... }`
-//! 拼装。
+//! ## 2026-10-02 去 part 化
+//! `find_inspection_batch_for_fail` 更名 `find_inspection_batch_by_id` 并**去掉
+//! `part_id` 形参**：调用方是 `to_process_core`，而 `batch_id` 自 2026-10-02 起
+//! 是 URL 路径参数（`POST /prod/batches/{batch_id}/to-process`），必填 ⇒ 原来的
+//! 「COUNT-then-SELECT 消歧」`None` 分支成为死代码，一并删除；`part_id` 由
+//! service 从批次行反查，SQL 里的 `AND part_id = $2` 恒真，属冗余断言。
+//!
+//! ## 事务 / 错误类型
+//! 2026-10-01 起除 `mark_batch_returned`（只写 holder/location，不改 status）外，
+//! 所有 `t_part_batch.status` 写点都是 `status_gate` 之上的薄包装 —— 全仓唯一的
+//! 批次状态写入口。
 
 use sqlx::{PgConnection, PgExecutor};
 
-use super::PartRepo;
-// 2026-10-01：本文件除 `mark_batch_returned`（只写 holder/location，不改
-// status）外，所有 `t_part_batch.status` 写点均已收口为
-// `status_gate` 之上的薄包装 —— 全仓唯一的批次状态写入口。
-use crate::modules::part::service::status_gate::{self, StatusChange};
+use super::queries::PartBatchRepo;
+use crate::modules::prod::batch::model::TPartBatch;
+use crate::modules::prod::batch::status_gate::{self, StatusChange};
 use crate::shared::error::AppError;
-// PR2 合并后，`TPartBatch` 与 `PartBatchRepo` 都已搬到 `crate::modules::part::batch::*`。
-// 本文件继续走新路径（与 PR2 「合并 part_batch → part/batch」约束一致）。
-use crate::modules::part::batch::model::TPartBatch;
 
-impl PartRepo {
-    /// 定位 part 的 INSPECTION 状态批次。
+impl PartBatchRepo {
+    /// 定位 INSPECTION 状态批次。
     ///
     /// - `expected_batch_id = None`：先 COUNT 校验唯一性（≥2 → 歧义 `RowNotFound`），
     ///   == 0 → `Ok(None)`，== 1 → 取 id 最小者。
-    /// - `expected_batch_id = Some(bid)`：按 id 校验 ownership。
+    /// - `expected_batch_id = Some(bid)`：按 id + 状态定位。
     ///
     /// 签名收 `&mut PgConnection`：方法在 `None` 分支需在同一事务内连发两条 SQL。
     ///
     /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加 current_process_step_id。
+    ///
+    /// 2026-10-02：`Some` 分支删 `AND part_id = $2`。调用方是 `to_ship_core`，其
+    /// `part_id` 由同一批次行反查得到 ⇒ 该谓词恒真，属冗余断言（批次 id 全局唯一）。
     pub async fn find_inprocess_batch_for_part(
         conn: &mut PgConnection,
         part_id: i64,
@@ -67,11 +74,10 @@ impl PartRepo {
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
-                WHERE id = $1 AND part_id = $2 AND status = 'INSPECTION'
+                WHERE id = $1 AND status = 'INSPECTION'
                   AND deleted_at IS NULL
                 "#,
                     bid,
-                    part_id,
                 )
                 .fetch_optional(&mut *conn)
                 .await
@@ -118,6 +124,9 @@ impl PartRepo {
     /// 定位 to-inspection 的目标批次（白名单 `{PENDING, PROGRAMMING, IN_PROCESS}`）。
     ///
     /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加 current_process_step_id。
+    ///
+    /// 2026-10-02：`Some` 分支删 `AND part_id = $2`（调用方 `to_inspection_core`
+    /// 的 `part_id` 由同一批次行反查 ⇒ 恒真）。
     pub async fn find_scan_target_batch(
         conn: &mut PgConnection,
         part_id: i64,
@@ -135,12 +144,11 @@ impl PartRepo {
                        version, created_at, created_by, updated_at, updated_by,
                        deleted_at
                 FROM t_part_batch
-                WHERE id = $1 AND part_id = $2
+                WHERE id = $1
                   AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')
                   AND deleted_at IS NULL
                 "#,
                     bid,
-                    part_id,
                 )
                 .fetch_optional(&mut *conn)
                 .await
@@ -188,72 +196,38 @@ impl PartRepo {
         }
     }
 
-    /// 定位 to-process 的目标 INSPECTION 批次。
+    /// 按 id 定位 INSPECTION 状态批次（`to-process` 锚点校验）。
     ///
     /// 2026-09-16 PR-3 批次 step 化：删 next_process_id / placed_at，加 current_process_step_id。
-    pub async fn find_inspection_batch_for_fail(
+    ///
+    /// 2026-10-02：原 `find_inspection_batch_for_fail(part_id, Option<batch_id>)`
+    /// 改写为按 id 定位。`batch_id` 自 `POST /prod/batches/{batch_id}/to-process`
+    /// 起是必填的
+    /// 路径参数 ⇒ ① `part_id` 形参删除（part_id 由 service 从批次行反查，SQL 里
+    /// `AND part_id = $2` 恒真）；② `None` 分支（COUNT-then-SELECT 的多候选消歧
+    /// 守卫）成为死代码，一并删除 —— 唯一调用方是 `to_process_core`，它恒传
+    /// `Some(batch_id)`。
+    pub async fn find_inspection_batch_by_id(
         conn: &mut PgConnection,
-        part_id: i64,
-        expected_batch_id: Option<i64>,
+        batch_id: i64,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        match expected_batch_id {
-            Some(bid) => {
-                sqlx::query_as!(
-                    TPartBatch,
-                    r#"
-                SELECT id, part_id, batch_no, quantity, status, location,
-                       current_holder_id, current_process_id, current_process_step_id,
-                       delivery_note_id, parent_batch_id,
-                       is_repairing,
-                       version, created_at, created_by, updated_at, updated_by,
-                       deleted_at
-                FROM t_part_batch
-                WHERE id = $1 AND part_id = $2 AND status = 'INSPECTION'
-                  AND deleted_at IS NULL
-                "#,
-                    bid,
-                    part_id,
-                )
-                .fetch_optional(&mut *conn)
-                .await
-            }
-            None => {
-                let count: i64 = sqlx::query_scalar!(
-                    r#"
-                    SELECT COUNT(*) AS "n!"
-                    FROM t_part_batch
-                    WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL
-                    "#,
-                    part_id,
-                )
-                .fetch_one(&mut *conn)
-                .await?;
-                match count {
-                    0 => Ok(None),
-                    1 => {
-                        sqlx::query_as!(
-                            TPartBatch,
-                            r#"
-                        SELECT id, part_id, batch_no, quantity, status, location,
-                               current_holder_id, current_process_id, current_process_step_id,
-                               delivery_note_id, parent_batch_id,
-                               is_repairing,
-                               version, created_at, created_by, updated_at, updated_by,
-                               deleted_at
-                        FROM t_part_batch
-                        WHERE part_id = $1 AND status = 'INSPECTION' AND deleted_at IS NULL
-                        ORDER BY id ASC
-                        LIMIT 1
-                        "#,
-                            part_id,
-                        )
-                        .fetch_optional(&mut *conn)
-                        .await
-                    }
-                    _ => Err(sqlx::Error::RowNotFound),
-                }
-            }
-        }
+        sqlx::query_as!(
+            TPartBatch,
+            r#"
+            SELECT id, part_id, batch_no, quantity, status, location,
+                   current_holder_id, current_process_id, current_process_step_id,
+                   delivery_note_id, parent_batch_id,
+                   is_repairing,
+                   version, created_at, created_by, updated_at, updated_by,
+                   deleted_at
+            FROM t_part_batch
+            WHERE id = $1 AND status = 'INSPECTION'
+              AND deleted_at IS NULL
+            "#,
+            batch_id,
+        )
+        .fetch_optional(&mut *conn)
+        .await
     }
 
     /// 取 part 当前活跃 INSPECTION 批次的 id（前端轮询用）。
@@ -726,7 +700,7 @@ impl PartRepo {
     /// 走 SELECT 继承源。
     ///
     /// 2026-09-17 PR-4 卫生项 B2：薄包装委托到 `_split_batch_inner`
-    /// （part/batch/repo.rs 的 `PartBatchRepo`）；`split_batch`（手动部分量）也
+    /// （prod/batch/repo/queries.rs 的 `PartBatchRepo`）；`split_batch`（手动部分量）也
     /// 委托同一 helper。
     #[allow(clippy::too_many_arguments)]
     pub async fn split_batch_for_partial_pass(
@@ -740,7 +714,7 @@ impl PartRepo {
         current_user_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
         let user_id = current_user_id.unwrap_or(0);
-        crate::modules::part::batch::repo::PartBatchRepo::_split_batch_inner(
+        super::queries::PartBatchRepo::_split_batch_inner(
             conn,
             new_batch_id,
             src_batch_id,

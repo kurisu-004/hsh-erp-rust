@@ -116,7 +116,7 @@ pub mod code {
     // 由 status_from_code 表驱动映射。
     pub const BIZ_BATCH_LOCATION_MISMATCH: i32 = 20122;
     // 2026-09-30 新增：part 域 MANAGER 单角色强推工单为 COMPLETED 端点（force-complete）。
-    // 触发场景：`POST /api/v2/parts/{part_id}/force-complete` 撞 part 已是
+    // 触发场景：`POST /api/v2/parts/{part_id}/force-complete`（留 part 域）撞 part 已是
     // COMPLETED（不可重复强推）。槽位选择：20123 顺延 201xx 段（parts 段），
     // HTTP 409 由 status_from_code 表驱动映射。语义与 `BIZ_PART_ALREADY_CANCELLED=20115`
     // 对称（CAN/COMPLETED 互为幂等拒绝码）。

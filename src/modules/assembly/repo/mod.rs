@@ -57,12 +57,12 @@ use async_trait::async_trait;
 use sqlx::PgConnection;
 
 use super::model::TAssembly;
-use crate::modules::part::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::part::model::TPart;
 use crate::modules::part::repo::PartRepo;
 use crate::modules::part::repo::part::{ChildInheritFields, NewPartCreate};
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo};
+use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 
 pub mod sql;
 

@@ -3,7 +3,7 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
-use crate::modules::part::batch::model::InspectionBatchListRow;
+use crate::modules::prod::batch::model::InspectionBatchListRow;
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 /// `GET /parts/inspection-batches` 列表行：批次 + 工单 + 客户 + holder/process/
@@ -11,7 +11,7 @@ use crate::shared::types::{serialize_i64, serialize_i64_opt};
 ///
 /// 字段命名沿用 v1 `PartOut`/`PartBatchOut` 约定（`batch_id` 即 `t_part_batch.id`，
 /// `version` 即乐观锁版本号）。前端用 `batch_id + version` 直接拼
-/// `POST /parts/{part_id}/to-ship` 或 `to-inspection` 的请求体。
+/// `POST /prod/batches/{batch_id}/to-ship` 或 `to-inspection` 的请求体。
 ///
 /// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` 字段
 /// （t_part_batch 列已删；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
@@ -74,7 +74,7 @@ pub struct InspectionBatchListItemOut {
     /// 第三个端点（返修中）：2026-10-01 起 `mark_batch_repairing` **不再把批次
     /// 翻出 IN_PROCESS**（status 保持不变），故该列对返修批次不再有「残留
     /// 陈旧值」问题 —— 但本 VO 仍统一走 step 派生，理由是「展示类列表一律走
-    /// step 派生」这条分工（见 `part/batch/model.rs` 模块 doc 的读取方清单），
+    /// step 派生」这条分工（见 `prod/batch/model.rs` 模块 doc 的读取方清单），
     /// 不因单个端点的判据变化而分叉。
     /// `current_process_step_id` 在送检期间被刻意保留
     /// （`mark_batch_inspected` 不写它），正是「INSPECTION 期间显示批次走到

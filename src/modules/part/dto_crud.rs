@@ -1,4 +1,10 @@
-//! part 域 CRUD + lifecycle DTO（Phase PR-CRUD 2026-08-25）
+//! part 域 CRUD + part 级 lifecycle DTO（Phase PR-CRUD 2026-08-25）
+//!
+//! 2026-10-02 批次路由迁 prod 域后，本文件**只剩 part 级 / 多批次级**入参：
+//! `cancel`（BATCH-N 翻转该 part 全部活跃批次）、`force-complete`（BATCH-N）、
+//! `soft-delete`、以及全部 list / 批量创建 / 文件工具入参。17 个**以单个批次为
+//! 操作对象**的流转入参（`deliver` / `complete` / `place-on-shelf` / `to-ship` …）
+//! 已迁到 `crate::modules::prod::batch::dto`。
 //!
 //! 命名约定：
 //! - `CreateXxxRequest` / `UpdateXxxRequest`：写操作入参
@@ -215,25 +221,6 @@ pub struct PartSoftDeleteRequest {
 }
 
 // ===== Lifecycle =====
-
-/// `POST /parts/{id}/deliver` 入参。
-///
-/// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) BREAKING CHANGE：
-/// lifecycle 三端点（deliver / complete / start-repair）改为 batch 级，OCC
-/// 锚定 `t_part_batch.version`。`batch_id` 由前端从
-/// `GET /parts/by-serial/{serial_no}/part-batches` 拿到（每个 batch 含
-/// `id` + `version` + `status`），状态机守卫读 batch 当前状态。
-///
-/// `batch_id` 用 String 序列化（雪花 i64 > 2^53，按 string 透传）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct DeliverRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
 /// `POST /parts/{id}/cancel` 入参。
 ///
 /// cancel 保持 part 级（PR-B3 §4.3 D3）：级联取消全部活跃批次 → part 翻转
@@ -245,21 +232,6 @@ pub struct CancelRequest {
     #[serde(default)]
     pub note: Option<String>,
 }
-
-/// `POST /parts/{id}/complete` 入参。
-///
-/// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) BREAKING CHANGE：
-/// 收 `batch_id` + `version`（锚 `t_part_batch.version`，与 inspection 三流一致）。
-/// 状态机守卫读 batch 当前状态 `DELIVERED → COMPLETED`。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct CompleteRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
 /// `POST /parts/{id}/force-complete` 入参（2026-09-30 新增）。
 ///
 /// MANAGER 单角色守卫；完全绕状态机把 part + 所有活跃批次强推到 COMPLETED。
@@ -270,194 +242,6 @@ pub struct ForceCompleteRequest {
     #[serde(default)]
     pub note: Option<String>,
 }
-
-/// `POST /parts/{id}/start-repair` 入参。
-///
-/// 2026-09-11 part/assembly/batch 重构方案 §4.3 (PR-B3) BREAKING CHANGE：
-/// 收 `batch_id` + `version`。
-///
-/// 2026-09-16 PR-2 瘦身（migration 027）：t_part_batch 删 `has_been_repaired` 列。
-///
-/// 2026-10-01（REPAIRING 降级为标记列，migration 005/006）：守卫从「状态机
-/// `IN_PROCESS → REPAIRING`」改为「batch 当前 `status='IN_PROCESS'` **且**
-/// `is_repairing = false`」；本端点**不再改 status**，只把 `is_repairing` 置
-/// true。返修事实改由 `t_part_batch.is_repairing` 列 +
-/// `t_part_event.event_type='REPAIR_STARTED'` 事件共同承载（part 派生列无需同步）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct StartRepairRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-// ===== Phase 1（2026-09-13）14 端点 DTO =====
-
-/// `POST /parts/{id}/place-on-shelf` 入参。
-///
-/// PENDING → IN_PROCESS（`location='PRODUCTION_SHELF'`）：放到指定生产货架。
-/// 状态机守卫读 batch 当前状态 `PENDING → IN_PROCESS`；service 层校验
-/// `shelf ↔ process` 映射（`BIZ_SHELF_PROCESS_NOT_MAPPED` 422）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PlaceOnShelfRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub next_process_id: i64,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /parts/{id}/recall-to-pending` 入参。
-///
-/// ON_SHELF（IN_PROCESS+PRODUCTION_SHELF）或 PROGRAMMING → PENDING：
-/// 召回未领批次回 PENDING。状态机白名单放行 `IN_PROCESS → PENDING` 与
-/// `PROGRAMMING → PENDING`；service 层守 `IN_PROCESS` 时必须有 `location=PRODUCTION_SHELF`。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct RecallToPendingRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /parts/{id}/release-from-programming` 入参。
-///
-/// PROGRAMMING → IN_PROCESS（`location='PRODUCTION_SHELF'`）。复用
-/// `PlaceOnShelfRequest`（shelf_id + next_process_id + 校验 shelf↔process 映射）。
-pub type ReleaseFromProgrammingRequest = PlaceOnShelfRequest;
-
-/// `POST /parts/{id}/send-to-outsource` 入参。
-///
-/// PENDING / IN_PROCESS+PRODUCTION_SHELF → OUTSOURCE（`location='OUTSOURCE_COMPANY'`）。
-/// `outsource_company_id` + `process_id` 必填。Phase 1 简化版：状态机放行
-/// `PENDING → OUTSOURCE` 与 `IN_PROCESS → OUTSOURCE`（白名单后者由
-/// `IN_PROCESS→PROGRAMMING` 已有的位置守 + service 层新增的 `OUTSOURCE` 目标组合守卫）。
-///
-/// Phase 2（2026-09-13）：
-/// - `quote_id` 必填（APPROVED 报价）；service 在同事务内 INSERT t_outsource_shipment
-/// - `direct` 标志：当 `direct=true` 时跳过 quote 校验（DIRECT 免审批占位；
-///   Phase 2 stub：返回 501 NOT_IMPLEMENTED）
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct SendToOutsourceRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub outsource_company_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub process_id: i64,
-    /// APPROVED 报价 id（DIRECT 模式 stub 时必填；service 内会校验）
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub quote_id: Option<i64>,
-    /// DIRECT 模式占位（暂返回 501 NOT_IMPLEMENTED；follow-up 任务）
-    #[serde(default)]
-    pub direct: Option<bool>,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /parts/{id}/receive-from-outsource` 入参。
-///
-/// OUTSOURCE → IN_PROCESS（回生产架）。复用 `PlaceOnShelfRequest` 形态
-/// （shelf_id + next_process_id）。
-pub type ReceiveFromOutsourceRequest = PlaceOnShelfRequest;
-
-/// `POST /parts/{id}/receive-from-outsource-to-inspection` 入参。
-///
-/// OUTSOURCE → INSPECTION（直接送检）。`shelf_id` 必填，service 层校验 zone=INSPECTION。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ReceiveFromOutsourceToInspectionRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
-    #[serde(default)]
-    pub auto_pass_inspection: Option<bool>,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /parts/{id}/complete-repair` 入参。
-///
-/// 要求 batch `is_repairing = true`（确实在返修中）。去向由 shelf.zone 决定：
-/// PRODUCTION → `IN_PROCESS`（落回生产架、重新入池，写 `next_process_id` +
-/// step）或 INSPECTION → `INSPECTION`（送检区、出池）。两条路径都清
-/// `is_repairing`。shelf.zone=PRODUCTION 时 next_process_id 必填且需校验
-/// shelf↔process 映射。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct CompleteRepairRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub next_process_id: Option<i64>,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /parts/{id}/repair-dispatch` 入参。
-///
-/// 一步式返修下发（`start_repair + complete_repair` 合并）：从 IN_PROCESS / INSPECTION
-/// / READY_TO_SHIP 入口直达目标状态。`shelf_id` 必填（PRODUCTION 或 INSPECTION 区）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct RepairDispatchRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub next_process_id: Option<i64>,
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /parts/{id}/batches/split` 入参。
-///
-/// 拆出部分量为新批次（继承源批次 status/location/holder/next_process；
-/// 不继承 delivery_note_id）。`quantity` ∈ [1, source_batch.quantity - 1]。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct SplitBatchRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub quantity: i64,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /parts/{id}/pick-up` 入参（B 方案：手动 pick-up 兜底）。
-///
-/// PENDING / IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER。
-/// `worker_id` 必填（持有件工人）；`batch_id` 必填；`shelf_id` 必填
-/// （当前批次所在货架；service 层仅校验存在 + 同 shelf ↔ process 映射）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PickUpRequest {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub worker_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
 /// `GET /parts/by-work-type/{work_type_id}` 入参（query）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ByWorkTypeQuery {
@@ -504,51 +288,7 @@ pub struct PendingProgrammingQuery {
     pub has_cnc_program: Option<bool>,
 }
 
-/// `POST /parts/{id}/batches/{batch_id}/cancel` 入参。
-///
-/// 批次级取消：终态保护，非终态 → CANCELLED。`version` OCC 守。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct CancelBatchRequest {
-    pub version: i32,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-/// `POST /parts/{id}/scan-inspect` 入参。
-///
-/// 扫码快捷品检（一步式：`{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION →
-/// READY_TO_SHIP 或「返修中」，由 `pass` 字段决定）。
-/// `target_inspection_shelf_id` 必填（INSPECTION 区 active）。
-/// `pass=true`：READY_TO_SHIP；`pass=false`：`status='IN_PROCESS'` +
-/// `is_repairing=true`（批次停在送检架，`shelf_id` + `next_process_id` 供随后
-/// 的 `complete-repair` 落回生产架用）。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ScanInspectRequest {
-    pub pass: bool,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub target_inspection_shelf_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    pub version: i32,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub shelf_id: Option<i64>,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub next_process_id: Option<i64>,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /parts/scan/deliver-part` 入参（无 path part_id；从 `serial_no` 反查）。
-///
-/// 司机扫码发货：`part_serial_no` + `worker_badge_code`。Service 层校验
-/// worker.work_type.code == '送货司机'。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct ScanDeliverPartRequest {
-    pub part_serial_no: String,
-    pub worker_badge_code: String,
-    #[serde(default)]
-    pub note: Option<String>,
-}
+// ===== 文件 / Excel 工具 =====
 
 /// `POST /parts/batch-with-pdfs` multipart 入参：JSON + PDFs。
 #[derive(Debug, Clone, Default, Deserialize)]

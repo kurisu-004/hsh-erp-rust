@@ -45,8 +45,8 @@
 
 use sqlx::PgConnection;
 
-use crate::modules::part::service::status_gate::{self, StatusChange};
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::prod::batch::status_gate::{self, StatusChange};
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
@@ -175,21 +175,18 @@ fn ensure_transition(from: PartStatus, to: PartStatus, ctx: &str) -> Result<(), 
     Ok(())
 }
 
-/// 校验 batch 属于 part + 锚定 `version`（OCC）。
+/// 锚定 `version` 的 caller 侧乐观锁守卫（OCC）。
+///
+/// 2026-10-02：原 `validate_batch_ownership` 还兼做「batch 属于 part」断言，
+/// 该断言随 `part_id` 路径参数退场（part_id 改由批次行反查）而恒真，已删 ——
+/// 批次 id 全局唯一即锚点，不存在「跨 part 批次」这一场景。函数随之更名为
+/// `validate_batch_version` 并去掉两个 part 形参。
 #[inline]
-fn validate_batch_ownership(
-    batch_part_id: i64,
+fn validate_batch_version(
     batch_id: i64,
-    expected_part_id: i64,
     expected_version: i32,
     actual_version: i32,
 ) -> Result<(), AppError> {
-    if batch_part_id != expected_part_id {
-        return Err(AppError::biz(
-            code::BIZ_PART_BATCH_NOT_FOUND,
-            format!("batch {batch_id} 不属于 part {expected_part_id}"),
-        ));
-    }
     if batch_version_mismatch(batch_id, expected_version, actual_version) {
         return Err(AppError::biz(
             code::VERSION_CONFLICT,
@@ -294,7 +291,7 @@ async fn assert_shelf_maps_process(
 ///    工序池查询命中（4 条池 SQL 与 `list_pickable_by_work_type` 均硬限定
 ///    `status='IN_PROCESS'` 叠加 `location='PRODUCTION_SHELF'`）。
 ///
-/// 初始批次 / 子批次仍为严格 NULL（见 `part/batch/repo.rs::create_initial_batch`
+/// 初始批次 / 子批次仍为严格 NULL（见 `prod/batch/repo/queries.rs::create_initial_batch`
 /// 与 `part/repo/sql/part_sql.rs::insert_child_for_assembly`，两者都不写该列）。
 ///
 /// 2026-10-01：改为 `status_gate::apply_batch_status_change` 的薄包装

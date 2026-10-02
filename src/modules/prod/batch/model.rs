@@ -38,7 +38,7 @@
 //!   + `list_pickable_by_work_type` + rollup 派生 `t_part.next_process_id`。
 //! - **展示类列表一律继续从 `current_process_step_id` → step JOIN 派生工序名**。
 //!   完整清单（改动前请逐条对照，勿凭端点名想当然）：
-//!   1. `part/batch/repo.rs::list_batches_with_part`
+//!   1. `prod/batch/repo/queries.rs::list_batches_with_part`
 //!      —— `GET /parts/inspection-batches`（M3 已回退）
 //!   2. `part/service/phase1/repair.rs::list_batches_matching`
 //!      —— `GET /parts/repair-batches`（DELIVERED）+ `GET /parts/repairing-batches`

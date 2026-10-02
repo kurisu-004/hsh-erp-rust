@@ -3,7 +3,9 @@
 //! 对应 Python myERP `api/v1/part.py` 中的 list / detail / create / update /
 //! soft-delete / by-serial 端点。
 //!
-//! 范围：本文件覆盖 11 个 CRUD 端点。lifecycle / inspection / batch 见同名文件。
+//! 范围：本文件覆盖 list / detail / create / update / soft-delete / by-serial /
+//! 位置树 / Excel 工具。lifecycle（part 级终态 + 各类 list）/ batch（批量创建 +
+//! COS confirm）见同名文件。
 //!
 //! ## 权限
 //! - 列表 / 详情 / by-serial：4 角色全开放（Manager / Clerk / Inspector / CncProgrammer）
@@ -20,15 +22,14 @@ use serde_json::json;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::assembly::vo::AssemblyDetail;
-use crate::modules::part::dto::InspectionBatchListQuery;
 use crate::modules::part::dto_crud::{
     BatchUpdateOrderInfoRequest, MatchByExcelItemsRequest, PartCreateRequest, PartListQuery,
     PartSoftDeleteRequest, PartUpdateRequest,
 };
 use crate::modules::part::service::PartService;
 use crate::modules::part::vo::{
-    BatchUpdateOrderInfoOut, InspectionBatchListOut, LocationTreeOut, MatchByExcelItemResult,
-    PartBatchListItemOut, PartDetailOut, PartEventOut, PartListOut, PartScanContextOut,
+    BatchUpdateOrderInfoOut, LocationTreeOut, MatchByExcelItemResult, PartBatchListItemOut,
+    PartDetailOut, PartEventOut, PartListOut, PartScanContextOut,
 };
 use crate::modules::part_file::model::TPartFile;
 use crate::shared::error::{AppError, code};
@@ -70,31 +71,6 @@ pub async fn list_parts(
     Ok(Json(R::ok(out)))
 }
 
-/// `GET /api/v2/parts/inspection-batches`
-///
-/// 状态筛选列表：返回 `status='INSPECTION'` 全部活跃批次（含工单 + holder /
-/// process / delivery_note / customer 名称一次解析）。前端用每行的
-/// `batch_id + version` 直接拼 `POST /parts/{part_id}/to-ship` 或
-/// `to-inspection` 的请求体，替代每次扫码 / 手动输入。
-///
-/// 行为：
-/// - 权限：Manager 或 Inspector
-/// - Query：`InspectionBatchListQuery { keyword?, customer_id?, serial_no?, planned_delivery_date_from?, planned_delivery_date_to?, limit?, offset? }`
-/// - 业务流转：纯读，不开 WS 广播
-/// - 响应：`InspectionBatchListOut { items, total, limit, offset }`
-///
-/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
-pub async fn list_inspection_batches(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Query(query): Query<InspectionBatchListQuery>,
-) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::Inspector])?;
-    let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_inspection_batches(&mut *conn, &query, &current).await?;
-    Ok(Json(R::ok(out)))
-}
-
 /// `GET /api/v2/parts/{part_id}`
 ///
 /// 单件详情。`path` 段 `part_id` 是 i64；service 内 OCC 已用 version 守。
@@ -130,7 +106,7 @@ pub async fn get_by_serial(
 /// `GET /api/v2/parts/by-serial/{serial_no}/part-batches`
 ///
 /// 扫码快捷品检上下文：返回工单窄字段（8 列 + id）+ 全部活跃批次（含 holder 名称）。
-/// 前端扫码弹窗据此拼 `POST /parts/{part_id}/to-ship` 的 `{ batch_id, version }`。
+/// 前端扫码弹窗据此拼 `POST /prod/batches/{batch_id}/to-ship` 的 `{ version }`。
 /// 与 `get_by_serial`（`PartDetailOut` 28 列）并存，互不替代。
 ///
 /// 2026-09-22 PR5：只读 get 端点改 `pool.acquire()`。

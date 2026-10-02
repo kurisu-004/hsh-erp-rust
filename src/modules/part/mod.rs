@@ -6,7 +6,17 @@
 //! - repository/part_repository.py
 //! - model/part.py
 //! - schema/part.py
-pub mod dto;
+//!
+//! 2026-10-02 批次路由迁出后，本域只留「多批次动作 + 非批次动作」：
+//! `/{part_id}/cancel`（BATCH-N：翻转该 part 全部活跃批次）、
+//! `/{part_id}/force-complete`（BATCH-N：全部非 CANCELLED 批次）、
+//! `/{part_id}/soft-delete`、`GET /{part_id}/batches`（part 的批次集合读）、
+//! 全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。
+//!
+//! 以**单个批次**为操作对象的 22 条端点（`to-*` / `deliver` / `complete` /
+//! `pick-up` / `split-batch` / `cancel-batch` / `worker-scan` / 3 条批次集合读 …）
+//! 已迁至 `crate::modules::prod::batch`，URL 改挂 `/api/v2/prod/batches/*`
+//! （原 `/api/v2/parts/{part_id}/…` 404，**无 alias**）。
 pub mod dto_crud;
 pub mod handler;
 pub mod model;
@@ -14,12 +24,6 @@ pub mod repo;
 pub mod service;
 pub mod statemachine;
 pub mod vo;
-
-// 2026-09-22 PR2 合并：原 `part_batch` 域（1866 行 helper，无独立 URL，5 域静态
-// 调用）物理合并入 part 域的 `part/batch/` 子目录。访问路径：
-// `crate::modules::part::batch::{model, repo, PartBatchRepo, PartBatchRepoTrait,
-// NewInitialBatch, TPartBatch, PartBatchScanRow, RecentBatchRow, InspectionBatchListRow}`。
-pub mod batch;
 
 use axum::{
     Router,
@@ -38,7 +42,7 @@ use crate::state::AppState;
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ★ 静态段必须在 /{part_id}/... catch-all 之前注册，
-        //   否则 axum 会把静态段（如 `batch`、`by-serial`、`worker-scan`、`batch-to-*`）
+        //   否则 axum 会把静态段（如 `batch`、`by-serial`、`pending-programming`）
         //   解析成 part_id。
         // ---- 列表 / 静态段 ----
         .route("/", get(handler::list_parts).post(handler::create_part))
@@ -48,14 +52,6 @@ pub fn router() -> Router<Arc<AppState>> {
             "/by-serial/{serial_no}/part-batches",
             get(handler::get_by_serial_part_batches),
         )
-        .route("/batch-to-ship", post(handler::batch_to_ship))
-        .route("/batch-to-inspection", post(handler::batch_to_inspection))
-        // inspection 列表（status 筛选）也必须在 /{part_id} 之前注册，
-        // 否则 axum 会把 `inspection-batches` 解析成 part_id 的 catch-all。
-        .route("/inspection-batches", get(handler::list_inspection_batches))
-        // worker-scan 静态段也必须在 /{part_id}/... 之前注册，
-        // 否则 axum 会把 `worker-scan` 解析成 part_id=... 的 catch-all。
-        .route("/worker-scan", post(handler::worker_scan))
         // ---- Phase 1（2026-09-13）静态段（在 {part_id} catch-all 之前注册）----
         .route(
             "/pending-programming",
@@ -66,10 +62,7 @@ pub fn router() -> Router<Arc<AppState>> {
             get(handler::list_outsource_in_flight),
         )
         .route("/outsource-sendable", get(handler::list_outsource_sendable))
-        .route("/repair-batches", get(handler::list_repair_batches))
-        .route("/repairing-batches", get(handler::list_repairing_batches))
         .route("/location-tree", get(handler::get_location_tree))
-        .route("/scan/deliver-part", post(handler::scan_deliver_part))
         .route("/match-by-excel-items", post(handler::match_by_excel_items))
         .route(
             "/batch-update-order-info",
@@ -92,51 +85,15 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/soft-delete", post(handler::soft_delete_part))
         .route("/{part_id}/upload-drawing", post(handler::upload_drawing))
         .route("/{part_id}/upload-3d-model", post(handler::upload_3d_model)) // 2026-09-11 新增：3D 模型上传
-        .route("/{part_id}/deliver", post(handler::deliver))
+        // BATCH-N：翻转该 part 全部活跃批次 → part CANCELLED（留 part 域）
         .route("/{part_id}/cancel", post(handler::cancel))
-        .route("/{part_id}/complete", post(handler::complete))
+        // BATCH-N：全部非 CANCELLED 批次强推 COMPLETED（留 part 域）
         .route("/{part_id}/force-complete", post(handler::force_complete)) // 2026-09-30 新增：MANAGER 单角色强推工单 + 所有活跃批次为 COMPLETED（绕状态机）
-        .route("/{part_id}/start-repair", post(handler::start_repair))
-        // ---- Phase 1 单件端点 ----
-        .route("/{part_id}/place-on-shelf", post(handler::place_on_shelf))
-        .route(
-            "/{part_id}/recall-to-pending",
-            post(handler::recall_to_pending),
-        )
-        .route(
-            "/{part_id}/release-from-programming",
-            post(handler::release_from_programming),
-        )
-        .route(
-            "/{part_id}/send-to-outsource",
-            post(handler::send_to_outsource),
-        )
-        .route(
-            "/{part_id}/receive-from-outsource",
-            post(handler::receive_from_outsource),
-        )
-        .route(
-            "/{part_id}/receive-from-outsource-to-inspection",
-            post(handler::receive_from_outsource_to_inspection),
-        )
-        .route("/{part_id}/complete-repair", post(handler::complete_repair))
-        .route("/{part_id}/repair-dispatch", post(handler::repair_dispatch))
-        .route("/{part_id}/scan-inspect", post(handler::scan_inspect))
         .route("/{part_id}/events", get(handler::list_part_events))
+        // part 的批次集合读（留 part 域：操作对象是「该 part 的批次集合」）
         .route("/{part_id}/batches", get(handler::list_part_batches))
-        .route("/{part_id}/batches/split", post(handler::split_batch))
-        .route(
-            "/{part_id}/batches/{batch_id}/cancel",
-            post(handler::cancel_batch),
-        )
-        // ---- Phase 2 (2026-09-13) 手动 pick-up ----
-        .route("/{part_id}/pick-up", post(handler::pick_up))
         // ---- 2026-09-25 D-08 api-drift-fix：按 part 反查所属装配体 ----
         .route("/{part_id}/assembly", get(handler::get_assembly_by_part))
-        // ---- to-XXX 流（替换 Phase F / F2 inspection）----
-        .route("/{part_id}/to-ship", post(handler::to_ship))
-        .route("/{part_id}/to-inspection", post(handler::to_inspection))
-        .route("/{part_id}/to-process", post(handler::to_process))
         // ---- 2026-09-29 修复：移除 2026-09-15 followup-cleanup A8 的兼容 nest。
         //      part 维度文件路由（cad-files / cnc-programs / setup-sheets / cnc-pair / files）
         //      仅通过 part_file 域 canonical 第二入口

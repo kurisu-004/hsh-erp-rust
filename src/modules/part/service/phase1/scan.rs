@@ -12,18 +12,18 @@ use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::super::dto_crud::{ScanDeliverPartRequest, ScanInspectRequest};
 use super::super::PartService;
+use crate::modules::prod::batch::dto::{ScanDeliverPartRequest, ScanInspectRequest};
 
 use super::{
-    mark_batch_status_only, mark_batch_with_status_and_meta, validate_batch_ownership,
+    mark_batch_status_only, mark_batch_with_status_and_meta, validate_batch_version,
     validate_shelf_zone,
 };
 
 impl PartService {
     // ===== 1.7 扫码检 / 司机扫码 =====
 
-    /// `POST /parts/{id}/scan-inspect`：扫码快捷品检（一步式）。
+    /// `POST /prod/batches/{batch_id}/scan-inspect`：扫码快捷品检（一步式）。
     ///
     /// `{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION（target_shelf）→
     /// READY_TO_SHIP（pass=true）或 IN_PROCESS + `is_repairing = true`
@@ -32,20 +32,23 @@ impl PartService {
     pub async fn scan_inspect<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: ScanInspectRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Inspector])?;
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
         let part = repo
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         // 入口白名单

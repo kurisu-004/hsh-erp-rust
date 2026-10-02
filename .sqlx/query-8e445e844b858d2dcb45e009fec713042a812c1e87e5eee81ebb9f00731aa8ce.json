@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT id, part_id, batch_no, quantity, status, location,\n                       current_holder_id, current_process_id, current_process_step_id,\n                       delivery_note_id, parent_batch_id,\n                       is_repairing,\n                       version, created_at, created_by, updated_at, updated_by,\n                       deleted_at\n                FROM t_part_batch\n                WHERE id = $1 AND part_id = $2\n                  AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')\n                  AND deleted_at IS NULL\n                ",
+  "query": "\n                SELECT id, part_id, batch_no, quantity, status, location,\n                       current_holder_id, current_process_id, current_process_step_id,\n                       delivery_note_id, parent_batch_id,\n                       is_repairing,\n                       version, created_at, created_by, updated_at, updated_by,\n                       deleted_at\n                FROM t_part_batch\n                WHERE id = $1\n                  AND status IN ('PENDING', 'PROGRAMMING', 'IN_PROCESS')\n                  AND deleted_at IS NULL\n                ",
   "describe": {
     "columns": [
       {
@@ -204,7 +204,6 @@
     ],
     "parameters": {
       "Left": [
-        "Int8",
         "Int8"
       ]
     },
@@ -229,5 +228,5 @@
       true
     ]
   },
-  "hash": "e44aeb5c430cc6ec672e14117d65920f2ab753feb22651b644f8886da709c708"
+  "hash": "8e445e844b858d2dcb45e009fec713042a812c1e87e5eee81ebb9f00731aa8ce"
 }

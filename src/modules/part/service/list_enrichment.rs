@@ -11,9 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::modules::part::batch::model::TPartBatch;
-use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::part::repo::PartRepoTrait;
+use crate::modules::prod::batch::model::TPartBatch;
+use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::AppError;
 
 /// 列表页「位置 / 持有人」派生（按 min-progress 活跃批次，跨 t_shelf /

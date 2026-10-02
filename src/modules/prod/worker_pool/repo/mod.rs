@@ -67,8 +67,8 @@
 use async_trait::async_trait;
 use sqlx::PgConnection;
 
-use crate::modules::part::batch::model::TPartBatch;
 use crate::modules::part::model::{NewPartEvent, TPart};
+use crate::modules::prod::batch::model::TPartBatch;
 use crate::modules::prod::process::model::TProcess;
 use crate::modules::prod::work_type::model::TWorkType;
 use crate::modules::prod::worker::model::TWorker;
@@ -504,7 +504,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         &mut self,
         worker_id: i64,
     ) -> Result<i64, sqlx::Error> {
-        crate::modules::part::batch::repo::PartBatchRepo::count_held_by_worker(
+        crate::modules::prod::batch::repo::PartBatchRepo::count_held_by_worker(
             &mut **self,
             worker_id,
         )
@@ -516,7 +516,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         id: i64,
         include_deleted: bool,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        crate::modules::part::batch::repo::PartBatchRepo::get_by_id(
+        crate::modules::prod::batch::repo::PartBatchRepo::get_by_id(
             &mut **self,
             id,
             include_deleted,
@@ -529,7 +529,7 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
     ) -> Result<Vec<TPartBatch>, sqlx::Error> {
-        crate::modules::part::batch::repo::PartBatchRepo::list_active_by_part_id(
+        crate::modules::prod::batch::repo::PartBatchRepo::list_active_by_part_id(
             &mut **self,
             part_id,
         )
@@ -551,8 +551,8 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         batch_id: i64,
         worker_id: i64,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        use crate::modules::part::repo::PartRepo;
-        PartRepo::find_inprocess_batch_by_id_and_holder(&mut **self, batch_id, worker_id).await
+        use crate::modules::prod::batch::repo::PartBatchRepo;
+        PartBatchRepo::find_inprocess_batch_by_id_and_holder(&mut **self, batch_id, worker_id).await
     }
 
     async fn part_mark_batch_returned(
@@ -563,8 +563,8 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         step_id: Option<i64>,
         updated_by: Option<i64>,
     ) -> Result<u64, sqlx::Error> {
-        use crate::modules::part::repo::PartRepo;
-        PartRepo::mark_batch_returned(
+        use crate::modules::prod::batch::repo::PartBatchRepo;
+        PartBatchRepo::mark_batch_returned(
             &mut **self,
             batch_id,
             expected_version,

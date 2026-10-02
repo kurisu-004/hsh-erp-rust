@@ -5,8 +5,8 @@
 //! ## 这个域解决什么问题
 //!
 //! `t_part_batch.status` → `t_part.status` → `t_assembly.status` 是三层单向派生，
-//! 写入口已收口到 `part::service::status_gate`（单测
-//! `part::service::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
+//! 写入口已收口到 `prod::batch::status_gate`（单测
+//! `prod::batch::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
 //! 守住「只有它能写批次状态」）。但派生**缓存**仍可能与真源不一致：
 //!
 //! 1. **历史漂移**：status_gate 收口之前有 3 个写点漏调 sync，线上/备份库里已经存在
@@ -37,7 +37,7 @@ use sqlx::PgConnection;
 
 use crate::modules::assembly::service::sync_from_part::recompute_assembly_status_by_id;
 use crate::modules::part::repo::sql::PartRepo;
-use crate::modules::part::service::status_gate;
+use crate::modules::prod::batch::status_gate;
 use crate::shared::error::AppError;
 
 use super::dto::StatusChangeEntry;

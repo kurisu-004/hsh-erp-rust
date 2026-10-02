@@ -39,13 +39,13 @@
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::batch::model::TPartBatch;
-use crate::modules::part::dto::{
+use crate::modules::part::repo::PartRepoTrait;
+use crate::modules::part::vo::{BatchOpFailure, BatchToXxxOut, ToXxxOut};
+use crate::modules::prod::batch::dto::{
     BatchToInspectionRequest, BatchToShipRequest, ToInspectionRequest, ToProcessRequest,
     ToShipRequest,
 };
-use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::vo::{BatchOpFailure, BatchToXxxOut, ToXxxOut};
+use crate::modules::prod::batch::model::TPartBatch;
 use crate::modules::shelf::model::TShelf;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
@@ -258,18 +258,13 @@ impl PartService {
     pub async fn to_ship<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: ToShipRequest,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
-        let batch_id: i64 = req
-            .batch_id
-            .parse()
-            .map_err(|_| AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id)))?;
         Self::to_ship_core(
             &mut repo,
             snowflake,
-            part_id,
             batch_id,
             req.version,
             req.quantity,
@@ -319,18 +314,6 @@ impl PartService {
                     continue;
                 }
             };
-            // 反查 batch（拿 part_id + 校验存在 + 校验未软删）
-            let target = match Self::_lookup_batch_by_id(&mut repo, parsed_bid).await {
-                Ok(t) => t,
-                Err(e) => {
-                    failed.push(BatchOpFailure {
-                        batch_id: parsed_bid,
-                        code: e.code(),
-                        message: format!("{e}"),
-                    });
-                    continue;
-                }
-            };
             // per-item savepoint：失败 item 回滚部分写入，不影响后续 item（参考 batch_create_parts）
             use sqlx::AssertSqlSafe;
             let sp_name = format!("batch_to_ship_item_{idx}");
@@ -340,8 +323,7 @@ impl PartService {
             match Self::to_ship_core(
                 &mut repo,
                 snowflake,
-                target.part_id,
-                target.id,
+                parsed_bid,
                 // caller 送来的 version（**不是** target.version）——否则 OCC 恒真、静默失效
                 item.version,
                 item.quantity,
@@ -360,7 +342,7 @@ impl PartService {
                         .execute(repo.conn_mut())
                         .await?;
                     failed.push(BatchOpFailure {
-                        batch_id: target.id,
+                        batch_id: parsed_bid,
                         code: e.code(),
                         message: format!("{e}"),
                     });
@@ -375,7 +357,7 @@ impl PartService {
     pub async fn to_process<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: ToProcessRequest,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
@@ -394,14 +376,9 @@ impl PartService {
                 ),
             )
         })?;
-        let batch_id: i64 = req
-            .batch_id
-            .parse()
-            .map_err(|_| AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id)))?;
         Self::to_process_core(
             &mut repo,
             snowflake,
-            part_id,
             shelf_id,
             next_process_id,
             req.note.as_deref(),
@@ -417,7 +394,7 @@ impl PartService {
     pub async fn to_inspection<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: ToInspectionRequest,
         current: &CurrentUser,
     ) -> Result<ToXxxOut, AppError> {
@@ -431,14 +408,9 @@ impl PartService {
                     ),
                 )
             })?;
-        let batch_id: i64 = req
-            .batch_id
-            .parse()
-            .map_err(|_| AppError::validation(format!("batch_id '{}' 解析失败", req.batch_id)))?;
         Self::to_inspection_core(
             &mut repo,
             snowflake,
-            part_id,
             target_inspection_shelf_id,
             batch_id,
             req.version,
@@ -503,18 +475,6 @@ impl PartService {
                     continue;
                 }
             };
-            // 反查 batch（拿 part_id + 校验存在 + 校验未软删）
-            let target = match Self::_lookup_batch_by_id(&mut repo, parsed_bid).await {
-                Ok(t) => t,
-                Err(e) => {
-                    failed.push(BatchOpFailure {
-                        batch_id: parsed_bid,
-                        code: e.code(),
-                        message: format!("{e}"),
-                    });
-                    continue;
-                }
-            };
             // per-item savepoint：失败 item 回滚部分写入，不影响后续 item（参考 batch_create_parts）
             use sqlx::AssertSqlSafe;
             let sp_name = format!("batch_to_inspection_item_{idx}");
@@ -524,9 +484,8 @@ impl PartService {
             match Self::to_inspection_core(
                 &mut repo,
                 snowflake,
-                target.part_id,
                 target_inspection_shelf_id,
-                target.id,
+                parsed_bid,
                 // caller 送来的 version（**不是** target.version）——否则 OCC 恒真、静默失效
                 item.version,
                 item.quantity,
@@ -546,7 +505,7 @@ impl PartService {
                         .execute(repo.conn_mut())
                         .await?;
                     failed.push(BatchOpFailure {
-                        batch_id: target.id,
+                        batch_id: parsed_bid,
                         code: e.code(),
                         message: format!("{e}"),
                     });
