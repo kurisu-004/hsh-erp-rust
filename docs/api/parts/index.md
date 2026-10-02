@@ -156,6 +156,31 @@
 > （只投影 `p.id` / `p.serial_no` / `p.drawing_no`），故该端点返回的 `version` 恒为 `0`
 > （有意占位，不是漏取值）；该端点的批次乐观锁版本一律走 `batch_version`。
 
+#### 前端配套改动清单（2026-10-03 新增 `batch_id` / `batch_version`）
+
+本 VO 被 3 个端点复用，故这两个新字段会出现在**所有**复用路径的响应里（值为
+`null`）。逐端点影响与前端动作：
+
+| 端点 | `batch_id` / `batch_version` | 前端是否要改 |
+|---|---|---|
+| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | 需要：TS `PartItem` 补 2 个可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
+| `GET /parts` | 恒 `null` | **不需要** |
+| `GET /api/v2/com/union-list` | 恒 `null` | **不需要** |
+| `GET /parts/pending-programming`（part 域） | 恒 `null` | **不需要** |
+
+**前端无需改 Zod schema**，依据两条（均已核实）：
+
+1. 两个新字段是 `#[serde(serialize_with = "serialize_i64_opt")]` + 无
+   `skip_serializing_if`，即**恒出现**（无值时为 `null`）—— 属增量 key；
+2. part 列表行 schema 刻意**不用** `.strict()`（前端 `src/composables/queries/schemas.ts`
+   该处注释明写「行级 `.strict()` 会在后端加**任何一个**新字段时把整表打挂」），
+   Zod 默认 strip 模式会安静吞掉未声明的 key。
+   另：`listPartsByWorkTypeAllShelves` 走裸 `api.get<PartItem[]>` 泛型、根本不过 Zod。
+
+> ⚠️ 与 `GET /api/v2/prod/programming/pending` 的 `ProgrammingItemOut` 同名字段**语义不同**：
+> 那两个走**另一个 VO**，填的是「`status='PROGRAMMING'` 活跃批次」（`id` 最大者），
+> 对齐 `release-from-programming` 的写出口。两处不要互相复用类型。
+
 > 2026-09-16 PR-2（migration 027）：`t_part` 删 `actual_delivery_date` /
 > `location` / `current_holder_id` / `placed_at` / `delivery_note_id` /
 > `has_been_repaired` 6 个批次依附列；`TPart` 由 29 列精简至 23 列。
