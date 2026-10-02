@@ -167,7 +167,9 @@ pub struct MoveResult {
 mod tests {
     use super::*;
 
-    fn sample_move_result(shelf_id: Option<i64>) -> MoveResult {
+    /// POOL→WORKER：service 必填 `shelf_id`（值 = `from.shelf_id`），
+    /// 故「方向为 POOL→WORKER 且 `shelf_id` 为 None」不是现实可出现的组合。
+    fn move_result_pool_to_worker(shelf_id: Option<i64>) -> MoveResult {
         MoveResult {
             batch_id: 1590000000000000002,
             from_kind: "POOL".to_string(),
@@ -182,10 +184,28 @@ mod tests {
         }
     }
 
+    /// WORKER→WORKER：唯一 `shelf_id` 现实为 `None` 的方向（`to_kind=WORKER`
+    /// 故 `current_held` / `max_held` 照填）。
+    fn move_result_worker_to_worker() -> MoveResult {
+        MoveResult {
+            batch_id: 1590000000000000002,
+            from_kind: "WORKER".to_string(),
+            to_kind: "WORKER".to_string(),
+            new_holder_id: 1590000000000000003,
+            new_location: "WORKER".to_string(),
+            version: 2,
+            current_held: Some(1),
+            max_held: Some(5),
+            shelf_id: None,
+            taken: None,
+        }
+    }
+
     /// 雪花 ID 走 `serialize_i64_opt` ⇒ JSON string，且十进制内容与传入值一致。
     #[test]
     fn move_result_shelf_id_serializes_as_string() {
-        let value = serde_json::to_value(sample_move_result(Some(1590000000000000001))).unwrap();
+        let value =
+            serde_json::to_value(move_result_pool_to_worker(Some(1590000000000000001))).unwrap();
         assert_eq!(
             value["shelf_id"],
             serde_json::Value::String("1590000000000000001".into())
@@ -195,7 +215,12 @@ mod tests {
     /// `skip_serializing_if` 优先于 `serialize_i64_opt` ⇒ None 时 key 不出现。
     #[test]
     fn move_result_omits_shelf_id_when_none() {
-        let value = serde_json::to_value(sample_move_result(None)).unwrap();
-        assert!(value.get("shelf_id").is_none());
+        let value = serde_json::to_value(move_result_worker_to_worker()).unwrap();
+        // 先断言是 object：`Value::get` 对非 object 同样返回 None，
+        // 直接 get 会让「序列化结果不是 object」这条异常路径静默通过。
+        let object = value
+            .as_object()
+            .expect("MoveResult 应序列化为 JSON object");
+        assert!(object.get("shelf_id").is_none());
     }
 }
