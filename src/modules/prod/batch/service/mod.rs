@@ -30,15 +30,15 @@
 //! （`part::statemachine`）都经 part 域 trait。
 //!
 //! ## 依赖方向：过渡期，**尚未单向**
-//! 本模块的批次方法（`mark_batch_*` / `find_*batch*` / `split_batch_for_partial_pass`
-//! 共 13 个，全目录 46 处 `PartRepoTrait` 引用）**经 part 域的 `PartRepoTrait` 调用**，
-//! 而这些 trait 的默认体在 `part::repo::PartRepoTrait` 内直接回调
+//! 本模块的批次方法以 `<R: PartRepoTrait>` 形参接收 part 域 trait，批次写入经它
+//! 落到 prod 域的表；而 `PartRepoTrait` 的默认体在 `part::repo` 内直接回调
 //! `PartBatchRepo` + `status_gate`。即调用链是
 //! `prod::batch::service → part::repo::PartRepoTrait → prod::batch::repo`：
 //! **prod 域的 service 借 part 域的 trait 写 prod 域自己的表**，这是当前真实存在的
-//! 反向依赖，不是单向。part → prod 方向另有 `status_gate` + `PartBatchRepo` 两处
-//! 数据依赖（`part::service` 的 `batch` / `crud` / `rollup` / `list_enrichment` /
-//! `phase1::events`）。
+//! 反向依赖，不是单向。少数集合读与拆批直接调本域 `PartBatchRepo`（经
+//! `repo.conn_mut()`），不改变上述借用关系。part → prod 方向另有 `status_gate` +
+//! `PartBatchRepo` 两处数据依赖，代码调用点分布在 `part::service` 的 `batch` /
+//! `crud` / `rollup` / `list_enrichment` / `phase1::events`。
 //!
 //! 收敛目标（分两步，本轮只做标注，未动代码）：
 //! 1. prod service 改直调 `PartBatchRepo` / `status_gate`，不再借 part 域 trait；

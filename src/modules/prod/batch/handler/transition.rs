@@ -1,7 +1,7 @@
 //! 批次流转 handler —— to-XXX 流 + 批量流转 + 扫码快捷入口 + 集合读。
 //!
-//! 2026-10-02 自 `part/handler/inspection.rs` 迁入 prod 域：这些端点的操作对象
-//! 是**批次**（OCC 锚 `t_part_batch.version`），路径锚由 `part_id` 改为 `batch_id`。
+//! 2026-10-02 迁入 prod 域：这些端点的操作对象是**批次**（OCC 锚
+//! `t_part_batch.version`），路径锚是 `batch_id`。
 //!
 //! ## 端点
 //! - `POST /api/v2/prod/batches/{batch_id}/to-inspection`

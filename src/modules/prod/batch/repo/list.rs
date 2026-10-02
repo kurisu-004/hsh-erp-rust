@@ -45,29 +45,30 @@ impl PartBatchRepo {
     ///   ON s.id = pb.current_process_step_id` 后取 `s.process_id` / `t_process.name`
     /// - `pb.current_process_step_id` 新增
     ///
-    /// 2026-09-30（review 第 3 轮 M3）**回退**该查询到 step 派生，理由：
+    /// 2026-09-30 决定该查询**不直读** `current_process_id`，继续从 step 派生，
+    /// 理由：
     ///
     /// 本函数服务的三个集合读端点 —— `GET /prod/batches/inspection`（`statuses =
     /// ['INSPECTION']`）与 `GET /prod/batches/repair` / `GET /prod/batches/repairing`
     /// （`RepairBatchesOut` 是本行结构的类型别名）—— 都不是**工序池**端点，判据是
     /// `status`，与 `current_process_id` 无关。
     ///
-    /// 而 review 第 2 轮 H2 修复把「送检 = 出池 → `current_process_id = NULL`」
-    /// 落实后，**所有进 INSPECTION 的写点都把该列清成 NULL**
+    /// 「送检 = 出池 → `current_process_id = NULL`」是不变式，且
+    /// **所有进 INSPECTION 的写点都把该列清成 NULL**
     /// （`mark_batch_inspected` / `phase1::scan` / `outsource::receive_to_inspection` /
     /// `repair::complete_repair` 的 INSPECTION 分支）。若本查询改直读 cpid，则
     /// `next_process_id` / `next_process_name` 在 INSPECTION 列表里**恒为 null**
     /// —— 用户可见回归，且 `tests/part/inspection_batches.rs` 原本不断言该字段，
     /// 无人能发现。
     ///
-    /// 处置：`current_process_id` 是**池归属权威列**，其读取方严格限定为 5 条池
-    /// SQL + rollup 派生；**展示类列表**继续从 `current_process_step_id`
-    /// （可选的显示用定位信息）派生，与本分支之前的字节级行为一致。
+    /// 因此 `current_process_id` 是**池归属权威列**，其读取方严格限定为工序池 SQL
+    /// （take_one / take_specific / list_candidates / group_count /
+    /// count_pool_by_shelf）+ rollup 派生；**展示类列表**继续从
+    /// `current_process_step_id`（可选的显示用定位信息）派生。
     ///
-    /// 顺带删掉 `pb_current_process_id` 投影 —— 它在 2026-09-30 改直读时加进来，
-    /// 但行映射从未消费，属死列。
+    /// 本函数不投影 `pb_current_process_id`（行映射无对应字段）。
     ///
-    /// 对外 DTO 字段名（`next_process_id` / `next_process_name`）始终不变。
+    /// 对外 DTO 字段名为 `next_process_id` / `next_process_name`，取自 step 派生列。
     #[allow(clippy::too_many_arguments)]
     pub async fn list_batches_with_part<'e, E: PgExecutor<'e>>(
         executor: E,

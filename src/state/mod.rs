@@ -192,8 +192,8 @@ impl AppState {
         let process_service = Arc::new(ProcessService::new(snowflake.clone()));
         // 2026-09-22 prod/worker_pool service 是 unit struct，无字段依赖，
         // 无需装线到 AppState——handler 直接 `WorkerPoolService::method(&mut *tx, ...)`
-        // 静态调用即可（与原 `WorkerPoolService` 调用形态一致，part 域
-        // `part/handler/inspection.rs:298` 沿用）。
+        // 静态调用即可（与原 `WorkerPoolService` 调用形态一致，prod 域
+        // `prod/worker_pool/handler.rs` 与 `prod/batch/handler/transition.rs` 沿用）。
         let worker_pool_service = Arc::new(WorkerPoolService::new());
         // 2026-09-22 Group E dashboard service 是 unit struct（WS-only，4 个聚合 trait call
         // 不需要任何字段依赖——雪花 ID 在 snapshot 里无新增，主键全部借用既有数据）。

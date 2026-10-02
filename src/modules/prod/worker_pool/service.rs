@@ -70,8 +70,8 @@ use super::vo::{
 ///
 /// 2026-09-22 D-2 决策：本 service 保持 unit struct（**不**持字段依赖），与
 /// 原 `pub struct WorkerPoolService;` 一致。snowflake 由每个写方法形参显式收——
-/// handler 端调用时传 `&state.snowflake`，跨域调用点（如 `part/handler/inspection.rs`
-/// 的 worker-scan 路径）也按相同形参顺序传，不破坏既有调用点。
+/// handler 端调用时传 `&state.snowflake`，跨域调用点（`prod/batch/handler/transition.rs`
+/// 的 worker-scan 后 refill 路径）也按相同形参顺序传，不破坏既有调用点。
 ///
 /// 这种"无字段 service + 显式 snowflake 形参"的形态与 iam / shelf / customer /
 /// worker 等其它域不同——本域**唯一**需要 snowflake 的点是 part_event.id 生成
