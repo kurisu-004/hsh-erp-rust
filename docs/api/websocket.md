@@ -237,7 +237,7 @@ flush 直接断。
 > `DashboardSnapshot` 与 `DashboardEvent` 两个变体；「心跳」走独立的 `WsHeartbeatMsg` text 帧 +
 > protocol-level `Ping`（见「握手流程」第 6 条），不再占用 `WsEvent` 变体。
 
-> **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts/inspection.md#post-apiv2partsworker-scan`](./parts/inspection.md#post-apiv2partsworker-scan) 与 [`./production/worker-pool.md`](./production/worker-pool.md)。
+> **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts/inspection.md#post-apiv2prodbatchesworker-scan`](./parts/inspection.md#post-apiv2prodbatchesworker-scan) 与 [`./production/worker-pool.md`](./production/worker-pool.md)。
 >
 > **batch 事件说明（2026-09-29 新增）**：`BATCH_PLACED_ON_SHELF` 同样在 HTTP commit 之后广播（沿 worker_pool 范本）；payload 含 4 个字段（batch_id / target_process_id / shelf_id / version）。单条 dispatch 端点发单条形态（payload 顶层字段）；bulk-dispatch / auto-dispatch 端点发批量形态（payload.batches 数组，仅含 succeeded 部分，skipped 不广播）。详见 [`./production/batches.md#ws-事件`](./production/batches.md#ws-事件)。
 >
@@ -248,9 +248,11 @@ flush 直接断。
 - **Payload**: `{ "assembly_id": "<stringified i64>" }`
 - **触发端点**:
  - `POST /api/v2/assemblies/{id}/update`（前端主动改字段）
- - `POST /api/v2/parts/{id}/to-inspection` / `to-ship` / `to-process`
- - `POST /api/v2/parts/batch-to-inspection` / `batch-to-ship`
- - `POST /api/v2/parts/worker-scan`（仅 `INSPECTED` 分支，**实际翻状态时**才下发；dedup by assembly_id）
+ - `POST /api/v2/prod/batches/{batch_id}/to-inspection` / `to-ship` / `to-process`
+ - `POST /api/v2/prod/batches/to-inspection` / `to-ship`
+ - `POST /api/v2/prod/batches/worker-scan`（仅 `INSPECTED` 分支，**实际翻状态时**才下发；dedup by assembly_id）
+
+ > **2026-10-02**：上列触发端点自 part 域迁入 prod 域（锚点 `part_id` → `batch_id`）。事件 `kind` 字符串不变。
 - **频率**：每个 inspection 调用最多 1 次（per unique parent assembly）。
 
 ### `ROLLUP_RECOMPUTED`

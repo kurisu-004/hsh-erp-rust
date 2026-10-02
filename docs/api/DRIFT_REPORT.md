@@ -63,6 +63,16 @@
 
 ### 2.2 parts/{crud, lifecycle, inspection}.md（高优先级 — 大量端点缺失）
 
+> **⚠️ 基线日期 2026-09-23（扫描基准 master `7f0641f`）**：本小节的端点清单是当时的
+> `src/modules/part/mod.rs` 快照，**不再代表现行 URL**。2026-10-02 起 25 条以单个批次
+> 为操作对象的路由已迁往 `/api/v2/prod/batches/*`（锚点 `part_id` → `batch_id`，硬切换
+> 无 alias），其中包括本清单里的 `POST /{part_id}/to-inspection` / `to-process` /
+> `to-ship` / `scan-inspect` / `batches/split` / `batches/{batch_id}/cancel` /
+> `batch-to-inspection` / `batch-to-ship` / `worker-scan` / `scan/deliver-part` 与
+> `GET /inspection-batches` / `repair-batches` / `repairing-batches`。
+> 现行路径见 [`production/batches.md`](./production/batches.md#2026-10-02-t_part_batch-子资源迁入)
+> 与 [`parts/index.md`](./parts/index.md)。本清单保留原样以存档该次扫描的结论。
+
 **实际 endpoints（50 个，从 src/modules/part/mod.rs 提取）**：
 ```
 GET /                                       ✓ docs/parts/crud

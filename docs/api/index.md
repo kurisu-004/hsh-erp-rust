@@ -10,7 +10,7 @@
 > - [`./production/shelf-process-mapping.md`](./production/shelf-process-mapping.md) — shelf ↔ process 工序映射（**2026-10-02 自 shelves 域搬入 prod**，3 端点，URL `/api/v2/prod/shelf-processes/*`，旧路径 404 无 alias —— `GET /shelves/processes` 例外为 400 纯文本；**前端配套改动清单见该页同名小节**）
 > - [`./production/workers.md`](./production/workers.md) — worker 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文件从顶层迁入 `production/`）
 > - [`./production/index.md`](./production/index.md) — **生产管理** 域（工种/工序/工序映射/工艺链/工人候选池 + 工人档案；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias）
-> - [`./parts/index.md`](./parts/index.md) — part 域（49 端点：to-inspection / to-ship 批量+单件 / to-process / **worker-scan** + Phase 1/2 全套批量与单件状态机扩展，2026-09-14）
+> - [`./parts/index.md`](./parts/index.md) — part 域（CRUD / 文件 / 列表 / 多批次动作 `cancel` / `force-complete`）。**2026-10-02 域收窄**：to-inspection / to-ship / to-process / **worker-scan** 等 25 条 batch 子资源已迁 prod 域，清单见 [`./production/batches.md`](./production/batches.md#2026-10-02-t_part_batch-子资源迁入)
 > - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（8 端点：装配体 CRUD + multipart PDF + 子件自动生成 + start + 子件 auto-rollup，2026-09-14 Phase 3）
 > - [`./cnc-programs.md`](./cnc-programs.md) — cnc_program 域（2 端点：配对上传 + 列表，2026-09-14 Phase 3）
 > - [`./files.md`](./files.md) — part_file 域（multipart 上传 + 列表 + 下载 URL + confirm 绑定，2026-09-14 Phase 3；2026-09-18 删除 upload-intents；2026-09-28 删除相关 STS 会话域，前端改为单 uploader + python `sts-tmp-keys` 数组入参直签）
@@ -205,7 +205,7 @@ HTTP 状态码：
 | shelves | [`./shelves.md`](./shelves.md) | 7 | ✅ 完全上线（CRUD + picker，2026-08-26；**2026-10-02 域拆分：端点 10 → 7（文档原写 11，逐 router 复核实为 10）—— 3 个货架↔工序映射端点搬到 [`production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)（prod 域，无 alias）；货架↔账号部分**消除**（`ShelfOut.account_count` 删除，绑定真源在 iam `t_user_role`，零 iam 改动）**） |
 | workers（已并入 prod） | [`./production/workers.md`](./production/workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文档从顶层迁入 `production/`） |
 | **生产管理** | [`./production/index.md`](./production/index.md) | **35** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池 + 工人档案 + 待下发批次 + 待编程一览；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步；2026-10-01 增 `prod::programming` 待编程一览 1 端点；**2026-10-02 增 `prod::shelf_process` 货架↔工序映射 3 端点，自 shelves 域搬入**） |
-| part | [`./parts/index.md`](./parts/index.md) | **49** | ✅ 完全上线（Phase 1+2 全部状态机 / 批量 / 扫码 / pick-up 端点落地，2026-09-14；2026-10-01 `t_part_batch.status` 收口为 `status_gate` 单一写入口） |
+| part | [`./parts/index.md`](./parts/index.md) | **49** | ✅ 完全上线（2026-10-01 `t_part_batch.status` 收口为 `status_gate` 单一写入口；**2026-10-02：25 条 batch 子资源迁 prod 域，part 域只留多批次动作（`/{part_id}/cancel` / `force-complete`）与非批次动作**） |
 | admin（对账） | [`./admin.md`](./admin.md) | 1 | ✅ 完全上线（2026-10-01 新增 `POST /api/v2/admin/recompute-rollup`；Manager 单角色；**复用**既有 rollup 实现，不新增派生算法） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |

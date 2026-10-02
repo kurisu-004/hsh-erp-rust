@@ -158,7 +158,7 @@ Response 200 `data`：`ScanDeliveryOut`
 
 > part 级信息（`serial_no` / `drawing_no` / `name`）只在外层 `UnresolvedTargetDto` 上，`available_batches[]` / `attachable_batches[]` 内不重复。
 >
-> B 候选转一键送检：前端把 `available_batches[]` 逐条映射为 `{ batch_id, version, quantity? }` 塞进 `POST /api/v2/parts/batch-to-inspection` 的 `items[]`。`version` 不符 → 该 item 落 `failed[].code = 40901`。
+> B 候选转一键送检：前端把 `available_batches[]` 逐条映射为 `{ batch_id, version, quantity? }` 塞进 `POST /api/v2/prod/batches/to-inspection` 的 `items[]`。`version` 不符 → 该 item 落 `failed[].code = 40901`。
 >
 > A 组转 attach：前端把 `attachable_batches[]` 逐条映射为 `{ batch_id, version }` 塞进 `POST /{id}/attach-batches` 的 `batches[]`；部分失败 → 200 + `conflicts[]`（详见下文）。
 
@@ -167,7 +167,7 @@ Response 200 `data`：`ScanDeliveryOut`
 `PENDING` / `PROGRAMMING` / `IN_PROCESS` / `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` / `OUTSOURCE` / `COMPLETED` / `CANCELLED`（**2026-10-01**：REPAIRING 已降级为 `t_part_batch.is_repairing` 标记列，DB 不再产生该 status）
 
 > 前端可基于 `unresolved_targets[i].available_batches[].status` 区分触发端点：
-> - `status ∈ {PENDING, PROGRAMMING, IN_PROCESS}`（IN_PROCESS 需未被工人持有）→ 触发一键送检（`to-inspection` / `POST /parts/batch-scan-inspect`），成功后 re-scan 同一 code 完成入单
+> - `status ∈ {PENDING, PROGRAMMING, IN_PROCESS}`（IN_PROCESS 需未被工人持有）→ 触发一键送检（`POST /api/v2/prod/batches/to-inspection`），成功后 re-scan 同一 code 完成入单。原文并列的 `POST /parts/batch-scan-inspect` 是 Python v1 遗留名，Rust v2 无此路由
 
 错误码：
 
