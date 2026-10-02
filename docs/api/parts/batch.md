@@ -13,6 +13,8 @@
 
 > **2026-09-30 Phase 2 dashboard 二次调整**：新增 `GET /api/v2/parts/{part_id}/batches`
 > 文档章节，`PartBatchListItemOut` 字段从 11 扩展到 18（详见后文）。
+> **2026-10-02 订正**：该 VO 现为 **19 字段**（新增 `is_repairing`），见下文
+> 字段表下的订正段；上面这句保留 2026-09-30 当天的历史数字，不改。
 
 ## 本文件目录
 
@@ -69,7 +71,7 @@ Response 200 `data`：`PartBatchListItemOut[]`，数组按 `batch_no ASC` 升序
 | `batch_label` | string | no | 展示标签，格式 `L{id}`（与 delivery_note 一致） |
 | `quantity` | number | no | 批次数量 |
 | `status` | string | no | `OrderStatus` 枚举字符串 |
-| `is_repairing` | bool | no | 是否处于返修中（**2026-10-01 review 第 1 轮 M5 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006）；非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，返修中的批次 `status` 恒为 `IN_PROCESS` ⇒ 只能读本字段判「返修中」。语义与 Rust 侧 `src/modules/part/vo/part.rs` 一致 |
+| `is_repairing` | bool | no | 是否处于返修中（**2026-10-01 review 第 1 轮 M5 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006）；非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，起修时 `status` 保持 `IN_PROCESS` ⇒ 判断「返修中」只能读本字段。前端 Zod schema 必须按**必填** `boolean` 声明，不能 `.optional()`（同 `InspectionBatchListItemOut`）。语义与 Rust 侧 `src/modules/part/vo/part.rs` 一致 |
 | `location` | string | yes | `OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF / OUTSOURCE_COMPANY` |
 | `current_holder_id` | string | yes | 当前持有者 ID |
 | `current_holder_display` | string | yes | 当前持有者解析名（货架 code / 工人姓名 / 外协公司名） |
@@ -88,10 +90,11 @@ Response 200 `data`：`PartBatchListItemOut[]`，数组按 `batch_no ASC` 升序
 > **2026-10-02 订正**：上段是 **2026-09-30 的历史记录**（当时 11 → 18 属实，不改）。
 > 2026-10-01 review 第 1 轮 M5 之后本 VO 实际为 **19 字段** —— 新增
 > `is_repairing`（**BREAKING**，直读 `t_part_batch.is_repairing` 标记列，非
-> `Option` ⇒ 恒定返回）。`REPAIRING` 已从 `PartStatus` 降级为标记列，返修中的
-> 批次 `status` 恒为 `IN_PROCESS` ⇒ 前端判「返修中」**只能**读 `is_repairing`，
-> 靠 `status` 区分不出来。本文件此前（2026-09-30 起）**从未记录过该字段**，
-> 属文档漂移，本次补齐。背景与端点影响面见
+> `Option` ⇒ 恒定返回）。`REPAIRING` 已从 `PartStatus` 降级为标记列，起修时
+> `status` 保持 `IN_PROCESS`；且标记与 `status` 正交（起修后送检可得
+> `INSPECTION` + `is_repairing = true`）⇒ 前端判「返修中」**只能**读
+> `is_repairing`，靠 `status` 区分不出来。本文件此前（2026-09-30 起）**从未记录过
+> 该字段**，属文档漂移，本次补齐。背景与端点影响面见
 > [`./lifecycle.md` § GET /api/v2/parts/repairing-batches](./lifecycle.md#get-apiv2partsrepairing-batches)；
 > 同一批字段的另一个 VO（`InspectionBatchListItemOut`）见
 > [`./inspection.md`](./inspection.md)。

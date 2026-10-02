@@ -518,7 +518,7 @@ Response 200 `data`：`InspectionBatchListOut`
 | `batch_no` | string? | 批次号 |
 | `quantity` | i32 | 批次数量 |
 | `status` | string | 批次状态枚举字符串（本端点固定为 `INSPECTION`） |
-| `is_repairing` | bool | 是否处于返修中（**2026-10-01 review 第 1 轮 M5 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006），非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，故返修中的批次 `status` 恒为 `IN_PROCESS`（`repair-batches` 恒 `IN_PROCESS`、`inspection-batches` 恒 `INSPECTION`）—— **「是否返修中」只能读本字段**，靠 `status` 无法区分。语义与 Rust 侧 `src/modules/part/vo/inspection.rs` 一致 |
+| `is_repairing` | bool | 是否处于返修中（**2026-10-01 review 第 1 轮 M5 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006），非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，起修时 `status` 保持 `IN_PROCESS`（DB 不再产生 `REPAIRING` 字面量）；本字段与 `status` **正交**（起修后送检可得 `INSPECTION` + `is_repairing = true`，可达链见下方订正段）—— **「是否返修中」只能读本字段**。`repairing-batches` 的判据即 `is_repairing = true`。语义与 Rust 侧 `src/modules/part/vo/inspection.rs` 一致 |
 | `location` | string? | 批次所在位置（`INSPECTION_SHELF` 等） |
 | `version` | i32 | 乐观锁（`t_part_batch.version`，caller OCC 锚点） |
 | `current_process_step_id` | string (i64)? | 逻辑 FK → `t_process_chain_step.id`（PR-3 批次 step 化 2026-09-16 新增，替代 next_process_id 列） |
@@ -562,12 +562,22 @@ Response 200 `data`：`InspectionBatchListOut`
 > 见上方批次字段表。
 >
 > **为什么必须有这个字段**（原结论的推理漏洞，留档以免回潮）：
-> - `REPAIRING` 降级为标记列后，返修中批次的 `status` **恒为 `IN_PROCESS`**
->   （DB 不再产生 `REPAIRING` 字面量）⇒ 前端的老判据
->   `status === 'REPAIRING'` 在**任何**端点都取不到值。
-> - 「前端从 `status` + 端点语义即可判断」不成立：`IN_PROCESS` 是全仓最常见的
->   生产中状态，`inspection-batches` / `repair-batches` 返回的行里返修件与普通
->   在制品**混在一起**，端点语义（该端点在查什么）不能推出每一行是否返修中。
+> - `REPAIRING` 降级为标记列后，DB 不再产生 `REPAIRING` 字面量（起修时 `status`
+>   保持 `IN_PROCESS`）⇒ 前端的老判据 `status === 'REPAIRING'` 在**任何**端点
+>   都取不到值。
+> - 「前端从 `status` + 端点语义即可判断」不成立：**返修标记与 `status` 正交**。
+>   返修中的批次可以停在非 `IN_PROCESS` 的状态上而标记不变 —— `start-repair`
+>   （`IN_PROCESS` + 标记 `true`）之后走 `POST /parts/{id}/to-inspection` 或
+>   worker-scan `INSPECTED`，两条路都经 `mark_batch_inspected`
+>   （`is_repairing: None` = **保持**标记，`allowed_from` 含 `IN_PROCESS`）
+>   ⇒ 批次落到 `INSPECTION` + `is_repairing = true`。该状态可达的反证是
+>   `to-process` 对它有 20118 守卫（`src/modules/part/service/inspection_core.rs`
+>   step 4.6）。于是 `inspection-batches`（判据 `status='INSPECTION'`）返回的行里
+>   返修件与普通送检件**混在一起**；标记还会经 `mark_batch_passed_inspection` /
+>   `mark_batch_delivered`（同样 `is_repairing: None` = 保持）一路带到
+>   `DELIVERED`（`to-ship` 无返修守卫，只有 `to-process` 有），故
+>   `repair-batches`（判据 `status='DELIVERED'`）同样混。端点语义（该端点在查什么）
+>   推不出每一行是否返修中。
 > - 「要区分就只调 `GET /api/v2/parts/repairing-batches`」也不是答案：该端点只
 >   返回 `is_repairing = true` 的批次，覆盖不了「同一个列表里既有返修件又有
 >   普通在制品」的展示场景，而后者才是队列类页面的常态。
