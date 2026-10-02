@@ -335,6 +335,9 @@ pub async fn cancel_batch(
 ///
 /// 手动 pick-up（B 方案）：PENDING / IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER。
 /// Manager / Clerk / ShelfAccount 三角色可触发；worker 必须 active 且绑定 work_type。
+///
+/// 2026-10-03：`quantity` 支持部分领取（service 自动拆批）。**响应体形状不变**
+/// （仍 `R<PartOut>`），拆批信息只走 WS。
 pub async fn pick_up(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
@@ -347,15 +350,37 @@ pub async fn pick_up(
     // （在 `req` 被 service 消费前先取出）。消费方只读 `kind`，payload 修正
     // 对现有前端无影响。
     let worker_id = req.worker_id;
-    let out = BatchService::pick_up(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+    let outcome =
+        BatchService::pick_up(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
+    // 2026-10-03：部分领取发生了拆批 → 补发 PART_BATCH_SPLIT。
+    // 必须发：拆批把源批次的 quantity 静默扣减、并新建了一个批次行，其它端的
+    // 批次视图不收到这条事件就永远看不到「源批次余量变了 / 多了一个批次」。
+    // payload 字段与 `split_batch` 端点的 PART_BATCH_SPLIT 保持同形（消费方
+    // 按 event type 分派，两处字段名必须一致）。
+    if let Some(split) = outcome.split.as_ref() {
+        ws_broadcast(
+            &state,
+            "PART_BATCH_SPLIT",
+            json!({
+                "part_id": split.part_id.to_string(),
+                "new_batch_id": split.new_batch_id.to_string(),
+                "source_batch_id": batch_id.to_string(),
+                "quantity": split.quantity,
+            }),
+        );
+    }
+    // 2026-10-03：补 batch_id + quantity（整批路径 = 源批次 / 整批量；
+    // 部分路径 = 拆出来的新批次 / 拆走量），消费方据此知道工人领走了哪一批。
     ws_broadcast(
         &state,
         "PART_PICKED_UP",
         json!({
-            "part_id": out.id.to_string(),
+            "part_id": outcome.part.id.to_string(),
             "worker_id": worker_id.to_string(),
+            "batch_id": outcome.picked_batch_id.to_string(),
+            "quantity": outcome.picked_quantity,
         }),
     );
-    Ok(Json(R::ok(out)))
+    Ok(Json(R::ok(outcome.part)))
 }

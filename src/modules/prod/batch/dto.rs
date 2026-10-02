@@ -389,6 +389,10 @@ pub struct CancelBatchRequest {
 /// PENDING / IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER。
 /// `worker_id` 必填（持有件工人）；`shelf_id` 必填（当前批次所在货架；service 层
 /// 仅校验存在 + 同 shelf ↔ process 映射）。
+///
+/// 2026-10-03 新增：部分领取。`quantity` 缺省 = 整批领取（保持既有行为，向后
+/// 兼容）；`0 < quantity < batch.quantity` 时 service 自动拆批，把拆出来的那
+/// 部分交给工人，源批次留在原处、数量递减。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PickUpRequest {
     pub version: i32,
@@ -396,6 +400,16 @@ pub struct PickUpRequest {
     pub worker_id: i64,
     #[serde(deserialize_with = "deserialize_i64")]
     pub shelf_id: i64,
+    /// 2026-10-03 新增：部分领取；缺省 = 整批。
+    ///
+    /// 线上形态与同族的 `SplitBatchRequest.quantity` 一致：**JSON 字符串**
+    /// （`deserialize_i64_opt` 只吃 str），例如 `"quantity": "4"`。
+    ///
+    /// `None` / `>= batch.quantity` 一律按整批处理（`==` 是「显式整批」的合法
+    /// 写法，语义与 `None` 等价）；`0 < q < batch.quantity` 触发自动拆批。
+    /// 范围校验在 service 层，错误码 `BIZ_PART_BATCH_INVALID_QUANTITY`。
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub quantity: Option<i64>,
     #[serde(default)]
     pub note: Option<String>,
 }

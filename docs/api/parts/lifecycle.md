@@ -248,10 +248,11 @@ rollup 让 `part.status='COMPLETED'` 自动落地。
 
 ### `POST /api/v2/prod/batches/{batch_id}/pick-up`
 
-权限: **Worker**（自己的 part 拣货；其它人需 Manager）
+权限: **Manager / Clerk / ShelfAccount**（扫码台即 ShelfAccount 角色）
 
-> P3 pickup 端点（batch 级 OCC 集成）。用于 worker 主动拣走自己的在制件；`version` 锚定
-> `t_part_batch.version`。
+> P3 pickup 端点（batch 级 OCC 集成）。用于把在制批次交到工人手上；`version` 锚定
+> `t_part_batch.version`。起点状态：`PENDING` / `IN_PROCESS`（后者要求批次停在
+> `PRODUCTION_SHELF` 上），目标 `IN_PROCESS + location=WORKER`。
 
 Path：
 
@@ -264,15 +265,51 @@ Request：`PickUpRequest`（body 必填）
 ```json
 {
   "version": 0,               // 必填；batch.version（OCC）
-  "worker_id": 42,            // 必填；拣货工人
-  "shelf_id": 43,             // 必填；目标货架
+  "worker_id": "42",          // 必填；拣货工人（须 is_active 且已绑 work_type）
+  "shelf_id": "43",           // 必填；当前批次所在货架（zone=PRODUCTION 且 active）
+  "quantity": "4",            // 可选；缺省 = 整批；小于总量时自动拆批（JSON 字符串）
   "note": "string (可选)"
 }
 ```
 
-Response 200 `data`：`PartOut`。
+Response 200 `data`：`PartOut`（**响应体形状与整批领取完全一致**；拆批信息只走 WS
+`PART_BATCH_SPLIT`）。
 
-错误码：20101 / 20109 / 20119 / 40901。
+#### 部分领取（2026-10-03 新增，`quantity`）
+
+`quantity` 的三种落法：
+
+| 取值 | 行为 |
+|---|---|
+| 不传 / `null` | 整批领取（既有行为） |
+| `== batch.quantity` | 整批领取（显式写法，**不报错、不拆批**） |
+| `0 < q < batch.quantity` | 自动拆批：拆出 `q` 件成交给工人的新批次，源批次留原处、数量递减 |
+| `q ≤ 0` 或 `q > batch.quantity` | 拒：`20111 BIZ_PART_BATCH_INVALID_QUANTITY`（HTTP 400） |
+
+> ⚠️ 与 `POST /api/v2/prod/batches/{batch_id}/split` 的数量语义**不同**：split 要求
+> `q < batch.quantity`（等于即非法，因为整批无需拆）；pick-up 允许等于（等于就是整批
+> 领取）。也不要与 `to-inspection` / `to-ship` 的 `op_qty` 混淆——那边 `op_qty >`
+> 总量时按整批处理，pick-up 则直接报 20111。
+
+拆批语义（同一事务内，与整批领取共用一个响应）：
+
+- 新批次 = 被领走的那部分：`quantity = q`、`status` 与源批次相同、`batch_no =
+  max + 1`、`parent_batch_id` = 源批次 id；继承源批次的 `location` /
+  `current_holder_id` / `current_process_id` / `current_process_step_id` /
+  `is_repairing`，随后被翻到 `IN_PROCESS + WORKER + current_holder_id=worker_id`；
+- 源批次**保留原 `batch_no`**，只是 `quantity -= q`，位置与 holder 不变（余量仍在
+  生产架上，可被下一个工人再领）；
+- **OCC 仍锚源批次**：请求的 `version` 校验源批次、拆批 SQL 也以它为条件；新批次
+  建出时 `version = 0`；
+- 事件流留痕：`SPLIT`（`quantity = q`，`note = "pick-up 部分领取自动拆批"`）+
+  `PICKED_UP`（`quantity = q`）两条，都挂在新批次上，可经
+  `GET /api/v2/parts/{part_id}/events` 查到；
+- WS（均在 commit 之后广播）：`PART_BATCH_SPLIT`（`part_id` / `new_batch_id` /
+  `source_batch_id` / `quantity`）+ `PART_PICKED_UP`（`part_id` / `worker_id` /
+  `batch_id` / `quantity`，整批路径下后两者即源批次与整批量）。
+
+错误码：20101 / 20109 / 20119 / 40901 / 20111（`quantity ≤ 0` 或 `> batch.quantity`
+→ HTTP 400；`BIZ_PART_BATCH_INVALID_QUANTITY`）。
 
 ### `POST /api/v2/prod/batches/{batch_id}/place-on-shelf`
 
