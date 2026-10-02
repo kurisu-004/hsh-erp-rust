@@ -76,7 +76,7 @@ Response 200 `data`：`PartBatchListItemOut[]`，数组按 `batch_no ASC` 升序
 | `batch_label` | string | no | 展示标签，格式 `L{id}`（与 delivery_note 一致） |
 | `quantity` | number | no | 批次数量 |
 | `status` | string | no | `OrderStatus` 枚举字符串 |
-| `is_repairing` | bool | no | 是否处于返修中（**2026-10-01 review 第 1 轮 M5 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006）；非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，起修时 `status` 保持 `IN_PROCESS` ⇒ 判断「返修中」只能读本字段。前端 Zod schema 必须按**必填** `boolean` 声明，不能 `.optional()`（同 `InspectionBatchListItemOut`）。语义与 Rust 侧 `src/modules/part/vo/part.rs` 一致 |
+| `is_repairing` | bool | no | 是否处于返修中（**2026-10-01 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006）；非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，起修时 `status` 保持 `IN_PROCESS` ⇒ 判断「返修中」只能读本字段。前端 Zod schema 必须按**必填** `boolean` 声明，不能 `.optional()`（同 `InspectionBatchListItemOut`）。语义与 Rust 侧 `src/modules/part/vo/part.rs` 一致 |
 | `location` | string | yes | `OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF / OUTSOURCE_COMPANY` |
 | `current_holder_id` | string | yes | 当前持有者 ID |
 | `current_holder_display` | string | yes | 当前持有者解析名（货架 code / 工人姓名 / 外协公司名） |

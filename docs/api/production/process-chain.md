@@ -210,7 +210,7 @@ helper）。错误码 HTTP 409，业务含义：「请先制定工序链（part 
 - `POST /api/v2/prod/batches/{batch_id}/repair-dispatch` —— 派发维修
 - `POST /api/v2/prod/batches/{batch_id}/to-process` —— 品检打回
 
-守卫实现仍在 part 侧（批次所属 part 的 `process_chain_id` 判空），迁路由不改变触发条件。
+守卫判据是 part 的 `process_chain_id` 判空，与路由归属无关。
 
 > 注：与 `to-process` 共用 service 的静态批量端点（`POST /prod/batches/to-inspection` 等）
 > 一并继承此守卫。具体每个端点的「错误码」段列在

@@ -1,13 +1,17 @@
-# prod::batch 域 API —— 车间 PENDING 批次列表 + 下发（2026-09-30 重构）
+# prod::batch 域 API —— 车间下发 + `t_part_batch` 生产流转
 
-> 本文件须与 `src/modules/prod/batch/{handler.rs,dto.rs,service.rs,repo.rs,vo.rs}` 保持同步
+> 本文件须与 `src/modules/prod/batch/handler/` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
-> 范围：**车间下发** PENDING 批次专用域 —— UI「待下发队列」展示 + 一键 / 批量 / 自动预览 3 路径。
+> **范围一 —— 车间下发**（PENDING 批次专用域）：UI「待下发队列」展示 + 一键 / 批量 / 自动预览 3 路径。
 > 2026-09-29 新增 + 2026-09-30 重构：
 > - dispatch 统一 bulk-only（单条下发即 `targets.length == 1`）
 > - auto-dispatch 改为只读 preview（不再真下发，返回首道工序 + 首货架 + skip_reason）
 > - bulk-dispatch 端点删除（路由层不再挂载）
+>
+> **范围二 —— `t_part_batch` 生产流转**（2026-10-02 自 part 域迁入的 25 条以单个批次为
+> 操作对象的路由：19 条子资源 + 3 条静态批量 / 事件 + 3 条集合读），逐条清单见
+> [下方「t_part_batch 子资源迁入」节](#2026-10-02-t_part_batch-子资源迁入)。本域端点总数 3 → 28。
 
 ## 端点列表
 
@@ -96,10 +100,16 @@
 
 | code | 变更前 | 变更后 |
 |---|---|---|
-| 20109 `BIZ_PART_BATCH_NOT_FOUND` | 传一个「不属于该 part 的 `batch_id`」（靠 SQL 的 `AND part_id = $2` 判定） | **退化为**「批次不存在 / 已软删 / 状态不是流转起点」—— `batch_id` 全局唯一即锚点，「跨 part 批次」不再是可表达的场景。part 域 lifecycle 端点（仍有 part 路径参数）的 20109 另含「不属于该 part」 |
+| 20109 `BIZ_PART_BATCH_NOT_FOUND` | 传一个「不属于该 part 的 `batch_id`」（靠 SQL 的 `AND part_id = $2` 判定） | **退化为**「批次不存在 / 已软删 / 状态不是流转起点」—— `batch_id` 全局唯一即锚点，「跨 part 批次」不再是可表达的场景。留在 part 域的 `cancel` / `force-complete` 操作对象是该 part 的多个批次、不接受 `batch_id` 入参，故不返回 20109 |
 | 20101 `BIZ_PART_NOT_FOUND` | 传了不存在的 `part_id` | 仍可达，语义不变：只能经由「批次的 part 已软删」触发 |
 
 登记处见 [`../inconsistencies.md`](../inconsistencies.md)。
+
+> **待办（2026-10-02）**：批次子资源迁出后，`parts/{index,inspection}.md` 中若干
+> `src/modules/part/**` 实现位置引用待回填（handler 目录 / 文件切分以代码为准）——
+> 包括 `inspection.md` 的 `by-serial/…/part-batches` 端点实现位置、`to-process` 返修
+> 守卫位置、`index.md` 的仓库分层图与文件头同步声明、`statemachine.rs` 与
+> `status_gate` 写入口 CI 测试的 Rust 模块路径。
 
 ---
 

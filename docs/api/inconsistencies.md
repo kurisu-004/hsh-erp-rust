@@ -96,7 +96,7 @@
 ### 2.1 列表/筛选（Rust 已全补）
 
 > 下表 `Path` 列是 **Python v1 主仓的现行路径**（`/api/v1/*`），不受 2026-10-02 的
-> Rust 侧路由迁移影响；Rust 对应路径见末列。
+> Rust 侧路由迁移影响；Rust 对应路径见末列。（§2.1–§2.6 各表 `Path` 列均为 Python v1 现行路径）
 
 | Method | Path | Python | Rust |
 |---|---|---|---|
@@ -312,7 +312,7 @@
 
 | code | 变更前 | 变更后 |
 |---|---|---|
-| 20109 `BIZ_PART_BATCH_NOT_FOUND` | 传一个「**不属于该 part** 的 `batch_id`」→ 20109（靠 SQL 的 `AND part_id = $2` 判定） | **退化为**「批次不存在 / 已软删 / 状态不是流转起点」。`batch_id` 全局唯一即锚点，「跨 part 批次」不再是可表达的场景，SQL 里的 `AND part_id = $2` 冗余断言随之删除。仍留 part 域的 lifecycle 端点（保留 part 路径参数）其 20109 另含「不属于该 part」 |
+| 20109 `BIZ_PART_BATCH_NOT_FOUND` | 传一个「**不属于该 part** 的 `batch_id`」→ 20109（靠 SQL 的 `AND part_id = $2` 判定） | **退化为**「批次不存在 / 已软删 / 状态不是流转起点」。`batch_id` 全局唯一即锚点，「跨 part 批次」不再是可表达的场景，SQL 里的 `AND part_id = $2` 冗余断言随之删除。留在 part 域的 `cancel` / `force-complete` 操作对象是该 part 的多个批次、不接受 `batch_id` 入参，故不返回 20109 |
 | 20101 `BIZ_PART_NOT_FOUND` | 传了不存在的 `part_id` | **仍可达，语义不变** —— 只能经由「批次的 part 已软删」触发（service 按 `batch_id` 反查 part 后判软删） |
 
 > 归口文档：[`./parts/inspection.md`](./parts/inspection.md) § 错误码参考（含各端点

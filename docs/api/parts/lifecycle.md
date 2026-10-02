@@ -143,7 +143,7 @@ Path：
 
 > batch 级动作，OCC 锚定 `t_part_batch.version`。
 >
-> **REPAIRING 降级为布尔标记列
+> **2026-10-01 起 REPAIRING 降级为布尔标记列**
 > `t_part_batch.is_repairing`（migration 005/006）。本端点**不再发生 status
 > 迁移** —— 守卫条件由「状态机 `IN_PROCESS → REPAIRING`」改为
 > **「`status='IN_PROCESS'` 且 `is_repairing = false`」**，命中后只把
@@ -402,8 +402,7 @@ Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
 
 权限: **Manager / Inspector**
 
-> P3 list。返回所有 `status='DELIVERED'` 的 batch 汇总
-> （历史文档误写为 REPAIRING，2026-10-01 订正：REPAIRING 已降级为标记列）。
+> P3 list。返回所有 `status='DELIVERED'` 的 batch 汇总（判据 `status='DELIVERED'`；REPAIRING 已降级为 `is_repairing` 标记列）。
 
 Query：`worker_id?` / `process_id?` / `limit?` / `offset?`。
 
