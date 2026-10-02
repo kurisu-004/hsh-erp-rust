@@ -24,7 +24,8 @@
 ## 业务模型
 
 工种是 worker-pool 域的核心枢纽：定义「一类工人可执行哪些工序 + 最多可同时持有几个批次」。
-`t_work_type_process` 是无业务软删的 mapping 表（worker-pool / worker-scan 校验依赖），
+`t_work_type_process` 是工种 ↔ 工序的 mapping 表（worker-pool / worker-scan 校验依赖），
+走「整组替换」语义（软删旧行 + 插新行），读路径只返回 active 行；
 `Process` 与 `Worker` 业务上挂到工种下：
 
 - `code`：业务唯一键（`uk_t_work_type_code`，活跃行唯一）。**不可变** —— update 接口
@@ -176,5 +177,5 @@ Response 200 `data`：`null`
 1. `max_held_batches` 撞 DB 唯一约束（如有）由 service 捕获 23505 兜底；
    当前阶段无 unique constraint，仅在 service 层校验 `≥1`。
 2. 软删引用计数（`count_work_type_references`）单条 `UNION ALL` 查
-   `t_worker.work_type_id`（活跃行）+ `t_work_type_process.work_type_id`（mapping 表
-   无业务软删，不筛 `deleted_at`）；任一分支 > 0 ⇒ 20903 拒。**该 SQL 在 work_types 域的 soft-delete 端点执行**；mapping 端的整组替换语义见 [`./work-type-process-mapping.md`](./work-type-process-mapping.md)。
+   `t_worker.work_type_id`（活跃行）+ `t_work_type_process.work_type_id`（junction 分支
+   **不过滤** `deleted_at`：引用计数要算历史，否则用户把映射清空到空后该工种再也删不掉（整组替换后 items 非空必有 active 行可计数，照样拒））；任一分支 > 0 ⇒ 20903 拒。**该 SQL 在 work_types 域的 soft-delete 端点执行**；mapping 端的整组替换语义见 [`./work-type-process-mapping.md`](./work-type-process-mapping.md)。

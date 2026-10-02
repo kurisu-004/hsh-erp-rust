@@ -179,15 +179,21 @@ Response 200 `data`：`null`
 
 ## 软删引用查询（best-effort）
 
-`ProcessRepo::count_process_references` 单条 SQL 加法累加以下 5 张表的非软删计数：
+`ProcessRepo::count_process_references` 单条 SQL 加法累加以下 5 张表的行数：
 
 | 引用表 | 用途 | 是否筛 deleted_at |
 |---|---|---|
-| `t_work_type_process` | 工种可执行工序白名单 | 否（mapping 表无业务软删） |
-| `t_outsource_company_process` | 外协公司能力清单 | 否（mapping 表无业务软删） |
-| `t_shelf_process` | 货架支持的工序 | 否（mapping 表无业务软删） |
+| `t_work_type_process` | 工种可执行工序白名单 | 否（junction 计数要算历史，见下） |
+| `t_outsource_company_process` | 外协公司能力清单 | 否（junction 计数要算历史） |
+| `t_shelf_process` | 货架支持的工序 | 否（junction 计数要算历史） |
 | `t_part` (`next_process_id`) | 工单下一工序（rollup 派生缓存） | **是**（part 表带软删） |
 | `t_process_chain_step` (`process_id`) | 工艺链步骤所属工序 | **是**（step 表带软删） |
+
+3 张 junction 表的子查询不过滤 `deleted_at`：它们按整组替换语义写入（整组替换 = 软删旧行
++ 插新行），引用计数若只算 active 行，用户清空一次映射就能绕过 20803 把仍在历史映射里的
+工序软删掉。本函数只产出 20803；工种侧同规则的计数与 20903 见
+[`./work-types.md`](./work-types.md) 与
+[`./work-type-process-mapping.md`](./work-type-process-mapping.md)。
 
 任一总数 > 0 ⇒ 20803 `BIZ_PROCESS_IN_USE`。5 张表都已迁移到位，
 无 junction repo 缺口；后续如需按 junction 拆分 repo，可保留 best-effort 注释。

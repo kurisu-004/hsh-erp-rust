@@ -333,7 +333,8 @@ impl WorkerRepo {
 
     /// 列出可执行该 process 的所有 active worker（含其所属 work_type）。
     /// SQL：t_worker JOIN t_work_type JOIN t_work_type_process，过滤
-    /// `is_active = TRUE AND deleted_at IS NULL`。
+    /// `is_active = TRUE AND deleted_at IS NULL`（三张表各筛一次，2026-10-02 起
+    /// 映射表 `wtp.deleted_at IS NULL` 也在其中 —— 整组替换会软删旧映射行）。
     ///
     /// 返回元组：(worker_id, worker_name, work_type_id, work_type_code)。
     /// 同一 worker 若所属工种映射该 process 出现一次（t_worker.work_type_id 单值）。
@@ -354,7 +355,7 @@ impl WorkerRepo {
                JOIN t_work_type_process wtp ON wtp.work_type_id = wt.id
                WHERE wtp.process_id = $1
                  AND w.is_active = TRUE AND w.deleted_at IS NULL
-                 AND wt.deleted_at IS NULL
+                 AND wt.deleted_at IS NULL AND wtp.deleted_at IS NULL
                ORDER BY wt.sort_order ASC, w.id ASC"#,
         )
         .bind(process_id)

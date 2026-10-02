@@ -286,6 +286,11 @@ impl ProcessRepo {
     /// `t_shelf_process` + `t_part.next_process_id` + `t_process_chain_step` 5 张表
     /// 的引用计数总和。
     ///
+    /// 前 3 张 junction 表的 sub-select **不过滤** `deleted_at`：它们按整组替换语义
+    /// 写入（整组替换 = 软删旧行 + 插新行），引用计数若只算 active 行，用户清空一次
+    /// 映射就能绕过 20803 把仍在历史映射里的工序软删掉。`t_part` /
+    /// `t_process_chain_step` 两张实体表则带 `deleted_at IS NULL`。
+    ///
     /// 2026-09-17 PR-4 守卫修复：补 `t_process_chain_step.process_id`（PR-1 工艺链
     /// FK 翻转 + PR-3 批次 step 化后，part → chain → step 是新的工艺引用通道；
     /// 之前缺这条会漏掉「工艺链 step 仍引用此 process」场景，软删后 step 的
