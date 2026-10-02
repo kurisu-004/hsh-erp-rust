@@ -31,15 +31,17 @@ use serde_json::json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::service::{
-    BATCH_TO_INSPECTION_MAX_ITEMS, BATCH_TO_SHIP_MAX_ITEMS, PartService,
-};
-use crate::modules::part::vo::{
-    BatchToXxxOut, InspectionBatchListOut, PartOut, ToXxxOut, WorkerScanOut,
-};
+use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
     BatchToInspectionRequest, BatchToShipRequest, InspectionBatchListQuery, ScanDeliverPartRequest,
     ScanInspectRequest, ToInspectionRequest, ToProcessRequest, ToShipRequest, WorkerScanRequest,
+};
+use crate::modules::prod::batch::service::BatchService;
+use crate::modules::prod::batch::service::transition::{
+    BATCH_TO_INSPECTION_MAX_ITEMS, BATCH_TO_SHIP_MAX_ITEMS,
+};
+use crate::modules::prod::batch::vo::{
+    BatchToXxxOut, InspectionBatchListOut, ToXxxOut, WorkerScanOut,
 };
 use crate::modules::prod::worker_pool::service::WorkerPoolService;
 use crate::shared::error::AppError;
@@ -101,7 +103,7 @@ pub async fn to_ship(
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
     current.require_any_role(TO_XXX_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::to_ship(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+    let out = BatchService::to_ship(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     if let Some(aid) = out.synced_assembly_id {
         ws_broadcast_assembly_updated(&state, aid);
@@ -139,7 +141,7 @@ pub async fn batch_to_ship(
         )));
     }
     let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_to_ship(&mut *tx, &state.snowflake, req, &current).await?;
+    let out = BatchService::batch_to_ship(&mut *tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     let mut seen_assemblies = std::collections::HashSet::new();
     for item in &out.submitted {
@@ -178,7 +180,7 @@ pub async fn to_inspection(
     current.require_any_role(TO_XXX_ROLES)?;
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::to_inspection(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+        BatchService::to_inspection(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     if let Some(aid) = out.synced_assembly_id {
         ws_broadcast_assembly_updated(&state, aid);
@@ -205,7 +207,7 @@ pub async fn to_process(
 ) -> Result<Json<R<ToXxxOut>>, AppError> {
     current.require_any_role(TO_XXX_ROLES)?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::to_process(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+    let out = BatchService::to_process(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     if let Some(aid) = out.synced_assembly_id {
         ws_broadcast_assembly_updated(&state, aid);
@@ -227,7 +229,7 @@ pub async fn scan_inspect(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::scan_inspect(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+        BatchService::scan_inspect(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     let kind = if out.status == "READY_TO_SHIP" {
         "PART_SCAN_INSPECT_PASSED"
@@ -250,7 +252,7 @@ pub async fn scan_deliver_part(
     Json(req): Json<ScanDeliverPartRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::scan_deliver_part(&mut *tx, &state.snowflake, req, &current).await?;
+    let out = BatchService::scan_deliver_part(&mut *tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "PART_DELIVERED".into(),
@@ -311,7 +313,7 @@ pub async fn worker_scan(
     let mut tx = state.pool.begin().await?;
     // scan（状态翻转 + 写事件日志）
     let scan_out =
-        PartService::worker_scan_event(&mut *tx, &state.snowflake, req.clone(), &current).await?;
+        BatchService::worker_scan_event(&mut *tx, &state.snowflake, req.clone(), &current).await?;
     // refill（同事务；WorkerPoolService::refill_for_worker_with_work_type 内部
     // 对 work_type / process 映射校验失败会抛业务错——事务自动回滚 scan 写入，保持原子语义）。
     // 复用 worker_scan_event 已经 fetch 过的 work_type_id + badge_code，
@@ -359,7 +361,7 @@ pub async fn worker_scan(
 
 /// `GET /api/v2/prod/batches/inspection`
 ///
-/// INSPECTION 状态批次列表（Manager + Clerk + Inspector）。只读端点：
+/// INSPECTION 状态批次列表（Manager + Inspector）。只读端点：
 /// `pool.acquire()` 不开事务。
 pub async fn list_inspection_batches(
     State(state): State<Arc<AppState>>,
@@ -367,13 +369,13 @@ pub async fn list_inspection_batches(
     Query(query): Query<InspectionBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_inspection_batches(&mut *conn, &query, &current).await?;
+    let out = BatchService::list_inspection_batches(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `GET /api/v2/prod/batches/repair`
 ///
-/// DELIVERED 批次列表（Manager + Clerk + Inspector）。只读端点：
+/// DELIVERED 批次列表（Manager + Inspector）。只读端点：
 /// `pool.acquire()` 不开事务。
 pub async fn list_repair_batches(
     State(state): State<Arc<AppState>>,
@@ -381,14 +383,14 @@ pub async fn list_repair_batches(
     Query(query): Query<InspectionBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_repair_batches(&mut *conn, &query, &current).await?;
+    let out = BatchService::list_repair_batches(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
 /// `GET /api/v2/prod/batches/repairing`
 ///
-/// 返修中批次列表（`t_part_batch.is_repairing = true`，Manager + Clerk +
-/// Inspector）。判据是 `is_repairing = true`（REPAIRING 降级为标记列，不是状态）。
+/// 返修中批次列表（`t_part_batch.is_repairing = true`，Manager + Inspector）。
+/// 判据是 `is_repairing = true`（REPAIRING 降级为标记列，不是状态）。
 /// 只读端点：`pool.acquire()` 不开事务。
 pub async fn list_repairing_batches(
     State(state): State<Arc<AppState>>,
@@ -396,7 +398,7 @@ pub async fn list_repairing_batches(
     Query(query): Query<InspectionBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_repairing_batches(&mut *conn, &query, &current).await?;
+    let out = BatchService::list_repairing_batches(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -427,7 +429,7 @@ pub async fn batch_to_inspection(
         )));
     }
     let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_to_inspection(&mut *tx, &state.snowflake, req, &current).await?;
+    let out = BatchService::batch_to_inspection(&mut *tx, &state.snowflake, req, &current).await?;
     tx.commit().await?;
     let mut seen_assemblies = std::collections::HashSet::new();
     for item in &out.submitted {

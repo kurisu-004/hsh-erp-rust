@@ -1,26 +1,27 @@
-//! Phase 1 / 1.7 扫码检 / 司机扫码
+//! prod::batch 的两条扫码快捷入口
 //!
-//! 方法：`scan_inspect` / `scan_deliver_part`。
-//!
-//! 2026-09-22 D-6：从原 `phase1.rs` 按业务动作拆出。共享 helper 在 `phase1/mod.rs` 同 crate 内可见。
+//! - `POST /api/v2/prod/batches/{batch_id}/scan-inspect` —— 一步式
+//!   `{PENDING, PROGRAMMING, IN_PROCESS}` → INSPECTION → READY_TO_SHIP（pass=true）
+//!   或 `IN_PROCESS + is_repairing=true`（pass=false，批次停在送检架等
+//!   `complete-repair` 落回生产架）
+//! - `POST /api/v2/prod/batches/scan/deliver` —— 司机扫码发货，`serial_no` 反查批次
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::prod::batch::dto::{ScanDeliverPartRequest, ScanInspectRequest};
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::PartService;
-use crate::modules::prod::batch::dto::{ScanDeliverPartRequest, ScanInspectRequest};
-
-use super::{
+use super::BatchService;
+use super::guard::{
     mark_batch_status_only, mark_batch_with_status_and_meta, validate_batch_version,
     validate_shelf_zone,
 };
 
-impl PartService {
+impl BatchService {
     // ===== 1.7 扫码检 / 司机扫码 =====
 
     /// `POST /prod/batches/{batch_id}/scan-inspect`：扫码快捷品检（一步式）。
@@ -177,7 +178,7 @@ impl PartService {
         Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
-    /// `POST /parts/scan/deliver-part`：司机扫码发货。
+    /// `POST /prod/batches/scan/deliver`：司机扫码发货。
     /// `part_serial_no` 反查 part_id；`worker_badge_code` 校验必须是「送货司机」工种。
     /// 状态机：`READY_TO_SHIP` → `DELIVERED`（复用 `deliver` 流程的核心）。
     pub async fn scan_deliver_part<R: PartRepoTrait>(

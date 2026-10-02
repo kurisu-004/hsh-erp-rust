@@ -59,18 +59,17 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/dispatch", post(dispatch::dispatch))
         // auto-dispatch 改为只读查询
         .route("/auto-dispatch", post(dispatch::auto_dispatch))
-        // ---- 迁入：静态批量流转（原 /api/v2/parts/batch-to-*）----
+        // ---- 静态批量流转（2 条，无 Path extractor）----
         .route("/to-ship", post(transition::batch_to_ship))
         .route("/to-inspection", post(transition::batch_to_inspection))
-        // ---- 迁入：工人扫码台主入口（原 /api/v2/parts/worker-scan）----
+        // ---- 工人扫码台主入口（无 Path extractor，主键 serial_no）----
         .route("/worker-scan", post(transition::worker_scan))
-        // ---- 迁入：集合读（原 /api/v2/parts/{inspection,repair,repairing}-batches）----
+        // ---- 集合读 3 条（只读端点，pool.acquire() 不开事务）----
         .route("/inspection", get(transition::list_inspection_batches))
         .route("/repair", get(transition::list_repair_batches))
         .route("/repairing", get(transition::list_repairing_batches))
         // ====================================================================
-        // ② 2 段、首段静态（无 Path）—— `scan/deliver` 原
-        //    `/api/v2/parts/scan/deliver-part`
+        // ② 2 段、首段静态（无 Path）—— `scan/deliver`：`serial_no` 反查批次
         // ====================================================================
         .route("/scan/deliver", post(transition::scan_deliver_part))
         // ====================================================================

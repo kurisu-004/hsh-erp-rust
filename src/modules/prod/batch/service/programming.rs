@@ -1,32 +1,25 @@
-//! Phase 1 / 1.2 CNC 编程流转
+//! prod::batch 的 CNC 编程出口：`POST /api/v2/prod/batches/{batch_id}/release-from-programming`
 //!
-//! 方法：`release_from_programming`。
-//!
-//! 2026-09-29 端点下线：`send_to_programming` 与 `recall_to_programming`
-//! 整体删除（PROGRAMMING 状态废弃进入路径，仅保留 4 条出口供历史数据消化）。
-//! 编程员现在通过工艺链 + CNC step 直接进入生产流；待编程一览由
-//! `t_process.is_cnc` 列驱动。
-//!
-//! 2026-09-22 D-6：从原 `phase1.rs` 按业务动作拆出。共享 helper 在
-//! `phase1/mod.rs` 同 crate 内可见。
+//! PROGRAMMING 状态的**唯一出口**。进入路径（`send-to-programming` /
+//! `recall-to-programming`）已下线：编程员通过工艺链 + CNC step（`t_process.is_cnc`）
+//! 直接进入生产流，本状态只留出口供历史数据消化。
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
+use crate::modules::prod::batch::dto::PlaceOnShelfRequest;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::PartService;
-use crate::modules::prod::batch::dto::PlaceOnShelfRequest;
-
-use super::{
+use super::BatchService;
+use super::guard::{
     assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
     require_process_chain, validate_batch_version, validate_shelf_zone,
 };
 
-impl PartService {
+impl BatchService {
     /// `POST /prod/batches/{batch_id}/release-from-programming`：PROGRAMMING → IN_PROCESS（PRODUCTION_SHELF）。
     ///
     /// 2026-09-16 PR-3 批次 step 化：chain 必须性守卫 + req.next_process_id

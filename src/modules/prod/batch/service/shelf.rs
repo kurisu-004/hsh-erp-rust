@@ -1,0 +1,187 @@
+//! prod::batch 的上架 / 召回
+//!
+//! - `POST /api/v2/prod/batches/{batch_id}/place-on-shelf` —— `PENDING` →
+//!   `IN_PROCESS` + `location='PRODUCTION_SHELF'`
+//! - `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` —— `IN_PROCESS` →
+//!   `PENDING`（撤回上架）
+
+use crate::auth::rbac::{CurrentUser, Role};
+use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::part::model::NewPartEvent;
+use crate::modules::part::repo::PartRepoTrait;
+use crate::modules::part::statemachine::PartStatus;
+use crate::modules::prod::batch::dto::{PlaceOnShelfRequest, RecallToPendingRequest};
+use crate::modules::prod::process_chain::repo::ProcessChainRepo;
+use crate::shared::error::{AppError, code};
+
+use super::BatchService;
+use super::guard::{
+    assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
+    require_process_chain, validate_batch_version, validate_shelf_zone,
+};
+
+impl BatchService {
+    /// `POST /prod/batches/{batch_id}/place-on-shelf`：PENDING → IN_PROCESS（PRODUCTION_SHELF）。
+    ///
+    /// 2026-09-16 PR-3 批次 step 化：
+    /// - 入口新增 process_chain 必须性守卫（`BIZ_PROCESS_CHAIN_REQUIRED`）
+    /// - `req.next_process_id` 经 `ProcessChainRepo::resolve_step_id_by_process`
+    ///   解析为 step_id 写入 `t_part_batch.current_process_step_id`
+    pub async fn place_on_shelf<R: PartRepoTrait>(
+        mut repo: R,
+        snowflake: &SnowflakeIdGenerator,
+        batch_id: i64,
+        req: PlaceOnShelfRequest,
+        current: &CurrentUser,
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
+        let part = repo
+            .get_part_inspected(part_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
+        let from = PartStatus::from_str(&batch.status)
+            .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
+        ensure_transition(from, PartStatus::IN_PROCESS, "place-on-shelf")?;
+        // PR-3：part 必须已绑定工艺链
+        let chain_id = require_process_chain(repo.conn_mut(), part_id).await?;
+        // shelf 校验
+        validate_shelf_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION").await?;
+        // shelf ↔ process 映射
+        assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, req.next_process_id).await?;
+        // PR-3：解析 step_id（chain 内 process_id → step_id）
+        let step_id = ProcessChainRepo::resolve_step_id_by_process(
+            repo.conn_mut(),
+            chain_id,
+            req.next_process_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                format!(
+                    "chain {} 内找不到 process_id={} 的活跃 step",
+                    chain_id, req.next_process_id
+                ),
+            )
+        })?;
+        // 翻状态
+        // 2026-09-30：进池 → current_process_id 写目标工序（池归属权威依据）
+        let n = mark_batch_with_status_and_meta(
+            repo.conn_mut(),
+            batch.id,
+            req.version,
+            "IN_PROCESS",
+            Some("PRODUCTION_SHELF"),
+            Some(req.shelf_id),
+            Some(step_id),
+            Some(req.next_process_id),
+            current.id,
+        )
+        .await?;
+        if n == 0 {
+            return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
+        }
+        // 2026-10-01 review 第 1 轮 m4：原此处有一行
+        // `let _ = PartService::sync_from_batch_change(...)`。status_gate 收口后它是
+        // 无害空跑（派生已在 `mark_batch_with_status_and_meta` 内做完），且会让
+        // 下一个读代码的人以为「调它」是必须的 —— 已删。
+        // 事件日志
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "PLACED_ON_SHELF",
+            from_status: Some(from.as_str()),
+            to_status: Some("IN_PROCESS"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
+        .await?;
+        let fresh = repo
+            .get_part_inspected(part_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "place-on-shelf 后查不到"))?;
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
+    }
+
+    /// `POST /prod/batches/{batch_id}/recall-to-pending`：ON_SHELF / PROGRAMMING → PENDING。
+    pub async fn recall_to_pending<R: PartRepoTrait>(
+        mut repo: R,
+        snowflake: &SnowflakeIdGenerator,
+        batch_id: i64,
+        req: RecallToPendingRequest,
+        current: &CurrentUser,
+    ) -> Result<crate::modules::part::vo::PartOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
+        let part = repo
+            .get_part_inspected(part_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
+        let from = PartStatus::from_str(&batch.status)
+            .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
+        ensure_transition(from, PartStatus::PENDING, "recall-to-pending")?;
+        // 额外 service 守：IN_PROCESS 时必须有 location=PRODUCTION_SHELF（与 Python 一致）
+        if from == PartStatus::IN_PROCESS && batch.location.as_deref() != Some("PRODUCTION_SHELF") {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_TRANSITION,
+                "recall-to-pending: IN_PROCESS 批次必须在 PRODUCTION_SHELF 上",
+            ));
+        }
+        // 翻状态
+        // 2026-09-30：出池（转 PENDING）→ current_process_id 置 NULL，
+        // 否则 PENDING 批次会混进工序候选池
+        let n = mark_batch_with_status_and_meta(
+            repo.conn_mut(),
+            batch.id,
+            req.version,
+            "PENDING",
+            None,
+            None,
+            None,
+            None,
+            current.id,
+        )
+        .await?;
+        if n == 0 {
+            return Err(AppError::biz(code::VERSION_CONFLICT, "batch 版本冲突"));
+        }
+        repo.insert_part_event(NewPartEvent {
+            id: snowflake.next_id(),
+            part_id,
+            event_type: "RECALLED",
+            from_status: Some(from.as_str()),
+            to_status: Some("PENDING"),
+            batch_id: Some(batch.id),
+            quantity: Some(batch.quantity),
+            drawing_code: Some(&part.drawing_no),
+            badge_code: None,
+            note: req.note.as_deref(),
+            created_by: Some(current.id),
+        })
+        .await?;
+        let fresh = repo
+            .get_part_inspected(part_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "recall 后查不到"))?;
+        Ok(crate::modules::part::vo::PartOut::from(fresh))
+    }
+}

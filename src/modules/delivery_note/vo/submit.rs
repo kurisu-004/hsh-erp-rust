@@ -10,7 +10,7 @@ use super::scan::UnresolvedTargetDto;
 /// - `SUBMITTED`：全部批次已 `READY_TO_SHIP`，状态机 DRAFT → SUBMITTED 已提交；
 ///   `note` 字段返回提交后的送货单投影。
 /// - `CANDIDATES_AVAILABLE`：存在仍在 `INSPECTION` 的批次，**本次未提交**；
-///   返回这些批次供前端一键过检（转发 `POST /parts/batch-to-ship`）；
+///   返回这些批次供前端一键过检（转发 `POST /prod/batches/to-ship`）；
 ///   `note` 为 `null`（未提交，无新状态可返回）。
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

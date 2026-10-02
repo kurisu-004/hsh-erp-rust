@@ -34,13 +34,13 @@ use serde_json::json;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::service::PartService;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
     CancelBatchRequest, CompleteRepairRequest, CompleteRequest, DeliverRequest, PickUpRequest,
     PlaceOnShelfRequest, RecallToPendingRequest, ReceiveFromOutsourceToInspectionRequest,
     RepairDispatchRequest, SendToOutsourceRequest, SplitBatchRequest, StartRepairRequest,
 };
+use crate::modules::prod::batch::service::BatchService;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
@@ -65,7 +65,7 @@ pub async fn deliver(
 ) -> Result<Json<R<PartOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Clerk])?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::deliver(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+    let out = BatchService::deliver(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -86,7 +86,7 @@ pub async fn complete(
 ) -> Result<Json<R<PartOut>>, AppError> {
     current.require_any_role(&[Role::Manager, Role::Clerk])?;
     let mut tx = state.pool.begin().await?;
-    let out = PartService::complete(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+    let out = BatchService::complete(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -110,7 +110,7 @@ pub async fn start_repair(
     current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::start_repair(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+        BatchService::start_repair(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -129,7 +129,7 @@ pub async fn place_on_shelf(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::place_on_shelf(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+        BatchService::place_on_shelf(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -147,8 +147,8 @@ pub async fn recall_to_pending(
     Json(req): Json<RecallToPendingRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::recall_to_pending(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+    let out = BatchService::recall_to_pending(&mut *tx, &state.snowflake, batch_id, req, &current)
+        .await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -167,7 +167,7 @@ pub async fn release_from_programming(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::release_from_programming(&mut *tx, &state.snowflake, batch_id, req, &current)
+        BatchService::release_from_programming(&mut *tx, &state.snowflake, batch_id, req, &current)
             .await?;
     tx.commit().await?;
     ws_broadcast(
@@ -186,8 +186,8 @@ pub async fn send_to_outsource(
     Json(req): Json<SendToOutsourceRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::send_to_outsource(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+    let out = BatchService::send_to_outsource(&mut *tx, &state.snowflake, batch_id, req, &current)
+        .await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -206,7 +206,7 @@ pub async fn receive_from_outsource(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::receive_from_outsource(&mut *tx, &state.snowflake, batch_id, req, &current)
+        BatchService::receive_from_outsource(&mut *tx, &state.snowflake, batch_id, req, &current)
             .await?;
     tx.commit().await?;
     ws_broadcast(
@@ -225,7 +225,7 @@ pub async fn receive_from_outsource_to_inspection(
     Json(req): Json<ReceiveFromOutsourceToInspectionRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let out = PartService::receive_from_outsource_to_inspection(
+    let out = BatchService::receive_from_outsource_to_inspection(
         &mut *tx,
         &state.snowflake,
         batch_id,
@@ -255,7 +255,7 @@ pub async fn complete_repair(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::complete_repair(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+        BatchService::complete_repair(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -277,7 +277,7 @@ pub async fn repair_dispatch(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::repair_dispatch(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+        BatchService::repair_dispatch(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -296,7 +296,7 @@ pub async fn split_batch(
 ) -> Result<Json<R<i64>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let (new_batch_id, part_id) =
-        PartService::split_batch(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+        BatchService::split_batch(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -318,7 +318,7 @@ pub async fn cancel_batch(
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
     let out =
-        PartService::cancel_batch(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+        BatchService::cancel_batch(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,
@@ -347,7 +347,7 @@ pub async fn pick_up(
     // （在 `req` 被 service 消费前先取出）。消费方只读 `kind`，payload 修正
     // 对现有前端无影响。
     let worker_id = req.worker_id;
-    let out = PartService::pick_up(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
+    let out = BatchService::pick_up(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
     ws_broadcast(
         &state,

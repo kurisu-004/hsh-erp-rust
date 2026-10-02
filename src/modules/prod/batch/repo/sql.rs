@@ -57,6 +57,13 @@ impl PartBatchRepo {
     ///
     /// 2026-10-02：`Some` 分支删 `AND part_id = $2`。调用方是 `to_ship_core`，其
     /// `part_id` 由同一批次行反查得到 ⇒ 该谓词恒真，属冗余断言（批次 id 全局唯一）。
+    ///
+    /// ## 形参使用范围
+    /// - `expected_batch_id = Some(_)`：`part_id` **不使用**（SQL 只绑 `$1 = id`）；
+    ///   本方法只回 `Ok(None)` 或真 DB 错，不会回 `RowNotFound`。
+    /// - `expected_batch_id = None`：`part_id` 用于 COUNT + SELECT 的多候选消歧，
+    ///   `count >= 2` 时回 `RowNotFound`。prod 域唯一调用方是
+    ///   `service::scan` 的「当前 INSPECTION 批次」查询。
     pub async fn find_inprocess_batch_for_part(
         conn: &mut PgConnection,
         part_id: i64,
@@ -127,6 +134,11 @@ impl PartBatchRepo {
     ///
     /// 2026-10-02：`Some` 分支删 `AND part_id = $2`（调用方 `to_inspection_core`
     /// 的 `part_id` 由同一批次行反查 ⇒ 恒真）。
+    ///
+    /// ## 形参使用范围
+    /// - `expected_batch_id = Some(_)`：`part_id` **不使用**（SQL 只绑 `$1 = id`），
+    ///   本方法只回 `Ok(None)` 或真 DB 错，不会回 `RowNotFound`。`batch_id` 是必填
+    ///   路径参数，prod 域无 `None` 分支调用方。
     pub async fn find_scan_target_batch(
         conn: &mut PgConnection,
         part_id: i64,
@@ -350,7 +362,7 @@ impl PartBatchRepo {
     /// `chain_id + next_process_id` **重新解析** step_id 写入
     /// （`inspection_core.rs::to_process`），所以上下文不会真的丢。
     ///
-    /// 现在保留 step 的实际价值：它是 `GET /parts/inspection-batches` 的
+    /// 现在保留 step 的实际价值：它是 `GET /prod/batches/inspection` 的
     /// `next_process_id` / `next_process_name` 的**唯一数据来源**（step JOIN 派生），
     /// 供送检期间前端显示批次**首次定位**在工艺链的哪一步。属**显示用信息**，
     /// 不是状态机依赖。
@@ -386,7 +398,7 @@ impl PartBatchRepo {
                 // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
                 // 「保持原值」；送检刻意**保留** `current_process_step_id`
                 //（INSPECTION 期间要显示批次走到工艺链第几步，见
-                //  `part/vo/inspection.rs`），故 step 的 clear 为 false。
+                //  `prod/batch/vo.rs`），故 step 的 clear 为 false。
                 clear_location: false,
                 clear_holder_id: false,
                 clear_process_step_id: false,
@@ -416,7 +428,7 @@ impl PartBatchRepo {
     /// 之所以仍写 `None`（保持）而不是 `Some(false)`：若将来新增 caller 忘了那条
     /// 守卫，`Some(false)` 会**静默**把返修件挪出返修流（正是 MAJOR-3 的失败类别），
     /// 而 `None` 会让同一个洞以「标记与状态矛盾」的形式暴露在
-    /// `GET /parts/repairing-batches` 上，更容易被发现。
+    /// `GET /prod/batches/repairing` 上，更容易被发现。
     pub async fn mark_batch_failed_inspection(
         conn: &mut PgConnection,
         batch_id: i64,

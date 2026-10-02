@@ -1,9 +1,13 @@
-//! part 域 inspection 流的三个共享核心（`to_ship_core` / `to_process_core` /
-//! `to_inspection_core`）。
+//! prod::batch 的 to-XXX 三个共享核心：`to_ship_core` / `to_process_core` /
+//! `to_inspection_core`。
 //!
-//! 从 `inspection.rs` 拆出，原因是该文件触及 1000 行上限（见 docs/conventions.md）。
-//! 三个 core 与 `inspection.rs` 里的薄 wrapper / 批量聚合器同属 `impl PartService`，
-//! 分文件不改变可见性与调用方式（与 `worker_scan.rs` 同一模式）。
+//! 与 `transition.rs` 的薄 wrapper / 批量聚合器同属 `impl BatchService`，分文件
+//! 只为满足 docs/conventions.md 的单文件行数上限。
+//!
+//! ## 签名约定
+//! `<R: PartRepoTrait>(repo: &mut R, ...)`：事务边界由 caller（handler / 批量
+//! 聚合器）保证；本方法只跑业务校验 + repo 调用 + 状态机守卫。生产
+//! `R = &mut PgConnection`，跨域 repo 与 inline sqlx 走 `repo.conn_mut()`。
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
@@ -11,14 +15,15 @@ use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::part::vo::{PartOut, ToXxxOut};
+use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::model::TPartBatch;
+use crate::modules::prod::batch::vo::ToXxxOut;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
-use super::PartService;
+use super::BatchService;
 
-impl PartService {
+impl BatchService {
     /// to_ship 共享核心（被单件 / batch 端点共用）。
     ///
     /// 事务边界由 caller（handler / batch aggregator）保证；本方法只跑
@@ -74,8 +79,14 @@ impl PartService {
             ));
         }
 
-        // 3. 校验锚定批次处于 INSPECTION 状态（2026-10-02：`batch_id` 路径参数
-        //    必填，SQL 里的 `AND part_id = $2` 恒真已删；状态不符即 20109）
+        // 3. 校验锚定批次处于 INSPECTION 状态。
+        //
+        //    2026-10-02：`batch_id` 是必填路径参数，SQL 走 `Some` 分支
+        //    （`WHERE id = $1 AND status = 'INSPECTION'`，`AND part_id = $2` 恒真已删）。
+        //    该分支是 `fetch_optional` ⇒ 只回 `Ok(None)` 或真 DB 错，不会回
+        //    `RowNotFound`，故「多批次歧义」这一形态在此**不存在**（批次 id 全局
+        //    唯一即锚点）。repo 的 `None` 分支（按 part 消歧）仍被 `scan.rs` 的
+        //    「当前 INSPECTION 批次」查询使用。
         let target: TPartBatch = match repo
             .find_inprocess_batch_for_part(part_id, Some(batch_id))
             .await
@@ -85,12 +96,6 @@ impl PartService {
                 return Err(AppError::biz(
                     code::BIZ_PART_BATCH_NOT_FOUND,
                     format!("batch {batch_id} 不是 INSPECTION 状态的批次"),
-                ));
-            }
-            Err(sqlx::Error::RowNotFound) => {
-                return Err(AppError::biz(
-                    code::BIZ_PART_BATCH_NOT_FOUND,
-                    "multiple INSPECTION batches; specify batch_id".to_string(),
                 ));
             }
             Err(e) => return Err(AppError::from(e)),
@@ -107,13 +112,11 @@ impl PartService {
 
         // 5. UPDATE t_part_batch: INSPECTION → READY_TO_SHIP（OCC + 写 updated_by）
         //
-        // 2026-10-01：写与派生已焊在 `status_gate` 一个函数里（见
-        // `service/status_gate.rs`，NIT-1 订正：注释原写成 `repo/status_gate.rs`，
-        // 该文件在 REPAIRING 标记列化那轮已从 `part/repo/` 移到 `part/service/`），
-        // 故这里拿到的 `rollup` **就是** batch → part →
-        // assembly 的最终结果：0 行由 gate 直接抛 40901 `VERSION_CONFLICT`
-        // （原先 `if n == 0` 那层判断已是死代码 —— 包装函数恒返回 1）；
-        // `rollup.sync` 供下方第 7 步填 `synced_assembly_id`。
+        // 2026-10-01：写与派生已焊在 `crate::modules::prod::batch::status_gate` 的
+        // `apply_batch_status_change` 一个函数里，故这里拿到的 `rollup` **就是**
+        // batch → part → assembly 的最终结果：0 行由 gate 直接抛 40901
+        // `VERSION_CONFLICT`（包装函数恒返回 1，caller 不需要、也不应该自己判断
+        // 影响行数）；`rollup.sync` 供下方第 7 步填 `synced_assembly_id`。
         let rollup = repo
             .mark_batch_passed_inspection(operated_id, operated_version, Some(current.id))
             .await?;
@@ -243,11 +246,12 @@ impl PartService {
         // - to-process = 「检验不合格，回**正常生产流**继续做」；
         // - complete-repair = 「返修完成 / 到位」，是**唯一**被授权清 `is_repairing`
         //   的动作（`mark_batch_with_status_and_meta` 的 `is_repairing: Some(false)`
-        //   漏斗，见 `phase1/mod.rs` 的「本漏斗 = 批次离开返修态的清零点」）。
+        //   漏斗，见 `service::guard::mark_batch_with_status_and_meta` 的
+        //   「本漏斗 = 批次离开返修态的清零点」）。
         //
         // 若放行，`mark_batch_failed_inspection`（`is_repairing: None` = 保持）会把
         // 批次落到生产架却仍挂着 `is_repairing = true`：它在
-        // `GET /parts/repairing-batches` 里**长期显示「返修中」**（实际是普通在制品），
+        // `GET /prod/batches/repairing` 里**长期显示「返修中」**（实际是普通在制品），
         // `complete-repair` 还会继续接受它 → 用户可把在制品当「完成返修」搬走。
         // 这是**标记列化新引入**的洞：改造前返修批次 `status='REPAIRING'`，而
         // `allowed_from = ["INSPECTION"]` 根本不让它进入本端点。
@@ -447,7 +451,7 @@ impl PartService {
             ));
         }
         // 5. 定位目标批次（先于 IN_PROCESS 组合校验，以便直接读 target_batch.location）
-        let target = Self::_resolve_scan_target_batch(repo, part_id, Some(batch_id)).await?;
+        let target = Self::_resolve_scan_target_batch(repo, part_id, batch_id).await?;
         // 5.5 caller 侧乐观锁：锚定 batch 而非 part
         Self::_assert_batch_version(&target, expected_batch_version)?;
         // 4（PR-2 重排后）IN_PROCESS 组合校验：工人持有件 / 非生产架件拒绝

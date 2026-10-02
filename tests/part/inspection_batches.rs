@@ -1,4 +1,4 @@
-//! part 域集成测试 —— `GET /parts/inspection-batches` 端点
+//! part 域集成测试 —— `GET /prod/batches/inspection` 端点
 //!
 //! 覆盖：
 //!   1. happy path：list 仅返回 INSPECTION 批次，返回的 `batch_id + version`
@@ -193,7 +193,7 @@ async fn insert_part_with_step_located_insp_batch(
 /// 步骤：
 ///   1. 插 part A + INSPECTION 批次（qty=5，holder=INSPECTION 货架）
 ///   2. 插 part B + IN_PROCESS 批次（qty=3）—— 必须不出现在 list 中
-///   3. GET /parts/inspection-batches?limit=10（INSPECTOR token）
+///   3. GET /prod/batches/inspection?limit=10（INSPECTOR token）
 ///   4. 断言：
 ///      - status 200
 ///      - data.total >= 1
@@ -355,7 +355,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
 ///   1. 2 个 L1 客户 L1_a / L1_b（互不关联）
 ///   2. 每个 L1 下挂 1 个 part，名字不同（带唯一关键字）
 ///   3. 每个 part 都有 INSPECTION 批次
-///   4. GET /parts/inspection-batches?customer_id=L1_a&keyword=<L1_a part name>
+///   4. GET /prod/batches/inspection?customer_id=L1_a&keyword=<L1_a part name>
 ///      → items 仅含 L1_a 的 batch（L1_b 的被过滤）
 ///
 /// **keyword 字符约束**：service 层拒绝 `%` / `_` / `\\` 通配符特殊字符
@@ -497,7 +497,7 @@ async fn inspection_batches_role_guard_rejects_worker() {
 ///
 /// 步骤：
 ///   1. 3 个 L1 客户各下 1 个 part，每个 part 有 INSPECTION 批次（≥3 条活跃批次）
-///   2. GET /parts/inspection-batches?limit=2&offset=1
+///   2. GET /prod/batches/inspection?limit=2&offset=1
 ///   3. 断言：items.len() == 2；total >= 3；limit == 2；offset == 1
 ///
 /// **L1 prefix 约束**：`t_customer.serial_prefix` 是 `varchar(1)` +

@@ -5,13 +5,13 @@
 //! - 间隔 `AUTO_COMPLETE_INTERVAL_HOURS`（默认 24h）
 //! - 扫描 DELIVERED 且对应 `t_part_event` 中 `event_type='DELIVERED'` 事件的
 //!   `created_at < now() - interval 'AUTO_COMPLETE_THRESHOLD_DAYS days'` 的批次，
-//!   逐个调用 `PartService::complete`（DELIVERED → COMPLETED）。
+//!   逐个调用 `BatchService::complete`（DELIVERED → COMPLETED）。
 //! - 收到 `CancellationToken` 时优雅退出
 //!
 //! Phase 0 实现要点：
 //! - 单事务包住「扫描 + 逐个 complete」：commit 后再广播 WS 事件（CLAUDE.md §架构 6）。
 //! - 构造伪 `CurrentUser`（id=0, username="system"）承担后台身份——
-//   `PartService::complete` 要求 MANAGER/CLERK 角色；后续接 RBAC 时再升级。
+//   `BatchService::complete` 要求 MANAGER/CLERK 角色；后续接 RBAC 时再升级。
 //! - 单批失败 log 继续（与 Python `_run_once` 一致），不影响后续批次。
 //!
 //! 2026-09-16 PR-3 批次 step 化（migration 028）：阈值口径由
@@ -33,10 +33,10 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::clock::now_naive;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::service::PartService;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::CompleteRequest;
 use crate::modules::prod::batch::repo::PartBatchRepo;
+use crate::modules::prod::batch::service::BatchService;
 use crate::shared::error::AppError;
 use crate::state::AppState;
 
@@ -71,14 +71,14 @@ pub async fn run(state: Arc<AppState>, token: CancellationToken) {
 /// 2. 开事务；
 /// 3. `PartBatchRepo::find_delivered_older_than(&mut *tx, threshold)` 拿候选
 ///    `(batch_id, part_id, version)`；
-/// 4. 对每行调 `PartService::complete`（用伪 system CurrentUser）；
+/// 4. 对每行调 `BatchService::complete`（用伪 system CurrentUser）；
 /// 5. commit；
 /// 6. commit 成功后批量 `ws_hub.broadcast` 每行的 PART_COMPLETED 事件。
 ///
 /// 单批失败 log 继续；commit 包含所有已成功的批（失败批不影响事务，因
-/// `PartService::complete` 内部用 OCC + status guard，失败会直接返回 Err）。
+/// `BatchService::complete` 内部用 OCC + status guard，失败会直接返回 Err）。
 ///
-/// 注意：`PartService::complete` 在第 4 步可能 throw `VERSION_CONFLICT`
+/// 注意：`BatchService::complete` 在第 4 步可能 throw `VERSION_CONFLICT`
 /// （行被并发改了）或 `BIZ_PART_NOT_DELIVERED`（状态已变）。两都视为「跳过」
 /// 即可，不影响后续批次。
 pub async fn run_once(state: &Arc<AppState>, threshold_days: u32) -> anyhow::Result<()> {
@@ -153,7 +153,8 @@ pub async fn run_once(state: &Arc<AppState>, threshold_days: u32) -> anyhow::Res
 
 /// 构造后台伪 CurrentUser：id=0 / username="system" / MANAGER 角色。
 ///
-/// `PartService::complete` 要求 `Manager` / `Clerk` 角色（lifecycle.rs:249）。
+/// `BatchService::complete` 要求 `Manager` / `Clerk` 角色（见
+/// `prod::batch::service::lifecycle` 的 `complete`）。
 /// 系统身份用 MANAGER——与 Python `service/auto_complete.py` 等价（Python
 /// 不走 service 的角色守卫，后台循环直接调 service）。
 pub(crate) fn system_current_user() -> CurrentUser {
@@ -166,7 +167,7 @@ pub(crate) fn system_current_user() -> CurrentUser {
     }
 }
 
-/// 包装 `PartService::complete`：在事务（`&mut PgConnection`）内调用。
+/// 包装 `BatchService::complete`：在事务（`&mut PgConnection`）内调用。
 ///
 /// 2026-10-02：`batch_id` 是唯一入参（complete 端点以批次为锚），part_id 由
 /// service 从批次行反查。
@@ -177,7 +178,7 @@ async fn complete_one(
     req: CompleteRequest,
     current: &CurrentUser,
 ) -> Result<PartOut, AppError> {
-    PartService::complete(conn, snowflake, batch_id, req, current).await
+    BatchService::complete(conn, snowflake, batch_id, req, current).await
 }
 
 #[cfg(test)]
@@ -185,7 +186,7 @@ mod tests {
     use super::*;
 
     /// `system_current_user` 构造合法性：id=0 / MANAGER 角色。
-    /// 关键约束：`PartService::complete` 走 `require_any_role(Manager|Clerk)`，
+    /// 关键约束：`BatchService::complete` 走 `require_any_role(Manager|Clerk)`，
     /// 系统身份必须满足其一；这里选 MANAGER（与 Python 等价的「最高权限」路径）。
     #[test]
     fn system_current_user_has_manager_role() {

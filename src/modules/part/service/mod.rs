@@ -1,42 +1,41 @@
-//! part 域业务逻辑（按业务流聚合）
+//! part 域业务逻辑（按业务流聚合，`impl PartService`）
 //!
-//! - `crud.rs`：单件 CRUD（create_part / get_part / list_parts / update_part / soft_delete_part
-//!   / upload_part_file / upload_drawing / upload_3d_model / list_inspection_batches /
-//!   get_part_batches_by_serial / list_parts）+ helpers（map_create_error /
-//!   expand_customer_id / lookup_customer_names）
+//! 2026-10-02：`t_part_batch` 的归属连同**全部以批次为对象的用例**迁往
+//! `crate::modules::prod::batch`（repo / model / status_gate / 25 条路由的服务层）。
+//! 本模块自此只承载 part 级用例。
+//!
+//! - `crud.rs`：单件 CRUD（create_part / get_part / list_parts / update_part /
+//!   soft_delete_part / upload_part_file / upload_drawing / upload_3d_model /
+//!   get_part_batches_by_serial）+ helpers（map_create_error / expand_customer_id /
+//!   lookup_customer_names）
 //! - `batch.rs`：批量创建（batch_create_parts legacy + batch_create_parts_with_bindings +
 //!   prepare_binding_head_copy + PreparedBinding），2026-09-16 M2-B + M2-C 重构
-//! - `inspection.rs`：to_ship / to_inspection / to_process 流薄 wrapper +
-//!   批量聚合器 + 共享私有辅助函数（Phase F2 / F3）
-//! - `inspection_core.rs`：to_ship / to_inspection / to_process 的 `*_core`
-//!   共享核心（impl 块拆文件，承接 inspection.rs 因 1000 行上限而拆出的逻辑）
-//! - `worker_scan.rs`：`POST /parts/worker-scan` 流（Task 8）；impl 块拆文件，
-//!   Rust 允许同一 `impl PartService { ... }` 分布在多个同 crate 文件中。
-//! - `lifecycle.rs`：deliver / cancel / complete / start_repair（终态翻转）
-//! - `phase1.rs`：Phase 1（2026-09-13）14 端点（place-on-shelf / programming /
-//!   outsource / repair / batch 操作 / 事件历史 / 位置树 / scan / match /
-//!   batch-with-pdfs / batch-update-order-info）
-//!
-//! 2026-10-02：`status_gate.rs`（batch → part → assembly 单一写入口）随
-//! `t_part_batch` 归属迁至 `crate::modules::prod::batch::status_gate`；本模块
-//! 仍经 `crate::modules::part::repo::PartRepoTrait` 调用它。
+//! - `lifecycle.rs`：part 级多批次终态（cancel / force_complete）
+//! - `phase1/events.rs`：事件历史 / 位置树 / 批量创建增强（list_events /
+//!   location_tree / batch_with_pdfs / match_by_excel_items / batch_update_order_info）
+//! - `phase1/lifecycle_helpers.rs`：待编程一览 + 批次列表（list_pending_programming /
+//!   list_batches）
+//! - `phase1/outsource.rs`：外协系列只读端点（list_outsource_in_flight /
+//!   list_outsource_sendable）
+//! - `phase1/work_type.rs`：工种维度只读端点（list_by_work_type /
+//!   list_pickable_by_work_type / list_by_worker）
 //! - `rollup.rs`：rollup 工具（sync_from_batch_change）
 //! - `list_enrichment.rs`：list_parts 派生层「位置 / 持有人」跨三表解析
 //!   helper（2026-09-22 review 第 2 轮从 crud.rs 抽出，原 1054 行超限）
+//!
+//! ## 对 prod 域的依赖（数据依赖，方向单一）
+//! `part::repo` 与本模块的 `list_enrichment` / `batch` / `crud` 经
+//! `crate::modules::prod::batch::repo::PartBatchRepo` 读写 `t_part_batch`，
+//! `rollup.rs` 经 `crate::modules::prod::batch::status_gate::rollup_part_derived`
+//! 做 batch → part 派生。`t_part_batch.status` 的写入口全仓唯一，在
+//! `crate::modules::prod::batch::status_gate`。
 
 pub mod batch;
 pub mod crud;
-pub mod inspection;
-pub mod inspection_core;
 pub mod lifecycle;
 pub mod list_enrichment;
 pub mod phase1;
 pub mod rollup;
-pub mod worker_scan;
-
-// 重导出子模块内的 `pub const`（impl 块里的方法由 `PartService` 自身承载，
-// 不需要 re-export；caller 通过 `PartService::xxx()` 直接调用）。
-pub use inspection::{BATCH_TO_INSPECTION_MAX_ITEMS, BATCH_TO_SHIP_MAX_ITEMS};
 
 /// 批量端点单次请求最大 item 数（handler/service 双层校验）。
 pub const BATCH_CREATE_PARTS_MAX_ITEMS: usize = 200;

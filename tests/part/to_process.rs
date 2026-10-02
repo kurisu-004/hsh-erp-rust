@@ -416,7 +416,7 @@ async fn insert_part_with_batch_qty(
 /// `IN_PROCESS` / `INSPECTION`，`to-process` 的 `allowed_from = ["INSPECTION"]`
 /// 拦不住它了。可达链：`start-repair` → `to-inspection`（送检**保持**标记，
 /// `mark_batch_inspected` 的 `is_repairing: None`）→ 本端点。放行的话批次会落到
-/// 生产架却仍挂「返修中」标记（`GET /parts/repairing-batches` 长期显示异常、
+/// 生产架却仍挂「返修中」标记（`GET /prod/batches/repairing` 长期显示异常、
 /// `complete-repair` 仍接受它）。
 ///
 /// 断言三件事：

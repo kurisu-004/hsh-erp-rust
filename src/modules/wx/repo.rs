@@ -121,7 +121,7 @@ impl PartList {
     ///   用户可见性等价于生产中）。本 SQL 的过滤是 `$1::text` 直传（无白名单
     ///   校验），传 `REPAIRING` 只会得到空列表而非报错。
     /// - 排序：`is_urgent DESC, planned_delivery_date ASC, id ASC`（紧急 + 交期近
-    ///   优先；与 `prod::batch::repo.rs::list_batches_with_part` 同形）。
+    ///   优先；与 `prod::batch::repo::queries::list_batches_with_part` 同形）。
     /// - JOIN：`t_customer`（取客户名）+ 层级 LEFT JOIN `t_part_batch` / `t_shelf` /
     ///   `t_worker` / `t_outsource_company` 解析当前 holder 标签。
     /// - 一次聚合（无 N+1）：对每个 part 拿「当前活跃批次」（多批次时取 batch_no ASC
@@ -129,8 +129,8 @@ impl PartList {
     ///   'CANCELLED')）；并 JOIN 解析 holder。
     ///
     /// 已知折中（与 dashboard 域 `COALESCE(s.name, w.name, oc.name)` 同形 bug，
-    /// 见 prod/batch/repo/queries.rs:1115 处说明）：holder 多态歧义时优先 shelf.name。
-    /// mini-program 不强依赖此字段精确性，仅作展示。
+    /// 见 `prod::batch::repo::queries` 模块 doc 的 holder 多态歧义一节）：holder
+    /// 多态歧义时优先 shelf.name。mini-program 不强依赖此字段精确性，仅作展示。
     #[allow(clippy::too_many_arguments)]
     pub async fn list<'e, E: PgExecutor<'e>>(
         executor: E,

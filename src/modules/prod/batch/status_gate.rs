@@ -1323,8 +1323,8 @@ mod write_guard_tests {
 
         assert!(
             violations.is_empty(),
-            "以下 {} 处直接写了 `t_part_batch.status`，绕过了 part 域唯一状态写入口 \
-             `src/modules/prod/batch/status_gate.rs`：\n{}\n\
+            "以下 {} 处直接写了 `t_part_batch.status`，绕过了 `t_part_batch` 域唯一 \
+             状态写入口 `src/modules/prod/batch/status_gate.rs`：\n{}\n\
              \n\
              规则（见 `status_gate.rs` 末尾 `mod write_guard_tests`）：\n\
              \x20 * 判定 = 同一语句里既有对批次表的 UPDATE、其 SET 子句又对 `status` 列赋值；\n\

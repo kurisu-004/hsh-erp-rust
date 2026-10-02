@@ -1,14 +1,27 @@
 //! prod::batch 子模块 VO —— 出参（handler 响应序列化层）
 //!
-//! 2026-09-29 新增 + 2026-09-30 重构：与 worker_pool / process_chain 同形 VO 模块，
 //! 仅 `Serialize` 不 `Deserialize`（禁止出现在 axum extractor 反序列化侧）。
 //!
 //! i64 一律走 `serialize_i64` → JSON string（雪花 ID > 2^53，JS `Number`
 //! 会丢精度，参见 `shared::types` 模块 doc）。
+//!
+//! ## 分组
+//! - **下发流**（`dispatch.rs`）：pending / dispatch / auto-dispatch 五类
+//! - **流转与生命周期**（`transition*` / `lifecycle` / `shelf` / `programming` /
+//!   `outsource` / `repair` / `batch_ops` / `pickup` / `scan` / `worker_scan`）：
+//!   `ToXxxOut` / `BatchToXxxOut` / `BatchOpFailure` / `WorkerScanOut`
+//! - **集合读**（`list.rs` / `repair.rs`）：`InspectionBatchListOut` 三条端点共用
+//!
+//! 2026-10-02：to-XXX / batch-to-XXX / worker-scan / inspection·repair·repairing
+//! 三条集合读这 8 类出参随批次用例自 `part::vo` 迁入。`PartOut` 例外 —— 它是
+//! part 域实体投影，25 条路由与 part 域共用，本模块直接 `use`（单向依赖）。
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
+use crate::modules::part::vo::PartOut;
+use crate::modules::prod::batch::model::InspectionBatchListRow;
+use crate::modules::prod::worker_pool::model::RefillResult;
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 // ===== pending list =====
@@ -196,4 +209,250 @@ pub struct AutoDispatchItem {
 #[derive(Debug, Clone, Serialize)]
 pub struct AutoDispatchResult {
     pub items: Vec<AutoDispatchItem>,
+}
+
+// ===== 集合读（inspection / repair / repairing 三端点共用）=====
+
+/// `GET /prod/batches/inspection` 列表行：批次 + 工单 + 客户 + holder/process/
+/// delivery_note 名称（一次性 JOIN 解析，不在 service 做 N+1）。
+///
+/// 字段命名沿用 v1 `PartOut`/`PartBatchOut` 约定（`batch_id` 即 `t_part_batch.id`，
+/// `version` 即乐观锁版本号）。前端用 `batch_id + version` 直接拼
+/// `POST /prod/batches/{batch_id}/to-ship` 或 `to-inspection` 的请求体。
+///
+/// 2026-09-16 PR-2 瘦身（migration 027）：删 `has_been_repaired` 字段
+/// （t_part_batch 列已删；返修事实由 t_part_event REPAIR_STARTED 事件追溯）。
+///
+/// 2026-09-16 PR-3 批次 step 化（migration 028）：
+/// - 删 `placed_at`（t_part_batch 列已删，不再统计生产时间）
+/// - 新增 `current_process_step_id`：逻辑 FK → t_process_chain_step.id
+///   （批次**首次定位**的工艺链步骤；NULL = 批次尚未进入生产流或 part 无链）
+/// - `next_process_id` / `next_process_name` 字段保留，由 repo JOIN step 派生
+///   （保持 DTO 兼容，不破坏前端）
+///
+/// 2026-09-30（review 第 3 轮 M3）：本 VO 的 `next_process_id` 保持**从
+/// `current_process_step_id` 经 step JOIN 派生**，不改直读新列
+/// `current_process_id`。后者是**池归属权威列**，只服务 5 条工序池 SQL + rollup；
+/// INSPECTION 批次按出池不变式该列恒为 NULL，直读会让本 VO 的工序字段恒 null。
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionBatchListItemOut {
+    // ===== 批次字段 =====
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    pub batch_no: i32,
+    pub quantity: i32,
+    pub status: String, // 必为 "INSPECTION"
+    /// 2026-10-01 review 第 1 轮 M5 新增（migration 005，**BREAKING**）：
+    /// `REPAIRING` 已从 `PartStatus` 降级为 `t_part_batch.is_repairing` 标记列，
+    /// 本 VO 的 `status` 因此**恒为** `IN_PROCESS`（`GET /prod/batches/repairing`
+    /// 的过滤判据已是 `is_repairing = true`）。改造前前端靠
+    /// `status === 'REPAIRING'` 标「返修中」，现在任何端点都拿不到该值 ——
+    /// 除非读本字段。
+    pub is_repairing: bool,
+    pub location: Option<String>,
+    pub version: i32,
+    /// 逻辑 FK → t_process_chain_step.id（2026-09-16 PR-3；替代 next_process_id 列）
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub current_process_step_id: Option<i64>,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub parent_batch_id: Option<i64>,
+
+    // ===== holder 解析（COALESCE 三表）=====
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub current_holder_id: Option<i64>,
+    pub holder_name: Option<String>,
+    /// 由 `current_process_step_id` 经 `LEFT JOIN t_process_chain_step` 取
+    /// `s.process_id` 派生；保留字段名以兼容前端契约。
+    ///
+    /// 2026-09-30 一度改直读 `t_part_batch.current_process_id`（migration 004），
+    /// **2026-09-30 review 第 3 轮 M3 已回退**（follow-up 于 2026-09-30 补齐
+    /// repair 两端点的漏网项）。原因：送检 = 出池，该列被置 NULL。
+    ///
+    /// 本字段由 3 个端点共用（`InspectionBatchListItemOut`，别名
+    /// `RepairBatchesOut`），**3 个都不是工序池端点**，判据都是 `status`：
+    /// - `GET /prod/batches/inspection`（`status='INSPECTION'`，M3 已回退）
+    /// - `GET /prod/batches/repair`（`DELIVERED`，2026-09-30 follow-up 补齐）
+    /// - `GET /prod/batches/repairing`（`is_repairing = true`，2026-10-01 由
+    ///   `status='REPAIRING'` 改为标记列过滤）
+    ///
+    /// 前两者（三者中的 2 个 status 判据端点）的 `current_process_id` 分别为
+    /// 「按出池不变式恒 NULL」「DELIVERED 必经 INSPECTION 故同样恒 NULL」⇒
+    /// 直读一律得不到正确值，故这 2 条查询走 step 派生。
+    /// 第三个端点（返修中）：2026-10-01 起 `mark_batch_repairing` **不再把批次
+    /// 翻出 IN_PROCESS**（status 保持不变），故该列对返修批次不再有「残留
+    /// 陈旧值」问题 —— 但本 VO 仍统一走 step 派生，理由是「展示类列表一律走
+    /// step 派生」这条分工（见 `prod/batch/model.rs` 模块 doc 的读取方清单），
+    /// 不因单个端点的判据变化而分叉。
+    /// `current_process_step_id` 在送检期间被刻意保留
+    /// （`mark_batch_inspected` 不写它），正是「INSPECTION 期间显示批次走到
+    /// 工艺链第几步」这条产品需求的数据来源。
+    ///
+    /// 2026-09-27 part 域前后端字段对齐：`/parts` 响应已对该字段加
+    /// `#[serde(skip)]` 仅隐藏（DB 列保留、rollup 派生链路不变）。inspection /
+    /// repair 域**不做 skip**，字段照常序列化。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub next_process_id: Option<i64>,
+    pub next_process_name: Option<String>,
+
+    // ===== delivery_note 解析 =====
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub delivery_note_id: Option<i64>,
+    pub delivery_note_no: Option<String>,
+
+    // ===== 工单字段（JOIN t_part）=====
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    pub serial_no: Option<String>,
+    pub drawing_no: String,
+    pub name: String,
+    pub order_no: Option<String>,
+    pub planned_delivery_date: NaiveDate,
+    pub is_urgent: bool,
+    pub part_version: i32,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+
+    // ===== 客户解析（JOIN t_customer + 自连 L1）=====
+    #[serde(serialize_with = "serialize_i64")]
+    pub customer_id: i64,
+    pub customer_name: Option<String>,
+    pub l1_customer_name: Option<String>,
+}
+
+impl From<InspectionBatchListRow> for InspectionBatchListItemOut {
+    fn from(r: InspectionBatchListRow) -> Self {
+        Self {
+            batch_id: r.batch_id,
+            batch_no: r.batch_no,
+            quantity: r.quantity,
+            status: r.status,
+            is_repairing: r.is_repairing,
+            location: r.location,
+            version: r.version,
+            current_process_step_id: r.current_process_step_id,
+            parent_batch_id: r.parent_batch_id,
+            current_holder_id: r.current_holder_id,
+            holder_name: r.holder_name,
+            next_process_id: r.next_process_id,
+            next_process_name: r.next_process_name,
+            delivery_note_id: r.delivery_note_id,
+            delivery_note_no: r.delivery_note_no,
+            part_id: r.part_id,
+            serial_no: r.serial_no,
+            drawing_no: r.drawing_no,
+            name: r.name,
+            order_no: r.order_no,
+            planned_delivery_date: r.planned_delivery_date,
+            is_urgent: r.is_urgent,
+            part_version: r.part_version,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            customer_id: r.customer_id,
+            customer_name: r.customer_name,
+            l1_customer_name: r.l1_customer_name,
+        }
+    }
+}
+
+/// `GET /api/v2/prod/batches/inspection` 出参（分页）。
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionBatchListOut {
+    pub items: Vec<InspectionBatchListItemOut>,
+    #[serde(serialize_with = "serialize_i64")]
+    pub total: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub limit: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub offset: i64,
+}
+
+/// `GET /api/v2/prod/batches/repair` / `repairing` 出参：返修批次列表（复用
+/// `InspectionBatchListOut`，三条端点只有过滤判据不同）。
+pub type RepairBatchesOut = InspectionBatchListOut;
+
+/// 单件 / 批量 to-XXX 端点的统一出参 shape。
+///
+/// `part`：操作后 part 的最新 [`PartOut`] 投影（含 OCC 更新后的 `version`）。
+/// `new_batch_id`：仅当 `quantity < target.quantity` 走拆批分支时为
+///   `Some(remainder_id)`（拆批后**剩余批次**的 id，留在源状态待后续操作）；
+///   整批操作时为 `None`（序列化为 JSON `null`），前端拿到非 null 时应刷新批次列表。
+///   用 `serialize_i64_opt` 把 Some 序列化为 JSON 字符串、None 序列化为 `null`，
+///   跟 [`PartOut`] 的雪花 id 序列化契约对齐。
+/// `synced_assembly_id`：仅当本 part 由 inspection 流触发父装配件 status 翻转时
+///   为 `Some(assembly_id)`（handler 据此发 `ASSEMBLY_UPDATED` WS 广播）；
+///   无父装配件或父未变更时为 `None`。
+#[derive(Debug, Clone, Serialize)]
+// ===== to-XXX 三流 / 批量流转 / worker-scan =====
+
+pub struct ToXxxOut {
+    pub part: PartOut,
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub new_batch_id: Option<i64>,
+    /// 父装配件 id（仅当本 part 由 inspection 流触发父 status 变更时 Some）
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub synced_assembly_id: Option<i64>,
+}
+
+/// Per-item 失败明细（item 级别错误，非整批失败）。
+///
+/// `batch_id`：按 batch 定位失败 item（批量 item 不含 `part_id`，服务从
+///   `BatchOpItem::batch_id` 反查后回填；无法 parse 的串落到 `40001` 失败，
+///   不进入本结构）。`i64` 而非 `String` 是因为 service 已 parse 过一次，
+///   用 `serialize_i64` 序列化为 JSON 字符串与前端 batch_id 字段类型对称。
+/// `code` 透传 service 层错误码（20103 / 20104 / 20109 / 20111 / 20511 / 20512 / 40901）；
+/// `message` 透传 service 层错误文案（前端可作 toast）。
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchOpFailure {
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    pub code: i32,
+    pub message: String,
+}
+
+/// 批量端点统一出参（`batch-to-ship` / `batch-to-inspection` 共用）。
+///
+/// `submitted`：成功并完成状态流转的 item（含 `PartOut` 最小投影 + 拆批后的
+///   `new_batch_id`）；`failed`：item 级别错误（共享 [`BatchOpFailure`]）。
+/// `submitted` 与 `failed` 互斥，单 item 不会同时出现在两侧。
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchToXxxOut {
+    pub submitted: Vec<ToXxxOut>,
+    pub failed: Vec<BatchOpFailure>,
+}
+
+/// worker-scan 核心出参（不含 refill）。
+///
+/// handler 会把 `scan + refill` 一起装到 [`WorkerScanOut`] 返回；
+/// `WorkerScanCoreOut` 是 service 层直接产出的最小投影（与 worker-pool
+/// `RefillResult` 解耦，便于 service 层单测）。
+///
+/// `work_type_id` 与 `badge_code` 是**内部管道字段**：handler 用它把
+/// `worker_scan_event` 已经 fetch 过的 worker 信息透传给同事务的
+/// `WorkerPoolService::refill_for_worker_with_work_type`，避免重复
+/// `WorkerRepo::get_by_id` 查询。不暴露到 JSON 响应里。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerScanCoreOut {
+    #[serde(serialize_with = "serialize_i64")]
+    pub worker_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    pub event_type: String,
+    /// 父装配件 id（仅当 INSPECTED 分支触发父 status 变更时 Some）
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub synced_assembly_id: Option<i64>,
+    /// 内部：透传给 refill，refill 不再 fetch worker。
+    #[serde(skip)]
+    pub work_type_id: i64,
+    /// 内部：refill 写 `TAKEN_FROM_POOL` 事件日志需要 badge_code。
+    #[serde(skip)]
+    pub badge_code: String,
+}
+
+/// worker-scan 端点出参：`scan` + 同事务 refill 结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerScanOut {
+    pub scan: WorkerScanCoreOut,
+    pub refill: RefillResult,
 }

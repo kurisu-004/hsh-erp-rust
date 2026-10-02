@@ -46,10 +46,11 @@ pub struct BatchRepo;
 impl BatchRepo {
     /// PENDING 批次列表（JOIN 4 表）。
     ///
-    /// 与 `prod/batch/repo/queries.rs::list_batches_with_part` 同骨架（基表 + 工单 +
-    /// 客户 L1+L2 + 申请人），但额外 LEFT JOIN `t_part.process_chain_id` 与
-    /// `pb.current_process_step_id`（PR-3 批次 step 化字段），且硬限定
-    /// `pb.status = 'PENDING'`。
+    /// 2026-10-02：本方法只服务「下发车间」一条流（`list_pending` / `auto_dispatch`），
+    /// 其投影比通用读 `queries::list_batches_with_part_in_customers` 宽：额外
+    /// LEFT JOIN `t_part.process_chain_id` 与 `pb.current_process_step_id`（批次
+    /// step 化字段，下发时要定位首道工序），且硬限定 `pb.status = 'PENDING'`。
+    /// 两者投影不同，**不是**同一 SQL 的两份实现，不做合并。
     ///
     /// 排序：`p.system_delivery_date ASC NULLS LAST, p.is_urgent DESC,
     /// pb.created_at ASC`（计划交期近 + 加急件优先 + 批次入库时间兜底）。

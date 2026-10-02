@@ -1191,7 +1191,7 @@ async fn submit_with_inspection_batch_returns_candidates_and_stays_draft() {
     assert_eq!(
         b["version"].as_i64().unwrap(),
         i64::from(expected_version),
-        "version 必须是批次当前真实 version（供 batch-to-ship 转发）"
+        "version 必须是批次当前真实 version（供 to-ship 转发）"
     );
 
     // 零写入：重新读单据仍是 DRAFT，且 version 未 bump

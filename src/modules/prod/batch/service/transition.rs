@@ -1,64 +1,47 @@
-//! part 域 to-XXX 流业务逻辑（to_ship / to_inspection / to_process 流）。
+//! prod::batch 的 to-XXX 三流：`to_ship` / `to_process` / `to_inspection`
 //!
-//! 对应 Python myERP/service/part_service.py 中三个 inspection 流的实现（已统一为
-//! to_ship / to_inspection / to_process 模型）。
-//! 实施约定：方法签名 `<R: PartRepoTrait>(mut repo: R, ...)`（2026-09-22 D-6），
-//! 由 handler 开 tx 并 commit；生产 `R = &mut PgConnection`，跨域 repo 与
-//! inline sqlx 走 `repo.conn_mut()`（Rust auto-deref + reborrow 拿到 `&mut PgConnection`）。
+//! 操作对象是**批次**（OCC 锚 `t_part_batch.version`），URL 锚是 `batch_id`。
+//! 本文件只留薄 wrapper / 批量聚合器与共享私有辅助函数；三个 `*_core` 共享核心
+//! 在 `transition_core.rs`（`impl` 块拆文件，Rust 允许同一 `impl BatchService`
+//! 分布在多个同 crate 文件中）。
 //!
-//! 三个 `*_core` 共享核心已拆到 `inspection_core.rs`（impl 块拆文件；与
-//! `worker_scan.rs` 同一模式）；本文件只留薄 wrapper / 批量聚合器与共享私有
-//! 辅助函数。
-//!
-//! ## to_ship 流（part 通过品检 / 部分通过拆批）
-//! - `PartService::to_ship_core`：单件共享核心（见 `inspection_core.rs`，被单件 / batch 端点共用）
-//! - `PartService::to_ship`：单件公开 service fn（handler 调用）
-//! - `PartService::batch_to_ship`：批量（per-item 失败不中断）
-//!
-//! ## to_inspection 流（送检 / 单步；不再带 PASS/FAIL 分支）
-//! - `PartService::to_inspection_core`：单件共享核心（见 `inspection_core.rs`，`{PENDING, PROGRAMMING, IN_PROCESS}` → `INSPECTION`）
-//! - `PartService::to_inspection`：单件公开 service fn
-//! - `PartService::batch_to_inspection`：批量
-//!
-//! ## to_process 流（品检打回 / 选下一工序）
-//! - `PartService::to_process_core`：单件共享核心（见 `inspection_core.rs`，`INSPECTION` → `IN_PROCESS`）
-//! - `PartService::to_process`：薄包装
-//!
-//! ## 错误码契约（Phase F2 新增 / 复用）
-//! - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE` —— target_inspection_shelf.zone ≠ 'INSPECTION'
-//! - 20512 `BIZ_SHELF_INACTIVE` —— target_inspection_shelf.is_active = false
+//! ## 三流入口
+//! - `to_ship_core` → `to_ship`（单件）/ `batch_to_ship`（批量，per-item 失败不中断）
+//! - `to_inspection_core` → `to_inspection`（单件）/ `batch_to_inspection`（批量）
+//! - `to_process_core` → `to_process`（薄包装）
 //!
 //! ## 错误码契约
 //! - 20101 `BIZ_PART_NOT_FOUND` —— part 不存在
 //! - 20103 `BIZ_INVALID_TRANSITION` —— 当前状态非合法 to-XXX 起点
 //! - 20104 `BIZ_INVALID_VALUE` —— 入参值非法
-//! - 20109 `BIZ_PART_BATCH_NOT_FOUND` —— 找不到指定批次 / 多个候选批次无 hint
+//! - 20109 `BIZ_PART_BATCH_NOT_FOUND` —— 找不到指定批次
 //! - 20111 `BIZ_PART_BATCH_INVALID_QUANTITY` —— 拆分数量非法（仅 ≤0；> batch_quantity 等价于整批操作）
+//! - 20511 `BIZ_SHELF_NOT_INSPECTION_ZONE` —— target_inspection_shelf.zone ≠ 'INSPECTION'
+//! - 20512 `BIZ_SHELF_INACTIVE` —— target_inspection_shelf.is_active = false
 //! - 40001 `VALIDATION_ERROR` —— 批量入参校验失败（items 为空 / 超过上限 / batch_id 解析失败）
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败（已被并发修改）
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::vo::{BatchOpFailure, BatchToXxxOut, ToXxxOut};
 use crate::modules::prod::batch::dto::{
     BatchToInspectionRequest, BatchToShipRequest, ToInspectionRequest, ToProcessRequest,
     ToShipRequest,
 };
 use crate::modules::prod::batch::model::TPartBatch;
+use crate::modules::prod::batch::vo::{BatchOpFailure, BatchToXxxOut, ToXxxOut};
 use crate::modules::shelf::model::TShelf;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
-use super::PartService;
+use super::BatchService;
 
-/// 批量 to-ship 单次请求最大 item 数（handler/service 双层校验）。
 pub const BATCH_TO_SHIP_MAX_ITEMS: usize = 200;
 
 /// 批量 to-inspection 单次请求最大 item 数（与 batch-to-ship 对齐）。
 pub const BATCH_TO_INSPECTION_MAX_ITEMS: usize = 200;
 
-impl PartService {
+impl BatchService {
     /// 校验品检架：必须存在、未软删、is_active=true、zone='INSPECTION'。
     ///
     /// 错误码：
@@ -143,24 +126,24 @@ impl PartService {
 
     /// 定位 to-inspection 目标批次（白名单 `{PENDING, PROGRAMMING, IN_PROCESS}`）。
     ///
-    /// 多批次歧义 → 20109；未找到 → 20109；显式 batch_id 但不属于 part → 20109。
+    /// 2026-10-02：`batch_id` 是必填路径参数，本方法只接 `i64`。
+    /// repo 的 `Some` 分支是 `fetch_optional`（`WHERE id = $1 AND status IN (…)`），
+    /// 只可能回 `Ok(None)` 或真 DB 错，**不会**回 `RowNotFound` ⇒ 无「多批次歧义」
+    /// 这一形态（批次 id 全局唯一即锚点）。`None` 分支（按 `part_id` 多候选消歧）
+    /// 在 prod 域已无调用方，仅 `scan.rs` 的「当前 INSPECTION 批次」查询仍用它。
     ///
     /// 错误码：
     /// - 20109 `BIZ_PART_BATCH_NOT_FOUND`
     pub(super) async fn _resolve_scan_target_batch<R: PartRepoTrait>(
         repo: &mut R,
         part_id: i64,
-        batch_id: Option<i64>,
+        batch_id: i64,
     ) -> Result<TPartBatch, AppError> {
-        match repo.find_scan_target_batch(part_id, batch_id).await {
+        match repo.find_scan_target_batch(part_id, Some(batch_id)).await {
             Ok(Some(b)) => Ok(b),
             Ok(None) => Err(AppError::biz(
                 code::BIZ_PART_BATCH_NOT_FOUND,
-                format!("part {part_id} 找不到候选批次（hint={:?}）", batch_id),
-            )),
-            Err(sqlx::Error::RowNotFound) => Err(AppError::biz(
-                code::BIZ_PART_BATCH_NOT_FOUND,
-                "多个候选批次；请显式指定 batch_id".to_string(),
+                format!("batch {batch_id} 不在 {{PENDING, PROGRAMMING, IN_PROCESS}} 状态"),
             )),
             Err(e) => Err(AppError::from(e)),
         }

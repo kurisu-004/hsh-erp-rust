@@ -32,7 +32,7 @@
 //! 函数，而 service 在写完又补调一次 `PartService::sync_from_batch_change`，
 //! 第二次派生必然 `NoChange`，把 `synced_assembly_id` 恒吞成 null（连带 handler 的
 //! `ASSEMBLY_UPDATED` 广播永不发）。修法见
-//! `src/modules/part/service/inspection_core.rs` / `worker_scan.rs` 里
+//! `src/modules/prod/batch/service/transition_core.rs` / `worker_scan.rs` 里
 //! 「2026-10-01：不再补调」的注释。本文件的用例同时是那条回归的护栏。
 //!
 //! ## 派生写可以跨状态机边（重要语义，勿误读为 bug）

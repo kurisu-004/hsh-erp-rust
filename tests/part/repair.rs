@@ -529,7 +529,7 @@ async fn insert_step_located_delivered_part_batch(
     (part_id, batch_id, process_id, process_name.to_string())
 }
 
-/// `GET /parts/repair-batches`：`next_process_id` / `next_process_name` 必须由
+/// `GET /prod/batches/repair`：`next_process_id` / `next_process_name` 必须由
 /// `current_process_step_id` → step JOIN 派生，**不直读** `current_process_id`。
 ///
 /// 若有人把 `list_batches_matching` 改回直读 cpid，本测试必红
@@ -601,7 +601,7 @@ async fn repair_batches_derives_next_process_from_step_not_cpid() {
     );
 }
 
-/// `GET /parts/repairing-batches` 走的是**同一条** SQL（2026-10-01 起判据是
+/// `GET /prod/batches/repairing` 走的是**同一条** SQL（2026-10-01 起判据是
 /// `is_repairing = true`），故同样不直读 `current_process_id`。
 ///
 /// ## 2026-10-01：测试前提随语义变更重写

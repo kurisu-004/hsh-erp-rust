@@ -264,8 +264,8 @@ pub struct StartRepairRequest {
 }
 
 /// `POST /api/v2/prod/batches/{batch_id}/place-on-shelf` 入参。
-/// 被 4 个端点复用（place-on-shelf / release-from-programming /
-/// receive-from-outsource / receive-from-outsource 的 `PlaceOnShelfRequest` 别名）。
+/// 被 3 个端点复用（place-on-shelf / release-from-programming /
+/// receive-from-outsource）。
 ///
 /// PENDING → IN_PROCESS（`location='PRODUCTION_SHELF'`）：放到指定生产货架。
 /// service 层校验 `shelf ↔ process` 映射（`BIZ_SHELF_PROCESS_NOT_MAPPED` 422）。

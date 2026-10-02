@@ -34,13 +34,11 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::repo::{NewPartCreate, PartListFilters, PartUpdate};
 use crate::modules::part::vo::{
-    InspectionBatchListItemOut, InspectionBatchListOut, PartBatchScanOut, PartDetailOut,
-    PartListItem, PartListOut, PartScanContextOut, PartScanInfoOut,
+    PartBatchScanOut, PartDetailOut, PartListItem, PartListOut, PartScanContextOut, PartScanInfoOut,
 };
 use crate::modules::part_file::model::TPartFile;
 use crate::modules::part_file::policy; // 2026-09-11 新增：kind → 扩展名 / content_type 白名单
 use crate::modules::part_file::repo::{NewPartFile, PartFileRepo, hash_bytes};
-use crate::modules::prod::batch::dto::InspectionBatchListQuery;
 use crate::modules::prod::batch::repo::{NewInitialBatch, PartBatchRepo};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
@@ -390,96 +388,6 @@ impl PartService {
             locations,
             holder_ids,
         ))
-    }
-
-    /// `GET /parts/inspection-batches` 列表：对齐 Python v1
-    /// `PartService.list_inspection_batches`，返回 status=INSPECTION 全部活跃批次
-    /// （含工单 / holder / process / delivery_note / customer 名称，一次 JOIN 解析，
-    /// 服务层无 N+1）。
-    ///
-    /// 权限：Manager + Inspector（对齐 v1）。
-    /// 限流：`limit ∈ [1, 200]`，默认 200；`offset` 默认 0。
-    /// customer_id：单值 → `expand_customer_id` 展开为 L1+L2 ids（与 `list_parts` 同逻辑）。
-    /// keyword / serial_no：service 层拼 `%...%` 加通配符；为防 SQL 注入风险，
-    /// 拒绝 `%` / `_` / `\\` 等通配符特殊字符（含任一 → VALIDATION_ERROR 40001）。
-    pub async fn list_inspection_batches<R: PartRepoTrait>(
-        mut repo: R,
-        query: &InspectionBatchListQuery,
-        current: &CurrentUser,
-    ) -> Result<InspectionBatchListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Inspector])?;
-
-        let limit = query.limit.unwrap_or(200).clamp(1, 200);
-        let offset = query.offset.unwrap_or(0).max(0);
-
-        // customer_id 展开：单值 → [L1, 所有 L2]；None → 不传（走全客户）
-        let customer_ids_owned: Vec<i64>;
-        let customer_ids: &[i64] = if let Some(cid) = query.customer_id {
-            customer_ids_owned = expand_customer_id(repo.conn_mut(), cid).await?;
-            &customer_ids_owned
-        } else {
-            &[]
-        };
-
-        // keyword：service 层拼 `%...%` + 拒绝 SQL 通配符特殊字符（% _ \）
-        let keyword_owned: Option<String> = match query.keyword.as_deref() {
-            Some(kw) => {
-                if kw.contains(['%', '_', '\\']) {
-                    return Err(AppError::validation("keyword 不能包含通配符 % _ \\"));
-                }
-                Some(format!("%{kw}%"))
-            }
-            None => None,
-        };
-        let keyword: Option<&str> = keyword_owned.as_deref();
-
-        // serial_no：同上
-        let serial_no_owned: Option<String> = match query.serial_no.as_deref() {
-            Some(sn) => {
-                if sn.contains(['%', '_', '\\']) {
-                    return Err(AppError::validation("serial_no 不能包含通配符 % _ \\"));
-                }
-                Some(format!("%{sn}%"))
-            }
-            None => None,
-        };
-        let serial_no: Option<&str> = serial_no_owned.as_deref();
-
-        let statuses: &[&str] = &["INSPECTION"];
-
-        let rows = PartBatchRepo::list_batches_with_part(
-            repo.conn_mut(),
-            statuses,
-            customer_ids,
-            keyword,
-            serial_no,
-            query.planned_delivery_date_from,
-            query.planned_delivery_date_to,
-            limit,
-            offset,
-        )
-        .await?;
-
-        let total = PartBatchRepo::count_batches_with_part(
-            repo.conn_mut(),
-            statuses,
-            customer_ids,
-            keyword,
-            serial_no,
-            query.planned_delivery_date_from,
-            query.planned_delivery_date_to,
-        )
-        .await?;
-
-        Ok(InspectionBatchListOut {
-            items: rows
-                .into_iter()
-                .map(InspectionBatchListItemOut::from)
-                .collect(),
-            total,
-            limit,
-            offset,
-        })
     }
 
     pub async fn get_part<R: PartRepoTrait>(
@@ -913,7 +821,7 @@ pub(super) fn map_create_error(e: sqlx::Error) -> AppError {
 /// 语义：
 /// - L1 客户（无 parent_id）→ 自身 + 全部 L2 子节点 ids
 /// - L2 客户（有 parent_id）→ 自身 + 同 L1 下所有兄弟 L2 ids
-pub(super) async fn expand_customer_id(
+pub(crate) async fn expand_customer_id(
     conn: &mut PgConnection,
     cid: i64,
 ) -> Result<Vec<i64>, AppError> {
@@ -954,7 +862,7 @@ pub(super) async fn expand_customer_id(
 ///
 /// 返回 `(Some(name), Some(l1_name))`：当自身为 L1 时 l1_name 与 name 同；
 /// 当 customer 不存在 → `(None, None)`（service 层可容忍）。
-pub(super) async fn lookup_customer_names(
+pub(crate) async fn lookup_customer_names(
     conn: &mut PgConnection,
     customer_id: i64,
 ) -> Result<(Option<String>, Option<String>), AppError> {
