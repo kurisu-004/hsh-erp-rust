@@ -111,20 +111,26 @@ async fn find_approved_quote_id(
 /// `quote_id`。
 ///
 /// 1. **复用**：按 `(part_id, company_id, process_id)` 找活跃（`SUBMITTED` /
-///    `APPROVED`）报价中的 APPROVED 条目 —— 与仓内其它 DIRECT 判定同口径
-///    （见 `OutsourceSendable` 的 `send_mode`），多条时取 id 最大者（最新审批）。
+///    `APPROVED`）报价中的 APPROVED 条目（不区分 `is_direct`，故 DIRECT 占位报价
+///    本身也会被复用），多条时取 id 最大者（最新审批）。
 /// 2. **自动建**：没有则 INSERT 一条 `price = 0` / `status='APPROVED'` /
 ///    `is_direct = true` 的占位报价（`submitted_at` / `reviewed_at` = now），
 ///    复用下方主流程的「APPROVED 校验 + 写 SENT 事件」路径。
 ///
-/// ## 幂等与唯一约束
+/// ## 幂等与两条互补的 partial 唯一索引
 ///
-/// `uq_t_outsource_quote_approved_part_process` 的谓词是
-/// `deleted_at IS NULL AND status = 'APPROVED' AND is_direct = false` —— **不含**
-/// DIRECT 占位报价，故建占位不会与审批报价争这条索引（这正是 `is_direct` 列存在的
-/// 意义）。INSERT 仍写 `ON CONFLICT DO NOTHING` + 回查（与 `shipment_create` 同款），
-/// 命中冲突时用回查结果当 `quote_id`；极端并发下最多多出几条等价的 0 元占位报价
-/// （价 0 / APPROVED / is_direct=true），对账语义与幂等重试一致。
+/// `t_outsource_quote` 上与「APPROVED 活跃行」相关的唯一索引有两条，谓词互斥：
+///
+/// | 索引 | 键 | 谓词 | 拦的是谁 |
+/// |---|---|---|---|
+/// | `uq_t_outsource_quote_approved_part_process`（baseline） | `(part_id, process_id)` | `deleted_at IS NULL AND status='APPROVED' AND is_direct = false` | 审批报价：每 (零件, 工序) 最多一条 |
+/// | `uq_t_outsource_quote_direct_part_company_process`（migration 008） | `(part_id, outsource_company_id, process_id)` | `deleted_at IS NULL AND status='APPROVED' AND is_direct = true` | DIRECT 占位报价：每 (零件, 公司, 工序) 最多一条 |
+///
+/// 两条都必须有：审批报价**故意**排除 `is_direct = true`（这正是 `is_direct` 列
+/// 存在的意义 —— 免审批直发不该占用审批报价的唯一键），代价是单靠它兜不住 DIRECT
+/// 行。migration 008 补上后半条，于是下面的 `ON CONFLICT DO NOTHING` + 回查
+/// 才真正成立：并发下第二个 INSERT 命中该索引 → 0 行 → 回查取第一条的 id 当
+/// `quote_id`，同一 tuple 恒定只留一条 0 元占位报价。
 async fn resolve_direct_quote_id(
     conn: &mut PgConnection,
     snowflake: &SnowflakeIdGenerator,
@@ -155,7 +161,8 @@ async fn resolve_direct_quote_id(
     if inserted.rows_affected() == 1 {
         return Ok(quote_id);
     }
-    // ON CONFLICT 命中 → 回查（并发窗口内同一 tuple 已被别的请求建过）
+    // 命中 `uq_t_outsource_quote_direct_part_company_process`（并发窗口内同一
+    // tuple 已被别的请求建过占位报价）→ 回查复用它，不留第二条等价记录
     match find_approved_quote_id(conn, part_id, company_id, process_id).await? {
         Some(qid) => Ok(qid),
         None => Err(AppError::biz(
@@ -430,6 +437,12 @@ impl BatchService {
         // version），由 `_split_batch_inner` 内部守卫；子批次的 `version` 被它写死
         // 为 0，所以必须**读回子批次行**取真实 version 再喂给 status_gate ——
         // 拿 `req.version` 去撞子批次会恒 409。
+        //
+        // 调用方要知道的副作用（2026-10-03 补注）：`_split_batch_inner` 对源批次
+        // 的 UPDATE 带 `version = version + 1`，故**拆批成功后源批次的 version
+        // 已经 +1**。同一次请求内不可能再对源批次做第二次流转（它已不在本次的
+        // 流转对象里），但**跨请求的二次部分发送必须先刷新列表**拿新 version，
+        // 否则恒 409 —— 这是设计意图（OCC 挡住「基于旧读数继续拆」），不是缺陷。
         let (target_batch_id, target_version, send_qty) = match partial_qty {
             Some(q) => {
                 let child = PartBatchRepo::_split_batch_inner(
@@ -611,6 +624,11 @@ impl BatchService {
         // 即「出池清 location + holder」的三态由 status_gate 的 `clear_*` 语义兜住
         // （本调用点 4 列都传 `Some(..)`，故走的是「写值」而非 clear 分支）。
         // 源批次**不动** status / location / holder：它还在外协厂里。
+        //
+        // OCC 锚分两段（与 send 侧同款）：源批次用请求里的 `version`（由
+        // `_split_batch_inner` 内部守卫），子批次必须用**读回行**的 version ——
+        // 它被写死为 0，拿 `req.version` 去撞会恒 409。副作用同 send 侧：
+        // 拆批成功后**源批次 version 已 +1**，二次部分接收必须先刷新列表。
         let (target_batch_id, target_version) = match partial_qty {
             Some(q) => {
                 let child = PartBatchRepo::_split_batch_inner(

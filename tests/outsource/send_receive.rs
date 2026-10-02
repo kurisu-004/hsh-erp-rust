@@ -7,6 +7,11 @@
 //! - DIRECT 免审批直发（2026-10-03：复用活跃报价 / 自动建 0 元占位报价 / 与
 //!   quote_id 互斥 / 必须给价来源）
 //! - 部分发送 / 部分接收（2026-10-03：拆批语义 + shipment 记账口径）
+//! - 拆批的 OCC 契约（2026-10-03 review 第 1 轮：源批次 version +1、子批次用读回
+//!   行 version 作锚、二次收发必须先刷新列表）
+//! - 部分收发的派生契约（min-progress：部分发送后 part 停在 `PENDING`、部分接收
+//!   后 part 变 `IN_PROCESS`）
+//! - DIRECT 占位报价唯一性（migration 008：同 tuple 只留 1 条 `is_direct=true`）
 //! - 补齐后的守卫（process 类别必须 OUTSOURCE / 公司必须映射该工序）
 //!
 //! ## 集成测试范本（PR13 Phase H，2026-09-24）
@@ -122,16 +127,32 @@ async fn insert_batch_with_qty(
     location: Option<&str>,
     qty: i32,
 ) -> i64 {
+    insert_nth_batch(pool, part_id, 1, status, location, qty).await
+}
+
+/// 直插同 part 下的**第 n 个**批次。
+///
+/// 与 [`insert_batch_with_qty`] 分开是因为 `uq_t_part_batch_part_no` 要求同
+/// `part_id` 下 `batch_no` 互异，造第二个批次时不能再写死 1。
+async fn insert_nth_batch(
+    pool: &PgPool,
+    part_id: i64,
+    batch_no: i32,
+    status: &str,
+    location: Option<&str>,
+    qty: i32,
+) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_part_batch \
          (id, part_id, batch_no, quantity, status, location, version, created_at, updated_at) \
-         VALUES ($1, $2, 1, $3, $4, $5, 0, $6, $6)",
+         VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $7)",
     )
     .bind(id)
     .bind(part_id)
+    .bind(batch_no)
     .bind(qty)
     .bind(status)
     .bind(location)
@@ -417,6 +438,15 @@ async fn list_batches(pool: &PgPool, part_id: i64) -> Vec<(i64, i32, String, Opt
     .expect("list t_part_batch")
 }
 
+/// 读 `t_part` 的派生 `status`（批次 min-progress 派生的缓存列）。
+async fn part_status(pool: &PgPool, part_id: i64) -> String {
+    sqlx::query_scalar("SELECT status FROM t_part WHERE id = $1")
+        .bind(part_id)
+        .fetch_one(pool)
+        .await
+        .expect("read t_part.status")
+}
+
 // ===========================================================================
 //  Tests
 // ===========================================================================
@@ -639,6 +669,105 @@ async fn send_to_outsource_direct_creates_zero_price_placeholder_quote() {
     assert_eq!(row.1, 5);
     assert_eq!(row.2, "OUTSOURCING");
     assert_eq!(row.3, "0.00");
+}
+
+/// 2026-10-03（migration 008）：同一个 `(part_id, outsource_company_id,
+/// process_id)` tuple 连发两次 DIRECT，只允许存在 **1 条** `is_direct = true` 的
+/// 0 元占位报价，两张 shipment 共用同一个 `quote_id`。
+///
+/// 锁的是两件独立的事：
+/// 1. **串行幂等**（`find_approved_quote_id` 复用路径）——第二次不新建占位报价；
+/// 2. **约束真的存在**（`uq_t_outsource_quote_direct_part_company_process`）——
+///    绕过 service 直接再插一条同 tuple 的占位报价必须被拒（0 行），否则并发窗口
+///    （双击 / 超时重试 / 两个批次同 tuple 直发）仍会各留一条等价记录，
+///    `resolve_direct_quote_id` 的 `ON CONFLICT DO NOTHING` + 回查也就形同虚设。
+#[tokio::test]
+async fn send_to_outsource_direct_same_tuple_keeps_single_placeholder_quote() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "DirDup", "C").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let b1 = insert_batch(&pool, part_id, "PENDING", None).await;
+    // 同一 part 的第二个批次（batch_no 必须不同 —— `uq_t_part_batch_part_no`）
+    let b2 = insert_nth_batch(&pool, part_id, 2, "PENDING", None, 5).await;
+    let company_id = insert_outsource_company(&pool, "DirDupCo").await;
+    let proc_id = seed_outsource_process(&pool, "PDIRDUP", "dirdup").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+
+    for bid in [b1, b2] {
+        let (s, env) = send(
+            app.clone(),
+            json_request(
+                "POST",
+                &format!("/prod/batches/{bid}/send-to-outsource"),
+                Some(json!({
+                    "version": 0,
+                    "outsource_company_id": company_id.to_string(),
+                    "process_id": proc_id.to_string(),
+                    "direct": true,
+                })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "DIRECT 直发 batch {bid}: {env}");
+    }
+
+    // 串行幂等：同 tuple 只留 1 条占位报价
+    let placeholder_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM t_outsource_quote \
+         WHERE part_id = $1 AND outsource_company_id = $2 AND process_id = $3 \
+           AND status = 'APPROVED' AND is_direct = true AND deleted_at IS NULL",
+    )
+    .bind(part_id)
+    .bind(company_id)
+    .bind(proc_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        placeholder_count, 1,
+        "同 (part, company, process) 只允许 1 条 DIRECT 占位报价"
+    );
+    // 两张 shipment 引用同一个 quote_id
+    let distinct_quote_ids: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT quote_id)::bigint FROM t_outsource_shipment WHERE part_id = $1",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(distinct_quote_ids, 1, "两次 DIRECT 必须共用同一条占位报价");
+    let shipment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_shipment WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shipment_count, 2, "两个批次各一张开口 shipment");
+
+    // 约束本身生效：绕过 service 直接插同 tuple 的占位报价必须被索引拒掉
+    let dup_id: i64 = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let dup = sqlx::query(
+        "INSERT INTO t_outsource_quote \
+             (id, part_id, outsource_company_id, process_id, price, note, status, \
+              submitted_at, reviewed_at, is_direct, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 0, 'dup', 'APPROVED', now(), now(), true, now(), now()) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(dup_id)
+    .bind(part_id)
+    .bind(company_id)
+    .bind(proc_id)
+    .execute(&pool)
+    .await
+    .expect("直插重复 tuple 的 DIRECT 占位报价应被 ON CONFLICT 吞掉");
+    assert_eq!(
+        dup.rows_affected(),
+        0,
+        "uq_t_outsource_quote_direct_part_company_process 必须拒掉重复 tuple"
+    );
 }
 
 /// 2026-10-03：DIRECT 命中活跃 APPROVED 报价时**复用**它（不新建占位），
@@ -917,6 +1046,16 @@ async fn send_to_outsource_partial_quantity_splits_batch() {
     assert_eq!(ship_qty, 2);
     assert_eq!(ship_price, "12.50");
 
+    // OCC 契约（2026-10-03 补断言）：源批次的 version 被 `_split_batch_inner` 的
+    // `version = version + 1` 顶到 1；子批次 INSERT 写死 version 0，随后 status_gate
+    // 流转 +1 → 也是 1。二次部分发送必须拿刷新后的 version=1。
+    assert_eq!(source.4, 1, "拆批后源批次 version +1");
+    assert_eq!(child.4, 1, "子批次 0 → 1（INSERT 写 0 + status_gate +1）");
+
+    // 派生契约：min-progress 里源批次 `PENDING`(rank 0) 慢于子批次
+    // `OUTSOURCE`(rank 3)，故 part 仍 `PENDING`。
+    assert_eq!(part_status(&pool, part_id).await, "PENDING");
+
     // part_event 记本次发送量与子批次
     let (ev_batch, ev_qty): (i64, i32) = sqlx::query_as(
         "SELECT batch_id, quantity FROM t_part_event \
@@ -928,6 +1067,58 @@ async fn send_to_outsource_partial_quantity_splits_batch() {
     .unwrap();
     assert_eq!(ev_batch, child.0);
     assert_eq!(ev_qty, 2);
+}
+
+/// 2026-10-03（MINOR-3）：部分发送时子批次的 OCC 锚必须是**读回行**的 version，
+/// 不能拿请求里的 `req.version` 顶替 —— 子批次被 `_split_batch_inner` 写死
+/// `version = 0`，拿一个非 0 的 `req.version` 去撞必然 0 行。
+///
+/// 用例把源批次 version 预置成 2（真实场景：批次此前已流转过），这样两个 version
+/// 值才真的不同 —— 若用 version=0 的批次，`req.version` 恰好等于子批次的 0，
+/// 错实现也能蒙混过关，本用例就失去鉴别力。
+#[tokio::test]
+async fn send_to_outsource_partial_anchors_child_on_read_back_version() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "PVer", "L").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    // 源批次此前已流转过（version 2），与子批次的 0 明确不同
+    sqlx::query("UPDATE t_part_batch SET version = 2 WHERE id = $1")
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .expect("预置源批次 version=2");
+    let company_id = insert_outsource_company(&pool, "PVerCo").await;
+    let proc_id = seed_outsource_process(&pool, "PPVER", "pver").await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 2,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "quote_id": quote_id.to_string(),
+                "quantity": 2,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "部分发送（源批次 version=2）: {env}");
+
+    let batches = list_batches(&pool, part_id).await;
+    assert_eq!(batches.len(), 2, "部分发送应拆出 1 个子批次：{batches:?}");
+    let source = batches.iter().find(|b| b.0 == bid).expect("源批次");
+    let child = batches.iter().find(|b| b.0 != bid).expect("子批次");
+    assert_eq!(source.4, 3, "源批次 2 → 3（拆批 +1）");
+    assert_eq!(child.4, 1, "子批次 0 → 1（读回行 version=0 作锚）");
 }
 
 /// 2026-10-03：`quantity == 批次量` 视为整批，**不产生**子批次。
@@ -1298,6 +1489,188 @@ async fn receive_from_outsource_partial_quantity_keeps_shipment_open() {
     .unwrap();
     assert_eq!(ev_batch, child.0);
     assert_eq!(ev_qty, 2);
+
+    // OCC 契约（2026-10-03 补断言）：源批次 version 0 → 1（`_split_batch_inner` 的
+    // `version = version + 1`），子批次 0 → 1（INSERT 写 0 + status_gate +1）。
+    // 二次部分接收必须拿刷新后的 version=1。
+    assert_eq!(source.4, 1, "拆批后源批次 version +1");
+    assert_eq!(child.4, 1, "子批次 0 → 1");
+
+    // 派生契约：源批次 `OUTSOURCE`(rank 3) 与子批次 `IN_PROCESS`(rank 2) 并存时
+    // min-progress 取 2 → part 变 `IN_PROCESS`（尽管源批次还在外协厂）。
+    assert_eq!(part_status(&pool, part_id).await, "IN_PROCESS");
+}
+
+/// 2026-10-03（MINOR-3）：部分接收 → 再整批回收余量，这条链上
+/// `uq_t_outsource_shipment_open_batch` 的不变式是「**同一批次同时最多一张开口
+/// shipment**」：部分接收期间开口不关，第二次整批回收才关它，且此时 quote event
+/// `RECEIVED` 只写一次。
+///
+/// 顺带锁住拆批的 OCC 副作用：第一次部分接收把源批次 version 顶到 1，第二次请求
+/// **必须**带刷新后的 1。
+#[tokio::test]
+async fn receive_from_outsource_partial_then_whole_closes_shipment() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (bid, quote_id, shelf_id, next_proc) =
+        setup_inflight(&pool, "TwiceR", "F", "PTWICE", "REC-F", "REC-PROC-F", 5).await;
+    let part_id: i64 = sqlx::query_scalar("SELECT part_id FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    // 源批次 version 预置成 2：与子批次的 0 明确不同，拆批时若错拿 `req.version`
+    // 当子批次的 OCC 锚，本用例会直接 409（鉴别力来源）
+    sqlx::query("UPDATE t_part_batch SET version = 2 WHERE id = $1")
+        .bind(bid)
+        .execute(&pool)
+        .await
+        .expect("预置源批次 version=2");
+
+    // 第一次：部分回收 2 件
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/receive-from-outsource"),
+            Some(json!({
+                "version": 2,
+                "shelf_id": shelf_id.to_string(),
+                "next_process_id": next_proc.to_string(),
+                "quantity": 2,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "部分接收: {env}");
+    let (status, received_at): (String, Option<chrono::NaiveDateTime>) =
+        sqlx::query_as("SELECT status, received_at FROM t_outsource_shipment WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "OUTSOURCING", "部分接收后开口 shipment 仍开口");
+    assert!(received_at.is_none());
+
+    // 拆批把源批次 version 顶到 3；第二次请求必须带 3
+    let source_version: i32 = sqlx::query_scalar("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source_version, 3, "拆批后源批次 version 2 → 3");
+
+    // 第二次：整批回收剩余 3 件（quantity == 余量 → 不再拆批）
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/receive-from-outsource"),
+            Some(json!({
+                "version": 3,
+                "shelf_id": shelf_id.to_string(),
+                "next_process_id": next_proc.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "整批回收余量: {env}");
+
+    // 开口 shipment 此刻才关
+    let (status, received_at, ver): (String, Option<chrono::NaiveDateTime>, i32) = sqlx::query_as(
+        "SELECT status, received_at, version FROM t_outsource_shipment WHERE part_id = $1",
+    )
+    .bind(part_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "RECEIVED", "整批回收后开口 shipment 必须关闭");
+    assert!(received_at.is_some(), "整批回收必须写 received_at");
+    assert_eq!(ver, 1, "shipment version 0 → 1（关单那一次 UPDATE）");
+
+    // 仍然只有 1 张 shipment（`uq_t_outsource_shipment_open_batch` 不允许第二张开口）
+    let shipment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_shipment WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shipment_count, 1, "全程只应有 1 张 shipment");
+
+    // quote event RECEIVED 只在整批回收时写一次
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM t_outsource_quote_event \
+         WHERE quote_id = $1 AND event_type = 'RECEIVED'",
+    )
+    .bind(quote_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(event_count, 1, "RECEIVED 事件只应有 1 条");
+
+    // 两条批次都回生产架，part 派生 `IN_PROCESS`
+    let batches = list_batches(&pool, part_id).await;
+    assert_eq!(batches.len(), 2, "第二次不再拆批：{batches:?}");
+    for b in &batches {
+        assert_eq!(b.2, "IN_PROCESS", "两条批次都应回生产架：{batches:?}");
+        assert_eq!(b.3.as_deref(), Some("PRODUCTION_SHELF"));
+    }
+    let source_after: i32 = sqlx::query_scalar("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source_after, 4, "整批回收把源批次 3 → 4（status_gate +1）");
+    assert_eq!(part_status(&pool, part_id).await, "IN_PROCESS");
+}
+
+/// 2026-10-03（MINOR-3 负向）：拆批把源批次 version +1 之后，用**旧** version 再
+/// 回收一次必须 409。这条锁住「二次收发必须先刷新列表」这条调用方契约。
+#[tokio::test]
+async fn receive_from_outsource_partial_then_stale_version_conflicts() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (bid, _q, shelf_id, next_proc) =
+        setup_inflight(&pool, "StaleTwice", "H", "PSTALE", "REC-H", "REC-PROC-H", 5).await;
+
+    let (s, _env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/receive-from-outsource"),
+            Some(json!({
+                "version": 0,
+                "shelf_id": shelf_id.to_string(),
+                "next_process_id": next_proc.to_string(),
+                "quantity": 2,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "第一次部分接收");
+
+    // 复用 version=0（未刷新列表）→ 409
+    let (s2, env2) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/receive-from-outsource"),
+            Some(json!({
+                "version": 0,
+                "shelf_id": shelf_id.to_string(),
+                "next_process_id": next_proc.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::CONFLICT,
+        "拆批后旧 version 必须 409: {env2}"
+    );
+    assert_eq!(env2["code"].as_i64().unwrap(), 40901);
 }
 
 /// 2026-10-03：部分接收的 3 类数量非法（超量 / 0 / 负数）一律 400 且不动批次。

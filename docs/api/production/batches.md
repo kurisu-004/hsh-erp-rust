@@ -151,9 +151,19 @@
      `is_direct = true` 的占位报价，`note` 固定写
      `DIRECT 直发自动创建（免审批，单价待对账补录）`，再用它的 id 走同一条
      APPROVAL 校验 + 写 `SENT` 事件路径。**对账页单价为 0 的行据此识别**。
-  3. 唯一约束 `uq_t_outsource_quote_approved_part_process` 的谓词含
-     `is_direct = false`，故 DIRECT 占位报价不与审批报价争该索引；INSERT 走
-     `ON CONFLICT DO NOTHING` + 回查（并发下最多多出几条等价的 0 元占位报价）。
+  3. **幂等靠两条互补的 partial 唯一索引**（谓词互斥，缺一不可）：
+
+     | 索引 | 键 | 谓词 | 拦的是谁 |
+     |---|---|---|---|
+     | `uq_t_outsource_quote_approved_part_process`（baseline） | `(part_id, process_id)` | `deleted_at IS NULL AND status='APPROVED' AND is_direct = false` | 审批报价：每 (零件, 工序) 最多一条 |
+     | `uq_t_outsource_quote_direct_part_company_process`（**migration 008，2026-10-03 新增**） | `(part_id, outsource_company_id, process_id)` | `deleted_at IS NULL AND status='APPROVED' AND is_direct = true` | DIRECT 占位报价：每 (零件, 公司, 工序) 最多一条 |
+
+     第一条**故意**排除 `is_direct = true`（免审批直发不该占用审批报价的唯一键 —— 这
+     正是 `is_direct` 列存在的意义），代价是单靠它兜不住 DIRECT 行；migration 008
+     补上后半条后，下面的 `ON CONFLICT DO NOTHING` + 回查才**真正成立**：并发下第二
+     个 INSERT 命中该索引 → 0 行 → 回查取第一条的 id 当 `quote_id`，同一 tuple 恒定
+     只留一条 0 元占位报价（回归用例
+     `send_to_outsource_direct_same_tuple_keeps_single_placeholder_quote`）。
 
 两条路径都会写 `t_outsource_quote_event` `SENT`（`from_status='APPROVED'` →
 `to_status='APPROVED'`，不改 quote 状态）。
@@ -172,6 +182,16 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 `version`（`_split_batch_inner` 把新批次 `version` 写死 0，拿请求的 `version` 去撞子
 批次会恒 409）。
 
+> ⚠️ **拆批成功后源批次的 `version` 已经 +1**（`_split_batch_inner` 的源批次 UPDATE 带
+> `version = version + 1`）。所以**同一个源批次的第二次部分发送必须先刷新列表**拿新
+> `version`，否则恒 409 —— 这是设计意图（OCC 挡住「基于旧读数继续拆」），不是缺陷。
+> 典型序列：发 5 件（`quantity=2`，源批次 v0 → v1，余量 3）→ 再发 2 件必须带
+> `version=1`；第二次会再拆一个新子批次并把源批次顶到 v2。
+>
+> `t_part` 派生状态：min-progress 下源批次 `PENDING`(rank 0) 慢于子批次
+> `OUTSOURCE`(rank 3)，故**部分发送后 `t_part.status` 仍为 `PENDING`**（回归用例
+> `send_to_outsource_partial_quantity_splits_batch` 断言该值）。
+
 `t_part_event`（`SENT_TO_OUTSOURCE`）的 `batch_id` 指向真正发出去的那个批次、
 `quantity` 记本次发送量。
 
@@ -184,6 +204,12 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 | `next_process_id` | string(i64) | ✓ | 收回后重新入池的工序；`t_shelf_process` 必须映射 |
 | `quantity` | i32? | — | 部分接收数量；缺省或 `== 批次量` = 整批 |
 | `note` | string? | — | 落到 `t_part_event.note` 与 quote event `RECEIVED` 的 note |
+
+> ⚠️ **前端 `next_process_id` 失配（计划接受的现状）**：本 DTO **没有** `deny_unknown_fields`，
+> serde 静默丢弃未声明字段。前端若继续发旧字段名（如 `process_id`）而不发
+> `next_process_id`，该字段会以 `0` 落到解析器 → `BIZ_PROCESS_NOT_FOUND(20801)`。
+> 前端在另一个仓改，本轮不加 `deny_unknown_fields`（会让所有历史多余字段直接 400，
+> 迁移面远大于收益）；接入前请确认前端已切到 `next_process_id`。
 
 2026-10-03 起入参**不再复用** `PlaceOnShelfRequest`（后者仍被 `place-on-shelf` /
 `release-from-programming` 共用，加 `quantity` 会污染它们的契约）。
@@ -202,6 +228,24 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 所以对账列表里 `shipment.quantity` 与批次当前余量**可能不相等** —— 对账要回答的是
 「发出去多少、单价多少」。`t_part_event`（`RECEIVED_FROM_OUTSOURCE`）仍记本次回收量
 与子批次 id。
+
+**二次回收必须先刷新列表**（与部分发送同款）：第一次部分回收把源批次 `version` 顶到
++1，第二次请求带旧 `version` 恒 409。链式示例（发出 5 件、源批次初始 v0）：
+
+| 步骤 | 请求 | 结果 | 源批次 version |
+|---|---|---|---|
+| 1 | `quantity=2` | 拆批：子批次 2 件回生产架，源批次余量 3 件仍 `OUTSOURCE`，shipment 仍开口 | 0 → 1 |
+| 2 | `version=1`，不带 `quantity`（或 `quantity=3`） | 整批回收余量：源批次 `IN_PROCESS` + `PRODUCTION_SHELF`，**开口 shipment 此刻才关**（`RECEIVED` + 写 `received_at` + 写 quote event `RECEIVED`） | 1 → 2 |
+
+全程只会有 1 张 shipment（`uq_t_outsource_shipment_open_batch`），RECEIVED 事件只写
+1 条。回归用例：`receive_from_outsource_partial_then_whole_closes_shipment`（正向）
++ `receive_from_outsource_partial_then_stale_version_conflicts`（复用旧 version → 409）。
+
+> **`t_part` 派生状态**：部分接收后源批次 `OUTSOURCE`(rank 3) 与子批次
+> `IN_PROCESS`(rank 2) 并存，min-progress 取 2 → **`t_part.status` 变 `IN_PROCESS`**，
+> **尽管源批次还在外协厂**。这是三层派生契约（batch → part → assembly）的固有性质、
+> 不是新 bug：前端工单列表会看到「在产」，而外协在途页仍有在途批次，两边都正确。
+> 回归用例 `receive_from_outsource_partial_quantity_keeps_shipment_open` 断言该值。
 
 ### `POST /{batch_id}/receive-from-outsource-to-inspection`（`ReceiveFromOutsourceToInspectionRequest`）
 
@@ -239,12 +283,26 @@ PG 报 22001 使整个事务 500 —— 该端点此前**从未被集成测试�
 
 ### 已知不一致（2026-10-03 登记，未修）
 
-`PartStatus::can_transition_to` 只放行 `PENDING → OUTSOURCE`，**没有**
-`IN_PROCESS → OUTSOURCE` 边。故 `send_to_outsource` 实际只能从 `PENDING` 发起；
-service 里「`IN_PROCESS` 必须在 `PRODUCTION_SHELF`」那段守恒在当前代码里不可达，
-端点注释与早期文档写的「`PENDING` 或 `IN_PROCESS+PRODUCTION_SHELF`」与实现不符。
-修法是给状态机补这条边（`src/modules/part/statemachine.rs`），属 part 域改动，
-不在本轮范围。
+1. **状态机缺 `IN_PROCESS → OUTSOURCE` 边**：`PartStatus::can_transition_to` 只放行
+   `PENDING → OUTSOURCE`。故 `send_to_outsource` 实际只能从 `PENDING` 发起；service
+   里「`IN_PROCESS` 必须在 `PRODUCTION_SHELF`」那段守恒在当前代码里不可达，端点注释
+   与早期文档写的「`PENDING` 或 `IN_PROCESS+PRODUCTION_SHELF`」与实现不符。修法是给
+   状态机补这条边（`src/modules/part/statemachine.rs`），属 part 域改动，不在本轮范围。
+2. **`t_part_event.event_type` 与 `backend-python` 词汇分叉**（M4）：本仓 2026-10-03
+   把直送品检事件改名为 `RECEIVED_TO_INSPECTION`（见上节），而
+   `backend-python/model/enums.py` 仍定义 `RECEIVED_FROM_OUTSOURCE_INSPECTED`。两个
+   后端共库，同一业务动作会按「谁服务的」产出两种 `event_type` 值。保留改名（仓内零
+   消费方、无历史行需要迁移），但词汇分叉未消除。
+   **彻底解决需追加一条 append-only migration**：
+   `ALTER TABLE t_part_event ALTER COLUMN event_type TYPE varchar(40);` —— 本轮不做
+   （列宽是既有的全表约束，改它影响所有域的历史行与 Python 端写入路径）。
+3. **`uq_t_part_batch_part_no` 的 `MAX(batch_no)+1` 竞态**（MINOR-5）：`_split_batch_inner`
+   先 `SELECT COALESCE(MAX(batch_no),0)+1` 再 INSERT，两条语句之间无锁。并发拆批
+   （例如两个批次同时对外协做部分发送）会算出同一个 `batch_no` → 撞唯一约束 → 整事务
+   **500** 而非 409。属既有缺陷，本 PR 新增 2 个调用点（send / receive 的部分收发）
+   扩大了暴露面，但**本轮只登记不修**：修法要么给拆批加 part 级 advisory lock、要么
+   把 `batch_no` 改成可重试分配，两条都会动到所有拆批调用方（`split_batch` /
+   `split_batch_for_partial_pass` / pickup 路径），超出本轮范围。
 
 ---
 
