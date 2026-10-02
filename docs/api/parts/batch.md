@@ -1,13 +1,18 @@
-# part 域 — Batch 操作
+# Batch 操作 —— part 的批次集合 + 批次拆分
 
-> 本文件须与 `src/modules/part/{handler.rs,dto.rs, service/batch.rs}` 保持同步
 > 通用约定见 [`../index.md`](../index.md)
 > 共享 DTO 见 [`./index.md`](./index.md)
 >
-> 范围：本文件覆盖 4 个 batch 端点（batch-with-pdfs / `GET /{part_id}/batches` /
-> `POST /{part_id}/batches` / `/{part_id}/batches/split`）。CRUD / lifecycle / inspection 见
+> 范围：本文件覆盖 4 个 batch 端点（`POST /api/v2/parts/batch-with-pdfs` /
+> `GET /api/v2/parts/{part_id}/batches` / `POST /api/v2/parts/{part_id}/batches` /
+> `POST /api/v2/prod/batches/{batch_id}/split`）。CRUD / lifecycle / inspection 见
 > [`./crud.md`](./crud.md) / [`./lifecycle.md`](./lifecycle.md) / [`./inspection.md`](./inspection.md)。
-
+>
+> **2026-10-02 归属变更**：`split` 以**单个批次**为操作对象，已迁到 prod 域
+> `/api/v2/prod/batches/{batch_id}/split`，`batch_id` 改由路径提供。part 域保留
+> `GET|POST /api/v2/parts/{part_id}/batches`（part 的批次集合读 / 在 part 下新开批次）——
+> 操作对象是 part，不是某个批次。
+>
 > **2026-09-23 PR12 新增文件**：本节 3 个端点原 docs/api/parts/ 未覆盖，
 > 本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。
 
@@ -21,7 +26,7 @@
 - [POST /api/v2/parts/batch-with-pdfs](#post-apiv2partsbatch-with-pdfs)
 - [GET /api/v2/parts/{part_id}/batches](#get-apiv2partspart_idbatches)
 - [POST /api/v2/parts/{part_id}/batches](#post-apiv2partspart_idbatches)
-- [POST /api/v2/parts/{part_id}/batches/split](#post-apiv2partspart_idbatchessplit)
+- [POST /api/v2/prod/batches/{batch_id}/split](#post-apiv2prodbatchesbatch_idsplit)
 
 ---
 
@@ -71,7 +76,7 @@ Response 200 `data`：`PartBatchListItemOut[]`，数组按 `batch_no ASC` 升序
 | `batch_label` | string | no | 展示标签，格式 `L{id}`（与 delivery_note 一致） |
 | `quantity` | number | no | 批次数量 |
 | `status` | string | no | `OrderStatus` 枚举字符串 |
-| `is_repairing` | bool | no | 是否处于返修中（**2026-10-01 review 第 1 轮 M5 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006）；非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，起修时 `status` 保持 `IN_PROCESS` ⇒ 判断「返修中」只能读本字段。前端 Zod schema 必须按**必填** `boolean` 声明，不能 `.optional()`（同 `InspectionBatchListItemOut`）。语义与 Rust 侧 `src/modules/part/vo/part.rs` 一致 |
+| `is_repairing` | bool | no | 是否处于返修中（**2026-10-01 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006）；非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，起修时 `status` 保持 `IN_PROCESS` ⇒ 判断「返修中」只能读本字段。前端 Zod schema 必须按**必填** `boolean` 声明，不能 `.optional()`（同 `InspectionBatchListItemOut`）。语义与 Rust 侧 `src/modules/part/vo/part.rs` 一致 |
 | `location` | string | yes | `OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF / OUTSOURCE_COMPANY` |
 | `current_holder_id` | string | yes | 当前持有者 ID |
 | `current_holder_display` | string | yes | 当前持有者解析名（货架 code / 工人姓名 / 外协公司名） |
@@ -95,7 +100,7 @@ Response 200 `data`：`PartBatchListItemOut[]`，数组按 `batch_no ASC` 升序
 > `INSPECTION` + `is_repairing = true`）⇒ 前端判「返修中」**只能**读
 > `is_repairing`，靠 `status` 区分不出来。本文件此前（2026-09-30 起）**从未记录过
 > 该字段**，属文档漂移，本次补齐。背景与端点影响面见
-> [`./lifecycle.md` § GET /api/v2/parts/repairing-batches](./lifecycle.md#get-apiv2partsrepairing-batches)；
+> [`./lifecycle.md` § GET /api/v2/prod/batches/repairing](./lifecycle.md#get-apiv2prodbatchesrepairing)；
 > 同一批字段的另一个 VO（`InspectionBatchListItemOut`）见
 > [`./inspection.md`](./inspection.md)。
 
@@ -126,11 +131,11 @@ Response 201 `data`：`BatchOut`。
 
 错误码：20101 / 20104 / 40001。
 
-### `POST /api/v2/parts/{part_id}/batches/split`
+### `POST /api/v2/prod/batches/{batch_id}/split`
 
 权限: **Manager / Inspector**
 
-> 2026-09-22 起 P3 split：对 `t_part_batch` 拆批操作（一个批次 → 两个批次）。
+> P3 split：对 `t_part_batch` 拆批操作（一个批次 → 两个批次）。
 > 用于：返工拆批 / 部分检验拆批 / 多工人合作拆批。`version` 锚
 > `t_part_batch.version`。
 
@@ -138,26 +143,27 @@ Path：
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
-| `part_id` | string (i64) | part 雪花 ID |
+| `batch_id` | string (i64) | 被拆批次的雪花 ID（`t_part_batch.id`，全局唯一；**2026-10-02 起由路径锚定**） |
 
-Request：
+Request：`SplitBatchRequest`（body 必填）
 
 ```json
 {
-  "batch_id": 1234567890,    // 必填；被拆的批次
   "version": 0,               // 必填；batch.version（OCC）
-  "split_quantity": 1,        // 必填；新批次数量（>0 且 < source.batch.quantity）
-  "reason": "string (可选)",
+  "quantity": 1,              // 必填；新批次数量（>0 且 < source.batch.quantity）
   "note": "string (可选)"
 }
 ```
+
+> **2026-10-02 BREAKING**：`batch_id` 从 body 删除（成为路径参数）。
+> 被拆批次的 `part_id` 由 service 按 `batch_id` 反查得到。
 
 业务流转：source.quantity -= split_quantity → new_batch.quantity = split_quantity
 两个新批次共享原状态（如 QUERY_TO_SHIP → 拆后两个批次都仍 QUERY_TO_SHIP）。
 
 Response 200 `data`：`{ source_batch: BatchOut, new_batch: BatchOut, event: PartEventOut }`。
 
-错误码：20101 / 20109 / 20111（quantity 非法）/ 40901。
+错误码：20101 / 20109（批次不存在 / 已软删 / 状态不是流转起点）/ 20111（`quantity ≤ 0`）/ 40901。
 
 ---
 

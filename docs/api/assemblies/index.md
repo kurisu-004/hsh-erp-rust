@@ -201,8 +201,8 @@
 
 **触发点（PR-B3 后扩展）**：
 
-- Phase 0（仅 inspection 流）：`POST /parts/{id}/{to-inspection,to-ship,to-process}` + `POST /parts/batch-to-inspection` + `POST /parts/batch-to-ship` + `POST /parts/worker-scan`（仅 `INSPECTED` 分支）
-- **Phase 1（2026-09-11 起）**：`POST /parts/{id}/{deliver, complete, cancel, start-repair}` 等 batch lifecycle 端点也通过 `PartService::sync_from_batch_change` 触发同一 rollup——同一 part 的批次状态变化都会级联到父装配件
+- Phase 0（仅 inspection 流，**2026-10-02 起归 prod 域**）：`POST /prod/batches/{batch_id}/{to-inspection,to-ship,to-process}` + `POST /prod/batches/to-inspection` + `POST /prod/batches/to-ship` + `POST /prod/batches/worker-scan`（仅 `INSPECTED` 分支）
+- **Phase 1（2026-09-11 起）**：batch lifecycle 端点（`POST /prod/batches/{batch_id}/{deliver, complete, start-repair}` + 仍留 part 域的 `POST /parts/{id}/cancel`）也通过同一个 `status_gate` 派生触发同一 rollup——同一 part 的批次状态变化都会级联到父装配件
 - 详见 [`docs/refactor-part-assembly-batch.md`](../../refactor-part-assembly-batch.md#42-rollup-回调核心-新增-partservicesync_from_batch_change)
 
 算法与 Python `service/_assembly_rollup.py::recompute_assembly_status` 对齐，按以下顺序：
@@ -242,7 +242,7 @@
    （`PENDING → INSPECTION` 不在 `can_transition_to` 白名单里）——这在业务上等价于
    「每个子件都真实流转过」，是对子件进度的如实映射。
 
-涉及的 part inspection 端点：`POST /parts/{id}/{to-inspection,to-ship,to-process}`、`POST /parts/{batch-to-inspection,batch-to-ship}`、`POST /parts/worker-scan`（仅 `INSPECTED` 分支；`RETURNED` 不动 part.status）。
+涉及的 inspection 端点（**2026-10-02 起归 prod 域**）：`POST /prod/batches/{batch_id}/{to-inspection,to-ship,to-process}`、`POST /prod/batches/{to-inspection,to-ship}`、`POST /prod/batches/worker-scan`（仅 `INSPECTED` 分支；`RETURNED` 不动 part.status）。
 
 WS 广播：每次实际翻状态 → commit 后下发 `ASSEMBLY_UPDATED`（payload `{ assembly_id }`），与 assembly update endpoint 复用同一 kind。
 

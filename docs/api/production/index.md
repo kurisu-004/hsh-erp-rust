@@ -1,6 +1,10 @@
 # production 域 API — 生产管理
 
-> 本目录须与 `src/modules/prod/{work_type,process,process_chain,worker_pool,worker,batch,programming,shelf_process}/{handler.rs,dto.rs,service.rs}` 保持同步
+> 本目录须与 `src/modules/prod/*` 保持同步（2026-10-03 订正：各模块文件形态不一致，不适用统一通配）：
+> - 扁平三件套 `{handler.rs,dto.rs,service.rs}`：`work_type` / `process` / `worker_pool` / `worker` / `programming` / `shelf_process`
+> - `process_chain`：`{handler.rs,dto.rs}` + `service/` `repo/` `vo/` 目录
+> - `batch`：`{dto.rs,vo.rs,mod.rs,model.rs,status_gate.rs}` + `handler/` `service/` `repo/` 目录（见 [`./batches.md`](./batches.md)）
+>
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
 > 范围：**生产管理**菜单（前端 `production_group` 一级 + `process_work_type` / `part_process_chain` / `worker_queue` 三个子菜单）下挂的全部后端域。本目录按前端菜单 + 工人档案 + 待下发批次拆分 **9 个子页 + 1 个入口**（⚠️ 2026-10-02 订正：原写「7 个文件」，实为 9 个子页）。
@@ -13,7 +17,7 @@
 
 ---
 
-## 端点列表（35 个 = 7 worker + 7 工种 + 5 工序 + 3 工艺链 + 6 pool + 3 batch + 1 programming + 3 货架映射）
+## 端点列表（60 个 = 7 worker + 7 工种 + 5 工序 + 3 工艺链 + 6 pool + 28 batch + 1 programming + 3 货架映射）
 
 > 2026-09-19 prod 聚合：原 19 端点 + worker 7 端点（详见 [`workers.md`](./workers.md)）+ worker_pool 的 admin/assign 1 端点。2026-09-29 新增 4 端点（详见 [`batches.md`](./batches.md)）：1 个 PENDING 列表 + 3 个下发（单条 / 批量 / 自动）。
 > 2026-09-30 prod 域 9 端点重构（worker-pool + batches 合并）：
@@ -22,7 +26,10 @@
 > - batches auto-dispatch 改为只读 preview（不再真下发）。
 > - 净变化：原 31 → 30 端点（-1 net）。
 > 2026-10-01 新增 1 端点（详见 [`pending-programming.md`](./pending-programming.md)）：`prod::programming` 待编程一览 → 净变化 30 → 31 端点（+1）。
-> 2026-10-02 新增 3 端点（详见 [`shelf-process-mapping.md`](./shelf-process-mapping.md)）：`prod::shelf_process` 货架 ↔ 工序映射，自 `src/modules/shelf/process_mapping/` 搬入本域（旧路径 404，无 alias）→ 净变化 32 → 35 端点（+3）。⚠️ 2026-10-02 订正：上文两处旧账均系计数残留 —— ①「worker-pool 5 端点」实为 6（见「工人池」节），故 **master 上的「31」实为 32**；② 本节标题原按「17 + 5 + 3 + 6 + 3 + 1」记账，17 是「主数据表实列行数」（= 7 worker + 5 工种 CRUD + 5 工序），而按子模块求和应是 7 + 7 + 5 = 19，两者相差的 2 条正是工种↔工序映射端点（记在下一节的 5 条里）。现标题改为**按子模块求和**的显式公式，逐项可加：7 + 7 + 5 + 3 + 6 + 3 + 1 + 3 = 35。
+> 2026-10-02 新增 3 端点（详见 [`shelf-process-mapping.md`](./shelf-process-mapping.md)）：`prod::shelf_process` 货架 ↔ 工序映射，自 `src/modules/shelf/process_mapping/` 搬入本域（旧路径 404，无 alias）→ 净变化 32 → 35 端点（+3）。⚠️ 2026-10-02 订正：上文两处旧账均系计数残留 —— ①「worker-pool 5 端点」实为 6（见「工人池」节），故 **master 上的「31」实为 32**；② 本节标题原按「17 + 5 + 3 + 6 + 3 + 1」记账，17 是「主数据表实列行数」（= 7 worker + 5 工种 CRUD + 5 工序），而按子模块求和应是 7 + 7 + 5 = 19，两者相差的 2 条正是工种↔工序映射端点（记在下一节的 5 条里）。现标题改为**按子模块求和**的显式公式，逐项可加：7 + 7 + 5 + 3 + 6 + 3 + 1 + 3 = 35（订正时点为 35，2026-10-02 batch 子资源迁入后为 60，见下条）。
+> **2026-10-02 订正**：25 条 `t_part_batch` 子资源路由自 part 域迁入后，本节标题的
+> 35 改为 **60**（35 + 25）。子资源逐条清单见
+> [`batches.md`](./batches.md#2026-10-02-t_part_batch-子资源迁入)。
 
 ### worker / work_type / process 主数据（17 端点）
 
@@ -96,7 +103,7 @@
 > 2026-09-30 重构时的旧计数残留（`/counts` 新增时只加了行没改标题）。故 **master 上的
 > 「31」实为 32**；本任务 +3 后 **实际 35**。
 
-### 待下发批次（3 端点，2026-09-29 新增 + 2026-09-30 重构）
+### 待下发批次（3 端点，2026-09-29 新增 + 2026-09-30 重构；2026-10-02 扩为 28）
 
 | Method | Path | 权限 | 说明 | 详情 |
 |---|---|---|---|---|
@@ -105,6 +112,15 @@
 | POST | `/api/v2/prod/batches/auto-dispatch` | Manager+Clerk | **2026-09-30 改为只读预览**：返回每个 batch 的首道工序 + 首货架 + skip_reason；前端据此构造 dispatch 请求 | [`batches.md`](./batches.md#post-apiv2prodbatchesauto-dispatch) |
 
 > 旧 `/api/v2/prod/batches/bulk-dispatch` 端点 404（router 层不再挂载；bulk 走统一 dispatch 的 targets 数组）。
+>
+> **2026-10-02 扩充**：`/api/v2/prod/batches/*` 前缀下新增 25 条 `t_part_batch`
+> 子资源路由（自 part 域迁入，锚点 `part_id` → `batch_id`）—— 单批流转
+> （`to-inspection` / `to-ship` / `to-process` / `deliver` / `complete` / `start-repair` /
+> `place-on-shelf` / `recall-to-pending` / `release-from-programming` / 外协 3 条 /
+> 返修 3 条 / `scan-inspect` / `pick-up` / `split` / 单批 `cancel` / `scan/deliver`）+
+> 静态批量与事件 3 条（`to-ship` / `to-inspection` / `worker-scan`）+ 集合读 3 条
+> （`inspection` / `repair` / `repairing`）。本域端点总数 35 → 60。逐条清单与文档章节索引见
+> [`batches.md#2026-10-02-t_part_batch-子资源迁入`](./batches.md#2026-10-02-t_part_batch-子资源迁入)。
 
 ### 待编程一览（1 端点，2026-10-01 新增）
 
@@ -130,24 +146,35 @@
 [排工序]                       [待下发]                       [下发]                            [报工]                          [完成]
    |                              |                              |                                |                                |
    ▼                              ▼                              ▼                                ▼                                ▼
-prod/process-chains/by-part/*   prod/batches/pending          prod/pool/{process_id}          parts/worker-scan (part域)       parts/{part_id}/complete (part域)
-prod/process-chains/{chain_id}  prod/batches/dispatch         prod/pool/refill                parts/{part_id}/pick-up (part域)  parts/{id}/to-process (part域)
-                                prod/batches/auto-dispatch    prod/pool/move                  parts/{part_id}/to-process (part域) parts/{id}/to-inspection (part域)
-                                                               prod/pool/auto-allocate                                      parts/{id}/scan-inspect (part域)
-                                                               prod/pool/state
-                                                               prod/pool/counts
+prod/process-chains/by-part/*   prod/batches/pending          prod/pool/{process_id}          prod/batches/worker-scan     prod/batches/{batch_id}/complete
+prod/process-chains/{chain_id}  prod/batches/dispatch         prod/pool/refill                prod/batches/{batch_id}/pick-up
+                               prod/batches/auto-dispatch    prod/pool/move                  prod/batches/{batch_id}/to-process
+                                                              prod/pool/auto-allocate         prod/batches/{batch_id}/to-inspection
+                                                              prod/pool/state                 prod/batches/{batch_id}/scan-inspect
+                                                              prod/pool/counts
 ```
 
 **核心入口**：
 - **车间下发台**：浏览器打开「待下发 Tab」先 `GET /api/v2/prod/batches/pending` 拿列表，UI 自动 `POST /api/v2/prod/batches/auto-dispatch {batch_ids: [...]}` 预览每批的首道工序 + 首货架，用户确认后 `POST /api/v2/prod/batches/dispatch {targets: [{batch_id, target_process_id}, ...]}` 真正下发。提交后 batch 状态 `PENDING → IN_PROCESS`，自动触发 `BATCH_PLACED_ON_SHELF` WS 广播让其他客户端刷新候选池。
-- **扫码台**（工人报工唯一入口）：`POST /api/v2/parts/worker-scan`（part 域）。扫描成功后同事务触发 `refill_for_worker`（→ 详见 [`worker-pool.md#worker-scan-与-refill-的联动`](./worker-pool.md#worker-scan-与-refill-的联动)）。
+- **扫码台**（工人报工唯一入口）：`POST /api/v2/prod/batches/worker-scan`。扫描成功后同事务触发 `refill_for_worker`（→ 详见 [`worker-pool.md#worker-scan-与-refill-的联动`](./worker-pool.md#worker-scan-与-refill-的联动)）。
 - **大屏候选池**：`GET /api/v2/prod/pool/state`（无 role guard，worker 自查 + admin 监控共用）。
 - **管理员拖拽 / 转移批次**：UI 走 `POST /api/v2/prod/pool/move {from, to}`（POOL ↔ WORKER + WORKER ↔ WORKER 三方向通用移动端点）；批量按 COUNT/TIME 走 `pool/auto-allocate`。
 
-**为何报工端点留在 part 域**：
-part / assembly 是 ERP 核心实体（跨生产 + 编程 + 外协 + 质检 + 交付 + 返修），CLAUDE.md 明确标记为「跨域枢纽」。
-`worker-scan` / `pick-up` / `to-*` / `complete` / 返修闭环 共享 `t_part_batch` OCC + 事件 rollup + 状态机本体，
-强行从 part 域拆出会掏空 part 域并制造双向依赖。本节只负责文档串联，**代码侧零迁移**。
+**为何报工端点归 prod 域**：
+`worker-scan` / `pick-up` / `to-*` / `complete` / 返修闭环 共享 `t_part_batch` OCC +
+`status_gate` rollup + 状态机本体 —— 这三者（`PartBatchRepo` / `status_gate` /
+批次 SQL）已**整体搬到 prod 域**，路由因而与实现同域；part 域收窄为
+「多批次动作 + 非批次动作」（`POST /parts/{part_id}/cancel` / `force-complete` /
+CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
+路径锚点也据此从 `part_id` 改为 `batch_id`：`t_part_batch.id` 全局唯一即锚点，
+`part_id` 形参本就冗余（`status_gate` 的 part 派生由 `RETURNING part_id` 反推，
+不依赖调用方传值），且「批次不属于该 part」这一场景在 `batch_id` 必填后不再存在。
+
+**与 2026-09-29 那次 parts 集合迁移的边界**（勿与本节混为一谈）：
+2026-09-29 迁的是 **parts 集合**（工单列表 `/prod/parts` → 移回 `/parts`），
+`GET /api/v2/parts`、`GET /api/v2/parts/by-serial/*` 等至今在 part 域；
+2026-10-02 迁的是 **batch 子资源**（`/parts/*/{action}` → `/prod/batches/{batch_id}/{action}`）。
+两者方向相反、对象不同，不冲突。
 
 ---
 

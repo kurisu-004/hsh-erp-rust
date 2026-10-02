@@ -95,14 +95,17 @@
 
 ### 2.1 列表/筛选（Rust 已全补）
 
+> 下表 `Path` 列是 **Python v1 主仓的现行路径**（`/api/v1/*`），不受 2026-10-02 的
+> Rust 侧路由迁移影响；Rust 对应路径见末列。（§2.1–§2.6 各表 `Path` 列均为 Python v1 现行路径）
+
 | Method | Path | Python | Rust |
 |---|---|---|---|
 | GET | `/api/v1/parts/pending-programming` | `pending_programming` | ✅ `/api/v2/parts/pending-programming` |
 | GET | `/api/v1/parts/outsource-in-flight` | `outsource_in_flight` | ✅ `/api/v2/parts/outsource-in-flight` |
 | GET | `/api/v1/parts/outsource-sendable` | `outsource_sendable` | ✅ `/api/v2/parts/outsource-sendable` |
-| GET | `/api/v1/parts/inspection-batches` | `inspection_batches` | ✅ `/api/v2/parts/inspection-batches` |
-| GET | `/api/v1/parts/repair-batches` | `repair_batches` | ✅ `/api/v2/parts/repair-batches` |
-| GET | `/api/v1/parts/repairing-batches` | `repairing_batches` | ✅ `/api/v2/parts/repairing-batches` |
+| GET | `/api/v1/parts/inspection-batches` | `inspection_batches` | ✅ `/api/v2/prod/batches/inspection` |
+| GET | `/api/v1/parts/repair-batches` | `repair_batches` | ✅ `/api/v2/prod/batches/repair` |
+| GET | `/api/v1/parts/repairing-batches` | `repairing_batches` | ✅ `/api/v2/prod/batches/repairing` |
 | GET | `/api/v1/parts/location-tree` | `location_tree` | ✅ `/api/v2/parts/location-tree` |
 
 ### 2.2 批次管理（Rust 已全补）
@@ -110,32 +113,38 @@
 | Method | Path | Python | Rust |
 |---|---|---|---|
 | GET | `/api/v1/parts/{id}/batches` | list | ✅ `/api/v2/parts/{part_id}/batches` |
-| POST | `/api/v1/parts/{id}/batches/split` | split | ✅ `/api/v2/parts/{part_id}/batches/split` |
-| POST | `/api/v1/parts/{id}/batches/{batch_id}/cancel` | cancel | ✅ `/api/v2/parts/{part_id}/batches/{batch_id}/cancel` |
+| POST | `/api/v1/parts/{id}/batches/split` | split | ✅ `/api/v2/prod/batches/{batch_id}/split` |
+| POST | `/api/v1/parts/{id}/batches/{batch_id}/cancel` | cancel | ✅ `/api/v2/prod/batches/{batch_id}/cancel` |
 
 ### 2.3 状态机扩展（Rust 已全补）
 
 | Method | Path | Python | Rust |
 |---|---|---|---|
-| POST | `/api/v1/parts/{id}/place-on-shelf` | place-on-shelf | ✅ |
-| POST | `/api/v1/parts/{id}/recall-to-pending` | recall-to-pending | ✅ |
+| POST | `/api/v1/parts/{id}/place-on-shelf` | place-on-shelf | ✅ `/api/v2/prod/batches/{batch_id}/place-on-shelf` |
+| POST | `/api/v1/parts/{id}/recall-to-pending` | recall-to-pending | ✅ `/api/v2/prod/batches/{batch_id}/recall-to-pending` |
 | POST | `/api/v1/parts/{id}/send-to-programming` | send-to-programming | ✅ |
 | POST | `/api/v1/parts/{id}/recall-to-programming` | recall-to-programming | ✅ |
-| POST | `/api/v1/parts/{id}/release-from-programming` | release-from-programming | ✅ |
-| POST | `/api/v1/parts/{id}/send-to-outsource` | send-to-outsource | ✅ |
-| POST | `/api/v1/parts/{id}/receive-from-outsource` | receive-from-outsource | ✅ |
-| POST | `/api/v1/parts/{id}/receive-from-outsource-to-inspection` | receive-to-inspection | ✅ |
-| POST | `/api/v1/parts/{id}/repair-dispatch` | repair-dispatch | ✅ |
-| POST | `/api/v1/parts/{id}/start-repair` | start-repair | ✅ |
-| POST | `/api/v1/parts/{id}/complete-repair` | complete-repair | ✅ |
+| POST | `/api/v1/parts/{id}/release-from-programming` | release-from-programming | ✅ `/api/v2/prod/batches/{batch_id}/release-from-programming` |
+| POST | `/api/v1/parts/{id}/send-to-outsource` | send-to-outsource | ✅ `/api/v2/prod/batches/{batch_id}/send-to-outsource` |
+| POST | `/api/v1/parts/{id}/receive-from-outsource` | receive-from-outsource | ✅ `/api/v2/prod/batches/{batch_id}/receive-from-outsource` |
+| POST | `/api/v1/parts/{id}/receive-from-outsource-to-inspection` | receive-to-inspection | ✅ `/api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` |
+| POST | `/api/v1/parts/{id}/repair-dispatch` | repair-dispatch | ✅ `/api/v2/prod/batches/{batch_id}/repair-dispatch` |
+| POST | `/api/v1/parts/{id}/start-repair` | start-repair | ✅ `/api/v2/prod/batches/{batch_id}/start-repair` |
+| POST | `/api/v1/parts/{id}/complete-repair` | complete-repair | ✅ `/api/v2/prod/batches/{batch_id}/complete-repair` |
+
+> 表中 ✅ 路径为 **2026-10-02 后的现行路径**：以单个批次为操作对象的端点已自
+> `/api/v2/parts/*` 迁往 `/api/v2/prod/batches/*`（锚点 `part_id` → `batch_id`，硬切换无
+> alias）。留在 part 域的是多批次动作（`/parts/{part_id}/cancel` / `force-complete`）
+> 与非批次动作。逐条清单见
+> [`./production/batches.md#2026-10-02-t_part_batch-子资源迁入`](./production/batches.md#2026-10-02-t_part_batch-子资源迁入)。
 
 ### 2.4 扫码台（Rust 已全补 + Rust-only）
 
 | Method | Path | Python | Rust |
 |---|---|---|---|
 | POST | `/api/v1/parts/scan` | 通用扫码 | ⚪ 当前走 `worker-scan`（功能更细） |
-| POST | `/api/v1/parts/pick-up` | 领取件 | ⚪ 当前走 `worker-scan` + `/pick-up` B 方案 |
-| POST | `/api/v1/parts/scan/deliver-part` | 扫码发货 | ✅ |
+| POST | `/api/v1/parts/pick-up` | 领取件 | ⚪ 当前走 `worker-scan` + `/prod/batches/{batch_id}/pick-up` B 方案 |
+| POST | `/api/v1/parts/scan/deliver-part` | 扫码发货 | ✅ `/api/v2/prod/batches/scan/deliver` |
 | GET | `/api/v1/parts/by-work-type/{work_type_id}` | 按工种查 | ✅ |
 | GET | `/api/v1/parts/pickable-by-work-type/{work_type_id}` | 按工种查可领取 | ✅ |
 | GET | `/api/v1/parts/by-worker/{worker_id}` | 按工人查持有 | ✅ |
@@ -192,8 +201,8 @@
 |---|---|---|---|
 | POST | `/api/v2/delivery-notes/scan` | delivery_notes | P3 扫码建单（find-or-create 草稿） |
 | GET | `/api/v2/delivery-notes/batch-detail` | delivery_notes | 批量详情（按 id 列表） |
-| POST | `/api/v2/parts/batch-to-ship` | part | 批量通过品检（Python 仅单件 `/parts/{id}/to-ship`） |
-| POST | `/api/v2/parts/batch-to-inspection` | part | 批量送检（Python 仅单件 `/parts/{id}/to-inspection`） |
+| POST | `/api/v2/prod/batches/to-ship` | prod::batch | 静态批量通过品检（Python 仅单件 to-ship） |
+| POST | `/api/v2/prod/batches/to-inspection` | prod::batch | 静态批量送检（Python 仅单件 to-inspection） |
 | GET / POST | `/api/v2/delivery-groups` | delivery_groups | 送货分组（Rust 新增域） |
 | POST | `/api/v2/delivery-groups/{id}/update` / `soft-delete` | delivery_groups | 同上 |
 | GET | `/api/v2/prod/worker-pool/state` | worker_pool | 工人池状态查询（Rust 新增域） |
@@ -201,12 +210,12 @@
 | POST | `/api/v2/prod/admin/worker-pool/remove` | worker_pool | 管理员手动 remove |
 | POST | `/api/v2/prod/admin/worker-pool/auto-allocate` | worker_pool | auto-allocate 批量分配（Phase 2，2026-09-12） |
 | POST | `/api/v2/parts/by-work-type/{wt}` / `pickable-by-work-type/{wt}` / `by-worker/{w}` | part | 工种/工人视角列表（Phase 2） |
-| POST | `/api/v2/parts/{id}/pick-up` | part | B 方案手动 pick-up 兜底（Phase 2） |
-| POST | `/api/v2/parts/{id}/send-to-outsource` / `receive-from-outsource` | part | 派发外协 / 外协回收（Phase 1） |
-| POST | `/api/v2/parts/{id}/repair-dispatch` / `complete-repair` | part | 维修派发 / 完成（Phase 1） |
-| POST | `/api/v2/parts/{id}/scan-inspect` | part | 扫码品检（Phase 1） |
-| POST | `/api/v2/parts/scan/deliver-part` | part | 扫码发货（Phase 1） |
-| POST | `/api/v2/parts/match-by-excel-items` / `batch-update-order-info` / `batch-with-pdfs` | part | 流程辅助（Phase 1） |
+| POST | `/api/v2/prod/batches/{batch_id}/pick-up` | prod::batch | B 方案手动 pick-up 兜底（Phase 2） |
+| POST | `/api/v2/prod/batches/{batch_id}/send-to-outsource` / `receive-from-outsource` | prod::batch | 派发外协 / 外协回收（Phase 1） |
+| POST | `/api/v2/prod/batches/{batch_id}/repair-dispatch` / `complete-repair` | prod::batch | 维修派发 / 完成（Phase 1） |
+| POST | `/api/v2/prod/batches/{batch_id}/scan-inspect` | prod::batch | 扫码品检（Phase 1） |
+| POST | `/api/v2/prod/batches/scan/deliver` | prod::batch | 扫码发货（Phase 1） |
+| POST | `/api/v2/parts/match-by-excel-items` / `batch-update-order-info` / `batch-with-pdfs` | part | 流程辅助（Phase 1；仍留 part 域） |
 | POST | `/api/v2/assemblies/{id}/start` | assembly | 装配件启动（Phase 3 deferred #4） |
 | POST | `/api/v2/assemblies/{id}/files` | assembly | 装配件独立 PDF 上传（Phase 3 deferred #1） |
 | POST/GET | `/api/v2/_e2e/*`（11 端点） | _e2e | seed hook（2026-09-14，dev/test 默认） |
@@ -269,3 +278,43 @@
 - **修复（已做）**：parts/ 域补 12 个缺失端点 + 新增 batch.md（commit `cc7654b`）
 - **修复（未做）**：production/* 错误码 review / statistics.md 错误码段 / customers/applicants/shelves PR4 vo/ 字段一致性核对（drift 报告 P2/P3 项）
 - **决策**：PR12 已基本完成（P0 parts 全部补齐）。P2/P3 留给后续 doc-drift PR。
+
+
+---
+
+## 9. Rust 内部契约变更登记（非 Python 对齐差异）
+
+本节登记 **Rust 前后端之间**的契约变更（Python myERP 不参与，故不属于第 1~7 节）。
+
+### 9.1 2026-10-02：25 条 t_part_batch 子资源路由迁往 prod 域
+
+`t_part_batch` 是生产执行单元，其 OCC / `status_gate` rollup / 状态机本体整体归 prod 域，
+25 条「以单个批次为操作对象」的路由随之从 `/api/v2/parts/*` 迁到
+`/api/v2/prod/batches/*`（**URL 硬切换，无 alias**，旧路径 404）。逐条清单见
+[`./production/batches.md`](./production/batches.md#2026-10-02-t_part_batch-子资源迁入)。
+
+**判据**：操作对象是**多个批次**或**根本不是批次**的端点留在 part 域 ——
+`POST /parts/{part_id}/cancel`（翻转该 part 全部活跃批次）、
+`POST /parts/{part_id}/force-complete`（全部非 CANCELLED 批次）、
+`POST /parts/{part_id}/soft-delete`、`GET /parts/{part_id}/batches`，
+以及全部 CRUD / 文件 / 各类 list 端点。
+
+**BREAKING 变更**：
+
+| 维度 | 变更前 | 变更后 |
+|---|---|---|
+| 19 条子资源的路径锚点 | `{part_id}` + body 内 `batch_id` | `{batch_id}` 路径参数，**body 内 `batch_id` 字段删除** |
+| 3 条静态批量 / 事件（`to-ship` / `to-inspection` / `worker-scan`） | 无 Path | 仍无 Path，**请求体逐字不变**（`items[].batch_id` / `batch_id?` 保留） |
+| 3 条集合读 | `GET /parts/{inspection,repair,repairing}-batches` | `GET /prod/batches/{inspection,repair,repairing}` |
+| WS 事件 `kind` 字符串 | `PART_TO_SHIP` / `PART_TO_INSPECTION` / `PART_TO_PROCESS` / `BATCH_TO_*` / `WORKER_SCAN_*` | **不变** |
+
+**错误码语义变更**（本节即该变更的登记处）：
+
+| code | 变更前 | 变更后 |
+|---|---|---|
+| 20109 `BIZ_PART_BATCH_NOT_FOUND` | 传一个「**不属于该 part** 的 `batch_id`」→ 20109（靠 SQL 的 `AND part_id = $2` 判定） | **退化为**「批次不存在 / 已软删 / 状态不是流转起点」。`batch_id` 全局唯一即锚点，「跨 part 批次」不再是可表达的场景，SQL 里的 `AND part_id = $2` 冗余断言随之删除。留在 part 域的 `cancel` / `force-complete` 操作对象是该 part 的多个批次、不接受 `batch_id` 入参，故不返回 20109 |
+| 20101 `BIZ_PART_NOT_FOUND` | 传了不存在的 `part_id` | **仍可达，语义不变** —— 只能经由「批次的 part 已软删」触发（service 按 `batch_id` 反查 part 后判软删） |
+
+> 归口文档：[`./parts/inspection.md`](./parts/inspection.md) § 错误码参考（含各端点
+> 「错误码」小节）、[`./parts/lifecycle.md`](./parts/lifecycle.md)、
+> [`./production/batches.md`](./production/batches.md#错误码语义变更20109--20101)。

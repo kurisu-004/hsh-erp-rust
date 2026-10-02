@@ -1,13 +1,17 @@
-# prod::batch 域 API —— 车间 PENDING 批次列表 + 下发（2026-09-30 重构）
+# prod::batch 域 API —— 车间下发 + `t_part_batch` 生产流转
 
-> 本文件须与 `src/modules/prod/batch/{handler.rs,dto.rs,service.rs,repo.rs,vo.rs}` 保持同步
+> 本文件须与 `src/modules/prod/batch/{handler/,service/,repo/,dto.rs,vo.rs,mod.rs,model.rs,status_gate.rs}` 保持同步（2026-10-03 订正：`handler` / `service` / `repo` 为目录制，与 [`../parts/inspection.md`](../parts/inspection.md) 实现位置段同一口径。）
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
-> 范围：**车间下发** PENDING 批次专用域 —— UI「待下发队列」展示 + 一键 / 批量 / 自动预览 3 路径。
+> **范围一 —— 车间下发**（PENDING 批次专用域）：UI「待下发队列」展示 + 一键 / 批量 / 自动预览 3 路径。
 > 2026-09-29 新增 + 2026-09-30 重构：
 > - dispatch 统一 bulk-only（单条下发即 `targets.length == 1`）
 > - auto-dispatch 改为只读 preview（不再真下发，返回首道工序 + 首货架 + skip_reason）
 > - bulk-dispatch 端点删除（路由层不再挂载）
+>
+> **范围二 —— `t_part_batch` 生产流转**（2026-10-02 自 part 域迁入的 25 条以单个批次为
+> 操作对象的路由：19 条子资源 + 3 条静态批量 / 事件 + 3 条集合读），逐条清单见
+> [下方「t_part_batch 子资源迁入」节](#2026-10-02-t_part_batch-子资源迁入)。本域端点总数 3 → 28。
 
 ## 端点列表
 
@@ -19,6 +23,93 @@
 
 > 路由挂载：`prod::mod::router().nest("/batches", batch::router())` —— 见 `src/modules/prod/mod.rs`。
 > 旧 `/batches/bulk-dispatch` 端点 404（router 层不再挂载）。
+
+---
+
+## 2026-10-02 t_part_batch 子资源迁入
+
+`t_part_batch` 是生产执行单元，其 OCC / `status_gate` rollup / 状态机本体
+（`PartBatchRepo` + `status_gate` + 批次 SQL）整体归 prod 域，25 条「以单个批次为
+操作对象」的路由随之从 `/api/v2/parts/*` 迁到 `/api/v2/prod/batches/*`。
+**URL 硬切换，无 alias**；旧路径 404。
+
+路径锚点由 `part_id` 改为 `batch_id`（`t_part_batch.id` 全局唯一即锚点），
+子资源端点的 `batch_id` **同时从请求体删除**。
+
+**留在 part 域的判据**：操作对象是**多个批次**或**根本不是批次**——
+`POST /parts/{part_id}/cancel`（翻转该 part 全部活跃批次）、
+`POST /parts/{part_id}/force-complete`（全部非 CANCELLED 批次）、
+`POST /parts/{part_id}/soft-delete`、`GET /parts/{part_id}/batches`，
+以及全部 CRUD / 文件 / 各类 list 端点。
+
+### 单批流转子资源（19 条，锚点 = `batch_id`）
+
+| Method | Path | 权限 | 说明 | 文档章节 |
+|---|---|---|---|---|
+| POST | `/api/v2/prod/batches/{batch_id}/to-inspection` | Manager / Inspector | 单件送检 | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesbatch_idto-inspection) |
+| POST | `/api/v2/prod/batches/{batch_id}/to-ship` | Manager / Inspector | 单件通过品检 | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesbatch_idto-ship) |
+| POST | `/api/v2/prod/batches/{batch_id}/to-process` | Manager / Inspector | 单件指定下一工序 | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesbatch_idto-process) |
+| POST | `/api/v2/prod/batches/{batch_id}/deliver` | Manager / Clerk | READY_TO_SHIP → DELIVERED | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_iddeliver) |
+| POST | `/api/v2/prod/batches/{batch_id}/complete` | Manager / Clerk | DELIVERED → COMPLETED | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idcomplete) |
+| POST | `/api/v2/prod/batches/{batch_id}/start-repair` | Manager / Clerk / Inspector | 置 `is_repairing=true` | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idstart-repair) |
+| POST | `/api/v2/prod/batches/{batch_id}/place-on-shelf` | Manager / Clerk | 上架 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idplace-on-shelf) |
+| POST | `/api/v2/prod/batches/{batch_id}/recall-to-pending` | Manager / Clerk | 召回至 PENDING | lifecycle.md 尚无独立章节（见 [`../parts/index.md`](../parts/index.md) 端点表） |
+| POST | `/api/v2/prod/batches/{batch_id}/release-from-programming` | Manager / Clerk | 编程完成释放 | lifecycle.md 尚无独立章节；20706 守卫见 [`./process-chain.md`](./process-chain.md#20706-biz_process_chain_required) |
+| POST | `/api/v2/prod/batches/{batch_id}/send-to-outsource` | Manager / Clerk | 派发外协 | lifecycle.md 尚无独立章节；20706 守卫见 [`./process-chain.md`](./process-chain.md#20706-biz_process_chain_required) |
+| POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource` | Manager / Clerk | 外协回收入库 | lifecycle.md 尚无独立章节；20706 守卫见 [`./process-chain.md`](./process-chain.md#20706-biz_process_chain_required) |
+| POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | Manager / Clerk / Inspector | 外协回收 → 品检 | lifecycle.md 尚无独立章节（见 [`../parts/index.md`](../parts/index.md) 端点表） |
+| POST | `/api/v2/prod/batches/{batch_id}/complete-repair` | Manager / Clerk / Inspector | 完成维修 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idcomplete-repair) |
+| POST | `/api/v2/prod/batches/{batch_id}/repair-dispatch` | Manager / Clerk | 派发维修 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idrepair-dispatch) |
+| POST | `/api/v2/prod/batches/{batch_id}/scan-inspect` | Manager / Inspector | 扫码品检 | [`../parts/inspection.md` 状态机表](../parts/inspection.md#状态机can_transition_to-白名单)（尚无独立章节） |
+| POST | `/api/v2/prod/batches/{batch_id}/split` | Manager / Clerk | 拆分批次 | [`../parts/batch.md`](../parts/batch.md#post-apiv2prodbatchesbatch_idsplit) |
+| POST | `/api/v2/prod/batches/{batch_id}/cancel` | Manager / Clerk | 取消**单个**批次 | [`../parts/index.md`](../parts/index.md)（尚无独立章节） |
+| POST | `/api/v2/prod/batches/{batch_id}/pick-up` | Manager / Clerk / ShelfAccount | 手动 pick-up 兜底 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idpick-up) |
+| POST | `/api/v2/prod/batches/scan/deliver` | Manager / Clerk | 扫码发货（**无 Path**，`ScanDeliverPartRequest` body 不变） | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesscandeliver) |
+
+### 静态批量 / 事件（3 条，无 Path，请求体逐字不变）
+
+| Method | Path | 权限 | 说明 | 文档章节 |
+|---|---|---|---|---|
+| POST | `/api/v2/prod/batches/to-ship` | Manager / Inspector | 静态批量通过品检（`items[].batch_id` 仍在 body） | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesto-ship) |
+| POST | `/api/v2/prod/batches/to-inspection` | Manager / Inspector | 静态批量送检（`items[].batch_id` 仍在 body） | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesto-inspection) |
+| POST | `/api/v2/prod/batches/worker-scan` | **Manager** / **ShelfAccount** | 工人扫码归还 / 送检；成功后同事务触发 worker-pool refill | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesworker-scan) |
+
+`worker-scan` 保持**无 Path extractor** + `serial_no` 主键 + `batch_id` 可选消歧。它一笔
+事务改 2 个批次（扫的那个 + 同事务从工人池补的），是全仓唯一的跨 part 批次写点，但动作
+语义仍是「以批次为对象的工人报工」，故归 prod。
+
+### 集合读（3 条，从 parts 迁入，与已有 `/prod/batches/pending` 并列）
+
+| Method | Path | 权限 | 说明 | 文档章节 |
+|---|---|---|---|---|
+| GET | `/api/v2/prod/batches/inspection` | Manager / Inspector | 待品检批次列表（判据 `status='INSPECTION'`） | [`../parts/inspection.md`](../parts/inspection.md#get-apiv2prodbatchesinspection) |
+| GET | `/api/v2/prod/batches/repair` | Manager / Inspector | 维修批次列表（判据 `status='DELIVERED'`） | [`../parts/lifecycle.md`](../parts/lifecycle.md#get-apiv2prodbatchesrepair) |
+| GET | `/api/v2/prod/batches/repairing` | Manager / Inspector | 维修中批次列表（判据 `is_repairing = true`） | [`../parts/lifecycle.md`](../parts/lifecycle.md#get-apiv2prodbatchesrepairing) |
+
+### 注册顺序（axum / matchit）
+
+- 静态段必须先于 `/{batch_id}` 注册。静态批量 3 条与集合读 3 条是 1 段、子资源是 2 段，
+  **段数不同，无冲突**。
+- 但 `POST /prod/batches/scan/deliver`（2 段，首段静态 `scan`）与
+  `POST /prod/batches/{batch_id}/*`（2 段，首段动态）**同段数**，靠 matchit 的静态优先
+  规则消解 —— 必须实测本路径未被 `/{batch_id}` 吞掉。
+- **不要**新增 `GET /prod/batches/{batch_id}`：它与上面 3 条静态集合读同形状，
+  会引入歧义（当前设计上单批详情走 part 域 `GET /parts/{part_id}/batches`）。
+
+### 错误码语义变更（20109 / 20101）
+
+| code | 变更前 | 变更后 |
+|---|---|---|
+| 20109 `BIZ_PART_BATCH_NOT_FOUND` | 传一个「不属于该 part 的 `batch_id`」（靠 SQL 的 `AND part_id = $2` 判定） | **退化为**「批次不存在 / 已软删 / 状态不是流转起点」—— `batch_id` 全局唯一即锚点，「跨 part 批次」不再是可表达的场景。留在 part 域的 `cancel` / `force-complete` 操作对象是该 part 的多个批次、不接受 `batch_id` 入参，故不返回 20109 |
+| 20101 `BIZ_PART_NOT_FOUND` | 传了不存在的 `part_id` | 仍可达，语义不变：只能经由「批次的 part 已软删」触发 |
+
+登记处见 [`../inconsistencies.md`](../inconsistencies.md)。
+
+> **待办（2026-10-02）**：批次子资源迁出后，`parts/{index,inspection}.md` 中若干
+> `src/modules/part/**` 实现位置引用待回填（handler 目录 / 文件切分以代码为准）——
+> 包括 `inspection.md` 的 `by-serial/…/part-batches` 端点实现位置、`to-process` 返修
+> 守卫位置、`index.md` 的仓库分层图与文件头同步声明、`statemachine.rs` 与
+> `status_gate` 写入口 CI 测试的 Rust 模块路径。
 
 ---
 
@@ -270,7 +361,7 @@ Response 200 `data`：[`AutoDispatchResult`](#autodispatchresult-字段)
     find_batch_by_id / find_first_shelf_for_process / update_batch_dispatched /
     first_step_of_chain + part_get_process_chain_id）
   - 3 个新错误码（20120 / 20121 / 20508）注册到 status_from_code + 测试
-  - in-source 单测：`src/modules/prod/batch/service.rs::tests` —— list_pending /
+  - in-source 单测：`src/modules/prod/batch/service/dispatch.rs::tests` —— list_pending /
     dispatch_batch 成功路径 + 二次 dispatch 40903 / 不存在 batch_id 40404 /
     并发冲突 40901 / t_shelf_process 多结果取 LIMIT 1 / Inspector 角色 40300 /
     bulk_dispatch 全回滚 + 空 targets 422 / auto_dispatch 无 chain / 无 step /
@@ -278,7 +369,7 @@ Response 200 `data`：[`AutoDispatchResult`](#autodispatchresult-字段)
 
 ## 参考
 
-- 模块 README：见 `src/modules/prod/batch/{mod,handler,service,repo,vo,dto}.rs`
+- 模块 README：见 `src/modules/prod/batch/{mod.rs,model.rs,status_gate.rs,dto.rs,vo.rs,handler/,service/,repo/}`
 - 错误码：`src/shared/error.rs::code`
 - 前端模块文档：`frontend/docs/03-modules/production/README.md`
 - 前端视图目录：`frontend/src/views/production/`

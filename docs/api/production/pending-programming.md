@@ -153,7 +153,7 @@ LIMIT $limit OFFSET $offset
 ## 业务场景
 
 - **Tab = 待编程**（`has_cnc_program=false`）：命中三规则但**未**上传 G_CODE 的工单。编程员在列表内点「上传 G_CODE」→ `POST /api/v2/part-files/upload-intents` + 直传 COS + `confirm`。
-- **Tab = 已编程**（`has_cnc_program=true`）：命中三规则且**已**上传 G_CODE 的工单。编程员确认无误后通知车间放行（走 `POST /api/v2/parts/{id}/release-from-programming`）。
+- **Tab = 已编程**（`has_cnc_program=true`）：命中三规则且**已**上传 G_CODE 的工单。编程员确认无误后通知车间放行（走 `POST /api/v2/prod/batches/{batch_id}/release-from-programming`）。
 - **Tab = 全部**（`has_cnc_program` 缺省）：所有命中三规则的工单。
 
 ---

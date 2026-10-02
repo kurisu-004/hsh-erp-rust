@@ -13,7 +13,7 @@
 > - 旧 `/admin/worker-pool/{remove, assign}` → `/pool/move`（统一通用移动端点）
 > - 旧 `/worker-pool/{state, counts, {process_id}}` + `/admin/worker-pool/{refill, auto-allocate}` → `/pool/{state, counts, {process_id}, refill, auto-allocate}`
 >
-> worker-scan 主入口 `POST /api/v2/parts/worker-scan` 见 [`./parts/index.md`](./parts/index.md)；worker-scan 成功后**同事务**触发 `refill_for_worker`，见 §WS 广播。
+> worker-scan 主入口 `POST /api/v2/prod/batches/worker-scan` 见 [`./batches.md`](./batches.md#2026-10-02-t_part_batch-子资源迁入)；worker-scan 成功后**同事务**触发 `refill_for_worker`，见 §WS 广播。
 
 ## 端点列表
 
@@ -579,10 +579,10 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 
 | kind | 触发端点 | payload 关键字段 |
 |---|---|---|
-| `WORKER_SCAN_RETURNED` | `POST /parts/worker-scan`（event_type=RETURNED） | `{ worker_id, part_id, batch_id, event_type }`（即 `WorkerScanCoreOut`） |
-| `WORKER_SCAN_INSPECTED` | `POST /parts/worker-scan`（event_type=INSPECTED） | `{ worker_id, part_id, batch_id, event_type }`（即 `WorkerScanCoreOut`） |
-| `WORKER_POOL_REFILL_DONE` | `POST /parts/worker-scan` 同事务 refill 抢到 / `POST /pool/refill` | `{ worker_id, shelf_id, taken: [TakenItem], pool_empty }`（即 `RefillResult`） |
-| `WORKER_POOL_EMPTY` | `POST /parts/worker-scan` 同事务 refill 池空 / `POST /pool/refill` 池空 | `{ worker_id, shelf_id }` |
+| `WORKER_SCAN_RETURNED` | `POST /prod/batches/worker-scan`（event_type=RETURNED） | `{ worker_id, part_id, batch_id, event_type }`（即 `WorkerScanCoreOut`） |
+| `WORKER_SCAN_INSPECTED` | `POST /prod/batches/worker-scan`（event_type=INSPECTED） | `{ worker_id, part_id, batch_id, event_type }`（即 `WorkerScanCoreOut`） |
+| `WORKER_POOL_REFILL_DONE` | `POST /prod/batches/worker-scan` 同事务 refill 抢到 / `POST /pool/refill` | `{ worker_id, shelf_id, taken: [TakenItem], pool_empty }`（即 `RefillResult`） |
+| `WORKER_POOL_EMPTY` | `POST /prod/batches/worker-scan` 同事务 refill 池空 / `POST /pool/refill` 池空 | `{ worker_id, shelf_id }` |
 | `WORKER_POOL_MOVE_DONE` | `POST /pool/move` | `{ batch_id, from_kind, to_kind, new_holder_id, new_location, version, current_held?, max_held?, shelf_id?, taken? }`（即 `MoveResult`；**2026-09-30 新增**，取代旧 `WORKER_POOL_ADMIN_REMOVED` / `WORKER_POOL_ASSIGN_DONE`） |
 | `WORKER_POOL_AUTO_ALLOCATE_DONE` | `POST /pool/auto-allocate` | `{ process_id, shelf_id, mode, fill_ratio, filled: [WorkerFillItem], pool_empty }`（即 `AutoAllocateResult`） |
 
@@ -603,10 +603,10 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 - ✅ Task 4：基础错误码（20205/20206/20114）+ `worker.repo::get_by_badge_code` + `part_batch.count_held_by_worker`
 - ✅ Task 6：`worker_pool.repo::take_one_from_pool` CTE（FOR UPDATE SKIP LOCKED）
 - ✅ Task 7：`worker_pool.service`（refill_for_worker / compute_state / admin_remove_held_batch）+ handler 三端点 + admin router
-- ✅ Task 8：`POST /parts/worker-scan`（同事务联动 refill）
+- ✅ Task 8：`POST /prod/batches/worker-scan`（同事务联动 refill；2026-10-02 自 part 域迁入）
 - ✅ 2026-09-11 part-worker-pool-federated-rocket：新增 `auto_allocate_for_process` + 端点 `POST /admin/worker-pool/auto-allocate` + COUNT/TIME 模式 + fill_ratio 校验（20704）；错误码段 20701/20702/20703/20704
 - ✅ 2026-09-14 follow-up-ux：`WorkerPoolState` 新增 `held_batches` 字段（`list_held_by_worker_with_part` JOIN t_part 取全量）+ 新增 `POST /admin/worker-pool/assign` 端点（单 batch 拖拽分配，service `assign_batch_to_worker`）+ `WorkerPoolRepo::take_specific_from_pool`（单 SQL 限定 `(shelf_id, batch_id)` 原子切换 holder）；错误码沿用既有 20204 / 20114 / 20104
-- ⏳ 未上线：`WorkerRepo` 列表 / 创建 / 软删等 CRUD（worker 域当前仅供 worker_pool / parts worker-scan 复用）
+- ⏳ 未上线：`WorkerRepo` 列表 / 创建 / 软删等 CRUD（worker 域当前仅供 worker_pool / prod batches worker-scan 复用）
 
 ## 参考
 

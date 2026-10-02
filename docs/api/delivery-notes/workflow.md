@@ -44,7 +44,7 @@ Response 200 `data`：`SubmitDeliveryOut`
 
 > `unresolved_targets` 只收 `INSPECTION` 批次；同一单里已 `READY_TO_SHIP` 的批次不会出现在候选里。分组顺序 = part 首次出现顺序，组内 = 批次 id 升序。
 
-**一键过检衔接**：`unresolved_targets[i].available_batches[]` 的 `{ batch_id, version, quantity }` 可直接映射为 [`POST /api/v2/parts/batch-to-ship`](../parts/inspection.md#post-apiv2partsbatch-to-ship) 的 `items[]`；`version` 不符 → 该 item 落 `failed[].code = 40901`。全部过检成功后用**同一个** `version`（候选分支没有 bump 单据 version）重新 submit 即可。
+**一键过检衔接**：`unresolved_targets[i].available_batches[]` 的 `{ batch_id, version, quantity }` 可直接映射为 [`POST /api/v2/prod/batches/to-ship`](../parts/inspection.md#post-apiv2prodbatchesto-ship) 的 `items[]`；`version` 不符 → 该 item 落 `failed[].code = 40901`。全部过检成功后用**同一个** `version`（候选分支没有 bump 单据 version）重新 submit 即可。
 
 错误码：
 
