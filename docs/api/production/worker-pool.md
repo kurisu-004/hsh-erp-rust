@@ -545,7 +545,7 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 | `version` | i32 | `batch.version + 1` |
 | `current_held` | i32? | 仅 `to_kind=WORKER` 时填：目标 worker 移动后持有数（含本批次） |
 | `max_held` | i32? | 仅 `to_kind=WORKER` 时填：目标 worker 工种的 `max_held_batches` |
-| `shelf_id` | string (i64)? | 仅 `to_kind=POOL` 时填：候选池货架 ID |
+| `shelf_id` | string (i64)? | 涉及的候选池货架 ID：POOL→WORKER 填 `from.shelf_id`、WORKER→POOL 填 `to.shelf_id`、WORKER→WORKER 不填 |
 | `taken` | [TakenItem](#takenitem-字段)? | 仅 POOL→WORKER 移动时填：从 pool 取出的 batch 详情 |
 
 ### ProcessBatchCount 字段
