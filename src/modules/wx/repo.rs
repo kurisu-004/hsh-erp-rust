@@ -130,10 +130,12 @@ impl PartList {
     ///   第一条 active 批次；b.deleted_at IS NULL 且 status NOT IN ('COMPLETED',
     ///   'CANCELLED')）；并 JOIN 解析 holder。
     ///
-    /// 已知折中（与 dashboard 域 `COALESCE(s.name, w.name, oc.name)` 同形 bug，
+    /// 已知折中（holder 多态歧义：与 `prod::batch::repo::queries` /
+    /// `prod::batch::service::repair::list_batches_matching` /
+    /// `part::service::phase1::lifecycle_helpers::list_batches` 同形，
     /// 见 `prod::batch::repo::mod` 模块 doc 的「holder 三表 COALESCE 的多态歧义」
-    /// 一节）：holder 多态歧义时优先 shelf.name。mini-program 不强依赖此字段精确性，
-    /// 仅作展示。
+    /// 一节）：本处是 `COALESCE(sh.code, w.name, oc.name)` 变体，歧义时取
+    /// `t_shelf.code`（非 name）。mini-program 不强依赖此字段精确性，仅作展示。
     #[allow(clippy::too_many_arguments)]
     pub async fn list<'e, E: PgExecutor<'e>>(
         executor: E,

@@ -186,9 +186,12 @@ impl PartBatchRepo {
         Ok(rows
             .into_iter()
             .map(|r| {
-                // l1_customer_name 派生：c.parent_id IS NOT NULL → pc.name.or(c.name)；
-                // 否则（自身即 L1）→ c.name。与 `service/repair.rs::list_batches_matching`
-                // 走 part 域 repo 时用的同名派生逐字一致。
+                // l1_customer_name 派生：c.parent_id IS NOT NULL → pc.name.or(c.name)
+                // （pc 的 LEFT JOIN 不带 deleted_at 过滤，父行在即取父名，父行悬空才
+                // 回落 c.name）；否则（自身即 L1）→ c.name。与
+                // `service/repair.rs::list_batches_matching` 的同名派生**口径不同**
+                // （那条不回落 c.name：客户自身即 L1、或父客户被软删时为 null），差异见
+                // `docs/api/parts/lifecycle.md` 的 `InspectionBatchListItemOut` 字段表。
                 let l1_customer_name = if r.customer_parent_id.is_some() {
                     r.parent_customer_name
                         .clone()

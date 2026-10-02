@@ -37,7 +37,6 @@ use crate::shared::error::AppError;
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait PartBatchRepoTrait: Send {
-    // ── t_part_batch CRUD（15）──
     async fn get_by_id(
         &mut self,
         id: i64,
