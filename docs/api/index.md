@@ -205,8 +205,8 @@ HTTP 状态码：
 | customers | [`./customers.md`](./customers.md) | 5 | ✅ 完全上线（CRUD + L1/L2 + OCC，2026-08-26；聚合于 com 模块，2026-09-19） |
 | shelves | [`./shelves.md`](./shelves.md) | 7 | ✅ 完全上线（CRUD + picker，2026-08-26；**2026-10-02 域拆分：端点 10 → 7（文档原写 11，逐 router 复核实为 10）—— 3 个货架↔工序映射端点搬到 [`production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)（prod 域，无 alias）；货架↔账号部分**消除**（`ShelfOut.account_count` 删除，绑定真源在 iam `t_user_role`，零 iam 改动）**） |
 | workers（已并入 prod） | [`./production/workers.md`](./production/workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文档从顶层迁入 `production/`） |
-| **生产管理** | [`./production/index.md`](./production/index.md) | **35** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池 + 工人档案 + 待下发批次 + 待编程一览；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步；2026-10-01 增 `prod::programming` 待编程一览 1 端点；**2026-10-02 增 `prod::shelf_process` 货架↔工序映射 3 端点，自 shelves 域搬入**） |
-| part | [`./parts/index.md`](./parts/index.md) | **49**（计数残留，未随 2026-10-02 域收窄订正） | ✅ 完全上线（2026-10-01 `t_part_batch.status` 收口为 `status_gate` 单一写入口；**2026-10-02：25 条 batch 子资源迁 prod 域，part 域只留多批次动作（`/{part_id}/cancel` / `force-complete`）与非批次动作**） |
+| **生产管理** | [`./production/index.md`](./production/index.md) | **60** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池 + 工人档案 + 待下发批次 + 待编程一览；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步；2026-10-01 增 `prod::programming` 待编程一览 1 端点；**2026-10-02 增 `prod::shelf_process` 货架↔工序映射 3 端点，自 shelves 域搬入；2026-10-02 增 `t_part_batch` 子资源 25 端点，自 part 域搬入**） |
+| part | [`./parts/index.md`](./parts/index.md) | **25**（2026-10-02 域收窄：49 → 25，25 条 batch 子资源迁出） | ✅ 完全上线（2026-10-01 `t_part_batch.status` 收口为 `status_gate` 单一写入口；**2026-10-02：25 条 batch 子资源迁 prod 域，part 域只留多批次动作（`/{part_id}/cancel` / `force-complete`）与非批次动作**） |
 | admin（对账） | [`./admin.md`](./admin.md) | 1 | ✅ 完全上线（2026-10-01 新增 `POST /api/v2/admin/recompute-rollup`；Manager 单角色；**复用**既有 rollup 实现，不新增派生算法） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
@@ -325,3 +325,12 @@ HTTP 状态码：
    - `<module>/queries.md` / `<module>/drafts.md` / `<module>/workflow.md` / `<module>/print.md` — 按访问语义分组（视域而定；查询、草稿变更、状态流转、打印是最常见的四类）
 
    子文件顶部须有 sibling-nav 链回入口与同级文件；共享 DTO 锚点统一指向 `./index.md#<dto>-字段`。实施示例：`docs/api/delivery-notes/`。
+
+## 文档链接待办（2026-10-02）
+
+以下为本目录跨文件链接的既有问题，与具体域的端点归属无关，单独登记：
+
+- `admin.md`「子件状态聚合 auto-rollup」处写作 `../assemblies/index.md`；`admin.md` 本身就在 `docs/api/` 下，该路径会解析到 `docs/assemblies/`（不存在），应为 `./assemblies/index.md`。
+- `wx.md` 的 `user` 字段表写作 `../iam.md#get-apiv2iamme`；同上会解析到 `docs/iam.md`（不存在），应为 `./iam.md`。
+
+另有两类同源问题待后续统一处理：2026-09-14 起既存的 38 处悬空锚点、`parts/index.md` 指向已删除文件 `refactor-part-assembly-batch.md` 的死链。

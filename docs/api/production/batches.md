@@ -1,6 +1,6 @@
 # prod::batch 域 API —— 车间下发 + `t_part_batch` 生产流转
 
-> 本文件须与 `src/modules/prod/batch/handler/` 保持同步
+> 本文件须与 `src/modules/prod/batch/{handler.rs,dto.rs,service.rs,repo.rs,vo.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
 > **范围一 —— 车间下发**（PENDING 批次专用域）：UI「待下发队列」展示 + 一键 / 批量 / 自动预览 3 路径。

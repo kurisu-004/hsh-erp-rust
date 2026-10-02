@@ -22,7 +22,7 @@
 > - batches auto-dispatch 改为只读 preview（不再真下发）。
 > - 净变化：原 31 → 30 端点（-1 net）。
 > 2026-10-01 新增 1 端点（详见 [`pending-programming.md`](./pending-programming.md)）：`prod::programming` 待编程一览 → 净变化 30 → 31 端点（+1）。
-> 2026-10-02 新增 3 端点（详见 [`shelf-process-mapping.md`](./shelf-process-mapping.md)）：`prod::shelf_process` 货架 ↔ 工序映射，自 `src/modules/shelf/process_mapping/` 搬入本域（旧路径 404，无 alias）→ 净变化 32 → 35 端点（+3）。⚠️ 2026-10-02 订正：上文两处旧账均系计数残留 —— ①「worker-pool 5 端点」实为 6（见「工人池」节），故 **master 上的「31」实为 32**；② 本节标题原按「17 + 5 + 3 + 6 + 3 + 1」记账，17 是「主数据表实列行数」（= 7 worker + 5 工种 CRUD + 5 工序），而按子模块求和应是 7 + 7 + 5 = 19，两者相差的 2 条正是工种↔工序映射端点（记在下一节的 5 条里）。现标题改为**按子模块求和**的显式公式，逐项可加：7 + 7 + 5 + 3 + 6 + 3 + 1 + 3 = 35。
+> 2026-10-02 新增 3 端点（详见 [`shelf-process-mapping.md`](./shelf-process-mapping.md)）：`prod::shelf_process` 货架 ↔ 工序映射，自 `src/modules/shelf/process_mapping/` 搬入本域（旧路径 404，无 alias）→ 净变化 32 → 35 端点（+3）。⚠️ 2026-10-02 订正：上文两处旧账均系计数残留 —— ①「worker-pool 5 端点」实为 6（见「工人池」节），故 **master 上的「31」实为 32**；② 本节标题原按「17 + 5 + 3 + 6 + 3 + 1」记账，17 是「主数据表实列行数」（= 7 worker + 5 工种 CRUD + 5 工序），而按子模块求和应是 7 + 7 + 5 = 19，两者相差的 2 条正是工种↔工序映射端点（记在下一节的 5 条里）。现标题改为**按子模块求和**的显式公式，逐项可加：7 + 7 + 5 + 3 + 6 + 3 + 1 + 3 = 35（订正时点为 35，2026-10-02 batch 子资源迁入后为 60，见下条）。
 > **2026-10-02 订正**：25 条 `t_part_batch` 子资源路由自 part 域迁入后，本节标题的
 > 35 改为 **60**（35 + 25）。子资源逐条清单见
 > [`batches.md`](./batches.md#2026-10-02-t_part_batch-子资源迁入)。
