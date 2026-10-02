@@ -303,7 +303,6 @@ pub async fn split_batch(
         "PART_BATCH_SPLIT",
         json!({
             "part_id": part_id.to_string(),
-            "batch_id": batch_id.to_string(),
             "new_batch_id": new_batch_id.to_string(),
         }),
     );
