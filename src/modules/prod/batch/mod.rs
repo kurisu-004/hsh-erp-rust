@@ -18,12 +18,13 @@
 //!
 //! ## 模块结构
 //! - `model.rs` —— `TPartBatch` / `RecentBatchRow` / `PartBatchScanRow` /
-//!   `InspectionBatchListRow` 行结构（sqlx `FromRow`）
+//!   `InspectionQueueRow`（待品检窄投影）行结构
 //! - `status_gate.rs` —— **全仓唯一** `t_part_batch.status` 写入口（写 + batch →
 //!   part → assembly 派生焊在一个函数里）
 //! - `repo/queries.rs` —— ZST `PartBatchRepo` + 通用 SQL 静态方法
 //! - `repo/sql.rs` —— inspection / lifecycle 流转的定位 + 写点
-//! - `repo/list.rs` —— 8-JOIN 集合读（服务 inspection / repair / repairing 三条列表端点）
+//! - `repo/list.rs` —— 集合读：3-JOIN 窄投影 + 表头筛选/排序
+//!   （`GET /prod/batches/inspection` 专用，2026-10-03 VO 收口）
 //! - `repo/trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
 //! - `repo/mod.rs` —— ZST `BatchRepo`：「PENDING 批次下发给车间」专用查询
 //! - `service/` —— 全部业务用例（`impl BatchService`，按流拆文件，见该目录 mod doc）
@@ -88,7 +89,7 @@ pub mod status_gate;
 pub mod vo;
 
 // 重导出 model 与 repo 的公开符号，保持外部 callers 用 `prod::batch::*` 一层路径。
-pub use model::{InspectionBatchListRow, PartBatchScanRow, RecentBatchRow, TPartBatch};
+pub use model::{PartBatchScanRow, RecentBatchRow, TPartBatch};
 pub use repo::{NewInitialBatch, PartBatchRepo, PartBatchRepoTrait};
 pub use service::BatchService;
 

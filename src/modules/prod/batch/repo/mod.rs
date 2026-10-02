@@ -9,7 +9,8 @@
 //! ## 两个 ZST 的分工（命名相近，注意区分）
 //! - `PartBatchRepo` —— `t_part_batch` 的**通用** SQL 真源，全仓读写批次表的
 //!   默认入口：18 个通用方法（`queries.rs`）+ 19 个流转写点（`sql.rs`）+
-//!   2 个 8-JOIN 集合读（`list.rs`）。跨域调用方一律走它。
+//!   2 个集合读（`list.rs`：3-JOIN 窄投影 + 表头筛选/排序）。跨域调用方
+//!   一律走它。
 //! - `BatchRepo`（本文件）—— **只服务「PENDING 批次下发给车间」一条流**的专用
 //!   查询（7 个方法），唯一调用方是 `service::dispatch.rs`。
 //!   两者都是无状态 ZST + 固有静态方法，职责不重叠。
@@ -21,8 +22,9 @@
 //! - `sql.rs` —— inspection / lifecycle 流转的 19 个定位 + 写点
 //!   （`find_*` / `mark_*` / `split_batch_for_partial_pass` /
 //!   `cancel_all_active_batches_for_part` / `force_complete_all_batches_for_part`）
-//! - `list.rs` —— 8-JOIN 集合读（`list_batches_with_part` /
-//!   `count_batches_with_part`，服务 inspection / repair / repairing 三条列表端点）
+//! - `list.rs` —— 集合读 2 条：`list_inspection_queue` / `count_inspection_queue`
+//!   （3-JOIN 窄投影 + 表头筛选/排序，服务 `GET /prod/batches/inspection`；
+//!   list 与 count 共用同一个 WHERE 拼装器，判据只此一份）
 //! - `trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
 //! - `mod.rs`（本文件）—— ZST `BatchRepo`：本域「PENDING 批次下发给车间」
 //!   专用查询（pending 列表 / auto-dispatch 预览 / 首道 step / 兜底反查 part_id）
@@ -31,6 +33,32 @@
 //! 本文件原 `BatchRepo::find_batch_by_id`（`WHERE id = $1 AND ($2 OR deleted_at IS NULL)`）
 //! 与 `queries.rs::PartBatchRepo::get_by_id` 是同一条 SQL 的两份实现，已删，
 //! 调用方（`service::dispatch_single`）改调 `PartBatchRepo::get_by_id`。
+//!
+//! ## 已知缺陷：holder 三表 COALESCE 的多态歧义
+//! `holder_name` 一律按 `COALESCE(s.name, w.name, oc.name)` 解析
+//! （`t_shelf` / `t_worker` / `t_outsource_company` 三表对同一个
+//! `current_holder_id` 各 JOIN 一次）。该写法**假定** holder id 在三表 PK 空间里
+//! 互不重叠；一旦某 id 同时命中其中两表，取到的是 `t_shelf.name`。
+//!
+//! 全仓 holder 名多表 COALESCE 共 **5 处**（3 处 `t_shelf.name` 形态 + 2 处
+//! `t_shelf.code` 变体，后者歧义时取 `t_shelf.code` 而非 name）：
+//!
+//! - `prod/batch/repo/queries.rs::PartBatchRepo::list_active_by_part_id_with_holder`
+//! - `prod/batch/service/repair.rs::list_batches_matching`（`sqlx::query_as` 内联 SQL）
+//! - `part/service/phase1/lifecycle_helpers.rs::list_batches`
+//! - `wx/repo.rs::PartList::list`
+//! - `wx/repo.rs::PartList::by_serial`
+//!
+//! dashboard 域**不在此列** —— 它的 SQL 只投影 `b.current_holder_id AS holder_id`，
+//! 名字在 service 侧按各自 JOIN 来源装配（货架分组自带 `shelf_name`，工人分组查
+//! `worker_name_map`，见 `dashboard/service/snapshot.rs`），不在 SQL 里做多表 COALESCE。
+//!
+//! 正确解法是用 `t_part_batch.location` 作 discriminator
+//! （`CASE location WHEN 'WORKER' THEN w.name WHEN 'OUTSOURCE_COMPANY' THEN oc.name
+//! ELSE s.name END`）。**本次不动**：改这一处会让 5 条 SQL 的行为对某些历史脏数据
+//! 发生变化，属独立改动，且当务之急是修「返修列表 holder 名解析错」还是「先补
+//! 脏数据清洗」需要产品侧确认。修时必须 5 处一起改，逐处改会造成同一 holder 在
+//! 不同端点显示不同名字。
 //!
 //! ## 错误类型
 //! repo 静态方法 → `sqlx::Error`（与项目惯例一致），由 service 层映射 `AppError`。

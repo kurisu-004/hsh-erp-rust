@@ -38,8 +38,9 @@
 //!   + `list_pickable_by_work_type` + rollup 派生 `t_part.next_process_id`。
 //! - **展示类列表一律继续从 `current_process_step_id` → step JOIN 派生工序名**。
 //!   完整清单（改动前请逐条对照，勿凭端点名想当然）：
-//!   1. `prod/batch/repo/queries.rs::list_batches_with_part`
-//!      —— `GET /prod/batches/inspection`
+//!   1. `prod/batch/repo/list.rs::list_inspection_queue`
+//!      —— `GET /prod/batches/inspection`（2026-10-03 起 3-JOIN 窄投影，
+//!      **不投影** `next_process_*`，故本条已无「派生 vs 直读」之争）
 //!   2. `prod/batch/service/repair.rs::list_batches_matching`
 //!      —— `GET /prod/batches/repair`（DELIVERED）+ `GET /prod/batches/repairing`
 //!      （`is_repairing = true`）。
@@ -189,65 +190,33 @@ pub struct PartBatchScanRow {
     pub version: i32,
 }
 
-// ===== Inspection Batch List =====
+// ===== Inspection Queue =====
 
 /// `GET /prod/batches/inspection` 单行中间结构（repo ↔ service 边界类型）。
 ///
-/// SQL 列别名见 repo `list_batches_with_part`（单次 JOIN 8 表，含 holder_name
-/// / next_process_name / delivery_note_no / customer_name / l1_customer_name
-/// 全部解析）。
+/// 2026-10-03 VO 收口新增：待品检页只渲染 7 个数据列（序列号 / 图号 / 名称 /
+/// 批次 / 数量 / 系统交期 / 客户）。同批删掉原 28 字段宽投影
+/// `InspectionBatchListRow` —— 待品检端点是它在 prod 域的最后调用方；返修两条
+/// 端点（`/repair` / `/repairing`）在 service 层直接构造
+/// `vo::InspectionBatchListItemOut`，不经 repo 行结构。
 ///
-/// 2026-09-16 PR-3 批次 step 化：
-/// - 删 `placed_at`（t_part_batch 列已删）
-/// - `next_process_id` 改为派生：`LEFT JOIN t_process_chain_step s
-///   ON s.id = pb.current_process_step_id` 后取 `s.process_id`，
-///   `next_process_name` 由 `t_process np ON np.id = s.process_id` 拼齐
-///
-/// 2026-09-30（migration 004）一度改直读 `pb.current_process_id`，**2026-09-30
-/// review 第 3 轮 M3 已回退**到 step 派生：INSPECTION 批次按出池不变式该列恒为
-/// NULL，直读会让 `next_process_id` / `next_process_name` 在
-/// `GET /prod/batches/inspection` 恒 null（用户可见回归）。字段名始终保留，
-/// 兼容 DTO 与前端。
-#[derive(Debug, Clone)]
-pub struct InspectionBatchListRow {
-    // 批次
+/// 字段与 `vo::InspectionQueueItemOut` 逐字同形（13 个）：SQL 侧列别名直接取
+/// 语义名（`pb.id AS batch_id` 等），repo 层 1:1 搬运，service 只做形状转换。
+/// `l1_customer_name` 的派生在 repo 层完成（原料列 `c.parent_id` / `pc.name`）。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InspectionQueueRow {
     pub batch_id: i64,
     pub part_id: i64,
     pub batch_no: i32,
     pub quantity: i32,
-    pub status: String,
-    /// 2026-10-01 review 第 1 轮 M5 新增（migration 005）：REPAIRING 已从
-    /// `PartStatus` 降级为标记列，**必须**随列表一起投出 —— 否则前端在
-    /// `GET /prod/batches/repairing` 上拿到的 `status` 恒为 `IN_PROCESS`，
-    /// 「返修中」这个信号彻底消失。
-    pub is_repairing: bool,
-    pub location: Option<String>,
+    /// OCC 锚 `t_part_batch.version`（不是 `t_part.version`）。
     pub version: i32,
-    /// 逻辑 FK → t_process_chain_step.id（2026-09-16 PR-3 替代 next_process_id）
-    pub current_process_step_id: Option<i64>,
-    pub parent_batch_id: Option<i64>,
-    // holder / process / delivery_note 解析
-    pub current_holder_id: Option<i64>,
-    pub holder_name: Option<String>,
-    /// 派生自 `current_process_step_id`（LEFT JOIN `t_process_chain_step` 取
-    /// `s.process_id`）；保留字段名以兼容下游 DTO 与前端。
-    ///
-    /// **刻意不直读 `current_process_id`**：见本结构 doc 的 review 第 3 轮 M3 段。
-    pub next_process_id: Option<i64>,
-    pub next_process_name: Option<String>,
-    pub delivery_note_id: Option<i64>,
-    pub delivery_note_no: Option<String>,
-    // 工单
     pub serial_no: Option<String>,
     pub drawing_no: String,
     pub name: String,
-    pub order_no: Option<String>,
-    pub planned_delivery_date: NaiveDate,
+    /// 系统交期（2026-10-03 新增投影；页面已不显示计划交期，日期筛选改筛本列）。
+    pub system_delivery_date: Option<NaiveDate>,
     pub is_urgent: bool,
-    pub part_version: i32,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-    // 客户
     pub customer_id: i64,
     pub customer_name: Option<String>,
     pub l1_customer_name: Option<String>,

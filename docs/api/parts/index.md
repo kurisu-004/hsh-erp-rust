@@ -24,7 +24,7 @@
 | GET | `/api/v2/parts/{part_id}` | Manager / Clerk / Inspector / CncProgrammer | 工单详情（含 customer_name / current_batch_id 冗余） | [`crud.md`](./crud.md#get-apiv2partspart_id) |
 | GET | `/api/v2/parts/by-serial/{serial_no}` | Manager / Clerk / Inspector / CncProgrammer | 通过序列号查详情 | [`crud.md`](./crud.md#get-apiv2partsby-serialserial_no) |
 | GET | `/api/v2/parts/by-serial/{serial_no}/part-batches` | Manager / Clerk / Inspector / CncProgrammer | 扫码快捷品检上下文（工单窄字段 + 全部活跃批次含 holder 名称） | [`inspection.md`](./inspection.md#get-apiv2partsby-serialserial_nopart-batches) |
-| GET | `/api/v2/prod/batches/inspection` | Manager / Inspector | 待品检批次列表（status=INSPECTION；含 batch_id + version + 工单 + holder/process/delivery_note/customer 名称一次解析）—— **2026-10-02 自 part 域迁入** | [`inspection.md`](./inspection.md#get-apiv2prodbatchesinspection) |
+| GET | `/api/v2/prod/batches/inspection` | Manager / Inspector | 待品检批次列表（判据 `status=INSPECTION`；**2026-10-03 VO 收口为 13 字段 `InspectionQueueItemOut` + 表头筛选 / 服务端排序**，与 repair / repairing 不再共用 VO）—— 2026-10-02 自 part 域迁入 | [`inspection.md`](./inspection.md#get-apiv2prodbatchesinspection) |
 | POST | `/api/v2/parts/{part_id}/update` | Manager / Clerk | 字段可选 UPDATE（OCC + 软删守卫） | [`crud.md`](./crud.md#post-apiv2partspart_idupdate) |
 | POST | `/api/v2/parts/{part_id}/soft-delete` | **Manager** | 软删（OCC + 终态禁 + delivery_note 锁禁） | [`crud.md`](./crud.md#post-apiv2partspart_idsoft-delete) |
 | POST | `/api/v2/parts/{part_id}/upload-drawing` | Manager / Clerk | Multipart PDF 上传到 COS + 落 `t_part_file`（CAS key 格式 2026-09-11 变更） | [`crud.md`](./crud.md#post-apiv2partspart_idupload-drawing) |
@@ -168,7 +168,7 @@
 > 权威依据**；`current_process_step_id` 降级为**可选的显示用定位信息**（仅当工单
 > 有工序链时才有值，允许 NULL；且**只在首次定位工序时写、之后不再推进**，
 > 不是「当前走到第几步」的进度指针 —— 见
-> [`inspection.md`](./inspection.md#inspectionbatchlistitemout-字段)）。
+> [`lifecycle.md`](./lifecycle.md#inspectionbatchlistitemout-字段)）。
 > - 修掉隐患：原派生只看「最慢批次」的 step_id，而该值对无工序链工单恒为 NULL，
 >   会把整个工单的 `t_part.next_process_id` 抹成 NULL —— 该列是**删工序的保护
 >   条件之一**（`t_process` 软删前 `count_referencing` 的 5 个子查询之一），
@@ -259,11 +259,11 @@
 事实改由 **`t_part_batch.is_repairing`（boolean，默认 false）** 承载。所有「返修中」
 的查询 / 守卫一律读该列，不再判 `status = 'REPAIRING'`（DB 里不再产生该字面量；
 `PartStatus::from_str("REPAIRING")` 保留 → `IN_PROCESS` 的过渡兼容分支）。
-**2026-10-02 review 第 2 轮订正**：原文「批次返修中时 `status` 保持 `IN_PROCESS`」
+**2026-10-02 订正**：原文「批次返修中时 `status` 保持 `IN_PROCESS`」
 字面读成了「返修中 ⇒ `IN_PROCESS`」的不变式，**不成立** —— 标记与 `status`
 **正交**：起修后送检 / 送检通过 / 发货都只保持标记，故返修件的 `status` 也可能是
 `INSPECTION` / `READY_TO_SHIP` / `DELIVERED`（可达链见
-[`./inspection.md`](./inspection.md) 订正段）。
+[`./lifecycle.md` § GET /api/v2/prod/batches/repairing](./lifecycle.md#get-apiv2prodbatchesrepairing)）。
 
 ### 三层单向派生 + 单一写入口
 

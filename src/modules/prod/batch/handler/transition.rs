@@ -33,15 +33,16 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::dto::{
-    BatchToInspectionRequest, BatchToShipRequest, InspectionBatchListQuery, ScanDeliverPartRequest,
-    ScanInspectRequest, ToInspectionRequest, ToProcessRequest, ToShipRequest, WorkerScanRequest,
+    BatchToInspectionRequest, BatchToShipRequest, InspectionQueueQuery, RepairBatchListQuery,
+    ScanDeliverPartRequest, ScanInspectRequest, ToInspectionRequest, ToProcessRequest,
+    ToShipRequest, WorkerScanRequest,
 };
 use crate::modules::prod::batch::service::BatchService;
 use crate::modules::prod::batch::service::transition::{
     BATCH_TO_INSPECTION_MAX_ITEMS, BATCH_TO_SHIP_MAX_ITEMS,
 };
 use crate::modules::prod::batch::vo::{
-    BatchToXxxOut, InspectionBatchListOut, ToXxxOut, WorkerScanOut,
+    BatchToXxxOut, InspectionBatchListOut, InspectionQueueListOut, ToXxxOut, WorkerScanOut,
 };
 use crate::modules::prod::worker_pool::service::WorkerPoolService;
 use crate::shared::error::AppError;
@@ -361,13 +362,16 @@ pub async fn worker_scan(
 
 /// `GET /api/v2/prod/batches/inspection`
 ///
-/// INSPECTION 状态批次列表（Manager + Inspector）。只读端点：
-/// `pool.acquire()` 不开事务。
+/// 待品检队列列表（Manager + Inspector）。只读端点：`pool.acquire()` 不开事务。
+///
+/// 2026-10-03 VO 收口：出参切到 `InspectionQueueListOut`（13 字段），查询参数
+/// 换 `InspectionQueueQuery`（表头 7 列各一个筛选 + 服务端排序），与
+/// `/repair` / `/repairing` 的宽 VO 彻底分家。
 pub async fn list_inspection_batches(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
-    Query(query): Query<InspectionBatchListQuery>,
-) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
+    Query(query): Query<InspectionQueueQuery>,
+) -> Result<Json<R<InspectionQueueListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = BatchService::list_inspection_batches(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
@@ -380,7 +384,7 @@ pub async fn list_inspection_batches(
 pub async fn list_repair_batches(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
-    Query(query): Query<InspectionBatchListQuery>,
+    Query(query): Query<RepairBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = BatchService::list_repair_batches(&mut *conn, &query, &current).await?;
@@ -395,7 +399,7 @@ pub async fn list_repair_batches(
 pub async fn list_repairing_batches(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
-    Query(query): Query<InspectionBatchListQuery>,
+    Query(query): Query<RepairBatchListQuery>,
 ) -> Result<Json<R<InspectionBatchListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = BatchService::list_repairing_batches(&mut *conn, &query, &current).await?;

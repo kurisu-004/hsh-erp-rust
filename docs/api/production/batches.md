@@ -82,7 +82,7 @@
 
 | Method | Path | 权限 | 说明 | 文档章节 |
 |---|---|---|---|---|
-| GET | `/api/v2/prod/batches/inspection` | Manager / Inspector | 待品检批次列表（判据 `status='INSPECTION'`） | [`../parts/inspection.md`](../parts/inspection.md#get-apiv2prodbatchesinspection) |
+| GET | `/api/v2/prod/batches/inspection` | Manager / Inspector | 待品检批次列表（判据 `status='INSPECTION'`）；**2026-10-03 VO 收口为 `InspectionQueueItemOut`（13 字段），查询参数加表头筛选 + 服务端排序，与 repair / repairing 不再共用** | [`../parts/inspection.md`](../parts/inspection.md#get-apiv2prodbatchesinspection) |
 | GET | `/api/v2/prod/batches/repair` | Manager / Inspector | 维修批次列表（判据 `status='DELIVERED'`） | [`../parts/lifecycle.md`](../parts/lifecycle.md#get-apiv2prodbatchesrepair) |
 | GET | `/api/v2/prod/batches/repairing` | Manager / Inspector | 维修中批次列表（判据 `is_repairing = true`） | [`../parts/lifecycle.md`](../parts/lifecycle.md#get-apiv2prodbatchesrepairing) |
 

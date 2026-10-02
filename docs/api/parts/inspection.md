@@ -124,7 +124,7 @@ Request：`ToInspectionRequest`（body 必填 —— `target_inspection_shelf_id
 - 起点状态：`PENDING` / `PROGRAMMING` / `IN_PROCESS`
   - `IN_PROCESS` 必须 `location='PRODUCTION_SHELF'` + `current_holder_id` 命中 `t_shelf`（service 启发式区分 worker 持有 vs shelf 持有；worker 持有 → 20103 / "工人持有件请先归还或送检"）
 - 终点状态：`INSPECTION`（`location='INSPECTION_SHELF'` + `current_holder_id=target_shelf.id`）
-- **2026-09-30（review H2 修复）：`current_process_id` 置 NULL**（送检 = **出池**，
+- **`current_process_id` 置 NULL**（送检 = **出池**，
   写入不变式第 2 行）。此前本端点只翻 `status` / `location` / `current_holder_id`，
   批次会带着上一道工序的 `current_process_id` 停在 `INSPECTION` 状态，与 migration 004
   的列定义「NULL 表示批次不在生产工序池中」矛盾。
@@ -370,7 +370,7 @@ Request：`WorkerScanRequest`
 - **RETURNED**：worker 把 IN_PROCESS+WORKER 批次放回生产架
   - `shelf_id` 必须映射 `next_process_id`（service 校验 `t_shelf_process`）→ 不匹配 `20507 BIZ_SHELF_PROCESS_NOT_MAPPED`
   - `part_batch` 与 `part` 状态切回 IN_PROCESS+PRODUCTION_SHELF+holder=shelf（OCC）
-  - **2026-09-30（review H1 修复）：写 `current_process_id = next_process_id`** ——
+  - **写 `current_process_id = next_process_id`** ——
     RETURNED 是全仓唯一的**工序推进**路径，批次归还货架后落进**下一道工序**的候选池。
     此前该列不写，批次带着旧工序 id 落回**原工序**池（权威列在主干流程上说谎）。
     另：RETURNED 仍**不更新** `current_process_step_id`（可选的显示用定位信息），
@@ -380,7 +380,7 @@ Request：`WorkerScanRequest`
   - `target_inspection_shelf_id` 必须属于 INSPECTION 区且 active
   - 不符合 → `20511 BIZ_SHELF_NOT_INSPECTION_ZONE` / `20512 BIZ_SHELF_INACTIVE`
   - 内部走 `to_inspection_core`：状态机 `IN_PROCESS → INSPECTION` + holder worker → target_shelf + 写 `SENT_TO_INSPECTION` 事件日志
-  - **2026-09-30（review H2 修复）：`current_process_id` 置 NULL**（送检 = 出池），
+  - **`current_process_id` 置 NULL**（送检 = 出池），
     与单件送检 `to-inspection` 口径一致
   - 不带 quantity 拆批（worker-scan 是单件持有件流转，不涉及批次拆分）
 - **任一成功后**同事务调用 `WorkerPoolService::refill_for_worker`：
@@ -486,12 +486,12 @@ Response 200 `data`：`PartScanContextOut`
 
 实现位置：
 
-- handler：`src/modules/part/handler.rs::get_by_serial_part_batches` (line 423) → `PartScanContextOut`
-- service：`src/modules/part/service/crud.rs::get_part_batches_by_serial` (line 366)
-- dto：`src/modules/part/dto.rs`（`PartScanContextOut` / `PartScanInfoOut` / `PartBatchScanOut`）
-- repo（批次 + holder 名称）：`src/modules/part_batch/repo.rs::list_active_by_part_id_with_holder` (line 547)，LEFT JOIN `t_worker` / `t_shelf` 拼 holder_name
-- repo（part）：`src/modules/part/repo/part.rs::get_by_serial` (line 140)
-- model：`src/modules/part_batch/model.rs::TPartBatch`（批次行 + 状态枚举）
+- handler：`src/modules/part/handler/crud.rs::get_by_serial_part_batches` → `PartScanContextOut`
+- service：`src/modules/part/service/crud.rs::get_part_batches_by_serial`
+- vo：`src/modules/part/vo/part_batch.rs`（`PartScanContextOut` / `PartScanInfoOut` / `PartBatchScanOut`）
+- repo（批次 + holder 名称）：`src/modules/prod/batch/repo/queries.rs::list_active_by_part_id_with_holder`，LEFT JOIN `t_worker` / `t_shelf` 拼 holder_name
+- repo（part）：`src/modules/part/repo/sql/part_sql.rs::get_by_serial`
+- model：`src/modules/prod/batch/model.rs::TPartBatch`（批次行 + 状态枚举）
 
 ---
 
@@ -499,171 +499,115 @@ Response 200 `data`：`PartScanContextOut`
 
 权限: **Manager / Inspector**
 
+> **VO 收口（2026-10-03，BREAKING）**：本端点出参不再是 28 字段的
+> `InspectionBatchListItemOut`，而是精简的 `InspectionQueueItemOut`（**13 字段**），
+> 严格对齐待品检页的 7 个数据列 + 操作列锚点；`/prod/batches/repair` /
+> `repairing` 继续用原宽 VO（字段表见
+> [`./lifecycle.md`](./lifecycle.md#get-apiv2prodbatchesrepair)）。查询参数同时换代：
+> 跨字段 `keyword` 拆成表头 3 个独立筛选，新增 `sort_by` / `sort_dir`，
+> 日期区间从**计划交期**改筛**系统交期**。
+
 Query：
 
 | 参数 | 类型 | 必填 | 默认值 | 校验 / 说明 |
 |---|---|---|---|---|
-| `keyword` | string | — | — | ILIKE 匹配 `t_part.drawing_no` / `name` / `serial_no` / `order_no`；含 `%` / `_` / `\\` → `40001 VALIDATION_ERROR` |
+| `drawing_no` | string | — | — | ILIKE 匹配 `t_part.drawing_no`（表头「图号」列）；含 `%` / `_` / `\\` → `40001 VALIDATION_ERROR`；空串 = 不过滤。**拒通配符是语义约束**（防 `%…%` 被当通配符放大成全表扫描），不是注入防护 —— 注入面由 repo 侧 `push_bind` 参数化保证 |
+| `name` | string | — | — | ILIKE 匹配 `t_part.name`（表头「名称」列）；通配符校验同上 |
+| `serial_no` | string | — | — | ILIKE 匹配 `t_part.serial_no`（表头「序列号」列）；通配符校验同上 |
 | `customer_id` | string (i64) | — | — | 单值；service 用 `expand_customer_id` 展开为 L1+L2 ids（关联 `t_customer.parent_id`） |
-| `serial_no` | string | — | — | ILIKE 匹配 `t_part.serial_no`；含 `%` / `_` / `\\` → `40001 VALIDATION_ERROR` |
-| `planned_delivery_date_from` | date | — | — | 范围下界（包含），匹配 `t_part.planned_delivery_date` |
-| `planned_delivery_date_to` | date | — | — | 范围上界（包含），匹配 `t_part.planned_delivery_date` |
+| `system_delivery_date_from` | date | — | — | 范围下界（含），匹配 `t_part.system_delivery_date`；**NULL 交期不被命中**。格式非法 → 400（axum Query 层，非 R 信封，见错误码段） |
+| `system_delivery_date_to` | date | — | — | 范围上界（含），匹配 `t_part.system_delivery_date`；格式非法同上 |
+| `sort_by` | string | — | `SYSTEM_DELIVERY_DATE` | 白名单（见下方排序表）；**非法值退化为 `SYSTEM_DELIVERY_DATE`，不报错** |
+| `sort_dir` | string | — | `ASC` | 仅 `DESC`（忽略大小写）被接受，其余（含缺省）→ `ASC` |
 | `limit` | string (i64) | — | `200` | clamp 到 `[1, 200]`（`0` / 负数 → `1`；超过 `200` → `200`；非法 → `200`） |
 | `offset` | string (i64) | — | `0` | `max(0, v)`（负数 / 非法 → 取 0） |
 
 > 只读查询，无状态变更、无事务、无 WS 广播。
 
-业务说明：
+排序（服务端，表头点列即换 `sort_by` + `sort_dir`）：
 
-- 与现有 `by-serial/{serial_no}/part-batches` 的区别：
-  - **`by-serial/.../part-batches`** —— 按序列号扫码上下文，单 part 的全部活跃批次（不限 status），工单窄字段 + 全部活跃批次；典型场景：工人扫序列号弹窗显示该工单下全部批次
-  - **`/prod/batches/inspection`** —— 按状态筛选（固定 `status='INSPECTION'`）的全量批次列表，page-style（`limit` / `offset` / `total`），典型场景：品检员进入待品检队列页加载下一页
-- 与 to-XXX 流程的衔接：本端点返回的 `batch_id` + `version` 是后续 `POST /prod/batches/{batch_id}/to-ship` / `to-process`（`batch_id` 作路径参数）或 `POST /prod/batches/to-ship`（`batch_id` 进 `items[]`）等 caller OCC 锚点的**权威来源**（前端列表页拿到后直接拼路径 / 请求体）。注意 `version` 是 `t_part_batch.version`，不是 `t_part.version`
+| `sort_by` | ORDER BY 列 | 说明 |
+|---|---|---|
+| `SERIAL_NO` | `p.serial_no` | 序列号 |
+| `DRAWING_NO` | `p.drawing_no` | 图号 |
+| `NAME` | `p.name` | 名称 |
+| `BATCH_NO` | `pb.batch_no` | 批次 |
+| `QUANTITY` | `pb.quantity` | 数量 |
+| `SYSTEM_DELIVERY_DATE` | `p.system_delivery_date` | 系统交期（缺省值；非法 `sort_by` 也退化到它） |
+| `CUSTOMER_NAME` | `c.name` | 客户 |
 
-排序：`is_urgent DESC, planned_delivery_date ASC, batch.id ASC`（紧急件优先 → 交期近优先 → 批次 id 兜底稳定排序）
+排序形态：`{列} {ASC|DESC} NULLS LAST, pb.id ASC`。
 
-Response 200 `data`：`InspectionBatchListOut`
+- `NULLS LAST` 是必需的：`system_delivery_date` 可空，而 PG 的默认值是
+  ASC → `NULLS LAST` / DESC → `NULLS FIRST`，不显式指定时按交期倒序会把未填交期的行
+  顶到最前。
+- `pb.id ASC` 兜底：排序列可重复（同名不同批次），无兜底键时翻页会漏行 / 重复行。该
+  路径由 `tests/part/inspection_batches.rs::inspection_batches_pagination_tiebreak_by_batch_id_is_stable`
+  覆盖（3 行排序键全并列、并列组跨页边界，断言两页拼回与整页同序）。
+- 列名白名单在 service 层映射后才进 repo，故外部输入不可能成为 SQL 片段。
+- **2026-10-03：`is_urgent` 不再参与排序**。改 VO 之前服务端硬编码
+  `ORDER BY is_urgent DESC, planned_delivery_date ASC, pb.id ASC`，即「紧急件优先」
+  自动置顶；现改为仿照零件一览页的表头点列排序，`is_urgent` **降级为纯展示字段**
+  （前端自行标红），不再是任何 `sort_by` 的排序键。接入方注意：默认序下加急件
+  **不会**自动置顶，要置顶需前端按 `is_urgent` 自行排。
+
+Response 200 `data`：`InspectionQueueListOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `items` | [`InspectionBatchListItemOut`](#inspectionbatchlistitemout-字段)[] | 批次列表（按上述排序规则排序） |
-| `total` | string (i64) | 满足过滤条件的总数（`COUNT(*)`） |
+| `items` | [`InspectionQueueItemOut`](#inspectionqueueitemout-字段)[] | 批次列表（按上述排序规则排序） |
+| `total` | string (i64) | 满足过滤条件的总数（`COUNT(*)`，与 items 同 WHERE） |
 | `limit` | string (i64) | 实际生效的 limit（clamp 后） |
 | `offset` | string (i64) | 实际生效的 offset（max(0) 后） |
 
-#### `InspectionBatchListItemOut` 字段
+#### `InspectionQueueItemOut` 字段
 
-批次字段段：
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `batch_id` | string (i64) | 批次雪花 ID |
-| `batch_no` | string? | 批次号 |
-| `quantity` | i32 | 批次数量 |
-| `status` | string | 批次状态枚举字符串（本端点固定为 `INSPECTION`） |
-| `is_repairing` | bool | 是否处于返修中（**2026-10-01 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006），非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，起修时 `status` 保持 `IN_PROCESS`（DB 不再产生 `REPAIRING` 字面量）；本字段与 `status` **正交**（起修后送检可得 `INSPECTION` + `is_repairing = true`，可达链见下方订正段）—— **「是否返修中」只能读本字段**。`/prod/batches/repairing` 的判据即 `is_repairing = true`。语义与 Rust 侧 `src/modules/prod/batch/vo.rs` 一致 |
-| `location` | string? | 批次所在位置（`INSPECTION_SHELF` 等） |
-| `version` | i32 | 乐观锁（`t_part_batch.version`，caller OCC 锚点） |
-| `current_process_step_id` | string (i64)? | 逻辑 FK → `t_process_chain_step.id`（PR-3 批次 step 化 2026-09-16 新增，替代 next_process_id 列） |
-| `parent_batch_id` | string (i64)? | 拆批来源的父批次 ID（仅拆批产生的新批次非 None） |
-
-> 2026-09-16 PR-3 批次 step 化（migration 028）：删 `placed_at` 字段
-> —— `t_part_batch.placed_at` 列已删（不再统计生产时间）。
-> 新增 `current_process_step_id`（逻辑 FK → 工艺链步骤）。
->
-> **2026-09-30（migration 004）**：`t_part_batch` 新增 `current_process_id`
-> （逻辑 FK → `t_process.id`），作为批次**工序池归属的权威依据**。
-> `current_process_step_id` 相应降级为**可选的显示用定位信息**
-> （**只在首次定位工序时写、之后不再推进**）。
->
-> **2026-09-30 review 第 3 轮 M3 —— 本 DTO 的工序字段仍走 step 派生，未改直读**
-> 一度把 `next_process_id` / `next_process_name` 改直读 `current_process_id`，
-> 但送检 = 出池、该列对 `INSPECTION` 批次**恒为 NULL**，而本端点只查
-> `status='INSPECTION'` → 改直读会让这两个字段**恒 null**（用户可见回归，且原有
-> 集成测试不断言该字段，无人发现）。已回退到 `current_process_step_id` →
-> step JOIN 派生。
->
-> **读取方分工（勿越界）**：`current_process_id` 只服务 5 条工序池 SQL
-> （`/prod/pool/{process_id}` / `/prod/pool/counts` / `take_one_from_pool` /
-> `take_specific_from_pool` / `count_pool_by_shelf_and_process`）+
-> `list_pickable_by_work_type` + rollup 派生 `t_part.next_process_id`；
-> **展示类列表（本端点 / `/prod/batches/repair` / part 批次明细 / dashboard）一律继续走
-> step 派生**。两个 DTO 字段名（`next_process_id` / `next_process_name`）始终不变。
->
-> 2026-09-16 PR-2（migration 027）：`InspectionBatchListItemOut` 删 `has_been_repaired`
-> 字段 —— `t_part_batch.has_been_repaired` 列已删。
->
-> **2026-10-01**：返修事实改由 `t_part_batch.is_repairing` 标记列 +
-> `t_part_event.event_type='REPAIR_STARTED'` 事件日志共同追溯（详见
-> [`../../api/parts/lifecycle.md`](../../api/parts/lifecycle.md) § start-repair）。
->
-> **2026-10-02 订正 —— 上一段「都不新增 `is_repairing` 字段」的结论是错的**，
-> 已由 2026-10-01 review 第 1 轮 M5 推翻（与
-> [`./lifecycle.md` § GET /api/v2/prod/batches/repairing](./lifecycle.md#get-apiv2prodbatchesrepairing)
-> 的记载矛盾）。**订正后的事实**：`is_repairing: bool` **已随本 VO 的 3 个共用端点
-> （`/prod/batches/inspection` / `/prod/batches/repair` / `/prod/batches/repairing`）一起返回**，
-> 见上方批次字段表。
->
-> **为什么必须有这个字段**（原结论的推理漏洞，留档以免回潮）：
-> - `REPAIRING` 降级为标记列后，DB 不再产生 `REPAIRING` 字面量（起修时 `status`
->   保持 `IN_PROCESS`）⇒ 前端的老判据 `status === 'REPAIRING'` 在**任何**端点
->   都取不到值。
-> - 「前端从 `status` + 端点语义即可判断」不成立：**返修标记与 `status` 正交**。
->   返修中的批次可以停在非 `IN_PROCESS` 的状态上而标记不变 —— `start-repair`
->   （`IN_PROCESS` + 标记 `true`）之后走 `POST /prod/batches/{batch_id}/to-inspection` 或
->   worker-scan `INSPECTED`，两条路都经 `mark_batch_inspected`
->   （`is_repairing: None` = **保持**标记，`allowed_from` 含 `IN_PROCESS`）
->   ⇒ 批次落到 `INSPECTION` + `is_repairing = true`。该状态可达的反证是
->   `to-process` 对它有 20118 守卫（`src/modules/part/service/inspection_core.rs`
->   step 4.6）。于是 `/prod/batches/inspection`（判据 `status='INSPECTION'`）返回的行里
->   返修件与普通送检件**混在一起**；标记还会经 `mark_batch_passed_inspection` /
->   `mark_batch_delivered`（同样 `is_repairing: None` = 保持）一路带到
->   `DELIVERED`（`to-ship` 无返修守卫，只有 `to-process` 有），故
->   `/prod/batches/repair`（判据 `status='DELIVERED'`）同样混。端点语义（该端点在查什么）
->   推不出每一行是否返修中。
-> - 「要区分就只调 `GET /api/v2/prod/batches/repairing`」也不是答案：该端点只
->   返回 `is_repairing = true` 的批次，覆盖不了「同一个列表里既有返修件又有
->   普通在制品」的展示场景，而后者才是队列类页面的常态。
->
-> 字段形态：`bool`（**非** `Option`、**无** `#[serde(default)]`、**无**
-> `skip_serializing_if`）⇒ **恒定出现在 JSON 里**，前端 Zod schema 必须按必填
-> `boolean` 声明，不能 `.optional()`。同批新增的另一个 VO `PartBatchListItemOut`
-> （`GET /api/v2/parts/{id}/batches`）同样有 `is_repairing: bool`，见
-> [`./batch.md`](./batch.md)。
-
-holder 解析段（LEFT JOIN `t_worker` / `t_shelf` 一次拼齐）：
+**恰好 13 个**（集成测试对 key 集合做相等断言，多一个少一个都失败）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `current_holder_id` | string (i64)? | 当前持有人 id（worker.id 或 shelf.id） |
-| `holder_name` | string? | 当前持有人名称（worker 真名 / 货架 code / null） |
-| `next_process_id` | string (i64)? | 下一道工序 id（对应 `t_process`）。由 `current_process_step_id` 经 `LEFT JOIN t_process_chain_step` 取 `s.process_id` 派生（**不直读 `current_process_id`**，理由见上方 review M3 段） |
-| `next_process_name` | string? | 下一道工序名称（`t_process.name`，`LEFT JOIN t_process np ON np.id = s.process_id` 拼齐） |
-
-delivery_note 解析段（LEFT JOIN `t_delivery_note` 一次拼齐）：
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `delivery_note_id` | string (i64)? | 关联送货单 id（`t_part_batch.delivery_note_id`，LEFT JOIN 后填 `delivery_note_id`） |
-| `delivery_note_no` | string? | 关联送货单号（`t_delivery_note.delivery_note_no`） |
-
-工单字段段（`t_part`）：
-
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `part_id` | string (i64) | 工单雪花 ID |
-| `serial_no` | string? | 工单序列号 |
+| `batch_id` | string (i64) | 批次雪花 ID；三个写端点的路径参数 + 扫码选择行标识 |
+| `batch_no` | i32 | 批次号 |
+| `quantity` | i32 | 批次数量（部分通过弹窗的 `quantity` 上限） |
+| `version` | i32 | 乐观锁（`t_part_batch.version`，caller OCC 锚点；**不是** `t_part.version`） |
+| `part_id` | string (i64) | 工单雪花 ID（详情页 `/parts/{part_id}`） |
+| `serial_no` | string? | 工单序列号（手工工单可空） |
 | `drawing_no` | string | 图号 |
 | `name` | string | 工单名 |
-| `order_no` | string? | 订单号 |
-| `planned_delivery_date` | date? | 计划交付日（用于范围过滤 + 排序） |
-| `is_urgent` | bool | 是否加急（用于排序：紧急件优先） |
-| `part_version` | i32 | part 聚合 version（**注意：caller OCC 必须用 `version`（即 `t_part_batch.version`），不能用 `part_version`**） |
-| `created_at` | naive datetime | 工单创建时间 |
-| `updated_at` | naive datetime | 工单更新时间 |
+| `system_delivery_date` | date? | 系统交期（2026-10-03 新增投影；可空 → JSON `null`） |
+| `is_urgent` | bool | 是否加急（前端标红）；恒定出现，前端 schema 按**必填** boolean 声明 |
+| `customer_id` | string (i64) | 工单客户 id（表头客户筛选的入参回显） |
+| `customer_name` | string? | L2 客户名（`t_customer.name`） |
+| `l1_customer_name` | string? | L1 客户名（`c.parent_id` → 上级客户名；自身即 L1 时等于 `customer_name`） |
 
-客户解析段（LEFT JOIN `t_customer` L1 一次拼齐）：
+> 与前端的衔接：`batch_id` + `version` 是后续 `POST /prod/batches/{batch_id}/to-ship`
+> / `to-process`（`batch_id` 作路径参数）或 `POST /prod/batches/to-ship`（`batch_id` 进
+> `items[]`）等 caller OCC 锚点的**权威来源**（前端列表页拿到后直接拼路径 / 请求体）。
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `customer_id` | string (i64) | 工单客户 id（`t_part.customer_id`） |
-| `customer_name` | string? | 客户名（`t_customer.name`） |
-| `l1_customer_name` | string? | L1 客户名（`t_customer.parent_id` → `t_customer.name` 拼齐；与 `crud.md` 列表保持一致） |
+SQL 形态：3 个 JOIN（`t_part` / `t_customer` / `t_customer` 自连 L1）+ 13 个输出列。
+**不** JOIN `t_shelf` / `t_worker` / `t_outsource_company` / `t_process_chain_step` /
+`t_process` / `t_delivery_note` —— 本页不渲染 holder / 工序 / 送货单。
+WHERE 判据固定：`pb.status = 'INSPECTION'` + 双方未软删 + 上述可选筛选。
 
 错误码：
 
-- 40001 VALIDATION_ERROR — `keyword` / `serial_no` 含通配符 `%` / `_` / `\\`
+- 40001 VALIDATION_ERROR（HTTP 422）— `drawing_no` / `name` / `serial_no` 含通配符 `%` / `_` / `\\`
 - 40100 UNAUTHORIZED — 未登录 / token 过期 / session 失效
 - 40300 FORBIDDEN — 非 Manager / 非 Inspector
+- 400 BAD_REQUEST — `system_delivery_date_from` / `system_delivery_date_to` 格式非法
+  （如 `not-a-date`）。这一条走 **axum `Query` 反序列化层**，早于 service：返回的是
+  **非 `R` 信封**的纯文本 body（`Failed to deserialize query string`），不走本仓统一
+  响应信封。属全仓既有模式（所有带日期 query 参数的 list 端点同此），本端点只是
+  新增了 2 个日期参数。
 
 实现位置：
 
-- handler：`src/modules/prod/batch/handler/transition.rs`（`list_inspection_batches` → `InspectionBatchListOut`）
-- service：`src/modules/prod/batch/service/list.rs`（`BatchService::list_inspection_batches`：状态过滤 + 范围展开 + clamp + ILIKE 校验）
-- dto：`src/modules/prod/batch/dto.rs`（`InspectionBatchListQuery`）
-- vo：`src/modules/prod/batch/vo.rs`（`InspectionBatchListItemOut` / `InspectionBatchListOut` + `From<Row> for InspectionBatchListItemOut` impl）
-- repo：`src/modules/prod/batch/repo/list.rs`（`PartBatchRepo::list_batches_with_part` / `count_batches_with_part`，单 SQL JOIN 8 表：t_part_batch + t_part + t_worker + t_shelf + t_process + t_delivery_note + t_customer + L1 customer）
-- model：`src/modules/prod/batch/model.rs`（`InspectionBatchListRow`）
+- handler：`src/modules/prod/batch/handler/transition.rs`（`list_inspection_batches` → `InspectionQueueListOut`）
+- service：`src/modules/prod/batch/service/list.rs`（`BatchService::list_inspection_batches`：客户范围展开 + clamp + ILIKE 通配符校验 + 排序列白名单）
+- dto：`src/modules/prod/batch/dto.rs`（`InspectionQueueQuery`）
+- vo：`src/modules/prod/batch/vo.rs`（`InspectionQueueItemOut` / `InspectionQueueListOut` + `From<InspectionQueueRow>`）
+- repo：`src/modules/prod/batch/repo/list.rs`（`PartBatchRepo::list_inspection_queue` / `count_inspection_queue`）
+- model：`src/modules/prod/batch/model.rs`（`InspectionQueueRow`）
 
 ---
 
@@ -896,7 +840,7 @@ pub struct BatchToXxxOut {
 // id (i64 string) / serial_no / name / drawing_no / status / version /
 // quantity / order_no / updated_at / updated_by
 // （详见 [`./index.md`](./index.md#partout-字段)；
-// 2026-09-16 PR-2 删 `actual_delivery_date`，由 t_part_event DELIVERED 事件派生）
+// 2026-09-16（migration 027）删 `actual_delivery_date`，由 t_part_event DELIVERED 事件派生）
 ```
 
 ---
