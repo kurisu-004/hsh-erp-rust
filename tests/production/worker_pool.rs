@@ -594,7 +594,7 @@ async fn worker_scan_inspected_triggers_refill() {
         app,
         json_request(
             "POST",
-            "/parts/worker-scan",
+            "/prod/batches/worker-scan",
             Some(json!({
                 "serial_no": "H-001",
                 "badge_code": "BC001",
@@ -646,7 +646,7 @@ async fn worker_scan_returned_triggers_refill() {
         app,
         json_request(
             "POST",
-            "/parts/worker-scan",
+            "/prod/batches/worker-scan",
             Some(json!({
                 "serial_no": "H-002",
                 "badge_code": "BC002",
@@ -714,7 +714,7 @@ async fn worker_scan_returned_advances_current_process_id() {
         app,
         json_request(
             "POST",
-            "/parts/worker-scan",
+            "/prod/batches/worker-scan",
             Some(json!({
                 "serial_no": "H-002B",
                 "badge_code": "BC002B",
@@ -959,7 +959,7 @@ async fn worker_scan_shelf_scope_violation_403() {
         app,
         json_request(
             "POST",
-            "/parts/worker-scan",
+            "/prod/batches/worker-scan",
             Some(json!({
                 "serial_no": "H-008",
                 "badge_code": "BC008",
@@ -1121,7 +1121,7 @@ async fn events_persisted_to_t_part_event() {
         app,
         json_request(
             "POST",
-            "/parts/worker-scan",
+            "/prod/batches/worker-scan",
             Some(json!({
                 "serial_no": "H-011",
                 "badge_code": "BC011",

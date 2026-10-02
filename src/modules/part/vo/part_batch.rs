@@ -2,8 +2,8 @@
 
 use serde::Serialize;
 
-use crate::modules::part::batch::model::PartBatchScanRow;
 use crate::modules::part::service::crud::TPartScanRow;
+use crate::modules::prod::batch::model::PartBatchScanRow;
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
 /// `POST /parts/batch` per-item 失败明细。

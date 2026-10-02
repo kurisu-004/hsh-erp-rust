@@ -1,8 +1,8 @@
-//! part 域集成测试 —— `GET /parts/inspection-batches` 端点
+//! part 域集成测试 —— `GET /prod/batches/inspection` 端点
 //!
 //! 覆盖：
 //!   1. happy path：list 仅返回 INSPECTION 批次，返回的 `batch_id + version`
-//!      可直接拼 `POST /parts/{part_id}/to-ship` 请求体（核心验收）。
+//!      可直接拼 `POST /prod/batches/{batch_id}/to-ship` 请求体（核心验收）。
 //!   2. keyword + customer_id 过滤：组合筛选命中预期行（其余行被过滤）。
 //!   3. 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。brief 原话
 //!      「Worker role」并不存在，本仓库 5 角色中 ShelfAccount 是唯一合法登录、
@@ -188,19 +188,19 @@ async fn insert_part_with_step_located_insp_batch(
 // ===========================================================================
 
 /// happy path：list 仅返回 INSPECTION 状态的批次；返回的 `batch_id + version`
-/// 可直接喂给 `POST /parts/{part_id}/to-ship`（核心验收）。
+/// 可直接喂给 `POST /prod/batches/{batch_id}/to-ship`（核心验收）。
 ///
 /// 步骤：
 ///   1. 插 part A + INSPECTION 批次（qty=5，holder=INSPECTION 货架）
 ///   2. 插 part B + IN_PROCESS 批次（qty=3）—— 必须不出现在 list 中
-///   3. GET /parts/inspection-batches?limit=10（INSPECTOR token）
+///   3. GET /prod/batches/inspection?limit=10（INSPECTOR token）
 ///   4. 断言：
 ///      - status 200
 ///      - data.total >= 1
 ///      - items 包含 A 的 batch_id 且 status=="INSPECTION"
 ///      - items 不包含 B 的 batch_id
 ///      - 命中项：batch_id / part_id / version / customer_name 字段语义正确
-///   5. 用 items[0].batch_id + version 调 POST /parts/{A.id}/to-ship → 200
+///   5. 用 items[0].batch_id + version 调 POST /prod/batches/{batch_id}/to-ship → 200
 ///      （to-ship 前先 UPDATE part.current_holder_id 指向 INSPECTION 货架，
 ///       让 holder_name 解析为 Some；to-ship 路径本身不强制 holder，但
 ///       前端会基于 holder_name 渲染提示）。
@@ -254,7 +254,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
         app.clone(),
         json_request(
             "GET",
-            "/parts/inspection-batches?limit=10",
+            "/prod/batches/inspection?limit=10",
             None::<Value>,
             Some(&token),
         ),
@@ -325,16 +325,15 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
         "items 不应含 part B 的 IN_PROCESS 批次（batch_id={batch_b}）: body={body}"
     );
 
-    // Step 5（核心验收）：用 hit.batch_id + hit.version 调 POST /parts/{part_a}/to-ship
+    // Step 5（核心验收）：用 hit.batch_id + hit.version 调 POST /prod/batches/{batch_id}/to-ship
     let to_ship_batch_id = hit["batch_id"].as_str().unwrap().to_string();
     let to_ship_version = hit["version"].as_i64().unwrap() as i32;
     let (ship_status, ship_body) = send(
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_a}/to-ship"),
+            &format!("/prod/batches/{to_ship_batch_id}/to-ship"),
             Some(json!({
-                "batch_id": to_ship_batch_id,
                 "version": to_ship_version,
             })),
             Some(&token),
@@ -356,7 +355,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
 ///   1. 2 个 L1 客户 L1_a / L1_b（互不关联）
 ///   2. 每个 L1 下挂 1 个 part，名字不同（带唯一关键字）
 ///   3. 每个 part 都有 INSPECTION 批次
-///   4. GET /parts/inspection-batches?customer_id=L1_a&keyword=<L1_a part name>
+///   4. GET /prod/batches/inspection?customer_id=L1_a&keyword=<L1_a part name>
 ///      → items 仅含 L1_a 的 batch（L1_b 的被过滤）
 ///
 /// **keyword 字符约束**：service 层拒绝 `%` / `_` / `\\` 通配符特殊字符
@@ -406,7 +405,7 @@ async fn inspection_batches_filters_by_keyword_and_customer() {
         app,
         json_request(
             "GET",
-            &format!("/parts/inspection-batches?customer_id={l1_a}&keyword=PARTA"),
+            &format!("/prod/batches/inspection?customer_id={l1_a}&keyword=PARTA"),
             None::<Value>,
             Some(&token),
         ),
@@ -471,7 +470,7 @@ async fn inspection_batches_role_guard_rejects_worker() {
         app,
         json_request(
             "GET",
-            "/parts/inspection-batches",
+            "/prod/batches/inspection",
             None::<Value>,
             Some(&token),
         ),
@@ -498,7 +497,7 @@ async fn inspection_batches_role_guard_rejects_worker() {
 ///
 /// 步骤：
 ///   1. 3 个 L1 客户各下 1 个 part，每个 part 有 INSPECTION 批次（≥3 条活跃批次）
-///   2. GET /parts/inspection-batches?limit=2&offset=1
+///   2. GET /prod/batches/inspection?limit=2&offset=1
 ///   3. 断言：items.len() == 2；total >= 3；limit == 2；offset == 1
 ///
 /// **L1 prefix 约束**：`t_customer.serial_prefix` 是 `varchar(1)` +
@@ -545,7 +544,7 @@ async fn inspection_batches_pagination_limit_offset() {
         app.clone(),
         json_request(
             "GET",
-            "/parts/inspection-batches?limit=2&offset=1",
+            "/prod/batches/inspection?limit=2&offset=1",
             None::<Value>,
             Some(&token),
         ),
@@ -582,7 +581,7 @@ async fn inspection_batches_pagination_limit_offset() {
         app.clone(),
         json_request(
             "GET",
-            "/parts/inspection-batches?limit=2&offset=2",
+            "/prod/batches/inspection?limit=2&offset=2",
             None::<Value>,
             Some(&token),
         ),
@@ -645,7 +644,7 @@ async fn inspection_batches_derives_next_process_from_step_not_cpid() {
         app,
         json_request(
             "GET",
-            "/parts/inspection-batches?limit=50",
+            "/prod/batches/inspection?limit=50",
             None::<Value>,
             Some(&token),
         ),

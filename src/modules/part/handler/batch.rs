@@ -27,12 +27,11 @@ use axum::Json;
 use axum::extract::{Multipart, Path, State};
 use serde_json::json;
 
-use crate::auth::rbac::{CurrentUser, Role};
+use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
-use crate::modules::part::dto::BatchToInspectionRequest;
 use crate::modules::part::dto_crud::{BatchWithPdfsRequest, PartBatchCreateRequest};
 use crate::modules::part::service::PartService;
-use crate::modules::part::vo::{BatchToXxxOut, PartBatchCreateOut, PartDetailOut};
+use crate::modules::part::vo::{PartBatchCreateOut, PartDetailOut};
 use crate::modules::part_file::dto::ConfirmFileIn;
 use crate::modules::part_file::vo::PartFileOut;
 use crate::shared::error::AppError;
@@ -228,46 +227,6 @@ pub async fn batch_with_pdfs(
     state.ws_hub.broadcast(WsEvent::DashboardEvent {
         kind: "PART_BATCH_WITH_PDFS_CREATED".into(),
         payload: json!({ "part_id": out.part.id.to_string() }),
-    });
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/batch-to-inspection`
-///
-/// 批量送检（共享品检架 + per-item to_inspection_core）。
-///
-/// 行为：
-/// - 权限：`Manager` 或 `Inspector`
-/// - 入参：`{ target_inspection_shelf_id, items: [...] }`
-/// - 业务流转：service `batch_to_inspection`（共享外层事务 + per-item 独立 core）
-/// - WS 广播：commit 后 `BATCH_TO_INSPECTION`
-/// - 响应：`{ submitted, failed }`
-pub async fn batch_to_inspection(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Json(req): Json<BatchToInspectionRequest>,
-) -> Result<Json<R<BatchToXxxOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::Inspector])?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::batch_to_inspection(&mut *tx, &state.snowflake, req, &current).await?;
-    tx.commit().await?;
-    let mut seen_assemblies = std::collections::HashSet::new();
-    for item in &out.submitted {
-        if let Some(aid) = item.synced_assembly_id
-            && seen_assemblies.insert(aid)
-        {
-            state.ws_hub.broadcast(WsEvent::DashboardEvent {
-                kind: "ASSEMBLY_UPDATED".into(),
-                payload: json!({ "assembly_id": aid.to_string() }),
-            });
-        }
-    }
-    state.ws_hub.broadcast(WsEvent::DashboardEvent {
-        kind: "BATCH_TO_INSPECTION".into(),
-        payload: json!({
-            "submitted": out.submitted.len(),
-            "failed": out.failed.len(),
-        }),
     });
     Ok(Json(R::ok(out)))
 }

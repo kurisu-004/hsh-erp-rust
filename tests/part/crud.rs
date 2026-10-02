@@ -788,7 +788,7 @@ async fn get_by_serial_404() {
 //  Tests — Part 5: lifecycle (deliver / cancel / complete / start-repair)
 // ===========================================================================
 
-/// POST /parts/{id}/deliver —— READY_TO_SHIP → DELIVERED (200 + status)。
+/// POST /prod/batches/{batch_id}/deliver —— READY_TO_SHIP → DELIVERED (200 + status)。
 #[tokio::test]
 async fn deliver_ready_to_ship_200() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -807,9 +807,8 @@ async fn deliver_ready_to_ship_200() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{bid}/deliver"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "note": "发货"
             })),
@@ -822,7 +821,7 @@ async fn deliver_ready_to_ship_200() {
     assert_eq!(env["data"]["status"], "DELIVERED");
 }
 
-/// POST /parts/{id}/deliver —— batch 当前 INSPECTION → 20117。
+/// POST /prod/batches/{batch_id}/deliver —— batch 当前 INSPECTION → 20117。
 #[tokio::test]
 async fn deliver_wrong_state_400() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -834,9 +833,8 @@ async fn deliver_wrong_state_400() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{bid}/deliver"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
             })),
             Some(&token),
@@ -888,7 +886,7 @@ async fn cancel_wrong_state_400() {
     assert_eq!(env["code"], 20103, "BIZ_INVALID_TRANSITION: {env}");
 }
 
-/// POST /parts/{id}/complete —— DELIVERED → COMPLETED (200 + status)。
+/// POST /prod/batches/{batch_id}/complete —— DELIVERED → COMPLETED (200 + status)。
 #[tokio::test]
 async fn complete_delivered_200() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -900,9 +898,8 @@ async fn complete_delivered_200() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete"),
+            &format!("/prod/batches/{bid}/complete"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "note": "归档"
             })),
@@ -919,7 +916,7 @@ async fn complete_delivered_200() {
     );
 }
 
-/// POST /parts/{id}/complete —— batch 当前 INSPECTION → 20116。
+/// POST /prod/batches/{batch_id}/complete —— batch 当前 INSPECTION → 20116。
 #[tokio::test]
 async fn complete_wrong_state_400() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -931,9 +928,8 @@ async fn complete_wrong_state_400() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete"),
+            &format!("/prod/batches/{bid}/complete"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
             })),
             Some(&token),
@@ -944,7 +940,7 @@ async fn complete_wrong_state_400() {
     assert_eq!(env["code"], 20116, "BIZ_PART_NOT_DELIVERED: {env}");
 }
 
-/// POST /parts/{id}/start-repair —— batch IN_PROCESS + is_repairing=true (200 + status)。
+/// POST /prod/batches/{batch_id}/start-repair —— batch IN_PROCESS + is_repairing=true (200 + status)。
 ///
 /// 2026-10-01 契约变更：REPAIRING 从 `PartStatus` 降级为
 /// `t_part_batch.is_repairing` 标记列（migration 005/006），故
@@ -961,9 +957,8 @@ async fn start_repair_in_process_200() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/start-repair"),
+            &format!("/prod/batches/{bid}/start-repair"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "reason": "尺寸偏大"
             })),
@@ -999,7 +994,7 @@ async fn start_repair_in_process_200() {
     );
 }
 
-/// POST /parts/{id}/start-repair —— batch 已在返修中（is_repairing=true）→ 20118。
+/// POST /prod/batches/{batch_id}/start-repair —— batch 已在返修中（is_repairing=true）→ 20118。
 ///
 /// 2026-10-01 新增：start-repair 不再改 status，故「重复起修」无法靠状态守卫
 /// 拦住 —— 必须查 `is_repairing` 标记。重复起修会多写一条 REPAIR_STARTED
@@ -1020,9 +1015,8 @@ async fn start_repair_already_repairing_400() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/start-repair"),
+            &format!("/prod/batches/{bid}/start-repair"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "reason": "重复起修"
             })),
@@ -1038,7 +1032,7 @@ async fn start_repair_already_repairing_400() {
     assert_eq!(env["code"], 20118, "BIZ_PART_REPAIR_NOT_TRIGGERED: {env}");
 }
 
-/// POST /parts/{id}/start-repair —— batch PENDING → 20118。
+/// POST /prod/batches/{batch_id}/start-repair —— batch PENDING → 20118。
 #[tokio::test]
 async fn start_repair_wrong_state_400() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -1050,9 +1044,8 @@ async fn start_repair_wrong_state_400() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/start-repair"),
+            &format!("/prod/batches/{bid}/start-repair"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "reason": "no-op"
             })),
@@ -1068,7 +1061,7 @@ async fn start_repair_wrong_state_400() {
     assert_eq!(env["code"], 20118, "BIZ_PART_REPAIR_NOT_TRIGGERED: {env}");
 }
 
-/// POST /parts/{id}/deliver —— CANCELLED 状态 → 20115 BIZ_PART_ALREADY_CANCELLED (409)。
+/// POST /prod/batches/{batch_id}/deliver —— CANCELLED 状态 → 20115 BIZ_PART_ALREADY_CANCELLED (409)。
 #[tokio::test]
 async fn deliver_cancelled_409() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -1080,9 +1073,8 @@ async fn deliver_cancelled_409() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{bid}/deliver"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
             })),
             Some(&token),
@@ -1117,7 +1109,7 @@ async fn batch_status_and_version(
     row
 }
 
-/// POST /parts/{id}/deliver —— READY_TO_SHIP → DELIVERED 应同时翻转
+/// POST /prod/batches/{batch_id}/deliver —— READY_TO_SHIP → DELIVERED 应同时翻转
 /// 指定 batch 到 DELIVERED（PR-B3 batch 级）。
 #[tokio::test]
 async fn deliver_also_updates_batch() {
@@ -1137,9 +1129,8 @@ async fn deliver_also_updates_batch() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{bid}/deliver"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": bver,
                 "note": "发货"
             })),
@@ -1189,11 +1180,11 @@ async fn cancel_also_updates_batch() {
     );
 }
 
-/// POST /parts/{id}/deliver —— batch_id 不存在 → 20109 BIZ_PART_BATCH_NOT_FOUND。
+/// POST /prod/batches/{batch_id}/deliver —— batch_id 不存在 → 20109 BIZ_PART_BATCH_NOT_FOUND。
 #[tokio::test]
 async fn deliver_without_source_batch_409() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let pid = insert_part(
+    let _pid = insert_part(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -1207,9 +1198,8 @@ async fn deliver_without_source_batch_409() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/deliver"),
+            &format!("/prod/batches/{fake_bid}/deliver"),
             Some(json!({
-                "batch_id": fake_bid.to_string(),
                 "version": 0,
             })),
             Some(&token),

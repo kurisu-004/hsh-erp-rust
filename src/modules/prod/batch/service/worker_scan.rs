@@ -1,24 +1,12 @@
-//! part 域 worker-scan 流业务逻辑。
+//! prod::batch 的工人扫码台主入口：`POST /api/v2/prod/batches/worker-scan`
 //!
-//! 对应 Python myERP/api/v1/parts.py 中 `POST /parts/worker-scan` 端点
-//! （Task 8）：worker 把持有件通过扫码台 RETURNED（放回生产架） / INSPECTED
-//! （直接送检）。
+//! worker 把持有件通过扫码台 **RETURNED**（放回生产架）/ **INSPECTED**（直接送检）。
 //!
-//! 本文件只承载 `PartService::worker_scan_event`（impl 块拆文件，Rust 允许
-//! 同一 `impl Foo { ... }` 块分布在多个同 crate 文件中，编译器合并）。
-//!
-//! 实施约定：方法签名 `<R: PartRepoTrait>(mut repo: R, ...)`，由 handler 开 tx
-//! 并 commit。生产 `R = &mut PgConnection`，跨域 repo（shelf / worker / process_chain）
-//! 与 inline sqlx 查询（t_shelf_process / t_part.process_chain_id）经 `repo.conn_mut()`
-//! 调用——Rust auto-deref + reborrow 让 `repo: &mut &mut PgConnection` 的
-//! `repo.conn_mut()` 表达式得到 `&mut PgConnection`（sqlx Executor）。
-//!
-//! ## worker_scan_event
-//! - 两分支 `WorkerScanEvent::{RETURNED, INSPECTED}`，分别走 mark_*_returned /
-//!   mark_*_inspected（OCC）+ 写 `RETURNED_TO_SHELF` / `SENT_TO_INSPECTION` 事件。
-//! - 不负责 refill：handler 在 commit 之前紧接着调
-//!   `WorkerPoolService::refill_for_worker`（同事务），scan 与 refill 共享一个
-//!   原子事务（OM-6 决议）。
+//! ## 与 refill 的原子性
+//! 本文件只承载 `worker_scan_event`（状态翻转 + 写事件日志）；refill 由 handler
+//! 在 commit 之前同事务紧接着调 `WorkerPoolService::refill_for_worker_with_work_type`
+//! —— scan 与 refill 共享一个原子事务，否则「扫描放回 → refill 抢批」中间会被
+//! 并发抢走同批。
 //!
 //! ## 错误码契约
 //! - 20101 `BIZ_PART_NOT_FOUND` —— serial_no 不存在
@@ -34,28 +22,26 @@
 //! - 40001 `VALIDATION_ERROR` —— next_process_id / target_inspection_shelf_id 缺 / 非法
 //! - 40301 `SHELF_MISMATCH` —— 当前用户无权限访问 target shelf
 //! - 40901 `VERSION_CONFLICT` —— 乐观锁失败
-//!
-//! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
-//! `impl for &mut PgConnection`）。
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::assembly::service::SyncOutcome;
-use crate::modules::part::dto::WorkerScanRequest;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
+use crate::modules::part::service::PartService;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::part::vo::WorkerScanCoreOut;
+use crate::modules::prod::batch::dto::WorkerScanRequest;
+use crate::modules::prod::batch::vo::WorkerScanCoreOut;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::prod::worker_pool::dto::WorkerScanEvent;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
-use super::PartService;
+use super::BatchService;
 
-impl PartService {
-    /// worker-scan 共享核心（被单件端点 `POST /parts/worker-scan` 调用，Task 8）。
+impl BatchService {
+    /// worker-scan 共享核心（被单件端点 `POST /prod/batches/worker-scan` 调用，Task 8）。
     ///
     /// 两分支：
     /// - `RETURNED`：worker 把持有件放回生产架（同 admin_remove 语义，但走扫码台 +
@@ -77,7 +63,8 @@ impl PartService {
     ///
     /// `WorkerScanEvent` 是 unit enum（`Copy`），所以 `req` 按值传（caller 的
     /// DTO `req.clone()` 不再需要）。
-    // 2026-09-11 PR-B2 改造后保留 master 既有的 `event_type_str` 晚初始化模式（worker_scan.rs:146
+    // 2026-09-11 PR-B2 改造后保留 master 既有的 `event_type_str` 晚初始化模式（见本文件
+    // `worker_scan_event` 的 RETURNED 分支
     // 是 master 既有的 pre-existing 例外），新版本 clippy (1.98) 会以
     // `clippy::needless_late_init` 报警，故显式豁免。
     #[allow(clippy::too_many_lines, clippy::needless_late_init)]

@@ -15,7 +15,7 @@ use crate::infra::clock::now_naive;
 use crate::infra::serial::next_delivery_note_no;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
-use crate::modules::part::batch::repo::PartBatchRepo;
+use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::super::dto::{
@@ -269,7 +269,7 @@ impl DeliveryNoteService {
         let mut by_note: HashMap<
             i64,
             Vec<(
-                crate::modules::part::batch::model::TPartBatch,
+                crate::modules::prod::batch::model::TPartBatch,
                 crate::modules::part::model::TPart,
             )>,
         > = HashMap::new();

@@ -180,7 +180,6 @@ async fn place_on_shelf_happy_path() {
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     // fixture 已预置映射
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -189,7 +188,7 @@ async fn place_on_shelf_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/place-on-shelf"),
+            &format!("/prod/batches/{bid}/place-on-shelf"),
             Some(body),
             Some(&token),
         ),
@@ -209,7 +208,6 @@ async fn place_on_shelf_rbac_clerk_ok() {
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     // fixture 已预置映射
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -218,7 +216,7 @@ async fn place_on_shelf_rbac_clerk_ok() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/place-on-shelf"),
+            &format!("/prod/batches/{bid}/place-on-shelf"),
             Some(body),
             Some(&token),
         ),
@@ -238,7 +236,6 @@ async fn place_on_shelf_invalid_transition_rejects() {
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     // fixture 已预置映射
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -247,7 +244,7 @@ async fn place_on_shelf_invalid_transition_rejects() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/place-on-shelf"),
+            &format!("/prod/batches/{bid}/place-on-shelf"),
             Some(body),
             Some(&token),
         ),
@@ -276,7 +273,6 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
     let chain_id = create_chain_for_part(&pool, pid).await;
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -285,7 +281,7 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/place-on-shelf"),
+            &format!("/prod/batches/{bid}/place-on-shelf"),
             Some(body),
             Some(&token),
         ),
@@ -303,7 +299,7 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
 #[tokio::test]
 async fn recall_to_pending_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
     // 写入 location=PRODUCTION_SHELF（recall-to-pending 要求）
     sqlx::query("UPDATE t_part_batch SET location = 'PRODUCTION_SHELF' WHERE id = $1")
         .bind(bid)
@@ -312,14 +308,13 @@ async fn recall_to_pending_happy_path() {
         .expect("set location");
     let version = batch_version(&pool, bid).await;
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
     });
     let (s, env) = send(
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/recall-to-pending"),
+            &format!("/prod/batches/{bid}/recall-to-pending"),
             Some(body),
             Some(&token),
         ),
@@ -343,7 +338,6 @@ async fn release_from_programming_happy_path() {
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     // fixture 已预置映射
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -352,7 +346,7 @@ async fn release_from_programming_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/release-from-programming"),
+            &format!("/prod/batches/{bid}/release-from-programming"),
             Some(body),
             Some(&token),
         ),
@@ -371,7 +365,6 @@ async fn release_from_programming_rbac_inspector_rejects() {
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     // fixture 已预置映射
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -380,7 +373,7 @@ async fn release_from_programming_rbac_inspector_rejects() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/release-from-programming"),
+            &format!("/prod/batches/{bid}/release-from-programming"),
             Some(body),
             Some(&token),
         ),
@@ -401,19 +394,18 @@ async fn release_from_programming_rbac_inspector_rejects() {
 #[tokio::test]
 async fn scan_inspect_pass_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "PENDING", 5).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
         "pass": true,
         "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-        "batch_id": bid.to_string(),
         "version": version,
     });
     let (s, env) = send(
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/scan-inspect"),
+            &format!("/prod/batches/{bid}/scan-inspect"),
             Some(body),
             Some(&token),
         ),
@@ -426,7 +418,7 @@ async fn scan_inspect_pass_happy_path() {
 #[tokio::test]
 async fn scan_inspect_fail_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
     let version = batch_version(&pool, bid).await;
     // 设 location=PRODUCTION_SHELF + current_holder_id=production_shelf
     sqlx::query(
@@ -441,7 +433,6 @@ async fn scan_inspect_fail_happy_path() {
     let body = json!({
         "pass": false,
         "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -450,7 +441,7 @@ async fn scan_inspect_fail_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/scan-inspect"),
+            &format!("/prod/batches/{bid}/scan-inspect"),
             Some(body),
             Some(&token),
         ),
@@ -475,19 +466,18 @@ async fn scan_inspect_fail_happy_path() {
 #[tokio::test]
 async fn scan_inspect_invalid_transition_rejects() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "DELIVERED", 5).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "DELIVERED", 5).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
         "pass": true,
         "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-        "batch_id": bid.to_string(),
         "version": version,
     });
     let (s, env) = send(
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/scan-inspect"),
+            &format!("/prod/batches/{bid}/scan-inspect"),
             Some(body),
             Some(&token),
         ),
@@ -540,7 +530,12 @@ async fn scan_deliver_part_requires_driver() {
     });
     let (s, env) = send(
         app,
-        json_request("POST", "/parts/scan/deliver-part", Some(body), Some(&token)),
+        json_request(
+            "POST",
+            "/prod/batches/scan/deliver",
+            Some(body),
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND, "无效工牌应拒绝: {env}");
@@ -954,8 +949,8 @@ async fn multi_batch_complete_releases_serial_only_when_part_terminates() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete"),
-            Some(json!({ "batch_id": b1.to_string(), "version": v1 })),
+            &format!("/prod/batches/{b1}/complete"),
+            Some(json!({  "version": v1 })),
             Some(&token),
         ),
     )
@@ -978,8 +973,8 @@ async fn multi_batch_complete_releases_serial_only_when_part_terminates() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete"),
-            Some(json!({ "batch_id": b2.to_string(), "version": v2 })),
+            &format!("/prod/batches/{b2}/complete"),
+            Some(json!({  "version": v2 })),
             Some(&token),
         ),
     )
@@ -1034,7 +1029,7 @@ async fn multi_batch_complete_releases_serial_only_when_part_terminates() {
 /// 派生到 CANCELLED 时，序列号也必须被释放。
 ///
 /// 覆盖改造前的**永久泄漏**路径：`PartService::cancel_batch`
-/// （`POST /parts/{id}/batches/{batch_id}/cancel`）只翻批次、调 rollup，
+/// （`POST /prod/batches/{batch_id}/cancel`）只翻批次、调 rollup，
 /// 从不调 `clear_part_serial_no_when_completed`（那个函数的 WHERE 只认
 /// `status='COMPLETED'`）。于是 part 已 CANCELLED、`serial_no` 却还挂着，
 /// 被 `uk_t_part_serial_no` 永久占住，同序列号再也无法被新工单复用，
@@ -1051,7 +1046,7 @@ async fn cancel_last_batch_releases_serial_when_part_becomes_cancelled() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{pid}/batches/{b1}/cancel"),
+            &format!("/prod/batches/{b1}/cancel"),
             Some(json!({ "version": v1 })),
             Some(&token),
         ),
@@ -1071,7 +1066,7 @@ async fn cancel_last_batch_releases_serial_when_part_becomes_cancelled() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{pid}/batches/{b2}/cancel"),
+            &format!("/prod/batches/{b2}/cancel"),
             Some(json!({ "version": v2 })),
             Some(&token),
         ),
@@ -1300,7 +1295,7 @@ async fn cancel_part_is_not_overwritten_by_rollup_completed() {
 #[tokio::test]
 async fn recall_to_pending_clears_location_holder_and_step() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
     // 池内状态：压在生产架上、挂着 holder、记着工序 step
     sqlx::query(
         "UPDATE t_part_batch \
@@ -1334,9 +1329,8 @@ async fn recall_to_pending_clears_location_holder_and_step() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/recall-to-pending"),
+            &format!("/prod/batches/{bid}/recall-to-pending"),
             Some(json!({
-                "batch_id": bid.to_string(),
                 "version": version,
             })),
             Some(&token),

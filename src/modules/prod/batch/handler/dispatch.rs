@@ -1,14 +1,9 @@
-//! prod::batch 子模块 handler 层 —— HTTP 路由 + 角色守卫 + WS 广播
+//! 「PENDING 批次下发给车间」3 端点（`pending` / `dispatch` / `auto-dispatch`）
+//! 的 HTTP 路由 + 角色守卫 + WS 广播。
 //!
-//! 2026-09-29 新增 + 2026-09-30 重构：
 //! - dispatch 统一 bulk-only（单条下发即 `targets.length == 1`）
 //! - auto-dispatch 改为只读查询（不开事务、不发 WS 广播）
 //! - bulk-dispatch 端点删除（路由层不再挂载）
-//!
-//! ## 端点
-//! - `GET  /api/v2/prod/batches/pending`         —— Manager+Clerk+Inspector
-//! - `POST /api/v2/prod/batches/dispatch`        —— Manager+Clerk（bulk-only）
-//! - `POST /api/v2/prod/batches/auto-dispatch`   —— Manager+Clerk（只读查询）
 //!
 //! ## 事务边界 + WS 广播
 //! - 读端点（pending）：`pool.acquire()` 不开事务
@@ -32,9 +27,9 @@ use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use super::dto::{AutoDispatchRequest, DispatchRequest, ListPendingQuery};
-use super::service::BatchService;
-use super::vo::{AutoDispatchResult, DispatchResult, PendingBatchListOut};
+use crate::modules::prod::batch::dto::{AutoDispatchRequest, DispatchRequest, ListPendingQuery};
+use crate::modules::prod::batch::service::BatchService;
+use crate::modules::prod::batch::vo::{AutoDispatchResult, DispatchResult, PendingBatchListOut};
 
 /// 通用 WS 广播 helper：单 kind + 单 payload 字段（与 worker_pool 同形）。
 #[inline]

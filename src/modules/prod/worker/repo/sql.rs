@@ -294,7 +294,7 @@ impl WorkerRepo {
     /// 与第 1 个子查询同一行命中，守卫强度不变）。
     /// ⚠️ `'RETURNED'` **不是** `PartStatus` 的变体（worker-scan 的
     /// `mark_batch_returned` 的 WHERE 硬限定 `status='IN_PROCESS' AND
-    /// location='WORKER'`，见 `part/repo/sql/batch_sql.rs`，该分支根本不改
+    /// location='WORKER'`，见 `prod/batch/repo/sql.rs`，该分支根本不改
     /// status），它是历史遗留字面量，本轮**刻意不动** —— 删掉它会放宽
     /// 「工人持有待回交批次」的停用守卫。遗留清理需单独一轮。
     pub async fn count_in_use_parts<'e, E: PgExecutor<'e>>(

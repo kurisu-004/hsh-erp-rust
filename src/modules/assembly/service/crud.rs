@@ -40,9 +40,9 @@ use crate::modules::assembly::vo::{
     AssemblyChildOut, AssemblyCreateResult, AssemblyDetail, AssemblyListItem, AssemblyListOut,
     AssemblyOut,
 };
-use crate::modules::part::batch::repo::NewInitialBatch;
 use crate::modules::part::repo::part::{ChildInheritFields, NewPartCreate};
 use crate::modules::part::vo::PartListItem;
+use crate::modules::prod::batch::repo::NewInitialBatch;
 use crate::shared::error::{AppError, code};
 
 use super::AssemblyService;

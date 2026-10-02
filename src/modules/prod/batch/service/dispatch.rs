@@ -1,4 +1,4 @@
-//! prod::batch 子模块 service 层 —— 业务逻辑
+//! prod::batch 的「下发」子流：待下发列表 + 批量下发 + 自动下发预览。
 //!
 //! 2026-09-29 新增 + 2026-09-30 重构：
 //! - `dispatch_batch` 改为 bulk-only（接受 `Vec<(batch_id, target_process_id)>`，
@@ -6,7 +6,7 @@
 //! - `bulk_dispatch` service 删除（合并入 `dispatch_batch` 循环）
 //! - `auto_dispatch` 改为 `auto_dispatch_preview` 只读查询（不开事务）
 //!
-//! ## 4 个公共方法（2026-09-30 重构后）
+//! ## 3 个公共方法
 //! - [`BatchService::list_pending`] —— 读 PENDING 批次列表（handler `pool.acquire()`）
 //! - [`BatchService::dispatch_batch`] —— bulk-only 下发（事务内）：fetch batch → 校验 status='PENDING' → 解析货架 → UPDATE OCC → 写事件
 //! - [`BatchService::auto_dispatch_preview`] —— 只读查询，返回每个 batch 的首道工序 + 首货架
@@ -19,7 +19,7 @@
 //! service 收 `&mut PgConnection` → handler `commit()`。
 //!
 //! ## 事务内并发冲突（OCC）
-//! dispatch_batch 入口 `find_batch_by_id` 后用 fetched `batch.version` 作
+//! dispatch_batch 入口 `PartBatchRepo::get_by_id` 后用 fetched `batch.version` 作
 //! `expected_version`；UPDATE 0 行 → `VERSION_CONFLICT 40901`。
 //!
 //! ## 2026-10-02 `t_shelf_process` SQL 收口
@@ -33,7 +33,7 @@ use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepo;
-use crate::modules::prod::batch::repo::BatchRepo;
+use crate::modules::prod::batch::repo::{BatchRepo, PartBatchRepo};
 use crate::modules::prod::batch::vo::{
     AutoDispatchItem, AutoDispatchResult, DispatchResult, DispatchSuccessItem, PendingBatchItem,
     PendingBatchListOut,
@@ -41,14 +41,8 @@ use crate::modules::prod::batch::vo::{
 use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::shared::error::{AppError, code};
 
-use super::repo::PendingBatchRow;
-
-/// `prod::batch` service（ZST，与 worker_pool 范本一致）。
-///
-/// 公共方法均通过 `<BatchService>::batch_service()` 访问（unit struct 形态）。
-/// 显式 snowflake 形参保留（与 worker_pool `WorkerPoolService::refill_for_worker`
-/// 同形 —— 跨模块调用方预留兼容）。
-pub struct BatchService;
+use super::BatchService;
+use crate::modules::prod::batch::repo::PendingBatchRow;
 
 impl BatchService {
     pub fn new() -> Self {
@@ -153,7 +147,7 @@ impl BatchService {
         current: &CurrentUser,
     ) -> Result<DispatchSuccessItem, AppError> {
         // 1. 取 batch
-        let batch = BatchRepo::find_batch_by_id(&mut *conn, batch_id, false)
+        let batch = PartBatchRepo::get_by_id(&mut *conn, batch_id, false)
             .await?
             .ok_or_else(|| {
                 AppError::biz(

@@ -1,32 +1,51 @@
-//! prod::batch 子模块 repo 层 —— SQL 真源
+//! `t_part_batch` repo 层 —— SQL 真源
 //!
-//! 2026-09-29 新增：本域 SQL 全部集中在本文件（ZST `BatchRepo` + 5 静态方法）；
-//! 不引入胖 trait（与 part/service/phase1/`lifecycle_helpers.rs` 同形 ——
-//! 单 service 不需要 mock 替身，service 收 `&mut PgConnection` 直调 ZST）。
+//! 2026-10-02 域迁移：`t_part_batch` 是生产执行单元，本表的 repo 层整体归
+//! `prod::batch`。原 `part/batch/repo.rs`（单文件 1785 行）拆为
+//! `queries.rs` / `sql.rs` / `list.rs` / `trait.rs` 四文件；原
+//! `part/repo/sql/batch_sql.rs`（`impl PartRepo` 的 19 个流转写点）并入
+//! `sql.rs`，impl 目标由 `PartRepo` 改为本域 ZST `PartBatchRepo`。
 //!
-//! ## 5 个静态方法
-//! - [`BatchRepo::list_pending_batches`] —— 车间 PENDING 批次列表（JOIN 4 表）
-//! - [`BatchRepo::find_batch_by_id`] —— 按 id 查 batch（含软删过滤开关）
-//! - [`BatchRepo::update_batch_dispatched`] —— 标记 PENDING 批次已下发
-//!   （status='IN_PROCESS' + location='PRODUCTION_SHELF' + current_holder_id=shelf_id +
-//!   **current_process_id=target_process_id** + current_process_step_id=NULL），带乐观锁
-//! - [`BatchRepo::first_step_of_chain`] —— 取工艺链首道 step（`ORDER BY step_no LIMIT 1`）
+//! ## 两个 ZST 的分工（命名相近，注意区分）
+//! - `PartBatchRepo` —— `t_part_batch` 的**通用** SQL 真源，全仓读写批次表的
+//!   默认入口：18 个通用方法（`queries.rs`）+ 19 个流转写点（`sql.rs`）+
+//!   2 个 8-JOIN 集合读（`list.rs`）。跨域调用方一律走它。
+//! - `BatchRepo`（本文件）—— **只服务「PENDING 批次下发给车间」一条流**的专用
+//!   查询（7 个方法），唯一调用方是 `service::dispatch.rs`。
+//!   两者都是无状态 ZST + 固有静态方法，职责不重叠。
 //!
-//! 2026-10-02 域拆分：本文件原有第 3 个方法 `find_first_shelf_for_process`（读
-//! `t_shelf_process`）已删除，SQL 真源搬到
-//! `crate::modules::prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
-//! （`t_shelf_process` 归 prod::shelf_process 域），调用方 `dispatch_single` 改调该处。
-//! 本文件现为 5 个静态方法。
+//! ## 文件分工
+//! - `queries.rs` —— ZST `PartBatchRepo` + 18 个通用静态方法
+//!   （`create_initial_batch` / `get_by_id` / `update` / `attach_to_note` /
+//!   `split_batch` / 工人持有件查询 等）
+//! - `sql.rs` —— inspection / lifecycle 流转的 19 个定位 + 写点
+//!   （`find_*` / `mark_*` / `split_batch_for_partial_pass` /
+//!   `cancel_all_active_batches_for_part` / `force_complete_all_batches_for_part`）
+//! - `list.rs` —— 8-JOIN 集合读（`list_batches_with_part` /
+//!   `count_batches_with_part`，服务 inspection / repair / repairing 三条列表端点）
+//! - `trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
+//! - `mod.rs`（本文件）—— ZST `BatchRepo`：本域「PENDING 批次下发给车间」
+//!   专用查询（pending 列表 / auto-dispatch 预览 / 首道 step / 兜底反查 part_id）
+//!
+//! ## 2026-10-02 去重
+//! 本文件原 `BatchRepo::find_batch_by_id`（`WHERE id = $1 AND ($2 OR deleted_at IS NULL)`）
+//! 与 `queries.rs::PartBatchRepo::get_by_id` 是同一条 SQL 的两份实现，已删，
+//! 调用方（`service::dispatch_single`）改调 `PartBatchRepo::get_by_id`。
 //!
 //! ## 错误类型
 //! repo 静态方法 → `sqlx::Error`（与项目惯例一致），由 service 层映射 `AppError`。
 
+pub mod list;
+pub mod queries;
+pub mod sql;
+pub mod r#trait;
+
+pub use queries::{NewInitialBatch, PartBatchRepo};
+pub use r#trait::PartBatchRepoTrait;
+
 use chrono::NaiveDate;
 use sqlx::PgConnection;
 
-use crate::modules::part::batch::model::TPartBatch;
-// 2026-10-01：`update_batch_dispatched` 改走 status_gate（唯一批次状态写入口）。
-use crate::modules::part::service::status_gate::{self, StatusChange};
 use crate::shared::error::AppError;
 
 /// `prod::batch` ZST 静态方法容器。
@@ -35,10 +54,11 @@ pub struct BatchRepo;
 impl BatchRepo {
     /// PENDING 批次列表（JOIN 4 表）。
     ///
-    /// 与 `part/batch/repo.rs::list_batches_with_part` 同骨架（基表 + 工单 +
-    /// 客户 L1+L2 + 申请人），但额外 LEFT JOIN `t_part.process_chain_id` 与
-    /// `pb.current_process_step_id`（PR-3 批次 step 化字段），且硬限定
-    /// `pb.status = 'PENDING'`。
+    /// 2026-10-02：本方法只服务「下发车间」一条流（`list_pending` / `auto_dispatch`），
+    /// 其投影比通用读 `queries::list_batches_with_part_in_customers` 宽：额外
+    /// LEFT JOIN `t_part.process_chain_id` 与 `pb.current_process_step_id`（批次
+    /// step 化字段，下发时要定位首道工序），且硬限定 `pb.status = 'PENDING'`。
+    /// 两者投影不同，**不是**同一 SQL 的两份实现，不做合并。
     ///
     /// 排序：`p.system_delivery_date ASC NULLS LAST, p.is_urgent DESC,
     /// pb.created_at ASC`（计划交期近 + 加急件优先 + 批次入库时间兜底）。
@@ -121,34 +141,6 @@ impl BatchRepo {
         Ok(n)
     }
 
-    /// 按 batch_id 查 batch（含软删过滤开关）。
-    ///
-    /// dispatch 路径使用 `include_deleted=false`（已软删 batch 视为不存在 →
-    /// 抛 `BIZ_BATCH_NOT_FOUND`）。
-    pub async fn find_batch_by_id(
-        conn: &mut PgConnection,
-        id: i64,
-        include_deleted: bool,
-    ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        sqlx::query_as!(
-            TPartBatch,
-            r#"
-            SELECT id, part_id, batch_no, quantity, status, location,
-                   current_holder_id, current_process_id, current_process_step_id,
-                   delivery_note_id, parent_batch_id,
-                   is_repairing,
-                   version, created_at, created_by, updated_at, updated_by, deleted_at
-            FROM t_part_batch
-            WHERE id = $1
-              AND ($2::bool OR deleted_at IS NULL)
-            "#,
-            id,
-            include_deleted,
-        )
-        .fetch_optional(&mut *conn)
-        .await
-    }
-
     /// 标记 PENDING 批次已下发（OCC UPDATE）。
     ///
     /// 输入：batch_id, expected_version (PENDING batch 当前 version), shelf_id,
@@ -173,22 +165,17 @@ impl BatchRepo {
     /// （工单无工序链时本就解析不出）。该列已降级为**可选的显示用定位信息**，
     /// NULL 不影响入池。
     ///
-    /// ⚠️ **措辞订正（2026-09-30 review 第 3 轮附带发现）**：本函数原注释写
-    /// 「由 worker-scan RETURNED / INSPECTED 等后续流转写入」—— **这已不成立**。
-    /// `mark_batch_returned` 与 `mark_batch_inspected` 都不写 step
-    /// （见 `PartRepo::mark_batch_returned` doc「已知缺口」段），worker-scan
-    /// 两条分支都**不**推进该列。step 只在其它「首次定位工序」的写点被写入
-    /// （place_on_shelf / release_from_programming / outsource 收发 /
-    /// complete_repair / to_process），对多工序链工单它永远停在**首次定位**的
-    /// 那一步，故不可当「当前走到第几步」用。
+    /// `current_process_step_id` 的**已知缺口**：本列只在其它「首次定位工序」
+    /// 的写点被写入（place_on_shelf / release_from_programming / outsource 收发 /
+    /// complete_repair / to_process）。`mark_batch_returned` 与
+    /// `mark_batch_inspected` 都不写 step，worker-scan 两条分支也**不**推进该列
+    /// ⇒ 对多工序链工单它永远停在**首次定位**的那一步，故不可当「当前走到第几步」
+    /// 用，只作可选的显示用定位信息。
     ///
-    /// ## 2026-10-01：改为 status_gate 薄包装（全仓唯一 `t_part_batch.status`
-    /// 写入口）——写完状态自动补做 part → assembly 派生。
-    ///
-    /// ⚠️ 签名两处变更（调用方零改动，见 `part::repo::sql::batch_sql.rs`
-    /// 同批改造的说明）：`Result<u64, sqlx::Error>` → `Result<u64, AppError>`
-    /// （status_gate 用 `VERSION_CONFLICT` 表达「没写成」，转 `sqlx::Error`
-    /// 会把 409 降级成 500）。
+    /// 本函数是 `status_gate::apply_batch_status_change` 之上的薄包装
+    /// （全仓唯一 `t_part_batch.status` 写入口，写完状态自动补做
+    /// part → assembly 派生）。返回 `Result<u64, AppError>`：status_gate 用
+    /// `VERSION_CONFLICT` 表达「没写成」，转 `sqlx::Error` 会把 409 降级成 500。
     pub async fn update_batch_dispatched(
         conn: &mut PgConnection,
         batch_id: i64,
@@ -197,9 +184,9 @@ impl BatchRepo {
         updated_by: Option<i64>,
         current_process_id: i64,
     ) -> Result<u64, AppError> {
-        status_gate::apply_batch_status_change(
+        crate::modules::prod::batch::status_gate::apply_batch_status_change(
             conn,
-            StatusChange {
+            crate::modules::prod::batch::status_gate::StatusChange {
                 batch_id,
                 new_status: "IN_PROCESS",
                 new_location: Some("PRODUCTION_SHELF"),
@@ -213,20 +200,19 @@ impl BatchRepo {
                 expected_version: Some(expected_version),
                 allowed_from: &["PENDING"],
                 updated_by: updated_by.unwrap_or(0),
-                // 2026-10-01 review 第 1 轮 M2：本包装函数的 `None` 一律是
-                // 「保持原值」，清空语义由同名 clear_* 显式表达。
+                // 本包装函数的 `None` 一律是「保持原值」，清空语义由同名
+                // clear_* 显式表达。
                 clear_location: false,
                 clear_holder_id: false,
                 clear_process_id: false,
-                // 2026-10-01 review 第 2 轮 MINOR-1：**还原**改造前 SQL 的语义
-                // —— 原语句是 `current_process_step_id = NULL`（直写），本轮一度
-                // 按「dispatch 的批次从未写过 step，等价于 NULL」改成「保持原值」。
-                // 那个等价性依赖一条**没有任何约束保证**的不变式「`status='PENDING'`
-                // ⇒ step IS NULL」（allowed_from 之外的旁路写点、手工 SQL、历史
-                // 脏数据都能破坏它）。这是 M2 同类语义漂移，且落在另一个漏斗上，
-                // 故按「faithful translation」原则还原为显式清 NULL。
+                // **还原**改造前 SQL 的语义 —— 原语句是
+                // `current_process_step_id = NULL`（直写）。「dispatch 的批次从未写过
+                // step，等价于 NULL」这条等价性依赖一条**没有任何约束保证**的不变式
+                // 「`status='PENDING'` ⇒ step IS NULL」（allowed_from 之外的旁路写点、
+                // 手工 SQL、历史脏数据都能破坏它），故按「faithful translation」原则
+                // 还原为显式清 NULL。
                 clear_process_step_id: true,
-                // 目标状态 IN_PROCESS 不是终态 → 终态归档事件分支不可达（M4）
+                // 目标状态 IN_PROCESS 不是终态 → 终态归档事件分支不可达
                 event_id: None,
             },
         )

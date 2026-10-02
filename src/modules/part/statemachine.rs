@@ -149,7 +149,7 @@ impl PartStatus {
     /// start-repair = `IN_PROCESS` + `is_repairing=true`；complete-repair =
     /// `IN_PROCESS`（清标记）+ `location='PRODUCTION_SHELF'`。守卫从
     /// 「枚举迁移」改为「service 层读 `is_repairing` 列」，
-    /// 见 `src/modules/part/service/status_gate.rs`。
+    /// 见 `src/modules/prod/batch/status_gate.rs`。
     ///
     /// 2026-09-29 废弃：
     /// - 删除 `PENDING → PROGRAMMING`（原 send-to-programming；端点已下线）

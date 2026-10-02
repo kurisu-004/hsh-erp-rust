@@ -155,10 +155,9 @@ async fn to_inspection_from_pending_succeeds() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -176,7 +175,7 @@ async fn to_inspection_from_pending_succeeds() {
 #[tokio::test]
 async fn to_inspection_from_programming_succeeds() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -191,10 +190,9 @@ async fn to_inspection_from_programming_succeeds() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -211,7 +209,7 @@ async fn to_inspection_from_programming_succeeds() {
 #[tokio::test]
 async fn to_inspection_from_in_process_production_shelf_succeeds() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -235,10 +233,9 @@ async fn to_inspection_from_in_process_production_shelf_succeeds() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -262,7 +259,7 @@ async fn to_inspection_from_in_process_production_shelf_succeeds() {
 #[tokio::test]
 async fn to_inspection_clears_current_process_id() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0-CLEAR",
         fx.customer_l2_id,
@@ -288,10 +285,9 @@ async fn to_inspection_clears_current_process_id() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -322,7 +318,7 @@ async fn to_inspection_clears_current_process_id() {
 #[tokio::test]
 async fn to_inspection_in_process_worker_rejected() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -347,10 +343,9 @@ async fn to_inspection_in_process_worker_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -368,7 +363,7 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
     // 第二个 INSPECTION 货架当 holder（让 part 持有一个非 PRODUCTION 的 shelf）
     let holder_shelf = insert_shelf(&pool, "INSP-002", "品检架B", "INSPECTION").await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -392,10 +387,9 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -411,7 +405,7 @@ async fn to_inspection_in_process_non_production_shelf_rejected() {
 #[tokio::test]
 async fn to_inspection_target_shelf_wrong_zone_rejected() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) =
+    let (_part_id, batch_id) =
         insert_part_with_batch(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING", 5).await;
     let v = batch_version(&pool, batch_id).await;
 
@@ -419,10 +413,9 @@ async fn to_inspection_target_shelf_wrong_zone_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.production_shelf_id.to_string(),  // 故意用 PRODUCTION 架
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -445,7 +438,7 @@ async fn to_inspection_target_shelf_inactive_rejected() {
     .execute(&pool)
     .await
     .unwrap();
-    let (part_id, batch_id) =
+    let (_part_id, batch_id) =
         insert_part_with_batch(&pool, "P0", fx.customer_l2_id, Some("P000"), "PENDING", 5).await;
     let v = batch_version(&pool, batch_id).await;
 
@@ -453,10 +446,9 @@ async fn to_inspection_target_shelf_inactive_rejected() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
             })),
             Some(&token),
@@ -475,7 +467,7 @@ async fn batch_to_inspection_empty_items_rejected() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-inspection",
+            "/prod/batches/to-inspection",
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
                 "items": [],
@@ -502,7 +494,7 @@ async fn batch_to_inspection_too_many_items_rejected() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-inspection",
+            "/prod/batches/to-inspection",
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
                 "items": item_payloads,
@@ -561,7 +553,7 @@ async fn batch_to_inspection_mixed_partial_success() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-inspection",
+            "/prod/batches/to-inspection",
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
                 "items": [
@@ -590,7 +582,7 @@ async fn batch_to_inspection_clerk_forbidden() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-inspection",
+            "/prod/batches/to-inspection",
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
                 "items": [{ "batch_id": "1", "version": 0 }],
@@ -615,10 +607,9 @@ async fn to_inspection_partial_split_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v,
                 "quantity": 3,
             })),
@@ -684,10 +675,9 @@ async fn part_batches_returns_narrow_part_and_batches_with_holder() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-inspection"),
+            &format!("/prod/batches/{batch_id}/to-inspection"),
             Some(json!({
                 "target_inspection_shelf_id": fx.inspection_shelf_id.to_string(),
-                "batch_id": batch_id.to_string(),
                 "version": v_initial,
             })),
             Some(&insp_token),
@@ -772,9 +762,8 @@ async fn part_batches_returns_narrow_part_and_batches_with_holder() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-ship"),
+            &format!("/prod/batches/{scan_batch_id_str}/to-ship"),
             Some(json!({
-                "batch_id": scan_batch_id_str,
                 "version": scan_batch_version,
                 "quantity": serde_json::Value::Null,
             })),

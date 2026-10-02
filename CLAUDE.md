@@ -123,11 +123,10 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | `prod::process_chain` | 3 | `/api/v2/prod/process-chains` | `t_part_process_chain` + `t_process_chain_step` | 工单工艺链 |
 | `prod::shelf_process` | 3 | `/api/v2/prod/shelf-processes` | `t_shelf_process` | **2026-10-02 新增**：货架 ↔ 工序映射，自 `src/modules/shelf/process_mapping/` 搬入（`t_shelf_process` 关联的是 prod 域实体 `t_process`）。旧路径 `GET|POST /api/v2/shelves/{id}/processes` + `GET /api/v2/shelves/processes` 已删除（**无 alias**），这 3 个端点请求 / 响应契约逐字不变；但同 commit 删的 `account_count` 出参会打爆前端 Zod 必填字段，**前端配套改动清单见 `docs/api/production/shelf-process-mapping.md#前端配套改动清单`** |
 | `prod::worker_pool` | 6 | `/api/v2/prod/pool` | `t_part_batch`（候选池视图） | 工人候选池（2026-09-30 `/worker-pool` + `/admin/worker-pool` 双 nest 合并为 `/pool`；**2026-10-02 订正**：文档原写 5，实际 6 条 route） |
-| `prod::batch` | 3 | `/api/v2/prod/batches` | `t_part_batch` | 待下发批次（2026-09-29 新增） |
+| `prod::batch` | 28 | `/api/v2/prod/batches` | `t_part_batch` | 批次域全集（2026-09-29 建 3 条下发端点；**2026-10-02** 硬切进 25 条批次路由，操作对象是批次、无 alias，路由表见 `src/modules/prod/batch/mod.rs` 模块 doc） |
 | `prod::programming` | 1 | `/api/v2/prod/programming` | `t_part` + `t_part_batch` + chain | 待编程一览（2026-10-01 新增） |
 
-> 表内 8 个子模块端点求和 = 7 + 7 + 5 + 3 + 3 + 6 + 3 + 1 = **35**，与
-> `docs/api/production/index.md` 的 prod 总数一致。
+> 表内 8 个子模块端点求和 = 7 + 7 + 5 + 3 + 3 + 6 + 28 + 1 = **60**。
 
 **2026-10-02 shelf 域拆分**（依据「货架自身包括了账号的部分和工序映射相关的部分，
 应拆分到 iam 域和 prod 域」）：
@@ -168,7 +167,7 @@ t_part.status / next_process_id   ← 派生缓存
 t_assembly.status               ← 派生缓存
 ```
 
-- **写 `t_part_batch.status` 只能走 `src/modules/part/service/status_gate.rs`**
+- **写 `t_part_batch.status` 只能走 `src/modules/prod/batch/status_gate.rs`**
   （`apply_batch_status_change` / `apply_bulk_batch_status_change_for_part`）。
   它一函数内完成「写批次（OCC + SQL 层源状态白名单）→ 回填 part 派生列 →
   级联 assembly → 终态序列号归档 / 释放」，所以 **caller 没有「要不要顺手调
@@ -177,7 +176,7 @@ t_assembly.status               ← 派生缓存
   `NoChange`，会把响应的 `synced_assembly_id` 吞成 `null`、连带 WS 的
   `ASSEMBLY_UPDATED` 永不发。
 - **CI 强制**：`cargo test --lib` 的
-  `part::service::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
+  `prod::batch::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
   扫全 `src/**/*.rs`，除 `status_gate.rs` 外任何文件写
   `UPDATE t_part_batch SET status …` 即失败（注释 / `#[cfg(test)]` 块 / 只改其它列
   的 UPDATE 不在判定范围）。改动 `mark_batch_*` 后请顺手跑一次。

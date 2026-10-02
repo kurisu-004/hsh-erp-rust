@@ -143,7 +143,7 @@ async fn batch_to_ship_happy_path() {
     let body = json!({ "items": items });
     let (s, env) = send(
         app,
-        json_request("POST", "/parts/batch-to-ship", Some(body), Some(&token)),
+        json_request("POST", "/prod/batches/to-ship", Some(body), Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "happy path: {env}");
@@ -184,7 +184,7 @@ async fn batch_to_ship_partial_failure() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-ship",
+            "/prod/batches/to-ship",
             Some(json!({ "items": items })),
             Some(&token),
         ),
@@ -214,7 +214,7 @@ async fn batch_to_ship_empty_items_40001() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-ship",
+            "/prod/batches/to-ship",
             Some(json!({"items": []})),
             Some(&token),
         ),
@@ -250,7 +250,7 @@ async fn batch_to_ship_non_numeric_batch_id_40001() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-ship",
+            "/prod/batches/to-ship",
             Some(json!({
                 "items": [{"batch_id": "abc", "version": 0}]
             })),
@@ -287,7 +287,7 @@ async fn batch_to_ship_clerk_forbidden() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-ship",
+            "/prod/batches/to-ship",
             Some(json!({"items": [{"batch_id": "1", "version": 0}]})),
             Some(&token),
         ),
@@ -318,8 +318,8 @@ async fn single_to_ship_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/to-ship"),
-            Some(json!({"batch_id": bid.to_string(), "version": v})),
+            &format!("/prod/batches/{bid}/to-ship"),
+            Some(json!({ "version": v})),
             Some(&token),
         ),
     )
@@ -339,7 +339,7 @@ async fn single_to_ship_happy_path() {
 #[tokio::test]
 async fn single_to_ship_retry_returns_20103() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(
+    let (_pid, bid) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -355,8 +355,8 @@ async fn single_to_ship_retry_returns_20103() {
         app.clone(),
         json_request(
             "POST",
-            &format!("/parts/{pid}/to-ship"),
-            Some(json!({"batch_id": bid.to_string(), "version": v})),
+            &format!("/prod/batches/{bid}/to-ship"),
+            Some(json!({ "version": v})),
             Some(&token),
         ),
     )
@@ -370,8 +370,8 @@ async fn single_to_ship_retry_returns_20103() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/to-ship"),
-            Some(json!({"batch_id": bid.to_string(), "version": v2})),
+            &format!("/prod/batches/{bid}/to-ship"),
+            Some(json!({ "version": v2})),
             Some(&token),
         ),
     )
@@ -391,7 +391,7 @@ async fn single_to_ship_retry_returns_20103() {
 #[tokio::test]
 async fn to_ship_partial_split_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -406,9 +406,8 @@ async fn to_ship_partial_split_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-ship"),
+            &format!("/prod/batches/{batch_id}/to-ship"),
             Some(json!({
-                "batch_id": batch_id.to_string(),
                 "version": v,
                 "quantity": 3,
             })),
@@ -436,7 +435,7 @@ async fn to_ship_partial_split_happy_path() {
 #[tokio::test]
 async fn to_ship_full_batch() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -451,8 +450,8 @@ async fn to_ship_full_batch() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-ship"),
-            Some(json!({"batch_id": batch_id.to_string(), "version": v})),
+            &format!("/prod/batches/{batch_id}/to-ship"),
+            Some(json!({ "version": v})),
             Some(&token),
         ),
     )
@@ -471,7 +470,7 @@ async fn to_ship_full_batch() {
 #[tokio::test]
 async fn single_to_ship_stale_version_returns_409_40901() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
-    let (part_id, batch_id) = insert_part_with_batch(
+    let (_part_id, batch_id) = insert_part_with_batch(
         &pool,
         "P0",
         fx.customer_l2_id,
@@ -486,8 +485,8 @@ async fn single_to_ship_stale_version_returns_409_40901() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{part_id}/to-ship"),
-            Some(json!({"batch_id": batch_id.to_string(), "version": v - 1})),
+            &format!("/prod/batches/{batch_id}/to-ship"),
+            Some(json!({ "version": v - 1})),
             Some(&token),
         ),
     )
@@ -529,7 +528,7 @@ async fn batch_to_ship_stale_version_lands_in_failed() {
         app,
         json_request(
             "POST",
-            "/parts/batch-to-ship",
+            "/prod/batches/to-ship",
             Some(json!({
                 "items": [
                     {"batch_id": b1.to_string(), "version": v1},

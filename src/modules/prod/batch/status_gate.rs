@@ -1,4 +1,7 @@
-//! part 域**唯一**批次状态写入口（status_gate）—— 2026-10-01 新增
+//! **唯一**批次状态写入口（status_gate）
+//!
+//! 2026-10-01 新增（原落 `part/service/status_gate.rs`）；2026-10-02 随
+//! `t_part_batch` 归属迁入 prod 域，与 `repo/` 同域。
 //!
 //! # 为什么要有这个模块
 //!
@@ -70,10 +73,10 @@ use sqlx::PgConnection;
 
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::assembly::service::{AssemblyService, SyncOutcome};
-use crate::modules::part::batch::repo::PartBatchRepo;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::sql::PartRepo;
 use crate::modules::part::statemachine::{BatchForRollup, compute_part_target};
+use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 /// 一次批次状态变更的完整意图（status_gate 的唯一入参形状）。
@@ -853,7 +856,7 @@ mod write_guard_tests {
     ///
     /// 写死成字面量而不是 `file!()`：`file!()` 只能证明「本文件自己干净」，
     /// 而这条规则要表达的是「**别的**文件不许写」，两者不是一回事。
-    const SANCTIONED: &str = "src/modules/part/service/status_gate.rs";
+    const SANCTIONED: &str = "src/modules/prod/batch/status_gate.rs";
 
     /// 扫描用的字面量。
     ///
@@ -1254,7 +1257,7 @@ mod write_guard_tests {
     /// (a) **注释 / 文档注释里提到这条 SQL** —— 排除。`scan_rust` 把注释
     ///     空格化后才做匹配。本仓有 8 处文档注释在描述「UPDATE t_part_batch
     ///     : INSPECTION → READY_TO_SHIP（OCC）」这类流程（`inspection_core.rs`
-    ///     3 处、`batch_sql.rs` 3 处、`worker_pool/repo/sql.rs` 1 处），它们是
+    ///     3 处、`repo/sql.rs` 3 处、`worker_pool/repo/sql.rs` 1 处），它们是
     ///     **文档**，排除掉之后规则才能盯住真实 SQL。
     ///
     /// (b) **`#[cfg(test)]` 块** —— 排除。全仓唯一的真实例子是
@@ -1320,8 +1323,8 @@ mod write_guard_tests {
 
         assert!(
             violations.is_empty(),
-            "以下 {} 处直接写了 `t_part_batch.status`，绕过了 part 域唯一状态写入口 \
-             `src/modules/part/service/status_gate.rs`：\n{}\n\
+            "以下 {} 处直接写了 `t_part_batch.status`，绕过了 `t_part_batch` 域唯一 \
+             状态写入口 `src/modules/prod/batch/status_gate.rs`：\n{}\n\
              \n\
              规则（见 `status_gate.rs` 末尾 `mod write_guard_tests`）：\n\
              \x20 * 判定 = 同一语句里既有对批次表的 UPDATE、其 SET 子句又对 `status` 列赋值；\n\

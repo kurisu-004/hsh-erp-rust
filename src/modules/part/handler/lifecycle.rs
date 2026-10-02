@@ -34,10 +34,7 @@ use serde_json::json;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::part::dto_crud::{
-    ByWorkTypeQuery, ByWorkerQuery, CancelBatchRequest, CancelRequest, CompleteRepairRequest,
-    CompleteRequest, DeliverRequest, ForceCompleteRequest, PickUpRequest, PlaceOnShelfRequest,
-    RecallToPendingRequest, ReceiveFromOutsourceToInspectionRequest, RepairDispatchRequest,
-    SendToOutsourceRequest, SplitBatchRequest, StartRepairRequest,
+    ByWorkTypeQuery, ByWorkerQuery, CancelRequest, ForceCompleteRequest,
 };
 use crate::modules::part::service::PartService;
 use crate::modules::part::vo::{PartListOut, PartOut};
@@ -52,27 +49,6 @@ fn ws_broadcast(state: &AppState, kind: &str, payload: serde_json::Value) {
         kind: kind.into(),
         payload,
     });
-}
-
-/// `POST /api/v2/parts/{part_id}/deliver`
-///
-/// READY_TO_SHIP → DELIVERED；commit 后广播 `PART_DELIVERED`。
-pub async fn deliver(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<DeliverRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::Clerk])?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::deliver(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_DELIVERED",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
 }
 
 /// `POST /api/v2/parts/{part_id}/cancel`
@@ -91,27 +67,6 @@ pub async fn cancel(
     ws_broadcast(
         &state,
         "PART_CANCELLED",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/{part_id}/complete`
-///
-/// DELIVERED → COMPLETED；commit 后广播 `PART_COMPLETED`。
-pub async fn complete(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<CompleteRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::Clerk])?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::complete(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_COMPLETED",
         json!({ "part_id": part_id.to_string() }),
     );
     Ok(Json(R::ok(out)))
@@ -141,96 +96,6 @@ pub async fn force_complete(
     Ok(Json(R::ok(out)))
 }
 
-/// `POST /api/v2/parts/{part_id}/start-repair`
-///
-/// 源状态必须 `IN_PROCESS` **且** `is_repairing = false`（2026-10-01：REPAIRING
-/// 降级为 `t_part_batch.is_repairing` 标记列，本端点**不再发生 status 迁移**，
-/// 只把标记置 true）。commit 后广播 `PART_REPAIR_STARTED`。
-pub async fn start_repair(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<StartRepairRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::start_repair(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_REPAIR_STARTED",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-// ===== Phase 1（2026-09-13）14 端点 =====
-
-/// `POST /api/v2/parts/{part_id}/place-on-shelf`
-pub async fn place_on_shelf(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<PlaceOnShelfRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::place_on_shelf(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_PLACED_ON_SHELF",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/{part_id}/recall-to-pending`
-pub async fn recall_to_pending(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<RecallToPendingRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::recall_to_pending(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_RECALLED",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/{part_id}/send-to-programming`
-/// 2026-09-29 端点下线 —— 删除（PROGRAMMING 状态废弃进入路径）。
-///
-/// 旧行为：`PENDING → PROGRAMMING`（location='OFFICE'）。由编程员通过
-/// 工艺链 + CNC step 直接进入生产流替代；待编程一览由 `t_process.is_cnc`
-/// 列驱动。`POST /parts/{part_id}/send-to-programming` 已返回 404。
-///
-/// `POST /api/v2/parts/{part_id}/release-from-programming`
-pub async fn release_from_programming(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<PlaceOnShelfRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::release_from_programming(&mut *tx, &state.snowflake, part_id, req, &current)
-            .await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_RELEASED_FROM_PROGRAMMING",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
 /// `GET /api/v2/parts/pending-programming`
 ///
 /// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
@@ -245,70 +110,6 @@ pub async fn list_pending_programming(
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = PartService::list_pending_programming(&mut *conn, &query, &current).await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/{part_id}/send-to-outsource`
-pub async fn send_to_outsource(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<SendToOutsourceRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::send_to_outsource(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_SENT_TO_OUTSOURCE",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/{part_id}/receive-from-outsource`
-pub async fn receive_from_outsource(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<PlaceOnShelfRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::receive_from_outsource(&mut *tx, &state.snowflake, part_id, req, &current)
-            .await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_RECEIVED_FROM_OUTSOURCE",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/{part_id}/receive-from-outsource-to-inspection`
-pub async fn receive_from_outsource_to_inspection(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<ReceiveFromOutsourceToInspectionRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::receive_from_outsource_to_inspection(
-        &mut *tx,
-        &state.snowflake,
-        part_id,
-        req,
-        &current,
-    )
-    .await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_RECEIVED_FROM_OUTSOURCE_INSPECTED",
-        json!({ "part_id": part_id.to_string() }),
-    );
     Ok(Json(R::ok(out)))
 }
 
@@ -335,122 +136,6 @@ pub async fn list_outsource_sendable(
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = PartService::list_outsource_sendable(&mut *conn, &query, &current).await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/{part_id}/complete-repair`
-///
-/// 要求批次 `is_repairing = true`（确实在返修中）。按 shelf.zone 决定去向：
-/// PRODUCTION → `IN_PROCESS`（落回生产架、重新入池）或 INSPECTION →
-/// `INSPECTION`（送检区）。两条路径都把 `is_repairing` 清回 false。
-pub async fn complete_repair(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<CompleteRepairRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::complete_repair(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_REPAIR_COMPLETED",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/{part_id}/repair-dispatch`
-///
-/// 一步式返修下发（INSPECTION / READY_TO_SHIP / IN_PROCESS / DELIVERED →
-/// 由 shelf.zone 决定的 IN_PROCESS / INSPECTION）。
-pub async fn repair_dispatch(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<RepairDispatchRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::repair_dispatch(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_REPAIR_DISPATCHED",
-        json!({ "part_id": part_id.to_string() }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-/// `POST /api/v2/parts/{part_id}/batches/split`
-pub async fn split_batch(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<SplitBatchRequest>,
-) -> Result<Json<R<i64>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let new_batch_id =
-        PartService::split_batch(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_BATCH_SPLIT",
-        json!({
-            "part_id": part_id.to_string(),
-            "new_batch_id": new_batch_id.to_string(),
-        }),
-    );
-    Ok(Json(R::ok(new_batch_id)))
-}
-
-/// `POST /api/v2/parts/{part_id}/batches/{batch_id}/cancel`
-pub async fn cancel_batch(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path((part_id, batch_id)): Path<(i64, i64)>,
-    Json(req): Json<CancelBatchRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out =
-        PartService::cancel_batch(&mut *tx, &state.snowflake, part_id, batch_id, req, &current)
-            .await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_BATCH_CANCELLED",
-        json!({
-            "part_id": part_id.to_string(),
-            "batch_id": batch_id.to_string(),
-        }),
-    );
-    Ok(Json(R::ok(out)))
-}
-
-// ===== Phase 2（2026-09-13）手动 pick-up =====
-
-/// `POST /api/v2/parts/{part_id}/pick-up`
-///
-/// 手动 pick-up（B 方案）：PENDING / IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER。
-/// Manager / Clerk / ShelfAccount 三角色可触发；worker 必须 active 且绑定 work_type。
-pub async fn pick_up(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Path(part_id): Path<i64>,
-    Json(req): Json<PickUpRequest>,
-) -> Result<Json<R<PartOut>>, AppError> {
-    let mut tx = state.pool.begin().await?;
-    let out = PartService::pick_up(&mut *tx, &state.snowflake, part_id, req, &current).await?;
-    tx.commit().await?;
-    ws_broadcast(
-        &state,
-        "PART_PICKED_UP",
-        json!({
-            "part_id": part_id.to_string(),
-            "worker_id": out.id.to_string(),
-        }),
-    );
     Ok(Json(R::ok(out)))
 }
 

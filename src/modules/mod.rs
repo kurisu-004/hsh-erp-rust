@@ -33,9 +33,10 @@ pub mod files;
 pub mod iam;
 pub mod outsource;
 pub mod part;
-// 2026-09-22 PR2 合并：原 `part_batch` 域（1866 行 helper，无独立 URL）
-// 物理合并入 part 域的 `part::batch` 子模块（src/modules/part/batch/）。
-// 这里不再 `pub mod part_batch;`，所有引用改走 `crate::modules::part::batch::*`。
+// 2026-10-02 域归属定案：原 `part_batch` 域（1866 行 helper，无独立 URL）整体
+// 归入 prod 域的 `prod::batch` 子模块（src/modules/prod/batch/），承载 `t_part_batch`
+// 的 repo / model / status_gate / 全部批次用例与 25 条批次路由。
+// 这里不再 `pub mod part_batch;`，所有引用走 `crate::modules::prod::batch::*`。
 pub mod part_file;
 // 2026-09-19 新增 prod 模块聚合：worker + work_type + process + process_chain +
 // worker_pool 平移至 `prod::*`，URL 硬切换到 `/api/v2/prod/*`（无 alias，前端锁步）。

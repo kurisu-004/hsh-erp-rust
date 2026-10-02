@@ -1,12 +1,14 @@
-//! Phase 1 / 1.4 返修闭环
+//! prod::batch 的返修闭环：两个写点 + 三条集合读
 //!
-//! 方法：`complete_repair` / `repair_dispatch` / `list_repair_batches` /
-//! `list_repairing_batches` + 共享 `list_batches_matching` helper。
-//!
-//! 2026-09-22 D-6：从原 `phase1.rs` 按业务动作拆出。共享 helper 在 `phase1/mod.rs` 同 crate 内可见。
+//! | 端点 | 方法 |
+//! |---|---|
+//! | `POST /{batch_id}/complete-repair` | `complete_repair` |
+//! | `POST /{batch_id}/repair-dispatch` | `repair_dispatch` |
+//! | `GET  /repair` | `list_repair_batches` |
+//! | `GET  /repairing` | `list_repairing_batches` |
 //!
 //! 2026-10-01：REPAIRING 降级为 `t_part_batch.is_repairing` 标记列
-//! （migration 005/006）后本文件的语义变更：
+//! （migration 005/006）后本流的语义：
 //!
 //! | 维度 | 改造前 | 改造后 |
 //! |---|---|---|
@@ -14,33 +16,33 @@
 //! | `complete_repair` 守卫 | 枚举迁移白名单（源须为 REPAIRING） | `is_repairing == true`（否则 20118） |
 //! | `complete_repair` / `repair_dispatch` 的写点 | 写 `status` | 写 `status` **并**清 `is_repairing`（经 `mark_batch_with_status_and_meta`）|
 //! | 事件 `from_status` / `to_status` | 含 `'REPAIRING'` 字面量 | 一律写**真实**状态值（返修事实由 `event_type` + `is_repairing` 承载）|
-//! | `repairing-batches` 列表 | `statuses = ['REPAIRING']` | `is_repairing = true`（本文件 `BatchListFilter::Repairing`）|
+//! | `GET /repairing` 列表 | `statuses = ['REPAIRING']` | `is_repairing = true`（`BatchListFilter::Repairing`）|
 
 use sqlx::PgConnection;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
-use crate::modules::part::dto::InspectionBatchListQuery;
 use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
-use crate::modules::part::vo::{InspectionBatchListItemOut, InspectionBatchListOut};
+use crate::modules::prod::batch::dto::{
+    CompleteRepairRequest, InspectionBatchListQuery, RepairDispatchRequest,
+};
+use crate::modules::prod::batch::vo::{InspectionBatchListItemOut, InspectionBatchListOut};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
-use super::super::super::dto_crud::{CompleteRepairRequest, RepairDispatchRequest};
-use super::super::PartService;
-
-use super::{
+use super::BatchService;
+use super::guard::{
     InspectionRepairRow, assert_shelf_maps_process, mark_batch_with_status_and_meta,
-    require_process_chain, validate_batch_ownership,
+    require_process_chain, validate_batch_version,
 };
 
-impl PartService {
+impl BatchService {
     // ===== 1.4 返修闭环 =====
 
-    /// `POST /parts/{id}/complete-repair`：完成返修。
+    /// `POST /prod/batches/{batch_id}/complete-repair`：完成返修。
     ///
     /// 前置：批次 `is_repairing = true`（确实在返修中）。
     /// 去向由 shelf.zone 决定：PRODUCTION → `IN_PROCESS`（落回生产架、重新
@@ -49,20 +51,23 @@ impl PartService {
     pub async fn complete_repair<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: CompleteRepairRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
         let part = repo
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
         // 守卫 1：源状态必须在生产流里。REPAIRING 降级为标记列（migration
         // 005/006）后本端点不再是「状态迁移」，status 恒为 IN_PROCESS ——
         // 这条守卫拦住 PENDING / PROGRAMMING / INSPECTION / READY_TO_SHIP /
@@ -209,7 +214,7 @@ impl PartService {
         Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
-    /// `POST /parts/{id}/repair-dispatch`：一步式返修下发。
+    /// `POST /prod/batches/{batch_id}/repair-dispatch`：一步式返修下发。
     ///
     /// 入口：IN_PROCESS / INSPECTION / READY_TO_SHIP / DELIVERED；目标状态由
     /// shelf.zone 决定（PRODUCTION → IN_PROCESS；INSPECTION → INSPECTION）。
@@ -218,20 +223,23 @@ impl PartService {
     pub async fn repair_dispatch<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
-        part_id: i64,
+        batch_id: i64,
         req: RepairDispatchRequest,
         current: &CurrentUser,
     ) -> Result<crate::modules::part::vo::PartOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
+        let batch = repo
+            .find_batch_by_id(batch_id)
+            .await?
+            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
+        // 2026-10-02：batch_id 来自 URL 路径参数（`POST /prod/batches/{batch_id}/…`），
+        // part_id 由批次行反查。
+        let part_id = batch.part_id;
         let part = repo
             .get_part_inspected(part_id)
             .await?
             .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, "part 不存在"))?;
-        let batch = repo
-            .find_batch_by_id(req.batch_id)
-            .await?
-            .ok_or_else(|| AppError::biz(code::BIZ_PART_BATCH_NOT_FOUND, "batch 不存在"))?;
-        validate_batch_ownership(batch.part_id, batch.id, part_id, req.version, batch.version)?;
+        validate_batch_version(batch.id, req.version, batch.version)?;
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         // 入口白名单（PR-M 2026-08-04：INSPECTION / READY_TO_SHIP / IN_PROCESS / DELIVERED）
@@ -358,7 +366,7 @@ impl PartService {
         Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
-    /// `GET /parts/repair-batches`：DELIVERED 批次列表（M+C+I）。
+    /// `GET /prod/batches/repair`：DELIVERED 批次列表（M+C+I）。
     /// 复用 `InspectionBatchListQuery` + repo；status=DELIVERED。
     pub async fn list_repair_batches<R: PartRepoTrait>(
         mut repo: R,
@@ -375,7 +383,7 @@ impl PartService {
         .await
     }
 
-    /// `GET /parts/repairing-batches`：返修中批次列表（M+C+I）。
+    /// `GET /prod/batches/repairing`：返修中批次列表（M+C+I）。
     ///
     /// 2026-10-01：判据由 `status = 'REPAIRING'` 改为 `is_repairing = true`
     /// （REPAIRING 降级为标记列，migration 005/006）。
@@ -385,7 +393,7 @@ impl PartService {
     /// `InspectionBatchListItemOut` DTO、同套分页 / 过滤 / 计数），差别**只有
     /// WHERE 里的一个判据**。为此新增 `PartBatchRepo` 方法有两种做法，都更差：
     /// (1) 复制整条 SQL（两份必须手工保持同步的投影，漂移即两端口径不一致）；
-    /// (2) 把 SQL 搬进 `part/batch/repo.rs` 并连带搬迁 `InspectionRepairRow`
+    /// (2) 把 SQL 搬进 `prod/batch/repo/queries.rs` 并连带搬迁 `InspectionRepairRow`
     ///   —— 那是与本轮「消费新列」无关的结构搬迁。故本轮用
     ///   [`BatchListFilter`] 把判据显式化（调用点读起来就是「按标记过滤」，
     ///   不再出现 `'REPAIRING'` 字面量），判据在 SQL 层仍是同一个 bind 位。
@@ -421,8 +429,8 @@ impl PartService {
         // 本分支 d8f5788（原 6ecdf2c，migration 004）一度把两列改直读
         // `b.current_process_id`（并删掉 s2 JOIN），**该改法已回退**，理由：
         //
-        // 本函数服务 `GET /parts/repair-batches`（`DELIVERED`）与
-        // `GET /parts/repairing-batches`（`is_repairing = true`），两个端点
+        // 本函数服务 `GET /prod/batches/repair`（`DELIVERED`）与
+        // `GET /prod/batches/repairing`（`is_repairing = true`），两个端点
         // 都**不是工序池端点**（工序池端点只认 `status='IN_PROCESS' AND
         // location='PRODUCTION_SHELF'`），与 `current_process_id` 无关。
         //
@@ -449,10 +457,10 @@ impl PartService {
         //
         // 读取方分工（勿越界）：`current_process_id` 的读取方严格限定为 5 条工序池
         // SQL + `list_pickable_by_work_type` + rollup 派生；**展示类列表一律走
-        // step 派生**。完整清单见 `part/batch/model.rs` 模块 doc。
+        // step 派生**。完整清单见 `prod/batch/model.rs` 模块 doc。
         //
-        // ⚠️ 本函数与 `part/batch/repo.rs::list_batches_with_part`（服务
-        // `GET /parts/inspection-batches`）是**两条独立 SQL**，M3 只回退了后者；
+        // ⚠️ 本函数与 `prod/batch/repo/queries.rs::list_batches_with_part`（服务
+        // `GET /prod/batches/inspection`）是**两条独立 SQL**，M3 只回退了后者；
         // 本条当时漏网，本次补齐。
         let rows: Vec<InspectionRepairRow> = sqlx::query_as::<_, InspectionRepairRow>(
             "SELECT b.id AS batch_id, b.part_id, b.batch_no, b.quantity, b.status, b.is_repairing,              b.location, b.version, b.current_process_step_id, b.parent_batch_id,              b.current_holder_id, COALESCE(s.name, w.name, oc.name) AS holder_name,              s2.process_id AS next_process_id, p2.name AS next_process_name,              b.delivery_note_id, dn.delivery_note_no,              p.serial_no, p.drawing_no, p.name, p.order_no, p.planned_delivery_date,              p.is_urgent, p.version AS part_version, p.created_at, p.updated_at,              p.customer_id, c.name AS customer_name, c_l1.name AS l1_customer_name              FROM t_part_batch b JOIN t_part p ON p.id = b.part_id              LEFT JOIN t_customer c ON c.id = p.customer_id              LEFT JOIN t_customer c_l1 ON c_l1.id = c.parent_id AND c_l1.deleted_at IS NULL              LEFT JOIN t_shelf s ON s.id = b.current_holder_id              LEFT JOIN t_worker w ON w.id = b.current_holder_id              LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id              LEFT JOIN t_process_chain_step s2 ON s2.id = b.current_process_step_id              LEFT JOIN t_process p2 ON p2.id = s2.process_id              LEFT JOIN t_delivery_note dn ON dn.id = b.delivery_note_id              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL              AND (CASE WHEN $9::bool THEN b.is_repairing = true ELSE b.status = ANY($1) END)              AND (NOT $9::bool OR b.status NOT IN ('COMPLETED', 'CANCELLED'))              AND ($2 = '' OR p.drawing_no ILIKE '%' || $2 || '%' OR p.name ILIKE '%' || $2 || '%')              AND ($3::bigint IS NULL OR p.customer_id = $3)              AND ($4::text IS NULL OR p.serial_no ILIKE '%' || $4 || '%')              AND ($5::date IS NULL OR p.planned_delivery_date >= $5)              AND ($6::date IS NULL OR p.planned_delivery_date <= $6)              ORDER BY b.id DESC LIMIT $7 OFFSET $8",

@@ -40,7 +40,7 @@ use crate::state::AppState;
 ///   本次提交会发出 `DELIVERY_NOTE_SUBMITTED` 大屏事件。
 /// - `outcome = CANDIDATES_AVAILABLE`：存在仍在 `INSPECTION` 的已挂单批次，**本次未提交**；
 ///   `note` 为 `null`；`unresolved_targets` 按 part 分组列出未过检批次（含 `version`，
-///   前端可一键转发到 `POST /parts/batch-to-ship` 让其到 READY_TO_SHIP 后再重提本接口）。
+///   前端可一键转发到 `POST /prod/batches/to-ship` 让其到 READY_TO_SHIP 后再重提本接口）。
 ///   候选分支不写库、不发事件。
 pub async fn submit_delivery_note(
     State(state): State<Arc<AppState>>,

@@ -26,25 +26,23 @@
 //!   普通过滤（不再 JOIN `t_process_chain_step`）
 //! - `current_process_step_id` 相应**降级为可选的显示用定位信息**：仅当工单已
 //!   绑定工序链时才写，允许 NULL；且**只在首次定位工序时写、之后不再推进**
-//!   （2026-09-30 review 第 3 轮订正措辞，详见 `TPartBatch` 字段 doc）
+//!   （只在首次定位工序时写、之后不再推进，详见 `TPartBatch` 字段 doc）
 //! - 目的：让**没有工序链的工单，其批次也能正常入池**（旧设计下 dispatch 写
 //!   `step=NULL` + 候选池 SQL INNER JOIN step → 批次对所有池查询隐身，形成
 //!   「要推进 step 先进池、要进池先有 step」的死状态）
 //!
-//! **读取方分工**（2026-09-30 review 第 3 轮 M3 确立，勿越界）：
+//! **读取方分工**（勿越界）：
 //!
 //! - `current_process_id` 的读取方严格限定为 **5 条工序池 SQL**（take_one /
 //!   take_specific / list_candidates / group_count / count_pool_by_shelf）
 //!   + `list_pickable_by_work_type` + rollup 派生 `t_part.next_process_id`。
 //! - **展示类列表一律继续从 `current_process_step_id` → step JOIN 派生工序名**。
 //!   完整清单（改动前请逐条对照，勿凭端点名想当然）：
-//!   1. `part/batch/repo.rs::list_batches_with_part`
-//!      —— `GET /parts/inspection-batches`（M3 已回退）
-//!   2. `part/service/phase1/repair.rs::list_batches_matching`
-//!      —— `GET /parts/repair-batches`（DELIVERED）+ `GET /parts/repairing-batches`
-//!      （`is_repairing = true`，2026-10-01 由 `status='REPAIRING'` 改判据）。
-//!      **M3 当时漏网**（它与第 1 条是两条独立 SQL，M3 只回退了
-//!      第 1 条），2026-09-30 follow-up 补齐。
+//!   1. `prod/batch/repo/queries.rs::list_batches_with_part`
+//!      —— `GET /prod/batches/inspection`
+//!   2. `prod/batch/service/repair.rs::list_batches_matching`
+//!      —— `GET /prod/batches/repair`（DELIVERED）+ `GET /prod/batches/repairing`
+//!      （`is_repairing = true`）。
 //!   3. `part/service/phase1/lifecycle_helpers.rs::list_batches`
 //!      —— `GET /parts/{id}/batches`（工单批次明细，**无 status 过滤**，同时返回
 //!      PENDING / IN_PROCESS / INSPECTION / READY_TO_SHIP 等各状态批次；返修中的
@@ -193,7 +191,7 @@ pub struct PartBatchScanRow {
 
 // ===== Inspection Batch List =====
 
-/// `GET /parts/inspection-batches` 单行中间结构（repo ↔ service 边界类型）。
+/// `GET /prod/batches/inspection` 单行中间结构（repo ↔ service 边界类型）。
 ///
 /// SQL 列别名见 repo `list_batches_with_part`（单次 JOIN 8 表，含 holder_name
 /// / next_process_name / delivery_note_no / customer_name / l1_customer_name
@@ -208,7 +206,7 @@ pub struct PartBatchScanRow {
 /// 2026-09-30（migration 004）一度改直读 `pb.current_process_id`，**2026-09-30
 /// review 第 3 轮 M3 已回退**到 step 派生：INSPECTION 批次按出池不变式该列恒为
 /// NULL，直读会让 `next_process_id` / `next_process_name` 在
-/// `GET /parts/inspection-batches` 恒 null（用户可见回归）。字段名始终保留，
+/// `GET /prod/batches/inspection` 恒 null（用户可见回归）。字段名始终保留，
 /// 兼容 DTO 与前端。
 #[derive(Debug, Clone)]
 pub struct InspectionBatchListRow {
@@ -220,7 +218,7 @@ pub struct InspectionBatchListRow {
     pub status: String,
     /// 2026-10-01 review 第 1 轮 M5 新增（migration 005）：REPAIRING 已从
     /// `PartStatus` 降级为标记列，**必须**随列表一起投出 —— 否则前端在
-    /// `GET /parts/repairing-batches` 上拿到的 `status` 恒为 `IN_PROCESS`，
+    /// `GET /prod/batches/repairing` 上拿到的 `status` 恒为 `IN_PROCESS`，
     /// 「返修中」这个信号彻底消失。
     pub is_repairing: bool,
     pub location: Option<String>,

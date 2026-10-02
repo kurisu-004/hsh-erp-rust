@@ -183,7 +183,6 @@ async fn complete_repair_to_process_happy_path() {
     // 注：fixture 已预置 fx.production_shelf_id ↔ fx.process_id 的映射
     // （t_shelf_process WORK_TYPE_PROCESS_ID），无需 link_shelf_to_process。
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -192,7 +191,7 @@ async fn complete_repair_to_process_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete-repair"),
+            &format!("/prod/batches/{bid}/complete-repair"),
             Some(body),
             Some(&token),
         ),
@@ -217,10 +216,9 @@ async fn complete_repair_to_process_happy_path() {
 #[tokio::test]
 async fn complete_repair_to_inspection_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_repairing_part_batch(&pool, "P0", fx.customer_l2_id, 5).await;
+    let (_pid, bid) = insert_repairing_part_batch(&pool, "P0", fx.customer_l2_id, 5).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.inspection_shelf_id.to_string(),
     });
@@ -228,7 +226,7 @@ async fn complete_repair_to_inspection_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete-repair"),
+            &format!("/prod/batches/{bid}/complete-repair"),
             Some(body),
             Some(&token),
         ),
@@ -258,7 +256,6 @@ async fn complete_repair_invalid_source_rejects() {
     let chain_id = create_chain_for_part(&pool, pid).await;
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -267,7 +264,7 @@ async fn complete_repair_invalid_source_rejects() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete-repair"),
+            &format!("/prod/batches/{bid}/complete-repair"),
             Some(body),
             Some(&token),
         ),
@@ -293,7 +290,6 @@ async fn complete_repair_non_repairing_in_process_rejects() {
     let chain_id = create_chain_for_part(&pool, pid).await;
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.production_shelf_id.to_string(),
         "next_process_id": fx.process_id.to_string(),
@@ -302,7 +298,7 @@ async fn complete_repair_non_repairing_in_process_rejects() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/complete-repair"),
+            &format!("/prod/batches/{bid}/complete-repair"),
             Some(body),
             Some(&token),
         ),
@@ -337,10 +333,9 @@ async fn complete_repair_non_repairing_in_process_rejects() {
 async fn repair_dispatch_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     // 入口：INSPECTION / READY_TO_SHIP / IN_PROCESS / DELIVERED
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "INSPECTION", 5).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "INSPECTION", 5).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.inspection_shelf_id.to_string(),
     });
@@ -348,7 +343,7 @@ async fn repair_dispatch_happy_path() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/repair-dispatch"),
+            &format!("/prod/batches/{bid}/repair-dispatch"),
             Some(body),
             Some(&token),
         ),
@@ -361,10 +356,9 @@ async fn repair_dispatch_happy_path() {
 #[tokio::test]
 async fn repair_dispatch_invalid_source_rejects() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
-    let (pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "CANCELLED", 5).await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "CANCELLED", 5).await;
     let version = batch_version(&pool, bid).await;
     let body = json!({
-        "batch_id": bid.to_string(),
         "version": version,
         "shelf_id": fx.inspection_shelf_id.to_string(),
     });
@@ -372,7 +366,7 @@ async fn repair_dispatch_invalid_source_rejects() {
         app,
         json_request(
             "POST",
-            &format!("/parts/{pid}/repair-dispatch"),
+            &format!("/prod/batches/{bid}/repair-dispatch"),
             Some(body),
             Some(&token),
         ),
@@ -388,7 +382,7 @@ async fn list_repair_batches_happy_path() {
     let (pid, _bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "DELIVERED", 5).await;
     let (s, env) = send(
         app,
-        json_request("GET", "/parts/repair-batches", None, Some(&token)),
+        json_request("GET", "/prod/batches/repair", None, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "list-repair-batches: {env}");
@@ -407,7 +401,7 @@ async fn list_repairing_batches_happy_path() {
         insert_part_with_batch(&pool, "P1", fx.customer_l2_id, "DELIVERED", 5).await;
     let (s, env) = send(
         app,
-        json_request("GET", "/parts/repairing-batches", None, Some(&token)),
+        json_request("GET", "/prod/batches/repairing", None, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "list-repairing-batches: {env}");
@@ -535,7 +529,7 @@ async fn insert_step_located_delivered_part_batch(
     (part_id, batch_id, process_id, process_name.to_string())
 }
 
-/// `GET /parts/repair-batches`：`next_process_id` / `next_process_name` 必须由
+/// `GET /prod/batches/repair`：`next_process_id` / `next_process_name` 必须由
 /// `current_process_step_id` → step JOIN 派生，**不直读** `current_process_id`。
 ///
 /// 若有人把 `list_batches_matching` 改回直读 cpid，本测试必红
@@ -573,7 +567,7 @@ async fn repair_batches_derives_next_process_from_step_not_cpid() {
 
     let (s, env) = send(
         app,
-        json_request("GET", "/parts/repair-batches?limit=50", None, Some(&token)),
+        json_request("GET", "/prod/batches/repair?limit=50", None, Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "list-repair-batches: {env}");
@@ -607,7 +601,7 @@ async fn repair_batches_derives_next_process_from_step_not_cpid() {
     );
 }
 
-/// `GET /parts/repairing-batches` 走的是**同一条** SQL（2026-10-01 起判据是
+/// `GET /prod/batches/repairing` 走的是**同一条** SQL（2026-10-01 起判据是
 /// `is_repairing = true`），故同样不直读 `current_process_id`。
 ///
 /// ## 2026-10-01：测试前提随语义变更重写
@@ -662,7 +656,7 @@ async fn repairing_batches_derives_next_process_from_step_not_stale_cpid() {
         app,
         json_request(
             "GET",
-            "/parts/repairing-batches?limit=50",
+            "/prod/batches/repairing?limit=50",
             None,
             Some(&token),
         ),
