@@ -148,6 +148,13 @@
 | `has_children` | bool | 2026-09-28 新增。是否有子件（Tree data lazy mode 必需）：PART 行 → `false`；ASSEMBLY 行 → `child_count.unwrap_or(0) > 0`。后端不强制走 `GET /assemblies/{id}` 预拉，前端按此字段切换展开/折叠交互即可。 |
 | `child_count` | string (i64)? | 2026-09-28 新增。子件计数（装配表行专用）；PART 行 → `null`。真相源：`t_part WHERE assembly_id = $1 AND deleted_at IS NULL` 的 COUNT（≤200 ids / 1 extra query）。 |
 | `has_cnc_program` | bool | 2026-09-29 新增（CNC 重构 5 任务之一）。是否已上传 G_CODE 数控程序。真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`。`GET /parts/pending-programming` 走专用 repo 填充真实值；其它 list 端点默认 `false`（service 不 enrich，避免 N+1）。详见 [`./lifecycle.md#get-apiv2partspending-programming`](./lifecycle.md#get-apiv2partspending-programming)。 |
+| `batch_id` | string (i64)? | 2026-10-03 新增。**活跃批次雪花 id**（`serialize_i64_opt` → JSON string；无值时序列化为 `null`）。**仅 `GET /parts/pickable-by-work-type/{work_type_id}` 填** —— 该端点的行本来就是「批次行」（取行 SQL 从 `t_part_batch b` 起），扫码台「领料」按本字段定位批次后发写请求。**其余复用 `PartListItem` 的路径恒为 `null`**（`GET /parts` / `GET /api/v2/com/union-list` / `GET /parts/pending-programming` 等）：那些行的语义单位是 part，一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故宁可不填。 |
+| `batch_version` | i32? | 2026-10-03 新增。`batch_id` 那个批次的乐观锁版本号（`t_part_batch.version`），前端发写请求时作 OCC 版本回传。填充口径与 `batch_id` 完全一致（同为「仅 pickable-by-work-type 填，其余路径 `null`」），二者同生共死。⚠️ **批次 OCC 只认本字段，不要拿 `version` 当批次版本用**（见下条）。 |
+
+> ⚠️ `PartListItem.version` 是 **part 级**（`t_part.version`）乐观锁，与批次 OCC 无关。
+> `GET /parts/pickable-by-work-type/{work_type_id}` 的取行 SQL **不投影 `p.version`**
+> （只投影 `p.id` / `p.serial_no` / `p.drawing_no`），故该端点返回的 `version` 恒为 `0`
+> （有意占位，不是漏取值）；该端点的批次乐观锁版本一律走 `batch_version`。
 
 > 2026-09-16 PR-2（migration 027）：`t_part` 删 `actual_delivery_date` /
 > `location` / `current_holder_id` / `placed_at` / `delivery_note_id` /

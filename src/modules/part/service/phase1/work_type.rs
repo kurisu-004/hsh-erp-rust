@@ -127,6 +127,11 @@ impl PartService {
         let shelf_filter = query.shelf_id;
         // 列：t_part_batch WHERE location=PRODUCTION_SHELF AND batch.current_process_id IN (工种→工序映射)
         //
+        // 2026-10-03 补投影 `b.id` / `b.version`：本端点的行本来就是「批次行」，
+        // 而出参 VO 只有 part 级字段，扫码台「领料」拿不到批次 id 就发不出写请求。
+        // 两者填进 `PartListItem::batch_id` / `batch_version`（仅本端点填，
+        // 其它复用该 VO 的端点恒 null，见 vo/part.rs 字段 doc）。
+        //
         // 2026-09-30 修复（migration 004）：原写法是
         // `JOIN t_process_chain_step s ON s.id = b.current_process_step_id
         //  JOIN t_work_type_process wtp ON wtp.process_id = s.process_id` ——
@@ -139,8 +144,13 @@ impl PartService {
         // 「整组替换」（软删旧行 + 插新行），不过滤则已取消勾选的工序仍会把批次
         // 匹配进本工种的可领取列表。下方 COUNT 同步用**同一 `wtp` 谓词**，否则
         // `total` 与 `items` 对不上（两处的 `t_part` 侧不对称见 COUNT 处注释）。
-        let rows: Vec<(i64, String, String, i32, Option<i64>)> = sqlx::query_as(
-            "SELECT p.id, p.serial_no, p.drawing_no, b.quantity, b.current_process_id \
+        // ⚠️ `p.serial_no` 按 `Option<String>` 收（2026-10-03 修）：`t_part.serial_no`
+        // 是 nullable（手工工单无序列号），原先按 `String` 解码 → 遇到任一
+        // `serial_no IS NULL` 的 part 就整页 500（`unexpected null; try decoding as
+        // an Option`）。手工工单是常态，故这是真会触发的路径。
+        let rows: Vec<(i64, Option<String>, String, i32, Option<i64>, i64, i32)> = sqlx::query_as(
+            "SELECT p.id, p.serial_no, p.drawing_no, b.quantity, b.current_process_id, \
+                    b.id, b.version \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
              JOIN t_work_type_process wtp ON wtp.process_id = b.current_process_id \
@@ -162,12 +172,12 @@ impl PartService {
         .await?;
         let items: Vec<PartListItem> = rows
             .into_iter()
-            .map(|(id, serial, drawing, qty, _np)| {
+            .map(|(id, serial, drawing, qty, _np, batch_id, batch_version)| {
                 // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段，
                 // 通过 `From<TPart>` 派生基础字段（next_process_id 自动不复制）。
                 let p = crate::modules::part::model::TPart {
                     id,
-                    serial_no: Some(serial),
+                    serial_no: serial,
                     name: drawing.clone(),
                     drawing_no: drawing,
                     applicant_name: String::new(),
@@ -184,6 +194,12 @@ impl PartService {
                     note: None,
                     unit_price: rust_decimal::Decimal::ZERO,
                     total_price: rust_decimal::Decimal::ZERO,
+                    // ⚠️ 本 VO 的 `version` 是 **part 级**（`t_part.version`），
+                    // 而取行 SQL 压根没投影 `p.version`（只投影了 p.id /
+                    // p.serial_no / p.drawing_no）—— 恒 0 是**有意的占位**，
+                    // 不是漏取值。批次乐观锁版本走 2026-10-03 新增的
+                    // `PartListItem::batch_version`（取自 `b.version`）；
+                    // 下一个读者请勿把本字段当批次版本用。
                     version: 0,
                     created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
                     created_by: None,
@@ -192,7 +208,12 @@ impl PartService {
                     deleted_at: None,
                     process_chain_id: None,
                 };
-                PartListItem::from(p)
+                let mut item = PartListItem::from(p);
+                // 批次锚点：本端点是全仓唯一填这两字段的路径（出参契约见
+                // vo/part.rs::PartListItem::batch_id 的字段 doc）。
+                item.batch_id = Some(batch_id);
+                item.batch_version = Some(batch_version);
+                item
             })
             .collect();
         let total: i64 = sqlx::query_scalar(

@@ -205,6 +205,25 @@ pub struct PartListItem {
     ///   走 `GET /parts/pending-programming` 即可拿到此字段）
     #[serde(default)]
     pub has_cnc_program: bool,
+    /// 2026-10-03 新增：活跃批次雪花 id（序列化走 `serialize_i64_opt` → JSON string）。
+    ///
+    /// **仅 `GET /parts/pickable-by-work-type/{work_type_id}` 填** —— 该端点的行
+    /// 本来就是「批次行」（取行 SQL 从 `t_part_batch b` 起），扫码台「领料」按本
+    /// 字段定位批次后发写请求。
+    ///
+    /// 其余复用 `PartListItem` 的路径（`GET /parts` / `GET /com/union-list` /
+    /// `GET /parts/pending-programming` 等）**恒为 `None`**：那些行的语义单位是
+    /// part，一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故宁可不填。
+    #[serde(serialize_with = "serialize_i64_opt")]
+    pub batch_id: Option<i64>,
+    /// 2026-10-03 新增：`batch_id` 那个批次的乐观锁版本号（`t_part_batch.version`）。
+    ///
+    /// 前端发写请求时作 OCC 版本回传。⚠️ 本 VO 的 `version` 字段是 **part 级**
+    /// （`t_part.version`），与批次 OCC 无关；批次 OCC 只认本字段，**不要拿
+    /// `version` 当批次版本用**。填充口径与 `batch_id` 完全一致（同为「仅
+    /// pickable-by-work-type 填，其余路径 null」）。
+    #[serde(default)]
+    pub batch_version: Option<i32>,
 }
 
 impl From<TPart> for PartListItem {
@@ -248,6 +267,12 @@ impl From<TPart> for PartListItem {
             // 调用 repo 时通过 EXISTS 子查询填充。其它 list caller 不填 → 默认 false
             // （前端无影响，因为这些 caller 不暴露此字段语义）。
             has_cnc_program: false,
+            // 2026-10-03 新增：`From<TPart>` 是 part 级投影，不含批次语义
+            // （`TPart` 本身不持 batch_id）→ 恒 None。需要批次锚点的端点
+            // （目前只有 `pickable-by-work-type`）在 `PartListItem::from` 之后
+            // 显式覆写这两个字段。
+            batch_id: None,
+            batch_version: None,
         }
     }
 }

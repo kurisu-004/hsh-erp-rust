@@ -764,6 +764,11 @@ fn project_assembly_to_part_list_item(a: TAssembly) -> PartListItem {
         // （part/vo/part.rs:200-207），t_assembly 不持 G_CODE 程序概念，ALL 模式下默认 false。
         // 注：com/union_list 是 feat 新增域，feat 未跟到此字段；fix-up 在合并 master 时加。
         has_cnc_program: false,
+        // 2026-10-03：批次锚点字段。union-list 的行单位是 part（ASSEMBLY 行连 part
+        // 都不是），一个 part 可能有多个活跃批次 → 本端点**刻意不填**（恒 null），
+        // 与 VO 契约（仅 pickable-by-work-type 填）一致。
+        batch_id: None,
+        batch_version: None,
     }
 }
 
@@ -807,5 +812,8 @@ fn union_row_to_part_list_item(r: UnionListRow) -> PartListItem {
         child_count: None,
         // 2026-09-29 合并：同上，`has_cnc_program` 默认 false。
         has_cnc_program: false,
+        // 2026-10-03：同上，批次锚点字段在本端点恒 null（行单位是 part，批次不唯一）。
+        batch_id: None,
+        batch_version: None,
     }
 }

@@ -133,6 +133,13 @@ GET /api/v2/com/union-list
 | `customer_name` / `l1_customer_name` | 派生 | 派生 |
 | `assembly_id` | 装配件子件 → `Some(id)`；顶层零件 → `None` | `None`（顶层装配件无父） |
 | `process_chain_id` | 直接搬 | `None`（t_assembly 无此列） |
+| `batch_id` / `batch_version` | **`None`（恒 `null`，不填）** | **`None`（恒 `null`，不填）** |
+
+> ⚠️ `batch_id` / `batch_version` 是 2026-10-03 给 `PartListItem` 加的两个可选字段
+> （全仓**仅** `GET /parts/pickable-by-work-type/{work_type_id}` 填）。本端点
+> **刻意不填**：union-list 的行单位是 part（ASSEMBLY 行连 part 都不是），一个 part
+> 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故两字段恒为 `null`。
+> 完整字段表见 [`./parts/index.md#partlistitem-字段`](./parts/index.md#partlistitem-字段)。
 
 ## 状态码
 

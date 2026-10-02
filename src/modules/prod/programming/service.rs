@@ -99,5 +99,9 @@ fn row_to_item(r: ProgrammingRow) -> ProgrammingItemOut {
         customer_name: r.customer_name,
         parent_customer_name: r.parent_customer_name,
         has_cnc_program: r.has_cnc_program,
+        // 2026-10-03 新增：PROGRAMMING 活跃批次锚点（无该状态批次 → 两个都是 None，
+        // 前端据此禁用「下发」按钮）。与上面的 part 级 `version` 严格区分。
+        batch_id: r.batch_id,
+        batch_version: r.batch_version,
     }
 }

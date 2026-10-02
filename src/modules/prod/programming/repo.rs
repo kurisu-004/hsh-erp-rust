@@ -66,6 +66,12 @@
 //! 候选池同源。**同一常量**同时供 list 的 SELECT 列表与 WHERE 过滤复用（见该常量
 //! doc 的改一同步二约定）。
 //!
+//! ## 批次锚点（2026-10-03 新增）
+//! SELECT 列表挂一条 [`PROGRAMMING_BATCH_JOIN`]（`LEFT JOIN LATERAL`），取该 part 的
+//! PROGRAMMING 活跃批次 id + `t_part_batch.version`，供前端拼
+//! `POST /api/v2/prod/batches/{batch_id}/release-from-programming`。该端点以批次为锚
+//! 且对批次做 OCC，故 part 级 `p.version` 无法替代。口径细节见该常量 doc。
+//!
 //! ## list / count 共用谓词
 //! 两个方法共用私有 [`push_where`]（WHERE 骨架 + `has_cnc_program` + keyword +
 //! `serial_no` 四段）与常量 [`FROM_SQL`]。旧端点把同一段谓词手抄两遍（list 一份、
@@ -110,6 +116,33 @@ const FROM_SQL: &str = " FROM t_part p \
 /// 集成测试 `soft_delete_filters_exclude_rows` 会覆盖 `deleted_at` 维度的漂移。
 const G_CODE_EXISTS: &str = "EXISTS (SELECT 1 FROM t_part_file pf \
      WHERE pf.part_id = p.id AND pf.kind = 'G_CODE' AND pf.deleted_at IS NULL)";
+
+/// list 的 SELECT 列表专用 LATERAL 子查询（2026-10-03 新增）：取该 part 的
+/// **PROGRAMMING 活跃批次**（雪花 id + 批次 OCC 版本号）。
+///
+/// 只取 PROGRAMMING 是因为本列表的唯一写出口
+/// `POST /api/v2/prod/batches/{batch_id}/release-from-programming` 硬要求源状态
+/// 是 PROGRAMMING（`prod/batch/service/programming.rs` 的 `from != PROGRAMMING`
+/// 直接 20103）——给 PENDING / IN_PROCESS 批次的 id 等于给前端一个必然失败的锚点。
+/// 同 part 有多个 PROGRAMMING 批次时 `ORDER BY pb.id DESC LIMIT 1` 取最新
+/// （雪花 ID 随时间单调递增）；无 PROGRAMMING 批次 → 两列都 `NULL`
+/// （LEFT JOIN 语义），前端据此禁用「下发」按钮。
+///
+/// **与 `G_CODE_EXISTS` 的「改一同步二」义务不同**：本片段是**纯 SELECT 投影**，
+/// WHERE 侧不引用它，故不存在改一处漏另一处的漂移面。两个 alias 名
+/// （`batch_id` / `batch_version`）必须与 [`ProgrammingRow`] 同名字段对齐，
+/// 否则 `FromRow` 取不到值。
+///
+/// 刻意**不**放进 [`FROM_SQL`]：`ProgrammingRepo::count` 只需要行数，不需要批次锚点，
+/// 放进去会给每个待计数的 part 白跑一次相关子查询。
+const PROGRAMMING_BATCH_JOIN: &str = " LEFT JOIN LATERAL ( \
+     SELECT pb.id AS batch_id, pb.version AS batch_version \
+     FROM t_part_batch pb \
+     WHERE pb.part_id = p.id \
+       AND pb.deleted_at IS NULL \
+       AND pb.status = 'PROGRAMMING' \
+     ORDER BY pb.id DESC \
+     LIMIT 1) pb_prog ON true";
 
 /// list / count 共用的 WHERE 骨架（part 状态闸门 + 三规则并集，不含四个动态段）。
 ///
@@ -159,8 +192,9 @@ impl ProgrammingRepo {
             "SELECT p.id, p.version, p.serial_no, p.name, p.drawing_no, p.quantity, \
                     p.status, p.is_urgent, p.planned_delivery_date, p.system_delivery_date, \
                     c.name AS customer_name, pc.name AS parent_customer_name, \
-                    {G_CODE_EXISTS} AS has_cnc_program \
-             {FROM_SQL}"
+                    {G_CODE_EXISTS} AS has_cnc_program, \
+                    pb_prog.batch_id AS batch_id, pb_prog.batch_version AS batch_version \
+             {FROM_SQL}{PROGRAMMING_BATCH_JOIN}"
         ));
         push_where(&mut qb, f);
 
@@ -274,7 +308,7 @@ fn order_by(f: &ProgrammingFilters) -> (&'static str, &'static str) {
 
 /// `list` 的行结构（`FromRow`，手写而非 `query_as!` —— SQL 动态拼装）。
 ///
-/// 字段与 `vo::ProgrammingItemOut` 一一对应（13 字段）。
+/// 字段与 `vo::ProgrammingItemOut` 一一对应（15 字段）。
 #[derive(Debug, Clone, FromRow)]
 pub struct ProgrammingRow {
     pub id: i64,
@@ -291,4 +325,9 @@ pub struct ProgrammingRow {
     pub customer_name: Option<String>,
     pub parent_customer_name: Option<String>,
     pub has_cnc_program: bool,
+    /// 2026-10-03 新增：PROGRAMMING 活跃批次 id（[`PROGRAMMING_BATCH_JOIN`] 投影，
+    /// alias 必须同名）；无该状态批次 → `None`。
+    pub batch_id: Option<i64>,
+    /// 2026-10-03 新增：同 `batch_id` 批次的 `t_part_batch.version`（批次 OCC）。
+    pub batch_version: Option<i32>,
 }

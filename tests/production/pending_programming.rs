@@ -23,6 +23,12 @@
 //!  13. 空串分页（E 项）：`?limit=&offset=`（含全空白）走缺省 50/0，不 400
 //!  14. keyword 通配符转义（G 项）：`%` / `_` 按字面量匹配，不做通配全扫
 //!
+//! 2026-10-03 新增 2 个场景（批次锚点出参）：
+//!  15. `batch_id` / `batch_version`：有 PROGRAMMING 批次 → 雪花 id（JSON string）+
+//!      与库里 `t_part_batch.version` 一致；多个取 id 最大者；无 → 两字段都 null
+//!  16. 批次锚点只认 PROGRAMMING：批次状态是 PENDING / IN_PROCESS / READY_TO_SHIP
+//!      时 `batch_id` 恒 null（否则前端会拼出必然 20103 的写请求）
+//!
 //! ## 串行化
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
 //! 完全独立，无需 Mutex / `--test-threads=1` 双保险。每个测试内部造自己的
@@ -174,6 +180,21 @@ async fn insert_part(
 
 /// 插一个 `t_part_batch` 行（`current_process_id` 是批次工序归属唯一权威依据）。
 async fn insert_batch(pool: &PgPool, part_id: i64, status: &str, current_process_id: i64) -> i64 {
+    insert_batch_versioned(pool, part_id, status, Some(current_process_id), 0).await
+}
+
+/// 2026-10-03 新增：`insert_batch` 的可指定 `version` / 可空 `current_process_id` 版本。
+///
+/// 批次 OCC 断言（`batch_version` 必须等于 `t_part_batch.version`）需要非 0 的
+/// version，否则「返回 0」和「没取到值而兜底成 0」无法区分；`current_process_id`
+/// 可空是为了造「还没进工序」的 PROGRAMMING 批次。
+async fn insert_batch_versioned(
+    pool: &PgPool,
+    part_id: i64,
+    status: &str,
+    current_process_id: Option<i64>,
+    version: i32,
+) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
     let id = pool_snowflake()
@@ -181,20 +202,35 @@ async fn insert_batch(pool: &PgPool, part_id: i64, status: &str, current_process
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
     let now = now_naive();
+    // `batch_no` 取该 part 的下一个序号（`uq_t_part_batch_part_no` 是
+    // `(part_id, batch_no)` 唯一约束）—— 2026-10-03 起部分用例要给同一 part 插
+    // 多个批次，原先写死的 1 会撞唯一约束。首个批次仍得 1，既有断言不受影响。
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
          current_process_id, version, created_at, updated_at) \
-         VALUES ($1, $2, 1, 1, $3, 'PRODUCTION_SHELF', $4, 0, $5, $5)",
+         SELECT $1, $2, COALESCE(MAX(batch_no), 0) + 1, 1, $3, 'PRODUCTION_SHELF', $4, $5, $6, $6 \
+         FROM t_part_batch WHERE part_id = $2",
     )
     .bind(id)
     .bind(part_id)
     .bind(status)
     .bind(current_process_id)
+    .bind(version)
     .bind(now)
     .execute(pool)
     .await
     .expect("insert t_part_batch");
     id
+}
+
+/// 回读某批次在库里的 `version`（断言「出参 batch_version == 库里的真值」用）。
+async fn batch_version_in_db(pool: &PgPool, batch_id: i64) -> i32 {
+    let (v,): (i32,) = sqlx::query_as("SELECT version FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("select t_part_batch.version id={batch_id}: {e}"));
+    v
 }
 
 /// 给工单挂一个 `kind='G_CODE'` 文件（`has_cnc_program` 真相源）。
@@ -1316,4 +1352,137 @@ async fn keyword_escapes_like_wildcards() {
         ]),
         "keyword=50（无通配符）应命中全部 3 件: {loose}"
     );
+}
+
+/// 场景 15（2026-10-03 新增）: `batch_id` / `batch_version` —— PROGRAMMING 活跃批次锚点。
+///
+/// 覆盖三条：
+/// 1. **有** PROGRAMMING 批次 → `batch_id` 是 JSON string 形态的雪花 id、
+///    `batch_version` 与库里 `t_part_batch.version` 一致；
+/// 2. **无** PROGRAMMING 批次（只有 PENDING / IN_PROCESS 批次）→ `batch_id` /
+///    `batch_version` 都是 `null`（前端据此禁用「下发」按钮）；
+/// 3. 多个 PROGRAMMING 批次 → 取 `id` 最大的一个（最新）。
+///
+/// `batch_version` 刻意用非 0 值（默认插 0 的话，「取到真值」与「取不到而兜底 0」
+/// 无法区分）。
+#[tokio::test]
+async fn batch_anchor_points_to_active_programming_batch() {
+    let (pool, app, token, _fx, cfx) = bootstrap().await;
+    let today = hsh_erp_rust::infra::clock::now_naive().date();
+
+    // ① 有 PROGRAMMING 批次（version=7）+ 一个更早的 PROGRAMMING 批次（version=3）
+    let with_prog = insert_part(
+        &pool,
+        cfx.l2_customer_id,
+        "PG-BA-1",
+        "有编程批次件",
+        "D-BA-1",
+        "PROGRAMMING",
+        today,
+        None,
+    )
+    .await;
+    insert_batch_versioned(&pool, with_prog, "PROGRAMMING", None, 3).await;
+    let newest_batch = insert_batch_versioned(&pool, with_prog, "PROGRAMMING", None, 7).await;
+    assert_eq!(
+        batch_version_in_db(&pool, newest_batch).await,
+        7,
+        "前提：库里的批次 version 确实是 7"
+    );
+
+    // ② 无 PROGRAMMING 批次：只有 IN_PROCESS 批次。part 状态走 `PROGRAMMING`（规则1）
+    // 保证它一定在列表里 —— 本用例要验的是「在列表但没有 PROGRAMMING 批次」，
+    // 若 part 也是 IN_PROCESS 且链/批次都不含 CNC，三条规则都不命中，行根本不上榜。
+    let no_prog = insert_part(
+        &pool,
+        cfx.l2_customer_id,
+        "PG-BA-2",
+        "无编程批次件",
+        "D-BA-2",
+        "PROGRAMMING",
+        today,
+        None,
+    )
+    .await;
+    let plain = seed_process(&pool, "PG-BA-PLAIN", "普通工序 BA", false).await;
+    insert_batch_versioned(&pool, no_prog, "IN_PROCESS", Some(plain), 5).await;
+
+    let env = get_pending(&app, &token, "").await;
+    assert_eq!(
+        sorted(item_ids(&env)),
+        sorted(vec![with_prog.to_string(), no_prog.to_string()]),
+        "两件都该在列表里: {env}"
+    );
+
+    // ① 多个 PROGRAMMING 批次 → 取 id 最大者；batch_id 是 string 形态雪花 id
+    let item = item_by_id(&env, with_prog);
+    assert_eq!(
+        item["batch_id"].as_str(),
+        Some(newest_batch.to_string().as_str()),
+        "多个 PROGRAMMING 批次必须取 id 最大的（最新）那个: {env}"
+    );
+    assert_eq!(
+        item["batch_version"], 7,
+        "batch_version 必须等于库里 t_part_batch.version（不是 part 级 version）: {env}"
+    );
+    assert_eq!(
+        item["version"], 0,
+        "part 级 version 仍原样返回（与 batch_version 严格区分）: {env}"
+    );
+
+    // ② 无 PROGRAMMING 批次 → 两字段都 null
+    let item = item_by_id(&env, no_prog);
+    assert!(
+        item["batch_id"].is_null(),
+        "无 PROGRAMMING 批次时 batch_id 应为 null（前端据此禁用下发按钮）: {env}"
+    );
+    assert!(
+        item["batch_version"].is_null(),
+        "无 PROGRAMMING 批次时 batch_version 应与 batch_id 同为 null: {env}"
+    );
+}
+
+/// 场景 16（2026-10-03 新增）: `batch_id` 口径只认 PROGRAMMING，别的状态批次一律不给。
+///
+/// 单独钉住「不误给」这一侧：`release_from_programming` 硬要求源状态是 PROGRAMMING
+/// （否则 20103），若列表把 PENDING / IN_PROCESS / READY_TO_SHIP 批次的 id 也当作
+/// 锚点给出去，前端就会拼出一个必然失败的写请求。
+#[tokio::test]
+async fn batch_anchor_ignores_non_programming_batch_status() {
+    let (pool, app, token, _fx, cfx) = bootstrap().await;
+    let today = hsh_erp_rust::infra::clock::now_naive().date();
+    let cnc = seed_process(&pool, "PG-BA-CNC", "CNC 工序 BA", true).await;
+
+    // 三种「存在批次但都不是 PROGRAMMING」的形态，part 状态走规则1 保证一定上榜
+    // （`t_part.serial_no` 是 varchar(15)，故 serial_no 用序号而非状态名拼）
+    let statuses = ["PENDING", "IN_PROCESS", "READY_TO_SHIP"];
+    let mut parts = Vec::new();
+    for (i, st) in statuses.iter().enumerate() {
+        let pid = insert_part(
+            &pool,
+            cfx.l2_customer_id,
+            &format!("PG-BA-NP-{i}"),
+            "非编程状态批次件",
+            "D-BA-NP",
+            "PROGRAMMING",
+            today,
+            None,
+        )
+        .await;
+        insert_batch_versioned(&pool, pid, st, Some(cnc), 9).await;
+        parts.push(pid);
+    }
+
+    let env = get_pending(&app, &token, "").await;
+    for pid in parts {
+        let item = item_by_id(&env, pid);
+        assert!(
+            item["batch_id"].is_null(),
+            "批次状态非 PROGRAMMING 时不该给 batch_id: {env}"
+        );
+        assert!(
+            item["batch_version"].is_null(),
+            "批次状态非 PROGRAMMING 时不该给 batch_version: {env}"
+        );
+    }
 }
