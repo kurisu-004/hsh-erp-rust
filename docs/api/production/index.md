@@ -1,6 +1,10 @@
 # production 域 API — 生产管理
 
-> 本目录须与 `src/modules/prod/{work_type,process,process_chain,worker_pool,worker,batch,programming,shelf_process}/{handler.rs,dto.rs,service.rs}` 保持同步
+> 本目录须与 `src/modules/prod/*` 保持同步（2026-10-03 订正：各模块文件形态不一致，不适用统一通配）：
+> - 扁平三件套 `{handler.rs,dto.rs,service.rs}`：`work_type` / `process` / `worker_pool` / `worker` / `programming` / `shelf_process`
+> - `process_chain`：`{handler.rs,dto.rs}` + `service/` `repo/` `vo/` 目录
+> - `batch`：`{dto.rs,vo.rs,mod.rs,model.rs,status_gate.rs}` + `handler/` `service/` `repo/` 目录（见 [`./batches.md`](./batches.md)）
+>
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
 > 范围：**生产管理**菜单（前端 `production_group` 一级 + `process_work_type` / `part_process_chain` / `worker_queue` 三个子菜单）下挂的全部后端域。本目录按前端菜单 + 工人档案 + 待下发批次拆分 **9 个子页 + 1 个入口**（⚠️ 2026-10-02 订正：原写「7 个文件」，实为 9 个子页）。

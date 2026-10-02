@@ -1,6 +1,6 @@
 # prod::batch 域 API —— 车间下发 + `t_part_batch` 生产流转
 
-> 本文件须与 `src/modules/prod/batch/{handler.rs,dto.rs,service.rs,repo.rs,vo.rs}` 保持同步
+> 本文件须与 `src/modules/prod/batch/{handler/,service/,repo/,dto.rs,vo.rs,mod.rs,model.rs,status_gate.rs}` 保持同步（2026-10-03 订正：`handler` / `service` / `repo` 为目录制，与 [`../parts/inspection.md`](../parts/inspection.md) 实现位置段同一口径。）
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
 > **范围一 —— 车间下发**（PENDING 批次专用域）：UI「待下发队列」展示 + 一键 / 批量 / 自动预览 3 路径。
@@ -361,7 +361,7 @@ Response 200 `data`：[`AutoDispatchResult`](#autodispatchresult-字段)
     find_batch_by_id / find_first_shelf_for_process / update_batch_dispatched /
     first_step_of_chain + part_get_process_chain_id）
   - 3 个新错误码（20120 / 20121 / 20508）注册到 status_from_code + 测试
-  - in-source 单测：`src/modules/prod/batch/service.rs::tests` —— list_pending /
+  - in-source 单测：`src/modules/prod/batch/service/dispatch.rs::tests` —— list_pending /
     dispatch_batch 成功路径 + 二次 dispatch 40903 / 不存在 batch_id 40404 /
     并发冲突 40901 / t_shelf_process 多结果取 LIMIT 1 / Inspector 角色 40300 /
     bulk_dispatch 全回滚 + 空 targets 422 / auto_dispatch 无 chain / 无 step /
@@ -369,7 +369,7 @@ Response 200 `data`：[`AutoDispatchResult`](#autodispatchresult-字段)
 
 ## 参考
 
-- 模块 README：见 `src/modules/prod/batch/{mod,handler,service,repo,vo,dto}.rs`
+- 模块 README：见 `src/modules/prod/batch/{mod.rs,model.rs,status_gate.rs,dto.rs,vo.rs,handler/,service/,repo/}`
 - 错误码：`src/shared/error.rs::code`
 - 前端模块文档：`frontend/docs/03-modules/production/README.md`
 - 前端视图目录：`frontend/src/views/production/`

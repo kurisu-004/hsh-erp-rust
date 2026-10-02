@@ -541,7 +541,7 @@ Response 200 `data`：`InspectionBatchListOut`
 | `batch_no` | string? | 批次号 |
 | `quantity` | i32 | 批次数量 |
 | `status` | string | 批次状态枚举字符串（本端点固定为 `INSPECTION`） |
-| `is_repairing` | bool | 是否处于返修中（**2026-10-01 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006），非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，起修时 `status` 保持 `IN_PROCESS`（DB 不再产生 `REPAIRING` 字面量）；本字段与 `status` **正交**（起修后送检可得 `INSPECTION` + `is_repairing = true`，可达链见下方订正段）—— **「是否返修中」只能读本字段**。`/prod/batches/repairing` 的判据即 `is_repairing = true`。语义与 Rust 侧 `src/modules/part/vo/inspection.rs` 一致 |
+| `is_repairing` | bool | 是否处于返修中（**2026-10-01 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006），非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，起修时 `status` 保持 `IN_PROCESS`（DB 不再产生 `REPAIRING` 字面量）；本字段与 `status` **正交**（起修后送检可得 `INSPECTION` + `is_repairing = true`，可达链见下方订正段）—— **「是否返修中」只能读本字段**。`/prod/batches/repairing` 的判据即 `is_repairing = true`。语义与 Rust 侧 `src/modules/prod/batch/vo.rs` 一致 |
 | `location` | string? | 批次所在位置（`INSPECTION_SHELF` 等） |
 | `version` | i32 | 乐观锁（`t_part_batch.version`，caller OCC 锚点） |
 | `current_process_step_id` | string (i64)? | 逻辑 FK → `t_process_chain_step.id`（PR-3 批次 step 化 2026-09-16 新增，替代 next_process_id 列） |
@@ -658,11 +658,12 @@ delivery_note 解析段（LEFT JOIN `t_delivery_note` 一次拼齐）：
 
 实现位置：
 
-- handler：`src/modules/prod/batch/handler/`（`list_inspection_batches` → `InspectionBatchListOut`）
-- service：`src/modules/prod/batch/service/`（`PartService::list_inspection_batches`：状态过滤 + 范围展开 + clamp + ILIKE 校验）
-- dto：`src/modules/prod/batch/dto.rs`（`InspectionBatchListQuery` / `InspectionBatchListItemOut` / `InspectionBatchListOut`）
-- repo：`src/modules/prod/batch/repo_list.rs`（`PartBatchRepo::list_batches_with_part` / `count_batches_with_part`，单 SQL JOIN 8 表：t_part_batch + t_part + t_worker + t_shelf + t_process + t_delivery_note + t_customer + L1 customer）
-- model：`src/modules/prod/batch/model.rs`（`InspectionBatchListRow` + `From<Row> for InspectionBatchListItemOut` impl）
+- handler：`src/modules/prod/batch/handler/transition.rs`（`list_inspection_batches` → `InspectionBatchListOut`）
+- service：`src/modules/prod/batch/service/list.rs`（`BatchService::list_inspection_batches`：状态过滤 + 范围展开 + clamp + ILIKE 校验）
+- dto：`src/modules/prod/batch/dto.rs`（`InspectionBatchListQuery`）
+- vo：`src/modules/prod/batch/vo.rs`（`InspectionBatchListItemOut` / `InspectionBatchListOut` + `From<Row> for InspectionBatchListItemOut` impl）
+- repo：`src/modules/prod/batch/repo/list.rs`（`PartBatchRepo::list_batches_with_part` / `count_batches_with_part`，单 SQL JOIN 8 表：t_part_batch + t_part + t_worker + t_shelf + t_process + t_delivery_note + t_customer + L1 customer）
+- model：`src/modules/prod/batch/model.rs`（`InspectionBatchListRow`）
 
 ---
 
