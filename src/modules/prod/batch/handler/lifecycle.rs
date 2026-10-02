@@ -343,6 +343,10 @@ pub async fn pick_up(
     Json(req): Json<PickUpRequest>,
 ) -> Result<Json<R<PartOut>>, AppError> {
     let mut tx = state.pool.begin().await?;
+    // 2026-10-02 修正：原填 `out.id`，而 `out: PartOut` 的 `id` 是 part id，
+    // 与 `worker_id` 字段名不符。取值改回请求携带的 `req.worker_id`
+    // （在 `req` 被 service 消费前先取出）。消费方只读 `kind`，payload 修正
+    // 对现有前端无影响。
     let worker_id = req.worker_id;
     let out = PartService::pick_up(&mut *tx, &state.snowflake, batch_id, req, &current).await?;
     tx.commit().await?;
