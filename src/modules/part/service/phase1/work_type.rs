@@ -264,8 +264,8 @@ impl PartService {
         //
         // 2026-10-02 修：JOIN 条件补 `wtp.deleted_at IS NULL` —— 工种↔工序映射走
         // 「整组替换」（软删旧行 + 插新行），不过滤则已取消勾选的工序仍会把批次
-        // 匹配进本工种的可领取列表。下方 COUNT 用**同一谓词**，否则 `total` 与
-        // `items` 对不上。
+        // 匹配进本工种的可领取列表。下方 COUNT 同步用**同一 `wtp` 谓词**，否则
+        // `total` 与 `items` 对不上（两处的 `t_part` 侧不对称见 COUNT 处注释）。
         let rows: Vec<(i64, String, String, i32, Option<i64>)> = sqlx::query_as(
             "SELECT p.id, p.serial_no, p.drawing_no, b.quantity, b.current_process_id \
              FROM t_part_batch b \
@@ -323,7 +323,11 @@ impl PartService {
             })
             .collect();
         let total: i64 = sqlx::query_scalar(
-            // 与上面的取行查询同 WHERE（含 `wtp.deleted_at IS NULL`，见上方注释）
+            // 2026-10-02 订正：与取行查询同 `wtp` 谓词（含 `wtp.deleted_at IS NULL`），
+            // 但**不等于同 WHERE** —— 取行查询额外 `JOIN t_part p` 且带
+            // `p.deleted_at IS NULL`，本 COUNT 不 join `t_part`。故软删 part 的 active
+            // batch 会计入 `total` 而不计入 `items`，软删 part 下该工种的可领批次分页
+            // 总数偏大。是否补 join 属 `total` 语义决策，未在本处改动。
             "SELECT COUNT(*)::bigint FROM t_part_batch b \
              JOIN t_work_type_process wtp ON wtp.process_id = b.current_process_id \
                 AND wtp.deleted_at IS NULL \

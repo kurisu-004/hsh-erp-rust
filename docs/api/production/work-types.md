@@ -178,4 +178,4 @@ Response 200 `data`：`null`
    当前阶段无 unique constraint，仅在 service 层校验 `≥1`。
 2. 软删引用计数（`count_work_type_references`）单条 `UNION ALL` 查
    `t_worker.work_type_id`（活跃行）+ `t_work_type_process.work_type_id`（junction 分支
-   **不过滤** `deleted_at`：引用计数要算历史，否则整组替换软删掉的映射行会让该工种永远删不掉）；任一分支 > 0 ⇒ 20903 拒。**该 SQL 在 work_types 域的 soft-delete 端点执行**；mapping 端的整组替换语义见 [`./work-type-process-mapping.md`](./work-type-process-mapping.md)。
+   **不过滤** `deleted_at`：引用计数要算历史，否则用户把映射清空到空后该工种再也删不掉（整组替换后 items 非空必有 active 行可计数，照样拒））；任一分支 > 0 ⇒ 20903 拒。**该 SQL 在 work_types 域的 soft-delete 端点执行**；mapping 端的整组替换语义见 [`./work-type-process-mapping.md`](./work-type-process-mapping.md)。

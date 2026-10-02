@@ -30,7 +30,7 @@ worker-scan 校验依赖）。**整组替换 = 软删旧行 + 插新行**（`set
   worker-pool / 工种可领批次查询）都只返回 active 行
 - **业务软删检测**：删除工种时（见 [work-types.md](./work-types.md) `POST /work-types/{id}/soft-delete`），
   service 用 `count_work_type_references` 查 `t_work_type_process.work_type_id` 任一 > 0 ⇒ 20903 拒。
-  该计数**不过滤** `deleted_at`（要算历史，否则整组替换后工种再也删不掉，理由见「维护约定」第 3 条）
+  该计数**不过滤** `deleted_at`（要算历史，否则用户把映射清空到空后工种再也删不掉；整组替换后 items 非空必有 active 行可计数，理由见「维护约定」第 3 条）
 - **`process_ids` 出参**：工种 list / detail 接口会通过 `WorkTypeProcessRepo::list_by_work_types_batch`
   单条 SQL 批量补全 `WorkTypeOut.process_ids`（防 N+1）
 
@@ -126,7 +126,8 @@ Response 200 `data`：`null`
    `bulk_insert`。空 `items` = 清空全部 mapping（仍走事务）。
 3. 软删引用计数（`count_work_type_references`）单条 `UNION ALL` 查
    `t_worker.work_type_id`（活跃行）+ `t_work_type_process.work_type_id`；
-   **junction 分支不过滤 `deleted_at`** —— 引用计数要算历史，否则整组替换软删掉的
-   映射行会让该工种永远删不掉（与 `ProcessRepo::count_process_references` 的 junction
-   处理一致）。任一分支 > 0 ⇒ 20903 拒（**该逻辑在 work_types 域 soft-delete 端点，
+   **junction 分支不过滤 `deleted_at`** —— 引用计数要算历史，否则用户把映射清空到空后该工种
+   再也删不掉（整组替换后 items 非空必有 ≥1 条 active 行可计数，照样拒；与
+   `ProcessRepo::count_process_references` 的 junction 处理一致）。任一分支 > 0 ⇒ 20903 拒
+   （**该逻辑在 work_types 域 soft-delete 端点，
    详见 [`./work-types.md`](./work-types.md#post-apiv2work-typesidsoft-delete)**）。

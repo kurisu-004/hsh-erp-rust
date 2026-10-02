@@ -279,9 +279,10 @@ impl WorkTypeRepo {
     ///
     /// 任一分支 > 0 ⇒ 20903 `BIZ_WORK_TYPE_IN_USE`。
     ///
-    /// 注：`t_work_type_process` 子查询**不过滤** `deleted_at` —— 引用计数要算历史，
-    /// 否则「整组替换后映射已软删」的历史行会让工种永远删不掉（与
-    /// `ProcessRepo::count_process_references` 的 junction 处理一致）。
+    /// 注：`t_work_type_process` 子查询**不过滤** `deleted_at` —— 引用计数要算历史。
+    /// 整组替换只软删旧行、随即插新行，所以替换后 items 非空必有 ≥1 条 active 行可计数，
+    /// 照样拒；唯一被绕过的情形是用户把映射清空到空。故不过滤守的是「清空一次即删工种」
+    /// 这道防线（与 `ProcessRepo::count_process_references` 的 junction 处理一致）。
     pub async fn count_work_type_references<'e, E: PgExecutor<'e>>(
         executor: E,
         work_type_id: i64,
