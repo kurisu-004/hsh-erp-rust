@@ -130,8 +130,12 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段)。
 > `is_repairing` 置 `true`（`status` 保持 `IN_PROCESS`）。
 >
 > - 重复起修（`is_repairing` 已为 `true`）→ 20118 `BIZ_PART_REPAIR_NOT_TRIGGERED`。
-> - `t_part.status` 恒为 `IN_PROCESS`（返修仍在生产中，progress 与原 REPAIRING
->   同档 2），**不再出现 `'REPAIRING'`**。
+> - 起修**不翻转 status**：`t_part_batch.status` 保持 `IN_PROCESS`（progress 与原
+>   REPAIRING 同档 2）；派生列 `t_part.status` 按 min-progress 取活跃批次里最慢的
+>   那条（`compute_part_target`，见 `src/modules/part/statemachine.rs`），故
+>   **不再出现 `'REPAIRING'`**，但**不保证恒为** `IN_PROCESS`（同 part 下存在更慢的
+>   活跃批次时取那条）。**2026-10-02 review 第 2 轮订正**：原文「`t_part.status`
+>   恒为 `IN_PROCESS`」的「恒为」不成立。
 >
 > 2026-09-16 PR-2（migration 027）：`has_been_repaired` 列已从 `t_part` 与
 > `t_part_batch` 双删 —— 拆批后无法确定是哪一个批次返修，列语义失真整体废弃。
@@ -363,8 +367,14 @@ Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 > 2026-09-22 起 P3 list（与 `repair-batches` 同形状，区别：判据不同）。
 >
 > **2026-10-01 BREAKING CHANGE**：判据由 `status = 'REPAIRING'` 改为
-> **`t_part_batch.is_repairing = true`**。返回项的 `status` 字段恒为
-> `IN_PROCESS`（REPAIRING 已不是任何列会取到的值）。
+> **`t_part_batch.is_repairing = true`**。判据**不含 status**（SQL 只额外排除
+> `COMPLETED` / `CANCELLED`）⇒ 返回项的 `status` **不固定**：起修时为
+> `IN_PROCESS`，但起修后送检 / 送检通过 / 发货三步都**只保持标记**、不改判据，
+> 故本端点也可能返回 `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` 的返修件。
+> **2026-10-02 review 第 2 轮订正**：原文「返回项的 `status` 字段恒为
+> `IN_PROCESS`」**不成立** —— 「DB 不再产生 `REPAIRING` 字面量」≠「`status` 恒为
+> `IN_PROCESS`」；判「返修中」一律读 `is_repairing`，可达链（起修后送检 /
+> 送检通过 / 发货的保持标记链）见 [`./inspection.md`](./inspection.md) 订正段。
 >
 > 2026-10-01 review 第 1 轮 M5 补齐：返修标记已随
 > `BatchOut`（= `InspectionBatchListItemOut`）的**新字段 `is_repairing: bool`**

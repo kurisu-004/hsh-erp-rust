@@ -250,11 +250,16 @@
 | `DELIVERED` | 6 | 已交付 |
 | `COMPLETED` / `CANCELLED` | 终态 | 终态（`part_status_progress` 不给终态定档，由 `compute_*_target` 单独短路处理） |
 
-**返修不再是状态**（2026-10-01 BREAKING CHANGE，migration 005/006）：批次返修中时
-`status` 保持 `IN_PROCESS`（progress 同档 2），返修事实改由
-**`t_part_batch.is_repairing`（boolean，默认 false）** 承载。所有「返修中」的查询 /
-守卫一律读该列，不再判 `status = 'REPAIRING'`（DB 里不再产生该字面量；
+**返修不再是状态**（2026-10-01 BREAKING CHANGE，migration 005/006）：**起修**
+（`start-repair`）只把 `status` 保持 `IN_PROCESS` 不翻转（progress 同档 2），返修
+事实改由 **`t_part_batch.is_repairing`（boolean，默认 false）** 承载。所有「返修中」
+的查询 / 守卫一律读该列，不再判 `status = 'REPAIRING'`（DB 里不再产生该字面量；
 `PartStatus::from_str("REPAIRING")` 保留 → `IN_PROCESS` 的过渡兼容分支）。
+**2026-10-02 review 第 2 轮订正**：原文「批次返修中时 `status` 保持 `IN_PROCESS`」
+字面读成了「返修中 ⇒ `IN_PROCESS`」的不变式，**不成立** —— 标记与 `status`
+**正交**：起修后送检 / 送检通过 / 发货都只保持标记，故返修件的 `status` 也可能是
+`INSPECTION` / `READY_TO_SHIP` / `DELIVERED`（可达链见
+[`./inspection.md`](./inspection.md) 订正段）。
 
 ### 三层单向派生 + 单一写入口
 
