@@ -518,6 +518,7 @@ Response 200 `data`：`InspectionBatchListOut`
 | `batch_no` | string? | 批次号 |
 | `quantity` | i32 | 批次数量 |
 | `status` | string | 批次状态枚举字符串（本端点固定为 `INSPECTION`） |
+| `is_repairing` | bool | 是否处于返修中（**2026-10-01 review 第 1 轮 M5 新增**，BREAKING）。直读 `t_part_batch.is_repairing` 标记列（migration 005/006），非 `Option`、无 `skip_serializing_if` ⇒ 恒定返回。`REPAIRING` 已从 `PartStatus` 降级，故返修中的批次 `status` 恒为 `IN_PROCESS`（`repair-batches` 恒 `IN_PROCESS`、`inspection-batches` 恒 `INSPECTION`）—— **「是否返修中」只能读本字段**，靠 `status` 无法区分。语义与 Rust 侧 `src/modules/part/vo/inspection.rs` 一致 |
 | `location` | string? | 批次所在位置（`INSPECTION_SHELF` 等） |
 | `version` | i32 | 乐观锁（`t_part_batch.version`，caller OCC 锚点） |
 | `current_process_step_id` | string (i64)? | 逻辑 FK → `t_process_chain_step.id`（PR-3 批次 step 化 2026-09-16 新增，替代 next_process_id 列） |
@@ -552,11 +553,30 @@ Response 200 `data`：`InspectionBatchListOut`
 > **2026-10-01**：返修事实改由 `t_part_batch.is_repairing` 标记列 +
 > `t_part_event.event_type='REPAIR_STARTED'` 事件日志共同追溯（详见
 > [`../../api/parts/lifecycle.md`](../../api/parts/lifecycle.md) § start-repair）。
-> 本 VO 的 3 个共用端点（`inspection-batches` / `repair-batches` /
-> `repairing-batches`）**都不新增** `is_repairing` 字段 —— 前端从
-> `status` + 端点语义即可判断（返修中批次的 `status` 是 `IN_PROCESS`）；
-> 若前端需要区分「返修中」，走 `GET /api/v2/parts/repairing-batches`
-> （判据即 `is_repairing = true`）。
+>
+> **2026-10-02 订正 —— 上一段「都不新增 `is_repairing` 字段」的结论是错的**，
+> 已由 2026-10-01 review 第 1 轮 M5 推翻（与
+> [`./lifecycle.md` § GET /api/v2/parts/repairing-batches](./lifecycle.md#get-apiv2partsrepairing-batches)
+> 的记载矛盾）。**订正后的事实**：`is_repairing: bool` **已随本 VO 的 3 个共用端点
+> （`inspection-batches` / `repair-batches` / `repairing-batches`）一起返回**，
+> 见上方批次字段表。
+>
+> **为什么必须有这个字段**（原结论的推理漏洞，留档以免回潮）：
+> - `REPAIRING` 降级为标记列后，返修中批次的 `status` **恒为 `IN_PROCESS`**
+>   （DB 不再产生 `REPAIRING` 字面量）⇒ 前端的老判据
+>   `status === 'REPAIRING'` 在**任何**端点都取不到值。
+> - 「前端从 `status` + 端点语义即可判断」不成立：`IN_PROCESS` 是全仓最常见的
+>   生产中状态，`inspection-batches` / `repair-batches` 返回的行里返修件与普通
+>   在制品**混在一起**，端点语义（该端点在查什么）不能推出每一行是否返修中。
+> - 「要区分就只调 `GET /api/v2/parts/repairing-batches`」也不是答案：该端点只
+>   返回 `is_repairing = true` 的批次，覆盖不了「同一个列表里既有返修件又有
+>   普通在制品」的展示场景，而后者才是队列类页面的常态。
+>
+> 字段形态：`bool`（**非** `Option`、**无** `#[serde(default)]`、**无**
+> `skip_serializing_if`）⇒ **恒定出现在 JSON 里**，前端 Zod schema 必须按必填
+> `boolean` 声明，不能 `.optional()`。同批新增的另一个 VO `PartBatchListItemOut`
+> （`GET /api/v2/parts/{id}/batches`）同样有 `is_repairing: bool`，见
+> [`./batch.md`](./batch.md)。
 
 holder 解析段（LEFT JOIN `t_worker` / `t_shelf` 一次拼齐）：
 
