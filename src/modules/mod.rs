@@ -116,6 +116,8 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/outsource-companies", outsource::company_router())
         .nest("/outsource-quotes", outsource::quote_router())
         .nest("/outsource-shipments", outsource::shipment_router())
+        // 2026-10-03 新增：可发送外协一览（独立顶层前缀；非任何单一域的子资源）
+        .nest("/outsource-sendable", outsource::sendable_router())
         .nest("/delivery-notes", delivery_note::router())
         .nest("/delivery-groups", p1_router())
         .nest("/statistics", statistics::router())

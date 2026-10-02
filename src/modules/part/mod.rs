@@ -9,7 +9,7 @@
 //!
 //! 2026-10-02 批次路由迁出后，本域只留「多批次动作 + 非批次动作」：
 //! `/{part_id}/cancel`（BATCH-N：翻转该 part 全部活跃批次）、
-//! `/{part_id}/force-complete`（BATCH-N：全部非 CANCELLED 批次）、
+//! `/{part_id}/force-complete`（全部非 CANCELLED 批次）、
 //! `/{part_id}/soft-delete`、`GET /{part_id}/batches`（part 的批次集合读）、
 //! 全部 CRUD / 文件 / Excel 工具 / 各类 list 端点。
 //!
@@ -17,6 +17,14 @@
 //! `pick-up` / `split-batch` / `cancel-batch` / `worker-scan` / 3 条批次集合读 …）
 //! 已迁至 `crate::modules::prod::batch`，URL 改挂 `/api/v2/prod/batches/*`
 //! （原 `/api/v2/parts/{part_id}/…` 404，**无 alias**）。
+//!
+//! 2026-10-03 下线 2 条外协 list 端点：`/outsource-in-flight` /
+//! `/outsource-sendable` —— 二者返回的是通用 `PartListItem`，与前端外协域需要的
+//! 字段（批次级 version / quantity、外协公司、报价价、客户路径…）**形状不匹配**
+//! （前端两个 tab 因此空白 / 全灰）。取代者迁往 outsource 域：
+//! `GET /api/v2/outsource-shipments/in-flight` 与
+//! `GET /api/v2/outsource-sendable`。**硬切无 alias**，旧 URL 现为 404。
+
 pub mod dto_crud;
 pub mod handler;
 pub mod model;
@@ -57,11 +65,6 @@ pub fn router() -> Router<Arc<AppState>> {
             "/pending-programming",
             get(handler::list_pending_programming),
         )
-        .route(
-            "/outsource-in-flight",
-            get(handler::list_outsource_in_flight),
-        )
-        .route("/outsource-sendable", get(handler::list_outsource_sendable))
         .route("/location-tree", get(handler::get_location_tree))
         .route("/match-by-excel-items", post(handler::match_by_excel_items))
         .route(

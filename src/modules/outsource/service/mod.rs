@@ -1,11 +1,12 @@
 //! outsource service 层入口
 //!
 //! 按职责拆为：
-//! - `company` — 外协公司 CRUD + 工序映射（list / create / get / update / soft-delete /
+//! - `company`  — 外协公司 CRUD + 工序映射（list / create / get / update / soft-delete /
 //!   by-process / set-processes）
-//! - `quote`   — 报价 CRUD + 状态机（list / create / get / update / submit / approve /
-//!   reject / soft-delete）
-//! - `shipment`— 对账单更新（reconcile-update）
+//! - `quote`    — 报价 CRUD + 状态机（list / create / get / update / submit / approve /
+//!   reject / soft-delete）+ `quotable-parts` picker
+//! - `shipment` — 对账单更新（reconcile-update）+ 对账页 sent-parts + 在途 in-flight
+//! - `sendable` — `GET /outsource-sendable`（可发送外协一览，APPROVAL / DIRECT 双模式）
 //!
 //! 对外 API（`handler.rs` 调用面）保持原方法名（`OutsourceService::xxx`），handler 通过
 //! `crate::modules::outsource::service::OutsourceService` 引用。
@@ -18,6 +19,8 @@
 //! - 事务移交 handler：service 不知事务——handler `pool.begin()` + `tx.commit()` 包外。
 //! - `OutsourceService` 字段仅 `Arc<SnowflakeIdGenerator>`（无 Redis session / WS 等
 //!   post-commit 副作用需求；与 iam AccountService / com CustomerService 同形）。
+//!
+//! 2026-10-03 新增（读侧补齐）：4 个 list 端点上线上，见各子模块头注释。
 
 #![allow(
     clippy::collapsible_if,
@@ -38,10 +41,37 @@ use crate::shared::error::{AppError, code};
 
 mod company;
 mod quote;
+mod sendable;
 mod shipment;
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
+
+/// 2026-10-03 新增：4 个新 list 端点统一用 `clamp(1, 200)`（对齐 part 域旧
+/// `list_outsource_in_flight` / `list_outsource_sendable` 的分页上限）。
+const LIST_MAX_LIMIT: i64 = 200;
+
+/// 拼客户路径：有 L1 给 `L1 / L2`，L1 自指（无 parent）时只给 L2 名，两侧都缺
+/// 返回 `None`。
+///
+/// 2026-10-03 新增：此前 outsource 域全部 VO 的 `customer_path` 都是硬编码
+/// `None`（前端 4 个外协视图「客户」列恒 `—`）。范式抄
+/// `prod::worker_pool::repo::sql.rs`（`CandidateRow → PoolBatchItem`）。
+pub(crate) fn join_customer_path(l1: Option<&str>, l2: Option<&str>) -> Option<String> {
+    match (l1, l2) {
+        (Some(p), Some(l)) => Some(format!("{p} / {l}")),
+        (_, Some(l)) => Some(l.to_string()),
+        _ => None,
+    }
+}
+
+/// 把 keyword 归一化成 `ILIKE` 通配串；trim 后为空视为无过滤。
+pub(crate) fn keyword_pattern(keyword: Option<&str>) -> Option<String> {
+    keyword
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("%{s}%"))
+}
 
 fn not_found_company(id: i64) -> AppError {
     AppError::biz(

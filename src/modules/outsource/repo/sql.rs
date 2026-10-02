@@ -22,6 +22,9 @@ use super::super::model::{
     NewOutsourceShipment, TOutsourceCompany, TOutsourceCompanyProcess, TOutsourceQuote,
     TOutsourceQuoteEvent, TOutsourceShipment,
 };
+use super::{
+    OutsourceInFlightRow, OutsourceQuotableRow, OutsourceSendableRow, OutsourceSentPartRow,
+};
 
 // ===========================================================================
 // Company
@@ -762,8 +765,12 @@ impl OutsourceShipmentRepo {
         Ok(r.rows_affected())
     }
 
-    /// 对账页 list（行=shipment + 左联 part / process / company）
-    pub async fn count_reconciliation_for_company<'e, E: PgExecutor<'e>>(
+    /// 对账页 count（行=shipment，WHERE 与 `list_for_company` 逐条一致）。
+    ///
+    /// 2026-10-03：原名 `count_reconciliation_for_company`，是零调用方的孤儿
+    /// （前端子页从未落地）。`GET /outsource-companies/{id}/sent-parts` 补齐时
+    /// 收编为正式 count，改名 `count_for_company` 与 `list_for_company` 对齐。
+    pub async fn count_for_company<'e, E: PgExecutor<'e>>(
         executor: E,
         company_id: i64,
         part_ids_in: &[i64],
@@ -788,6 +795,372 @@ impl OutsourceShipmentRepo {
         .bind(sent_to)
         .bind(received_from)
         .bind(received_to)
+        .fetch_one(executor)
+        .await?;
+        Ok(n)
+    }
+
+    /// 2026-10-03 新增：对账页 list（行 = shipment，JOIN 补齐展示字段）。
+    ///
+    /// 展示字段（part 图号/名称/加急、客户路径、工序名、批次号）**一次 JOIN 拿完**，
+    /// service 层不再逐行回查（防 N+1）。
+    ///
+    /// `sort_by` / `sort_dir` 以**归一化后的白名单 token** 走 bind（`$7` / `$8`），
+    /// 用 CASE 表达式选列 —— 用户输入永远不进 SQL 文本。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_for_company<'e, E: PgExecutor<'e>>(
+        executor: E,
+        company_id: i64,
+        part_ids_in: &[i64],
+        sent_from: Option<chrono::NaiveDateTime>,
+        sent_to: Option<chrono::NaiveDateTime>,
+        received_from: Option<chrono::NaiveDateTime>,
+        received_to: Option<chrono::NaiveDateTime>,
+        sort_by: &str,
+        sort_dir: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceSentPartRow>, sqlx::Error> {
+        sqlx::query_as::<_, OutsourceSentPartRow>(
+            "SELECT s.id, s.version, s.quote_id, s.part_id, \
+                    p.drawing_no, p.name, p.is_urgent, \
+                    c.name AS customer_name, cp.name AS parent_customer_name, \
+                    s.process_id, pr.name AS process_name, \
+                    pb.batch_no, \
+                    s.quantity, s.unit_price::text, s.sent_at, s.received_at, \
+                    s.status, s.is_billed \
+             FROM t_outsource_shipment s \
+             LEFT JOIN t_part p ON p.id = s.part_id \
+             LEFT JOIN t_process pr ON pr.id = s.process_id \
+             LEFT JOIN t_part_batch pb ON pb.id = s.batch_id \
+             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
+             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
+             WHERE s.deleted_at IS NULL AND s.status IN ('OUTSOURCING', 'RECEIVED') \
+               AND s.outsource_company_id = $1 \
+               AND (cardinality($2::bigint[]) = 0 OR s.part_id = ANY($2)) \
+               AND ($3::timestamp IS NULL OR s.sent_at >= $3) \
+               AND ($4::timestamp IS NULL OR s.sent_at <= $4) \
+               AND ($5::timestamp IS NULL OR s.received_at >= $5) \
+               AND ($6::timestamp IS NULL OR s.received_at <= $6) \
+             ORDER BY \
+               CASE WHEN $7::text = 'PRICE' AND $8::text = 'ASC' THEN s.unit_price END ASC NULLS LAST, \
+               CASE WHEN $7::text = 'PRICE' AND $8::text <> 'ASC' THEN s.unit_price END DESC NULLS LAST, \
+               CASE WHEN $7::text = 'RECEIVED_AT' AND $8::text = 'ASC' THEN s.received_at END ASC NULLS LAST, \
+               CASE WHEN $7::text = 'RECEIVED_AT' AND $8::text <> 'ASC' THEN s.received_at END DESC NULLS LAST, \
+               CASE WHEN $7::text = 'SENT_AT' AND $8::text = 'ASC' THEN s.sent_at END ASC, \
+               CASE WHEN $7::text = 'SENT_AT' AND $8::text <> 'ASC' THEN s.sent_at END DESC, \
+               s.id DESC \
+             LIMIT $9 OFFSET $10",
+        )
+        .bind(company_id)
+        .bind(part_ids_in)
+        .bind(sent_from)
+        .bind(sent_to)
+        .bind(received_from)
+        .bind(received_to)
+        .bind(sort_by)
+        .bind(sort_dir)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(executor)
+        .await
+    }
+
+    /// 2026-10-03 新增：外协在途批次 list（`status='OUTSOURCING'`）。
+    ///
+    /// 驱动表是 `t_outsource_shipment`，但 INNER JOIN `t_part_batch` ⋈ `t_part` ——
+    /// 批次 / 零件已软删的行不再出现在在途列表（`version` / `quantity` 必须取自
+    /// 批次行，缺批次时该语义无从谈起）。
+    pub async fn list_in_flight<'e, E: PgExecutor<'e>>(
+        executor: E,
+        keyword_pat: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceInFlightRow>, sqlx::Error> {
+        sqlx::query_as::<_, OutsourceInFlightRow>(
+            "SELECT p.id, pb.id AS batch_id, pb.batch_no, pb.quantity, pb.version, \
+                    p.serial_no, p.drawing_no, p.name, p.is_urgent, \
+                    c.name AS customer_name, cp.name AS parent_customer_name, \
+                    s.process_id, pr.name AS process_name, \
+                    s.outsource_company_id, oc.name AS outsource_company_name, s.sent_at \
+             FROM t_outsource_shipment s \
+             JOIN t_part_batch pb ON pb.id = s.batch_id AND pb.deleted_at IS NULL \
+             JOIN t_part p ON p.id = s.part_id AND p.deleted_at IS NULL \
+             LEFT JOIN t_outsource_company oc ON oc.id = s.outsource_company_id AND oc.deleted_at IS NULL \
+             LEFT JOIN t_process pr ON pr.id = s.process_id AND pr.deleted_at IS NULL \
+             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
+             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
+             WHERE s.deleted_at IS NULL AND s.status = 'OUTSOURCING' \
+               AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1) \
+             ORDER BY s.sent_at DESC, pb.id DESC \
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(keyword_pat)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(executor)
+        .await
+    }
+
+    pub async fn count_in_flight<'e, E: PgExecutor<'e>>(
+        executor: E,
+        keyword_pat: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint \
+             FROM t_outsource_shipment s \
+             JOIN t_part_batch pb ON pb.id = s.batch_id AND pb.deleted_at IS NULL \
+             JOIN t_part p ON p.id = s.part_id AND p.deleted_at IS NULL \
+             WHERE s.deleted_at IS NULL AND s.status = 'OUTSOURCING' \
+               AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1)",
+        )
+        .bind(keyword_pat)
+        .fetch_one(executor)
+        .await?;
+        Ok(n)
+    }
+}
+
+// ===========================================================================
+// Quotable（报价 picker：可建报价的 零件 × OUTSOURCE 工序 组合）
+// ===========================================================================
+
+/// 2026-10-03 新增：`GET /outsource-quotes/quotable-parts` 的 SQL 真源。
+///
+/// ## 行粒度 = (part_id, process_id)
+/// 用 `DISTINCT ON (p.id, pr.id)` 去重（外层 `ORDER BY` 另算展示序）。
+/// 同一台零件有多个符合条件的活跃批次时，靠内层 `ORDER BY … pb.batch_no ASC`
+/// 选 batch_no 最小的那条做代表行。
+///
+/// ## 4 层筛选（缺一不可）
+/// 1. 活跃批次：PENDING，或 IN_PROCESS + PRODUCTION_SHELF；
+/// 2. 批次所在货架绑了 OUTSOURCE 工序（`t_shelf_process` ⋈ `t_process`）；
+/// 3. **该 OUTSOURCE 工序在该 part 的活跃工艺链里**（`t_process_chain_step`）
+///    —— 少了这条会给出工艺链上不存在的工序，后续 `send-to-outsource` 的
+///    `resolve_step_id_by_process` 会 404；
+/// 4. `t_part` 未软删。
+pub struct OutsourceQuotableRepo;
+
+impl OutsourceQuotableRepo {
+    pub async fn list<'e, E: PgExecutor<'e>>(
+        executor: E,
+        keyword_pat: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceQuotableRow>, sqlx::Error> {
+        sqlx::query_as::<_, OutsourceQuotableRow>(
+            "SELECT q.id, q.serial_no, q.drawing_no, q.name, q.is_urgent, q.unit_price, \
+                    q.customer_id, q.customer_name, q.parent_customer_name, \
+                    q.shelf_id, q.shelf_code, q.next_process_id, q.next_process_name \
+             FROM ( \
+               SELECT DISTINCT ON (p.id, pr.id) \
+                 p.id, p.serial_no, p.drawing_no, p.name, p.is_urgent, p.unit_price::text AS unit_price, \
+                 p.customer_id, c.name AS customer_name, cp.name AS parent_customer_name, \
+                 sh.id AS shelf_id, sh.code AS shelf_code, \
+                 pr.id AS next_process_id, pr.name AS next_process_name, \
+                 p.is_urgent AS order_is_urgent, p.planned_delivery_date AS order_planned_date, \
+                 pb.batch_no AS order_batch_no \
+               FROM t_part_batch pb \
+               JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
+               JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
+               JOIN t_shelf_process sp ON sp.shelf_id = sh.id AND sp.deleted_at IS NULL \
+               JOIN t_process pr ON pr.id = sp.process_id AND pr.deleted_at IS NULL \
+                 AND pr.category = 'OUTSOURCE' \
+               JOIN t_process_chain_step pcs ON pcs.chain_id = p.process_chain_id \
+                 AND pcs.process_id = pr.id AND pcs.deleted_at IS NULL \
+               LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
+               LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
+               WHERE pb.deleted_at IS NULL \
+                 AND (pb.status = 'PENDING' \
+                      OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF')) \
+               ORDER BY p.id, pr.id, pb.batch_no ASC \
+             ) q \
+             WHERE ($1::text IS NULL OR q.drawing_no ILIKE $1 OR q.name ILIKE $1) \
+             ORDER BY q.order_is_urgent DESC, q.order_planned_date ASC NULLS LAST, \
+                      q.id ASC, q.next_process_id ASC \
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(keyword_pat)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(executor)
+        .await
+    }
+
+    pub async fn count<'e, E: PgExecutor<'e>>(
+        executor: E,
+        keyword_pat: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        // 口径必须与 list 一致（含 DISTINCT ON 去重后的行粒度），否则分页 total 对不上。
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM ( \
+               SELECT DISTINCT p.id, pr.id \
+               FROM t_part_batch pb \
+               JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
+               JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
+               JOIN t_shelf_process sp ON sp.shelf_id = sh.id AND sp.deleted_at IS NULL \
+               JOIN t_process pr ON pr.id = sp.process_id AND pr.deleted_at IS NULL \
+                 AND pr.category = 'OUTSOURCE' \
+               JOIN t_process_chain_step pcs ON pcs.chain_id = p.process_chain_id \
+                 AND pcs.process_id = pr.id AND pcs.deleted_at IS NULL \
+               LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
+               WHERE pb.deleted_at IS NULL \
+                 AND (pb.status = 'PENDING' \
+                      OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF')) \
+                 AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1) \
+             ) d",
+        )
+        .bind(keyword_pat)
+        .fetch_one(executor)
+        .await?;
+        Ok(n)
+    }
+}
+
+// ===========================================================================
+// Sendable（可发送外协的 活跃批次 × OUTSOURCE 工序 组合）
+// ===========================================================================
+
+/// 2026-10-03 新增：`GET /outsource-sendable` 的 SQL 真源。
+///
+/// ## 行粒度 = (batch_id, next_process_id)
+/// 三层结构：
+/// 1. 内层：批次 ⋈ 零件 ⋈ 货架 ⋈ 货架工序 ⋈ OUTSOURCE 工序 ⋈ 工艺链 step，
+///    并 LEFT JOIN 该 (part, process) 的 APPROVED 报价；`company_options` 用
+///    标量子查询 `array_agg(json_build_object(...))` **一次拿完**（防 N+1）。
+/// 2. 中层 `DISTINCT ON (batch_id, next_process_id)`：**多个 APPROVED 报价时取
+///    `quote_id ASC NULLS LAST` 的第一条**。DB 有 partial unique
+///    `uq_t_outsource_quote_approved_part_process` 兜底（撞了 → 21303），但并发
+///    审批 / 历史数据仍可能出现多条；此时取最早批准的那条，语义上是「先批准的
+///    报价优先」且结果稳定（不会随查询计划变化）。
+/// 3. 外层：keyword / customer_id 过滤 + 展示序 + LIMIT/OFFSET。
+///
+/// **DIRECT 且 `company_options` 为空的行保留返回**（前端 `canSend()` 据
+/// `company_options.length >= 1` 置灰），count 口径同样保留。
+pub struct OutsourceSendableRepo;
+
+impl OutsourceSendableRepo {
+    pub async fn list<'e, E: PgExecutor<'e>>(
+        executor: E,
+        keyword_pat: Option<&str>,
+        customer_id: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceSendableRow>, sqlx::Error> {
+        sqlx::query_as::<_, OutsourceSendableRow>(
+            "SELECT d.batch_version, d.batch_id, d.batch_no, d.batch_quantity, d.source_status, \
+                    d.part_id, d.part_serial_no, d.part_drawing_no, d.part_name, \
+                    d.planned_delivery_date, d.is_urgent, \
+                    d.customer_name, d.parent_customer_name, \
+                    d.shelf_code, d.next_process_id, d.next_process_name, \
+                    d.quote_id, d.price, d.outsource_company_id, d.outsource_company_name, \
+                    d.company_options, d.customer_id \
+             FROM ( \
+               SELECT DISTINCT ON (x.batch_id, x.next_process_id) \
+                 x.batch_version, x.batch_id, x.batch_no, x.batch_quantity, x.source_status, \
+                 x.part_id, x.part_serial_no, x.part_drawing_no, x.part_name, \
+                 x.planned_delivery_date, x.is_urgent, \
+                 x.customer_name, x.parent_customer_name, x.customer_id, \
+                 x.shelf_code, x.next_process_id, x.next_process_name, \
+                 x.quote_id, x.price, x.outsource_company_id, x.outsource_company_name, \
+                 x.company_options \
+               FROM ( \
+                 SELECT pb.version AS batch_version, pb.id AS batch_id, pb.batch_no, \
+                        pb.quantity AS batch_quantity, pb.status AS source_status, \
+                        p.id AS part_id, p.serial_no AS part_serial_no, \
+                        p.drawing_no AS part_drawing_no, p.name AS part_name, \
+                        to_char(p.planned_delivery_date, 'YYYY-MM-DD') AS planned_delivery_date, \
+                        p.is_urgent, p.customer_id, \
+                        c.name AS customer_name, cp.name AS parent_customer_name, \
+                        sh.code AS shelf_code, \
+                        pr.id AS next_process_id, pr.name AS next_process_name, \
+                        q.id AS quote_id, q.price::text AS price, \
+                        q.outsource_company_id, oc.name AS outsource_company_name, \
+                        sp.id AS sp_id, pcs.id AS step_id, \
+                        CASE WHEN q.id IS NOT NULL THEN '[]'::jsonb ELSE COALESCE( \
+                          to_jsonb((SELECT array_agg( \
+                                    json_build_object('id', c2.id, 'name', c2.name) \
+                                    ORDER BY cp2.sort_order, c2.id) \
+                             FROM t_outsource_company_process cp2 \
+                             JOIN t_outsource_company c2 \
+                               ON c2.id = cp2.outsource_company_id \
+                              AND c2.is_active AND c2.deleted_at IS NULL \
+                             WHERE cp2.process_id = pr.id AND cp2.deleted_at IS NULL)), \
+                          '[]'::jsonb) END AS company_options \
+                 FROM t_part_batch pb \
+                 JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
+                 JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
+                 JOIN t_shelf_process sp ON sp.shelf_id = sh.id AND sp.deleted_at IS NULL \
+                 JOIN t_process pr ON pr.id = sp.process_id AND pr.deleted_at IS NULL \
+                   AND pr.category = 'OUTSOURCE' \
+                 JOIN t_process_chain_step pcs ON pcs.chain_id = p.process_chain_id \
+                   AND pcs.process_id = pr.id AND pcs.deleted_at IS NULL \
+                 LEFT JOIN t_outsource_quote q ON q.part_id = p.id AND q.process_id = pr.id \
+                   AND q.status = 'APPROVED' AND q.deleted_at IS NULL \
+                 LEFT JOIN t_outsource_company oc ON oc.id = q.outsource_company_id \
+                   AND oc.deleted_at IS NULL \
+                 LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
+                 LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
+                 WHERE pb.deleted_at IS NULL \
+                   AND (pb.status = 'PENDING' \
+                        OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF')) \
+               ) x \
+               ORDER BY x.batch_id, x.next_process_id, x.sp_id, x.step_id, \
+                        x.quote_id ASC NULLS LAST \
+             ) d \
+             WHERE ($1::text IS NULL OR d.part_drawing_no ILIKE $1 OR d.part_name ILIKE $1) \
+               AND ($2::bigint IS NULL OR d.customer_id = $2) \
+             ORDER BY d.is_urgent DESC, d.planned_delivery_date ASC NULLS LAST, \
+                      d.part_id ASC, d.batch_no ASC, d.next_process_id ASC \
+             LIMIT $3 OFFSET $4",
+        )
+        .bind(keyword_pat)
+        .bind(customer_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(executor)
+        .await
+    }
+
+    pub async fn count<'e, E: PgExecutor<'e>>(
+        executor: E,
+        keyword_pat: Option<&str>,
+        customer_id: Option<i64>,
+    ) -> Result<i64, sqlx::Error> {
+        // 与 list 的 WHERE + DISTINCT ON 口径逐条一致（含 DIRECT 空 options 行）。
+        // keyword / customer_id 过滤下推到最内层（都作用在 part 列上，与外层
+        // 等价），这样外层只需 `SELECT DISTINCT ON ... FROM (...) x`，省一层包裹。
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM ( \
+               SELECT DISTINCT ON (x.batch_id, x.next_process_id) \
+                 x.batch_id, x.next_process_id, x.part_drawing_no, x.part_name, x.customer_id \
+               FROM ( \
+                 SELECT pb.id AS batch_id, \
+                        p.drawing_no AS part_drawing_no, p.name AS part_name, p.customer_id, \
+                        pr.id AS next_process_id, sp.id AS sp_id, pcs.id AS step_id, \
+                        q.id AS quote_id \
+                 FROM t_part_batch pb \
+                 JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
+                 JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
+                 JOIN t_shelf_process sp ON sp.shelf_id = sh.id AND sp.deleted_at IS NULL \
+                 JOIN t_process pr ON pr.id = sp.process_id AND pr.deleted_at IS NULL \
+                   AND pr.category = 'OUTSOURCE' \
+                 JOIN t_process_chain_step pcs ON pcs.chain_id = p.process_chain_id \
+                   AND pcs.process_id = pr.id AND pcs.deleted_at IS NULL \
+                 LEFT JOIN t_outsource_quote q ON q.part_id = p.id AND q.process_id = pr.id \
+                   AND q.status = 'APPROVED' AND q.deleted_at IS NULL \
+                 WHERE pb.deleted_at IS NULL \
+                   AND (pb.status = 'PENDING' \
+                        OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF')) \
+                   AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1) \
+                   AND ($2::bigint IS NULL OR p.customer_id = $2) \
+               ) x \
+               ORDER BY x.batch_id, x.next_process_id, x.sp_id, x.step_id, \
+                        x.quote_id ASC NULLS LAST \
+             ) d",
+        )
+        .bind(keyword_pat)
+        .bind(customer_id)
         .fetch_one(executor)
         .await?;
         Ok(n)

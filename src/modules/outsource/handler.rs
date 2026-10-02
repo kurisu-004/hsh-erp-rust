@@ -26,11 +26,12 @@
 //! ## 权限
 //! 权限守卫在 service 层（`current.require_any_role`），handler 不重复校验。
 //!
-//! ## 路由表（17 端点）
+//! ## 路由表（20 端点）
 //!
 //! - `GET    /outsource-companies`              — 列表（READ）
 //! - `POST   /outsource-companies`              — 新建（WRITE）
 //! - `GET    /outsource-companies/{id}`         — 详情
+//! - `GET    /outsource-companies/{id}/sent-parts` — 对账页 sent-parts 一览（2026-10-03 新增）
 //! - `POST   /outsource-companies/{id}/update`  — 更新（OCC）
 //! - `POST   /outsource-companies/{id}/soft-delete` — 软删
 //! - `GET    /outsource-companies/by-process/{process_id}` — 按工序反查
@@ -38,6 +39,7 @@
 //!
 //! - `GET    /outsource-quotes`                 — 列表
 //! - `POST   /outsource-quotes`                 — 新建 DRAFT
+//! - `GET    /outsource-quotes/quotable-parts`  — 报价 picker（2026-10-03 新增）
 //! - `GET    /outsource-quotes/{id}`            — 详情
 //! - `POST   /outsource-quotes/{id}/update`     — 更新 DRAFT
 //! - `POST   /outsource-quotes/{id}/submit`     — DRAFT → SUBMITTED
@@ -45,7 +47,11 @@
 //! - `POST   /outsource-quotes/{id}/reject`     — SUBMITTED → REJECTED (MANAGER-only)
 //! - `POST   /outsource-quotes/{id}/soft-delete` — 软删 DRAFT/REJECTED
 //!
+//! - `GET    /outsource-shipments/in-flight`    — 在途批次一览（2026-10-03 新增）
 //! - `POST   /outsource-shipments/{id}/reconcile-update` — 对账页更新
+//!
+//! 顶层（独立前缀，见 `modules::mod.rs::v2_router`）：
+//! - `GET    /outsource-sendable`               — 可发送外协一览（2026-10-03 新增）
 
 use std::sync::Arc;
 
@@ -57,13 +63,15 @@ use axum::{Json, Router};
 use crate::auth::rbac::CurrentUser;
 use crate::modules::outsource::dto::{
     OutsourceCompanyCreateRequest, OutsourceCompanyListQuery, OutsourceCompanyUpdateRequest,
-    OutsourceQuoteApproveRequest, OutsourceQuoteCreateRequest, OutsourceQuoteListQuery,
-    OutsourceQuoteRejectRequest, OutsourceQuoteUpdateRequest,
+    OutsourceInFlightListQuery, OutsourceQuotablePartListQuery, OutsourceQuoteApproveRequest,
+    OutsourceQuoteCreateRequest, OutsourceQuoteListQuery, OutsourceQuoteRejectRequest,
+    OutsourceQuoteUpdateRequest, OutsourceSendableListQuery, OutsourceSentPartListQuery,
     OutsourceShipmentReconcileUpdateRequest, SetOutsourceCompanyProcessRequest,
 };
 use crate::modules::outsource::vo::{
     OutsourceCompanyListOut, OutsourceCompanyOut, OutsourceCompanyWithProcessesOut,
-    OutsourceQuoteListOut, OutsourceQuoteOut, OutsourceShipmentOut,
+    OutsourceInFlightListOut, OutsourceQuoteListOut, OutsourceQuoteOut, OutsourceSendableListOut,
+    OutsourceSentPartListOut, OutsourceShipmentOut, QuotablePartListOut,
 };
 use crate::shared::error::AppError;
 use crate::shared::response::R;
@@ -177,6 +185,25 @@ pub async fn set_company_processes(
         .set_company_processes(&mut *tx, id, &req, &current)
         .await?;
     tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `GET /outsource-companies/{id}/sent-parts`（2026-10-03 新增）—— 读端点
+///
+/// 2 段路径（`/{id}/sent-parts`），与 1 段的 `/{id}` 无 matchit 冲突。
+/// 此前本端点**根本没注册**，前端「外协对账」页恒 404（写侧 reconcile-update
+/// 一直存在，只是读不到数据）。
+pub async fn list_company_sent_parts(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Path(id): Path<i64>,
+    Query(query): Query<OutsourceSentPartListQuery>,
+) -> Result<Json<R<OutsourceSentPartListOut>>, AppError> {
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .outsource_service
+        .list_company_sent_parts(&mut *conn, id, &query, &current)
+        .await?;
     Ok(Json(R::ok(out)))
 }
 
@@ -311,9 +338,45 @@ pub async fn soft_delete_quote(
     Ok(Json(R::ok_empty()))
 }
 
+/// `GET /outsource-quotes/quotable-parts`（2026-10-03 新增）—— 读端点
+///
+/// ⚠️ **必须注册在 `quote_router()` 的 `/{id}` 之前**。此前本端点未注册，
+/// 请求被 `/{id}`（`Path<i64>`）吞掉 → `PathRejection` → 恒 400（前端报价一览页
+/// 每次进都报错、「新建报价」picker 恒空）。
+pub async fn list_quotable_parts(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<OutsourceQuotablePartListQuery>,
+) -> Result<Json<R<QuotablePartListOut>>, AppError> {
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .outsource_service
+        .list_quotable_parts(&mut *conn, &query, &current)
+        .await?;
+    Ok(Json(R::ok(out)))
+}
+
 // ===========================================================================
 //  Shipment
 // ===========================================================================
+
+/// `GET /outsource-shipments/in-flight`（2026-10-03 新增）—— 读端点
+///
+/// 1 段静态路径，与 2 段的 `/{id}/reconcile-update` 无 matchit 冲突。
+/// 取代 part 域旧 `/parts/outsource-in-flight`（返回通用 `PartListItem`，
+/// 形状不匹配导致前端在途 tab 空白）。
+pub async fn list_in_flight(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<OutsourceInFlightListQuery>,
+) -> Result<Json<R<OutsourceInFlightListOut>>, AppError> {
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .outsource_service
+        .list_in_flight(&mut *conn, &query, &current)
+        .await?;
+    Ok(Json(R::ok(out)))
+}
 
 /// POST /outsource-shipments/{id}/reconcile-update —— 纯写端点
 pub async fn reconcile_update_shipment(
@@ -332,6 +395,28 @@ pub async fn reconcile_update_shipment(
 }
 
 // ===========================================================================
+//  Sendable（2026-10-03 新增，独立顶层前缀 `/outsource-sendable`）
+// ===========================================================================
+
+/// `GET /outsource-sendable` —— 读端点
+///
+/// 一行 = 一个（活跃批次 × OUTSOURCE 工序）组合，`send_mode` 判 APPROVAL / DIRECT
+/// 由 SQL 一次判定（见 `OutsourceSendableRepo`）。角色守卫与旧
+/// `/parts/outsource-sendable` 一致。
+pub async fn list_sendable(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<OutsourceSendableListQuery>,
+) -> Result<Json<R<OutsourceSendableListOut>>, AppError> {
+    let mut conn = state.pool.acquire().await?;
+    let out = state
+        .outsource_service
+        .list_sendable(&mut *conn, &query, &current)
+        .await?;
+    Ok(Json(R::ok(out)))
+}
+
+// ===========================================================================
 //  Router（注意静态段必须在 catch-all `/{id}` 之前注册）
 // ===========================================================================
 
@@ -344,6 +429,8 @@ pub fn company_router() -> Router<Arc<AppState>> {
         .route("/{id}/update", post(update_company))
         .route("/{id}/soft-delete", post(soft_delete_company))
         .route("/{id}/processes", post(set_company_processes))
+        // 2026-10-03 新增：对账页 sent-parts（2 段路径，与 1 段 `/{id}` 无冲突）
+        .route("/{id}/sent-parts", get(list_company_sent_parts))
         .route("/{id}", get(get_company))
 }
 
@@ -351,6 +438,9 @@ pub fn company_router() -> Router<Arc<AppState>> {
 pub fn quote_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/", get(list_quotes).post(create_quote))
+        // 2026-10-03 新增：**静态段必须在 `/{id}` catch-all 之前注册**，否则
+        // `quotable-parts` 会被 `Path<i64>` 吞掉（400 PathRejection）。
+        .route("/quotable-parts", get(list_quotable_parts))
         .route("/{id}/update", post(update_quote))
         .route("/{id}/submit", post(submit_quote))
         .route("/{id}/approve", post(approve_quote))
@@ -361,5 +451,18 @@ pub fn quote_router() -> Router<Arc<AppState>> {
 
 /// Shipment 路由（挂载点 `/outsource-shipments`）
 pub fn shipment_router() -> Router<Arc<AppState>> {
-    Router::new().route("/{id}/reconcile-update", post(reconcile_update_shipment))
+    Router::new()
+        // 2026-10-03 新增：1 段静态段（与 2 段的 `/{id}/reconcile-update` 无冲突）
+        .route("/in-flight", get(list_in_flight))
+        .route("/{id}/reconcile-update", post(reconcile_update_shipment))
+}
+
+/// Sendable 路由（挂载点 `/outsource-sendable`，**独立顶层前缀**）
+///
+/// 2026-10-03 新增。`/outsource-sendable` 不是 quote / shipment / company 任何
+/// 单一域的子资源（「可发送外协的批次」横跨全部三者），故不 nest 进既有 3 个
+/// router，而是顶层独立前缀 —— 命名沿用旧的 `/parts/outsource-sendable`，便于
+/// 前端对照迁移。
+pub fn sendable_router() -> Router<Arc<AppState>> {
+    Router::new().route("/", get(list_sendable))
 }
