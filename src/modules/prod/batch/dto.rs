@@ -204,13 +204,16 @@ pub struct WorkerScanRequest {
     pub batch_id: Option<String>,
 }
 
-/// `GET /api/v2/prod/batches/inspection` / `repair` / `repairing` 查询参数（3 条共用）。
+/// `GET /api/v2/prod/batches/repair` / `repairing` 查询参数（2 条共用）。
+///
+/// **仅这 2 条端点**（2026-10-03 起）：`GET /prod/batches/inspection` 已分化到
+/// [`InspectionQueueQuery`]。
 ///
 /// `customer_id` 单值；service 层复用 `expand_customer_id` 展开为 L1+L2 ids
 /// （与 `list_parts` 同逻辑）。`keyword` / `serial_no` ILIKE 匹配。
 /// `planned_delivery_date_*` 作用于 `t_part.planned_delivery_date`。
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct InspectionBatchListQuery {
+pub struct RepairBatchListQuery {
     #[serde(default)]
     pub keyword: Option<String>,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
@@ -221,6 +224,38 @@ pub struct InspectionBatchListQuery {
     pub planned_delivery_date_from: Option<chrono::NaiveDate>,
     #[serde(default)]
     pub planned_delivery_date_to: Option<chrono::NaiveDate>,
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub limit: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub offset: Option<i64>,
+}
+
+/// `GET /api/v2/prod/batches/inspection` 查询参数。
+///
+/// 2026-10-03 与 [`RepairBatchListQuery`] 分化：待品检页的筛选收敛到表头 7 列，
+/// 每列一个独立参数（图号 / 名称 / 序列号各一个 ILIKE），不再用跨字段 `keyword`；
+/// 日期区间筛系统交期（页面已不显示计划交期）。
+/// `sort_by` 白名单（SERIAL_NO / DRAWING_NO / NAME / BATCH_NO / QUANTITY /
+/// SYSTEM_DELIVERY_DATE / CUSTOMER_NAME），非法值退化为 SYSTEM_DELIVERY_DATE；
+/// `sort_dir` 非法退化为 ASC。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct InspectionQueueQuery {
+    #[serde(default)]
+    pub drawing_no: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub serial_no: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub customer_id: Option<i64>,
+    #[serde(default)]
+    pub system_delivery_date_from: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    pub system_delivery_date_to: Option<chrono::NaiveDate>,
+    #[serde(default)]
+    pub sort_by: Option<String>,
+    #[serde(default)]
+    pub sort_dir: Option<String>,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
     pub limit: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]

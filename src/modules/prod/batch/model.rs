@@ -252,3 +252,33 @@ pub struct InspectionBatchListRow {
     pub customer_name: Option<String>,
     pub l1_customer_name: Option<String>,
 }
+
+/// `GET /prod/batches/inspection` 单行中间结构（repo ↔ service 边界类型）。
+///
+/// 2026-10-03 VO 收口新增：待品检页只渲染 7 个数据列（序列号 / 图号 / 名称 /
+/// 批次 / 数量 / 系统交期 / 客户），故本结构与同文件的
+/// [`InspectionBatchListRow`] 分家 —— 后者继续服务 `/prod/batches/repair` /
+/// `repairing`，两者不共用。
+///
+/// 字段与 `vo::InspectionQueueItemOut` 逐字同形（13 个）：SQL 侧列别名直接取
+/// 语义名（`pb.id AS batch_id` 等），repo 层 1:1 搬运，service 只做形状转换。
+/// `l1_customer_name` 的派生在 repo 层完成（原料列 `c.parent_id` / `pc.name`），
+/// 逻辑与上方 [`InspectionBatchListRow`] 的同名派生逐字一致。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InspectionQueueRow {
+    pub batch_id: i64,
+    pub part_id: i64,
+    pub batch_no: i32,
+    pub quantity: i32,
+    /// OCC 锚 `t_part_batch.version`（不是 `t_part.version`）。
+    pub version: i32,
+    pub serial_no: Option<String>,
+    pub drawing_no: String,
+    pub name: String,
+    /// 系统交期（2026-10-03 新增投影；页面已不显示计划交期，日期筛选改筛本列）。
+    pub system_delivery_date: Option<NaiveDate>,
+    pub is_urgent: bool,
+    pub customer_id: i64,
+    pub customer_name: Option<String>,
+    pub l1_customer_name: Option<String>,
+}

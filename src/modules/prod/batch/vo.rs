@@ -10,7 +10,9 @@
 //! - **流转与生命周期**（`transition*` / `lifecycle` / `shelf` / `programming` /
 //!   `outsource` / `repair` / `batch_ops` / `pickup` / `scan` / `worker_scan`）：
 //!   `ToXxxOut` / `BatchToXxxOut` / `BatchOpFailure` / `WorkerScanOut`
-//! - **集合读**（`list.rs` / `repair.rs`）：`InspectionBatchListOut` 三条端点共用
+//! - **集合读**（`list.rs` / `repair.rs`）：`InspectionQueueListOut`
+//!   （待品检队列，2026-10-03 VO 收口）+ `InspectionBatchListOut`
+//!   （仅 repair / repairing 两条共用）
 //!
 //! 2026-10-02：to-XXX / batch-to-XXX / worker-scan / inspection·repair·repairing
 //! 三条集合读这 8 类出参随批次用例自 `part::vo` 迁入。`PartOut` 例外 —— 它是
@@ -20,7 +22,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use serde::Serialize;
 
 use crate::modules::part::vo::PartOut;
-use crate::modules::prod::batch::model::InspectionBatchListRow;
+use crate::modules::prod::batch::model::{InspectionBatchListRow, InspectionQueueRow};
 use crate::modules::prod::worker_pool::model::RefillResult;
 use crate::shared::types::{serialize_i64, serialize_i64_opt};
 
@@ -211,10 +213,87 @@ pub struct AutoDispatchResult {
     pub items: Vec<AutoDispatchItem>,
 }
 
-// ===== 集合读（inspection / repair / repairing 三端点共用）=====
+// ===== 集合读（待品检队列：inspection 专用）=====
 
-/// `GET /prod/batches/inspection` 列表行：批次 + 工单 + 客户 + holder/process/
-/// delivery_note 名称（一次性 JOIN 解析，不在 service 做 N+1）。
+/// `GET /api/v2/prod/batches/inspection` 出参项。
+///
+/// 2026-10-03 VO 收口：本 VO 只服务待品检队列页，字段严格对齐前端 7 个数据列
+/// （序列号 / 图号 / 名称 / 批次 / 数量 / 系统交期 / 客户）+ 操作列所需的
+/// 锚点（`batch_id` / `version` / `part_id` / `is_urgent` / `customer_id`）。
+/// 返修两条端点继续用 [`InspectionBatchListItemOut`]（28 字段，本 VO 不共用）——
+/// 共用会让那 15 个字段在待品检页成为无用负载。
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionQueueItemOut {
+    /// 三个写端点的路径参数 + 扫码选择行标识。
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    /// 批次列。
+    pub batch_no: i32,
+    /// 数量列 + 部分通过弹窗上限（`POST /prod/batches/{batch_id}/to-ship` 的
+    /// `quantity` 不得超过本值）。
+    pub quantity: i32,
+    /// OCC 锚 `t_part_batch.version`（**不是** `t_part.version`）。
+    pub version: i32,
+    /// 详情页 `/parts/{part_id}`。
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    /// 序列号列（`t_part.serial_no` 可空：手工工单可没序列号）。
+    pub serial_no: Option<String>,
+    /// 图号列。
+    pub drawing_no: String,
+    /// 名称列。
+    pub name: String,
+    /// 系统交期列（2026-10-03 新增投影）。可空 → JSON `null`。
+    pub system_delivery_date: Option<NaiveDate>,
+    /// 加急红底。
+    pub is_urgent: bool,
+    /// 客户表头筛选的入参回显（caller 选中 L1 / L2 都用它）。
+    #[serde(serialize_with = "serialize_i64")]
+    pub customer_id: i64,
+    pub customer_name: Option<String>,
+    pub l1_customer_name: Option<String>,
+}
+
+impl From<InspectionQueueRow> for InspectionQueueItemOut {
+    fn from(r: InspectionQueueRow) -> Self {
+        Self {
+            batch_id: r.batch_id,
+            batch_no: r.batch_no,
+            quantity: r.quantity,
+            version: r.version,
+            part_id: r.part_id,
+            serial_no: r.serial_no,
+            drawing_no: r.drawing_no,
+            name: r.name,
+            system_delivery_date: r.system_delivery_date,
+            is_urgent: r.is_urgent,
+            customer_id: r.customer_id,
+            customer_name: r.customer_name,
+            l1_customer_name: r.l1_customer_name,
+        }
+    }
+}
+
+/// `GET /api/v2/prod/batches/inspection` 出参（分页）。
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionQueueListOut {
+    pub items: Vec<InspectionQueueItemOut>,
+    #[serde(serialize_with = "serialize_i64")]
+    pub total: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub limit: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub offset: i64,
+}
+
+// ===== 集合读（返修：repair / repairing 两条共用）=====
+
+/// `GET /prod/batches/repair` / `repairing` 列表行：批次 + 工单 + 客户 + holder/
+/// process/delivery_note 名称（一次性 JOIN 解析，不在 service 做 N+1）。
+///
+/// **仅这 2 条端点共用**（2026-10-03 起）：`GET /prod/batches/inspection` 已切到
+/// 精简 VO [`InspectionQueueItemOut`]（13 字段）—— 待品检页只渲染 7 个数据列，
+/// 共用本 VO 会让 15 个字段成为无用负载。
 ///
 /// 字段命名沿用 v1 `PartOut`/`PartBatchOut` 约定（`batch_id` 即 `t_part_batch.id`，
 /// `version` 即乐观锁版本号）。前端用 `batch_id + version` 直接拼
@@ -268,17 +347,16 @@ pub struct InspectionBatchListItemOut {
     /// **2026-09-30 review 第 3 轮 M3 已回退**（follow-up 于 2026-09-30 补齐
     /// repair 两端点的漏网项）。原因：送检 = 出池，该列被置 NULL。
     ///
-    /// 本字段由 3 个端点共用（`InspectionBatchListItemOut`，别名
-    /// `RepairBatchesOut`），**3 个都不是工序池端点**，判据都是 `status`：
-    /// - `GET /prod/batches/inspection`（`status='INSPECTION'`，M3 已回退）
+    /// 本字段由 2 个端点共用（`InspectionBatchListItemOut`，别名
+    /// `RepairBatchesOut`），**2 个都不是工序池端点**：
     /// - `GET /prod/batches/repair`（`DELIVERED`，2026-09-30 follow-up 补齐）
     /// - `GET /prod/batches/repairing`（`is_repairing = true`，2026-10-01 由
     ///   `status='REPAIRING'` 改为标记列过滤）
     ///
-    /// 前两者（三者中的 2 个 status 判据端点）的 `current_process_id` 分别为
-    /// 「按出池不变式恒 NULL」「DELIVERED 必经 INSPECTION 故同样恒 NULL」⇒
-    /// 直读一律得不到正确值，故这 2 条查询走 step 派生。
-    /// 第三个端点（返修中）：2026-10-01 起 `mark_batch_repairing` **不再把批次
+    /// DELIVERED 端点的 `current_process_id` 按「DELIVERED 必经 INSPECTION」
+    /// 不变式同样恒 NULL（进 INSPECTION 的写点都把该列清成 NULL）⇒ 直读得不到
+    /// 正确值，故该查询走 step 派生。
+    /// 返修中端点：2026-10-01 起 `mark_batch_repairing` **不再把批次
     /// 翻出 IN_PROCESS**（status 保持不变），故该列对返修批次不再有「残留
     /// 陈旧值」问题 —— 但本 VO 仍统一走 step 派生，理由是「展示类列表一律走
     /// step 派生」这条分工（见 `prod/batch/model.rs` 模块 doc 的读取方清单），
@@ -288,8 +366,8 @@ pub struct InspectionBatchListItemOut {
     /// 工艺链第几步」这条产品需求的数据来源。
     ///
     /// 2026-09-27 part 域前后端字段对齐：`/parts` 响应已对该字段加
-    /// `#[serde(skip)]` 仅隐藏（DB 列保留、rollup 派生链路不变）。inspection /
-    /// repair 域**不做 skip**，字段照常序列化。
+    /// `#[serde(skip)]` 仅隐藏（DB 列保留、rollup 派生链路不变）。repair 域
+    /// **不做 skip**，字段照常序列化。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub next_process_id: Option<i64>,
     pub next_process_name: Option<String>,
@@ -354,7 +432,10 @@ impl From<InspectionBatchListRow> for InspectionBatchListItemOut {
     }
 }
 
-/// `GET /api/v2/prod/batches/inspection` 出参（分页）。
+/// `GET /api/v2/prod/batches/repair` / `repairing` 出参（分页）：返修批次列表。
+///
+/// **仅这 2 条端点**（2026-10-03 起）：`GET /prod/batches/inspection` 已切到
+/// [`InspectionQueueListOut`]，两条端点只有过滤判据不同。
 #[derive(Debug, Clone, Serialize)]
 pub struct InspectionBatchListOut {
     pub items: Vec<InspectionBatchListItemOut>,
@@ -366,8 +447,7 @@ pub struct InspectionBatchListOut {
     pub offset: i64,
 }
 
-/// `GET /api/v2/prod/batches/repair` / `repairing` 出参：返修批次列表（复用
-/// `InspectionBatchListOut`，三条端点只有过滤判据不同）。
+/// `GET /api/v2/prod/batches/repair` / `repairing` 出参别名。
 pub type RepairBatchesOut = InspectionBatchListOut;
 
 /// 单件 / 批量 to-XXX 端点的统一出参 shape。

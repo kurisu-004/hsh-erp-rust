@@ -1,7 +1,10 @@
-//! 胖 trait `PartBatchRepoTrait`（17 方法）+ `impl for &mut PgConnection`。
+//! 胖 trait `PartBatchRepoTrait`（21 方法）+ `impl for &mut PgConnection`。
 //!
 //! 2026-10-02 随 `t_part_batch` 归属迁入 prod 域，从单文件 `prod/batch/repo/queries.rs`
 //! 拆出（单文件已超 conventions.md §2 的 1000 行上限）。签名零变化。
+//!
+//! 2026-10-03 追加 2 条待品检队列方法（`list_inspection_queue` /
+//! `count_inspection_queue`），供 `GET /prod/batches/inspection` 用。
 //!
 //! ## 为什么是胖 trait
 //! `&mut PgConnection` 同一作用域只能借给一个 repo 实例；service 同时需要
@@ -16,9 +19,10 @@ use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::PgConnection;
 
+use super::list::InspectionQueueFilters;
 use super::queries::{NewInitialBatch, PartBatchRepo};
 use crate::modules::prod::batch::model::{
-    InspectionBatchListRow, PartBatchScanRow, RecentBatchRow, TPartBatch,
+    InspectionBatchListRow, InspectionQueueRow, PartBatchScanRow, RecentBatchRow, TPartBatch,
 };
 use crate::shared::error::AppError;
 
@@ -135,6 +139,16 @@ pub trait PartBatchRepoTrait: Send {
         serial_no: Option<&'b str>,
         date_from: Option<NaiveDate>,
         date_to: Option<NaiveDate>,
+    ) -> Result<i64, sqlx::Error>;
+
+    // ── 待品检队列列表 / COUNT（2，2026-10-03 VO 收口新增）── 来自 list.rs
+    async fn list_inspection_queue<'a, 'b>(
+        &mut self,
+        f: &'b InspectionQueueFilters<'a>,
+    ) -> Result<Vec<InspectionQueueRow>, sqlx::Error>;
+    async fn count_inspection_queue<'a, 'b>(
+        &mut self,
+        f: &'b InspectionQueueFilters<'a>,
     ) -> Result<i64, sqlx::Error>;
 }
 
@@ -340,5 +354,20 @@ impl PartBatchRepoTrait for &mut PgConnection {
             date_to,
         )
         .await
+    }
+
+    // ── list.rs（待品检队列 2 条）──
+    async fn list_inspection_queue<'a, 'b>(
+        &mut self,
+        f: &'b InspectionQueueFilters<'a>,
+    ) -> Result<Vec<InspectionQueueRow>, sqlx::Error> {
+        PartBatchRepo::list_inspection_queue(&mut **self, f).await
+    }
+
+    async fn count_inspection_queue<'a, 'b>(
+        &mut self,
+        f: &'b InspectionQueueFilters<'a>,
+    ) -> Result<i64, sqlx::Error> {
+        PartBatchRepo::count_inspection_queue(&mut **self, f).await
     }
 }

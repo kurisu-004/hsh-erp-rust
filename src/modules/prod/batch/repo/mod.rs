@@ -9,7 +9,8 @@
 //! ## 两个 ZST 的分工（命名相近，注意区分）
 //! - `PartBatchRepo` —— `t_part_batch` 的**通用** SQL 真源，全仓读写批次表的
 //!   默认入口：18 个通用方法（`queries.rs`）+ 19 个流转写点（`sql.rs`）+
-//!   2 个 8-JOIN 集合读（`list.rs`）。跨域调用方一律走它。
+//!   4 个集合读（`list.rs`：2 个 8-JOIN 宽投影 + 2 个 3-JOIN 窄投影）。跨域调用方
+//!   一律走它。
 //! - `BatchRepo`（本文件）—— **只服务「PENDING 批次下发给车间」一条流**的专用
 //!   查询（7 个方法），唯一调用方是 `service::dispatch.rs`。
 //!   两者都是无状态 ZST + 固有静态方法，职责不重叠。
@@ -21,8 +22,10 @@
 //! - `sql.rs` —— inspection / lifecycle 流转的 19 个定位 + 写点
 //!   （`find_*` / `mark_*` / `split_batch_for_partial_pass` /
 //!   `cancel_all_active_batches_for_part` / `force_complete_all_batches_for_part`）
-//! - `list.rs` —— 8-JOIN 集合读（`list_batches_with_part` /
-//!   `count_batches_with_part`，服务 inspection / repair / repairing 三条列表端点）
+//! - `list.rs` —— 集合读 4 条：`list_batches_with_part` / `count_batches_with_part`
+//!   （8-JOIN 宽投影，服务 repair / repairing）+
+//!   `list_inspection_queue` / `count_inspection_queue`（3-JOIN 窄投影 +
+//!   表头筛选/排序，服务 `GET /prod/batches/inspection`）
 //! - `trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
 //! - `mod.rs`（本文件）—— ZST `BatchRepo`：本域「PENDING 批次下发给车间」
 //!   专用查询（pending 列表 / auto-dispatch 预览 / 首道 step / 兜底反查 part_id）

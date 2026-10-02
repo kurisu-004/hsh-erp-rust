@@ -18,12 +18,14 @@
 //!
 //! ## 模块结构
 //! - `model.rs` —— `TPartBatch` / `RecentBatchRow` / `PartBatchScanRow` /
-//!   `InspectionBatchListRow` 行结构（sqlx `FromRow`）
+//!   `InspectionBatchListRow`（返修宽投影）/ `InspectionQueueRow`（待品检窄投影）
+//!   行结构
 //! - `status_gate.rs` —— **全仓唯一** `t_part_batch.status` 写入口（写 + batch →
 //!   part → assembly 派生焊在一个函数里）
 //! - `repo/queries.rs` —— ZST `PartBatchRepo` + 通用 SQL 静态方法
 //! - `repo/sql.rs` —— inspection / lifecycle 流转的定位 + 写点
-//! - `repo/list.rs` —— 8-JOIN 集合读（服务 inspection / repair / repairing 三条列表端点）
+//! - `repo/list.rs` —— 集合读：8-JOIN 宽投影（返修两条端点共用）+ 3-JOIN 窄投影
+//!   + 表头筛选/排序（`GET /prod/batches/inspection` 专用，2026-10-03 VO 收口）
 //! - `repo/trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
 //! - `repo/mod.rs` —— ZST `BatchRepo`：「PENDING 批次下发给车间」专用查询
 //! - `service/` —— 全部业务用例（`impl BatchService`，按流拆文件，见该目录 mod doc）

@@ -26,7 +26,7 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::batch::dto::{
-    CompleteRepairRequest, InspectionBatchListQuery, RepairDispatchRequest,
+    CompleteRepairRequest, RepairBatchListQuery, RepairDispatchRequest,
 };
 use crate::modules::prod::batch::vo::{InspectionBatchListItemOut, InspectionBatchListOut};
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
@@ -367,10 +367,10 @@ impl BatchService {
     }
 
     /// `GET /prod/batches/repair`：DELIVERED 批次列表（M+C+I）。
-    /// 复用 `InspectionBatchListQuery` + repo；status=DELIVERED。
+    /// 复用 `RepairBatchListQuery` + repo；status=DELIVERED。
     pub async fn list_repair_batches<R: PartRepoTrait>(
         mut repo: R,
-        query: &InspectionBatchListQuery,
+        query: &RepairBatchListQuery,
         current: &CurrentUser,
     ) -> Result<InspectionBatchListOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
@@ -399,7 +399,7 @@ impl BatchService {
     ///   不再出现 `'REPAIRING'` 字面量），判据在 SQL 层仍是同一个 bind 位。
     pub async fn list_repairing_batches<R: PartRepoTrait>(
         mut repo: R,
-        query: &InspectionBatchListQuery,
+        query: &RepairBatchListQuery,
         current: &CurrentUser,
     ) -> Result<InspectionBatchListOut, AppError> {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
@@ -410,7 +410,7 @@ impl BatchService {
     /// 通用 INSPECTION / DELIVERED / 返修中 等批次列表实现。
     async fn list_batches_matching(
         conn: &mut PgConnection,
-        query: &InspectionBatchListQuery,
+        query: &RepairBatchListQuery,
         filter: BatchListFilter<'_>,
         _current: &CurrentUser,
     ) -> Result<InspectionBatchListOut, AppError> {
