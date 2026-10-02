@@ -210,16 +210,22 @@ struct InspBatchSpec<'a> {
     system_delivery_date: Option<chrono::NaiveDate>,
 }
 
-/// 按规格插入一条 INSPECTION part + 批次（holder = 品检架），返回 (part_id, batch_id)。
-async fn insert_insp_batch_with_spec(
+/// 按规格插入一条 INSPECTION part + 批次（holder = 品检架），**两个主键都由调用方
+/// 指定**，返回无（part_id 由调用方自己持有）。
+///
+/// 2026-10-03 新增：拆出这一层是为了让
+/// `inspection_batches_pagination_tiebreak_by_batch_id_is_stable` 能**按指定顺序**
+/// 写入 batch id（降序插入），从而让「`ORDER BY` 有没有 `pb.id ASC` 兜底键」变成
+/// 可观测差异而不是靠 PG 恰好稳定的返回顺序。雪花 id 恒随插入顺序升序，用
+/// `insert_insp_batch_with_spec` 造不出这种数据。
+async fn insert_insp_batch_with_ids(
     pool: &PgPool,
     insp_shelf_id: i64,
+    part_id: i64,
+    batch_id: i64,
     spec: &InspBatchSpec<'_>,
-) -> (i64, i64) {
+) {
     use hsh_erp_rust::infra::clock::now_naive;
-    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let part_id = snowflake.next_id();
     let now = now_naive();
     let today = now.date();
     sqlx::query(
@@ -240,7 +246,6 @@ async fn insert_insp_batch_with_spec(
     .execute(pool)
     .await
     .expect("insert INSPECTION part");
-    let batch_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
          current_holder_id, version, created_at, updated_at) \
@@ -255,6 +260,20 @@ async fn insert_insp_batch_with_spec(
     .execute(pool)
     .await
     .expect("insert INSPECTION batch");
+}
+
+/// 按规格插入一条 INSPECTION part + 批次（holder = 品检架），返回 (part_id, batch_id)。
+/// 主键走雪花生成器 ⇒ **恒随插入顺序升序**。
+async fn insert_insp_batch_with_spec(
+    pool: &PgPool,
+    insp_shelf_id: i64,
+    spec: &InspBatchSpec<'_>,
+) -> (i64, i64) {
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let batch_id = snowflake.next_id();
+    insert_insp_batch_with_ids(pool, insp_shelf_id, part_id, batch_id, spec).await;
     (part_id, batch_id)
 }
 
@@ -1169,7 +1188,8 @@ async fn inspection_batches_pagination_splits_items_and_total_matches() {
         .expect("data.total 应可解析为 i64");
     assert_eq!(total_p1, 4, "total 不随 offset 变化: body={body}");
 
-    // 第 2 页：limit=2&offset=2 → 后 2 行，**无重复无漏行**（兜底键 pb.id ASC 有效）
+    // 第 2 页：limit=2&offset=2 → 后 2 行，**无重复无漏行**（本用例 4 行的排序键互异，
+    // 未触发 `pb.id ASC` 兜底路径；该路径由下面的并列行用例专门覆盖）
     let (status, body) = send(
         app.clone(),
         json_request(
@@ -1215,6 +1235,119 @@ async fn inspection_batches_pagination_splits_items_and_total_matches() {
         .parse::<i64>()
         .expect("data.total 应可解析为 i64");
     assert_eq!(total_p3, 4, "越界翻页 total 仍是全量条数: body={body}");
+}
+
+/// 排序键**全并列**时的 `pb.id ASC` 兜底：返回顺序必须由 batch id 升序决定，
+/// 且分页两页拼回与整页同序、无重复无漏行。
+///
+/// 上一条 `inspection_batches_pagination_splits_items_and_total_matches` 的 4 行
+/// 排序键互异（交期 1/2/3 月 + NULL），**没走过兜底键**。本条补缺口：3 行的
+/// `system_delivery_date` / `batch_no` / `quantity` **全部相同**（只有 `name` /
+/// `serial_no` / `drawing_no` 不同，够不上任何排序列），排序键零区分度。
+///
+/// **关键是按降序写 batch id**（`+2 / +1 / +0`，物理堆顺序 = 降序）。若按升序插入，
+/// 兜底键在与不在都会返回升序（PG 恰好按堆顺序吐行）⇒ 断言假绿；降序插入把「PG 的
+/// 自然返回顺序」与「`pb.id ASC` 要求的顺序」掰成相反方向，兜底键存在与否才成为
+/// 可观测差异。本用例已用删掉 `pb.id ASC` 的变异体验证过会红。
+#[tokio::test]
+async fn inspection_batches_pagination_tiebreak_by_batch_id_is_stable() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let tied_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 1).expect("固定交期必可构造");
+    // 固定 id 基座（远高于任何雪花 id，测试库内不会撞）；按 **降序** 插入 3 行全并列数据
+    let id_base = 8_000_000_000_000_000_000i64;
+    let mut expected_asc: Vec<String> = Vec::new();
+    for (i, name) in ["TIE-A", "TIE-B", "TIE-C"].iter().enumerate() {
+        let batch_id = id_base + (2 - i as i64);
+        insert_insp_batch_with_ids(
+            &pool,
+            fx.inspection_shelf_id,
+            snowflake.next_id(),
+            batch_id,
+            &InspBatchSpec {
+                name,
+                drawing_no: "TIE-DWG",
+                serial_no: Some(name),
+                customer_id: fx.customer_l2_id,
+                quantity: 7,
+                batch_no: 7,
+                system_delivery_date: Some(tied_date),
+            },
+        )
+        .await;
+        expected_asc.push(batch_id.to_string());
+    }
+    expected_asc.sort();
+    assert_eq!(
+        expected_asc,
+        vec![
+            (id_base).to_string(),
+            (id_base + 1).to_string(),
+            (id_base + 2).to_string(),
+        ],
+        "基座自检：3 个 batch id 应为 base+0/1/2 且升序"
+    );
+
+    // 整页（limit=50）：并列行必须按 batch id **升序**返回 —— 这条就是兜底键本身
+    let (status, body) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            "/prod/batches/inspection?limit=50&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "full page: body={body}");
+    let full = item_batch_ids(&body);
+    assert_eq!(
+        full, expected_asc,
+        "排序键全并列时，整页应严格按 batch id 升序（pb.id ASC 兜底）: body={body}"
+    );
+    assert_eq!(
+        body["data"]["total"].as_str(),
+        Some("3"),
+        "total 应为 3（三行全并列不影响计数）: body={body}"
+    );
+
+    // 并列组跨 limit=2 的页边界（并列行占位置 0/1/2，边界落在 1 与 2 之间）
+    let mut paged: Vec<String> = Vec::new();
+    for (label, offset, expected_len) in [("page 1", 0usize, 2usize), ("page 2", 2, 1)] {
+        let (status, body) = send(
+            app.clone(),
+            json_request(
+                "GET",
+                &format!(
+                    "/prod/batches/inspection?limit=2&offset={offset}&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC"
+                ),
+                None::<Value>,
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{label}: body={body}");
+        let page = item_batch_ids(&body);
+        assert_eq!(
+            page.len(),
+            expected_len,
+            "{label} 应返回 {expected_len} 行: body={body}"
+        );
+        paged.extend(page);
+    }
+
+    // 核心断言：两页拼回与整页**逐位同序** —— 无重复、无漏行
+    assert_eq!(
+        paged, full,
+        "两页拼回应与整页同序且无重复无漏行（pb.id ASC 兜底提供全序）: paged={paged:?} full={full:?}"
+    );
+    let mut paged_sorted = paged.clone();
+    paged_sorted.sort();
+    assert_eq!(
+        paged_sorted, expected_asc,
+        "两页拼回的 id 集合应恰好等于 3 个期望 id（无重复无漏行）: paged={paged:?}"
+    );
 }
 
 /// 筛选 + 分页 + 排序三者叠加：`total` 必须等于**过滤后**的条数，不是全表条数。

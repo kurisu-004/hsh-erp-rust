@@ -163,6 +163,7 @@ impl PartBatchRepo {
     ///   ASC → `NULLS LAST` / DESC → `NULLS FIRST`，不显式指定时按交期倒序会把
     ///   未填交期的行顶到最前（与 `repo/mod.rs::list_pending_batches` 的既有做法一致）。
     /// - `pb.id ASC` 兜底：排序列可重复（同名不同批次），无兜底键时翻页会漏行 / 重复行。
+    ///   覆盖用例：`tests/part/inspection_batches.rs::inspection_batches_pagination_tiebreak_by_batch_id_is_stable`
     ///
     /// 走 `QueryBuilder`（动态 `ORDER BY` + 可选过滤，宏无法固化），故本查询不进
     /// `.sqlx` 离线元数据。

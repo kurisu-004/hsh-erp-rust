@@ -541,7 +541,9 @@ Query：
 - `NULLS LAST` 是必需的：`system_delivery_date` 可空，而 PG 的默认值是
   ASC → `NULLS LAST` / DESC → `NULLS FIRST`，不显式指定时按交期倒序会把未填交期的行
   顶到最前。
-- `pb.id ASC` 兜底：排序列可重复（同名不同批次），无兜底键时翻页会漏行 / 重复行。
+- `pb.id ASC` 兜底：排序列可重复（同名不同批次），无兜底键时翻页会漏行 / 重复行。该
+  路径由 `tests/part/inspection_batches.rs::inspection_batches_pagination_tiebreak_by_batch_id_is_stable`
+  覆盖（3 行排序键全并列、并列组跨页边界，断言两页拼回与整页同序）。
 - 列名白名单在 service 层映射后才进 repo，故外部输入不可能成为 SQL 片段。
 - **2026-10-03：`is_urgent` 不再参与排序**。改 VO 之前服务端硬编码
   `ORDER BY is_urgent DESC, planned_delivery_date ASC, pb.id ASC`，即「紧急件优先」

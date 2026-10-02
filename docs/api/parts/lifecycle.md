@@ -417,6 +417,83 @@ clamp `[1,500]`）/ `offset?`（默认 0）。
 
 Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 
+#### `InspectionBatchListItemOut` 字段
+
+**恰好 28 个**。`BatchOut` 是 `InspectionBatchListItemOut` 的别名
+（`src/modules/prod/batch/vo.rs`），本表是返修两条端点
+（`/prod/batches/repair` + `/prod/batches/repairing`）响应 `items[]` 的字段契约。
+排序固定 `b.id DESC`（`service/repair.rs::list_batches_matching`）—— **不做**
+「紧急件优先」排序；`total` 与 `items` 走同一条 WHERE 拼装。
+
+批次字段段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string (i64) | 批次雪花 ID |
+| `batch_no` | i32 | 批次号（`t_part_batch.batch_no`，非空列，恒为 JSON number） |
+| `quantity` | i32 | 批次数量 |
+| `status` | string | 批次状态枚举字符串。`/repair` 固定 `DELIVERED`（判据 `status='DELIVERED'`）；`/repairing` **不固定** —— 判据是 `is_repairing = true` 且 `status NOT IN ('COMPLETED','CANCELLED')`，故可能是 `IN_PROCESS` / `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` |
+| `is_repairing` | bool | 是否处于返修中。直读 `t_part_batch.is_repairing` 标记列（migration 005/006）；非 `Option`、无 `#[serde(default)]`、无 `skip_serializing_if` ⇒ **恒定出现在 JSON 里**，前端 Zod 必须按必填 `boolean` 声明、不能 `.optional()`。`REPAIRING` 已从 `PartStatus` 降级、DB 不再产生 `REPAIRING` 字面量，且本字段与 `status` **正交**（起修后送检可得 `INSPECTION` + `is_repairing = true`）⇒ **判「返修中」只能读本字段**，端点语义与 `status` 都推不出来。完整可达链见本文件 [`GET /api/v2/prod/batches/repairing`](#get-apiv2prodbatchesrepairing) 末「返修标记与 status 正交 —— 可达链」 |
+| `location` | string? | 批次所在位置（`t_part_batch.location`） |
+| `version` | i32 | 乐观锁（`t_part_batch.version`，caller OCC 锚点；**不是** `part_version`） |
+| `current_process_step_id` | string (i64)? | 逻辑 FK → `t_process_chain_step.id`；**只在首次定位工序时写、之后不再推进**（显示用定位信息，不是「当前走到第几步」的进度指针），允许 NULL |
+| `parent_batch_id` | string (i64)? | 拆批来源的父批次 ID（仅拆批产生的新批次非 NULL） |
+
+holder 解析段（`current_holder_id` 同一列 LEFT JOIN 三张表，按
+`t_shelf` → `t_worker` → `t_outsource_company` 顺序 COALESCE 出 `holder_name`）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `current_holder_id` | string (i64)? | 当前持有人 id（`t_shelf.id` / `t_worker.id` / `t_outsource_company.id` 三义，单列无法区分归属表） |
+| `holder_name` | string? | `COALESCE(shelf.name, worker.name, outsource_company.name)`；`current_holder_id` 为 NULL 时为 `null` |
+| `next_process_id` | string (i64)? | 下一道工序 id（对应 `t_process.id`）。由 `current_process_step_id` 经 `LEFT JOIN t_process_chain_step` 取 `process_id` 派生；**刻意不直读 `t_part_batch.current_process_id`** —— 送检 = 出池，该列被写点置 NULL，对本 VO 的 `DELIVERED` / 返修行结构性恒 NULL，直读会让这两个字段恒 `null`。字段名保留以兼容前端契约 |
+| `next_process_name` | string? | 下一道工序名称（`LEFT JOIN t_process p2 ON p2.id = s2.process_id` 拼齐） |
+
+> **读取方分工（勿越界）**：`t_part_batch.current_process_id` 是**工序池归属的权威
+> 列**，读取方严格限定为 5 条工序池 SQL + `list_pickable_by_work_type` + rollup 派生
+> `t_part.next_process_id`；**展示类列表（本 VO / dashboard / part 批次明细）一律走
+> step 派生**。完整清单见 `src/modules/prod/batch/model.rs` 模块 doc。
+
+delivery_note 解析段（LEFT JOIN `t_delivery_note` 一次拼齐）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `delivery_note_id` | string (i64)? | 关联送货单 id（`t_part_batch.delivery_note_id`） |
+| `delivery_note_no` | string? | 关联送货单号（`t_delivery_note.delivery_note_no`） |
+
+工单字段段（JOIN `t_part`）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `part_id` | string (i64) | 工单雪花 ID |
+| `serial_no` | string? | 工单序列号（手工工单可空） |
+| `drawing_no` | string | 图号 |
+| `name` | string | 工单名 |
+| `order_no` | string? | 订单号 |
+| `planned_delivery_date` | date | 计划交付日（`t_part.planned_delivery_date`，**非空列**；两个 query 参数 `planned_delivery_date_from` / `_to` 即作用于它） |
+| `is_urgent` | bool | 是否加急；纯展示字段，本 VO 端点不按它排序 |
+| `part_version` | i32 | part 聚合 version（**caller OCC 必须用 `version`（`t_part_batch.version`），不能用本字段**） |
+| `created_at` | naive datetime | 工单创建时间 |
+| `updated_at` | naive datetime | 工单更新时间 |
+
+客户解析段（LEFT JOIN `t_customer` + 自连 L1 一次拼齐）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `customer_id` | string (i64) | 工单客户 id（`t_part.customer_id`） |
+| `customer_name` | string? | 客户名（`t_customer.name`） |
+| `l1_customer_name` | string? | L1 客户名（`c_l1.id = c.parent_id` → `c_l1.name`；**不回落到 `c.name`**，故客户自身即 L1（`parent_id IS NULL`）时为 `null`。注意与 `GET /prod/batches/inspection` 的同名派生口径不同 —— 那个 VO 走 `COALESCE`，自身即 L1 时等于 `customer_name`） |
+
+SQL 形态：单条 SQL 9 个 JOIN / 10 张表（`t_part_batch` + `t_part` + `t_customer` +
+自连 L1 `t_customer` + `t_shelf` + `t_worker` + `t_outsource_company` +
+`t_process_chain_step` + `t_process` + `t_delivery_note`）。
+
+> **2026-10-03 迁入本节**：本表原先挂在 `inspection.md` 的
+> `GET /api/v2/prod/batches/inspection` 端点段下，但该端点已于同日换成 13 字段的
+> `InspectionQueueItemOut`、不再共用本 VO，返修两条端点仍在用 ⇒ 表随 VO 实际宿主
+> 迁到本节。`GET /prod/batches/inspection` 的字段表见
+> [`./inspection.md`](./inspection.md#inspectionqueueitemout-字段)。
+
 ### `GET /api/v2/prod/batches/repairing`
 
 权限: **Manager / Inspector**
@@ -433,7 +510,8 @@ Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 > 判「返修中」一律读 `is_repairing`。标记与 `status` **正交**的完整推导见本节末
 > 「返修标记与 status 正交 —— 可达链」。
 >
-> 返修标记随 `BatchOut`（= `InspectionBatchListItemOut`）的字段
+> 返修标记随 `BatchOut`（= [`InspectionBatchListItemOut`](#inspectionbatchlistitemout-字段)，
+> 字段表见上一节）的字段
 > `is_repairing: bool` 一起返回 —— 「只有 status」的端点会让前端彻底失去
 > 「返修中」信号（改造前靠 `status === 'REPAIRING'` 判定，改造后任何接口都拿不到
 > 该值）。影响端点：`GET /prod/batches/repairing`、`GET /prod/batches/repair`、

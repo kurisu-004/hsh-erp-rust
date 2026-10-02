@@ -102,8 +102,8 @@ Response 200 `data`：`PartBatchListItemOut[]`，数组按 `batch_no ASC` 升序
 > 该字段**，属文档漂移，本次补齐。背景与端点影响面见
 > [`./lifecycle.md` § GET /api/v2/prod/batches/repairing](./lifecycle.md#get-apiv2prodbatchesrepairing)；
 > 返修两条端点（`GET /prod/batches/repair` / `repairing`）用的宽 VO
-> （`InspectionBatchListItemOut`）字段表见
-> [`./lifecycle.md`](./lifecycle.md#get-apiv2prodbatchesrepair)；
+> （`InspectionBatchListItemOut`，28 字段）字段表见
+> [`./lifecycle.md`](./lifecycle.md#inspectionbatchlistitemout-字段)；
 > `GET /prod/batches/inspection` 已于 2026-10-03 换成精简 VO
 > （`InspectionQueueItemOut`，13 字段），见
 > [`./inspection.md`](./inspection.md#get-apiv2prodbatchesinspection)。
