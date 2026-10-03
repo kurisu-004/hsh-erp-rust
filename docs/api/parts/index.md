@@ -7,7 +7,7 @@
 >
 > **⚠️ 2026-10-02 域收窄**：以**单个批次**为操作对象的 25 条路由已从 `/api/v2/parts/*` 迁到 `/api/v2/prod/batches/*`，锚点由 `part_id` 改为 `batch_id`。**part 域现在只剩多批次动作（`/{part_id}/cancel` / `force-complete`）与非批次动作（CRUD / 文件 / 列表 / `GET /{part_id}/batches`）**。本表仍列出迁出的端点并指向新路径，便于按动作查文档；25 条逐条清单见 [`../production/batches.md`](../production/batches.md#2026-10-02-t_part_batch-子资源迁入)。
 > **⚠️ 2026-10-03 再收窄 2 条**：`/parts/outsource-in-flight` 与 `/parts/outsource-sendable` 两个外协读端点迁往 outsource 域（旧路径无 alias，见下表对应两行）。这两条与下表的 `GET /outsource-shipments/in-flight` / `GET /outsource-sendable` 行由**读侧分支**在同一次合并中落地，单分支快照下不存在。
-> **计数口径（2026-10-03 review 第 1 轮厘清）**：本表登记 **53 行**，其中 **27 行**指向已迁出 part 域的端点（25 条 batch 子资源 + 2 条外协读端点）、**2 行**是已下线端点（`send-to-programming` / `recall-to-programming`，返回 404），故 part 域**实际注册**端点 = 53 − 27 − 2 = **24**，与 `src/modules/part/mod.rs::router()` 的 method 级注册数逐条对齐（`GET /` + `POST /` 算 2 条）。
+> **计数口径（2026-10-03 登记）**：本表登记 **53 行**，其中 **27 行**指向已迁出 part 域的端点（25 条 batch 子资源 + 2 条外协读端点）、**2 行**是已下线端点（`send-to-programming` / `recall-to-programming`，返回 404），故 part 域**实际注册**端点 = 53 − 27 − 2 = **24**，与 `src/modules/part/mod.rs::router()` 的 method 级注册数逐条对齐（`GET /` + `POST /` 算 2 条）。
 > 已拆为子目录：
 >
 > 导航：[**`index.md`**](./index.md) · [`crud.md`](./crud.md) · [`lifecycle.md`](./lifecycle.md) · [`inspection.md`](./inspection.md) · [`batch.md`](./batch.md)
@@ -87,7 +87,10 @@
 > 同 nest 内**静态段必须先于 `/{batch_id}` 注册**：`POST /prod/batches/scan/deliver`（首段静态
 > `scan`）与 `POST /prod/batches/{batch_id}/*` 段数相同，靠 axum / matchit 的静态优先规则消解。
 >
-> axum `/:col` 占位匹配会**先吃静态段**——任何静态段如果排在 `/{part_id}` 之后都会被解析成 `part_id`，返回 404。
+> axum / matchit 的匹配规则是**静态段优先、参数段兜底**——任何静态段如果排在
+> `/{part_id}` 之后，都会被 `/{part_id}` 吃掉并交给 `Path<i64>` 反序列化
+> （`ErrorKind::ParseError`）→ **400**，不是 404。写文档时注意区分两种「打不到」：
+> 有 catch-all 兜底 ⇒ 400；没有任何路由匹配 ⇒ 404。
 
 ---
 
@@ -373,4 +376,4 @@ part / lifecycle 错误码（20101 / 20103 / 20104 / 20109 / 20111 / 20115 / 201
 - 状态机：`src/modules/part/statemachine.rs`
 - 错误码：`src/shared/error.rs::code`
 - worker-scan 联动：详见 [`../production/worker-pool.md`](../production/worker-pool.md)
-- Python myERP 参考：`/Users/ren/Code/myERP/api/v1/part.py`。**口径说明（2026-10-03 review 第 1 轮厘清）**：此处的「端点数」一律指 **router 口径的 method 级注册数**（`GET /` + `POST /` 算 2 条），即 part 域 **24** 条（推导见文件头「计数口径」一节）；旧文案写的「本目录 18 个端点 / 32 个 Python 独有端点 / 18 + 32 = 50 ≠ 46」三者互相对不上，是 2026-10-02 域收窄前的残留计数，已作废。逐条 Python↔Rust 差异见 [`../inconsistencies.md`](../inconsistencies.md)
+- Python myERP 参考：`/Users/ren/Code/myERP/api/v1/part.py`。**端点数口径**：一律按 **router 口径的 method 级注册数**计（`GET /` + `POST /` 算 2 条），即 part 域 **24** 条（推导见文件头「计数口径」一节）。逐条 Python↔Rust 差异见 [`../inconsistencies.md`](../inconsistencies.md)

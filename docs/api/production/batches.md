@@ -140,6 +140,21 @@
 | `quantity` | i32? | — | 部分发送数量；缺省或 `== 批次量` = 整批 |
 | `note` | string? | — | 落到 `t_part_event.note` 与 quote event `SENT` 的 note |
 
+> ⚠️ **工序字段名 = `process_id`，不是 `next_process_id`**（2026-10-03 登记）。本字段
+> **无 `#[serde(default)]`**，是必填：`SendToOutsourceRequest` 也**没有**
+> `deny_unknown_fields`，所以发 `next_process_id` 会被 serde **静默丢弃**，紧接着因
+> 必填字段缺失而失败。失败形态是 **`422` + 纯文本**（axum `Json` 提取器的
+> `MissingField`，`tests/iam/wx_bind.rs` 有同形态先例），响应体形如
+> `Failed to deserialize the JSON body into the target type: missing field \`process_id\``，
+> **不是**业务信封、也不是 `BIZ_PROCESS_NOT_FOUND` —— 排查未升级的历史客户端时按这个
+> 特征认。
+>
+> 取舍：DTO **不加** `deny_unknown_fields`。加了以后任何多余字段都直接 422，迁移面
+> 远大于收益（会连带打到 Python v1 客户端等已上线的调用方）；字段名保持 `process_id`
+> 是因为它与已上线的 Python v1 客户端绑定，改名会破坏它。**前端已适配**
+> （`SendToOutsourcePayload` 的键为 `process_id`，并有契约用例逐字钉死 + 反断言禁止
+> `next_process_id` 出现在 body 里），两个仓同一次编排合入。
+
 **价来源二选一**：`direct` 与 `quote_id` 必须恰给一个，否则 `400 20104 BIZ_INVALID_VALUE`。
 
 - **APPROVAL**：`quote_id` 必须是 `APPROVED`，且 `part_id` / `outsource_company_id` /
@@ -205,11 +220,9 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 | `quantity` | i32? | — | 部分接收数量；缺省或 `== 批次量` = 整批 |
 | `note` | string? | — | 落到 `t_part_event.note` 与 quote event `RECEIVED` 的 note |
 
-> ⚠️ **前端 `next_process_id` 失配（计划接受的现状）**：本 DTO **没有** `deny_unknown_fields`，
-> serde 静默丢弃未声明字段。前端若继续发旧字段名（如 `process_id`）而不发
-> `next_process_id`，该字段会以 `0` 落到解析器 → `BIZ_PROCESS_NOT_FOUND(20801)`。
-> 前端在另一个仓改，本轮不加 `deny_unknown_fields`（会让所有历史多余字段直接 400，
-> 迁移面远大于收益）；接入前请确认前端已切到 `next_process_id`。
+> ⚠️ **本端点与 send 端的工序字段名不同，勿互相套用**：`send-to-outsource` 用
+> `process_id`（外协**这道**工序），`receive-from-outsource` 用 `next_process_id`
+> （收回后**下一道**工序，用于重新入池）。两者都是必填、都没有 `#[serde(default)]`。
 
 2026-10-03 起入参**不再复用** `PlaceOnShelfRequest`（后者仍被 `place-on-shelf` /
 `release-from-programming` 共用，加 `quantity` 会污染它们的契约）。
@@ -260,11 +273,10 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 `current_process_id` / `current_process_step_id`（出池），并把开口 shipment 标
 `RECEIVED`。
 
-`t_part_event.event_type` = `RECEIVED_TO_INSPECTION`（2026-10-03 由
-`RECEIVED_FROM_OUTSOURCE_INSPECTED` 改名：旧字面量 33 字符超过该列 `varchar(30)`，
-PG 报 22001 使整个事务 500 —— 该端点此前**从未被集成测试覆盖**，一直是坏的。
-前端 `PartEventType` 联合类型里本就没有旧字面量，改名无消费方影响；WS 事件名
-`PART_RECEIVED_FROM_OUTSOURCE_INSPECTED` 逐字不变）。
+`t_part_event.event_type` = `RECEIVED_TO_INSPECTION`（外协收回 → 直接进品检）。
+**列宽是硬约束**：该列是 `varchar(30)`，字面量超 30 字符 → PG `22001` 使**整个
+事务**回滚；本字面量 22 字符在限内。WS 事件名 `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED`
+不在 payload 内、不受该列宽约束，逐字不变。
 
 ### 外协收发守卫一览
 
@@ -280,6 +292,7 @@ PG 报 22001 使整个事务 500 —— 该端点此前**从未被集成测试�
 | 公司在册 / 启用 | 21201 / 21205 | 公司不存在 / 已停用 |
 | 工艺链 | 20706 | part 未绑定 `process_chain_id` |
 | 重复开口 shipment | 21502 | 同一批次已有 `OUTSOURCING` shipment |
+| 入参字段名 | 422（axum `Json` 提取器，**非业务信封**） | body 缺 `process_id`（send）/ `next_process_id`（receive），或字段名拼错被静默丢弃 |
 
 ### 已知不一致（2026-10-03 登记，未修）
 
@@ -287,22 +300,21 @@ PG 报 22001 使整个事务 500 —— 该端点此前**从未被集成测试�
    `PENDING → OUTSOURCE`。故 `send_to_outsource` 实际只能从 `PENDING` 发起；service
    里「`IN_PROCESS` 必须在 `PRODUCTION_SHELF`」那段守恒在当前代码里不可达，端点注释
    与早期文档写的「`PENDING` 或 `IN_PROCESS+PRODUCTION_SHELF`」与实现不符。修法是给
-   状态机补这条边（`src/modules/part/statemachine.rs`），属 part 域改动，不在本轮范围。
-2. **`t_part_event.event_type` 与 `backend-python` 词汇分叉**（M4）：本仓 2026-10-03
-   把直送品检事件改名为 `RECEIVED_TO_INSPECTION`（见上节），而
+   状态机补这条边（`src/modules/part/statemachine.rs`），属 part 域改动，不在本域范围。
+2. **`t_part_event.event_type` 与 `backend-python` 词汇分叉**（2026-10-03 登记）：本仓
+   直送品检事件用 `RECEIVED_TO_INSPECTION`（见上节），而
    `backend-python/model/enums.py` 仍定义 `RECEIVED_FROM_OUTSOURCE_INSPECTED`。两个
-   后端共库，同一业务动作会按「谁服务的」产出两种 `event_type` 值。保留改名（仓内零
-   消费方、无历史行需要迁移），但词汇分叉未消除。
+   后端共库，同一业务动作会按「谁服务的」产出两种 `event_type` 值。分叉保留（仓内零
+   消费方、无历史行需要迁移）。
    **彻底解决需追加一条 append-only migration**：
    `ALTER TABLE t_part_event ALTER COLUMN event_type TYPE varchar(40);` —— 本轮不做
    （列宽是既有的全表约束，改它影响所有域的历史行与 Python 端写入路径）。
-3. **`uq_t_part_batch_part_no` 的 `MAX(batch_no)+1` 竞态**（MINOR-5）：`_split_batch_inner`
+3. **`uq_t_part_batch_part_no` 的 `MAX(batch_no)+1` 竞态**（2026-10-03 登记）：`_split_batch_inner`
    先 `SELECT COALESCE(MAX(batch_no),0)+1` 再 INSERT，两条语句之间无锁。并发拆批
    （例如两个批次同时对外协做部分发送）会算出同一个 `batch_no` → 撞唯一约束 → 整事务
-   **500** 而非 409。属既有缺陷，本 PR 新增 2 个调用点（send / receive 的部分收发）
-   扩大了暴露面，但**本轮只登记不修**：修法要么给拆批加 part 级 advisory lock、要么
-   把 `batch_no` 改成可重试分配，两条都会动到所有拆批调用方（`split_batch` /
-   `split_batch_for_partial_pass` / pickup 路径），超出本轮范围。
+   **500** 而非 409。**只登记不修**：修法要么给拆批加 part 级 advisory lock、要么把
+   `batch_no` 改成可重试分配，两条都会动到所有拆批调用方（`split_batch` /
+   `split_batch_for_partial_pass` / pickup 路径），超出本域范围。
 
 ---
 

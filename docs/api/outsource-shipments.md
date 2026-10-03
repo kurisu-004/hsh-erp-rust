@@ -26,17 +26,17 @@
 > 路由注册：`in-flight` 是 1 段静态路径，与 2 段的 `/{id}/reconcile-update` 无
 > matchit 冲突（见 `src/modules/outsource/handler.rs::shipment_router`）。
 
-> ⚠️ **合并时点（2026-10-03 review 第 1 轮 M1 登记）**：本文件描述的
-> `GET /in-flight` 与写端点 `POST /{id}/reconcile-update` **不在同一条开发分支上**，
-> 但在**同一次编排中先后合入 master**，合并后本文件整体自洽。若只看其中任一分支的
-> 单分支快照，`in-flight` 都**不在册**（本仓 `shipment_router()` 只注册
-> `/{id}/reconcile-update`），此时该路径 404 —— 这是分支切分期的正常状态，不是契约
-> 缺失。**别据此撤掉本节**。
+> ⚠️ **合并时点（2026-10-03 登记）**：本文件描述的 `GET /in-flight` 与写端点
+> `POST /{id}/reconcile-update` **不在同一条开发分支上**，但在**同一次编排中先后合入
+> master**，合并后本文件整体自洽。若只看其中任一分支的单分支快照，`in-flight` 都
+> **不在册**（本仓 `shipment_router()` 只注册 `/{id}/reconcile-update`），此时该路径
+> 404 —— 这是分支切分期的正常状态，不是契约缺失。**别据此撤掉本节**。
 >
 > 旧路径 `/api/v2/parts/outsource-in-flight` 已下线：不带 alias，且**返回 400 而非
 > 404** —— part 域还有 `GET /parts/{part_id}` catch-all，matchit 静态段优先、参数段
-> 兜底，于是 `outsource-in-flight` 被当作 `part_id` 交给雪花 ID 反序列化，解析失败即
-> 400。
+> 兜底，于是 `outsource-in-flight` 被当作 `part_id` 交给雪花 ID 反序列化
+> （`Path<i64>` 的 `ErrorKind::ParseError`）→ 400。400 比 404 更安全：404 无法区分
+> 「端点被删」与「端点从未存在」，400 至少能指出「这里现在要一个雪花 ID」。
 
 ---
 
@@ -147,9 +147,10 @@ shipment**：
 | `quantity` | i32? | — | 覆盖发出量；`<= 0` → 400 `20104 BIZ_INVALID_VALUE` |
 | `is_billed` | bool? | — | 是否已开票 |
 
-> 2026-10-03 订正：本表此前列的 `status` / `received_at` / `note` **三个字段在代码里
-> 根本不存在**（DTO 只有上面 4 个），且状态机不允许对账端点改 `status`（外协收回由
-> `receive-from-outsource` 改），已删除。
+> 本 DTO **只有**上面 4 个字段。尤其**不含** `status` / `received_at` / `note`：
+> shipment 的状态与收货时间只能由外协回收侧（`receive-from-outsource` /
+> `receive-from-outsource-to-inspection`）在**整批**回收时改，对账端点不参与状态机，
+> 备注也没有落库列可写。
 
 ---
 

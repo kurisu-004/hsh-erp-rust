@@ -7,8 +7,8 @@
 //! - DIRECT 免审批直发（2026-10-03：复用活跃报价 / 自动建 0 元占位报价 / 与
 //!   quote_id 互斥 / 必须给价来源）
 //! - 部分发送 / 部分接收（2026-10-03：拆批语义 + shipment 记账口径）
-//! - 拆批的 OCC 契约（2026-10-03 review 第 1 轮：源批次 version +1、子批次用读回
-//!   行 version 作锚、二次收发必须先刷新列表）
+//! - 拆批的 OCC 契约（2026-10-03：源批次 version +1、子批次用读回行 version 作锚、
+//!   二次收发必须先刷新列表）
 //! - 部分收发的派生契约（min-progress：部分发送后 part 停在 `PENDING`、部分接收
 //!   后 part 变 `IN_PROCESS`）
 //! - DIRECT 占位报价唯一性（migration 008：同 tuple 只留 1 条 `is_direct=true`）
@@ -868,8 +868,8 @@ async fn send_to_outsource_direct_with_quote_id_rejected() {
 
 /// 2026-10-03：既不给 `direct` 也不给 `quote_id` → 400。
 ///
-/// 这是「外协对账单价恒为 0」的根因守卫：此前不传价来源会被静默接受，shipment
-/// 的 `unit_price` 落 0 且无人察觉。
+/// 守卫的必要性：没有价来源时 shipment 的 `unit_price` 只能落 0，而对账页看到
+/// 「单价 0」无从判断是漏填还是 DIRECT 免审批直发。
 #[tokio::test]
 async fn send_to_outsource_without_price_source_rejected() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -985,8 +985,8 @@ async fn send_to_outsource_rejects_company_without_process_mapping() {
 /// 2026-10-03 部分发送：`quantity = 批次量的一半` → 源批次留在原处（量减半、
 /// 状态/货架不变），新子批次 OUTSOURCE，shipment 记本次发送量。
 ///
-/// 锁住的是「拆批而不是静默整批」——此前 DTO 无 `quantity` 字段，serde 静默忽略，
-/// 用户选 5 件实际整批发出。
+/// 锁住的是「拆批而不是静默整批」：`quantity` 缺省即整批，所以显式的部分量必须真的
+/// 走拆批路径，否则界面上选 5 件、实际整批发出。
 #[tokio::test]
 async fn send_to_outsource_partial_quantity_splits_batch() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -1069,20 +1069,20 @@ async fn send_to_outsource_partial_quantity_splits_batch() {
     assert_eq!(ev_qty, 2);
 }
 
-/// 2026-10-03（MINOR-3）：部分发送时子批次的 OCC 锚必须是**读回行**的 version，
-/// 不能拿请求里的 `req.version` 顶替 —— 子批次被 `_split_batch_inner` 写死
-/// `version = 0`，拿一个非 0 的 `req.version` 去撞必然 0 行。
+/// 2026-10-03：部分发送时子批次的 OCC 锚必须是**读回行**的 version，不能拿请求里的
+/// `req.version` 顶替 —— 子批次被 `_split_batch_inner` 写死 `version = 0`，拿一个
+/// 非 0 的 `req.version` 去撞必然 0 行。
 ///
-/// 用例把源批次 version 预置成 2（真实场景：批次此前已流转过），这样两个 version
-/// 值才真的不同 —— 若用 version=0 的批次，`req.version` 恰好等于子批次的 0，
-/// 错实现也能蒙混过关，本用例就失去鉴别力。
+/// 用例把源批次 version 预置成 2（真实场景：批次已经流转过若干次），这样两个 version
+/// 值才真的不同 —— 若用 version=0 的批次，`req.version` 恰好等于子批次的 0，错实现
+/// 也能蒙混过关，本用例就失去鉴别力。
 #[tokio::test]
 async fn send_to_outsource_partial_anchors_child_on_read_back_version() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let customer_id = insert_l1_customer(&pool, "PVer", "L").await;
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
-    // 源批次此前已流转过（version 2），与子批次的 0 明确不同
+    // 源批次已流转过若干次（version 2），与子批次的 0 明确不同
     sqlx::query("UPDATE t_part_batch SET version = 2 WHERE id = $1")
         .bind(bid)
         .execute(&pool)
@@ -1501,7 +1501,7 @@ async fn receive_from_outsource_partial_quantity_keeps_shipment_open() {
     assert_eq!(part_status(&pool, part_id).await, "IN_PROCESS");
 }
 
-/// 2026-10-03（MINOR-3）：部分接收 → 再整批回收余量，这条链上
+/// 2026-10-03：部分接收 → 再整批回收余量，这条链上
 /// `uq_t_outsource_shipment_open_batch` 的不变式是「**同一批次同时最多一张开口
 /// shipment**」：部分接收期间开口不关，第二次整批回收才关它，且此时 quote event
 /// `RECEIVED` 只写一次。
@@ -1625,8 +1625,8 @@ async fn receive_from_outsource_partial_then_whole_closes_shipment() {
     assert_eq!(part_status(&pool, part_id).await, "IN_PROCESS");
 }
 
-/// 2026-10-03（MINOR-3 负向）：拆批把源批次 version +1 之后，用**旧** version 再
-/// 回收一次必须 409。这条锁住「二次收发必须先刷新列表」这条调用方契约。
+/// 2026-10-03 负向用例：拆批把源批次 version +1 之后，用**旧** version 再回收一次
+/// 必须 409。这条锁住「二次收发必须先刷新列表」这条调用方契约。
 #[tokio::test]
 async fn receive_from_outsource_partial_then_stale_version_conflicts() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;

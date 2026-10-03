@@ -304,9 +304,9 @@ pub struct RecallToPendingRequest {
 ///   `(part_id, outsource_company_id, process_id)` 找活跃 APPROVED 报价复用；找不到
 ///   则自动建一条 `price = 0` 的 APPROVED 占位报价（`is_direct = true`），
 ///   shipment 的 `unit_price` 因而可能是 0 —— 对账时靠该报价的 `note` 识别。
-/// - 两者都不传 / 同时传 → `400 BIZ_INVALID_VALUE`（service 层显式校验）。
-///   此前两者都不传是**允许**的，shipment 单价恒落 0 且无人察觉（外协对账单价
-///   恒为 0 的根因）。
+/// - 两者都不传 / 同时传 → `400 BIZ_INVALID_VALUE`（service 层显式校验）。守卫的
+///   必要性：没有价来源时 shipment 的 `unit_price` 只能是 0，外协对账页会看到
+///   「单价 0」却无从判断是漏填还是免审批直发。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct SendToOutsourceRequest {
     pub version: i32,
@@ -315,10 +315,16 @@ pub struct SendToOutsourceRequest {
     /// 外协加工的**工序** id（`t_process.category` 必须为 `'OUTSOURCE'`，且该公司
     /// 必须映射该工序）。
     ///
-    /// 2026-10-03 保留本名不改：前端此前发的是 `next_process_id`（它一直按「下一道
-    /// 工序」的措辞建模），但该字段名与已上线的 Python v1 客户端绑定，改名会破坏
-    /// 它；由前端去对齐后端。契约见
-    /// `docs/api/production/batches.md#外协流转send--receive`。
+    /// 字段名是 `process_id` 而非 `next_process_id`：本名与已上线的 Python v1 客户端
+    /// 绑定，改名会破坏它。前端已按本名对齐（`SendToOutsourcePayload.process_id`，
+    /// 契约用例逐字钉死并反断言 body 里不得出现 `next_process_id`）。
+    ///
+    /// ⚠️ 本字段**无 `serde(default)`**，是必填；本结构也**没有**
+    /// `deny_unknown_fields`，故发 `next_process_id` 会被静默丢弃并因必填字段缺失
+    /// 而失败：**`422` + 纯文本** `missing field \`process_id\``（axum `Json` 提取器），
+    /// 不是业务信封、不要按 `BIZ_PROCESS_NOT_FOUND` 排查。刻意不加
+    /// `deny_unknown_fields`：那会让任何多余字段直接 422，迁移面远大于收益。
+    /// 契约见 `docs/api/production/batches.md#外协流转send--receive`。
     #[serde(deserialize_with = "deserialize_i64")]
     pub process_id: i64,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]

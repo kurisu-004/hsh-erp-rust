@@ -55,8 +55,9 @@ const DIRECT_PLACEHOLDER_NOTE: &str = "DIRECT 直发自动创建（免审批，�
 /// - `Ok(Some(q))` = 部分量，已守 `0 < q < batch_quantity`
 /// - `Err` = 数量非法（`q <= 0` / `q > 批次量`）→ 400 `BIZ_INVALID_VALUE`
 ///
-/// 2026-10-03 新增。此前两个端点的 DTO 都没有 `quantity` 字段，serde **静默忽略**
-/// 前端传来的部分量 → 用户选 5 件、实际整批发出。
+/// 2026-10-03 新增。守卫的必要性：`quantity` 缺省即整批，若不做「显式部分量」的
+/// 归一化，调用方传了部分量却因字段名不匹配被 serde 静默忽略，界面上选 5 件、
+/// 实际整批发出。
 #[inline]
 fn resolve_partial_quantity(
     quantity: Option<i32>,
@@ -255,9 +256,8 @@ impl BatchService {
         current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
         // ---- 价来源守卫：APPROVAL（quote_id）与 DIRECT（direct=true）互斥且必居其一 ----
         //
-        // 2026-10-03 新增。此前两者都不给是允许的，路径直接落
-        // `unit_price = Decimal::new(0, 0)` —— 前端从不传 `quote_id`，于是外协对账
-        // 的单价恒为 0 且没有任何报错。现在把「没有价来源」显式拒掉。
+        // 2026-10-03 新增。守卫的必要性：没有价来源时 shipment 的 `unit_price` 只能
+        // 落 0，而对账页看到「单价 0」无从判断是漏填还是 DIRECT 免审批直发。
         let direct = req.direct.unwrap_or(false);
         if direct && req.quote_id.is_some() {
             return Err(AppError::biz(
@@ -319,11 +319,10 @@ impl BatchService {
                 format!("outsource_company {} 已停用", req.outsource_company_id),
             ));
         }
-        // 2026-10-03 新增守卫：外协工序必须是 OUTSOURCE 类别。
-        //
-        // 此前只校验了「process 存在」，于是把货派给一道**非外协**工序（例如内部
-        // 装配工序）也能通过 —— 批次随后被标成 OUTSOURCE + holder 写外协公司，
-        // 库内从此出现「这道工序由不需要它的公司加工」的脏关系，且无任何报错。
+        // 2026-10-03 新增守卫：外协工序必须是 OUTSOURCE 类别。守卫的必要性：只校验
+        // 「process 存在」的话，把货派给一道**非外协**工序（例如内部装配工序）也会
+        // 通过，批次随后被标成 OUTSOURCE + holder 写外协公司，库内会出现
+        // 「这道工序由不需要它的公司加工」的脏关系。
         // `process_get_category` 只查未软删行，故「不存在」仍由上面的
         // `BIZ_PROCESS_NOT_FOUND` 先行拦掉。
         let category = {
@@ -805,13 +804,11 @@ impl BatchService {
         repo.insert_part_event(NewPartEvent {
             id: snowflake.next_id(),
             part_id,
-            // 2026-10-03 修正：原字面量 `RECEIVED_FROM_OUTSOURCE_INSPECTED`（33 字符）
-            // 超过 `t_part_event.event_type` 的 `varchar(30)` → PG 报 22001，整个事务
-            // 500。该端点此前**从未被集成测试覆盖**，所以「直送品检」一直是坏的。
-            // 新字面量 22 字符、语义不变（外协收回 → 直接进品检）；前端
-            // `PartEventType` 联合类型里本就没有旧字面量（改前改后都无消费方），
-            // WS 事件名 `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED` 不在 payload 内、
-            // 也不受列宽约束，保持逐字不变。
+            // 列宽硬约束（2026-10-03 核对）：`t_part_event.event_type` 是
+            // `varchar(30)`，字面量超 30 字符 → PG 22001 使**整个事务**回滚。本字面量
+            // 22 字符、语义为「外协收回 → 直接进品检」。
+            // WS 事件名 `PART_RECEIVED_FROM_OUTSOURCE_INSPECTED` 不在本 payload 内、
+            // 不受该列宽约束，逐字不变。
             event_type: "RECEIVED_TO_INSPECTION",
             from_status: Some("OUTSOURCE"),
             to_status: Some("INSPECTION"),
