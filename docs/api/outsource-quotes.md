@@ -266,7 +266,7 @@ id ASC` 排序）。`total` 的口径与 list 的 WHERE + `DISTINCT ON` 逐条�
 
 ## 集成测试
 
-- `tests/outsource/quote.rs`（9+ 用例：create DRAFT / 唯一性 21303 / update DRAFT happy / update SUBMITTED 21302 / submit / approve MANAGER-only / reject review_note 必填 / soft-delete 仅 DRAFT/REJECTED / **list keyword 零命中返 0 行**（带「无 keyword 返全量」对照组））
+- `tests/outsource/quote.rs`（12 用例：create DRAFT / 唯一性 21303 / update DRAFT happy / update SUBMITTED 21302 / submit / approve MANAGER-only / reject review_note 必填 / soft-delete 仅 DRAFT/REJECTED / **list keyword 零命中返 0 行**（带「无 keyword 返全量」对照组）+ 4 条 `customer_id`）
   - `list_quotes_customer_id_l1_expands_to_children_without_keyword` — 只给 L1
     `customer_id` 即命中其全部 L2 子客户的报价，**不需 keyword**（曾恒返空）
   - `list_quotes_customer_id_l2_returns_only_its_own_quotes` — 传 L2 只回该 L2 的
