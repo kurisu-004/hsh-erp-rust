@@ -63,7 +63,7 @@
 | POST | `/api/v2/prod/batches/{batch_id}/scan-inspect` | Manager / Inspector | 扫码品检 | [`../parts/inspection.md` 状态机表](../parts/inspection.md#状态机can_transition_to-白名单)（尚无独立章节） |
 | POST | `/api/v2/prod/batches/{batch_id}/split` | Manager / Clerk | 拆分批次 | [`../parts/batch.md`](../parts/batch.md#post-apiv2prodbatchesbatch_idsplit) |
 | POST | `/api/v2/prod/batches/{batch_id}/cancel` | Manager / Clerk | 取消**单个**批次 | [`../parts/index.md`](../parts/index.md)（尚无独立章节） |
-| POST | `/api/v2/prod/batches/{batch_id}/pick-up` | Manager / Clerk / ShelfAccount | 手动 pick-up 兜底 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idpick-up) |
+| POST | `/api/v2/prod/batches/{batch_id}/pick-up` | Manager / Clerk / ShelfAccount | 手动 pick-up 兜底（**支持部分领取**：传 `quantity` 小于批量时自动拆批） | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idpick-up) |
 | POST | `/api/v2/prod/batches/scan/deliver` | Manager / Clerk | 扫码发货（**无 Path**，`ScanDeliverPartRequest` body 不变） | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesscandeliver) |
 
 ### 静态批量 / 事件（3 条，无 Path，请求体逐字不变）

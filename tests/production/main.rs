@@ -18,11 +18,14 @@
 //! - pending_programming.rs     ← 2026-10-01 新增（prod::programming 待编程一览 1 端点，10 场景）
 //! - shelf_process.rs          ← 2026-10-02 新增（prod::shelf_process 3 端点；自
 //!   tests/shelf/api.rs 迁入整组替换场景 + 补全集查询 / 20505 / 旧路径 404 场景）
+//! - pickup.rs                 ← 2026-10-03 新增（pick-up 整批 + **部分领取自动拆批**，
+//!   9 场景）
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
 mod batch;
 mod pending_programming;
+mod pickup;
 mod process;
 mod process_chain;
 mod shelf_process;
