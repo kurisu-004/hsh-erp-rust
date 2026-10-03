@@ -219,7 +219,8 @@ pub mod code {
     pub const BIZ_APPLICANT_BAD_CUSTOMER: i32 = 21003; // customer 不存在或不是一级
     pub const BIZ_APPLICANT_IN_USE: i32 = 21004; // 被 part.applicant_name 引用 → 拒软删
 
-    // 211xx 零件文件（t_part_file，统一 5 类；含送货模板相关码）
+    // 211xx 零件文件（t_part_file，统一 5 类；另含 4 个送货单打印模板码 21109 / 21111 /
+    // 21112 / 21113 —— 由 python 端判定并产出、rust 原样透传，rust 侧注册仅为识别 / 回显）
     pub const BIZ_PART_FILE_NOT_FOUND: i32 = 21101;
     pub const BIZ_PART_FILE_BAD_TYPE: i32 = 21102; // 扩展名与 kind 不匹配
     pub const BIZ_PART_FILE_TOO_LARGE: i32 = 21103; // 文件大小 ≤0 或 > cos_max_file_size_bytes
@@ -229,7 +230,9 @@ pub mod code {
     // 2026-10-03：打印端点改纯转发后本码无 rust 生产点 —— 由 python 端判定并产出、rust 原样透传，
     // rust 侧无任何送货单模板配置。保留常量供 rust 识别 / 回显 python 产出的码。
     pub const BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED: i32 = 21109; // python 侧：客户 prefix 未配出 xlsx 模板
-    pub const BIZ_DELIVERY_PART_STATUS_INVALID: i32 = 21111; // 所选零件状态非 READY_TO_SHIP
+    // 2026-10-03：打印端点改纯转发后本码无 rust 生产点 —— 由 python 端判定并产出、rust 原样透传，
+    // rust 侧无零件状态校验。保留常量供 rust 识别 / 回显 python 产出的码。
+    pub const BIZ_DELIVERY_PART_STATUS_INVALID: i32 = 21111; // python 侧：所选零件状态非 READY_TO_SHIP
     // 2026-10-03：同上，纯 python 端产出、rust 原样透传，rust 侧无模板容量概念。
     pub const BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS: i32 = 21112; // python 侧：所选零件超过模板容量（法 14 / 路 25）
     pub const BIZ_DELIVERY_PRINT_BAD_ORDER: i32 = 21113; // custom_order 含非法 batch id 或漏行（422）

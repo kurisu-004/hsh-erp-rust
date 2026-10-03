@@ -31,14 +31,17 @@
   缺 / 坏 / 过期 token → 40100 / 40102 / 40105。
 - RBAC：`require_any_role([MANAGER, CLERK, INSPECTOR])`，不通过 → 40300 FORBIDDEN。
   `SHELF_ACCOUNT`（货架终端）不放行——它只该扫码，不该开单打印。
-- Python 端这 2 个端点**自身无应用层鉴权**。当前部署形态是 nginx 仍有
-  `location /api/ { proxy_pass http://myerp_backend; }`（前端仓 `frontend/nginx.conf`），
-  所以 `/api/v1` 在网关层仍可被直连；Python 只在 compose 内网经 Rust 触达是**设计意图**，
-  尚未在部署配置上收口。
-- 本 diff（rust 仓）提供的是 `/api/v2` 这一跳的强制 JWT + RBAC 闸门。
-- **收口 `/api/v1` 直连路径是跨仓动作**：前端仓把这 2 个端点从 `apiPrint` 切到
-  `api`（走 `/api/v2`），并下线 nginx 的 `location /api/` 转发块。安全性以那两仓的
-  合入为准；在此之前不能把「Python 端裸开」当作已被部署层挡住的事实。
+- Python 端这 2 个 `/api/v1` 端点**自身无应用层鉴权**，谁能把请求送到它们就等于拿到
+  打印能力。因此本仓提供的**唯一受支持入口**是本文件覆盖的 2 条 `/api/v2` 路径
+  （`/print` 与 `/print-labels`）：强制 JWT + RBAC 在 Rust 侧判定通过，Rust 才会把
+  请求转给 Python。
+- 鉴权凭据**不**透传给 Python：`Authorization` / `Cookie` 被 `filter_request_headers`
+  剥离，Python 侧只能读到 Rust 注入的 `X-Forwarded-User-Id`。Python 端因此不需要、
+  也不应该自己解析 JWT。
+- `/api/v1` **不是**受支持的对外入口。Python 后端只应在内网经 `PYTHON_BACKEND_BASE_URL`
+  被触达（compose 服务名 / 集群内网），对外暴露面以 `/api/v2` 这道闸门收口。
+- 反向代理模板（nginx 配置）归 `frontend/` 子模块所有，不在本仓描述其内容与状态；
+  本仓可核实的契约边界就是上面这几条。
 
 ## 行为（BFF 转发）
 
@@ -103,10 +106,12 @@ Response：Python 的响应原样透传。成功形态：
 | 21113 | BIZ_DELIVERY_PRINT_BAD_ORDER（HTTP 422） | `custom_order` 含非法批次 id 或漏行 |
 | 21401 | BIZ_DELIVERY_NOTE_NOT_FOUND（HTTP 404） | 送货单不存在 |
 
-这 3 个 211xx 模板码与 214xx 送货单码在 `src/shared/error.rs::code` 里**仍然注册**
+表中的 2 个 211xx 模板码与 21401 在 `src/shared/error.rs::code` 里**仍然注册**
 （保留与 Python 错误码表对齐），但 Rust 端已无生产点：链路上的它们全部来自 Python。
-Python 侧还会返回哪些码以 Python 端为准，Rust 侧不预判、不枚举；前端按
-`{code, message, data}` 解封即可。
+两处计数的口径不同，别混：本表只列**这 2 个打印端点**当前由 Python 产出的码；
+211xx 段内「已无 rust 生产点」的**全段**清单是 4 个码（21109 / 21111 / 21112 / 21113），
+见 [`../index.md`](../index.md)。Python 侧还会返回哪些码以 Python 端为准，
+Rust 侧不预判、不枚举；前端按 `{code, message, data}` 解封即可。
 
 ## rust 端错误码
 
