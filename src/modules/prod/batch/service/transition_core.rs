@@ -18,10 +18,10 @@ use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
 use crate::modules::prod::batch::model::TPartBatch;
 use crate::modules::prod::batch::vo::ToXxxOut;
-use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
+use super::guard::{optional_process_chain, optional_step_id};
 
 impl BatchService {
     /// to_ship 共享核心（被单件 / batch 端点共用）。
@@ -288,44 +288,11 @@ impl BatchService {
             Self::_split_for_partial_op(repo, snowflake, &target, quantity, current).await?;
         // 6. UPDATE t_part_batch: INSPECTION → IN_PROCESS + location/holder/process
         // PR-3 批次 step 化：解析 step_id（chain 内 process_id → step_id）。
-        // 注意：part 存在性已在 step 1（PartRepo::get_part_inspected）确认，
-        // 此处只需区分「part 软删 / 并发消失」与「part 未绑定工艺链」两种情形。
-        let row: Option<(Option<i64>,)> = sqlx::query_as(
-            "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(part_id)
-        .fetch_optional(repo.conn_mut())
-        .await?;
-        let chain_id = match row {
-            None => {
-                return Err(AppError::biz(
-                    code::BIZ_PART_NOT_FOUND,
-                    format!("part {part_id} 不存在或已软删"),
-                ));
-            }
-            Some((None,)) => {
-                return Err(AppError::biz(
-                    code::BIZ_PROCESS_CHAIN_REQUIRED,
-                    "to_process: part 必须已绑定工艺链",
-                ));
-            }
-            Some((Some(cid),)) => cid,
-        };
-        let step_id = ProcessChainRepo::resolve_step_id_by_process(
-            repo.conn_mut(),
-            chain_id,
-            next_process_id,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                format!(
-                    "chain {} 内找不到 process_id={} 的活跃 step",
-                    chain_id, next_process_id
-                ),
-            )
-        })?;
+        // 2026-10-03：内联读链改为 `optional_process_chain`（无链放行，step 落
+        // NULL）—— 本调用点此前不查 `BIZ_PROCESS_CHAIN_STEP_NOT_FOUND` 以外的
+        // 链错误，与其余 6 个端点收口到同一对守卫。
+        let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
+        let step_id = optional_step_id(repo.conn_mut(), chain_id, next_process_id).await?;
         // 2026-10-01：写与派生已焊在 status_gate 内（0 行由 gate 抛 40901，
         // 原 `if n == 0` 是死代码）；`rollup.sync` 供第 8 步填
         // `synced_assembly_id`。
@@ -334,7 +301,8 @@ impl BatchService {
                 operated_id,
                 operated_version,
                 shelf_id,
-                Some(step_id),
+                // 2026-10-03：无链时 None ⇒ 写 NULL（与 process 列同一约定）
+                step_id,
                 // 2026-09-30：检验不合格打回生产架 = 进池 → 写目标工序
                 Some(next_process_id),
                 Some(current.id),

@@ -54,7 +54,7 @@
 | POST | `/api/v2/prod/batches/{batch_id}/start-repair` | Manager / Clerk / Inspector | 置 `is_repairing=true` | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idstart-repair) |
 | POST | `/api/v2/prod/batches/{batch_id}/place-on-shelf` | Manager / Clerk | 上架 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idplace-on-shelf) |
 | POST | `/api/v2/prod/batches/{batch_id}/recall-to-pending` | Manager / Clerk | 召回至 PENDING | lifecycle.md 尚无独立章节（见 [`../parts/index.md`](../parts/index.md) 端点表） |
-| POST | `/api/v2/prod/batches/{batch_id}/release-from-programming` | Manager / Clerk | 编程完成释放 | lifecycle.md 尚无独立章节；20706 守卫见 [`./process-chain.md`](./process-chain.md#20706-biz_process_chain_required) |
+| POST | `/api/v2/prod/batches/{batch_id}/release-from-programming` | Manager / Clerk | 编程完成释放 | lifecycle.md 尚无独立章节；工艺链可选守卫见 [`./process-chain.md`](./process-chain.md#20706-biz_process_chain_required) |
 | POST | `/api/v2/prod/batches/{batch_id}/send-to-outsource` | Manager / Clerk / Inspector | 派发外协（APPROVAL / DIRECT 双模式 + 部分发送） | [外协流转](#外协流转send--receive)（本节） |
 | POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource` | Manager / Clerk / Inspector | 外协回收入库（支持部分接收） | [外协流转](#外协流转send--receive)（本节） |
 | POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | Manager / Clerk / Inspector | 外协回收 → 品检（整批） | [外协流转](#外协流转send--receive)（本节） |
@@ -290,7 +290,7 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 | 工序类别 | 20104 | `process.category != 'OUTSOURCE'` |
 | 公司↔工序映射 | 20104 | `t_outsource_company_process` 无该 (company, process) 未删行 |
 | 公司在册 / 启用 | 21201 / 21205 | 公司不存在 / 已停用 |
-| 工艺链 | 20706 | part 未绑定 `process_chain_id` |
+| 工艺链 | 20702 | **part 有链但链内没有该 process 的活跃 step**（2026-10-03 起 part 无链放行，不再返回 20706） |
 | 重复开口 shipment | 21502 | 同一批次已有 `OUTSOURCING` shipment |
 | 入参字段名 | 422（axum `Json` 提取器，**非业务信封**） | body 缺 `process_id`（send）/ `next_process_id`（receive），或字段名拼错被静默丢弃 |
 

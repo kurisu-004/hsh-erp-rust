@@ -16,7 +16,7 @@
 //! ## 2026-10-03 新增 `pool.rs`
 //! `GET /outsource-pool/*` 是看板三件套（counts / {process_id} / state），形态
 //! 照抄 `prod::pool`。候选侧与 `sendable.rs` 同源 SQL，但**不复用
-//! `OutsourceSendableItem`**：看板视角工序已提到顶层，带 `next_process_*` 会
+//! `OutsourceSendableItem`**：看板视角工序已提到顶层，带 `current_process_*` 会
 //! 出现两个真相源。
 
 // 2026-09-22 PR4：复制自 iam/vo/ 范本。

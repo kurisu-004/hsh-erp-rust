@@ -15,7 +15,7 @@
 |---|---|---|---|
 | GET | `/api/v2/outsource-quotes` | Manager / Clerk / Inspector / CncProgrammer | 列表（part / company / status 过滤 + 分页） |
 | POST | `/api/v2/outsource-quotes` | Manager / Clerk | 新建 DRAFT 报价 |
-| GET | `/api/v2/outsource-quotes/quotable-parts` | Manager / Clerk | **报价 picker**：可建报价的 (零件 × OUTSOURCE 工序) 组合（2026-10-03 新增） |
+| GET | `/api/v2/outsource-quotes/quotable-parts` | Manager / Clerk | **报价 picker**：还没下发的零件（**一行 = 一个零件**，2026-10-03 新增） |
 | GET | `/api/v2/outsource-quotes/{id}` | Manager / Clerk / Inspector / CncProgrammer | 报价详情 |
 | POST | `/api/v2/outsource-quotes/{id}/update` | Manager / Clerk | DRAFT 部分更新（OCC） |
 | POST | `/api/v2/outsource-quotes/{id}/submit` | Manager / Clerk | DRAFT → SUBMITTED |
@@ -152,15 +152,11 @@
 | `customer_name` | string? | L2（零件直属客户） |
 | `l1_customer_name` | string? | L1（`t_customer.parent_id`） |
 | `customer_path` | string? | 有 L1 拼 `L1 / L2`，仅 L2 时给 L2 名，无客户 `null` |
-| `shelf_id` | string (i64) | 批次所在货架 |
-| `shelf_code` | string | |
-| `next_process_id` | string (i64) | **该 OUTSOURCE 工序**。前端「新建报价」靠它自动填 `process_id` |
-| `next_process_name` | string | |
 
-> ⚠️ `next_process_id` 是**显式字段**，不是临时 cast。part 域通用列表
-> `PartListItem` **刻意不声明**它（2026-09-27 决策：part list 响应不暴露派生工序），
-> 前端此前只能靠一个 `rawPart as { next_process_id?: string }` 的临时 cast 读。
-> 本 VO 的存在就是为了消掉那个 hack。
+> **2026-10-03 简化**：原 VO 还带 `shelf_id` / `shelf_code` / `next_process_id` /
+> `next_process_name` 四个字段（行粒度是「零件 × OUTSOURCE 工序」，靠「货架绑了哪些
+> 外协工序」枚举）。行粒度收成「一零件一行」后这 4 个字段一并删除：报价工序由用户在
+> 建报价时从 `category = 'OUTSOURCE'` 的工序列表里选，那个下拉本来就独立存在。
 
 ### QuotablePartListOut 字段
 
@@ -177,26 +173,29 @@
 
 ### `quotable-parts` 的行粒度与筛选
 
-**行 = 一个 (part_id, process_id) 组合，同一组合只出一行**（不按批次出多行）。
-SQL 用 `DISTINCT ON (p.id, pr.id)` 去重，内层 `ORDER BY … pb.batch_no ASC` 选
-batch_no 最小的批次做代表行；外层再按展示序（`is_urgent DESC,
-planned_delivery_date ASC NULLS LAST, id ASC, next_process_id ASC`）排序。
+**行 = 一个零件**（只要它有 PENDING 批次），同一零件无论几个批次都只出一行。
+SQL 用 `DISTINCT ON (p.id)` 去重（内层 `ORDER BY p.id, pb.batch_no ASC` 取 batch_no
+最小的批次做代表行；外层按展示序 `is_urgent DESC, planned_delivery_date ASC NULLS LAST,
+id ASC` 排序）。`total` 的口径与 list 的 WHERE + `DISTINCT ON` 逐条一致。
 
-4 层筛选（缺一不可）：
+筛选（2026-10-03 起 2 条）：
 
-1. **活跃批次**：`pb.deleted_at IS NULL` 且（`pb.status = 'PENDING'` 或
-   （`pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF'`)）。
-2. **货架绑了该 OUTSOURCE 工序**：`t_shelf_process`（`sp.shelf_id = pb.current_holder_id`，
-   `deleted_at IS NULL`）JOIN `t_process`（`deleted_at IS NULL AND category = 'OUTSOURCE'`）。
-3. **该 OUTSOURCE 工序在这台零件的活跃工艺链里**：`p.process_chain_id` →
-   `t_process_chain_step`（`deleted_at IS NULL`）里有 `process_id = pr.id`。
-   **少了这条会给出零件工艺链上根本不存在的工序**，后续
-   `POST /prod/batches/{batch_id}/send-to-outsource` 的
-   `resolve_step_id_by_process` 会 404。这是必须加的，不是可选优化
-   （回归测试：`tests/outsource/quotable.rs::quotable_process_not_in_part_chain_excluded`）。
-4. `t_part.deleted_at IS NULL`。
+1. **`t_part.deleted_at IS NULL`**。
+2. **存在 PENDING 批次**：`t_part_batch`（`pb.part_id = p.id AND pb.deleted_at IS NULL
+   AND pb.status = 'PENDING'`）。业务口径是「报价是给**还没下发**的零件提前锁价」，
+   所以已下发（在产 / 在外协）的零件不出现。
 
-`total` 的口径与 list 的 WHERE + `DISTINCT ON` 逐条一致。
+**不再参与筛选的三项**（2026-10-03 全部移除）：
+
+- **货架 ↔ 工序映射**（`t_shelf_process` ⋈ `t_process`）：它要求批次已上架并绑定
+  外协工序，而 picker 的目标恰恰是**还没下发**的零件。
+- **工艺链求交**（`t_process_chain_step`）：`PENDING` 批次的
+  `current_process_id` / `current_holder_id` 实测全为 NULL，且生产库里绝大多数零件
+  没有 `process_chain_id`；叠加这条筛选后 picker 长期恒空。
+- **`t_process.requires_approval`**：提前锁价与该工序是否需要审批无关。
+
+> **与 `/outsource-sendable` 不再同源**：sendable 的判据是「批次停在某道外协工序上」，
+> 两者谓词不同，不共享 SQL 常量，也不再要求口径一致。
 
 ### Lifecycle 守卫
 
@@ -221,7 +220,7 @@ planned_delivery_date ASC NULLS LAST, id ASC, next_process_id ASC`）排序。
 ### 防 N+1
 
 - `list_quotes` 单 SQL JOIN `t_outsource_company` + `t_process` 一次拿齐 company_name / process_name。
-- `list_quotable_parts` **一条 SQL** 一次拿齐 part / 客户(L2+L1) / 货架 / 工序展示字段，
+- `list_quotable_parts` **一条 SQL** 一次拿齐 part / 客户(L2+L1) 展示字段，
   `total` 走第二条同口径 `COUNT(*)`；service 层不循环查询。
 
 ---
@@ -242,4 +241,4 @@ planned_delivery_date ASC NULLS LAST, id ASC, next_process_id ASC`）排序。
 ## 集成测试
 
 - `tests/outsource/quote.rs`（9+ 用例：create DRAFT / 唯一性 21303 / update DRAFT happy / update SUBMITTED 21302 / submit / approve MANAGER-only / reject review_note 必填 / soft-delete 仅 DRAFT/REJECTED / **list keyword 零命中返 0 行**（带「无 keyword 返全量」对照组））
-- `tests/outsource/quotable.rs`（7 用例：happy path（含 `next_process_id`）/ 货架未绑 OUTSOURCE 工序 / **工序不在工艺链内** / 多批次去重 / 未上架 PENDING 排除 / keyword+分页 / 路由不被 `/{id}` 吞掉）
+- `tests/outsource/quotable.rs`（8 用例：happy path（含 4 个已删字段的缺席断言）/ 无 PENDING 批次排除 / **无工艺链也出现** / 多 PENDING 批次去重 / PENDING+IN_PROCESS 混合 / 软删零件与软删批次排除 / keyword+分页 / 路由不被 `/{id}` 吞掉）

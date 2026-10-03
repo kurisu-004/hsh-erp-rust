@@ -22,6 +22,9 @@
 //!  14. refill_failure_rolls_back_worker_scan   [`#[ignore]`：DB 故障注入缺基建]
 //!  15. max_held_null_returns_error
 //!  16. worker_no_work_type_returns_error
+//!  17. state_without_shelf_id_returns_held_batches_and_empty_pool_count
+//!      （2026-10-04 回归：`GET /pool/state` 的 `shelf_id` 降为可选后，缺省调用
+//!      仍须返回完整持有视图，仅 `pool_count_by_process` 退化为空数组）
 //!
 //! ## 串行化
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -2120,6 +2123,120 @@ async fn held_batch_includes_has_cnc_program() {
         }
     }
     assert!(found_a && found_b, "应同时找到 H-CNC-A 与 H-CNC-B: {env}");
+}
+
+/// `GET /prod/pool/state` 缺省 `shelf_id`（2026-10-04 起该参数可选）应仍返回完整
+/// 持有视图，且 `pool_count_by_process` 返空数组。
+///
+/// 该参数在 `compute_state` 内只有一个用途 —— 逐工序算「某货架 × 某工序」候选池
+/// 计数；`held_batches` / `max_held` / `current_held` / `capacity_remaining` 均与
+/// 货架无关。缺省语义：跳过计数查询，`pool_count_by_process = []`。
+///
+/// 场景：worker 有工种（上限 5）+ 工种映射 1 道工序 + 货架映射同工序，持有 2 个
+/// batch，且**该货架该工序的候选池里真实躺着 1 个 batch**。因此：
+/// - 带 `shelf_id` → `pool_count_by_process` 非空（`pool_count = 1`）
+/// - 不带 `shelf_id` → `pool_count_by_process == []`
+/// 成对断言是本用例的关键：只断言「不带时为空」无法区分「参数生效」与「池本来就是空的」。
+#[tokio::test]
+async fn state_without_shelf_id_returns_held_batches_and_empty_pool_count() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL-NOSHELF").await;
+    let proc = seed_process(&pool, "PROC-NOSHELF", "工序-NOSHELF").await;
+    let wt = insert_work_type(&pool, "WT-NOSHELF", "工种-NOSHELF", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-NOSHELF", "PROD-NOSHELF", "PRODUCTION").await;
+    link_shelf_to_process(&pool, prod_shelf, proc).await;
+
+    let worker = insert_worker(&pool, "BC-NOSHELF", "工NOSHELF", Some(wt)).await;
+    // 候选池里放 1 个（shelf + process 均匹配）—— 供带 shelf_id 的对照断言用
+    insert_pool_part(&pool, customer, "P-NOSHELF-POOL", prod_shelf, proc, 1).await;
+    // worker 持有 2 个
+    let (_part_a, _batch_a, _step_a) =
+        insert_worker_held_part(&pool, customer, "H-NOSHELF-A", worker, proc, 1, true).await;
+    let (_part_b, _batch_b, _step_b) =
+        insert_worker_held_part(&pool, customer, "H-NOSHELF-B", worker, proc, 1, true).await;
+
+    let (app, token) = login_manager_with_username(&pool, "admin_noshelf").await;
+
+    // 对照组：带 shelf_id → 候选池计数非空（证明池里确实有货）
+    let uri_with = format!("/prod/pool/state?worker_id={worker}&shelf_id={prod_shelf}");
+    let (s_with, env_with) = send(
+        app.clone(),
+        json_request("GET", &uri_with, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s_with, StatusCode::OK, "state 带 shelf_id: {env_with}");
+    let counts_with = env_with["data"]["pool_count_by_process"]
+        .as_array()
+        .expect("pool_count_by_process array");
+    assert_eq!(
+        counts_with.len(),
+        1,
+        "带 shelf_id 时应返回 1 道工序的候选池计数: {env_with}"
+    );
+    assert_eq!(counts_with[0]["process_id"], proc.to_string(), "{env_with}");
+    assert_eq!(
+        counts_with[0]["pool_count"], 1,
+        "候选池应有 1 件: {env_with}"
+    );
+
+    // 主体：缺 shelf_id → 200 + 持有视图完整 + 候选池计数空数组
+    let uri_without = format!("/prod/pool/state?worker_id={worker}");
+    let (s, env) = send(
+        app,
+        json_request("GET", &uri_without, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "state 缺省 shelf_id: {env}");
+    assert_eq!(env["code"], 0, "code 应 0: {env}");
+    assert_eq!(env["data"]["worker_id"], worker.to_string(), "{env}");
+
+    // 与货架无关的四段：一个都不许因缺 shelf_id 而退化
+    assert_eq!(
+        env["data"]["max_held"], 5,
+        "max_held 应仍为工种上限 5: {env}"
+    );
+    assert_eq!(env["data"]["current_held"], 2, "current_held 应为 2: {env}");
+    assert_eq!(
+        env["data"]["capacity_remaining"], 3,
+        "容量余量应 5-2=3: {env}"
+    );
+
+    let held = env["data"]["held_batches"]
+        .as_array()
+        .expect("held_batches array");
+    assert_eq!(
+        held.len(),
+        2,
+        "缺省 shelf_id 仍应返回 2 个 held batch: {env}"
+    );
+    let mut found_a = false;
+    let mut found_b = false;
+    for it in held {
+        let serial = sqlx::query_scalar::<_, String>("SELECT serial_no FROM t_part WHERE id = $1")
+            .bind(it["part_id"].as_str().unwrap().parse::<i64>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("lookup serial");
+        match serial.as_str() {
+            "H-NOSHELF-A" => found_a = true,
+            "H-NOSHELF-B" => found_b = true,
+            _ => {}
+        }
+    }
+    assert!(
+        found_a && found_b,
+        "held_batches 内容应与带 shelf_id 时一致: {env}"
+    );
+
+    // 唯一因缺 shelf_id 而变化的字段
+    let counts = env["data"]["pool_count_by_process"]
+        .as_array()
+        .expect("pool_count_by_process array");
+    assert!(
+        counts.is_empty(),
+        "缺省 shelf_id 时 pool_count_by_process 应为空数组（候选池计数与货架无关则无从算起）: {env}"
+    );
 }
 
 // 2026-09-30 重构：原 `admin_assign_process_id_mismatch` 端点已删除，被 move 端点取代。

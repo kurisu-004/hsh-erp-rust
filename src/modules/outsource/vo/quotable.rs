@@ -1,14 +1,14 @@
 //! outsource 域 `quotable-parts` 端点响应 VO
 //!
-//! 2026-10-03 新增：外协报价 picker 的读侧契约。一行 = 一个
-//! （零件 × OUTSOURCE 工序）组合，同一组合只出一行（见 repo SQL 的
-//! `DISTINCT ON (p.id, pr.id)`）。
+//! 2026-10-03 新增：外协报价 picker 的读侧契约。同日简化为**一行 = 一个还没下发
+//! 的零件**（该零件存在 `PENDING` 批次），见 `repo/sql.rs::OutsourceQuotableRepo`
+//! 的头注释。
 //!
 //! ## 为什么单独一套 VO 而不是复用 `PartListItem`
-//! `PartListItem` 是 part 域通用列表投影，**刻意不声明 `next_process_id`**
-//! （2026-09-27 决策：part list 响应不暴露派生工序）。而报价 picker 必须拿到
-//! `next_process_id` 才能自动填工序 —— 复用一个「字段缺省」的 VO 只会把
-//! 前端逼进临时 cast。本 VO 显式声明该字段。
+//! 2026-09-27 决策：`PartListItem` 刻意不声明任何派生工序字段（part list 响应不
+//! 暴露派生工序），而本 VO 要带 `unit_price` / `is_urgent` / 客户路径供 picker 列表
+//! 直接渲染。2026-10-03 简化行粒度后本 VO 与 `PartListItem` 的差异只剩这几个字段，
+//! 仍不值得为它引入一层临时 cast。
 //!
 //! 本文件在 `vo/mod.rs` 的 re-export 里是 `quotable`；与 `quote.rs`（报价
 //! lifecycle 出参）刻意分文件，避免 2 个语义不同的读模型混在一个文件里。
@@ -26,7 +26,7 @@ pub struct QuotablePartListOut {
     pub offset: i64,
 }
 
-/// 可建外协报价的（零件 × OUTSOURCE 工序）组合行。
+/// 可建外协报价的一个零件行。
 #[derive(Debug, Clone, Serialize)]
 pub struct QuotablePartOut {
     /// `t_part.id`。
@@ -45,12 +45,4 @@ pub struct QuotablePartOut {
     pub l1_customer_name: Option<String>,
     /// 客户路径：有 L1 拼 `L1 / L2`，否则仅 L2 名，缺客户为 `null`。
     pub customer_path: Option<String>,
-    /// 批次所在货架（绑定了该 OUTSOURCE 工序的货架）。
-    #[serde(serialize_with = "serialize_i64")]
-    pub shelf_id: i64,
-    pub shelf_code: String,
-    /// 该 OUTSOURCE 工序（**前端靠这个字段自动填报价工序**）。
-    #[serde(serialize_with = "serialize_i64")]
-    pub next_process_id: i64,
-    pub next_process_name: String,
 }

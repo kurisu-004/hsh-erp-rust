@@ -29,14 +29,13 @@ use crate::modules::prod::batch::dto::{
     CompleteRepairRequest, RepairBatchListQuery, RepairDispatchRequest,
 };
 use crate::modules::prod::batch::vo::{InspectionBatchListItemOut, InspectionBatchListOut};
-use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
 use super::guard::{
     InspectionRepairRow, assert_shelf_maps_process, mark_batch_with_status_and_meta,
-    require_process_chain, validate_batch_version,
+    optional_process_chain, optional_step_id, validate_batch_version,
 };
 
 impl BatchService {
@@ -125,28 +124,12 @@ impl BatchService {
                 let np = req.next_process_id.ok_or_else(|| {
                     AppError::biz(code::BIZ_INVALID_VALUE, "PRODUCTION 区需要 next_process_id")
                 })?;
-                // PR-3：PRODUCTION 区必须已绑定工艺链
-                let chain_id = require_process_chain(repo.conn_mut(), part_id).await?;
+                // 2026-10-03：PRODUCTION 区的工序链可选（无链落 NULL step）
+                let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
                 assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, np).await?;
-                // PR-3：解析 step_id
-                let step_id =
-                    ProcessChainRepo::resolve_step_id_by_process(repo.conn_mut(), chain_id, np)
-                        .await?
-                        .ok_or_else(|| {
-                            AppError::biz(
-                                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                                format!(
-                                    "chain {} 内找不到 process_id={} 的活跃 step",
-                                    chain_id, np
-                                ),
-                            )
-                        })?;
-                (
-                    "IN_PROCESS",
-                    Some("PRODUCTION_SHELF"),
-                    Some(step_id),
-                    Some(np),
-                )
+                // PR-3：解析 step_id（无链 → NULL；有链但链内无该工序 → 20702）
+                let step_id = optional_step_id(repo.conn_mut(), chain_id, np).await?;
+                ("IN_PROCESS", Some("PRODUCTION_SHELF"), step_id, Some(np))
             }
             "INSPECTION" => {
                 // INSPECTION 区不带 step（送检区不需要 process 上下文）；
@@ -268,28 +251,12 @@ impl BatchService {
                 let np = req.next_process_id.ok_or_else(|| {
                     AppError::biz(code::BIZ_INVALID_VALUE, "PRODUCTION 区需要 next_process_id")
                 })?;
-                // PR-3：PRODUCTION 区必须已绑定工艺链
-                let chain_id = require_process_chain(repo.conn_mut(), part_id).await?;
+                // 2026-10-03：PRODUCTION 区的工序链可选（无链落 NULL step）
+                let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
                 assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, np).await?;
-                // PR-3：解析 step_id
-                let step_id =
-                    ProcessChainRepo::resolve_step_id_by_process(repo.conn_mut(), chain_id, np)
-                        .await?
-                        .ok_or_else(|| {
-                            AppError::biz(
-                                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                                format!(
-                                    "chain {} 内找不到 process_id={} 的活跃 step",
-                                    chain_id, np
-                                ),
-                            )
-                        })?;
-                (
-                    "IN_PROCESS",
-                    Some("PRODUCTION_SHELF"),
-                    Some(step_id),
-                    Some(np),
-                )
+                // PR-3：解析 step_id（无链 → NULL；有链但链内无该工序 → 20702）
+                let step_id = optional_step_id(repo.conn_mut(), chain_id, np).await?;
+                ("IN_PROCESS", Some("PRODUCTION_SHELF"), step_id, Some(np))
             }
             "INSPECTION" => ("INSPECTION", Some("INSPECTION_SHELF"), None, None),
             other => {

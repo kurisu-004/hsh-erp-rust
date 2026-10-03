@@ -11,8 +11,8 @@
 //! - 候选侧（`counts.sendable_count` / `items`）与 `GET /outsource-sendable`
 //!   **同源 SQL**（见 `repo/sql.rs` 的 `SENDABLE_INNER_X_SQL`），逐字段一致。
 //! - `OutsourcePoolCandidate` 刻意**不复用** `OutsourceSendableItem`：后者带
-//!   `next_process_id` / `next_process_name`（分页一览里「这一行是哪道工序」是
-//!   必须的），而看板视角工序已提到顶层 `process_id`，重复出现会让前端 Zod
+//!   `current_process_id` / `current_process_name`（分页一览里「这一行是哪道工序」
+//!   是必须的），而看板视角工序已提到顶层 `process_id`，重复出现会让前端 Zod
 //!   守门时出现两个真相源。
 //!
 //! ## 雪花 ID / Decimal 序列化口径
@@ -83,7 +83,8 @@ pub struct OutsourcePoolCompanyOut {
 pub struct OutsourcePoolCandidate {
     /// `t_part_batch.version`（批次级 OCC）。前端发送时原样回传。
     pub version: i32,
-    /// `"APPROVAL"`（有已批准报价）/ `"DIRECT"`（无报价直发）。
+    /// `"APPROVAL"`（该外协工序 `requires_approval = true` 且已命中已批准报价）/
+    /// `"DIRECT"`（`requires_approval = false`，免审批直发）。
     pub send_mode: String,
     /// 批次来源状态：`"PENDING"` / `"IN_PROCESS"`。
     pub source_status: String,
@@ -104,7 +105,7 @@ pub struct OutsourcePoolCandidate {
     pub is_urgent: bool,
     /// 有 L1 拼 `L1 / L2`，仅 L2 时给 L2 名，无客户 `null`。
     pub customer_path: Option<String>,
-    /// 批次所在货架 code。
+    /// 批次所在货架 code。`PENDING` 且未上架的批次没有 holder，故为 `null`。
     pub shelf_code: Option<String>,
     /// APPROVAL 有值（取报价的公司）/ DIRECT `null`。
     #[serde(serialize_with = "serialize_i64_opt")]

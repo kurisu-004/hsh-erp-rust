@@ -194,26 +194,36 @@ Request：`UpsertChainRequest`
 
 ### 20706 BIZ_PROCESS_CHAIN_REQUIRED
 
-「part 进入生产流前必须已绑定工艺链」守卫（service `require_process_chain`
-helper）。错误码 HTTP 409，业务含义：「请先制定工序链（part 未绑定 process_chain）」。
-触发条件：
+> ⚠️ **2026-10-03 起无端点会返回 20706**。下面 7 个端点原先在
+> `t_part.process_chain_id IS NULL` 时被 `require_process_chain` 拦下，现已全部改用
+> `optional_process_chain` + `optional_step_id`（`src/modules/prod/batch/service/guard.rs`）：
+> **无链放行**，`current_process_step_id` 落 NULL（该列早已被官方降级为「可选的
+> 显示用定位信息」，写 NULL 有 `dispatch` 路径的先例）。
+>
+> 放松的理由：`t_part_batch.current_process_id` 才是工序候选池归属的权威依据，
+> `prod::worker_pool` 的候选池 SQL 早已（2026-09-30）按它普通过滤 —— 若写侧还
+> 强制「先有链」，读侧能列出来的批次就发不出去。
+>
+> **`20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND` 仍然生效**：有链但链内没有正在加工的
+> 工序时拒收（真数据错误，不随无链一起放行）。
+
+错误码 HTTP 409，业务含义：「请先制定工序链（part 未绑定 process_chain）」。
+触发条件（`require_process_chain` 严格变体，当前**无生产流调用方**）：
 
 - `t_part.process_chain_id IS NULL`（part 还没制定工艺链）
 
-受影响的 7 个端点（6 个 Phase 1 + 1 个 inspection 流）—— **2026-10-02 起全部以
-`batch_id` 为锚、归 prod 域**：
+2026-10-02 起这些端点已全部以 `batch_id` 为锚、归 prod 域（2026-10-03 起不再受
+20706 守卫）：
 - `POST /api/v2/prod/batches/{batch_id}/place-on-shelf` —— 上架
 - `POST /api/v2/prod/batches/{batch_id}/release-from-programming` —— 编程完成释放
 - `POST /api/v2/prod/batches/{batch_id}/send-to-outsource` —— 派发外协
 - `POST /api/v2/prod/batches/{batch_id}/receive-from-outsource` —— 外协回收入库
-- `POST /api/v2/prod/batches/{batch_id}/complete-repair` —— 完成维修
-- `POST /api/v2/prod/batches/{batch_id}/repair-dispatch` —— 派发维修
+- `POST /api/v2/prod/batches/{batch_id}/complete-repair` —— 完成返修（PRODUCTION 区）
+- `POST /api/v2/prod/batches/{batch_id}/repair-dispatch` —— 派发返修（PRODUCTION 区）
 - `POST /api/v2/prod/batches/{batch_id}/to-process` —— 品检打回
 
-守卫判据是 part 的 `process_chain_id` 判空，与路由归属无关。
-
 > 注：与 `to-process` 共用 service 的静态批量端点（`POST /prod/batches/to-inspection` 等）
-> 一并继承此守卫。具体每个端点的「错误码」段列在
+> 一并继承同一对守卫（无链放行）。具体每个端点的「错误码」段列在
 > [`docs/api/parts/lifecycle.md`](../../api/parts/lifecycle.md) 与
 > [`docs/api/parts/inspection.md`](../../api/parts/inspection.md) 中。
 
@@ -224,7 +234,7 @@ helper）。错误码 HTTP 409，业务含义：「请先制定工序链（part 
 - ✅ Migration 018：生产管理菜单（production_group 一级 + part_process_chain 二级 + worker_queue 迁移）
 - ✅ Migration 026（2026-09-16）：FK 方向翻转 —— `t_part.process_chain_id` + 回填 +
   `ix_t_part_process_chain_id` + `uq_t_part_process_chain`；`t_part_process_chain` 删 `part_id` 列
-- ✅ 错误码 20701 / 20702 / 20703 / 20704 / 20705（PENDING 守卫）/ **20706（PROCESS_CHAIN_REQUIRED，作用于 7 个生产流端点；2026-10-02 起这 7 条的 URL 归 prod 域 `/prod/batches/{batch_id}/*`）**
+- ✅ 错误码 20701 / 20702 / 20703 / 20704 / 20705（PENDING 守卫）/ **20706（PROCESS_CHAIN_REQUIRED；2026-10-02 起相关端点归 prod 域 `/prod/batches/{batch_id}/*`，2026-10-03 起这 7 条链守卫放开为可选，见上节）**
 - ✅ 模块 6 文件 + repo / service 子模块拆分
 - ✅ 端点：`GET / POST /by-part/{part_id}` + **`GET /{chain_id}`（2026-09-16 新增）**（2026-09-29 改 PUT → POST）
 - ✅ 集成测试 10 场景：happy（含 part 指针回写断言）/ 404 / 替换 steps / negative minutes /

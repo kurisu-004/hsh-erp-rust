@@ -35,13 +35,12 @@ use crate::modules::prod::batch::dto::{
     ReceiveFromOutsourceRequest, ReceiveFromOutsourceToInspectionRequest, SendToOutsourceRequest,
 };
 use crate::modules::prod::batch::repo::PartBatchRepo;
-use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
 use super::guard::{
     assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
-    require_process_chain, validate_batch_version, validate_shelf_zone,
+    optional_process_chain, optional_step_id, validate_batch_version, validate_shelf_zone,
 };
 
 /// 2026-10-03：DIRECT 占位报价的 `note` 固定文案 —— 让对账页一眼看出
@@ -298,8 +297,8 @@ impl BatchService {
         // 2026-10-03：部分发送数量解析（缺省 / 等于批次量 = 整批）
         let partial_qty =
             resolve_partial_quantity(req.quantity, batch.quantity, "send-to-outsource")?;
-        // 2026-09-16 PR-3：part 进入生产流前必须已绑定工艺链
-        let chain_id = require_process_chain(repo.conn_mut(), part_id).await?;
+        // 2026-10-03：工序链改为可选（无链的旧零件也能发外协，见 guard.rs）
+        let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
         // 校验 outsource 公司存在 + 启用
         let company_row: Option<(bool,)> = sqlx::query_as(
             "SELECT is_active FROM t_outsource_company WHERE id = $1 AND deleted_at IS NULL",
@@ -363,19 +362,10 @@ impl BatchService {
                 ),
             ));
         }
-        // PR-3：解析 step_id（chain 内 process_id → step_id）写入 OUTSOURCE 批次
-        let step_id =
-            ProcessChainRepo::resolve_step_id_by_process(repo.conn_mut(), chain_id, req.process_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                        format!(
-                            "chain {} 内找不到 process_id={} 的活跃 step",
-                            chain_id, req.process_id
-                        ),
-                    )
-                })?;
+        // PR-3：解析 step_id（chain 内 process_id → step_id）写入 OUTSOURCE 批次。
+        // 2026-10-03：无链 → 落 NULL（显示用定位信息，非必填）；有链但链内没有该
+        // 工序 → 20702 拒收。
+        let step_id = optional_step_id(repo.conn_mut(), chain_id, req.process_id).await?;
         // 价来源解析：DIRECT 自动取（复用 / 建占位），APPROVAL 用调用方给的
         // quote_id。两条路径汇合到同一段 APPROVED 校验 + 写 SENT 事件。
         let quote_id: i64 = match (direct, req.quote_id) {
@@ -481,7 +471,8 @@ impl BatchService {
             "OUTSOURCE",
             Some("OUTSOURCE_COMPANY"),
             Some(req.outsource_company_id),
-            Some(step_id),
+            // 2026-10-03：无链时为 None ⇒ status_gate 的 clear 分支写 NULL
+            step_id,
             // 2026-09-30：记录批次所属工序（外协加工的就是这道工序），
             // 收回时按 next_process_id 重新入池即可
             Some(req.process_id),
@@ -557,8 +548,8 @@ impl BatchService {
     ///
     /// Phase 2（2026-09-13）扩展：同事务把批次开口 shipment 标 RECEIVED + 写 RECEIVED 事件。
     ///
-    /// 2026-09-16 PR-3 批次 step 化：chain 必须性守卫 + req.next_process_id
-    /// 解析为 step_id 写入 current_process_step_id。
+    /// 2026-09-16 PR-3 批次 step 化：req.next_process_id 解析为 step_id 写入
+    /// current_process_step_id（2026-10-03 起链本身可选，见 guard.rs）。
     ///
     /// 2026-10-03：入参从 `PlaceOnShelfRequest` 换成 `ReceiveFromOutsourceRequest`（多
     /// `quantity`），并支持**部分接收**：拆批后只回收子批次，源批次保留余量、继续持有
@@ -595,26 +586,12 @@ impl BatchService {
         // 2026-10-03：部分接收数量解析（缺省 / 等于批次量 = 整批）
         let partial_qty =
             resolve_partial_quantity(req.quantity, batch.quantity, "receive-from-outsource")?;
-        // PR-3：part 必须已绑定工艺链
-        let chain_id = require_process_chain(repo.conn_mut(), part_id).await?;
+        // 2026-10-03：工序链可选（无链的旧零件也能收回，见 guard.rs）
+        let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
         validate_shelf_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION").await?;
         assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, req.next_process_id).await?;
-        // PR-3：解析 step_id
-        let step_id = ProcessChainRepo::resolve_step_id_by_process(
-            repo.conn_mut(),
-            chain_id,
-            req.next_process_id,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                format!(
-                    "chain {} 内找不到 process_id={} 的活跃 step",
-                    chain_id, req.next_process_id
-                ),
-            )
-        })?;
+        // PR-3：解析 step_id（无链 → NULL；有链但链内无该工序 → 20702）
+        let step_id = optional_step_id(repo.conn_mut(), chain_id, req.next_process_id).await?;
         // ---- 2026-10-03 部分接收：拆出子批次，只回收子批次 ----
         //
         // 新子批次继承源批次的 `OUTSOURCE` 状态与 `OUTSOURCE_COMPANY` holder
@@ -665,7 +642,8 @@ impl BatchService {
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
-            Some(step_id),
+            // 2026-10-03：无链时为 None ⇒ status_gate 的 clear 分支写 NULL
+            step_id,
             // 2026-09-30：进池 → current_process_id 写目标工序
             Some(req.next_process_id),
             current.id,

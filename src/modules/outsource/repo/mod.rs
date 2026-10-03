@@ -126,6 +126,9 @@ pub struct OutsourceInFlightRow {
 }
 
 /// `GET /outsource-quotes/quotable-parts` 行。
+///
+/// 一零件一行（2026-10-03 简化前是「零件 × OUTSOURCE 工序」，`shelf_*` /
+/// `next_process_*` 四列随之删除，见 `repo/sql.rs::OutsourceQuotableRepo` 的头注释）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OutsourceQuotableRow {
     pub id: i64,
@@ -137,10 +140,6 @@ pub struct OutsourceQuotableRow {
     pub customer_id: i64,
     pub customer_name: Option<String>,
     pub parent_customer_name: Option<String>,
-    pub shelf_id: i64,
-    pub shelf_code: String,
-    pub next_process_id: i64,
-    pub next_process_name: String,
 }
 
 /// `GET /outsource-sendable` 行。
@@ -168,13 +167,17 @@ pub struct OutsourceSendableRow {
     /// 从不读这个字段 —— 保留投影是为了让 list / count 的过滤位置保持同构（见
     /// `repo/sql.rs::OutsourceSendableRepo` 头注释）。
     pub customer_id: Option<i64>,
-    /// `t_shelf.code`，驱动表是 `JOIN t_shelf`（INNER）⇒ DB 层 NOT NULL。
-    /// 与 quotable 侧 `OutsourceQuotableRow.shelf_code` 同一写法。
-    pub shelf_code: String,
-    pub next_process_id: i64,
-    /// `t_process.name`，`JOIN t_process pr`（INNER）⇒ DB 层 NOT NULL。
-    /// 与 quotable 侧 `OutsourceQuotableRow.next_process_name` 同一写法。
-    pub next_process_name: String,
+    /// `t_shelf.code`（`LEFT JOIN t_shelf`）⇒ `PENDING` 且未上架的批次（无
+    /// holder）为 `None`，VO 相应可空。
+    pub shelf_code: Option<String>,
+    /// `t_part_batch.current_process_id`（池归属权威依据），`JOIN t_process pr`
+    /// （INNER）⇒ DB 层 NOT NULL。
+    pub current_process_id: i64,
+    /// `t_process.name`，同一 INNER JOIN ⇒ DB 层 NOT NULL。
+    pub current_process_name: String,
+    /// `t_process.requires_approval` —— `send_mode` 判定的输入（false = 免审批
+    /// 直发 / true = 必须有已审批报价）。见 `service/sendable.rs::send_mode_of`。
+    pub requires_approval: bool,
     pub quote_id: Option<i64>,
     pub price: Option<String>,
     pub outsource_company_id: Option<i64>,
@@ -483,7 +486,7 @@ pub trait OutsourceRepoTrait: Send {
         keyword_pat: Option<&'a str>,
     ) -> Result<i64, sqlx::Error>;
 
-    // ── quotable-parts（2026-10-03 新增，可建报价的 零件 × OUTSOURCE 工序） ──
+    // ── quotable-parts（2026-10-03 新增，可建报价的未下发零件，一零件一行） ──
     async fn quotable_list<'a>(
         &mut self,
         keyword_pat: Option<&'a str>,
@@ -495,7 +498,7 @@ pub trait OutsourceRepoTrait: Send {
         keyword_pat: Option<&'a str>,
     ) -> Result<i64, sqlx::Error>;
 
-    // ── sendable（2026-10-03 新增，可发送外协的 活跃批次 × OUTSOURCE 工序） ──
+    // ── sendable（2026-10-03 新增，可发送外协的活跃批次，一批次一行） ──
     async fn sendable_list<'a>(
         &mut self,
         keyword_pat: Option<&'a str>,
@@ -509,14 +512,14 @@ pub trait OutsourceRepoTrait: Send {
         customer_id: Option<i64>,
     ) -> Result<i64, sqlx::Error>;
     /// 2026-10-03 新增：按外协工序取可发送候选（看板左列）。
-    /// 与 `sendable_list` 同核心 SQL、只把外层过滤换成 `next_process_id = $1`。
+    /// 与 `sendable_list` 同核心 SQL、只把外层过滤换成 `current_process_id = $1`。
     async fn sendable_list_by_process(
         &mut self,
         process_id: i64,
     ) -> Result<Vec<OutsourceSendableRow>, sqlx::Error>;
 
     // ── pool（2026-10-03 新增，按外协工序切 tab 的看板三端点） ──
-    /// 候选侧按工序分组计数（`GROUP BY next_process_id`，与
+    /// 候选侧按工序分组计数（`GROUP BY current_process_id`，与
     /// `sendable_list_by_process` 行粒度一致）。
     async fn pool_group_sendable_counts(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error>;
     /// 在途侧按工序分组计数（`GROUP BY current_process_id`）。

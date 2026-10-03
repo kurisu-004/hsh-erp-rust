@@ -923,23 +923,30 @@ impl OutsourceShipmentRepo {
 }
 
 // ===========================================================================
-// Quotable（报价 picker：可建报价的 零件 × OUTSOURCE 工序 组合）
+// Quotable（报价 picker：还没下发的零件，一零件一行）
 // ===========================================================================
 
 /// 2026-10-03 新增：`GET /outsource-quotes/quotable-parts` 的 SQL 真源。
 ///
-/// ## 行粒度 = (part_id, process_id)
-/// 用 `DISTINCT ON (p.id, pr.id)` 去重（外层 `ORDER BY` 另算展示序）。
-/// 同一台零件有多个符合条件的活跃批次时，靠内层 `ORDER BY … pb.batch_no ASC`
-/// 选 batch_no 最小的那条做代表行。
+/// ## 行粒度 = 一零件一行
+/// 2026-10-03 简化前是 `(part_id, process_id)` 组合（`DISTINCT ON (p.id, pr.id)`），
+/// 那套形状要求「按货架上绑了哪些 OUTSOURCE 工序」来枚举，于是被迫带出
+/// `shelf_id` / `shelf_code` / `next_process_id` / `next_process_name` 四个字段。
+/// 业务上「报价是给**还没下发的零件**提前锁价」，故谓词收成「该零件有 PENDING
+/// 批次」：行粒度变成一零件一行，那 4 个字段全部消失（可选项的工序列表由前端从
+/// `category = 'OUTSOURCE'` 的工序表自行筛选）。
 ///
-/// ## 4 层筛选（缺一不可）
-/// 1. 活跃批次：PENDING，或 IN_PROCESS + PRODUCTION_SHELF；
-/// 2. 批次所在货架绑了 OUTSOURCE 工序（`t_shelf_process` ⋈ `t_process`）；
-/// 3. **该 OUTSOURCE 工序在该 part 的活跃工艺链里**（`t_process_chain_step`）
-///    —— 少了这条会给出工艺链上不存在的工序，后续 `send-to-outsource` 的
-///    `resolve_step_id_by_process` 会 404；
-/// 4. `t_part` 未软删。
+/// **不再与 `/outsource-sendable` 同源**：两个端点的谓词已完全不同（picker 筛
+/// PENDING 零件；sendable 按 `t_part_batch.current_process_id` 判「停在哪道外协
+/// 工序上」），没有可共享的谓词可抽。`requires_approval` 也**不**参与本查询 ——
+/// 提前锁价与该工序是否需要审批无关。
+///
+/// ## 筛选
+/// 1. `p.deleted_at IS NULL`；
+/// 2. 存在 PENDING 批次（`pb.deleted_at IS NULL AND pb.status = 'PENDING'`）——
+///    同一零件多个 PENDING 批次由 `DISTINCT ON (p.id)` + `pb.batch_no ASC` 收敛为
+///    一行（内层 `ORDER BY` 必须以 DISTINCT ON 的键打头，故需要这层子查询）；
+/// 3. keyword（停在外层之前即内层，与 list 一致）。
 pub struct OutsourceQuotableRepo;
 
 impl OutsourceQuotableRepo {
@@ -951,34 +958,22 @@ impl OutsourceQuotableRepo {
     ) -> Result<Vec<OutsourceQuotableRow>, sqlx::Error> {
         sqlx::query_as::<_, OutsourceQuotableRow>(
             "SELECT q.id, q.serial_no, q.drawing_no, q.name, q.is_urgent, q.unit_price, \
-                    q.customer_id, q.customer_name, q.parent_customer_name, \
-                    q.shelf_id, q.shelf_code, q.next_process_id, q.next_process_name \
+                    q.customer_id, q.customer_name, q.parent_customer_name \
              FROM ( \
-               SELECT DISTINCT ON (p.id, pr.id) \
-                 p.id, p.serial_no, p.drawing_no, p.name, p.is_urgent, p.unit_price::text AS unit_price, \
-                 p.customer_id, c.name AS customer_name, cp.name AS parent_customer_name, \
-                 sh.id AS shelf_id, sh.code AS shelf_code, \
-                 pr.id AS next_process_id, pr.name AS next_process_name, \
-                 p.is_urgent AS order_is_urgent, p.planned_delivery_date AS order_planned_date, \
-                 pb.batch_no AS order_batch_no \
-               FROM t_part_batch pb \
-               JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
-               JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
-               JOIN t_shelf_process sp ON sp.shelf_id = sh.id AND sp.deleted_at IS NULL \
-               JOIN t_process pr ON pr.id = sp.process_id AND pr.deleted_at IS NULL \
-                 AND pr.category = 'OUTSOURCE' \
-               JOIN t_process_chain_step pcs ON pcs.chain_id = p.process_chain_id \
-                 AND pcs.process_id = pr.id AND pcs.deleted_at IS NULL \
+               SELECT DISTINCT ON (p.id) \
+                  p.id, p.serial_no, p.drawing_no, p.name, p.is_urgent, p.unit_price::text AS unit_price, \
+                  p.customer_id, c.name AS customer_name, cp.name AS parent_customer_name, \
+                  p.is_urgent AS order_is_urgent, p.planned_delivery_date AS order_planned_date \
+               FROM t_part p \
+               JOIN t_part_batch pb ON pb.part_id = p.id AND pb.deleted_at IS NULL \
+                 AND pb.status = 'PENDING' \
                LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
                LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
-               WHERE pb.deleted_at IS NULL \
-                 AND (pb.status = 'PENDING' \
-                      OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF')) \
-               ORDER BY p.id, pr.id, pb.batch_no ASC \
+               WHERE p.deleted_at IS NULL \
+                 AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1) \
+               ORDER BY p.id, pb.batch_no ASC \
              ) q \
-             WHERE ($1::text IS NULL OR q.drawing_no ILIKE $1 OR q.name ILIKE $1) \
-             ORDER BY q.order_is_urgent DESC, q.order_planned_date ASC NULLS LAST, \
-                      q.id ASC, q.next_process_id ASC \
+             ORDER BY q.order_is_urgent DESC, q.order_planned_date ASC NULLS LAST, q.id ASC \
              LIMIT $2 OFFSET $3",
         )
         .bind(keyword_pat)
@@ -992,24 +987,17 @@ impl OutsourceQuotableRepo {
         executor: E,
         keyword_pat: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
-        // 口径必须与 list 一致（含 DISTINCT ON 去重后的行粒度），否则分页 total 对不上。
-        // 2026-10-03：keyword 过滤与 list 统一停在外层 `d` 上，内层不重复过滤。
+        // 口径必须与 list 一致（含 DISTINCT ON 收敛后的行粒度），否则分页 total 对不上。
+        // keyword 过滤与 list 统一停在内层。
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM ( \
-               SELECT DISTINCT p.id, pr.id, p.drawing_no, p.name \
-               FROM t_part_batch pb \
-               JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
-               JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
-               JOIN t_shelf_process sp ON sp.shelf_id = sh.id AND sp.deleted_at IS NULL \
-               JOIN t_process pr ON pr.id = sp.process_id AND pr.deleted_at IS NULL \
-                 AND pr.category = 'OUTSOURCE' \
-               JOIN t_process_chain_step pcs ON pcs.chain_id = p.process_chain_id \
-                 AND pcs.process_id = pr.id AND pcs.deleted_at IS NULL \
-               WHERE pb.deleted_at IS NULL \
-                 AND (pb.status = 'PENDING' \
-                      OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF')) \
-             ) d \
-             WHERE ($1::text IS NULL OR d.drawing_no ILIKE $1 OR d.name ILIKE $1)",
+               SELECT DISTINCT p.id \
+               FROM t_part p \
+               JOIN t_part_batch pb ON pb.part_id = p.id AND pb.deleted_at IS NULL \
+                 AND pb.status = 'PENDING' \
+               WHERE p.deleted_at IS NULL \
+                 AND ($1::text IS NULL OR p.drawing_no ILIKE $1 OR p.name ILIKE $1) \
+             ) d",
         )
         .bind(keyword_pat)
         .fetch_one(executor)
@@ -1028,12 +1016,12 @@ impl OutsourceQuotableRepo {
 // 背景：`GET /outsource-sendable`（分页 list + count）与
 // `GET /outsource-pool/{process_id}`（按工序取全量 + 按工序分组计数）问的是
 // **同一个集合**，只是外层过滤不同。判定谓词（批次状态三态 / OUTSOURCE 类别 /
-// 工艺链求交 / APPROVED 报价 LEFT JOIN）在每个查询里各写一份的话，任一改动漏改
+// 审批闸门 / APPROVED 报价 LEFT JOIN）在每个查询里各写一份的话，任一改动漏改
 // 一处，前端就会看到「看板 tab 徽标数与 tab 内实际行数对不上」。
 //
 // 故把「产出行」的部分抽成常量 + 参数化投影：
 // - `SENDABLE_INNER_X_SQL`：JOIN 与 WHERE（**谓词只有这一个落点**）
-// - `SENDABLE_DISTINCT_D_SQL`：`DISTINCT ON (batch_id, next_process_id)` 收敛
+// - `SENDABLE_DISTINCT_D_SQL`：`DISTINCT ON (batch_id, current_process_id)` 收敛
 // - `SENDABLE_OUTER_COLS` / `SENDABLE_DISPLAY_ORDER`：外层列清单 / 展示序
 // - `SENDABLE_PROJECTION_*` / `SENDABLE_DEDUP_PROJECTION_*`：投影列表
 //   （list / list_by_process 用全投影，count / group_sendable_counts 用精简投影）
@@ -1044,49 +1032,81 @@ impl OutsourceQuotableRepo {
 // 故 count 用精简投影（只要分组键 + 过滤列）不违反任何约束。
 // ---------------------------------------------------------------------------
 
-/// 可发送外协查询的内层 `x`：一行 = 一个
-/// `(batch, shelf_process, chain_step, approved_quote)` 组合。
+/// 可发送外协查询的内层 `x`：一行 = 一个 `(batch, approved_quote)` 组合。
 ///
 /// `{projection}` 由调用方填（全投影 / count 精简投影）；**JOIN 与 WHERE
 /// 只有这一份**，四个查询共用。
+///
+/// ## 判定谓词 = 「批次当前停在某道外协工序上」
+/// 工序来源是 `pb.current_process_id`（`JOIN t_process pr ON pr.id =
+/// pb.current_process_id AND pr.category = 'OUTSOURCE'`）—— 那一列是**工序候选池
+/// 归属的权威依据**（写入不变式见 `prod::batch::service::guard.rs`）。
+///
+/// 2026-10-03 移除的两层 JOIN：原实现要求「该 OUTSOURCE 工序同时出现在零件的
+/// `process_chain_id` 链内」（`JOIN t_process_chain_step pcs`），而生产库里 1874 个
+/// 零件只有 2 个绑了链、`t_process_chain_step` 里 OUTSOURCE 类的 step 有 0 条 ⇒
+/// 交集恒空 ⇒ 端点恒返回空列表。同一类 bug 在 `prod::worker_pool` 的候选池 SQL 上
+/// 已于 2026-09-30 以同样方式修过（全仓已无 INNER JOIN `t_process_chain_step` 残留）。
+/// 业务决策：**兼容没有工序链的旧零件**，`current_process_id` 指外协工序即可发。
+///
+/// ## 审批闸门（`t_process.requires_approval`）
+/// 该列此前是**只写不读的死字段**（process CRUD 在维护、outsource 域从未读）。本查询
+/// 是第一次真正使用它：
+/// - `requires_approval = false` → 免审批直发，直接出行；
+/// - `requires_approval = true` → 必须已有该 (part, process) 的 APPROVED 报价，
+///   否则**不出行**（这是本次新增的排除语义，回归测试
+///   `tests/outsource/sendable.rs::sendable_requires_approval_without_quote_excluded`）。
+///
+/// 报价的 LEFT JOIN 条件里带 `AND pr.requires_approval`：它把「命中报价」严格定义成
+/// 「send_mode = APPROVAL」。否则免审批工序上恰好存在一条历史 APPROVED 报价时，该行
+/// 会被判成 APPROVAL（报价三件套有值）而 `company_options` 又被 CASE 短路成 `[]` ——
+/// 两种模式的字段契约同时被破坏。DIRECT 行的 `quote_id` / `price` / 公司三件套因此
+/// 恒为 `null`，与 VO 声明一致。
+///
+/// ## 为什么 `t_shelf` 降级成 LEFT JOIN
+/// 外层投影仍要 `shelf_code`（前端看板卡片要显示批次在哪排），但 `PENDING` 批次的
+/// `current_holder_id` 恒为 `NULL`（还没上架）—— 若保持 INNER JOIN，未上架的
+/// PENDING 批次会整批消失。`shelf_code` 相应改为可空（VO 本来就是 `Option`）。
 const SENDABLE_INNER_X_SQL: &str = "SELECT {projection} \
              FROM t_part_batch pb \
              JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
-             JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
-             JOIN t_shelf_process sp ON sp.shelf_id = sh.id AND sp.deleted_at IS NULL \
-             JOIN t_process pr ON pr.id = sp.process_id AND pr.deleted_at IS NULL \
+             JOIN t_process pr ON pr.id = pb.current_process_id AND pr.deleted_at IS NULL \
                AND pr.category = 'OUTSOURCE' \
-             JOIN t_process_chain_step pcs ON pcs.chain_id = p.process_chain_id \
-               AND pcs.process_id = pr.id AND pcs.deleted_at IS NULL \
+             LEFT JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
              LEFT JOIN t_outsource_quote q ON q.part_id = p.id AND q.process_id = pr.id \
-               AND q.status = 'APPROVED' AND q.deleted_at IS NULL \
+               AND q.status = 'APPROVED' AND q.deleted_at IS NULL AND pr.requires_approval \
              LEFT JOIN t_outsource_company oc ON oc.id = q.outsource_company_id \
                AND oc.deleted_at IS NULL \
              LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
              LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
              WHERE pb.deleted_at IS NULL \
                AND (pb.status = 'PENDING' \
-                    OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF'))";
+                    OR (pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF')) \
+               AND ( NOT pr.requires_approval \
+                  OR EXISTS (SELECT 1 FROM t_outsource_quote q2 \
+                             WHERE q2.part_id = p.id AND q2.process_id = pr.id \
+                               AND q2.status = 'APPROVED' AND q2.deleted_at IS NULL) )";
 
-/// `x → d` 收敛层：`DISTINCT ON (batch_id, next_process_id)`。
+/// `x → d` 收敛层：`DISTINCT ON (batch_id, current_process_id)`。
 ///
-/// 排序键 `x.sp_id, x.step_id, x.quote_id ASC NULLS LAST` 的作用有二：
-/// 1. 多个 APPROVED 报价时取 `quote_id` 最小的那条（DB 有 partial unique
-///    `uq_t_outsource_quote_approved_part_process` 兜底撞了 → 21303，但并发审批 /
-///    历史数据仍可能出现多条；取最早批准的那条语义是「先批准的报价优先」且结果
-///    稳定，不随查询计划变化）；
-/// 2. 顺手吃掉 `t_shelf_process` / `t_process_chain_step` 的重复行（两者都没有
-///    `(shelf, process)` / `(chain, process)` 唯一约束）。
-const SENDABLE_DISTINCT_D_SQL: &str = "SELECT DISTINCT ON (x.batch_id, x.next_process_id) \
+/// 排序键 `x.quote_id ASC NULLS LAST` 的作用：多个 APPROVED 报价时取 `quote_id` 最小
+/// 的那条（DB 有 partial unique `uq_t_outsource_quote_approved_part_process` 兜底撞了
+/// → 21303，但并发审批 / 历史数据仍可能出现多条；取最早批准的那条语义是「先批准的
+/// 报价优先」且结果稳定，不随查询计划变化）。2026-10-03 起内层不再有
+/// `t_shelf_process` / `t_process_chain_step` 的重复行来源（两层 JOIN 已删），
+/// 重复行只剩报价这一处。
+///
+/// **为什么保留 `current_process_id` 这一列而不是只写 `DISTINCT ON (batch_id)`**：
+/// `current_process_id` 由 `batch_id` 单值决定，两者语义等价。保留两列是为了让
+/// `SENDABLE_PROJECTION_COUNT` / `SENDABLE_DEDUP_PROJECTION_COUNT` 与全投影共享同一
+/// 组「分组键列名」，`SENDABLE_DEDUP_PROJECTION_*` 可以逐字对应（否则两套投影各维护
+/// 不同的键集，改谓词时容易只改一半）。收敛后行粒度恒为「一批次一行」。
+const SENDABLE_DISTINCT_D_SQL: &str = "SELECT DISTINCT ON (x.batch_id, x.current_process_id) \
              {projection} \
              FROM ( {inner} ) x \
-             ORDER BY x.batch_id, x.next_process_id, x.sp_id, x.step_id, \
-                      x.quote_id ASC NULLS LAST";
+             ORDER BY x.batch_id, x.current_process_id, x.quote_id ASC NULLS LAST";
 
 /// 全投影（`OutsourceSendableRow` 的解码目标）。
-///
-/// `sp_id` / `step_id` 只服务收敛层排序，不进 `OutsourceSendableRow`（多余列
-/// 被 `FromRow` 按名忽略，不影响解码）。
 const SENDABLE_PROJECTION_FULL: &str = "pb.version AS batch_version, pb.id AS batch_id, \
      pb.batch_no, pb.quantity AS batch_quantity, pb.status AS source_status, \
      p.id AS part_id, p.serial_no AS part_serial_no, \
@@ -1095,10 +1115,10 @@ const SENDABLE_PROJECTION_FULL: &str = "pb.version AS batch_version, pb.id AS ba
      p.is_urgent, p.customer_id, \
      c.name AS customer_name, cp.name AS parent_customer_name, \
      sh.code AS shelf_code, \
-     pr.id AS next_process_id, pr.name AS next_process_name, \
+     pr.id AS current_process_id, pr.name AS current_process_name, \
+     pr.requires_approval, \
      q.id AS quote_id, q.price::text AS price, \
      q.outsource_company_id, oc.name AS outsource_company_name, \
-     sp.id AS sp_id, pcs.id AS step_id, \
      CASE WHEN q.id IS NOT NULL THEN '[]'::jsonb ELSE COALESCE( \
        to_jsonb((SELECT array_agg( \
                  json_build_object('id', c2.id, 'name', c2.name) \
@@ -1110,27 +1130,26 @@ const SENDABLE_PROJECTION_FULL: &str = "pb.version AS batch_version, pb.id AS ba
           WHERE cp2.process_id = pr.id AND cp2.deleted_at IS NULL)), \
        '[]'::jsonb) END AS company_options";
 
-/// 收敛层全投影（逐字对应 `SENDABLE_PROJECTION_FULL`，去掉收敛层不需要的
-/// `sp_id` / `step_id`）。
+/// 收敛层全投影（逐字对应 `SENDABLE_PROJECTION_FULL`）。
 const SENDABLE_DEDUP_PROJECTION_FULL: &str = "x.batch_version, x.batch_id, x.batch_no, \
      x.batch_quantity, x.source_status, \
      x.part_id, x.part_serial_no, x.part_drawing_no, x.part_name, \
      x.planned_delivery_date, x.is_urgent, \
      x.customer_name, x.parent_customer_name, x.customer_id, \
-     x.shelf_code, x.next_process_id, x.next_process_name, \
+     x.shelf_code, x.current_process_id, x.current_process_name, x.requires_approval, \
      x.quote_id, x.price, x.outsource_company_id, x.outsource_company_name, \
      x.company_options";
 
-/// 计数侧精简投影：只要分组键 `(batch_id, next_process_id)` + 外层过滤要用的
-/// 3 列（`part_drawing_no` / `part_name` / `customer_id`）。
+/// 计数侧精简投影：只要分组键 `(batch_id, current_process_id)` + 外层过滤要用的
+/// 3 列（`part_drawing_no` / `part_name` / `customer_id`）+ 收敛排序键
+/// `quote_id`。
 ///
 /// 语义等价前提：分组键内 part 列恒定（同一批次恒同一零件，故这些列组内不变）。
 const SENDABLE_PROJECTION_COUNT: &str = "pb.id AS batch_id, \
      p.drawing_no AS part_drawing_no, p.name AS part_name, p.customer_id, \
-     pr.id AS next_process_id, sp.id AS sp_id, pcs.id AS step_id, \
-     q.id AS quote_id";
+     pr.id AS current_process_id, q.id AS quote_id";
 
-const SENDABLE_DEDUP_PROJECTION_COUNT: &str = "x.batch_id, x.next_process_id, \
+const SENDABLE_DEDUP_PROJECTION_COUNT: &str = "x.batch_id, x.current_process_id, \
      x.part_drawing_no, x.part_name, x.customer_id";
 
 /// 外层列清单（`list` / `list_by_process` 共用；两者的行结构完全相同）。
@@ -1139,7 +1158,7 @@ const SENDABLE_OUTER_COLS: &str = "d.batch_version, d.batch_id, d.batch_no, \
      d.part_id, d.part_serial_no, d.part_drawing_no, d.part_name, \
      d.planned_delivery_date, d.is_urgent, \
      d.customer_name, d.parent_customer_name, \
-     d.shelf_code, d.next_process_id, d.next_process_name, \
+     d.shelf_code, d.current_process_id, d.current_process_name, d.requires_approval, \
      d.quote_id, d.price, d.outsource_company_id, d.outsource_company_name, \
      d.company_options, d.customer_id";
 
@@ -1147,7 +1166,7 @@ const SENDABLE_OUTER_COLS: &str = "d.batch_version, d.batch_id, d.batch_no, \
 /// 按 tab 渲染时可与 sendable 一览对账）。
 const SENDABLE_DISPLAY_ORDER: &str = "ORDER BY d.is_urgent DESC, \
      d.planned_delivery_date ASC NULLS LAST, \
-     d.part_id ASC, d.batch_no ASC, d.next_process_id ASC";
+     d.part_id ASC, d.batch_no ASC, d.current_process_id ASC";
 
 /// 拼出 `x → d` 两层子查询（供外层复用）。
 ///
@@ -1166,12 +1185,12 @@ fn sendable_dedup_sql(inner_projection: &str, dedup_projection: &str) -> String 
 /// 2026-10-03 新增：`GET /outsource-sendable` + `GET /outsource-pool/{process_id}`
 /// 共用的 SQL 真源。
 ///
-/// ## 行粒度 = (batch_id, next_process_id)
+/// ## 行粒度 = 一批次一行
 /// 三层结构：
-/// 1. 内层 `x`（`SENDABLE_INNER_X_SQL`）：批次 ⋈ 零件 ⋈ 货架 ⋈ 货架工序 ⋈
-///    OUTSOURCE 工序 ⋈ 工艺链 step，并 LEFT JOIN 该 (part, process) 的 APPROVED
-///    报价；`company_options` 用标量子查询 `array_agg(json_build_object(...))`
-///    **一次拿完**（防 N+1）。
+/// 1. 内层 `x`（`SENDABLE_INNER_X_SQL`）：批次 ⋈ 零件 ⋈ OUTSOURCE 工序
+///    （`pb.current_process_id`），并 LEFT JOIN 该 (part, process) 的 APPROVED
+///    报价（仅限 `requires_approval = true` 的工序）；`company_options` 用标量子查询
+///    `array_agg(json_build_object(...))` **一次拿完**（防 N+1）。
 /// 2. 中层 `d`（`SENDABLE_DISTINCT_D_SQL`）：`DISTINCT ON` 收敛（见该常量注释）。
 /// 3. 外层：各端点自己的过滤 + 展示序 + 分页。
 ///
@@ -1230,9 +1249,9 @@ impl OutsourceSendableRepo {
 
     /// 2026-10-03 新增：`GET /outsource-pool/{process_id}` 的候选批次 list。
     ///
-    /// 与 [`list`] 的**唯一差别**是外层 `WHERE d.next_process_id = $1`（而非
+    /// 与 [`list`] 的**唯一差别**是外层 `WHERE d.current_process_id = $1`（而非
     /// keyword / customer_id + 分页）。判定谓词、行粒度、排序全部来自同一批
-    /// 常量，故「看板 tab 内行」与「sendable 一览按 next_process_id 过滤的行」
+    /// 常量，故「看板 tab 内行」与「sendable 一览按 `current_process_id` 过滤的行」
     /// 逐字段一致（`tests/outsource/pool.rs` 有专门断言守这条）。
     ///
     /// 不分页：admin 看板视角，一个 tab 要一次拿全（与
@@ -1244,7 +1263,7 @@ impl OutsourceSendableRepo {
         let dedup = sendable_dedup_sql(SENDABLE_PROJECTION_FULL, SENDABLE_DEDUP_PROJECTION_FULL);
         let sql = format!(
             "SELECT {SENDABLE_OUTER_COLS} FROM ( {dedup} ) d \
-             WHERE d.next_process_id = $1 \
+             WHERE d.current_process_id = $1 \
              {SENDABLE_DISPLAY_ORDER}"
         );
         sqlx::query_as::<_, OutsourceSendableRow>(AssertSqlSafe(sql))
@@ -1270,7 +1289,7 @@ impl OutsourceSendableRepo {
 pub struct OutsourcePoolRepo;
 
 impl OutsourcePoolRepo {
-    /// 候选侧按工序分组计数（`GROUP BY next_process_id`）。
+    /// 候选侧按工序分组计数（`GROUP BY current_process_id`）。
     ///
     /// 与 `sendable_list_by_process` 的行粒度**逐行一致**（同一份核心 SQL），
     /// 故看板 tab 徽标「可发 N」与 tab 内 `items.len()` 天然相等。
@@ -1281,10 +1300,10 @@ impl OutsourcePoolRepo {
     ) -> Result<Vec<(i64, i64)>, sqlx::Error> {
         let dedup = sendable_dedup_sql(SENDABLE_PROJECTION_COUNT, SENDABLE_DEDUP_PROJECTION_COUNT);
         let sql = format!(
-            "SELECT d.next_process_id, COUNT(*)::bigint \
+            "SELECT d.current_process_id, COUNT(*)::bigint \
              FROM ( {dedup} ) d \
-             GROUP BY d.next_process_id \
-             ORDER BY d.next_process_id ASC"
+             GROUP BY d.current_process_id \
+             ORDER BY d.current_process_id ASC"
         );
         let rows: Vec<(i64, i64)> = sqlx::query_as(AssertSqlSafe(sql))
             .fetch_all(executor)
@@ -1369,27 +1388,35 @@ impl OutsourcePoolRepo {
     /// 照单全收，静默错值比拒收更难发现。
     ///
     /// **锚链与写侧同源**：写侧 `receive_from_outsource` 走
-    /// `require_process_chain(part_id)`（读 `t_part.process_chain_id`）+
-    /// `resolve_step_id_by_process(chain_id, process_id)`。锚 `p.process_chain_id`
-    /// ⇒ 本端点返回的 process_id 必然是**锚链内活跃 step 的工序**，写侧能在同一
-    /// 条链上解析到。
+    /// `optional_process_chain(part_id)`（读 `t_part.process_chain_id`）+
+    /// `optional_step_id(chain_id, process_id)`。锚 `p.process_chain_id` ⇒ 本端点
+    /// 返回的 process_id 必然是**锚链内活跃 step 的工序**，写侧能在同一条链上解析到
+    /// （有链时）。
     ///
-    /// 锚链**恒等于**写侧解析用的那条链：`link_chain_to_part` 带
-    /// `AND process_chain_id IS NULL` 守卫（已绑定的 part 不可改绑，其唯一调用方
-    /// 也在「该 part 尚无链」的分支），`unlink_part_from_chain` 只被 part 软删
-    /// 级联调用；`send_to_outsource` 强制 `require_process_chain` ⇒ 在途批次的
-    /// part 必然已绑链。`COALESCE` 的 `cur.chain_id` 分支因此只是防御性兜底
-    /// （`p.process_chain_id IS NULL` 是脏数据），不是活场景。
+    /// 2026-10-03 写侧放松了链的必须性（无链零件可发可收，见
+    /// `prod::batch::service::guard.rs::optional_process_chain`），对本查询的影响：
     ///
-    /// 2026-10-03 登记**保留而非删掉**该回落分支的取舍（它不可达，但是死代码，
-    /// 不写清楚理由就会被后人当垃圾清理）：删掉后，同样脏数据下读侧会落到
-    /// 「无下一 step」⇒ `chain_resolvable=false`，被前端读成「链坏了、需手填
-    /// 下一道工序」；而写侧的真实阻塞是 `20706 BIZ_PROCESS_CHAIN_REQUIRED`
-    /// 「请先制定工序链」—— 两者指向完全不同的排查方向。保留回落使读侧的诊断
-    /// 与写侧对齐。**不改变任何结果**：回落生效时写侧照样先撞 20706
-    /// （`require_process_chain` 读的就是 `t_part.process_chain_id`，与本回落
-    /// 无关），所以这不是「为了让脏数据能写下去」。成本是一个 `COALESCE`，
-    /// 命中分支时多一次 PK 索引查找。
+    /// - **无链批次**（`p.process_chain_id IS NULL`）落到 `chain_resolvable = false`
+    ///   分支：派生值 `COALESCE(..., 0) = 0`，前端据此弹「需手填下一道工序」对话框。
+    ///   这条降级路径本轮之前就已实现，不是新增风险。
+    /// - **有链但链内找不到该工序**的批次读侧同样给 `chain_resolvable = false`，而写侧
+    ///   `optional_step_id` 会以 `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND` 拒收。
+    ///   两侧的处置方向一致（都让用户手填），但**读侧不会替写侧报 20702** ——
+    ///   前端读 `chain_resolvable == false` 就弹手填框，不会走到服务端拒收那条路。
+    ///
+    /// `COALESCE(p.process_chain_id, cur.chain_id)` 回落分支**不再是「脏数据专属的
+    /// 死代码」**：无链批次本身就是活场景（2026-10-03 起它们能发外协，也就可能在途），
+    /// 每次派生都会走到这个回落分支。但它**取到的仍是 NULL** —— 无链批次的
+    /// `current_process_step_id` 按新的写入不变式恒为 NULL（`optional_step_id` 在无链
+    /// 时返回 `None`），`cur` 子查询无行 ⇒ 锚链解析失败 ⇒ 落 `chain_resolvable =
+    /// false`。保留 `COALESCE` 仍是对的（读侧不假设写侧何时写 step），它现在守的是
+    /// 「无链」这一常态，而不是「链被软删 / 数据坏了」。
+    ///
+    /// 2026-10-03 登记**保留而非删掉**该回落分支的取舍：不写清楚理由就会被后人当
+    /// 垃圾清理。删掉后无链批次与链尾批次会落到同一个「无下一 step」分支，两者的
+    /// 派生结果本就相同（都是 NULL），所以删掉不改变任何返回值；保留的成本是一个
+    /// `COALESCE`，收益是读侧 SQL 自己说明了「锚链优先取 part 的，缺了才回退到
+    /// step 指针所在的链」这一意图。
     ///
     /// ⚠️ **两个派生列都必须显式 `AS receive_next_process_*`**：LATERAL 子查询的输出
     /// 列名只跟子查询内部的名字走（`nx.next_process_name` 的列名是
