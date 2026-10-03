@@ -984,7 +984,7 @@ Response 200 `data`：`PartOut`（**2026-10-03 订正**：原文档写的
 `{ part_id, batch_id, from_status, to_status, version }` 与实现不符，handler 返回
 `R<PartOut>`，即 `parts/crud.md` 那套 part 视图对象）。
 
-错误码：20101 / 20104 / 20109 / 20201 / 20202 / 21405 / 21409 / 40901。
+错误码：20101 / 20104 / 20109 / 20201 / 20202 / 21405 / 21409 / 40300 / 40901。
 
 ---
 

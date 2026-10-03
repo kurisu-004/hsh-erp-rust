@@ -184,7 +184,7 @@ loop {
 - **报告口径**：这类行既不进 `changes`（守卫命中时一个字节都没写），也**不等于**
   「数据已一致」。故 `status_gate::RollupOutcome::terminal_skip` 上抛，
   报告给出 `parts_skipped_terminal` + `skipped_terminal[{id, current, derived}]`。
-  终态跳过**不落进任何日志**（仅 `tracing::warn!`），运维从报告里看到的
+  终态跳过只留一条 `tracing::warn!`，信号太弱：运维从报告里看到的
   `parts_examined=1 / parts_changed=0` 与「数据本来就一致」**不可区分** ——
   即「兜底修数工具给假干净报告」，与本端点要消灭的失败类别同类。
 - **人工怎么修**：守卫对**定点路径同样

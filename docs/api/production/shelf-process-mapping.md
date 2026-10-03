@@ -165,14 +165,14 @@ Response 200 `data`：`null`
 保留本节而非删除，是因为它同时承担两个仍有效的职责：① 记录硬切前后的 URL 对照，
 方便日后排查旧路径残留；② 记录 `ShelfOut` 字段变更的前端同步面（见顶部警示块）。
 
-| | 日期 | 内容 |
-|---|---|---|
-| 后端 | 2026-10-02 | 工序映射搬进 prod 域 + 账号部分消除（原始拆分） |
-| 后端 | 2026-10-02 | 端点数订正 + 本清单 + 测试加固 |
-| 后端合并 | 2026-10-02 | 货架域拆分（工序映射搬进 prod/shelf_process + 账号部分消除）已入 `master` |
-| 前端 | 2026-10-02 | 端点契约对齐 v2 后端（422 根因 + 3 处静默数据损坏） |
-| 前端 | 2026-10-02 | 保存闸门堵死静默清空 + 5 项准确性订正 |
-| 前端 | 2026-10-02 | 3 端点 URL 硬切到 prod 域 |
+| 归属 | 内容 |
+|---|---|
+| 后端 | 工序映射搬进 prod 域 + 账号部分消除（原始拆分） |
+| 后端 | 端点数订正 + 本清单 + 测试加固 |
+| 后端合并 | 货架域拆分（工序映射搬进 prod/shelf_process + 账号部分消除）已入 `master` |
+| 前端 | 端点契约对齐 v2 后端（422 根因 + 3 处静默数据损坏） |
+| 前端 | 保存闸门堵死静默清空 + 5 项准确性订正 |
+| 前端 | 3 端点 URL 硬切到 prod 域 |
 
 - **后端**：已在 `master`。
 - **前端**：在 `feat/shelf-domain-split` 分支，**截至 2026-10-02 尚未合入前端 `main`**
@@ -200,11 +200,11 @@ Response 200 `data`：`null`
 **URL 硬切本身是本次最小的一层**，但同一次前端改动顺带修了 3 个**独立的**、与域拆分
 无关的 v1(Python)→v2(Rust) 迁移遗留契约 bug（都不属于后端本次改动，故从未进过本清单）：
 
-| # | 症状 | 根因 | 前端落点 |
-|---|---|---|---|
-| BUG-1 | 保存工序映射报 **HTTP 422** | `setShelfProcesses` 发 `{process_ids: string[]}`，后端 `SetShelfProcessesRequest.items` 必填且无 `#[serde(default)]` → 40001。**该功能自 v1 迁 v2 起从未成功过一次** | `toShelfProcessesPayload()` 收口 payload 形态（`sort_order` 取数组下标 + 去重防撞 partial unique index） |
-| BUG-2 | 打开编辑弹窗已选工序被清空，点保存即**静默清空整组映射** | `getShelfProcesses` 读 `sp.processes`，后端实际返 `{items:[…]}` → `undefined.map` 抛 TypeError → 被裸 `catch` 吞掉 | `toShelfProcessIds()` 收口读形态；`catch` 不再清空而是置 `processLoadFailed` 硬拦整个保存动作（`ShelfList.vue`） |
-| BUG-3 | 多个页面的货架 / 工序下拉被**静默清空** | `getAllShelfProcessMappings` 按 v1 的「一架子集一行」读 `item.process_ids`；v2 返**扁平行**（一行一个 (货架, 工序) 对）→ `new Set(undefined)` = 空集 | `useShelfProcessFilter` 改按 `shelf_id` regroup 扁平行 |
+| 症状 | 根因 | 前端落点 |
+|---|---|---|
+| 保存工序映射报 **HTTP 422** | `setShelfProcesses` 发 `{process_ids: string[]}`，后端 `SetShelfProcessesRequest.items` 必填且无 `#[serde(default)]` → 40001。**该功能自 v1 迁 v2 起从未成功过一次** | `toShelfProcessesPayload()` 收口 payload 形态（`sort_order` 取数组下标 + 去重防撞 partial unique index） |
+| 打开编辑弹窗已选工序被清空，点保存即**静默清空整组映射** | `getShelfProcesses` 读 `sp.processes`，后端实际返 `{items:[…]}` → `undefined.map` 抛 TypeError → 被裸 `catch` 吞掉 | `toShelfProcessIds()` 收口读形态；`catch` 不再清空而是置 `processLoadFailed` 硬拦整个保存动作（`ShelfList.vue`） |
+| 多个页面的货架 / 工序下拉被**静默清空** | `getAllShelfProcessMappings` 按 v1 的「一架子集一行」读 `item.process_ids`；v2 返**扁平行**（一行一个 (货架, 工序) 对）→ `new Set(undefined)` = 空集 | `useShelfProcessFilter` 改按 `shelf_id` regroup 扁平行 |
 
 > 顺带修正的**纯前端类型谎言**（后端从未返过这些字段，非本次后端改动引起）：
 > `@/types/shelf::ShelfForReturn` 摘除 `display_order` / `mapped_process_codes`、
@@ -217,7 +217,7 @@ Response 200 `data`：`null`
 | 消费方 | 调用点 | 是否需改 | 实际状态 |
 |---|---|---|---|
 | `src/views/shelves/ShelfList.vue` | 直调 `getShelfProcesses` / `setShelfProcesses` 各 1 | 需改 | ✅ 已改 |
-| `src/composables/useShelfProcessFilter.ts` | 直调 `getAllShelfProcessMappings` | 需改 | ✅ 已改（BUG-3 regroup） |
+| `src/composables/useShelfProcessFilter.ts` | 直调 `getAllShelfProcessMappings` | 需改 | ✅ 已改（按 `shelf_id` regroup 扁平行） |
 | `src/views/cnc/composables/usePendingProgrammingStore.ts` | `useShelfProcessFilter` ×1 | **不需改** | ✅ 未改（对外 API 零变更，见下） |
 | `src/views/inspection/InspectionPending.vue` | `useShelfProcessFilter` ×2 | **不需改** | ✅ 未改（同上） |
 | `src/views/outsource/composables/useOutsourceReceivingList.ts` | `useShelfProcessFilter` ×1 | **不需改** | ✅ 未改（同上） |
@@ -231,7 +231,7 @@ Response 200 `data`：`null`
 1. **原写「已知消费者（7 处，需一并核对）」→ 实际是 8 个文件 / 12 个调用点**
    （7 个文件经 `useShelfProcessFilter`，共 10 个调用点；`ShelfList.vue` 直调 2 处）。
    原清单只列了 5 个经 composable 的文件，**漏了 `usePartDispatch.ts` 和
-   `RepairStartDialog.vue`** —— 这两处是 BUG-3「下拉被静默清空」的实际受害面。
+   `RepairStartDialog.vue`** —— 这两处是「下拉被静默清空」的实际受害面。
 2. **原写「需一并核对」措辞误导**：`useShelfProcessFilter` 的对外 API 本次
    **零变更**（经它的 7 个文件 / 10 个调用点一个都不用改），需要改的只有
    `ShelfList.vue` 那 2 处直调。把两者混列成「7 处需一并核对」会让后来者
@@ -241,7 +241,7 @@ Response 200 `data`：`null`
 **新增测试文件（原清单未提）**：`src/api/shelfProcesses.spec.ts`（3 函数 URL +
 payload / 响应形态逐字钉死 + 旧路径不出现）、`src/composables/__tests__/useShelfProcessFilter.spec.ts`
 （扁平行 regroup + 失败态）、`src/views/shelves/__tests__/ShelfList.processMapping.spec.ts`
-（BUG-2 保存闸门 P1~P4）。**漏网核查结论：全仓 `src/**` 已无任何拼装旧路径字符串的地方**
+（保存闸门 P1~P4）。**漏网核查结论：全仓 `src/**` 已无任何拼装旧路径字符串的地方**
 （`git grep '/shelves/processes' feat/shelf-domain-split` 的命中全在注释里，
 且都是解释「旧路径已废」用的）；3 个 URL 只在 `src/api/shelves.ts` 一处拼装，
  无页面绕过 api 层自拼路径。

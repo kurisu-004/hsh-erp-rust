@@ -384,7 +384,7 @@ Response 200 `data`: `null`
 
 ### 路线 B 修复（2026-08-27 ~ 2026-08-31）
 
-> 原设计文档 `scan-route-b-fix.md` 已折叠进本节（2026-08-31）。如需 git 历史，参见 `git log -- docs/api/delivery-notes/scan-route-b-fix.md`（最后一次修订 2026-08-27）。
+> 原设计文档 `scan-route-b-fix.md` 已折叠进本节（2026-08-31）。如需 git 历史，参见 `git log -- docs/api/delivery-notes/scan-route-b-fix.md`。
 
 #### Context
 

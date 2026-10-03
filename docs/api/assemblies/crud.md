@@ -4,7 +4,7 @@
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 > 共享 DTO（AssemblyOut / AssemblyListItem / AssemblyListOut / AssemblyChildOut / AssemblyFileRef / AssemblyDetail / AssemblyCreateResult）见 [`./index.md`](./index.md)
 >
-> 范围：本文件覆盖 7 个 CRUD 端点（list / create / get / update / soft-delete / **files-list** / **children**）+ start / files。cancel 见 [`./cancel.md`](./cancel.md)。
+> 范围：本文件覆盖 7 个 CRUD 端点（list / create / get / update / soft-delete / **files-list** / **children**）。cancel 见 [`./cancel.md`](./cancel.md)。
 >
 > 注：跨域端点 `GET /api/v2/parts/{part_id}/assembly`（2026-09-25 新增）虽挂在 parts 路由下但属于本域契约，文档收录在本文件末尾（仅文档归口，不改 frontend 路径）。
 
