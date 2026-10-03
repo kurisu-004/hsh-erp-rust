@@ -7,6 +7,8 @@
 //!   内部循环调 `WorkerPoolRepoTrait::take_one_from_pool`，直到池空或达到上限；
 //!   每抢到一批写一条 `TAKEN_FROM_POOL` 事件日志（commit 由 handler 负责）。
 //! - `compute_state` —— worker 当前持有数 + 池候选数（按工序分组）；用于 state 端点。
+//!   2026-10-04 起 `shelf_id` 降为可选（`Option<i64>`）：缺省时不算候选池计数，
+//!   `pool_count_by_process` 返空数组；持有列表 / 上限 / 容量与货架无关，不受影响。
 //!
 //! ## 2026-09-30 move 重构
 //! - 原 `admin_remove_held_batch`（WORKER→POOL 单边）+ `assign_batch_to_worker`（POOL→WORKER
@@ -230,12 +232,18 @@ impl WorkerPoolService {
     /// AND current_holder_id = shelf_id AND next_process_id = pid` 的批次数。
     /// 该 SQL 通过 trait helper `count_pool_by_shelf_and_process` 下沉。
     ///
+    /// **2026-10-04：`shelf_id` 降为可选**（`Option<i64>`）。`shelf_id = None` 时
+    /// 不查候选池计数，`pool_count_by_process` 返空数组；`held_batches` / `max_held` /
+    /// `current_held` / `capacity_remaining` 四段本就与货架无关，行为不变。
+    /// 缘由：shelf scope 只对 SHELF_ACCOUNT 返 `shelf_ids`，把它做成必填会让
+    /// MANAGER / CLERK / INSPECTOR 拿不到工人持有列表。
+    ///
     /// worker 无 work_type 时 `max_held = 0`、`process_ids = []`（state 端点不会拒绝，
     /// 仅展示空池 + 0 上限）。
     pub async fn compute_state(
         conn: &mut PgConnection,
         worker_id: i64,
-        shelf_id: i64,
+        shelf_id: Option<i64>,
     ) -> Result<WorkerPoolState, AppError> {
         let worker = (&mut *conn)
             .worker_get_by_id(worker_id, false)
@@ -255,21 +263,27 @@ impl WorkerPoolService {
             .await?;
         let capacity_remaining = (max_held as i64 - current_held).max(0) as i32;
 
-        let process_ids = if let Some(wt_id) = worker.work_type_id {
-            (&mut *conn).work_type_list_process_ids(wt_id).await?
-        } else {
-            vec![]
-        };
-
-        let mut pool_count_by_process = Vec::with_capacity(process_ids.len());
-        for pid in &process_ids {
-            let n = (&mut *conn)
-                .count_pool_by_shelf_and_process(shelf_id, *pid)
-                .await?;
-            pool_count_by_process.push(ProcessPoolCount {
-                process_id: *pid,
-                pool_count: n,
-            });
+        // 2026-10-04：shelf_id 缺省 → 不查候选池计数，pool_count_by_process 留空数组。
+        // 工种→工序映射（work_type_list_process_ids）只被下面的计数循环消费，
+        // 故一并收进 Some 分支：缺省时它是无产出的一次 DB 往返，而 state 端点按
+        // worker 逐个轮询，留着会被放大成 N 倍白跑。
+        let mut pool_count_by_process = Vec::new();
+        if let Some(sid) = shelf_id {
+            let process_ids = if let Some(wt_id) = worker.work_type_id {
+                (&mut *conn).work_type_list_process_ids(wt_id).await?
+            } else {
+                vec![]
+            };
+            pool_count_by_process.reserve(process_ids.len());
+            for pid in &process_ids {
+                let n = (&mut *conn)
+                    .count_pool_by_shelf_and_process(sid, *pid)
+                    .await?;
+                pool_count_by_process.push(ProcessPoolCount {
+                    process_id: *pid,
+                    pool_count: n,
+                });
+            }
         }
 
         // 2026-09-14 follow-up-ux 新增 → follow-up-round2 升级为 17 字段 HeldBatchItem：
