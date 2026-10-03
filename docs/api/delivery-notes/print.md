@@ -31,9 +31,14 @@
   缺 / 坏 / 过期 token → 40100 / 40102 / 40105。
 - RBAC：`require_any_role([MANAGER, CLERK, INSPECTOR])`，不通过 → 40300 FORBIDDEN。
   `SHELF_ACCOUNT`（货架终端）不放行——它只该扫码，不该开单打印。
-- Python 端这 2 个端点**本身无鉴权**，安全性来自部署层：nginx 不把 `/api/v1` 转发到
-  公网，Python 只在 compose 内网经 Rust 触达。⚠️ 该设计对部署配置有依赖——恢复
-  `/api/v1` 的公网转发块会让这 2 个端点等于裸开。
+- Python 端这 2 个端点**自身无应用层鉴权**。当前部署形态是 nginx 仍有
+  `location /api/ { proxy_pass http://myerp_backend; }`（前端仓 `frontend/nginx.conf`），
+  所以 `/api/v1` 在网关层仍可被直连；Python 只在 compose 内网经 Rust 触达是**设计意图**，
+  尚未在部署配置上收口。
+- 本 diff（rust 仓）提供的是 `/api/v2` 这一跳的强制 JWT + RBAC 闸门。
+- **收口 `/api/v1` 直连路径是跨仓动作**：前端仓把这 2 个端点从 `apiPrint` 切到
+  `api`（走 `/api/v2`），并下线 nginx 的 `location /api/` 转发块。安全性以那两仓的
+  合入为准；在此之前不能把「Python 端裸开」当作已被部署层挡住的事实。
 
 ## 行为（BFF 转发）
 
@@ -63,7 +68,7 @@ number 就是一次有损转换，故全链路按 string 透传，由 Python 端
 Response：Python 的响应原样透传（status + body + 经清洗的 headers）。成功形态：
 
 - `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
-- `Content-Disposition: attachment; filename="F-<YYYY-MM-DD>-note.xlsx"`
+- `Content-Disposition: inline; filename="delivery-note-{prefix}{delivery_note_no}.xlsx"`
 - Body: xlsx 二进制
 
 ### `POST /api/v2/delivery-notes/{id}/print-labels`  （P4 标签打印）
@@ -77,28 +82,28 @@ Request：同 `/print` 的 3 个字段，另加：
 Response：Python 的响应原样透传。成功形态：
 
 - `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
-- `Content-Disposition: attachment; filename="F-<YYYY-MM-DD>-labels.xlsx"`
+- `Content-Disposition: inline; filename="labels-{prefix}{delivery_note_no}.xlsx"`
 - Body: xlsx 二进制
 
-> 两个端点的文件名由 Python 端按送货单日期生成，前端 `parseFilename` 读
-> `content-disposition` 取名，取不到时回落到 `note-{id}.xlsx` / `label-{id}.xlsx`。
+> 文件名由 Python 端按「客户 `serial_prefix` + 送货单 `delivery_note_no`」生成
+> （`api/v1/delivery_note_print.py`），disposition 是 `inline`（浏览器内联渲染而非强制
+> 下载）。前端 `parseFilename`（`src/api/deliveryNote.ts`）直接读这个 header，取不到时
+> 回落到 `note-{id}.xlsx` / `label-{id}.xlsx`。
 
 ## Python 错误码透传
 
-下列错误码在本链路由**Python 端产出、原样透传**，Rust 端不产出、不改写、不二次包装：
+下列错误码在本链路由**Python 端产出、原样透传**，Rust 端不产出、不改写、不二次包装。
+清单以 Python 仓 `core/error_code.py` 的 `ErrCode` 为准，Python 端新增码时以那儿的
+定义为准：
 
 | code | 名称 | 语义 |
 |---|---|---|
+| 20104 | BIZ_INVALID_VALUE | `/print-labels` 传了 `line_item_ids=[]`（空数组） |
 | 21109 | BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED | 未按客户 prefix 配出 xlsx 模板 |
-| 21111 | BIZ_DELIVERY_PART_STATUS_INVALID | 所选零件状态不允许打印 |
-| 21112 | BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS | 所选零件超过模板容量 |
 | 21113 | BIZ_DELIVERY_PRINT_BAD_ORDER（HTTP 422） | `custom_order` 含非法批次 id 或漏行 |
-| 21401 | BIZ_DELIVERY_NOTE_NOT_FOUND | 送货单不存在 |
-| 21402 | BIZ_DELIVERY_NOTE_INVALID_TRANSITION | 送货单状态不允许打印 |
+| 21401 | BIZ_DELIVERY_NOTE_NOT_FOUND（HTTP 404） | 送货单不存在 |
 
-`/print-labels` 另可能返回 `20104 BIZ_INVALID_VALUE`（`line_item_ids=[]`）。
-
-这 4 个 211xx 模板码与 214xx 送货单码在 `src/shared/error.rs::code` 里**仍然注册**
+这 3 个 211xx 模板码与 214xx 送货单码在 `src/shared/error.rs::code` 里**仍然注册**
 （保留与 Python 错误码表对齐），但 Rust 端已无生产点：链路上的它们全部来自 Python。
 Python 侧还会返回哪些码以 Python 端为准，Rust 侧不预判、不枚举；前端按
 `{code, message, data}` 解封即可。
@@ -137,7 +142,8 @@ Python 侧还会返回哪些码以 Python 端为准，Rust 侧不预判、不枚
 - 注入：`X-Forwarded-User-Id: <CurrentUser.id>`（Python 端 STS 已信任该头；打印端点目前不读）。
 - 保留：`X-Request-Id` + 其它自定义业务头（trace 在 前端 nginx → rust → python 一致）。
 - 剥离：`Authorization` / `Cookie`（不让 Python 端反向依赖 Rust 的 JWT）/
-  `Host` / `Content-Length`（reqwest 自管）/ hop-by-hop 全套
+  `Host` / `Content-Length` / `Content-Type`（reqwest 自管：`.headers()` 是**追加**语义，
+  放行前端那份会与 `.json()` 自己写的那条并存）/ hop-by-hop 全套
   （`Connection` / `Keep-Alive` / `Transfer-Encoding` / `Upgrade` / `Te` / `Trailer`）。
 
 **响应侧**
@@ -145,9 +151,12 @@ Python 侧还会返回哪些码以 Python 端为准，Rust 侧不预判、不枚
 - 保留：`content-type`（前端靠它区分 xlsx / PDF）/ `content-disposition`
   （前端 `parseFilename` 靠它取下载文件名）/ `cache-control`（Python 端给的语义照搬）/
   其余自定义头。
-- 剥离：hop-by-hop 全套 + `content-encoding`（body 已被 reqwest 在解码层消费，
-  再带着这头出去会让前端 blob 拿到「声明为 gzip 实为明文」的数据）+ `date` /
-  `server`（上游 server 的自我标识，Rust 自己会写）。
+- 剥离：hop-by-hop 全套 + `content-encoding` + `date` / `server`（上游 server 的
+  自我标识，Rust 自己会写）。
+- `content-encoding` 之所以能安全剥：reqwest 开了 `gzip` feature，发请求时带
+  `accept-encoding: gzip`，收到 gzip 响应时在**解码层**把 body 还原成明文（并顺手
+  摘掉 `content-encoding` / `content-length`）。**解码与剥头必须成对**——只剥不解会
+  让前端拿到「声明 xlsx 实为 gzip 流」的坏文件且无报错。
 - **重算**：`content-length` 一律按实际 body 长度。打印响应可能是数 MB 的 xlsx，
   长度与实际不符时前端 `responseType: 'blob'` 的下载会被截断，表现为「下到一个坏
   文件」且无报错，极难排查。
@@ -161,9 +170,10 @@ Python 侧还会返回哪些码以 Python 端为准，Rust 侧不预判、不枚
 - **身份单头传递**：handler clone 一份 `HeaderMap` 再注入 `X-Forwarded-User-Id`
   （不能直接 mutate extractor 给的那份，会污染共用同一 `HeaderMap` 的其它
   extractor / middleware）。
-- **响应不 gzip**：`/api/v2` 的 `CompressionLayer` 谓词排除 xlsx 的 content-type
-  （已压缩格式再 gzip 只是白烧 CPU），PDF 同样排除；其余 content-type 的行为与
-  默认谓词一致。
+- **响应不 gzip**：`/api/v2` 的 `CompressionLayer` 谓词 = tower-http `DefaultPredicate`
+  （< 32 字节 / `image/*` / gRPC / SSE 不压缩）**且**排除 xlsx 的 content-type
+  （已压缩格式再 gzip 只是白烧 CPU，PDF 同样排除）。用 `.and()` 组合而非替换，因为
+  `compress_when` 是替换语义，只写排除项会把默认谓词的 4 条保护一起丢掉。
 - **幂等跳过**：打印路径被 `middleware::idempotency` 跳过（前端打印请求不带
   `Idempotency-Key`；大体积 xlsx 响应也不该进 Redis 缓存）。
 - **无 WS 事件**：打印端点不广播 WS 事件。

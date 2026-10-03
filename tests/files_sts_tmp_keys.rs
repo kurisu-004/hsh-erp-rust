@@ -332,13 +332,16 @@ async fn forward_sts_tmp_keys_does_not_leak_auth_header() {
     // 用真实 HttpPyBackend 替换 state.py_backend
     //
     // 2026-10-03：`new()` 增第 3 参 `print_timeout`（打印 4 方法的逐请求超时
-    // 覆盖档）。本用例只打 STS 链路，走 client 级 `timeout`，打印档取值与
-    // 生产默认值（`PYTHON_PRINT_TIMEOUT_MS` 缺省 600_000）保持一致即可。
+    // 覆盖档）。本用例只打 STS 链路，走 client 级 `timeout`，打印档取
+    // `PythonBackendConfig::default().print_timeout_ms`——引缺省值而不是写死
+    // 字面量，缺省改了这里不会悄悄漂移（该值在本用例中永远读不到，写死只是噪声）。
+    let print_timeout_ms =
+        hsh_erp_rust::infra::config::PythonBackendConfig::default().print_timeout_ms;
     let real_py_backend: Arc<dyn PyBackendClient> = Arc::new(
         hsh_erp_rust::infra::py_backend::HttpPyBackend::new(
             base_url.clone(),
             Duration::from_millis(2000),
-            Duration::from_millis(600_000),
+            Duration::from_millis(print_timeout_ms),
         )
         .expect("构造 HttpPyBackend"),
     );

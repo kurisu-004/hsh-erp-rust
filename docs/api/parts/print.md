@@ -29,9 +29,14 @@
   不通过 → 40300 FORBIDDEN。`SHELF_ACCOUNT`（货架终端）不放行——它只该扫码。
 - 图纸打印比送货单打印多放行一个 `CNC_PROGRAMMER`：CNC 编程岗要看图纸才能编程序，
   送货单是单据打印、编程岗用不上。
-- Python 端这 2 个端点**本身无鉴权**，安全性来自部署层：nginx 不把 `/api/v1` 转发到
-  公网，Python 只在 compose 内网经 Rust 触达。⚠️ 该设计对部署配置有依赖——恢复
-  `/api/v1` 的公网转发块会让这 2 个端点等于裸开。
+- Python 端这 2 个端点**自身无应用层鉴权**。当前部署形态是 nginx 仍有
+  `location /api/ { proxy_pass http://myerp_backend; }`（前端仓 `frontend/nginx.conf`），
+  所以 `/api/v1` 在网关层仍可被直连；Python 只在 compose 内网经 Rust 触达是**设计意图**，
+  尚未在部署配置上收口。
+- 本 diff（rust 仓）提供的是 `/api/v2` 这一跳的强制 JWT + RBAC 闸门。
+- **收口 `/api/v1` 直连路径是跨仓动作**：前端仓把这 2 个端点从 `apiPrint` 切到
+  `api`（走 `/api/v2`），并下线 nginx 的 `location /api/` 转发块。安全性以那两仓的
+  合入为准；在此之前不能把「Python 端裸开」当作已被部署层挡住的事实。
 
 ## 行为（BFF 转发）
 
@@ -71,12 +76,15 @@ Request（body 是 `Json<Value>`，**原样透传**，Rust 侧不解析字段、
 |---|---|---|---|
 | `part_ids` | [string (i64)] | ✓ | 待合并的工单 id 列表；Python 端按此顺序合并 |
 | `assembly_ids` | [string (i64)]? | — | 追加总装图页 |
+| `vector` | bool? | — | 光栅旁路，与单件端点的 `?vector=` 同一语义（Python 端 `PrintBatchRequest` 缺省 `false`） |
 
 ⚠️ 雪花 id 一律是 JSON **string**（> 2^53，JSON number 会丢精度）：Rust 侧若解析成
 number 就是一次有损转换，故全链路按 string 透传，由 Python 端解析。
 
-Response：同上（`application/pdf`，合并后的单个文件）。批量打印 20 件/批，合法耗时
-数分钟 —— 这 2 条路径因此走长档请求超时（见「env 配置」）。
+Response：`application/pdf` + `Content-Disposition: inline; filename="parts-batch.pdf"` +
+`Cache-Control: private, max-age=600`，Body 是合并后的单个 PDF（文件名**不含** part id，
+故前端拿到 header 也无法从文件名反推是哪一批）。批量打印 20 件/批，合法耗时数分钟 ——
+这 2 条路径因此走长档请求超时（见「env 配置」）。
 
 ## Python 错误码透传
 
@@ -118,7 +126,8 @@ Python 打印端点会返回哪些码由 Python 端负责，Rust 侧不预判、
 - 注入：`X-Forwarded-User-Id: <CurrentUser.id>`（Python 端 STS 已信任该头；打印端点目前不读）。
 - 保留：`X-Request-Id` + 其它自定义业务头（trace 在 前端 nginx → rust → python 一致）。
 - 剥离：`Authorization` / `Cookie`（不让 Python 端反向依赖 Rust 的 JWT）/
-  `Host` / `Content-Length`（reqwest 自管）/ hop-by-hop 全套
+  `Host` / `Content-Length` / `Content-Type`（reqwest 自管：`.headers()` 是**追加**语义，
+  放行前端那份会与 `.json()` 自己写的那条并存）/ hop-by-hop 全套
   （`Connection` / `Keep-Alive` / `Transfer-Encoding` / `Upgrade` / `Te` / `Trailer`）。
 
 **响应侧**
@@ -126,9 +135,12 @@ Python 打印端点会返回哪些码由 Python 端负责，Rust 侧不预判、
 - 保留：`content-type`（前端靠它区分 PDF）/ `content-disposition`
   （前端 `parseFilename` 靠它取下载文件名）/ `cache-control`（Python 端对 PDF 给的
   `private, max-age=600`，语义照搬）/ 其余自定义头。
-- 剥离：hop-by-hop 全套 + `content-encoding`（body 已被 reqwest 在解码层消费，
-  再带着这头出去会让前端 blob 拿到「声明为 gzip 实为明文」的数据）+ `date` /
-  `server`（上游 server 的自我标识，Rust 自己会写）。
+- 剥离：hop-by-hop 全套 + `content-encoding` + `date` / `server`（上游 server 的
+  自我标识，Rust 自己会写）。
+- `content-encoding` 之所以能安全剥：reqwest 开了 `gzip` feature，发请求时带
+  `accept-encoding: gzip`，收到 gzip 响应时在**解码层**把 body 还原成明文（并顺手
+  摘掉 `content-encoding` / `content-length`）。**解码与剥头必须成对**——只剥不解会
+  让前端拿到「声明 PDF 实为 gzip 流」的坏文件且无报错。
 - **重算**：`content-length` 一律按实际 body 长度。打印响应是数 MB 的 PDF，长度与
   实际不符时前端 `responseType: 'blob'` 的下载会被截断，表现为「下到一个坏文件」
   且无报错，极难排查。
@@ -143,9 +155,10 @@ Python 打印端点会返回哪些码由 Python 端负责，Rust 侧不预判、
 - **身份单头传递**：handler clone 一份 `HeaderMap` 再注入 `X-Forwarded-User-Id`
   （不能直接 mutate extractor 给的那份，会污染共用同一 `HeaderMap` 的其它
   extractor / middleware）。
-- **响应不 gzip**：`/api/v2` 的 `CompressionLayer` 谓词排除
-  `application/pdf` 与 xlsx 的 content-type（已压缩格式再 gzip 只是白烧 CPU），
-  其余 content-type 的行为与默认谓词一致。
+- **响应不 gzip**：`/api/v2` 的 `CompressionLayer` 谓词 = tower-http `DefaultPredicate`
+  （< 32 字节 / `image/*` / gRPC / SSE 不压缩）**且**排除 `application/pdf` 与 xlsx 的
+  content-type（已压缩格式再 gzip 只是白烧 CPU）。用 `.and()` 组合而非替换，因为
+  `compress_when` 是替换语义，只写排除项会把默认谓词的 4 条保护一起丢掉。
 - **幂等跳过**：打印路径被 `middleware::idempotency` 跳过（前端打印请求不带
   `Idempotency-Key`；数 MB 的 PDF 响应也不该进 Redis 缓存）。
 - **无 WS 事件**：打印端点不广播 WS 事件。

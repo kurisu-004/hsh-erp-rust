@@ -651,14 +651,30 @@ impl PyCapture {
     }
 }
 
+/// mock python 响应体 `b"%PDF-mock-python-body"` 的 gzip 流（`mtime=0` 定长输出）。
+///
+/// 手写常量而非引 `flate2` / `async-compression`（生产侧已是 reqwest 的传递依赖，
+/// 测试侧不必为一段固定字节再开一个 dev-dep）。
+const MOCK_GZIPPED_BODY: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x53, 0x0d, 0x70, 0x71, 0xd3, 0xcd,
+    0xcd, 0x4f, 0xce, 0xd6, 0x2d, 0xa8, 0x2c, 0xc9, 0xc8, 0xcf, 0xd3, 0x4d, 0xca, 0x4f, 0xa9, 0x04,
+    0x00, 0x70, 0x34, 0x7a, 0xcd, 0x15, 0x00, 0x00, 0x00,
+];
+
 /// 起本地 mock python 服务端（注册 4 条 v1 路由），返回 (base_url, 捕获槽)。
 ///
 /// 响应刻意做两件事，用来证明 rust 侧的响应头清洗确实生效：
 /// - body 用 **stream** 发送 → hyper 走 `transfer-encoding: chunked`、**不发**
 ///   `content-length`。于是 rust 必须**自己按实际 body 长度补出**
 ///   `content-length`，否则前端 blob 下载会被截断成「下到一个坏文件且无报错」。
-/// - 带 `content-encoding: gzip`（reqwest 未开 gzip feature，body 不会真被解码）
-///   与 `server: uvicorn` —— 这两个头都必须被剥掉。
+/// - 带 `content-encoding: gzip` 与 `server: uvicorn` —— 这两个头都必须被剥掉。
+///
+/// `gzip` 头的 body 是**真 gzip 字节**（[`MOCK_GZIPPED_BODY`]，即
+/// `b"%PDF-mock-python-body"` 的 gzip 流）：`reqwest` 开了 `gzip` feature，会在解码层
+/// 把它还原成明文并摘掉 `content-encoding` / `content-length`，rust 侧
+/// `filter_response_headers` 再剥一次 `content-encoding`（防御性兜底）并按明文长度
+/// 重算 `content-length`。若这里改成「gzip 头 + 明文 body」，reqwest 解压失败，
+/// 整个链路会变成 502，测不到头清洗。
 async fn spawn_mock_python() -> (String, PyCapture) {
     use axum::Router;
     use axum::routing::{get as rget, post as rpost};
@@ -678,10 +694,8 @@ async fn spawn_mock_python() -> (String, PyCapture) {
             &headers,
         );
         // 未知长度的 body → chunked；故意让 python 侧不带 content-length。
-        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![
-            Ok(axum::body::Bytes::from_static(b"%PDF-mock-")),
-            Ok(axum::body::Bytes::from_static(b"python-body")),
-        ];
+        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> =
+            vec![Ok(axum::body::Bytes::from_static(MOCK_GZIPPED_BODY))];
         axum::response::Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/pdf")

@@ -238,7 +238,11 @@ impl HttpPyBackend {
 ///
 /// ## 过滤清单
 /// - `Authorization` / `Cookie` —— 不能让 python 端"借"rust 的 JWT 上下文
-/// - `Host` / `Content-Length` —— reqwest 会自己处理
+/// - `Host` / `Content-Length` / `Content-Type` —— reqwest 自管：body 由
+///   `RequestBuilder::json()` 序列化，它自己写 `content-type: application/json`；
+///   而 `.headers(filtered)` 走 `HeaderMap::append` 是**追加**语义，前端带来的
+///   `content-type` 若也放行，转发出去的请求会带两条 `content-type`。
+///   与响应侧对 `content-length` 用 `insert` 消重是同一件事。
 /// - `Connection` / `Keep-Alive` / `Transfer-Encoding` / `Upgrade` / `Te` /
 ///   `Trailer` —— hop-by-hop
 /// - **不**含 `X-Forwarded-User-Id` —— handler 注入的 python 端身份依据，必须放行
@@ -250,6 +254,7 @@ fn filter_request_headers(src: &HeaderMap) -> HeaderMap {
         "cookie",
         "host",
         "content-length",
+        "content-type",
         "connection",
         "keep-alive",
         "transfer-encoding",
@@ -275,14 +280,28 @@ fn filter_request_headers(src: &HeaderMap) -> HeaderMap {
 /// - hop-by-hop 头（`connection` / `keep-alive` / `transfer-encoding` / `upgrade` /
 ///   `te` / `trailer`）—— 它们描述的是 python↔rust 这一跳的连接语义，对
 ///   rust↔前端那一跳无效甚至是错的；
-/// - `content-encoding` —— reqwest 已在解码层消费掉编码，body 是明文字节，
-///   再带着这头出去会让前端 blob 拿到「声明为 gzip 实为明文」的数据；
+/// - `content-encoding` —— 见下节；
 /// - `content-length` —— 与实际 body 长度不一致时（gzip/chunked 解码后、
 ///   或上游自己写错），前端 `responseType: 'blob'` 的下载会被截断。打印响应是
 ///   多 MB 的 PDF / XLSX，截断表现为「下到一个坏文件」且无报错，极难排查。
 ///   故一律**用实际 body 长度重算**。
 ///
 /// `date` / `server` 也一并剥掉：它们是上游 server 的自我标识，rust 自己会写。
+///
+/// ## `content-encoding` 为什么必须剥
+/// `reqwest` 开了 `gzip` feature（`Cargo.toml`）：发请求时自动带
+/// `accept-encoding: gzip`，收到 `content-encoding: gzip` 的响应时在**解码层**把 body
+/// 还原成明文（tower-http `decompression-gzip`，并在同一层摘掉 `content-encoding` 与
+/// `content-length`）。因此到达本函数时 body 是明文字节。
+///
+/// 若把 `content-encoding` 透传出去而 body 其实是明文，前端会拿「声明为 gzip 实为
+/// 明文」的数据去解压 ⇒ 静默下到一个坏文件。反过来若**既不解码又剥头**，更糟：
+/// body 是原始 gzip 字节、头被剥掉，浏览器按 `content-type` 当 PDF 解析 ⇒ 同样无报错。
+/// 解码与剥头必须成对，缺一不可。
+///
+/// SKIP 清单里保留 `content-encoding` 是防御性兜底（当前 `reqwest` 已先摘过一道，
+/// 走到这里通常已无此头）：万一将来换用未开 `gzip` feature 的 client，宁可剥掉一个
+/// 冗余头，也不能让「编码声明」与「明文 body」错配流到前端。
 ///
 /// ## 保留项
 /// - `content-type` —— 前端靠它区分 PDF / xlsx
@@ -300,7 +319,7 @@ fn filter_response_headers(src: &HeaderMap, body_len: usize) -> HeaderMap {
         "upgrade",
         "te",
         "trailer",
-        // body 已被 reqwest 解码，再声明编码会让前端误解
+        // body 已被 reqwest 解码成明文，再声明编码会让前端误解
         "content-encoding",
         // 上游 server 的自我标识
         "date",

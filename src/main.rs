@@ -161,10 +161,11 @@ async fn main() -> anyhow::Result<()> {
     // 执行，合法耗时数分钟，原先统一 30s 会把批量打印必然打断成 408；
     // 其余路径仍走 `request_timeout_seconds`（缺省 30s，行为不变）。
     let api_v2 = modules::v2_router(state.clone())
-        // 2026-10-03 新增：`compress_when(NoPrecompressedMime)` 排除 PDF / xlsx
-        // 这两个**已压缩**格式（缘由见该 struct 的 doc）。其余 content-type 的 gzip
-        // 行为与 `CompressionLayer::new()` 的默认谓词保持一致。
-        .layer(CompressionLayer::new().compress_when(NoPrecompressedMime))
+        // 2026-10-03 新增：谓词 = tower-http 默认谓词 `and` 排除已压缩格式
+        // （缘由见 `NoPrecompressedMime` 的 doc）。`compress_when` 是**替换**语义，
+        // 不 `and` 在默认谓词之上就会连带丢掉「< 32 字节 / image/* / gRPC / SSE
+        // 不压缩」这 4 条保护。
+        .layer(CompressionLayer::new().compress_when(compression_predicate()))
         // 超时层仍是最外层（后调 = 外层 = 请求先经过），保证超时判定覆盖到
         // Compression 的整个响应写出过程；不影响 /ws 长连接（本层只在 nest 内）。
         .layer(axum::middleware::from_fn_with_state(
@@ -277,7 +278,7 @@ fn trace_on_response(resp: &Response, latency: Duration, _span: &tracing::Span) 
 /// 2026-10-03 新增：gzip 压缩谓词——跳过**已压缩**的响应格式。
 ///
 /// ## 为什么需要它
-/// `CompressionLayer::new()` 用 tower-http 默认谓词，它只排除 `image/*` / gRPC / SSE，
+/// tower-http 默认谓词（`DefaultPredicate`）只排除 `image/*` / gRPC / SSE / < 32 字节，
 /// 于是 `application/pdf`（批量图纸打印的产物）与
 /// `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`（xlsx 导出）
 /// 都会被 gzip 一遍——这两者**本身就是压缩格式**，gzip 只会烧 CPU、几乎压不动体积。
@@ -286,7 +287,12 @@ fn trace_on_response(resp: &Response, latency: Duration, _span: &tracing::Span) 
 ///
 /// ## 为什么自己实现而不复用 tower-http 的 `ContentType` 枚举
 /// 直接按 mime 字符串比对：不依赖 tower-http 有没有 PDF / XLSX 的枚举变体，
-/// 跨 tower-http 版本稳定。谓词语义保持「其余 content-type 的 gzip 行为不变」。
+/// 跨 tower-http 版本稳定。
+///
+/// ## 它只是**排除项**，必须 `and` 在默认谓词之上
+/// `CompressionLayer::compress_when` 的语义是**替换**内置谓词，直接传本 struct 会把
+/// 默认谓词的 4 条保护一起丢掉。本 struct 自身**不判断体积**（未知长度响应一律放行），
+/// 体积门槛由 [`compression_predicate`] 里的 `DefaultPredicate` 负责。
 #[derive(Clone, Copy)]
 struct NoPrecompressedMime;
 
@@ -320,6 +326,17 @@ impl tower_http::compression::Predicate for NoPrecompressedMime {
     }
 }
 
+/// `/api/v2` 的完整压缩谓词。
+///
+/// 语义 = tower-http `DefaultPredicate`（`SizeAbove(32)` ∧ 非 gRPC ∧ 非 `image/*` ∧
+/// 非 SSE）**且** [`NoPrecompressedMime`]（非 PDF / xlsx）。用 `.and()` 组合而不是
+/// 自写一份，是因为 `compress_when` 会**替换**内置谓词：只写排除项会把体积门槛与
+/// SSE / image 保护一并丢掉（SSE 被 gzip 会破坏流式推送，`image/*` 本来压不动）。
+fn compression_predicate() -> impl tower_http::compression::Predicate {
+    use tower_http::compression::Predicate as _;
+    tower_http::compression::predicate::DefaultPredicate::new().and(NoPrecompressedMime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,48 +344,91 @@ mod tests {
     use axum::http::Response;
     use tower_http::compression::Predicate;
 
+    /// 造一个带 content-type 与**已知长度** body 的响应。
+    ///
+    /// body 必须非空且能给出 size_hint：默认谓词的 `SizeAbove(32)` 读的是
+    /// `content-length` 或 `body.size_hint()`，`Body::empty()` 恒为 0 会被判「不压缩」。
     fn resp_with_content_type(ct: Option<&str>) -> Response<Body> {
+        resp_with_body(ct, "x".repeat(1024).into_bytes())
+    }
+
+    fn resp_with_body(ct: Option<&str>, body: Vec<u8>) -> Response<Body> {
         let mut builder = Response::builder();
         if let Some(ct) = ct {
             builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
         }
-        builder.body(Body::empty()).expect("构造响应")
+        builder.body(Body::from(body)).expect("构造响应")
     }
 
     /// 已压缩格式（pdf / xlsx）不压缩。
     #[test]
     fn no_compression_for_precompressed_mime() {
+        let p = compression_predicate();
         assert!(
-            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some("application/pdf"))),
+            !p.should_compress(&resp_with_content_type(Some("application/pdf"))),
             "application/pdf 已压缩，不应再 gzip"
         );
         assert!(
-            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some(
+            !p.should_compress(&resp_with_content_type(Some(
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             ))),
             "xlsx 已压缩，不应再 gzip"
         );
     }
 
-    /// 其余 content-type 的 gzip 行为保持不变（含无 content-type 的响应）。
+    /// 其余 content-type 的 gzip 行为与 tower-http 默认谓词一致（含无 content-type）。
     #[test]
     fn compression_unchanged_for_other_mime() {
+        let p = compression_predicate();
         for ct in [
             "application/json",
             "application/json; charset=utf-8",
             "text/plain",
-            "text/event-stream",
-            "image/png",
             "application/octet-stream",
         ] {
             assert!(
-                NoPrecompressedMime.should_compress(&resp_with_content_type(Some(ct))),
+                p.should_compress(&resp_with_content_type(Some(ct))),
                 "非「已压缩格式」的响应应保持压缩行为：{ct}"
             );
         }
         assert!(
-            NoPrecompressedMime.should_compress(&resp_with_content_type(None)),
+            p.should_compress(&resp_with_content_type(None)),
             "无 content-type 时保持默认行为（压缩）"
+        );
+    }
+
+    /// 默认谓词的 4 条保护必须**同时**生效：`compress_when` 是替换语义，
+    /// 谓词若只做「排除已压缩格式」就会把这些一起丢掉（SSE 被 gzip 会破坏流式推送）。
+    #[test]
+    fn default_predicate_protections_survive_composition() {
+        let p = compression_predicate();
+        // 保护 1：image/* 不压缩
+        assert!(
+            !p.should_compress(&resp_with_content_type(Some("image/png"))),
+            "image/* 已压缩，不应再 gzip"
+        );
+        // 保护 2：SSE 不压缩
+        assert!(
+            !p.should_compress(&resp_with_content_type(Some("text/event-stream"))),
+            "SSE 是流式推送，gzip 会破坏分帧"
+        );
+        // 保护 3：gRPC 不压缩
+        assert!(
+            !p.should_compress(&resp_with_content_type(Some("application/grpc"))),
+            "gRPC 自带压缩，不应再 gzip"
+        );
+        // 保护 4：小于 32 字节的响应不压缩
+        assert!(
+            !p.should_compress(&resp_with_body(Some("application/json"), b"{}".to_vec())),
+            "小于 32 字节的响应压不动，不应 gzip"
+        );
+        // 门槛之上仍压缩（防「谓词恒 false」这种把压缩层关掉的写法）
+        assert!(
+            p.should_compress(&resp_with_body(
+                Some("application/json"),
+                "y".repeat(1024).into_bytes()
+            )),
+            "超过 32 字节的 JSON 仍应压缩"
         );
     }
 
@@ -376,19 +436,13 @@ mod tests {
     /// 同样不该被 gzip）。
     #[test]
     fn mime_matching_is_case_insensitive_and_ignores_parameters() {
-        assert!(
-            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some("Application/PDF")))
-        );
-        assert!(
-            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some(
-                "application/pdf; charset=binary"
-            )))
-        );
-        assert!(
-            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some(
-                "APPLICATION/VND.OPENXMLFORMATS-OFFICEDOCUMENT.SPREADSHEETML.SHEET"
-            ))),
-            "xlsx mime 应大小写不敏感"
-        );
+        let p = compression_predicate();
+        assert!(!p.should_compress(&resp_with_content_type(Some("Application/PDF"))));
+        assert!(!p.should_compress(&resp_with_content_type(Some(
+            "application/pdf; charset=binary"
+        ))));
+        assert!(!p.should_compress(&resp_with_content_type(Some(
+            "APPLICATION/VND.OPENXMLFORMATS-OFFICEDOCUMENT.SPREADSHEETML.SHEET"
+        ))));
     }
 }
