@@ -247,7 +247,7 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 | （**前端 menuCode 待定 2026-09-29**） | `/production/pending-dispatch` | `ProductionPendingDispatchPage.vue`（**新前端页面 2026-09-29**） | `prod::batch` | [`batches.md`](./batches.md) |
 | （**前端 menuCode 待定 2026-10-01**） | 「待编程一览」页（沿用 part 域路由） | 待编程 tab（`has_cnc_program` 三态） | `prod::programming` | [`pending-programming.md`](./pending-programming.md)（口径：状态白名单闸门 + 三规则并集，与 part 域旧端点的差异见该页「过滤谓词」段） |
 
-> 上述 `process_work_type` / `part_process_chain` / `worker_queue` 3 个 menuCode 的授权（MANAGER + CLERK + INSPECTOR）由后端 migration 018 + 021 写入 `t_role_menu`。
+> 上述 `process_work_type` / `part_process_chain` / `worker_queue` 3 个 menuCode 的授权（MANAGER + CLERK + INSPECTOR）由 `seeds/menu.sql` 第 4 节（角色授权 `t_role_menu`）按扁平 code 列表写入。
 > 2026-10-04：`workers_list`（工人档案）随前端视图搬到 `/production/worker-list`，菜单从 `auth_group` 迁到 `production_group`（`seeds/menu.sql` 改父分组 + path + sort_order 25）—— `t_role_menu` 仍是扁平 code 列表，**授权范围一行未变**（仍只有 MANAGER 有 `workers_list`）。
 > `prod::batch` 4 端点走 service 内 `require_any_role(...)` 守卫（list=Manager+Clerk+Inspector；写=Manager+Clerk），无需新增 `t_role_menu` 行（沿用 production_group 既有授权）。
 > `prod::programming` 1 端点同样走 service 内守卫（Manager+Clerk+Inspector+**CNC_PROGRAMMER**），同样无需新增 `t_role_menu` 行。

@@ -41,7 +41,7 @@ Query：
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `worker_id` | string (i64) | ✓ | 工人雪花 ID |
-| `shelf_id` | string (i64) |  | 工人所在货架 ID（决定候选池范围）；**2026-10-04 起可选** —— 缺省表示不关心候选池计数，`pool_count_by_process` 返空数组（`held_batches` / `max_held` / `current_held` / `capacity_remaining` 与货架无关，照常返回） |
+| `shelf_id` | string (i64) | — | 工人所在货架 ID（决定候选池范围）；**2026-10-04 起可选** —— 缺省表示不关心候选池计数，`pool_count_by_process` 返空数组（`held_batches` / `max_held` / `current_held` / `capacity_remaining` 与货架无关，照常返回） |
 
 Response 200 `data`：[`WorkerPoolState`](#workerpoolstate-字段)
 
