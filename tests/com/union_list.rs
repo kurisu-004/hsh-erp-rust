@@ -9,6 +9,9 @@
 //! 4. ALL 模式 `sort_by=SERIAL_NO` —— 降级 CREATED_AT，不报错。
 //! 5. 非法 `row_type=BAD` —— 40001 VALIDATION_ERROR。
 //! 6. `row_type=ALL` deep offset 分页回归 —— pushdown 修分页 bug（plan §3）。
+//! 7. 2026-10-03 新增：`delivered_quantity`（已送数量 / 已送套数）—— PART 行
+//!    只累加 DELIVERED / COMPLETED 且非软删的批次；ASSEMBLY 行取
+//!    `MIN(子件已送 × 套数 / 子件总量)`（总量 0 不参与 / 无子件为 0）。
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -298,6 +301,111 @@ async fn insert_assembly_full(
 async fn test_state(pool: PgPool) -> std::sync::Arc<hsh_erp_rust::state::AppState> {
     use hsh_erp_test_support::test_state as ts_test_state;
     ts_test_state(pool).await
+}
+
+/// 2026-10-03 新增：直插一个 `t_part_batch` 行（`delivered_quantity` 用例专用）。
+///
+/// `deleted_at` 传 `Some(_)` 即软删（验证软删批次不计入已送数量）。
+async fn add_batch(
+    pool: &PgPool,
+    part_id: i64,
+    batch_no: i32,
+    qty: i32,
+    status: &str,
+    deleted_at: Option<chrono::NaiveDateTime>,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_test_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, updated_at, deleted_at) \
+         VALUES ($1, $2, $3, $4, $5, 0, $6, $6, $7)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(batch_no)
+    .bind(qty)
+    .bind(status)
+    .bind(now)
+    .bind(deleted_at)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch");
+    id
+}
+
+/// 2026-10-03 新增：直插一个指定套数的 `t_assembly` 行（已送套数 min 公式用）。
+async fn add_assembly_with_quantity(
+    pool: &PgPool,
+    drawing_no: &str,
+    name: &str,
+    customer_id: i64,
+    quantity: i32,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_test_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
+         request_date, planned_delivery_date, status, quantity, unit_price, total_price, \
+         version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, '', $4, $5, $5, 'PENDING', $6, 0, 0, 0, $7, NULL, $7, NULL)",
+    )
+    .bind(id)
+    .bind(drawing_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(quantity)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_assembly with quantity");
+    id
+}
+
+/// 2026-10-03 新增：直插一个指定「子件总数」的装配体子件（已送套数 min 公式用）。
+async fn add_child_part_with_quantity(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    assembly_id: i64,
+    quantity: i32,
+) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_test_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at, assembly_id) \
+         VALUES ($1, NULL, $2, 'D-001', $3, 'PENDING', $2, $5, $5, $4, 0, $6, $6, $7)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(customer_id)
+    .bind(quantity)
+    .bind(today)
+    .bind(now)
+    .bind(assembly_id)
+    .execute(pool)
+    .await
+    .expect("insert child part with quantity");
+    id
+}
+
+/// 2026-10-03 新增：从 `items` 里按 id 取单行（取不到即 panic，附完整响应便于定位）。
+fn find_row(env: &Value, id: i64) -> Value {
+    env["data"]["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("items 缺数组: {env}"))
+        .iter()
+        .find(|i| i["id"].as_str().and_then(|s| s.parse::<i64>().ok()) == Some(id))
+        .cloned()
+        .unwrap_or_else(|| panic!("响应里找不到 id={id}: {env}"))
 }
 
 // ===========================================================================
@@ -2158,5 +2266,310 @@ async fn list_union_items_filters_by_request_date_from_invalid_format() {
             .unwrap_or("")
             .contains("request_date_from"),
         "错误消息应包含字段名: {env}"
+    );
+}
+
+// ===========================================================================
+//  2026-10-03 新增：delivered_quantity（已送数量 / 已送套数）
+// ===========================================================================
+
+/// PART 行：只累加 `DELIVERED` 批次，`IN_PROCESS` 不计入。
+///
+/// 装配件 3 套（DELIVERED）+ 4 套（DELIVERED）+ 5 套（IN_PROCESS）→ 7。
+#[tokio::test]
+async fn delivered_quantity_part_row_sums_only_delivered_batches() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let p = insert_part(&pool, "PD1", fx.customer_l2_id, Some("PD1"), "IN_PROCESS").await;
+    add_batch(&pool, p, 1, 3, "DELIVERED", None).await;
+    add_batch(&pool, p, 2, 4, "DELIVERED", None).await;
+    add_batch(&pool, p, 3, 5, "IN_PROCESS", None).await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=ALL&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list ALL: {env}");
+    let row = find_row(&env, p);
+    assert_eq!(row["row_type"], "PART");
+    assert_eq!(
+        row["delivered_quantity"], 7,
+        "3+4 已交，5 件在制不计入: {row}"
+    );
+}
+
+/// PART 行：`COMPLETED` 批次同样计入（口径是 `IN ('DELIVERED', 'COMPLETED')`）。
+#[tokio::test]
+async fn delivered_quantity_part_row_counts_completed_batches() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let p = insert_part(&pool, "PD2", fx.customer_l2_id, Some("PD2"), "IN_PROCESS").await;
+    add_batch(&pool, p, 1, 2, "DELIVERED", None).await;
+    add_batch(&pool, p, 2, 6, "COMPLETED", None).await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=PART&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list PART: {env}");
+    let row = find_row(&env, p);
+    assert_eq!(
+        row["delivered_quantity"], 8,
+        "COMPLETED 与 DELIVERED 同口径计入: {row}"
+    );
+}
+
+/// PART 行：软删批次（`deleted_at` 非空）不计入。
+#[tokio::test]
+async fn delivered_quantity_part_row_excludes_soft_deleted_batches() {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let p = insert_part(&pool, "PD3", fx.customer_l2_id, Some("PD3"), "IN_PROCESS").await;
+    add_batch(&pool, p, 1, 5, "DELIVERED", None).await;
+    add_batch(&pool, p, 2, 7, "DELIVERED", Some(now_naive())).await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=ALL&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list ALL: {env}");
+    let row = find_row(&env, p);
+    assert_eq!(row["delivered_quantity"], 5, "软删的 7 件不计入: {row}");
+}
+
+/// PART 行：`CANCELLED` 批次不计入。
+#[tokio::test]
+async fn delivered_quantity_part_row_excludes_cancelled_batches() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let p = insert_part(&pool, "PD4", fx.customer_l2_id, Some("PD4"), "IN_PROCESS").await;
+    add_batch(&pool, p, 1, 4, "DELIVERED", None).await;
+    add_batch(&pool, p, 2, 9, "CANCELLED", None).await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=ALL&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list ALL: {env}");
+    let row = find_row(&env, p);
+    assert_eq!(row["delivered_quantity"], 4, "已取消的 9 件不计入: {row}");
+}
+
+/// PART 行：零批次 → 0，且**键必须存在**（不是缺字段）。
+#[tokio::test]
+async fn delivered_quantity_part_row_is_zero_when_no_batches() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let p = insert_part(&pool, "PD5", fx.customer_l2_id, Some("PD5"), "PENDING").await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=ALL&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list ALL: {env}");
+    let row = find_row(&env, p);
+    assert!(
+        row.get("delivered_quantity").is_some(),
+        "delivered_quantity 键必须恒在（零批次也不能缺）: {row}"
+    );
+    assert_eq!(
+        row["delivered_quantity"], 0,
+        "零批次 → 0（COALESCE 生效）: {row}"
+    );
+}
+
+/// ASSEMBLY 行：已送套数 = min(子件已送 × 套数 / 子件总量)。
+///
+/// 装配件 10 套；子件 A 总量 20 已交 10（→ 10*10/20 = 5 套）；子件 B 总量 10 已交 0
+/// （→ 0 套）→ min = 0；补交 B 的 10 件后 → min(5, 10) = 5。
+#[tokio::test]
+async fn delivered_quantity_assembly_row_uses_min_set_formula() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let asm = add_assembly_with_quantity(&pool, "D-MIN", "A-MIN", fx.customer_l2_id, 10).await;
+    let child_a = add_child_part_with_quantity(&pool, "CA", fx.customer_l2_id, asm, 20).await;
+    let child_b = add_child_part_with_quantity(&pool, "CB", fx.customer_l2_id, asm, 10).await;
+    add_batch(&pool, child_a, 1, 10, "DELIVERED", None).await;
+
+    let url = format!(
+        "/com/union-list?customer_id={}&row_type=ALL&limit=200",
+        fx.customer_l2_id
+    );
+    let (s, env) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list ALL: {env}");
+    let row = find_row(&env, asm);
+    assert_eq!(row["row_type"], "ASSEMBLY");
+    assert_eq!(row["quantity"], 10, "装配件套数字面应回显: {row}");
+    assert_eq!(
+        row["delivered_quantity"], 0,
+        "子件 B 一件没交 → min(5, 0) = 0: {row}"
+    );
+
+    // 补交子件 B 的 10 件 → min(5, 10) = 5
+    add_batch(&pool, child_b, 1, 10, "DELIVERED", None).await;
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request("GET", &url, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list ALL（补交后）: {env}");
+    let row = find_row(&env, asm);
+    assert_eq!(
+        row["delivered_quantity"], 5,
+        "子件 B 补齐后 → min(5, 10) = 5: {row}"
+    );
+}
+
+/// ASSEMBLY 行：子件总量为 0 → 该子件不参与（不得整除零出错、也不拖累 min）。
+///
+/// 装配件 10 套；子件 Z 总量 0（已交 100 件，数学上无意义但能验证 NULLIF 分支）、
+/// 子件 A 总量 20 已交 10（→ 5 套）→ 期望 5。
+#[tokio::test]
+async fn delivered_quantity_assembly_row_skips_zero_quantity_child() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let asm = add_assembly_with_quantity(&pool, "D-ZERO", "A-ZERO", fx.customer_l2_id, 10).await;
+    let child_zero = add_child_part_with_quantity(&pool, "CZ", fx.customer_l2_id, asm, 0).await;
+    let child_a = add_child_part_with_quantity(&pool, "CA", fx.customer_l2_id, asm, 20).await;
+    add_batch(&pool, child_zero, 1, 100, "DELIVERED", None).await;
+    add_batch(&pool, child_a, 1, 10, "DELIVERED", None).await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=ALL&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "总量 0 的子件不应整除零: {env}");
+    let row = find_row(&env, asm);
+    assert_eq!(row["child_count"], 2, "两个子件都参与计数: {row}");
+    assert_eq!(
+        row["delivered_quantity"], 5,
+        "总量 0 的子件不参与 min，其余子件仍给出 5 套: {row}"
+    );
+}
+
+/// ASSEMBLY 行：无子件 → 0（外层 COALESCE 兜底，键恒在）。
+#[tokio::test]
+async fn delivered_quantity_assembly_row_is_zero_without_children() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let asm = add_assembly_with_quantity(&pool, "D-NOKID", "A-NOKID", fx.customer_l2_id, 7).await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=ASSEMBLY&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list ASSEMBLY: {env}");
+    let row = find_row(&env, asm);
+    assert_eq!(row["child_count"], 0);
+    assert!(
+        row.get("delivered_quantity").is_some(),
+        "delivered_quantity 键必须恒在: {row}"
+    );
+    assert_eq!(row["delivered_quantity"], 0, "无子件 → 0 套: {row}");
+}
+
+/// `GET /api/v2/parts` 与 `GET /com/union-list` 的已送数量一致（同一 fixture、同一 part）。
+#[tokio::test]
+async fn delivered_quantity_parts_endpoint_matches_union_list() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let p = insert_part(&pool, "PD6", fx.customer_l2_id, Some("PD6"), "IN_PROCESS").await;
+    add_batch(&pool, p, 1, 7, "DELIVERED", None).await;
+    add_batch(&pool, p, 2, 3, "COMPLETED", None).await;
+
+    let (s_union, env_union) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=PART&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s_union, StatusCode::OK, "union-list PART: {env_union}");
+    let union_val = find_row(&env_union, p)["delivered_quantity"].clone();
+
+    let (s_parts, env_parts) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!("/parts?customer_id={}&limit=200", fx.customer_l2_id),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s_parts, StatusCode::OK, "GET /parts: {env_parts}");
+    let row = find_row(&env_parts, p);
+    assert_eq!(
+        row["delivered_quantity"], 10,
+        "7(DELIVERED) + 3(COMPLETED) = 10: {row}"
+    );
+    assert_eq!(
+        union_val, row["delivered_quantity"],
+        "两个端点的已送数量口径必须一致: union={union_val} parts={row}"
     );
 }
