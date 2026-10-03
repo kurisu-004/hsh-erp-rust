@@ -27,11 +27,12 @@
 //! （1）转发到 `prod::batch` 域的 ZST 静态方法，`conn_mut` 则无对应 SQL 方法。
 //!
 //! ## 为什么 trait 命名为 `PartRepoTrait`（带 `Trait` 后缀）
-//! 跨模块静态调用方（delivery_note / assembly / outsource / part_file / statistics /
-//! shelf 6 域，prod::worker_pool 1 域）继续走 `PartRepo::xxx(&mut *conn, ...)`
-//! ZST 静态方法——保持 24 处静态调用零修改（本任务**不能**破坏 `part::repo::PartRepo`
-//! 作为 ZST 的对外身份），故 trait 改名 `PartRepoTrait`（与 shelf / customer / part_batch
-//! 范本同形）：
+//! 跨模块静态调用方（2026-10-03 实测 7 域 10 文件：assembly 6 / delivery_note 5 /
+//! prod::batch 5 / com::union_list 3 / admin 2 / prod::worker_pool 2 /
+//! prod::process_chain 1）继续走 `PartRepo::xxx(&mut *conn, ...)` ZST 静态方法——保持
+//! 24 处静态调用零修改（口径：`src/` 下剔除注释行后的 `PartRepo::` 出现次数，排除
+//! part 域自身；本任务**不能**破坏 `part::repo::PartRepo` 作为 ZST 的对外身份），
+//! 故 trait 改名 `PartRepoTrait`（与 shelf / customer / part_batch 范本同形）：
 //!
 //! - `part::repo::PartRepo` —— ZST struct（在 `sql/mod.rs` 内，通过 `pub use sql::PartRepo;`
 //!   重新导出至本模块），保留 21 个静态方法签名不变（cross-module 调用方零修改）。
@@ -46,19 +47,21 @@
 //! PgConnection`，单测 `R = MockPartRepoTrait`）。
 //!
 //! ## 跨域 helper（1）—— 下沉到 PartRepoTrait
-//! service 跨域调用（CustomerRepo::lookup_names / ProcessChainRepo::xxx /
-//! PartBatchRepo::xxx / PartFileRepo::xxx / WorkerPoolService::refill_*）下沉到
-//! `PartRepoTrait` helper 方法，trait impl 一行委托到对应域的 ZST 静态方法。这样
-//! service 仍只需一个 `repo: R: PartRepoTrait` 参数，避免多 trait 借连接的限制。
+//! 设计意图：service 跨域读别的域时，除 `repo: R: PartRepoTrait` 外还得再借一次连接，
+//! 而 `&mut PgConnection` 同一作用域只能借给一个 repo 实例。故 D-6 起计划把这类调用
+//! （历史上候选涉及 Customer / ProcessChain / PartBatch / PartFile / WorkerPool 等域）
+//! 下沉成 `PartRepoTrait` helper、impl 一行委托到对应域 ZST 静态方法，service 就只需
+//! 一个 `repo` 参数。**实际落地只有 1 个**：
 //!
 //! - `part_batch_has_active_on_delivery_note(part_id)` —— 委托 `PartBatchRepo::has_active_batch_on_delivery_note`
 //!
-//! 注：2026-10-03 订正——原文列的 `customer_lookup_names` /
-//! `part_batch_list_active_by_part_id` 两个 helper 在 trait 里**并不存在**
-//! （前者从未落地；后者零调用方，已与 `find_inprocess_batch_by_id_and_holder`、
-//! `mark_batch_cancelled` 一并删除）。原 `enrich_part_list_with_location_and_holder`
-//! 跨域 helper（t_shelf / t_worker / t_outsource_company 三表解析 holder 名）保留
-//! service 内调用形态——下沉到 trait 会让 trait 膨胀。
+//! 注：2026-10-03 订正——原文把上述历史候选与实际 trait 方法并列为「跨域 helper 清单」，
+//! 读起来像都已落地。其中 `customer_lookup_names` 从未落地；
+//! `part_batch_list_active_by_part_id` 曾落地但零调用方，已与
+//! `find_inprocess_batch_by_id_and_holder`、`mark_batch_cancelled` 一并删除。
+//! 原 `enrich_part_list_with_location_and_holder`（t_shelf / t_worker /
+//! t_outsource_company 三表解析 holder 名）保留 service 内调用形态——下沉到 trait 会让
+//! trait 膨胀。
 //!
 //! ## 为什么 trait 可以直接对 `&mut PgConnection` 实现
 //! `Transaction<'_, Postgres>` 与 `PoolConnection<Postgres>` 都 `DerefMut<Target = PgConnection>`，
@@ -72,9 +75,13 @@
 //!   按 conventions.md §4.1 含 IO 不强求 100%。
 //!
 //! ## 错误类型
-//! 40 个方法里 31 个返回 `sqlx::Error`（与 `sql/` 静态方法签名 1:1，零翻译）；8 个
-//! `t_part_batch.status` 写点返回 `AppError`（契约是「没写成 = `VERSION_CONFLICT`」，
-//! 转 `sqlx::Error` 会把 409 降级成 500）；`conn_mut` 无返回值。
+//! 40 个方法里 31 个返回 `sqlx::Error`、8 个 `t_part_batch.status` 写点返回
+//! `AppError`（契约是「没写成 = `VERSION_CONFLICT`」，转 `sqlx::Error` 会把 409 降级成
+//! 500）、`conn_mut` 无返回值。31 个 `sqlx::Error` 按委托目标再分两处——**都是零翻译**，
+//! 但 1:1 的对象不同：
+//! - 21 个 1:1 委托 `sql::PartRepo`（t_part 18 + t_part_event 1 + pending-programming 2，
+//!   恰好等于 `sql/` 静态方法数）
+//! - 10 个 1:1 委托 `PartBatchRepo`（t_part_batch 段 9 + 跨域 helper 1）
 //!
 //! ## 已知架构债（D-6 阶段过渡）
 //!
@@ -742,7 +749,7 @@ impl PartRepoTrait for &mut PgConnection {
         .await
     }
 
-    // ── t_part_batch lifecycle（5）──
+    // ── t_part_batch lifecycle（6）──
     async fn mark_batch_delivered(
         &mut self,
         batch_id: i64,
