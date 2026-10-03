@@ -71,7 +71,11 @@ GET /outsource-pool/state?...       → 点某公司列：那一列的批次卡�
   （2026-10-03 起：判据换成批次自身的工序归属锚；旧谓词要求「货架绑了该外协工序」
   且「该工序在零件工艺链内」，而生产库里绝大多数零件没有链 ⇒ 交集恒空 ⇒ tab 恒空）。
 - **审批闸门**：`t_process.requires_approval = false` → 直接出行；
-  `= true` → 必须已有该 `(part, process)` 的 APPROVED 报价，否则不出行。
+  `= true` → 必须已有该 `(part, process)` 的**真实审批**报价
+  （`status='APPROVED' AND is_direct=false AND deleted_at IS NULL`），否则不出行。
+  `is_direct = true` 的是 DIRECT 直发自动建的 0 元占位报价，**不是被人审批过的报价**
+  （2026-10-03 review 第 1 轮）。本域与 `GET /outsource-sendable` 共用同一份 SQL 常量
+  `SENDABLE_INNER_X_SQL`，该谓词**只有那一个落点**，本文件只是它的转述。
 - **`send_mode` 二选一**：`requires_approval = true` → `APPROVAL`（`quote_id` /
   `outsource_company_id` / `price` 取报价，`company_options` 恒 `[]`）；
   `= false` → `DIRECT`（三者恒 `null`，`company_options` = 该工序映射的

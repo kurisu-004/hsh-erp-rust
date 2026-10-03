@@ -1053,7 +1053,7 @@ impl OutsourceQuotableRepo {
 /// 该列此前是**只写不读的死字段**（process CRUD 在维护、outsource 域从未读）。本查询
 /// 是第一次真正使用它：
 /// - `requires_approval = false` → 免审批直发，直接出行；
-/// - `requires_approval = true` → 必须已有该 (part, process) 的 APPROVED 报价，
+/// - `requires_approval = true` → 必须已有该 (part, process) 的**真实审批**报价，
 ///   否则**不出行**（这是本次新增的排除语义，回归测试
 ///   `tests/outsource/sendable.rs::sendable_requires_approval_without_quote_excluded`）。
 ///
@@ -1063,10 +1063,39 @@ impl OutsourceQuotableRepo {
 /// 两种模式的字段契约同时被破坏。DIRECT 行的 `quote_id` / `price` / 公司三件套因此
 /// 恒为 `null`，与 VO 声明一致。
 ///
+/// ## 2026-10-03 review 第 1 轮：`AND is_direct = false`（两处谓词都要带）
+/// 「APPROVED 报价」不等于「被人审批过的报价」：`prod::batch::send_to_outsource` 的
+/// DIRECT 直发路径会自动建 `status='APPROVED' AND is_direct=true AND price=0` 的
+/// 占位报价（见 `prod::batch::service::outsource::resolve_direct_quote_id`）。只判
+/// `status='APPROVED' AND deleted_at IS NULL` 时，那个组合可达：某 (part, process)
+/// 历史上被 `direct=true` 发过一次（库里留下 0 元占位报价）→ 此后该 (part, process)
+/// 的批次在本列表被判成 `send_mode=APPROVAL` / `price="0.00"` /
+/// `company_options=[]` —— 用户以为在按审批价发货，实际用的是一条从未被人审批过的
+/// 0 元占位报价，shipment 单价落 0。故 LEFT JOIN 的 `q` 与 WHERE 里 EXISTS 的 `q2`
+/// **都**要加 `AND is_direct = false`，这正是「真实审批报价」的定义。
+///
+/// 附带收益：DB 上有 partial unique index
+/// `uq_t_outsource_quote_approved_part_process (part_id, process_id)
+///  WHERE deleted_at IS NULL AND status='APPROVED' AND is_direct=false` ——
+/// 加上该条件后 EXISTS 子查询的谓词与该索引谓词**逐字相等**，能直接吃这个索引；
+/// 不加则退到 `ix_t_outsource_quote_part_id`（少了 `is_direct` 这一维，扫描量更大）。
+/// 闸门与投影各自独立成立（`EXISTS` 判「出行与否」、LEFT JOIN 判「回哪条报价」），
+/// 故两处谓词重复是有意的，改一处必须同改另一处。
+///
 /// ## 为什么 `t_shelf` 降级成 LEFT JOIN
 /// 外层投影仍要 `shelf_code`（前端看板卡片要显示批次在哪排），但 `PENDING` 批次的
 /// `current_holder_id` 恒为 `NULL`（还没上架）—— 若保持 INNER JOIN，未上架的
 /// PENDING 批次会整批消失。`shelf_code` 相应改为可空（VO 本来就是 `Option`）。
+///
+/// ## `pb.status = 'PENDING'` 这一析取项在写侧不可达（不是 bug，别按可达路径核对）
+/// 写入不变式：PENDING ⇔ 出池（`clear_process_id` 把 `current_process_id` 置 NULL，
+/// 见 `prod::batch::service::guard.rs::mark_batch_with_status_and_meta` 的 doc），
+/// 而本查询要求 `pr.id = pb.current_process_id` ⇒ PENDING 批次恒不满足 ⇒ 正常业务流
+/// 下该析取项永远不命中。它只对 **legacy 导入数据**有意义：Python 旧库恢复脚本
+/// `scripts/restore_from_backup.sh` 的 `RENAME_MAP` 把旧列
+/// `t_part_batch.next_process_id` 映进 `current_process_id`，可能留下「PENDING 却带着
+/// current_process_id」的组合（测试 fixture 直接 INSERT 也能造出）。保留该析取项是
+/// 为了让这类行仍可被看到并手工修掉，而不是让它们在列表里彻底隐身。
 const SENDABLE_INNER_X_SQL: &str = "SELECT {projection} \
              FROM t_part_batch pb \
              JOIN t_part p ON p.id = pb.part_id AND p.deleted_at IS NULL \
@@ -1074,7 +1103,8 @@ const SENDABLE_INNER_X_SQL: &str = "SELECT {projection} \
                AND pr.category = 'OUTSOURCE' \
              LEFT JOIN t_shelf sh ON sh.id = pb.current_holder_id AND sh.deleted_at IS NULL \
              LEFT JOIN t_outsource_quote q ON q.part_id = p.id AND q.process_id = pr.id \
-               AND q.status = 'APPROVED' AND q.deleted_at IS NULL AND pr.requires_approval \
+               AND q.status = 'APPROVED' AND q.is_direct = false \
+               AND q.deleted_at IS NULL AND pr.requires_approval \
              LEFT JOIN t_outsource_company oc ON oc.id = q.outsource_company_id \
                AND oc.deleted_at IS NULL \
              LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
@@ -1085,16 +1115,20 @@ const SENDABLE_INNER_X_SQL: &str = "SELECT {projection} \
                AND ( NOT pr.requires_approval \
                   OR EXISTS (SELECT 1 FROM t_outsource_quote q2 \
                              WHERE q2.part_id = p.id AND q2.process_id = pr.id \
-                               AND q2.status = 'APPROVED' AND q2.deleted_at IS NULL) )";
+                               AND q2.status = 'APPROVED' AND q2.is_direct = false \
+                               AND q2.deleted_at IS NULL) )";
 
 /// `x → d` 收敛层：`DISTINCT ON (batch_id, current_process_id)`。
 ///
 /// 排序键 `x.quote_id ASC NULLS LAST` 的作用：多个 APPROVED 报价时取 `quote_id` 最小
-/// 的那条（DB 有 partial unique `uq_t_outsource_quote_approved_part_process` 兜底撞了
-/// → 21303，但并发审批 / 历史数据仍可能出现多条；取最早批准的那条语义是「先批准的
-/// 报价优先」且结果稳定，不随查询计划变化）。2026-10-03 起内层不再有
-/// `t_shelf_process` / `t_process_chain_step` 的重复行来源（两层 JOIN 已删），
-/// 重复行只剩报价这一处。
+/// 的那条。2026-10-03 review 第 1 轮起内层报价谓词带上了 `q.is_direct = false`，
+/// 而 DB 的 partial unique `uq_t_outsource_quote_approved_part_process (part_id,
+/// process_id) WHERE deleted_at IS NULL AND status='APPROVED' AND is_direct=false`
+/// 恰好逐字覆盖这个集合 ⇒ 同一 (part, process) 的真实审批报价至多一条，撞了 → 21303。
+/// 仍保留 `DISTINCT ON` 作为兜底：并发审批 / 历史数据 / 索引缺失都可能让重复行出现，
+/// 取最早批准的那条语义是「先批准的报价优先」且结果稳定，不随查询计划变化。
+/// 2026-10-03 起内层不再有 `t_shelf_process` / `t_process_chain_step` 的重复行来源
+/// （两层 JOIN 已删），重复行只剩报价这一处。
 ///
 /// **为什么保留 `current_process_id` 这一列而不是只写 `DISTINCT ON (batch_id)`**：
 /// `current_process_id` 由 `batch_id` 单值决定，两者语义等价。保留两列是为了让

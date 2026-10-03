@@ -200,6 +200,12 @@ Request：`UpsertChainRequest`
 > **无链放行**，`current_process_step_id` 落 NULL（该列早已被官方降级为「可选的
 > 显示用定位信息」，写 NULL 有 `dispatch` 路径的先例）。
 >
+> `require_process_chain` 本身也已于 2026-10-03 review 第 1 轮**删除**（切走之后
+> 零调用点，挂着 `#[allow(dead_code)]` 只会掩盖「20706 已无端点可返回」这个事实）。
+> 常量 `BIZ_PROCESS_CHAIN_REQUIRED` 仍留在 `src/shared/error::code` 的注册表里 ——
+> 错误码是对外契约的一部分，删常量等于改契约。真要恢复严格变体时，在
+> `optional_process_chain` 之上加一层 `ok_or_else` 即可，读链逻辑不必重新发明。
+>
 > 放松的理由：`t_part_batch.current_process_id` 才是工序候选池归属的权威依据，
 > `prod::worker_pool` 的候选池 SQL 早已（2026-09-30）按它普通过滤 —— 若写侧还
 > 强制「先有链」，读侧能列出来的批次就发不出去。
@@ -208,7 +214,8 @@ Request：`UpsertChainRequest`
 > 工序时拒收（真数据错误，不随无链一起放行）。
 
 错误码 HTTP 409，业务含义：「请先制定工序链（part 未绑定 process_chain）」。
-触发条件（`require_process_chain` 严格变体，当前**无生产流调用方**）：
+触发条件（`t_part.process_chain_id IS NULL`）：**当前无生产流调用方**（守卫函数已删除，
+见上）。
 
 - `t_part.process_chain_id IS NULL`（part 还没制定工艺链）
 

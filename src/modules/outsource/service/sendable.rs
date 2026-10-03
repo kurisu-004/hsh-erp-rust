@@ -47,6 +47,22 @@ fn decode_company_options(raw: serde_json::Value) -> Vec<OutsourceCompanyOption>
 /// - `requires_approval = true` → `APPROVAL`。SQL 的 EXISTS 闸门已保证存在已批准
 ///   报价，故 `has_approved_quote` 恒为 `true`；两个入参都取仍写成「与」是为了把
 ///   「APPROVAL 必有 quote_id」这条不变量守在派生点，而不是依赖 SQL 的隐式保证。
+///
+/// ## `(true, false)` 分支是双重闸门下的兜底，构造上不可达（保留而非改 fail-closed）
+/// 2026-10-03 review 第 1 轮复核过是否该把它改成报错/不出行，结论是**不改**：
+/// 1. **不可达**：`requires_approval=true` 的行要出行必须过 SQL 的 EXISTS 闸门，
+///    而同一份内层 `x` 的 LEFT JOIN 谓词与之等价（都要求命中一条真实审批报价，
+///    2026-10-03 起两处都带 `is_direct = false`）⇒ `quote_id IS NULL` 的行根本进不了
+///    结果集；写侧 `send_to_outsource` 也已拒 `requires_approval && direct`（20104）。
+/// 2. **改 fail-closed 会破坏 VO 契约**：`OutsourceSendableItem.quote_id` 的契约是
+///    「APPROVAL 有值 / DIRECT `null`」。让本函数返回 APPROVAL 之外的第三种结果（或
+///    抛错）都要求 service 层开始丢弃行，于是「列表行数 ≠ count」这类对账事故重新
+///    出现；返回 `"APPROVAL"` + `quote_id = null` 则直接违反上面那条 VO 契约，前端
+///    拿 `null` 去调 `send-to-outsource` 会吃 400。
+/// 3. **保留的代价可控**：真走到这个分支时，该行的 `company_options` 由 SQL 的
+///    `CASE WHEN q.id IS NOT NULL` 短路成 `[]`（`q.id` 为 NULL）⇒ 前端
+///    `canSend()`（要求 APPROVAL 或 `company_options.length >= 1`）把该行置灰，
+///    不会出现「用 0 元占位价发货」。
 pub(super) fn send_mode_of(requires_approval: bool, has_approved_quote: bool) -> &'static str {
     if requires_approval && has_approved_quote {
         "APPROVAL"
@@ -147,6 +163,10 @@ mod tests {
     /// 需审批但没命中报价（SQL 的 EXISTS 闸门理论上已排除）→ 降级 DIRECT，
     /// 代价是 `company_options` 为空时前端把该行置灰，而不是拿一个没有 quote_id
     /// 的 APPROVAL 行去发。
+    ///
+    /// 2026-10-03 review 第 1 轮：保留本用例是为了把「兜底而非 fail-closed」这个
+    /// 决策钉在测试里 —— 改成报错或返回 APPROVAL 会违反 VO 契约，理由见
+    /// `send_mode_of` 的 doc「`(true, false)` 分支是双重闸门下的兜底」。
     #[test]
     fn send_mode_falls_back_to_direct_when_quote_missing() {
         assert_eq!(send_mode_of(true, false), "DIRECT");

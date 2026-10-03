@@ -44,12 +44,22 @@
   （`current_process_step_id` 是可选的显示用定位信息，无链时落 NULL）。
 - **审批闸门（`t_process.requires_approval`，DEFAULT true）**：
   - `requires_approval = false` → 免审批直发，直接出行。
-  - `requires_approval = true` → **必须**已有该 `(part, process)` 的 APPROVED 报价，
-    否则不出行（`NOT pr.requires_approval OR EXISTS (… APPROVED quote …)`）。
-    这是 `requires_approval` 第一次被真正读取（此前 process CRUD 只写不读）。
+  - `requires_approval = true` → **必须**已有该 `(part, process)` 的**真实审批**报价，
+    否则不出行（`NOT pr.requires_approval OR EXISTS (… APPROVED AND is_direct=false
+    的 quote …)`）。这是 `requires_approval` 第一次被真正读取（此前 process CRUD
+    只写不读）。
+  - **「真实审批」= `status='APPROVED' AND is_direct = false AND deleted_at IS NULL`**
+    （2026-10-03 review 第 1 轮）。`is_direct = true` 的是 DIRECT 直发自动建的 0 元
+    占位报价（`prod::batch::send_to_outsource` → `resolve_direct_quote_id`），
+    **从未被人审批过**。闸门漏掉这一维时的可达路径：某 `(part, process)` 历史上被
+    `direct=true` 发过一次 → 库里留下 0 元占位报价 → 此后该 `(part, process)` 的批次
+    被 EXISTS 命中 → 本端点返回 `send_mode="APPROVAL"` / `price="0.00"` /
+    `company_options=[]`，用户以为在按审批价发货，实际 shipment 单价落 0。
+    该谓词与 DB 的 partial unique `uq_t_outsource_quote_approved_part_process` 的
+    谓词逐字相等 ⇒ EXISTS 子查询能直接吃这个索引。
 - **`send_mode` 二选一**（LEFT JOIN `t_outsource_quote`：
   `q.part_id = p.id AND q.process_id = pr.id AND q.status = 'APPROVED'
-  AND q.deleted_at IS NULL AND pr.requires_approval`）：
+  AND q.is_direct = false AND q.deleted_at IS NULL AND pr.requires_approval`）：
   - `requires_approval = true`（⇒ 报价必然存在）→ `send_mode = "APPROVAL"`，
     `quote_id` / `outsource_company_id` / `price` 三件套取自报价，
     `company_options` 恒为空数组。
@@ -60,12 +70,21 @@
     （`t_outsource_company_process` JOIN `t_outsource_company` where `is_active AND deleted_at IS NULL`）。
   - **DIRECT 且 `company_options` 为空的行仍要返回**（前端 `canSend()` 据
     `company_options.length >= 1` 把它置灰），`total` 同样计入 —— 不要在 SQL 里滤掉。
-- **多 APPROVED 报价的处理**：DB 有 partial unique
-  `uq_t_outsource_quote_approved_part_process` 兜底（撞了 → 21303 DUPLICATE），但并发审批 /
-  历史数据仍可能出现多条。SQL 用 `DISTINCT ON (batch_id, current_process_id)` + `ORDER BY … quote_id ASC NULLS LAST`
-  **取 id 最小的那条**：语义是「先批准的报价优先」，且结果稳定（不随查询计划变化）。
-  `current_process_id` 由 `batch_id` 单值决定，故这两列的分组键语义等价；保留两列是为了
-  让 count 侧精简投影与全投影共享同一组键列名。
+  - **多 APPROVED 报价的处理**：DB 有 partial unique
+    `uq_t_outsource_quote_approved_part_process`（谓词
+    `deleted_at IS NULL AND status='APPROVED' AND is_direct=false`）兜底（撞了 → 21303
+    DUPLICATE），与内层报价谓词逐字相同 ⇒ 同一 `(part, process)` 的真实审批报价至多
+    一条；但并发审批 / 历史数据 / 索引缺失仍可能重复，故 SQL 用
+    `DISTINCT ON (batch_id, current_process_id)` + `ORDER BY … quote_id ASC NULLS LAST`
+    **取 id 最小的那条**：语义是「先批准的报价优先」，且结果稳定（不随查询计划变化）。
+    `current_process_id` 由 `batch_id` 单值决定，故这两列的分组键语义等价；保留两列是为了
+    让 count 侧精简投影与全投影共享同一组键列名。
+- **`PENDING` 分支只对 legacy 导入数据有意义**（2026-10-03 review 第 1 轮）：按写入
+  不变式 `PENDING ⇔ 出池（current_process_id 置 NULL）`，而本查询要求
+  `pr.id = pb.current_process_id` ⇒ 正常业务流下 `pb.status = 'PENDING'` 这个析取项
+  恒不命中。它服务的是 Python 旧库恢复（`scripts/restore_from_backup.sh` 的
+  `RENAME_MAP` 把旧列 `t_part_batch.next_process_id` 映进 `current_process_id`，可能留下
+  「PENDING 却带着 current_process_id」的组合）。保留它是为了让这类行仍可见并手工修掉。
 - **货架可空**：`t_shelf` 是 `LEFT JOIN`（`PENDING` 且未上架的批次没有
   `current_holder_id`）⇒ `shelf_code` 为 `null`。
 
@@ -145,6 +164,13 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 | `current_process_id` | `send-to-outsource` 的 `process_id` |
 | `canSend()` 判定 | `status_label === 'sendable'` 且（`send_mode === 'APPROVAL'` 或 `company_options.length >= 1`） |
 
+> **`DIRECT` 只在 `requires_approval = false` 的工序上出现**（`send_mode` 的定义就是
+> 该列）。2026-10-03 review 第 1 轮起写侧也守了同一条规则：`send-to-outsource` 收到
+> `direct = true` 且该工序 `requires_approval = true` 时以 `400` / `20104
+> BIZ_INVALID_VALUE` 拒收（文案「该工序需要报价审批，请先走审批再发货，不能 direct
+> 直发」）。此前该规则**只在读侧生效**，绕过 UI 直接调 API 就能对需审批工序直发。
+> 两侧同码 20104，前端提示文案要能区分两种成因。
+
 ### 排序
 
 `is_urgent DESC, planned_delivery_date ASC NULLS LAST, part_id ASC, batch_no ASC, current_process_id ASC`
@@ -193,13 +219,15 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 
 ## 集成测试
 
-`tests/outsource/sendable.rs`（15 用例）：
+`tests/outsource/sendable.rs`（17 用例）：
 
 - `sendable_approval_mode_when_approved_quote_exists` — APPROVAL 三件套 + `company_options` 空数组 + `version == batch.version`
 - `sendable_direct_mode_lists_active_company_options` — DIRECT 正确列出**活跃**公司（停用的不得出现）
 - `sendable_direct_mode_even_with_approved_quote_when_approval_not_required` — 免审批工序即使有已批准报价也判 DIRECT，且报价三件套为 `null`
 - `sendable_requires_approval_without_quote_excluded` — 需审批但无已批准报价 → **不出行**
 - `sendable_requires_approval_with_draft_quote_excluded` — DRAFT 报价不算已批准 → **不出行**
+- `sendable_requires_approval_with_direct_placeholder_quote_excluded` — **只有** `is_direct=true` 的 0 元占位报价 → **不出行**（2026-10-03 review 第 1 轮：占位报价不是「被人审批过的报价」）
+- `sendable_requires_approval_prefers_real_quote_over_direct_placeholder` — 占位报价与真实审批报价并存 → 出行且回传后者、`price` 非 0（堵「把判据写成反向排除」的写法）
 - `sendable_direct_row_kept_when_no_active_company` — 空 options 行仍返回且计入 `total`
 - `sendable_pending_without_holder_has_null_shelf_code` — 未上架的 PENDING 批次仍出行，`shelf_code` 为 `null`
 - `sendable_excludes_non_outsource_current_process` — `current_process_id` 指向 INHOUSE 工序 → 不出现
@@ -225,11 +253,13 @@ JSON 解码：空数组 / 正常 / 畸形降级不 500）。
 > （分页信封），另有 1 个出参新增字段、1 个类型声明与实际返回不符。只改 URL 的话
 > 页面仍会「能请求但不显示 / 显示错」。
 
-> **状态：5 项已全部落地**（前端仓 `hsh-erp/frontend`，2026-10-03 逐个打开
-> 核对当前实现）。本节从「待办清单」转为「已完成的改动记录」—— 保留是为了
-> ① 记录硬切前后的 URL 对照，便于日后排查旧路径残留；② 记录返回形状变更的
-> 前端同步面（`listQuotableParts` / `useOutsourceReceivingList` 两处若漏改，
-> 症状是「表格空白 / 翻页恒 1 页」且**不报错**，最难自查）。
+> **状态：第 1 批 5 项 + 第 2 批 5 项已全部落地**（前端仓 `hsh-erp/frontend`，
+> 2026-10-03 逐个打开核对当前实现；第 2 批在并行分支
+> `feat/outsource-sendable-relax` 上完成）。本节从「待办清单」转为「已完成的改动
+> 记录」—— 保留是为了 ① 记录硬切前后的 URL 对照，便于日后排查旧路径残留；
+> ② 记录返回形状变更的前端同步面（`listQuotableParts` /
+> `useOutsourceReceivingList` 两处若漏改，症状是「表格空白 / 翻页恒 1 页」且
+> **不报错**，最难自查）。
 
 | 前端位置 | 改前现状（2026-10-03 前） | 改后新契约（前端已完成适配） |
 |---|---|---|
@@ -238,6 +268,41 @@ JSON 解码：空数组 / 正常 / 畸形降级不 500）。
 | `frontend/src/api/outsource.ts` 的 `listQuotableParts` 返回类型 | 声明 `Promise<PartListItem[]>`，按数组消费 | 返回 `QuotablePartListResult`（分页信封）；消费方 `OutsourceQuoteList.vue` 改读 `r.items` |
 | `frontend/src/views/outsource/composables/useOutsourceReceivingList.ts` 的 `receivingFetcher` | `return { items, total: items.length }` | `return { items: r.items, total: r.total }`（`total: items.length` 会让翻页器只有 1 页） |
 | `frontend/src/types/outsource.ts` 的 `OutsourceSendableItem` | 无 `quote_id` | 有 `quote_id: string \| null`（APPROVAL 有值 / DIRECT `null`）—— `send-to-outsource` 要求 `quote_id` 与 `direct` 必传其一 |
+
+### 第 2 批：判定改按 `current_process_id` 后的 5 项硬切（2026-10-03）
+
+本端点的判定谓词、VO 字段与 `quotable-parts` 的行粒度在 2026-10-03 全部重做
+（根因与缘由见本文件「业务模型」节）。**这 5 项与第 1 批不同：老前端不是「显示错」
+而是「直接抛错」** —— Zod 守门遇到缺失的必填字段会 `parse` 抛异常，页面整块白屏。
+
+| # | 后端契约变更 | 前端必须同步改的点 | 漏改症状 |
+|---|---|---|---|
+| 1 | VO 字段更名：`next_process_id` → `current_process_id`、`next_process_name` → `current_process_name` | `OutsourceSendableItem` 类型声明 + Zod schema + 消费方（发送时当 `process_id` 回传、外协看板卡片上的工序名） | schema `parse` 抛「required」⇒ 列表接口整个失败 |
+| 2 | `shelf_code` 由必填 `string` 降为可空 `string \| null` | 类型声明放宽为 `string \| null`；渲染处必须写兜底（`PENDING` 未上架批次恒 `null`） | 类型不匹配时 TS 报错；宽松成 `''` 会让前端把「未上架」显示成空货架号 |
+| 3 | `send_mode` 判定语义变更：改由 `t_process.requires_approval` 决定（`false` → DIRECT / `true` → APPROVAL），**并新增排除语义**（`requires_approval=true` 且无真实审批报价 ⇒ 该行**不返回**） | 消费方不再自行推断模式，一律读 `send_mode`；`APPROVAL` 行必带 `quote_id`、`DIRECT` 行必带 `company_options` | 沿用旧推断（按 `quote_id` 有无判模式）⇒ APPROVAL/DIRECT 反了，发货传错价来源 |
+| 4 | `GET /outsource-quotes/quotable-parts` 行粒度收成「一零件一行」，出参**删 4 个字段**：`shelf_id` / `shelf_code` / `next_process_id` / `next_process_name` | `QuotablePartOut` 类型 + 表格列（去掉货架 / 工序两列） | 多余列恒空（不报错），但「每零件一行」后旧的多行 UI 会显示重复零件 |
+| 5 | 写侧新增守卫：`requires_approval=true` 的工序 + `direct=true` → `400` / `20104`（原先只有读侧生效，可绕过 UI 直发） | 发送前按 `send_mode` 决定传 `quote_id` 还是 `direct`；对 20104 的提示文案要能区分「价来源互斥」与「该工序需审批」两种成因 | 前端仍对需审批工序发 `direct=true` ⇒ 400，且用户看到的是一句笼统的参数错误 |
+
+> **`send_mode` 的两种取值与 `quote_id` / `company_options` 的对应关系是硬契约**：
+> APPROVAL 行的 `quote_id` 必有值、`company_options` 恒 `[]`；DIRECT 行
+> `quote_id` / `price` / `outsource_company_id` 恒 `null`、`company_options` 列出
+> 候选活跃公司（可能为空数组，此时前端 `canSend()` 置灰但后端仍返回该行）。
+
+### 部署顺序：后端与前端必须同批上线（2026-10-03）
+
+第 2 批的 5 项是**双向不兼容**，与第 1 批（老前端能跑、只是显示错）性质不同：
+
+- **后端先上、老前端**：老 schema 里的 `next_process_id` 等必填字段在新响应里已经
+  不存在 ⇒ Zod `parse` 抛错 ⇒ 页面整块白屏。
+- **前端先上、新后端**：新 schema 声明的 `current_process_id` 在老响应里没有 ⇒
+  同样 `parse` 抛错。
+- 唯一能分批上线的是「纯放宽」型变更（如
+  [`production/worker-pool.md`](./production/worker-pool.md) 里
+  `GET /pool/state` 的 `shelf_id` 降为可选，老前端继续传 `Some` 分支时响应逐字不变）。
+
+⇒ **同批发布**：后端镜像与前端静态资源一起上，中间不留「新后端 + 老前端」的窗口。
+回滚方向相反即可（先回前端再回后端），因为回滚后前端会先于后端报错而不是发出
+写请求。
 
 ### 已知限制（不在本轮修）
 

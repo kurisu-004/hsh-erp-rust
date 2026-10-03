@@ -33,7 +33,11 @@
 
 - **报价表** `t_outsource_quote`：`id` / `part_id` / `outsource_company_id` / `process_id` / `price` (numeric) / `status` / `quantity`? / `is_direct` / `is_billed` / `version` / 审计字段 + 软删。
 - **状态机**：`DRAFT → SUBMITTED → APPROVED | REJECTED`（单向前进，不可回退；详见 `src/modules/outsource/statemachine.rs::can_transition_to`）。
-- **唯一约束**：同 `(part_id, outsource_company_id, process_id)` 仅一个活跃报价（DB partial unique 兜底 → 21303 DUPLICATE）。
+- **唯一约束**：同 `(part_id, outsource_company_id, process_id)` 仅一个活跃报价（DB partial unique 兜底 → 21303 DUPLICATE）。实际是**两条谓词互斥的 partial unique**（2026-10-03 核对）：
+  - `uq_t_outsource_quote_approved_part_process (part_id, process_id) WHERE deleted_at IS NULL AND status='APPROVED' AND is_direct=false` —— **审批报价**：每 (零件, 工序) 至多一条；
+  - `uq_t_outsource_quote_direct_part_company_process (part_id, outsource_company_id, process_id) WHERE deleted_at IS NULL AND status='APPROVED' AND is_direct=true`（migration 008）—— **DIRECT 占位报价**：每 (零件, 公司, 工序) 至多一条。
+
+  `is_direct = true` 的是 `prod::batch::send-to-outsource` 直发路径自动建的 **0 元占位报价**（`price=0` / `note` 写明 DIRECT 来源），**不是被人审批过的报价**。读侧的可发送闸门与写侧的 `requires_approval` 守卫（见 [`./outsource-sendable.md`](./outsource-sendable.md)）都以 `is_direct = false` 定义「真实审批报价」；漏掉这一维就会让 0 元占位报价冒充审批价发货。
 
 ---
 
@@ -242,3 +246,21 @@ id ASC` 排序）。`total` 的口径与 list 的 WHERE + `DISTINCT ON` 逐条�
 
 - `tests/outsource/quote.rs`（9+ 用例：create DRAFT / 唯一性 21303 / update DRAFT happy / update SUBMITTED 21302 / submit / approve MANAGER-only / reject review_note 必填 / soft-delete 仅 DRAFT/REJECTED / **list keyword 零命中返 0 行**（带「无 keyword 返全量」对照组））
 - `tests/outsource/quotable.rs`（8 用例：happy path（含 4 个已删字段的缺席断言）/ 无 PENDING 批次排除 / **无工艺链也出现** / 多 PENDING 批次去重 / PENDING+IN_PROCESS 混合 / 软删零件与软删批次排除 / keyword+分页 / 路由不被 `/{id}` 吞掉）
+
+---
+
+## 前端配套改动清单
+
+> 口径与部署顺序同
+> [`./outsource-sendable.md#前端配套改动清单`](./outsource-sendable.md#前端配套改动清单)
+> （第 2 批 5 项硬切 + 「后端与前端必须同批上线」）。本域落在第 2 批的是这两项：
+
+| # | 后端契约变更 | 前端必须同步改的点 | 漏改症状 |
+|---|---|---|---|
+| 1 | `GET /quotable-parts` 行粒度收成「一零件一行」，出参**删 4 个字段**：`shelf_id` / `shelf_code` / `next_process_id` / `next_process_name` | `QuotablePartOut` 类型 + Zod schema 去掉这 4 个字段（**必填声明也要一起去掉**，否则后端不返回时 `parse` 抛错）+ 表格去掉「货架 / 工序」两列 | 旧 schema 把已删字段声明为必填 ⇒ `parse` 抛错，报价一览页的 picker 整块白屏 |
+| 2 | 报价生效判定改按 `is_direct = false`（0 元 DIRECT 占位报价不再满足审批闸门） | 无需改代码：DIRECT 行的 `send_mode` 由后端给出，前端不再自行按「有无 APPROVED 报价」推断模式 | 若前端仍自行推断，会对「只有占位报价」的场景误判成「已审批」 |
+
+> 第 2 批其余 3 项（`next_process_*` → `current_process_*` 更名、`shelf_code` 可空、
+> `send_mode` 语义 + 写侧 `requires_approval` 守卫）都在
+> [`./outsource-sendable.md`](./outsource-sendable.md) 一侧，清单与部署顺序以该文件为
+> 准，本节不重复。

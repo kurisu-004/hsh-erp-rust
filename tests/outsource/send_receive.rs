@@ -12,6 +12,9 @@
 //! - 部分收发的派生契约（min-progress：部分发送后 part 停在 `PENDING`、部分接收
 //!   后 part 变 `IN_PROCESS`）
 //! - DIRECT 占位报价唯一性（migration 008：同 tuple 只留 1 条 `is_direct=true`）
+//! - **需审批工序不许直发**（2026-10-03 review 第 1 轮：`requires_approval=true` +
+//!   `direct=true` → 400/20104，且不建占位报价、不开 shipment；同工序走 APPROVAL
+//!   仍放行）
 //! - 补齐后的守卫（process 类别必须 OUTSOURCE / 公司必须映射该工序）
 //! - **无工艺链零件的收发闭环**（2026-10-03：part 没有 `process_chain_id` 时
 //!   `send-to-outsource` / `receive-from-outsource` 仍返 200，
@@ -187,19 +190,32 @@ async fn insert_outsource_company(pool: &PgPool, name: &str) -> i64 {
 }
 
 /// 直插任意 category 的 process。
-async fn seed_process(pool: &PgPool, code: &str, name: &str, category: &str) -> i64 {
+///
+/// 2026-10-03 review 第 1 轮：`requires_approval` 变成形参。原先本 helper 一律写
+/// `true`，在「该列只写不读」时无害；现在它决定两件事 —— 写侧 `send-to-outsource`
+/// 拒 `requires_approval=true` + `direct=true`（20104），读侧 sendable / pool 判定
+/// 该 (part, process) 需不需要先有审批报价。DIRECT 用例必须显式传 `false`，
+/// 否则它会挂在「直发被拒」而不是它自己声称验证的那条路径上。
+async fn seed_process(
+    pool: &PgPool,
+    code: &str,
+    name: &str,
+    category: &str,
+    requires_approval: bool,
+) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let id = snowflake.next_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
          version, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, 0, true, 0, $5, $5)",
+         VALUES ($1, $2, $3, $4, 0, $5, 0, $6, $6)",
     )
     .bind(id)
     .bind(code)
     .bind(name)
     .bind(category)
+    .bind(requires_approval)
     .bind(now)
     .execute(pool)
     .await
@@ -208,8 +224,13 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str, category: &str) -> 
 }
 
 /// 直插 OUTSOURCE 类别 process。
-async fn seed_outsource_process(pool: &PgPool, code: &str, name: &str) -> i64 {
-    seed_process(pool, code, name, "OUTSOURCE").await
+async fn seed_outsource_process(
+    pool: &PgPool,
+    code: &str,
+    name: &str,
+    requires_approval: bool,
+) -> i64 {
+    seed_process(pool, code, name, "OUTSOURCE", requires_approval).await
 }
 
 /// 2026-10-03 新增：直插 `t_outsource_company_process`（公司 ↔ 工序映射）。
@@ -372,7 +393,7 @@ async fn setup_receive_side(
     next_proc_code: &str,
 ) -> (i64, i64) {
     let shelf_id = insert_shelf(pool, shelf_code, "PRODUCTION").await;
-    let next_proc = seed_outsource_process(pool, next_proc_code, "recv_proc").await;
+    let next_proc = seed_outsource_process(pool, next_proc_code, "recv_proc", true).await;
     map_shelf_process(pool, shelf_id, next_proc).await;
     create_step(pool, chain_id, next_proc, 2).await;
     (shelf_id, next_proc)
@@ -403,7 +424,7 @@ async fn setup_inflight(
     )
     .await;
     let company_id = insert_outsource_company(pool, &format!("{name}Co")).await;
-    let proc_id = seed_outsource_process(pool, proc_code, "proc").await;
+    let proc_id = seed_outsource_process(pool, proc_code, "proc", true).await;
     let quote_id = insert_approved_quote(pool, part_id, company_id, proc_id).await;
     let chain_id = create_chain_for_part(pool, part_id).await;
     create_step(pool, chain_id, proc_id, 1).await;
@@ -455,11 +476,10 @@ async fn part_status(pool: &PgPool, part_id: i64) -> String {
 /// 2026-10-03 新增：part **完全没有** `process_chain_id` 时，send → receive 全链路
 /// 仍然走通，`current_process_step_id` 落 NULL。
 ///
-/// 旧行为：`require_process_chain` 拦在 send 之前 → `20706
-/// BIZ_PROCESS_CHAIN_REQUIRED`「请先制定工序链」，而生产库里 1874 个零件只有 2 个
-/// 绑了链 ⇒ 绝大多数货根本发不出去（外协「可发送」列表恒空也是同一个根因）。
-/// `current_process_step_id` 早已被官方降级为「可选的显示用定位信息」，写 NULL
-/// 有 `dispatch` 路径的先例。
+/// 无链零件发外协曾被 `20706 BIZ_PROCESS_CHAIN_REQUIRED`「请先制定工序链」拦在 send
+/// 之前，而生产库里 1874 个零件只有 2 个绑了链 ⇒ 绝大多数货根本发不出去（外协
+/// 「可发送」列表恒空也是同一个根因）。`current_process_step_id` 早已被官方降级为
+/// 「可选的显示用定位信息」，写 NULL 有 `dispatch` 路径的先例。
 #[tokio::test]
 async fn send_and_receive_without_process_chain_succeeds() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -467,7 +487,7 @@ async fn send_and_receive_without_process_chain_succeeds() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "NoChainCo").await;
-    let proc_id = seed_outsource_process(&pool, "PNC-SND", "noc_send").await;
+    let proc_id = seed_outsource_process(&pool, "PNC-SND", "noc_send", true).await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
     map_company_process(&pool, company_id, proc_id).await;
     // 前提断言：part 确实没有链
@@ -527,7 +547,7 @@ async fn send_and_receive_without_process_chain_succeeds() {
 
     // ---- receive ----
     let shelf_id = insert_shelf(&pool, "NOC-REC", "PRODUCTION").await;
-    let next_proc = seed_outsource_process(&pool, "PNC-REC", "noc_recv").await;
+    let next_proc = seed_outsource_process(&pool, "PNC-REC", "noc_recv", true).await;
     map_shelf_process(&pool, shelf_id, next_proc).await;
     let version: i32 = sqlx::query_scalar("SELECT version FROM t_part_batch WHERE id = $1")
         .bind(bid)
@@ -576,7 +596,7 @@ async fn send_to_outsource_inserts_shipment_out_sourcing() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "SendCo").await;
-    let proc_id = seed_outsource_process(&pool, "PSND", "psend").await;
+    let proc_id = seed_outsource_process(&pool, "PSND", "psend", true).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
@@ -632,7 +652,7 @@ async fn send_to_outsource_duplicate_open_shipment_rejected() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "DupCo").await;
-    let proc_id = seed_outsource_process(&pool, "PDUP", "dup").await;
+    let proc_id = seed_outsource_process(&pool, "PDUP", "dup", true).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
@@ -719,7 +739,7 @@ async fn send_to_outsource_direct_creates_zero_price_placeholder_quote() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "DirCo").await;
-    let proc_id = seed_outsource_process(&pool, "PDIR", "dir").await;
+    let proc_id = seed_outsource_process(&pool, "PDIR", "dir", false).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -808,7 +828,7 @@ async fn send_to_outsource_direct_same_tuple_keeps_single_placeholder_quote() {
     // 同一 part 的第二个批次（batch_no 必须不同 —— `uq_t_part_batch_part_no`）
     let b2 = insert_nth_batch(&pool, part_id, 2, "PENDING", None, 5).await;
     let company_id = insert_outsource_company(&pool, "DirDupCo").await;
-    let proc_id = seed_outsource_process(&pool, "PDIRDUP", "dirdup").await;
+    let proc_id = seed_outsource_process(&pool, "PDIRDUP", "dirdup", false).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -897,7 +917,7 @@ async fn send_to_outsource_direct_reuses_active_approved_quote() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "DirReuseCo").await;
-    let proc_id = seed_outsource_process(&pool, "PDIRREUSE", "dirreuse").await;
+    let proc_id = seed_outsource_process(&pool, "PDIRREUSE", "dirreuse", false).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -951,7 +971,7 @@ async fn send_to_outsource_direct_with_quote_id_rejected() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "DirXCo").await;
-    let proc_id = seed_outsource_process(&pool, "PDIRX", "dirx").await;
+    let proc_id = seed_outsource_process(&pool, "PDIRX", "dirx", false).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -984,6 +1004,124 @@ async fn send_to_outsource_direct_with_quote_id_rejected() {
     assert_eq!(status, "PENDING");
 }
 
+/// 2026-10-03 review 第 1 轮：`requires_approval = true` 的工序 + `direct = true`
+/// → 400 / 20104，且**任何一行都不许被改**。
+///
+/// 守卫的必要性：改之前 `requires_approval` 只在读侧（`GET /outsource-sendable` /
+/// `/outsource-pool` 的判定 SQL）生效，写侧零校验 ⇒ 绕过 UI 直接调本端点传
+/// `direct=true` 就能对「先审批再发」这道业务规则该走报价的工序直发，系统里没有
+/// 任何一处强制。写侧守了之后读侧/写侧才闭环：读侧决定看不看得见，写侧决定发不发
+/// 得成。
+///
+/// 断言三件事：① 错误码是 20104（`BIZ_INVALID_VALUE`，与 `direct`/`quote_id` 互斥
+/// 守卫同码 —— 前端按 20104 统一提示「参数/守卫不满足」即可）；② 批次仍是 PENDING、
+/// 没有 holder / 工序写入（守卫必须落在 `mark_batch_with_status_and_meta` **之前**）；
+/// ③ 没有占位报价、没有 shipment（守卫必须落在 `resolve_direct_quote_id` **之前**，
+/// 否则库里会留下一条 0 元 `is_direct=true` 报价，下一次审批流程会被它污染）。
+#[tokio::test]
+async fn send_to_outsource_direct_rejected_when_process_requires_approval() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "ApReq", "H").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "ApReqCo").await;
+    // 需审批的 OUTSOURCE 工序：写侧守卫的输入
+    let proc_id = seed_outsource_process(&pool, "PAPR", "apreq", true).await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "direct": true,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "需审批工序不许直发: {env}");
+    assert_eq!(env["code"].as_i64().unwrap(), 20104, "{env}");
+
+    // 批次未被改动（守卫在写 status 之前）
+    let (status, location, holder, cur_proc): (String, Option<String>, Option<i64>, Option<i64>) =
+        sqlx::query_as(
+            "SELECT status, location, current_holder_id, current_process_id \
+             FROM t_part_batch WHERE id = $1",
+        )
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .expect("read batch after rejected direct send");
+    assert_eq!(status, "PENDING", "被拒请求不得改批次状态: {env}");
+    assert!(location.is_none(), "不得写 holder 位置: {env}");
+    assert!(holder.is_none(), "不得写 holder: {env}");
+    assert!(cur_proc.is_none(), "不得写 current_process_id: {env}");
+
+    // 未建占位报价 / 未开 shipment（守卫在 resolve_direct_quote_id 之前）
+    let quote_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_quote WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(quote_count, 0, "被拒的直发不得留下占位报价: {env}");
+    let shipment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_shipment WHERE batch_id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shipment_count, 0, "被拒请求不得留下 shipment: {env}");
+}
+
+/// 2026-10-03 review 第 1 轮：同一道 `requires_approval = true` 的工序，走
+/// APPROVAL（传 `quote_id`）**放行** —— 守卫只拦 `direct=true`，不能误伤正常审批流。
+#[tokio::test]
+async fn send_to_outsource_approval_allowed_when_process_requires_approval() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "ApOk", "O").await;
+    let part_id = insert_part(&pool, customer_id, "PENDING").await;
+    let bid = insert_batch(&pool, part_id, "PENDING", None).await;
+    let company_id = insert_outsource_company(&pool, "ApOkCo").await;
+    let proc_id = seed_outsource_process(&pool, "PAPOK", "apok", true).await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let quote_id = insert_quote_with_price(&pool, part_id, company_id, proc_id, "33.30").await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "quote_id": quote_id.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "需审批工序走 APPROVAL 必须放行: {env}");
+    assert_eq!(env["data"]["status"], "OUTSOURCE", "{env}");
+    let (unit_price,): (String,) =
+        sqlx::query_as("SELECT unit_price::text FROM t_outsource_shipment WHERE batch_id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .expect("shipment row");
+    assert_eq!(unit_price, "33.30", "APPROVAL 发货必须用审批价");
+}
+
 /// 2026-10-03：既不给 `direct` 也不给 `quote_id` → 400。
 ///
 /// 守卫的必要性：没有价来源时 shipment 的 `unit_price` 只能落 0，而对账页看到
@@ -995,7 +1133,7 @@ async fn send_to_outsource_without_price_source_rejected() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "NoPCo").await;
-    let proc_id = seed_outsource_process(&pool, "PNOP", "nop").await;
+    let proc_id = seed_outsource_process(&pool, "PNOP", "nop", true).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -1036,7 +1174,7 @@ async fn send_to_outsource_rejects_non_outsource_process_category() {
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "CatCo").await;
     // 内部工序（category='INHOUSE' —— t_process 的合法类别只有 INHOUSE / OUTSOURCE）
-    let proc_id = seed_process(&pool, "PASM", "asm", "INHOUSE").await;
+    let proc_id = seed_process(&pool, "PASM", "asm", "INHOUSE", false).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -1069,7 +1207,7 @@ async fn send_to_outsource_rejects_company_without_process_mapping() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "MapCo").await;
-    let proc_id = seed_outsource_process(&pool, "PMAP", "map").await;
+    let proc_id = seed_outsource_process(&pool, "PMAP", "map", true).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     // 刻意不调 map_company_process
@@ -1115,12 +1253,12 @@ async fn send_to_outsource_rejects_process_missing_from_existing_chain() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "StepCo").await;
-    let proc_id = seed_outsource_process(&pool, "PSTP", "step").await;
+    let proc_id = seed_outsource_process(&pool, "PSTP", "step", true).await;
     map_company_process(&pool, company_id, proc_id).await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
     // 链里只登记**另一道**工序（INHOUSE），外协工序 proc_id 刻意不入链
     let chain_id = create_chain_for_part(&pool, part_id).await;
-    let other = seed_process(&pool, "PSTP-OTH", "oth", "INHOUSE").await;
+    let other = seed_process(&pool, "PSTP-OTH", "oth", "INHOUSE", false).await;
     create_step(&pool, chain_id, other, 1).await;
 
     let (s, env) = send(
@@ -1164,7 +1302,7 @@ async fn send_to_outsource_partial_quantity_splits_batch() {
     // 「已知不一致」节）。部分发送的拆批语义与源状态无关，故用 PENDING 覆盖。
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "PsendCo").await;
-    let proc_id = seed_outsource_process(&pool, "PPSEND", "psend2").await;
+    let proc_id = seed_outsource_process(&pool, "PPSEND", "psend2", true).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -1255,7 +1393,7 @@ async fn send_to_outsource_partial_anchors_child_on_read_back_version() {
         .await
         .expect("预置源批次 version=2");
     let company_id = insert_outsource_company(&pool, "PVerCo").await;
-    let proc_id = seed_outsource_process(&pool, "PPVER", "pver").await;
+    let proc_id = seed_outsource_process(&pool, "PPVER", "pver", true).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -1295,7 +1433,7 @@ async fn send_to_outsource_quantity_equal_batch_is_whole_batch() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "EqAllCo").await;
-    let proc_id = seed_outsource_process(&pool, "PEQALL", "eqall").await;
+    let proc_id = seed_outsource_process(&pool, "PEQALL", "eqall", true).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -1333,7 +1471,7 @@ async fn send_to_outsource_invalid_quantity_rejected() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "BadQCo").await;
-    let proc_id = seed_outsource_process(&pool, "PBADQ", "badq").await;
+    let proc_id = seed_outsource_process(&pool, "PBADQ", "badq", true).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -1377,7 +1515,7 @@ async fn send_to_outsource_partial_stale_version_conflicts() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "StaleCo").await;
-    let proc_id = seed_outsource_process(&pool, "PSTALE", "stale").await;
+    let proc_id = seed_outsource_process(&pool, "PSTALE", "stale", true).await;
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, proc_id, 1).await;
     map_company_process(&pool, company_id, proc_id).await;
@@ -1412,7 +1550,7 @@ async fn send_to_outsource_quote_not_approved_returns_21307() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "QdCo").await;
-    let proc_id = seed_outsource_process(&pool, "PQ", "pq").await;
+    let proc_id = seed_outsource_process(&pool, "PQ", "pq", true).await;
     // 直接 raw SQL 插一个 DRAFT quote（不走 service 校验）
 
     // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
@@ -1467,7 +1605,7 @@ async fn receive_from_outsource_marks_shipment_received() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "OUTSOURCE", Some("OUTSOURCE_COMPANY")).await;
     let company_id = insert_outsource_company(&pool, "RecvCo").await;
-    let proc_id = seed_outsource_process(&pool, "PR", "pr").await;
+    let proc_id = seed_outsource_process(&pool, "PR", "pr", true).await;
     let quote_id = insert_approved_quote(&pool, part_id, company_id, proc_id).await;
 
     // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
@@ -1506,7 +1644,7 @@ async fn receive_from_outsource_marks_shipment_received() {
     .execute(&pool)
     .await
     .unwrap();
-    let next_proc = seed_outsource_process(&pool, "REC-PROC", "recv_proc").await;
+    let next_proc = seed_outsource_process(&pool, "REC-PROC", "recv_proc", true).await;
     // link shelf to process (via t_shelf_process)
     let link_id = snowflake.next_id();
     let link_now = now_naive();
@@ -1968,7 +2106,7 @@ async fn reconcile_update_shipment_unit_price_quantity() {
     let part_id = insert_part(&pool, customer_id, "PENDING").await;
     let bid = insert_batch(&pool, part_id, "PENDING", None).await;
     let company_id = insert_outsource_company(&pool, "RecCo").await;
-    let proc_id = seed_outsource_process(&pool, "PRU", "pru").await;
+    let proc_id = seed_outsource_process(&pool, "PRU", "pru", true).await;
 
     // 2026-09-16 PR-3 批次 step 化：send-to-outsource /
     // receive-from-outsource 要求 part 已绑定工艺链

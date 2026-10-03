@@ -218,13 +218,32 @@ pub(crate) async fn assert_shelf_maps_process(
 ///     `current_process_step_id` 不再清，而展示用的 `next_process_id` 正是由它
 ///     经 `t_process_chain_step` JOIN 派生 → 出池批次显示上一道工序。
 ///
-///   依赖该约定的 5 个调用点（改任何一处都要连带复核这 5 处）：
-///   `shelf::recall_to_pending`、`outsource::receive_from_outsource_to_inspection`、
-///   `scan::scan_inspect`、`repair::complete_repair`、
-///   `repair::repair_dispatch`。
-///   其余 5 个调用点（共 **10** 个调用点，place_on_shelf / release_from_programming /
-///   send_to_outsource / receive_from_outsource / work_type pick-up）4 列全传
-///   `Some(..)`，走不到 clear 分支。
+/// ## step 列的 10 个调用点里，**9 个可能传 `None`**（2026-10-03 review 第 1 轮订正）
+/// 上一版注释在这里逐字写着「其余 5 个调用点……4 列全传 `Some(..)`，走不到 clear
+/// 分支」，同时又把 `complete_repair` / `repair_dispatch` 列进「依赖该约定的 5 个
+/// 调用点」——两组自相矛盾，且第一组在本轮改动后已不成立。逐点核对后的现状：
+///
+/// | 调用点 | step 形参 | 何时为 `None` ⇒ 走 clear 分支 |
+/// |---|---|---|
+/// | `shelf::place_on_shelf` | `optional_step_id(..)` | 无链 |
+/// | `programming::release_from_programming` | `optional_step_id(..)` | 无链 |
+/// | `outsource::send_to_outsource` | `optional_step_id(..)` | 无链 |
+/// | `outsource::receive_from_outsource` | `optional_step_id(..)` | 无链 |
+/// | `repair::complete_repair` | `step_id_opt` | 无链（PRODUCTION 分支）/ 恒 `None`（INSPECTION 分支） |
+/// | `repair::repair_dispatch` | `step_id_opt` | 无链（PRODUCTION 分支）/ 恒 `None`（INSPECTION 分支） |
+/// | `shelf::recall_to_pending` | 字面 `None` | 恒 `None` |
+/// | `outsource::receive_from_outsource_to_inspection` | 字面 `None` | 恒 `None` |
+/// | `scan::scan_inspect`（第一步） | 字面 `None` | 恒 `None` |
+/// | `pickup`（work_type pick-up） | `batch.current_process_step_id`（读回） | 批次行该列本来就是 NULL（无链零件）⇒ 传 `None`，与 clear 等价（目标列已 NULL，无副作用） |
+///
+/// 即 **6 处生产流端点的 step 列在「无链」时为 `None` 而走 clear 分支**（这 6 处是
+/// 2026-10-03 起从 `require_process_chain` 切到 `optional_process_chain` /
+/// `optional_step_id` 的直接后果，链可选项化后「无链」从 20706 拒收变成放行 + 落
+/// NULL），另 3 处恒传 `None`（纯出池路径），只有 work_type pick-up 是把**读回值**
+/// 原样传下去 —— 有链时保持定位信息不丢，无链时恰好等价于清 NULL。
+///
+/// 改任何一处的 step 形参，都要连带复核上表：把该传 `Some(..)` 的地方改成 `None`
+/// 会静默清掉定位信息，把该传 `None` 的地方改成 `Some(..)` 会留下陈旧 step。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn mark_batch_with_status_and_meta(
     conn: &mut PgConnection,
@@ -374,8 +393,8 @@ pub(crate) fn status_guard_for_target(target: &str) -> &'static [&'static str] {
 
 /// 读 part 的 `process_chain_id`（part 不存在 / 已软删 → `BIZ_PART_NOT_FOUND`）。
 ///
-/// 2026-10-03 新增：抽出后由 `require_process_chain`（严格）与
-/// `optional_process_chain`（可选）共用，两者的**差异只有一处** —— `NULL` 怎么处理。
+/// 2026-10-03 新增：抽出后与严格变体 `require_process_chain` 共用（该函数已于
+/// 2026-10-03 review 第 1 轮随零调用点一并删除，详见 [`optional_process_chain`]）。
 #[inline]
 async fn read_part_chain_id(
     conn: &mut PgConnection,
@@ -391,32 +410,6 @@ async fn read_part_chain_id(
         .0)
 }
 
-/// 2026-09-16 PR-3 批次 step 化：part 进入生产流（place_on_shelf /
-/// release_from_programming / send_to_outsource）前必须已制定工艺链。
-///
-/// 守卫：
-/// - `process_chain_id IS NULL` → `BIZ_PROCESS_CHAIN_REQUIRED` 409 「请先制定工序链」
-///
-/// 返回：chain_id（已校验非空）。caller 继续用 `process_id` 经
-/// `ProcessChainRepo::resolve_step_id_by_process` 解析为 step_id。
-///
-/// **2026-10-03 起无调用方**：7 个生产流端点改用 [`optional_process_chain`]（无链放行）。
-/// 保留本函数是因为 `20706 BIZ_PROCESS_CHAIN_REQUIRED` 仍是 API 错误码契约的一部分
-/// （见 `docs/api/production/process-chain.md`），「必须先有链才能做 X」这个严格变体
-/// 需要时不必重新发明读链逻辑。`#[allow(dead_code)]` 是这个保留的直接后果。
-#[allow(dead_code)]
-pub(crate) async fn require_process_chain(
-    conn: &mut PgConnection,
-    part_id: i64,
-) -> Result<i64, AppError> {
-    read_part_chain_id(conn, part_id).await?.ok_or_else(|| {
-        AppError::biz(
-            code::BIZ_PROCESS_CHAIN_REQUIRED,
-            "请先制定工序链（part 未绑定 process_chain）",
-        )
-    })
-}
-
 /// 2026-10-03 新增：工序链**可选**版守卫（`optional_process_chain` 的 part 侧）。
 ///
 /// ## 为什么要放松
@@ -427,14 +420,23 @@ pub(crate) async fn require_process_chain(
 /// 仓库的既定权威依据。
 ///
 /// ## 三种返回
-/// - part 不存在 / 已软删 → `20101 BIZ_PART_NOT_FOUND`（与 `require_process_chain` 同码）
+/// - part 不存在 / 已软删 → `20101 BIZ_PART_NOT_FOUND`
 /// - `process_chain_id IS NULL` → `Ok(None)`，caller 放行、`current_process_step_id` 落 NULL
 /// - 已绑链 → `Ok(Some(chain_id))`
 ///
 /// **链行自身已软删的情形本函数不判**：读的就是 `t_part.process_chain_id` 一个列，
 /// 链软删后该列仍是旧 id，caller 的 step 解析在链内找不到活跃 step 时才以
-/// `20702` 拒收（见 [`optional_step_id`]）。这是与 `require_process_chain` 完全一致的
-/// 读法 —— 它也没有链软删的独立分支。
+/// `20702` 拒收（见 [`optional_step_id`]）。
+///
+/// ## 严格变体 `require_process_chain` 已删除（2026-10-03 review 第 1 轮）
+/// 它与本函数的唯一差异是「`NULL` 怎么处理」（前者 20706 拒收 / 本函数放行）。
+/// 7 个生产流端点全部切到本函数后它**零调用点**（`rg require_process_chain src/ tests/`
+/// 只剩历史注释），`#[allow(dead_code)]` 挂着也掩盖了「20706 已无任何端点可返回」
+/// 这一事实。`20706 BIZ_PROCESS_CHAIN_REQUIRED` 仍留在 `shared::error::code` 的注册
+/// 表里（错误码是对外契约的一部分，删常量等于改契约），docs 侧已按
+/// 「已注册但 2026-10-03 起无端点返回」登记（`docs/api/production/process-chain.md`
+/// 的 20706 节）。真要恢复严格变体时，直接在本函数之上加一个 `ok_or_else` 包一层即可，
+/// 读链逻辑不必重新发明。
 pub(crate) async fn optional_process_chain(
     conn: &mut PgConnection,
     part_id: i64,

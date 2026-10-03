@@ -8,6 +8,9 @@
 //! - `requires_approval = true` + 已批准报价 → `send_mode="APPROVAL"` / `price` 非
 //!   null / `quote_id` 非 null / `company_options` 空数组
 //! - `requires_approval = true` + 无已批准报价 → **不出行**（新增的排除语义）
+//! - `requires_approval = true` + 只有 `is_direct=true` 的 0 元占位报价 → **不出行**
+//!   （2026-10-03 review 第 1 轮：占位报价不是「被人审批过的报价」）；
+//!   占位报价与真实审批报价并存时出行且回传后者
 //! - DIRECT 但未映射任何活跃公司 → **该行仍返回**，`company_options` 空数组
 //! - `current_process_id` 指向非 OUTSOURCE 工序 → 不出行
 //! - `PENDING` 且未上架（无 holder）的批次 → 出行，`shelf_code` 为 `null`
@@ -531,6 +534,129 @@ async fn sendable_requires_approval_with_draft_quote_excluded() {
     let (s, env) = get_sendable(&app, &token, "").await;
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["total"], 0, "DRAFT 报价不是已批准报价: {env}");
+}
+
+/// 2026-10-03 review 第 1 轮：DIRECT 自动建的 0 元占位报价
+/// （`status='APPROVED' AND is_direct=true`）**不满足**审批闸门 → 需审批工序
+/// 仍不出行。
+///
+/// 这是本轮堵掉的真实业务漏洞：某 (part, process) 历史上被 `direct=true` 发过一次
+/// （`resolve_direct_quote_id` 在库里留下 `is_direct=true, price=0` 的 APPROVED
+/// 占位报价）→ 之后同一 (part, process) 的批次被 EXISTS 闸门命中 → 端点返回
+/// `send_mode="APPROVAL"` / `price="0.00"` / `company_options=[]`，用户以为在按
+/// 审批价发货，实际用的是一条**从未被人审批过**的 0 元占位报价，shipment 单价落 0。
+///
+/// 锁住 SQL 层两处谓词（LEFT JOIN 的 `q` 与 WHERE 里 EXISTS 的 `q2`）都带
+/// `AND is_direct = false`；少任一处都会让该行以 APPROVAL 身份出现。
+#[tokio::test]
+async fn sendable_requires_approval_with_direct_placeholder_quote_excluded() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "SdApDir", "V").await;
+    let pid = insert_part(&pool, cid, "APDIR", false, "2026-12-01").await;
+    let proc_id = seed_outsource_process(&pool, "SDAPDIR", true).await;
+    let shelf_id = insert_shelf(&pool, "SV1").await;
+    let co = insert_company(&pool, "ApDirCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+    // DIRECT 占位报价的**逐字形状**（照 `resolve_direct_quote_id` 的 INSERT 抄）：
+    // status=APPROVED + price=0 + is_direct=true + note 标明 DIRECT 来源
+    let placeholder = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    sqlx::query(
+        "INSERT INTO t_outsource_quote \
+         (id, part_id, outsource_company_id, process_id, price, note, status, \
+          submitted_at, reviewed_at, is_direct, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 0, 'DIRECT 直发自动创建（免审批，单价待对账补录）', \
+                 'APPROVED', now(), now(), true, 0, now(), now())",
+    )
+    .bind(placeholder)
+    .bind(pid)
+    .bind(co)
+    .bind(proc_id)
+    .execute(&pool)
+    .await
+    .expect("insert DIRECT 占位报价");
+    insert_batch(
+        &pool,
+        pid,
+        1,
+        Some(shelf_id),
+        "PENDING",
+        None,
+        Some(proc_id),
+        0,
+    )
+    .await;
+
+    let (s, env) = get_sendable(&app, &token, "").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 0,
+        "is_direct=true 的占位报价不是真实审批报价，必须不出现: {env}"
+    );
+    assert_eq!(env["data"]["items"].as_array().unwrap().len(), 0, "{env}");
+}
+
+/// 2026-10-03 review 第 1 轮：同一 (part, process) 上**既有** `is_direct=true` 的
+/// 占位报价、**又有**一条真实审批报价时，出行且回传的是后者（`is_direct=false`），
+/// 价不是 0。
+///
+/// 上一条锁「只有占位报价 ⇒ 不出行」，本条锁「不能把判据写成 `NOT EXISTS(占位)`
+/// 之类的反向排除」—— 加 `is_direct = false` 是**收窄命中集**（取真实审批报价），
+/// 不是「有占位就整行剔除」。两条一起把谓词的语义钉死。
+#[tokio::test]
+async fn sendable_requires_approval_prefers_real_quote_over_direct_placeholder() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "SdApBoth", "Y").await;
+    let pid = insert_part(&pool, cid, "APBOTH", false, "2026-12-01").await;
+    let proc_id = seed_outsource_process(&pool, "SDAPBOTH", true).await;
+    let shelf_id = insert_shelf(&pool, "SY1").await;
+    let co = insert_company(&pool, "ApBothCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+    // 占位报价先建（id 更小），真实审批报价后建 —— 若谓词漏了 `is_direct = false`，
+    // `DISTINCT ON … quote_id ASC` 会挑中这条 0 元占位报价，正好被断言抓住
+    let placeholder = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    sqlx::query(
+        "INSERT INTO t_outsource_quote \
+         (id, part_id, outsource_company_id, process_id, price, note, status, \
+          submitted_at, reviewed_at, is_direct, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 0, 'DIRECT 直发自动创建（免审批，单价待对账补录）', \
+                 'APPROVED', now(), now(), true, 0, now(), now())",
+    )
+    .bind(placeholder)
+    .bind(pid)
+    .bind(co)
+    .bind(proc_id)
+    .execute(&pool)
+    .await
+    .expect("insert DIRECT 占位报价");
+    let real = insert_approved_quote(&pool, pid, co, proc_id, "77.70").await;
+    insert_batch(
+        &pool,
+        pid,
+        1,
+        Some(shelf_id),
+        "PENDING",
+        None,
+        Some(proc_id),
+        0,
+    )
+    .await;
+
+    let (s, env) = get_sendable(&app, &token, "").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 1, "{env}");
+    let row = &env["data"]["items"][0];
+    assert_eq!(row["send_mode"], "APPROVAL", "{env}");
+    assert_eq!(
+        row["quote_id"].as_str().unwrap(),
+        real.to_string(),
+        "必须回传真实验审批报价而不是 0 元占位报价: {env}"
+    );
+    assert_eq!(row["price"].as_str().unwrap(), "77.70", "{env}");
+    assert_eq!(
+        row["company_options"].as_array().unwrap().len(),
+        0,
+        "APPROVAL 行的 company_options 恒空: {env}"
+    );
 }
 
 #[tokio::test]

@@ -15,7 +15,8 @@
 //!    子批次，源批次留在原处（量减少 `q`）。拆批统一走
 //!    `PartBatchRepo::_split_batch_inner`（OCC + 数量守卫都在里面）。
 //! 3. **补齐缺失守卫**：`process.category` 必须 `OUTSOURCE`、公司必须映射该工序、
-//!    `direct` 与 `quote_id` 必须恰给一个。
+//!    `direct` 与 `quote_id` 必须恰给一个、`requires_approval=true` 的工序不许
+//!    `direct=true` 直发（2026-10-03 review 第 1 轮）。
 //!
 //! 部分接收的**记账口径**（有意为之，勿"顺手修"）：shipment 记的是**发出时**的全量。
 //! 部分回收只拆批次，源批次余量继续挂着那张 `OUTSOURCING` shipment；
@@ -244,7 +245,9 @@ impl BatchService {
     /// - **DIRECT**：`direct=true` 时复用 `(part, company, process)` 的活跃 APPROVED
     ///   报价，没有则自动建 `price=0` 占位报价；与 `quote_id` 互斥，两者都不给 → 400
     /// - **部分发送**：`quantity ∈ (0, 批次量)` 时先拆出子批次，只把子批次发出
-    /// - **守卫**：process 类别必须 `OUTSOURCE`；公司必须映射该工序
+    /// - **守卫**：process 类别必须 `OUTSOURCE`；公司必须映射该工序；
+    ///   **`requires_approval=true` 的工序不许 `direct=true`**（2026-10-03 review
+    ///   第 1 轮补：此前该规则只在读侧 SQL 生效，写侧无任何强制）
     pub async fn send_to_outsource<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -340,6 +343,32 @@ impl BatchService {
                 format!(
                     "send-to-outsource: process {} 的 category={category}，外协派发必须 \
                      走 OUTSOURCE 类别的工序",
+                    req.process_id
+                ),
+            ));
+        }
+        // 2026-10-03 review 第 1 轮：写侧补「需审批的工序不许直发」守卫。
+        //
+        // 守卫的必要性：`requires_approval` 此前**只在读侧生效**（`GET
+        // /outsource-sendable` 与 `/outsource-pool` 的判定 SQL 会把「需审批但无审批
+        // 报价」的批次藏起来），写侧零校验 ⇒ 绕过 UI 直接调本端点传 `direct=true`
+        // 就能对「先审批再发」这道业务规则下该走报价的工序直发，系统里没有任何一处
+        // 强制。两侧同时守才闭环：读侧决定「看不看得见」，写侧决定「发不发得成」。
+        //
+        // 放在 category 校验之后：那里已经用同一个 `process_get_category` 确认了
+        // 工序存在（`BIZ_PROCESS_NOT_FOUND` 先行），这里「不存在」的情形不可能出现，
+        // 用 `unwrap_or(true)` 取**保守默认**（宁可拒，不放行）而不是 `unwrap()`。
+        let requires_approval = {
+            let mut orepo = &mut *repo.conn_mut();
+            orepo.process_get_requires_approval(req.process_id).await?
+        }
+        .unwrap_or(true);
+        if direct && requires_approval {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!(
+                    "send-to-outsource: 外协工序 {} requires_approval=true，该工序需要 \
+                     报价审批，请先走审批（传 quote_id）再发货，不能 direct 直发",
                     req.process_id
                 ),
             ));

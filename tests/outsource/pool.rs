@@ -1288,7 +1288,7 @@ async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
         "锚链内存在下一 step ⇒ 可解析: {env}"
     );
 
-    // 写侧前提：`require_process_chain(part)` 取到的链 + 在该链内按
+    // 写侧前提：`optional_process_chain(part)` 取到的链 + 在该链内按
     // `resolve_step_id_by_process` 解析，必须落在**同一个 step** 上 ——
     // 否则上一组断言等于给了前端一个写侧会拒收（404 `20702`）的默认值。
     let write_side: Vec<(i64, i64)> = sqlx::query_as(
@@ -1309,7 +1309,7 @@ async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
     );
     assert_eq!(
         write_side[0].0, chain_b,
-        "写侧 require_process_chain 取到的链必须与读侧锚链一致"
+        "写侧 optional_process_chain 取到的链必须与读侧锚链一致"
     );
 }
 

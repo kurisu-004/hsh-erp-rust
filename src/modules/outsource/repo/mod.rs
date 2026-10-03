@@ -247,9 +247,9 @@ pub struct OutsourceHeldBatchRow {
 /// outsource 域数据访问胖 trait。
 ///
 /// 单 trait 合并 6 ZST（company + company_process + quote + quote_event + shipment，
-/// 外加 2026-10-03 新增的 quotable / sendable / pool 三个读模型 ZST），共 56 方法：
+/// 外加 2026-10-03 新增的 quotable / sendable / pool 三个读模型 ZST），共 57 方法：
 /// company 8 + company_process 4 + quote 11 + quote_event 1 + shipment 10
-/// + quotable 2 + sendable 3 + pool 5 + 跨域 helper 11。
+/// + quotable 2 + sendable 3 + pool 5 + 跨域 helper 12。
 ///
 /// 方法签名 = `sql.rs` 固有静态方法去 executor 形参。`<'a>` 显式生命周期是 mockall
 /// 0.15 automock 在 `async_trait` 上下文的硬性要求。
@@ -550,6 +550,17 @@ pub trait OutsourceRepoTrait: Send {
         &mut self,
         process_id: i64,
     ) -> Result<Option<String>, sqlx::Error>;
+    /// `t_process` 按 id 查 `requires_approval`（仅未软删）。
+    ///
+    /// 2026-10-03 新增：供 `prod::batch::send_to_outsource` 写侧守「需审批的工序
+    /// 不许 `direct=true` 直发」——该列此前只有读侧（sendable / pool 的判定 SQL）
+    /// 在用，写侧零校验 ⇒ 绕过 UI 直接调 API 就能对需审批工序直发。读法与
+    /// `process_get_category` 同形（同表、同 `deleted_at IS NULL`、返回 `Option`
+    /// 让调用方自己决定「不存在」怎么处理）。
+    async fn process_get_requires_approval(
+        &mut self,
+        process_id: i64,
+    ) -> Result<Option<bool>, sqlx::Error>;
     /// `t_process` 按 ids 查 `(id, code, name, category)`（仅未软删）。
     /// 供 build_with_processes 与 quote_out_many 使用。
     async fn process_map_full<'a>(
@@ -1093,7 +1104,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourcePoolRepo::list_held(&mut **self, company_id, process_id).await
     }
 
-    // ── 跨域 helper（11）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
+    // ── 跨域 helper（12）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
@@ -1123,6 +1134,19 @@ impl OutsourceRepoTrait for &mut PgConnection {
                 .bind(process_id)
                 .fetch_optional(&mut **self)
                 .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    async fn process_get_requires_approval(
+        &mut self,
+        process_id: i64,
+    ) -> Result<Option<bool>, sqlx::Error> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT requires_approval FROM t_process WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(process_id)
+        .fetch_optional(&mut **self)
+        .await?;
         Ok(row.map(|r| r.0))
     }
 

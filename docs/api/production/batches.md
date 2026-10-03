@@ -136,7 +136,7 @@
 | `outsource_company_id` | string(i64) | ✓ | 必须在册 + `is_active` |
 | `process_id` | string(i64) | ✓ | 外协工序；`t_process.category` 必须 `'OUTSOURCE'`，且该公司必须映射它 |
 | `quote_id` | string(i64)? | — | **APPROVAL 模式**：APPROVED 报价；`unit_price = quote.price` |
-| `direct` | bool? | — | **DIRECT 模式**（免审批直发），与 `quote_id` **互斥** |
+| `direct` | bool? | — | **DIRECT 模式**（免审批直发），与 `quote_id` **互斥**；该工序 `requires_approval=true` 时拒（`20104`，见下） |
 | `quantity` | i32? | — | 部分发送数量；缺省或 `== 批次量` = 整批 |
 | `note` | string? | — | 落到 `t_part_event.note` 与 quote event `SENT` 的 note |
 
@@ -156,6 +156,18 @@
 > `next_process_id` 出现在 body 里），两个仓同一次编排合入。
 
 **价来源二选一**：`direct` 与 `quote_id` 必须恰给一个，否则 `400 20104 BIZ_INVALID_VALUE`。
+
+> **DIRECT 受工序的 `requires_approval` 约束**（2026-10-03 review 第 1 轮）。`direct=true`
+> 且该 `process_id` 的 `t_process.requires_approval = true` 时以
+> `400 20104 BIZ_INVALID_VALUE` 拒收，文案「该工序需要报价审批，请先走审批再发货，
+> 不能 direct 直发」。守卫落在建占位报价**之前**（被拒请求不留报价 / shipment / 状态变更）。
+>
+> 守卫的必要性：`requires_approval` 此前**只在读侧生效**（`GET /outsource-sendable` /
+> `/outsource-pool` 会把「需审批但无真实审批报价」的批次藏起来），写侧零校验 ⇒ 绕过 UI
+> 直接调本端点就能对「先审批再发」这道业务规则该走报价的工序直发。读侧决定看不看得见、
+> 写侧决定发不发得成，两侧同守才闭环。同一道工序走 APPROVAL（传 `quote_id`）不受影响。
+> 回归：`tests/outsource/send_receive.rs::send_to_outsource_direct_rejected_when_process_requires_approval`
+> / `…approval_allowed_when_process_requires_approval`。
 
 - **APPROVAL**：`quote_id` 必须是 `APPROVED`，且 `part_id` / `outsource_company_id` /
   `process_id` 三者与本次请求一致（否则 `400 21302`）。
@@ -285,7 +297,7 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 | 角色 | 40300 | 非 Manager / Clerk / Inspector |
 | OCC | 40901 | `version` 与批次行不符（含部分收发时拆批 OCC 失败） |
 | 状态机 | 20103 | 源状态不在白名单（如已 `OUTSOURCE` 再 send） |
-| 价来源 | 20104 | `direct` 与 `quote_id` 都给或都不给 |
+| 价来源 | 20104 | `direct` 与 `quote_id` 都给或都不给；**`direct=true` 且该工序 `requires_approval=true`** |
 | 数量 | 20104 | `quantity <= 0` / `> 批次量` |
 | 工序类别 | 20104 | `process.category != 'OUTSOURCE'` |
 | 公司↔工序映射 | 20104 | `t_outsource_company_process` 无该 (company, process) 未删行 |
