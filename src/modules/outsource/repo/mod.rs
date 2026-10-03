@@ -545,6 +545,18 @@ pub trait OutsourceRepoTrait: Send {
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error>;
     /// `t_part` 按关键字模糊搜（drawing_no OR name）。供 list_quotes 关键字过滤。
     async fn part_keyword_search<'a>(&mut self, keyword: &'a str) -> Result<Vec<i64>, sqlx::Error>;
+    /// `t_part` 按客户子树取零件 id（2026-10-04 新增）。供 list_quotes 的
+    /// `customer_id` 过滤展开。
+    ///
+    /// 谓词形状与 `OutsourceSendableRepo` 的 `customer_id` 谓词**逐字同形**
+    /// （`customer_id = $1 OR customer_id IN (直接子客户)`）：零件恒挂在 L2 客户上，
+    /// 前端选的常是 L1，只判等值时 L1 必然零命中。**等值那一支保留** ⇒ 传 L2 id 的
+    /// 行为与展开前一致。
+    ///
+    /// 「展开一层即完整」依赖客户树严格两层（L3 数量为 0）；将来引入 L3 需改成递归
+    /// CTE。`LIMIT 10000` 与 `part_keyword_search` 同上限（两个集合要能在 service
+    /// 层求交，都不许无界）。
+    async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error>;
     /// `t_process` 按 id 查 category。供 create_quote 校验 OUTSOURCE 类别。
     async fn process_get_category(
         &mut self,
@@ -1115,7 +1127,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourcePoolRepo::list_held(&mut **self, company_id, process_id).await
     }
 
-    // ── 跨域 helper（13）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
+    // ── 跨域 helper（14）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
@@ -1131,6 +1143,20 @@ impl OutsourceRepoTrait for &mut PgConnection {
              (drawing_no ILIKE $1 OR name ILIKE $1) LIMIT 10000",
         )
         .bind(format!("%{}%", keyword))
+        .fetch_all(&mut **self)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT id FROM t_part WHERE deleted_at IS NULL \
+             AND (customer_id = $1 \
+                  OR customer_id IN (SELECT c2.id FROM t_customer c2 \
+                                     WHERE c2.parent_id = $1 AND c2.deleted_at IS NULL)) \
+             LIMIT 10000",
+        )
+        .bind(customer_id)
         .fetch_all(&mut **self)
         .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
