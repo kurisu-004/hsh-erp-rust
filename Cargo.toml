@@ -25,7 +25,6 @@ resolver = "2"
 # ---------------------------------------------------------------------------------
 # 后续业务实现阶段会按需追加（文档见 docs/architecture.md）：
 #   rust_decimal / bigdecimal    —— 金额、数量（Numeric 列）
-#   umya-spreadsheet 或 calamine —— 送货单 Excel 模板填充
 #   printpdf / lopdf              —— PDF 拆分与渲染
 #   barcoders                     —— Code128 条码
 #   rmcp                          —— MCP Streamable HTTP（远期）
@@ -102,11 +101,6 @@ dashmap = "6"                                                     # ws 连接注
 # 上移到主依赖而非仅 dev-deps。
 mockall = "0.15"
 
-# Excel 模板（送货单打印，P4）
-# 任务说明强制指定 umya-spreadsheet = "2"；最新 3.x 已移除 get_* 弃用方法，
-# 需重写代码。这里先用 "2" 走通后续 P4 实施；后续可统一升级 + 评估。
-umya-spreadsheet = "2"
-
 # 2026-09-20 迁移清理：OpenDAL S3 backend（COS 兼容）+ reqwest HTTP 客户端。
 #
 # 历史（2026-09-11 ~ 2026-09-16）：用社区 SDK `cos-rust-sdk`（仿 cos-python-sdk-v5
@@ -126,15 +120,8 @@ opendal = { version = "0.53", default-features = false, features = [
     "services-memory",
 ] }
 
-# P4 print_xml_patch 用 zip crate 直接读写 xlsx 内部 entry（绕过 umya 的
-# _xlnm.Print_Aria 重复 + pageSetUpPr + shrinkToFit 缺口）。这是 umya-spreadsheet
-# 的传递依赖（v2.4.2），但我们直接声明以避开「传递依赖隐性升级」风险。
-zip = "2"
-# 同样来自 umya-spreadsheet 的传递依赖（v0.37.5），用于 styles.xml 内
-# cellXfs 段插入新的 xf（P4 shrinkToFit patch 用）。
-quick-xml = "0.37"
-# 渲染走 spawn_blocking；响应按 bytes 直接返 Body（Python 64KB chunk 不复刻，
-# 前端 onDownloadProgress 由浏览器原生 a.download 兜住）。
+# tokio-stream：转发链路的测试桩用 `Body::from_stream` 构造 python 侧分块响应
+# （tests/print_forward.rs 覆盖 python 不带 content-length 的 chunked 路径）。
 tokio-stream = "0.1"
 
 # reqwest：OpenDAL 传递依赖 + 真 COS 端到端回归测试（tests/cos_real_smoke.rs）。
@@ -219,12 +206,6 @@ hsh-erp-test-support = { path = "test-support" }
 # 的 tokio-tungstenite 0.29（避免 union features 之外引入额外版本）。
 tokio-tungstenite = "0.29"
 
-# calamine 现在的角色：P4 集成测试（tests/delivery_print_api.rs）回读生成的
-# xlsx 断言关键单元格。它是 umya-spreadsheet 的传递依赖，但这里**显式声明**
-# 让 dev-only 限制在测试范围内（P0 spike 时期它在主依赖里是因为 [[bin]] 不接受
-# dev-deps；spike 已废弃，移除 bin 后即可下放到 dev-deps）。
-calamine = "0.26"
-
 # 2026-09-21：test 进程退出时 DROP DATABASE。tests/common/mod.rs 注册 libc::atexit
 # handler 回收 fresh_database_url() 在本进程创建的 test_<uuid> 库，避免 nextest
 # session tmpfs 累积（439 测试 × 库大小）。已在 tokio 传递依赖树里，固定版本
@@ -244,7 +225,3 @@ rsa = { version = "0.9", features = ["pem"] }
 # 库（其 0.10 起已禁 alg=none 的 encode，构造不出来）。base64 已是传递依赖
 # （opendal / reqwest 等），但显式声明避免 union features 漂移。
 base64 = "0.22"
-
-# ---------------------------------------------------------------------------------
-# P0 spike bin 已删除（迁移到 src/modules/delivery_note/print.rs）。
-# ---------------------------------------------------------------------------------
