@@ -5,7 +5,8 @@
 >
 > 域覆盖：可发送外协的一览（**1 端点**）。2026-10-03 新增。
 > 关联域：[`./outsource-companies.md`](./outsource-companies.md) / [`./outsource-quotes.md`](./outsource-quotes.md) /
-> [`./outsource-shipments.md`](./outsource-shipments.md) / [`./production/batches.md`](./production/batches.md)。
+> [`./outsource-shipments.md`](./outsource-shipments.md) / [`./production/batches.md`](./production/batches.md) /
+> [`./outsource-pool.md`](./outsource-pool.md)（外协看板，2026-10-03 新增 —— **候选侧与本端点共用同一份核心 SQL**，见该文件「与 `/outsource-sendable` 的 SQL 共享」节）。
 
 ---
 
@@ -151,10 +152,20 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 - handler：`src/modules/outsource/handler.rs::list_sendable` + `sendable_router()`
 - service：`src/modules/outsource/service/sendable.rs::OutsourceService::list_sendable`
 - repo：`src/modules/outsource/repo/sql.rs::OutsourceSendableRepo::list / count`
-  （行结构 `repo/mod.rs::OutsourceSendableRow`）
+  （行结构 `repo/mod.rs::OutsourceSendableRow`；核心 SQL 常量 `SENDABLE_INNER_X_SQL` /
+  `SENDABLE_DISTINCT_D_SQL` / `SENDABLE_PROJECTION_*` / `SENDABLE_OUTER_COLS` /
+  `SENDABLE_DISPLAY_ORDER` 供 `list_by_process` / `pool_group_sendable_counts` 复用）
 - dto：`src/modules/outsource/dto.rs::OutsourceSendableListQuery`
 - vo：`src/modules/outsource/vo/sendable.rs::OutsourceSendableItem / OutsourceSendableListOut / OutsourceCompanyOption`
 - 路由挂载：`/outsource-sendable`（见 `src/modules/mod.rs::v2_router`）
+
+> **2026-10-03：`/outsource-pool/{process_id}` 的 `items` 与本端点同源**。看板按外协
+> 工序切 tab，需要「不分页拿全 + 按工序过滤」，本端点的分页契约不能动，故另起
+> `/outsource-pool` 前缀而不是给它加 `process_id`。两端点的行粒度、字段口径、
+> 排序**必须保持一致** —— 谓词抽到共享 SQL 常量
+> `repo/sql.rs::SENDABLE_INNER_X_SQL`（唯一落点），
+> 由 `tests/outsource/pool.rs::pool_detail_items_match_sendable_endpoint_field_by_field`
+> 逐字段比对守住。**改本端点的判定谓词时，必须同查那批常量。**
 
 ---
 

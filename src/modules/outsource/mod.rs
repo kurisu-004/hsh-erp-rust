@@ -28,6 +28,13 @@
 //!   （2026-10-03 硬切，无 alias；旧 URL 实际返回 **400** 而非 404 —— part 域
 //!   `/{part_id}`（`Path<i64>`）catch-all 兜住任何未注册的 1 段静态路径，再由
 //!   `Path` extractor 拒绝非数字段；成因见 `docs/api/inconsistencies.md` § 9.2）。
+//!
+//! 2026-10-03 看板三件套（`/outsource-pool/*`，3 只读端点）：
+//! - 新增第 5 个 router 工厂 `pool_router()`，独立顶层前缀 `/api/v2/outsource-pool`，
+//!   形态照抄 `prod::pool`（`counts` / `state` / `{process_id}`）。
+//! - `vo` 增 `pool.rs`，`service` 增 `pool.rs`，repo 增 ZST `OutsourcePoolRepo`
+//!   （另给 `OutsourceSendableRepo` 增 `list_by_process`，两者共用同一份核心 SQL ——
+//!   见 `repo/sql.rs::SENDABLE_INNER_X_SQL`）。
 
 pub mod dto;
 pub mod handler;
@@ -62,4 +69,13 @@ pub fn shipment_router() -> Router<Arc<AppState>> {
 /// 不属于任何单一域的子资源。
 pub fn sendable_router() -> Router<Arc<AppState>> {
     handler::sendable_router()
+}
+
+/// 外协看板路由（挂载点 `/outsource-pool`）。
+///
+/// 2026-10-03 新增。第 5 个独立顶层前缀，形态照抄 `prod::pool`；既有
+/// `/outsource-sendable` / `/outsource-shipments/in-flight` 都**不接受
+/// `process_id` 且分页**，无法支撑按工序切 tab，故另起前缀而不是扩它们。
+pub fn pool_router() -> Router<Arc<AppState>> {
+    handler::pool_router()
 }
