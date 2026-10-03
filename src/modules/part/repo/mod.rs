@@ -1,46 +1,64 @@
 //! part 域 repo 层（SQL 真源 + 胖 trait + PG 实现）
 //!
 //! ## 结构（2026-09-22 D-6 重构对齐 iam / shelf / customer / part_batch / worker_pool 范本）
-//! - `sql.rs`：原 `repo/part.rs` + `repo/batch.rs` + `repo/event.rs` 三文件 SQL 全文
-//!   搬迁合并，37 个 pub 固有静态方法 + sqlx `query!` 宏，**内容零 diff**
-//!   （`.sqlx/query-*.json` 哈希不变）。ZST struct `PartRepo` 收 `impl PgExecutor<'_>` 形参。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（37 方法合并单 trait；
-//!   t_part 16 + t_part_batch 17 + t_part_event 1 + 跨域 helper 3），并直接
-//!   `impl PartRepoTrait for &mut PgConnection`——handler/service 借 `&mut *tx` /
-//!   `&mut *conn` 即可，零中间壳。
+//! - `sql/`（原 `sql.rs`，已按表拆 `part_sql.rs` / `event_sql.rs` /
+//!   `pending_programming_sql.rs` / `helper_sql.rs` + `mod.rs`）：SQL 全文，
+//!   21 个 pub 固有静态方法（t_part 18 + t_part_event 1 + pending-programming 2）
+//!   + sqlx `query!` 宏。ZST struct `PartRepo` 收 `impl PgExecutor<'_>` 形参。
+//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（40 方法合并单 trait，
+//!   口径见下文「方法计数口径」），并直接 `impl PartRepoTrait for &mut PgConnection`
+//!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
+//!
+//! ## 方法计数口径（2026-10-03 逐个重数）
+//! 「trait 方法数」= `pub trait PartRepoTrait` 花括号内声明的 `fn` 签名条数；
+//! `conn_mut` 这类工具方法计入，`#[allow(...)]` / doc 注释不计；`#[async_trait]`
+//! 展开出的生命周期形参不算独立方法。40 = `conn_mut` 1 + t_part 18 +
+//! t_part_batch 17 + t_part_event 1 + 跨域 helper 1 + pending-programming 2：
+//!
+//! - `conn_mut` 1 —— 工具方法，暴露 `&mut PgConnection`
+//! - t_part 18 —— 查询 5 + CRUD 6 + assembly 子件 4 + rollup 3（一行委托 `sql::PartRepo`）
+//! - t_part_batch 17 —— 查询 6 + mark_* 品检 4 + lifecycle 6 + split 1（一行委托
+//!   `prod::batch::repo::PartBatchRepo` / `prod::batch::status_gate`）
+//! - t_part_event 1 —— `insert_part_event`（委托 `sql::PartRepo`）
+//! - 跨域 helper 1 —— `part_batch_has_active_on_delivery_note`（委托 `PartBatchRepo`）
+//! - pending-programming 2 —— 委托 `sql::PartRepo`
+//!
+//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（21）：t_part_batch 段（17）与跨域 helper
+//! （1）转发到 `prod::batch` 域的 ZST 静态方法，`conn_mut` 则无对应 SQL 方法。
 //!
 //! ## 为什么 trait 命名为 `PartRepoTrait`（带 `Trait` 后缀）
 //! 跨模块静态调用方（delivery_note / assembly / outsource / part_file / statistics /
-// shelf 6 域，prod::worker_pool 1 域）继续走 `PartRepo::xxx(&mut *conn, ...)`
-//! ZST 静态方法——保持 12 处静态调用零修改（本任务**不能**破坏 `part::repo::PartRepo`
+//! shelf 6 域，prod::worker_pool 1 域）继续走 `PartRepo::xxx(&mut *conn, ...)`
+//! ZST 静态方法——保持 24 处静态调用零修改（本任务**不能**破坏 `part::repo::PartRepo`
 //! 作为 ZST 的对外身份），故 trait 改名 `PartRepoTrait`（与 shelf / customer / part_batch
 //! 范本同形）：
 //!
-//! - `part::repo::PartRepo` —— ZST struct（在 `sql.rs` 内，通过 `pub use sql::PartRepo;`
-//!   重新导出至本模块），保留 37 个静态方法签名不变（cross-module 调用方零修改）。
-//! - `part::repo::PartRepoTrait` —— 本文件新加的胖 trait（37 方法合并单 trait），part 域
-//!   内部 service 用 `<R: PartRepoTrait>` 收。trait 方法数 = SQL 静态方法数（1:1 对应）。
+//! - `part::repo::PartRepo` —— ZST struct（在 `sql/mod.rs` 内，通过 `pub use sql::PartRepo;`
+//!   重新导出至本模块），保留 21 个静态方法签名不变（cross-module 调用方零修改）。
+//! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（40 方法合并单 trait），part 域
+//!   内部 service 用 `<R: PartRepoTrait>` 收。
 //!
 //! ## 为什么是胖 trait 而非按表拆 3 trait
 //! `&mut PgConnection` 同一作用域只能借给一个 repo 实例；service 同时需要
 //! `get_part_detail`（t_part）+ `find_batch_by_id`（t_part_batch）+ `insert_part_event`
 //! （t_part_event）时无法表达「同连接三次借用」。胖 trait 是单借位，service 签名
 //! `<R: PartRepoTrait>(&self, mut repo: R, ...)` 一次收下（by-value；生产 `R = &mut
-//! PgConnection`，单测 `R = MockPartRepo`）。
+//! PgConnection`，单测 `R = MockPartRepoTrait`）。
 //!
-//! ## 跨域 helper（3）—— 下沉到 PartRepoTrait
+//! ## 跨域 helper（1）—— 下沉到 PartRepoTrait
 //! service 跨域调用（CustomerRepo::lookup_names / ProcessChainRepo::xxx /
 //! PartBatchRepo::xxx / PartFileRepo::xxx / WorkerPoolService::refill_*）下沉到
 //! `PartRepoTrait` helper 方法，trait impl 一行委托到对应域的 ZST 静态方法。这样
 //! service 仍只需一个 `repo: R: PartRepoTrait` 参数，避免多 trait 借连接的限制。
 //!
-//! - `customer_lookup_names(cid)` —— 委托 `CustomerRepo::lookup_names`
 //! - `part_batch_has_active_on_delivery_note(part_id)` —— 委托 `PartBatchRepo::has_active_batch_on_delivery_note`
-//! - `part_batch_list_active_by_part_id(part_id)` —— 委托 `PartBatchRepo::list_active_by_part_id`
 //!
-//! 注：原 `enrich_part_list_with_location_and_holder` 跨域 helper（t_shelf / t_worker /
-//! t_outsource_company 三表解析 holder 名）暂保留 service 内调用形态——下沉到 trait 会
-//! 让 trait 膨胀且与 D-6 范围不符，留待后续 D-7/D-8 处理。
+//! 注：2026-10-03 订正——原文列的 `customer_lookup_names` /
+//! `part_batch_list_active_by_part_id` 两个 helper 在 trait 里**并不存在**
+//! （前者从未落地；后者零调用方，已与 `find_inprocess_batch_by_id_and_holder`、
+//! `mark_batch_cancelled` 一并删除）。原 `enrich_part_list_with_location_and_holder`
+//! 跨域 helper（t_shelf / t_worker / t_outsource_company 三表解析 holder 名）保留
+//! service 内调用形态——下沉到 trait 会让 trait 膨胀。
 //!
 //! ## 为什么 trait 可以直接对 `&mut PgConnection` 实现
 //! `Transaction<'_, Postgres>` 与 `PoolConnection<Postgres>` 都 `DerefMut<Target = PgConnection>`，
@@ -54,7 +72,9 @@
 //!   按 conventions.md §4.1 含 IO 不强求 100%。
 //!
 //! ## 错误类型
-//! repo trait 方法 → `sqlx::Error`（与 `sql.rs` 签名 1:1，零翻译）。
+//! 40 个方法里 31 个返回 `sqlx::Error`（与 `sql/` 静态方法签名 1:1，零翻译）；8 个
+//! `t_part_batch.status` 写点返回 `AppError`（契约是「没写成 = `VERSION_CONFLICT`」，
+//! 转 `sqlx::Error` 会把 409 降级成 500）；`conn_mut` 无返回值。
 //!
 //! ## 已知架构债（D-6 阶段过渡）
 //!
@@ -62,7 +82,9 @@
 //! 静态调用；这是 D-6 阶段过渡 API，因 part 域 50+ 端点 + 跨 5 域 inline SQL 太多，
 //! 统一 trait 形参成本过高。
 //!
-//! 147 处散点 `repo.conn_mut()` 调用是技术债；D-7/D-8 计划逐方法下沉到 trait helper：
+//! 2026-10-03 实测 `.conn_mut()` 真实调用行 198 处（口径：`src/` 下剔除注释行后含
+//! `.conn_mut()` 的代码行，分布 25 个文件；其中 part 域 61 处，`tests/` 0 处），是技术债；
+//! D-7/D-8 计划逐方法下沉到 trait helper：
 //! - 首批候选：`enrich_part_list_with_location_and_holder`（M1 已下沉到
 //!   `service/list_enrichment.rs`）+ `sync_from_batch_change`
 //! - Phase1 inline query（inspection/repair 跨域 join）后续逐项下沉
@@ -97,7 +119,9 @@ pub use sql::{
     PendingProgrammingFilters, PendingProgrammingItem, scale_qty,
 };
 
-/// part 域数据访问 trait（37 方法 = t_part 16 + t_part_batch 17 + t_part_event 1 + 跨域 helper 3）。
+/// part 域数据访问 trait（40 方法 = `conn_mut` 1 + t_part 18 + t_part_batch 17 +
+/// t_part_event 1 + 跨域 helper 1 + pending-programming 2；计数口径见模块头
+/// 「方法计数口径」小节）。
 ///
 /// 单 trait 而非按表拆 3 trait：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
 /// 拆分会让 service 无法同时持有三个 repo（2026-09-22 D-6 重构定案；与 iam / shelf /
@@ -226,7 +250,7 @@ pub trait PartRepoTrait: Send {
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
 
-    // ── t_part_batch 查询（4）──
+    // ── t_part_batch 查询（6）──
     async fn find_inprocess_batch_for_part(
         &mut self,
         part_id: i64,
@@ -252,11 +276,6 @@ pub trait PartRepoTrait: Send {
         &mut self,
         batch_id: i64,
     ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error>;
-    async fn find_inprocess_batch_by_id_and_holder(
-        &mut self,
-        batch_id: i64,
-        holder_id: i64,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error>;
     async fn find_worker_held_batch_for_part(
         &mut self,
         part_id: i64,
@@ -264,7 +283,7 @@ pub trait PartRepoTrait: Send {
         expected_batch_id: Option<i64>,
     ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error>;
 
-    // ── t_part_batch mark_*（6）──
+    // ── t_part_batch mark_*（4）──
     //
     // 2026-10-01：除 `mark_batch_returned`（不改 status）外，全部
     // `t_part_batch.status` 写点已收口到 `service::status_gate`。
@@ -309,7 +328,7 @@ pub trait PartRepoTrait: Send {
         current_user_id: Option<i64>,
     ) -> Result<u64, sqlx::Error>;
 
-    // ── t_part_batch lifecycle（5）──
+    // ── t_part_batch lifecycle（6）──
     async fn mark_batch_delivered(
         &mut self,
         batch_id: i64,
@@ -320,15 +339,6 @@ pub trait PartRepoTrait: Send {
     /// COMPLETED（最后一条批次完成时），故 caller 必须传真实雪花 id 供终态序列号
     /// 归档事件（`SERIAL_RELEASED`）使用。
     async fn mark_batch_completed(
-        &mut self,
-        batch_id: i64,
-        expected_version: i32,
-        current_user_id: i64,
-        event_id: Option<i64>,
-    ) -> Result<u64, AppError>;
-    /// `event_id`：同 [`Self::mark_batch_completed`]（本方法能让 part 新进
-    /// CANCELLED）。
-    async fn mark_batch_cancelled(
         &mut self,
         batch_id: i64,
         expected_version: i32,
@@ -380,17 +390,12 @@ pub trait PartRepoTrait: Send {
     // ── t_part_event 事件日志（1）──
     async fn insert_part_event<'a>(&mut self, e: NewPartEvent<'a>) -> Result<(), sqlx::Error>;
 
-    // ── 跨域 helper（2）── 委托 part_batch 静态方法，避免 service 收第二个 conn
+    // ── 跨域 helper（1）── 委托 part_batch 静态方法，避免 service 收第二个 conn
     /// part 任一活跃批次是否已挂送货单（委托 `PartBatchRepo::has_active_batch_on_delivery_note`）。
     async fn part_batch_has_active_on_delivery_note(
         &mut self,
         part_id: i64,
     ) -> Result<bool, sqlx::Error>;
-    /// 列 part 全部活跃批次（委托 `PartBatchRepo::list_active_by_part_id`，用于 rollup）。
-    async fn part_batch_list_active_by_part_id(
-        &mut self,
-        part_id: i64,
-    ) -> Result<Vec<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error>;
 
     // ── pending-programming 列表（2026-09-29 新增）──
     async fn list_pending_programming_with_cnc_filter(
@@ -609,7 +614,7 @@ impl PartRepoTrait for &mut PgConnection {
         PartRepo::clear_part_serial_no_when_completed(&mut **self, part_id, updated_by).await
     }
 
-    // ── t_part_batch 查询（7）──
+    // ── t_part_batch 查询（6）──
     async fn find_inprocess_batch_for_part(
         &mut self,
         part_id: i64,
@@ -645,14 +650,6 @@ impl PartRepoTrait for &mut PgConnection {
         batch_id: i64,
     ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error> {
         PartBatchRepo::find_batch_by_id(&mut **self, batch_id).await
-    }
-
-    async fn find_inprocess_batch_by_id_and_holder(
-        &mut self,
-        batch_id: i64,
-        holder_id: i64,
-    ) -> Result<Option<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error> {
-        PartBatchRepo::find_inprocess_batch_by_id_and_holder(&mut **self, batch_id, holder_id).await
     }
 
     async fn find_worker_held_batch_for_part(
@@ -745,7 +742,7 @@ impl PartRepoTrait for &mut PgConnection {
         .await
     }
 
-    // ── t_part_batch lifecycle（6）──
+    // ── t_part_batch lifecycle（5）──
     async fn mark_batch_delivered(
         &mut self,
         batch_id: i64,
@@ -769,23 +766,6 @@ impl PartRepoTrait for &mut PgConnection {
         event_id: Option<i64>,
     ) -> Result<u64, AppError> {
         PartBatchRepo::mark_batch_completed(
-            &mut **self,
-            batch_id,
-            expected_version,
-            current_user_id,
-            event_id,
-        )
-        .await
-    }
-
-    async fn mark_batch_cancelled(
-        &mut self,
-        batch_id: i64,
-        expected_version: i32,
-        current_user_id: i64,
-        event_id: Option<i64>,
-    ) -> Result<u64, AppError> {
-        PartBatchRepo::mark_batch_cancelled(
             &mut **self,
             batch_id,
             expected_version,
@@ -875,21 +855,13 @@ impl PartRepoTrait for &mut PgConnection {
         PartRepo::insert_part_event(&mut **self, e).await
     }
 
-    // ── 跨域 helper（2）── 委托 part_batch 静态方法 ──────────
+    // ── 跨域 helper（1）── 委托 part_batch 静态方法 ──────────
     async fn part_batch_has_active_on_delivery_note(
         &mut self,
         part_id: i64,
     ) -> Result<bool, sqlx::Error> {
         use crate::modules::prod::batch::repo::PartBatchRepo;
         PartBatchRepo::has_active_batch_on_delivery_note(&mut **self, part_id).await
-    }
-
-    async fn part_batch_list_active_by_part_id(
-        &mut self,
-        part_id: i64,
-    ) -> Result<Vec<crate::modules::prod::batch::model::TPartBatch>, sqlx::Error> {
-        use crate::modules::prod::batch::repo::PartBatchRepo;
-        PartBatchRepo::list_active_by_part_id(&mut **self, part_id).await
     }
 
     // ── pending-programming 列表（2026-09-29 新增）──
