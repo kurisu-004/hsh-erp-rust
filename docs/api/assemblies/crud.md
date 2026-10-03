@@ -4,9 +4,9 @@
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 > 共享 DTO（AssemblyOut / AssemblyListItem / AssemblyListOut / AssemblyChildOut / AssemblyFileRef / AssemblyDetail / AssemblyCreateResult）见 [`./index.md`](./index.md)
 >
-> 范围：本文件覆盖 7 个 CRUD 端点（list / create / get / update / soft-delete / **files-list（D-09）** / **children（D-07）**）+ start / files。cancel 见 [`./cancel.md`](./cancel.md)。
+> 范围：本文件覆盖 7 个 CRUD 端点（list / create / get / update / soft-delete / **files-list** / **children**）+ start / files。cancel 见 [`./cancel.md`](./cancel.md)。
 >
-> 注：跨域端点 `GET /api/v2/parts/{part_id}/assembly`（D-08）虽挂在 parts 路由下但属于本域契约，文档收录在本文件末尾（仅文档归口，不改 frontend 路径）。
+> 注：跨域端点 `GET /api/v2/parts/{part_id}/assembly`（2026-09-25 新增）虽挂在 parts 路由下但属于本域契约，文档收录在本文件末尾（仅文档归口，不改 frontend 路径）。
 
 ## 本文件目录
 
@@ -16,9 +16,9 @@
 - [GET /api/v2/assemblies/{assembly_id}](#get-apiv2assembliesassembly_id)
 - [POST /api/v2/assemblies/{assembly_id}/update](#post-apiv2assembliesassembly_idupdate)
 - [POST /api/v2/assemblies/{assembly_id}/soft-delete](#post-apiv2assembliesassembly_idsoft-delete)
-- [GET /api/v2/assemblies/{assembly_id}/files](#get-apiv2assembliesassembly_idfiles) （2026-09-25 D-09）
-- [POST /api/v2/assemblies/{assembly_id}/children](#post-apiv2assembliesassembly_idchildren) （2026-09-25 D-07）
-- [GET /api/v2/parts/{part_id}/assembly](#get-apiv2partspart_idassembly) （2026-09-25 D-08）
+- [GET /api/v2/assemblies/{assembly_id}/files](#get-apiv2assembliesassembly_idfiles) （2026-09-25 新增）
+- [POST /api/v2/assemblies/{assembly_id}/children](#post-apiv2assembliesassembly_idchildren) （2026-09-25 新增）
+- [GET /api/v2/parts/{part_id}/assembly](#get-apiv2partspart_idassembly) （2026-09-25 新增）
 
 ---
 
@@ -176,11 +176,11 @@ Request：`AssemblyUpdateRequest` — 字段全部可选（缺省 = DB 不动）
 | `planned_delivery_date` | date? (三态) | — | 同上 |
 | `is_urgent` | bool? | — | |
 
-> 2026-09-16 PR-2（migration 027）：`AssemblyUpdateRequest` 删 `actual_delivery_date`
+> 2026-09-16（migration 027）：`AssemblyUpdateRequest` 删 `actual_delivery_date`
 > 入参 —— `t_assembly.actual_delivery_date` 列已删；实际交付日期由
 > `t_part_event.event_type='DELIVERED'` 事件派生（子件批次交付事件体现）。
 >
-> 2026-09-17 PR-4：`request_date` / `planned_delivery_date` 在 DDL 是 NOT NULL
+> 2026-09-17：`request_date` / `planned_delivery_date` 在 DDL 是 NOT NULL
 > （migration 005:20-21），DTO 沿用三态语义（`Option<Option<NaiveDate>>`）保留
 > 兼容；service 层遇 `Some(None)` 改判 `20104 BIZ_INVALID_VALUE`（`t_assembly`
 > 模型与 DDL 对齐后两字段已非 `Option<>`）。
@@ -205,9 +205,8 @@ WS 广播（commit 后下发）：
 |---|---|
 | `request_date` / `applicant_name` / `order_no` / `system_delivery_date` / `planned_delivery_date` / `is_urgent` / `note` / `customer_id` | 父件"更新后的当前行值" |
 
-> - 2026-09-16 PR-2（migration 027）：`actual_delivery_date` 列已从 `t_assembly`
->   删除（与 `t_part` 同处理），级联子件集合保持 8 字段不变（PR-2 §
->   `assembly/service.rs:522` §3.2 注释）。
+> - 2026-09-16（migration 027）：`actual_delivery_date` 列已从 `t_assembly`
+>   删除（与 `t_part` 同处理），级联子件集合保持 8 字段不变。
 > - 排除 `quantity`：单独走 §3.3 缩放（见下）。
 > - 实现上按"父件更新后的当前行值"覆盖，避免三态解析歧义；未变更字段被覆写为原值（语义无差）。
 > - `customer_id` 变更时同样级联。
@@ -264,7 +263,7 @@ WS 广播（commit 后下发）：
 
 权限: **Manager / Clerk / Inspector / CncProgrammer**
 
-2026-09-25 新增（D-09 api-drift-fix）：列出装配体已上传的 PDF 文件（kind=ASSEMBLY_MASTER），与现有 `POST /{id}/files` 配套。
+2026-09-25 新增：列出装配体已上传的 PDF 文件（kind=ASSEMBLY_MASTER），与现有 `POST /{id}/files` 配套。
 
 Path：
 
@@ -294,7 +293,7 @@ Response 200 `data`：[`PartFileListOut`](../files.md#partfilelistout-字段)
 
 权限: **Manager / Clerk**
 
-2026-09-25 新增（D-07 api-drift-fix）：在已存在的装配体下追加单个 part 子件。子件继承父件 7 个共享信息字段（applicant_name / request_date / order_no / system_delivery_date / is_urgent / note / customer_id）；planned_delivery_date 子件入参优先，缺省继承父件。
+2026-09-25 新增：在已存在的装配体下追加单个 part 子件。子件继承父件 7 个共享信息字段（applicant_name / request_date / order_no / system_delivery_date / is_urgent / note / customer_id）；planned_delivery_date 子件入参优先，缺省继承父件。
 
 Path：
 
@@ -347,7 +346,7 @@ Response 200 `data`：[`PartListItem`](../parts/index.md#partlistitem-字段)
 
 权限: **Manager / Clerk / Inspector / CncProgrammer**
 
-2026-09-25 新增（D-08 api-drift-fix）：按 part 反查其所属装配体。响应 `R<Option<AssemblyDetail>>`——`null` 表示 part 不属于任何装配体（独立工单 / 单件 part）。
+2026-09-25 新增：按 part 反查其所属装配体。响应 `R<Option<AssemblyDetail>>`——`null` 表示 part 不属于任何装配体（独立工单 / 单件 part）。
 
 Path：
 
@@ -359,7 +358,7 @@ Response 200 `data`：`Option<AssemblyDetail>`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `Some(detail)` | [AssemblyDetail](#assemblydetail-字段) | 含 assembly 行 + children parts + files，与 `GET /assemblies/{id}` 同形 |
+| `Some(detail)` | [AssemblyDetail](./index.md#assemblydetail-字段) | 含 assembly 行 + children parts + files，与 `GET /assemblies/{id}` 同形 |
 | `None` | null | part 存在但无父装配体（assembly_id IS NULL） |
 
 业务流转（service 层走 `PartService::get_assembly_by_part`）：
@@ -398,7 +397,7 @@ Response 200 `data`：`Option<AssemblyDetail>`
 ### AssemblyUpdateRequest 字段
 
 见上文 [`POST /assemblies/{id}/update`](#post-apiv2assembliesassembly_idupdate) 字段表。注意 `customer_id` / `request_date` / `planned_delivery_date` / `unit_price` / `total_price` / `system_delivery_date` 是三态 `Option<Option<T>>`。
-> 2026-09-16 PR-2：`actual_delivery_date` 已从 `AssemblyUpdateRequest` 删除（t_assembly 列已删）。
+> 2026-09-16：`actual_delivery_date` 已从 `AssemblyUpdateRequest` 删除（t_assembly 列已删）。
 
 ## Rust DTO 定义
 
@@ -414,11 +413,11 @@ pub struct AssemblyOut {
     pub applicant_name: Option<String>,
     #[serde(serialize_with = "serialize_i64")]
     pub customer_id: i64,
-    // 2026-09-17 PR-4：request_date / planned_delivery_date 与 DDL NOT NULL 对齐去 Option
+    // 2026-09-17：request_date / planned_delivery_date 与 DDL NOT NULL 对齐去 Option
     pub request_date: NaiveDate,
     pub planned_delivery_date: NaiveDate,
-    // 2026-09-16 PR-2（migration 027）：删 `actual_delivery_date` —— 由
-    // t_part_event.event_type='DELIVERED' 派生（PR-2 § assembly/dto.rs:141）。
+    // 2026-09-16（migration 027）：删 `actual_delivery_date` —— 由
+    // t_part_event.event_type='DELIVERED' 派生（`assembly/dto.rs`）。
     pub is_urgent: bool,
     pub status: String,                 // PENDING / IN_PROCESS / COMPLETED / CANCELLED
     pub version: i32,
@@ -569,8 +568,8 @@ pub struct AssemblyUpdateRequest {
     pub request_date: Option<Option<NaiveDate>>,     // 三态
     #[serde(default, deserialize_with = "deserialize_optional_optional_date")]
     pub planned_delivery_date: Option<Option<NaiveDate>>,
-    // 2026-09-16 PR-2（migration 027）：删 `actual_delivery_date` —— 由
-    // t_part_event.event_type='DELIVERED' 派生（PR-2 § assembly/dto.rs:174）。
+    // 2026-09-16（migration 027）：删 `actual_delivery_date` —— 由
+    // t_part_event.event_type='DELIVERED' 派生（`assembly/dto.rs`）。
     #[serde(default)]
     pub is_urgent: Option<bool>,
     #[serde(default)]

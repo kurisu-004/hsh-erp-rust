@@ -945,38 +945,48 @@ INSPECTION → IN_PROCESS 由 `POST /prod/batches/{batch_id}/to-process`（to_pr
 
 ### `POST /api/v2/prod/batches/scan/deliver`
 
-权限: **已登录**
+权限: **Manager / ShelfAccount**（`require_any_role(&[Manager, ShelfAccount])`）
 
-> 2026-09-23 起 PR12 补：扫码交付端点（区别于 `delivery_note/scan`，本端点是
-> 工人扫码交付在制 part，触发 P3 流转）。前端从 PDA / 扫描枪直接 POST，body
-> 仅含 `part_serial_no`（或 `batch_id`），服务端按状态机守卫 + 自动流转。
+> 扫码交付端点（区别于 `delivery_note/scan`，本端点是工人扫码交付在制 part，
+> 触发 P3 流转）。前端从 PDA / 扫描枪直接 POST。
 >
 > **2026-10-02**：`ScanDeliverPartRequest` body 逐字不变，本端点**无 Path 参数**。
 > 路由注册顺序要点：本路径首段静态 `scan`，与
 > `POST /prod/batches/{batch_id}/*`（首段动态）**段数相同**，靠 axum / matchit 的静态优先
 > 规则消解 —— 新增/调整同类路由时必须实测本路径未被 `/{batch_id}` 吞掉。
 
-Request：
+Request：`ScanDeliverPartRequest`（`part_serial_no` / `worker_badge_code` **均必填无
+default**，缺任一 → axum `Json` 提取器 **422 + 纯文本**，不是业务信封）
 
 ```json
 {
-  "serial_no": "string (必填；若用 batch_id 则二选一)",
-  "batch_id": 1234567890,    // 可选；扫描到 part_id 后再用
-  "to_worker_id": 42,         // 可选；指定交付目标工人（默认当前 user）
+  "part_serial_no": "string (必填；t_part.serial_no 反查 part_id)",
+  "worker_badge_code": "string (必填；工牌码，须命中 is_active 且工种 code = 'DRIVER')",
   "note": "string (可选)"
 }
 ```
 
+> 2026-10-03 订正：原示例里的 `serial_no` / `batch_id` / `to_worker_id` 三个字段
+> **在 DTO 里都不存在**（本 struct 无 `deny_unknown_fields`，故多发会被静默丢弃而不是
+> 422 —— 照抄那版会得到「扫不出货却 200」）。
+
 业务流转：
-- 扫描 `serial_no` → 找到 part + 当前 active batch
-- 状态机检查：`IN_PROCESS → DELIVERED`（worker scan 流程）
-- 同事务：写 `t_part_event(event_type='DELIVERED')` + `t_part_event(actor_user_id=worker)`
+- `part_serial_no` → 反查 `t_part`（`deleted_at IS NULL`）
+- `worker_badge_code` → `WorkerRepo::get_by_badge_code`，校验 `is_active` 且
+  `t_work_type.code == 'DRIVER'`
+- 状态机守卫：`part.status` 必须为 `READY_TO_SHIP`
+- 取该 part 的 `READY_TO_SHIP` 批次 → `mark_batch_delivered`（OCC，带 `version`）
+- 同事务：写 `t_part_event(event_type='DELIVERED', from='READY_TO_SHIP', to='DELIVERED',
+  badge_code=worker_badge_code, created_by=当前 user)`
+- handler 在 commit 后广播 WS `PART_DELIVERED`（payload 仅 `part_id`）
 
-Response 200 `data`：`{ part_id, batch_id, from_status, to_status, version }`。
+Response 200 `data`：`PartOut`（**2026-10-03 订正**：原文档写的
+`{ part_id, batch_id, from_status, to_status, version }` 与实现不符，handler 返回
+`R<PartOut>`，即 `parts/crud.md` 那套 part 视图对象）。
 
-错误码：
-- 20101 / 20109 / 20114 / 20115 / 20116 / 20117 / 40901
+错误码：20101 / 20104 / 20109 / 20201 / 20202 / 21405 / 21409 / 40901。
 
 ---
 
-> **2026-09-23 PR12 同步说明**：本节 1 个端点（`POST /prod/batches/scan/deliver`）原 docs/api/parts/inspection.md 未覆盖，本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。
+> **2026-09-23 同步说明**：本节 1 个端点（`POST /prod/batches/scan/deliver`）原
+> docs/api/parts/inspection.md 未覆盖，本次按 [docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycle-inspectionmd高优先级--大量端点缺失) 补齐。

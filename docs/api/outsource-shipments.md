@@ -2,7 +2,7 @@
 
 > 本文件须与 `src/modules/outsource/{handler.rs,dto.rs,model.rs,repo/,service/}` 及
 > `src/modules/outsource/vo/shipment.rs` 保持同步
-> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
+> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 域覆盖：外协发货对账页（shipment 2 端点，2026-10-03 由 1 端点增为 2）。
 > 2026-09-13 Phase 2 落地 reconcile-update；2026-10-03 补 in-flight 在途一览。

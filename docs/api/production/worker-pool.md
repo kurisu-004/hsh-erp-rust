@@ -142,7 +142,7 @@ Request：`MoveRequest`
   - WORKER → `(location='WORKER', current_holder_id=worker_id)`
   - 不匹配 → `20122 BIZ_BATCH_LOCATION_MISMATCH`（**新增**，HTTP 409）
 
-> #### ⚠️ 2026-09-30（review 第 1 轮）两处行为变化
+> #### ⚠️ 2026-09-30 两处行为变化
 >
 > **(1) move 的 `to` 校验从「静默跳过」变为「强制执行」**（breaking behavior）
 >
@@ -157,7 +157,7 @@ Request：`MoveRequest`
 >
 > 这是**修正漏检**（原本应校验而未校验），但既有前端流程可能因此开始收到上述两个错误码。
 
-> **(2) worker-scan RETURNED 现在会推进 `current_process_id`（H1 修复）**
+> **(2) worker-scan RETURNED 现在会推进 `current_process_id`**
 >
 > `part/service/worker_scan.rs` 的 RETURNED 事件是全仓唯一的**工序推进**路径。
 > 它此前不写 `current_process_id`，导致工人在 P1 完工、扫 RETURNED 传
@@ -168,7 +168,7 @@ Request：`MoveRequest`
 > 2026-09-30 prod/pool move 重构中被移除，RETURNED 复用了同一函数）。这是**已知缺口**，
 > 影响面仅限显示（`current_process_step_id` 不更新），池归属不受影响。后续单独一轮处理。
 >
-> ⚠️ 措辞（2026-09-30 review 第 3 轮附带发现）：`current_process_step_id` **不是**
+> ⚠️ 措辞（2026-09-30 附带发现）：`current_process_step_id` **不是**
 > 「会随流转推进的进度指针」—— 它只在**首次定位**工序时写、之后一律不再推进
 > （worker-scan 两条分支都不写），对多工序链工单永远停在首次定位那一步。
 
@@ -192,7 +192,7 @@ Request：`MoveRequest`
 8. `PartService::sync_from_batch_change_with_conn` 同步 part 派生列
 9. 返回 `MoveResult`
 
-Response 200 `data`：[`MoveResult`](#moveresult-字段)
+Response 200 `data`：[`MoveResult`](#moveresult-字段2026-09-30-新增取代旧-assignresult)
 
 错误码：
 
@@ -462,7 +462,7 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 | `note` | string? | 工单级备注（t_part.note，DB 无 batch 级 remark 字段；复用） |
 | `version` | i32 | 乐观锁 |
 
-> **2026-09-16 PR-3 字段下线**：`placed_at` 字段已移除（t_part_batch 列已删）。
+> **2026-09-16 字段下线**：`placed_at` 字段已移除（t_part_batch 列已删）。
 > 前端如需展示积压时长，由前端按 `PICKED_UP` 事件 `created_at` 自派生；或后端后续补字段。
 >
 > **2026-09-29 新增字段**：`has_cnc_program: bool`（CNC 重构 5 任务之一）。
@@ -575,7 +575,7 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 ## WS 事件清单（worker-pool 相关）
 
 > 全部走 `WsEvent::DashboardEvent { kind, payload }`，payload 字段如下：
-> 详见 [`./websocket.md`](./websocket.md)
+> 详见 [`../websocket.md`](../websocket.md)
 
 | kind | 触发端点 | payload 关键字段 |
 |---|---|---|

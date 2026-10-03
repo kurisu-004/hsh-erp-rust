@@ -153,7 +153,7 @@ Response 200 `data`：`null`
 
 ### ApplicantListOut 字段
 
-见 [GET /applicants](#get-api-v2applicants) 响应小节。
+见 [GET /applicants](#get-apiv2comapplicants) 响应小节。
 
 ---
 

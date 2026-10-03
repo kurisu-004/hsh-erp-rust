@@ -3,7 +3,7 @@
 > ⚠️ **本目录文件须与 `src/modules/*/{handler,dto}.rs` 保持同步**
 >
 > 后端代码变更（**新增 / 修改 / 删除端点**，或**修改 DTO 字段 / 错误码**）后，必须**立即**更新对应模块文件：
-> - [`./iam.md`](./iam.md) — iam 域（auth + user 合并，2026-09-19；PR-4 收尾后 `/api/v2/iam/*` 为唯一对外接口，旧 alias `/auth` + `/users` 已下线）
+> - [`./iam.md`](./iam.md) — iam 域（auth + user 合并，2026-09-19；收尾后 `/api/v2/iam/*` 为唯一对外接口，旧 alias `/auth` + `/users` 已下线）
 > - [`./applicants.md`](./applicants.md) — applicant 域（申请人 CRUD，2026-08-26；2026-09-19 聚合于 com 模块 → `/api/v2/com/applicants`）
 > - [`./customers.md`](./customers.md) — customers 域（L1/L2 CRUD，2026-08-26；2026-09-19 聚合于 com 模块 → `/api/v2/com/customers`）
 > - [`./shelves.md`](./shelves.md) — shelves 域（CRUD + picker，2026-08-26；**2026-10-02 端点 10 → 7（文档原写 11，实为 10），货架↔工序映射搬到 prod 域，`account_count` 出参取消**）
@@ -201,7 +201,7 @@ HTTP 状态码：
 
 | 模块 | 文件 | 端点数 | 状态 |
 |---|---|---|---|
-| auth + users | [`./iam.md`](./iam.md) | 14 | ✅ 完全上线（2026-09-19 合并为单一 iam 域；PR-4 收尾后 `/api/v2/iam/*` 为唯一对外接口） |
+| auth + users | [`./iam.md`](./iam.md) | 14 | ✅ 完全上线（2026-09-19 合并为单一 iam 域；收尾后 `/api/v2/iam/*` 为唯一对外接口） |
 | applicants | [`./applicants.md`](./applicants.md) | 5 | ✅ 完全上线（CRUD + L1 customer 校验 + OCC，2026-08-26；聚合于 com 模块，2026-09-19） |
 | customers | [`./customers.md`](./customers.md) | 5 | ✅ 完全上线（CRUD + L1/L2 + OCC，2026-08-26；聚合于 com 模块，2026-09-19） |
 | shelves | [`./shelves.md`](./shelves.md) | 7 | ✅ 完全上线（CRUD + picker，2026-08-26；**2026-10-02 域拆分：端点 10 → 7（文档原写 11，逐 router 复核实为 10）—— 3 个货架↔工序映射端点搬到 [`production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)（prod 域，无 alias）；货架↔账号部分**消除**（`ShelfOut.account_count` 删除，绑定真源在 iam `t_user_role`，零 iam 改动）**） |

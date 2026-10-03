@@ -6,7 +6,7 @@
 > Close 帧（关闭码表见下方「连接关闭码」）+ Ping/Pong 存活检测 + 周期性 re-auth（→ `4001`）。
 > 实现说明见 `src/modules/dashboard/handler.rs` 的 module-level doc「2026-10-01 WS 健壮性加固（4 项）」。
 >
-> **2026-10-02 review 第 1 轮修复（3 Major）**：
+> **2026-10-02 修复（3 项）**：
 > 1. **re-auth 失败按原因分流**：`40100/40102/40105`（鉴权类）→ `4001`；其余（含 Redis 故障
 >    `50000 INTERNAL`）→ `1011 re-auth unavailable`。此前对两者一律发 `4001`，一次 Redis 抖动
 >    就会按下表的约定把全站用户登出。
@@ -237,9 +237,9 @@ flush 直接断。
 > `DashboardSnapshot` 与 `DashboardEvent` 两个变体；「心跳」走独立的 `WsHeartbeatMsg` text 帧 +
 > protocol-level `Ping`（见「握手流程」第 6 条），不再占用 `WsEvent` 变体。
 
-> **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts/inspection.md#post-apiv2prodbatchesworker-scan`](./parts/inspection.md#post-apiv2prodbatchesworker-scan) 与 [`./production/worker-pool.md`](./production/worker-pool.md)。
+> **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式）；payload 完整定义见 [`./parts/inspection.md#post-apiv2prodbatchesworker-scan`](./parts/inspection.md#post-apiv2prodbatchesworker-scan) 与 [`./production/worker-pool.md`](./production/worker-pool.md)。
 >
-> **batch 事件说明（2026-09-29 新增）**：`BATCH_PLACED_ON_SHELF` 同样在 HTTP commit 之后广播（沿 worker_pool 范本）；payload 含 4 个字段（batch_id / target_process_id / shelf_id / version）。单条 dispatch 端点发单条形态（payload 顶层字段）；bulk-dispatch / auto-dispatch 端点发批量形态（payload.batches 数组，仅含 succeeded 部分，skipped 不广播）。详见 [`./production/batches.md#ws-事件`](./production/batches.md#ws-事件)。
+> **batch 事件说明（2026-09-29 新增）**：`BATCH_PLACED_ON_SHELF` 同样在 HTTP commit 之后广播（沿 worker_pool 范本）；payload 含 4 个字段（batch_id / target_process_id / shelf_id / version）。单条 dispatch 端点发单条形态（payload 顶层字段）；bulk-dispatch / auto-dispatch 端点发批量形态（payload.batches 数组，仅含 succeeded 部分，skipped 不广播）。详见 [`./production/batches.md` 事务 + WS 广播](./production/batches.md#事务--ws-广播沿-worker_pool-范本)。
 >
 > i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
 

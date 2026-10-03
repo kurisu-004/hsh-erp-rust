@@ -130,4 +130,4 @@ Response 200 `data`：`null`
    再也删不掉（整组替换后 items 非空必有 ≥1 条 active 行可计数，照样拒；与
    `ProcessRepo::count_process_references` 的 junction 处理一致）。任一分支 > 0 ⇒ 20903 拒
    （**该逻辑在 work_types 域 soft-delete 端点，
-   详见 [`./work-types.md`](./work-types.md#post-apiv2work-typesidsoft-delete)**）。
+   详见 [`./work-types.md`](./work-types.md#post-apiv2prodwork-typesidsoft-delete)**）。

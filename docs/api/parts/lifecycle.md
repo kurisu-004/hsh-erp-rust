@@ -47,7 +47,7 @@ Request：`DeliverRequest`（body 必填）
 }
 ```
 
-业务流转：`READY_TO_SHIP → DELIVERED`（batch 级）；part 派生列由 PR-B2
+业务流转：`READY_TO_SHIP → DELIVERED`（batch 级）；part 派生列由
 rollup 自动回填；事件日志 `DELIVERED` 的 `batch_id` / `quantity` 来自
 操作的批次。
 
@@ -233,8 +233,7 @@ Response 200 `data`：[`PartOut`](./index.md#partout-字段) — 强推后的工
 
 ### CancelRequest 字段（保持 part 级）
 
-仅含可选 `reason` / `note`（cancel 走 part 级 + 级联取消全部活跃批次，详见
-[重构方案 §4.2](../../refactor-part-assembly-batch.md#42-rollup-回调核心-新增-partservicesync_from_batch_change)）。
+仅含可选 `reason` / `note`（cancel 走 part 级 + 级联取消全部活跃批次）。
 
 ### ForceCompleteRequest 字段（2026-09-30 新增，MANAGER 单角色强推逃生通道）
 
@@ -374,7 +373,7 @@ Response 200 `data`：`PartOut`。
 
 ### `POST /api/v2/prod/batches/{batch_id}/repair-dispatch`
 
-权限: **Manager**
+权限: **Manager / Clerk / Inspector**（`require_any_role(&[Manager, Clerk, Inspector])`）
 
 Path：
 
@@ -397,12 +396,15 @@ Request：`RepairDispatchRequest`（body 必填）
 {
   "shelf_id": 42,            // 必填；去向由 shelf.zone 决定
   "version": 0,
-  "worker_id": 42,           // 必填；被派工工人
   "next_process_id": 44,     // 可选
   "reason": "string (可选)",
   "note": "string (可选)"
 }
 ```
+
+> `RepairDispatchRequest` **无 `worker_id` / 工人字段**（2026-10-03 订正：原文档示例里的
+> `worker_id` 是虚构字段，`dto.rs` 的该 struct 里不存在，故照抄的客户端会静默被丢弃）。
+> 被派工人不由本端点的请求体指定：操作人身份取 JWT 解析出的 `CurrentUser`。
 
 Response 200 `data`：`PartOut`。
 
@@ -566,8 +568,7 @@ SQL 形态：单条 SQL 9 个 JOIN / 10 张表（`t_part_batch` + `t_part` + `t_
 > `COMPLETED` / `CANCELLED`）⇒ 返回项的 `status` **不固定**：起修时为
 > `IN_PROCESS`，但起修后送检 / 送检通过 / 发货三步都**只保持标记**、不改判据，
 > 故本端点也可能返回 `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` 的返修件。
-> **2026-10-02 订正**：原文「返回项的 `status` 字段恒为 `IN_PROCESS`」
-> **不成立** —— 「DB 不再产生 `REPAIRING` 字面量」≠「`status` 恒为 `IN_PROCESS`」；
+> ⚠️「DB 不再产生 `REPAIRING` 字面量」**不等于**「`status` 恒为 `IN_PROCESS`」——
 > 判「返修中」一律读 `is_repairing`。标记与 `status` **正交**的完整推导见本节末
 > 「返修标记与 status 正交 —— 可达链」。
 >
@@ -623,7 +624,7 @@ Response 200 `data`：`{ items: [BatchOut], total, limit, offset }`。
 
 ---
 
-> **2026-09-23 PR12 同步说明**：本节 8 个端点（pick-up / place-on-shelf / complete-repair / repair-dispatch / 4 个 GET 列表）原 docs/api/parts/lifecycle.md 未覆盖，本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。
+> **2026-09-23 同步说明**：本节 8 个端点（pick-up / place-on-shelf / complete-repair / repair-dispatch / 4 个 GET 列表）原 docs/api/parts/lifecycle.md 未覆盖，本次按 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycle-inspectionmd高优先级--大量端点缺失)）。
 
 ---
 

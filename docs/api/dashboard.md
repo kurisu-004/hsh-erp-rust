@@ -20,7 +20,7 @@
 ### `GET /api/v2/dashboard/snapshot`
 
 权限：任意已登录用户（MANAGER / SHELF_ACCOUNT / CLERK / INSPECTOR / CNC_PROGRAMMER），
-与 [`GET /ws/dashboard`](./websocket.md#get-wsdashboard) 对齐。
+与 [`GET /ws/dashboard`](./websocket.md#get-wsdashboard--websocket-升级) 对齐。
 
 Request：
 

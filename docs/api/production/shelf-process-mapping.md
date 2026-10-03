@@ -24,7 +24,7 @@
 > prod 聚合先例）。⚠️ 但**整个后端 commit 的前端配套改动不止改 URL** —— 同 commit
 > 删除的 `ShelfOut.account_count` 会打爆前端 Zod 必填字段。
 >
-> **状态（2026-10-02 已回填）**：后端 `f01acd0` + `bb75fce` 已随 merge commit `3384926`
+> **状态（2026-10-02 已回填）**：后端改动已随合并
 > 合入 `master`；前端配套已全部落在 `feat/shelf-domain-split`（3 commit，见下方
 > [前端配套改动清单](#前端配套改动清单)的状态声明）。
 >
@@ -165,16 +165,16 @@ Response 200 `data`：`null`
 保留本节而非删除，是因为它同时承担两个仍有效的职责：① 记录硬切前后的 URL 对照，
 方便日后排查旧路径残留；② 记录 `ShelfOut` 字段变更的前端同步面（见顶部警示块）。
 
-| | commit | 内容 |
+| | 日期 | 内容 |
 |---|---|---|
-| 后端 | `f01acd0` | 工序映射搬进 prod 域 + 账号部分消除（原始拆分） |
-| 后端 | `bb75fce` | review 第 1 轮修复：端点数订正 + 本清单 + 测试加固 |
-| 后端合并 | `3384926` | `merge: 货架域拆分 —— 工序映射搬进 prod/shelf_process + 账号部分消除`，已入 `master` |
-| 前端 | `5e5a551` | 端点契约对齐 v2 后端（422 根因 + 3 处静默数据损坏） |
-| 前端 | `3ef1a35` | review 第 1 轮修复：保存闸门堵死静默清空 + 5 项准确性订正 |
-| 前端 | `7685876` | 3 端点 URL 硬切到 prod 域 |
+| 后端 | 2026-10-02 | 工序映射搬进 prod 域 + 账号部分消除（原始拆分） |
+| 后端 | 2026-10-02 | 端点数订正 + 本清单 + 测试加固 |
+| 后端合并 | 2026-10-02 | 货架域拆分（工序映射搬进 prod/shelf_process + 账号部分消除）已入 `master` |
+| 前端 | 2026-10-02 | 端点契约对齐 v2 后端（422 根因 + 3 处静默数据损坏） |
+| 前端 | 2026-10-02 | 保存闸门堵死静默清空 + 5 项准确性订正 |
+| 前端 | 2026-10-02 | 3 端点 URL 硬切到 prod 域 |
 
-- **后端**：已在 `master`（`git merge-base --is-ancestor bb75fce master` 为真）。
+- **后端**：已在 `master`。
 - **前端**：在 `feat/shelf-domain-split` 分支，**截至 2026-10-02 尚未合入前端 `main`**
   （`main..feat/shelf-domain-split` = 3 commit，反向为空）。部署 / 联调以外部分支
   `main` 为准的环境仍会打旧路径。
@@ -187,7 +187,7 @@ Response 200 `data`：`null`
   前端侧对应走 `src/api/shelves.ts` 的 `getAllShelfProcessMappings` /
   `getShelfProcesses` / `setShelfProcesses` 三个函数，无第二个 URL 拼装点（见 A 节核实结论）。
 
-### A. 3 个 URL 硬切（写路径现在 404）—— ✅ 已落地（`7685876`）
+### A. 3 个 URL 硬切（写路径现在 404）—— ✅ 已落地
 
 `src/api/shelves.ts`：
 
@@ -203,7 +203,7 @@ Response 200 `data`：`null`
 | # | 症状 | 根因 | 前端落点 |
 |---|---|---|---|
 | BUG-1 | 保存工序映射报 **HTTP 422** | `setShelfProcesses` 发 `{process_ids: string[]}`，后端 `SetShelfProcessesRequest.items` 必填且无 `#[serde(default)]` → 40001。**该功能自 v1 迁 v2 起从未成功过一次** | `toShelfProcessesPayload()` 收口 payload 形态（`sort_order` 取数组下标 + 去重防撞 partial unique index） |
-| BUG-2 | 打开编辑弹窗已选工序被清空，点保存即**静默清空整组映射** | `getShelfProcesses` 读 `sp.processes`，后端实际返 `{items:[…]}` → `undefined.map` 抛 TypeError → 被裸 `catch` 吞掉 | `toShelfProcessIds()` 收口读形态；`catch` 不再清空而是置 `processLoadFailed` 硬拦整个保存动作（`ShelfList.vue` review I-1） |
+| BUG-2 | 打开编辑弹窗已选工序被清空，点保存即**静默清空整组映射** | `getShelfProcesses` 读 `sp.processes`，后端实际返 `{items:[…]}` → `undefined.map` 抛 TypeError → 被裸 `catch` 吞掉 | `toShelfProcessIds()` 收口读形态；`catch` 不再清空而是置 `processLoadFailed` 硬拦整个保存动作（`ShelfList.vue`） |
 | BUG-3 | 多个页面的货架 / 工序下拉被**静默清空** | `getAllShelfProcessMappings` 按 v1 的「一架子集一行」读 `item.process_ids`；v2 返**扁平行**（一行一个 (货架, 工序) 对）→ `new Set(undefined)` = 空集 | `useShelfProcessFilter` 改按 `shelf_id` regroup 扁平行 |
 
 > 顺带修正的**纯前端类型谎言**（后端从未返过这些字段，非本次后端改动引起）：
@@ -212,7 +212,7 @@ Response 200 `data`：`null`
 > 连带落点 `src/views/scan/components/ShelfPickerDialog.vue`（去掉 `:mapped-process-codes`）
 > 与 `src/views/scan/components/HmiPickerCard.vue`（标注该分支当前不可达、保留待后端补字段复活）。
 
-**消费者核实（2026-10-02 逐个 `git grep` 核对 `feat/shelf-domain-split@7685876`）**：
+**消费者核实（2026-10-02 逐个 `git grep` 核对）**：
 
 | 消费方 | 调用点 | 是否需改 | 实际状态 |
 |---|---|---|---|
@@ -226,7 +226,7 @@ Response 200 `data`：`null`
 | `src/views/parts/list/composables/usePartDispatch.ts` | `useShelfProcessFilter` ×2 | **不需改** | ✅ 未改（同上）**← 本节此前漏列** |
 | `src/views/repair/RepairStartDialog.vue` | `useShelfProcessFilter` ×1 | **不需改** | ✅ 未改（同上）**← 本节此前漏列** |
 
-**订正此前清单的三处计数 / 表述错误**（`bb75fce` 原写法）：
+**已订正的三处计数 / 表述错误**：
 
 1. **原写「已知消费者（7 处，需一并核对）」→ 实际是 8 个文件 / 12 个调用点**
    （7 个文件经 `useShelfProcessFilter`，共 10 个调用点；`ShelfList.vue` 直调 2 处）。
@@ -246,7 +246,7 @@ payload / 响应形态逐字钉死 + 旧路径不出现）、`src/composables/__
 且都是解释「旧路径已废」用的）；3 个 URL 只在 `src/api/shelves.ts` 一处拼装，
  无页面绕过 api 层自拼路径。
 
-### B. `account_count` 出参删除 —— ✅ 已落地（`5e5a551`，`3ef1a35` 补齐）
+### B. `account_count` 出参删除 —— ✅ 已落地
 
 后端侧已删：`master` 的 `src/modules/shelf/vo/shelf.rs::ShelfOut` 现为 **10 字段**，
 无 `account_count`（连同 `ShelfRepo::count_accounts_by_shelf` 一并移除）。
@@ -266,10 +266,7 @@ payload / 响应形态逐字钉死 + 旧路径不出现）、`src/composables/__
 - `src/views/cnc/composables/usePendingProgrammingStore.ts` —— 注释记「两侧同步摘除」
 - `src/api/shelves.ts` 文件头注释 —— 记「`account_count` 摘除已在前一个 commit 落地」
 
-**回归用例 S30 的处置 —— 原清单的处方已订正**：
-
-`bb75fce` 原写「前端 PR 必须改写 S30（改为断言『缺 `account_count` **不**抛错』或
-直接改为针对其它必填字段的 strip 陷阱 guard）」。**实际采用第二种：guard 字段从
+**回归用例 S30 的处置**：guard 字段从
 `account_count` 换成同为必填的 `zone`**，用例改名「S30：shelfSchema 缺 zone → 抛
 ZodError；shelfListResultSchema 缺 items → 抛 ZodError」。
 
@@ -297,7 +294,7 @@ CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃�
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `items` | [SetShelfProcessesItem](#setshelfprocessesitem-字段) | — | 空数组 = 清空全部 mapping |
+| `items` | [SetShelfProcessesItem](#dto-字段参考) | — | 空数组 = 清空全部 mapping |
 
 `SetShelfProcessesItem`：
 

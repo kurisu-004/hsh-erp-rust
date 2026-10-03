@@ -3,8 +3,8 @@
 > 本文件须与 `src/modules/iam/{handler.rs,dto.rs,service/{session,account}.rs}` 保持同步
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 
-> **2026-09-19 IAM 域合并（PR-1）**：原 `auth.md` + `users.md` 已合并为本文档。
-> **2026-09-19 IAM 域收尾（PR-4）**：旧 alias `/api/v2/auth/*` + `/api/v2/users/*` 已下线，
+> **2026-09-19 IAM 域合并**：原 `auth.md` + `users.md` 已合并为本文档。
+> **2026-09-19 IAM 域收尾**：旧 alias `/api/v2/auth/*` + `/api/v2/users/*` 已下线，
 > `/api/v2/iam/*` 成为 IAM 域唯一对外接口。`auth.md` + `users.md` 已删除。
 
 ## 端点列表

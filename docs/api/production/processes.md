@@ -170,7 +170,7 @@ Response 200 `data`：`null`
 | `description` | string? | |
 | `requires_approval` | bool | INHOUSE 永远 false；OUTSOURCE 由请求决定 |
 | `color` | string? | 前端工序卡片颜色（`#RRGGBBAA`，9 字符含 alpha）；`Option::is_none` ⇒ 序列化时省略 |
-| `is_cnc` | bool | 2026-09-29 新增（CNC 重构 5 任务之一）。是否 CNC 工序，用于待编程一览的链上/货架过滤 + worker_pool 候选池自动分配优先级。详见 [`../../migrations/20260929100000_002_add_is_cnc_to_process.sql`](../../migrations/20260929100000_002_add_is_cnc_to_process.sql)。 |
+| `is_cnc` | bool | 2026-09-29 新增（CNC 重构 5 任务之一）。是否 CNC 工序，用于待编程一览的链上/货架过滤 + worker_pool 候选池自动分配优先级。详见 [`../../../migrations/20260929100000_002_add_is_cnc_to_process.sql`](../../../migrations/20260929100000_002_add_is_cnc_to_process.sql)。 |
 | `version` | i32 | 乐观锁；每次写操作 +1 |
 | `created_at` | naive datetime | Asia/Shanghai |
 | `updated_at` | naive datetime | Asia/Shanghai |
@@ -198,7 +198,7 @@ Response 200 `data`：`null`
 任一总数 > 0 ⇒ 20803 `BIZ_PROCESS_IN_USE`。5 张表都已迁移到位，
 无 junction repo 缺口；后续如需按 junction 拆分 repo，可保留 best-effort 注释。
 
-> #### ⚠️ 2026-09-30（review 第 1 轮 M3）两点说明
+> #### ⚠️ 2026-09-30 两点说明
 >
 > **(1) 软删会比以前更容易被 20803 拒（行为收紧）**
 >

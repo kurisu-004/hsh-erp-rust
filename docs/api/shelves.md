@@ -46,7 +46,7 @@
 | 更新 `name` | None = 不改；Some(空串) = 20104；Some(非空) = 改 |
 | 更新 `location` | 三态：`None` 不改；`Some(null)` 清空；`Some(v)` 改 |
 | 更新 `display_order` | None = 不改；Some(v) = 改 |
-| 软删 | `t_part_batch.current_holder_id = shelf_id` 且 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` 且 `status IN ('IN_PROCESS','INSPECTION')` 仍有非软删引用 → 20503 拒（**2026-09-16 PR-2**：`t_part.current_holder_id` 列已删；**2026-10-01**：REPAIRING 降级为 `is_repairing` 标记，返修批次 status 即 IN_PROCESS，守卫强度不变）|
+| 软删 | `t_part_batch.current_holder_id = shelf_id` 且 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` 且 `status IN ('IN_PROCESS','INSPECTION')` 仍有非软删引用 → 20503 拒（**2026-09-16**：`t_part.current_holder_id` 列已删；**2026-10-01**：REPAIRING 降级为 `is_repairing` 标记，返修批次 status 即 IN_PROCESS，守卫强度不变）|
 
 ---
 
@@ -148,7 +148,7 @@ Response 200 `data`：`null`
 语义：等同 soft-delete —— `is_active = false` 同时 `deleted_at = now()`（Python pattern）。
 软删前查 `t_part_batch.current_holder_id = shelf_id` 且 `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF')` 且 `status IN ('IN_PROCESS','INSPECTION')` 引用数（单条 SQL 累加 2 个 sub-SELECT；**2026-10-01** 删掉原第 3 个 REPAIRING 子查询 —— 返修批次已被 IN_PROCESS 覆盖）。
 
-> 2026-09-16 PR-2（migration 027）：`t_part.current_holder_id` 列已删；该守卫改查 `t_part_batch` 真相源（PR-2 § `shelf/repo.rs::count_in_use_parts`）。
+> 2026-09-16（migration 027）：`t_part.current_holder_id` 列已删；该守卫改查 `t_part_batch` 真相源（`shelf/repo.rs::count_in_use_parts`）。
 
 错误码：
 

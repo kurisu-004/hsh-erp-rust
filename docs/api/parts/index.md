@@ -42,19 +42,19 @@
 | POST | `/api/v2/prod/batches/{batch_id}/to-ship` | Manager / Inspector | 单件通过品检（INSPECTION → READY_TO_SHIP）—— **2026-10-02 迁往 prod 域** | [`inspection.md`](./inspection.md#post-apiv2prodbatchesbatch_idto-ship) |
 | POST | `/api/v2/prod/batches/{batch_id}/to-process` | Manager / Inspector | 单件指定下一工序（INSPECTION → IN_PROCESS）—— **2026-10-02 迁往 prod 域** | [`inspection.md`](./inspection.md#post-apiv2prodbatchesbatch_idto-process) |
 | POST | `/api/v2/prod/batches/worker-scan` | **Manager** / **ShelfAccount** | 工人扫码归还 / 送检；成功后同事务触发 worker-pool refill —— **2026-10-02 迁往 prod 域**（无 Path，`serial_no` 主键） | [`inspection.md`](./inspection.md#post-apiv2prodbatchesworker-scan) |
-| GET | `/api/v2/parts/pending-programming` | Manager / Clerk / Inspector / CncProgrammer | 待编程列表（Phase 1）—— **2026-10-01 起前端请改用 [`GET /api/v2/prod/programming/pending`](../production/pending-programming.md#get-apiv2prodprogrammingpending)**（本端点保留兼容，规则2 走「批次货架 → 工序」间接链路、开发库恒返空） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
+| GET | `/api/v2/parts/pending-programming` | Manager / Clerk / Inspector / CncProgrammer | 待编程列表（Phase 1）—— **2026-10-01 起前端请改用 [`GET /api/v2/prod/programming/pending`](../production/pending-programming.md#get-apiv2prodprogrammingpending)**（本端点保留兼容，规则2 走「批次货架 → 工序」间接链路、开发库恒返空） | [`lifecycle.md`](./lifecycle.md#get-apiv2partspending-programming) |
 | GET | `/api/v2/outsource-shipments/in-flight` | Manager / Clerk | 外协在途列表 —— **2026-10-03 迁往 outsource 域**（旧 `/parts/outsource-in-flight` 无 alias，命中本表 `GET /{part_id}` catch-all → **400**；新形状含 `batch_id` / `batch.version` / 批次余量，是部分接收的输入源） | [`../outsource-shipments.md`](../outsource-shipments.md#get-apiv2outsource-shipmentsin-flight) |
 | GET | `/api/v2/outsource-sendable` | Manager / Clerk / Inspector | 可发外协一览（APPROVAL / DIRECT 两种 `send_mode`）—— **2026-10-03 迁往 outsource 域独立顶层前缀**（旧 `/parts/outsource-sendable` 无 alias，命中本表 `GET /{part_id}` catch-all → **400**） | [`../outsource-sendable.md`](../outsource-sendable.md) |
 | GET | `/api/v2/prod/batches/repair` | Manager / Inspector | 维修批次列表（判据 `status='DELIVERED'`）—— **2026-10-02 自 part 域迁入** | [`lifecycle.md`](./lifecycle.md#get-apiv2prodbatchesrepair) |
 | GET | `/api/v2/prod/batches/repairing` | Manager / Inspector | 维修中批次列表（判据 `is_repairing=true`）—— **2026-10-02 自 part 域迁入** | [`lifecycle.md`](./lifecycle.md#get-apiv2prodbatchesrepairing) |
-| GET | `/api/v2/parts/location-tree` | Manager / Clerk / Inspector / CncProgrammer | 库位树（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
-| POST | `/api/v2/prod/batches/scan/deliver` | Manager / Clerk | 扫码发货 —— **2026-10-02 迁往 prod 域** | [`inspection.md`](./inspection.md#post-apiv2prodbatchesscandeliver) |
-| POST | `/api/v2/parts/match-by-excel-items` | Manager / Clerk | Excel 行匹配（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
-| POST | `/api/v2/parts/batch-update-order-info` | Manager / Clerk | 批量更新订单信息（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
-| POST | `/api/v2/parts/batch-with-pdfs` | Manager / Clerk | 多页 PDF 树形创建（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
-| GET | `/api/v2/parts/by-work-type/{work_type_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工种查 part（Phase 2） | [`crud.md`](./crud.md#phase-2-工种工人视角) |
-| GET | `/api/v2/parts/pickable-by-work-type/{work_type_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工种查可领取 part（Phase 2） | [`crud.md`](./crud.md#phase-2-工种工人视角) |
-| GET | `/api/v2/parts/by-worker/{worker_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工人查持有 part（Phase 2） | [`crud.md`](./crud.md#phase-2-工种工人视角) |
+| GET | `/api/v2/parts/location-tree` | Manager / Clerk / Inspector / CncProgrammer | 库位树（Phase 1） | [`crud.md`](./crud.md#get-apiv2partslocation-tree) |
+| POST | `/api/v2/prod/batches/scan/deliver` | Manager / ShelfAccount | 扫码发货 —— **2026-10-02 迁往 prod 域** | [`inspection.md`](./inspection.md#post-apiv2prodbatchesscandeliver) |
+| POST | `/api/v2/parts/match-by-excel-items` | Manager / Clerk | Excel 行匹配（Phase 1） | [`crud.md`](./crud.md#post-apiv2partsmatch-by-excel-items) |
+| POST | `/api/v2/parts/batch-update-order-info` | Manager / Clerk | 批量更新订单信息（Phase 1） | [`crud.md`](./crud.md) |
+| POST | `/api/v2/parts/batch-with-pdfs` | Manager / Clerk | 多页 PDF 树形创建（Phase 1） | [`batch.md`](./batch.md#post-apiv2partsbatch-with-pdfs) |
+| GET | `/api/v2/parts/by-work-type/{work_type_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工种查 part（Phase 2） | [`crud.md`](./crud.md) |
+| GET | `/api/v2/parts/pickable-by-work-type/{work_type_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工种查可领取 part（Phase 2） | [`crud.md`](./crud.md) |
+| GET | `/api/v2/parts/by-worker/{worker_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工人查持有 part（Phase 2） | [`lifecycle.md`](./lifecycle.md#get-apiv2partsby-workerworker_id) |
 | POST | `/api/v2/prod/batches/{batch_id}/place-on-shelf` | Manager / Clerk | 上架 —— **2026-10-02 迁往 prod 域** | [`lifecycle.md`](./lifecycle.md#post-apiv2prodbatchesbatch_idplace-on-shelf) |
 | POST | `/api/v2/prod/batches/{batch_id}/recall-to-pending` | Manager / Clerk | 召回至 PENDING —— **2026-10-02 迁往 prod 域**（lifecycle.md 尚无独立章节） | [`production/batches.md`](./index.md) |
 | POST | `/api/v2/parts/{part_id}/send-to-programming` | Manager / Clerk | 派发编程（Phase 1）—— **已下线，返回 404** | [`lifecycle.md`](./lifecycle.md#get-apiv2partspending-programming) |
@@ -64,14 +64,14 @@
 | POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource` | Manager / Clerk / Inspector | 外协回收入库 —— **2026-10-02 迁往 prod 域**（支持部分接收 `quantity`） | [`production/batches.md`](../production/batches.md#外协流转send--receive) |
 | POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | Manager / Clerk / Inspector | 外协回收 → 品检（整批） —— **2026-10-02 迁往 prod 域** | [`production/batches.md`](../production/batches.md#外协流转send--receive) |
 | POST | `/api/v2/prod/batches/{batch_id}/complete-repair` | Manager / Clerk / Inspector | 完成维修 —— **2026-10-02 迁往 prod 域** | [`lifecycle.md`](./lifecycle.md#post-apiv2prodbatchesbatch_idcomplete-repair) |
-| POST | `/api/v2/prod/batches/{batch_id}/repair-dispatch` | Manager / Clerk | 派发维修 —— **2026-10-02 迁往 prod 域** | [`lifecycle.md`](./lifecycle.md#post-apiv2prodbatchesbatch_idrepair-dispatch) |
+| POST | `/api/v2/prod/batches/{batch_id}/repair-dispatch` | Manager / Clerk / Inspector | 派发维修 —— **2026-10-02 迁往 prod 域** | [`lifecycle.md`](./lifecycle.md#post-apiv2prodbatchesbatch_idrepair-dispatch) |
 | POST | `/api/v2/prod/batches/{batch_id}/scan-inspect` | Manager / Inspector | 扫码品检 —— **2026-10-02 迁往 prod 域**（本表尚无独立章节，见 [`./inspection.md` 状态机表](./inspection.md#状态机can_transition_to-白名单)） | [`inspection.md`](./inspection.md#状态机can_transition_to-白名单) |
-| GET | `/api/v2/parts/{part_id}/events` | Manager / Clerk / Inspector / CncProgrammer | 工单事件时间线（Phase 1） | [`crud.md`](./crud.md#phase-1-流程辅助) |
+| GET | `/api/v2/parts/{part_id}/events` | Manager / Clerk / Inspector / CncProgrammer | 工单事件时间线（Phase 1） | [`crud.md`](./crud.md#get-apiv2partspart_idevents) |
 | GET | `/api/v2/parts/{part_id}/batches` | Manager / Clerk / Inspector / CncProgrammer | 列出 part 下所有批次（Phase 1） | [`batch.md`](./batch.md#get-apiv2partspart_idbatches) |
-| GET | `/api/v2/parts/{part_id}/assembly` | Manager / Clerk / Inspector / CncProgrammer | 按 part 反查所属装配体（无父装配件为 null）—— 2026-09-25 D-08；路由注册在 part nest，**契约归 assembly 域** | [`../assemblies/crud.md`](../assemblies/crud.md#get-apiv2partspart_idassembly) |
-| POST | `/api/v2/parts/{part_id}/files/confirm` | Manager / Clerk | 直传 COS 链路绑定（head 校验 size → copy 到 CAS key → INSERT READY part_file）—— 契约归 [`../files.md`](../files.md#post-apiv2partspart_idfiles-confirm) | [`crud.md`](./crud.md#post-apiv2partspart_idfiles-confirm) |
+| GET | `/api/v2/parts/{part_id}/assembly` | Manager / Clerk / Inspector / CncProgrammer | 按 part 反查所属装配体（无父装配件为 null）—— 2026-09-25 新增；路由注册在 part nest，**契约归 assembly 域** | [`../assemblies/crud.md`](../assemblies/crud.md#get-apiv2partspart_idassembly) |
+| POST | `/api/v2/parts/{part_id}/files/confirm` | Manager / Clerk | 直传 COS 链路绑定（head 校验 size → copy 到 CAS key → INSERT READY part_file）—— 契约归 [`../files.md`](../files.md#post-apiv2partspart_idfilesconfirm) | [`crud.md`](./crud.md#post-apiv2partspart_idfilesconfirm) |
 | POST | `/api/v2/prod/batches/{batch_id}/split` | Manager / Clerk | 拆分批次 —— **2026-10-02 迁往 prod 域** | [`./batch.md`](./batch.md#post-apiv2prodbatchesbatch_idsplit) |
-| POST | `/api/v2/prod/batches/{batch_id}/cancel` | Manager / Clerk | 取消**单个**批次 —— **2026-10-02 迁往 prod 域**（区别：part 域 `POST /{part_id}/cancel` 翻转该 part 全部活跃批次） | [`crud.md`](./crud.md#phase-1-流程辅助) |
+| POST | `/api/v2/prod/batches/{batch_id}/cancel` | Manager / Clerk | 取消**单个**批次 —— **2026-10-02 迁往 prod 域**（区别：part 域 `POST /{part_id}/cancel` 翻转该 part 全部活跃批次） | [`../production/batches.md`](../production/batches.md#单批流转子资源19-条锚点--batch_id) |
 | POST | `/api/v2/prod/batches/{batch_id}/pick-up` | Manager / Clerk / ShelfAccount | B 方案手动 pick-up 兜底 —— **2026-10-02 迁往 prod 域**（本表尚无独立章节，载荷见 [`./lifecycle.md`](./lifecycle.md#post-apiv2prodbatchesbatch_idpick-up)） | [`lifecycle.md`](./lifecycle.md#post-apiv2prodbatchesbatch_idpick-up) |
 
 > **路由顺序（part 域剩余端点）**：所有静态段必须在 `/{part_id}/...` catch-all 前注册。
@@ -111,7 +111,7 @@
 | `updated_at` | naive datetime | |
 | `updated_by` | string (i64)? | |
 
-> 2026-09-16 PR-2（migration 027）：`PartOut` 删 `actual_delivery_date` —— 由
+> 2026-09-16（migration 027）：`PartOut` 删 `actual_delivery_date` —— 由
 > `t_part_event.event_type='DELIVERED'` 事件派生（详见
 > [`../../api/statistics.md`](../../api/statistics.md) 交付口径）。实际交付日期前端
 > 应通过 `GET /parts/{part_id}/events` 拉时间线或由对应 DELIVERED 事件携带。
@@ -151,7 +151,7 @@
 | `process_chain_id` | string (i64)? | 2026-09-16 migration 026 新增：逻辑指向 `t_part_process_chain.id`；`null` = 未制定工艺链 |
 | `customer_name` | string? | 冗余（lookup_customer_names） |
 | `l1_customer_name` | string? | 冗余（lookup_customer_names） |
-| `location` | string? | **派生**（2026-09-16 PR-2 § part/service/crud.rs::enrich_part_list_with_location_and_holder）；`min-progress 活跃批次.location`（与 `compute_part_target` 一致）。无活跃批次 → `null`。前端展示文案规范化由前端承担（`PRODUCTION_SHELF` → "货架 X" 等）；后端只负责值。**仅 PART 行有值；ALL 模式装配件段恒 `null`**（t_assembly 不持 location 字段；真相源在 t_part_batch）。 |
+| `location` | string? | **派生**（2026-09-16 起，见 part/service/crud.rs::enrich_part_list_with_location_and_holder）；`min-progress 活跃批次.location`（与 `compute_part_target` 一致）。无活跃批次 → `null`。前端展示文案规范化由前端承担（`PRODUCTION_SHELF` → "货架 X" 等）；后端只负责值。**仅 PART 行有值；ALL 模式装配件段恒 `null`**（t_assembly 不持 location 字段；真相源在 t_part_batch）。 |
 | `holder_name` | string? | **派生**（同上）；按 min-progress 活跃批次的 `current_holder_id` 解析（按 batch.location 分桶：`PRODUCTION_SHELF` / `INSPECTION_SHELF` → `t_shelf.code`；`WORKER` → `t_worker.name`；`OUTSOURCE_COMPANY` → `t_outsource_company.name`；`OFFICE` / `None` → `null`）。**仅 PART 行有值；ALL 模式装配件段恒 `null`**（t_assembly 不持 holder_name 派生字段）。 |
 | `row_type` | string? | 2026-09-28 新增。行类型标识：`"PART"`（零件）/ `"ASSEMBLY"`（装配件）/ `null`（历史 caller 旧 PART-only 形态）。ALL 模式混合列表用；前端按此字段切普通行 vs Tree 节点 lazy load。 |
 | `has_children` | bool | 2026-09-28 新增。是否有子件（Tree data lazy mode 必需）：PART 行 → `false`；ASSEMBLY 行 → `child_count.unwrap_or(0) > 0`。后端不强制走 `GET /assemblies/{id}` 预拉，前端按此字段切换展开/折叠交互即可。 |
@@ -181,12 +181,9 @@
 | `GET /parts/by-worker/{worker_id}` | 恒 `null` | `part/service/phase1/work_type.rs:321` `PartListItem::from(手工 TPart)` | **不需要** |
 | `GET /api/v2/com/union-list` | 恒 `null` | `com/union_list/service/crud.rs:731` / `:781` 结构体字面量（穷尽式，显式写 `None`） | **不需要** |
 
-> 2026-10-03（review 第 2 轮 Minor-A）订正：本文档初版写「被 3 个端点复用」而表里列了
-> 4 行，自相矛盾，且**漏了 4 个复用端点**（`by-work-type` / `by-worker` /
-> `outsource-in-flight` / `outsource-sendable`）。上表的 8 行是按「所有返回
-> `R<PartListOut>` 的 handler」逐一枚举得出的，每行都标了构造点以便复核。
-> 讽刺的是漏掉的 `by-work-type` / `by-worker` 恰是本分支同期修掉 `serial_no` 空值
-> 500 的两个端点（`serial_no` 才是它们的主字段）—— 漏掉它们的代价比抽象的计数错误更大。
+> 2026-10-03 订正：上表的 8 行是按「所有返回 `R<PartListOut>` 的 handler」逐一枚举
+> 得出的，每行都标了构造点以便复核。`by-work-type` / `by-worker` 是其中两行，
+> 且 `serial_no` 才是它们的主字段 —— 枚举时不可按「主端点」直觉漏掉。
 
 **前端无需改 Zod schema**，依据两条（均已核实）：
 
@@ -201,12 +198,12 @@
 > 那两个走**另一个 VO**，填的是「`status='PROGRAMMING'` 活跃批次」（`id` 最大者），
 > 对齐 `release-from-programming` 的写出口。两处不要互相复用类型。
 
-> 2026-09-16 PR-2（migration 027）：`t_part` 删 `actual_delivery_date` /
+> 2026-09-16（migration 027）：`t_part` 删 `actual_delivery_date` /
 > `location` / `current_holder_id` / `placed_at` / `delivery_note_id` /
 > `has_been_repaired` 6 个批次依附列；`TPart` 由 29 列精简至 23 列。
 > 列表项位置/持有人展示由 service 层按 min-progress 活跃批次派生（见上）。
 >
-> 2026-09-16 PR-3 批次 step 化（migration 028）：`t_part_batch.next_process_id` 列
+> 2026-09-16 批次 step 化（migration 028）：`t_part_batch.next_process_id` 列
 > 替换为 `current_process_step_id`（逻辑 FK → `t_process_chain_step.id`）。
 > `t_part_batch.placed_at` 列已删除（不再统计生产时间）。`TPart.next_process_id`
 > DB 列保留作派生缓存。
@@ -237,7 +234,7 @@
 >   `/// @deprecated 2026-09-27` 注释（行为不变）。前端如需该信息，按
 >   `current_process_step_id` 派生即可。
 > - 本目录 VOs **从未**包含过 `customer_path` / `parent_customer_name` 字段
->   —— 前端若仍读取请改读 `l1_customer_name`（2026-09-16 PR-2 24 列对齐后
+>   —— 前端若仍读取请改读 `l1_customer_name`（2026-09-16 24 列对齐后
 >   即稳定）。
 >
 > 2026-09-27 part 域前后端字段对齐：新增 `unit_price` / `total_price` 两个
@@ -267,9 +264,9 @@
 
 ### PartDetailOut 字段
 
-`TPart` 完整 25 列（2026-09-16 PR-2 瘦身后 23 列 + 2026-09-27 新增 `unit_price` / `total_price` 2 列；**含** `next_process_id`——detail 端点保留）+ `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
+`TPart` 完整 25 列（2026-09-16 瘦身后 23 列 + 2026-09-27 新增 `unit_price` / `total_price` 2 列；**含** `next_process_id`——detail 端点保留）+ `customer_name` / `l1_customer_name` / `current_batch_id`（仅 INSPECTION 时非 None）。
 
-> 2026-09-27 review 第 1 轮修复语义：`TPart.next_process_id` 撤销
+> 2026-09-27 修复语义：`TPart.next_process_id` 撤销
 > `#[serde(skip)]`，detail 端点（`PartDetailOut` 仍 flatten `TPart`）保留
 > `next_process_id` 字段；list 端点（`PartListItem` 改显式列字段）不含
 > `next_process_id`。
@@ -281,14 +278,13 @@
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → `20101`
 - **状态机**：详见 [状态机（can_transition_to 白名单）](./inspection.md#状态机can_transition_to-白名单)；不在白名单内的 source / target 组合返回 `20103 BIZ_INVALID_TRANSITION`（迁移表见 `src/modules/part/statemachine.rs`）
 - **事件日志**：状态迁移在 service 内事务内统一插入对应事件，service 提交后由 WS 中枢广播
-- **part↔batch 同步（PR-B2/B3 改写 2026-09-11；2026-10-01 收口为 status_gate 单一写入口）**：
+- **part↔batch 同步（2026-09-11 改写；2026-10-01 收口为 status_gate 单一写入口）**：
   part.status 不再直接 UPDATE，而是由「写批次状态」那一个函数一并在事务内派生
   （`part::service::status_gate::apply_batch_status_change`，min-progress 规则）。
   lifecycle 终态 / 翻转（deliver / cancel / complete / start-repair）只在最近一条
   source-status 批次上翻状态；装配体子件 rollup 同步触发（见
   [`../assemblies/index.md#子件状态聚合`](../assemblies/index.md#子件状态聚合auto-rollup)）。
-  详见 [`docs/refactor-part-assembly-batch.md`](../../refactor-part-assembly-batch.md) 与
-  [状态派生契约](#状态派生契约2026-10-01)。
+  详见 [状态派生契约](#状态派生契约2026-10-01)。
 ---
 
 ## 状态派生契约（2026-10-01）
@@ -311,10 +307,9 @@
 事实改由 **`t_part_batch.is_repairing`（boolean，默认 false）** 承载。所有「返修中」
 的查询 / 守卫一律读该列，不再判 `status = 'REPAIRING'`（DB 里不再产生该字面量；
 `PartStatus::from_str("REPAIRING")` 保留 → `IN_PROCESS` 的过渡兼容分支）。
-**2026-10-02 订正**：原文「批次返修中时 `status` 保持 `IN_PROCESS`」
-字面读成了「返修中 ⇒ `IN_PROCESS`」的不变式，**不成立** —— 标记与 `status`
-**正交**：起修后送检 / 送检通过 / 发货都只保持标记，故返修件的 `status` 也可能是
-`INSPECTION` / `READY_TO_SHIP` / `DELIVERED`（可达链见
+⚠️ 标记与 `status` **正交**，不要把「起修只保持 `IN_PROCESS` 不翻转」读成
+「返修中 ⇒ `IN_PROCESS`」的不变式：起修后送检 / 送检通过 / 发货都只保持标记，故返修件的
+`status` 也可能是 `INSPECTION` / `READY_TO_SHIP` / `DELIVERED`（可达链见
 [`./lifecycle.md` § GET /api/v2/prod/batches/repairing](./lifecycle.md#get-apiv2prodbatchesrepairing)）。
 
 ### 三层单向派生 + 单一写入口
@@ -345,7 +340,7 @@ t_assembly.status               ← 派生缓存
   只改其它列的 UPDATE 不在判定范围，细则见该测试文档注释）。
 - 派生层的 OCC 冲突**一律降级为「跳过 + `tracing::warn!`」**，绝不让派生缓存否决
   用户的主操作（详见 [`../assemblies/index.md#子件状态聚合`](../assemblies/index.md#子件状态聚合auto-rollup)）。
-- **派生层也不得覆盖主操作**（2026-10-01 review 第 1 轮 B1）：`POST /parts/{id}/cancel`
+- **派生层也不得覆盖主操作**（2026-10-01）：`POST /parts/{id}/cancel`
   先把 part 打成 CANCELLED，随后的批次级联若算出 COMPLETED（「已完成批次 + 其余被批量
   取消」）**不许**写回。`update_part_rollup` 的 `status NOT IN ('COMPLETED','CANCELLED')`
   是 SQL 层兜底，bulk 入口的 `PartDerivation::KeepPartTerminalAsIs` 是显式表达
@@ -362,21 +357,20 @@ t_assembly.status               ← 派生缓存
   派生函数重跑一遍并回报 before→after，幂等；全量对账用**分表游标**续扫
   （响应回 `next_part_after_id` / `next_assembly_after_id`，回传为请求的
   `part_after_id` / `assembly_after_id`）直到 `truncated=false`。两表 id 来自同一
-  个雪花流且按时间序交错，**必须分表推进**（review 第 2 轮 MAJOR-2：共用一个游标会
+  个雪花流且按时间序交错，**必须分表推进**（共用一个游标会
   永久跳过 `(assembly_max, part_max]` 那段装配件却仍报 `truncated=false`）。
   报告里 `parts_skipped_terminal > 0` = 「已终态、派生被守卫跳过」，≠「数据已一致」。
   见 [`../admin.md`](../admin.md)。
 
-> **migration 007 注释订正（2026-10-01 review 第 1 轮 m1）**：007 里「
-> `t_part_event.id` 无默认值、SQL 里无法生成雪花 ID」这句是**错的** ——
-> baseline 已有 `SET DEFAULT nextval('t_part_event_id_seq')`（reviewer 已在
-> information_schema 确认）。007 选 `MAX(id)+ROW_NUMBER()` 的**结论**仍然可用
+> **migration 007 的选型理由（2026-10-01 订正）**：baseline 已有
+> `SET DEFAULT nextval('t_part_event_id_seq')`，故 007 里「无默认值、SQL 里无法生成
+> 雪花 ID」的说法不成立。007 选 `MAX(id)+ROW_NUMBER()` 的**结论**仍然可用
 > （运行时那条路径拿不到雪花生成器），但理由是「不与运行时生成的 id 抢空间 /
-> 排到时间线顶部」而不是「无默认值」。运行时路径已改为由 caller 透传真实雪花
+> 排到时间线顶部」。运行时路径已改为由 caller 透传真实雪花
 > （见上一条），故 migration 007 本身按 append-only 约定**保持原样不改**
 > （改它会变更 sqlx 记录的 checksum，让已 apply 过该迁移的库启动失败）。
 >
-> **TODO(2026-10-01 review 第 2 轮 MINOR-4，follow-up PR —— 上线窗口需人工评估)**：
+> **TODO(2026-10-01 登记 —— 上线窗口需人工评估)**：
 > `migrations/20261001000200_007_serial_release.sql:113-118` 是
 > `DROP INDEX` + **非并发** `CREATE UNIQUE INDEX` + 全表 `UPDATE`。在生产级
 > `t_part` 上，事务内的 `CREATE INDEX` 会持 `ACCESS EXCLUSIVE` 锁**贯穿整个构建**，

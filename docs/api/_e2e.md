@@ -1,7 +1,7 @@
 # _e2e 域 API（seed hook）
 
 > 本文件须与 `src/modules/_e2e/{handler.rs,dto.rs,mod.rs}` 保持同步
-> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
+> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 域覆盖：e2e 测试 seed hook（12 端点），供 Playwright spec 匿名灌入 seed 数据。
 > 2026-09-14 落地；dev/test profile 默认启用，release profile 必须显式 `E2E_HOOKS_ENABLED=false`。

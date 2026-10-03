@@ -34,8 +34,8 @@ Query：
 | `statuses` | string? | 多状态过滤，逗号分隔（如 `PENDING,READY_TO_SHIP`） |
 | `is_urgent` | bool? | 紧急标记过滤 |
 | `keyword` | string? | 模糊匹配 `name` / `drawing_no` / `serial_no` |
-| `locations` | string? | 2026-09-17 PR-4 新增。位置白名单，逗号分隔（`OFFICE` / `PRODUCTION_SHELF` / `WORKER` / `INSPECTION_SHELF` / `OUTSOURCE_COMPANY`），查 `t_part_batch.location`（多态批次的 `location` 字段） |
-| `holder_ids` | string? | 2026-09-17 PR-4 新增。持有人 ID 列表，逗号分隔雪花字符串（多态：t_shelf / t_worker / t_outsource_company 任一表匹配同雪花 id 即命中）；查 `t_part_batch.current_holder_id`。非法雪花 ID → `40001 VALIDATION_ERROR`（422） |
+| `locations` | string? | 2026-09-17 新增。位置白名单，逗号分隔（`OFFICE` / `PRODUCTION_SHELF` / `WORKER` / `INSPECTION_SHELF` / `OUTSOURCE_COMPANY`），查 `t_part_batch.location`（多态批次的 `location` 字段） |
+| `holder_ids` | string? | 2026-09-17 新增。持有人 ID 列表，逗号分隔雪花字符串（多态：t_shelf / t_worker / t_outsource_company 任一表匹配同雪花 id 即命中）；查 `t_part_batch.current_holder_id`。非法雪花 ID → `40001 VALIDATION_ERROR`（422） |
 | `row_type` | string? | 2026-09-28 新增。行类型筛选：`"PART"` / `"ASSEMBLY"` / 缺省（=ALL）。非法值 → `40001 VALIDATION_ERROR`。详见下方「行类型合并规则」。 |
 | `include_assemblies` | bool? | 2026-09-28 新增。是否合并装配件：仅 `row_type` 缺省时生效。`false` 强制仅零件（兼容 `/parts/pending-programming` 等内部 caller）。`true` 或缺省 → 默认 ALL 模式。详见下方「行类型合并规则」。 |
 | `sort_by` | string? | 白名单 `CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它退化为 `CREATED_AT`。ALL 模式下 `SERIAL_NO` 不在 t_part / t_assembly 共有列交集 → 降级为 `CREATED_AT`（见下方「SORT 键交互」）。 |
@@ -188,7 +188,7 @@ Request：`PartUpdateRequest` — 字段全部可选（缺省 = DB 不动）；`
 | `unit_price` | string (Decimal)? | — | 2026-09-27 新增：单价（NUMERIC(12,2) NOT NULL DEFAULT 0）。`Decimal` 由 axum extractor 从 JSON string 反序列化 |
 | `total_price` | string (Decimal)? | — | 2026-09-27 新增：总价（NUMERIC(14,2) NOT NULL DEFAULT 0）。同上 |
 
-> 2026-09-16 PR-2（migration 027）：`PartUpdateRequest` 删 `actual_delivery_date`
+> 2026-09-16（migration 027）：`PartUpdateRequest` 删 `actual_delivery_date`
 > 入参 —— 该列已从 `t_part` 删除；实际交付日期由 `t_part_event.event_type='DELIVERED'`
 > 事件派生，不接受手工改（详见
 > [`../../api/statistics.md`](../../api/statistics.md)）。
@@ -273,7 +273,7 @@ Response 200 `data`：最新 `TPartFile` 行（`kind` = `3D_MODEL`，`file_type`
 
 ### `POST /api/v2/parts/{part_id}/files/confirm`
 
-直传 COS 链路的「提交绑定」端点。完整契约见 [`../files.md`](../files.md#post-apiv2parts%7Bpart_id%7Dfilesconfirm)（part_file 域文档统一托管，本处只列要点）。
+直传 COS 链路的「提交绑定」端点。完整契约见 [`../files.md`](../files.md#post-apiv2partspart_idfilesconfirm)（part_file 域文档统一托管，本处只列要点）。
 
 - **权限**：Manager / Clerk
 - **用途**：客户端 PUT 到 tmp 区成功后调用本端点 → 把 tmp 对象 copy 到 CAS key + INSERT `t_part_file` + 异步清理 tmp
@@ -314,7 +314,7 @@ Response 200 `data`：最新 `TPartFile` 行（`kind` = `3D_MODEL`，`file_type`
 
 权限: **已登录**
 
-> 2026-09-23 起 PR12 补：列出 part 全部事件日志（含状态机流转 + batch 流转 + repair + delivery note 挂接等）。
+> 2026-09-23 补：列出 part 全部事件日志（含状态机流转 + batch 流转 + repair + delivery note 挂接等）。
 
 Path：
 
@@ -344,7 +344,7 @@ Response 200 `data`：`{ items: [PartEventOut], total, limit, offset }`。
 
 权限: **已登录**
 
-> 2026-09-23 起 PR12 补：返回货架树（按 zone 分组：PRODUCTION / INSPECTION / RETURN），用于前端 picker。
+> 2026-09-23 补：返回货架树（按 zone 分组：PRODUCTION / INSPECTION / RETURN），用于前端 picker。
 
 Response 200 `data`：`[ShelfNode]`（递归 `children`）。
 
@@ -356,13 +356,13 @@ Response 200 `data`：`[ShelfNode]`（递归 `children`）。
 | `zone_label` | string | 中文显示 |
 | `shelves` | [Shelf] | 该 zone 下货架（按 `sort_order` 排序） |
 
-`Shelf` 见 [`../shelves.md#shelf-字段`](../shelves.md#shelf-字段)。
+`Shelf` 见 [`../shelves.md#dto-字段参考`](../shelves.md#dto-字段参考)。
 
 ### `POST /api/v2/parts/match-by-excel-items`
 
 权限: **Manager / Clerk**
 
-> 2026-09-23 起 PR12 补：Excel 批量匹配（POST 入参 body）。前端上传 Excel → 服务端按 `part_name` / `drawing_no` / `serial_no` 三种 key 分别匹配已有 part；返回每个 item 的匹配结果（用于人工确认导入）。
+> 2026-09-23 补：Excel 批量匹配（POST 入参 body）。前端上传 Excel → 服务端按 `part_name` / `drawing_no` / `serial_no` 三种 key 分别匹配已有 part；返回每个 item 的匹配结果（用于人工确认导入）。
 
 Request：
 
@@ -395,4 +395,4 @@ Response 200 `data`：`{ matches: [MatchResult], unmatched: [ExcelItem] }`。
 
 ---
 
-> **2026-09-23 PR12 同步说明**：本节 3 个端点（`/{part_id}/events` / `/location-tree` / `/match-by-excel-items`）原 docs/api/parts/crud.md 未覆盖，本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。
+> **2026-09-23 同步说明**：本节 3 个端点（`/{part_id}/events` / `/location-tree` / `/match-by-excel-items`）原 docs/api/parts/crud.md 未覆盖，本次按 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycle-inspectionmd高优先级--大量端点缺失)）。
