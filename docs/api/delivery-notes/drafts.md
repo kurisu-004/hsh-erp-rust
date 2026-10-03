@@ -337,7 +337,7 @@ Response 200 `data`：`AttachBatchesOut`
 | `21403` | `BIZ_DELIVERY_NOTE_NOT_DRAFT` | **409**（由 `biz_with_status` 强制） | note 状态非 DRAFT |
 | `40300` | `FORBIDDEN` | 403 | 角色不符（非 Manager / Clerk） |
 
-WS 事件：commit 后广播 `DELIVERY_NOTE_BATCHES_ATTACHED`（payload：`{ delivery_note_id, attached_count, conflict_count }`；详见 [`../../websocket.md`](../../websocket.md)）；监听端用 `conflict_count > 0` 判断是否有失败项。
+WS 事件：commit 后广播 `DELIVERY_NOTE_BATCHES_ATTACHED`（payload：`{ delivery_note_id, attached_count, conflict_count }`；详见 [`../websocket.md`](../websocket.md)）；监听端用 `conflict_count > 0` 判断是否有失败项。
 
 完整示例：
 
@@ -384,7 +384,7 @@ Response 200 `data`: `null`
 
 ### 路线 B 修复（2026-08-27 ~ 2026-08-31）
 
-> 原设计文档 `scan-route-b-fix.md` 已折叠进本节（2026-08-31）。如需 git 历史，参见 `git log -- docs/api/delivery-notes/scan-route-b-fix.md`（HEAD 中最后一次修订为 169f442）。
+> 原设计文档 `scan-route-b-fix.md` 已折叠进本节（2026-08-31）。如需 git 历史，参见 `git log -- docs/api/delivery-notes/scan-route-b-fix.md`。
 
 #### Context
 
@@ -418,8 +418,8 @@ Response 200 `data`: `null`
 | 日期 | 改动 |
 |---|---|
 | 2026-08-26 | 路线 B 初始设计稿（`scan-route-b-fix.md` 创建） |
-| 2026-08-27 | DTO 精简 + 错误码 21421 重写（commit `169f442`） |
-| 2026-08-28 | `IN_PROCESS` 持有判定从 `current_holder_id IS NOT NULL` 改为 `location = 'WORKER'`（commit `81bb858`） |
+| 2026-08-27 | DTO 精简 + 错误码 21421 重写 |
+| 2026-08-28 | `IN_PROCESS` 持有判定从 `current_holder_id IS NOT NULL` 改为 `location = 'WORKER'` |
 | 2026-08-31 | **C 组语义修订**：任一 C → 21421 改为「任一 target 全 C 才 21421」，混合场景静默过滤；A 组不再由 scan 自动 attach（混合场景下），改由 `POST /{id}/attach-batches` 弹窗显式提交；新增 `UnresolvedTargetDto.attachable_batches` 字段与 `POST /{id}/attach-batches` 端点；WS 新增 `DELIVERY_NOTE_BATCHES_ATTACHED` 事件 |
 
 #### 关键实现位置

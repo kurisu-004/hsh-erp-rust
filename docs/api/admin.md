@@ -1,7 +1,7 @@
 # admin 域 API
 
 > 本文件须与 `src/modules/admin/{mod.rs,handler.rs,service.rs,dto.rs}` 保持同步
-> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
+> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 域定位：**对账 / 修数据的逃生口**。域内**不含任何新的派生算法**，只复用
 > part / assembly 域既有的 rollup 函数把派生缓存重算一遍。
@@ -76,8 +76,7 @@ t_assembly.status     ← 派生缓存
 反序会让本轮刚修正的 part 不被计进父件聚合（要等下一次调用才对齐，破坏
 「调一次就收敛」的直觉）。
 
-**全量对账如何扫完整表**（2026-10-01 review 第 1 轮 M7 新增游标，第 2 轮 MAJOR-2
-拆成两个）：响应里 `truncated = true` 时，把 `data.next_part_after_id` /
+**全量对账如何扫完整表**（2026-10-01）：响应里 `truncated = true` 时，把 `data.next_part_after_id` /
 `data.next_assembly_after_id` 中**非 null** 的值**原样回传**为下一次请求的
 `part_after_id` / `assembly_after_id`，重复调用直到 `truncated = false` 即两段都扫完：
 
@@ -94,13 +93,13 @@ loop {
 > 收敛性保证：`truncated = true` 至少意味着有一段取满了 `limit + 1` 行，即该段本轮
 > 处理了 `limit ≥ 1` 行、游标必然推进 ⇒ 循环必然终止。
 
-> **为什么必须是两个游标**（review 第 2 轮 MAJOR-2）：`t_part` 与 `t_assembly` 的
+> **为什么必须是两个游标**（2026-10-01）：`t_part` 与 `t_assembly` 的
 > id 来自**同一个** `state.snowflake`（建父装配件与建子件都用它），两表 id 在时间序
-> 上**交错**。第 1 轮的实现让两段共用一个 `after_id`、回一个
-> `next_after_id = max(part_max, assembly_max)`：当两表行数都 `> limit` 时，
-> 第 2 轮起 assembly 窗口从 `part_max` 起步，`(assembly_max, part_max]` 区间那一段
+> 上**交错**。若两段共用一个 `after_id`、回一个
+> `next_after_id = max(part_max, assembly_max)`，当两表行数都 `> limit` 时
+> assembly 窗口会从 `part_max` 起步，`(assembly_max, part_max]` 区间那一段
 > 装配件**永远扫不到**，而循环仍以 `truncated = false` 收尾 —— 报告谎称「已覆盖
-> 全表」。现在两段各自推进，交错 id 不再互相吞窗口。
+> 全表」。故两段各自推进，交错 id 不互相吞窗口。
 >
 > 回归测试：`tests/part/rollup_recompute.rs::
 > recompute_rollup_full_scope_covers_interleaved_part_and_assembly_ids`
@@ -173,9 +172,9 @@ loop {
   note 记原序列号）再清 `t_part.serial_no`。即对账也补做序列号释放。
   与业务流完全同一段代码，故不会重复释放（每个 part 至多 1 条归档事件）。
 - 父装配件进终态时清 `t_assembly.serial_no`（不归档，`t_assembly` 无事件表）。
-### 终态守卫：被跳过的行**必须**单独上报（2026-10-01 review 第 2 轮 MAJOR-1）
+### 终态守卫：被跳过的行**必须**单独上报（2026-10-01）
 
-- **已终态的 part 不参与对账**（2026-10-01 review 第 1 轮 B1）：
+- **已终态的 part 不参与对账**（2026-10-01）：
   `update_part_rollup` 带 `status NOT IN ('COMPLETED','CANCELLED')` 守卫 ——
   「派生层不得覆盖主操作」在 SQL 层的兜底（`POST /parts/{id}/cancel` 会先把
   part 打成 CANCELLED，随后批次的级联派生不许把它推回 COMPLETED）。
@@ -183,12 +182,13 @@ loop {
   而批次还在 INSPECTION）无法靠本端点自动纠正 —— 那需要一次人工决策（究竟哪个是
   真的），由派生算法替运营做决定比不做更危险。
 - **报告口径**：这类行既不进 `changes`（守卫命中时一个字节都没写），也**不等于**
-  「数据已一致」。故第 2 轮把 `status_gate::RollupOutcome::terminal_skip` 上抛，
+  「数据已一致」。故 `status_gate::RollupOutcome::terminal_skip` 上抛，
   报告给出 `parts_skipped_terminal` + `skipped_terminal[{id, current, derived}]`。
-  此前这里只有一条 `tracing::warn!`，运维从报告里看到的
-  `parts_examined=1 / parts_changed=0` 与「数据本来就一致」**不可区分** ——
-  即「兜底修数工具给假干净报告」，与本端点要消灭的失败类别同类。
-- **人工怎么修**（订正第 1 轮文档里那条不可能成立的建议）：守卫对**定点路径同样
+  日志侧终态跳过只留一条 `tracing::warn!`（信号太弱），故报告另给上述计数——只看
+  `parts_examined=1 / parts_changed=0` 会与「数据本来就一致」不可区分，必须同时看
+  `parts_skipped_terminal`。否则「兜底修数工具给假干净报告」，与本端点要消灭的
+  失败类别同类。
+- **人工怎么修**：守卫对**定点路径同样
   生效**，所以「用 `part_ids` 定点跑一遍」**不可能**改掉终态行。可行路径只有两条：
   1. 若 `derived`（min-progress 派生值）**就是**你想要的终态 → 用
      `POST /parts/{id}/force-complete`（Manager 逃生通道，明确绕过状态机）或
@@ -205,7 +205,7 @@ loop {
   事务会在 commit 前一直占着全部 `t_part` / `t_assembly` 行锁；且某块撞脏数据
   时，前面几块已提交，重试只需重跑失败块。
 - 派生层的 OCC 冲突**一律降级为「跳过 + `tracing::warn!`**，不会让本端点失败
-  （见 [`../assemblies/index.md`](../assemblies/index.md#子件状态聚合auto-rollup)）。
+  （见 [`./assemblies/index.md`](./assemblies/index.md#子件状态聚合auto-rollup)）。
 
 ### WS 广播
 
@@ -244,8 +244,8 @@ Manager 单角色，口径一致。
 - 集成测试：`tests/part/rollup_recompute.rs`（8 用例：part 定点修正 + 幂等 +
   序列号释放归档 / assembly 反向漂移修正 + 幂等 / RBAC 403 且不改数据 /
   无 body = 全量 / `limit` 超上限 400 / `part_after_id` 游标续扫收敛 /
-  **两表 id 交错的续扫收敛**（MAJOR-2 回归）/ 终态守卫跳过时 `parts_skipped_terminal`
-  与 `skipped_terminal` 明细上抛（MAJOR-1 回归））
+  **两表 id 交错的续扫收敛** / 终态守卫跳过时 `parts_skipped_terminal`
+  与 `skipped_terminal` 明细上抛）
 - 复用的既有派生实现（**一行算法都没重写**）：
   - part：`src/modules/part/service/status_gate.rs::rollup_part_derived`
   - assembly：`src/modules/assembly/service/sync_from_part.rs::sync_assembly_status`
@@ -253,7 +253,7 @@ Manager 单角色，口径一致。
 - 守门单测（均在 `cargo test --lib` 跑）：
   - `src/modules/part/service/status_gate.rs::write_guard_tests`：扫全
     `src/**/*.rs`，除 `status_gate.rs` 外任何人写 `t_part_batch.status` 即 CI 失败。
-    已知绕过口（2026-10-01 review 第 1 轮 m3 记录在案，尚未修）：
+    已知绕过口（2026-10-01 记录在案，尚未修）：
     `UPDATE ONLY t_part_batch` / `UPDATE public.t_part_batch`（schema 限定）/
     `INSERT … ON CONFLICT … DO UPDATE SET status=…`（upsert）；且只覆盖 batch 层，
     `t_part.status` / `t_assembly.status` 尚无同类护栏。

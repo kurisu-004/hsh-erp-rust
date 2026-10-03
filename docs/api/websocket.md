@@ -6,7 +6,7 @@
 > Close 帧（关闭码表见下方「连接关闭码」）+ Ping/Pong 存活检测 + 周期性 re-auth（→ `4001`）。
 > 实现说明见 `src/modules/dashboard/handler.rs` 的 module-level doc「2026-10-01 WS 健壮性加固（4 项）」。
 >
-> **2026-10-02 review 第 1 轮修复（3 Major）**：
+> **2026-10-02 修复（3 项）**：
 > 1. **re-auth 失败按原因分流**：`40100/40102/40105`（鉴权类）→ `4001`；其余（含 Redis 故障
 >    `50000 INTERNAL`）→ `1011 re-auth unavailable`。此前对两者一律发 `4001`，一次 Redis 抖动
 >    就会按下表的约定把全站用户登出。
@@ -129,7 +129,7 @@ Request：
 握手成功**之后**，服务端在**能发出 Close 帧的路径**上都主动发（此前全仓零主动发送，退出路径
 全是裸 drop，浏览器只能看到 1006，无法区分「服务端主动踢 / 网络断 / session 失效」）。
 
-2026-10-02 起有两处**不发** Close 帧（2026-10-02 修复 Minor-3 / Minor-5 / Nit-2）：
+2026-10-02 起有两处**不发** Close 帧：
 
 - **写侧已失败的 6 条路径**（推初始快照 / 回 Pong / 广播快照 / 广播事件 / text 心跳 /
   协议层 Ping 写失败）：`send` 已返回 Err，写端与 socket 已不可用，再发 Close 帧必然再失败一次
@@ -150,7 +150,7 @@ flush 直接断。
 | 1000 | normal closure | —（客户端通常不带 reason） | **服务端当前不主动发 1000**；只会在客户端 `close(1000)` 的回声里出现 | 正常关闭，无需动作 |
 | 1001 | going away | — | **服务端当前不主动发 1001**（2026-10-02 起写失败路径改为裸断，见上文） | 走通用重连 |
 | 1011 | internal error | `snapshot build failed` | 首次快照构建失败（DB 故障等） | **可重试但应退避**（服务端侧问题，连续重试无意义 → 提示用户稍后再试） |
-| 1011 | internal error | `send snapshot failed` | **服务端当前不主动发此 reason**（2026-10-02 Nit-2 起「推初始快照写失败」也改为裸断，见上文） | 无需动作（不会出现） |
+| 1011 | internal error | `send snapshot failed` | **服务端当前不主动发此 reason**（2026-10-02 修复起「推初始快照写失败」也改为裸断，见上文） | 无需动作（不会出现） |
 | 1011 | internal error | `re-auth unavailable` | **2026-10-02 新增**：周期性 re-auth 失败但**不是**鉴权问题（典型：Redis 挂 / 连接池耗尽 → `50000`） | 走通用重连（**不要**清 token —— 重连后 re-auth 大概率就恢复了） |
 | 1011 | internal error | `pong timeout` | 超过 `ws_pong_timeout_seconds` 未收到任何入站帧（对端已死 / 半开连接） | 走通用重连（**必须**重连：旧连接不会再有数据） |
 | 1012 | service restart | `server restart` | 服务优雅退出（Ctrl-C / 发布重启） | **立即重连**（可能需退避，避免重启风暴期打满） |
@@ -178,7 +178,7 @@ flush 直接断。
   间隔独立配置（`WS_HEARTBEAT_INTERVAL_SECONDS` / `WS_PING_INTERVAL_SECONDS` /
   `WS_PONG_TIMEOUT_SECONDS`）。超时判定必须用「最后一次入站帧 + 固定时长」的**绝对 deadline**，
   不能用相对 `sleep`——`select!` 每轮迭代都重建 future，相对时长会被 30s 的 text 心跳不断重置。
-- `select!` 必须写 `biased;` 且入站分支排第一（2026-10-02 修复 Minor-1）：否则 pong deadline 与
+- `select!` 必须写 `biased;` 且入站分支排第一（2026-10-02 修复）：否则 pong deadline 与
   socket 可读**同时** ready 时随机选分支，有概率先命中超时分支、把健康连接判死。dashboard 入站
   流量只有客户端自动回的 Pong（1 个 / ping_interval，随收随走），饿不死其它分支。
 - 在线连接表：`WsHub::conns`（`conn_id` 维度，同一用户可多条）+ `conn_count()` /
@@ -237,9 +237,9 @@ flush 直接断。
 > `DashboardSnapshot` 与 `DashboardEvent` 两个变体；「心跳」走独立的 `WsHeartbeatMsg` text 帧 +
 > protocol-level `Ping`（见「握手流程」第 6 条），不再占用 `WsEvent` 变体。
 
-> **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式，参见 [`docs/architecture.md` §3.7](../architecture.md)）；payload 完整定义见 [`./parts/inspection.md#post-apiv2prodbatchesworker-scan`](./parts/inspection.md#post-apiv2prodbatchesworker-scan) 与 [`./production/worker-pool.md`](./production/worker-pool.md)。
+> **worker-pool 事件说明**：5 个 `WORKER_*` 事件均在 HTTP commit 之后广播（对齐 Python 延迟广播模式）；payload 完整定义见 [`./parts/inspection.md#post-apiv2prodbatchesworker-scan`](./parts/inspection.md#post-apiv2prodbatchesworker-scan) 与 [`./production/worker-pool.md`](./production/worker-pool.md)。
 >
-> **batch 事件说明（2026-09-29 新增）**：`BATCH_PLACED_ON_SHELF` 同样在 HTTP commit 之后广播（沿 worker_pool 范本）；payload 含 4 个字段（batch_id / target_process_id / shelf_id / version）。单条 dispatch 端点发单条形态（payload 顶层字段）；bulk-dispatch / auto-dispatch 端点发批量形态（payload.batches 数组，仅含 succeeded 部分，skipped 不广播）。详见 [`./production/batches.md#ws-事件`](./production/batches.md#ws-事件)。
+> **batch 事件说明（2026-09-29 新增）**：`BATCH_PLACED_ON_SHELF` 同样在 HTTP commit 之后广播（沿 worker_pool 范本）；payload 含 4 个字段（batch_id / target_process_id / shelf_id / version）。单条 dispatch 端点发单条形态（payload 顶层字段）；bulk-dispatch / auto-dispatch 端点发批量形态（payload.batches 数组，仅含 succeeded 部分，skipped 不广播）。详见 [`./production/batches.md` 事务 + WS 广播](./production/batches.md#事务--ws-广播沿-worker_pool-范本)。
 >
 > i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
 

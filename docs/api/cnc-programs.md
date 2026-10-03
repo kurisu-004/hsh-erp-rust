@@ -1,7 +1,7 @@
 # cnc_program 域 API
 
 > 本文件须与 `src/modules/cnc_program/{handler.rs,dto.rs,service.rs}` 保持同步
-> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
+> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 域覆盖：CNC 程序配对上传 + 列表。2026-09-14 Phase 3 落地。
 > 存储复用 part_file（kind='G_CODE' + kind='SETUP_SHEET'，`paired_file_id` 互指）。

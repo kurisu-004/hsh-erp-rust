@@ -19,11 +19,11 @@
 | POST | `/api/v2/assemblies/{assembly_id}/update` | Manager / Clerk | 字段可选 UPDATE（含 `customer_id` 三态校验 + L2 校验，OCC；Phase 3：`applicant_name`/`order_no`/`note` 三态 NULL-clear） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idupdate) |
 | POST | `/api/v2/assemblies/{assembly_id}/soft-delete` | **Manager** | 软删（OCC；Phase 3：HAS_SHIPMENT 预检 → 20307） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idsoft-delete) |
 | POST | `/api/v2/assemblies/{assembly_id}/cancel` | Manager / Clerk | 取消（终态 COMPLETED/CANCELLED 禁 cancel；非终态一律可 cancel） | [`cancel.md`](./cancel.md#post-apiv2assembliesassembly_idcancel) |
-| POST | `/api/v2/assemblies/{assembly_id}/start` | Manager / Clerk | **Phase 3（deferred #4）**：PENDING → IN_PROCESS 状态机守卫 | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idstart) |
-| POST | `/api/v2/assemblies/{assembly_id}/files` | Manager / Clerk | **Phase 3（deferred #1）**：multipart PDF 上传到 COS（kind=ASSEMBLY_MASTER） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idfiles) |
-| GET | `/api/v2/assemblies/{assembly_id}/files` | Manager / Clerk / Inspector / CncProgrammer | **2026-09-25（D-09 api-drift-fix）**：列出装配体已上传 PDF（kind=ASSEMBLY_MASTER） | [`crud.md`](./crud.md#get-apiv2assembliesassembly_idfiles) |
-| POST | `/api/v2/assemblies/{assembly_id}/children` | Manager / Clerk | **2026-09-25（D-07 api-drift-fix）**：在已存在装配体下追加单个 part 子件（事务：INSERT t_part + INSERT 初始 t_part_batch） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idchildren) |
-| GET | `/api/v2/parts/{part_id}/assembly` | Manager / Clerk / Inspector / CncProgrammer | **2026-09-25（D-08 api-drift-fix）**：按 part 反查其所属装配体（None 表示无父装配体） | [`crud.md`](./crud.md#get-apiv2partspart_idassembly) |
+| POST | `/api/v2/assemblies/{assembly_id}/start` | Manager / Clerk | **Phase 3（deferred #4）**：PENDING → IN_PROCESS 状态机守卫 | [`crud.md`](./crud.md) |
+| POST | `/api/v2/assemblies/{assembly_id}/files` | Manager / Clerk | **Phase 3（deferred #1）**：multipart PDF 上传到 COS（kind=ASSEMBLY_MASTER） | [`crud.md`](./crud.md#get-apiv2assembliesassembly_idfiles) |
+| GET | `/api/v2/assemblies/{assembly_id}/files` | Manager / Clerk / Inspector / CncProgrammer | **2026-09-25 新增**：列出装配体已上传 PDF（kind=ASSEMBLY_MASTER） | [`crud.md`](./crud.md#get-apiv2assembliesassembly_idfiles) |
+| POST | `/api/v2/assemblies/{assembly_id}/children` | Manager / Clerk | **2026-09-25 新增**：在已存在装配体下追加单个 part 子件（事务：INSERT t_part + INSERT 初始 t_part_batch） | [`crud.md`](./crud.md#post-apiv2assembliesassembly_idchildren) |
+| GET | `/api/v2/parts/{part_id}/assembly` | Manager / Clerk / Inspector / CncProgrammer | **2026-09-25 新增**：按 part 反查其所属装配体（None 表示无父装配体） | [`crud.md`](./crud.md#get-apiv2partspart_idassembly) |
 
 > 路由顺序：`/{assembly_id}` 必须在 `/{assembly_id}/{action}` 之前注册；当前 `/{assembly_id}` 仅 `GET`，无静态冲突。
 
@@ -46,10 +46,10 @@
 | `planned_delivery_date` | date | 计划交付日 |
 | `is_urgent` | bool | 紧急标记 |
 
-> 2026-09-16 PR-2（migration 027）：`AssemblyOut` 删 `actual_delivery_date` 字段
+> 2026-09-16（migration 027）：`AssemblyOut` 删 `actual_delivery_date` 字段
 > —— `t_assembly.actual_delivery_date` 列已删；装配体实际交付由子件批次交付事件体现。
 >
-> 2026-09-17 PR-4 与 DDL 对齐：`request_date` / `planned_delivery_date` 在 DDL（migration 005:20-21）
+> 2026-09-17 与 DDL 对齐：`request_date` / `planned_delivery_date` 在 DDL（migration 005:20-21）
 > 是 NOT NULL，DTO 去 `Option<>` 包裹；`TAssembly` model 同步去 `Option<NaiveDate>`。
 | `status` | string | 状态枚举字符串（PENDING / IN_PROCESS / INSPECTION / READY_TO_SHIP / DELIVERED / COMPLETED / CANCELLED，2026-09 扩 7 态对齐 Python） |
 | `version` | i32 | 乐观锁 |
@@ -178,7 +178,7 @@
 
 `PENDING` / `IN_PROCESS` / `INSPECTION` / `READY_TO_SHIP` / `DELIVERED` /
 `COMPLETED` / `CANCELLED`（2026-09 由 4 态扩展为 7 态，对齐 Python
-`AssemblyStatus`；2026-09-02 `eaec9d4`）。
+`AssemblyStatus`；2026-09-02 订正）。
 
 > ⚠️ **DB 注释是历史快照，不是权威**：`migrations/20260925000000_001_baseline.sql`
 > 里 `t_assembly.status` 的 `COMMENT` 仍写「PENDING（默认）/ IN_PROCESS /
@@ -199,11 +199,10 @@
 父装配件 `t_assembly.status` 是**派生缓存**（真源是 `t_part_batch.status`），
 由 part 侧的 status_gate 在同一事务内自动同步，**前端无需主动调用**。
 
-**触发点（PR-B3 后扩展）**：
+**触发点**：
 
 - Phase 0（仅 inspection 流，**2026-10-02 起归 prod 域**）：`POST /prod/batches/{batch_id}/{to-inspection,to-ship,to-process}` + `POST /prod/batches/to-inspection` + `POST /prod/batches/to-ship` + `POST /prod/batches/worker-scan`（仅 `INSPECTED` 分支）
 - **Phase 1（2026-09-11 起）**：batch lifecycle 端点（`POST /prod/batches/{batch_id}/{deliver, complete, start-repair}` + 仍留 part 域的 `POST /parts/{id}/cancel`）也通过同一个 `status_gate` 派生触发同一 rollup——同一 part 的批次状态变化都会级联到父装配件
-- 详见 [`docs/refactor-part-assembly-batch.md`](../../refactor-part-assembly-batch.md#42-rollup-回调核心-新增-partservicesync_from_batch_change)
 
 算法与 Python `service/_assembly_rollup.py::recompute_assembly_status` 对齐，按以下顺序：
 

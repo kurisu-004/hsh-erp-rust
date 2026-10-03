@@ -1,7 +1,7 @@
 # part_file 域 API
 
 > 本文件须与 `src/modules/part_file/{handler.rs,dto.rs,service.rs}` 保持同步
-> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
+> 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 域覆盖：零件文件 CRUD（multipart 单文件上传 + 列表 + 详情 + COS 预签下载 URL）。
 > 2026-09-14 Phase 3 落地。

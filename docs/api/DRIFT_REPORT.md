@@ -1,7 +1,7 @@
-# docs/api/ Drift 扫描报告（PR11，2026-09-23）
+# docs/api/ Drift 扫描报告（2026-09-23）
 
 > 主代理在主 checkout 直接编写并提交（本报告不需 worktree，按用户授权）。
-> 扫描基准：master HEAD = `7f0641f`（含 PR1-8 + 期间 merged 的 jti/refresh rotation/idempotency 等）
+> 扫描基准：master HEAD = `7f0641f`（含 jti/refresh rotation/idempotency 等）
 > 扫描方法：grep 提取实际 `.route()` 调用 vs `docs/api/` 各 .md 文件的 `### ` 端点章节，逐域对比
 >
 > **2026-10-03 订正（只动 part 一行的计数）**：本报告是 2026-09-23 的**历史
@@ -35,15 +35,15 @@
 | customers | 5 | 5 | 🟢 全覆盖 |
 | applicants | 5 | 5 | 🟢 全覆盖 |
 | prod/5 子域 | 27 | 27 | 🟡 待 verify（process-chain 改名 / worker-pool 自动分配可能漏） |
-| statistics | 5 | 5 | 🟡 待 verify（PR3/8 后需确认） |
-| websocket | WS 1 端点 | 多业务事件 | 🟡 待 verify（PR3 analytics 后事件无变化） |
+| statistics | 5 | 5 | 🟡 待 verify（需确认） |
+| websocket | WS 1 端点 | 多业务事件 | 🟡 待 verify（analytics 抽离后事件无变化） |
 | _e2e | 14 | 14 | 🟢 全覆盖 |
 
 **主要 drift 集中点**：
 1. 🔴 **iam.md**：JWT 架构大改（HS256→RS256+kid、access TTL 12h→15min、refresh rotation + reuse detection、idempotency middleware、jti 重构）后未及时同步 docs
 2. 🔴 **parts/**：约 20 个端点缺失文档（worker-scan, scan-deliver-part, location-tree, repair-batches, etc.）
 3. 🟡 **prod/**：process-chain rename、worker-pool 自动分配 API 文档可能滞后
-4. 🟡 **statistics.md**：PR3 抽离 + PR8 trait 后端点未变，但错误码段需核
+4. 🟡 **statistics.md**：抽离 + trait 化后端点未变，但错误码段需核
 
 ---
 
@@ -122,9 +122,8 @@ POST /batch                                  ❌ docs 缺失（应在 batch）
 POST /batch-to-inspection                    ✓ docs/parts/inspection
 POST /batch-to-ship                         ✓ docs/parts/inspection
 POST /batch-with-pdfs                       ❌ docs 缺失（应在 batch）
-POST /scan/deliver-part                     ❌ docs 缺失（应在 inspection）
+POST /scan/deliver-part                     ✓ docs/parts/inspection（2026-10-03 订正：本行原写「docs 缺失」，实际已在 parts/inspection 文档化，现路径为 /api/v2/prod/batches/scan/deliver）
 POST /worker-scan                           ✓ docs/parts/inspection
-PUT  /{part_id}                             ⚠️ docs 未列出 PUT 形式（实际有 PUT）
 ```
 
 **drift 数**：约 20 个 endpoint 在 docs 缺失
@@ -138,8 +137,8 @@ PUT  /{part_id}                             ⚠️ docs 未列出 PUT 形式（�
 
 **docs/api/delivery-notes/{drafts,workflow,print,queries,index}.md**：
 - 已覆盖 18 个 endpoints（与代码 18 个路径一致）
-- ⚠️ 部分 DTO 字段名可能因 PR4 vo/ 抽离而变化（i64 serialize_i64 字符串化行为）
-- ⚠️ 部分错误码可能因 PR8 / PR9 改动而漂移
+- ⚠️ 部分 DTO 字段名可能因 vo/ 抽离而变化（i64 serialize_i64 字符串化行为）
+- ⚠️ 部分错误码可能因后续改动而漂移
 
 **drift 风险**：低
 
@@ -147,7 +146,7 @@ PUT  /{part_id}                             ⚠️ docs 未列出 PUT 形式（�
 
 **docs/api/production/{workers,work-types,processes,process-chain,work-type-process-mapping,worker-pool}.md**：
 - 27 endpoints 覆盖 5 子域（workers / work-types / processes / process-chains / worker-pool）
-- ⚠️ process-chain 文档可能需说明 PR6 中 statemachine → helpers 的内部重构（**无 API 变化**，仅文档说明性补充）
+- ⚠️ process-chain 文档可能需说明 statemachine → helpers 的内部重构（**无 API 变化**，仅文档说明性补充）
 - ⚠️ worker-pool 自动分配（auto-allocate）错误码段需对照代码现状
 
 **drift 风险**：低-中
@@ -156,18 +155,18 @@ PUT  /{part_id}                             ⚠️ docs 未列出 PUT 形式（�
 
 **docs/api/statistics.md**：
 - 5 endpoints 覆盖（overview / workers / worker_detail / pickup-skips / pickup_skip_detail）
-- ⚠️ PR3 抽离共享聚合函数到 `src/shared/analytics/` 后，**对外 API 无变化**，docs 不需改
-- ⚠️ PR8 statistics 加 trait + 读端点 acquire — **对外 API 无变化**，docs 不需改
-- ⚠️ 错误码段可能需要 review（PR8 后）
+- ⚠️ 抽离共享聚合函数到 `src/shared/analytics/` 后，**对外 API 无变化**，docs 不需改
+- ⚠️ statistics 加 trait + 读端点 acquire — **对外 API 无变化**，docs 不需改
+- ⚠️ 错误码段可能需要复核
 
 **drift 风险**：低
 
 ### 2.6 其他域（小优先级）
 
-- `customers.md` / `applicants.md`：PR4 vo/ 后字段可能漂移（i64 serialize_i64 字符串化）
-- `shelves.md` / `outsource-*.md` / `cnc-programs.md` / `files.md`：PR4 vo/ 抽离后字段名序列化输出未变（仅内部结构调整），docs 不需改
+- `customers.md` / `applicants.md`：vo/ 抽离后字段可能漂移（i64 serialize_i64 字符串化）
+- `shelves.md` / `outsource-*.md` / `cnc-programs.md` / `files.md`：vo/ 抽离后字段名序列化输出未变（仅内部结构调整），docs 不需改
 - 相关会话域 docs（2026-09-28 备注）：域整体下线，文档整文件删除；本条仅作历史记录
-- `websocket.md`：dashboard WS 消息，PR3 analytics 抽离未影响事件定义
+- `websocket.md`：dashboard WS 消息，analytics 抽离未影响事件定义
 
 **drift 风险**：极低
 
@@ -175,7 +174,7 @@ PUT  /{part_id}                             ⚠️ docs 未列出 PUT 形式（�
 
 **docs/api/inconsistencies.md**：
 - 历史不一致记录，非 API 文档
-- 可能需加一条新条目："2026-09-23 PR11 drift 扫描后尚未修复的 drift 列表见 DRIFT_REPORT.md"
+- 可能需加一条新条目："2026-09-23 drift 扫描后尚未修复的 drift 列表见 DRIFT_REPORT.md"
 
 ---
 
@@ -186,9 +185,9 @@ PUT  /{part_id}                             ⚠️ docs 未列出 PUT 形式（�
 | P0 | `docs/api/iam.md` | JWT RS256 + jti + refresh rotation + idempotency + access TTL 同步 | ~30 行 |
 | P0 | `docs/api/parts/{crud,lifecycle,inspection}.md` | 补 ~20 个缺失 endpoint 章节 | ~150 行 |
 | P1 | `docs/api/parts/` | 加 parts/batch.md（按 docs/api/delivery-notes/ 子目录模式） | ~80 行 |
-| P2 | `docs/api/production/{process-chain,worker-pool}.md` | 补 PR6 / PR9 后的说明性段落 | ~20 行 |
+| P2 | `docs/api/production/{process-chain,worker-pool}.md` | 补内部重构后的说明性段落 | ~20 行 |
 | P2 | `docs/api/statistics.md` | 错误码段 review | ~10 行 |
-| P3 | `docs/api/{customers,applicants,shelves}.md` | PR4 vo/ 字段名一致性核对 | ~10 行 |
+| P3 | `docs/api/{customers,applicants,shelves}.md` | vo/ 字段名一致性核对 | ~10 行 |
 | P3 | `docs/api/inconsistencies.md` | 加新条目 | ~5 行 |
 
 **总预估**：~300 行 docs 修改
@@ -212,7 +211,7 @@ PUT  /{part_id}                             ⚠️ docs 未列出 PUT 形式（�
 由于用户授权"文档修复不需要单独 worktree，直接在主分支提交即可"，本报告输出后立即：
 1. 在主 checkout（main checkout）按 P0 → P3 顺序直接修复
 2. 修复后 cargo nextest run 验证测试不破（虽然只改 docs，但保险起见）
-3. git commit -m "docs(api): 按 PR11 drift 报告同步 docs/api/"（中文 + 日期戳）
+3. git commit -m "docs(api): 按 drift 报告同步 docs/api/"（中文 + 日期戳）
 4. git push origin master 直接推 main（monorepo 内部约定，无 PR）
 5. 根仓 SHA bump（虽然只是 docs 改动，但 backend-rust HEAD 变了，仍需 bump）
 

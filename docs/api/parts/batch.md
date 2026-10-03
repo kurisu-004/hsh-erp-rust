@@ -13,8 +13,8 @@
 > `GET|POST /api/v2/parts/{part_id}/batches`（part 的批次集合读 / 在 part 下新开批次）——
 > 操作对象是 part，不是某个批次。
 >
-> **2026-09-23 PR12 新增文件**：本节 3 个端点原 docs/api/parts/ 未覆盖，
-> 本次按 PR11 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycleinspectionmd高优先级--大量端点缺失)）。
+> **2026-09-23 新增文件**：本节 3 个端点原 docs/api/parts/ 未覆盖，
+> 本次按 drift 报告补齐（[docs/api/DRIFT_REPORT.md §2.2](../DRIFT_REPORT.md#22-partscrud-lifecycle-inspectionmd高优先级--大量端点缺失)）。
 
 > **2026-09-30 Phase 2 dashboard 二次调整**：新增 `GET /api/v2/parts/{part_id}/batches`
 > 文档章节，`PartBatchListItemOut` 字段从 11 扩展到 18（详见后文）。
@@ -81,7 +81,7 @@ Response 200 `data`：`PartBatchListItemOut[]`，数组按 `batch_no ASC` 升序
 | `current_holder_id` | string | yes | 当前持有者 ID |
 | `current_holder_display` | string | yes | 当前持有者解析名（货架 code / 工人姓名 / 外协公司名） |
 | `current_process_step_id` | string | yes | 当前工艺链步骤 ID |
-| `next_process_id` | string | yes | 下一工艺链步骤的 process_id（DTO 兼容保留，2026-09-16 PR-3 之后与 `current_process_step_id` 同源） |
+| `next_process_id` | string | yes | 下一工艺链步骤的 process_id（DTO 兼容保留，2026-09-16 批次 step 化后与 `current_process_step_id` 同源） |
 | `next_process_name` | string | yes | 下一工序名称 |
 | `delivery_note_id` | string | yes | 关联送货单 ID |
 | `delivery_note_no` | string | yes | 关联送货单号 |
@@ -93,7 +93,7 @@ Response 200 `data`：`PartBatchListItemOut[]`，数组按 `batch_no ASC` 升序
 > **2026-09-30 Phase 2 更新**：相比此前 11 字段版本，新增 `part_id` / `batch_label` / `current_holder_display`（重命名自 `holder_name`） / `current_process_step_id` / `next_process_name` / `delivery_note_no` / `created_at` / `updated_at`。前端 dashboard PartPreviewDialog Zod schema 已对齐 18 字段。
 >
 > **2026-10-02 订正**：上段是 **2026-09-30 的历史记录**（当时 11 → 18 属实，不改）。
-> 2026-10-01 review 第 1 轮 M5 之后本 VO 实际为 **19 字段** —— 新增
+> 2026-10-01 起本 VO 实际为 **19 字段** —— 新增
 > `is_repairing`（**BREAKING**，直读 `t_part_batch.is_repairing` 标记列，非
 > `Option` ⇒ 恒定返回）。`REPAIRING` 已从 `PartStatus` 降级为标记列，起修时
 > `status` 保持 `IN_PROCESS`；且标记与 `status` 正交（起修后送检可得

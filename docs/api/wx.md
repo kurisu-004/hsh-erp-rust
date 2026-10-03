@@ -63,7 +63,7 @@
 |---|---|---|
 | `token` | string | JWT access token |
 | `refresh_token` | string | JWT refresh token |
-| `user` | object | 与 [`GET /iam/me`](../iam.md#get-apiv2iamme) 同结构 |
+| `user` | object | 与 [`GET /iam/me`](./iam.md#get-apiv2iamme) 同结构 |
 
 ### 错误码
 

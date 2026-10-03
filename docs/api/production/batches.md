@@ -59,12 +59,12 @@
 | POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource` | Manager / Clerk / Inspector | 外协回收入库（支持部分接收） | [外协流转](#外协流转send--receive)（本节） |
 | POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | Manager / Clerk / Inspector | 外协回收 → 品检（整批） | [外协流转](#外协流转send--receive)（本节） |
 | POST | `/api/v2/prod/batches/{batch_id}/complete-repair` | Manager / Clerk / Inspector | 完成维修 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idcomplete-repair) |
-| POST | `/api/v2/prod/batches/{batch_id}/repair-dispatch` | Manager / Clerk | 派发维修 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idrepair-dispatch) |
+| POST | `/api/v2/prod/batches/{batch_id}/repair-dispatch` | Manager / Clerk / Inspector | 派发维修 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idrepair-dispatch) |
 | POST | `/api/v2/prod/batches/{batch_id}/scan-inspect` | Manager / Inspector | 扫码品检 | [`../parts/inspection.md` 状态机表](../parts/inspection.md#状态机can_transition_to-白名单)（尚无独立章节） |
 | POST | `/api/v2/prod/batches/{batch_id}/split` | Manager / Clerk | 拆分批次 | [`../parts/batch.md`](../parts/batch.md#post-apiv2prodbatchesbatch_idsplit) |
 | POST | `/api/v2/prod/batches/{batch_id}/cancel` | Manager / Clerk | 取消**单个**批次 | [`../parts/index.md`](../parts/index.md)（尚无独立章节） |
 | POST | `/api/v2/prod/batches/{batch_id}/pick-up` | Manager / Clerk / ShelfAccount | 手动 pick-up 兜底（**支持部分领取**：传 `quantity` 小于批量时自动拆批） | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idpick-up) |
-| POST | `/api/v2/prod/batches/scan/deliver` | Manager / Clerk | 扫码发货（**无 Path**，`ScanDeliverPartRequest` body 不变） | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesscandeliver) |
+| POST | `/api/v2/prod/batches/scan/deliver` | Manager / ShelfAccount | 扫码发货（**无 Path**，`ScanDeliverPartRequest` body 不变） | [`../parts/inspection.md`](../parts/inspection.md#post-apiv2prodbatchesscandeliver) |
 
 ### 静态批量 / 事件（3 条，无 Path，请求体逐字不变）
 
@@ -400,7 +400,7 @@ Request：`DispatchRequest`
 5. 写 `t_part_event(kind='PLACED_ON_SHELF', from='PENDING', to='IN_PROCESS')`
 6. 返回 `DispatchSuccessItem { batch_id, current_process_step_id=None, current_process_id=Some(target_process_id), target_process_id, shelf_id, version=batch.version+1 }`
 
-Response 200 `data`：[`DispatchResult`](#dispatchresult-字段)
+Response 200 `data`：[`DispatchResult`](#dispatchresult-字段2026-09-30-重构bulk-only-形态)
 
 错误码（任一硬失败顶层响应）：
 
@@ -442,7 +442,7 @@ Request：`AutoDispatchRequest`
 
 > **不写库、不发 WS**（只读查询，无业务流转）。
 
-Response 200 `data`：[`AutoDispatchResult`](#autodispatchresult-字段)
+Response 200 `data`：[`AutoDispatchResult`](#autodispatchresult-字段2026-09-30-重构只读-preview)
 
 错误码：
 
