@@ -157,6 +157,49 @@
 | `has_children` | bool | 2026-09-28 新增。是否有子件（Tree data lazy mode 必需）：PART 行 → `false`；ASSEMBLY 行 → `child_count.unwrap_or(0) > 0`。后端不强制走 `GET /assemblies/{id}` 预拉，前端按此字段切换展开/折叠交互即可。 |
 | `child_count` | string (i64)? | 2026-09-28 新增。子件计数（装配表行专用）；PART 行 → `null`。真相源：`t_part WHERE assembly_id = $1 AND deleted_at IS NULL` 的 COUNT（≤200 ids / 1 extra query）。 |
 | `has_cnc_program` | bool | 2026-09-29 新增（CNC 重构 5 任务之一）。是否已上传 G_CODE 数控程序。真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`。`GET /parts/pending-programming` 走专用 repo 填充真实值；其它 list 端点默认 `false`（service 不 enrich，避免 N+1）。详见 [`./lifecycle.md#get-apiv2partspending-programming`](./lifecycle.md#get-apiv2partspending-programming)。 |
+| `batch_id` | string (i64)? | 2026-10-03 新增。**活跃批次雪花 id**（`serialize_i64_opt` → JSON string；无值时序列化为 `null`）。**仅 `GET /parts/pickable-by-work-type/{work_type_id}` 填** —— 该端点的行本来就是「批次行」（取行 SQL 从 `t_part_batch b` 起），扫码台「领料」按本字段定位批次后发写请求。**其余复用 `PartListItem` 的路径恒为 `null`**（`GET /parts` / `GET /api/v2/com/union-list` / `GET /parts/pending-programming` 等）：那些行的语义单位是 part，一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故宁可不填。 |
+| `batch_version` | i32? | 2026-10-03 新增。`batch_id` 那个批次的乐观锁版本号（`t_part_batch.version`），前端发写请求时作 OCC 版本回传。填充口径与 `batch_id` 完全一致（同为「仅 pickable-by-work-type 填，其余路径 `null`」），二者同生共死。⚠️ **批次 OCC 只认本字段，不要拿 `version` 当批次版本用**（见下条）。 |
+
+> ⚠️ `PartListItem.version` 是 **part 级**（`t_part.version`）乐观锁，与批次 OCC 无关。
+> `GET /parts/pickable-by-work-type/{work_type_id}` 的取行 SQL **不投影 `p.version`**
+> （只投影 `p.id` / `p.serial_no` / `p.drawing_no`），故该端点返回的 `version` 恒为 `0`
+> （有意占位，不是漏取值）；该端点的批次乐观锁版本一律走 `batch_version`。
+
+#### 前端配套改动清单（2026-10-03 新增 `batch_id` / `batch_version`）
+
+返回 `R<PartListOut>` 的端点共 **8 个**，故这两个新字段会出现在**每一个**复用路径的
+响应里（除 `pickable-by-work-type` 外均为 `null`）。逐端点影响与前端动作：
+
+| 端点 | `batch_id` / `batch_version` | 构造路径（决定为何 null） | 前端是否要改 |
+|---|---|---|---|
+| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | `part/service/phase1/work_type.rs:222-223` 在 `From<TPart>` 之后**显式覆写**（全仓唯一填 `Some` 的路径） | 需要：TS `PartItem` 补 2 个可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
+| `GET /parts` | 恒 `null` | `part/service/crud.rs:290` `p.into()`（`From<TPart>`） | **不需要** |
+| `GET /parts/pending-programming` | 恒 `null` | `part/service/phase1/lifecycle_helpers.rs:71-73` 结构体更新 `..PartListItem::from(..)` | **不需要** |
+| `GET /parts/outsource-in-flight` | 恒 `null` | `part/service/phase1/outsource.rs:82` `.map(PartListItem::from)` | **不需要** |
+| `GET /parts/outsource-sendable` | 恒 `null` | `part/service/phase1/outsource.rs:150` `.map(PartListItem::from)` | **不需要** |
+| `GET /parts/by-work-type/{work_type_id}` | 恒 `null` | `part/service/phase1/work_type.rs:99` `PartListItem::from(手工 TPart)` | **不需要** |
+| `GET /parts/by-worker/{worker_id}` | 恒 `null` | `part/service/phase1/work_type.rs:321` `PartListItem::from(手工 TPart)` | **不需要** |
+| `GET /api/v2/com/union-list` | 恒 `null` | `com/union_list/service/crud.rs:731` / `:781` 结构体字面量（穷尽式，显式写 `None`） | **不需要** |
+
+> 2026-10-03（review 第 2 轮 Minor-A）订正：本文档初版写「被 3 个端点复用」而表里列了
+> 4 行，自相矛盾，且**漏了 4 个复用端点**（`by-work-type` / `by-worker` /
+> `outsource-in-flight` / `outsource-sendable`）。上表的 8 行是按「所有返回
+> `R<PartListOut>` 的 handler」逐一枚举得出的，每行都标了构造点以便复核。
+> 讽刺的是漏掉的 `by-work-type` / `by-worker` 恰是本分支同期修掉 `serial_no` 空值
+> 500 的两个端点（`serial_no` 才是它们的主字段）—— 漏掉它们的代价比抽象的计数错误更大。
+
+**前端无需改 Zod schema**，依据两条（均已核实）：
+
+1. 两个新字段是 `#[serde(serialize_with = "serialize_i64_opt")]` + 无
+   `skip_serializing_if`，即**恒出现**（无值时为 `null`）—— 属增量 key；
+2. part 列表行 schema 刻意**不用** `.strict()`（前端 `src/composables/queries/schemas.ts`
+   该处注释明写「行级 `.strict()` 会在后端加**任何一个**新字段时把整表打挂」），
+   Zod 默认 strip 模式会安静吞掉未声明的 key。
+   另：`listPartsByWorkTypeAllShelves` 走裸 `api.get<PartItem[]>` 泛型、根本不过 Zod。
+
+> ⚠️ 与 `GET /api/v2/prod/programming/pending` 的 `ProgrammingItemOut` 同名字段**语义不同**：
+> 那两个走**另一个 VO**，填的是「`status='PROGRAMMING'` 活跃批次」（`id` 最大者），
+> 对齐 `release-from-programming` 的写出口。两处不要互相复用类型。
 
 > 2026-09-16 PR-2（migration 027）：`t_part` 删 `actual_delivery_date` /
 > `location` / `current_holder_id` / `placed_at` / `delivery_note_id` /

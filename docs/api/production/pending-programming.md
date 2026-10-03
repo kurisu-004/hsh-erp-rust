@@ -160,12 +160,12 @@ LIMIT $limit OFFSET $offset
 
 ## 字段定义
 
-### `ProgrammingItemOut` 字段（13 个）
+### `ProgrammingItemOut` 字段（15 个）
 
 ```jsonc
 {
-  "id": "1001",                     // string(i64) 雪花
-  "version": 0,                     // i32，乐观锁
+  "id": "1001",                     // string(i64) 雪花（part 级）
+  "version": 0,                     // i32，**part 级**乐观锁（t_part.version）
   "serial_no": "B01",               // Option<String>，手工工单可空
   "name": "fala-A",                 // String
   "drawing_no": "DWG-001",          // String
@@ -176,12 +176,30 @@ LIMIT $limit OFFSET $offset
   "system_delivery_date": null,     // Option<NaiveDate>
   "customer_name": "ACME L2",       // Option<String>，L2 叶子客户
   "parent_customer_name": "ACME Group", // Option<String>，L1 一级集团
-  "has_cnc_program": false          // bool，是否已上传 G_CODE
+  "has_cnc_program": false,         // bool，是否已上传 G_CODE
+  "batch_id": "2002",               // string(i64)?，PROGRAMMING 活跃批次雪花 id
+  "batch_version": 0                // i32?，该批次的 t_part_batch.version（批次 OCC）
 }
 ```
 
 > 字段集**刻意收窄**：不加 `match_reason` 之类诊断字段 —— 命中原因由规则语义表达，
 > 前端不需要逐行归因。
+>
+> 2026-10-03 由 13 扩到 15：加 `batch_id` / `batch_version`。原因是本端点的唯一写出口
+> `POST /api/v2/prod/batches/{batch_id}/release-from-programming` **以批次为锚**
+> （批次 id 走 URL path；入参 `PlaceOnShelfRequest.version` 又对
+> `t_part_batch.version` 做 OCC 校验），而列表行原来只给 part 级 id + part 级
+> `version`，前端拼不出这个请求。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string (i64)? | 2026-10-03 新增。**该 part 的 PROGRAMMING 活跃批次 id**（`serialize_i64_opt` → JSON string）。取值口径：`t_part_batch WHERE part_id = p.id AND status = 'PROGRAMMING' AND deleted_at IS NULL` 中 **`id` 最大者**（雪花 ID 随时间单调递增 = 最新那个）。<br>**只认 PROGRAMMING**：唯一写出口 `release_from_programming` 硬要求源状态是 PROGRAMMING（`from != PROGRAMMING` → 20103），给 PENDING / IN_PROCESS / READY_TO_SHIP 批次的 id 等于给前端一个必然失败的锚点。列表的过滤规则覆盖 `status IN ('PENDING','IN_PROCESS','PROGRAMMING')`，故**非 PROGRAMMING 的行 `batch_id` 恒为 `null`**，前端据此禁用「下发」按钮。 |
+| `batch_version` | i32? | 2026-10-03 新增。`batch_id` 那个批次的 `t_part_batch.version`，作 `release-from-programming` 的 OCC 版本回传。与 `batch_id` 同生共死（`batch_id = null` 时本字段也必为 `null`）。⚠️ `version` 是 **part 级**（`t_part.version`），批次 OCC 只认本字段。 |
+
+> 过滤规则与批次锚点口径是**两件独立的事**：三规则（链含 CNC / 批次在 CNC 工序 /
+> part 状态 PROGRAMMING）决定「这行出不出现」，`batch_id` 口径决定「这行能不能下发」。
+> 命中三规则的行未必有 PROGRAMMING 批次（如仅有 `PENDING` 批次的行），此时
+> `batch_id` 为 `null` 属正常语义，不是 bug。
 
 ### `ProgrammingListOut` 字段
 
