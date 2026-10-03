@@ -10,8 +10,9 @@
 //! 5. 非法 `row_type=BAD` —— 40001 VALIDATION_ERROR。
 //! 6. `row_type=ALL` deep offset 分页回归 —— pushdown 修分页 bug（plan §3）。
 //! 7. 2026-10-03 新增：`delivered_quantity`（已送数量 / 已送套数）—— PART 行
-//!    只累加 DELIVERED / COMPLETED 且非软删的批次；ASSEMBLY 行取
-//!    `MIN(子件已送 × 套数 / 子件总量)`（总量 0 不参与 / 无子件为 0）。
+//!    只累加 DELIVERED / COMPLETED 且非软删的批次（含 `0 < 已交 < 总量` 的
+//!    部分已交形态）；ASSEMBLY 行取 `MIN(子件已送 × 套数 / 子件总量)` 并对工单
+//!    总套数 `LEAST` 收口（总量 0 不参与 / 无子件为 0 / 子件超交收口 / 大数不溢出）。
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -73,6 +74,22 @@ async fn insert_part(
     serial_no: Option<&str>,
     status: &str,
 ) -> i64 {
+    insert_part_with_quantity(pool, name, customer_id, serial_no, status, 1).await
+}
+
+/// 直插一个 `t_part` 行，显式指定工单总数量（2026-10-03 新增）。
+///
+/// 与 [`insert_part`] 的唯一差别是 `quantity` 列（前者恒为 1）；`insert_part` 本身
+/// 转调本函数，故既有调用点不受影响。
+#[allow(clippy::too_many_arguments)]
+async fn insert_part_with_quantity(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    status: &str,
+    quantity: i32,
+) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let id = next_test_id();
     let now = now_naive();
@@ -81,7 +98,7 @@ async fn insert_part(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
          applicant_name, request_date, planned_delivery_date, quantity, version, \
          created_at, updated_at) \
-         VALUES ($1, $2, $3, 'D-001', $4, $7, $3, $5, $5, 1, 0, $6, $6)",
+         VALUES ($1, $2, $3, 'D-001', $4, $7, $3, $5, $5, $8, 0, $6, $6)",
     )
     .bind(id)
     .bind(serial_no)
@@ -90,9 +107,10 @@ async fn insert_part(
     .bind(today)
     .bind(now)
     .bind(status)
+    .bind(quantity)
     .execute(pool)
     .await
-    .expect("insert part");
+    .expect("insert part with quantity");
     id
 }
 
@@ -2526,6 +2544,114 @@ async fn delivered_quantity_assembly_row_is_zero_without_children() {
         "delivered_quantity 键必须恒在: {row}"
     );
     assert_eq!(row["delivered_quantity"], 0, "无子件 → 0 套: {row}");
+}
+
+/// PART 行：需求的真实形态 `0 < 已交 < 总量`（部分已交）。
+///
+/// 工单 20 件、已交 7 件、其余 13 件在制 → `delivered_quantity == 7`（不是 0，
+/// 也不是 20）。既有用例的 fixture 都在超交（`insert_part` 硬编码 quantity=1
+/// 而已送量 4~10），本例补上「总量 > 0」这一侧。
+#[tokio::test]
+async fn delivered_quantity_part_row_reflects_partial_delivery_below_total() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let p = insert_part_with_quantity(
+        &pool,
+        "PD7",
+        fx.customer_l2_id,
+        Some("PD7"),
+        "IN_PROCESS",
+        20,
+    )
+    .await;
+    add_batch(&pool, p, 1, 7, "DELIVERED", None).await;
+    add_batch(&pool, p, 2, 13, "IN_PROCESS", None).await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=PART&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list PART: {env}");
+    let row = find_row(&env, p);
+    assert_eq!(row["quantity"], 20, "工单总数量应回显: {row}");
+    assert_eq!(
+        row["delivered_quantity"], 7,
+        "部分已交：7 < 20，取已交件数而非总件数的任何比例: {row}"
+    );
+}
+
+/// ASSEMBLY 行：子件超交时收口到工单总套数（不可能交付超过总套数的套数）。
+///
+/// 装配件 10 套；子件 A 总量 20 已交 100（超交）→ 未收口时 `100 × 10 / 20 = 50` 套，
+/// UI 会显示「50 / 10 套」；收口后应给 10。
+#[tokio::test]
+async fn delivered_quantity_assembly_row_clamps_on_over_delivery() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let asm = add_assembly_with_quantity(&pool, "D-OVR", "A-OVR", fx.customer_l2_id, 10).await;
+    let child_a = add_child_part_with_quantity(&pool, "CA", fx.customer_l2_id, asm, 20).await;
+    add_batch(&pool, child_a, 1, 100, "DELIVERED", None).await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=ASSEMBLY&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "union-list ASSEMBLY: {env}");
+    let row = find_row(&env, asm);
+    assert_eq!(row["quantity"], 10, "装配件总套数应回显: {row}");
+    assert_eq!(
+        row["delivered_quantity"], 10,
+        "子件超交：100*10/20 = 50 套必须收口到总套数 10: {row}"
+    );
+}
+
+/// ASSEMBLY 行：int8 乘积不因 `::int` 收窄溢出（否则整个列表页 500）。
+///
+/// 装配件 1_000_000 套；子件 A 总量 1 已交 1_000_000 → `1e6 × 1e6 = 1e12` 超 int4。
+/// 未收口时 PG 抛 `integer out of range`；收口到 `a.quantity` 后给 1_000_000。
+#[tokio::test]
+async fn delivered_quantity_assembly_row_survives_large_quantities() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let asm =
+        add_assembly_with_quantity(&pool, "D-BIG", "A-BIG", fx.customer_l2_id, 1_000_000).await;
+    let child_a = add_child_part_with_quantity(&pool, "CA", fx.customer_l2_id, asm, 1).await;
+    add_batch(&pool, child_a, 1, 1_000_000, "DELIVERED", None).await;
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=ASSEMBLY&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "int8 乘积不得触发 500: {env}");
+    let row = find_row(&env, asm);
+    assert_eq!(
+        row["delivered_quantity"], 1_000_000,
+        "1e6 × 1e6 = 1e12 收窄前先钳到总套数 1e6: {row}"
+    );
 }
 
 /// `GET /api/v2/parts` 与 `GET /com/union-list` 的已送数量一致（同一 fixture、同一 part）。
