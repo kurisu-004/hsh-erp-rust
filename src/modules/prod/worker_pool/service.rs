@@ -263,15 +263,18 @@ impl WorkerPoolService {
             .await?;
         let capacity_remaining = (max_held as i64 - current_held).max(0) as i32;
 
-        let process_ids = if let Some(wt_id) = worker.work_type_id {
-            (&mut *conn).work_type_list_process_ids(wt_id).await?
-        } else {
-            vec![]
-        };
-
-        // 2026-10-04：shelf_id 缺省 → 不查候选池计数，pool_count_by_process 留空数组
-        let mut pool_count_by_process = Vec::with_capacity(process_ids.len());
+        // 2026-10-04：shelf_id 缺省 → 不查候选池计数，pool_count_by_process 留空数组。
+        // 工种→工序映射（work_type_list_process_ids）只被下面的计数循环消费，
+        // 故一并收进 Some 分支：缺省时它是无产出的一次 DB 往返，而 state 端点按
+        // worker 逐个轮询，留着会被放大成 N 倍白跑。
+        let mut pool_count_by_process = Vec::new();
         if let Some(sid) = shelf_id {
+            let process_ids = if let Some(wt_id) = worker.work_type_id {
+                (&mut *conn).work_type_list_process_ids(wt_id).await?
+            } else {
+                vec![]
+            };
+            pool_count_by_process.reserve(process_ids.len());
             for pid in &process_ids {
                 let n = (&mut *conn)
                     .count_pool_by_shelf_and_process(sid, *pid)
