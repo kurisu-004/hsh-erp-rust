@@ -23,8 +23,18 @@
 
 | Method | Path | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/api/v2/outsource-shipments/in-flight` | Manager / Clerk | 在途批次一览（`status='OUTSOURCING'` 的 shipment ⋈ 批次 ⋈ 工单） |
+| GET | `/api/v2/outsource-shipments/in-flight` | Manager / Clerk / Inspector | 在途批次一览（`status='OUTSOURCING'` 的 shipment ⋈ 批次 ⋈ 工单） |
 | POST | `/api/v2/outsource-shipments/{id}/reconcile-update` | Manager / Clerk | 对账页更新 shipment 行（OCC + 状态机守卫） |
+
+> **`in-flight` 的 Inspector 权限是读侧对齐写侧的结果**（2026-10-04）。外协三个写
+> 端点（`prod::batch::send_to_outsource` / `receive_from_outsource` /
+> `receive_from_outsource_to_inspection`）与菜单 `outsource_send_receive_list` 都已授予
+> INSPECTOR，而本端点此前只放 Manager + Clerk ⇒ Inspector 能把批次发去外协、能收
+> 回来，却看不到当前在外协的批次、点不到「接收」按钮。本端点纯只读且出参不含任何
+> 价格列（`OutsourceInFlightItem` 的 14 个字段里没有 `price` / `unit_price`），故一并
+> 放宽。`reconcile-update`（会改对账单价 / 数量 / 开票标记）与
+> `GET /outsource-companies/{id}/sent-parts`（对账页列，含 `unit_price`）**维持
+> Manager + Clerk**。
 
 > 路由注册：`in-flight` 是 1 段静态路径，与 2 段的 `/{id}/reconcile-update` 无
 > matchit 冲突（见 `src/modules/outsource/handler.rs::shipment_router`）。
@@ -155,8 +165,9 @@ shipment**：
 
 ### `GET /api/v2/outsource-shipments/in-flight`
 
-权限：**Manager / Clerk**（service 层 `require_any_role`，与被它取代的 part 域旧
-`/parts/outsource-in-flight` 一致）
+权限：**Manager / Clerk / Inspector**（service 层 `require_any_role`）。放宽缘由见
+「端点列表」下的说明：读侧对齐写侧已授予 INSPECTOR 的三个外协写端点，且本端点出参
+不含任何价格列。
 
 1. 只读端点：`pool.acquire()` 不开事务，无 WS 广播。
 2. 驱动 SQL 是 **INNER JOIN 主导**：`t_outsource_shipment` ⋈ `t_part_batch` ⋈
@@ -214,4 +225,12 @@ WS 广播：本域**无**独立事件（对账是后台核对动作，不驱动�
   才关 shipment、reconcile OCC 40901、**需审批工序不许 `direct=true` 直发**
   （20104 + 不建占位报价 / 不开 shipment）与同工序走 APPROVAL 仍放行 —— 后两条
   2026-10-03 review 第 1 轮补）
-- `tests/outsource/shipment.rs`（in-flight / sent-parts 读侧）
+- `tests/outsource/shipment.rs`（in-flight / sent-parts 读侧）：
+  - `in_flight_allows_inspector_while_reconcile_update_still_forbids` — INSPECTOR
+    读 in-flight 得 200（曾 403），且行内不含 `price` / `unit_price`；同一用例里
+    对照断言 `reconcile-update` 对 INSPECTOR 仍 403 / `code=40300`（防守卫被整段删掉）
+  - `in_flight_only_returns_outsourcing_and_takes_batch_version_and_quantity` —
+    只返 OUTSOURCING；`version` 取 `t_part_batch.version` 而非 shipment.version，
+    `quantity` 取 `t_part_batch.quantity` 而非 shipment.quantity
+  - `in_flight_keyword_filter` / `sent_parts_*`（含窗口、排序白名单、零命中兜底、分页）
+

@@ -324,23 +324,28 @@ AND deleted_at IS NULL`，归属锚是批次自身的
 启用，**不能反过来拿字段敏感度当首选口径** —— `{process_id}` 吐的
 `items[*].price` 同样含报价单价、同样含 Inspector，按敏感度排会自相矛盾。
 
+> 对齐不是无条件照抄：**等价端点自己放宽后，要重新比一次字段敏感度**。`state` 行
+> 就是这么从「对齐 `/in-flight`」变成「不放宽」的 —— `/in-flight` 于 2026-10-04 纳入
+> Inspector 后，比它多吐 `unit_price` + 申请人姓名的 `/state` 不能再跟着走。
+
 | 端点 | 权限 | 依据 |
 |---|---|---|
 | `GET /outsource-pool/counts` | **Manager + Clerk + Inspector** | 照抄 `GET /api/v2/prod/pool/counts`（`docs/api/production/worker-pool.md`「端点列表」行 + `service::pool_counts_all_shelves` 的 `require_any_role(&[Manager, Clerk, Inspector])`）—— admin 视角但不止 Manager。外协候选与在途本来就是业务/跟单视角，Clerk 必须能看 |
 | `GET /outsource-pool/{process_id}` | **Manager + Clerk + Inspector** | 照抄 `GET /api/v2/prod/pool/{process_id}`（同文档；`service::pool_by_process` 内 `require_any_role`）。与 `counts` 同集合：两者是同一个看板的 tab 列表与 tab 内容，权限必须一致，否则会出现「徽标看得见、点进去 403」 |
-| `GET /outsource-pool/state` | **Manager + Clerk** | 对齐同域等价数据端点 `GET /outsource-shipments/in-flight`（`docs/api/outsource-shipments.md`，Manager / Clerk）。**不放宽到「已登录」**：本端点除批次元数据外还吐 `price`（`t_outsource_shipment.unit_price`）与 `customer_name` / `parent_customer_name` / `applicant_name`，敏感级别与 `/in-flight` 同档；而 `GET /api/v2/prod/pool/state` 之所以能做到「已登录即可读」，是因为它只吐内部批次元数据 —— **不能把 prod 侧的宽松口径照抄到外协域**，否则 SHELF scope 账号被 `counts` / `{process_id}` 双双 403，却能经 `/state` 枚举任意外协公司的在外协批次、单价与客户 |
+| `GET /outsource-pool/state` | **Manager + Clerk** | 曾对齐同域等价数据端点 `GET /outsource-shipments/in-flight`，该端点已于 2026-10-04 放宽到含 Inspector、在途面已不再是可照抄的对齐目标。**本端点仍不放宽到 Inspector**：它除批次元数据外还吐 `price`（`t_outsource_shipment.unit_price`）与 `customer_name` / `parent_customer_name` / `applicant_name`，敏感级别比不含任何价格列的 `/in-flight` 高一档；`GET /api/v2/prod/pool/state` 之所以能做到「已登录即可读」，是因为它只吐内部批次元数据 —— **不能把 prod 侧的宽松口径照抄到外协域**，否则 SHELF scope 账号被 `counts` / `{process_id}` 双双 403，却能经 `/state` 枚举任意外协公司的在外协批次、单价与客户 |
 
-> **`state` 行故意打破上面 `{process_id}` 那条「tab 列表与 tab 内容同权限」
-> 不变量**：Inspector 能看 tab（`counts` / `{process_id}`）但打不开公司列，
-> 是有意的敏感级取舍，不是漏配。理由见该行「依据」列。
+> **`state` 行是有意的敏感级取舍**：Inspector 能看 tab（`counts` / `{process_id}`）也能
+> 看在途面（`GET /outsource-shipments/in-flight`，2026-10-04 起含 Inspector），但打不开
+> 公司列。理由见该行「依据」列 —— `/state` 比 `/in-flight` 多吐 `unit_price` 与申请人
+> 姓名。
 >
-> 由此产生**「能写不能读」**：外协写侧 3 个端点（`send-to-outsource` /
-> `receive-from-outsource` / `receive-from-outsource-to-inspection`）都是
-> **Manager + Clerk + Inspector**，读侧在途面只有 **Manager + Clerk** ⇒
-> Inspector 可以把批次发去外协、可以收回来，却看不到当前在外协的批次。这个
-> 不对称是**本域既有先例**（`/outsource-shipments/in-flight` 同样如此），本端点
-> 只是向它看齐、并非新造。若产品认为 Inspector 应当能看自己的在途面，应**同时**
-> 放宽 `/in-flight` 与本端点（只改一端只会把不对称挪个位置）。
+> 由此残留的**「能写不能读」**只落在 `/state` 一个端点上：外协写侧 3 个端点
+> （`send-to-outsource` / `receive-from-outsource` /
+> `receive-from-outsource-to-inspection`）与在途读取面都是
+> **Manager + Clerk + Inspector**，只有本端点仍是 **Manager + Clerk** ⇒
+> Inspector 可以把批次发去外协、可以收回来、能读到在途，却打不开公司列看单家外协的
+> 收货明细与单价。这是**本域刻意保留的取舍**（敏感字段多一档），不是漏配；产品若认为
+> Inspector 应当能看公司列，要单独立项评估 `unit_price` 的可见性，而不是顺手放开。
 
 三处守卫都在 **service 层**（`current.require_any_role`），handler 不重复校验
 （与 work_type / assembly 域惯例一致）。负向回归网：`tests/outsource/pool.rs` 的
