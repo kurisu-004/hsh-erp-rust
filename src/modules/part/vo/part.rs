@@ -113,7 +113,7 @@ impl PartDetailOut {
 
 /// 2026-10-04 新增：报工台放回页的「工序链可否免填下一道工序」三值判据。
 ///
-/// 序列化形态是大写字符串（`rename_all = "UPPER"` ⇒ `"NONE"` / `"NEXT"` /
+/// 序列化形态是大写字符串（`rename_all = "UPPERCASE"` ⇒ `"NONE"` / `"NEXT"` /
 /// `"TAIL"`），与本仓「无 DB ENUM、Rust enum 校验」的约定一致。
 ///
 /// 三值**互斥**而不是两个 bool：两个 bool 会出现「可免填 + 是链尾」这类自相矛盾的
@@ -279,13 +279,19 @@ pub struct PartListItem {
     /// `chain_state != NEXT` 时为 `0`。
     #[serde(serialize_with = "serialize_i64")]
     pub chain_next_process_id: i64,
-    /// 2026-10-04 新增：下一道工序名称（`t_process.name`）。
-    /// `chain_state != NEXT`（含下一 step 的工序已软删）时为 `None`。仅 `by-worker` 填。
+    /// 2026-10-04 新增：下一道工序名称（`t_process.name`）。仅 `by-worker` 填。
+    /// `chain_next_process_id == "0"`（无下一道）时为 `None`；⚠️ **`chain_state ==
+    /// "NEXT"` 时也可能为 `None`** —— 下一道工序本身被软删（取名走
+    /// `LEFT JOIN t_process ... AND np.deleted_at IS NULL`，id 仍有值）。
+    /// **前端按本字段判空，不要按 `chain_state` 推断。**
     #[serde(default)]
     pub chain_next_process_name: Option<String>,
     /// 2026-10-04 新增：当前工序名称（`t_process.name`，链尾提示里点名
-    /// 「当前工序 X 已是最后一道」用）。解析不出（无链 / 工序已软删）时为 `None`。
-    /// 仅 `by-worker` 填。
+    /// 「当前工序 X 已是最后一道」用）。仅 `by-worker` 填。
+    /// 取名走锚链内按 `b.current_process_id` 定位到的那一步 ⇒ **门控是链内定位**，
+    /// 不是工序本身存不存在：`chain_state == "NONE"`（链内定位不成立，含链内
+    /// `process_id` 重复的歧义）时恒为 `None`；`NEXT` / `TAIL` 下为该工序的
+    /// `t_process.name`，工序本身被软删时为 `None`。
     #[serde(default)]
     pub chain_current_process_name: Option<String>,
     /// 2026-10-03 新增：已送数量。
@@ -489,3 +495,63 @@ pub struct PartBatchListItemOut {
 /// 派生）+ 新 query 参数 `has_cnc_program?: bool`（Tab 切换）。详见
 /// [`PartListItem`](Self#structfield.has_cnc_program)。
 pub type PendingProgrammingOut = PartListOut;
+
+#[cfg(test)]
+mod tests {
+    //! `ChainState` 的 DB 文本 → 枚举映射守卫（含序列化字面量）。
+    //!
+    //! 这条映射的唯一调用点是取行 SQL 里 `COALESCE(nx.chain_state, 'NONE')` 的
+    //! 结果，而 SQL 的 `CASE` 只能产出 `NONE` / `NEXT` / `TAIL` 三个字面量。
+    //! 一旦两边字面量漂移（改了 SQL 分支名却没改 `from_db_text`），未知取值会
+    //! 静默降级成 `NONE` —— 症状是「放回页突然让工人手填工序」，离根因很远。
+    //! 故把映射与序列化形态一并锁在单测里。
+    use super::*;
+
+    #[test]
+    fn from_db_text_maps_all_three_values() {
+        assert_eq!(ChainState::from_db_text("NEXT"), ChainState::Next);
+        assert_eq!(ChainState::from_db_text("TAIL"), ChainState::Tail);
+        assert_eq!(ChainState::from_db_text("NONE"), ChainState::None);
+    }
+
+    #[test]
+    fn from_db_text_unknown_falls_back_to_none() {
+        // 未知取值必须降级成 `NONE`（保守方向：多一次人工选择，而不是免填投错工序）
+        for raw in ["WAT", "", "next", "Next", "TAIL "] {
+            assert_eq!(
+                ChainState::from_db_text(raw),
+                ChainState::None,
+                "未知取值 {raw:?} 必须降级为 NONE"
+            );
+        }
+    }
+
+    #[test]
+    fn default_is_none() {
+        // `#[serde(default)]` 依赖 `Default = None`（其它复用路径不填该字段）
+        assert_eq!(ChainState::default(), ChainState::None);
+    }
+
+    #[test]
+    fn serializes_as_uppercase_strings() {
+        // 出参契约的 wire 字面量：前端按 `"NEXT"` / `"TAIL"` / `"NONE"` 判三态
+        for (state, want) in [
+            (ChainState::None, "\"NONE\""),
+            (ChainState::Next, "\"NEXT\""),
+            (ChainState::Tail, "\"TAIL\""),
+        ] {
+            let json = serde_json::to_string(&state).expect("serialize ChainState");
+            assert_eq!(json, want);
+        }
+    }
+
+    #[test]
+    fn deserializes_from_uppercase_strings() {
+        assert_eq!(
+            serde_json::from_str::<ChainState>("\"NEXT\"").expect("deserialize"),
+            ChainState::Next
+        );
+        // 小写字面量必须拒收（`rename_all = "UPPERCASE"` 的大小写是契约的一部分）
+        assert!(serde_json::from_str::<ChainState>("\"next\"").is_err());
+    }
+}

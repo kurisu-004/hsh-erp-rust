@@ -436,7 +436,7 @@ Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `batch_id` | string (i64) | 该行的 `t_part_batch.id`（**本端点填**；此前恒 `null`）。放回页据此定位批次发写请求 |
+| `batch_id` | string (i64) | 该行的 `t_part_batch.id`（**本端点填**）。放回页据此定位批次发写请求 |
 | `batch_version` | i32 | 该批次的乐观锁版本（`t_part_batch.version`），发写请求时作 OCC 版本回传 |
 | `process_chain_id` | string (i64)? | 零件的工艺链逻辑 FK（`t_part.process_chain_id`），无链为 `null`（本端点填真实投影值） |
 
@@ -447,8 +447,8 @@ Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
 
 | `chain_state` | 语义 | 配套字段 | 前端动作（报工台放回） |
 |---|---|---|---|
-| `NONE` | 无链 / 链已软删 / 锚链解析失败 / **当前工序不在链内（位置指针漂移）** | `chain_next_process_id = "0"`、`chain_next_process_name = null`、`chain_current_process_name = null` | 弹工序选择框，让工人手填下一道工序 |
-| `NEXT` | 当前工序在链内**且有下一道** | `chain_next_process_id` = 下一道工序 id、`chain_next_process_name` = 其 `t_process.name`、`chain_current_process_name` = 当前工序名 | 免填，确认后直接放回，提示「下一道工序为 xxx，请将工件放到 xx 货架」 |
+| `NONE` | 无链 / 链已软删 / 锚链解析失败 / **当前工序不在链内（位置指针漂移）** / **链内同一 `process_id` 出现多次（位置有歧义）** | `chain_next_process_id = "0"`、`chain_next_process_name = null`、`chain_current_process_name = null` | 弹工序选择框，让工人手填下一道工序 |
+| `NEXT` | 当前工序在链内**且有下一道** | `chain_next_process_id` = 下一道工序 id、`chain_next_process_name` = 其 `t_process.name`（⚠️ 下一道工序被软删时为 `null`）、`chain_current_process_name` = 当前工序名 | 免填，确认后直接放回，提示「下一道工序为 xxx，请将工件放到 xx 货架」 |
 | `TAIL` | 当前工序是链内**最后一道** | `chain_next_process_id = "0"`、`chain_next_process_name = null`、`chain_current_process_name` = 当前工序名 | 提示「当前为最后一道工序，加工完成后请送检」 |
 
 四个字段（`chain_state` / `chain_next_process_id` / `chain_next_process_name` /
@@ -460,6 +460,14 @@ Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
 `chain_next_process_id` 是**非可空**的 `"0"` 兜底口径（沿用
 `GET /outsource-pool/state` 的 `receive_next_process_id` 同一约定：JSON 里恒出现，
 `"0"` = 无下一道），前端不要按 `null` 判空。
+
+前端判空必须读字段本身，不要从 `chain_state` 推断：
+
+- `chain_next_process_name` 在 `chain_next_process_id == "0"` 时为 `null`，在
+  `chain_state == "NEXT"` 时**也可能**为 `null`（下一道工序被软删，id 仍有值）。
+- `chain_current_process_name` 的门控是**链内定位**而不是工序存不存在：
+  `chain_state == "NONE"` 时恒为 `null`（`NONE` 态不展示当前工序名）；`NEXT` /
+  `TAIL` 下为该工序的 `t_process.name`，工序本身被软删时为 `null`。
 
 #### 派生口径（为什么能这么判）
 
@@ -477,16 +485,29 @@ Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
   ⇒ 写侧照单全收，**静默把工件投回原工序**比拒收更难发现。同一批次第 N 次放回都只能
   靠 `current_process_id` 定位。
 - **「下一道」按 `sort_order > 当前 ORDER BY sort_order ASC LIMIT 1` 取**，与写侧
-  `prod::process_chain::repo::query::next_step_in_chain` 逐条同形。**不能**写成
-  `sort_order = 当前 + 1`：`t_process_chain_step.sort_order` 按设计是**稀疏**的
-  （默认 `10/20/30`，UI 中间插入取 `(prev+next)/2`，见
-  [`../production/process-chain.md`](../production/process-chain.md)），
-  `+ 1` 会把真实的 `10/20/30` 链误判成链尾、让报工台对工人谎报「当前为最后一道工序」。
+  `prod::process_chain::repo::query::next_step_in_chain` 逐条同形，读侧不替写侧产生
+  分歧。**不能**写成 `sort_order = 当前 + 1`：`sort_order` 的**密度不由读侧决定**，
+  写侧只保证链内 `sort_order` 互不重复（`upsert_chain` 校验 +
+  `uq_chain_step_chain_order (chain_id, sort_order)` 兜底），稠密 0-based（前端
+  `usePartProcessDesign` 保存时拍平成 `0,1,2…`）与稀疏 `10/20/30`
+  （[`../production/process-chain.md`](../production/process-chain.md) 记的是稀疏
+  口径）两种密度都能落库。`+ 1` 只在稠密下正确、在稀疏下会把「还有两道工序」误判成
+  链尾、让报工台对工人谎报「当前为最后一道工序」；`>` 对两种密度都成立。
 - 取不到任何链内位置（`cur2` 无行）⇒ `NONE`；位置解析成功但没有更大的
-  `sort_order` ⇒ `TAIL`；否则 `NEXT`。`chain_next_process_name` 在「下一 step 的
-  工序已软删」时为 `null`（id 仍有值，与 `outsource-pool` 同一取舍）。
-- LATERAL 末尾 `LIMIT 1` 收口：锚链内同一 `process_id` 重复属数据异常，不收口会把
-  一行批次扇成多行、破坏 `items.len()` 等于持有批次数的不变量。
+  `sort_order` ⇒ `TAIL`；否则 `NEXT`。
+- **链内 `process_id` 重复 ⇒ `NONE`（显式降级，不靠 `LIMIT 1` 取舍）**：
+  `t_process_chain_step` 只有 `uq_chain_step_chain_order (chain_id, sort_order)
+  WHERE deleted_at IS NULL` 一个唯一约束，**没有** `(chain_id, process_id)` 唯一
+  约束；写侧 `upsert_chain` 也只校验 `sort_order` 重复、不校验 `process_id` 重复 ⇒
+  重复工序的链后端照收。此时按 `process_id` 定位当前 step 会**扇出多行**（链
+  `[(A,10),(A,20),(B,30)]` 而 `current_process_id = A` ⇒ 一行派生 `NEXT → A`
+  即**当前工序自己**、另一行派生 `TAIL`）。取行 SQL 用 `(count(*) OVER ())` 带出
+  链内命中数，命中 >1 时**显式落 `NONE`** 并门控全部派生列（下一道 id 为 `"0"`、
+  两个名字为 `null`），与「未知一律往保守方向降」一致。
+- LATERAL 末尾 `ORDER BY cur.id ASC LIMIT 1` 收口：`cur` / `pc` 都按主键定位，本就
+  至多一行，此处只为把「至多一行」这条不变量写进 SQL —— 一旦上游改动放宽了任一
+  JOIN，一行批次会扇成多行、破坏 `items.len()` 等于持有批次数的不变量；带
+  `ORDER BY` 则万一扇行也是确定性的。
 
 ### 外协两条 list 端点 — 2026-10-03 已下线，迁往 outsource 域
 

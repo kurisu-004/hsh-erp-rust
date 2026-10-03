@@ -285,15 +285,17 @@ impl PartService {
         // `chain_next_process_name` / `chain_current_process_name`（填充口径见
         // `vo/part.rs` 字段 doc；本端点是链四字段的唯一填充路径）。
         //
-        // `LEFT JOIN LATERAL` 派生的三值判据，**两步定位**（沿用外协
-        // `OutsourcePoolRepo::list_held` 的纪律：锚链两步定位 / 派生列显式别名 /
-        // 末尾 `LIMIT 1` 收口；「下一道」的定义与它不同，理由见下）：
+        // `LEFT JOIN LATERAL` 派生的三值判据，**两步定位**（本端点自有纪律：锚链两步
+        // 定位 / 派生列显式别名 / 末尾 `ORDER BY ... LIMIT 1` 收口 / 链内歧义显式
+        // 落 `NONE`；「下一道」的定义见下）：
         // 1. **锚链** = `COALESCE(p.process_chain_id, cur.chain_id)`，`cur` =
         //    `b.current_process_step_id` 指向的 step，只用于回退取链 id（该 JOIN
         //    无行 ⇒ 锚链解析失败 ⇒ 落 `NONE`）；中间 JOIN `t_part_process_chain`
         //    是为了让「锚链已软删」同样落 `NONE`。
         // 2. **当前 step 在锚链内的位置**：`cur2.process_id = b.current_process_id`；
         //    再取锚链内 **`sort_order` 大于它且最小**的那一个未软删 step。
+        //    `cur2` 由 JOIN LATERAL 定位并带出 `hit_count`（链内命中数），
+        //    命中 >1 视作歧义落 `NONE`（见下）。
         //
         // ⚠️ **第 2 步必须按 `current_process_id` 在锚链内重新定位，绝对不能拿
         // `b.current_process_step_id` 的 `sort_order` 直接当位置** —— step 指针与
@@ -306,25 +308,40 @@ impl PartService {
         // 而 `chain_state` 仍在说「可免填」⇒ 写侧照单全收，静默错值比拒收更难
         // 发现。同一批次第 N 次放回都只能靠 `current_process_id` 定位。
         //
-        // ⚠️ **「下一道」按 `sort_order > 当前 ORDER BY ASC LIMIT 1` 取，不按
-        // `= 当前 + 1`**：本仓的「链内下一步」正典是写侧的
-        // `prod::process_chain::repo::query::next_step_in_chain`（`sort_order > $2
-        // ORDER BY sort_order ASC LIMIT 1`），而 `sort_order` 按设计是**稀疏**的
-        // ——`prod::process_chain::helpers::reorder_with_step_size` 整条链规整成
-        // `10/20/30` 就是为了给「中间插入」留间隙（官方口径见
-        // `docs/api/production/process-chain.md`「稀疏 sort」）。用 `+ 1` 等价于
-        // 假设链内 `sort_order` 连续，遇到真实的 `10/20/30` 链会把「还有两道工序」
-        // 误判成链尾、让报工台对工人谎报「当前为最后一道工序」。本 LATERAL 内的
-        // `nsp` 子查询与写侧 `next_step_in_chain` 逐条同形，读侧与写侧对「下一道」
-        // 的定义因此只有一处。
+        // ⚠️ **锚链内同一 `process_id` 允许重复，读侧必须自己识别歧义**：
+        // `t_process_chain_step` 只有 `uq_chain_step_chain_order (chain_id,
+        // sort_order) WHERE deleted_at IS NULL` 一个唯一约束，**没有**
+        // `(chain_id, process_id)` 唯一约束；写侧 `prod::process_chain::service::
+        // upsert_chain` 也只校验链内 `sort_order` 互不重复，不校验 `process_id`
+        // 重复 ⇒ 重复工序的链后端照收（前端工序链编辑页连续「添加工序」且不改
+        // 工序即是一条）。此时 `cur2` 会扇出多行：一行派生 `NEXT → 当前工序自己`
+        // （如链 `[(A,10),(A,20),(B,30)]` 而 `current_process_id = A`），另一行
+        // 派生 `TAIL`，让 `LIMIT 1` 静默取其一就是拿「绝不能把当前工序自己当成
+        // 下一道」这条安全承诺去赌 PG 的行序。故 `cur2` 侧用
+        // `(count(*) OVER ())` 带出命中数，`hit_count > 1` 时**显式落 `NONE`**
+        // （与「未知一律往保守方向降」一致），并同时门控 `nsp` / `cp` 两个派生
+        // 侧：歧义时不产出任何派生值，维持 `NONE` ⇒ 下一道 id 为 `"0"`、两个名字
+        // 均为 `null` 的不变量。
         //
-        // ⚠️ **4 个派生列都要显式 `AS chain_*`**：LATERAL 子查询输出的列名只跟子
-        // 查询内部走（`nx.chain_state` 的列名是 `chain_state`，不带 `nx.` 前缀），
-        // 不写别名时 runtime `query_as` 的 `FromRow` 会报
-        // `ColumnNotFound("chain_state")`。外层 LATERAL 末尾 `LIMIT 1` 收口：锚链
-        // 内同一 `process_id` 重复属数据异常（`nsp` 侧已自带 `LIMIT 1` 消歧），
-        // 不收口会把一行批次扇成多行、破坏 VO 层「`items.len()` 等于持有批次数」
-        // 的不变量。
+        // ⚠️ **「下一道」按 `sort_order > 当前 ORDER BY ASC LIMIT 1` 取，不按
+        // `= 当前 + 1`**：与写侧的「链内下一步」正典
+        // `prod::process_chain::repo::query::next_step_in_chain`（`sort_order > $2
+        // ORDER BY sort_order ASC LIMIT 1`）逐条同形，读侧不会替写侧产生分歧。
+        // 而 `sort_order` 的**密度不由读侧决定**：写侧只保证链内 `sort_order`
+        // 互不重复（`upsert_chain` 校验 + `uq_chain_step_chain_order` 兜底），
+        // 稠密 0-based（前端 `usePartProcessDesign` 保存时拍平成 `0,1,2…`）与
+        // 稀疏 `10/20/30`（`docs/api/production/process-chain.md` 记的是稀疏
+        // 口径）两种密度都能落库且都受支持。`+ 1` 只在稠密下正确、在稀疏下会把
+        // 「还有两道工序」误判成链尾，`>` 对两种密度都成立 ⇒ 读侧只能用 `>`。
+        //
+        // 4 个派生列都显式 `AS chain_*` 别名，与外层 `COALESCE(nx.*)` 逐字对应，
+        // 避免内外层列名不一致时读错位。
+        //
+        // 外层 LATERAL 末尾 `ORDER BY cur.id ASC LIMIT 1` 收口：不为消歧（`cur` /
+        // `pc` 都按主键定位，本就至多一行），而是把「至多一行」这条不变量写进
+        // SQL —— 不收口则一旦上游改动放宽了任一 JOIN，一行批次就会扇成多行、
+        // 破坏 VO 层「`items.len()` 等于持有批次数」的不变量；带 `ORDER BY` 则
+        // 万一扇行也是确定性的。
         //
         // `p.process_chain_id` / `b.current_process_id` /
         // `b.current_process_step_id` 全部是可空列：列本身可空时 `query_as` 返回的
@@ -357,6 +374,7 @@ impl PartService {
                SELECT \
                  CASE \
                    WHEN cur2.id IS NULL THEN 'NONE' \
+                   WHEN cur2.hit_count > 1 THEN 'NONE' \
                    WHEN nsp.id IS NULL THEN 'TAIL' \
                    ELSE 'NEXT' \
                  END AS chain_state, \
@@ -367,14 +385,22 @@ impl PartService {
                JOIN t_part_process_chain pc \
                  ON pc.id = COALESCE(p.process_chain_id, cur.chain_id) \
                 AND pc.deleted_at IS NULL \
-               JOIN t_process_chain_step cur2 \
-                 ON cur2.chain_id = pc.id \
-                AND cur2.process_id = b.current_process_id \
-                AND cur2.deleted_at IS NULL \
+               JOIN LATERAL ( \
+                 SELECT cur2b.id AS id, cur2b.process_id AS process_id, \
+                        cur2b.sort_order AS sort_order, \
+                        (count(*) OVER ()) AS hit_count \
+                 FROM t_process_chain_step cur2b \
+                 WHERE cur2b.chain_id = pc.id \
+                   AND cur2b.process_id = b.current_process_id \
+                   AND cur2b.deleted_at IS NULL \
+                 ORDER BY cur2b.sort_order ASC, cur2b.id ASC \
+                 LIMIT 1 \
+               ) cur2 ON TRUE \
                LEFT JOIN LATERAL ( \
                  SELECT nxt.id AS id, nxt.process_id AS process_id \
                  FROM t_process_chain_step nxt \
-                 WHERE nxt.chain_id = pc.id \
+                 WHERE cur2.hit_count = 1 \
+                   AND nxt.chain_id = pc.id \
                    AND nxt.sort_order > cur2.sort_order \
                    AND nxt.deleted_at IS NULL \
                  ORDER BY nxt.sort_order ASC \
@@ -384,7 +410,9 @@ impl PartService {
                  ON np.id = nsp.process_id AND np.deleted_at IS NULL \
                LEFT JOIN t_process cp \
                  ON cp.id = cur2.process_id AND cp.deleted_at IS NULL \
+                AND cur2.hit_count = 1 \
                WHERE cur.id = b.current_process_step_id AND cur.deleted_at IS NULL \
+               ORDER BY cur.id ASC \
                LIMIT 1 \
              ) nx ON TRUE \
              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL \
@@ -440,7 +468,7 @@ impl PartService {
                         updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
                         updated_by: None,
                         deleted_at: None,
-                        // 2026-10-04：取行 SQL 投影的真实值（此前恒 `None` 占位）。
+                        // 2026-10-04：取行 SQL 投影的真实值。
                         process_chain_id,
                     };
                     let mut item = PartListItem::from(p);

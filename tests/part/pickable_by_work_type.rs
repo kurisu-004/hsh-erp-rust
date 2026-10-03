@@ -488,7 +488,7 @@ async fn by_worker_tolerates_null_serial_no() {
 //
 // | `chain_state` | 含义                                   | 前端动作                        |
 // |---------------|----------------------------------------|---------------------------------|
-// | `NONE`        | 无链 / 链已软删 / 当前工序不在链内       | 弹工序选择框，让用户手填        |
+// | `NONE`        | 无链 / 链已软删 / 当前工序不在链内 / 链内 `process_id` 重复（位置有歧义） | 弹工序选择框，让用户手填 |
 // | `NEXT`        | 当前工序在链内且有下一道                | 免填，确认后直接放回            |
 // | `TAIL`        | 当前工序是链内最后一道                  | 提示「加工完成后请送检」        |
 //
@@ -498,14 +498,19 @@ async fn by_worker_tolerates_null_serial_no() {
 // ## 链数据怎么造
 // `ProcessChainFixture` 只预置「2 工序 + 2 part + 2 用户」，**不含任何链 / step 行**
 // （见 `test-support/src/fixture/process_chain.rs` 的「当前域」），故链数据在本节
-// 按 DB 约定现场直插：`t_part_process_chain` + `t_process_chain_step`（`sort_order`
-// 稀疏 10/20/30，无物理外键，软删列留 NULL = 活跃）。
+// 按 DB 约定现场直插：`t_part_process_chain` + `t_process_chain_step`（无物理外键，
+// 软删列留 NULL = 活跃）。`sort_order` 一律用稀疏 `10/20/30` —— 读侧「下一道」按
+// `sort_order > 当前` 取（与写侧 `next_step_in_chain` 同形），稀疏链是它的**判别性**
+// 输入：写成 `+ 1` 时这两组用例全塌成 `TAIL`。
 //
 // ## 关键回归点
-// 最后一则 `by_worker_chain_state_repositions_by_current_process_id_not_step_pointer`
-// 锁的是「不能拿 step 指针的 `sort_order` 当位置」：worker-scan 的 RETURNED 只写
-// `current_process_id`、不推进 `current_process_step_id`，多工序链批次第 2 次放回
-// 时指针仍停在**首次定位**那一步，按位置推进会把当前工序自己当成下一道返回。
+// - `by_worker_chain_state_repositions_by_current_process_id_not_step_pointer`：
+//   「不能拿 step 指针的 `sort_order` 当位置」—— worker-scan 的 RETURNED 只写
+//   `current_process_id`、不推进 `current_process_step_id`，多工序链批次第 2 次放回
+//   时指针仍停在**首次定位**那一步，按位置推进会把当前工序自己当成下一道返回。
+// - `by_worker_chain_state_none_when_duplicate_process_in_chain`：链内同一
+//   `process_id` 重复时「当前 step」定位扇行 ⇒ 显式降级 `NONE`，不许让 `LIMIT 1`
+//   静默取到「`NEXT → 当前工序自己`」那一行。
 
 /// 进程级 snowflake 取号（复用本文件既有 inline 写法，含毒化兜底）。
 fn next_id() -> i64 {
@@ -623,7 +628,7 @@ async fn by_worker_item(app: &axum::Router, token: &str, worker_id: i64, part_id
     item_by_part_id(&env, part_id).clone()
 }
 
-/// 断言「取行 SQL 投影的 `b.id` / `b.version`」已填进出参（2026-10-04 之前恒 null）。
+/// 断言「取行 SQL 投影的 `b.id` / `b.version`」已填进出参。
 fn assert_batch_anchor(item: &Value, batch_id: i64) {
     assert_eq!(
         item["batch_id"].as_str(),
@@ -640,10 +645,29 @@ fn assert_batch_anchor(item: &Value, batch_id: i64) {
     );
 }
 
+/// 断言「`chain_state == "NONE"`」的配套不变量：下一道 id 为 `"0"`、两个名字为
+/// `null`。`NONE` 是保守降级态，前端据此弹工序选择框，任何一个派生字段残留真值
+/// 都会让「免填」与「手填」两条路径在前端产生分歧。
+fn assert_none_state(item: &Value) {
+    assert_eq!(item["chain_state"], "NONE", "{item}");
+    assert_eq!(
+        item["chain_next_process_id"].as_str(),
+        Some("0"),
+        "NONE 时下一道工序 id 必须是 \"0\" 兜底（不是 null、也不是残留真值）: {item}"
+    );
+    assert!(
+        item["chain_next_process_name"].is_null(),
+        "NONE 时下一道工序名恒 null: {item}"
+    );
+    assert!(
+        item["chain_current_process_name"].is_null(),
+        "NONE 时当前工序名恒 null: {item}"
+    );
+}
+
 /// 场景 1（`NONE` · 无链）：`p.process_chain_id IS NULL` ⇒ 前端弹工序选择框。
 ///
-/// 同时锁住批次锚点与 `process_chain_id` 投影：三个断言都是 2026-10-04 之前
-/// 恒为「占位值 / null」的字段。
+/// 同时锁住批次锚点与 `process_chain_id` 投影。
 #[tokio::test]
 async fn by_worker_chain_state_none_when_part_has_no_chain() {
     let (pool, app, token, fx) = bootstrap().await;
@@ -661,23 +685,10 @@ async fn by_worker_chain_state_none_when_part_has_no_chain() {
     set_batch_position(&pool, batch_id, Some(fx.process_a_id), None).await;
 
     let item = by_worker_item(&app, &token, worker_id, part_id).await;
-    assert_eq!(item["chain_state"], "NONE", "无链 ⇒ NONE: {item}");
-    assert_eq!(
-        item["chain_next_process_id"].as_str(),
-        Some("0"),
-        "无链时下一道工序是 0 兜底（JSON string \"0\"，不是 null）: {item}"
-    );
-    assert!(
-        item["chain_next_process_name"].is_null(),
-        "NONE 时下一道工序名恒 null: {item}"
-    );
-    assert!(
-        item["chain_current_process_name"].is_null(),
-        "链内定位不成立时当前工序名也解析不出: {item}"
-    );
+    assert_none_state(&item);
     assert!(
         item["process_chain_id"].is_null(),
-        "process_chain_id 现在取真实投影值（无链 ⇒ null）: {item}"
+        "process_chain_id 取真实投影值（无链 ⇒ null）: {item}"
     );
     assert_batch_anchor(&item, batch_id);
 }
@@ -799,19 +810,7 @@ async fn by_worker_chain_state_none_when_current_process_not_in_chain() {
     set_batch_position(&pool, batch_id, Some(proc_d), Some(step_a)).await;
 
     let item = by_worker_item(&app, &token, worker_id, part_id).await;
-    assert_eq!(
-        item["chain_state"], "NONE",
-        "当前工序不在链内 ⇒ NONE（不能退化成按 step 指针位置给下一道）: {item}"
-    );
-    assert_eq!(
-        item["chain_next_process_id"].as_str(),
-        Some("0"),
-        "NONE 时下一道工序是 0 兜底: {item}"
-    );
-    assert!(
-        item["chain_next_process_name"].is_null(),
-        "NONE 时下一道工序名恒 null: {item}"
-    );
+    assert_none_state(&item);
     assert_batch_anchor(&item, batch_id);
 }
 
@@ -866,5 +865,66 @@ async fn by_worker_chain_state_repositions_by_current_process_id_not_step_pointe
         item["chain_next_process_name"], "真正下一道 NC",
         "下一道工序名与 id 同行: {item}"
     );
+    assert_batch_anchor(&item, batch_id);
+}
+
+/// 场景 6（**歧义**）：链内同一 `process_id` 出现两次 ⇒ 必须落 `NONE`。
+///
+/// 前置：链 = [A(10), **A**(20), B(30)]，`current_process_id = A`、step 指针指向
+/// A 的第一步。这条链是后端**照收**的：`t_process_chain_step` 只有
+/// `uq_chain_step_chain_order (chain_id, sort_order)` 一个唯一约束，没有
+/// `(chain_id, process_id)` 唯一约束；写侧 `upsert_chain` 也只校验链内
+/// `sort_order` 互不重复。
+///
+/// 危险在于：按 `process_id` 定位当前 step 会**扇出两行** —— 一行派生
+/// `NEXT → A`（**当前工序自己**），另一行派生 `TAIL`。若让 `LIMIT 1` 静默取其
+/// 一，就是拿「绝不能把当前工序自己当成下一道」这条承诺去赌 PG 的行序。
+///
+/// 期望：`NONE`（`hit_count > 1` 显式降级）+ 下一道 id 为 `"0"`，前端弹工序
+/// 选择框让工人手填。本用例即该安全承诺的边界守卫。
+#[tokio::test]
+async fn by_worker_chain_state_none_when_duplicate_process_in_chain() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-CHAIN-DUP").await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "工序重复件",
+        "D-CHAIN-DUP",
+        Some("CH-DUP-1"),
+    )
+    .await;
+    let chain_id = create_chain(&pool, "chain-abc").await;
+    bind_part_to_chain(&pool, part_id, chain_id).await;
+    // ⚠️ 工序 A 连上两道（sort 10 / 20）—— 唯一索引只管 sort 槽位唯一，管不到
+    // process_id，故这条链能落库
+    let step_a1 = add_chain_step(&pool, chain_id, fx.process_a_id, 10).await;
+    add_chain_step(&pool, chain_id, fx.process_a_id, 20).await;
+    add_chain_step(&pool, chain_id, fx.process_b_id, 30).await;
+    let batch_id = insert_worker_held_batch(&pool, part_id, worker_id, 5).await;
+    set_batch_position(&pool, batch_id, Some(fx.process_a_id), Some(step_a1)).await;
+
+    // 前提自证：库里确实有 2 条 process_id = A 的活跃 step
+    let dup_hits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM t_process_chain_step \
+         WHERE chain_id = $1 AND process_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(chain_id)
+    .bind(fx.process_a_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count duplicate steps");
+    assert_eq!(dup_hits, 2, "前提：锚链内 process_id=A 的活跃 step 有 2 条");
+
+    let item = by_worker_item(&app, &token, worker_id, part_id).await;
+    assert_none_state(&item);
+    assert_ne!(
+        item["chain_next_process_id"].as_str(),
+        Some(fx.process_a_id.to_string().as_str()),
+        "绝不能把当前工序自己（A）当成下一道返回: {item}"
+    );
+    // 保守降级不许退化成 TAIL：TAIL 会让放回页提示「加工完成后请送检」而不再要
+    // 下一道工序，等于把「位置有歧义」当成「确定在链尾」
+    assert_ne!(item["chain_state"], "TAIL", "歧义不许退化成 TAIL: {item}");
     assert_batch_anchor(&item, batch_id);
 }
