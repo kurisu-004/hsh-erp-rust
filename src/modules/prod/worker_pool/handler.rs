@@ -4,7 +4,11 @@
 //!
 //! ## 端点（2026-09-30 重构：worker-pool → pool 路径收敛 + 5 个端点挂 pool/*）
 //! - `GET  /api/v2/prod/pool/state?worker_id=&shelf_id=` —— worker 当前持有 +
-//!   池候选数（按工序分组）。无 role guard。
+//!   池候选数（按工序分组）。无 role guard。2026-10-04 起 `shelf_id` 降为可选：
+//!   它**只**决定 `pool_count_by_process` 的候选池范围，`held_batches` / `max_held` /
+//!   `current_held` / `capacity_remaining` 全部与货架无关 ⇒ 不关心候选池计数时可省略。
+//!   背景：后端只给 SHELF_ACCOUNT + 货架 scope 的角色返 `shelf_ids`，前端把它接在
+//!   `auth.activeShelfId` 上后 MANAGER / CLERK / INSPECTOR 恒为空。
 //! - `GET  /api/v2/prod/pool/counts`               —— 2026-09-30 新增：全工序
 //!   候选批次聚合计数（GROUP BY process_id），跨所有货架，admin 视图。
 //!   Manager+Clerk+Inspector 可调；service 内守卫。
@@ -54,12 +58,17 @@ use super::vo::{AutoAllocateResult, MoveResult, ProcessPoolDetail};
 #[derive(Debug, Deserialize)]
 pub struct StateQuery {
     pub worker_id: i64,
-    pub shelf_id: i64,
+    /// 2026-10-04 降为可选（`Option<i64>`）：缺省 = 不查候选池计数，
+    /// `pool_count_by_process` 返空数组，其余字段与货架无关、不受影响。
+    pub shelf_id: Option<i64>,
 }
 
 /// GET /api/v2/prod/pool/state?worker_id=&shelf_id=
 ///
 /// 无 role guard —— worker 自查 / admin 监控共用。
+///
+/// `shelf_id` 可选（2026-10-04）：不传则跳过候选池计数查询。老前端继续传
+/// `shelf_id` 走原 `Some` 分支，响应逐字不变 ⇒ 部署顺序为后端先上。
 ///
 /// 读端点（③ 形态）：`pool.acquire()` 不开事务；service 借 `&mut PgConnection` 跑查询。
 pub async fn state(

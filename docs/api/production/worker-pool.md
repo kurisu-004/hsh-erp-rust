@@ -4,7 +4,7 @@
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`./index.md`](./index.md)
 >
 > 范围：工人扫码台（worker-scan）配套的工序候选池管理：
-> - `GET /state` —— 工人当前持有数 + 各工序候选池计数（前端轮询用）
+> - `GET /state` —— 工人当前持有数 + 各工序候选池计数（前端轮询用）。2026-10-04：`shelf_id` 由必填改为可选（缺省 → `pool_count_by_process` 返空数组）
 > - `POST /refill` —— Manager 主动触发「为某 worker 抢满 max_held」
 > - `POST /move` —— 通用移动端点（POOL ↔ WORKER + WORKER ↔ WORKER 三方向，取代旧 `assign` / `remove`）
 > - `POST /auto-allocate` —— Manager 按 process + shelf 自动为多个 worker 抢批次/工时
@@ -41,7 +41,7 @@ Query：
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `worker_id` | string (i64) | ✓ | 工人雪花 ID |
-| `shelf_id` | string (i64) | ✓ | 工人所在货架 ID（决定候选池范围） |
+| `shelf_id` | string (i64) |  | 工人所在货架 ID（决定候选池范围）；**2026-10-04 起可选** —— 缺省表示不关心候选池计数，`pool_count_by_process` 返空数组（`held_batches` / `max_held` / `current_held` / `capacity_remaining` 与货架无关，照常返回） |
 
 Response 200 `data`：[`WorkerPoolState`](#workerpoolstate-字段)
 
@@ -435,7 +435,7 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 | `max_held` | i32 | `work_type.max_held_batches`（未设置时为 0） |
 | `current_held` | i64 | worker 当前持有批次数（`t_part_batch` 中 `status='IN_PROCESS' AND location='WORKER' AND current_holder_id = worker_id`） |
 | `capacity_remaining` | i32 | `max(0, max_held - current_held)` |
-| `pool_count_by_process` | [ProcessPoolCount](#processpoolcount-字段) | 各工序候选池计数（仅含 work_type 映射到的工序） |
+| `pool_count_by_process` | [ProcessPoolCount](#processpoolcount-字段) | 各工序候选池计数（仅含 work_type 映射到的工序）；**`shelf_id` 未传时为空数组** |
 | `held_batches` | [HeldBatchItem](#heldbatchitem-字段)[] | **2026-09-14 follow-up-ux 新增**：worker 当前持有的完整 batch 列表（JOIN t_part），按 `t_part_batch.id ASC` 排序。避免前端按 worker 轮询 K 次单 batch 详情接口的 N+1；UI sink `WorkerQueueBoard.vue` 已对接 `:batches="workerHeld[w.id] ?? []"` |
 
 ### PoolBatchItem 字段
@@ -606,6 +606,7 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 - ✅ Task 8：`POST /prod/batches/worker-scan`（同事务联动 refill；2026-10-02 自 part 域迁入）
 - ✅ 2026-09-11 part-worker-pool-federated-rocket：新增 `auto_allocate_for_process` + 端点 `POST /admin/worker-pool/auto-allocate` + COUNT/TIME 模式 + fill_ratio 校验（20704）；错误码段 20701/20702/20703/20704
 - ✅ 2026-09-14 follow-up-ux：`WorkerPoolState` 新增 `held_batches` 字段（`list_held_by_worker_with_part` JOIN t_part 取全量）+ 新增 `POST /admin/worker-pool/assign` 端点（单 batch 拖拽分配，service `assign_batch_to_worker`）+ `WorkerPoolRepo::take_specific_from_pool`（单 SQL 限定 `(shelf_id, batch_id)` 原子切换 holder）；错误码沿用既有 20204 / 20114 / 20104
+- ✅ 2026-10-04：`GET /pool/state` 的 `shelf_id` 由必填 `i64` 降为可选 `Option<i64>`。该参数在 `compute_state` 内只有一个用途 —— 逐工序算「某货架 × 某工序」候选池计数（`count_pool_by_shelf_and_process`）；`held_batches` / `max_held` / `current_held` / `capacity_remaining` 均与货架无关。**缺省语义**：`shelf_id = None` → 跳过计数查询，`pool_count_by_process` 返空数组。缘由：iam 侧只给 SHELF_ACCOUNT + 货架 scope 的角色返 `shelf_ids`，前端把该参数接在 `auth.activeShelfId` 上后对 MANAGER / CLERK / INSPECTOR 恒为空、工人持有列表恒空。**向后兼容**：老前端继续传 `shelf_id` 走原 `Some` 分支，响应逐字不变 ⇒ 部署顺序后端先上
 - ⏳ 未上线：`WorkerRepo` 列表 / 创建 / 软删等 CRUD（worker 域当前仅供 worker_pool / prod batches worker-scan 复用）
 
 ## 参考
