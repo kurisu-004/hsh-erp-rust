@@ -55,7 +55,9 @@ use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::sql::{AssemblyListFilters, AssemblyRepo};
 use crate::modules::part::repo::PartListFilters;
 use crate::modules::part::repo::PartRepo;
-use crate::modules::part::service::list_enrichment::enrich_part_list_with_location_and_holder;
+use crate::modules::part::service::list_enrichment::{
+    enrich_part_list_with_location_and_holder, fetch_delivered_quantities, fetch_delivered_sets,
+};
 use crate::modules::part::vo::PartListItem;
 use crate::shared::error::AppError;
 
@@ -163,6 +165,7 @@ impl UnionListService {
         // 因此用 `&mut *conn` reborrow 一次：`&mut (&mut PgConnection)`，R = &mut PgConnection）。
         let batch_enrichment =
             enrich_part_list_with_location_and_holder(&mut conn, &part_ids).await?;
+        let delivered_quantities = fetch_delivered_quantities(&mut *conn, &part_ids).await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for p in rows {
@@ -173,6 +176,9 @@ impl UnionListService {
             item.l1_customer_name = l1cn;
             item.location = loc;
             item.holder_name = holder;
+            // 2026-10-03 新增：已送数量（零批次 → 0，键恒存在）。
+            item.delivered_quantity =
+                Some(delivered_quantities.get(&item.id).copied().unwrap_or(0));
             items.push(item);
         }
         Ok(PartListOut {
@@ -229,6 +235,8 @@ impl UnionListService {
 
         let asm_ids: Vec<i64> = asm_rows.iter().map(|a| a.id).collect();
         let child_counts = fetch_child_counts(&mut *conn, &asm_ids).await?;
+        // 2026-10-03 新增：已送套数（子件 min 公式）。
+        let delivered_sets = fetch_delivered_sets(&mut *conn, &asm_ids).await?;
 
         let mut items = Vec::with_capacity(asm_rows.len());
         for a in asm_rows {
@@ -239,6 +247,8 @@ impl UnionListService {
             item.l1_customer_name = l1cn;
             item.child_count = Some(cc);
             item.has_children = cc > 0;
+            // 2026-10-03 新增：已送套数（无子件 → 0）。
+            item.delivered_quantity = Some(delivered_sets.get(&item.id).copied().unwrap_or(0));
             items.push(item);
         }
         Ok(PartListOut {
@@ -393,6 +403,10 @@ impl UnionListService {
         let batch_enrichment =
             enrich_part_list_with_location_and_holder(&mut conn, &part_ids).await?;
         let child_counts = fetch_child_counts(&mut *conn, &asm_ids).await?;
+        // 2026-10-03 新增：已送数量按行类型分流 —— PART 段取已交批次数量之和，
+        // ASSEMBLY 段取可凑齐的套数（两个 row_type 分支都要写，否则对应行会静默留 None）。
+        let delivered_quantities = fetch_delivered_quantities(&mut *conn, &part_ids).await?;
+        let delivered_sets = fetch_delivered_sets(&mut *conn, &asm_ids).await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for r in rows {
@@ -407,10 +421,13 @@ impl UnionListService {
                     .unwrap_or((None, None));
                 item.location = loc;
                 item.holder_name = holder;
+                item.delivered_quantity =
+                    Some(delivered_quantities.get(&item.id).copied().unwrap_or(0));
             } else if item.row_type.as_deref() == Some("ASSEMBLY") {
                 let cc = child_counts.get(&item.id).copied().unwrap_or(0);
                 item.child_count = Some(cc);
                 item.has_children = cc > 0;
+                item.delivered_quantity = Some(delivered_sets.get(&item.id).copied().unwrap_or(0));
             }
             items.push(item);
         }
@@ -769,6 +786,10 @@ fn project_assembly_to_part_list_item(a: TAssembly) -> PartListItem {
         // 与 VO 契约（仅 pickable-by-work-type 填）一致。
         batch_id: None,
         batch_version: None,
+        // 2026-10-03 新增：已送数量。本 helper 只做 TAssembly → PartListItem 的字段
+        // 搬运，装配行的已送套数需跨表聚合，由 caller（list_assembly / list_all 的
+        // ASSEMBLY 分支）用 `fetch_delivered_sets` 显式覆写。
+        delivered_quantity: None,
     }
 }
 
@@ -815,5 +836,8 @@ fn union_row_to_part_list_item(r: UnionListRow) -> PartListItem {
         // 2026-10-03：同上，批次锚点字段在本端点恒 null（行单位是 part，批次不唯一）。
         batch_id: None,
         batch_version: None,
+        // 2026-10-03 新增：同上，已送数量由 caller（list_all 的 PART / ASSEMBLY
+        // 两个分支）按行类型分别用两个聚合 helper 覆写。
+        delivered_quantity: None,
     }
 }

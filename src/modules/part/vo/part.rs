@@ -224,6 +224,24 @@ pub struct PartListItem {
     /// pickable-by-work-type 填，其余路径 null」）。
     #[serde(default)]
     pub batch_version: Option<i32>,
+    /// 2026-10-03 新增：已送数量。
+    ///
+    /// - PART 行 = 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的
+    ///   `quantity` 之和（零批次 → `0`，不是 `null`；`t_part_batch.status` 是
+    ///   批次级「已交」的唯一真源）。
+    /// - ASSEMBLY 行 = 可凑齐的套数
+    ///   `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，
+    ///   PG 整数除法截断；子件总量为 0 者不参与，无子件为 0；`LEAST` 收口到
+    ///   工单总套数（子件超交时不会算出超过总套数的值）。
+    /// - 仅 `GET /api/v2/com/union-list`（三种 `row_type` 模式）与
+    ///   `GET /api/v2/parts` 填；其余复用本 VO 的 **5 处返回点**恒 `null`
+    ///   （4 个列表端点 + `POST /assemblies/{id}/children` 返回的单对象
+    ///   `R<PartListItem>`，走 `From<TPart>` 从不覆写）。
+    ///
+    /// 已知取舍：软删子件不参与装配套数聚合（与 `child_count` 同口径），因此软删一个
+    /// 已部分交付的子件会让父装配件的已送套数下降。
+    #[serde(default)]
+    pub delivered_quantity: Option<i32>,
 }
 
 impl From<TPart> for PartListItem {
@@ -273,6 +291,11 @@ impl From<TPart> for PartListItem {
             // 显式覆写这两个字段。
             batch_id: None,
             batch_version: None,
+            // 2026-10-03 新增：`From<TPart>` 是 part 级投影，不含批次语义
+            // （`TPart` 本身不持任何批次聚合量）→ 恒 None。需要该值的端点
+            // （`GET /parts` / `GET /com/union-list`）在 `PartListItem::from`
+            // 之后显式覆写。
+            delivered_quantity: None,
         }
     }
 }

@@ -159,36 +159,53 @@
 | `has_cnc_program` | bool | 2026-09-29 新增（CNC 重构 5 任务之一）。是否已上传 G_CODE 数控程序。真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`。`GET /parts/pending-programming` 走专用 repo 填充真实值；其它 list 端点默认 `false`（service 不 enrich，避免 N+1）。详见 [`./lifecycle.md#get-apiv2partspending-programming`](./lifecycle.md#get-apiv2partspending-programming)。 |
 | `batch_id` | string (i64)? | 2026-10-03 新增。**活跃批次雪花 id**（`serialize_i64_opt` → JSON string；无值时序列化为 `null`）。**仅 `GET /parts/pickable-by-work-type/{work_type_id}` 填** —— 该端点的行本来就是「批次行」（取行 SQL 从 `t_part_batch b` 起），扫码台「领料」按本字段定位批次后发写请求。**其余复用 `PartListItem` 的路径恒为 `null`**（`GET /parts` / `GET /api/v2/com/union-list` / `GET /parts/pending-programming` 等）：那些行的语义单位是 part，一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故宁可不填。 |
 | `batch_version` | i32? | 2026-10-03 新增。`batch_id` 那个批次的乐观锁版本号（`t_part_batch.version`），前端发写请求时作 OCC 版本回传。填充口径与 `batch_id` 完全一致（同为「仅 pickable-by-work-type 填，其余路径 `null`」），二者同生共死。⚠️ **批次 OCC 只认本字段，不要拿 `version` 当批次版本用**（见下条）。 |
+| `delivered_quantity` | i32? | 2026-10-03 新增。已送数量。**仅 `GET /api/v2/com/union-list`（三种 `row_type` 模式）与 `GET /api/v2/parts` 填；其余复用本 VO 的 5 处返回点恒 `null`（4 个列表端点 + `POST /assemblies/{id}/children` 返回的单对象 `R<PartListItem>`）**。<br>**PART 行** = 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的 `quantity` 之和（真相源是 `t_part_batch.status`，**不**从派生缓存 `t_part.status` 反推 —— 后者在 min-progress 规则下会把「部分已交」压成 0）。<br>**ASSEMBLY 行** = 可凑齐的套数 `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，PG 整数除法截断；子件总量为 0 者不参与（`NULLIF`），无子件为 0；`LEAST` 收口到工单总套数（子件超交时不会算出超过总套数的值）。软删子件不参与（与 `child_count` 同口径）。<br>零批次的行给 `0`（不是 `null`），键恒在。 |
+
+> ⚠️ **本字段不参与后端任何过滤**（2026-10-03 登记，避免契约归属被静默遗忘）：
+> 紧急 / 逾期列表的「有已交批次即移出」由**消费方**按本字段 `> 0` 判定。后端的
+> `is_urgent` / `system_delivery_date` 过滤（`part/repo/sql/part_sql.rs`）是裸
+> `AND is_urgent = $1`，**不含**已交排除条件；「有已交批次即移出紧急/逾期列表」的
+> 消费方实现由前端仓负责（前端仓同批改动已按 `delivered_quantity > 0` 客户端分桶），
+> 后端契约只保证本字段的取值口径，不承担过滤职责。`statistics` 域的逾期口径
+> 是另一套 —— `count_overdue_undelivered` 用 `NOT EXISTS` DELIVERED 事件。
 
 > ⚠️ `PartListItem.version` 是 **part 级**（`t_part.version`）乐观锁，与批次 OCC 无关。
 > `GET /parts/pickable-by-work-type/{work_type_id}` 的取行 SQL **不投影 `p.version`**
 > （只投影 `p.id` / `p.serial_no` / `p.drawing_no`），故该端点返回的 `version` 恒为 `0`
 > （有意占位，不是漏取值）；该端点的批次乐观锁版本一律走 `batch_version`。
 
-#### 前端配套改动清单（2026-10-03 新增 `batch_id` / `batch_version`）
+#### 前端配套改动清单
 
-返回 `R<PartListOut>` 的端点共 **8 个**，故这两个新字段会出现在**每一个**复用路径的
-响应里（除 `pickable-by-work-type` 外均为 `null`）。逐端点影响与前端动作：
+返回 `R<PartListOut>` 的端点共 **6 个**。`batch_id` / `batch_version`（2026-10-03 新增）
+与 `delivered_quantity`（2026-10-03 新增）在**每一个**复用路径的响应里都出现，
+但填充口径不同。逐端点影响与前端动作：
 
-| 端点 | `batch_id` / `batch_version` | 构造路径（决定为何 null） | 前端是否要改 |
-|---|---|---|---|
-| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | `part/service/phase1/work_type.rs:222-223` 在 `From<TPart>` 之后**显式覆写**（全仓唯一填 `Some` 的路径） | 需要：TS `PartItem` 补 2 个可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
-| `GET /parts` | 恒 `null` | `part/service/crud.rs:290` `p.into()`（`From<TPart>`） | **不需要** |
-| `GET /parts/pending-programming` | 恒 `null` | `part/service/phase1/lifecycle_helpers.rs:71-73` 结构体更新 `..PartListItem::from(..)` | **不需要** |
-| `GET /parts/outsource-in-flight` | 恒 `null` | `part/service/phase1/outsource.rs:82` `.map(PartListItem::from)` | **不需要** |
-| `GET /parts/outsource-sendable` | 恒 `null` | `part/service/phase1/outsource.rs:150` `.map(PartListItem::from)` | **不需要** |
-| `GET /parts/by-work-type/{work_type_id}` | 恒 `null` | `part/service/phase1/work_type.rs:99` `PartListItem::from(手工 TPart)` | **不需要** |
-| `GET /parts/by-worker/{worker_id}` | 恒 `null` | `part/service/phase1/work_type.rs:321` `PartListItem::from(手工 TPart)` | **不需要** |
-| `GET /api/v2/com/union-list` | 恒 `null` | `com/union_list/service/crud.rs:731` / `:781` 结构体字面量（穷尽式，显式写 `None`） | **不需要** |
+| 端点 | `batch_id` / `batch_version` | `delivered_quantity` | 构造路径（决定为何 null / 为 0） | 前端是否要改 |
+|---|---|---|---|---|
+| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | 恒 `null` | `part/service/phase1/work_type.rs` 在 `From<TPart>` 之后**显式覆写**批次两字段（全仓唯一填 `Some` 的路径）；已送数量未覆写 | 需要：TS `PartItem` 补可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
+| `GET /parts` | 恒 `null` | **有值** | `PartService::list_parts_part_only_with_total`：`From<TPart>` 后显式覆写已送数量（零批次给 0） | **需要**（2026-10-03）：零件一览「已送数量」列此前恒显 0，现为真实数字 |
+| `GET /api/v2/com/union-list` | 恒 `null` | **有值** | `UnionListService` 三种 `row_type` 模式各接一次：PART 行取已交批次数量之和，ASSEMBLY 行取可凑齐套数 | **需要**（2026-10-03）：前端「部分已交」列表据此判定与展示 |
+| `GET /parts/pending-programming` | 恒 `null` | 恒 `null` | `part/service/phase1/lifecycle_helpers.rs` 结构体更新 `..PartListItem::from(..)` | **不需要** |
+| `GET /parts/by-work-type/{work_type_id}` | 恒 `null` | 恒 `null` | `part/service/phase1/work_type.rs` `PartListItem::from(手工 TPart)` | **不需要** |
+| `GET /parts/by-worker/{worker_id}` | 恒 `null` | 恒 `null` | `part/service/phase1/work_type.rs` `PartListItem::from(手工 TPart)` | **不需要** |
 
-> 2026-10-03 订正：上表的 8 行是按「所有返回 `R<PartListOut>` 的 handler」逐一枚举
-> 得出的，每行都标了构造点以便复核。`by-work-type` / `by-worker` 是其中两行，
-> 且 `serial_no` 才是它们的主字段 —— 枚举时不可按「主端点」直觉漏掉。
+> 上表只统计列表信封 `R<PartListOut>` 的 6 个端点。`POST /api/v2/assemblies/{id}/children`
+> 另返回单个 `R<PartListItem>`（共 7 处返回点），该处 `delivered_quantity` 恒 `null`。
+
+> 2026-10-03 订正一：上表原列 8 个端点，其中
+> `GET /parts/outsource-in-flight` / `GET /parts/outsource-sendable` 已于同日下线并
+> 迁到 `/api/v2` 下的**兄弟**前缀 `/api/v2/outsource-sendable` 与
+> `/api/v2/outsource-shipments/in-flight`（不是 `/api/v2/outsource/*` 的子路径），
+> 不再返回 `PartListOut`，故删去两行。
+>
+> 2026-10-03 订正二：`by-work-type` / `by-worker` 的主字段是 `serial_no`，
+> 枚举时不可按「主端点」直觉漏掉。
 
 **前端无需改 Zod schema**，依据两条（均已核实）：
 
-1. 两个新字段是 `#[serde(serialize_with = "serialize_i64_opt")]` + 无
-   `skip_serializing_if`，即**恒出现**（无值时为 `null`）—— 属增量 key；
+1. `batch_id` 是 `#[serde(serialize_with = "serialize_i64_opt")]` + 无
+   `skip_serializing_if`，`delivered_quantity` 是 `#[serde(default)]` + 无
+   `skip_serializing_if`，二者都是**恒出现**的增量 key（无值时为 `null`）；
 2. part 列表行 schema 刻意**不用** `.strict()`（前端 `src/composables/queries/schemas.ts`
    该处注释明写「行级 `.strict()` 会在后端加**任何一个**新字段时把整表打挂」），
    Zod 默认 strip 模式会安静吞掉未声明的 key。
