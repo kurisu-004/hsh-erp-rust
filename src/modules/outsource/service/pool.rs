@@ -88,13 +88,13 @@ impl OutsourceService {
     /// 角色守卫照抄 `/api/v2/prod/pool/counts`：Manager + Clerk + Inspector
     /// （admin 视角但不止 Manager）。
     ///
-    /// 流程（4 条查询，与工序数无关）：
+    /// 流程（3 条 SQL + 1 步内存合并，与工序数无关）：
     /// 1. 候选侧 `GROUP BY next_process_id` 计数（与 `pool_by_process` 的 items
     ///    行粒度逐行一致）；
     /// 2. 在途侧 `GROUP BY current_process_id` 计数；
-    /// 3. 两张计数表求并集，只留 `sendable + in_flight > 0` 的工序，
-    ///    按 `process_id ASC` 排；
-    /// 4. 一次 `process_map_short(&all_ids)` 取齐工序元数据。
+    /// 3. 一次 `process_map_short(&all_ids)` 取齐工序元数据。
+    /// 4. （非 SQL）两张计数表求并集 + 只留 `sendable + in_flight > 0` 的工序 +
+    ///    按 `process_id ASC` 排。
     pub async fn pool_counts<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
@@ -247,10 +247,14 @@ impl OutsourceService {
 
     /// `GET /outsource-pool/state?outsource_company_id=&process_id=`（2026-10-03 新增）
     ///
-    /// **无 role guard**（口径同 `/api/v2/prod/pool/state`：已登录即可读，
-    /// 看板上 admin 监控与业务自查共用）。
+    /// **角色守卫 = Manager + Clerk**（2026-10-03 review 第 1 轮修复）：与同域等价
+    /// 数据端点 `GET /outsource-shipments/in-flight` 对齐。本端点吐
+    /// `unit_price`（`price`）与 `customer_name` / `parent_customer_name` /
+    /// `applicant_name`，属外协域的敏感读面；`GET /api/v2/prod/pool/state` 之所以
+    /// 能做到「已登录即可读」，是因为它只吐内部批次元数据 —— 不能把这个宽松口径
+    /// 照抄到外协域。
     ///
-    /// 流程（2 条查询）：
+    /// 流程（2 条 SQL）：
     /// 1. 公司名（不存在 → `None`，**不拒绝**，见文档「端点契约要点」）；
     /// 2. 一条 list SQL 拿完该公司在该工序在外协的全部批次（含 shipment 字段
     ///    与派生的下一道工序）。
@@ -261,7 +265,10 @@ impl OutsourceService {
         &self,
         mut repo: R,
         query: &OutsourcePoolStateQuery,
+        current: &CurrentUser,
     ) -> Result<OutsourcePoolStateOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+
         let company_name = repo
             .company_get_by_id(query.outsource_company_id, false)
             .await?

@@ -13,7 +13,11 @@
 //! 8. `pool_state_rejects_missing_query_params_with_400`
 //! 9. `pool_serializes_snowflake_ids_and_price_as_strings`
 //! 10. `pool_counts_and_state_are_static_routes_not_process_id`（注册顺序守卫）
-//! + `pool_counts_allows_clerk_role`
+//! 11. 权限：`pool_counts_allows_clerk_role`（正向）+ `pool_counts_forbidden_for_shelf_account`
+//!     / `pool_by_process_forbidden_for_shelf_account` / `pool_state_forbidden_for_shelf_account`
+//!     （三个端点各一条负向回归网）
+//! 12. `pool_state_derives_next_step_from_parts_current_chain_after_rebind`（读侧锚链与写侧同源）
+//! 13. `pool_state_does_not_fan_out_on_duplicate_applicant_name`（`t_applicant` 重名不扇出）
 //!
 //! ## fixture 范本
 //! 通用基建（`send` / `json_request` / `test_app` / `test_pool` / `test_state` /
@@ -23,7 +27,7 @@
 //! 都要按需造不同组合，fixture 预置会污染 counts 的「只含非零工序」断言。
 
 use axum::http::StatusCode;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
@@ -50,6 +54,80 @@ async fn bootstrap_as_clerk() -> (PgPool, axum::Router, String, OutsourceFixture
     let app = test_app(test_state(pool.clone()).await);
     let token = login_token(&app, &fx.clerk_username, OutsourceFixture::PASSWORD).await;
     (pool, app, token, fx)
+}
+
+/// 插一个 `is_active=true` 的 `t_user` 行（bcrypt 哈希现场生成）。
+async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password: &str) -> i64 {
+    use hsh_erp_rust::auth::password;
+
+    let hash = password::hash(plain_password).expect("bcrypt hash");
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_user (id, username, password_hash, full_name, is_active, \
+         refresh_token_version, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(username.to_lowercase())
+    .bind(hash)
+    .bind(username)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user");
+    id
+}
+
+/// 插一个 `t_user_role` 行（user_id + role + scope）。
+async fn add_role(
+    pool: &PgPool,
+    user_id: i64,
+    role: &str,
+    scope_type: Option<&str>,
+    scope_id: Option<i64>,
+) -> i64 {
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_user_role (id, user_id, role, scope_type, scope_id, version, \
+         created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 0, $6, $6)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(role)
+    .bind(scope_type)
+    .bind(scope_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user_role");
+    id
+}
+
+/// SHELF scope 账号登录（scope 限定到给定 shelves；必须给 scope 才能通过登录校验）。
+///
+/// pool 域独享：`OutsourceFixture` 的 shelf scope 绑的是 fixture 预置货架，
+/// 负向用例要的是「只认货架、看不到全厂」的账号，本地 helper 便于按用例限定。
+async fn login_shelf_account(
+    pool: PgPool,
+    username: &str,
+    shelves: &[i64],
+) -> (axum::Router, String) {
+    let uid = insert_user_with_password(&pool, username, "changeme").await;
+    for sid in shelves {
+        add_role(&pool, uid, "SHELF_ACCOUNT", Some("shelf"), Some(*sid)).await;
+    }
+    let state = test_state(pool.clone()).await;
+    let req = json_request(
+        "POST",
+        "/iam/login",
+        Some(json!({"username": username, "password": "changeme"})),
+        None,
+    );
+    let (_, env) = send(test_app(state.clone()), req).await;
+    let token = env["data"]["token"].as_str().unwrap().to_string();
+    (test_app(state), token)
 }
 
 // ===========================================================================
@@ -106,6 +184,34 @@ async fn insert_part(pool: &PgPool, customer_id: i64, tag: &str, planned: &str) 
     .await
     .expect("insert t_part");
     id
+}
+
+/// 直插申请人（`t_applicant` 唯一索引是 `(name, customer_id)`，name 单独可重名）。
+async fn insert_applicant(pool: &PgPool, name: &str, customer_id: i64) -> i64 {
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_applicant (id, name, customer_id, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(customer_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_applicant");
+    id
+}
+
+/// 改 part 的申请人姓名（`insert_part` 固定写 `'Tester'`）。
+async fn set_part_applicant(pool: &PgPool, part_id: i64, applicant_name: &str) {
+    sqlx::query("UPDATE t_part SET applicant_name = $1 WHERE id = $2")
+        .bind(applicant_name)
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("update t_part.applicant_name");
 }
 
 /// 直插 OUTSOURCE 类别工序，返回 `(id, code, name)`。
@@ -178,6 +284,49 @@ async fn link_shelf_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
     .expect("insert t_shelf_process");
 }
 
+/// 建一条空的工艺链（**不**绑到任何 part）。
+async fn create_chain(pool: &PgPool, name: &str) -> i64 {
+    let chain_id = next_id();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+         updated_at, updated_by) VALUES ($1, $2, 0, now(), 0, now(), 0)",
+    )
+    .bind(chain_id)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("insert t_part_process_chain");
+    chain_id
+}
+
+/// 往 `chain_id` 追加一个 step，返回 step_id。
+async fn add_chain_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
+    let step_id = next_id();
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, 30, 0, now(), 0, now(), 0)",
+    )
+    .bind(step_id)
+    .bind(chain_id)
+    .bind(sort_order)
+    .bind(process_id)
+    .execute(pool)
+    .await
+    .expect("insert t_process_chain_step");
+    step_id
+}
+
+/// 把 part 绑到指定工艺链（改绑用）。
+async fn bind_part_to_chain(pool: &PgPool, part_id: i64, chain_id: i64) {
+    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+        .bind(chain_id)
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("bind part to chain");
+}
+
 /// 建工艺链并按 `steps`（`[(process_id, sort_order)]`）建 step。
 ///
 /// 返回 `(chain_id, Vec<step_id>)`（下标与 `steps` 下标一一对应）。
@@ -187,39 +336,12 @@ async fn create_chain_with_steps(
     part_id: i64,
     steps: &[(i64, i32)],
 ) -> (i64, Vec<i64>) {
-    let chain_id = next_id();
-    sqlx::query(
-        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
-         updated_at, updated_by) VALUES ($1, $2, 0, now(), 0, now(), 0)",
-    )
-    .bind(chain_id)
-    .bind(format!("chain-{part_id}"))
-    .execute(pool)
-    .await
-    .expect("insert t_part_process_chain");
-    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
-        .bind(chain_id)
-        .bind(part_id)
-        .execute(pool)
-        .await
-        .expect("bind part to chain");
+    let chain_id = create_chain(pool, &format!("chain-{part_id}")).await;
+    bind_part_to_chain(pool, part_id, chain_id).await;
 
     let mut step_ids = Vec::with_capacity(steps.len());
     for (process_id, sort_order) in steps {
-        let step_id = next_id();
-        sqlx::query(
-            "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
-             estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
-             VALUES ($1, $2, $3, $4, 30, 0, now(), 0, now(), 0)",
-        )
-        .bind(step_id)
-        .bind(chain_id)
-        .bind(sort_order)
-        .bind(process_id)
-        .execute(pool)
-        .await
-        .expect("insert t_process_chain_step");
-        step_ids.push(step_id);
+        step_ids.push(add_chain_step(pool, chain_id, *process_id, *sort_order).await);
     }
     (chain_id, step_ids)
 }
@@ -527,8 +649,9 @@ async fn pool_counts_returns_200_sorted_and_totals_match() {
     );
 }
 
-/// 权限口径：`counts` / `{process_id}` 是 Manager + Clerk + Inspector（照抄
-/// `/prod/pool/counts`），CLERK 也在集合内。
+/// 权限口径：`counts` / `state` 是 Manager + Clerk（`state` 与同域
+/// `/outsource-shipments/in-flight` 对齐；`counts` 另含 Inspector），
+/// CLERK 都在集合内。
 #[tokio::test]
 async fn pool_counts_allows_clerk_role() {
     let (_pool, app, token, _fx) = bootstrap_as_clerk().await;
@@ -541,7 +664,63 @@ async fn pool_counts_allows_clerk_role() {
         9_000_000_000_000_000_100,
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "state 无 role guard: {env}");
+    assert_eq!(s, StatusCode::OK, "CLERK 应可读 state: {env}");
+}
+
+/// 权限负向回归：SHELF scope 账号被 `counts` 拒（403）。
+///
+/// 只测正向的话，将来有人删掉 `pool_counts` 里的 `require_any_role` 这条用例
+/// 仍然全绿。口径对齐 `tests/production/worker_pool.rs` 同名用例。
+#[tokio::test]
+async fn pool_counts_forbidden_for_shelf_account() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PC-FB").await;
+    let shelf = insert_shelf(&pool, "PCS-FB").await;
+    link_shelf_process(&pool, shelf, proc_id).await;
+    let co = insert_company(&pool, "FbCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+
+    // scope 必须给才能登录；给了也仍然被 service 的 role 守卫拒。
+    let (app, token) = login_shelf_account(pool.clone(), "shelf_user_pool_counts", &[shelf]).await;
+
+    let (s, env) = get_counts(&app, &token).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
+    assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
+}
+
+/// 权限负向回归：SHELF scope 账号被 `{process_id}` 拒（403）。
+#[tokio::test]
+async fn pool_by_process_forbidden_for_shelf_account() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PBP-FB").await;
+    let shelf = insert_shelf(&pool, "PBPS-FB").await;
+    link_shelf_process(&pool, shelf, proc_id).await;
+
+    let (app, token) = login_shelf_account(pool.clone(), "shelf_user_pool_detail", &[shelf]).await;
+
+    let (s, env) = get_detail(&app, &token, proc_id).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
+    assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
+}
+
+/// 权限负向回归：SHELF scope 账号被 `state` 拒（403）。
+///
+/// `state` 吐 `unit_price` + 客户名 / 申请人名，是外协域的敏感读面 ——
+/// 若守卫被放宽回「已登录即可读」，SHELF 账号就能枚举任意外协公司的在外协批次
+/// 与单价，而 `counts` / `{process_id}` 对它是 403。这条用例就是那道防线。
+#[tokio::test]
+async fn pool_state_forbidden_for_shelf_account() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PST-FB").await;
+    let shelf = insert_shelf(&pool, "PSTS-FB").await;
+    let co = insert_company(&pool, "StFbCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+
+    let (app, token) = login_shelf_account(pool.clone(), "shelf_user_pool_state", &[shelf]).await;
+
+    let (s, env) = get_state(&app, &token, co, proc_id).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
+    assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
 }
 
 // ===========================================================================
@@ -978,6 +1157,115 @@ async fn pool_state_chain_unresolvable_when_no_step_or_chain_tail() {
         );
         assert!(row["receive_next_process_name"].is_null(), "{tag}: {env}");
     }
+}
+
+/// 读侧锚链必须与写侧同源：part 在外协期间被**改绑到另一条工艺链**时，
+/// `receive_next_process_id` 必须指向**新链**里的下一道工序。
+///
+/// 写侧 `receive_from_outsource` 走 `require_process_chain(part_id)`（读
+/// `t_part.process_chain_id`）+ `resolve_step_id_by_process(chain_id, process_id)`。
+/// 若读侧锚 `pb.current_process_step_id` 所属的旧链，返回的就是新链里不存在的
+/// 工序 id，写侧必然 404，而 `chain_resolvable` 却在说「可免填」。
+#[tokio::test]
+async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_customer(&pool, "PcRebind", "I").await;
+    let (proc_os, _, _) = seed_outsource_process(&pool, "PRB-OS").await;
+    let (proc_next_a, _, next_name_a) = seed_inhouse_process(&pool, "PRB-NEXTA").await;
+    let (proc_next_b, _, next_name_b) = seed_inhouse_process(&pool, "PRB-NEXTB").await;
+    let co = insert_company(&pool, "RebindCo", true).await;
+    link_company_process(&pool, co, proc_os).await;
+
+    // 发出时：part 绑链 A（sort 1 = 外协，sort 2 = 下一道 NEXT_A）。
+    let p = insert_part(&pool, cid, "RB", "2026-12-01").await;
+    let (_, steps_a) = create_chain_with_steps(&pool, p, &[(proc_os, 1), (proc_next_a, 2)]).await;
+    let b = insert_held_batch(&pool, p, co, proc_os, Some(steps_a[0]), 6, 2).await;
+    let q = insert_approved_quote(&pool, p, co, proc_os, "9.00").await;
+    insert_open_shipment(&pool, q, p, b, co, proc_os, 6, "9.00").await;
+
+    // 改绑到链 B（同样两道工序，但第二道是 NEXT_B）—— 批次的
+    // `current_process_step_id` 仍指向**旧链 A** 的 step。
+    let chain_b = create_chain(&pool, "rebound-chain").await;
+    add_chain_step(&pool, chain_b, proc_os, 1).await;
+    add_chain_step(&pool, chain_b, proc_next_b, 2).await;
+    bind_part_to_chain(&pool, p, chain_b).await;
+
+    let (s, env) = get_state(&app, &token, co, proc_os).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let row = row_by_batch(env["data"]["items"].as_array().unwrap(), b, &env);
+    assert_eq!(
+        row["receive_next_process_id"],
+        proc_next_b.to_string(),
+        "必须解析 part 当前链（B）里的下一道工序，而不是旧链（A）: {env}"
+    );
+    assert_eq!(row["receive_next_process_name"], next_name_b, "{env}");
+    assert_ne!(
+        row["receive_next_process_id"],
+        proc_next_a.to_string(),
+        "{env}"
+    );
+    assert_ne!(row["receive_next_process_name"], next_name_a, "{env}");
+    assert_eq!(
+        row["chain_resolvable"], true,
+        "新链有下一 step ⇒ 可解析: {env}"
+    );
+
+    // 写侧前提：`resolve_step_id_by_process(chain_b, proc_next_b)` 必须能解析到
+    // step，否则上一组断言等于给了前端一个会 404 的默认值。
+    let resolvable: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM t_process_chain_step \
+         WHERE chain_id = $1 AND process_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(chain_b)
+    .bind(proc_next_b)
+    .fetch_one(&pool)
+    .await
+    .expect("count chain_b step for proc_next_b");
+    assert_eq!(resolvable, 1, "写侧在 chain B 里必须能解析出该工序的 step");
+}
+
+/// `t_applicant` 按 name 匹配（字符串非 FK，唯一索引是 `(name, customer_id)`），
+/// 同名申请人跨客户并存时 `list_held` **不得扇出**：一个批次恒一行，且
+/// `current_held == items.len()`。
+#[tokio::test]
+async fn pool_state_does_not_fan_out_on_duplicate_applicant_name() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    // `serial_prefix` 是 varchar(1) 且全局唯一（uq_t_customer_root_prefix），
+    // 两个客户必须用不同前缀。
+    let cid1 = insert_customer(&pool, "PcAp1", "Z").await;
+    let cid2 = insert_customer(&pool, "PcAp2", "Y").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PAP-OS").await;
+    let co = insert_company(&pool, "ApCo", true).await;
+    link_company_process(&pool, co, proc_id).await;
+
+    // 同名申请人分属两个客户 —— DB 允许（唯一索引含 customer_id）。
+    insert_applicant(&pool, "DupName", cid1).await;
+    insert_applicant(&pool, "DupName", cid2).await;
+
+    let p = insert_part(&pool, cid1, "AP", "2026-12-01").await;
+    set_part_applicant(&pool, p, "DupName").await;
+    let (_, steps) = create_chain_with_steps(&pool, p, &[(proc_id, 1)]).await;
+    let b = insert_held_batch(&pool, p, co, proc_id, Some(steps[0]), 5, 2).await;
+    let q = insert_approved_quote(&pool, p, co, proc_id, "4.00").await;
+    insert_open_shipment(&pool, q, p, b, co, proc_id, 5, "4.00").await;
+
+    let (s, env) = get_state(&app, &token, co, proc_id).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "同名申请人跨客户不得把一行批次扇成多行: {env}"
+    );
+    assert_eq!(
+        env["data"]["current_held"].as_i64().unwrap(),
+        items.len() as i64,
+        "current_held 必须等于 items.len(): {env}"
+    );
+    let batch_ids: Vec<&Value> = items.iter().map(|i| &i["batch_id"]).collect();
+    assert_eq!(batch_ids.len(), 1, "batch_id 不得重复: {env}");
+    let row = row_by_batch(items, b, &env);
+    assert_eq!(row["applicant_name"], "DupName", "{env}");
 }
 
 #[tokio::test]

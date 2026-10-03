@@ -20,7 +20,7 @@
 |---|---|---|---|
 | GET | `/api/v2/outsource-pool/counts` | **Manager + Clerk + Inspector** | 跨所有货架，按外协工序聚合「可发 / 在途」双徽标 |
 | GET | `/api/v2/outsource-pool/{process_id}` | **Manager + Clerk + Inspector** | 单个 tab 的全部内容：左列候选批次 + 右列全部活跃公司 |
-| GET | `/api/v2/outsource-pool/state` | **已登录（无 role guard）** | 某公司在某工序在外协的全部批次（看板右列的卡片来源） |
+| GET | `/api/v2/outsource-pool/state` | **Manager + Clerk** | 某公司在某工序在外协的全部批次（看板右列的卡片来源） |
 
 > 路由挂载：`/api/v2/outsource-pool`（独立顶层前缀，见 `src/modules/mod.rs::v2_router`）。
 >
@@ -88,18 +88,35 @@ AND deleted_at IS NULL`，归属锚是批次自身的
 `send_to_outsource` 就是这么落的（`prod::batch::service::outsource.rs` 的
 `mark_batch_with_status_and_meta(..., Some(company_id), Some(step_id), Some(process_id))`）。
 
+> ⚠️ **在途侧两处口径刻意不对称**（都只可能在途侧触发，候选侧不涉及）：
+> 1. `counts[].in_flight_count` 只按 `current_process_id` 聚合，**不 JOIN
+>    `t_process`**；而 `{process_id}.companies[]` 的 `held_count` 要求公司
+>    `is_active` **且**已映射该工序。因此
+>    **`in_flight_count` 可能 `>` `Σ companies[].held_count`** —— 差值来自
+>    「公司被停用 / 映射被删 / 工序已软删」的批次。同理
+>    `counts[].process_name` 的 `(deleted#<id>)` 占位也只会在途侧出现
+>    （候选侧 INNER JOIN `t_process` 已排除软删工序）。
+> 2. `in_flight_count` 不做货架 scope 过滤（`counts` 是 admin 视角的全厂聚合），
+>    与 SHELF 账号无关 —— `counts` 对 SHELF 账号是 403。
+
 ### 下一道工序的派生（`state.items[*].receive_next_process_*`）
 
-从 `pb.current_process_step_id` 取当前 step 的 `sort_order`，再取同 `chain_id` 内
-`sort_order = 当前 + 1` 且未软删的 step。DB 有唯一索引
+**锚链取 `COALESCE(p.process_chain_id, cur.chain_id)`**：`cur` =
+`pb.current_process_step_id` 指向的 step，只用它取 `sort_order`；取下一 step 时
+在**锚链**内找 `sort_order = 当前 + 1` 且未软删的 step。DB 有唯一索引
 `uq_chain_step_chain_order (chain_id, sort_order) WHERE deleted_at IS NULL`
-⇒ **唯一无歧义**。
+⇒ **唯一无歧义**。锚链软删时同样落到「无下一 step」分支。
+
+**锚链必须与写侧同源**：写侧 `receive-from-outsource` 走
+`require_process_chain(part_id)`（读 `t_part.process_chain_id`）+ 
+`resolve_step_id_by_process(chain_id, next_process_id)`。锚 `p.process_chain_id`
+⇒ 本端点给出的 process_id 必然是**锚链内的活跃 step 的工序**，写侧一定能解析到。
 
 `chain_resolvable = receive_next_process_id != 0`，等价于下面三条同时成立：
 
 1. `current_process_step_id` 存在且非 `"0"`；
-2. 该 step 属于一个**存在且未软删**的 `t_part_process_chain`；
-3. 同 chain 内存在下一 step（未软删）。
+2. 锚链存在且**未软删**；
+3. 锚链内存在下一 step（未软删）。
 
 **业务含义**（前端据此决定接收时要不要弹对话框让用户填工序）：
 `true` ⇒ 工序链已知，可免填「下一道工序」；`false` ⇒ 工序链缺失或指针漂移，
@@ -109,6 +126,18 @@ AND deleted_at IS NULL`，归属锚是批次自身的
 > `receive_next_process_name` 为 `null`、`chain_resolvable` 仍为 `true` ——
 > 判据按步骤 1–3 判定，工序名取不到不影响「下一 step 存在」这个事实。
 > 这也是 `receive_next_process_name` 声明为可空的原因。
+
+> ⚠️ **`chain_resolvable == true` 仍可能收到写侧 404（`20702`）**：若 part 在外协
+> 期间被改绑工艺链、且**新链内与 `current_process_step_id` 的 `sort_order + 1`
+> 位置没有 step**（例如新链只有一道工序），本端点算出的下一 step 缺失 ⇒
+> `chain_resolvable` 为 `false`，前端走既有交互路径（弹对话框让用户手填）；
+> 但若 part 在**本端点返回之后、用户点接收之前**被再次改绑 / 该 step 被软删，
+> 写侧会 **404 `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`**（`chain {} 内找不到
+> process_id={} 的活跃 step`）。这类竞态无法在读侧消除，**前端必须处理 `20702`
+> 兜底**：与 `chain_resolvable == false` 一样弹对话框让用户手填下一道工序，
+> 重试一次即可。`p.process_chain_id IS NULL`（脏数据）时锚链回落到
+> `cur.chain_id`，此时写侧会先撞 `20706 BIZ_PROCESS_CHAIN_REQUIRED`（409）——
+> 同属「读侧已登录才能看到、但写侧不保证接受」的情形。
 
 ---
 
@@ -219,7 +248,7 @@ AND deleted_at IS NULL`，归属锚是批次自身的
 | `is_urgent` | bool | |
 | `customer_name` | string? | L2 叶子客户名 |
 | `parent_customer_name` | string? | L1 一级集团名 |
-| `applicant_name` | string? | `t_part.applicant_name` LEFT JOIN `t_applicant.name`（非 FK，字符串匹配） |
+| `applicant_name` | string? | `t_part.applicant_name` LEFT JOIN `t_applicant.name`（非 FK，字符串匹配）。`t_applicant` 的唯一索引是 `(name, customer_id)`，**name 单独不唯一**，故 JOIN 走 `LEFT JOIN LATERAL (… ORDER BY id ASC LIMIT 1)` 收敛到一行 —— 否则同名申请人跨客户并存时一个批次会扇出成多行，破坏 `current_held == items.len()` |
 | `location` | string | 恒为 `"OUTSOURCE_COMPANY"` |
 | `note` | string? | 工单级备注（`t_part.note`；DB 无 batch 级 remark 字段） |
 | `version` | i32 | **`t_part_batch.version`** —— `receive-from-outsource` 的 OCC 锚 |
@@ -240,8 +269,13 @@ AND deleted_at IS NULL`，归属锚是批次自身的
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `outsource_company_id` | string (i64) | ✓ | 外协公司雪花 ID（= `t_part_batch.current_holder_id`） |
-| `process_id` | string (i64) | ✓ | 外协工序雪花 ID（= `t_part_batch.current_process_id`） |
+| `outsource_company_id` | i64 | ✓ | 外协公司雪花 ID（= `t_part_batch.current_holder_id`） |
+| `process_id` | i64 | ✓ | 外协工序雪花 ID（= `t_part_batch.current_process_id`） |
+
+> 两个 query 参数在 wire 上都是**字符串**（雪花 ID 超 i64 JS 安全整数），由
+> `serde_urlencoded` 按串解析成 `i64`；类型列写 `i64` 是与同域
+> `outsource-sendable.md` / `outsource-shipments.md` 的 query 参数标注保持一致。
+> **响应体**里的雪花 ID 则序列化成字符串（`serialize_i64`），两者不要混。
 
 ---
 
@@ -253,10 +287,13 @@ AND deleted_at IS NULL`，归属锚是批次自身的
 |---|---|---|
 | `GET /outsource-pool/counts` | **Manager + Clerk + Inspector** | 照抄 `GET /api/v2/prod/pool/counts`（`docs/api/production/worker-pool.md`「端点列表」行 + `service::pool_counts_all_shelves` 的 `require_any_role(&[Manager, Clerk, Inspector])`）—— admin 视角但不止 Manager。外协候选与在途本来就是业务/跟单视角，Clerk 必须能看 |
 | `GET /outsource-pool/{process_id}` | **Manager + Clerk + Inspector** | 照抄 `GET /api/v2/prod/pool/{process_id}`（同文档；`service::pool_by_process` 内 `require_any_role`）。与 `counts` 同集合：两者是同一个看板的 tab 列表与 tab 内容，权限必须一致，否则会出现「徽标看得见、点进去 403」 |
-| `GET /outsource-pool/state` | **已登录（无 role guard）** | 照抄 `GET /api/v2/prod/pool/state`（同文档「权限: 已登录（**无 role guard** —— worker 自查 + admin 监控共用）」）。该端点是某列的卡片来源，语义同「这部分货现在在谁手上」，业务侧只需登录 |
+| `GET /outsource-pool/state` | **Manager + Clerk** | 对齐同域等价数据端点 `GET /outsource-shipments/in-flight`（`docs/api/outsource-shipments.md`，Manager / Clerk）。**不放宽到「已登录」**：本端点除批次元数据外还吐 `price`（`t_outsource_shipment.unit_price`）与 `customer_name` / `parent_customer_name` / `applicant_name`，敏感级别与 `/in-flight` 同档；而 `GET /api/v2/prod/pool/state` 之所以能做到「已登录即可读」，是因为它只吐内部批次元数据 —— **不能把 prod 侧的宽松口径照抄到外协域**，否则 SHELF scope 账号被 `counts` / `{process_id}` 双双 403，却能经 `/state` 枚举任意外协公司的在外协批次、单价与客户 |
 
 三处守卫都在 **service 层**（`current.require_any_role`），handler 不重复校验
-（与 work_type / assembly 域惯例一致）。
+（与 work_type / assembly 域惯例一致）。负向回归网：`tests/outsource/pool.rs` 的
+`pool_counts_forbidden_for_shelf_account` / `pool_by_process_forbidden_for_shelf_account`
+/ `pool_state_forbidden_for_shelf_account`（三个端点各一条，SHELF scope 账号
+必须 403 + `code=40300`）。
 
 ### 前端如何用本域输出驱动写端点
 
@@ -278,6 +315,7 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 | `process_id` | `send-to-outsource` 的 `process_id` |
 | `state.items[*].chain_resolvable` | `true` ⇒ 接收时免填「下一道工序」；`false` ⇒ 弹对话框让用户填 |
 | `state.items[*].receive_next_process_id` | `chain_resolvable == true` 时可作为对话框的默认值 |
+| 写侧 404 `20702` / 409 `20706` | 与 `chain_resolvable == false` **同一条交互路径**：弹对话框让用户手填下一道工序后重试（成因见「下一道工序的派生」的 caveat） |
 
 ### 排序
 
@@ -291,8 +329,9 @@ batch_no ASC, next_process_id ASC` —— 与 `/outsource-sendable` 逐字一致
 
 `counts`：`process_id ASC`。
 
-`state.items`：`t_part_batch.id ASC`（与 `/outsource-pool/state` 的
-`list_held_by_worker_with_part` 惯例一致，按 batch_id 稳定展示）。
+`state.items`：`t_part_batch.id ASC`（与
+`prod::worker_pool::WorkerPoolRepo::list_held_by_worker_with_part` 惯例一致，
+按 batch_id 稳定展示）。
 
 ### 工序不存在时的行为（刻意不对称）
 
@@ -333,7 +372,8 @@ dashboard 事件），见 [`./websocket.md`](./websocket.md)。
 - `counts` 的工序元数据**一次 `process_map_short(&all_ids)` 取齐**（不是按工序逐个查）。
 - `{process_id}` 的 `companies[].held_count` 与 `state.items` 全部在各自**一条 SQL**
   内 JOIN / `LEFT JOIN LATERAL` 解析完毕，service 层零回查。
-- 查询条数：counts 4 条（两组 GROUP BY + 元数据 + 合并在内存）、`{process_id}` 3 条、
+- 查询条数：`counts` 3 条 SQL（候选 / 在途两条 `GROUP BY` + 一次
+  `process_map_short` 元数据，并集与排序在内存里做）、`{process_id}` 3 条、
   `state` 2 条 —— **与行数、工序数无关**。
 
 ### 与 `/outsource-sendable` 的 SQL 共享（防分叉）
@@ -376,12 +416,15 @@ dashboard 事件），见 [`./websocket.md`](./websocket.md)。
 
 ## 集成测试
 
-`tests/outsource/pool.rs`（12 用例，与本文件验收标准逐条对应）：
+`tests/outsource/pool.rs`（17 用例，与本文件验收标准逐条对应）：
 
 | 用例 | 守的不变量 |
 |---|---|
 | `pool_counts_returns_200_sorted_and_totals_match` | counts 只含 `sendable+in_flight>0` 的工序、按 `process_id ASC`；`total == sendable_total + in_flight_total`；工序元数据正确；0+0 的工序不出现 |
-| `pool_counts_allows_clerk_role` | 权限口径：CLERK 可读 counts / state |
+| `pool_counts_allows_clerk_role` | 权限正向：CLERK 可读 counts / state |
+| `pool_counts_forbidden_for_shelf_account` | **权限负向回归**：SHELF scope 账号读 counts → 403 + `code=40300`（删掉守卫该用例会红） |
+| `pool_by_process_forbidden_for_shelf_account` | 同上，`{process_id}` 403 |
+| `pool_state_forbidden_for_shelf_account` | 同上，`state` 403（`state` 带单价 + 客户名，守卫不能被放宽回「已登录」） |
 | `pool_counts_empty_returns_zeroed_totals` | 空库返 200 + 空数组 + 全零（不是 500） |
 | `pool_counts_and_state_are_static_routes_not_process_id` | **注册顺序守卫**：`/counts`、`/state` 不被 `/{process_id}` 吞成 400 |
 | `pool_detail_lists_all_mapped_companies_including_empty_column` | `companies` 恰为映射的活跃公司（停用的不出现）；`held_count` 正确；**无在途批次的公司也在列且 `= 0`**；`items` 不含其它工序的行；`total == items.len()` |
@@ -391,6 +434,8 @@ dashboard 事件），见 [`./websocket.md`](./websocket.md)。
 | `pool_state_returns_held_batches_with_shipment_fields` | 该公司在该工序的全部在外协批次（含 `sent_at` / `price` / `version`）；`current_held == items.len()`；别的公司 / 别的工序的批次不出现 |
 | `pool_state_chain_resolvable_when_next_step_exists` | 有下一 step ⇒ `chain_resolvable == true` 且 id / name = 下一 step 的工序 |
 | `pool_state_chain_unresolvable_when_no_step_or_chain_tail` | 链尾 / 无 `current_process_step_id` 两种情形 ⇒ `chain_resolvable == false`、`receive_next_process_id == "0"`、`_name == null` |
+| `pool_state_derives_next_step_from_parts_current_chain_after_rebind` | **读侧锚链与写侧同源**：part 改绑到链 B 后，`receive_next_process_id` 指向链 B 的下一道工序（不是旧链 A 的），且写侧 `resolve_step_id_by_process` 在链 B 内确实能解析到该 step |
+| `pool_state_does_not_fan_out_on_duplicate_applicant_name` | `t_applicant` 同名跨客户并存时 `items` **不扇出**（一个批次恒一行、无重复 `batch_id`）、`current_held == items.len()`、`applicant_name` 仍取到 |
 | `pool_state_rejects_missing_query_params_with_400` | 缺任一 query 参数 → **400**（非 500、非静默默认值） |
 
 单测：

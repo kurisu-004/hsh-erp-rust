@@ -25,8 +25,10 @@
 //!
 //! ## 权限
 //! 权限守卫在 service 层（`current.require_any_role`），handler 不重复校验。
+//! 三个 pool 端点的权限面统一由 service 兜住（`pool_state` 的角色集合与取舍见
+//! 该函数注释）。
 //!
-//! ## 路由表（20 端点）
+//! ## 路由表（23 端点）
 //!
 //! - `GET    /outsource-companies`              — 列表（READ）
 //! - `POST   /outsource-companies`              — 新建（WRITE）
@@ -465,20 +467,27 @@ pub async fn pool_by_process(
 
 /// `GET /outsource-pool/state?outsource_company_id=&process_id=` —— 读端点
 ///
-/// **无 role guard**（口径同 `/api/v2/prod/pool/state`：已登录即可读）。两个
-/// query 参数都必填，缺任一个 → axum `QueryRejection` → **400**（不会静默
-/// 给默认值，否则看板右列会「看起来正常地空掉」）。
+/// **角色守卫 = Manager + Clerk**（下沉到 service 的 `pool_state`），与同域等价
+/// 数据端点 `GET /outsource-shipments/in-flight`（Manager / Clerk）对齐。
 ///
-/// handler 不接 `CurrentUser`：本端点不读用户上下文（与 `prod::pool/state`
-/// 一致），鉴权由 `authenticate_middleware` 统一兜住。
+/// 2026-10-03 review 第 1 轮修复：权限面按**外协域自身的敏感级别**定，不照抄
+/// `GET /api/v2/prod/pool/state` 的「已登录即可读」—— prod 侧那个端点只吐内部
+/// 批次元数据，本端点除批次元数据外还吐 `t_outsource_shipment.unit_price`
+/// （`price`）与 `customer_name` / `parent_customer_name` / `applicant_name`。
+/// 守卫只要求登录的话，SHELF scope 账号会被 `counts` / `{process_id}` 双双 403，
+/// 却能经 `/state` 枚举任意外协公司的在外协批次、单价与客户。
+///
+/// 两个 query 参数都必填，缺任一个 → axum `QueryRejection` → **400**（不会静默
+/// 给默认值，否则看板右列会「看起来正常地空掉」）。
 pub async fn pool_state(
     State(state): State<Arc<AppState>>,
+    current: CurrentUser,
     Query(query): Query<OutsourcePoolStateQuery>,
 ) -> Result<Json<R<OutsourcePoolStateOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = state
         .outsource_service
-        .pool_state(&mut *conn, &query)
+        .pool_state(&mut *conn, &query, &current)
         .await?;
     Ok(Json(R::ok(out)))
 }
