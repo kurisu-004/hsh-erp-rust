@@ -399,3 +399,86 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 > [`./outsource-shipments.md`](./outsource-shipments.md) /
 > [`./outsource-sendable.md`](./outsource-sendable.md) /
 > [`./parts/lifecycle.md`](./parts/lifecycle.md)。
+
+### 9.3 2026-10-04：报工台放回页的工序链适配（`by-worker` 出参增量）
+
+报工台「放回」要判定三态：链内有下一道 ⇒ 免填并提示下一道；当前工序是链内最后一道 ⇒
+提示「加工完成后请送检」；无链 / 位置漂移 / 位置有歧义 ⇒ 弹工序选择框。放回页的唯一
+数据源是 `GET /api/v2/parts/by-worker/{worker_id}`，本次在该端点的行出参上补齐判据。
+
+**新增 4 个字段**（`PartListItem`，**仅本端点填**，其余 6 处返回点恒默认值）：
+
+| 字段 | 类型 | 取值 |
+|---|---|---|
+| `chain_state` | string | 三值互斥枚举：`"NONE"` / `"NEXT"` / `"TAIL"`（`rename_all = "UPPERCASE"`） |
+| `chain_next_process_id` | string (i64) | 下一道工序 id；非可空 + `"0"` 兜底（与 `outsource-pool` 的 `receive_next_process_id` 同款约定） |
+| `chain_next_process_name` | string? | 下一道工序名（`t_process.name`） |
+| `chain_current_process_name` | string? | 当前工序名（`TAIL` 提示点名用） |
+
+三值用**一个枚举**而不是两个 bool：两个 bool 会产生「可免填 + 是链尾」这类自相矛盾的
+组合，前端必须自己排优先级，而排错的后果是静默把工件投到错误工序。
+
+**同一取行 SQL 一并补齐的两列投影**（同为本端点填）：
+
+- `batch_id` / `batch_version` —— 本端点的行本来就是「批次行」，但出参 VO 只有 part 级
+  字段，放回页拿不到批次 id 就发不出写请求。这两个字段的口径已改为「pickable 与
+  by-worker 都填」。
+- `process_chain_id` —— 取行 SQL 现在投影该列，VO 不再硬编码 `None`。
+
+**派生口径的三条硬约束**（读侧自己说了不算，必须与写侧同源 / 必须自己识别歧义）：
+
+1. **锚链内「当前工序的位置」必须按 `b.current_process_id` 重新定位**，不能拿
+   `b.current_process_step_id` 的 `sort_order` 当位置 —— worker-scan 的 RETURNED 分支
+   只写 `current_process_id`、不推进 step 指针（见
+   [`./parts/inspection.md`](./parts/inspection.md) worker-scan 业务流转节），
+   多工序链批次第 2 次放回时指针仍停在首次定位那一步，按位置推进会把**当前工序自己**
+   当成下一道返回，而 `chain_state` 仍在说「可免填」⇒ 静默错值比拒收更难发现。
+2. **「下一道」按 `sort_order > 当前 ORDER BY sort_order ASC LIMIT 1` 取**，与写侧
+   `prod::process_chain::repo::query::next_step_in_chain` 逐条同形。**不能**用
+   `sort_order = 当前 + 1`：`sort_order` 的**密度不由读侧决定**，写侧只保证链内
+   `sort_order` 互不重复（`upsert_chain` 校验 + `uq_chain_step_chain_order` 兜底），
+   稠密 0-based（前端 `usePartProcessDesign` 保存时拍平）与稀疏 `10/20/30` 两种密度
+   都能落库；`+ 1` 只在稠密下正确，`>` 对两种密度都成立。
+3. **链内同一 `process_id` 重复 ⇒ 显式落 `NONE`**。`t_process_chain_step` 只有
+   `uq_chain_step_chain_order (chain_id, sort_order) WHERE deleted_at IS NULL` 一个
+   唯一约束，**没有** `(chain_id, process_id)` 唯一约束；写侧 `upsert_chain` 也只校验
+   `sort_order` 重复、不校验 `process_id` 重复 ⇒ 重复工序的链后端照收。此时按
+   `process_id` 定位当前 step 会扇出多行（一行派生 `NEXT → 当前工序自己`、另一行派生
+   `TAIL`），让 `LIMIT 1` 静默取其一就是拿「绝不能把当前工序自己当成下一道」这条承诺
+   去赌 PG 的行序。取行 SQL 用 `(count(*) OVER ())` 带出链内命中数，命中 >1 时显式落
+   `NONE` 并门控全部派生列。
+
+> 归口文档：[`./parts/lifecycle.md`](./parts/lifecycle.md)
+> `GET /api/v2/parts/by-worker/{worker_id}` 节（字段表 + 三值语义表 + 派生口径）、
+> [`./parts/index.md`](./parts/index.md) 的 `PartListItem` 字段表与前端配套改动清单。
+
+### 9.4 2026-10-04 登记：外协 `list_held` 的「下一道」仍用 `sort_order + 1`
+
+**本次不修**，登记以免下一个读 `OutsourcePoolRepo::list_held` 的人把它当正典抄。
+
+`src/modules/outsource/repo/sql.rs` 的 `list_held` 取「下一道」写的是
+`nsp.sort_order = cur2.sort_order + 1`，其 doc 用唯一索引
+`uq_chain_step_chain_order (chain_id, sort_order)` 论证「下一道唯一无歧义」——
+**这是 non-sequitur**：该索引只保证一个 `sort` 槽位唯一，不蕴含下一道落在 `+1`。
+同样的口径已扩散到 [`./outsource-pool.md`](./outsource-pool.md)。
+
+与 §9.3 的 `by-worker` 派生是同源问题的两侧：`by-worker` 走 `>` 是因为要与写侧
+`next_step_in_chain` 同形、且对稠密 / 稀疏两种密度都成立；`list_held` 的 `+ 1` 只在
+稠密下成立，一旦库里出现稀疏 `sort_order` 的链（`docs/api/production/process-chain.md`
+记的正是稀疏口径），外协看板的接收提示就会把「还有下一道」说成链尾。
+
+本次不修的理由：
+
+- 该行在本次改动之前就存在、本次 diff 未触碰；
+- 当前真实写路径（前端保存时把 `sort_order` 拍平成稠密 0-based）下结果是**潜在**
+  缺陷而非活跃 bug；
+- ⚠️ **别把 [`./production/process-chain.md`](./production/process-chain.md) 当密度
+  依据**：那份文档记的写入口径（`sort_order` 默认稀疏 `10/20/30`、中间插入取
+  `(prev+next)/2`、精度耗尽走 `reorder_with_step_size` 批量重排）与真实写路径不符 ——
+  前端工序链编辑页保存时经 `upsertSteps` / `reorderSteps` 把 `sort_order` 按下标**拍平为
+  稠密 0-based**，文档提到的重排路径也未实装触发条件。文档漂移本身不在本次修复范围，
+  但它正是稀疏口径的传播源：读侧无论库里是哪种密度都只能用 `>`（与写侧正典
+  `next_step_in_chain` 同形），不能用 `+ 1`；
+- 外协出参把「无下一道」与「链不可解析」塌成同一个 `chain_resolvable = false`
+  （与 `by-worker` 的三值不同），改它要连带复核文档 3 处 + 约 499 行测试期望；
+- 属另一个变更，应当独立成一次带回归测试的修复。

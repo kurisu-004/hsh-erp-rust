@@ -58,7 +58,7 @@ use crate::modules::part::repo::PartRepo;
 use crate::modules::part::service::list_enrichment::{
     enrich_part_list_with_location_and_holder, fetch_delivered_quantities, fetch_delivered_sets,
 };
-use crate::modules::part::vo::PartListItem;
+use crate::modules::part::vo::{ChainState, PartListItem};
 use crate::shared::error::AppError;
 
 use super::super::dto::{RowType, UnionListQuery};
@@ -783,9 +783,16 @@ fn project_assembly_to_part_list_item(a: TAssembly) -> PartListItem {
         has_cnc_program: false,
         // 2026-10-03：批次锚点字段。union-list 的行单位是 part（ASSEMBLY 行连 part
         // 都不是），一个 part 可能有多个活跃批次 → 本端点**刻意不填**（恒 null），
-        // 与 VO 契约（仅 pickable-by-work-type 填）一致。
+        // 与 VO 契约（仅 pickable-by-work-type 与 by-worker 填）一致。
         batch_id: None,
         batch_version: None,
+        // 2026-10-04：链四字段。链位置是**批次级**事实（同一 part 的不同活跃批次
+        // 处在链的不同道次），本端点的行单位是 part → 恒取保守默认值
+        // `NONE` / `"0"` / `null` / `null`（唯一填充路径是 `GET /parts/by-worker`）。
+        chain_state: ChainState::None,
+        chain_next_process_id: 0,
+        chain_next_process_name: None,
+        chain_current_process_name: None,
         // 2026-10-03 新增：已送数量。本 helper 只做 TAssembly → PartListItem 的字段
         // 搬运，装配行的已送套数需跨表聚合，由 caller（list_assembly / list_all 的
         // ASSEMBLY 分支）用 `fetch_delivered_sets` 显式覆写。
@@ -836,6 +843,11 @@ fn union_row_to_part_list_item(r: UnionListRow) -> PartListItem {
         // 2026-10-03：同上，批次锚点字段在本端点恒 null（行单位是 part，批次不唯一）。
         batch_id: None,
         batch_version: None,
+        // 2026-10-04：同上，链四字段在本端点恒默认值（行单位是 part，链位置是批次级）。
+        chain_state: ChainState::None,
+        chain_next_process_id: 0,
+        chain_next_process_name: None,
+        chain_current_process_name: None,
         // 2026-10-03 新增：同上，已送数量由 caller（list_all 的 PART / ASSEMBLY
         // 两个分支）按行类型分别用两个聚合 helper 覆写。
         delivered_quantity: None,
