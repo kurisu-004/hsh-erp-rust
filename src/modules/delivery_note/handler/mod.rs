@@ -4,7 +4,8 @@
 //! - `crud.rs` —— 基础 CRUD：create / list / get / update / add-parts / remove-parts /
 //!   soft-delete / batch-detail / candidate-parts / pickup-pending / events + P1 送货分组 CRUD
 //! - `lifecycle.rs` —— 状态机转换：submit / recall / pickup-scan / pickup
-//! - `print.rs` —— 打印：print / print-labels（纯 BFF 转发到 python 执行渲染）
+//! - `print.rs` —— 打印：print / print-labels（读本单批次算装配件可出货套数后
+//!   BFF 转发到 python 执行渲染，2026-10-04 起不再是纯转发）
 //! - `scan.rs` —— 扫码入单：scan（/scan 端点）+ attach-batches（弹窗提交时附挂批次）
 //!
 //! ## 约定（2026-09-22 D-5 + review 第 1 轮）

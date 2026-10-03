@@ -28,6 +28,7 @@ use super::inner::{
     add_parts_inner, build_note_outs, get_with_parts, note_not_found, note_version_conflict,
     write_event,
 };
+use super::shippable_sets::note_shippable_sets;
 
 use super::DeliveryNoteService;
 
@@ -286,6 +287,9 @@ impl DeliveryNoteService {
                 continue;
             };
             let items_rows = by_note.remove(nid).unwrap_or_default();
+            // 2026-10-04 新增：循环前先在本单行集上聚合一次可出货套数
+            // （`p.quantity` / `assembly_map` 都已在手，纯内存、不新增 SQL）。
+            let sets_map = note_shippable_sets(&items_rows, &assembly_map);
             let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(items_rows.len());
             for (b, p) in items_rows {
                 let leaf = leaf_map.get(&p.customer_id);
@@ -330,6 +334,9 @@ impl DeliveryNoteService {
                     assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),
                     assembly_name: asm.map(|a| a.name.clone()),
                     assembly_order_no: asm.and_then(|a| a.order_no.clone()),
+                    // 2026-10-04 新增：装配件工单总套数 + 本单可出货套数（散件 None）
+                    assembly_quantity: asm.map(|a| a.quantity),
+                    shippable_sets: p.assembly_id.and_then(|id| sets_map.get(&id).copied()),
                 });
             }
             out.push(DeliveryNoteDetailOut {

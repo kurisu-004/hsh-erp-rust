@@ -25,6 +25,7 @@ use crate::shared::error::{AppError, code};
 use super::super::dto::DeliveryNoteAddItem;
 use super::super::model::{DeliveryNote, DeliveryNoteEvent, NoteScope};
 use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
+use super::shippable_sets::note_shippable_sets;
 
 // ===========================================================================
 //  types
@@ -239,6 +240,10 @@ pub(super) async fn get_with_parts(
         }
     }
 
+    // 2026-10-04 新增：循环前先聚合一次本单可出货套数（`p.quantity` /
+    // `assembly_map` 都已在手，纯内存、不新增 SQL）。
+    let sets_map = note_shippable_sets(&rows, &assembly_map);
+
     let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(rows.len());
     for (b, p) in rows {
         let leaf = leaf_map.get(&p.customer_id);
@@ -286,6 +291,9 @@ pub(super) async fn get_with_parts(
             assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),
             assembly_name: asm.map(|a| a.name.clone()),
             assembly_order_no: asm.and_then(|a| a.order_no.clone()),
+            // 2026-10-04 新增：装配件工单总套数 + 本单可出货套数（散件 None）
+            assembly_quantity: asm.map(|a| a.quantity),
+            shippable_sets: p.assembly_id.and_then(|id| sets_map.get(&id).copied()),
         });
     }
 

@@ -111,3 +111,5 @@
 | `assembly_drawing_no` | string? | |
 | `assembly_name` | string? | |
 | `assembly_order_no` | string? | |
+| `assembly_quantity` | i32? | 装配件工单总套数（`t_assembly.quantity`）；散件行 `null` |
+| `shippable_sets` | i32? | **本单**可出货套数（子件行 = `min` 各子件「本单出货量 × 装配件套数 ÷ 子件整单数量」，再对 `assembly_quantity` 收口；0 = 凑不齐整套）；散件行 `null`。口径见 [`print.md`](./print.md#rust-侧注入的两个键) |

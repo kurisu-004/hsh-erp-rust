@@ -4,17 +4,19 @@
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
 > 范围：本文件覆盖 2 个端点（`POST /api/v2/delivery-notes/{id}/print` /
-> `POST /api/v2/delivery-notes/{id}/print-labels`）。两者都是**纯转发**：Rust 侧强制
-> JWT + RBAC 之后把请求原样送到 Python 后端，xlsx 的生成由 Python 端执行。Rust 端
-> 不读 DB、不开事务、不解析请求字段、不二次包装响应。
-> part 域的 2 个 PDF 打印端点（同样是转发形态）见 [`../parts/print.md`](../parts/print.md)。
+> `POST /api/v2/delivery-notes/{id}/print-labels`）。Rust 侧强制 JWT + RBAC 之后，
+> **读本单批次算装配件可出货套数**并把结果注入转发 body，再把请求送到 Python 后端；
+> xlsx 的生成仍由 Python 端执行。Rust 端不开事务、不改 DB、不解析前端字段、
+> 不二次包装响应。
+> part 域的 2 个 PDF 打印端点（**纯**转发形态，无 DB 读）见
+> [`../parts/print.md`](../parts/print.md)。
 >
 > **导航**：[`index.md`](./index.md) · [`queries.md`](./queries.md) · [`drafts.md`](./drafts.md) · [`workflow.md`](./workflow.md) · **`print.md`**
 
 ## 本文件目录
 
 1. [鉴权](#鉴权)
-2. [行为（BFF 转发）](#行为bff-转发)
+2. [行为（BFF 转发 + 套数注入）](#行为bff-转发--套数注入)
 3. [POST /api/v2/delivery-notes/{id}/print  （P4 打印）](#post-apiv2delivery-notesidprint--p4-打印)
 4. [POST /api/v2/delivery-notes/{id}/print-labels  （P4 标签打印）](#post-apiv2delivery-notesidprint-labels--p4-标签打印)
 5. [Python 错误码透传](#python-错误码透传)
@@ -43,7 +45,7 @@
 - 反向代理模板（nginx 配置）归 `frontend/` 子模块所有，不在本仓描述其内容与状态；
   本仓可核实的契约边界就是上面这几条。
 
-## 行为（BFF 转发）
+## 行为（BFF 转发 + 套数注入）
 
 ### v2 → v1 映射
 
@@ -55,18 +57,54 @@
 这 2 条与 Python 端**同名同路径段**（part 域的 2 条打印端点不同名，见
 [`../parts/print.md`](../parts/print.md)）。
 
+### Rust 侧注入的两个键
+
+打印端点**不再是纯转发**：转发前 Rust 读本单批次，算出每个装配件的
+**可出货套数**，覆盖写入 body 的两个键。前端发的同名字段会被整体覆盖。
+
+| 键 | 类型 | 谁写 | 说明 |
+|---|---|---|---|
+| `assembly_ids` | [string (i64)] | **Rust 注入** | 本单批次所属、且能解析到的装配件 id（未软删）。Python 端用它组装 `assembly_map`；`None` / 空 → 不做装配件合并 |
+| `merge_quantities` | {string (i64): i32} | **Rust 注入** | `{ "<assembly_id>": <可出货套数> }`。**值为 0 表示该装配件凑不齐整套，其子件不进 xlsx** |
+
+计算口径（`src/modules/delivery_note/service/shippable_sets.rs`，
+**只统计本单**批次）：
+
+```text
+child_note_qty = Σ 本单上该子件 part 的 b.quantity          (i64)
+per_set        = child_note_qty * asm.quantity / part.quantity
+sets           = LEAST(COALESCE(MIN(per_set over 参与子件), 0), asm.quantity)   → i32
+```
+
+边界（与 part 列表的「已送套数」同源，差别只在分子是**本单**而非全局已送）：
+
+- `part.quantity == 0` 的子件**不参与** `min`（对应 SQL 的 `NULLIF`）；
+- 装配件在本单上无参与子件 → `0` 套（`COALESCE` 在 `LEAST` 里面，写反会在
+  「子件总量全为 0」时返回 `asm.quantity`，与「全零 → 0 套」正好相反）；
+- `LEAST(..., asm.quantity)` 顺带收口子件超交（不会出现「100 / 10 套」），
+  并消除 int8→int4 溢出（中间量用 i64，收口后钳到 i32）；
+- PG 整数除法向零截断。
+
+**不注入、原样转发的 4 种情形**（BFF 层不新造失败路径）：本单无批次 / 本单无
+装配件 / 本单引用的装配件全部软删或不存在 / `body` 不是 JSON object。
+「送货单不存在」的 404 仍由 Python 侧 `BIZ_DELIVERY_NOTE_NOT_FOUND` 兜。
+
+⚠️ 雪花 id 一律是 JSON **string**（> 2^53，JSON number 会丢精度）：`assembly_ids`
+的元素与 `merge_quantities` 的 key 都是 string；`merge_quantities` 的 value 是普通
+JSON number（套数是计数，不是 id）。
+
 ### `POST /api/v2/delivery-notes/{id}/print`  （P4 打印）
 
-Request（body 是 `Json<Value>`，**原样透传**，Rust 侧不解析字段、不做 schema 校验）：
+Request（body 是 `Json<Value>`：前端字段原样透传，Rust 侧不解析、不做 schema 校验；
+唯二被 Rust 改写的是上面两个注入键）：
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `custom_order` | [string (i64)]? | — | 批次 id 序列；缺省走 Python 端的默认顺序 |
-| `merge_assemblies` | bool? | — | true → 同装配件子件合并一行（缺省 `false`） |
-| `merge_quantities` | object? | — | `{ "<assembly_id>": <count> }`，按装配件 id 覆盖合并行数量 |
-
-⚠️ 雪花 id 一律是 JSON **string**（> 2^53，JSON number 会丢精度）：Rust 侧若解析成
-number 就是一次有损转换，故全链路按 string 透传，由 Python 端解析。
+| `custom_order` | [string (i64)]? | — | 行顺序（批次 id 序列）。**每个 part 只承认其「代表批次 id」**（该 part 在本单最小的 `b.id`），且必须**覆盖本单全部 part** —— 漏行 / 非代表 id / 不属于本单都 → Python 侧 422 `BIZ_DELIVERY_PRINT_BAD_ORDER`。缺省走 Python 端默认顺序（`b.id ASC`） |
+| `merge_assemblies` | bool? | — | true → 同装配件子件合并一行（缺省 `false`）。⚠️ 无 `assembly_ids` 时合并不生效（`assembly_map` 为空） |
+| `assembly_ids` | [string (i64)]? | — | **Rust 注入**（见上） |
+| `merge_quantities` | object? | — | **Rust 注入**（见上）：`{ "<assembly_id>": <可出货套数> }`，值为 0 = 该装配件子件不进 xlsx |
+| `line_item_ids` | [string (i64)]? | — | 标签端点专用：只打这些批次行（`line_items[].id`）；见下一节 |
 
 Response：Python 的响应原样透传（status + body + 经清洗的 headers）。成功形态：
 
@@ -76,7 +114,8 @@ Response：Python 的响应原样透传（status + body + 经清洗的 headers�
 
 ### `POST /api/v2/delivery-notes/{id}/print-labels`  （P4 标签打印）
 
-Request：同 `/print` 的 3 个字段，另加：
+Request：同 `/print` 的字段（含同一套注入键 —— 两个端点在 Python 端共用同一份行
+构建逻辑，套数口径必须一致），另加：
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
@@ -168,10 +207,19 @@ Rust 侧不预判、不枚举；前端按 `{code, message, data}` 解封即可�
 
 ## 实现要点
 
-- **无 DB 读、无事务**：handler 内不出现 `state.pool`，也不开 tx。
-- **body 原样透传**：`Json<Value>` 透传，不定义强类型 DTO、不解析字段
-  （雪花 id 是 string，解析只是引入一层无收益的转换；字段语义由 Python 端 schema
-  负责，与 STS 转发同构）。
+- **只读取数、不开 tx、不改 DB**：handler 内 `state.pool.acquire()` 拿连接（读端点
+  范式，同 `handler/crud.rs`），跑 2 条只读查询即 drop。读数**仅**用于注入转发
+  body，不参与任何业务写入。
+- **不新增 SQL**：取数走既有 repo 方法
+  （`PartBatchRepo::list_with_part_by_delivery_note` +
+  `AssemblyRepo::list_by_ids(..., include_deleted=false)`），套数在内存里算
+  （`service::shippable_sets::note_shippable_sets`）。同一公式也用于详情只读字段
+  `line_items[].shippable_sets`，两处口径不会漂。
+- **前端字段原样透传**：`Json<Value>` 透传，不定义强类型 DTO、不解析前端字段
+  （雪花 id 是 string，解析只是引入一层无收益的转换）。唯二被改写的是
+  `assembly_ids` / `merge_quantities` 两个注入键。
+- **不新增 404**：本单查不到数据时原样转发，让 Python 侧产出既有错误码
+  （`BIZ_DELIVERY_NOTE_NOT_FOUND` 等），避免 BFF 层多出一条与上游不一致的失败路径。
 - **身份单头传递**：handler clone 一份 `HeaderMap` 再注入 `X-Forwarded-User-Id`
   （不能直接 mutate extractor 给的那份，会污染共用同一 `HeaderMap` 的其它
   extractor / middleware）。
