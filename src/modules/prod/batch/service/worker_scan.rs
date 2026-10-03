@@ -191,18 +191,17 @@ impl BatchService {
                 // 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`
                 // 与 `prod/worker_pool/repo/mod.rs::process_chain_step_get_process_id`。
                 //
-                // ⚠️ 2026-09-30（review H1）**已知缺口**：下面算出的 `step_id_opt`
+                // ⚠️ 2026-09-30 起的**已知缺口**：下面算出的 `step_id_opt`
                 // 传给 `mark_batch_returned` 后**被丢弃** —— 该函数的
                 // `current_process_step_id` SET 子句在 2026-09-30 prod/pool move
                 // 重构中被移除（admin 主动退回不推进工序链），RETURNED 复用了同一
                 // 函数，于是该显示用列在 RETURNED 时也不再更新。
                 //
-                // 本轮**刻意不修**（避免与 H1 的 `current_process_id` 改动混在一次
-                // 变更里扩大 review 面）：影响面仅限显示 —— 池归属已由
-                // `current_process_id` 承担且本次已正确写入；step 现在是「批次
+                // **刻意不修**：影响面仅限显示 —— 池归属已由
+                // `current_process_id` 承担并正确写入；step 是「批次
                 // **首次定位**在工艺链哪一步」的可选显示用信息，不是状态机依赖。
                 //
-                // ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现）：step **不是**
+                // ⚠️ 措辞订正（2026-09-30 附带发现）：step **不是**
                 // 「会随流转推进的进度指针」—— 它只在首次定位工序时写、之后一律
                 // 不再推进（RETURNED / INSPECTED 都不写），对多工序链工单永远停在
                 // 首次定位那一步。后续单独一轮处理（届时 `mark_batch_returned` 需按
@@ -228,7 +227,7 @@ impl BatchService {
                 };
                 // 切 holder worker → shelf（OCC）
                 //
-                // 2026-09-30（review H1 修复）：RETURNED 是全仓唯一**推进工序**的
+                // 2026-09-30 修复：RETURNED 是全仓唯一**推进工序**的
                 // 路径 —— 工人在 P1 完工、扫 RETURNED 传 next_process_id=P2，批次
                 // 归还货架后必须落进 **P2** 的候选池。此前 `mark_batch_returned` 不写
                 // `current_process_id`，批次会带着 P1 落回 P1 池（migration 004 确立
@@ -239,7 +238,7 @@ impl BatchService {
                 // 校验（真实映射到该货架的 t_process.id），且 RETURNED 的业务语义就是
                 // 「这批要进 P2 池」。chain 被软删只导致解析不出 P2 对应的 step
                 // （**显示用定位信息**写不了），不影响**池归属**该写成 P2 —— 若此时
-                // fallback 旧值，恰好会把 H1 要修的 bug 换个条件复现。
+                // fallback 旧值，恰好让「RETURNED 不推进工序」的缺陷换个条件复现。
                 let n = repo
                     .mark_batch_returned(
                         batch.id,
@@ -256,7 +255,7 @@ impl BatchService {
                 // PR-B2：part 派生列由 sync_from_batch_change 统一回填；part.status
                 // 未变化（IN_PROCESS→IN_PROCESS）但 location/holder/process 物化。
                 //
-                // 2026-10-01 review 第 1 轮 M4：RETURNED 不改 status，该批次仍
+                // 2026-10-01 订正：RETURNED 不改 status，该批次仍
                 // 非终态 → min-progress 推不出 part 终态，`event_id` 传 `None`
                 // （归档事件分支不可达）。
                 PartService::sync_from_batch_change(&mut repo, part.id, current, None).await?;

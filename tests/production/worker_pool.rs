@@ -689,7 +689,7 @@ async fn worker_scan_returned_triggers_refill() {
     );
 }
 
-/// 场景 2b（2026-09-30 review 第 1 轮 H1 回归测试）: worker-scan RETURNED 推进工序
+/// 场景 2b（2026-09-30 回归测试）: worker-scan RETURNED 推进工序
 /// → 批次落进**下一道**工序的候选池，而不是落回原工序池。
 ///
 /// 背景：`mark_batch_returned` 此前既不写 `current_process_id` 也不写
@@ -2057,7 +2057,7 @@ async fn list_candidates_includes_has_cnc_program() {
 
 /// `GET /prod/pool/state` 应在 `held_batches[*].has_cnc_program` 透传实际值。
 ///
-/// 2026-09-29 review 第 1 轮补漏：前端 `WorkerQueueBoard.vue`「已编程」tag 渲染依赖
+/// 2026-09-29 补漏：前端 `WorkerQueueBoard.vue`「已编程」tag 渲染依赖
 /// `HeldBatchItem.has_cnc_program` 字段。后端 model 与 SQL 必须真实返回 EXISTS(G_CODE) 值，
 /// 否则 Zod strip 模式下前端静默丢字段会触发 schema 校验异常（`has_cnc_program` 必填）。
 /// 场景：worker 持有 2 个 batch（A 有 G_CODE，B 无），断言 `held_batches[*].has_cnc_program`

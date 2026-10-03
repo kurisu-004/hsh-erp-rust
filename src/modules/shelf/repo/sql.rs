@@ -10,7 +10,7 @@
 //! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
 //! - `list_active_production_ordered` 通过 LEFT JOIN `t_part_batch` 聚合 current_load
 //! - `list_active_inspection_with_load` 是 11 个静态方法里专供 picker for-inspection
-//!   的那一个，与 for-return 聚合口径逐字一致；理由见各方法 doc）
+//!   的那一个，与 for-return 聚合口径逐字一致；理由见各方法 doc
 //!
 //! ## Phase P3+ shelf CRUD 暴露给 service 的能力（2026-10-02 起 10 静态方法；
 //! 2026-10-04 加 `list_active_inspection_with_load` 后为 11）
