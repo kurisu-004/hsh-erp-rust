@@ -1381,13 +1381,27 @@ impl OutsourcePoolRepo {
     /// part 必然已绑链。`COALESCE` 的 `cur.chain_id` 分支因此只是防御性兜底
     /// （`p.process_chain_id IS NULL` 是脏数据），不是活场景。
     ///
+    /// 2026-10-03 登记**保留而非删掉**该回落分支的取舍（它不可达，但是死代码，
+    /// 不写清楚理由就会被后人当垃圾清理）：删掉后，同样脏数据下读侧会落到
+    /// 「无下一 step」⇒ `chain_resolvable=false`，被前端读成「链坏了、需手填
+    /// 下一道工序」；而写侧的真实阻塞是 `20706 BIZ_PROCESS_CHAIN_REQUIRED`
+    /// 「请先制定工序链」—— 两者指向完全不同的排查方向。保留回落使读侧的诊断
+    /// 与写侧对齐。**不改变任何结果**：回落生效时写侧照样先撞 20706
+    /// （`require_process_chain` 读的就是 `t_part.process_chain_id`，与本回落
+    /// 无关），所以这不是「为了让脏数据能写下去」。成本是一个 `COALESCE`，
+    /// 命中分支时多一次 PK 索引查找。
+    ///
     /// ⚠️ **两个派生列都必须显式 `AS receive_next_process_*`**：LATERAL 子查询的输出
     /// 列名只跟子查询内部的名字走（`nx.next_process_name` 的列名是
     /// `next_process_name`，不带 `nx.` 前缀），不写别名时 runtime `query_as` 的
     /// `FromRow` 会报 `ColumnNotFound("receive_next_process_name")`。末尾
-    /// `LIMIT 1` 保证 LATERAL 恒至多一行：锚链内同一 `process_id` 重复属数据异常
-    /// （写侧 `resolve_step_id_by_process` 同样不守），不设 `LIMIT` 会把一行批次
-    /// 扇成多行、破坏 VO 层「`current_held == items.len()`」。
+    /// `LIMIT 1` 保证 LATERAL 恒至多一行：锚链内同一 `process_id` 重复属数据异常，
+    /// 而这不是读侧单方面放过的缺口 —— 写侧 `resolve_step_id_by_process`
+    /// （`src/modules/prod/process_chain/repo/query.rs`）自己登记的立场逐字是
+    /// 「链内同一 process_id 重复（数据异常）的歧义不在本函数守，caller 用
+    /// `count_steps_by_chain_process` 单独查证」，读侧沿用同一口径收口、不另立
+    /// 一套；不设 `LIMIT` 会把一行批次扇成多行、破坏 VO 层
+    /// 「`current_held == items.len()`」。
     ///
     /// `t_applicant` 走 `LEFT JOIN LATERAL (… ORDER BY ap.id ASC LIMIT 1)` 而不是
     /// 直接 JOIN：`t_part.applicant_name` 是字符串非 FK，而 `t_applicant` 的唯一索引

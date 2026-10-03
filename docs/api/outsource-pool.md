@@ -131,6 +131,15 @@ part 软删级联调用；`send-to-outsource` 强制 `require_process_chain` ⇒
 批次的 part 必然已绑链。故 `COALESCE` 的 `cur.chain_id` 分支只是防御性兜底
 （`p.process_chain_id IS NULL` 属脏数据），不是活场景。
 
+**保留而非删掉**该回落分支的取舍（它不可达，但属于死代码，不写清楚理由就会
+被后人当垃圾清理）：删掉后，同样脏数据下读侧会落到「无下一 step」⇒
+`chain_resolvable = false`，被前端读成「链坏了、需手填下一道工序」；而写侧的
+真实阻塞是 `20706 BIZ_PROCESS_CHAIN_REQUIRED`「请先制定工序链」—— 两者指向
+完全不同的排查方向。保留回落使读侧的诊断与写侧对齐。**不改变任何结果**：回落
+生效时写侧照样先撞 20706（`require_process_chain` 读的就是
+`t_part.process_chain_id`，与本回落无关），所以这不是「为了让脏数据能写下去」。
+成本是一个 `COALESCE`，命中分支时多一次 PK 索引查找。
+
 `chain_resolvable = receive_next_process_id != 0`，等价于下面三条同时成立：
 
 1. `current_process_step_id` 存在且非 `"0"`；
@@ -304,11 +313,14 @@ part 软删级联调用；`send-to-outsource` 强制 `require_process_chain` ⇒
 
 ### 权限（逐条登记）
 
-**本域权限规则**：读面的守卫**对齐同域等价端点**（候选侧 ←
-`GET /outsource-sendable`；在途侧 ← `GET /outsource-shipments/in-flight`），
-**不跨域照抄 `/prod/pool/*` 的形态模板** —— 后者只吐内部批次元数据，不含商务
-敏感字段。改任一守卫前先按这条规则定位「同域等价端点」是哪一个，再对它的守卫
-取值。
+**本域权限规则**：读面的守卫**优先对齐同域等价端点**（候选侧 ←
+`GET /outsource-sendable`；在途侧 ← `GET /outsource-shipments/in-flight`）；
+**本域确实没有等价端点时**才回退去照抄 `/prod/pool/*` 的形态模板（`counts`
+即属这一档 —— 本域没有同形状的聚合端点），且照抄前须先核对该模板的数据面是否
+含商务敏感字段：`/prod/pool/*` 只吐内部批次元数据，不含。改任一守卫前先按这条
+规则定位「同域等价端点」是哪一个，再对它的守卫取值。回退档只在域内类比用尽后
+启用，**不能反过来拿字段敏感度当首选口径** —— `{process_id}` 吐的
+`items[*].price` 同样含报价单价、同样含 Inspector，按敏感度排会自相矛盾。
 
 | 端点 | 权限 | 依据 |
 |---|---|---|
