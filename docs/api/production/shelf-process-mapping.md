@@ -310,7 +310,7 @@ CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃�
 ## 错误码归属（2026-10-02 调整说明，数字不动）
 
 `20504` ~ `20508` 仍是**已发布契约**，本次只改归属说明，**数字一律不动**
-（20507 被 `part/worker_scan` + `prod/worker_pool` + `delivery print` 三处判定，
+（20507 被 `part/worker_scan` + `prod/worker_pool` 两处判定，
 20508 被 `prod::batch` dispatch 判定）。
 
 | 码 | 名称 | 归属 | 触发场景 |

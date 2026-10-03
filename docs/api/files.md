@@ -195,9 +195,14 @@ CAS 命中（已上传过相同内容）→ 跳过 COS PUT，直接复用已有 
 
 ## BFF 转发端点：`POST /api/v2/files/sts-tmp-keys`
 
-> 2026-09-28 新增：薄壳鉴权转发到 python `/api/v1/files/sts-tmp-keys`。
-> 修复上一轮"删除 STS session 设施"完成后 python 端 STS 端点裸开漏洞——前端
-> 直连 python 绕过了所有 IAM 鉴权。本端点是新的强制鉴权点（rust 端）。
+> 薄壳鉴权转发到 python `/api/v1/files/sts-tmp-keys`。前端直连 python 会绕过所有
+> IAM 鉴权，本端点是强制鉴权点（rust 端）。
+>
+> **同一机制现已覆盖打印链路**：4 个打印端点（`delivery-notes/{id}/print` /
+> `print-labels` / `parts/{part_id}/print-drawing` / `parts/print-drawing-batch`）
+> 与本端点共用 `infra::py_backend` 的转发客户端与 header 清洗逻辑，区别只在两档
+> 超时（STS 10s / 打印 600s）与失败错误码（20406 / 20407）。打印端点契约见
+> [`./parts/print.md`](./parts/print.md) 与 [`./delivery-notes/print.md`](./delivery-notes/print.md)。
 
 ### 鉴权
 
@@ -209,8 +214,8 @@ CAS 命中（已上传过相同内容）→ 跳过 COS PUT，直接复用已有 
 ### 行为
 
 请求 body（任意 shape）原样转发到 python `POST /api/v1/files/sts-tmp-keys`；
-python 响应（status + headers + body）原样透传给前端。handler 不解封 body，
-body 由 `envelopeResponseInterceptor` 在前端 axios 层解析。
+python 的 status 与 body 原样透传给前端，响应 headers 经清洗（见「Header 透传策略」）。
+handler 不解封 body，body 由 `envelopeResponseInterceptor` 在前端 axios 层解析。
 
 ### Python 错误码透传
 
@@ -222,20 +227,36 @@ python 端的业务错误码（如 `BIZ_PART_NOT_FOUND`、`BIZ_CUSTOMER_NOT_FOUN
 
 | code | 名称 | HTTP | 触发场景 |
 |---|---|---|---|
-| 20406 | BIZ_STS_FORWARD_FAILED | 502 | rust → python 网络层失败（连接拒 / 超时 / 读 body 失败）；语义同 nginx upstream fail |
+| 20406 | BIZ_STS_FORWARD_FAILED | 502 | rust → python 网络层失败（连接拒 / 超时 / 读 body 失败 / `PYTHON_BACKEND_BASE_URL` 未配置走 `NoopPyBackend`）；语义同 nginx upstream fail |
+| 20407 | BIZ_PRINT_FORWARD_FAILED | 502 | **本端点不返此码**：它是打印链路（4 个打印端点）的同款失败，错误码按链路分家便于日志直接看出挂的是 STS 还是打印 |
 
 ### env 配置
 
 | env | 说明 | 缺省 |
 |---|---|---|
-| `PYTHON_BACKEND_BASE_URL` | python 后端 base URL；设置即 `enabled=true`，未设走 `NoopPyBackend` | 空 |
+| `PYTHON_BACKEND_BASE_URL` | python 后端 base URL；设置即 `enabled=true`，未设 / 留空走 `NoopPyBackend`（⚠️ 降级**不**拒启，调用时才以 20406 / 20407 暴露） | 空 |
 | `PYTHON_STS_TIMEOUT_MS` | 单次转发超时（毫秒） | `10_000` |
+| `PYTHON_PRINT_TIMEOUT_MS` | 打印链路的单次转发超时（毫秒）；与 STS 的 10s 通道分档 | `600_000` |
+| `PRINT_REQUEST_TIMEOUT_SECONDS` | 打印路径的 HTTP 请求级超时（秒），须大于上一行换算的秒数 | `660` |
 
 ### Header 透传策略
 
+请求侧：
+
 - 透传：`x-request-id` / 自定义业务头（便于 trace 一致性）
+- 注入：`x-forwarded-user-id`（python 端 STS 端点信任此头作为身份依据）
 - **不**透传：`Authorization` / `Cookie` / `Host` / `Content-Length` / `Connection` /
   hop-by-hop 全套——避免把 rust 端 JWT 反向暴露给 python（python 端裸开 by design）。
+
+响应侧（`filter_response_headers`）：
+
+- 保留：`content-type` / `content-disposition`（前端 `parseFilename` 靠它取下载
+  文件名）/ `cache-control` / 其余自定义头
+- **不**透传：hop-by-hop 全套 + `content-encoding`（body 已被 reqwest 在解码层
+  消费，再声明编码会让前端 blob 拿到坏数据）+ `date` / `server`（上游 server 的
+  自我标识，rust 自己会写）
+- **重算**：`content-length` 一律按实际 body 长度——与实际长度不一致时前端的 blob
+  下载会被截断，且不报错
 
 ---
 

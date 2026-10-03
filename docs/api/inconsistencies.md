@@ -11,7 +11,7 @@
 | 维度 | 数量 | 说明 |
 |---|---:|---|
 | 整域缺失（Python 有 Rust 无） | **1 域** | 仅 statistics（聚合读占位） |
-| 部分缺失（part 域） | ~3 端点 | Python 46 vs Rust 24（Rust 端大部分补齐；剩余 print-drawing-* / scan 通用端点） |
+| 部分缺失（part 域） | ~1 端点 | Python 46 vs Rust 26（Rust 端大部分补齐；剩余 scan 通用端点） |
 | 部分缺失（其他域） | ~3 端点 | applicants 7 vs 5；assemblies 9 vs 8；少量边角未补 |
 | Rust-only | **30+** | delivery-notes 新增 P3 scan + batch-detail；worker-pool（5 端点）；_e2e seed hook（11 端点）；auto-allocate；by-work-type / pickable / by-worker；pick-up；send-to-outsource；receive-from-outsource；repair-dispatch；complete-repair；scan-inspect；scan/deliver-part；match-by-excel-items；batch-with-pdfs；assembly start + files |
 | 占位模块（路由挂载但 Router 空） | **2 域** | statistics + dashboard WS 握手 |
@@ -97,18 +97,18 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 
 ---
 
-## 2. part 域部分缺失 — Python 46 端点 / **Rust 24 端点**
+## 2. part 域部分缺失 — Python 46 端点 / **Rust 26 端点**
 
 **Python 参考**：`/Users/ren/Code/myERP/api/v1/part.py`（46 端点）
-**Rust 当前**：[`./parts/index.md`](./parts/index.md)（**24 端点**，method 级口径）
+**Rust 当前**：[`./parts/index.md`](./parts/index.md)（**26 端点**，method 级口径）
 逐条清单见 [`./parts/index.md`](./parts/index.md) 端点列表；端点总表
 [`./index.md`](./index.md) 与 [`./DRIFT_REPORT.md`](./DRIFT_REPORT.md) 同一口径。
 
 > **计数口径 = method 级注册数**：`src/modules/part/mod.rs` 逐个数
 > `get(handler::…)` / `post(handler::…)`（`route("/")` 上的 `get().post()` 记 2 条）。
-> 当前 **24**。等价推导：表登记 53 行 − 27 行已迁出（25 条 `t_part_batch` 子资源
+> 当前 **26**。等价推导：表登记 55 行 − 27 行已迁出（25 条 `t_part_batch` 子资源
 > + 2 条外协读端点）− 2 行已下线（`send-to-programming` / `recall-to-programming`）
-> = 24。
+> = 26。
 > ⚠️ 本文件与 [`./DRIFT_REPORT.md`](./DRIFT_REPORT.md) 早期版本里的 48 / 49 / 50
 > 是**另一种口径**（`.route()` 调用数，漏掉 `route("/")` 上的第 2 个 method），
 > 且未扣除 2026-10-02 迁往 prod 域的 25 条。
@@ -169,12 +169,15 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 | GET | `/api/v1/parts/pickable-by-work-type/{work_type_id}` | 按工种查可领取 | ✅ |
 | GET | `/api/v1/parts/by-worker/{worker_id}` | 按工人查持有 | ✅ |
 
-### 2.5 打印（仍差 2 端点）
+### 2.5 打印（Rust 已全补 —— 纯 BFF 转发）
 
 | Method | Path | Python | Rust |
 |---|---|---|---|
-| GET | `/api/v1/parts/{id}/print-drawing` | 打印单件图纸 | ❌ 缺失 |
-| POST | `/api/v1/parts/print-drawing-batch` | 批量打印图纸 | ❌ 缺失 |
+| GET | `/api/v1/parts/{id}/print` | 打印单件图纸 | ✅ `/api/v2/parts/{part_id}/print-drawing`（**v2/v1 路径不同名**） |
+| POST | `/api/v1/parts/print-batch` | 批量打印图纸 | ✅ `/api/v2/parts/print-drawing-batch`（**v2/v1 路径不同名**） |
+
+> 两端点只做「Rust 鉴权 + RBAC → 转发」，PDF 生成由 Python 执行（Rust 侧不渲染）；
+> 契约见 [`./parts/print.md`](./parts/print.md)。
 
 ### 2.6 流程辅助（Rust 已全补）
 
@@ -185,7 +188,7 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 | GET | `/api/v1/parts/{id}/events` | 工单事件时间线 | ✅ |
 | POST | `/api/v1/parts/batch-with-pdfs` | 多页 PDF 树形创建 | ✅ |
 
-> **剩余 ~3 个端点**：(a) `/parts/{id}/print-drawing` 单件图纸打印；(b) `/parts/print-drawing-batch` 批量图纸打印；(c) `/parts/scan` 通用扫码（与 worker-scan 功能重叠，留待业务侧决策是否保留）。
+> **剩余 ~1 个端点**：`/parts/scan` 通用扫码（与 worker-scan 功能重叠，留待业务侧决策是否保留）。
 
 ---
 

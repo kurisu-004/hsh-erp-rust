@@ -76,8 +76,8 @@
 > 关联的是本域实体 `t_process`，按域规约搬入 prod。旧路径已从 router 删除（**无
 > alias**），请求 / 响应契约逐字不变。同期删除的还有 `ShelfOut.account_count`
 > （账号绑定数，绑定真源本来就在 iam 域 `t_user_role`）—— **本目录零 iam 改动**。
-> 20504~20508 数字不动（20507 被 `part/worker_scan` + `prod/worker_pool` + `delivery
-> print` 判定，20508 被 `prod::batch` 判定），只改归属说明。
+> 20504~20508 数字不动（20507 被 `part/worker_scan` + `prod/worker_pool` 判定，
+> 20508 被 `prod::batch` 判定），只改归属说明。
 > ⚠️ `GET /api/v2/shelves/processes` 例外：现在落到 shelf 域 `/{id}` 路由，
 > `processes` 非 i64 被 axum 拒为 400 纯文本（非 `R` 信封），而非 404。
 > ⚠️ **前端配套改动 ≠ 只改 URL**：mapping 端点本身确实只改 URL，但同 commit 删掉的

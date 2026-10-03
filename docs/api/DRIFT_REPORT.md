@@ -22,7 +22,7 @@
 | iam | 14 | 14 | 🟢 大致覆盖；JWT 重大变更未同步 |
 | delivery_note | 18 | 18 | 🟢 全覆盖 |
 | delivery_groups | 4 | 4 | 🟢 全覆盖 |
-| part | **50**（扫描基线 `7f0641f` 的 `.route()` 调用数；method 级为 51）→ **现值 24** | **~30** | 🔴 **大量缺失** |
+| part | **50**（扫描基线 `7f0641f` 的 `.route()` 调用数；method 级为 51）→ **现值 26** | **~30** | 🔴 **大量缺失** |
 | assembly | 7 | 7 | 🟡 待 verify（需补 /start /update 文档说明） |
 | shelf | ~11 | ~11 | 🟢 大致覆盖 |
 | outsource-companies | 8 | 8 | 🟢 全覆盖（2026-10-03 +`sent-parts`） |
