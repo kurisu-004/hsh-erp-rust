@@ -1,6 +1,7 @@
 //! worker_pool 域端到端集成测试（Task 10 / plan §11）
 //!
-//! 覆盖 16 个场景：
+//! 场景清单（回归场景持续追加，清单不承诺与文件内测试函数一一对应；某条
+//! 能力的完整覆盖以函数名为准）：
 //!   1. worker_scan INSPECTED → 自动 refill
 //!   2. worker_scan RETURNED → 自动 refill；RETURNED 推进 `current_process_id`
 //!      （2026-09-30 review 第 1 轮 H1 回归：批次落进**下一道**工序池而非原池）；

@@ -261,6 +261,16 @@ impl ShelfRepo {
     /// 1. `zone` 常量为 `'INSPECTION'`；
     /// 2. 不按 `load.cnt` 排序（品检架无「最空优先」语义，for-return 的
     ///    `is_recommended` 是它独有的出参，本方法不提供）。
+    ///    末两段 `ORDER BY s.display_order ASC, s.id ASC` 与 for-return 一致，
+    ///    即本方法**有**稳定排序，只是不按负载排。
+    ///
+    /// **不设 LIMIT**（2026-10-04 决策）：INSPECTION 区活跃架一次性全量返回，
+    /// 不分页。旧路径 `list_with_filters(..., MAX_LIMIT=500, offset=0)` 的
+    /// 500 截断**不保留** —— 它的 `ORDER BY` 与本方法逐段相同，所以去掉截断
+    /// 只改「最多 500 条」为「全部」，排序语义零变化；而静默丢架比超长列表更糟
+    ///（前端 picker 会把第 501 个架当成不存在）。同时使两个 picker 的分页形态
+    /// 统一（`list_active_production_ordered` 同样无 LIMIT）。品检架基数是
+    /// 「物理送检架数」量级，全量返回无性能压力。**下一个人不要把 500 加回来。**
     ///
     /// ⚠️ 聚合子查询与 `list_active_production_ordered` 的那段必须逐字一致。
     pub async fn list_active_inspection_with_load<'e, E: PgExecutor<'e>>(

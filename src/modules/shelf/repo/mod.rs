@@ -105,7 +105,9 @@ pub trait ShelfRepoTrait: Send {
     async fn list_active_production_ordered(&mut self) -> Result<Vec<TShelfWithLoad>, sqlx::Error>;
     /// 2026-10-04 新增（picker for-inspection 专供，聚合口径与
     /// `list_active_production_ordered` 逐字一致）：出参带 `current_load`。
-    async fn list_active_inspection_with_load(&mut self) -> Result<Vec<TShelfWithLoad>, sqlx::Error>;
+    async fn list_active_inspection_with_load(
+        &mut self,
+    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
     async fn create<'a>(
         &mut self,
@@ -185,7 +187,9 @@ impl ShelfRepoTrait for &mut PgConnection {
         ShelfRepo::list_active_production_ordered(&mut **self).await
     }
 
-    async fn list_active_inspection_with_load(&mut self) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
+    async fn list_active_inspection_with_load(
+        &mut self,
+    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
         ShelfRepo::list_active_inspection_with_load(&mut **self).await
     }
 

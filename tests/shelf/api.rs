@@ -6,6 +6,9 @@
 //!    （2026-10-01：REPAIRING 降级为 `t_part_batch.is_repairing` 标记列，返修
 //!    批次 status 即 IN_PROCESS，仍被本守卫覆盖。）
 //! 2. `create_then_get_shelf_round_trip` — happy path：create → get → 含 location 字段。
+//! 3. `for_inspection_returns_current_load_as_sum_of_quantity`（2026-10-04）—— picker
+//!    for-inspection 必须出 `current_load`（`SUM(quantity)` 件数口径）且空架取 0；
+//!    该端点此前零覆盖，出参缺字段时前端渲染「在架 undefined 件」无人拦。
 //!
 //! 2026-10-02 域拆分：原第 3 个测试 `set_shelf_processes_replaces_existing_mapping`
 //! 连同 `insert_test_process` helper 一起迁到
@@ -220,5 +223,132 @@ async fn create_shelf_then_deactivate_with_in_use_part_fails() {
         env2["code"].as_i64().unwrap(),
         20503,
         "expected BIZ_SHELF_IN_USE; got: {env2}"
+    );
+}
+
+/// `GET /shelves/for-inspection` 必须带 `current_load`，且为该架在架批次的
+/// `SUM(quantity)`（件数口径）。
+///
+/// 2026-10-04 回归（本端点此前走裸 `TShelf` 查询、**不出**该字段，前端品检架卡片
+/// 无 `v-if` 守卫地渲染「在架 N 件」⇒ 每张送检架卡片显示「在架 **undefined** 件」）。
+/// 本测试是该缺陷的防线：出参若再次缺 `current_load`（或退回批次数口径），
+/// `env["data"]["items"]` 里的 `current_load` 断言会直接失败。
+///
+/// 断言用 `quantity=3` 的单个批次而非 2 个 `quantity=1`：这样 `SUM(quantity)=3`
+/// 与 `COUNT(*)=1` 可区分，把「件数口径」钉死。
+#[tokio::test]
+async fn for_inspection_returns_current_load_as_sum_of_quantity() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    // 1. 建一个 INSPECTION 区货架（for-inspection 只看 INSPECTION 区）
+    let (s1, env1) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/shelves",
+            Some(json!({
+                "code": "S-INSP-01",
+                "name": "Inspection-01",
+                "zone": "INSPECTION",
+                "location": "QC-Bay-01",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::CREATED, "create inspection shelf: {env1}");
+    let shelf_id: i64 = env1["data"]["id"].as_str().unwrap().parse().unwrap();
+
+    // 2. 另一个 INSPECTION 架，零批次 —— 用于验证 LEFT JOIN 侧的空载取 0
+    let (s1b, env1b) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/shelves",
+            Some(json!({
+                "code": "S-INSP-02",
+                "name": "Inspection-02",
+                "zone": "INSPECTION",
+                "location": "QC-Bay-02",
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s1b,
+        StatusCode::CREATED,
+        "create 2nd inspection shelf: {env1b}"
+    );
+
+    // 3. 直插一个 quantity=3、current_holder_id=该架的 INSPECTION 批次
+    {
+        use hsh_erp_rust::infra::clock::now_naive;
+        use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+        let part_id = snowflake.next_id();
+        let batch_id = snowflake.next_id();
+        let now = now_naive();
+        sqlx::query!(
+            "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, \
+             request_date, planned_delivery_date, customer_id, status, version, \
+             created_at, updated_at) \
+             VALUES ($1, 'INSP-PART', 'INSP-DWG', 'INSP-APPLICANT', 3, \
+                     CURRENT_DATE, CURRENT_DATE, $2, 'INSPECTION', 0, $3, $3)",
+            part_id,
+            1_i64,
+            now,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert t_part for inspection load");
+        sqlx::query!(
+            "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+             current_holder_id, version, created_at, updated_at) \
+             VALUES ($1, $2, 1, 3, 'INSPECTION', 'INSPECTION_SHELF', $3, 0, $4, $4)",
+            batch_id,
+            part_id,
+            shelf_id,
+            now,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert t_part_batch held by inspection shelf");
+    }
+
+    // 4. 拉 for-inspection picker，按 code 定位本测试建的 2 个架
+    let (s2, env2) = send(
+        app,
+        json_request("GET", "/shelves/for-inspection", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "for-inspection: {env2}");
+    assert_eq!(env2["code"], 0);
+
+    let items = env2["data"]["items"].as_array().unwrap();
+    let loaded = items
+        .iter()
+        .find(|it| it["code"] == "S-INSP-01")
+        .unwrap_or_else(|| panic!("S-INSP-01 missing from for-inspection: {env2}"));
+    assert_eq!(
+        loaded["current_load"].as_i64(),
+        Some(3),
+        "current_load 必须是 quantity 总和（件数口径）而非批次数; got: {loaded}"
+    );
+    assert_eq!(loaded["zone"], "INSPECTION");
+    // is_recommended 是 for-return 独有的出参，本端点不提供
+    assert!(
+        loaded.get("is_recommended").is_none(),
+        "for-inspection 不应带 is_recommended; got: {loaded}"
+    );
+
+    let empty = items
+        .iter()
+        .find(|it| it["code"] == "S-INSP-02")
+        .unwrap_or_else(|| panic!("S-INSP-02 missing from for-inspection: {env2}"));
+    assert_eq!(
+        empty["current_load"].as_i64(),
+        Some(0),
+        "空载货架 LEFT JOIN 应取 0（不是 null）; got: {empty}"
     );
 }

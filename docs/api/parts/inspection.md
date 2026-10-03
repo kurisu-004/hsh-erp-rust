@@ -353,7 +353,7 @@ Request：`WorkerScanRequest`
 | `serial_no` | string | ✓ | 扫码得到的序列号（service 反查 part） |
 | `badge_code` | string | ✓ | 工人 badge_code（service 反查 worker） |
 | `event_type` | string | ✓ | `"RETURNED"` / `"INSPECTED"`（`WorkerScanEvent` 枚举） |
-| `shelf_id` | string (i64) | ✓ | **工人触发扫码的 PRODUCTION 货架（两个 event_type 同）**。service 对它做无条件 PRODUCTION 硬校验（不分 `event_type`）→ `20501`。**不是**品检架：INSPECTED 的品检架走 `target_inspection_shelf_id`。它必须留在 PRODUCTION 区的真正原因是 refill 候选池按 `current_holder_id = $2` 过滤（`location='PRODUCTION_SHELF'`）—— 传品检架会让 refill 查空池。**2026-10-04 订正**：此前本行写「INSPECTED 时是工人触发扫码的货架（PRODUCTION 区校验）」，仓内 DTO 注释却写「INSPECTION 区也会校验，按 event_type 分支走」，后者与代码矛盾且已误导过一次调用方 |
+| `shelf_id` | string (i64) | ✓ | **工人触发扫码的 PRODUCTION 货架（两个 event_type 同）**。service 对它做无条件 PRODUCTION 硬校验（不分 `event_type`）→ `20501`。**不是**品检架：INSPECTED 的品检架走 `target_inspection_shelf_id`。它必须留在 PRODUCTION 区的真正原因是 refill 候选池按 `current_holder_id = $2` 过滤（`location='PRODUCTION_SHELF'`）—— 传品检架会让 refill 查空池 |
 | `next_process_id` | string (i64)? | — | **仅 RETURNED 必填**；缺 / 非法 → `40001` |
 | `target_inspection_shelf_id` | string (i64)? | — | **仅 INSPECTED 必填**；缺 / 非法 → `40001`；service 校验 `zone='INSPECTION'` 且 `is_active=true` |
 | `batch_id` | string (i64)? | — | 多批次歧义时 caller 显式指定以消除歧义 |
@@ -368,8 +368,13 @@ Request：`WorkerScanRequest`
 > **可空列注记（2026-10-04 新增）**：本端点路径（含经 part/batch repo 下游读到的列）会碰到的
 > `t_part.serial_no` / `t_part.process_chain_id` / `t_part_batch.location` /
 > `t_part_batch.current_process_id` / `t_part_batch.current_process_step_id`
-> **全部是可空列**（baseline migration 001 建表时均无 `NOT NULL`；`process_chain_id` 的列
-> COMMENT 明写「NULL = 未制定工艺链」）。读取方一律按 `Option` 收 —— 按非 `Option` 解码会以
+> **全部是可空列**，出处分两处：`t_part.serial_no` / `t_part.process_chain_id` /
+> `t_part_batch.location` / `t_part_batch.current_process_step_id` 是 baseline
+> migration `001_baseline` 建表时就有的列（均未加 `NOT NULL`）；
+> `t_part_batch.current_process_id` 在 baseline 里**并不存在**，是 migration
+> `004_add_batch_current_process_id` 用 `ADD COLUMN IF NOT EXISTS` 后加的
+> （该迁移刻意保持可空、无默认值）。另：`process_chain_id` 的列 COMMENT 明写
+> 「NULL = 未制定工艺链」。读取方一律按 `Option` 收 —— 按非 `Option` 解码会以
 > `error occurred while decoding column 0: unexpected null; try decoding as an Option`
 > 整笔 500。特别注意 `sqlx` 的 `fetch_optional()` 返回的是 `Result<Option<O>>`，那个
 > `Option` **只表示「有没有行」，不表示列的类型**；列本身可空时 `O` 仍须是 `Option<T>`
@@ -398,17 +403,19 @@ Request：`WorkerScanRequest`
     这是已知缺口，影响仅限显示，池归属不受影响。
   - service 会读 `t_part.process_chain_id` 解析 `next_process_id` 对应的 `step_id`；
     该列**可空**，手写工单（无工艺链的常态）为 `NULL` → 保留批次既有的
-    `current_process_step_id`，不抹除。**2026-10-04 修**：此前该列按 `i64` 解码，
-    `NULL` 会在 `if let` 之前就以 `unexpected null` 500 掉整个请求（正是手写工单必现
-    的那条路），上述保留分支从未被执行到。
+    `current_process_step_id`，不抹除。**读取方必须按 `Option` 解码后进 `if let`** ——
+    按 `i64` 解码会让 `NULL` 在 `if let` 之前就以 `unexpected null` 500 掉整个请求，
+    上面这个保留分支对手写工单（必现形态）就永远走不到。
   - 写 `RETURNED_TO_SHELF` 事件日志
 - **INSPECTED**：worker 把持有件直接送检
   - `target_inspection_shelf_id` 必须属于 INSPECTION 区且 active
   - 不符合 → `20511 BIZ_SHELF_NOT_INSPECTION_ZONE` / `20512 BIZ_SHELF_INACTIVE`
   - 状态机 `IN_PROCESS → INSPECTION` + holder worker → target_shelf（由
     `mark_batch_inspected` 内的 status_gate 一次完成）+ 写 `SENT_TO_INSPECTION`
-    事件日志。**2026-10-04 订正**：本节此前写「内部走 `to_inspection_core`」，仓内无此
-    中间层，`worker_scan.rs` 直接调 `PartBatchRepo::mark_batch_inspected`
+    事件日志。worker-scan 的 INSPECTED 分支**不走** `to_inspection_core`（该中间层
+    定义在 `prod/batch/service/transition_core.rs`，服务的是单件 `to_inspection` 与
+    批量 `batch_to_inspection` 两个端点），而是直接调
+    `PartBatchRepo::mark_batch_inspected`
   - **`current_process_id` 置 NULL**（送检 = 出池），
     与单件送检 `to-inspection` 口径一致
   - 不带 quantity 拆批（worker-scan 是单件持有件流转，不涉及批次拆分）
