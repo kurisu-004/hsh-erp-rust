@@ -187,8 +187,21 @@ pub struct BatchToShipRequest {
 ///
 /// 无 Path extractor：`serial_no` 是主键，`batch_id` 仅在多批次歧义时用于消歧。
 /// `event_type`：`WorkerScanEvent::RETURNED` / `INSPECTED`。
-/// `shelf_id`：必填；RETURNED 时是 worker-scan 货架（PRODUCTION 区），INSPECTED
-/// 时是 worker-scan 货架（INSPECTION 区也会校验，按 event_type 分支走）。
+///
+/// `shelf_id`：**必填，且两个 event_type 都是 PRODUCTION 区的 worker-scan 货架** ——
+/// service 对它做的是**无条件**的 PRODUCTION 硬校验（不分 `event_type`），非
+/// PRODUCTION → 20501 `BIZ_SHELF_NOT_FOUND`。**不要**把 INSPECTION 区的品检架塞进
+/// 本字段：INSPECTED 的品检架走 `target_inspection_shelf_id`。
+///
+/// 2026-10-04 订正：本字段此前写「INSPECTED 时是 worker-scan 货架（INSPECTION 区也
+/// 会校验，按 event_type 分支走）」，与代码直接矛盾（并无按 event_type 分支的
+/// 校验），前端正是照着这句错误描述把品检架传进 `shelf_id` 才引发送检 20501。
+///
+/// 它**必须留在 PRODUCTION 区**的真正原因不是「工人站在哪个架前」：INSPECTED 时它
+/// 是**补料用的生产架**，在同事务的 worker-pool refill 里当候选池的
+/// `current_holder_id` 过滤键用（候选池 SQL 限
+/// `location='PRODUCTION_SHELF' AND current_holder_id = $2`，见
+/// `prod/worker_pool/repo/sql.rs`）。传品检架会让 refill 查空池。
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerScanRequest {
     pub serial_no: String,

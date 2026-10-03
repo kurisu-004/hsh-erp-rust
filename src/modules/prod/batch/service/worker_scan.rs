@@ -33,6 +33,7 @@ use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::batch::dto::WorkerScanRequest;
 use crate::modules::prod::batch::vo::WorkerScanCoreOut;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
+use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
 use crate::modules::prod::worker_pool::dto::WorkerScanEvent;
 use crate::modules::shelf::repo::ShelfRepo;
@@ -150,16 +151,19 @@ impl BatchService {
                     .ok_or_else(|| AppError::validation("RETURNED 必须传 next_process_id"))?
                     .parse()
                     .map_err(|_| AppError::validation("next_process_id 非法"))?;
-                // shelf ↔ process 映射校验（JOIN t_shelf_process）
-                let maps: bool = sqlx::query_scalar!(
-                    r#"SELECT EXISTS(
-                        SELECT 1 FROM t_shelf_process
-                        WHERE shelf_id = $1 AND process_id = $2
-                    ) AS "exists!""#,
+                // shelf ↔ process 映射校验。
+                //
+                // 2026-10-04 改调 `ShelfProcessRepo::exists_for_shelf_process`：
+                // 原先是本文件内联的 `SELECT EXISTS(…)`，漏了 `deleted_at IS NULL`，
+                // 与该方法（2026-10-02 SQL 收口时已统一加守卫）**语义不等价** ——
+                // 已软删的货架↔工序映射仍能放行 RETURNED，使 20507
+                // `BIZ_SHELF_PROCESS_NOT_MAPPED` 的触发条件在两条路径上分叉。改调共享
+                // 方法后两条路径同源，不会再各自漂移。
+                let maps = ShelfProcessRepo::exists_for_shelf_process(
+                    repo.conn_mut(),
                     req.shelf_id,
                     next_pid,
                 )
-                .fetch_one(repo.conn_mut())
                 .await?;
                 if !maps {
                     return Err(AppError::biz(
@@ -168,9 +172,24 @@ impl BatchService {
                     ));
                 }
                 // PR-3 批次 step 化：解析 step_id（chain 内 process_id → step_id）。
-                // 防御性：part 后续 chain 被运维软删时，chain_id_opt=None → 不能
-                // 静默抹除 batch.current_process_step_id（否则 part 持有件从
-                // worker 归还到货架后丢失 step 上下文）。此时保留旧 step_id 值。
+                // part 的 `process_chain_id` 为 NULL（未制定工艺链）时**不能**静默抹除
+                // batch.current_process_step_id（否则 part 持有件从 worker 归还到货架后
+                // 丢失 step 上下文）—— 此时保留旧 step_id 值。
+                //
+                // ⚠️ 2026-10-04 修：`O` 从 `i64` 改为 `Option<i64>`（外层 `Option` 由
+                // `fetch_optional` 表示「有没有行」，**不是**列的类型；列的可空性要
+                // 自己收在 `O` 里，末尾 `.flatten()` 把两层压成一层）。
+                // `t_part.process_chain_id` 是可空列：baseline migration 001 建表时
+                // `process_chain_id bigint` **无 NOT NULL**，列 COMMENT 明写
+                // 「NULL = 未制定工艺链」；本查询的目标列即 `column 0`，为 NULL 时按
+                // `i64` 解码触发 sqlx
+                // `error occurred while decoding column 0: unexpected null; try decoding as an Option`
+                // 整笔 500。**真会触发**：手工工单（无工艺链）是常态，工人归还这类件
+                // 必现 —— 也正因为 NULL 在下方 `if let` 之前就抛了，else 分支此前从未
+                // 执行过。回归见 `tests/production/worker_pool.rs::worker_scan_returned_without_process_chain_succeeds`。
+                // 同款反模式（`Option<i64>` 包当前 `NOT NULL` 的列，列一旦变可空就同样
+                // 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`
+                // 与 `prod/worker_pool/repo/mod.rs::process_chain_step_get_process_id`。
                 //
                 // ⚠️ 2026-09-30（review H1）**已知缺口**：下面算出的 `step_id_opt`
                 // 传给 `mark_batch_returned` 后**被丢弃** —— 该函数的
@@ -188,12 +207,13 @@ impl BatchService {
                 // 不再推进（RETURNED / INSPECTED 都不写），对多工序链工单永远停在
                 // 首次定位那一步。后续单独一轮处理（届时 `mark_batch_returned` 需按
                 // 调用方决定是否写 step，语义与 `advance_to_process_id` 同形）。
-                let chain_id_opt: Option<i64> = sqlx::query_scalar(
+                let chain_id_opt: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(
                     "SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL",
                 )
                 .bind(batch.part_id)
                 .fetch_optional(repo.conn_mut())
-                .await?;
+                .await?
+                .flatten();
                 let step_id_opt: Option<i64> = if let Some(chain_id) = chain_id_opt {
                     ProcessChainRepo::resolve_step_id_by_process(
                         repo.conn_mut(),
@@ -202,8 +222,8 @@ impl BatchService {
                     )
                     .await?
                 } else {
-                    // chain 已删：保留 batch 旧的 current_process_step_id（fallback
-                    // 到入参快照，避免 chain 被软删时 RETURNED 把 step 上下文置 NULL）
+                    // 无工艺链（手写工单的常态）：保留 batch 旧的
+                    // current_process_step_id（fallback 到入参快照）
                     batch.current_process_step_id
                 };
                 // 切 holder worker → shelf（OCC）

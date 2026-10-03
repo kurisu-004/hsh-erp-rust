@@ -175,7 +175,7 @@ Response 200 `data`：`ShelfForReturnOut`
 | `items[].name` | string | |
 | `items[].zone` | string | |
 | `items[].location` | string? | |
-| `items[].current_load` | i64 | LEFT JOIN t_part_batch 聚合（status IN (PENDING/IN_PROCESS/INSPECTION/OUTSOURCE) 的批次 quantity 总和；**2026-10-01** 删掉 REPAIRING 字面量 —— 返修批次 status 即 IN_PROCESS，负载口径不变）|
+| `items[].current_load` | i64 | 货架负载 = `t_part_batch` 中 `current_holder_id = 本架`、`status IN ('PENDING','IN_PROCESS','INSPECTION','OUTSOURCE')` **且 `deleted_at IS NULL`** 的批次 **quantity 总和**（件数口径，不是批次数）。2026-10-01 删掉 REPAIRING 字面量 —— 返修批次 status 即 IN_PROCESS，负载口径不变；2026-10-04 聚合子查询补 `deleted_at IS NULL`（此前只有外层 `t_shelf` 带了，软删批次的量会被永久计入）|
 | `items[].is_recommended` | bool | `current_load` 最小的第一条 = `true`，其余 `false` |
 
 业务规则：
@@ -194,12 +194,14 @@ Response 200 `data`：`ShelfForInspectionOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `items[]` | `ShelfForInspectionItem` | `id` / `code` / `name` / `zone` / `location` / `is_active` |
+| `items[]` | `ShelfForInspectionItem` | `id` / `code` / `name` / `zone` / `location` / `is_active` / `current_load` |
+| `items[].current_load` | i64 | **2026-10-04 新增**。口径与 [`for-return`](#get-apiv2shelvesfor-returnnext_process_id) 的 `current_load` **逐字一致**（同 status 列表 `('PENDING','IN_PROCESS','INSPECTION','OUTSOURCE')`、同 `SUM(quantity)`、同 `deleted_at IS NULL`）—— 两个 picker 对同一个架必须给出同一个数。此前本端点走裸 `TShelf` 查询、**不出**该字段，前端品检架卡片无守卫地渲染「在架 N 件」⇒ 每张送检架卡片显示「在架 **undefined** 件」；现改为在后端补齐，前端不动 |
 
 业务规则：
 
 - 仅 `zone='INSPECTION' AND is_active=true AND deleted_at IS NULL`
 - 不过滤 SHELF_ACCOUNT scope（品检架全员可见）
+- 不排序（无「最空优先」语义）、**不**标 `is_recommended`（for-return 独有的出参）
 
 ---
 

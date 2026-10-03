@@ -5,13 +5,18 @@
 //!
 //! ## 约定
 //! - 全部使用 `sqlx::query!` / `query_as!` 编译期宏（需 `DATABASE_URL` 或 `.sqlx/` 离线元数据）
-//! - 读查询一律带 `deleted_at IS NULL`（软删）
+//! - 读查询一律带 `deleted_at IS NULL`（软删）—— **含 LEFT JOIN 的聚合子查询**（外层带了
+//!   不算数，子查询自己也得带，否则软删行的量会被永久计入）
 //! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
 //! - `list_active_production_ordered` 通过 LEFT JOIN `t_part_batch` 聚合 current_load
+//! - 2026-10-04：`list_active_inspection_with_load` 是 11 方法里的新增项（picker
+//!   for-inspection 专供，与 for-return 聚合口径逐字一致；理由见各方法 doc）
 //!
-//! ## Phase P3+ shelf CRUD 暴露给 service 的能力（2026-10-02 起 10 静态方法）
+//! ## Phase P3+ shelf CRUD 暴露给 service 的能力（2026-10-02 起 10 静态方法；
+//! 2026-10-04 加 `list_active_inspection_with_load` 后为 11）
 //! - 读：`get_active_by_id` / `get_by_id` / `get_by_id_zone`
 //!   / `list_with_filters` / `count_with_filters` / `list_active_production_ordered`
+//!   / `list_active_inspection_with_load`
 //! - 过滤+分页+计数：`list_with_filters` / `count_with_filters`（QueryBuilder）
 //! - 写：`create` / `update` / `soft_delete`（同时 `is_active = false`）
 //! - 引用计数：`count_in_use_parts`（deactivate 前查 t_part_batch.current_holder_id
@@ -21,6 +26,7 @@
 //! impl 逐个一行委托到本文件的同名静态方法，故本文件 `pub async fn` 也是 10 个，
 //! 一一对应无遗漏。master 原写「8」是 `t_shelf_process` 4 方法尚在时对 `t_shelf`
 //! 部分的旧计数，本次随方法搬移一并订正为 10。
+//! 2026-10-04：随 `list_active_inspection_with_load` 新增，两处同步为 **11**。
 //!
 //! 2026-09-22 重构：从 `repo.rs` 平移到 `repo/sql.rs`，本文件 SQL 与方法签名零 diff，
 //! `.sqlx/query-*.json` 哈希不变；新增的 `ShelfRepoTrait` 胖 trait 在 `repo/mod.rs`。
@@ -37,7 +43,8 @@ use crate::modules::shelf::model::TShelf;
 
 /// `TShelf` + 聚合 `current_load`（来自 t_part_batch LEFT JOIN）。
 ///
-/// 用于 `list_active_production_ordered`（picker for-return）。
+/// 用于 `list_active_production_ordered`（picker for-return）与
+/// `list_active_inspection_with_load`（picker for-inspection，2026-10-04 新增）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TShelfWithLoad {
     pub id: i64,
@@ -57,7 +64,7 @@ pub struct TShelfWithLoad {
 }
 
 // ---------------------------------------------------------------------------
-// ShelfRepo（t_shelf，8 方法）
+// ShelfRepo（t_shelf，11 方法）
 // ---------------------------------------------------------------------------
 
 pub struct ShelfRepo;
@@ -196,14 +203,24 @@ impl ShelfRepo {
     ///
     /// 用途：`list_for_return` picker —— worker 把成品零件送回时找空货架。
     /// `current_load` 用 `LEFT JOIN t_part_batch` 聚合（status IN ('PENDING',
-    /// 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')）的批次总 quantity；
+    /// 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')）的批次 quantity 总和；
     /// LEFT JOIN 保留 0-负载货架（current_load = 0）。
+    ///
+    /// 2026-10-04：聚合子查询补 `deleted_at IS NULL`（与本文件「读查询一律带
+    /// `deleted_at IS NULL`」的约定对齐；此前只有外层 `t_shelf` 带了）。不过滤则
+    /// 软删批次的 quantity 会被**永久**计入所属货架的负载。2026-10-04 在本 worktree
+    /// 库上核对 `t_part_batch WHERE deleted_at IS NOT NULL` 为 0 行，即该缺陷当前
+    /// 不可观测，属预防性收口。
     ///
     /// 2026-10-01：聚合条件删掉 `'REPAIRING'` 字面量。REPAIRING 已从
     /// `PartStatus` 降级为 `t_part_batch.is_repairing` 标记列（migration
     /// 005/006），返修中的批次 `status` 就是 `'IN_PROCESS'`，已被本 IN 列表的
     /// IN_PROCESS 臂覆盖 —— **负载口径不变**（返修批次仍占着货架），只是不再
     /// 需要第二个字面量。
+    ///
+    /// ⚠️ 聚合子查询与 `list_active_inspection_with_load` 的那段**必须逐字一致**
+    /// （同 status 列表、同 `SUM(quantity)`、同 `deleted_at IS NULL`）：两个 picker
+    /// 对同一个架必须给出同一个数。改一处务必同步另一处。
     pub async fn list_active_production_ordered<'e, E: PgExecutor<'e>>(
         executor: E,
     ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
@@ -219,12 +236,55 @@ impl ShelfRepo {
                        SUM(quantity)::bigint AS cnt
                 FROM t_part_batch
                 WHERE status IN ('PENDING', 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')
+                  AND deleted_at IS NULL
                 GROUP BY current_holder_id
             ) load ON load.shelf_id = s.id
             WHERE s.zone = 'PRODUCTION'
               AND s.is_active = true
               AND s.deleted_at IS NULL
             ORDER BY load.cnt ASC NULLS FIRST, s.display_order ASC, s.id ASC
+            "#,
+        )
+        .fetch_all(executor)
+        .await
+    }
+
+    /// INSPECTION 区活跃货架列表，带 `current_load` 聚合（供 picker for-inspection）。
+    ///
+    /// 2026-10-04 新增：原 `list_for_inspection` 复用 `list_with_filters` 取裸
+    /// `TShelf`（无聚合），出参因此缺 `current_load`，而前端的品检架卡片无
+    /// `v-if` 守卫照渲染「在架 N 件」→ 每张送检架卡片都显示「在架 **undefined** 件」。
+    /// 本方法把聚合补在**后端**（不在前端加守卫），口径与
+    /// `list_active_production_ordered` 逐字一致。
+    ///
+    /// 与 for-return 的差异**仅两处**，且都不影响 `current_load` 口径：
+    /// 1. `zone` 常量为 `'INSPECTION'`；
+    /// 2. 不按 `load.cnt` 排序（品检架无「最空优先」语义，for-return 的
+    ///    `is_recommended` 是它独有的出参，本方法不提供）。
+    ///
+    /// ⚠️ 聚合子查询与 `list_active_production_ordered` 的那段必须逐字一致。
+    pub async fn list_active_inspection_with_load<'e, E: PgExecutor<'e>>(
+        executor: E,
+    ) -> Result<Vec<TShelfWithLoad>, sqlx::Error> {
+        sqlx::query_as!(
+            TShelfWithLoad,
+            r#"
+            SELECT s.id, s.code, s.name, s.zone, s.location, s.is_active, s.display_order,
+                   s.version, s.created_at, s.created_by, s.updated_at, s.updated_by, s.deleted_at,
+                   COALESCE(load.cnt, 0)::bigint AS "current_load!"
+            FROM t_shelf s
+            LEFT JOIN (
+                SELECT current_holder_id AS shelf_id,
+                       SUM(quantity)::bigint AS cnt
+                FROM t_part_batch
+                WHERE status IN ('PENDING', 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')
+                  AND deleted_at IS NULL
+                GROUP BY current_holder_id
+            ) load ON load.shelf_id = s.id
+            WHERE s.zone = 'INSPECTION'
+              AND s.is_active = true
+              AND s.deleted_at IS NULL
+            ORDER BY s.display_order ASC, s.id ASC
             "#,
         )
         .fetch_all(executor)

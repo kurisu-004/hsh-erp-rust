@@ -353,7 +353,7 @@ Request：`WorkerScanRequest`
 | `serial_no` | string | ✓ | 扫码得到的序列号（service 反查 part） |
 | `badge_code` | string | ✓ | 工人 badge_code（service 反查 worker） |
 | `event_type` | string | ✓ | `"RETURNED"` / `"INSPECTED"`（`WorkerScanEvent` 枚举） |
-| `shelf_id` | string (i64) | ✓ | RETURNED 时是 worker-scan 货架（PRODUCTION 区）；INSPECTED 时是工人触发扫码的货架（PRODUCTION 区校验） |
+| `shelf_id` | string (i64) | ✓ | **工人触发扫码的 PRODUCTION 货架（两个 event_type 同）**。service 对它做无条件 PRODUCTION 硬校验（不分 `event_type`）→ `20501`。**不是**品检架：INSPECTED 的品检架走 `target_inspection_shelf_id`。它必须留在 PRODUCTION 区的真正原因是 refill 候选池按 `current_holder_id = $2` 过滤（`location='PRODUCTION_SHELF'`）—— 传品检架会让 refill 查空池。**2026-10-04 订正**：此前本行写「INSPECTED 时是工人触发扫码的货架（PRODUCTION 区校验）」，仓内 DTO 注释却写「INSPECTION 区也会校验，按 event_type 分支走」，后者与代码矛盾且已误导过一次调用方 |
 | `next_process_id` | string (i64)? | — | **仅 RETURNED 必填**；缺 / 非法 → `40001` |
 | `target_inspection_shelf_id` | string (i64)? | — | **仅 INSPECTED 必填**；缺 / 非法 → `40001`；service 校验 `zone='INSPECTION'` 且 `is_active=true` |
 | `batch_id` | string (i64)? | — | 多批次歧义时 caller 显式指定以消除歧义 |
@@ -365,21 +365,50 @@ Request：`WorkerScanRequest`
 >
 > **本端点豁免 `version`**：`worker-scan` 是「扫序列号 + 扫胸牌」的纯扫码流，前端手上没有批次 `version`（强加会要求工人先查一次批次）。该端点语义即「以 DB 当前状态为准」，仅保留 service 内部 OCC（事务内自读自写），不做 caller 侧 OCC。因此 `batch_id` 在这里仍是可选的，保留「按持有关系唯一匹配」推断。详见 [乐观锁](#乐观锁caller-侧-occ)。
 
+> **可空列注记（2026-10-04 新增）**：本端点路径（含经 part/batch repo 下游读到的列）会碰到的
+> `t_part.serial_no` / `t_part.process_chain_id` / `t_part_batch.location` /
+> `t_part_batch.current_process_id` / `t_part_batch.current_process_step_id`
+> **全部是可空列**（baseline migration 001 建表时均无 `NOT NULL`；`process_chain_id` 的列
+> COMMENT 明写「NULL = 未制定工艺链」）。读取方一律按 `Option` 收 —— 按非 `Option` 解码会以
+> `error occurred while decoding column 0: unexpected null; try decoding as an Option`
+> 整笔 500。特别注意 `sqlx` 的 `fetch_optional()` 返回的是 `Result<Option<O>>`，那个
+> `Option` **只表示「有没有行」，不表示列的类型**；列本身可空时 `O` 仍须是 `Option<T>`
+> （末尾补 `.flatten()` 把两层压成一层）。
+>
+> 本端点路径 2026-10-04 一次修掉 2 处：`process_chain_id` 的 `unexpected null` 500
+> （手写工单必现），以及内联 `t_shelf_process` 漏 `deleted_at IS NULL` 造成的 20507
+> 触发条件分叉。同款 `unexpected null` 反模式在相邻的扫码 / 工种只读端点上还出过
+> （`part/service/phase1/work_type.rs` 三个列表端点的 `serial_no`，2026-10-03 修）——
+> 下一个要动这段 SQL 的人请把本注记读完再动手。
+
 业务流转：
 
 - **RETURNED**：worker 把 IN_PROCESS+WORKER 批次放回生产架
-  - `shelf_id` 必须映射 `next_process_id`（service 校验 `t_shelf_process`）→ 不匹配 `20507 BIZ_SHELF_PROCESS_NOT_MAPPED`
+  - `shelf_id` 必须映射 `next_process_id`（service 校验 `t_shelf_process`，含
+    `deleted_at IS NULL` 守卫 —— 已软删的货架↔工序映射不放行）→ 不匹配
+    `20507 BIZ_SHELF_PROCESS_NOT_MAPPED`。**2026-10-04 订正**：该校验原先是 worker-scan
+    内联的 `SELECT EXISTS(…)` 且漏了 `deleted_at IS NULL`，与 worker-pool `move_batch`
+    走的那条（`ShelfProcessRepo::exists_for_shelf_process`）语义不等价，使 20507 的
+    触发条件在两条路径上分叉；现已统一改调后者。
   - `part_batch` 与 `part` 状态切回 IN_PROCESS+PRODUCTION_SHELF+holder=shelf（OCC）
   - **写 `current_process_id = next_process_id`** ——
     RETURNED 是全仓唯一的**工序推进**路径，批次归还货架后落进**下一道工序**的候选池。
     此前该列不写，批次带着旧工序 id 落回**原工序**池（权威列在主干流程上说谎）。
     另：RETURNED 仍**不更新** `current_process_step_id`（可选的显示用定位信息），
     这是已知缺口，影响仅限显示，池归属不受影响。
+  - service 会读 `t_part.process_chain_id` 解析 `next_process_id` 对应的 `step_id`；
+    该列**可空**，手写工单（无工艺链的常态）为 `NULL` → 保留批次既有的
+    `current_process_step_id`，不抹除。**2026-10-04 修**：此前该列按 `i64` 解码，
+    `NULL` 会在 `if let` 之前就以 `unexpected null` 500 掉整个请求（正是手写工单必现
+    的那条路），上述保留分支从未被执行到。
   - 写 `RETURNED_TO_SHELF` 事件日志
 - **INSPECTED**：worker 把持有件直接送检
   - `target_inspection_shelf_id` 必须属于 INSPECTION 区且 active
   - 不符合 → `20511 BIZ_SHELF_NOT_INSPECTION_ZONE` / `20512 BIZ_SHELF_INACTIVE`
-  - 内部走 `to_inspection_core`：状态机 `IN_PROCESS → INSPECTION` + holder worker → target_shelf + 写 `SENT_TO_INSPECTION` 事件日志
+  - 状态机 `IN_PROCESS → INSPECTION` + holder worker → target_shelf（由
+    `mark_batch_inspected` 内的 status_gate 一次完成）+ 写 `SENT_TO_INSPECTION`
+    事件日志。**2026-10-04 订正**：本节此前写「内部走 `to_inspection_core`」，仓内无此
+    中间层，`worker_scan.rs` 直接调 `PartBatchRepo::mark_batch_inspected`
   - **`current_process_id` 置 NULL**（送检 = 出池），
     与单件送检 `to-inspection` 口径一致
   - 不带 quantity 拆批（worker-scan 是单件持有件流转，不涉及批次拆分）

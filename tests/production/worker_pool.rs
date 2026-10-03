@@ -3,7 +3,10 @@
 //! 覆盖 16 个场景：
 //!   1. worker_scan INSPECTED → 自动 refill
 //!   2. worker_scan RETURNED → 自动 refill；RETURNED 推进 `current_process_id`
-//!      （2026-09-30 review 第 1 轮 H1 回归：批次落进**下一道**工序池而非原池）
+//!      （2026-09-30 review 第 1 轮 H1 回归：批次落进**下一道**工序池而非原池）；
+//!      另有 2d（2026-10-04 回归）：RETURNED 在 part **无工艺链**时也必须成功 ——
+//!      `t_part.process_chain_id` 可空，按 `i64` 解码会把整个 RETURNED 打成 500，
+//!      而原 fixture 无条件建链，正是该 bug 的免疫屏障
 //!   3. refill_when_pool_empty_returns_empty
 //!   4. refill_caps_at_max_held_batches
 //!   5. concurrent_refill_no_double_pick       [`#[ignore]`：需 app-level 并发基建]
@@ -462,14 +465,24 @@ async fn insert_pool_part(
 ///
 /// 入参：
 /// - `worker_id`：worker.id
-/// - `shelf_id`：RETURNED 目标 shelf
-/// - `process_id`：batch.next_process_id（必填 RETURNED）
+/// - `next_process_id`：batch.next_process_id（必填 RETURNED）
+/// - `with_chain`：part 是否绑定工艺链。`false` ⇒ `t_part.process_chain_id` 留 NULL
+///   （手写工单的常态）
 ///
-/// 返回 (part_id, batch_id)。
+/// 返回 (part_id, batch_id, step_id)。`step_id` 是批次 `current_process_step_id` 的
+/// 入参值，恒非 NULL —— 两种 `with_chain` 都建 chain/step 行，`with_chain` 只控制 part
+/// 是否**绑**上它（`with_chain=false` 时 step 行是「孤儿」，与真实数据里「part 无链、
+/// 批次仍带 step 定位」同形；也让调用方能断言 RETURNED 后该值被保留）。
 ///
 /// 2026-09-16 PR-3 fix：复用同一 `snowflake` guard 生成所有 id，不要再
 /// `pool_snowflake().lock()` 第二次——`std::sync::Mutex` 非递归，
 /// 同线程二次 lock 会永久 hang（PR-3 step3 之前无此问题）。
+///
+/// 2026-10-04 加 `with_chain`：原 helper **无条件**建 chain + step 并把
+/// `process_chain_id` 绑回 part，于是 `t_part.process_chain_id` 在全部 worker-scan
+/// 用例里恒非 NULL —— 这正是 `worker_scan.rs` 把该列按 `i64` 解码（而该列可空 ⇒
+/// `unexpected null` 把整个 RETURNED 打成 500）却让 CI 全绿的原因：无链工单这条
+/// 免疫屏障从未被测过。回归见 `worker_scan_returned_without_process_chain_succeeds`。
 async fn insert_worker_held_part(
     pool: &PgPool,
     customer_id: i64,
@@ -477,7 +490,8 @@ async fn insert_worker_held_part(
     worker_id: i64,
     next_process_id: i64,
     quantity: i32,
-) -> (i64, i64) {
+    with_chain: bool,
+) -> (i64, i64, i64) {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let now = now_naive();
@@ -508,6 +522,8 @@ async fn insert_worker_held_part(
     .execute(pool)
     .await
     .expect("insert chain step");
+    // 2026-10-04：`t_part.process_chain_id` 可空（列 COMMENT「NULL = 未制定工艺链」），
+    // 故绑定 `Option<i64>` —— `with_chain=false` 时该列保持 NULL。
     sqlx::query!(
         "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
          request_date, planned_delivery_date, system_delivery_date, status, \
@@ -522,7 +538,7 @@ async fn insert_worker_held_part(
         customer_id,
         quantity,
         now,
-        chain_id,
+        with_chain.then_some(chain_id),
     )
     .execute(pool)
     .await
@@ -549,7 +565,7 @@ async fn insert_worker_held_part(
     .execute(pool)
     .await
     .expect("insert held t_part_batch");
-    (part_id, batch_id)
+    (part_id, batch_id, step_id)
 }
 
 /// 把 part_id 给定批次标为 worker 持有（针对 pool→worker 流转后的批次）。
@@ -583,8 +599,8 @@ async fn worker_scan_inspected_triggers_refill() {
 
     let worker = insert_worker(&pool, "BC001", "工1", Some(wt)).await;
     // worker 当前持 1 件；池里 1 件待 refill
-    let (held_part, _held_batch) =
-        insert_worker_held_part(&pool, customer, "H-001", worker, proc, 1).await;
+    let (held_part, _held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-001", worker, proc, 1, true).await;
     let (_pool_part, _pool_batch) =
         insert_pool_part(&pool, customer, "P-001", prod_shelf, proc, 1).await;
 
@@ -636,8 +652,8 @@ async fn worker_scan_returned_triggers_refill() {
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC002", "工2", Some(wt)).await;
-    let (_held_part, _held_batch) =
-        insert_worker_held_part(&pool, customer, "H-002", worker, proc, 1).await;
+    let (_held_part, _held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-002", worker, proc, 1, true).await;
     let (_pool_part, _pool_batch) =
         insert_pool_part(&pool, customer, "P-002", prod_shelf, proc, 1).await;
 
@@ -706,8 +722,8 @@ async fn worker_scan_returned_advances_current_process_id() {
 
     let worker = insert_worker(&pool, "BC002B", "工2B", Some(wt)).await;
     // 工人持有 1 件 IN_PROCESS+WORKER 批次，current_process_id = proc_b（起点工序）
-    let (_held_part, held_batch) =
-        insert_worker_held_part(&pool, customer, "H-002B", worker, proc_b, 1).await;
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-002B", worker, proc_b, 1, true).await;
 
     let (app, token, _pool) = login_shelf_account(pool.clone(), "user2b", &[prod_shelf]).await;
     let (s, env) = send(
@@ -776,6 +792,108 @@ async fn worker_scan_returned_advances_current_process_id() {
     assert!(
         in_c,
         "RETURNED 推进后批次应出现在目标工序 {proc_c} 池: {ec}"
+    );
+}
+
+/// 场景 2d（2026-10-04 回归）: worker-scan RETURNED 在 part **无工艺链**时也必须成功。
+///
+/// ## 这条测试补的是哪个洞
+/// `insert_worker_held_part` 原先**无条件**建 `t_part_process_chain` +
+/// `t_process_chain_step` 并把 `process_chain_id` 绑回 `t_part`，所以全部
+/// worker-scan 用例里该列恒非 NULL。而 `t_part.process_chain_id` 是可空列
+/// （baseline 列 COMMENT：「NULL = 未制定工艺链」），`worker_scan.rs` 却按 `i64`
+/// 解码它 —— 手写工单（无链，工单域的常态）归还时必撞
+/// `error occurred while decoding column 0: unexpected null; try decoding as an Option`
+/// 整笔 500。fixture 就是那个 bug 的免疫屏障，所以 CI 全绿、线上必现。
+///
+/// 现在 fixture 支持 `with_chain=false`（见其 doc），本测试走该分支。
+///
+/// ## 断言
+/// 1. 前置：`t_part.process_chain_id IS NULL`（防 fixture 未来被改回有链而假绿）
+/// 2. `POST /prod/batches/worker-scan`（RETURNED）→ HTTP 200 + `code=0`
+/// 3. `current_process_id` 推进到 `next_process_id`（RETURNED 的主状态变更）
+/// 4. `current_process_step_id` 保留原值（走 else 分支）
+///
+/// ## 断言 4 的诚实边界
+/// `mark_batch_returned` 的 `current_process_step_id` 形参带 `_` 前缀、SQL 里
+/// **不写**该列（2026-09-30 review H1 的已知缺口，只影响显示），所以「保留原值」
+/// 无论 else 分支返回什么都成立 —— 它是**防回归的护栏**（挡住将来有人改成写 NULL），
+/// 不是 else 分支确实执行过的证明。真正的回归信号是断言 2：修之前这里是 500。
+#[tokio::test]
+async fn worker_scan_returned_without_process_chain_succeeds() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "POOL2D").await;
+    // 起点工序（工种可加工）→ RETURNED 传的目标工序（工种**不含**，否则同事务的
+    // refill 会把刚归还的批次又抢回工人，干扰断言）
+    let proc_b = seed_process(&pool, "PROC-B3", "工序B3").await;
+    let proc_c = seed_process(&pool, "PROC-C3", "工序C3").await;
+    let wt = insert_work_type(&pool, "WT-B3", "工种B3", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc_b).await;
+    let prod_shelf = insert_shelf(&pool, "PROD-B3", "PROD-B3", "PRODUCTION").await;
+    // RETURNED 的 20507 校验要求目标货架映射 next_process_id（= proc_c）
+    link_shelf_to_process(&pool, prod_shelf, proc_c).await;
+
+    let worker = insert_worker(&pool, "BC002D", "工2D", Some(wt)).await;
+    // with_chain = false ⇒ t_part.process_chain_id 为 NULL；批次仍带一个**非 NULL**
+    // 的旧 current_process_step_id，好让断言 4 有东西可保留
+    let (_held_part, held_batch, old_step) =
+        insert_worker_held_part(&pool, customer, "H-002D", worker, proc_b, 1, false).await;
+
+    // 前置守卫：fixture 若被改回「无条件建链」，本测试会变成假绿，先在这里 fail
+    let chain_id: Option<i64> = sqlx::query_scalar(
+        "SELECT p.process_chain_id FROM t_part p \
+         JOIN t_part_batch b ON b.part_id = p.id WHERE b.id = $1",
+    )
+    .bind(held_batch)
+    .fetch_one(&pool)
+    .await
+    .expect("query part process_chain_id");
+    assert!(
+        chain_id.is_none(),
+        "fixture 前置不成立：part 绑了工艺链 {chain_id:?}，本测试就测不到无链分支了"
+    );
+
+    let (app, token, _pool) = login_shelf_account(pool.clone(), "user2d", &[prod_shelf]).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/batches/worker-scan",
+            Some(json!({
+                "serial_no": "H-002D",
+                "badge_code": "BC002D",
+                "event_type": "RETURNED",
+                "shelf_id": prod_shelf.to_string(),
+                "next_process_id": proc_c.to_string(),
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    // 修之前这里 500：`decoding column 0: unexpected null`（part 无工艺链）
+    assert_eq!(s, StatusCode::OK, "scan RETURNED（part 无工艺链）: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(env["data"]["scan"]["event_type"], "WORKER_SCAN_RETURNED");
+
+    let after: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT current_process_id, current_process_step_id \
+         FROM t_part_batch WHERE id = $1",
+    )
+    .bind(held_batch)
+    .fetch_one(&pool)
+    .await
+    .expect("query batch after RETURNED");
+    assert_eq!(
+        after.0,
+        Some(proc_c),
+        "RETURNED 应把 current_process_id 推进到 next_process_id({proc_c})，实际 {:?}",
+        after.0
+    );
+    assert_eq!(
+        after.1,
+        Some(old_step),
+        "part 无工艺链时 RETURNED 应保留批次既有 current_process_step_id({old_step})，实际 {:?}",
+        after.1
     );
 }
 
@@ -950,8 +1068,8 @@ async fn worker_scan_shelf_scope_violation_403() {
     link_shelf_to_process(&pool, shelf_y, proc).await;
 
     let worker = insert_worker(&pool, "BC008", "工8", Some(wt)).await;
-    let (_held_part, _held_batch) =
-        insert_worker_held_part(&pool, customer, "H-008", worker, proc, 1).await;
+    let (_held_part, _held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-008", worker, proc, 1, true).await;
 
     // user 只绑定 shelf_x，请求扫描到 shelf_y → 40301 SHELF_MISMATCH
     let (app, token, _pool) = login_shelf_account(pool.clone(), "user8", &[shelf_x]).await;
@@ -1110,8 +1228,8 @@ async fn events_persisted_to_t_part_event() {
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC011", "工11", Some(wt)).await;
-    let (held_part, _held_batch) =
-        insert_worker_held_part(&pool, customer, "H-011", worker, proc, 1).await;
+    let (held_part, _held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-011", worker, proc, 1, true).await;
     let (pool_part, _pool_batch) =
         insert_pool_part(&pool, customer, "P-011", prod_shelf, proc, 1).await;
 
@@ -1220,8 +1338,8 @@ async fn move_worker_to_pool_returns_batch_to_pool() {
     link_shelf_to_process(&pool, prod_shelf, proc).await;
 
     let worker = insert_worker(&pool, "BC013", "工13", Some(wt)).await;
-    let (_held_part, held_batch) =
-        insert_worker_held_part(&pool, customer, "H-013", worker, proc, 1).await;
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-013", worker, proc, 1, true).await;
 
     // 取 move 前的 step_id / current_process_id（move 后都应保持不变）
     let (step_before, process_before): (Option<i64>, Option<i64>) = sqlx::query_as(
@@ -1355,8 +1473,8 @@ async fn move_worker_to_worker_transfers_batch() {
 
     let worker_src = insert_worker(&pool, "BC013C1", "工13C1", Some(wt)).await;
     let worker_dst = insert_worker(&pool, "BC013C2", "工13C2", Some(wt)).await;
-    let (_held_part, held_batch) =
-        insert_worker_held_part(&pool, customer, "H-013C", worker_src, proc, 1).await;
+    let (_held_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-013C", worker_src, proc, 1, true).await;
 
     let (app, token) = login_manager_with_username(&pool, "admin13C").await;
     let (s, env) = send(
@@ -1435,12 +1553,12 @@ async fn move_target_worker_capacity_exceeded() {
 
     let worker_dst = insert_worker(&pool, "BC013E-DST", "工13E-DST", Some(wt)).await;
     // 目标 worker 已持 1 批（触顶）
-    let (_held_part_dst, _held_batch_dst) =
-        insert_worker_held_part(&pool, customer, "H-DST", worker_dst, proc, 1).await;
+    let (_held_part_dst, _held_batch_dst, _step) =
+        insert_worker_held_part(&pool, customer, "H-DST", worker_dst, proc, 1, true).await;
 
     let worker_src = insert_worker(&pool, "BC013E-SRC", "工13E-SRC", Some(wt)).await;
-    let (_held_part_src, held_batch_src) =
-        insert_worker_held_part(&pool, customer, "H-SRC", worker_src, proc, 1).await;
+    let (_held_part_src, held_batch_src, _step) =
+        insert_worker_held_part(&pool, customer, "H-SRC", worker_src, proc, 1, true).await;
 
     let (app, token) = login_manager_with_username(&pool, "admin13E").await;
     let (s, env) = send(
@@ -1957,10 +2075,10 @@ async fn held_batch_includes_has_cnc_program() {
 
     let worker = insert_worker(&pool, "BC-CNC-HELD", "工CNC-held", Some(wt)).await;
     // 两个 held batch：A 有 G_CODE，B 无
-    let (_part_a, _batch_a) =
-        insert_worker_held_part(&pool, customer, "H-CNC-A", worker, proc, 1).await;
-    let (_part_b, _batch_b) =
-        insert_worker_held_part(&pool, customer, "H-CNC-B", worker, proc, 1).await;
+    let (_part_a, _batch_a, _step_a) =
+        insert_worker_held_part(&pool, customer, "H-CNC-A", worker, proc, 1, true).await;
+    let (_part_b, _batch_b, _step_b) =
+        insert_worker_held_part(&pool, customer, "H-CNC-B", worker, proc, 1, true).await;
     let part_a_id: i64 = sqlx::query_scalar("SELECT id FROM t_part WHERE serial_no = 'H-CNC-A'")
         .fetch_one(&pool)
         .await

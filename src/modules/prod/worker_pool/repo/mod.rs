@@ -489,14 +489,22 @@ impl WorkerPoolRepoTrait for &mut PgConnection {
         &mut self,
         step_id: i64,
     ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<i64> = sqlx::query_scalar(
+        // ⚠️ 2026-10-04 加固：`O` 按 `Option<i64>` 收（外层 `Option` 由
+        // `fetch_optional` 表示「有没有行」，不表示列的类型）。`t_process_chain_step.process_id`
+        // 当前是 `NOT NULL`，故按 `i64` 解码当前安全；列一旦变可空，同款写法会以
+        // `error occurred while decoding column 0: unexpected null; try decoding as an Option`
+        // 整笔 500。**本次零行为变化**（`NOT NULL` 列 `.flatten()` 恒为 `Some(v)`）。
+        // 同款修法见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`
+        // 与 `prod/batch/service/worker_scan.rs::worker_scan_event`（后者是可空列，
+        // 已在 2026-10-04 真修过一次 500）。
+        let row: Option<Option<i64>> = sqlx::query_scalar(
             "SELECT process_id FROM t_process_chain_step \
              WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(step_id)
         .fetch_optional(&mut **self)
         .await?;
-        Ok(row)
+        Ok(row.flatten())
     }
 
     // ── part_batch helper ──
