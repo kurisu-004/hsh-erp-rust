@@ -161,8 +161,12 @@
 | `has_children` | bool | 2026-09-28 新增。是否有子件（Tree data lazy mode 必需）：PART 行 → `false`；ASSEMBLY 行 → `child_count.unwrap_or(0) > 0`。后端不强制走 `GET /assemblies/{id}` 预拉，前端按此字段切换展开/折叠交互即可。 |
 | `child_count` | string (i64)? | 2026-09-28 新增。子件计数（装配表行专用）；PART 行 → `null`。真相源：`t_part WHERE assembly_id = $1 AND deleted_at IS NULL` 的 COUNT（≤200 ids / 1 extra query）。 |
 | `has_cnc_program` | bool | 2026-09-29 新增（CNC 重构 5 任务之一）。是否已上传 G_CODE 数控程序。真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`。`GET /parts/pending-programming` 走专用 repo 填充真实值；其它 list 端点默认 `false`（service 不 enrich，避免 N+1）。详见 [`./lifecycle.md#get-apiv2partspending-programming`](./lifecycle.md#get-apiv2partspending-programming)。 |
-| `batch_id` | string (i64)? | 2026-10-03 新增。**活跃批次雪花 id**（`serialize_i64_opt` → JSON string；无值时序列化为 `null`）。**仅 `GET /parts/pickable-by-work-type/{work_type_id}` 填** —— 该端点的行本来就是「批次行」（取行 SQL 从 `t_part_batch b` 起），扫码台「领料」按本字段定位批次后发写请求。**其余复用 `PartListItem` 的路径恒为 `null`**（`GET /parts` / `GET /api/v2/com/union-list` / `GET /parts/pending-programming` 等）：那些行的语义单位是 part，一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故宁可不填。 |
-| `batch_version` | i32? | 2026-10-03 新增。`batch_id` 那个批次的乐观锁版本号（`t_part_batch.version`），前端发写请求时作 OCC 版本回传。填充口径与 `batch_id` 完全一致（同为「仅 pickable-by-work-type 填，其余路径 `null`」），二者同生共死。⚠️ **批次 OCC 只认本字段，不要拿 `version` 当批次版本用**（见下条）。 |
+| `batch_id` | string (i64)? | 2026-10-03 新增。**批次雪花 id**（`serialize_i64_opt` → JSON string；无值时序列化为 `null`）。**仅 `GET /parts/pickable-by-work-type/{work_type_id}` 与 `GET /parts/by-worker/{worker_id}` 填** —— 这两条端点的行本来就是「批次行」（取行 SQL 从 `t_part_batch b` 起），扫码台「领料 / 放回」按本字段定位批次后发写请求。**其余复用 `PartListItem` 的路径恒为 `null`**（`GET /parts` / `GET/api/v2/com/union-list` / `GET/parts/pending-programming` 等）：那些行的语义单位是 part，一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故宁可不填。 |
+| `batch_version` | i32? | 2026-10-03 新增。`batch_id` 那个批次的乐观锁版本号（`t_part_batch.version`），前端发写请求时作 OCC 版本回传。填充口径与 `batch_id` 完全一致（同为「pickable-by-work-type 与 by-worker 填，其余路径 `null`」），二者同生共死。⚠️ **批次 OCC 只认本字段，不要拿 `version` 当批次版本用**（见下条）。 |
+| `chain_state` | string | 2026-10-04 新增。工序链三值判据（**仅 `GET /parts/by-worker/{worker_id}` 填**，其余 6 处返回点恒 `"NONE"`）：`"NONE"` = 无链 / 链已软删 / **当前工序不在链内（位置指针漂移）** ⇒ 前端弹工序选择框；`"NEXT"` = 当前工序在链内**且有下一道** ⇒ 免填、直接确认放回；`"TAIL"` = 当前工序是链内**最后一道** ⇒ 提示「加工完成后请送检」。三值互斥而非两个 bool（两个 bool 会产生「可免填 + 是链尾」的自相矛盾组合）。派生口径见 [`./lifecycle.md`](./lifecycle.md#get-apiv2partsby-workerworker_id)。 |
+| `chain_next_process_id` | string (i64) | 2026-10-04 新增。下一道工序 id。**非可空 + `"0"` 兜底**（与 `GET /outsource-pool/state` 的 `receive_next_process_id` 同一约定：JSON 里恒出现，`"0"` = 无下一道，前端不要按 `null` 判空）。`chain_state != "NEXT"` 时为 `"0"`。仅 `by-worker` 填。 |
+| `chain_next_process_name` | string? | 2026-10-04 新增。下一道工序名（`t_process.name`）。`chain_state != "NEXT"` 时为 `null`（含「下一 step 的工序已软删」——此时 id 仍有值）。仅 `by-worker` 填。 |
+| `chain_current_process_name` | string? | 2026-10-04 新增。当前工序名（`t_process.name`，`TAIL` 提示里点名「当前工序 X 已是最后一道」用）。链内定位不成立（无链 / 锚链软删 / 当前工序不在链内）或工序已软删时为 `null`。仅 `by-worker` 填。 |
 | `delivered_quantity` | i32? | 2026-10-03 新增。已送数量。**仅 `GET /api/v2/com/union-list`（三种 `row_type` 模式）与 `GET /api/v2/parts` 填；其余复用本 VO 的 5 处返回点恒 `null`（4 个列表端点 + `POST /assemblies/{id}/children` 返回的单对象 `R<PartListItem>`）**。<br>**PART 行** = 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的 `quantity` 之和（真相源是 `t_part_batch.status`，**不**从派生缓存 `t_part.status` 反推 —— 后者在 min-progress 规则下会把「部分已交」压成 0）。<br>**ASSEMBLY 行** = 可凑齐的套数 `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，PG 整数除法截断；子件总量为 0 者不参与（`NULLIF`），无子件为 0；`LEAST` 收口到工单总套数（子件超交时不会算出超过总套数的值）。软删子件不参与（与 `child_count` 同口径）。<br>零批次的行给 `0`（不是 `null`），键恒在。<br>⚠️ 本字段是**全局已送**口径。同公式的**本单**口径（分子只算某张送货单上的批次）在送货单侧另有两个字段：`line_items[].shippable_sets` / `assembly_quantity`（见 [`../delivery-notes/index.md`](../delivery-notes/index.md) 与 [`../delivery-notes/print.md`](../delivery-notes/print.md)），两者不互相替代。 |
 
 > ⚠️ **本字段不参与后端任何过滤**（2026-10-03 登记，避免契约归属被静默遗忘）：
@@ -180,21 +184,22 @@
 
 #### 前端配套改动清单
 
-返回 `R<PartListOut>` 的端点共 **6 个**。`batch_id` / `batch_version`（2026-10-03 新增）
-与 `delivered_quantity`（2026-10-03 新增）在**每一个**复用路径的响应里都出现，
-但填充口径不同。逐端点影响与前端动作：
+返回 `R<PartListOut>` 的端点共 **6 个**。`batch_id` / `batch_version`（2026-10-03 新增）、
+`chain_state` / `chain_next_process_id` / `chain_next_process_name` /
+`chain_current_process_name`（2026-10-04 新增）与 `delivered_quantity`（2026-10-03 新增）
+在**每一个**复用路径的响应里都出现，但填充口径不同。逐端点影响与前端动作：
 
-| 端点 | `batch_id` / `batch_version` | `delivered_quantity` | 构造路径（决定为何 null / 为 0） | 前端是否要改 |
-|---|---|---|---|---|
-| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | 恒 `null` | `part/service/phase1/work_type.rs` 在 `From<TPart>` 之后**显式覆写**批次两字段（全仓唯一填 `Some` 的路径）；已送数量未覆写 | 需要：TS `PartItem` 补可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
-| `GET /parts` | 恒 `null` | **有值** | `PartService::list_parts_part_only_with_total`：`From<TPart>` 后显式覆写已送数量（零批次给 0） | **需要**（2026-10-03）：零件一览「已送数量」列此前恒显 0，现为真实数字 |
-| `GET /api/v2/com/union-list` | 恒 `null` | **有值** | `UnionListService` 三种 `row_type` 模式各接一次：PART 行取已交批次数量之和，ASSEMBLY 行取可凑齐套数 | **需要**（2026-10-03）：前端「部分已交」列表据此判定与展示 |
-| `GET /parts/pending-programming` | 恒 `null` | 恒 `null` | `part/service/phase1/lifecycle_helpers.rs` 结构体更新 `..PartListItem::from(..)` | **不需要** |
-| `GET /parts/by-work-type/{work_type_id}` | 恒 `null` | 恒 `null` | `part/service/phase1/work_type.rs` `PartListItem::from(手工 TPart)` | **不需要** |
-| `GET /parts/by-worker/{worker_id}` | 恒 `null` | 恒 `null` | `part/service/phase1/work_type.rs` `PartListItem::from(手工 TPart)` | **不需要** |
+| 端点 | `batch_id` / `batch_version` | 链四字段（`chain_state` / `chain_next_process_id` / `chain_next_process_name` / `chain_current_process_name`） | `delivered_quantity` | 构造路径（决定为何 null / 为 0） | 前端是否要改 |
+| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | 恒 `"NONE"` / `"0"` / `null` / `null` | 恒 `null` | `part/service/phase1/work_type.rs` 在 `From<TPart>` 之后**显式覆写**批次两字段；链四字段未覆写 | 需要：TS `PartItem` 补可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
+| `GET /parts` | 恒 `null` | 恒 `"NONE"` / `"0"` / `null` / `null` | **有值** | `PartService::list_parts_part_only_with_total`：`From<TPart>` 后显式覆写已送数量（零批次给 0） | **需要**（2026-10-03）：零件一览「已送数量」列此前恒显 0，现为真实数字 |
+| `GET /api/v2/com/union-list` | 恒 `null` | 恒 `"NONE"` / `"0"` / `null` / `null` | **有值** | `UnionListService` 三种 `row_type` 模式各接一次：PART 行取已交批次数量之和，ASSEMBLY 行取可凑齐套数 | **需要**（2026-10-03）：前端「部分已交」列表据此判定与展示 |
+| `GET /parts/pending-programming` | 恒 `null` | 恒 `"NONE"` / `"0"` / `null` / `null` | 恒 `null` | `part/service/phase1/lifecycle_helpers.rs` 结构体更新 `..PartListItem::from(..)` | **不需要** |
+| `GET /parts/by-work-type/{work_type_id}` | 恒 `null` | 恒 `"NONE"` / `"0"` / `null` / `null` | 恒 `null` | `part/service/phase1/work_type.rs` `PartListItem::from(手工 TPart)` | **不需要** |
+| `GET /parts/by-worker/{worker_id}` | **有值**（该行的批次 + 其 version） | **有值**（全仓唯一填充路径，见 [`./lifecycle.md`](./lifecycle.md#get-apiv2partsby-workerworker_id)） | 恒 `null` | `part/service/phase1/work_type.rs`：`From<TPart>` 之后显式覆写批次两字段 + 4 个链派生列（取行 SQL 的 `LEFT JOIN LATERAL`） | **需要**（2026-10-04）：报工台放回页按 `chain_state` 三态决定「免填 / 弹选择框 / 提示送检」，并按 `batch_id` + `batch_version` 发写请求 |
 
 > 上表只统计列表信封 `R<PartListOut>` 的 6 个端点。`POST /api/v2/assemblies/{id}/children`
-> 另返回单个 `R<PartListItem>`（共 7 处返回点），该处 `delivered_quantity` 恒 `null`。
+> 另返回单个 `R<PartListItem>`（共 7 处返回点），该处 `delivered_quantity` 恒 `null`、
+> 链四字段也恒取默认值。
 
 > 2026-10-03 订正一：上表原列 8 个端点，其中
 > `GET /parts/outsource-in-flight` / `GET /parts/outsource-sendable` 已于同日下线并
@@ -208,8 +213,8 @@
 **前端无需改 Zod schema**，依据两条（均已核实）：
 
 1. `batch_id` 是 `#[serde(serialize_with = "serialize_i64_opt")]` + 无
-   `skip_serializing_if`，`delivered_quantity` 是 `#[serde(default)]` + 无
-   `skip_serializing_if`，二者都是**恒出现**的增量 key（无值时为 `null`）；
+   `skip_serializing_if`，`delivered_quantity` 与链四字段都是 `#[serde(default)]` + 无
+   `skip_serializing_if`，六者都是**恒出现**的增量 key（无值时为 `null` 或默认值）；
 2. part 列表行 schema 刻意**不用** `.strict()`（前端 `src/composables/queries/schemas.ts`
    该处注释明写「行级 `.strict()` 会在后端加**任何一个**新字段时把整表打挂」），
    Zod 默认 strip 模式会安静吞掉未声明的 key。

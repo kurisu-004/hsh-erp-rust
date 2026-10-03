@@ -399,3 +399,45 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 > [`./outsource-shipments.md`](./outsource-shipments.md) /
 > [`./outsource-sendable.md`](./outsource-sendable.md) /
 > [`./parts/lifecycle.md`](./parts/lifecycle.md)。
+
+### 9.3 2026-10-04：报工台放回页的工序链适配（`by-worker` 出参增量）
+
+报工台「放回」要判定三态：链内有下一道 ⇒ 免填并提示下一道；当前工序是链内最后一道 ⇒
+提示「加工完成后请送检」；无链 / 位置漂移 ⇒ 弹工序选择框。放回页的唯一数据源是
+`GET /api/v2/parts/by-worker/{worker_id}`，本次在该端点的行出参上补齐判据。
+
+**新增 4 个字段**（`PartListItem`，**仅本端点填**，其余 6 处返回点恒默认值）：
+
+| 字段 | 类型 | 取值 |
+|---|---|---|
+| `chain_state` | string | 三值互斥枚举：`"NONE"` / `"NEXT"` / `"TAIL"`（`rename_all = "UPPERCASE"`） |
+| `chain_next_process_id` | string (i64) | 下一道工序 id；非可空 + `"0"` 兜底（与 `outsource-pool` 的 `receive_next_process_id` 同款约定） |
+| `chain_next_process_name` | string? | 下一道工序名（`t_process.name`） |
+| `chain_current_process_name` | string? | 当前工序名（`TAIL` 提示点名用） |
+
+三值用**一个枚举**而不是两个 bool：两个 bool 会产生「可免填 + 是链尾」这类自相矛盾的
+组合，前端必须自己排优先级，而排错的后果是静默把工件投到错误工序。
+
+**顺带补齐的两处既有空缺**（同为本端点填）：
+
+- `batch_id` / `batch_version` —— 本端点的行本来就是「批次行」，但出参 VO 只有 part 级
+  字段，放回页拿不到批次 id 就发不出写请求。此前这两个字段的口径写的是「仅
+  `pickable-by-work-type` 填」，现改为「pickable 与 by-worker 都填」。
+- `process_chain_id` —— 取行 SQL 原先不投影该列、VO 里硬编码 `None`，现取真实值。
+
+**派生口径的两条硬约束**（读侧自己说了不算，必须与写侧同源）：
+
+1. **锚链内「当前工序的位置」必须按 `b.current_process_id` 重新定位**，不能拿
+   `b.current_process_step_id` 的 `sort_order` 当位置 —— worker-scan 的 RETURNED 分支
+   只写 `current_process_id`、不推进 step 指针（见
+   [`./parts/inspection.md`](./parts/inspection.md) worker-scan 业务流转节），
+   多工序链批次第 2 次放回时指针仍停在首次定位那一步，按位置推进会把**当前工序自己**
+   当成下一道返回，而 `chain_state` 仍在说「可免填」⇒ 静默错值比拒收更难发现。
+2. **「下一道」按 `sort_order > 当前 ORDER BY sort_order ASC LIMIT 1` 取**，与写侧
+   `prod::process_chain::repo::query::next_step_in_chain` 逐条同形。**不能**用
+   `sort_order = 当前 + 1`：`sort_order` 按设计是**稀疏**的（默认 `10/20/30`，
+   UI 中间插入取 `(prev+next)/2`），`+ 1` 会把真实的 `10/20/30` 链误判成链尾。
+
+> 归口文档：[`./parts/lifecycle.md`](./parts/lifecycle.md)
+> `GET /api/v2/parts/by-worker/{worker_id}` 节（字段表 + 三值语义表 + 派生口径）、
+> [`./parts/index.md`](./parts/index.md) 的 `PartListItem` 字段表与前端配套改动清单。

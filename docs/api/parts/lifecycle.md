@@ -412,9 +412,11 @@ Response 200 `data`：`PartOut`。
 
 ### `GET /api/v2/parts/by-worker/{worker_id}`
 
-权限: **已登录**
+权限: **Manager / Clerk / Inspector / ShelfAccount**
 
 > 2026-09-22 起 P3 list by worker。返回该 worker 名下所有活跃 part 列表。
+> 2026-10-04 起本端点是**报工台「放回」页的唯一数据源**（前端不另查别的端点），
+> 故行内多带一层批次语义：批次锚点 + 工序链位置。
 
 Path：
 
@@ -422,9 +424,69 @@ Path：
 |---|---|---|
 | `worker_id` | string (i64) | 工人雪花 ID |
 
-Query：`status?` / `limit?` / `offset?`（默认 50 / 0）。
+Query：`limit?` / `offset?`（默认 50 / 0）。
 
-Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
+Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
+
+**筛选条件**：`t_part_batch` 侧 `status='IN_PROCESS'` + `location='WORKER'` +
+`deleted_at IS NULL` + `current_holder_id = {worker_id}`，且 part 本身
+`deleted_at IS NULL`；`ORDER BY b.id DESC`。行单位是**批次**（不是 part）。
+
+#### 2026-10-04 批次锚点字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `batch_id` | string (i64) | 该行的 `t_part_batch.id`（**本端点填**；此前恒 `null`）。放回页据此定位批次发写请求 |
+| `batch_version` | i32 | 该批次的乐观锁版本（`t_part_batch.version`），发写请求时作 OCC 版本回传 |
+| `process_chain_id` | string (i64)? | 零件的工艺链逻辑 FK（`t_part.process_chain_id`），无链为 `null`（本端点填真实投影值） |
+
+> ⚠️ 本 VO 的 `version` 字段是 **part 级**（`t_part.version`）且本端点取行 SQL
+> 不投影 `p.version` ⇒ 恒 `0`（有意占位）。批次 OCC 只认 `batch_version`。
+
+#### 2026-10-04 工序链派生字段（三值 `chain_state`）
+
+| `chain_state` | 语义 | 配套字段 | 前端动作（报工台放回） |
+|---|---|---|---|
+| `NONE` | 无链 / 链已软删 / 锚链解析失败 / **当前工序不在链内（位置指针漂移）** | `chain_next_process_id = "0"`、`chain_next_process_name = null`、`chain_current_process_name = null` | 弹工序选择框，让工人手填下一道工序 |
+| `NEXT` | 当前工序在链内**且有下一道** | `chain_next_process_id` = 下一道工序 id、`chain_next_process_name` = 其 `t_process.name`、`chain_current_process_name` = 当前工序名 | 免填，确认后直接放回，提示「下一道工序为 xxx，请将工件放到 xx 货架」 |
+| `TAIL` | 当前工序是链内**最后一道** | `chain_next_process_id = "0"`、`chain_next_process_name = null`、`chain_current_process_name` = 当前工序名 | 提示「当前为最后一道工序，加工完成后请送检」 |
+
+四个字段（`chain_state` / `chain_next_process_id` / `chain_next_process_name` /
+`chain_current_process_name`）**仅本端点填**，其余 6 处复用 `PartListItem` 的返回点
+恒为 `NONE` / `"0"` / `null` / `null`（行单位是 part，链位置是批次级事实，填任一
+活跃批次都是错锚点）。`chain_state` 用三值互斥枚举而不是两个 bool：两个 bool 会
+产生「可免填 + 是链尾」这类自相矛盾组合。
+
+`chain_next_process_id` 是**非可空**的 `"0"` 兜底口径（沿用
+`GET /outsource-pool/state` 的 `receive_next_process_id` 同一约定：JSON 里恒出现，
+`"0"` = 无下一道），前端不要按 `null` 判空。
+
+#### 派生口径（为什么能这么判）
+
+- **锚链** = `COALESCE(p.process_chain_id, <step 指针所在 step 的 chain_id>)`；
+  step 指针无行、或锚链已软删 ⇒ `NONE`。中间 JOIN `t_part_process_chain` 就是为了
+  让「锚链已软删」也落 `NONE`。
+- **当前 step 在锚链内的位置按 `b.current_process_id` 重新定位**
+  （`cur2.process_id = b.current_process_id`），**绝对不拿 `b.current_process_step_id`
+  的 `sort_order` 当位置**。step 指针与「当前工序在链内的位置」是两个独立事实，而
+  worker-scan 的 RETURNED 分支只写 `current_process_id = next_process_id`、**不推进**
+  `current_process_step_id`（已知缺口，见 [`./inspection.md`](./inspection.md)
+  worker-scan 业务流转节）。于是多工序链的批次在第 2 次放回时 step 指针仍停在**首次
+  定位**那一步：按 `sort_order` 推进会把**当前工序自己**当成下一道返回（如指针停在
+  A 的 step 而 `current_process_id = B` ⇒ 返回 B），而 `chain_state` 仍在说「可免填」
+  ⇒ 写侧照单全收，**静默把工件投回原工序**比拒收更难发现。同一批次第 N 次放回都只能
+  靠 `current_process_id` 定位。
+- **「下一道」按 `sort_order > 当前 ORDER BY sort_order ASC LIMIT 1` 取**，与写侧
+  `prod::process_chain::repo::query::next_step_in_chain` 逐条同形。**不能**写成
+  `sort_order = 当前 + 1`：`t_process_chain_step.sort_order` 按设计是**稀疏**的
+  （默认 `10/20/30`，UI 中间插入取 `(prev+next)/2`，见
+  [`../production/process-chain.md`](../production/process-chain.md)），
+  `+ 1` 会把真实的 `10/20/30` 链误判成链尾、让报工台对工人谎报「当前为最后一道工序」。
+- 取不到任何链内位置（`cur2` 无行）⇒ `NONE`；位置解析成功但没有更大的
+  `sort_order` ⇒ `TAIL`；否则 `NEXT`。`chain_next_process_name` 在「下一 step 的
+  工序已软删」时为 `null`（id 仍有值，与 `outsource-pool` 同一取舍）。
+- LATERAL 末尾 `LIMIT 1` 收口：锚链内同一 `process_id` 重复属数据异常，不收口会把
+  一行批次扇成多行、破坏 `items.len()` 等于持有批次数的不变量。
 
 ### 外协两条 list 端点 — 2026-10-03 已下线，迁往 outsource 域
 

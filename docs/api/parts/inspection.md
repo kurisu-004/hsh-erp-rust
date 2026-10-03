@@ -402,6 +402,11 @@ Request：`WorkerScanRequest`
     此前该列不写，批次带着旧工序 id 落回**原工序**池（权威列在主干流程上说谎）。
     另：RETURNED 仍**不更新** `current_process_step_id`（可选的显示用定位信息），
     这是已知缺口，影响仅限显示，池归属不受影响。
+    ⚠️ 报工台放回页的工序链派生**不受该缺口影响**：
+    `GET /api/v2/parts/by-worker/{worker_id}` 的 `chain_state` / `chain_next_process_*`
+    按 `b.current_process_id` 在链内**重新定位**当前 step，不读 step 指针的
+    `sort_order`（详见 [`./lifecycle.md`](./lifecycle.md)
+    `GET /api/v2/parts/by-worker/{worker_id}` 节的「派生口径」）。
   - service 会读 `t_part.process_chain_id` 解析 `next_process_id` 对应的 `step_id`；
     该列**可空**，手写工单（无工艺链的常态）为 `NULL` → 保留批次既有的
     `current_process_step_id`，不抹除。**读取方必须按 `Option` 解码后进 `if let`** ——
