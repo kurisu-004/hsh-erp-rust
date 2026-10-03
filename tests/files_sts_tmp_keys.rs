@@ -330,10 +330,15 @@ async fn forward_sts_tmp_keys_does_not_leak_auth_header() {
     let base_url = format!("http://127.0.0.1:{}", addr.port());
 
     // 用真实 HttpPyBackend 替换 state.py_backend
+    //
+    // 2026-10-03：`new()` 增第 3 参 `print_timeout`（打印 4 方法的逐请求超时
+    // 覆盖档）。本用例只打 STS 链路，走 client 级 `timeout`，打印档取值与
+    // 生产默认值（`PYTHON_PRINT_TIMEOUT_MS` 缺省 600_000）保持一致即可。
     let real_py_backend: Arc<dyn PyBackendClient> = Arc::new(
         hsh_erp_rust::infra::py_backend::HttpPyBackend::new(
             base_url.clone(),
             Duration::from_millis(2000),
+            Duration::from_millis(600_000),
         )
         .expect("构造 HttpPyBackend"),
     );

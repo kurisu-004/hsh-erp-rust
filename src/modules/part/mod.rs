@@ -75,6 +75,12 @@ pub fn router() -> Router<Arc<AppState>> {
             post(handler::batch_update_order_info),
         )
         .route("/batch-with-pdfs", post(handler::batch_with_pdfs))
+        // 2026-10-03 新增：批量零件图纸打印（纯 BFF 转发到 python 执行 PDF 光栅化 +
+        // pikepdf 合并）。★静态段必须在 /{part_id}/... catch-all 之前注册。
+        .route(
+            "/print-drawing-batch",
+            post(handler::print::print_drawing_batch),
+        )
         // ---- Phase 2 (2026-09-13) 静态段（by-work-type / pickable / by-worker）----
         .route(
             "/by-work-type/{work_type_id}",
@@ -91,6 +97,12 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/{part_id}/soft-delete", post(handler::soft_delete_part))
         .route("/{part_id}/upload-drawing", post(handler::upload_drawing))
         .route("/{part_id}/upload-3d-model", post(handler::upload_3d_model)) // 2026-09-11 新增：3D 模型上传
+        // 2026-10-03 新增：单件零件图纸打印（图纸正面 + 条码背面的双面 PDF）。
+        // 纯 BFF 转发到 python `GET /api/v1/parts/{id}/print`（v2/v1 路径不同名）。
+        .route(
+            "/{part_id}/print-drawing",
+            get(handler::print::print_drawing),
+        )
         // BATCH-N：翻转该 part 全部活跃批次 → part CANCELLED（留 part 域）
         .route("/{part_id}/cancel", post(handler::cancel))
         // BATCH-N：全部非 CANCELLED 批次强推 COMPLETED（留 part 域）

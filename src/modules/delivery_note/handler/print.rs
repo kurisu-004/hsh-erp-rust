@@ -1,198 +1,103 @@
-//! delivery_note 域打印 handler
+//! delivery_note 域打印 handler（BFF 转发）
 //!
-//! 范围：print / print-labels 端点（设计 §8，P4）+ 内部助手 `parse_i64_opt` /
-//! `parse_i64_map_opt`。
+//! 2026-10-03：2 个端点改为**纯转发**——`POST /delivery-notes/{id}/print` 与
+//! `POST /delivery-notes/{id}/print-labels` 只做「鉴权 + 闸门 + 转发」，渲染动作
+//! （模板填表 / 标签生成）全在 python 侧执行。
 //!
-//! 渲染送货单 / 标签 xlsx bytes；CPU 密集 umya 渲染走 `tokio::task::spawn_blocking`（由 service 实现）。
+//! ## handler 语义
+//! 1. `authenticate_middleware` 已强制 JWT 校验（未带 token → 40100）；
+//! 2. `require_any_role` 限制 `MANAGER / CLERK / INSPECTOR`（对齐前端 `canPrint`
+//!    闸门 + python 端历史 RBAC）；不通过 → 40300；
+//! 3. clone `headers` 后注入 `X-Forwarded-User-Id: <CurrentUser.id>`；
+//! 4. 调 `state.py_backend.forward_delivery_note_print{,_labels}(id, body, headers)`，
+//!    拿 `(status, headers, body)` 三元组原样拼 `Response`。
 //!
-//! ## 约定（2026-09-22 D-5 + review 第 1 轮）
-//! - 事务边界在 handler：`state.pool.begin()` → 借 `&mut *tx` 喂给 service → 显式
-//!   `tx.commit()`；提前 return（`?`）时 `Transaction` 的 Drop 自动回滚。
-//! - **service 形参 by-value trait**（iam 严格范本）：handler 借 `&mut *tx` 给
-//!   `state.delivery_note_service.xxx(&mut *tx, ...)` 或 `&mut *conn` 给读端点。
-//! - **handler 三形态**：
-//!   - ① 纯写端点 `pool.begin() → service → commit`；
-//!   - ② 写 + post-commit Redis / WS（broadcast 落 handler，service 不持有 WsHub）`pool.begin() → service → commit → state.ws_hub.broadcast(...)`；
-//!   - ③ 读端点（list_*/get_*）`pool.acquire() → service`，不开事务。
-//! - 统一响应信封：`Result<Json<R<T>>, AppError>` 或返回 `axum::response::Response`（二进制下载）。
-//! - 权限在 service 层（`current.require_any_role(...)`）；handler 这里只解析
-//!   query / path / body。
+//! ## 三条关键取舍
+//! - **不开事务**：纯转发，不读写 DB。`state.pool` 在本文件里不出现。
+//! - **body 用 `Json<Value>` 原样透传**：不定义强类型 DTO、不解析字段。前端发的
+//!   雪花 ID 是 string（> 2^53，JSON number 会丢精度），rust 侧解析只会引入
+//!   一层无收益的转换；`custom_order` / `merge_quantities` / `line_item_ids` 的
+//!   语义由 python 端 schema 负责（与 STS 转发同构）。
+//! - **鉴权头不透传给 python**：`filter_request_headers`（`infra::py_backend`）
+//!   剥掉 `Authorization` / `Cookie`，python 端不反向依赖 rust 的 JWT。身份只
+//!   通过 `X-Forwarded-User-Id` 单头传递。
+//!
+//! ## 响应头
+//! 由 `filter_response_headers` 清洗：保留 `content-type` / `content-disposition`
+//! （前端 `parseFilename` 靠后者取下载文件名）/ `cache-control`，`content-length`
+//! 按实际 body 长度重算；hop-by-hop 与 `content-encoding` 剥除。
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use serde_json::Value;
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::delivery_note::dto::{
-    DeliveryNotePath, PrintDeliveryNoteRequest, PrintLabelsRequest,
-};
+use crate::modules::delivery_note::dto::DeliveryNotePath;
 use crate::shared::error::AppError;
 use crate::state::AppState;
 
-/// POST /api/v2/delivery-notes/{id}/print  （设计 §8，P4）
+/// 打印允许的角色集：`MANAGER` / `CLERK` / `INSPECTOR`。
 ///
-/// 渲染送货单 → xlsx bytes；CPU 密集 umya 渲染走 `tokio::task::spawn_blocking`。
-/// 角色：M / C / I（与 Python `print_note` 对齐）。
+/// 与前端 `canPrint` 闸门、python 端历史 RBAC 三方对齐；`SHELF_ACCOUNT`
+/// （货架终端）不放行——它只该扫码，不该开单打印。
+fn require_print_role(current: &CurrentUser) -> Result<(), AppError> {
+    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])
+}
+
+/// 2026-10-03 新增：clone `headers` 并注入 `X-Forwarded-User-Id`。
+///
+/// 形参 `headers` 由 axum extractor 提供，**不可**直接 mutate（会污染共用同一
+/// `HeaderMap` 的其它 extractor / middleware），故先 clone 一份副本再插入。
+/// `filter_request_headers` 的 SKIP 列表不含此 header，不会被二次过滤。
+fn forwarded_headers(headers: &HeaderMap, current: &CurrentUser) -> HeaderMap {
+    let mut fwd = headers.clone();
+    if let Ok(value) = current.id.to_string().parse() {
+        fwd.insert("x-forwarded-user-id", value);
+    }
+    fwd
+}
+
+/// `POST /api/v2/delivery-notes/{id}/print` —— 鉴权 + 转发
+///
+/// 转发到 python `POST /api/v1/delivery-notes/{id}/print`（路径同名），
+/// 拿回 xlsx 字节流原样返回。
 pub async fn print_delivery_note(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
-    Json(req): Json<PrintDeliveryNoteRequest>,
-) -> Result<axum::response::Response, AppError> {
-    use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
-    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-
-    let custom_order = parse_i64_opt(req.custom_order.as_ref(), "custom_order")?;
-    let merge_quantities = parse_i64_map_opt(req.merge_quantities.as_ref(), "merge_quantities")?;
-
-    let bytes_prefix = state
-        .delivery_note_service
-        .print_xlsx(
-            &state.pool,
-            path.id,
-            custom_order,
-            req.merge_assemblies.unwrap_or(false),
-            merge_quantities,
-            None,
-            &state.config.delivery_note_template_dir,
-            &current,
-        )
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    require_print_role(&current)?;
+    let fwd_headers = forwarded_headers(&headers, &current);
+    let note_id = path.id.to_string();
+    let resp = state
+        .py_backend
+        .forward_delivery_note_print(&note_id, body, fwd_headers)
         .await?;
-    let (bytes, _prefix) = bytes_prefix;
-
-    let filename = format!("F-{}-note.xlsx", chrono::Local::now().format("%Y-%m-%d"));
-    let len = bytes.len();
-    let resp = axum::response::Response::builder()
-        .status(axum::http::StatusCode::OK)
-        .header(
-            CONTENT_TYPE,
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        .header(
-            CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\""),
-        )
-        .header(CONTENT_LENGTH, len.to_string())
-        .header(CACHE_CONTROL, "no-store")
-        .body(axum::body::Body::from(bytes))
-        .map_err(|e| AppError::internal(format!("build print response: {e}")))?;
-
-    // 渲染成功后广播（轻量：只推单据级事件，不按行推送）
-    state
-        .ws_hub
-        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-            kind: "DELIVERY_NOTE_PRINTED".to_string(),
-            payload: serde_json::json!({
-                "delivery_note_id": path.id,
-                "kind": "note",
-            }),
-        });
-
-    Ok(resp)
+    Ok((resp.status, resp.headers, resp.body).into_response())
 }
 
-/// POST /api/v2/delivery-notes/{id}/print-labels  （设计 §8，P4）
+/// `POST /api/v2/delivery-notes/{id}/print-labels` —— 鉴权 + 转发
 ///
-/// 标签渲染（不走模板，直接 `openpyxl.Workbook` 等价）
+/// 转发到 python `POST /api/v1/delivery-notes/{id}/print-labels`（路径同名）。
 pub async fn print_labels(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,
     Path(path): Path<DeliveryNotePath>,
-    Json(req): Json<PrintLabelsRequest>,
-) -> Result<axum::response::Response, AppError> {
-    use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
-    current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
-
-    let custom_order = parse_i64_opt(req.custom_order.as_ref(), "custom_order")?;
-    let merge_quantities = parse_i64_map_opt(req.merge_quantities.as_ref(), "merge_quantities")?;
-    let line_item_ids = parse_i64_opt(req.line_item_ids.as_ref(), "line_item_ids")?;
-
-    let bytes_prefix = state
-        .delivery_note_service
-        .print_xlsx(
-            &state.pool,
-            path.id,
-            custom_order,
-            req.merge_assemblies.unwrap_or(true), // labels 默认 true（与 Python 一致）
-            merge_quantities,
-            line_item_ids,
-            &state.config.delivery_note_template_dir,
-            &current,
-        )
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, AppError> {
+    require_print_role(&current)?;
+    let fwd_headers = forwarded_headers(&headers, &current);
+    let note_id = path.id.to_string();
+    let resp = state
+        .py_backend
+        .forward_delivery_note_labels(&note_id, body, fwd_headers)
         .await?;
-    let (bytes, _prefix) = bytes_prefix;
-
-    let filename = format!("F-{}-labels.xlsx", chrono::Local::now().format("%Y-%m-%d"));
-    let len = bytes.len();
-    let resp = axum::response::Response::builder()
-        .status(axum::http::StatusCode::OK)
-        .header(
-            CONTENT_TYPE,
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        .header(
-            CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\""),
-        )
-        .header(CONTENT_LENGTH, len.to_string())
-        .header(CACHE_CONTROL, "no-store")
-        .body(axum::body::Body::from(bytes))
-        .map_err(|e| AppError::internal(format!("build labels response: {e}")))?;
-
-    // 渲染成功后广播（轻量：只推单据级事件，不按行推送）
-    state
-        .ws_hub
-        .broadcast(crate::infra::ws_hub::WsEvent::DashboardEvent {
-            kind: "DELIVERY_NOTE_PRINTED".to_string(),
-            payload: serde_json::json!({
-                "delivery_note_id": path.id,
-                "kind": "label",
-            }),
-        });
-
-    Ok(resp)
-}
-
-// 解析 JSON 字符串键的 i64 / HashMap
-fn parse_i64_opt(field: Option<&Vec<String>>, name: &str) -> Result<Option<Vec<i64>>, AppError> {
-    match field {
-        None => Ok(None),
-        Some(v) => {
-            let mut out = Vec::with_capacity(v.len());
-            for s in v {
-                let n: i64 = s.parse().map_err(|_| {
-                    AppError::biz(
-                        crate::shared::error::code::BIZ_INVALID_VALUE,
-                        format!("{name} contains non-integer id: {s:?}"),
-                    )
-                })?;
-                out.push(n);
-            }
-            Ok(Some(out))
-        }
-    }
-}
-
-fn parse_i64_map_opt(
-    field: Option<&HashMap<String, i32>>,
-    name: &str,
-) -> Result<HashMap<i64, i32>, AppError> {
-    match field {
-        None => Ok(HashMap::new()),
-        Some(m) => {
-            let mut out = HashMap::with_capacity(m.len());
-            for (k, v) in m {
-                let n: i64 = k.parse().map_err(|_| {
-                    AppError::biz(
-                        crate::shared::error::code::BIZ_INVALID_VALUE,
-                        format!("{name} contains non-integer key: {k:?}"),
-                    )
-                })?;
-                out.insert(n, *v);
-            }
-            Ok(out)
-        }
-    }
+    Ok((resp.status, resp.headers, resp.body).into_response())
 }
