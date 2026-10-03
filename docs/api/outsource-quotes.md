@@ -124,7 +124,7 @@
 | `customer_id` | string (i64)? | **2026-10-03 订正**：代码 `OutsourceQuoteListQuery` 里一直有这个字段，但本文档此前漏记。当前实现只在「同时给了 `customer_id`」时生效，且**必须同时给 `keyword`**：只给 `customer_id` 不给 `keyword` 时端点直接返回空列表（`total=0`）——已知简化实现，见 service `list_quotes` 注释 |
 | `status` | string? | 单状态过滤 |
 | `statuses` | string? | 多状态过滤（逗号分隔）；**2026-10-03 订正**：DTO 里没有该字段，service 恒传空数组给 repo（等价不过滤） |
-| `keyword` | string? | **2026-10-03 订正**：代码里已有（走 `part_keyword_search` 展开成 `part_id = ANY(...)`），本文档此前漏记。trim 后空串视为无过滤；**零命中返回 `items: []` / `total: 0`**（2026-10-03 review 第 1 轮 BLOCKER-1 修复：与 `sent-parts` 同源 —— SQL 的 `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 让空 id 数组短路掉 keyword 条件，「不存在的词」曾返回全量报价） |
+| `keyword` | string? | **2026-10-03 订正**：代码里已有（走 `part_keyword_search` 展开成 `part_id = ANY(...)`），本文档此前漏记。trim 后空串视为无过滤；**零命中返回 `items: []` / `total: 0`**（service 层兜住，与 `sent-parts` 同源 —— SQL 的 `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 里空 id 数组会让整个 keyword 条件短路） |
 | `sort_by` | string? | **2026-10-03 订正**：代码里已有。`PRICE` / `REVIEWED_AT` / `CREATED_AT`，默认 `CREATED_AT`；非法值静默回落 |
 | `sort_dir` | string? | **2026-10-03 订正**：代码里已有。`ASC` / `DESC`，默认 `DESC` |
 | `limit` | i64? | 默认 50，clamp(1, 500) |

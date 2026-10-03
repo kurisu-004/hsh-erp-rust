@@ -43,10 +43,10 @@ async fn shipment_out<R: OutsourceRepoTrait>(
 ) -> Result<OutsourceShipmentOut, AppError> {
     // 单条拼装：part / 客户 / process / company 四个批查
     let part = repo.part_drawing_name(s.part_id).await?;
-    // 2026-10-03 review 第 1 轮 A8：此前 customer_path 硬编码 None（对账行编辑
-    // 每次回读都把客户列抹掉）。口径与 list 侧 `OutsourceSentPartRow` 的两条
-    // LEFT JOIN 逐条一致（客户自身 `deleted_at IS NULL` 才给名），故同一条历史
-    // shipment 经写端点回读与经 list 读到的 customer_path 恒相同。
+    // 2026-10-03 起 customer_path 真算（此前硬编码 None，对账行编辑每次回读都把
+    // 客户列抹掉）。口径与 list 侧 `OutsourceSentPartRow` 的两条 LEFT JOIN 逐条
+    // 一致（客户自身 `deleted_at IS NULL` 才给名），故同一条历史 shipment 经写
+    // 端点回读与经 list 读到的 customer_path 恒相同。
     let (l2_name, l1_name) = repo.part_customer_names(s.part_id).await?;
     let company = repo.company_map_name(&[s.outsource_company_id]).await?;
     let company = company.into_iter().next().map(|(_, name)| name);
@@ -160,9 +160,8 @@ impl OutsourceService {
         let offset = query.offset.unwrap_or(0).max(0);
         // 排序列白名单归一化：**用户输入只在这里被映射成 3 个 token 之一**，
         // 之后一律 bind 进 SQL（`CASE WHEN $7 = ...`），绝不拼进 SQL 文本。
-        // 2026-10-03 review 第 1 轮 m5：先 `to_ascii_uppercase` 再 match —— 白名单
-        // 此前大小写敏感，`?sort_by=price` 会静默回落成 `SENT_AT`（前端小写传参
-        // 时排序「不生效」且不报错，是最难查的一类）。
+        // 2026-10-03：`to_ascii_uppercase` 后再 match，白名单**大小写不敏感**
+        // （`?sort_by=price` 与 `?sort_by=PRICE` 等价）。
         let sort_by = match query
             .sort_by
             .as_deref()
@@ -195,13 +194,12 @@ impl OutsourceService {
             Some(kw) => repo.part_keyword_search(kw).await?,
             None => Vec::new(),
         };
-        // 2026-10-03 review 第 1 轮 BLOCKER-1：**给了 keyword 却零命中时必须在
-        // service 层早返回**。SQL 谓词是
-        // `AND (cardinality($2::bigint[]) = 0 OR s.part_id = ANY($2))` ——
-        // 空数组让 `cardinality = 0` 成立，整个 keyword 条件被短路掉，
-        // 「不存在的关键词」会返回该公司的**全部** shipment（list 与 count 同时错，
-        // total 也一起错）。SQL 谓词保持不变（无 keyword 时 `cardinality = 0`
-        // 正是「不过滤」的正确表达），语义由这里兜住。
+        // 2026-10-03：**给了 keyword 却零命中时必须在 service 层早返回**。SQL 谓词
+        // `AND (cardinality($2::bigint[]) = 0 OR s.part_id = ANY($2))` 里，空数组
+        // 让 `cardinality = 0` 成立、整个 keyword 条件被短路掉；不在这兜住，
+        // 「不存在的关键词」会返回该公司的全部 shipment（list 与 count 同时错）。
+        // SQL 谓词保持不变 —— 无 keyword 时 `cardinality = 0` 正是「不过滤」的
+        // 正确表达，语义由这里兜住。
         if kw.is_some() && part_ids_in.is_empty() {
             return Ok(OutsourceSentPartListOut {
                 items: vec![],
@@ -236,11 +234,10 @@ impl OutsourceService {
             )
             .await?;
 
-        // 2026-10-03 review 第 1 轮 m2：解析失败不再 `unwrap_or(Decimal::ZERO)`。
-        // 对账页上的「假 0.00 金额」是最坏的失败模式（`total_price` 静默变 0，
-        // 用户看不出是数据坏了）；`parse_price` 返回 `Result` 本就是让 caller 传播
-        // （`create_quote` 用 `?`），这里改 `?` 让 20104 BIZ_INVALID_VALUE 直接冒到
-        // 前端 —— 该值 DB 侧是 `Numeric(12,2) NOT NULL`，正常不可达，是兜底闸门。
+        // 2026-10-03：`unit_price` 解析失败用 `?` 传播（`create_quote` 同款），不
+        // 降级成 `Decimal::ZERO` —— 对账页上的「假 0.00 金额」是最坏的失败模式
+        // （`total_price` 静默变 0，用户看不出是数据坏了）。该列 DB 侧是
+        // `Numeric(12,2) NOT NULL`，正常不可达，是兜底闸门。
         let mut items = Vec::with_capacity(rows.len());
         for r in rows {
             let unit_price = parse_price(&r.unit_price)?;

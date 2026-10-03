@@ -4,11 +4,16 @@
 > 扫描基准：master HEAD = `7f0641f`（含 PR1-8 + 期间 merged 的 jti/refresh rotation/idempotency 等）
 > 扫描方法：grep 提取实际 `.route()` 调用 vs `docs/api/` 各 .md 文件的 `### ` 端点章节，逐域对比
 >
-> **2026-10-03 review 第 1 轮订正（只动 part 一行的计数）**：本报告是 2026-09-23
-> 的**历史快照**，`实际 endpoints` 列一律以扫描基线 `7f0641f` 为准；此后 part 域
-> 发生两次减端点（2026-10-02 迁往 prod 域 25 条、2026-10-03 下线 2 条外协 list），
-> 故 `50` 已不是现值。现值以 `src/modules/part/mod.rs` 的 method 级注册逐个数：
-> **23**。其余各域本轮未复核，数字不动。
+> **2026-10-03 订正（只动 part 一行的计数）**：本报告是 2026-09-23 的**历史
+> 快照**，`实际 endpoints` 列一律以扫描基线 `7f0641f` 为准；此后 part 域发生三次
+> 减端点（2026-09-29 下线 `send-to-programming` / `recall-to-programming` 2 条、
+> 2026-10-02 迁往 prod 域 25 条 `t_part_batch` 子资源、2026-10-03 下线 2 条外协
+> list），且中间补过 1 条（2026-09-30 `force-complete`）。现值以
+> `src/modules/part/mod.rs` 的 **method 级**注册逐个数：**24**。
+> ⚠️ 基线的 `50` 是 `.route()` **调用数**（`route("/")` 上有 2 个 method，
+> 只记 1）—— method 级口径下基线是 51。
+> 同一口径的推导见 [`./inconsistencies.md`](./inconsistencies.md) § 2。
+> 其余各域本轮未复核，数字不动。
 
 ## 1. 总体结论
 
@@ -17,7 +22,7 @@
 | iam | 14 | 14 | 🟢 大致覆盖；JWT 重大变更未同步 |
 | delivery_note | 18 | 18 | 🟢 全覆盖 |
 | delivery_groups | 4 | 4 | 🟢 全覆盖 |
-| part | **50**（扫描基线 `7f0641f`）→ **现值 23** | **~30** | 🔴 **大量缺失** |
+| part | **50**（扫描基线 `7f0641f` 的 `.route()` 调用数；method 级为 51）→ **现值 24** | **~30** | 🔴 **大量缺失** |
 | assembly | 7 | 7 | 🟡 待 verify（需补 /start /update 文档说明） |
 | shelf | ~11 | ~11 | 🟢 大致覆盖 |
 | outsource-companies | 8 | 8 | 🟢 全覆盖（2026-10-03 +`sent-parts`） |

@@ -186,10 +186,11 @@ impl OutsourceService {
                 offset,
             });
         }
-        // 2026-10-03 review 第 1 轮 BLOCKER-1（与 `list_company_sent_parts` 同源）：
-        // 给了 keyword 却零命中时必须早返回。SQL 谓词
-        // `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 让空数组把整个
-        // keyword 条件短路掉 —— 不在这里兜住，「不存在的关键词」会返回全量报价。
+        // 2026-10-03：给了 keyword 却零命中时必须早返回。SQL 谓词
+        // `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 里，空数组
+        // 让 `cardinality = 0` 成立、整个 keyword 条件被短路掉；不在这兜住，
+        // 「不存在的关键词」会返回全量报价。SQL 谓词保持不变 —— 无 keyword 时
+        // `cardinality = 0` 正是「不过滤」的正确表达。
         let kw_given = query
             .keyword
             .as_deref()

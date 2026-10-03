@@ -178,22 +178,25 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 
 ## 前端配套改动清单
 
-> ⚠️ 2026-10-03 新增小节（口径同
-> [`./production/shelf-process-mapping.md#前端配套改动清单`](./production/shelf-process-mapping.md#前端配套改动清单)）。
+> 口径同
+> [`./production/shelf-process-mapping.md#前端配套改动清单`](./production/shelf-process-mapping.md#前端配套改动清单)。
 > **前端配套改动不止改 URL**：本批 4 个读端点里，2 个换了前缀、2 个换了返回形状
 > （分页信封），另有 1 个出参新增字段、1 个类型声明与实际返回不符。只改 URL 的话
 > 页面仍会「能请求但不显示 / 显示错」。
 
-> 核实基准：前端仓 `hsh-erp/frontend`（`src/api/` / `src/types/` / `src/views/outsource/composables/`），
-> 2026-10-03 逐个打开确认。
+> **状态：5 项已全部落地**（前端仓 `hsh-erp/frontend`，2026-10-03 逐个打开
+> 核对当前实现）。本节从「待办清单」转为「已完成的改动记录」—— 保留是为了
+> ① 记录硬切前后的 URL 对照，便于日后排查旧路径残留；② 记录返回形状变更的
+> 前端同步面（`listQuotableParts` / `useOutsourceReceivingList` 两处若漏改，
+> 症状是「表格空白 / 翻页恒 1 页」且**不报错**，最难自查）。
 
-| 前端位置 | 现状 | 后端新契约 |
+| 前端位置 | 改前现状（2026-10-03 前） | 改后新契约（前端已完成适配） |
 |---|---|---|
-| `frontend/src/api/outsource.ts` 的 `listOutsourceInFlight` | 打 `/parts/outsource-in-flight` | URL 已下线（实际 400）→ 改 `/outsource-shipments/in-flight`；返回也从 `OutsourceInFlightItem[]` 变 `{items,total,limit,offset}` |
-| `frontend/src/api/parts/crud.ts` 的 sendable helper | 打 `/parts/outsource-sendable` | URL 已下线（实际 400）→ 改 `/outsource-sendable`；**函数应迁到 `api/outsource.ts`**（可发送外协已不是 part 域概念，`api/parts/*` 里留着会误导） |
-| `frontend/src/api/outsource.ts` 的 `listQuotableParts` 返回类型 | 声明 `Promise<PartListItem[]>` | 实际是 `{items,total,limit,offset}` 分页信封 → 改返回类型；`OutsourceQuoteList.vue:83` 的 `raw` 消费方同步改成 `raw.items` |
-| `frontend/src/views/outsource/composables/useOutsourceReceivingList.ts` 的 `receivingFetcher` | `return { items, total: items.length }` | 实际分页信封 → `return { items: r.items, total: r.total }`（`total: items.length` 会让翻页器只有 1 页） |
-| `frontend/src/types/outsource.ts` 的 `OutsourceSendableItem` | **无 `quote_id`** | 后端已加 `quote_id: string \| null`（`send-to-outsource` 靠它决定传哪个报价）→ 补字段 |
+| `frontend/src/api/outsource.ts` 的 `listOutsourceInFlight` | 打 `/parts/outsource-in-flight`，返回按 `OutsourceInFlightItem[]` 消费 | 打 `/outsource-shipments/in-flight`（旧路径已下线，实际 400），返回按 `OutsourceInFlightListResult`（`{items,total,limit,offset}`）消费并经 Zod 守门 |
+| `frontend/src/api/parts/crud.ts` 的 sendable helper | 函数在 `api/parts/crud.ts`，打 `/parts/outsource-sendable` | 函数已迁到 `frontend/src/api/outsource.ts::listOutsourceSendable`，打 `/outsource-sendable`（旧路径已下线，实际 400）—— 读侧属外协域，与写的 `send-to-outsource`（prod/batches 域）不同域 |
+| `frontend/src/api/outsource.ts` 的 `listQuotableParts` 返回类型 | 声明 `Promise<PartListItem[]>`，按数组消费 | 返回 `QuotablePartListResult`（分页信封）；消费方 `OutsourceQuoteList.vue` 改读 `r.items` |
+| `frontend/src/views/outsource/composables/useOutsourceReceivingList.ts` 的 `receivingFetcher` | `return { items, total: items.length }` | `return { items: r.items, total: r.total }`（`total: items.length` 会让翻页器只有 1 页） |
+| `frontend/src/types/outsource.ts` 的 `OutsourceSendableItem` | 无 `quote_id` | 有 `quote_id: string \| null`（APPROVAL 有值 / DIRECT `null`）—— `send-to-outsource` 要求 `quote_id` 与 `direct` 必传其一 |
 
 ### 已知限制（不在本轮修）
 

@@ -112,7 +112,7 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `keyword` | string? | part 的 `drawing_no` / `name` ILIKE `%needle%`（复用 `part_keyword_search` 语义）；trim 后空串视为无过滤。**零命中返回 `items: []` / `total: 0`**（2026-10-03 review 第 1 轮 BLOCKER-1 修复：此前 SQL 的 `AND (cardinality($2::bigint[]) = 0 OR part_id = ANY($2))` 让空 id 数组把 keyword 条件短路掉，「不存在的词」返回该公司的**全部** shipment） |
+| `keyword` | string? | part 的 `drawing_no` / `name` ILIKE `%needle%`（复用 `part_keyword_search` 语义）；trim 后空串视为无过滤。**零命中返回 `items: []` / `total: 0`**（service 层兜住：SQL 的 `AND (cardinality($2::bigint[]) = 0 OR part_id = ANY($2))` 里空 id 数组会让整个 keyword 条件短路，不兜就会返回该公司的**全部** shipment） |
 | `sent_from` | naive datetime? | `sent_at` 闭区间下界（含），ISO 串如 `2026-09-01T00:00:00` |
 | `sent_to` | naive datetime? | `sent_at` 闭区间上界（含） |
 | `received_from` | naive datetime? | `received_at` 闭区间下界（含） |

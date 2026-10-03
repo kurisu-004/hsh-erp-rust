@@ -53,12 +53,11 @@ const LIST_MAX_LIMIT: i64 = 200;
 
 /// 拼客户路径：有 L1 给 `L1 / L2`，无 L1 时只给 L2 名，两侧都缺返回 `None`。
 ///
-/// 2026-10-03 review 第 1 轮 m9：原文写「L1 自指（无 parent）时只给 L2 名」是
-/// 错的措辞 —— `t_customer` 有 `ck_t_customer_no_self_parent` CHECK，自指不可能。
-/// 该分支的真义就是「**没有 L1（`parent_id IS NULL` 或 L1 已软删）**」。
+/// 「无 L1」含两种成因：`parent_id IS NULL`，或 L1 客户自身 `deleted_at IS NOT NULL`
+/// （取名的 LEFT JOIN 带软删过滤）。**不含自指** —— `t_customer` 有
+/// `ck_t_customer_no_self_parent` CHECK，`parent_id = id` 不可能。
 ///
-/// 2026-10-03 新增：此前 outsource 域全部 VO 的 `customer_path` 都是硬编码
-/// `None`（前端 4 个外协视图「客户」列恒 `—`）。范式抄
+/// 2026-10-03 起 outsource 域全部 VO 的 `customer_path` 都走本函数。范式抄
 /// `prod::worker_pool::repo::sql.rs`（`CandidateRow → PoolBatchItem`）。
 pub(crate) fn join_customer_path(l1: Option<&str>, l2: Option<&str>) -> Option<String> {
     match (l1, l2) {

@@ -8,7 +8,7 @@
 //! - submit DRAFT only（SUBMITTED 状态再 submit → 400）
 //! - soft-delete 仅 DRAFT / REJECTED 可删
 //! - duplicate 同 (part, company, process) → 409
-//! - list keyword 零命中 → 0 行（2026-10-03 review 第 1 轮 BLOCKER-1 同源修复）
+//! - list keyword 零命中 → 0 行
 //!
 //! ## 集成测试范本（PR13 Phase H，2026-09-24）
 //! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
@@ -187,13 +187,13 @@ async fn create_quote_draft_happy() {
     assert_eq!(env["data"]["price"], "12.50");
 }
 
-/// 2026-10-03 review 第 1 轮 BLOCKER-1（`list_quotes` 同源）：给了 keyword 却
-/// **零命中**时必须返回 0 行。
+/// `list_quotes` 的 keyword **零命中**必须返回 0 行（与 `sent-parts` 同源）。
 ///
-/// 回归的 bug：SQL 谓词是
-/// `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))`，
+/// 这条断言守着 SQL 谓词
+/// `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 的一个陷阱：
 /// `part_keyword_search` 零命中时给出空数组 → `cardinality = 0` 成立 →
 /// keyword 条件被短路掉 → 返回**全量**报价（list 与 count 同时错）。
+/// service 层早返回是唯一的兜底点。
 #[tokio::test]
 async fn list_quotes_keyword_zero_match_returns_empty_not_all_rows() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;

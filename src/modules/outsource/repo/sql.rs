@@ -992,8 +992,7 @@ impl OutsourceQuotableRepo {
         keyword_pat: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
         // 口径必须与 list 一致（含 DISTINCT ON 去重后的行粒度），否则分页 total 对不上。
-        // 2026-10-03 review 第 1 轮 m3：keyword 过滤与 list 统一停在外层 `d`
-        // （此前 count 下推到最内层、`list` 停在外层，两侧漂移）。
+        // 2026-10-03：keyword 过滤与 list 统一停在外层 `d` 上，内层不重复过滤。
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM ( \
                SELECT DISTINCT p.id, pr.id, p.drawing_no, p.name \
@@ -1036,9 +1035,10 @@ impl OutsourceQuotableRepo {
 ///    报价优先」且结果稳定（不会随查询计划变化）。
 /// 3. 外层：keyword / customer_id 过滤 + 展示序 + LIMIT/OFFSET。
 ///
-/// **count 的过滤位置必须与 list 一致**（2026-10-03 review 第 1 轮 m3）：两者都把
-/// keyword / customer_id 停在**外层** `d` 上，内层不重复过滤、不重复投影。
-/// 谓词改动只有一个落点，不会出现「改了 list 忘了 count」。
+/// **count 的过滤位置必须与 list 一致**（2026-10-03）：两者都把 keyword /
+/// customer_id 停在**外层** `d` 上，内层不重复过滤。谓词改动只有一个落点，
+/// 不会出现「改了 list 忘了 count」。语义等价的前提是分组键
+/// `(batch_id, next_process_id)` 内 part 列恒定。
 ///
 /// **DIRECT 且 `company_options` 为空的行保留返回**（前端 `canSend()` 据
 /// `company_options.length >= 1` 置灰），count 口径同样保留。
@@ -1133,12 +1133,10 @@ impl OutsourceSendableRepo {
         customer_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
         // 与 list 的 WHERE + DISTINCT ON 口径逐条一致（含 DIRECT 空 options 行）。
-        // 2026-10-03 review 第 1 轮 m3：keyword / customer_id 此前被下推到**最内层**
-        // （list 留在外层 WHERE），两侧过滤位置不一致 —— 今天语义等价（分组键
-        // `(batch_id, next_process_id)` 内 part 列恒定），但改动时容易只改一侧。
-        // 现与 list 统一停在外层，过滤谓词只剩一个落点；内层也不再需要投影
-        // `part_drawing_no` / `part_name` / `customer_id`（此前是为下推的过滤备的，
-        // 改到外层后是死投影）。
+        // 2026-10-03：keyword / customer_id 停在外层 `d` 上，与 list 同一位置 ——
+        // 谓词改动只有一个落点，不会出现「改了 list 忘了 count」。语义等价的前提
+        // 是分组键 `(batch_id, next_process_id)` 内 part 列恒定（同一批次恒同一
+        // 零件，故 `drawing_no` / `name` / `customer_id` 在组内不变）。
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM ( \
                SELECT DISTINCT ON (x.batch_id, x.next_process_id) \

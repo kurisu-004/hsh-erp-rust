@@ -11,7 +11,7 @@
 | 维度 | 数量 | 说明 |
 |---|---:|---|
 | 整域缺失（Python 有 Rust 无） | **1 域** | 仅 statistics（聚合读占位） |
-| 部分缺失（part 域） | ~3 端点 | Python 46 vs Rust 49（Rust 端大部分补齐；剩余 print-drawing-* / scan 通用端点） |
+| 部分缺失（part 域） | ~3 端点 | Python 46 vs Rust 24（Rust 端大部分补齐；剩余 print-drawing-* / scan 通用端点） |
 | 部分缺失（其他域） | ~3 端点 | applicants 7 vs 5；assemblies 9 vs 8；少量边角未补 |
 | Rust-only | **30+** | delivery-notes 新增 P3 scan + batch-detail；worker-pool（5 端点）；_e2e seed hook（11 端点）；auto-allocate；by-work-type / pickable / by-worker；pick-up；send-to-outsource；receive-from-outsource；repair-dispatch；complete-repair；scan-inspect；scan/deliver-part；match-by-excel-items；batch-with-pdfs；assembly start + files |
 | 占位模块（路由挂载但 Router 空） | **2 域** | statistics + dashboard WS 握手 |
@@ -97,10 +97,21 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 
 ---
 
-## 2. part 域部分缺失 — Python 46 端点 / **Rust 49 端点**
+## 2. part 域部分缺失 — Python 46 端点 / **Rust 24 端点**
 
 **Python 参考**：`/Users/ren/Code/myERP/api/v1/part.py`（46 端点）
-**Rust 当前**：[`./parts/index.md`](./parts/index.md)（**49 端点**，2026-09-14 Phase 1+2 补齐后已**超过** Python）
+**Rust 当前**：[`./parts/index.md`](./parts/index.md)（**24 端点**，method 级口径）
+逐条清单见 [`./parts/index.md`](./parts/index.md) 端点列表；端点总表
+[`./index.md`](./index.md) 与 [`./DRIFT_REPORT.md`](./DRIFT_REPORT.md) 同一口径。
+
+> **计数口径 = method 级注册数**：`src/modules/part/mod.rs` 逐个数
+> `get(handler::…)` / `post(handler::…)`（`route("/")` 上的 `get().post()` 记 2 条）。
+> 当前 **24**。等价推导：表登记 53 行 − 27 行已迁出（25 条 `t_part_batch` 子资源
+> + 2 条外协读端点）− 2 行已下线（`send-to-programming` / `recall-to-programming`）
+> = 24。
+> ⚠️ 本文件与 [`./DRIFT_REPORT.md`](./DRIFT_REPORT.md) 早期版本里的 48 / 49 / 50
+> 是**另一种口径**（`.route()` 调用数，漏掉 `route("/")` 上的第 2 个 method），
+> 且未扣除 2026-10-02 迁往 prod 域的 25 条。
 
 ### 2.1 列表/筛选（Rust 已全补）
 
@@ -369,11 +380,9 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
   DIRECT 模式），取代者 `OutsourceSendableItem`。`next_process_id` 改由
   `quotable-parts` 的 `QuotablePartOut` **显式**暴露（part 域 `PartListItem` 仍刻意
   不声明它，前端此前的临时 cast 可随之移除）。
-- `customer_path` 失真修复：`OutsourceQuoteOut.customer_path` 与
-  `OutsourceShipmentOut.customer_path` 此前**恒为硬编码 `None`** → 前端 4 个外协视图
-  「客户」列全 `—`。`OutsourceQuoteOut` 已改为真算（`part_map_for_quote` 扩 2 列带 L1/L2
-  客户名）；`OutsourceShipmentOut`（`reconcile-update` 写端点出参）**2026-10-03 review
-  第 1 轮 A8 一并改为真算** —— 新增 repo 方法 `part_customer_names`，两条
+- `customer_path` 改为真算（2026-10-03）：`OutsourceQuoteOut` 经
+  `part_map_for_quote` 扩 2 列带 L1/L2 客户名，`OutsourceShipmentOut`（`reconcile-update`
+  写端点出参）经新增的 repo 方法 `part_customer_names` —— 后者的两条
   `LEFT JOIN t_customer` 与 list 侧 `OutsourceSentPartRow` 逐条一致，故同一条 shipment
   经写端点回读与经 `sent-parts` 读到的 `customer_path` 恒相同（此前是「列表有值、
   编辑回读变空」的不一致）。

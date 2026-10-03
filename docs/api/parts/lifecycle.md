@@ -414,13 +414,13 @@ Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
 > `/api/v2/parts/zzz-not-a-real-endpoint`）行为完全相同。
 > 旧 handler 已彻底删除，不再有任何 outsource 专用处理。
 >
-> 端点数影响：part 域 25 → **23**（25 是 2026-10-02 把 25 条「以单个批次为操作
-> 对象」的路由迁往 prod 域**之后**的基数；本次下线 2 条 → 23。以
-> `src/modules/part/mod.rs` 的 23 个 method 级注册为准 —— 更早文档里出现的
-> 「50 / 48」是 2026-09-23 扫描基线的数字，未扣除 2026-10-02 的 25 条，
-> 已同步订正到 [`../DRIFT_REPORT.md`](../DRIFT_REPORT.md) 与
-> [`../inconsistencies.md`](../inconsistencies.md) § 2。
-> 完整变更登记见 [`../inconsistencies.md`](../inconsistencies.md) § 9.2。
+> 端点数影响：part 域 26 → **24**（**method 级**注册口径：`route("/")` 上的
+> `get().post()` 记 2 条。基数 26 = method 级 51 − 2026-10-02 迁往 prod 域的 25 条
+> `t_part_batch` 子资源；本次再下线 2 条外协 list → 24）。
+> 现值以 `src/modules/part/mod.rs` 逐个数为准；同一口径与推导见
+> [`../inconsistencies.md`](../inconsistencies.md) § 2 与
+> [`../DRIFT_REPORT.md`](../DRIFT_REPORT.md)。完整变更登记见
+> [`../inconsistencies.md`](../inconsistencies.md) § 9.2。
 
 ### `GET /api/v2/prod/batches/repair`
 

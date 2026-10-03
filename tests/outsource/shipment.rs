@@ -430,13 +430,13 @@ async fn sent_parts_sort_by_price_sent_at_received_at() {
     );
 }
 
-/// 2026-10-03 review 第 1 轮 BLOCKER-1：给了 keyword 却**零命中**时必须返回 0 行。
+/// keyword **零命中**必须返回 0 行。
 ///
-/// 回归的 bug：SQL 谓词是
-/// `AND (cardinality($2::bigint[]) = 0 OR s.part_id = ANY($2))`，
-/// `part_keyword_search` 零命中时给出空数组 → `cardinality = 0` 成立 →
-/// 整个 keyword 条件被短路掉 → 返回该公司的**全部** shipment（list 与 count
-/// 同时错，`total` 也一起错）。
+/// 这条断言守着 SQL 谓词
+/// `AND (cardinality($2::bigint[]) = 0 OR s.part_id = ANY($2))` 的一个陷阱：
+/// `part_keyword_search` 零命中时给出空数组 → `cardinality = 0` 成立 → 整个
+/// keyword 条件被短路掉 → 返回该公司的**全部** shipment（list 与 count 同时错，
+/// `total` 也一起错）。service 层早返回是唯一的兜底点。
 #[tokio::test]
 async fn sent_parts_keyword_zero_match_returns_empty_not_all_rows() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -496,8 +496,9 @@ async fn sent_parts_keyword_zero_match_returns_empty_not_all_rows() {
     );
 }
 
-/// 2026-10-03 review 第 1 轮 m5：`sort_by` / `sort_dir` 白名单**大小写不敏感**
-/// （此前 `?sort_by=price` 静默回落成 `SENT_AT`，前端小写传参时排序不生效且不报错）。
+/// 2026-10-03：`sort_by` / `sort_dir` 白名单**大小写不敏感** ——
+/// `?sort_by=price` 与 `?sort_by=PRICE` 等价（大小写敏感时小写会静默回落成
+/// `SENT_AT`：排序不生效且不报错）。
 #[tokio::test]
 async fn sent_parts_sort_whitelist_is_case_insensitive() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -544,10 +545,11 @@ async fn sent_parts_sort_whitelist_is_case_insensitive() {
     );
 }
 
-/// 2026-10-03 review 第 1 轮 m1：补 2 条不同 `sent_at` 的行并**断言降序**。
+/// 非法 `sort_by` / `sort_dir` 必须回落到 `SENT_AT` / `DESC` **并验行序**。
 ///
-/// 原用例只种 1 行 —— 1 行无法验序，只能证明"回落没注入、没报错、没删数据"，
-/// 不能证明真的回落到 `SENT_AT` / `DESC`。
+/// 1 行数据验不出序（只能证明"没注入、没报错、没删数据"），故种 3 行且让
+/// `sent_at` / `received_at` / `unit_price` 三列互不同向 —— 任何回落列的错配
+/// 都会改变行序。
 #[tokio::test]
 async fn sent_parts_illegal_sort_by_falls_back_to_sent_at_desc_without_injection() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
@@ -600,7 +602,7 @@ async fn sent_parts_illegal_sort_by_falls_back_to_sent_at_desc_without_injection
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["total"], 3, "{env}");
     // ★ 回落语义本体：3 行按 sent_at 降序。删掉这两行断言，本用例就退化成
-    // "没注入、没报错"而不再验序（review 第 1 轮 m1 点的正是这个缺口）。
+    // "没注入、没报错"而不再验序。
     let names: Vec<&str> = env["data"]["items"]
         .as_array()
         .unwrap()
