@@ -7,7 +7,8 @@
 //!   40101 BIZ_AUTH_INVALID、40102 TOKEN_EXPIRED、40103 REFRESH_INVALID、40104 OLD_PASSWORD_MISMATCH、
 //!   40105 SESSION_REVOKED、40106 BIZ_WX_LOGIN_FAILED、40107 BIZ_WX_NOT_BOUND、
 //!   40108 BIZ_WX_BINDING_DUPLICATE、40109 BIZ_WX_NOT_CONFIGURED、
-//!   40300 FORBIDDEN、40301 SHELF_MISMATCH、40400 NOT_FOUND、40901 VERSION_CONFLICT、41301 REQUEST_TOO_LARGE）
+//!   40300 FORBIDDEN、40301 SHELF_MISMATCH、40400 NOT_FOUND、40800 REQUEST_TIMEOUT、
+//!   40901 VERSION_CONFLICT、41301 REQUEST_TOO_LARGE）
 //!   Auth 业务码与通用 UNAUTHORIZED 的区别：业务码携带细分原因。
 //! - `5xxxx`      系统错误（50000 INTERNAL、50001 DATABASE）
 //! - `2xxxx`      业务域错误：200xx 用户/订单、201xx 零件/客户、202xx 工人、203xx 装配体、
@@ -76,6 +77,14 @@ pub mod code {
 
     pub const NOT_FOUND: i32 = 40400;
     pub const VERSION_CONFLICT: i32 = 40901;
+    // 2026-10-03 新增：HTTP 408 REQUEST_TIMEOUT 的错误码（Rust 侧独有，Python 端无对应值）。
+    // 触发场景：`middleware::timeout` 的请求级超时到点。**必须带标准 `{code,message,data}`
+    // 信封而不是空 body**——前端打印请求是 `responseType: 'blob'`，blob 错误分支会把
+    // body 当文本读出来 JSON.parse；空 body 直接 parse 失败，用户只能看到一句泛化
+    // 网络错误，丢失「请求超时」这个可读原因。
+    // 槽位选择：4xxxx 段 HTTP 语义层，前缀 408 对齐 HTTP 状态码（既有码同样按状态码
+    // 取前缀：40000/40100/40300/40400/40901/41301），未被占用。
+    pub const REQUEST_TIMEOUT: i32 = 40800;
     pub const REQUEST_TOO_LARGE: i32 = 41301;
 
     // ===== 2xxxx 业务域错误（沿用 Python core/error_code.py 数值契约） =====
@@ -150,6 +159,15 @@ pub mod code {
     // HTTP 502 BAD_GATEWAY；语义与 nginx upstream 失败同形（"上传相关资源失败"）。
     // 槽位选择：204xx 图纸文件/上传段，与 `BIZ_DRAWING_UPLOAD_FAILED=20404` 同形；20406 与上1下20405 同段连续。
     pub const BIZ_STS_FORWARD_FAILED: i32 = 20406;
+    // 2026-10-03 新增：rust → python 薄壳鉴权转发**打印**失败。
+    // 触发场景：打印链路 4 个端点鉴权通过后转发到 Python 端执行，失败（网络层超时 /
+    // 连接拒 / 读取 body 失败）。HTTP 502 BAD_GATEWAY，语义与 nginx upstream 失败
+    // 同形（"上游 python 后端不可达 / 读 body 失败"）。
+    // 与 `BIZ_STS_FORWARD_FAILED` 同形但**独立命名**：打印覆盖 4 个端点（送货单
+    // print / print-labels、零件 print-drawing / print-drawing-batch），不只 STS 一条；
+    // 独立码让前端与日志能区分是哪条转发链路挂了。
+    // 槽位选择：204xx 图纸文件 / 上传段，20406 之后顺延（20405 已刻意跳过）。
+    pub const BIZ_PRINT_FORWARD_FAILED: i32 = 20407;
 
     // 205xx 货架（t_shelf）
     pub const BIZ_SHELF_NOT_FOUND: i32 = 20501;
@@ -443,6 +461,10 @@ fn status_from_code(c: i32) -> StatusCode {
         c if c == code::FORBIDDEN => StatusCode::FORBIDDEN,
         c if c == code::NOT_FOUND => StatusCode::NOT_FOUND,
         c if c == code::VERSION_CONFLICT => StatusCode::CONFLICT,
+        // 2026-10-03 新增：请求级超时（`middleware::timeout`）→ 408。必须显式登记：
+        // 下面 `(40000..50000) => BAD_REQUEST` 的兜底会把它变成 400，前端就无法区分
+        // 「超时」与「参数错」。
+        c if c == code::REQUEST_TIMEOUT => StatusCode::REQUEST_TIMEOUT,
         c if c == code::REQUEST_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
         c if c == code::INTERNAL || c == code::DATABASE => StatusCode::INTERNAL_SERVER_ERROR,
 
@@ -531,8 +553,10 @@ fn status_from_code(c: i32) -> StatusCode {
 
         // ---- 2xxxx 业务码：502 (上游网关失败，nginx upstream 同形) ----
         // 2026-09-28 新增：rust → python 薄壳鉴权转发 STS 失败 = 502 BAD_GATEWAY。
-        // 与 nginx upstream fail 的语义一致（"上游 python 后端不可达 / 读 body 失败"）。
-        c if c == code::BIZ_STS_FORWARD_FAILED => StatusCode::BAD_GATEWAY,
+        // 2026-10-03 新增：打印转发失败同为 502（与 nginx upstream fail 同语义）。
+        c if c == code::BIZ_STS_FORWARD_FAILED || c == code::BIZ_PRINT_FORWARD_FAILED => {
+            StatusCode::BAD_GATEWAY
+        }
 
         // ---- 2xxxx 兜底：Python BizError 默认 400 ----
         c if c == code::BIZ_DELIVERY_NOTE_SCOPE_MISMATCH
@@ -612,6 +636,8 @@ mod tests {
         (code::SHELF_MISMATCH, "SHELF_MISMATCH"),
         (code::NOT_FOUND, "NOT_FOUND"),
         (code::VERSION_CONFLICT, "VERSION_CONFLICT"),
+        // 2026-10-03 新增：请求级超时（middleware::timeout）
+        (code::REQUEST_TIMEOUT, "REQUEST_TIMEOUT"),
         (code::REQUEST_TOO_LARGE, "REQUEST_TOO_LARGE"),
         // 5xxxx
         (code::INTERNAL, "INTERNAL"),
@@ -720,6 +746,8 @@ mod tests {
         (code::BIZ_DRAWING_UPLOAD_FAILED, "BIZ_DRAWING_UPLOAD_FAILED"),
         // 2026-09-28 新增：rust → python STS 转发失败
         (code::BIZ_STS_FORWARD_FAILED, "BIZ_STS_FORWARD_FAILED"),
+        // 2026-10-03 新增：rust → python 打印转发失败
+        (code::BIZ_PRINT_FORWARD_FAILED, "BIZ_PRINT_FORWARD_FAILED"),
         // 205xx
         (code::BIZ_SHELF_NOT_FOUND, "BIZ_SHELF_NOT_FOUND"),
         (code::BIZ_SHELF_DUPLICATE_CODE, "BIZ_SHELF_DUPLICATE_CODE"),
@@ -1025,6 +1053,8 @@ mod tests {
         assert_eq!(code::SHELF_MISMATCH, 40301);
         assert_eq!(code::NOT_FOUND, 40400);
         assert_eq!(code::VERSION_CONFLICT, 40901);
+        // 2026-10-03 新增：HTTP 408 语义（Rust 侧独有，Python 端无对应值）
+        assert_eq!(code::REQUEST_TIMEOUT, 40800);
         assert_eq!(code::REQUEST_TOO_LARGE, 41301);
         assert_eq!(code::INTERNAL, 50000);
         assert_eq!(code::DATABASE, 50001);
@@ -1082,6 +1112,8 @@ mod tests {
         assert_eq!(code::BIZ_DRAWING_UPLOAD_FAILED, 20404);
         // 2026-09-28 新增：rust → python STS 转发失败
         assert_eq!(code::BIZ_STS_FORWARD_FAILED, 20406);
+        // 2026-10-03 新增：rust → python 打印转发失败
+        assert_eq!(code::BIZ_PRINT_FORWARD_FAILED, 20407);
 
         // 205xx
         assert_eq!(code::BIZ_SHELF_NOT_FOUND, 20501);
@@ -1282,6 +1314,12 @@ mod tests {
             code::VERSION_CONFLICT,
             StatusCode::CONFLICT,
             "VERSION_CONFLICT",
+        ),
+        // 2026-10-03 新增：请求级超时 → 408（显式登记，绕开 40000 段兜底 400）
+        (
+            code::REQUEST_TIMEOUT,
+            StatusCode::REQUEST_TIMEOUT,
+            "REQUEST_TIMEOUT",
         ),
         (
             code::REQUEST_TOO_LARGE,
@@ -1653,6 +1691,12 @@ mod tests {
             code::BIZ_STS_FORWARD_FAILED,
             StatusCode::BAD_GATEWAY,
             "BIZ_STS_FORWARD_FAILED",
+        ),
+        // 2026-10-03 新增：rust → python 打印转发失败 → 502 BAD_GATEWAY
+        (
+            code::BIZ_PRINT_FORWARD_FAILED,
+            StatusCode::BAD_GATEWAY,
+            "BIZ_PRINT_FORWARD_FAILED",
         ),
     ];
 

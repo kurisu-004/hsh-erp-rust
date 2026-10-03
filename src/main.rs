@@ -15,7 +15,6 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -156,13 +155,22 @@ async fn main() -> anyhow::Result<()> {
 
     // 10. 路由组装
     let max_body = state.config.max_request_body_size;
-    let request_timeout = Duration::from_secs(state.config.request_timeout_seconds);
+    // 2026-10-03 新增：请求级超时改为按路径分档（替换 `tower_http::timeout::TimeoutLayer`）。
+    // 打印路径（送货单 print / print-labels、零件 print-drawing / print-drawing-batch）
+    // 走长档 `print_request_timeout_seconds`（缺省 660s）——批量图纸打印由 python 端
+    // 执行，合法耗时数分钟，原先统一 30s 会把批量打印必然打断成 408；
+    // 其余路径仍走 `request_timeout_seconds`（缺省 30s，行为不变）。
     let api_v2 = modules::v2_router(state.clone())
-        .layer(CompressionLayer::new()) // gzip 响应压缩（nest 内层）
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            request_timeout,
-        )); // 请求级超时（nest 内最外层，覆盖 Compression；不影响 WS）
+        // 2026-10-03 新增：`compress_when(NoPrecompressedMime)` 排除 PDF / xlsx
+        // 这两个**已压缩**格式（缘由见该 struct 的 doc）。其余 content-type 的 gzip
+        // 行为与 `CompressionLayer::new()` 的默认谓词保持一致。
+        .layer(CompressionLayer::new().compress_when(NoPrecompressedMime))
+        // 超时层仍是最外层（后调 = 外层 = 请求先经过），保证超时判定覆盖到
+        // Compression 的整个响应写出过程；不影响 /ws 长连接（本层只在 nest 内）。
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            hsh_erp_rust::middleware::timeout::timeout_middleware,
+        ));
     let app: Router = Router::new()
         .nest("/api/v2", api_v2)
         .nest("/ws", modules::ws_router())
@@ -263,5 +271,124 @@ fn trace_on_response(resp: &Response, latency: Duration, _span: &tracing::Span) 
         tracing::info!(status = %status, latency_ms = %latency_ms, "http response");
     } else {
         tracing::warn!(status = %status, latency_ms = %latency_ms, "http response");
+    }
+}
+
+/// 2026-10-03 新增：gzip 压缩谓词——跳过**已压缩**的响应格式。
+///
+/// ## 为什么需要它
+/// `CompressionLayer::new()` 用 tower-http 默认谓词，它只排除 `image/*` / gRPC / SSE，
+/// 于是 `application/pdf`（批量图纸打印的产物）与
+/// `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`（xlsx 导出）
+/// 都会被 gzip 一遍——这两者**本身就是压缩格式**，gzip 只会烧 CPU、几乎压不动体积。
+/// 更贵的是路径本身：`nginx.conf` 是 `proxy_buffering off`，意味着要把整个多 MB 的
+/// 批量 PDF 完整在请求路径上 gzip 一遍才能吐给前端。
+///
+/// ## 为什么自己实现而不复用 tower-http 的 `ContentType` 枚举
+/// 直接按 mime 字符串比对：不依赖 tower-http 有没有 PDF / XLSX 的枚举变体，
+/// 跨 tower-http 版本稳定。谓词语义保持「其余 content-type 的 gzip 行为不变」。
+#[derive(Clone, Copy)]
+struct NoPrecompressedMime;
+
+impl tower_http::compression::Predicate for NoPrecompressedMime {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: axum::body::HttpBody,
+    {
+        let raw = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        match raw {
+            // 无 content-type / 非法 header 值：交给默认行为（压缩）
+            None => true,
+            Some(v) => {
+                // 只取 media type 本体，丢掉 `; charset=…` / `; boundary=…` 参数
+                let mime = v
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                !matches!(
+                    mime.as_str(),
+                    "application/pdf"
+                        | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Response;
+    use tower_http::compression::Predicate;
+
+    fn resp_with_content_type(ct: Option<&str>) -> Response<Body> {
+        let mut builder = Response::builder();
+        if let Some(ct) = ct {
+            builder = builder.header(axum::http::header::CONTENT_TYPE, ct);
+        }
+        builder.body(Body::empty()).expect("构造响应")
+    }
+
+    /// 已压缩格式（pdf / xlsx）不压缩。
+    #[test]
+    fn no_compression_for_precompressed_mime() {
+        assert!(
+            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some("application/pdf"))),
+            "application/pdf 已压缩，不应再 gzip"
+        );
+        assert!(
+            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ))),
+            "xlsx 已压缩，不应再 gzip"
+        );
+    }
+
+    /// 其余 content-type 的 gzip 行为保持不变（含无 content-type 的响应）。
+    #[test]
+    fn compression_unchanged_for_other_mime() {
+        for ct in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "text/plain",
+            "text/event-stream",
+            "image/png",
+            "application/octet-stream",
+        ] {
+            assert!(
+                NoPrecompressedMime.should_compress(&resp_with_content_type(Some(ct))),
+                "非「已压缩格式」的响应应保持压缩行为：{ct}"
+            );
+        }
+        assert!(
+            NoPrecompressedMime.should_compress(&resp_with_content_type(None)),
+            "无 content-type 时保持默认行为（压缩）"
+        );
+    }
+
+    /// 判定对大小写与 `; 参数` 不敏感（`Application/PDF`、`application/pdf; charset=…`
+    /// 同样不该被 gzip）。
+    #[test]
+    fn mime_matching_is_case_insensitive_and_ignores_parameters() {
+        assert!(
+            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some("Application/PDF")))
+        );
+        assert!(
+            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some(
+                "application/pdf; charset=binary"
+            )))
+        );
+        assert!(
+            !NoPrecompressedMime.should_compress(&resp_with_content_type(Some(
+                "APPLICATION/VND.OPENXMLFORMATS-OFFICEDOCUMENT.SPREADSHEETML.SHEET"
+            ))),
+            "xlsx mime 应大小写不敏感"
+        );
     }
 }
