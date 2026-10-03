@@ -8,6 +8,7 @@
 //! - submit DRAFT only（SUBMITTED 状态再 submit → 400）
 //! - soft-delete 仅 DRAFT / REJECTED 可删
 //! - duplicate 同 (part, company, process) → 409
+//! - list keyword 零命中 → 0 行
 //!
 //! ## 集成测试范本（PR13 Phase H，2026-09-24）
 //! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
@@ -184,6 +185,69 @@ async fn create_quote_draft_happy() {
     assert_eq!(s, StatusCode::CREATED, "create: {env}");
     assert_eq!(env["data"]["status"], "DRAFT");
     assert_eq!(env["data"]["price"], "12.50");
+}
+
+/// `list_quotes` 的 keyword **零命中**必须返回 0 行（与 `sent-parts` 同源）。
+///
+/// 这条断言守着 SQL 谓词
+/// `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 的一个陷阱：
+/// `part_keyword_search` 零命中时给出空数组 → `cardinality = 0` 成立 →
+/// keyword 条件被短路掉 → 返回**全量**报价（list 与 count 同时错）。
+/// service 层早返回是唯一的兜底点。
+#[tokio::test]
+async fn list_quotes_keyword_zero_match_returns_empty_not_all_rows() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (pid, cid, proc_id) = setup_basic(&pool).await;
+    // 同 (company, process) 下两台不同零件各挂 1 条报价 —— 同一 (part, company,
+    // process) 二次 create 会 21303，所以必须换 part。
+    let pid2 = insert_part(&pool, insert_l1_customer(&pool, "QuoteCo2", "R").await).await;
+    for p in [pid, pid2] {
+        let (s, env) = send(
+            app.clone(),
+            json_request(
+                "POST",
+                "/outsource-quotes",
+                Some(json!({
+                    "part_id": p.to_string(),
+                    "outsource_company_id": cid.to_string(),
+                    "process_id": proc_id.to_string(),
+                    "price": "3.00",
+                })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{env}");
+    }
+
+    let list = |qs: &str, app: &axum::Router, token: String| {
+        let url = format!("/outsource-quotes{qs}");
+        let app = app.clone();
+        async move {
+            send(
+                app.clone(),
+                json_request("GET", &url, None, Some(token.as_str())),
+            )
+            .await
+        }
+    };
+
+    // 无 keyword → 全量（对照组）
+    let (s, env) = list("", &app, token.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 2, "无 keyword 应返回全量: {env}");
+
+    // 零命中 keyword → 0 条。删掉 service 层早返回就会拿到 2 条 → 红。
+    let (s, env) = list("?keyword=NOSUCHTOKENQQ", &app, token).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 0,
+        "零命中 keyword 必须 total=0（曾返回全量 2）: {env}"
+    );
+    assert!(
+        env["data"]["items"].as_array().unwrap().is_empty(),
+        "零命中 keyword 必须 items 为空: {env}"
+    );
 }
 
 #[tokio::test]

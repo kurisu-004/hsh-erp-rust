@@ -5,8 +5,11 @@
 //! - 1.2 CNC 编程流转（release-from-programming / pending-programming 列表）；
 //!   2026-09-29 端点下线：send-to-programming / recall-to-programming 已删除
 //! - 1.3 外协流转（send-to-outsource / receive-from-outsource /
-//!   receive-from-outsource-to-inspection / outsource-in-flight /
-//!   outsource-sendable 列表）
+//!   receive-from-outsource-to-inspection）—— **2026-10-02 已随批次用例迁往
+//!   `prod::batch`**；配套的 2 条外协 list 端点（`/outsource-in-flight` /
+//!   `/outsource-sendable`）于 2026-10-03 因**返回形状与前端外协域不匹配**一并
+//!   下线，取代者见 `outsource` 域的 `/outsource-shipments/in-flight` 与
+//!   `/outsource-sendable`
 //! - 1.4 返修闭环（complete-repair / repair-dispatch / repair-batches /
 //!   repairing-batches 列表）
 //! - 1.5 批次拆分 / 取消（split-batch / cancel-batch）
@@ -110,32 +113,6 @@ pub async fn list_pending_programming(
 ) -> Result<Json<R<PartListOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = PartService::list_pending_programming(&mut *conn, &query, &current).await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// `GET /api/v2/parts/outsource-in-flight`
-///
-/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
-pub async fn list_outsource_in_flight(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Query(query): Query<crate::modules::part::dto_crud::PartListQuery>,
-) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_outsource_in_flight(&mut *conn, &query, &current).await?;
-    Ok(Json(R::ok(out)))
-}
-
-/// `GET /api/v2/parts/outsource-sendable`
-///
-/// 2026-09-22 PR5：只读 list 端点改 `pool.acquire()`。
-pub async fn list_outsource_sendable(
-    State(state): State<Arc<AppState>>,
-    current: CurrentUser,
-    Query(query): Query<crate::modules::part::dto_crud::PartListQuery>,
-) -> Result<Json<R<PartListOut>>, AppError> {
-    let mut conn = state.pool.acquire().await?;
-    let out = PartService::list_outsource_sendable(&mut *conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }
 

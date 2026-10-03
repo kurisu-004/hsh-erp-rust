@@ -387,15 +387,39 @@ Query：`status?` / `limit?` / `offset?`（默认 50 / 0）。
 
 Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
 
-### `GET /api/v2/parts/outsource-sendable`
+### 外协两条 list 端点 — 2026-10-03 已下线，迁往 outsource 域
 
-权限: **Manager / Clerk**
+> **BREAKING（硬切，无 alias）**：`GET /api/v2/parts/outsource-in-flight` 与
+> `GET /api/v2/parts/outsource-sendable` **已从 part 域删除**（实现文件
+> `src/modules/part/service/phase1/outsource.rs` 整文件移除）。
+>
+> **下线原因**：二者返回的是通用 `PartListItem`，与前端外协域
+> （`frontend/src/views/outsource/`）需要的字段**形状不匹配** ——
+> 缺批次级 `version` / `quantity`、外协公司、`customer_path`；`sendable` 还缺
+> `send_mode` / `company_options` / `quote_id` / `source_status`，**根本无法表达
+> DIRECT（无报价直发）模式**。前端因此长期「在途 tab 空白 / 可发送 tab 全灰」。
+>
+> **迁移指引**：
 
-> 2026-09-22 起 P3 list。返回可发送外协的 part 列表（状态 = READY_TO_SHIP 且无 active 外协 quote）。
+| 变更前 | 变更后 | 文档 |
+|---|---|---|
+| `GET /api/v2/parts/outsource-in-flight` | **`GET /api/v2/outsource-shipments/in-flight`** | [`../outsource-quotes.md`](../outsource-quotes.md) 同批登记 / [`../outsource-sendable.md`](../outsource-sendable.md) |
+| `GET /api/v2/parts/outsource-sendable` | **`GET /api/v2/outsource-sendable`** | [`../outsource-sendable.md`](../outsource-sendable.md) |
 
-Query：`process_id?` / `limit?` / `offset?`。
-
-Response 200 `data`：`{ items: [PartOut], total, limit, offset }`。
+> ⚠️ 旧路径的**实际 HTTP 状态码是 400 而非 404**：part 域 `Router` 注册了
+> `/{part_id}`（`Path<i64>`）catch-all，matchit 静态段优先、参数段兜底 ⇒ 任何
+> 未注册的 1 段静态路径都先落到 `/{part_id}`，再由 `Path` extractor 拒绝非数字段
+> （`Invalid URL: Cannot parse '...' to a 'i64'`）—— 任意不存在的静态段（如
+> `/api/v2/parts/zzz-not-a-real-endpoint`）行为完全相同。
+> 旧 handler 已彻底删除，不再有任何 outsource 专用处理。
+>
+> 端点数影响：part 域 26 → **24**（**method 级**注册口径：`route("/")` 上的
+> `get().post()` 记 2 条。基数 26 = method 级 51 − 2026-10-02 迁往 prod 域的 25 条
+> `t_part_batch` 子资源；本次再下线 2 条外协 list → 24）。
+> 现值以 `src/modules/part/mod.rs` 逐个数为准；同一口径与推导见
+> [`../inconsistencies.md`](../inconsistencies.md) § 2 与
+> [`../DRIFT_REPORT.md`](../DRIFT_REPORT.md)。完整变更登记见
+> [`../inconsistencies.md`](../inconsistencies.md) § 9.2。
 
 ### `GET /api/v2/prod/batches/repair`
 

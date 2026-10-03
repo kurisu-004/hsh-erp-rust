@@ -3,6 +3,17 @@
 > 主代理在主 checkout 直接编写并提交（本报告不需 worktree，按用户授权）。
 > 扫描基准：master HEAD = `7f0641f`（含 PR1-8 + 期间 merged 的 jti/refresh rotation/idempotency 等）
 > 扫描方法：grep 提取实际 `.route()` 调用 vs `docs/api/` 各 .md 文件的 `### ` 端点章节，逐域对比
+>
+> **2026-10-03 订正（只动 part 一行的计数）**：本报告是 2026-09-23 的**历史
+> 快照**，`实际 endpoints` 列一律以扫描基线 `7f0641f` 为准；此后 part 域发生三次
+> 减端点（2026-09-29 下线 `send-to-programming` / `recall-to-programming` 2 条、
+> 2026-10-02 迁往 prod 域 25 条 `t_part_batch` 子资源、2026-10-03 下线 2 条外协
+> list），且中间补过 1 条（2026-09-30 `force-complete`）。现值以
+> `src/modules/part/mod.rs` 的 **method 级**注册逐个数：**24**。
+> ⚠️ 基线的 `50` 是 `.route()` **调用数**（`route("/")` 上有 2 个 method，
+> 只记 1）—— method 级口径下基线是 51。
+> 同一口径的推导见 [`./inconsistencies.md`](./inconsistencies.md) § 2。
+> 其余各域本轮未复核，数字不动。
 
 ## 1. 总体结论
 
@@ -11,12 +22,13 @@
 | iam | 14 | 14 | 🟢 大致覆盖；JWT 重大变更未同步 |
 | delivery_note | 18 | 18 | 🟢 全覆盖 |
 | delivery_groups | 4 | 4 | 🟢 全覆盖 |
-| part | **50** | **~30** | 🔴 **大量缺失** |
+| part | **50**（扫描基线 `7f0641f` 的 `.route()` 调用数；method 级为 51）→ **现值 24** | **~30** | 🔴 **大量缺失** |
 | assembly | 7 | 7 | 🟡 待 verify（需补 /start /update 文档说明） |
 | shelf | ~11 | ~11 | 🟢 大致覆盖 |
-| outsource-companies | ~7 | ~7 | 🟢 待 verify |
-| outsource-quotes | ~8 | ~8 | 🟢 待 verify |
-| outsource-shipments | 1 | 1 | 🟢 全覆盖 |
+| outsource-companies | 8 | 8 | 🟢 全覆盖（2026-10-03 +`sent-parts`） |
+| outsource-quotes | 9 | 9 | 🟢 全覆盖（2026-10-03 +`quotable-parts`） |
+| outsource-shipments | 2 | 2 | 🟢 全覆盖（2026-10-03 +`in-flight`） |
+| outsource-sendable | 1 | 1 | 🟢 全覆盖（2026-10-03 新增独立顶层前缀） |
 | cnc-programs | 2 | 2 | 🟢 全覆盖 |
 | files (part_file) | ~6 | ~6 | 🟢 全覆盖 |
 | upload-sessions | ~7 | ~7 | 🟢 待 verify |
@@ -82,7 +94,7 @@ GET /by-serial/{serial_no}/part-batches     ⚠️ docs 仅在 crud 提一次未
 GET /inspection-batches                      ❌ docs 缺失（应在 inspection）
 GET /location-tree                          ❌ docs 缺失（应在 crud）
 GET /match-by-excel-items                   ❌ docs 缺失（应在 crud）
-GET /outsource-sendable                     ❌ docs 缺失（应在 lifecycle）
+GET /outsource-sendable                     ✅ docs/api/outsource-sendable.md（2026-10-03 迁往 outsource 域独立顶层前缀）
 GET /repair-batches                         ❌ docs 缺失（应在 lifecycle / repair）
 GET /repairing-batches                      ❌ docs 缺失（应在 lifecycle / repair）
 GET /{part_id}/events                       ❌ docs 缺失（应在 crud）
@@ -190,7 +202,8 @@ PUT  /{part_id}                             ⚠️ docs 未列出 PUT 形式（�
 - `_e2e.md`：14/14 全覆盖
 - `cnc-programs.md`：2/2 全覆盖
 - `parts/{crud,lifecycle,inspection}` 已有章节覆盖的端点
-- `outsource-shipments.md`：1/1 全覆盖
+- `outsource-shipments.md`：写端点 1/1 全覆盖；2026-10-03 在 `shipment_router` 上另加 `GET /in-flight`（读侧，归口见 `outsource-sendable.md` / `outsource-companies.md` 的同批登记）
+- `outsource-sendable.md`：1/1 全覆盖（2026-10-03 新建）
 
 ---
 

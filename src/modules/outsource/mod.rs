@@ -17,6 +17,17 @@
 //! - `handler.rs` 17 端点保持 3 router 工厂（company_router / quote_router /
 //!   shipment_router）；handler 三形态严格区分（读走 `pool.acquire()`，
 //!   写走 `pool.begin() + tx.commit()`）。
+//!
+//! 2026-10-03 读侧补齐（20 端点 / 4 router 工厂）：
+//! - 新增 4 个 list 端点：companies 的 `sent-parts`、quotes 的 `quotable-parts`、
+//!   shipments 的 `in-flight`、独立顶层 `/outsource-sendable`。
+//! - `vo` 增 2 文件（`quotable.rs` / `sendable.rs`），`service` 增 1 文件
+//!   （`sendable.rs`），repo 增 2 ZST（`OutsourceQuotableRepo` / `OutsourceSendableRepo`）。
+//! - 删除 part 域两个**错形状**的同义端点（返回通用 `PartListItem`，与前端字段
+//!   需求不匹配）：`/parts/outsource-in-flight`、`/parts/outsource-sendable`
+//!   （2026-10-03 硬切，无 alias；旧 URL 实际返回 **400** 而非 404 —— part 域
+//!   `/{part_id}`（`Path<i64>`）catch-all 兜住任何未注册的 1 段静态路径，再由
+//!   `Path` extractor 拒绝非数字段；成因见 `docs/api/inconsistencies.md` § 9.2）。
 
 pub mod dto;
 pub mod handler;
@@ -43,4 +54,12 @@ pub fn quote_router() -> Router<Arc<AppState>> {
 /// 发货记录域路由（挂载点 `/outsource-shipments`）。
 pub fn shipment_router() -> Router<Arc<AppState>> {
     handler::shipment_router()
+}
+
+/// 可发送外协一览路由（挂载点 `/outsource-sendable`）。
+///
+/// 2026-10-03 新增。独立顶层前缀：可发送判定横跨 company / quote / batch 三域，
+/// 不属于任何单一域的子资源。
+pub fn sendable_router() -> Router<Arc<AppState>> {
+    handler::sendable_router()
 }
