@@ -7,7 +7,7 @@
 >
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
-> 范围：**生产管理**菜单（前端 `production_group` 一级 + `process_work_type` / `part_process_chain` / `worker_queue` 三个子菜单）下挂的全部后端域。本目录按前端菜单 + 工人档案 + 待下发批次拆分 **9 个子页 + 1 个入口**（⚠️ 2026-10-02 订正：原写「7 个文件」，实为 9 个子页）。
+> 范围：**生产管理**菜单（前端 `production_group` 一级 + `process_work_type` / `part_process_chain` / `pending_programming` / `worker_queue` / `inspection_pending` / **`workers_list`（2026-10-04 自权限管理 `auth_group` 迁入）** 子菜单）下挂的全部后端域。本目录按前端菜单 + 工人档案 + 待下发批次拆分 **9 个子页 + 1 个入口**（⚠️ 2026-10-02 订正：原写「7 个文件」，实为 9 个子页）。
 >
 > 实施阶段：part-worker-pool-federated-rocket（2026-09-11 起），整合自 settings/process_chain/worker_pool 三批 PR，2026-09-12 落盘为 production/ 子目录。2026-09-19 prod 容器聚合：worker / work_type / process / process_chain / worker_pool 五个支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias；工人档案 worker（7 端点）一并并入。2026-09-29 新增 `prod::batch`（车间 PENDING 待下发批次列表 + 单条 / 批量 / 自动下发 4 端点，URL `/api/v2/prod/batches/*`）。2026-09-30 prod 域 9 端点重构：worker-pool → pool 路径收敛（`/pool/*` 单 nest，5 端点；新增通用 move 取代 assign+remove；移除 admin nest）；batches dispatch 统一 bulk-only（`/dispatch` 单端点，`targets` 数组；移除 bulk-dispatch）；auto-dispatch 改为只读 preview。2026-10-01 新增 `prod::programming`（待编程一览 1 只读端点，URL `/api/v2/prod/programming/pending`，part 状态白名单闸门 + 三规则并集口径；前端「待编程一览」页从 part 域 `GET /api/v2/parts/pending-programming` 切过来，part 域旧端点保留兼容）。2026-10-02 新增 `prod::shelf_process`（货架 ↔ 工序映射 `t_shelf_process` 3 端点，URL `/api/v2/prod/shelf-processes/*`）：自 `src/modules/shelf/process_mapping/` 整体搬入 prod 域，旧路径 `GET|POST /api/v2/shelves/{id}/processes` + `GET /api/v2/shelves/processes` **404（无 alias）**，请求 / 响应契约逐字不变。**前端配套改动不止改 URL，清单见 [`shelf-process-mapping.md#前端配套改动清单`](./shelf-process-mapping.md#前端配套改动清单)**（3 个 URL + `account_count` 出参删除引发的 4 处 Zod/类型/表格落点）。
 
@@ -242,12 +242,13 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 |---|---|---|---|---|
 | `process_work_type` | `/production/process-work-type` | `ProcessWorkTypePage.vue`（tabbed shell: work-types / processes / mapping） | `prod::work_type` + `prod::process` | [`work-types.md`](./work-types.md) + [`processes.md`](./processes.md) + [`work-type-process-mapping.md`](./work-type-process-mapping.md) |
 | `part_process_chain` | `/parts/process-chains` | （**前端页面待建**，menuCode 已 INSERT） | `prod::process_chain` | [`process-chain.md`](./process-chain.md) |
-| `worker_queue` | `/workers/queue` | `WorkerQueueBoard.vue`（**实际挂在生产管理菜单下**） | `prod::worker_pool` | [`worker-pool.md`](./worker-pool.md) |
-| 工人档案管理（**菜单归属非 production_group**） | `/workers` 等 | （前端视图目录 `frontend/src/views/workers/`） | `prod::worker` | [`workers.md`](./workers.md) |
+| `worker_queue` | `/production/worker-queue` | `production/WorkerQueueBoard.vue` | `prod::worker_pool` | [`worker-pool.md`](./worker-pool.md) |
+| 工人档案管理（**2026-10-04 菜单归属改为 `production_group`**） | `/production/worker-list` | （前端视图目录 `frontend/src/views/production/`） | `prod::worker` | [`workers.md`](./workers.md) |
 | （**前端 menuCode 待定 2026-09-29**） | `/production/pending-dispatch` | `ProductionPendingDispatchPage.vue`（**新前端页面 2026-09-29**） | `prod::batch` | [`batches.md`](./batches.md) |
 | （**前端 menuCode 待定 2026-10-01**） | 「待编程一览」页（沿用 part 域路由） | 待编程 tab（`has_cnc_program` 三态） | `prod::programming` | [`pending-programming.md`](./pending-programming.md)（口径：状态白名单闸门 + 三规则并集，与 part 域旧端点的差异见该页「过滤谓词」段） |
 
 > 上述 `process_work_type` / `part_process_chain` / `worker_queue` 3 个 menuCode 的授权（MANAGER + CLERK + INSPECTOR）由后端 migration 018 + 021 写入 `t_role_menu`。
+> 2026-10-04：`workers_list`（工人档案）随前端视图搬到 `/production/worker-list`，菜单从 `auth_group` 迁到 `production_group`（`seeds/menu.sql` 改父分组 + path + sort_order 25）—— `t_role_menu` 仍是扁平 code 列表，**授权范围一行未变**（仍只有 MANAGER 有 `workers_list`）。
 > `prod::batch` 4 端点走 service 内 `require_any_role(...)` 守卫（list=Manager+Clerk+Inspector；写=Manager+Clerk），无需新增 `t_role_menu` 行（沿用 production_group 既有授权）。
 > `prod::programming` 1 端点同样走 service 内守卫（Manager+Clerk+Inspector+**CNC_PROGRAMMER**），同样无需新增 `t_role_menu` 行。
 > 前端 `process_work_type` tabbed shell 替代了原 `settings_root` 下的 3 个旧菜单（`work_types_list` / `processes_list` / `work_type_processes_list`，migration 021 软删）。

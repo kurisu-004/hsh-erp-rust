@@ -105,7 +105,8 @@ INSERT INTO t_menu (
     (9000000000000107, (SELECT id FROM t_menu WHERE code = 'order_group'         AND deleted_at IS NULL), 'repair_receive',            '返修接收',      '/repair/receive',              'Tools',        65, true, 0, now(), 0, now(), 0),
 
     -- auth_group 下（含 025 把 shelves_list 从 floor_group 移入）
-    (9000000000000201, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'workers_list',              '工人一览',      '/workers',                     'User',         10, true, 0, now(), 0, now(), 0),
+    -- 2026-10-04 移除：workers_list 从 auth_group 移到 production_group 下（前端视图
+    -- 搬到 frontend/src/views/production/，路由随之前端搬到 /production/worker-list）。
     (9000000000000202, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'users_list',                '账号管理',      '/users',                       'List',         20, true, 0, now(), 0, now(), 0),
     (9000000000000203, (SELECT id FROM t_menu WHERE code = 'auth_group'         AND deleted_at IS NULL), 'shelves_list',              '货架管理',      '/shelves',                     'Platform',     30, true, 0, now(), 0, now(), 0),
 
@@ -118,14 +119,19 @@ INSERT INTO t_menu (
     (9000000000000502, (SELECT id FROM t_menu WHERE code = 'outsource_list'    AND deleted_at IS NULL), 'outsource_quotes_list',     '报价一览',      '/outsource/quotes',            'Document',     20, true, 0, now(), 0, now(), 0),
     (9000000000000503, (SELECT id FROM t_menu WHERE code = 'outsource_list'    AND deleted_at IS NULL), 'outsource_send_receive_list','外协发送/接收','/outsource/send-receive',       'Promotion',    30, true, 0, now(), 0, now(), 0),
 
-    -- production_group 下（018/021/024 累计 + 2026-09-29 新增 pending_programming / inspection_pending）
+    -- production_group 下（018/021/024 累计 + 2026-09-29 新增 pending_programming / inspection_pending + 2026-10-04 迁入 workers_list）
     (9000000000000601, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'process_work_type',         '工序工种',      '/production/process-work-type','Operation',     5, true, 0, now(), 0, now(), 0),
     (9000000000000602, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'part_process_chain',        '制定工序',      '/production/process-design',   'SetUp',        10, true, 0, now(), 0, now(), 0),
     -- 2026-09-29 新增：待编程（原顶级菜单 id=6，title 改「待编程」）挂在 production_group 下；
     -- 用原 id（9000000000000006）保证 ON CONFLICT 命中；sort_order=15（在 process_work_type=5 / part_process_chain=10 之后、worker_queue=20 之前）。
     -- 2026-09-29 review 修复：原 sort_order=25 会让 worker_queue(20) → pending_programming(25) → inspection_pending(30) 渲染错位。
     (9000000000000006, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'pending_programming',       '待编程',        '/cnc/pending',                'Cpu',          15, true, 0, now(), 0, now(), 0),
-    (9000000000000603, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'worker_queue',              '生产队列',      '/workers/queue',              'Operation',    20, true, 0, now(), 0, now(), 0),
+    -- 2026-10-04：path 随前端视图搬到 /production/worker-queue（sort_order 不变）。
+    (9000000000000603, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'worker_queue',              '生产队列',      '/production/worker-queue',    'Operation',    20, true, 0, now(), 0, now(), 0),
+    -- 2026-10-04 新增（自 auth_group 迁入）：工人档案管理，路由随前端视图搬到
+    -- /production/worker-list；sort_order=25（插在 worker_queue=20 与 inspection_pending=30 之间）。
+    -- 换父分组不改授权：t_role_menu 仍是扁平 code 列表，workers_list 仅 MANAGER 持有。
+    (9000000000000201, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'workers_list',              '工人一览',      '/production/worker-list',     'User',         25, true, 0, now(), 0, now(), 0),
     -- 2026-09-29 新增：待品检（inspection_pending）从 order_group 移到 production_group；
     -- 原 id（9000000000000105）保留；sort_order 从 50 改为 30（在 worker_queue 之后）。
     (9000000000000105, (SELECT id FROM t_menu WHERE code = 'production_group'  AND deleted_at IS NULL), 'inspection_pending',        '待品检',        '/inspection/pending',          'CircleCheck',  30, true, 0, now(), 0, now(), 0),
