@@ -227,10 +227,12 @@ pub struct PartListItem {
     /// 2026-10-03 新增：已送数量。
     ///
     /// - PART 行 = 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的
-    ///   `quantity` 之和（`t_part_batch.status` 是批次级「已交」的唯一真源）。
+    ///   `quantity` 之和（零批次 → `0`，不是 `null`；`t_part_batch.status` 是
+    ///   批次级「已交」的唯一真源）。
     /// - ASSEMBLY 行 = 可凑齐的套数
-    ///   `MIN(子件已送件数 × 装配件套数 / 子件总量)`，PG 整数除法截断；
-    ///   子件总量为 0 者不参与，无子件为 0。
+    ///   `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，
+    ///   PG 整数除法截断；子件总量为 0 者不参与，无子件为 0；`LEAST` 收口到
+    ///   工单总套数（子件超交时不会算出超过总套数的值）。
     /// - 仅 `GET /api/v2/com/union-list`（三种 `row_type` 模式）与
     ///   `GET /api/v2/parts` 填；其余复用本 VO 的 **5 处返回点**恒 `null`
     ///   （4 个列表端点 + `POST /assemblies/{id}/children` 返回的单对象
