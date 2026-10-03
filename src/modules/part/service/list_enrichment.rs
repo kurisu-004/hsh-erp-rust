@@ -222,19 +222,38 @@ pub(crate) async fn fetch_delivered_quantities(
 /// 口径：每套需要的子零件数 = `子件总量 / 套数`（用户在「新建装配件」时指定装配件
 /// 套数与每个子零件的总数）。故某子件能支撑的套数 =
 /// `子件已送件数 × 装配件套数 / 子件总量`，父装配件的可交套数取所有子件的 **min**
-/// （PG 整数除法截断，凑不满整套就按 0 记）。
+/// （PG 整数除法截断，凑不满整套就按 0 记），再对装配件总套数 `a.quantity` 收口
+/// （`LEAST`）—— 不可能交付超过工单总套数的套数。
 ///
 /// 边界处理：
 /// - `COALESCE(SUM(...), 0)` 不可省 —— 未交任何批次的子件若贡献 NULL 会被 `MIN` 忽略，
 ///   那样「子件 A 交一半、子件 B 一件没交」会误判成 A 能撑的套数；
 /// - `NULLIF(子件总量, 0)` —— 总量为 0 的子件让该项为 NULL 从而被 `MIN` 忽略
 ///   （不参与），既不整除零出错也不拖累 min；
-/// - 外层 `COALESCE(..., 0)` 兜底 —— 无子件 / 子件总量全为 0 时 `MIN` 为 NULL。
+/// - `LEAST(COALESCE(MIN(...), 0), a.quantity)` —— 收口到工单总套数，同时兜住
+///   子件超交（子件已送 > 子件总量时按比例会算出超过总套数的值，UI 会出现
+///   「20 / 10 套」）。**`COALESCE` 必须在 `LEAST` 里面**：PG 的 `LEAST` 会忽略
+///   NULL 实参（与 `MIN` 聚合同语义），写成 `COALESCE(LEAST(MIN(...), a.quantity), 0)`
+///   会在「子件总量全为 0、`MIN` 为 NULL」时返回 `a.quantity`（整套全交），
+///   与「子件全零 → 0 套」的口径正好相反；
+/// - `LEAST` 顺带消除 int8→int4 收窄溢出：`子件已送 × 装配件套数` 是 int8 乘积
+///   （子件总量为 1 时等于乘积本身），`1e6 × 1e6 = 1e12` 超 int4 会让整页 500；
+///   收口后上界是 `a.quantity`（int4），`::int` 不再可能溢出。
+///   PART 侧的 `fetch_delivered_quantities` 保持纯 `::int` 不加钳制：那边只是
+///   `SUM(quantity)` 不放大，无真实溢出路径，加钳制反而会掩盖「已交量 > 总量」。
+///
+/// 前提：假设 `t_assembly.quantity` / `t_part.quantity` 恒非负。三列都是
+/// `integer NOT NULL` 且**无 CHECK**（全仓唯一 quantity CHECK 在 outsource 域），
+/// `AssemblyCreateRequest.quantity` 是 `Option<i32>` + `unwrap_or(1)`、create 路径无
+/// `>0` 校验，但业务不会建负量工单；PG 整数除法对负数是**向零截断**（`-1 / 2 = 0`）
+/// 会让套数偏大，而 `NULLIF` 只挡 0 不挡负。
 ///
 /// 无子件的装配件不产生结果行（SQL 以子件表为驱动表），caller 侧
 /// `.copied().unwrap_or(0)` 兜 0。
 ///
-/// SQL 数：1 条，与页大小 N 无关。
+/// SQL 条数：1 条，与页大小 N 无关（防 N+1 往返）；但**扫描量是 O(本页装配件的子件
+/// 总数)**，每个子件一次 `ix_t_part_batch_part_id` 索引探测。不改写成 CTE hash 聚合
+/// —— 收益不可测、风险大于收益。
 pub(crate) async fn fetch_delivered_sets(
     conn: &mut PgConnection,
     asm_ids: &[i64],
@@ -243,17 +262,24 @@ pub(crate) async fn fetch_delivered_sets(
     if asm_ids.is_empty() {
         return Ok(out);
     }
-    // 以 `t_part`（子件）为驱动表走 `ix_t_part_assembly_id_status`，每个子件的已送量
-    // 是相关标量子查询（走 `ix_t_part_batch_part_id` 位图扫），因此整段仍只 1 条 SQL。
+    // 以 `t_part`（子件）为驱动表，走 `(assembly_id, ...)` 前缀索引，因此整段仍只 1 条
+    // SQL。不写死索引名：`ix_t_part_assembly_id_status` 与 `ix_t_part_assembly_id` 同
+    // 前缀，planner 可能选后者，钉死名字必过期。
     // `GROUP BY c.assembly_id, a.quantity`：套数是表达式的一部分，必须进 GROUP BY。
+    // ⚠️ `c.id` / `c.quantity` **未**进 GROUP BY 却被 SELECT 表达式引用，靠的是
+    // 「相关标量子查询的外层引用不受 grouping 检查」这一 PG 行为 —— 标准 SQL 应拒绝
+    // （PG 的函数依赖放宽只在 GROUP BY 含表主键时生效，`c.assembly_id` 不是 `t_part`
+    // 的主键）。**把相关子查询改写成 LEFT JOIN 或改用窗口函数会立刻报**
+    // `column "c.id" must appear in the GROUP BY clause`，改写前务必先跑
+    // `tests/com/union_list.rs` 的 `delivered_quantity_*` 用例。
     let rows: Vec<(i64, i32)> = sqlx::query_as(
         "SELECT c.assembly_id, \
-                COALESCE(MIN( \
+                LEAST(COALESCE(MIN( \
                     (COALESCE((SELECT SUM(b.quantity) FROM t_part_batch b \
                                WHERE b.part_id = c.id AND b.deleted_at IS NULL \
                                  AND b.status IN ('DELIVERED', 'COMPLETED')), 0) \
                      * a.quantity) / NULLIF(c.quantity, 0) \
-                ), 0)::int AS delivered_sets \
+                ), 0), a.quantity)::int AS delivered_sets \
          FROM t_part c \
          JOIN t_assembly a ON a.id = c.assembly_id AND a.deleted_at IS NULL \
          WHERE c.assembly_id = ANY($1) AND c.deleted_at IS NULL \
