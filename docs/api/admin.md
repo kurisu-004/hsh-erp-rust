@@ -184,9 +184,10 @@ loop {
 - **报告口径**：这类行既不进 `changes`（守卫命中时一个字节都没写），也**不等于**
   「数据已一致」。故 `status_gate::RollupOutcome::terminal_skip` 上抛，
   报告给出 `parts_skipped_terminal` + `skipped_terminal[{id, current, derived}]`。
-  终态跳过只留一条 `tracing::warn!`，信号太弱：运维从报告里看到的
-  `parts_examined=1 / parts_changed=0` 与「数据本来就一致」**不可区分** ——
-  即「兜底修数工具给假干净报告」，与本端点要消灭的失败类别同类。
+  日志侧终态跳过只留一条 `tracing::warn!`（信号太弱），故报告另给上述计数——只看
+  `parts_examined=1 / parts_changed=0` 会与「数据本来就一致」不可区分，必须同时看
+  `parts_skipped_terminal`。否则「兜底修数工具给假干净报告」，与本端点要消灭的
+  失败类别同类。
 - **人工怎么修**：守卫对**定点路径同样
   生效**，所以「用 `part_ids` 定点跑一遍」**不可能**改掉终态行。可行路径只有两条：
   1. 若 `derived`（min-progress 派生值）**就是**你想要的终态 → 用
