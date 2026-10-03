@@ -226,9 +226,12 @@ pub mod code {
     pub const BIZ_PART_FILE_UPLOAD_FAILED: i32 = 21104; // COS SDK 抛错
     pub const BIZ_PART_FILE_OWNER_NOT_FOUND: i32 = 21105; // polymorphic owner (part/assembly) 不存在
     pub const BIZ_PART_FILE_DUPLICATE: i32 = 21108; // 同 part+kind+content_sha256 撞唯一索引（并发兜底）
-    pub const BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED: i32 = 21109; // root prefix 未配置 DELIVERY_NOTE_TEMPLATE_BY_PREFIX
+    // 2026-10-03：打印端点改纯转发后本码无 rust 生产点 —— 由 python 端判定并产出、rust 原样透传，
+    // rust 侧无任何送货单模板配置。保留常量供 rust 识别 / 回显 python 产出的码。
+    pub const BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED: i32 = 21109; // python 侧：客户 prefix 未配出 xlsx 模板
     pub const BIZ_DELIVERY_PART_STATUS_INVALID: i32 = 21111; // 所选零件状态非 READY_TO_SHIP
-    pub const BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS: i32 = 21112; // 所选零件超过模板容量（法 14 / 路 25）
+    // 2026-10-03：同上，纯 python 端产出、rust 原样透传，rust 侧无模板容量概念。
+    pub const BIZ_DELIVERY_TEMPLATE_TOO_MANY_PARTS: i32 = 21112; // python 侧：所选零件超过模板容量（法 14 / 路 25）
     pub const BIZ_DELIVERY_PRINT_BAD_ORDER: i32 = 21113; // custom_order 含非法 batch id 或漏行（422）
     // 2026-09-16 M2-A 新增：前端直传 COS 链路错误码。
     // 槽位选择说明：
