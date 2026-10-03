@@ -6,7 +6,7 @@
 > 域覆盖：CRUD / by-serial 查询 / upload-drawing / lifecycle 状态机（deliver / cancel / complete / start-repair）/ batch 集合读（`GET /{part_id}/batches`）。所有路径前缀 `/api/v2`。
 >
 > **⚠️ 2026-10-02 域收窄**：以**单个批次**为操作对象的 25 条路由已从 `/api/v2/parts/*` 迁到 `/api/v2/prod/batches/*`，锚点由 `part_id` 改为 `batch_id`。**part 域现在只剩多批次动作（`/{part_id}/cancel` / `force-complete`）与非批次动作（CRUD / 文件 / 列表 / `GET /{part_id}/batches`）**。本表仍列出迁出的端点并指向新路径，便于按动作查文档；25 条逐条清单见 [`../production/batches.md`](../production/batches.md#2026-10-02-t_part_batch-子资源迁入)。
-> **⚠️ 2026-10-03 再收窄 2 条**：`/parts/outsource-in-flight` 与 `/parts/outsource-sendable` 两个外协读端点迁往 outsource 域（旧路径无 alias，见下表对应两行）。这两条与下表的 `GET /outsource-shipments/in-flight` / `GET /outsource-sendable` 行由**读侧分支**在同一次合并中落地，单分支快照下不存在。
+> **⚠️ 2026-10-03 再收窄 2 条**：`/parts/outsource-in-flight` 与 `/parts/outsource-sendable` 两个外协读端点迁往 outsource 域（旧路径无 alias，见下表对应两行）。新路径为 `GET /outsource-shipments/in-flight`（见 [`../outsource-shipments.md`](../outsource-shipments.md)）与 `GET /outsource-sendable`（见 [`../outsource-sendable.md`](../outsource-sendable.md)）。
 > **计数口径（2026-10-03 登记）**：本表登记 **53 行**，其中 **27 行**指向已迁出 part 域的端点（25 条 batch 子资源 + 2 条外协读端点）、**2 行**是已下线端点（`send-to-programming` / `recall-to-programming`，返回 404），故 part 域**实际注册**端点 = 53 − 27 − 2 = **24**，与 `src/modules/part/mod.rs::router()` 的 method 级注册数逐条对齐（`GET /` + `POST /` 算 2 条）。
 > 已拆为子目录：
 >
@@ -44,7 +44,7 @@
 | POST | `/api/v2/prod/batches/worker-scan` | **Manager** / **ShelfAccount** | 工人扫码归还 / 送检；成功后同事务触发 worker-pool refill —— **2026-10-02 迁往 prod 域**（无 Path，`serial_no` 主键） | [`inspection.md`](./inspection.md#post-apiv2prodbatchesworker-scan) |
 | GET | `/api/v2/parts/pending-programming` | Manager / Clerk / Inspector / CncProgrammer | 待编程列表（Phase 1）—— **2026-10-01 起前端请改用 [`GET /api/v2/prod/programming/pending`](../production/pending-programming.md#get-apiv2prodprogrammingpending)**（本端点保留兼容，规则2 走「批次货架 → 工序」间接链路、开发库恒返空） | [`crud.md`](./crud.md#phase-1-列表与筛选) |
 | GET | `/api/v2/outsource-shipments/in-flight` | Manager / Clerk | 外协在途列表 —— **2026-10-03 迁往 outsource 域**（旧 `/parts/outsource-in-flight` 无 alias，命中本表 `GET /{part_id}` catch-all → **400**；新形状含 `batch_id` / `batch.version` / 批次余量，是部分接收的输入源） | [`../outsource-shipments.md`](../outsource-shipments.md#get-apiv2outsource-shipmentsin-flight) |
-| GET | `/api/v2/outsource-sendable` | Manager / Clerk / Inspector | 可发外协一览（APPROVAL / DIRECT 两种 `send_mode`）—— **2026-10-03 迁往 outsource 域独立顶层前缀**（旧 `/parts/outsource-sendable` 无 alias，命中本表 `GET /{part_id}` catch-all → **400**） | `docs/api/outsource-sendable.md`（**读侧分支文件，与本行端点同一次合并落地**，单分支快照下不存在） |
+| GET | `/api/v2/outsource-sendable` | Manager / Clerk / Inspector | 可发外协一览（APPROVAL / DIRECT 两种 `send_mode`）—— **2026-10-03 迁往 outsource 域独立顶层前缀**（旧 `/parts/outsource-sendable` 无 alias，命中本表 `GET /{part_id}` catch-all → **400**） | [`../outsource-sendable.md`](../outsource-sendable.md) |
 | GET | `/api/v2/prod/batches/repair` | Manager / Inspector | 维修批次列表（判据 `status='DELIVERED'`）—— **2026-10-02 自 part 域迁入** | [`lifecycle.md`](./lifecycle.md#get-apiv2prodbatchesrepair) |
 | GET | `/api/v2/prod/batches/repairing` | Manager / Inspector | 维修中批次列表（判据 `is_repairing=true`）—— **2026-10-02 自 part 域迁入** | [`lifecycle.md`](./lifecycle.md#get-apiv2prodbatchesrepairing) |
 | GET | `/api/v2/parts/location-tree` | Manager / Clerk / Inspector / CncProgrammer | 库位树（Phase 1） | [`crud.md`](./crud.md#phase-1-列表与筛选) |

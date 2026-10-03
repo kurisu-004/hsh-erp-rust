@@ -1850,9 +1850,9 @@ async fn reconcile_update_shipment_unit_price_quantity() {
     assert_eq!(env["data"]["unit_price"], "15.50");
     assert_eq!(env["data"]["quantity"], 8);
     assert_eq!(env["data"]["is_billed"], true);
-    // 2026-10-03 review 第 1 轮 A8：OutsourceShipmentOut.customer_path 此前恒
-    // null（"前端不读其客户列"）。现真算，口径与 sent-parts list 一致 ——
-    // 这条 L1 客户无 parent，故只给 L2 名。
+    // 2026-10-03：`shipment_out` 的 `customer_path` 改为真算（`part_customer_names`
+    // + `join_customer_path`），不再硬编码 `None`；此处断言它与 sent-parts list
+    // 侧口径一致 —— 这条 L1 客户无 parent，故只给 L2 名。
     assert_eq!(
         env["data"]["customer_path"], "RU",
         "reconcile-update 出参的 customer_path 必须真算: {env}"

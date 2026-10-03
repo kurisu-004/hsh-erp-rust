@@ -7,9 +7,9 @@
 > 域覆盖：外协发货对账页（shipment 2 端点，2026-10-03 由 1 端点增为 2）。
 > 2026-09-13 Phase 2 落地 reconcile-update；2026-10-03 补 in-flight 在途一览。
 > 关联域：[`./outsource-companies.md`](./outsource-companies.md) /
-> [`./outsource-quotes.md`](./outsource-quotes.md) / `outsource-sendable.md`
-> （可发外协一览，独立顶层前缀 `GET /api/v2/outsource-sendable`；该文件与本域的
-> `GET /in-flight` 由读侧分支在**同一次合并**中落地，单分支快照下不存在）。
+> [`./outsource-quotes.md`](./outsource-quotes.md) /
+> [`./outsource-sendable.md`](./outsource-sendable.md)（可发外协一览，独立顶层前缀
+> `GET /api/v2/outsource-sendable`）
 > **shipment 的写入方不是本域**：`send-to-outsource` / `receive-from-outsource` 在
 > prod 域批次侧（见 [`./production/batches.md#外协流转send--receive`](./production/batches.md#外协流转send--receive)），
 > 本域只读 + 对账改。
@@ -26,12 +26,6 @@
 > 路由注册：`in-flight` 是 1 段静态路径，与 2 段的 `/{id}/reconcile-update` 无
 > matchit 冲突（见 `src/modules/outsource/handler.rs::shipment_router`）。
 
-> ⚠️ **合并时点（2026-10-03 登记）**：本文件描述的 `GET /in-flight` 与写端点
-> `POST /{id}/reconcile-update` **不在同一条开发分支上**，但在**同一次编排中先后合入
-> master**，合并后本文件整体自洽。若只看其中任一分支的单分支快照，`in-flight` 都
-> **不在册**（本仓 `shipment_router()` 只注册 `/{id}/reconcile-update`），此时该路径
-> 404 —— 这是分支切分期的正常状态，不是契约缺失。**别据此撤掉本节**。
->
 > 旧路径 `/api/v2/parts/outsource-in-flight` 已下线：不带 alias，且**返回 400 而非
 > 404** —— part 域还有 `GET /parts/{part_id}` catch-all，matchit 静态段优先、参数段
 > 兜底，于是 `outsource-in-flight` 被当作 `part_id` 交给雪花 ID 反序列化
@@ -104,7 +98,7 @@ shipment**：
 | `created_at` / `updated_at` | naive datetime | |
 | `part_drawing_no` / `part_name` | string? | 工单显示字段 |
 | `outsource_company_name` / `process_name` | string? | 公司 / 工序名 |
-| `customer_path` | string? | 客户路径。2026-10-03 起与读侧同一次合并落地：`shipment_out` 改为真算（`part_customer_names` + `join_customer_path`，有 L1 拼 `L1 / L2`、否则仅 L2 名、缺客户为 `null`），不再硬编码 `None` |
+| `customer_path` | string? | 客户路径（`part_customer_names` + `join_customer_path` 真算，有 L1 拼 `L1 / L2`、否则仅 L2 名、缺客户为 `null`），口径与 sent-parts list 一致 |
 
 ### OutsourceInFlightItem 字段（`GET /in-flight` 单行）
 
@@ -199,7 +193,7 @@ WS 广播：本域**无**独立事件（对账是后台核对动作，不驱动�
 
 ## 实现位置
 
-- handler：`src/modules/outsource/handler.rs::list_in_flight` / `reconcile_update_shipment` + `shipment_router()`（`list_in_flight` 与读侧同一次合并落地）
+- handler：`src/modules/outsource/handler.rs::list_in_flight` / `reconcile_update_shipment` + `shipment_router()`
 - service：`src/modules/outsource/service/shipment.rs::OutsourceService::{list_in_flight, reconcile_update_shipment}`（+ 文件内私有 `shipment_out` 拼装）
 - repo：`src/modules/outsource/repo/sql.rs::OutsourceShipmentRepo`（trait 声明在 `repo/mod.rs::OutsourceRepoTrait`）
 - dto：`src/modules/outsource/dto.rs::{OutsourceShipmentReconcileUpdateRequest, OutsourceInFlightListQuery}`
@@ -215,5 +209,4 @@ WS 广播：本域**无**独立事件（对账是后台核对动作，不驱动�
 - `tests/outsource/send_receive.rs`（写入侧 + 对账：整批 / 部分收发、shipment
   `OUTSOURCING → RECEIVED` 记账、部分接收不动 shipment、部分接收 → 整批回收余量
   才关 shipment、reconcile OCC 40901）
-- `tests/outsource/shipment.rs`（in-flight / sent-parts 读侧；**读侧分支文件**，与
-  `GET /in-flight` 同一次合并落地，单分支快照下不存在）
+- `tests/outsource/shipment.rs`（in-flight / sent-parts 读侧）
