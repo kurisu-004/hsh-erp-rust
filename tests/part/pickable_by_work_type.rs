@@ -479,3 +479,392 @@ async fn by_worker_tolerates_null_serial_no() {
     );
     assert_eq!(item["quantity"], 7, "quantity 取自批次: {env}");
 }
+
+// ===========================================================================
+//  2026-10-04：`GET /parts/by-worker/{worker_id}` 的工序链派生
+// ===========================================================================
+//
+// 报工台「放回」页要判定三态，全部依赖本端点行内字段（前端无第二数据源）：
+//
+// | `chain_state` | 含义                                   | 前端动作                        |
+// |---------------|----------------------------------------|---------------------------------|
+// | `NONE`        | 无链 / 链已软删 / 当前工序不在链内       | 弹工序选择框，让用户手填        |
+// | `NEXT`        | 当前工序在链内且有下一道                | 免填，确认后直接放回            |
+// | `TAIL`        | 当前工序是链内最后一道                  | 提示「加工完成后请送检」        |
+//
+// 本节同时锁住批次锚点（`batch_id` / `batch_version`）—— 放回页要发写请求，
+// 拿不到批次 id 就发不出去。
+//
+// ## 链数据怎么造
+// `ProcessChainFixture` 只预置「2 工序 + 2 part + 2 用户」，**不含任何链 / step 行**
+// （见 `test-support/src/fixture/process_chain.rs` 的「当前域」），故链数据在本节
+// 按 DB 约定现场直插：`t_part_process_chain` + `t_process_chain_step`（`sort_order`
+// 稀疏 10/20/30，无物理外键，软删列留 NULL = 活跃）。
+//
+// ## 关键回归点
+// 最后一则 `by_worker_chain_state_repositions_by_current_process_id_not_step_pointer`
+// 锁的是「不能拿 step 指针的 `sort_order` 当位置」：worker-scan 的 RETURNED 只写
+// `current_process_id`、不推进 `current_process_step_id`，多工序链批次第 2 次放回
+// 时指针仍停在**首次定位**那一步，按位置推进会把当前工序自己当成下一道返回。
+
+/// 进程级 snowflake 取号（复用本文件既有 inline 写法，含毒化兜底）。
+fn next_id() -> i64 {
+    pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id()
+}
+
+/// 插一个 INHOUSE 工序（链里有 3 道，而 fixture 只预置 2 道；漂移用例还要第 4 道）。
+async fn insert_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'INHOUSE', 0, false, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(code)
+    .bind(name)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_process");
+    id
+}
+
+/// 建一条空工艺链（不绑 part），返回 chain_id。
+async fn create_chain(pool: &PgPool, name: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+         updated_at, updated_by) VALUES ($1, $2, 0, $3, 0, $3, 0)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_process_chain");
+    id
+}
+
+/// 往链上追加一个 step，返回 step_id。
+async fn add_chain_step(pool: &PgPool, chain_id: i64, process_id: i64, sort_order: i32) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, \
+         estimated_minutes, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, $4, 30, 0, $5, 0, $5, 0)",
+    )
+    .bind(id)
+    .bind(chain_id)
+    .bind(sort_order)
+    .bind(process_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_process_chain_step");
+    id
+}
+
+/// 把 part 绑到指定工艺链（`uq_t_part_process_chain` 要求一条活跃链只绑一个 part，
+/// 故同一测试里只能建一条链绑一个 part）。
+async fn bind_part_to_chain(pool: &PgPool, part_id: i64, chain_id: i64) {
+    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+        .bind(chain_id)
+        .bind(part_id)
+        .execute(pool)
+        .await
+        .expect("bind part to chain");
+}
+
+/// 写批次的链位置两列（`insert_worker_held_batch` 造的批次这两列是 NULL）。
+///
+/// 两列**故意分开**给：worker-scan 的 RETURNED 只写 `current_process_id` 而不推进
+/// `current_process_step_id`，所以「指针漂移 + 工序正确」是生产上真实存在的组合。
+async fn set_batch_position(
+    pool: &PgPool,
+    batch_id: i64,
+    current_process_id: Option<i64>,
+    current_process_step_id: Option<i64>,
+) {
+    sqlx::query(
+        "UPDATE t_part_batch SET current_process_id = $2, current_process_step_id = $3 \
+         WHERE id = $1",
+    )
+    .bind(batch_id)
+    .bind(current_process_id)
+    .bind(current_process_step_id)
+    .execute(pool)
+    .await
+    .expect("update t_part_batch chain position");
+}
+
+/// 打一次 by-worker 列表并按 part id 取出目标行（找不到即 panic 并打印整份信封）。
+async fn by_worker_item(app: &axum::Router, token: &str, worker_id: i64, part_id: i64) -> Value {
+    let uri = format!("/parts/by-worker/{worker_id}");
+    let (status, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(token)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GET {uri}: {env}");
+    assert_eq!(env["code"], 0, "GET {uri}: {env}");
+    item_by_part_id(&env, part_id).clone()
+}
+
+/// 断言「取行 SQL 投影的 `b.id` / `b.version`」已填进出参（2026-10-04 之前恒 null）。
+fn assert_batch_anchor(item: &Value, batch_id: i64) {
+    assert_eq!(
+        item["batch_id"].as_str(),
+        Some(batch_id.to_string().as_str()),
+        "batch_id 必须是雪花 ID 的 JSON string 形态且等于 t_part_batch.id: {item}"
+    );
+    assert_eq!(
+        item["batch_version"], 0,
+        "batch_version 必须等于 t_part_batch.version（insert_worker_held_batch 写死 0）: {item}"
+    );
+    assert_eq!(
+        item["version"], 0,
+        "part 级 version 仍是 0 占位，批次 OCC 只认 batch_version: {item}"
+    );
+}
+
+/// 场景 1（`NONE` · 无链）：`p.process_chain_id IS NULL` ⇒ 前端弹工序选择框。
+///
+/// 同时锁住批次锚点与 `process_chain_id` 投影：三个断言都是 2026-10-04 之前
+/// 恒为「占位值 / null」的字段。
+#[tokio::test]
+async fn by_worker_chain_state_none_when_part_has_no_chain() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-CHAIN-NONE").await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "无链条件",
+        "D-CHAIN-NONE",
+        Some("CHAIN-NONE-001"),
+    )
+    .await;
+    let batch_id = insert_worker_held_batch(&pool, part_id, worker_id, 4).await;
+    // 批次停在工序 A 上，但零件没制定工艺链 ⇒ 锚链解析失败
+    set_batch_position(&pool, batch_id, Some(fx.process_a_id), None).await;
+
+    let item = by_worker_item(&app, &token, worker_id, part_id).await;
+    assert_eq!(item["chain_state"], "NONE", "无链 ⇒ NONE: {item}");
+    assert_eq!(
+        item["chain_next_process_id"].as_str(),
+        Some("0"),
+        "无链时下一道工序是 0 兜底（JSON string \"0\"，不是 null）: {item}"
+    );
+    assert!(
+        item["chain_next_process_name"].is_null(),
+        "NONE 时下一道工序名恒 null: {item}"
+    );
+    assert!(
+        item["chain_current_process_name"].is_null(),
+        "链内定位不成立时当前工序名也解析不出: {item}"
+    );
+    assert!(
+        item["process_chain_id"].is_null(),
+        "process_chain_id 现在取真实投影值（无链 ⇒ null）: {item}"
+    );
+    assert_batch_anchor(&item, batch_id);
+}
+
+/// 场景 2（`NEXT`）：链 = [A(10), B(20), C(30)]，当前工序 = B ⇒ 免填、下一道 = C。
+///
+/// 顺带锁住两个名字字段与 `process_chain_id` 的真实投影。
+#[tokio::test]
+async fn by_worker_chain_state_next_points_to_step_after_current_process() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-CHAIN-NEXT").await;
+    let proc_c = insert_process(&pool, "FX-NC-CHAIN", "链上第三道 NC").await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "链中段件",
+        "D-CHAIN-NEXT",
+        Some("CHAIN-NEXT-001"),
+    )
+    .await;
+    let chain_id = create_chain(&pool, "chain-abc").await;
+    bind_part_to_chain(&pool, part_id, chain_id).await;
+    let _step_a = add_chain_step(&pool, chain_id, fx.process_a_id, 10).await;
+    let step_b = add_chain_step(&pool, chain_id, fx.process_b_id, 20).await;
+    let _step_c = add_chain_step(&pool, chain_id, proc_c, 30).await;
+    let batch_id = insert_worker_held_batch(&pool, part_id, worker_id, 6).await;
+    // 正常形态：step 指针与 current_process_id 同指 B
+    set_batch_position(&pool, batch_id, Some(fx.process_b_id), Some(step_b)).await;
+
+    let item = by_worker_item(&app, &token, worker_id, part_id).await;
+    assert_eq!(item["chain_state"], "NEXT", "链中段 ⇒ NEXT: {item}");
+    assert_eq!(
+        item["chain_next_process_id"].as_str(),
+        Some(proc_c.to_string().as_str()),
+        "下一道必须是 sort_order 30 那道（工序 C）: {item}"
+    );
+    assert_eq!(
+        item["chain_next_process_name"], "链上第三道 NC",
+        "下一道工序名取 t_process.name: {item}"
+    );
+    assert_eq!(
+        item["chain_current_process_name"], "FX 工序 NB",
+        "当前工序名 = 批次 current_process_id 对应的工序名（字面值取自 \
+         test-support/fixtures/production.sql 的 FX-NB 行）: {item}"
+    );
+    assert_eq!(
+        item["process_chain_id"].as_str(),
+        Some(chain_id.to_string().as_str()),
+        "process_chain_id 投影真实链 id: {item}"
+    );
+    assert_batch_anchor(&item, batch_id);
+}
+
+/// 场景 3（`TAIL` · 链尾）：链 = [A, B, C]，当前工序 = C ⇒ 提示「加工完成后请送检」。
+#[tokio::test]
+async fn by_worker_chain_state_tail_when_current_process_is_chain_end() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-CHAIN-TAIL").await;
+    let proc_c = insert_process(&pool, "FX-NC-TAIL", "链尾工序 NC").await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "链尾件",
+        "D-CHAIN-TAIL",
+        Some("CHAIN-TAIL-001"),
+    )
+    .await;
+    let chain_id = create_chain(&pool, "chain-abc").await;
+    bind_part_to_chain(&pool, part_id, chain_id).await;
+    add_chain_step(&pool, chain_id, fx.process_a_id, 10).await;
+    add_chain_step(&pool, chain_id, fx.process_b_id, 20).await;
+    let step_c = add_chain_step(&pool, chain_id, proc_c, 30).await;
+    let batch_id = insert_worker_held_batch(&pool, part_id, worker_id, 5).await;
+    set_batch_position(&pool, batch_id, Some(proc_c), Some(step_c)).await;
+
+    let item = by_worker_item(&app, &token, worker_id, part_id).await;
+    assert_eq!(item["chain_state"], "TAIL", "链尾 ⇒ TAIL: {item}");
+    assert_eq!(
+        item["chain_next_process_id"].as_str(),
+        Some("0"),
+        "链尾没有下一道 ⇒ 0 兜底: {item}"
+    );
+    assert!(
+        item["chain_next_process_name"].is_null(),
+        "TAIL 时下一道工序名恒 null: {item}"
+    );
+    assert_eq!(
+        item["chain_current_process_name"], "链尾工序 NC",
+        "TAIL 提示要能点名当前工序: {item}"
+    );
+    assert_batch_anchor(&item, batch_id);
+}
+
+/// 场景 4（`NONE` · 位置漂移）：链 = [A, B, C]，当前工序 = **链外的 D**。
+///
+/// 链本身可解析、step 指针也合法（指向 A），但「当前工序在链内的位置」定位失败
+/// ⇒ 必须落 `NONE` 让用户手填，而不是退化成「按 A 的位置给 B」。
+#[tokio::test]
+async fn by_worker_chain_state_none_when_current_process_not_in_chain() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-CHAIN-DRIFT").await;
+    let proc_c = insert_process(&pool, "FX-NC-DRIFT", "链上第三道 NC").await;
+    let proc_d = insert_process(&pool, "FX-ND-DRIFT", "链外工序 ND").await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "位置漂移件",
+        "D-CHAIN-DRIFT",
+        Some("CH-DRIFT-1"),
+    )
+    .await;
+    let chain_id = create_chain(&pool, "chain-abc").await;
+    bind_part_to_chain(&pool, part_id, chain_id).await;
+    let step_a = add_chain_step(&pool, chain_id, fx.process_a_id, 10).await;
+    add_chain_step(&pool, chain_id, fx.process_b_id, 20).await;
+    add_chain_step(&pool, chain_id, proc_c, 30).await;
+    let batch_id = insert_worker_held_batch(&pool, part_id, worker_id, 3).await;
+    // 指针合法（指向 A），但 current_process_id 是链外的 D
+    set_batch_position(&pool, batch_id, Some(proc_d), Some(step_a)).await;
+
+    let item = by_worker_item(&app, &token, worker_id, part_id).await;
+    assert_eq!(
+        item["chain_state"], "NONE",
+        "当前工序不在链内 ⇒ NONE（不能退化成按 step 指针位置给下一道）: {item}"
+    );
+    assert_eq!(
+        item["chain_next_process_id"].as_str(),
+        Some("0"),
+        "NONE 时下一道工序是 0 兜底: {item}"
+    );
+    assert!(
+        item["chain_next_process_name"].is_null(),
+        "NONE 时下一道工序名恒 null: {item}"
+    );
+    assert_batch_anchor(&item, batch_id);
+}
+
+/// 场景 5（**核心回归**）：step 指针漂移但 `current_process_id` 正确时，
+/// 下一道必须按 `current_process_id` 在链内重新定位。
+///
+/// 前置：链 = [A(10), B(20), C(30)]；`current_process_step_id` 仍指向 **A** 的 step，
+/// `current_process_id = B`。这正是 worker-scan RETURNED 之后的形态（该分支只写
+/// `current_process_id = next_process_id`、不推进 step 指针）。
+///
+/// 期望：`NEXT` + 下一道 = **C**。若实现改成拿 step 指针的 `sort_order` 当位置，
+/// 会得到 sort 20 那道 = **B 自己**（即当前工序），前端仍在说「可免填」⇒ 静默把
+/// 工件投回原工序。断言里额外 `assert_ne` 显式锁死这一点。
+#[tokio::test]
+async fn by_worker_chain_state_repositions_by_current_process_id_not_step_pointer() {
+    let (pool, app, token, fx) = bootstrap().await;
+    let worker_id = insert_active_worker(&pool, fx.work_type_a_id, "WK-CHAIN-REPOINT").await;
+    let proc_c = insert_process(&pool, "FX-NC-REPOINT", "真正下一道 NC").await;
+    let part_id = insert_part(
+        &pool,
+        fx.part_customer_l1_id,
+        "指针漂移件",
+        "D-CHAIN-REPOINT",
+        Some("CH-REPOINT-1"),
+    )
+    .await;
+    let chain_id = create_chain(&pool, "chain-abc").await;
+    bind_part_to_chain(&pool, part_id, chain_id).await;
+    let step_a = add_chain_step(&pool, chain_id, fx.process_a_id, 10).await;
+    add_chain_step(&pool, chain_id, fx.process_b_id, 20).await;
+    add_chain_step(&pool, chain_id, proc_c, 30).await;
+    let batch_id = insert_worker_held_batch(&pool, part_id, worker_id, 8).await;
+    // ⚠️ 指针停在 A（sort 10），工序却是 B ⇒ 按 sort_order 推进会返回 B 自己
+    set_batch_position(&pool, batch_id, Some(fx.process_b_id), Some(step_a)).await;
+
+    let item = by_worker_item(&app, &token, worker_id, part_id).await;
+    assert_eq!(
+        item["chain_state"], "NEXT",
+        "current_process_id=B 在链内且有下一道 ⇒ NEXT: {item}"
+    );
+    assert_eq!(
+        item["chain_next_process_id"].as_str(),
+        Some(proc_c.to_string().as_str()),
+        "必须按 current_process_id=B 在链内定位后取 sort 30（工序 C）: {item}"
+    );
+    assert_ne!(
+        item["chain_next_process_id"].as_str(),
+        Some(fx.process_b_id.to_string().as_str()),
+        "绝不能把当前工序自己（B）当成下一道返回: {item}"
+    );
+    assert_eq!(
+        item["chain_next_process_name"], "真正下一道 NC",
+        "下一道工序名与 id 同行: {item}"
+    );
+    assert_batch_anchor(&item, batch_id);
+}
