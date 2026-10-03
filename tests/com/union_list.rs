@@ -81,7 +81,6 @@ async fn insert_part(
 ///
 /// 与 [`insert_part`] 的唯一差别是 `quantity` 列（前者恒为 1）；`insert_part` 本身
 /// 转调本函数，故既有调用点不受影响。
-#[allow(clippy::too_many_arguments)]
 async fn insert_part_with_quantity(
     pool: &PgPool,
     name: &str,

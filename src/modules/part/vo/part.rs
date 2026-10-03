@@ -231,8 +231,10 @@ pub struct PartListItem {
     /// - ASSEMBLY 行 = 可凑齐的套数
     ///   `MIN(子件已送件数 × 装配件套数 / 子件总量)`，PG 整数除法截断；
     ///   子件总量为 0 者不参与，无子件为 0。
-    /// - 仅 `GET /api/v2/com/union-list` 与 `GET /api/v2/parts` 填，其余复用本 VO
-    ///   的 4 个端点恒 `null`。
+    /// - 仅 `GET /api/v2/com/union-list`（三种 `row_type` 模式）与
+    ///   `GET /api/v2/parts` 填；其余复用本 VO 的 **5 处返回点**恒 `null`
+    ///   （4 个列表端点 + `POST /assemblies/{id}/children` 返回的单对象
+    ///   `R<PartListItem>`，走 `From<TPart>` 从不覆写）。
     ///
     /// 已知取舍：软删子件不参与装配套数聚合（与 `child_count` 同口径），因此软删一个
     /// 已部分交付的子件会让父装配件的已送套数下降。

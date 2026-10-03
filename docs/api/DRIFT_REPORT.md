@@ -176,6 +176,22 @@ POST /worker-scan                           ✓ docs/parts/inspection
 - 历史不一致记录，非 API 文档
 - 可能需加一条新条目："2026-09-23 drift 扫描后尚未修复的 drift 列表见 DRIFT_REPORT.md"
 
+### 2.8 parts/crud.md 的 `row_type` 行类型模式（2026-10-03 登记，待清）
+
+[`./parts/crud.md`](./parts/crud.md) 的「行类型合并规则」一节（6 行模式表 +「All 模式实现要点」+「SORT 键交互」+ 默认走 All 模式的备注）在描述**已不存在的能力**：
+
+- `PartListQuery`（`part/dto_crud.rs`）**已无** `row_type` / `include_assemblies` 字段，
+  二者随 ALL 模式退役一并从 query DTO 移除；
+- `part/service/crud.rs` 的 list 路径**硬编码** `part_only: true`，`GET /parts` 只有
+  单一 PART-only 形态，不存在「Part / Assembly / All」三选一。
+
+现行能力与字段口径见 [`./parts/index.md`](./parts/index.md) 与
+[`./com-union-list.md`](./com-union-list.md)（`row_type` 混合列表已迁往
+`GET /api/v2/com/union-list`）。
+
+**待办**（独立清理 commit，不与字段新增类改动混提）：把该节从 part 域 CRUD 页清走，
+删后需确认 `docs/api/` 内的目录锚点与目录页引用不悬空。
+
 ---
 
 ## 3. 修复优先级（按 ROI 排序）

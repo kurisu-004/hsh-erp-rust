@@ -1,7 +1,7 @@
 //! part 列表派生层（2026-09-22 review 第 2 轮从 `crud.rs` 抽出）
 //!
-//! 本文件承载两族「一次性批量聚合」helper，都是列表行上的派生值、都与页大小 N
-//! 无关（防 N+1），且被 `part::service::crud`（`GET /parts`）与
+//! 本文件承载两族「一次性批量聚合」helper，都是列表行上的派生值、都以单条聚合
+//! SQL 完成（防 N+1 往返），且被 `part::service::crud`（`GET /parts`）与
 //! `com::union_list::service::crud`（`GET /api/v2/com/union-list` 三种 row_type
 //! 模式）共同消费，故统一放 part 域、`pub(crate)` 供跨域 import：
 //!
@@ -189,7 +189,9 @@ pub(crate) async fn enrich_part_list_with_location_and_holder<R: PartRepoTrait>(
 /// 空 ids → 返回空 HashMap（不发起 SQL）。caller 侧用 `.copied().unwrap_or(0)`
 /// 兜底零批次行。
 ///
-/// SQL 数：1 条，与页大小 N 无关。
+/// SQL 条数：1 条，与页大小 N 无关（防 N+1 往返）；但**扫描量是 O(本页零件的批次
+/// 总数)**，走 `ix_t_part_batch_part_id` 索引探测。不改写成 CTE hash 聚合
+/// —— 收益不可测、风险大于收益。
 pub(crate) async fn fetch_delivered_quantities(
     conn: &mut PgConnection,
     part_ids: &[i64],
