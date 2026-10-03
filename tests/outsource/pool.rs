@@ -27,10 +27,9 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use hsh_erp_rust::infra::clock::now_naive;
-use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
-    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app, test_pool,
-    test_state,
+    OutsourceFixture, json_request, load_outsource_fixture, login_token, pool_snowflake, send,
+    test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -57,8 +56,15 @@ async fn bootstrap_as_clerk() -> (PgPool, axum::Router, String, OutsourceFixture
 //  pool 域独享 helpers（直插 `sqlx::query`；与 sendable.rs / send_receive.rs 同形）
 // ===========================================================================
 
+/// 取一个测试用雪花 ID。
+///
+/// 走 `test-support::pool_snowflake()`（**进程级** `OnceLock<Mutex<..>>`，instance
+/// 由 pid ⊕ 启动时间派生）而不是每次 `SnowflakeIdGenerator::new(...)` 新建 ——
+/// 新建的话同一毫秒内连续两次调用会生成**完全相同**的 id（`instance=1` + 同一
+/// 时间戳 + seq 都从 0 开始），撞 `t_*_pkey`。本文件建公司的间隔只有一次
+/// await，实测能在同一毫秒内跑到两次。
 fn next_id() -> i64 {
-    SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id()
+    pool_snowflake().lock().expect("pool_snowflake").next_id()
 }
 
 /// 直插 L1 客户。
