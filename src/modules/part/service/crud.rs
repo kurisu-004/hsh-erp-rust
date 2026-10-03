@@ -45,7 +45,9 @@ use crate::shared::error::{AppError, code};
 use crate::state::AppState;
 
 use super::PartService;
-use super::list_enrichment::enrich_part_list_with_location_and_holder;
+use super::list_enrichment::{
+    enrich_part_list_with_location_and_holder, fetch_delivered_quantities,
+};
 use crate::modules::part::dto_crud::{
     PartBatchCreateRequest, PartCreateRequest, PartListQuery, PartUpdateRequest,
 };
@@ -280,6 +282,10 @@ impl PartService {
         let part_ids: Vec<i64> = rows.iter().map(|p| p.id).collect();
         let batch_enrichment =
             enrich_part_list_with_location_and_holder(&mut repo, &part_ids).await?;
+        // 2026-10-03 新增：已送数量。独立聚合查询（不复用上一行的 batch
+        // enrichment —— 它的返回形态是「min-progress 目标批次的 location/holder」，
+        // 既不暴露批次明细、返回类型也放不下 quantity 之和）。
+        let delivered_quantities = fetch_delivered_quantities(repo.conn_mut(), &part_ids).await?;
 
         let mut items = Vec::with_capacity(rows.len());
         for p in rows {
@@ -292,6 +298,9 @@ impl PartService {
             item.l1_customer_name = l1cn;
             item.location = loc;
             item.holder_name = holder;
+            // 2026-10-03 新增：已送数量（零批次 → 0，键恒存在）。
+            item.delivered_quantity =
+                Some(delivered_quantities.get(&item.id).copied().unwrap_or(0));
             items.push(item);
         }
         Ok(PartListOut {

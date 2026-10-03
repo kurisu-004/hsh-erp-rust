@@ -1,4 +1,14 @@
-//! part 列表「位置 / 持有人」派生层（2026-09-22 review 第 2 轮从 `crud.rs` 抽出）
+//! part 列表派生层（2026-09-22 review 第 2 轮从 `crud.rs` 抽出）
+//!
+//! 本文件承载两族「一次性批量聚合」helper，都是列表行上的派生值、都与页大小 N
+//! 无关（防 N+1），且被 `part::service::crud`（`GET /parts`）与
+//! `com::union_list::service::crud`（`GET /api/v2/com/union-list` 三种 row_type
+//! 模式）共同消费，故统一放 part 域、`pub(crate)` 供跨域 import：
+//!
+//! 1. 「位置 / 持有人」（2026-09-16 PR-2 瘦身后新增，见下）：按 min-progress
+//!    活跃批次跨 `t_shelf` / `t_worker` / `t_outsource_company` 解析。
+//! 2. 「已送数量」（2026-10-03 新增）：PART 行取已交批次 `quantity` 之和，
+//!    ASSEMBLY 行取可凑齐的套数（min 公式）。
 //!
 //! 2026-09-16 PR-2 瘦身（migration 027）：t_part 删 `location` /
 //! `current_holder_id`（已删列），列表页需要的「位置 / 持有人」展示由
@@ -10,6 +20,8 @@
 //! `&mut PgConnection` 与其它域一致）。
 
 use std::collections::{HashMap, HashSet};
+
+use sqlx::PgConnection;
 
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::prod::batch::model::TPartBatch;
@@ -163,6 +175,95 @@ pub(crate) async fn enrich_part_list_with_location_and_holder<R: PartRepoTrait>(
                 _ => None,
             });
         out.insert(part_id, (location, holder_name));
+    }
+    Ok(out)
+}
+
+/// 一批 part 的「已送数量」：未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')`
+/// 的 `quantity` 之和。
+///
+/// 真相源是 `t_part_batch.status`（批次级「已交」的唯一依据，**不**从派生缓存
+/// `t_part.status` 反推 —— 后者在 min-progress 规则下只有全部活跃批次都 DELIVERED
+/// 才等于 DELIVERED，会把「部分已交」一律压成 0）。
+///
+/// 空 ids → 返回空 HashMap（不发起 SQL）。caller 侧用 `.copied().unwrap_or(0)`
+/// 兜底零批次行。
+///
+/// SQL 数：1 条，与页大小 N 无关。
+pub(crate) async fn fetch_delivered_quantities(
+    conn: &mut PgConnection,
+    part_ids: &[i64],
+) -> Result<HashMap<i64, i32>, AppError> {
+    let mut out: HashMap<i64, i32> = HashMap::new();
+    if part_ids.is_empty() {
+        return Ok(out);
+    }
+    // `::int` cast 不可省：PG 的 `SUM(int4)` 返回 int8，直接绑 i32 解码会报类型不匹配
+    // （整页 500）。`COALESCE(..., 0)` 不可省：空集合 SUM 返 NULL。
+    // status 字面量全大写 —— `t_part_batch.status` 是 varchar（非 DB enum）。
+    let rows: Vec<(i64, i32)> = sqlx::query_as(
+        "SELECT part_id, COALESCE(SUM(quantity), 0)::int \
+         FROM t_part_batch \
+         WHERE part_id = ANY($1) AND deleted_at IS NULL \
+           AND status IN ('DELIVERED', 'COMPLETED') \
+         GROUP BY part_id",
+    )
+    .bind(part_ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (part_id, qty) in rows {
+        out.insert(part_id, qty);
+    }
+    Ok(out)
+}
+
+/// 一批装配件的「已送套数」：能凑齐几套。
+///
+/// 口径：每套需要的子零件数 = `子件总量 / 套数`（用户在「新建装配件」时指定装配件
+/// 套数与每个子零件的总数）。故某子件能支撑的套数 =
+/// `子件已送件数 × 装配件套数 / 子件总量`，父装配件的可交套数取所有子件的 **min**
+/// （PG 整数除法截断，凑不满整套就按 0 记）。
+///
+/// 边界处理：
+/// - `COALESCE(SUM(...), 0)` 不可省 —— 未交任何批次的子件若贡献 NULL 会被 `MIN` 忽略，
+///   那样「子件 A 交一半、子件 B 一件没交」会误判成 A 能撑的套数；
+/// - `NULLIF(子件总量, 0)` —— 总量为 0 的子件让该项为 NULL 从而被 `MIN` 忽略
+///   （不参与），既不整除零出错也不拖累 min；
+/// - 外层 `COALESCE(..., 0)` 兜底 —— 无子件 / 子件总量全为 0 时 `MIN` 为 NULL。
+///
+/// 无子件的装配件不产生结果行（SQL 以子件表为驱动表），caller 侧
+/// `.copied().unwrap_or(0)` 兜 0。
+///
+/// SQL 数：1 条，与页大小 N 无关。
+pub(crate) async fn fetch_delivered_sets(
+    conn: &mut PgConnection,
+    asm_ids: &[i64],
+) -> Result<HashMap<i64, i32>, AppError> {
+    let mut out: HashMap<i64, i32> = HashMap::new();
+    if asm_ids.is_empty() {
+        return Ok(out);
+    }
+    // 以 `t_part`（子件）为驱动表走 `ix_t_part_assembly_id_status`，每个子件的已送量
+    // 是相关标量子查询（走 `ix_t_part_batch_part_id` 位图扫），因此整段仍只 1 条 SQL。
+    // `GROUP BY c.assembly_id, a.quantity`：套数是表达式的一部分，必须进 GROUP BY。
+    let rows: Vec<(i64, i32)> = sqlx::query_as(
+        "SELECT c.assembly_id, \
+                COALESCE(MIN( \
+                    (COALESCE((SELECT SUM(b.quantity) FROM t_part_batch b \
+                               WHERE b.part_id = c.id AND b.deleted_at IS NULL \
+                                 AND b.status IN ('DELIVERED', 'COMPLETED')), 0) \
+                     * a.quantity) / NULLIF(c.quantity, 0) \
+                ), 0)::int AS delivered_sets \
+         FROM t_part c \
+         JOIN t_assembly a ON a.id = c.assembly_id AND a.deleted_at IS NULL \
+         WHERE c.assembly_id = ANY($1) AND c.deleted_at IS NULL \
+         GROUP BY c.assembly_id, a.quantity",
+    )
+    .bind(asm_ids)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (asm_id, sets) in rows {
+        out.insert(asm_id, sets);
     }
     Ok(out)
 }
