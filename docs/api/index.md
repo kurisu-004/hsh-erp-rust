@@ -15,9 +15,10 @@
 > - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（8 端点：装配体 CRUD + multipart PDF + 子件自动生成 + start + 子件 auto-rollup，2026-09-14 Phase 3）
 > - [`./cnc-programs.md`](./cnc-programs.md) — cnc_program 域（2 端点：配对上传 + 列表，2026-09-14 Phase 3）
 > - [`./files.md`](./files.md) — part_file 域（multipart 上传 + 列表 + 下载 URL + confirm 绑定，2026-09-14 Phase 3；2026-09-18 删除 upload-intents；2026-09-28 删除相关 STS 会话域，前端改为单 uploader + python `sts-tmp-keys` 数组入参直签）
-> - [`./outsource-companies.md`](./outsource-companies.md) — 外协公司（7 端点，2026-09-13 Phase 2）
-> - [`./outsource-quotes.md`](./outsource-quotes.md) — 外协报价（8 端点，2026-09-13 Phase 2）
-> - [`./outsource-shipments.md`](./outsource-shipments.md) — 外协发货对账（**2 端点**：reconcile-update，2026-09-13 Phase 2 + 2026-10-03 补 `GET /in-flight` 在途一览；旧路径 `/parts/outsource-in-flight` 已下线且无 alias，命中 part 域 `/{part_id}` catch-all → **400**）
+> - [`./outsource-companies.md`](./outsource-companies.md) — 外协公司（**8 端点**，2026-09-13 Phase 2 + 2026-10-03 补 `sent-parts` 对账页读侧）
+> - [`./outsource-quotes.md`](./outsource-quotes.md) — 外协报价（**9 端点**，2026-09-13 Phase 2 + 2026-10-03 补 `quotable-parts` picker）
+> - [`./outsource-shipments.md`](./outsource-shipments.md) — 外协发货对账（**2 端点**，2026-09-13 Phase 2 的 reconcile-update + 2026-10-03 补 `GET /in-flight` 在途一览）
+> - [`./outsource-sendable.md`](./outsource-sendable.md) — 可发送外协一览（**1 端点**，**2026-10-03 新增**；独立顶层前缀 `/api/v2/outsource-sendable`，取代形状不匹配的 `/parts/outsource-sendable`）
 > - [`./delivery-notes/index.md`](./delivery-notes/index.md) — delivery_notes 域（已拆为子目录：[queries](./delivery-notes/queries.md) / [drafts](./delivery-notes/drafts.md) / [workflow](./delivery-notes/workflow.md) / [print](./delivery-notes/print.md)）
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
 > - [`./_e2e.md`](./_e2e.md) — e2e seed hook（11 端点；dev/test 默认启用，release profile 硬关，2026-09-14）
@@ -206,14 +207,15 @@ HTTP 状态码：
 | shelves | [`./shelves.md`](./shelves.md) | 7 | ✅ 完全上线（CRUD + picker，2026-08-26；**2026-10-02 域拆分：端点 10 → 7（文档原写 11，逐 router 复核实为 10）—— 3 个货架↔工序映射端点搬到 [`production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)（prod 域，无 alias）；货架↔账号部分**消除**（`ShelfOut.account_count` 删除，绑定真源在 iam `t_user_role`，零 iam 改动）**） |
 | workers（已并入 prod） | [`./production/workers.md`](./production/workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文档从顶层迁入 `production/`） |
 | **生产管理** | [`./production/index.md`](./production/index.md) | **60** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池 + 工人档案 + 待下发批次 + 待编程一览；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步；2026-10-01 增 `prod::programming` 待编程一览 1 端点；**2026-10-02 增 `prod::shelf_process` 货架↔工序映射 3 端点，自 shelves 域搬入；2026-10-02 增 `t_part_batch` 子资源 25 端点，自 part 域搬入**） |
-| part | [`./parts/index.md`](./parts/index.md) | **25**（2026-10-02 域收窄：50 → 25，25 条 batch 子资源迁出） | ✅ 完全上线（2026-10-01 `t_part_batch.status` 收口为 `status_gate` 单一写入口；**2026-10-02：25 条 batch 子资源迁 prod 域，part 域只留多批次动作（`/{part_id}/cancel` / `force-complete`）与非批次动作**） |
+| part | [`./parts/index.md`](./parts/index.md) | **24**（**method 级**注册数：`GET /` 与 `POST /` 记 2 条） | ✅ 完全上线（2026-10-01 `t_part_batch.status` 收口为 `status_gate` 单一写入口；**2026-10-02：25 条 batch 子资源迁 prod 域，part 域只留多批次动作（`/{part_id}/cancel` / `force-complete`）与非批次动作**；**2026-10-03：2 条错形状的外协 list 端点下线并迁往 outsource 域，25 → 24**。口径与逐 commit 复核链见 [`./inconsistencies.md`](./inconsistencies.md) § 2 —— 此前各文档里的 25 / 48 / 49 / 50 都是 `.route()` **调用数**，漏掉 `route("/")` 上的第 2 个 method） |
 | admin（对账） | [`./admin.md`](./admin.md) | 1 | ✅ 完全上线（2026-10-01 新增 `POST /api/v2/admin/recompute-rollup`；Manager 单角色；**复用**既有 rollup 实现，不新增派生算法） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
 | part-files | [`./files.md`](./files.md) | 4 | ✅ 完全上线（2026-09-14，Phase 3；2026-09-18 删除 upload-intents → 改由相关 STS 会话域承载 STS 共享机制；2026-09-28 进一步下线相关会话域，前端改单 uploader + python sts-tmp-keys 数组入参直签） |
-| outsource-companies | [`./outsource-companies.md`](./outsource-companies.md) | 7 | ✅ 完全上线（2026-09-14，Phase 2） |
-| outsource-quotes | [`./outsource-quotes.md`](./outsource-quotes.md) | 8 | ✅ 完全上线（2026-09-14，Phase 2） |
-| outsource-shipments | [`./outsource-shipments.md`](./outsource-shipments.md) | 2 | ✅ 完全上线（2026-09-14，Phase 2；2026-10-03 补 `GET /in-flight` 在途一览 —— 与本仓的 reconcile-update 写端点**在同一次合并中落地**，单分支快照下不可用；旧路径 `/parts/outsource-in-flight` 无 alias，命中 part 域 `/{part_id}` catch-all（matchit 静态优先、参数兜底）→ **400** 而非 404） |
+| outsource-companies | [`./outsource-companies.md`](./outsource-companies.md) | 8 | ✅ 完全上线（2026-09-14，Phase 2；2026-10-03 补 `GET /{id}/sent-parts`） |
+| outsource-quotes | [`./outsource-quotes.md`](./outsource-quotes.md) | 9 | ✅ 完全上线（2026-09-14，Phase 2；2026-10-03 补 `GET /quotable-parts`） |
+| outsource-shipments | [`./outsource-shipments.md`](./outsource-shipments.md) | 2 | ✅ 完全上线（2026-09-14，Phase 2 的 reconcile-update；2026-10-03 补 `GET /in-flight` 在途一览 —— 取代 part 域旧 `/parts/outsource-in-flight`，**硬切无 alias**；旧路径实际返回 **400 而非 404**，成因与取舍同 outsource-sendable 行） |
+| outsource-sendable | [`./outsource-sendable.md`](./outsource-sendable.md) | 1 | ✅ 完全上线（2026-10-03；取代 `/parts/outsource-sendable`，**硬切无 alias**。旧路径实际返回 **400 而非 404**：part 域 `GET /{part_id}` 的 `Path<i64>` catch-all 兜住任何未注册的 1 段静态路径（matchit 静态段优先、参数段兜底），再由 `Path` extractor 拒绝非数字段 → axum `ErrorKind::ParseError` → 400。取舍：400 无法区分「端点被删」与「端点从不存在」，比 404 不泄露「此路径曾存在」，故不改跨域路由语义。成因与逐条清单见 [`./inconsistencies.md`](./inconsistencies.md) § 9.2） |
 | delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | _e2e | [`./_e2e.md`](./_e2e.md) | 11 | ✅ 完全上线（2026-09-14，e2e seed hook，dev/test profile） |

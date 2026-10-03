@@ -9,6 +9,9 @@
 //! - approve_quote     — SUBMITTED → APPROVED（MANAGER-only；自动 reject 竞争报价）
 //! - reject_quote      — SUBMITTED → REJECTED（review_note 必填；MANAGER-only）
 //! - soft_delete_quote — 软删（DRAFT / REJECTED 状态才允许）
+//! - list_quotable_parts   — 2026-10-03 新增：报价 picker（可建报价的
+//!   零件 × OUTSOURCE 工序 组合）。此前路由未注册，被 `quote_router` 的
+//!   `/{id}`（`Path<i64>`）吞掉 → `PathRejection` → 恒 400。
 //!
 //! ## 事务边界（2026-09-22 refactor 对齐 iam 范本）
 //! 事务移交 handler：service 仅业务逻辑，所有跨 repo 操作经 `repo: R`
@@ -16,7 +19,8 @@
 //! `&mut *conn` 喂给 `OutsourceRepoTrait` trait（trait 已直接 `impl for &mut PgConnection`）。
 //! service 不知事务——handler `pool.begin()` + `tx.commit()` 包外。
 //!
-//! impl 块直接挂在 `OutsourceService` 上（与 mod.rs / company.rs / shipment.rs 共同 impl）。
+//! impl 块直接挂在 `OutsourceService` 上（与 mod.rs / company.rs / shipment.rs /
+//! sendable.rs 共同 impl）。
 //!
 //! ## helper 测试
 //! 承接原 `service.rs::mod tests` 中 quote 子域用到的 2 个 helper 测试：
@@ -26,19 +30,23 @@ use std::collections::HashMap;
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::outsource::dto::{
-    OutsourceQuoteCreateRequest, OutsourceQuoteListQuery, OutsourceQuoteUpdateRequest,
+    OutsourceQuotablePartListQuery, OutsourceQuoteCreateRequest, OutsourceQuoteListQuery,
+    OutsourceQuoteUpdateRequest,
 };
 use crate::modules::outsource::model::{
     NewOutsourceQuote, NewOutsourceQuoteEvent, TOutsourceQuote,
 };
 use crate::modules::outsource::repo::OutsourceRepoTrait;
 use crate::modules::outsource::statemachine::OutsourceQuoteStatus;
-use crate::modules::outsource::vo::{OutsourceQuoteListOut, OutsourceQuoteOut};
+use crate::modules::outsource::vo::{
+    OutsourceQuoteListOut, OutsourceQuoteOut, QuotablePartListOut, QuotablePartOut,
+};
 use crate::shared::error::{AppError, code};
 
 use super::{
-    DEFAULT_LIMIT, MAX_LIMIT, OutsourceService, current_id_to_snowflake, format_price,
-    not_found_company, not_found_quote, parse_price, parse_snowflake_id, version_conflict,
+    DEFAULT_LIMIT, LIST_MAX_LIMIT, MAX_LIMIT, OutsourceService, current_id_to_snowflake,
+    format_price, join_customer_path, keyword_pattern, not_found_company, not_found_quote,
+    parse_price, parse_snowflake_id, version_conflict,
 };
 
 /// quote_out_many：批量拼装 `OutsourceQuoteOut`（part/company/process 名称补全）。
@@ -53,10 +61,21 @@ async fn quote_out_many<R: OutsourceRepoTrait>(
     let company_ids: Vec<i64> = quotes.iter().map(|q| q.outsource_company_id).collect();
     let process_ids: Vec<i64> = quotes.iter().map(|q| q.process_id).collect();
 
-    let part_map: HashMap<i64, (Option<String>, String, String, bool, Option<String>)> = {
+    let part_map: HashMap<
+        i64,
+        (
+            Option<String>,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+    > = {
         let rows = repo.part_map_for_quote(&part_ids).await?;
         rows.into_iter()
-            .map(|r| (r.0, (r.1, r.2, r.3, r.4, r.5)))
+            .map(|r| (r.0, (r.1, r.2, r.3, r.4, r.5, r.6, r.7)))
             .collect()
     };
     let company_map: HashMap<i64, String> = {
@@ -70,10 +89,10 @@ async fn quote_out_many<R: OutsourceRepoTrait>(
 
     let mut out = Vec::with_capacity(quotes.len());
     for q in quotes {
-        let (serial, drawing, name, urgent, unit_price) = part_map
+        let (serial, drawing, name, urgent, unit_price, cust_l2, cust_l1) = part_map
             .get(&q.part_id)
             .cloned()
-            .unwrap_or_else(|| (None, String::new(), String::new(), false, None));
+            .unwrap_or_else(|| (None, String::new(), String::new(), false, None, None, None));
         let company_name = company_map.get(&q.outsource_company_id).cloned();
         let (proc_code, proc_name) = process_map
             .get(&q.process_id)
@@ -99,7 +118,8 @@ async fn quote_out_many<R: OutsourceRepoTrait>(
             outsource_company_name: company_name,
             process_code: Some(proc_code),
             process_name: Some(proc_name),
-            customer_path: None,
+            // 2026-10-03 新增：此前硬编码 `None` → 前端报价一览「客户」列恒 `—`
+            customer_path: join_customer_path(cust_l1.as_deref(), cust_l2.as_deref()),
             part_unit_price: unit_price,
             is_urgent: urgent,
         });
@@ -166,6 +186,24 @@ impl OutsourceService {
                 offset,
             });
         }
+        // 2026-10-03：给了 keyword 却零命中时必须早返回。SQL 谓词
+        // `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 里，空数组
+        // 让 `cardinality = 0` 成立、整个 keyword 条件被短路掉；不在这兜住，
+        // 「不存在的关键词」会返回全量报价。SQL 谓词保持不变 —— 无 keyword 时
+        // `cardinality = 0` 正是「不过滤」的正确表达。
+        let kw_given = query
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if kw_given && part_ids_in.is_empty() {
+            return Ok(OutsourceQuoteListOut {
+                items: vec![],
+                total: 0,
+                limit,
+                offset,
+            });
+        }
         let part_id: Option<i64> =
             if let Some(s) = query.part_id.as_deref().filter(|s| !s.is_empty()) {
                 Some(
@@ -210,6 +248,56 @@ impl OutsourceService {
             .await?;
         let items = quote_out_many(&mut repo, rows).await?;
         Ok(OutsourceQuoteListOut {
+            items,
+            total,
+            limit,
+            offset,
+        })
+    }
+
+    /// `GET /outsource-quotes/quotable-parts`（2026-10-03 新增）
+    ///
+    /// 返回「可以给它建外协报价」的 (零件, OUTSOURCE 工序) 组合，**一行 = 一个组合**。
+    /// 筛选与去重的口径全部落在 repo SQL（`OutsourceQuotableRepo`），service 只做
+    /// 参数归一化 + VO 组装。
+    pub async fn list_quotable_parts<R: OutsourceRepoTrait>(
+        &self,
+        mut repo: R,
+        query: &OutsourceQuotablePartListQuery,
+        current: &CurrentUser,
+    ) -> Result<QuotablePartListOut, AppError> {
+        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        let offset = query.offset.unwrap_or(0).max(0);
+        let pat = keyword_pattern(query.keyword.as_deref());
+
+        let rows = repo.quotable_list(pat.as_deref(), limit, offset).await?;
+        let total = repo.quotable_count(pat.as_deref()).await?;
+
+        let items = rows
+            .into_iter()
+            .map(|r| QuotablePartOut {
+                id: r.id,
+                serial_no: r.serial_no,
+                drawing_no: r.drawing_no,
+                name: r.name,
+                is_urgent: r.is_urgent,
+                unit_price: r.unit_price,
+                customer_id: r.customer_id,
+                customer_name: r.customer_name.clone(),
+                l1_customer_name: r.parent_customer_name.clone(),
+                customer_path: join_customer_path(
+                    r.parent_customer_name.as_deref(),
+                    r.customer_name.as_deref(),
+                ),
+                shelf_id: r.shelf_id,
+                shelf_code: r.shelf_code,
+                next_process_id: r.next_process_id,
+                next_process_name: r.next_process_name,
+            })
+            .collect();
+
+        Ok(QuotablePartListOut {
             items,
             total,
             limit,

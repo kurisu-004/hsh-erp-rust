@@ -10,6 +10,7 @@
 //! 本文件仅保留 `Deserialize` 入参；出参类型（`Out` / `ListOut`）已抽离到
 //! `super::vo`，handler 入口需改 `use crate::modules::outsource::vo::*`。
 
+use chrono::NaiveDateTime;
 use serde::Deserialize;
 
 // ===========================================================================
@@ -135,6 +136,21 @@ pub struct OutsourceQuoteListQuery {
     pub offset: Option<i64>,
 }
 
+/// 可建报价的（零件 × OUTSOURCE 工序）组合列表查询参数。
+///
+/// 2026-10-03 新增：前端报价一览页 + 「新建报价」零件 picker 的读侧契约
+/// （此前路由未注册，请求被 `/{id}`（`Path<i64>`）吞掉恒返 400）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OutsourceQuotablePartListQuery {
+    /// drawing_no / name ILIKE 模糊匹配（与 `part_keyword_search` 同语义）。
+    #[serde(default)]
+    pub keyword: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
 // ===========================================================================
 // 入参 — Shipment
 // ===========================================================================
@@ -151,13 +167,71 @@ pub struct OutsourceShipmentReconcileUpdateRequest {
     pub version: i32,
 }
 
-/// 已批准可发送的零件列表查询参数。
+/// 外协对账页：某公司已发出零件列表查询参数。
+///
+/// 2026-10-03 新增：`GET /outsource-companies/{id}/sent-parts` 读侧契约
+/// （此前路由未注册，前端「外协对账」页 404）。
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct ApprovedForSendListQuery {
+pub struct OutsourceSentPartListQuery {
+    /// part 的 drawing_no / name ILIKE 模糊匹配（复用 `part_keyword_search` 语义）。
+    #[serde(default)]
+    pub keyword: Option<String>,
+    /// `sent_at` 闭区间下界（含）。
+    #[serde(default)]
+    pub sent_from: Option<NaiveDateTime>,
+    /// `sent_at` 闭区间上界（含）。
+    #[serde(default)]
+    pub sent_to: Option<NaiveDateTime>,
+    /// `received_at` 闭区间下界（含）。
+    #[serde(default)]
+    pub received_from: Option<NaiveDateTime>,
+    /// `received_at` 闭区间上界（含）。
+    #[serde(default)]
+    pub received_to: Option<NaiveDateTime>,
+    /// 排序列白名单：`PRICE` / `SENT_AT` / `RECEIVED_AT`；非法值回落 `SENT_AT`。
+    /// **绝不把本字段拼进 SQL** —— service 只归一化成白名单 token 后 bind。
+    #[serde(default)]
+    pub sort_by: Option<String>,
+    /// `ASC` / `DESC`；非法值回落 `DESC`。
+    #[serde(default)]
+    pub sort_dir: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+/// 外协在途批次列表查询参数。
+///
+/// 2026-10-03 新增：`GET /outsource-shipments/in-flight` 读侧契约
+/// （替代 part 域错形状的 `/parts/outsource-in-flight`）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OutsourceInFlightListQuery {
+    /// part 的 drawing_no / name ILIKE 模糊匹配。
     #[serde(default)]
     pub keyword: Option<String>,
     #[serde(default)]
-    pub customer_id: Option<String>,
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+// ===========================================================================
+// 入参 — Sendable
+// ===========================================================================
+
+/// 可发送外协的（活跃批次 × OUTSOURCE 工序）列表查询参数。
+///
+/// 2026-10-03 新增：`GET /outsource-sendable` 读侧契约
+/// （替代 part 域错形状的 `/parts/outsource-sendable`）。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OutsourceSendableListQuery {
+    /// part 的 drawing_no / name ILIKE 模糊匹配。
+    #[serde(default)]
+    pub keyword: Option<String>,
+    /// 按 `t_part.customer_id` 精确过滤。
+    #[serde(default)]
+    pub customer_id: Option<i64>,
     #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]

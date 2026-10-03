@@ -96,7 +96,12 @@ Response 200 `data`：`PartListOut`
 
 **SORT 键交互**：`SERIAL_NO` 仅 t_part 独有，t_assembly 无该列；ALL 模式下 `sort_by=SERIAL_NO` 会被降级为 `CREATED_AT`（不报错；文档标注以便前端解释）。
 
-> 默认行为变更（2026-09-28）：不传 `row_type` / `include_assemblies` 时，`GET /parts` 默认走 **All** 模式（合并装配件）。旧 PART-only caller（如 `/parts/pending-programming` 等内部端点）需显式传 `include_assemblies=false` 才能保留原行为——本次 task 内已对 `list_pending_programming` / `list_outsource_in_flight` / `list_outsource_sendable` 三个内部 endpoint 走 `PartListFilters.part_only=false` 兜底，对外不受影响。
+> 默认行为变更（2026-09-28）：不传 `row_type` / `include_assemblies` 时，`GET /parts` 默认走 **All** 模式（合并装配件）。旧 PART-only caller（如 `/parts/pending-programming` 等内部端点）需显式传 `include_assemblies=false` 才能保留原行为——本次 task 内已对 `list_pending_programming` 走 `PartListFilters.part_only=false` 兜底，对外不受影响。
+>
+> **2026-10-03 订正**：原文此处并列点名了 `list_outsource_in_flight` /
+> `list_outsource_sendable` 两个内部 endpoint。二者已于 2026-10-03 随 part 域两条
+> 外协 list 端点一起删除（`service/phase1/outsource.rs` 整文件移除），取代者迁往
+> outsource 域：见 [`../lifecycle.md`](./lifecycle.md#外协两条-list-端点--2026-10-03-已下线迁往-outsource-域)。
 
 ### `POST /api/v2/parts`
 

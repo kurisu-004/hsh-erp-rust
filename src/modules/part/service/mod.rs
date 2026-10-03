@@ -15,8 +15,6 @@
 //!   location_tree / batch_with_pdfs / match_by_excel_items / batch_update_order_info）
 //! - `phase1/lifecycle_helpers.rs`：待编程一览 + 批次列表（list_pending_programming /
 //!   list_batches）
-//! - `phase1/outsource.rs`：外协系列只读端点（list_outsource_in_flight /
-//!   list_outsource_sendable）
 //! - `phase1/work_type.rs`：工种维度只读端点（list_by_work_type /
 //!   list_pickable_by_work_type / list_by_worker）
 //! - `rollup.rs`：rollup 工具（sync_from_batch_change）

@@ -58,14 +58,139 @@ pub use super::model::{
     TOutsourceQuoteEvent, TOutsourceShipment,
 };
 pub use sql::{
-    OutsourceCompanyProcessRepo, OutsourceCompanyRepo, OutsourceQuoteEventRepo, OutsourceQuoteRepo,
-    OutsourceShipmentRepo,
+    OutsourceCompanyProcessRepo, OutsourceCompanyRepo, OutsourceQuotableRepo,
+    OutsourceQuoteEventRepo, OutsourceQuoteRepo, OutsourceSendableRepo, OutsourceShipmentRepo,
 };
+
+// ===========================================================================
+//  读模型行结构（2026-10-03 新增）
+// ===========================================================================
+//
+// 既有跨表投影（`part_map_for_quote` / `process_map_short` 等）都返回 tuple，
+// 但 4 个新 list 端点每行 13~21 列 —— tuple 到第 5 列就不可读，且列序错位
+// 是静默 bug。故改用具名 `FromRow` 结构，声明在 `repo/mod.rs`（trait 签名
+// 引用处），SQL 字符串仍在 `repo/sql.rs`。
+//
+// 全部 `sqlx::FromRow` + 运行时 `query_as`（**非 `query!` 宏**），
+// 因此不需要重新生成 `.sqlx/`。
+
+/// `GET /outsource-companies/{id}/sent-parts` 行。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OutsourceSentPartRow {
+    pub id: i64,
+    pub version: i32,
+    pub quote_id: i64,
+    pub part_id: i64,
+    pub drawing_no: Option<String>,
+    pub name: Option<String>,
+    pub is_urgent: bool,
+    /// L2 客户名（`t_customer`，即 part 直属客户）。
+    pub customer_name: Option<String>,
+    /// L1 客户名（`t_customer.parent_id`）。
+    pub parent_customer_name: Option<String>,
+    pub process_id: i64,
+    pub process_name: Option<String>,
+    pub batch_no: Option<i32>,
+    pub quantity: i32,
+    /// `unit_price::text`（Decimal 字符串；避免 Decimal 精度往返）。
+    pub unit_price: String,
+    pub sent_at: chrono::NaiveDateTime,
+    pub received_at: Option<chrono::NaiveDateTime>,
+    pub status: String,
+    pub is_billed: bool,
+}
+
+/// `GET /outsource-shipments/in-flight` 行。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OutsourceInFlightRow {
+    /// `t_part.id`。
+    pub id: i64,
+    /// `t_part_batch.id`。
+    pub batch_id: i64,
+    pub batch_no: i32,
+    /// `t_part_batch.quantity`（剩余待收量）。
+    pub quantity: i32,
+    /// `t_part_batch.version`（**不是** shipment.version）。
+    pub version: i32,
+    pub serial_no: Option<String>,
+    pub drawing_no: Option<String>,
+    pub name: Option<String>,
+    pub is_urgent: bool,
+    pub customer_name: Option<String>,
+    pub parent_customer_name: Option<String>,
+    pub process_id: i64,
+    pub process_name: Option<String>,
+    pub outsource_company_id: i64,
+    pub outsource_company_name: Option<String>,
+    pub sent_at: chrono::NaiveDateTime,
+}
+
+/// `GET /outsource-quotes/quotable-parts` 行。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OutsourceQuotableRow {
+    pub id: i64,
+    pub serial_no: Option<String>,
+    pub drawing_no: String,
+    pub name: String,
+    pub is_urgent: bool,
+    pub unit_price: String,
+    pub customer_id: i64,
+    pub customer_name: Option<String>,
+    pub parent_customer_name: Option<String>,
+    pub shelf_id: i64,
+    pub shelf_code: String,
+    pub next_process_id: i64,
+    pub next_process_name: String,
+}
+
+/// `GET /outsource-sendable` 行。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct OutsourceSendableRow {
+    /// `t_part_batch.version`（批次级 OCC）。
+    pub batch_version: i32,
+    pub batch_id: i64,
+    pub batch_no: i32,
+    pub batch_quantity: i32,
+    /// `t_part_batch.status`（`PENDING` / `IN_PROCESS`）。
+    pub source_status: String,
+    pub part_id: i64,
+    pub part_serial_no: Option<String>,
+    pub part_drawing_no: Option<String>,
+    pub part_name: Option<String>,
+    /// `t_part.planned_delivery_date`（Postgres `date` → 文本）。
+    pub planned_delivery_date: Option<String>,
+    pub is_urgent: bool,
+    pub customer_name: Option<String>,
+    pub parent_customer_name: Option<String>,
+    /// **只服务 SQL 层的过滤，Rust 侧不消费**：`OutsourceSendableRepo::list` 的
+    /// 外层 `WHERE ($2::bigint IS NULL OR d.customer_id = $2)` 要投影出这一列才能
+    /// 引用它。VO 不暴露客户 id（前端只拿 `customer_path`），故 `service/sendable.rs`
+    /// 从不读这个字段 —— 保留投影是为了让 list / count 的过滤位置保持同构（见
+    /// `repo/sql.rs::OutsourceSendableRepo` 头注释）。
+    pub customer_id: Option<i64>,
+    /// `t_shelf.code`，驱动表是 `JOIN t_shelf`（INNER）⇒ DB 层 NOT NULL。
+    /// 与 quotable 侧 `OutsourceQuotableRow.shelf_code` 同一写法。
+    pub shelf_code: String,
+    pub next_process_id: i64,
+    /// `t_process.name`，`JOIN t_process pr`（INNER）⇒ DB 层 NOT NULL。
+    /// 与 quotable 侧 `OutsourceQuotableRow.next_process_name` 同一写法。
+    pub next_process_name: String,
+    pub quote_id: Option<i64>,
+    pub price: Option<String>,
+    pub outsource_company_id: Option<i64>,
+    pub outsource_company_name: Option<String>,
+    /// SQL `to_jsonb(array_agg(json_build_object(...)))` 的结果（单个 JSONB 值，
+    /// 不是 `json[]` —— 后者 sqlx 解不进 `serde_json::Value`）。
+    /// APPROVAL 行恒为 `[]`（SQL 侧 CASE 短路）。
+    pub company_options: serde_json::Value,
+}
 
 /// outsource 域数据访问胖 trait。
 ///
-/// 单 trait 合并 3 ZST（company + company_process + quote + quote_event + shipment）
-/// 共 23 方法：company 8 + company_process 4 + quote 11 + quote_event 1 + shipment 6。
+/// 单 trait 合并 5 ZST（company + company_process + quote + quote_event + shipment，
+/// 外加 2026-10-03 新增的 quotable / sendable 两个读模型 ZST），共 50 方法：
+/// company 8 + company_process 4 + quote 11 + quote_event 1 + shipment 10
+/// + quotable 2 + sendable 2 + 跨域 helper 11。
 ///
 /// 方法签名 = `sql.rs` 固有静态方法去 executor 形参。`<'a>` 显式生命周期是 mockall
 /// 0.15 automock 在 `async_trait` 上下文的硬性要求。
@@ -266,7 +391,7 @@ pub trait OutsourceRepoTrait: Send {
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
-    async fn shipment_count_reconciliation_for_company<'a>(
+    async fn shipment_count_for_company<'a>(
         &mut self,
         company_id: i64,
         part_ids_in: &'a [i64],
@@ -274,6 +399,58 @@ pub trait OutsourceRepoTrait: Send {
         sent_to: Option<NaiveDateTime>,
         received_from: Option<NaiveDateTime>,
         received_to: Option<NaiveDateTime>,
+    ) -> Result<i64, sqlx::Error>;
+    /// 2026-10-03 新增：对账页 list（与 `shipment_count_for_company` 同 WHERE 口径）。
+    #[allow(clippy::too_many_arguments)]
+    async fn shipment_list_for_company<'a>(
+        &mut self,
+        company_id: i64,
+        part_ids_in: &'a [i64],
+        sent_from: Option<NaiveDateTime>,
+        sent_to: Option<NaiveDateTime>,
+        received_from: Option<NaiveDateTime>,
+        received_to: Option<NaiveDateTime>,
+        sort_by: &'a str,
+        sort_dir: &'a str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceSentPartRow>, sqlx::Error>;
+    /// 2026-10-03 新增：外协在途批次 list。
+    async fn shipment_list_in_flight<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceInFlightRow>, sqlx::Error>;
+    async fn shipment_count_in_flight<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+    ) -> Result<i64, sqlx::Error>;
+
+    // ── quotable-parts（2026-10-03 新增，可建报价的 零件 × OUTSOURCE 工序） ──
+    async fn quotable_list<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceQuotableRow>, sqlx::Error>;
+    async fn quotable_count<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+    ) -> Result<i64, sqlx::Error>;
+
+    // ── sendable（2026-10-03 新增，可发送外协的 活跃批次 × OUTSOURCE 工序） ──
+    async fn sendable_list<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+        customer_id: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceSendableRow>, sqlx::Error>;
+    async fn sendable_count<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+        customer_id: Option<i64>,
     ) -> Result<i64, sqlx::Error>;
 
     // ── 跨域 helper（service 散落的 inline SQL 抽 trait） ──
@@ -306,13 +483,30 @@ pub trait OutsourceRepoTrait: Send {
         &mut self,
         process_ids: &'a [i64],
     ) -> Result<Vec<(i64, String)>, sqlx::Error>;
-    /// `t_part` 按 ids 查 `(id, serial_no, drawing_no, name, is_urgent, unit_price::text)`。
+    /// `t_part` 按 ids 查
+    /// `(id, serial_no, drawing_no, name, is_urgent, unit_price::text, customer_name, l1_customer_name)`。
     /// 供 quote_out_many 拼装 part 显示字段。
+    ///
+    /// 2026-10-03 扩 2 列：L2 / L1 客户名（`t_customer` ⋈ 自引用），供 service 拼
+    /// `customer_path`（此前 `OutsourceQuoteOut.customer_path` 恒 `None` → 前端报价
+    /// 一览「客户」列全 `—`）。
     #[allow(clippy::type_complexity)]
     async fn part_map_for_quote<'a>(
         &mut self,
         part_ids: &'a [i64],
-    ) -> Result<Vec<(i64, Option<String>, String, String, bool, Option<String>)>, sqlx::Error>;
+    ) -> Result<
+        Vec<(
+            i64,
+            Option<String>,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+        sqlx::Error,
+    >;
     /// `t_outsource_company` 按 ids 查 `(id, name)`（仅未软删）。供 quote_out_many。
     async fn company_map_name<'a>(
         &mut self,
@@ -323,6 +517,14 @@ pub trait OutsourceRepoTrait: Send {
         &mut self,
         part_id: i64,
     ) -> Result<Option<(String, String)>, sqlx::Error>;
+    /// `t_part` 按 id 查 `(L2 客户名, L1 客户名)`，供 `shipment_out` 真算
+    /// `customer_path`。两条 JOIN 与 list 侧 `OutsourceSentPartRow` 的
+    /// `t_customer` / `t_customer.parent_id` 逐条一致（各自 `deleted_at IS NULL`
+    /// 才给名，part 软删不影响取名 —— list 侧是 `LEFT JOIN t_part`）。
+    async fn part_customer_names(
+        &mut self,
+        part_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error>;
     /// `t_process` 按 id 查 name。供 shipment_out 单条拼装。
     async fn process_get_name(&mut self, process_id: i64) -> Result<Option<String>, sqlx::Error>;
     /// `t_part_batch` 按 id 查 batch_no。供 shipment_out 单条拼装。
@@ -677,7 +879,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn shipment_count_reconciliation_for_company<'b>(
+    async fn shipment_count_for_company<'b>(
         &mut self,
         company_id: i64,
         part_ids_in: &'b [i64],
@@ -686,7 +888,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         received_from: Option<NaiveDateTime>,
         received_to: Option<NaiveDateTime>,
     ) -> Result<i64, sqlx::Error> {
-        OutsourceShipmentRepo::count_reconciliation_for_company(
+        OutsourceShipmentRepo::count_for_company(
             &mut **self,
             company_id,
             part_ids_in,
@@ -696,6 +898,86 @@ impl OutsourceRepoTrait for &mut PgConnection {
             received_to,
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn shipment_list_for_company<'b>(
+        &mut self,
+        company_id: i64,
+        part_ids_in: &'b [i64],
+        sent_from: Option<NaiveDateTime>,
+        sent_to: Option<NaiveDateTime>,
+        received_from: Option<NaiveDateTime>,
+        received_to: Option<NaiveDateTime>,
+        sort_by: &'b str,
+        sort_dir: &'b str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceSentPartRow>, sqlx::Error> {
+        OutsourceShipmentRepo::list_for_company(
+            &mut **self,
+            company_id,
+            part_ids_in,
+            sent_from,
+            sent_to,
+            received_from,
+            received_to,
+            sort_by,
+            sort_dir,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    async fn shipment_list_in_flight<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceInFlightRow>, sqlx::Error> {
+        OutsourceShipmentRepo::list_in_flight(&mut **self, keyword_pat, limit, offset).await
+    }
+
+    async fn shipment_count_in_flight<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+    ) -> Result<i64, sqlx::Error> {
+        OutsourceShipmentRepo::count_in_flight(&mut **self, keyword_pat).await
+    }
+
+    async fn quotable_list<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceQuotableRow>, sqlx::Error> {
+        OutsourceQuotableRepo::list(&mut **self, keyword_pat, limit, offset).await
+    }
+
+    async fn quotable_count<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+    ) -> Result<i64, sqlx::Error> {
+        OutsourceQuotableRepo::count(&mut **self, keyword_pat).await
+    }
+
+    async fn sendable_list<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+        customer_id: Option<i64>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<OutsourceSendableRow>, sqlx::Error> {
+        OutsourceSendableRepo::list(&mut **self, keyword_pat, customer_id, limit, offset).await
+    }
+
+    async fn sendable_count<'a>(
+        &mut self,
+        keyword_pat: Option<&'a str>,
+        customer_id: Option<i64>,
+    ) -> Result<i64, sqlx::Error> {
+        OutsourceSendableRepo::count(&mut **self, keyword_pat, customer_id).await
     }
 
     // ── 跨域 helper（11）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
@@ -773,10 +1055,26 @@ impl OutsourceRepoTrait for &mut PgConnection {
     async fn part_map_for_quote<'b>(
         &mut self,
         part_ids: &'b [i64],
-    ) -> Result<Vec<(i64, Option<String>, String, String, bool, Option<String>)>, sqlx::Error> {
+    ) -> Result<
+        Vec<(
+            i64,
+            Option<String>,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )>,
+        sqlx::Error,
+    > {
         sqlx::query_as(
-            "SELECT id, serial_no, drawing_no, name, is_urgent, unit_price::text \
-             FROM t_part WHERE id = ANY($1) AND deleted_at IS NULL",
+            "SELECT p.id, p.serial_no, p.drawing_no, p.name, p.is_urgent, p.unit_price::text, \
+                    c.name, cp.name \
+             FROM t_part p \
+             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
+             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
+             WHERE p.id = ANY($1) AND p.deleted_at IS NULL",
         )
         .bind(part_ids)
         .fetch_all(&mut **self)
@@ -804,6 +1102,25 @@ impl OutsourceRepoTrait for &mut PgConnection {
             .bind(part_id)
             .fetch_optional(&mut **self)
             .await
+    }
+
+    async fn part_customer_names(
+        &mut self,
+        part_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        // LEFT JOIN 出 L2 / L1 两个可空名（都可能是 NULL：未挂客户 / 客户已软删）；
+        // part 行不存在时 fetch_optional 返 None，塌成 (None, None)。
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT c.name, cp.name \
+             FROM t_part p \
+             LEFT JOIN t_customer c ON c.id = p.customer_id AND c.deleted_at IS NULL \
+             LEFT JOIN t_customer cp ON cp.id = c.parent_id AND cp.deleted_at IS NULL \
+             WHERE p.id = $1",
+        )
+        .bind(part_id)
+        .fetch_optional(&mut **self)
+        .await?;
+        Ok(row.unwrap_or((None, None)))
     }
 
     async fn process_get_name(&mut self, process_id: i64) -> Result<Option<String>, sqlx::Error> {
