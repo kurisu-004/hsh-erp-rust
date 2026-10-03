@@ -230,7 +230,6 @@ pub fn test_app_config() -> Arc<AppConfig> {
             session_ttl_seconds: 900,
             pool_max_size: 1,
         },
-        delivery_note_template_dir: std::path::PathBuf::new(),
         enable_e2e_hooks: false,
         ws_heartbeat_interval_seconds: 30,
         // 2026-10-01 新增：WS 存活检测（session service 单测不读 WS，占位默认值，

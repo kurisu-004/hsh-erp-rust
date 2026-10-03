@@ -233,7 +233,7 @@ t_assembly.status               ← 派生缓存
 
 | 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
 |---|---:|---|
-| `tests/delivery/{main,group,attach_batches,print,scan,note}.rs` | 5 | `delivery` |
+| `tests/delivery/{main,group,attach_batches,scan,note}.rs` | 5 | `delivery` |
 | `tests/part/{main,helpers,crud,lifecycle,batch,file,list_enrichment,repair,to_ship,to_inspection,to_process,inspection_batches,serial}.rs` | 12 | `part` |
 | `tests/assembly/{main,api,files,status_sync}.rs` | 3 | `assembly` |
 | `tests/iam/{main,api,middleware}.rs` | 2 | `iam`（redis-flush group）|

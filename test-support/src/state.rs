@@ -124,7 +124,6 @@ pub fn test_state_with_redis(pool: PgPool, redis_pool: RedisPool) -> Arc<AppStat
             threshold_days: 7,
             interval_hours: 24,
         },
-        delivery_note_template_dir: std::path::PathBuf::from("template"),
         enable_e2e_hooks: true,
         // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳，E2E WS 用例可在 2s 内验到 text 帧。
         ws_heartbeat_interval_seconds: 1,
@@ -293,7 +292,6 @@ pub fn test_state_with_disabled_session(pool: PgPool) -> Arc<AppState> {
             threshold_days: 7,
             interval_hours: 24,
         },
-        delivery_note_template_dir: std::path::PathBuf::from("template"),
         enable_e2e_hooks: true,
         // 2026-09-15 followup-cleanup A5/A6：测试默认 1s 心跳。
         ws_heartbeat_interval_seconds: 1,
@@ -439,7 +437,6 @@ pub async fn test_state_with_cos(
             threshold_days: 7,
             interval_hours: 24,
         },
-        delivery_note_template_dir: std::path::PathBuf::from("template"),
         enable_e2e_hooks: true,
         ws_heartbeat_interval_seconds: 1,
         // 2026-10-01 新增：WS 存活检测（协议层 Ping + Pong 超时）。测试取秒级：

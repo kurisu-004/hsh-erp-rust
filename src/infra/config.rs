@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -20,10 +20,6 @@ pub struct AppConfig {
     pub auto_complete: AutoCompleteConfig,
     /// Redis 会话存储（服务端 session 真相源；access token 吊销依赖）
     pub redis: RedisConfig,
-    /// 送货单 Excel 模板目录（P4 打印）。环境变量 `DELIVERY_NOTE_TEMPLATE_DIR`
-    /// 优先；缺省回退到编译期绝对路径 `<CARGO_MANIFEST_DIR>/template`，
-    /// 因此本地 `cargo run` 不依赖 cwd。
-    pub delivery_note_template_dir: PathBuf,
     /// 2026-09-14 新增：是否启用 /api/v2/_e2e/* hook。
     /// 启用后 e2e 测试可通过匿名 POST 直接灌入 seed 数据 + revoke session。
     /// 仅 dev / test 环境开启；prod 通过环境变量显式 `E2E_HOOKS_ENABLED=false`（ops 责任）。
@@ -540,10 +536,6 @@ impl AppConfig {
                 session_ttl_seconds: env_parse("REDIS_SESSION_TTL_SECONDS", 900u64)?,
                 pool_max_size: env_parse("REDIS_POOL_MAX_SIZE", 10usize)?,
             },
-            delivery_note_template_dir: PathBuf::from(env_or(
-                "DELIVERY_NOTE_TEMPLATE_DIR",
-                concat!(env!("CARGO_MANIFEST_DIR"), "/template"),
-            )),
             // 2026-09-14 新增：_e2e 路由门控。
             // 单一控制点 = env `E2E_HOOKS_ENABLED`（缺省 true）。docker compose / dev `cargo run`
             // 走默认（启用）；prod / staging 必须显式 `E2E_HOOKS_ENABLED=false`（ops 责任）。
