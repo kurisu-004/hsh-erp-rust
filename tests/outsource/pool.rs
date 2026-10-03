@@ -1159,20 +1159,28 @@ async fn pool_state_chain_unresolvable_when_no_step_or_chain_tail() {
     }
 }
 
-/// 读侧锚链必须与写侧同源：part 在外协期间被**改绑到另一条工艺链**时，
-/// `receive_next_process_id` 必须指向**新链**里的下一道工序。
+/// 读侧派生下一 step 时，**当前 step 必须在锚链内按 `current_process_id` 重新
+/// 定位**，不能拿 `pb.current_process_step_id` 的 `sort_order` 当位置。
 ///
-/// 写侧 `receive_from_outsource` 走 `require_process_chain(part_id)`（读
-/// `t_part.process_chain_id`）+ `resolve_step_id_by_process(chain_id, process_id)`。
-/// 若读侧锚 `pb.current_process_step_id` 所属的旧链，返回的就是新链里不存在的
-/// 工序 id，写侧必然 404，而 `chain_resolvable` 却在说「可免填」。
+/// 本用例把外协工序在锚链内从 `sort 1` 挪到 `sort 2`（**位置漂移**）后，断言
+/// 返回的是**真正的下一道工序**，而不是外协工序自己：
+/// - 位置式定位会返回 `sort_order = 旧 sort + 1` 那一步 = 外协工序自己，
+///   且 `chain_resolvable` 仍为 `true` ⇒ 写侧照单全收，是**静默错值**；
+/// - 按 `current_process_id` 定位才能取到外协工序在锚链内的真实位置 +1。
+///
+/// ⚠️ **本用例构造的状态产品不可达**：`bind_part_to_chain` 是裸
+/// `UPDATE t_part SET process_chain_id`，绕过了 `link_chain_to_part` 的
+/// `AND process_chain_id IS NULL` 守卫（已绑定的 part 走产品路径不可改绑）。
+/// 保留它是**防御性回归网** —— 守住「锚链内位置漂移时仍取对值」这条性质，
+/// 而不是把该混合语义固化成期望行为。断言未因此弱化。
 #[tokio::test]
 async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcRebind", "I").await;
-    let (proc_os, _, _) = seed_outsource_process(&pool, "PRB-OS").await;
+    let (proc_os, _, os_name) = seed_outsource_process(&pool, "PRB-OS").await;
     let (proc_next_a, _, next_name_a) = seed_inhouse_process(&pool, "PRB-NEXTA").await;
     let (proc_next_b, _, next_name_b) = seed_inhouse_process(&pool, "PRB-NEXTB").await;
+    let (proc_next_c, _, next_name_c) = seed_inhouse_process(&pool, "PRB-NEXTC").await;
     let co = insert_company(&pool, "RebindCo", true).await;
     link_company_process(&pool, co, proc_os).await;
 
@@ -1183,11 +1191,14 @@ async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
     let q = insert_approved_quote(&pool, p, co, proc_os, "9.00").await;
     insert_open_shipment(&pool, q, p, b, co, proc_os, 6, "9.00").await;
 
-    // 改绑到链 B（同样两道工序，但第二道是 NEXT_B）—— 批次的
-    // `current_process_step_id` 仍指向**旧链 A** 的 step。
+    // 改绑到链 B。**关键：外协工序在链 B 里被挪到 sort 2**（sort 1 = NEXT_B），
+    // 批次的 `current_process_step_id` 仍指向**旧链 A** 的 step（sort 1）。
+    // ⇒ 位置式定位会算成「链 B 的 sort 2」= 外协工序自己（静默错值）；
+    //   按 current_process_id 定位才会拿到「链 B 的 sort 2 → sort 3」= NEXT_C。
     let chain_b = create_chain(&pool, "rebound-chain").await;
-    add_chain_step(&pool, chain_b, proc_os, 1).await;
-    add_chain_step(&pool, chain_b, proc_next_b, 2).await;
+    add_chain_step(&pool, chain_b, proc_next_b, 1).await;
+    add_chain_step(&pool, chain_b, proc_os, 2).await;
+    add_chain_step(&pool, chain_b, proc_next_c, 3).await;
     bind_part_to_chain(&pool, p, chain_b).await;
 
     let (s, env) = get_state(&app, &token, co, proc_os).await;
@@ -1195,33 +1206,60 @@ async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
     let row = row_by_batch(env["data"]["items"].as_array().unwrap(), b, &env);
     assert_eq!(
         row["receive_next_process_id"],
-        proc_next_b.to_string(),
-        "必须解析 part 当前链（B）里的下一道工序，而不是旧链（A）: {env}"
+        proc_next_c.to_string(),
+        "外协工序在锚链内位于 sort 2，真正的下一道是 sort 3 的 NEXT_C \
+         （按位置取会返回外协工序自己）: {env}"
     );
-    assert_eq!(row["receive_next_process_name"], next_name_b, "{env}");
+    assert_eq!(row["receive_next_process_name"], next_name_c, "{env}");
+    // 位置式定位的取值（外协工序自己）必须被排除，且它带 `chain_resolvable=true`
+    // ⇒ 一旦实现退回按位置取，这两条断言就是它唯一的护栏。
+    assert_ne!(
+        row["receive_next_process_id"],
+        proc_os.to_string(),
+        "绝不能把外协工序自己当成下一道工序返回（静默错值）: {env}"
+    );
+    assert_ne!(row["receive_next_process_name"], os_name, "{env}");
+    // 位置式定位不会退回旧链 A ⇒ NEXT_A 同样必须被排除。
     assert_ne!(
         row["receive_next_process_id"],
         proc_next_a.to_string(),
-        "{env}"
+        "不得返回旧链 A 里的下一道工序: {env}"
     );
     assert_ne!(row["receive_next_process_name"], next_name_a, "{env}");
+    assert_ne!(
+        row["receive_next_process_id"],
+        proc_next_b.to_string(),
+        "NEXT_B 排在当前工序之前，不是下一道: {env}"
+    );
+    assert_ne!(row["receive_next_process_name"], next_name_b, "{env}");
     assert_eq!(
         row["chain_resolvable"], true,
-        "新链有下一 step ⇒ 可解析: {env}"
+        "锚链内存在下一 step ⇒ 可解析: {env}"
     );
 
-    // 写侧前提：`resolve_step_id_by_process(chain_b, proc_next_b)` 必须能解析到
-    // step，否则上一组断言等于给了前端一个会 404 的默认值。
-    let resolvable: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM t_process_chain_step \
-         WHERE chain_id = $1 AND process_id = $2 AND deleted_at IS NULL",
+    // 写侧前提：`require_process_chain(part)` 取到的链 + 在该链内按
+    // `resolve_step_id_by_process` 解析，必须落在**同一个 step** 上 ——
+    // 否则上一组断言等于给了前端一个写侧会拒收（404 `20702`）的默认值。
+    let write_side: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT (SELECT process_chain_id FROM t_part WHERE id = $1)::bigint, s.id \
+         FROM t_process_chain_step s \
+         WHERE s.chain_id = (SELECT process_chain_id FROM t_part WHERE id = $1) \
+           AND s.process_id = $2 AND s.deleted_at IS NULL LIMIT 1",
     )
-    .bind(chain_b)
-    .bind(proc_next_b)
-    .fetch_one(&pool)
+    .bind(p)
+    .bind(proc_next_c)
+    .fetch_all(&pool)
     .await
-    .expect("count chain_b step for proc_next_b");
-    assert_eq!(resolvable, 1, "写侧在 chain B 里必须能解析出该工序的 step");
+    .expect("resolve write-side step for proc_next_c");
+    assert_eq!(
+        write_side.len(),
+        1,
+        "写侧必须在 chain B 内解析出 NEXT_C 的 step，否则默认值会被 404 拒收"
+    );
+    assert_eq!(
+        write_side[0].0, chain_b,
+        "写侧 require_process_chain 取到的链必须与读侧锚链一致"
+    );
 }
 
 /// `t_applicant` 按 name 匹配（字符串非 FK，唯一索引是 `(name, customer_id)`），

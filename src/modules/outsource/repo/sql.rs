@@ -1353,34 +1353,50 @@ impl OutsourcePoolRepo {
     /// **一条 list SQL 拿完**（防 N+1）：公司名 / 工序名 / 客户路径 / shipment
     /// 字段 / 下一道工序全部在 SQL 内 JOIN / LATERAL 解析，service 层零回查。
     ///
-    /// `LEFT JOIN LATERAL` 派生 `receive_next_process_*`：锚链取
-    /// `COALESCE(p.process_chain_id, cur.chain_id)`，即**优先 part 当前绑定的
-    /// 工艺链**（`cur` = `pb.current_process_step_id` 指向的 step，只用来取
-    /// `sort_order`）；再取锚链内 `sort_order + 1` 的未软删 step（唯一索引
-    /// `uq_chain_step_chain_order (chain_id, sort_order) WHERE deleted_at IS NULL`
-    /// 保证唯一无歧义）。中间 JOIN `t_part_process_chain` 是为了让「锚链已软删」
-    /// 也落到「无下一 step」分支（`chain_resolvable=false`）。
+    /// `LEFT JOIN LATERAL` 派生 `receive_next_process_*`，两步定位：
+    /// 1. **锚链** = `COALESCE(p.process_chain_id, cur.chain_id)`（`cur` =
+    ///    `pb.current_process_step_id` 指向的 step，只用于回退取链 id）；
+    /// 2. **当前 step 在锚链内的位置**：`cur2.process_id = pb.current_process_id`；
+    ///    再取锚链内 `sort_order = cur2.sort_order + 1` 的未软删 step（唯一索引
+    ///    `uq_chain_step_chain_order (chain_id, sort_order) WHERE deleted_at IS NULL`
+    ///    ⇒ 唯一无歧义）。中间 JOIN `t_part_process_chain` 是为了让「锚链已软删」
+    ///    也落到「无下一 step」分支（`chain_resolvable=false`）。
     ///
-    /// **锚链必须与写侧同源**：写侧 `receive_from_outsource` 走
+    /// ⚠️ **第 2 步必须按 `current_process_id` 在锚链内重新定位，不能拿
+    /// `pb.current_process_step_id` 的 `sort_order` 直接当位置**：step 指针与
+    /// 「当前工序在链内的位置」是两个独立事实，后者漂移时按位置推进会把**外协
+    /// 工序自己**当成下一道工序返回，而 `chain_resolvable` 仍在说「可免填」⇒ 写侧
+    /// 照单全收，静默错值比拒收更难发现。
+    ///
+    /// **锚链与写侧同源**：写侧 `receive_from_outsource` 走
     /// `require_process_chain(part_id)`（读 `t_part.process_chain_id`）+
-    /// `resolve_step_id_by_process(chain_id, process_id)`。若读侧锚 `cur.chain_id`，
-    /// part 在外协期间被改绑工艺链时读侧会给出**新链里不存在**的工序 id，写侧
-    /// 直接 404（`chain {} 内找不到 process_id={} 的活跃 step`），`chain_resolvable`
-    /// 却在说「可免填」。锚 `p.process_chain_id` 后，返回的 process_id 必然是
-    /// 锚链内的活跃 step 的工序 ⇒ 写侧一定能解析到（前提：该 step 未软删，且
-    /// part 未在读侧到写侧之间再次改绑 —— 窗口极小，文档已登记该 caveat）。
+    /// `resolve_step_id_by_process(chain_id, process_id)`。锚 `p.process_chain_id`
+    /// ⇒ 本端点返回的 process_id 必然是**锚链内活跃 step 的工序**，写侧能在同一
+    /// 条链上解析到。
+    ///
+    /// 锚链**恒等于**写侧解析用的那条链：`link_chain_to_part` 带
+    /// `AND process_chain_id IS NULL` 守卫（已绑定的 part 不可改绑，其唯一调用方
+    /// 也在「该 part 尚无链」的分支），`unlink_part_from_chain` 只被 part 软删
+    /// 级联调用；`send_to_outsource` 强制 `require_process_chain` ⇒ 在途批次的
+    /// part 必然已绑链。`COALESCE` 的 `cur.chain_id` 分支因此只是防御性兜底
+    /// （`p.process_chain_id IS NULL` 是脏数据），不是活场景。
     ///
     /// ⚠️ **两个派生列都必须显式 `AS receive_next_process_*`**：LATERAL 子查询的输出
     /// 列名只跟子查询内部的名字走（`nx.next_process_name` 的列名是
     /// `next_process_name`，不带 `nx.` 前缀），不写别名时 runtime `query_as` 的
-    /// `FromRow` 会报 `ColumnNotFound("receive_next_process_name")`。
+    /// `FromRow` 会报 `ColumnNotFound("receive_next_process_name")`。末尾
+    /// `LIMIT 1` 保证 LATERAL 恒至多一行：锚链内同一 `process_id` 重复属数据异常
+    /// （写侧 `resolve_step_id_by_process` 同样不守），不设 `LIMIT` 会把一行批次
+    /// 扇成多行、破坏 VO 层「`current_held == items.len()`」。
     ///
     /// `t_applicant` 走 `LEFT JOIN LATERAL (… ORDER BY ap.id ASC LIMIT 1)` 而不是
     /// 直接 JOIN：`t_part.applicant_name` 是字符串非 FK，而 `t_applicant` 的唯一索引
     /// 是 `(name, customer_id)`，**name 单独不唯一** —— 同名申请人跨客户存在时直接
-    /// JOIN 会把一行批次扇出成多行，破坏 VO 层「`current_held == items.len()`」
-    /// 这个不变量（`batch_id` 重复 + 计数虚高）。`ORDER BY ap.id ASC` 让解析结果
-    /// 稳定（最早建的申请人），不随查询计划抖动。
+    /// JOIN 会把一行批次扇出成多行，破坏上面那个 `current_held == items.len()`
+    /// 不变量（`batch_id` 重复 + 计数虚高）。投影只有 `ap.name` 一个列，而
+    /// `ap.name = p.applicant_name` 由 WHERE 保证恒等 ⇒ **取哪一行取值都一样**，
+    /// `ORDER BY ap.id ASC` 的作用只是给这条 LATERAL 一个确定的行（配合
+    /// `LIMIT 1`），零语义内容；不要把它当成「挑了某个申请人」。
     pub async fn list_held<'e, E: PgExecutor<'e>>(
         executor: E,
         company_id: i64,
@@ -1416,9 +1432,13 @@ impl OutsourcePoolRepo {
                JOIN t_part_process_chain pc \
                  ON pc.id = COALESCE(p.process_chain_id, cur.chain_id) \
                 AND pc.deleted_at IS NULL \
+               JOIN t_process_chain_step cur2 \
+                 ON cur2.chain_id = pc.id \
+                AND cur2.process_id = pb.current_process_id \
+                AND cur2.deleted_at IS NULL \
                JOIN t_process_chain_step nsp \
                  ON nsp.chain_id = pc.id \
-                AND nsp.sort_order = cur.sort_order + 1 \
+                AND nsp.sort_order = cur2.sort_order + 1 \
                 AND nsp.deleted_at IS NULL \
                LEFT JOIN t_process np \
                  ON np.id = nsp.process_id AND np.deleted_at IS NULL \

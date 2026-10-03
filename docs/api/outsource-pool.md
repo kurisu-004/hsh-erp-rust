@@ -101,43 +101,64 @@ AND deleted_at IS NULL`，归属锚是批次自身的
 
 ### 下一道工序的派生（`state.items[*].receive_next_process_*`）
 
-**锚链取 `COALESCE(p.process_chain_id, cur.chain_id)`**：`cur` =
-`pb.current_process_step_id` 指向的 step，只用它取 `sort_order`；取下一 step 时
-在**锚链**内找 `sort_order = 当前 + 1` 且未软删的 step。DB 有唯一索引
-`uq_chain_step_chain_order (chain_id, sort_order) WHERE deleted_at IS NULL`
-⇒ **唯一无歧义**。锚链软删时同样落到「无下一 step」分支。
+**两步定位**：
 
-**锚链必须与写侧同源**：写侧 `receive-from-outsource` 走
-`require_process_chain(part_id)`（读 `t_part.process_chain_id`）+ 
+1. **锚链** = `COALESCE(p.process_chain_id, cur.chain_id)`（`cur` =
+   `pb.current_process_step_id` 指向的 step，只用于回退取链 id）。
+2. **当前 step 在锚链内的位置** = 锚链内 `cur2.process_id = pb.current_process_id`
+   的那一步；下一 step 取锚链内 `sort_order = cur2.sort_order + 1` 且未软删的
+   step。DB 有唯一索引 `uq_chain_step_chain_order (chain_id, sort_order)
+   WHERE deleted_at IS NULL` ⇒ **唯一无歧义**。锚链软删时同样落到「无下一
+   step」分支。
+
+> ⚠️ **第 2 步必须按 `current_process_id` 在锚链内重新定位，不能拿
+> `pb.current_process_step_id` 的 `sort_order` 直接当位置。** step 指针与
+> 「当前工序在链内的位置」是两个独立事实。位置漂移时（例如当前工序在锚链内从
+> `sort 1` 挪到 `sort 2`），按位置推进会把**外协工序自己**当成下一道工序返回，
+> 而 `chain_resolvable` 仍是 `true` ⇒ 前端免填、写侧照单全收，产出**静默错值**
+> ——比拒收更难发现。
+
+**锚链与写侧同源**：写侧 `receive-from-outsource` 走
+`require_process_chain(part_id)`（读 `t_part.process_chain_id`）+
 `resolve_step_id_by_process(chain_id, next_process_id)`。锚 `p.process_chain_id`
-⇒ 本端点给出的 process_id 必然是**锚链内的活跃 step 的工序**，写侧一定能解析到。
+⇒ 本端点给出的 process_id 必然是**锚链内的活跃 step 的工序**，写侧在同一
+条链上解析得到。
+
+锚链**恒等于**写侧解析用的那条链：`link_chain_to_part` 带
+`AND process_chain_id IS NULL` 守卫（已绑定的 part 走产品路径不可改绑，其
+唯一调用方也只在「该 part 尚无链」的分支），`unlink_part_from_chain` 只被
+part 软删级联调用；`send-to-outsource` 强制 `require_process_chain` ⇒ 在途
+批次的 part 必然已绑链。故 `COALESCE` 的 `cur.chain_id` 分支只是防御性兜底
+（`p.process_chain_id IS NULL` 属脏数据），不是活场景。
 
 `chain_resolvable = receive_next_process_id != 0`，等价于下面三条同时成立：
 
 1. `current_process_step_id` 存在且非 `"0"`；
 2. 锚链存在且**未软删**；
-3. 锚链内存在下一 step（未软删）。
+3. 锚链内能按 `current_process_id` 定位到当前 step，且其后 `sort_order + 1`
+   处存在未软删 step（链尾 ⇒ 无）。
 
 **业务含义**（前端据此决定接收时要不要弹对话框让用户填工序）：
-`true` ⇒ 工序链已知，可免填「下一道工序」；`false` ⇒ 工序链缺失或指针漂移，
-必须让用户填。
+`true` ⇒ 工序链已知，可免填「下一道工序」；`false` ⇒ 工序链缺失 / 链已到尾 /
+指针漂移，必须让用户填。
 
 > 「下一 step 的工序已软删」时：`receive_next_process_id` 仍有值、
 > `receive_next_process_name` 为 `null`、`chain_resolvable` 仍为 `true` ——
-> 判据按步骤 1–3 判定，工序名取不到不影响「下一 step 存在」这个事实。
+> 判据按上面 1–3 判定，工序名取不到不影响「下一 step 存在」这个事实。
 > 这也是 `receive_next_process_name` 声明为可空的原因。
 
-> ⚠️ **`chain_resolvable == true` 仍可能收到写侧 404（`20702`）**：若 part 在外协
-> 期间被改绑工艺链、且**新链内与 `current_process_step_id` 的 `sort_order + 1`
-> 位置没有 step**（例如新链只有一道工序），本端点算出的下一 step 缺失 ⇒
-> `chain_resolvable` 为 `false`，前端走既有交互路径（弹对话框让用户手填）；
-> 但若 part 在**本端点返回之后、用户点接收之前**被再次改绑 / 该 step 被软删，
-> 写侧会 **404 `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`**（`chain {} 内找不到
-> process_id={} 的活跃 step`）。这类竞态无法在读侧消除，**前端必须处理 `20702`
-> 兜底**：与 `chain_resolvable == false` 一样弹对话框让用户手填下一道工序，
-> 重试一次即可。`p.process_chain_id IS NULL`（脏数据）时锚链回落到
-> `cur.chain_id`，此时写侧会先撞 `20706 BIZ_PROCESS_CHAIN_REQUIRED`（409）——
-> 同属「读侧已登录才能看到、但写侧不保证接受」的情形。
+> ⚠️ **`chain_resolvable == false` 是既有交互路径，不是错误**：链尾（当前工序是
+> 链上最后一道）、锚链内按 `current_process_id` 定位不到当前 step、锚链已软删
+> 三种情形都归到这一支，前端一律弹对话框让用户手填下一道工序。
+>
+> **`chain_resolvable == true` 仍可能收到写侧 404（`20702`）**：本端点返回之后、
+> 用户点接收之前，该 step 被软删或 `current_process_step_id` 再次移动，写侧会
+> **404 `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`**（`chain {} 内找不到
+> process_id={} 的活跃 step`）。这类竞态无法在读侧消除，**前端必须处理
+> `20702` 兜底**：与 `chain_resolvable == false` 一样弹对话框让用户手填，重试
+> 一次即可。`p.process_chain_id IS NULL`（脏数据）时写侧会先撞 `20706
+> BIZ_PROCESS_CHAIN_REQUIRED`（409）—— 同属「读侧已登录才能看到、但写侧不保证
+> 接受」的情形。
 
 ---
 
@@ -283,11 +304,29 @@ AND deleted_at IS NULL`，归属锚是批次自身的
 
 ### 权限（逐条登记）
 
+**本域权限规则**：读面的守卫**对齐同域等价端点**（候选侧 ←
+`GET /outsource-sendable`；在途侧 ← `GET /outsource-shipments/in-flight`），
+**不跨域照抄 `/prod/pool/*` 的形态模板** —— 后者只吐内部批次元数据，不含商务
+敏感字段。改任一守卫前先按这条规则定位「同域等价端点」是哪一个，再对它的守卫
+取值。
+
 | 端点 | 权限 | 依据 |
 |---|---|---|
 | `GET /outsource-pool/counts` | **Manager + Clerk + Inspector** | 照抄 `GET /api/v2/prod/pool/counts`（`docs/api/production/worker-pool.md`「端点列表」行 + `service::pool_counts_all_shelves` 的 `require_any_role(&[Manager, Clerk, Inspector])`）—— admin 视角但不止 Manager。外协候选与在途本来就是业务/跟单视角，Clerk 必须能看 |
 | `GET /outsource-pool/{process_id}` | **Manager + Clerk + Inspector** | 照抄 `GET /api/v2/prod/pool/{process_id}`（同文档；`service::pool_by_process` 内 `require_any_role`）。与 `counts` 同集合：两者是同一个看板的 tab 列表与 tab 内容，权限必须一致，否则会出现「徽标看得见、点进去 403」 |
 | `GET /outsource-pool/state` | **Manager + Clerk** | 对齐同域等价数据端点 `GET /outsource-shipments/in-flight`（`docs/api/outsource-shipments.md`，Manager / Clerk）。**不放宽到「已登录」**：本端点除批次元数据外还吐 `price`（`t_outsource_shipment.unit_price`）与 `customer_name` / `parent_customer_name` / `applicant_name`，敏感级别与 `/in-flight` 同档；而 `GET /api/v2/prod/pool/state` 之所以能做到「已登录即可读」，是因为它只吐内部批次元数据 —— **不能把 prod 侧的宽松口径照抄到外协域**，否则 SHELF scope 账号被 `counts` / `{process_id}` 双双 403，却能经 `/state` 枚举任意外协公司的在外协批次、单价与客户 |
+
+> **`state` 行故意打破上面 `{process_id}` 那条「tab 列表与 tab 内容同权限」
+> 不变量**：Inspector 能看 tab（`counts` / `{process_id}`）但打不开公司列，
+> 是有意的敏感级取舍，不是漏配。理由见该行「依据」列。
+>
+> 由此产生**「能写不能读」**：外协写侧 3 个端点（`send-to-outsource` /
+> `receive-from-outsource` / `receive-from-outsource-to-inspection`）都是
+> **Manager + Clerk + Inspector**，读侧在途面只有 **Manager + Clerk** ⇒
+> Inspector 可以把批次发去外协、可以收回来，却看不到当前在外协的批次。这个
+> 不对称是**本域既有先例**（`/outsource-shipments/in-flight` 同样如此），本端点
+> 只是向它看齐、并非新造。若产品认为 Inspector 应当能看自己的在途面，应**同时**
+> 放宽 `/in-flight` 与本端点（只改一端只会把不对称挪个位置）。
 
 三处守卫都在 **service 层**（`current.require_any_role`），handler 不重复校验
 （与 work_type / assembly 域惯例一致）。负向回归网：`tests/outsource/pool.rs` 的
@@ -434,7 +473,7 @@ dashboard 事件），见 [`./websocket.md`](./websocket.md)。
 | `pool_state_returns_held_batches_with_shipment_fields` | 该公司在该工序的全部在外协批次（含 `sent_at` / `price` / `version`）；`current_held == items.len()`；别的公司 / 别的工序的批次不出现 |
 | `pool_state_chain_resolvable_when_next_step_exists` | 有下一 step ⇒ `chain_resolvable == true` 且 id / name = 下一 step 的工序 |
 | `pool_state_chain_unresolvable_when_no_step_or_chain_tail` | 链尾 / 无 `current_process_step_id` 两种情形 ⇒ `chain_resolvable == false`、`receive_next_process_id == "0"`、`_name == null` |
-| `pool_state_derives_next_step_from_parts_current_chain_after_rebind` | **读侧锚链与写侧同源**：part 改绑到链 B 后，`receive_next_process_id` 指向链 B 的下一道工序（不是旧链 A 的），且写侧 `resolve_step_id_by_process` 在链 B 内确实能解析到该 step |
+| `pool_state_derives_next_step_from_parts_current_chain_after_rebind` | **锚链内位置漂移下仍取对值**（防御性用例：裸 `UPDATE t_part SET process_chain_id` 绕过了 `link_chain_to_part` 的 `IS NULL` 守卫，该状态走产品路径不可达）：外协工序在锚链内从 `sort 1` 挪到 `sort 2` 后，`receive_next_process_id` 必须是**真正的下一道**（`sort 3`），且断言它 **≠ 外协工序自己**、≠ 旧链 A 的下一道、≠ 排在当前工序之前的工序；`chain_resolvable == true`；写侧 `require_process_chain` + `resolve_step_id_by_process` 落在同一链 / 同一 step |
 | `pool_state_does_not_fan_out_on_duplicate_applicant_name` | `t_applicant` 同名跨客户并存时 `items` **不扇出**（一个批次恒一行、无重复 `batch_id`）、`current_held == items.len()`、`applicant_name` 仍取到 |
 | `pool_state_rejects_missing_query_params_with_400` | 缺任一 query 参数 → **400**（非 500、非静默默认值） |
 

@@ -92,9 +92,10 @@ impl OutsourceService {
     /// 1. 候选侧 `GROUP BY next_process_id` 计数（与 `pool_by_process` 的 items
     ///    行粒度逐行一致）；
     /// 2. 在途侧 `GROUP BY current_process_id` 计数；
-    /// 3. 一次 `process_map_short(&all_ids)` 取齐工序元数据。
-    /// 4. （非 SQL）两张计数表求并集 + 只留 `sendable + in_flight > 0` 的工序 +
-    ///    按 `process_id ASC` 排。
+    /// 3. （非 SQL）两张计数表求并集 + 只留 `sendable + in_flight > 0` 的工序 +
+    ///    按 `process_id ASC` 排 —— 这一步在取元数据**之前**做，因为工序 id 集合
+    ///    就是并集的结果；
+    /// 4. 一次 `process_map_short(&all_ids)` 取齐工序元数据。
     pub async fn pool_counts<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
