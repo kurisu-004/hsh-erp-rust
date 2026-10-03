@@ -204,7 +204,6 @@ flush 直接断。
 | ↳ `DELIVERY_NOTE_BATCHES_ATTACHED` | 弹窗提交后（`POST /{note_id}/attach-batches`，2026-08-31 新增） | `{ delivery_note_id, attached_count, conflict_count }`（监听端用 `conflict_count > 0` 判断是否有失败项） |
 | ↳ `DELIVERY_NOTE_SUBMITTED` | 提交 | `note_id` |
 | ↳ `DELIVERY_NOTE_PICKED_UP` | 司机领取 | `note_id`, `driver_user_id` |
-| ↳ `DELIVERY_NOTE_PRINTED` | 打印（kind=`note` 或 `label`） | `note_id`, `kind` |
 | ↳ `PART_TO_SHIP` | to-ship 成功后 | `part_id` |
 | ↳ `PART_TO_INSPECTION` | to-inspection 成功后 | `part_id`, `shelf_code` |
 | ↳ `PART_TO_PROCESS` | to-process 成功后 | `part_id` |

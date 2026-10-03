@@ -85,6 +85,8 @@ dashmap = "6"
 # OpenDAL 仅作传递依赖声明。
 opendal = { version = "0.53", default-features = false, features = ["services-memory"] }
 
-# 不包含（按 PR13 Phase A 任务硬约束）：
-# - umya-spreadsheet / zip / quick-xml / tokio-stream / calamine：Excel 打印
-#   与真 COS 集成测试专属，与本测试基建解耦。
+# 依赖范围：只列本测试基建直接需要的依赖。主仓 integration test 自己用的依赖
+# （如转发链路分块响应桩的 tokio-stream）不进本 crate；确需仅为对齐传递依赖而声明的
+# （见上方 opendal / reqwest），须在行内注明。
+# 打印链路在 rust 侧是纯 BFF 转发（PDF / xlsx 生成由 python 执行），本 crate 不需要
+# 任何表格解析 / PDF 处理依赖。

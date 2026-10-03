@@ -6,6 +6,7 @@
 //! - `lifecycle.rs` —— part 级终态（cancel / force-complete）+ 各种 list 列表
 //!   （pending-programming / by-work-type / by-worker）
 //! - `batch.rs` —— 批量创建（batch / batch-with-bindings / batch-with-pdfs）+ 直传 COS confirm
+//! - `print.rs` —— 打印转发（print-drawing / print-drawing-batch，纯 BFF：鉴权 + 转发到 python）
 //!
 //! 2026-10-02：原 `inspection.rs` 整体迁至 `crate::modules::prod::batch::handler`
 //! （to-XXX 流 / 扫码 / worker-scan / 3 条批次集合读 + `lifecycle.rs` 里的 18 个
@@ -27,6 +28,7 @@
 pub mod batch;
 pub mod crud;
 pub mod lifecycle;
+pub mod print;
 
 // 2026-09-15 followup-cleanup A8：原 part 文件路由（cad-files / cnc-programs /
 // setup-sheets / cnc-pair / files）已迁出到 `src/modules/part_file/handler.rs::part_nested_router()`，

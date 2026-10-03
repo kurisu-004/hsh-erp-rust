@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -20,10 +20,6 @@ pub struct AppConfig {
     pub auto_complete: AutoCompleteConfig,
     /// Redis 会话存储（服务端 session 真相源；access token 吊销依赖）
     pub redis: RedisConfig,
-    /// 送货单 Excel 模板目录（P4 打印）。环境变量 `DELIVERY_NOTE_TEMPLATE_DIR`
-    /// 优先；缺省回退到编译期绝对路径 `<CARGO_MANIFEST_DIR>/template`，
-    /// 因此本地 `cargo run` 不依赖 cwd。
-    pub delivery_note_template_dir: PathBuf,
     /// 2026-09-14 新增：是否启用 /api/v2/_e2e/* hook。
     /// 启用后 e2e 测试可通过匿名 POST 直接灌入 seed 数据 + revoke session。
     /// 仅 dev / test 环境开启；prod 通过环境变量显式 `E2E_HOOKS_ENABLED=false`（ops 责任）。
@@ -70,6 +66,20 @@ pub struct AppConfig {
     /// （不影响 WS 长连接，也不影响根 Router 的 CORS/Body limit）。环境变量
     /// `REQUEST_TIMEOUT_SECONDS`，缺省 `30`。
     pub request_timeout_seconds: u64,
+    /// 2026-10-03 新增：打印路径 HTTP 请求超时（秒），缺省 `660`。与上面的通用档
+    /// 分档并存——`middleware::timeout` 按 [`crate::middleware::timeout::is_print_path`]
+    /// 判定：打印路径走本档，其余路径仍走 `request_timeout_seconds`（30s 不变）。
+    ///
+    /// ## 为什么缺省 660 而不是 600（多出的 60s 是有意的边际）
+    /// 批量图纸打印（20 件/批）由 Python 端执行，Python 侧超时是 600s
+    /// （`python_backend.print_timeout_ms`）。Rust 自己的超时必须**严格大于**
+    /// Python 的超时：两者同时到点时，先被杀的是 Rust，Python 侧真实的超时 / 上游
+    /// 错误就再也浮不上来，用户只会看到一句「请求超时」而看不到真正的原因。留
+    /// 60s（10%）边际后，Python 侧的 502 会先于 Rust 的 408 抵达前端，定位到的是
+    /// 准确原因而不是超时表象。
+    ///
+    /// 环境变量 `PRINT_REQUEST_TIMEOUT_SECONDS`，缺省 660。
+    pub print_request_timeout_seconds: u64,
     /// 2026-09-23 新增 Idempotency 中间件 TTL（秒）：POST/PUT/PATCH 带
     /// `Idempotency-Key` header 的请求，缓存响应在 Redis 中的过期时间。
     /// 环境变量 `IDEMPOTENCY_TTL_SECONDS`，缺省 `86400`（24h）。
@@ -229,6 +239,20 @@ pub struct AutoCompleteConfig {
 
 // 2026-09-28 删除：相关上传会话域配置结构体（域整体下线）。
 
+/// 2026-10-03 新增：Python 端**打印**执行超时缺省值（毫秒）= 10 分钟。
+///
+/// 抽成 const 是为了让「Rust HTTP 档必须比它多 60s 边际」这条不变量能被单测直接
+/// 断言（见 `tests::print_timeout_defaults_leave_headroom_over_python`），而不必去
+/// 读进程级 env（本仓 `env_parse` 读全局 env，同进程并行单测会互相覆盖）。
+const PYTHON_PRINT_TIMEOUT_MS_DEFAULT: u64 = 600_000;
+
+/// 2026-10-03 新增：Rust 端**打印路径** HTTP 超时缺省值（秒）= 600s + 60s 边际。
+///
+/// 为什么是 660 而不是 600：打印真正在 Python 端执行，Python 侧超时 600s。Rust
+/// 自己的超时若与它同时到点，先被杀的是 Rust，Python 真实的超时 / 上游错误再也
+/// 浮不上来。多留 60s 让 Python 侧的 502 先于 Rust 的 408 抵达前端，暴露准确原因。
+const PRINT_REQUEST_TIMEOUT_SECONDS_DEFAULT: u64 = 660;
+
 /// 2026-09-28 新增：rust → python 后端转发配置（薄壳鉴权转发专用）。
 ///
 /// ## 触发场景
@@ -240,6 +264,8 @@ pub struct AutoCompleteConfig {
 /// - `PYTHON_BACKEND_BASE_URL`：python 后端 base URL（如 `http://backend:8000`）；
 ///   设置即 `enabled=true`，未设置走 `NoopPyBackend`（本地 `cargo run` 不依赖 python）。
 /// - `PYTHON_STS_TIMEOUT_MS`：单次转发请求超时，缺省 `10_000`（10s）。
+/// - `PYTHON_PRINT_TIMEOUT_MS`（2026-10-03 新增）：打印转发专用超时，缺省 `600_000`
+///   （10 分钟）——打印在 Python 端执行，不能与 STS 的 10s 通道同档。
 ///
 /// ## 与原 `infra::python_sts::PythonStsConfig` 的区别
 /// 原 STS 配置随 `upload_session` 域下线已删除；本配置是新的「rust 鉴权后
@@ -250,6 +276,13 @@ pub struct PythonBackendConfig {
     pub base_url: String,
     /// 单次转发请求超时（毫秒），传给 `reqwest::Client::timeout`。
     pub timeout_ms: u64,
+    /// 2026-10-03 新增：**打印**转发专用超时（毫秒），缺省 `600_000`（10 分钟）。
+    /// 打印请求由 Python 端真正执行（批量图纸打印 20 件/批，合法耗时数分钟），
+    /// 不能与 STS 那条 10s 通道共用同一档；且换算成秒后必须严格小于
+    /// [`AppConfig::print_request_timeout_seconds`]（600s < 660s），否则先到点的是
+    /// Rust，Python 的真实错误被 408 掩盖。
+    /// 环境变量 `PYTHON_PRINT_TIMEOUT_MS`。
+    pub print_timeout_ms: u64,
     /// 是否启用真实转发。`false` → `NoopPyBackend`（本地 cargo run 不依赖 python）。
     pub enabled: bool,
 }
@@ -262,6 +295,7 @@ impl Default for PythonBackendConfig {
         Self {
             base_url: "http://localhost:8000".to_string(),
             timeout_ms: 10_000,
+            print_timeout_ms: PYTHON_PRINT_TIMEOUT_MS_DEFAULT,
             enabled: false,
         }
     }
@@ -502,10 +536,6 @@ impl AppConfig {
                 session_ttl_seconds: env_parse("REDIS_SESSION_TTL_SECONDS", 900u64)?,
                 pool_max_size: env_parse("REDIS_POOL_MAX_SIZE", 10usize)?,
             },
-            delivery_note_template_dir: PathBuf::from(env_or(
-                "DELIVERY_NOTE_TEMPLATE_DIR",
-                concat!(env!("CARGO_MANIFEST_DIR"), "/template"),
-            )),
             // 2026-09-14 新增：_e2e 路由门控。
             // 单一控制点 = env `E2E_HOOKS_ENABLED`（缺省 true）。docker compose / dev `cargo run`
             // 走默认（启用）；prod / staging 必须显式 `E2E_HOOKS_ENABLED=false`（ops 责任）。
@@ -521,6 +551,15 @@ impl AppConfig {
             ws_reauth_every_n_heartbeats,
             // 2026-09-20 新增：HTTP nest 请求超时；与 WS 隔离（挂在内层）。
             request_timeout_seconds: env_parse("REQUEST_TIMEOUT_SECONDS", 30u64)?,
+            // 2026-10-03 新增：打印路径专用 HTTP 超时档（`middleware::timeout` 按
+            // `is_print_path` 分档）。缺省 660s = Python 打印档 600s + 60s 边际，
+            // 理由见 `AppConfig::print_request_timeout_seconds` 的 doc。
+            // 用 `env_parse(.., 缺省)` 而非 `env_required`：本仓约定是「未配置则降级」
+            // （与 `python_backend` / `wecom` 的 enabled 闸同一范式），不是「未配置则拒启」。
+            print_request_timeout_seconds: env_parse(
+                "PRINT_REQUEST_TIMEOUT_SECONDS",
+                PRINT_REQUEST_TIMEOUT_SECONDS_DEFAULT,
+            )?,
             // 2026-09-23 新增 Idempotency 中间件 TTL（秒）。
             idempotency_ttl_seconds: env_parse("IDEMPOTENCY_TTL_SECONDS", 86_400u64)?,
             // 2026-09-26 新增：可选初始管理员账号种子开关（生产默认关闭）。
@@ -535,6 +574,12 @@ impl AppConfig {
                 PythonBackendConfig {
                     base_url,
                     timeout_ms: env_parse("PYTHON_STS_TIMEOUT_MS", 10_000u64)?,
+                    // 2026-10-03 新增：打印转发走独立长档（10 分钟），与 STS 的 10s 通道
+                    // 分开；见 `PythonBackendConfig::print_timeout_ms` 的 doc。
+                    print_timeout_ms: env_parse(
+                        "PYTHON_PRINT_TIMEOUT_MS",
+                        PYTHON_PRINT_TIMEOUT_MS_DEFAULT,
+                    )?,
                     enabled,
                 }
             },
@@ -857,6 +902,47 @@ mod tests {
         assert!(
             validate_ws_liveness(20, 0).is_err(),
             "pong=0 必须 bail（一连接上就判死）"
+        );
+    }
+
+    // =======================================================================
+    // 2026-10-03 新增：打印链路两档超时的缺省值钉子。
+    //
+    // 两个新配置都是纯缺省值（无跨字段校验），因此不拆「读 env / 纯校验」两段——
+    // 缺省值本身被提成 const，直接对 const 断言即可，不需要读进程级 env
+    // （`env_parse` 读全局 env，同进程并行单测会互相覆盖，见 `validate_ws_liveness`
+    // 上方的说明）。
+    // =======================================================================
+
+    /// Python 打印档缺省 10 分钟，且 `PythonBackendConfig::default()` 带上它
+    /// （`Default` 与 `from_env` 的缺省必须一致，否则本地 `cargo run` 与生产行为分叉）。
+    #[test]
+    fn python_print_timeout_default_is_ten_minutes() {
+        assert_eq!(PYTHON_PRINT_TIMEOUT_MS_DEFAULT, 600_000);
+        assert_eq!(PythonBackendConfig::default().print_timeout_ms, 600_000);
+        // 打印档与 STS 档是两个独立档位，别被合并成一个
+        assert!(PythonBackendConfig::default().timeout_ms < PYTHON_PRINT_TIMEOUT_MS_DEFAULT);
+    }
+
+    /// Rust 打印 HTTP 档缺省必须**严格大于** Python 打印执行档，且边际是 60s。
+    ///
+    /// 这条不变量是 660 这个数字的全部理由：两者同时到点时先被杀的是 Rust，
+    /// Python 侧真实的超时 / 上游错误（502）就被 Rust 的 408 掩盖了。留 60s 边际后
+    /// 502 先抵达前端，暴露的是准确原因。
+    #[test]
+    fn print_timeout_defaults_leave_headroom_over_python() {
+        assert_eq!(PRINT_REQUEST_TIMEOUT_SECONDS_DEFAULT, 660);
+        let python_seconds = PYTHON_PRINT_TIMEOUT_MS_DEFAULT / 1000;
+        assert_eq!(python_seconds, 600);
+        assert!(
+            PRINT_REQUEST_TIMEOUT_SECONDS_DEFAULT > python_seconds,
+            "Rust 档（{}s）必须严格大于 Python 档（{python_seconds}s），否则同时到点时是 Rust 先杀",
+            PRINT_REQUEST_TIMEOUT_SECONDS_DEFAULT
+        );
+        assert_eq!(
+            PRINT_REQUEST_TIMEOUT_SECONDS_DEFAULT - python_seconds,
+            60,
+            "边际固定 60s（10%），够覆盖 Python 回 502 的往返与响应收尾"
         );
     }
 }

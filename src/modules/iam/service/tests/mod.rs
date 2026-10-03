@@ -230,7 +230,6 @@ pub fn test_app_config() -> Arc<AppConfig> {
             session_ttl_seconds: 900,
             pool_max_size: 1,
         },
-        delivery_note_template_dir: std::path::PathBuf::new(),
         enable_e2e_hooks: false,
         ws_heartbeat_interval_seconds: 30,
         // 2026-10-01 新增：WS 存活检测（session service 单测不读 WS，占位默认值，
@@ -240,6 +239,8 @@ pub fn test_app_config() -> Arc<AppConfig> {
         // 2026-10-02 新增：周期性 re-auth 周期（与生产缺省一致）。
         ws_reauth_every_n_heartbeats: 10,
         request_timeout_seconds: 30,
+        // 2026-10-03 新增：打印路径长档（session service 单测不读，取生产缺省值）。
+        print_request_timeout_seconds: 660,
         // 2026-09-28 删除：相关上传会话域字段（域整体下线）。
         idempotency_ttl_seconds: 86400,
         bootstrap_admin_enabled: false,

@@ -7,7 +7,6 @@
 //! - `scan` — DeliveryNoteService::scan_add（P3 扫码入单）+ NoteScope 分类 +
 //!   5 组分类 helpers + resolve_scan_kind（按业务子域再拆为
 //!   `scan/{mod, classify, resolve_scan_kind, helpers, find_or_create, tests}.rs`）
-//! - `print` — DeliveryNoteService::print_xlsx（P4 Excel 打印）
 //! - `attach` — DeliveryNoteService::attach_batches（P3+ 弹窗批量 attach）
 //! - `inner` — 跨子模块共享的私有 helper（`build_note_outs` / `add_parts_inner` /
 //!   `write_event` / `validate_*` / 错误构造器 等）
@@ -17,7 +16,7 @@
 //! - `service::DeliveryNoteService::{list_with_filters, list_for_pickup, create_draft,
 //!    get_with_parts, get_many_with_parts, update, add_parts, remove_parts, submit, recall,
 //!    pickup_scan, pickup, soft_delete, list_events, list_candidate_parts, scan_add,
-//!    attach_batches, print_xlsx}`
+//!    attach_batches}`
 //!
 //! ## 2026-09-22 D-5 重构对齐 iam / shelf / customer 范本（review 第 1 轮修正）
 //! - 本域 SQL 真源统一在 `repo/sql.rs`（原 `repo/query.rs` + `repo/mutate.rs`
@@ -44,7 +43,6 @@ mod crud;
 mod group;
 mod inner;
 mod lifecycle;
-mod print;
 mod scan;
 
 use std::sync::Arc;

@@ -262,6 +262,20 @@ pub async fn idempotency_middleware(
         return next.run(req).await;
     }
 
+    // 1.6) 2026-10-03 新增：打印路径闸门 —— 打印响应**直接 pass-through，不缓存**。
+    // 防御目标：本中间件会把下游响应**整份 body 缓冲进内存并写进 Redis 24h**。
+    // 前端打印请求（送货单 print / print-labels、零件 print-drawing /
+    // print-drawing-batch）正常不带 Idempotency-Key，所以线上无感；但只要有人
+    // 带上（网关/客户端统一注入、或未来某个打印批次的重试逻辑），多 MB 的
+    // PDF / XLSX 就会被整份塞进 Redis —— 一次批量打印 20 件就是几十 MB，
+    // 反复几次即可把实例 OOM。缓存打印二进制也毫无收益：打印是只读渲染，
+    // 同一份 key 命中另一台机器的渲染结果反而可能是过期的。
+    // 本闸门与 route_layer 顺序（auth 在外层 = 先跑）同样构成双保险：即便
+    // 顺序错位也不缓存打印响应。
+    if crate::middleware::timeout::is_print_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+
     // 2) 提取 header 并校验长度
     let key = match extract_key(req.headers()) {
         Some(k) => k,
@@ -447,5 +461,97 @@ where
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         Ok(IdempotencyKey(raw))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2026-10-03 新增：打印路径跳过闸门与**已注册路由**逐字对齐。
+    ///
+    /// 这条测试钉的是「改了一边忘了另一边」这个失效模式：若有人把
+    /// `print-drawing` 改名而没同步 [`crate::middleware::timeout::is_print_path`]，
+    /// 后果是双向的 —— 该端点既拿不到长档超时（批量打印被 30s 砍断），
+    /// 打印响应又会重新落进 Redis 缓存。两者都不可接受。
+    ///
+    /// 断言方向：中间件只对 `is_print_path` 判定为真的路径跳过缓存，所以这里
+    /// 反过来断言「4 条已注册打印路由的两种路径形态（带 /api/v2 前缀的生产形态
+    /// + 测试直挂 v2_router 的裸路径形态）都必须命中该判定」。
+    #[test]
+    fn print_gate_covers_every_registered_print_route() {
+        for p in [
+            "/api/v2/delivery-notes/1234567890/print",
+            "/api/v2/delivery-notes/1234567890/print-labels",
+            "/api/v2/parts/1234567890/print-drawing",
+            "/api/v2/parts/print-drawing-batch",
+            "/delivery-notes/1234567890/print",
+            "/delivery-notes/1234567890/print-labels",
+            "/parts/1234567890/print-drawing",
+            "/parts/print-drawing-batch",
+        ] {
+            assert!(
+                crate::middleware::timeout::is_print_path(p),
+                "打印路径应命中跳过闸门（否则多 MB 的 PDF/XLSX 会被整份塞进 Redis）：{p}"
+            );
+        }
+    }
+
+    /// 跳过闸门不能误伤普通端点：写路径（POST）仍必须正常进缓存。
+    #[test]
+    fn print_gate_does_not_swallow_regular_write_paths() {
+        for p in [
+            "/api/v2/delivery-notes",
+            "/api/v2/parts",
+            "/api/v2/parts/1234567890/update",
+            "/api/v2/delivery-notes/1234567890/submit",
+            // 名字相近但不是打印的路径：既不命中 is_print_path，也不该被跳过缓存
+            "/api/v2/delivery-notes/1234567890/print-preview",
+            "/api/v2/parts/1234567890/print-drawing-batch",
+        ] {
+            assert!(
+                !crate::middleware::timeout::is_print_path(p),
+                "非打印路径不该命中跳过闸门（否则幂等能力被静默关掉）：{p}"
+            );
+        }
+    }
+
+    /// 公开路径闸门的既有语义保持不变（登录响应含 JWT，绝不可缓存）。
+    #[test]
+    fn public_path_gate_still_rejects_auth_endpoints() {
+        assert!(is_public_idempotency_path("/api/v2/iam/login"));
+        assert!(is_public_idempotency_path("/iam/login"));
+        assert!(is_public_idempotency_path("/api/v2/iam/refresh"));
+        assert!(is_public_idempotency_path("/api/v2/wx/iam/wx-login"));
+        assert!(!is_public_idempotency_path(
+            "/api/v2/delivery-notes/1/print"
+        ));
+    }
+
+    /// `extract_key`：1..=255 长度才返回 `Some`，其余 pass-through。
+    #[test]
+    fn extract_key_enforces_length_bounds() {
+        let mut h = HeaderMap::new();
+        assert!(extract_key(&h).is_none(), "header 缺失 → None");
+
+        h.insert(HEADER_NAME, HeaderValue::from_static("k"));
+        assert_eq!(extract_key(&h).as_deref(), Some("k"));
+
+        h.insert(HEADER_NAME, HeaderValue::from_static(""));
+        assert!(extract_key(&h).is_none(), "空串 → None（pass-through）");
+
+        let long = "x".repeat(KEY_MAX_LEN);
+        let mut h2 = HeaderMap::new();
+        h2.insert(HEADER_NAME, HeaderValue::from_str(&long).unwrap());
+        assert_eq!(
+            extract_key(&h2).as_deref(),
+            Some(long.as_str()),
+            "恰好 255 字符应放行"
+        );
+
+        let too_long = "x".repeat(KEY_MAX_LEN + 1);
+        let mut h3 = HeaderMap::new();
+        h3.insert(HEADER_NAME, HeaderValue::from_str(&too_long).unwrap());
+        assert!(extract_key(&h3).is_none(), "超长 → None（不传 4xx）");
     }
 }

@@ -11,7 +11,7 @@
 > - [`./production/workers.md`](./production/workers.md) — worker 域（CRUD + verify-badge + deactivate/reactivate，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文件从顶层迁入 `production/`）
 > - [`./production/index.md`](./production/index.md) — **生产管理** 域（工种/工序/工序映射/工艺链/工人候选池 + 工人档案；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias）
 > - [`./production/batches.md`](./production/batches.md) — `prod::batch` 域（车间下发 PENDING 列表 + dispatch / auto-dispatch；**2026-10-02 承载 `t_part_batch` 生产流转 25 条子资源路由**（自 part 域迁入，锚点 `part_id` → `batch_id`，硬切换无 alias，旧路径 404），逐条清单见该文件「`t_part_batch` 子资源迁入」节）
-> - [`./parts/index.md`](./parts/index.md) — part 域（CRUD / 文件 / 列表 / 多批次动作 `cancel` / `force-complete`）。**2026-10-02 域收窄**：to-inspection / to-ship / to-process / **worker-scan** 等 25 条 batch 子资源已迁 prod 域，清单见 [`./production/batches.md`](./production/batches.md#2026-10-02-t_part_batch-子资源迁入)
+> - [`./parts/index.md`](./parts/index.md) — part 域（CRUD / 文件 / 列表 / 多批次动作 `cancel` / `force-complete` / 图纸打印 2 端点；已拆为子目录：[`crud`](./parts/crud.md) / [`lifecycle`](./parts/lifecycle.md) / [`inspection`](./parts/inspection.md) / [`batch`](./parts/batch.md) / [`print`](./parts/print.md)）。**2026-10-02 域收窄**：to-inspection / to-ship / to-process / **worker-scan** 等 25 条 batch 子资源已迁 prod 域，清单见 [`./production/batches.md`](./production/batches.md#2026-10-02-t_part_batch-子资源迁入)
 > - [`./assemblies/index.md`](./assemblies/index.md) — assembly 域（8 端点：装配体 CRUD + multipart PDF + 子件自动生成 + start + 子件 auto-rollup，2026-09-14 Phase 3）
 > - [`./cnc-programs.md`](./cnc-programs.md) — cnc_program 域（2 端点：配对上传 + 列表，2026-09-14 Phase 3）
 > - [`./files.md`](./files.md) — part_file 域（multipart 上传 + 列表 + 下载 URL + confirm 绑定，2026-09-14 Phase 3；2026-09-18 删除 upload-intents；2026-09-28 删除相关 STS 会话域，前端改为单 uploader + python `sts-tmp-keys` 数组入参直签）
@@ -84,6 +84,7 @@ HTTP 状态码：
 | 未授权 | 401 | 40100 / 40101 / 40102 / 40103 |
 | 权限不足 | 403 | 40300 / 40301 / 20606 |
 | 资源不存在 | 404 | 40400 + 2xxxx_NOT_FOUND |
+| 请求超时 | 408 | 40800 |
 | 状态冲突 | 409 | 40901 + 2xxxx_DUPLICATE / _IN_USE / _LOCKED |
 | 请求体过大 | 413 | 41301 |
 | 系统错误 | 500 | 50000 / 50001 |
@@ -180,6 +181,7 @@ HTTP 状态码：
 - 命中缓存（同 key 24h 内）：直接返回首次响应（status + headers + body 字节级一致）
 - 缺失 header：pass-through（零 Redis I/O）
 - 公开路径（health / login / refresh / _e2e）：不缓存（防 JWT 缓存泄漏劫持 session）
+- 打印路径（4 个打印端点，`delivery-notes/{id}/print` / `print-labels` / `parts/{part_id}/print-drawing` / `parts/print-drawing-batch`）：不缓存（响应是数 MB 的 PDF / xlsx，不该进 Redis）
 - 简化方案：key 不与 method/path 绑定——跨方法同 key 撞车（client bug，暴露而非掩盖）
 - TTL：默认 24h（`IDEMPOTENCY_TTL_SECONDS` env 可调）
 
@@ -208,7 +210,7 @@ HTTP 状态码：
 | shelves | [`./shelves.md`](./shelves.md) | 7 | ✅ 完全上线（CRUD + picker，2026-08-26；**2026-10-02 域拆分：端点 10 → 7（文档原写 11，逐 router 复核实为 10）—— 3 个货架↔工序映射端点搬到 [`production/shelf-process-mapping.md`](./production/shelf-process-mapping.md)（prod 域，无 alias）；货架↔账号部分**消除**（`ShelfOut.account_count` 删除，绑定真源在 iam `t_user_role`，零 iam 改动）**） |
 | workers（已并入 prod） | [`./production/workers.md`](./production/workers.md) | 7 | ✅ 完全上线（CRUD + verify-badge + deactivate/reactivate + id_card_no 40901，2026-08-26；2026-09-19 聚合于 prod 模块 → `/api/v2/prod/workers`，文档从顶层迁入 `production/`） |
 | **生产管理** | [`./production/index.md`](./production/index.md) | **60** | ✅ 完全上线（工种/工序/工序映射/工艺链/工人候选池 + 工人档案 + 待下发批次 + 待编程一览；按前端 `production_group` 菜单整合为子目录，2026-09-12；2026-09-19 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步；2026-10-01 增 `prod::programming` 待编程一览 1 端点；**2026-10-02 增 `prod::shelf_process` 货架↔工序映射 3 端点，自 shelves 域搬入；2026-10-02 增 `t_part_batch` 子资源 25 端点，自 part 域搬入**） |
-| part | [`./parts/index.md`](./parts/index.md) | **24**（**method 级**注册数：`GET /` 与 `POST /` 记 2 条） | ✅ 完全上线（2026-10-01 `t_part_batch.status` 收口为 `status_gate` 单一写入口；**2026-10-02：25 条 batch 子资源迁 prod 域，part 域只留多批次动作（`/{part_id}/cancel` / `force-complete`）与非批次动作**；**2026-10-03：2 条错形状的外协 list 端点下线并迁往 outsource 域，25 → 24**。口径与逐 commit 复核链见 [`./inconsistencies.md`](./inconsistencies.md) § 2 —— 此前各文档里的 25 / 48 / 49 / 50 都是 `.route()` **调用数**，漏掉 `route("/")` 上的第 2 个 method） |
+| part | [`./parts/index.md`](./parts/index.md) | **26**（**method 级**注册数：`GET /` 与 `POST /` 记 2 条） | ✅ 完全上线（2026-10-01 `t_part_batch.status` 收口为 `status_gate` 单一写入口；**2026-10-02：25 条 batch 子资源迁 prod 域，part 域只留多批次动作（`/{part_id}/cancel` / `force-complete`）与非批次动作**；**2026-10-03：2 条错形状的外协 list 端点下线并迁往 outsource 域，25 → 24**；**2026-10-03：新增 2 条图纸打印端点（`GET /parts/{part_id}/print-drawing` / `POST /parts/print-drawing-batch`，纯 BFF 转发到 python 执行渲染，见 [`./parts/print.md`](./parts/print.md)），24 → 26**。口径与逐 commit 复核链见 [`./inconsistencies.md`](./inconsistencies.md) § 2 —— 此前各文档里的 25 / 48 / 49 / 50 都是 `.route()` **调用数**，漏掉 `route("/")` 上的第 2 个 method） |
 | admin（对账） | [`./admin.md`](./admin.md) | 1 | ✅ 完全上线（2026-10-01 新增 `POST /api/v2/admin/recompute-rollup`；Manager 单角色；**复用**既有 rollup 实现，不新增派生算法） |
 | assembly | [`./assemblies/index.md`](./assemblies/index.md) | **8** | ✅ 完全上线（Phase 3 加 /start + /files，2026-09-14） |
 | cnc-programs | [`./cnc-programs.md`](./cnc-programs.md) | 2 | ✅ 完全上线（2026-09-14，Phase 3） |
@@ -256,6 +258,7 @@ HTTP 状态码：
 | 40300 | FORBIDDEN | 403 |
 | 40301 | SHELF_MISMATCH | 403 |
 | 40400 | NOT_FOUND | 404 |
+| 40800 | REQUEST_TIMEOUT | 408 |
 | 40901 | VERSION_CONFLICT | 409 |
 | 41301 | REQUEST_TOO_LARGE | 413 |
 | 50000 | INTERNAL | 500 |
@@ -283,14 +286,14 @@ HTTP 状态码：
 | 201xx | 零件/客户/序列号（PART_NOT_FOUND 20101 / CUSTOMER_NOT_FOUND 20102 / INVALID_TRANSITION 20103 / INVALID_VALUE 20104 / SERIAL_EXHAUSTED 20105 / ... / PART_BATCH_NOT_FOUND 20109 / PRICE_LOCKED_BY_ASSEMBLY 20110 / PART_BATCH_INVALID_QUANTITY 20111 / PART_QUANTITY_LOCKED 20112 / CUSTOMER_IN_USE 20113 / **PART_BATCH_NOT_HELD_BY_WORKER 20114 / PART_ALREADY_CANCELLED 20115 / PART_NOT_DELIVERED 20116 / PART_NOT_READY_TO_SHIP 20117 / PART_REPAIR_NOT_TRIGGERED 20118 / PART_NOT_DELETABLE 20119**） |
 | 202xx | 工人（WORKER_NOT_FOUND 20201 / WORKER_INACTIVE 20202 / WORKER_IN_USE 20203 / WORKER_HOLD_LIMIT_EXCEEDED 20204 / **WORKER_POOL_EMPTY 20205 / NO_WORK_TYPE 20206**） |
 | 203xx | 装配体（ASSEMBLY_NOT_FOUND 20301 / BAD_CUSTOMER 20302 / TOO_MANY_CHILDREN 20303 / **PDF_INVALID 20305 / CHILD_PRICE_LOCKED 20306 / HAS_SHIPMENT 20307 / CUSTOMER_NO_SERIAL_PREFIX 20308**） |
-| 204xx | 图纸文件（DRAWING_FILE_NOT_FOUND 20401 / BAD_TYPE 20402 / TOO_LARGE 20403 / UPLOAD_FAILED 20404） |
-| 205xx | **货架域**（20501 SHELF_NOT_FOUND / 20502 DUPLICATE_CODE / 20503 IN_USE / NOT_INSPECTION_ZONE 20511 / INACTIVE 20512）；**货架↔工序映射端点物理在 prod 子模块** —— 20504 PROCESS_SHELF_NOT_FOUND / 20505 PROCESS_PROCESS_NOT_FOUND（[`prod::shelf_process`](./production/shelf-process-mapping.md)，2026-10-02 自 shelves 域搬入）/ 20506 NO_MATCH_FOR_PROCESS / 20507 PROCESS_NOT_MAPPED（`prod::worker_pool` + `part::worker_scan` + delivery print 复用）/ 20508 PROCESS_NOT_FOUND（`prod::batch` dispatch 复用） |
+| 204xx | 图纸文件（DRAWING_FILE_NOT_FOUND 20401 / BAD_TYPE 20402 / TOO_LARGE 20403 / UPLOAD_FAILED 20404）；**rust → python 转发失败**（BIZ_STS_FORWARD_FAILED 20406 —— `POST /api/v2/files/sts-tmp-keys`，见 [`./files.md`](./files.md)；**BIZ_PRINT_FORWARD_FAILED 20407** —— 4 个打印端点，见 [`./parts/print.md`](./parts/print.md) 与 [`./delivery-notes/print.md`](./delivery-notes/print.md)） |
+| 205xx | **货架域**（20501 SHELF_NOT_FOUND / 20502 DUPLICATE_CODE / 20503 IN_USE / NOT_INSPECTION_ZONE 20511 / INACTIVE 20512）；**货架↔工序映射端点物理在 prod 子模块** —— 20504 PROCESS_SHELF_NOT_FOUND / 20505 PROCESS_PROCESS_NOT_FOUND（[`prod::shelf_process`](./production/shelf-process-mapping.md)，2026-10-02 自 shelves 域搬入）/ 20506 NO_MATCH_FOR_PROCESS / 20507 PROCESS_NOT_MAPPED（`prod::worker_pool` + `part::worker_scan` 复用）/ 20508 PROCESS_NOT_FOUND（`prod::batch` dispatch 复用） |
 | 206xx | 账号（USER_ACCOUNT_NOT_FOUND 20601 / DUPLICATE_USERNAME 20602 / INACTIVE 20603 / ROLE_DUPLICATE 20604 / ROLE_NOT_FOUND 20605 / NO_ROLE 20606） |
 | 207xx | 工艺链（**PROCESS_CHAIN_NOT_FOUND 20701 / PROCESS_CHAIN_STEP_NOT_FOUND 20702 / WORK_TYPE_MAX_HELD_MINUTES_NOT_SET 20703 / AUTO_ALLOCATE_INVALID_RATIO 20704 / PROCESS_CHAIN_PART_NOT_PENDING 20705 / PROCESS_CHAIN_REQUIRED 20706**） |
 | 208xx | 工序（PROCESS_NOT_FOUND 20801 / DUPLICATE_CODE 20802 / IN_USE 20803） |
 | 209xx | 工种（WORK_TYPE_NOT_FOUND 20901 / DUPLICATE_CODE 20902 / IN_USE 20903 / **MAX_HELD_NOT_SET 20904 / NO_PROCESS_MAPPING 20905**） |
 | 210xx | 申请人（APPLICANT_NOT_FOUND 21001 / DUPLICATE_NAME 21002 / BAD_CUSTOMER 21003 / IN_USE 21004） |
-| 211xx | 零件文件 / 模板（PART_FILE_NOT_FOUND 21101 / BAD_TYPE 21102 / TOO_LARGE 21103 / UPLOAD_FAILED 21104 / OWNER_NOT_FOUND 21105 / DUPLICATE 21108 / DELIVERY_TEMPLATE_NOT_CONFIGURED 21109 / DELIVERY_PART_STATUS_INVALID 21111 / TEMPLATE_TOO_MANY_PARTS 21112 / PRINT_BAD_ORDER 21113 / **PART_FILE_TMP_OBJECT_MISSING 21114 / PART_FILE_SIZE_MISMATCH 21115**）⚠️ 21110 已 deprecated 别名 = 21407 |
+| 211xx | 零件文件 / 模板（PART_FILE_NOT_FOUND 21101 / BAD_TYPE 21102 / TOO_LARGE 21103 / UPLOAD_FAILED 21104 / OWNER_NOT_FOUND 21105 / DUPLICATE 21108 / DELIVERY_TEMPLATE_NOT_CONFIGURED 21109 / DELIVERY_PART_STATUS_INVALID 21111 / TEMPLATE_TOO_MANY_PARTS 21112 / PRINT_BAD_ORDER 21113 / **PART_FILE_TMP_OBJECT_MISSING 21114 / PART_FILE_SIZE_MISMATCH 21115**）⚠️ 21110 已 deprecated 别名 = 21407；**打印模板码 21109 / 21111 / 21112 / 21113 已无 rust 生产点**（打印端点是纯转发，链路上的码由 python 端产出后原样透传；其中这 2 个打印端点当前实际会收到的码见 [`./delivery-notes/print.md`](./delivery-notes/print.md)） |
 | 212xx | 外协公司（OUTSOURCE_COMPANY_NOT_FOUND 21201 / DUPLICATE 21202 / BAD_PROCESS 21203 / PROCESS_NOT_MAPPED 21204 / IN_USE 21205 / **PART_NOT_OUTSOURCEABLE 21206 / DIRECT_REQUIRES_C2_SHELF 21207 / NO_SHELF 21208**） |
 | 213xx | 外协报价（OUTSOURCE_QUOTE_NOT_FOUND 21301 / INVALID_TRANSITION 21302 / DUPLICATE 21303 / NOT_APPROVED 21307） |
 | 214xx | 送货单（NOT_FOUND 21401 / INVALID_TRANSITION 21402 / NOT_DRAFT 21403 / NOT_SUBMITTED 21404 / PART_NOT_READY 21405 / PART_ALREADY_ASSIGNED 21406 / PARTS_MULTIPLE_CUSTOMERS 21407 / SCAN_MISMATCH 21408 / DRIVER_INVALID 21409 / SCAN_INCOMPLETE 21410 / INVALID_VALUE 21411 / PARTS_LOCKED 21412 / GROUP_NOT_FOUND 21413 / GROUP_DUPLICATE_NAME 21414 / GROUP_MEMBER_CONFLICT 21415 / SCOPE_MISMATCH 21416 / SCAN_UNKNOWN_CODE 21417 / ASSEMBLY_PARTS_NOT_READY 21418 / DRAFT_SCOPE_CONFLICT 21419 / LOCKED_PART 21420 / **BATCH_STATE_INVALID 21421**） |
