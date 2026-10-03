@@ -63,11 +63,10 @@
 **可出货套数**，覆盖写入 body 的两个键。
 
 **覆盖契约（定死，无歧义）**：`merge_quantities` 一旦被写入，就是**整体替换**
-该键（`assembly_ids` 同理），不是逐键 merge。前端发的同名字段
-（`PrintPreviewDialog.vue` 里操作员手填的「装配件行套数」）**全部作废**，
-Python 端不会看到任何前端值。唯一的例外是「本单没有可解析装配件」时
-两个键都不写，此时前端自己发的 `merge_quantities` 原样透传 —— 但那时
-`assembly_map` 为空，Python 端也用不到它。
+该键（`assembly_ids` 同理），不是逐键 merge。前端发来的同名字段**全部作废**，
+Python 端不会看到任何前端值（前端已不再发这两个键，见「跨仓生效前提」第 3 条）。
+唯一的例外是「本单没有可解析装配件」时两个键都不写、body 原样转发 —— 但那时
+`assembly_map` 为空，Python 端也用不到它们。
 
 | 键 | 类型 | 谁写 | 说明 |
 |---|---|---|---|
@@ -128,26 +127,33 @@ JSON number（套数是计数，不是 id）。
 
 ### 跨仓生效前提（缺一即静默空操作）
 
-注入的 `merge_quantities` 要真正影响 xlsx，**下列 3 件事必须同时成立**，
-任一不成立都不会报错、只是结果与今天完全一样：
+注入的 `merge_quantities` 要真正影响 xlsx，**下列 3 件事必须同时成立**，任一不成立
+都不会报错、只是套数注入退化成空操作（xlsx 回落成「每套装配件 1 套」）。2026-10-04
+三仓齐发后三条均已满足；仍逐条列出，是为了让后来人改动其中任一环时能立刻意识到
+会再次静默失效：
 
 1. **前端必须发 `merge_assemblies = true`**。Python 端 `_build_print_rows` 在
    `merge_assemblies` 为假时**直接早退逐行输出**，`merge_quantities` 根本不被读取。
-   2026-10-04 review 第 3 轮（MINOR-2）订正：本条原文写「前端当前默认值是
-   `false`」是**事实错误** —— `PrintPreviewDialog.vue` 的 `mergeMode` 初值是
-   `'merge'`（`ref<'separate' | 'merge'>('merge')`，`onConfirm` 里 `mergeFlag = true`），
-   即**默认就是合并模式、默认发 `merge_assemblies = true`**，本条前提当前**已满足**。
+   `PrintPreviewDialog.vue` 的 `mergeMode` 初值是 `'merge'`
+   （`ref<'separate' | 'merge'>('merge')`，`onConfirm` 里 `mergeFlag = true`），即
+   **默认就是合并模式、默认发 `merge_assemblies = true`**，本条前提当前**已满足**；
    只有操作员主动切到「分开打印」时才是 `false`，**那个分支下注入是空操作**。
-2. **Python 端 `PrintDeliveryNoteRequest` 必须有 `assembly_ids` 字段**。现状：Python
-   的请求模型只有 `merge_assemblies` / `merge_quantities`，**没有** `assembly_ids`，
-   API 层还硬传 `assembly_ids=None`（`api/v1/delivery_note_print.py`）⇒ Rust 注入的
-   `assembly_ids` 会被 pydantic **静默丢弃**，`assembly_map` 为空 ⇒ 装配件合并不生效。
-   Rust 侧不会因此报错（注入发生在转发 body 上，Python 收不收由它自己决定）。
-   **这条必须进跨仓验收**：Python 端补上该字段并把它透传给
-   `service.print*` 后，本文件的两条链路才真正闭环。
-3. **前端手工 override 的 UI 需清理**。`PrintPreviewDialog.vue` 装配件行的
-   `el-input-number`（默认写死 1）与 `merge_quantities[asm] = r.quantity` 现在
-   全部被 Rust 覆盖，属死代码，留着会让操作员以为自己填的值生效。
+2. **Python 端 `PrintDeliveryNoteRequest` 必须有 `assembly_ids` 字段**。
+   2026-10-04 已满足：Python 端补上了
+   `assembly_ids: list[str] | None = Field(default=None, max_length=500)`
+   （`api/v1/delivery_note_print.py`），新增 `_parse_assembly_ids` 把 str 列表解析成
+   service 层的 `list[int]`（非法 / 空 id → 400，不静默丢弃），`/print` 与
+   `/print-labels` 两个 handler 都改为取 body 值透传给 `service.print*`（原先硬传
+   `assembly_ids=None`）⇒ `assembly_map` 不再恒空，装配件合并真正生效。
+   ⚠️ **三仓版本必须齐发**：`/api/v1/*` 无公网入口、pydantic 对未知字段默认静默
+   丢弃，所以 Python 端一旦回退该字段或漏发本次改动，Rust 侧**不会报错**、注入照样
+   成功，只是 `assembly_map` 仍为空，结果与本次修复前完全一样。
+3. **前端不得再引入手工 override**。2026-10-04 已满足：前端的
+   `PrintPreviewDialog.vue` 装配件行 `el-input-number` 与
+   `merge_quantities[asm] = r.quantity` 发送均已删除，`PrintNotePayload` 不再带
+   `merge_quantities`；父行数量改为只读展示后端算出的 `shippable_sets`（该值缺失渲染
+   「—」、真 0 渲染「0 套」）。⚠️ 若前端重新加回「手填装配件套数」的输入并随请求
+   发送，它会被 Rust 整体覆盖，操作员却以为自己填的值生效。
 
 ### `POST /api/v2/delivery-notes/{id}/print`  （P4 打印）
 
@@ -274,7 +280,8 @@ Rust 侧不预判、不枚举；前端按 `{code, message, data}` 解封即可�
   body，不参与任何业务写入。
 - **读失败 fail-loud，绝不降级成「不注入」**：DB 读失败一律 `AppError::Database`
   （50001 / HTTP 500），不 catch 后原样转发。理由：降级会让 Python 端回落到
-  「每套装配件默认 1 套」（`_build_print_rows` 里 `(merge_quantities or {}).get(asm_id, 1)`）
+  「每套装配件默认 1 套」（`_build_print_rows` 里 `(merge_quantities or {}).get(asm_id, 1)`；
+  该回落**只在 Rust 未注入该键时**发生，正常链路上该键恒由 Rust 写入）
   ⇒ 静默打出**错标签**，用户拿到一份看起来正常但套数全错的 xlsx。打印错标签比
   打印失败难查得多。
 - **取数 3 步，不新增 `query!` 宏**：① `PartBatchRepo::list_with_part_by_delivery_note`
