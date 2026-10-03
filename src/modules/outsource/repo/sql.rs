@@ -1230,10 +1230,55 @@ fn sendable_dedup_sql(inner_projection: &str, dedup_projection: &str) -> String 
 ///
 /// **过滤位置约定**：keyword / customer_id / process_id 全部停在**外层 `d`** 上，
 /// 内层不重复过滤 —— 谓词改动只有一个落点，不会出现「改了 list 忘了 count」。
+/// 其中 `customer_id` 的谓词由共享常量 `SENDABLE_CUSTOMER_SUBTREE_PREDICATE` 提供，
+/// `list` 与 `count` 引用的是同一个符号（见该常量注释）。
 ///
 /// **DIRECT 且 `company_options` 为空的行保留返回**（前端 `canSend()` 据
 /// `company_options.length >= 1` 置灰），count / counts 口径同样保留。
 pub struct OutsourceSendableRepo;
+
+/// `customer_id` 过滤谓词（2026-10-04 新增）：命中该客户**子树**，而非只命中它本身。
+///
+/// 起因是实测到的分布：`t_part.customer_id` 指向的都是叶子客户，而前端客户树选中的
+/// 常常是 L1 ⇒ 只判 `d.customer_id = $2` 时，选中一个 L1 必然 total 0（「可发送列表
+/// 没有任何批次」的根因）。谓词分三支：
+///
+/// - `$2 IS NULL` → 不过滤；
+/// - `d.customer_id = $2` → **该支必须保留**：传 L2 id 时行为与展开前逐字一致，
+///   整个改动是纯放宽，老前端的请求参数无需任何变更即可独立上线；
+/// - `d.customer_id IN (子客户)` → L1 展开一层，吃 `ix_t_customer_parent_id`。
+///
+/// **「展开一层即完整」是数据观察，不是被强制的结构不变式**（2026-10-04 订正措辞）。
+/// 生产库当日实测：客户 14 个（3 L1 + 11 L2），**L3 数量 0**，全库 1874 个零件**全部**
+/// 挂在 L2 上、直接挂 L1 的零件数为 0。但 API 层**不强制**这个结构 ——
+/// `POST /api/v2/com/customers`（`com/customer/service/crud.rs::create_customer`）只按
+/// `parent_id.is_some()` 校验 `serial_prefix` 三态，**不校验 `parent_id` 是否指向根
+/// 客户**（连存在性都不查，表上无物理外键）；`update_customer` 禁改 `parent_id` ⇒
+/// create 是唯一能造出 L3 的入口，传个 L2 的 id 当 `parent_id` 即可。
+///
+/// **日后一旦出现 L3，本谓词必须改成递归 CTE**（`WITH RECURSIVE`），否则传 L1 会漏掉
+/// L3 名下的批次。⚠️ 该退化**是静默的**：只表现为 `total` 偏小 / 少报，不报任何错，
+/// 零命中守卫也不触发 —— 属于本仓反复要避免的失败模式。
+///
+/// 集成测试 `sendable_customer_id_l1_expands_to_children` 造的 L3 是自己直接 SQL 插
+/// 进去的（绕开 API），断言它**不**命中 ⇒ 它守的是「有人把谓词改成递归 CTE 会立刻
+/// 红」，**不是**「数据里不会出现 L3」。真出现 L3 时该测试不会红。
+///
+/// **软删节点行为不对称**（2026-10-04 review 第 1 轮登记，不是 bug，别反复查）：传一
+/// 个已软删的 L2 id 时 `d.customer_id = $2` 那一支不过滤 `deleted_at`，其零件照样命中；
+/// 而传它的父客户时，该软删 L2 被子查询的 `c2.deleted_at IS NULL` 排除 ⇒ 同一批零件
+/// 「按自己查得到、按父亲查不到」。零件可见性不受客户 ACL 约束（故不是权限漏洞），
+/// 业务上客户一旦被引用就被 `BIZ_CUSTOMER_IN_USE` 挡住软删，几乎不可达。
+///
+/// 抽成常量而非在 `list` / `count` 两处各写一遍：两处 WHERE 必须逐字一致（漏改
+/// `count` 就会出现 items 与 total 对不上），共用一个符号是唯一能杜绝该漂移的写法。
+/// 反向引用：报价一览的 `customer_id` 展开（`repo/mod.rs::part_ids_by_customer`）是
+/// 同一谓词的**另一份拷贝**（内联字面量、`$1` 而非 `$2`），两边靠本注释的约定保持
+/// 逐字同形，**无编译期保障** —— 改这里记得同步改那里。
+const SENDABLE_CUSTOMER_SUBTREE_PREDICATE: &str = "($2::bigint IS NULL \
+     OR d.customer_id = $2 \
+     OR d.customer_id IN (SELECT c2.id FROM t_customer c2 \
+                          WHERE c2.parent_id = $2 AND c2.deleted_at IS NULL))";
 
 impl OutsourceSendableRepo {
     pub async fn list<'e, E: PgExecutor<'e>>(
@@ -1247,9 +1292,10 @@ impl OutsourceSendableRepo {
         let sql = format!(
             "SELECT {SENDABLE_OUTER_COLS} FROM ( {dedup} ) d \
              WHERE ($1::text IS NULL OR d.part_drawing_no ILIKE $1 OR d.part_name ILIKE $1) \
-               AND ($2::bigint IS NULL OR d.customer_id = $2) \
+               AND {} \
              {SENDABLE_DISPLAY_ORDER} \
-             LIMIT $3 OFFSET $4"
+             LIMIT $3 OFFSET $4",
+            SENDABLE_CUSTOMER_SUBTREE_PREDICATE,
         );
         sqlx::query_as::<_, OutsourceSendableRow>(AssertSqlSafe(sql))
             .bind(keyword_pat)
@@ -1271,7 +1317,8 @@ impl OutsourceSendableRepo {
         let sql = format!(
             "SELECT COUNT(*)::bigint FROM ( {dedup} ) d \
              WHERE ($1::text IS NULL OR d.part_drawing_no ILIKE $1 OR d.part_name ILIKE $1) \
-               AND ($2::bigint IS NULL OR d.customer_id = $2)"
+               AND {}",
+            SENDABLE_CUSTOMER_SUBTREE_PREDICATE,
         );
         let n: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
             .bind(keyword_pat)

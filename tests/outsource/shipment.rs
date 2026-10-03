@@ -20,8 +20,8 @@ use sqlx::PgPool;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_test_support::{
-    OutsourceFixture, json_request, load_outsource_fixture, login_token, send, test_app, test_pool,
-    test_state,
+    OutsourceFixture, PartFixture, json_request, load_outsource_fixture, login_token, send,
+    test_app, test_pool, test_state,
 };
 
 // ===========================================================================
@@ -34,6 +34,21 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, OutsourceFixtu
     let app = test_app(test_state(pool.clone()).await);
     let token = login_token(&app, &fx.part_manager_username, OutsourceFixture::PASSWORD).await;
     (pool, app, token, fx)
+}
+
+/// 以 INSPECTOR 身份登录（用户名复用 part 域基线 fixture 的 INSPECTOR 用户；
+/// 该用户在 `load_outsource_fixture` 里随 part fixture 一起落库）。
+async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String) {
+    let pool = test_pool().await;
+    load_outsource_fixture(&pool).await;
+    let app = test_app(test_state(pool.clone()).await);
+    let token = login_token(
+        &app,
+        PartFixture::INSPECTOR_USERNAME,
+        OutsourceFixture::PASSWORD,
+    )
+    .await;
+    (pool, app, token)
 }
 
 // ===========================================================================
@@ -787,4 +802,80 @@ async fn in_flight_keyword_filter() {
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["total"], 1, "{env}");
     assert_eq!(env["data"]["items"][0]["part_id"], p1.to_string(), "{env}");
+}
+
+/// INSPECTOR 必须能读在途列表（2026-10-04 权限对齐）。
+///
+/// 外协三个写端点（`send-to-outsource` / `receive-from-outsource` /
+/// `receive-from-outsource-to-inspection`）与菜单都已授予 INSPECTOR，读侧在途面
+/// 若只放 Manager + Clerk，Inspector 就是「能发能收却看不到在途、点不到接收」。
+/// 本端点纯只读且出参不含任何价格列，故一并放宽。
+///
+/// 对照断言（防止把守卫整段删掉）：`reconcile-update` 仍对 INSPECTOR 403。
+#[tokio::test]
+async fn in_flight_allows_inspector_while_reconcile_update_still_forbids() {
+    let (pool, app, token) = bootstrap_as_inspector().await;
+    let cid = insert_l1_customer(&pool, "FiCo", "H").await;
+    let pid = insert_part(&pool, cid, "INSP").await;
+    let company = OutsourceFixture::OUTSOURCE_COMPANY_ID;
+    let proc_id = seed_outsource_process(&pool, "FIPROC").await;
+    let qid = insert_quote(&pool, pid, company, proc_id).await;
+    let bid = insert_batch(&pool, pid, 4, 5).await;
+    let sid = insert_shipment(
+        &pool,
+        qid,
+        pid,
+        Some(bid),
+        company,
+        proc_id,
+        1,
+        "7.50",
+        "OUTSOURCING",
+        "2026-09-01 10:00:00",
+        None,
+    )
+    .await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", "/outsource-shipments/in-flight", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "INSPECTOR 读在途必须 200（曾 403）: {env}"
+    );
+    assert_eq!(env["data"]["total"], 1, "{env}");
+    let row = &env["data"]["items"][0];
+    assert_eq!(row["batch_id"], bid.to_string(), "{env}");
+    assert_eq!(row["version"], 5, "version 必须取 batch.version: {env}");
+    assert_eq!(row["quantity"], 4, "quantity 必须取 batch.quantity: {env}");
+    // 出参不含任何价格列 —— 放宽权限的安全前提，改 VO 时要重新评估
+    assert!(
+        row.get("price").is_none(),
+        "in-flight 行不得含 price: {env}"
+    );
+    assert!(
+        row.get("unit_price").is_none(),
+        "in-flight 行不得含 unit_price: {env}"
+    );
+
+    // 对照：对账写端点含 unit_price，权限维持 Manager + Clerk
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/outsource-shipments/{sid}/reconcile-update"),
+            Some(json!({"version": 0, "quantity": 2})),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::FORBIDDEN,
+        "reconcile-update 必须仍对 INSPECTOR 403: {env}"
+    );
+    assert_eq!(env["code"], 40300, "{env}");
 }

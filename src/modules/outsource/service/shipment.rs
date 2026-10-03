@@ -278,14 +278,24 @@ impl OutsourceService {
     /// `GET /outsource-shipments/in-flight`（2026-10-03 新增）
     ///
     /// 取代 part 域旧 `list_outsource_in_flight`（后者返回通用 `PartListItem`，
-    /// 与前端外协域的字段需求完全不匹配）。角色守卫与旧实现一致。
+    /// 与前端外协域的字段需求完全不匹配）。
+    ///
+    /// 2026-10-04 权限对齐为 **Manager + Clerk + Inspector**：外协三个写端点
+    /// （`prod::batch::send_to_outsource` / `receive_from_outsource` /
+    /// `receive_from_outsource_to_inspection`）与菜单 `outsource_send_receive_list`
+    /// 都已授予 INSPECTOR，导致 Inspector 能发能收却看不到在途列表、点不到「接收」
+    /// 按钮。本端点纯只读，且返回体不含任何价格列（`OutsourceInFlightItem` 没有
+    /// `price` / `unit_price` 任何一列），故放宽不涉商务敏感数据。
+    ///
+    /// 同域的 `reconcile_update_shipment`（写对账单价 / 数量 / 开票标记）与
+    /// `list_company_sent_parts`（对账页列，含 `unit_price`）**维持 Manager + Clerk**。
     pub async fn list_in_flight<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
         query: &OutsourceInFlightListQuery,
         current: &CurrentUser,
     ) -> Result<OutsourceInFlightListOut, AppError> {
-        current.require_any_role(&[Role::Manager, Role::Clerk])?;
+        current.require_any_role(&[Role::Manager, Role::Clerk, Role::Inspector])?;
         let limit = query
             .limit
             .unwrap_or(DEFAULT_LIMIT)

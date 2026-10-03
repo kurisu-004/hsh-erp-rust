@@ -125,7 +125,7 @@
 |---|---|---|
 | `part_id` | string (i64)? | 按 part 过滤 |
 | `outsource_company_id` | string (i64)? | 按 company 过滤 |
-| `customer_id` | string (i64)? | **2026-10-03 订正**：代码 `OutsourceQuoteListQuery` 里一直有这个字段，但本文档此前漏记。当前实现只在「同时给了 `customer_id`」时生效，且**必须同时给 `keyword`**：只给 `customer_id` 不给 `keyword` 时端点直接返回空列表（`total=0`）——已知简化实现，见 service `list_quotes` 注释 |
+| `customer_id` | string (i64)? | 客户**子树**过滤：展开成「该客户自身 ∪ 其直接子客户」名下的 `part_id` 集合，再走 `part_id = ANY($4)`。**无需同时给 `keyword`**（2026-10-04 起；此前 service 解析完即丢弃，且「给了 `customer_id` 没给 `keyword`」直接返回空列表）。与 `keyword` 同时给时两者**取交集**；零命中返回 `items: []` / `total: 0` |
 | `status` | string? | 单状态过滤 |
 | `statuses` | string? | 多状态过滤（逗号分隔）；**2026-10-03 订正**：DTO 里没有该字段，service 恒传空数组给 repo（等价不过滤） |
 | `keyword` | string? | **2026-10-03 订正**：代码里已有（走 `part_keyword_search` 展开成 `part_id = ANY(...)`），本文档此前漏记。trim 后空串视为无过滤；**零命中返回 `items: []` / `total: 0`**（service 层兜住，与 `sent-parts` 同源 —— SQL 的 `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 里空 id 数组会让整个 keyword 条件短路） |
@@ -174,6 +174,38 @@
 ---
 
 ## 端点契约要点
+
+### `list` 的 `keyword` / `customer_id`：两个 part_id 集合求交
+
+两个过滤维度各自在 service 层展开成一个 `part_id` 集合，再交给**同一条** repo SQL
+（`quote_list_with_filters` / `quote_count_with_filters`）：
+
+| 给了什么 | `part_ids` 取值 |
+|---|---|
+| 都没有 | 空数组（SQL 侧 `cardinality($4::bigint[]) = 0` 表示「不过滤」） |
+| 只有 `keyword` | `part_keyword_search` 的结果（`drawing_no` / `name` ILIKE `%needle%`） |
+| 只有 `customer_id` | `part_ids_by_customer` 的结果（客户子树） |
+| 两个都有 | **交集**（`HashSet` 求交；两个源查询各自 `LIMIT 10000`，不能用嵌套循环） |
+
+- `customer_id` 的子树形状与 `GET /outsource-sendable` 的 `customer_id` 谓词**逐字
+  同形**（`customer_id = $1 OR customer_id IN (parent_id = $1 且未软删)`）：实测零件
+  都挂在 L2 客户上，前端选中的常是 L1，只判等值时 L1 必然零命中。等值那一支保留 ⇒
+  传 L2 id 的请求行为不变。「展开一层即完整」是 2026-10-04 生产库实测结论（零件全挂
+  L2、L3 数量 0），**API 层不强制**该结构 —— `create_customer` 不校验 `parent_id`
+  是否指向根客户；出现 L3 后两边都要改成递归 CTE，且漏报**是静默的**（`total` 偏小、
+  不报错）。逐条依据见
+  [`./outsource-sendable.md#customer_id-是子树过滤不是等值过滤`](./outsource-sendable.md#customer_id-是子树过滤不是等值过滤)
+  一节。
+- **`LIMIT 10000` 与「静默截断」的已知取舍**：该上限是从 `part_keyword_search` 抄来
+  的（那边要的是万级关键词结果求交），与「某客户子树的零件数」无因果关系；实际全库
+  `t_part` 只有 1874 行（2026-10-04 实测）⇒ 单棵子树规模上界即全库，**最坏情况余量
+  也有 5 倍以上**（10000 / 1874 ≈ 5.3）。但本查询**无 `ORDER BY`** ⇒ 真触顶时返回
+  任意 10000 条（非确定性子集、`total` 偏小、零命中守卫不触发 ⇒ 静默少报）。已知取舍，
+  本轮不改。
+- **零命中必须早返回空**：SQL 谓词 `AND (cardinality($4::bigint[]) = 0 OR
+  part_id = ANY($4))` 里，空数组让 `cardinality = 0` 成立、整个过滤条件被短路掉。
+  不在 service 层兜住，「一个零件都没有的客户」会返回**全量**报价。守卫的判定条件是
+  「`keyword` 或 `customer_id` **任一**已给出且结果集为空」，两个维度都必须算进去。
 
 ### `quotable-parts` 的行粒度与筛选
 
@@ -233,7 +265,7 @@ id ASC` 排序）。`total` 的口径与 list 的 WHERE + `DISTINCT ON` 逐条�
 
 - handler：`src/modules/outsource/handler.rs::list_quotes / list_quotable_parts / create_quote / get_quote / update_quote / submit_quote / approve_quote / reject_quote / soft_delete_quote` + `quote_router()`
 - service：`src/modules/outsource/service/quote.rs::OutsourceService::list_quotes / list_quotable_parts / …`
-- repo：`src/modules/outsource/repo/{mod,sql}.rs`（`OutsourceQuotableRepo::list / count`）
+- repo：`src/modules/outsource/repo/{mod,sql}.rs`（`OutsourceQuotableRepo::list / count`；`customer_id` 展开走 `OutsourceRepoTrait::part_ids_by_customer`，实现是 `repo/mod.rs` 里一行 `sqlx::query_as` 跨表 SELECT）
 - dto：`src/modules/outsource/dto.rs`
 - vo：`src/modules/outsource/vo/quote.rs`（生命周期出参）+ `src/modules/outsource/vo/quotable.rs`（picker 读模型）
 - model：`src/modules/outsource/model.rs::TOutsourceQuote + OutsourceQuoteStatus`
@@ -244,7 +276,25 @@ id ASC` 排序）。`total` 的口径与 list 的 WHERE + `DISTINCT ON` 逐条�
 
 ## 集成测试
 
-- `tests/outsource/quote.rs`（9+ 用例：create DRAFT / 唯一性 21303 / update DRAFT happy / update SUBMITTED 21302 / submit / approve MANAGER-only / reject review_note 必填 / soft-delete 仅 DRAFT/REJECTED / **list keyword 零命中返 0 行**（带「无 keyword 返全量」对照组））
+- `tests/outsource/quote.rs`（**12 用例**，下表逐条对应 `#[tokio::test]`；2026-10-04 订正：原列举写了 13 项且含两条并不存在的 update 用例，submit / approve 实为同一条）：
+
+  | # | 测试名 | 断言要点 |
+  |---|---|---|
+  | 1 | `create_quote_draft_happy` | create 落 DRAFT |
+  | 2 | `create_quote_duplicate_returns_21303` | 同 (零件 × 公司 × 工序) 唯一性 21303 |
+  | 3 | `quote_full_lifecycle_draft_submit_approve` | DRAFT → submit → approve 一条走完（**submit 与 approve 在同一条里**） |
+  | 4 | `approve_quote_clerk_forbidden_40300` | approve MANAGER-only |
+  | 5 | `reject_quote_requires_review_note` | reject 必填 review_note |
+  | 6 | `submit_quote_wrong_status_returns_21302` | 对已 SUBMITTED 再次 submit → 21302 |
+  | 7 | `soft_delete_quote_approved_forbidden` | 软删仅 DRAFT / REJECTED 可行，已 APPROVED 被拒 |
+  | 8 | `list_quotes_keyword_zero_match_returns_empty_not_all_rows` | **keyword 零命中返 0 行**（带「无 keyword 返全量」对照组） |
+  | 9 | `list_quotes_customer_id_l1_expands_to_children_without_keyword` | 只给 L1 `customer_id` 即命中其全部 L2 子客户的报价，**不需 keyword**（曾恒返空） |
+  | 10 | `list_quotes_customer_id_l2_returns_only_its_own_quotes` | 传 L2 只回该 L2 的 |
+  | 11 | `list_quotes_customer_id_and_keyword_intersection` | 两维度取交集；交集为空 → `total=0` |
+  | 12 | `list_quotes_customer_id_zero_match_returns_empty_not_all_rows` | 零命中的 `customer_id` → `total=0` 而非全量（守 `cardinality($4)=0` 短路陷阱） |
+
+  > 本域**没有 update 端点的集成测试**（`PUT /quotes/{id}` 只在 service 层被其它测试间接走到）；要覆盖 update 契约需另立用例。
+
 - `tests/outsource/quotable.rs`（8 用例：happy path（含 4 个已删字段的缺席断言）/ 无 PENDING 批次排除 / **无工艺链也出现** / 多 PENDING 批次去重 / PENDING+IN_PROCESS 混合 / 软删零件与软删批次排除 / keyword+分页 / 路由不被 `/{id}` 吞掉）
 
 ---

@@ -26,7 +26,7 @@
 //! 承接原 `service.rs::mod tests` 中 quote 子域用到的 2 个 helper 测试：
 //! `parse_snowflake_id_valid` / `parse_snowflake_id_invalid`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::outsource::dto::{
@@ -153,50 +153,49 @@ impl OutsourceService {
         let sort_by = query.sort_by.as_deref().unwrap_or("CREATED_AT");
         let sort_dir = query.sort_dir.as_deref().unwrap_or("DESC");
 
-        // keyword / customer_id → part_ids
-        let part_ids_in: Vec<i64> = if query.keyword.is_some() || query.customer_id.is_some() {
-            let kw = query
-                .keyword
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let _cid =
-                if let Some(s) = query.customer_id.as_deref().filter(|s| !s.is_empty()) {
-                    Some(s.parse::<i64>().map_err(|_| {
-                        AppError::biz(code::BIZ_INVALID_VALUE, "customer_id 非整数")
-                    })?)
-                } else {
-                    None
-                };
-            // 仅按 keyword（忽略 customer_id 展开以避免跨表依赖）
-            if let Some(k) = kw {
-                repo.part_keyword_search(k).await?
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        // 若提供了 customer_id 但未提供 keyword：返回空（简化实现，复杂展开留给 service 扩展）
-        if (query.customer_id.is_some()) && query.keyword.is_none() {
-            return Ok(OutsourceQuoteListOut {
-                items: vec![],
-                total: 0,
-                limit,
-                offset,
-            });
-        }
-        // 2026-10-03：给了 keyword 却零命中时必须早返回。SQL 谓词
-        // `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 里，空数组
-        // 让 `cardinality = 0` 成立、整个 keyword 条件被短路掉；不在这兜住，
-        // 「不存在的关键词」会返回全量报价。SQL 谓词保持不变 —— 无 keyword 时
-        // `cardinality = 0` 正是「不过滤」的正确表达。
-        let kw_given = query
+        // keyword / customer_id → part_ids（2026-10-04：`customer_id` 不再被丢弃）
+        //
+        // 两个过滤维度各自落成一个 part_id 集合，再求交集：
+        // - 两侧都缺省 → 空 Vec（下游 SQL 的 `cardinality = 0` 表示「不过滤」）
+        // - 只有 keyword → keyword 集；只有 customer → customer 子树集
+        // - 两侧都有 → 交集。`part_keyword_search` / `part_ids_by_customer` 各自
+        //   `LIMIT 10000`，单集合可达万级 ⇒ 必须 `HashSet` 求交，不能 O(n·m) 嵌套。
+        let kw = query
             .keyword
             .as_deref()
             .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-        if kw_given && part_ids_in.is_empty() {
+            .filter(|s| !s.is_empty());
+        let cid = if let Some(s) = query.customer_id.as_deref().filter(|s| !s.is_empty()) {
+            Some(
+                s.parse::<i64>()
+                    .map_err(|_| AppError::biz(code::BIZ_INVALID_VALUE, "customer_id 非整数"))?,
+            )
+        } else {
+            None
+        };
+        let cid_given = cid.is_some();
+        let part_ids_in: Vec<i64> = match (kw, cid) {
+            (Some(k), Some(cid)) => {
+                let kw_part_ids = repo.part_keyword_search(k).await?;
+                let cust_set: HashSet<i64> =
+                    repo.part_ids_by_customer(cid).await?.into_iter().collect();
+                kw_part_ids
+                    .into_iter()
+                    .filter(|id| cust_set.contains(id))
+                    .collect()
+            }
+            (Some(k), None) => repo.part_keyword_search(k).await?,
+            (None, Some(cid)) => repo.part_ids_by_customer(cid).await?,
+            (None, None) => Vec::new(),
+        };
+        // 2026-10-03 / 2026-10-04：过滤条件已给出却零命中时必须早返回。SQL 谓词
+        // `AND (cardinality($N::bigint[]) = 0 OR part_id = ANY($N))` 里，空数组
+        // 让 `cardinality = 0` 成立、整个过滤条件被短路掉；不在这兜住，
+        // 「不存在的关键词」与「一个零件都没有的客户」都会返回**全量**报价。
+        // 判定条件因此必须覆盖两个维度（`kw.is_some() || cid_given`），只判 keyword
+        // 会在「只给 customer_id 且零命中」时漏掉本守卫。SQL 谓词保持不变 ——
+        // 两个维度都缺省时 `cardinality = 0` 正是「不过滤」的正确表达。
+        if (kw.is_some() || cid_given) && part_ids_in.is_empty() {
             return Ok(OutsourceQuoteListOut {
                 items: vec![],
                 total: 0,

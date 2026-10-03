@@ -9,6 +9,8 @@
 //! - soft-delete 仅 DRAFT / REJECTED 可删
 //! - duplicate 同 (part, company, process) → 409
 //! - list keyword 零命中 → 0 行
+//! - list `customer_id`：L1 展开到全部 L2 子客户（无需 keyword）/ L2 精确 / 与 keyword
+//!   取交集 / 零命中 → 0 行（2026-10-04）
 //!
 //! ## 集成测试范本（PR13 Phase H，2026-09-24）
 //! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
@@ -87,6 +89,27 @@ async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     id
 }
 
+/// 直插 L2 客户（挂到 `parent_id` 之下）—— `customer_id` 子树展开用例的前提。
+///
+/// `serial_prefix` 唯一索引 `uq_t_customer_root_prefix` 只作用于 `parent_id IS NULL`
+/// 的根客户，L2 不受限（这里干脆传 NULL）。
+async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
+    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(parent_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_customer (L2)");
+    id
+}
+
 /// 直插 part（PENDING）—— 绕开 part CRUD。
 async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
@@ -95,17 +118,36 @@ async fn insert_part(pool: &PgPool, customer_id: i64) -> i64 {
     sqlx::query(
         "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
          request_date, planned_delivery_date, customer_id, status, version, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, 1, 0, 0, CURRENT_DATE, CURRENT_DATE, $5, 'PENDING', 0, $6, $6)",
+         VALUES ($1, $2, $3, 'Tester', 1, 0, 0, CURRENT_DATE, CURRENT_DATE, $4, 'PENDING', 0, $5, $5)",
     )
     .bind(id)
     .bind(format!("PT-{id}"))
     .bind(format!("DWG-{id}"))
-    .bind("Tester")
     .bind(customer_id)
     .bind(now)
     .execute(pool)
     .await
     .expect("insert t_part");
+    id
+}
+
+/// 直插 part 并在 name / drawing_no 里带上 tag —— keyword 维度用例要靠它区分零件。
+async fn insert_tagged_part(pool: &PgPool, customer_id: i64, tag: &str) -> i64 {
+    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, total_price, \
+         request_date, planned_delivery_date, customer_id, status, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'Tester', 1, 0, 0, CURRENT_DATE, CURRENT_DATE, $4, 'PENDING', 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(format!("PT-{tag}"))
+    .bind(format!("DWG-{tag}-{id}"))
+    .bind(customer_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert tagged t_part");
     id
 }
 
@@ -156,6 +198,41 @@ async fn setup_basic(pool: &PgPool) -> (i64, i64, i64) {
     let company_id = insert_company(pool, "Quote Outsource Co", true).await;
     let proc_id = seed_outsource_process(pool, "QPROC", "Q过程").await;
     (part_id, company_id, proc_id)
+}
+
+/// 建一条 DRAFT 报价（`customer_id` 过滤用例的造数入口）。
+async fn create_quote(
+    app: &axum::Router,
+    token: &str,
+    part_id: i64,
+    company_id: i64,
+    process_id: i64,
+) -> (StatusCode, serde_json::Value) {
+    send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/outsource-quotes",
+            Some(json!({
+                "part_id": part_id.to_string(),
+                "outsource_company_id": company_id.to_string(),
+                "process_id": process_id.to_string(),
+                "price": "3.00",
+            })),
+            Some(token),
+        ),
+    )
+    .await
+}
+
+/// 取报价列表里的 `part_name` 集合（用于「命中了哪些零件」的断言）。
+fn part_names(env: &serde_json::Value) -> Vec<String> {
+    env["data"]["items"]
+        .as_array()
+        .expect("items 必须是数组")
+        .iter()
+        .map(|i| i["part_name"].as_str().unwrap_or_default().to_string())
+        .collect()
 }
 
 // ===========================================================================
@@ -543,4 +620,196 @@ async fn soft_delete_quote_approved_forbidden() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST, "sd APPROVED: {env}");
     assert_eq!(env["code"].as_i64().unwrap(), 21302);
+}
+
+// ===========================================================================
+//  `customer_id` 过滤（2026-10-04 新增语义）
+// ===========================================================================
+
+/// 只给 `customer_id`（**L1**）就能命中其全部 L2 子客户的报价，**不需 keyword**。
+///
+/// 2026-10-04 之前 service 把 `customer_id` 解析成 `_cid` 后直接丢弃，且「给了
+/// `customer_id` 没给 `keyword`」就早返回空列表 ⇒ 前端选客户后一览恒空。
+#[tokio::test]
+async fn list_quotes_customer_id_l1_expands_to_children_without_keyword() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1_customer(&pool, "QCustRoot", "W").await;
+    let l2_a = insert_l2_customer(&pool, "QCustA", l1).await;
+    let l2_b = insert_l2_customer(&pool, "QCustB", l1).await;
+    // 另一个 L1 下的叶子：不在本 L1 子树内，必须被排除
+    let other_l1 = insert_l1_customer(&pool, "QCustOther", "V").await;
+    let other_l2 = insert_l2_customer(&pool, "QCustC", other_l1).await;
+
+    let proc_id = seed_outsource_process(&pool, "QCL1", "QC-L1").await;
+    let company = insert_company(&pool, "QCustCo", true).await;
+    for (cid, tag) in [(l2_a, "ALPHA"), (l2_b, "BETA"), (other_l2, "GAMMA")] {
+        let pid = insert_tagged_part(&pool, cid, tag).await;
+        let (s, env) = create_quote(&app, &token, pid, company, proc_id).await;
+        assert_eq!(s, StatusCode::CREATED, "{env}");
+    }
+
+    let list = |qs: &str, app: &axum::Router, token: String| {
+        let url = format!("/outsource-quotes{qs}");
+        let app = app.clone();
+        async move {
+            send(
+                app.clone(),
+                json_request("GET", &url, None, Some(token.as_str())),
+            )
+            .await
+        }
+    };
+
+    // 对照：不带任何过滤 → 3 条
+    let (s, env) = list("", &app, token.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 3, "{env}");
+
+    // 只给 L1 → 2 条（两个 L2 子客户的零件），GAMMA 属于别的 L1 子树
+    let (s, env) = list(&format!("?customer_id={l1}"), &app, token.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 2,
+        "只给 L1 必须命中其全部 L2 子客户且无需 keyword: {env}"
+    );
+    let names = part_names(&env);
+    assert!(names.iter().any(|n| n == "PT-ALPHA"), "{names:?}");
+    assert!(names.iter().any(|n| n == "PT-BETA"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "PT-GAMMA"), "{names:?}");
+}
+
+/// 只给 `customer_id`（**L2**）→ 只返回该 L2 的报价（等值那一支必须保留）。
+#[tokio::test]
+async fn list_quotes_customer_id_l2_returns_only_its_own_quotes() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1_customer(&pool, "QCustRoot2", "U").await;
+    let l2_a = insert_l2_customer(&pool, "QCustA2", l1).await;
+    let l2_b = insert_l2_customer(&pool, "QCustB2", l1).await;
+    let proc_id = seed_outsource_process(&pool, "QCL2", "QC-L2").await;
+    let company = insert_company(&pool, "QCustCo2", true).await;
+    for (cid, tag) in [(l2_a, "ALPHA"), (l2_b, "BETA")] {
+        let pid = insert_tagged_part(&pool, cid, tag).await;
+        let (s, env) = create_quote(&app, &token, pid, company, proc_id).await;
+        assert_eq!(s, StatusCode::CREATED, "{env}");
+    }
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/outsource-quotes?customer_id={l2_a}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 1, "传 L2 只返回该 L2 的: {env}");
+    assert_eq!(part_names(&env), vec!["PT-ALPHA".to_string()], "{env}");
+}
+
+/// `customer_id` + `keyword` 同时给 → **取交集**（service 层 `HashSet` 求交）。
+#[tokio::test]
+async fn list_quotes_customer_id_and_keyword_intersection() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1_customer(&pool, "QCustRoot3", "T").await;
+    let l2_a = insert_l2_customer(&pool, "QCustA3", l1).await;
+    let l2_b = insert_l2_customer(&pool, "QCustB3", l1).await;
+    // 关键字命中的零件挂在别的 L1 下 ⇒ 交集必为空
+    let other_l1 = insert_l1_customer(&pool, "QCustOther3", "S").await;
+    let other_l2 = insert_l2_customer(&pool, "QCustC3", other_l1).await;
+    let proc_id = seed_outsource_process(&pool, "QCL3", "QC-L3").await;
+    let company = insert_company(&pool, "QCustCo3", true).await;
+    for (cid, tag) in [(l2_a, "ALPHA"), (l2_b, "BETA"), (other_l2, "GAMMA")] {
+        let pid = insert_tagged_part(&pool, cid, tag).await;
+        let (s, env) = create_quote(&app, &token, pid, company, proc_id).await;
+        assert_eq!(s, StatusCode::CREATED, "{env}");
+    }
+
+    // 交集命中：L1 子树 ∩ keyword=ALPHA
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/outsource-quotes?customer_id={l1}&keyword=ALPHA"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 1, "交集必须只留 1 条: {env}");
+    assert_eq!(part_names(&env), vec!["PT-ALPHA".to_string()], "{env}");
+
+    // keyword 单独给 → 全库 1 条（证明上面的 1 不是 keyword 的功劳）
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", "/outsource-quotes?keyword=ALPHA", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 1, "{env}");
+
+    // 交集为空：keyword=GAMMA 的零件不在 L1 子树内 ⇒ total 0（不是全量 3）
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/outsource-quotes?customer_id={l1}&keyword=GAMMA"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 0,
+        "交集为空必须 total=0（曾返回全量）: {env}"
+    );
+}
+
+/// 只给一个零命中的 `customer_id` → total 0，**不是全量**。
+///
+/// 守着 SQL 谓词 `AND (cardinality($4::bigint[]) = 0 OR part_id = ANY($4))` 的陷阱：
+/// 展开成空数组后 `cardinality = 0` 成立、整个条件被短路。service 层的零命中早返回
+/// 守卫必须把 customer 维度也算进去（判定条件 `kw.is_some() || cid_given`），
+/// 否则「选了一个零件都没有的客户」会列出全部报价。
+#[tokio::test]
+async fn list_quotes_customer_id_zero_match_returns_empty_not_all_rows() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let (pid, cid, proc_id) = setup_basic(&pool).await;
+    let pid2 = insert_part(&pool, insert_l1_customer(&pool, "QuoteCo2", "R").await).await;
+    for p in [pid, pid2] {
+        let (s, env) = create_quote(&app, &token, p, cid, proc_id).await;
+        assert_eq!(s, StatusCode::CREATED, "{env}");
+    }
+
+    // 一个存在但**没有任何零件**的客户（底下也没有子客户）
+    let empty_root = insert_l1_customer(&pool, "QuoteEmptyRoot", "E").await;
+    insert_l2_customer(&pool, "QuoteEmptyLeaf", empty_root).await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", "/outsource-quotes", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 2, "对照组：全量 2 条: {env}");
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("/outsource-quotes?customer_id={empty_root}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 0,
+        "零命中的 customer_id 必须 total=0（曾返回全量 2）: {env}"
+    );
+    assert!(env["data"]["items"].as_array().unwrap().is_empty(), "{env}");
 }
