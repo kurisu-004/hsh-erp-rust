@@ -158,15 +158,26 @@
 
 #### 前端配套改动清单（2026-10-03 新增 `batch_id` / `batch_version`）
 
-本 VO 被 3 个端点复用，故这两个新字段会出现在**所有**复用路径的响应里（值为
-`null`）。逐端点影响与前端动作：
+返回 `R<PartListOut>` 的端点共 **8 个**，故这两个新字段会出现在**每一个**复用路径的
+响应里（除 `pickable-by-work-type` 外均为 `null`）。逐端点影响与前端动作：
 
-| 端点 | `batch_id` / `batch_version` | 前端是否要改 |
-|---|---|---|
-| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | 需要：TS `PartItem` 补 2 个可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
-| `GET /parts` | 恒 `null` | **不需要** |
-| `GET /api/v2/com/union-list` | 恒 `null` | **不需要** |
-| `GET /parts/pending-programming`（part 域） | 恒 `null` | **不需要** |
+| 端点 | `batch_id` / `batch_version` | 构造路径（决定为何 null） | 前端是否要改 |
+|---|---|---|---|
+| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | `part/service/phase1/work_type.rs:222-223` 在 `From<TPart>` 之后**显式覆写**（全仓唯一填 `Some` 的路径） | 需要：TS `PartItem` 补 2 个可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
+| `GET /parts` | 恒 `null` | `part/service/crud.rs:290` `p.into()`（`From<TPart>`） | **不需要** |
+| `GET /parts/pending-programming` | 恒 `null` | `part/service/phase1/lifecycle_helpers.rs:71-73` 结构体更新 `..PartListItem::from(..)` | **不需要** |
+| `GET /parts/outsource-in-flight` | 恒 `null` | `part/service/phase1/outsource.rs:82` `.map(PartListItem::from)` | **不需要** |
+| `GET /parts/outsource-sendable` | 恒 `null` | `part/service/phase1/outsource.rs:150` `.map(PartListItem::from)` | **不需要** |
+| `GET /parts/by-work-type/{work_type_id}` | 恒 `null` | `part/service/phase1/work_type.rs:99` `PartListItem::from(手工 TPart)` | **不需要** |
+| `GET /parts/by-worker/{worker_id}` | 恒 `null` | `part/service/phase1/work_type.rs:321` `PartListItem::from(手工 TPart)` | **不需要** |
+| `GET /api/v2/com/union-list` | 恒 `null` | `com/union_list/service/crud.rs:731` / `:781` 结构体字面量（穷尽式，显式写 `None`） | **不需要** |
+
+> 2026-10-03（review 第 2 轮 Minor-A）订正：本文档初版写「被 3 个端点复用」而表里列了
+> 4 行，自相矛盾，且**漏了 4 个复用端点**（`by-work-type` / `by-worker` /
+> `outsource-in-flight` / `outsource-sendable`）。上表的 8 行是按「所有返回
+> `R<PartListOut>` 的 handler」逐一枚举得出的，每行都标了构造点以便复核。
+> 讽刺的是漏掉的 `by-work-type` / `by-worker` 恰是本分支同期修掉 `serial_no` 空值
+> 500 的两个端点（`serial_no` 才是它们的主字段）—— 漏掉它们的代价比抽象的计数错误更大。
 
 **前端无需改 Zod schema**，依据两条（均已核实）：
 
