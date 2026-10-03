@@ -135,13 +135,14 @@ GET /api/v2/com/union-list
 | `assembly_id` | 装配件子件 → `Some(id)`；顶层零件 → `None` | `None`（顶层装配件无父） |
 | `process_chain_id` | 直接搬 | `None`（t_assembly 无此列） |
 | `batch_id` / `batch_version` | **`None`（恒 `null`，不填）** | **`None`（恒 `null`，不填）** |
-| `delivered_quantity` | 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的 `quantity` 之和（零批次 → `0`） | 可凑齐的套数 `MIN(子件已送件数 × 装配件套数 / 子件总量)`，整数除法截断；子件总量为 0 者不参与，无子件 → `0` |
+| `delivered_quantity` | 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的 `quantity` 之和（零批次 → `0`） | 可凑齐的套数 `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，整数除法截断；子件总量为 0 者不参与，无子件 → `0`，子件超交时收口到工单总套数 |
 
 > ⚠️ `delivered_quantity`（2026-10-03 新增）：真相源是 `t_part_batch.status`
 > （批次级「已交」的唯一依据，**不**从派生缓存 `t_part.status` 反推 —— 后者在
 > min-progress 规则下只有全部活跃批次都 DELIVERED 才等于 DELIVERED，会把「部分已交」
-> 一律压成 0）。两种 row_type 模式都填该字段（三态矩阵里 PART / ASSEMBLY / ALL
-> 各接一次聚合查询），故 `delivered_quantity` 恒为非 null 数字。
+> 一律压成 0）。三种 `row_type` 模式都填该字段：PART / ALL 走「已交数量之和」聚合，
+> ASSEMBLY / ALL 走「已送套数 min 公式」聚合（ALL 模式两段都接，共 2 条聚合 SQL），
+> 故 `delivered_quantity` 恒为非 null 数字。
 > 与 `GET /api/v2/parts` 的同名字段口径逐字一致（同一对 helper）。
 > 完整字段表见 [`./parts/index.md#partlistitem-字段`](./parts/index.md#partlistitem-字段)。
 
@@ -404,7 +405,7 @@ PART / ALL / ASSEMBLY 三模式全部生效（UNION ALL SQL `part_seg` / `asm_se
 
 测试覆盖：11 个新增 union-list 用例（4 文本 + 2 日期 + 4 IS NULL + 1 combined smoke）+ 1
 非法日期格式 + 2 老端点兼容回归（`/parts` + `/assemblies`）= 共 14 个新增测试。
-2026-10-03 再加 10 个 `delivered_quantity_*` 用例（PART 行 5 个 + ASSEMBLY 行 4 个
+2026-10-03 再加 12 个 `delivered_quantity_*` 用例（PART 行 6 个 + ASSEMBLY 行 5 个
 + `GET /parts` 口径一致 1 个）。
 
 ```bash
@@ -428,13 +429,14 @@ curl -G "http://localhost:3000/api/v2/com/union-list" \
 
 - 前端对应：`src/api/com/unionList.ts`（前端子模块另开 PR 接入；本端点路由
   自身即可工作）
-- 集成测试：`tests/com/union_list.rs`（20 用例覆盖 PART / ASSEMBLY / ALL /
+- 集成测试：`tests/com/union_list.rs`（33 用例覆盖 PART / ASSEMBLY / ALL /
   SERIAL_NO 降级 / 非法 row_type / 缺省默认值 / deep offset 分页 / 日期窗口过滤
   / **10 字段筛选（4 文本 ILIKE + 4 日期 + 2 IS NULL）+ combined smoke + 非法
-  日期格式**；2026-10-03 新增 10 个 `delivered_quantity_*` 用例覆盖 PART 行
-  口径（只累加 DELIVERED / COMPLETED、排除软删与 CANCELLED、零批次为 0 且键恒在）、
-  ASSEMBLY 行套数 min 公式（含子件总量 0 不参与、无子件为 0、补交后 min 变化）
-  与 `GET /parts` 端点的口径一致性）
+  日期格式**；2026-10-03 新增 12 个 `delivered_quantity_*` 用例覆盖 PART 行
+  口径（只累加 DELIVERED / COMPLETED、排除软删与 CANCELLED、零批次为 0 且键恒在、
+  `0 < 已交 < 总量` 的部分已交形态）、ASSEMBLY 行套数 min 公式（含子件总量 0 不参与、
+  无子件为 0、补交后 min 变化、子件超交收口到工单总套数、大数量不触发 int8→int4
+  溢出）与 `GET /parts` 端点的口径一致性）
   + `tests/part/crud.rs::list_parts_old_endpoint_ignores_new_union_list_fields`
   + `tests/assembly/api.rs::list_assemblies_with_compat_union_list_fields` 兼容回归
 - API 设计文档：`docs/api/com-union-list.md`（本文件）

@@ -159,7 +159,14 @@
 | `has_cnc_program` | bool | 2026-09-29 新增（CNC 重构 5 任务之一）。是否已上传 G_CODE 数控程序。真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`。`GET /parts/pending-programming` 走专用 repo 填充真实值；其它 list 端点默认 `false`（service 不 enrich，避免 N+1）。详见 [`./lifecycle.md#get-apiv2partspending-programming`](./lifecycle.md#get-apiv2partspending-programming)。 |
 | `batch_id` | string (i64)? | 2026-10-03 新增。**活跃批次雪花 id**（`serialize_i64_opt` → JSON string；无值时序列化为 `null`）。**仅 `GET /parts/pickable-by-work-type/{work_type_id}` 填** —— 该端点的行本来就是「批次行」（取行 SQL 从 `t_part_batch b` 起），扫码台「领料」按本字段定位批次后发写请求。**其余复用 `PartListItem` 的路径恒为 `null`**（`GET /parts` / `GET /api/v2/com/union-list` / `GET /parts/pending-programming` 等）：那些行的语义单位是 part，一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故宁可不填。 |
 | `batch_version` | i32? | 2026-10-03 新增。`batch_id` 那个批次的乐观锁版本号（`t_part_batch.version`），前端发写请求时作 OCC 版本回传。填充口径与 `batch_id` 完全一致（同为「仅 pickable-by-work-type 填，其余路径 `null`」），二者同生共死。⚠️ **批次 OCC 只认本字段，不要拿 `version` 当批次版本用**（见下条）。 |
-| `delivered_quantity` | i32? | 2026-10-03 新增。已送数量。**仅 `GET /api/v2/com/union-list`（三种 `row_type` 模式）与 `GET /api/v2/parts` 填，其余复用本 VO 的 4 个端点恒 `null`**。<br>**PART 行** = 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的 `quantity` 之和（真相源是 `t_part_batch.status`，**不**从派生缓存 `t_part.status` 反推 —— 后者在 min-progress 规则下会把「部分已交」压成 0）。<br>**ASSEMBLY 行** = 可凑齐的套数 `MIN(子件已送件数 × 装配件套数 / 子件总量)`，PG 整数除法截断；子件总量为 0 者不参与（`NULLIF`），无子件为 0。软删子件不参与（与 `child_count` 同口径）。<br>零批次的行给 `0`（不是 `null`），键恒在。 |
+| `delivered_quantity` | i32? | 2026-10-03 新增。已送数量。**仅 `GET /api/v2/com/union-list`（三种 `row_type` 模式）与 `GET /api/v2/parts` 填，其余复用本 VO 的 4 个端点恒 `null`**。<br>**PART 行** = 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的 `quantity` 之和（真相源是 `t_part_batch.status`，**不**从派生缓存 `t_part.status` 反推 —— 后者在 min-progress 规则下会把「部分已交」压成 0）。<br>**ASSEMBLY 行** = 可凑齐的套数 `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，PG 整数除法截断；子件总量为 0 者不参与（`NULLIF`），无子件为 0；`LEAST` 收口到工单总套数（子件超交时不会算出超过总套数的值）。软删子件不参与（与 `child_count` 同口径）。<br>零批次的行给 `0`（不是 `null`），键恒在。 |
+
+> ⚠️ **本字段不参与后端任何过滤**（2026-10-03 登记，避免契约归属被静默遗忘）：
+> 紧急 / 逾期列表的「有已交批次即移出」由**消费方**按本字段 `> 0` 判定。后端的
+> `is_urgent` / `system_delivery_date` 过滤（`part/repo/sql/part_sql.rs`）是裸
+> `AND is_urgent = $1`，**不含**已交排除条件；dashboard「最紧急工单」由前端在
+> union-list 结果上按 `delivered_quantity > 0` 客户端分桶。`statistics` 域的逾期口径
+> 是另一套 —— `count_overdue_undelivered` 用 `NOT EXISTS` DELIVERED 事件。
 
 > ⚠️ `PartListItem.version` 是 **part 级**（`t_part.version`）乐观锁，与批次 OCC 无关。
 > `GET /parts/pickable-by-work-type/{work_type_id}` 的取行 SQL **不投影 `p.version`**
@@ -183,7 +190,9 @@
 
 > 2026-10-03 订正一：上表原列 8 个端点，其中
 > `GET /parts/outsource-in-flight` / `GET /parts/outsource-sendable` 已于同日下线并
-> 迁到 `/api/v2/outsource/*` 顶层前缀，不再返回 `PartListOut`，故删去两行。
+> 迁到 `/api/v2` 下的**兄弟**前缀 `/api/v2/outsource-sendable` 与
+> `/api/v2/outsource-shipments/in-flight`（不是 `/api/v2/outsource/*` 的子路径），
+> 不再返回 `PartListOut`，故删去两行。
 >
 > 2026-10-03 订正二：`by-work-type` / `by-worker` 的主字段是 `serial_no`，
 > 枚举时不可按「主端点」直觉漏掉。

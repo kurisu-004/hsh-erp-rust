@@ -88,12 +88,6 @@ Response 200 `data`：`PartListOut`
 - 内存 merge sort by 统一 sort_key（t_part / t_assembly 共有列交集：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `DRAWING_NO` / `NAME`），二级 id DESC 保证稳定。
 - 切 `[offset, offset+limit)`。
 
-**Assembly 模式 / All 模式装配件段专用字段**：
-- `row_type = "ASSEMBLY"`
-- `has_children = child_count.unwrap_or(0) > 0`（前端 Tree lazy mode 判定）
-- `child_count` 一次性 `SELECT assembly_id, COUNT(*) FROM t_part WHERE assembly_id = ANY($1) AND deleted_at IS NULL GROUP BY assembly_id`（≤200 ids / 1 extra query）
-- `location / holder_name / process_chain_id / batch_* / assembly_id` 均为 `null`（t_assembly 不持这些字段；真相源在 t_part / t_part_batch）
-
 **SORT 键交互**：`SERIAL_NO` 仅 t_part 独有，t_assembly 无该列；ALL 模式下 `sort_by=SERIAL_NO` 会被降级为 `CREATED_AT`（不报错；文档标注以便前端解释）。
 
 > 默认行为变更（2026-09-28）：不传 `row_type` / `include_assemblies` 时，`GET /parts` 默认走 **All** 模式（合并装配件）。旧 PART-only caller（如 `/parts/pending-programming` 等内部端点）需显式传 `include_assemblies=false` 才能保留原行为——本次 task 内已对 `list_pending_programming` 走 `PartListFilters.part_only=false` 兜底，对外不受影响。
