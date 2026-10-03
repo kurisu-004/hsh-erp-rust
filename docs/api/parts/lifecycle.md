@@ -489,11 +489,13 @@ Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
   分歧。**不能**写成 `sort_order = 当前 + 1`：`sort_order` 的**密度不由读侧决定**，
   写侧只保证链内 `sort_order` 互不重复（`upsert_chain` 校验 +
   `uq_chain_step_chain_order (chain_id, sort_order)` 兜底），稠密 0-based（前端
-  `usePartProcessDesign` 保存时拍平成 `0,1,2…`）与稀疏 `10/20/30`
-  （[`../production/process-chain.md`](../production/process-chain.md) 记的是稀疏
-  口径）两种密度都能落库。`+ 1` 只在稠密下正确、在稀疏下会把「还有两道工序」误判成
+  `usePartProcessDesign` 保存时拍平成 `0,1,2…`）与稀疏 `10/20/30` 两种密度都能落库。
+  ⚠️ [`../production/process-chain.md`](../production/process-chain.md) 记的稀疏口径与
+  真实写路径不符（漂移登记见 [`../inconsistencies.md`](../inconsistencies.md) §9.4），
+  别拿它当密度依据。`+ 1` 只在稠密下正确、在稀疏下会把「还有两道工序」误判成
   链尾、让报工台对工人谎报「当前为最后一道工序」；`>` 对两种密度都成立。
-- 取不到任何链内位置（`cur2` 无行）⇒ `NONE`；位置解析成功但没有更大的
+- `cur2` 是 **inner** `JOIN LATERAL`：定位不到链内位置时整个派生子查询无行、四个派生
+  列全 `NULL`，由最外层 `COALESCE(..., 'NONE')` 兜底成 `NONE`；位置解析成功但没有更大的
   `sort_order` ⇒ `TAIL`；否则 `NEXT`。
 - **链内 `process_id` 重复 ⇒ `NONE`（显式降级，不靠 `LIMIT 1` 取舍）**：
   `t_process_chain_step` 只有 `uq_chain_step_chain_order (chain_id, sort_order)
@@ -506,8 +508,9 @@ Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
   两个名字为 `null`），与「未知一律往保守方向降」一致。
 - LATERAL 末尾 `ORDER BY cur.id ASC LIMIT 1` 收口：`cur` / `pc` 都按主键定位，本就
   至多一行，此处只为把「至多一行」这条不变量写进 SQL —— 一旦上游改动放宽了任一
-  JOIN，一行批次会扇成多行、破坏 `items.len()` 等于持有批次数的不变量；带
-  `ORDER BY` 则万一扇行也是确定性的。
+  JOIN，一行批次会扇成多行、破坏 `items.len()` 等于持有批次数的不变量。排序键
+  `cur.id` 在任何假设的扇行里都是同一个常量、打不破平局，故这个 `ORDER BY` 只表达
+  行数上界，**不承担消歧**。
 
 ### 外协两条 list 端点 — 2026-10-03 已下线，迁往 outsource 域
 

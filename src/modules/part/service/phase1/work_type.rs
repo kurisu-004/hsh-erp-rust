@@ -295,7 +295,9 @@ impl PartService {
         // 2. **当前 step 在锚链内的位置**：`cur2.process_id = b.current_process_id`；
         //    再取锚链内 **`sort_order` 大于它且最小**的那一个未软删 step。
         //    `cur2` 由 JOIN LATERAL 定位并带出 `hit_count`（链内命中数），
-        //    命中 >1 视作歧义落 `NONE`（见下）。
+        //    命中 >1 视作歧义落 `NONE`（见下）。`cur2` 是 **inner** `JOIN
+        //    LATERAL`：定位不到时整个派生子查询无行，故下面的 `CASE` 里没有
+        //    「定位不到」这一分支（该路径由最外层 `COALESCE(..., 'NONE')` 兜底）。
         //
         // ⚠️ **第 2 步必须按 `current_process_id` 在锚链内重新定位，绝对不能拿
         // `b.current_process_step_id` 的 `sort_order` 直接当位置** —— step 指针与
@@ -330,8 +332,10 @@ impl PartService {
         // 而 `sort_order` 的**密度不由读侧决定**：写侧只保证链内 `sort_order`
         // 互不重复（`upsert_chain` 校验 + `uq_chain_step_chain_order` 兜底），
         // 稠密 0-based（前端 `usePartProcessDesign` 保存时拍平成 `0,1,2…`）与
-        // 稀疏 `10/20/30`（`docs/api/production/process-chain.md` 记的是稀疏
-        // 口径）两种密度都能落库且都受支持。`+ 1` 只在稠密下正确、在稀疏下会把
+        // 稀疏 `10/20/30` 两种密度都能落库且都受支持。⚠️
+        // `docs/api/production/process-chain.md` 记的稀疏口径与真实写路径不符（漂移
+        // 登记见 `docs/api/inconsistencies.md` §9.4），别拿它当密度依据。
+        // `+ 1` 只在稠密下正确、在稀疏下会把
         // 「还有两道工序」误判成链尾，`>` 对两种密度都成立 ⇒ 读侧只能用 `>`。
         //
         // 4 个派生列都显式 `AS chain_*` 别名，与外层 `COALESCE(nx.*)` 逐字对应，
@@ -340,8 +344,9 @@ impl PartService {
         // 外层 LATERAL 末尾 `ORDER BY cur.id ASC LIMIT 1` 收口：不为消歧（`cur` /
         // `pc` 都按主键定位，本就至多一行），而是把「至多一行」这条不变量写进
         // SQL —— 不收口则一旦上游改动放宽了任一 JOIN，一行批次就会扇成多行、
-        // 破坏 VO 层「`items.len()` 等于持有批次数」的不变量；带 `ORDER BY` 则
-        // 万一扇行也是确定性的。
+        // 破坏 VO 层「`items.len()` 等于持有批次数」的不变量。排序键 `cur.id` 在
+        // 任何假设的扇行里都是同一个常量、打不破平局，故这个 `ORDER BY` 只表达
+        // 行数上界，**不买确定性**。
         //
         // `p.process_chain_id` / `b.current_process_id` /
         // `b.current_process_step_id` 全部是可空列：列本身可空时 `query_as` 返回的
@@ -372,12 +377,11 @@ impl PartService {
              JOIN t_part p ON p.id = b.part_id \
              LEFT JOIN LATERAL ( \
                SELECT \
-                 CASE \
-                   WHEN cur2.id IS NULL THEN 'NONE' \
-                   WHEN cur2.hit_count > 1 THEN 'NONE' \
-                   WHEN nsp.id IS NULL THEN 'TAIL' \
-                   ELSE 'NEXT' \
-                 END AS chain_state, \
+                  CASE \
+                    WHEN cur2.hit_count > 1 THEN 'NONE' \
+                    WHEN nsp.id IS NULL THEN 'TAIL' \
+                    ELSE 'NEXT' \
+                  END AS chain_state, \
                  nsp.process_id AS chain_next_process_id, \
                  np.name AS chain_next_process_name, \
                  cp.name AS chain_current_process_name \

@@ -212,9 +212,13 @@
 
 **前端无需改 Zod schema**，依据两条（均已核实）：
 
-1. `batch_id` 是 `#[serde(serialize_with = "serialize_i64_opt")]` + 无
-   `skip_serializing_if`，`delivered_quantity` 与链四字段都是 `#[serde(default)]` + 无
-   `skip_serializing_if`，六者都是**恒出现**的增量 key（无值时为 `null` 或默认值）；
+1. `batch_id` / `chain_next_process_id` 各带一条 `serialize_with`（`serialize_i64_opt`
+   对应可空的 `batch_id`、`serialize_i64` 对应非可空 `i64` 的 `chain_next_process_id`），
+   `batch_version` / `delivered_quantity` / `chain_state` /
+   `chain_next_process_name` / `chain_current_process_name` 是 `#[serde(default)]`；
+   六个字段**一律无** `skip_serializing_if` ⇒ 六者都是**恒出现**的增量 key（无值时为
+   `null` 或默认值）。「键恒出现」只由有无 `skip_serializing_if` 决定，
+   `#[serde(default)]` 是反序列化侧的兜底、与序列化出参无关；
 2. part 列表行 schema 刻意**不用** `.strict()`（前端 `src/composables/queries/schemas.ts`
    该处注释明写「行级 `.strict()` 会在后端加**任何一个**新字段时把整表打挂」），
    Zod 默认 strip 模式会安静吞掉未声明的 key。

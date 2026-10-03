@@ -472,6 +472,13 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 - 该行在本次改动之前就存在、本次 diff 未触碰；
 - 当前真实写路径（前端保存时把 `sort_order` 拍平成稠密 0-based）下结果是**潜在**
   缺陷而非活跃 bug；
+- ⚠️ **别把 [`./production/process-chain.md`](./production/process-chain.md) 当密度
+  依据**：那份文档记的写入口径（`sort_order` 默认稀疏 `10/20/30`、中间插入取
+  `(prev+next)/2`、精度耗尽走 `reorder_with_step_size` 批量重排）与真实写路径不符 ——
+  前端工序链编辑页保存时经 `upsertSteps` / `reorderSteps` 把 `sort_order` 按下标**拍平为
+  稠密 0-based**，文档提到的重排路径也未实装触发条件。文档漂移本身不在本次修复范围，
+  但它正是稀疏口径的传播源：读侧无论库里是哪种密度都只能用 `>`（与写侧正典
+  `next_step_in_chain` 同形），不能用 `+ 1`；
 - 外协出参把「无下一道」与「链不可解析」塌成同一个 `chain_resolvable = false`
   （与 `by-worker` 的三值不同），改它要连带复核文档 3 处 + 约 499 行测试期望；
 - 属另一个变更，应当独立成一次带回归测试的修复。

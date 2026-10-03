@@ -881,7 +881,9 @@ async fn by_worker_chain_state_repositions_by_current_process_id_not_step_pointe
 /// 一，就是拿「绝不能把当前工序自己当成下一道」这条承诺去赌 PG 的行序。
 ///
 /// 期望：`NONE`（`hit_count > 1` 显式降级）+ 下一道 id 为 `"0"`，前端弹工序
-/// 选择框让工人手填。本用例即该安全承诺的边界守卫。
+/// 选择框让工人手填。**不是 `TAIL`**：`TAIL` 会让放回页提示「加工完成后请送检」而不再
+/// 要下一道工序，等于把「位置有歧义」当成「确定在链尾」。本用例即该安全承诺的边界
+/// 守卫。
 #[tokio::test]
 async fn by_worker_chain_state_none_when_duplicate_process_in_chain() {
     let (pool, app, token, fx) = bootstrap().await;
@@ -923,8 +925,5 @@ async fn by_worker_chain_state_none_when_duplicate_process_in_chain() {
         Some(fx.process_a_id.to_string().as_str()),
         "绝不能把当前工序自己（A）当成下一道返回: {item}"
     );
-    // 保守降级不许退化成 TAIL：TAIL 会让放回页提示「加工完成后请送检」而不再要
-    // 下一道工序，等于把「位置有歧义」当成「确定在链尾」
-    assert_ne!(item["chain_state"], "TAIL", "歧义不许退化成 TAIL: {item}");
     assert_batch_anchor(&item, batch_id);
 }
