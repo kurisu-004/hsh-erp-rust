@@ -242,27 +242,27 @@ flush 直接断。
 > **batch 事件说明（2026-09-29 新增）**：`BATCH_PLACED_ON_SHELF` 同样在 HTTP commit 之后广播（沿 worker_pool 范本）；payload 含 4 个字段（batch_id / target_process_id / shelf_id / version）。单条 dispatch 端点发单条形态（payload 顶层字段）；bulk-dispatch / auto-dispatch 端点发批量形态（payload.batches 数组，仅含 succeeded 部分，skipped 不广播）。详见 [`./production/batches.md#ws-事件`](./production/batches.md#ws-事件)。
 >
 > i64 字段在 WS payload 中序列化为字符串（与 HTTP `R<T>` 一致）。
->
-> **`PART_BATCH_SPLIT` 双 payload（2026-10-03 订正）**：同一事件名有**两种** payload，
-> 消费方按「哪些 key 存在」分支，不要假设字段集固定：
->
-> | 触发端点 | payload | 何时发 |
-> |---|---|---|
-> | `POST /api/v2/prod/batches/{batch_id}/split` | `{ part_id, new_batch_id }` | 总是（手动拆批） |
-> | `POST /api/v2/prod/batches/{batch_id}/pick-up` | `{ part_id, new_batch_id, source_batch_id, quantity }` | **仅部分领取**（`0 < quantity < batch.quantity` 自动拆批时）；整批领取不发本事件 |
->
-> 两种 payload **共用** `part_id` / `new_batch_id` 两个字段名（这是消费方唯一可以
-> 无条件依赖的部分），后两个字段是 pick-up 侧的增量：`source_batch_id` = 被扣减的
-> 源批次（= URL 里的 `batch_id`）、`quantity` = 拆走量。
->
-> ⚠️ **2026-10-03 订正**：本事件**从来不发 `batch_id` 字段**（旧版本表误记为
-> `part_id` / `batch_id` / `new_batch_id`）——源批次走 `source_batch_id` 且只在
-> pick-up 侧有值；`split` 端点的源批次就是 URL 里的 `batch_id`，未冗余重发。
->
-> ⚠️ **消费方注意（源批次 OCC 已过期）**：部分领取会在同一事务里对源批次做
-> `quantity -= q` **且 `version += 1`**（`PartBatchRepo::_split_batch_inner`），所以
-> 收到本事件后**源批次的乐观锁版本已失效**，必须重新拉取列表拿新的
-> `batch_version` 再发下一次写请求。本事件不携带 `source_batch_version`。
+
+#### `PART_BATCH_SPLIT` 双 payload（2026-10-03 订正）
+
+同一事件名有**两种** payload，消费方按「哪些 key 存在」分支，不要假设字段集固定：
+
+| 触发端点 | payload | 何时发 |
+|---|---|---|
+| `POST /api/v2/prod/batches/{batch_id}/split` | `{ part_id, new_batch_id }` | 总是（手动拆批） |
+| `POST /api/v2/prod/batches/{batch_id}/pick-up` | `{ part_id, new_batch_id, source_batch_id, quantity }` | **仅部分领取**（`0 < quantity < batch.quantity` 自动拆批时）；整批领取不发本事件 |
+
+两种 payload **共用** `part_id` / `new_batch_id` 两个字段名（这是消费方唯一可以无条件依赖的
+部分），后两个字段是 pick-up 侧的增量：`source_batch_id` = 被扣减的源批次（= URL 里的
+`batch_id`）、`quantity` = 拆走量。
+
+⚠️ 本事件**不发** `batch_id` 字段：源批次走 `source_batch_id`，且该字段只在 pick-up 侧有值；
+`split` 端点的源批次就是 URL 里的 `batch_id`，未冗余重发。
+
+⚠️ **消费方注意（源批次 OCC 已过期）**：部分领取会在同一事务里对源批次做
+`quantity -= q` **且 `version += 1`**（`PartBatchRepo::_split_batch_inner`），所以
+收到本事件后**源批次的乐观锁版本已失效**，必须重新拉取列表拿新的 `batch_version`
+再发下一次写请求。本事件不携带 `source_batch_version`。
 
 ### `ASSEMBLY_UPDATED`
 
