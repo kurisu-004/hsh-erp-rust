@@ -248,8 +248,8 @@ pub struct OutsourceHeldBatchRow {
 ///
 /// 单 trait 合并 6 ZST（company + company_process + quote + quote_event + shipment，
 /// 外加 2026-10-03 新增的 quotable / sendable / pool 三个读模型 ZST），共 57 方法：
-/// company 8 + company_process 4 + quote 11 + quote_event 1 + shipment 10
-/// + quotable 2 + sendable 3 + pool 5 + 跨域 helper 12。
+/// company 8 + company_process 4 + quote 13 + quote_event 1 + shipment 9
+/// + quotable 2 + sendable 3 + pool 4 + 跨域 helper 13。
 ///
 /// 方法签名 = `sql.rs` 固有静态方法去 executor 形参。`<'a>` 显式生命周期是 mockall
 /// 0.15 automock 在 `async_trait` 上下文的硬性要求。
@@ -325,7 +325,7 @@ pub trait OutsourceRepoTrait: Send {
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
 
-    // ── t_outsource_quote（11）──
+    // ── t_outsource_quote（13）──
     async fn quote_get_by_id(
         &mut self,
         id: i64,
@@ -420,7 +420,7 @@ pub trait OutsourceRepoTrait: Send {
         new: NewOutsourceQuoteEvent,
     ) -> Result<TOutsourceQuoteEvent, sqlx::Error>;
 
-    // ── t_outsource_shipment（6）──
+    // ── t_outsource_shipment（9）──
     async fn shipment_get_by_id(
         &mut self,
         id: i64,
@@ -557,6 +557,14 @@ pub trait OutsourceRepoTrait: Send {
     /// 在用，写侧零校验 ⇒ 绕过 UI 直接调 API 就能对需审批工序直发。读法与
     /// `process_get_category` 同形（同表、同 `deleted_at IS NULL`、返回 `Option`
     /// 让调用方自己决定「不存在」怎么处理）。
+    ///
+    /// **为何不并进 `process_get_category`（2026-10-03 review 第 2 轮登记）**：两者读
+    /// 的是 `t_process` 同一行的相邻两列，合到一个 `process_get_flag_row` 里确实能
+    /// 少一次往返。但代价是回归面从 outsource 域扩到全部 `process_get_category`
+    /// 调用方（`outsource/service/quote.rs` 的建报价校验、`prod::batch::
+    /// send_to_outsource` 的类别校验），且返回类型要从 `Option<String>` 变成一个
+    /// 两字段结构体 —— 收益（省一次同表主键查询）远小于改面。故本轮保持独立，等真有
+    /// 第三个同表 flag 列时再合并。
     async fn process_get_requires_approval(
         &mut self,
         process_id: i64,
@@ -750,7 +758,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
             .await
     }
 
-    // ── t_outsource_quote（11）── 一行委托 sql::OutsourceQuoteRepo ─────────
+    // ── t_outsource_quote（13）── 一行委托 sql::OutsourceQuoteRepo ─────────
     async fn quote_get_by_id(
         &mut self,
         id: i64,
@@ -919,7 +927,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceQuoteEventRepo::create(&mut **self, new).await
     }
 
-    // ── t_outsource_shipment（6）── 一行委托 sql::OutsourceShipmentRepo ─────
+    // ── t_outsource_shipment（9）── 一行委托 sql::OutsourceShipmentRepo ─────
     async fn shipment_get_by_id(
         &mut self,
         id: i64,
@@ -1104,7 +1112,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourcePoolRepo::list_held(&mut **self, company_id, process_id).await
     }
 
-    // ── 跨域 helper（12）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
+    // ── 跨域 helper（13）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")

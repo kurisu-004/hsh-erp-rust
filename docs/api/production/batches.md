@@ -169,6 +169,19 @@
 > 回归：`tests/outsource/send_receive.rs::send_to_outsource_direct_rejected_when_process_requires_approval`
 > / `…approval_allowed_when_process_requires_approval`。
 
+> **APPROVAL 的 `quote_id` 也不接受 DIRECT 占位报价**（2026-10-03 review 第 2 轮）。
+> 占位报价是 DIRECT 路径自动建的 `status='APPROVED' / is_direct=true / price=0` 行，
+> 它满足下面 APPROVAL 的全部既有校验条件（状态 + 三元组）⇒ 只守 `direct=true` 的话，
+> 改传占位报价的 id 就能让需审批工序 0 元发货，把上一条守卫绕开。故 `quote_id`
+> 指向 `is_direct = true` 的报价时以 `400 21307 BIZ_OUTSOURCE_QUOTE_NOT_APPROVED`
+> 拒收，文案「该报价是免审批直发的占位价，不能作为审批价来源」（守卫落在建
+> shipment **之前**，不改动报价行本身）。存量占位报价的来源是这条守卫上线前的历史
+> 数据、或 `PATCH /prod/processes/{id}` 把 OUTSOURCE 工序的 `requires_approval` 由
+> `false` 翻成 `true`，故不能靠「清数据」消除。DIRECT 路径复用占位报价**不受影响**
+> ——那正是免审批直发的既有正确行为，且该路径在需审批工序上已被上一条守卫整体拦掉。
+> 回归：`tests/outsource/send_receive.rs::send_to_outsource_rejects_direct_placeholder_quote_as_approval_price`
+> / `…direct_still_reuses_placeholder_quote_when_approval_not_required`。
+
 - **APPROVAL**：`quote_id` 必须是 `APPROVED`，且 `part_id` / `outsource_company_id` /
   `process_id` 三者与本次请求一致（否则 `400 21302`）。
 - **DIRECT**（2026-10-03 由 501 stub 落地）：

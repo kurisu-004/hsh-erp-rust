@@ -218,10 +218,8 @@ pub(crate) async fn assert_shelf_maps_process(
 ///     `current_process_step_id` 不再清，而展示用的 `next_process_id` 正是由它
 ///     经 `t_process_chain_step` JOIN 派生 → 出池批次显示上一道工序。
 ///
-/// ## step 列的 10 个调用点里，**9 个可能传 `None`**（2026-10-03 review 第 1 轮订正）
-/// 上一版注释在这里逐字写着「其余 5 个调用点……4 列全传 `Some(..)`，走不到 clear
-/// 分支」，同时又把 `complete_repair` / `repair_dispatch` 列进「依赖该约定的 5 个
-/// 调用点」——两组自相矛盾，且第一组在本轮改动后已不成立。逐点核对后的现状：
+/// ## step 列的 10 个调用点里，**10 个都可能传 `None`**（2026-10-03 review 第 2 轮订正）
+/// 逐点核对后的现状（改任一处 step 形参都要连带复核本表）：
 ///
 /// | 调用点 | step 形参 | 何时为 `None` ⇒ 走 clear 分支 |
 /// |---|---|---|
@@ -237,8 +235,8 @@ pub(crate) async fn assert_shelf_maps_process(
 /// | `pickup`（work_type pick-up） | `batch.current_process_step_id`（读回） | 批次行该列本来就是 NULL（无链零件）⇒ 传 `None`，与 clear 等价（目标列已 NULL，无副作用） |
 ///
 /// 即 **6 处生产流端点的 step 列在「无链」时为 `None` 而走 clear 分支**（这 6 处是
-/// 2026-10-03 起从 `require_process_chain` 切到 `optional_process_chain` /
-/// `optional_step_id` 的直接后果，链可选项化后「无链」从 20706 拒收变成放行 + 落
+/// 2026-10-03 起工序链从「必须」放宽为 `optional_process_chain` / `optional_step_id`
+/// 的直接后果，链可选项化后「无链」从 20706 拒收变成放行 + 落
 /// NULL），另 3 处恒传 `None`（纯出池路径），只有 work_type pick-up 是把**读回值**
 /// 原样传下去 —— 有链时保持定位信息不丢，无链时恰好等价于清 NULL。
 ///
@@ -271,11 +269,11 @@ pub(crate) async fn mark_batch_with_status_and_meta(
             // `mark_batch_repairing`（start-repair，只置标记不改 status）与
             // `mark_batch_status_only`（scan-inspect FAIL，形参
             // `is_repairing = Some(true)`），二者都**不走**本漏斗的返修分支；
-            // 本漏斗的 8 个调用点（place_on_shelf / recall_to_pending /
+            // 本漏斗的 10 个调用点（place_on_shelf / recall_to_pending /
             // release_from_programming / outsource 收发 ×3 / complete_repair /
-            // repair_dispatch / scan-inspect 第一步）全部表示「批次回到了正常
-            // 生产流 / 送检 / 完成返修」，此刻必须清标记，否则返修态永远挂着。
-            // 其中 `complete_repair` 与 `repair_dispatch` 正是最关键的两个
+            // repair_dispatch / scan-inspect 第一步 / work_type pick-up）全部表示
+            // 「批次回到了正常生产流 / 送检 / 完成返修」，此刻必须清标记，否则返修态
+            // 永远挂着。其中 `complete_repair` 与 `repair_dispatch` 正是最关键的两个
             // 清除点（前者=返修完成，后者=一步式起修并直接到位）。
             is_repairing: Some(false),
             expected_version: Some(expected_version),
@@ -393,8 +391,8 @@ pub(crate) fn status_guard_for_target(target: &str) -> &'static [&'static str] {
 
 /// 读 part 的 `process_chain_id`（part 不存在 / 已软删 → `BIZ_PART_NOT_FOUND`）。
 ///
-/// 2026-10-03 新增：抽出后与严格变体 `require_process_chain` 共用（该函数已于
-/// 2026-10-03 review 第 1 轮随零调用点一并删除，详见 [`optional_process_chain`]）。
+/// 与 [`optional_process_chain`] 共用读链逻辑，`BIZ_PROCESS_CHAIN_REQUIRED`（20706）
+/// 的严格变体也建立在它之上。
 #[inline]
 async fn read_part_chain_id(
     conn: &mut PgConnection,
@@ -428,15 +426,8 @@ async fn read_part_chain_id(
 /// 链软删后该列仍是旧 id，caller 的 step 解析在链内找不到活跃 step 时才以
 /// `20702` 拒收（见 [`optional_step_id`]）。
 ///
-/// ## 严格变体 `require_process_chain` 已删除（2026-10-03 review 第 1 轮）
-/// 它与本函数的唯一差异是「`NULL` 怎么处理」（前者 20706 拒收 / 本函数放行）。
-/// 7 个生产流端点全部切到本函数后它**零调用点**（`rg require_process_chain src/ tests/`
-/// 只剩历史注释），`#[allow(dead_code)]` 挂着也掩盖了「20706 已无任何端点可返回」
-/// 这一事实。`20706 BIZ_PROCESS_CHAIN_REQUIRED` 仍留在 `shared::error::code` 的注册
-/// 表里（错误码是对外契约的一部分，删常量等于改契约），docs 侧已按
-/// 「已注册但 2026-10-03 起无端点返回」登记（`docs/api/production/process-chain.md`
-/// 的 20706 节）。真要恢复严格变体时，直接在本函数之上加一个 `ok_or_else` 包一层即可，
-/// 读链逻辑不必重新发明。
+/// 恢复「必须有链」（`20706 BIZ_PROCESS_CHAIN_REQUIRED`）的严格变体时，在本函数
+/// 之上加一层 `ok_or_else` 即可，读链逻辑不必重新发明。
 pub(crate) async fn optional_process_chain(
     conn: &mut PgConnection,
     part_id: i64,

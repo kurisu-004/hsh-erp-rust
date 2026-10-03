@@ -247,7 +247,9 @@ impl BatchService {
     /// - **部分发送**：`quantity ∈ (0, 批次量)` 时先拆出子批次，只把子批次发出
     /// - **守卫**：process 类别必须 `OUTSOURCE`；公司必须映射该工序；
     ///   **`requires_approval=true` 的工序不许 `direct=true`**（2026-10-03 review
-    ///   第 1 轮补：此前该规则只在读侧 SQL 生效，写侧无任何强制）
+    ///   第 1 轮补：此前该规则只在读侧 SQL 生效，写侧无任何强制）；
+    ///   **`quote_id` 不接受 DIRECT 占位报价**（2026-10-03 review 第 2 轮补：
+    ///   占位报价同样是 `status='APPROVED'`，能绕开上面那条守卫）
     pub async fn send_to_outsource<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -419,16 +421,17 @@ impl BatchService {
                 ));
             }
         };
-        let quote_row: Option<(String, rust_decimal::Decimal, i64, i64, i64)> = sqlx::query_as(
-            "SELECT status, price, part_id, outsource_company_id, process_id \
-             FROM t_outsource_quote \
-             WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(quote_id)
-        .fetch_optional(repo.conn_mut())
-        .await?;
-        let (status, price, q_part_id, q_company_id, q_process_id) =
-            quote_row.ok_or_else(|| {
+        let quote_row: Option<(String, rust_decimal::Decimal, i64, i64, i64, bool)> =
+            sqlx::query_as(
+                "SELECT status, price, part_id, outsource_company_id, process_id, is_direct \
+                 FROM t_outsource_quote \
+                 WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(quote_id)
+            .fetch_optional(repo.conn_mut())
+            .await?;
+        let (status, price, q_part_id, q_company_id, q_process_id, q_is_direct) = quote_row
+            .ok_or_else(|| {
                 AppError::biz(
                     code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND,
                     format!("quote {quote_id} 不存在"),
@@ -438,6 +441,36 @@ impl BatchService {
             return Err(AppError::biz(
                 code::BIZ_OUTSOURCE_QUOTE_NOT_APPROVED,
                 format!("quote {quote_id} 当前 {status}，非 APPROVED 不可发送"),
+            ));
+        }
+        // 2026-10-03 review 第 2 轮：APPROVAL（`quote_id`）路径拒 `is_direct=true`。
+        //
+        // 不变式：「需审批的工序只能凭真审批价发货」有两条入口，两条都要守 ——
+        // `direct=true` 由上面那道 `requires_approval` 守卫拦，`quote_id` 由本守卫
+        // 拦。只守状态与三元组不够：占位报价是 `resolve_direct_quote_id` 自动建的
+        // `price=0 / status='APPROVED' / is_direct=true` 行，恰好满足 APPROVAL 分支的
+        // 既有校验条件（`status='APPROVED'` + (part, company, process) 三元组一致），
+        // 不看 `is_direct` 就与真审批报价无法区分。
+        //
+        // 占位报价在库里已经存在（守卫上线前建的，或建完之后该工序的
+        // `requires_approval` 由 false 被 `PATCH /prod/processes/{id}` 翻成 true），
+        // 所以这道守卫必须落在端点里，不能靠清数据。
+        //
+        // 判据用 `!direct` 而不是「凡 `is_direct=true` 就拒」：DIRECT 路径的
+        // `find_approved_quote_id` 复用占位报价是**既有正确行为**（免审批直发本就
+        // 没有审批价），而该路径在需审批工序上已被上面那道守卫整体拦掉，不会走到
+        // 这里。两条路径的价来源判定必须分开。
+        //
+        // 错误码取 `BIZ_OUTSOURCE_QUOTE_NOT_APPROVED`（与紧邻的 status 守卫同码）：
+        // 两者都是「这不是可用的审批价来源」，只是原因不同（没批 / 是占位价）；
+        // 21302 留给「与请求参数不匹配」那条。
+        if !direct && q_is_direct {
+            return Err(AppError::biz(
+                code::BIZ_OUTSOURCE_QUOTE_NOT_APPROVED,
+                format!(
+                    "quote {quote_id} 是免审批直发的占位价（is_direct=true、price=0），\
+                     不能作为审批价来源；请改传该 (part, company, process) 经审批的报价"
+                ),
             ));
         }
         if q_part_id != part_id

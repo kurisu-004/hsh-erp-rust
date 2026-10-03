@@ -170,6 +170,14 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 > BIZ_INVALID_VALUE` 拒收（文案「该工序需要报价审批，请先走审批再发货，不能 direct
 > 直发」）。此前该规则**只在读侧生效**，绕过 UI 直接调 API 就能对需审批工序直发。
 > 两侧同码 20104，前端提示文案要能区分两种成因。
+>
+> **第 2 轮补的另一半**：写侧只守 `direct=true` 仍能被绕开 —— `APPROVAL` 分支的
+> `quote_id` 若指向一条 `is_direct=true` 的 0 元占位报价（同样 `status='APPROVED'`），
+> 上一条守卫形同虚设。故 `send-to-outsource` 额外以 `400` / `21307` 拒收
+> `is_direct = true` 的 `quote_id`（2026-10-03 review 第 2 轮，详见
+> [`./production/batches.md`](./production/batches.md) 的价来源一节）。
+> ⇒ 本端点出行的 `APPROVAL` 行在写侧一定发得成；出行的 `DIRECT` 行在需审批工序上
+> 也一定发不出去（该工序不会出 `DIRECT` 行）。**两侧口径一致，这是本轮闭环的判据。**
 
 ### 排序
 
@@ -219,7 +227,7 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 
 ## 集成测试
 
-`tests/outsource/sendable.rs`（17 用例）：
+`tests/outsource/sendable.rs`（18 用例）：
 
 - `sendable_approval_mode_when_approved_quote_exists` — APPROVAL 三件套 + `company_options` 空数组 + `version == batch.version`
 - `sendable_direct_mode_lists_active_company_options` — DIRECT 正确列出**活跃**公司（停用的不得出现）
