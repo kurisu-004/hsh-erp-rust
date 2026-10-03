@@ -229,7 +229,15 @@ pub struct OutsourceSendableListQuery {
     /// part 的 drawing_no / name ILIKE 模糊匹配。
     #[serde(default)]
     pub keyword: Option<String>,
-    /// 按 `t_part.customer_id` 精确过滤。
+    /// 客户子树过滤（2026-10-04 改语义）：命中 `t_part.customer_id` 等于该客户
+    /// **或其任一直接子客户**的批次。
+    ///
+    /// 零件恒挂在 L2（叶子）客户上，而前端客户树选中的常常是 L1 ⇒ 只判等值时选中
+    /// 一个 L1 必然 total 0（可发送列表恒空的根因）。**保留等值那一支** ⇒ 传 L2 id
+    /// 的请求行为逐字不变，老前端可独立于本轮上线。
+    ///
+    /// ⚠️ 「展开一层即完整」依赖客户树是**严格两层**结构（L3 数量为 0）。将来引入
+    /// L3 后本字段需改成递归子树展开，否则传 L1 会漏掉 L3 下的批次。
     #[serde(default)]
     pub customer_id: Option<i64>,
     #[serde(default)]

@@ -1230,10 +1230,34 @@ fn sendable_dedup_sql(inner_projection: &str, dedup_projection: &str) -> String 
 ///
 /// **过滤位置约定**：keyword / customer_id / process_id 全部停在**外层 `d`** 上，
 /// 内层不重复过滤 —— 谓词改动只有一个落点，不会出现「改了 list 忘了 count」。
+/// 其中 `customer_id` 的谓词由共享常量 `SENDABLE_CUSTOMER_SUBTREE_PREDICATE` 提供，
+/// `list` 与 `count` 引用的是同一个符号（见该常量注释）。
 ///
 /// **DIRECT 且 `company_options` 为空的行保留返回**（前端 `canSend()` 据
 /// `company_options.length >= 1` 置灰），count / counts 口径同样保留。
 pub struct OutsourceSendableRepo;
+
+/// `customer_id` 过滤谓词（2026-10-04 新增）：命中该客户**子树**，而非只命中它本身。
+///
+/// 零件恒挂在 L2 客户上（`t_part.customer_id` 指向 `t_customer` 的叶子行），而前端
+/// 客户树选中的常常是 L1 ⇒ 只判 `d.customer_id = $2` 时，选中一个 L1 必然 total 0
+/// （「可发送列表没有任何批次」的根因）。谓词分三支：
+///
+/// - `$2 IS NULL` → 不过滤；
+/// - `d.customer_id = $2` → **该支必须保留**：传 L2 id 时行为与展开前逐字一致，
+///   整个改动是纯放宽，老前端的请求参数无需任何变更即可独立上线；
+/// - `d.customer_id IN (子客户)` → L1 展开一层，吃 `ix_t_customer_parent_id`。
+///
+/// **展开一层即完整**：客户树是严格两层结构（叶子恒 `parent_id` 指向 L1，L3 数量
+/// 为 0），所以「子树」在这里就是「自身 ∪ 直接子客户」。**将来若引入 L3，必须把
+/// 这条谓词改成递归 CTE**（`WITH RECURSIVE`），否则传 L1 会漏掉 L3 下的零件。
+///
+/// 抽成常量而非在 `list` / `count` 两处各写一遍：两处 WHERE 必须逐字一致（漏改
+/// `count` 就会出现 items 与 total 对不上），共用一个符号是唯一能杜绝该漂移的写法。
+const SENDABLE_CUSTOMER_SUBTREE_PREDICATE: &str = "($2::bigint IS NULL \
+     OR d.customer_id = $2 \
+     OR d.customer_id IN (SELECT c2.id FROM t_customer c2 \
+                          WHERE c2.parent_id = $2 AND c2.deleted_at IS NULL))";
 
 impl OutsourceSendableRepo {
     pub async fn list<'e, E: PgExecutor<'e>>(
@@ -1247,9 +1271,10 @@ impl OutsourceSendableRepo {
         let sql = format!(
             "SELECT {SENDABLE_OUTER_COLS} FROM ( {dedup} ) d \
              WHERE ($1::text IS NULL OR d.part_drawing_no ILIKE $1 OR d.part_name ILIKE $1) \
-               AND ($2::bigint IS NULL OR d.customer_id = $2) \
+               AND {} \
              {SENDABLE_DISPLAY_ORDER} \
-             LIMIT $3 OFFSET $4"
+             LIMIT $3 OFFSET $4",
+            SENDABLE_CUSTOMER_SUBTREE_PREDICATE,
         );
         sqlx::query_as::<_, OutsourceSendableRow>(AssertSqlSafe(sql))
             .bind(keyword_pat)
@@ -1271,7 +1296,8 @@ impl OutsourceSendableRepo {
         let sql = format!(
             "SELECT COUNT(*)::bigint FROM ( {dedup} ) d \
              WHERE ($1::text IS NULL OR d.part_drawing_no ILIKE $1 OR d.part_name ILIKE $1) \
-               AND ($2::bigint IS NULL OR d.customer_id = $2)"
+               AND {}",
+            SENDABLE_CUSTOMER_SUBTREE_PREDICATE,
         );
         let n: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
             .bind(keyword_pat)

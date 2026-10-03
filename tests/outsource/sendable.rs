@@ -15,7 +15,9 @@
 //! - `current_process_id` 指向非 OUTSOURCE 工序 → 不出行
 //! - `PENDING` 且未上架（无 holder）的批次 → 出行，`shelf_code` 为 `null`
 //! - `version` == `t_part_batch.version`；`source_status` 区分 PENDING / IN_PROCESS
-//! - `customer_id` query 过滤生效
+//! - `customer_id` query 过滤：传 **L2** 时精确只命中该 L2（回归保护，纯放宽）；
+//!   传 **L1** 时展开到其全部 L2 子客户（2026-10-04 新语义 —— 只判等值时选中 L1
+//!   必然 total 0，那是「可发送列表没有任何批次」的根因）；不存在的 id → 0 行
 //! - `total` 与 items 实际行数一致（含 DIRECT 空 options 行）
 //! - `is_urgent` 排序在首
 
@@ -56,6 +58,29 @@ async fn insert_customer(pool: &PgPool, name: &str, prefix: &str) -> i64 {
     .execute(pool)
     .await
     .expect("insert t_customer");
+    id
+}
+
+/// 直插 L2 客户（挂到 `parent_id` 之下）—— `customer_id` 子树展开用例的前提。
+///
+/// `serial_prefix` 唯一索引 `uq_t_customer_root_prefix` 只作用于 `parent_id IS NULL`
+/// 的根客户，L2 用哪个前缀都不冲突。
+async fn insert_child_customer(pool: &PgPool, name: &str, prefix: &str, parent_id: i64) -> i64 {
+    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_customer \
+         (id, name, parent_id, serial_prefix, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(parent_id)
+    .bind(prefix)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_customer (L2)");
     id
 }
 
@@ -830,14 +855,22 @@ async fn sendable_source_status_and_batch_version() {
     assert_eq!(row_i["version"], 22, "version 必须取 batch.version: {env}");
 }
 
+/// `customer_id` 传 **L2** 时仍只命中该 L2（2026-10-04 展开前的行为，回归保护）。
+///
+/// 子树谓词里 `d.customer_id = $2` 那一支必须保留 ⇒ 这条断言同时守住「纯放宽」：
+/// 老前端传 L2 id 的请求逐字不变，不需要跟着本轮一起上线。`keyword` 维度一并覆盖
+/// （两个 query 参数各自的过滤互不影响）。
+///
+/// 另带一条「不存在的 id → 0 而非全量」。
 #[tokio::test]
-async fn sendable_customer_id_filter_and_keyword() {
+async fn sendable_customer_id_l2_exact_match_and_keyword() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let cid_a = insert_customer(&pool, "CustA", "N").await;
-    let cid_b = insert_customer(&pool, "CustB", "O").await;
-    let proc_id = seed_outsource_process(&pool, "SDCF", false).await;
-    let shelf_id = insert_shelf(&pool, "SE1").await;
-    for (cid, tag) in [(cid_a, "FJA"), (cid_b, "FJB")] {
+    let l1 = insert_customer(&pool, "RootL1", "W").await;
+    let l2_a = insert_child_customer(&pool, "LeafA", "Q", l1).await;
+    let l2_b = insert_child_customer(&pool, "LeafB", "R", l1).await;
+    let proc_id = seed_outsource_process(&pool, "SDEX", false).await;
+    let shelf_id = insert_shelf(&pool, "SX1").await;
+    for (cid, tag) in [(l2_a, "LXA"), (l2_b, "LXB")] {
         let pid = insert_part(&pool, cid, tag, false, "2026-12-01").await;
         insert_batch(
             &pool,
@@ -852,20 +885,108 @@ async fn sendable_customer_id_filter_and_keyword() {
         .await;
     }
 
-    let (s, env) = get_sendable(&app, &token, &format!("?customer_id={cid_a}")).await;
+    let (s, env) = get_sendable(&app, &token, &format!("?customer_id={l2_a}")).await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    assert_eq!(env["data"]["total"], 1, "{env}");
+    assert_eq!(env["data"]["total"], 1, "传 L2 必须只命中该 L2: {env}");
     assert!(
         env["data"]["items"][0]["part_drawing_no"]
             .as_str()
             .unwrap()
-            .contains("FJA"),
+            .contains("LXA"),
         "{env}"
     );
 
-    let (s, env) = get_sendable(&app, &token, "?keyword=FJB").await;
+    let (s, env) = get_sendable(&app, &token, "?keyword=LXB").await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    assert_eq!(env["data"]["total"], 1, "{env}");
+    assert_eq!(env["data"]["total"], 1, "keyword 过滤仍生效: {env}");
+
+    // 不存在的 id → 0 行，不是全量
+    let (s, env) = get_sendable(&app, &token, "?customer_id=880000000000000001").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 0,
+        "不存在的 customer_id 必须 total=0（曾返回全量）: {env}"
+    );
+    assert!(env["data"]["items"].as_array().unwrap().is_empty(), "{env}");
+}
+
+/// `customer_id` 传 **L1** 时命中其全部 L2 子客户的行（2026-10-04 新语义的核心断言）。
+///
+/// 零件恒挂在 L2 客户上，只判等值时选中 L1 必然 total 0 —— 这正是「可发送列表没有
+/// 任何批次」的根因。谓词形状：`= $2` 或 `IN (parent_id = $2)`。
+///
+/// 「展开一层即完整」依赖客户树严格两层，故这里同时建一条 L3（挂在 L2 下）来钉住
+/// 前提：将来若把谓词改成递归 CTE，本用例的期望值（不含 L3 那行）需要相应调整。
+#[tokio::test]
+async fn sendable_customer_id_l1_expands_to_children() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_customer(&pool, "RootSub", "L").await;
+    let l2_a = insert_child_customer(&pool, "SubA", "M", l1).await;
+    let l2_b = insert_child_customer(&pool, "SubB", "N", l1).await;
+    // L3（挂在 L2 之下）：客户树实测恒无 L3，这里造一条只用于钉住「只展开一层」
+    let l3 = insert_child_customer(&pool, "SubC", "S", l2_b).await;
+    let proc_id = seed_outsource_process(&pool, "SDLT", false).await;
+    let shelf_id = insert_shelf(&pool, "SY1").await;
+    for (cid, tag) in [(l2_a, "LTA"), (l2_b, "LTB"), (l3, "LTC")] {
+        let pid = insert_part(&pool, cid, tag, false, "2026-12-01").await;
+        insert_batch(
+            &pool,
+            pid,
+            1,
+            Some(shelf_id),
+            "PENDING",
+            None,
+            Some(proc_id),
+            0,
+        )
+        .await;
+    }
+
+    let (s, env) = get_sendable(&app, &token, &format!("?customer_id={l1}")).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    // L1 自身无零件 ⇒ 命中两个 L2 子客户的 2 行；L3 那行不命中（只展开一层）
+    assert_eq!(env["data"]["total"], 2, "传 L1 必须命中两个 L2: {env}");
+    let drawings: Vec<&str> = env["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["part_drawing_no"].as_str().unwrap())
+        .collect();
+    assert!(
+        drawings.iter().any(|d| d.contains("LTA")),
+        "缺 L2-A: {drawings:?}"
+    );
+    assert!(
+        drawings.iter().any(|d| d.contains("LTB")),
+        "缺 L2-B: {drawings:?}"
+    );
+    assert!(
+        !drawings.iter().any(|d| d.contains("LTC")),
+        "只展开一层，不该命中 L3 的行: {drawings:?}"
+    );
+
+    // 展开对「传进来的那个节点」一视同仁，不区分 L1 / L2：传 L2-B（它自己有个子
+    // 客户 L3）会命中 L2-B 与 L3 两行。
+    let (s, env) = get_sendable(&app, &token, &format!("?customer_id={l2_b}")).await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["total"], 2,
+        "传 L2-B 命中自身 + 它的子客户: {env}"
+    );
+    assert!(
+        env["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| { i["part_drawing_no"].as_str().unwrap().contains("LTB") })
+    );
+    assert!(
+        env["data"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["part_drawing_no"].as_str().unwrap().contains("LTC"))
+    );
 }
 
 #[tokio::test]

@@ -97,7 +97,7 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `keyword` | string? | part 的 `drawing_no` / `name` ILIKE `%needle%`；trim 后空串视为无过滤 |
-| `customer_id` | i64? | 按 `t_part.customer_id` 精确过滤 |
+| `customer_id` | i64? | 客户**子树**过滤：命中 `t_part.customer_id` 等于该客户**或其任一直接子客户**的批次（2026-10-04 改语义，见「端点契约要点」的「`customer_id` 是子树过滤」一节） |
 | `limit` | i64? | 默认 50，clamp(1, 200) |
 | `offset` | i64? | 默认 0，max(0) |
 
@@ -144,6 +144,34 @@
 ---
 
 ## 端点契约要点
+
+### `customer_id` 是子树过滤，不是等值过滤
+
+零件恒挂在 **L2（叶子）客户**上（`t_part.customer_id` 指向 `t_customer` 的叶子行），
+而前端客户树里被点选的常常是 **L1** ⇒ 谓词若只判 `d.customer_id = $2`，选中一个 L1
+必然 `total = 0`。这是「可发送列表没有任何批次」的直接根因。
+
+2026-10-04 起谓词分三支：
+
+```sql
+AND ($2::bigint IS NULL
+     OR d.customer_id = $2
+     OR d.customer_id IN (SELECT c2.id FROM t_customer c2
+                          WHERE c2.parent_id = $2 AND c2.deleted_at IS NULL))
+```
+
+- **等值那一支必须保留** ⇒ 传 L2 id 时行为与改动前逐字一致，整个变更是**纯放宽**，
+  可独立于前端上线（老前端的请求参数一个字都不用改）。
+- 展开对「传进来的那个节点」一视同仁，不区分 L1 / L2：传一个自己带子客户的 L2 同样
+  会带上它的子客户。
+- 子查询吃 `t_customer(parent_id)` 上已存在的索引 `ix_t_customer_parent_id`。
+- 该谓词抽成 `repo/sql.rs::SENDABLE_CUSTOMER_SUBTREE_PREDICATE`，`list` 与 `count`
+  引用的是同一个符号 —— 两处 WHERE 必须逐字一致，漏改 `count` 就会出现 items 与
+  total 对不上。
+- **⚠️ 展开一层即完整，前提是客户树严格两层**（L3 数量实测为 0）。**将来若引入 L3，
+  必须把这条谓词改成递归 CTE**，否则传 L1 会漏掉 L3 下的批次。集成测试
+  `sendable_customer_id_l1_expands_to_children` 里特意造了一条 L3 并断言它**不**命中，
+  就是为了在前提失效时立刻红。
 
 ### 前端如何用本端点的输出驱动写端点
 
@@ -238,7 +266,7 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 
 ## 集成测试
 
-`tests/outsource/sendable.rs`（18 用例）：
+`tests/outsource/sendable.rs`（19 用例）：
 
 - `sendable_approval_mode_when_approved_quote_exists` — APPROVAL 三件套 + `company_options` 空数组 + `version == batch.version`
 - `sendable_direct_mode_lists_active_company_options` — DIRECT 正确列出**活跃**公司（停用的不得出现）
@@ -252,7 +280,8 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 - `sendable_excludes_non_outsource_current_process` — `current_process_id` 指向 INHOUSE 工序 → 不出现
 - `sendable_excludes_batch_without_current_process` — `current_process_id IS NULL` → 不出现
 - `sendable_source_status_and_batch_version` — `source_status` 区分 PENDING / IN_PROCESS，WORKER 上的批次不出现
-- `sendable_customer_id_filter_and_keyword` — 两个 query 过滤生效
+- `sendable_customer_id_l2_exact_match_and_keyword` — 传 **L2** 仍精确只命中该 L2（纯放宽的回归保护）+ `keyword` 维度 + 不存在的 id → `total=0`（不是全量）
+- `sendable_customer_id_l1_expands_to_children` — 传 **L1** 命中其全部 L2 子客户；顺带造一条 L3 断言**不**命中（钉住「展开一层」的前提）
 - `sendable_total_matches_items_and_pagination` — `total` 与实际行数一致 + 分页（**不含 DIRECT 空 options 行** —— 本用例的 2 个 DIRECT 行各有 1 个 option；空 options 行由 `sendable_direct_row_kept_when_no_active_company` 单独覆盖）
 - `sendable_orders_urgent_first_then_planned_delivery` — 排序
 - `sendable_includes_outsource_process_when_part_has_no_chain` — 零件**完全没有**工艺链 → 仍出行（取代旧的 `sendable_excludes_process_not_in_part_chain`）
