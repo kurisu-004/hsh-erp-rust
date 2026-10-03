@@ -147,9 +147,9 @@
 
 ### `customer_id` 是子树过滤，不是等值过滤
 
-零件恒挂在 **L2（叶子）客户**上（`t_part.customer_id` 指向 `t_customer` 的叶子行），
-而前端客户树里被点选的常常是 **L1** ⇒ 谓词若只判 `d.customer_id = $2`，选中一个 L1
-必然 `total = 0`。这是「可发送列表没有任何批次」的直接根因。
+实测 `t_part.customer_id` 指向的都是**叶子（L2）客户**，而前端客户树里被点选的常常是
+**L1** ⇒ 谓词若只判 `d.customer_id = $2`，选中一个 L1 必然 `total = 0`。这是「可发送
+列表没有任何批次」的直接根因。
 
 2026-10-04 起谓词分三支：
 
@@ -168,10 +168,24 @@ AND ($2::bigint IS NULL
 - 该谓词抽成 `repo/sql.rs::SENDABLE_CUSTOMER_SUBTREE_PREDICATE`，`list` 与 `count`
   引用的是同一个符号 —— 两处 WHERE 必须逐字一致，漏改 `count` 就会出现 items 与
   total 对不上。
-- **⚠️ 展开一层即完整，前提是客户树严格两层**（L3 数量实测为 0）。**将来若引入 L3，
-  必须把这条谓词改成递归 CTE**，否则传 L1 会漏掉 L3 下的批次。集成测试
-  `sendable_customer_id_l1_expands_to_children` 里特意造了一条 L3 并断言它**不**命中，
-  就是为了在前提失效时立刻红。
+- **⚠️「展开一层即完整」是数据观察，不是被强制的结构不变式**（2026-10-04 订正措辞）。
+  **依据**是当日生产库实测：客户 14 个（3 L1 + 11 L2），**L3 数量 0**，全库 1874 个
+  零件**全部**挂在 L2 上、直接挂 L1 的零件数为 0。
+  但 API 层**不强制**这个结构 —— `POST /api/v2/com/customers`
+  （`com/customer/service/crud.rs::create_customer`）只按 `parent_id.is_some()` 校验
+  `serial_prefix` 三态，**不校验 `parent_id` 是否指向根客户**（连存在性都不查，表上无
+  物理外键）；`update_customer` 禁改 `parent_id` ⇒ create 是唯一能造出 L3 的入口。
+- **日后一旦出现 L3，必须把这条谓词改成递归 CTE**（`WITH RECURSIVE`），否则传 L1 会
+  漏掉 L3 名下的批次。⚠️ 该退化**是静默的**：只表现为 `total` 偏小 / 少报，不报任何
+  错，零命中守卫也不触发。
+- **集成测试 `sendable_customer_id_l1_expands_to_children` 守的不是「数据里不会出现
+  L3」**：它造的 L3 是自己直接 SQL 插进去的（绕开 API），断言该行**不**命中 ⇒ 它钉住
+  的是「只展开一层」，有人把谓词改成递归 CTE 时会立刻红；真出现 L3 时它不会红。
+- **软删节点行为不对称**（不是 bug，别反复查）：传一个已软删的 L2 id 时等值那一支不过
+  滤 `deleted_at`，其零件照样命中；而传它的父客户时该软删 L2 被子查询的
+  `c2.deleted_at IS NULL` 排除 ⇒ 同一批零件「按自己查得到、按父亲查不到」。零件可见性
+  不受客户 ACL 约束故不是权限漏洞，业务上客户被引用即被 `BIZ_CUSTOMER_IN_USE` 挡住
+  软删，几乎不可达。
 
 ### 前端如何用本端点的输出驱动写端点
 
@@ -281,7 +295,7 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 - `sendable_excludes_batch_without_current_process` — `current_process_id IS NULL` → 不出现
 - `sendable_source_status_and_batch_version` — `source_status` 区分 PENDING / IN_PROCESS，WORKER 上的批次不出现
 - `sendable_customer_id_l2_exact_match_and_keyword` — 传 **L2** 仍精确只命中该 L2（纯放宽的回归保护）+ `keyword` 维度 + 不存在的 id → `total=0`（不是全量）
-- `sendable_customer_id_l1_expands_to_children` — 传 **L1** 命中其全部 L2 子客户；顺带造一条 L3 断言**不**命中（钉住「展开一层」的前提）
+- `sendable_customer_id_l1_expands_to_children` — 传 **L1** 命中其全部 L2 子客户；顺带造一条 L3 断言**不**命中（钉住「只展开一层」这个实现选择 —— 有人把谓词改成递归 CTE 会红；**它守不了「数据里不会出现 L3」**）
 - `sendable_total_matches_items_and_pagination` — `total` 与实际行数一致 + 分页（**不含 DIRECT 空 options 行** —— 本用例的 2 个 DIRECT 行各有 1 个 option；空 options 行由 `sendable_direct_row_kept_when_no_active_company` 单独覆盖）
 - `sendable_orders_urgent_first_then_planned_delivery` — 排序
 - `sendable_includes_outsource_process_when_part_has_no_chain` — 零件**完全没有**工艺链 → 仍出行（取代旧的 `sendable_excludes_process_not_in_part_chain`）

@@ -549,13 +549,30 @@ pub trait OutsourceRepoTrait: Send {
     /// `customer_id` 过滤展开。
     ///
     /// 谓词形状与 `OutsourceSendableRepo` 的 `customer_id` 谓词**逐字同形**
-    /// （`customer_id = $1 OR customer_id IN (直接子客户)`）：零件恒挂在 L2 客户上，
-    /// 前端选的常是 L1，只判等值时 L1 必然零命中。**等值那一支保留** ⇒ 传 L2 id 的
-    /// 行为与展开前一致。
+    /// （`customer_id = $1 OR customer_id IN (直接子客户)`，反向引用见
+    /// `repo/sql.rs::SENDABLE_CUSTOMER_SUBTREE_PREDICATE` 的注释）：实测
+    /// `t_part.customer_id` 指向的都是叶子客户，前端选的常是 L1，只判等值时 L1 必然
+    /// 零命中。**等值那一支保留** ⇒ 传 L2 id 的行为与展开前一致。
     ///
-    /// 「展开一层即完整」依赖客户树严格两层（L3 数量为 0）；将来引入 L3 需改成递归
-    /// CTE。`LIMIT 10000` 与 `part_keyword_search` 同上限（两个集合要能在 service
-    /// 层求交，都不许无界）。
+    /// 「展开一层即完整」是 2026-10-04 生产库实测结论（零件全挂 L2、L3 数量 0），
+    /// **API 层不强制**（`create_customer` 不校验 `parent_id` 是否指向根客户）；出现
+    /// L3 后本谓词需改成递归 CTE，且漏报**是静默的**（`total` 偏小、不报错）。
+    ///
+    /// **软删节点行为不对称**（2026-10-04 review 第 1 轮登记，不是 bug，别反复查）：
+    /// 传一个已软删的 L2 id 时等值那一支不过滤 `deleted_at`，其零件照样命中；而传它
+    /// 的父客户时该软删 L2 被子查询的 `c2.deleted_at IS NULL` 排除 ⇒ 同一批零件
+    /// 「按自己查得到、按父亲查不到」。零件可见性不受客户 ACL 约束故不是权限漏洞，
+    /// 业务上客户一旦被引用就被 `BIZ_CUSTOMER_IN_USE` 挡住软删，几乎不可达。
+    ///
+    /// **`LIMIT 10000` 的依据与已知取舍**（2026-10-04 review 第 1 轮登记）：这个数字
+    /// 是从 `part_keyword_search` 抄来的（那边要的是「万级关键词结果求交」，两者在
+    /// service 层求交），**与「某客户子树的零件数」没有因果关系**，纯形式一致。实际
+    /// 余量：全库 `t_part` 1874 行（2026-10-04 实测），所以任何单棵子树的规模上界就是
+    /// 全库 1874 ⇒ **最坏情况余量也有 5 倍以上**（10000 / 1874 ≈ 5.3），实测中单棵
+    /// 子树只是全库的一个零头，今天不可能截断。但 ⚠️ 本查询**没有 `ORDER BY`** ⇒ 一旦
+    /// 真的触顶，返回的是**任意 10000 条**（非确定性子集、同一请求两次可能不同），
+    /// `total` 偏小且零命中守卫不触发 ⇒ 静默少报。已知取舍，本轮不改成 count+warn、
+    /// 不加 `ORDER BY`（属计划外改动）。
     async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error>;
     /// `t_process` 按 id 查 category。供 create_quote 校验 OUTSOURCE 类别。
     async fn process_get_category(
@@ -1148,6 +1165,9 @@ impl OutsourceRepoTrait for &mut PgConnection {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
+    // 2026-10-04 review 第 1 轮：谓词与 `LIMIT 10000` 的依据（含「无 ORDER BY ⇒
+    // 触顶时静默返回非确定性子集」这个已知取舍）统一写在 trait 处同名方法的 doc 上，
+    // 避免两份拷贝各自漂移。此处只放字面量，不重复论证。
     async fn part_ids_by_customer(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error> {
         let rows: Vec<(i64,)> = sqlx::query_as(
             "SELECT id FROM t_part WHERE deleted_at IS NULL \

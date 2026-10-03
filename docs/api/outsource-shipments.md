@@ -31,7 +31,7 @@
 > `receive_from_outsource_to_inspection`）与菜单 `outsource_send_receive_list` 都已授予
 > INSPECTOR，而本端点此前只放 Manager + Clerk ⇒ Inspector 能把批次发去外协、能收
 > 回来，却看不到当前在外协的批次、点不到「接收」按钮。本端点纯只读且出参不含任何
-> 价格列（`OutsourceInFlightItem` 的 14 个字段里没有 `price` / `unit_price`），故一并
+> 价格列（`OutsourceInFlightItem` 不含 `price` / `unit_price` 任何一列），故一并
 > 放宽。`reconcile-update`（会改对账单价 / 数量 / 开票标记）与
 > `GET /outsource-companies/{id}/sent-parts`（对账页列，含 `unit_price`）**维持
 > Manager + Clerk**。

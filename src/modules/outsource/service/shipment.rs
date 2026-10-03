@@ -284,8 +284,8 @@ impl OutsourceService {
     /// （`prod::batch::send_to_outsource` / `receive_from_outsource` /
     /// `receive_from_outsource_to_inspection`）与菜单 `outsource_send_receive_list`
     /// 都已授予 INSPECTOR，导致 Inspector 能发能收却看不到在途列表、点不到「接收」
-    /// 按钮。本端点纯只读，且返回体不含任何价格列（`OutsourceInFlightItem` 14 个字段
-    /// 里没有 `price` / `unit_price`），故放宽不涉商务敏感数据。
+    /// 按钮。本端点纯只读，且返回体不含任何价格列（`OutsourceInFlightItem` 没有
+    /// `price` / `unit_price` 任何一列），故放宽不涉商务敏感数据。
     ///
     /// 同域的 `reconcile_update_shipment`（写对账单价 / 数量 / 开票标记）与
     /// `list_company_sent_parts`（对账页列，含 `unit_price`）**维持 Manager + Clerk**。
