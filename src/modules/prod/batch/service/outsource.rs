@@ -292,7 +292,13 @@ impl BatchService {
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         ensure_transition(from, PartStatus::OUTSOURCE, "send-to-outsource")?;
-        // service 守：IN_PROCESS 时必须有 location=PRODUCTION_SHELF
+        // service 守：IN_PROCESS 时必须有 location=PRODUCTION_SHELF。
+        // 2026-10-03：本守卫此前**不可达** —— 状态机白名单里没有
+        // `IN_PROCESS → OUTSOURCE`（只有 `PENDING → OUTSOURCE`），`ensure_transition`
+        // 一定先把 IN_PROCESS 源拒掉。于是「可发送一览」的行（按写入不变式
+        // `PENDING ⇔ 出池`，几乎全是 IN_PROCESS 源）发一单就被 20103 拒，
+        // 端到端实测下外协发送 100% 不可用。状态机补边后本守卫才真正承担
+        // IN_PROCESS 源的 location 不变式（与 recall-to-pending / to-inspection 同分工）。
         if from == PartStatus::IN_PROCESS && batch.location.as_deref() != Some("PRODUCTION_SHELF") {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,

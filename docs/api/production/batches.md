@@ -122,7 +122,7 @@
 
 | 端点 | 迁移 | shipment 记账 |
 |---|---|---|
-| `POST /{batch_id}/send-to-outsource` | `PENDING → OUTSOURCE`（`location='OUTSOURCE_COMPANY'`） | 同事务 INSERT `t_outsource_shipment`（`OUTSOURCING`） |
+| `POST /{batch_id}/send-to-outsource` | `PENDING → OUTSOURCE` 或 `IN_PROCESS → OUTSOURCE`（后者**必须** `location='PRODUCTION_SHELF'`；落 `location='OUTSOURCE_COMPANY'`） | 同事务 INSERT `t_outsource_shipment`（`OUTSOURCING`） |
 | `POST /{batch_id}/receive-from-outsource` | `OUTSOURCE → IN_PROCESS`（`location='PRODUCTION_SHELF'`） | 整批回收才把开口 shipment 标 `RECEIVED` |
 | `POST /{batch_id}/receive-from-outsource-to-inspection` | `OUTSOURCE → INSPECTION`（`location='INSPECTION_SHELF'`） | 整批回收，口 shipment 标 `RECEIVED` |
 
@@ -154,6 +154,20 @@
 > 是因为它与已上线的 Python v1 客户端绑定，改名会破坏它。**前端已适配**
 > （`SendToOutsourcePayload` 的键为 `process_id`，并有契约用例逐字钉死 + 反断言禁止
 > `next_process_id` 出现在 body 里），两个仓同一次编排合入。
+
+**源状态**：`PENDING` 或 `IN_PROCESS`。`IN_PROCESS` 源额外要求
+`location='PRODUCTION_SHELF'`（货在生产架上），否则 `400 20103 BIZ_INVALID_TRANSITION`；
+在工人手上（`location='WORKER'`）的批次同样拒。该 location 不变式由 service 守卫承担
+（`send_to_outsource`），状态机只判「状态对不对」—— 与 `IN_PROCESS → PENDING`
+recall-to-pending、`IN_PROCESS → INSPECTION` to-inspection 同一分工。
+
+> **2026-10-03 补状态机边**：此前 `can_transition_to` 只有 `PENDING → OUTSOURCE`，
+> `IN_PROCESS → OUTSOURCE` 缺失 ⇒ 上面那条 location 守卫**永远不可达**，实际表现是
+> 「可发送一览」里的行发一单就被 `20103` 拒。而一览按 `current_process_id` 出行，
+> 按写入不变式（`PENDING ⇔ 出池`）出行的批次几乎全是 `IN_PROCESS` 源 ⇒ 端到端实测下
+> 外协发送 100% 不可用。回归：
+> `tests/outsource/send_receive.rs::send_to_outsource_from_in_process_shelf_batch_succeeds`
+> / `…send_to_outsource_rejects_in_process_off_production_shelf`。
 
 **价来源二选一**：`direct` 与 `quote_id` 必须恰给一个，否则 `400 20104 BIZ_INVALID_VALUE`。
 
@@ -313,7 +327,8 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 |---|---|---|
 | 角色 | 40300 | 非 Manager / Clerk / Inspector |
 | OCC | 40901 | `version` 与批次行不符（含部分收发时拆批 OCC 失败） |
-| 状态机 | 20103 | 源状态不在白名单（如已 `OUTSOURCE` 再 send） |
+| 状态机 | 20103 | 源状态不在白名单（如已 `OUTSOURCE` 再 send；`INSPECTION` / `DELIVERED` 等） |
+| 源 location | 20103 | `IN_PROCESS` 源但 `location != 'PRODUCTION_SHELF'`（例如货在工人手上）；2026-10-03 补状态机边后这道 service 守卫才真正可达 |
 | 价来源 | 20104 | `direct` 与 `quote_id` 都给或都不给；**`direct=true` 且该工序 `requires_approval=true`** |
 | 数量 | 20104 | `quantity <= 0` / `> 批次量` |
 | 工序类别 | 20104 | `process.category != 'OUTSOURCE'` |
@@ -325,12 +340,7 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 
 ### 已知不一致（2026-10-03 登记，未修）
 
-1. **状态机缺 `IN_PROCESS → OUTSOURCE` 边**：`PartStatus::can_transition_to` 只放行
-   `PENDING → OUTSOURCE`。故 `send_to_outsource` 实际只能从 `PENDING` 发起；service
-   里「`IN_PROCESS` 必须在 `PRODUCTION_SHELF`」那段守恒在当前代码里不可达，端点注释
-   与早期文档写的「`PENDING` 或 `IN_PROCESS+PRODUCTION_SHELF`」与实现不符。修法是给
-   状态机补这条边（`src/modules/part/statemachine.rs`），属 part 域改动，不在本域范围。
-2. **`t_part_event.event_type` 与 `backend-python` 词汇分叉**（2026-10-03 登记）：本仓
+1. **`t_part_event.event_type` 与 `backend-python` 词汇分叉**（2026-10-03 登记）：本仓
    直送品检事件用 `RECEIVED_TO_INSPECTION`（见上节），而
    `backend-python/model/enums.py` 仍定义 `RECEIVED_FROM_OUTSOURCE_INSPECTED`。两个
    后端共库，同一业务动作会按「谁服务的」产出两种 `event_type` 值。分叉保留（仓内零
@@ -338,7 +348,7 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
    **彻底解决需追加一条 append-only migration**：
    `ALTER TABLE t_part_event ALTER COLUMN event_type TYPE varchar(40);` —— 本轮不做
    （列宽是既有的全表约束，改它影响所有域的历史行与 Python 端写入路径）。
-3. **`uq_t_part_batch_part_no` 的 `MAX(batch_no)+1` 竞态**（2026-10-03 登记）：`_split_batch_inner`
+2. **`uq_t_part_batch_part_no` 的 `MAX(batch_no)+1` 竞态**（2026-10-03 登记）：`_split_batch_inner`
    先 `SELECT COALESCE(MAX(batch_no),0)+1` 再 INSERT，两条语句之间无锁。并发拆批
    （例如两个批次同时对外协做部分发送）会算出同一个 `batch_no` → 撞唯一约束 → 整事务
    **500** 而非 409。**只登记不修**：修法要么给拆批加 part 级 advisory lock、要么把

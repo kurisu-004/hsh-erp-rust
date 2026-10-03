@@ -24,6 +24,10 @@
 //!   `current_process_step_id` 落 NULL）
 //! - **20702 不被「链可选」一起吞掉**（2026-10-03：part 有链但链内没有该外协工序的
 //!   step 时，`send-to-outsource` 仍以 20702 / HTTP 404 拒收）
+//! - **IN_PROCESS 源能发**（2026-10-03：端到端实测发现的阻塞 bug —— 状态机白名单缺
+//!   `IN_PROCESS → OUTSOURCE`，「可发送一览」的行发一单就被 20103 拒。补边后
+//!   `IN_PROCESS + PRODUCTION_SHELF` 的无链零件 `direct=true` 发送 200；配对的负向
+//!   用例证明 `location != PRODUCTION_SHELF` 仍被 service 守卫拒在 20103）
 //!
 //! ## 集成测试范本（PR13 Phase H，2026-09-24）
 //! 本文件按 Phase F 范本收敛：删除本地 `send` / `json_request` / `setup` /
@@ -171,6 +175,39 @@ async fn insert_nth_batch(
     .execute(pool)
     .await
     .expect("insert t_part_batch");
+    id
+}
+
+/// 2026-10-03 新增：直插「**已入池**」的批次 —— `current_process_id` 指向一道工序。
+///
+/// 「可发送一览」的行按该列出行（而不是按状态），所以 IN_PROCESS 源的发送用例
+/// 必须造出这个组合，否则验的不是真实数据形态。`current_holder_id` 留 NULL
+/// （生产架批次本来就记货架 id，本用例不验它）。
+async fn insert_batch_with_process(
+    pool: &PgPool,
+    part_id: i64,
+    status: &str,
+    location: Option<&str>,
+    current_process_id: i64,
+) -> i64 {
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch \
+         (id, part_id, batch_no, quantity, status, location, current_process_id, version, \
+          created_at, updated_at) \
+         VALUES ($1, $2, 1, 5, $3, $4, $5, 0, $6, $6)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(status)
+    .bind(location)
+    .bind(current_process_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch with current_process_id");
     id
 }
 
@@ -615,6 +652,191 @@ async fn send_and_receive_without_process_chain_succeeds() {
     assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
     assert_eq!(cur_proc, Some(next_proc), "回池后归属下一道工序");
     assert!(step.is_none(), "无链时回收后 step 仍为 NULL");
+}
+
+/// 2026-10-03 新增：`IN_PROCESS` 源（`location='PRODUCTION_SHELF'`）的无链零件发送
+/// **成功** —— 端到端实测曾发现这里 100% 被拒。
+///
+/// 根因是状态机白名单只有 `PENDING → OUTSOURCE`（`part/statemachine.rs`），没有
+/// `IN_PROCESS → OUTSOURCE`，而 `send_to_outsource` 拿 batch 的源状态去
+/// `ensure_transition(.., OUTSOURCE, ..)` ⇒ 一律 20103。影响面是全量：
+/// 「可发送一览」按 `current_process_id` 出行，而按写入不变式
+/// `PENDING ⇔ 出池（current_process_id 置 NULL）`，出行的批次几乎全是
+/// `IN_PROCESS` 源 ⇒ 整个外协发送功能不可用。
+///
+/// 造的组合与真实数据形态一致：part **无** `process_chain_id`、批次
+/// `IN_PROCESS + PRODUCTION_SHELF + current_process_id → OUTSOURCE 工序`、
+/// 工序 `requires_approval=false`（免审批直发）。
+#[tokio::test]
+async fn send_to_outsource_from_in_process_shelf_batch_succeeds() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "InProcSnd", "Z").await;
+    let part_id = insert_part(&pool, customer_id, "IN_PROCESS").await;
+    let company_id = insert_outsource_company(&pool, "InProcSndCo").await;
+    let proc_id = seed_outsource_process(&pool, "ZIPS", "inproc_send", false).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    let bid = insert_batch_with_process(
+        &pool,
+        part_id,
+        "IN_PROCESS",
+        Some("PRODUCTION_SHELF"),
+        proc_id,
+    )
+    .await;
+    // 前提断言：part 确实没有链（无链时 step 落 NULL，是本用例的一半考点）
+    let chain: Option<i64> =
+        sqlx::query_scalar("SELECT process_chain_id FROM t_part WHERE id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read process_chain_id");
+    assert!(chain.is_none(), "本用例前提是 part 无工艺链");
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "direct": true,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "IN_PROCESS 源在生产架上必须能发外协: {env}"
+    );
+    assert_eq!(env["data"]["status"], "OUTSOURCE", "{env}");
+
+    let (status, location, holder, cur_proc, step): (
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT status, location, current_holder_id, current_process_id, \
+                current_process_step_id \
+         FROM t_part_batch WHERE id = $1",
+    )
+    .bind(bid)
+    .fetch_one(&pool)
+    .await
+    .expect("read batch after send");
+    assert_eq!(status, "OUTSOURCE");
+    assert_eq!(location.as_deref(), Some("OUTSOURCE_COMPANY"));
+    assert_eq!(holder, Some(company_id), "holder 写外协公司");
+    assert_eq!(
+        cur_proc,
+        Some(proc_id),
+        "批次归属锚 current_process_id 写该 OUTSOURCE 工序（收回时按它重新入池）"
+    );
+    assert!(
+        step.is_none(),
+        "无链时 current_process_step_id 必须落 NULL（该列是可选的显示用定位信息）"
+    );
+
+    // shipment 照常开一张开口单；part 由 min-progress 派生为 OUTSOURCE
+    let ship: (String, i64, i64) = sqlx::query_as(
+        "SELECT status, batch_id, process_id FROM t_outsource_shipment WHERE batch_id = $1",
+    )
+    .bind(bid)
+    .fetch_one(&pool)
+    .await
+    .expect("shipment row");
+    assert_eq!(ship.0, "OUTSOURCING");
+    assert_eq!(ship.1, bid);
+    assert_eq!(ship.2, proc_id);
+    assert_eq!(part_status(&pool, part_id).await, "OUTSOURCE");
+}
+
+/// 2026-10-03 新增：`IN_PROCESS` 源但 `location != 'PRODUCTION_SHELF'`（例如在工人
+/// 手上）仍**拒收**，20103。
+///
+/// 这条与上一条成对：状态机补 `IN_PROCESS → OUTSOURCE` 后，`IN_PROCESS` 源的
+/// 不变式就只剩 `send_to_outsource` 里那道 location 守卫（与 recall-to-pending /
+/// to-inspection 同一分工）。本用例证明守卫没被一起放松 —— 货还在工人手上时
+/// 不该被发到外协。
+#[tokio::test]
+async fn send_to_outsource_rejects_in_process_off_production_shelf() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let customer_id = insert_l1_customer(&pool, "InProcOff", "Y").await;
+    let part_id = insert_part(&pool, customer_id, "IN_PROCESS").await;
+    let company_id = insert_outsource_company(&pool, "InProcOffCo").await;
+    let proc_id = seed_outsource_process(&pool, "YIPO", "inproc_off", false).await;
+    map_company_process(&pool, company_id, proc_id).await;
+    // location = WORKER：货在工人手上，不在生产架
+    let bid =
+        insert_batch_with_process(&pool, part_id, "IN_PROCESS", Some("WORKER"), proc_id).await;
+
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/send-to-outsource"),
+            Some(json!({
+                "version": 0,
+                "outsource_company_id": company_id.to_string(),
+                "process_id": proc_id.to_string(),
+                "direct": true,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "不在生产架上的 IN_PROCESS 批次必须拒: {env}"
+    );
+    assert_eq!(
+        env["code"].as_i64().unwrap(),
+        20103,
+        "命中 service 层的 location 守卫（BIZ_INVALID_TRANSITION）: {env}"
+    );
+
+    // 批次一个字节都没动（守卫在任何写之前）
+    let (status, location, holder, cur_proc, version): (
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        i32,
+    ) = sqlx::query_as(
+        "SELECT status, location, current_holder_id, current_process_id, version \
+         FROM t_part_batch WHERE id = $1",
+    )
+    .bind(bid)
+    .fetch_one(&pool)
+    .await
+    .expect("read batch after rejected send");
+    assert_eq!(status, "IN_PROCESS", "被拒请求不得改批次状态: {env}");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert!(holder.is_none(), "不得写 holder: {env}");
+    assert_eq!(cur_proc, Some(proc_id), "不得改 current_process_id: {env}");
+    assert_eq!(version, 0, "被拒请求不得推 version: {env}");
+
+    // 未建占位报价 / 未开 shipment（守卫在 resolve_direct_quote_id 之前）
+    let quote_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_quote WHERE part_id = $1")
+            .bind(part_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count quotes");
+    assert_eq!(quote_count, 0, "被拒的发送不得留下占位报价: {env}");
+    let shipment_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM t_outsource_shipment WHERE batch_id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .expect("count shipments");
+    assert_eq!(shipment_count, 0, "被拒请求不得留下 shipment: {env}");
 }
 
 // ===========================================================================

@@ -594,6 +594,9 @@ mod tests {
         ensure_transition(PartStatus::PROGRAMMING, PartStatus::PENDING, "test").unwrap();
         ensure_transition(PartStatus::PROGRAMMING, PartStatus::IN_PROCESS, "test").unwrap();
         ensure_transition(PartStatus::OUTSOURCE, PartStatus::IN_PROCESS, "test").unwrap();
+        // 2026-10-03：send-to-outsource 的两个源状态
+        ensure_transition(PartStatus::PENDING, PartStatus::OUTSOURCE, "test").unwrap();
+        ensure_transition(PartStatus::IN_PROCESS, PartStatus::OUTSOURCE, "test").unwrap();
     }
 
     #[test]

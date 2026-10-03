@@ -162,7 +162,16 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 | 部分发送 / 部分接收 | 传 `quantity`（≤ `batch_quantity`）；`quantity == batch_quantity` 时传 `null` 走全量语义 |
 | `version` | 两种端点都必传的 OCC 锚（批次级），原样回传 |
 | `current_process_id` | `send-to-outsource` 的 `process_id` |
+| `source_status == "IN_PROCESS"` | 无需改动，直接发；写侧只额外要求该批次此刻仍 `location='PRODUCTION_SHELF'`，否则 `20103` |
 | `canSend()` 判定 | `status_label === 'sendable'` 且（`send_mode === 'APPROVAL'` 或 `company_options.length >= 1`） |
+
+> **读出行 ⇔ 写侧发得成（源状态这一维）**（2026-10-03）。本端点出 `PENDING` 与
+> `IN_PROCESS + PRODUCTION_SHELF` 两类行，写侧 `send-to-outsource` 的源状态白名单
+> 也正是这两者 —— 但 2026-10-03 之前**代码里并不是**：状态机只有
+> `PENDING → OUTSOURCE`（见 [`production/batches.md`](./production/batches.md) 的
+> 源状态一节），本端点列出的 `IN_PROCESS` 行发一单就被 `20103` 拒 ⇒ 一览 100% 不可发。
+> 补边后两侧口径才一致。仍存在的时序缺口：批次在列出之后被工人抢走
+> （`location` 变 `WORKER`）时发送会以 `20103` 拒，属 OCC 之外的另一道不变式。
 
 > **`DIRECT` 只在 `requires_approval = false` 的工序上出现**（`send_mode` 的定义就是
 > 该列）。2026-10-03 review 第 1 轮起写侧也守了同一条规则：`send-to-outsource` 收到
@@ -252,6 +261,12 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 
 单测：`service/sendable.rs::mod tests` 6 个（`send_mode_of` 三分支 + `company_options`
 JSON 解码：空数组 / 正常 / 畸形降级不 500）。
+
+写侧的源状态契约由 `tests/outsource/send_receive.rs` 锁住（2026-10-03 新增 2 个）：
+`send_to_outsource_from_in_process_shelf_batch_succeeds`（`IN_PROCESS +
+PRODUCTION_SHELF` 的无链零件 `direct=true` 发送 200，step 落 NULL）/
+`send_to_outsource_rejects_in_process_off_production_shelf`（`location='WORKER'` 仍
+以 `20103` 拒）。
 
 ---
 
