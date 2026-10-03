@@ -269,12 +269,18 @@ impl DeliveryNoteService {
         // 是 N 单 × M 装配件，不能逐个 `list_children`，故 1 条 SQL 批量取。
         // 与 `inner.rs::get_with_parts` / `handler/print.rs` 同 `include_deleted=false`
         // 口径 ⇒ 详情 VO 与打印注入的套数同源同值。
-        let children_by_asm: HashMap<i64, Vec<TPart>> = if asm_ids.is_empty() {
+        let children_by_asm: HashMap<i64, Vec<TPart>> = if assembly_map.is_empty() {
             HashMap::new()
         } else {
-            let mut m: HashMap<i64, Vec<TPart>> = HashMap::with_capacity(asm_ids.len());
-            for c in PartRepo::list_children_by_assemblies(&mut *repo.conn_mut(), &asm_ids, false)
-                .await?
+            // 2026-10-04 review 第 3 轮（INFO-5）：按 `assembly_map` 的 key 取子件，
+            // 不用 `asm_ids`。差集 = 被 `include_deleted=false` 判为软删的装配件，
+            // 它的子件查回来也用不上（`asm_quantity` 里没有该 key，`note_shippable_sets`
+            // 直接跳过），对应行上 `shippable_sets` 取 `None` 与现状一致，纯省一批
+            // 无谓往返。
+            let keys: Vec<i64> = assembly_map.keys().copied().collect();
+            let mut m: HashMap<i64, Vec<TPart>> = HashMap::with_capacity(keys.len());
+            for c in
+                PartRepo::list_children_by_assemblies(&mut *repo.conn_mut(), &keys, false).await?
             {
                 if let Some(aid) = c.assembly_id {
                     m.entry(aid).or_default().push(c);

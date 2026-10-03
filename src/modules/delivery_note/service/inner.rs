@@ -248,8 +248,12 @@ pub(super) async fn get_with_parts(
         .map(|(id, a)| (*id, a.quantity))
         .collect();
     let mut children_by_asm: HashMap<i64, Vec<crate::modules::part::model::TPart>> =
-        HashMap::with_capacity(asm_ids.len());
-    for aid in &asm_ids {
+        HashMap::with_capacity(assembly_map.len());
+    // 2026-10-04 review 第 3 轮（INFO-5）：遍历 `assembly_map` 的 key 而不是
+    // `asm_ids`。差集 = 被 `include_deleted=false` 判为软删的装配件，它的子件查回来
+    // 也用不上（`asm_quantity` 里没有该 key，`note_shippable_sets` 直接跳过），
+    // 对应行上 `shippable_sets` 取 `None` 与现状一致，纯省一次 DB 往返。
+    for aid in assembly_map.keys() {
         children_by_asm.insert(
             *aid,
             PartRepo::list_children(&mut *conn, *aid, false).await?,

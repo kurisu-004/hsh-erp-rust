@@ -98,6 +98,15 @@ sets(asm)         = LEAST(COALESCE(MIN(per_set(c) for c ∈ asm 的**全部**子
   （`COALESCE` 在 `LEAST` 里面，写反会在「子件总量全为 0」时返回
   `asm.quantity`，与「全零 → 0 套」正好相反）；
 - 软删子件不参与（取子件时统一 `include_deleted = false`）；
+- **`不按批次状态过滤`（与全局已送口径有意不同）**：本单口径的分子只要求批次挂在
+  本单（`PartBatchRepo::list_with_part_by_delivery_note` 只过滤 `deleted_at`）；
+  part 列表的 `shippable_sets`（`fetch_delivered_sets`）额外要求
+  `b.status IN ('DELIVERED','COMPLETED')`。⇒ DRAFT 单上若挂着 `INSPECTION` 状态
+  的批次（入单校验允许 `INSPECTION` / `READY_TO_SHIP` 进单，见
+  `service/inner.rs`），本单口径会把它算进去、全局口径不会。这是**多算**方向
+  （缺件仍压到 0，不会凭空多出整套），且与打印语义自洽。**不要**给本单口径补状态
+  过滤：那会让 DRAFT 单在 `INSPECTION` 阶段就打印出 0 套，与详情 VO 同源同值的
+  约束冲突。理由详见 `src/modules/delivery_note/service/shippable_sets.rs` 模块文档；
 - `LEAST(..., asm.quantity)` 顺带收口子件超交（不会出现「100 / 10 套」），
   并消除 int8→int4 溢出（中间量用 i64，收口后钳到 i32）；
 - PG 整数除法向零截断。
@@ -124,7 +133,11 @@ JSON number（套数是计数，不是 id）。
 
 1. **前端必须发 `merge_assemblies = true`**。Python 端 `_build_print_rows` 在
    `merge_assemblies` 为假时**直接早退逐行输出**，`merge_quantities` 根本不被读取。
-   前端当前默认值是 `false`（见 `PrintPreviewDialog.vue`）—— 不改前端，注入是空操作。
+   2026-10-04 review 第 3 轮（MINOR-2）订正：本条原文写「前端当前默认值是
+   `false`」是**事实错误** —— `PrintPreviewDialog.vue` 的 `mergeMode` 初值是
+   `'merge'`（`ref<'separate' | 'merge'>('merge')`，`onConfirm` 里 `mergeFlag = true`），
+   即**默认就是合并模式、默认发 `merge_assemblies = true`**，本条前提当前**已满足**。
+   只有操作员主动切到「分开打印」时才是 `false`，**那个分支下注入是空操作**。
 2. **Python 端 `PrintDeliveryNoteRequest` 必须有 `assembly_ids` 字段**。现状：Python
    的请求模型只有 `merge_assemblies` / `merge_quantities`，**没有** `assembly_ids`，
    API 层还硬传 `assembly_ids=None`（`api/v1/delivery_note_print.py`）⇒ Rust 注入的
@@ -185,7 +198,7 @@ Response：Python 的响应原样透传。成功形态：
 |---|---|---|
 | 20104 | BIZ_INVALID_VALUE | `/print-labels` 传了 `line_item_ids=[]`（空数组） |
 | 21109 | BIZ_DELIVERY_TEMPLATE_NOT_CONFIGURED | 未按客户 prefix 配出 xlsx 模板 |
-| 21113 | BIZ_DELIVERY_PRINT_BAD_ORDER（HTTP 422） | `custom_order` 含非法批次 id 或漏行 |
+| 21113 | BIZ_DELIVERY_PRINT_BAD_ORDER（HTTP 422） | `custom_order` 不满足 reps 口径：**漏行**（未覆盖本单全部 part）/ **非代表 id**（该 part 只承认本单最小的 `b.id`）/ **不属于本单**的批次 id —— 逐条对应上表 `custom_order` 行 |
 | 21401 | BIZ_DELIVERY_NOTE_NOT_FOUND（HTTP 404） | 送货单不存在 |
 
 表中的 2 个 211xx 模板码与 21401 在 `src/shared/error.rs::code` 里**仍然注册**

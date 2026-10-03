@@ -1,8 +1,8 @@
 //! 2026-10-04 新增：本单口径的装配件「可出货套数」（纯内存计算，无 SQL）
 //!
 //! 口径与 `part::service::list_enrichment::fetch_delivered_sets`（**全局已送套数**）
-//! 同源，唯一差别是「分子」从「全局已送批次量」换成「**本单**批次量」——
-//! 打印要回答的是「这一单能出几套」，不是「这个装配件历史上共出几套」。
+//! 同源，差别有两处，都在下文列明：分子换成「**本单**批次量」（打印要回答的是
+//! 「这一单能出几套」，不是「这个装配件历史上共出几套」），以及**不按批次状态过滤**。
 //!
 //! 三个消费方共用本函数，避免同一公式在 handler / service 各写一遍：
 //! - `handler/print.rs` —— 注入转发 body 的 `merge_quantities`（打印套数）
@@ -54,6 +54,21 @@
 //!   （三列都是 `integer NOT NULL` 且无 CHECK，业务不会建负量工单）。PG 侧对负数
 //!   向零截断会让套数偏大而 `NULLIF` 只挡 0 不挡负；本实现在 i32 收窄处把越界值
 //!   兜成 0（`try_from` 失败即 0），不把 wrap 后的垃圾值传下去。
+//!
+//! ## 与全局已送口径的**有意**不同：不按批次状态过滤
+//!
+//! 2026-10-04 review 第 3 轮（MINOR-4）订正：原文档写「唯一差别是分子」，不准确。
+//! `fetch_delivered_sets` 的分子除了求和，还带 `b.status IN ('DELIVERED','COMPLETED')`
+//! 过滤（`src/modules/part/service/list_enrichment.rs`）；本单版**不过滤批次状态**
+//! —— 入参 `rows` 来自 `PartBatchRepo::list_with_part_by_delivery_note`，只过滤
+//! `deleted_at`，入单时挂上来的批次一律计入（`service/inner.rs` 的入单校验允许
+//! `INSPECTION` / `READY_TO_SHIP` 进单）。
+//!
+//! ⇒ DRAFT 单上若挂着 `INSPECTION` 状态的批次，本单口径会把它算进可出货套数、
+//! 全局已送口径不会。这是「**多算**」方向（不会凭空多出整套：缺件仍然压到 0），
+//! 且与打印语义自洽 —— 打印问的是「这张单声称能出几套」，入单动作本身已经
+//! 把这些批次认领到本单上了。故保留现状，**不要**给本单口径补状态过滤：
+//! 那会让 DRAFT 单在 `INSPECTION` 阶段就打印出 0 套，与详情 VO 同源同值的约束冲突。
 
 use std::collections::HashMap;
 

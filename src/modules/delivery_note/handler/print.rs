@@ -147,11 +147,15 @@ async fn with_shippable_sets(
     // 套数公式只需要装配件的 `quantity`（比例因子 + LEAST 收口上界），收成
     // `HashMap<i64, i32>` 免掉整行 clone。
     let asm_quantity: HashMap<i64, i32> = asms.iter().map(|a| (a.id, a.quantity)).collect();
-    let mut children_by_asm: HashMap<i64, Vec<TPart>> = HashMap::with_capacity(asm_ids.len());
-    for aid in &asm_ids {
+    let mut children_by_asm: HashMap<i64, Vec<TPart>> = HashMap::with_capacity(asms.len());
+    // 2026-10-04 review 第 3 轮（INFO-5）：遍历 `asms`（已解析到的装配件）而不是
+    // `asm_ids`（源自本单批次行）。两者的差集 = 被 `include_deleted=false` 判为软删
+    // 的装配件，它们的子件查回来也用不上（`asm_quantity` 里没有这个 key，
+    // `note_shippable_sets` 直接跳过），纯浪费一次 DB 往返。
+    for a in &asms {
         children_by_asm.insert(
-            *aid,
-            PartRepo::list_children(&mut *conn, *aid, false).await?,
+            a.id,
+            PartRepo::list_children(&mut *conn, a.id, false).await?,
         );
     }
     let sets = note_shippable_sets(&rows, &asm_quantity, &children_by_asm);

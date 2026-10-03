@@ -1133,10 +1133,19 @@ fn labels_uri(note_id: i64) -> String {
 /// 装一套「1 个装配件 + 若干子件 + 批次挂单」的场景，返回 (note_id, asm_id, 子件 part id 列表)。
 ///
 /// `children` = `(子件名, 整单数量, 本单出货量)` 三元组。
+///
+/// 2026-10-04 review 第 3 轮修正：本单出货量改成 `Option<i32>`，**`None` = 该子件
+/// 完全不挂批次到本单**（不是「挂一行 quantity = 0 的批次」）。
+///
+/// ⚠️ 这两件事对「`min` 定义域」类断言是**完全不同**的场景：
+/// `Some(0)` 是本单有一行 0 量的批次行 ⇒ 只扫本单行集的旧口径也能算出 0 套 ⇒ 用例绿；
+/// `None` 是本单一行都没有 ⇒ 只有扫「全部子件」的口径才会算成 0 套。
+/// 原签名只能表达前者，导致「子件 C 不在本单」的两条用例给出的是**虚假保障**
+/// （退回 BLOCKER-1 修复前的实现照样全绿）。
 async fn seed_assembly_scenario(
     pool: &PgPool,
     asm_quantity: i32,
-    children: &[(&str, i32, i32)],
+    children: &[(&str, i32, Option<i32>)],
 ) -> (i64, i64, Vec<i64>) {
     let l1 = seed_customer(pool, "注入客户", None).await;
     let l2 = seed_customer(pool, "注入二厂", Some(l1)).await;
@@ -1145,7 +1154,9 @@ async fn seed_assembly_scenario(
     let mut part_ids = Vec::new();
     for (name, part_qty, note_qty) in children {
         let pid = seed_part(pool, l2, name, Some(asm_id), *part_qty).await;
-        seed_batch(pool, pid, note_id, *note_qty).await;
+        if let Some(nq) = note_qty {
+            seed_batch(pool, pid, note_id, *nq).await;
+        }
         part_ids.push(pid);
     }
     (note_id, asm_id, part_ids)
@@ -1185,7 +1196,7 @@ async fn delivery_note_print_injects_shippable_sets_for_assembly() {
     let (pool, app, fx) = bootstrap().await;
     let manager_token = token_of(&app, &fx.manager_username).await;
     let (note_id, asm_id, _parts) =
-        seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8), ("子件B", 10, 5)]).await;
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件B", 10, Some(5))]).await;
 
     let slot = body_slot();
     let s = slot.clone();
@@ -1288,7 +1299,8 @@ async fn delivery_note_print_skips_soft_deleted_assembly() {
     // 2026-10-04 review 第 1 轮修正：用 seed 返回的 asm_id。原实现
     // `SELECT id FROM t_assembly LIMIT 1` 只因 part fixture 不含 t_assembly 行才
     // 恰好选中目标行，fixture 一旦加装配体就会静默测错对象。
-    let (note_id, asm_id, _parts) = seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8)]).await;
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8))]).await;
     soft_delete_assembly(&pool, asm_id).await;
 
     let slot = body_slot();
@@ -1327,7 +1339,8 @@ async fn delivery_note_print_injects_zero_sets_when_children_short() {
     let (pool, app, fx) = bootstrap().await;
     let manager_token = token_of(&app, &fx.manager_username).await;
     // 装配件 10 套；子件整单 20 件（每套 2 件），本单只出 1 件 ⇒ 1*10/20 = 0 套
-    let (note_id, asm_id, _parts) = seed_assembly_scenario(&pool, 10, &[("子件A", 20, 1)]).await;
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 20, Some(1))]).await;
 
     let slot = body_slot();
     let s = slot.clone();
@@ -1366,7 +1379,8 @@ async fn delivery_note_print_caps_sets_by_assembly_quantity() {
     let (pool, app, fx) = bootstrap().await;
     let manager_token = token_of(&app, &fx.manager_username).await;
     // 装配件 10 套；子件整单 10 件，本单超交 100 件 ⇒ 100 套，收口到 10
-    let (note_id, asm_id, _parts) = seed_assembly_scenario(&pool, 10, &[("子件A", 10, 100)]).await;
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(100))]).await;
 
     let slot = body_slot();
     let s = slot.clone();
@@ -1406,7 +1420,7 @@ async fn delivery_note_print_ignores_zero_quantity_child_in_min() {
     // 装配件 10 套；子件 A 整单 10 件 / 本单 8 件 → 8 套；
     // 子件 B 整单 0 件 / 本单 3 件（越界数据）→ 跳过，min 仍取 8
     let (note_id, asm_id, _parts) =
-        seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8), ("子件B", 0, 3)]).await;
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件B", 0, Some(3))]).await;
 
     let slot = body_slot();
     let s = slot.clone();
@@ -1449,7 +1463,7 @@ async fn both_print_endpoints_inject_identical_shippable_sets() {
     let (pool, app, fx) = bootstrap().await;
     let manager_token = token_of(&app, &fx.manager_username).await;
     let (note_id, asm_id, _parts) =
-        seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8), ("子件B", 10, 5)]).await;
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件B", 10, Some(5))]).await;
 
     let print_slot = body_slot();
     let labels_slot = body_slot();
@@ -1505,16 +1519,22 @@ async fn both_print_endpoints_inject_identical_shippable_sets() {
 /// 套数必须是 0，不能只按「本单出现过的子件」取 min。
 ///
 /// 装配件 10 套；子件 A 整单 10 件 / 本单送 8 件（8 套）；子件 C 整单 10 件 /
-/// **本单一件没送**（0 套）⇒ min = 0。业务上剩余部分不能单独发货、必须等子件收齐，
-/// 打印时也不能凭空打出 8 套 —— python 端拿到 0 会丢掉该装配件的全部子件行。
+/// **本单一行批次都没有**（`note_qty = None`，0 套）⇒ min = 0。业务上剩余部分不能
+/// 单独发货、必须等子件收齐，打印时也不能凭空打出 8 套 —— python 端拿到 0 会丢掉
+/// 该装配件的全部子件行。
+///
+/// ⚠️ 2026-10-04 review 第 3 轮（MINOR-1）：本例原先写的是 `("子件C", 10, 0)`，
+/// 即给 C 挂了一行 **quantity = 0 的批次**。那种 seed 下旧口径（只扫本单批次行）
+/// 也能算出 0 套，用例对 BLOCKER-1 没有任何鉴别力。改成 `None`（C 真不在本单）后，
+/// `min` 的定义域里 C 只能来自「全部子件」查询 —— 退回旧实现本例会红。
 #[tokio::test]
 async fn delivery_note_print_injects_zero_sets_when_child_absent_from_note() {
     let (pool, app, fx) = bootstrap().await;
     let manager_token = token_of(&app, &fx.manager_username).await;
     // 装配件 10 套；子件 A 整单 10 件 / 本单 8 件 → 8 套；
-    // 子件 C 整单 10 件 / 本单 0 件 → 0 套 ⇒ min = 0
+    // 子件 C 整单 10 件 / **本单不挂批次** → 0 套 ⇒ min = 0
     let (note_id, asm_id, _parts) =
-        seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8), ("子件C", 10, 0)]).await;
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件C", 10, None)]).await;
 
     let slot = body_slot();
     let s = slot.clone();
@@ -1560,14 +1580,19 @@ async fn delivery_note_print_injects_zero_sets_when_child_absent_from_note() {
 /// 「子件 A 交 8 件 + 子件 C 一件没交」这个只有「全部子件」口径才会算成 0 的场景，
 /// 并额外断言两侧都等于 0：若任一侧退回旧口径（只看本单批次行），两侧会同时变成 8，
 /// 单纯的「两侧相等」断言察觉不到。
+///
+/// ⚠️ 2026-10-04 review 第 3 轮（MINOR-1）：子件 C 用 `note_qty = None`（真不在本单，
+/// 不是挂一行 0 量批次）。连带后果是 `line_items` 只有子件 A 一行 —— 详情 VO 的
+/// `line_items` 由**本单批次行**驱动，C 没有批次就没有行可挂；C 的 0 贡献只体现在
+/// 「同一行上的 `shippable_sets` 被压成 0」这件事上。
 #[tokio::test]
 async fn detail_shippable_sets_match_injected_merge_quantities() {
     let (pool, app, fx) = bootstrap().await;
     let manager_token = token_of(&app, &fx.manager_username).await;
     // 装配件 10 套；子件 A 整单 10 件 / 本单 8 件（8 套）；子件 C 整单 10 件 /
-    // 本单 0 件（0 套）⇒ 全子件口径下 min = 0
-    let (note_id, asm_id, parts) =
-        seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8), ("子件C", 10, 0)]).await;
+    // **本单不挂批次**（0 套）⇒ 全子件口径下 min = 0
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件C", 10, None)]).await;
 
     let slot = body_slot();
     let s = slot.clone();
@@ -1605,8 +1630,8 @@ async fn detail_shippable_sets_match_injected_merge_quantities() {
         .collect();
     assert_eq!(
         detail_sets.len(),
-        parts.len(),
-        "两个子件行都应带 assembly_id 与 shippable_sets: {denv}"
+        1,
+        "只有子件 A 在本单（子件 C 无批次 ⇒ 无行）；该行仍必须带 assembly_id 与 shippable_sets: {denv}"
     );
     assert!(
         detail_sets.iter().all(|s| *s == 0),
