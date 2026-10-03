@@ -1285,12 +1285,10 @@ async fn delivery_note_print_without_assembly_injects_nothing() {
 async fn delivery_note_print_skips_soft_deleted_assembly() {
     let (pool, app, fx) = bootstrap().await;
     let manager_token = token_of(&app, &fx.manager_username).await;
-    let (note_id, _asm_id, _parts) = seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8)]).await;
-    // 把本单唯一装配件软删
-    let asm_id: i64 = sqlx::query_scalar("SELECT id FROM t_assembly LIMIT 1")
-        .fetch_one(&pool)
-        .await
-        .expect("查装配件 id");
+    // 2026-10-04 review 第 1 轮修正：用 seed 返回的 asm_id。原实现
+    // `SELECT id FROM t_assembly LIMIT 1` 只因 part fixture 不含 t_assembly 行才
+    // 恰好选中目标行，fixture 一旦加装配体就会静默测错对象。
+    let (note_id, asm_id, _parts) = seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8)]).await;
     soft_delete_assembly(&pool, asm_id).await;
 
     let slot = body_slot();
@@ -1501,4 +1499,141 @@ async fn both_print_endpoints_inject_identical_shippable_sets() {
         json!(5)
     );
     assert_id_is_json_string(&from_labels, asm_id);
+}
+
+/// ★ 2026-10-04 review 第 1 轮（BLOCKER-1）：装配件有子件**本单完全没交批次**时，
+/// 套数必须是 0，不能只按「本单出现过的子件」取 min。
+///
+/// 装配件 10 套；子件 A 整单 10 件 / 本单送 8 件（8 套）；子件 C 整单 10 件 /
+/// **本单一件没送**（0 套）⇒ min = 0。业务上剩余部分不能单独发货、必须等子件收齐，
+/// 打印时也不能凭空打出 8 套 —— python 端拿到 0 会丢掉该装配件的全部子件行。
+#[tokio::test]
+async fn delivery_note_print_injects_zero_sets_when_child_absent_from_note() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    // 装配件 10 套；子件 A 整单 10 件 / 本单 8 件 → 8 套；
+    // 子件 C 整单 10 件 / 本单 0 件 → 0 套 ⇒ min = 0
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8), ("子件C", 10, 0)]).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-absent")));
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    let (status, _h, _out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fwd = take_body(&slot);
+    assert_eq!(
+        fwd["assembly_ids"],
+        json!([asm_id.to_string()]),
+        "装配件本身仍要注入（子件行是散件行兜底还是丢弃由 python 端按套数决定）"
+    );
+    assert_eq!(
+        fwd["merge_quantities"][asm_id.to_string().as_str()],
+        json!(0),
+        "本单没交批次的子件必须以 0 参与 min：凑不齐整套不能发，否则印出物理上不存在的整套"
+    );
+}
+
+/// ★ 同源同值（2026-10-04 review 第 1 轮，frontend reviewer 硬要求）：
+/// 详情 VO 的 `line_items[].shippable_sets`（前端预览显示的套数）与注入 body 的
+/// `merge_quantities[asm_id]`（实际导出 xlsx 的套数）必须**同源同值**。
+///
+/// 两条链路的输入集必须完全一致（都基于「该装配件的全部子件」，含本单没批次的子件），
+/// 否则用户会看到一个数、拿到另一个数的文件，且前端无从发现。用例刻意造
+/// 「子件 A 交 8 件 + 子件 C 一件没交」这个只有「全部子件」口径才会算成 0 的场景，
+/// 并额外断言两侧都等于 0：若任一侧退回旧口径（只看本单批次行），两侧会同时变成 8，
+/// 单纯的「两侧相等」断言察觉不到。
+#[tokio::test]
+async fn detail_shippable_sets_match_injected_merge_quantities() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    // 装配件 10 套；子件 A 整单 10 件 / 本单 8 件（8 套）；子件 C 整单 10 件 /
+    // 本单 0 件（0 套）⇒ 全子件口径下 min = 0
+    let (note_id, asm_id, parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, 8), ("子件C", 10, 0)]).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-same-source")));
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    // ① 详情端点（前端预览的数据源）
+    let (ds, denv) = send_json(
+        app2.clone(),
+        json_request(
+            "GET",
+            &format!("/delivery-notes/{note_id}"),
+            None,
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(ds, StatusCode::OK, "get detail: {denv}");
+    let items = denv["data"]["line_items"]
+        .as_array()
+        .expect("line_items 必须是数组");
+    let detail_sets: Vec<i64> = items
+        .iter()
+        .filter(|i| i["assembly_id"].as_str() == Some(asm_id.to_string().as_str()))
+        .map(|i| {
+            i["shippable_sets"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("装配件子件行必须有 shippable_sets: {i}"))
+        })
+        .collect();
+    assert_eq!(
+        detail_sets.len(),
+        parts.len(),
+        "两个子件行都应带 assembly_id 与 shippable_sets: {denv}"
+    );
+    assert!(
+        detail_sets.iter().all(|s| *s == 0),
+        "详情口径必须是「全部子件」：本单没交批次的子件以 0 参与 min ⇒ 0 套，实际 {detail_sets:?}"
+    );
+
+    // ② 打印端点（实际导出 xlsx 的数据源）
+    let (ps, _h, _out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(ps, StatusCode::OK);
+    let fwd = take_body(&slot);
+    let injected = fwd["merge_quantities"][asm_id.to_string().as_str()]
+        .as_i64()
+        .expect("merge_quantities[asm_id] 必须是 JSON number");
+
+    // ③ 同源同值
+    assert_eq!(
+        detail_sets,
+        vec![injected; detail_sets.len()],
+        "预览显示的套数（shippable_sets）必须与导出 xlsx 的套数（merge_quantities）相等"
+    );
 }

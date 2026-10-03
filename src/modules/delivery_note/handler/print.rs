@@ -7,8 +7,7 @@
 //! 2026-10-04：转发前**读本单批次算装配件可出货套数**并注入 body 的
 //! `assembly_ids` / `merge_quantities` 两个键。套数算在 rust 侧是因为口径必须与
 //! 详情只读字段（`line_items[].shippable_sets`）逐字一致，两处共用
-//! `service::shippable_sets::note_shippable_sets`；python 端只负责把套数填进
-//! xlsx，不再自己推算。
+//! `service::note_shippable_sets`；python 端只负责把套数填进 xlsx，不再自己推算。
 //!
 //! ## handler 语义
 //! 1. `authenticate_middleware` 已强制 JWT 校验（未带 token → 40100）；
@@ -30,8 +29,11 @@
 //!
 //! ## 三条关键取舍
 //! - **只读取数、不开 tx、不改 DB**：handler 内 `state.pool.acquire()` 拿连接
-//!   （`handler/crud.rs` 读端点同款范式），跑 2 条只读查询即 drop —— 读数**仅**
-//!   用于注入转发 body，不参与任何业务写入，故不开事务。
+//!   （`handler/crud.rs` 读端点同款范式），跑只读查询即 drop —— 读数**仅**
+//!   用于注入转发 body，不参与任何业务写入，故不开事务。**读失败一律
+//!   `AppError::Database`（50001 / HTTP 500）fail-loud，不降级成「不注入」**：
+//!   降级会让 python 端回落成每套默认 1（`_build_print_rows` 里
+//!   `(merge_quantities or {}).get(asm_id, 1)`）⇒ 静默打出错标签。
 //! - **不新增 404**：note 不存在 / 本单无批次 / 无装配件 / 装配件全软删时，
 //!   **不注入任何键**、原样转发。404 仍由 python 侧 `BIZ_DELIVERY_NOTE_NOT_FOUND`
 //!   兜，避免在 BFF 层新造一条与上游不一致的失败路径。
@@ -39,7 +41,9 @@
 //!   雪花 ID 是 string（> 2^53，JSON number 会丢精度），rust 侧解析只会引入
 //!   一层无收益的转换；`custom_order` / `line_item_ids` 的语义仍由 python 端
 //!   schema 负责（与 STS 转发同构）。`merge_quantities` 是**例外**：它由 rust 侧
-//!   覆盖写入，不再接受前端的人工 override。
+//!   **总是覆盖**写入（键级整体替换，不是逐键 merge），不再接受前端的人工
+//!   override。⚠️ 注入只在「本单有可解析装配件」时发生；没有装配件时前端自己
+//!   发的 `merge_quantities` 原样透传（python 端也用不到它）。
 //!
 //! ## 鉴权头不透传给 python
 //! `filter_request_headers`（`infra::py_backend`）剥掉 `Authorization` / `Cookie`，
@@ -60,10 +64,11 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 
 use crate::auth::rbac::{CurrentUser, Role};
-use crate::modules::assembly::model::TAssembly;
 use crate::modules::assembly::repo::AssemblyRepo;
 use crate::modules::delivery_note::dto::DeliveryNotePath;
-use crate::modules::delivery_note::service::shippable_sets::note_shippable_sets;
+use crate::modules::delivery_note::service::note_shippable_sets;
+use crate::modules::part::model::TPart;
+use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::AppError;
 use crate::state::AppState;
@@ -91,12 +96,24 @@ fn forwarded_headers(headers: &HeaderMap, current: &CurrentUser) -> HeaderMap {
 
 /// 2026-10-04 新增：转发前读本单批次，把装配件可出货套数注入 body。
 ///
-/// 取数走 2 条既有 repo 方法（**不新增 SQL / `query!` 宏**，`.sqlx/` 离线缓存不必重生成）：
+/// 取数走 3 类既有 repo 方法（**不新增 `query!` 宏**，`.sqlx/` 离线缓存不必重生成）：
 /// 1. `PartBatchRepo::list_with_part_by_delivery_note` —— 本单全部未删批次 × 工单；
-/// 2. `AssemblyRepo::list_by_ids(..., include_deleted=false)` —— 装配件（软删的解析不到）。
+/// 2. `AssemblyRepo::list_by_ids(..., include_deleted=false)` —— 装配件（软删的解析不到）；
+/// 3. `PartRepo::list_children(..., include_deleted=false)` —— 每个装配件的**全部**子件。
+///
+/// ⚠️ 第 3 步是 `min` 的定义域（缺它就会把「A 交一半、C 一件没交」误判成 A 能撑的
+/// 套数 ⇒ 印出物理上不存在的整套），本域按装配件逐个取：单单装配件通常 1~3 个，
+/// N 次小查询可接受（先例 `service/scan/mod.rs:143,166`）。批量详情那条链路
+/// （N 单 × M 装配件）改用 1 条 SQL 的 `PartRepo::list_children_by_assemblies`，
+/// 两条路径同 `include_deleted=false` 口径，套数不会分叉。
 ///
 /// 「不注入任何键、原样转发」的 4 种情形（本单无批次 / 无装配件 / 装配件全软删 /
 /// `body` 不是 JSON object），都是 python 侧已能处理的输入，BFF 层不新造失败路径。
+///
+/// 2026-10-04 观察项：本函数**不做用户货架 scope 过滤**（delivery_note 域本就无
+/// user-scope 校验，打印端点连单是否存在都不查）。当前不泄漏 —— 响应体来自 python
+/// 端自己的单据查询，本函数算出的套数只写进转发 body。若将来任何响应回显套数，
+/// 必须先补 scope 过滤。
 async fn with_shippable_sets(
     state: &AppState,
     note_id: i64,
@@ -104,10 +121,10 @@ async fn with_shippable_sets(
 ) -> Result<Value, AppError> {
     let Some(obj) = body.as_object() else {
         // body 不是 JSON object（前端理论上不会这么发）→ 不注入，也不报错。
-        // 先于取数短路：省掉 2 条无用的 DB 往返。
+        // 先于取数短路：省掉 3 条无用的 DB 往返。
         return Ok(body);
     };
-    // 读端点不开 tx：pool.acquire() → 2 条只读查询 → drop（同 handler/crud.rs 范式）。
+    // 读端点不开 tx：pool.acquire() → 只读查询 → drop（同 handler/crud.rs 范式）。
     let mut conn = state.pool.acquire().await?;
     let rows = PartBatchRepo::list_with_part_by_delivery_note(&mut *conn, note_id).await?;
     if rows.is_empty() {
@@ -127,8 +144,17 @@ async fn with_shippable_sets(
     if asms.is_empty() {
         return Ok(body);
     }
-    let assembly_map: HashMap<i64, TAssembly> = asms.iter().map(|a| (a.id, a.clone())).collect();
-    let sets = note_shippable_sets(&rows, &assembly_map);
+    // 套数公式只需要装配件的 `quantity`（比例因子 + LEAST 收口上界），收成
+    // `HashMap<i64, i32>` 免掉整行 clone。
+    let asm_quantity: HashMap<i64, i32> = asms.iter().map(|a| (a.id, a.quantity)).collect();
+    let mut children_by_asm: HashMap<i64, Vec<TPart>> = HashMap::with_capacity(asm_ids.len());
+    for aid in &asm_ids {
+        children_by_asm.insert(
+            *aid,
+            PartRepo::list_children(&mut *conn, *aid, false).await?,
+        );
+    }
+    let sets = note_shippable_sets(&rows, &asm_quantity, &children_by_asm);
 
     // 雪花 id > 2^53 ⇒ id 一律 JSON string；套数是普通计数 ⇒ JSON number。
     let mut quantities: Map<String, Value> = Map::with_capacity(asms.len());

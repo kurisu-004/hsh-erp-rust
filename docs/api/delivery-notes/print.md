@@ -60,7 +60,14 @@
 ### Rust 侧注入的两个键
 
 打印端点**不再是纯转发**：转发前 Rust 读本单批次，算出每个装配件的
-**可出货套数**，覆盖写入 body 的两个键。前端发的同名字段会被整体覆盖。
+**可出货套数**，覆盖写入 body 的两个键。
+
+**覆盖契约（定死，无歧义）**：`merge_quantities` 一旦被写入，就是**整体替换**
+该键（`assembly_ids` 同理），不是逐键 merge。前端发的同名字段
+（`PrintPreviewDialog.vue` 里操作员手填的「装配件行套数」）**全部作废**，
+Python 端不会看到任何前端值。唯一的例外是「本单没有可解析装配件」时
+两个键都不写，此时前端自己发的 `merge_quantities` 原样透传 —— 但那时
+`assembly_map` 为空，Python 端也用不到它。
 
 | 键 | 类型 | 谁写 | 说明 |
 |---|---|---|---|
@@ -71,19 +78,36 @@
 **只统计本单**批次）：
 
 ```text
-child_note_qty = Σ 本单上该子件 part 的 b.quantity          (i64)
-per_set        = child_note_qty * asm.quantity / part.quantity
-sets           = LEAST(COALESCE(MIN(per_set over 参与子件), 0), asm.quantity)   → i32
+child_note_qty(c) = Σ 本单上子件 c 的 b.quantity          (i64，本单无批次 = 0)
+per_set(c)        = child_note_qty(c) * asm.quantity / c.quantity
+sets(asm)         = LEAST(COALESCE(MIN(per_set(c) for c ∈ asm 的**全部**子件), 0),
+                           asm.quantity)                → i32
 ```
 
-边界（与 part 列表的「已送套数」同源，差别只在分子是**本单**而非全局已送）：
+⚠️ **`min` 的定义域是「该装配件的全部子件」**，不是「本单出现过的子件」。
+本单完全没交批次的子件以 `child_note_qty = 0` **参与** `min` ⇒ 必然把该装配件
+压到 0 套。业务规则原文「剩余的部分不能单独发货，需要等待其他子零件收集齐组装为
+装配件出货」：凑不齐整套就不能发。此时 Python 端拿到 0 会丢掉该装配件的全部子件行，
+不会印出物理上不存在的整套。与 part 列表「已送套数」同源（`COALESCE(SUM, 0)`），
+差别只在分子是**本单**而非全局已送。
+
+边界：
 
 - `part.quantity == 0` 的子件**不参与** `min`（对应 SQL 的 `NULLIF`）；
-- 装配件在本单上无参与子件 → `0` 套（`COALESCE` 在 `LEAST` 里面，写反会在
-  「子件总量全为 0」时返回 `asm.quantity`，与「全零 → 0 套」正好相反）；
+- 装配件**无参与子件**（没有子件 / 全部子件 `quantity = 0`）→ `0` 套
+  （`COALESCE` 在 `LEAST` 里面，写反会在「子件总量全为 0」时返回
+  `asm.quantity`，与「全零 → 0 套」正好相反）；
+- 软删子件不参与（取子件时统一 `include_deleted = false`）；
 - `LEAST(..., asm.quantity)` 顺带收口子件超交（不会出现「100 / 10 套」），
   并消除 int8→int4 溢出（中间量用 i64，收口后钳到 i32）；
 - PG 整数除法向零截断。
+
+**与详情只读字段同源同值**：`GET /api/v2/delivery-notes/{id}` 的
+`line_items[].shippable_sets`（前端预览显示的套数）与本处注入的
+`merge_quantities`（实际导出 xlsx 的套数）由**同一个纯函数**算出，且三条调用链
+（打印 handler / 详情 / 批量详情）传入的子件集合同口径（都取「该装配件的全部
+未软删子件」）。契约测试：`tests/print_forward.rs`
+`detail_shippable_sets_match_injected_merge_quantities`。
 
 **不注入、原样转发的 4 种情形**（BFF 层不新造失败路径）：本单无批次 / 本单无
 装配件 / 本单引用的装配件全部软删或不存在 / `body` 不是 JSON object。
@@ -93,6 +117,25 @@ sets           = LEAST(COALESCE(MIN(per_set over 参与子件), 0), asm.quantity
 的元素与 `merge_quantities` 的 key 都是 string；`merge_quantities` 的 value 是普通
 JSON number（套数是计数，不是 id）。
 
+### 跨仓生效前提（缺一即静默空操作）
+
+注入的 `merge_quantities` 要真正影响 xlsx，**下列 3 件事必须同时成立**，
+任一不成立都不会报错、只是结果与今天完全一样：
+
+1. **前端必须发 `merge_assemblies = true`**。Python 端 `_build_print_rows` 在
+   `merge_assemblies` 为假时**直接早退逐行输出**，`merge_quantities` 根本不被读取。
+   前端当前默认值是 `false`（见 `PrintPreviewDialog.vue`）—— 不改前端，注入是空操作。
+2. **Python 端 `PrintDeliveryNoteRequest` 必须有 `assembly_ids` 字段**。现状：Python
+   的请求模型只有 `merge_assemblies` / `merge_quantities`，**没有** `assembly_ids`，
+   API 层还硬传 `assembly_ids=None`（`api/v1/delivery_note_print.py`）⇒ Rust 注入的
+   `assembly_ids` 会被 pydantic **静默丢弃**，`assembly_map` 为空 ⇒ 装配件合并不生效。
+   Rust 侧不会因此报错（注入发生在转发 body 上，Python 收不收由它自己决定）。
+   **这条必须进跨仓验收**：Python 端补上该字段并把它透传给
+   `service.print*` 后，本文件的两条链路才真正闭环。
+3. **前端手工 override 的 UI 需清理**。`PrintPreviewDialog.vue` 装配件行的
+   `el-input-number`（默认写死 1）与 `merge_quantities[asm] = r.quantity` 现在
+   全部被 Rust 覆盖，属死代码，留着会让操作员以为自己填的值生效。
+
 ### `POST /api/v2/delivery-notes/{id}/print`  （P4 打印）
 
 Request（body 是 `Json<Value>`：前端字段原样透传，Rust 侧不解析、不做 schema 校验；
@@ -101,9 +144,9 @@ Request（body 是 `Json<Value>`：前端字段原样透传，Rust 侧不解析�
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `custom_order` | [string (i64)]? | — | 行顺序（批次 id 序列）。**每个 part 只承认其「代表批次 id」**（该 part 在本单最小的 `b.id`），且必须**覆盖本单全部 part** —— 漏行 / 非代表 id / 不属于本单都 → Python 侧 422 `BIZ_DELIVERY_PRINT_BAD_ORDER`。缺省走 Python 端默认顺序（`b.id ASC`） |
-| `merge_assemblies` | bool? | — | true → 同装配件子件合并一行（缺省 `false`）。⚠️ 无 `assembly_ids` 时合并不生效（`assembly_map` 为空） |
+| `merge_assemblies` | bool? | — | true → 同装配件子件合并一行（缺省 `false`）。⚠️ 无 `assembly_ids` 时合并不生效（`assembly_map` 为空）；**且为 `false` 时 Python 端早退逐行、`merge_quantities` 完全不被消费 ⇒ 注入是空操作**（见「跨仓生效前提」） |
 | `assembly_ids` | [string (i64)]? | — | **Rust 注入**（见上） |
-| `merge_quantities` | object? | — | **Rust 注入**（见上）：`{ "<assembly_id>": <可出货套数> }`，值为 0 = 该装配件子件不进 xlsx |
+| `merge_quantities` | object? | — | **Rust 注入**（见上）：`{ "<assembly_id>": <可出货套数> }`，值为 0 = 该装配件子件不进 xlsx。**总是整体覆盖**前端同名字段 |
 | `line_item_ids` | [string (i64)]? | — | 标签端点专用：只打这些批次行（`line_items[].id`）；见下一节 |
 
 Response：Python 的响应原样透传（status + body + 经清洗的 headers）。成功形态：
@@ -158,7 +201,13 @@ Rust 侧不预判、不枚举；前端按 `{code, message, data}` 解封即可�
 |---|---|---|---|
 | 20407 | BIZ_PRINT_FORWARD_FAILED | 502 | rust → python 网络层失败：连接拒 / 超时 / 读 body 失败 / `PYTHON_BACKEND_BASE_URL` 未配置（`NoopPyBackend` 占位） |
 | 40800 | REQUEST_TIMEOUT | 408 | 打印路径超过 `PRINT_REQUEST_TIMEOUT_SECONDS`（缺省 660s）—— 由 `middleware::timeout` 返回，带标准信封 |
+| 50001 | DATABASE | 500 | 转发前读本单批次 / 装配件 / 子件失败（`state.pool.acquire()` 与 3 条 repo 查询的 `?`）。DB 抖动/连接池耗尽时出现，**可重试** |
 
+> 50001 是 2026-10-04 随「转发前读 DB 算套数」新增的失败路径（此前这 2 个端点
+> 只读取数之外什么都不做，故表里只有 20407 / 40800）。注意它**不是** 20407：
+> 20407 = rust 转发不到 Python；50001 = rust 根本没能读到本单数据、请求没发出去。
+> 该路径**刻意不做降级**（不降级成「不注入任何键」），理由见下方实现要点。
+>
 > 20407 与 STS 转发的 20406 `BIZ_STS_FORWARD_FAILED` 是两条链路的独立命名：前端与
 > 日志能直接看出挂的是 STS 还是打印。
 >
@@ -208,18 +257,35 @@ Rust 侧不预判、不枚举；前端按 `{code, message, data}` 解封即可�
 ## 实现要点
 
 - **只读取数、不开 tx、不改 DB**：handler 内 `state.pool.acquire()` 拿连接（读端点
-  范式，同 `handler/crud.rs`），跑 2 条只读查询即 drop。读数**仅**用于注入转发
+  范式，同 `handler/crud.rs`），跑只读查询即 drop。读数**仅**用于注入转发
   body，不参与任何业务写入。
-- **不新增 SQL**：取数走既有 repo 方法
-  （`PartBatchRepo::list_with_part_by_delivery_note` +
-  `AssemblyRepo::list_by_ids(..., include_deleted=false)`），套数在内存里算
-  （`service::shippable_sets::note_shippable_sets`）。同一公式也用于详情只读字段
-  `line_items[].shippable_sets`，两处口径不会漂。
+- **读失败 fail-loud，绝不降级成「不注入」**：DB 读失败一律 `AppError::Database`
+  （50001 / HTTP 500），不 catch 后原样转发。理由：降级会让 Python 端回落到
+  「每套装配件默认 1 套」（`_build_print_rows` 里 `(merge_quantities or {}).get(asm_id, 1)`）
+  ⇒ 静默打出**错标签**，用户拿到一份看起来正常但套数全错的 xlsx。打印错标签比
+  打印失败难查得多。
+- **取数 3 步，不新增 `query!` 宏**：① `PartBatchRepo::list_with_part_by_delivery_note`
+  （本单未删批次 × 工单）② `AssemblyRepo::list_by_ids(..., include_deleted=false)`
+  （装配件）③ 子件 —— 打印 / 单单详情按装配件逐个 `PartRepo::list_children`（单单
+  装配件通常 1~3 个，N 次小查询可接受，先例 `service/scan/mod.rs`）；批量详情
+  （N 单 × M 装配件）用 1 条 SQL 的 `PartRepo::list_children_by_assemblies`（非宏
+  `sqlx::query_as`，不进 `.sqlx/` 离线缓存）。两条取子件路径同 `include_deleted=false`
+  口径。
+- **套数只有一个纯函数**：`service::shippable_sets::note_shippable_sets`，三处调用
+  （打印注入 / `line_items[].shippable_sets` / 批量详情）共用。它的入参只含
+  `装配件 id → quantity` 与 `装配件 id → 全部子件`，不含 `TAssembly` 整行
+  （算套数不需要装配件的其它字段，调用方就不必 clone 整行）。
 - **前端字段原样透传**：`Json<Value>` 透传，不定义强类型 DTO、不解析前端字段
   （雪花 id 是 string，解析只是引入一层无收益的转换）。唯二被改写的是
-  `assembly_ids` / `merge_quantities` 两个注入键。
+  `assembly_ids` / `merge_quantities` 两个注入键（整体覆盖）。
 - **不新增 404**：本单查不到数据时原样转发，让 Python 侧产出既有错误码
   （`BIZ_DELIVERY_NOTE_NOT_FOUND` 等），避免 BFF 层多出一条与上游不一致的失败路径。
+  ⚠️ 这条只针对「查得到但查不出东西」（无批次 / 无装配件 / 全软删）；**连接失败与
+  查询报错不在此列**，那些是 50001。
+- **注入的 DB 读不做用户货架 scope 过滤**：delivery_note 域本就无 user-scope 校验，
+  打印端点连单是否存在都不查（404 交给 Python）。当前**不泄漏** —— 响应体来自
+  Python 端自己的单据查询，Rust 算出的套数只写进转发 body。将来若任何响应回显套数，
+  必须先补 scope 过滤。
 - **身份单头传递**：handler clone 一份 `HeaderMap` 再注入 `X-Forwarded-User-Id`
   （不能直接 mutate extractor 给的那份，会污染共用同一 `HeaderMap` 的其它
   extractor / middleware）。

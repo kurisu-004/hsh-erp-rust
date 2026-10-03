@@ -103,6 +103,10 @@ pub struct DeliveryNoteLineItem {
     /// 2026-10-04 新增：本单可出货套数（**只统计本单**批次，口径见
     /// `service::shippable_sets::note_shippable_sets`）。
     ///
+    /// `min` 的定义域是「该装配件的**全部**子件」：本单没交批次的子件以 0 参与
+    /// ⇒ 凑不齐整套就是 0。须与打印注入的 `merge_quantities` 逐字同值（同一纯
+    /// 函数、同一子件集），否则前端预览与导出 xlsx 会给出两个数。
+    ///
     /// 仅子件行填；散件为 `None`。0 = 凑不齐整套（打印时不进 xlsx）。
     /// 装配件被软删 / 不存在时同样是 `None`（与 `assembly_id` 同口径：都取
     /// 「解析到的装配件」）。

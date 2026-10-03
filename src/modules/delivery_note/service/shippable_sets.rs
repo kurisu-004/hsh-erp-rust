@@ -12,10 +12,28 @@
 //! ## 公式
 //!
 //! ```text
-//! child_note_qty = Σ 本单上该子件 part 的 b.quantity          (i64)
-//! per_set        = child_note_qty * asm.quantity / part.quantity
-//! sets           = LEAST(COALESCE(MIN(per_set 参与子件), 0), asm.quantity) → i32
+//! child_note_qty(c) = Σ 本单上子件 c 的 b.quantity          (i64，本单无批次 = 0)
+//! per_set(c)        = child_note_qty(c) * asm.quantity / c.quantity
+//! sets(asm)         = LEAST(COALESCE(MIN(per_set(c) for c ∈ asm 的**全部**子件), 0),
+//!                            asm.quantity)                → i32
 //! ```
+//!
+//! ## `min` 的定义域是「该装配件的全部子件」，不是「本单出现过的子件」
+//!
+//! 2026-10-04 review 第 1 轮修正：原实现只由本单批次行（`rows`）构建 `min` 的
+//! 定义域，**本单完全没有批次的子件不参与** —— 「A 交一半、C 一件没交」会算成
+//! A 能撑的套数。业务上这是错标签：剩余部分不能单独发货，必须等所有子件收齐，
+//! 凑不齐整套就是 **0 套**。三条独立依据：
+//! 1. 业务规则原文「剩余的部分不能单独发货，需要等待其他子零件收集齐组装为装配件出货」；
+//! 2. 本仓同公式 SQL 版 `fetch_delivered_sets` 以 `t_part`（子件）为驱动表，本单
+//!    无批次的子件以 `COALESCE(SUM,0)=0` 参与 `min`（其注释原话：「未交任何批次的
+//!    子件若贡献 NULL 会被 MIN 忽略，那样『子件 A 交一半、子件 B 一件没交』会误判
+//!    成 A 能撑的套数」）；
+//! 3. `docs/api/delivery-notes/index.md` / `print.md` 的公式段写的就是「各子件」。
+//!
+//! 故入参必须有「该装配件的全部子件」`children_by_asm`，它由调用方从
+//! `PartRepo::list_children`（单单，N 次小查询）/ `PartRepo::list_children_by_assemblies`
+//! （批量，1 条 SQL）取，`include_deleted=false` 两条路径同口径。
 //!
 //! ## 边界（逐条对齐 `fetch_delivered_sets` 的注释，不许改口径）
 //!
@@ -26,6 +44,8 @@
 //!   `COALESCE(LEAST(MIN(...), a.quantity), 0)` 会在「子件总量全为 0」时返回
 //!   `a.quantity`（整套全交），与「子件全零 → 0 套」正好相反。故本实现先
 //!   `unwrap_or(0)` 兜底再 `min(cap)`，顺序不可调换。
+//! - **本单无批次的子件按 0 参与**（`note_qty_by_part.get(..).unwrap_or(0)`），
+//!   对应 PG 的 `COALESCE(SUM(...), 0)`；见上节。
 //! - **`LEAST(..., asm.quantity)` 顺带收口子件超交**（子件超交时按比例会算出超过
 //!   工单总套数的值），并消除 int8→int4 收窄溢出：中间量用 i64，收口后上界是
 //!   `asm.quantity`（i32）。
@@ -37,62 +57,56 @@
 
 use std::collections::HashMap;
 
-use crate::modules::assembly::model::TAssembly;
 use crate::modules::part::model::TPart;
 use crate::modules::prod::batch::model::TPartBatch;
 
-/// 本单上每个子件 part 的聚合口径：`p.assembly_id` / `p.quantity` / 本单批次量合计。
-type ChildAgg = (Option<i64>, i32, i64);
-
 /// 算每个装配件的「本单可出货套数」，key = 装配件 id。
 ///
-/// 入参 `rows` 是 `PartBatchRepo::list_with_part_by_delivery_note` 的结果（本单
-/// 全部未删批次 × 对应工单，`ORDER BY pb.id ASC`），`assembly_map` 是这些批次所属
-/// 装配件的解析结果（`AssemblyRepo::list_by_ids(..., include_deleted=false)`）。
+/// 入参：
+/// - `rows` —— `PartBatchRepo::list_with_part_by_delivery_note` 的结果（本单
+///   全部未删批次 × 对应工单，`ORDER BY pb.id ASC`）；
+/// - `asm_quantity` —— `装配件 id → t_assembly.quantity`（工单总套数，既是
+///   `per_set` 的比例因子、也是 `LEAST` 收口上界）。**只收 quantity 而不是整个
+///   `TAssembly`**：本函数不需要装配件的其它字段，调用方就不必为了算套数而
+///   clone 整行（`handler/print.rs` 原先的 `asms.iter().map(|(a.id, a.clone()))`）；
+/// - `children_by_asm` —— `装配件 id → 全部未软删子件`（`min` 的定义域，见模块
+///   文档「`min` 的定义域」一节）。缺键 = 该装配件无子件 ⇒ 0 套。
 ///
-/// **返回集合 = `assembly_map` 的 key**（不是「本单引用过」的装配件全集）：软删 /
+/// **返回集合 = `asm_quantity` 的 key**（不是「本单引用过」的装配件全集）：软删 /
 /// 不存在的装配件不在 map 里，也就不出现在结果里 —— 打印侧据此不把它的 id 写进
 /// `assembly_ids`，python 端 `assembly_map` 缺它，其子件按散件行打印。
 pub(crate) fn note_shippable_sets(
     rows: &[(TPartBatch, TPart)],
-    assembly_map: &HashMap<i64, TAssembly>,
+    asm_quantity: &HashMap<i64, i32>,
+    children_by_asm: &HashMap<i64, Vec<TPart>>,
 ) -> HashMap<i64, i32> {
     // 本单上每个子件 part 的批次量合计（同 part 多批次折叠，与 python 端
-    // `_build_print_rows` 的 `qty_by_part` 求和同口径）。
-    let mut by_part: HashMap<i64, ChildAgg> = HashMap::new();
+    // `_build_print_rows` 的 `qty_by_part` 求和同口径）。本单没批次的子件
+    // 不进这张表，下面查不到时按 0 参与 min。
+    let mut note_qty_by_part: HashMap<i64, i64> = HashMap::new();
     for (b, p) in rows {
-        let slot = by_part
-            .entry(p.id)
-            .or_insert((p.assembly_id, p.quantity, 0));
-        slot.2 += i64::from(b.quantity);
+        *note_qty_by_part.entry(p.id).or_insert(0) += i64::from(b.quantity);
     }
 
-    // 每个装配件取参与子件的 per_set 最小值；`part.quantity == 0` 的子件不参与。
-    let mut min_per_set: HashMap<i64, i64> = HashMap::new();
-    for (asm_id, part_quantity, note_qty) in by_part.values() {
-        let Some(asm_id) = asm_id else { continue };
-        let Some(asm) = assembly_map.get(asm_id) else {
-            continue;
-        };
-        if *part_quantity == 0 {
-            continue;
+    // 每个装配件取「全部子件」的 per_set 最小值；`part.quantity == 0` 的子件不参与。
+    let mut out: HashMap<i64, i32> = HashMap::with_capacity(asm_quantity.len());
+    for (asm_id, cap) in asm_quantity {
+        let cap = i64::from(*cap);
+        let mut min_per_set: Option<i64> = None;
+        let empty: Vec<TPart> = Vec::new();
+        for child in children_by_asm.get(asm_id).unwrap_or(&empty) {
+            if child.quantity == 0 {
+                continue;
+            }
+            let note_qty = note_qty_by_part.get(&child.id).copied().unwrap_or(0);
+            let per_set = note_qty * cap / i64::from(child.quantity);
+            min_per_set = Some(match min_per_set {
+                Some(cur) => cur.min(per_set),
+                None => per_set,
+            });
         }
-        let per_set = note_qty * i64::from(asm.quantity) / i64::from(*part_quantity);
-        min_per_set
-            .entry(*asm_id)
-            .and_modify(|cur| {
-                if per_set < *cur {
-                    *cur = per_set;
-                }
-            })
-            .or_insert(per_set);
-    }
-
-    // 兜 0 → LEAST(..., asm.quantity) 收口 → 钳到 i32。
-    let mut out: HashMap<i64, i32> = HashMap::with_capacity(assembly_map.len());
-    for (asm_id, asm) in assembly_map {
-        let cap = i64::from(asm.quantity);
-        let sets = min_per_set.get(asm_id).copied().unwrap_or(0).min(cap);
+        // 兜 0 → LEAST(..., cap) 收口 → 钳到 i32。
+        let sets = min_per_set.unwrap_or(0).min(cap);
         out.insert(*asm_id, i32::try_from(sets).unwrap_or(0));
     }
     out
@@ -194,19 +208,25 @@ mod tests {
         }
     }
 
-    fn one_child(
-        asm_id: i64,
-        asm_qty: i32,
-        part_qty: i32,
-        note_qty: i32,
-    ) -> (Vec<(TPartBatch, TPart)>, HashMap<i64, TAssembly>) {
+    /// 「1 个装配件 + 1 个子件，子件本单出货 `note_qty`」的最小场景。
+    ///
+    /// 返回 `(本单批次行, 装配件套数 map, 装配件 → 全部子件 map)`。
+    fn one_child(asm_id: i64, asm_qty: i32, part_qty: i32, note_qty: i32) -> OneChildScenario {
         let rows = vec![(
             batch(1, 11, note_qty),
             child_part(11, Some(asm_id), part_qty),
         )];
-        let map = HashMap::from([(asm_id, asm(asm_id, asm_qty))]);
-        (rows, map)
+        let asms = HashMap::from([(asm_id, asm_qty)]);
+        let children = HashMap::from([(asm_id, vec![child_part(11, Some(asm_id), part_qty)])]);
+        (rows, asms, children)
     }
+
+    /// [`one_child`] 的返回形态：`(本单行, 装配件总套数, 装配件 → 全部子件)`。
+    type OneChildScenario = (
+        Vec<(TPartBatch, TPart)>,
+        HashMap<i64, i32>,
+        HashMap<i64, Vec<TPart>>,
+    );
 
     #[test]
     fn sets_are_min_over_child_parts() {
@@ -216,8 +236,15 @@ mod tests {
             (batch(1, 11, 10), child_part(11, Some(10), 10)),
             (batch(2, 12, 5), child_part(12, Some(10), 10)),
         ];
-        let map = HashMap::from([(10, asm(10, 10))]);
-        assert_eq!(note_shippable_sets(&rows, &map).get(&10), Some(&5));
+        let asms = HashMap::from([(10, 10)]);
+        let children = HashMap::from([(
+            10,
+            vec![child_part(11, Some(10), 10), child_part(12, Some(10), 10)],
+        )]);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&10),
+            Some(&5)
+        );
     }
 
     #[test]
@@ -226,22 +253,32 @@ mod tests {
             (batch(1, 11, 6), child_part(11, Some(10), 10)),
             (batch(2, 11, 4), child_part(11, Some(10), 10)),
         ];
-        let map = HashMap::from([(10, asm(10, 10))]);
-        assert_eq!(note_shippable_sets(&rows, &map).get(&10), Some(&10));
+        let asms = HashMap::from([(10, 10)]);
+        let children = HashMap::from([(10, vec![child_part(11, Some(10), 10)])]);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&10),
+            Some(&10)
+        );
     }
 
     #[test]
     fn insufficient_child_yields_zero_sets() {
         // 装配件 10 套；子件整单 20 件（每套 2 件），本单只出 1 件 ⇒ 1*10/20 = 0 套
-        let (rows, map) = one_child(10, 10, 20, 1);
-        assert_eq!(note_shippable_sets(&rows, &map).get(&10), Some(&0));
+        let (rows, asms, children) = one_child(10, 10, 20, 1);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&10),
+            Some(&0)
+        );
     }
 
     #[test]
     fn over_delivery_is_capped_by_assembly_quantity() {
         // 子件整单 10 件，本单超交 100 件 ⇒ 100 套，LEAST 收口到 10
-        let (rows, map) = one_child(10, 10, 10, 100);
-        assert_eq!(note_shippable_sets(&rows, &map).get(&10), Some(&10));
+        let (rows, asms, children) = one_child(10, 10, 10, 100);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&10),
+            Some(&10)
+        );
     }
 
     #[test]
@@ -251,21 +288,92 @@ mod tests {
             (batch(1, 11, 8), child_part(11, Some(10), 10)),
             (batch(2, 12, 100), child_part(12, Some(10), 0)),
         ];
-        let map = HashMap::from([(10, asm(10, 10))]);
-        assert_eq!(note_shippable_sets(&rows, &map).get(&10), Some(&8));
+        let asms = HashMap::from([(10, 10)]);
+        let children = HashMap::from([(
+            10,
+            vec![child_part(11, Some(10), 10), child_part(12, Some(10), 0)],
+        )]);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&10),
+            Some(&8)
+        );
     }
 
     #[test]
     fn assembly_with_no_participating_child_yields_zero() {
         // 全部子件 quantity = 0 ⇒ 无参与项 ⇒ 兜 0（而不是 asm.quantity）
-        let (rows, map) = one_child(10, 10, 0, 100);
-        assert_eq!(note_shippable_sets(&rows, &map).get(&10), Some(&0));
+        let (rows, asms, children) = one_child(10, 10, 0, 100);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&10),
+            Some(&0)
+        );
     }
 
     #[test]
     fn loose_part_and_unresolved_assembly_are_absent_from_result() {
-        // 散件（assembly_id = None）+ 装配件子件但装配件不在 map（软删）⇒ 空结果
+        // 散件（assembly_id = None）+ 装配件软删（不在 asm_quantity 里）⇒ 空结果
         let rows = vec![(batch(1, 11, 5), child_part(11, None, 10))];
-        assert!(note_shippable_sets(&rows, &HashMap::new()).is_empty());
+        assert!(
+            note_shippable_sets(&rows, &HashMap::new(), &HashMap::new()).is_empty(),
+            "返回集合必须等于 asm_quantity 的 key（软删装配件不参与）"
+        );
+    }
+
+    /// ★ 2026-10-04 review 第 1 轮：`min` 的定义域是「全部子件」，本单没批次的
+    /// 子件按 0 参与 ⇒ 0 套。原实现只扫本单批次行，本例会误判成 8 套。
+    #[test]
+    fn child_absent_from_note_participates_with_zero() {
+        // 装配件 10 套；子件 A 整单 10 件 / 本单送 8 件（8 套）；子件 C 整单 10 件、
+        // **本单一件没送**（0 套）⇒ min = 0（凑不齐整套不能发）
+        let rows = vec![(batch(1, 11, 8), child_part(11, Some(10), 10))];
+        let asms = HashMap::from([(10, 10)]);
+        let children = HashMap::from([(
+            10,
+            vec![child_part(11, Some(10), 10), child_part(13, Some(10), 10)],
+        )]);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&10),
+            Some(&0),
+            "本单完全没交批次的子件必须参与 min（否则会印出物理上不存在的整套）"
+        );
+    }
+
+    /// 装配件一个子件都没有（`children_by_asm` 缺键）⇒ 0 套。
+    #[test]
+    fn assembly_without_children_yields_zero() {
+        let rows = vec![(batch(1, 11, 8), child_part(11, Some(10), 10))];
+        let asms = HashMap::from([(10, 10)]);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &HashMap::new()).get(&10),
+            Some(&0)
+        );
+    }
+
+    /// 单据行上的 part 若不在「全部子件」里（理论上不可能：装了同一 asm_id 的件
+    /// 必然是它的子件），套数只看子件表，不看本单批次行 —— 钉死「驱动表是子件」。
+    #[test]
+    fn sets_ignore_note_rows_whose_part_is_not_a_child() {
+        let rows = vec![(batch(1, 99, 100), child_part(99, Some(10), 1))];
+        let asms = HashMap::from([(10, 10)]);
+        let children = HashMap::from([(10, vec![child_part(11, Some(10), 10)])]);
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&10),
+            Some(&0),
+            "子件 11 本单无批次 ⇒ 0 套；行里的 part 99 不该被当成子件 11 的量"
+        );
+    }
+
+    /// 保留 `asm()` 构造器：装配件行的其它字段与套数无关，但仍断言函数签名
+    /// 已从 `HashMap<i64, TAssembly>` 收窄为 `HashMap<i64, i32>`（只取 quantity）。
+    #[test]
+    fn assembly_quantity_is_the_only_needed_field() {
+        let full = asm(10, 7);
+        let asms = HashMap::from([(full.id, full.quantity)]);
+        let (rows, _asms, children) = one_child(10, 7, 10, 3);
+        // 子件整单 10 件 / 本单 3 件 ⇒ 3*7/10 = 2 套
+        assert_eq!(
+            note_shippable_sets(&rows, &asms, &children).get(&10),
+            Some(&2)
+        );
     }
 }

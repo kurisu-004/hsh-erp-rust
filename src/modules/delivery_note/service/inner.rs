@@ -25,7 +25,7 @@ use crate::shared::error::{AppError, code};
 use super::super::dto::DeliveryNoteAddItem;
 use super::super::model::{DeliveryNote, DeliveryNoteEvent, NoteScope};
 use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
-use super::shippable_sets::note_shippable_sets;
+use super::note_shippable_sets;
 
 // ===========================================================================
 //  types
@@ -240,9 +240,22 @@ pub(super) async fn get_with_parts(
         }
     }
 
-    // 2026-10-04 新增：循环前先聚合一次本单可出货套数（`p.quantity` /
-    // `assembly_map` 都已在手，纯内存、不新增 SQL）。
-    let sets_map = note_shippable_sets(&rows, &assembly_map);
+    // 2026-10-04 新增：循环前先聚合一次本单可出货套数。`min` 的定义域是「该
+    // 装配件的**全部**子件」（本单没批次的子件按 0 参与），故必须补取子件 ——
+    // 按装配件逐个取（单单装配件通常 1~3 个），与 `handler/print.rs` 同一写法。
+    let asm_quantity: HashMap<i64, i32> = assembly_map
+        .iter()
+        .map(|(id, a)| (*id, a.quantity))
+        .collect();
+    let mut children_by_asm: HashMap<i64, Vec<crate::modules::part::model::TPart>> =
+        HashMap::with_capacity(asm_ids.len());
+    for aid in &asm_ids {
+        children_by_asm.insert(
+            *aid,
+            PartRepo::list_children(&mut *conn, *aid, false).await?,
+        );
+    }
+    let sets_map = note_shippable_sets(&rows, &asm_quantity, &children_by_asm);
 
     let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(rows.len());
     for (b, p) in rows {
