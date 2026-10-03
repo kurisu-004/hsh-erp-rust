@@ -939,8 +939,12 @@ pub struct WorkerScanCoreOut {
 | IN_PROCESS | IN_PROCESS | worker-scan RETURNED（holder worker → shelf，状态不变） |
 | READY_TO_SHIP | DELIVERED | `deliver`（同事务翻最近一条 source-status 批次） |
 | DELIVERED | COMPLETED | `complete`（同事务；清空 `serial_no`） |
+| PENDING | OUTSOURCE | `POST /prod/batches/{batch_id}/send-to-outsource`（未派工的待下发工单） |
+| IN_PROCESS | OUTSOURCE | 同上（已入池的批次，**必须 IN_PROCESS+PRODUCTION_SHELF**；2026-10-03 补齐的边 —— 此前缺失导致「可发送一览」的行发一单就被 20103 拒。location 由 service 守，与 `IN_PROCESS → PENDING` / `IN_PROCESS → INSPECTION` 同一分工。详见 [`../../production/batches.md`](../../production/batches.md#外协流转send--receive)） |
+| OUTSOURCE | IN_PROCESS | `POST /prod/batches/{batch_id}/receive-from-outsource`（回生产架） |
+| OUTSOURCE | INSPECTION | `POST /prod/batches/{batch_id}/receive-from-outsource-to-inspection` |
 | IN_PROCESS | IN_PROCESS | **2026-10-01**：REPAIRING 降级为标记列 `t_part_batch.is_repairing`（migration 005/006），`start-repair` **不再是状态迁移** —— 只把标记置 `true`（`status` 保持 IN_PROCESS，progress 同档 2）；重复起修（标记已 true）→ 20118。`scan-inspect` `pass=false` 同理（INSPECTION → IN_PROCESS + 标记 true）|
-| PENDING / PROGRAMMING / INSPECTION / READY_TO_SHIP / DELIVERED | CANCELLED | `cancel`（同事务翻最近一条 source-status 批次；delivery_note 锁禁） |
+| PENDING / PROGRAMMING / INSPECTION / READY_TO_SHIP / DELIVERED / OUTSOURCE | CANCELLED | `cancel`（同事务翻最近一条 source-status 批次；delivery_note 锁禁） |
 
 INSPECTION → IN_PROCESS 由 `POST /prod/batches/{batch_id}/to-process`（to_process 流）走 service 流程：
 

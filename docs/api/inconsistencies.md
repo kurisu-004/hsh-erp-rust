@@ -352,9 +352,9 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 | Method | Path | 行粒度 | 修的故障 |
 |---|---|---|---|
 | GET | `/api/v2/outsource-companies/{id}/sent-parts` | shipment | 「外协对账」页 **404**（路由从未注册；写侧 reconcile-update 一直存在） |
-| GET | `/api/v2/outsource-quotes/quotable-parts` | (part, OUTSOURCE 工序) | 报价一览页每次进报 **400**（请求被 `quote_router` 的 `/{id}`（`Path<i64>`）吞掉 → `PathRejection`）+「新建报价」picker 恒空 |
+| GET | `/api/v2/outsource-quotes/quotable-parts` | 未下发零件（一零件一行） | 报价一览页每次进报 **400**（请求被 `quote_router` 的 `/{id}`（`Path<i64>`）吞掉 → `PathRejection`）+「新建报价」picker 恒空 |
 | GET | `/api/v2/outsource-shipments/in-flight` | shipment（OUTSOURCING） | 在途 tab 空白 |
-| GET | `/api/v2/outsource-sendable` | (活跃批次, OUTSOURCE 工序) | 可发送 tab 全灰 |
+| GET | `/api/v2/outsource-sendable` | 活跃批次（`current_process_id` 指向外协工序） | 可发送 tab 全灰 |
 
 **下线 2 条错形状端点**（`src/modules/part/**`，**URL 硬切换，无 alias**）：
 
@@ -380,9 +380,13 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
   语义改为取 **`t_part_batch`**（不是 `shipment`）—— 前端拿它们当 `receive-from-outsource`
   的 OCC 锚与部分接收 max 值。
 - **删除死 VO** `ApprovedForSendItem` / `ApprovedForSendListOut`（零调用方；表达不了
-  DIRECT 模式），取代者 `OutsourceSendableItem`。`next_process_id` 改由
-  `quotable-parts` 的 `QuotablePartOut` **显式**暴露（part 域 `PartListItem` 仍刻意
-  不声明它，前端此前的临时 cast 可随之移除）。
+  DIRECT 模式），取代者 `OutsourceSendableItem`。
+- **2026-10-03 追加**：`/outsource-sendable` 的 `next_process_id` 更名为
+  `current_process_id`（判据从「货架枚举 + 工艺链求交」换成
+  `t_part_batch.current_process_id`）；`/outsource-quotes/quotable-parts` 的行粒度
+  同时收成「一零件一行」，`shelf_id` / `shelf_code` / `next_process_id` /
+  `next_process_name` 四个字段删除（报价工序改由前端从 OUTSOURCE 工序表自选）。
+  两个端点**不再要求同源**。
 - `customer_path` 改为真算（2026-10-03）：`OutsourceQuoteOut` 经
   `part_map_for_quote` 扩 2 列带 L1/L2 客户名，`OutsourceShipmentOut`（`reconcile-update`
   写端点出参）经新增的 repo 方法 `part_customer_names` —— 后者的两条

@@ -9,9 +9,9 @@
 //! - approve_quote     — SUBMITTED → APPROVED（MANAGER-only；自动 reject 竞争报价）
 //! - reject_quote      — SUBMITTED → REJECTED（review_note 必填；MANAGER-only）
 //! - soft_delete_quote — 软删（DRAFT / REJECTED 状态才允许）
-//! - list_quotable_parts   — 2026-10-03 新增：报价 picker（可建报价的
-//!   零件 × OUTSOURCE 工序 组合）。此前路由未注册，被 `quote_router` 的
-//!   `/{id}`（`Path<i64>`）吞掉 → `PathRejection` → 恒 400。
+//! - list_quotable_parts   — 2026-10-03 新增：报价 picker（还没下发的零件，
+//!   一零件一行；同日由「零件 × OUTSOURCE 工序」简化而来）。此前路由未注册，
+//!   被 `quote_router` 的 `/{id}`（`Path<i64>`）吞掉 → `PathRejection` → 恒 400。
 //!
 //! ## 事务边界（2026-09-22 refactor 对齐 iam 范本）
 //! 事务移交 handler：service 仅业务逻辑，所有跨 repo 操作经 `repo: R`
@@ -257,9 +257,10 @@ impl OutsourceService {
 
     /// `GET /outsource-quotes/quotable-parts`（2026-10-03 新增）
     ///
-    /// 返回「可以给它建外协报价」的 (零件, OUTSOURCE 工序) 组合，**一行 = 一个组合**。
-    /// 筛选与去重的口径全部落在 repo SQL（`OutsourceQuotableRepo`），service 只做
-    /// 参数归一化 + VO 组装。
+    /// 返回「可以给它建外协报价」的零件，**一行 = 一个零件**（该零件存在 PENDING
+    /// 批次）。筛选与去重的口径全部落在 repo SQL（`OutsourceQuotableRepo`），service
+    /// 只做参数归一化 + VO 组装。报价工序由用户在建报价时从 `category='OUTSOURCE'`
+    /// 的工序列表里选，本端点不预置。
     pub async fn list_quotable_parts<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
@@ -290,10 +291,6 @@ impl OutsourceService {
                     r.parent_customer_name.as_deref(),
                     r.customer_name.as_deref(),
                 ),
-                shelf_id: r.shelf_id,
-                shelf_code: r.shelf_code,
-                next_process_id: r.next_process_id,
-                next_process_name: r.next_process_name,
             })
             .collect();
 

@@ -57,7 +57,7 @@ GET /outsource-pool/state?...       → 点某公司列：那一列的批次卡�
 | 端点 | 行粒度 |
 |---|---|
 | `counts[].*` | 一道**外协工序**（`t_process.category = 'OUTSOURCE'` 语义域） |
-| `{process_id}.items[]` | 一个 `(活跃批次, 该批次所在货架上、且在该零件工艺链内的 OUTSOURCE 工序)` 组合 —— **与 `/outsource-sendable` 的行粒度逐行一致** |
+| `{process_id}.items[]` | 一个**活跃批次**（其 `current_process_id` = 本 tab 的工序）—— **与 `/outsource-sendable` 的行粒度逐行一致** |
 | `{process_id}.companies[]` | 该工序映射的一条**活跃外协公司**（含 `held_count = 0` 的空列） |
 | `state.items[]` | 一个 `(批次, 外协公司, 外协工序)` 三元组，批次满足 `status='OUTSOURCE' AND location='OUTSOURCE_COMPANY'` |
 
@@ -66,17 +66,23 @@ GET /outsource-pool/state?...       → 点某公司列：那一列的批次卡�
 - **批次范围**：`t_part_batch.deleted_at IS NULL` 且
   （`status = 'PENDING'` 或（`status = 'IN_PROCESS' AND location = 'PRODUCTION_SHELF'`)）
   → `source_status = PENDING / IN_PROCESS`。
-- **OUTSOURCE 工序来源**：`t_shelf_process`（`sp.shelf_id = pb.current_holder_id`）
-  JOIN `t_process`（`category = 'OUTSOURCE'`）**并与该 part 的
-  `t_process_chain_step` 求交** —— 少了链内交集会给出工艺链上不存在的工序，
-  发送时 `resolve_step_id_by_process` 会 404。
-- **`send_mode` 二选一**（LEFT JOIN `t_outsource_quote`，`status='APPROVED'`）：
-  命中 → `APPROVAL`（`quote_id` / `outsource_company_id` / `price` 取报价，
-  `company_options` 恒 `[]`）；未命中 → `DIRECT`（三者恒 `null`，`company_options`
-  = 该工序映射的**全部活跃公司**）。
+- **OUTSOURCE 工序来源**：`JOIN t_process pr ON pr.id = pb.current_process_id`
+  （`category = 'OUTSOURCE'`）。**工艺链与货架工序映射都不参与判定**
+  （2026-10-03 起：判据换成批次自身的工序归属锚；旧谓词要求「货架绑了该外协工序」
+  且「该工序在零件工艺链内」，而生产库里绝大多数零件没有链 ⇒ 交集恒空 ⇒ tab 恒空）。
+- **审批闸门**：`t_process.requires_approval = false` → 直接出行；
+  `= true` → 必须已有该 `(part, process)` 的**真实审批**报价
+  （`status='APPROVED' AND is_direct=false AND deleted_at IS NULL`），否则不出行。
+  `is_direct = true` 的是 DIRECT 直发自动建的 0 元占位报价，**不是被人审批过的报价**
+  （2026-10-03 review 第 1 轮）。本域与 `GET /outsource-sendable` 共用同一份 SQL 常量
+  `SENDABLE_INNER_X_SQL`，该谓词**只有那一个落点**，本文件只是它的转述。
+- **`send_mode` 二选一**：`requires_approval = true` → `APPROVAL`（`quote_id` /
+  `outsource_company_id` / `price` 取报价，`company_options` 恒 `[]`）；
+  `= false` → `DIRECT`（三者恒 `null`，`company_options` = 该工序映射的
+  **全部活跃公司**）。
 - **DIRECT 且 `company_options` 为空的行仍要返回**且计入 `total` /
   `sendable_count`（前端据 `can_send` 把它置灰，**不要在 SQL 里滤掉**）。
-- **多 APPROVED 报价**：`DISTINCT ON (batch_id, next_process_id)` +
+- **多 APPROVED 报价**：`DISTINCT ON (batch_id, current_process_id)` +
   `ORDER BY … quote_id ASC NULLS LAST` 取最早批准的那条（语义是「先批准的报价优先」
   且结果稳定，不随查询计划变化）。
 
@@ -119,26 +125,23 @@ AND deleted_at IS NULL`，归属锚是批次自身的
 > ——比拒收更难发现。
 
 **锚链与写侧同源**：写侧 `receive-from-outsource` 走
-`require_process_chain(part_id)`（读 `t_part.process_chain_id`）+
-`resolve_step_id_by_process(chain_id, next_process_id)`。锚 `p.process_chain_id`
-⇒ 本端点给出的 process_id 必然是**锚链内的活跃 step 的工序**，写侧在同一
+`optional_process_chain(part_id)`（读 `t_part.process_chain_id`）+
+`optional_step_id(chain_id, next_process_id)`。锚 `p.process_chain_id`
+⇒ 有链时本端点给出的 process_id 必然是**锚链内的活跃 step 的工序**，写侧在同一
 条链上解析得到。
 
-锚链**恒等于**写侧解析用的那条链：`link_chain_to_part` 带
-`AND process_chain_id IS NULL` 守卫（已绑定的 part 走产品路径不可改绑，其
-唯一调用方也只在「该 part 尚无链」的分支），`unlink_part_from_chain` 只被
-part 软删级联调用；`send-to-outsource` 强制 `require_process_chain` ⇒ 在途
-批次的 part 必然已绑链。故 `COALESCE` 的 `cur.chain_id` 分支只是防御性兜底
-（`p.process_chain_id IS NULL` 属脏数据），不是活场景。
+**无链批次**（2026-10-03 新增场景：写侧不再强制「先有链」，无链零件可发可收）：
+`p.process_chain_id IS NULL` 时 `cur` 子查询无行（无链批次的
+`current_process_step_id` 按新的写入不变式恒为 NULL）⇒ 派生值为
+`receive_next_process_id = "0"`、`chain_resolvable = false` ⇒ 前端弹「需手填下一道
+工序」。这条降级路径**此前就已实现**（`chain_resolvable = receive_next_process_id
+!= 0`），不是本次新增的风险；写侧此时直接放行（step 落 NULL），不会拒收。
 
-**保留而非删掉**该回落分支的取舍（它不可达，但属于死代码，不写清楚理由就会
-被后人当垃圾清理）：删掉后，同样脏数据下读侧会落到「无下一 step」⇒
-`chain_resolvable = false`，被前端读成「链坏了、需手填下一道工序」；而写侧的
-真实阻塞是 `20706 BIZ_PROCESS_CHAIN_REQUIRED`「请先制定工序链」—— 两者指向
-完全不同的排查方向。保留回落使读侧的诊断与写侧对齐。**不改变任何结果**：回落
-生效时写侧照样先撞 20706（`require_process_chain` 读的就是
-`t_part.process_chain_id`，与本回落无关），所以这不是「为了让脏数据能写下去」。
-成本是一个 `COALESCE`，命中分支时多一次 PK 索引查找。
+`COALESCE(p.process_chain_id, cur.chain_id)` 的回落分支**不再是「脏数据专属的
+死代码」**：无链批次本身就是活场景，每次派生都会走到它。但它取到的仍是 NULL
+（理由同上），所以回落与不回落的结果一致；保留它的理由是读侧 SQL 自己说明了
+「锚链优先取 part 的，缺了才回退到 step 指针所在的链」这一意图，不写清楚就会被
+后人当垃圾清理。成本是一个 `COALESCE`。
 
 `chain_resolvable = receive_next_process_id != 0`，等价于下面三条同时成立：
 
@@ -165,9 +168,8 @@ part 软删级联调用；`send-to-outsource` 强制 `require_process_chain` ⇒
 > **404 `20702 BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`**（`chain {} 内找不到
 > process_id={} 的活跃 step`）。这类竞态无法在读侧消除，**前端必须处理
 > `20702` 兜底**：与 `chain_resolvable == false` 一样弹对话框让用户手填，重试
-> 一次即可。`p.process_chain_id IS NULL`（脏数据）时写侧会先撞 `20706
-> BIZ_PROCESS_CHAIN_REQUIRED`（409）—— 同属「读侧已登录才能看到、但写侧不保证
-> 接受」的情形。
+> 一次即可。`p.process_chain_id IS NULL`（无链零件，2026-10-03 起属常态而非脏数据）
+> 时写侧**放行**（step 落 NULL），不构成拒收。
 
 ---
 
@@ -244,7 +246,7 @@ part 软删级联调用；`send-to-outsource` 强制 `require_process_chain` ⇒
 | `can_send` | bool | `send_mode == "APPROVAL" \|\| !company_options.is_empty()`（服务端算好，前端不必各写一遍） |
 | `status_label` | string | 恒为 `"sendable"` |
 
-> **不复用 `OutsourceSendableItem`**：后者多 `next_process_id` / `next_process_name`
+> **不复用 `OutsourceSendableItem`**：后者多 `current_process_id` / `current_process_name`
 > （分页一览里「这一行是哪道工序」是必须的），而看板视角工序已提到顶层
 > `process_id`。保留两组字段会让前端 Zod 守门时出现两个真相源。两者的其余字段
 > 逐字段一致，由集成测试
@@ -366,12 +368,12 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 | `process_id` | `send-to-outsource` 的 `process_id` |
 | `state.items[*].chain_resolvable` | `true` ⇒ 接收时免填「下一道工序」；`false` ⇒ 弹对话框让用户填 |
 | `state.items[*].receive_next_process_id` | `chain_resolvable == true` 时可作为对话框的默认值 |
-| 写侧 404 `20702` / 409 `20706` | 与 `chain_resolvable == false` **同一条交互路径**：弹对话框让用户手填下一道工序后重试（成因见「下一道工序的派生」的 caveat） |
+| 写侧 404 `20702` | 与 `chain_resolvable == false` **同一条交互路径**：弹对话框让用户手填下一道工序后重试（成因见「下一道工序的派生」的 caveat） |
 
 ### 排序
 
 `items`：`is_urgent DESC, planned_delivery_date ASC NULLS LAST, part_id ASC,
-batch_no ASC, next_process_id ASC` —— 与 `/outsource-sendable` 逐字一致
+batch_no ASC, current_process_id ASC` —— 与 `/outsource-sendable` 逐字一致
 （同源 `SENDABLE_DISPLAY_ORDER` 常量）。
 
 `companies`：`MIN(t_outsource_company_process.sort_order) ASC, company_id ASC`
@@ -434,7 +436,7 @@ dashboard 事件），见 [`./websocket.md`](./websocket.md)。
 | 常量 / 函数 | 作用 |
 |---|---|
 | `SENDABLE_INNER_X_SQL` | 内层 JOIN + WHERE —— **判定谓词的唯一落点** |
-| `SENDABLE_DISTINCT_D_SQL` | `DISTINCT ON (batch_id, next_process_id)` 收敛 |
+| `SENDABLE_DISTINCT_D_SQL` | `DISTINCT ON (batch_id, current_process_id)` 收敛 |
 | `SENDABLE_PROJECTION_FULL` / `SENDABLE_DEDUP_PROJECTION_FULL` | list / `list_by_process` 的投影 |
 | `SENDABLE_PROJECTION_COUNT` / `SENDABLE_DEDUP_PROJECTION_COUNT` | count / counts 的精简投影（不重算 `company_options`） |
 | `SENDABLE_OUTER_COLS` / `SENDABLE_DISPLAY_ORDER` | 外层列清单 / 展示序 |
@@ -479,13 +481,13 @@ dashboard 事件），见 [`./websocket.md`](./websocket.md)。
 | `pool_counts_empty_returns_zeroed_totals` | 空库返 200 + 空数组 + 全零（不是 500） |
 | `pool_counts_and_state_are_static_routes_not_process_id` | **注册顺序守卫**：`/counts`、`/state` 不被 `/{process_id}` 吞成 400 |
 | `pool_detail_lists_all_mapped_companies_including_empty_column` | `companies` 恰为映射的活跃公司（停用的不出现）；`held_count` 正确；**无在途批次的公司也在列且 `= 0`**；`items` 不含其它工序的行；`total == items.len()` |
-| `pool_detail_items_match_sendable_endpoint_field_by_field` | **防 SQL 分叉核心断言**：21 个字段逐字段比对 `/outsource-pool/{pid}` 与 `/outsource-sendable`（同 seed、过滤 `next_process_id == pid`）；停用公司不进 `company_options` |
+| `pool_detail_items_match_sendable_endpoint_field_by_field` | **防 SQL 分叉核心断言**：21 个字段逐字段比对 `/outsource-pool/{pid}` 与 `/outsource-sendable`（同 seed、过滤 `current_process_id == pid`；APPROVAL 与 DIRECT 用两道工序分别对照）；停用公司不进 `company_options` |
 | `pool_detail_keeps_direct_row_with_empty_company_options` | DIRECT 空 options 行仍返回、计入 `total`，且 `counts.sendable_count` 也计入；`can_send == false` |
 | `pool_detail_unknown_process_returns_404` | 工序不存在 → 404 / `code=20801` |
 | `pool_state_returns_held_batches_with_shipment_fields` | 该公司在该工序的全部在外协批次（含 `sent_at` / `price` / `version`）；`current_held == items.len()`；别的公司 / 别的工序的批次不出现 |
 | `pool_state_chain_resolvable_when_next_step_exists` | 有下一 step ⇒ `chain_resolvable == true` 且 id / name = 下一 step 的工序 |
 | `pool_state_chain_unresolvable_when_no_step_or_chain_tail` | 链尾 / 无 `current_process_step_id` 两种情形 ⇒ `chain_resolvable == false`、`receive_next_process_id == "0"`、`_name == null` |
-| `pool_state_derives_next_step_from_parts_current_chain_after_rebind` | **锚链内位置漂移下仍取对值**（防御性用例：裸 `UPDATE t_part SET process_chain_id` 绕过了 `link_chain_to_part` 的 `IS NULL` 守卫，该状态走产品路径不可达）：外协工序在锚链内从 `sort 1` 挪到 `sort 2` 后，`receive_next_process_id` 必须是**真正的下一道**（`sort 3`），且断言它 **≠ 外协工序自己**、≠ 旧链 A 的下一道、≠ 排在当前工序之前的工序；`chain_resolvable == true`；写侧 `require_process_chain` + `resolve_step_id_by_process` 落在同一链 / 同一 step |
+| `pool_state_derives_next_step_from_parts_current_chain_after_rebind` | **锚链内位置漂移下仍取对值**（防御性用例：裸 `UPDATE t_part SET process_chain_id` 绕过了 `link_chain_to_part` 的 `IS NULL` 守卫，该状态走产品路径不可达）：外协工序在锚链内从 `sort 1` 挪到 `sort 2` 后，`receive_next_process_id` 必须是**真正的下一道**（`sort 3`），且断言它 **≠ 外协工序自己**、≠ 旧链 A 的下一道、≠ 排在当前工序之前的工序；`chain_resolvable == true`；写侧 `optional_process_chain` + `optional_step_id` 落在同一链 / 同一 step |
 | `pool_state_does_not_fan_out_on_duplicate_applicant_name` | `t_applicant` 同名跨客户并存时 `items` **不扇出**（一个批次恒一行、无重复 `batch_id`）、`current_held == items.len()`、`applicant_name` 仍取到 |
 | `pool_state_rejects_missing_query_params_with_400` | 缺任一 query 参数 → **400**（非 500、非静默默认值） |
 

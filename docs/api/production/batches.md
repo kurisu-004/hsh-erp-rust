@@ -54,7 +54,7 @@
 | POST | `/api/v2/prod/batches/{batch_id}/start-repair` | Manager / Clerk / Inspector | 置 `is_repairing=true` | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idstart-repair) |
 | POST | `/api/v2/prod/batches/{batch_id}/place-on-shelf` | Manager / Clerk | 上架 | [`../parts/lifecycle.md`](../parts/lifecycle.md#post-apiv2prodbatchesbatch_idplace-on-shelf) |
 | POST | `/api/v2/prod/batches/{batch_id}/recall-to-pending` | Manager / Clerk | 召回至 PENDING | lifecycle.md 尚无独立章节（见 [`../parts/index.md`](../parts/index.md) 端点表） |
-| POST | `/api/v2/prod/batches/{batch_id}/release-from-programming` | Manager / Clerk | 编程完成释放 | lifecycle.md 尚无独立章节；20706 守卫见 [`./process-chain.md`](./process-chain.md#20706-biz_process_chain_required) |
+| POST | `/api/v2/prod/batches/{batch_id}/release-from-programming` | Manager / Clerk | 编程完成释放 | lifecycle.md 尚无独立章节；工艺链可选守卫见 [`./process-chain.md`](./process-chain.md#20706-biz_process_chain_required) |
 | POST | `/api/v2/prod/batches/{batch_id}/send-to-outsource` | Manager / Clerk / Inspector | 派发外协（APPROVAL / DIRECT 双模式 + 部分发送） | [外协流转](#外协流转send--receive)（本节） |
 | POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource` | Manager / Clerk / Inspector | 外协回收入库（支持部分接收） | [外协流转](#外协流转send--receive)（本节） |
 | POST | `/api/v2/prod/batches/{batch_id}/receive-from-outsource-to-inspection` | Manager / Clerk / Inspector | 外协回收 → 品检（整批） | [外协流转](#外协流转send--receive)（本节） |
@@ -122,7 +122,7 @@
 
 | 端点 | 迁移 | shipment 记账 |
 |---|---|---|
-| `POST /{batch_id}/send-to-outsource` | `PENDING → OUTSOURCE`（`location='OUTSOURCE_COMPANY'`） | 同事务 INSERT `t_outsource_shipment`（`OUTSOURCING`） |
+| `POST /{batch_id}/send-to-outsource` | `PENDING → OUTSOURCE` 或 `IN_PROCESS → OUTSOURCE`（后者**必须** `location='PRODUCTION_SHELF'`；落 `location='OUTSOURCE_COMPANY'`） | 同事务 INSERT `t_outsource_shipment`（`OUTSOURCING`） |
 | `POST /{batch_id}/receive-from-outsource` | `OUTSOURCE → IN_PROCESS`（`location='PRODUCTION_SHELF'`） | 整批回收才把开口 shipment 标 `RECEIVED` |
 | `POST /{batch_id}/receive-from-outsource-to-inspection` | `OUTSOURCE → INSPECTION`（`location='INSPECTION_SHELF'`） | 整批回收，口 shipment 标 `RECEIVED` |
 
@@ -136,7 +136,7 @@
 | `outsource_company_id` | string(i64) | ✓ | 必须在册 + `is_active` |
 | `process_id` | string(i64) | ✓ | 外协工序；`t_process.category` 必须 `'OUTSOURCE'`，且该公司必须映射它 |
 | `quote_id` | string(i64)? | — | **APPROVAL 模式**：APPROVED 报价；`unit_price = quote.price` |
-| `direct` | bool? | — | **DIRECT 模式**（免审批直发），与 `quote_id` **互斥** |
+| `direct` | bool? | — | **DIRECT 模式**（免审批直发），与 `quote_id` **互斥**；该工序 `requires_approval=true` 时拒（`20104`，见下） |
 | `quantity` | i32? | — | 部分发送数量；缺省或 `== 批次量` = 整批 |
 | `note` | string? | — | 落到 `t_part_event.note` 与 quote event `SENT` 的 note |
 
@@ -155,7 +155,50 @@
 > （`SendToOutsourcePayload` 的键为 `process_id`，并有契约用例逐字钉死 + 反断言禁止
 > `next_process_id` 出现在 body 里），两个仓同一次编排合入。
 
+**源状态**：`PENDING` 或 `IN_PROCESS`。`IN_PROCESS` 源额外要求
+`location='PRODUCTION_SHELF'`（货在生产架上），否则 `400 20103 BIZ_INVALID_TRANSITION`；
+在工人手上（`location='WORKER'`）的批次同样拒。该 location 不变式由 service 守卫承担
+（`send_to_outsource`），状态机只判「状态对不对」—— 与 `IN_PROCESS → PENDING`
+recall-to-pending、`IN_PROCESS → INSPECTION` to-inspection 同一分工。
+
+> **2026-10-03 补状态机边**：此前 `can_transition_to` 只有 `PENDING → OUTSOURCE`，
+> `IN_PROCESS → OUTSOURCE` 缺失 ⇒ 上面那条 location 守卫**永远不可达**，实际表现是
+> 「可发送一览」里的行发一单就被 `20103` 拒。而一览按 `current_process_id` 出行，
+> 按写入不变式（`PENDING ⇔ 出池`）出行的批次几乎全是 `IN_PROCESS` 源 ⇒ 端到端实测下
+> 外协发送 100% 不可用。回归：
+> `tests/outsource/send_receive.rs::send_to_outsource_from_in_process_shelf_batch_succeeds`
+> / `…send_to_outsource_rejects_in_process_off_production_shelf`。
+
 **价来源二选一**：`direct` 与 `quote_id` 必须恰给一个，否则 `400 20104 BIZ_INVALID_VALUE`。
+
+> **DIRECT 受工序的 `requires_approval` 约束**（2026-10-03 review 第 1 轮）。`direct=true`
+> 且该 `process_id` 的 `t_process.requires_approval = true` 时以
+> `400 20104 BIZ_INVALID_VALUE` 拒收，文案（节选）「该工序需要报价审批，请先走审批再发货，
+> 不能 direct 直发」。守卫落在建占位报价**之前**（被拒请求不留报价 / shipment / 状态变更）。
+>
+> 守卫的必要性：`requires_approval` 此前**只在读侧生效**（`GET /outsource-sendable` /
+> `/outsource-pool` 会把「需审批但无真实审批报价」的批次藏起来），写侧零校验 ⇒ 绕过 UI
+> 直接调本端点就能对「先审批再发」这道业务规则该走报价的工序直发。读侧决定看不看得见、
+> 写侧决定发不发得成，两侧同守才闭环。同一道工序走 APPROVAL（传 `quote_id`）不受影响。
+> 回归：`tests/outsource/send_receive.rs::send_to_outsource_direct_rejected_when_process_requires_approval`
+> / `…approval_allowed_when_process_requires_approval`。
+
+> **APPROVAL 的 `quote_id` 也不接受 DIRECT 占位报价**（2026-10-03 review 第 2 轮）。
+> 占位报价是 DIRECT 路径自动建的 `status='APPROVED' / is_direct=true / price=0` 行，
+> 它满足下面 APPROVAL 的全部既有校验条件（状态 + 三元组）⇒ 只守 `direct=true` 的话，
+> 改传占位报价的 id 就能让需审批工序 0 元发货，把上一条守卫绕开。故 `quote_id`
+> 指向 `is_direct = true` 的报价时以 `400 21307 BIZ_OUTSOURCE_QUOTE_NOT_APPROVED`
+> 拒收，文案「quote {id} 是免审批直发的占位价（is_direct=true、price=0），不能作为
+> 审批价来源；请改传该 (part, company, process) 经审批的报价；若该工序
+> requires_approval=false，请改用 direct=true」（守卫落在建 shipment **之前**，不改动
+> 报价行本身）。守卫**排在三元组校验之后**：同时命中「三元组不匹配」与「是占位价」
+> 时归 21302（参数不一致），文案直指调用方唯一改得动的那一条。存量占位报价的来源是
+> 这条守卫上线前的历史数据、或 `PATCH /prod/processes/{id}` 把 OUTSOURCE 工序的
+> `requires_approval` 由 `false` 翻成 `true`，故不能靠「清数据」消除。DIRECT 路径
+> 复用占位报价**不受影响** ——那正是免审批直发的既有正确行为，且该路径在需审批工序上
+> 已被上一条守卫整体拦掉。
+> 回归：`tests/outsource/send_receive.rs::send_to_outsource_rejects_direct_placeholder_quote_as_approval_price`
+> / `…direct_still_reuses_placeholder_quote_when_approval_not_required`。
 
 - **APPROVAL**：`quote_id` 必须是 `APPROVED`，且 `part_id` / `outsource_company_id` /
   `process_id` 三者与本次请求一致（否则 `400 21302`）。
@@ -284,24 +327,20 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
 |---|---|---|
 | 角色 | 40300 | 非 Manager / Clerk / Inspector |
 | OCC | 40901 | `version` 与批次行不符（含部分收发时拆批 OCC 失败） |
-| 状态机 | 20103 | 源状态不在白名单（如已 `OUTSOURCE` 再 send） |
-| 价来源 | 20104 | `direct` 与 `quote_id` 都给或都不给 |
+| 状态机 | 20103 | 源状态不在白名单（如已 `OUTSOURCE` 再 send；`INSPECTION` / `DELIVERED` 等） |
+| 源 location | 20103 | `IN_PROCESS` 源但 `location != 'PRODUCTION_SHELF'`（例如货在工人手上）；2026-10-03 补状态机边后这道 service 守卫才真正可达 |
+| 价来源 | 20104 | `direct` 与 `quote_id` 都给或都不给；**`direct=true` 且该工序 `requires_approval=true`** |
 | 数量 | 20104 | `quantity <= 0` / `> 批次量` |
 | 工序类别 | 20104 | `process.category != 'OUTSOURCE'` |
 | 公司↔工序映射 | 20104 | `t_outsource_company_process` 无该 (company, process) 未删行 |
 | 公司在册 / 启用 | 21201 / 21205 | 公司不存在 / 已停用 |
-| 工艺链 | 20706 | part 未绑定 `process_chain_id` |
+| 工艺链 | 20702 | **part 有链但链内没有该 process 的活跃 step**（2026-10-03 起 part 无链放行，不再返回 20706） |
 | 重复开口 shipment | 21502 | 同一批次已有 `OUTSOURCING` shipment |
 | 入参字段名 | 422（axum `Json` 提取器，**非业务信封**） | body 缺 `process_id`（send）/ `next_process_id`（receive），或字段名拼错被静默丢弃 |
 
 ### 已知不一致（2026-10-03 登记，未修）
 
-1. **状态机缺 `IN_PROCESS → OUTSOURCE` 边**：`PartStatus::can_transition_to` 只放行
-   `PENDING → OUTSOURCE`。故 `send_to_outsource` 实际只能从 `PENDING` 发起；service
-   里「`IN_PROCESS` 必须在 `PRODUCTION_SHELF`」那段守恒在当前代码里不可达，端点注释
-   与早期文档写的「`PENDING` 或 `IN_PROCESS+PRODUCTION_SHELF`」与实现不符。修法是给
-   状态机补这条边（`src/modules/part/statemachine.rs`），属 part 域改动，不在本域范围。
-2. **`t_part_event.event_type` 与 `backend-python` 词汇分叉**（2026-10-03 登记）：本仓
+1. **`t_part_event.event_type` 与 `backend-python` 词汇分叉**（2026-10-03 登记）：本仓
    直送品检事件用 `RECEIVED_TO_INSPECTION`（见上节），而
    `backend-python/model/enums.py` 仍定义 `RECEIVED_FROM_OUTSOURCE_INSPECTED`。两个
    后端共库，同一业务动作会按「谁服务的」产出两种 `event_type` 值。分叉保留（仓内零
@@ -309,7 +348,7 @@ UPDATE 三条 SQL，源批次 UPDATE 带 `version` OCC + `quantity > q` 数量�
    **彻底解决需追加一条 append-only migration**：
    `ALTER TABLE t_part_event ALTER COLUMN event_type TYPE varchar(40);` —— 本轮不做
    （列宽是既有的全表约束，改它影响所有域的历史行与 Python 端写入路径）。
-3. **`uq_t_part_batch_part_no` 的 `MAX(batch_no)+1` 竞态**（2026-10-03 登记）：`_split_batch_inner`
+2. **`uq_t_part_batch_part_no` 的 `MAX(batch_no)+1` 竞态**（2026-10-03 登记）：`_split_batch_inner`
    先 `SELECT COALESCE(MAX(batch_no),0)+1` 再 INSERT，两条语句之间无锁。并发拆批
    （例如两个批次同时对外协做部分发送）会算出同一个 `batch_no` → 撞唯一约束 → 整事务
    **500** 而非 409。**只登记不修**：修法要么给拆批加 part 级 advisory lock、要么把

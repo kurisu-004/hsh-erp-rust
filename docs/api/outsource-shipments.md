@@ -211,5 +211,7 @@ WS 广播：本域**无**独立事件（对账是后台核对动作，不驱动�
 
 - `tests/outsource/send_receive.rs`（写入侧 + 对账：整批 / 部分收发、shipment
   `OUTSOURCING → RECEIVED` 记账、部分接收不动 shipment、部分接收 → 整批回收余量
-  才关 shipment、reconcile OCC 40901）
+  才关 shipment、reconcile OCC 40901、**需审批工序不许 `direct=true` 直发**
+  （20104 + 不建占位报价 / 不开 shipment）与同工序走 APPROVAL 仍放行 —— 后两条
+  2026-10-03 review 第 1 轮补）
 - `tests/outsource/shipment.rs`（in-flight / sent-parts 读侧）

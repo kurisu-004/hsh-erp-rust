@@ -219,8 +219,6 @@ async fn to_process_invalid_next_process_id_rejected() {
 }
 
 /// to-process happy path：INSPECTION → IN_PROCESS（推荐需求 3）。
-///
-/// 2026-09-16 PR-3 适配：to-process 入口要求 part 已绑定工艺链（20706）。
 #[tokio::test]
 async fn to_process_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_inspector().await;
@@ -260,7 +258,7 @@ async fn to_process_happy_path() {
 /// to-process 拒绝：非 INSPECTION 状态（PENDING）→ 404 / 20109。
 ///
 /// 2026-09-16 PR-3 后，state machine 允许 PENDING → IN_PROCESS（place-on-shelf 路径）；
-/// to_process 是品检打回流，要求 part 已绑定工艺链 + 存在 INSPECTION 批次。
+/// to_process 是品检打回流，要求存在 INSPECTION 批次。
 /// 锚定批次不是 INSPECTION 状态 → service 在 step 4 `find_inspection_batch_by_id`
 /// 抛 20109 BIZ_PART_BATCH_NOT_FOUND（HTTP 404）。
 #[tokio::test]
@@ -316,7 +314,7 @@ async fn to_process_partial_split_happy_path() {
         10,
     )
     .await;
-    // 2026-09-16 PR-3：to_process 要求 part 已绑定工艺链
+    // to_process 有链时把 current_process_step_id 写成链内该工序的活跃 step（无链则落 NULL）
     let chain_id = create_chain_for_part(&pool, part_id).await;
     let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
     let v = batch_version(&pool, batch_id).await;

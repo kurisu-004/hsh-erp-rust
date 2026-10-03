@@ -10,20 +10,19 @@ use crate::modules::part::model::NewPartEvent;
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::batch::dto::PlaceOnShelfRequest;
-use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
 use super::guard::{
     assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
-    require_process_chain, validate_batch_version, validate_shelf_zone,
+    optional_process_chain, optional_step_id, validate_batch_version, validate_shelf_zone,
 };
 
 impl BatchService {
     /// `POST /prod/batches/{batch_id}/release-from-programming`：PROGRAMMING → IN_PROCESS（PRODUCTION_SHELF）。
     ///
-    /// 2026-09-16 PR-3 批次 step 化：chain 必须性守卫 + req.next_process_id
-    /// 解析为 step_id 写入 current_process_step_id。
+    /// 2026-09-16 PR-3 批次 step 化：req.next_process_id 解析为 step_id 写入
+    /// current_process_step_id（2026-10-03 起链可选，无链落 NULL）。
     pub async fn release_from_programming<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -53,26 +52,12 @@ impl BatchService {
                 "release-from-programming: 源状态必须是 PROGRAMMING",
             ));
         }
-        // PR-3：part 必须已绑定工艺链
-        let chain_id = require_process_chain(repo.conn_mut(), part_id).await?;
+        // 2026-10-03：工序链可选（无链的旧零件也能释放，见 guard.rs）
+        let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
         validate_shelf_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION").await?;
         assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, req.next_process_id).await?;
-        // PR-3：解析 step_id
-        let step_id = ProcessChainRepo::resolve_step_id_by_process(
-            repo.conn_mut(),
-            chain_id,
-            req.next_process_id,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                format!(
-                    "chain {} 内找不到 process_id={} 的活跃 step",
-                    chain_id, req.next_process_id
-                ),
-            )
-        })?;
+        // PR-3：解析 step_id（无链 → NULL；有链但链内无该工序 → 20702）
+        let step_id = optional_step_id(repo.conn_mut(), chain_id, req.next_process_id).await?;
         let n = mark_batch_with_status_and_meta(
             repo.conn_mut(),
             batch.id,
@@ -80,7 +65,8 @@ impl BatchService {
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
-            Some(step_id),
+            // 2026-10-03：无链时为 None ⇒ status_gate 的 clear 分支写 NULL
+            step_id,
             // 2026-09-30：进池 → current_process_id 写目标工序
             Some(req.next_process_id),
             current.id,

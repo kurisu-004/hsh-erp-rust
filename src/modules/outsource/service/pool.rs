@@ -16,8 +16,9 @@
 //! `items` / `sendable_count` 走 `sendable_list_by_process` /
 //! `pool_group_sendable_counts`，二者与 `sendable_list` / `sendable_count` 共享
 //! `repo/sql.rs::SENDABLE_INNER_X_SQL`（谓词唯一落点）。故
-//! 「看板 tab 内行」与「sendable 一览按 `next_process_id` 过滤的行」逐字段一致
-//! —— 由 `tests/outsource/pool.rs` 的对照用例守住。
+//! 「看板 tab 内行」与「sendable 一览按 `current_process_id` 过滤的行」逐字段一致
+//! —— 由 `tests/outsource/pool.rs` 的对照用例守住。`send_mode` 的判定同样共用
+//! `service/sendable.rs::send_mode_of`。
 //!
 //! ## 事务边界
 //! 三个端点都是纯读：handler `pool.acquire()` **不开事务**，service 借
@@ -43,6 +44,7 @@ use crate::modules::outsource::vo::{
 };
 use crate::shared::error::{AppError, code};
 
+use super::sendable::send_mode_of;
 use super::{OutsourceService, join_customer_path};
 
 /// 把 SQL `array_agg(json_build_object(...))` 的结果解成 `Vec<OutsourceCompanyOption>`。
@@ -59,6 +61,11 @@ fn decode_company_options(raw: serde_json::Value) -> Vec<OutsourceCompanyOption>
 ///
 /// 提成独立函数是为了能单测 —— 这条判定同时驱动「卡片是否置灰」和「拖到公司列
 /// 后能否真发出去」，两处口径漂移的代价是用户点了没反应。
+///
+/// 2026-10-03：`send_mode` 的语义从「有没有命中报价」改成「工序是否需要审批」
+/// （见 `service/sendable.rs::send_mode_of`），本函数**不需要跟着改** —— 两种模式下
+/// 「可发」的含义没变：APPROVAL 报价已批（公司由报价指定），DIRECT 得由用户选一家
+/// 映射公司。SQL 侧同样按新语义短路（APPROVAL 行 `company_options = []`）。
 fn can_send(send_mode: &str, company_options: &[OutsourceCompanyOption]) -> bool {
     send_mode == "APPROVAL" || !company_options.is_empty()
 }
@@ -89,7 +96,7 @@ impl OutsourceService {
     /// （admin 视角但不止 Manager）。
     ///
     /// 流程（3 条 SQL + 1 步内存合并，与工序数无关）：
-    /// 1. 候选侧 `GROUP BY next_process_id` 计数（与 `pool_by_process` 的 items
+    /// 1. 候选侧 `GROUP BY current_process_id` 计数（与 `pool_by_process` 的 items
     ///    行粒度逐行一致）；
     /// 2. 在途侧 `GROUP BY current_process_id` 计数；
     /// 3. （非 SQL）两张计数表求并集 + 只留 `sendable + in_flight > 0` 的工序 +
@@ -170,7 +177,7 @@ impl OutsourceService {
     /// 2. `companies`：该工序映射的全部活跃外协公司 + `held_count`（无在途批次的
     ///    公司也在列，`held_count = 0`）；
     /// 3. `items`：候选批次（与 `/outsource-sendable` 同源 SQL，按
-    ///    `next_process_id = $1` 过滤，不分页）。
+    ///    `current_process_id = $1` 过滤，不分页）。
     pub async fn pool_by_process<R: OutsourceRepoTrait>(
         &self,
         mut repo: R,
@@ -198,13 +205,8 @@ impl OutsourceService {
             .into_iter()
             .map(|r| {
                 let company_options = decode_company_options(r.company_options);
-                // 命中 APPROVED 报价 → APPROVAL（quote_id / company / price 三件套
-                // 来自报价）；未命中 → DIRECT。判定与 `/outsource-sendable` 同源。
-                let send_mode = if r.quote_id.is_some() {
-                    "APPROVAL"
-                } else {
-                    "DIRECT"
-                };
+                // send_mode 判定与 `/outsource-sendable` 同源（同一函数）。
+                let send_mode = send_mode_of(r.requires_approval, r.quote_id.is_some());
                 OutsourcePoolCandidate {
                     version: r.batch_version,
                     send_mode: send_mode.to_string(),
@@ -223,7 +225,7 @@ impl OutsourceService {
                         r.parent_customer_name.as_deref(),
                         r.customer_name.as_deref(),
                     ),
-                    shelf_code: Some(r.shelf_code),
+                    shelf_code: r.shelf_code,
                     outsource_company_id: r.outsource_company_id,
                     outsource_company_name: r.outsource_company_name,
                     quote_id: r.quote_id,

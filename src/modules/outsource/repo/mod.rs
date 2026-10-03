@@ -126,6 +126,9 @@ pub struct OutsourceInFlightRow {
 }
 
 /// `GET /outsource-quotes/quotable-parts` 行。
+///
+/// 一零件一行（2026-10-03 简化前是「零件 × OUTSOURCE 工序」，`shelf_*` /
+/// `next_process_*` 四列随之删除，见 `repo/sql.rs::OutsourceQuotableRepo` 的头注释）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct OutsourceQuotableRow {
     pub id: i64,
@@ -137,10 +140,6 @@ pub struct OutsourceQuotableRow {
     pub customer_id: i64,
     pub customer_name: Option<String>,
     pub parent_customer_name: Option<String>,
-    pub shelf_id: i64,
-    pub shelf_code: String,
-    pub next_process_id: i64,
-    pub next_process_name: String,
 }
 
 /// `GET /outsource-sendable` 行。
@@ -168,13 +167,17 @@ pub struct OutsourceSendableRow {
     /// 从不读这个字段 —— 保留投影是为了让 list / count 的过滤位置保持同构（见
     /// `repo/sql.rs::OutsourceSendableRepo` 头注释）。
     pub customer_id: Option<i64>,
-    /// `t_shelf.code`，驱动表是 `JOIN t_shelf`（INNER）⇒ DB 层 NOT NULL。
-    /// 与 quotable 侧 `OutsourceQuotableRow.shelf_code` 同一写法。
-    pub shelf_code: String,
-    pub next_process_id: i64,
-    /// `t_process.name`，`JOIN t_process pr`（INNER）⇒ DB 层 NOT NULL。
-    /// 与 quotable 侧 `OutsourceQuotableRow.next_process_name` 同一写法。
-    pub next_process_name: String,
+    /// `t_shelf.code`（`LEFT JOIN t_shelf`）⇒ `PENDING` 且未上架的批次（无
+    /// holder）为 `None`，VO 相应可空。
+    pub shelf_code: Option<String>,
+    /// `t_part_batch.current_process_id`（池归属权威依据），`JOIN t_process pr`
+    /// （INNER）⇒ DB 层 NOT NULL。
+    pub current_process_id: i64,
+    /// `t_process.name`，同一 INNER JOIN ⇒ DB 层 NOT NULL。
+    pub current_process_name: String,
+    /// `t_process.requires_approval` —— `send_mode` 判定的输入（false = 免审批
+    /// 直发 / true = 必须有已审批报价）。见 `service/sendable.rs::send_mode_of`。
+    pub requires_approval: bool,
     pub quote_id: Option<i64>,
     pub price: Option<String>,
     pub outsource_company_id: Option<i64>,
@@ -244,9 +247,9 @@ pub struct OutsourceHeldBatchRow {
 /// outsource 域数据访问胖 trait。
 ///
 /// 单 trait 合并 6 ZST（company + company_process + quote + quote_event + shipment，
-/// 外加 2026-10-03 新增的 quotable / sendable / pool 三个读模型 ZST），共 56 方法：
-/// company 8 + company_process 4 + quote 11 + quote_event 1 + shipment 10
-/// + quotable 2 + sendable 3 + pool 5 + 跨域 helper 11。
+/// 外加 2026-10-03 新增的 quotable / sendable / pool 三个读模型 ZST），共 57 方法：
+/// company 8 + company_process 4 + quote 13 + quote_event 1 + shipment 9
+/// + quotable 2 + sendable 3 + pool 4 + 跨域 helper 13。
 ///
 /// 方法签名 = `sql.rs` 固有静态方法去 executor 形参。`<'a>` 显式生命周期是 mockall
 /// 0.15 automock 在 `async_trait` 上下文的硬性要求。
@@ -322,7 +325,7 @@ pub trait OutsourceRepoTrait: Send {
         updated_by: i64,
     ) -> Result<u64, sqlx::Error>;
 
-    // ── t_outsource_quote（11）──
+    // ── t_outsource_quote（13）──
     async fn quote_get_by_id(
         &mut self,
         id: i64,
@@ -417,7 +420,7 @@ pub trait OutsourceRepoTrait: Send {
         new: NewOutsourceQuoteEvent,
     ) -> Result<TOutsourceQuoteEvent, sqlx::Error>;
 
-    // ── t_outsource_shipment（6）──
+    // ── t_outsource_shipment（9）──
     async fn shipment_get_by_id(
         &mut self,
         id: i64,
@@ -483,7 +486,7 @@ pub trait OutsourceRepoTrait: Send {
         keyword_pat: Option<&'a str>,
     ) -> Result<i64, sqlx::Error>;
 
-    // ── quotable-parts（2026-10-03 新增，可建报价的 零件 × OUTSOURCE 工序） ──
+    // ── quotable-parts（2026-10-03 新增，可建报价的未下发零件，一零件一行） ──
     async fn quotable_list<'a>(
         &mut self,
         keyword_pat: Option<&'a str>,
@@ -495,7 +498,7 @@ pub trait OutsourceRepoTrait: Send {
         keyword_pat: Option<&'a str>,
     ) -> Result<i64, sqlx::Error>;
 
-    // ── sendable（2026-10-03 新增，可发送外协的 活跃批次 × OUTSOURCE 工序） ──
+    // ── sendable（2026-10-03 新增，可发送外协的活跃批次，一批次一行） ──
     async fn sendable_list<'a>(
         &mut self,
         keyword_pat: Option<&'a str>,
@@ -509,14 +512,14 @@ pub trait OutsourceRepoTrait: Send {
         customer_id: Option<i64>,
     ) -> Result<i64, sqlx::Error>;
     /// 2026-10-03 新增：按外协工序取可发送候选（看板左列）。
-    /// 与 `sendable_list` 同核心 SQL、只把外层过滤换成 `next_process_id = $1`。
+    /// 与 `sendable_list` 同核心 SQL、只把外层过滤换成 `current_process_id = $1`。
     async fn sendable_list_by_process(
         &mut self,
         process_id: i64,
     ) -> Result<Vec<OutsourceSendableRow>, sqlx::Error>;
 
     // ── pool（2026-10-03 新增，按外协工序切 tab 的看板三端点） ──
-    /// 候选侧按工序分组计数（`GROUP BY next_process_id`，与
+    /// 候选侧按工序分组计数（`GROUP BY current_process_id`，与
     /// `sendable_list_by_process` 行粒度一致）。
     async fn pool_group_sendable_counts(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error>;
     /// 在途侧按工序分组计数（`GROUP BY current_process_id`）。
@@ -547,6 +550,25 @@ pub trait OutsourceRepoTrait: Send {
         &mut self,
         process_id: i64,
     ) -> Result<Option<String>, sqlx::Error>;
+    /// `t_process` 按 id 查 `requires_approval`（仅未软删）。
+    ///
+    /// 2026-10-03 新增：供 `prod::batch::send_to_outsource` 写侧守「需审批的工序
+    /// 不许 `direct=true` 直发」——该列此前只有读侧（sendable / pool 的判定 SQL）
+    /// 在用，写侧零校验 ⇒ 绕过 UI 直接调 API 就能对需审批工序直发。读法与
+    /// `process_get_category` 同形（同表、同 `deleted_at IS NULL`、返回 `Option`
+    /// 让调用方自己决定「不存在」怎么处理）。
+    ///
+    /// **为何不并进 `process_get_category`（2026-10-03 review 第 2 轮登记）**：两者读
+    /// 的是 `t_process` 同一行的相邻两列，合到一个 `process_get_flag_row` 里确实能
+    /// 少一次往返。但代价是回归面从 outsource 域扩到全部 `process_get_category`
+    /// 调用方（`outsource/service/quote.rs` 的建报价校验、`prod::batch::
+    /// send_to_outsource` 的类别校验），且返回类型要从 `Option<String>` 变成一个
+    /// 两字段结构体 —— 收益（省一次同表主键查询）远小于改面。故本轮保持独立，等真有
+    /// 第三个同表 flag 列时再合并。
+    async fn process_get_requires_approval(
+        &mut self,
+        process_id: i64,
+    ) -> Result<Option<bool>, sqlx::Error>;
     /// `t_process` 按 ids 查 `(id, code, name, category)`（仅未软删）。
     /// 供 build_with_processes 与 quote_out_many 使用。
     async fn process_map_full<'a>(
@@ -736,7 +758,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
             .await
     }
 
-    // ── t_outsource_quote（11）── 一行委托 sql::OutsourceQuoteRepo ─────────
+    // ── t_outsource_quote（13）── 一行委托 sql::OutsourceQuoteRepo ─────────
     async fn quote_get_by_id(
         &mut self,
         id: i64,
@@ -905,7 +927,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceQuoteEventRepo::create(&mut **self, new).await
     }
 
-    // ── t_outsource_shipment（6）── 一行委托 sql::OutsourceShipmentRepo ─────
+    // ── t_outsource_shipment（9）── 一行委托 sql::OutsourceShipmentRepo ─────
     async fn shipment_get_by_id(
         &mut self,
         id: i64,
@@ -1026,6 +1048,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceShipmentRepo::count_in_flight(&mut **self, keyword_pat).await
     }
 
+    // ── quotable-parts（2）── 一行委托 sql::OutsourceQuotableRepo ─────────
     async fn quotable_list<'a>(
         &mut self,
         keyword_pat: Option<&'a str>,
@@ -1042,6 +1065,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceQuotableRepo::count(&mut **self, keyword_pat).await
     }
 
+    // ── sendable（3）── 一行委托 sql::OutsourceSendableRepo ───────────────
     async fn sendable_list<'a>(
         &mut self,
         keyword_pat: Option<&'a str>,
@@ -1067,6 +1091,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceSendableRepo::list_by_process(&mut **self, process_id).await
     }
 
+    // ── pool（4）── 一行委托 sql::OutsourcePoolRepo ──────────────────────
     async fn pool_group_sendable_counts(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error> {
         OutsourcePoolRepo::group_sendable_counts(&mut **self).await
     }
@@ -1090,7 +1115,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourcePoolRepo::list_held(&mut **self, company_id, process_id).await
     }
 
-    // ── 跨域 helper（11）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
+    // ── 跨域 helper（13）── 一行委托 `sqlx::query_as` 跨表 SELECT ─────────
     async fn part_exists(&mut self, part_id: i64) -> Result<bool, sqlx::Error> {
         let row: Option<(i64,)> =
             sqlx::query_as("SELECT id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
@@ -1120,6 +1145,19 @@ impl OutsourceRepoTrait for &mut PgConnection {
                 .bind(process_id)
                 .fetch_optional(&mut **self)
                 .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    async fn process_get_requires_approval(
+        &mut self,
+        process_id: i64,
+    ) -> Result<Option<bool>, sqlx::Error> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT requires_approval FROM t_process WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(process_id)
+        .fetch_optional(&mut **self)
+        .await?;
         Ok(row.map(|r| r.0))
     }
 

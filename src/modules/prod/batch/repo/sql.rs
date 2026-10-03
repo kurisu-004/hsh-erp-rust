@@ -454,11 +454,13 @@ impl PartBatchRepo {
                 // 进池 → 写目标工序；`current_process_id` 为 None 时即「不进任何
                 // 工序池」，清 NULL 是本路径的既有语义。
                 clear_process_id: current_process_id.is_none(),
-                // 2026-10-01 review 第 1 轮 M2：location / holder 都有实参，
-                // step 为 `None` 时是「保持原值」（本路径的既有语义）。
+                // 2026-10-03：step 与 process 同一套三态约定 —— None 即写 NULL。
+                // 此前本路径的 step 恒有值（无链时调用方先撞 20702），「None = 保持」
+                // 是条走不到的空分支；工序链放开后无链批次会真的传 None，此时保留
+                // 上一道工序的 step 指针会让读侧显示一个与实际不符的位置。
                 clear_location: false,
                 clear_holder_id: false,
-                clear_process_step_id: false,
+                clear_process_step_id: current_process_step_id.is_none(),
                 event_id: None,
             },
         )

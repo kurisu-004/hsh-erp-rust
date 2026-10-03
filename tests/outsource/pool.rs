@@ -17,6 +17,13 @@
 //!     / `pool_by_process_forbidden_for_shelf_account` / `pool_state_forbidden_for_shelf_account`
 //!     （三个端点各一条负向回归网）
 //! 12. `pool_state_derives_next_step_from_parts_current_chain_after_rebind`（读侧锚链与写侧同源）
+//!
+//! ## 候选侧（counts.sendable_count / {process_id}.items）的新判据
+//! 2026-10-03 起候选批次由 `t_part_batch.current_process_id` 判定（必须指向一道
+//! OUTSOURCE 工序），**不再要求零件绑了工艺链**；且该工序 `requires_approval = true`
+//! 时必须已有 APPROVED 报价。故本文件的两个 helper 都加了对应形参：
+//! `seed_outsource_process(.., requires_approval)` 与
+//! `insert_candidate_batch(.., process_id, ..)`。
 //! 13. `pool_state_does_not_fan_out_on_duplicate_applicant_name`（`t_applicant` 重名不扇出）
 //!
 //! ## fixture 范本
@@ -215,18 +222,26 @@ async fn set_part_applicant(pool: &PgPool, part_id: i64, applicant_name: &str) {
 }
 
 /// 直插 OUTSOURCE 类别工序，返回 `(id, code, name)`。
-async fn seed_outsource_process(pool: &PgPool, code: &str) -> (i64, String, String) {
+///
+/// `requires_approval` 是候选侧谓词的输入（true = 必须有已批准报价才出现在
+/// 候选列 / sendable 一览；false = 免审批直发），故由用例显式给出。
+async fn seed_outsource_process(
+    pool: &PgPool,
+    code: &str,
+    requires_approval: bool,
+) -> (i64, String, String) {
     let id = next_id();
     let name = format!("PROC-{code}");
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
          version, created_at, updated_at) \
-         VALUES ($1, $2, $3, 'OUTSOURCE', 0, true, 0, $4, $4)",
+         VALUES ($1, $2, $3, 'OUTSOURCE', 0, $4, 0, $5, $5)",
     )
     .bind(id)
     .bind(code)
     .bind(&name)
+    .bind(requires_approval)
     .bind(now)
     .execute(pool)
     .await
@@ -346,17 +361,28 @@ async fn create_chain_with_steps(
     (chain_id, step_ids)
 }
 
-/// 直插候选批次（在架上等发外协）：`status='PENDING'` + `location='PRODUCTION_SHELF'`。
-async fn insert_candidate_batch(pool: &PgPool, part_id: i64, shelf_id: i64, version: i32) -> i64 {
+/// 直插候选批次（在架上等发外协）：`status='PENDING'` + `location='PRODUCTION_SHELF'`
+/// + `current_process_id = process_id`。
+///
+/// `current_process_id` 是候选侧判定的权威依据（2026-10-03 起不再靠「货架绑了哪些
+/// 外协工序」枚举），故必须显式给出。
+async fn insert_candidate_batch(
+    pool: &PgPool,
+    part_id: i64,
+    shelf_id: i64,
+    process_id: i64,
+    version: i32,
+) -> i64 {
     let id = next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
-         current_holder_id, version, created_at, updated_at) \
-         VALUES ($1, $2, 1, 8, 'PENDING', 'PRODUCTION_SHELF', $3, $4, now(), now())",
+         current_holder_id, current_process_id, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, 8, 'PENDING', 'PRODUCTION_SHELF', $3, $4, $5, now(), now())",
     )
     .bind(id)
     .bind(part_id)
     .bind(shelf_id)
+    .bind(process_id)
     .bind(version)
     .execute(pool)
     .await
@@ -566,31 +592,31 @@ async fn pool_counts_returns_200_sorted_and_totals_match() {
     let cid = insert_customer(&pool, "PcCnt", "A").await;
 
     // 工序 A：既有候选、又有在途。
-    let (proc_a, _, _) = seed_outsource_process(&pool, "PC-A").await;
+    let (proc_a, _, _) = seed_outsource_process(&pool, "PC-A", true).await;
     let shelf_a = insert_shelf(&pool, "PCS-A").await;
     link_shelf_process(&pool, shelf_a, proc_a).await;
     let co_a = insert_company(&pool, "PcCntCoA", true).await;
     link_company_process(&pool, co_a, proc_a).await;
     let p_a1 = insert_part(&pool, cid, "CA1", "2026-12-01").await;
     create_chain_with_steps(&pool, p_a1, &[(proc_a, 1)]).await;
-    insert_candidate_batch(&pool, p_a1, shelf_a, 0).await;
+    insert_candidate_batch(&pool, p_a1, shelf_a, proc_a, 0).await;
     let q_a = insert_approved_quote(&pool, p_a1, co_a, proc_a, "12.50").await;
     let p_a2 = insert_part(&pool, cid, "CA2", "2026-12-02").await;
     create_chain_with_steps(&pool, p_a2, &[(proc_a, 1)]).await;
     let held_a = insert_held_batch(&pool, p_a2, co_a, proc_a, None, 8, 3).await;
     insert_open_shipment(&pool, q_a, p_a2, held_a, co_a, proc_a, 8, "12.50").await;
 
-    // 工序 B：只有候选。
+    // 工序 B：只有候选（免审批直发，无报价）。
     // ⚠️ 必须比 proc_a 大，才能验证 `process_id ASC` 而不是插入序。
-    let (proc_b, _, _) = seed_outsource_process(&pool, "PC-B").await;
+    let (proc_b, _, _) = seed_outsource_process(&pool, "PC-B", false).await;
     let shelf_b = insert_shelf(&pool, "PCS-B").await;
     link_shelf_process(&pool, shelf_b, proc_b).await;
     let p_b = insert_part(&pool, cid, "CB1", "2026-12-03").await;
     create_chain_with_steps(&pool, p_b, &[(proc_b, 1)]).await;
-    insert_candidate_batch(&pool, p_b, shelf_b, 0).await;
+    insert_candidate_batch(&pool, p_b, shelf_b, proc_b, 0).await;
 
     // 工序 C：只有在途。
-    let (proc_c, _, _) = seed_outsource_process(&pool, "PC-C").await;
+    let (proc_c, _, _) = seed_outsource_process(&pool, "PC-C", true).await;
     let co_c = insert_company(&pool, "PcCntCoC", true).await;
     link_company_process(&pool, co_c, proc_c).await;
     let p_c = insert_part(&pool, cid, "CC1", "2026-12-04").await;
@@ -600,7 +626,7 @@ async fn pool_counts_returns_200_sorted_and_totals_match() {
     insert_open_shipment(&pool, q_c, p_c, held_c, co_c, proc_c, 5, "3.00").await;
 
     // 工序 D：映射了公司但一个批次都没有 → **不得出现**（0+0）。
-    let (proc_d, _, _) = seed_outsource_process(&pool, "PC-D").await;
+    let (proc_d, _, _) = seed_outsource_process(&pool, "PC-D", true).await;
     let co_d = insert_company(&pool, "PcCntCoD", true).await;
     link_company_process(&pool, co_d, proc_d).await;
 
@@ -674,7 +700,7 @@ async fn pool_counts_allows_clerk_role() {
 #[tokio::test]
 async fn pool_counts_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PC-FB").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PC-FB", true).await;
     let shelf = insert_shelf(&pool, "PCS-FB").await;
     link_shelf_process(&pool, shelf, proc_id).await;
     let co = insert_company(&pool, "FbCo", true).await;
@@ -692,7 +718,7 @@ async fn pool_counts_forbidden_for_shelf_account() {
 #[tokio::test]
 async fn pool_by_process_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PBP-FB").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PBP-FB", true).await;
     let shelf = insert_shelf(&pool, "PBPS-FB").await;
     link_shelf_process(&pool, shelf, proc_id).await;
 
@@ -711,7 +737,7 @@ async fn pool_by_process_forbidden_for_shelf_account() {
 #[tokio::test]
 async fn pool_state_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PST-FB").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PST-FB", true).await;
     let shelf = insert_shelf(&pool, "PSTS-FB").await;
     let co = insert_company(&pool, "StFbCo", true).await;
     link_company_process(&pool, co, proc_id).await;
@@ -731,7 +757,7 @@ async fn pool_state_forbidden_for_shelf_account() {
 async fn pool_detail_lists_all_mapped_companies_including_empty_column() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcDet", "B").await;
-    let (proc_id, code, name) = seed_outsource_process(&pool, "PD-CO").await;
+    let (proc_id, code, name) = seed_outsource_process(&pool, "PD-CO", true).await;
     let shelf_id = insert_shelf(&pool, "PDS").await;
     link_shelf_process(&pool, shelf_id, proc_id).await;
 
@@ -745,17 +771,17 @@ async fn pool_detail_lists_all_mapped_companies_including_empty_column() {
     }
 
     // 另一道工序的候选行 —— detail 不得把它带进来。
-    let (other_proc, _, _) = seed_outsource_process(&pool, "PD-OTHER").await;
+    let (other_proc, _, _) = seed_outsource_process(&pool, "PD-OTHER", false).await;
     let other_shelf = insert_shelf(&pool, "PDS-OTHER").await;
     link_shelf_process(&pool, other_shelf, other_proc).await;
     let p_other = insert_part(&pool, cid, "OTH", "2026-12-01").await;
     create_chain_with_steps(&pool, p_other, &[(other_proc, 1)]).await;
-    let other_batch = insert_candidate_batch(&pool, p_other, other_shelf, 0).await;
+    let other_batch = insert_candidate_batch(&pool, p_other, other_shelf, other_proc, 0).await;
 
     // 本工序：1 个候选（APPROVAL，co1）+ 1 个在外协（co2）。
     let p1 = insert_part(&pool, cid, "DT1", "2026-12-02").await;
     let (chain1, steps1) = create_chain_with_steps(&pool, p1, &[(proc_id, 1)]).await;
-    let batch1 = insert_candidate_batch(&pool, p1, shelf_id, 7).await;
+    let batch1 = insert_candidate_batch(&pool, p1, shelf_id, proc_id, 7).await;
     insert_approved_quote(&pool, p1, co1, proc_id, "42.00").await;
 
     let p2 = insert_part(&pool, cid, "DT2", "2026-12-03").await;
@@ -831,7 +857,7 @@ async fn pool_detail_lists_all_mapped_companies_including_empty_column() {
 async fn pool_counts_and_state_are_static_routes_not_process_id() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let co = insert_company(&pool, "RouteCo", true).await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-ROUTE").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-ROUTE", true).await;
 
     // `/counts` 若被 `/{process_id}` 吞掉，这里会是 400（"counts" 不是 i64）。
     let (s, env) = get_counts(&app, &token).await;
@@ -847,13 +873,13 @@ async fn pool_counts_and_state_are_static_routes_not_process_id() {
 async fn pool_detail_keeps_direct_row_with_empty_company_options() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcBare", "C").await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-BARE").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-BARE", false).await;
     let shelf_id = insert_shelf(&pool, "PDB").await;
     link_shelf_process(&pool, shelf_id, proc_id).await;
     // 该工序**不映射任何活跃公司** → DIRECT 且 company_options 为空。
     let part_id = insert_part(&pool, cid, "BARE", "2026-12-01").await;
     create_chain_with_steps(&pool, part_id, &[(proc_id, 1)]).await;
-    let batch_id = insert_candidate_batch(&pool, part_id, shelf_id, 0).await;
+    let batch_id = insert_candidate_batch(&pool, part_id, shelf_id, proc_id, 0).await;
 
     let (s, env) = get_detail(&app, &token, proc_id).await;
     assert_eq!(s, StatusCode::OK, "{env}");
@@ -893,60 +919,47 @@ async fn pool_detail_keeps_direct_row_with_empty_company_options() {
 async fn pool_detail_items_match_sendable_endpoint_field_by_field() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcCmp", "E").await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PD-CMP").await;
+    // 两道工序：APPROVAL（需审批 + 已批准报价）与 DIRECT（免审批）。
+    // `requires_approval` 是**工序级**属性，同一道工序不可能同时产出两种模式，
+    // 所以必须分两道工序来对照。
+    let (proc_appr, _, _) = seed_outsource_process(&pool, "PD-CMP-A", true).await;
+    let (proc_dir, _, _) = seed_outsource_process(&pool, "PD-CMP-D", false).await;
     let shelf_id = insert_shelf(&pool, "PDC").await;
-    link_shelf_process(&pool, shelf_id, proc_id).await;
+    link_shelf_process(&pool, shelf_id, proc_appr).await;
+    link_shelf_process(&pool, shelf_id, proc_dir).await;
     let co1 = insert_company(&pool, "CmpCo1", true).await;
     let co2 = insert_company(&pool, "CmpCo2", true).await;
-    link_company_process(&pool, co1, proc_id).await;
-    link_company_process(&pool, co2, proc_id).await;
+    link_company_process(&pool, co1, proc_appr).await;
+    link_company_process(&pool, co1, proc_dir).await;
+    link_company_process(&pool, co2, proc_dir).await;
     // 停用但已映射的公司：两边都不得把它列进 company_options。
     let co_off = insert_company(&pool, "CmpCoOff", false).await;
-    link_company_process(&pool, co_off, proc_id).await;
+    link_company_process(&pool, co_off, proc_dir).await;
 
     let batch_appr = {
         let p = insert_part(&pool, cid, "AP", "2026-12-01").await;
-        create_chain_with_steps(&pool, p, &[(proc_id, 1)]).await;
-        let b = insert_candidate_batch(&pool, p, shelf_id, 11).await;
-        insert_approved_quote(&pool, p, co1, proc_id, "19.90").await;
+        create_chain_with_steps(&pool, p, &[(proc_appr, 1)]).await;
+        let b = insert_candidate_batch(&pool, p, shelf_id, proc_appr, 11).await;
+        insert_approved_quote(&pool, p, co1, proc_appr, "19.90").await;
         b
     };
     let batch_direct = {
         let p = insert_part(&pool, cid, "DI", "2026-12-02").await;
-        create_chain_with_steps(&pool, p, &[(proc_id, 1)]).await;
-        insert_candidate_batch(&pool, p, shelf_id, 22).await
+        create_chain_with_steps(&pool, p, &[(proc_dir, 1)]).await;
+        insert_candidate_batch(&pool, p, shelf_id, proc_dir, 22).await
     };
-    // 另一道工序的行 —— 两个端点都不该带出它（detail 端点额外断言）。
-    let (other_proc, _, _) = seed_outsource_process(&pool, "PD-CMP-OTHER").await;
+    // 另一道工序的行 —— detail 端点不得带出它。
+    let (other_proc, _, _) = seed_outsource_process(&pool, "PD-CMP-OTHER", false).await;
     let other_shelf = insert_shelf(&pool, "PDC-OTHER").await;
     link_shelf_process(&pool, other_shelf, other_proc).await;
     let p_other = insert_part(&pool, cid, "OT", "2026-12-03").await;
     create_chain_with_steps(&pool, p_other, &[(other_proc, 1)]).await;
-    insert_candidate_batch(&pool, p_other, other_shelf, 33).await;
+    let other_batch = insert_candidate_batch(&pool, p_other, other_shelf, other_proc, 33).await;
 
-    let (s, detail_env) = get_detail(&app, &token, proc_id).await;
-    assert_eq!(s, StatusCode::OK, "{detail_env}");
     let (s, sendable_env) = get_sendable(&app, &token).await;
     assert_eq!(s, StatusCode::OK, "{sendable_env}");
 
-    let detail_items = detail_env["data"]["items"].as_array().unwrap();
-    // sendable 侧按 next_process_id 过滤出同一批行。
-    let pid = proc_id.to_string();
-    let sendable_items: Vec<&Value> = sendable_env["data"]["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|i| i["next_process_id"] == pid)
-        .collect();
-
-    assert_eq!(
-        detail_items.len(),
-        sendable_items.len(),
-        "同一工序的行数必须一致: detail={detail_env} sendable={sendable_env}"
-    );
-    assert_eq!(detail_items.len(), 2, "{detail_env}");
-
-    // 逐字段比对（detail 少了 next_process_*，工序已提到顶层）。
+    // 逐字段比对（detail 少了 current_process_*，工序已提到顶层）。
     let fields = [
         "batch_id",
         "batch_no",
@@ -970,37 +983,75 @@ async fn pool_detail_items_match_sendable_endpoint_field_by_field() {
         "status_label",
         "company_options",
     ];
-    for d in detail_items {
-        let key = d["batch_id"].as_str().unwrap().to_string();
-        let s_row = sendable_items
+    for (proc_id, expect_modes) in [(proc_appr, vec!["APPROVAL"]), (proc_dir, vec!["DIRECT"])] {
+        let (s, detail_env) = get_detail(&app, &token, proc_id).await;
+        assert_eq!(s, StatusCode::OK, "{detail_env}");
+        let detail_items = detail_env["data"]["items"].as_array().unwrap();
+        // sendable 侧按 current_process_id 过滤出同一批行。
+        let pid = proc_id.to_string();
+        let sendable_items: Vec<&Value> = sendable_env["data"]["items"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|i| i["batch_id"].as_str() == Some(key.as_str()))
-            .unwrap_or_else(|| panic!("sendable 缺 batch {key}: {sendable_env}"));
-        for f in fields {
-            assert_eq!(
-                d[f], s_row[f],
-                "字段 {f} 在 batch {key} 上不一致: detail={detail_env} sendable={sendable_env}"
-            );
+            .filter(|i| i["current_process_id"] == pid)
+            .collect();
+        assert_eq!(
+            detail_items.len(),
+            sendable_items.len(),
+            "同一工序的行数必须一致: detail={detail_env} sendable={sendable_env}"
+        );
+        assert_eq!(detail_items.len(), expect_modes.len(), "{detail_env}");
+        assert!(
+            detail_items
+                .iter()
+                .all(|i| i["batch_id"].as_str() != Some(other_batch.to_string().as_str())),
+            "不得含其它工序的行: {detail_env}"
+        );
+        let modes: Vec<&str> = detail_items
+            .iter()
+            .map(|i| i["send_mode"].as_str().unwrap())
+            .collect();
+        assert_eq!(modes, expect_modes, "{detail_env}");
+        for d in detail_items {
+            let key = d["batch_id"].as_str().unwrap().to_string();
+            let s_row = sendable_items
+                .iter()
+                .find(|i| i["batch_id"].as_str() == Some(key.as_str()))
+                .unwrap_or_else(|| panic!("sendable 缺 batch {key}: {sendable_env}"));
+            for f in fields {
+                assert_eq!(
+                    d[f], s_row[f],
+                    "字段 {f} 在 batch {key} 上不一致: detail={detail_env} sendable={sendable_env}"
+                );
+            }
         }
     }
 
     // 停用公司确实不在 DIRECT 的 options 里（顺带锁 DIRECT 口径一致性）。
-    let direct = row_by_batch(detail_items, batch_direct, &detail_env);
-    assert_eq!(direct["send_mode"], "DIRECT", "{detail_env}");
+    let (s, dir_env) = get_detail(&app, &token, proc_dir).await;
+    assert_eq!(s, StatusCode::OK, "{dir_env}");
+    let dir_items = dir_env["data"]["items"].as_array().unwrap();
+    let direct = row_by_batch(dir_items, batch_direct, &dir_env);
     let opt_ids: Vec<String> = direct["company_options"]
         .as_array()
         .unwrap()
         .iter()
         .map(|o| o["id"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(opt_ids.len(), 2, "{detail_env}");
-    assert!(!opt_ids.contains(&co_off.to_string()), "{detail_env}");
-    let appr = row_by_batch(detail_items, batch_appr, &detail_env);
-    assert_eq!(appr["send_mode"], "APPROVAL", "{detail_env}");
+    assert_eq!(opt_ids.len(), 2, "{dir_env}");
+    assert!(!opt_ids.contains(&co_off.to_string()), "{dir_env}");
+    let (s, appr_env) = get_detail(&app, &token, proc_appr).await;
+    assert_eq!(s, StatusCode::OK, "{appr_env}");
+    let appr = row_by_batch(
+        appr_env["data"]["items"].as_array().unwrap(),
+        batch_appr,
+        &appr_env,
+    );
+    assert_eq!(appr["send_mode"], "APPROVAL", "{appr_env}");
     assert_eq!(
         appr["company_options"].as_array().unwrap().len(),
         0,
-        "{detail_env}"
+        "{appr_env}"
     );
 }
 
@@ -1012,7 +1063,7 @@ async fn pool_detail_items_match_sendable_endpoint_field_by_field() {
 async fn pool_state_returns_held_batches_with_shipment_fields() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcSt", "F").await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PST-MAIN").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PST-MAIN", true).await;
     let co1 = insert_company(&pool, "StCo1", true).await;
     let co2 = insert_company(&pool, "StCo2", true).await;
     link_company_process(&pool, co1, proc_id).await;
@@ -1081,7 +1132,7 @@ async fn pool_state_returns_held_batches_with_shipment_fields() {
     assert!(r1["price"].is_string(), "price 必须是字符串: {r1}");
 
     // 另一工序上同公司的批次也不该出现。
-    let (other_proc, _, _) = seed_outsource_process(&pool, "PST-OTHER").await;
+    let (other_proc, _, _) = seed_outsource_process(&pool, "PST-OTHER", true).await;
     let p4 = insert_part(&pool, cid, "ST4", "2026-12-04").await;
     let (_, s4) = create_chain_with_steps(&pool, p4, &[(other_proc, 1)]).await;
     let b4 = insert_held_batch(&pool, p4, co1, other_proc, Some(s4[0]), 2, 1).await;
@@ -1098,7 +1149,7 @@ async fn pool_state_returns_held_batches_with_shipment_fields() {
 async fn pool_state_chain_resolvable_when_next_step_exists() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcChain", "G").await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PCH-OS").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PCH-OS", true).await;
     let (next_id_, _, next_name) = seed_inhouse_process(&pool, "PCH-NEXT").await;
     let co = insert_company(&pool, "ChainCo", true).await;
     link_company_process(&pool, co, proc_id).await;
@@ -1126,7 +1177,7 @@ async fn pool_state_chain_resolvable_when_next_step_exists() {
 async fn pool_state_chain_unresolvable_when_no_step_or_chain_tail() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcNoChain", "H").await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PNC-OS").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PNC-OS", true).await;
     let co = insert_company(&pool, "NoChainCo", true).await;
     link_company_process(&pool, co, proc_id).await;
 
@@ -1177,7 +1228,7 @@ async fn pool_state_chain_unresolvable_when_no_step_or_chain_tail() {
 async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_customer(&pool, "PcRebind", "I").await;
-    let (proc_os, _, os_name) = seed_outsource_process(&pool, "PRB-OS").await;
+    let (proc_os, _, os_name) = seed_outsource_process(&pool, "PRB-OS", true).await;
     let (proc_next_a, _, next_name_a) = seed_inhouse_process(&pool, "PRB-NEXTA").await;
     let (proc_next_b, _, next_name_b) = seed_inhouse_process(&pool, "PRB-NEXTB").await;
     let (proc_next_c, _, next_name_c) = seed_inhouse_process(&pool, "PRB-NEXTC").await;
@@ -1237,7 +1288,7 @@ async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
         "锚链内存在下一 step ⇒ 可解析: {env}"
     );
 
-    // 写侧前提：`require_process_chain(part)` 取到的链 + 在该链内按
+    // 写侧前提：`optional_process_chain(part)` 取到的链 + 在该链内按
     // `resolve_step_id_by_process` 解析，必须落在**同一个 step** 上 ——
     // 否则上一组断言等于给了前端一个写侧会拒收（404 `20702`）的默认值。
     let write_side: Vec<(i64, i64)> = sqlx::query_as(
@@ -1258,7 +1309,7 @@ async fn pool_state_derives_next_step_from_parts_current_chain_after_rebind() {
     );
     assert_eq!(
         write_side[0].0, chain_b,
-        "写侧 require_process_chain 取到的链必须与读侧锚链一致"
+        "写侧 optional_process_chain 取到的链必须与读侧锚链一致"
     );
 }
 
@@ -1272,7 +1323,7 @@ async fn pool_state_does_not_fan_out_on_duplicate_applicant_name() {
     // 两个客户必须用不同前缀。
     let cid1 = insert_customer(&pool, "PcAp1", "Z").await;
     let cid2 = insert_customer(&pool, "PcAp2", "Y").await;
-    let (proc_id, _, _) = seed_outsource_process(&pool, "PAP-OS").await;
+    let (proc_id, _, _) = seed_outsource_process(&pool, "PAP-OS", true).await;
     let co = insert_company(&pool, "ApCo", true).await;
     link_company_process(&pool, co, proc_id).await;
 

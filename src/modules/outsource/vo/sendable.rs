@@ -1,8 +1,10 @@
 //! outsource 域 `GET /outsource-sendable` 端点响应 VO
 //!
-//! 2026-10-03 新增：可发送外协的（活跃批次 × OUTSOURCE 工序）一览。一行 =
-//! 一个组合，与 quote / shipment / company 任何单一域都不是子资源，故走独立
-//! 顶层前缀 `/api/v2/outsource-sendable`。
+//! 2026-10-03 新增：可发送外协的（活跃批次 × OUTSOURCE 工序）一览；同日改为
+//! **一行 = 一个活跃批次**（判据是 `t_part_batch.current_process_id` 指向外协工序，
+//! 不再要求零件绑了工艺链，见 `repo/sql.rs::SENDABLE_INNER_X_SQL`）。与 quote /
+//! shipment / company 任何单一域都不是子资源，故走独立顶层前缀
+//! `/api/v2/outsource-sendable`。
 //!
 //! ## 与写侧（prod 域）的契约
 //! 前端拿本 VO 驱动两个写端点：
@@ -44,7 +46,8 @@ pub struct OutsourceCompanyOption {
 pub struct OutsourceSendableItem {
     /// **`t_part_batch.version`**（批次级 OCC）。前端发送时原样回传。
     pub version: i32,
-    /// `"APPROVAL"`（有已批准报价）/ `"DIRECT"`（无报价直发）。
+    /// `"APPROVAL"`（该外协工序 `requires_approval = true`，本行已命中一条已批准
+    /// 报价）/ `"DIRECT"`（`requires_approval = false`，免审批直发）。
     pub send_mode: String,
     /// 批次来源状态：`"PENDING"` / `"IN_PROCESS"`。
     pub source_status: String,
@@ -65,11 +68,12 @@ pub struct OutsourceSendableItem {
     pub is_urgent: bool,
     /// 客户路径：有 L1 拼 `L1 / L2`，否则仅 L2 名，缺客户为 `null`。
     pub customer_path: Option<String>,
-    /// 该货架上的 OUTSOURCE 工序（前端发送时当 `process_id` 回传）。
+    /// 批次当前所在的外协工序（= `t_part_batch.current_process_id`；前端发送时
+    /// 当 `process_id` 回传）。
     #[serde(serialize_with = "serialize_i64")]
-    pub next_process_id: i64,
-    pub next_process_name: Option<String>,
-    /// 批次所在货架 code。
+    pub current_process_id: i64,
+    pub current_process_name: Option<String>,
+    /// 批次所在货架 code。`PENDING` 且未上架的批次没有 holder，故为 `null`。
     pub shelf_code: Option<String>,
     /// APPROVAL 有值 / DIRECT `null`。
     #[serde(serialize_with = "serialize_i64_opt")]
@@ -79,7 +83,7 @@ pub struct OutsourceSendableItem {
     /// **前端靠它决定发送时传哪个报价**（见文件头「与写侧的契约」）。
     #[serde(serialize_with = "serialize_i64_opt")]
     pub quote_id: Option<i64>,
-    /// DIRECT 列出该公司工序映射的全部**活跃**公司；APPROVAL 恒为空数组。
+    /// DIRECT 列出该工序映射的全部**活跃**公司；APPROVAL 恒为空数组。
     /// DIRECT 且该工序未映射任何活跃公司时为空数组 —— **该行仍返回**
     /// （前端 `canSend()` 据 `company_options.length >= 1` 置灰），不要在 SQL 里滤掉。
     pub company_options: Vec<OutsourceCompanyOption>,

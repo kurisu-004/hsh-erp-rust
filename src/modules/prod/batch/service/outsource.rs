@@ -15,7 +15,8 @@
 //!    子批次，源批次留在原处（量减少 `q`）。拆批统一走
 //!    `PartBatchRepo::_split_batch_inner`（OCC + 数量守卫都在里面）。
 //! 3. **补齐缺失守卫**：`process.category` 必须 `OUTSOURCE`、公司必须映射该工序、
-//!    `direct` 与 `quote_id` 必须恰给一个。
+//!    `direct` 与 `quote_id` 必须恰给一个、`requires_approval=true` 的工序不许
+//!    `direct=true` 直发（2026-10-03 review 第 1 轮）。
 //!
 //! 部分接收的**记账口径**（有意为之，勿"顺手修"）：shipment 记的是**发出时**的全量。
 //! 部分回收只拆批次，源批次余量继续挂着那张 `OUTSOURCING` shipment；
@@ -35,13 +36,12 @@ use crate::modules::prod::batch::dto::{
     ReceiveFromOutsourceRequest, ReceiveFromOutsourceToInspectionRequest, SendToOutsourceRequest,
 };
 use crate::modules::prod::batch::repo::PartBatchRepo;
-use crate::modules::prod::process_chain::repo::ProcessChainRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
 use super::guard::{
     assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
-    require_process_chain, validate_batch_version, validate_shelf_zone,
+    optional_process_chain, optional_step_id, validate_batch_version, validate_shelf_zone,
 };
 
 /// 2026-10-03：DIRECT 占位报价的 `note` 固定文案 —— 让对账页一眼看出
@@ -245,7 +245,11 @@ impl BatchService {
     /// - **DIRECT**：`direct=true` 时复用 `(part, company, process)` 的活跃 APPROVED
     ///   报价，没有则自动建 `price=0` 占位报价；与 `quote_id` 互斥，两者都不给 → 400
     /// - **部分发送**：`quantity ∈ (0, 批次量)` 时先拆出子批次，只把子批次发出
-    /// - **守卫**：process 类别必须 `OUTSOURCE`；公司必须映射该工序
+    /// - **守卫**：process 类别必须 `OUTSOURCE`；公司必须映射该工序；
+    ///   **`requires_approval=true` 的工序不许 `direct=true`**（2026-10-03 review
+    ///   第 1 轮补：此前该规则只在读侧 SQL 生效，写侧无任何强制）；
+    ///   **`quote_id` 不接受 DIRECT 占位报价**（2026-10-03 review 第 2 轮补：
+    ///   占位报价同样是 `status='APPROVED'`，能绕开上面那条守卫）
     pub async fn send_to_outsource<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -288,7 +292,13 @@ impl BatchService {
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         ensure_transition(from, PartStatus::OUTSOURCE, "send-to-outsource")?;
-        // service 守：IN_PROCESS 时必须有 location=PRODUCTION_SHELF
+        // service 守：IN_PROCESS 时必须有 location=PRODUCTION_SHELF。
+        // 2026-10-03：本守卫此前**不可达** —— 状态机白名单里没有
+        // `IN_PROCESS → OUTSOURCE`（只有 `PENDING → OUTSOURCE`），`ensure_transition`
+        // 一定先把 IN_PROCESS 源拒掉。于是「可发送一览」的行（按写入不变式
+        // `PENDING ⇔ 出池`，几乎全是 IN_PROCESS 源）发一单就被 20103 拒，
+        // 端到端实测下外协发送 100% 不可用。状态机补边后本守卫才真正承担
+        // IN_PROCESS 源的 location 不变式（与 recall-to-pending / to-inspection 同分工）。
         if from == PartStatus::IN_PROCESS && batch.location.as_deref() != Some("PRODUCTION_SHELF") {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,
@@ -298,8 +308,8 @@ impl BatchService {
         // 2026-10-03：部分发送数量解析（缺省 / 等于批次量 = 整批）
         let partial_qty =
             resolve_partial_quantity(req.quantity, batch.quantity, "send-to-outsource")?;
-        // 2026-09-16 PR-3：part 进入生产流前必须已绑定工艺链
-        let chain_id = require_process_chain(repo.conn_mut(), part_id).await?;
+        // 2026-10-03：工序链改为可选（无链的旧零件也能发外协，见 guard.rs）
+        let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
         // 校验 outsource 公司存在 + 启用
         let company_row: Option<(bool,)> = sqlx::query_as(
             "SELECT is_active FROM t_outsource_company WHERE id = $1 AND deleted_at IS NULL",
@@ -345,6 +355,32 @@ impl BatchService {
                 ),
             ));
         }
+        // 2026-10-03 review 第 1 轮：写侧补「需审批的工序不许直发」守卫。
+        //
+        // 守卫的必要性：`requires_approval` 此前**只在读侧生效**（`GET
+        // /outsource-sendable` 与 `/outsource-pool` 的判定 SQL 会把「需审批但无审批
+        // 报价」的批次藏起来），写侧零校验 ⇒ 绕过 UI 直接调本端点传 `direct=true`
+        // 就能对「先审批再发」这道业务规则下该走报价的工序直发，系统里没有任何一处
+        // 强制。两侧同时守才闭环：读侧决定「看不看得见」，写侧决定「发不发得成」。
+        //
+        // 放在 category 校验之后：那里已经用同一个 `process_get_category` 确认了
+        // 工序存在（`BIZ_PROCESS_NOT_FOUND` 先行），这里「不存在」的情形不可能出现，
+        // 用 `unwrap_or(true)` 取**保守默认**（宁可拒，不放行）而不是 `unwrap()`。
+        let requires_approval = {
+            let mut orepo = &mut *repo.conn_mut();
+            orepo.process_get_requires_approval(req.process_id).await?
+        }
+        .unwrap_or(true);
+        if direct && requires_approval {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!(
+                    "send-to-outsource: 外协工序 {} requires_approval=true，该工序需要 \
+                     报价审批，请先走审批（传 quote_id）再发货，不能 direct 直发",
+                    req.process_id
+                ),
+            ));
+        }
         // 2026-10-03 新增守卫：公司必须**活跃映射**该工序
         // （`t_outsource_company_process` 存在未软删行）。与「公司有没有这项能力」
         // 是两件事：`t_outsource_company.is_active` 只说公司在册。
@@ -363,19 +399,10 @@ impl BatchService {
                 ),
             ));
         }
-        // PR-3：解析 step_id（chain 内 process_id → step_id）写入 OUTSOURCE 批次
-        let step_id =
-            ProcessChainRepo::resolve_step_id_by_process(repo.conn_mut(), chain_id, req.process_id)
-                .await?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                        format!(
-                            "chain {} 内找不到 process_id={} 的活跃 step",
-                            chain_id, req.process_id
-                        ),
-                    )
-                })?;
+        // PR-3：解析 step_id（chain 内 process_id → step_id）写入 OUTSOURCE 批次。
+        // 2026-10-03：无链 → 落 NULL（显示用定位信息，非必填）；有链但链内没有该
+        // 工序 → 20702 拒收。
+        let step_id = optional_step_id(repo.conn_mut(), chain_id, req.process_id).await?;
         // 价来源解析：DIRECT 自动取（复用 / 建占位），APPROVAL 用调用方给的
         // quote_id。两条路径汇合到同一段 APPROVED 校验 + 写 SENT 事件。
         let quote_id: i64 = match (direct, req.quote_id) {
@@ -400,16 +427,17 @@ impl BatchService {
                 ));
             }
         };
-        let quote_row: Option<(String, rust_decimal::Decimal, i64, i64, i64)> = sqlx::query_as(
-            "SELECT status, price, part_id, outsource_company_id, process_id \
-             FROM t_outsource_quote \
-             WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(quote_id)
-        .fetch_optional(repo.conn_mut())
-        .await?;
-        let (status, price, q_part_id, q_company_id, q_process_id) =
-            quote_row.ok_or_else(|| {
+        let quote_row: Option<(String, rust_decimal::Decimal, i64, i64, i64, bool)> =
+            sqlx::query_as(
+                "SELECT status, price, part_id, outsource_company_id, process_id, is_direct \
+                 FROM t_outsource_quote \
+                 WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(quote_id)
+            .fetch_optional(repo.conn_mut())
+            .await?;
+        let (status, price, q_part_id, q_company_id, q_process_id, q_is_direct) = quote_row
+            .ok_or_else(|| {
                 AppError::biz(
                     code::BIZ_OUTSOURCE_QUOTE_NOT_FOUND,
                     format!("quote {quote_id} 不存在"),
@@ -428,6 +456,43 @@ impl BatchService {
             return Err(AppError::biz(
                 code::BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION,
                 format!("quote {quote_id} 与 send_to_outsource 参数不一致（part/company/process）"),
+            ));
+        }
+        // 2026-10-03 review 第 2 轮：APPROVAL（`quote_id`）路径拒 `is_direct=true`。
+        //
+        // 不变式：「需审批的工序只能凭真审批价发货」有两条入口，两条都要守 ——
+        // `direct=true` 由上面那道 `requires_approval` 守卫拦，`quote_id` 由本守卫
+        // 拦。只守状态与三元组不够：占位报价是 `resolve_direct_quote_id` 自动建的
+        // `price=0 / status='APPROVED' / is_direct=true` 行，恰好满足 APPROVAL 分支的
+        // 既有校验条件（`status='APPROVED'` + (part, company, process) 三元组一致），
+        // 不看 `is_direct` 就与真审批报价无法区分。
+        //
+        // 占位报价在库里已经存在（守卫上线前建的，或建完之后该工序的
+        // `requires_approval` 由 false 被 `PATCH /prod/processes/{id}` 翻成 true），
+        // 所以这道守卫必须落在端点里，不能靠清数据。
+        //
+        // 判据用 `!direct` 而不是「凡 `is_direct=true` 就拒」：DIRECT 路径的
+        // `find_approved_quote_id` 复用占位报价是**既有正确行为**（免审批直发本就
+        // 没有审批价），而该路径在需审批工序上已被上面那道守卫整体拦掉，不会走到
+        // 这里。两条路径的价来源判定必须分开。
+        //
+        // 错误码取 `BIZ_OUTSOURCE_QUOTE_NOT_APPROVED`（与紧邻的 status 守卫同码）：
+        // 两者都是「这不是可用的审批价来源」，只是原因不同（没批 / 是占位价）；
+        // 21302 留给「与请求参数不匹配」那条。
+        //
+        // 2026-10-03 review 第 3 轮：本守卫**排在三元组校验之后**。两条都在写之前、
+        // 互不依赖，同一请求可同时命中（「quote 属于别的 (part, company, process)」+
+        // 「该 quote 是占位价」）；先判三元组时归因才准 —— 21302 的文案直指参数
+        // 不一致，是调用方唯一改得动的那一条，若让 21307 先接手，请求方会去查报价
+        // 状态，而真正要改的是 quote_id 本身。
+        if !direct && q_is_direct {
+            return Err(AppError::biz(
+                code::BIZ_OUTSOURCE_QUOTE_NOT_APPROVED,
+                format!(
+                    "quote {quote_id} 是免审批直发的占位价（is_direct=true、price=0），\
+                     不能作为审批价来源；请改传该 (part, company, process) 经审批的报价；\
+                     若该工序 requires_approval=false，请改用 direct=true"
+                ),
             ));
         }
         // ---- 2026-10-03 部分发送：拆出子批次，只把子批次流转出去 ----
@@ -481,7 +546,8 @@ impl BatchService {
             "OUTSOURCE",
             Some("OUTSOURCE_COMPANY"),
             Some(req.outsource_company_id),
-            Some(step_id),
+            // 2026-10-03：无链时为 None ⇒ status_gate 的 clear 分支写 NULL
+            step_id,
             // 2026-09-30：记录批次所属工序（外协加工的就是这道工序），
             // 收回时按 next_process_id 重新入池即可
             Some(req.process_id),
@@ -557,8 +623,8 @@ impl BatchService {
     ///
     /// Phase 2（2026-09-13）扩展：同事务把批次开口 shipment 标 RECEIVED + 写 RECEIVED 事件。
     ///
-    /// 2026-09-16 PR-3 批次 step 化：chain 必须性守卫 + req.next_process_id
-    /// 解析为 step_id 写入 current_process_step_id。
+    /// 2026-09-16 PR-3 批次 step 化：req.next_process_id 解析为 step_id 写入
+    /// current_process_step_id（2026-10-03 起链本身可选，见 guard.rs）。
     ///
     /// 2026-10-03：入参从 `PlaceOnShelfRequest` 换成 `ReceiveFromOutsourceRequest`（多
     /// `quantity`），并支持**部分接收**：拆批后只回收子批次，源批次保留余量、继续持有
@@ -595,26 +661,12 @@ impl BatchService {
         // 2026-10-03：部分接收数量解析（缺省 / 等于批次量 = 整批）
         let partial_qty =
             resolve_partial_quantity(req.quantity, batch.quantity, "receive-from-outsource")?;
-        // PR-3：part 必须已绑定工艺链
-        let chain_id = require_process_chain(repo.conn_mut(), part_id).await?;
+        // 2026-10-03：工序链可选（无链的旧零件也能收回，见 guard.rs）
+        let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
         validate_shelf_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION").await?;
         assert_shelf_maps_process(repo.conn_mut(), req.shelf_id, req.next_process_id).await?;
-        // PR-3：解析 step_id
-        let step_id = ProcessChainRepo::resolve_step_id_by_process(
-            repo.conn_mut(),
-            chain_id,
-            req.next_process_id,
-        )
-        .await?
-        .ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
-                format!(
-                    "chain {} 内找不到 process_id={} 的活跃 step",
-                    chain_id, req.next_process_id
-                ),
-            )
-        })?;
+        // PR-3：解析 step_id（无链 → NULL；有链但链内无该工序 → 20702）
+        let step_id = optional_step_id(repo.conn_mut(), chain_id, req.next_process_id).await?;
         // ---- 2026-10-03 部分接收：拆出子批次，只回收子批次 ----
         //
         // 新子批次继承源批次的 `OUTSOURCE` 状态与 `OUTSOURCE_COMPANY` holder
@@ -665,7 +717,8 @@ impl BatchService {
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
-            Some(step_id),
+            // 2026-10-03：无链时为 None ⇒ status_gate 的 clear 分支写 NULL
+            step_id,
             // 2026-09-30：进池 → current_process_id 写目标工序
             Some(req.next_process_id),
             current.id,

@@ -1,12 +1,13 @@
 //! `GET /outsource-quotes/quotable-parts` 集成测试（2026-10-03 新增）
 //!
-//! 覆盖：
-//! - happy path：货架绑了 OUTSOURCE 工序 + 批次在架上 → 出现
-//! - 货架**没绑** OUTSOURCE 工序 → 不出现
-//! - 该 OUTSOURCE 工序**不在**零件工艺链内 → 不出现（关键回归：少了这条筛选，
-//!   `send-to-outsource` 的 `resolve_step_id_by_process` 会 404）
-//! - 同一 (part, process) 有 2 个活跃批次 → **只出一行**（`DISTINCT ON`）
-//! - `next_process_id` / `next_process_name` 确实返回（前端靠它自动填报价工序）
+//! 覆盖（行粒度 = 一零件一行，2026-10-03 由「零件 × OUTSOURCE 工序」简化而来）：
+//! - happy path：零件有 PENDING 批次 → 出现
+//! - 只有 IN_PROCESS 批次 → **不出现**（报价是给还没下发的零件准备的）
+//! - 零件**没有**工艺链 → 仍然出现（picker 不看工艺链）
+//! - 同一零件 2 个 PENDING 批次 → **只出一行**（`DISTINCT ON`）
+//! - 未上架（无 holder）的 PENDING 批次 → 出现（该端点不再输出货架字段）
+//! - 已软删零件 / 软删批次 → 不出现
+//! - keyword + 分页
 //! - 路由不被 `/{id}` 吞掉（未带 `/{id}` 路径也能通；响应是分页信封不是 400）
 
 use axum::http::StatusCode;
@@ -69,96 +70,15 @@ async fn insert_part(pool: &PgPool, customer_id: i64, tag: &str) -> i64 {
     id
 }
 
-async fn seed_outsource_process(pool: &PgPool, code: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
-    let now = now_naive();
-    sqlx::query(
-        "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
-         version, created_at, updated_at) \
-         VALUES ($1, $2, $3, 'OUTSOURCE', 0, true, 0, $4, $4)",
-    )
-    .bind(id)
-    .bind(code)
-    .bind(format!("PROC-{code}"))
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert t_process");
-    id
-}
-
-async fn insert_shelf(pool: &PgPool, code: &str) -> i64 {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
-    let now = now_naive();
-    sqlx::query(
-        "INSERT INTO t_shelf (id, code, name, zone, is_active, version, created_at, updated_at) \
-         VALUES ($1, $2, $3, 'PRODUCTION', true, 0, $4, $4)",
-    )
-    .bind(id)
-    .bind(code)
-    .bind(format!("shelf-{code}"))
-    .bind(now)
-    .execute(pool)
-    .await
-    .expect("insert t_shelf");
-    id
-}
-
-async fn link_shelf_process(pool: &PgPool, shelf_id: i64, process_id: i64) {
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
-    sqlx::query(
-        "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, created_at, updated_at) \
-         VALUES ($1, $2, $3, 0, 0, now(), now())",
-    )
-    .bind(id)
-    .bind(shelf_id)
-    .bind(process_id)
-    .execute(pool)
-    .await
-    .expect("insert t_shelf_process");
-}
-
-/// 建链 + 绑 part + 加 step（OUTSOURCE 工序必须出现在链内）。
-async fn create_chain_with_step(pool: &PgPool, part_id: i64, process_id: i64) -> i64 {
-    let chain_id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
-    sqlx::query(
-        "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, 0, now(), 0, now(), 0)",
-    )
-    .bind(chain_id)
-    .bind(format!("chain-{part_id}"))
-    .execute(pool)
-    .await
-    .expect("insert chain");
-    sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
-        .bind(chain_id)
-        .bind(part_id)
-        .execute(pool)
-        .await
-        .expect("bind part to chain");
-    let step_id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
-    sqlx::query(
-        "INSERT INTO t_process_chain_step (id, chain_id, sort_order, process_id, estimated_minutes, \
-         version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, 1, $3, 30, 0, now(), 0, now(), 0)",
-    )
-    .bind(step_id)
-    .bind(chain_id)
-    .bind(process_id)
-    .execute(pool)
-    .await
-    .expect("insert step");
-    chain_id
-}
-
-/// 批次挂在货架上（`current_holder_id` = shelf_id）。
-async fn insert_batch_on_shelf(
+/// 直插一个批次。`holder` 可为 `None`（未上架的常态），`status` 由用例指定
+/// （picker 只认 `PENDING`）。
+async fn insert_batch(
     pool: &PgPool,
     part_id: i64,
     batch_no: i32,
-    shelf_id: i64,
     status: &str,
     location: Option<&str>,
+    holder: Option<i64>,
 ) -> i64 {
     let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
     sqlx::query(
@@ -171,7 +91,7 @@ async fn insert_batch_on_shelf(
     .bind(batch_no)
     .bind(status)
     .bind(location)
-    .bind(shelf_id)
+    .bind(holder)
     .execute(pool)
     .await
     .expect("insert t_part_batch");
@@ -200,70 +120,48 @@ async fn get_quotable(
 // ===========================================================================
 
 #[tokio::test]
-async fn quotable_happy_path_returns_next_process_and_shelf() {
+async fn quotable_happy_path_returns_part_fields() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_l1_customer(&pool, "QtCo", "B").await;
     let pid = insert_part(&pool, cid, "HAPPY").await;
-    let proc_id = seed_outsource_process(&pool, "QTHP").await;
-    let shelf_id = insert_shelf(&pool, "C2A").await;
-    link_shelf_process(&pool, shelf_id, proc_id).await;
-    create_chain_with_step(&pool, pid, proc_id).await;
-    insert_batch_on_shelf(
-        &pool,
-        pid,
-        1,
-        shelf_id,
-        "IN_PROCESS",
-        Some("PRODUCTION_SHELF"),
-    )
-    .await;
+    insert_batch(&pool, pid, 1, "PENDING", None, None).await;
 
     let (s, env) = get_quotable(&app, &token, "").await;
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(env["data"]["total"], 1, "{env}");
     let row = &env["data"]["items"][0];
     assert_eq!(row["id"], pid.to_string(), "{env}");
-    // ★ next_process_id 是显式字段（前端靠它自动填报价工序，不做临时 cast）
-    assert_eq!(row["next_process_id"], proc_id.to_string(), "{env}");
-    assert_eq!(row["next_process_name"], "PROC-QTHP", "{env}");
-    assert_eq!(row["shelf_id"], shelf_id.to_string(), "{env}");
-    assert_eq!(row["shelf_code"], "C2A", "{env}");
     assert_eq!(row["unit_price"], "33.00", "{env}");
     // 客户路径：本例 customer 是根 L1（无 parent）→ 只给自身名
     assert_eq!(row["customer_path"], "QtCo", "{env}");
     assert_eq!(row["l1_customer_name"], serde_json::Value::Null, "{env}");
+    // 2026-10-03：行粒度收成「一零件一行」，货架 / 工序四字段已从契约里删除
+    for gone in [
+        "shelf_id",
+        "shelf_code",
+        "next_process_id",
+        "next_process_name",
+    ] {
+        assert!(
+            row.get(gone).is_none(),
+            "字段 {gone} 应已从 QuotablePartOut 移除: {row}"
+        );
+    }
 }
 
+/// picker 只给「还没下发」的零件报价：只有 IN_PROCESS 批次的不出现。
 #[tokio::test]
-async fn quotable_shelf_without_outsource_process_excluded() {
+async fn quotable_excludes_part_without_pending_batch() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let cid = insert_l1_customer(&pool, "QtNoProc", "D").await;
-    let pid = insert_part(&pool, cid, "NOPROC").await;
-    // 另一台货架只绑了「非外协」工序 → 不应命中
-    let other_proc = {
-        let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
-        let now = now_naive();
-        sqlx::query(
-            "INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, \
-             version, created_at, updated_at) VALUES ($1, 'INH-QT', 'INH', 'INHOUSE', 0, false, 0, $2, $2)",
-        )
-        .bind(id)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .expect("insert INHOUSE process");
-        id
-    };
-    let shelf_id = insert_shelf(&pool, "C2B").await;
-    link_shelf_process(&pool, shelf_id, other_proc).await;
-    create_chain_with_step(&pool, pid, other_proc).await;
-    insert_batch_on_shelf(
+    let cid = insert_l1_customer(&pool, "QtInProc", "D").await;
+    let pid = insert_part(&pool, cid, "INPROC").await;
+    insert_batch(
         &pool,
         pid,
         1,
-        shelf_id,
         "IN_PROCESS",
         Some("PRODUCTION_SHELF"),
+        Some(9_000_000_000_000_001_001),
     )
     .await;
 
@@ -271,103 +169,113 @@ async fn quotable_shelf_without_outsource_process_excluded() {
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(
         env["data"]["total"], 0,
-        "货架未绑 OUTSOURCE 工序必须不出现: {env}"
+        "已下发（在产）的零件不属于报价 picker: {env}"
     );
 }
 
+/// 2026-10-03：picker 不看工艺链 —— 零件完全没有 `process_chain_id` 也照常出现。
+///
+/// 旧谓词要求「候选外协工序在零件工艺链内」，而生产库里绝大多数零件没有链，
+/// 叠加「按货架枚举外协工序」后 picker 长期恒空。
 #[tokio::test]
-async fn quotable_process_not_in_part_chain_excluded() {
-    // ★ 关键回归：货架绑了 OUTSOURCE 工序，但该工序不在零件工艺链内 → 必须不出现
-    // （少了这条筛选，后续 send-to-outsource 的 resolve_step_id_by_process 会 404）
+async fn quotable_includes_part_without_process_chain() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_l1_customer(&pool, "QtNoChain", "E").await;
     let pid = insert_part(&pool, cid, "NOCHAIN").await;
-    let chain_proc = seed_outsource_process(&pool, "QTC-IN").await;
-    let shelf_proc = seed_outsource_process(&pool, "QTC-OUT").await;
-    let shelf_id = insert_shelf(&pool, "C2C").await;
-    // 货架只绑 shelf_proc；工艺链里只有 chain_proc
-    link_shelf_process(&pool, shelf_id, shelf_proc).await;
-    create_chain_with_step(&pool, pid, chain_proc).await;
-    insert_batch_on_shelf(
-        &pool,
-        pid,
-        1,
-        shelf_id,
-        "IN_PROCESS",
-        Some("PRODUCTION_SHELF"),
-    )
-    .await;
+    // 前提断言：part 确实没有链
+    let chain: Option<i64> =
+        sqlx::query_scalar("SELECT process_chain_id FROM t_part WHERE id = $1")
+            .bind(pid)
+            .fetch_one(&pool)
+            .await
+            .expect("read process_chain_id");
+    assert!(chain.is_none(), "本用例前提是 part 无工艺链");
+    insert_batch(&pool, pid, 1, "PENDING", None, None).await;
 
     let (s, env) = get_quotable(&app, &token, "").await;
     assert_eq!(s, StatusCode::OK, "{env}");
-    assert_eq!(
-        env["data"]["total"], 0,
-        "OUTSOURCE 工序不在零件工艺链内必须不出现: {env}"
-    );
+    assert_eq!(env["data"]["total"], 1, "无链零件也必须进 picker: {env}");
+    assert_eq!(env["data"]["items"][0]["id"], pid.to_string(), "{env}");
 }
 
+/// 同一零件多个 PENDING 批次 → 只出一行（`DISTINCT ON (p.id)`）。
 #[tokio::test]
-async fn quotable_dedups_multiple_batches_same_part_process() {
+async fn quotable_dedups_multiple_pending_batches_same_part() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let cid = insert_l1_customer(&pool, "QtDup", "G").await;
     let pid = insert_part(&pool, cid, "DUP").await;
-    let proc_id = seed_outsource_process(&pool, "QTDUP").await;
-    let shelf_id = insert_shelf(&pool, "C2D").await;
-    link_shelf_process(&pool, shelf_id, proc_id).await;
-    create_chain_with_step(&pool, pid, proc_id).await;
-    // 同一 (part, process) 两个活跃批次
-    insert_batch_on_shelf(&pool, pid, 1, shelf_id, "PENDING", None).await;
-    insert_batch_on_shelf(&pool, pid, 2, shelf_id, "PENDING", None).await;
+    insert_batch(&pool, pid, 1, "PENDING", None, None).await;
+    insert_batch(&pool, pid, 2, "PENDING", None, None).await;
 
     let (s, env) = get_quotable(&app, &token, "").await;
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(
         env["data"]["total"], 1,
-        "同一 (part, process) 多批次只出一行: {env}"
+        "同一零件多个 PENDING 批次只出一行: {env}"
     );
     assert_eq!(env["data"]["items"].as_array().unwrap().len(), 1, "{env}");
 }
 
+/// `PENDING` + `IN_PROCESS` 混合：只要有一个 PENDING 批次就出行。
 #[tokio::test]
-async fn quotable_pending_batch_without_holder_excluded() {
-    // PENDING 且没上架（current_holder_id IS NULL）→ 命中不了货架工序 → 不出现
+async fn quotable_includes_part_with_pending_and_in_process_batches() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let cid = insert_l1_customer(&pool, "QtNoShelf", "H").await;
-    let pid = insert_part(&pool, cid, "NOSHELF").await;
-    let proc_id = seed_outsource_process(&pool, "QTNOS").await;
-    let shelf_id = insert_shelf(&pool, "C2E").await;
-    link_shelf_process(&pool, shelf_id, proc_id).await;
-    create_chain_with_step(&pool, pid, proc_id).await;
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 1).next_id();
-    sqlx::query(
-        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, created_at, updated_at) \
-         VALUES ($1, $2, 1, 5, 'PENDING', 0, now(), now())",
+    let cid = insert_l1_customer(&pool, "QtMix", "H").await;
+    let pid = insert_part(&pool, cid, "MIXED").await;
+    insert_batch(
+        &pool,
+        pid,
+        1,
+        "IN_PROCESS",
+        Some("PRODUCTION_SHELF"),
+        Some(9_000_000_000_000_001_002),
     )
-    .bind(id)
-    .bind(pid)
-    .execute(&pool)
-    .await
-    .expect("insert t_part_batch");
+    .await;
+    insert_batch(&pool, pid, 2, "PENDING", None, None).await;
+
+    let (s, env) = get_quotable(&app, &token, "").await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["total"], 1, "{env}");
+    assert_eq!(env["data"]["items"][0]["id"], pid.to_string(), "{env}");
+}
+
+/// 软删边界：软删零件 / 软删 PENDING 批次都不出行。
+#[tokio::test]
+async fn quotable_excludes_soft_deleted_part_and_batch() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let cid = insert_l1_customer(&pool, "QtSoft", "I").await;
+
+    let p_soft = insert_part(&pool, cid, "SOFTP").await;
+    insert_batch(&pool, p_soft, 1, "PENDING", None, None).await;
+    sqlx::query("UPDATE t_part SET deleted_at = now() WHERE id = $1")
+        .bind(p_soft)
+        .execute(&pool)
+        .await
+        .expect("soft delete part");
+
+    let p_bsoft = insert_part(&pool, cid, "SOFTB").await;
+    let b = insert_batch(&pool, p_bsoft, 1, "PENDING", None, None).await;
+    sqlx::query("UPDATE t_part_batch SET deleted_at = now() WHERE id = $1")
+        .bind(b)
+        .execute(&pool)
+        .await
+        .expect("soft delete batch");
 
     let (s, env) = get_quotable(&app, &token, "").await;
     assert_eq!(s, StatusCode::OK, "{env}");
     assert_eq!(
         env["data"]["total"], 0,
-        "未上架的 PENDING 批次不应出现: {env}"
+        "软删零件 / 软删批次都不应出现: {env}"
     );
 }
 
 #[tokio::test]
 async fn quotable_keyword_filter_and_pagination() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
-    let cid = insert_l1_customer(&pool, "QtKw", "I").await;
-    let proc_id = seed_outsource_process(&pool, "QTKW").await;
-    let shelf_id = insert_shelf(&pool, "C2F").await;
-    link_shelf_process(&pool, shelf_id, proc_id).await;
+    let cid = insert_l1_customer(&pool, "QtKw", "J").await;
     for tag in ["KWA", "KWB"] {
         let pid = insert_part(&pool, cid, tag).await;
-        create_chain_with_step(&pool, pid, proc_id).await;
-        insert_batch_on_shelf(&pool, pid, 1, shelf_id, "PENDING", None).await;
+        insert_batch(&pool, pid, 1, "PENDING", None, None).await;
     }
 
     let (s, env) = get_quotable(&app, &token, "?keyword=KWA").await;

@@ -15,7 +15,7 @@
 |---|---|---|---|
 | GET | `/api/v2/outsource-quotes` | Manager / Clerk / Inspector / CncProgrammer | 列表（part / company / status 过滤 + 分页） |
 | POST | `/api/v2/outsource-quotes` | Manager / Clerk | 新建 DRAFT 报价 |
-| GET | `/api/v2/outsource-quotes/quotable-parts` | Manager / Clerk | **报价 picker**：可建报价的 (零件 × OUTSOURCE 工序) 组合（2026-10-03 新增） |
+| GET | `/api/v2/outsource-quotes/quotable-parts` | Manager / Clerk | **报价 picker**：还没下发的零件（**一行 = 一个零件**，2026-10-03 新增） |
 | GET | `/api/v2/outsource-quotes/{id}` | Manager / Clerk / Inspector / CncProgrammer | 报价详情 |
 | POST | `/api/v2/outsource-quotes/{id}/update` | Manager / Clerk | DRAFT 部分更新（OCC） |
 | POST | `/api/v2/outsource-quotes/{id}/submit` | Manager / Clerk | DRAFT → SUBMITTED |
@@ -33,7 +33,11 @@
 
 - **报价表** `t_outsource_quote`：`id` / `part_id` / `outsource_company_id` / `process_id` / `price` (numeric) / `status` / `quantity`? / `is_direct` / `is_billed` / `version` / 审计字段 + 软删。
 - **状态机**：`DRAFT → SUBMITTED → APPROVED | REJECTED`（单向前进，不可回退；详见 `src/modules/outsource/statemachine.rs::can_transition_to`）。
-- **唯一约束**：同 `(part_id, outsource_company_id, process_id)` 仅一个活跃报价（DB partial unique 兜底 → 21303 DUPLICATE）。
+- **唯一约束**：同 `(part_id, outsource_company_id, process_id)` 仅一个活跃报价（DB partial unique 兜底 → 21303 DUPLICATE）。实际是**两条谓词互斥的 partial unique**（2026-10-03 核对）：
+  - `uq_t_outsource_quote_approved_part_process (part_id, process_id) WHERE deleted_at IS NULL AND status='APPROVED' AND is_direct=false` —— **审批报价**：每 (零件, 工序) 至多一条；
+  - `uq_t_outsource_quote_direct_part_company_process (part_id, outsource_company_id, process_id) WHERE deleted_at IS NULL AND status='APPROVED' AND is_direct=true`（migration 008）—— **DIRECT 占位报价**：每 (零件, 公司, 工序) 至多一条。
+
+  `is_direct = true` 的是 `prod::batch::send-to-outsource` 直发路径自动建的 **0 元占位报价**（`price=0` / `note` 写明 DIRECT 来源），**不是被人审批过的报价**。读侧的可发送闸门与写侧的 `requires_approval` 守卫（见 [`./outsource-sendable.md`](./outsource-sendable.md)）都以 `is_direct = false` 定义「真实审批报价」；漏掉这一维就会让 0 元占位报价冒充审批价发货。
 
 ---
 
@@ -44,7 +48,7 @@
 | 21301 | BIZ_OUTSOURCE_QUOTE_NOT_FOUND | 404 | 报价不存在 / 已软删 |
 | 21302 | BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION | 400 | 当前状态不允许此操作（如 SUBMITTED 调 update） |
 | 21303 | BIZ_OUTSOURCE_QUOTE_DUPLICATE | 409 | 同 `(part, company, process)` 已存在活跃报价 |
-| 21307 | BIZ_OUTSOURCE_QUOTE_NOT_APPROVED | 404 | 找不到 `(part, company, process)` 的 APPROVED 报价 |
+| 21307 | BIZ_OUTSOURCE_QUOTE_NOT_APPROVED | 400 | 报价非 `APPROVED`、或 `is_direct=true` 的 DIRECT 占位报价（`send-to-outsource` 拒收）、或 DIRECT 占位价并发回查失败 |
 
 > 21304–21306 预留（业务未触发的中间状态码）。
 
@@ -152,15 +156,11 @@
 | `customer_name` | string? | L2（零件直属客户） |
 | `l1_customer_name` | string? | L1（`t_customer.parent_id`） |
 | `customer_path` | string? | 有 L1 拼 `L1 / L2`，仅 L2 时给 L2 名，无客户 `null` |
-| `shelf_id` | string (i64) | 批次所在货架 |
-| `shelf_code` | string | |
-| `next_process_id` | string (i64) | **该 OUTSOURCE 工序**。前端「新建报价」靠它自动填 `process_id` |
-| `next_process_name` | string | |
 
-> ⚠️ `next_process_id` 是**显式字段**，不是临时 cast。part 域通用列表
-> `PartListItem` **刻意不声明**它（2026-09-27 决策：part list 响应不暴露派生工序），
-> 前端此前只能靠一个 `rawPart as { next_process_id?: string }` 的临时 cast 读。
-> 本 VO 的存在就是为了消掉那个 hack。
+> **2026-10-03 简化**：原 VO 还带 `shelf_id` / `shelf_code` / `next_process_id` /
+> `next_process_name` 四个字段（行粒度是「零件 × OUTSOURCE 工序」，靠「货架绑了哪些
+> 外协工序」枚举）。行粒度收成「一零件一行」后这 4 个字段一并删除：报价工序由用户在
+> 建报价时从 `category = 'OUTSOURCE'` 的工序列表里选，那个下拉本来就独立存在。
 
 ### QuotablePartListOut 字段
 
@@ -177,26 +177,29 @@
 
 ### `quotable-parts` 的行粒度与筛选
 
-**行 = 一个 (part_id, process_id) 组合，同一组合只出一行**（不按批次出多行）。
-SQL 用 `DISTINCT ON (p.id, pr.id)` 去重，内层 `ORDER BY … pb.batch_no ASC` 选
-batch_no 最小的批次做代表行；外层再按展示序（`is_urgent DESC,
-planned_delivery_date ASC NULLS LAST, id ASC, next_process_id ASC`）排序。
+**行 = 一个零件**（只要它有 PENDING 批次），同一零件无论几个批次都只出一行。
+SQL 用 `DISTINCT ON (p.id)` 去重（内层 `ORDER BY p.id, pb.batch_no ASC` 取 batch_no
+最小的批次做代表行；外层按展示序 `is_urgent DESC, planned_delivery_date ASC NULLS LAST,
+id ASC` 排序）。`total` 的口径与 list 的 WHERE + `DISTINCT ON` 逐条一致。
 
-4 层筛选（缺一不可）：
+筛选（2026-10-03 起 2 条）：
 
-1. **活跃批次**：`pb.deleted_at IS NULL` 且（`pb.status = 'PENDING'` 或
-   （`pb.status = 'IN_PROCESS' AND pb.location = 'PRODUCTION_SHELF'`)）。
-2. **货架绑了该 OUTSOURCE 工序**：`t_shelf_process`（`sp.shelf_id = pb.current_holder_id`，
-   `deleted_at IS NULL`）JOIN `t_process`（`deleted_at IS NULL AND category = 'OUTSOURCE'`）。
-3. **该 OUTSOURCE 工序在这台零件的活跃工艺链里**：`p.process_chain_id` →
-   `t_process_chain_step`（`deleted_at IS NULL`）里有 `process_id = pr.id`。
-   **少了这条会给出零件工艺链上根本不存在的工序**，后续
-   `POST /prod/batches/{batch_id}/send-to-outsource` 的
-   `resolve_step_id_by_process` 会 404。这是必须加的，不是可选优化
-   （回归测试：`tests/outsource/quotable.rs::quotable_process_not_in_part_chain_excluded`）。
-4. `t_part.deleted_at IS NULL`。
+1. **`t_part.deleted_at IS NULL`**。
+2. **存在 PENDING 批次**：`t_part_batch`（`pb.part_id = p.id AND pb.deleted_at IS NULL
+   AND pb.status = 'PENDING'`）。业务口径是「报价是给**还没下发**的零件提前锁价」，
+   所以已下发（在产 / 在外协）的零件不出现。
 
-`total` 的口径与 list 的 WHERE + `DISTINCT ON` 逐条一致。
+**不再参与筛选的三项**（2026-10-03 全部移除）：
+
+- **货架 ↔ 工序映射**（`t_shelf_process` ⋈ `t_process`）：它要求批次已上架并绑定
+  外协工序，而 picker 的目标恰恰是**还没下发**的零件。
+- **工艺链求交**（`t_process_chain_step`）：`PENDING` 批次的
+  `current_process_id` / `current_holder_id` 实测全为 NULL，且生产库里绝大多数零件
+  没有 `process_chain_id`；叠加这条筛选后 picker 长期恒空。
+- **`t_process.requires_approval`**：提前锁价与该工序是否需要审批无关。
+
+> **与 `/outsource-sendable` 不再同源**：sendable 的判据是「批次停在某道外协工序上」，
+> 两者谓词不同，不共享 SQL 常量，也不再要求口径一致。
 
 ### Lifecycle 守卫
 
@@ -221,7 +224,7 @@ planned_delivery_date ASC NULLS LAST, id ASC, next_process_id ASC`）排序。
 ### 防 N+1
 
 - `list_quotes` 单 SQL JOIN `t_outsource_company` + `t_process` 一次拿齐 company_name / process_name。
-- `list_quotable_parts` **一条 SQL** 一次拿齐 part / 客户(L2+L1) / 货架 / 工序展示字段，
+- `list_quotable_parts` **一条 SQL** 一次拿齐 part / 客户(L2+L1) 展示字段，
   `total` 走第二条同口径 `COUNT(*)`；service 层不循环查询。
 
 ---
@@ -242,4 +245,22 @@ planned_delivery_date ASC NULLS LAST, id ASC, next_process_id ASC`）排序。
 ## 集成测试
 
 - `tests/outsource/quote.rs`（9+ 用例：create DRAFT / 唯一性 21303 / update DRAFT happy / update SUBMITTED 21302 / submit / approve MANAGER-only / reject review_note 必填 / soft-delete 仅 DRAFT/REJECTED / **list keyword 零命中返 0 行**（带「无 keyword 返全量」对照组））
-- `tests/outsource/quotable.rs`（7 用例：happy path（含 `next_process_id`）/ 货架未绑 OUTSOURCE 工序 / **工序不在工艺链内** / 多批次去重 / 未上架 PENDING 排除 / keyword+分页 / 路由不被 `/{id}` 吞掉）
+- `tests/outsource/quotable.rs`（8 用例：happy path（含 4 个已删字段的缺席断言）/ 无 PENDING 批次排除 / **无工艺链也出现** / 多 PENDING 批次去重 / PENDING+IN_PROCESS 混合 / 软删零件与软删批次排除 / keyword+分页 / 路由不被 `/{id}` 吞掉）
+
+---
+
+## 前端配套改动清单
+
+> 口径与部署顺序同
+> [`./outsource-sendable.md#前端配套改动清单`](./outsource-sendable.md#前端配套改动清单)
+> （第 2 批 5 项硬切 + 「后端与前端必须同批上线」）。本域落在第 2 批的是这两项：
+
+| # | 后端契约变更 | 前端必须同步改的点 | 漏改症状 |
+|---|---|---|---|
+| 1 | `GET /quotable-parts` 行粒度收成「一零件一行」，出参**删 4 个字段**：`shelf_id` / `shelf_code` / `next_process_id` / `next_process_name` | `QuotablePartOut` 类型 + Zod schema 去掉这 4 个字段（**必填声明也要一起去掉**，否则后端不返回时 `parse` 抛错）+ 表格去掉「货架 / 工序」两列 | 旧 schema 把已删字段声明为必填 ⇒ `parse` 抛错，报价一览页的 picker 整块白屏 |
+| 2 | 报价生效判定改按 `is_direct = false`（0 元 DIRECT 占位报价不再满足审批闸门） | 无需改代码：DIRECT 行的 `send_mode` 由后端给出，前端不再自行按「有无 APPROVED 报价」推断模式 | 若前端仍自行推断，会对「只有占位报价」的场景误判成「已审批」 |
+
+> 第 2 批其余 3 项（`next_process_*` → `current_process_*` 更名、`shelf_code` 可空、
+> `send_mode` 语义 + 写侧 `requires_approval` 守卫）都在
+> [`./outsource-sendable.md`](./outsource-sendable.md) 一侧，清单与部署顺序以该文件为
+> 准，本节不重复。

@@ -218,13 +218,30 @@ pub(crate) async fn assert_shelf_maps_process(
 ///     `current_process_step_id` 不再清，而展示用的 `next_process_id` 正是由它
 ///     经 `t_process_chain_step` JOIN 派生 → 出池批次显示上一道工序。
 ///
-///   依赖该约定的 5 个调用点（改任何一处都要连带复核这 5 处）：
-///   `shelf::recall_to_pending`、`outsource::receive_from_outsource_to_inspection`、
-///   `scan::scan_inspect`、`repair::complete_repair`、
-///   `repair::repair_dispatch`。
-///   其余 5 个调用点（共 **10** 个调用点，place_on_shelf / release_from_programming /
-///   send_to_outsource / receive_from_outsource / work_type pick-up）4 列全传
-///   `Some(..)`，走不到 clear 分支。
+/// ## step 列的 10 个调用点里，**10 个都可能传 `None`**（2026-10-03 review 第 2 轮订正）
+/// 逐点核对后的现状（改任一处 step 形参都要连带复核本表）：
+///
+/// | 调用点 | step 形参 | 何时为 `None` ⇒ 走 clear 分支 |
+/// |---|---|---|
+/// | `shelf::place_on_shelf` | `optional_step_id(..)` | 无链 |
+/// | `programming::release_from_programming` | `optional_step_id(..)` | 无链 |
+/// | `outsource::send_to_outsource` | `optional_step_id(..)` | 无链 |
+/// | `outsource::receive_from_outsource` | `optional_step_id(..)` | 无链 |
+/// | `repair::complete_repair` | `step_id_opt` | 无链（PRODUCTION 分支）/ 恒 `None`（INSPECTION 分支） |
+/// | `repair::repair_dispatch` | `step_id_opt` | 无链（PRODUCTION 分支）/ 恒 `None`（INSPECTION 分支） |
+/// | `shelf::recall_to_pending` | 字面 `None` | 恒 `None` |
+/// | `outsource::receive_from_outsource_to_inspection` | 字面 `None` | 恒 `None` |
+/// | `scan::scan_inspect`（第一步） | 字面 `None` | 恒 `None` |
+/// | `pickup`（work_type pick-up） | `batch.current_process_step_id`（读回） | 批次行该列本来就是 NULL（无链零件）⇒ 传 `None`，与 clear 等价（目标列已 NULL，无副作用） |
+///
+/// 即 **6 处生产流端点的 step 列在「无链」时为 `None` 而走 clear 分支**（这 6 处是
+/// 2026-10-03 起工序链从「必须」放宽为 `optional_process_chain` / `optional_step_id`
+/// 的直接后果，链可选项化后「无链」从 20706 拒收变成放行 + 落
+/// NULL），另 3 处恒传 `None`（纯出池路径），只有 work_type pick-up 是把**读回值**
+/// 原样传下去 —— 有链时保持定位信息不丢，无链时恰好等价于清 NULL。
+///
+/// 改任何一处的 step 形参，都要连带复核上表：把该传 `Some(..)` 的地方改成 `None`
+/// 会静默清掉定位信息，把该传 `None` 的地方改成 `Some(..)` 会留下陈旧 step。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn mark_batch_with_status_and_meta(
     conn: &mut PgConnection,
@@ -252,11 +269,11 @@ pub(crate) async fn mark_batch_with_status_and_meta(
             // `mark_batch_repairing`（start-repair，只置标记不改 status）与
             // `mark_batch_status_only`（scan-inspect FAIL，形参
             // `is_repairing = Some(true)`），二者都**不走**本漏斗的返修分支；
-            // 本漏斗的 8 个调用点（place_on_shelf / recall_to_pending /
+            // 本漏斗的 10 个调用点（place_on_shelf / recall_to_pending /
             // release_from_programming / outsource 收发 ×3 / complete_repair /
-            // repair_dispatch / scan-inspect 第一步）全部表示「批次回到了正常
-            // 生产流 / 送检 / 完成返修」，此刻必须清标记，否则返修态永远挂着。
-            // 其中 `complete_repair` 与 `repair_dispatch` 正是最关键的两个
+            // repair_dispatch / scan-inspect 第一步 / work_type pick-up）全部表示
+            // 「批次回到了正常生产流 / 送检 / 完成返修」，此刻必须清标记，否则返修态
+            // 永远挂着。其中 `complete_repair` 与 `repair_dispatch` 正是最关键的两个
             // 清除点（前者=返修完成，后者=一步式起修并直接到位）。
             is_repairing: Some(false),
             expected_version: Some(expected_version),
@@ -372,40 +389,202 @@ pub(crate) fn status_guard_for_target(target: &str) -> &'static [&'static str] {
     }
 }
 
-/// 2026-09-16 PR-3 批次 step 化：part 进入生产流（place_on_shelf /
-/// release_from_programming / send_to_outsource）前必须已制定工艺链。
-///
-/// 守卫：
-/// - `process_chain_id IS NULL` → `BIZ_PROCESS_CHAIN_REQUIRED` 409 「请先制定工序链」
-/// - chain 已软删（防御）→ 同样 `BIZ_PROCESS_CHAIN_REQUIRED`
-///
-/// 返回：chain_id（已校验非空）。caller 继续用 `process_id` 经
-/// `ProcessChainRepo::resolve_step_id_by_process` 解析为 step_id。
-pub(crate) async fn require_process_chain(
+/// 读 part 的 `process_chain_id`（part 不存在 / 已软删 → `BIZ_PART_NOT_FOUND`）。
+#[inline]
+async fn read_part_chain_id(
     conn: &mut PgConnection,
     part_id: i64,
-) -> Result<i64, AppError> {
+) -> Result<Option<i64>, AppError> {
     let row: Option<(Option<i64>,)> =
         sqlx::query_as("SELECT process_chain_id FROM t_part WHERE id = $1 AND deleted_at IS NULL")
             .bind(part_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let chain_id_opt = row
+    Ok(row
         .ok_or_else(|| AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在")))?
-        .0;
-    chain_id_opt.ok_or_else(|| {
-        AppError::biz(
-            code::BIZ_PROCESS_CHAIN_REQUIRED,
-            "请先制定工序链（part 未绑定 process_chain）",
-        )
-    })
+        .0)
 }
+
+/// 2026-10-03 新增：工序链**可选**版守卫（`optional_process_chain` 的 part 侧）。
+///
+/// ## 为什么要放松
+/// 生产库里绝大多数零件没有 `t_part.process_chain_id`（`worker_pool` 的候选池 SQL 早在
+/// 2026-09-30 就因为「INNER JOIN t_process_chain_step 导致批次隐身」改成按
+/// `t_part_batch.current_process_id` 普通过滤）。若进生产流仍强制「先有链」，
+/// 读侧（候选池 / 外协可发送列表）能列出来的批次，写侧却发不出去 —— 读侧口径才是
+/// 仓库的既定权威依据。
+///
+/// ## 三种返回
+/// - part 不存在 / 已软删 → `20101 BIZ_PART_NOT_FOUND`
+/// - `process_chain_id IS NULL` → `Ok(None)`，caller 放行、`current_process_step_id` 落 NULL
+/// - 已绑链 → `Ok(Some(chain_id))`
+///
+/// **链行自身已软删的情形本函数不判**：读的就是 `t_part.process_chain_id` 一个列，
+/// 链软删后该列仍是旧 id，caller 的 step 解析在链内找不到活跃 step 时才以
+/// `20702` 拒收（见 [`optional_step_id`]）。
+///
+/// 恢复「必须有链」（`20706 BIZ_PROCESS_CHAIN_REQUIRED`）的严格变体时，在本函数
+/// 之上加一层 `ok_or_else` 即可，读链逻辑不必重新发明。
+pub(crate) async fn optional_process_chain(
+    conn: &mut PgConnection,
+    part_id: i64,
+) -> Result<Option<i64>, AppError> {
+    read_part_chain_id(conn, part_id).await
+}
+
+/// 2026-10-03 新增：工序链**可选**版守卫（step 侧），与 [`optional_process_chain`] 配对使用。
+///
+/// ## 两种返回必须分清
+/// - `chain_id = None`（压根没链）→ `Ok(None)`，**放行**。写 NULL 的先例见
+///   `dispatch` 路径（`worker-scan` RETURNED 不写 step 是既有行为），
+///   `current_process_step_id` 早已被官方降级为「可选的显示用定位信息」
+///   （写入不变式见本文件 [`mark_batch_with_status_and_meta`]）。
+/// - `chain_id = Some(_)` 但链内找不到该 process 的活跃 step → `20702
+///   BIZ_PROCESS_CHAIN_STEP_NOT_FOUND`，**继续拒**。这是真数据错误：链是有的，
+///   却没把正在加工的工序登记进链内（例如链在批次发出之后才被改写）。跟着
+///   「没链就放行」一起吞掉的话，批次会带着一个链内不存在的工序静默入池，
+///   之后每一步的 step 定位全部漂移，且没有任何报错可查。
+pub(crate) async fn optional_step_id(
+    conn: &mut PgConnection,
+    chain_id: Option<i64>,
+    process_id: i64,
+) -> Result<Option<i64>, AppError> {
+    let Some(chain_id) = chain_id else {
+        return Ok(None);
+    };
+    let step_id =
+        crate::modules::prod::process_chain::repo::ProcessChainRepo::resolve_step_id_by_process(
+            conn, chain_id, process_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND,
+                format!("chain {chain_id} 内找不到 process_id={process_id} 的活跃 step"),
+            )
+        })?;
+    Ok(Some(step_id))
+}
+
 // ===== unit tests for state-machine helpers =====
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::clock::now_naive;
+    use crate::infra::snowflake::SnowflakeIdGenerator;
     use crate::modules::part::statemachine::PartStatus;
+    use hsh_erp_test_support::test_pool;
+
+    /// 2026-10-03 新增：写一个 `t_part` 行（`process_chain_id` 留空由调用方决定）。
+    ///
+    /// `t_part.customer_id` 是 NOT NULL，故先造一个根 L1 客户（无 parent）。
+    async fn insert_part(pool: &sqlx::PgPool, name: &str) -> i64 {
+        let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 9);
+        let now = now_naive();
+        let customer_id = snowflake.next_id();
+        sqlx::query(
+            "INSERT INTO t_customer (id, name, version, created_at, updated_at) \
+             VALUES ($1, $2, 0, $3, $3)",
+        )
+        .bind(customer_id)
+        .bind(format!("Co-{name}"))
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_customer");
+        let id = snowflake.next_id();
+        sqlx::query(
+            "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, unit_price, \
+             total_price, request_date, planned_delivery_date, customer_id, status, version, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, 'Tester', 1, 1.00, 1.00, CURRENT_DATE, CURRENT_DATE, $4, \
+                     'PENDING', 0, $5, $5)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(format!("DWG-{name}"))
+        .bind(customer_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert t_part");
+        id
+    }
+
+    /// 2026-10-03 新增：`optional_process_chain` 的三条分支。
+    #[tokio::test]
+    async fn optional_process_chain_none_when_part_has_no_chain() {
+        let pool = test_pool().await;
+        let conn = &mut *pool.acquire().await.expect("acquire");
+        let part_id = insert_part(&pool, "OPCH-NONE").await;
+        assert_eq!(optional_process_chain(conn, part_id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn optional_process_chain_some_when_part_bound_to_chain() {
+        let pool = test_pool().await;
+        let conn = &mut *pool.acquire().await.expect("acquire");
+        let part_id = insert_part(&pool, "OPCH-SOME").await;
+        // 换 instance 取 id：同毫秒内重复 `SnowflakeIdGenerator::new(..)` 会撞 pkey
+        let chain_id = SnowflakeIdGenerator::new(1_577_836_800_000, 11).next_id();
+        sqlx::query(
+            "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+             updated_at, updated_by) VALUES ($1, 'chain-opch', 0, now(), 0, now(), 0)",
+        )
+        .bind(chain_id)
+        .execute(&pool)
+        .await
+        .expect("insert t_part_process_chain");
+        sqlx::query("UPDATE t_part SET process_chain_id = $1 WHERE id = $2")
+            .bind(chain_id)
+            .bind(part_id)
+            .execute(&pool)
+            .await
+            .expect("bind part to chain");
+        assert_eq!(
+            optional_process_chain(conn, part_id).await.unwrap(),
+            Some(chain_id)
+        );
+    }
+
+    /// part 不存在 ⇒ 仍 `20101 BIZ_PART_NOT_FOUND`（放松的是「有没有链」，不是
+    /// 「part 存不存在」）。
+    #[tokio::test]
+    async fn optional_process_chain_missing_part_is_part_not_found() {
+        let pool = test_pool().await;
+        let conn = &mut *pool.acquire().await.expect("acquire");
+        let err = optional_process_chain(conn, 9_000_000_000_000_009_999)
+            .await
+            .expect_err("不存在的 part 必须拒");
+        assert_eq!(err.code(), code::BIZ_PART_NOT_FOUND);
+    }
+
+    /// 2026-10-03 新增：`optional_step_id` 的两条分支。
+    #[tokio::test]
+    async fn optional_step_id_none_without_chain_but_rejects_unlisted_process() {
+        let pool = test_pool().await;
+        let conn = &mut *pool.acquire().await.expect("acquire");
+        let part_id = insert_part(&pool, "OPST").await;
+        let chain_id = SnowflakeIdGenerator::new(1_577_836_800_000, 11).next_id();
+        sqlx::query(
+            "INSERT INTO t_part_process_chain (id, name, version, created_at, created_by, \
+             updated_at, updated_by) VALUES ($1, 'chain-opst', 0, now(), 0, now(), 0)",
+        )
+        .bind(chain_id)
+        .execute(&pool)
+        .await
+        .expect("insert t_part_process_chain");
+
+        // ① 无链 → 放行（NULL）
+        assert_eq!(optional_step_id(conn, None, 4_242).await.unwrap(), None);
+        // ② 有链但链内没有该 process → 20702，不放行
+        let err = optional_step_id(conn, Some(chain_id), 4_242)
+            .await
+            .expect_err("链内没有该工序必须拒");
+        assert_eq!(err.code(), code::BIZ_PROCESS_CHAIN_STEP_NOT_FOUND);
+        let _ = part_id;
+    }
 
     #[test]
     fn ensure_transition_allows_known() {
@@ -415,6 +594,9 @@ mod tests {
         ensure_transition(PartStatus::PROGRAMMING, PartStatus::PENDING, "test").unwrap();
         ensure_transition(PartStatus::PROGRAMMING, PartStatus::IN_PROCESS, "test").unwrap();
         ensure_transition(PartStatus::OUTSOURCE, PartStatus::IN_PROCESS, "test").unwrap();
+        // 2026-10-03：send-to-outsource 的两个源状态
+        ensure_transition(PartStatus::PENDING, PartStatus::OUTSOURCE, "test").unwrap();
+        ensure_transition(PartStatus::IN_PROCESS, PartStatus::OUTSOURCE, "test").unwrap();
     }
 
     #[test]
