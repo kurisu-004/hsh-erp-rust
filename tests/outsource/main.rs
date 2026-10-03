@@ -11,10 +11,13 @@
 //! - shipment.rs   — 2026-10-03 新增：对账页 sent-parts + 在途 in-flight
 //! - quotable.rs   — 2026-10-03 新增：报价 picker
 //! - sendable.rs   — 2026-10-03 新增：可发送外协一览（APPROVAL / DIRECT）
+//! - pool.rs       — 2026-10-03 新增：`/outsource-pool/*` 看板三件套
+//!   （counts / {process_id} / state；形态照抄 `/prod/pool`）
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
 mod company;
+mod pool;
 mod quotable;
 mod quote;
 mod send_receive;

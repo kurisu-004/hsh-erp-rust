@@ -9,7 +9,10 @@
 > 关联域：[`./outsource-companies.md`](./outsource-companies.md) /
 > [`./outsource-quotes.md`](./outsource-quotes.md) /
 > [`./outsource-sendable.md`](./outsource-sendable.md)（可发外协一览，独立顶层前缀
-> `GET /api/v2/outsource-sendable`）
+> `GET /api/v2/outsource-sendable`）/
+> [`./outsource-pool.md`](./outsource-pool.md)（外协看板，2026-10-03 新增 ——
+> `GET /api/v2/outsource-pool/state` 的 `quantity` 与本域 in-flight **同口径**
+> （取 `t_part_batch.quantity` 当前余量，不取 `shipment.quantity`））
 > **shipment 的写入方不是本域**：`send-to-outsource` / `receive-from-outsource` 在
 > prod 域批次侧（见 [`./production/batches.md#外协流转send--receive`](./production/batches.md#外协流转send--receive)），
 > 本域只读 + 对账改。

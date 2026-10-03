@@ -19,6 +19,7 @@
 > - [`./outsource-quotes.md`](./outsource-quotes.md) — 外协报价（**9 端点**，2026-09-13 Phase 2 + 2026-10-03 补 `quotable-parts` picker）
 > - [`./outsource-shipments.md`](./outsource-shipments.md) — 外协发货对账（**2 端点**，2026-09-13 Phase 2 的 reconcile-update + 2026-10-03 补 `GET /in-flight` 在途一览）
 > - [`./outsource-sendable.md`](./outsource-sendable.md) — 可发送外协一览（**1 端点**，**2026-10-03 新增**；独立顶层前缀 `/api/v2/outsource-sendable`，取代形状不匹配的 `/parts/outsource-sendable`）
+> - [`./outsource-pool.md`](./outsource-pool.md) — 外协看板（**3 只读端点**，**2026-10-03 新增**；独立顶层前缀 `/api/v2/outsource-pool`，按外协工序切 tab，形态照抄 `/api/v2/prod/pool/*`）
 > - [`./delivery-notes/index.md`](./delivery-notes/index.md) — delivery_notes 域（已拆为子目录：[queries](./delivery-notes/queries.md) / [drafts](./delivery-notes/drafts.md) / [workflow](./delivery-notes/workflow.md) / [print](./delivery-notes/print.md)）
 > - [`./delivery-groups.md`](./delivery-groups.md) — delivery_groups 域
 > - [`./_e2e.md`](./_e2e.md) — e2e seed hook（11 端点；dev/test 默认启用，release profile 硬关，2026-09-14）
@@ -216,6 +217,7 @@ HTTP 状态码：
 | outsource-quotes | [`./outsource-quotes.md`](./outsource-quotes.md) | 9 | ✅ 完全上线（2026-09-14，Phase 2；2026-10-03 补 `GET /quotable-parts`） |
 | outsource-shipments | [`./outsource-shipments.md`](./outsource-shipments.md) | 2 | ✅ 完全上线（2026-09-14，Phase 2 的 reconcile-update；2026-10-03 补 `GET /in-flight` 在途一览 —— 取代 part 域旧 `/parts/outsource-in-flight`，**硬切无 alias**；旧路径实际返回 **400 而非 404**，成因与取舍同 outsource-sendable 行） |
 | outsource-sendable | [`./outsource-sendable.md`](./outsource-sendable.md) | 1 | ✅ 完全上线（2026-10-03；取代 `/parts/outsource-sendable`，**硬切无 alias**。旧路径实际返回 **400 而非 404**：part 域 `GET /{part_id}` 的 `Path<i64>` catch-all 兜住任何未注册的 1 段静态路径（matchit 静态段优先、参数段兜底），再由 `Path` extractor 拒绝非数字段 → axum `ErrorKind::ParseError` → 400。取舍：400 无法区分「端点被删」与「端点从不存在」，比 404 不泄露「此路径曾存在」，故不改跨域路由语义。成因与逐条清单见 [`./inconsistencies.md`](./inconsistencies.md) § 9.2） |
+| outsource-pool（外协看板） | [`./outsource-pool.md`](./outsource-pool.md) | 3 | ✅ 完全上线（2026-10-03；独立顶层前缀 `/api/v2/outsource-pool`，3 个**只读**端点 `counts` / `{process_id}` / `state`，形态刻意照抄 `/api/v2/prod/pool/*` 让前端复用同一套 queryKey / 失效编排。既有 `/outsource-sendable` 与 `/outsource-shipments/in-flight` 都**不接受 `process_id` 且分页**，无法支撑按工序切 tab，故另起前缀而非扩它们。候选侧与 `/outsource-sendable` 共享同一份核心 SQL（`repo/sql.rs::SENDABLE_INNER_X_SQL`）；写入侧 `send-to-outsource` / `receive-from-outsource` 仍在 `prod::batch` 域） |
 | delivery-notes | [`./delivery-notes/index.md`](./delivery-notes/index.md) | 18 | ✅ 完全上线（P1–P4，按功能拆为子目录） |
 | delivery-groups | [`./delivery-groups.md`](./delivery-groups.md) | 4 | ✅ 完全上线（P1） |
 | _e2e | [`./_e2e.md`](./_e2e.md) | 11 | ✅ 完全上线（2026-09-14，e2e seed hook，dev/test profile） |

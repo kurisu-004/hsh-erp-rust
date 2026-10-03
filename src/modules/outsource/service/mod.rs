@@ -7,6 +7,8 @@
 //!   reject / soft-delete）+ `quotable-parts` picker
 //! - `shipment` — 对账单更新（reconcile-update）+ 对账页 sent-parts + 在途 in-flight
 //! - `sendable` — `GET /outsource-sendable`（可发送外协一览，APPROVAL / DIRECT 双模式）
+//! - `pool`     — `GET /outsource-pool/*`（按外协工序切 tab 的看板三件套，
+//!   形态照抄 `prod::pool`）
 //!
 //! 对外 API（`handler.rs` 调用面）保持原方法名（`OutsourceService::xxx`），handler 通过
 //! `crate::modules::outsource::service::OutsourceService` 引用。
@@ -40,6 +42,7 @@ use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::shared::error::{AppError, code};
 
 mod company;
+mod pool;
 mod quote;
 mod sendable;
 mod shipment;

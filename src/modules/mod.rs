@@ -118,6 +118,10 @@ pub fn v2_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .nest("/outsource-shipments", outsource::shipment_router())
         // 2026-10-03 新增：可发送外协一览（独立顶层前缀；非任何单一域的子资源）
         .nest("/outsource-sendable", outsource::sendable_router())
+        // 2026-10-03 新增：外协看板三件套（按外协工序切 tab；形态照抄 /prod/pool，
+        // 前端可复用同一套 queryKey / 失效编排）。既有 /outsource-sendable 与
+        // /outsource-shipments/in-flight 都不接受 process_id 且分页，无法支撑切 tab。
+        .nest("/outsource-pool", outsource::pool_router())
         .nest("/delivery-notes", delivery_note::router())
         .nest("/delivery-groups", p1_router())
         .nest("/statistics", statistics::router())
