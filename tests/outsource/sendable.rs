@@ -912,18 +912,31 @@ async fn sendable_customer_id_l2_exact_match_and_keyword() {
 
 /// `customer_id` 传 **L1** 时命中其全部 L2 子客户的行（2026-10-04 新语义的核心断言）。
 ///
-/// 零件恒挂在 L2 客户上，只判等值时选中 L1 必然 total 0 —— 这正是「可发送列表没有
-/// 任何批次」的根因。谓词形状：`= $2` 或 `IN (parent_id = $2)`。
+/// 起因是实测到的分布：零件挂的都是 L2（叶子）客户，而前端点选的常常是 L1 ⇒ 只判等值
+/// 时选中 L1 必然 total 0，这正是「可发送列表没有任何批次」的根因。谓词形状：`= $2` 或
+/// `IN (parent_id = $2)`。
 ///
-/// 「展开一层即完整」依赖客户树严格两层，故这里同时建一条 L3（挂在 L2 下）来钉住
-/// 前提：将来若把谓词改成递归 CTE，本用例的期望值（不含 L3 那行）需要相应调整。
+/// **「展开一层即完整」是数据观察，不是被强制的结构不变式**（2026-10-04 review 第 1 轮
+/// 订正措辞）。依据是当日生产库实测：客户 14 个（3 L1 + 11 L2）、L3 数量 0、全库 1874
+/// 个零件全部挂在 L2 上、直接挂 L1 的零件数为 0。但 API 层**不强制**该结构 ——
+/// `com/customer/service/crud.rs::create_customer` 只按 `parent_id.is_some()` 校验
+/// `serial_prefix` 三态，**不校验 `parent_id` 是否指向根客户**（连存在性都不查，表上无
+/// 物理外键）；`update_customer` 禁改 `parent_id` ⇒ create 是唯一能造出 L3 的入口。
+///
+/// 日后一旦出现 L3，谓词需改成递归 CTE（`WITH RECURSIVE`），且该退化**是静默的**：只
+/// 表现为 `total` 偏小 / 少报，不报任何错，零命中守卫也不触发。
+///
+/// ⚠️ **本用例守的不是「数据里不会出现 L3」**：它造的 L3 是自己直接 SQL 插进去的（绕开
+/// API），断言该行不命中 ⇒ 它钉住的是「只展开一层」这个实现选择，有人把谓词改成递归
+/// CTE 时会立刻红；数据里真出现 L3 时它不会红。
 #[tokio::test]
 async fn sendable_customer_id_l1_expands_to_children() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;
     let l1 = insert_customer(&pool, "RootSub", "L").await;
     let l2_a = insert_child_customer(&pool, "SubA", "M", l1).await;
     let l2_b = insert_child_customer(&pool, "SubB", "N", l1).await;
-    // L3（挂在 L2 之下）：客户树实测恒无 L3，这里造一条只用于钉住「只展开一层」
+    // L3（挂在 L2 之下）：2026-10-04 生产库实测 L3 数量为 0（但 API 层不强制，见本
+    // 用例 doc），这里造一条只用于钉住「只展开一层」
     let l3 = insert_child_customer(&pool, "SubC", "S", l2_b).await;
     let proc_id = seed_outsource_process(&pool, "SDLT", false).await;
     let shelf_id = insert_shelf(&pool, "SY1").await;
