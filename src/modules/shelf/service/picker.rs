@@ -101,12 +101,12 @@ impl super::crud::ShelfService {
     /// `GET /shelves/for-inspection`：仅 `zone='INSPECTION' AND is_active=true`。
     /// 不过滤 SHELF_ACCOUNT scope（品检架通常由全员可见）。
     ///
-    /// 2026-10-04：改调 `list_active_inspection_with_load`（原调
-    /// `list_with_filters(None, Some(ZONE_INSPECTION), Some(true), MAX_LIMIT, 0)`，
-    /// 取的是裸 `TShelf`、**无聚合**）—— 出参因此缺 `current_load`，前端品检架卡片
-    /// 无守卫地渲染「在架 N 件」⇒ 每张卡片显示「在架 **undefined** 件」。补在**后端**，
-    /// 聚合口径与 `list_for_return` 逐字一致（同 status 列表、同 `SUM(quantity)`、
-    /// 同 `deleted_at IS NULL`），两个 picker 对同一个架不会给出不同的数。
+    /// 出参必带 `current_load`，数据源是 `ShelfRepo::list_active_inspection_with_load`
+    /// 的聚合结果（**不可**退回裸 `TShelf` 列表查询）：前端品检架卡片无 `v-if`
+    /// 守卫地渲染「在架 N 件」，缺字段则每张卡片显示「在架 **undefined** 件」。聚合
+    /// 放在**后端**而非前端加守卫，口径与 `list_for_return` 逐字一致（同 status
+    /// 列表、同 `SUM(quantity)`、同 `deleted_at IS NULL`），两个 picker 对同一个架
+    /// 不会给出不同的数。
     ///
     /// 本端点**不**标 `is_recommended`：品检架没有「最空优先」的选架语义，
     /// 也没有消费方（for-return 独有）。

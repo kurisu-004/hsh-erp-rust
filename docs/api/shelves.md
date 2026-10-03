@@ -195,7 +195,7 @@ Response 200 `data`：`ShelfForInspectionOut`
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `items[]` | `ShelfForInspectionItem` | `id` / `code` / `name` / `zone` / `location` / `is_active` / `current_load` |
-| `items[].current_load` | i64 | **2026-10-04 新增**：前端品检架卡片按「在架 N 件」渲染且**无 `v-if` 守卫**，本字段是其唯一数据源（缺字段则卡片显示「在架 **undefined** 件」），故在后端补齐而非前端加守卫。口径与 [`for-return`](#get-apiv2shelvesfor-returnnext_process_id) 的 `current_load` **逐字一致**（同 status 列表 `('PENDING','IN_PROCESS','INSPECTION','OUTSOURCE')`、同 `SUM(quantity)`、同 `deleted_at IS NULL`）—— 两个 picker 对同一个架必须给出同一个数 |
+| `items[].current_load` | i64 | **2026-10-04**：前端品检架卡片按「在架 N 件」渲染且**无 `v-if` 守卫**，本字段是其唯一数据源（缺字段则卡片显示「在架 **undefined** 件」），故在后端补齐而非前端加守卫。口径与 [`for-return`](#get-apiv2shelvesfor-returnnext_process_id) 的 `current_load` **逐字一致**（同 status 列表 `('PENDING','IN_PROCESS','INSPECTION','OUTSOURCE')`、同 `SUM(quantity)`、同 `deleted_at IS NULL`）—— 两个 picker 对同一个架必须给出同一个数 |
 
 业务规则：
 

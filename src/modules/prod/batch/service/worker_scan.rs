@@ -153,12 +153,11 @@ impl BatchService {
                     .map_err(|_| AppError::validation("next_process_id 非法"))?;
                 // shelf ↔ process 映射校验。
                 //
-                // 2026-10-04 改调 `ShelfProcessRepo::exists_for_shelf_process`：
-                // 原先是本文件内联的 `SELECT EXISTS(…)`，漏了 `deleted_at IS NULL`，
-                // 与该方法（2026-10-02 SQL 收口时已统一加守卫）**语义不等价** ——
-                // 已软删的货架↔工序映射仍能放行 RETURNED，使 20507
-                // `BIZ_SHELF_PROCESS_NOT_MAPPED` 的触发条件在两条路径上分叉。改调共享
-                // 方法后两条路径同源，不会再各自漂移。
+                // 必须走 `ShelfProcessRepo::exists_for_shelf_process`，**不要**在本文件
+                // 内联 `SELECT EXISTS(…)`：共享方法带 `deleted_at IS NULL` 守卫，内联
+                // 写法一旦漏掉，已软删的货架↔工序映射就会放行 RETURNED，使 20507
+                // `BIZ_SHELF_PROCESS_NOT_MAPPED` 的触发条件与 worker-pool `move_batch`
+                // 那条路径分叉。走共享方法后两条路径同源，不会再各自漂移。
                 let maps = ShelfProcessRepo::exists_for_shelf_process(
                     repo.conn_mut(),
                     req.shelf_id,
@@ -176,17 +175,18 @@ impl BatchService {
                 // batch.current_process_step_id（否则 part 持有件从 worker 归还到货架后
                 // 丢失 step 上下文）—— 此时保留旧 step_id 值。
                 //
-                // ⚠️ 2026-10-04 修：`O` 从 `i64` 改为 `Option<i64>`（外层 `Option` 由
-                // `fetch_optional` 表示「有没有行」，**不是**列的类型；列的可空性要
-                // 自己收在 `O` 里，末尾 `.flatten()` 把两层压成一层）。
+                // ⚠️ `O` 必须是 `Option<i64>`（外层 `Option` 由 `fetch_optional` 表示
+                // 「有没有行」，**不是**列的类型；列的可空性要自己收在 `O` 里，末尾
+                // `.flatten()` 把两层压成一层）。
                 // `t_part.process_chain_id` 是可空列：baseline migration 001 建表时
                 // `process_chain_id bigint` **无 NOT NULL**，列 COMMENT 明写
                 // 「NULL = 未制定工艺链」；本查询的目标列即 `column 0`，为 NULL 时按
                 // `i64` 解码触发 sqlx
                 // `error occurred while decoding column 0: unexpected null; try decoding as an Option`
                 // 整笔 500。**真会触发**：手工工单（无工艺链）是常态，工人归还这类件
-                // 必现 —— 也正因为 NULL 在下方 `if let` 之前就抛了，else 分支此前从未
-                // 执行过。回归见 `tests/production/worker_pool.rs::worker_scan_returned_without_process_chain_succeeds`。
+                // 必现；且 NULL 在下方 `if let` **之前**就抛，所以 `O` 若不收
+                // `Option`，下面的 else 分支（保留批次旧 step）对手写工单恒不可达。
+                // 回归见 `tests/production/worker_pool.rs::worker_scan_returned_without_process_chain_succeeds`。
                 // 同款反模式（`Option<i64>` 包当前 `NOT NULL` 的列，列一旦变可空就同样
                 // 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`
                 // 与 `prod/worker_pool/repo/mod.rs::process_chain_step_get_process_id`。

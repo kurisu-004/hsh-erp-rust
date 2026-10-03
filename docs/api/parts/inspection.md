@@ -365,7 +365,7 @@ Request：`WorkerScanRequest`
 >
 > **本端点豁免 `version`**：`worker-scan` 是「扫序列号 + 扫胸牌」的纯扫码流，前端手上没有批次 `version`（强加会要求工人先查一次批次）。该端点语义即「以 DB 当前状态为准」，仅保留 service 内部 OCC（事务内自读自写），不做 caller 侧 OCC。因此 `batch_id` 在这里仍是可选的，保留「按持有关系唯一匹配」推断。详见 [乐观锁](#乐观锁caller-侧-occ)。
 
-> **可空列注记（2026-10-04 新增）**：本端点路径（含经 part/batch repo 下游读到的列）会碰到的
+> **可空列注记（2026-10-04）**：本端点路径（含经 part/batch repo 下游读到的列）会碰到的
 > `t_part.serial_no` / `t_part.process_chain_id` / `t_part_batch.location` /
 > `t_part_batch.current_process_id` / `t_part_batch.current_process_step_id`
 > **全部是可空列**，出处分两处：`t_part.serial_no` / `t_part.process_chain_id` /
@@ -380,21 +380,22 @@ Request：`WorkerScanRequest`
 > `Option` **只表示「有没有行」，不表示列的类型**；列本身可空时 `O` 仍须是 `Option<T>`
 > （末尾补 `.flatten()` 把两层压成一层）。
 >
-> 本端点路径 2026-10-04 一次修掉 2 处：`process_chain_id` 的 `unexpected null` 500
-> （手写工单必现），以及内联 `t_shelf_process` 漏 `deleted_at IS NULL` 造成的 20507
-> 触发条件分叉。同款 `unexpected null` 反模式在相邻的扫码 / 工种只读端点上还出过
-> （`part/service/phase1/work_type.rs` 三个列表端点的 `serial_no`，2026-10-03 修）——
-> 下一个要动这段 SQL 的人请把本注记读完再动手。
+> 本端点路径上最容易踩的两个坑，动手改这段 SQL 前先对一遍：① `process_chain_id`
+> 必须按 `Option` 收（手写工单为 NULL，是必现形态）；② 20507 校验走
+> `ShelfProcessRepo::exists_for_shelf_process` 且带 `deleted_at IS NULL` 守卫，
+> 已软删的货架↔工序映射不放行。同类可空列还出现在相邻的工种只读端点组
+> （`part/service/phase1/work_type.rs` 三个列表端点的 `serial_no`），那边同样按
+> `Option` 收 —— 下单列表端点时把这套 `O` 选型一并照抄。
 
 业务流转：
 
 - **RETURNED**：worker 把 IN_PROCESS+WORKER 批次放回生产架
-  - `shelf_id` 必须映射 `next_process_id`（service 校验 `t_shelf_process`，含
-    `deleted_at IS NULL` 守卫 —— 已软删的货架↔工序映射不放行）→ 不匹配
-    `20507 BIZ_SHELF_PROCESS_NOT_MAPPED`。**2026-10-04 订正**：该校验原先是 worker-scan
-    内联的 `SELECT EXISTS(…)` 且漏了 `deleted_at IS NULL`，与 worker-pool `move_batch`
-    走的那条（`ShelfProcessRepo::exists_for_shelf_process`）语义不等价，使 20507 的
-    触发条件在两条路径上分叉；现已统一改调后者。
+  - `shelf_id` 必须映射 `next_process_id`（service 走
+    `ShelfProcessRepo::exists_for_shelf_process`，含 `deleted_at IS NULL` 守卫 ——
+    已软删的货架↔工序映射不放行）→ 不匹配 `20507 BIZ_SHELF_PROCESS_NOT_MAPPED`。
+    该校验与 worker-pool `move_batch` 是同一个方法，两条路径的 20507 触发条件同源；
+    **不要**在 worker-scan 里内联 `SELECT EXISTS(…)`（漏掉软删守卫会让已软删的映射
+    放行，触发条件再次分叉）。
   - `part_batch` 与 `part` 状态切回 IN_PROCESS+PRODUCTION_SHELF+holder=shelf（OCC）
   - **写 `current_process_id = next_process_id`** ——
     RETURNED 是全仓唯一的**工序推进**路径，批次归还货架后落进**下一道工序**的候选池。

@@ -4,10 +4,10 @@
 //! 能力的完整覆盖以函数名为准）：
 //!   1. worker_scan INSPECTED → 自动 refill
 //!   2. worker_scan RETURNED → 自动 refill；RETURNED 推进 `current_process_id`
-//!      （2026-09-30 review 第 1 轮 H1 回归：批次落进**下一道**工序池而非原池）；
+//!      （2026-09-30 回归：批次落进**下一道**工序池而非原池）；
 //!      另有 2d（2026-10-04 回归）：RETURNED 在 part **无工艺链**时也必须成功 ——
 //!      `t_part.process_chain_id` 可空，按 `i64` 解码会把整个 RETURNED 打成 500，
-//!      而原 fixture 无条件建链，正是该 bug 的免疫屏障
+//!      而 fixture 必须能造出「无链」形态，否则该 500 恒被免疫屏障挡住
 //!   3. refill_when_pool_empty_returns_empty
 //!   4. refill_caps_at_max_held_batches
 //!   5. concurrent_refill_no_double_pick       [`#[ignore]`：需 app-level 并发基建]
@@ -479,11 +479,11 @@ async fn insert_pool_part(
 /// `pool_snowflake().lock()` 第二次——`std::sync::Mutex` 非递归，
 /// 同线程二次 lock 会永久 hang（PR-3 step3 之前无此问题）。
 ///
-/// 2026-10-04 加 `with_chain`：原 helper **无条件**建 chain + step 并把
-/// `process_chain_id` 绑回 part，于是 `t_part.process_chain_id` 在全部 worker-scan
-/// 用例里恒非 NULL —— 这正是 `worker_scan.rs` 把该列按 `i64` 解码（而该列可空 ⇒
-/// `unexpected null` 把整个 RETURNED 打成 500）却让 CI 全绿的原因：无链工单这条
-/// 免疫屏障从未被测过。回归见 `worker_scan_returned_without_process_chain_succeeds`。
+/// 2026-10-04：fixture 必须支持「不绑链」形态。worker-scan 全部用例若都让 fixture
+/// 建链并把 `process_chain_id` 绑回 part，`t_part.process_chain_id` 在用例里就恒非
+/// NULL，而 `worker_scan.rs` 把该列按 `i64` 解码（该列可空 ⇒ `unexpected null` 会把
+/// 整个 RETURNED 打成 500）这件事就恒测不出来。手写工单（无工艺链，工单域常态）
+/// 这条主路径必须有覆盖。回归见 `worker_scan_returned_without_process_chain_succeeds`。
 async fn insert_worker_held_part(
     pool: &PgPool,
     customer_id: i64,
@@ -799,27 +799,24 @@ async fn worker_scan_returned_advances_current_process_id() {
 /// 场景 2d（2026-10-04 回归）: worker-scan RETURNED 在 part **无工艺链**时也必须成功。
 ///
 /// ## 这条测试补的是哪个洞
-/// `insert_worker_held_part` 原先**无条件**建 `t_part_process_chain` +
-/// `t_process_chain_step` 并把 `process_chain_id` 绑回 `t_part`，所以全部
-/// worker-scan 用例里该列恒非 NULL。而 `t_part.process_chain_id` 是可空列
-/// （baseline 列 COMMENT：「NULL = 未制定工艺链」），`worker_scan.rs` 却按 `i64`
-/// 解码它 —— 手写工单（无链，工单域的常态）归还时必撞
+/// `t_part.process_chain_id` 是可空列（baseline 列 COMMENT：「NULL = 未制定工艺链」），
+/// `worker_scan.rs` 必须按 `Option` 收它 —— 按 `i64` 解码会让工人归还手写工单（无链，
+/// 工单域的常态）时必撞
 /// `error occurred while decoding column 0: unexpected null; try decoding as an Option`
-/// 整笔 500。fixture 就是那个 bug 的免疫屏障，所以 CI 全绿、线上必现。
-///
-/// 现在 fixture 支持 `with_chain=false`（见其 doc），本测试走该分支。
+/// 整笔 500。本测试走 fixture 的 `with_chain=false` 分支（`t_part.process_chain_id`
+/// 保持 NULL）覆盖这条主路径。
 ///
 /// ## 断言
-/// 1. 前置：`t_part.process_chain_id IS NULL`（防 fixture 未来被改回有链而假绿）
+/// 1. 前置：`t_part.process_chain_id IS NULL`（防 fixture 未来被改成有链而假绿）
 /// 2. `POST /prod/batches/worker-scan`（RETURNED）→ HTTP 200 + `code=0`
 /// 3. `current_process_id` 推进到 `next_process_id`（RETURNED 的主状态变更）
 /// 4. `current_process_step_id` 保留原值（走 else 分支）
 ///
 /// ## 断言 4 的诚实边界
 /// `mark_batch_returned` 的 `current_process_step_id` 形参带 `_` 前缀、SQL 里
-/// **不写**该列（2026-09-30 review H1 的已知缺口，只影响显示），所以「保留原值」
+/// **不写**该列（2026-09-30 起的已知缺口，只影响显示），所以「保留原值」
 /// 无论 else 分支返回什么都成立 —— 它是**防回归的护栏**（挡住将来有人改成写 NULL），
-/// 不是 else 分支确实执行过的证明。真正的回归信号是断言 2：修之前这里是 500。
+/// 不是 else 分支确实执行过的证明。真正的回归信号是断言 2 的 HTTP 200。
 #[tokio::test]
 async fn worker_scan_returned_without_process_chain_succeeds() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
@@ -840,7 +837,7 @@ async fn worker_scan_returned_without_process_chain_succeeds() {
     let (_held_part, held_batch, old_step) =
         insert_worker_held_part(&pool, customer, "H-002D", worker, proc_b, 1, false).await;
 
-    // 前置守卫：fixture 若被改回「无条件建链」，本测试会变成假绿，先在这里 fail
+    // 前置守卫：fixture 的 `with_chain=false` 失效的话，本测试会变成假绿，先在这里 fail
     let chain_id: Option<i64> = sqlx::query_scalar(
         "SELECT p.process_chain_id FROM t_part p \
          JOIN t_part_batch b ON b.part_id = p.id WHERE b.id = $1",
@@ -871,7 +868,8 @@ async fn worker_scan_returned_without_process_chain_succeeds() {
         ),
     )
     .await;
-    // 修之前这里 500：`decoding column 0: unexpected null`（part 无工艺链）
+    // 这是本测试的核心断言：按 `i64` 解码 `process_chain_id` 时这里会 500
+    // （`decoding column 0: unexpected null`，part 无工艺链）
     assert_eq!(s, StatusCode::OK, "scan RETURNED（part 无工艺链）: {env}");
     assert_eq!(env["code"], 0);
     assert_eq!(env["data"]["scan"]["event_type"], "WORKER_SCAN_RETURNED");

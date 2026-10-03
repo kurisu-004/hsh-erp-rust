@@ -73,9 +73,9 @@ pub struct ShelfForReturnOut {
 /// for-inspection picker 出参：仅 `zone='INSPECTION' AND is_active=true`。
 ///
 /// 2026-09-22 PR4：迁移到 vo/。
-/// 2026-10-04：新增 `current_load` —— 本 VO 此前**没有**该字段，而前端品检架卡片
-/// 无 `v-if` 守卫地渲染「在架 N 件」⇒ 每张送检架卡片都显示「在架 **undefined** 件」。
-/// 补在后端而不是前端加守卫，聚合口径与 `ShelfForReturnItem::current_load` 逐字
+/// `current_load` 是**必出**字段：前端品检架卡片无 `v-if` 守卫地渲染「在架 N 件」，
+/// 本字段是其唯一数据源，缺字段则每张送检架卡片显示「在架 **undefined** 件」。
+/// 聚合在后端补齐而不是前端加守卫，口径与 `ShelfForReturnItem::current_load` 逐字
 /// 一致（同 status 列表、同 `SUM(quantity)`、同 `deleted_at IS NULL`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct ShelfForInspectionItem {

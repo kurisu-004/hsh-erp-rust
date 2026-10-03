@@ -9,8 +9,8 @@
 //!   不算数，子查询自己也得带，否则软删行的量会被永久计入）
 //! - 写查询带 `WHERE id = $1 AND version = $2` 乐观锁，返回 `rows_affected`，0 行由 service 转 409
 //! - `list_active_production_ordered` 通过 LEFT JOIN `t_part_batch` 聚合 current_load
-//! - 2026-10-04：`list_active_inspection_with_load` 是 11 方法里的新增项（picker
-//!   for-inspection 专供，与 for-return 聚合口径逐字一致；理由见各方法 doc）
+//! - `list_active_inspection_with_load` 是 11 个静态方法里专供 picker for-inspection
+//!   的那一个，与 for-return 聚合口径逐字一致；理由见各方法 doc）
 //!
 //! ## Phase P3+ shelf CRUD 暴露给 service 的能力（2026-10-02 起 10 静态方法；
 //! 2026-10-04 加 `list_active_inspection_with_load` 后为 11）
@@ -44,7 +44,7 @@ use crate::modules::shelf::model::TShelf;
 /// `TShelf` + 聚合 `current_load`（来自 t_part_batch LEFT JOIN）。
 ///
 /// 用于 `list_active_production_ordered`（picker for-return）与
-/// `list_active_inspection_with_load`（picker for-inspection，2026-10-04 新增）。
+/// `list_active_inspection_with_load`（picker for-inspection，2026-10-04）。
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct TShelfWithLoad {
     pub id: i64,
@@ -206,11 +206,12 @@ impl ShelfRepo {
     /// 'IN_PROCESS', 'INSPECTION', 'OUTSOURCE')）的批次 quantity 总和；
     /// LEFT JOIN 保留 0-负载货架（current_load = 0）。
     ///
-    /// 2026-10-04：聚合子查询补 `deleted_at IS NULL`（与本文件「读查询一律带
-    /// `deleted_at IS NULL`」的约定对齐；此前只有外层 `t_shelf` 带了）。不过滤则
-    /// 软删批次的 quantity 会被**永久**计入所属货架的负载。2026-10-04 在本 worktree
-    /// 库上核对 `t_part_batch WHERE deleted_at IS NOT NULL` 为 0 行，即该缺陷当前
-    /// 不可观测，属预防性收口。
+    /// ⚠️ 聚合子查询**自己**也必须带 `deleted_at IS NULL`（本文件「读查询一律带
+    /// `deleted_at IS NULL`」的约定对 LEFT JOIN 的聚合子查询同样成立：外层
+    /// `t_shelf` 带了不算数）。不过滤则软删批次的 quantity 会被**永久**计入所属
+    /// 货架的负载。2026-10-04 在本 worktree 库上核对
+    /// `t_part_batch WHERE deleted_at IS NOT NULL` 为 0 行，即该约束当前不可观测，
+    /// 属预防性护栏。
     ///
     /// 2026-10-01：聚合条件删掉 `'REPAIRING'` 字面量。REPAIRING 已从
     /// `PartStatus` 降级为 `t_part_batch.is_repairing` 标记列（migration
@@ -251,11 +252,10 @@ impl ShelfRepo {
 
     /// INSPECTION 区活跃货架列表，带 `current_load` 聚合（供 picker for-inspection）。
     ///
-    /// 2026-10-04 新增：原 `list_for_inspection` 复用 `list_with_filters` 取裸
-    /// `TShelf`（无聚合），出参因此缺 `current_load`，而前端的品检架卡片无
-    /// `v-if` 守卫照渲染「在架 N 件」→ 每张送检架卡片都显示「在架 **undefined** 件」。
-    /// 本方法把聚合补在**后端**（不在前端加守卫），口径与
-    /// `list_active_production_ordered` 逐字一致。
+    /// 必须出 `current_load`（前端品检架卡片无 `v-if` 守卫地渲染「在架 N 件」，
+    /// 缺该字段则每张送检架卡片显示「在架 **undefined** 件」），故聚合补在**后端**
+    /// 而不是前端加守卫，口径与 `list_active_production_ordered` 逐字一致。
+    /// 数据源**不可**退回裸 `TShelf` 列表查询（那种查询不带任何聚合）。
     ///
     /// 与 for-return 的差异**仅两处**，且都不影响 `current_load` 口径：
     /// 1. `zone` 常量为 `'INSPECTION'`；
