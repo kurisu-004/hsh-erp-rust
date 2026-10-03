@@ -243,7 +243,11 @@ pub mod code {
     pub const BIZ_OUTSOURCE_QUOTE_NOT_FOUND: i32 = 21301;
     pub const BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION: i32 = 21302; // 当前状态不允许此操作
     pub const BIZ_OUTSOURCE_QUOTE_DUPLICATE: i32 = 21303; // 同 (part,company,process) 已存在活跃报价
-    pub const BIZ_OUTSOURCE_QUOTE_NOT_APPROVED: i32 = 21307; // 找不到该 tuple 的 APPROVED 报价
+    // 2026-10-03 review 第 3 轮放宽语义：不是「找不到该 tuple 的 APPROVED 报价」，
+    // 而是「这不是可用的审批价来源」——报价非 APPROVED / 是 DIRECT 占位价
+    // （is_direct=true）/ DIRECT 占位价并发建行后回查失败。三个成因同码。
+    // HTTP 未登记进 `status_from_code` 的任何特例，落 2xxxx 兜底 = 400。
+    pub const BIZ_OUTSOURCE_QUOTE_NOT_APPROVED: i32 = 21307; // 报价不可用作审批价来源（非 APPROVED / DIRECT 占位价 / 并发回查失败）
 
     // 214xx 送货单（t_delivery_note）
     pub const BIZ_DELIVERY_NOTE_NOT_FOUND: i32 = 21401; // 找不到指定的送货单

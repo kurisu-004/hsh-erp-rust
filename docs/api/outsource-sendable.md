@@ -176,8 +176,10 @@ POST /api/v2/prod/batches/{batch_id}/receive-from-outsource
 > 上一条守卫形同虚设。故 `send-to-outsource` 额外以 `400` / `21307` 拒收
 > `is_direct = true` 的 `quote_id`（2026-10-03 review 第 2 轮，详见
 > [`./production/batches.md`](./production/batches.md) 的价来源一节）。
-> ⇒ 本端点出行的 `APPROVAL` 行在写侧一定发得成；出行的 `DIRECT` 行在需审批工序上
-> 也一定发不出去（该工序不会出 `DIRECT` 行）。**两侧口径一致，这是本轮闭环的判据。**
+> ⇒ 就**价来源这一维度**而言，本端点出行的 `APPROVAL` 行在写侧一定发得成；出行的
+> `DIRECT` 行在需审批工序上也一定发不出去（该工序不会出 `DIRECT` 行）。**两侧口径
+> 一致，这是本轮闭环的判据。**（限定词的由来：价来源之外仍有拒发路径 —— 批次 OCC
+> 409、外协公司被停用 21205、链内缺该 step 20702 等，故不是端到端保证。）
 
 ### 排序
 

@@ -390,9 +390,6 @@ pub(crate) fn status_guard_for_target(target: &str) -> &'static [&'static str] {
 }
 
 /// 读 part 的 `process_chain_id`（part 不存在 / 已软删 → `BIZ_PART_NOT_FOUND`）。
-///
-/// 与 [`optional_process_chain`] 共用读链逻辑，`BIZ_PROCESS_CHAIN_REQUIRED`（20706）
-/// 的严格变体也建立在它之上。
 #[inline]
 async fn read_part_chain_id(
     conn: &mut PgConnection,

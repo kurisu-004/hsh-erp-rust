@@ -1048,6 +1048,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceShipmentRepo::count_in_flight(&mut **self, keyword_pat).await
     }
 
+    // ── quotable-parts（2）── 一行委托 sql::OutsourceQuotableRepo ─────────
     async fn quotable_list<'a>(
         &mut self,
         keyword_pat: Option<&'a str>,
@@ -1064,6 +1065,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceQuotableRepo::count(&mut **self, keyword_pat).await
     }
 
+    // ── sendable（3）── 一行委托 sql::OutsourceSendableRepo ───────────────
     async fn sendable_list<'a>(
         &mut self,
         keyword_pat: Option<&'a str>,
@@ -1089,6 +1091,7 @@ impl OutsourceRepoTrait for &mut PgConnection {
         OutsourceSendableRepo::list_by_process(&mut **self, process_id).await
     }
 
+    // ── pool（4）── 一行委托 sql::OutsourcePoolRepo ──────────────────────
     async fn pool_group_sendable_counts(&mut self) -> Result<Vec<(i64, i64)>, sqlx::Error> {
         OutsourcePoolRepo::group_sendable_counts(&mut **self).await
     }

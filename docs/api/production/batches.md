@@ -159,7 +159,7 @@
 
 > **DIRECT 受工序的 `requires_approval` 约束**（2026-10-03 review 第 1 轮）。`direct=true`
 > 且该 `process_id` 的 `t_process.requires_approval = true` 时以
-> `400 20104 BIZ_INVALID_VALUE` 拒收，文案「该工序需要报价审批，请先走审批再发货，
+> `400 20104 BIZ_INVALID_VALUE` 拒收，文案（节选）「该工序需要报价审批，请先走审批再发货，
 > 不能 direct 直发」。守卫落在建占位报价**之前**（被拒请求不留报价 / shipment / 状态变更）。
 >
 > 守卫的必要性：`requires_approval` 此前**只在读侧生效**（`GET /outsource-sendable` /
@@ -174,11 +174,15 @@
 > 它满足下面 APPROVAL 的全部既有校验条件（状态 + 三元组）⇒ 只守 `direct=true` 的话，
 > 改传占位报价的 id 就能让需审批工序 0 元发货，把上一条守卫绕开。故 `quote_id`
 > 指向 `is_direct = true` 的报价时以 `400 21307 BIZ_OUTSOURCE_QUOTE_NOT_APPROVED`
-> 拒收，文案「该报价是免审批直发的占位价，不能作为审批价来源」（守卫落在建
-> shipment **之前**，不改动报价行本身）。存量占位报价的来源是这条守卫上线前的历史
-> 数据、或 `PATCH /prod/processes/{id}` 把 OUTSOURCE 工序的 `requires_approval` 由
-> `false` 翻成 `true`，故不能靠「清数据」消除。DIRECT 路径复用占位报价**不受影响**
-> ——那正是免审批直发的既有正确行为，且该路径在需审批工序上已被上一条守卫整体拦掉。
+> 拒收，文案「quote {id} 是免审批直发的占位价（is_direct=true、price=0），不能作为
+> 审批价来源；请改传该 (part, company, process) 经审批的报价；若该工序
+> requires_approval=false，请改用 direct=true」（守卫落在建 shipment **之前**，不改动
+> 报价行本身）。守卫**排在三元组校验之后**：同时命中「三元组不匹配」与「是占位价」
+> 时归 21302（参数不一致），文案直指调用方唯一改得动的那一条。存量占位报价的来源是
+> 这条守卫上线前的历史数据、或 `PATCH /prod/processes/{id}` 把 OUTSOURCE 工序的
+> `requires_approval` 由 `false` 翻成 `true`，故不能靠「清数据」消除。DIRECT 路径
+> 复用占位报价**不受影响** ——那正是免审批直发的既有正确行为，且该路径在需审批工序上
+> 已被上一条守卫整体拦掉。
 > 回归：`tests/outsource/send_receive.rs::send_to_outsource_rejects_direct_placeholder_quote_as_approval_price`
 > / `…direct_still_reuses_placeholder_quote_when_approval_not_required`。
 

@@ -48,7 +48,7 @@
 | 21301 | BIZ_OUTSOURCE_QUOTE_NOT_FOUND | 404 | 报价不存在 / 已软删 |
 | 21302 | BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION | 400 | 当前状态不允许此操作（如 SUBMITTED 调 update） |
 | 21303 | BIZ_OUTSOURCE_QUOTE_DUPLICATE | 409 | 同 `(part, company, process)` 已存在活跃报价 |
-| 21307 | BIZ_OUTSOURCE_QUOTE_NOT_APPROVED | 404 | 找不到 `(part, company, process)` 的 APPROVED 报价 |
+| 21307 | BIZ_OUTSOURCE_QUOTE_NOT_APPROVED | 400 | 报价非 `APPROVED`、或 `is_direct=true` 的 DIRECT 占位报价（`send-to-outsource` 拒收）、或 DIRECT 占位价并发回查失败 |
 
 > 21304–21306 预留（业务未触发的中间状态码）。
 

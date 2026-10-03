@@ -443,6 +443,15 @@ impl BatchService {
                 format!("quote {quote_id} 当前 {status}，非 APPROVED 不可发送"),
             ));
         }
+        if q_part_id != part_id
+            || q_company_id != req.outsource_company_id
+            || q_process_id != req.process_id
+        {
+            return Err(AppError::biz(
+                code::BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION,
+                format!("quote {quote_id} 与 send_to_outsource 参数不一致（part/company/process）"),
+            ));
+        }
         // 2026-10-03 review 第 2 轮：APPROVAL（`quote_id`）路径拒 `is_direct=true`。
         //
         // 不变式：「需审批的工序只能凭真审批价发货」有两条入口，两条都要守 ——
@@ -464,22 +473,20 @@ impl BatchService {
         // 错误码取 `BIZ_OUTSOURCE_QUOTE_NOT_APPROVED`（与紧邻的 status 守卫同码）：
         // 两者都是「这不是可用的审批价来源」，只是原因不同（没批 / 是占位价）；
         // 21302 留给「与请求参数不匹配」那条。
+        //
+        // 2026-10-03 review 第 3 轮：本守卫**排在三元组校验之后**。两条都在写之前、
+        // 互不依赖，同一请求可同时命中（「quote 属于别的 (part, company, process)」+
+        // 「该 quote 是占位价」）；先判三元组时归因才准 —— 21302 的文案直指参数
+        // 不一致，是调用方唯一改得动的那一条，若让 21307 先接手，请求方会去查报价
+        // 状态，而真正要改的是 quote_id 本身。
         if !direct && q_is_direct {
             return Err(AppError::biz(
                 code::BIZ_OUTSOURCE_QUOTE_NOT_APPROVED,
                 format!(
                     "quote {quote_id} 是免审批直发的占位价（is_direct=true、price=0），\
-                     不能作为审批价来源；请改传该 (part, company, process) 经审批的报价"
+                     不能作为审批价来源；请改传该 (part, company, process) 经审批的报价；\
+                     若该工序 requires_approval=false，请改用 direct=true"
                 ),
-            ));
-        }
-        if q_part_id != part_id
-            || q_company_id != req.outsource_company_id
-            || q_process_id != req.process_id
-        {
-            return Err(AppError::biz(
-                code::BIZ_OUTSOURCE_QUOTE_INVALID_TRANSITION,
-                format!("quote {quote_id} 与 send_to_outsource 参数不一致（part/company/process）"),
             ));
         }
         // ---- 2026-10-03 部分发送：拆出子批次，只把子批次流转出去 ----
