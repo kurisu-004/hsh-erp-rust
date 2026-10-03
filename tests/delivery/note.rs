@@ -1499,3 +1499,260 @@ async fn test_get_delivery_note_line_items_fields_are_populated() {
         "note 透传"
     );
 }
+
+// ===========================================================================
+//  2026-10-04 新增：line_items 的装配件套数字段（只读展示用）
+// ===========================================================================
+
+/// 本节新增 helper 共用的雪花生成器。
+///
+/// ⚠️ 必须共享：每次 `SnowflakeIdGenerator::new()` 的首个 id 相同（sequence=0），
+/// 各自 `new()` 的 helper 在**同一张表**插两行会直接撞主键。范式
+/// `tests/com/union_list.rs::next_test_id`。
+static SHARED_SNOWFLAKE: std::sync::OnceLock<SnowflakeIdGenerator> = std::sync::OnceLock::new();
+
+fn next_shared_id() -> i64 {
+    SHARED_SNOWFLAKE
+        .get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
+        .next_id()
+}
+
+/// 直插装配件（`quantity` = 工单总套数）。测试侧用 `sqlx::query()` 而非 `query!`
+/// 宏，避免污染 `.sqlx/` 离线缓存（同本文件 `test_get_delivery_note_line_items_
+/// fields_are_populated` 的约定）。
+async fn insert_assembly(pool: &PgPool, customer_id: i64, name: &str, quantity: i32) -> i64 {
+    let id = next_shared_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
+         request_date, planned_delivery_date, status, quantity, unit_price, total_price, \
+         version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'ASM-001', $2, '', $3, $4, $4, 'ACTIVE', $5, 0, 0, 0, $6, NULL, $6, NULL)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(quantity)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert assembly");
+    id
+}
+
+/// 直插工单：`assembly_id = Some(..)` 是装配件子件，`None` 是散件；
+/// `quantity` = 整单数量（每套需要「整单数量 / 装配件套数」件子）。
+async fn insert_part_local(
+    pool: &PgPool,
+    customer_id: i64,
+    name: &str,
+    assembly_id: Option<i64>,
+    quantity: i32,
+) -> i64 {
+    let id = next_shared_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, created_by, updated_at, updated_by, assembly_id) \
+         VALUES ($1, $2, $3, 'D-001', $4, 'READY_TO_SHIP', $3, $5, $5, $6, 0, \
+         $7, NULL, $7, NULL, $8)",
+    )
+    .bind(id)
+    .bind(Option::<String>::None) // serial_no 可空（varchar(15)，别塞雪花 id 进去）
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(quantity)
+    .bind(now)
+    .bind(assembly_id)
+    .execute(pool)
+    .await
+    .expect("insert part");
+    id
+}
+
+/// 直插一个 DRAFT 送货单。
+async fn insert_note_row(pool: &PgPool, l1_id: i64, no: &str) -> i64 {
+    let id = next_shared_id();
+    sqlx::query(
+        "INSERT INTO t_delivery_note \
+         (id, delivery_note_no, customer_id, status, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'DRAFT', 0, now(), now())",
+    )
+    .bind(id)
+    .bind(no)
+    .bind(l1_id)
+    .execute(pool)
+    .await
+    .expect("insert delivery note");
+    id
+}
+
+/// 直插一个**已挂在单上**的批次（`delivery_note_id` 直写，跳过 add_parts 的状态机
+/// 校验 —— 详情与打印都只读「本单挂了哪些批次」）。
+///
+/// ⚠️ 不能复用本文件既有的 `insert_batch`：它每次 `SnowflakeIdGenerator::new()` 拿
+/// 同一个 sequence=0 的 id，同一测试里连插 2 个批次就会撞主键。
+async fn insert_note_batch(pool: &PgPool, part_id: i64, note_id: i64, quantity: i32) -> i64 {
+    insert_note_batch_no(pool, part_id, note_id, quantity, 1).await
+}
+
+/// [`insert_note_batch`] 的显式 `batch_no` 版本。
+///
+/// 同一个 part 挂到**两张**单上时需要 `batch_no` 递进 —— `uq_t_part_batch_part_no`
+/// 是 `(part_id, batch_no)` 唯一，两张单都写 `batch_no = 1` 会撞约束。
+async fn insert_note_batch_no(
+    pool: &PgPool,
+    part_id: i64,
+    note_id: i64,
+    quantity: i32,
+    batch_no: i32,
+) -> i64 {
+    let id = next_shared_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, \
+         delivery_note_id, version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $6, $3, 'READY_TO_SHIP', $4, 0, $5, NULL, $5, NULL)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(quantity)
+    .bind(note_id)
+    .bind(now)
+    .bind(batch_no)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch on note");
+    id
+}
+
+/// 装配件子件行的 `assembly_quantity` / `shippable_sets` 必须填对；散件行为 null。
+///
+/// 数据：装配件 10 套；子件 A 整单 10 件 / 本单 8 件（8 套）；子件 B 整单 10 件 /
+/// 本单 5 件（5 套）⇒ 两行的 `shippable_sets` 都是 5（同装配件口径一致），
+/// `assembly_quantity` 都是 10；同单里的散件行两个字段都是 `null`。
+#[tokio::test]
+async fn get_with_parts_exposes_assembly_quantity_and_shippable_sets() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1(&pool, "套数客户", "F").await;
+    let asm_id = insert_assembly(&pool, l1, "套数装配体", 10).await;
+    let note_id = insert_note_row(&pool, l1, "DN-TEST-9101").await;
+
+    // 2 个装配件子件 + 1 个散件，各挂一个批次
+    let mut child_ids = Vec::new();
+    for (name, part_qty, note_qty) in [("子件A", 10, 8), ("子件B", 10, 5)] {
+        let pid = insert_part_local(&pool, l1, name, Some(asm_id), part_qty).await;
+        insert_note_batch(&pool, pid, note_id, note_qty).await;
+        child_ids.push(pid);
+    }
+    let loose_id = insert_part_local(&pool, l1, "散件C", None, 10).await;
+    insert_note_batch(&pool, loose_id, note_id, 3).await;
+
+    let (gs, genv) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/delivery-notes/{note_id}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(gs, StatusCode::OK, "get detail: {genv}");
+
+    let items = genv["data"]["line_items"].as_array().unwrap();
+    assert_eq!(items.len(), 3, "2 子件 + 1 散件: {genv}");
+    for pid in &child_ids {
+        let item = items
+            .iter()
+            .find(|i| i["part_id"].as_str() == Some(&pid.to_string()))
+            .unwrap_or_else(|| panic!("找不到 part {pid} 的行: {genv}"));
+        assert_eq!(
+            item["assembly_id"].as_str(),
+            Some(asm_id.to_string().as_str()),
+            "子件行必须带装配件 id"
+        );
+        assert_eq!(item["assembly_quantity"], 10, "装配件工单总套数");
+        assert_eq!(
+            item["shippable_sets"], 5,
+            "本单可出货套数 = min(子件 A 8 套, 子件 B 5 套)；同一装配件的所有行同值"
+        );
+    }
+    let loose = items
+        .iter()
+        .find(|i| i["part_id"].as_str() == Some(&loose_id.to_string()))
+        .expect("找不到散件行");
+    assert!(
+        loose["assembly_quantity"].is_null(),
+        "散件行不应带装配件套数: {loose}"
+    );
+    assert!(
+        loose["shippable_sets"].is_null(),
+        "散件行本单可出货套数应为 null: {loose}"
+    );
+}
+
+/// ★ 2026-10-04 review 第 1 轮（BLOCKER-1）：`min` 的定义域必须是「该装配件的
+/// **全部**子件」，本单没交批次的子件按 0 参与。本例同时覆盖批量详情
+/// （`get_many_with_parts`，1 条 SQL 批量取子件）这条链路。
+///
+/// 同 1 个装配件（10 套）、同 2 个子件 A / C（各整单 10 件），2 张单：
+/// - 单 1：A 交 8 件、C 交 5 件 ⇒ min(8, 5) = **5** 套；
+/// - 单 2：只交 A 8 件、C 一件没交 ⇒ min(8, 0) = **0** 套（凑不齐整套不能发）。
+///
+/// 若实现退回「只看本单批次行」的口径，单 2 会误判成 8 套。
+#[tokio::test]
+async fn batch_detail_shippable_sets_use_all_children_not_only_note_rows() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    let l1 = insert_l1(&pool, "批量套数客户", "F").await;
+    let asm_id = insert_assembly(&pool, l1, "批量套数装配体", 10).await;
+    let note1 = insert_note_row(&pool, l1, "DN-TEST-9201").await;
+    let note2 = insert_note_row(&pool, l1, "DN-TEST-9202").await;
+
+    let child_a = insert_part_local(&pool, l1, "批量子件A", Some(asm_id), 10).await;
+    let child_c = insert_part_local(&pool, l1, "批量子件C", Some(asm_id), 10).await;
+    insert_note_batch(&pool, child_a, note1, 8).await;
+    insert_note_batch(&pool, child_c, note1, 5).await;
+    // 单 2 只挂子件 A，子件 C 完全不在这张单上（同一 part 挂两张单 ⇒ batch_no 递进）
+    insert_note_batch_no(&pool, child_a, note2, 8, 2).await;
+
+    let uri = format!("/delivery-notes/batch-detail?ids={note1},{note2}");
+    let (status, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
+    assert_eq!(status, StatusCode::OK, "batch detail: {env}");
+
+    let items = env["data"]["items"].as_array().expect("items 必须是数组");
+    assert_eq!(items.len(), 2, "两张单都要返回: {env}");
+
+    let sets_of = |note_id: i64| -> Vec<i64> {
+        let it = items
+            .iter()
+            .find(|i| i["id"].as_str() == Some(note_id.to_string().as_str()))
+            .unwrap_or_else(|| panic!("找不到单 {note_id}: {env}"));
+        it["line_items"]
+            .as_array()
+            .expect("line_items 必须是数组")
+            .iter()
+            .map(|li| {
+                li["shippable_sets"]
+                    .as_i64()
+                    .unwrap_or_else(|| panic!("子件行必须有 shippable_sets: {li}"))
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        sets_of(note1),
+        vec![5, 5],
+        "单 1：子件 A 8 套 / 子件 C 5 套 ⇒ 5 套（同一装配件的所有行同值）"
+    );
+    assert_eq!(
+        sets_of(note2),
+        vec![0],
+        "单 2：子件 C 本单没交批次（按 0 参与 min）⇒ 0 套，不能误判成 8 套"
+    );
+}

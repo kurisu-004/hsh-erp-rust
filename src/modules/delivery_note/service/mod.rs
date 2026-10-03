@@ -10,6 +10,7 @@
 //! - `attach` — DeliveryNoteService::attach_batches（P3+ 弹窗批量 attach）
 //! - `inner` — 跨子模块共享的私有 helper（`build_note_outs` / `add_parts_inner` /
 //!   `write_event` / `validate_*` / 错误构造器 等）
+//! - `shippable_sets` — 本单口径的装配件可出货套数（纯函数，2026-10-04 新增）
 //!
 //! 对外 API（`handler.rs` 调用面）保持原路径：
 //! - `service::DeliveryGroupService::{list_for_l1, create, update, soft_delete}`
@@ -44,6 +45,15 @@ mod group;
 mod inner;
 mod lifecycle;
 mod scan;
+mod shippable_sets;
+
+/// 2026-10-04 新增：本单口径的装配件「可出货套数」纯内存计算。
+///
+/// 模块保持私有（与其余 service 子模块一致），只把函数放开到 crate 内 ——
+/// 打印 handler（`handler/print.rs`）也要用它把套数注入转发 body，与
+/// `inner.rs::get_with_parts` / `crud.rs::get_many_with_parts` 共用同一公式，
+/// 避免三处各写一遍。范式 `outsource/service/mod.rs` 的 `pub(crate) fn` 导出。
+pub(crate) use shippable_sets::note_shippable_sets;
 
 use std::sync::Arc;
 

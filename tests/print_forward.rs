@@ -27,6 +27,7 @@
 #![allow(clippy::await_holding_lock)]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::body::{Body, Bytes, to_bytes};
@@ -35,9 +36,11 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
+use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::py_backend::{
     HttpPyBackend, MockPyBackendClient, PyBackendClient, PyBackendResponse,
 };
+use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::shared::error::AppError;
 use hsh_erp_test_support::{
     PartFixture, json_request, load_part_fixture, login_token, send as ts_send, test_app,
@@ -202,6 +205,11 @@ async fn login_user_with_role(pool: &PgPool, username: &str, role: &str) -> Stri
 // ===========================================================================
 
 /// 4 条路由各自命中正确的 py_backend 方法，且 note_id 拼装正确、body 原样透传。
+///
+/// 2026-10-04 补注：`1234567890` 这个 note 在库里**没有批次**，故套数注入走
+/// 「无批次 → 不注入任何键、原样转发」分支，body 仍与入参逐字相等（含前端自己
+/// 发的 `merge_quantities`）。下方那条断言把这个分支钉死：一旦有人把注入改成
+/// 无条件的（比如凭空造一个空 `merge_quantities` 覆盖掉），本用例会红。
 #[tokio::test]
 async fn delivery_note_print_forwards_body_and_note_id() {
     let (pool, app, fx) = bootstrap().await;
@@ -941,4 +949,716 @@ fn idem_request(uri: &str, key: &str) -> Request<Body> {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from("{}"))
         .expect("build idem request")
+}
+
+// ===========================================================================
+// 11. 套数注入：assembly_ids / merge_quantities（2026-10-04 新增）
+// ===========================================================================
+//
+// 打印 handler 不再是纯转发：转发前读本单批次算装配件「可出货套数」，注入 body。
+// 公式与边界见 `src/modules/delivery_note/service/shippable_sets.rs`，本节锁死
+// 对外可见的 4 件事：
+// 1. 注入的 id 与 key 全是 JSON **string**（雪花 id > 2^53）；
+// 2. 「不注入」分支（本单无装配件 / 装配件全软删）不产生空数组或空对象；
+// 3. 套数口径的 4 条边界（凑不齐 = 0 / 超交 LEAST 收口 / quantity=0 子件不参与 /
+//    min 取所有子件）；
+// 4. 两个端点注入结果逐字一致（python 端 xlsx 行构建是同一份代码）。
+//
+// seed 约定：测试侧 SQL 一律用 `sqlx::query()`（**不是** `query!` 宏），避免为
+// 纯测试 INSERT 往 `.sqlx/` 离线缓存塞新条目（`tests/delivery/note.rs:1404` 同款）。
+
+/// 本文件 seed helper 共用的雪花生成器。
+///
+/// ⚠️ 必须共享：每次 `SnowflakeIdGenerator::new()` 的首个 id 相同（sequence=0），
+/// 各自 `new()` 的 helper 在**同一张表**插两行会直接撞主键。范式
+/// `tests/com/union_list.rs::next_test_id`。
+static SHARED_SNOWFLAKE: std::sync::OnceLock<SnowflakeIdGenerator> = std::sync::OnceLock::new();
+
+fn next_test_id() -> i64 {
+    SHARED_SNOWFLAKE
+        .get_or_init(|| SnowflakeIdGenerator::new(1_577_836_800_000, 1))
+        .next_id()
+}
+
+/// 转发 body 捕获槽：`withf` 同步闭包里写，测试体内读。
+type BodySlot = Arc<Mutex<Option<Value>>>;
+
+fn body_slot() -> BodySlot {
+    Arc::new(Mutex::new(None))
+}
+
+/// `withf` 用：把转发出去的 body 存进槽，返回 true（`times(1)` 另行保证次数）。
+fn record_body(slot: &BodySlot, body: &Value) -> bool {
+    *slot.lock().expect("body slot mutex") = Some(body.clone());
+    true
+}
+
+/// 取捕获到的 body。没取到说明转发压根没发生（`times(1)` 会先炸，这里是双保险）。
+fn take_body(slot: &BodySlot) -> Value {
+    slot.lock()
+        .expect("body slot mutex")
+        .take()
+        .expect("py_backend 转发方法未被调用")
+}
+
+/// 装一个 `t_customer` 行（L1：parent_id = NULL；L2：parent_id = l1_id）。
+async fn seed_customer(pool: &PgPool, name: &str, parent_id: Option<i64>) -> i64 {
+    let id = next_test_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, 'F', 0, $4, NULL, $4, NULL)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(parent_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_customer");
+    id
+}
+
+/// 装一张 `DRAFT` 送货单（打印 handler 不读单头，但让用例读起来是完整业务场景）。
+async fn seed_note(pool: &PgPool, l1_id: i64, no: &str) -> i64 {
+    let id = next_test_id();
+    sqlx::query(
+        "INSERT INTO t_delivery_note \
+         (id, delivery_note_no, customer_id, status, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'DRAFT', 0, now(), now())",
+    )
+    .bind(id)
+    .bind(no)
+    .bind(l1_id)
+    .execute(pool)
+    .await
+    .expect("insert t_delivery_note");
+    id
+}
+
+/// 装一个装配件工单（`quantity` = 套数）。
+async fn seed_assembly(pool: &PgPool, customer_id: i64, name: &str, quantity: i32) -> i64 {
+    let id = next_test_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
+         request_date, planned_delivery_date, status, quantity, unit_price, total_price, \
+         version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'ASM-001', $2, '', $3, $4, $4, 'ACTIVE', $5, 0, 0, 0, $6, NULL, $6, NULL)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(quantity)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_assembly");
+    id
+}
+
+/// 装一个工单：`assembly_id = Some(..)` 是装配件子件，`None` 是散件；
+/// `quantity` 是**整单数量**（每套需要「整单数量 / 装配件套数」件子）。
+async fn seed_part(
+    pool: &PgPool,
+    customer_id: i64,
+    name: &str,
+    assembly_id: Option<i64>,
+    quantity: i32,
+) -> i64 {
+    let id = next_test_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, created_by, updated_at, updated_by, assembly_id) \
+         VALUES ($1, $2, $3, 'D-001', $4, 'READY_TO_SHIP', $3, $5, $5, $6, 0, \
+         $7, NULL, $7, NULL, $8)",
+    )
+    .bind(id)
+    .bind(Option::<String>::None) // serial_no 可空（varchar(15)，别塞雪花 id 进去）
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(quantity)
+    .bind(now)
+    .bind(assembly_id)
+    .execute(pool)
+    .await
+    .expect("insert t_part");
+    id
+}
+
+/// 装一个挂在单上的批次（`quantity` = 本单出货量）。
+async fn seed_batch(pool: &PgPool, part_id: i64, note_id: i64, quantity: i32) -> i64 {
+    let id = next_test_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, delivery_note_id, \
+         version, created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, $3, 'READY_TO_SHIP', $4, 0, $5, NULL, $5, NULL)",
+    )
+    .bind(id)
+    .bind(part_id)
+    .bind(quantity)
+    .bind(note_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch");
+    id
+}
+
+/// 软删一个装配件（`list_by_ids(include_deleted=false)` 解析不到它）。
+async fn soft_delete_assembly(pool: &PgPool, asm_id: i64) {
+    sqlx::query("UPDATE t_assembly SET deleted_at = now() WHERE id = $1")
+        .bind(asm_id)
+        .execute(pool)
+        .await
+        .expect("soft delete t_assembly");
+}
+
+fn print_uri(note_id: i64) -> String {
+    format!("/delivery-notes/{note_id}/print")
+}
+
+fn labels_uri(note_id: i64) -> String {
+    format!("/delivery-notes/{note_id}/print-labels")
+}
+
+/// 装一套「1 个装配件 + 若干子件 + 批次挂单」的场景，返回 (note_id, asm_id, 子件 part id 列表)。
+///
+/// `children` = `(子件名, 整单数量, 本单出货量)` 三元组。
+///
+/// 2026-10-04 review 第 3 轮修正：本单出货量改成 `Option<i32>`，**`None` = 该子件
+/// 完全不挂批次到本单**（不是「挂一行 quantity = 0 的批次」）。
+///
+/// ⚠️ 这两件事对「`min` 定义域」类断言是**完全不同**的场景：
+/// `Some(0)` 是本单有一行 0 量的批次行 ⇒ 只扫本单行集的旧口径也能算出 0 套 ⇒ 用例绿；
+/// `None` 是本单一行都没有 ⇒ 只有扫「全部子件」的口径才会算成 0 套。
+/// 原签名只能表达前者，导致「子件 C 不在本单」的两条用例给出的是**虚假保障**
+/// （退回 BLOCKER-1 修复前的实现照样全绿）。
+async fn seed_assembly_scenario(
+    pool: &PgPool,
+    asm_quantity: i32,
+    children: &[(&str, i32, Option<i32>)],
+) -> (i64, i64, Vec<i64>) {
+    let l1 = seed_customer(pool, "注入客户", None).await;
+    let l2 = seed_customer(pool, "注入二厂", Some(l1)).await;
+    let note_id = seed_note(pool, l1, "DN-TEST-9001").await;
+    let asm_id = seed_assembly(pool, l1, "注入装配体", asm_quantity).await;
+    let mut part_ids = Vec::new();
+    for (name, part_qty, note_qty) in children {
+        let pid = seed_part(pool, l2, name, Some(asm_id), *part_qty).await;
+        if let Some(nq) = note_qty {
+            seed_batch(pool, pid, note_id, *nq).await;
+        }
+        part_ids.push(pid);
+    }
+    (note_id, asm_id, part_ids)
+}
+
+/// 断言「注入的 id 与 map key 全是 JSON string」：值层用 `Value::String` 比对，
+/// 再把序列化文本里带引号的形态钉死（雪花 id > 2^53，number 会丢精度）。
+fn assert_id_is_json_string(forwarded: &Value, asm_id: i64) {
+    let ids = forwarded["assembly_ids"]
+        .as_array()
+        .expect("assembly_ids 必须是数组");
+    assert!(
+        ids.iter().all(|v| v.is_string()),
+        "assembly_ids 元素必须是 JSON string: {ids:?}"
+    );
+    assert!(
+        forwarded["merge_quantities"]
+            .as_object()
+            .expect("merge_quantities 必须是对象")
+            .keys()
+            .all(|k| k.parse::<i64>().is_ok()),
+        "merge_quantities 的 key 必须是雪花 id 的十进制字符串"
+    );
+    let raw = forwarded.to_string();
+    assert!(
+        raw.contains(&format!("\"{asm_id}\"")),
+        "装配件 id 必须以带引号的 string 出现在转发 body 里: {raw}"
+    );
+}
+
+/// ★ 主路径：有装配件 → 注入正确的 `assembly_ids` / `merge_quantities`。
+///
+/// 装配件 10 套；子件 A 整单 10 件、本单 8 件（8 套）；子件 B 整单 10 件、本单
+/// 5 件（5 套）⇒ min = 5，`LEAST(5, 10)` 仍是 5。
+#[tokio::test]
+async fn delivery_note_print_injects_shippable_sets_for_assembly() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件B", 10, Some(5))]).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |note_id_s, body, _h| note_id_s == note_id.to_string() && record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-asm")));
+    // 姊妹方法一次都不能被调用（否则 2 条路由串了）
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    let (status, _h, out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(out, b"xlsx-asm");
+
+    let fwd = take_body(&slot);
+    assert_eq!(
+        fwd["assembly_ids"],
+        json!([asm_id.to_string()]),
+        "只注入能解析到的装配件，且序列化为 string"
+    );
+    let mq = fwd["merge_quantities"]
+        .as_object()
+        .expect("merge_quantities 必须是对象");
+    assert_eq!(mq.len(), 1, "只应有本单这一个装配件: {mq:?}");
+    assert!(
+        !mq.contains_key("1900000000000000003"),
+        "前端自己发的 merge_quantities（人工 override）必须被 rust 侧算出的套数整体覆盖: {mq:?}"
+    );
+    assert_eq!(
+        mq[&asm_id.to_string()],
+        json!(5),
+        "套数 = min(子件各能撑的套数) = min(8, 5)"
+    );
+    // 前端字段原样透传（注入是「加键」不是「替换 body」）
+    assert_eq!(fwd["custom_order"], snowflake_body()["custom_order"]);
+    assert_eq!(fwd["line_item_ids"], snowflake_body()["line_item_ids"]);
+    assert_id_is_json_string(&fwd, asm_id);
+}
+
+/// 无装配件（纯散件单）→ **不注入**两个键，body 与入参逐字相等。
+///
+/// ⚠️ `snowflake_body()` 自带一个 `merge_quantities`：本分支下它**原样透传**
+/// （handler 只在有装配件时覆盖写该键，不做「无装配件就抹掉」的清洗）。
+#[tokio::test]
+async fn delivery_note_print_without_assembly_injects_nothing() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    let l1 = seed_customer(&pool, "散件客户", None).await;
+    let l2 = seed_customer(&pool, "散件二厂", Some(l1)).await;
+    let note_id = seed_note(&pool, l1, "DN-TEST-9002").await;
+    let loose = seed_part(&pool, l2, "散件", None, 10).await;
+    seed_batch(&pool, loose, note_id, 4).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-loose")));
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    let (status, _h, _out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fwd = take_body(&slot);
+    assert_eq!(
+        fwd,
+        snowflake_body(),
+        "无装配件时不该注入任何键，也不该动前端字段: {fwd}"
+    );
+}
+
+/// 装配件软删 → 解析不到 → 既不注入 id 也不注入套数（子件在 python 侧按散件行打印）。
+#[tokio::test]
+async fn delivery_note_print_skips_soft_deleted_assembly() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    // 2026-10-04 review 第 1 轮修正：用 seed 返回的 asm_id。原实现
+    // `SELECT id FROM t_assembly LIMIT 1` 只因 part fixture 不含 t_assembly 行才
+    // 恰好选中目标行，fixture 一旦加装配体就会静默测错对象。
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8))]).await;
+    soft_delete_assembly(&pool, asm_id).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-deleted")));
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    let (status, _h, _out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fwd = take_body(&slot);
+    assert_eq!(
+        fwd,
+        snowflake_body(),
+        "装配件软删时不该注入（更不能注入空数组 / 空对象）: {fwd}"
+    );
+}
+
+/// 子件凑不齐整套 → 套数是 **0**（而不是缺键 / 负数），python 侧据此不进 xlsx。
+#[tokio::test]
+async fn delivery_note_print_injects_zero_sets_when_children_short() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    // 装配件 10 套；子件整单 20 件（每套 2 件），本单只出 1 件 ⇒ 1*10/20 = 0 套
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 20, Some(1))]).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-short")));
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    let (status, _h, _out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fwd = take_body(&slot);
+    assert_eq!(fwd["assembly_ids"], json!([asm_id.to_string()]));
+    assert_eq!(
+        fwd["merge_quantities"][asm_id.to_string().as_str()],
+        json!(0),
+        "凑不齐整套必须显式给 0（缺键会被 python 端回落到默认 1 套）"
+    );
+}
+
+/// 子件超交（按比例算出 100 套）→ `LEAST` 收口到装配件工单总套数 10。
+#[tokio::test]
+async fn delivery_note_print_caps_sets_by_assembly_quantity() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    // 装配件 10 套；子件整单 10 件，本单超交 100 件 ⇒ 100 套，收口到 10
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(100))]).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-over")));
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    let (status, _h, _out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fwd = take_body(&slot);
+    assert_eq!(
+        fwd["merge_quantities"][asm_id.to_string().as_str()],
+        json!(10),
+        "子件超交时套数必须被 LEAST 收口到装配件总套数（UI/xlsx 会出现「100 / 10 套」）"
+    );
+}
+
+/// `part.quantity == 0` 的子件**不参与 min**：既不整除零炸掉，也不把套数拖成 0。
+#[tokio::test]
+async fn delivery_note_print_ignores_zero_quantity_child_in_min() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    // 装配件 10 套；子件 A 整单 10 件 / 本单 8 件 → 8 套；
+    // 子件 B 整单 0 件 / 本单 3 件（越界数据）→ 跳过，min 仍取 8
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件B", 0, Some(3))]).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-zeroqty")));
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    let (status, _h, _out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "quantity=0 的子件不能让请求 500（对应 SQL 的 NULLIF）"
+    );
+
+    let fwd = take_body(&slot);
+    assert_eq!(
+        fwd["merge_quantities"][asm_id.to_string().as_str()],
+        json!(8),
+        "quantity=0 的子件不参与 min，套数应取子件 A 的 8 套"
+    );
+}
+
+/// ★ 两个端点注入结果逐字一致（python 端 xlsx 行构建是同一份 `_prepare_print_rows`，
+/// 套数必须同一口径，否则同一单「送货单」与「标签」打出不同套数）。
+#[tokio::test]
+async fn both_print_endpoints_inject_identical_shippable_sets() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件B", 10, Some(5))]).await;
+
+    let print_slot = body_slot();
+    let labels_slot = body_slot();
+    let (ps, ls) = (print_slot.clone(), labels_slot.clone());
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&ps, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-print")));
+    mock.expect_forward_delivery_note_labels()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&ls, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-labels")));
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    let (s1, _h1, b1) = send_bytes(
+        app2.clone(),
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    let (s2, _h2, b2) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &labels_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(b1, b"xlsx-print");
+    assert_eq!(b2, b"xlsx-labels");
+
+    let from_print = take_body(&print_slot);
+    let from_labels = take_body(&labels_slot);
+    assert_eq!(from_print, from_labels, "两个端点注入的 body 必须逐字一致");
+    assert_eq!(from_print["assembly_ids"], json!([asm_id.to_string()]));
+    assert_eq!(
+        from_print["merge_quantities"][asm_id.to_string().as_str()],
+        json!(5)
+    );
+    assert_id_is_json_string(&from_labels, asm_id);
+}
+
+/// ★ 2026-10-04 review 第 1 轮（BLOCKER-1）：装配件有子件**本单完全没交批次**时，
+/// 套数必须是 0，不能只按「本单出现过的子件」取 min。
+///
+/// 装配件 10 套；子件 A 整单 10 件 / 本单送 8 件（8 套）；子件 C 整单 10 件 /
+/// **本单一行批次都没有**（`note_qty = None`，0 套）⇒ min = 0。业务上剩余部分不能
+/// 单独发货、必须等子件收齐，打印时也不能凭空打出 8 套 —— python 端拿到 0 会丢掉
+/// 该装配件的全部子件行。
+///
+/// ⚠️ 2026-10-04 review 第 3 轮（MINOR-1）：本例原先写的是 `("子件C", 10, 0)`，
+/// 即给 C 挂了一行 **quantity = 0 的批次**。那种 seed 下旧口径（只扫本单批次行）
+/// 也能算出 0 套，用例对 BLOCKER-1 没有任何鉴别力。改成 `None`（C 真不在本单）后，
+/// `min` 的定义域里 C 只能来自「全部子件」查询 —— 退回旧实现本例会红。
+#[tokio::test]
+async fn delivery_note_print_injects_zero_sets_when_child_absent_from_note() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    // 装配件 10 套；子件 A 整单 10 件 / 本单 8 件 → 8 套；
+    // 子件 C 整单 10 件 / **本单不挂批次** → 0 套 ⇒ min = 0
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件C", 10, None)]).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-absent")));
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    let (status, _h, _out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let fwd = take_body(&slot);
+    assert_eq!(
+        fwd["assembly_ids"],
+        json!([asm_id.to_string()]),
+        "装配件本身仍要注入（子件行是散件行兜底还是丢弃由 python 端按套数决定）"
+    );
+    assert_eq!(
+        fwd["merge_quantities"][asm_id.to_string().as_str()],
+        json!(0),
+        "本单没交批次的子件必须以 0 参与 min：凑不齐整套不能发，否则印出物理上不存在的整套"
+    );
+}
+
+/// ★ 同源同值（2026-10-04 review 第 1 轮，frontend reviewer 硬要求）：
+/// 详情 VO 的 `line_items[].shippable_sets`（前端预览显示的套数）与注入 body 的
+/// `merge_quantities[asm_id]`（实际导出 xlsx 的套数）必须**同源同值**。
+///
+/// 两条链路的输入集必须完全一致（都基于「该装配件的全部子件」，含本单没批次的子件），
+/// 否则用户会看到一个数、拿到另一个数的文件，且前端无从发现。用例刻意造
+/// 「子件 A 交 8 件 + 子件 C 一件没交」这个只有「全部子件」口径才会算成 0 的场景，
+/// 并额外断言两侧都等于 0：若任一侧退回旧口径（只看本单批次行），两侧会同时变成 8，
+/// 单纯的「两侧相等」断言察觉不到。
+///
+/// ⚠️ 2026-10-04 review 第 3 轮（MINOR-1）：子件 C 用 `note_qty = None`（真不在本单，
+/// 不是挂一行 0 量批次）。连带后果是 `line_items` 只有子件 A 一行 —— 详情 VO 的
+/// `line_items` 由**本单批次行**驱动，C 没有批次就没有行可挂；C 的 0 贡献只体现在
+/// 「同一行上的 `shippable_sets` 被压成 0」这件事上。
+#[tokio::test]
+async fn detail_shippable_sets_match_injected_merge_quantities() {
+    let (pool, app, fx) = bootstrap().await;
+    let manager_token = token_of(&app, &fx.manager_username).await;
+    // 装配件 10 套；子件 A 整单 10 件 / 本单 8 件（8 套）；子件 C 整单 10 件 /
+    // **本单不挂批次**（0 套）⇒ 全子件口径下 min = 0
+    let (note_id, asm_id, _parts) =
+        seed_assembly_scenario(&pool, 10, &[("子件A", 10, Some(8)), ("子件C", 10, None)]).await;
+
+    let slot = body_slot();
+    let s = slot.clone();
+    let mut mock = MockPyBackendClient::new();
+    mock.expect_forward_delivery_note_print()
+        .times(1)
+        .withf(move |_id, body, _h| record_body(&s, body))
+        .returning(|_i, _b, _h| Ok(ok_xlsx_response(b"xlsx-same-source")));
+    mock.expect_forward_delivery_note_labels().never();
+
+    let (app2, _fx) = app_with_mock(&pool, mock).await;
+    // ① 详情端点（前端预览的数据源）
+    let (ds, denv) = send_json(
+        app2.clone(),
+        json_request(
+            "GET",
+            &format!("/delivery-notes/{note_id}"),
+            None,
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(ds, StatusCode::OK, "get detail: {denv}");
+    let items = denv["data"]["line_items"]
+        .as_array()
+        .expect("line_items 必须是数组");
+    let detail_sets: Vec<i64> = items
+        .iter()
+        .filter(|i| i["assembly_id"].as_str() == Some(asm_id.to_string().as_str()))
+        .map(|i| {
+            i["shippable_sets"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("装配件子件行必须有 shippable_sets: {i}"))
+        })
+        .collect();
+    assert_eq!(
+        detail_sets.len(),
+        1,
+        "只有子件 A 在本单（子件 C 无批次 ⇒ 无行）；该行仍必须带 assembly_id 与 shippable_sets: {denv}"
+    );
+    assert!(
+        detail_sets.iter().all(|s| *s == 0),
+        "详情口径必须是「全部子件」：本单没交批次的子件以 0 参与 min ⇒ 0 套，实际 {detail_sets:?}"
+    );
+
+    // ② 打印端点（实际导出 xlsx 的数据源）
+    let (ps, _h, _out) = send_bytes(
+        app2,
+        json_request(
+            "POST",
+            &print_uri(note_id),
+            Some(snowflake_body()),
+            Some(&manager_token),
+        ),
+    )
+    .await;
+    assert_eq!(ps, StatusCode::OK);
+    let fwd = take_body(&slot);
+    let injected = fwd["merge_quantities"][asm_id.to_string().as_str()]
+        .as_i64()
+        .expect("merge_quantities[asm_id] 必须是 JSON number");
+
+    // ③ 同源同值
+    assert_eq!(
+        detail_sets,
+        vec![injected; detail_sets.len()],
+        "预览显示的套数（shippable_sets）必须与导出 xlsx 的套数（merge_quantities）相等"
+    );
 }

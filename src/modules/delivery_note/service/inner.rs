@@ -25,6 +25,7 @@ use crate::shared::error::{AppError, code};
 use super::super::dto::DeliveryNoteAddItem;
 use super::super::model::{DeliveryNote, DeliveryNoteEvent, NoteScope};
 use super::super::vo::{DeliveryNoteDetailOut, DeliveryNoteLineItem, DeliveryNoteOut};
+use super::note_shippable_sets;
 
 // ===========================================================================
 //  types
@@ -239,6 +240,27 @@ pub(super) async fn get_with_parts(
         }
     }
 
+    // 2026-10-04 新增：循环前先聚合一次本单可出货套数。`min` 的定义域是「该
+    // 装配件的**全部**子件」（本单没批次的子件按 0 参与），故必须补取子件 ——
+    // 按装配件逐个取（单单装配件通常 1~3 个），与 `handler/print.rs` 同一写法。
+    let asm_quantity: HashMap<i64, i32> = assembly_map
+        .iter()
+        .map(|(id, a)| (*id, a.quantity))
+        .collect();
+    let mut children_by_asm: HashMap<i64, Vec<crate::modules::part::model::TPart>> =
+        HashMap::with_capacity(assembly_map.len());
+    // 2026-10-04 review 第 3 轮（INFO-5）：遍历 `assembly_map` 的 key 而不是
+    // `asm_ids`。差集 = 被 `include_deleted=false` 判为软删的装配件，它的子件查回来
+    // 也用不上（`asm_quantity` 里没有该 key，`note_shippable_sets` 直接跳过），
+    // 对应行上 `shippable_sets` 取 `None` 与现状一致，纯省一次 DB 往返。
+    for aid in assembly_map.keys() {
+        children_by_asm.insert(
+            *aid,
+            PartRepo::list_children(&mut *conn, *aid, false).await?,
+        );
+    }
+    let sets_map = note_shippable_sets(&rows, &asm_quantity, &children_by_asm);
+
     let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(rows.len());
     for (b, p) in rows {
         let leaf = leaf_map.get(&p.customer_id);
@@ -286,6 +308,9 @@ pub(super) async fn get_with_parts(
             assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),
             assembly_name: asm.map(|a| a.name.clone()),
             assembly_order_no: asm.and_then(|a| a.order_no.clone()),
+            // 2026-10-04 新增：装配件工单总套数 + 本单可出货套数（散件 None）
+            assembly_quantity: asm.map(|a| a.quantity),
+            shippable_sets: p.assembly_id.and_then(|id| sets_map.get(&id).copied()),
         });
     }
 

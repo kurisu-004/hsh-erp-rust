@@ -15,6 +15,8 @@ use crate::infra::clock::now_naive;
 use crate::infra::serial::next_delivery_note_no;
 use crate::modules::com::customer::repo::CustomerRepo;
 use crate::modules::delivery_note::repo::DeliveryNoteRepoTrait;
+use crate::modules::part::model::TPart;
+use crate::modules::part::repo::PartRepo;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
@@ -28,6 +30,7 @@ use super::inner::{
     add_parts_inner, build_note_outs, get_with_parts, note_not_found, note_version_conflict,
     write_event,
 };
+use super::note_shippable_sets;
 
 use super::DeliveryNoteService;
 
@@ -261,6 +264,35 @@ impl DeliveryNoteService {
             }
         }
 
+        // 2026-10-04 新增：套数公式的 `min` 定义域是「该装配件的**全部**子件」，
+        // 本单没批次的子件按 0 参与（否则会算出凑不齐的套数 → 错标签）。批量详情
+        // 是 N 单 × M 装配件，不能逐个 `list_children`，故 1 条 SQL 批量取。
+        // 与 `inner.rs::get_with_parts` / `handler/print.rs` 同 `include_deleted=false`
+        // 口径 ⇒ 详情 VO 与打印注入的套数同源同值。
+        let children_by_asm: HashMap<i64, Vec<TPart>> = if assembly_map.is_empty() {
+            HashMap::new()
+        } else {
+            // 2026-10-04 review 第 3 轮（INFO-5）：按 `assembly_map` 的 key 取子件，
+            // 不用 `asm_ids`。差集 = 被 `include_deleted=false` 判为软删的装配件，
+            // 它的子件查回来也用不上（`asm_quantity` 里没有该 key，`note_shippable_sets`
+            // 直接跳过），对应行上 `shippable_sets` 取 `None` 与现状一致，纯省一批
+            // 无谓往返。
+            let keys: Vec<i64> = assembly_map.keys().copied().collect();
+            let mut m: HashMap<i64, Vec<TPart>> = HashMap::with_capacity(keys.len());
+            for c in
+                PartRepo::list_children_by_assemblies(&mut *repo.conn_mut(), &keys, false).await?
+            {
+                if let Some(aid) = c.assembly_id {
+                    m.entry(aid).or_default().push(c);
+                }
+            }
+            m
+        };
+        let asm_quantity: HashMap<i64, i32> = assembly_map
+            .iter()
+            .map(|(id, a)| (*id, a.quantity))
+            .collect();
+
         let head_outs = build_note_outs(&mut *repo.conn_mut(), &heads).await?;
         let head_out_map: HashMap<i64, DeliveryNoteOut> =
             head_outs.into_iter().map(|h| (h.id, h)).collect();
@@ -286,6 +318,8 @@ impl DeliveryNoteService {
                 continue;
             };
             let items_rows = by_note.remove(nid).unwrap_or_default();
+            // 2026-10-04 新增：循环前先在本单行集上聚合一次可出货套数。
+            let sets_map = note_shippable_sets(&items_rows, &asm_quantity, &children_by_asm);
             let mut items: Vec<DeliveryNoteLineItem> = Vec::with_capacity(items_rows.len());
             for (b, p) in items_rows {
                 let leaf = leaf_map.get(&p.customer_id);
@@ -330,6 +364,9 @@ impl DeliveryNoteService {
                     assembly_drawing_no: asm.map(|a| a.drawing_no.clone()),
                     assembly_name: asm.map(|a| a.name.clone()),
                     assembly_order_no: asm.and_then(|a| a.order_no.clone()),
+                    // 2026-10-04 新增：装配件工单总套数 + 本单可出货套数（散件 None）
+                    assembly_quantity: asm.map(|a| a.quantity),
+                    shippable_sets: p.assembly_id.and_then(|id| sets_map.get(&id).copied()),
                 });
             }
             out.push(DeliveryNoteDetailOut {

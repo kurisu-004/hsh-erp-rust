@@ -6,9 +6,9 @@
 //!
 //! ## 承载方法（17 个）
 //!
-//! ### 只读查询（5）
+//! ### 只读查询（6）
 //! - `get_by_id` / `list_by_ids` / `get_by_serial` / `list_children`
-//! - `get_part_inspected`
+//! - `get_part_inspected` / `list_children_by_assemblies`
 //!
 //! ### CRUD（6）
 //! - `get_part_detail` / `create_part` / `update_part` / `soft_delete_part`
@@ -282,6 +282,47 @@ impl PartRepo {
             assembly_id,
             include_deleted,
         )
+        .fetch_all(executor)
+        .await
+    }
+
+    /// 一批装配件的**全部**子件（1 条 SQL，供 N 单 × M 装配件的批量场景用）。
+    ///
+    /// 2026-10-04 review 第 1 轮新增：`delivery_note::service::shippable_sets`
+    /// 算「本单可出货套数」时，`min` 的定义域必须是**该装配件的全部子件**（含本单
+    /// 完全没有批次的子件，其本单出货量按 0 参与），而 `list_children` 一次只取一个
+    /// 装配件 ⇒ 批量详情（`get_many_with_parts`，N 单 × M 装配件）不能逐个调。
+    /// 两条查询口径必须逐字一致（同 `assembly_id` 过滤 + 同 `include_deleted`
+    /// 语义 + 同一列投影），否则详情 VO 与打印注入的套数会分叉。
+    ///
+    /// 用**非宏** `sqlx::query_as`（`TPart` 已 `derive(FromRow)`）：非宏不进
+    /// `.sqlx/` 离线缓存，改本文件不需要重跑 `scripts/sqlx_prepare.sh`。
+    /// 范本 `part::service::list_enrichment::fetch_delivered_sets`。
+    pub async fn list_children_by_assemblies<'e, E: PgExecutor<'e>>(
+        executor: E,
+        assembly_ids: &[i64],
+        include_deleted: bool,
+    ) -> Result<Vec<TPart>, sqlx::Error> {
+        if assembly_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 走 `(assembly_id, ...)` 前缀索引，扫描量 O(这批装配件的子件数)。
+        // 排序 `assembly_id, id` 让输出稳定（同 `list_children` 的 `id ASC`）。
+        sqlx::query_as::<_, TPart>(
+            "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
+             request_date, planned_delivery_date, \
+             customer_id, assembly_id, status, is_urgent, \
+             next_process_id, \
+             order_no, system_delivery_date, note, \
+             unit_price, total_price, \
+             version, created_at, created_by, updated_at, updated_by, \
+             deleted_at, process_chain_id \
+             FROM t_part WHERE assembly_id = ANY($1) \
+               AND ($2::bool OR deleted_at IS NULL) \
+             ORDER BY assembly_id ASC, id ASC",
+        )
+        .bind(assembly_ids)
+        .bind(include_deleted)
         .fetch_all(executor)
         .await
     }
