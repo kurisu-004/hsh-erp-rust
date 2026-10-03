@@ -54,6 +54,10 @@ pub struct ShelfForReturnItem {
     pub name: String,
     pub zone: String,
     pub location: Option<String>,
+    /// 货架负载 = `t_part_batch` 里 `current_holder_id = 本架` 且
+    /// `status IN ('PENDING','IN_PROCESS','INSPECTION','OUTSOURCE')` 且
+    /// `deleted_at IS NULL` 的批次 **quantity 总和**（件数口径，不是批次数）。
+    /// 口径与 `ShelfForInspectionItem::current_load` 逐字一致。
     pub current_load: i64,
     pub is_recommended: bool,
 }
@@ -69,6 +73,10 @@ pub struct ShelfForReturnOut {
 /// for-inspection picker 出参：仅 `zone='INSPECTION' AND is_active=true`。
 ///
 /// 2026-09-22 PR4：迁移到 vo/。
+/// `current_load` 是**必出**字段：前端品检架卡片无 `v-if` 守卫地渲染「在架 N 件」，
+/// 本字段是其唯一数据源，缺字段则每张送检架卡片显示「在架 **undefined** 件」。
+/// 聚合在后端补齐而不是前端加守卫，口径与 `ShelfForReturnItem::current_load` 逐字
+/// 一致（同 status 列表、同 `SUM(quantity)`、同 `deleted_at IS NULL`）。
 #[derive(Debug, Clone, Serialize)]
 pub struct ShelfForInspectionItem {
     #[serde(serialize_with = "serialize_i64")]
@@ -78,6 +86,8 @@ pub struct ShelfForInspectionItem {
     pub zone: String,
     pub location: Option<String>,
     pub is_active: bool,
+    /// 批次 quantity 总和（口径见 `ShelfForReturnItem::current_load`）。
+    pub current_load: i64,
 }
 
 /// for-inspection picker 整体响应。

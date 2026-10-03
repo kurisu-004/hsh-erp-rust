@@ -175,7 +175,7 @@ Response 200 `data`：`ShelfForReturnOut`
 | `items[].name` | string | |
 | `items[].zone` | string | |
 | `items[].location` | string? | |
-| `items[].current_load` | i64 | LEFT JOIN t_part_batch 聚合（status IN (PENDING/IN_PROCESS/INSPECTION/OUTSOURCE) 的批次 quantity 总和；**2026-10-01** 删掉 REPAIRING 字面量 —— 返修批次 status 即 IN_PROCESS，负载口径不变）|
+| `items[].current_load` | i64 | 货架负载 = `t_part_batch` 中 `current_holder_id = 本架`、`status IN ('PENDING','IN_PROCESS','INSPECTION','OUTSOURCE')` **且 `deleted_at IS NULL`** 的批次 **quantity 总和**（件数口径，不是批次数）。`deleted_at IS NULL` 必须落在**聚合子查询**里（只写外层 `t_shelf` 不够，否则软删批次的量会被永久计入）。返修批次 status 就是 `IN_PROCESS`（`REPAIRING` 是 `t_part_batch.is_repairing` 标记列，不是独立 status），已被 IN_PROCESS 臂覆盖，故无独立的 REPAIRING 字面量 |
 | `items[].is_recommended` | bool | `current_load` 最小的第一条 = `true`，其余 `false` |
 
 业务规则：
@@ -194,12 +194,22 @@ Response 200 `data`：`ShelfForInspectionOut`
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `items[]` | `ShelfForInspectionItem` | `id` / `code` / `name` / `zone` / `location` / `is_active` |
+| `items[]` | `ShelfForInspectionItem` | `id` / `code` / `name` / `zone` / `location` / `is_active` / `current_load` |
+| `items[].current_load` | i64 | **2026-10-04**：前端品检架卡片按「在架 N 件」渲染且**无 `v-if` 守卫**，本字段是其唯一数据源（缺字段则卡片显示「在架 **undefined** 件」），故在后端补齐而非前端加守卫。口径与 [`for-return`](#get-apiv2shelvesfor-returnnext_process_id) 的 `current_load` **逐字一致**（同 status 列表 `('PENDING','IN_PROCESS','INSPECTION','OUTSOURCE')`、同 `SUM(quantity)`、同 `deleted_at IS NULL`）—— 两个 picker 对同一个架必须给出同一个数 |
 
 业务规则：
 
 - 仅 `zone='INSPECTION' AND is_active=true AND deleted_at IS NULL`
 - 不过滤 SHELF_ACCOUNT scope（品检架全员可见）
+- 按 `display_order ASC, id ASC` **稳定排序**（与 for-return 的 `ORDER BY` 后两段
+  一致，故两个 picker 对同一组货架的相对次序不会因分区筛选而抖动），但**不**按
+  `current_load` 排 —— 品检架无「最空优先」语义；**不**标 `is_recommended`
+  （for-return 独有的出参）
+- **不设 LIMIT**：返回全部符合条件的 INSPECTION 区活跃架，不分页。本端点不再经
+  `list_with_filters`（旧路径带 `MAX_LIMIT = 500` 的截断），改走
+  `list_active_inspection_with_load` 后与 for-return 的
+  `list_active_production_ordered` 一样无上限，两个 picker 的分页形态就此统一。
+  品检架基数是「物理送检架数」量级，500 的截断只会静默丢架，不作为行为保留。
 
 ---
 

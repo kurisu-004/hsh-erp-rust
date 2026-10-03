@@ -187,8 +187,18 @@ pub struct BatchToShipRequest {
 ///
 /// 无 Path extractor：`serial_no` 是主键，`batch_id` 仅在多批次歧义时用于消歧。
 /// `event_type`：`WorkerScanEvent::RETURNED` / `INSPECTED`。
-/// `shelf_id`：必填；RETURNED 时是 worker-scan 货架（PRODUCTION 区），INSPECTED
-/// 时是 worker-scan 货架（INSPECTION 区也会校验，按 event_type 分支走）。
+///
+/// `shelf_id`：**必填，且两个 event_type 都是 PRODUCTION 区的 worker-scan 货架** ——
+/// service 对它做的是**无条件**的 PRODUCTION 硬校验（不分 `event_type`），非
+/// PRODUCTION → 20501 `BIZ_SHELF_NOT_FOUND`。**不要**把 INSPECTION 区的品检架塞进
+/// 本字段：INSPECTED 的品检架走 `target_inspection_shelf_id`。任何声称本字段
+/// 「按 `event_type` 分支校验 zone」的说明都是错的 —— 本段是唯一权威口径。
+///
+/// 它**必须留在 PRODUCTION 区**的真正原因不是「工人站在哪个架前」：INSPECTED 时它
+/// 是**补料用的生产架**，在同事务的 worker-pool refill 里当候选池的
+/// `current_holder_id` 过滤键用（候选池 SQL 限
+/// `location='PRODUCTION_SHELF' AND current_holder_id = $2`，见
+/// `prod/worker_pool/repo/sql.rs`）。传品检架会让 refill 查空池。
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerScanRequest {
     pub serial_no: String,

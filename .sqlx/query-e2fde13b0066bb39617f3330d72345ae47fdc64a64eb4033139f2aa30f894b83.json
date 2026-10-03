@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_part (id, name, drawing_no, applicant_name, quantity, request_date, planned_delivery_date, customer_id, status, version, created_at, updated_at) VALUES ($1, 'TEST-NAME', 'TEST-DWG', 'TEST-APPLICANT', $2, CURRENT_DATE, CURRENT_DATE, $3, $4, 0, $5, $5)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int4",
+        "Int8",
+        "Varchar",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e2fde13b0066bb39617f3330d72345ae47fdc64a64eb4033139f2aa30f894b83"
+}

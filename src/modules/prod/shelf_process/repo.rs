@@ -153,11 +153,20 @@ impl ShelfProcessRepo {
     /// SQL 逐字保留，0 结果 → `Ok(None)`（由 service 层映射 `BIZ_SHELF_PROCESS_NOT_FOUND`）。
     ///
     /// 不带 `is_active` 守卫（车间 active 货架默认软删）；后续如需守卫再加。
+    ///
+    /// ⚠️ 2026-10-04 加固：`O` 按 `Option<i64>` 收（外层 `Option` 由
+    /// `fetch_optional` 表示「有没有行」，不表示列的类型）。`t_shelf_process.shelf_id`
+    /// 当前是 `NOT NULL`，故按 `i64` 解码当前安全；但列一旦变可空，同款写法会以
+    /// `error occurred while decoding column 0: unexpected null; try decoding as an Option`
+    /// 整笔 500。**本次零行为变化**（`NOT NULL` 列 `.flatten()` 恒为 `Some(v)`）。
+    /// 同款修法见 `prod/worker_pool/repo/mod.rs::process_chain_step_get_process_id`
+    /// 与 `prod/batch/service/worker_scan.rs::worker_scan_event`（后者是可空列，
+    /// 已在 2026-10-04 真修过一次 500）。
     pub async fn find_first_shelf_for_process<'e, E: PgExecutor<'e>>(
         executor: E,
         process_id: i64,
     ) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<i64> = sqlx::query_scalar(
+        let row: Option<Option<i64>> = sqlx::query_scalar(
             r#"
             SELECT shelf_id
             FROM t_shelf_process
@@ -169,7 +178,7 @@ impl ShelfProcessRepo {
         .bind(process_id)
         .fetch_optional(executor)
         .await?;
-        Ok(row)
+        Ok(row.flatten())
     }
 
     /// 存在性检查：该 shelf 是否映射了该 process。

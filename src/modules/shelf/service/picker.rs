@@ -6,6 +6,12 @@
 //! - `list_for_inspection` —— 仅 `zone='INSPECTION' AND is_active=true`，
 //!   不过滤 scope（品检架通常由全员可见）
 //!
+//! ## 两个 picker 的 `current_load` 口径必须一致（2026-10-04）
+//! 两者的聚合 SQL 在 `shelf/repo/sql.rs` 的 `list_active_production_ordered` 与
+//! `list_active_inspection_with_load` 里，**聚合子查询逐字相同**（同 status 列表、
+//! 同 `SUM(quantity)`、同 `deleted_at IS NULL`）。口径分叉会让两个 picker 对同一个架
+//! 给出不同的数。差异仅在 `zone` 与是否按 load 排序。
+//!
 //! ## SHELF_ACCOUNT scope 收窄（Fix B 简化）
 //! `CurrentUser::can_access_shelf` 已经对 `shelf_wildcard` / `Role::Manager`
 //! 短路返回 true，所以无需在外层再分支判断。统一调 `can_access_shelf` 即可：
@@ -27,7 +33,6 @@ use crate::shared::error::AppError;
 use super::super::dto::*;
 use super::super::repo::{ShelfRepoTrait, TShelfWithLoad};
 use super::super::vo::*;
-use super::{MAX_LIMIT, ZONE_INSPECTION};
 
 impl super::crud::ShelfService {
     // =======================================================================
@@ -95,6 +100,16 @@ impl super::crud::ShelfService {
 
     /// `GET /shelves/for-inspection`：仅 `zone='INSPECTION' AND is_active=true`。
     /// 不过滤 SHELF_ACCOUNT scope（品检架通常由全员可见）。
+    ///
+    /// 出参必带 `current_load`，数据源是 `ShelfRepo::list_active_inspection_with_load`
+    /// 的聚合结果（**不可**退回裸 `TShelf` 列表查询）：前端品检架卡片无 `v-if`
+    /// 守卫地渲染「在架 N 件」，缺字段则每张卡片显示「在架 **undefined** 件」。聚合
+    /// 放在**后端**而非前端加守卫，口径与 `list_for_return` 逐字一致（同 status
+    /// 列表、同 `SUM(quantity)`、同 `deleted_at IS NULL`），两个 picker 对同一个架
+    /// 不会给出不同的数。
+    ///
+    /// 本端点**不**标 `is_recommended`：品检架没有「最空优先」的选架语义，
+    /// 也没有消费方（for-return 独有）。
     pub async fn list_for_inspection<R: ShelfRepoTrait>(
         &self,
         mut repo: R,
@@ -109,10 +124,7 @@ impl super::crud::ShelfService {
             Role::Inspector,
         ])?;
 
-        // 直接复用 list_with_filters，zone='INSPECTION' AND is_active=true
-        let shelves = repo
-            .list_with_filters(None, Some(ZONE_INSPECTION), Some(true), MAX_LIMIT, 0)
-            .await?;
+        let shelves = repo.list_active_inspection_with_load().await?;
         let items = shelves
             .into_iter()
             .map(|s| ShelfForInspectionItem {
@@ -122,6 +134,7 @@ impl super::crud::ShelfService {
                 zone: s.zone,
                 location: s.location,
                 is_active: s.is_active,
+                current_load: s.current_load,
             })
             .collect();
         Ok(ShelfForInspectionOut { items })
