@@ -23,9 +23,18 @@ WORKDIR /build
 
 # ---- 依赖层：清单 + 桩源码 ----
 COPY Cargo.toml Cargo.lock ./
+# 2026-10-04 修：workspace 是 `members = [".", "test-support"]`（hsh-erp-test-support
+# 反向依赖根包），cargo 解析 workspace 清单时必须能读到该成员的 manifest 与 targets，
+# 否则任何 cargo 命令都在解析阶段就挂：`failed to read /build/test-support/Cargo.toml`。
+# 本镜像只 build `--bin hsh-erp-rust`，dev-dep 链上的 test-support 不会被编译，
+# 这里纯粹是为满足清单解析。
+COPY test-support ./test-support
 RUN mkdir -p src \
     && echo 'fn main() {}' > src/main.rs \
-    && : > src/lib.rs
+    && : > src/lib.rs \
+    && for p in $(sed -n '/^\[\[bin\]\]/,/^\[/s/^path *= *"\(.*\)"/\1/p' Cargo.toml); do \
+         mkdir -p "$(dirname "$p")" && echo 'fn main() {}' > "$p"; \
+       done
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --release --locked
@@ -33,6 +42,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---- 真实源码（.sqlx 与 migrations 都是编译期宏的输入）----
 COPY .sqlx ./.sqlx
 COPY migrations ./migrations
+# seeds/ 同理：src/infra/seed.rs 用 include_str! 编译期内嵌 menu.sql / admin.sql
+COPY seeds ./seeds
 COPY src ./src
 
 # 关键：必须 touch 全部 .rs，cargo 的 mtime 缓存才不会复用空 lib.rs

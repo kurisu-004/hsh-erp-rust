@@ -65,7 +65,10 @@ services:
     container_name: ${CONTAINER_PREFIX:-}redis-dev
     restart: unless-stopped
     ports:
-      - "${REDIS_PORT:-6380}:6370"
+      # 容器内固定 6379：写 6370 时 redis 根本没监听那个端口，宿主机连上去必 connection refused。
+      # 宿主机侧 6379 是主 checkout 的开发库约定（见文件头端口表），worktree 由
+      # scripts/wt_services.sh 注入 REDIS_PORT 落到 6381-6449 保留段。
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis-pdata:/data
     healthcheck:
@@ -79,7 +82,9 @@ services:
     container_name: ${CONTAINER_PREFIX:-}redis-test
     restart: unless-stopped
     ports:
-      - "${REDIS_TEST_PORT:-6381}:6379"
+      # 6380 是主 checkout 的测试库约定；不能挪到 6381 —— 那是 wt_services.sh
+      # 给 worktree 分配的保留段起点，会跟 worktree 抢端口。
+      - "${REDIS_TEST_PORT:-6380}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
