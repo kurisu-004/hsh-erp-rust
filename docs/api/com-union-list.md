@@ -38,7 +38,7 @@ GET /api/v2/com/union-list
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |---|---|---|---|---|
-| `row_type` | `string` | 否 | `"ALL"` | 行类型过滤：`"ALL"` / `"PART"` / `"ASSEMBLY"`。非法值 → `40001 VALIDATION_ERROR` |
+| `row_type` | `string` | 否 | `"ALL"` | 行类型过滤：`"ALL"` / `"PART"` / `"PART_FLAT"` / `"ASSEMBLY"`。非法值 → `40001 VALIDATION_ERROR` |
 | `customer_id` | `i64` (string) | 否 | — | 客户 id（雪花 ID 字符串）；service 层展开 L1+L2 ids |
 | `status` | `string` | 否 | — | 单状态筛选（如 `"PENDING"`） |
 | `statuses` | `string` | 否 | — | 多状态逗号分隔（如 `"PENDING,IN_PROCESS"`） |
@@ -65,12 +65,18 @@ GET /api/v2/com/union-list
 
 ### `row_type` 语义矩阵
 
-| `row_type`         | 行为 |
+| `row_type` | 行为 |
 |--------------------|-------------------------------------------------|
 | `"PART"`           | 仅 `t_part WHERE assembly_id IS NULL`（装配体子件被守卫排除） |
+| `"PART_FLAT"`      | 2026-10-05 新增：仅 `t_part`（**含** `assembly_id IS NOT NULL` 的装配件子件），**无** `t_assembly` 段。口径与 `GET /api/v2/dashboard/snapshot` 的 `upcoming_delivery[].count`（`t_part` 行数）逐行对齐，供该统计的下钻列表消费：柱状图 9（4 子件 + 5 独立件）时本态也返 9 行 |
 | `"ASSEMBLY"`       | 仅 `t_assembly`（投影为 `PartListItem` 形态） |
 | `"ALL"` / 缺省 / `""` | `t_part` UNION ALL `t_assembly` + 每段 `LIMIT (offset+limit)` pushdown |
 | 其它非空字符串      | `40001 VALIDATION_ERROR`（HTTP 422） |
+
+> `"PART_FLAT"` 与 `"PART"` 的唯一差别是 SQL 里的 `AND assembly_id IS NULL` 子件守卫
+> 开关（`PartListFilters.part_only`）——过滤参数、排序、enrichment、`count` 全部共用同一
+> 实现。响应行的 `row_type` 字段恒为 `"PART"`（`PartListItem` 从 `TPart` 派生，不是
+> `"PART_FLAT"`）。
 
 ## 响应
 
@@ -91,7 +97,7 @@ GET /api/v2/com/union-list
         "request_date": "2026-09-29",
         "planned_delivery_date": "2026-10-15",
         "customer_id": "9876543210987654321",
-        "assembly_id": null,             // PART 行 None / 装配件子件 None
+        "assembly_id": null,             // PART / PART_FLAT 行见下表
         "status": "PENDING",
         "is_urgent": false,
         "order_no": null,
@@ -125,17 +131,27 @@ GET /api/v2/com/union-list
 
 **派生字段规则**：
 
-| 字段 | PART 行 | ASSEMBLY 行 |
-|---|---|---|
-| `location` | min-progress 活跃批次 location；无活跃批次 → `None` | `None` |
-| `holder_name` | 按 location 分桶解析（`t_shelf.code` / `t_worker.name` / `t_outsource_company.name`） | `None` |
-| `has_children` | `false` | `child_count.unwrap_or(0) > 0` |
-| `child_count` | `None` | 子件数（`t_part WHERE assembly_id = $1 AND deleted_at IS NULL` 的 COUNT） |
-| `customer_name` / `l1_customer_name` | 派生 | 派生 |
-| `assembly_id` | 装配件子件 → `Some(id)`；顶层零件 → `None` | `None`（顶层装配件无父） |
-| `process_chain_id` | 直接搬 | `None`（t_assembly 无此列） |
-| `batch_id` / `batch_version` | **`None`（恒 `null`，不填）** | **`None`（恒 `null`，不填）** |
-| `delivered_quantity` | 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的 `quantity` 之和（零批次 → `0`） | 可凑齐的套数 `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，整数除法截断；子件总量为 0 者不参与，无子件 → `0`，子件超交时收口到工单总套数 |
+| 字段 | PART 行 | PART_FLAT 行 | ASSEMBLY 行 |
+|---|---|---|---|
+| `location` | min-progress 活跃批次 location；无活跃批次 → `None` | 同 PART 行 | `None` |
+| `holder_name` | 按 location 分桶解析（`t_shelf.code` / `t_worker.name` / `t_outsource_company.name`） | 同 PART 行 | `None` |
+| `has_children` | `false` | `false` | `child_count.unwrap_or(0) > 0` |
+| `child_count` | `None` | `None` | 子件数（`t_part WHERE assembly_id = $1 AND deleted_at IS NULL` 的 COUNT） |
+| `customer_name` / `l1_customer_name` | 派生 | 派生 | 派生 |
+| `assembly_id` | 恒为 `null`（子件被守卫排除） | 子件 → `Some(父 t_assembly.id)`；独立件 → `None` | `None`（顶层装配件无父） |
+| `process_chain_id` | 直接搬 | 直接搬 | `None`（t_assembly 无此列） |
+| `batch_id` / `batch_version` | **`None`（恒 `null`，不填）** | **`None`（恒 `null`，不填）** | **`None`（恒 `null`，不填）** |
+| `delivered_quantity` | 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的 `quantity` 之和（零批次 → `0`） | 同 PART 行 | 可凑齐的套数 `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，整数除法截断；子件总量为 0 者不参与，无子件 → `0`，子件超交时收口到工单总套数 |
+
+> ⚠️ `assembly_id`（2026-10-05 新增 `PART_FLAT` 态）：该字段此前只挂在 VO 上、
+> 三态都没有真实取值 —— `PART` 行被 `assembly_id IS NULL` 守卫挡住、恒 `null`；
+> `ASSEMBLY` 行由投影函数硬编码 `None`。`PART_FLAT` 态是本端点第一次把它放出来：
+> 装配件子件带 `Some(父 t_assembly.id)`，独立件为 `None`，前端可据此把子件
+> 归组到父装配件。
+>
+> `row_type` 字段值恒为 `"PART"`（`PartListItem` 从 `TPart` 派生，与请求的
+> `row_type=PART_FLAT` 无关），故本端点四态中只有 `"PART"` / `"ASSEMBLY"` 两种
+> 行标签。
 
 > ⚠️ `delivered_quantity`（2026-10-03 新增）：真相源是 `t_part_batch.status`
 > （批次级「已交」的唯一依据，**不**从派生缓存 `t_part.status` 反推 —— 后者在
@@ -210,11 +226,13 @@ LIMIT $limit OFFSET $offset;
 - `keyword` 走 ILIKE 三列 OR（name / drawing_no / serial_no），DDL 上无
   trigram 索引，单段可能 seq scan；客户筛选缩窄后命中索引覆盖
 
-### PART / ASSEMBLY 单段模式
+### PART / PART_FLAT / ASSEMBLY 单段模式
 
 直走现成 repo：
 - PART：`part/repo/sql/part_sql.rs::list_with_filters`（`part_only=true` 强写
-  守卫）+ `count_with_filters`
+  子件守卫）+ `count_with_filters`
+- PART_FLAT（2026-10-05 新增）：同一个 `list_with_filters`，`part_only=false`
+  放行子件；过滤 / 排序 / enrichment / 分页与 PART 同一份实现
 - ASSEMBLY：`assembly/repo/sql.rs::list_with_filters` + `count_with_filters`
 
 不需 pushdown（本身就是单表）。
@@ -224,6 +242,7 @@ LIMIT $limit OFFSET $offset;
 - ALL：`part_total + asm_total`（两次 `count_with_filters`），不查 union 表
   （union 计数代价高）
 - PART：`PartRepo::count_with_filters(part_only=true)`
+- PART_FLAT：`PartRepo::count_with_filters(part_only=false)`
 - ASSEMBLY：`AssemblyRepo::count_with_filters`
 
 ## 示例
@@ -302,6 +321,44 @@ curl -G "http://localhost:3000/api/v2/com/union-list" \
 }
 ```
 
+### PART_FLAT 模式（2026-10-05 新增）
+
+统计与展示统一以 `t_part` 行为单元：装配件父行（`t_assembly`）不计入不展示，
+每个子件（`assembly_id IS NOT NULL`）各计 1、各占 1 行。口径与
+`GET /api/v2/dashboard/snapshot` 的 `upcoming_delivery[].count` 一致。
+
+```bash
+curl -G "http://localhost:3000/api/v2/com/union-list" \
+  -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode "row_type=PART_FLAT" \
+  --data-urlencode "statuses=PENDING,IN_PROCESS" \
+  --data-urlencode "system_delivery_date_from=2026-10-05" \
+  --data-urlencode "sort_by=SYSTEM_DELIVERY_DATE" \
+  --data-urlencode "sort_dir=ASC" \
+  --data-urlencode "limit=200"
+```
+
+场景数据：1 个装配件（4 个子件）+ 5 个独立零件。响应（`total == items.len() == 9`，
+4 条子件带同一 `assembly_id`，5 条独立件为 `null`）：
+
+```json
+{
+  "code": 0,
+  "data": {
+    "items": [
+      {"id": "1111", "row_type": "PART", "assembly_id": "9999", "name": "子件 A", ...},
+      {"id": "2222", "row_type": "PART", "assembly_id": null, "name": "独立件 B", ...}
+    ],
+    "total": 9,
+    "limit": 200,
+    "offset": 0
+  }
+}
+```
+
+> `limit` 上限 200（`query.limit.unwrap_or(50).clamp(1, 200)`），传 500 会被静默截到
+> 200；需要展示全量时前端按 `total` 与 `items.length` 的差额给截断提示。
+
 ### 非法 `row_type`
 
 ```bash
@@ -314,7 +371,7 @@ curl -G "http://localhost:3000/api/v2/com/union-list" \
 ```json
 {
   "code": 40001,
-  "message": "row_type 非法: BAD（必须是 PART / ASSEMBLY / ALL 或省略）"
+  "message": "row_type 非法: BAD（必须是 PART / PART_FLAT / ASSEMBLY / ALL 或省略）"
 }
 ```
 

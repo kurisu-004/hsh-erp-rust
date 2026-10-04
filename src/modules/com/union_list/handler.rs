@@ -42,7 +42,7 @@ const LIST_UNION_ROLES: &[Role] = &[
 /// `GET /api/v2/com/union-list` —— 跨表合并视图（part UNION assembly）。
 ///
 /// 权限：`LIST_UNION_ROLES`（Manager / Clerk / Inspector / CncProgrammer）。
-/// query：`UnionListQuery`（含 `row_type=ALL|PART|ASSEMBLY` 必传语义）。
+/// query：`UnionListQuery`（含 `row_type=ALL|PART|PART_FLAT|ASSEMBLY` 必传语义）。
 /// 业务流转：纯读；不开事务。
 /// 响应：`R<PartListOut>` —— 与 `/api/v2/parts` 同形 VO。
 pub async fn list_union_items(

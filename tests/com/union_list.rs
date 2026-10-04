@@ -13,6 +13,12 @@
 //!    只累加 DELIVERED / COMPLETED 且非软删的批次（含 `0 < 已交 < 总量` 的
 //!    部分已交形态）；ASSEMBLY 行取 `MIN(子件已送 × 套数 / 子件总量)` 并对工单
 //!    总套数 `LEAST` 收口（总量 0 不参与 / 无子件为 0 / 子件超交收口 / 大数不溢出）。
+//! 8. 2026-10-05 新增：`row_type=PART_FLAT`（t_part 平铺口径）—— 仅 `t_part`
+//!    且**含**装配件子件。1 装配件 + 4 子件 + 5 独立件 → `PART_FLAT` 返 9
+//!    （4 条带同一 `assembly_id` + 5 条 `null`，行 `row_type` 恒 `"PART"`）、
+//!    `PART` 仍返 5（子件守卫未失效）、`ALL` 仍返 6（未被波及）；并断言该态的
+//!    过滤 / 排序参数与 PART 态同形（`statuses` + `system_delivery_date_from/to`
+//!    + `sort_by=SYSTEM_DELIVERY_DATE` 三参数组合，子件同样参与过滤与排序）。
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -575,6 +581,234 @@ async fn union_list_row_type_all_merges_part_and_assembly() {
         row_types.is_empty(),
         "应仅含 PART / ASSEMBLY 两类: {row_types:?}"
     );
+}
+
+/// 2026-10-05 新增：`row_type=PART_FLAT` —— 统计与展示统一以 `t_part` 行为单元。
+///
+/// 场景数据（对应用户需求原文的 1 装配件 + 4 子件 + 5 独立件 = 9）：
+/// - 1 个 `t_assembly` 父行（`t_assembly` 全模块零引用，本态不返）
+/// - 4 个子件（`t_part.assembly_id = 父 id`）
+/// - 5 个独立件（`t_part.assembly_id IS NULL`）
+///
+/// 三态对照断言：
+/// - `PART_FLAT` → `total == 9`（4 子件 + 5 独立件），4 条带同一 `assembly_id`
+/// - `PART`     → `total == 5`（子件守卫 `assembly_id IS NULL` 未失效）
+/// - `ALL`      → `total == 6`（5 独立 + 1 装配件父行；ALL 分支未被波及）
+///
+/// 另断言响应行的 `row_type` 字段恒为 `"PART"`（`PartListItem` 从 `TPart` 派生，
+/// 不是请求里的 `"PART_FLAT"`）。
+#[tokio::test]
+async fn union_list_row_type_part_flat_counts_child_parts_as_rows() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+
+    // 1 个装配件父行 + 4 个子件 + 5 个独立件
+    let asm = insert_assembly(&pool, "ASM-FLAT-001", "A-FLAT", fx.customer_l2_id).await;
+    for i in 0..4 {
+        insert_part_under_assembly(
+            &pool,
+            &format!("CHILD-{i}"),
+            fx.customer_l2_id,
+            asm,
+            "PENDING",
+        )
+        .await;
+    }
+    for i in 0..5 {
+        insert_part(
+            &pool,
+            &format!("SOLO-{i}"),
+            fx.customer_l2_id,
+            Some(&format!("SOLO{i:03}")),
+            "PENDING",
+        )
+        .await;
+    }
+
+    // ----- PART_FLAT：9 行（4 子件 + 5 独立件）-----
+    let (s, env) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=PART_FLAT&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "row_type=PART_FLAT: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(env["data"]["total"], 9, "4 子件 + 5 独立件 = 9: {env}");
+    assert_eq!(items.len(), 9, "无分页时 total 应等于 items.len(): {env}");
+
+    let mut child_rows = 0usize;
+    let mut solo_rows = 0usize;
+    for item in items {
+        // 响应行标签恒为 "PART"（请求态是 PART_FLAT）
+        assert_eq!(item["row_type"], "PART", "PART_FLAT 行 row_type: {item}");
+        // 子件 → Some(父 id)；wire 上是字符串（serialize_i64_opt）
+        let aid = item["assembly_id"]
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok());
+        match aid {
+            Some(a) => {
+                child_rows += 1;
+                assert_eq!(a, asm, "子件的 assembly_id 应指向同一父装配件: {item}");
+            }
+            None => solo_rows += 1,
+        }
+    }
+    assert_eq!(child_rows, 4, "应有 4 条带 assembly_id 的子件行: {env}");
+    assert_eq!(solo_rows, 5, "应有 5 条 assembly_id=null 的独立件行: {env}");
+
+    // ----- 回归：PART 态仍被 `assembly_id IS NULL` 守卫收窄到 5 -----
+    let (s, env) = send(
+        app.clone(),
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=PART&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "row_type=PART: {env}");
+    assert_eq!(env["data"]["total"], 5, "PART 态应仍排除 4 个子件: {env}");
+
+    // ----- 回归：ALL 态不受影响（5 独立 + 1 装配件父行）-----
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=ALL&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "row_type=ALL: {env}");
+    assert_eq!(
+        env["data"]["total"], 6,
+        "ALL 态 = 5 独立 part + 1 装配件父行: {env}"
+    );
+}
+
+/// 2026-10-05 新增：`row_type=PART_FLAT` 的过滤 / 排序参数与 PART 态完全同形。
+///
+/// 组合断言（2026-10-05 需求验收第 6 条，至少覆盖三参数组合）：
+/// - `statuses=PENDING,IN_PROCESS`（子件也参与状态过滤）
+/// - `system_delivery_date_from` / `_to` 闭区间（子件也参与交期窗口过滤）
+/// - `sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC`（子件也参与排序）
+///
+/// 排布（today 为基准）：
+/// - 子件 A：status=IN_PROCESS、sd=today+2d（命中窗口，排最前）
+/// - 独立件 B：status=PENDING、sd=today+3d（命中窗口，排其后）
+/// - 独立件 C：status=DELIVERED、sd=today+3d（状态不命中 → 被 statuses 排除）
+/// - 子件 D：status=PENDING、sd=today+9d（窗口不命中 → 被日期排除）
+/// 期望命中 2 条，且 ASC 顺序为 A → B。
+#[tokio::test]
+async fn union_list_row_type_part_flat_supports_part_filters() {
+    use chrono::Duration;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+
+    let asm = insert_assembly(&pool, "ASM-FLT-001", "A-FLT", fx.customer_l2_id).await;
+    // 子件：insert_part_full 不带 assembly_id，故子件用 under_assembly + 事后 UPDATE
+    // system_delivery_date / status 的组合（helper 家族无「子件 + 系统交期」组合）
+    let child_a =
+        insert_part_under_assembly(&pool, "CHILD-A", fx.customer_l2_id, asm, "IN_PROCESS").await;
+    let child_d =
+        insert_part_under_assembly(&pool, "CHILD-D", fx.customer_l2_id, asm, "PENDING").await;
+    let solo_b = insert_part_full(
+        &pool,
+        "SOLO-B",
+        "D-FLT-B",
+        fx.customer_l2_id,
+        Some("FLTB"),
+        None,
+        today,
+        today,
+        Some(today + Duration::days(3)),
+    )
+    .await;
+    let solo_c = insert_part_full(
+        &pool,
+        "SOLO-C",
+        "D-FLT-C",
+        fx.customer_l2_id,
+        Some("FLTC"),
+        None,
+        today,
+        today,
+        Some(today + Duration::days(3)),
+    )
+    .await;
+    // 子件补系统交期（helper 无组合参数，用 UPDATE 补齐，见上方注释）
+    sqlx::query("UPDATE t_part SET system_delivery_date = $1 WHERE id = $2")
+        .bind(today + Duration::days(2))
+        .bind(child_a)
+        .execute(&pool)
+        .await
+        .expect("set child A system_delivery_date");
+    sqlx::query("UPDATE t_part SET system_delivery_date = $1 WHERE id = $2")
+        .bind(today + Duration::days(9))
+        .bind(child_d)
+        .execute(&pool)
+        .await
+        .expect("set child D system_delivery_date");
+    sqlx::query("UPDATE t_part SET status = 'DELIVERED' WHERE id = $1")
+        .bind(solo_c)
+        .execute(&pool)
+        .await
+        .expect("set solo C delivered");
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=PART_FLAT\
+                 &statuses=PENDING,IN_PROCESS\
+                 &system_delivery_date_from={}&system_delivery_date_to={}\
+                 &sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC&limit=200",
+                fx.customer_l2_id,
+                (today + Duration::days(2)).format("%Y-%m-%d"),
+                (today + Duration::days(3)).format("%Y-%m-%d"),
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "PART_FLAT 组合筛选: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().unwrap();
+    assert_eq!(
+        env["data"]["total"], 2,
+        "statuses + 系统交期窗口应仅命中子件 A 与独立件 B: {env}"
+    );
+    assert_eq!(items.len(), 2, "{env}");
+    let ids: Vec<i64> = items
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![child_a, solo_b],
+        "ASC 排序：系统交期 today+2d 的子件 A 应在 today+3d 的 B 之前; ids={ids:?}"
+    );
+    // 命中的子件行 assembly_id 仍是真实父 id（未被过滤参数抹掉）
+    assert_eq!(find_row(&env, child_a)["assembly_id"], asm.to_string());
+    assert!(find_row(&env, solo_b)["assembly_id"].is_null());
 }
 
 /// `row_type=ALL` deep offset 分页回归 —— pushdown 修分页 bug（plan §3）。

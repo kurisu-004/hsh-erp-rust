@@ -144,11 +144,17 @@ HTTP request
 | `data.on_production_shelves[].items[].next_process_name` | string \| null | 否 | 下一道工序名 |
 | `data.on_production_shelves[].items[].worker_name` | string \| null | 否 | 当前持有工人姓名 |
 | `data.upcoming_delivery[].date` | string | 是 | 日期 `YYYY-MM-DD`。**口径由 `?basis=` 决定**（2026-10-04 新增）：`planned` = 计划交期日、`system` = 系统交期日；桶本身（日期序列 + 补零规则）两口径一致 |
-| `data.upcoming_delivery[].count` | integer | 是 | 当天预计交付 part 数（i64，JSON wire 保留 number；非 snowflake ID 故不走字符串化） |
-| `data.upcoming_delivery[].by_status` | object<string, integer> | 是 | 当天按 `OrderStatus` 细分的件数（2026-09-30 新增；供 dashboard 分层堆叠柱状图用）。**COMPLETED / CANCELLED 已 WHERE 排除，by_status 不会含这两个 key**；空对象 `{}` 表示当日 0 件。key 字母序排列（BTreeMap 序列化保证），但前端按 key 直接查，不依赖顺序。 |
+| `data.upcoming_delivery[].count` | integer | 是 | 当天预计交付件数（i64，JSON wire 保留 number；非 snowflake ID 故不走字符串化）。**口径 = `t_part` 行数**：**含**装配件子件（`assembly_id IS NOT NULL`，每个子件各计 1），**不含**装配件父行（`t_assembly` 在本端点全模块零引用，`t_part.assembly_id` 只是个指向 `t_assembly.id` 的逻辑外键）。与 `GET /api/v2/com/union-list?row_type=PART_FLAT` 的下钻列表口径一致，本字段的条目数应等于该态同一时间窗下的 `total` |
+| `data.upcoming_delivery[].by_status` | object<string, integer> | 是 | 当天按 `OrderStatus` 细分的件数（2026-09-30 新增；供 dashboard 分层堆叠柱状图用），口径与同桶 `count` 完全一致（含子件、不含装配件父行）。**COMPLETED / CANCELLED 已 WHERE 排除，by_status 不会含这两个 key**；空对象 `{}` 表示当日 0 件。key 字母序排列（BTreeMap 序列化保证），但前端按 key 直接查，不依赖顺序。 |
 
 > `data.upcoming_delivery[].by_status` 与 `data.upcoming_delivery[].count` 的关系：
 > `count = by_status 所有 value 之和`（service 端求和，VO 与 SQL 二次一致性由 SQL 单次聚合保证）。
+
+> ⚠️ **`count` 的统计单元（2026-10-05 写明）**：本字段统计的是 `t_part` 行，
+> **含装配件子件**、**不含装配件父行**。前端由本字段触发的下钻列表必须用
+> `GET /api/v2/com/union-list?row_type=PART_FLAT`（同一 `t_part` 口径），
+> 不得用 `row_type=PART`（子件被 `assembly_id IS NULL` 守卫排除，会出现
+> 「柱状图 9 条 / 抽屉 5 条」的不一致）或 `row_type=ALL`（会多出装配件父行）。
 
 > ⚠️ **两口径的缺失语义（2026-10-04 新增）**
 > - `?basis=system` 下 `system_delivery_date IS NULL` 的工单**整件不计入**：WHERE 的两处

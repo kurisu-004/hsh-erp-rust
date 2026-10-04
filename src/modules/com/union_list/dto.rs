@@ -7,6 +7,7 @@
 //! | `row_type`         | 行为                                            |
 //! |--------------------|-------------------------------------------------|
 //! | `"PART"`           | 仅 `t_part WHERE assembly_id IS NULL`           |
+//! | `"PART_FLAT"`      | 仅 `t_part`（**含** `assembly_id IS NOT NULL` 的装配件子件），无 `t_assembly` 段 |
 //! | `"ASSEMBLY"`       | 仅 `t_assembly`（投影为 `PartListItem`）        |
 //! | absent / `"ALL"`   | ALL：`t_part` UNION ALL `t_assembly` + pushdown |
 //! | 其它非空字符串     | `40001 VALIDATION_ERROR`                        |
@@ -30,6 +31,15 @@ use crate::shared::types::deserialize_i64_opt;
 pub enum RowType {
     All,
     Part,
+    /// 2026-10-05 新增：仅 `t_part`，且**不去**装配件子件守卫（`assembly_id IS NOT NULL`
+    /// 的子件各计 1、各占 1 行），**不含** `t_assembly` 段。
+    ///
+    /// 存在的理由：dashboard 大屏交期分桶柱状图（`GET /api/v2/dashboard/snapshot` 的
+    /// `upcoming_delivery[].count`）以 `t_part` 行为单元统计，而下钻列表此前走
+    /// `PART` 态（子件被 `assembly_id IS NULL` 守卫排除），导致柱状图数量与抽屉条目数
+    /// 对不上（1 装配件 + 4 子件 + 5 独立件 = 柱状图 9 / 抽屉 5）。本态把下钻列表
+    /// 切到与柱状图同一口径：装配件父行（`t_assembly`）不计入不展示，每个子件各计 1。
+    PartFlat,
     Assembly,
 }
 
@@ -38,6 +48,7 @@ impl RowType {
     ///
     /// - `None` / `Some("ALL")` / `Some("all")` / `Some("")` → `RowType::All`
     /// - `Some("PART")` / `Some("part")` → `RowType::Part`
+    /// - `Some("PART_FLAT")` / `Some("part_flat")` → `RowType::PartFlat`
     /// - `Some("ASSEMBLY")` / `Some("assembly")` → `RowType::Assembly`
     /// - 其它 → `Err(AppError::validation(...))`（错误码 40001）
     pub fn parse(raw: Option<&str>) -> Result<Self, crate::shared::error::AppError> {
@@ -45,9 +56,10 @@ impl RowType {
         match raw.map(|s| s.trim().to_ascii_uppercase()).as_deref() {
             None | Some("") | Some("ALL") => Ok(RowType::All),
             Some("PART") => Ok(RowType::Part),
+            Some("PART_FLAT") => Ok(RowType::PartFlat),
             Some("ASSEMBLY") => Ok(RowType::Assembly),
             Some(other) => Err(AppError::validation(format!(
-                "row_type 非法: {other}（必须是 PART / ASSEMBLY / ALL 或省略）"
+                "row_type 非法: {other}（必须是 PART / PART_FLAT / ASSEMBLY / ALL 或省略）"
             ))),
         }
     }
@@ -62,7 +74,7 @@ impl RowType {
 /// `row_type` 取代）。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct UnionListQuery {
-    /// 行类型：`"ALL"` / `"PART"` / `"ASSEMBLY"` / 省略(=ALL)。非法值 → 40001。
+    /// 行类型：`"ALL"` / `"PART"` / `"PART_FLAT"` / `"ASSEMBLY"` / 省略(=ALL)。非法值 → 40001。
     #[serde(default)]
     pub row_type: Option<String>,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
