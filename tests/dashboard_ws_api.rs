@@ -31,7 +31,8 @@
 //!    11. http_snapshot_custom_7_days_returns_7_buckets   — ?upcoming_days=7 → 7 条桶（向后兼容老契约）
 //!
 //!   HTTP `?basis=` query 参数（2026-10-04 新增）：
-//!    17. http_snapshot_basis_system_returns_14_buckets  — ?basis=system → 200 + 桶数仍 = N
+//!    17. http_snapshot_basis_switches_delivery_date_column — 同库同数据下
+//!        ?basis=planned 落 today+3 桶、?basis=system 落 today+9 桶（钉死交期列切换）
 //!    18. http_snapshot_basis_invalid_value_returns_400  — ?basis=xxx → 400（Query 反序列化，纯文本体）
 //!
 //! 测试栈：必须建 Redis pool，session 写入才算「已吊销」
@@ -1158,27 +1159,107 @@ async fn http_snapshot_custom_7_days_returns_7_buckets() {
 // 2026-10-04 新增：HTTP `GET /api/v2/dashboard/snapshot?basis=` query 参数
 // ===========================================================================
 //
-// 覆盖 handler 层 `SnapshotQuery.basis` 的 `Query` 反序列化（此前只有 service 直调
-// 传 `None` 的用例，走不到 axum 提取器）：
-//   - basis_system_returns_14_buckets — ?basis=system → 200 + 桶数仍 = N（口径不
-//     影响桶的日期序列，只影响 count / by_status）
-//   - basis_invalid_value_returns_400 — ?basis=xxx → 400（纯文本 body，不走信封）
+// 覆盖 handler 层 `SnapshotQuery.basis` 的 `Query` 反序列化 + repo 层两段 SQL 的
+// 交期列切换：
+//   - basis_switches_delivery_date_column  — 同库同数据下 `?basis=planned` 与
+//     `?basis=system` 的桶内容落在不同日期下标，把「交期列换了」钉死
+//   - basis_invalid_value_returns_400      — ?basis=xxx → 400（纯文本 body，不走信封）
 //
 // 非法取值的响应体不是 `R<T>` JSON，故用 `send_raw` 取原始文本（`send` 会在 JSON
 // 解析处 panic）。
 
 #[tokio::test]
-async fn http_snapshot_basis_system_returns_14_buckets() {
-    // `?basis=system`：service 层 `basis.or(Planned)` 走 System 分支，交期列换成
-    // `system_delivery_date`；桶的日期序列（today → today+N-1）与补零规则两口径
-    // 共用，故桶数仍 = 14。
+async fn http_snapshot_basis_switches_delivery_date_column() {
+    // 鉴别力设计：本库只插 **1 行** t_part，且它的两列交期分处窗口内不同下标
+    // （planned = today+3 在 14 天窗口内，system = today+9 也在窗口内）——单看
+    // 「桶数 = 14」两口径不可区分，必须断言**同一行落进不同的桶**才说明
+    // `SQL_COUNTERS_PLANNED` / `SQL_COUNTERS_SYSTEM` 真的换了列。
     let pool = setup().await;
     let state = test_state(pool.clone()).await;
     let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
     let app = test_app(state.clone());
 
+    // 沿 SQL 内 `CURRENT_DATE`（= Local::now().date_naive()）口径，避免本地日期漂移
+    let today = chrono::Local::now().date_naive();
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+
+    // t_part.customer_id 是逻辑外键（无 DB 级 FK 约束），仍随仓内既有写法插一条
+    // t_customer 保证引用自洽（serial_prefix varchar(1) 且须大写字母）。
+    let cust_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, updated_at) VALUES ($1, 'basis_cust', NULL, 'Z', 0, $2, $2)",
+    )
+    .bind(cust_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert t_customer");
+
+    // 唯一 1 行 part：两列交期**故意错开**——planned 落 today+3 桶、system 落
+    // today+9 桶，两者都在 14 天窗口内，故「只插 NULL system 交期」那种数据无法
+    // 区分口径。status 取 PENDING（SQL 已排除 COMPLETED / CANCELLED）。
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
+         request_date, planned_delivery_date, system_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'p-basis', 'DWG-BASIS', 'tester', $2, $3, $4, $5, 'PENDING', 0, $6, NULL, $6, NULL)",
+    )
+    .bind(snowflake.next_id())
+    .bind(cust_id)
+    .bind(today)
+    .bind(today + chrono::Duration::days(3))
+    .bind(today + chrono::Duration::days(9))
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert t_part");
+
+    // ── ?basis=planned：只认 planned_delivery_date → 落 today+3（idx 3） ──
     let (status, envelope) = send(
-        app,
+        app.clone(),
+        json_request(
+            "GET",
+            "/dashboard/snapshot?basis=planned",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "?basis=planned 应返 200"
+    );
+    assert_eq!(envelope["code"], 0);
+    let buckets = envelope["data"]["upcoming_delivery"]
+        .as_array()
+        .expect("upcoming_delivery 必为 array");
+    assert_eq!(buckets.len(), 14, "缺省 N = 14");
+    assert_eq!(
+        buckets[3]["count"].as_i64(),
+        Some(1),
+        "planned 口径应把该行计入 today+3 桶；got={}",
+        buckets[3]
+    );
+    assert_eq!(
+        buckets[9]["count"].as_i64(),
+        Some(0),
+        "planned 口径不该认 system 交期，today+9 桶应为 0；got={}",
+        buckets[9]
+    );
+    assert_eq!(
+        buckets[3]["by_status"]["PENDING"].as_i64(),
+        Some(1),
+        "planned 口径 today+3 桶 by_status 应含 PENDING=1"
+    );
+
+    // ── ?basis=system：只认 system_delivery_date → 落 today+9（idx 9） ──
+    // 同一行、同一库，只改 query 口径：桶数与日期序列不动（两口径共用装配逻辑），
+    // 变的只是命中哪一桶。
+    let (status, envelope) = send(
+        app.clone(),
         json_request(
             "GET",
             "/dashboard/snapshot?basis=system",
@@ -1198,14 +1279,28 @@ async fn http_snapshot_basis_system_returns_14_buckets() {
         "?basis=system 不改变桶的日期序列，缺省 N 仍为 14"
     );
     // 首桶日期仍为 today（口径只换交期列，不换分桶锚点）
-    let today_str = chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
+    let today_str = today.format("%Y-%m-%d").to_string();
     assert_eq!(
         buckets[0]["date"].as_str(),
         Some(today_str.as_str()),
         "system 口径首桶日期仍应为今天"
+    );
+    assert_eq!(
+        buckets[3]["count"].as_i64(),
+        Some(0),
+        "system 口径不该认 planned 交期，today+3 桶应为 0；got={}",
+        buckets[3]
+    );
+    assert_eq!(
+        buckets[9]["count"].as_i64(),
+        Some(1),
+        "system 口径应把该行计入 today+9 桶；got={}",
+        buckets[9]
+    );
+    assert_eq!(
+        buckets[9]["by_status"]["PENDING"].as_i64(),
+        Some(1),
+        "system 口径 today+9 桶 by_status 应含 PENDING=1"
     );
     for (idx, b) in buckets.iter().enumerate() {
         assert!(
@@ -1239,5 +1334,11 @@ async fn http_snapshot_basis_invalid_value_returns_400() {
     assert!(
         serde_json::from_str::<serde_json::Value>(&body).is_err(),
         "400 body 应为纯文本而非 JSON 信封；body={body}"
+    );
+    // 光「非 JSON」定不出是哪个 query 参数解析失败的（只传 ?basis=xxx、
+    // upcoming_days 缺省，故此断言同时把失败原因钉在 basis 上）。
+    assert!(
+        body.contains("basis"),
+        "400 应由 basis 参数反序列化失败触发；body={body}"
     );
 }
