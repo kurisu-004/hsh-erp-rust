@@ -92,8 +92,10 @@ async fn build_snapshot_with_workers_basic() {
     // `Transaction` deref 到 `PgConnection`）。
     // 2026-09-30 新增 days 形参（默认 14）：service 层兜底 unwrap_or(14).clamp(1, 60)；
     // service-level 直调沿用 `None` 走默认 14 天，与 HTTP 端点缺省值对齐。
+    // 2026-10-04 新增 basis 形参（默认 planned）：service 层 unwrap_or_default()；
+    // 本用例直调沿用 `None` → 计划交期口径，断言 shape 不受口径影响。
     let snap = DashboardService::new()
-        .build_snapshot_with_workers(&mut *tx, None, None)
+        .build_snapshot_with_workers(&mut *tx, None, None, None)
         .await
         .expect("snapshot ok");
     drop(tx);
@@ -189,7 +191,7 @@ async fn build_snapshot_with_workers_returns_full_shape() {
     // 2026-09-30 新增 days 形参：本用例继续 None 走默认 14 天（保持 JSON shape / by_status
     // 断言沿用 build_snapshot_with_workers_basic 同形）。
     let snap = DashboardService::new()
-        .build_snapshot_with_workers(&mut *tx, None, None)
+        .build_snapshot_with_workers(&mut *tx, None, None, None)
         .await
         .expect("snapshot ok");
     drop(tx);
@@ -280,7 +282,7 @@ async fn snapshot_counters_by_status_returns_per_status_breakdown() {
 
     let mut tx = pool.begin().await.unwrap();
     let snap = DashboardService::new()
-        .build_snapshot_with_workers(&mut *tx, None, None)
+        .build_snapshot_with_workers(&mut *tx, None, None, None)
         .await
         .expect("snapshot ok");
     drop(tx);

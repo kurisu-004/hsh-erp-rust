@@ -14,7 +14,7 @@
 //! `&mut **self` 转 `&mut PgConnection` 喂入。
 //!
 //! ## 4 个聚合方法（snapshot_*）
-//! - `snapshot_counters(days)` —— 未来 N 天交付分桶（upcoming_delivery_bucket）
+//! - `snapshot_counters(days, basis)` —— 未来 N 天交付分桶（upcoming_delivery_bucket）
 //! - `snapshot_top_parts(top_n)` —— 产线架 + 品检区在持批次 + 客户 / 工序 名字查表
 //! - `snapshot_recent_batches(top_n)` —— 工人持有 IN_PROCESS 批次 + 客户 / PICKED_UP 事件
 //! - `snapshot_workers(ids)` —— 工人 id → 名称 映射（worker-held items 用）
@@ -23,6 +23,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use sqlx::{PgConnection, Row};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use crate::modules::dashboard::dto::DeliveryBasis;
 use crate::modules::dashboard::vo::UpcomingDeliveryBucket;
 
 /// t_part_batch + t_part JOIN 行精简（dashboard 聚合专用，无完整表行）
@@ -107,6 +108,32 @@ fn row_to_part_batch_pair(r: sqlx::postgres::PgRow) -> (BatchLite, PartLite) {
 }
 
 // ---------------------------------------------------------------------------
+// `snapshot_counters` 的两段静态 SQL（2026-10-04 新增）
+//
+// 两口径同形，唯一差别是交期列：planned → `t_part.planned_delivery_date`，
+// system → `t_part.system_delivery_date`。各自是**完整字面量**，不做字符串拼接
+// （拼列名会开 SQL 注入面，且 SQL 文本不再可被静态检查 / 计划器友好解析）。
+//
+// WHERE 的两处范围比较对 NULL 恒为 false，故 `system_delivery_date IS NULL` 的
+// 工单在 system 口径下整件不计入——与 union-list 端点「NULL 交期不被命中」的
+// 既有语义一致，无需额外写 `IS NOT NULL`。
+const SQL_COUNTERS_PLANNED: &str = "SELECT planned_delivery_date AS d, status AS s, COUNT(*)::bigint AS cnt \
+     FROM t_part \
+     WHERE deleted_at IS NULL \
+       AND status NOT IN ('COMPLETED', 'CANCELLED') \
+       AND planned_delivery_date >= CURRENT_DATE \
+       AND planned_delivery_date < CURRENT_DATE + ($1::bigint || ' days')::interval \
+     GROUP BY planned_delivery_date, status";
+
+const SQL_COUNTERS_SYSTEM: &str = "SELECT system_delivery_date AS d, status AS s, COUNT(*)::bigint AS cnt \
+     FROM t_part \
+     WHERE deleted_at IS NULL \
+       AND status NOT IN ('COMPLETED', 'CANCELLED') \
+       AND system_delivery_date >= CURRENT_DATE \
+       AND system_delivery_date < CURRENT_DATE + ($1::bigint || ' days')::interval \
+     GROUP BY system_delivery_date, status";
+
+// ---------------------------------------------------------------------------
 // DashboardRepo（4 个聚合静态方法 + 私有 SQL helper）
 // ---------------------------------------------------------------------------
 
@@ -119,6 +146,7 @@ impl DashboardRepo {
     pub async fn snapshot_counters(
         conn: &mut PgConnection,
         days: i64,
+        basis: DeliveryBasis,
     ) -> Result<Vec<UpcomingDeliveryBucket>, sqlx::Error> {
         // 2026-09-30 修改：原 `GROUP BY planned_delivery_date` 扩为
         // `GROUP BY planned_delivery_date, status`，让每个桶返回按 OrderStatus
@@ -127,18 +155,16 @@ impl DashboardRepo {
         // `idx_parts_planned_delivery_date` 索引覆盖，不需新索引。WHERE 仍排除
         // COMPLETED / CANCELLED，故 by_status 不会含这两个 key（沿 frontend
         // `z.record(z.string(), z.number())` 必填契约）。
-        let rows = sqlx::query(
-            "SELECT planned_delivery_date AS d, status AS s, COUNT(*)::bigint AS cnt \
-             FROM t_part \
-             WHERE deleted_at IS NULL \
-               AND status NOT IN ('COMPLETED', 'CANCELLED') \
-               AND planned_delivery_date >= CURRENT_DATE \
-               AND planned_delivery_date < CURRENT_DATE + ($1::bigint || ' days')::interval \
-             GROUP BY planned_delivery_date, status",
-        )
-        .bind(days)
-        .fetch_all(&mut *conn)
-        .await?;
+        //
+        // 2026-10-04 新增 `basis`：交期列按口径二选一（`SQL_COUNTERS_PLANNED` /
+        // `SQL_COUNTERS_SYSTEM` 两段完整字面量）。system 口径走既有索引
+        // `ix_t_part_system_delivery_date`，不需新 migration。$1 占位与查询
+        // 之后的 HashMap/BTreeMap 装配逻辑两口径共用（零改动）。
+        let sql = match basis {
+            DeliveryBasis::Planned => SQL_COUNTERS_PLANNED,
+            DeliveryBasis::System => SQL_COUNTERS_SYSTEM,
+        };
+        let rows = sqlx::query(sql).bind(days).fetch_all(&mut *conn).await?;
         // (date, status) → 件数
         let mut bucket: HashMap<(NaiveDate, String), i64> = HashMap::new();
         for r in rows {

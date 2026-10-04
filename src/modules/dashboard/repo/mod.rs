@@ -36,6 +36,8 @@ use async_trait::async_trait;
 use sqlx::PgConnection;
 use std::collections::HashMap;
 
+use crate::modules::dashboard::dto::DeliveryBasis;
+
 pub mod sql;
 
 // 重导出 sql.rs 中的 ZST struct / 中间聚合结构 / 行精简类型。
@@ -59,9 +61,14 @@ pub use sql::{BatchLite, DashboardRepo, PartLite, RecentBatchesData, TopPartsDat
 #[async_trait]
 pub trait DashboardRepoTrait: Send {
     /// 未来 N 天交付分桶（counter buckets）。0 计数天也填充（保证 N 天固定 N 条，`days` 形参驱动；2026-09-30 同步）。
+    ///
+    /// `basis` 收值而非 `Option`（2026-10-04 新增）：默认值已在 service 层
+    /// `unwrap_or_default()` 收敛成唯一决策点，repo 层必须拿到确定口径，
+    /// 否则 SQL 里会出现「到底用哪列」的隐式兜底。
     async fn snapshot_counters(
         &mut self,
         days: i64,
+        basis: DeliveryBasis,
     ) -> Result<Vec<crate::modules::dashboard::vo::UpcomingDeliveryBucket>, sqlx::Error>;
 
     /// 产线架 + IN_PROCESS 批次 + 品检区批次 + 客户 / 工序 名字查表。
@@ -91,8 +98,9 @@ impl DashboardRepoTrait for &mut PgConnection {
     async fn snapshot_counters(
         &mut self,
         days: i64,
+        basis: DeliveryBasis,
     ) -> Result<Vec<crate::modules::dashboard::vo::UpcomingDeliveryBucket>, sqlx::Error> {
-        DashboardRepo::snapshot_counters(&mut **self, days).await
+        DashboardRepo::snapshot_counters(&mut **self, days, basis).await
     }
 
     async fn snapshot_top_parts(&mut self, top_n: i64) -> Result<TopPartsData, sqlx::Error> {

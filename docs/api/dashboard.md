@@ -29,6 +29,11 @@ Request：
   - `upcoming_days` — 未来 N 天交付分桶的天数，i64 字符串形式（沿仓内 part 域 DTO
     `deserialize_i64_opt` 解析规则）；缺省 / 非法 → service 层兜底为 14；
     取值范围 `1..=60`（service 层 `clamp` 防御恶意大数 / 拼写错把日期塞成 10000）。
+  - `basis` — `upcoming_delivery[]` 分桶的**交期口径**（2026-10-04 新增）：
+    - `planned`（缺省）— 按 `t_part.planned_delivery_date`（计划交期）分桶
+    - `system` — 按 `t_part.system_delivery_date`（系统交期）分桶
+    - 缺省 → service 层 `unwrap_or_default()` = `planned`；
+      其它取值（如 `?basis=xxx`）走 axum `Query` 反序列化自动 4xx，不自写错误码。
 - 无 body
 
 调用链：
@@ -38,10 +43,10 @@ HTTP request
   → v2_router authenticate_middleware (Bearer JWT + Redis session)
   → CurrentUser extractor
   → handler::get_snapshot
-    → Query<SnapshotQuery> 解析 upcoming_days（缺省 None）
+    → Query<SnapshotQuery> 解析 upcoming_days / basis（缺省 None）
     → state.pool.begin()
-    → state.dashboard_service.build_snapshot_with_workers(&mut *tx, None, q.upcoming_days)
-       // service 层 days.unwrap_or(14).clamp(1, 60) 兜底
+    → state.dashboard_service.build_snapshot_with_workers(&mut *tx, None, q.upcoming_days, q.basis)
+       // service 层 days.unwrap_or(14).clamp(1, 60)、basis.unwrap_or_default() 兜底
     → tx.commit()
   → Json(R<DashboardSnapshot>)
 ```
@@ -112,7 +117,7 @@ HTTP request
 | `data.on_production_shelves` | array | 是 | 生产区货架分组（每架 `OnProductionShelfGroup`） |
 | `data.on_inspection_shelves` | array | 是 | 待品检货架上的 part 项（`DashboardItem`） |
 | `data.in_process` | array | 是 | 加工中的 part（`DashboardItem`，holder 类别为 `WORKER` / `WORKER_POOL`） |
-| `data.upcoming_delivery` | array | 是 | 未来 N 天交付分桶（`UpcomingDeliveryBucket`），固定 N 条；N 来自 `?upcoming_days=`，缺省 14，service 层 `clamp(1, 60)` 兜底（2026-09-30 新增） |
+| `data.upcoming_delivery` | array | 是 | 未来 N 天交付分桶（`UpcomingDeliveryBucket`），固定 N 条；N 来自 `?upcoming_days=`，缺省 14，service 层 `clamp(1, 60)` 兜底（2026-09-30 新增）。**分桶所依的交期口径由 `?basis=` 决定**（2026-10-04 新增，缺省 `planned`） |
 | `data.ts` | string | 是 | 快照构建本地时间戳（`YYYY-MM-DDTHH:MM:SS.fff+08:00`） |
 | `data.on_production_shelves[].shelf_id` | string | 是 | 货架 snowflake id（**i64 → 字符串**） |
 | `data.on_production_shelves[].shelf_code` | string | 是 | 货架代号 |
@@ -138,12 +143,19 @@ HTTP request
 | `data.on_production_shelves[].items[].next_process_id` | string \| null | 否 | 下一道工序 id（deprecated 标记保留，2026-09-27 part 域字段对齐影响）。**2026-09-30 改直读 `t_part_batch.current_process_id`**（migration 004）——原先经 `LEFT JOIN t_process_chain_step` 取 `s.process_id`，新下发批次（step 为 NULL）会显示 `null` 工序；**字段名不变** |
 | `data.on_production_shelves[].items[].next_process_name` | string \| null | 否 | 下一道工序名 |
 | `data.on_production_shelves[].items[].worker_name` | string \| null | 否 | 当前持有工人姓名 |
-| `data.upcoming_delivery[].date` | string | 是 | 日期 `YYYY-MM-DD` |
+| `data.upcoming_delivery[].date` | string | 是 | 日期 `YYYY-MM-DD`。**口径由 `?basis=` 决定**（2026-10-04 新增）：`planned` = 计划交期日、`system` = 系统交期日；桶本身（日期序列 + 补零规则）两口径一致 |
 | `data.upcoming_delivery[].count` | integer | 是 | 当天预计交付 part 数（i64，JSON wire 保留 number；非 snowflake ID 故不走字符串化） |
 | `data.upcoming_delivery[].by_status` | object<string, integer> | 是 | 当天按 `OrderStatus` 细分的件数（2026-09-30 新增；供 dashboard 分层堆叠柱状图用）。**COMPLETED / CANCELLED 已 WHERE 排除，by_status 不会含这两个 key**；空对象 `{}` 表示当日 0 件。key 字母序排列（BTreeMap 序列化保证），但前端按 key 直接查，不依赖顺序。 |
 
 > `data.upcoming_delivery[].by_status` 与 `data.upcoming_delivery[].count` 的关系：
 > `count = by_status 所有 value 之和`（service 端求和，VO 与 SQL 二次一致性由 SQL 单次聚合保证）。
+
+> ⚠️ **`?basis=system` 下 `system_delivery_date IS NULL` 的工单整件不计入**
+> （2026-10-04 新增）：WHERE 的两处范围比较（`>= CURRENT_DATE` /
+> `< CURRENT_DATE + N days`）对 NULL 恒为 false，NULL 行天然不命中——与
+> union-list 端点「NULL 交期不被命中」的既有语义一致，未额外写 `IS NOT NULL`。
+> 因此 **system 口径的合计恒 ≤ planned 口径**（planned 列同样可空），两口径的
+> 桶总数恒为 N（缺失日期补 0），差异只体现在 `count` / `by_status` 上。
 
 错误码：
 
@@ -166,6 +178,7 @@ HTTP request
 | 鉴权凭证 | `Authorization: Bearer <jwt>` | `?token=<jwt>` query 参数 |
 | 用途 | 视图首屏加载（HTTP 全量首取） | 实时增量（snapshot envelope + 业务事件 + 心跳） |
 | 共用 service | `DashboardService::build_snapshot_with_workers` | 同 |
+| 交期口径（2026-10-04 新增） | 由 `?basis=` 指定（`planned` / `system`） | **恒为 `planned`**（WS 无 query 参数，service 收 `None` → `Planned`） |
 | 调用方前端 | dashboard 视图组件 mount 时 1 次 | dashboard 视图组件 mount 后维持连接 |
 
 实现要点：
@@ -186,3 +199,7 @@ HTTP request
 - WS handshake 仍推一次 `WsSnapshotMsg`（保留向后兼容），不动 `ws_dashboard`
   handler 的 snapshot 推送逻辑；前端可走「HTTP 首取 + WS 事件 invalidate」
   模式忽略 WS 首帧 snapshot，也可保留原行为。
+- 交期口径（2026-10-04 新增）：WS handshake snapshot **恒为 `planned` 口径**。
+  前端丢弃 WS 推送的 snapshot（只把它当 invalidate 触发器，收到事件后重发
+  HTTP `/snapshot?basis=…` 拉数据），故 WS 侧固定 planned 对前端透明；需要
+  system 口径的调用方一律走 HTTP 端点带 `?basis=system`。
