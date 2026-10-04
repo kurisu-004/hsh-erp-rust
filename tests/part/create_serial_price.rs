@@ -776,6 +776,9 @@ async fn batch_create_rejects_when_l1_parent_soft_deleted() {
 /// 写入路径外，所以本测试先摘掉该 CHECK 造脏数据 —— 目的是钉死
 /// `serial_prefix_for_customer` 遇到它返回 20104（而不是 500 或静默用一个非法 prefix
 /// 去 `acquire`）。摘 CHECK 只影响本测试的 fresh DB。
+/// 取舍理由与参照范式写在 fixture 头部注释
+/// （`test-support/fixtures/part.sql` 的「造『客户 serial_prefix 非 A-Z』脏数据时
+/// 要改 schema」一节），改 fixture / 造客户数据前先看那段。
 #[tokio::test]
 async fn batch_create_rejects_when_serial_prefix_not_uppercase() {
     let (pool, app, token, _fx) = bootstrap_as_manager().await;

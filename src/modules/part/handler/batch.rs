@@ -91,19 +91,22 @@ pub async fn batch_create_parts(
     // 警告。Ok/Err 都先 move 出 keys 再 commit（Err 路径也透出 — M2-C 修）。
     //
     // **登记（2026-10-05）：Err 分支也 `commit()` 而不是 `rollback()`，是既有行为。**
-    // 两条 Err 分支今天都不写任何行，所以「commit 空事务」与 rollback 等价：
-    // - with_bindings 的 Err 来自第一遍 head/copy 或 `serial_prefix_for_customer`
-    //   （20308 / 20102 / 20104），都发生在第二遍 INSERT 循环之前；
-    // - legacy 的 Err 来自 customer 存在性 / prefix 解析（都在第二遍循环之前）与
-    //   循环内的 `acquire`（20108 / 20105）——这两个失败条件都是 prefix 级
-    //   （未注册 / 池耗尽），同 prefix 的**第一次** acquire 就会失败 ⇒ 0 行落库。
+    // 两个 service 入口的 Err 出口分两类：
+    // - 循环之前（一条行都没写 ⇒ 「commit 空事务」与 rollback 等价）：
+    //   `CustomerRepo::get_by_id` → 20102、`serial_prefix_for_customer` →
+    //   20102 / 20308 / 20104、with_bindings 独有的第一遍 head/copy 失败；
+    // - 循环之内：**两个入口的第二遍循环第一条语句都是 `shared::serial::acquire`**
+    //   （20108 / 20105，位置在 per-item SAVEPOINT 之前），失败条件是 prefix 级
+    //   （prefix 未在 `t_serial_counter` 注册 / 序列号池耗尽）⇒ 同 prefix 的第一次
+    //   acquire 就会失败，0 行落库。循环内其余 Err 出口（`SAVEPOINT` /
+    //   `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` 语句失败、INSERT 之后的
+    //   detail 回读失败）全是 DB 语句级失败，等价于「数据库或连接出问题」，
+    //   此时部分落库不是首要后果。
     //
-    // **何时会被引爆**：第二遍 per-item 循环内任何 `?` 冒泡到第 k 件（0 < k < N）时，
-    // 前 k-1 件的 INSERT 会被 commit 掉而客户端收到错误信封。当前循环内的可失败调用
-    // 只有 `acquire`（prefix 级，恒在第 1 件失败），故现网触发不了；但后续往循环里
-    // 加任何 per-item 的 `?`（如文件绑定的 DB 写、金额校验）都会打开这个窗口。届时
-    // 应把这里改成 `Err ⇒ tx.rollback()`，或让 service 用 savepoint 兜住 per-item 错误
-    // 只往 `failed[]` 里塞。
+    // **何时会被引爆**：往第二遍循环里加**业务级**的 per-item `?`（如金额校验、
+    // 跨表引用校验）时，它可能在第 k 件（1 < k ≤ N）才失败 ⇒ 前 k-1 件的 INSERT
+    // 会被 commit 掉而客户端收到错误信封。届时应把这里改成 `Err ⇒ tx.rollback()`，
+    // 或让 service 用 savepoint 兜住 per-item 错误只往 `failed[]` 里塞。
     let (cleanup_keys, commit_result): (Vec<String>, Result<(), sqlx::Error>) = match &out_result {
         Ok((_out, keys)) => {
             let commit = tx.commit().await;

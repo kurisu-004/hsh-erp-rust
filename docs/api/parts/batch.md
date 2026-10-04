@@ -61,7 +61,7 @@ Request (multipart/form-data)：
 
 Response 201 `data`：`PartBatchCreateOut`（见 [`./crud.md#partbatchcreateout-字段`](./crud.md#partbatchcreateout-字段)）
 
-错误码：20102 / 20104 / 40001 / 40300。
+错误码：20102 / 20104 / 20308（L1 父客户无 `serial_prefix`）/ 20108（`serial_prefix` 未在 `t_serial_counter` 注册）/ 40001 / 40300。
 
 > **2026-10-05 行为变化**：序列号改由 INSERT 期派发后，「L2 客户自身未软删、但它的
 > L1 父行已软删」这一路径从 `fetch_one` 查空结果集 → `sqlx::RowNotFound` →

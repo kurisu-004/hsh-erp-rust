@@ -40,6 +40,20 @@
 --  按需用 sqlx::query 直插（PR-C 末统一迁 test-support）。
 --  例外：t_serial_counter 是建单派发序列号的计数器（2026-10-05 起建单端点
 --  强制派发），缺它建单会被拒，故预置一行。
+--
+--  ## 造「客户 serial_prefix 非 A-Z」脏数据时要改 schema（2026-10-05 登记）
+--  客户 serial_prefix 有 DB CHECK 约束 `ck_t_customer_serial_prefix_uppercase`
+--  （`^[A-Z]$`），customer 域 service 也双校验，所以「L1 的 serial_prefix 是非
+--  大写字母 / 空串」这个形态在正常写入路径下进不来。而
+--  PartRepo::serial_prefix_for_customer 对它有 20104 BIZ_INVALID_VALUE 兜底
+--  分支（脏数据防御），要覆盖那条分支只能先在测试库里
+--  `ALTER TABLE t_customer DROP CONSTRAINT ck_t_customer_serial_prefix_uppercase`。
+--  本仓集成测试首次出现「改 schema 造脏数据」，取的是「覆盖不可达的防御分支」
+--  这个取舍：若将来有人放松 CHECK 或 service 校验，20104 分支仍必须给出正确
+--  错误码而不是 500 / 静默拿非法 prefix 去 acquire。参照
+--  `src/infra/serial.rs` 的 `normalize_prefix_*` 兜底分支测试（同类型范式）。
+--  改动只落在 per-test fresh DB（test-support::pool::test_pool 每测试
+--  CREATE DATABASE），不会污染 template 库或开发库。
 -- ============================================================================
 
 -- ---- L1 客户 + L2 子客户 ----
