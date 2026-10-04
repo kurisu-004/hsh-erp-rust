@@ -86,6 +86,12 @@ impl PartService {
     /// **已知代价**：个别 item 失败（唯一索引撞号 / part_file 写失败）时该 item 已
     /// 消耗的号不会回收，序列号出现空洞。序列号是单调递增的工单标识、不承载「连续
     /// 区间」语义，空洞可接受（换来的好处是号永不重复）。
+    ///
+    /// **并发约束**：`acquire` 是 `UPDATE ... RETURNING`，会对 `t_serial_counter`
+    /// 该 prefix 行加行级排他锁并**持有到整个事务 COMMIT**。所以同 prefix 的并发
+    /// 建单会在这一行上串行排队（跨 prefix 不互相阻塞）。单批 N 上限 200、单次
+    /// 持锁时长与 N 成正比，这个吞吐对本域可接受，不做「取一批号后立刻提交」的改法
+    /// （那会让号与 INSERT 脱离同一事务，崩溃后留下永久空洞）。
     #[allow(clippy::too_many_arguments)]
     pub async fn batch_create_parts_with_bindings<R: PartRepoTrait>(
         mut repo: R,
@@ -432,7 +438,8 @@ impl PartService {
     /// `has_bindings` 分流），而前端 PDF 批量上传正是这条路径，所以序列号派发与
     /// `unit_price` / `total_price` 透传必须在这里也做一遍，否则真实建单入口仍然
     /// 拿不到序列号。prefix 只取一次、per-item 派一次号的取舍与
-    /// [`Self::batch_create_parts_with_bindings`] 同（序列号空洞可接受）。
+    /// [`Self::batch_create_parts_with_bindings`] 同（序列号空洞可接受、
+    /// 同 prefix 建单在 `t_serial_counter` 该行的排他锁上串行到 COMMIT）。
     pub(super) async fn batch_create_parts_legacy<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,

@@ -1237,10 +1237,18 @@ impl PartRepo {
     /// 用 `COALESCE(parent_id, id)` 把 L2 折回它的 L1，外层再取那一行的 prefix。
     /// 一条 SQL 走完，不在 Rust 侧分叉。
     ///
+    /// `COALESCE` **只折一层**：本函数假定客户树恒为两层（建 L2 时必须有 L1 父行、
+    /// 不得再挂子节点，都由 customer 域 service 保证，DB 侧**无**约束）。
+    /// 若真出现 L2 的 `parent_id` 指向另一个 L2（第三层），内层折回的是那个中间 L2
+    /// 而它的 `serial_prefix` 恒为 NULL ⇒ 本函数报 `20308`（语义上应是层级非法，
+    /// 但该形态进不来，不另设错误码）。
+    ///
     /// 三种失败（都不该被 DB CHECK 之外的脏数据放过，故逐个显式判）：
     /// - 目标客户或其 L1 父行不存在 / 已软删 → `20102 BIZ_CUSTOMER_NOT_FOUND`
     /// - prefix 为 NULL（L1 客户未配前缀）→ `20308 BIZ_CUSTOMER_NO_SERIAL_PREFIX`
     /// - prefix 为空串 / 非 ASCII 大写开头 → `20104 BIZ_INVALID_VALUE`
+    ///   （`ck_t_customer_serial_prefix_uppercase` 已用 `^[A-Z]$` 挡住该形态，
+    ///   这两条分支是对脏数据的兜底，正常写入路径进不来）
     ///
     /// 用 `sqlx::query_scalar`（非 `query_scalar!` 宏）：返回值只有
     /// `Option<Option<String>>` 两态（无行 / 有行但 prefix 为 NULL），

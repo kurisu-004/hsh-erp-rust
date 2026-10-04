@@ -14,7 +14,11 @@
 //! 5. `batch_create_serials_are_unique_and_increasing` —— 同批 / 跨批都不重号且递增；
 //! 6. `batch_with_pdfs_keeps_master_and_child_serial_pattern` —— 遗留端点回归：
 //!    有 PDF 仍派 master 号 + `{master}-{NN}` 子件号；
-//! 7. `batch_with_pdfs_without_pdf_leaves_serial_null` —— 无 PDF 时仍不派号。
+//! 7. `batch_with_pdfs_without_pdf_leaves_serial_null` —— 无 PDF 时仍不派号；
+//! 8. `batch_create_with_bindings_dispatches_serial_and_keeps_prices` —— 带
+//!    `drawing_file` 的另一个 service 入口（`has_bindings` 分流）同样派号 + 透传金额；
+//! 9. `batch_create_rejects_when_l1_parent_soft_deleted` —— L1 父行已软删 → 20102；
+//! 10. `batch_create_rejects_when_serial_prefix_not_uppercase` —— prefix 非 A-Z → 20104。
 //!
 //! 基建沿用 `crud.rs` / `batch.rs` 的写法（`test_pool` + `load_part_fixture` +
 //! `send` / `json_request` / `login_token`），不新建 helper 体系。
@@ -46,18 +50,17 @@ fn today() -> chrono::NaiveDate {
         .date_naive()
 }
 
-/// 断言序列号是 fixture L1 客户 prefix（`'P'`）+ 7 位数字。
+/// 断言序列号等于**预期字面值**（fixture L1 客户 prefix `'P'` + 7 位数字）。
 ///
-/// 只校验**格式**不校验字面值：`t_serial_counter` 的起始值取决于该测试库此前被
-/// 派过多少次（`cargo test` 单进程多线程下同 binary 共用一个库），写死
-/// `P0000001` 会让断言依赖执行顺序。
-fn assert_dispatched_serial(serial: Option<&str>, ctx: &str) -> String {
+/// `test_pool()` 给**每个测试** `CREATE DATABASE` 一个全新库
+/// （`test-support/src/pool.rs` 的 `test_pool()`），`load_part_fixture` 预置的
+/// `t_serial_counter('P', counter=0)` 因此恒为起点 ⇒ 首个派发号恒是 `P0000001`、
+/// 第 n 个恒是 `P000000{n}`。所以断言直接写字面值，既验了「派发了」也钉死了
+/// counter 起点与逐件递增（哪天 fixture 那行不再是 `counter=0` 这些用例会红）。
+fn assert_dispatched_serial(serial: Option<&str>, expected: &str, ctx: &str) -> String {
     let s = serial.unwrap_or_else(|| panic!("{ctx}: serial_no 应已派发，实际为 null"));
-    assert_eq!(
-        s.len(),
-        8,
-        "{ctx}: 序列号应为 prefix + 7 位数字（8 字符），实际 {s:?}"
-    );
+    assert_eq!(s, expected, "{ctx}: 序列号应为 {expected}（P + 7 位数字）");
+    assert_eq!(s.len(), 8, "{ctx}: 序列号应为 8 字符，实际 {s:?}");
     assert!(
         s.starts_with('P'),
         "{ctx}: 序列号应以 L1 prefix 'P' 开头，实际 {s:?}"
@@ -83,25 +86,67 @@ async fn count_parts(pool: &PgPool) -> i64 {
         .expect("count t_part")
 }
 
-/// 造一个 L1 客户但**不配** `serial_prefix`（customer 域 service 会拒这种组合，
-/// 只能直插；用来验 20308 分支）。
-async fn insert_l1_customer_without_prefix(pool: &PgPool, name: &str) -> i64 {
-    use hsh_erp_rust::infra::clock::now_naive;
+/// 造客户行用的雪花 ID：每次调用换一个 `instance_id`。
+///
+/// 同一 epoch + 同一 `instance_id` 的两个 `SnowflakeIdGenerator` 在同一毫秒会吐出
+/// **相同**的 ID（同毫秒内 sequence 从 0 起），而本文件多个测试要在同一个测试里连插
+/// L1 + L2 两行 ⇒ 固定 instance_id 会撞主键。用自增 instance_id 避开。
+fn raw_customer_id() -> i64 {
     use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
-    let id = SnowflakeIdGenerator::new(1_577_836_800_000, 7).next_id();
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static INSTANCE: AtomicU16 = AtomicU16::new(900);
+    let instance = INSTANCE.fetch_add(1, Ordering::SeqCst);
+    SnowflakeIdGenerator::new(1_577_836_800_000, instance).next_id()
+}
+
+/// 直插一个 L1 客户行（绕过 customer 域 service 的前缀双校验，只为造 DB 形态）。
+/// `prefix = None` 即 `serial_prefix IS NULL`。
+async fn insert_l1_customer(pool: &PgPool, name: &str, prefix: Option<&str>) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = raw_customer_id();
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
          created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, NULL, NULL, 0, $3, NULL, $3, NULL)",
+         VALUES ($1, $2, NULL, $3, 0, $4, NULL, $4, NULL)",
     )
     .bind(id)
     .bind(name)
+    .bind(prefix)
     .bind(now)
     .execute(pool)
     .await
-    .expect("insert L1 customer without serial_prefix");
+    .expect("insert L1 customer");
     id
+}
+
+/// 直插一个 L2 客户行（`parent_id` 指 L1）。L2 的 `serial_prefix` 恒为 NULL。
+async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = raw_customer_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, $3, NULL, 0, $4, NULL, $4, NULL)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(parent_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert L2 customer");
+    id
+}
+
+/// 软删一行客户。
+async fn soft_delete_customer(pool: &PgPool, id: i64) {
+    sqlx::query("UPDATE t_customer SET deleted_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .expect("soft delete customer");
 }
 
 /// 造 N 页 PDF（`batch-with-pdfs` 按 `lopdf` 解析出的页数决定派几个子件号）。
@@ -223,8 +268,14 @@ async fn batch_create_dispatches_serial_and_keeps_prices() {
         "不应有失败件: {env}"
     );
 
+    // 全新测试库 ⇒ counter 从 0 起 ⇒ 两件分别是第 1、第 2 个号
+    const EXPECTED: [&str; 2] = ["P0000001", "P0000002"];
     for (i, item) in created.iter().enumerate() {
-        let serial = assert_dispatched_serial(item["serial_no"].as_str(), &format!("created[{i}]"));
+        let serial = assert_dispatched_serial(
+            item["serial_no"].as_str(),
+            EXPECTED[i],
+            &format!("created[{i}]"),
+        );
         // 单价 / 总价：TPart 用 rust_decimal serde-with-str 序列化 → JSON 字符串
         assert_eq!(
             item["unit_price"].as_str(),
@@ -249,8 +300,8 @@ async fn batch_create_dispatches_serial_and_keeps_prices() {
             "created[{i}]：DB 行 serial_no 必须与响应一致（INSERT 期写入，非事后 UPDATE）"
         );
     }
-    let s1 = assert_dispatched_serial(created[0]["serial_no"].as_str(), "created[0]");
-    let s2 = assert_dispatched_serial(created[1]["serial_no"].as_str(), "created[1]");
+    let s1 = assert_dispatched_serial(created[0]["serial_no"].as_str(), "P0000001", "created[0]");
+    let s2 = assert_dispatched_serial(created[1]["serial_no"].as_str(), "P0000002", "created[1]");
     assert!(
         serial_number(&s1) < serial_number(&s2),
         "同批内序列号应递增: {s1} vs {s2}"
@@ -332,7 +383,8 @@ async fn create_single_part_dispatches_serial() {
     )
     .await;
     assert_eq!(s, StatusCode::CREATED, "create part: {env}");
-    let serial = assert_dispatched_serial(env["data"]["serial_no"].as_str(), "POST /parts");
+    let serial =
+        assert_dispatched_serial(env["data"]["serial_no"].as_str(), "P0000001", "POST /parts");
     assert_eq!(
         env["data"]["unit_price"].as_str(),
         Some("12.34"),
@@ -373,7 +425,7 @@ async fn batch_create_rejects_when_l1_serial_prefix_missing() {
     let before = count_parts(&pool).await;
     assert_eq!(before, 2, "前置应已建 2 件");
 
-    let l1_no_prefix = insert_l1_customer_without_prefix(&pool, "无 prefix 的 L1").await;
+    let l1_no_prefix = insert_l1_customer(&pool, "无 prefix 的 L1", None).await;
     let bad_body = json!({
         "customer_id": l1_no_prefix.to_string(),
         "items": batch_items(2, false),
@@ -408,7 +460,12 @@ async fn batch_create_rejects_when_l1_serial_prefix_missing() {
 async fn batch_create_serials_are_unique_and_increasing() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     let mut all: Vec<String> = Vec::new();
-    for round in 0..2 {
+    // 全新测试库 ⇒ counter 从 0 起；两轮各 3 件，号连续 1..=6
+    const EXPECTED: [[&str; 3]; 2] = [
+        ["P0000001", "P0000002", "P0000003"],
+        ["P0000004", "P0000005", "P0000006"],
+    ];
+    for (round, expected) in EXPECTED.iter().enumerate() {
         let body = json!({
             "customer_id": fx.customer_l2_id.to_string(),
             "items": batch_items(3, false),
@@ -425,7 +482,11 @@ async fn batch_create_serials_are_unique_and_increasing() {
             .iter()
             .enumerate()
             .map(|(i, item)| {
-                assert_dispatched_serial(item["serial_no"].as_str(), &format!("round{round}[{i}]"))
+                assert_dispatched_serial(
+                    item["serial_no"].as_str(),
+                    expected[i],
+                    &format!("round{round}[{i}]"),
+                )
             })
             .collect();
         for w in round_serials.windows(2) {
@@ -479,7 +540,7 @@ async fn batch_with_pdfs_keeps_master_and_child_serial_pattern() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "batch-with-pdfs: {env}");
-    let master = assert_dispatched_serial(env["data"]["serial_no"].as_str(), "master");
+    let master = assert_dispatched_serial(env["data"]["serial_no"].as_str(), "P0000001", "master");
     let master_id = env["data"]["id"].as_str().expect("master id").to_string();
 
     let child_serials: Vec<Option<String>> = sqlx::query_scalar(
@@ -534,4 +595,219 @@ async fn batch_with_pdfs_without_pdf_leaves_serial_null() {
         "DB 里 master.serial_no 应为 NULL: {master_db:?}"
     );
     assert_eq!(count_parts(&pool).await, 1, "无 PDF 时只建 master 一件");
+}
+
+// ===========================================================================
+//  8. 带文件绑定的 with_bindings 分支：同样派号 + 透传金额
+// ===========================================================================
+
+/// 2026-10-05 补：handler 按 `has_bindings` 分流，带 `drawing_file` 时走
+/// `batch_create_parts_with_bindings`（另一个 service 入口）。该入口的 `acquire`
+/// 刻意放在 per-item SAVEPOINT **之前**（失败时 counter 不回退，代价是号留空洞），
+/// 此前只有「补两个字段」的覆盖、零 serial_no / 金额断言，这里钉死它与 legacy
+/// 分支同口径。
+#[tokio::test]
+async fn batch_create_with_bindings_dispatches_serial_and_keeps_prices() {
+    let pool = test_pool().await;
+    let fx = load_part_fixture(&pool).await;
+    let cos = std::sync::Arc::new(MockCos::new());
+    let tmp_key = "tmp/test/with-bindings.pdf";
+    cos.set_head(tmp_key, 1024);
+    let app = test_app(test_state_with_cos(pool.clone(), cos.clone()).await);
+    let token = login_token(&app, &fx.manager_username, PartFixture::PASSWORD).await;
+
+    let today = today().to_string();
+    let body = json!({
+        "customer_id": fx.customer_l2_id.to_string(),
+        "items": [{
+            "name": "带图纸件",
+            "drawing_no": "D-BIND",
+            "applicant_name": "甲",
+            "quantity": 1,
+            "request_date": today,
+            "planned_delivery_date": today,
+            "is_urgent": false,
+            "unit_price": "88.80",
+            "total_price": "177.60",
+            "drawing_file": {
+                "tmp_key": tmp_key,
+                "content_sha256": "c".repeat(64),
+                "original_filename": "with-bindings.pdf",
+                "file_size": "1024",
+                "content_type": "application/pdf",
+            },
+            "model3d_file": null,
+        }],
+    });
+    let (s, env) = send(
+        app,
+        json_request("POST", "/parts/batch", Some(body), Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "batch create（带绑定）: {env}");
+    assert_eq!(env["code"], 0, "batch create（带绑定）: {env}");
+    let created = env["data"]["created"].as_array().expect("created 数组");
+    assert_eq!(created.len(), 1, "一件应成功: {env}");
+    assert!(
+        env["data"]["failed"]
+            .as_array()
+            .expect("failed 数组")
+            .is_empty(),
+        "不应有失败件: {env}"
+    );
+    let item = &created[0];
+    // 全新库 ⇒ counter 从 0 起 ⇒ 本件拿到第 1 个号
+    let serial = assert_dispatched_serial(item["serial_no"].as_str(), "P0000001", "created[0]");
+    assert_eq!(
+        item["unit_price"].as_str(),
+        Some("88.80"),
+        "with_bindings 分支也要透传单价: {item}"
+    );
+    assert_eq!(
+        item["total_price"].as_str(),
+        Some("177.60"),
+        "with_bindings 分支也要透传总价: {item}"
+    );
+    let (db_serial, unit_price, total_price): (
+        Option<String>,
+        rust_decimal::Decimal,
+        rust_decimal::Decimal,
+    ) = sqlx::query_as(
+        "SELECT serial_no, unit_price, total_price FROM t_part WHERE id = $1::bigint",
+    )
+    .bind(item["id"].as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("查 t_part");
+    assert_eq!(
+        db_serial.as_deref(),
+        Some(serial.as_str()),
+        "DB 行 serial_no 必须与响应一致（INSERT 期写入）"
+    );
+    assert_eq!(
+        unit_price,
+        rust_decimal::Decimal::new(8880, 2),
+        "DB 单价 88.80"
+    );
+    assert_eq!(
+        total_price,
+        rust_decimal::Decimal::new(17760, 2),
+        "DB 总价 177.60"
+    );
+    // 确实走了 with_bindings 分支（不是 legacy）：part_file 行存在
+    let file_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM t_part_file WHERE part_id = $1::bigint AND kind = 'DRAWING'",
+    )
+    .bind(item["id"].as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .expect("count t_part_file");
+    assert_eq!(
+        file_rows, 1,
+        "drawing_file 绑定应落 1 行 t_part_file: {env}"
+    );
+    // counter 恰好被推进 1 次（1 件 1 号，无重复派发）
+    let counter: i64 =
+        sqlx::query_scalar("SELECT counter FROM t_serial_counter WHERE prefix = 'P'")
+            .fetch_one(&pool)
+            .await
+            .expect("查 t_serial_counter");
+    assert_eq!(counter, 1, "1 件只该派 1 个号，counter 应为 1");
+}
+
+// ===========================================================================
+//  9-10. serial_prefix_for_customer 的负向分支（20102 / 20104）
+// ===========================================================================
+
+/// 2026-10-05 补：L2 自身未软删、但 L1 父行已软删。`CustomerRepo::get_by_id` 只看
+/// 自己那一行（不递归父行）所以客户存在性检查过得去，挂在
+/// `serial_prefix_for_customer` 的内层 `COALESCE` 折回后外层查不到未删的 L1 ⇒
+/// 20102 整批拒，且不落任何行。
+#[tokio::test]
+async fn batch_create_rejects_when_l1_parent_soft_deleted() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    // 先建 2 件，让「行数不变」有基线
+    let ok_body = json!({
+        "customer_id": fx.customer_l2_id.to_string(),
+        "items": batch_items(2, false),
+    });
+    let (s, env) = send(
+        app.clone(),
+        json_request("POST", "/parts/batch", Some(ok_body), Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "前置建单应成功: {env}");
+    let before = count_parts(&pool).await;
+    assert_eq!(before, 2, "前置应已建 2 件");
+
+    let l1 = insert_l1_customer(&pool, "将软删的 L1", Some("Q")).await;
+    let l2 = insert_l2_customer(&pool, "L1 已软删的 L2", l1).await;
+    soft_delete_customer(&pool, l1).await;
+
+    let bad_body = json!({
+        "customer_id": l2.to_string(),
+        "items": batch_items(2, false),
+    });
+    let (s, env) = send(
+        app,
+        json_request("POST", "/parts/batch", Some(bad_body), Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "L1 父行已软删应整批拒（20102 映射 404）: {env}"
+    );
+    assert_eq!(
+        env["code"],
+        code::BIZ_CUSTOMER_NOT_FOUND,
+        "错误码应为 20102 BIZ_CUSTOMER_NOT_FOUND: {env}"
+    );
+    assert_eq!(
+        count_parts(&pool).await,
+        before,
+        "20102 fail-fast：t_part 行数必须不变"
+    );
+}
+
+/// 2026-10-05 补：`serial_prefix` 非 A-Z 的兜底分支（20104）。
+///
+/// 该形态被 DB CHECK `ck_t_customer_serial_prefix_uppercase`（`^[A-Z]$`）挡在正常
+/// 写入路径外，所以本测试先摘掉该 CHECK 造脏数据 —— 目的是钉死
+/// `serial_prefix_for_customer` 遇到它返回 20104（而不是 500 或静默用一个非法 prefix
+/// 去 `acquire`）。摘 CHECK 只影响本测试的 fresh DB。
+#[tokio::test]
+async fn batch_create_rejects_when_serial_prefix_not_uppercase() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+    sqlx::query("ALTER TABLE t_customer DROP CONSTRAINT ck_t_customer_serial_prefix_uppercase")
+        .execute(&pool)
+        .await
+        .expect("drop ck_t_customer_serial_prefix_uppercase");
+    let bad_l1 = insert_l1_customer(&pool, "prefix 非大写的 L1", Some("1")).await;
+    let before = count_parts(&pool).await;
+
+    let body = json!({
+        "customer_id": bad_l1.to_string(),
+        "items": batch_items(1, false),
+    });
+    let (s, env) = send(
+        app,
+        json_request("POST", "/parts/batch", Some(body), Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "serial_prefix 非 A-Z 应整批拒（2xxxx 兜底 400）: {env}"
+    );
+    assert_eq!(
+        env["code"],
+        code::BIZ_INVALID_VALUE,
+        "错误码应为 20104 BIZ_INVALID_VALUE: {env}"
+    );
+    assert_eq!(
+        count_parts(&pool).await,
+        before,
+        "20104 fail-fast：t_part 行数必须不变"
+    );
 }

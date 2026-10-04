@@ -89,6 +89,21 @@ pub async fn batch_create_parts(
     // 2026-09-16 M2-B review 第 2 轮 B1 修：必须在 tx.commit() 之前拿到 cleanup_tmp_keys，
     // 否则 tx.commit().await 持有 conn 时跨 .await 容易踩 sqlx 的 connection-held-across-await
     // 警告。Ok/Err 都先 move 出 keys 再 commit（Err 路径也透出 — M2-C 修）。
+    //
+    // **登记（2026-10-05）：Err 分支也 `commit()` 而不是 `rollback()`，是既有行为。**
+    // 两条 Err 分支今天都不写任何行，所以「commit 空事务」与 rollback 等价：
+    // - with_bindings 的 Err 来自第一遍 head/copy 或 `serial_prefix_for_customer`
+    //   （20308 / 20102 / 20104），都发生在第二遍 INSERT 循环之前；
+    // - legacy 的 Err 来自 customer 存在性 / prefix 解析（都在第二遍循环之前）与
+    //   循环内的 `acquire`（20108 / 20105）——这两个失败条件都是 prefix 级
+    //   （未注册 / 池耗尽），同 prefix 的**第一次** acquire 就会失败 ⇒ 0 行落库。
+    //
+    // **何时会被引爆**：第二遍 per-item 循环内任何 `?` 冒泡到第 k 件（0 < k < N）时，
+    // 前 k-1 件的 INSERT 会被 commit 掉而客户端收到错误信封。当前循环内的可失败调用
+    // 只有 `acquire`（prefix 级，恒在第 1 件失败），故现网触发不了；但后续往循环里
+    // 加任何 per-item 的 `?`（如文件绑定的 DB 写、金额校验）都会打开这个窗口。届时
+    // 应把这里改成 `Err ⇒ tx.rollback()`，或让 service 用 savepoint 兜住 per-item 错误
+    // 只往 `failed[]` 里塞。
     let (cleanup_keys, commit_result): (Vec<String>, Result<(), sqlx::Error>) = match &out_result {
         Ok((_out, keys)) => {
             let commit = tx.commit().await;

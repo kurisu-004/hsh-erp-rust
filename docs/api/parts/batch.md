@@ -63,6 +63,13 @@ Response 201 `data`：`PartBatchCreateOut`（见 [`./crud.md#partbatchcreateout-
 
 错误码：20102 / 20104 / 40001 / 40300。
 
+> **2026-10-05 行为变化**：序列号改由 INSERT 期派发后，「L2 客户自身未软删、但它的
+> L1 父行已软删」这一路径从 `fetch_one` 查空结果集 → `sqlx::RowNotFound` →
+> `AppError::Database`（**HTTP 500**）改为 `20102 BIZ_CUSTOMER_NOT_FOUND`（**HTTP
+> 404**）。同一段查询里另两条口径：L1 父客户未配 `serial_prefix` → `20308`、
+> `serial_prefix` 未在 `t_serial_counter` 注册 → `20108`（都是 2xxxx 兜底 400）。
+> 三条都只在 PDF 页数 > 0、需要派 master 号时才触发：页数为 0 不派号、不查 prefix。
+
 ### `GET /api/v2/parts/{part_id}/batches`
 
 工单全部活跃批次列表（含 holder 名称 / 下一工序 / 父批次 / 送货单号 / 时间戳等元信息）。

@@ -261,6 +261,12 @@ impl PartService {
     /// `PartRepoTrait::serial_prefix_for_customer` + `shared::serial::acquire`。
     /// 行为不变：有 PDF 才派 master 号、子件号仍是 `{master}-{NN}`、PDF 页数为 0
     /// 时 master 与（无）子件都不派号。`BatchWithPdfsRequest` 无前端调用方。
+    ///
+    /// 2026-10-05 错误码变化：`serial_prefix_for_customer` 改用 `fetch_optional`，
+    /// 此前同一段是两条 `fetch_one`（先折 L1、再取 prefix）。所以「L2 自身未软删、
+    /// L1 父行已软删」从空结果集 `RowNotFound` → `AppError::Database`（**500**）
+    /// 变为 `20102 BIZ_CUSTOMER_NOT_FOUND`（**404**）。该查询只在 PDF 页数 > 0
+    /// 时执行。
     pub async fn batch_with_pdfs<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,

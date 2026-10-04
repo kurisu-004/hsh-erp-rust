@@ -131,7 +131,7 @@ Request：`PartCreateRequest`
 
 Response 201 `data`：[`PartDetailOut`](./index.md#partdetailout-字段) — 含 TPart 完整列 + 客户冗余 + `current_batch_id`。
 
-错误码：40001（字段空 / quantity≤0）、40300（角色不符）、20102（customer 不存在）、20308（L1 客户无 `serial_prefix`）。
+错误码：40001（字段空 / quantity≤0）、40300（角色不符）、20102（customer 不存在）、20308（L1 客户无 `serial_prefix`）、20108（L1 的 `serial_prefix` 未在 `t_serial_counter` 注册，见 [`./index.md`](./index.md#序列号serial_no生命周期)）。
 
 ### `POST /api/v2/parts/batch`
 
@@ -177,7 +177,7 @@ Response 200 `data`：
 | `created` | [PartDetailOut](./index.md#partdetailout-字段)[] | 成功插入并读取详情的件 |
 | `failed` | `PartBatchCreateFailure`[] | 单件失败明细（含 item_index）；成功与失败互斥 |
 
-错误码：40001（items 空 / 超过 200）、40300、20308（L1 客户无 `serial_prefix`，整批拒）；item-level（`failed[].code`）：50001 / 20101 等。
+错误码：40001（items 空 / 超过 200）、40300、20308（L1 客户无 `serial_prefix`，整批拒）、20108（L1 的 `serial_prefix` 未在 `t_serial_counter` 注册，整批拒）；item-level（`failed[].code`）：50001 / 20101 等。
 
 ### `GET /api/v2/parts/{part_id}`
 
