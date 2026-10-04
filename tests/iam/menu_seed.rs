@@ -59,7 +59,31 @@
 //!    两处不一致 = 要么伪造的行没被回收、要么期望的期望值错了。
 //! 3. 白名单与 4.7 回收段**必须成对变更**：第 4 节是 **add-only** 语义，只删白名单
 //!    **不会**回收存量授权行，生产库菜单不会消失。用例 ⑤ 的断言 A 就是为了钉住这条
-//!    契约（`live == 白名单 − 已软删菜单`）。
+//!    契约（`live == 白名单 − 已软删菜单`）；断言 A 的独立价值在**存量库 / 老 template
+//!    / 生产升级**场景（库里的 live 行不是当轮 seed 建的），标准 CI 路径下 template
+//!    由当轮 seed 重建，此时抓手是上面 1 里的硬编码快照。
+//! 4. **解析器防呆不变量**（2026-10-05 review 第 2 轮 NIT-2 补）——前 3 条说的是
+//!    「该同步哪个常量」，这条说的是「**会先撞上哪个 panic**」。改 seed 骨架前先读：
+//!    - 4.1-4.5 段角色授权必须**恒为 5 段**（`WHITELIST_SECTIONS`）：加第 6 个角色段
+//!      或删掉某段会先 panic「应恰有 5 段…请先修解析器（**不是** seed 写错了）」，
+//!      改法是先把 `EXPECTED_SNAPSHOT` 补上，再改 `WHITELIST_SECTIONS`；
+//!    - 全文件**只允许 1 处** `AND (rm.role, m.code) IN (`（4.7 回收段）：多写一处回收段
+//!      会 panic「应恰有 1 处」，需先把两处合并，或改解析器并拆分 `REVOKED_PAIRS` 的
+//!      分段表达；
+//!    - code 字面量必须匹配 `^[a-z_]+$`：引号写错位置 / 混入非小写字符会 panic。
+//!    - 附：code 列表**中间**的 `--` 注释行由 `strip_sql_line_comments` 剥除后才交给
+//!      `quoted_re`，所以注释里可自由出现单引号；但注释里若出现 ASCII `)`，
+//!      `whitelist_re` 的 `[^)]*` 会提前截断（表现为「缺失若干 code」的 fail-loud）。
+//! 5. **为什么没有「生产升级演练」用例**（2026-10-05 review 第 2 轮 MINOR-1，决定不
+//!    做，故记在这里备查）：reviewer 建议在 `test-support/fixtures/` 放一份上一版
+//!    `menu.sql` 快照 + 加第 6 个用例，理由是「快照与 seed 一起改 → 白名单删了 + 快照
+//!    也改了 + 4.7 漏写」三重手误时无人抓。不做的理由：那份快照是 300 行 SQL 的
+//!    **冻结副本**，会随 `seeds/menu.sql` 演化无声变陈旧 —— 维护者改了 seed 却忘了改
+//!    fixture，测试就拿一份错误的「上一版」当基线，制造出**比它要防的更隐蔽**的假
+//!    失败/假绿；而它要防的是三重手误同时发生，①（硬编码快照）已覆盖最常见的「白名单
+//!    删了但没改快照」，⑤ 覆盖存量库场景下的同一不变量。真正的升级演练在 seed 变更时
+//!    手工用 psql 跑一次即可（本次变更已跑过 3 次连跑 + 存量→新 seed 升级模拟，见
+//!    commit `420652b` 与 review 记录），固化成 fixture 的边际价值低于其陈旧成本。
 //!
 //! ## 期望值的来源（防 tautology）
 //!
@@ -339,12 +363,44 @@ fn parse_whitelist(sql: &str) -> Whitelist {
     out
 }
 
+/// 剥掉 `--` 行注释（2026-10-05 review 第 2 轮 MINOR-2）。
+///
+/// **为什么必须剥**：`seeds/menu.sql` 是注释极密的文件，4.2 / 4.3 段的 code 列表
+/// **中间就夹着整段中文注释**。若某条注释里出现单引号（例如
+/// `-- 参照 'scan_badge' 的 HMI 口径`），`quoted_re`（`'[^']*'`）会把它当成一个
+/// code 抓走 → 断言 A 报「缺失 scan_badge」的**假红**。fail-loud 不是假绿，但会给
+/// 维护者一个与真实缺陷无关的红脸，而踩中它的概率随注释密度上升。
+///
+/// **为什么不做成「让 `whitelist_re` 的 `codes` 组跳过注释行」**：`codes` 是捕获组，
+/// 必然是 `IN (` 与 `)` 之间一段**连续**文本，中间的注释行无论用哪种跳写法（先行
+/// 断言 / 重复跳行）都仍落在组内 —— 除非把整个括号体抓成一个 `codes_body` 再二次
+/// 加工，那还不如直接在 `parse_code_list` 里剥。故选「先剥后解析」，改动面最小；
+/// 且**剥在 `parse_code_list` 内部**（而不是调用点前），未来新增调用点不会漏掉这步。
+///
+/// 只认「`trim_start()` 后以 `--` 开头」的行：SQL 里 `--` 一律是行注释，
+/// `seeds/menu.sql` 也没有含 `--` 的字符串字面量，code 列表内更无行尾注释。
+/// 残留局限（fail-loud，非静默）：注释行里若出现 ASCII `)`，会让 `whitelist_re` 的
+/// `[^)]*` codes 组提前截断，表现为「缺失若干 code」而不是误报多出 code。
+fn strip_sql_line_comments(body: &str) -> String {
+    body.lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 从 `WHERE m.code IN (...)` 的括号内容里取出 code 集合，逐个按 `^[a-z_]+$` 校验。
+///
+/// 括号体先经 `strip_sql_line_comments` 剥掉 `--` 行注释再交给 `quoted_re`（理由见
+/// 该函数注释）；报错信息里的「片段」是**剥完注释后**正则真正看到的那段文本。
 fn parse_code_list(body: &str, role: &str) -> BTreeSet<String> {
-    let raws: Vec<&str> = quoted_re().find_iter(body).map(|m| m.as_str()).collect();
+    let stripped = strip_sql_line_comments(body);
+    let raws: Vec<&str> = quoted_re()
+        .find_iter(&stripped)
+        .map(|m| m.as_str())
+        .collect();
     assert!(
         !raws.is_empty(),
-        "角色 {role} 的 code 列表里一个单引号片段都没有（片段：{body:?}）"
+        "角色 {role} 的 code 列表里一个单引号片段都没有（剥注释后的片段：{stripped:?}）"
     );
     let mut out = BTreeSet::new();
     for raw in raws {
@@ -352,7 +408,7 @@ fn parse_code_list(body: &str, role: &str) -> BTreeSet<String> {
         assert!(
             code_re().is_match(code),
             "角色 {role} 的 code {code:?} 不匹配 `^[a-z_]+$` —— 引号位置/字面值与解析器 \
-             假设不符，请修解析器或核对 seed（片段：{body:?}）"
+             假设不符，请修解析器或核对 seed（剥注释后的片段：{stripped:?}）"
         );
         out.insert(code.to_string());
     }
@@ -993,9 +1049,11 @@ async fn menu_seed_live_matrix_matches_whitelist() {
             "角色 {role} 的 live 授权矩阵与 seeds/menu.sql 4.1-4.5 白名单对不上：\n\
              \x20 实际 {} 项 / 白名单（扣掉已软删菜单）{} 项\n\
              \x20 多出（白名单里没有，库里却仍是 live）: {extra:?}\n\
-             \x20   ↑ 若这些 code 是「从白名单里删掉」的，说明**漏写了 4.7 段回收**：\
-             \x20     第 4 节是 add-only，白名单删 code 不会软删存量 t_role_menu 行，\
-             \x20     生产库菜单不会消失（这是本用例存在的唯一理由）\n\
+            \x20   ↑ 若这些 code 是「从白名单里删掉」的，说明**漏写了 4.7 段回收**：\
+            \x20     第 4 节是 add-only，白名单删 code 不会软删存量 t_role_menu 行，\
+            \x20     生产库菜单不会消失。断言 A 的独立价值在**存量库 / 老 template /\
+            \x20     生产升级**场景（库里的 live 行不是当轮 seed 建的）；标准 CI 路径下\
+            \x20     hsh_erp_template 由当轮 seed 重建，抓手是上面那几份硬编码快照\n\
              \x20 缺失（白名单里有，库里却没有）: {missing:?}\n\
              \x20   ↑ 通常是 4.1-4.5 段的 INSERT 没跑成功，或该菜单已被软删\n\
              \x20 实际全集（排序）: {actual:?}\n\
