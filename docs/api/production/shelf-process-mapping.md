@@ -190,14 +190,18 @@ Response 200 `data`：`null`
 漏件批次。存量非法行的排查 SQL（只读）见下方「只读诊断 SQL」，**本仓不自动修数据**，
 修复走独立的数据修复单 + 上面的清空路径。
 
-**⚠️ 前端配套未完成（2026-10-04 review 第 1 轮 B1，待前端仓处理）**
-`ShelfList.vue::saveShelf` 在**编辑态无条件**调 `setShelfProcesses`，且 `updateShelf`
-先于它执行 ⇒ 改品检架的名称 / 物理顺序时，基本字段已落库、映射这一步返 `20104`、弹窗不关、
-toast 是后端原文 `shelf {code} (id={id}) zone=INSPECTION 不等于 PRODUCTION` —— **半截保存**。
-前端需两处配套：① `shelfForm.zone !== 'PRODUCTION'` 时隐藏工序多选（读侧已是这个口径）；
-② 编辑态对非 PRODUCTION 区货架跳过 `setShelfProcesses` 调用。
-在该配套落地前，**后端先上、库存管理页对品检架的编辑会失败**（清空路径已豁免，故清空动作
-本身仍可用）。
+**⚠️ 前端配套未完成（2026-10-04 review 第 1 轮 B1 / 第 2 轮 N1，待前端仓处理）**
+`ShelfList.vue::saveShelf` **无条件**调 `setShelfProcesses`，且 `updateShelf`（编辑态）/
+`createShelf`（新增态）**都先于**它执行 ⇒ 映射这一步返 `20104` 时**基本字段已落库**、
+弹窗不关、toast 是后端原文 `shelf {code} (id={id}) zone=INSPECTION 不等于 PRODUCTION`
+—— **半截保存**。**两条路径都中招，且新增路径更糟**：create 模式下货架已建出来，界面却
+报错卡住；用户再点保存会用同一个 `code` 重新建架、撞 `uk_t_shelf_code` 报
+`20502 DUPLICATE_CODE`，彻底卡死。前端需 3 处配套（判据取**货架行的 DB zone**、
+新增与编辑统一提交 `{items: []}`、zone 变更时清空已选工序）—— 逐条见本文末尾
+「前端配套改动清单」的 **C 节**（不写锚点链接：标题里带 `——` / `⏳`，锚点生成规则易随
+渲染器差异而失效）。
+在该配套落地前，**后端先上、库存管理页对品检架的新增 / 编辑都会失败**（清空路径已豁免，
+故「把品检架映射清空」这个动作本身仍可用）。
 
 ---
 
@@ -411,24 +415,91 @@ CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃�
 ### C. `ShelfList.vue` 按 zone 收敛映射编辑区 —— ⏳ 待办（2026-10-04 新增）
 
 配合 [`POST` 的 zone 守卫](#zone-守卫2026-10-04-新增写侧收紧)（`items` 非空时要求
-`zone='PRODUCTION'`）。**后端已上，前端未配套 ⇒ 库存管理页对品检架的编辑会失败。**
+`zone='PRODUCTION'`，`items: []` 豁免）。**后端已上，前端未配套 ⇒ 库存管理页对品检架的
+新增 / 编辑都会失败。**
 
-问题（`frontend/src/views/shelves/ShelfList.vue`）：
+> 本节行号取自 2026-10-04 的 `frontend/src/views/shelves/ShelfList.vue`。**行号会漂移，
+> 以符号名（`saveShelf` / `editShelf` / `resetForm` / `editingShelf` / `selectedProcessIds`）
+> 为准。**
 
-| 落点 | 现状 | 后果 |
+#### 问题（3 个落点 + 3 个隐蔽缺陷）
+
+| 落点（当前行号） | 现状 | 后果 |
 |---|---|---|
-| `saveShelf` 无条件调 `setShelfProcesses(shelfId, …)` | 不看 `shelfForm.zone` | 品检架的编辑 / 保存必收 20104 |
-| 工序多选（弹窗内）对所有 zone 显示 | 读侧 10 处 `useShelfProcessFilter` 的候选源早已是 `zone='PRODUCTION'` 口径 | 与后端新守卫口径不一致 |
-| `updateShelf` **先于** `setShelfProcesses` 执行 | 编辑态两个写点顺序固定 | **半截保存**：名称 / 物理顺序已落库，映射这一步报错，弹窗不关，toast 是后端原文 |
+| `saveShelf`（`:315`）→ `setShelfProcesses`（`:352`） | **无条件**调用，不看任何 zone | 品检架的新增 / 编辑必收 `20104` |
+| `el-form-item label="工序"`（`:107`） | 对所有 zone 渲染 | 与后端新守卫口径不一致（读侧 10 处 `useShelfProcessFilter` 的候选源早已是 `zone='PRODUCTION'` 口径） |
+| `updateShelf`（`:330`）/ `createShelf`（`:337`）**都先于** `:352` | 两个写点顺序固定 | **半截保存**，见下 |
 
-配套清单（2 处）：
+**隐蔽缺陷 ① —— 新增（create）路径与编辑路径同样坏，且更糟。** `saveShelf` 是新增 / 编辑
+**共用**的单个函数。create 分支里 `shelfId = String(created.id)` ⇒ **货架已落库**，映射这
+一步才 `20104` ⇒ 弹窗卡住 + 留一个孤儿货架；用户再点保存会带着**同一个 `code`** 重新
+`createShelf`，撞 `uk_t_shelf_code`（部分唯一索引，`WHERE deleted_at IS NULL`）⇒ 报
+`20502 DUPLICATE_CODE`，用户彻底卡死。恢复手段只有停用那个孤儿货架（`deactivateShelf` 是
+软删，`uk_t_shelf_code` 带 `WHERE deleted_at IS NULL` ⇒ 软删后 code 即释放），**编辑弹窗里
+没有任何入口**。
 
-1. `shelfForm.zone !== 'PRODUCTION'` 时**隐藏**工序多选（`el-form-item label="工序"`）；
-2. `saveShelf` 在编辑态且 `shelfForm.zone !== 'PRODUCTION'` 时**跳过**
-   `setShelfProcesses` 调用（此时报 20104 只会造成半截保存）。
+**隐蔽缺陷 ② —— 「隐藏多选」不等于「清空选择」。** `ShelfList.vue` 里 `watch` / `@change`
+**零命中**，`selectedProcessIds` 只在 `resetForm`（`:277`）被清、在 `editShelf`（`:302`）
+被 `getShelfProcesses` 的返回值填充。新增弹窗里 zone 缺省 `'PRODUCTION'`（`:274`）⇒ 用户
+先选工序 P1、再把「区域」切成品检，多选虽被隐藏，**model 里的 `[P1]` 仍在**，`:352` 照发。
 
-配套落地前可用的绕过：品检架的映射用 `items: []` 清空（清空路径已豁免 zone 守卫，见上），
-其余字段的编辑需前端修好后才不会失败。
+**隐蔽缺陷 ③ —— 判据不能用 `shelfForm.zone`。** zone 的 `<el-select>`（`:86-87`）在编辑态
+**没有** `:disabled`（只有「代码」输入框 `:80` 有 `:disabled="!!editingShelf"`），而
+`updateShelf` 的 payload（`:330-334`）只发 `{name, location, display_order}` —— **不发
+`zone`**。于是编辑态改「区域」对 DB **完全无效**，而以表单值为判据会与后端守卫读到的
+DB zone 打架，两个方向都错：
+
+- 品检架（DB = INSPECTION）被切到 PRODUCTION ⇒ 判据说「可以写」⇒ 调接口 ⇒ 后端读 DB 仍是
+  INSPECTION ⇒ `20104`（又半截保存）；
+- 生产架（DB = PRODUCTION）被切到品检 ⇒ 判据说「跳过」⇒ **静默留下陈旧映射**，界面无任何提示。
+
+#### 判据：`effectiveZone`（DB zone 从哪取）
+
+**编辑态的权威 zone 是 `editingShelf.value.zone`** —— 它是 `editShelf(s: Shelf)`（`:284`）
+从**表格行** `s` 存下来的（表格数据源 `items` ← `fetchData`（`:262-269`）的
+`listShelves({limit: 200})`，**不过滤 zone**，所以品检架也在表里），而 `editingShelf` 只在
+`:286` 被赋值一次、`:278` 被清空，**任何表单交互都不会写它**。`Shelf.zone` 是
+`@/types/shelf.ts` 里的必填 `string`（`'PRODUCTION' | 'INSPECTION'`），Zod 侧
+`shelfSchema` 同样必填。
+
+**新增态没有 DB 行可读**（`editingShelf === null`），此时唯一的 zone 就是 `shelfForm.zone`
+—— 而它正是将随 `createShelf({zone: shelfForm.zone})`（`:340`）写进 DB 的值，**不可能分叉**。
+```ts
+// 2026-10-04：映射编辑区的 zone 判据。
+// 编辑态以货架行的 DB zone 为准 —— updateShelf 的 payload 不含 zone，表单里改「区域」
+// 对 DB 无效，用表单值判会与后端守卫读到不同的 zone 而误判。
+// 新增态货架尚不存在，shelfForm.zone 就是将写入 DB 的值。
+const effectiveZone = computed(() => editingShelf.value?.zone ?? shelfForm.zone);
+```
+
+#### 配套清单（3 处，缺一不可）
+
+1. **隐藏**：`<el-form-item label="工序">`（`:107`）仅在 `effectiveZone === 'PRODUCTION'`
+   时渲染。
+2. **提交**：**新增与编辑两条路径统一** —— `effectiveZone !== 'PRODUCTION'` 时提交
+   `{ items: [] }`（走清空豁免，见上方「清空路径豁免」；
+   `toShelfProcessesPayload([])` → `{items: []}`，见 `src/api/shelves.ts`），
+   **不要跳过 `setShelfProcesses` 调用**。
+3. **清空**：zone 变更时（`<el-select @change>` 或 `watch(() => effectiveZone.value)`）同步
+   `selectedProcessIds.value = []`，否则被隐藏的 model 残留仍会被提交（隐蔽缺陷 ②）。
+
+#### ⛔ 明确不可取：编辑态「跳过 `setShelfProcesses` 调用」
+
+只按「非 PRODUCTION 就不调」实现，**新增路径会留下孤儿货架**（隐蔽缺陷 ①）—— 因为
+`createShelf` 已经提交成功，跳过映射调用等于「建了架但界面报成功」，用户以为配好了，实际
+一个非法映射都没写入、也拿不到任何报错。提交 `{items: []}` 才是对的：它让清空动作真的发生
+（品检架本来就不该有映射），且**不报 20104**。
+
+#### 配套落地前可用的绕过
+
+品检架的映射用 `{items: []}` 清空（清空路径已豁免 zone 守卫）；新增品检架时**不要**选工序。
+其余字段的新增 / 编辑需前端修好后才不会失败。
+
+#### 附带建议（可选，不属本批范围）
+
+编辑态的「区域」下拉对 DB 无效（`updateShelf` 不发 `zone`），却允许用户改 —— 改用
+`effectiveZone` 后它对映射区无害，但仍是误导。彻底做法是编辑态给该 `<el-select>` 加
+`:disabled="!!editingShelf"`（与「代码」输入框一致）。
 
 ---
 

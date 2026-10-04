@@ -149,6 +149,13 @@ impl ShelfProcessService {
         } else if ShelfRepo::get_by_id(&mut *conn, shelf_id).await?.is_none() {
             // 文案与 `validate_shelf_zone` 的 20501 分支**逐字一致**（刻意）：同一个
             // 「货架不存在」事实不该因 `items` 是否为空而给运营两种说法。改一处记得改另一处。
+            //
+            // 2026-10-04 review 第 2 轮 N4（技术债登记，**非缺陷**）：全仓这句 20501 文案
+            // 共 3 处 —— `prod::batch::service::guard::validate_shelf_zone`、本分支这一处、
+            // 以及本文件 `list_shelf_processes` 的既有那一处（3 处字面值已用 shasum 逐字
+            // 核对一致）。抽出共享断言（如 `guard::assert_shelf_exists`）供三处复用属**后续
+            // 重构项**，本轮刻意不做：它要动 `validate_shelf_zone` 全部调用点共用的共享层，
+            // 收益（几行去重）远小于把既有生产流端点的守卫一次性卷入改动的风险。
             return Err(AppError::biz(
                 code::BIZ_SHELF_NOT_FOUND,
                 format!("shelf {shelf_id} 不存在"),

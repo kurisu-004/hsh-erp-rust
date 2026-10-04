@@ -620,7 +620,10 @@ impl WorkerPoolService {
                 // AND sh.is_active = true AND sh.zone = 'PRODUCTION'`，故落到品检架 /
                 // 停用架 / 已软删架上的批次永远不会被工人领到，也不报错。
                 // 下面改为**无条件**走 `validate_shelf_zone`（与 place_on_shelf / pickup /
-                // outsource 等 6 个生产流端点同源同码：20501 → 20512 → 20104）。
+                // outsource 等生产流端点同源同码：20501 → 20512 → 20104）。
+                // 2026-10-04 review 第 2 轮 N2：原文写「6 个生产流端点」，那是本分支
+                // 收紧**之前**的调用点数；本分支新增 2 个 caller 后已过期。调用点数会随
+                // 端点增删漂移，故此处不写数字。
                 validate_shelf_zone(&mut *conn, *shelf_id, "PRODUCTION").await?;
                 if let Some(spid) = step_process_id {
                     // 2026-10-02 SQL 收口 + review 第 1 轮 M-6 改名：原内联
