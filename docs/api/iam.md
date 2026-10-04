@@ -109,7 +109,7 @@ ORDER BY m.sort_order, m.code
    + `rm.deleted_at IS NULL`（授权侧）。任一为假该菜单即不可见 —— 所以**回收授权
    用软删 `t_role_menu.deleted_at` 就够了**，不必动 `t_menu`。
 2. **父分组不会自动可见**：角色必须**显式持有父节点 code**，否则子节点会被
-   `build_menu_tree`（`src/modules/iam/service/menu.rs:46-51`）的孤儿兜底提升为
+   `build_menu_tree`（`src/modules/iam/service/menu.rs:44-52`）的孤儿兜底提升为
    顶级节点。例如 INSPECTOR 保留了 `inspection_pending`（待品检），就必须同时保留
    它的父节点 `production_group`。
 3. **多角色取并集**：一个用户有多个角色时是 `rm.role = ANY(...)` 的并集 + `DISTINCT` 去重，

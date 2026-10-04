@@ -247,8 +247,10 @@ WHERE m.code IN (
     'home',
     'parts_list', 'delivery_notes_manage',
     'assemblies_list',
-    -- 2026-10-05 权限收紧：INSPECTOR 收回 production_group 下的 3 个配置型子菜单
-    -- （process_work_type / part_process_chain / worker_queue），品检不应看到生产管理配置。
+    -- 2026-10-05 权限收紧：INSPECTOR 收回 production_group 下的 3 个子菜单
+    -- （process_work_type / part_process_chain / worker_queue）——前两个是生产管理
+    -- **配置型**菜单，worker_queue（生产执行看板）不是配置型，一并收回是因为品检
+    -- 不参与生产执行。品检不应看到生产管理的这些入口。
     -- production_group 本身**必须保留**——其子菜单 inspection_pending（待品检）要挂上去，
     -- 丢了会变孤儿节点被 build_menu_tree 提升为顶级。
     'production_group',
@@ -291,14 +293,15 @@ WHERE rm.menu_id = m.id
   AND m.deleted_at IS NOT NULL;
 
 -- ============================================================================
--- 4.7 角色授权回收（2026-10-05 权限收紧：品检不应看到生产管理的 3 个配置型菜单）
+-- 4.7 角色授权回收（2026-10-05 权限收紧：工序工种 / 制定工序改 MANAGER 专有、
+--     生产队列改 MANAGER + CLERK，品检三项全收回）
 -- ============================================================================
 -- ⚠️ 第 4 节的授权是**纯增量**（ON CONFLICT ... DO NOTHING），从白名单里删 code
 --    **不会**回收生产库已存在的 t_role_menu 行。收紧权限必须在本节显式列出来。
 --    与第 3 节 t_menu soft-delete 同一哲学：变更显式化，不做「白名单之外一律删」。
 --
 -- 本次收紧（用户需求：工序工种/制定工序 → MANAGER；生产队列 → MANAGER+CLERK；
--- 品检三个都看不到）：
+-- 品检三个都看不到）——覆盖两个角色，不止品检：
 --   CLERK     − process_work_type、part_process_chain（CLERK 保留 worker_queue）
 --   INSPECTOR − process_work_type、part_process_chain、worker_queue
 --   INSPECTOR 仍保留 production_group（其 inspection_pending 子菜单需要）
@@ -307,6 +310,12 @@ WHERE rm.menu_id = m.id
 -- 幂等、不每次启动都 bump version。
 -- ⚠️ `version = rm.version + 1` 必须带表名限定：本 UPDATE 带 `FROM t_menu m`，而
 --    两张表都有 version 列，不限定会被 PG 判为 ambiguous 直接报错。
+--
+-- 2026-10-05（review 第 1 轮 NIT-2）：本段**刻意不加** `AND m.deleted_at IS NULL`
+--    （4.1-4.5 各段都有，与此处不对称）。原因：① 菜单若已软删，其授权行留着也无害——
+--    渲染层 SQL 已按 `m.deleted_at IS NULL` 过滤，且第 4.6 段会硬删 settings_root 等
+--    特定 code 的 role_menu 行；② 回收段求的是「最大化覆盖」，宁可多软删一条不可见
+--    的授权，也不依赖「菜单永远不会被软删」这个上游不变式。
 UPDATE t_role_menu rm
 SET deleted_at = now(),
     updated_at = now(),

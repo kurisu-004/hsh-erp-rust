@@ -18,7 +18,7 @@
 //! `production_group`（生产管理分组）在 MANAGER / CLERK / INSPECTOR 三方都必须保留：
 //! INSPECTOR 靠它挂 `inspection_pending`（待品检），CLERK 靠它挂 `worker_queue`。
 //!
-//! ## 4 个用例各钉什么
+//! ## 5 个用例各钉什么
 //!
 //! 1. **`menu_seed_role_matrix`** —— 钉住 `t_role_menu` 授权口径的全量快照
 //!    （每角色 code 集合**完全相等**，不是「包含」这种弱断言）。
@@ -34,6 +34,32 @@
 //! 4. **`menu_seed_rendered_tree_per_role`** —— 端到端：登录后 `GET /iam/me` 返回的
 //!    `data.menus` 树（前端真正消费的数据：`src/layouts/MainLayout.vue:109` 渲染
 //!    `auth.menus`、`src/router/index.ts:486` 用 `meta.menuCode` 在这棵树里做成员判断）。
+//! 5. **`menu_seed_live_matrix_matches_whitelist`**（2026-10-05 review 第 1 轮 MINOR-1
+//!    新增）—— 把「库里的 live 矩阵 == seed 文本里的 4.1-4.5 白名单」这条不变量**从 seed
+//!    文本现场解析**出来断言，并断言「4.7 回收元组 ∩ 白名单 == ∅」。关的是前 4 个用例的
+//!    盲区：**只从白名单删 code、忘了写进 4.7 段**，在「测试库继承 template 的 live 行」
+//!    的前提下不改变任何 live 矩阵 → 前 4 个用例全绿而线上菜单没收紧。
+//!
+//! ## 维护约定（改 `seeds/menu.sql` 前必读，2026-10-05 新增）
+//!
+//! 本文件是 seed 的**回归护栏**，多处断言是**精确集合相等**，不是「包含」。改动 seed 时
+//! 漏改对应常量，测试会以「快照不匹配」的红脸失败 —— **这是设计意图，不是误报**，但
+//! 失败信息只说「不符」不说「你该改哪个文件」，所以维护约定写在这里：
+//!
+//! 1. 改 **4.1-4.5 段白名单**（增删任一 role 的任一 code）或增删 `production_group`
+//!    下的子菜单时，**必须同步**改这 3 处（缺任一处都会红）：
+//!    - `EXPECTED_SNAPSHOT`（= `MANAGER_EXPECTED` / `CLERK_EXPECTED` /
+//!      `INSPECTOR_EXPECTED` / `CNC_PROGRAMMER_EXPECTED` / `SHELF_ACCOUNT_EXPECTED`）；
+//!    - `HEADLINE`（仅当动的是 3 个目标 code 之一的可见性）；
+//!    - `menu_seed_rendered_tree_per_role` 里 3 处 `children_of(...)` 的**精确子节点
+//!      集合**断言（MANAGER 6 个 / CLERK 1 个 / INSPECTOR 1 个）—— 给
+//!      `production_group` 加一个子菜单就会在这里红。
+//! 2. 改 **4.7 段回收元组**时，**必须同步** `REVOKED_PAIRS`（用例 ⑤ 的断言 C 会直接
+//!    比对两处来源）。用例会伪造这些 `(role, code)` 的 legacy 存量行来验回收生效，
+//!    两处不一致 = 要么伪造的行没被回收、要么期望的期望值错了。
+//! 3. 白名单与 4.7 回收段**必须成对变更**：第 4 节是 **add-only** 语义，只删白名单
+//!    **不会**回收存量授权行，生产库菜单不会消失。用例 ⑤ 的断言 A 就是为了钉住这条
+//!    契约（`live == 白名单 − 已软删菜单`）。
 //!
 //! ## 期望值的来源（防 tautology）
 //!
@@ -43,6 +69,12 @@
 //!   `AND m.deleted_at IS NULL`，故它不入库（MANAGER 白名单 30 项 → 实际 29 项）；
 //! - `floor_group` 只被第 3.2 段置 `is_active = false`（不软删），仍进授权表；
 //! - 4.6 段 `DELETE` 会硬删 `settings_root` 等已软删菜单的 role_menu 行。
+//!
+//! 两类期望值并存、各司其职，**都不许删也不许放宽**：
+//! - 硬编码快照（上面 5 份 + `HEADLINE` + `REVOKED_PAIRS`）= 「人读得懂的期望值」，
+//!   角色/代码改名或增删时红给改的人看；
+//! - 用例 ⑤ 从 `MENU_SEED_SQL` **现场解析**出的白名单 = 「与 DB 对账的权威」，专治
+//!   「seed 改了但快照忘了改」与「只删白名单不写 4.7」两类错误。
 //!
 //! ## 测试策略
 //!
@@ -55,9 +87,11 @@
 //! 状态**：①③ 里的 seed 调用此时是 no-op（顺带验幂等），② 必须自己伪造 legacy 存量行。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use axum::http::StatusCode;
 use chrono::NaiveDateTime;
+use regex::Regex;
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 
@@ -193,6 +227,168 @@ const LEGACY_GRANT_ID_BASE: i64 = 9_000_000_009_000_001;
 const INSPECTOR_USER_ROLE_ID: i64 = 9_000_000_009_000_101;
 
 // ===========================================================================
+// seed 文本解析（2026-10-05 review 第 1 轮 MINOR-1 新增）
+// ===========================================================================
+// 目的：把「库里的 live 授权矩阵 == seeds/menu.sql 第 4.1-4.5 段白名单」这条不变量
+// **从 seed 文本现场解析**出来断言，而不是靠硬编码快照间接覆盖。理由：硬编码快照钉住
+// 的是「今天是什么样」，而「只从白名单删掉 code、忘了写进 4.7 段回收」这种错在
+// fresh DB（从已 seed 的 template 克隆）里**不改变任何 live 矩阵** → 快照全绿。
+//
+// 5 段 role_menu INSERT 的骨架是固定的（见 seeds/menu.sql 第 4.1-4.5 段）：
+//   INSERT INTO t_role_menu (id, role, ...)
+//   SELECT  900000000100{n}001 + row_number() OVER (),  '<ROLE>',  m.id,  ...
+//   FROM t_menu m
+//   WHERE m.code IN ( 'a', 'b', ... )  AND m.deleted_at IS NULL
+//   ON CONFLICT (role, menu_id) WHERE deleted_at IS NULL DO NOTHING;
+// 4.6 段是 DELETE、4.7 段是 UPDATE，均不含 `INSERT INTO t_role_menu`，故不会误匹配。
+
+/// 角色 → 白名单 code 集合（4.1-4.5 段解析结果）。
+type Whitelist = BTreeMap<String, BTreeSet<String>>;
+
+/// `('CLERK', 'process_work_type')` 形式的回收二元组。
+type RevokedPairs = BTreeSet<(String, String)>;
+
+/// 段数 = 5（MANAGER / CLERK / INSPECTOR / CNC_PROGRAMMER / SHELF_ACCOUNT）。
+const WHITELIST_SECTIONS: usize = 5;
+
+/// 4.1-4.5 段的 INSERT 骨架（DOTALL + 非贪婪）。
+fn whitelist_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?s)INSERT INTO t_role_menu \(id, role,.*?'(?P<role>[A-Z_]+)',\s*m\.id,.*?WHERE m\.code IN \((?P<codes>[^)]*)\)",
+        )
+        .expect("4.1-4.5 段 INSERT 骨架正则编译失败")
+    })
+}
+
+/// 4.7 段的 `AND (rm.role, m.code) IN ( ... )` 元组列表。
+///
+/// 终止锚点是语句末的 `\n\s*);`（不是 `)`）—— 元组本身带括号，用 `[^)]*` 会在第一个
+/// `('CLERK',` 处就截断。锚点失配时 `captures_iter` 命中 0 处 → `parse_revoked_pairs`
+/// 直接 panic（防呆要求），不会静默变成「4.7 段为空」。
+fn revoked_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?s)AND \(rm\.role, m\.code\) IN \((?P<tuples>.*?)\n\s*\);")
+            .expect("4.7 段元组列表正则编译失败")
+    })
+}
+
+/// 单个 `('ROLE', 'code')` 元组（4.7 段里是逗号对齐排版，故 `\s*` 放宽空白）。
+fn revoked_pair_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\(\s*'(?P<role>[A-Z_]+)'\s*,\s*'(?P<code>[a-z_]+)'\s*\)")
+            .expect("4.7 段单个元组正则编译失败")
+    })
+}
+
+/// 单引号字符串片段（从 `WHERE m.code IN (...)` 里取 code 原文）。
+fn quoted_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"'[^']*'").expect("单引号片段正则编译失败"))
+}
+
+/// menu code 的合法字面值（`t_menu.code` 全是小写下划线；用于解析器防呆）。
+fn code_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[a-z_]+$").expect("code 正则编译失败"))
+}
+
+/// 从 4.1-4.5 段解析出「角色 → code 集合」白名单。
+///
+/// **防呆是硬要求**（2026-10-05）：解析失败必须 panic，绝不允许「解析不到 → 集合为空
+/// → 断言恰好通过」这种静默假绿。故下列任一情况都直接 panic：
+/// - 解析出的段数 ≠ 5（seed 骨架变了 / 某段被删）；
+/// - 某个角色的 `code IN (...)` 解析出 0 个 code；
+/// - 任一 code 不匹配 `^[a-z_]+$`（说明引号/截断位置不对，或 code 写法变了）；
+/// - 同一角色出现两段 INSERT（正则跨段误匹配）。
+fn parse_whitelist(sql: &str) -> Whitelist {
+    let caps: Vec<_> = whitelist_re().captures_iter(sql).collect();
+    assert_eq!(
+        caps.len(),
+        WHITELIST_SECTIONS,
+        "seeds/menu.sql 第 4.1-4.5 段应恰有 {WHITELIST_SECTIONS} 段角色授权 INSERT，\
+         实际解析出 {} 段 —— 解析器已与 seed 骨架脱节，用例 ⑤ 的「live == 白名单」\
+         不变量随之失去意义，请先修解析器（**不是** seed 写错了）",
+        caps.len()
+    );
+
+    let mut out: Whitelist = BTreeMap::new();
+    for cap in caps {
+        let role = cap
+            .name("role")
+            .expect("匹配必带 role 捕获组")
+            .as_str()
+            .to_string();
+        let codes_body = cap.name("codes").expect("匹配必带 codes 捕获组").as_str();
+        let codes = parse_code_list(codes_body, &role);
+        assert!(
+            !codes.is_empty(),
+            "角色 {role} 的 `WHERE m.code IN (...)` 解析出 0 个 code —— 正则多半没吃到 \
+             正确的代码列表（片段：{codes_body:?}）"
+        );
+        if let Some(prev) = out.insert(role.clone(), codes) {
+            panic!(
+                "角色 {role} 在 seed 里出现两段授权 INSERT（正则跨段误匹配）：{prev:?}；\
+                 请修解析器"
+            );
+        }
+    }
+    out
+}
+
+/// 从 `WHERE m.code IN (...)` 的括号内容里取出 code 集合，逐个按 `^[a-z_]+$` 校验。
+fn parse_code_list(body: &str, role: &str) -> BTreeSet<String> {
+    let raws: Vec<&str> = quoted_re().find_iter(body).map(|m| m.as_str()).collect();
+    assert!(
+        !raws.is_empty(),
+        "角色 {role} 的 code 列表里一个单引号片段都没有（片段：{body:?}）"
+    );
+    let mut out = BTreeSet::new();
+    for raw in raws {
+        let code = raw.trim_matches('\'');
+        assert!(
+            code_re().is_match(code),
+            "角色 {role} 的 code {code:?} 不匹配 `^[a-z_]+$` —— 引号位置/字面值与解析器 \
+             假设不符，请修解析器或核对 seed（片段：{body:?}）"
+        );
+        out.insert(code.to_string());
+    }
+    out
+}
+
+/// 从 4.7 段解析出 `('ROLE', 'code')` 回收二元组集合。
+fn parse_revoked_pairs(sql: &str) -> RevokedPairs {
+    let caps: Vec<_> = revoked_re().captures_iter(sql).collect();
+    assert_eq!(
+        caps.len(),
+        1,
+        "seeds/menu.sql 应恰有 1 处 `AND (rm.role, m.code) IN (...)`（4.7 段回收清单），\
+         实际解析出 {} 处 —— 解析器已与 seed 骨架脱节（**不是**「4.7 段可以为空」），\
+         请先修解析器",
+        caps.len()
+    );
+    let tuples = caps[0]
+        .name("tuples")
+        .expect("匹配必带 tuples 捕获组")
+        .as_str();
+    let mut out: RevokedPairs = BTreeSet::new();
+    for cap in revoked_pair_re().captures_iter(tuples) {
+        out.insert((
+            cap.name("role").expect("必带 role 组").as_str().to_string(),
+            cap.name("code").expect("必带 code 组").as_str().to_string(),
+        ));
+    }
+    assert!(
+        !out.is_empty(),
+        "4.7 段元组列表解析出 0 个 ('ROLE', 'code') —— 片段：{tuples:?}"
+    );
+    out
+}
+
+// ===========================================================================
 // Helpers
 // ===========================================================================
 
@@ -223,6 +419,20 @@ async fn live_codes_by_role(pool: &PgPool) -> BTreeMap<String, BTreeSet<String>>
         out.insert(role, codes.into_iter().collect());
     }
     out
+}
+
+/// `t_menu` 里**已软删**（`deleted_at IS NOT NULL`）的 code 集合。
+///
+/// 4.1-4.5 段的 INSERT 都带 `AND m.deleted_at IS NULL`，故白名单里的软删 code
+/// （当前只有第 3.1 段的 `settings_root`；fresh 测试库里 `work_types_list` 等 3 个旧
+/// 菜单根本不存在）不会进授权表。用例 ⑤ 的「live == 白名单 − 软删菜单」要用它做差集。
+async fn soft_deleted_menu_codes(pool: &PgPool) -> BTreeSet<String> {
+    sqlx::query_scalar::<_, String>("SELECT code FROM t_menu WHERE deleted_at IS NOT NULL")
+        .fetch_all(pool)
+        .await
+        .expect("查询 t_menu 已软删 code")
+        .into_iter()
+        .collect()
 }
 
 /// 取某角色 code 集合；角色整体不在结果里（授权被清空）时返回空集 —— 由调用方的
@@ -731,5 +941,99 @@ async fn add_inspector_role(pool: &PgPool) {
         affected.rows_affected(),
         1,
         "给 fx_iam_target 插 INSPECTOR 角色应命中 1 行"
+    );
+}
+
+// ===========================================================================
+// 用例 ⑤：live 授权矩阵 == seed 白名单（4.1-4.5）且与 4.7 回收段不相交
+// ===========================================================================
+// 2026-10-05 review 第 1 轮 MINOR-1 新增。关的是前 4 个用例的盲区：
+// **「只从白名单删 code、忘了写进 4.7 段」在 fresh DB 里不改变任何 live 矩阵**
+// （第 4 节 add-only：白名单删 code 不会软删存量授权行；测试库又继承 template 的
+// live 行）→ 硬编码快照全绿，而生产库菜单并没有收紧。
+// 本用例把不变量从「seed 文本」现场解析出来，与 DB 对账，三条断言：
+//   A：每角色 `live == 白名单 − t_menu 已软删的 code`（抓「白名单删了但没进 4.7」）
+//   B：`4.7 元组 ∩ 白名单 == ∅`（抓「同一个 code 既被授权又被回收」的自相矛盾配置）
+//   C：`4.7 元组 == REVOKED_PAIRS`（两处独立来源必须一致，防只改一处）
+#[tokio::test]
+async fn menu_seed_live_matrix_matches_whitelist() {
+    let pool = test_pool().await;
+    apply_menu_seed(&pool).await;
+
+    // ── 从 seed 文本解析期望值（解析器自带防呆：段数 / 空集合 / code 字面值不合规
+    //    一律 panic，见 parse_whitelist / parse_revoked_pairs 的注释）──
+    let whitelist = parse_whitelist(MENU_SEED_SQL);
+    let revoked = parse_revoked_pairs(MENU_SEED_SQL);
+
+    // 前提校验：解析出的角色集合必须与本文件的 5 份快照完全一致（防解析器漏掉某段）
+    let declared: BTreeSet<String> = EXPECTED_SNAPSHOT
+        .iter()
+        .map(|(r, _)| r.to_string())
+        .collect();
+    let parsed_roles: BTreeSet<String> = whitelist.keys().cloned().collect();
+    assert_eq!(
+        parsed_roles, declared,
+        "seeds/menu.sql 解析出的角色集合与本文件的 EXPECTED_SNAPSHOT 角色集合不符：\
+         若 seed 真的增删了角色授权段，请同步改 EXPECTED_SNAPSHOT；若没改，多半是解析器失配"
+    );
+
+    let live = live_codes_by_role(&pool).await;
+    let soft_deleted = soft_deleted_menu_codes(&pool).await;
+
+    // ── 断言 A：每角色 live 集合 == 白名单 − 已软删菜单 ──
+    for (role, wl) in &whitelist {
+        let expected: BTreeSet<String> = wl.difference(&soft_deleted).cloned().collect();
+        let actual = codes_of(&live, role);
+        if actual == expected {
+            continue;
+        }
+        let extra: Vec<&str> = actual.difference(&expected).map(String::as_str).collect();
+        let missing: Vec<&str> = expected.difference(&actual).map(String::as_str).collect();
+        panic!(
+            "角色 {role} 的 live 授权矩阵与 seeds/menu.sql 4.1-4.5 白名单对不上：\n\
+             \x20 实际 {} 项 / 白名单（扣掉已软删菜单）{} 项\n\
+             \x20 多出（白名单里没有，库里却仍是 live）: {extra:?}\n\
+             \x20   ↑ 若这些 code 是「从白名单里删掉」的，说明**漏写了 4.7 段回收**：\
+             \x20     第 4 节是 add-only，白名单删 code 不会软删存量 t_role_menu 行，\
+             \x20     生产库菜单不会消失（这是本用例存在的唯一理由）\n\
+             \x20 缺失（白名单里有，库里却没有）: {missing:?}\n\
+             \x20   ↑ 通常是 4.1-4.5 段的 INSERT 没跑成功，或该菜单已被软删\n\
+             \x20 实际全集（排序）: {actual:?}\n\
+             \x20 期望全集（排序）: {expected:?}",
+            actual.len(),
+            expected.len()
+        );
+    }
+    // 兜底：库里不应出现 seed 第 4 节之外的角色授权段（防止有人加了第 6 段而解析器
+    // 其实吃到了、白名单集合里却没体现角色名）
+    let live_roles: BTreeSet<String> = live.keys().cloned().collect();
+    assert_eq!(
+        live_roles, declared,
+        "t_role_menu 里出现了 seeds/menu.sql 第 4 节未声明的角色"
+    );
+
+    // ── 断言 B：4.7 回收元组与白名单**不相交**（逐 role 判 (role, code) 二元组）──
+    // 同一个 (role, code) 既在白名单里被 INSERT、又被 4.7 段软删 = 自相矛盾配置：
+    // seed 每跑一次就「授权 + 回收」来回抖，`version` 无限 bump，菜单随机闪没。
+    for (role, code) in &revoked {
+        let granted = whitelist
+            .get(role)
+            .is_some_and(|codes| codes.contains(code));
+        assert!(
+            !granted,
+            "自相矛盾配置：({role}, {code}) 同时出现在 seeds/menu.sql 的 4.1-4.5 白名单 \
+             与 4.7 回收清单里 —— 要么从白名单删掉、要么从 4.7 删掉，不能两处都有"
+        );
+    }
+
+    // ── 断言 C：4.7 段解析出的元组 == REVOKED_PAIRS 常量（两处独立来源必须一致）──
+    let expected_revoked: RevokedPairs = REVOKED_PAIRS
+        .iter()
+        .map(|(r, c)| (r.to_string(), c.to_string()))
+        .collect();
+    assert_eq!(
+        revoked, expected_revoked,
+        "seeds/menu.sql 4.7 段的回收元组与本文件 REVOKED_PAIRS 常量不一致（两处独立来源 \
+         必须同步改）：4.7 段新增/删除了回收项时，务必同步 REVOKED_PAIRS"
     );
 }
