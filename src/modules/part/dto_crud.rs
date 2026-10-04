@@ -201,7 +201,7 @@ pub struct PartUpdateRequest {
 /// 2026-09-29 简化：原 `row_type` / `include_assemblies` 三态合并矩阵已下沉
 /// 到新端点 `GET /api/v2/com/union-list`（plan §1-3）。本端点（`GET /parts`）
 /// 只查 `t_part WHERE assembly_id IS NULL`，不再承担 ALL/ASSEMBLY 合并。需
-/// 三态筛选的 caller 切换到 `/com/union-list?row_type=ALL|PART|ASSEMBLY`。
+/// 跨行类型筛选的 caller 切换到 `/com/union-list?row_type=ALL|PART|PART_FLAT|ASSEMBLY`。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PartListQuery {
     #[serde(default, deserialize_with = "deserialize_i64_opt")]

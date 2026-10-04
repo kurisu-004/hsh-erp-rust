@@ -2,20 +2,23 @@
 //!
 //! ## 范围
 //! - `UnionListService::list_union_items(query, current)` —— 跨表合并视图端点
-//!   `GET /api/v2/com/union-list` 的核心实现。row_type 三态（ALL / PART /
-//!   ASSEMBLY）由 DTO 层 `UnionListQuery` 承载 → `RowType` enum normalize →
-//!   service 端 dispatch。
+//!   `GET /api/v2/com/union-list` 的核心实现。row_type 四态（ALL / PART /
+//!   PART_FLAT / ASSEMBLY）由 DTO 层 `UnionListQuery` 承载 → `RowType` enum
+//!   normalize → service 端 dispatch。
 //!
 //! ## 设计要点（plan §3-4）
 //! - **ALL 模式 SQL UNION ALL + pushdown**：每段 SQL 内部 `LIMIT (offset+limit)`
 //!   OFFSET 0，外层 UNION 后再做 ORDER BY + LIMIT + OFFSET（修分页 bug：
 //!   原 ALL 模式 `segment_limit.clamp(1,200)` 在 deep offset 时返回空集）。
-//! - **PART 模式直走 `PartRepo::list_with_filters(part_only=true)`** + count；
-//!   单段无需 pushdown。
+//! - **PART 模式直走 `PartRepo::list_with_filters`** + count；单段无需 pushdown。
+//! - **PART_FLAT 模式（2026-10-05 新增）复用 PART 全链路**，仅把 `part_only`
+//!   传 `false` 关掉子件守卫；过滤 / enrichment / count / 分页 / 排序与 PART
+//!   逐行相同。
 //! - **ASSEMBLY 模式直走 `AssemblyRepo::list_with_filters`** + count；
 //!   t_assembly 无 batch 派生字段（locations / holder_ids 忽略）。
-//! - **enrichment 分桶**：PART 行 `location` / `holder_name`；ASSEMBLY 行
-//!   `child_count` / `has_children`；所有行 `customer_name` / `l1_customer_name`。
+//! - **enrichment 分桶**：PART / PART_FLAT 行 `location` / `holder_name`；
+//!   ASSEMBLY 行 `child_count` / `has_children`；所有行 `customer_name` /
+//!   `l1_customer_name`。
 //!
 //! ## 与 part::service::crud 边界
 //! - 原 `PartService::list_parts` 的 ALL / ASSEMBLY 分支（`list_parts_assembly_only` /
@@ -28,7 +31,7 @@
 //! 修前端 dashboard UpcomingDeliveryListDrawer 的隐藏 bug —— 前端已传这俩参数
 //! 但本 DTO 之前没有对应字段，参数被静默丢弃。本 service 层在 `parse_filters`
 //! 解析 `YYYY-MM-DD` → `chrono::NaiveDate`，非法格式 → 40001 VALIDATION_ERROR。
-//! PART / ALL / ASSEMBLY 三模式全部生效。
+//! 四态全部生效。
 //!
 //! ## 2026-09-30 新增：10 字段筛选（4 文本 ILIKE + 4 日期窗口 + 2 IS NULL 三态）
 //! 修零件一览页面（frontend `PartsTable.vue` / `usePartsListQuery.ts::buildParams()`）
@@ -39,10 +42,11 @@
 //!   （`order_no` 含空串语义对齐 PR-F 2026-08-11）
 //!
 //! 三层修复：DTO 声明（避免 axum Query 静默丢弃）→ service 解析 + 预格式化
-//!   → repo SQL 段内消费。PART / ALL / ASSEMBLY 三模式全部生效。
+//!   → repo SQL 段内消费。四态全部生效。
 //!
 //! ## SQL 引用
-//! - PART 段：`part/repo/sql/part_sql.rs::list_with_filters`（part_only=true）
+//! - PART / PART_FLAT 段：`part/repo/sql/part_sql.rs::list_with_filters`
+//!   （`part_only` 由 row_type 决定）
 //! - ASSEMBLY 段：`assembly/repo/sql.rs::list_with_filters`
 //! - ALL 段：本域 `repo/sql.rs::list_union_all_with_filters`
 
@@ -68,15 +72,16 @@ use super::super::vo::PartListOut;
 /// 跨表合并视图端点业务逻辑。
 ///
 /// 行为：
-/// 1. normalize `row_type`（`None` / `"ALL"` / `""` → `All`；`"PART"` / `"ASSEMBLY"` 合法；其它 → 40001）。
+/// 1. normalize `row_type`（`None` / `"ALL"` / `""` → `All`；`"PART"` / `"PART_FLAT"` / `"ASSEMBLY"` 合法；其它 → 40001）。
 /// 2. 解析共享筛选条件（`expand_customer_id` + 字符串切分）。
 /// 3. 按 `RowType` dispatch：
-///    - `Part` → `PartRepo::list_with_filters` + `count_with_filters`
+///    - `Part` → `PartRepo::list_with_filters` + `count_with_filters`（`part_only=true`）
+///    - `PartFlat` → 同上但 `part_only=false`（2026-10-05 新增，含装配件子件）
 ///    - `Assembly` → `AssemblyRepo::list_with_filters` + `count_with_filters`
 ///    - `All` → `UnionListRepo::list_union_all_with_filters`（UNION ALL +
 ///      pushdown）+ 两次 `count_with_filters`
 /// 4. enrichment 分桶（`customer_name` / `l1_customer_name` 全部行；
-///    `location` / `holder_name` 仅 PART 行；`child_count` / `has_children`
+///    `location` / `holder_name` 仅 PART / PART_FLAT 行；`child_count` / `has_children`
 ///    仅 ASSEMBLY 行）。
 /// 5. 投影为 `PartListItem`（已含 `row_type` 字段）→ 序列化为 `PartListOut`。
 ///
@@ -104,7 +109,9 @@ impl UnionListService {
         let offset = query.offset.unwrap_or(0).max(0);
 
         match row_type {
-            RowType::Part => Self::list_part(conn, query, limit, offset, current).await,
+            RowType::Part => Self::list_part(conn, query, limit, offset, true, current).await,
+            // 2026-10-05 新增：与 Part 同一条查询路径，仅关掉子件守卫。
+            RowType::PartFlat => Self::list_part(conn, query, limit, offset, false, current).await,
             RowType::Assembly => Self::list_assembly(conn, query, limit, offset, current).await,
             RowType::All => Self::list_all(conn, query, limit, offset, current).await,
         }
@@ -112,12 +119,20 @@ impl UnionListService {
 
     // ===== PART 单段模式 =====
 
-    /// PART 单段：直走 `PartRepo::list_with_filters(part_only=true)` + count。
+    /// PART 单段：直走 `PartRepo::list_with_filters` + count。
+    ///
+    /// `part_only` 形参（2026-10-05 新增）是子件守卫开关，直接透传给
+    /// `PartListFilters.part_only`：
+    /// - `true`（`row_type=PART`）→ SQL 追加 `AND assembly_id IS NULL`，排除装配件子件
+    /// - `false`（`row_type=PART_FLAT`）→ 守卫不放行，子件各计 1 / 各占 1 行
+    ///
+    /// 两种取值共用同一套过滤构造 / enrichment / count / 分页 / 排序实现。
     async fn list_part(
         mut conn: &mut PgConnection,
         query: &UnionListQuery,
         limit: i64,
         offset: i64,
+        part_only: bool,
         _current: &CurrentUser,
     ) -> Result<PartListOut, AppError> {
         let parsed = parse_filters(&mut *conn, query).await?;
@@ -146,7 +161,9 @@ impl UnionListService {
             // 2026-09-30 新增：2 IS NULL 三态
             order_no_is_null: parsed.order_no_is_null,
             system_delivery_date_is_null: parsed.system_delivery_date_is_null,
-            part_only: true, // PART-only 模式强制打开装配体子件守卫
+            // 2026-10-05：由 `part_only` 形参透传 —— true=排除装配件子件
+            // （`row_type=PART`）/ false=子件各计 1（`row_type=PART_FLAT`）。
+            part_only,
             sort_by: &parsed.sort_by,
             sort_dir: &parsed.sort_dir,
             limit,
@@ -493,8 +510,10 @@ async fn parse_filters(
     query: &UnionListQuery,
 ) -> Result<ParsedFilters, AppError> {
     // 排序键白名单：7 键（去掉 SERIAL_NO，因 t_assembly 上无对应列）。
-    // SYSTEM_DELIVERY_DATE 2026-09-30 dashboard 配套（b28f409 / aaeb6f1）：
-    // 「最紧急工单」按系统交期排序。
+    // SYSTEM_DELIVERY_DATE 是 dashboard「最紧急工单」与交期抽屉的排序语义锚，
+    // 本端点接受它之后还必须在 repo 的列名映射里也认它（PART 系走
+    // `part/repo/sql/part_sql.rs::order_col`，ALL 段走本域 `union_sort_col`），
+    // 两处白名单必须同步，见 `part_sql.rs::list_with_filters` 的说明。
     let sort_by = [
         "CREATED_AT",
         "UPDATED_AT",
@@ -503,7 +522,6 @@ async fn parse_filters(
         "SYSTEM_DELIVERY_DATE",
         "DRAWING_NO",
         "NAME",
-        "SYSTEM_DELIVERY_DATE", // 2026-09-30 新增（dashboard「最紧急工单」按系统交期排序）
     ]
     .iter()
     .find(|&&s| Some(s) == query.sort_by.as_deref())
@@ -713,7 +731,9 @@ async fn lookup_customer_names(
 
 /// 一次性 GROUP BY 拿一组 assembly_id 的子件计数（从 `part::service::crud` 下沉）。
 ///
-/// 空 ids → 返回空 HashMap（不发起 SQL）。PART / ALL 段装配件行专用。
+/// 空 ids → 返回空 HashMap（不发起 SQL）。仅 ASSEMBLY 段与 ALL 段的装配件行
+/// 需要（`child_count` / `has_children` 两个派生字段）；PART 系两态的行是
+/// `t_part` 本身，不带该字段。
 async fn fetch_child_counts(
     conn: &mut PgConnection,
     asm_ids: &[i64],

@@ -236,7 +236,8 @@ impl PartService {
 
         // 2026-09-29 简化：原 ALL / ASSEMBLY 分支已下沉到 `com::union_list::service`
         // （plan §1-3）。本端点只查 `t_part WHERE assembly_id IS NULL`（PART-only）。
-        // 需三态筛选的 caller 切换到 `GET /api/v2/com/union-list?row_type=ALL|PART|ASSEMBLY`。
+        // 需跨行类型筛选的 caller 切换到
+        // `GET /api/v2/com/union-list?row_type=ALL|PART|PART_FLAT|ASSEMBLY`。
         Self::list_parts_part_only_with_total(repo, query, limit, offset, current).await
     }
 
