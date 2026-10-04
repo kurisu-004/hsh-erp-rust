@@ -225,7 +225,10 @@ WHERE m.code IN (
     'customer_management', 'customers_list', 'applicants_list',
     'order_group', 'parts_list', 'parts_new', 'delivery_notes_manage',
     'assemblies_list',
-    'production_group', 'process_work_type', 'part_process_chain', 'worker_queue',
+    -- 2026-10-05 权限收紧：CLERK 收回 process_work_type / part_process_chain
+    -- （配置型菜单，改为 MANAGER 专有），保留 production_group（worker_queue 需要）与
+    -- worker_queue 本身。已存在的授权行由 4.7 段显式软删回收，本段只管增量。
+    'production_group', 'worker_queue',
     'outsource_list', 'outsource_companies_list', 'outsource_quotes_list', 'outsource_send_receive_list',
     'repair_receive'
 )
@@ -244,7 +247,11 @@ WHERE m.code IN (
     'home',
     'parts_list', 'delivery_notes_manage',
     'assemblies_list',
-    'production_group', 'process_work_type', 'part_process_chain', 'worker_queue',
+    -- 2026-10-05 权限收紧：INSPECTOR 收回 production_group 下的 3 个配置型子菜单
+    -- （process_work_type / part_process_chain / worker_queue），品检不应看到生产管理配置。
+    -- production_group 本身**必须保留**——其子菜单 inspection_pending（待品检）要挂上去，
+    -- 丢了会变孤儿节点被 build_menu_tree 提升为顶级。
+    'production_group',
     'outsource_send_receive_list',
     'inspection_pending', 'delivery_dispatch', 'repair_receive'
 )
@@ -282,5 +289,37 @@ USING t_menu m
 WHERE rm.menu_id = m.id
   AND m.code IN ('settings_root', 'work_types_list', 'processes_list', 'work_type_processes_list')
   AND m.deleted_at IS NOT NULL;
+
+-- ============================================================================
+-- 4.7 角色授权回收（2026-10-05 权限收紧：品检不应看到生产管理的 3 个配置型菜单）
+-- ============================================================================
+-- ⚠️ 第 4 节的授权是**纯增量**（ON CONFLICT ... DO NOTHING），从白名单里删 code
+--    **不会**回收生产库已存在的 t_role_menu 行。收紧权限必须在本节显式列出来。
+--    与第 3 节 t_menu soft-delete 同一哲学：变更显式化，不做「白名单之外一律删」。
+--
+-- 本次收紧（用户需求：工序工种/制定工序 → MANAGER；生产队列 → MANAGER+CLERK；
+-- 品检三个都看不到）：
+--   CLERK     − process_work_type、part_process_chain（CLERK 保留 worker_queue）
+--   INSPECTOR − process_work_type、part_process_chain、worker_queue
+--   INSPECTOR 仍保留 production_group（其 inspection_pending 子菜单需要）
+--
+-- 软删而非硬删：留审计，与 t_menu 一致；`AND rm.deleted_at IS NULL` 保证重跑
+-- 幂等、不每次启动都 bump version。
+-- ⚠️ `version = rm.version + 1` 必须带表名限定：本 UPDATE 带 `FROM t_menu m`，而
+--    两张表都有 version 列，不限定会被 PG 判为 ambiguous 直接报错。
+UPDATE t_role_menu rm
+SET deleted_at = now(),
+    updated_at = now(),
+    version    = rm.version + 1
+FROM t_menu m
+WHERE rm.menu_id = m.id
+  AND rm.deleted_at IS NULL
+  AND (rm.role, m.code) IN (
+      ('CLERK',     'process_work_type'),
+      ('CLERK',     'part_process_chain'),
+      ('INSPECTOR', 'process_work_type'),
+      ('INSPECTOR', 'part_process_chain'),
+      ('INSPECTOR', 'worker_queue')
+  );
 
 COMMIT;

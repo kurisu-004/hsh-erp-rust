@@ -241,13 +241,31 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 | 前端 menuCode | 前端路由 | 前端组件 | 后端子模块 | 后端文档 |
 |---|---|---|---|---|
 | `process_work_type` | `/production/process-work-type` | `ProcessWorkTypePage.vue`（tabbed shell: work-types / processes / mapping） | `prod::work_type` + `prod::process` | [`work-types.md`](./work-types.md) + [`processes.md`](./processes.md) + [`work-type-process-mapping.md`](./work-type-process-mapping.md) |
-| `part_process_chain` | `/parts/process-chains` | （**前端页面待建**，menuCode 已 INSERT） | `prod::process_chain` | [`process-chain.md`](./process-chain.md) |
+| `part_process_chain` | `/production/process-design` | `ProcessDesignView.vue`（子组件 `PartPickerList.vue` / `DrawingPreviewPane.vue` / `ProcessStepCardList.vue`，组合式函数 `usePartProcessDesign.ts`；**2026-10-05 订正**：原文档写「前端页面待建 / 路由 `/parts/process-chains`」均为漂移，页面早已上线） | `prod::process_chain` | [`process-chain.md`](./process-chain.md) |
 | `worker_queue` | `/production/worker-queue` | `production/WorkerQueueBoard.vue` | `prod::worker_pool` | [`worker-pool.md`](./worker-pool.md) |
 | 工人档案管理（**2026-10-04 菜单归属改为 `production_group`**） | `/production/worker-list` | （前端视图目录 `frontend/src/views/production/`） | `prod::worker` | [`workers.md`](./workers.md) |
 | （**前端 menuCode 待定 2026-09-29**） | `/production/pending-dispatch` | `ProductionPendingDispatchPage.vue`（**新前端页面 2026-09-29**） | `prod::batch` | [`batches.md`](./batches.md) |
 | （**前端 menuCode 待定 2026-10-01**） | 「待编程一览」页（沿用 part 域路由） | 待编程 tab（`has_cnc_program` 三态） | `prod::programming` | [`pending-programming.md`](./pending-programming.md)（口径：状态白名单闸门 + 三规则并集，与 part 域旧端点的差异见该页「过滤谓词」段） |
 
-> 上述 `process_work_type` / `part_process_chain` / `worker_queue` 3 个 menuCode 的授权（MANAGER + CLERK + INSPECTOR）由 `seeds/menu.sql` 第 4 节（角色授权 `t_role_menu`）按扁平 code 列表写入。
+> **2026-10-05 权限收紧**：`process_work_type` / `part_process_chain` / `worker_queue` 3 个 menuCode 的授权矩阵已收紧为下表（真源 = `seeds/menu.sql` 第 4 节白名单 + 4.7 回收段）：
+>
+> | menuCode | MANAGER | CLERK | INSPECTOR | CNC_PROGRAMMER | SHELF_ACCOUNT |
+> |---|---|---|---|---|---|
+> | `process_work_type` 工序工种 | 保留 | **收回** | **收回** | 本来没有 | 本来没有 |
+> | `part_process_chain` 制定工序 | 保留 | **收回** | **收回** | 本来没有 | 本来没有 |
+> | `worker_queue` 生产队列 | 保留 | 保留 | **收回** | 本来没有 | 本来没有 |
+>
+> 机制要点：`t_role_menu` 授权写入是**纯增量**（第 4 节 `ON CONFLICT ... DO NOTHING`），
+> 从白名单里删 code **不会**回收生产库已存在的授权行，菜单不会消失。故收紧一律在
+> **4.7「角色授权回收」段**显式软删（`deleted_at` + `version + 1`，`AND rm.deleted_at IS NULL`
+> 保证幂等），与第 3 节 `t_menu` soft-delete 同一哲学：变更显式化，不做「白名单之外一律删」。
+> 本次只改菜单**可见性**（`t_role_menu`），**一行 API 角色守卫都没动** —— 下表是前端侧栏
+> 与 `GET /iam/me` 返回的 `menus` 树口径，**不代表**后端端点的角色准入。
+> 另注：`production_group` 父分组在 CLERK / INSPECTOR 上**必须保留**
+> （INSPECTOR 靠它挂 `inspection_pending` 待品检；CLERK 靠它挂 `worker_queue`），
+> 父分组缺失时子节点会被 `build_menu_tree` 提升为顶级（孤儿兜底）。
+>
+> ⚠️ 菜单 `title` 是「制定工序」，前端路由 `meta.title` 是「工序制定」——同一页面的两处文案不一致，勿据此判为两个菜单。
 > 2026-10-04：`workers_list`（工人档案）随前端视图搬到 `/production/worker-list`，菜单从 `auth_group` 迁到 `production_group`（`seeds/menu.sql` 改父分组 + path + sort_order 25）—— `t_role_menu` 仍是扁平 code 列表，**授权范围一行未变**（仍只有 MANAGER 有 `workers_list`）。
 > `prod::batch` 4 端点走 service 内 `require_any_role(...)` 守卫（list=Manager+Clerk+Inspector；写=Manager+Clerk），无需新增 `t_role_menu` 行（沿用 production_group 既有授权）。
 > `prod::programming` 1 端点同样走 service 内守卫（Manager+Clerk+Inspector+**CNC_PROGRAMMER**），同样无需新增 `t_role_menu` 行。

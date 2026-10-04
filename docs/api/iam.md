@@ -72,7 +72,7 @@ Response 200 `data`：
 | `is_active` | bool | |
 | `roles` | [string] | 角色枚举（`MANAGER`/`CLERK`/`INSPECTOR`/`CNC_PROGRAMMER`/`SHELF_ACCOUNT`） |
 | `shelf_ids` | [string (i64)] | 货架一体机可访问的货架 ID 列表 |
-| `menus` | [object] | 菜单树（递归 `children`），见下 |
+| `menus` | [object] | 菜单树（递归 `children`），见下；**可见性口径与角色矩阵见 [`菜单可见性（2026-10-05）`](#菜单可见性2026-10-05)** |
 
 `menus[]` 节点字段：
 
@@ -87,6 +87,60 @@ Response 200 `data`：
 | `icon` | string? | Element Plus 图标名 |
 | `sort_order` | i32 | |
 | `children` | [object] | 递归子节点 |
+
+#### 菜单可见性（2026-10-05）
+
+`menus` 树 = `t_menu JOIN t_role_menu` 的拍平行再组装成树，SQL 真源
+`src/modules/iam/repo/sql/menu.rs:8-31`：
+
+```sql
+SELECT DISTINCT m.* FROM t_menu m
+JOIN t_role_menu rm ON rm.menu_id = m.id
+WHERE rm.role = ANY($1)
+  AND m.is_active = TRUE
+  AND m.deleted_at IS NULL
+  AND rm.deleted_at IS NULL
+ORDER BY m.sort_order, m.code
+```
+
+三条注意：
+
+1. **过滤条件是三段合取**：`m.is_active = TRUE` + `m.deleted_at IS NULL`（菜单侧）
+   + `rm.deleted_at IS NULL`（授权侧）。任一为假该菜单即不可见 —— 所以**回收授权
+   用软删 `t_role_menu.deleted_at` 就够了**，不必动 `t_menu`。
+2. **父分组不会自动可见**：角色必须**显式持有父节点 code**，否则子节点会被
+   `build_menu_tree`（`src/modules/iam/service/menu.rs:46-51`）的孤儿兜底提升为
+   顶级节点。例如 INSPECTOR 保留了 `inspection_pending`（待品检），就必须同时保留
+   它的父节点 `production_group`。
+3. **多角色取并集**：一个用户有多个角色时是 `rm.role = ANY(...)` 的并集 + `DISTINCT` 去重，
+   不是交集。
+
+**角色 × 菜单规范矩阵**（2026-10-05 收紧后的真源，逐角色列出其可见 menuCode 全集）：
+
+| 角色 | 可见 menuCode 全集 |
+|---|---|
+| `MANAGER` | `home`、`production_stats`、`customer_management`、`customers_list`、`applicants_list`、`order_group`、`parts_list`、`parts_new`、`assemblies_list`、`delivery_notes_manage`、`inspection_pending`、`delivery_dispatch`、`repair_receive`、`pending_programming`、`production_group`、`process_work_type`、`part_process_chain`、`worker_queue`、`workers_list`、`template_management`、`print_templates_designer`、`auth_group`、`users_list`、`shelves_list`、`outsource_list`、`outsource_companies_list`、`outsource_quotes_list`、`outsource_send_receive_list`、`floor_group` |
+| `CLERK` | `home`、`customer_management`、`customers_list`、`applicants_list`、`order_group`、`parts_list`、`parts_new`、`assemblies_list`、`delivery_notes_manage`、`repair_receive`、`production_group`、`worker_queue`、`outsource_list`、`outsource_companies_list`、`outsource_quotes_list`、`outsource_send_receive_list` |
+| `INSPECTOR` | `home`、`parts_list`、`assemblies_list`、`delivery_notes_manage`、`inspection_pending`、`delivery_dispatch`、`repair_receive`、`production_group`、`outsource_send_receive_list` |
+| `CNC_PROGRAMMER` | `home`、`parts_list`、`pending_programming` |
+| `SHELF_ACCOUNT` | `home`、`scan_badge`、`floor_group` |
+
+> ⚠️ 本表按「`t_role_menu` 授权口径」列（= `seeds/menu.sql` 第 4 节白名单 + 4.7 回收段），
+> 便于与 seed 对账；**实际渲染到 `menus` 树还要再过 `m.is_active = TRUE` 一关**：
+> `assemblies_list` 虽在 MANAGER/CLERK/INSPECTOR 的授权行里，但 `t_menu.is_active = false`
+> （seed 第 3.4 段 prod 停用，授权行刻意保留以备重新启用），故**不会**出现在响应里。
+> `settings_root` 及其 3 个旧子菜单已被 seed 第 3.1 段软删、授权行由第 4.6 段硬删，故表中均无。
+
+**真源与维护约定**：菜单可见性的唯一真源是 `seeds/menu.sql` —— 第 4 节
+`INSERT ... ON CONFLICT (role, menu_id) DO NOTHING` 白名单（写权限）+
+**4.7 段显式回收**（收权限）。注意 `t_role_menu` 是 **add-only** 语义：
+授权写入走 `DO NOTHING`，从白名单里删掉某个 code **不会**回收生产库已存在的授权行，
+菜单也就不会消失。**收紧权限必须在 4.7 段显式软删**（`deleted_at` + `version + 1`）。
+`uk_t_role_menu_role_menu` 是 partial（`WHERE deleted_at IS NULL`），故软删后将来若把
+某 code 加回白名单，INSERT 会插新行不撞键，旧软删行留作审计。
+
+本次收紧（用户需求：工序工种/制定工序 → MANAGER，生产队列 → MANAGER + CLERK，品检三项全收回）
+的逐菜单对照见 [`production/index.md`](./production/index.md#menucode-映射)。
 
 ### `POST /api/v2/iam/logout`
 
