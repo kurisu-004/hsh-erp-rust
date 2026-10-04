@@ -99,6 +99,15 @@ impl PartService {
                 )
             })?;
         let new_id = snowflake.next_id();
+        // 2026-10-05：序列号派发下沉到 create_part（唯一收口点）。此前
+        // `POST /parts` 与 `POST /parts/batch` 都从不派发，只有
+        // `POST /parts/batch-with-pdfs` 在 INSERT 后补 UPDATE 一列。前缀缺失
+        // （20308）在这里 fail-fast 整单拒，不留半成品工单。
+        // `acquire` 的 `UPDATE ... RETURNING` 会持 `t_serial_counter` 该 prefix 行的
+        // 排他锁到 COMMIT ⇒ 同 prefix 的并发单件建单在这一行上串行（跨 prefix 互不
+        // 阻塞）；单件建单只一次往返，串行代价可忽略。
+        let serial_prefix = repo.serial_prefix_for_customer(req.customer_id).await?;
+        let serial_no = crate::shared::serial::acquire(repo.conn_mut(), serial_prefix).await?;
         let new = NewPartCreate {
             id: new_id,
             name: req.name.trim(),
@@ -114,6 +123,9 @@ impl PartService {
             system_delivery_date: req.system_delivery_date,
             note: req.note.as_deref(),
             created_by: current.id,
+            serial_no: Some(&serial_no),
+            unit_price: req.unit_price,
+            total_price: req.total_price,
         };
         if let Err(e) = repo.create_part(new).await {
             return Err(map_create_error(e));
@@ -808,9 +820,15 @@ impl PartService {
 // ===== helpers =====
 
 /// `create_part` 的 sqlx 错误码映射：唯一索引冲突（`23505`） → 业务语义
-/// `BIZ_PART_NOT_FOUND`（serial_no 已被使用；可能是软删旧件占号导致
-/// `uk_t_part_serial_no` 触发。当前 INSERT 路径 serial_no 写 NULL，partial
-/// unique 不生效；此分支为预留，等 serial_no 变成可写时启用）。
+/// `BIZ_PART_NOT_FOUND`。
+///
+/// 2026-10-05 起 `serial_no` 在 INSERT 期写入，`uk_t_part_serial_no` 在 INSERT
+/// 那一刻就参与判定；同 prefix 的 counter 是原子递增，正常路径下不会撞号，撞号
+/// 说明有历史脏数据或别处绕过了派发器（如直接写库的脚本）。唯一索引谓词是
+/// `serial_no IS NOT NULL AND deleted_at IS NULL AND status <> 'CANCELLED'`
+/// ⇒ **软删行与 `CANCELLED` 行不占坑**，`serial_no IS NULL` 的行不参与判定。
+/// 返回的 `message` 仍是「可能软删旧件占号」的旧措辞（对外错误文案，改动会变更
+/// 客户端可见字符串）。
 ///
 /// `pub(super)`：暴露给 `lifecycle.rs`（如需要）。
 pub(super) fn map_create_error(e: sqlx::Error) -> AppError {

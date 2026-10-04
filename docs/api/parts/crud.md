@@ -117,10 +117,21 @@ Request：`PartCreateRequest`
 | `order_no` | string? | — | 订单号 |
 | `system_delivery_date` | date? | — | 系统派工日 |
 | `note` | string? | — | 备注 |
+| `unit_price` | decimal（**JSON 字符串**） | — | 单价，如 `"95.00"`；缺省 `0` |
+| `total_price` | decimal（**JSON 字符串**） | — | 总价，如 `"950.00"`；缺省 `0` |
+
+> 2026-10-05 新增 `unit_price` / `total_price`。**JSON 里必须是字符串**，不能写裸
+> 数字 `95` —— 后端 `rust_decimal` 只开了 `serde-with-str`，裸数字会在反序列化
+> 阶段直接 400。
+>
+> **序列号不收**：建件时按 L1 客户 `serial_prefix` 自动派发（见
+> [`./index.md#序列号serial_no生命周期`](./index.md#序列号serial_no生命周期)）。
+> L1 客户未配 `serial_prefix` → `20308 BIZ_CUSTOMER_NO_SERIAL_PREFIX`，**整单拒**
+> （不落任何行、不消耗序列号 counter）。
 
 Response 201 `data`：[`PartDetailOut`](./index.md#partdetailout-字段) — 含 TPart 完整列 + 客户冗余 + `current_batch_id`。
 
-错误码：40001（字段空 / quantity≤0）、40300（角色不符）、20102（customer 不存在）。
+错误码：40001（字段空 / quantity≤0）、40300（角色不符）、20102（customer 不存在 / 其 L1 父行已软删，**HTTP 404**）、20308（L1 客户无 `serial_prefix`）、20108（L1 的 `serial_prefix` 未在 `t_serial_counter` 注册，见 [`./index.md`](./index.md#序列号serial_no生命周期)）。
 
 ### `POST /api/v2/parts/batch`
 
@@ -133,6 +144,32 @@ Request：
 | `customer_id` | string (i64) | ✓ | 批量共享的二级客户 id |
 | `items` | `PartBatchCreateItem`[] | ✓ | 1..=200；每件独立校验 |
 
+`PartBatchCreateItem` 字段（2026-10-05 起与 `PartCreateRequest` 同构）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` / `drawing_no` / `applicant_name` | string | ✓ | 工单名 / 图号 / 申请人 |
+| `quantity` | i32 | ✓ | > 0 |
+| `request_date` / `planned_delivery_date` | date | ✓ | 客户请求日 / 计划交付日 |
+| `is_urgent` | bool | — | 缺省 `false` |
+| `order_no` / `note` | string? | — | 订单号 / 备注 |
+| `system_delivery_date` | date? | — | 系统派工日 |
+| `assembly_id` | string (i64)? | — | 父装配体 |
+| `unit_price` | decimal（**JSON 字符串**） | — | 单价，如 `"95.00"`；缺省 `0` |
+| `total_price` | decimal（**JSON 字符串**） | — | 总价，如 `"950.00"`；缺省 `0` |
+| `drawing_file` / `model3d_file` | object? | — | 文件绑定（`tmp_key` + `content_sha256` + `original_filename` + `file_size` + `content_type` + `ext?`） |
+
+> 金额两列同样是 **JSON 字符串**，裸数字会被反序列化拒。
+>
+> **序列号不收**：每件建单时按 L1 客户 `serial_prefix` 自动派发一个
+> `serial_no`（`prefix` + 7 位数字），INSERT 期写入。L1 客户未配
+> `serial_prefix` → `20308`，**整批拒**（在任何一行落库之前，连文件绑定都不
+> head/copy）。
+>
+> 带 `drawing_file` / `model3d_file` 时走 COS 直传绑定路径：任一 binding
+> head/copy 失败 → 整体报错回滚；DB 层仍是 per-item savepoint，单件失败只进
+> `failed[]` 不影响其余件。
+
 Response 200 `data`：
 
 | 字段 | 类型 | 说明 |
@@ -140,7 +177,7 @@ Response 200 `data`：
 | `created` | [PartDetailOut](./index.md#partdetailout-字段)[] | 成功插入并读取详情的件 |
 | `failed` | `PartBatchCreateFailure`[] | 单件失败明细（含 item_index）；成功与失败互斥 |
 
-错误码：40001（items 空 / 超过 200）、40300；item-level（`failed[].code`）：50001 / 20101 等。
+错误码：40001（items 空 / 超过 200）、40300、20102（customer 不存在 / 其 L1 父行已软删，**HTTP 404**）、20308（L1 客户无 `serial_prefix`，整批拒）、20108（L1 的 `serial_prefix` 未在 `t_serial_counter` 注册，整批拒）；item-level（`failed[].code`）：50001 / 20101 等。
 
 ### `GET /api/v2/parts/{part_id}`
 

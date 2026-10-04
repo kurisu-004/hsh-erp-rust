@@ -255,6 +255,18 @@ impl PartService {
     }
 
     /// `POST /parts/batch-with-pdfs`：multipart JSON + PDFs。
+    ///
+    /// 2026-10-05：序列号改由 `create_part` INSERT 期写入（此前是 INSERT 后一句
+    /// `UPDATE t_part SET serial_no = $1`），派发器与另两个建单端点共用
+    /// `PartRepoTrait::serial_prefix_for_customer` + `shared::serial::acquire`。
+    /// 行为不变：有 PDF 才派 master 号、子件号仍是 `{master}-{NN}`、PDF 页数为 0
+    /// 时 master 与（无）子件都不派号。`BatchWithPdfsRequest` 无前端调用方。
+    ///
+    /// 2026-10-05 错误码变化：`serial_prefix_for_customer` 改用 `fetch_optional`，
+    /// 此前同一段是两条 `fetch_one`（先折 L1、再取 prefix）。所以「L2 自身未软删、
+    /// L1 父行已软删」从空结果集 `RowNotFound` → `AppError::Database`（**500**）
+    /// 变为 `20102 BIZ_CUSTOMER_NOT_FOUND`（**404**）。该查询只在 PDF 页数 > 0
+    /// 时执行。
     pub async fn batch_with_pdfs<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -298,28 +310,7 @@ impl PartService {
 
         // 若有 PDF → 派 master serial（从 L1 客户 serial_prefix 拿）
         let master_serial: Option<String> = if page_count > 0 {
-            let l1_id: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(parent_id, id) FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(req.customer_id)
-            .fetch_one(repo.conn_mut())
-            .await?;
-            let prefix_str: Option<String> = sqlx::query_scalar(
-                "SELECT serial_prefix FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(l1_id)
-            .fetch_one(repo.conn_mut())
-            .await?;
-            let p = prefix_str.ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
-                    "L1 客户无 serial_prefix",
-                )
-            })?;
-            let ch = p
-                .chars()
-                .next()
-                .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 为空"))?;
+            let ch = repo.serial_prefix_for_customer(req.customer_id).await?;
             Some(crate::shared::serial::acquire(repo.conn_mut(), ch).await?)
         } else {
             None
@@ -340,16 +331,11 @@ impl PartService {
             system_delivery_date: None,
             note: req.note.as_deref(),
             created_by: current.id,
+            serial_no: master_serial.as_deref(),
+            unit_price: None,
+            total_price: None,
         };
         repo.create_part(new).await?;
-        // master 设置 serial_no（仅在有 PDF 时）
-        if let Some(sn) = &master_serial {
-            sqlx::query("UPDATE t_part SET serial_no = $1 WHERE id = $2 AND deleted_at IS NULL")
-                .bind(sn)
-                .bind(new_id)
-                .execute(repo.conn_mut())
-                .await?;
-        }
         // 初始批次
         let initial_batch_id = snowflake.next_id();
         PartBatchRepo::create_initial_batch(
@@ -387,15 +373,12 @@ impl PartService {
                     system_delivery_date: None,
                     note: req.note.as_deref(),
                     created_by: current.id,
+                    // 子件号从 master 号派生，不再向 t_serial_counter 派发
+                    serial_no: Some(&child_serial),
+                    unit_price: None,
+                    total_price: None,
                 };
                 repo.create_part(child).await?;
-                sqlx::query(
-                    "UPDATE t_part SET serial_no = $1 WHERE id = $2 AND deleted_at IS NULL",
-                )
-                .bind(&child_serial)
-                .bind(child_id)
-                .execute(repo.conn_mut())
-                .await?;
                 // 初始批次
                 PartBatchRepo::create_initial_batch(
                     repo.conn_mut(),

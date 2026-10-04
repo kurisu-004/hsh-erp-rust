@@ -418,6 +418,8 @@ async fn batch_create_with_bindings_object_key_test() {
             system_delivery_date: None,
             note: None,
             assembly_id: None,
+            unit_price: None,
+            total_price: None,
             drawing_file: Some(FileBindingIn {
                 tmp_key: tmp_key.into(),
                 content_sha256: sha.clone(),

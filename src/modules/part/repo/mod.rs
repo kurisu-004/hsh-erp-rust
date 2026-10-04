@@ -3,28 +3,32 @@
 //! ## 结构（2026-09-22 D-6 重构对齐 iam / shelf / customer / part_batch / worker_pool 范本）
 //! - `sql/`（原 `sql.rs`，已按表拆 `part_sql.rs` / `event_sql.rs` /
 //!   `pending_programming_sql.rs` / `helper_sql.rs` + `mod.rs`）：SQL 全文，
-//!   21 个 pub 固有静态方法（t_part 18 + t_part_event 1 + pending-programming 2）
+//!   22 个 pub 固有静态方法（t_part 19 + t_part_event 1 + pending-programming 2）
 //!   + sqlx `query!` 宏。ZST struct `PartRepo` 收 `impl PgExecutor<'_>` 形参。
-//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（40 方法合并单 trait，
+//! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（41 方法合并单 trait，
 //!   口径见下文「方法计数口径」），并直接 `impl PartRepoTrait for &mut PgConnection`
 //!   ——handler/service 借 `&mut *tx` / `&mut *conn` 即可，零中间壳。
 //!
-//! ## 方法计数口径（2026-10-03 逐个重数）
+//! ## 方法计数口径
 //! 「trait 方法数」= `pub trait PartRepoTrait` 花括号内声明的 `fn` 签名条数；
 //! `conn_mut` 这类工具方法计入，`#[allow(...)]` / doc 注释不计；`#[async_trait]`
-//! 展开出的生命周期形参不算独立方法。40 = `conn_mut` 1 + t_part 18 +
-//! t_part_batch 17 + t_part_event 1 + 跨域 helper 1 + pending-programming 2：
+//! 展开出的生命周期形参不算独立方法。41 = `conn_mut` 1 + t_part 18 +
+//! t_part_batch 17 + t_part_event 1 + 跨域 helper 2 + pending-programming 2：
 //!
 //! - `conn_mut` 1 —— 工具方法，暴露 `&mut PgConnection`
 //! - t_part 18 —— 查询 5 + CRUD 6 + assembly 子件 4 + rollup 3（一行委托 `sql::PartRepo`）
 //! - t_part_batch 17 —— 查询 6 + mark_* 品检 4 + lifecycle 6 + split 1（一行委托
 //!   `prod::batch::repo::PartBatchRepo` / `prod::batch::status_gate`）
 //! - t_part_event 1 —— `insert_part_event`（委托 `sql::PartRepo`）
-//! - 跨域 helper 1 —— `part_batch_has_active_on_delivery_note`（委托 `PartBatchRepo`）
+//! - 跨域 helper 2 —— `part_batch_has_active_on_delivery_note`（委托 `PartBatchRepo`）
+//!   + `serial_prefix_for_customer`（2026-10-05 新增，查 `t_customer`，委托
+//!     `sql::PartRepo`；建单派发序列号的前置）
 //! - pending-programming 2 —— 委托 `sql::PartRepo`
 //!
-//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（21）：t_part_batch 段（17）与跨域 helper
-//! （1）转发到 `prod::batch` 域的 ZST 静态方法，`conn_mut` 则无对应 SQL 方法。
+//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（22）：`t_part_batch` 段（17）与跨域 helper
+//! 中的一项转发到 `prod::batch` 域的 ZST 静态方法，`conn_mut` 则无对应 SQL 方法；
+//! 反向地 `sql::PartRepo` 有一个 `list_children_by_assemblies` 静态方法未上 trait
+//! （直接查 t_part 的其它域自用）。
 //!
 //! ## 为什么 trait 命名为 `PartRepoTrait`（带 `Trait` 后缀）
 //! 跨模块静态调用方（2026-10-03 实测 7 域 10 文件：assembly 6 / delivery_note 5 /
@@ -36,7 +40,7 @@
 //!
 //! - `part::repo::PartRepo` —— ZST struct（在 `sql/mod.rs` 内，通过 `pub use sql::PartRepo;`
 //!   重新导出至本模块），保留 21 个静态方法签名不变（cross-module 调用方零修改）。
-//! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（40 方法合并单 trait），part 域
+//! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（41 方法合并单 trait），part 域
 //!   内部 service 用 `<R: PartRepoTrait>` 收。
 //!
 //! ## 为什么是胖 trait 而非按表拆 3 trait
@@ -46,14 +50,16 @@
 //! `<R: PartRepoTrait>(&self, mut repo: R, ...)` 一次收下（by-value；生产 `R = &mut
 //! PgConnection`，单测 `R = MockPartRepoTrait`）。
 //!
-//! ## 跨域 helper（1）—— 下沉到 PartRepoTrait
+//! ## 跨域 helper（2）—— 下沉到 PartRepoTrait
 //! 设计意图：service 跨域读别的域时，除 `repo: R: PartRepoTrait` 外还得再借一次连接，
 //! 而 `&mut PgConnection` 同一作用域只能借给一个 repo 实例。故 D-6 起计划把这类调用
 //! （历史上候选涉及 Customer / ProcessChain / PartBatch / PartFile / WorkerPool 等域）
 //! 下沉成 `PartRepoTrait` helper、impl 一行委托到对应域 ZST 静态方法，service 就只需
-//! 一个 `repo` 参数。**实际落地只有 1 个**：
+//! 一个 `repo` 参数。**实际落地 2 个**：
 //!
 //! - `part_batch_has_active_on_delivery_note(part_id)` —— 委托 `PartBatchRepo::has_active_batch_on_delivery_note`
+//! - `serial_prefix_for_customer(customer_id)` —— 查 `t_customer`（2026-10-05 新增，
+//!   建单派发序列号的前置；SQL 在 `sql::PartRepo`）
 //!
 //! 注：2026-10-03 订正——原文把上述历史候选与实际 trait 方法并列为「跨域 helper 清单」，
 //! 读起来像都已落地。其中 `customer_lookup_names` 从未落地；
@@ -75,12 +81,13 @@
 //!   按 conventions.md §4.1 含 IO 不强求 100%。
 //!
 //! ## 错误类型
-//! 40 个方法里 31 个返回 `sqlx::Error`、8 个 `t_part_batch.status` 写点返回
-//! `AppError`（契约是「没写成 = `VERSION_CONFLICT`」，转 `sqlx::Error` 会把 409 降级成
-//! 500）、`conn_mut` 无返回值。31 个 `sqlx::Error` 按委托目标再分两处——**都是零翻译**，
-//! 但 1:1 的对象不同：
+//! 41 个方法里 31 个返回 `sqlx::Error`、9 个返回 `AppError`
+//! （`t_part_batch.status` 写点 8 个 —— 契约是「没写成 = `VERSION_CONFLICT`」，
+//! 转 `sqlx::Error` 会把 409 降级成 500；`serial_prefix_for_customer` 1 个 ——
+//! 20308 / 20104 / 20102 三个业务码要原样透出）、`conn_mut` 无返回值。31 个
+//! `sqlx::Error` 按委托目标再分两处——**都是零翻译**，但 1:1 的对象不同：
 //! - 21 个 1:1 委托 `sql::PartRepo`（t_part 18 + t_part_event 1 + pending-programming 2，
-//!   恰好等于 `sql/` 静态方法数）
+//!   恰好等于 `sql/` 静态方法数减去未上 trait 的 `list_children_by_assemblies`）
 //! - 10 个 1:1 委托 `PartBatchRepo`（t_part_batch 段 9 + 跨域 helper 1）
 //!
 //! ## 已知架构债（D-6 阶段过渡）
@@ -126,8 +133,8 @@ pub use sql::{
     PendingProgrammingFilters, PendingProgrammingItem, scale_qty,
 };
 
-/// part 域数据访问 trait（40 方法 = `conn_mut` 1 + t_part 18 + t_part_batch 17 +
-/// t_part_event 1 + 跨域 helper 1 + pending-programming 2；计数口径见模块头
+/// part 域数据访问 trait（41 方法 = `conn_mut` 1 + t_part 18 + t_part_batch 17 +
+/// t_part_event 1 + 跨域 helper 2 + pending-programming 2；计数口径见模块头
 /// 「方法计数口径」小节）。
 ///
 /// 单 trait 而非按表拆 3 trait：`&mut PgConnection` 同一作用域只能借给一个 repo 实例，
@@ -397,12 +404,15 @@ pub trait PartRepoTrait: Send {
     // ── t_part_event 事件日志（1）──
     async fn insert_part_event<'a>(&mut self, e: NewPartEvent<'a>) -> Result<(), sqlx::Error>;
 
-    // ── 跨域 helper（1）── 委托 part_batch 静态方法，避免 service 收第二个 conn
+    // ── 跨域 helper（2）── 委托其它域 / 其它表，避免 service 收第二个 conn
     /// part 任一活跃批次是否已挂送货单（委托 `PartBatchRepo::has_active_batch_on_delivery_note`）。
     async fn part_batch_has_active_on_delivery_note(
         &mut self,
         part_id: i64,
     ) -> Result<bool, sqlx::Error>;
+    /// 2026-10-05 新增：取 L1 客户的 `serial_prefix` 首字符（派发序列号用）。
+    /// 入参 L1 / L2 均可（内部折回 L1）；失败语义见 `sql::PartRepo` 同名方法。
+    async fn serial_prefix_for_customer(&mut self, customer_id: i64) -> Result<char, AppError>;
 
     // ── pending-programming 列表（2026-09-29 新增）──
     async fn list_pending_programming_with_cnc_filter(
@@ -862,13 +872,20 @@ impl PartRepoTrait for &mut PgConnection {
         PartRepo::insert_part_event(&mut **self, e).await
     }
 
-    // ── 跨域 helper（1）── 委托 part_batch 静态方法 ──────────
+    // ── 跨域 helper（2）── 委托其它域 / 其它表 ──────────
     async fn part_batch_has_active_on_delivery_note(
         &mut self,
         part_id: i64,
     ) -> Result<bool, sqlx::Error> {
         use crate::modules::prod::batch::repo::PartBatchRepo;
         PartBatchRepo::has_active_batch_on_delivery_note(&mut **self, part_id).await
+    }
+
+    /// 2026-10-05 新增：建单派发序列号前取 L1 客户的 `serial_prefix`。
+    /// 返回 `AppError`（而非 `sqlx::Error`）：20308 / 20104 / 20102 三个业务码要
+    /// 原样透到响应信封，转 `sqlx::Error` 会被降级成 500。
+    async fn serial_prefix_for_customer(&mut self, customer_id: i64) -> Result<char, AppError> {
+        PartRepo::serial_prefix_for_customer(&mut **self, customer_id).await
     }
 
     // ── pending-programming 列表（2026-09-29 新增）──

@@ -38,6 +38,22 @@
 --  出现在 unfiltered list 中干扰其它断言。因此 fixture 仅预置「不可变共享」
 --  行（customer / process / shelf / user / role / 映射），工单 / 批次由各 sub-file
 --  按需用 sqlx::query 直插（PR-C 末统一迁 test-support）。
+--  例外：t_serial_counter 是建单派发序列号的计数器（2026-10-05 起建单端点
+--  强制派发），缺它建单会被拒，故预置一行。
+--
+--  ## 造「客户 serial_prefix 非 A-Z」脏数据时要改 schema（2026-10-05 登记）
+--  客户 serial_prefix 有 DB CHECK 约束 `ck_t_customer_serial_prefix_uppercase`
+--  （`^[A-Z]$`），customer 域 service 也双校验，所以「L1 的 serial_prefix 是非
+--  大写字母 / 空串」这个形态在正常写入路径下进不来。而
+--  PartRepo::serial_prefix_for_customer 对它有 20104 BIZ_INVALID_VALUE 兜底
+--  分支（脏数据防御），要覆盖那条分支只能先在测试库里
+--  `ALTER TABLE t_customer DROP CONSTRAINT ck_t_customer_serial_prefix_uppercase`。
+--  本仓集成测试首次出现「改 schema 造脏数据」，取的是「覆盖不可达的防御分支」
+--  这个取舍：若将来有人放松 CHECK 或 service 校验，20104 分支仍必须给出正确
+--  错误码而不是 500 / 静默拿非法 prefix 去 acquire。参照
+--  `src/infra/serial.rs` 的 `normalize_prefix_*` 兜底分支测试（同类型范式）。
+--  改动只落在 per-test fresh DB（test-support::pool::test_pool 每测试
+--  CREATE DATABASE），不会污染 template 库或开发库。
 -- ============================================================================
 
 -- ---- L1 客户 + L2 子客户 ----
@@ -45,6 +61,16 @@ INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, created_at,
 VALUES
   (9000000000000000010, 'FX 客户 L1', NULL, 'P', 0, now(), now()),
   (9000000000000000011, 'FX 客户 L2', 9000000000000000010, NULL, 0, now(), now());
+
+-- ---- 序列号计数器（L1 prefix='P'）----
+-- 2026-10-05 起 POST /parts / POST /parts/batch 建单时按 L1 prefix 派发
+-- serial_no（shared::serial::acquire 走 `UPDATE t_serial_counter ... RETURNING`）。
+-- 该表**不在** migrations / seeds 里（A-Z 26 行由生产数据注入），测试库独立，
+-- 所以 fixture 必须自带 'P' 一行，否则建单会以 20108 BIZ_SERIAL_PREFIX_UNKNOWN
+-- 整单拒。counter 起 0 → 首件派到 P0000001。
+INSERT INTO t_serial_counter (prefix, counter, version, created_at, updated_at)
+VALUES ('P', 0, 0, now(), now())
+ON CONFLICT (prefix) DO NOTHING;
 
 -- ---- 工序（INHOUSE 类别，FX-PROC-A）----
 INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, version, created_at, updated_at)
