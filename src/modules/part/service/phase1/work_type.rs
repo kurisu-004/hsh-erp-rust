@@ -165,6 +165,36 @@ impl WorkTypeListRow {
     }
 }
 
+/// `pickable-by-work-type` 的货架 scope 谓词入参（2026-10-04 新增）。
+///
+/// 语义**逐条**对齐 `auth::rbac::CurrentUser::can_access_shelf`：
+/// ```text
+/// shelf_wildcard || shelf_ids.contains(&shelf_id) || has_role(Role::Manager)
+/// ```
+/// 即「谓词对某货架恒真」的两类账号（wildcard / Manager）返回 `None`（SQL 侧不加
+/// 任何谓词），其余账号返回 scope 数组走 `sh.id = ANY($n)`。
+///
+/// ⚠️ `CurrentUser.shelf_ids` 是 `Vec<i64>`（JSON 层才是 string 序列）。
+/// ⚠️ 空 scope 返回 `Some(vec![])` 而**不是** `None`：`ANY('{}')` 对任何货架都
+/// 假，与 `can_access_shelf` 对任何货架都返 false 同形。若把空数组误判成
+/// 「无限制」，未绑架的 SHELF_ACCOUNT 会看到全厂。
+///
+/// ⚠️ **Clerk / Inspector 的行为变更**：本端点的角色白名单含 Clerk / Inspector，
+/// 而这两类角色按惯例不配 `t_user_role` 的 SHELF_ACCOUNT 行 ⇒ `shelf_ids` 为空
+/// 且 `shelf_wildcard = false` ⇒ 收口后**返回空列表**。这是「与
+/// `can_access_shelf` 对齐」的必然结果（写侧 `worker-scan` 的
+/// `require_any_role(&[Manager, ShelfAccount])` 只放行 Manager/ShelfAccount，故
+/// 对这两类账号不存在「列表给出但提交被拒」的落差），但对读侧是行为变更。
+/// 契约见 `docs/api/parts/lifecycle.md` 的
+/// `GET /api/v2/parts/pickable-by-work-type/{work_type_id}` 节。
+fn pickable_shelf_scope(current: &CurrentUser) -> Option<Vec<i64>> {
+    if current.shelf_wildcard || current.has_role(Role::Manager) {
+        None
+    } else {
+        Some(current.shelf_ids.clone())
+    }
+}
+
 impl PartService {
     // ===== Phase 2 (2026-09-13) — 领取链路 (B 方案：手动 pick-up 兜底) =====
 
@@ -269,6 +299,13 @@ impl PartService {
         let limit = query.limit.unwrap_or(50).clamp(1, 200);
         let offset = query.offset.unwrap_or(0).max(0);
         let shelf_filter = query.shelf_id;
+        // 2026-10-04 scope 收口：客户端可控的 `?shelf_id=` 此前是本端点**唯一**的
+        // 货架输入，不与用户 scope 求交、不传时谓词恒真 ⇒ 绑了架 A 的 SHELF_ACCOUNT
+        // 能看到全厂所有 PRODUCTION 架上该工种可领的批次（信息泄露）。现按
+        // `pickable_shelf_scope` 追加 `$5` 谓词，两条 SQL 完全同形。
+        // `?shelf_id=` 参数本身保留不动：收口后它的语义从「不传即全给」变成
+        // 「收口后的进一步收窄」，只能更严不能更松。
+        let shelf_scope = pickable_shelf_scope(current);
         // 列：t_part_batch WHERE location=PRODUCTION_SHELF AND batch.current_process_id IN (工种→工序映射)
         //
         // 2026-10-03 补投影 `b.id` / `b.version`：本端点的行本来就是「批次行」，
@@ -293,11 +330,21 @@ impl PartService {
         // `serial_no IS NULL` 的 part 就整页 500（`unexpected null; try decoding as
         // an Option`）。手工工单是常态，故这是真会触发的路径。
         //
+        // 2026-10-04 补 `sh.deleted_at IS NULL`（**行为变更**）：`t_shelf` 的软删
+        // 守卫此前缺失，而 pick-up 写侧 `validate_shelf_zone` 走
+        // `ShelfRepo::get_by_id`（带 `deleted_at IS NULL`）会拒软删架 ⇒ 现状是
+        // 「列表给出但提交必被拒」。补上后两边一致：软删架上的批次不再出现在
+        // 结果里。取行与 COUNT 同步补。
+        //
         // 2026-10-04 补投影 part 侧 4 个真实列（`name` / `is_urgent` /
         // `system_delivery_date` / `planned_delivery_date`），并给
         // `t_part_process_chain` 无关的链四列投影 `NULL`（本端点不填，口径见
         // [`WorkTypeListRow`] 字段 doc）—— `FromRow` 按列名匹配，列集必须与
         // struct 字段集逐字对齐。
+        //
+        // ⚠️ `$5` 是 scope 数组、排在 `$3`/`$4`（limit/offset）**之前**出现：PG 的
+        // `$n` 只是占位名、不要求按序出现，故把新参数追加在 bind 列表末尾即可把
+        // `LIMIT`/`OFFSET` 的 diff 压到零。
         let rows: Vec<WorkTypeListRow> = sqlx::query_as(
             "SELECT p.id, p.serial_no, p.name, p.drawing_no, p.is_urgent, \
                     p.system_delivery_date, p.planned_delivery_date, b.quantity, \
@@ -310,12 +357,13 @@ impl PartService {
              JOIN t_part p ON p.id = b.part_id \
              JOIN t_work_type_process wtp ON wtp.process_id = b.current_process_id \
                 AND wtp.deleted_at IS NULL \
-             JOIN t_shelf sh ON sh.id = b.current_holder_id \
+             JOIN t_shelf sh ON sh.id = b.current_holder_id AND sh.deleted_at IS NULL \
              WHERE b.deleted_at IS NULL AND p.deleted_at IS NULL \
                AND b.status = 'IN_PROCESS' AND b.location = 'PRODUCTION_SHELF' \
                AND sh.is_active = true AND sh.zone = 'PRODUCTION' \
                AND wtp.work_type_id = $1 \
                AND ($2::bigint IS NULL OR b.current_holder_id = $2) \
+               AND ($5::bigint[] IS NULL OR sh.id = ANY($5)) \
              ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, b.id ASC \
              LIMIT $3 OFFSET $4",
         )
@@ -323,6 +371,7 @@ impl PartService {
         .bind(shelf_filter)
         .bind(limit)
         .bind(offset)
+        .bind(shelf_scope.clone())
         .fetch_all(repo.conn_mut())
         .await?;
         let items: Vec<PartListItem> = rows
@@ -335,18 +384,28 @@ impl PartService {
             // `p.deleted_at IS NULL`，本 COUNT 不 join `t_part`。故软删 part 的 active
             // batch 会计入 `total` 而不计入 `items`，软删 part 下该工种的可领批次分页
             // 总数偏大。是否补 join 属 `total` 语义决策，未在本处改动。
+            //
+            // 2026-10-04：scope 谓词与 `sh.deleted_at IS NULL` 两处**必须**与取行
+            // 同形，否则 `total` 与 `items` 在收窄后对不上（漏任一处都会让「返回
+            // 空列表但 total 仍是全厂数」或反之）。
+            // ⚠️ 本 COUNT 的 scope 参数编号是 `$3` 而**不是** `$5`：PG 要求每个被
+            // 引用的参数都能推断类型，而未引用的 `$3`/`$4` 会触发
+            // `could not determine data type of parameter $3`。故 COUNT 独立按
+            // 自身 bind 顺序连续编号，谓词语义与取行逐字相同。
             "SELECT COUNT(*)::bigint FROM t_part_batch b \
              JOIN t_work_type_process wtp ON wtp.process_id = b.current_process_id \
                 AND wtp.deleted_at IS NULL \
-             JOIN t_shelf sh ON sh.id = b.current_holder_id \
+             JOIN t_shelf sh ON sh.id = b.current_holder_id AND sh.deleted_at IS NULL \
              WHERE b.deleted_at IS NULL \
                AND b.status = 'IN_PROCESS' AND b.location = 'PRODUCTION_SHELF' \
                AND sh.is_active = true AND sh.zone = 'PRODUCTION' \
                AND wtp.work_type_id = $1 \
-               AND ($2::bigint IS NULL OR b.current_holder_id = $2)",
+               AND ($2::bigint IS NULL OR b.current_holder_id = $2) \
+               AND ($3::bigint[] IS NULL OR sh.id = ANY($3))",
         )
         .bind(work_type_id)
         .bind(shelf_filter)
+        .bind(shelf_scope)
         .fetch_one(repo.conn_mut())
         .await?;
         Ok(PartListOut {

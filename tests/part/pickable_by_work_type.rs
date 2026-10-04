@@ -927,3 +927,324 @@ async fn by_worker_chain_state_none_when_duplicate_process_in_chain() {
     );
     assert_batch_anchor(&item, batch_id);
 }
+
+// ===========================================================================
+//  2026-10-04：SHELF_ACCOUNT 货架 scope 收口
+// ===========================================================================
+//
+// 2026-10-04 之前本端点**完全没有**按 `user.shelf_ids` 收口：全文零
+// `can_access_shelf` / 零 `current.shelf_ids` / 零 `shelf_wildcard`，唯一的货架
+// 输入是客户端可控的 `?shelf_id=`，而它不与用户 scope 求交、不传时谓词恒真。
+// ⇒ 绑了架 A 的 SHELF_ACCOUNT 能看到**全厂所有 PRODUCTION 架**上该工种可领的批次。
+//
+// 收口规则（`pickable_shelf_scope`，语义逐条对齐
+// `auth::rbac::CurrentUser::can_access_shelf`）：
+// - `shelf_wildcard == true` **或** 角色含 `MANAGER` ⇒ `None`（SQL 不加谓词，全集）
+// - 否则 ⇒ `Some(shelf_ids)`，谓词 `sh.id = ANY($n)`（空数组 ⇒ 空集）
+//
+// 取行与 COUNT 两条 SQL 带**同形**谓词，否则「返回空列表但 total 仍是全厂数」。
+//
+// ## 造用户方式
+// 复用仓库既有办法（`tests/production/worker_pool.rs` 的同款本地 helper，本文件
+// 独享复制）：`t_user` 直插 + `t_user_role` 逐架插 `SHELF_ACCOUNT` scope 行。fixture
+// 预置的 `fx_part_shelf` scope 到 INSPECTION 架，对本端点（只返 PRODUCTION 架）无用。
+
+/// 插一个 `is_active=true` 的 `t_user` 行（bcrypt 哈希现场生成）。
+async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password: &str) -> i64 {
+    use hsh_erp_rust::auth::password;
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let hash = password::hash(plain_password).expect("bcrypt hash");
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_user (id, username, password_hash, full_name, is_active, \
+         refresh_token_version, version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+    )
+    .bind(id)
+    .bind(username.to_lowercase())
+    .bind(hash)
+    .bind(username)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user");
+    id
+}
+
+/// 插一个 `t_user_role` 行（user_id + role + scope）。
+///
+/// `scope_id = None` 的 `SHELF_ACCOUNT` 行是 iam 侧判定 `shelf_wildcard = true`
+/// 的唯一来源（`iam::service::session::resolve_roles_and_scope`），故本文件用它
+/// 造 wildcard 账号。
+async fn add_shelf_account_role(pool: &PgPool, user_id: i64, shelf_id: Option<i64>) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_user_role (id, user_id, role, scope_type, scope_id, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, 'SHELF_ACCOUNT', 'shelf', $3, 0, $4, $4)",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(shelf_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_user_role");
+    id
+}
+
+/// 造一个 SHELF_ACCOUNT 账号并登录，返回 access token。
+///
+/// `shelves: &[i64]` 每项插一条 scope 行；传 `&[]` 则插一条 `scope_id = NULL`
+/// 的行 ⇒ iam 侧 `shelf_wildcard = true`（全开放）。
+async fn login_shelf_account(
+    pool: &PgPool,
+    app: &axum::Router,
+    username: &str,
+    shelves: &[i64],
+) -> String {
+    const PASSWORD: &str = "changeme";
+    let uid = insert_user_with_password(pool, username, PASSWORD).await;
+    if shelves.is_empty() {
+        add_shelf_account_role(pool, uid, None).await;
+    } else {
+        for sid in shelves {
+            add_shelf_account_role(pool, uid, Some(*sid)).await;
+        }
+    }
+    login_token(app, username, PASSWORD).await
+}
+
+/// 软删一张货架（`t_shelf.deleted_at`）。列表侧补这个守卫后，其上的批次不再可见。
+async fn soft_delete_shelf(pool: &PgPool, shelf_id: i64) {
+    sqlx::query("UPDATE t_shelf SET deleted_at = now() WHERE id = $1")
+        .bind(shelf_id)
+        .execute(pool)
+        .await
+        .expect("soft delete t_shelf");
+}
+
+/// 断言信封的 `items` 与 `total` 自洽（`total` 必须等于收窄后的可见行数）。
+fn assert_total_matches_items(env: &Value, uri: &str) {
+    let n = env["data"]["items"].as_array().expect("data.items").len();
+    assert_eq!(
+        env["data"]["total"], n as i64,
+        "total 与 items 的 scope 谓词必须同形（否则分页总数会说谎）: {uri}: {env}"
+    );
+}
+
+/// 场景 1（**核心**）：绑架 A 的 SHELF_ACCOUNT 只能看到架 A 上的批次。
+///
+/// 修复前：本端点不收口 ⇒ 两张架的批次都在响应里。
+#[tokio::test]
+async fn pickable_scope_closed_to_single_bound_shelf() {
+    let (pool, app, _mgr_token, fx) = bootstrap().await;
+    // 架 A = fixture 预置的 PRODUCTION 架；架 B = 本测试新造
+    let shelf_a = PRODUCTION_SHELF_ID;
+    let shelf_b = insert_production_shelf(&pool, "SCOPE-SH-B").await;
+    let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
+    let on_b = insert_part(&pool, fx.part_customer_l1_id, "架B件", "D-SCOPE-B", None).await;
+    insert_pickable_batch(&pool, on_a, shelf_a, fx.process_a_id, 1).await;
+    insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
+
+    let token = login_shelf_account(&pool, &app, "scope_single", &[shelf_a]).await;
+    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    assert_eq!(
+        part_ids(&env),
+        vec![on_a.to_string()],
+        "绑架 A 的账号不得看到架 B 的批次: {env}"
+    );
+    assert_total_matches_items(&env, &uri);
+}
+
+/// 场景 2：绑架 A + 架 B ⇒ 看到 **A ∪ B**（多架是并集不是交集也不是只取第一个）。
+#[tokio::test]
+async fn pickable_scope_is_union_of_bound_shelves() {
+    let (pool, app, _mgr_token, fx) = bootstrap().await;
+    let shelf_a = PRODUCTION_SHELF_ID;
+    let shelf_b = insert_production_shelf(&pool, "SCOPE-SH-B").await;
+    let shelf_c = insert_production_shelf(&pool, "SCOPE-SH-C").await;
+    let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
+    let on_b = insert_part(&pool, fx.part_customer_l1_id, "架B件", "D-SCOPE-B", None).await;
+    let on_c = insert_part(&pool, fx.part_customer_l1_id, "架C件", "D-SCOPE-C", None).await;
+    insert_pickable_batch(&pool, on_a, shelf_a, fx.process_a_id, 1).await;
+    insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
+    insert_pickable_batch(&pool, on_c, shelf_c, fx.process_a_id, 1).await;
+
+    let token = login_shelf_account(&pool, &app, "scope_union", &[shelf_a, shelf_b]).await;
+    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    let mut got = part_ids(&env);
+    got.sort();
+    let mut want = vec![on_a.to_string(), on_b.to_string()];
+    want.sort();
+    assert_eq!(
+        got, want,
+        "scope 必须是并集 A∪B（架 C 不在 scope 内）: {env}"
+    );
+    assert_total_matches_items(&env, &uri);
+}
+
+/// 场景 3：**wildcard**（SHELF_ACCOUNT 的 `scope_id = NULL`）⇒ 不受收口，可见全集。
+#[tokio::test]
+async fn pickable_scope_wildcard_sees_all_shelves() {
+    let (pool, app, _mgr_token, fx) = bootstrap().await;
+    let shelf_b = insert_production_shelf(&pool, "SCOPE-SH-B").await;
+    let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
+    let on_b = insert_part(&pool, fx.part_customer_l1_id, "架B件", "D-SCOPE-B", None).await;
+    insert_pickable_batch(&pool, on_a, PRODUCTION_SHELF_ID, fx.process_a_id, 1).await;
+    insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
+
+    let token = login_shelf_account(&pool, &app, "scope_wildcard", &[]).await;
+    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    let mut got = part_ids(&env);
+    got.sort();
+    let mut want = vec![on_a.to_string(), on_b.to_string()];
+    want.sort();
+    assert_eq!(got, want, "wildcard 账号不受收口: {env}");
+    assert_total_matches_items(&env, &uri);
+}
+
+/// 场景 4：**Manager** 角色 ⇒ 不受收口（`can_access_shelf` 对 Manager 短路 true）。
+#[tokio::test]
+async fn pickable_scope_manager_bypasses_closure() {
+    let (pool, app, mgr_token, fx) = bootstrap().await;
+    let shelf_b = insert_production_shelf(&pool, "SCOPE-SH-B").await;
+    let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
+    let on_b = insert_part(&pool, fx.part_customer_l1_id, "架B件", "D-SCOPE-B", None).await;
+    insert_pickable_batch(&pool, on_a, PRODUCTION_SHELF_ID, fx.process_a_id, 1).await;
+    insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
+
+    // bootstrap 的 token 就是 MANAGER（且无 SHELF_ACCOUNT 行 ⇒ 靠 Manager 角色短路）
+    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&mgr_token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    assert_eq!(part_ids(&env).len(), 2, "Manager 必须见全集: {env}");
+    assert_total_matches_items(&env, &uri);
+}
+
+/// 场景 5：`?shelf_id=` 与 scope 求**交** —— X 不在 scope 内 ⇒ 空集。
+///
+/// 收口后 `?shelf_id=` 的语义从「不传即全给」变成「scope 的进一步收窄」，只能更严
+/// 不能更松。这本身就是一处安全改善：收口前它能把视野撑到 scope 之外。
+#[tokio::test]
+async fn pickable_shelf_filter_intersects_with_scope() {
+    let (pool, app, _mgr_token, fx) = bootstrap().await;
+    let shelf_a = PRODUCTION_SHELF_ID;
+    let shelf_b = insert_production_shelf(&pool, "SCOPE-SH-B").await;
+    let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
+    let on_b = insert_part(&pool, fx.part_customer_l1_id, "架B件", "D-SCOPE-B", None).await;
+    insert_pickable_batch(&pool, on_a, shelf_a, fx.process_a_id, 1).await;
+    insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
+
+    let token = login_shelf_account(&pool, &app, "scope_x", &[shelf_a]).await;
+
+    // X 在 scope 内 ⇒ 只剩架 A
+    let uri_ok = format!(
+        "{PICKABLE_URI_PREFIX}/{}?shelf_id={shelf_a}",
+        fx.work_type_a_id
+    );
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri_ok, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri_ok}: {env}");
+    assert_eq!(
+        part_ids(&env),
+        vec![on_a.to_string()],
+        "shelf_id ∈ scope ⇒ 取交集: {env}"
+    );
+    assert_total_matches_items(&env, &uri_ok);
+
+    // X 不在 scope 内 ⇒ 空集（**且 total 也必须是 0**，证明 COUNT 带了同一条谓词）
+    let uri_bad = format!(
+        "{PICKABLE_URI_PREFIX}/{}?shelf_id={shelf_b}",
+        fx.work_type_a_id
+    );
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri_bad, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri_bad}: {env}");
+    assert!(
+        env["data"]["items"].as_array().expect("items").is_empty(),
+        "shelf_id ∉ scope ⇒ 必须空集（收口前这里会返回架 B 的批次）: {env}"
+    );
+    assert_eq!(
+        env["data"]["total"], 0,
+        "COUNT 必须带同一条 scope 谓词，否则 total 会说「有 N 条」而 items 是空的: {env}"
+    );
+}
+
+/// 场景 6（**行为变更**）：软删货架上的批次不再出现在结果里（取行 + COUNT 同步）。
+///
+/// 修复前 `JOIN t_shelf` 缺 `deleted_at IS NULL`，而 pick-up 写侧的
+/// `validate_shelf_zone` 走 `ShelfRepo::get_by_id`（带软删守卫）会拒软删架 ⇒
+/// 「列表给出但提交必被拒」。
+#[tokio::test]
+async fn pickable_excludes_batches_on_soft_deleted_shelf() {
+    let (pool, app, mgr_token, fx) = bootstrap().await;
+    let shelf_b = insert_production_shelf(&pool, "SCOPE-SH-B").await;
+    let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
+    let on_b = insert_part(&pool, fx.part_customer_l1_id, "架B件", "D-SCOPE-B", None).await;
+    insert_pickable_batch(&pool, on_a, PRODUCTION_SHELF_ID, fx.process_a_id, 1).await;
+    insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
+    // 前提自证：软删前两张架都可见
+    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&mgr_token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    assert_eq!(
+        part_ids(&env).len(),
+        2,
+        "前提：软删前两张架的批次都在: {env}"
+    );
+
+    soft_delete_shelf(&pool, shelf_b).await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&mgr_token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    assert_eq!(
+        part_ids(&env),
+        vec![on_a.to_string()],
+        "软删架上的批次不得再出现（与 pick-up 写侧一致）: {env}"
+    );
+    assert_total_matches_items(&env, &uri);
+}
