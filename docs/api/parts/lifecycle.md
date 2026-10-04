@@ -470,9 +470,11 @@ Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
 > 可能偏大。是否补 join 属 `total` 语义决策，`work_type.rs` 的 COUNT 处注释已
 > 登记。**但 #11（scope 谓词）与 #7（`sh.deleted_at`）两条必须两边同形** ——
 > 漏任一条都会让「`items` 已按 scope 收窄、`total` 仍报全厂数」或反之。COUNT 侧
-> 的 scope 参数编号是 `$3` 而非 `$5`（PG 要求每个被引用的参数都能推断类型，未引用
-> 的 `$3`/`$4` 会触发 `could not determine data type of parameter`），谓词语义
-> 与取行逐字相同。
+> 的 scope 参数编号是 `$3` 而非 `$5`：**PG 扩展协议要求 Parse 消息声明的参数类型个数
+> == SQL 里被引用的参数个数**（个数 = 被引用的最大 `$n`），而 sqlx 按 `.bind()`
+> 个数声明类型 —— COUNT 若沿用 `$5`，就得额外 bind 两个没人引用的 `$3`/`$4`，
+> Parse 期直接被 PG 拒（`bind message supplies 5 parameters, but prepared statement
+> ... requires 3`）。故 COUNT 按自身 bind 顺序连续编号，谓词语义与取行**逐字相同**。
 
 #### scope 收口（2026-10-04 新增，**安全修复**）
 
@@ -490,10 +492,26 @@ shelf_wildcard || shelf_ids.contains(&shelf_id) || has_role(Role::Manager)
 
 | 账号 | scope 谓词 |
 |---|---|
-| `shelf_wildcard = true`（任一 SHELF_ACCOUNT 的 `t_user_role.scope_id IS NULL`） | `None` ⇒ **不加谓词，全集** |
+| `shelf_wildcard = true`（存在 `role='SHELF_ACCOUNT' AND scope_type='shelf' AND scope_id IS NULL` 的 `t_user_role` 行） | `None` ⇒ **不加谓词，全集** |
 | 角色含 `MANAGER` | `None` ⇒ **不加谓词，全集** |
 | 其余（`shelf_ids` 非空） | `Some(shelf_ids)` ⇒ `sh.id = ANY($n)` |
-| 其余（`shelf_ids` 为空，如未绑架的 SHELF_ACCOUNT） | `Some([])` ⇒ **空集**（不是「无限制」） |
+| 其余（`shelf_ids` 为空） | `Some([])` ⇒ **空集**（不是「无限制」） |
+
+`shelf_wildcard` 的三个限定缺一不可（`role='SHELF_ACCOUNT'` **且**
+`scope_type='shelf'` **且** `scope_id IS NULL`），判据见
+`iam::service::session::resolve_roles_and_scope`。
+
+⚠️ **`shelf_wildcard` 这一档在产品 API 下建不出来**：
+`iam::service::account::validate_role_scope` 对 `Role::ShelfAccount` 硬校验
+`scope_id.is_some()`（缺一即 `40001 VALIDATION` / HTTP 422
+`SHELF_ACCOUNT role requires scope_type='shelf' and scope_id`），而 `t_user_role` 的
+唯一生产写路径就是它（`POST /iam/users/{id}/roles` → `add_role`）。⇒ 上表第一档只有
+fixture / 直插 SQL 能造出来，保留它是为了「万一库里存在这种行，读侧按全集处理」，
+不代表产品支持这个配置。
+
+⚠️ 空 scope（第四档）在生产的真实成因：`resolve_roles_and_scope` 会把绑到
+**已停用 / 已软删 / 不存在**货架的 `scope_id` 过滤掉（登录时求值），这类账号登录后
+`shelf_ids == []` 且 `shelf_wildcard == false`。
 
 `?shelf_id=` 与 scope 求**交**：最终作用域 = `scope ∩ {shelf_id}`，`shelf_id` 不在
 scope 内 ⇒ 返回空集。`shelf_id` 入参本身（`ByWorkTypeQuery.shelf_id`）保留不动，
@@ -504,8 +522,13 @@ scope 内 ⇒ 返回空集。`shelf_id` 入参本身（`ByWorkTypeQuery.shelf_id
 > `shelf_wildcard = false` ⇒ 收口后**返回空列表**。这是「与 `can_access_shelf`
 > 对齐」的必然结果：写侧 `POST /api/v2/prod/batches/worker-scan` 的角色白名单只有
 > `[Manager, ShelfAccount]` 并对 `req.shelf_id` 调 `can_access_shelf`，故对这两类
-> 账号本来就不存在「列表给出但提交被拒」的落差。若业务上需要 Clerk / Inspector
-> 看到全集，给它们配 SHELF_ACCOUNT wildcard 角色行即可（`scope_id = NULL`）。
+> 账号本来就不存在「列表给出但提交被拒」的落差。
+> **爆炸半径**：本端点唯一前端消费方是 `/scan/pick`（`listPartsByWorkTypeAllShelves`），
+> 该路由 `meta.allowRoles = ['SHELF_ACCOUNT']`，Clerk / Inspector 进不来。
+> ⚠️ **若业务上要放开，唯一经产品 API 可达的办法是给它们逐架配 `scope_id` 的
+> SHELF_ACCOUNT 行**（每架一行，`POST /iam/users/{id}/roles`）。`scope_id = NULL`
+> 的 wildcard 行做不到 —— `validate_role_scope` 对 SHELF_ACCOUNT 硬拒
+> `scope_id IS NULL`（见上「`shelf_wildcard` 这一档在产品 API 下建不出来」）。
 
 #### 2026-10-04 行为变更：`t_shelf` 软删守卫
 
@@ -537,7 +560,8 @@ scope 内 ⇒ 返回空集。`shelf_id` 入参本身（`ByWorkTypeQuery.shelf_id
 > 端点不填的字段在 SQL 里显式投影 `NULL::<type> AS <字段名>`。上表的「恒为占位值」
 > 与「恒不出现在响应里」两条不变量因此由类型系统 + 这一个穷尽 struct 字面量保证。
 
-错误码：40300（角色不在白名单）/ 40105（未登录）/ 50001+（DB 错误）。
+错误码：40300（角色不在白名单）/ 40100（未带 token 或 token 非法）/ 40102（access
+token 过期）/ 40105（Redis session 已失效）/ 50001+（DB 错误）。
 
 ### `GET /api/v2/parts/by-worker/{worker_id}`
 
@@ -574,6 +598,9 @@ tag 与交期 chip 因此永不渲染）。`quantity` 取自 `b.quantity`（批�
 > 本端点的**行单位是工人持有物**，没有货架维度，故**不做** SHELF_ACCOUNT 货架
 > scope 收口（`by-worker` 的 `can_access_shelf` 语义无处可施）。收口只加在
 > [`pickable-by-work-type`](#get-apiv2partspickable-by-work-typework_type_id)。
+> `by-work-type` 同理（行是 `location='WORKER'` 的工人持有物）。
+> ⚠️ 该取舍连同「SHELF_ACCOUNT 仍可枚举任意 `worker_id`」的边界已登记进
+> [`../inconsistencies.md`](../inconsistencies.md#96-2026-10-04-登记：by-worker--by-work-type-不做货架-scope-收口)。
 
 #### 2026-10-04 批次锚点字段
 

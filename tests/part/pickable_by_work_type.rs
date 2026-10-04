@@ -946,8 +946,42 @@ async fn by_worker_chain_state_none_when_duplicate_process_in_chain() {
 //
 // ## 造用户方式
 // 复用仓库既有办法（`tests/production/worker_pool.rs` 的同款本地 helper，本文件
-// 独享复制）：`t_user` 直插 + `t_user_role` 逐架插 `SHELF_ACCOUNT` scope 行。fixture
-// 预置的 `fx_part_shelf` scope 到 INSPECTION 架，对本端点（只返 PRODUCTION 架）无用。
+// 独享复制）：`t_user` 直插 + `t_user_role` 逐架插 `SHELF_ACCOUNT` scope 行。
+//
+// ## 三个 scope 形态各自怎么造（2026-10-04 review 第 1 轮补齐）
+// | 形态 | 登录后 `shelf_ids` / `shelf_wildcard` | 造法 | 用例 |
+// |---|---|---|---|
+// | 逐架绑定 | `[架A, …]` / `false` | `Scope::Bound(vec![…])` | 场景 1 / 2 / 5 |
+// | wildcard | `[]` / **`true`** | `Scope::Wildcard`（插 `scope_id IS NULL` 行） | 场景 3 |
+// | 空 scope | `[]` / `false` | 绑定一张架、**登录前**把它停用 ⇒ 登录时该 `scope_id` 被过滤 | 场景 7 |
+// | 非 PRODUCTION 绑定 | `[INSPECTION 架]` / `false` | 直接用 fixture 预置的 `fx_part_shelf` | 场景 8 |
+//
+// ⚠️ **空 scope 造不出「零角色行」**：那种账号登录直接被
+// `iam::service::session` 挡掉（`roles.is_empty()` → 20606 NO_ROLE），且拿不到
+// `SHELF_ACCOUNT` 角色、过不了本端点 `require_any_role`。所以 `Scope::Bound(&[])`
+// 在 helper 里直接 panic 并指向正确造法（场景 7）—— 见 [`Scope`]。
+
+/// 本文件新造账号共用的明文密码（与 `fixtures/part.sql` 内嵌哈希同款，cost=12）。
+const NEW_USER_PASSWORD: &str = "changeme";
+
+/// SHELF_ACCOUNT 账号的货架 scope 形态（2026-10-04 新增）。
+///
+/// 刻意收 enum 而不是 `&[i64]`：空切片的语义在两种构造下**正好相反** ——
+/// `Bound(&[])` 造不出「空 scope」（需要一个有效角色行 + 一个登录时被过滤掉的
+/// `scope_id`），而「零角色行」又过不了登录。历史上用 `&[]` 表示「无 scope 行 ⇒
+/// wildcard」，与「空数组 ⇒ 空集」的安全语义**方向相反**，照 doc 抄一遍极易把两个
+/// 用例写反。`Bound` 收空切片在此 panic 并指向正确造法。
+enum Scope {
+    /// 逐架绑定：每个 id 插一条 `scope_type='shelf' AND scope_id=<id>` 的角色行。
+    Bound(Vec<i64>),
+    /// 一行 `scope_id IS NULL` ⇒ 登录时 `shelf_wildcard = true` ⇒ 不加谓词、全集。
+    ///
+    /// ⚠️ 该行**产品 API 建不出来**：`iam::service::account::validate_role_scope`
+    /// 对 `SHELF_ACCOUNT` 硬校验 `scope_id.is_some()`，故 `POST /iam/users/{id}/roles`
+    /// 必返 `40001 VALIDATION`（HTTP 422）。`shelf_wildcard` 只有 fixture / 直插 SQL
+    /// 能造 ⇒ 本用例锁的是「万一库里存在这种行，读侧不会把它误当空集」。
+    Wildcard,
+}
 
 /// 插一个 `is_active=true` 的 `t_user` 行（bcrypt 哈希现场生成）。
 async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password: &str) -> i64 {
@@ -968,6 +1002,7 @@ async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password
     .bind(hash)
     .bind(username)
     .bind(now)
+    .bind(now)
     .execute(pool)
     .await
     .expect("insert t_user");
@@ -977,8 +1012,9 @@ async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password
 /// 插一个 `t_user_role` 行（user_id + role + scope）。
 ///
 /// `scope_id = None` 的 `SHELF_ACCOUNT` 行是 iam 侧判定 `shelf_wildcard = true`
-/// 的唯一来源（`iam::service::session::resolve_roles_and_scope`），故本文件用它
-/// 造 wildcard 账号。
+/// 的唯一来源（`iam::service::session::resolve_roles_and_scope`：判据是
+/// `role == ShelfAccount && scope_type == 'shelf' && scope_id IS NULL` 三者同时成立），
+/// 故本文件用它造 wildcard 账号。**产品 API 建不出这种行**（见 [`Scope::Wildcard`]）。
 async fn add_shelf_account_role(pool: &PgPool, user_id: i64, shelf_id: Option<i64>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -1000,26 +1036,31 @@ async fn add_shelf_account_role(pool: &PgPool, user_id: i64, shelf_id: Option<i6
     id
 }
 
-/// 造一个 SHELF_ACCOUNT 账号并登录，返回 access token。
-///
-/// `shelves: &[i64]` 每项插一条 scope 行；传 `&[]` 则插一条 `scope_id = NULL`
-/// 的行 ⇒ iam 侧 `shelf_wildcard = true`（全开放）。
+/// 造一个指定 scope 形态的 SHELF_ACCOUNT 账号并登录，返回 access token。
 async fn login_shelf_account(
     pool: &PgPool,
     app: &axum::Router,
     username: &str,
-    shelves: &[i64],
+    scope: Scope,
 ) -> String {
-    const PASSWORD: &str = "changeme";
-    let uid = insert_user_with_password(pool, username, PASSWORD).await;
-    if shelves.is_empty() {
-        add_shelf_account_role(pool, uid, None).await;
-    } else {
-        for sid in shelves {
-            add_shelf_account_role(pool, uid, Some(*sid)).await;
+    let uid = insert_user_with_password(pool, username, NEW_USER_PASSWORD).await;
+    match scope {
+        Scope::Bound(shelves) => {
+            assert!(
+                !shelves.is_empty(),
+                "Scope::Bound(&[]) 造不出「空 scope」：零角色行的账号登录即被拒（20606 \
+                 NO_ROLE），且拿不到 SHELF_ACCOUNT 角色。空 scope 请用「绑定一张架后、\
+                 登录前停用它」——见 pickable_scope_empty_when_bound_shelf_deactivated"
+            );
+            for sid in shelves {
+                add_shelf_account_role(pool, uid, Some(sid)).await;
+            }
+        }
+        Scope::Wildcard => {
+            add_shelf_account_role(pool, uid, None).await;
         }
     }
-    login_token(app, username, PASSWORD).await
+    login_token(app, username, NEW_USER_PASSWORD).await
 }
 
 /// 软删一张货架（`t_shelf.deleted_at`）。列表侧补这个守卫后，其上的批次不再可见。
@@ -1029,6 +1070,42 @@ async fn soft_delete_shelf(pool: &PgPool, shelf_id: i64) {
         .execute(pool)
         .await
         .expect("soft delete t_shelf");
+}
+
+/// 停用一张货架（`is_active = false` + `deleted_at = now()`，与
+/// `ShelfService::soft_delete_shelf` 的写侧同形）。
+///
+/// 本文件用它造**空 scope**：登录时 `resolve_roles_and_scope` 会校验被绑货架的
+/// `is_active`（并经 `get_shelf_by_id` 过滤软删），非 active 的 `scope_id` 不进
+/// `shelf_ids` ⇒ 登录后 `shelf_ids == []` 且 `shelf_wildcard == false`
+/// （区别于 wildcard 的 `[]` + `true`）。
+async fn deactivate_shelf(pool: &PgPool, shelf_id: i64) {
+    sqlx::query("UPDATE t_shelf SET is_active = false, deleted_at = now() WHERE id = $1")
+        .bind(shelf_id)
+        .execute(pool)
+        .await
+        .expect("deactivate t_shelf");
+}
+
+/// 读回服务端为该 token 算出的 `shelf_ids`（`GET /iam/me`）。
+///
+/// 用途：scope 类用例必须先自证「服务端到底算出了什么 scope」，否则「列表为空」可能
+/// 是另一条原因（架被停用 / scope 绑的是别的区）造成的，断言就失去回归价值。
+/// ⚠️ 顺带覆盖 [`docs/api/inconsistencies.md` §9.5] 登记的缺口：响应里**没有**
+/// `shelf_wildcard` 键，所以只能断言 `shelf_ids`，wildcard 与空 scope 在这里同形。
+async fn server_side_shelf_ids(app: &axum::Router, token: &str) -> Vec<String> {
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", "/iam/me", None::<Value>, Some(token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET /iam/me: {env}");
+    env["data"]["shelf_ids"]
+        .as_array()
+        .expect("data.shelf_ids 是数组")
+        .iter()
+        .map(|v| v.as_str().expect("shelf_ids 元素是 string").to_string())
+        .collect()
 }
 
 /// 断言信封的 `items` 与 `total` 自洽（`total` 必须等于收窄后的可见行数）。
@@ -1054,7 +1131,7 @@ async fn pickable_scope_closed_to_single_bound_shelf() {
     insert_pickable_batch(&pool, on_a, shelf_a, fx.process_a_id, 1).await;
     insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
 
-    let token = login_shelf_account(&pool, &app, "scope_single", &[shelf_a]).await;
+    let token = login_shelf_account(&pool, &app, "scope_single", Scope::Bound(vec![shelf_a])).await;
     let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
     let (s, env) = send(
         app.clone(),
@@ -1084,7 +1161,13 @@ async fn pickable_scope_is_union_of_bound_shelves() {
     insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
     insert_pickable_batch(&pool, on_c, shelf_c, fx.process_a_id, 1).await;
 
-    let token = login_shelf_account(&pool, &app, "scope_union", &[shelf_a, shelf_b]).await;
+    let token = login_shelf_account(
+        &pool,
+        &app,
+        "scope_union",
+        Scope::Bound(vec![shelf_a, shelf_b]),
+    )
+    .await;
     let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
     let (s, env) = send(
         app.clone(),
@@ -1113,7 +1196,7 @@ async fn pickable_scope_wildcard_sees_all_shelves() {
     insert_pickable_batch(&pool, on_a, PRODUCTION_SHELF_ID, fx.process_a_id, 1).await;
     insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
 
-    let token = login_shelf_account(&pool, &app, "scope_wildcard", &[]).await;
+    let token = login_shelf_account(&pool, &app, "scope_wildcard", Scope::Wildcard).await;
     let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
     let (s, env) = send(
         app.clone(),
@@ -1165,7 +1248,7 @@ async fn pickable_shelf_filter_intersects_with_scope() {
     insert_pickable_batch(&pool, on_a, shelf_a, fx.process_a_id, 1).await;
     insert_pickable_batch(&pool, on_b, shelf_b, fx.process_a_id, 1).await;
 
-    let token = login_shelf_account(&pool, &app, "scope_x", &[shelf_a]).await;
+    let token = login_shelf_account(&pool, &app, "scope_x", Scope::Bound(vec![shelf_a])).await;
 
     // X 在 scope 内 ⇒ 只剩架 A
     let uri_ok = format!(
@@ -1246,5 +1329,135 @@ async fn pickable_excludes_batches_on_soft_deleted_shelf() {
         vec![on_a.to_string()],
         "软删架上的批次不得再出现（与 pick-up 写侧一致）: {env}"
     );
+    assert_total_matches_items(&env, &uri);
+}
+
+/// 场景 7（**空 scope 分支，2026-10-04 review 第 1 轮补**）：`shelf_ids == []` 且
+/// `shelf_wildcard == false` ⇒ 必须返空集，**不是**「无限制」。
+///
+/// 这条是 `pickable_shelf_scope` 里被显式标为安全关键的分支：一旦有人把
+/// `Some(vec![])` 误写成「空 ⇒ 不加谓词」，未绑架 / 已失去全部绑定架的 SHELF_ACCOUNT
+/// 就会重新看到全厂 PRODUCTION 架。
+///
+/// **造法**（与 wildcard 的方向必须能一眼分辨）：
+/// 1. 账号绑一张 PRODUCTION 架 `dead`（`scope_id = dead`）；
+/// 2. **登录前**把 `dead` 停用 ⇒ 登录时 `resolve_roles_and_scope` 的
+///    `s.is_active` 校验不过 ⇒ 该 `scope_id` 不进 `shelf_ids`；
+/// 3. ⇒ 登录后 `shelf_ids == []` / `shelf_wildcard == false`（= 空 scope，
+///    而 wildcard 是 `[]` + `true`，见场景 3）。
+///
+/// ⚠️ 停用的必须是**另一张**架：架 A 上的批次要保持 `is_active = true`，否则列表
+/// 为空是「架被停用」造成的，这条用例就变成恒真断言、失去回归价值（下方先自证
+/// Manager 能看到 1 条）。
+#[tokio::test]
+async fn pickable_scope_empty_when_bound_shelf_deactivated() {
+    let (pool, app, mgr_token, fx) = bootstrap().await;
+    // 架 A：放可领批次，全程 active；架 dead：只用来绑 scope，随后停用
+    let dead = insert_production_shelf(&pool, "SCOPE-SH-DEAD").await;
+    let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
+    insert_pickable_batch(&pool, on_a, PRODUCTION_SHELF_ID, fx.process_a_id, 1).await;
+
+    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    // 前提自证：批次确实可领（否则下面的空集断言是恒真的）
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&mgr_token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    assert_eq!(
+        part_ids(&env),
+        vec![on_a.to_string()],
+        "前提：架 A 上的批次可领（Manager 可见）: {env}"
+    );
+
+    // 绑定 dead 架 → 停用 dead 架 → 登录（登录时 scope 被过滤成空数组）
+    let uid = insert_user_with_password(&pool, "scope_empty", NEW_USER_PASSWORD).await;
+    add_shelf_account_role(&pool, uid, Some(dead)).await;
+    deactivate_shelf(&pool, dead).await;
+    let token = login_token(&app, "scope_empty", NEW_USER_PASSWORD).await;
+
+    // 分支自证：服务端算出的必须是**空数组**（`[]` + 非 wildcard）。若它算出了
+    // [dead] 之类，下面的空集断言就变成了「架被停用」而不是「空 scope」在起作用。
+    let scope = server_side_shelf_ids(&app, &token).await;
+    assert!(
+        scope.is_empty(),
+        "前提：停用后该账号登录的 shelf_ids 必须是空数组（空 scope 分支）: {scope:?}"
+    );
+
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    assert!(
+        env["data"]["items"].as_array().expect("items").is_empty(),
+        "空 scope（shelf_ids=[] 且非 wildcard）必须返空集：若这里看到架 A 的批次，\
+         说明空数组被当成了「无限制」: {env}"
+    );
+    assert_eq!(
+        env["data"]["total"], 0,
+        "COUNT 必须带同一条 scope 谓词，空 scope 下同样是 0: {env}"
+    );
+    assert_total_matches_items(&env, &uri);
+}
+
+/// 场景 8（**2026-10-04 review 第 1 轮补**）：scope 非空但**全是 INSPECTION 架** ⇒
+/// 与本端点的 `sh.zone = 'PRODUCTION'` 硬过滤求交为空。
+///
+/// 直接用 fixture 预置的 `fx_part_shelf`（`fixtures/part.sql` 里
+/// `SHELF_ACCOUNT` + `scope_type='shelf'` + `scope_id=FX-SH-INSP`），不新造账号 ——
+/// 这正是生产里「品检区一体机」的形状：登录后 `shelf_ids` **非空**（长度 1），
+/// 与场景 7 的「空 scope」是两条不同分支（本例锁「非空但不含 PRODUCTION 架」）。
+#[tokio::test]
+async fn pickable_scope_bound_to_inspection_shelf_only_yields_nothing() {
+    let (pool, app, mgr_token, fx) = bootstrap().await;
+    let on_a = insert_part(&pool, fx.part_customer_l1_id, "架A件", "D-SCOPE-A", None).await;
+    insert_pickable_batch(&pool, on_a, PRODUCTION_SHELF_ID, fx.process_a_id, 1).await;
+
+    let uri = format!("{PICKABLE_URI_PREFIX}/{}", fx.work_type_a_id);
+    // 前提自证：批次可领
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&mgr_token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    assert_eq!(
+        part_ids(&env).len(),
+        1,
+        "前提：架 A 上的批次可领（Manager 可见）: {env}"
+    );
+
+    // fixture 预置账号：SHELF_ACCOUNT scope 绑在 INSPECTION 架上（非空数组）
+    let token = login_token(
+        &app,
+        &fx.part_shelf_account_username,
+        ProductionFixture::PASSWORD,
+    )
+    .await;
+
+    // 分支自证：scope 必须是**非空**的（长度 1 的 INSPECTION 架），与场景 7 的空数组
+    // 是两条不同分支。
+    let scope = server_side_shelf_ids(&app, &token).await;
+    assert_eq!(
+        scope,
+        vec![PartFixture::INSPECTION_SHELF_ID.to_string()],
+        "前提：fixture 账号的 shelf_ids 应恰是那一张 INSPECTION 架（非空 scope 分支）: {scope:?}"
+    );
+
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", &uri, None::<Value>, Some(&token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    assert!(
+        env["data"]["items"].as_array().expect("items").is_empty(),
+        "scope 只含 INSPECTION 架时，与本端点的 PRODUCTION 架过滤求交为空（scope 非空，\
+         与场景 7 的空数组是两条不同分支）: {env}"
+    );
+    assert_eq!(env["data"]["total"], 0, "COUNT 同样为 0: {env}");
     assert_total_matches_items(&env, &uri);
 }

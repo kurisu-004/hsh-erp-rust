@@ -7,7 +7,7 @@
 //! 2026-10-02：手动 `pick_up`（B 方案兜底）随批次用例迁往
 //! `crate::modules::prod::batch::service::pickup`，三条 list 端点留在 part 域。
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 use rust_decimal::Decimal;
 
 use crate::auth::rbac::{CurrentUser, Role};
@@ -26,8 +26,7 @@ use crate::modules::part::dto_crud::{ByWorkTypeQuery, ByWorkerQuery};
 const PLACEHOLDER_DATE: NaiveDate = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
 
 /// Unix epoch：未投影的 `timestamp` 类占位值。
-const PLACEHOLDER_TS: chrono::NaiveDateTime =
-    chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap();
+const PLACEHOLDER_TS: NaiveDateTime = NaiveDateTime::from_timestamp_opt(0, 0).unwrap();
 
 // ===========================================================================
 //  共享取行投影（2026-10-04 新增）
@@ -46,10 +45,12 @@ const PLACEHOLDER_TS: chrono::NaiveDateTime =
 ///    排的却是 **DB 真实列** ⇒ 列表已按加急排好、工件上看不出任何标记。
 /// 2. **漏字段不报错** —— `TPart` 30+ 字段，加字段时三份字面量要手改三处。
 ///
-/// 本 struct 把「SQL 投影了什么」写成**一个**可编译检查的事实：字段名即 SQL 别名
-/// （`#[derive(sqlx::FromRow)]` 按列名匹配），三处取行 SQL 必须逐字投影每一个字段，
-/// 否则运行时报 missing column 而非静默取到默认值。端点不消费的字段在 SQL 里显式
-/// 投影成 `NULL::<type> AS <字段名>`，把「本端点不填」写进 SQL 而不是靠 struct 缺省。
+/// 本 struct 把「SQL 投影了什么」收敛成**一处**事实：字段名即 SQL 别名
+/// （`#[derive(sqlx::FromRow)]` 按列名匹配），三处取行 SQL 必须逐字投影每一个字段。
+/// ⚠️ 这是**运行期**校验（`sqlx::query_as` 而非 `query_as!` 宏，宏才有编译期校验）：
+/// 少投影一列 → 运行时报 missing column；**多投影一列 → 静默忽略**（不报错、不取值）。
+/// 端点不消费的字段在 SQL 里显式投影成 `NULL::<type> AS <字段名>`，把「本端点不填」
+/// 写进 SQL 而不是靠 struct 缺省 —— 这样「不填」与「漏填」在 SQL 文本上就长得不一样。
 ///
 /// ## 字段填充口径
 /// - part 侧 `id` / `serial_no` / `name` / `drawing_no` / `is_urgent` /
@@ -178,6 +179,9 @@ impl WorkTypeListRow {
 /// ⚠️ 空 scope 返回 `Some(vec![])` 而**不是** `None`：`ANY('{}')` 对任何货架都
 /// 假，与 `can_access_shelf` 对任何货架都返 false 同形。若把空数组误判成
 /// 「无限制」，未绑架的 SHELF_ACCOUNT 会看到全厂。
+/// 空 scope 在生产里的真实成因：`iam::service::session::resolve_roles_and_scope`
+/// 会把绑到「已停用 / 已软删 / 不存在」货架的 `scope_id` 过滤掉（登录时求值），
+/// 于是这类账号登录后 `shelf_ids == []` 且 `shelf_wildcard == false`。
 ///
 /// ⚠️ **Clerk / Inspector 的行为变更**：本端点的角色白名单含 Clerk / Inspector，
 /// 而这两类角色按惯例不配 `t_user_role` 的 SHELF_ACCOUNT 行 ⇒ `shelf_ids` 为空
@@ -185,6 +189,10 @@ impl WorkTypeListRow {
 /// `can_access_shelf` 对齐」的必然结果（写侧 `worker-scan` 的
 /// `require_any_role(&[Manager, ShelfAccount])` 只放行 Manager/ShelfAccount，故
 /// 对这两类账号不存在「列表给出但提交被拒」的落差），但对读侧是行为变更。
+/// ⚠️ 若业务上要放开，唯一经产品 API 可达的办法是给它们**逐架**配
+/// `scope_id` 的 SHELF_ACCOUNT 行（`POST /iam/users/{id}/roles`）：wildcard
+/// （`scope_id IS NULL`）被 `iam::service::account::validate_role_scope` 硬拒，
+/// 属只有 fixture / 直插 SQL 能造出的状态。
 /// 契约见 `docs/api/parts/lifecycle.md` 的
 /// `GET /api/v2/parts/pickable-by-work-type/{work_type_id}` 节。
 fn pickable_shelf_scope(current: &CurrentUser) -> Option<Vec<i64>> {
@@ -234,11 +242,12 @@ impl PartService {
         //
         // 2026-10-04 删两列死投影（`b.id AS bid` / `w.name AS worker_name`）：原
         // 代码取出来只 `let _ = bid;` / `let _ = worker_name;` 丢弃，从未进过出参。
-        // 删掉后本 SQL 的列集与 [`WorkTypeListRow`] 的字段集逐字对齐 —— 本端点
-        // 不填批次锚点与链派生（口径见 [`WorkTypeListRow`] 字段 doc），故显式
-        // 投影成 `NULL::<type> AS <字段名>`：`FromRow` 按列名匹配，漏投影会报
-        // missing column，而 `Option` 字段漏投影时若改用 `#[sqlx(default)]`
-        // 会**静默**取默认值，正是本次要消灭的那类「填了但没人知道」的口径。
+        // `FromRow` 按列名匹配，**多余列会被静默忽略**（少投影才报 missing column），
+        // 所以删这两列是「少取两列 + 列集与 [`WorkTypeListRow`] 字段集一一对应」的
+        // 整洁性取舍，不是正确性修复 —— 保留它们同样能跑通。
+        // 端点不填的字段（批次锚点 / 链派生）则显式投影成 `NULL::<type> AS <字段名>`：
+        // 把「本端点不填」写进 SQL，而不是靠 struct 缺省或 `#[sqlx(default)]`
+        // （后者会**静默**取默认值，正是本次要消灭的那类「填了但没人知道」的口径）。
         let rows: Vec<WorkTypeListRow> = sqlx::query_as(
             "SELECT p.id, p.serial_no, p.name, p.drawing_no, p.is_urgent, \
                     p.system_delivery_date, p.planned_delivery_date, b.quantity, \
@@ -344,7 +353,8 @@ impl PartService {
         //
         // ⚠️ `$5` 是 scope 数组、排在 `$3`/`$4`（limit/offset）**之前**出现：PG 的
         // `$n` 只是占位名、不要求按序出现，故把新参数追加在 bind 列表末尾即可把
-        // `LIMIT`/`OFFSET` 的 diff 压到零。
+        // `LIMIT`/`OFFSET` 的 diff 压到零（下方 COUNT 无 `$3`/`$4`，它的编号为何要
+        // 独立连续，见该处注释）。
         let rows: Vec<WorkTypeListRow> = sqlx::query_as(
             "SELECT p.id, p.serial_no, p.name, p.drawing_no, p.is_urgent, \
                     p.system_delivery_date, p.planned_delivery_date, b.quantity, \
@@ -388,10 +398,14 @@ impl PartService {
             // 2026-10-04：scope 谓词与 `sh.deleted_at IS NULL` 两处**必须**与取行
             // 同形，否则 `total` 与 `items` 在收窄后对不上（漏任一处都会让「返回
             // 空列表但 total 仍是全厂数」或反之）。
-            // ⚠️ 本 COUNT 的 scope 参数编号是 `$3` 而**不是** `$5`：PG 要求每个被
-            // 引用的参数都能推断类型，而未引用的 `$3`/`$4` 会触发
-            // `could not determine data type of parameter $3`。故 COUNT 独立按
-            // 自身 bind 顺序连续编号，谓词语义与取行逐字相同。
+            // ⚠️ 本 COUNT 的 scope 参数编号是 `$3` 而**不是** `$5`：PG 扩展协议要求
+            // Parse 消息声明的参数类型个数 **等于** SQL 里被引用的参数个数（个数 = 被
+            // 引用的最大 `$n`）。sqlx 按 `.bind()` 个数声明类型，所以本 COUNT 若沿用
+            // 取行的 `$5` 编号，就得额外 bind 两个没人引用的 `$3`/`$4`，Parse 期直接被
+            // PG 拒（`bind message supplies 5 parameters, but prepared statement ...
+            // requires 3`）。未被引用的 `$n` 连「参数」都算不上，更不会触发类型推断
+            // 报错 —— 那是另一种失败（被引用但类型推不出，且发生在 Bind/EXECUTE 期）。
+            // 故 COUNT 按自身 bind 顺序连续编号，谓词语义与取行**逐字相同**。
             "SELECT COUNT(*)::bigint FROM t_part_batch b \
              JOIN t_work_type_process wtp ON wtp.process_id = b.current_process_id \
                 AND wtp.deleted_at IS NULL \

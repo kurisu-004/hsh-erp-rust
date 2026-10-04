@@ -80,17 +80,25 @@ Response 200 `data`：
 > （`src/auth/rbac.rs`：`self.shelf_wildcard || self.shelf_ids.contains(&shelf_id)
 > || self.has_role(Role::Manager)`）**依赖它**。
 >
-> `shelf_wildcard` 的来源是「任一 `SHELF_ACCOUNT` 角色行的
-> `t_user_role.scope_id IS NULL`」（见 `iam::service::session::resolve_roles_and_scope`
-> 第 3 段）。于是前端拿到 `shelf_ids: []` 时**无法区分**两种账号：
+> `shelf_wildcard` 的来源是「存在 `role='SHELF_ACCOUNT' AND scope_type='shelf'
+> AND scope_id IS NULL` 的 `t_user_role` 行」（三个限定缺一不可，见
+> `iam::service::session::resolve_roles_and_scope`）。于是前端拿到 `shelf_ids: []`
+> 时**无法区分**两种账号：
 >
 > | 账号 | 语义 | 前端看到的 |
 > |---|---|---|
-> | 未绑架的 SHELF_ACCOUNT | 一个架都看不到 | `shelf_ids: []` |
+> | 未绑架 / 已失去全部绑定架的 SHELF_ACCOUNT | 一个架都看不到 | `shelf_ids: []` |
 > | wildcard SHELF_ACCOUNT（`scope_id = NULL`） | **全厂所有架都能看** | `shelf_ids: []` |
 >
 > 两者在前端是**完全相同的响应**，而后端可见范围相差全集。任何「用 `shelf_ids`
 > 为空就当作无权限 / 就当作显示全部」的客户端分支都会对其中一类判错。
+>
+> ⚠️ 第二行那种账号在**产品 API 下建不出来**：`iam::service::account::
+> validate_role_scope` 对 `Role::ShelfAccount` 硬校验 `scope_id.is_some()`（缺一即
+> `40001 VALIDATION` / HTTP 422），而 `t_user_role` 的唯一生产写路径就是
+> `POST /iam/users/{id}/roles`。所以这一行目前只有 fixture / 直插 SQL 能造出来 ——
+> 补 `shelf_wildcard` 字段前，先想清楚是要暴露「一个产品造不出来的状态」，还是顺带
+> 把 `validate_role_scope` 放宽（那是另一个变更）。
 >
 > 影响面举例：2026-10-04 起
 > [`GET /api/v2/parts/pickable-by-work-type/{work_type_id}`](./parts/lifecycle.md#get-apiv2partspickable-by-work-typework_type_id)
@@ -99,7 +107,7 @@ Response 200 `data`：
 >
 > 修法（**不在本次范围**）：`CurrentUserOut` 补 `shelf_wildcard: bool`，前端 TS /
 > Zod schema 同步加该字段。归口登记见
-> [`./inconsistencies.md`](./inconsistencies.md#95-2026-10-04-登记iam-me-不返-shelf_wildcard)。
+> [`./inconsistencies.md`](./inconsistencies.md#95-2026-10-04-登记：iamme-不返-shelf_wildcard)。
 
 `menus[]` 节点字段：
 
