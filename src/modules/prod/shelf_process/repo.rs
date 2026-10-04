@@ -145,20 +145,46 @@ impl ShelfProcessRepo {
             .map(|r| r.rows_affected())
     }
 
-    /// 按 `process_id` 取首条 active 货架映射（多结果取 sort_order 最小者）。
+    /// 按 `process_id` 取首条**可用**货架映射（多结果取 sort_order 最小者）。
     ///
     /// 2026-10-02 新增：原为 `prod::batch::repo::find_first_shelf_for_process`
     /// （`src/modules/prod/batch/repo.rs`）的手写 SQL，随 shelf↔process 映射搬到本
     /// 文件作为 SQL 真源，调用方 `prod::batch::service::dispatch_single` 改调本方法。
-    /// SQL 逐字保留，0 结果 → `Ok(None)`（由 service 层映射 `BIZ_SHELF_PROCESS_NOT_FOUND`）。
+    /// 0 结果 → `Ok(None)`（由 service 层映射 `BIZ_SHELF_PROCESS_NOT_FOUND`）。
     ///
-    /// 不带 `is_active` 守卫（车间 active 货架默认软删）；后续如需守卫再加。
+    /// ⚠️ 2026-10-04 加固（`current_holder_id` 写脏缺口）：原 SQL **不 JOIN `t_shelf`**，
+    /// 只要 `t_shelf_process` 行未软删就返回，故已停用 / 已软删 / 品检区货架会被
+    /// 下发给批次并写进 `t_part_batch.current_holder_id`。后果不是报错而是**静默漏件**：
+    /// 报工台取件页数据源（`part::service::phase1::work_type` 的 pickable-by-work-type）
+    /// 的取行 SQL 硬限定 `JOIN t_shelf sh ON sh.id = b.current_holder_id
+    /// AND sh.is_active = true AND sh.zone = 'PRODUCTION'`，故这种批次永远不会出现在
+    /// 工人的可领列表里。历史脏数据排查 SQL 见
+    /// [`docs/api/production/shelf-process-mapping.md`](../../../../docs/api/production/shelf-process-mapping.md)
+    /// 的「只读诊断 SQL」一节（只读，不自动修数据）。
+    ///
+    /// ## 为什么 JOIN 上 3 个谓词（zone 的判断依据）
+    /// 唯一调用方是 `prod::batch::service::dispatch_single`，它把货架写死成
+    /// `location='PRODUCTION_SHELF'` + `current_holder_id=shelf_id` + `status='IN_PROCESS'`
+    /// （`BatchRepo::update_batch_dispatched`），且只接 `status='PENDING'` 的批次
+    /// —— 品检流转（`scan_inspect` / `outsource::receive_*`）走的是另一套显式
+    /// `target_inspection_shelf_id` + `validate_shelf_zone(.., "INSPECTION")` 路径，
+    /// **不经过本方法**。故 `zone='PRODUCTION'` 与写入不变式一致，不会误伤品检。
+    /// `deleted_at IS NULL` / `is_active = true` 则与 `validate_shelf_zone` 的
+    /// 判序（存在 → 20501 / 停用 → 20512 / zone → 20104）同源，只是这里用 JOIN
+    /// 一次判完。
+    ///
+    /// ## 为什么是「跳过不可用候选」而不是「命中即报错」
+    /// 谓词写在 WHERE 上 ⇒ sort_order 最小的**不可用**货架被静默跳过，继续往后找。
+    /// 反过来（在 service 层取到首条再 `validate_shelf_zone` 报错）会在「sort_order=1
+    /// 的架已停用、sort_order=2 的架是好的」时把整个下发打成失败，把一个本可自动
+    /// 恢复的运维事故升级成阻塞。全部候选都不可用时才返回 `None`，由 dispatch 映射
+    /// 既有的 `20508 BIZ_SHELF_PROCESS_NOT_FOUND`（不新造错误码）。
     ///
     /// ⚠️ 2026-10-04 加固：`O` 按 `Option<i64>` 收（外层 `Option` 由
     /// `fetch_optional` 表示「有没有行」，不表示列的类型）。`t_shelf_process.shelf_id`
     /// 当前是 `NOT NULL`，故按 `i64` 解码当前安全；但列一旦变可空，同款写法会以
     /// `error occurred while decoding column 0: unexpected null; try decoding as an Option`
-    /// 整笔 500。**本次零行为变化**（`NOT NULL` 列 `.flatten()` 恒为 `Some(v)`）。
+    /// 整笔 500。**该次加固零行为变化**（`NOT NULL` 列 `.flatten()` 恒为 `Some(v)`）。
     /// 同款修法见 `prod/worker_pool/repo/mod.rs::process_chain_step_get_process_id`
     /// 与 `prod/batch/service/worker_scan.rs::worker_scan_event`（后者是可空列，
     /// 已在 2026-10-04 真修过一次 500）。
@@ -168,10 +194,15 @@ impl ShelfProcessRepo {
     ) -> Result<Option<i64>, sqlx::Error> {
         let row: Option<Option<i64>> = sqlx::query_scalar(
             r#"
-            SELECT shelf_id
-            FROM t_shelf_process
-            WHERE process_id = $1 AND deleted_at IS NULL
-            ORDER BY sort_order ASC, id ASC
+            SELECT sp.shelf_id
+            FROM t_shelf_process sp
+            JOIN t_shelf s ON s.id = sp.shelf_id
+            WHERE sp.process_id = $1
+              AND sp.deleted_at IS NULL
+              AND s.deleted_at IS NULL
+              AND s.is_active = true
+              AND s.zone = 'PRODUCTION'
+            ORDER BY sp.sort_order ASC, sp.id ASC
             LIMIT 1
             "#,
         )

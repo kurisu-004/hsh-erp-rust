@@ -51,9 +51,17 @@ prod 批次下发解析货架、worker-pool 移动校验三处的共同依据。
 - **逻辑引用**：`shelf_id` / `process_id` 为 bigint 逻辑引用，DB 层无 FK 约束
 - **软删**：mapping 行有 `deleted_at`；整组替换时先 `UPDATE … SET deleted_at = now()`，
   再 `bulk_insert` 新行（历史行保留，便于追溯）
-- **读守卫**：所有读查询一律带 `deleted_at IS NULL`；全集查询额外要求 `s.is_active = true`
+- **读守卫**：所有读查询一律带 `deleted_at IS NULL`；全集查询额外要求 `s.is_active = true`；
+  **`find_first_shelf_for_process`（2026-10-04）额外要求 `s.is_active = true` 且
+  `s.zone = 'PRODUCTION'`** —— 它是三条读侧里**唯一从映射里选出**货架的（另两条
+  `worker_scan` RETURNED 与 `/prod/pool/move` WORKER→POOL 的 `shelf_id` 来自请求，各有
+  独立守卫），谓词不全即静默漏件（见下方「只读诊断 SQL」）
+- **写守卫**：`POST` 侧自 2026-10-04 起要求目标货架 `zone='PRODUCTION'`（`items: []`
+  清空路径豁免，见下方「zone 守卫」）
 - **依赖方向（2026-10-02 翻转）**：本域只**读** `shelf::repo::ShelfRepo::get_by_id`
-  校验货架存在 / scope（prod → shelf）；反向的 shelf → prod 依赖已随端点搬移清零
+  校验货架存在 / scope（prod → shelf）；反向的 shelf → prod 依赖已随端点搬移清零。
+  2026-10-04 起额外调用**同域** `prod::batch::service::guard::validate_shelf_zone`
+  （判序与错误码的唯一真源）
 
 业务约束（service 层 enforce）：
 
@@ -61,7 +69,7 @@ prod 批次下发解析货架、worker-pool 移动校验三处的共同依据。
 |---|---|
 | `GET /` | 任意已登录；SHELF_ACCOUNT 按 `user.shelf_ids` 收窄；按 `shelf_id ASC, sort_order ASC` |
 | `GET /{shelf_id}` | 货架不存在 → 20501；SHELF_ACCOUNT 越界 → 40301；按 `sort_order ASC, id ASC` |
-| `POST /{shelf_id}` | 货架不存在 → 20501；items 里有 process_id 不存在或已软删 → 20505；整组替换语义，`items: []` = 清空 |
+| `POST /{shelf_id}` | 货架不存在 → 20501（**任何** items 都守）；**`items` 非空时**货架 `is_active=false` → 20512、货架 `zone≠'PRODUCTION'` → 20104（2026-10-04 新增；`items: []` 清空路径豁免这两条）；items 里有 process_id 不存在或已软删 → 20505；整组替换语义，`items: []` = 清空 |
 
 ---
 
@@ -134,19 +142,136 @@ Request：`SetShelfProcessesRequest`
 语义：整组替换 —— 事务内：
 
 1. 校验 shelf 存在（20501）
-2. 校验 items 里所有 process_id 存在且未软删（20505）
-3. 软删该 shelf 的全部 active mapping（清 `deleted_at`）
-4. `bulk_insert` 新 mapping（带 sort_order）
+2. **`items` 非空时**额外校验 `is_active=true`（20512）、`zone='PRODUCTION'`（20104）
+3. 校验 items 里所有 process_id 存在且未软删（20505）
+4. 软删该 shelf 的全部 active mapping（清 `deleted_at`）
+5. `bulk_insert` 新 mapping（带 sort_order）
 
-`items` 可为 `[]`（清空映射）。
+`items` 可为 `[]`（清空映射）。⚠️ **2026-10-04 review 第 1 轮 B1：`items: []` 豁免第 2 步
+的 20512 / 20104**（只守存在性 20501）—— 见下方「zone 守卫」的「清空路径豁免」。
 
 Response 200 `data`：`null`
 
 错误码：
 
-- 20501 `BIZ_SHELF_NOT_FOUND` —— shelf 不存在 / 已软删
+- 20501 `BIZ_SHELF_NOT_FOUND` —— shelf 不存在 / 已软删（**任何** `items` 都守）
+- 20512 `BIZ_SHELF_INACTIVE` —— shelf `is_active=false`（2026-10-04 新增；`items: []` 不触发）
+- 20104 `BIZ_INVALID_VALUE` —— shelf `zone≠'PRODUCTION'`（2026-10-04 新增；`items: []` 不触发）/ process_id 非整数
 - 20505 `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND` —— items 里有 process_id 不存在
-- 20104 `BIZ_INVALID_VALUE` —— process_id 非整数
+
+### zone 守卫（2026-10-04 新增，写侧收紧）
+
+`POST` 建 / 改映射时只接受 **PRODUCTION 区**货架。判序由
+`prod::batch::service::guard::validate_shelf_zone` 统一承担（`ShelfRepo::get_by_id` 带
+`deleted_at IS NULL`），与 `place_on_shelf` / `pickup` / `release_from_programming` /
+外协收发等生产流端点**同源同码**（20501 → 20512 → 20104），不另造判定。
+
+**为什么要收紧**：`t_shelf_process` 的三条读侧全是生产流（下发解析货架 / worker 归还 /
+候选池放回）。其中只有下发（`dispatch_single`）是**从映射里选出**货架，故它的谓词必须
+下沉到 `find_first_shelf_for_process` 的 SQL；另两条的 `shelf_id` 来自请求、写进
+`t_part_batch.current_holder_id` 之前各有独立守卫（`worker_scan` 用
+`ShelfRepo::get_by_id_zone(.., "PRODUCTION")`、`/prod/pool/move` 用 `validate_shelf_zone`）
+—— 全仓 3 个 `current_holder_id` 写点已全覆盖，清单见
+`src/modules/prod/batch/service/guard.rs` 模块 doc。品检流走的是显式
+`target_inspection_shelf_id` + `validate_shelf_zone(.., "INSPECTION")`，**不读
+`t_shelf_process`**；前端 10 处 `useShelfProcessFilter` 的货架候选源也一律是
+`zone='PRODUCTION'` 过滤后的列表。品检架上的映射行因此是**无读侧消费**的纯负债。
+
+**清空路径豁免（2026-10-04 review 第 1 轮 B1）**：`items: []` 只 `soft_delete_all_for_shelf`、
+**不新增任何非法映射**，故跳过 20512 / 20104（存在性 20501 仍无条件守 —— 对已软删货架的
+空操作不该静默「成功」）。不豁免的话，**存量非法映射将失去唯一的 API 清理路径**：
+整组替换语义下改不了其中一条，而 `PUT /shelves/{id}` 的 `ShelfUpdateRequest` 只有 `name` /
+`location`（`zone` 不可经 API 改），也没有「先换成生产架再清映射」这条绕路 —— 于是
+「只读诊断 SQL ② 列出的行在本仓清不掉」，诊断与处置自相矛盾。
+回归：`tests/production/shelf_process.rs::set_shelf_processes_allows_clearing_inspection_zone_mappings`。
+
+**副作用（已知且接受）**：对品检架（或任何非 PRODUCTION 区货架）调本端点且 `items`
+**非空**时返 `20104`。这是刻意的 fail-fast：让配置错误在写侧暴露，而不是继续静默产出
+漏件批次。存量非法行的排查 SQL（只读）见下方「只读诊断 SQL」，**本仓不自动修数据**，
+修复走独立的数据修复单 + 上面的清空路径。
+
+**⚠️ 前端配套未完成（2026-10-04 review 第 1 轮 B1 / 第 2 轮 N1，待前端仓处理）**
+`ShelfList.vue::saveShelf` **无条件**调 `setShelfProcesses`，且 `updateShelf`（编辑态）/
+`createShelf`（新增态）**都先于**它执行 ⇒ 映射这一步返 `20104` 时**基本字段已落库**、
+弹窗不关、toast 是后端原文 `shelf {code} (id={id}) zone=INSPECTION 不等于 PRODUCTION`
+—— **半截保存**。**两条路径都中招，且新增路径更糟**：create 模式下货架已建出来，界面却
+报错卡住；用户再点保存会用同一个 `code` 重新建架、撞 `uk_t_shelf_code` 报
+`20502 DUPLICATE_CODE`，彻底卡死。前端需 3 处配套（判据取**货架行的 DB zone**、
+新增与编辑统一提交 `{items: []}`、zone 变更时清空已选工序）—— 逐条见本文末尾
+「前端配套改动清单」的 **C 节**（不写锚点链接：标题里带 `——` / `⏳`，锚点生成规则易随
+渲染器差异而失效）。
+在该配套落地前，**后端先上、库存管理页对品检架的新增 / 编辑都会失败**（清空路径已豁免，
+故「把品检架映射清空」这个动作本身仍可用）。
+
+---
+
+## 只读诊断 SQL（2026-10-04 新增）
+
+> ⚠️ **只读诊断，非迁移**。本节两条 SQL **不含任何 `UPDATE` / `DELETE` / `INSERT`**，
+> 只作排查用。仓库既有的可执行 SQL 惯例是 `migrations/`（schema）与 `seeds/`（配置
+> 数据）两个目录 —— 二者都是**会被应用**的变更脚本，把只读排查语句塞进去会与之混淆，
+> 故本节落在文档里。需要执行时直接贴进 `psql` / 客户端跑即可。
+>
+> **用途**：`current_holder_id` 写脏的**后果是静默漏件而不是报错**。报工台取件页的
+> 数据源（`GET /api/v2/parts/pickable-by-work-type/{work_type_id}`）取行 SQL 硬限定
+> ```sql
+> JOIN t_shelf sh ON sh.id = b.current_holder_id
+> ... AND sh.is_active = true AND sh.zone = 'PRODUCTION'
+> ```
+> 所以一个 `location='PRODUCTION_SHELF'` 但 `current_holder_id` 指向品检架 / 停用架 /
+> 已软删架的批次，**永远不会出现在工人的可领列表里，也不报任何错**。下面第 1 条把这类
+> 批次全部列出来，第 2 条把「会让脏货架落进 holder」的非法映射源头列出来。
+
+### ① `current_holder_id` 指向不可用货架的在池批次
+
+```sql
+SELECT b.id, b.part_id, b.current_holder_id, sh.code, sh.zone, sh.is_active, sh.deleted_at
+FROM t_part_batch b LEFT JOIN t_shelf sh ON sh.id = b.current_holder_id
+WHERE b.location = 'PRODUCTION_SHELF' AND b.status = 'IN_PROCESS' AND b.deleted_at IS NULL
+  AND (sh.id IS NULL OR sh.zone <> 'PRODUCTION' OR NOT sh.is_active OR sh.deleted_at IS NOT NULL);
+```
+
+谓词逐条对应 `validate_shelf_zone` 的三个判据（`sh.id IS NULL` 覆盖悬空 holder；
+`sh.zone <> 'PRODUCTION'` / `NOT sh.is_active` / `sh.deleted_at IS NOT NULL`），
+`LEFT JOIN` 保证 holder 指向已消失的货架时也能命中。
+
+### ② 非法 shelf ↔ process 映射（脏 holder 的源头）
+
+```sql
+SELECT sp.id AS mapping_id, sp.shelf_id, sh.code AS shelf_code, sh.zone, sh.is_active,
+       sh.deleted_at AS shelf_deleted_at, sp.process_id, p.code AS process_code,
+       sp.deleted_at AS mapping_deleted_at
+FROM t_shelf_process sp
+JOIN t_shelf sh ON sh.id = sp.shelf_id
+JOIN t_process p ON p.id = sp.process_id
+WHERE sp.deleted_at IS NULL
+  AND (sh.deleted_at IS NOT NULL OR NOT sh.is_active OR sh.zone <> 'PRODUCTION');
+```
+
+即「映射行本身还 active，但货架已软删 / 已停用 / 不是生产架」。这三条正是
+`ShelfProcessRepo::find_first_shelf_for_process` 自 2026-10-04 起在 SQL 里挡掉的谓词，
+也是 `POST /{shelf_id}` 现在拒收的形态。**修完守卫后本查询仍应作为存量巡检手段定期跑**
+（新守卫只挡新写入，挡不住历史行）。
+
+### 本仓验证记录
+
+2026-10-04 在本 worktree 的开发库（`DATABASE_URL=postgres://hsh:6065161@localhost:5450/hsh`，
+schema 由 `sqlx migrate run` 建到 HEAD）实跑：两条均返回 **0 行**。
+⚠️ 该库是**空库**（`t_shelf` / `t_shelf_process` / `t_part_batch` / `t_part` 均为 0 行，已逐表
+`count(*)` 核实），故这是**空真值**、**不构成「线上无脏数据」的证据** —— 线上库需另行执行。
+
+为确认 SQL 本身能命中（而非因写错谓词恒返空），另在同库一个 `BEGIN … ROLLBACK` 事务内
+合成「1 品检架 + 1 停用架 + 1 软删架 + 1 正常架 / 各 1 条映射 / 5 条在池批次（其中 1 条
+holder 指向不存在的货架）」后逐分支核对：
+
+- **SQL ① 命中 4 行**，四条各打中一个互不相同的分支 —— `zone<>PRODUCTION` /
+  `NOT is_active` / `deleted_at IS NOT NULL` / **`sh.id IS NULL`（悬空 holder）**；
+  正常架那条批次正确地未被命中。
+- **SQL ② 命中 3 行** —— `zone<>PRODUCTION` / `NOT is_active` / `deleted_at IS NOT NULL`。
+
+`ROLLBACK` 后复查 `t_shelf` / `t_shelf_process` / `t_part_batch` / `t_part` 四表均回到 0 行。
+（2026-10-04 review 第 1 轮订正：首版验证记录只覆盖了 ① 的前三个分支，漏了正文声称覆盖的
+悬空 holder 分支，且把 ① 的行数一并记成 3；现已补测并按上列数字订正。）
 
 ---
 
@@ -173,6 +298,7 @@ Response 200 `data`：`null`
 | 前端 | 端点契约对齐 v2 后端（422 根因 + 3 处静默数据损坏） |
 | 前端 | 保存闸门堵死静默清空 + 5 项准确性订正 |
 | 前端 | 3 端点 URL 硬切到 prod 域 |
+| **前端（⏳ 待办，2026-10-04 新增）** | **C. `ShelfList.vue` 按 zone 收敛映射编辑区（配合 2026-10-04 zone 守卫）** |
 
 - **后端**：已在 `master`。
 - **前端**：在 `feat/shelf-domain-split` 分支，**截至 2026-10-02 尚未合入前端 `main`**
@@ -286,6 +412,95 @@ CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃�
 > 前端若仍需展示「账号数」，应另走 iam 域用户列表按 `scope_type='shelf'` 聚合，
 > **不要**指望货架域继续下发该字段。
 
+### C. `ShelfList.vue` 按 zone 收敛映射编辑区 —— ⏳ 待办（2026-10-04 新增）
+
+配合 [`POST` 的 zone 守卫](#zone-守卫2026-10-04-新增写侧收紧)（`items` 非空时要求
+`zone='PRODUCTION'`，`items: []` 豁免）。**后端已上，前端未配套 ⇒ 库存管理页对品检架的
+新增 / 编辑都会失败。**
+
+> 本节行号取自 2026-10-04 的 `frontend/src/views/shelves/ShelfList.vue`。**行号会漂移，
+> 以符号名（`saveShelf` / `editShelf` / `resetForm` / `editingShelf` / `selectedProcessIds`）
+> 为准。**
+
+#### 问题（3 个落点 + 3 个隐蔽缺陷）
+
+| 落点（当前行号） | 现状 | 后果 |
+|---|---|---|
+| `saveShelf`（`:315`）→ `setShelfProcesses`（`:352`） | **无条件**调用，不看任何 zone | 品检架的新增 / 编辑必收 `20104` |
+| `el-form-item label="工序"`（`:107`） | 对所有 zone 渲染 | 与后端新守卫口径不一致（读侧 10 处 `useShelfProcessFilter` 的候选源早已是 `zone='PRODUCTION'` 口径） |
+| `updateShelf`（`:330`）/ `createShelf`（`:337`）**都先于** `:352` | 两个写点顺序固定 | **半截保存**，见下 |
+
+**隐蔽缺陷 ① —— 新增（create）路径与编辑路径同样坏，且更糟。** `saveShelf` 是新增 / 编辑
+**共用**的单个函数。create 分支里 `shelfId = String(created.id)` ⇒ **货架已落库**，映射这
+一步才 `20104` ⇒ 弹窗卡住 + 留一个孤儿货架；用户再点保存会带着**同一个 `code`** 重新
+`createShelf`，撞 `uk_t_shelf_code`（部分唯一索引，`WHERE deleted_at IS NULL`）⇒ 报
+`20502 DUPLICATE_CODE`，用户彻底卡死。恢复手段只有停用那个孤儿货架（`deactivateShelf` 是
+软删，`uk_t_shelf_code` 带 `WHERE deleted_at IS NULL` ⇒ 软删后 code 即释放），**编辑弹窗里
+没有任何入口**。
+
+**隐蔽缺陷 ② —— 「隐藏多选」不等于「清空选择」。** `ShelfList.vue` 里 `watch` / `@change`
+**零命中**，`selectedProcessIds` 只在 `resetForm`（`:277`）被清、在 `editShelf`（`:302`）
+被 `getShelfProcesses` 的返回值填充。新增弹窗里 zone 缺省 `'PRODUCTION'`（`:274`）⇒ 用户
+先选工序 P1、再把「区域」切成品检，多选虽被隐藏，**model 里的 `[P1]` 仍在**，`:352` 照发。
+
+**隐蔽缺陷 ③ —— 判据不能用 `shelfForm.zone`。** zone 的 `<el-select>`（`:86-87`）在编辑态
+**没有** `:disabled`（只有「代码」输入框 `:80` 有 `:disabled="!!editingShelf"`），而
+`updateShelf` 的 payload（`:330-334`）只发 `{name, location, display_order}` —— **不发
+`zone`**。于是编辑态改「区域」对 DB **完全无效**，而以表单值为判据会与后端守卫读到的
+DB zone 打架，两个方向都错：
+
+- 品检架（DB = INSPECTION）被切到 PRODUCTION ⇒ 判据说「可以写」⇒ 调接口 ⇒ 后端读 DB 仍是
+  INSPECTION ⇒ `20104`（又半截保存）；
+- 生产架（DB = PRODUCTION）被切到品检 ⇒ 判据说「跳过」⇒ **静默留下陈旧映射**，界面无任何提示。
+
+#### 判据：`effectiveZone`（DB zone 从哪取）
+
+**编辑态的权威 zone 是 `editingShelf.value.zone`** —— 它是 `editShelf(s: Shelf)`（`:284`）
+从**表格行** `s` 存下来的（表格数据源 `items` ← `fetchData`（`:262-269`）的
+`listShelves({limit: 200})`，**不过滤 zone**，所以品检架也在表里），而 `editingShelf` 只在
+`:286` 被赋值一次、`:278` 被清空，**任何表单交互都不会写它**。`Shelf.zone` 是
+`@/types/shelf.ts` 里的必填 `string`（`'PRODUCTION' | 'INSPECTION'`），Zod 侧
+`shelfSchema` 同样必填。
+
+**新增态没有 DB 行可读**（`editingShelf === null`），此时唯一的 zone 就是 `shelfForm.zone`
+—— 而它正是将随 `createShelf({zone: shelfForm.zone})`（`:340`）写进 DB 的值，**不可能分叉**。
+```ts
+// 2026-10-04：映射编辑区的 zone 判据。
+// 编辑态以货架行的 DB zone 为准 —— updateShelf 的 payload 不含 zone，表单里改「区域」
+// 对 DB 无效，用表单值判会与后端守卫读到不同的 zone 而误判。
+// 新增态货架尚不存在，shelfForm.zone 就是将写入 DB 的值。
+const effectiveZone = computed(() => editingShelf.value?.zone ?? shelfForm.zone);
+```
+
+#### 配套清单（3 处，缺一不可）
+
+1. **隐藏**：`<el-form-item label="工序">`（`:107`）仅在 `effectiveZone === 'PRODUCTION'`
+   时渲染。
+2. **提交**：**新增与编辑两条路径统一** —— `effectiveZone !== 'PRODUCTION'` 时提交
+   `{ items: [] }`（走清空豁免，见上方「清空路径豁免」；
+   `toShelfProcessesPayload([])` → `{items: []}`，见 `src/api/shelves.ts`），
+   **不要跳过 `setShelfProcesses` 调用**。
+3. **清空**：zone 变更时（`<el-select @change>` 或 `watch(() => effectiveZone.value)`）同步
+   `selectedProcessIds.value = []`，否则被隐藏的 model 残留仍会被提交（隐蔽缺陷 ②）。
+
+#### ⛔ 明确不可取：编辑态「跳过 `setShelfProcesses` 调用」
+
+只按「非 PRODUCTION 就不调」实现，**新增路径会留下孤儿货架**（隐蔽缺陷 ①）—— 因为
+`createShelf` 已经提交成功，跳过映射调用等于「建了架但界面报成功」，用户以为配好了，实际
+一个非法映射都没写入、也拿不到任何报错。提交 `{items: []}` 才是对的：它让清空动作真的发生
+（品检架本来就不该有映射），且**不报 20104**。
+
+#### 配套落地前可用的绕过
+
+品检架的映射用 `{items: []}` 清空（清空路径已豁免 zone 守卫）；新增品检架时**不要**选工序。
+其余字段的新增 / 编辑需前端修好后才不会失败。
+
+#### 附带建议（可选，不属本批范围）
+
+编辑态的「区域」下拉对 DB 无效（`updateShelf` 不发 `zone`），却允许用户改 —— 改用
+`effectiveZone` 后它对映射区无害，但仍是误导。彻底做法是编辑态给该 `<el-select>` 加
+`:disabled="!!editingShelf"`（与「代码」输入框一致）。
+
 ---
 
 ## DTO 字段参考
@@ -294,7 +509,7 @@ CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃�
 
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `items` | [SetShelfProcessesItem](#dto-字段参考) | — | 空数组 = 清空全部 mapping |
+| `items` | [SetShelfProcessesItem](#dto-字段参考) | — | 空数组 = 清空全部 mapping。**空数组时豁免 20512 / 20104 的 zone / is_active 守卫**（只守 20501），见 [zone 守卫](#zone-守卫2026-10-04-新增写侧收紧) |
 
 `SetShelfProcessesItem`：
 
@@ -321,7 +536,11 @@ CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃�
 | 20505 | `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND` | **prod::shelf_process** | items 里有 process_id 不存在 |
 | 20506 | `BIZ_SHELF_NO_MATCH_FOR_PROCESS` | prod 域 | 没有 active 货架映射指定 process |
 | 20507 | `BIZ_SHELF_PROCESS_NOT_MAPPED` | prod::worker_pool | 货架未映射该工序（move / worker-scan 复用） |
-| 20508 | `BIZ_SHELF_PROCESS_NOT_FOUND` | prod::batch | 按 `target_process_id` 在 `t_shelf_process` 0 结果 |
+| 20508 | `BIZ_SHELF_PROCESS_NOT_FOUND` | prod::batch | 按 `target_process_id` 查不到**可用**货架（2026-10-04 起含「有映射但货架已软删 / 已停用 / 非生产区」） |
+| 20512 | `BIZ_SHELF_INACTIVE` | 货架域 | shelf `is_active=false`（2026-10-04 起 `POST /prod/shelf-processes/{shelf_id}` 经 `validate_shelf_zone` 也会命中） |
+
+20104 `BIZ_INVALID_VALUE` 另见 [`../index.md`](./index.md) 通用错误码表 —— 2026-10-04
+起它多了一个触发场景：本域 `POST` 收到非 PRODUCTION 区货架时。
 
 ---
 
@@ -342,7 +561,7 @@ CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃�
 
 ## 参考
 
-- 集成测试：`tests/production/shelf_process.rs`（4 场景：整组替换 / 全集查询 /
-  20505 拒未知工序 / 旧路径 4xx）
+- 集成测试：`tests/production/shelf_process.rs`（6 场景：整组替换 / 全集查询 /
+  20505 拒未知工序 / 旧路径 4xx / 2026-10-04 品检架 20104 / 2026-10-04 停用架 20512）
 - 错误码：`src/shared/error.rs::code`
 - 货架 CRUD：[`../shelves.md`](../shelves.md)

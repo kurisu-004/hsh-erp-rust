@@ -7,6 +7,27 @@
 //!
 //! 这里是 part → prod 依赖的反向证明：这层守卫只经 `status_gate` 写
 //! `t_part_batch.status`，不引用 part 域任何 service / vo。
+//!
+//! 2026-10-04 起本文件不再只服务 `prod::batch`：`prod::shelf_process`（建映射时的 zone
+//! 守卫）与 `prod::worker_pool`（WORKER→POOL 放回时的货架守卫）两个**同域**跨模块
+//! caller 也调 [`validate_shelf_zone`]。新增 caller 时**必须**调本函数而不要复制判序 ——
+//! 判序（20501 存在 → 20512 停用 → 20104 zone）与文案只有一份，是 2026-10-04 那次
+//! 「`current_holder_id` 写脏」修复的核心：3 个写点各写各的守卫时，其中一个漏了
+//! `t_shelf` 侧谓词就足以让批次落到品检架上并从此静默漏件。
+//!
+//! 2026-10-04 review 第 1 轮 I1：**不要**给 `prod::batch::service::worker_scan` 的
+//! RETURNED 分支再加一道货架守卫。它在 `worker_scan_event` 的第 1 步（`event_type`
+//! 分支**之前**）已经用 `ShelfRepo::get_by_id_zone(req.shelf_id, "PRODUCTION")` 一步
+//! 守掉存在 / 软删 / 停用 / zone 四个谓词（`shelf::repo::sql` 的 WHERE 是
+//! `id=$1 AND zone=$2 AND is_active=true AND deleted_at IS NULL`），而写进
+//! `current_holder_id` 的正是同一个 `req.shelf_id`。
+//!
+//! `current_holder_id`（= 货架）的写点全仓恰好 3 个，本批全部覆盖、无遗留：
+//! ① `dispatch_single`（`update_batch_dispatched`，货架由
+//! `find_first_shelf_for_process` 从映射里**选出** ⇒ 谓词下沉到该方法的 SQL）；
+//! ② `move_batch` WORKER→POOL（`worker_pool::service`，货架来自请求 ⇒
+//! `validate_shelf_zone`）；③ `worker_scan` RETURNED（货架来自请求 ⇒ 已有的
+//! `get_by_id_zone`）。改任一处都请先回到这条清单核对。
 
 use sqlx::PgConnection;
 

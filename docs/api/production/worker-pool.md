@@ -156,6 +156,10 @@ Request：`MoveRequest`
 > | `to.kind=POOL` 的「货架必须映射 batch 当前工序」 | 跳过 | **执行** → 未映射则 `20507 BIZ_SHELF_PROCESS_NOT_MAPPED` |
 >
 > 这是**修正漏检**（原本应校验而未校验），但既有前端流程可能因此开始收到上述两个错误码。
+>
+> ⚠️ 2026-10-04 补：上表只覆盖**映射**校验（依赖 `current_process_id`）。**货架本身**
+> 的校验（存在 / 停用 / `zone='PRODUCTION'`）自 2026-10-04 起是**无条件**执行的
+> —— 即便 `current_process_id IS NULL` 也会守，详见下方「`to` 校验」小节。
 
 > **(2) worker-scan RETURNED 现在会推进 `current_process_id`**
 >
@@ -177,8 +181,35 @@ Request：`MoveRequest`
 
 | `to.kind` | 校验 |
 |---|---|
-| `POOL`   | `t_shelf_process WHERE shelf_id = $x AND process_id = $batch.current_process_id` 必须 ≥1 条（货架必须映射到 batch 当前工序；**2026-09-30 改直读 `current_process_id`**，原先是 `current_process_step_id` → step JOIN） |
+| `POOL`   | **2026-10-04 起无条件**先校验货架本身：`prod::batch::service::guard::validate_shelf_zone(shelf_id, "PRODUCTION")` —— 不存在/已软删 → `20501`、`is_active=false` → `20512`、`zone≠'PRODUCTION'` → `20104`。再校验映射：`t_shelf_process WHERE shelf_id = $x AND process_id = $batch.current_process_id` 必须 ≥1 条（**2026-09-30 改直读 `current_process_id`**，原先是 `current_process_step_id` → step JOIN）；仅当 `current_process_id IS NOT NULL` 时执行 |
 | `WORKER` | worker 必须 `is_active=true`；worker 的工种必须含 batch 当前工序；`held < work_type.max_held_batches`（容量上限） |
+
+> **`to.kind=POOL` 的货架守卫（2026-10-04 新增）**
+>
+> 该分支把 `to.shelf_id` 写进 `t_part_batch.current_holder_id` 并把 `location` 翻成
+> `PRODUCTION_SHELF`。收紧前**只在** `current_process_id` 非空时才校验货架↔工序映射，
+> 且任何情况下都不校验货架本身（存在性 / 软删 / 停用 / zone 全无）—— 即
+> `current_process_id IS NULL` 的批次（本域唯一一条「完全零校验」的路径）能落进任意货架。
+>
+> 现改为**无条件**走 `validate_shelf_zone(.., "PRODUCTION")`，与 `place_on_shelf` /
+> `pickup` / `release_from_programming` / 外协收发等生产流端点**同源同码**
+> （20501 → 20512 → 20104）。**映射**校验仍只在 `current_process_id` 非空时执行：
+> `None` 意味着没有 process_id 可比，若改成硬拒会把「管理员手动把卡住的批次放回货架」
+> 这条自救路径一并堵死；且其对应的存量脏数据排查见
+> [`./shelf-process-mapping.md`](./shelf-process-mapping.md) 的「只读诊断 SQL」。
+>
+> **为什么值得守**：脏 holder 的后果是**静默漏件**——报工台取件页数据源
+> （`GET /api/v2/parts/pickable-by-work-type/{work_type_id}`）取行 SQL 硬限定
+> `JOIN t_shelf sh ON sh.id = b.current_holder_id AND sh.is_active = true
+> AND sh.zone = 'PRODUCTION'`，故落到品检架 / 停用架 / 已软删架上的批次永远不会被工人
+> 领到，也不报错。
+>
+> **为什么本端点不加 `can_access_shelf` / 40301 scope 校验**：角色白名单是 Manager 独占
+> （`require_role(Role::Manager)`，无 `require_any_role` 分支），而
+> `CurrentUser::can_access_shelf` 的实现是
+> `shelf_wildcard || shelf_ids.contains(id) || has_role(Role::Manager)` —— 对本端点的
+> **每一个** caller 恒为 true，加上去是可证明的死代码。scope 收窄只对 SHELF_ACCOUNT
+> 有意义，而 SHELF_ACCOUNT 进不来本端点。
 
 业务流转（service `move_batch`）：
 
@@ -187,7 +218,7 @@ Request：`MoveRequest`
 3. 取 batch（`include_deleted=false`）；不存在 → `20121 BIZ_BATCH_NOT_FOUND`
 4. 校验 `status='IN_PROCESS'` → 否则 `20120 BIZ_BATCH_INVALID_STATUS`
 5. 校验 `from` 与 batch 当前 `(location, holder_id)` 一致 → 否则 `20122 BIZ_BATCH_LOCATION_MISMATCH`
-6. 按 (from, to) 选 SQL 分支（见上表）+ `to` 校验（worker 资格 / 容量 / shelf 映射）
+6. 按 (from, to) 选 SQL 分支（见上表）+ `to` 校验（worker 资格 / 容量 / 货架 + 映射）
 7. 写 `MOVED` 事件日志（note 含 `move POOL→WORKER` / `WORKER→POOL` / `WORKER→WORKER` 或 caller 自定义）
 8. `PartService::sync_from_batch_change_with_conn` 同步 part 派生列
 9. 返回 `MoveResult`
@@ -203,7 +234,9 @@ Response 200 `data`：[`MoveResult`](#moveresult-字段2026-09-30-新增取代�
 - **20202 BIZ_WORKER_INACTIVE**（HTTP 409）—— `to` worker 已停用
 - **20204 BIZ_WORKER_HOLD_LIMIT_EXCEEDED**（HTTP 409）—— `to` worker 容量触顶
 - **20507 BIZ_SHELF_PROCESS_NOT_MAPPED**（HTTP 422）—— `to` 为 POOL 时 shelf 未映射 batch 当前工序
-- **20104 BIZ_INVALID_VALUE**（HTTP 400）—— `to` worker 工种不含 batch 当前工序
+- **20104 BIZ_INVALID_VALUE**（HTTP 400）—— `to` worker 工种不含 batch 当前工序；**2026-10-04 新增**：`to` 为 POOL 时 shelf `zone≠'PRODUCTION'`
+- **20501 BIZ_SHELF_NOT_FOUND**（HTTP 404）—— **2026-10-04 新增**：`to` 为 POOL 时 shelf 不存在 / 已软删
+- **20512 BIZ_SHELF_INACTIVE**（HTTP 400）—— **2026-10-04 新增**：`to` 为 POOL 时 shelf `is_active=false`
 - **40001 VALIDATION_ERROR**（HTTP 422）—— POOL→POOL 同 kind 移动 / WORKER→WORKER src==dst / payload shape 错
 - **40300 FORBIDDEN** —— 非 Manager
 - **40901 VERSION_CONFLICT** —— 并发写，乐观锁失败
@@ -607,6 +640,7 @@ JOIN t_part_batch + t_part + t_customer L1+L2 + t_applicant + t_shelf 一把拉�
 - ✅ 2026-09-11 part-worker-pool-federated-rocket：新增 `auto_allocate_for_process` + 端点 `POST /admin/worker-pool/auto-allocate` + COUNT/TIME 模式 + fill_ratio 校验（20704）；错误码段 20701/20702/20703/20704
 - ✅ 2026-09-14 follow-up-ux：`WorkerPoolState` 新增 `held_batches` 字段（`list_held_by_worker_with_part` JOIN t_part 取全量）+ 新增 `POST /admin/worker-pool/assign` 端点（单 batch 拖拽分配，service `assign_batch_to_worker`）+ `WorkerPoolRepo::take_specific_from_pool`（单 SQL 限定 `(shelf_id, batch_id)` 原子切换 holder）；错误码沿用既有 20204 / 20114 / 20104
 - ✅ 2026-10-04：`GET /pool/state` 的 `shelf_id` 由必填 `i64` 降为可选 `Option<i64>`。该参数在 `compute_state` 内只有一个用途 —— 逐工序算「某货架 × 某工序」候选池计数（`count_pool_by_shelf_and_process`）；`held_batches` / `max_held` / `current_held` / `capacity_remaining` 均与货架无关。**缺省语义**：`shelf_id = None` → 跳过计数查询，`pool_count_by_process` 返空数组。缘由：iam 侧只给 SHELF_ACCOUNT + 货架 scope 的角色返 `shelf_ids`，前端把该参数接在 `auth.activeShelfId` 上后对 MANAGER / CLERK / INSPECTOR 恒为空、工人持有列表恒空。**向后兼容**：老前端继续传 `shelf_id` 走原 `Some` 分支，响应逐字不变 ⇒ 部署顺序后端先上
+- ✅ 2026-10-04（`current_holder_id` 写脏守卫）：`move_batch` 的 WORKER→POOL 分支**无条件**校验 `to.shelf_id`（`validate_shelf_zone(.., "PRODUCTION")`）。新增错误码 0 个 —— 20501 / 20512 / 20104 全是既有码，与 place_on_shelf / pickup / outsource 等生产流端点同源（2026-10-04 review 第 2 轮 N2：原文写「6 个生产流端点」，该数字在本次收紧新增 2 个 caller 后即已过期，故不写数字）。收紧前该分支仅在 `current_process_id` 非空时校验映射、且从不校验货架本身。回归见 `tests/production/worker_pool.rs::move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes` / `::move_worker_to_pool_validates_shelf_when_batch_has_no_process`
 - ⏳ 未上线：`WorkerRepo` 列表 / 创建 / 软删等 CRUD（worker 域当前仅供 worker_pool / prod batches worker-scan 复用）
 
 ## 参考
