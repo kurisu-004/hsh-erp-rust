@@ -112,16 +112,18 @@ pub struct RedisConfig {
 /// ## 2026-09-23 重构要点（HS256 → RS256 + kid）
 /// - `signing_kid` / `private_key` / `public_keys` / `allow_hs256_fallback` 4 字段
 ///   本轮新增，详见字段 doc。
-/// - `secret` 字段保留：HS256 fallback 过渡期 decode 端仍按 `allow_hs256_fallback=true`
-///   走 secret 验签；签发端永不产出 HS256 token。下轮 cleanup PR 删除 secret + fallback 路径。
+/// - `secret` 字段保留：`allow_hs256_fallback=true` 时 decode 端仍走 secret 验签；
+///   签发端永不产出 HS256 token。2026-10-04 起该开关缺省改为 false（见字段 doc）。
 /// - 启动期严格校验：`JWT_PRIVATE_KEY_PATH` / `JWT_PUBLIC_KEYS_DIR` / `signing_kid ∈ public_keys`
 ///   任何一项缺失或格式错误即 bail（fail-fast，避免运行时才发现签不出/发不出对应 kid）。
 #[derive(Clone, Debug)]
 pub struct JwtConfig {
-    /// 2026-09-23 重构：HS256 fallback 过渡期仍占用。**签发端不再使用**（encode 强制
-    /// RS256），仅作为 `decode_access` / `decode_refresh` 在 `allow_hs256_fallback=true`
+    /// HS256 fallback 的验签 secret。**签发端不使用**（encode 强制 RS256）。
+    /// 仅作为 `decode_access` / `decode_refresh` 在 `allow_hs256_fallback=true`
     /// 时对历史 HS256 token 的验签 secret。环境变量 `JWT_SECRET`，仅在
-    /// `allow_hs256_fallback=true` 时必填；下轮 cleanup PR 删除。
+    /// `allow_hs256_fallback=true` 时必填。
+    /// 2026-10-04 起 `allow_hs256_fallback` 缺省为 false，本字段在默认配置下
+    /// 恒为空串且无人读取（生产/staging/local 三份 compose 均已删除 JWT_SECRET）。
     pub secret: String,
     pub issuer: String,
     /// JWT `aud` 校验目标（2026-09-22 新增：删 Python v1 兼容后 Rust 自签 token 强绑定 audience）。
@@ -137,10 +139,10 @@ pub struct JwtConfig {
     ///   生产构建中这是 RS256 私钥；签发端不再走 HS256 secret。
     /// - `public_keys`：从 `JWT_PUBLIC_KEYS_DIR`（必填）目录扫描 `*.pem`，kid = 文件名
     ///   去后缀（同一目录 kid 必须唯一）。`BTreeMap` 保证按 kid 字典序遍历，便于审计。
-    /// - `allow_hs256_fallback`：环境变量 `JWT_ALLOW_HS256_FALLBACK`，缺省 `true`；
-    ///   `true` 时 `secret` 必填且 `decode_access` / `decode_refresh` 接受 HS256 token
-    ///   走 `secret` 验签；`false` 时仅 RS256。HS256 fallback 段写明过渡期保留，
-    ///   下轮 cleanup PR 删除。
+    /// - `allow_hs256_fallback`：环境变量 `JWT_ALLOW_HS256_FALLBACK`，缺省 `false`
+    ///   （2026-10-04 由 true 收紧）。`false` 时仅 RS256，HS256 token 一律 40100；
+    ///   `true` 时 `secret` 变必填且 `decode_access` / `decode_refresh` 接受 HS256 token
+    ///   走 `secret` 验签 —— 仅供紧急回滚，全链路已无 HS256 token 的生产者。
     pub signing_kid: String,
     pub private_key: EncodingKey,
     pub public_keys: BTreeMap<String, DecodingKey>,
@@ -414,15 +416,18 @@ impl AppConfig {
                 //    后缀；kid 唯一性校验；目录不存在 bail
                 // 3. JWT_SIGNING_KID 必须在 public_keys 字典内（启动期断言：签发端
                 //    kid 必须有对应公钥），缺失 bail
-                // 4. JWT_ALLOW_HS256_FALLBACK=true（默认）：保留 HS256 fallback 能力，
-                //    此时 JWT_SECRET 仍必填（decode 走 secret 验签）；false：仅 RS256，
-                //    JWT_SECRET 可省略（HS256 token 一律 40100）
+                // 4. JWT_ALLOW_HS256_FALLBACK（缺省 false）：false 时仅 RS256，
+                //    JWT_SECRET 可省略（HS256 token 一律 40100）；true 才恢复
+                //    历史 HS256 token 的验签能力，此时 JWT_SECRET 变回必填。
                 //
-                // HS256 fallback 段：过渡期保留——decode_access / decode_refresh 按
-                // header.alg 分支，HS256 仅在 allow_hs256_fallback=true 且
-                // hs256_fallback_secret.is_some() 时走 secret 验签；签发端永不产出
-                // HS256 token。下轮 cleanup PR（next iteration）删除 secret 字段 +
-                // fallback 路径。
+                // HS256 fallback 段：2026-10-04 起默认关闭。签发端自 2026-09-23 起
+                // 只产 RS256，v1 python 端 IAM 已下线也不再签发 token，全链路已无
+                // HS256 token 的生产者，fallback 只是一条无人走的历史兼容分支。
+                // 缺省值取 false 而非 true 是刻意的：此前缺省 true 时，任何漏配
+                // JWT_ALLOW_HS256_FALLBACK 的环境（staging / prod 的 compose 就漏配过）
+                // 都会默默开着 HS256 验签口。代码缺省与部署配置必须同向收紧。
+                // decode_access / decode_refresh 的 header.alg 分支与 secret 字段
+                // 仍保留（显式置 true 可回滚），彻底删除留待后续 cleanup。
                 let private_key_path = env_required("JWT_PRIVATE_KEY_PATH")?;
                 let private_key = load_private_key(&private_key_path)
                     .with_context(|| format!("加载 JWT 私钥失败 ({private_key_path})"))?;
@@ -437,8 +442,11 @@ impl AppConfig {
                          把 {signing_kid}.pem 放进公钥目录"
                     ));
                 }
-                let allow_hs256_fallback = env_bool("JWT_ALLOW_HS256_FALLBACK", true)?;
-                // secret 在 HS256 fallback=true 时仍必填；false 时允许省略。
+                let allow_hs256_fallback = env_bool("JWT_ALLOW_HS256_FALLBACK", false)?;
+                // secret 在 HS256 fallback=true 时仍必填；false（缺省）时允许省略，
+                // 省略时为空串 —— 但空串绝不会被拿去验签：middleware.rs / session.rs
+                // 按 allow_hs256_fallback 决定传 Some(&secret) 还是 None，
+                // 传 None 时 decode_* 直接 40100（防「空 secret HMAC bypass」）。
                 let secret = if allow_hs256_fallback {
                     env_required("JWT_SECRET").context(
                         "JWT_ALLOW_HS256_FALLBACK=true 时 JWT_SECRET 必填（HS256 fallback 用）",
