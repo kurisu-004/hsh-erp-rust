@@ -72,6 +72,10 @@ pub struct AssemblyListOut {
 /// 2026-09-14 Phase 3（deferred #7）— `current_batch_id` 子件当前激活批次 id；
 /// 子件无活跃批次（如刚被 CANCELLED）时为 `None`。
 ///
+/// 2026-10-05 新增 `unit_price` / `total_price`（Decimal 序列化成 JSON 字符串，
+/// 与 `AssemblyOut` 同风格）：建单入参收子件价格后需要回显给前端核对，缺省落 0
+/// 不会是 NULL（两列 NOT NULL）。
+///
 /// 2026-09-22 PR4：迁移到 vo/。
 #[derive(Debug, Clone, Serialize)]
 pub struct AssemblyChildOut {
@@ -90,6 +94,8 @@ pub struct AssemblyChildOut {
     pub system_delivery_date: Option<NaiveDate>,
     pub is_urgent: bool,
     pub note: Option<String>,
+    pub unit_price: Option<Decimal>,
+    pub total_price: Option<Decimal>,
     #[serde(serialize_with = "serialize_i64_opt")]
     pub current_batch_id: Option<i64>,
 }

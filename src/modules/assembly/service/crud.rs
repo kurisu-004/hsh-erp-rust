@@ -4,8 +4,9 @@
 //!
 //! ## 业务约束（service 层 enforce）
 //! - 列表：`customer_id` 支持 L1 展开（recursive CTE，由 trait 提供）
-//! - 创建：`customer_id` 必须是 L2 叶子；子件 ≤ 99；PDF 页数 == children.len()+1；
-//!   有 PDF 时从 L1 customer.serial_prefix 派发序列号
+//! - 创建：`customer_id` 必须是 L2 叶子；子件 ≤ 99；**若提供** PDF 则页数 ==
+//!   children.len()+1；序列号从 L1 customer.serial_prefix 派发（与是否提供 PDF
+//!   无关）
 //! - 更新：customer_id 三态（None/Some(None)/Some(Some(v))）+ L2 校验；OCC；§3.2
 //!   级联覆盖父件到所有未软删子件（8 个共享信息字段）；§3.3 套数缩放
 //! - 软删：Manager only；OCC；终态守；预检子件挂送货单（PR-2 后 JOIN t_part_batch 查）
@@ -361,6 +362,8 @@ impl AssemblyService {
                     system_delivery_date: p.system_delivery_date,
                     is_urgent: p.is_urgent,
                     note: p.note,
+                    unit_price: Some(p.unit_price),
+                    total_price: Some(p.total_price),
                     current_batch_id: cb_id,
                 }
             })
@@ -392,13 +395,19 @@ impl AssemblyService {
     // 创建
     // =======================================================================
 
-    /// 创建：multipart PDF（可选） + 子件 + 序列号派发。
+    /// 创建：子件 + 序列号派发（PDF 可选，仅用于页数校验）。
     ///
     /// 关键校验：
     /// 1. `customer_id` 必须是 L2 叶子（`parent_id NOT NULL`）
     /// 2. 子件 ≤ 99（`BIZ_ASSEMBLY_TOO_MANY_CHILDREN`）
     /// 3. 若提供 PDF：页数 == `children.len() + 1`（首页 + 每子件 1 页）
-    /// 4. 若提供 PDF：从 L1 客户的 `serial_prefix` 派发序列号（无 prefix → `BIZ_CUSTOMER_NO_SERIAL_PREFIX`）
+    ///
+    /// 序列号与子件创建**与 PDF 无关**（2026-10-05）：一律从 L1 客户的
+    /// `serial_prefix` 派 `t_assembly.serial_no`，并为每个子件派生
+    /// `{asm_serial}-{i:02d}`。PDF 在本端点从不入库（只数页），此前把派发与
+    /// 建子件挂在「有没有传 PDF」上，等于「不传 PDF 的建单拿不到序列号、子件
+    /// 也不建」——而前端 PDF 批量上传默认不发 PDF，于是装配件建出来只有父件、
+    /// 序列号全 NULL。
     pub async fn create_assembly_inner<R: AssemblyRepoTrait>(
         &self,
         mut repo: R,
@@ -436,8 +445,11 @@ impl AssemblyService {
             ));
         }
 
-        // 3. PDF 校验（如果提供）：首份 PDF 页数 == children.len() + 1
-        let page_count_opt = if !pdf_files.is_empty() {
+        // 3. PDF 校验（仅在提供时）：首份 PDF 页数 == children.len() + 1
+        //
+        // 页数校验**不**与派发/建子件耦合，但必须排在派发之前：它是纯入参校验，
+        // 失败时不该消耗序列号计数器（否则一次 20305 白烧一个号）。
+        if !pdf_files.is_empty() {
             // 当前只处理第一份 PDF（与分支一致）；其它累计忽略
             let pdf = &pdf_files[0];
             let doc = lopdf::Document::load_mem(pdf).map_err(|e| {
@@ -453,37 +465,14 @@ impl AssemblyService {
                     ),
                 ));
             }
-            Some(page_count as i32)
-        } else {
-            None
-        };
+        }
 
-        // 4. 派发 serial（仅在有 PDF 时拿 serial）
-        let (serial_no, prefix) = if pdf_files.is_empty() {
-            (None, None)
-        } else {
-            // 取 L1 客户的 serial_prefix 首字母（约定 L1 customer 必有 serial_prefix）
-            let l1_id = repo
-                .fetch_customer_l1_id(customer_id)
-                .await
-                .map_err(AppError::from)?
-                .ok_or_else(|| AppError::biz(code::BIZ_CUSTOMER_NOT_FOUND, "customer 不存在"))?;
-            let prefix_str = repo
-                .fetch_customer_serial_prefix(l1_id)
-                .await
-                .map_err(AppError::from)?
-                .ok_or_else(|| {
-                    AppError::biz(
-                        code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
-                        "L1 客户无 serial_prefix",
-                    )
-                })?;
-            let ch = prefix_str
-                .chars()
-                .next()
-                .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "serial_prefix 为空"))?;
-            (Some(repo.acquire_serial(ch).await?), Some(ch))
-        };
+        // 4. 无条件派发 serial（与是否提供 PDF 无关）
+        //
+        // L1 折叠 + prefix 校验走 `shared::serial::prefix_for_customer`（与 part
+        // 域建单同一入口），`acquire_serial` 走 `shared::serial::acquire`。
+        let serial_prefix = repo.serial_prefix_for_customer(customer_id).await?;
+        let serial_no = repo.acquire_serial(serial_prefix).await?;
 
         // 5. INSERT t_assembly
         //
@@ -504,7 +493,7 @@ impl AssemblyService {
             is_urgent: req.is_urgent.unwrap_or(false),
             status: "PENDING",
             version: 0,
-            serial_no: serial_no.as_deref(),
+            serial_no: Some(serial_no.as_str()),
             quantity: req.quantity.unwrap_or(1),
             unit_price: req.unit_price.or(Some(Decimal::ZERO)),
             total_price: req.total_price.or(Some(Decimal::ZERO)),
@@ -515,7 +504,7 @@ impl AssemblyService {
         };
         repo.insert(new).await.map_err(AppError::from)?;
 
-        // 6. 插入子件（如有 PDF，则带 serial_no 派生 `{asm_serial}-{i:02d}`）
+        // 6. 插入子件（serial_no 派生 `{asm_serial}-{i:02d}`）
         //
         // 子件字段继承父件（§3.1）：applicant_name/request_date/order_no/system_delivery_date/
         // is_urgent/note 由父件直接继承；planned_delivery_date 子件入参优先，缺省继承父件。
@@ -526,57 +515,60 @@ impl AssemblyService {
         let parent_planned_delivery_date = req.planned_delivery_date.unwrap_or(today);
         let parent_is_urgent = req.is_urgent.unwrap_or(false);
         let mut created_children_out: Vec<AssemblyChildOut> = Vec::new();
-        if let (Some(asm_serial), Some(_)) = (serial_no.as_ref(), prefix) {
-            for (i, ch) in req.children.iter().enumerate() {
-                let child_id = snowflake.next_id();
-                let initial_batch_id = snowflake.next_id();
-                let child_serial = format!("{}-{:02}", asm_serial, i + 1);
-                let child_qty = ch.quantity.unwrap_or(1);
-                let child_planned = ch
-                    .planned_delivery_date
-                    .or(Some(parent_planned_delivery_date));
-                let _ = page_count_opt; // reserved for AssemblyFileRef follow-up
-                let inherit = ChildInheritFields {
-                    applicant_name: parent_applicant_name,
-                    request_date: parent_request_date,
-                    order_no: req.order_no.as_deref(),
-                    system_delivery_date: req.system_delivery_date,
-                    is_urgent: parent_is_urgent,
-                    note: req.note.as_deref(),
-                };
-                repo.insert_part_child_for_assembly(
-                    child_id,
-                    customer_id,
-                    asm_id,
-                    &child_serial,
-                    &ch.name,
-                    ch.drawing_no.as_deref(),
-                    child_qty,
-                    child_planned,
-                    inherit,
-                    current.id,
-                    initial_batch_id,
-                )
-                .await
-                .map_err(AppError::from)?;
-                created_children_out.push(AssemblyChildOut {
-                    id: child_id,
-                    serial_no: Some(child_serial),
-                    name: ch.name.clone(),
-                    drawing_no: ch.drawing_no.clone(),
-                    status: "PENDING".into(),
-                    version: 0,
-                    quantity: child_qty,
-                    planned_delivery_date: child_planned,
-                    applicant_name: parent_applicant_name.to_string(),
-                    request_date: parent_request_date,
-                    order_no: req.order_no.clone(),
-                    system_delivery_date: req.system_delivery_date,
-                    is_urgent: parent_is_urgent,
-                    note: req.note.clone(),
-                    current_batch_id: Some(initial_batch_id),
-                });
-            }
+        for (i, ch) in req.children.iter().enumerate() {
+            let child_id = snowflake.next_id();
+            let initial_batch_id = snowflake.next_id();
+            let child_serial = format!("{}-{:02}", serial_no, i + 1);
+            let child_qty = ch.quantity.unwrap_or(1);
+            let child_planned = ch
+                .planned_delivery_date
+                .or(Some(parent_planned_delivery_date));
+            let inherit = ChildInheritFields {
+                applicant_name: parent_applicant_name,
+                request_date: parent_request_date,
+                order_no: req.order_no.as_deref(),
+                system_delivery_date: req.system_delivery_date,
+                is_urgent: parent_is_urgent,
+                note: req.note.as_deref(),
+            };
+            repo.insert_part_child_for_assembly(
+                child_id,
+                customer_id,
+                asm_id,
+                &child_serial,
+                &ch.name,
+                ch.drawing_no.as_deref(),
+                child_qty,
+                child_planned,
+                ch.unit_price,
+                ch.total_price,
+                inherit,
+                current.id,
+                initial_batch_id,
+            )
+            .await
+            .map_err(AppError::from)?;
+            // 缺省价格在 DB 侧 `COALESCE(·, 0)` 落 0（两列 NOT NULL），回显同步补 0
+            // —— 响应要与 DB 落库值一致，前端据此核对金额。
+            created_children_out.push(AssemblyChildOut {
+                id: child_id,
+                serial_no: Some(child_serial),
+                name: ch.name.clone(),
+                drawing_no: ch.drawing_no.clone(),
+                status: "PENDING".into(),
+                version: 0,
+                quantity: child_qty,
+                planned_delivery_date: child_planned,
+                applicant_name: parent_applicant_name.to_string(),
+                request_date: parent_request_date,
+                order_no: req.order_no.clone(),
+                system_delivery_date: req.system_delivery_date,
+                is_urgent: parent_is_urgent,
+                note: req.note.clone(),
+                unit_price: Some(ch.unit_price.unwrap_or(Decimal::ZERO)),
+                total_price: Some(ch.total_price.unwrap_or(Decimal::ZERO)),
+                current_batch_id: Some(initial_batch_id),
+            });
         }
 
         // 7. 读回返回（用 `include_deleted=true` 兜底刚 INSERT 的可见性）

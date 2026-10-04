@@ -196,7 +196,7 @@ async fn upload_files_happy_path() {
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let cos = Arc::new(NoopCos);
 
-    // 建一个无 PDF 装配体（serial_no=None）
+    // 建一个不传 PDF 的装配体（建单端点仍会派发 serial_no，PDF 只用于页数校验）
     let mut tx = pool.begin().await.unwrap();
     let req = hsh_erp_rust::modules::assembly::dto::AssemblyCreateRequest {
         drawing_no: "D-AF-1".into(),
@@ -376,6 +376,8 @@ async fn soft_delete_has_shipment_returns_20307() {
             drawing_no: Some("D-SD-SHIP-01".into()),
             planned_delivery_date: None,
             quantity: Some(1),
+            unit_price: None,
+            total_price: None,
         }],
     };
     let current = test_current_user(vec![Role::Manager]);
@@ -503,6 +505,8 @@ async fn child_current_batch_id_in_detail() {
             drawing_no: Some("D-CB-01".into()),
             planned_delivery_date: None,
             quantity: Some(1),
+            unit_price: None,
+            total_price: None,
         }],
     };
     let current = test_current_user(vec![Role::Manager]);

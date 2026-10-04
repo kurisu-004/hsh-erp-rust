@@ -1,7 +1,8 @@
 //! assembly 域 集成测试 — 2026-09-25 新增 D-07 `POST /assemblies/{id}/children`
 //!
 //! 覆盖场景：
-//!   1. add_child_happy_path: 创建装配体后追加单个子件（继承父件 7 个共享字段 + initial batch）
+//!   1. add_child_happy_path: 创建装配体后追加单个子件（继承父件 7 个共享字段 + initial batch，
+//!      且 `serial_no` 恒为 NULL —— 详情页补件不重新打开派发通道）
 //!   2. add_child_assembly_not_found: 不存在的 assembly_id → 20301
 //!   3. add_child_validation_error: drawing_no 空 / name 空 / quantity<=0 → 40001
 
@@ -185,7 +186,10 @@ async fn add_child_happy_path() {
     assert_eq!(child.order_no.as_deref(), Some("CH-ORDER-001"));
     assert_eq!(child.note.as_deref(), Some("加急备注"));
     assert!(!child.is_urgent);
-    assert!(child.serial_no.is_none(), "无 PDF 路径 → serial_no = NULL");
+    assert!(
+        child.serial_no.is_none(),
+        "POST /assemblies/{{id}}/children 是补件语义，不派生 serial_no（与建单端点是否传 PDF 无关）"
+    );
     assert_eq!(
         child.customer_name.as_deref(),
         Some("子客CH-1"),
@@ -193,16 +197,21 @@ async fn add_child_happy_path() {
     );
 
     // 4. DB 验证 t_part 行（独立读）
-    let row: (
-        String,
-        Option<String>,
-        Option<String>,
-        i32,
-        i64,
-        Option<i64>,
-        bool,
-    ) = sqlx::query_as(
-        "SELECT name, order_no, note, quantity, customer_id, assembly_id, is_urgent \
+    //
+    // 8 元组超 `clippy::type_complexity` 阈值，按仓库范式抽 type alias（见 api.rs）。
+    #[allow(clippy::type_complexity)]
+    type ChildPartRow = (
+        String,         // name
+        Option<String>, // order_no
+        Option<String>, // note
+        i32,            // quantity
+        i64,            // customer_id
+        Option<i64>,    // assembly_id
+        bool,           // is_urgent
+        Option<String>, // serial_no（补件语义恒 NULL）
+    );
+    let row: ChildPartRow = sqlx::query_as(
+        "SELECT name, order_no, note, quantity, customer_id, assembly_id, is_urgent, serial_no \
          FROM t_part WHERE id = $1",
     )
     .bind(child.id)
@@ -216,6 +225,7 @@ async fn add_child_happy_path() {
     assert_eq!(row.4, l2);
     assert_eq!(row.5, Some(asm_id));
     assert!(!row.6);
+    assert!(row.7.is_none(), "DB 侧补件子件 serial_no 也必须是 NULL");
 
     // 5. 验证初始 t_part_batch 插入（batch_no=1 / status='PENDING'）
     let batch_row: (i32, String) = sqlx::query_as(

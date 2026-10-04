@@ -4,7 +4,7 @@
 //! 私有 helpers：l1/l2 customer fixture、serial counter、PDF fixture。
 //!
 //! ## 覆盖（Task 8 + Task 3）
-//!   1. create_without_pdf_creates_empty_assembly     — 无 PDF → serial_no=None + 0 子件
+//!   1. create_without_pdf_dispatches_serial_no        — 无 PDF → 仍派 serial + 0 子件
 //!   2. create_with_pdf_creates_children_with_serial_pattern
 //!      — 3 页 PDF + 2 children → F0000001 / F0000001-01 / F0000001-02
 //!   3. create_pdf_page_mismatch_returns_20305       — 2 页 PDF + 2 children → 20305
@@ -198,9 +198,11 @@ fn test_current_user() -> CurrentUser {
 //  Tests
 // ===========================================================================
 
-/// 1. 无 PDF：service 不派发 serial，不插 children；assembly.serial_no = None。
+/// 1. 无 PDF：仍派发 serial（本用例 `children` 为空 ⇒ 0 子件）。
+///
+/// 无条件派发 + 无条件建子件的端到端覆盖见 `create_serial_price.rs`。
 #[tokio::test]
-async fn create_without_pdf_creates_empty_assembly() {
+async fn create_without_pdf_dispatches_serial_no() {
     let (pool, _fx) = setup().await;
     let l1 = insert_l1_customer(&pool, "客户A", "F").await;
     let l2 = insert_l2_customer(&pool, "子客A", l1).await;
@@ -232,12 +234,13 @@ async fn create_without_pdf_creates_empty_assembly() {
     tx.commit().await.unwrap();
 
     assert_eq!(
-        out.assembly.serial_no, None,
-        "无 PDF 时装配体不应有 serial_no"
+        out.assembly.serial_no.as_deref(),
+        Some("F0000001"),
+        "序列号派发与是否提供 PDF 无关"
     );
     assert!(
         out.created_children.is_empty(),
-        "无 PDF 时不应创建任何 children：got {:?}",
+        "children 为空时不应创建任何 children：got {:?}",
         out.created_children
     );
     assert_eq!(out.assembly.drawing_no, "D001");
@@ -283,12 +286,16 @@ async fn create_with_pdf_creates_children_with_serial_pattern() {
                 drawing_no: Some("D002-01".into()),
                 planned_delivery_date: None,
                 quantity: Some(1),
+                unit_price: None,
+                total_price: None,
             },
             AssemblyChildRequest {
                 name: "零件-2".into(),
                 drawing_no: Some("D002-02".into()),
                 planned_delivery_date: None,
                 quantity: Some(2),
+                unit_price: None,
+                total_price: None,
             },
         ],
     };
@@ -429,12 +436,16 @@ async fn create_pdf_page_mismatch_returns_20305() {
                 drawing_no: None,
                 planned_delivery_date: None,
                 quantity: Some(1),
+                unit_price: None,
+                total_price: None,
             },
             AssemblyChildRequest {
                 name: "c2".into(),
                 drawing_no: None,
                 planned_delivery_date: None,
                 quantity: Some(1),
+                unit_price: None,
+                total_price: None,
             },
         ], // 期望 PDF 页数 = 2 + 1 = 3，但实际是 2 → mismatch
     };
@@ -471,6 +482,8 @@ async fn create_too_many_children_returns_20303() {
             drawing_no: None,
             planned_delivery_date: None,
             quantity: Some(1),
+            unit_price: None,
+            total_price: None,
         })
         .collect();
 
@@ -814,11 +827,10 @@ async fn soft_delete_blocks_terminal_states() {
 ///      request_date/planned_delivery_date/unit_price/total_price）；
 ///    - `created_at` / `updated_at` 走 DB 默认 `now()`；
 ///    - `created_by` 由 service 显式写 `current.id`；
-///    - `serial_no` 无 PDF 时为 NULL。
+///    - `serial_no` 无条件派发（无 PDF 也派）。
 ///
 /// 适配：brief 用 `customer_id: 1` 不存在也非 L2，本测试按既有模式 insert l1+l2 fixture；
-/// created_at/updated_at 用 `chrono::NaiveDateTime`（非 Option，DB NOT NULL）；
-/// serial_no 走 Option<String>（无 PDF 时为 None）。
+/// created_at/updated_at 用 `chrono::NaiveDateTime`（非 Option，DB NOT NULL）。
 #[tokio::test]
 async fn create_assembly_default_not_null_columns() {
     let (pool, _fx) = setup().await;
@@ -862,7 +874,7 @@ async fn create_assembly_default_not_null_columns() {
         chrono::NaiveDateTime, // updated_at NOT NULL
         Option<i64>,           // created_by
         Option<i64>,           // updated_by
-        Option<String>,        // serial_no (无 PDF → NULL)
+        Option<String>,        // serial_no（建单即派发）
         chrono::NaiveDate,     // request_date NOT NULL
         chrono::NaiveDate,     // planned_delivery_date NOT NULL
         bool,                  // is_urgent NOT NULL
@@ -897,7 +909,11 @@ async fn create_assembly_default_not_null_columns() {
         row.5.is_none(),
         "updated_by 在 INSERT 阶段保持 NULL（service 不写）"
     );
-    assert!(row.6.is_none(), "无 PDF → serial_no 应为 NULL");
+    assert_eq!(
+        row.6.as_deref(),
+        Some("F0000001"),
+        "序列号无条件派发（与是否提供 PDF 无关）"
+    );
     assert!(
         row.7 <= chrono::Local::now().date_naive(),
         "request_date 应被 service 填今天"
@@ -1069,12 +1085,16 @@ async fn update_assembly_cascades_shared_fields_to_children() {
                 drawing_no: Some("CASC-D-1".into()),
                 planned_delivery_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap()),
                 quantity: Some(3),
+                unit_price: None,
+                total_price: None,
             },
             AssemblyChildRequest {
                 name: "c-2".into(),
                 drawing_no: Some("CASC-D-2".into()),
                 planned_delivery_date: None,
                 quantity: Some(5),
+                unit_price: None,
+                total_price: None,
             },
         ],
     };
@@ -1197,18 +1217,24 @@ async fn update_assembly_scales_child_quantities() {
                 drawing_no: Some("SCALE-D-1".into()),
                 planned_delivery_date: None,
                 quantity: Some(3),
+                unit_price: None,
+                total_price: None,
             },
             AssemblyChildRequest {
                 name: "c-2".into(),
                 drawing_no: Some("SCALE-D-2".into()),
                 planned_delivery_date: None,
                 quantity: Some(4),
+                unit_price: None,
+                total_price: None,
             },
             AssemblyChildRequest {
                 name: "c-3".into(),
                 drawing_no: Some("SCALE-D-3".into()),
                 planned_delivery_date: None,
                 quantity: Some(5),
+                unit_price: None,
+                total_price: None,
             },
         ],
     };
@@ -1404,18 +1430,24 @@ async fn update_assembly_scales_child_quantities_rounding_and_floor() {
                 drawing_no: Some("RD-D-1".into()),
                 planned_delivery_date: None,
                 quantity: Some(1),
+                unit_price: None,
+                total_price: None,
             },
             AssemblyChildRequest {
                 name: "c-2".into(),
                 drawing_no: Some("RD-D-2".into()),
                 planned_delivery_date: None,
                 quantity: Some(2),
+                unit_price: None,
+                total_price: None,
             },
             AssemblyChildRequest {
                 name: "c-3".into(),
                 drawing_no: Some("RD-D-3".into()),
                 planned_delivery_date: None,
                 quantity: Some(1),
+                unit_price: None,
+                total_price: None,
             },
         ],
     };

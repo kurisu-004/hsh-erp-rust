@@ -41,6 +41,16 @@ pub struct AssemblyListQuery {
     pub offset: Option<i64>,
 }
 
+/// `POST /api/v2/assemblies` 的单个子件入参。
+///
+/// 2026-10-05 新增 `unit_price` / `total_price`：此前子件价格被 repo 层写死
+/// `0`，建单入参里的子件金额静默丢失（父件 `AssemblyCreateRequest` 早有这两个
+/// 字段，子件侧缺）。`None` 由 SQL 侧 `COALESCE(·, 0)` 落 0 —— `t_part` 两列是
+/// `NUMERIC(12,2)` / `NUMERIC(14,2) NOT NULL DEFAULT 0`，列出现在 INSERT 列清单里
+/// 就不走 DB DEFAULT。
+///
+/// ⚠️ `rust_decimal` 启的是 `serde-with-str`：这两个字段**只接受 JSON 字符串**
+/// （`"12.50"`），传裸数字反序列化失败。
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssemblyChildRequest {
     pub name: String,
@@ -50,6 +60,10 @@ pub struct AssemblyChildRequest {
     pub planned_delivery_date: Option<NaiveDate>,
     #[serde(default = "default_child_qty")]
     pub quantity: Option<i32>,
+    #[serde(default)]
+    pub unit_price: Option<Decimal>,
+    #[serde(default)]
+    pub total_price: Option<Decimal>,
 }
 
 fn default_child_qty() -> Option<i32> {

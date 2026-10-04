@@ -60,12 +60,13 @@ Multipart body：
 | 字段 | content-type | 必填 | 说明 |
 |---|---|---|---|
 | `data` | text/plain | ✓ | 文本字段，序列化的 `AssemblyCreateRequest` JSON |
-| `files` | application/pdf | — | 可多个 PDF 二进制；**当前只处理首份**（与分支一致）做页数校验 |
+| `files` / `file` | application/pdf | — | 可多个 PDF 二进制；两个字段名**等价**（都收，可混用）；**当前只处理首份**做页数校验 |
 
 **Multipart 严格校验**：
 
-- 必须恰好含一个 `data` 字段（缺 / 多 / 其它字段名一律 40001）
+- 必须恰好含一个 `data` 字段（缺 → 40001）
 - `data` 字段必须是合法 UTF-8 文本（无法解析为 JSON → 20104 INVALID_VALUE）
+- 其它字段名一律静默丢弃（与 `python-multipart` 行为对齐，不报 40001）
 
 **`data` JSON 字段表**：
 
@@ -79,21 +80,38 @@ Multipart body：
 | `planned_delivery_date` | date? | — | 计划交付日 |
 | `is_urgent` | bool? | — | 缺省 `false` |
 | `quantity` | i32? | — | 缺省 `1` |
-| `unit_price` | decimal? | — | 单价 |
-| `total_price` | decimal? | — | 总价 |
+| `unit_price` | decimal? | — | 单价（**JSON 字符串**，如 `"12.50"`；缺省 0） |
+| `total_price` | decimal? | — | 总价（**JSON 字符串**；缺省 0） |
 | `order_no` | string? | — | 订单号 |
 | `system_delivery_date` | date? | — | 系统派工日 |
 | `note` | string? | — | 备注 |
 | `children` | `AssemblyChildRequest`[] | — | 子件；≤ 99 个（超出 → 20303） |
+
+**`AssemblyChildRequest` 字段表**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | ✓ | 子件名 |
+| `drawing_no` | string? | — | 子件图号 |
+| `planned_delivery_date` | date? | — | 缺省继承父件（见 §3.1） |
+| `quantity` | i32? | — | 缺省 `1` |
+| `unit_price` | decimal? | — | 单价（**JSON 字符串**；缺省落 0） |
+| `total_price` | decimal? | — | 总价（**JSON 字符串**；缺省落 0） |
+
+> ⚠️ 两个价格字段（父件 / 子件同名）只接受 **JSON 字符串**（`serde-with-str`），传裸数字
+> 反序列化失败 → 20104。
 
 **业务流转**：
 
 1. 校验 `customer_id` 存在且为 L2 叶子（→ 20102 / 20302）
 2. 子件数量 ≤ 99（→ 20303）
 3. **若提供 PDF**：用 `lopdf::Document::load_mem` 解析首份；`page_count` 必须 == `children.len() + 1`（首页 + 每子件 1 页；不匹配 / 解析失败 → 20305）
-4. **若提供 PDF**：从 L1 客户的 `serial_prefix` 派发序列号（无 prefix → 20308；序列号池耗尽 → 20105；prefix 未注册 → 20108）
+4. 从 L1 客户的 `serial_prefix` 派发序列号（无 prefix → 20308；序列号池耗尽 → 20105；prefix 未注册 → 20108）
 5. INSERT `t_assembly`（`status='PENDING'`，`version=0`）
-6. **若提供 PDF 且 serial 已派发**：为每个 child 按 `{asm_serial}-{i:02d}` 派生 `serial_no`，INSERT `t_part`（同事务）
+6. 为每个 child 按 `{asm_serial}-{i:02d}` 派生 `serial_no`，INSERT `t_part`（同事务）
+
+> 第 3 步是纯入参校验，排在派发之前：页数不符时整单回滚，不消耗序列号计数器。
+> 第 4 / 6 步**与是否提供 PDF 无关**。PDF 在本端点只用于页数校验，**不入库**。
 
 **§3.1（2026-09-11）子件字段继承**：第 6 步 INSERT 子件时，子件从父件 `t_assembly` 继承以下字段（不在入参里也能正确建档）：
 
@@ -106,16 +124,14 @@ Multipart body：
 | `is_urgent` | 父件 `is_urgent` |
 | `note` | 父件 `note` |
 | `planned_delivery_date` | 子件入参优先；缺省继承父件 |
-| `customer_id` / `quantity` / `serial_no` | 现状不变（customer 继承父件；quantity 为实际加工数；serial `{asm_serial}-{i:02d}`） |
-| `unit_price` / `total_price` | 保持 0（本期不动价格语义） |
-
-> 保留「有 PDF 才派 serial、才建子件」的门槛；不在本期放开。
+| `customer_id` / `quantity` / `serial_no` | customer 继承父件；quantity 为实际加工数；serial `{asm_serial}-{i:02d}` |
+| `unit_price` / `total_price` | 子件入参优先；缺省落 0（两列 NOT NULL，不会是 NULL） |
 
 WS 广播（commit 后下发）：
 
 - `ASSEMBLY_CREATED` —— payload `{ assembly_id }`
 
-Response 201 `data`：[`AssemblyCreateResult](./index.md#assemblycreateresult-字段) — 含刚 INSERT 的 assembly 行 + 创建的子件列表（无 PDF 时 `created_children` 为空数组）。
+Response 201 `data`：[`AssemblyCreateResult](./index.md#assemblycreateresult-字段) — 含刚 INSERT 的 assembly 行 + 创建的子件列表（`children` 缺省 / 空数组时 `created_children` 为空数组）。
 
 错误码：
 
