@@ -54,6 +54,10 @@ use sqlx::PgConnection;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
 use crate::modules::part::service::PartService;
+// 2026-10-04：`move_batch` WORKER→POOL 分支改为无条件校验目标货架
+// （存在 / 停用 / `zone='PRODUCTION'`），与 place_on_shelf / pickup / outsource 等
+// 生产流端点共用同一守卫，同源同码（20501 / 20512 / 20104）。
+use crate::modules::prod::batch::service::guard::validate_shelf_zone;
 use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::modules::prod::worker_pool::repo::WorkerPoolRepoTrait;
 use crate::shared::error::{AppError, code};
@@ -350,6 +354,13 @@ impl WorkerPoolService {
         current: &CurrentUser,
     ) -> Result<MoveResult, AppError> {
         current.require_role(Role::Manager)?;
+        // ⚠️ 2026-10-04 判定：这里**刻意不加** `can_access_shelf` / 40301 scope 校验。
+        // `CurrentUser::can_access_shelf` 的实现是
+        // `shelf_wildcard || shelf_ids.contains(id) || has_role(Role::Manager)`
+        // —— 本端点角色白名单是 Manager 独占（`require_role(Role::Manager)`，无
+        // `require_any_role` 分支），故该判定对本端点的**每一个** caller 恒为 true，
+        // 加上去是可证明的死代码。scope 收窄只对 SHELF_ACCOUNT 有意义，而 SHELF_ACCOUNT
+        // 进不来本端点。
 
         let from_kind = match &req.from {
             MoveLocation::Pool { .. } => "POOL",
@@ -600,7 +611,17 @@ impl WorkerPoolService {
                 MoveLocation::Pool { shelf_id },
             ) => {
                 // WORKER → POOL：复用 part_mark_batch_returned（不写 step）
-                // shelf 映射校验：shelf 必须映射 batch 当前所属工序
+                //
+                // 2026-10-04 新增（`current_holder_id` 写脏缺口）：本分支把 `shelf_id`
+                // 直接写进 `t_part_batch.current_holder_id` 且 `location` 翻成
+                // `PRODUCTION_SHELF`，原先**只**在 `step_process_id` 是 `Some` 时校验
+                // 货架↔工序映射，且任何情况下都不校验货架本身。后果是静默漏件：报工台
+                // 取件页的取件 SQL 硬限定 `JOIN t_shelf sh ON sh.id = b.current_holder_id
+                // AND sh.is_active = true AND sh.zone = 'PRODUCTION'`，故落到品检架 /
+                // 停用架 / 已软删架上的批次永远不会被工人领到，也不报错。
+                // 下面改为**无条件**走 `validate_shelf_zone`（与 place_on_shelf / pickup /
+                // outsource 等 6 个生产流端点同源同码：20501 → 20512 → 20104）。
+                validate_shelf_zone(&mut *conn, *shelf_id, "PRODUCTION").await?;
                 if let Some(spid) = step_process_id {
                     // 2026-10-02 SQL 收口 + review 第 1 轮 M-6 改名：原内联
                     // `SELECT shelf_id FROM t_shelf_process WHERE shelf_id=$1 AND
@@ -619,6 +640,15 @@ impl WorkerPoolService {
                             format!("shelf {shelf_id} 未映射工序 {spid}（batch 当前工序）"),
                         ));
                     }
+                } else {
+                    // ⚠️ 2026-10-04 判定：`None` 分支**不**升级为硬拒。`None` =
+                    // `t_part_batch.current_process_id IS NULL`，即「在池/在工人手上但
+                    // 没有工序归属」的批次（migration 004 之前的存量 + 直接改库的历史
+                    // 脏数据）。此时**无从校验映射**（没有 process_id 可比），若改成
+                    // 拒收，管理员连「把卡住的批次手动放回货架」这条自救路径都会被堵死。
+                    // 故保留跳过映射校验，但货架本身的存在性 / 停用 / zone 已由上方
+                    // `validate_shelf_zone` 无条件守住 —— 本分支不再存在「完全不校验货架」
+                    // 的形态。
                 }
 
                 let rows = (&mut *conn)

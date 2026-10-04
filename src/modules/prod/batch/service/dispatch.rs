@@ -91,6 +91,8 @@ impl BatchService {
     /// 2. fetch batch → `None` → `BIZ_BATCH_NOT_FOUND` 抛错
     /// 3. 校验 `batch.status == 'PENDING'` → 否则 `BIZ_BATCH_INVALID_STATUS` 抛错
     /// 4. `find_first_shelf_for_process(target_process_id)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND` 抛错
+    ///    （2026-10-04：该方法已带 `t_shelf` 的 `deleted_at` / `is_active` / `zone='PRODUCTION'`
+    ///    守卫，故 `None` 含「有映射但货架全不可用」，仍复用 20508 不新造码）
     /// 5. `update_batch_dispatched`（OCC）→ 0 行 → `VERSION_CONFLICT` 抛错
     /// 6. `PartRepo::insert_part_event('PLACED_ON_SHELF')`
     ///
@@ -172,6 +174,12 @@ impl BatchService {
         // `t_shelf_process` SQL），现改调 SQL 真源
         // `prod::shelf_process::repo::ShelfProcessRepo::find_first_shelf_for_process`
         // （executor 泛型直接接住 `&mut PgConnection`，无需改事务上下文）。
+        //
+        // 2026-10-04：货源守卫下沉到该方法的 SQL（`JOIN t_shelf` + `deleted_at IS NULL`
+        // + `is_active` + `zone='PRODUCTION'`），故此处拿到的 `shelf_id` 一定是可被
+        // 报工台取件页取到的生产架。`None` 有两种成因（完全没配映射 / 配了但货架全
+        // 不可用），都收敛到既有的 20508，不新造错误码；文案要写全，否则运营会去查
+        // 错方向（以为只是漏配映射，实际是货架被停用 / 改成了品检架）。
         let shelf_id =
             ShelfProcessRepo::find_first_shelf_for_process(&mut *conn, target_process_id)
                 .await?
@@ -179,7 +187,8 @@ impl BatchService {
                     AppError::biz(
                         code::BIZ_SHELF_PROCESS_NOT_FOUND,
                         format!(
-                            "process {target_process_id} 未配置任何 active 货架映射（t_shelf_process 0 结果）"
+                            "process {target_process_id} 无可用货架映射（t_shelf_process 0 结果，\
+                             或命中的货架已软删 / 已停用 / 非 PRODUCTION 区）"
                         ),
                     )
                 })?;

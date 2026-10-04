@@ -30,6 +30,7 @@ use sqlx::PgConnection;
 
 use crate::auth::rbac::CurrentUser;
 use crate::infra::snowflake::SnowflakeIdGenerator;
+use crate::modules::prod::batch::service::guard::validate_shelf_zone;
 use crate::modules::prod::process::repo::ProcessRepo;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
@@ -50,7 +51,7 @@ pub struct ShelfProcessService;
 impl ShelfProcessService {
     /// 设置指定 shelf 的工序映射 —— **整组替换**语义：
     ///
-    /// 1. 校验 shelf 存在 + active（`ShelfRepo::get_by_id`，跨域只读）
+    /// 1. 校验 shelf 存在 + active + `zone='PRODUCTION'`（`prod::batch::service::guard::validate_shelf_zone`）
     /// 2. 校验 items 内的所有 process_id 存在（`ProcessRepo::list_by_ids`，同域）
     /// 3. 软删该 shelf 的全部旧 mapping（`ShelfProcessRepo::soft_delete_all_for_shelf`）
     /// 4. INSERT 新 mapping（`ShelfProcessRepo::bulk_insert`，按 sort_order）
@@ -59,8 +60,40 @@ impl ShelfProcessService {
     ///
     /// 错误码：
     /// - 20501 `BIZ_SHELF_NOT_FOUND`
+    /// - 20512 `BIZ_SHELF_INACTIVE` —— shelf `is_active=false`（2026-10-04 新增，见下）
+    /// - 20104 `BIZ_INVALID_VALUE` —— shelf `zone≠'PRODUCTION'`（2026-10-04 新增）/
+    ///   process_id 非整数
     /// - 20505 `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND` —— items 里有 process_id 不存在
     /// - 20502 `BIZ_SHELF_DUPLICATE_CODE` —— uk_t_shelf_process 撞（理论不该发生，service 已去重）
+    ///
+    /// ## 2026-10-04 zone 守卫（写侧收紧，`current_holder_id` 写脏缺口的一环）
+    /// 原实现只校验「货架存在」，**不校验 zone**，于是品检区（`INSPECTION`）货架可以被
+    /// 配成某工序的落料架，再被 `ShelfProcessRepo::find_first_shelf_for_process`（同批
+    /// 收紧）选中并写进 `t_part_batch.current_holder_id`；而报工台取件页的取件 SQL 硬限定
+    /// `sh.zone = 'PRODUCTION'`，这种批次就永远不会被工人领到，且不报错。
+    ///
+    /// **为什么「只有 PRODUCTION 区能配工序」是对的**：`t_shelf_process` 的语义是
+    /// 「可执行某工序的**在制品**货架」，三条读侧全部是生产流 —— 下发解析货架
+    /// （`dispatch_single`）、worker 归还（worker_scan RETURNED）、候选池放回
+    /// （`/prod/pool/move`）。品检流走的是显式 `target_inspection_shelf_id` +
+    /// `validate_shelf_zone(.., "INSPECTION")`（见 `prod::batch::service::scan` /
+    /// `outsource`），**完全不读 `t_shelf_process`**；前端 10 处
+    /// `useShelfProcessFilter` 消费 `GET /prod/shelf-processes` 时，货架候选源也一律是
+    /// `zone='PRODUCTION'` 过滤后的列表。品检架上的映射行是**既无读侧消费、又能让脏货架
+    /// 落进 holder** 的纯负债。
+    ///
+    /// **收紧的副作用（已知且接受）**：对品检架（或任何非 PRODUCTION 区货架）调本端点
+    /// 现在返 `20104`，且**存量**非法映射在下一次 `POST` 整组替换时同样被拒（整组替换
+    /// 语义下无法只改其中一条）。这是刻意的 fail-fast：让配置错误在**写侧**暴露，而不是
+    /// 继续静默产出漏件批次。存量非法行的排查 SQL（只读）见
+    /// `docs/api/production/shelf-process-mapping.md` 的「只读诊断 SQL」一节；**本仓不
+    /// 自动修数据**，修复走独立的数据修复单。
+    ///
+    /// ## 20512 的可达性
+    /// 货架 service 的 `deactivate` 等价于 soft-delete（同时 `is_active=false` +
+    /// `deleted_at=now()`），故经 API 停用的货架先命中 20501；20512 是防「直接改库 /
+    /// 历史数据造成 `is_active=false` 但未软删」的防御位，与 `validate_shelf_zone`
+    /// 在其它 5 个调用点的定位一致。
     pub async fn set_shelf_processes(
         &self,
         conn: &mut PgConnection,
@@ -69,15 +102,19 @@ impl ShelfProcessService {
         items: &[SetShelfProcessesItem],
         current: &CurrentUser,
     ) -> Result<(), AppError> {
-        // 1. shelf 存在性 + 软删校验（已软删 → 404）
-        let shelf = ShelfRepo::get_by_id(&mut *conn, shelf_id)
-            .await?
-            .ok_or_else(|| {
-                AppError::biz(
-                    code::BIZ_SHELF_NOT_FOUND,
-                    format!("shelf {shelf_id} 不存在"),
-                )
-            })?;
+        // 1. shelf 存在性 + 软删 + 停用 + zone 守卫（2026-10-04 复用 prod::batch 的
+        // `validate_shelf_zone`，与 place_on_shelf / pickup / outsource 等 6 个生产流
+        // 端点**同源同码**：20501 → 20512 → 20104，不另造判定）。
+        //
+        // 依赖方向说明：shelf_process → prod::batch::service::guard 是**同域**横向依赖
+        // （guard.rs 是 prod 域的货架校验自由函数层，不是 batch 域私有实现）；换来的是
+        // 「判序与错误码只有一份」——本仓已因两份判序（2026-10-02 域拆分前后的内联 SQL）
+        // 分叉过一次，不值得再开第二个。
+        //
+        // ⚠️ 本函数原先自己 `ShelfRepo::get_by_id` 拿 `shelf`（为 20501），改调本守卫后
+        // 不再需要该行：守卫内部已按同一 id 查过同一次，`shelf.id == shelf_id`，
+        // 故下方 `bulk_insert` 直接用形参 `shelf_id`，**不增加任何 DB 往返**。
+        validate_shelf_zone(&mut *conn, shelf_id, "PRODUCTION").await?;
 
         // 2. 解析 + 校验所有 process_id 存在
         let mut process_ids: Vec<i64> = Vec::with_capacity(items.len());
@@ -114,7 +151,7 @@ impl ShelfProcessService {
             .iter()
             .zip(process_ids.iter())
             .map(|(it, &pid)| NewShelfProcessRow {
-                shelf_id: shelf.id,
+                shelf_id,
                 process_id: pid,
                 sort_order: it.sort_order,
             })

@@ -7,6 +7,14 @@
 //!
 //! 这里是 part → prod 依赖的反向证明：这层守卫只经 `status_gate` 写
 //! `t_part_batch.status`，不引用 part 域任何 service / vo。
+//!
+//! 2026-10-04 起本文件不再只服务 `prod::batch`：新增 2 个**同域**跨模块 caller
+//! （`prod::shelf_process::set_shelf_processes` 建映射时的 zone 守卫、
+//! `prod::worker_pool::move_batch` WORKER→POOL 放回时的货架守卫），二者都只调
+//! [`validate_shelf_zone`]。新增 caller 时**必须**调本函数而不要复制判序 —— 判序
+//! （20501 存在 → 20512 停用 → 20104 zone）与文案只有一份，是 2026-10-04 那次
+//! 「`current_holder_id` 写脏」修复的核心：3 个写点各写各的守卫时，其中一个漏了
+//! `t_shelf` 侧谓词就足以让批次落到品检架上并从此静默漏件。
 
 use sqlx::PgConnection;
 
