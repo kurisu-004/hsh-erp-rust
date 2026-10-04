@@ -22,6 +22,12 @@ use crate::shared::types::{deserialize_i64, deserialize_i64_opt};
 // ===== Create =====
 
 /// `POST /parts` 入参：单件创建工单。
+///
+/// 2026-10-05 新增 `unit_price` / `total_price`：此前建单 DTO 不收金额，
+/// INSERT 也不带这两列，PDF 批量上传解析出的单价被整条链丢弃（DB 默认 0）。
+/// **JSON 里必须是字符串**（`"95.00"`），不能写裸数字 `95` —— crate 的
+/// `rust_decimal` 只开了 `serde-with-str`，`Decimal` 的 Deserialize 实现
+/// 唯一入口是字符串，写数字会在反序列化阶段直接 400。
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartCreateRequest {
     pub name: String,
@@ -42,6 +48,12 @@ pub struct PartCreateRequest {
     pub system_delivery_date: Option<chrono::NaiveDate>,
     #[serde(default)]
     pub note: Option<String>,
+    /// 2026-10-05 新增：单价（JSON 字符串，如 `"95.00"`；缺省 = 0）
+    #[serde(default)]
+    pub unit_price: Option<Decimal>,
+    /// 2026-10-05 新增：总价（JSON 字符串，如 `"950.00"`；缺省 = 0）
+    #[serde(default)]
+    pub total_price: Option<Decimal>,
 }
 
 // ===== Batch create =====
@@ -56,6 +68,11 @@ pub struct PartCreateRequest {
 /// 两个字段都形如 [`FileBindingIn`]，由前端从 `POST /part-files/upload-intents`
 /// 拿到 `tmp_key` 后填回。`batch_create_parts` service 会先并发 head/copy 所有
 /// binding 项，**任一失败** → 整体回滚（让用户重试整批）。
+///
+/// 2026-10-05 新增 `unit_price` / `total_price`：PDF 批量上传的解析结果里有单价，
+/// 但本 item DTO 不收、`NewPartCreate` 也不带，金额在整条链上被丢弃。与
+/// [`PartCreateRequest`] 同约束：**JSON 里必须是字符串**（`"95.00"`），裸数字 95
+/// 会在反序列化阶段直接 400（crate 的 `rust_decimal` 只开了 `serde-with-str`）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct PartBatchCreateItem {
     pub name: String,
@@ -74,6 +91,12 @@ pub struct PartBatchCreateItem {
     pub note: Option<String>,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
     pub assembly_id: Option<i64>,
+    /// 2026-10-05 新增：单价（JSON 字符串，如 `"95.00"`；缺省 = 0）
+    #[serde(default)]
+    pub unit_price: Option<Decimal>,
+    /// 2026-10-05 新增：总价（JSON 字符串，如 `"950.00"`；缺省 = 0）
+    #[serde(default)]
+    pub total_price: Option<Decimal>,
     /// 2026-09-16 M2-B 新增：上传图纸 PDF 绑定（kind=DRAWING，file_type=PDF）
     #[serde(default)]
     pub drawing_file: Option<FileBindingIn>,
@@ -291,6 +314,11 @@ pub struct PendingProgrammingQuery {
 // ===== 文件 / Excel 工具 =====
 
 /// `POST /parts/batch-with-pdfs` multipart 入参：JSON + PDFs。
+///
+/// 2026-10-05：本 DTO **不收** `unit_price` / `total_price`（该端点无前端调用方，
+/// 金额字段的补齐只做在 `POST /parts` / `POST /parts/batch` 两个真实建单端点上）。
+/// 序列号仍由 service 按 L1 客户 `serial_prefix` 派发（master 1 个 +
+/// 子件 `{master}-{NN}`），与另两个端点同一套派发器。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BatchWithPdfsRequest {
     #[serde(deserialize_with = "deserialize_i64")]

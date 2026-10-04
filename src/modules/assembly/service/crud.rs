@@ -889,6 +889,9 @@ impl AssemblyService {
             system_delivery_date: asm.system_delivery_date,
             note: asm.note.as_deref(),
             created_by: current.id,
+            serial_no: None,
+            unit_price: None,
+            total_price: None,
         };
         repo.create_simple_child_part(new)
             .await

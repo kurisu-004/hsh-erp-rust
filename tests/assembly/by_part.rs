@@ -63,6 +63,22 @@ async fn insert_l2_customer(pool: &PgPool, name: &str, parent_id: i64) -> i64 {
     id
 }
 
+/// 2026-10-05 新增：`PartService::create_part` 建单时按 L1 `serial_prefix` 派发
+/// 序列号（`shared::serial::acquire` 写 `t_serial_counter`）。本文件自建 L1 客户，
+/// 故也要自建对应 counter 行，否则建单会以 20108 BIZ_SERIAL_PREFIX_UNKNOWN 失败。
+async fn insert_serial_counter(pool: &PgPool, prefix: &str) {
+    sqlx::query!(
+        "INSERT INTO t_serial_counter (prefix, counter, version, created_at, created_by, \
+         updated_at, updated_by) \
+         VALUES ($1, 0, 0, now(), NULL, now(), NULL) \
+         ON CONFLICT (prefix) DO NOTHING",
+        prefix,
+    )
+    .execute(pool)
+    .await
+    .expect("insert t_serial_counter");
+}
+
 fn test_current_user() -> CurrentUser {
     CurrentUser {
         id: 1,
@@ -183,6 +199,7 @@ async fn by_part_part_no_parent() {
     let (pool, _fx) = setup().await;
     let l1 = insert_l1_customer(&pool, "客户BP-NP", "F").await;
     let l2 = insert_l2_customer(&pool, "子客BP-NP", l1).await;
+    insert_serial_counter(&pool, "F").await;
     let current = test_current_user();
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
 
@@ -200,6 +217,8 @@ async fn by_part_part_no_parent() {
         order_no: None,
         system_delivery_date: None,
         note: None,
+        unit_price: None,
+        total_price: None,
     };
     let mut tx = pool.begin().await.unwrap();
     let out = PartService::create_part(&mut *tx, &snowflake, &req, &current)

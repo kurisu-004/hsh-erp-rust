@@ -34,6 +34,19 @@
 
 权限: **Manager / Clerk**
 
+> ⚠️ **2026-10-05：该端点已无前端调用方，是遗留端点；本节字段表与真实 handler
+> 早已漂移，待另轮订正。** 下面这张表写的是历史设计（`items[]` + `pdfs[]` +
+> `default_work_type`），**不要照它拼请求**：真实 handler（`src/modules/part/
+> handler/batch.rs::batch_with_pdfs`）只认两个 multipart 字段名 ——
+> `json`（内容是 `BatchWithPdfsRequest`：单客户 + 若干可选字段 + **无金额字段**）
+> 与 `pdf` / `file`（PDF 二进制，可 0 个），出现其它字段名直接
+> `40001 VALIDATION_ERROR`。派生规则：page1 = master、page2..N = 自动子件，
+> PDF 页数为 0 时只建 master 且**不派序列号**。
+>
+> 前端真实的 PDF 批量建单走 `POST /api/v2/parts/batch`（见
+> [`./crud.md#post-apiv2partsbatch`](./crud.md#post-apiv2partsbatch)），
+> 金额字段也只在该端点收。
+
 > 2026-09-22 起 P3 batch 创建（与 `POST /parts/batch` 同源不同形态）：一次性
 > 创建 N 个 part + 同时上传 PDF 文件附件到 part_file。PartFile 上传走 OSS
 > presigned URL（见 [`../files.md`](../files.md)）。

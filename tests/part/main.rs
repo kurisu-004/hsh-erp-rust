@@ -16,6 +16,9 @@
 //! - rollup_recompute.rs   ← 2026-10-01 新增：admin 对账端点（POST /admin/recompute-rollup）定点修正 + 幂等断言
 //! - pickable_by_work_type.rs ← 2026-10-03 新增：`GET /parts/pickable-by-work-type/{id}`
 //!   出参 `batch_id` / `batch_version` 批次锚点（本端点此前零覆盖）
+//! - create_serial_price.rs ← 2026-10-05 新增：建单期序列号派发（`POST /parts` /
+//!   `POST /parts/batch` / `POST /parts/batch-with-pdfs`）+ `unit_price` /
+//!   `total_price` 入参落库
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
@@ -23,6 +26,7 @@
 // 引入（edition 2024 下 `mod foo;` 在 sub-file 中只查 sibling 目录、不向上到 crate root），
 // main.rs 仅列 sub-file 入口，不重复声明。
 mod batch;
+mod create_serial_price;
 mod crud;
 mod file;
 mod inspection_batches;

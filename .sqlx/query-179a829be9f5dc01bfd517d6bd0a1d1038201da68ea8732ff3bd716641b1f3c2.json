@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO t_serial_counter (prefix, counter, version, created_at, created_by, updated_at, updated_by) VALUES ($1, 0, 0, now(), NULL, now(), NULL) ON CONFLICT (prefix) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "179a829be9f5dc01bfd517d6bd0a1d1038201da68ea8732ff3bd716641b1f3c2"
+}

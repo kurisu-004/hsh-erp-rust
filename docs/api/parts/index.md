@@ -437,7 +437,7 @@ t_assembly.status               ← 派生缓存
 
 | 阶段 | 行为 |
 |---|---|
-| 派发 | 建件时由 `t_serial_counter` 按 L1 客户 `serial_prefix` 生成；`uk_t_part_serial_no` 唯一索引保证不重复 |
+| 派发 | 三个建单端点**统一**在 INSERT 期派发：`POST /parts`（每件 1 个）、`POST /parts/batch`（每件 1 个，共用一次 prefix 解析）、`POST /parts/batch-with-pdfs`（master 1 个 + 子件 `{master}-{NN}`，`PDF 页数 = 0` 时不派）。prefix 取自 `customer_id` 所属 **L1 客户**的 `serial_prefix`（入参传 L1 或 L2 都一样，内部按 `COALESCE(parent_id, id)` 折回 L1），号由 `shared::serial::acquire` 从 `t_serial_counter` 原子递增产生，格式 `{prefix}{counter:07}`。L1 未配 prefix → `20308` **整单拒**（不落库、不消耗 counter）；prefix 未在 `t_serial_counter` 注册 → `20108`。`uk_t_part_serial_no` 唯一索引在 INSERT 那一刻就参与判定。逐件失败的 item 已消耗的号不回收（序列号出现空洞，见 `service/batch.rs` 函数注释） |
 | 流转中 | 序列号在 part 的**整个非终态期**持续占用该唯一索引（货还在厂里，正确） |
 | 进入终态（`COMPLETED` / `CANCELLED`） | 由 rollup step 4 自动释放：**先**归档一条 `t_part_event`（`event_type='SERIAL_RELEASED'`，`note` 记原序列号）**再**清 `t_part.serial_no`。每个 part 至多 1 条归档事件（终态不可重复进入） |
 | 父装配件进终态 | 直接清 `t_assembly.serial_no`（不归档：`t_assembly` 无事件表，其 `note` 是用户可编辑业务备注，拿它记系统动作会污染用户数据） |
@@ -446,6 +446,19 @@ t_assembly.status               ← 派生缓存
 调用方**不需要**为序列号做任何事：释放是 rollup 的一步，`deliver` / `complete` /
 `cancel` / `force-complete` 等端点都自动带上（2026-10-01 起 `force-complete`
 也不再单独调清理函数）。
+
+> **前端注意（2026-10-05）**：三个建单端点都在服务端派发序列号，建单入参里
+> **没有也不该有** `serial_no` 字段。PDF 批量上传的真实端点是
+> `POST /api/v2/parts/batch`（见 [`./crud.md#post-apiv2partsbatch`](./crud.md#post-apiv2partsbatch)），
+> 每件建完立刻回填 `serial_no` 与 `unit_price` / `total_price`；
+> `POST /parts/batch-with-pdfs` 是遗留端点，无前端调用方。
+>
+> **格式并存（已知遗留，不在本轮范围）**：新派发是 **7 位**（`F0001478`），而库里
+> 历史数据是 **4 位**（`F1006`~`F2476`，子件 `F2435-01`），`t_serial_counter` 里 F 的
+> counter 也停在 1477。两种格式串长不同，`uk_t_part_serial_no` 不会互相冲突；
+> 但**按 `serial_no` 排序的列表会出现「新件排在旧件前面」的观感**（`F0001478` <
+> `F1006` 的字典序比较结果为真）。这是既有数据形态与新派发格式的差异，不是 bug；
+> 统一格式需要一次性刷历史数据。
 
 ## 状态机
 

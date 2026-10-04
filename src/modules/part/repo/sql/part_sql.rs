@@ -1,10 +1,11 @@
 //! part 域 SQL 真源 —— `t_part` 表相关查询（2026-09-22 PR2 拆分原 sql.rs）
 //!
 //! ## 文件拆分原则（PR2 约定）
-//! 按"主表归属"切分；函数体、签名、可见性、async 修饰全部保留；
-//! **零 SQL 文本变化**（sqlx prepare 哈希一致）。
+//! 按"主表归属"切分；函数体、签名、可见性、async 修饰全部保留。
+//! **改了 `query!` 宏里的 SQL 文本就必须重跑 `./scripts/sqlx_prepare.sh`**
+//! 并把 `.sqlx/query-*.json` 一起提交（CI / Docker 靠离线元数据构建）。
 //!
-//! ## 承载方法（17 个）
+//! ## 承载方法（20 个）
 //!
 //! ### 只读查询（6）
 //! - `get_by_id` / `list_by_ids` / `get_by_serial` / `list_children`
@@ -14,13 +15,17 @@
 //! - `get_part_detail` / `create_part` / `update_part` / `soft_delete_part`
 //! - `list_with_filters` / `count_with_filters`
 //!
-//! ### assembly 子件（3）
+//! ### assembly 子件（4）
 //! - `list_by_assembly_id` / `insert_child_for_assembly`
 //! - `cascade_sync_from_assembly` / `scale_children_quantity`
 //!
 //! ### rollup（3）
 //! - `get_part_rollup_state` / `update_part_rollup`
 //! - `clear_part_serial_no_when_completed`
+//!
+//! ### 跨表 helper（1）
+//! - `serial_prefix_for_customer` —— 查 `t_customer`（L1 客户的 `serial_prefix`），
+//!   供 service 建件时派发序列号
 //!
 //! ## ZST `PartRepo`
 //! ZST struct 在 `super`（sql/mod.rs）定义，本文件 `impl PartRepo { ... }`
@@ -29,13 +34,23 @@
 use sqlx::{PgConnection, PgExecutor};
 
 use crate::modules::part::model::{TPart, TPartInspected};
+use crate::shared::error::{AppError, code};
 
 use super::PartRepo;
 
 /// `create_part` 输入：service 层用 builder 模式注入。
 ///
 /// `id` 由 caller 预生成雪花；`status` 初始为 `'PENDING'`；`next_process_id` /
-/// `serial_no` / `deleted_at` / `version` 走 DB 默认或 `NULL`。
+/// `deleted_at` / `version` 走 DB 默认或 `NULL`。
+///
+/// 2026-10-05 新增 `serial_no` / `unit_price` / `total_price` 三个建单期字段：
+/// - `serial_no`：`None` = 不派发序列号（INSERT 写 NULL）；`Some(sn)` = 写入建单时
+///   由 service 派发的序列号。INSERT 期即写入（不再事后 `UPDATE`），这样
+///   `uk_t_part_serial_no` 在建单那一刻就参与唯一性判定。
+/// - `unit_price` / `total_price`：`None` = 由 SQL 侧 `COALESCE($n, 0)` 落 0。
+///   两列是 `NUMERIC(12,2)` / `NUMERIC(14,2) NOT NULL DEFAULT 0`，绑 NULL 会直接
+///   违反 NOT NULL，所以在 SQL 里兜底而不是靠 DEFAULT（DEFAULT 只在列不出现在
+///   列清单时生效，这里列出现在清单里）。
 pub struct NewPartCreate<'a> {
     pub id: i64,
     pub name: &'a str,
@@ -51,6 +66,12 @@ pub struct NewPartCreate<'a> {
     pub system_delivery_date: Option<chrono::NaiveDate>,
     pub note: Option<&'a str>,
     pub created_by: i64,
+    /// 2026-10-05 新增：建单时派发的序列号（`None` → INSERT 写 NULL）
+    pub serial_no: Option<&'a str>,
+    /// 2026-10-05 新增：单价（`None` → `COALESCE(., 0)`）
+    pub unit_price: Option<rust_decimal::Decimal>,
+    /// 2026-10-05 新增：总价（`None` → `COALESCE(., 0)`）
+    pub total_price: Option<rust_decimal::Decimal>,
 }
 
 /// `update_part` 输入：所有字段 `Option`，未设置的字段不动。
@@ -385,6 +406,13 @@ impl PartRepo {
     ///
     /// 返回写入行的雪花 `id`（与 `new.id` 一致；此处显式 `RETURNING id`
     /// 以兼容未来可能的 trigger 重写 id 的场景）。
+    ///
+    /// 2026-10-05：`serial_no` / `unit_price` / `total_price` 三列进 INSERT。
+    /// 序列号此前只在 `POST /parts/batch-with-pdfs` 走「INSERT 后 UPDATE」补写，
+    /// 单件 / 批量两个建单端点从不派发（前端 PDF 批量上传因此拿到一批无序列号、
+    /// 单价恒 0 的工单）。下沉到本 INSERT 后三个建单端点共用同一条写路径。
+    /// 金额两列用 `COALESCE($n, 0::numeric)`：列出现在列清单里就不再走 DB
+    /// DEFAULT，NOT NULL 列不能绑 NULL。
     pub async fn create_part<'e, E: PgExecutor<'e>>(
         executor: E,
         new: NewPartCreate<'_>,
@@ -396,13 +424,15 @@ impl PartRepo {
                 request_date, planned_delivery_date,
                 status, is_urgent, customer_id, assembly_id,
                 order_no, system_delivery_date, note,
+                serial_no, unit_price, total_price,
                 created_at, created_by, updated_at, updated_by
             ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7,
                 'PENDING', $8, $9, $10,
                 $11, $12, $13,
-                now(), $14, now(), $14
+                $14, COALESCE($15, 0::numeric), COALESCE($16, 0::numeric),
+                now(), $17, now(), $17
             )
             RETURNING id AS "id!"
             "#,
@@ -419,6 +449,9 @@ impl PartRepo {
             new.order_no,
             new.system_delivery_date,
             new.note,
+            new.serial_no,
+            new.unit_price,
+            new.total_price,
             new.created_by,
         )
         .fetch_one(executor)
@@ -1195,5 +1228,62 @@ impl PartRepo {
         .execute(executor)
         .await?;
         Ok(r.rows_affected())
+    }
+
+    /// 2026-10-05 新增：取「L1 客户」的 `serial_prefix` 首字符，供建单派发序列号。
+    ///
+    /// 序列号前缀是 L1 客户的属性（L2 客户的 `serial_prefix` 恒为 NULL，由
+    /// customer 域 service 双校验保证），所以入参可以是 L1 也可以是 L2：内层子查询
+    /// 用 `COALESCE(parent_id, id)` 把 L2 折回它的 L1，外层再取那一行的 prefix。
+    /// 一条 SQL 走完，不在 Rust 侧分叉。
+    ///
+    /// 三种失败（都不该被 DB CHECK 之外的脏数据放过，故逐个显式判）：
+    /// - 目标客户或其 L1 父行不存在 / 已软删 → `20102 BIZ_CUSTOMER_NOT_FOUND`
+    /// - prefix 为 NULL（L1 客户未配前缀）→ `20308 BIZ_CUSTOMER_NO_SERIAL_PREFIX`
+    /// - prefix 为空串 / 非 ASCII 大写开头 → `20104 BIZ_INVALID_VALUE`
+    ///
+    /// 用 `sqlx::query_scalar`（非 `query_scalar!` 宏）：返回值只有
+    /// `Option<Option<String>>` 两态（无行 / 有行但 prefix 为 NULL），
+    /// 宏的编译期校验在这里没有额外收益。
+    pub async fn serial_prefix_for_customer<'e, E: PgExecutor<'e>>(
+        executor: E,
+        customer_id: i64,
+    ) -> Result<char, AppError> {
+        // 外层 Option = 查无此行（客户或其 L1 父行不存在 / 已软删）；
+        // 内层 Option = 行在但 `serial_prefix IS NULL`（L1 未配前缀）。
+        let row: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT serial_prefix FROM t_customer \
+             WHERE id = (SELECT COALESCE(parent_id, id) FROM t_customer \
+                         WHERE id = $1 AND deleted_at IS NULL) \
+               AND deleted_at IS NULL",
+        )
+        .bind(customer_id)
+        .fetch_optional(executor)
+        .await?;
+        let prefix = row.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_CUSTOMER_NOT_FOUND,
+                format!("customer {customer_id} 不存在或已软删，无法取 serial_prefix"),
+            )
+        })?;
+        let prefix = prefix.ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
+                format!("customer {customer_id} 的 L1 父客户未配置 serial_prefix"),
+            )
+        })?;
+        let ch = prefix.chars().next().ok_or_else(|| {
+            AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("customer {customer_id} 的 serial_prefix 为空串"),
+            )
+        })?;
+        if !ch.is_ascii_uppercase() {
+            return Err(AppError::biz(
+                code::BIZ_INVALID_VALUE,
+                format!("customer {customer_id} 的 serial_prefix {ch:?} 不是 A-Z 开头"),
+            ));
+        }
+        Ok(ch)
     }
 }

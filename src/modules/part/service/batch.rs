@@ -73,6 +73,19 @@ impl PartService {
     ///
     /// 与 `batch_create_parts` 的区别：调用方需额外注入 `cos` / `cfg`（upload_prefix +
     /// tmp_prefix）；handler 层走 state 直接拿，service 层把 IO 控制在 pool（不依赖 tx）。
+    ///
+    /// ## 序列号派发（2026-10-05）
+    /// prefix 只在开头取一次（L1 客户缺 prefix → 20308 整批拒，连文件都不 head/copy），
+    /// per-item savepoint 循环内每条调一次 `shared::serial::acquire` 派一个号。
+    ///
+    /// **取舍**：不去做「批量预取 N 个号」省往返——预取会把 counter 一次性推进 N，
+    /// 一旦中途 savepoint 回滚就有 N 个号变空洞，且「一个 item 一次派发」的语义被
+    /// 打破。代价是事务内 N 次 `UPDATE t_serial_counter` 往返（N 上限 200，常规
+    /// PDF 批量 18 条量级，串行几百毫秒内可完成）。
+    ///
+    /// **已知代价**：个别 item 失败（唯一索引撞号 / part_file 写失败）时该 item 已
+    /// 消耗的号不会回收，序列号出现空洞。序列号是单调递增的工单标识、不承载「连续
+    /// 区间」语义，空洞可接受（换来的好处是号永不重复）。
     #[allow(clippy::too_many_arguments)]
     pub async fn batch_create_parts_with_bindings<R: PartRepoTrait>(
         mut repo: R,
@@ -113,6 +126,14 @@ impl PartService {
             }
             Err(e) => return Err((AppError::from(e), Vec::new())),
         }
+
+        // 2026-10-05：序列号 prefix 只取一次，且取在第一遍 head/copy **之前** ——
+        // L1 客户没配 prefix（20308）要 fail-fast 整批拒，此时一个 COS 对象都
+        // 没 head/copy 过，handler 的 tmp 清理集合天然为空。
+        let serial_prefix = repo
+            .serial_prefix_for_customer(req.customer_id)
+            .await
+            .map_err(|e| (e, Vec::new()))?;
 
         // ===== 第一遍：预生成 part_id + 收集所有 bindings + 并发 head/copy（max 5 并发） =====
         let preallocated_part_ids: Vec<i64> =
@@ -206,6 +227,15 @@ impl PartService {
 
         for (idx, item) in req.items.iter().enumerate() {
             let new_id = preallocated_part_ids[idx];
+            // 2026-10-05：每条 item 派发一个序列号（`shared::serial::acquire` 走
+            // `UPDATE t_serial_counter ... RETURNING`，与 prefix 解析分开两次往返）。
+            // 放在 SAVEPOINT **之前**：这样本 item 后续失败时 rollback 不会退掉
+            // counter，代价是序列号留空洞（见函数 doc 的「已知代价」）。
+            let serial_no =
+                match crate::shared::serial::acquire(repo.conn_mut(), serial_prefix).await {
+                    Ok(sn) => sn,
+                    Err(e) => return Err((e, cleanup_tmp_keys)),
+                };
             let new = NewPartCreate {
                 id: new_id,
                 name: item.name.trim(),
@@ -221,6 +251,9 @@ impl PartService {
                 system_delivery_date: item.system_delivery_date,
                 note: item.note.as_deref(),
                 created_by: current.id,
+                serial_no: Some(&serial_no),
+                unit_price: item.unit_price,
+                total_price: item.total_price,
             };
             // per-item savepoint
             use sqlx::AssertSqlSafe;
@@ -394,6 +427,12 @@ impl PartService {
     /// batch_create_parts 的 legacy 实现：与既有签名一致，不支持文件绑定。
     /// 2026-09-16 M2-B：拆出来供 batch_create_parts 复用（保留原 per-item savepoint 模型）。
     /// 2026-09-16 M2-C：从 crud.rs 迁移到本文件（按 docs/conventions.md §2 单文件职责拆分）。
+    ///
+    /// 2026-10-05：`POST /parts/batch` 不带任何 file binding 时走本路径（handler 按
+    /// `has_bindings` 分流），而前端 PDF 批量上传正是这条路径，所以序列号派发与
+    /// `unit_price` / `total_price` 透传必须在这里也做一遍，否则真实建单入口仍然
+    /// 拿不到序列号。prefix 只取一次、per-item 派一次号的取舍与
+    /// [`Self::batch_create_parts_with_bindings`] 同（序列号空洞可接受）。
     pub(super) async fn batch_create_parts_legacy<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -419,10 +458,13 @@ impl PartService {
                     format!("customer {} 不存在", req.customer_id),
                 )
             })?;
+        // 与 with_bindings 同口径：prefix 缺失（20308）在写任何行之前整批拒
+        let serial_prefix = repo.serial_prefix_for_customer(req.customer_id).await?;
         let mut created = Vec::new();
         let mut failed = Vec::new();
         for (idx, item) in req.items.iter().enumerate() {
             let new_id = snowflake.next_id();
+            let serial_no = crate::shared::serial::acquire(repo.conn_mut(), serial_prefix).await?;
             let new = NewPartCreate {
                 id: new_id,
                 name: item.name.trim(),
@@ -438,6 +480,9 @@ impl PartService {
                 system_delivery_date: item.system_delivery_date,
                 note: item.note.as_deref(),
                 created_by: current.id,
+                serial_no: Some(&serial_no),
+                unit_price: item.unit_price,
+                total_price: item.total_price,
             };
             use sqlx::AssertSqlSafe;
             let sp_name = format!("batch_item_{idx}");

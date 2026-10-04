@@ -38,6 +38,8 @@
 --  出现在 unfiltered list 中干扰其它断言。因此 fixture 仅预置「不可变共享」
 --  行（customer / process / shelf / user / role / 映射），工单 / 批次由各 sub-file
 --  按需用 sqlx::query 直插（PR-C 末统一迁 test-support）。
+--  例外：t_serial_counter 是建单派发序列号的计数器（2026-10-05 起建单端点
+--  强制派发），缺它建单会被拒，故预置一行。
 -- ============================================================================
 
 -- ---- L1 客户 + L2 子客户 ----
@@ -45,6 +47,16 @@ INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, created_at,
 VALUES
   (9000000000000000010, 'FX 客户 L1', NULL, 'P', 0, now(), now()),
   (9000000000000000011, 'FX 客户 L2', 9000000000000000010, NULL, 0, now(), now());
+
+-- ---- 序列号计数器（L1 prefix='P'）----
+-- 2026-10-05 起 POST /parts / POST /parts/batch 建单时按 L1 prefix 派发
+-- serial_no（shared::serial::acquire 走 `UPDATE t_serial_counter ... RETURNING`）。
+-- 该表**不在** migrations / seeds 里（A-Z 26 行由生产数据注入），测试库独立，
+-- 所以 fixture 必须自带 'P' 一行，否则建单会以 20108 BIZ_SERIAL_PREFIX_UNKNOWN
+-- 整单拒。counter 起 0 → 首件派到 P0000001。
+INSERT INTO t_serial_counter (prefix, counter, version, created_at, updated_at)
+VALUES ('P', 0, 0, now(), now())
+ON CONFLICT (prefix) DO NOTHING;
 
 -- ---- 工序（INHOUSE 类别，FX-PROC-A）----
 INSERT INTO t_process (id, code, name, category, sort_order, requires_approval, version, created_at, updated_at)

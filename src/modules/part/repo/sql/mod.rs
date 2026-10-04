@@ -6,12 +6,13 @@
 //! 拆分为 4 子文件：
 //!
 //! - `part_sql.rs` —— `t_part` 表 SQL（get_by_id / list_by_ids /
-//!   get_by_serial / list_children / get_part_inspected / get_part_detail /
+//!   get_by_serial / list_children / list_children_by_assemblies /
+//!   get_part_inspected / get_part_detail /
 //!   create_part / update_part / soft_delete_part / list_with_filters /
 //!   count_with_filters / list_by_assembly_id / insert_child_for_assembly /
 //!   cascade_sync_from_assembly / scale_children_quantity /
 //!   get_part_rollup_state / update_part_rollup /
-//!   clear_part_serial_no_when_completed）
+//!   clear_part_serial_no_when_completed / serial_prefix_for_customer）
 //! - `event_sql.rs` —— `t_part_event` 表 SQL（insert_part_event）
 //! - `helper_sql.rs` —— 杂项 helper（`scale_qty` 缩放公式纯函数 + 单测）
 //!

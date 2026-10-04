@@ -1483,6 +1483,8 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
                 system_delivery_date: None,
                 note: None,
                 assembly_id: None,
+                unit_price: None,
+                total_price: None,
                 drawing_file: Some(FileBindingIn {
                     tmp_key: tmp_key_0.into(),
                     content_sha256: sha_0.clone(),
@@ -1505,6 +1507,8 @@ async fn batch_create_with_bindings_partial_failure_cleans_all_tmp() {
                 system_delivery_date: None,
                 note: None,
                 assembly_id: None,
+                unit_price: None,
+                total_price: None,
                 drawing_file: Some(FileBindingIn {
                     tmp_key: tmp_key_1.into(),
                     content_sha256: sha_1.clone(),
