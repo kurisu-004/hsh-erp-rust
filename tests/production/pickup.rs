@@ -19,6 +19,15 @@
 //!   6. OCC 冲突（传错的 `version`）→ 40901 VERSION_CONFLICT 且**没有残留新批次**
 //!   7. 角色门禁：SHELF_ACCOUNT（扫码台角色）可通过；INSPECTOR 被拒 40300
 //!
+//! ## `shelf_id` 可选（2026-10-04 新增用例组，本改动的核心回归）
+//!
+//!   8. **请求体完全不带 `shelf_id`** → 200，领取成功且 status / location / holder 逐字正确（与场景 1 只差「少一个 shelf_id」）
+//!   9. `shelf_id` 缺省 + 部分领取 → 200，拆批语义与场景 2 一致
+//!  10. `shelf_id` **传了非法值仍被拒**（不存在 20501 / 停用 20512 / INSPECTION 区 20104）—— 钉住「传了才校验」
+//!  11. `"shelf_id": 43`（JSON 数字而非字符串）→ 422 纯文本（`deserialize_i64_opt` 只吃 str，与改动前一致、未放宽）
+//!  12. `"shelf_id": null` ≡ 字段缺省（`deserialize_i64_opt` 输入行为矩阵的第四格）
+//!  13. 缺 `version` / 缺 `worker_id` → 仍 422（钉住「本改动只放宽 `shelf_id`」）
+//!
 //! ## 集成测试范本（PR13 Phase F）
 //! 所有 HTTP / fixture helper 一律 `use hsh_erp_test_support::{...}`，**不保留
 //! 本地副本**。本文件独享的 raw SQL 构造（`insert_part` / `insert_part_batch` /
@@ -30,6 +39,7 @@
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tower::ServiceExt;
 
 use hsh_erp_test_support::{
     PartFixture, ProductionFixture, json_request, load_production_fixture, login_token,
@@ -202,6 +212,28 @@ async fn count_batches(pool: &PgPool, part_id: i64) -> i64 {
     .fetch_one(pool)
     .await
     .expect("count t_part_batch")
+}
+
+/// 直插一个**已停用**的 PRODUCTION 架（`is_active=false`），用于钉住 `20512`。
+///
+/// `code` 用固定短码：`t_shelf.code` 是 `varchar(32)`，塞不进
+/// `PICKUP-INACTIVE-<19 位雪花 id>`（36 字符）；每测试一个 fresh database，
+/// 固定码不会与 fixture 的 `FX-SH-*` 撞。
+async fn insert_inactive_production_shelf(pool: &PgPool) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+    let id = next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) VALUES ($1, 'PICKUP-INACT', 'PICKUP 停用生产架', \
+         'PRODUCTION', false, 0, 0, $2, $2)",
+    )
+    .bind(id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("insert t_shelf (inactive)");
+    id
 }
 
 /// 按 `event_type` 从 `GET /parts/{id}/events` 里挑出唯一一条事件。
@@ -714,4 +746,399 @@ async fn pick_up_forbidden_for_inspector() {
     assert_eq!(count_batches(&ctx.pool, part_id).await, 1, "被拒后不应拆批");
     let (quantity, _status, _loc, _holder, _v) = read_batch(&ctx.pool, batch_id).await;
     assert_eq!(quantity, 3, "被拒后数量不变");
+}
+
+/// 场景 8（2026-10-04 新增，**本改动的核心回归**）：请求体**完全不带 `shelf_id`**
+/// → 200，领取成功
+///
+/// 与场景 1 的请求体**只差「少一个 shelf_id」**，其余完全相同
+/// （同为 IN_PROCESS+PRODUCTION_SHELF 源、version=0、不传 quantity），因此
+/// 「传 / 不传」对结果的影响必须为零：status / location / holder / version /
+/// 批次数 / 事件流逐字一致。
+///
+/// 为什么值得单独钉一条：该字段对 pick-up 的最终结果**零影响**（本路径 3 条
+/// `t_part_batch` 写入的 SET / WHERE 均无货架列，`t_part_event` 无货架列，响应
+/// VO `PartOut` 无 shelf 字段），原先那条 `validate_shelf_zone` 是防呆断言而
+/// 非安全边界。若后人把它误当成「批次归属依据」写进 WHERE/SET，本用例会红。
+#[tokio::test]
+async fn pick_up_without_shelf_id_succeeds() {
+    let ctx = bootstrap().await;
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 10).await;
+    let batch_id =
+        insert_part_batch(&ctx.pool, part_id, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/pick-up"),
+            // ⚠️ body 里**没有** shelf_id 这个 key（不是 null）
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "shelf_id 缺省应照常领取: {env}");
+    assert_eq!(env["code"], 0);
+    assert_eq!(
+        env["data"]["id"],
+        part_id.to_string(),
+        "响应体形状不变（仍是 PartOut）: {env}"
+    );
+
+    // 与场景 1 的断言集合逐条对齐：状态机结果必须完全相同
+    let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(quantity, 10, "整批领取不应改数量");
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(worker_id), "holder 应写入 worker_id");
+    assert_eq!(version, 1, "OCC 应 +1");
+    assert_eq!(
+        count_batches(&ctx.pool, part_id).await,
+        1,
+        "整批路径不应拆出新批次"
+    );
+
+    let (_, ev) = fetch_events(&ctx, part_id).await;
+    let picked = pick_event(&ev, "PICKED_UP");
+    assert_eq!(picked["quantity"], 10);
+    assert_eq!(picked["batch_id"], batch_id.to_string());
+    assert_eq!(
+        ev["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["event_type"] == "SPLIT")
+            .count(),
+        0,
+        "整批路径不应写 SPLIT 事件"
+    );
+}
+
+/// 场景 9（2026-10-04 新增）：`shelf_id` 缺省 + **部分领取** → 200，拆批语义不变
+///
+/// 覆盖「部分领取的自动拆批路径（`_split_batch_inner`）与 `shelf_id` 缺省正交」
+/// 这一点：拆批 SQL 与后续翻状态都不碰货架，故两者同时出现也必须照常工作。
+#[tokio::test]
+async fn pick_up_partial_without_shelf_id_succeeds() {
+    let ctx = bootstrap().await;
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 10).await;
+    let batch_id =
+        insert_part_batch(&ctx.pool, part_id, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "quantity": "4",
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "shelf_id 缺省 + 部分领取应 200: {env}");
+
+    // 源批次：余量留原处（与场景 2 一致）
+    let (src_qty, src_status, src_loc, _src_holder, src_ver) =
+        read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(src_qty, 6, "源批次应剩 10 - 4 = 6");
+    assert_eq!(src_status, "IN_PROCESS");
+    assert_eq!(
+        src_loc.as_deref(),
+        Some("PRODUCTION_SHELF"),
+        "源批次应仍在生产架上"
+    );
+    assert_eq!(src_ver, 1, "源批次 version +1（拆批 OCC 写）");
+
+    // 新批次：拆走的那份交到工人手上
+    let new_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM t_part_batch WHERE part_id = $1 AND deleted_at IS NULL AND id <> $2",
+    )
+    .bind(part_id)
+    .bind(batch_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("部分领取应拆出一个新批次");
+    let (new_qty, new_status, new_loc, new_holder, _v) = read_batch(&ctx.pool, new_id).await;
+    assert_eq!(new_qty, 4);
+    assert_eq!(new_status, "IN_PROCESS");
+    assert_eq!(new_loc.as_deref(), Some("WORKER"));
+    assert_eq!(new_holder, Some(worker_id));
+}
+
+/// 场景 10（2026-10-04 新增）：`shelf_id` **传了非法值仍被拒**
+///
+/// 这是本次改动的**反向钉子**：`shelf_id` 变可选后，「传了就校验」这一半必须
+/// 原样保留。三条子用例各覆盖 `validate_shelf_zone` 的一个分支：
+/// - 不存在 / 已软删 → `20501 BIZ_SHELF_NOT_FOUND`（HTTP 404）
+/// - 已停用 → `20512 BIZ_SHELF_INACTIVE`（HTTP 400）
+/// - zone 不是 PRODUCTION → `20104 BIZ_INVALID_VALUE`（HTTP 400）
+///
+/// 少了这组用例，「把 `if let` 写反成 `if let None`」或干脆删掉校验都不会有
+/// 任何测试变红。
+#[tokio::test]
+async fn pick_up_invalid_shelf_id_still_rejected() {
+    let ctx = bootstrap().await;
+    let inactive_shelf = insert_inactive_production_shelf(&ctx.pool).await;
+    // fixture 内不存在、也永远不会创建的 id（与 PartFixture 的 9000000000000000xx
+    // 段物理不相交）
+    let missing_shelf = 9_000_000_000_000_099_999i64;
+
+    // (shelf_id 字面值, 期望 code, 期望 HTTP 状态, 场景说明)
+    // 用 `String` 而非 `&str`：id 是现算出来的，`&x.to_string()` 会借到语句结束就
+    // 被释放的临时值（E0716）。
+    let cases: Vec<(String, i32, StatusCode, &'static str)> = vec![
+        (
+            missing_shelf.to_string(),
+            20501,
+            StatusCode::NOT_FOUND,
+            "shelf 不存在 / 已软删",
+        ),
+        (
+            inactive_shelf.to_string(),
+            20512,
+            StatusCode::BAD_REQUEST,
+            "shelf 已停用",
+        ),
+        (
+            PartFixture::INSPECTION_SHELF_ID.to_string(),
+            20104,
+            StatusCode::BAD_REQUEST,
+            "shelf 在 INSPECTION 区",
+        ),
+    ];
+
+    for (idx, (shelf_id, want_code, want_status, why)) in cases.into_iter().enumerate() {
+        // 每条子用例用独立的 part / 批次，避免前一条失败后留下脏状态干扰后一条
+        let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+        let part_id = insert_part(&ctx.pool, 10).await;
+        let batch_id =
+            insert_part_batch(&ctx.pool, part_id, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+        let (s, env) = send(
+            ctx.app.clone(),
+            json_request(
+                "POST",
+                &format!("/prod/batches/{batch_id}/pick-up"),
+                Some(json!({
+                    "version": 0,
+                    "worker_id": worker_id.to_string(),
+                    "shelf_id": shelf_id,
+                    "quantity": "4",
+                })),
+                Some(&ctx.manager),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s, want_status,
+            "[{idx}] {why}：期望 HTTP {want_status}，实际 {s}: {env}"
+        );
+        assert_eq!(
+            env["code"], want_code,
+            "[{idx}] {why}：期望 code {want_code}，实际 {env}"
+        );
+
+        // 校验在事务内、且在拆批**之前** —— 失败后不得有任何残留
+        assert_eq!(
+            count_batches(&ctx.pool, part_id).await,
+            1,
+            "[{idx}] {why}：非法 shelf 必须在拆批前被拒，不得拆批"
+        );
+        let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+        assert_eq!(quantity, 10, "[{idx}] {why}：数量不应被扣");
+        assert_eq!(status, "IN_PROCESS");
+        assert_eq!(
+            location.as_deref(),
+            Some("PRODUCTION_SHELF"),
+            "[{idx}] {why}：位置不应被改"
+        );
+        assert_eq!(
+            holder,
+            Some(ctx.shelf_id()),
+            "[{idx}] {why}：holder 不应被改"
+        );
+        assert_eq!(version, 0, "[{idx}] {why}：version 不应被改");
+    }
+}
+
+/// 场景 11（2026-10-04 新增）：`"shelf_id": 43`（JSON 数字）→ 422
+///
+/// 线上形态是 **JSON 字符串**（雪花 id 精度）。`deserialize_i64_opt` 内部先
+/// `Option::<String>::deserialize` 再 parse，故**只吃字符串**：`"shelf_id": 43`
+/// 在提取器阶段就失败。
+///
+/// ⚠️ 与改动前一致：`deserialize_i64`（原必填版）同样只吃 str，本次改动**没有**
+/// 顺带放宽数字输入。别把它误读成「变可选 = 顺带接受数字」。
+///
+/// ⚠️ 响应是 axum `Json` 提取器的**纯文本** 422，不是业务信封，故不能用
+/// `hsh_erp_test_support::send`（它对非 JSON body 直接 panic），这里直读 raw body。
+#[tokio::test]
+async fn pick_up_shelf_id_as_json_number_is_rejected() {
+    use axum::body::to_bytes;
+
+    let ctx = bootstrap().await;
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 10).await;
+    let batch_id =
+        insert_part_batch(&ctx.pool, part_id, 10, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+    let resp = ctx
+        .app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "shelf_id": ctx.shelf_id(),   // ← JSON 数字，不是字符串
+            })),
+            Some(&ctx.manager),
+        ))
+        .await
+        .expect("oneshot");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "shelf_id 传 JSON 数字应 422（deserialize_i64_opt 只吃 str）"
+    );
+    let raw = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        text.contains("shelf_id"),
+        "422 原因应指向 shelf_id（否则说明拒绝来自别的字段，用例会假绿）: {text}"
+    );
+
+    // 提取器就拒了，业务逻辑一行没跑 —— 批次必须原封不动
+    let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(quantity, 10);
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
+    assert_eq!(holder, Some(ctx.shelf_id()));
+    assert_eq!(version, 0);
+}
+
+/// 场景 12（2026-10-04 新增）：`"shelf_id": null` ≡ 字段缺省
+///
+/// 补齐 `deserialize_i64_opt` 四种输入的行为矩阵：缺省（场景 8）/ `null`（本条）/
+/// 字符串「`"43"`」（场景 1-7 全部既有用例）/ 数字「`43`」（场景 11）。
+///
+/// `deserialize_i64_opt` 的实现是 `Option::<String>::deserialize(d)` —— JSON
+/// `null` 与字段缺省都落进外层 `None`，两者**不可区分**、也不需要区分：语义都是
+/// 「不做任何校验」。本条把该等价性钉住，免得后人以为 `null` 会被当成「显式清空」
+/// 之类的第三种语义。
+#[tokio::test]
+async fn pick_up_null_shelf_id_is_treated_as_absent() {
+    let ctx = bootstrap().await;
+    let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+    let part_id = insert_part(&ctx.pool, 7).await;
+    let batch_id =
+        insert_part_batch(&ctx.pool, part_id, 7, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+    let (s, env) = send(
+        ctx.app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/pick-up"),
+            Some(json!({
+                "version": 0,
+                "worker_id": worker_id.to_string(),
+                "shelf_id": Value::Null,
+            })),
+            Some(&ctx.manager),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "shelf_id = null 应与缺省同效: {env}");
+
+    let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+    assert_eq!(quantity, 7);
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(location.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(worker_id));
+    assert_eq!(version, 1);
+}
+
+/// 场景 13（2026-10-04 新增，review 第 1 轮 M-4）：`version` / `worker_id` 缺失仍 422
+///
+/// 本次把 `shelf_id` 从必填放宽为可选，最容易被顺手搞混的就是「哪些字段仍必填」——
+/// `version`（OCC 锚）与 `worker_id`（持有件工人）**必须保持必填**。代码上的依据：
+/// 两者都**没有** `#[serde(default)]`，serde 对缺字段直接报错 ⇒ axum `Json` 提取器
+/// 422。缺了这条用例，将来有人给 `worker_id` 补一个 `default` 不会有任何测试变红。
+///
+/// 与场景 11 同款处理：响应是 axum `JsonRejection` 的**纯文本** 422（非业务信封），
+/// 不能用 `hsh_erp_test_support::send`（它对非 JSON body 直接 panic），故直读 raw
+/// body 并断言拒绝原因里点名了缺失的那个字段。
+#[tokio::test]
+async fn pick_up_missing_required_fields_still_422() {
+    use axum::body::to_bytes;
+
+    let ctx = bootstrap().await;
+
+    for (idx, omit) in ["version", "worker_id"].into_iter().enumerate() {
+        // 每条子用例用独立的 part / 批次，避免前一条失败后留下脏状态干扰后一条
+        let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+        let part_id = insert_part(&ctx.pool, 4).await;
+        let batch_id =
+            insert_part_batch(&ctx.pool, part_id, 4, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+        // 先造完整 body 再删掉一个 key —— 保证两条 body 只差「缺哪个必填字段」，
+        // 其余（status / location / holder / version / shelf_id）逐字相同
+        let mut body = json!({
+            "version": 0,
+            "worker_id": worker_id.to_string(),
+            "shelf_id": ctx.shelf_id().to_string(),
+        });
+        let removed = body
+            .as_object_mut()
+            .expect("body 是 object")
+            .remove(omit)
+            .unwrap_or_else(|| panic!("完整 body 里应有 {omit} 键"));
+        assert!(!removed.is_null(), "{omit} 本就不该是 null");
+
+        let resp = ctx
+            .app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/prod/batches/{batch_id}/pick-up"),
+                Some(body),
+                Some(&ctx.manager),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "[{idx}] 缺 {omit} 应 422（它仍是必填字段，不因 shelf_id 放宽而变可选）"
+        );
+        let raw = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.contains(omit),
+            "[{idx}] 422 原因应点名缺失字段 {omit}: {text}"
+        );
+
+        // 提取器就拒了，业务逻辑一行没跑 —— 批次必须原封不动
+        let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+        assert_eq!(quantity, 4);
+        assert_eq!(status, "IN_PROCESS");
+        assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
+        assert_eq!(holder, Some(ctx.shelf_id()));
+        assert_eq!(version, 0);
+    }
 }
