@@ -264,14 +264,61 @@ Request：`PickUpRequest`（body 必填）
 {
   "version": 0,               // 必填；batch.version（OCC）
   "worker_id": "42",          // 必填；拣货工人（须 is_active 且已绑 work_type）
-  "shelf_id": "43",           // 必填；当前批次所在货架（zone=PRODUCTION 且 active）
+  "shelf_id": "43",           // — 可选（2026-10-04 起）；缺省 = 完全不校验
   "quantity": "4",            // 可选；缺省 = 整批；小于总量时自动拆批（JSON 字符串）
   "note": "string (可选)"
 }
 ```
 
-Response 200 `data`：`PartOut`（**响应体形状与整批领取完全一致**；拆批信息只走 WS
-`PART_BATCH_SPLIT`）。
+Response 200 `data`：`PartOut`（**响应体形状与整批领取完全一致**，与 `shelf_id` 传不传
+无关；拆批信息只走 WS `PART_BATCH_SPLIT`）。
+
+#### `shelf_id` 可选（2026-10-04 变更）
+
+`shelf_id` 由**必填 `i64`** 放宽为**可选**（`Option<i64>`）。语义：
+
+| 取值 | 行为 |
+|---|---|
+| 不传 / `null` | **不做任何校验、不推导、不回退**，请求照常受理 |
+| `"shelf_id": "<id>"` | 校验「存在 + `is_active` + `zone='PRODUCTION'`」 |
+| `"shelf_id": <数字>` | `422`（纯文本，非业务信封）——线上形态是 **JSON 字符串**（雪花 id 精度） |
+
+> ⚠️ **本字段不影响任何持久化结果**（这是它可以变可选的根据）：
+>
+> - 不落库：pick-up 路径上 `t_part_batch` 的全部 3 条写入 —— `pickup.rs` 的内联
+>   `UPDATE`（IN_PROCESS 分支）、`guard.rs` → `status_gate.rs` 的通用
+>   `BATCH_STATUS_UPDATE_SQL`（PENDING 分支）、部分领取的
+>   `split_batch_for_partial_pass` —— 它们的 SET 与 WHERE **均无货架列、也无货架
+>   条件**；
+> - 事件无货架列：`t_part_event` 没有 shelf 字段，`PICKED_UP` / `SPLIT` 两条
+>   事件都不记货架；
+> - 响应无 shelf 字段：响应体是 `PartOut`，不含任何 shelf 属性；
+> - `t_shelf` 零写入：那条校验内部只
+>   `SELECT ... FROM t_shelf WHERE id = $1 AND deleted_at IS NULL`。
+>
+> ⇒ 原先那条校验是**防呆断言**（让手填错区的人当场看见 `20104`），**不是安全
+> 边界**。缺省它，扫码台 / 看板等自动发起 pick-up 的调用方（本就无从知道「批次
+> 此刻名义上在哪一个架」）才可正常调用。
+
+> **为什么不做「从批次自身的 `current_holder_id` 推导货架」**（2026-10-04 逐条
+> 核实后否决，技术上不可行）：
+>
+> 1. **PENDING 起点的批次 `current_holder_id` 恒为 `NULL`** ——
+>    `create_initial_batch` 写死 `NULL, NULL`，推导不出任何值；而 pick-up 的
+>    PENDING 分支正是给「待下发池」用的；
+> 2. **IN_PROCESS 起点只守 `location='PRODUCTION_SHELF'`、不守 holder** ——
+>    `dispatch` 与 `pool/move` 两个写点能把 INSPECTION 区的架写进
+>    `current_holder_id`，推导出来的值可能根本不在 PRODUCTION 区；
+> 3. **上架后货架被停用 / 软删时 `current_holder_id` 仍指向失效 id** ——
+>    「推导 + 施加同样校验」会把这类批次**永久锁死**（既领不走、也不报错可解释）。
+>
+> 故选择「缺省就什么都不做」，而不是替调用方猜一个值。
+
+> ⚠️ **本字段无 scope 校验**。与 worker-scan 对照：后者对 `shelf_id` 走
+> `current.can_access_shelf()`，越权返 `40301 SHELF_MISMATCH`
+> （见 [`./inspection.md`](./inspection.md#post-apiv2prodbatchesworker-scan)）。
+> pick-up **不做**该校验 ⇒ `shelf_id` 缺省时没有任何货架维度的权限收敛；本端点
+> 唯一的权限边界是角色门 `require_any_role(&[Manager, Clerk, ShelfAccount])`。
 
 #### 部分领取（2026-10-03 新增，`quantity`）
 
@@ -306,8 +353,39 @@ Response 200 `data`：`PartOut`（**响应体形状与整批领取完全一致**
   `source_batch_id` / `quantity`）+ `PART_PICKED_UP`（`part_id` / `worker_id` /
   `batch_id` / `quantity`，整批路径下后两者即源批次与整批量）。
 
-错误码：20101 / 20109 / 20119 / 40901 / 20111（`quantity ≤ 0` 或 `> batch.quantity`
-→ HTTP 400；`BIZ_PART_BATCH_INVALID_QUANTITY`）。
+错误码（2026-10-04 逐条从代码核实补全；此前只列了 5 个，且其中 `20119` 与本端点
+无关）：
+
+| code | 名称 | HTTP | 触发条件 |
+|---|---|---|---|
+| 20109 | `BIZ_PART_BATCH_NOT_FOUND` | 404 | `batch_id` 不存在 / 已软删 |
+| 20101 | `BIZ_PART_NOT_FOUND` | 404 | 批次所属 part 已软删 |
+| 40901 | `VERSION_CONFLICT` | 409 | ① `version` 与 `t_part_batch.version` 不符；② `status_gate` 的 `UPDATE ... RETURNING` 无行（源状态不在白名单 / 已软删）；③ 部分领取时拆批 SQL 未命中 |
+| 20103 | `BIZ_INVALID_TRANSITION` | 400 | 起点状态不是 `PENDING` / `IN_PROCESS`；或 `IN_PROCESS` 批次不在 `PRODUCTION_SHELF` 上 |
+| 20104 | `BIZ_INVALID_VALUE` | 400 | ① `t_part_batch.status` 存了非法字符串；② **`shelf_id` 的 zone 不是 `PRODUCTION`**（仅当传了 `shelf_id`） |
+| 20111 | `BIZ_PART_BATCH_INVALID_QUANTITY` | 400 | `quantity` ≤ 0、`> batch.quantity`，或超出 `i32` 范围 |
+| 20201 | `BIZ_WORKER_NOT_FOUND` | 404 | `worker_id` 不存在 / 已软删 |
+| 20202 | `BIZ_WORKER_INACTIVE` | 400 | `worker.is_active = false` |
+| 20206 | `BIZ_WORKER_NO_WORK_TYPE` | 400 | `worker.work_type_id IS NULL` |
+| 20501 | `BIZ_SHELF_NOT_FOUND` | 404 | `shelf_id` 不存在 / 已软删（**仅当传了 `shelf_id`**） |
+| 20512 | `BIZ_SHELF_INACTIVE` | 400 | `shelf_id` 指向的货架 `is_active = false`（**仅当传了 `shelf_id`**） |
+| 40300 | `FORBIDDEN` | 403 | 角色门 `require_any_role(&[Manager, Clerk, ShelfAccount])` 不通过 |
+| 40100 | `UNAUTHORIZED` | 401 | 缺 / 坏 Bearer token（含签名失败、claims 不合规） |
+| 40105 | `SESSION_REVOKED` | 401 | 服务端 Redis session 已不存在（已 logout / 改密 / 被吊销） |
+| 40800 | `REQUEST_TIMEOUT` | 408 | 超过请求级超时（默认 `request_timeout_seconds = 30s`） |
+| 50000 / 50001 | `INTERNAL` / `DATABASE` | 500 | DB 故障 / handler panic |
+
+> **两条非业务信封的 4xx**（有 HTTP 状态、body 里**没有** `code` 字段）：
+> - **422 + 纯文本**：axum `Json` 提取器拒绝。如 `"shelf_id": 43` 传了 JSON 数字
+>   （线上形态是字符串），或 `version` / `worker_id` 缺字段。
+> - **413 + 纯文本**：`tower_http::limit::RequestBodyLimitLayer` 拒绝（超
+>   `max_request_body_size`）。⚠️ 它**不产** `41301` —— 该码在 `error.rs` 里只
+>   有状态映射登记、无产生点。
+
+> **顺序（决定同一请求多个错误时先报哪个）**：角色门 → 批次/ part 读取 → OCC →
+> 起点状态 / location 守卫 → `quantity` 范围 → worker 三项 → **`shelf_id` 校验**
+> → 拆批 → 翻状态。`shelf_id` 校验在**事务内、拆批之前**，故非法 `shelf_id`
+> 不会留下任何拆批残留。
 
 ### `POST /api/v2/prod/batches/{batch_id}/place-on-shelf`
 
