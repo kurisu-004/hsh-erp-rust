@@ -114,6 +114,13 @@ Request：
 > （`src/modules/dashboard/vo/snapshot.rs::UpcomingDeliveryBucket` 的字段是 **`by_status`**：
 > `BTreeMap<OrderStatus 字面, i64>`，即「按状态细分的件数」；`count` 是当日合计）。
 
+> 2026-10-04 新增：WS 握手 snapshot 的 `upcoming_delivery[]` **恒为 `planned`（计划交期）
+> 口径**——`build_snapshot_msg` 给 service 传 `basis = None`，由 service
+> `unwrap_or_default()` 落到 `DeliveryBasis::Planned`。WS 端点不接受口径入参：
+> 前端丢弃 WS 推送的 snapshot（只当 invalidate 触发器，收到事件后重发 HTTP
+> `/snapshot?basis=planned|system`），故固定 planned 对前端透明。需要 `system`
+> 口径的调用方走 [`GET /api/v2/dashboard/snapshot?basis=system`](./dashboard.md#get-apiv2dashboardsnapshot)。
+
 错误码（握手阶段，HTTP 响应）：
 
 | code | 名称 | HTTP | 触发场景 |

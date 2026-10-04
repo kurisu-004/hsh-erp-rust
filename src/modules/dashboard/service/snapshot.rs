@@ -16,6 +16,9 @@
 //!   恶意大数；trait / SQL 层早已参数化（`planned_delivery_date < CURRENT_DATE +
 //   ($1::bigint || ' days')::interval`），本轮只把天数从写死 7 提到 query-driven
 //! - service 不持 repo / pool——handler 借 `&mut *tx` 喂给 trait 即可
+//! - 2026-10-04 新增 `basis: Option<DeliveryBasis>` 形参：交期分桶口径（计划交期
+//!   ↔ 系统交期）；None → `Planned`。口径默认值在本层 `unwrap_or_default()` 收口，
+//!   repo 层收确定值不做隐式兜底；WS 路径无 query 恒传 None，对前端透明
 //!
 //! ## 事务分层
 //! 事务移交 handler：service 方法 `<R: DashboardRepoTrait>(&self, mut repo: R, ...)`
@@ -28,6 +31,7 @@
 
 use std::collections::HashMap;
 
+use crate::modules::dashboard::dto::DeliveryBasis;
 use crate::modules::dashboard::repo::{BatchLite, DashboardRepoTrait, PartLite};
 use crate::modules::dashboard::vo::{DashboardItem, DashboardSnapshot, OnProductionShelfGroup};
 use crate::shared::analytics::shelf_grouping::group_by_shelf;
@@ -78,11 +82,15 @@ impl DashboardService {
     /// - `days`：未来 N 天交付分桶天数；None → `DASHBOARD_DEFAULT_DAYS`（14，与
     ///   前端 dashboard 视图横轴默认宽度对齐）；clamp(1, 60) 防御恶意大数 /
     ///   拼写错（0 / 负数 / 巨大日期）
+    /// - `basis`（2026-10-04 新增）：`upcoming_delivery[]` 分桶的交期口径；None →
+    ///   `DeliveryBasis::Planned`（计划交期）。默认值在此 `unwrap_or_default()`
+    ///   收敛成唯一决策点，repo 层收确定值不做兜底。
     pub async fn build_snapshot_with_workers<R: DashboardRepoTrait>(
         &self,
         mut repo: R,
         top_n: Option<i64>,
         days: Option<i64>,
+        basis: Option<DeliveryBasis>,
     ) -> Result<DashboardSnapshot, sqlx::Error> {
         let top_n = top_n.unwrap_or(DASHBOARD_TOP_N);
         // 2026-09-30 新增：原写死 7 改为 query-driven；None → 14 默认值
@@ -90,9 +98,11 @@ impl DashboardService {
         let days = days
             .unwrap_or(DASHBOARD_DEFAULT_DAYS)
             .clamp(DASHBOARD_MIN_DAYS, DASHBOARD_MAX_DAYS);
+        // 2026-10-04 新增：口径默认值在此收口；WS 路径恒传 None → Planned。
+        let basis = basis.unwrap_or_default();
 
         // 1) 4 次聚合 trait call
-        let upcoming = repo.snapshot_counters(days).await?;
+        let upcoming = repo.snapshot_counters(days, basis).await?;
         let top = repo.snapshot_top_parts(top_n).await?;
         let recent = repo.snapshot_recent_batches(top_n).await?;
 

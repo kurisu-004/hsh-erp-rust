@@ -106,7 +106,7 @@
 //! `docs/api/websocket.md`「连接关闭码」。
 //!
 //! ## 2026-09-22 Group E 重构：handler 三形态 ①（snapshot 单次只读聚合）
-//! `build_snapshot_msg` 走 `state.pool.begin() → state.dashboard_service.build_snapshot_with_workers(&mut tx, None) → tx.commit()`
+//! `build_snapshot_msg` 走 `state.pool.begin() → state.dashboard_service.build_snapshot_with_workers(&mut *tx, None, None, None) → tx.commit()`
 //! 路径，commit 即结束（WS 协议不依赖 tx，handler 内已完成全部 DB 读取）。后续 ws_hub.broadcast
 //! 是订阅事件模式，不再走 service、不开 tx。
 //!
@@ -128,6 +128,7 @@ use tracing::{info, warn};
 use crate::auth::middleware::verify_session_token;
 use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
+use crate::modules::dashboard::dto::DeliveryBasis;
 use crate::modules::dashboard::vo::{DashboardSnapshot, WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
@@ -167,10 +168,15 @@ pub struct WsQuery {
 ///   业务取值范围 1..=60（service 层 `clamp` 防御恶意大数）。
 /// - 字段解析走 `deserialize_i64_opt`：None 表示缺省，Some(str) parse 为 i64；
 ///   非数字字符串会返 4xx（axum Query 反序列化错误）——与仓内 part 域 DTO 一致。
+/// - `basis`（2026-10-04 新增）：`upcoming_delivery[]` 分桶的交期口径
+///   （`planned` / `system`），None / 缺省 = `planned`（service 层兜底）；
+///   非法取值由 axum `Query` 反序列化直接 4xx，不自写错误码。
 #[derive(Debug, Default, Deserialize)]
 pub struct SnapshotQuery {
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
     pub upcoming_days: Option<i64>,
+    #[serde(default)]
+    pub basis: Option<DeliveryBasis>,
 }
 
 /// `GET /ws/dashboard?token=<JWT>`
@@ -228,16 +234,20 @@ pub async fn ws_dashboard(
 /// - `?upcoming_days=<i64>`：未来 N 天交付分桶的天数；缺省 / 非法 → 14
 ///   （service 层 `unwrap_or(14).clamp(1, 60)` 兜底）。前端 dashboard 视图可
 ///   按用户视图范围调整柱状图横轴宽度。
+/// - `?basis=planned|system`（2026-10-04 新增）：`upcoming_delivery[]` 分桶的交期
+///   口径，`planned` = `t_part.planned_delivery_date`（缺省）、
+///   `system` = `t_part.system_delivery_date`；非法取值（如 `?basis=xxx`）由 axum
+///   `Query` 反序列化自动 4xx。
 ///
 /// 实现要点（handler 三形态 ①：snapshot 单次只读聚合）：
 /// - `state.pool.begin()` 借 tx 边界
-/// - `state.dashboard_service.build_snapshot_with_workers(&mut *tx, None, q.upcoming_days)` —— 同
+/// - `state.dashboard_service.build_snapshot_with_workers(&mut *tx, None, q.upcoming_days, q.basis)` —— 同
 ///   `build_snapshot_msg` 内部调用的 service 方法，零新 SQL；WS 路径 `None` 透传
-///   走默认 14 天（前端 WS 信封 schema 不验长度，安全）
+///   走默认 14 天 + `planned` 口径（前端 WS 信封 schema 不验长度与口径，安全）
 /// - `tx.commit()` 立即结束（service 层内部 SQL 全只读，开 tx 仅作聚合边界）
 /// - 不引入新错误码：DB / SQL 失败走 `AppError::from(sqlx::Error)` 通透 `R<T>` 错误码
-///   段（与现有 handler 一致）；非数字 `upcoming_days` 走 axum `Query` 反序列化
-///   错误自动 4xx（与 part 域 DTO 行为对齐）
+///   段（与现有 handler 一致）；非数字 `upcoming_days` / 非法 `basis` 走 axum `Query`
+///   反序列化错误自动 4xx（与 part 域 DTO 行为对齐）
 pub async fn get_snapshot(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SnapshotQuery>,
@@ -246,7 +256,7 @@ pub async fn get_snapshot(
     let mut tx = state.pool.begin().await?;
     let snap = state
         .dashboard_service
-        .build_snapshot_with_workers(&mut *tx, None, q.upcoming_days)
+        .build_snapshot_with_workers(&mut *tx, None, q.upcoming_days, q.basis)
         .await?;
     tx.commit().await?;
     Ok(Json(R::ok(snap)))
@@ -671,9 +681,13 @@ async fn build_snapshot_msg(state: &AppState) -> Result<String, AppError> {
     // 2026-09-30 新增 days 形参：WS 握手 snapshot 与 HTTP `/snapshot` 共享 service，
     // WS 路径无 query，固定 `None` 走 service 默认 14 天（与 HTTP 缺省值对齐）；
     // 前端 WS 信封 schema 不验长度，透传对前端透明。
+    // 2026-10-04 新增 basis 形参：WS 恒传 `None` → service 兜底 `Planned`（计划交期）。
+    // 理由：前端 dashboard 丢弃 WS 推送的 snapshot（只把它当 invalidate 触发器，
+    // 数据靠收到事件后重发 HTTP `/snapshot?basis=…` 拉），故 WS 侧固定 planned
+    // 口径对前端完全透明，不需要在 WS 握手上再开一个口径协商面。
     let snap = state
         .dashboard_service
-        .build_snapshot_with_workers(&mut *tx, None, None)
+        .build_snapshot_with_workers(&mut *tx, None, None, None)
         .await?;
     tx.commit().await?;
     let envelope = WsSnapshotMsg::new(snap);
