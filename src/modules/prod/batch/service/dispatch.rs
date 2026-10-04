@@ -187,8 +187,8 @@ impl BatchService {
                     AppError::biz(
                         code::BIZ_SHELF_PROCESS_NOT_FOUND,
                         format!(
-                            "process {target_process_id} 无可用货架映射（t_shelf_process 0 结果，\
-                             或命中的货架已软删 / 已停用 / 非 PRODUCTION 区）"
+                            "process {target_process_id} 无可用货架映射（无 active 映射，\
+                             或命中的映射其货架均已软删 / 已停用 / 非 PRODUCTION 区）"
                         ),
                     )
                 })?;

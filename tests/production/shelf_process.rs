@@ -15,6 +15,12 @@
 //!    品检区货架配工序 → 20104 `BIZ_INVALID_VALUE`，且一条 mapping 都不写
 //! 6. `set_shelf_processes_rejects_inactive_shelf` —— 2026-10-04：`is_active=false`
 //!    但未软删的货架 → 20512 `BIZ_SHELF_INACTIVE`（该形态经 API 造不出，故直插）
+//! 7. `set_shelf_processes_rejects_missing_or_soft_deleted_shelf` —— 2026-10-04
+//!    review 第 1 轮 M1 补齐第三形态：货架不存在 / 已软删 → 20501，且**清空路径
+//!    （`items: []`）同样守**（否则会静默「成功」一个对已删货架的空操作）
+//! 8. `set_shelf_processes_allows_clearing_inspection_zone_mappings` —— 2026-10-04
+//!    review 第 1 轮 B1：`items: []`（清空）**豁免** zone / is_active 守卫 —— 存量
+//!    非法映射必须留有 API 清理路径，否则「只读诊断 SQL ② 列出的行清不掉」
 //!
 //! ## fixture 选择（2026-10-02 判定）
 //! 用 **production fixture**（`load_production_fixture`）而非 shelf fixture：
@@ -450,4 +456,174 @@ async fn set_shelf_processes_rejects_inactive_shelf() {
     .await
     .expect("count active mappings");
     assert_eq!(n, 0, "拒收的 set 不得留下 mapping 行; got {n}");
+}
+
+/// 2026-10-04 review 第 1 轮 M1 补齐的第三形态：货架**已软删** → 20501。
+///
+/// 本文件此前 6 个用例没有一个覆盖 20501（`get_by_id` 带 `deleted_at IS NULL`，
+/// 已软删架与不存在的架同码）。验收要求「软删架 / 停用架 / 错 zone 架 各 ≥1 case」。
+/// 顺带把 B1 的边界钉住：**清空路径（`items: []`）也守 20501** —— 对一个已软删的
+/// 货架「清空映射」本该是 404，放行就变成静默成功的空操作。
+#[tokio::test]
+async fn set_shelf_processes_rejects_missing_or_soft_deleted_shelf() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    use hsh_erp_rust::infra::clock::now_naive;
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_002, 5);
+    let shelf_id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at, deleted_at) VALUES ($1, 'FX-SH-DEL', 'FX 软删架', \
+         'PRODUCTION', false, 0, 0, $2, $2, $2)",
+    )
+    .bind(shelf_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert soft-deleted t_shelf");
+
+    let p1 = insert_test_process(&pool, "P-MAP-DEL", "Map-Process-Deleted").await;
+
+    // ① 非空 items → 20501（HTTP 404）
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/shelf-processes/{shelf_id}"),
+            Some(json!({
+                "items": [
+                    { "process_id": p1.to_string(), "sort_order": 0 },
+                ],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "已软删货架应 404（20501 资源缺失段）: {env}"
+    );
+    assert_eq!(
+        env["code"].as_i64().unwrap(),
+        20501,
+        "expected BIZ_SHELF_NOT_FOUND; got: {env}"
+    );
+
+    // ② 清空路径同样守 20501 —— 豁免的只是 zone / is_active，不是存在性
+    let (s2, env2) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/shelf-processes/{shelf_id}"),
+            Some(json!({ "items": [] })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s2,
+        StatusCode::NOT_FOUND,
+        "已软删货架的清空请求也不该静默成功: {env2}"
+    );
+    assert_eq!(env2["code"].as_i64().unwrap(), 20501, "got: {env2}");
+
+    // ③ 完全不存在的 id 也归 20501（与已软删同码）
+    let (s3, env3) = send(
+        bootstrap_as_manager().await.1,
+        json_request(
+            "POST",
+            "/prod/shelf-processes/999999999999999999",
+            Some(json!({ "items": [] })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::NOT_FOUND, "不存在的货架应 404: {env3}");
+    assert_eq!(env3["code"].as_i64().unwrap(), 20501, "got: {env3}");
+}
+
+/// 2026-10-04 review 第 1 轮 B1：`items: []`（清空）**豁免** zone / is_active 守卫。
+///
+/// 无条件守卫会让**存量非法映射失去唯一的 API 清理路径** —— 整组替换语义下改不了其中
+/// 一条，而 `PUT /shelves/{id}` 的 `ShelfUpdateRequest` 只有 `name` / `location`
+/// （`zone` 不可经 API 改），也没有「先换成生产架再清映射」这条绕路。于是「只读诊断
+/// SQL ② 列出的行在本仓清不掉」，诊断与处置自相矛盾。
+///
+/// 用例形状：品检架（`INSPECTION`，active）先造 1 条 active 映射（直插，模拟存量脏数据
+/// —— 新守卫上线后 API 已造不出），再发 `items: []` ⇒ 必须 200 且该映射被软删。
+/// 与 `set_shelf_processes_rejects_inspection_zone_shelf` 同架同 `items` 形态的对照是
+/// 「非空 → 20104」 vs 「空 → 200」，两条一起把守卫边界钉死。
+#[tokio::test]
+async fn set_shelf_processes_allows_clearing_inspection_zone_mappings() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    // part fixture 预置的品检架（FX-SH-INSP，zone='INSPECTION'，is_active=true）
+    let shelf_id = PartFixture::INSPECTION_SHELF_ID;
+    let p1 = insert_test_process(&pool, "P-MAP-CLR", "Map-Process-Clear").await;
+
+    // 直插 1 条「存量非法映射」：品检架 + active mapping 行（API 已造不出）
+    sqlx::query(
+        "INSERT INTO t_shelf_process (shelf_id, process_id, sort_order, version, \
+         created_at, updated_at) VALUES ($1, $2, 0, 0, now(), now())",
+    )
+    .bind(shelf_id)
+    .bind(p1)
+    .execute(&pool)
+    .await
+    .expect("insert legacy illegal mapping");
+
+    let before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_shelf_process WHERE shelf_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(shelf_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count before clear");
+    assert_eq!(before, 1, "前置：品检架上应有 1 条 active 存量映射");
+
+    // 清空请求：品检架 + items: [] ⇒ 必须放行（豁免 zone / is_active）
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/shelf-processes/{shelf_id}"),
+            Some(json!({ "items": [] })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "清空路径必须对品检架放行（否则存量非法映射无 API 清理路径）: {env}"
+    );
+
+    let after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_shelf_process WHERE shelf_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(shelf_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count after clear");
+    assert_eq!(
+        after, 0,
+        "放行的清空必须真的软删掉 active 映射; got {after}"
+    );
+
+    // 历史行保留（软删而非物理删），便于追溯 —— 与端点契约一致
+    let soft_deleted_at: Option<chrono::NaiveDateTime> = sqlx::query_scalar(
+        "SELECT deleted_at FROM t_shelf_process \
+         WHERE shelf_id = $1 AND process_id = $2 AND deleted_at IS NOT NULL",
+    )
+    .bind(shelf_id)
+    .bind(p1)
+    .fetch_one(&pool)
+    .await
+    .expect("read soft-deleted mapping");
+    assert!(
+        soft_deleted_at.is_some(),
+        "清空应走软删（deleted_at 置位）而非物理删除"
+    );
 }

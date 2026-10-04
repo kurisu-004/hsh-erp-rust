@@ -449,6 +449,7 @@ Response 200 `data`：[`DispatchResult`](#dispatchresult-字段2026-09-30-重构
 - 20508 BIZ_SHELF_PROCESS_NOT_FOUND —— `target_process_id` 查不到**可用**货架映射
   （2026-10-04 起含「有映射但货架已软删 / 已停用 / `zone≠'PRODUCTION'`」，详见下节）
 - 40901 VERSION_CONFLICT —— 并发事务已成功提交过本批次（OCC）
+- 40300 FORBIDDEN —— 非 Manager/Clerk
 
 ### 目标货架守卫（2026-10-04 新增）
 
@@ -475,7 +476,10 @@ AND sh.zone = 'PRODUCTION'`，故这类批次永远不出现在工人的可领�
 存量排查 SQL 见 [`./shelf-process-mapping.md`](./shelf-process-mapping.md) 的
 「只读诊断 SQL」一节（只读，不自动修数据）。
 
-- 40300 FORBIDDEN —— 非 Manager/Clerk
+> 另两个 `current_holder_id` 写点（`/prod/pool/move` 的 WORKER→POOL、`worker-scan` 的
+> RETURNED）的货架来自**请求**而非映射，各有独立守卫（`validate_shelf_zone` /
+> `ShelfRepo::get_by_id_zone(.., "PRODUCTION")`），全仓 3 个写点已全覆盖。改动本节前
+> 请先看 `src/modules/prod/batch/service/guard.rs` 模块 doc 的写点清单。
 
 WS 广播（commit 后下发；仅 succeeded 时广播）：
 

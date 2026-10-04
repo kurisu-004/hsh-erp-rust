@@ -51,10 +51,12 @@ pub struct ShelfProcessService;
 impl ShelfProcessService {
     /// 设置指定 shelf 的工序映射 —— **整组替换**语义：
     ///
-    /// 1. 校验 shelf 存在 + active + `zone='PRODUCTION'`（`prod::batch::service::guard::validate_shelf_zone`）
-    /// 2. 校验 items 内的所有 process_id 存在（`ProcessRepo::list_by_ids`，同域）
-    /// 3. 软删该 shelf 的全部旧 mapping（`ShelfProcessRepo::soft_delete_all_for_shelf`）
-    /// 4. INSERT 新 mapping（`ShelfProcessRepo::bulk_insert`，按 sort_order）
+    /// 1. 校验 shelf 存在（20501）
+    /// 2. **`items` 非空时**额外校验 shelf active（20512）+ `zone='PRODUCTION'`（20104）
+    ///    （`prod::batch::service::guard::validate_shelf_zone`；`items` 为空 = 清空，见下）
+    /// 3. 校验 items 内的所有 process_id 存在（`ProcessRepo::list_by_ids`，同域）
+    /// 4. 软删该 shelf 的全部旧 mapping（`ShelfProcessRepo::soft_delete_all_for_shelf`）
+    /// 5. INSERT 新 mapping（`ShelfProcessRepo::bulk_insert`，按 sort_order）
     ///
     /// 整组事务由 caller 保证（handler 层 `state.pool.begin()` + commit）。
     ///
@@ -74,26 +76,40 @@ impl ShelfProcessService {
     ///
     /// **为什么「只有 PRODUCTION 区能配工序」是对的**：`t_shelf_process` 的语义是
     /// 「可执行某工序的**在制品**货架」，三条读侧全部是生产流 —— 下发解析货架
-    /// （`dispatch_single`）、worker 归还（worker_scan RETURNED）、候选池放回
+    /// （`dispatch_single`）、worker 归还（`worker_scan` RETURNED）、候选池放回
     /// （`/prod/pool/move`）。品检流走的是显式 `target_inspection_shelf_id` +
     /// `validate_shelf_zone(.., "INSPECTION")`（见 `prod::batch::service::scan` /
     /// `outsource`），**完全不读 `t_shelf_process`**；前端 10 处
     /// `useShelfProcessFilter` 消费 `GET /prod/shelf-processes` 时，货架候选源也一律是
-    /// `zone='PRODUCTION'` 过滤后的列表。品检架上的映射行是**既无读侧消费、又能让脏货架
-    /// 落进 holder** 的纯负债。
+    /// `zone='PRODUCTION'` 过滤后的列表。品检架上的映射行因此是**无读侧消费**的纯负债：
+    /// 三条读侧里只有 `dispatch_single` 会**从映射里选出**货架（故其 SQL 必须自带
+    /// 谓词），另两条的 `shelf_id` 来自请求、在写 `current_holder_id` 之前各自独立
+    /// 守过货架本身（`worker_scan` 用 `ShelfRepo::get_by_id_zone(.., "PRODUCTION")`
+    /// 一步守掉存在/软删/停用/zone 四个谓词；`move_batch` 用
+    /// `validate_shelf_zone`）—— 故品检架上的映射行不会被它们选中。
     ///
     /// **收紧的副作用（已知且接受）**：对品检架（或任何非 PRODUCTION 区货架）调本端点
-    /// 现在返 `20104`，且**存量**非法映射在下一次 `POST` 整组替换时同样被拒（整组替换
-    /// 语义下无法只改其中一条）。这是刻意的 fail-fast：让配置错误在**写侧**暴露，而不是
-    /// 继续静默产出漏件批次。存量非法行的排查 SQL（只读）见
+    /// 且 `items` **非空**时现在返 `20104`。这是刻意的 fail-fast：让配置错误在**写侧**
+    /// 暴露，而不是继续静默产出漏件批次。存量非法行的排查 SQL（只读）见
     /// `docs/api/production/shelf-process-mapping.md` 的「只读诊断 SQL」一节；**本仓不
     /// 自动修数据**，修复走独立的数据修复单。
+    ///
+    /// ## 2026-10-04 review 第 1 轮 B1：`items: []`（清空）豁免 zone / is_active 守卫
+    /// 守卫只对「**要写新 mapping 行**」的请求生效，`items.is_empty()` 时跳过。理由：
+    /// 清空只会 `soft_delete_all_for_shelf`，**不新增任何非法映射**，拦它零收益；反过来，
+    /// 无条件守卫会让**存量非法映射失去唯一的 API 清理路径** —— 整组替换语义下改不了
+    /// 其中一条，而 `ShelfUpdateRequest` 只有 `name` / `location`（`zone` 不可经 API 改），
+    /// 也就没有「先把架改成 PRODUCTION 再清映射」这条绕路。结果是「只读诊断 SQL ② 列出的
+    /// 行，在本仓找不到任何 API 能清掉」，诊断与处置自相矛盾。
+    /// 存在性（20501）仍无条件守：货架不存在/已软删时清空也无意义（`get_by_id` 带
+    /// `deleted_at IS NULL`，否则会静默「成功」一个对已删货架的空操作）。
+    /// 回归见 `tests/production/shelf_process.rs::set_shelf_processes_allows_clearing_inspection_zone_mappings`。
     ///
     /// ## 20512 的可达性
     /// 货架 service 的 `deactivate` 等价于 soft-delete（同时 `is_active=false` +
     /// `deleted_at=now()`），故经 API 停用的货架先命中 20501；20512 是防「直接改库 /
     /// 历史数据造成 `is_active=false` 但未软删」的防御位，与 `validate_shelf_zone`
-    /// 在其它 5 个调用点的定位一致。
+    /// 在其余生产流调用点的定位一致。
     pub async fn set_shelf_processes(
         &self,
         conn: &mut PgConnection,
@@ -103,18 +119,41 @@ impl ShelfProcessService {
         current: &CurrentUser,
     ) -> Result<(), AppError> {
         // 1. shelf 存在性 + 软删 + 停用 + zone 守卫（2026-10-04 复用 prod::batch 的
-        // `validate_shelf_zone`，与 place_on_shelf / pickup / outsource 等 6 个生产流
+        // `validate_shelf_zone`，与 place_on_shelf / pickup / outsource 等生产流
         // 端点**同源同码**：20501 → 20512 → 20104，不另造判定）。
+        //
+        // ⚠️ 2026-10-04 review 第 1 轮 B1：守卫**只对「要写新 mapping 行」的请求生效**，
+        // `items` 为空（清空）时跳过。存在性（20501）仍在下方无条件守。
+        //
+        //   为什么不拦清空：清空只 `soft_delete_all_for_shelf`，不新增任何非法映射，
+        //   拦它零收益；无条件守卫会让存量非法映射**失去唯一的 API 清理路径**（整组
+        //   替换改不了其中一条，且 `ShelfUpdateRequest` 无 `zone` 字段、换不了区），
+        //   于是「只读诊断 SQL ② 列出的行在本仓清不掉」，诊断与处置自相矛盾。
+        //
+        //   为什么仍守存在性：货架不存在/已软删时清空也无意义，放行会变成对已删货架的
+        //   静默空操作（`ShelfRepo::get_by_id` 带 `deleted_at IS NULL`）。
+        //
+        //   回归：`tests/production/shelf_process.rs::set_shelf_processes_allows_clearing_inspection_zone_mappings`
+        //   （品检架 + `items: []` → 200 且旧映射被清掉）。
         //
         // 依赖方向说明：shelf_process → prod::batch::service::guard 是**同域**横向依赖
         // （guard.rs 是 prod 域的货架校验自由函数层，不是 batch 域私有实现）；换来的是
         // 「判序与错误码只有一份」——本仓已因两份判序（2026-10-02 域拆分前后的内联 SQL）
         // 分叉过一次，不值得再开第二个。
         //
-        // ⚠️ 本函数原先自己 `ShelfRepo::get_by_id` 拿 `shelf`（为 20501），改调本守卫后
-        // 不再需要该行：守卫内部已按同一 id 查过同一次，`shelf.id == shelf_id`，
-        // 故下方 `bulk_insert` 直接用形参 `shelf_id`，**不增加任何 DB 往返**。
-        validate_shelf_zone(&mut *conn, shelf_id, "PRODUCTION").await?;
+        // ⚠️ 两个分支各自恰好 1 次 DB 往返：非空分支由守卫内部的 `ShelfRepo::get_by_id`
+        // 承担，空分支由下面的显式 `get_by_id` 承担。守卫内部查的就是同一 id
+        // （`shelf.id == shelf_id`），故下方 `bulk_insert` 直接用形参 `shelf_id`。
+        if !items.is_empty() {
+            validate_shelf_zone(&mut *conn, shelf_id, "PRODUCTION").await?;
+        } else if ShelfRepo::get_by_id(&mut *conn, shelf_id).await?.is_none() {
+            // 文案与 `validate_shelf_zone` 的 20501 分支**逐字一致**（刻意）：同一个
+            // 「货架不存在」事实不该因 `items` 是否为空而给运营两种说法。改一处记得改另一处。
+            return Err(AppError::biz(
+                code::BIZ_SHELF_NOT_FOUND,
+                format!("shelf {shelf_id} 不存在"),
+            ));
+        }
 
         // 2. 解析 + 校验所有 process_id 存在
         let mut process_ids: Vec<i64> = Vec::with_capacity(items.len());
