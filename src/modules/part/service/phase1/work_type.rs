@@ -7,6 +7,9 @@
 //! 2026-10-02：手动 `pick_up`（B 方案兜底）随批次用例迁往
 //! `crate::modules::prod::batch::service::pickup`，三条 list 端点留在 part 域。
 
+use chrono::NaiveDate;
+use rust_decimal::Decimal;
+
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::vo::{ChainState, PartListItem, PartListOut};
@@ -14,6 +17,153 @@ use crate::shared::error::AppError;
 
 use super::super::PartService;
 use crate::modules::part::dto_crud::{ByWorkTypeQuery, ByWorkerQuery};
+
+/// 1970-01-01：未投影的 `date` 类占位值。
+///
+/// ⚠️ `planned_delivery_date` 自 2026-10-04 起**投影真实值**（见
+/// [`WorkTypeListRow`]），本常量只剩 `request_date` 一个消费方；而 `request_date`
+/// 三条端点都没投影，恒为占位。前端没有消费 `request_date`，故保持占位不动。
+const PLACEHOLDER_DATE: NaiveDate = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+
+/// Unix epoch：未投影的 `timestamp` 类占位值。
+const PLACEHOLDER_TS: chrono::NaiveDateTime =
+    chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap();
+
+// ===========================================================================
+//  共享取行投影（2026-10-04 新增）
+// ===========================================================================
+
+/// 三条工种 / 工人维度 list 端点共用的取行投影。
+///
+/// ## 为什么不是 `TPart` 字面量
+/// 2026-10-04 之前三处各手抄一份 20 字段的 `TPart { ... }` 字面量再交给
+/// `PartListItem::from`。两个后果：
+/// 1. **占位值伪装成业务值** —— 取行 SQL 只投影 `p.id` / `p.serial_no` /
+///    `p.drawing_no` 三列，其余全靠字面量填，于是 `name` 填成图号、
+///    `is_urgent` 填 `false`、`system_delivery_date` 填 `None`、
+///    `planned_delivery_date` 填 1970-01-01。报工台三页的「加急」tag 与交期 chip
+///    因此永不渲染，而 `ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC`
+///    排的却是 **DB 真实列** ⇒ 列表已按加急排好、工件上看不出任何标记。
+/// 2. **漏字段不报错** —— `TPart` 30+ 字段，加字段时三份字面量要手改三处。
+///
+/// 本 struct 把「SQL 投影了什么」写成**一个**可编译检查的事实：字段名即 SQL 别名
+/// （`#[derive(sqlx::FromRow)]` 按列名匹配），三处取行 SQL 必须逐字投影每一个字段，
+/// 否则运行时报 missing column 而非静默取到默认值。端点不消费的字段在 SQL 里显式
+/// 投影成 `NULL::<type> AS <字段名>`，把「本端点不填」写进 SQL 而不是靠 struct 缺省。
+///
+/// ## 字段填充口径
+/// - part 侧 `id` / `serial_no` / `name` / `drawing_no` / `is_urgent` /
+///   `planned_delivery_date` / `system_delivery_date`：三条端点都投影**真实值**。
+/// - `quantity`：取自**批次**（`b.quantity`）而非 part。
+/// - `process_chain_id`：仅 `by-worker` 投影真实值；另两条投影 `NULL`（口径见
+///   `vo/part.rs` 字段 doc）。
+/// - `batch_id` / `batch_version`：仅 `pickable-by-work-type` / `by-worker` 填
+///   （本 VO 的行单位是批次；`by-work-type` 投影 `NULL`）。
+/// - 链四字段：仅 `by-worker` 填（链位置是**批次级**事实，part 级投影无从推导）。
+///
+/// ## 刻意没有的字段
+/// `next_process_id` **不在本 struct 里，也不在 `PartListItem` 里** —— 列表响应
+/// 从不暴露该字段（2026-09-27 用户决策范围 C，`vo/part.rs` 的
+/// `From<TPart> for PartListItem` 因此也不复制它）。旧代码在 `TPart` 字面量里写
+/// `next_process_id: None` 只是给一个不会被读的字段赋值。现在这条不变量由
+/// **类型系统 + 序列化守卫**双重保证：struct 与 `PartListItem` 都没有该字段
+/// （新增即编译失败），且 `tests/part/pickable_by_work_type.rs` 断言响应 JSON
+/// 不含 `next_process_id` 键。
+#[derive(Debug, sqlx::FromRow)]
+struct WorkTypeListRow {
+    // ---- part 侧（三条端点均投影真实值）----
+    id: i64,
+    serial_no: Option<String>,
+    name: String,
+    drawing_no: String,
+    is_urgent: bool,
+    planned_delivery_date: NaiveDate,
+    /// `t_part.system_delivery_date` 是**可空**列（`date` 无 NOT NULL）。
+    system_delivery_date: Option<NaiveDate>,
+    // ---- 批次侧 ----
+    /// 取自 `b.quantity`（批次数量），不是 `p.quantity`。
+    quantity: i32,
+    process_chain_id: Option<i64>,
+    batch_id: Option<i64>,
+    batch_version: Option<i32>,
+    // ---- 工序链派生（仅 by-worker 填）----
+    /// 取行 SQL 侧已 `COALESCE(..., 'NONE')`，故 `by-worker` 恒为 `Some`；
+    /// 另两条端点投影 `NULL::text` ⇒ `None`。
+    chain_state: Option<String>,
+    /// 取行 SQL 侧已 `COALESCE(..., 0)`；另两条端点投影 `NULL::bigint`。
+    chain_next_process_id: Option<i64>,
+    chain_next_process_name: Option<String>,
+    chain_current_process_name: Option<String>,
+}
+
+impl WorkTypeListRow {
+    /// 投影行 → `PartListItem`。
+    ///
+    /// 这是全仓**唯一**构造这三端点出参的地方，用**穷尽 struct 字面量**而非
+    /// `From<TPart>`：`PartListItem` 加字段时这里编译失败（`From` 派生路径同样会
+    /// 失败，但字面量让「哪些字段是投影、哪些是占位」一眼可辨）。
+    ///
+    /// 仍为占位值的字段（前端均无消费方，2026-10-04 有意不动）：`applicant_name` /
+    /// `request_date` / `customer_id` / `status` / `order_no` / `note` /
+    /// `unit_price` / `total_price` / `version` / `created_at` / `created_by` /
+    /// `updated_at` / `updated_by` / `deleted_at` / `assembly_id` /
+    /// `customer_name` / `l1_customer_name` / `location` / `holder_name` /
+    /// `delivered_quantity`。口径与改造前逐字一致（`From<TPart>` 也是这么填的）。
+    fn into_list_item(self) -> PartListItem {
+        PartListItem {
+            id: self.id,
+            serial_no: self.serial_no,
+            // ⚠️ 2026-10-04 起是 `t_part.name` 真实值；改造前是 `drawing_no` 的副本。
+            name: self.name,
+            drawing_no: self.drawing_no,
+            is_urgent: self.is_urgent,
+            planned_delivery_date: self.planned_delivery_date,
+            system_delivery_date: self.system_delivery_date,
+            quantity: self.quantity,
+            process_chain_id: self.process_chain_id,
+            batch_id: self.batch_id,
+            batch_version: self.batch_version,
+            // 未投影链字段的两条端点（`None`）取保守默认 `NONE` / `"0"`：
+            // `NONE` 语义是「让用户手填下一道工序」，与「不知道」同向。
+            chain_state: self
+                .chain_state
+                .as_deref()
+                .map_or(ChainState::None, ChainState::from_db_text),
+            chain_next_process_id: self.chain_next_process_id.unwrap_or(0),
+            chain_next_process_name: self.chain_next_process_name,
+            chain_current_process_name: self.chain_current_process_name,
+            // ---- 以下为占位值（前端无消费方，见方法 doc）----
+            applicant_name: String::new(),
+            request_date: PLACEHOLDER_DATE,
+            customer_id: 0,
+            status: "IN_PROCESS".to_string(),
+            order_no: None,
+            note: None,
+            unit_price: Decimal::ZERO,
+            total_price: Decimal::ZERO,
+            // ⚠️ 本 VO 的 `version` 是 **part 级**（`t_part.version`），而三条端点的
+            // 取行 SQL 都没投影 `p.version` —— 恒 0 是**有意的占位**，不是漏取值。
+            // 批次乐观锁版本走 `PartListItem::batch_version`（取自 `b.version`）；
+            // 下一个读者请勿把本字段当批次版本用。
+            version: 0,
+            created_at: PLACEHOLDER_TS,
+            created_by: None,
+            updated_at: PLACEHOLDER_TS,
+            updated_by: None,
+            deleted_at: None,
+            assembly_id: None,
+            customer_name: None,
+            l1_customer_name: None,
+            location: None,
+            holder_name: None,
+            row_type: Some("PART".to_string()),
+            has_children: false,
+            child_count: None,
+            has_cnc_program: false,
+            delivered_quantity: None,
+        }
+    }
+}
 
 impl PartService {
     // ===== Phase 2 (2026-09-13) — 领取链路 (B 方案：手动 pick-up 兜底) =====
@@ -45,8 +195,28 @@ impl PartService {
         // （`unexpected null; try decoding as an Option`）。手工工单是常态，
         // 故这是真会触发的路径。同一缺陷的第三处见 `list_pickable_by_work_type`
         // （2026-10-03 已修）与本文件 `list_by_worker`（同批已修）。
-        let rows: Vec<(i64, Option<String>, String, i32, i64, Option<String>)> = sqlx::query_as(
-            "SELECT p.id, p.serial_no, p.drawing_no, b.quantity, b.id AS bid, w.name AS worker_name \
+        //
+        // 2026-10-04 补投影 part 侧 4 个真实列（`name` / `is_urgent` /
+        // `system_delivery_date` / `planned_delivery_date`）：此前 `name` 填的是
+        // 图号副本、`is_urgent` 恒 false、两个交期是占位值。本端点前端无消费方
+        // （`pickable-by-work-type` 才是报工台的列表源），补投影只为三个端点口径
+        // 一致，避免下次又各自漂移。
+        //
+        // 2026-10-04 删两列死投影（`b.id AS bid` / `w.name AS worker_name`）：原
+        // 代码取出来只 `let _ = bid;` / `let _ = worker_name;` 丢弃，从未进过出参。
+        // 删掉后本 SQL 的列集与 [`WorkTypeListRow`] 的字段集逐字对齐 —— 本端点
+        // 不填批次锚点与链派生（口径见 [`WorkTypeListRow`] 字段 doc），故显式
+        // 投影成 `NULL::<type> AS <字段名>`：`FromRow` 按列名匹配，漏投影会报
+        // missing column，而 `Option` 字段漏投影时若改用 `#[sqlx(default)]`
+        // 会**静默**取默认值，正是本次要消灭的那类「填了但没人知道」的口径。
+        let rows: Vec<WorkTypeListRow> = sqlx::query_as(
+            "SELECT p.id, p.serial_no, p.name, p.drawing_no, p.is_urgent, \
+                    p.system_delivery_date, p.planned_delivery_date, b.quantity, \
+                    NULL::bigint AS batch_id, NULL::integer AS batch_version, \
+                    NULL::bigint AS process_chain_id, NULL::text AS chain_state, \
+                    NULL::bigint AS chain_next_process_id, \
+                    NULL::text AS chain_next_process_name, \
+                    NULL::text AS chain_current_process_name \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
              JOIN t_worker w ON w.id = b.current_holder_id \
@@ -63,41 +233,7 @@ impl PartService {
         .await?;
         let items: Vec<PartListItem> = rows
             .into_iter()
-            .map(|(id, serial, drawing, qty, bid, worker_name)| {
-                // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段，
-                // 通过 `From<TPart>` 派生基础字段（next_process_id 自动不复制）。
-                let p = crate::modules::part::model::TPart {
-                    id,
-                    serial_no: serial,
-                    name: drawing.clone(),
-                    drawing_no: drawing,
-                    applicant_name: String::new(),
-                    quantity: qty,
-                    request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    customer_id: 0,
-                    assembly_id: None,
-                    status: "IN_PROCESS".to_string(),
-                    is_urgent: false,
-                    next_process_id: None,
-                    order_no: None,
-                    system_delivery_date: None,
-                    note: None,
-                    unit_price: rust_decimal::Decimal::ZERO,
-                    total_price: rust_decimal::Decimal::ZERO,
-                    version: 0,
-                    created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                    created_by: None,
-                    updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                    updated_by: None,
-                    deleted_at: None,
-                    process_chain_id: None,
-                };
-                // 附加 worker_name（轻量：DTO 上没字段，仅放 batch_id 展示）
-                let _ = bid;
-                let _ = worker_name;
-                PartListItem::from(p)
-            })
+            .map(WorkTypeListRow::into_list_item)
             .collect();
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::bigint FROM t_part_batch b \
@@ -156,9 +292,20 @@ impl PartService {
         // 是 nullable（手工工单无序列号），原先按 `String` 解码 → 遇到任一
         // `serial_no IS NULL` 的 part 就整页 500（`unexpected null; try decoding as
         // an Option`）。手工工单是常态，故这是真会触发的路径。
-        let rows: Vec<(i64, Option<String>, String, i32, Option<i64>, i64, i32)> = sqlx::query_as(
-            "SELECT p.id, p.serial_no, p.drawing_no, b.quantity, b.current_process_id, \
-                    b.id, b.version \
+        //
+        // 2026-10-04 补投影 part 侧 4 个真实列（`name` / `is_urgent` /
+        // `system_delivery_date` / `planned_delivery_date`），并给
+        // `t_part_process_chain` 无关的链四列投影 `NULL`（本端点不填，口径见
+        // [`WorkTypeListRow`] 字段 doc）—— `FromRow` 按列名匹配，列集必须与
+        // struct 字段集逐字对齐。
+        let rows: Vec<WorkTypeListRow> = sqlx::query_as(
+            "SELECT p.id, p.serial_no, p.name, p.drawing_no, p.is_urgent, \
+                    p.system_delivery_date, p.planned_delivery_date, b.quantity, \
+                    b.id AS batch_id, b.version AS batch_version, \
+                    NULL::bigint AS process_chain_id, NULL::text AS chain_state, \
+                    NULL::bigint AS chain_next_process_id, \
+                    NULL::text AS chain_next_process_name, \
+                    NULL::text AS chain_current_process_name \
              FROM t_part_batch b \
              JOIN t_part p ON p.id = b.part_id \
              JOIN t_work_type_process wtp ON wtp.process_id = b.current_process_id \
@@ -180,49 +327,7 @@ impl PartService {
         .await?;
         let items: Vec<PartListItem> = rows
             .into_iter()
-            .map(|(id, serial, drawing, qty, _np, batch_id, batch_version)| {
-                // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段，
-                // 通过 `From<TPart>` 派生基础字段（next_process_id 自动不复制）。
-                let p = crate::modules::part::model::TPart {
-                    id,
-                    serial_no: serial,
-                    name: drawing.clone(),
-                    drawing_no: drawing,
-                    applicant_name: String::new(),
-                    quantity: qty,
-                    request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                    customer_id: 0,
-                    assembly_id: None,
-                    status: "IN_PROCESS".to_string(),
-                    is_urgent: false,
-                    next_process_id: None,
-                    order_no: None,
-                    system_delivery_date: None,
-                    note: None,
-                    unit_price: rust_decimal::Decimal::ZERO,
-                    total_price: rust_decimal::Decimal::ZERO,
-                    // ⚠️ 本 VO 的 `version` 是 **part 级**（`t_part.version`），
-                    // 而取行 SQL 压根没投影 `p.version`（只投影了 p.id /
-                    // p.serial_no / p.drawing_no）—— 恒 0 是**有意的占位**，
-                    // 不是漏取值。批次乐观锁版本走 2026-10-03 新增的
-                    // `PartListItem::batch_version`（取自 `b.version`）；
-                    // 下一个读者请勿把本字段当批次版本用。
-                    version: 0,
-                    created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                    created_by: None,
-                    updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                    updated_by: None,
-                    deleted_at: None,
-                    process_chain_id: None,
-                };
-                let mut item = PartListItem::from(p);
-                // 批次锚点：本端点是全仓唯一填这两字段的路径（出参契约见
-                // vo/part.rs::PartListItem::batch_id 的字段 doc）。
-                item.batch_id = Some(batch_id);
-                item.batch_version = Some(batch_version);
-                item
-            })
+            .map(WorkTypeListRow::into_list_item)
             .collect();
         let total: i64 = sqlx::query_scalar(
             // 2026-10-02 订正：与取行查询同 `wtp` 谓词（含 `wtp.deleted_at IS NULL`），
@@ -278,12 +383,14 @@ impl PartService {
         // 最后一处。
         //
         // 2026-10-04 补投影（`b.id` / `b.version` / `p.process_chain_id` +
-        // 4 个链派生列）：本端点的行本来就是「批次行」，而出参 VO 只有 part 级
-        // 字段 —— 报工台放回时既定位不到批次（发不出写请求），也判定不了「这批
-        // 是不是链尾 / 下一道是哪道」。批次锚点填 `PartListItem::batch_id` /
-        // `batch_version`，链派生填 `chain_state` / `chain_next_process_id` /
-        // `chain_next_process_name` / `chain_current_process_name`（填充口径见
-        // `vo/part.rs` 字段 doc；本端点是链四字段的唯一填充路径）。
+        // part 侧 4 个真实列 + 4 个链派生列）：本端点的行本来就是「批次行」，
+        // 而出参 VO 只有 part 级字段 —— 报工台放回时既定位不到批次（发不出写请求），
+        // 也判定不了「这批是不是链尾 / 下一道是哪道」，更看不到工单名 / 加急 /
+        // 交期（此前 `name` 填的是图号副本、`is_urgent` 恒 false、两个交期是占位
+        // 值）。批次锚点填 `PartListItem::batch_id` / `batch_version`，链派生填
+        // `chain_state` / `chain_next_process_id` / `chain_next_process_name` /
+        // `chain_current_process_name`（填充口径见 `vo/part.rs` 字段 doc；本端点是
+        // 链四字段的唯一填充路径）。
         //
         // `LEFT JOIN LATERAL` 派生的三值判据，**两步定位**（本端点自有纪律：锚链两步
         // 定位 / 派生列显式别名 / 末尾 `ORDER BY ... LIMIT 1` 收口 / 链内歧义显式
@@ -354,20 +461,9 @@ impl PartService {
         // 「有没有行」）。`chain_state` 的 `COALESCE(..., 'NONE')` 在最外层兜底：
         // 无链批次的 `current_process_step_id` 按写入不变式恒为 NULL ⇒ `cur` 无行
         // ⇒ LATERAL 无行 ⇒ 四个派生列全 NULL，此时必须仍给出 `NONE` / `0`。
-        let rows: Vec<(
-            i64,            // p.id
-            Option<String>, // p.serial_no
-            String,         // p.drawing_no
-            i32,            // b.quantity
-            i64,            // b.id
-            i32,            // b.version
-            Option<i64>,    // p.process_chain_id
-            String,         // chain_state
-            i64,            // chain_next_process_id
-            Option<String>, // chain_next_process_name
-            Option<String>, // chain_current_process_name
-        )> = sqlx::query_as(
-            "SELECT p.id, p.serial_no, p.drawing_no, b.quantity, \
+        let rows: Vec<WorkTypeListRow> = sqlx::query_as(
+            "SELECT p.id, p.serial_no, p.name, p.drawing_no, p.is_urgent, \
+                    p.system_delivery_date, p.planned_delivery_date, b.quantity, \
                     b.id AS batch_id, b.version AS batch_version, p.process_chain_id, \
                     COALESCE(nx.chain_state, 'NONE') AS chain_state, \
                     COALESCE(nx.chain_next_process_id, 0) AS chain_next_process_id, \
@@ -382,9 +478,9 @@ impl PartService {
                     WHEN nsp.id IS NULL THEN 'TAIL' \
                     ELSE 'NEXT' \
                   END AS chain_state, \
-                 nsp.process_id AS chain_next_process_id, \
-                 np.name AS chain_next_process_name, \
-                 cp.name AS chain_current_process_name \
+                  nsp.process_id AS chain_next_process_id, \
+                  np.name AS chain_next_process_name, \
+                  cp.name AS chain_current_process_name \
                FROM t_process_chain_step cur \
                JOIN t_part_process_chain pc \
                  ON pc.id = COALESCE(p.process_chain_id, cur.chain_id) \
@@ -431,63 +527,7 @@ impl PartService {
         .await?;
         let items: Vec<PartListItem> = rows
             .into_iter()
-            .map(
-                |(
-                    id,
-                    serial,
-                    drawing,
-                    qty,
-                    batch_id,
-                    batch_version,
-                    process_chain_id,
-                    chain_state,
-                    chain_next_process_id,
-                    chain_next_process_name,
-                    chain_current_process_name,
-                )| {
-                    // 2026-09-27 review 第 1 轮修复：PartListItem 改显式列字段，
-                    // 通过 `From<TPart>` 派生基础字段（next_process_id 自动不复制）。
-                    let p = crate::modules::part::model::TPart {
-                        id,
-                        serial_no: serial,
-                        name: drawing.clone(),
-                        drawing_no: drawing,
-                        applicant_name: String::new(),
-                        quantity: qty,
-                        request_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                        planned_delivery_date: chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
-                        customer_id: 0,
-                        assembly_id: None,
-                        status: "IN_PROCESS".to_string(),
-                        is_urgent: false,
-                        next_process_id: None,
-                        order_no: None,
-                        system_delivery_date: None,
-                        note: None,
-                        unit_price: rust_decimal::Decimal::ZERO,
-                        total_price: rust_decimal::Decimal::ZERO,
-                        version: 0,
-                        created_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                        created_by: None,
-                        updated_at: chrono::NaiveDateTime::from_timestamp_opt(0, 0).unwrap(),
-                        updated_by: None,
-                        deleted_at: None,
-                        // 2026-10-04：取行 SQL 投影的真实值。
-                        process_chain_id,
-                    };
-                    let mut item = PartListItem::from(p);
-                    // 批次锚点：与 `list_pickable_by_work_type` 同款覆写（出参契约见
-                    // vo/part.rs::PartListItem::batch_id 的字段 doc）。
-                    item.batch_id = Some(batch_id);
-                    item.batch_version = Some(batch_version);
-                    // 链派生：本端点是链四字段的唯一填充路径。
-                    item.chain_state = ChainState::from_db_text(&chain_state);
-                    item.chain_next_process_id = chain_next_process_id;
-                    item.chain_next_process_name = chain_next_process_name;
-                    item.chain_current_process_name = chain_current_process_name;
-                    item
-                },
-            )
+            .map(WorkTypeListRow::into_list_item)
             .collect();
         let total: i64 = sqlx::query_scalar(
             // 2026-10-04 不动本 COUNT：链派生只影响 items 的字段取值，不改变行的

@@ -1360,3 +1360,311 @@ async fn recall_to_pending_clears_location_holder_and_step() {
         "recall 出池后 current_process_step_id 必须清 NULL（review M2）"
     );
 }
+
+// ===========================================================================
+//  2026-10-04：工种 / 工人维度三条 list 端点的 part 侧真实字段投影
+// ===========================================================================
+//
+// 三个端点（`GET /parts/by-work-type/{id}` / `GET /parts/pickable-by-work-type/{id}`
+// / `GET /parts/by-worker/{id}`）此前共享一个根因：取行 SQL 只投影
+// `p.id` / `p.serial_no` / `p.drawing_no` 三列，剩下的 `PartListItem` 字段靠**手抄
+// 20 个占位值**的 `TPart { ... }` 字面量填。于是 `name` 填成图号副本（前端卡片第 1
+// 行与第 2 行重复）、`is_urgent` 恒 `false`（加急 tag 永不渲染）、
+// `system_delivery_date` 恒 `null`（交期 chip 永不渲染）、
+// `planned_delivery_date` 恒 `1970-01-01`。
+//
+// 而 `pickable-by-work-type` 的 `ORDER BY p.is_urgent DESC,
+// p.planned_delivery_date ASC` 排的是 **DB 真实列** ⇒ 列表已经按加急排好了，工件上
+// 却看不出任何标记。
+//
+// 2026-10-04 起三处改为投影 `p.name` / `p.is_urgent` / `p.system_delivery_date` /
+// `p.planned_delivery_date` 真实值并共用 `WorkTypeListRow` 投影 struct。本节把
+// 「真实值」与「响应不含 `next_process_id`」两条不变量锁在这三个端点上。
+//
+// ## 断言手法
+// `insert_part_biz` 造 part 时让 `name` **不等于** `drawing_no`：改造前 `name`
+// 就是图号副本，两者相等时任何 `assert_eq!(name, ...)` 都测不出漂移。
+// 另外 `is_urgent` / `planned_delivery_date` 刻意取**非默认值**（`false` / 当天），
+// 否则「投影到真值」与「仍填占位」不可区分。
+
+/// 插一个 part，显式带上本次要断言的 4 个 part 侧业务列，返回 part id。
+async fn insert_part_biz(
+    pool: &PgPool,
+    customer_id: i64,
+    name: &str,
+    drawing_no: &str,
+    is_urgent: bool,
+    planned_delivery_date: chrono::NaiveDate,
+    system_delivery_date: Option<chrono::NaiveDate>,
+) -> i64 {
+    use hsh_erp_test_support::pool_snowflake;
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let part_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, customer_id, status, applicant_name, \
+         request_date, planned_delivery_date, system_delivery_date, is_urgent, quantity, \
+         version, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'IN_PROCESS', '', $5, $6, $7, $8, 1, 0, now(), now())",
+    )
+    .bind(part_id)
+    .bind(name)
+    .bind(drawing_no)
+    .bind(customer_id)
+    .bind(planned_delivery_date)
+    .bind(planned_delivery_date)
+    .bind(system_delivery_date)
+    .bind(is_urgent)
+    .execute(pool)
+    .await
+    .expect("insert t_part (biz fields)");
+    part_id
+}
+
+/// 插一个 active 且绑 `work_type_id` 的工人（`by-work-type` 走 `t_worker` JOIN，
+/// `by-worker` 以 worker_id 为过滤锚点）。
+async fn insert_worker(pool: &PgPool, work_type_id: i64, code: &str) -> i64 {
+    use hsh_erp_test_support::pool_snowflake;
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let worker_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_worker (id, badge_code, name, is_active, work_type_id, version, \
+         created_at, updated_at) VALUES ($1, $2, $3, true, $4, 0, now(), now())",
+    )
+    .bind(worker_id)
+    .bind(code)
+    .bind(format!("{code}-NAME"))
+    .bind(work_type_id)
+    .execute(pool)
+    .await
+    .expect("insert t_worker");
+    worker_id
+}
+
+/// 造一条「可领取」批次：PRODUCTION_SHELF + holder=生产架 + current_process_id=工序。
+/// 前两条 list 端点要求批次满足这三条 + part 未软删 + 工种↔工序映射活跃。
+async fn insert_pickable_batch(pool: &PgPool, part_id: i64, shelf_id: i64, process_id: i64) -> i64 {
+    use hsh_erp_test_support::pool_snowflake;
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let batch_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, current_process_id, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, 3, 'IN_PROCESS', 'PRODUCTION_SHELF', $3, $4, 0, now(), now())",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(shelf_id)
+    .bind(process_id)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch (PRODUCTION_SHELF)");
+    batch_id
+}
+
+/// 造一条「工人持有中」批次：IN_PROCESS + location='WORKER' + holder=worker。
+async fn insert_worker_held_batch(pool: &PgPool, part_id: i64, worker_id: i64) -> i64 {
+    use hsh_erp_test_support::pool_snowflake;
+    let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
+    let batch_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
+         current_holder_id, version, created_at, updated_at) \
+         VALUES ($1, $2, 1, 3, 'IN_PROCESS', 'WORKER', $3, 0, now(), now())",
+    )
+    .bind(batch_id)
+    .bind(part_id)
+    .bind(worker_id)
+    .execute(pool)
+    .await
+    .expect("insert t_part_batch (WORKER-held)");
+    batch_id
+}
+
+/// 打一次 list 端点并按 part id 取目标行（找不到即 panic 并打印整份信封）。
+async fn list_item(app: &axum::Router, token: &str, uri: &str, part_id: i64) -> Value {
+    let (s, env) = send(
+        app.clone(),
+        json_request("GET", uri, None::<Value>, Some(token)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "GET {uri}: {env}");
+    assert_eq!(env["code"], 0, "GET {uri}: {env}");
+    let want = part_id.to_string();
+    env["data"]["items"]
+        .as_array()
+        .expect("data.items")
+        .iter()
+        .find(|it| it["id"].as_str() == Some(want.as_str()))
+        .unwrap_or_else(|| panic!("part {part_id} 不在 {uri} 的结果里: {env}"))
+        .clone()
+}
+
+/// 断言一个 item 的 4 个 part 侧业务列都是 DB 真值。
+///
+/// 同时锁死 `next_process_id` **不出现在响应里**（`PartListItem` 根本没有该字段，
+/// 序列化后不应有这个键）—— 这条不变量在 2026-10-04 之前是靠「`TPart` 字面量里
+/// 写 `next_process_id: None` + `From<TPart>` 不复制它」两处巧合隐式达成的，
+/// 重构后改由类型系统保证，本断言是它的线缆级守卫。
+fn assert_real_part_fields(
+    item: &Value,
+    want_name: &str,
+    want_urgent: bool,
+    want_planned: &str,
+    want_system: Option<&str>,
+) {
+    assert_eq!(
+        item["name"], want_name,
+        "name 必须是 t_part.name 真实值（改造前是 drawing_no 的副本）: {item}"
+    );
+    assert_eq!(
+        item["is_urgent"], want_urgent,
+        "is_urgent 必须是 t_part.is_urgent 真实值（改造前恒 false）: {item}"
+    );
+    assert_eq!(
+        item["planned_delivery_date"], want_planned,
+        "planned_delivery_date 必须是真实值（改造前恒 1970-01-01）: {item}"
+    );
+    match want_system {
+        Some(s) => assert_eq!(
+            item["system_delivery_date"], s,
+            "system_delivery_date 必须是 t_part 的真实值: {item}"
+        ),
+        None => assert!(
+            item["system_delivery_date"].is_null(),
+            "system_delivery_date 为 NULL 的 part 必须序列化成 null: {item}"
+        ),
+    }
+    assert!(
+        item.get("next_process_id").is_none(),
+        "列表响应恒不含 next_process_id（PartListItem 无该字段）: {item}"
+    );
+}
+
+/// `GET /parts/by-work-type/{id}`：part 侧 4 列投影真实值。
+#[tokio::test]
+async fn by_work_type_projects_real_part_business_fields() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let part_id = insert_part_biz(
+        &pool,
+        fx.customer_l1_id,
+        "急件工单名",
+        "D-BIZ-WT",
+        true,
+        chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 11, 30).unwrap()),
+    )
+    .await;
+    let worker_id = insert_worker(&pool, fx.work_type_id, "WT-BIZ").await;
+    insert_worker_held_batch(&pool, part_id, worker_id).await;
+
+    let item = list_item(
+        &app,
+        &token,
+        &format!("/parts/by-work-type/{}", fx.work_type_id),
+        part_id,
+    )
+    .await;
+    assert_real_part_fields(&item, "急件工单名", true, "2026-12-31", Some("2026-11-30"));
+    assert_ne!(
+        item["name"], item["drawing_no"],
+        "前提自证：name 与 drawing_no 必须不同（相等时测不出「name 填成图号」的漂移）: {item}"
+    );
+    // 本端点的行不是「批次锚点」语义（口径见 vo/part.rs 字段 doc），仍是 null。
+    assert!(
+        item["batch_id"].is_null() && item["batch_version"].is_null(),
+        "by-work-type 不填批次锚点: {item}"
+    );
+}
+
+/// `GET /parts/pickable-by-work-type/{id}`：part 侧 4 列投影真实值。
+#[tokio::test]
+async fn pickable_by_work_type_projects_real_part_business_fields() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let part_id = insert_part_biz(
+        &pool,
+        fx.customer_l1_id,
+        "可领急件名",
+        "D-BIZ-PICK",
+        true,
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+        None,
+    )
+    .await;
+    insert_pickable_batch(&pool, part_id, fx.production_shelf_id, fx.process_id).await;
+
+    let item = list_item(
+        &app,
+        &token,
+        &format!("/parts/pickable-by-work-type/{}", fx.work_type_id),
+        part_id,
+    )
+    .await;
+    // system_delivery_date 为 NULL ⇒ 序列化成 null（不是 1970-01-01）
+    assert_real_part_fields(&item, "可领急件名", true, "2026-10-20", None);
+}
+
+/// `GET /parts/by-worker/{id}`：part 侧 4 列投影真实值。
+#[tokio::test]
+async fn by_worker_projects_real_part_business_fields() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let part_id = insert_part_biz(
+        &pool,
+        fx.customer_l1_id,
+        "持有中工单名",
+        "D-BIZ-WK",
+        true,
+        chrono::NaiveDate::from_ymd_opt(2027, 1, 15).unwrap(),
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 12, 20).unwrap()),
+    )
+    .await;
+    let worker_id = insert_worker(&pool, fx.work_type_id, "WK-BIZ").await;
+    insert_worker_held_batch(&pool, part_id, worker_id).await;
+
+    let item = list_item(
+        &app,
+        &token,
+        &format!("/parts/by-worker/{worker_id}"),
+        part_id,
+    )
+    .await;
+    assert_real_part_fields(
+        &item,
+        "持有中工单名",
+        true,
+        "2027-01-15",
+        Some("2026-12-20"),
+    );
+    // 本端点**不填**链四字段的前提：无链 ⇒ 保守默认 NONE / "0" / null / null
+    assert_eq!(item["chain_state"], "NONE", "无链批次应落 NONE: {item}");
+    assert_eq!(item["chain_next_process_id"].as_str(), Some("0"), "{item}");
+}
+
+/// 非加急 + 有 system_delivery_date 的组合：`is_urgent` 不得被反向填成 true。
+///
+/// 上一节三例全走 `is_urgent = true`，只锁住「true 能穿透」；本例锁住另一半：false
+/// 是**真值**（与「未投影而恒 false」不可区分，但至少保证没有恒 true 的镜像 bug）。
+#[tokio::test]
+async fn by_work_type_keeps_non_urgent_and_real_system_delivery_date() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let part_id = insert_part_biz(
+        &pool,
+        fx.customer_l1_id,
+        "不急工单",
+        "D-BIZ-CALM",
+        false,
+        chrono::NaiveDate::from_ymd_opt(2027, 3, 1).unwrap(),
+        Some(chrono::NaiveDate::from_ymd_opt(2027, 2, 1).unwrap()),
+    )
+    .await;
+    let worker_id = insert_worker(&pool, fx.work_type_id, "WT-CALM").await;
+    insert_worker_held_batch(&pool, part_id, worker_id).await;
+
+    let item = list_item(
+        &app,
+        &token,
+        &format!("/parts/by-work-type/{}", fx.work_type_id),
+        part_id,
+    )
+    .await;
+    assert_real_part_fields(&item, "不急工单", false, "2027-03-01", Some("2027-02-01"));
+}
