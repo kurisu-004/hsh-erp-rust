@@ -56,7 +56,8 @@ impl BatchService {
     ///
     /// 不变量：
     /// - worker 必须 is_active 且 work_type_id 不为 NULL
-    /// - shelf 必须 zone=PRODUCTION 且 active
+    /// - shelf（**仅当调用方传了 `shelf_id`**，2026-10-04 起可选）必须 zone=PRODUCTION
+    ///   且 active；缺省则完全不校验
     /// - 状态机迁移：`{PENDING, IN_PROCESS} → IN_PROCESS`（DB 状态相同；service 守 location）
     /// - 写 PICKED_UP 事件 + 广播 PART_PICKED_UP WS
     ///
@@ -166,7 +167,19 @@ impl BatchService {
                 format!("worker {} 未绑定 work_type", req.worker_id),
             ));
         }
-        validate_shelf_zone(repo.conn_mut(), req.shelf_id, "PRODUCTION").await?;
+        // 2026-10-04 新增：`shelf_id` 改为可选，**缺省 = 完全不校验**。
+        //
+        // 该字段对 pick-up 的最终结果零影响（本路径 3 条 `t_part_batch` 写入的
+        // SET / WHERE 均无货架列或货架条件，`t_part_event` 无货架列，响应 VO 无
+        // shelf 字段），原先那条 `validate_shelf_zone` 是防呆断言而非安全边界，
+        // 故扫码台 / 看板等自动发起方可以不带它。传了才校验，语义与改动前逐字
+        // 一致（20501 / 20512 / 20104 三条错误码不变）。
+        //
+        // ⚠️ 位置不动：仍在事务内、仍在 worker 校验之后、仍在拆批之前 —— 保证
+        // 「非法 shelf 不拆批」这条既有性质不变。
+        if let Some(shelf_id) = req.shelf_id {
+            validate_shelf_zone(repo.conn_mut(), shelf_id, "PRODUCTION").await?;
+        }
         // 2026-10-03 新增：部分领取 —— 翻状态**之前**先把要交出去的那部分拆成
         // 新批次；之后所有针对批次的写入都改指新批次（version 恒为 0）。
         //

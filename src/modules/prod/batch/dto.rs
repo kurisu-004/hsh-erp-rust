@@ -493,8 +493,7 @@ pub struct CancelBatchRequest {
 /// `POST /api/v2/prod/batches/{batch_id}/pick-up` 入参（手动 pick-up 兜底）。
 ///
 /// PENDING / IN_PROCESS+PRODUCTION_SHELF → IN_PROCESS+WORKER。
-/// `worker_id` 必填（持有件工人）；`shelf_id` 必填（当前批次所在货架；service 层
-/// 仅校验存在 + 同 shelf ↔ process 映射）。
+/// `worker_id` 必填（持有件工人）；`shelf_id` **可选**（见该字段 doc）。
 ///
 /// 2026-10-03 新增：部分领取。`quantity` 缺省 = 整批领取（保持既有行为，向后
 /// 兼容）；`0 < quantity < batch.quantity` 时 service 自动拆批，把拆出来的那
@@ -504,8 +503,56 @@ pub struct PickUpRequest {
     pub version: i32,
     #[serde(deserialize_with = "deserialize_i64")]
     pub worker_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub shelf_id: i64,
+    /// 当前批次所在货架。**2026-10-04 起可选**。
+    ///
+    /// ## 传了才校验，缺省什么都不做
+    ///
+    /// `Some(sid)` → service 校验「存在 + `is_active` + `zone='PRODUCTION'`」
+    /// （`validate_shelf_zone`，依次 `20501` / `20512` / `20104`）。
+    /// `None`（缺省或显式 `null`）→ **不校验、不推导、不回退**，请求照常受理。
+    ///
+    /// ## 为什么可以缺省：这个字段对最终结果零影响
+    ///
+    /// pick-up 路径上 `shelf_id` 只进 `validate_shelf_zone`，而它内部只
+    /// `SELECT ... FROM t_shelf WHERE id = $1 AND deleted_at IS NULL`（零写）；
+    /// 本路径 `t_part_batch` 的全部 3 条写入（`pickup.rs` 内联 SQL、
+    /// `guard.rs` → `status_gate.rs` 的通用 UPDATE、部分领取的
+    /// `split_batch_for_partial_pass`）的 SET 与 WHERE 均无货架列或货架条件；
+    /// `t_part_event` 无货架列；响应 VO `PartOut` 无 shelf 字段。
+    /// ⇒ 那条校验是**防呆断言**（让手填错区的人当场看见 20104），不是安全边界，
+    /// 故不必强绑在成功路径上 —— 扫码台 / 看板等自动发起 pick-up 的调用方
+    /// 本就无从知道「批次此刻名义上在哪一个架」。
+    ///
+    /// ## 订正一处旧表述（2026-10-04）
+    ///
+    /// 本字段旧注释写「service 层仅校验存在 + 同 shelf ↔ process 映射」，
+    /// **后半句是错的**：pick-up 从不校验货架↔工序映射，
+    /// `assert_shelf_maps_process`（`20507 BIZ_SHELF_PROCESS_NOT_MAPPED`）在本
+    /// 路径一次都没被调用 —— 它只服务 `place-on-shelf` 与 worker-scan。
+    ///
+    /// ## 为什么不做「从 `current_holder_id` 推导」
+    ///
+    /// 技术上不可行（2026-10-04 逐条核实）：
+    /// 1. PENDING 起点的批次 `current_holder_id` 恒为 `NULL`
+    ///    （`create_initial_batch` 写死 `NULL, NULL`），而 PENDING 正是「待下发池」
+    ///    的 pick-up 起点；
+    /// 2. IN_PROCESS 起点只守 `location='PRODUCTION_SHELF'`、**不守 holder**，
+    ///    `dispatch` 与 `pool/move` 两个写点能把 INSPECTION 区的架写进
+    ///    `current_holder_id`；
+    /// 3. 批次上架后货架被停用 / 软删时 `current_holder_id` 仍指向失效 id，
+    ///    「推导 + 同样校验」会把这类批次**永久锁死**。
+    ///
+    /// ## ⚠️ 本字段**无 scope 校验**
+    ///
+    /// 与 worker-scan 对照：后者对 `shelf_id` 走 `can_access_shelf` 并在越权时
+    /// 返 `40301 SHELF_MISMATCH`。pick-up 不做该校验，故本字段缺省时**没有**
+    /// 任何货架维度的权限收敛；SHELF_ACCOUNT 角色门（`require_any_role`）是本
+    /// 端点唯一的权限边界。
+    ///
+    /// 线上形态仍是 **JSON 字符串**（`deserialize_i64_opt` 只吃 `str`），
+    /// 例如 `"shelf_id": "43"`；`"shelf_id": 43`（数字）→ `422`。
+    #[serde(default, deserialize_with = "deserialize_i64_opt")]
+    pub shelf_id: Option<i64>,
     /// 2026-10-03 新增：部分领取；缺省 = 整批。
     ///
     /// 线上形态与同族的 `SplitBatchRequest.quantity` 一致：**JSON 字符串**
