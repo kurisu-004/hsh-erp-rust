@@ -30,6 +30,10 @@
 //!    10. http_snapshot_default_14_days_returns_14_buckets — 缺省 ?upcoming_days → 14 条桶
 //!    11. http_snapshot_custom_7_days_returns_7_buckets   — ?upcoming_days=7 → 7 条桶（向后兼容老契约）
 //!
+//!   HTTP `?basis=` query 参数（2026-10-04 新增）：
+//!    17. http_snapshot_basis_system_returns_14_buckets  — ?basis=system → 200 + 桶数仍 = N
+//!    18. http_snapshot_basis_invalid_value_returns_400  — ?basis=xxx → 400（Query 反序列化，纯文本体）
+//!
 //! 测试栈：必须建 Redis pool，session 写入才算「已吊销」
 //!
 //! ## Fixture 范本化（2026-09-24 PR13 Phase I）
@@ -48,8 +52,8 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::modules::dashboard::service::DashboardService;
 use hsh_erp_test_support::{
-    DashboardWsFixture, json_request, load_dashboard_ws_fixture, send as ts_send, test_app,
-    test_pool, test_state, test_ws_app,
+    DashboardWsFixture, json_request, load_dashboard_ws_fixture, send as ts_send, send_raw,
+    test_app, test_pool, test_state, test_ws_app,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -1147,5 +1151,93 @@ async fn http_snapshot_custom_7_days_returns_7_buckets() {
         buckets[6]["date"].as_str(),
         Some(day6_str.as_str()),
         "末桶日期应为 today+6 天"
+    );
+}
+
+// ===========================================================================
+// 2026-10-04 新增：HTTP `GET /api/v2/dashboard/snapshot?basis=` query 参数
+// ===========================================================================
+//
+// 覆盖 handler 层 `SnapshotQuery.basis` 的 `Query` 反序列化（此前只有 service 直调
+// 传 `None` 的用例，走不到 axum 提取器）：
+//   - basis_system_returns_14_buckets — ?basis=system → 200 + 桶数仍 = N（口径不
+//     影响桶的日期序列，只影响 count / by_status）
+//   - basis_invalid_value_returns_400 — ?basis=xxx → 400（纯文本 body，不走信封）
+//
+// 非法取值的响应体不是 `R<T>` JSON，故用 `send_raw` 取原始文本（`send` 会在 JSON
+// 解析处 panic）。
+
+#[tokio::test]
+async fn http_snapshot_basis_system_returns_14_buckets() {
+    // `?basis=system`：service 层 `basis.or(Planned)` 走 System 分支，交期列换成
+    // `system_delivery_date`；桶的日期序列（today → today+N-1）与补零规则两口径
+    // 共用，故桶数仍 = 14。
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+    let app = test_app(state.clone());
+
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "GET",
+            "/dashboard/snapshot?basis=system",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "?basis=system 应返 200");
+    assert_eq!(envelope["code"], 0);
+    let buckets = envelope["data"]["upcoming_delivery"]
+        .as_array()
+        .expect("upcoming_delivery 必为 array");
+    assert_eq!(
+        buckets.len(),
+        14,
+        "?basis=system 不改变桶的日期序列，缺省 N 仍为 14"
+    );
+    // 首桶日期仍为 today（口径只换交期列，不换分桶锚点）
+    let today_str = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    assert_eq!(
+        buckets[0]["date"].as_str(),
+        Some(today_str.as_str()),
+        "system 口径首桶日期仍应为今天"
+    );
+    for (idx, b) in buckets.iter().enumerate() {
+        assert!(
+            b["by_status"].is_object(),
+            "第 {idx} 桶 by_status 应为 object（system 口径同契约）"
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_snapshot_basis_invalid_value_returns_400() {
+    // `?basis=xxx` 不在 `DeliveryBasis` 的 `rename_all = "lowercase"` 变体里，
+    // axum `Query` 反序列化直接返 400（纯文本 body，不走 `R<T>` 信封）。
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+    let app = test_app(state.clone());
+
+    let (status, body) = send_raw(
+        app,
+        json_request("GET", "/dashboard/snapshot?basis=xxx", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "非法 ?basis 取值应返 400；body={body}"
+    );
+    // 契约要点：axum 提取器层的 rejection 返纯文本，**不走 `R<T>` 信封**
+    // （`docs/api/dashboard.md` 错误码段有对应说明）。
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&body).is_err(),
+        "400 body 应为纯文本而非 JSON 信封；body={body}"
     );
 }

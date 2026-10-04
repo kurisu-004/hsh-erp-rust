@@ -11,6 +11,11 @@
 //! - [`send`]: drive an Axum router via oneshot, return `(StatusCode, Value)`.
 //! - [`login_token`]: POST `/iam/login` and return the bearer token string.
 //!
+//! ## 2026-10-04 新增 [`send_raw`]
+//! axum 提取器层的 rejection（如 `Query` 反序列化失败）返回的是**纯文本** body，
+//! 不走 `R<T>` 信封，`send` 的 JSON 解析会 panic。断言这类 4xx 需用 `send_raw`
+//! 拿原始 body 文本。
+//!
 //! ## 签名契约（与原版一致，便于批量迁移）
 //! - `send(app: axum::Router, req: Request<Body>)` —— app 按值，与原
 //!   `tests/production/process_chain.rs::send` 逐字一致。
@@ -18,6 +23,8 @@
 //!   bearer: Option<&str>) -> Request<Body>` —— method 用 `&str`（非 `Method`）。
 //! - `login_token(app: &axum::Router, username: &str, password: &str) -> String`
 //!   —— 新增 helper，内部走 `json_request` + `send`。
+//! - `send_raw(app: axum::Router, req: Request<Body>) -> (StatusCode, String)`
+//!   —— 与 `send` 同签名同消费语义，body 交还 `String` 而非 `Value`。
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
@@ -70,6 +77,21 @@ pub async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, Value) 
         )
     });
     (status, envelope)
+}
+
+/// Drive an Axum router with a single request and return `(status, body-as-raw-text)`.
+///
+/// 2026-10-04 新增：`send` 的孪生原语，body 交还 `String` 而非 `Value`，用于断言
+/// axum 提取器层 rejection 的纯文本 4xx（如 `Query` 反序列化失败），那类响应不
+/// 走 `R<T>` 信封、`send` 会在 JSON 解析处 panic。传输层错误仍 panic（基建 bug）。
+#[allow(dead_code)]
+pub async fn send_raw(app: axum::Router, req: Request<Body>) -> (StatusCode, String) {
+    let response = app.oneshot(req).await.expect("oneshot");
+    let status = response.status();
+    let body_bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    (status, String::from_utf8_lossy(&body_bytes).into_owned())
 }
 
 /// Log a user in via `POST /iam/login` and return the bearer token string.

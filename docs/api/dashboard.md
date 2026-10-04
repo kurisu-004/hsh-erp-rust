@@ -150,12 +150,16 @@ HTTP request
 > `data.upcoming_delivery[].by_status` 与 `data.upcoming_delivery[].count` 的关系：
 > `count = by_status 所有 value 之和`（service 端求和，VO 与 SQL 二次一致性由 SQL 单次聚合保证）。
 
-> ⚠️ **`?basis=system` 下 `system_delivery_date IS NULL` 的工单整件不计入**
-> （2026-10-04 新增）：WHERE 的两处范围比较（`>= CURRENT_DATE` /
-> `< CURRENT_DATE + N days`）对 NULL 恒为 false，NULL 行天然不命中——与
-> union-list 端点「NULL 交期不被命中」的既有语义一致，未额外写 `IS NOT NULL`。
-> 因此 **system 口径的合计恒 ≤ planned 口径**（planned 列同样可空），两口径的
-> 桶总数恒为 N（缺失日期补 0），差异只体现在 `count` / `by_status` 上。
+> ⚠️ **两口径的缺失语义（2026-10-04 新增）**
+> - `?basis=system` 下 `system_delivery_date IS NULL` 的工单**整件不计入**：WHERE 的两处
+>   范围比较（`>= CURRENT_DATE` / `< CURRENT_DATE + N days`）对 NULL 恒为 false，NULL 行
+>   天然不命中——与 union-list 端点「NULL 交期不被命中」的既有语义一致，未额外写
+>   `IS NOT NULL`。
+> - `planned_delivery_date` 是 `t_part` 的 **`NOT NULL` 列**（`system_delivery_date` 可空），
+>   planned 口径无此缺失。
+> - 两口径的**桶总数恒为 N**（缺失日期补 0），差异只体现在 `count` / `by_status` 上。
+> - 两口径的**合计之间无可比大小关系**：同一工单的两列可能分别落在窗口内外不同侧
+>   （如计划交期已逾期、仅系统交期顺延到窗口内），方向可以反转，前端不得依赖任一方向。
 
 错误码：
 
@@ -167,6 +171,9 @@ HTTP request
 
 > 错误码段说明：本端点不引入新业务错误码；DB / SQL 失败走 `AppError::from(sqlx::Error)`
 > 透传（50000 / 50001 段），与现有 HTTP handler 风格一致。
+>
+> query 反序列化失败（`?upcoming_days=abc` / `?basis=xxx`）由 axum `Query` 直接返
+> **400**（纯文本 body，**不走 `R<T>` 信封**），与上表的业务错误码段无关。
 
 与 `/ws/dashboard` 的关系：
 

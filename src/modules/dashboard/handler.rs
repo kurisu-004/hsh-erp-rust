@@ -106,7 +106,7 @@
 //! `docs/api/websocket.md`「连接关闭码」。
 //!
 //! ## 2026-09-22 Group E 重构：handler 三形态 ①（snapshot 单次只读聚合）
-//! `build_snapshot_msg` 走 `state.pool.begin() → state.dashboard_service.build_snapshot_with_workers(&mut tx, None) → tx.commit()`
+//! `build_snapshot_msg` 走 `state.pool.begin() → state.dashboard_service.build_snapshot_with_workers(&mut *tx, None, None, None) → tx.commit()`
 //! 路径，commit 即结束（WS 协议不依赖 tx，handler 内已完成全部 DB 读取）。后续 ws_hub.broadcast
 //! 是订阅事件模式，不再走 service、不开 tx。
 //!
