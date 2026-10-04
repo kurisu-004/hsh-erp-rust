@@ -72,6 +72,9 @@ cargo run
 - **t_role_menu.id 同样用静态 ID**：`9000001000xxx` 段
 - **不自动删"未在文件声明的菜单"**：菜单下线必须显式列在第 3 节 soft-delete 区段
   （防止误删生产手工加的菜单）
+- **t_role_menu 授权同样是纯增量**：第 4 节 `ON CONFLICT ... DO NOTHING`，
+  从角色白名单里删 code **不等于**回收已存在的授权行。收紧权限必须显式列在
+  4.7 回收区段（软删 + `version + 1`）
 - **`include_str!` 编译期嵌入**：`src/infra/seed.rs` 把整个 SQL 文件嵌进二进制，
   启动时直接 `sqlx::raw_sql` 执行，不走 IO
 
