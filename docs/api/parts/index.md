@@ -52,9 +52,9 @@
 | POST | `/api/v2/parts/match-by-excel-items` | Manager / Clerk | Excel 行匹配（Phase 1） | [`crud.md`](./crud.md#post-apiv2partsmatch-by-excel-items) |
 | POST | `/api/v2/parts/batch-update-order-info` | Manager / Clerk | 批量更新订单信息（Phase 1） | [`crud.md`](./crud.md) |
 | POST | `/api/v2/parts/batch-with-pdfs` | Manager / Clerk | 多页 PDF 树形创建（Phase 1） | [`batch.md`](./batch.md#post-apiv2partsbatch-with-pdfs) |
-| GET | `/api/v2/parts/by-work-type/{work_type_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工种查 part（Phase 2） | [`crud.md`](./crud.md) |
-| GET | `/api/v2/parts/pickable-by-work-type/{work_type_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工种查可领取 part（Phase 2） | [`crud.md`](./crud.md) |
-| GET | `/api/v2/parts/by-worker/{worker_id}` | Manager / Clerk / Inspector / CncProgrammer | 按工人查持有 part（Phase 2） | [`lifecycle.md`](./lifecycle.md#get-apiv2partsby-workerworker_id) |
+| GET | `/api/v2/parts/by-work-type/{work_type_id}` | Manager / Clerk / Inspector / **ShelfAccount**（**权限列 2026-10-04 订正**：原文列 `CncProgrammer`、漏 `ShelfAccount`，两者都错） | 按工种查该工种工人持有的 part（Phase 2）—— **本端点无独立章节**（行单位与字段口径见 [`lifecycle.md`](./lifecycle.md#get-apiv2partspickable-by-work-typework_type_id) 的共享填充口径表） |
+| GET | `/api/v2/parts/pickable-by-work-type/{work_type_id}` | Manager / Clerk / Inspector / **ShelfAccount**（**权限列 2026-10-04 订正**：同上行） | 按工种查可领取 part（Phase 2）—— **2026-10-04 自本次起按 `user.shelf_ids` 收口**（此前零收口 ⇒ 绑一个架的 SHELF_ACCOUNT 能看到全厂 PRODUCTION 架） | [`lifecycle.md`](./lifecycle.md#get-apiv2partspickable-by-work-typework_type_id) |
+| GET | `/api/v2/parts/by-worker/{worker_id}` | Manager / Clerk / Inspector / **ShelfAccount**（**权限列 2026-10-04 订正**：同上行） | 按工人查持有 part（Phase 2） | [`lifecycle.md`](./lifecycle.md#get-apiv2partsby-workerworker_id) |
 | POST | `/api/v2/prod/batches/{batch_id}/place-on-shelf` | Manager / Clerk | 上架 —— **2026-10-02 迁往 prod 域** | [`lifecycle.md`](./lifecycle.md#post-apiv2prodbatchesbatch_idplace-on-shelf) |
 | POST | `/api/v2/prod/batches/{batch_id}/recall-to-pending` | Manager / Clerk | 召回至 PENDING —— **2026-10-02 迁往 prod 域**（lifecycle.md 尚无独立章节） | [`production/batches.md`](./index.md) |
 | POST | `/api/v2/parts/{part_id}/send-to-programming` | Manager / Clerk | 派发编程（Phase 1）—— **已下线，返回 404** | [`lifecycle.md`](./lifecycle.md#get-apiv2partspending-programming) |
@@ -179,8 +179,29 @@
 
 > ⚠️ `PartListItem.version` 是 **part 级**（`t_part.version`）乐观锁，与批次 OCC 无关。
 > `GET /parts/pickable-by-work-type/{work_type_id}` 的取行 SQL **不投影 `p.version`**
-> （只投影 `p.id` / `p.serial_no` / `p.drawing_no`），故该端点返回的 `version` 恒为 `0`
-> （有意占位，不是漏取值）；该端点的批次乐观锁版本一律走 `batch_version`。
+> （只投影 `p.id` / `p.serial_no` / `p.name` / `p.drawing_no` / `p.is_urgent` /
+> `p.system_delivery_date` / `p.planned_delivery_date` / `b.*`），故该端点返回的
+> `version` 恒为 `0`（有意占位，不是漏取值）；该端点的批次乐观锁版本一律走
+> `batch_version`。
+
+> ⚠️ **2026-10-04 订正：`pickable-by-work-type` / `by-worker` / `by-work-type`
+> 三个端点的 part 侧字段改投影真实值**。此前三者的取行 SQL 只投影 `p.id` /
+> `p.serial_no` / `p.drawing_no` 三列，其余字段靠手抄的 `TPart` 占位值填，于是：
+> - `name` = `drawing_no` 的副本 ⇒ 卡片第 1 / 2 行重复显示同一串
+> - `is_urgent` 恒 `false` ⇒ 报工台三页的「加急」tag **永不渲染**
+> - `system_delivery_date` 恒 `null` ⇒ 交期 chip **永不渲染**
+> - `planned_delivery_date` 恒 `1970-01-01`
+>
+> 而 `pickable-by-work-type` 的 `ORDER BY p.is_urgent DESC,
+> p.planned_delivery_date ASC` 排的仍是 **DB 真实列** ⇒ 列表已按加急排好、工件上
+> 却看不出任何标记。
+>
+> 2026-10-04 起四列均为 `t_part` 真实投影值。**其余占位值（`applicant_name` /
+> `request_date` / `customer_id` / `status` / `order_no` / `note` / `unit_price` /
+> `total_price` / `version` / `created_at` / `updated_at` / `deleted_at` 等）一律
+> 不动** —— 前端无消费方，改了只扩大 diff 面积。逐字段口径见
+> [`./lifecycle.md`](./lifecycle.md#get-apiv2partspickable-by-work-typework_type_id)
+> 的填充口径表。
 
 #### 前端配套改动清单
 
@@ -190,12 +211,12 @@
 在**每一个**复用路径的响应里都出现，但填充口径不同。逐端点影响与前端动作：
 
 | 端点 | `batch_id` / `batch_version` | 链四字段（`chain_state` / `chain_next_process_id` / `chain_next_process_name` / `chain_current_process_name`） | `delivered_quantity` | 构造路径（决定为何 null / 为 0） | 前端是否要改 |
-| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | 恒 `"NONE"` / `"0"` / `null` / `null` | 恒 `null` | `part/service/phase1/work_type.rs` 在 `From<TPart>` 之后**显式覆写**批次两字段；链四字段未覆写 | 需要：TS `PartItem` 补可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
+| `GET /parts/pickable-by-work-type/{work_type_id}` | **有值**（该行的批次 + 其 version） | 恒 `"NONE"` / `"0"` / `null` / `null` | 恒 `null` | `part/service/phase1/work_type.rs`：取行 SQL 直接投影 `b.id AS batch_id` / `b.version AS batch_version`，链四列显式投影 `NULL::<type>`；2026-10-04 起经共享投影 struct `WorkTypeListRow::into_list_item` 构造（不再走 `From<TPart>`） | 需要：TS `PartItem` 补可选字段，扫码台「领料」按 `batch_id` 定位批次、`batch_version` 作 OCC 版本回传 |
 | `GET /parts` | 恒 `null` | 恒 `"NONE"` / `"0"` / `null` / `null` | **有值** | `PartService::list_parts_part_only_with_total`：`From<TPart>` 后显式覆写已送数量（零批次给 0） | **需要**（2026-10-03）：零件一览「已送数量」列此前恒显 0，现为真实数字 |
 | `GET /api/v2/com/union-list` | 恒 `null` | 恒 `"NONE"` / `"0"` / `null` / `null` | **有值** | `UnionListService` 三种 `row_type` 模式各接一次：PART 行取已交批次数量之和，ASSEMBLY 行取可凑齐套数 | **需要**（2026-10-03）：前端「部分已交」列表据此判定与展示 |
 | `GET /parts/pending-programming` | 恒 `null` | 恒 `"NONE"` / `"0"` / `null` / `null` | 恒 `null` | `part/service/phase1/lifecycle_helpers.rs` 结构体更新 `..PartListItem::from(..)` | **不需要** |
-| `GET /parts/by-work-type/{work_type_id}` | 恒 `null` | 恒 `"NONE"` / `"0"` / `null` / `null` | 恒 `null` | `part/service/phase1/work_type.rs` `PartListItem::from(手工 TPart)` | **不需要** |
-| `GET /parts/by-worker/{worker_id}` | **有值**（该行的批次 + 其 version） | **有值**（全仓唯一填充路径，见 [`./lifecycle.md`](./lifecycle.md#get-apiv2partsby-workerworker_id)） | 恒 `null` | `part/service/phase1/work_type.rs`：`From<TPart>` 之后显式覆写批次两字段 + 4 个链派生列（取行 SQL 的 `LEFT JOIN LATERAL`） | **需要**（2026-10-04）：报工台放回页按 `chain_state` 三态决定「免填 / 弹选择框 / 提示送检」，并按 `batch_id` + `batch_version` 发写请求 |
+| `GET /parts/by-work-type/{work_type_id}` | 恒 `null` | 恒 `"NONE"` / `"0"` / `null` / `null` | 恒 `null` | `part/service/phase1/work_type.rs`：取行 SQL 显式投影 `NULL::<type>`（本端点不填），经共享投影 struct `WorkTypeListRow::into_list_item` 构造（2026-10-04 起不再走 `From<TPart>`） | **不需要** |
+| `GET /parts/by-worker/{worker_id}` | **有值**（该行的批次 + 其 version） | **有值**（全仓唯一填充路径，见 [`./lifecycle.md`](./lifecycle.md#get-apiv2partsby-workerworker_id)） | 恒 `null` | `part/service/phase1/work_type.rs`：取行 SQL 投影 `b.id AS batch_id` / `b.version AS batch_version` / `p.process_chain_id` + `LEFT JOIN LATERAL` 派生的 4 个 `AS chain_*` 列，经共享投影 struct `WorkTypeListRow::into_list_item` 构造（2026-10-04 起不再走 `From<TPart>`） | **需要**（2026-10-04）：报工台放回页按 `chain_state` 三态决定「免填 / 弹选择框 / 提示送检」，并按 `batch_id` + `batch_version` 发写请求 |
 
 > 上表只统计列表信封 `R<PartListOut>` 的 6 个端点。`POST /api/v2/assemblies/{id}/children`
 > 另返回单个 `R<PartListItem>`（共 7 处返回点），该处 `delivered_quantity` 恒 `null`、

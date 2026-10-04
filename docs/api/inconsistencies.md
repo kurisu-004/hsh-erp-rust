@@ -482,3 +482,71 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 - 外协出参把「无下一道」与「链不可解析」塌成同一个 `chain_resolvable = false`
   （与 `by-worker` 的三值不同），改它要连带复核文档 3 处 + 约 499 行测试期望；
 - 属另一个变更，应当独立成一次带回归测试的修复。
+
+### 9.5 2026-10-04 登记：`/iam/me` 不返 `shelf_wildcard`
+
+**本次不修**，登记以免下一个读 `CurrentUserOut` 的人把它当「`shelf_ids` 就是货架
+可见性全貌」。
+
+`src/modules/iam/vo/session.rs::CurrentUserOut` 有 `shelf_ids`、**没有**
+`shelf_wildcard`；而后端的货架可见性判据
+`src/auth/rbac.rs::CurrentUser::can_access_shelf` 是三元：
+
+```rust
+self.shelf_wildcard || self.shelf_ids.contains(&shelf_id) || self.has_role(Role::Manager)
+```
+
+`shelf_wildcard` 的来源是「存在 `role='SHELF_ACCOUNT' AND scope_type='shelf' AND
+scope_id IS NULL` 的 `t_user_role` 行」（三个限定缺一不可，见
+`iam::service::session::resolve_roles_and_scope`）。于是前端拿到 `shelf_ids: []` 时
+**无法区分**「未绑架（一个架都看不到）」与「wildcard（全厂所有架都能看）」—— 两者
+响应逐字相同，而后端可见范围相差全集。
+
+⚠️ **2026-10-04 review 第 1 轮补：`shelf_wildcard` 分支在产品 API 下不可达。**
+`iam::service::account::validate_role_scope` 对 `Role::ShelfAccount` 硬校验
+`scope_id.is_some()`（缺一即 `40001 VALIDATION` / HTTP 422
+`SHELF_ACCOUNT role requires scope_type='shelf' and scope_id`），而 `t_user_role` 的
+唯一生产写路径就是 `POST /iam/users/{id}/roles` → `add_role`。⇒ `shelf_wildcard` 只有
+fixture / 直插 SQL 能造出来。**依赖它做安全判据前先确认这一点**：现在它是恒 `false`
+的分支，写「wildcard ⇒ 放行」等于给一个产品建不出来的配置开了后门式的信任；
+真要支持 wildcard，得先决定是否放宽 `validate_role_scope`（另一个变更）。
+「给 Clerk / Inspector 放开 `pickable-by-work-type`」也不能靠 wildcard 绕 ——
+只能逐架配 `scope_id` 的 SHELF_ACCOUNT 行（见
+[`./parts/lifecycle.md`](./parts/lifecycle.md#get-apiv2partspickable-by-work-typework_type_id)）。
+
+本次的直接影响：2026-10-04 起
+[`GET /api/v2/parts/pickable-by-work-type/{work_type_id}`](./parts/lifecycle.md#get-apiv2partspickable-by-work-typework_type_id)
+按该判据收口（wildcard / Manager ⇒ 不加谓词；空 scope ⇒ 空集），前端要预判
+「这个货架账号能不能领料」就绕不开 wildcard 这个缺失字段。同一判据也已经在
+`shelves::for-return`（`ShelfService::list_for_return`）、
+`shelves::crud`（`ShelfService::list`）、`prod::shelf_process`、
+`prod::batch::worker-scan`（`transition.rs`）四处在用，故这不是单端点问题。
+
+修法（属另一个变更，应独立成一次带前端配套的修复）：`CurrentUserOut` 补
+`shelf_wildcard: bool`，前端 TS / Zod schema 同步加该字段，并复核所有
+「`shelf_ids.length === 0` ⇒ …」的客户端分支。字段级说明已写进
+[`./iam.md`](./iam.md#get-apiv2iamme) 的 `GET /api/v2/iam/me` 节（该处是前端查
+响应 schema 时**必然会读到**的位置）。
+
+### 9.6 2026-10-04 登记：`by-worker` / `by-work-type` 不做货架 scope 收口
+
+**本次不修**（计划只要求收 `pickable-by-work-type`），登记以免下一个读这两个端点的人
+以为「SHELF_ACCOUNT 只能看到自己那几架的件」。
+
+- **现象**：`GET /api/v2/parts/by-worker/{worker_id}` 与
+  `GET /api/v2/parts/by-work-type/{work_type_id}` 的角色白名单都含 `ShelfAccount`，
+  但**全文零 `can_access_shelf` 收口** ⇒ 绑了架 A 的 SHELF_ACCOUNT 可以枚举任意
+  `worker_id` / `work_type_id`，看到全厂工人当前持有的件（含 part 名 / 图号 / 数量）。
+  同一族的 `GET /parts/pickable-by-work-type/{id}` 自 2026-10-04 起已按
+  `user.shelf_ids` 收口（见下方归口文档的该端点章节），三个端点口径不一致。
+- **为何不收**：`by-worker` 的行单位是「某工人持有的批次」
+  （`location='WORKER'`、`current_holder_id = worker_id`），批次离开货架后
+  `current_holder_id` 指向工人、`t_part_batch` 上**不再有货架维度** ⇒
+  `can_access_shelf(shelf_id)` 语义无处可施（该端点也没有 `shelf_id` 入参）。
+  且它是报工台「放回 / 送检」两页的唯一数据源：若按货架收窄，工人在 A 架领的件放到
+  B 架、或绑定架与领料架不一致的账号会**看不到自己要放的件**。
+- **何时需复核**：若将来给 `by-worker` 加 `shelf_id` 入参（让调用方声明「我只处理
+  这个架的流转」），或 `t_part_batch` 增补「领取来源架」列（可回溯 scope），就应当
+  把它与 `pickable-by-work-type` 一起收口；届时本条删除。归口文档：
+  [`./parts/lifecycle.md`](./parts/lifecycle.md#get-apiv2partsby-workerworker_id)
+  的 `by-worker` 节。

@@ -147,9 +147,14 @@ GET /api/v2/com/union-list
 > 完整字段表见 [`./parts/index.md#partlistitem-字段`](./parts/index.md#partlistitem-字段)。
 
 > ⚠️ `batch_id` / `batch_version` 是 2026-10-03 给 `PartListItem` 加的两个可选字段
-> （全仓**仅** `GET /parts/pickable-by-work-type/{work_type_id}` 填）。本端点
-> **刻意不填**：union-list 的行单位是 part（ASSEMBLY 行连 part 都不是），一个 part
-> 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故两字段恒为 `null`。
+> （**全仓两条填充路径**：`GET /parts/pickable-by-work-type/{work_type_id}` 与
+> `GET /parts/by-worker/{worker_id}` —— 两条端点的行单位都是「批次」）。
+> ⚠️ **2026-10-04 订正**：原文写「全仓**仅** `pickable-by-work-type` 填」是**错的**，
+> `by-worker` 自 2026-10-03 起同样填（`work_type.rs` 的取行 SQL 投影
+> `b.id AS batch_id` / `b.version AS batch_version`），与
+> [`./parts/index.md`](./parts/index.md#前端配套改动清单) 的端点矩阵一致。
+> 本端点**刻意不填**：union-list 的行单位是 part（ASSEMBLY 行连 part 都不是），
+> 一个 part 的活跃批次可能不止一个，填任一活跃批次都是错锚点，故两字段恒为 `null`。
 > 完整字段表见 [`./parts/index.md#partlistitem-字段`](./parts/index.md#partlistitem-字段)。
 
 ## 状态码
