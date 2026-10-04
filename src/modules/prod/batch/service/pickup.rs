@@ -169,7 +169,7 @@ impl BatchService {
         }
         // 2026-10-04 新增：`shelf_id` 改为可选，**缺省 = 完全不校验**。
         //
-        // 该字段对 pick-up 的最终结果零影响（本路径 3 条 `t_part_batch` 写入的
+        // 该字段对 pick-up 的最终结果零影响（本路径 3 个 `t_part_batch` 写入点的
         // SET / WHERE 均无货架列或货架条件，`t_part_event` 无货架列，响应 VO 无
         // shelf 字段），原先那条 `validate_shelf_zone` 是防呆断言而非安全边界，
         // 故扫码台 / 看板等自动发起方可以不带它。传了才校验，语义与改动前逐字

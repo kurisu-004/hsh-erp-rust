@@ -285,11 +285,12 @@ Response 200 `data`：`PartOut`（**响应体形状与整批领取完全一致**
 
 > ⚠️ **本字段不影响任何持久化结果**（这是它可以变可选的根据）：
 >
-> - 不落库：pick-up 路径上 `t_part_batch` 的全部 3 条写入 —— `pickup.rs` 的内联
->   `UPDATE`（IN_PROCESS 分支）、`guard.rs` → `status_gate.rs` 的通用
->   `BATCH_STATUS_UPDATE_SQL`（PENDING 分支）、部分领取的
->   `split_batch_for_partial_pass` —— 它们的 SET 与 WHERE **均无货架列、也无货架
->   条件**；
+> - 不落库：pick-up 路径上 `t_part_batch` 的**全部 3 个写入点**（拆成 4 条 SQL）——
+>   `pickup.rs` 的内联 `UPDATE`（IN_PROCESS 分支）、`guard.rs` → `status_gate.rs` 的
+>   通用 `BATCH_STATUS_UPDATE_SQL`（PENDING 分支）、部分领取的
+>   `split_batch_for_partial_pass`（= `_split_batch_inner` 的 `INSERT` 新批次 +
+>   `UPDATE` 源批次 quantity 两条语句）—— 它们的 SET 与 WHERE **均无货架列、也无
+>   货架条件**；
 > - 事件无货架列：`t_part_event` 没有 shelf 字段，`PICKED_UP` / `SPLIT` 两条
 >   事件都不记货架；
 > - 响应无 shelf 字段：响应体是 `PartOut`，不含任何 shelf 属性；
@@ -309,8 +310,21 @@ Response 200 `data`：`PartOut`（**响应体形状与整批领取完全一致**
 > 2. **IN_PROCESS 起点只守 `location='PRODUCTION_SHELF'`、不守 holder** ——
 >    `dispatch` 与 `pool/move` 两个写点能把 INSPECTION 区的架写进
 >    `current_holder_id`，推导出来的值可能根本不在 PRODUCTION 区；
-> 3. **上架后货架被停用 / 软删时 `current_holder_id` 仍指向失效 id** ——
+> 3. **`current_holder_id` 可能指向已软删 / 非 `PRODUCTION` 区的架** ——
 >    「推导 + 施加同样校验」会把这类批次**永久锁死**（既领不走、也不报错可解释）。
+>    三条机制（**2026-10-04 review 第 1 轮订正**：原表述「货架被停用 / 软删时
+>    holder 仍指向失效 id」按字面不成立 —— `deactivate` 与 soft-delete 是同一操作，
+>    且 soft-delete 在被引用时会被 `20503 BIZ_SHELF_IN_USE` 拦住）：
+>    （a）`dispatch` 的 `ShelfProcessRepo::find_first_shelf_for_process` 只按
+>    `t_shelf_process.deleted_at IS NULL` 过滤、**不 JOIN `t_shelf`** ⇒ 既不过滤
+>    `zone` 也不过滤 `is_active`，映射残留时会把已软删的架 id 写进
+>    `current_holder_id`；
+>    （b）soft-delete 的 `20503` 守卫（`ShelfRepo::count_in_use_parts`）谓词是
+>    `location IN ('PRODUCTION_SHELF','INSPECTION_SHELF') AND status IN
+>    ('IN_PROCESS','INSPECTION')` ⇒ `location='PRODUCTION_SHELF'` 但 status 落在该
+>    集合之外的行**不被计入**；
+>    （c）该守卫是「先 count、再 soft_delete」两条独立语句、中间无锁 ⇒ 并发上架可
+>    穿过守卫（TOCTOU）。
 >
 > 故选择「缺省就什么都不做」，而不是替调用方猜一个值。
 

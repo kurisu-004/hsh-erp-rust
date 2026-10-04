@@ -21,13 +21,12 @@
 //!
 //! ## `shelf_id` 可选（2026-10-04 新增用例组，本改动的核心回归）
 //!
-//!   8. **请求体完全不带 `shelf_id`** → 200，领取成功且 status / location / holder
-//!      逐字正确（与场景 1 只差「少一个 shelf_id」）
+//!   8. **请求体完全不带 `shelf_id`** → 200，领取成功且 status / location / holder 逐字正确（与场景 1 只差「少一个 shelf_id」）
 //!   9. `shelf_id` 缺省 + 部分领取 → 200，拆批语义与场景 2 一致
-//!   10. `shelf_id` **传了非法值仍被拒**（不存在 20501 / 停用 20512 / INSPECTION
-//!       区 20104）—— 钉住「传了才校验」，防后人把 `if let` 写反或删掉校验
-//!   11. `"shelf_id": 43`（JSON 数字而非字符串）→ 422 纯文本（`deserialize_i64_opt`
-//!       只吃 str；与改动前 `deserialize_i64` 的行为一致，未放宽）
+//!  10. `shelf_id` **传了非法值仍被拒**（不存在 20501 / 停用 20512 / INSPECTION 区 20104）—— 钉住「传了才校验」
+//!  11. `"shelf_id": 43`（JSON 数字而非字符串）→ 422 纯文本（`deserialize_i64_opt` 只吃 str，与改动前一致、未放宽）
+//!  12. `"shelf_id": null` ≡ 字段缺省（`deserialize_i64_opt` 输入行为矩阵的第四格）
+//!  13. 缺 `version` / 缺 `worker_id` → 仍 422（钉住「本改动只放宽 `shelf_id`」）
 //!
 //! ## 集成测试范本（PR13 Phase F）
 //! 所有 HTTP / fixture helper 一律 `use hsh_erp_test_support::{...}`，**不保留
@@ -1018,8 +1017,8 @@ async fn pick_up_shelf_id_as_json_number_is_rejected() {
         .expect("read body");
     let text = String::from_utf8_lossy(&raw);
     assert!(
-        !text.is_empty(),
-        "422 应带 axum 提取器的拒绝原因（纯文本），不应是空 body"
+        text.contains("shelf_id"),
+        "422 原因应指向 shelf_id（否则说明拒绝来自别的字段，用例会假绿）: {text}"
     );
 
     // 提取器就拒了，业务逻辑一行没跑 —— 批次必须原封不动
@@ -1070,4 +1069,76 @@ async fn pick_up_null_shelf_id_is_treated_as_absent() {
     assert_eq!(location.as_deref(), Some("WORKER"));
     assert_eq!(holder, Some(worker_id));
     assert_eq!(version, 1);
+}
+
+/// 场景 13（2026-10-04 新增，review 第 1 轮 M-4）：`version` / `worker_id` 缺失仍 422
+///
+/// 本次把 `shelf_id` 从必填放宽为可选，最容易被顺手搞混的就是「哪些字段仍必填」——
+/// `version`（OCC 锚）与 `worker_id`（持有件工人）**必须保持必填**。代码上的依据：
+/// 两者都**没有** `#[serde(default)]`，serde 对缺字段直接报错 ⇒ axum `Json` 提取器
+/// 422。缺了这条用例，将来有人给 `worker_id` 补一个 `default` 不会有任何测试变红。
+///
+/// 与场景 11 同款处理：响应是 axum `JsonRejection` 的**纯文本** 422（非业务信封），
+/// 不能用 `hsh_erp_test_support::send`（它对非 JSON body 直接 panic），故直读 raw
+/// body 并断言拒绝原因里点名了缺失的那个字段。
+#[tokio::test]
+async fn pick_up_missing_required_fields_still_422() {
+    use axum::body::to_bytes;
+
+    let ctx = bootstrap().await;
+
+    for (idx, omit) in ["version", "worker_id"].into_iter().enumerate() {
+        // 每条子用例用独立的 part / 批次，避免前一条失败后留下脏状态干扰后一条
+        let worker_id = insert_active_worker(&ctx.pool, ctx.fx.work_type_a_id).await;
+        let part_id = insert_part(&ctx.pool, 4).await;
+        let batch_id =
+            insert_part_batch(&ctx.pool, part_id, 4, "IN_PROCESS", Some(ctx.shelf_id())).await;
+
+        // 先造完整 body 再删掉一个 key —— 保证两条 body 只差「缺哪个必填字段」，
+        // 其余（status / location / holder / version / shelf_id）逐字相同
+        let mut body = json!({
+            "version": 0,
+            "worker_id": worker_id.to_string(),
+            "shelf_id": ctx.shelf_id().to_string(),
+        });
+        let removed = body
+            .as_object_mut()
+            .expect("body 是 object")
+            .remove(omit)
+            .unwrap_or_else(|| panic!("完整 body 里应有 {omit} 键"));
+        assert!(!removed.is_null(), "{omit} 本就不该是 null");
+
+        let resp = ctx
+            .app
+            .clone()
+            .oneshot(json_request(
+                "POST",
+                &format!("/prod/batches/{batch_id}/pick-up"),
+                Some(body),
+                Some(&ctx.manager),
+            ))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "[{idx}] 缺 {omit} 应 422（它仍是必填字段，不因 shelf_id 放宽而变可选）"
+        );
+        let raw = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.contains(omit),
+            "[{idx}] 422 原因应点名缺失字段 {omit}: {text}"
+        );
+
+        // 提取器就拒了，业务逻辑一行没跑 —— 批次必须原封不动
+        let (quantity, status, location, holder, version) = read_batch(&ctx.pool, batch_id).await;
+        assert_eq!(quantity, 4);
+        assert_eq!(status, "IN_PROCESS");
+        assert_eq!(location.as_deref(), Some("PRODUCTION_SHELF"));
+        assert_eq!(holder, Some(ctx.shelf_id()));
+        assert_eq!(version, 0);
+    }
 }
