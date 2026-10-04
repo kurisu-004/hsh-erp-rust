@@ -20,6 +20,7 @@
 - [POST /api/v2/prod/batches/{batch_id}/complete](#post-apiv2prodbatchesbatch_idcomplete)
 - [POST /api/v2/prod/batches/{batch_id}/start-repair](#post-apiv2prodbatchesbatch_idstart-repair)
 - [POST /api/v2/parts/{part_id}/force-complete](#post-apiv2partspart_idforce-complete)（MANAGER 单角色强推逃生通道；**留 part 域**）
+- [GET /api/v2/parts/pickable-by-work-type/{work_type_id}](#get-apiv2partspickable-by-work-typework_type_id)（**2026-10-04 新增章节**；SHELF_ACCOUNT scope 收口）
 - [GET /api/v2/parts/pending-programming](#get-apiv2partspending-programming)
 
 ---
@@ -410,6 +411,134 @@ Response 200 `data`：`PartOut`。
 
 错误码：20101 / 20109 / 20118 / 40901。
 
+### `GET /api/v2/parts/pickable-by-work-type/{work_type_id}`
+
+权限: **Manager / Clerk / Inspector / ShelfAccount**
+（实现见 `src/modules/part/service/phase1/work_type.rs::list_pickable_by_work_type`
+的 `current.require_any_role(&[Manager, Clerk, Inspector, ShelfAccount])`。
+⚠️ **不含 `CncProgrammer`** —— 同族的 `by-work-type` / `by-worker` 三处一致。）
+
+> 2026-10-04 新增本章节。此前本端点在 `docs/api/` 下**无任何章节**，只在
+> [`./index.md`](./index.md#端点总表) 的端点总表里出现过一行。行单位是**批次**
+> （取行 SQL 从 `t_part_batch b` 起），语义单位与 `by-worker` 同款。
+
+Path：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `work_type_id` | string (i64) | 工种雪花 ID |
+
+Query：
+
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `shelf_id` | string (i64)? | 客户端过滤：只看该货架上的批次。**2026-10-04 起语义收窄** —— 见下方「scope 收口」 |
+| `limit` | i64? | 默认 50，clamp 到 `[1, 200]` |
+| `offset` | i64? | 默认 0 |
+
+Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
+`PartListItem` 全字段表见 [`./index.md#partlistitem-字段`](./index.md#partlistitem-字段)。
+
+#### 完整 WHERE 谓词全集
+
+取行 SQL 的全部过滤条件（`total` 的 COUNT **缺 `p.deleted_at IS NULL` 一条**，见下）：
+
+| # | 谓词 | 位置 |
+|---|---|---|
+| 1 | `b.deleted_at IS NULL` | WHERE |
+| 2 | `p.deleted_at IS NULL` | WHERE（**仅取行**；COUNT 不 join `t_part`） |
+| 3 | `b.status = 'IN_PROCESS'` | WHERE |
+| 4 | `b.location = 'PRODUCTION_SHELF'` | WHERE |
+| 5 | `sh.is_active = true` | WHERE |
+| 6 | `sh.zone = 'PRODUCTION'` | WHERE |
+| 7 | `sh.deleted_at IS NULL` | **JOIN** `t_shelf sh ON sh.id = b.current_holder_id`（2026-10-04 补） |
+| 8 | `wtp.deleted_at IS NULL` | **JOIN** `t_work_type_process wtp ON wtp.process_id = b.current_process_id`（2026-10-02 补） |
+| 9 | `wtp.work_type_id = $1` | WHERE |
+| 10 | `($2::bigint IS NULL OR b.current_holder_id = $2)` | WHERE（`?shelf_id=`） |
+| 11 | `($5::bigint[] IS NULL OR sh.id = ANY($5))` | WHERE（**用户 scope 收口**，2026-10-04 补） |
+
+`ORDER BY p.is_urgent DESC, p.planned_delivery_date ASC, b.id ASC`。
+
+> ⚠️ **这条 `ORDER BY` 在前端会被覆盖**：报工台「领料」页在客户端按选中货架 /
+> 扫描顺序重排（见前端 `views/production` 的领料列表），故后端排序只对「不带客户端
+> 排序的直接调用方」可见。排序键排的是 **DB 真实列**（`p.is_urgent` /
+> `p.planned_delivery_date`），与响应里投出的同名字段同源 —— 不存在「按真值排、
+> 按假值显示」的落差。**本文件不修这个双重排序**，属前端侧范围。
+
+> ⚠️ **COUNT 与取行的既有不对称**（**本文件不修**）：COUNT 不 join `t_part`，
+> 故 #2 缺失 ⇒ 软删 part 的 active batch 计入 `total` 而不计入 `items`，分页总数
+> 可能偏大。是否补 join 属 `total` 语义决策，`work_type.rs` 的 COUNT 处注释已
+> 登记。**但 #11（scope 谓词）与 #7（`sh.deleted_at`）两条必须两边同形** ——
+> 漏任一条都会让「`items` 已按 scope 收窄、`total` 仍报全厂数」或反之。COUNT 侧
+> 的 scope 参数编号是 `$3` 而非 `$5`（PG 要求每个被引用的参数都能推断类型，未引用
+> 的 `$3`/`$4` 会触发 `could not determine data type of parameter`），谓词语义
+> 与取行逐字相同。
+
+#### scope 收口（2026-10-04 新增，**安全修复**）
+
+> **2026-10-04 之前本端点完全没有按 `user.shelf_ids` 收口**：全文零
+> `can_access_shelf` / 零 `shelf_ids` / 零 `shelf_wildcard`，唯一的货架输入是
+> 客户端可控的 `?shelf_id=`，而它不与用户 scope 求交、不传时谓词恒真。
+> ⇒ **绑了架 A 的 SHELF_ACCOUNT 账号能看到全厂所有 PRODUCTION 架上该工种可领的
+> 批次**（信息泄露）。
+
+收口规则**逐条**对齐 `src/auth/rbac.rs::CurrentUser::can_access_shelf`：
+
+```text
+shelf_wildcard || shelf_ids.contains(&shelf_id) || has_role(Role::Manager)
+```
+
+| 账号 | scope 谓词 |
+|---|---|
+| `shelf_wildcard = true`（任一 SHELF_ACCOUNT 的 `t_user_role.scope_id IS NULL`） | `None` ⇒ **不加谓词，全集** |
+| 角色含 `MANAGER` | `None` ⇒ **不加谓词，全集** |
+| 其余（`shelf_ids` 非空） | `Some(shelf_ids)` ⇒ `sh.id = ANY($n)` |
+| 其余（`shelf_ids` 为空，如未绑架的 SHELF_ACCOUNT） | `Some([])` ⇒ **空集**（不是「无限制」） |
+
+`?shelf_id=` 与 scope 求**交**：最终作用域 = `scope ∩ {shelf_id}`，`shelf_id` 不在
+scope 内 ⇒ 返回空集。`shelf_id` 入参本身（`ByWorkTypeQuery.shelf_id`）保留不动，
+只是语义从「不传即全给」变成「收口后的进一步收窄」—— 只能更严不能更松。
+
+> ⚠️ **Clerk / Inspector 的行为变更**：本端点角色白名单含 Clerk / Inspector，
+> 而这两类角色按惯例不配 `t_user_role` 的 SHELF_ACCOUNT 行 ⇒ `shelf_ids` 为空且
+> `shelf_wildcard = false` ⇒ 收口后**返回空列表**。这是「与 `can_access_shelf`
+> 对齐」的必然结果：写侧 `POST /api/v2/prod/batches/worker-scan` 的角色白名单只有
+> `[Manager, ShelfAccount]` 并对 `req.shelf_id` 调 `can_access_shelf`，故对这两类
+> 账号本来就不存在「列表给出但提交被拒」的落差。若业务上需要 Clerk / Inspector
+> 看到全集，给它们配 SHELF_ACCOUNT wildcard 角色行即可（`scope_id = NULL`）。
+
+#### 2026-10-04 行为变更：`t_shelf` 软删守卫
+
+`JOIN t_shelf sh ON sh.id = b.current_holder_id` 此前缺 `sh.deleted_at IS NULL`。
+而 pick-up 写侧 `validate_shelf_zone` 走 `ShelfRepo::get_by_id`（带软删守卫）会拒
+软删架 ⇒ 现状是「**列表给出但提交必被拒**」。取行与 COUNT 同步补齐后：软删架上的
+批次不再出现在结果里。
+
+#### 出参相对 `PartListItem` 的填充口径
+
+| 字段 | 口径 |
+|---|---|
+| `id` / `serial_no` / `name` / `drawing_no` | `t_part` 真实投影。⚠️ **2026-10-04 起 `name` 才是工单名**（此前填的是 `drawing_no` 的副本，卡片第 1 / 2 行重复）；`serial_no` 可空（手工工单） |
+| `is_urgent` | `t_part.is_urgent` 真实值。⚠️ **2026-10-04 起**（此前恒 `false`，报工台「加急」tag 永不渲染） |
+| `planned_delivery_date` | `t_part.planned_delivery_date` 真实值。⚠️ **2026-10-04 起**（此前恒 `1970-01-01`） |
+| `system_delivery_date` | `t_part.system_delivery_date` 真实值或 `null`（该列可空）。⚠️ **2026-10-04 起**（此前恒 `null`，交期 chip 永不渲染） |
+| `quantity` | **`b.quantity`（批次数量）**，不是 `p.quantity` |
+| `batch_id` / `batch_version` | 本端点**填**（行单位是批次）：`t_part_batch.id` / `.version`。批次 OCC 只认 `batch_version` |
+| `process_chain_id` | `NULL`（`FromRow` 按列名匹配，取行 SQL 显式投影 `NULL::bigint`）。口径见 [`./index.md`](./index.md#partlistitem-字段) |
+| `chain_state` / `chain_next_process_id` / `chain_next_process_name` / `chain_current_process_name` | 全 `NONE` / `"0"` / `null` / `null`（本端点不填；链位置是批次级事实，仅 `by-worker` 填） |
+| `version` | 恒 `0`（**有意占位**）：本 VO 的 `version` 是 **part 级**（`t_part.version`），而取行 SQL 不投影 `p.version` |
+| `applicant_name` / `request_date` / `customer_id` / `order_no` / `note` / `unit_price` / `total_price` / `created_at` / `created_by` / `updated_at` / `updated_by` / `deleted_at` / `assembly_id` / `customer_name` / `l1_customer_name` / `location` / `holder_name` / `delivered_quantity` | 恒为占位值（空串 / 0 / `null` / epoch）。**前端无消费方**，2026-10-04 有意不动 |
+| `next_process_id` | **恒不出现在响应里** —— `PartListItem` 根本没有该字段（2026-09-27 用户决策范围 C），`From<TPart> for PartListItem` 因此也不复制它 |
+
+> 2026-10-04 三个同族端点（`by-work-type` / `pickable-by-work-type` / `by-worker`）
+> 的占位值来源已从「三份手抄 20 字段的 `TPart { ... }` 字面量」收敛为**一个**共享
+> 投影 struct（`part::service::phase1::work_type::WorkTypeListRow` +
+> `into_list_item`），列集与 struct 字段集由 `#[derive(sqlx::FromRow)]` 逐字对齐 ——
+> 端点不填的字段在 SQL 里显式投影 `NULL::<type> AS <字段名>`。上表的「恒为占位值」
+> 与「恒不出现在响应里」两条不变量因此由类型系统 + 这一个穷尽 struct 字面量保证。
+
+错误码：40300（角色不在白名单）/ 40105（未登录）/ 50001+（DB 错误）。
+
 ### `GET /api/v2/parts/by-worker/{worker_id}`
 
 权限: **Manager / Clerk / Inspector / ShelfAccount**
@@ -431,6 +560,20 @@ Response 200 `data`：`{ items: [PartListItem], total, limit, offset }`。
 **筛选条件**：`t_part_batch` 侧 `status='IN_PROCESS'` + `location='WORKER'` +
 `deleted_at IS NULL` + `current_holder_id = {worker_id}`，且 part 本身
 `deleted_at IS NULL`；`ORDER BY b.id DESC`。行单位是**批次**（不是 part）。
+
+#### 2026-10-04 part 侧真实字段投影
+
+`name` / `is_urgent` / `system_delivery_date` / `planned_delivery_date` 四个字段
+自 2026-10-04 起是 `t_part` 的**真实投影值**（此前是占位值：`name` 填成图号副本、
+`is_urgent` 恒 `false`、两个交期恒 `1970-01-01` / `null`，报工台「放回」页的加急
+tag 与交期 chip 因此永不渲染）。`quantity` 取自 `b.quantity`（批次数量），不是
+`p.quantity`。字段级口径与占位值清单见
+[`pickable-by-work-type` 节的填充口径表](#get-apiv2partspickable-by-work-typework_type_id)
+（三端点共用同一份）。
+
+> 本端点的**行单位是工人持有物**，没有货架维度，故**不做** SHELF_ACCOUNT 货架
+> scope 收口（`by-worker` 的 `can_access_shelf` 语义无处可施）。收口只加在
+> [`pickable-by-work-type`](#get-apiv2partspickable-by-work-typework_type_id)。
 
 #### 2026-10-04 批次锚点字段
 

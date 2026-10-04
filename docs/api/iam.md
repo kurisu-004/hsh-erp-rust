@@ -74,6 +74,33 @@ Response 200 `data`：
 | `shelf_ids` | [string (i64)] | 货架一体机可访问的货架 ID 列表 |
 | `menus` | [object] | 菜单树（递归 `children`），见下 |
 
+> 🐛 **契约缺口（2026-10-04 登记，本文件不修）**：`CurrentUserOut`
+> （`src/modules/iam/vo/session.rs`）**不返 `shelf_wildcard` 字段**，而后端的
+> 货架可见性判据 `CurrentUser::can_access_shelf`
+> （`src/auth/rbac.rs`：`self.shelf_wildcard || self.shelf_ids.contains(&shelf_id)
+> || self.has_role(Role::Manager)`）**依赖它**。
+>
+> `shelf_wildcard` 的来源是「任一 `SHELF_ACCOUNT` 角色行的
+> `t_user_role.scope_id IS NULL`」（见 `iam::service::session::resolve_roles_and_scope`
+> 第 3 段）。于是前端拿到 `shelf_ids: []` 时**无法区分**两种账号：
+>
+> | 账号 | 语义 | 前端看到的 |
+> |---|---|---|
+> | 未绑架的 SHELF_ACCOUNT | 一个架都看不到 | `shelf_ids: []` |
+> | wildcard SHELF_ACCOUNT（`scope_id = NULL`） | **全厂所有架都能看** | `shelf_ids: []` |
+>
+> 两者在前端是**完全相同的响应**，而后端可见范围相差全集。任何「用 `shelf_ids`
+> 为空就当作无权限 / 就当作显示全部」的客户端分支都会对其中一类判错。
+>
+> 影响面举例：2026-10-04 起
+> [`GET /api/v2/parts/pickable-by-work-type/{work_type_id}`](./parts/lifecycle.md#get-apiv2partspickable-by-work-typework_type_id)
+> 按此判据收口（wildcard ⇒ 不加谓词、空 scope ⇒ 空集），前端要预判「这个货架账号
+> 能不能领料」就必须知道 wildcard。
+>
+> 修法（**不在本次范围**）：`CurrentUserOut` 补 `shelf_wildcard: bool`，前端 TS /
+> Zod schema 同步加该字段。归口登记见
+> [`./inconsistencies.md`](./inconsistencies.md#95-2026-10-04-登记iam-me-不返-shelf_wildcard)。
+
 `menus[]` 节点字段：
 
 | 字段 | 类型 | 说明 |

@@ -482,3 +482,35 @@ handler / dto / model / statemachine / repo/{mod,sql} / service/{mod,company,quo
 - 外协出参把「无下一道」与「链不可解析」塌成同一个 `chain_resolvable = false`
   （与 `by-worker` 的三值不同），改它要连带复核文档 3 处 + 约 499 行测试期望；
 - 属另一个变更，应当独立成一次带回归测试的修复。
+
+### 9.5 2026-10-04 登记：`/iam/me` 不返 `shelf_wildcard`
+
+**本次不修**，登记以免下一个读 `CurrentUserOut` 的人把它当「`shelf_ids` 就是货架
+可见性全貌」。
+
+`src/modules/iam/vo/session.rs::CurrentUserOut` 有 `shelf_ids`、**没有**
+`shelf_wildcard`；而后端的货架可见性判据
+`src/auth/rbac.rs::CurrentUser::can_access_shelf` 是三元：
+
+```rust
+self.shelf_wildcard || self.shelf_ids.contains(&shelf_id) || self.has_role(Role::Manager)
+```
+
+`shelf_wildcard` 的来源是「任一 `SHELF_ACCOUNT` 角色行的
+`t_user_role.scope_id IS NULL`」（`iam::service::session::resolve_roles_and_scope`
+第 3 段）。于是前端拿到 `shelf_ids: []` 时**无法区分**「未绑架（一个架都看不到）」
+与「wildcard（全厂所有架都能看）」—— 两者响应逐字相同，而后端可见范围相差全集。
+
+本次的直接影响：2026-10-04 起
+[`GET /api/v2/parts/pickable-by-work-type/{work_type_id}`](./parts/lifecycle.md#get-apiv2partspickable-by-work-typework_type_id)
+按该判据收口（wildcard / Manager ⇒ 不加谓词；空 scope ⇒ 空集），前端要预判
+「这个货架账号能不能领料」就绕不开 wildcard 这个缺失字段。同一判据也已经在
+`shelves::for-return`（`ShelfService::list_for_return`）、
+`shelves::crud`（`ShelfService::list`）、`prod::shelf_process`、
+`prod::batch::worker-scan`（`transition.rs`）四处在用，故这不是单端点问题。
+
+修法（属另一个变更，应独立成一次带前端配套的修复）：`CurrentUserOut` 补
+`shelf_wildcard: bool`，前端 TS / Zod schema 同步加该字段，并复核所有
+「`shelf_ids.length === 0` ⇒ …」的客户端分支。字段级说明已写进
+[`./iam.md`](./iam.md#get-apiv2iamme) 的 `GET /api/v2/iam/me` 节（该处是前端查
+响应 schema 时**必然会读到**的位置）。
