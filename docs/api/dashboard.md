@@ -156,15 +156,15 @@ HTTP request
 > 不得用 `row_type=PART`（子件被 `assembly_id IS NULL` 守卫排除，会出现
 > 「柱状图 9 条 / 抽屉 5 条」的不一致）或 `row_type=ALL`（会多出装配件父行）。
 >
-> **`count` == 下钻 `total` 的三个前置条件（缺一则必然不等）**：
+> **`count` == 下钻 `total` 的三个前置条件（三条都满足才可能相等）**：
 > 1. **交期口径对齐**：`?basis=system` 时下钻用
 >    `system_delivery_date_from` / `system_delivery_date_to`；`?basis=planned`
 >    （**缺省值**）时桶日取自 `planned_delivery_date`，下钻必须改用
 >    `planned_delivery_date_from` / `_to`。用错列则两条统计落在不同日期集合上。
 > 2. **状态口径对齐**：dashboard 的 count SQL 恒带
 >    `status NOT IN ('COMPLETED','CANCELLED')`。PART_FLAT 不传 `statuses` 时
->    这两个状态**会被计入**下钻 `total` ⇒ `total` 必然 > `count`。下钻须显式传
->    `statuses=` 排除它们。
+>    这两个状态**会被计入**下钻 `total` ⇒ `total ≥ count`，且桶内确有该两态行时
+>    严格 `total > count`。下钻须显式传 `statuses=` 排除它们。
 > 3. **时间窗精确等于桶日**：下钻的 `_from` / `_to` 须都取该桶的 `date`
 >    （闭区间同日），不得用「整个窗口」或「跨多个桶」的范围。
 >

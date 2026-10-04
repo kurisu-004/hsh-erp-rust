@@ -66,7 +66,7 @@ GET /api/v2/com/union-list
 ### `row_type` 语义矩阵
 
 | `row_type` | 行为 |
-|--------------------|-------------------------------------------------|
+|---|---|
 | `"PART"`           | 仅 `t_part WHERE assembly_id IS NULL`（装配体子件被守卫排除） |
 | `"PART_FLAT"`      | 2026-10-05 新增：仅 `t_part`（**含** `assembly_id IS NOT NULL` 的装配件子件），**无** `t_assembly` 段。口径与 `GET /api/v2/dashboard/snapshot` 的 `upcoming_delivery[].count`（`t_part` 行数）逐行对齐，供该统计的下钻列表消费 |
 | `"ASSEMBLY"`       | 仅 `t_assembly`（投影为 `PartListItem` 形态） |
@@ -155,11 +155,10 @@ GET /api/v2/com/union-list
 | `batch_id` / `batch_version` | **`None`（恒 `null`，不填）** | **`None`（恒 `null`，不填）** | **`None`（恒 `null`，不填）** |
 | `delivered_quantity` | 未软删批次中 `status ∈ ('DELIVERED', 'COMPLETED')` 的 `quantity` 之和（零批次 → `0`） | 同 PART 行 | 可凑齐的套数 `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，整数除法截断；子件总量为 0 者不参与，无子件 → `0`，子件超交时收口到工单总套数 |
 
-> ⚠️ `assembly_id`（2026-10-05 新增 `PART_FLAT` 态）：该字段此前只挂在 VO 上、
-> 三态都没有真实取值 —— `PART` 行被 `assembly_id IS NULL` 守卫挡住、恒 `null`；
-> `ASSEMBLY` 行由投影函数硬编码 `None`。`PART_FLAT` 态是本端点第一次把它放出来：
-> 装配件子件带 `Some(父 t_assembly.id)`，独立件为 `None`，前端可据此把子件
-> 归组到父装配件。
+> ⚠️ `assembly_id`：仅 `PART_FLAT` 态有真实取值 —— 装配件子件带
+> `Some(父 t_assembly.id)`、独立件为 `None`，前端据此把子件归组到父装配件。
+> 其余三态恒 `null`：`PART` 态被 `assembly_id IS NULL` 子件守卫挡住；`ASSEMBLY`
+> 态是顶层装配件、无父，`repo` 投影硬编码 `NULL::bigint`；`ALL` 态按行适用同前两则。
 >
 > `row_type` 字段值恒为 `"PART"`（`PartListItem` 从 `TPart` 派生，与请求的
 > `row_type=PART_FLAT` 无关），故本端点四态中只有 `"PART"` / `"ASSEMBLY"` 两种
@@ -168,8 +167,9 @@ GET /api/v2/com/union-list
 > ⚠️ `delivered_quantity`（2026-10-03 新增）：真相源是 `t_part_batch.status`
 > （批次级「已交」的唯一依据，**不**从派生缓存 `t_part.status` 反推 —— 后者在
 > min-progress 规则下只有全部活跃批次都 DELIVERED 才等于 DELIVERED，会把「部分已交」
-> 一律压成 0）。三种 `row_type` 模式都填该字段：PART / ALL 走「已交数量之和」聚合，
-> ASSEMBLY / ALL 走「已送套数 min 公式」聚合（ALL 模式两段都接，共 2 条聚合 SQL），
+> 一律压成 0）。四种 `row_type` 模式都填该字段：PART 系（`PART` / `PART_FLAT`）
+> 与 ALL 的 part 段走「已交数量之和」聚合，ASSEMBLY 态与 ALL 的 asm 段走
+> 「已送套数 min 公式」聚合（ALL 模式两段都接，共 2 条聚合 SQL），
 > 故 `delivered_quantity` 恒为非 null 数字。
 > 与 `GET /api/v2/parts` 的同名字段口径逐字一致（同一对 helper）。
 > 完整字段表见 [`./parts/index.md#partlistitem-字段`](./parts/index.md#partlistitem-字段)。

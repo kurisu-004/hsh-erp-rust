@@ -96,10 +96,12 @@ pub struct PartUpdate<'a> {
 /// 列），按 part 下任一 active batch 命中即返。空切片 → 不过滤（与旧行为一致）。
 ///
 /// 2026-09-28 新增：`part_only: bool` —— 装配体子件（`assembly_id IS NOT NULL`
-/// 的 `t_part` 行）是「装配体的零件条目」，前端零件一览页 `GET /parts` 在 ALL
-/// 模式（或 PART-only 模式）下要排除。`true` 时额外追加 `AND assembly_id IS NULL`
-/// 守卫；`false` 时不追加（兼容旧 caller）。repo 层不做"ALL 合并"，ALL 合并由
-/// service 层在内存里 merge（见 `PartService::list_parts` 三模式分发）。
+/// 的 `t_part` 行）是否排除。`true` 时额外追加 `AND assembly_id IS NULL` 守卫，
+/// 全仓三处置位：part 域 `GET /parts`（`PartService::list_parts_part_only_with_total`）、
+/// `GET /api/v2/com/union-list?row_type=PART`、以及 ALL 态的 part 段 / part 计数；
+/// `false` 时不加守卫，仅 `row_type=PART_FLAT` 一处使用。跨 `t_assembly` 的行类型
+/// 合并不落在本 repo —— `t_assembly` 段由 `com::union_list` 域自己的 SQL
+/// （UNION ALL）负责。
 ///
 /// 2026-09-30 新增：`planned_delivery_date_from/to: Option<chrono::NaiveDate>`
 /// 日期窗口过滤。`None` 端不参与过滤；`Some(d)` 端追加 `AND planned_delivery_date
@@ -156,8 +158,8 @@ pub struct PartListFilters<'a> {
     /// 系统交期 IS NULL 三态（None=不参与 / Some(true)=IS NULL / Some(false)=IS NOT NULL）
     pub system_delivery_date_is_null: Option<bool>,
     /// 2026-09-28 新增：装配体子件过滤开关。
-    /// - `true`：追加 `AND assembly_id IS NULL`（PART-only 模式 / ALL 模式零件段）
-    /// - `false`：不过滤（兼容旧 caller，如 `pending-programming` / `outsource-*` 等）
+    /// - `true`：追加 `AND assembly_id IS NULL`（part 域 `GET /parts` 与 union-list 的 `PART` 态 / ALL 态 part 段）
+    /// - `false`：不过滤（union-list 的 `PART_FLAT` 态）
     pub part_only: bool,
     pub sort_by: &'a str,
     pub sort_dir: &'a str,
@@ -527,8 +529,11 @@ impl PartRepo {
     /// 任一层漏认某个键，该键就在该态静默退化成建单序而不报错。
     /// `SYSTEM_DELIVERY_DATE` 正是这种键：dashboard「最紧急工单」面板与交期抽屉
     /// 的排序语义锚为系统交期升序，而本 repo 是它们在 PART 系（`PART` /
-    /// `PART_FLAT`）下唯一的排序实现。索引 `ix_t_part_system_delivery_date` 已
-    /// 覆盖该列，无需新增。
+    /// `PART_FLAT`）下唯一的排序实现。索引 `ix_t_part_system_delivery_date` 只服务
+    /// 范围过滤（`system_delivery_date >= from AND <= to`）；排序键是
+    /// `system_delivery_date <dir> NULLS LAST, id DESC`，其 `id DESC` 次键既非
+    /// 索引后继列、`NULLS LAST` 也无法靠反向扫描直出，故走增量排序
+    /// （Incremental Sort）。实测数据集下无需新增索引，故不加。
     ///
     /// 2026-10-03：待品检队列的排序列白名单是**另一套**，在 service 层
     /// （`prod/batch/service/list.rs::resolve_order_col` / `resolve_order_dir`），

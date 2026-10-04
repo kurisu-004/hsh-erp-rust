@@ -80,9 +80,13 @@
 //!   trigram 索引，单段可能 seq scan；客户筛选缩窄后命中索引覆盖。
 //!
 //! ## 排序键白名单
-//! CREATED_AT / UPDATED_AT / PLANNED_DELIVERY_DATE / REQUEST_DATE / DRAWING_NO /
-//! NAME；`SERIAL_NO` 仅 t_part 独有 → 降级 CREATED_AT（与 PART-only 模式一致；
-//! 服务层在 `parse_filters` 已收口）。
+//! CREATED_AT / UPDATED_AT / PLANNED_DELIVERY_DATE / REQUEST_DATE /
+//! SYSTEM_DELIVERY_DATE / DRAWING_NO / NAME（7 键，逐键对齐 `part/repo/sql/
+//! part_sql.rs::order_col` 去掉 `SERIAL_NO` 的子集 —— `t_assembly` 上无该列）；
+//! 非法值降级 `id`。`SYSTEM_DELIVERY_DATE` 是 dashboard 交期下钻与「最紧急工单」
+//! 的排序语义锚，缺它即静默退化成建单序。`docs/api/com-union-list.md` 的
+//! 「`sort_by` 有两层白名单」块以本节与 `order_col` 为第 2 层的权威来源，
+//! 两处必须逐键对齐。
 //!
 //! ## 函数签名
 //! - `list_union_all_with_filters`：接收 12 个扁平形参（避免

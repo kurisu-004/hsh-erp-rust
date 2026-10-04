@@ -726,6 +726,7 @@ async fn union_list_row_type_part_flat_counts_child_parts_as_rows() {
 ///
 /// 两者结论相反，故本断言在 `order_col` 漏掉 `SYSTEM_DELIVERY_DATE` 时必红；
 /// 若 fixture 把日期排成与插入序同向，排序键换成任何值都同样通过，断言恒真。
+/// 「子件 A 先插 → id 更小」这条前提由 setup 段的 `child_a < solo_b` 断言钉住。
 #[tokio::test]
 async fn union_list_row_type_part_flat_supports_part_filters() {
     use chrono::Duration;
@@ -782,6 +783,11 @@ async fn union_list_row_type_part_flat_supports_part_filters() {
         .execute(&pool)
         .await
         .expect("set solo C delivered");
+    // 命中集恒为 {子件 A, 独立件 B}，二者的 id 序须与交期序相反，排序断言才有鉴别力
+    assert!(
+        child_a < solo_b,
+        "fixture 前提：子件 A 必须先于独立件 B 插入（雪花 id 更小），否则本用例无鉴别力"
+    );
 
     let (s, env) = send(
         app,
