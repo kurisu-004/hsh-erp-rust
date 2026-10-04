@@ -2,7 +2,7 @@
 //!
 //! 本文件承载两族「一次性批量聚合」helper，都是列表行上的派生值、都以单条聚合
 //! SQL 完成（防 N+1 往返），且被 `part::service::crud`（`GET /parts`）与
-//! `com::union_list::service::crud`（`GET /api/v2/com/union-list` 三种 row_type
+//! `com::union_list::service::crud`（`GET /api/v2/com/union-list` 四种 row_type
 //! 模式）共同消费，故统一放 part 域、`pub(crate)` 供跨域 import：
 //!
 //! 1. 「位置 / 持有人」（2026-09-16 PR-2 瘦身后新增，见下）：按 min-progress

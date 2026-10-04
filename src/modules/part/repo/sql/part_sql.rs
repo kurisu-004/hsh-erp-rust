@@ -517,8 +517,18 @@ impl PartRepo {
     /// 列表筛选 + 分页 + 排序。
     ///
     /// 排序字段白名单（防 SQL 注入）：CREATED_AT / UPDATED_AT /
-    /// PLANNED_DELIVERY_DATE / REQUEST_DATE / SERIAL_NO / DRAWING_NO / NAME，
-    /// 其它值退化为 `id`。方向仅接受 `ASC`，其它视为 `DESC`。
+    /// PLANNED_DELIVERY_DATE / REQUEST_DATE / SYSTEM_DELIVERY_DATE / SERIAL_NO /
+    /// DRAWING_NO / NAME，其它值退化为 `id`。方向仅接受 `ASC`，其它视为 `DESC`。
+    ///
+    /// 2026-10-05：本白名单与 com 域 `union_list::repo::sql::union_sort_col` 的
+    /// 映射逐键对齐（那边少一个 `SERIAL_NO`，因 `t_assembly` 上无该列）。对齐是
+    /// **必需的**而非可选：排序键要过两层闸 —— service 层 `parse_filters` 的键名
+    /// 白名单（拒 → 降级 `CREATED_AT`）与本处的键名→列名映射（拒 → 降级 `id`），
+    /// 任一层漏认某个键，该键就在该态静默退化成建单序而不报错。
+    /// `SYSTEM_DELIVERY_DATE` 正是这种键：dashboard「最紧急工单」面板与交期抽屉
+    /// 的排序语义锚为系统交期升序，而本 repo 是它们在 PART 系（`PART` /
+    /// `PART_FLAT`）下唯一的排序实现。索引 `ix_t_part_system_delivery_date` 已
+    /// 覆盖该列，无需新增。
     ///
     /// 2026-10-03：待品检队列的排序列白名单是**另一套**，在 service 层
     /// （`prod/batch/service/list.rs::resolve_order_col` / `resolve_order_dir`），
@@ -538,6 +548,7 @@ impl PartRepo {
             "UPDATED_AT" => "updated_at",
             "PLANNED_DELIVERY_DATE" => "planned_delivery_date",
             "REQUEST_DATE" => "request_date",
+            "SYSTEM_DELIVERY_DATE" => "system_delivery_date",
             "SERIAL_NO" => "serial_no",
             "DRAWING_NO" => "drawing_no",
             "NAME" => "name",

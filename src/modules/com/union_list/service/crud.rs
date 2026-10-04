@@ -31,7 +31,7 @@
 //! 修前端 dashboard UpcomingDeliveryListDrawer 的隐藏 bug —— 前端已传这俩参数
 //! 但本 DTO 之前没有对应字段，参数被静默丢弃。本 service 层在 `parse_filters`
 //! 解析 `YYYY-MM-DD` → `chrono::NaiveDate`，非法格式 → 40001 VALIDATION_ERROR。
-//! PART / ALL / ASSEMBLY 三模式全部生效。
+//! 四态全部生效。
 //!
 //! ## 2026-09-30 新增：10 字段筛选（4 文本 ILIKE + 4 日期窗口 + 2 IS NULL 三态）
 //! 修零件一览页面（frontend `PartsTable.vue` / `usePartsListQuery.ts::buildParams()`）
@@ -42,7 +42,7 @@
 //!   （`order_no` 含空串语义对齐 PR-F 2026-08-11）
 //!
 //! 三层修复：DTO 声明（避免 axum Query 静默丢弃）→ service 解析 + 预格式化
-//!   → repo SQL 段内消费。PART / ALL / ASSEMBLY 三模式全部生效。
+//!   → repo SQL 段内消费。四态全部生效。
 //!
 //! ## SQL 引用
 //! - PART / PART_FLAT 段：`part/repo/sql/part_sql.rs::list_with_filters`
@@ -510,8 +510,10 @@ async fn parse_filters(
     query: &UnionListQuery,
 ) -> Result<ParsedFilters, AppError> {
     // 排序键白名单：7 键（去掉 SERIAL_NO，因 t_assembly 上无对应列）。
-    // SYSTEM_DELIVERY_DATE 2026-09-30 dashboard 配套（b28f409 / aaeb6f1）：
-    // 「最紧急工单」按系统交期排序。
+    // SYSTEM_DELIVERY_DATE 是 dashboard「最紧急工单」与交期抽屉的排序语义锚，
+    // 本端点接受它之后还必须在 repo 的列名映射里也认它（PART 系走
+    // `part/repo/sql/part_sql.rs::order_col`，ALL 段走本域 `union_sort_col`），
+    // 两处白名单必须同步，见 `part_sql.rs::list_with_filters` 的说明。
     let sort_by = [
         "CREATED_AT",
         "UPDATED_AT",
@@ -520,7 +522,6 @@ async fn parse_filters(
         "SYSTEM_DELIVERY_DATE",
         "DRAWING_NO",
         "NAME",
-        "SYSTEM_DELIVERY_DATE", // 2026-09-30 新增（dashboard「最紧急工单」按系统交期排序）
     ]
     .iter()
     .find(|&&s| Some(s) == query.sort_by.as_deref())
@@ -730,7 +731,9 @@ async fn lookup_customer_names(
 
 /// 一次性 GROUP BY 拿一组 assembly_id 的子件计数（从 `part::service::crud` 下沉）。
 ///
-/// 空 ids → 返回空 HashMap（不发起 SQL）。PART / ALL 段装配件行专用。
+/// 空 ids → 返回空 HashMap（不发起 SQL）。仅 ASSEMBLY 段与 ALL 段的装配件行
+/// 需要（`child_count` / `has_children` 两个派生字段）；PART 系两态的行是
+/// `t_part` 本身，不带该字段。
 async fn fetch_child_counts(
     conn: &mut PgConnection,
     asm_ids: &[i64],

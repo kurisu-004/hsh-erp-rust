@@ -13,7 +13,7 @@
 //! | 其它非空字符串     | `40001 VALIDATION_ERROR`                        |
 //!
 //! 设计取舍：
-//! - 行类型是必传语义（前端 rowType 下拉固定三态），但 DTO 仍以 `Option<String>`
+//! - 行类型是必传语义（前端 rowType 下拉固定四态），但 DTO 仍以 `Option<String>`
 //!   接，service 层负责 normalize 与 fallback（`None` → `ALL`）。
 //! - `statuses` / `locations` / `holder_ids` 逗号分隔字符串（与
 //!   `PartListQuery` 同形；query string 不友好 Vec）。
@@ -87,19 +87,20 @@ pub struct UnionListQuery {
     pub is_urgent: Option<bool>,
     #[serde(default)]
     pub keyword: Option<String>,
-    /// 逗号分隔字符串（query string 不支持 Vec 友好）。PART / ALL 模式生效；
-    /// ASSEMBLY 模式忽略（t_assembly 无 batch 派生字段）。
+    /// 逗号分隔字符串（query string 不支持 Vec 友好）。PART 系（`PART` /
+    /// `PART_FLAT`）与 ALL 模式生效；ASSEMBLY 模式忽略（t_assembly 无 batch
+    /// 派生字段）。
     #[serde(default)]
     pub locations: Option<String>,
-    /// 逗号分隔雪花 ID 字符串。PART / ALL 模式生效。
+    /// 逗号分隔雪花 ID 字符串。PART 系（`PART` / `PART_FLAT`）与 ALL 模式生效。
     #[serde(default)]
     pub holder_ids: Option<String>,
     // 2026-09-30 新增：`planned_delivery_date_from/to` 日期窗口（`YYYY-MM-DD`）。
     // 修隐藏 bug —— 前端 dashboard UpcomingDeliveryListDrawer 当前已传这俩
     // 参数，但本 DTO 之前没有对应字段，参数被静默丢弃；表现「看似只显示当天」
-    // 实为 7 天分桶 + limit 500 凑出来的。PART / ALL / ASSEMBLY 三模式全部生效
-    // （t_part.planned_delivery_date / t_assembly.planned_delivery_date 都是
-    // NOT NULL NaiveDate，SQL `>=`/`<=` 对 NULL 直接 false 即可）。
+    // 实为 7 天分桶 + limit 500 凑出来的。四态全部生效（t_part.planned_delivery_date /
+    // t_assembly.planned_delivery_date 都是 NOT NULL NaiveDate，SQL `>=`/`<=`
+    // 对 NULL 直接 false 即可）。
     #[serde(default)]
     pub planned_delivery_date_from: Option<String>,
     #[serde(default)]
@@ -111,7 +112,7 @@ pub struct UnionListQuery {
     // - `drawing_no` / `name` 命中 NOT NULL 列；`order_no` / `serial_no` 命
     //   中 t_part 的 nullable 列与 t_assembly 的 nullable 列；ILIKE pattern
     //   在 service 层预格式化为 `%x%`。
-    // - PART / ALL / ASSEMBLY 三模式全部生效。
+    // - PART 系（`PART` / `PART_FLAT`）/ ALL / ASSEMBLY 四态全部生效。
     /// 2026-09-30 新增：图号 ILIKE 模糊（已 trim + 预格式化 %x%）
     #[serde(default)]
     pub drawing_no: Option<String>,

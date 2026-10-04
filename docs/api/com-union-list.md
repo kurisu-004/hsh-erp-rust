@@ -44,21 +44,21 @@ GET /api/v2/com/union-list
 | `statuses` | `string` | 否 | — | 多状态逗号分隔（如 `"PENDING,IN_PROCESS"`） |
 | `is_urgent` | `bool` | 否 | — | 是否加急 |
 | `keyword` | `string` | 否 | — | 模糊匹配（name / drawing_no / serial_no 三列 ILIKE OR） |
-| `locations` | `string` | 否 | — | 逗号分隔位置白名单（OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF / OUTSOURCE_COMPANY）。**PART / ALL 模式生效**，ASSEMBLY 模式忽略（`t_assembly` 无 batch 派生字段） |
-| `holder_ids` | `string` | 否 | — | 逗号分隔雪花 ID。**PART / ALL 模式生效**；ASSEMBLY 模式忽略 |
-| `planned_delivery_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口下界 `planned_delivery_date >= $from`。**PART / ALL / ASSEMBLY 三模式全部生效**。非法格式 → `40001 VALIDATION_ERROR` |
-| `planned_delivery_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口上界 `planned_delivery_date <= $to`。**PART / ALL / ASSEMBLY 三模式全部生效**。非法格式 → `40001 VALIDATION_ERROR`。任一端缺失 → 对应 NULL 短路 |
-| `sort_by` | `string` | 否 | `CREATED_AT` | 排序键白名单：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `DRAWING_NO` / `NAME` / `SYSTEM_DELIVERY_DATE`。**注意**：`SERIAL_NO` 仅 `t_part` 独有 → ALL 模式降级 `CREATED_AT` |
-| `drawing_no` | `string` | 否 | — | 2026-09-30 新增：图号 ILIKE 模糊（`%x%`，已 trim + 预格式化）。**PART / ALL / ASSEMBLY 三模式全部生效**。空串 / 纯空白 → 不参与过滤 |
-| `name` | `string` | 否 | — | 2026-09-30 新增：名称 ILIKE 模糊（`%x%`）。**PART / ALL / ASSEMBLY 三模式全部生效** |
-| `order_no` | `string` | 否 | — | 2026-09-30 新增：订单号 ILIKE 模糊（`%x%`，t_part.order_no / t_assembly.order_no 均为 nullable varchar(30)）。**PART / ALL / ASSEMBLY 三模式全部生效** |
-| `serial_no` | `string` | 否 | — | 2026-09-30 新增：序列号 ILIKE 模糊（`%x%`，t_part.serial_no / t_assembly.serial_no 均为 nullable varchar(15)）。**PART / ALL / ASSEMBLY 三模式全部生效** |
-| `request_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：请求日期窗口下界 `request_date >= $from`。**PART / ALL / ASSEMBLY 三模式全部生效**（t_part.request_date / t_assembly.request_date 均 NOT NULL）。非法格式 → `40001 VALIDATION_ERROR` |
-| `request_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：请求日期窗口上界 `request_date <= $to`。**PART / ALL / ASSEMBLY 三模式全部生效**。任一端缺失 → 对应 NULL 短路 |
-| `system_delivery_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：系统交期窗口下界 `system_delivery_date >= $from`。**PART / ALL / ASSEMBLY 三模式全部生效**（t_part.system_delivery_date / t_assembly.system_delivery_date 均为 nullable date，普通 `>=`/`<=` 对 NULL 直接 false） |
-| `system_delivery_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：系统交期窗口上界 `system_delivery_date <= $to`。**PART / ALL / ASSEMBLY 三模式全部生效**。任一端缺失 → 对应 NULL 短路 |
-| `order_no_is_null` | `bool` | 否 | — | 2026-09-30 新增：订单号 IS NULL 三态过滤。`true` → `order_no IS NULL OR order_no = ''`（含空串语义对齐 PR-F 2026-08-11『空串视为未填』）；`false` → `order_no IS NOT NULL AND order_no <> ''`；省略 → 不参与。**PART / ALL / ASSEMBLY 三模式全部生效** |
-| `system_delivery_date_is_null` | `bool` | 否 | — | 2026-09-30 新增：系统交期 IS NULL 三态过滤。`true` → `system_delivery_date IS NULL`；`false` → `system_delivery_date IS NOT NULL`；省略 → 不参与。**PART / ALL / ASSEMBLY 三模式全部生效** |
+| `locations` | `string` | 否 | — | 逗号分隔位置白名单（OFFICE / PRODUCTION_SHELF / WORKER / INSPECTION_SHELF / OUTSOURCE_COMPANY）。**PART 系（`PART` / `PART_FLAT`）与 ALL 模式生效**，ASSEMBLY 模式忽略（`t_assembly` 无 batch 派生字段） |
+| `holder_ids` | `string` | 否 | — | 逗号分隔雪花 ID。**PART 系（`PART` / `PART_FLAT`）与 ALL 模式生效**；ASSEMBLY 模式忽略 |
+| `planned_delivery_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口下界 `planned_delivery_date >= $from`。**四态全部生效**。非法格式 → `40001 VALIDATION_ERROR` |
+| `planned_delivery_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：日期窗口上界 `planned_delivery_date <= $to`。**四态全部生效**。非法格式 → `40001 VALIDATION_ERROR`。任一端缺失 → 对应 NULL 短路 |
+| `sort_by` | `string` | 否 | `CREATED_AT` | 排序键白名单：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SYSTEM_DELIVERY_DATE` / `DRAWING_NO` / `NAME`。**PART / PART_FLAT / ALL 三态全部生效**；`ASSEMBLY` 态走 `assembly/repo/sql.rs::assembly_sort_col`，只认 `CREATED_AT` / `UPDATED_AT` / `DRAWING_NO` / `NAME`，其余键（含 `PLANNED_DELIVERY_DATE` / `REQUEST_DATE` / `SYSTEM_DELIVERY_DATE`）一律降级 `id`。**注意**：`SERIAL_NO` 仅 `t_part` 独有 → ALL 模式降级 `CREATED_AT` |
+| `drawing_no` | `string` | 否 | — | 2026-09-30 新增：图号 ILIKE 模糊（`%x%`，已 trim + 预格式化）。**四态全部生效**。空串 / 纯空白 → 不参与过滤 |
+| `name` | `string` | 否 | — | 2026-09-30 新增：名称 ILIKE 模糊（`%x%`）。**四态全部生效** |
+| `order_no` | `string` | 否 | — | 2026-09-30 新增：订单号 ILIKE 模糊（`%x%`，t_part.order_no / t_assembly.order_no 均为 nullable varchar(30)）。**四态全部生效** |
+| `serial_no` | `string` | 否 | — | 2026-09-30 新增：序列号 ILIKE 模糊（`%x%`，t_part.serial_no / t_assembly.serial_no 均为 nullable varchar(15)）。**四态全部生效** |
+| `request_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：请求日期窗口下界 `request_date >= $from`。**四态全部生效**（t_part.request_date / t_assembly.request_date 均 NOT NULL）。非法格式 → `40001 VALIDATION_ERROR` |
+| `request_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：请求日期窗口上界 `request_date <= $to`。**四态全部生效**。任一端缺失 → 对应 NULL 短路 |
+| `system_delivery_date_from` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：系统交期窗口下界 `system_delivery_date >= $from`。**四态全部生效**（t_part.system_delivery_date / t_assembly.system_delivery_date 均为 nullable date，普通 `>=`/`<=` 对 NULL 直接 false） |
+| `system_delivery_date_to` | `string` (`YYYY-MM-DD`) | 否 | — | 2026-09-30 新增：系统交期窗口上界 `system_delivery_date <= $to`。**四态全部生效**。任一端缺失 → 对应 NULL 短路 |
+| `order_no_is_null` | `bool` | 否 | — | 2026-09-30 新增：订单号 IS NULL 三态过滤。`true` → `order_no IS NULL OR order_no = ''`（含空串语义对齐 PR-F 2026-08-11『空串视为未填』）；`false` → `order_no IS NOT NULL AND order_no <> ''`；省略 → 不参与。**四态全部生效** |
+| `system_delivery_date_is_null` | `bool` | 否 | — | 2026-09-30 新增：系统交期 IS NULL 三态过滤。`true` → `system_delivery_date IS NULL`；`false` → `system_delivery_date IS NOT NULL`；省略 → 不参与。**四态全部生效** |
 | `sort_dir` | `string` | 否 | `DESC` | `"ASC"` / `"DESC"` |
 | `limit` | `i64` | 否 | `50` | `[1, 200]` |
 | `offset` | `i64` | 否 | `0` | `>= 0` |
@@ -68,7 +68,7 @@ GET /api/v2/com/union-list
 | `row_type` | 行为 |
 |--------------------|-------------------------------------------------|
 | `"PART"`           | 仅 `t_part WHERE assembly_id IS NULL`（装配体子件被守卫排除） |
-| `"PART_FLAT"`      | 2026-10-05 新增：仅 `t_part`（**含** `assembly_id IS NOT NULL` 的装配件子件），**无** `t_assembly` 段。口径与 `GET /api/v2/dashboard/snapshot` 的 `upcoming_delivery[].count`（`t_part` 行数）逐行对齐，供该统计的下钻列表消费：柱状图 9（4 子件 + 5 独立件）时本态也返 9 行 |
+| `"PART_FLAT"`      | 2026-10-05 新增：仅 `t_part`（**含** `assembly_id IS NOT NULL` 的装配件子件），**无** `t_assembly` 段。口径与 `GET /api/v2/dashboard/snapshot` 的 `upcoming_delivery[].count`（`t_part` 行数）逐行对齐，供该统计的下钻列表消费 |
 | `"ASSEMBLY"`       | 仅 `t_assembly`（投影为 `PartListItem` 形态） |
 | `"ALL"` / 缺省 / `""` | `t_part` UNION ALL `t_assembly` + 每段 `LIMIT (offset+limit)` pushdown |
 | 其它非空字符串      | `40001 VALIDATION_ERROR`（HTTP 422） |
@@ -77,6 +77,18 @@ GET /api/v2/com/union-list
 > 开关（`PartListFilters.part_only`）——过滤参数、排序、enrichment、`count` 全部共用同一
 > 实现。响应行的 `row_type` 字段恒为 `"PART"`（`PartListItem` 从 `TPart` 派生，不是
 > `"PART_FLAT"`）。
+
+> ⚠️ **`sort_by` 有两层白名单，缺一即静默降级**（2026-10-05 写明）：第 1 层是
+> service 层 `parse_filters` 的键名白名单（拒绝 → 降级 `CREATED_AT`），第 2 层是
+> repo 层的**键名 → SQL 列名**映射（拒绝 → 降级 `id`）。PART / PART_FLAT / ALL 三态
+> 的第 2 层分别是 `part/repo/sql/part_sql.rs::order_col`（PART 系两态共用）与本域
+> `repo/sql.rs::union_sort_col`（ALL 段）；两处映射必须逐键对齐，`SYSTEM_DELIVERY_DATE`
+> 在两处都认。少任一处，该态的排序就静默退化成建单序而不报错 ——
+> dashboard「最紧急工单」与交期抽屉的排序语义锚正是系统交期升序。
+> 回归守卫：`tests/com/union_list.rs` 的
+> `union_list_row_type_part_flat_supports_part_filters`（PART_FLAT 态）与
+> `union_list_row_type_part_sorts_by_system_delivery_date`（PART 态），
+> 两者的 fixture 都刻意让「插入序」与「交期序」相反，排序键失效时必红。
 
 ## 响应
 
@@ -97,7 +109,7 @@ GET /api/v2/com/union-list
         "request_date": "2026-09-29",
         "planned_delivery_date": "2026-10-15",
         "customer_id": "9876543210987654321",
-        "assembly_id": null,             // PART / PART_FLAT 行见下表
+        "assembly_id": null,             // PART_FLAT 行：子件=父 id / 独立件=null；PART 行恒 null；ASSEMBLY 行恒 null
         "status": "PENDING",
         "is_urgent": false,
         "order_no": null,
@@ -114,12 +126,12 @@ GET /api/v2/com/union-list
         "process_chain_id": null,
         "customer_name": "客户 L2",
         "l1_customer_name": "客户 L1",
-        "location": "PRODUCTION_SHELF",   // PART 行派生 / 其它 None
-        "holder_name": "A1",             // PART 行派生 / 其它 None
-        "row_type": "PART",              // "PART" / "ASSEMBLY"（与请求 row_type 一致）
-        "has_children": false,           // PART 行 false / 装配件按 child_count
-        "child_count": null,             // PART 行 null / 装配件子件数
-        "delivered_quantity": 0          // PART 行已送数量 / 装配件已送套数
+        "location": "PRODUCTION_SHELF",   // PART 系（PART / PART_FLAT）行派生 / ASSEMBLY 行 None
+        "holder_name": "A1",             // PART 系（PART / PART_FLAT）行派生 / ASSEMBLY 行 None
+        "row_type": "PART",              // 行标签：恒 "PART" / "ASSEMBLY"（与请求的 row_type 无关）
+        "has_children": false,           // PART 系行 false / ASSEMBLY 行按 child_count
+        "child_count": null,             // PART 系行 null / ASSEMBLY 行子件数
+        "delivered_quantity": 0          // 四态全部填充（PART 系=已交数量之和，ASSEMBLY=已送套数）
       }
     ],
     "total": 5,
@@ -457,8 +469,9 @@ curl -G "http://localhost:3000/api/v2/com/union-list" \
 - `UnionListRepo::list_union_all_with_filters` / `UnionListRepoTrait::list_union_all_with_filters`
   各加 10 扁平形参；仅 com::union_list 端点直接调用，零破坏。
 
-PART / ALL / ASSEMBLY 三模式全部生效（UNION ALL SQL `part_seg` / `asm_seg` 两段
-都追加同 `$13..$20` 守卫，外层 SQL 不消费这两个 placeholder 故不影响 `$9`/`$10`）。
+四态全部生效（UNION ALL SQL `part_seg` / `asm_seg` 两段都追加同 `$13..$20` 守卫，
+外层 SQL 不消费这两个 placeholder 故不影响 `$9`/`$10`；PART_FLAT 走 `part_seg`
+的同一份 `list_with_filters`）。
 
 测试覆盖：11 个新增 union-list 用例（4 文本 + 2 日期 + 4 IS NULL + 1 combined smoke）+ 1
 非法日期格式 + 2 老端点兼容回归（`/parts` + `/assemblies`）= 共 14 个新增测试。
@@ -482,11 +495,39 @@ curl -G "http://localhost:3000/api/v2/com/union-list" \
   --data-urlencode "system_delivery_date_is_null=false"
 ```
 
+## 前端配套改动清单（`row_type=PART_FLAT`）
+
+`PART_FLAT` 态是**前后端配对**的新增能力：后端加态本身对旧前端零破坏（不传
+`row_type` 仍是 `ALL`），但前端要真正用上它必须改三处契约。**发布顺序：后端先、
+前端后** —— 反序发布时前端会发出 `row_type=PART_FLAT`，旧后端的
+`RowType::parse` 走 `_ =>` 分支返 `40001 VALIDATION_ERROR`，dashboard 两个面板
+直接硬失败（非降级展示）。
+
+| # | 前端落点 | 改动 | 不改的后果 |
+|---|---|---|---|
+| 1 | `src/api/com/unionList.ts` 的 `UnionListRowType` | 联合类型加 `'PART_FLAT'` | TS 编译期就挡住 `row_type: 'PART_FLAT'`，改用 `as any` 绕过则类型失守 |
+| 2 | `src/views/dashboard/composables/useDashboardUpcomingList.ts` | `row_type` 硬编码 `'PART_FLAT'`（交期分桶抽屉的下钻列表），`sort_by` 随 `?basis=` 在 `PLANNED_DELIVERY_DATE` / `SYSTEM_DELIVERY_DATE` 间切换 | 抽屉走 `PART` 态 → 子件被 `assembly_id IS NULL` 守卫排除 → 「柱状图 9 条 / 抽屉 5 条」 |
+| 3 | `src/views/dashboard/composables/useDashboardUrgentList.ts` | `row_type` 硬编码 `'PART_FLAT'` + `sort_by: 'SYSTEM_DELIVERY_DATE'` + `sort_dir: 'ASC'`（「最紧急工单」面板） | 同上，面板少列装配件子件；且排序键失效时「最急」变成「最新建单」 |
+
+> 第 2、3 行同时是 `sort_by` 两层白名单对齐的**硬依赖**：`row_type=PART_FLAT`
+> 走 part 域的 `order_col`，上表两个排序键必须都在那层被认，否则面板静默按
+> `id` 建单序排（见上方「`sort_by` 有两层白名单」块）。
+
+配套的响应侧契约：`PART_FLAT` 行第一次让 `assembly_id` 有真实取值（子件 =
+父装配件 id、独立件 = `null`），前端 `partSchema` / `PartListItem` 需显式声明该
+字段 —— Zod 默认 strip 会**静默丢弃**，导致「子件归组到父装配件」拿不到锚点。
+
+> 与 `?basis=` 的交叉约束：抽屉的日期窗口参数随口径在
+> `system_delivery_date_from/to` 与 `planned_delivery_date_from/to` 之间切换，
+> 两口径的交期列不同（见 [`./dashboard.md`](./dashboard.md) 的「两口径的缺失语义」
+> 与「`count` == 下钻 `total` 的三个前置条件」）。前端切口径时必须同时切窗口
+> 参数，否则下钻落在不同日期集合上。
+
 ## 引用
 
 - 前端对应：`src/api/com/unionList.ts`（前端子模块另开 PR 接入；本端点路由
-  自身即可工作）
-- 集成测试：`tests/com/union_list.rs`（33 用例覆盖 PART / ASSEMBLY / ALL /
+  自身即可工作）。四态下的前端消费点见上方「前端配套改动清单」
+- 集成测试：`tests/com/union_list.rs`（36 用例覆盖 PART / PART_FLAT / ASSEMBLY / ALL /
   SERIAL_NO 降级 / 非法 row_type / 缺省默认值 / deep offset 分页 / 日期窗口过滤
   / **10 字段筛选（4 文本 ILIKE + 4 日期 + 2 IS NULL）+ combined smoke + 非法
   日期格式**；2026-10-03 新增 12 个 `delivered_quantity_*` 用例覆盖 PART 行

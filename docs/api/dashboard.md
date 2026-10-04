@@ -144,17 +144,32 @@ HTTP request
 | `data.on_production_shelves[].items[].next_process_name` | string \| null | 否 | 下一道工序名 |
 | `data.on_production_shelves[].items[].worker_name` | string \| null | 否 | 当前持有工人姓名 |
 | `data.upcoming_delivery[].date` | string | 是 | 日期 `YYYY-MM-DD`。**口径由 `?basis=` 决定**（2026-10-04 新增）：`planned` = 计划交期日、`system` = 系统交期日；桶本身（日期序列 + 补零规则）两口径一致 |
-| `data.upcoming_delivery[].count` | integer | 是 | 当天预计交付件数（i64，JSON wire 保留 number；非 snowflake ID 故不走字符串化）。**口径 = `t_part` 行数**：**含**装配件子件（`assembly_id IS NOT NULL`，每个子件各计 1），**不含**装配件父行（`t_assembly` 在本端点全模块零引用，`t_part.assembly_id` 只是个指向 `t_assembly.id` 的逻辑外键）。与 `GET /api/v2/com/union-list?row_type=PART_FLAT` 的下钻列表口径一致，本字段的条目数应等于该态同一时间窗下的 `total` |
+| `data.upcoming_delivery[].count` | integer | 是 | 当天预计交付件数（i64，JSON wire 保留 number；非 snowflake ID 故不走字符串化）。**口径 = `t_part` 行数**：**含**装配件子件（`assembly_id IS NOT NULL`，每个子件各计 1），**不含**装配件父行（`t_assembly` 在本端点全模块零引用，`t_part.assembly_id` 只是个指向 `t_assembly.id` 的逻辑外键）。下钻列表须用 `GET /api/v2/com/union-list?row_type=PART_FLAT`（同一 `t_part` 口径）；**该态下本字段的 `count` 等于下钻 `total` 需同时满足三个前置条件**（见下方 ⚠️ 块） |
 | `data.upcoming_delivery[].by_status` | object<string, integer> | 是 | 当天按 `OrderStatus` 细分的件数（2026-09-30 新增；供 dashboard 分层堆叠柱状图用），口径与同桶 `count` 完全一致（含子件、不含装配件父行）。**COMPLETED / CANCELLED 已 WHERE 排除，by_status 不会含这两个 key**；空对象 `{}` 表示当日 0 件。key 字母序排列（BTreeMap 序列化保证），但前端按 key 直接查，不依赖顺序。 |
 
 > `data.upcoming_delivery[].by_status` 与 `data.upcoming_delivery[].count` 的关系：
 > `count = by_status 所有 value 之和`（service 端求和，VO 与 SQL 二次一致性由 SQL 单次聚合保证）。
 
-> ⚠️ **`count` 的统计单元（2026-10-05 写明）**：本字段统计的是 `t_part` 行，
-> **含装配件子件**、**不含装配件父行**。前端由本字段触发的下钻列表必须用
-> `GET /api/v2/com/union-list?row_type=PART_FLAT`（同一 `t_part` 口径），
+> ⚠️ **`count` 的统计单元与下钻口径对齐（2026-10-05 写明）**：本字段统计的是
+> `t_part` 行，**含装配件子件**、**不含装配件父行**。前端由本字段触发的下钻列表
+> 必须用 `GET /api/v2/com/union-list?row_type=PART_FLAT`（同一 `t_part` 口径），
 > 不得用 `row_type=PART`（子件被 `assembly_id IS NULL` 守卫排除，会出现
 > 「柱状图 9 条 / 抽屉 5 条」的不一致）或 `row_type=ALL`（会多出装配件父行）。
+>
+> **`count` == 下钻 `total` 的三个前置条件（缺一则必然不等）**：
+> 1. **交期口径对齐**：`?basis=system` 时下钻用
+>    `system_delivery_date_from` / `system_delivery_date_to`；`?basis=planned`
+>    （**缺省值**）时桶日取自 `planned_delivery_date`，下钻必须改用
+>    `planned_delivery_date_from` / `_to`。用错列则两条统计落在不同日期集合上。
+> 2. **状态口径对齐**：dashboard 的 count SQL 恒带
+>    `status NOT IN ('COMPLETED','CANCELLED')`。PART_FLAT 不传 `statuses` 时
+>    这两个状态**会被计入**下钻 `total` ⇒ `total` 必然 > `count`。下钻须显式传
+>    `statuses=` 排除它们。
+> 3. **时间窗精确等于桶日**：下钻的 `_from` / `_to` 须都取该桶的 `date`
+>    （闭区间同日），不得用「整个窗口」或「跨多个桶」的范围。
+>
+> 三条都满足时，该桶 `count` 才等于下钻 `total`。任一条不满足时，前端不得把
+> 两者做等值校验或据此提示「数据不一致」。
 
 > ⚠️ **两口径的缺失语义（2026-10-04 新增）**
 > - `?basis=system` 下 `system_delivery_date IS NULL` 的工单**整件不计入**：WHERE 的两处

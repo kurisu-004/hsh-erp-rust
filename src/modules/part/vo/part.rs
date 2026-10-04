@@ -303,7 +303,7 @@ pub struct PartListItem {
     ///   `LEAST(MIN(子件已送件数 × 装配件套数 / 子件总量), 装配件套数)`，
     ///   PG 整数除法截断；子件总量为 0 者不参与，无子件为 0；`LEAST` 收口到
     ///   工单总套数（子件超交时不会算出超过总套数的值）。
-    /// - 仅 `GET /api/v2/com/union-list`（三种 `row_type` 模式）与
+    /// - 仅 `GET /api/v2/com/union-list`（四种 `row_type` 模式）与
     ///   `GET /api/v2/parts` 填；其余复用本 VO 的 **5 处返回点**恒 `null`
     ///   （4 个列表端点 + `POST /assemblies/{id}/children` 返回的单对象
     ///   `R<PartListItem>`，走 `From<TPart>` 从不覆写）。

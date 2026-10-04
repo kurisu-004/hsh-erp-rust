@@ -19,6 +19,11 @@
 //!    `PART` 仍返 5（子件守卫未失效）、`ALL` 仍返 6（未被波及）；并断言该态的
 //!    过滤 / 排序参数与 PART 态同形（`statuses` + `system_delivery_date_from/to`
 //!    + `sort_by=SYSTEM_DELIVERY_DATE` 三参数组合，子件同样参与过滤与排序）。
+//! 9. 2026-10-05 新增守卫：`sort_by=SYSTEM_DELIVERY_DATE` 在 **PART 态**也真正
+//!    生效（该键的 repo 列名映射是 PART / PART_FLAT 共用的 `part_sql.rs::order_col`，
+//!    少一处就静默退回建单序）。与第 8 条一样，两个用例的 fixture 都让「插入序」
+//!    与「交期序」**相反**（先插的拿更晚的交期），因此排序键被摘掉时断言必红；
+//!    若 fixture 排成同向，排序键换成任何值都同样通过，断言恒真。
 //!
 //! ## 并行
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -709,12 +714,18 @@ async fn union_list_row_type_part_flat_counts_child_parts_as_rows() {
 /// - `system_delivery_date_from` / `_to` 闭区间（子件也参与交期窗口过滤）
 /// - `sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC`（子件也参与排序）
 ///
-/// 排布（today 为基准）：
-/// - 子件 A：status=IN_PROCESS、sd=today+2d（命中窗口，排最前）
-/// - 独立件 B：status=PENDING、sd=today+3d（命中窗口，排其后）
+/// 排布（today 为基准）—— **插入序与交期序故意反相关**：
+/// - 子件 A：第 1 个插入、status=IN_PROCESS、sd=today+3d（命中窗口）
+/// - 独立件 B：第 3 个插入、status=PENDING、sd=today+2d（命中窗口）
 /// - 独立件 C：status=DELIVERED、sd=today+3d（状态不命中 → 被 statuses 排除）
 /// - 子件 D：status=PENDING、sd=today+9d（窗口不命中 → 被日期排除）
-/// 期望命中 2 条，且 ASC 顺序为 A → B。
+///
+/// 反相关是本用例排序断言的鉴别力来源：命中集恒为 {A, B} 两条，而
+/// - 按 `system_delivery_date ASC` → B（+2d）在前、A（+3d）在后；
+/// - 若排序键被静默降级成 `id ASC`（雪花建单序）→ A（先插）在前、B 在后。
+///
+/// 两者结论相反，故本断言在 `order_col` 漏掉 `SYSTEM_DELIVERY_DATE` 时必红；
+/// 若 fixture 把日期排成与插入序同向，排序键换成任何值都同样通过，断言恒真。
 #[tokio::test]
 async fn union_list_row_type_part_flat_supports_part_filters() {
     use chrono::Duration;
@@ -737,7 +748,7 @@ async fn union_list_row_type_part_flat_supports_part_filters() {
         None,
         today,
         today,
-        Some(today + Duration::days(3)),
+        Some(today + Duration::days(2)),
     )
     .await;
     let solo_c = insert_part_full(
@@ -753,8 +764,9 @@ async fn union_list_row_type_part_flat_supports_part_filters() {
     )
     .await;
     // 子件补系统交期（helper 无组合参数，用 UPDATE 补齐，见上方注释）
+    // 2026-10-05：子件 A 拿**更晚**的 +3d，与它「第 1 个插入」的建单序相反。
     sqlx::query("UPDATE t_part SET system_delivery_date = $1 WHERE id = $2")
-        .bind(today + Duration::days(2))
+        .bind(today + Duration::days(3))
         .bind(child_a)
         .execute(&pool)
         .await
@@ -803,12 +815,91 @@ async fn union_list_row_type_part_flat_supports_part_filters() {
         .collect();
     assert_eq!(
         ids,
-        vec![child_a, solo_b],
-        "ASC 排序：系统交期 today+2d 的子件 A 应在 today+3d 的 B 之前; ids={ids:?}"
+        vec![solo_b, child_a],
+        "ASC 排序：系统交期 today+2d 的独立件 B 应在 today+3d 的子件 A 之前（\
+         若得到 [child_a, solo_b] 说明排序键退化成 id 建单序）; ids={ids:?}"
     );
     // 命中的子件行 assembly_id 仍是真实父 id（未被过滤参数抹掉）
     assert_eq!(find_row(&env, child_a)["assembly_id"], asm.to_string());
     assert!(find_row(&env, solo_b)["assembly_id"].is_null());
+}
+
+/// 2026-10-05 新增守卫：`row_type=PART` 下 `sort_by=SYSTEM_DELIVERY_DATE` 真正生效。
+///
+/// PART 与 PART_FLAT 共用同一份 `PartRepo::list_with_filters`，排序键解析也在
+/// 同一处 `order_col` match 白名单里。本用例专门钉住 PART 态：防止后续有人认为
+/// 「PART 态不需要系统交期排序」而把该键从白名单删掉 / 收窄回 PART_FLAT 专用
+/// 分支，导致 PART 态静默退回建单序。
+///
+/// fixture 反相关：先插入的 p_first 拿**更晚**的交期，后插入的 p_second 拿更早的。
+/// - `sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC` → p_second 在前；
+/// - 排序键失效（降级 `id`）→ p_first 在前。两者结论相反，故断言有鉴别力。
+#[tokio::test]
+async fn union_list_row_type_part_sorts_by_system_delivery_date() {
+    use chrono::Duration;
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let today = chrono::Local::now().date_naive();
+
+    let p_first = insert_part_full(
+        &pool,
+        "P-PARTSORT-LATE",
+        "D-PARTSORT-LATE",
+        fx.customer_l2_id,
+        Some("PSRTLATE"),
+        None,
+        today,
+        today,
+        Some(today + Duration::days(5)),
+    )
+    .await;
+    let p_second = insert_part_full(
+        &pool,
+        "P-PARTSORT-EARLY",
+        "D-PARTSORT-EARLY",
+        fx.customer_l2_id,
+        Some("PSRTNEARLY"),
+        None,
+        today,
+        today,
+        Some(today + Duration::days(1)),
+    )
+    .await;
+    assert!(
+        p_first < p_second,
+        "fixture 前提：p_first 必须是先插入的（雪花 id 更小），否则本用例无鉴别力"
+    );
+
+    let (s, env) = send(
+        app,
+        hsh_erp_test_support::json_request(
+            "GET",
+            &format!(
+                "/com/union-list?customer_id={}&row_type=PART\
+                 &sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC&limit=200",
+                fx.customer_l2_id
+            ),
+            None::<Value>,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "PART 态系统交期排序: {env}");
+    assert_eq!(env["code"], 0);
+    let items = env["data"]["items"].as_array().unwrap();
+    let ids: Vec<i64> = items
+        .iter()
+        .map(|i| i["id"].as_str().unwrap().parse().unwrap())
+        .collect();
+    let pos_first = ids.iter().position(|&x| x == p_first).expect("p_first 在");
+    let pos_second = ids
+        .iter()
+        .position(|&x| x == p_second)
+        .expect("p_second 在");
+    assert!(
+        pos_second < pos_first,
+        "ASC 应按 system_delivery_date 排（+1d 在 +5d 之前），\
+         拿到相反顺序说明该键在 PART 态被降级成 id: ids={ids:?}"
+    );
 }
 
 /// `row_type=ALL` deep offset 分页回归 —— pushdown 修分页 bug（plan §3）。
