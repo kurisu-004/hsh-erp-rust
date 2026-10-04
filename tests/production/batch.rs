@@ -14,6 +14,10 @@
 //!  11. GET pending：unauth → 40100
 //!  12. 回归（2026-09-30 review 第 3 轮 L5）：**无工序链工单** dispatch 后出现在
 //!      `GET /prod/pool/{process_id}` + `/prod/pool/counts`（用户报告的原始 bug）
+//!  13. 2026-10-04 `current_holder_id` 写脏守卫：dispatch 的目标货架已软删 / 已停用 /
+//!      是品检区 → 20508 拒收且批次保持 PENDING + holder 仍 NULL
+//!  14. 2026-10-04「跳过」语义：sort_order 最小的候选不可用时继续往后找可用货架，
+//!      而不是把整个下发打成失败
 //!
 //! 2026-09-30 重构：
 //! - dispatch 统一 bulk-only（targets 数组）；响应 `DispatchResult { succeeded, failed }`
@@ -139,6 +143,38 @@ async fn insert_part_batch(pool: &PgPool, part_id: i64) -> i64 {
 
 /// 直插一个 `t_shelf` + `t_shelf_process` 映射（绕开 shelf CRUD）。
 async fn insert_shelf_process_mapping(pool: &PgPool, process_id: i64) -> i64 {
+    insert_shelf_process_mapping_state(
+        pool,
+        "BATCH-TEST-SHELF",
+        process_id,
+        "PRODUCTION",
+        true,
+        false,
+        0,
+    )
+    .await
+}
+
+/// 2026-10-04 新增：可指定货架状态的「工序 → 货架」映射构造。
+///
+/// 供 `current_holder_id` 写脏守卫的回归用例用：dispatch 解析货架走
+/// `ShelfProcessRepo::find_first_shelf_for_process`，该方法自 2026-10-04 起
+/// `JOIN t_shelf` 并带 `deleted_at IS NULL` + `is_active` + `zone='PRODUCTION'`
+/// 三个谓词，故测试必须能造出「映射行 active 但货架不可用」的三种形态。
+///
+/// 沿既有 helper 的做法：直插静态行（`sqlx::query` 运行时宏，不动 `.sqlx`）。
+/// `code` 参与形参是因为 `t_shelf.code` 有唯一约束（20502 BIZ_SHELF_DUPLICATE_CODE）
+/// —— 同一个用例内要造多个货架时必须各自不同。
+#[allow(clippy::too_many_arguments)]
+async fn insert_shelf_process_mapping_state(
+    pool: &PgPool,
+    code: &str,
+    process_id: i64,
+    zone: &str,
+    is_active: bool,
+    deleted: bool,
+    sort_order: i32,
+) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let shelf_id = snowflake.next_id();
@@ -146,21 +182,26 @@ async fn insert_shelf_process_mapping(pool: &PgPool, process_id: i64) -> i64 {
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
-         created_at, updated_at) VALUES ($1, 'BATCH-TEST-SHELF', 'BATCH-TEST-SHELF', \
-         'PRODUCTION', true, 0, 0, $2, $2)",
+         created_at, updated_at, deleted_at) VALUES ($1, $2, $2, $3, $4, 0, 0, $5, $5, \
+         CASE WHEN $6 THEN $5::timestamp ELSE NULL END)",
     )
     .bind(shelf_id)
+    .bind(code)
+    .bind(zone)
+    .bind(is_active)
     .bind(now)
+    .bind(deleted)
     .execute(pool)
     .await
     .expect("insert t_shelf");
     sqlx::query(
         "INSERT INTO t_shelf_process (id, shelf_id, process_id, sort_order, version, \
-         created_at, updated_at) VALUES ($1, $2, $3, 0, 0, $4, $4)",
+         created_at, updated_at) VALUES ($1, $2, $3, $4, 0, $5, $5)",
     )
     .bind(mapping_id)
     .bind(shelf_id)
     .bind(process_id)
+    .bind(sort_order)
     .bind(now)
     .execute(pool)
     .await
@@ -919,4 +960,171 @@ async fn dispatch_part_without_process_chain_appears_in_pool() {
         count >= 1,
         "process {process_a} 的候选批次数应 ≥ 1，实际 {count}: {counts_env}"
     );
+}
+
+// ===========================================================================
+//  2026-10-04 `current_holder_id` 写脏守卫：dispatch 解析货架
+// ===========================================================================
+//
+// 背景：`ShelfProcessRepo::find_first_shelf_for_process` 自 2026-10-04 起
+// `JOIN t_shelf` 并带 `deleted_at IS NULL` + `is_active=true` + `zone='PRODUCTION'`。
+// 收紧前它只看 `t_shelf_process` 行是否软删，于是「映射行 active、货架已停用 /
+// 已软删 / 是品检架」这三种形态都会被下发并写进 `t_part_batch.current_holder_id`。
+// 后果不是报错而是**静默漏件**：报工台取件页数据源
+// （`part::service::phase1::work_type` 的 pickable-by-work-type）硬限定
+// `JOIN t_shelf sh ON sh.id = b.current_holder_id AND sh.is_active = true
+//   AND sh.zone = 'PRODUCTION'`，故这类批次永远不出现在工人的可领列表里。
+//
+// 断言三件事：① 20508 拒收；② `t_part_batch` 未被写脏（仍 PENDING + holder NULL）；
+// ③ 候选里混着不可用货架时是「跳过」而不是「整笔失败」。
+
+/// 三种「映射 active 但货架不可用」形态：已软删 / 已停用 / 品检区。
+///
+/// 逐个独立跑（同一个用例内跑三遍，走三个 fresh batch）——三者是**不同谓词**
+/// （`deleted_at` / `is_active` / `zone`）各自的回归，合并成一个断言会让失败时看不出
+/// 是哪条谓词漏了。
+#[tokio::test]
+async fn dispatch_rejects_unusable_shelf_in_all_three_shapes() {
+    // (用例名, zone, is_active, deleted, 期望文案关键词)
+    let cases: [(&str, &str, bool, bool, &str); 3] = [
+        ("soft-deleted", "PRODUCTION", true, true, "已软删"),
+        ("inactive", "PRODUCTION", false, false, "已停用"),
+        (
+            "inspection-zone",
+            "INSPECTION",
+            true,
+            false,
+            "非 PRODUCTION 区",
+        ),
+    ];
+
+    for (name, zone, is_active, deleted, kw) in cases {
+        let (pool, app, token, fx) = bootstrap_as_manager().await;
+        let process_a = fx.process_a_id;
+        // 造 1 条映射，货架按用例指定的状态
+        let bad_shelf = insert_shelf_process_mapping_state(
+            &pool,
+            &format!("SH-BAD-{name}"),
+            process_a,
+            zone,
+            is_active,
+            deleted,
+            0,
+        )
+        .await;
+
+        let customer_id = insert_customer_l2(&pool, "BATCH-GUARD").await;
+        let part_id = insert_part(&pool, customer_id).await;
+        let batch_id = insert_part_batch(&pool, part_id).await;
+
+        let (s, env) = send(
+            app.clone(),
+            json_request(
+                "POST",
+                "/prod/batches/dispatch",
+                Some(json!({ "targets": [
+                    { "batch_id": batch_id.to_string(), "target_process_id": process_a.to_string() }
+                ] })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "{name}: 不可用货架应 404: {env}");
+        assert_eq!(
+            env["code"].as_i64().unwrap(),
+            20508,
+            "{name}: 应复用 20508 BIZ_SHELF_PROCESS_NOT_FOUND（不新造码）: {env}"
+        );
+        let msg = env["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains(kw),
+            "{name}: 错误文案要指出「{kw}」，否则运营会去查错方向: {env}"
+        );
+
+        // 批次未被写脏：仍 PENDING + holder 仍 NULL + version 未动
+        let (status, location, holder, version): (
+            String,
+            Option<String>,
+            Option<i64>,
+            i32,
+        ) = sqlx::query_as(
+            "SELECT status, location, current_holder_id, version FROM t_part_batch WHERE id = $1",
+        )
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read batch after rejected dispatch");
+        assert_eq!(status, "PENDING", "{name}: 拒收后 batch 应仍 PENDING");
+        assert_eq!(location, None, "{name}: 拒收后 location 应仍 NULL");
+        assert_eq!(
+            holder, None,
+            "{name}: current_holder_id 必须仍 NULL（未被写脏）"
+        );
+        assert_eq!(version, 0, "{name}: 拒收后 version 不应被自增");
+        let _ = bad_shelf;
+    }
+}
+
+/// 「跳过」语义：sort_order 最小的候选货架不可用时，应继续往后找到可用的那个，
+/// 而不是把整个下发打成失败。
+///
+/// 这条锁的是 `find_first_shelf_for_process` 把守卫写在 **SQL 的 WHERE** 上（而不是
+/// 在 service 层取首条再报错）的取舍 —— 后者在「第一个候选恰好被停用」这种极常见的
+/// 运维场景下会把本可自动恢复的下发升级成阻塞。
+#[tokio::test]
+async fn dispatch_skips_unusable_shelf_and_uses_next_candidate() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let process_a = fx.process_a_id;
+
+    // sort_order=0 的品检架（守卫要跳过）+ sort_order=1 的正常生产架
+    let _bad = insert_shelf_process_mapping_state(
+        &pool,
+        "SH-SKIP-BAD",
+        process_a,
+        "INSPECTION",
+        true,
+        false,
+        0,
+    )
+    .await;
+    let good = insert_shelf_process_mapping_state(
+        &pool,
+        "SH-SKIP-GOOD",
+        process_a,
+        "PRODUCTION",
+        true,
+        false,
+        1,
+    )
+    .await;
+
+    let customer_id = insert_customer_l2(&pool, "BATCH-SKIP").await;
+    let part_id = insert_part(&pool, customer_id).await;
+    let batch_id = insert_part_batch(&pool, part_id).await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            "/prod/batches/dispatch",
+            Some(json!({ "targets": [
+                { "batch_id": batch_id.to_string(), "target_process_id": process_a.to_string() }
+            ] })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "有可用候选时应下发成功: {env}");
+    assert_eq!(
+        env["data"]["succeeded"][0]["shelf_id"].as_str().unwrap(),
+        good.to_string(),
+        "应跳过品检架、选中下一个 PRODUCTION 候选: {env}"
+    );
+    let holder: Option<i64> =
+        sqlx::query_scalar("SELECT current_holder_id FROM t_part_batch WHERE id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read holder");
+    assert_eq!(holder, Some(good), "holder 必须是那个可用的生产架");
 }

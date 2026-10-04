@@ -446,8 +446,35 @@ Response 200 `data`：[`DispatchResult`](#dispatchresult-字段2026-09-30-重构
 - 40001 VALIDATION_ERROR —— `targets` 为空
 - 20120 BIZ_BATCH_INVALID_STATUS —— 批次当前 status 非 PENDING
 - 20121 BIZ_BATCH_NOT_FOUND —— batch_id 不存在 / 已软删
-- 20508 BIZ_SHELF_PROCESS_NOT_FOUND —— `target_process_id` 在 `t_shelf_process` 无任何 active 货架映射
+- 20508 BIZ_SHELF_PROCESS_NOT_FOUND —— `target_process_id` 查不到**可用**货架映射
+  （2026-10-04 起含「有映射但货架已软删 / 已停用 / `zone≠'PRODUCTION'`」，详见下节）
 - 40901 VERSION_CONFLICT —— 并发事务已成功提交过本批次（OCC）
+
+### 目标货架守卫（2026-10-04 新增）
+
+第 3 步解析出的货架会被写进 `t_part_batch.current_holder_id`（配 `location='PRODUCTION_SHELF'`
++ `status='IN_PROCESS'`）。`ShelfProcessRepo::find_first_shelf_for_process` 自 2026-10-04
+起在 **SQL 层** `JOIN t_shelf` 并带三个谓词：`s.deleted_at IS NULL` / `s.is_active = true`
+/ `s.zone = 'PRODUCTION'`。收紧前它只看 `t_shelf_process` 行是否软删，于是已停用 / 已软删 /
+品检区货架会被下发并写脏 holder。
+
+**为什么 `zone` 限死 `'PRODUCTION'`**：dispatch 只接 `status='PENDING'` 的批次，写死
+`location='PRODUCTION_SHELF'`；品检流转（`scan_inspect` / `outsource::receive_*`）走的是
+显式 `target_inspection_shelf_id` + `validate_shelf_zone(.., "INSPECTION")`，**不经过本方法**。
+
+**为什么是「跳过」而不是「命中即报错」**：谓词在 WHERE 上 ⇒ sort_order 最小的不可用
+货架被静默跳过，继续往后找（`sort_order=0` 是品检架、`sort_order=1` 是可用生产架时下发
+仍成功）。反过来在 service 层取首条再报错，会把「第一个候选恰好被停用」这种最常见的
+运维事故升级成下发阻塞。全部候选都不可用时才返回 `None` → 20508（不新造错误码），
+错误文案会点名三种成因，避免运营误判成「只是漏配映射」。
+
+**为什么重要（不只是安全问题）**：脏 holder 的后果是**静默漏件**。报工台取件页数据源
+（`GET /api/v2/parts/pickable-by-work-type/{work_type_id}`）取行 SQL 硬限定
+`JOIN t_shelf sh ON sh.id = b.current_holder_id AND sh.is_active = true
+AND sh.zone = 'PRODUCTION'`，故这类批次永远不出现在工人的可领列表里，也不报错。
+存量排查 SQL 见 [`./shelf-process-mapping.md`](./shelf-process-mapping.md) 的
+「只读诊断 SQL」一节（只读，不自动修数据）。
+
 - 40300 FORBIDDEN —— 非 Manager/Clerk
 
 WS 广播（commit 后下发；仅 succeeded 时广播）：
@@ -610,6 +637,11 @@ Response 200 `data`：[`AutoDispatchResult`](#autodispatchresult-字段2026-09-3
     并发冲突 40901 / t_shelf_process 多结果取 LIMIT 1 / Inspector 角色 40300 /
     bulk_dispatch 全回滚 + 空 targets 422 / auto_dispatch 无 chain / 无 step /
     全部无 chain / 有 chain 成功首道 step.id
+- ✅ 2026-10-04（`current_holder_id` 写脏守卫）：`find_first_shelf_for_process` 改为
+  `JOIN t_shelf` 并带 `deleted_at IS NULL` / `is_active=true` / `zone='PRODUCTION'`。
+  新增错误码 0 个 —— 全部候选不可用时仍返既有的 20508。回归见
+  `tests/production/batch.rs::dispatch_rejects_unusable_shelf_in_all_three_shapes` /
+  `::dispatch_skips_unusable_shelf_and_uses_next_candidate`
 
 ## 参考
 

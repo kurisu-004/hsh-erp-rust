@@ -11,6 +11,10 @@
 //!    → 20505 `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND`（HTTP 404）
 //! 4. `old_shelf_process_paths_are_gone` —— 硬切验证：3 个旧路径按 URI 钉死状态码
 //!    （`GET /shelves/processes` → 400；`GET|POST /shelves/{id}/processes` → 404）
+//! 5. `set_shelf_processes_rejects_inspection_zone_shelf` —— 2026-10-04 zone 守卫：
+//!    品检区货架配工序 → 20104 `BIZ_INVALID_VALUE`，且一条 mapping 都不写
+//! 6. `set_shelf_processes_rejects_inactive_shelf` —— 2026-10-04：`is_active=false`
+//!    但未软删的货架 → 20512 `BIZ_SHELF_INACTIVE`（该形态经 API 造不出，故直插）
 //!
 //! ## fixture 选择（2026-10-02 判定）
 //! 用 **production fixture**（`load_production_fixture`）而非 shelf fixture：
@@ -324,4 +328,126 @@ async fn old_shelf_process_paths_are_gone() {
             "old path {method} {uri} must be gone (no alias) and return {expected}; got: {status}"
         );
     }
+}
+
+// ===========================================================================
+//  2026-10-04 zone 守卫：只有 PRODUCTION 区货架能配工序映射
+// ===========================================================================
+//
+// `set_shelf_processes` 收紧前只校验「货架存在」，不校验 zone，于是品检区货架可以被
+// 配成某工序的落料架，再被 `ShelfProcessRepo::find_first_shelf_for_process`（同批
+// 收紧）选中写进 `t_part_batch.current_holder_id`；而报工台取件页的取件 SQL 硬限定
+// `sh.zone = 'PRODUCTION'`，这种批次就永远不会被工人领到、且不报错。
+// 收紧后改走 `validate_shelf_zone(.., "PRODUCTION")`（与 6 个生产流端点同源同码）。
+
+/// 品检区（`zone='INSPECTION'`）货架配工序 → 20104 `BIZ_INVALID_VALUE`（HTTP 400），
+/// 且**一条 mapping 都不写**（守卫在软删旧映射之前 ⇒ 存量映射不受影响）。
+#[tokio::test]
+async fn set_shelf_processes_rejects_inspection_zone_shelf() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    // part fixture 预置的品检架（FX-SH-INSP，zone='INSPECTION'，is_active=true）
+    let shelf_id = PartFixture::INSPECTION_SHELF_ID;
+    let p1 = insert_test_process(&pool, "P-MAP-INSP", "Map-Process-Inspection").await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/shelf-processes/{shelf_id}"),
+            Some(json!({
+                "items": [
+                    { "process_id": p1.to_string(), "sort_order": 0 },
+                ],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "品检架配工序应 400（20104 兜底段）: {env}"
+    );
+    assert_eq!(
+        env["code"].as_i64().unwrap(),
+        20104,
+        "expected BIZ_INVALID_VALUE（zone≠PRODUCTION）; got: {env}"
+    );
+    let msg = env["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("INSPECTION") && msg.contains("PRODUCTION"),
+        "错误文案要带上实际 zone 与期望 zone，运营才知道该改货架还是改映射: {env}"
+    );
+
+    // 不写任何 mapping
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_shelf_process WHERE shelf_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(shelf_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count active mappings");
+    assert_eq!(n, 0, "拒收的 set 不得留下 mapping 行; got {n}");
+}
+
+/// `is_active=false` 但未软删的货架配工序 → 20512 `BIZ_SHELF_INACTIVE`（HTTP 400）。
+///
+/// 该形态**经 API 造不出来**（shelf service 的 `deactivate` 等价 soft-delete，同时写
+/// `deleted_at`，会先命中 20501），所以本用例直插。这样才有覆盖到 20512 这条防御位
+/// —— 它防的是「直接改库 / 历史数据造成 `is_active=false` 但未软删」。
+#[tokio::test]
+async fn set_shelf_processes_rejects_inactive_shelf() {
+    let (pool, app, token, _fx) = bootstrap_as_manager().await;
+
+    use hsh_erp_rust::infra::clock::now_naive;
+    let snowflake = hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_001, 3);
+    let shelf_id = snowflake.next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
+         created_at, updated_at) VALUES ($1, 'FX-SH-INACT', 'FX 停用架', 'PRODUCTION', \
+         false, 0, 0, $2, $2)",
+    )
+    .bind(shelf_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("insert inactive t_shelf");
+
+    let p1 = insert_test_process(&pool, "P-MAP-INACT", "Map-Process-Inactive").await;
+
+    let (s, env) = send(
+        app.clone(),
+        json_request(
+            "POST",
+            &format!("/prod/shelf-processes/{shelf_id}"),
+            Some(json!({
+                "items": [
+                    { "process_id": p1.to_string(), "sort_order": 0 },
+                ],
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "停用架配工序应 400（20512 兜底段）: {env}"
+    );
+    assert_eq!(
+        env["code"].as_i64().unwrap(),
+        20512,
+        "expected BIZ_SHELF_INACTIVE; got: {env}"
+    );
+
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM t_shelf_process WHERE shelf_id = $1 AND deleted_at IS NULL",
+    )
+    .bind(shelf_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count active mappings");
+    assert_eq!(n, 0, "拒收的 set 不得留下 mapping 行; got {n}");
 }

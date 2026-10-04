@@ -51,9 +51,16 @@ prod 批次下发解析货架、worker-pool 移动校验三处的共同依据。
 - **逻辑引用**：`shelf_id` / `process_id` 为 bigint 逻辑引用，DB 层无 FK 约束
 - **软删**：mapping 行有 `deleted_at`；整组替换时先 `UPDATE … SET deleted_at = now()`，
   再 `bulk_insert` 新行（历史行保留，便于追溯）
-- **读守卫**：所有读查询一律带 `deleted_at IS NULL`；全集查询额外要求 `s.is_active = true`
+- **读守卫**：所有读查询一律带 `deleted_at IS NULL`；全集查询额外要求 `s.is_active = true`；
+  **`find_first_shelf_for_process`（2026-10-04）额外要求 `s.is_active = true` 且
+  `s.zone = 'PRODUCTION'`** —— 它是唯一会把货架 id 写进 `t_part_batch.current_holder_id`
+  的读侧，谓词不全即静默漏件（见下方「只读诊断 SQL」）
+- **写守卫**：`POST` 侧自 2026-10-04 起要求目标货架 `zone='PRODUCTION'`（见下方
+  「zone 守卫」小节）
 - **依赖方向（2026-10-02 翻转）**：本域只**读** `shelf::repo::ShelfRepo::get_by_id`
-  校验货架存在 / scope（prod → shelf）；反向的 shelf → prod 依赖已随端点搬移清零
+  校验货架存在 / scope（prod → shelf）；反向的 shelf → prod 依赖已随端点搬移清零。
+  2026-10-04 起额外调用**同域** `prod::batch::service::guard::validate_shelf_zone`
+  （判序与错误码的唯一真源）
 
 业务约束（service 层 enforce）：
 
@@ -61,7 +68,7 @@ prod 批次下发解析货架、worker-pool 移动校验三处的共同依据。
 |---|---|
 | `GET /` | 任意已登录；SHELF_ACCOUNT 按 `user.shelf_ids` 收窄；按 `shelf_id ASC, sort_order ASC` |
 | `GET /{shelf_id}` | 货架不存在 → 20501；SHELF_ACCOUNT 越界 → 40301；按 `sort_order ASC, id ASC` |
-| `POST /{shelf_id}` | 货架不存在 → 20501；items 里有 process_id 不存在或已软删 → 20505；整组替换语义，`items: []` = 清空 |
+| `POST /{shelf_id}` | 货架不存在 → 20501；货架 `is_active=false` → 20512；**货架 `zone≠'PRODUCTION'` → 20104**（2026-10-04 新增）；items 里有 process_id 不存在或已软删 → 20505；整组替换语义，`items: []` = 清空 |
 
 ---
 
@@ -133,7 +140,7 @@ Request：`SetShelfProcessesRequest`
 
 语义：整组替换 —— 事务内：
 
-1. 校验 shelf 存在（20501）
+1. 校验 shelf 存在（20501）、`is_active=true`（20512）、`zone='PRODUCTION'`（20104）
 2. 校验 items 里所有 process_id 存在且未软删（20505）
 3. 软删该 shelf 的全部 active mapping（清 `deleted_at`）
 4. `bulk_insert` 新 mapping（带 sort_order）
@@ -145,8 +152,87 @@ Response 200 `data`：`null`
 错误码：
 
 - 20501 `BIZ_SHELF_NOT_FOUND` —— shelf 不存在 / 已软删
+- 20512 `BIZ_SHELF_INACTIVE` —— shelf `is_active=false`（2026-10-04 新增）
+- 20104 `BIZ_INVALID_VALUE` —— shelf `zone≠'PRODUCTION'`（2026-10-04 新增）/ process_id 非整数
 - 20505 `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND` —— items 里有 process_id 不存在
-- 20104 `BIZ_INVALID_VALUE` —— process_id 非整数
+
+### zone 守卫（2026-10-04 新增，写侧收紧）
+
+`POST` 现在只接受 **PRODUCTION 区**货架。第 1~4 步的判序由
+`prod::batch::service::guard::validate_shelf_zone` 统一承担（`ShelfRepo::get_by_id` 带
+`deleted_at IS NULL`），与 `place_on_shelf` / `pickup` / `release_from_programming` /
+外协收发等生产流端点**同源同码**（20501 → 20512 → 20104），不另造判定。
+
+**为什么要收紧**：`t_shelf_process` 的三条读侧全是生产流（下发解析货架 / worker 归还 /
+候选池放回），而它们解析出的货架会被写进 `t_part_batch.current_holder_id`。品检流走的是
+显式 `target_inspection_shelf_id` + `validate_shelf_zone(.., "INSPECTION")`，**不读
+`t_shelf_process`**。品检架上的映射行因此是「既无读侧消费、又能让脏货架落进 holder」的
+纯负债。
+
+**副作用（已知且接受）**：对品检架（或任何非 PRODUCTION 区货架）调本端点现在返 `20104`；
+**存量**非法映射在下一次 `POST` 整组替换时同样被拒（整组替换无法只改其中一条）。这是
+刻意的 fail-fast：让配置错误在写侧暴露，而不是继续静默产出漏件批次。存量非法行的排查
+SQL（只读）见下方「只读诊断 SQL」，**本仓不自动修数据**，修复走独立的数据修复单。
+
+---
+
+## 只读诊断 SQL（2026-10-04 新增）
+
+> ⚠️ **只读诊断，非迁移**。本节两条 SQL **不含任何 `UPDATE` / `DELETE` / `INSERT`**，
+> 只作排查用。仓库既有的可执行 SQL 惯例是 `migrations/`（schema）与 `seeds/`（配置
+> 数据）两个目录 —— 二者都是**会被应用**的变更脚本，把只读排查语句塞进去会与之混淆，
+> 故本节落在文档里。需要执行时直接贴进 `psql` / 客户端跑即可。
+>
+> **用途**：`current_holder_id` 写脏的**后果是静默漏件而不是报错**。报工台取件页的
+> 数据源（`GET /api/v2/parts/pickable-by-work-type/{work_type_id}`）取行 SQL 硬限定
+> ```sql
+> JOIN t_shelf sh ON sh.id = b.current_holder_id
+> ... AND sh.is_active = true AND sh.zone = 'PRODUCTION'
+> ```
+> 所以一个 `location='PRODUCTION_SHELF'` 但 `current_holder_id` 指向品检架 / 停用架 /
+> 已软删架的批次，**永远不会出现在工人的可领列表里，也不报任何错**。下面第 1 条把这类
+> 批次全部列出来，第 2 条把「会让脏货架落进 holder」的非法映射源头列出来。
+
+### ① `current_holder_id` 指向不可用货架的在池批次
+
+```sql
+SELECT b.id, b.part_id, b.current_holder_id, sh.code, sh.zone, sh.is_active, sh.deleted_at
+FROM t_part_batch b LEFT JOIN t_shelf sh ON sh.id = b.current_holder_id
+WHERE b.location = 'PRODUCTION_SHELF' AND b.status = 'IN_PROCESS' AND b.deleted_at IS NULL
+  AND (sh.id IS NULL OR sh.zone <> 'PRODUCTION' OR NOT sh.is_active OR sh.deleted_at IS NOT NULL);
+```
+
+谓词逐条对应 `validate_shelf_zone` 的三个判据（`sh.id IS NULL` 覆盖悬空 holder；
+`sh.zone <> 'PRODUCTION'` / `NOT sh.is_active` / `sh.deleted_at IS NOT NULL`），
+`LEFT JOIN` 保证 holder 指向已消失的货架时也能命中。
+
+### ② 非法 shelf ↔ process 映射（脏 holder 的源头）
+
+```sql
+SELECT sp.id AS mapping_id, sp.shelf_id, sh.code AS shelf_code, sh.zone, sh.is_active,
+       sh.deleted_at AS shelf_deleted_at, sp.process_id, p.code AS process_code,
+       sp.deleted_at AS mapping_deleted_at
+FROM t_shelf_process sp
+JOIN t_shelf sh ON sh.id = sp.shelf_id
+JOIN t_process p ON p.id = sp.process_id
+WHERE sp.deleted_at IS NULL
+  AND (sh.deleted_at IS NOT NULL OR NOT sh.is_active OR sh.zone <> 'PRODUCTION');
+```
+
+即「映射行本身还 active，但货架已软删 / 已停用 / 不是生产架」。这三条正是
+`ShelfProcessRepo::find_first_shelf_for_process` 自 2026-10-04 起在 SQL 里挡掉的谓词，
+也是 `POST /{shelf_id}` 现在拒收的形态。**修完守卫后本查询仍应作为存量巡检手段定期跑**
+（新守卫只挡新写入，挡不住历史行）。
+
+### 本仓验证记录
+
+2026-10-04 在本 worktree 的开发库（`DATABASE_URL=postgres://hsh:6065161@localhost:5450/hsh`，
+schema 由 `sqlx migrate run` 建到 HEAD）实跑：两条均返回 **0 行**。
+⚠️ 该库是**空库**（`t_part_batch` / `t_shelf` / `t_shelf_process` 均为 0 行），
+故这是**空真值**、不构成「线上无脏数据」的证据 —— 线上库需另行执行。
+为确认 SQL 本身能命中（而非因写错谓词恒返空），另在同库一个 `BEGIN … ROLLBACK`
+事务内合成「1 品检架 + 1 停用架 + 1 软删架 + 1 正常架 / 各 1 条映射 / 各 1 条在池批次」，
+两条 SQL 各返回 3 行（正常架那行正确地未被命中），`ROLLBACK` 后复查三表均回到 0 行。
 
 ---
 
@@ -321,7 +407,11 @@ CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃�
 | 20505 | `BIZ_SHELF_PROCESS_PROCESS_NOT_FOUND` | **prod::shelf_process** | items 里有 process_id 不存在 |
 | 20506 | `BIZ_SHELF_NO_MATCH_FOR_PROCESS` | prod 域 | 没有 active 货架映射指定 process |
 | 20507 | `BIZ_SHELF_PROCESS_NOT_MAPPED` | prod::worker_pool | 货架未映射该工序（move / worker-scan 复用） |
-| 20508 | `BIZ_SHELF_PROCESS_NOT_FOUND` | prod::batch | 按 `target_process_id` 在 `t_shelf_process` 0 结果 |
+| 20508 | `BIZ_SHELF_PROCESS_NOT_FOUND` | prod::batch | 按 `target_process_id` 查不到**可用**货架（2026-10-04 起含「有映射但货架已软删 / 已停用 / 非生产区」） |
+| 20512 | `BIZ_SHELF_INACTIVE` | 货架域 | shelf `is_active=false`（2026-10-04 起 `POST /prod/shelf-processes/{shelf_id}` 经 `validate_shelf_zone` 也会命中） |
+
+20104 `BIZ_INVALID_VALUE` 另见 [`../index.md`](./index.md) 通用错误码表 —— 2026-10-04
+起它多了一个触发场景：本域 `POST` 收到非 PRODUCTION 区货架时。
 
 ---
 
@@ -342,7 +432,7 @@ CLAUDE.md 架构条目 §4「Zod 默认 strip 模式会让缺字段静默丢弃�
 
 ## 参考
 
-- 集成测试：`tests/production/shelf_process.rs`（4 场景：整组替换 / 全集查询 /
-  20505 拒未知工序 / 旧路径 4xx）
+- 集成测试：`tests/production/shelf_process.rs`（6 场景：整组替换 / 全集查询 /
+  20505 拒未知工序 / 旧路径 4xx / 2026-10-04 品检架 20104 / 2026-10-04 停用架 20512）
 - 错误码：`src/shared/error.rs::code`
 - 货架 CRUD：[`../shelves.md`](../shelves.md)

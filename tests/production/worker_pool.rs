@@ -25,6 +25,11 @@
 //!  17. state_without_shelf_id_returns_held_batches_and_empty_pool_count
 //!      （2026-10-04 回归：`GET /pool/state` 的 `shelf_id` 降为可选后，缺省调用
 //!      仍须返回完整持有视图，仅 `pool_count_by_process` 退化为空数组）
+//!  18. move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes
+//!      （2026-10-04 `current_holder_id` 写脏守卫：WORKER→POOL 的目标货架已软删
+//!      → 20501 / 已停用 → 20512 / 是品检架 → 20104，且批次不被写脏）
+//!  19. move_worker_to_pool_validates_shelf_when_batch_has_no_process
+//!      （同上，但 `current_process_id=NULL` ⇒ 收紧前一条货架校验都不跑的那条分支）
 //!
 //! ## 串行化
 //! 进程级 test_pool 每次 fresh database（plan 2 2026-09-20），DB 间 schema
@@ -191,6 +196,21 @@ async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
 
 /// 插一个 t_shelf 行（code / name / zone）。
 async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
+    insert_shelf_state(pool, code, name, zone, true, false).await
+}
+
+/// 2026-10-04 新增：可指定 `is_active` / `deleted_at` 的 t_shelf 构造。
+///
+/// 供 `move_batch` WORKER→POOL 货架守卫的回归用例用（品检区 / 停用 / 软删三种形态）。
+/// `insert_shelf` 改为委托本函数，避免同一目录出现两套货架 fixture 写法。
+async fn insert_shelf_state(
+    pool: &PgPool,
+    code: &str,
+    name: &str,
+    zone: &str,
+    is_active: bool,
+    deleted: bool,
+) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
@@ -198,14 +218,17 @@ async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 
     let now = now_naive();
     sqlx::query(
         "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
-         created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, true, 0, 0, $5, $5)",
+         created_at, updated_at, deleted_at) \
+         VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $6, \
+         CASE WHEN $7 THEN $6::timestamp ELSE NULL END)",
     )
     .bind(id)
     .bind(code)
     .bind(name)
     .bind(zone)
+    .bind(is_active)
     .bind(now)
+    .bind(deleted)
     .execute(pool)
     .await
     .expect("insert t_shelf");
@@ -2409,4 +2432,206 @@ async fn pool_counts_forbidden_for_shelf_account() {
     .await;
     assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
+}
+
+// ===========================================================================
+//  2026-10-04 `current_holder_id` 写脏守卫：move WORKER → POOL 的目标货架
+// ===========================================================================
+//
+// 背景：`move_batch` 的 WORKER→POOL 分支把 `to.shelf_id` 直接写进
+// `t_part_batch.current_holder_id` 并把 `location` 翻成 `PRODUCTION_SHELF`，
+// 收紧前**只在** `step_process_id` 是 `Some` 时才校验货架↔工序映射，且任何情况下
+// 都不校验货架本身（存在性 / 软删 / 停用 / zone 全无）。后果是静默漏件：报工台
+// 取件页数据源（`part::service::phase1::work_type` pickable-by-work-type）硬限定
+// `JOIN t_shelf sh ON sh.id = b.current_holder_id AND sh.is_active = true
+//   AND sh.zone = 'PRODUCTION'`，故落到品检架 / 停用架 / 已软删架上的批次永远不会被
+// 工人领到，也不报错。
+//
+// 收紧后该分支**无条件**走 `validate_shelf_zone(.., "PRODUCTION")`（与 place_on_shelf /
+// pickup / outsource 等生产流端点同源同码：20501 → 20512 → 20104）。
+
+/// 目标货架的三种不可用形态：已软删 / 已停用 / 品检区 → 拒收且批次不被写脏。
+#[tokio::test]
+async fn move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes() {
+    // (短标, 说明, zone, is_active, deleted, 期望错误码, 期望 HTTP 状态)
+    // 「短标」只进 serial_no / shelf code / 批号等有长度上限的列
+    // （`t_part.serial_no` 是 varchar(15)），长描述只进断言消息。
+    // HTTP 状态按 `error.rs::status_from_code` 的既有映射：20501 → 404（资源缺失段），
+    // 20512 / 20104 落在 2xxxx 兜底段 → 400。
+    let cases: [(&str, &str, &str, bool, bool, i64, StatusCode); 3] = [
+        (
+            "DEL",
+            "soft-deleted",
+            "PRODUCTION",
+            true,
+            true,
+            20501,
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "INACT",
+            "inactive",
+            "PRODUCTION",
+            false,
+            false,
+            20512,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "INSP",
+            "inspection-zone",
+            "INSPECTION",
+            true,
+            false,
+            20104,
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+
+    for (tag, name, zone, is_active, deleted, expect_code, expect_status) in cases {
+        let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+        let customer = insert_customer_l2(&pool, "MPG").await;
+        let proc = seed_process(&pool, "PROC-MPG", "工序MPG").await;
+        let wt = insert_work_type(&pool, "WT-MPG", "工种MPG", Some(5)).await;
+        link_work_type_to_process(&pool, wt, proc).await;
+        let worker =
+            insert_worker(&pool, &format!("BC-{tag}"), &format!("工{tag}"), Some(wt)).await;
+
+        // 目标货架按用例指定状态（**不**建映射：映射校验是另一层守卫，本用例只锁货架本身）
+        let bad_shelf = insert_shelf_state(
+            &pool,
+            &format!("SH-{tag}"),
+            &format!("SH-{tag}"),
+            zone,
+            is_active,
+            deleted,
+        )
+        .await;
+
+        let (_part, held_batch, _step) =
+            insert_worker_held_part(&pool, customer, &format!("H-{tag}"), worker, proc, 1, true)
+                .await;
+
+        let (app, token) = login_manager_with_username(&pool, "admin-mpg").await;
+        let (s, env) = send(
+            app,
+            json_request(
+                "POST",
+                "/prod/pool/move",
+                Some(json!({
+                    "batch_id": held_batch.to_string(),
+                    "from": { "kind": "WORKER", "worker_id": worker.to_string() },
+                    "to":   { "kind": "POOL",   "shelf_id": bad_shelf.to_string() },
+                })),
+                Some(&token),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s, expect_status,
+            "{name}: 不可用货架应 {expect_status}: {env}"
+        );
+        assert_eq!(
+            env["code"].as_i64().unwrap(),
+            expect_code,
+            "{name}: 错误码应复用 validate_shelf_zone 体系（不新造码）: {env}"
+        );
+
+        // 批次未被写脏：仍在 worker 手上（location/holder 均未变）
+        let row = sqlx::query!(
+            r#"SELECT location AS "loc!", current_holder_id AS "ch?", version
+            FROM t_part_batch WHERE id = $1"#,
+            held_batch,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query batch");
+        assert_eq!(
+            row.loc, "WORKER",
+            "{name}: 拒收后 batch 应仍在 WORKER（location 未被写脏）"
+        );
+        assert_eq!(
+            row.ch,
+            Some(worker),
+            "{name}: current_holder_id 必须仍指向 worker，未被写成目标货架"
+        );
+        assert_eq!(row.version, 0, "{name}: 拒收后 version 不应被自增");
+        assert_eq!(
+            count_held_by_worker(&pool, worker).await,
+            1,
+            "{name}: worker 仍持有该批次"
+        );
+    }
+}
+
+/// `step_process_id`（= `t_part_batch.current_process_id`）为 `None` 时也必须校验目标货架。
+///
+/// 收紧前 WORKER→POOL 分支的**全部**货架校验都包在 `if let Some(spid) = step_process_id`
+/// 里，`None` 时一条校验都不跑（`None` = 批次无工序归属，见 migration 004 之前的存量 /
+/// 直接改库的历史脏数据）。收紧后货架本身的存在性 / 停用 / zone 无条件守（映射校验仍
+/// 跳过 —— 没有 process_id 可比），本用例锁的就是这一点。
+#[tokio::test]
+async fn move_worker_to_pool_validates_shelf_when_batch_has_no_process() {
+    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
+    let customer = insert_customer_l2(&pool, "MPOOLNOPROC").await;
+    let proc = seed_process(&pool, "PROC-MPNP", "工序MPNP").await;
+    let wt = insert_work_type(&pool, "WT-MPNP", "工种MPNP", Some(5)).await;
+    link_work_type_to_process(&pool, wt, proc).await;
+    let worker = insert_worker(&pool, "BC-MPNP", "工MPNP", Some(wt)).await;
+    let bad_shelf = insert_shelf_state(
+        &pool,
+        "SH-MPNP-INSP",
+        "SH-MPNP-INSP",
+        "INSPECTION",
+        true,
+        false,
+    )
+    .await;
+
+    let (_part, held_batch, _step) =
+        insert_worker_held_part(&pool, customer, "H-MPNP", worker, proc, 1, true).await;
+    // 把 current_process_id 清空 ⇒ service 侧 step_process_id = None（映射校验会被跳过）
+    sqlx::query("UPDATE t_part_batch SET current_process_id = NULL WHERE id = $1")
+        .bind(held_batch)
+        .execute(&pool)
+        .await
+        .expect("clear current_process_id");
+
+    let (app, token) = login_manager_with_username(&pool, "admin-mpnp").await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            "/prod/pool/move",
+            Some(json!({
+                "batch_id": held_batch.to_string(),
+                "from": { "kind": "WORKER", "worker_id": worker.to_string() },
+                "to":   { "kind": "POOL",   "shelf_id": bad_shelf.to_string() },
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "current_process_id=NULL 时也必须拒品检架: {env}"
+    );
+    assert_eq!(
+        env["code"].as_i64().unwrap(),
+        20104,
+        "应复用 20104 BIZ_INVALID_VALUE（zone 不符）: {env}"
+    );
+
+    let holder: Option<i64> =
+        sqlx::query_scalar("SELECT current_holder_id FROM t_part_batch WHERE id = $1")
+            .bind(held_batch)
+            .fetch_one(&pool)
+            .await
+            .expect("read holder");
+    assert_eq!(
+        holder,
+        Some(worker),
+        "拒收后 current_holder_id 必须仍指向 worker（未被写脏）"
+    );
 }
