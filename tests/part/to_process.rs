@@ -294,6 +294,62 @@ async fn to_process_wrong_state_rejected() {
     assert_eq!(body["code"], 20109, "BIZ_PART_BATCH_NOT_FOUND: {body}");
 }
 
+/// 2026-10-06 批次锚定回归：状态机闸门必须读 `batch.status`（真源）而非
+/// `t_part.status`（min-progress 派生缓存列）。
+///
+/// 形态：`t_part.status` = `IN_PROCESS`（派生值）、被操作批次 = `INSPECTION`
+/// → to-process（品检打回）必须**放行**（200）。改前 `IN_PROCESS → IN_PROCESS`
+/// 无状态机边，恒被 20103 误拒。
+///
+/// 本文件的 `insert_part_with_batch` 本就分开接收 part status 与 batch status，
+/// 故无需新 helper —— 只需传一组两列不同的值。
+#[tokio::test]
+async fn to_process_ignores_part_derived_status_when_batch_is_in_inspection() {
+    let (pool, app, token, fx) = bootstrap_as_inspector().await;
+    // part 派生列 = IN_PROCESS；被操作批次 = INSPECTION
+    let (part_id, batch_id) = insert_part_with_batch(
+        &pool,
+        "P0",
+        fx.customer_l2_id,
+        Some("P000"),
+        "IN_PROCESS", // ← t_part.status：派生值
+        "INSPECTION", // ← 批次真源：被操作对象
+    )
+    .await;
+    let chain_id = create_chain_for_part(&pool, part_id).await;
+    let _step_id = create_step(&pool, chain_id, fx.process_id, 1).await;
+    let v = batch_version(&pool, batch_id).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{batch_id}/to-process"),
+            Some(json!({
+                "shelf_id": fx.production_shelf_id.to_string(),
+                "next_process_id": fx.process_id.to_string(),
+                "version": v,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "批次本身是 INSPECTION 就该放行，不该被 part 派生列误拒: {body}"
+    );
+    assert_eq!(body["code"], 0, "to-process 应成功: {body}");
+
+    let bs = sqlx::query_scalar::<_, String>("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("batch");
+    assert_eq!(bs, "IN_PROCESS", "被操作批次应已翻到 IN_PROCESS: {body}");
+}
+
 /// to-process partial-split happy path：INSPECTION 批次 qty=10 → quantity=3 → 拆批。
 ///
 /// 期望：

@@ -85,6 +85,68 @@ async fn batch_version(pool: &PgPool, batch_id: i64) -> i32 {
         .expect("batch not found")
 }
 
+/// 2026-10-06 回归 helper：造「同一 part 下多个批次、且 `t_part.status` 与被操作批次
+/// 状态**不同**」的形态。
+///
+/// 为什么需要它：既有 helper `insert_part_with_batch` 恒造**单个**批次且
+/// `part.status ≡ batch.status`，两列永远同值，于是「闸门读错列」这件事在测试里
+/// **不可观测** —— 这正是 `to_ship` 假阴性长期未被发现的根因。
+///
+/// `part_status` 由调用方显式传入（模拟 `rollup_part_derived` 的 min-progress 派生
+/// 结果），`batches` 逐个指定状态。返回 `(part_id, Vec<batch_id>)`。
+async fn insert_part_with_mixed_batches(
+    pool: &PgPool,
+    name: &str,
+    customer_id: i64,
+    serial_no: Option<&str>,
+    part_status: &str,
+    batches: &[(&str, i32)],
+) -> (i64, Vec<i64>) {
+    use hsh_erp_rust::infra::clock::now_naive;
+    use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let part_id = snowflake.next_id();
+    let now = now_naive();
+    let today = now.date();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, customer_id, status, \
+         applicant_name, request_date, planned_delivery_date, quantity, version, \
+         created_at, updated_at) \
+         VALUES ($1, $2, $3, 'D-001', $4, $7, $3, $5, $5, 1, 0, $6, $6)",
+    )
+    .bind(part_id)
+    .bind(serial_no)
+    .bind(name)
+    .bind(customer_id)
+    .bind(today)
+    .bind(now)
+    .bind(part_status)
+    .execute(pool)
+    .await
+    .expect("insert part");
+
+    let mut ids = Vec::with_capacity(batches.len());
+    for (idx, (status, qty)) in batches.iter().enumerate() {
+        let batch_id = snowflake.next_id();
+        sqlx::query(
+            "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+             created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, 0, $6, $6)",
+        )
+        .bind(batch_id)
+        .bind(part_id)
+        .bind(idx as i32 + 1)
+        .bind(*qty)
+        .bind(*status)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("insert batch");
+        ids.push(batch_id);
+    }
+    (part_id, ids)
+}
+
 // ===========================================================================
 //  bootstrap helpers
 // ===========================================================================
@@ -567,4 +629,124 @@ async fn batch_to_ship_stale_version_lands_in_failed() {
             .await
             .expect("b2");
     assert_eq!(b2_status, "INSPECTION", "失败 item 应被 savepoint 回滚");
+}
+
+// ===========================================================================
+//  2026-10-06 批次锚定回归：状态机闸门必须读 batch.status（真源）而非
+//  t_part.status（min-progress 派生缓存列）
+//
+//  背景：端点 2026-10-02 起以 `batch_id` 为锚（`/parts/{part_id}/to-ship` →
+//  `/prod/batches/{batch_id}/to-ship`），但闸门仍读 `t_part.status`。该列由
+//  `rollup_part_derived` 按 min-progress 派生：同工单只要还有任一批次进度更靠前，
+//  整单就派生成那个更早的状态。于是「批次本身 INSPECTION、`t_part.status` 却是
+//  IN_PROCESS」的工单品检通过必被 20103 误拒 —— 假阴性覆盖 5 种可能派生值中的 4 种
+//  （PENDING / PROGRAMMING / IN_PROCESS / OUTSOURCE）。
+//  既有 helper 恒造单批次且两列同值，故该形态在测试中原本不可观测。
+// ===========================================================================
+
+/// ★ 核心回归：`t_part.status`（派生）= `IN_PROCESS`、被操作批次 = `INSPECTION`
+/// → to-ship 必须**放行**（200）。改前恒 20103。
+///
+/// 这正是线上 F1006（part 207707237655773184）的形态：8 个批次里 5 个还在
+/// IN_PROCESS、2 个 INSPECTION，min-progress 把 part 压回 IN_PROCESS。
+#[tokio::test]
+async fn to_ship_ignores_part_derived_status_when_batch_is_in_inspection() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+
+    // part 派生列 = IN_PROCESS（兄弟批次还在产，min-progress 取最靠前的）
+    let (_pid, batch_ids) = insert_part_with_mixed_batches(
+        &pool,
+        "P0",
+        fx.customer_l2_id,
+        Some("P000"),
+        "IN_PROCESS", // ← t_part.status：派生值，非被操作批次的真源
+        &[("IN_PROCESS", 5), ("IN_PROCESS", 5), ("INSPECTION", 3)],
+    )
+    .await;
+    let target = batch_ids[2];
+    let v = batch_version(&pool, target).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{target}/to-ship"),
+            Some(json!({ "version": v })),
+            Some(&token),
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "批次本身是 INSPECTION 就该放行，不该被 part 派生列误拒: {body}"
+    );
+    assert_eq!(body["code"], 0, "to-ship 应成功: {body}");
+
+    // 批次真源应被翻到 READY_TO_SHIP
+    let bs = sqlx::query_scalar::<_, String>("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(target)
+        .fetch_one(&pool)
+        .await
+        .expect("batch");
+    assert_eq!(bs, "READY_TO_SHIP", "被操作批次应已翻转: {body}");
+
+    // part 派生列仍应是 IN_PROCESS —— 另两个 IN_PROCESS 兄弟批次还在产，
+    // min-progress 不变。顺带证明「放行」不是靠把 part 状态也一起改掉。
+    let ps = sqlx::query_scalar::<_, String>("SELECT status FROM t_part WHERE id = $1")
+        .bind(_pid)
+        .fetch_one(&pool)
+        .await
+        .expect("part");
+    assert_eq!(
+        ps, "IN_PROCESS",
+        "兄弟批次仍在产，part 派生值应保持 IN_PROCESS（min-progress）"
+    );
+}
+
+/// 反向守卫：批次**自身**不在 INSPECTION 时仍必须被拒（改判据不能把闸门放没）。
+/// part 派生列恰好也是 INSPECTION，但被点的是 PENDING 批次 → 20103。
+#[tokio::test]
+async fn to_ship_still_rejects_batch_not_in_inspection() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+
+    // part 派生列 = INSPECTION（全部批次都在品检）
+    let (_pid, batch_ids) = insert_part_with_mixed_batches(
+        &pool,
+        "P0",
+        fx.customer_l2_id,
+        Some("P000"),
+        "INSPECTION",
+        &[("INSPECTION", 5), ("PENDING", 2)],
+    )
+    .await;
+    // 手动把 part 派生列拨到 INSPECTION 是合法的（此时 min-progress 应是 PENDING，
+    // 但本用例只验「闸门读 batch 不读 part」，故显式构造 part=INSPECTION 的对照）
+    let target = batch_ids[1]; // PENDING 批次
+    let v = batch_version(&pool, target).await;
+
+    let (status, body) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{target}/to-ship"),
+            Some(json!({ "version": v })),
+            Some(&token),
+        ),
+    )
+    .await;
+
+    // part 派生列是 INSPECTION（能过闸门），但批次是 PENDING → 必须被拒。
+    // 这是「读 batch」与「读 part」两种判据在本用例下**唯一**可区分的形态。
+    assert!(
+        status.is_client_error() || status == StatusCode::BAD_REQUEST,
+        "PENDING 批次不该被放行: status={status} body={body}"
+    );
+    assert_eq!(body["code"], 20103, "应报 20103: {body}");
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains(&format!("batch {target}")),
+        "message 应以 batch（被操作对象）为主语: {msg}"
+    );
 }

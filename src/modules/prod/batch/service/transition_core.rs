@@ -62,18 +62,28 @@ impl BatchService {
         })?;
 
         // 2. 状态机守卫：INSPECTION → READY_TO_SHIP
-        let from = PartStatus::from_str(&part.status).ok_or_else(|| {
+        //
+        //    2026-10-06 读 `anchor.status`（批次真源）而非 `part.status`（派生缓存列）。
+        //    `t_part.status` 由 `rollup_part_derived` 按 min-progress 派生：同工单只要
+        //    还有任一批次进度更靠前，整单就派生成那个更早的状态。分批生产的工单因此
+        //    会出现「批次本身 INSPECTION、`t_part.status` 却是 IN_PROCESS / PENDING /
+        //    OUTSOURCE」的形态，用派生列判批次流转会**成片假阴性**（本守卫的假阴性
+        //    覆盖面是 5 种可能派生值里的 4 种）。端点自 2026-10-02 起以 `batch_id` 为
+        //    锚点（URL 从 `/parts/{part_id}/to-ship` 硬切到
+        //    `/prod/batches/{batch_id}/to-ship`），判据却没跟着换，直到本次才修。
+        //    房内已正确实现的同类端点见 `shelf.rs::place_on_shelf` /
+        //    `outsource.rs::send_to_outsource` / `lifecycle.rs::deliver`（同款注释）。
+        let from = PartStatus::from_str(&anchor.status).ok_or_else(|| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,
-                format!("part {} 状态非法: {}", part_id, part.status),
+                format!("batch {batch_id} 状态非法: {}", anchor.status),
             )
         })?;
         if !from.can_transition_to(PartStatus::READY_TO_SHIP) {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,
                 format!(
-                    "part {} 当前状态 {} 不允许通过品检（必须先送检）",
-                    part_id,
+                    "batch {batch_id} 当前状态 {} 不允许通过品检（必须先送检）",
                     from.as_str()
                 ),
             ));
@@ -204,18 +214,22 @@ impl BatchService {
             AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
         })?;
         // 2. 状态机守卫：必须 INSPECTION
-        let from = PartStatus::from_str(&part.status).ok_or_else(|| {
+        //
+        //    2026-10-06 读 `anchor.status`（批次真源）而非 `part.status`（派生缓存列），
+        //    理由与假阴性覆盖面见 `to_ship_core` 同处注释。本端点的假阴性窗口比
+        //    to-ship 窄（`t_part.status` 只可能派生到 IN_PROCESS 这一个被误拒的值），
+        //    但成因完全相同，一并修正。
+        let from = PartStatus::from_str(&anchor.status).ok_or_else(|| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,
-                format!("part {} 状态非法: {}", part_id, part.status),
+                format!("batch {batch_id} 状态非法: {}", anchor.status),
             )
         })?;
         if !from.can_transition_to(PartStatus::IN_PROCESS) {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,
                 format!(
-                    "part {} 当前状态 {} 不允许品检打回（必须先送检到 INSPECTION）",
-                    part_id,
+                    "batch {batch_id} 当前状态 {} 不允许品检打回（必须先送检到 INSPECTION）",
                     from.as_str()
                 ),
             ));
@@ -407,16 +421,23 @@ impl BatchService {
             AppError::biz(code::BIZ_PART_NOT_FOUND, format!("part {part_id} 不存在"))
         })?;
         // 3. 状态机守卫：必须在 {PENDING, PROGRAMMING, IN_PROCESS}
-        let from = PartStatus::from_str(&part.status).ok_or_else(|| {
+        //
+        //    2026-10-06 读 `anchor.status`（批次真源）而非 `part.status`（派生缓存列），
+        //    理由见 `to_ship_core` 同处注释。本端点**当前没有**假阴性：批次源状态里
+        //    IN_PROCESS 的 progress 最高，而 `t_part.status` 按 min-progress 只可能
+        //    派生成更早的 PENDING / PROGRAMMING / IN_PROCESS —— 三者到 INSPECTION
+        //    都有边。但判据读错列这件事本身就是隐患（下一条状态机补边时就会变成
+        //    假阴性），故一并对齐，不留「恰好没事」的写法。
+        let from = PartStatus::from_str(&anchor.status).ok_or_else(|| {
             AppError::biz(
                 code::BIZ_INVALID_VALUE,
-                format!("part {} 状态非法: {}", part_id, part.status),
+                format!("batch {batch_id} 状态非法: {}", anchor.status),
             )
         })?;
         if !from.can_transition_to(PartStatus::INSPECTION) {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,
-                format!("part {} 当前状态 {} 不允许送检", part_id, from.as_str()),
+                format!("batch {batch_id} 当前状态 {} 不允许送检", from.as_str()),
             ));
         }
         // 5. 定位目标批次（先于 IN_PROCESS 组合校验，以便直接读 target_batch.location）

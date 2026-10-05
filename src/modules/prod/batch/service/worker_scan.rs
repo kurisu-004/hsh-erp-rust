@@ -305,12 +305,21 @@ impl BatchService {
                     ));
                 }
                 // 状态机：IN_PROCESS → INSPECTION
-                let from = PartStatus::from_str(&part.status)
-                    .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "非法 part 状态"))?;
+                //
+                // 2026-10-06 读 `batch.status`（批次真源）而非 `part.status`（派生缓存列），
+                // 理由与假阴性分析见 `transition_core.rs::to_ship_core` 同处注释。本分支
+                // 当前无假阴性（batch 源状态固定 IN_PROCESS，part 派生值不会更晚），
+                // 但判据读错列本身是隐患，一并对齐。
+                let from = PartStatus::from_str(&batch.status).ok_or_else(|| {
+                    AppError::biz(
+                        code::BIZ_INVALID_VALUE,
+                        format!("batch {} 状态非法: {}", batch.id, batch.status),
+                    )
+                })?;
                 if !from.can_transition_to(PartStatus::INSPECTION) {
                     return Err(AppError::biz(
                         code::BIZ_INVALID_TRANSITION,
-                        format!("part {} 当前状态 {} 不允许送检", part.id, from.as_str()),
+                        format!("batch {} 当前状态 {} 不允许送检", batch.id, from.as_str()),
                     ));
                 }
                 // 切 holder worker → target_shelf + 状态 IN_PROCESS → INSPECTION（OCC）
