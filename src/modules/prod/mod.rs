@@ -37,7 +37,7 @@
 //!
 //! 2026-10-05 新增 `prod::process_design` 子模块（制定工序页零件列表，1 端点，URL 挂
 //! `/api/v2/prod/process-design/parts`）：前端「制定工序」页从 part 域
-//! `GET /api/v2/parts?status=PENDING&limit=200` 切过来。part 域 `GET /parts` 在
+//! `GET /api/v2/parts?status=PENDING` 切过来（前端**不传 `limit`**）。part 域 `GET /parts` 在
 //! service 层硬置 `part_only: true`，repo 据此在 SQL 里加 `AND assembly_id IS NULL`
 //! 守卫，把**装配件的子零件全部排除**；本页需要所有还没定工序的零件，故新端点
 //! **刻意不加**该守卫（子件行 `assembly_id` 有值，照常返回供前端标注归属）。
@@ -67,8 +67,8 @@ use crate::state::AppState;
 
 pub mod batch;
 pub mod process;
-pub mod process_design;
 pub mod process_chain;
+pub mod process_design;
 pub mod programming;
 pub mod shelf_process;
 pub mod work_type;

@@ -4,7 +4,7 @@
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
 > 范围：**「制定工序」页**的单一只读列表端点。前端该页从 part 域
-> `GET /api/v2/parts?status=PENDING&limit=200` 切到本端点（2026-10-05）；part 域旧端点
+> `GET /api/v2/parts?status=PENDING` 切到本端点（2026-10-05）；part 域旧端点
 > **保留兼容、一行未改**。
 
 ## 端点列表
@@ -47,6 +47,11 @@ Query：
 | `sort_dir` | string? | ✗ | `ASC` / `DESC`（缺省 `ASC`；非 `DESC` 一律按 `ASC` 处理，大小写不敏感）。排序键固定 `serial_no`，**无 `sort_by`** |
 | `limit` | int? | ✗ | 缺省 200；service 层 `clamp(1, 500)`。值以 URL query 形态到达（`?limit=200`），**带引号的 `"200"` 不接受**（400）；**空串 / 全空白按缺省处理** |
 | `offset` | int? | ✗ | 缺省 0；service 层 `max(0)`。取值容错同 `limit` |
+
+> **分页口径与 part 域旧端点不同（预期行为，非缺陷）**：前端调旧端点时**不传 `limit`**
+> （`listParts({ status: 'PENDING' })`），落 part 域 `unwrap_or(50).clamp(1, 200)`
+> （**缺省 50 / 封顶 200**）；本端点缺省 200、封顶 500，比旧端点**更宽**。⇒ 前端切到本
+> 端点后**首屏行数会从 50 涨到 200**。待制定工序的零件常超 50 条，这是刻意放宽的。
 
 > **刻意不提供的参数**（与 [`pending-programming.md`](./pending-programming.md) 的
 > 筛选型端点不同，本端点入参极窄）：
@@ -135,8 +140,10 @@ LIMIT $limit OFFSET $offset
 端点把同一段谓词手抄两遍，改一处漏一处就会让 `total` 与 `items` 对不上；本模块从结构上
 杜绝这种漂移。
 
-`SELECT_COLS`（7 列）**刻意只被 `list` 引用** —— `count` 只需行数，把投影塞进去会给每个
-待计数的 part 白跑一次无用列读取。
+`SELECT_COLS`（7 列）**刻意只被 `list` 引用** —— `count` 只需行数（`COUNT(*)::bigint`），
+而把 7 列投影塞进 `SELECT COUNT(*)` 会因**缺 `GROUP BY` 直接 SQL 报错**（PG 要求非聚合列
+必须出现在 `GROUP BY` 里，否则报 `column "p.id" must appear in the GROUP BY clause`），
+不是「多读几列」的效率取舍。
 
 ---
 
@@ -223,7 +230,7 @@ LIMIT $limit OFFSET $offset
 | Code | Name | HTTP | 触发场景 |
 |---|---|---|---|
 | 40300 | FORBIDDEN | 403 | 角色守卫失败（非 Manager/Clerk/Inspector/CNC_PROGRAMMER） |
-| 50001 | DB_ERROR | 500 | DB 查询失败 |
+| 50001 | DATABASE | 500 | DB 查询失败（`code::DATABASE` / `AppError::Database`） |
 
 **关于 40001**：本端点**不会**用 40001 报 `limit` / `offset` 越界 —— 越界一律
 **静默 clamp**（`limit=0 → 1`、`limit=99999 → 500`、`offset=-5 → 0`，见 service 层），

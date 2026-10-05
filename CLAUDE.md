@@ -125,7 +125,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | `prod::worker_pool` | 6 | `/api/v2/prod/pool` | `t_part_batch`（候选池视图） | 工人候选池（2026-09-30 `/worker-pool` + `/admin/worker-pool` 双 nest 合并为 `/pool`；**2026-10-02 订正**：文档原写 5，实际 6 条 route） |
 | `prod::batch` | 28 | `/api/v2/prod/batches` | `t_part_batch` | 批次域全集（2026-09-29 建 3 条下发端点；**2026-10-02** 硬切进 25 条批次路由，操作对象是批次、无 alias，路由表见 `src/modules/prod/batch/mod.rs` 模块 doc） |
 | `prod::programming` | 1 | `/api/v2/prod/programming` | `t_part` + `t_part_batch` + chain | 待编程一览（2026-10-01 新增） |
-| `prod::process_design` | 1 | `/api/v2/prod/process-design` | `t_part` | **2026-10-05 新增**：制定工序页零件列表。软删闸门 + `status = 'PENDING'` 闸门，7 字段最小集，**刻意不加** `AND assembly_id IS NULL` 守卫（part 域 `GET /parts` 带 `part_only: true` 会把装配件子件全部排除）故**含装配件子件**；入参只有 `sort_dir` / `limit` / `offset`。前端「制定工序」页自 part 域 `GET /api/v2/parts?status=PENDING&limit=200` 切来，part 域旧端点保留兼容、一行未改 |
+| `prod::process_design` | 1 | `/api/v2/prod/process-design` | `t_part` | **2026-10-05 新增**：制定工序页零件列表。软删闸门 + `status = 'PENDING'` 闸门，7 字段最小集，**刻意不加** `AND assembly_id IS NULL` 守卫（part 域 `GET /parts` 带 `part_only: true` 会把装配件子件全部排除）故**含装配件子件**；入参只有 `sort_dir` / `limit` / `offset`。前端「制定工序」页自 part 域 `GET /api/v2/parts?status=PENDING` 切来，part 域旧端点保留兼容、一行未改 |
 
 > 表内 9 个子模块端点求和 = 7 + 7 + 5 + 3 + 3 + 6 + 28 + 1 + 1 = **61**（2026-10-05 增 `prod::process_design` 1 端点）。
 
@@ -146,7 +146,9 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
   - prod 侧：文档原写「31」，系 `prod::worker_pool` 计数残留（标题写 5、router
     实为 6 route），实为 **32**；
   - 故 prod 的净变化是 32 → 35（+3），而非按旧账记的 31 → 34。
-  订正后的 prod 35 端点与本节上表求和一致（7+7+5+3+6+3+1+3）
+  订正后的 prod 35 端点与本节上表求和一致（7+7+5+3+6+3+1+3）。⚠️ 该求和只覆盖 2026-10-02
+  当时的 8 个子模块、35 端点，是**历史快照**；**端点求和的真值以本节上表下方那行为准**
+  （2026-10-05 增 `prod::process_design` 后为 9 个子模块 / 61 端点）
 - `t_shelf_process` 的 SQL 真源**只在** `prod::shelf_process::repo::ShelfProcessRepo`
   （6 个静态方法 = 平移 4 + 从 `prod::batch` / `prod::worker_pool` 各收 1 处）。
   故意保留 inline 的 3 处见 `docs/api/production/shelf-process-mapping.md#维护约定`

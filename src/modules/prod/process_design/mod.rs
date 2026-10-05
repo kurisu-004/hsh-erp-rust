@@ -1,8 +1,9 @@
 //! prod::process_design 子模块 —— 制定工序页的「待制定工序零件」列表
 //!
 //! 2026-10-05 新增：前端「制定工序」页从 part 域
-//! `GET /api/v2/parts?status=PENDING&limit=200` 切到本域
-//! `GET /api/v2/prod/process-design/parts`。
+//! `GET /api/v2/parts?status=PENDING`（前端**不传 `limit`**，落 part 域缺省 50）
+//! 切到本域 `GET /api/v2/prod/process-design/parts`（本域缺省 200、`clamp(1, 500)`，
+//! 详见 [`service`] 模块内 `DEFAULT_LIMIT` 的口径说明）。
 //!
 //! ## 为什么要在 prod 域另起端点
 //! part 域 `GET /parts` 在 service 层硬置 `part_only: true`
@@ -42,8 +43,8 @@
 //! ## 模块结构（与 `prod::programming` 平行）
 //! - `dto.rs` —— 入参（`ProcessDesignListQuery`，Query string）
 //! - `vo.rs` —— 出参（`ProcessDesignPartItemOut` / `ProcessDesignPartListOut`）
-//! - `repo.rs` —— SQL 真源（`ProcessDesignRepo` ZST + `list` / `count`，共用常量
-//!   [`WHERE_SKELETON`] 与 [`FROM_SQL`](repo.rs)）
+//! - `repo.rs` —— SQL 真源（`ProcessDesignRepo` ZST + `list` / `count`，共用 `repo`
+//!   模块内的 `FROM_SQL` 与 `WHERE_SKELETON` 两个私有常量）
 //! - `service.rs` —— 业务逻辑（角色守卫 + limit/offset clamp + row→vo 投影）
 //! - `handler.rs` —— HTTP 路由（只做参数提取 + `pool.acquire()` + `R::ok`）
 //!

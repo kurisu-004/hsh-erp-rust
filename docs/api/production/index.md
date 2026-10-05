@@ -144,7 +144,7 @@
 |---|---|---|---|---|
 | GET | `/api/v2/prod/process-design/parts` | Manager+Clerk+Inspector+CNC_PROGRAMMER | 待制定工序的零件列表（软删闸门 + `status = 'PENDING'` 闸门；**7 字段最小集**，**含装配件子件**） | [`process-design.md`](./process-design.md#get-apiv2prodprocess-designparts) |
 
-> 归属说明：前端「制定工序」页 2026-10-05 从 part 域 `GET /api/v2/parts?status=PENDING&limit=200`
+> 归属说明：前端「制定工序」页 2026-10-05 从 part 域 `GET /api/v2/parts?status=PENDING`
 > 切到本端点 —— 旧端点在 service 层硬置 `part_only: true`，repo 据此在 SQL 里加
 > `AND assembly_id IS NULL`，把**装配件的子零件全部排除**；本页需要所有还没定工序的零件，
 > 故新端点**刻意不加**该守卫。**part 域一行未改**，旧端点保留兼容。
@@ -265,7 +265,7 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 | 工人档案管理（**2026-10-04 菜单归属改为 `production_group`**） | `/production/worker-list` | （前端视图目录 `frontend/src/views/production/`） | `prod::worker` | [`workers.md`](./workers.md) |
 | （**前端 menuCode 待定 2026-09-29**） | `/production/pending-dispatch` | `ProductionPendingDispatchPage.vue`（**新前端页面 2026-09-29**） | `prod::batch` | [`batches.md`](./batches.md) |
 | （**前端 menuCode 待定 2026-10-01**） | 「待编程一览」页（沿用 part 域路由） | 待编程 tab（`has_cnc_program` 三态） | `prod::programming` | [`pending-programming.md`](./pending-programming.md)（口径：状态白名单闸门 + 三规则并集，与 part 域旧端点的差异见该页「过滤谓词」段） |
-| （**前端 menuCode 待定 2026-10-05**） | 「制定工序」页（沿用 part 域路由） | 待制定工序的零件列表（含装配件子件） | `prod::process_design` | [`process-design.md`](./process-design.md)（**刻意不加** `AND assembly_id IS NULL` 守卫，与 part 域 `GET /parts` 的核心差异见该页同名警示段） |
+| `part_process_chain`（2026-10-05 新增行：与上一行 `prod::process_chain` **共用同一 menuCode / 同一路由 / 同一页面** —— 两个后端子模块服务同一个前端页面，**不是两个菜单**，故 menuCode 列必然重复） | `/production/process-design`（同上） | `ProcessDesignView.vue`（同上；本端点供该页的零件列表用） | `prod::process_design` | [`process-design.md`](./process-design.md)（**刻意不加** `AND assembly_id IS NULL` 守卫，与 part 域 `GET /parts` 的核心差异见该页同名警示段） |
 
 > **2026-10-05 权限收紧**：`process_work_type` / `part_process_chain` / `worker_queue` 3 个 menuCode 的授权矩阵已收紧为下表（真源 = `seeds/menu.sql` 第 4 节白名单 + 4.7 回收段）：
 >
@@ -293,13 +293,13 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 
 ---
 
-## 端点约束（8 个子模块共享）
+## 端点约束（9 个子模块共享）
 
 - **i64 雪花 ID**：JSON 序列化为 `string`，避免 JS `Number.MAX_SAFE_INTEGER` 精度截断（详见 `shared::types`）
 - **乐观锁（OCC）**：表行 `version` 列；UPDATE 带 `WHERE id=$1 AND version=$2`，命中 0 行 → 40901 `VERSION_CONFLICT`
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → 2xxxx `_NOT_FOUND` 错误码
 - **事务边界在 handler**：handler `state.pool.begin()` → 传 `&mut tx` 给 service → 显式 `tx.commit()`；repo 用 `impl PgExecutor<'_>` 以同时接受 pool/conn/tx
-- **WS 广播在 commit 之后**：避免慢 WS 拖慢 HTTP 响应；本目录 8 个子模块内，
+- **WS 广播在 commit 之后**：避免慢 WS 拖慢 HTTP 响应；本目录 9 个子模块内，
   - `prod::worker_pool` —— 5 个 `WORKER_*` 事件（详见 [`worker-pool.md#ws-事件清单`](./worker-pool.md#ws-事件清单worker-pool-相关)）
   - `prod::batch` —— 1 个 `BATCH_PLACED_ON_SHELF` 事件（详见 [`batches.md` 事务 + WS 广播](./batches.md#事务--ws-广播沿-worker_pool-范本)）
   - `prod::programming` —— 纯读端点，**不发**任何 WS 事件

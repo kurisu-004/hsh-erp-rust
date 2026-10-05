@@ -26,12 +26,14 @@
 //! `tests/production/process_design.rs::assembly_child_parts_are_visible` 锁住该行为。
 //!
 //! ## list / count 共用谓词（从结构上杜绝漂移）
-//! 两个方法共用 [`FROM_SQL`] 与 [`WHERE_SKELETON`] 两个常量。part 域旧端点把同一段
+//! 两个方法共用 `FROM_SQL` 与 `WHERE_SKELETON` 两个私有常量。part 域旧端点把同一段
 //! 谓词手抄两遍（list 一份、count 一份），改一处漏一处就会让 `total` 与 `items`
 //! 对不上；本文件从结构上杜绝这种漂移。
 //!
-//! 刻意**不**引入 `SELECT_COLS` 之外的共享：count 只需行数，把 7 列投影塞进 count
-//! 会给每个待计数的 part 白跑一次无用列读取，故 [`SELECT_COLS`] 只被 `list` 引用。
+//! 刻意**不**引入 `SELECT_COLS` 之外的共享：`count` 只需行数，而把 7 列投影塞进
+//! `SELECT COUNT(*) FROM t_part p` 会因**缺 `GROUP BY` 直接 SQL 报错**（PG 要求非聚合列
+//! 必须出现在 `GROUP BY` 里，否则报 `column "p.id" must appear in the GROUP BY clause`），
+//! 故 `SELECT_COLS` 只被 `list` 引用。
 //!
 //! ## ⚠️ 排序是**字典序**不是数值序（2026-10-05 口径确认，**不是缺陷**）
 //! `serial_no` 是 `varchar(15)`，排序按字符比较：`F10` 排在 `F2` **前面**。
@@ -63,8 +65,9 @@ pub struct ProcessDesignRepo;
 
 /// list 专用的 SELECT 列表（7 列，与 [`ProcessDesignRow`] 一一对应）。
 ///
-/// 刻意**不**被 `count` 引用：`count` 只需 `COUNT(*)::bigint`，把投影塞进去会给每个
-/// 待计数的 part 白跑一次无用列读取（`t_part` 是本页最热的表）。
+/// 刻意**不**被 `count` 引用：`count` 只需 `COUNT(*)::bigint`，而这 7 列一旦出现在
+/// `SELECT COUNT(*)` 里，会因**缺 `GROUP BY` 直接 SQL 报错**（PG 要求非聚合列进
+/// `GROUP BY`）—— 是硬报错，不是「多读几列」的效率取舍。
 const SELECT_COLS: &str = "p.id, p.version, p.serial_no, p.name, p.drawing_no, \
      p.process_chain_id, p.assembly_id";
 
@@ -81,7 +84,11 @@ const WHERE_SKELETON: &str = " WHERE p.deleted_at IS NULL \
 /// 列表入参（service 层规范化后传入 repo）。
 ///
 /// 独立 struct，不污染其它域的 Filters 类型。
-#[derive(Debug, Clone, Default)]
+///
+/// ⚠️ 刻意**不** derive `Default`：全仓零调用点（service 层总是 3 字段全量显式构造），
+/// 且 `Default` 会造出 `limit: 0` 的实例，直接进 SQL 就是 `LIMIT 0` 返空列表 —— 比
+/// 「编译不过」难查得多。
+#[derive(Debug, Clone)]
 pub struct ProcessDesignFilters {
     pub sort_dir: Option<String>,
     pub limit: i64,
@@ -113,7 +120,7 @@ impl ProcessDesignRepo {
         Ok(rows)
     }
 
-    /// 列表配套 COUNT（与 `list` 共用 [`FROM_SQL`] 与 [`WHERE_SKELETON`]）。
+    /// 列表配套 COUNT（与 `list` 共用 `FROM_SQL` 与 `WHERE_SKELETON`）。
     ///
     /// 与 list 同谓词，故 `total` 必然等于「若不翻页能拿到的行数」。
     ///
@@ -151,7 +158,7 @@ fn order_dir(f: &ProcessDesignFilters) -> &'static str {
 /// `list` 的行结构（`FromRow`，手写而非 `query_as!` —— SQL 动态拼装）。
 ///
 /// 字段与 `vo::ProcessDesignPartItemOut` 一一对应（7 字段），alias 名与
-/// [`SELECT_COLS`] 的列名逐字对齐，否则 `FromRow` 取不到值。
+/// `SELECT_COLS` 的列名逐字对齐，否则 `FromRow` 取不到值。
 #[derive(Debug, Clone, FromRow)]
 pub struct ProcessDesignRow {
     pub id: i64,

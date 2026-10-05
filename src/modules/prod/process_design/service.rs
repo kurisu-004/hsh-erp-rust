@@ -26,7 +26,15 @@ use crate::shared::error::AppError;
 
 use super::dto::ProcessDesignListQuery;
 
-/// 默认分页大小（2026-10-05 新增，与前端现调 `GET /parts?limit=200` 的口径一致）。
+/// 默认分页大小（2026-10-05 新增）。
+///
+/// ⚠️ 依据**不是**「与前端现调口径一致」：前端 `usePartProcessDesign.ts::loadParts`
+/// 调的是 `listParts({ status: 'PENDING' })`，**不传 `limit`**，真正的前端口径是 part
+/// 域旧端点 `part/service/crud.rs` 的 `unwrap_or(50).clamp(1, 200)`
+/// （**缺省 50 / 封顶 200**）。本端点缺省 200、上限 {@link MAX_LIMIT} `clamp(1, 500)`
+/// （500 与 `prod::programming` 同值），比旧端点**更宽**：前端切端点后**首屏行数从 50
+/// 涨到 200** —— 这是预期契约后果（待制定工序的零件常超 50 条），不是 bug，量大时
+/// 前端按 `offset` 翻页。
 const DEFAULT_LIMIT: i64 = 200;
 
 /// 分页上限（service 层 clamp）。500 与 `prod::programming` 同值。

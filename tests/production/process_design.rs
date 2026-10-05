@@ -173,13 +173,11 @@ async fn assembly_child_parts_are_visible() {
 
     // 前提：fixture 的子件行确实是「PENDING + assembly_id 指向装配件 + 未挂工艺链」
     let (status, assembly_id, chain_id): (String, Option<i64>, Option<i64>) =
-        sqlx::query_as(
-            "SELECT status, assembly_id, process_chain_id FROM t_part WHERE id = $1",
-        )
-        .bind(ProcessDesignFixture::PART_CHILD)
-        .fetch_one(&pool)
-        .await
-        .expect("select 子件行");
+        sqlx::query_as("SELECT status, assembly_id, process_chain_id FROM t_part WHERE id = $1")
+            .bind(ProcessDesignFixture::PART_CHILD)
+            .fetch_one(&pool)
+            .await
+            .expect("select 子件行");
     assert_eq!(status, "PENDING", "前提：子件是 PENDING");
     assert_eq!(
         assembly_id,
@@ -234,12 +232,7 @@ async fn assembly_child_parts_are_visible() {
     // 避免后人误以为本端点与旧端点等价。
     let (pstatus, penv) = send(
         app.clone(),
-        json_request(
-            "GET",
-            "/parts?status=PENDING&limit=200",
-            None,
-            Some(&token),
-        ),
+        json_request("GET", "/parts?status=PENDING&limit=200", None, Some(&token)),
     )
     .await;
     assert_eq!(pstatus, StatusCode::OK, "GET /parts: {penv}");
@@ -316,17 +309,19 @@ async fn total_is_full_count_not_page_count() {
 
     // fixture 6 行 + 本例追加 3 行 = 9 行；用 limit=4 翻页
     for i in 0..3 {
-        insert_pending_part(&pool, fx.customer_id, Some(&format!("PD-EXTRA-{i:02}")), "extra")
-            .await;
+        insert_pending_part(
+            &pool,
+            fx.customer_id,
+            Some(&format!("PD-EXTRA-{i:02}")),
+            "extra",
+        )
+        .await;
     }
 
     let env = get_parts(&app, &token, "limit=4").await;
     assert_eq!(env["data"]["total"], 9, "total 应是全量 9 行: {env}");
     assert_eq!(
-        env["data"]["items"]
-            .as_array()
-            .expect("items")
-            .len(),
+        env["data"]["items"].as_array().expect("items").len(),
         4,
         "本页只该返 4 条（limit=4）: {env}"
     );
@@ -334,10 +329,7 @@ async fn total_is_full_count_not_page_count() {
     // 翻页后 total 不变（口径与 offset 无关）
     let page2 = get_parts(&app, &token, "limit=4&offset=4").await;
     assert_eq!(page2["data"]["total"], 9, "翻页后 total 仍应是 9: {page2}");
-    assert_eq!(
-        page2["data"]["offset"], 4,
-        "offset 回显: {page2}"
-    );
+    assert_eq!(page2["data"]["offset"], 4, "offset 回显: {page2}");
 
     // 不带 limit 时默认 200 → 全量返回，items 数 == total
     let all = get_parts(&app, &token, "").await;
@@ -375,10 +367,7 @@ async fn limit_offset_clamped() {
     let env = get_parts(&app, &token, "offset=-5").await;
     assert_eq!(env["data"]["offset"], 0, "offset=-5 → max 0: {env}");
     assert_eq!(
-        env["data"]["items"]
-            .as_array()
-            .expect("items")
-            .len(),
+        env["data"]["items"].as_array().expect("items").len(),
         EXPECTED_IDS.len(),
         "offset 归 0 → 返回全部 6 条: {env}"
     );
@@ -436,7 +425,11 @@ async fn sort_dir_desc_and_invalid_falls_back_to_asc() {
 
     // 小写也认（大小写不敏感）
     let lower = get_parts(&app, &token, "sort_dir=desc").await;
-    assert_eq!(rel(&lower), reversed, "sort_dir=desc（小写）应同样生效: {lower}");
+    assert_eq!(
+        rel(&lower),
+        reversed,
+        "sort_dir=desc（小写）应同样生效: {lower}"
+    );
 
     // 非法值退化为 ASC，不报错
     let garbage = get_parts(&app, &token, "sort_dir=garbage").await;
