@@ -26,6 +26,7 @@
 - [POST /api/v2/prod/batches/{batch_id}/to-process](#post-apiv2prodbatchesbatch_idto-process)
 - [POST /api/v2/prod/batches/worker-scan](#post-apiv2prodbatchesworker-scan)
 - [GET /api/v2/parts/by-serial/{serial_no}/part-batches](#get-apiv2partsby-serialserial_nopart-batches)
+  - [★ 扫码路径建议切至 prod 域（2026-10-05）](#-扫码路径建议切至-prod-域2026-10-05)
 - [GET /api/v2/prod/batches/inspection](#get-apiv2prodbatchesinspection)
 - [乐观锁（caller 侧 OCC）](#乐观锁caller-侧-occ)
 - [自动拆批（auto-split）](#自动拆批auto-split)
@@ -535,6 +536,45 @@ Response 200 `data`：`PartScanContextOut`
 - repo（part）：`src/modules/part/repo/sql/part_sql.rs::get_by_serial`
 - model：`src/modules/prod/batch/model.rs::TPartBatch`（批次行 + 状态枚举）
 
+#### ★ 扫码路径建议切至 prod 域（2026-10-05）
+
+**前端待品检页的扫码路径 ⏳ 建议切至**
+[`GET /api/v2/prod/inspection/scan/{serial_no}`](../production/inspection.md#get-apiv2prodinspectionscanserial_no)
+（`prod::inspection` 扫码查询），返回「装配件（可空）→ 全部子件 → 全部批次」三层树。
+完整契约（命中口径 / 两条必须记住的口径 / DTO 逐字段表 / 错误码）见
+[`../production/inspection.md`](../production/inspection.md)。
+
+> ⚠️ **前端尚未切换（2026-10-05，后端先上）**：`prod::inspection` 已在 prod 域上线，
+> 但**前端仓里的切换尚未合入**，故本端点当前**仍在被调用**。前端配套完成后本页两个
+> 端点即可下线调用（**后端端点保留兼容、一行未改**，不设下线日期）。
+>
+> **本页两个旧端点 `GET /api/v2/parts/by-serial/{serial_no}` 与
+> `GET /api/v2/parts/by-serial/{serial_no}/part-batches` 一律保留**，是否继续调用由
+> 前端决定 —— 「切过去」是前端待办，不是既成事实。
+
+建议切过去的理由（不是「旧端点坏了」，是**表达不了**）：
+
+| 维度 | 本页两个旧端点 | `prod::inspection` |
+|---|---|---|
+| 命中 | 只查 `t_part.serial_no`（扫装配件条码 → 404） | 先 `t_part`、未命中回退 `t_assembly` |
+| 装配件节点 | **不返回** | 返回（`assembly`，含 serial_no / 客户 / 状态） |
+| 兄弟子件 | **不展开** | `children` 是该装配件的**全部**子件 |
+| 批次层 | 只有批次 id / quantity / status / holder / version | 加 `location` / `current_holder_display` / `process_name` / `is_repairing` / `is_scanned` |
+| 命中标记 | 无 | `is_scanned`（前端据此高亮被扫中的那个） |
+
+⇒ 前端扫码弹窗要回答「这批货总共分了几批、哪些压在品检架上、每批能点什么动作」，
+单 part 上下文答不了；「一次取全 → 直接调 `POST /prod/batches/{batch_id}/to-ship`」
+的动作链在新端点上少一次往返。
+
+⚠️ **OCC 锚没变**（仍是 `t_part_batch.version`）：新端点的
+`ScanBatchOut.version` 承担 caller OCC，`ScanPartOut.version`（= `t_part.version`）仅
+展示。详见 [`../production/inspection.md#版本号分工前端最容易踩的一处`](../production/inspection.md#版本号分工前端最容易踩的一处)。
+
+> ⚠️ **两条口径不要在新端点上「修」**（它们是既定口径，不是缺陷）：
+> `process_name` 对 `INSPECTION` / `DELIVERED` 批次**恒为 `null`**（出池清
+> `current_process_id` 不变式的正确结果）；扫码树**读全部批次、不按状态过滤**（含
+> `COMPLETED` / `CANCELLED` 等终态，状态闸门在前端）。
+
 ---
 
 ### `GET /api/v2/prod/batches/inspection`
@@ -693,7 +733,18 @@ to-XXX 流共用的部分通过拆批语义。**所有 5 个单 / 批端点行�
 
 **前端的拆批后处理**：
 
-- 拿到非 null `new_batch_id` → 刷新批次列表（出现一行新批次 quantity = `batch.quantity - op_qty`）
+- 拿到非 null `new_batch_id` → **必须**刷新批次列表，刷新后应是**两行**：
+  - 响应里的 `new_batch_id`（**就是入参那个源批次的 id，id 不变**）是
+    **remainder**：quantity 原地减到 `batch.quantity - op_qty`、**仍留在源状态**，
+    且 `version` 已 +1（详见 [乐观锁](#乐观锁caller-侧-occ) 一节的拆批场景）；
+  - **拆出的新批次**是 operated 部分：quantity = `op_qty`、状态**已翻到目标状态**，
+    且它的 id **不在响应里** ⇒ 只能靠重新拉批次列表才看得到这一行。
+  - 2026-10-05 订正：原文写「新批次 quantity = `batch.quantity - op_qty`」是把
+    remainder 的终值安到了新批次头上，与上表「operated 部分（拆出的新批次，
+    quantity = op_qty）」自相矛盾。依据 `prod::batch::service::transition.rs`
+    的 `_split_for_partial_op` → `split_batch_for_partial_pass(..., op_qty, ...)`，
+    以及 `PartBatchRepo::_split_batch_inner` 的 INSERT `quantity = qty` /
+    源批次 `quantity -= qty`。
 - 拿到 null → 不需要刷新批次列表（仅 part.status 翻状态）
 
 **回滚语义**：拆批写入与 operated 批次状态翻转在同一事务；事务失败时拆出的新批次与状态翻转一并回滚，不会出现「拆了批但没翻转」的中间态。

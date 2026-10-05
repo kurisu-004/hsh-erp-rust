@@ -114,14 +114,17 @@ impl PartService {
             //     INSPECTION / READY_TO_SHIP 等各状态批次（返修中的批次按
             //     IN_PROCESS 一并返回）；
             //   - 而所有进 INSPECTION 的写点都按「出池 → `current_process_id = NULL`」
-            //     不变式把该列清空（`phase1::scan` / `outsource::
-            //     receive_to_inspection` / `repair::complete_repair` /
-            //     `mark_batch_inspected`）→ 直读会让 INSPECTION 批次的
-            //     `next_process_id` / `next_process_name` **恒为 null**。
+            //     不变式把该列清空（`BatchService::scan_inspect` /
+            //     `BatchService::receive_from_outsource_to_inspection` /
+            //     `BatchService::complete_repair` / `mark_batch_inspected`）→
+            //     直读会让 INSPECTION 批次的 `next_process_id` /
+            //     `next_process_name` **恒为 null**。
             //
             // 读取方分工（勿越界）：`current_process_id` 的读取方严格限定为 5 条
             // 工序池 SQL + `list_pickable_by_work_type` + rollup 派生；
-            // **展示类列表一律走 step 派生**。
+            // **展示类列表一律走 step 派生**。该清单目前登记了 4 个读点（3 条走
+            // step 派生 + 1 个有意例外），**第 4 个例外见
+            // `prod/batch/model.rs` 模块 doc 的读取方分工清单**。
             //
             // 2026-09-30 Phase 2（master 6be7531）：投影同时补齐 `b.part_id` /
             // `b.created_at` / `b.updated_at` / `b.current_process_step_id`（修复原

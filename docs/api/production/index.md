@@ -7,17 +7,17 @@
 >
 > 通用约定（响应信封 / 认证 / 角色 / 主键 / 错误码）见 [`../index.md`](../index.md)
 >
-> 范围：**生产管理**菜单（前端 `production_group` 一级 + `process_work_type` / `part_process_chain` / `pending_programming` / `worker_queue` / `inspection_pending` / **`workers_list`（2026-10-04 自权限管理 `auth_group` 迁入）** 子菜单）下挂的全部后端域。本目录按前端菜单 + 工人档案 + 待下发批次拆分 **9 个子页 + 1 个入口**（⚠️ 2026-10-02 订正：原写「7 个文件」，实为 9 个子页）。
+> 范围：**生产管理**菜单（前端 `production_group` 一级 + `process_work_type` / `part_process_chain` / `pending_programming` / `worker_queue` / `inspection_pending` / **`workers_list`（2026-10-04 自权限管理 `auth_group` 迁入）** 子菜单）下挂的全部后端域。本目录按前端菜单 + 工人档案 + 待下发批次拆分 **11 个子页 + 1 个入口**（⚠️ 2026-10-05：子页增 `inspection.md` 10 → 11；本处原写「9 → 10」系继承自 master 的 off-by-one —— 计数不含 `index.md` 自身，2026-10-05 实测目录 12 个文件 / 11 个子页，一并订正）。
 >
 > 实施阶段：part-worker-pool-federated-rocket（2026-09-11 起），整合自 settings/process_chain/worker_pool 三批 PR，2026-09-12 落盘为 production/ 子目录。2026-09-19 prod 容器聚合：worker / work_type / process / process_chain / worker_pool 五个支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias；工人档案 worker（7 端点）一并并入。2026-09-29 新增 `prod::batch`（车间 PENDING 待下发批次列表 + 单条 / 批量 / 自动下发 4 端点，URL `/api/v2/prod/batches/*`）。2026-09-30 prod 域 9 端点重构：worker-pool → pool 路径收敛（`/pool/*` 单 nest，5 端点；新增通用 move 取代 assign+remove；移除 admin nest）；batches dispatch 统一 bulk-only（`/dispatch` 单端点，`targets` 数组；移除 bulk-dispatch）；auto-dispatch 改为只读 preview。2026-10-01 新增 `prod::programming`（待编程一览 1 只读端点，URL `/api/v2/prod/programming/pending`，part 状态白名单闸门 + 三规则并集口径；前端「待编程一览」页从 part 域 `GET /api/v2/parts/pending-programming` 切过来，part 域旧端点保留兼容）。2026-10-02 新增 `prod::shelf_process`（货架 ↔ 工序映射 `t_shelf_process` 3 端点，URL `/api/v2/prod/shelf-processes/*`）：自 `src/modules/shelf/process_mapping/` 整体搬入 prod 域，旧路径 `GET|POST /api/v2/shelves/{id}/processes` + `GET /api/v2/shelves/processes` **404（无 alias）**，请求 / 响应契约逐字不变。**前端配套改动不止改 URL，清单见 [`shelf-process-mapping.md#前端配套改动清单`](./shelf-process-mapping.md#前端配套改动清单)**（3 个 URL + `account_count` 出参删除引发的 4 处 Zod/类型/表格落点 + **C 节：`ShelfList.vue` 按 zone 收敛映射编辑区，2026-10-04 新增、⏳ 待前端处理**）。
 
 ## 目录
 
-> **导航**：[**`index.md`**](./index.md) · [`work-types.md`](./work-types.md) · [`processes.md`](./processes.md) · [`work-type-process-mapping.md`](./work-type-process-mapping.md) · [`process-chain.md`](./process-chain.md) · [`shelf-process-mapping.md`](./shelf-process-mapping.md) · [`worker-pool.md`](./worker-pool.md) · [`workers.md`](./workers.md) · [`batches.md`](./batches.md) · [`pending-programming.md`](./pending-programming.md) · [`process-design.md`](./process-design.md)
+> **导航**：[**`index.md`**](./index.md) · [`work-types.md`](./work-types.md) · [`processes.md`](./processes.md) · [`work-type-process-mapping.md`](./work-type-process-mapping.md) · [`process-chain.md`](./process-chain.md) · [`shelf-process-mapping.md`](./shelf-process-mapping.md) · [`worker-pool.md`](./worker-pool.md) · [`workers.md`](./workers.md) · [`batches.md`](./batches.md) · [`pending-programming.md`](./pending-programming.md) · [`process-design.md`](./process-design.md) · [`inspection.md`](./inspection.md)
 
 ---
 
-## 端点列表（61 个 = 7 worker + 7 工种 + 5 工序 + 3 工艺链 + 6 pool + 28 batch + 1 programming + 3 货架映射 + 1 process_design）
+## 端点列表（62 个 = 7 worker + 7 工种 + 5 工序 + 3 工艺链 + 6 pool + 28 batch + 1 programming + 3 货架映射 + 1 process_design + 1 inspection）
 
 > 2026-09-19 prod 聚合：原 19 端点 + worker 7 端点（详见 [`workers.md`](./workers.md)）+ worker_pool 的 admin/assign 1 端点。2026-09-29 新增 4 端点（详见 [`batches.md`](./batches.md)）：1 个 PENDING 列表 + 3 个下发（单条 / 批量 / 自动）。
 > 2026-09-30 prod 域 9 端点重构（worker-pool + batches 合并）：
@@ -34,6 +34,8 @@
 > 制定工序页零件列表 → 60 → **61** 端点（+1）。谓词是 `deleted_at IS NULL AND status = 'PENDING'`，
 > **刻意不加** `AND assembly_id IS NULL` 守卫（part 域 `GET /parts` 带 `part_only: true` 会把
 > 装配件子件全部排除），故装配件子件在本页可见。
+> 2026-10-05 再增 1 端点（详见 [`inspection.md`](./inspection.md)）：`prod::inspection`
+> 扫码查询（装配件 → 全部子件 → 全部批次 三层树）→ 61 → **62** 端点（+1）。
 
 ### worker / work_type / process 主数据（17 端点）
 
@@ -153,6 +155,22 @@
 > ⚠️ 排序键固定 `serial_no`，是**字典序**（`F1001-10` 在 `F1001-2` 前）；`NULLS LAST`
 > 在两个方向都显式写死。两处口径都不是缺陷，勿当 bug 改。
 
+### 扫码上下文（1 端点，2026-10-05 新增）
+
+| Method | Path | 权限 | 说明 | 详情 |
+|---|---|---|---|---|
+| GET | `/api/v2/prod/inspection/scan/{serial_no}` | Manager+Inspector | 扫码查询：返回「装配件（可空）→ 全部子件 → 全部批次」三层树。命中口径先 `t_part.serial_no`、未命中回退 `t_assembly.serial_no`，都未命中 → 20101 / 404；**读全部批次不按状态过滤**；`process_name` 对 `INSPECTION` / `DELIVERED` 恒 `null` | [`inspection.md`](./inspection.md#get-apiv2prodinspectionscanserial_no) |
+
+> 归属说明：前端待品检页的扫码路径 ⏳ **建议**从 part 域
+> `GET /api/v2/parts/by-serial/{serial_no}`（+ `/part-batches`）切到本端点（**切换
+> 尚未在前端仓合入**，2026-10-05 后端先上）—— 旧两个
+> 端点都是**单 part 上下文**，既不返回装配件节点、也不展开兄弟子件，无法支撑扫码弹窗
+> 「一次取全 + 直接调 to-ship / to-process」的动作链。**part 域一行未改**，旧端点保留
+> 兼容、当前**仍在被调用**。
+> ⚠️ 本端点 `ScanBatchOut.version` 是 `t_part_batch.version`（**OCC 锚**），
+> `ScanPartOut.version` 是 `t_part.version`（仅展示）—— 两者不许混用，详见
+> [`inspection.md#版本号分工前端最容易踩的一处`](./inspection.md#版本号分工前端最容易踩的一处)。
+
 ---
 
 ## 生产全流程端点地图
@@ -266,6 +284,7 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 | （**前端 menuCode 待定 2026-09-29**） | `/production/pending-dispatch` | `ProductionPendingDispatchPage.vue`（**新前端页面 2026-09-29**） | `prod::batch` | [`batches.md`](./batches.md) |
 | （**前端 menuCode 待定 2026-10-01**） | 「待编程一览」页（沿用 part 域路由） | 待编程 tab（`has_cnc_program` 三态） | `prod::programming` | [`pending-programming.md`](./pending-programming.md)（口径：状态白名单闸门 + 三规则并集，与 part 域旧端点的差异见该页「过滤谓词」段） |
 | `part_process_chain`（2026-10-05 新增行：与上一行 `prod::process_chain` **共用同一 menuCode / 同一路由 / 同一页面** —— 两个后端子模块服务同一个前端页面，**不是两个菜单**，故 menuCode 列必然重复） | `/production/process-design`（同上） | `ProcessDesignView.vue`（同上；本端点供该页的零件列表用） | `prod::process_design` | [`process-design.md`](./process-design.md)（**刻意不加** `AND assembly_id IS NULL` 守卫，与 part 域 `GET /parts` 的核心差异见该页同名警示段） |
+| `inspection_pending` 待品检（**2026-10-05 新增行**） | （待品检页） | （扫码弹窗组件） | `prod::inspection` | [`inspection.md`](./inspection.md)（扫码查询三层树；本域的**只读**端点，与同页的 `prod::batch` 集合读 [`GET /prod/batches/inspection`](./inspection.md#端点列表) 互补：后者给队列列表，本端点给单个码的上下文） |
 
 > **2026-10-05 权限收紧**：`process_work_type` / `part_process_chain` / `worker_queue` 3 个 menuCode 的授权矩阵已收紧为下表（真源 = `seeds/menu.sql` 第 4 节白名单 + 4.7 回收段）：
 >
@@ -293,18 +312,19 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 
 ---
 
-## 端点约束（9 个子模块共享）
+## 端点约束（10 个子模块共享）
 
 - **i64 雪花 ID**：JSON 序列化为 `string`，避免 JS `Number.MAX_SAFE_INTEGER` 精度截断（详见 `shared::types`）
 - **乐观锁（OCC）**：表行 `version` 列；UPDATE 带 `WHERE id=$1 AND version=$2`，命中 0 行 → 40901 `VERSION_CONFLICT`
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → 2xxxx `_NOT_FOUND` 错误码
-- **事务边界在 handler**：handler `state.pool.begin()` → 传 `&mut tx` 给 service → 显式 `tx.commit()`；repo 用 `impl PgExecutor<'_>` 以同时接受 pool/conn/tx
-- **WS 广播在 commit 之后**：避免慢 WS 拖慢 HTTP 响应；本目录 9 个子模块内，
+- **事务边界在 handler**：写端点 handler `state.pool.begin()` → 传 `&mut tx` 给 service → 显式 `tx.commit()`；repo 用 `impl PgExecutor<'_>` 以同时接受 pool/conn/tx。**纯读端点例外**：`pool.acquire()` 不开事务，service 借 `&mut PgConnection` 跑查询、连接用完即 drop（本目录的 `prod::programming` / `prod::process_design` / `prod::inspection` 3 个只读端点都是这一形态）
+- **WS 广播在 commit 之后**：避免慢 WS 拖慢 HTTP 响应；本目录 10 个子模块内，
   - `prod::worker_pool` —— 5 个 `WORKER_*` 事件（详见 [`worker-pool.md#ws-事件清单`](./worker-pool.md#ws-事件清单worker-pool-相关)）
   - `prod::batch` —— 1 个 `BATCH_PLACED_ON_SHELF` 事件（详见 [`batches.md` 事务 + WS 广播](./batches.md#事务--ws-广播沿-worker_pool-范本)）
   - `prod::programming` —— 纯读端点，**不发**任何 WS 事件
   - `prod::shelf_process` —— 3 端点（1 写 2 读），**不发**任何 WS 事件
   - `prod::process_design` —— 纯读端点，**不发**任何 WS 事件
+  - `prod::inspection` —— 纯读端点（且不开事务），**不发**任何 WS 事件
 
 ---
 
@@ -341,12 +361,13 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 - ✅ **`prod::shelf_process`**（2026-10-02 新增）：货架 ↔ 工序映射 3 端点（全集查询 / 单架查询 / 整组替换），`t_shelf_process` SQL 真源收口到 `ShelfProcessRepo`（6 个静态方法：平移 4 + 从 `prod::batch` / `prod::worker_pool` 各收 1 处）；URL `/api/v2/prod/shelf-processes/*`，旧路径 404 无 alias；零 schema 变更；集成测试 `tests/production/shelf_process.rs` **4 场景**
 - ✅ **菜单整合**：migration 018 建 `production_group` + `part_process_chain` + 迁移 `worker_queue`；migration 021 软删 settings_root + 3 子菜单 + 新增 `process_work_type`（2026-09-12）
 - ✅ **`prod::process_design`**（2026-10-05 新增）：制定工序页零件列表 1 只读端点（软删闸门 + `status='PENDING'` 闸门；7 字段最小集；**刻意不加** `AND assembly_id IS NULL` 守卫故含装配件子件；入参只有 `sort_dir` / `limit` / `offset` 三个；`limit` / `offset` 空串走缺省 + `clamp(1,500)` / `max(0)`；排序键固定 `serial_no` 字典序 + 两方向 `NULLS LAST`；角色 Manager+Clerk+Inspector+CNC_PROGRAMMER），URL `/api/v2/prod/process-design/parts`；零 schema 变更、`.sqlx/` 零变更；集成测试 `tests/production/process_design.rs` **8 场景**
-- ✅ **API 文档整合**：本目录（2026-09-12；2026-09-29 增 `batches.md`；2026-09-30 增 move + 重构 pool/batches；2026-10-01 增 `pending-programming.md`；2026-10-02 增 `shelf-process-mapping.md`）
+- ✅ **`prod::inspection`**（2026-10-05 新增）：扫码查询 1 只读端点（「装配件（可空）→ 全部子件 → 全部批次」三层树；命中口径先 `t_part.serial_no`、未命中回退 `t_assembly.serial_no`，都未命中 → `20101` / 404，`serial_no` trim 后为空同样按未命中；软删闸门覆盖 part / assembly / batch 三表；**读全部批次不按状态过滤**含终态；`process_name` 走 `current_process_id` 权威列，故 `INSPECTION` / `DELIVERED` 恒 `null`；`is_scanned` 是唯一内存派生字段（`t_part_batch` 无序列号列）；批次层一条 SQL `part_id = ANY($1)` 取回整棵树、无 N+1；角色 Manager+Inspector），URL `/api/v2/prod/inspection/scan/{serial_no}`；零 schema 变更；集成测试 `tests/production/inspection.rs` **13 场景**
+- ✅ **API 文档整合**：本目录（2026-09-12；2026-09-29 增 `batches.md`；2026-09-30 增 move + 重构 pool/batches；2026-10-01 增 `pending-programming.md`；2026-10-02 增 `shelf-process-mapping.md`；2026-10-05 增 `process-design.md` + `inspection.md`）
 - ✅ **prod 容器聚合**（2026-09-19）：5 支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步
 
 ## 参考
 
-- 集成测试：`tests/work_type_api.rs` / `tests/work_type_process_mapping_api.rs` / `tests/process_api.rs` / `tests/process_chain_api.rs` / `tests/worker_pool_api.rs` / `tests/worker_pool_auto_allocate_api.rs` / `tests/worker_api.rs` / `tests/worker_shelf_deactivate_api.rs` / `tests/production/batch.rs`（2026-09-29 新增）/ `tests/production/pending_programming.rs`（2026-10-01 新增）/ `tests/production/shelf_process.rs`（2026-10-02 新增）/ `tests/production/process_design.rs`（2026-10-05 新增）
+- 集成测试：`tests/work_type_api.rs` / `tests/work_type_process_mapping_api.rs` / `tests/process_api.rs` / `tests/process_chain_api.rs` / `tests/worker_pool_api.rs` / `tests/worker_pool_auto_allocate_api.rs` / `tests/worker_api.rs` / `tests/worker_shelf_deactivate_api.rs` / `tests/production/batch.rs`（2026-09-29 新增）/ `tests/production/pending_programming.rs`（2026-10-01 新增）/ `tests/production/shelf_process.rs`（2026-10-02 新增）/ `tests/production/process_design.rs`（2026-10-05 新增）/ `tests/production/inspection.rs`（2026-10-05 新增）
 - 模块 README：见各子模块顶层
 - 错误码：`src/shared/error.rs::code`
 - 前端模块文档：`frontend/docs/03-modules/production/README.md`

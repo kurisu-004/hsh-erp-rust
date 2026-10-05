@@ -23,10 +23,13 @@
 //! - process_design.rs         ← 2026-10-05 新增（prod::process_design 制定工序页零件
 //!   列表 1 端点，8 场景；★ 核心回归是「装配件子件可见」，锁死不加
 //!   `AND assembly_id IS NULL` 守卫）
+//! - inspection.rs            ← 2026-10-05 新增（prod::inspection 扫码查询 1 端点，
+//!   13 场景；★ 核心回归是「扫子件 → 返回整棵装配件树（全部子件 + 全部批次）」）
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
 mod batch;
+mod inspection;
 mod pending_programming;
 mod pickup;
 mod process;
