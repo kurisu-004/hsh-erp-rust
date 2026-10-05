@@ -1,0 +1,131 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                b.id AS \"id!\",\n                b.part_id AS \"part_id!\",\n                b.batch_no AS \"batch_no!\",\n                b.quantity AS \"quantity!\",\n                b.status AS \"status!\",\n                b.version AS \"version!\",\n                b.is_repairing AS \"is_repairing!\",\n                b.location AS \"location?\",\n                COALESCE(s.name, w.name, oc.name) AS \"current_holder_display?\",\n                pr.name AS \"process_name?\"\n            FROM t_part_batch b\n            LEFT JOIN t_shelf s ON s.id = b.current_holder_id\n            LEFT JOIN t_worker w ON w.id = b.current_holder_id\n            LEFT JOIN t_outsource_company oc ON oc.id = b.current_holder_id\n            LEFT JOIN t_process pr ON pr.id = b.current_process_id\n            WHERE b.part_id = ANY($1)\n              AND b.deleted_at IS NULL\n            ORDER BY b.part_id ASC, b.batch_no ASC, b.id ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "part_id!",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "part_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "batch_no!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "batch_no"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "quantity!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "status!",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "is_repairing!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "is_repairing"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "location?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_part_batch",
+            "name": "location"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "current_holder_display?",
+        "type_info": "Varchar",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "process_name?",
+        "type_info": "Varchar",
+        "origin": {
+          "Table": {
+            "table": "t_process",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8Array"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null,
+      false
+    ]
+  },
+  "hash": "008dd045f5be5bd5e4ba33acb37e5b24ee0e6f1b49649ddef63d902bbbcec281"
+}

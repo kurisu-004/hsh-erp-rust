@@ -45,6 +45,15 @@
 //! 2026-10-01 `prod::programming` 的先例下沉到 prod 域。part 域旧端点**保留兼容、
 //! 一行未改**。
 //!
+//! 2026-10-05 新增 `prod::inspection` 子模块（扫码查询，1 端点，URL 挂
+//! `/api/v2/prod/inspection/scan/{serial_no}`）：返回「装配件（可空）→ 全部子件
+//! → 全部批次」三层树，供前端扫码弹窗一次取全。命中口径是**先查 `t_part.serial_no`、
+//! 未命中再查 `t_assembly.serial_no`**（子件码与父件码值域不同形，两表各自对活跃
+//! 行有唯一索引），都未命中返 20101 / HTTP 404。扫子件与扫父装配件返回的是
+//! **同一棵树**（`hit_kind` 区分）。角色 Manager + Inspector，与
+//! `GET /prod/batches/inspection` 及三个 `to-XXX` 写端点同组。零 schema 变更。
+//! part 域 `GET /parts/by-serial/{serial_no}` **保留兼容、一行未改**。
+//!
 //! `t_part_batch`（批次）是生产执行单元，**归 prod 域**：它的 repo / model /
 //! `status_gate` 状态写入口与 25 条批次路由（`worker-scan` / `pick-up` / `to-*` /
 //! `complete` / `split` / `cancel` / `scan-inspect` / 3 条集合读）整体在本域
@@ -66,6 +75,7 @@ use axum::Router;
 use crate::state::AppState;
 
 pub mod batch;
+pub mod inspection;
 pub mod process;
 pub mod process_chain;
 pub mod process_design;
@@ -90,6 +100,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/programming", programming::router())
         // 2026-10-05 新增：prod::process_design（制定工序页零件列表，含装配件子件）
         .nest("/process-design", process_design::router())
+        // 2026-10-05 新增：prod::inspection（扫码查询：装配件 → 子件 → 批次 三层树）
+        .nest("/inspection", inspection::router())
         // 2026-10-02 新增：prod::shelf_process（货架 ↔ 工序映射，3 端点，自 shelf 域硬切）
         .nest("/shelf-processes", shelf_process::router())
 }
