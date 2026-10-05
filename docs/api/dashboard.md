@@ -5,15 +5,6 @@
 
 通用响应信封 / 认证 / 角色 / 主键 / 错误码见 [`./index.md`](./index.md)（待补）。
 
-<!-- 同步检查清单（review 时逐项核对）：
-  1. handler.rs 的 2 个 handler 路径与方法
-  2. dto.rs::DeliveryBasis 枚举变体
-  3. vo/snapshot.rs 的 4 个 snapshot 子结构 + 3 个 WS 信封
-  4. service::DashboardService::build_snapshot_with_workers 形参
-  5. shared/error.rs 的 UNAUTHORIZED / SESSION_REVOKED / INTERNAL 错误码
-  6. infra/config.rs 的 WS_HEARTBEAT_INTERVAL_SECONDS 等 4 项 env
--->
-
 ## 端点总览
 
 | 方法 | 路径 | 一句话 | 权限 |
@@ -302,23 +293,3 @@ HTTP request
 
 > `WsEvent::DashboardSnapshot` 当前**无**业务方主动广播——快照由客户端在
 > WS 握手时拉取 + 在 HTTP 端点首屏拉取；服务端不主动重推。
-
----
-
-## 版本与变更日志
-
-- **2026-09-15**：`GET /ws/dashboard` takeover-fill（接手 v1 Python 端 WS）；WS 走
-  `verify_session_token`（不走 HTTP middleware）；
-- **2026-09-22**：dashboard 域对齐 iam 事务分层范式（Group E 重构），拆
-  `repo/` + `service/{mod,snapshot}.rs`，handler 三形态 ①；
-- **2026-09-28**：新增 HTTP 端点 `GET /api/v2/dashboard/snapshot`（前端走
-  「HTTP 首取 + WS 事件 invalidate」模式）；
-- **2026-09-30**：HTTP 端点新增 `?upcoming_days=` query 形参（默认 14，`clamp(1, 60)`）；
-  `BatchLite.next_process_id` 改直读 `t_part_batch.current_process_id`（migration 004）；
-  `upcoming_delivery[].by_status` 按状态细分（BTreeMap 保 key 顺序）；
-- **2026-10-01**：WS 健壮性加固 4 项（B1 `Lagged` 不静默 / B2 补 Close 帧 /
-  B3 接真连接表 / B4 协议层 Ping + pong 超时 + 周期 re-auth）；
-- **2026-10-02**：WS review 2 轮修复（re-auth 失败原因分流 / `select!` 分支顺序
-  / `close_with` 加超时护栏 / 写侧失败路径裸 break）；
-- **2026-10-04**：HTTP 端点新增 `?basis=` query 形参（`planned` / `system`，
-  缺省 `planned`）；WS 路径恒传 `None` → `Planned`。
