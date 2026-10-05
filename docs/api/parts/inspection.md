@@ -26,6 +26,7 @@
 - [POST /api/v2/prod/batches/{batch_id}/to-process](#post-apiv2prodbatchesbatch_idto-process)
 - [POST /api/v2/prod/batches/worker-scan](#post-apiv2prodbatchesworker-scan)
 - [GET /api/v2/parts/by-serial/{serial_no}/part-batches](#get-apiv2partsby-serialserial_nopart-batches)
+  - [★ 扫码路径已切至 prod 域（2026-10-05）](#-扫码路径已切至-prod-域2026-10-05)
 - [GET /api/v2/prod/batches/inspection](#get-apiv2prodbatchesinspection)
 - [乐观锁（caller 侧 OCC）](#乐观锁caller-侧-occ)
 - [自动拆批（auto-split）](#自动拆批auto-split)
@@ -534,6 +535,39 @@ Response 200 `data`：`PartScanContextOut`
 - repo（批次 + holder 名称）：`src/modules/prod/batch/repo/queries.rs::list_active_by_part_id_with_holder`，LEFT JOIN `t_worker` / `t_shelf` 拼 holder_name
 - repo（part）：`src/modules/part/repo/sql/part_sql.rs::get_by_serial`
 - model：`src/modules/prod/batch/model.rs::TPartBatch`（批次行 + 状态枚举）
+
+#### ★ 扫码路径已切至 prod 域（2026-10-05）
+
+**前端待品检页的扫码路径已切至** [`GET /api/v2/prod/inspection/scan/{serial_no}`](../production/inspection.md#get-apiv2prodinspectionscanserial_no)
+（`prod::inspection` 扫码查询），返回「装配件（可空）→ 全部子件 → 全部批次」三层树。
+完整契约（命中口径 / 两条必须记住的口径 / DTO 逐字段表 / 错误码）见
+[`../production/inspection.md`](../production/inspection.md)。
+
+**本页 `GET /api/v2/parts/by-serial/{serial_no}/part-batches` 端点保留，但本页不再调用。**
+`part` 域另一端点 `GET /api/v2/parts/by-serial/{serial_no}` 同样保留兼容、**一行未改**。
+
+切过去的理由（不是「旧端点坏了」，是**表达不了**）：
+
+| 维度 | 本页两个旧端点 | `prod::inspection` |
+|---|---|---|
+| 命中 | 只查 `t_part.serial_no`（扫装配件条码 → 404） | 先 `t_part`、未命中回退 `t_assembly` |
+| 装配件节点 | **不返回** | 返回（`assembly`，含 serial_no / 客户 / 状态） |
+| 兄弟子件 | **不展开** | `children` 是该装配件的**全部**子件 |
+| 批次层 | 只有批次 id / quantity / status / holder / version | 加 `location` / `current_holder_display` / `process_name` / `is_repairing` / `is_scanned` |
+| 命中标记 | 无 | `is_scanned`（前端据此高亮被扫中的那个） |
+
+⇒ 前端扫码弹窗要回答「这批货总共分了几批、哪些压在品检架上、每批能点什么动作」，
+单 part 上下文答不了；「一次取全 → 直接调 `POST /prod/batches/{batch_id}/to-ship`」
+的动作链在新端点上少一次往返。
+
+⚠️ **OCC 锚没变**（仍是 `t_part_batch.version`）：新端点的
+`ScanBatchOut.version` 承担 caller OCC，`ScanPartOut.version`（= `t_part.version`）仅
+展示。详见 [`../production/inspection.md#版本号分工前端最容易踩的一处`](../production/inspection.md#版本号分工前端最容易踩的一处)。
+
+> ⚠️ **两条口径不要在新端点上「修」**（它们是既定口径，不是缺陷）：
+> `process_name` 对 `INSPECTION` / `DELIVERED` 批次**恒为 `null`**（出池清
+> `current_process_id` 不变式的正确结果）；扫码树**读全部批次、不按状态过滤**（含
+> `COMPLETED` / `CANCELLED` 等终态，状态闸门在前端）。
 
 ---
 

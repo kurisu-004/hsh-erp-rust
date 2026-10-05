@@ -9,7 +9,8 @@
 //! （tests/user_repo/ 4 sub-file 复用）；2026-09-24 PR13 Phase I 末段新增
 //! 10 个单文件 binary 子模块（applicant / customer / dashboard_ws / _e2e /
 //! cnc_program / auto_complete / guard_dn_in_use / idempotency / cos_opendal
-//! / cos_real_smoke）。
+//! / cos_real_smoke）。2026-10-05 新增 `inspection` 子模块（prod::inspection
+//! 扫码端点 1 端点，服务 tests/production/inspection.rs）。
 //!
 //! ## 子模块命名约定
 //! - 每个子文件名 = 对应 binary 名（如 `part.rs` 服务 `cargo nextest run --filter-binary part`）
@@ -35,6 +36,7 @@ pub mod delivery;
 pub mod guard_dn_in_use;
 pub mod iam;
 pub mod idempotency;
+pub mod inspection;
 pub mod outsource;
 pub mod part;
 pub mod process_chain;
@@ -57,6 +59,7 @@ pub use delivery::*;
 pub use guard_dn_in_use::*;
 pub use iam::*;
 pub use idempotency::*;
+pub use inspection::*;
 pub use outsource::*;
 pub use part::*;
 pub use process_chain::*;
