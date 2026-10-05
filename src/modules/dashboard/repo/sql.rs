@@ -1,11 +1,8 @@
-//! dashboard 域数据访问（SQL 真源，零 diff 搬迁自 `service.rs`）
-//!
-//! 对应 Python myERP/repository/*（dashboard 聚合 SQL 散落多表 JOIN，无单仓文件）。
+//! dashboard 域数据访问（SQL 真源）
 //!
 //! ## 约定
 //! - 全走运行时 `sqlx::query` / `sqlx::query_as`（与 statistics 域同 pattern，
 //!   不依赖 query! 宏离线缓存——dashboard 聚合 SQL 字段多、不进 `.sqlx/`）
-//! - 所有 SQL 字符串零 diff 从原 `service.rs` 全文搬迁（2026-09-22 Group E 重构）
 //!
 //! ## 多表 JOIN 聚合方法签名
 //! dashboard 4 个聚合方法（`snapshot_*`）每个内部包含 1~5 条 SQL，故签名收
@@ -28,17 +25,14 @@ use crate::modules::dashboard::vo::UpcomingDeliveryBucket;
 
 /// t_part_batch + t_part JOIN 行精简（dashboard 聚合专用，无完整表行）
 ///
-/// 2026-09-15 review 修：原 `BatchLite` 缺 `batch_no` 字段导致 DTO 永远为 None。
-/// 本结构从原 service.rs 全量平移，2026-09-22 重构不破坏契约。
+/// 字段名 `next_process_id` 保持不变（`BatchLite` 是 repo 内部结构，
+/// dashboard VO 侧字段名同步不动）——其值 2026-09-30 起改直读
+/// `t_part_batch.current_process_id`（migration 004）。
 #[derive(Debug, Clone)]
 pub struct BatchLite {
     pub batch_id: i64,
     pub batch_no: Option<i32>,
     pub holder_id: Option<i64>,
-    /// 2026-09-30：取值来源改为直读 `t_part_batch.current_process_id`
-    /// （migration 004），不再是 `t_process_chain_step.process_id` JOIN 的
-    /// 中转结果。**字段名 `next_process_id` 保持不变**（`BatchLite` 是
-    /// repo 内部结构，dashboard VO 侧字段名同步不动）。
     pub next_process_id: Option<i64>,
 }
 

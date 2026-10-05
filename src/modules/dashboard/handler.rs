@@ -104,13 +104,6 @@
 //! 基础设施失败 / pong 超时）、`1012`（服务重启）、`4001`（re-auth 鉴权失败）、
 //! `4003`（慢消费方）。`1001` 自 Minor-3 起**无路径发出**。详见
 //! `docs/api/websocket.md`「连接关闭码」。
-//!
-//! ## 2026-09-22 Group E 重构：handler 三形态 ①（snapshot 单次只读聚合）
-//! `build_snapshot_msg` 走 `state.pool.begin() → state.dashboard_service.build_snapshot_with_workers(&mut *tx, None, None, None) → tx.commit()`
-//! 路径，commit 即结束（WS 协议不依赖 tx，handler 内已完成全部 DB 读取）。后续 ws_hub.broadcast
-//! 是订阅事件模式，不再走 service、不开 tx。
-//!
-//! 详见本文件 module-level doc + `service/mod.rs`。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -164,13 +157,11 @@ pub struct WsQuery {
 
 /// `GET /api/v2/dashboard/snapshot` 的 query 入参（2026-09-30 新增）。
 ///
-/// - `upcoming_days`：未来 N 天交付分桶的天数；None / 缺省 = 14（service 层兜底）；
-///   业务取值范围 1..=60（service 层 `clamp` 防御恶意大数）。
-/// - 字段解析走 `deserialize_i64_opt`：None 表示缺省，Some(str) parse 为 i64；
-///   非数字字符串会返 4xx（axum Query 反序列化错误）——与仓内 part 域 DTO 一致。
-/// - `basis`（2026-10-04 新增）：`upcoming_delivery[]` 分桶的交期口径
-///   （`planned` / `system`），None / 缺省 = `planned`（service 层兜底）；
-///   非法取值由 axum `Query` 反序列化直接 4xx，不自写错误码。
+/// 形参 `upcoming_days` / `basis` 语义见
+/// `service/snapshot.rs::build_snapshot_with_workers` / `dto.rs::DeliveryBasis`。
+/// `upcoming_days` 字段解析走 `deserialize_i64_opt`：None 表示缺省，
+/// Some(str) parse 为 i64；非数字字符串返 4xx（axum Query 反序列化错误）——
+/// 与仓内 part 域 DTO 一致。
 #[derive(Debug, Default, Deserialize)]
 pub struct SnapshotQuery {
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
@@ -203,7 +194,7 @@ pub async fn ws_dashboard(
     // WS 端点不持久化 token，仅丢弃 jti（与 HTTP middleware 同源）。
     let (user, _jti) = verify_session_token(&state, token).await?;
     // 2026-09-20 修改：username 写日志，便于按用户名排查连接异常；当前端点任意已登录即可，
-    // 故不调用 user.require_role(...)。未来若加「仅 MANAGER 可见」再启用 require_role 守卫。
+    // 故不调用 user.require_role(...)。
     info!(user_id = user.id, username = %user.username, "ws dashboard: 鉴权通过");
     let user_id = user.id;
     // 2026-10-01 新增：`username` 进连接表（`ws_hub.register_conn` 元信息，日志可定位到人）；
@@ -230,14 +221,8 @@ pub async fn ws_dashboard(
 /// - handler 用 `CurrentUser` extractor 占位（与 WS 端点权限对齐：任意已登录；不调
 ///   `require_role`，原因 2026-09-15 `ws_dashboard` 注释里有说明）
 ///
-/// Query 入参（2026-09-30 新增）：
-/// - `?upcoming_days=<i64>`：未来 N 天交付分桶的天数；缺省 / 非法 → 14
-///   （service 层 `unwrap_or(14).clamp(1, 60)` 兜底）。前端 dashboard 视图可
-///   按用户视图范围调整柱状图横轴宽度。
-/// - `?basis=planned|system`（2026-10-04 新增）：`upcoming_delivery[]` 分桶的交期
-///   口径，`planned` = `t_part.planned_delivery_date`（缺省）、
-///   `system` = `t_part.system_delivery_date`；非法取值（如 `?basis=xxx`）由 axum
-///   `Query` 反序列化自动 4xx。
+/// Query 入参（2026-09-30 新增 `upcoming_days`、2026-10-04 新增 `basis`）：
+/// 形参语义见 `service/snapshot.rs::build_snapshot_with_workers` / `dto.rs::DeliveryBasis`。
 ///
 /// 实现要点（handler 三形态 ①：snapshot 单次只读聚合）：
 /// - `state.pool.begin()` 借 tx 边界
@@ -613,8 +598,7 @@ async fn run_socket(
             // 2026-10-01 B4：协议层存活探测 Ping。浏览器 / tungstenite 会在协议栈
             // 自动回 Pong，服务端靠上面「入站帧刷新 last_seen」续命。
             _ = ping_timer.tick() => {
-                // 空 payload：Ping 只用「有没有回应」判定存活，不承载业务数据
-                // （RFC 6455 要求 control 帧 payload ≤ 125 字节）。
+                // 空 payload（RFC 6455：control 帧 payload ≤ 125 字节）：Ping 只用「有没有回应」判定存活。
                 if let Err(e) = sender.send(Message::Ping(Bytes::new())).await {
                     warn!(user_id = user_id, conn_id = conn_id, error = %e, "ws dashboard: Ping 写失败，关闭连接（写侧已不可用）");
                     break;
@@ -678,13 +662,8 @@ fn reauth_close_code(err_code: i32) -> (u16, &'static str) {
 /// `impl for &mut PgConnection`，2026-09-22 同 iam 范式）。
 async fn build_snapshot_msg(state: &AppState) -> Result<String, AppError> {
     let mut tx = state.pool.begin().await?;
-    // 2026-09-30 新增 days 形参：WS 握手 snapshot 与 HTTP `/snapshot` 共享 service，
-    // WS 路径无 query，固定 `None` 走 service 默认 14 天（与 HTTP 缺省值对齐）；
-    // 前端 WS 信封 schema 不验长度，透传对前端透明。
-    // 2026-10-04 新增 basis 形参：WS 恒传 `None` → service 兜底 `Planned`（计划交期）。
-    // 理由：前端 dashboard 丢弃 WS 推送的 snapshot（只把它当 invalidate 触发器，
-    // 数据靠收到事件后重发 HTTP `/snapshot?basis=…` 拉），故 WS 侧固定 planned
-    // 口径对前端完全透明，不需要在 WS 握手上再开一个口径协商面。
+    // WS 路径无 query：days / basis 形参均固定传 `None`，由 service `unwrap_or_default()` 兜底。
+    // 形参语义见 `service/snapshot.rs::build_snapshot_with_workers` / `dto.rs::DeliveryBasis`。
     let snap = state
         .dashboard_service
         .build_snapshot_with_workers(&mut *tx, None, None, None)

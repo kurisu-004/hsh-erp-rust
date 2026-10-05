@@ -14,15 +14,15 @@
 //! `system` 走 `t_part.system_delivery_date`。默认 `planned`（`Default` impl），
 //! service 层 `unwrap_or_default()` 收敛成唯一默认值决策点。
 //!
+//! 非法取值（如 `?basis=xxx`）由 axum `Query` 反序列化直接 4xx，不在本层自写校验
+//! 返回业务错误码（与 part 域 DTO 行为对齐）。
+//!
 //! `Copy + PartialEq + Eq` 是刻意约束：repo 层形参收值传递（不做二次兜底），
 //! `Copy` 让调用点无需克隆。
 
 use serde::Deserialize;
 
-/// `upcoming_delivery[]` 分桶的交期口径（2026-10-04 新增）。
-///
-/// 非法取值（如 `?basis=xxx`）由 axum `Query` 反序列化直接 4xx，不在本层自写校验
-/// 返回业务错误码（与 part 域 DTO 行为对齐）。
+/// 形参 `basis` 语义见模块 doc `DeliveryBasis` 章节。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DeliveryBasis {

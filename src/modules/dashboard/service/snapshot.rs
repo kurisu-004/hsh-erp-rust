@@ -11,19 +11,15 @@
 //! - `repo/sql.rs::DashboardRepo` ZST 提供 4 个聚合静态方法，每个方法内部已做完
 //!   「多表 JOIN + 防 N+1」（批量查名字、批量查客户路径、批量查 PICKED_UP 时间）
 //! - `top_n` 默认 1000：远高于合理在持量，仅作防爆兜底
-//! - 2026-09-30 新增 `days: Option<i64>` 形参：未来交付分桶天数；None → 14
-//!   默认值（与前端 dashboard 视图默认横轴宽度对齐），clamp(1, 60) 防御
-//!   恶意大数；trait / SQL 层早已参数化（`planned_delivery_date < CURRENT_DATE +
-//   ($1::bigint || ' days')::interval`），本轮只把天数从写死 7 提到 query-driven
+//! - 形参 `days` / `basis` 语义见 `build_snapshot_with_workers` 函数 doc +
+//!   `dto.rs::DeliveryBasis`（A.4 核实：两天形参与本文件同日 PR 8325350 / 9534e88 引入，
+//!   时间戳保留指向权威点）
 //! - service 不持 repo / pool——handler 借 `&mut *tx` 喂给 trait 即可
-//! - 2026-10-04 新增 `basis: Option<DeliveryBasis>` 形参：交期分桶口径（计划交期
-//!   ↔ 系统交期）；None → `Planned`。口径默认值在本层 `unwrap_or_default()` 收口，
-//!   repo 层收确定值不做隐式兜底；WS 路径无 query 恒传 None，对前端透明
 //!
 //! ## 事务分层
 //! 事务移交 handler：service 方法 `<R: DashboardRepoTrait>(&self, mut repo: R, ...)`
 //! by-value。生产 `R = &mut PgConnection`，handler `pool.begin()` + `tx.commit()`
-//! 包外。dashboard 是 WS-only 域，handler 三形态 ①（snapshot 拉一次即结束）。
+//! 包外。dashboard 两个端点均为 handler 三形态 ①（snapshot 拉一次即结束）。
 //!
 //! ## 数据结构
 //! `DashboardSnapshot` / `OnProductionShelfGroup` / `DashboardItem` /
