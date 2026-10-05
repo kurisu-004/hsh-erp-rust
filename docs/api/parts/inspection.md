@@ -733,7 +733,18 @@ to-XXX 流共用的部分通过拆批语义。**所有 5 个单 / 批端点行�
 
 **前端的拆批后处理**：
 
-- 拿到非 null `new_batch_id` → 刷新批次列表（出现一行新批次 quantity = `batch.quantity - op_qty`）
+- 拿到非 null `new_batch_id` → **必须**刷新批次列表，刷新后应是**两行**：
+  - 响应里的 `new_batch_id`（**就是入参那个源批次的 id，id 不变**）是
+    **remainder**：quantity 原地减到 `batch.quantity - op_qty`、**仍留在源状态**，
+    且 `version` 已 +1（详见 [乐观锁](#乐观锁caller-侧-occ) 一节的拆批场景）；
+  - **拆出的新批次**是 operated 部分：quantity = `op_qty`、状态**已翻到目标状态**，
+    且它的 id **不在响应里** ⇒ 只能靠重新拉批次列表才看得到这一行。
+  - 2026-10-05 订正：原文写「新批次 quantity = `batch.quantity - op_qty`」是把
+    remainder 的终值安到了新批次头上，与上表「operated 部分（拆出的新批次，
+    quantity = op_qty）」自相矛盾。依据 `prod::batch::service::transition.rs`
+    的 `_split_for_partial_op` → `split_batch_for_partial_pass(..., op_qty, ...)`，
+    以及 `PartBatchRepo::_split_batch_inner` 的 INSERT `quantity = qty` /
+    源批次 `quantity -= qty`。
 - 拿到 null → 不需要刷新批次列表（仅 part.status 翻状态）
 
 **回滚语义**：拆批写入与 operated 批次状态翻转在同一事务；事务失败时拆出的新批次与状态翻转一并回滚，不会出现「拆了批但没翻转」的中间态。

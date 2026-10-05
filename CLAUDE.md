@@ -242,7 +242,7 @@ t_assembly.status               ← 派生缓存
 | `tests/iam/{main,api,middleware}.rs` | 2 | `iam`（redis-flush group）|
 | `tests/shelf/{main,api,deactivate}.rs` | 2 | `shelf` |
 | `tests/statistics/{main,api,event_driven}.rs` | 2 | `statistics` |
-| `tests/production/{main,work_type,process,process_chain,worker,worker_pool,worker_pool_auto_allocate,batch,pending_programming,shelf_process,pickup,process_design,inspection}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 12 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」）|
+| `tests/production/{main,work_type,process,process_chain,worker,worker_pool,worker_pool_auto_allocate,batch,pending_programming,shelf_process,pickup,process_design,inspection}.rs` | 6 | `production`（按 `src/modules/prod/*` 对齐；`shelf_process.rs` 2026-10-02 自 `tests/shelf/api.rs` 迁入；**`process_design.rs` 2026-10-05 新增**，★ 核心回归是「装配件子件可见」；**`inspection.rs` 2026-10-05 新增** 13 场景，★ 核心回归是「扫子件 → 返回整棵装配件树」）|
 | `tests/outsource/{main,company,quote,send_receive}.rs` | 3 | `outsource` |
 | `tests/user_repo/{main,basic,role,password}.rs` | 1 → 3 sub-file | `user_repo` |
 | 单文件保留：applicant_api / customer_api / _e2e_api / cos_opendal_api / cos_real_smoke / auto_complete_api / dashboard_ws_api / idempotency_api / guard_dn_in_use_api / cnc_program_api | 10 | （各自原 binary 名）|
