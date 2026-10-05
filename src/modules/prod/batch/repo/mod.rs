@@ -40,12 +40,14 @@
 //! `current_holder_id` 各 JOIN 一次）。该写法**假定** holder id 在三表 PK 空间里
 //! 互不重叠；一旦某 id 同时命中其中两表，取到的是 `t_shelf.name`。
 //!
-//! 全仓 holder 名多表 COALESCE 共 **5 处**（3 处 `t_shelf.name` 形态 + 2 处
+//! 全仓 holder 名多表 COALESCE 共 **6 处**（4 处 `t_shelf.name` 形态 + 2 处
 //! `t_shelf.code` 变体，后者歧义时取 `t_shelf.code` 而非 name）：
 //!
 //! - `prod/batch/repo/queries.rs::PartBatchRepo::list_active_by_part_id_with_holder`
 //! - `prod/batch/service/repair.rs::list_batches_matching`（`sqlx::query_as` 内联 SQL）
 //! - `part/service/phase1/lifecycle_helpers.rs::list_batches`
+//! - `prod/inspection/repo.rs::InspectionScanRepo::list_batches_by_part_ids`
+//!   （2026-10-05 新增的扫码树批次层）
 //! - `wx/repo.rs::PartList::list`
 //! - `wx/repo.rs::PartList::by_serial`
 //!
@@ -55,9 +57,9 @@
 //!
 //! 正确解法是用 `t_part_batch.location` 作 discriminator
 //! （`CASE location WHEN 'WORKER' THEN w.name WHEN 'OUTSOURCE_COMPANY' THEN oc.name
-//! ELSE s.name END`）。**本次不动**：改这一处会让 5 条 SQL 的行为对某些历史脏数据
+//! ELSE s.name END`）。**本次不动**：改这一处会让 6 条 SQL 的行为对某些历史脏数据
 //! 发生变化，属独立改动，且当务之急是修「返修列表 holder 名解析错」还是「先补
-//! 脏数据清洗」需要产品侧确认。修时必须 5 处一起改，逐处改会造成同一 holder 在
+//! 脏数据清洗」需要产品侧确认。修时必须 6 处一起改，逐处改会造成同一 holder 在
 //! 不同端点显示不同名字。
 //!
 //! ## 错误类型

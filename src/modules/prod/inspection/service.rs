@@ -93,7 +93,9 @@ impl InspectionScanService {
         // 扫码枪偶发尾随空白 / 空格；空串等价于「没扫到东西」，按未命中收口。
         let serial_no = serial_no.trim();
         if serial_no.is_empty() {
-            return Err(not_found(serial_no));
+            // 空串直接插值进 message 会渲染成「序列号  未找到…」（双空格），用
+            // 占位符让日志与前端 toast 可读。
+            return Err(not_found("(空)"));
         }
 
         let hit = match InspectionScanRepo::find_part_by_serial(&mut *conn, serial_no).await? {
@@ -186,6 +188,7 @@ impl InspectionScanService {
 ///
 /// 复用 part 域的 `20101 BIZ_PART_NOT_FOUND`（HTTP 404）而不是另开错误码：
 /// 语义完全相同（扫到的东西不存在），前端按同一个 code 弹「未找到」即可。
+/// 入参是**已 trim** 的序列号；纯空白串那条路径传占位符 `"(空)"`（见 [`Self::scan`]）。
 fn not_found(serial_no: &str) -> AppError {
     AppError::biz(
         code::BIZ_PART_NOT_FOUND,

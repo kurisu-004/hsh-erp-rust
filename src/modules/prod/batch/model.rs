@@ -36,8 +36,9 @@
 //! - `current_process_id` 的读取方严格限定为 **5 条工序池 SQL**（take_one /
 //!   take_specific / list_candidates / group_count / count_pool_by_shelf）
 //!   + `list_pickable_by_work_type` + rollup 派生 `t_part.next_process_id`。
-//! - **展示类列表一律继续从 `current_process_step_id` → step JOIN 派生工序名**。
-//!   完整清单（改动前请逐条对照，勿凭端点名想当然）：
+//! - **展示类列表一律继续从 `current_process_step_id` → step JOIN 派生工序名**，
+//!   唯一**有意例外**是扫码树（第 4 条，已在下方登记）。完整清单（改动前请逐条
+//!   对照，勿凭端点名想当然）：
 //!   1. `prod/batch/repo/list.rs::list_inspection_queue`
 //!      —— `GET /prod/batches/inspection`（2026-10-03 起 3-JOIN 窄投影，
 //!      **不投影** `next_process_*`，故本条已无「派生 vs 直读」之争）
@@ -48,8 +49,16 @@
 //!      —— `GET /parts/{id}/batches`（工单批次明细，**无 status 过滤**，同时返回
 //!      PENDING / IN_PROCESS / INSPECTION / READY_TO_SHIP 等各状态批次；返修中的
 //!      批次按 `IN_PROCESS` 一并返回）
+//!   4. ⚠️ **有意例外**：`prod/inspection/repo.rs::InspectionScanRepo::
+//!      list_batches_by_part_ids` —— `GET /prod/inspection/scan/{serial_no}`
+//!      （2026-10-05 新增的扫码树，批次层唯一一条 SQL）。它的 `process_name`
+//!      直读 `current_process_id`，与第 1~3 条**故意不同**，理由是本端点的
+//!      工序名要回答「这批货现在在哪道工序」，而 step 指针只在首次定位工序时写、
+//!      之后永不推进，多工序链工单上会停在第一步 → 用它渲染会显示过时工序。
+//!      代价是本端点的 `INSPECTION` / `DELIVERED` 批次 `process_name` 恒 `null`
+//!      （这两个状态本就不在生产流里，不渲染工序标签即可）。
 //!
-//!   理由：上述端点都不是**工序池**端点，判据是 `status`，与
+//!   理由（第 1~3 条的推导）：上述端点都不是**工序池**端点，判据是 `status`，与
 //!   `current_process_id` 无关；而 `INSPECTION` 批次按出池不变式该列恒为 NULL
 //!   （DELIVERED 更进一步 —— 进 `READY_TO_SHIP` 的边只有 `INSPECTION →
 //!   READY_TO_SHIP`，故 DELIVERED 批次也**必经 INSPECTION**、该列同样恒 NULL），

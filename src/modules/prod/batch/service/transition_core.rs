@@ -240,8 +240,8 @@ impl BatchService {
         //
         // **为什么 to-process 不能碰返修中的批次**：`is_repairing = true` 的批次
         // 走的是**返修闭环**（`scan-inspect(pass=false)` / `start-repair` 起修 →
-        // `complete-repair` 落回生产架 / 送检架并清标记，见
-        // `phase1::scan` 与 `phase1::repair`），它与本端点表达的是**两件不同的
+        // `complete-repair` 落回生产架 / 送检架并清标记，见 `service::scan` 与
+        // `service::repair`），它与本端点表达的是**两件不同的
         // 事**：
         // - to-process = 「检验不合格，回**正常生产流**继续做」；
         // - complete-repair = 「返修完成 / 到位」，是**唯一**被授权清 `is_repairing`

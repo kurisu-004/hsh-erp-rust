@@ -15,6 +15,17 @@
 //! `serial_no` 是 `Path<String>`（不是 `ni64!` 那类数值提取器）：序列号是
 //! `varchar(15)` 的**字符串**，且可能含 `-`（子件 `{asm}-{i:02d}`），不能用数值
 //! 提取器。空串 / 尾随空白由 service 统一 trim + 兜底（空串按未命中 → 20101）。
+//!
+//! ⚠️ **前端必须对 `serial_no` 做 `encodeURIComponent`**（已进 API 契约）：序列号
+//! 是用户/业务侧自由文本，含 URL 保留字符时行为分两种 ——
+//!   - 含 `/`：axum 路由在 `/scan/{serial_no}` 这一段就把它当路径分隔符拆开 →
+//!     匹配不到路由 → **404 且信封 code 不是 20101**（与「未找到」的 404 形态不同，
+//!     前端不能靠 code 区分「没扫到」与「编码漏了」）；
+//!   - 含 `?` / `#`：未编码时会在客户端或代理层被当成 query / fragment 起始符 →
+//!     传进来的序列号被**截断**，同样表现为「扫到了但不对的码」。
+//!
+//! 本端点**不做**任何解码侧的兜底（不剥离非法字符、不做 `%` 转义还原），因为无法
+//! 区分「用户真敲了一个 `%`」与「前端忘了编码」。
 
 use std::sync::Arc;
 
@@ -35,6 +46,8 @@ use super::vo::ScanTreeOut;
 ///
 /// 角色：Manager + Inspector（service 内守卫）。
 /// 读端点：`pool.acquire()` 不开事务，不发 WS 广播。
+/// ⚠️ `serial_no` 含 URL 保留字符时前端必须 `encodeURIComponent`（含 `/` 会在路由
+/// 层 404 且信封 code ≠ 20101），详见模块 doc 的「路径参数」节。
 pub async fn scan(
     State(state): State<Arc<AppState>>,
     current: CurrentUser,

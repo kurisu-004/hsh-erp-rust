@@ -6,11 +6,15 @@
 //! 范本：
 //!
 //! 1. SQL 落到 `test-support/fixtures/inspection.sql`，常量 ID 走
-//!    9_000_000_000_000_000_201+ 区段（与 `process_design` 的 001~025 区段不撞）；
+//!    9_000_000_000_000_000_261+ 区段（与 `test-support/fixtures/` 下其余全部
+//!    fixture 声明的 ID 段物理不相交，核对清单见该 SQL 头注释）；
 //! 2. bcrypt 哈希预生成嵌入 SQL，省 ~250ms×N 现场 hash 开销；
 //! 3. 本文件定义 `InspectionFixture` struct + 常量 ID `const` + `Default` 实现
 //!    + `load_inspection_fixture(pool)` 函数；
 //! 4. 测试 binary（`tests/production/inspection.rs`）直接拿句柄。
+//!
+//! ⚠️ 本文件的常量与 `fixtures/inspection.sql` 的 INSERT 字面值是**同一批字面量**，
+//! 任何一边改 ID 段都必须同步另一边，否则集成测试会静默查空行。
 //!
 //! ## 为什么要 5 个角色账号
 //! 角色守卫场景要逐个登录 2 个白名单角色（MANAGER / INSPECTOR）并用 3 个越权角色
@@ -32,8 +36,8 @@ use sqlx::PgPool;
 
 /// `fixtures/inspection.sql` 加载产物：常量句柄供测试函数直接使用。
 ///
-/// 字段名与 SQL INSERT 字面值逐字对应。常量 ID 全部走 9_000_000_000_000_000_201+
-/// 区段，与运行时雪花 ID 物理不相交，也与 `process_design` fixture 不撞。
+/// 字段名与 SQL INSERT 字面值逐字对应。常量 ID 全部走 9_000_000_000_000_000_261+
+/// 区段，与运行时雪花 ID 及 `test-support/fixtures/` 下其余 fixture 均物理不相交。
 #[allow(dead_code)]
 pub struct InspectionFixture {
     /// L1 根客户 id
@@ -97,39 +101,39 @@ impl InspectionFixture {
     /// 改此处必须同步更新 fixtures/inspection.sql 的 password_hash 字面值。
     pub const PASSWORD: &'static str = "changeme";
 
-    pub const L1_CUSTOMER_ID: i64 = 9_000_000_000_000_000_201;
-    pub const L2_CUSTOMER_ID: i64 = 9_000_000_000_000_000_202;
-    pub const INSPECTION_SHELF_ID: i64 = 9_000_000_000_000_000_203;
-    pub const PRODUCTION_SHELF_ID: i64 = 9_000_000_000_000_000_204;
-    pub const PROCESS_A_ID: i64 = 9_000_000_000_000_000_205;
-    pub const PROCESS_B_ID: i64 = 9_000_000_000_000_000_206;
-    pub const SHELF_PROCESS_ID: i64 = 9_000_000_000_000_000_207;
-    pub const MANAGER_USER_ID: i64 = 9_000_000_000_000_000_208;
-    pub const CLERK_USER_ID: i64 = 9_000_000_000_000_000_209;
-    pub const INSPECTOR_USER_ID: i64 = 9_000_000_000_000_000_210;
-    pub const CNC_USER_ID: i64 = 9_000_000_000_000_000_211;
-    pub const SHELF_USER_ID: i64 = 9_000_000_000_000_000_212;
-    pub const MANAGER_ROLE_ID: i64 = 9_000_000_000_000_000_213;
-    pub const CLERK_ROLE_ID: i64 = 9_000_000_000_000_000_214;
-    pub const INSPECTOR_ROLE_ID: i64 = 9_000_000_000_000_000_215;
-    pub const CNC_ROLE_ID: i64 = 9_000_000_000_000_000_216;
-    pub const SHELF_ROLE_ID: i64 = 9_000_000_000_000_000_217;
-    pub const ASSEMBLY_ID: i64 = 9_000_000_000_000_000_218;
-    pub const PART_STANDALONE: i64 = 9_000_000_000_000_000_219;
+    pub const L1_CUSTOMER_ID: i64 = 9_000_000_000_000_000_261;
+    pub const L2_CUSTOMER_ID: i64 = 9_000_000_000_000_000_262;
+    pub const INSPECTION_SHELF_ID: i64 = 9_000_000_000_000_000_263;
+    pub const PRODUCTION_SHELF_ID: i64 = 9_000_000_000_000_000_264;
+    pub const PROCESS_A_ID: i64 = 9_000_000_000_000_000_265;
+    pub const PROCESS_B_ID: i64 = 9_000_000_000_000_000_266;
+    pub const SHELF_PROCESS_ID: i64 = 9_000_000_000_000_000_267;
+    pub const MANAGER_USER_ID: i64 = 9_000_000_000_000_000_268;
+    pub const CLERK_USER_ID: i64 = 9_000_000_000_000_000_269;
+    pub const INSPECTOR_USER_ID: i64 = 9_000_000_000_000_000_270;
+    pub const CNC_USER_ID: i64 = 9_000_000_000_000_000_271;
+    pub const SHELF_USER_ID: i64 = 9_000_000_000_000_000_272;
+    pub const MANAGER_ROLE_ID: i64 = 9_000_000_000_000_000_273;
+    pub const CLERK_ROLE_ID: i64 = 9_000_000_000_000_000_274;
+    pub const INSPECTOR_ROLE_ID: i64 = 9_000_000_000_000_000_275;
+    pub const CNC_ROLE_ID: i64 = 9_000_000_000_000_000_276;
+    pub const SHELF_ROLE_ID: i64 = 9_000_000_000_000_000_277;
+    pub const ASSEMBLY_ID: i64 = 9_000_000_000_000_000_278;
+    pub const PART_STANDALONE: i64 = 9_000_000_000_000_000_279;
     /// ★ 被扫中的子件行 id（扫码树核心回归：扫子件 → 返回整棵装配件树）
-    pub const PART_CHILD_1: i64 = 9_000_000_000_000_000_220;
-    pub const PART_CHILD_2: i64 = 9_000_000_000_000_000_221;
-    pub const PART_CHILD_3: i64 = 9_000_000_000_000_000_222;
-    pub const PART_CHILD_DELETED: i64 = 9_000_000_000_000_000_223;
-    pub const BATCH_INSPECTION: i64 = 9_000_000_000_000_000_230;
-    pub const BATCH_PENDING: i64 = 9_000_000_000_000_000_231;
-    pub const BATCH_IN_PROCESS: i64 = 9_000_000_000_000_000_232;
-    pub const BATCH_READY_TO_SHIP: i64 = 9_000_000_000_000_000_233;
-    pub const BATCH_COMPLETED: i64 = 9_000_000_000_000_000_234;
-    pub const BATCH_CANCELLED: i64 = 9_000_000_000_000_000_235;
-    pub const BATCH_REPAIRING: i64 = 9_000_000_000_000_000_236;
-    pub const BATCH_SOFT_DELETED: i64 = 9_000_000_000_000_000_237;
-    pub const BATCH_CHILD_INSPECTION: i64 = 9_000_000_000_000_000_240;
+    pub const PART_CHILD_1: i64 = 9_000_000_000_000_000_280;
+    pub const PART_CHILD_2: i64 = 9_000_000_000_000_000_281;
+    pub const PART_CHILD_3: i64 = 9_000_000_000_000_000_282;
+    pub const PART_CHILD_DELETED: i64 = 9_000_000_000_000_000_283;
+    pub const BATCH_INSPECTION: i64 = 9_000_000_000_000_000_290;
+    pub const BATCH_PENDING: i64 = 9_000_000_000_000_000_291;
+    pub const BATCH_IN_PROCESS: i64 = 9_000_000_000_000_000_292;
+    pub const BATCH_READY_TO_SHIP: i64 = 9_000_000_000_000_000_293;
+    pub const BATCH_COMPLETED: i64 = 9_000_000_000_000_000_294;
+    pub const BATCH_CANCELLED: i64 = 9_000_000_000_000_000_295;
+    pub const BATCH_REPAIRING: i64 = 9_000_000_000_000_000_296;
+    pub const BATCH_SOFT_DELETED: i64 = 9_000_000_000_000_000_297;
+    pub const BATCH_CHILD_INSPECTION: i64 = 9_000_000_000_000_000_300;
 
     /// 独立件序列号（扫它 → `assembly = null` 的独立件树）
     pub const STANDALONE_SERIAL_NO: &'static str = "SI-S1001";

@@ -245,9 +245,13 @@ async fn scanning_child_returns_whole_assembly_tree() {
         "装配件节点 id 必须是被扫子件的父件: {env}"
     );
     assert_eq!(asm["serial_no"], InspectionFixture::ASSEMBLY_SERIAL_NO, "{env}");
+    // 装配件节点**不该有**批次字段：`ScanAssemblyOut` 里根本没有 `children` 键
+    // （t_assembly 在 t_part_batch 里没有行）。用 `get().is_none()` 而不是
+    // `asm["children"].is_null()` —— 后者在 key 不存在时 serde_json 同样给
+    // `Value::Null`，恒真、零信息量。
     assert!(
-        asm["children"].is_null(),
-        "装配件节点没有批次（t_assembly 在 t_part_batch 里没有行）: {env}"
+        asm.get("children").is_none(),
+        "装配件节点不应带 children 字段（批次只挂在零件节点下）: {env}"
     );
 
     // ★ children 是**全部**活跃子件，不止被扫中的那个；软删子件不在其中

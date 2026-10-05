@@ -44,7 +44,7 @@
 2. **谓词不同**：本端点是「先 `t_part` 命中、未命中回退 `t_assembly`」的两表回退，
    既有端点都只有单表命中；且同号多行时按
    `ORDER BY (status = 'CANCELLED') ASC, id DESC LIMIT 1` 取值。
-3. **字段集与形状都不同**：本端点是 9~10 列窄投影 + 两层 `children` 树（不是平铺
+3. **字段集与形状都不同**：本端点是 9~11 列窄投影 + 两层 `children` 树（不是平铺
    列表）；给 part 域旧端点塞 `with_children` / `expand_assembly` 之类开关会把一个
    「详情型端点」变成「模式开关型端点」，两套口径挤在同一个出参里。
 4. 与 2026-10-05 的 [`prod::process_design`](./process-design.md)、
@@ -62,6 +62,18 @@ Path：
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `serial_no` | string | ✓ | 扫码得到的序列号。**精确匹配**（不做前缀 / `ILIKE` 模糊 —— `F100` 命中 `F1001` 会弹错树，比不弹更糟）；service 内 `trim()`，纯空白按未命中收口 |
+
+> ⚠️ **前端必须对 `serial_no` 做 `encodeURIComponent`**。序列号是业务侧自由文本，
+> 含 URL 保留字符时行为分两种，**都不是** 20101：
+> - 含 `/` → axum 路由在 `/scan/{serial_no}` 这一段就把它当路径分隔符拆开，匹配不到
+>   路由 → **HTTP 404 但信封 `code` 不是 20101**（前端不能靠 code 区分「没扫到」与
+>   「编码漏了」，只能靠请求 URL 自己保证编码）；
+> - 含 `?` / `#` → 未编码时在客户端或代理层被当成 query / fragment 起始符，序列号被
+>   **截断**，表现为「扫到了但不对的码」。
+>
+> 后端**不做**解码侧兜底（不剥离非法字符、不做 `%` 还原）：无法区分「用户真敲了一
+> 个 `%`」与「前端忘了编码」。`%20` 这类已编码的空白会被 Path 正常解码，再由 service
+> `trim()` 收口（见集成测试场景 4）。
 
 Query：**无**（本端点不接受任何 query 参数；分页 / 筛选一概没有）
 
@@ -95,11 +107,26 @@ Response 200 `data`：[`ScanTreeOut`](#scantreeout-字段)
 `deleted_at IS NULL AND serial_no IS NOT NULL`），活跃行必然唯一，故
 `find_assembly_by_serial` 只需 `LIMIT 1`。
 
+⚠️ **同号仅存 `CANCELLED` 行时，按正常命中返回一棵树**：`sort` 键只保证「活跃行
+优先」，不保证「必有活跃行」。`POST /api/v2/parts/{id}/cancel` 把 part 打成
+`CANCELLED` 后，rollup 的终态守卫会拦下 `release_part_serial_no`，序列号**保留**在
+库中，同号重建前一直可扫。此时 `children[].status == "CANCELLED"` 原文透出，
+`hit_kind` 仍是 `"PART"`、响应仍是 200 —— **前端必须自行禁用该节点上的写操作按钮**。
+后端刻意**不加** `AND p.status <> 'CANCELLED'`：那会让已取消工单的货再也扫不到，
+属产品决策（须用户拍板），不是实现细节。
+
 ### 父装配件已软删 → 退化成独立件树
 
 `find_assembly_by_id` 返回 `None` **只可能是父装配件已软删**。此时响应退化成
 `assembly = null` + `children = [被扫中的那个子件]`，而**不是**返回一棵「有子件但
 没有装配件节点」的孤儿树。
+
+> ⚠️ **前端无法从 payload 区分这一形态与「真独立件」**：`hit_kind = "PART"` +
+> `assembly = null` + `children.len() == 1` 三者同时成立时，父装配件被软删的子件与
+> 真正的独立件**逐字段同形**（后端不返回任何「父件已删」标记）。因此前端**不要**把
+> `assembly = null` 直接渲染成「这是一个独立零件」——它也可能是「所属装配件已被
+> 删除的子件」。若业务上必须提示用户，需另开端点或在 `t_part` 留「父件已删」标记列，
+> 属独立需求。
 
 ### 空子件装配件
 
@@ -113,18 +140,21 @@ Response 200 `data`：[`ScanTreeOut`](#scantreeout-字段)
 ### 1. `process_name` 对 `INSPECTION` / `DELIVERED` 批次恒为 `null`
 
 这**不是 bug**，是「出池必须把 `current_process_id` 置 NULL」这条不变式的**正确**
-结果：所有进 `INSPECTION` 的写点（`phase1::scan` / `outsource::receive_to_inspection` /
-`repair::complete_repair` / `mark_batch_inspected`）都按出池清该列；`DELIVERED` 更进一步
-—— 进 `READY_TO_SHIP` 的边只有 `INSPECTION → READY_TO_SHIP`，故也必经 `INSPECTION`、
-同样恒 NULL。
+结果：所有进 `INSPECTION` 的写点（`BatchService::scan_inspect` /
+`BatchService::receive_from_outsource_to_inspection` /
+`BatchService::complete_repair` / `mark_batch_inspected`）都按出池清该列；
+`DELIVERED` 更进一步 —— 进 `READY_TO_SHIP` 的边只有 `INSPECTION → READY_TO_SHIP`，
+故也必经 `INSPECTION`、同样恒 NULL。
 
 **前端在这两个状态下不要渲染工序标签。**
 
 取值列是 `current_process_id`（migration 004 确立的工序归属权威列），**不是**
 `current_process_step_id`。取舍：后者只在首次定位工序时写、之后永不推进，多工序链工单
 上会停在第一步，用它渲染「当前工序」会显示过时信息。其余展示类列表
-（`GET /parts/{id}/batches`、待品检队列、返修列表）仍走 step 派生，**本端点是唯一**
-按权威列直读的展示类列表，属有意为之。
+（`GET /parts/{id}/batches`、待品检队列、返修列表）仍走 step 派生，**本端点是唯一
+的有意例外**，已登记在 `src/modules/prod/batch/model.rs` 模块 doc 的「读取方分工」
+清单第 4 条 —— 后端侧的后续改动请先对照那份清单，不要凭端点名想当然把它当缺陷「修」
+回 step 派生。
 
 > 回归测试：`tests/production/inspection.rs::process_name_is_null_for_out_of_pool_states`
 > —— 同一条用例里既断言 `INSPECTION` / `READY_TO_SHIP` / `PENDING` 批次
@@ -182,6 +212,11 @@ part / assembly / batch 三处的软删行一律不返回（逐条 SQL 写死）
 | `t_assembly` | `a.deleted_at IS NULL`（按序列号 + 按 id 两条） |
 | `t_part_batch` | `b.deleted_at IS NULL` |
 | `t_customer`（附带） | `LEFT JOIN ... AND c.deleted_at IS NULL` —— 客户软删时客户名退化为 `null`，**不影响**该零件/批次返回 |
+
+而 `LEFT JOIN` 进来的 `t_process` / `t_shelf` / `t_worker` / `t_outsource_company`
+四张表**不加**软删闸门 —— 与 `prod::batch::repo` 的 `list_active_by_part_id_with_holder`
+既有写法一致（工序名 / holder 名都是展示用附加信息，被软删也照常显示最后的样子）。
+故上表不是「本端点读过的全部表」的清单。
 
 ⚠️ 软删闸门**不是**「保守过滤」而是本端点的语义闸门：扫到软删行等于扫到一个业务上
 已不存在的码，前端据此弹「未找到」（404 + 20101）比弹一棵含已删数据的树更安全。
@@ -267,28 +302,28 @@ part / assembly / batch 三处的软删行一律不返回（逐条 SQL 写死）
   "hit_kind": "PART",
   "scanned_serial_no": "SI-ASM-01",
   "assembly": {
-    "id": "9000000000000000218", "serial_no": "SI-ASM", "name": "SI assembly",
+    "id": "9000000000000000278", "serial_no": "SI-ASM", "name": "SI assembly",
     "drawing_no": "D-SI-ASM", "status": "IN_PROCESS", "quantity": 1,
     "is_urgent": false, "system_delivery_date": "2026-11-04",
     "customer_name": "SI L1 customer"
   },
   "children": [
-    { "id": "9000000000000000220", "serial_no": "SI-ASM-01", "name": "SI child 1",
+    { "id": "9000000000000000280", "serial_no": "SI-ASM-01", "name": "SI child 1",
       "drawing_no": "D-SI-02", "status": "INSPECTION", "quantity": 5,
       "is_urgent": false, "system_delivery_date": null,
       "customer_name": "SI L2 customer", "version": 4,
       "children": [
-        { "id": "9000000000000000240", "batch_no": 1, "quantity": 5,
+        { "id": "9000000000000000300", "batch_no": 1, "quantity": 5,
           "status": "INSPECTION", "version": 7, "is_repairing": false,
           "location": "INSPECTION_SHELF",
           "current_holder_display": "SI inspection shelf",
           "process_name": null, "is_scanned": true }
       ] },
-    { "id": "9000000000000000221", "serial_no": "SI-ASM-02", "name": "SI child 2",
+    { "id": "9000000000000000281", "serial_no": "SI-ASM-02", "name": "SI child 2",
       "drawing_no": "D-SI-03", "status": "PENDING", "quantity": 5,
       "is_urgent": false, "system_delivery_date": null,
       "customer_name": "SI L2 customer", "version": 0, "children": [] },
-    { "id": "9000000000000000222", "serial_no": "SI-ASM-03", "name": "SI child 3",
+    { "id": "9000000000000000282", "serial_no": "SI-ASM-03", "name": "SI child 3",
       "drawing_no": "D-SI-04", "status": "INSPECTION", "quantity": 5,
       "is_urgent": false, "system_delivery_date": null,
       "customer_name": "SI L2 customer", "version": 0, "children": [] }
@@ -343,6 +378,10 @@ part / assembly / batch 三处的软删行一律不返回（逐条 SQL 写死）
 | 装配件条码 | `find_assembly_by_serial` → `list_parts_by_assembly` → `list_batches_by_part_ids` | 3 |
 | 两表皆未命中 | `find_part_by_serial` → `find_assembly_by_serial` | 2 |
 
+> ⚠️ 「装配件条码」那行在**装配件无活跃子件**（没有子件，或子件全被软删）时是
+> **2 条**：`list_parts_by_assembly` 返回空 → `list_batches_by_part_ids` 对空切片
+> 直接返空、不发 SQL。
+
 子件再多也只有一条批次查询（`b.part_id = ANY($1)` 一次捞回整棵树的批次）。零件列表
 为空时 `list_batches_by_part_ids` **直接返空 Vec 而不发 SQL**（`= ANY('{}')` 在 PG 里恒为
 false、结果本就为空）。
@@ -353,6 +392,11 @@ false、结果本就为空）。
 - 零 schema 变更（无新 migration）。
 - 本子模块**刻意没有 `dto.rs`**：无 query / body 入参（`serial_no` 走 path），没有可反
   序列化的入参结构，造一个空 DTO 模块只是噪音。
+- ⚠️ **已知风险登记（不修）**：读端点不开事务意味着 2~4 条语句在 READ COMMITTED 下
+  各看一个快照，理论上可撕裂（4 条之间被扫中的子件被软删 → 树里没有刚扫的码、全树
+  `is_scanned = false`、**前端无任何错误提示**）。概率极低，且全仓读端点都是这个形态
+  （读端点不开事务是 CLAUDE.md 的约定），消除它需给读端点开 REPEATABLE READ 快照事务，
+  属跨域惯例改动。
 
 ---
 
@@ -361,6 +405,9 @@ false、结果本就为空）。
 1. **`process_name` 的取值列不要改成 `current_process_step_id`**。step 指针只在首次
    定位工序时写、之后永不推进，多工序链工单上会停在第一步。代价（`INSPECTION` /
    `DELIVERED` 恒 `null`）是**接受**的，见[口径 1](#1-process_name-对-inspection--delivered-批次恒为-null)。
+   本端点是「展示类列表一律走 step 派生」这条读取方分工的**唯一有意例外**，已登记在
+   `src/modules/prod/batch/model.rs` 的读取方分工清单第 4 条 —— 不要凭那份清单把它
+   当成越界顺手改回去。
 2. **不要给批次层加 `status` 过滤**。状态闸门在前端，加了过滤后前端就答不了
    「这批货总共分了几批」，见[口径 2](#2-本端点读全部批次不按状态过滤)。
 3. **`t_part` 的 11 列投影写了两份字面量**（`find_part_by_serial` 与
@@ -370,8 +417,9 @@ false、结果本就为空）。
 4. **已知缺陷：holder 三表 `COALESCE` 的多态歧义**。`current_holder_display` 沿用
    `COALESCE(s.name, w.name, oc.name)`，该写法**假定** holder id 在
    `t_shelf` / `t_worker` / `t_outsource_company` 三表 PK 空间里互不重叠；一旦某 id
-   同时命中其中两表，取到的是 `t_shelf.name`。本文件是该形态的全仓**第 6 处**（前 5 处
-   见 `prod::batch::repo` 模块 doc 的同名小节）。本次**刻意不修**（会让 6 条 SQL 对部分
+   同时命中其中两表，取到的是 `t_shelf.name`。本文件是该形态的全仓**第 6 处**（4 处
+   `t_shelf.name` 形态含本文件 + 2 处 `t_shelf.code` 变体；6 处清单见
+   `prod::batch::repo` 模块 doc 的同名小节）。本次**刻意不修**（会让 6 条 SQL 对部分
    历史脏数据的行为发生变化，且「先清洗还是先改判别式」需产品侧确认）；**将来要修必须
    6 处一起改**，逐处改会造成同一 holder 在不同端点显示不同名字。正确解法是
    `CASE location …`。
@@ -381,6 +429,10 @@ false、结果本就为空）。
    加角色前先确认它同时能操作那些批次。
 6. **`hit_kind` 的两个字面量只在 service 内的私有 `HitKind` 枚举构造**，出参仍是
    `String`（契约逐字要求，前端 Zod 用 `z.enum` 校验）。拼错字面量必须成为编译错误。
+7. **不要给命中查询加 `AND p.status <> 'CANCELLED'`**。已取消工单的序列号按终态
+   守卫会留在库里，加守卫等于让这批货再也扫不到，属**产品决策**（见端点下的「⚠️
+   同一 `serial_no` 可能并存多行」节）；本端点按「同号仅存 `CANCELLED` 行也返回正常
+   树、`status` 原文透出」处理，写操作门禁在前端。
 
 ---
 
@@ -398,7 +450,8 @@ false、结果本就为空）。
   来自 `t_part_batch` 而非 `t_part` / 9 i64 → JSON string / 10 角色守卫两放行三拒绝 /
   11 `process_name` 出池态恒 null + 生产中取真值 / 12 `is_repairing` 标记透传）
 - ✅ fixture：`test-support/fixtures/inspection.sql` + `test-support/src/fixture/inspection.rs`
-  （ID 走 9_000_000_000_000_000_201+ 区段，与 `process_design` 的 001~025 不撞）
+  （ID 走 9_000_000_000_000_000_261+ 区段，与 `test-support/fixtures/` 下全部
+  fixture 声明的 ID 段物理不相交；新增 fixture 前请核对该目录全部文件的头注释）
 
 ## 参考
 

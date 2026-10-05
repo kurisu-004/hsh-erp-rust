@@ -18,12 +18,22 @@
 //! | 装配件条码 | `find_assembly_by_serial` → `list_parts_by_assembly` → `list_batches_by_part_ids` | 3 |
 //! | 两表皆未命中 | `find_part_by_serial` → `find_assembly_by_serial` | 2 |
 //!
-//! ## 软删闸门（3 处，逐条 SQL 写死）
+//! ⚠️ 「装配件条码」那行在**装配件无活跃子件**（无子件 / 全部子件被软删）时是 **2 条**：
+//! `list_parts_by_assembly` 返回空 → `list_batches_by_part_ids` 对空切片提前返空、
+//! 不发 SQL。
+//!
+//! ## 软删闸门（4 张表，逐条 SQL 写死）
 //! - `t_part`：`p.deleted_at IS NULL`（命中查询 + 子件列表）
 //! - `t_assembly`：`a.deleted_at IS NULL`（按序列号 + 按 id 两条）
 //! - `t_part_batch`：`b.deleted_at IS NULL`
 //! - 附带：`LEFT JOIN t_customer ... AND c.deleted_at IS NULL` —— 客户软删时
 //!   客户名退化为 `null`，不影响该零件/批次返回
+//!
+//! 而 `LEFT JOIN` 进来的 `t_process` / `t_shelf` / `t_worker` /
+//! `t_outsource_company` 四张表**不加**软删闸门 —— 与 `prod::batch::repo` 的
+//! `list_active_by_part_id_with_holder` / `list_batches` 既有写法一致（工序名、
+//! holder 名都是展示用附加信息，被软删也照常显示最后的样子）。故上面这张清单不是
+//! 「本端点读过的全部表」的清单。
 //!
 //! ⚠️ 软删闸门**不是**「保守过滤」而是本端点的语义闸门：扫到软删行等于扫到一个
 //! 业务上已不存在的码，前端据此弹「未找到」比弹一棵含已删数据的树更安全。
@@ -37,6 +47,13 @@
 //! - `CANCELLED` 行**排到最后**（`false < true`）—— 扫到历史废弃工单毫无意义，
 //!   而工单被 `cancel` 后同号重建是常规操作
 //! - 剩余行由部分唯一索引保证至多一条，`p.id DESC` 只是兜底取新
+//!
+//! ⚠️ **只有 `CANCELLED` 行时照样返回正常树**（排序键只保证「活跃行优先」，不保证
+//! 「必有活跃行」）：`POST /parts/{id}/cancel` 把 part 打成 `CANCELLED` 后，终态
+//! 守卫会拦下 rollup 里的 `release_part_serial_no`，序列号因此**保留**在库中、
+//! 同号重建前一直可扫。此时 `part.status` 原文透出 `CANCELLED`，前端应自行禁用
+//! 该节点上的写操作按钮。刻意**不加** `AND p.status <> 'CANCELLED'`：那样会让
+//! 已取消工单的货再也扫不到，属产品决策。
 //!
 //! `t_assembly` 的 `uk_t_assembly_serial_no` 是**全量**唯一索引
 //! （`WHERE deleted_at IS NULL AND serial_no IS NOT NULL`），活跃行必然唯一，
@@ -69,9 +86,9 @@
 //! **假定** holder id 在三表 PK 空间里互不重叠；一旦某 id 同时命中其中两表，
 //! 取到的是 `t_shelf.name`。
 //!
-//! 完整说明（5 处清单 + 正确解法 `CASE location …` + 为何本次不动）见
+//! 完整说明（6 处清单 + 正确解法 `CASE location …` + 为何不动）见
 //! `prod::batch::repo` 模块 doc 的「holder 三表 COALESCE 的多态歧义」一节；
-//! **本文件是该形态的全仓第 6 处**（前 5 处：3 处 `t_shelf.name` 形态 + 2 处
+//! **本文件是该形态的全仓第 6 处**（4 处 `t_shelf.name` 形态含本文件 + 2 处
 //! `t_shelf.code` 变体）。
 //!
 //! 本次刻意**不**修：修这一处会让 6 条 SQL 对部分历史脏数据的行为发生变化，
