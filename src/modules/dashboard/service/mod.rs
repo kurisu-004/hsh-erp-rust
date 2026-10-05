@@ -3,18 +3,18 @@
 //! 拆分依据（Group E 重构 + 单文件职责 / 1000 行上限）：把单文件 `service.rs`
 //! 拆为
 //! - `snapshot` —— `build_snapshot_with_workers` 装配大屏完整快照（含工人持有的
-//!   PICKED_UP 时间戳、产线架每架 top-10 截流、worker 名称查表、未来 N 天交付分桶
-//!   （N 来自 `?upcoming_days=` / WS 路径默认 14；2026-09-30 同步））
+//!   PICKED_UP 时间戳、产线架每架 top-10 截流、worker 名称查表、未来 N 天交付分桶）
+//!
+//! 形参 `days` / `basis` 语义见 `service/snapshot.rs::build_snapshot_with_workers` / `dto.rs::DeliveryBasis`。
 //!
 //! `DashboardSnapshot` / `OnProductionShelfGroup` / `DashboardItem` /
-//! `UpcomingDeliveryBucket` 等数据结构在 `dto.rs`（2026-09-22 从 service.rs 平移），
+//! `UpcomingDeliveryBucket` 等数据结构在 `vo/snapshot.rs`（2026-09-22 从 service.rs 平移），
 //! `BatchLite` / `PartLite` 等 SQL 行精简在 `repo/sql.rs`。
 //!
 //! ## 调用方契约
 //! `handler.rs` 仅引 `crate::modules::dashboard::service::DashboardService::*`，
 //! 不直接访问 `snapshot` 子模块。本模块用 `pub use snapshot::*` 把 `DashboardService`
-//! 类型 + 方法重新汇出到 `service` 命名空间；`impl DashboardService` 块写在
-//! `snapshot.rs` 里不影响方法可见性 —— Rust 的 inherent 方法按类型名寻址，
+//! 类型 + 方法重新汇出到 `service` 命名空间。Rust 的 inherent 方法按类型名寻址，
 //! 不依赖定义所在文件。
 //!
 //! ## 事务分层（2026-09-22 Group E 重构对齐 iam 范本）
@@ -27,10 +27,11 @@
 //! `DashboardService` 是 unit struct（无字段依赖，iam 范本 §6）；方法签名
 //! `<R: DashboardRepoTrait>(&self, mut repo: R, ...)`，生产 `R = &mut PgConnection`。
 //!
-//! ## dashboard 域只有 snapshot 业务
-//! dashboard 是 WS-only 域，端点只有 `GET /ws/dashboard`，handler 三形态 ①（snapshot
-//! 拉一次即结束，开 tx 但只读无副作用，commit 即可）。后续 ws_hub.broadcast 是订阅模式，
-//! handler 不再走 service。
+//! ## dashboard 域两个端点
+//! - `GET /ws/dashboard`（WS，2026-09-15 takeover-fill）—— 握手首推 snapshot +
+//!   订阅 `WsEvent::DashboardEvent` 增量 + 30s text 心跳 + 周期 re-auth
+//! - `GET /api/v2/dashboard/snapshot`（HTTP，2026-09-28 新增）—— HTTP 全量首取
+//!   大屏快照，与 WS 端点共用 service（同一 service、同 SQL；不引入新 repo 调用）
 
 pub mod snapshot;
 

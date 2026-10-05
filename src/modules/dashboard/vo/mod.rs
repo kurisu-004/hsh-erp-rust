@@ -8,16 +8,9 @@
 //! VO **禁止** 出现在 axum extractor 反序列化侧——`serde::Deserialize` 不实现；
 //! 只用于 service 组装 + handler `serde_json::to_string(&envelope)` 序列化。
 //!
-//! ## 2026-09-22 PR4 整理
-//! dashboard/dto.rs 原同时承担 WS 消息外壳（`WsSnapshotMsg` / `WsEventMsg` /
-//! `WsHeartbeatMsg`）和大屏 snapshot 子结构（`DashboardSnapshot` /
-//! `OnProductionShelfGroup` / `DashboardItem` / `UpcomingDeliveryBucket`）——
-//! 全部出参均迁移到 vo/snapshot.rs。`dashboard/dto.rs` 留空（dashboard 无
-//! Deserialize-only DTO），handler 仍可 import `WsQuery`（位于 handler.rs）。
-//!
-//! 见 `src/modules/dashboard/dto.rs`（保留仅为占位/历史参照）。
-
-// 2026-09-22 PR4：复制自 iam/vo/ 范本。
+//! ## 出参 / 入参侧放置约定
+//! dto.rs 仅承载 `DeliveryBasis` 枚举（query 反序列化所需）；
+//! 入参结构体（`WsQuery` / `SnapshotQuery`）定义在 handler.rs。
 
 pub mod snapshot;
 
