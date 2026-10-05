@@ -18,6 +18,23 @@
 --       `cos_opendal` 210~219、`cos_real_smoke` 220~229 全部物理不相交。
 --       （2026-10-05 review 第 1 轮：原占 201+ 与后两个 stub 声明的保留段相撞，
 --        故整体挪到 261+。）
+--
+--    ⚠️ 目录里**已存在的两处 ID 段撞车（都不是本文件引入，2026-10-05 复核时顺带
+--       发现，不在本次 scope）**：
+--       1. `process_design.sql` 实际占 001~025，而 `process_chain.sql` 占 001~009；
+--       2. `user_repo.sql` 与 `wecom.sql` 两份都声明 120+，且两份都真的用到 120 / 121。
+--       两处都是不同 PR 里各自从段首起编号造成的（master 既有问题），修任一处要整体
+--       改写那份 fixture 的全部 ID，属独立改动，故本次只登记、不动。
+--
+--       上面那份核对清单覆盖的是**其余 18 份 fixture** 声明的段：010~049（part）、
+--       050~059（delivery）、060~069（production）、070~079（assembly）、
+--       080~089（shelf）、090~099（statistics）、100~109（outsource）、
+--       110~119（iam）、130~139（applicant）、140~149（customer）、
+--       150~159（dashboard_ws）、160~169（_e2e）、170~179（cnc_program）、
+--       180~189（auto_complete）、190~199（guard_dn_in_use）、200~209（idempotency）、
+--       210~219（cos_opendal）、220~229（cos_real_smoke）—— 逐段连续占满，
+--       230~260 是当前最大的整段空档，本段取 261+ 正落在其后。补 fixture 时按同一
+--       基准继续往后排（不要回填 230~260，那段留作缓冲）。
 --  - 预生成 bcrypt 哈希嵌入 SQL，避免每测试现场 hash (~250ms×N)。
 --    哈希明文 "changeme"，cost=12（与其余 fixture 逐字同一个哈希字面值）。
 --  - 时间列：审计字段用 now()，业务日期按 fixtures 字面。

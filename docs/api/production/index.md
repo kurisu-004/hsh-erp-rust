@@ -161,10 +161,12 @@
 |---|---|---|---|---|
 | GET | `/api/v2/prod/inspection/scan/{serial_no}` | Manager+Inspector | 扫码查询：返回「装配件（可空）→ 全部子件 → 全部批次」三层树。命中口径先 `t_part.serial_no`、未命中回退 `t_assembly.serial_no`，都未命中 → 20101 / 404；**读全部批次不按状态过滤**；`process_name` 对 `INSPECTION` / `DELIVERED` 恒 `null` | [`inspection.md`](./inspection.md#get-apiv2prodinspectionscanserial_no) |
 
-> 归属说明：前端待品检页的扫码路径 2026-10-05 从 part 域
-> `GET /api/v2/parts/by-serial/{serial_no}`（+ `/part-batches`）切到本端点 —— 旧两个
+> 归属说明：前端待品检页的扫码路径 ⏳ **建议**从 part 域
+> `GET /api/v2/parts/by-serial/{serial_no}`（+ `/part-batches`）切到本端点（**切换
+> 尚未在前端仓合入**，2026-10-05 后端先上）—— 旧两个
 > 端点都是**单 part 上下文**，既不返回装配件节点、也不展开兄弟子件，无法支撑扫码弹窗
-> 「一次取全 + 直接调 to-ship / to-process」的动作链。**part 域一行未改**，旧端点保留兼容。
+> 「一次取全 + 直接调 to-ship / to-process」的动作链。**part 域一行未改**，旧端点保留
+> 兼容、当前**仍在被调用**。
 > ⚠️ 本端点 `ScanBatchOut.version` 是 `t_part_batch.version`（**OCC 锚**），
 > `ScanPartOut.version` 是 `t_part.version`（仅展示）—— 两者不许混用，详见
 > [`inspection.md#版本号分工前端最容易踩的一处`](./inspection.md#版本号分工前端最容易踩的一处)。
@@ -315,7 +317,7 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 - **i64 雪花 ID**：JSON 序列化为 `string`，避免 JS `Number.MAX_SAFE_INTEGER` 精度截断（详见 `shared::types`）
 - **乐观锁（OCC）**：表行 `version` 列；UPDATE 带 `WHERE id=$1 AND version=$2`，命中 0 行 → 40901 `VERSION_CONFLICT`
 - **软删除**：`deleted_at IS NULL`；已软删件视为不存在 → 2xxxx `_NOT_FOUND` 错误码
-- **事务边界在 handler**：handler `state.pool.begin()` → 传 `&mut tx` 给 service → 显式 `tx.commit()`；repo 用 `impl PgExecutor<'_>` 以同时接受 pool/conn/tx
+- **事务边界在 handler**：写端点 handler `state.pool.begin()` → 传 `&mut tx` 给 service → 显式 `tx.commit()`；repo 用 `impl PgExecutor<'_>` 以同时接受 pool/conn/tx。**纯读端点例外**：`pool.acquire()` 不开事务，service 借 `&mut PgConnection` 跑查询、连接用完即 drop（本目录的 `prod::programming` / `prod::process_design` / `prod::inspection` 3 个只读端点都是这一形态）
 - **WS 广播在 commit 之后**：避免慢 WS 拖慢 HTTP 响应；本目录 10 个子模块内，
   - `prod::worker_pool` —— 5 个 `WORKER_*` 事件（详见 [`worker-pool.md#ws-事件清单`](./worker-pool.md#ws-事件清单worker-pool-相关)）
   - `prod::batch` —— 1 个 `BATCH_PLACED_ON_SHELF` 事件（详见 [`batches.md` 事务 + WS 广播](./batches.md#事务--ws-广播沿-worker_pool-范本)）
@@ -359,7 +361,7 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
 - ✅ **`prod::shelf_process`**（2026-10-02 新增）：货架 ↔ 工序映射 3 端点（全集查询 / 单架查询 / 整组替换），`t_shelf_process` SQL 真源收口到 `ShelfProcessRepo`（6 个静态方法：平移 4 + 从 `prod::batch` / `prod::worker_pool` 各收 1 处）；URL `/api/v2/prod/shelf-processes/*`，旧路径 404 无 alias；零 schema 变更；集成测试 `tests/production/shelf_process.rs` **4 场景**
 - ✅ **菜单整合**：migration 018 建 `production_group` + `part_process_chain` + 迁移 `worker_queue`；migration 021 软删 settings_root + 3 子菜单 + 新增 `process_work_type`（2026-09-12）
 - ✅ **`prod::process_design`**（2026-10-05 新增）：制定工序页零件列表 1 只读端点（软删闸门 + `status='PENDING'` 闸门；7 字段最小集；**刻意不加** `AND assembly_id IS NULL` 守卫故含装配件子件；入参只有 `sort_dir` / `limit` / `offset` 三个；`limit` / `offset` 空串走缺省 + `clamp(1,500)` / `max(0)`；排序键固定 `serial_no` 字典序 + 两方向 `NULLS LAST`；角色 Manager+Clerk+Inspector+CNC_PROGRAMMER），URL `/api/v2/prod/process-design/parts`；零 schema 变更、`.sqlx/` 零变更；集成测试 `tests/production/process_design.rs` **8 场景**
-- ✅ **`prod::inspection`**（2026-10-05 新增）：扫码查询 1 只读端点（「装配件（可空）→ 全部子件 → 全部批次」三层树；命中口径先 `t_part.serial_no`、未命中回退 `t_assembly.serial_no`，都未命中 → `20101` / 404，`serial_no` trim 后为空同样按未命中；软删闸门覆盖 part / assembly / batch 三表；**读全部批次不按状态过滤**含终态；`process_name` 走 `current_process_id` 权威列，故 `INSPECTION` / `DELIVERED` 恒 `null`；`is_scanned` 是唯一内存派生字段（`t_part_batch` 无序列号列）；批次层一条 SQL `part_id = ANY($1)` 取回整棵树、无 N+1；角色 Manager+Inspector），URL `/api/v2/prod/inspection/scan/{serial_no}`；零 schema 变更；集成测试 `tests/production/inspection.rs` **12 场景**
+- ✅ **`prod::inspection`**（2026-10-05 新增）：扫码查询 1 只读端点（「装配件（可空）→ 全部子件 → 全部批次」三层树；命中口径先 `t_part.serial_no`、未命中回退 `t_assembly.serial_no`，都未命中 → `20101` / 404，`serial_no` trim 后为空同样按未命中；软删闸门覆盖 part / assembly / batch 三表；**读全部批次不按状态过滤**含终态；`process_name` 走 `current_process_id` 权威列，故 `INSPECTION` / `DELIVERED` 恒 `null`；`is_scanned` 是唯一内存派生字段（`t_part_batch` 无序列号列）；批次层一条 SQL `part_id = ANY($1)` 取回整棵树、无 N+1；角色 Manager+Inspector），URL `/api/v2/prod/inspection/scan/{serial_no}`；零 schema 变更；集成测试 `tests/production/inspection.rs` **13 场景**
 - ✅ **API 文档整合**：本目录（2026-09-12；2026-09-29 增 `batches.md`；2026-09-30 增 move + 重构 pool/batches；2026-10-01 增 `pending-programming.md`；2026-10-02 增 `shelf-process-mapping.md`；2026-10-05 增 `process-design.md` + `inspection.md`）
 - ✅ **prod 容器聚合**（2026-09-19）：5 支撑域平移至 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`，旧 nest 下线无 alias，前端配套 PR 锁步
 

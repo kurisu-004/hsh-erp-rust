@@ -3,7 +3,7 @@
 //! 端点：`GET /api/v2/prod/inspection/scan/{serial_no}`
 //!      （测试内路径 `/prod/inspection/scan/{serial_no}`，不带 `/api/v2` 前缀）
 //!
-//! 覆盖 12 个场景：
+//! 覆盖 13 个场景：
 //!   1. **独立件树**：`hit_kind="PART"`、`assembly=null`、`children.len()==1`，
 //!      该件的 `children` 是它的全部批次（8 个，含终态）
 //!   2. **装配件树（★ 核心回归）**：扫子件 → `assembly` 非空、`children` 是**全部
@@ -23,6 +23,8 @@
 //!  11. **`process_name`**：`INSPECTION` / `READY_TO_SHIP` 批次恒 `null`（出池清
 //!      `current_process_id` 不变式的正确结果），`IN_PROCESS` 批次取到工序名
 //!  12. **`is_repairing`** 标记透传
+//!  13. **序列号含 `/`**：`%2F` 正确编码后单段匹配 + `Path` 解码命中；未编码则
+//!      路由不匹配 → 404 **空响应体**（前端 `res.json()` 会抛解析异常）
 //!
 //! ## 集成测试范本（PR13 Phase F / H）
 //! HTTP helper（`send` / `json_request` / `login_token` / `test_app` / `test_state` /
@@ -35,8 +37,8 @@ use serde_json::Value;
 use sqlx::PgPool;
 
 use hsh_erp_test_support::{
-    InspectionFixture, json_request, load_inspection_fixture, login_token, send, test_app,
-    test_pool, test_state,
+    InspectionFixture, json_request, load_inspection_fixture, login_token, send, send_raw,
+    test_app, test_pool, test_state,
 };
 
 /// 扫码端点路径前缀（测试 app 不带 `/api/v2` 前缀）。
@@ -177,6 +179,37 @@ async fn insert_inspection_batch(pool: &PgPool, part_id: i64, batch_no: i32) -> 
     id
 }
 
+/// 本域独享 raw SQL helper（造场景差异行）：插入一个**序列号含 `/`** 的独立零件。
+///
+/// 只在「`%2F` 解码」场景里用到。序列号是 `varchar(15)` 的业务自由文本，`/` 是
+/// 合法字符但同时是 URL 路径分隔符 —— 前端必须 `encodeURIComponent` 成 `%2F`，
+/// axum 才会把它当**单段**匹配并由 `Path` 解码回含 `/` 的序列号（详见
+/// `src/modules/prod/inspection/handler.rs` 模块 doc 的「路径参数」节）。
+async fn insert_part_with_slash_serial(pool: &PgPool, serial_no: &str) -> i64 {
+    use hsh_erp_rust::infra::clock::now_naive;
+
+    let id = hsh_erp_test_support::pool_snowflake()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .next_id();
+    let now = now_naive();
+    sqlx::query(
+        "INSERT INTO t_part (id, serial_no, name, drawing_no, applicant_name, \
+         request_date, planned_delivery_date, status, is_urgent, customer_id, \
+         quantity, version, created_at, updated_at) \
+         VALUES ($1, $2, 'SI slash serial part', 'D-SI-SLASH', 'SI', \
+                 $3::date, $3::date, 'INSPECTION', false, $4, 1, 0, $3, $3)",
+    )
+    .bind(id)
+    .bind(serial_no)
+    .bind(now)
+    .bind(InspectionFixture::L2_CUSTOMER_ID)
+    .execute(pool)
+    .await
+    .expect("insert t_part (序列号含 '/')");
+    id
+}
+
 // ===========================================================================
 //  Tests
 // ===========================================================================
@@ -190,7 +223,8 @@ async fn standalone_part_returns_single_part_tree_with_all_batches() {
 
     assert_eq!(env["data"]["hit_kind"], "PART", "独立件命中来源: {env}");
     assert_eq!(
-        env["data"]["scanned_serial_no"], InspectionFixture::STANDALONE_SERIAL_NO,
+        env["data"]["scanned_serial_no"],
+        InspectionFixture::STANDALONE_SERIAL_NO,
         "回显的应是 trim 后的原始扫码串: {env}"
     );
     assert!(
@@ -216,7 +250,8 @@ async fn standalone_part_returns_single_part_tree_with_all_batches() {
     // 扫码串带尾随空白仍命中（service 统一 trim）
     let trimmed = scan(&app, &token, "SI-S1001%20").await;
     assert_eq!(
-        trimmed["data"]["scanned_serial_no"], InspectionFixture::STANDALONE_SERIAL_NO,
+        trimmed["data"]["scanned_serial_no"],
+        InspectionFixture::STANDALONE_SERIAL_NO,
         "尾随空白应被 trim 掉再回显: {trimmed}"
     );
 }
@@ -235,16 +270,17 @@ async fn scanning_child_returns_whole_assembly_tree() {
 
     assert_eq!(env["data"]["hit_kind"], "PART", "扫子件命中 t_part: {env}");
     let asm = &env["data"]["assembly"];
-    assert!(
-        !asm.is_null(),
-        "扫装配件子件时装配件节点必须有值: {env}"
-    );
+    assert!(!asm.is_null(), "扫装配件子件时装配件节点必须有值: {env}");
     assert_eq!(
         asm["id"].as_str(),
         Some(InspectionFixture::ASSEMBLY_ID.to_string().as_str()),
         "装配件节点 id 必须是被扫子件的父件: {env}"
     );
-    assert_eq!(asm["serial_no"], InspectionFixture::ASSEMBLY_SERIAL_NO, "{env}");
+    assert_eq!(
+        asm["serial_no"],
+        InspectionFixture::ASSEMBLY_SERIAL_NO,
+        "{env}"
+    );
     // 装配件节点**不该有**批次字段：`ScanAssemblyOut` 里根本没有 `children` 键
     // （t_assembly 在 t_part_batch 里没有行）。用 `get().is_none()` 而不是
     // `asm["children"].is_null()` —— 后者在 key 不存在时 serde_json 同样给
@@ -270,7 +306,10 @@ async fn scanning_child_returns_whole_assembly_tree() {
     );
 
     // 两个无批次子件**仍要出现**（batch 列表为空数组，不是 null）
-    for id in [InspectionFixture::PART_CHILD_2, InspectionFixture::PART_CHILD_3] {
+    for id in [
+        InspectionFixture::PART_CHILD_2,
+        InspectionFixture::PART_CHILD_3,
+    ] {
         let c = part_by_id(&env, id);
         assert_eq!(
             c["children"].as_array().expect("part.children").len(),
@@ -294,7 +333,10 @@ async fn scanning_assembly_serial_returns_same_tree_without_is_scanned() {
     let by_child = scan(&app, &token, InspectionFixture::CHILD_1_SERIAL_NO).await;
     let by_asm = scan(&app, &token, InspectionFixture::ASSEMBLY_SERIAL_NO).await;
 
-    assert_eq!(by_asm["data"]["hit_kind"], "ASSEMBLY", "扫装配件条码: {by_asm}");
+    assert_eq!(
+        by_asm["data"]["hit_kind"], "ASSEMBLY",
+        "扫装配件条码: {by_asm}"
+    );
     assert_ne!(
         by_asm["data"]["hit_kind"], by_child["data"]["hit_kind"],
         "两条命中路径的 hit_kind 必须能区分: {by_asm}"
@@ -375,13 +417,12 @@ async fn soft_deleted_child_and_batch_excluded() {
     let (pool, app, token, _fx) = bootstrap().await;
 
     // 前提：fixture 软删子件确实是「active assembly_id + deleted_at 非空」
-    let (assembly_id, deleted_at): (Option<i64>, Option<chrono::NaiveDateTime>) = sqlx::query_as(
-        "SELECT assembly_id, deleted_at FROM t_part WHERE id = $1",
-    )
-    .bind(InspectionFixture::PART_CHILD_DELETED)
-    .fetch_one(&pool)
-    .await
-    .expect("select 软删子件行");
+    let (assembly_id, deleted_at): (Option<i64>, Option<chrono::NaiveDateTime>) =
+        sqlx::query_as("SELECT assembly_id, deleted_at FROM t_part WHERE id = $1")
+            .bind(InspectionFixture::PART_CHILD_DELETED)
+            .fetch_one(&pool)
+            .await
+            .expect("select 软删子件行");
     assert_eq!(
         assembly_id,
         Some(InspectionFixture::ASSEMBLY_ID),
@@ -448,7 +489,8 @@ async fn is_scanned_only_marks_the_scanned_part_batches() {
     let c2 = part_by_id(&env, InspectionFixture::PART_CHILD_2);
     let sibling = batch_by_id(c2, sibling_batch, &env);
     assert_eq!(
-        sibling["is_scanned"], false,
+        sibling["is_scanned"],
+        false,
         "零件 {} 不是被扫中的那个 → 其批次 is_scanned 必须为 false: {env}",
         InspectionFixture::PART_CHILD_2
     );
@@ -586,14 +628,19 @@ async fn i64_ids_are_serialized_as_json_strings() {
     // 而 version / batch_no / quantity 是计数与版本号，序列化为 JSON number
     let c1 = part_by_id(&env, InspectionFixture::PART_CHILD_1);
     assert!(c1["version"].is_number(), "version 应是 JSON number: {env}");
-    assert!(c1["quantity"].is_number(), "quantity 应是 JSON number: {env}");
-    let b = batch_by_id(
-        c1,
-        InspectionFixture::BATCH_CHILD_INSPECTION,
-        &env,
+    assert!(
+        c1["quantity"].is_number(),
+        "quantity 应是 JSON number: {env}"
     );
-    assert!(b["version"].is_number(), "批次 version 应是 JSON number: {env}");
-    assert!(b["batch_no"].is_number(), "batch_no 应是 JSON number: {env}");
+    let b = batch_by_id(c1, InspectionFixture::BATCH_CHILD_INSPECTION, &env);
+    assert!(
+        b["version"].is_number(),
+        "批次 version 应是 JSON number: {env}"
+    );
+    assert!(
+        b["batch_no"].is_number(),
+        "batch_no 应是 JSON number: {env}"
+    );
 }
 
 /// 场景 10: 角色守卫 —— MANAGER / INSPECTOR 放行；三个角色 403 + 40300。
@@ -657,13 +704,12 @@ async fn process_name_is_null_for_out_of_pool_states() {
         (InspectionFixture::BATCH_INSPECTION, "INSPECTION"),
         (InspectionFixture::BATCH_READY_TO_SHIP, "READY_TO_SHIP"),
     ] {
-        let (status, current_process_id): (String, Option<i64>) = sqlx::query_as(
-            "SELECT status, current_process_id FROM t_part_batch WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .expect("select 批次 current_process_id");
+        let (status, current_process_id): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, current_process_id FROM t_part_batch WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("select 批次 current_process_id");
         assert_eq!(status, want_status, "前提：批次 {id} 的状态");
         assert!(
             current_process_id.is_none(),
@@ -708,8 +754,7 @@ async fn process_name_is_null_for_out_of_pool_states() {
 
     // holder 名从品检架 / 生产架三表 COALESCE 拼出
     assert_eq!(
-        b_ins["current_holder_display"],
-        "SI inspection shelf",
+        b_ins["current_holder_display"], "SI inspection shelf",
         "INSPECTION 批次的 holder 应拼出品检架名: {env}"
     );
     assert_eq!(
@@ -746,4 +791,60 @@ async fn is_repairing_flag_is_passed_through() {
             "批次 {id} 不是返修中 → is_repairing 应为 false: {env}"
         );
     }
+}
+
+/// 场景 13: 序列号含 `/` —— **正确编码（`%2F`）能命中，忘记编码则路由不匹配**。
+///
+/// 本端点把 `serial_no` 放在 path 单段上，而 `/` 是路径分隔符，故前端必须
+/// `encodeURIComponent`。两种形态都要钉死：
+///
+/// - `SI%2FA1` → 路由按**单段**匹配、`Path` 解码回 `SI/A1` → 200 + 正常树；
+/// - `SI/A1`（未编码）→ axum 拆成两段、匹配不到路由 → **404 且响应体为空**
+///   （`v2_router()` 未挂 `.fallback(...)`，没有信封可解析）。
+///
+/// ⚠️ 第二条锁的是**响应体为空**而非「code ≠ 20101 的信封」—— 后者是错的：
+/// 路由不匹配时 handler 一行都不执行，压根不会有 `AppError` 产出。
+#[tokio::test]
+async fn percent_encoded_slash_in_serial_no_is_decoded_and_matched() {
+    let (pool, app, token, _fx) = bootstrap().await;
+
+    let raw_serial = "SI/A1";
+    let part_id = insert_part_with_slash_serial(&pool, raw_serial).await;
+
+    // ① 正确编码 → 200 命中，回显与 children 都是**解码后**的含 `/` 序列号
+    let env = scan(&app, &token, "SI%2FA1").await;
+    assert_eq!(
+        env["data"]["hit_kind"], "PART",
+        "含 '/' 的码应命中 t_part: {env}"
+    );
+    assert_eq!(
+        env["data"]["scanned_serial_no"], raw_serial,
+        "回显的应是 Path 解码回带 '/' 的序列号: {env}"
+    );
+    assert_eq!(
+        part_ids(&env),
+        vec![part_id.to_string()],
+        "含 '/' 的独立件树应恰好 1 个顶层零件节点: {env}"
+    );
+
+    // ② 忘记编码 → 路由不匹配：404 + **空响应体**（拿不到信封）
+    let (status, body) = send_raw(
+        app.clone(),
+        json_request(
+            "GET",
+            &format!("{SCAN_PREFIX}/{raw_serial}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "未编码的 '/' 会把路径拆成两段 → 路由不匹配: body={body}"
+    );
+    assert!(
+        body.trim().is_empty(),
+        "路由不匹配时响应体应为空（v2_router 未挂 .fallback，没有信封）: body={body}"
+    );
 }

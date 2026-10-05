@@ -17,6 +17,7 @@
 - [版本号分工（前端最容易踩的一处）](#版本号分工前端最容易踩的一处)
 - [软删闸门](#软删闸门)
 - [响应 DTO](#响应-dto)
+- [响应规模（无上限、无分页）](#响应规模无上限无分页)
 - [关键错误码速查](#关键错误码速查)
 - [实现位置](#实现位置)
 - [维护约定](#维护约定)
@@ -64,10 +65,13 @@ Path：
 | `serial_no` | string | ✓ | 扫码得到的序列号。**精确匹配**（不做前缀 / `ILIKE` 模糊 —— `F100` 命中 `F1001` 会弹错树，比不弹更糟）；service 内 `trim()`，纯空白按未命中收口 |
 
 > ⚠️ **前端必须对 `serial_no` 做 `encodeURIComponent`**。序列号是业务侧自由文本，
-> 含 URL 保留字符时行为分两种，**都不是** 20101：
-> - 含 `/` → axum 路由在 `/scan/{serial_no}` 这一段就把它当路径分隔符拆开，匹配不到
->   路由 → **HTTP 404 但信封 `code` 不是 20101**（前端不能靠 code 区分「没扫到」与
->   「编码漏了」，只能靠请求 URL 自己保证编码）；
+> 含 URL 保留字符时行为分两种，**都不是 20101**：
+> - 含 `/` → **未**编码时 axum 路由在 `/scan/{serial_no}` 这一段就把它当路径分隔符拆开，
+>   匹配不到路由 → **HTTP 404 且响应体为空**：`v2_router()` 未挂 `.fallback(...)`，
+>   handler 一行都不执行，**根本没有任何信封**可解析（前端 `res.json()` 直接抛解析
+>   异常，**不是**「拿到一个 code ≠ 20101 的信封」）。**正确**编码成 `%2F` 时路由按单段
+>   匹配、`Path` 解码回含 `/` 的序列号，正常走命中 / 20101 收口（回归测试：场景 13
+>   同时钉死「编码后 200 命中」与「未编码 404 空 body」两种形态）；
 > - 含 `?` / `#` → 未编码时在客户端或代理层被当成 query / fragment 起始符，序列号被
 >   **截断**，表现为「扫到了但不对的码」。
 >
@@ -75,7 +79,8 @@ Path：
 > 个 `%`」与「前端忘了编码」。`%20` 这类已编码的空白会被 Path 正常解码，再由 service
 > `trim()` 收口（见集成测试场景 4）。
 
-Query：**无**（本端点不接受任何 query 参数；分页 / 筛选一概没有）
+Query：**无**（本端点不接受任何 query 参数；分页 / 筛选一概没有 —— 体积口径见
+[响应规模](#响应规模无上限无分页)）
 
 Request body：**无**
 
@@ -304,7 +309,7 @@ part / assembly / batch 三处的软删行一律不返回（逐条 SQL 写死）
   "assembly": {
     "id": "9000000000000000278", "serial_no": "SI-ASM", "name": "SI assembly",
     "drawing_no": "D-SI-ASM", "status": "IN_PROCESS", "quantity": 1,
-    "is_urgent": false, "system_delivery_date": "2026-11-04",
+    "is_urgent": false, "system_delivery_date": null,
     "customer_name": "SI L1 customer"
   },
   "children": [
@@ -332,6 +337,32 @@ part / assembly / batch 三处的软删行一律不返回（逐条 SQL 写死）
 
 > ⚠️ 示例里的 `version` 是刻意错开的两对：零件 `version: 4` vs 批次 `version: 7`。
 > 前端调 `to-ship` / `to-process` / `to-inspection` 时回传的是**批次**的 7。
+>
+> ⚠️ 示例里 `assembly.system_delivery_date` 是 `null`：该列（`t_assembly` 的
+> `system_delivery_date date`，可空无默认）在本文配套的 fixture 里**没写**，
+> 故实际响应就是 `null` —— 与同示例里 3 个子件的 `system_delivery_date` 形态一致，
+> 不是漏抄。
+
+---
+
+## 响应规模（无上限、无分页）
+
+**本端点不接受任何 query 参数**（见端点下的「Query」行），`children` 与每个
+`children[].children` 都是**无界数组**，后端不做任何条数截断：
+
+| 数组 | 规模由什么决定 |
+|---|---|
+| `children` | 该装配件的**活跃子件数**（独立件树恒为 1） |
+| `children[].children` | 该子件的**活跃批次数**（不按 status 过滤，含终态） |
+
+⇒ 响应体规模 ≈ **子件数 × 每件批次数**，**无上限、无分页**。大装配件 + 多子件 + 多批次
+时体积不受控。对比 `GET /api/v2/prod/batches/inspection` 那个队列端点带
+`limit`（clamp 到 1~200），本端点**刻意没有** —— 扫码弹窗要一次答全「这批货总共分了
+几批、哪些压在品检架上、每批能点什么动作」，截断答不全，分页则会让动作链多一次往返。
+
+⚠️ **超大装配件的正解在前端**：本端点将来也**不会**变成分页端点（加 `limit` 属契约
+变更，须前后端同一次改动）。届时应由前端对树做**虚拟表格 / 按需展开**（默认只渲染展开
+路径上的节点），而不是等后端加参数。
 
 ---
 
@@ -345,7 +376,11 @@ part / assembly / batch 三处的软删行一律不返回（逐条 SQL 写死）
 
 **关于 20101**：本端点**复用** part 域的 `BIZ_PART_NOT_FOUND` 而不是另开错误码 ——
 语义完全相同（扫到的东西不存在），前端按同一个 code 弹「未找到」即可。`message` 携带
-原始（trim 后的）扫码串：`序列号 {serial_no} 未找到对应零件或装配件`。
+原始（trim 后的）扫码串，模板是 `序列号 {serial_no} 未找到对应零件或装配件`。
+
+> ⚠️ **纯空白串那条路径的 `{serial_no}` 是占位符 `(空)`**，不是空串 —— 直接插值会渲染
+> 成「序列号␣␣未找到…」（双空格），故 service 传 `"(空)"`，message 原文是
+> `序列号 (空) 未找到对应零件或装配件`。前端按 code 弹窗、别去解析 message。
 
 **关于 40100**：未登录 / token 过期由中间件返回，见
 [`../index.md`](../index.md#跨域错误码速查)。
@@ -433,6 +468,10 @@ false、结果本就为空）。
    守卫会留在库里，加守卫等于让这批货再也扫不到，属**产品决策**（见端点下的「⚠️
    同一 `serial_no` 可能并存多行」节）；本端点按「同号仅存 `CANCELLED` 行也返回正常
    树、`status` 原文透出」处理，写操作门禁在前端。
+8. **不要给本端点加 `limit` / 任何 query 参数**。响应规模 = 子件数 × 每件批次数，
+   **无上限、无分页**是**刻意**的（见[响应规模](#响应规模无上限无分页)）：扫码弹窗要
+   一次取全，截断答不全、分页多一次往返。规模过大时的正解是前端虚拟表格 / 按需展开，
+   不是后端加参数 —— 真要加就是契约变更，须前后端同一次改动。
 
 ---
 
@@ -443,12 +482,13 @@ false、结果本就为空）。
   - repo ZST + 5 个静态方法，全走 `sqlx::query_as!` 宏（编译期连库校验列名 / 列类型）
   - 角色守卫 Manager + Inspector（service 内 `require_any_role`）
   - **part 域 `GET /parts/by-serial/{serial_no}` 与 `/part-batches` 一行未改**（保留兼容）
-- ✅ 集成测试：`tests/production/inspection.rs` —— **12 场景**
+- ✅ 集成测试：`tests/production/inspection.rs` —— **13 场景**
   （1 独立件树 + trim / 2 ★扫子件返回整棵装配件树 / 3 扫装配件条码 = 同一棵树 +
   `is_scanned` 全 false / 4 未命中与纯空白串 404 + 20101 / 5 软删子件与软删批次闸门 /
   6 `is_scanned` 只标被扫中那个 part / 7 八种批次状态全在（含终态）/ 8 批次 version
   来自 `t_part_batch` 而非 `t_part` / 9 i64 → JSON string / 10 角色守卫两放行三拒绝 /
-  11 `process_name` 出池态恒 null + 生产中取真值 / 12 `is_repairing` 标记透传）
+  11 `process_name` 出池态恒 null + 生产中取真值 / 12 `is_repairing` 标记透传 /
+  13 序列号含 `/`：`%2F` 编码后单段匹配 + 解码命中，未编码则 404 **空 body**）
 - ✅ fixture：`test-support/fixtures/inspection.sql` + `test-support/src/fixture/inspection.rs`
   （ID 走 9_000_000_000_000_000_261+ 区段，与 `test-support/fixtures/` 下全部
   fixture 声明的 ID 段物理不相交；新增 fixture 前请核对该目录全部文件的头注释）

@@ -31,9 +31,9 @@
 //!
 //! 而 `LEFT JOIN` 进来的 `t_process` / `t_shelf` / `t_worker` /
 //! `t_outsource_company` 四张表**不加**软删闸门 —— 与 `prod::batch::repo` 的
-//! `list_active_by_part_id_with_holder` / `list_batches` 既有写法一致（工序名、
-//! holder 名都是展示用附加信息，被软删也照常显示最后的样子）。故上面这张清单不是
-//! 「本端点读过的全部表」的清单。
+//! `list_active_by_part_id_with_holder` 既有写法一致（工序名、holder 名都是展示用
+//! 附加信息，被软删也照常显示最后的样子）。故上面这张清单不是「本端点读过的全部表」
+//! 的清单。
 //!
 //! ⚠️ 软删闸门**不是**「保守过滤」而是本端点的语义闸门：扫到软删行等于扫到一个
 //! 业务上已不存在的码，前端据此弹「未找到」比弹一棵含已删数据的树更安全。

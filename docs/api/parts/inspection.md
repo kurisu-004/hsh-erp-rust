@@ -26,7 +26,7 @@
 - [POST /api/v2/prod/batches/{batch_id}/to-process](#post-apiv2prodbatchesbatch_idto-process)
 - [POST /api/v2/prod/batches/worker-scan](#post-apiv2prodbatchesworker-scan)
 - [GET /api/v2/parts/by-serial/{serial_no}/part-batches](#get-apiv2partsby-serialserial_nopart-batches)
-  - [★ 扫码路径已切至 prod 域（2026-10-05）](#-扫码路径已切至-prod-域2026-10-05)
+  - [★ 扫码路径建议切至 prod 域（2026-10-05）](#-扫码路径建议切至-prod-域2026-10-05)
 - [GET /api/v2/prod/batches/inspection](#get-apiv2prodbatchesinspection)
 - [乐观锁（caller 侧 OCC）](#乐观锁caller-侧-occ)
 - [自动拆批（auto-split）](#自动拆批auto-split)
@@ -536,17 +536,23 @@ Response 200 `data`：`PartScanContextOut`
 - repo（part）：`src/modules/part/repo/sql/part_sql.rs::get_by_serial`
 - model：`src/modules/prod/batch/model.rs::TPartBatch`（批次行 + 状态枚举）
 
-#### ★ 扫码路径已切至 prod 域（2026-10-05）
+#### ★ 扫码路径建议切至 prod 域（2026-10-05）
 
-**前端待品检页的扫码路径已切至** [`GET /api/v2/prod/inspection/scan/{serial_no}`](../production/inspection.md#get-apiv2prodinspectionscanserial_no)
+**前端待品检页的扫码路径 ⏳ 建议切至**
+[`GET /api/v2/prod/inspection/scan/{serial_no}`](../production/inspection.md#get-apiv2prodinspectionscanserial_no)
 （`prod::inspection` 扫码查询），返回「装配件（可空）→ 全部子件 → 全部批次」三层树。
 完整契约（命中口径 / 两条必须记住的口径 / DTO 逐字段表 / 错误码）见
 [`../production/inspection.md`](../production/inspection.md)。
 
-**本页 `GET /api/v2/parts/by-serial/{serial_no}/part-batches` 端点保留，但本页不再调用。**
-`part` 域另一端点 `GET /api/v2/parts/by-serial/{serial_no}` 同样保留兼容、**一行未改**。
+> ⚠️ **前端尚未切换（2026-10-05，后端先上）**：`prod::inspection` 已在 prod 域上线，
+> 但**前端仓里的切换尚未合入**，故本端点当前**仍在被调用**。前端配套完成后本页两个
+> 端点即可下线调用（**后端端点保留兼容、一行未改**，不设下线日期）。
+>
+> **本页两个旧端点 `GET /api/v2/parts/by-serial/{serial_no}` 与
+> `GET /api/v2/parts/by-serial/{serial_no}/part-batches` 一律保留**，是否继续调用由
+> 前端决定 —— 「切过去」是前端待办，不是既成事实。
 
-切过去的理由（不是「旧端点坏了」，是**表达不了**）：
+建议切过去的理由（不是「旧端点坏了」，是**表达不了**）：
 
 | 维度 | 本页两个旧端点 | `prod::inspection` |
 |---|---|---|

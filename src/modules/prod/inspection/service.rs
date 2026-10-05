@@ -36,7 +36,9 @@ use sqlx::PgConnection;
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::prod::inspection::model::{ScanAssemblyRow, ScanBatchRow, ScanPartRow};
 use crate::modules::prod::inspection::repo::InspectionScanRepo;
-use crate::modules::prod::inspection::vo::{ScanAssemblyOut, ScanBatchOut, ScanPartOut, ScanTreeOut};
+use crate::modules::prod::inspection::vo::{
+    ScanAssemblyOut, ScanBatchOut, ScanPartOut, ScanTreeOut,
+};
 use crate::shared::error::{AppError, code};
 
 /// 扫码端点允许的角色：Manager 或 Inspector。
@@ -103,29 +105,25 @@ impl InspectionScanService {
                 // 扫到零件：父装配件活跃 → 整棵装配件树；父装配件已软删（取不
                 // 到）→ 退化成独立件树（assembly = null），不返回孤儿树。
                 match p.assembly_id {
-                    Some(asm_id) => match InspectionScanRepo::find_assembly_by_id(
-                        &mut *conn,
-                        asm_id,
-                    )
-                    .await?
-                    {
-                        Some(asm) => HitTree {
-                            kind: HitKind::Part,
-                            scanned_part_id: Some(p.id),
-                            parts: InspectionScanRepo::list_parts_by_assembly(
-                                &mut *conn,
-                                asm_id,
-                            )
-                            .await?,
-                            assembly: Some(asm),
-                        },
-                        None => HitTree {
-                            kind: HitKind::Part,
-                            scanned_part_id: Some(p.id),
-                            parts: vec![p],
-                            assembly: None,
-                        },
-                    },
+                    Some(asm_id) => {
+                        match InspectionScanRepo::find_assembly_by_id(&mut *conn, asm_id).await? {
+                            Some(asm) => HitTree {
+                                kind: HitKind::Part,
+                                scanned_part_id: Some(p.id),
+                                parts: InspectionScanRepo::list_parts_by_assembly(
+                                    &mut *conn, asm_id,
+                                )
+                                .await?,
+                                assembly: Some(asm),
+                            },
+                            None => HitTree {
+                                kind: HitKind::Part,
+                                scanned_part_id: Some(p.id),
+                                parts: vec![p],
+                                assembly: None,
+                            },
+                        }
+                    }
                     None => HitTree {
                         kind: HitKind::Part,
                         scanned_part_id: Some(p.id),
@@ -151,7 +149,8 @@ impl InspectionScanService {
 
         // 批次层：一条 SQL 覆盖整棵树（无 N+1），空零件列表时 repo 直接返空。
         let part_ids: Vec<i64> = hit.parts.iter().map(|p| p.id).collect();
-        let batch_rows = InspectionScanRepo::list_batches_by_part_ids(&mut *conn, &part_ids).await?;
+        let batch_rows =
+            InspectionScanRepo::list_batches_by_part_ids(&mut *conn, &part_ids).await?;
 
         // 按 part_id 内存分组；SQL 已按 (part_id, batch_no, id) 排好序，
         // 分组后每个零件的批次序与 SQL 序一致，前端无需二次排序。
