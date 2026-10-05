@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO t_part (\n                id, name, drawing_no, applicant_name, quantity, request_date,\n                planned_delivery_date, is_urgent, customer_id, assembly_id,\n                order_no, system_delivery_date, note, status,\n                unit_price, total_price, serial_no, version, created_by\n            ) VALUES (\n                $1, $2, $3, $4, $5, $6,\n                $7, $8, $9, $10,\n                $11, $12, $13, 'PENDING',\n                COALESCE($14, 0::numeric), COALESCE($15, 0::numeric), $16, 0, $17\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Date",
+        "Date",
+        "Bool",
+        "Int8",
+        "Int8",
+        "Varchar",
+        "Date",
+        "Varchar",
+        "Numeric",
+        "Numeric",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "29ba0327713236c1923abe911190369b97d198f1cd02ecd8a42899d2acbe7765"
+}

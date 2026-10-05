@@ -197,6 +197,8 @@ pub trait AssemblyRepoTrait: Send {
         drawing_no: Option<&'a str>,
         quantity: i32,
         planned_delivery_date: Option<chrono::NaiveDate>,
+        unit_price: Option<rust_decimal::Decimal>,
+        total_price: Option<rust_decimal::Decimal>,
         inherit: ChildInheritFields<'a>,
         current_user_id: i64,
         initial_batch_id: i64,
@@ -266,14 +268,12 @@ pub trait AssemblyRepoTrait: Send {
     /// L1 → L2 子节点 + 自身展开（recursive CTE）；若入参是 L2 直接返回 `[customer_id]`。
     async fn expand_customer_l2_ids(&mut self, customer_id: i64) -> Result<Vec<i64>, sqlx::Error>;
 
-    /// customer.serial_prefix（用于 PDF 上传序列号派发）。
-    async fn fetch_customer_serial_prefix(
+    /// 建单派序列号用的 L1 客户 `serial_prefix` 首字符。委托
+    /// `shared::serial::prefix_for_customer`（与 part 域同一实现，全仓只一份）。
+    async fn serial_prefix_for_customer(
         &mut self,
         customer_id: i64,
-    ) -> Result<Option<String>, sqlx::Error>;
-
-    /// customer L1 id（`COALESCE(parent_id, id)`，把 L2 叶子转回 L1）。
-    async fn fetch_customer_l1_id(&mut self, customer_id: i64) -> Result<Option<i64>, sqlx::Error>;
+    ) -> Result<char, crate::shared::error::AppError>;
 
     /// customer name + parent_id 批量查（防 N+1，`ids` 为空返回空 HashMap）。
     async fn fetch_customer_names_by_ids<'a>(
@@ -547,6 +547,8 @@ impl AssemblyRepoTrait for &mut PgConnection {
         drawing_no: Option<&'b str>,
         quantity: i32,
         planned_delivery_date: Option<chrono::NaiveDate>,
+        unit_price: Option<rust_decimal::Decimal>,
+        total_price: Option<rust_decimal::Decimal>,
         inherit: ChildInheritFields<'b>,
         current_user_id: i64,
         initial_batch_id: i64,
@@ -561,6 +563,8 @@ impl AssemblyRepoTrait for &mut PgConnection {
             drawing_no,
             quantity,
             planned_delivery_date,
+            unit_price,
+            total_price,
             inherit,
             current_user_id,
             initial_batch_id,
@@ -706,27 +710,11 @@ impl AssemblyRepoTrait for &mut PgConnection {
         }
     }
 
-    async fn fetch_customer_serial_prefix(
+    async fn serial_prefix_for_customer(
         &mut self,
         customer_id: i64,
-    ) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT serial_prefix FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(customer_id)
-        .fetch_optional(&mut **self)
-        .await?;
-        Ok(row.and_then(|(p,)| p))
-    }
-
-    async fn fetch_customer_l1_id(&mut self, customer_id: i64) -> Result<Option<i64>, sqlx::Error> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT COALESCE(parent_id, id) FROM t_customer WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(customer_id)
-        .fetch_optional(&mut **self)
-        .await?;
-        Ok(row.map(|(p,)| p))
+    ) -> Result<char, crate::shared::error::AppError> {
+        crate::shared::serial::prefix_for_customer(&mut **self, customer_id).await
     }
 
     async fn fetch_customer_names_by_ids<'b>(

@@ -93,7 +93,8 @@ pub async fn get_assembly(
 ///
 /// multipart body：
 /// - `data`：必填，文本字段，序列化后的 `AssemblyCreateRequest` JSON；
-/// - `files`：可选，多个 PDF 二进制字段（首份会被 service 用作页数校验）。
+/// - `files` / `file`：可选，多个 PDF 二进制字段（首份会被 service 用作页数校验）。
+///   两个字段名等价，都收；PDF 在本端点**不入库**。
 ///
 /// 行为：
 /// - 业务流转：service `create_assembly`（L2 customer 校验 + 子件上限 +
@@ -121,7 +122,9 @@ pub async fn create_assembly(
                         .map_err(|e| AppError::validation(format!("data 字段读取失败: {e}")))?,
                 );
             }
-            "files" => {
+            // `files` / `file` 等价：只认其中一个名字的话，另一种拼写会被下面的
+            // `_` 分支静默吞掉，表现为「PDF 没生效」而没有任何报错。
+            "files" | "file" => {
                 let bytes = field
                     .bytes()
                     .await

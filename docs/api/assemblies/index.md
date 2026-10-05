@@ -53,7 +53,7 @@
 > 是 NOT NULL，DTO 去 `Option<>` 包裹；`TAssembly` model 同步去 `Option<NaiveDate>`。
 | `status` | string | 状态枚举字符串（PENDING / IN_PROCESS / INSPECTION / READY_TO_SHIP / DELIVERED / COMPLETED / CANCELLED，2026-09 扩 7 态对齐 Python） |
 | `version` | i32 | 乐观锁 |
-| `serial_no` | string? | 主装配体序列号（无 PDF 时 None；格式 `{prefix}{counter:07}`） |
+| `serial_no` | string? | 主装配体序列号（建单即派发，格式 `{prefix}{counter:07}`） |
 | `quantity` | i32 | 数量 |
 | `unit_price` | decimal? | 单价 |
 | `total_price` | decimal? | 总价 |
@@ -96,6 +96,8 @@
 | `system_delivery_date` | date? | 系统派工日（同上） |
 | `is_urgent` | bool | 紧急标记（同上） |
 | `note` | string? | 备注（同上） |
+| `unit_price` | decimal? | 单价（JSON 字符串；建单缺省落 0，**不会是 NULL**） |
+| `total_price` | decimal? | 总价（同上） |
 | `current_batch_id` | string (i64)? | **Phase 3（deferred #7）**：子件当前激活批次 id；`None` 表示无活跃批次 |
 
 > §3.4（2026-09-11）：后 6 字段为"共享信息字段"，创建时从父件 `t_assembly` 继承（§3.1），update 时按父件"更新后的当前行值"覆盖（§3.2）。`AssemblyService::get_assembly` 从 `t_part` 行直接透传。`AssemblyChildOut` 用于 `GET /assemblies/{id}`（children 数组）和 `POST /assemblies` 响应（created_children 数组）。
@@ -104,7 +106,7 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` | string (i64) | part_file 雪花 ID（owner_kind='ASSEMBLY', kind='ASSEMBLY_MASTER'） |
+| `id` | string (i64) | part_file 雪花 ID（`t_part_file.part_id` = assembly id，该列兼作 polymorphic owner 列；归属类型靠 `kind='ASSEMBLY_MASTER'` 判别，不单独存盘） |
 | `original_filename` | string | 原始文件名 |
 | `page_count` | i32? | PDF 页数（**Phase 3**：当前 pass 总是 `None`，懒加载） |
 
@@ -121,7 +123,7 @@
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `assembly` | [AssemblyOut](#assemblyout-字段) | 刚 INSERT 的 assembly 行（含 `serial_no`） |
-| `created_children` | [AssemblyChildOut](#assemblychildout-字段)[] | 创建的子件（无 PDF 时为空数组） |
+| `created_children` | [AssemblyChildOut](#assemblychildout-字段)[] | 创建的子件（`children` 缺省 / 空数组时为空数组） |
 
 
 ---
@@ -131,7 +133,7 @@
 ### Multipart 字段语义
 
 - **必填 `data` 文本字段**：序列化的 [`AssemblyCreateRequest`](./crud.md#assemblycreaterequest-字段) JSON；解析失败 → 20104 INVALID_VALUE。
-- **可选 `files` PDF 字段**：可多个二进制；当前实现**只处理首份**做页数校验，其余累计忽略。
+- **可选 `files` / `file` PDF 字段**：两个名字**等价**（都收，可混用）；可多个二进制；当前实现**只处理首份**做页数校验，其余累计忽略。PDF **不入库**（文件走 `POST /{id}/files` 单独上传）。
 - **未识别字段**：一律丢弃（与 Python `python-multipart` 行为对齐），不报 40001。
 - 整体走 axum `Multipart` extractor；body 大小上限由 `AppConfig.max_request_body_size` 控制（默认 300 MiB）。
 
@@ -143,6 +145,7 @@
   - `t_serial_counter` 中无对应 `prefix` 行 → 20108 SERIAL_PREFIX_UNKNOWN。
 - **子件 `serial_no`**：派生 `{asm_serial}-{i:02d}`（如 `F0000001-01` / `F0000001-02`）。
   - 子件 ≤ 99（i:02d 范围 1..=99），超出 → 20303 TOO_MANY_CHILDREN。
+- **派发时机**：`POST /assemblies` **无条件**派发（与是否上传 PDF 无关），并在同一事务内建全部子件。`POST /assemblies/{id}/children`（详情页补件）**不**派发，新子件 `serial_no = NULL`。
 
 ### L1 → L2 客户展开（list 与 create 共享）
 
@@ -299,7 +302,7 @@ assembly 域（203xx）见下方表格；共享错误码（40001 / 40300 / 40901
 
 ## 参考
 
-- 集成测试：`tests/assembly_api.rs`（6 用例：create 无 PDF / create 有 PDF + 子件派生 / create 页数不匹配 / create 超 99 子件 / cancel 终态禁 / list + L1 展开）
+- 集成测试：`tests/assembly/`（`api.rs` 13 例 / `create_serial_price.rs` 8 例 / `files.rs` 6 例 / `status_sync.rs` 5 例 / `children.rs` 4 例 / `files_list.rs` 4 例 / `by_part.rs` 3 例）
 - 仓库分层：`src/modules/assembly/handler.rs` (axum) → `service.rs` (业务) → `repo.rs` (SQL) → `dto.rs` / `model.rs` / `statemachine.rs`
 - 状态机：`src/modules/assembly/statemachine.rs`
 - 错误码：`src/shared/error.rs::code`

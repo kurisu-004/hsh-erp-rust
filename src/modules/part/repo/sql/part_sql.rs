@@ -24,8 +24,9 @@
 //! - `clear_part_serial_no_when_completed`
 //!
 //! ### 跨表 helper（1）
-//! - `serial_prefix_for_customer` —— 查 `t_customer`（L1 客户的 `serial_prefix`），
-//!   供 service 建件时派发序列号
+//! - `serial_prefix_for_customer` —— 派发序列号用的 L1 客户 `serial_prefix`；
+//!   实现已下沉到 `shared::serial::prefix_for_customer`（2026-10-05，part / assembly
+//!   两域共用，本文件只留一行委托）
 //!
 //! ## ZST `PartRepo`
 //! ZST struct 在 `super`（sql/mod.rs）定义，本文件 `impl PartRepo { ... }`
@@ -34,7 +35,7 @@
 use sqlx::{PgConnection, PgExecutor};
 
 use crate::modules::part::model::{TPart, TPartInspected};
-use crate::shared::error::{AppError, code};
+use crate::shared::error::AppError;
 
 use super::PartRepo;
 
@@ -913,6 +914,12 @@ impl PartRepo {
     /// `location='OFFICE'`（t_part.location 列已删）；批次行仍写
     /// `location='OFFICE'`（位置信息真相源在 t_part_batch）。
     ///
+    /// 2026-10-05 新增形参 `unit_price` / `total_price`：此前这两列在 INSERT 里
+    /// 写死字面 `0, 0`，建单入参里的子件价格被静默丢弃。`None` 走 SQL 侧
+    /// `COALESCE($n, 0::numeric)`（与 `create_part` 同形），`Some(v)` 原样落库。
+    /// 两列是 `NUMERIC(12,2)` / `NUMERIC(14,2) NOT NULL DEFAULT 0`，列出现在列
+    /// 清单里就不走 DEFAULT，绑 NULL 会直接违反 NOT NULL。
+    ///
     /// 函数签名收 `&mut PgConnection`（非 `impl PgExecutor<'_>`），因为要在同一
     /// 事务内连发两条 INSERT（与 `split_batch_for_partial_pass` / `split_batch`
     /// 同模式）。
@@ -927,6 +934,8 @@ impl PartRepo {
         drawing_no: Option<&str>,
         quantity: i32,
         planned_delivery_date: Option<chrono::NaiveDate>,
+        unit_price: Option<rust_decimal::Decimal>,
+        total_price: Option<rust_decimal::Decimal>,
         inherit: ChildInheritFields<'_>,
         current_user_id: i64,
         initial_batch_id: i64,
@@ -942,7 +951,7 @@ impl PartRepo {
                 $1, $2, $3, $4, $5, $6,
                 $7, $8, $9, $10,
                 $11, $12, $13, 'PENDING',
-                0, 0, $14, 0, $15
+                COALESCE($14, 0::numeric), COALESCE($15, 0::numeric), $16, 0, $17
             )
             "#,
             id,
@@ -958,6 +967,8 @@ impl PartRepo {
             inherit.order_no,
             inherit.system_delivery_date,
             inherit.note,
+            unit_price,
+            total_price,
             serial_no,
             current_user_id,
         )
@@ -1248,66 +1259,14 @@ impl PartRepo {
 
     /// 2026-10-05 新增：取「L1 客户」的 `serial_prefix` 首字符，供建单派发序列号。
     ///
-    /// 序列号前缀是 L1 客户的属性（L2 客户的 `serial_prefix` 恒为 NULL，由
-    /// customer 域 service 双校验保证），所以入参可以是 L1 也可以是 L2：内层子查询
-    /// 用 `COALESCE(parent_id, id)` 把 L2 折回它的 L1，外层再取那一行的 prefix。
-    /// 一条 SQL 走完，不在 Rust 侧分叉。
-    ///
-    /// `COALESCE` **只折一层**：本函数假定客户树恒为两层（建 L2 时必须有 L1 父行、
-    /// 不得再挂子节点，都由 customer 域 service 保证，DB 侧**无**约束）。
-    /// 若真出现 L2 的 `parent_id` 指向另一个 L2（第三层），内层折回的是那个中间 L2
-    /// 而它的 `serial_prefix` 恒为 NULL ⇒ 本函数报 `20308`（语义上应是层级非法，
-    /// 但该形态进不来，不另设错误码）。
-    ///
-    /// 三种失败（都不该被 DB CHECK 之外的脏数据放过，故逐个显式判）：
-    /// - 目标客户或其 L1 父行不存在 / 已软删 → `20102 BIZ_CUSTOMER_NOT_FOUND`
-    /// - prefix 为 NULL（L1 客户未配前缀）→ `20308 BIZ_CUSTOMER_NO_SERIAL_PREFIX`
-    /// - prefix 为空串 / 非 ASCII 大写开头 → `20104 BIZ_INVALID_VALUE`
-    ///   （`ck_t_customer_serial_prefix_uppercase` 已用 `^[A-Z]$` 挡住该形态，
-    ///   这两条分支是对脏数据的兜底，正常写入路径进不来）
-    ///
-    /// 用 `sqlx::query_scalar`（非 `query_scalar!` 宏）：返回值只有
-    /// `Option<Option<String>>` 两态（无行 / 有行但 prefix 为 NULL），
-    /// 宏的编译期校验在这里没有额外收益。
+    /// 2026-10-05 下沉到 `shared::serial::prefix_for_customer`：序列号派发要查的
+    /// 是 `t_customer`（客户域的表），本函数挂在 part 域只是历史落点；assembly 域
+    /// 建单也要同一份解析，两域共用 shared 里的唯一实现，本仓库不再存第二份 SQL。
+    /// 失败语义（20102 / 20308 / 20104）见 shared 侧 doc。
     pub async fn serial_prefix_for_customer<'e, E: PgExecutor<'e>>(
         executor: E,
         customer_id: i64,
     ) -> Result<char, AppError> {
-        // 外层 Option = 查无此行（客户或其 L1 父行不存在 / 已软删）；
-        // 内层 Option = 行在但 `serial_prefix IS NULL`（L1 未配前缀）。
-        let row: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT serial_prefix FROM t_customer \
-             WHERE id = (SELECT COALESCE(parent_id, id) FROM t_customer \
-                         WHERE id = $1 AND deleted_at IS NULL) \
-               AND deleted_at IS NULL",
-        )
-        .bind(customer_id)
-        .fetch_optional(executor)
-        .await?;
-        let prefix = row.ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_CUSTOMER_NOT_FOUND,
-                format!("customer {customer_id} 不存在或已软删，无法取 serial_prefix"),
-            )
-        })?;
-        let prefix = prefix.ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
-                format!("customer {customer_id} 的 L1 父客户未配置 serial_prefix"),
-            )
-        })?;
-        let ch = prefix.chars().next().ok_or_else(|| {
-            AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("customer {customer_id} 的 serial_prefix 为空串"),
-            )
-        })?;
-        if !ch.is_ascii_uppercase() {
-            return Err(AppError::biz(
-                code::BIZ_INVALID_VALUE,
-                format!("customer {customer_id} 的 serial_prefix {ch:?} 不是 A-Z 开头"),
-            ));
-        }
-        Ok(ch)
+        crate::shared::serial::prefix_for_customer(executor, customer_id).await
     }
 }

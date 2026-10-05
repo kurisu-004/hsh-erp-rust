@@ -15,12 +15,17 @@
 //! - children.rs    ← D-07 POST /assemblies/{id}/children
 //! - by_part.rs     ← D-08 GET  /parts/{id}/assembly
 //! - files_list.rs  ← D-09 GET  /assemblies/{id}/files
+//!
+//! ## 2026-10-05 新增 1 sub-file
+//! - create_serial_price.rs ← POST /assemblies 建单期序列号派发 + 子件金额
+//!   + multipart 字段名兼容
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
 mod api;
 mod by_part;
 mod children;
+mod create_serial_price;
 mod files;
 mod files_list;
 mod status_sync;

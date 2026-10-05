@@ -2,6 +2,13 @@
 //!
 //! 对应 Python `backend-python/repository/serial_counter.py::acquire_serial`。
 //!
+//! 本模块是**序列号派发的全仓唯一入口**，两个函数配套使用：
+//! - [`prefix_for_customer`]：把客户 id 解析成单字符 prefix（查 `t_customer`）
+//! - [`acquire`]：拿 prefix 从 `t_serial_counter` 派一个序列号
+//!
+//! part 域（`POST /parts` / `POST /parts/batch`）与 assembly 域
+//! （`POST /assemblies`）都建单即派发序列号，两域共用这两个函数，不各写一份。
+//!
 //! ## `acquire(conn, prefix) -> String`
 //! 通用派发：原子 `UPDATE t_serial_counter SET counter = counter + 1 RETURNING counter`，
 //! 格式 `{prefix}{counter:07}`（counter 从 1 开始），counter >= 99_999_999 视为耗尽。
@@ -15,6 +22,71 @@
 use sqlx::{PgConnection, PgExecutor};
 
 use crate::shared::error::{AppError, code};
+
+/// 2026-10-05 新增：取「L1 客户」的 `serial_prefix` 首字符，供建单派发序列号。
+///
+/// 序列号前缀是 L1 客户的属性（L2 客户的 `serial_prefix` 恒为 NULL，由
+/// customer 域 service 双校验保证），所以入参可以是 L1 也可以是 L2：内层子查询
+/// 用 `COALESCE(parent_id, id)` 把 L2 折回它的 L1，外层再取那一行的 prefix。
+/// 一条 SQL 走完，不在 Rust 侧分叉。
+///
+/// `COALESCE` **只折一层**：本函数假定客户树恒为两层（建 L2 时必须有 L1 父行、
+/// 不得再挂子节点，都由 customer 域 service 保证，DB 侧**无**约束）。
+/// 若真出现 L2 的 `parent_id` 指向另一个 L2（第三层），内层折回的是那个中间 L2
+/// 而它的 `serial_prefix` 恒为 NULL ⇒ 本函数报 `20308`（语义上应是层级非法，
+/// 但该形态进不来，不另设错误码）。
+///
+/// 三种失败（都不该被 DB CHECK 之外的脏数据放过，故逐个显式判）：
+/// - 目标客户或其 L1 父行不存在 / 已软删 → `20102 BIZ_CUSTOMER_NOT_FOUND`
+/// - prefix 为 NULL（L1 客户未配前缀）→ `20308 BIZ_CUSTOMER_NO_SERIAL_PREFIX`
+/// - prefix 为空串 / 非 ASCII 大写开头 → `20104 BIZ_INVALID_VALUE`
+///   （`ck_t_customer_serial_prefix_uppercase` 已用 `^[A-Z]$` 挡住该形态，
+///   这两条分支是对脏数据的兜底，正常写入路径进不来）
+///
+/// 用 `sqlx::query_scalar`（非 `query_scalar!` 宏）：返回值只有
+/// `Option<Option<String>>` 两态（无行 / 有行但 prefix 为 NULL），
+/// 宏的编译期校验在这里没有额外收益。
+pub async fn prefix_for_customer<'e, E: PgExecutor<'e>>(
+    executor: E,
+    customer_id: i64,
+) -> Result<char, AppError> {
+    // 外层 Option = 查无此行（客户或其 L1 父行不存在 / 已软删）；
+    // 内层 Option = 行在但 `serial_prefix IS NULL`（L1 未配前缀）。
+    let row: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT serial_prefix FROM t_customer \
+         WHERE id = (SELECT COALESCE(parent_id, id) FROM t_customer \
+                     WHERE id = $1 AND deleted_at IS NULL) \
+           AND deleted_at IS NULL",
+    )
+    .bind(customer_id)
+    .fetch_optional(executor)
+    .await?;
+    let prefix = row.ok_or_else(|| {
+        AppError::biz(
+            code::BIZ_CUSTOMER_NOT_FOUND,
+            format!("customer {customer_id} 不存在或已软删，无法取 serial_prefix"),
+        )
+    })?;
+    let prefix = prefix.ok_or_else(|| {
+        AppError::biz(
+            code::BIZ_CUSTOMER_NO_SERIAL_PREFIX,
+            format!("customer {customer_id} 的 L1 父客户未配置 serial_prefix"),
+        )
+    })?;
+    let ch = prefix.chars().next().ok_or_else(|| {
+        AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            format!("customer {customer_id} 的 serial_prefix 为空串"),
+        )
+    })?;
+    if !ch.is_ascii_uppercase() {
+        return Err(AppError::biz(
+            code::BIZ_INVALID_VALUE,
+            format!("customer {customer_id} 的 serial_prefix {ch:?} 不是 A-Z 开头"),
+        ));
+    }
+    Ok(ch)
+}
 
 /// 从 `t_serial_counter` 派发下一个序列号（`prefix` 是单字符业务 PK）。
 ///
