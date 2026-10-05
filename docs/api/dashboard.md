@@ -297,6 +297,8 @@ HTTP request
 | `admin` | 兜底对账 `POST /api/v2/admin/recompute-rollup`（Manager） |
 | `part::batch` | 工单批量改状态 / 批量取消 |
 | `part::crud` | 工单 CRUD（创建 / 修改 / 软删） |
+| `part::lifecycle` | 工单生命周期（取消 / 强制完工 / 召回；`handler/lifecycle.rs:51`） |
+| `delivery_note` | 送货单 CRUD / 生命周期 / 扫码收发货（`handler/{crud,lifecycle,scan}.rs`，3 个 broadcast 点） |
 
 > `WsEvent::DashboardSnapshot` 当前**无**业务方主动广播——快照由客户端在
 > WS 握手时拉取 + 在 HTTP 端点首屏拉取；服务端不主动重推。
