@@ -162,7 +162,7 @@ Request：
 > 金额两列同样是 **JSON 字符串**，裸数字会被反序列化拒。
 >
 > **序列号不收**：每件建单时按 L1 客户 `serial_prefix` 自动派发一个
-> `serial_no`（`prefix` + 7 位数字），INSERT 期写入。L1 客户未配
+> `serial_no`（`prefix` + 4 位数字，如 `P1000`），INSERT 期写入。L1 客户未配
 > `serial_prefix` → `20308`，**整批拒**（在任何一行落库之前，连文件绑定都不
 > head/copy）。
 >

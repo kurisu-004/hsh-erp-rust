@@ -51,7 +51,7 @@
 --  本仓集成测试首次出现「改 schema 造脏数据」，取的是「覆盖不可达的防御分支」
 --  这个取舍：若将来有人放松 CHECK 或 service 校验，20104 分支仍必须给出正确
 --  错误码而不是 500 / 静默拿非法 prefix 去 acquire。参照
---  `src/infra/serial.rs` 的 `normalize_prefix_*` 兜底分支测试（同类型范式）。
+--  `src/shared/serial.rs` 的 `counter_for_*` 号池单测（同类型范式）。
 --  改动只落在 per-test fresh DB（test-support::pool::test_pool 每测试
 --  CREATE DATABASE），不会污染 template 库或开发库。
 -- ============================================================================
@@ -64,10 +64,12 @@ VALUES
 
 -- ---- 序列号计数器（L1 prefix='P'）----
 -- 2026-10-05 起 POST /parts / POST /parts/batch 建单时按 L1 prefix 派发
--- serial_no（shared::serial::acquire 走 `UPDATE t_serial_counter ... RETURNING`）。
+-- serial_no（shared::serial::acquire 走 `SELECT ... FOR UPDATE` 锁 counter 行、
+-- 逐个试空号后写回 counter+1）。
 -- 该表**不在** migrations / seeds 里（A-Z 26 行由生产数据注入），测试库独立，
 -- 所以 fixture 必须自带 'P' 一行，否则建单会以 20108 BIZ_SERIAL_PREFIX_UNKNOWN
--- 整单拒。counter 起 0 → 首件派到 P0000001。
+-- 整单拒。counter 起 0 → 首个派发号是 4 位号池里的 P1000（counter = 下一个
+-- 要发的池内下标，1000 + counter % 9000）。
 INSERT INTO t_serial_counter (prefix, counter, version, created_at, updated_at)
 VALUES ('P', 0, 0, now(), now())
 ON CONFLICT (prefix) DO NOTHING;

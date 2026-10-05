@@ -143,7 +143,7 @@ Response 201 `data`：[`AssemblyCreateResult](./index.md#assemblycreateresult-�
 - 20303 — `children` 数量 > 99（HTTP 400）
 - 20305 — PDF 页数与 `children.len()+1` 不匹配 / `lopdf` 解析失败（HTTP 400）
 - 20308 — L1 客户的 `serial_prefix` 为空（HTTP 400）
-- 50001 — 子件序列号撞 `uk_t_part_serial_no`（HTTP 500）。子件号由 `{asm_serial}-{i:02d}` 派生，而 `uk_t_part_serial_no` 只排除 `deleted_at IS NOT NULL` 与 `status='CANCELLED'` 的行；父号由计数器单调递增，撞号只可能来自历史遗留的同形行（如已作废数据留下的 `P0000001-01`）。当前未做专门映射，DB 唯一约束冲突直接冒泡成 50001
+- 50001 — 子件序列号撞 `uk_t_part_serial_no`（HTTP 500）。子件号由 `{asm_serial}-{i:02d}` 派生，而 `uk_t_part_serial_no` 只排除 `deleted_at IS NOT NULL` 与 `status='CANCELLED'` 的行；父号由计数器单调递增，撞号只可能来自历史遗留的同形行（如已作废数据留下的 `P1000-01`）。当前未做专门映射，DB 唯一约束冲突直接冒泡成 50001
 - 40001 — multipart body 解析失败 / 字段读取失败（HTTP 422）
 - 40300 — 角色不符（HTTP 403）
 

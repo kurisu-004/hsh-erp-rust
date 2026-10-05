@@ -28,11 +28,12 @@
 --  child count。状态机不允许从 IN_PROCESS / COMPLETED 等回退 PENDING，
 --  预置会污染「期望空库」断言。
 --
---  ## t_serial_counter 行（1 行）
---  (prefix='F', counter=0) —— 18/20 assembly 测试用 'F' prefix；
---  余下 'X' prefix 测试（list_with_filters_and_l1_expansion）本地保留
---  `insert_serial_counter(pool, "X", 0)`（ON CONFLICT DO UPDATE 复用，
---  不与预置行冲突）。
+-- ## t_serial_counter 行（1 行）
+-- (prefix='F', counter=0) —— 18/20 assembly 测试用 'F' prefix；counter = 下一个
+-- 要发的池内下标（4 位号池 1000 + counter % 9000）⇒ 首个派发号恒为 F1000。
+-- 余下 'X' prefix 测试（list_with_filters_and_l1_expansion）本地保留
+-- `insert_serial_counter(pool, "X", 0)`（ON CONFLICT DO UPDATE 复用，
+-- 不与预置行冲突）。
 -- ============================================================================
 
 -- ---- 序列号计数器（canonical 'F' prefix）----

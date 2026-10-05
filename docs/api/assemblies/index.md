@@ -53,7 +53,7 @@
 > 是 NOT NULL，DTO 去 `Option<>` 包裹；`TAssembly` model 同步去 `Option<NaiveDate>`。
 | `status` | string | 状态枚举字符串（PENDING / IN_PROCESS / INSPECTION / READY_TO_SHIP / DELIVERED / COMPLETED / CANCELLED，2026-09 扩 7 态对齐 Python） |
 | `version` | i32 | 乐观锁 |
-| `serial_no` | string? | 主装配体序列号（建单即派发，格式 `{prefix}{counter:07}`） |
+| `serial_no` | string? | 主装配体序列号（建单即派发，格式 `{prefix}{4 位数字}`，如 `F1000`） |
 | `quantity` | i32 | 数量 |
 | `unit_price` | decimal? | 单价 |
 | `total_price` | decimal? | 总价 |
@@ -139,11 +139,21 @@
 
 ### 序列号（serial_no）模式
 
-- **装配体 `serial_no`**：从 `t_serial_counter` 派发，格式 `{prefix}{counter:07}`（如 `F0000001`）。
+- **装配体 `serial_no`**：从 `t_serial_counter` 派发，格式 `{prefix}{4 位数字}`（如 `F1000`），
+  取自 4 位号池 `[1000, 9999]`（`1000 + counter % 9000`，用尽后回绕）。
   - `prefix` 是 L1 客户的 `serial_prefix` 首字母（DB CHECK：单大写字母 `A-Z`）。
-  - `counter >= 99_999_999` 视为耗尽 → 20105 PART_SERIAL_EXHAUSTED。
+  - 整个号池被该 prefix 下的单据占满（绕一圈仍无空号）→ 20105 PART_SERIAL_EXHAUSTED。
   - `t_serial_counter` 中无对应 `prefix` 行 → 20108 SERIAL_PREFIX_UNKNOWN。
-- **子件 `serial_no`**：派生 `{asm_serial}-{i:02d}`（如 `F0000001-01` / `F0000001-02`）。
+  - **counter 语义 = 下一个要发的池内下标（先用后递增）**：counter=0 发出 `{prefix}1000`
+    并把 counter 写成 1。counter **不得手工重置**（回绕本身就会自动回到 1000）。
+  - 装配件与 part **共用同一 counter 行与同一号池**（`t_part.serial_no` 与
+    `t_assembly.serial_no` 从同一行取号，互相插号），碰撞检查也必须覆盖两张表：
+    装配件按 `uk_t_assembly_serial_no`（`deleted_at IS NULL`，**无** status 谓词 ⇒
+    `COMPLETED` 的装配件仍占号）、part 按 `uk_t_part_serial_no`
+    （`deleted_at IS NULL AND status <> 'CANCELLED'`）。详见
+    [`../parts/index.md`](../parts/index.md#序列号serial_no生命周期)。
+- **子件 `serial_no`**：派生 `{asm_serial}-{i:02d}`（如 `F1000-01` / `F1000-02`），
+  不占号池（1 次建单只消耗 1 个号）。
   - 子件 ≤ 99（i:02d 范围 1..=99），超出 → 20303 TOO_MANY_CHILDREN。
 - **派发时机**：`POST /assemblies` **无条件**派发（与是否上传 PDF 无关），并在同一事务内建全部子件。`POST /assemblies/{id}/children`（详情页补件）**不**派发，新子件 `serial_no = NULL`。
 

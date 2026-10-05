@@ -5,7 +5,7 @@
 //! （`t_assembly.serial_no = NULL`、0 子件）。本文件钉死放开后的行为：
 //!
 //! 1. `create_without_pdf_dispatches_serial_and_children` —— 不传 PDF：父件拿
-//!    `P` + 7 位序列号，N 个子件全建、`serial_no` 为 `{asm}-{i:02d}`（01 起）、
+//!    `P` + 4 位序列号，N 个子件全建、`serial_no` 为 `{asm}-{i:02d}`（01 起）、
 //!    `assembly_id` 指向父件、初始批次同步建；
 //! 2. `create_with_pdf_dispatches_serial_and_children` —— 传 PDF（页数相符）：结果
 //!    与不传 PDF 完全一致（PDF 只用于页数校验，不入库）；
@@ -154,20 +154,20 @@ fn create_body(customer_id: i64, children: &[(&str, Option<&str>, Option<&str>)]
     })
 }
 
-/// 断言序列号是「P + 7 位数字」形态；`test_pool()` 每测试一个 fresh database，
+/// 断言序列号是「P + 4 位数字」形态；`test_pool()` 每测试一个 fresh database，
 /// fixture 预置的 `t_serial_counter('P', 0)` 因而是恒定起点 ⇒ 首个派发号恒为
-/// `P0000001`，直接写字面值既验了「派发了」也钉死了 counter 起点。
+/// `P1000`，直接写字面值既验了「派发了」也钉死了 counter 起点。
 fn assert_p_serial(serial: Option<&str>, expected: &str, ctx: &str) -> String {
     let s = serial.unwrap_or_else(|| panic!("{ctx}: serial_no 应已派发，实际为 null"));
-    assert_eq!(s, expected, "{ctx}: 序列号应为 {expected}（P + 7 位数字）");
-    assert_eq!(s.len(), 8, "{ctx}: 序列号应为 8 字符，实际 {s:?}");
+    assert_eq!(s, expected, "{ctx}: 序列号应为 {expected}（P + 4 位数字）");
+    assert_eq!(s.len(), 5, "{ctx}: 序列号应为 5 字符，实际 {s:?}");
     assert!(
         s.starts_with('P'),
         "{ctx}: 应以 L1 prefix 'P' 开头，实际 {s:?}"
     );
     assert!(
         s[1..].chars().all(|c| c.is_ascii_digit()),
-        "{ctx}: 后 7 位必须是数字，实际 {s:?}"
+        "{ctx}: 后 4 位必须是数字，实际 {s:?}"
     );
     s.to_string()
 }
@@ -264,7 +264,7 @@ async fn create_without_pdf_dispatches_serial_and_children() {
 
     let asm_serial = assert_p_serial(
         env["data"]["assembly"]["serial_no"].as_str(),
-        "P0000001",
+        "P1000",
         "无 PDF 建单的父件",
     );
 
@@ -348,7 +348,7 @@ async fn create_with_pdf_dispatches_serial_and_children() {
 
     let asm_serial = assert_p_serial(
         env["data"]["assembly"]["serial_no"].as_str(),
-        "P0000001",
+        "P1000",
         "有 PDF 建单的父件",
     );
     let children = env["data"]["created_children"]
@@ -436,7 +436,7 @@ async fn create_accepts_singular_file_field() {
     );
     assert_p_serial(
         env["data"]["assembly"]["serial_no"].as_str(),
-        "P0000001",
+        "P1000",
         "`file` 字段名路径的父件",
     );
     assert_eq!(

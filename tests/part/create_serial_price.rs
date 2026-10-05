@@ -6,7 +6,7 @@
 //! → INSERT 三层全丢。本文件钉死收口后的行为：
 //!
 //! 1. `batch_create_dispatches_serial_and_keeps_prices` —— `POST /parts/batch`
-//!    两件都拿到 `P` + 7 位序列号，item 传入的单价 / 总价原样落库；
+//!    两件都拿到 `P` + 4 位序列号，item 传入的单价 / 总价原样落库；
 //! 2. `batch_create_price_defaults_to_zero` —— 金额缺省落 `0`（不是 NULL）；
 //! 3. `create_single_part_dispatches_serial` —— `POST /parts` 单件同样派发；
 //! 4. `batch_create_rejects_when_l1_serial_prefix_missing` —— L1 未配 prefix
@@ -50,24 +50,25 @@ fn today() -> chrono::NaiveDate {
         .date_naive()
 }
 
-/// 断言序列号等于**预期字面值**（fixture L1 客户 prefix `'P'` + 7 位数字）。
+/// 断言序列号等于**预期字面值**（fixture L1 客户 prefix `'P'` + 4 位数字）。
 ///
 /// `test_pool()` 给**每个测试** `CREATE DATABASE` 一个全新库
 /// （`test-support/src/pool.rs` 的 `test_pool()`），`load_part_fixture` 预置的
-/// `t_serial_counter('P', counter=0)` 因此恒为起点 ⇒ 首个派发号恒是 `P0000001`、
-/// 第 n 个恒是 `P000000{n}`。所以断言直接写字面值，既验了「派发了」也钉死了
-/// counter 起点与逐件递增（哪天 fixture 那行不再是 `counter=0` 这些用例会红）。
+/// `t_serial_counter('P', counter=0)` 因此恒为起点 ⇒ 首个派发号恒是 `P1000`、
+/// 第 n 个恒是 `P{999+n}`（4 位号池 `1000 + counter % 9000`，counter 是下一个
+/// 要发的池内下标）。所以断言直接写字面值，既验了「派发了」也钉死了 counter
+/// 起点与逐件递增（哪天 fixture 那行不再是 `counter=0` 这些用例会红）。
 fn assert_dispatched_serial(serial: Option<&str>, expected: &str, ctx: &str) -> String {
     let s = serial.unwrap_or_else(|| panic!("{ctx}: serial_no 应已派发，实际为 null"));
-    assert_eq!(s, expected, "{ctx}: 序列号应为 {expected}（P + 7 位数字）");
-    assert_eq!(s.len(), 8, "{ctx}: 序列号应为 8 字符，实际 {s:?}");
+    assert_eq!(s, expected, "{ctx}: 序列号应为 {expected}（P + 4 位数字）");
+    assert_eq!(s.len(), 5, "{ctx}: 序列号应为 5 字符，实际 {s:?}");
     assert!(
         s.starts_with('P'),
         "{ctx}: 序列号应以 L1 prefix 'P' 开头，实际 {s:?}"
     );
     assert!(
         s[1..].chars().all(|c| c.is_ascii_digit()),
-        "{ctx}: 序列号后 7 位必须是数字，实际 {s:?}"
+        "{ctx}: 序列号后 4 位必须是数字，实际 {s:?}"
     );
     s.to_string()
 }
@@ -269,7 +270,7 @@ async fn batch_create_dispatches_serial_and_keeps_prices() {
     );
 
     // 全新测试库 ⇒ counter 从 0 起 ⇒ 两件分别是第 1、第 2 个号
-    const EXPECTED: [&str; 2] = ["P0000001", "P0000002"];
+    const EXPECTED: [&str; 2] = ["P1000", "P1001"];
     for (i, item) in created.iter().enumerate() {
         let serial = assert_dispatched_serial(
             item["serial_no"].as_str(),
@@ -300,8 +301,8 @@ async fn batch_create_dispatches_serial_and_keeps_prices() {
             "created[{i}]：DB 行 serial_no 必须与响应一致（INSERT 期写入，非事后 UPDATE）"
         );
     }
-    let s1 = assert_dispatched_serial(created[0]["serial_no"].as_str(), "P0000001", "created[0]");
-    let s2 = assert_dispatched_serial(created[1]["serial_no"].as_str(), "P0000002", "created[1]");
+    let s1 = assert_dispatched_serial(created[0]["serial_no"].as_str(), "P1000", "created[0]");
+    let s2 = assert_dispatched_serial(created[1]["serial_no"].as_str(), "P1001", "created[1]");
     assert!(
         serial_number(&s1) < serial_number(&s2),
         "同批内序列号应递增: {s1} vs {s2}"
@@ -384,7 +385,7 @@ async fn create_single_part_dispatches_serial() {
     .await;
     assert_eq!(s, StatusCode::CREATED, "create part: {env}");
     let serial =
-        assert_dispatched_serial(env["data"]["serial_no"].as_str(), "P0000001", "POST /parts");
+        assert_dispatched_serial(env["data"]["serial_no"].as_str(), "P1000", "POST /parts");
     assert_eq!(
         env["data"]["unit_price"].as_str(),
         Some("12.34"),
@@ -460,11 +461,8 @@ async fn batch_create_rejects_when_l1_serial_prefix_missing() {
 async fn batch_create_serials_are_unique_and_increasing() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     let mut all: Vec<String> = Vec::new();
-    // 全新测试库 ⇒ counter 从 0 起；两轮各 3 件，号连续 1..=6
-    const EXPECTED: [[&str; 3]; 2] = [
-        ["P0000001", "P0000002", "P0000003"],
-        ["P0000004", "P0000005", "P0000006"],
-    ];
+    // 全新测试库 ⇒ counter 从 0 起；两轮各 3 件，号连续 P1000..=P1005
+    const EXPECTED: [[&str; 3]; 2] = [["P1000", "P1001", "P1002"], ["P1003", "P1004", "P1005"]];
     for (round, expected) in EXPECTED.iter().enumerate() {
         let body = json!({
             "customer_id": fx.customer_l2_id.to_string(),
@@ -540,7 +538,7 @@ async fn batch_with_pdfs_keeps_master_and_child_serial_pattern() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "batch-with-pdfs: {env}");
-    let master = assert_dispatched_serial(env["data"]["serial_no"].as_str(), "P0000001", "master");
+    let master = assert_dispatched_serial(env["data"]["serial_no"].as_str(), "P1000", "master");
     let master_id = env["data"]["id"].as_str().expect("master id").to_string();
 
     let child_serials: Vec<Option<String>> = sqlx::query_scalar(
@@ -657,7 +655,7 @@ async fn batch_create_with_bindings_dispatches_serial_and_keeps_prices() {
     );
     let item = &created[0];
     // 全新库 ⇒ counter 从 0 起 ⇒ 本件拿到第 1 个号
-    let serial = assert_dispatched_serial(item["serial_no"].as_str(), "P0000001", "created[0]");
+    let serial = assert_dispatched_serial(item["serial_no"].as_str(), "P1000", "created[0]");
     assert_eq!(
         item["unit_price"].as_str(),
         Some("88.80"),

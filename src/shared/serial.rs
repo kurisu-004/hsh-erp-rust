@@ -10,18 +10,24 @@
 //! （`POST /assemblies`）都建单即派发序列号，两域共用这两个函数，不各写一份。
 //!
 //! ## `acquire(conn, prefix) -> String`
-//! 通用派发：原子 `UPDATE t_serial_counter SET counter = counter + 1 RETURNING counter`，
-//! 格式 `{prefix}{counter:07}`（counter 从 1 开始），counter >= 99_999_999 视为耗尽。
-//!
-//! 与 `infra/serial::next_customer_serial` 的差异：
-//! - `next_customer_serial`：循环 + 防撞号 + 校验 active part（业务用）
-//! - `acquire`：纯原子递增，无循环（assembly / 早期 part 用）
-//!
-//! Phase 3 把 assembly 域的 `acquire_serial` 内联实现迁移到这里，保留相同语义。
+//! 4 位号池循环派发：`SELECT ... FOR UPDATE` 锁住 counter 行 → 逐个试
+//! `{prefix}{1000 + counter % 9000}` → 空闲则写回 `counter + 1` 并返回，
+//! 占用则 `counter + 1` 重试。详见 [`acquire`] 的文档。
 
 use sqlx::{PgConnection, PgExecutor};
 
 use crate::shared::error::{AppError, code};
+
+/// 4 位号池下界（与 Python `core/serial.py::SERIAL_MIN` 对齐）。
+const SERIAL_MIN: i64 = 1000;
+/// 4 位号池上界。
+const SERIAL_MAX: i64 = 9999;
+/// 号池宽度（`[1000, 9999]` 共 9000 个号，回绕周期）。
+const SERIAL_POOL_SIZE: i64 = 9000;
+/// 序列号数字部分宽度（4 位补零）。
+const SERIAL_FORMAT_WIDTH: usize = 4;
+/// 单次派发最多绕一圈（= 号池宽度）；再绕说明整池占满，抛 `20105`。
+const SERIAL_PREFIX_MAX_ATTEMPTS: i64 = SERIAL_POOL_SIZE;
 
 /// 2026-10-05 新增：取「L1 客户」的 `serial_prefix` 首字符，供建单派发序列号。
 ///
@@ -42,6 +48,10 @@ use crate::shared::error::{AppError, code};
 /// - prefix 为空串 / 非 ASCII 大写开头 → `20104 BIZ_INVALID_VALUE`
 ///   （`ck_t_customer_serial_prefix_uppercase` 已用 `^[A-Z]$` 挡住该形态，
 ///   这两条分支是对脏数据的兜底，正常写入路径进不来）
+///
+/// 2026-10-05 起本函数是**派号链路上 A-Z 校验的唯一一处**：`acquire` 收 `char`
+/// 且不重复校验，脏 prefix 必须在这里被挡住（DB CHECK
+/// `ck_t_customer_serial_prefix_uppercase` 是更外层的兜底）。
 ///
 /// 用 `sqlx::query_scalar`（非 `query_scalar!` 宏）：返回值只有
 /// `Option<Option<String>>` 两态（无行 / 有行但 prefix 为 NULL），
@@ -88,45 +98,147 @@ pub async fn prefix_for_customer<'e, E: PgExecutor<'e>>(
     Ok(ch)
 }
 
-/// 从 `t_serial_counter` 派发下一个序列号（`prefix` 是单字符业务 PK）。
+/// 从 `t_serial_counter` 派发下一个序列号（4 位号池，`prefix` 是单字符业务 PK）。
 ///
-/// 格式：`{prefix}{counter:07}`（counter 从 1 开始；与 Python
-/// `repository/serial_counter.py::acquire_serial` 对齐）。
+/// ## 格式与号池
+/// `{prefix}{4 位数字}`，数字部分取自 4 位号池 `[1000, 9999]`：
+/// `candidate = 1000 + counter % 9000`，`counter` 越过 9000 后**回绕**重新从 1000
+/// 开始。号池用尽（整池 9000 个号全部被占用、绕一圈仍找不到空号）→
+/// `BIZ_PART_SERIAL_EXHAUSTED`（20105）。
 ///
-/// `counter >= 99_999_999` 视为耗尽，返回 `BIZ_PART_SERIAL_EXHAUSTED`（20105）。
+/// `prefix` 未在 `t_serial_counter` 注册 → `BIZ_SERIAL_PREFIX_UNKNOWN`（20108）。
+/// A-Z 校验不在这里做：由 [`prefix_for_customer`] 独占（脏 prefix 在客户层就被
+/// 20104 挡住），本函数只接收它产出的 A-Z 单字符。
 ///
-/// `prefix` 必须是 A-Z 单字符（DB CHECK 约束），其它字符或空字符串 → `BIZ_INVALID_VALUE`。
+/// ## `counter` 语义：**先用后递增**
+/// `t_serial_counter.counter` 是**下一个要发的池内下标**，不是「已发计数」。
+/// `counter = 0` ⇒ 发出 `{prefix}1000` 并把 counter 写成 1；`counter = 1` ⇒ 发出
+/// `{prefix}1001`。`version` 随之 +1。
+///
+/// **counter 不得手工重置**（改成 0 / 改小以「重新从 1000 开始」都是错的）：重置
+/// 后碰撞循环要**逐个**跳过已被占用的号，而循环全程持 `t_serial_counter` 该行的
+/// `FOR UPDATE` 行锁 ⇒ 同一 prefix 的所有建单在这一次扫描期间全部排队（单次最坏
+/// 9000 次探测 × 2 张表的占用查询）。号池回绕本身就是「用完自动回到 1000」的
+/// 机制，不需要（也不该）靠重置实现。
+///
+/// ## part 与 assembly 共用同一个号池
+/// `t_part.serial_no` 与 `t_assembly.serial_no` 从 `t_serial_counter` 的**同一行**
+/// 取号，因此同一 L1 prefix 下两类单据共用一个序列流、互相插号。碰撞检查也
+/// 必须**同时**覆盖两张表（part 与 assembly 各按自己的唯一索引谓词判占用），
+/// 少查一张就会发出对方已经占着的号。
+///
+/// ## 并发模型
+/// 不同 prefix 取不同行锁、互不阻塞；同一 prefix 在 step 1 的行锁上排队，后者
+/// 读到前者提交后的 counter 值。
+///
+/// 必须在 caller 已开启的事务内调用（`&mut PgConnection`），使行锁随事务释放、
+/// 且整个碰撞循环与后续 INSERT 处在同一个事务里。
 pub async fn acquire(conn: &mut PgConnection, prefix: char) -> Result<String, AppError> {
-    let prefix_str = prefix.to_string();
-    if !prefix.is_ascii_uppercase() {
-        return Err(AppError::biz(
-            code::BIZ_INVALID_VALUE,
-            format!("prefix 必须是 A-Z 单字符，当前 {prefix:?}"),
-        ));
-    }
-    let row: Option<(i64,)> = sqlx::query_as(
-        "UPDATE t_serial_counter SET counter = counter + 1, updated_at = NOW() \
-         WHERE prefix = $1 RETURNING counter",
+    // 1. 锁住 prefix 对应的 counter 行
+    let mut counter: i64 = match sqlx::query_scalar!(
+        r#"SELECT counter AS "counter!" FROM t_serial_counter WHERE prefix = $1 FOR UPDATE"#,
+        prefix.to_string(),
     )
-    .bind(&prefix_str)
     .fetch_optional(&mut *conn)
-    .await?;
-    let counter = row.ok_or_else(|| {
-        AppError::biz(
-            code::BIZ_SERIAL_PREFIX_UNKNOWN,
-            format!("prefix '{prefix}' 未注册"),
+    .await?
+    {
+        Some(c) => c,
+        None => {
+            return Err(AppError::biz(
+                code::BIZ_SERIAL_PREFIX_UNKNOWN,
+                format!(
+                    "serial counter for prefix {prefix:?} not seeded; \
+                     add it to t_serial_counter before creating parts"
+                ),
+            ));
+        }
+    };
+
+    // 2. 在锁内逐个 candidate 试，直到找到空号或号池耗尽
+    for _ in 0..SERIAL_PREFIX_MAX_ATTEMPTS {
+        let serial = format!(
+            "{prefix}{:0width$}",
+            counter_for(counter),
+            width = SERIAL_FORMAT_WIDTH
+        );
+
+        // 占用判定必须逐字对齐各自的唯一索引谓词：判宽了（多看）只是多跳几个空号，
+        // 判窄了（少看）会把对方还占着的号当成空号重新发出，直到 INSERT 撞
+        // 唯一索引报 23505。
+        //   uk_t_part_serial_no     : serial_no IS NOT NULL AND deleted_at IS NULL
+        //                            AND status <> 'CANCELLED'
+        //   uk_t_assembly_serial_no : serial_no IS NOT NULL AND deleted_at IS NULL
+        let part_taken: Option<i32> = sqlx::query_scalar!(
+            r#"
+            SELECT 1 AS "taken!"
+            FROM t_part
+            WHERE serial_no = $1
+              AND deleted_at IS NULL
+              AND status <> 'CANCELLED'
+            LIMIT 1
+            "#,
+            serial,
         )
-    })?;
-    if counter.0 >= 99_999_999 {
-        return Err(AppError::biz(
-            code::BIZ_PART_SERIAL_EXHAUSTED,
-            "序列号池耗尽",
-        ));
+        .fetch_optional(&mut *conn)
+        .await?;
+        let assembly_taken: Option<i32> = sqlx::query_scalar!(
+            r#"
+            SELECT 1 AS "taken!"
+            FROM t_assembly
+            WHERE serial_no = $1
+              AND deleted_at IS NULL
+            LIMIT 1
+            "#,
+            serial,
+        )
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        if part_taken.is_none() && assembly_taken.is_none() {
+            // 找到空号：counter +1 写回（counter 语义是「下一个要发的池内下标」）
+            sqlx::query!(
+                r#"
+                UPDATE t_serial_counter
+                SET counter    = $2,
+                    version    = version + 1,
+                    updated_at = now()
+                WHERE prefix = $1
+                "#,
+                prefix.to_string(),
+                counter + 1,
+            )
+            .execute(&mut *conn)
+            .await?;
+
+            return Ok(serial);
+        }
+
+        // 撞号 → counter += 1 重试
+        counter += 1;
     }
-    Ok(format!("{}{:07}", prefix, counter.0))
+
+    Err(AppError::biz(
+        code::BIZ_PART_SERIAL_EXHAUSTED,
+        format!(
+            "serial pool for prefix {prefix:?} exhausted \
+             ([{SERIAL_MIN}, {SERIAL_MAX}] 共 {SERIAL_POOL_SIZE} 个号全部被占用)"
+        ),
+    ))
 }
 
-/// Pool 便捷入口（同 `infra::serial::next_customer_serial_via_pool` 模式）。
+/// 把 counter 转成号池内 `[SERIAL_MIN, SERIAL_MAX]` 的序列号数字部分。
+///
+/// 业务口径是 `SERIAL_MIN + (counter % SERIAL_POOL_SIZE)`。Rust 的 `%` 对负数
+/// 保留符号（Python 恒为非负），显式校正。
+fn counter_for(counter: i64) -> i64 {
+    let mut v = counter % SERIAL_POOL_SIZE;
+    if v < 0 {
+        v += SERIAL_POOL_SIZE;
+    }
+    SERIAL_MIN + v
+}
+
+/// Pool 便捷入口。
 ///
 /// caller 只有 `&sqlx::PgPool` 时（少量集成测试场景）可用；正式 service 流程
 /// 必须传 `&mut PgConnection` 以保证事务一致性。
@@ -138,53 +250,38 @@ pub async fn acquire_via_pool(pool: &sqlx::PgPool, prefix: char) -> Result<Strin
     Ok(serial)
 }
 
-/// Pool + executor 便捷入口（接受任何 `PgExecutor`）。
-///
-/// 用于 caller 已有 `&mut Transaction` 或 `&PgPool` 的场景。
-#[allow(dead_code)]
-pub async fn acquire_via_executor<'e, E: PgExecutor<'e>>(
-    exec: E,
-    prefix: char,
-) -> Result<String, AppError> {
-    let prefix_str = prefix.to_string();
-    if !prefix.is_ascii_uppercase() {
-        return Err(AppError::biz(
-            code::BIZ_INVALID_VALUE,
-            format!("prefix 必须是 A-Z 单字符，当前 {prefix:?}"),
-        ));
-    }
-    let row: Option<(i64,)> = sqlx::query_as(
-        "UPDATE t_serial_counter SET counter = counter + 1, updated_at = NOW() \
-         WHERE prefix = $1 RETURNING counter",
-    )
-    .bind(&prefix_str)
-    .fetch_optional(exec)
-    .await?;
-    let counter = row.ok_or_else(|| {
-        AppError::biz(
-            code::BIZ_SERIAL_PREFIX_UNKNOWN,
-            format!("prefix '{prefix}' 未注册"),
-        )
-    })?;
-    if counter.0 >= 99_999_999 {
-        return Err(AppError::biz(
-            code::BIZ_PART_SERIAL_EXHAUSTED,
-            "序列号池耗尽",
-        ));
-    }
-    Ok(format!("{}{:07}", prefix, counter.0))
-}
-
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
     use super::*;
 
+    /// counter → 号池内序列号的纯函数（无需 DB）。
     #[test]
-    fn format_serial_pads_seven_digits() {
-        assert_eq!(format!("F{:07}", 1), "F0000001");
-        assert_eq!(format!("A{:07}", 100), "A0000100");
-        // 8 位数字本身不需要补 0
-        assert_eq!(format!("F{:07}", 10_000_000), "F10000000");
+    fn counter_for_wraps_in_pool_range() {
+        // SERIAL_MIN 起
+        assert_eq!(counter_for(0), SERIAL_MIN);
+        assert_eq!(counter_for(1), SERIAL_MIN + 1);
+        // wrap 一次
+        assert_eq!(counter_for(SERIAL_POOL_SIZE), SERIAL_MIN);
+        assert_eq!(counter_for(SERIAL_POOL_SIZE + 1), SERIAL_MIN + 1);
+        // SERIAL_MAX 边界
+        assert_eq!(counter_for(SERIAL_MAX - SERIAL_MIN), SERIAL_MAX);
+    }
+
+    /// counter_for 接受负数（防御性，counter 列 NOT NULL 但显式校正 Rust 取模符号）。
+    #[test]
+    fn counter_for_handles_negative() {
+        // Python: (-1) % 9000 = 8999; Rust: (-1) % 9000 = -1。我们校正成 8999。
+        assert_eq!(counter_for(-1), SERIAL_MAX);
+        assert_eq!(counter_for(-SERIAL_POOL_SIZE), SERIAL_MIN);
+    }
+
+    /// 序列号格式化：prefix + 4 位零填充数字。
+    #[test]
+    fn customer_serial_format_pads_to_four_digits() {
+        let s = format!("{:0width$}", SERIAL_MIN, width = SERIAL_FORMAT_WIDTH);
+        assert_eq!(s, "1000");
+        let s = format!("F{:0width$}", SERIAL_MAX, width = SERIAL_FORMAT_WIDTH);
+        assert_eq!(s, "F9999");
     }
 }

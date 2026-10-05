@@ -6,7 +6,7 @@
 //! ## 覆盖（Task 8 + Task 3）
 //!   1. create_without_pdf_dispatches_serial_no        — 无 PDF → 仍派 serial + 0 子件
 //!   2. create_with_pdf_creates_children_with_serial_pattern
-//!      — 3 页 PDF + 2 children → F0000001 / F0000001-01 / F0000001-02
+//!      — 3 页 PDF + 2 children → F1000 / F1000-01 / F1000-02
 //!   3. create_pdf_page_mismatch_returns_20305       — 2 页 PDF + 2 children → 20305
 //!      BIZ_ASSEMBLY_PDF_INVALID
 //!   4. create_too_many_children_returns_20303        — 100 children → 20303
@@ -235,8 +235,8 @@ async fn create_without_pdf_dispatches_serial_no() {
 
     assert_eq!(
         out.assembly.serial_no.as_deref(),
-        Some("F0000001"),
-        "序列号派发与是否提供 PDF 无关"
+        Some("F1000"),
+        "序列号派发与是否提供 PDF 无关（counter=0 ⇒ 4 位号池的第一个号 F1000）"
     );
     assert!(
         out.created_children.is_empty(),
@@ -251,8 +251,9 @@ async fn create_without_pdf_dispatches_serial_no() {
 }
 
 /// 2. 3 页 PDF + 2 children：
-///    - assembly.serial_no = "F0000001"（counter 0→1 后 format!("F{:07}", 1)）
-///    - children[0].serial_no = "F0000001-01"，children[1].serial_no = "F0000001-02"
+///    - assembly.serial_no = "F1000"（counter=0 ⇒ 4 位号池 1000 + 0 % 9000，counter 写回 1）
+///    - children[0].serial_no = "F1000-01"，children[1].serial_no = "F1000-02"
+///      （子件号是父号的派生字符串，不占号池 ⇒ 1 次建单只消耗 1 个号）
 #[tokio::test]
 async fn create_with_pdf_creates_children_with_serial_pattern() {
     let (pool, _fx) = setup().await;
@@ -308,15 +309,15 @@ async fn create_with_pdf_creates_children_with_serial_pattern() {
         .expect("create with pdf should succeed");
     tx.commit().await.unwrap();
 
-    assert_eq!(out.assembly.serial_no.as_deref(), Some("F0000001"));
+    assert_eq!(out.assembly.serial_no.as_deref(), Some("F1000"));
     assert_eq!(out.created_children.len(), 2);
     assert_eq!(
         out.created_children[0].serial_no.as_deref(),
-        Some("F0000001-01")
+        Some("F1000-01")
     );
     assert_eq!(
         out.created_children[1].serial_no.as_deref(),
-        Some("F0000001-02")
+        Some("F1000-02")
     );
 
     // §3.1（2026-09-11）—— created_children 应透传父件继承字段
@@ -356,10 +357,7 @@ async fn create_with_pdf_creates_children_with_serial_pattern() {
     .expect("query child parts");
     assert_eq!(
         part_serials,
-        vec![
-            Some("F0000001-01".to_string()),
-            Some("F0000001-02".to_string()),
-        ]
+        vec![Some("F1000-01".to_string()), Some("F1000-02".to_string()),]
     );
 
     // §3.1 落库断言：DB t_part 行的 6 个继承字段 + customer_id 都被覆盖为父件值
@@ -911,7 +909,7 @@ async fn create_assembly_default_not_null_columns() {
     );
     assert_eq!(
         row.6.as_deref(),
-        Some("F0000001"),
+        Some("F1000"),
         "序列号无条件派发（与是否提供 PDF 无关）"
     );
     assert!(

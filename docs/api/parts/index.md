@@ -437,7 +437,8 @@ t_assembly.status               ← 派生缓存
 
 | 阶段 | 行为 |
 |---|---|
-| 派发 | 三个建单端点**统一**在 INSERT 期派发：`POST /parts`（每件 1 个）、`POST /parts/batch`（每件 1 个，共用一次 prefix 解析）、`POST /parts/batch-with-pdfs`（master 1 个 + 子件 `{master}-{NN}`，`PDF 页数 = 0` 时不派）。prefix 取自 `customer_id` 所属 **L1 客户**的 `serial_prefix`（入参传 L1 或 L2 都一样，内部按 `COALESCE(parent_id, id)` 折回 L1），号由 `shared::serial::acquire` 从 `t_serial_counter` 原子递增产生，格式 `{prefix}{counter:07}`（该 counter 行与 `t_assembly.serial_no` 共用，见下方「counter 行共享」）。L1 未配 prefix → `20308` **整单拒**（不落库、不消耗 counter）；prefix 未在 `t_serial_counter` 注册 → `20108`。`uk_t_part_serial_no` 唯一索引在 INSERT 那一刻就参与判定。逐件失败的 item 已消耗的号不回收（序列号出现空洞，见 `service/batch.rs` 函数注释） |
+| 派发 | 三个建单端点**统一**在 INSERT 期派发：`POST /parts`（每件 1 个）、`POST /parts/batch`（每件 1 个，共用一次 prefix 解析）、`POST /parts/batch-with-pdfs`（master 1 个 + 子件 `{master}-{NN}`，`PDF 页数 = 0` 时不派）。prefix 取自 `customer_id` 所属 **L1 客户**的 `serial_prefix`（入参传 L1 或 L2 都一样，内部按 `COALESCE(parent_id, id)` 折回 L1），号由 `shared::serial::acquire` 从 `t_serial_counter` 派发。L1 未配 prefix → `20308` **整单拒**（不落库、不消耗 counter）；prefix 未在 `t_serial_counter` 注册 → `20108`（该表**不在** migrations / seeds 里，A-Z 各行靠数据注入；新建 L1 客户配了新 `serial_prefix` 却没补 counter 行时，建单端点整体报 `20108`）。逐件失败的 item 已消耗的号不回收（序列号出现空洞，见 `service/batch.rs` 函数注释） |
+| 号池与防撞 | 格式 `{prefix}{4 位数字}`，数字部分取自 4 位号池 `[1000, 9999]`：`candidate = 1000 + counter % 9000`，用尽后**回绕**回 1000。派发时 `SELECT ... FOR UPDATE` 锁住该 prefix 的 counter 行，逐个 candidate 查占用，空闲才写回 `counter + 1`；整池 9000 个号全被占用（绕一圈仍无空号）→ `20105 BIZ_PART_SERIAL_EXHAUSTED`。**counter 语义 = 下一个要发的池内下标（先用后递增）**：counter=0 发出 `{prefix}1000` 并把 counter 写成 1。counter **不得手工重置**（改成 0 / 改小会让碰撞循环逐个跳过已占号，而循环全程持 `t_serial_counter` 行锁 ⇒ 同一 prefix 的建单全部排队）；回绕本身就是「用完自动回到 1000」的机制。**part 与 `t_assembly` 共用同一 counter 行与同一个 9000 号池**（`t_assembly.serial_no` 走同一个 `shared::serial::acquire`），所以同一 L1 prefix 下两类单据共用一个序列流、互相插号，`20105` 的耗尽信号也共用。碰撞检查**两张表都要查**，且各按自己的唯一索引谓词判占用：`t_part` 按 `deleted_at IS NULL AND status <> 'CANCELLED'`（`uk_t_part_serial_no` —— `COMPLETED` 的件**仍占号**），`t_assembly` 按 `deleted_at IS NULL`（`uk_t_assembly_serial_no` —— 没有 status 谓词，`COMPLETED` 的装配件**同样占号**）。判宽了（多看）只是多跳几个空号，判窄了（少看）会把对方还占着的号当成空号重新发出；`uk_t_part_serial_no` / `uk_t_assembly_serial_no` 唯一索引在 INSERT 那一刻兜底 |
 | 流转中 | 序列号在 part 的**整个非终态期**持续占用该唯一索引（货还在厂里，正确） |
 | 进入终态（`COMPLETED` / `CANCELLED`） | 由 rollup step 4 自动释放：**先**归档一条 `t_part_event`（`event_type='SERIAL_RELEASED'`，`note` 记原序列号）**再**清 `t_part.serial_no`。每个 part 至多 1 条归档事件（终态不可重复进入） |
 | 父装配件进终态 | 直接清 `t_assembly.serial_no`（不归档：`t_assembly` 无事件表，其 `note` 是用户可编辑业务备注，拿它记系统动作会污染用户数据） |
@@ -452,27 +453,6 @@ t_assembly.status               ← 派生缓存
 > `POST /api/v2/parts/batch`（见 [`./crud.md#post-apiv2partsbatch`](./crud.md#post-apiv2partsbatch)），
 > 每件建完立刻回填 `serial_no` 与 `unit_price` / `total_price`；
 > `POST /parts/batch-with-pdfs` 是遗留端点，无前端调用方。
->
-> **格式并存（已知遗留，不在本轮范围）**：库里历史工单的序列号是
-> `{prefix}{4 位数字}`，`batch-with-pdfs` 造的子件是 `{父序列号}-{2 位序号}`；
-> 2026-10-05 起本仓三个建单端点新派发的是 `shared::serial::acquire` 的
-> `{prefix}{7 位数字}`（格式与耗尽语义见 [`../index.md`](../index.md) 跨域错误码速查
-> 与 `src/shared/serial.rs`）。两种串长不同 ⇒ `uk_t_part_serial_no` 不会互相冲突。
-> 代价在**按 `serial_no` 文本排序**：同为 `{prefix}` 时，只要 counter 还没到
-> 1,000,000（`:07` 补零后第 2 位是 `'0'`），`'0' < '1'`~`'9'` 恒成立 ⇒ 新号整体
-> 排在旧号前面、观感上像「老件反而更新」；counter 越过这个量级后反序不再成立、
-> 两类号交错，排序结果失去「越大越新」的可读性。这是既有数据形态与新格式并存的
-> 已知取舍，统一格式要一次性刷历史数据。
->
-> **counter 行共享（2026-10-05）**：`t_part.serial_no` 与 `t_assembly.serial_no`
-> 从 `t_serial_counter` 的**同一行**取号（part 走
-> `PartRepoTrait::serial_prefix_for_customer` + `shared::serial::acquire`，assembly 走
-> `AssemblyRepoTrait::acquire_serial` + 同一个 `shared::serial::acquire`，两边都按 L1
-> 客户的 `serial_prefix` 定位同一 `{prefix}` 行），所以同一 L1 prefix 下两类单据
-> **共用一个序列流、互相插号**，counter 上限与耗尽信号（`20105`）也共用。
-> 该表**不在 migrations / seeds 里**（A-Z 各行靠数据注入）：新建 L1 客户配了新的
-> `serial_prefix` 却没有对应的 counter 行时，该客户的建单端点会整体报
-> `20108 BIZ_SERIAL_PREFIX_UNKNOWN`（`400`），需补一行 counter 记录。
 
 ## 状态机
 
