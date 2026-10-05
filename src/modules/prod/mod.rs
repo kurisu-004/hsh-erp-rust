@@ -35,6 +35,16 @@
 //! 404（**无 alias**，沿 2026-09-19 prod 聚合先例），请求 / 响应契约逐字不变。
 //! 跨域依赖方向由 shelf→prod 翻转为 prod→shelf（只读 `ShelfRepo::get_by_id`）。
 //!
+//! 2026-10-05 新增 `prod::process_design` 子模块（制定工序页零件列表，1 端点，URL 挂
+//! `/api/v2/prod/process-design/parts`）：前端「制定工序」页从 part 域
+//! `GET /api/v2/parts?status=PENDING` 切过来（前端**不传 `limit`**）。part 域 `GET /parts` 在
+//! service 层硬置 `part_only: true`，repo 据此在 SQL 里加 `AND assembly_id IS NULL`
+//! 守卫，把**装配件的子零件全部排除**；本页需要所有还没定工序的零件，故新端点
+//! **刻意不加**该守卫（子件行 `assembly_id` 有值，照常返回供前端标注归属）。
+//! 谓词（软删 + `PENDING` 状态闸门）与字段集（7 字段最小集）均与旧端点不同，沿
+//! 2026-10-01 `prod::programming` 的先例下沉到 prod 域。part 域旧端点**保留兼容、
+//! 一行未改**。
+//!
 //! `t_part_batch`（批次）是生产执行单元，**归 prod 域**：它的 repo / model /
 //! `status_gate` 状态写入口与 25 条批次路由（`worker-scan` / `pick-up` / `to-*` /
 //! `complete` / `split` / `cancel` / `scan-inspect` / 3 条集合读）整体在本域
@@ -58,6 +68,7 @@ use crate::state::AppState;
 pub mod batch;
 pub mod process;
 pub mod process_chain;
+pub mod process_design;
 pub mod programming;
 pub mod shelf_process;
 pub mod work_type;
@@ -77,6 +88,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .nest("/batches", batch::router())
         // 2026-10-01 新增：prod::programming（待编程一览，part 状态闸门 + 三规则并集口径）
         .nest("/programming", programming::router())
+        // 2026-10-05 新增：prod::process_design（制定工序页零件列表，含装配件子件）
+        .nest("/process-design", process_design::router())
         // 2026-10-02 新增：prod::shelf_process（货架 ↔ 工序映射，3 端点，自 shelf 域硬切）
         .nest("/shelf-processes", shelf_process::router())
 }
