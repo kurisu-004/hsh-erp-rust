@@ -304,6 +304,7 @@ CRUD / 文件 / 列表 / `GET /parts/{part_id}/batches`）。
   - `prod::batch` —— 1 个 `BATCH_PLACED_ON_SHELF` 事件（详见 [`batches.md` 事务 + WS 广播](./batches.md#事务--ws-广播沿-worker_pool-范本)）
   - `prod::programming` —— 纯读端点，**不发**任何 WS 事件
   - `prod::shelf_process` —— 3 端点（1 写 2 读），**不发**任何 WS 事件
+  - `prod::process_design` —— 纯读端点，**不发**任何 WS 事件
 
 ---
 

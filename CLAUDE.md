@@ -146,9 +146,8 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
   - prod 侧：文档原写「31」，系 `prod::worker_pool` 计数残留（标题写 5、router
     实为 6 route），实为 **32**；
   - 故 prod 的净变化是 32 → 35（+3），而非按旧账记的 31 → 34。
-  订正后的 prod 35 端点与本节上表求和一致（7+7+5+3+6+3+1+3）。⚠️ 该求和只覆盖 2026-10-02
-  当时的 8 个子模块、35 端点，是**历史快照**；**端点求和的真值以本节上表下方那行为准**
-  （2026-10-05 增 `prod::process_design` 后为 9 个子模块 / 61 端点）
+  - ⚠️ 上文「prod 32 → 35（+3）」是 2026-10-02 shelf 拆分当时的记账（当时 batch 记
+    3 端点、shelf_process +3），与本节上表已不同源；端点求和真值见上表下方那行。
 - `t_shelf_process` 的 SQL 真源**只在** `prod::shelf_process::repo::ShelfProcessRepo`
   （6 个静态方法 = 平移 4 + 从 `prod::batch` / `prod::worker_pool` 各收 1 处）。
   故意保留 inline 的 3 处见 `docs/api/production/shelf-process-mapping.md#维护约定`

@@ -33,8 +33,10 @@ use super::dto::ProcessDesignListQuery;
 /// 域旧端点 `part/service/crud.rs` 的 `unwrap_or(50).clamp(1, 200)`
 /// （**缺省 50 / 封顶 200**）。本端点缺省 200、上限 {@link MAX_LIMIT} `clamp(1, 500)`
 /// （500 与 `prod::programming` 同值），比旧端点**更宽**：前端切端点后**首屏行数从 50
-/// 涨到 200** —— 这是预期契约后果（待制定工序的零件常超 50 条），不是 bug，量大时
-/// 前端按 `offset` 翻页。
+/// 涨到 200**。这是预期契约后果，不是 bug，量大时前端按 `offset` 翻页。
+///
+/// 2026-10-05 归因订正：缺省 200 的依据是**本端点契约**，不是任何前端口径或业务量
+/// 的推导 —— 引用旧端点缺省 50 仅为说明切换后的**可见差异**，不构成 200 的推导链。
 const DEFAULT_LIMIT: i64 = 200;
 
 /// 分页上限（service 层 clamp）。500 与 `prod::programming` 同值。

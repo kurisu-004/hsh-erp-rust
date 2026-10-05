@@ -226,7 +226,7 @@ LIMIT $limit OFFSET $offset
 | Code | Name | HTTP | 触发场景 |
 |---|---|---|---|
 | 40300 | FORBIDDEN | 403 | 角色守卫失败（非 Manager/Clerk/Inspector/CNC_PROGRAMMER） |
-| 50001 | DB_ERROR | 500 | DB 查询失败 |
+| 50001 | DATABASE | 500 | DB 查询失败 |
 
 **关于 40001**：本端点**不会**用 40001 报 `limit` / `offset` 越界 —— 越界一律
 **静默 clamp**（`limit=0 → 1`、`limit=9999 → 500`、`offset=-1 → 0`，见 service 层），
