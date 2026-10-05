@@ -20,6 +20,9 @@
 //!   tests/shelf/api.rs 迁入整组替换场景 + 补全集查询 / 20505 / 旧路径 404 场景）
 //! - pickup.rs                 ← 2026-10-03 新增（pick-up 整批 + **部分领取自动拆批**，
 //!   9 场景）
+//! - process_design.rs         ← 2026-10-05 新增（prod::process_design 制定工序页零件
+//!   列表 1 端点，8 场景；★ 核心回归是「装配件子件可见」，锁死不加
+//!   `AND assembly_id IS NULL` 守卫）
 
 #![allow(dead_code, clippy::await_holding_lock, unused_imports)]
 
@@ -28,6 +31,7 @@ mod pending_programming;
 mod pickup;
 mod process;
 mod process_chain;
+mod process_design;
 mod shelf_process;
 mod work_type;
 mod worker;
