@@ -106,7 +106,7 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `id` | string (i64) | part_file 雪花 ID（owner_kind='ASSEMBLY', kind='ASSEMBLY_MASTER'） |
+| `id` | string (i64) | part_file 雪花 ID（`t_part_file.part_id` = assembly id，该列兼作 polymorphic owner 列；归属类型靠 `kind='ASSEMBLY_MASTER'` 判别，不单独存盘） |
 | `original_filename` | string | 原始文件名 |
 | `page_count` | i32? | PDF 页数（**Phase 3**：当前 pass 总是 `None`，懒加载） |
 
@@ -302,7 +302,7 @@ assembly 域（203xx）见下方表格；共享错误码（40001 / 40300 / 40901
 
 ## 参考
 
-- 集成测试：`tests/assembly_api.rs`（6 用例：create 无 PDF / create 有 PDF + 子件派生 / create 页数不匹配 / create 超 99 子件 / cancel 终态禁 / list + L1 展开）
+- 集成测试：`tests/assembly/`（`api.rs` 13 例 / `create_serial_price.rs` 8 例 / `files.rs` 6 例 / `status_sync.rs` 5 例 / `children.rs` 4 例 / `files_list.rs` 4 例 / `by_part.rs` 3 例）
 - 仓库分层：`src/modules/assembly/handler.rs` (axum) → `service.rs` (业务) → `repo.rs` (SQL) → `dto.rs` / `model.rs` / `statemachine.rs`
 - 状态机：`src/modules/assembly/statemachine.rs`
 - 错误码：`src/shared/error.rs::code`
