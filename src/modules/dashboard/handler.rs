@@ -1,110 +1,3 @@
-//! dashboard WebSocket handler（2026-09-15 takeover-fill + followup-cleanup +
-//! 2026-09-22 Group E 重构）
-//!
-//! 路径：`GET /ws/dashboard?token=<JWT>`（由 `dashboard::mod::router()` 桥接，
-//! 再由 `modules::ws_router()` 在 `/ws` 前缀下挂）。
-//!
-//! ## 实现要点
-//! - query token 鉴权：走 `auth::middleware::verify_session_token` 共享核验函数
-//!   （与 HTTP middleware 同源：Bearer JWT 验签 + iss 校验 + Redis session 校验
-//!   + 滑动 TTL；本 handler 不重复实现，2026-09-20 重构）
-//! - WS 不走 axum middleware（query-token 而非 Bearer；WS upgrade 帧也无法被
-//!   HTTP middleware 拦截），故单独调一次 `verify_session_token`
-//! - 任意已登录（*）即可连接
-//! - WS 升级：`axum::extract::ws::WebSocketUpgrade`
-//! - 业务事件订阅：把 `state.ws_hub.broadcast` 上的 `WsEvent::DashboardEvent`
-//!   透传给本连接
-//! - 心跳：30s 周期发 `WsHeartbeatMsg` 作为 **text** 帧（浏览器 JS `onmessage` 可直接收到；
-//!   原 `Message::Ping` 浏览器不会触发 `onmessage`，前端无法感知；2026-09-15 followup A6 改）。
-//!   间隔由 `state.config.ws_heartbeat_interval_seconds` 控制，生产 30s，测试可调小。
-//! - 推一次 `WsSnapshotMsg` 立即下发
-//!
-//! ## 2026-10-01 WS 健壮性加固（4 项）
-//! 1. **B1 `RecvError::Lagged` 不再静默吞掉**：原先 `Err(_)` 同时匹配 `Lagged(n)` 与
-//!    `Closed`，而 `Lagged` 意味 tokio **已永久丢弃**该连接的 n 条消息。丢的是
-//!    `DashboardEvent` 帧，前端更新语义是「WS 事件 → invalidate → HTTP 重取」而非增量
-//!    patch，故丢 1 个事件 = 对应区块永不刷新，且当时服务端零日志、客户端零感知。
-//!    现拆成两分支：`Lagged` → `warn!` + 发 `4003` Close 帧 + 断开（强制前端重连 →
-//!    一次全量 HTTP 重取，比补发 n 条后续事件更便宜也更正确）；`Closed` → `info!` + 断开。
-//! 2. **B2 补 Close 帧**：此前全仓零 `sender.send(Message::Close(..))`，全部退出路径都是
-//!    裸 drop，浏览器只见 1006，无法区分「服务端主动踢 / 网络断 / session 失效」。
-//!    见本文件底部 `close_with`（review 第 1~2 轮后：写侧已失败的那几条路径不再重复发，
-//!    故 Close 帧调用点为 5 处、退出路径 14 条——逐条见本文件末尾的表）。
-//! 3. **B3 接真连接表**：`handle_socket` 入口 `ws_hub.register_conn`、退出前
-//!    `unregister_conn`（返回值用于打「连接存活时长」日志），并在两端 `info!` 当前连接数。
-//! 4. **B4 存活检测**：新增协议层 `Message::Ping`（`ws_ping_interval_seconds`）+ 空闲
-//!    超时（`ws_pong_timeout_seconds`，**绝对 deadline** 写法，见循环内注释）+ 周期性
-//!    re-auth（每 `ws_reauth_every_n_heartbeats` 次 text 心跳验一次 session）。
-//!
-//! ### 2026-10-02 review 第 1 轮修复（3 Major + 9 Minor）
-//! - **Major-1 re-auth 失败原因分流**：`verify_session_token` 的失败被压平成一个 code，
-//!   其中「Redis 瞬时故障」（`AppError::Internal` → `50000`）与「session 真失效」
-//!   （`40100/40102/40105`）走同一条 `4001`。而 `4001` 按契约文档要求前端「清 token 跳登录页」
-//!   → 一次 Redis 抖动会把全站用户登出。现按 `e.code()` 分流：鉴权类 → `4001`，
-//!   基础设施类 → `1011 re-auth unavailable`（前端走普通重连）。
-//! - **Major-2 启动期把 `pong_timeout` 下限从 `> ping` 收紧为 `>= 2 × ping`**
-//!   （`config.rs::validate_ws_liveness` + 3 个单测）。
-//! - **Major-3 `close_with` 加 2s 收尾超时**：半开 TCP + 发送缓冲满时 `send`/`poll_close`
-//!   会长时间 `Pending`，会把 `run_socket` → `handle_socket` 的 `unregister_conn` 一起卡住
-//!   → 连接表条目泄漏（正是 B4 想回收的那类连接）。改动前这些路径是裸 `break`（立即 drop），
-//!   故这是本次加固引入的新阻塞点。
-//! - **Minor-1 `select!` 加 `biased;`**：pong deadline 与 socket 可读同时 ready 时随机选分支，
-//!   有概率选中超时分支误杀健康连接。入站分支排第一（dashboard 入站只有 Pong，饿死不了别的分支）。
-//! - **Minor-2 re-auth 套 5s `timeout`**：`verify_session_token` 有 Redis 往返，卡住会
-//!   阻塞整个 `select!`（`shutdown.cancelled()` 无法响应）。超时按「本轮跳过」处理，不判死。
-//! - **Minor-3 写侧已失败的 5 条路径不再重复 `close_with`**（回 Pong / 广播快照 / 广播事件
-//!   / text 心跳 / 协议层 Ping 写失败；reviewer 数成 4 条，实为 5 条——漏算了广播快照那处；
-//!   第 2 轮 Nit-2 又补上「推初始快照」那条，共 6 条）。见末尾「退出路径全景」表。
-//! - **Minor-4/5** 修正 `close_with` 与 `Closed` 分支的注释（行为不变，reviewer 已核实
-//!   `close()` 不等 Close 回声、只做收尾 flush；且 `is_allowed` 对本仓 5 个 code 全 true）。
-//! - **Minor-7 re-auth 周期从 `const` 改为配置项** `WS_REAUTH_EVERY_N_HEARTBEATS`，
-//!   使「re-auth 失败 → 4001」这条安全核心路径能被 E2E 覆盖。
-//!
-//! ### 2026-10-02 review 第 2 轮修复（1 Major-A + 1 Minor + 1 Nit，产品代码只动 2 处）
-//! - **Minor-1 订正 `select!` 分支顺序**：`shutdown.cancelled()` 提到**第一**，入站分支第二。
-//!   `biased` 下「持续 Ready 的高优先级分支会永久饿死低优先级分支」，上一轮把入站排第一
-//!   等于让「入站洪流 → 心跳停发 / Lagged 检测不到 / **1012 发不出**」。排序不变式：
-//!   `shutdown` → 入站（仍须在 pong 超时之前）→ 其余。
-//! - **Minor-2 订正 `close_with` 的选型理由**：`select!` 与 `timeout` 在这里**行为等价**
-//!   （tokio `Timeout::poll` 先 poll inner），上一版「timeout 会一次都不 poll 就丢帧」
-//!   +「这在 CI 上真实发生过」两句均不成立，已删。选型理由改为「让顺序在代码里可见」。
-//! - **Nit-2 退出路径 2 也改裸 break**：`send_msg` 失败后 `close_with` 属同类情形
-//!   （写端已不可用 → Close 帧物理上发不出去），故 Close 帧路径 6 → 5。
-//! - 另订正两处「`is_multiple_of(0)` 会 panic」的**错误注释**（已核 std 源码：不 panic，
-//!   恒返 `self == 0` ⇒ 真后果是 re-auth 静默永不触发）。
-//! - Major-A（`ws_e2e_pong_timeout_closes_dead_peer` 1/8 红）属**测试侧**问题，
-//!   产品代码未动：根因是 tungstenite 读到 Ping 会自动回 Pong、往已被服务端 drop 的
-//!   socket 写 → EPIPE，且 `poll_next` 置 `ended = true` 后 Close 帧再也读不到。
-//!   修法见 `tests/dashboard_ws_api.rs` 同名用例。
-//!
-//! ### 退出路径全景（14 条，其中 5 条发 Close 帧）
-//! | # | 触发 | 动作 | Close code |
-//! |---|---|---|---|
-//! | 1 | 首次快照构建失败 | close_with + return | `1011` |
-//! | 2 | 推初始快照失败 | 裸 return | —（写侧已死，见 Nit-2） |
-//! | 3 | 客户端 `Close` / 流结束 | 裸 break | —（客户端已发起关闭） |
-//! | 4 | 入站帧解码错误 | 裸 break | — |
-//! | 5 | 回 `Pong` 写失败 | 裸 break | —（写侧已死，见 Minor-3） |
-//! | 6 | 广播 snapshot 写失败 | 裸 break | —（同上） |
-//! | 7 | 广播 event 写失败 | 裸 break | —（同上） |
-//! | 8 | text 心跳写失败 | 裸 break | —（同上） |
-//! | 9 | 协议层 `Ping` 写失败 | 裸 break | —（同上） |
-//! | 10 | 广播队列溢出 `Lagged(n)` | close_with + break | `4003` |
-//! | 11 | 广播通道 `Closed` | 裸 break | — |
-//! | 12 | 周期性 re-auth 失败 | close_with + break | `4001` / `1011` |
-//! | 13 | 超过 `pong_timeout` 无入站帧 | close_with + break | `1011` |
-//! | 14 | 服务优雅退出 | close_with + break | `1012` |
-//!
-//! （心跳序列化失败与 re-auth 超时是 `continue` 而非退出路径，不计入。写侧已失败的
-//! 共 **6 条**（#2 #5 #6 #7 #8 #9），它们一律裸断：tokio-tungstenite 的
-//! `max_write_buffer_size` 缺省 `usize::MAX` ⇒ 写缓冲不主动限流，`Sink::send` 唯一
-//! 可能的失败就是 socket 级致命错，此时 Close 帧**物理上**发不出去。）
-//!
-//! 实际发出的 Close code 共 **4 个**：`1011`（3 条路径：首次快照构建失败 / re-auth
-//! 基础设施失败 / pong 超时）、`1012`（服务重启）、`4001`（re-auth 鉴权失败）、
-//! `4003`（慢消费方）。`1001` 自 Minor-3 起**无路径发出**。详见
-//! `docs/api/websocket.md`「连接关闭码」。
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -128,26 +21,8 @@ use crate::shared::response::R;
 use crate::shared::types::deserialize_i64_opt;
 use crate::state::AppState;
 
-/// 2026-10-02 新增（review 第 1 轮 Minor 2）：单次周期性 re-auth 的调用超时上限。
-///
-/// `verify_session_token` 内部有 Redis 往返（黑名单 EXISTS + session 查询 +
-/// `touch_session`），Redis 卡住（连接池耗尽 / 网络分区）会把整个 `select!` 一起冻住：
-/// 期间既处理不了 `shutdown.cancelled()`（`1012` 发不出），返回后 `last_seen` 也早已过期
-/// → 下一轮立即以 `1011 pong timeout` 踢掉**健康**连接。套 5s timeout 后超时按
-/// 「本轮跳过」处理（不判死），下一轮心跳再验。
-///
-/// 为什么不刷新 `last_seen`：健康客户端的 Pong 此刻已躺在 socket 接收缓冲里，
-/// 解冻后 `select!` 的 `biased` 入站分支会立刻取到它并刷新 deadline（见循环内注释）。
-const WS_REAUTH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 2026-10-02 新增（review 第 1 轮 Major-3）：`close_with` 的收尾窗口上限。
-///
-/// 半开 TCP（对端掉电 / NAT 静默丢映射 / 发送缓冲被慢读方填满）时
-/// `SplitSink::send` 会在 `poll_ready`/`poll_flush` 上长时间 `Pending`、`close()` 会在
-/// `poll_close` 上同样挂起（直到内核重传超时，可达数分钟~十几分钟）。这会连带把
-/// `run_socket` → `handle_socket` 的 `unregister_conn` 卡住 → 连接表条目泄漏，而
-/// 回收这类连接正是 B4 的存在意义。2s 是「足够把 Close 帧推进内核缓冲区」的量级，
-/// 超时就放弃 flush 直接断（丢掉一个 Close 帧好过泄漏一条连接表条目）。
+const WS_REAUTH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]
@@ -155,13 +30,7 @@ pub struct WsQuery {
     pub token: Option<String>,
 }
 
-/// `GET /api/v2/dashboard/snapshot` 的 query 入参（2026-09-30 新增）。
-///
-/// 形参 `upcoming_days` / `basis` 语义见
-/// `service/snapshot.rs::build_snapshot_with_workers` / `dto.rs::DeliveryBasis`。
-/// `upcoming_days` 字段解析走 `deserialize_i64_opt`：None 表示缺省，
-/// Some(str) parse 为 i64；非数字字符串返 4xx（axum Query 反序列化错误）——
-/// 与仓内 part 域 DTO 一致。
+
 #[derive(Debug, Default, Deserialize)]
 pub struct SnapshotQuery {
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
@@ -170,14 +39,6 @@ pub struct SnapshotQuery {
     pub basis: Option<DeliveryBasis>,
 }
 
-/// `GET /ws/dashboard?token=<JWT>`
-///
-/// WS-only 端点（2026-09-22 Group E 重构）：
-/// - 路径：`/ws/dashboard`（`modules::ws_router()` 在 `/ws` 前缀下挂，无 `/api/v2`）
-/// - 鉴权：`verify_session_token`（不走 HTTP middleware；WS upgrade 帧不能被拦截）
-/// - snapshot 拉取走 handler 三形态 ①（`pool.begin() → service → commit`，开 tx 仅作
-///   单次只读聚合边界，commit 即结束）
-/// - 后续 ws_hub.broadcast 是订阅模式，不开 tx、不再走 service
 pub async fn ws_dashboard(
     State(state): State<Arc<AppState>>,
     Query(q): Query<WsQuery>,
@@ -190,8 +51,6 @@ pub async fn ws_dashboard(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::biz(code::UNAUTHORIZED, "缺少 token 查询参数"))?;
-    // 2026-09-23 重构：返回值的第二个元素从 sha256 hash 改为 JWT jti (UUID v4)，
-    // WS 端点不持久化 token，仅丢弃 jti（与 HTTP middleware 同源）。
     let (user, _jti) = verify_session_token(&state, token).await?;
     // 2026-09-20 修改：username 写日志，便于按用户名排查连接异常；当前端点任意已登录即可，
     // 故不调用 user.require_role(...)。
@@ -209,30 +68,6 @@ pub async fn ws_dashboard(
     Ok(resp)
 }
 
-/// `GET /api/v2/dashboard/snapshot`  （2026-09-28 新增，2026-09-30 扩 query）
-///
-/// HTTP 全量首取大屏快照（前端 dashboard 视图走「HTTP 首取 + WS 事件 invalidate」
-/// 模式）。与 `GET /ws/dashboard` 共用同一 service（`DashboardService::build_snapshot_with_workers`），
-/// 返回 `R<DashboardSnapshot>`（HTTP JSON 信封）；WS 端点仍推一次 `WsSnapshotMsg` envelope
-/// 保留向后兼容。
-///
-/// 鉴权：
-/// - HTTP 走 `v2_router` 末尾的 `authenticate_middleware`（Bearer JWT + Redis session）
-/// - handler 用 `CurrentUser` extractor 占位（与 WS 端点权限对齐：任意已登录；不调
-///   `require_role`，原因 2026-09-15 `ws_dashboard` 注释里有说明）
-///
-/// Query 入参（2026-09-30 新增 `upcoming_days`、2026-10-04 新增 `basis`）：
-/// 形参语义见 `service/snapshot.rs::build_snapshot_with_workers` / `dto.rs::DeliveryBasis`。
-///
-/// 实现要点（handler 三形态 ①：snapshot 单次只读聚合）：
-/// - `state.pool.begin()` 借 tx 边界
-/// - `state.dashboard_service.build_snapshot_with_workers(&mut *tx, None, q.upcoming_days, q.basis)` —— 同
-///   `build_snapshot_msg` 内部调用的 service 方法，零新 SQL；WS 路径 `None` 透传
-///   走默认 14 天 + `planned` 口径（前端 WS 信封 schema 不验长度与口径，安全）
-/// - `tx.commit()` 立即结束（service 层内部 SQL 全只读，开 tx 仅作聚合边界）
-/// - 不引入新错误码：DB / SQL 失败走 `AppError::from(sqlx::Error)` 通透 `R<T>` 错误码
-///   段（与现有 handler 一致）；非数字 `upcoming_days` / 非法 `basis` 走 axum `Query`
-///   反序列化错误自动 4xx（与 part 域 DTO 行为对齐）
 pub async fn get_snapshot(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SnapshotQuery>,
@@ -247,10 +82,6 @@ pub async fn get_snapshot(
     Ok(Json(R::ok(snap)))
 }
 
-/// 单条 WS 连接的完整生命周期：登记连接表 → 主循环 → 注销连接表。
-///
-/// 2026-10-01 拆成薄壳 + `run_socket` 两层，只为让 register / unregister **各只有一处**
-/// ——早期 `handle_socket` 有 2 条 pre-loop 早退路径，逐条补 unregister 极易漏。
 async fn handle_socket(
     socket: WebSocket,
     state: Arc<AppState>,
@@ -622,31 +453,7 @@ async fn run_socket(
     }
 }
 
-/// 周期性 re-auth 失败 → Close code 的**唯一决策点**（2026-10-02，review 第 1 轮
-/// Major-1 抽成纯函数，便于单测钉死契约）。
-///
-/// `verify_session_token` 的失败原因**可区分**，只是原先被压平成一个 code：
-///
-/// | 失败原因 | `AppError` 变体 | `e.code()` | 本函数返回 |
-/// |---|---|---|---|
-/// | JWT 过期 / 验签失败 | `Jwt` / `Unauthorized` | `40102` / `40100` | `4001 auth expired` |
-/// | session 不存在 / jti 进黑名单 | `Biz` | `40105` | `4001 auth expired` |
-/// | Redis 挂 / 连接池耗尽 | `Internal` | `50000` | `1011 re-auth unavailable` |
-///
-/// 原实现对以上全部一律发 `4001`，而 `docs/api/websocket.md` 规定前端对 `4001` 的动作是
-/// 「**清本地 token 并跳登录页**」→ 一次 Redis 抖动 = 全站大屏收 4001 = 按自家文档把
-/// 全站用户登出。fail-closed 用错了位置：这里明明能判断（能区分鉴权失败与基础设施故障），
-/// 不该 fail-closed。
-///
-/// `_ =>` 兜底到 `1011`（可重试）而非 `4001`（终止）：新出现的错误码默认「先当服务端问题
-/// 处理」，宁可多几次重连，也不要因为一个没见过的状态把用户踢去登录页。
-///
-/// ⚠️ **维护须知**：`src/shared/error.rs::code` 里**新增任何鉴权类错误码**（即「这次
-/// re-auth 失败确实是因为 session 没了」）时，**必须**同步把它加进上面的白名单。
-/// 漏加的后果不是崩溃而是**静默降级**：该码会落到 `_ => 1011`，前端只重连不登出，
-/// 于是一个已被吊销的 session 会被无限重连下去 —— 恰好是 B4 周期性 re-auth 要堵的洞。
-/// 反向风险（误把基础设施故障的码加进白名单）会退回上一轮的 fail-closed 误伤，故宁可漏加
-/// 也不要乱加；加之前先确认该码的 `AppError` 变体确实由「鉴权判定」产生。
+
 fn reauth_close_code(err_code: i32) -> (u16, &'static str) {
     match err_code {
         code::UNAUTHORIZED | code::TOKEN_EXPIRED | code::SESSION_REVOKED => (4001, "auth expired"),
@@ -654,12 +461,6 @@ fn reauth_close_code(err_code: i32) -> (u16, &'static str) {
     }
 }
 
-/// 拉一次快照并组装 envelope（handler 三形态 ①：开 tx → service → commit）。
-///
-/// 2026-09-22 Group E 重构：从 `state.dashboard_service`（不是业务层 `AppState`
-/// 直接持有）取 service 实例；service 方法签名改 `<R: DashboardRepoTrait>(&self,
-/// mut repo: R, ...)` by-value，handler 借 `&mut *tx` 喂给 trait（trait 已直接
-/// `impl for &mut PgConnection`，2026-09-22 同 iam 范式）。
 async fn build_snapshot_msg(state: &AppState) -> Result<String, AppError> {
     let mut tx = state.pool.begin().await?;
     // WS 路径无 query：days / basis 形参均固定传 `None`，由 service `unwrap_or_default()` 兜底。
@@ -682,60 +483,6 @@ async fn send_msg(
         .await
 }
 
-/// 主动关闭连接并带上业务 Close code（2026-10-01 新增，B2；2026-10-02 加超时护栏）。
-///
-/// ## 为什么需要它
-/// 2026-10-01 之前全仓**零** `sender.send(Message::Close(..))`：所有退出路径都是裸 drop，
-/// 浏览器只会看到 1006（ Abnormal Closure），无法区分「服务端主动踢 / 网络断 /
-/// session 失效」三种完全不同的情况，排查时只能猜。
-///
-/// ## code 段约定（RFC 6455 §7.4.2）
-/// - `1000-2999` 协议保留段：`1000` normal / `1001` going away / `1011` internal error /
-///   `1012` service restart。本文件实际用到 `1011` / `1012`（`1001` 曾在「写失败」路径
-///   上用过，但那条路径的写侧已不可用，2026-10-02 Minor-3 起改为裸 break，见模块 doc）。
-/// - `4000-4999` 应用私有段：`4001` auth expired（session 失效）/ `4003` lagged（慢消费方）。
-///   与后端错误码段（`40100` 等 HTTP 信封码）刻意分开——WS Close code 是 2 字节 u16，
-///   与 HTTP 信封是两套协议。
-/// - tungstenite 的 `CloseCode::is_allowed` 对**协议段候选码 `1001` / `1011` / `1012` +
-///   私有段 `4001` / `4003`** 均为 true，故服务端发的 code 不会被客户端改写（不会变成
-///   1002 protocol error）。review 第 1 轮 Minor-4 已核实。
-///
-/// ## 为什么「`send(带 code 的 Close 帧)` + 再 `close()`」两步
-/// `SplitSink::close()` 本身**不接受** code 参数（`SinkExt::close(&mut self)` 无参），
-/// 单靠它发出去的 Close 帧没有业务 code，客户端只能拿到 1005/1006，等于没解决问题。
-/// 因此顺序是：先用 `send` 把**带 code 的** Close 帧写出（tungstenite 内部
-/// `Message::Close(c) → context.close(c)`：置 ClosedByUs + 写帧 + flush），
-/// 再调 `close()` 做**收尾 flush**。
-///
-/// 2026-10-02 订正（review 第 1 轮 Minor-4，reviewer 已核 tungstenite 源码
-/// `protocol/mod.rs:601`）：`close()` **不会**等对端的 Close 回声——`if let Active`
-/// 在这里不成立（状态已是 ClosedByUs），它只把已缓冲的数据 push 出网。原文案
-/// 「驱动关闭握手（Close 回声）」不准确，故改为「收尾 flush」。
-///
-/// ## 为什么套 `CLOSE_FLUSH_TIMEOUT`（2026-10-02，review 第 1 轮 Major-3）
-/// `send` → `poll_ready`/`poll_flush`、`close()` → `poll_close`，两者在发送缓冲被填满
-/// （半开 TCP：对端掉电 / NAT 静默丢映射 / 慢读方）时都会返回 `Pending` 并挂到 socket
-/// 写就绪，可达数分钟~十几分钟（直到内核重传超时）。那会把 `run_socket` → `handle_socket`
-/// 的 `unregister_conn` 一起卡住 → **连接表条目泄漏**，而回收这类连接正是 B4 的意义。
-/// 改动前这些路径是裸 `break`（立即 drop），故这是本次加固引入的新阻塞点。
-/// 超时后无条件放弃 flush 直接断：丢掉一个 Close 帧 ≫ 泄漏一条连接表条目。
-///
-/// `CLOSE_FLUSH_TIMEOUT = 2s` **刻意硬编码、不做成配置项**：它要覆盖的是「把几十字节
-/// Close 帧推进内核发送缓冲」这一个动作，2s 是绰绰有余的量级下限；做成 env 只会多一个
-/// 能被配错的旋钮（配成 <1s 就会在跨网 RTT 下把唯一带业务语义的信息帧丢掉，且症状是
-/// 「前端随机看到 1006」，极难归因）。
-///
-/// ## 为什么用 `select!` 而不是 `tokio::time::timeout`（2026-10-02 review 第 2 轮 Minor-2 订正）
-/// 两者在这里**行为等价**（已核 tokio-1.53.1 `time/timeout.rs:211-222`：`Timeout::poll`
-/// **先** poll inner future，只有 inner 返回 `Pending` 之后才去看 deadline），所以选
-/// `select!` 不是为了修任何 bug，而是让「**先推 Close 帧、再看 deadline**」这个顺序
-/// 在代码里显式可见，读代码的人不必去翻 tokio 内部实现来确认「帧到底有没有被试过」。
-///
-/// 2026-10-02 订正：上一版注释里「`timeout` 会在 task 被饿死时一次都不 poll inner 就判
-/// 超时、导致 Close 帧丢失」以及「这在 CI 上真实发生过」两句**均不成立**（前者已被上面
-/// 的源码证伪，后者是当时对一条测试失败原因的误判——真因见
-/// `tests/dashboard_ws_api.rs::ws_e2e_pong_timeout_closes_dead_peer` 的注释）。
-/// 留着会让后来者以为 `timeout` 有坑而绕开它。
 async fn close_with(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     code: u16,
@@ -776,16 +523,6 @@ async fn close_with(
 mod tests {
     use super::*;
 
-    // =======================================================================
-    // 2026-10-02 新增（review 第 1 轮 Major-1）：`reauth_close_code` 的分流契约。
-    //
-    // 这是「Redis 瞬时故障 ≠ session 失效」的唯一决策点，也是上一轮 fail-closed
-    // 用错位置（Redis 抖动 → 4001 → 按文档把全站用户登出）的回归闸。
-    // 纯函数、零 IO，直接喂 `AppError::code()` 的字面量即可。
-    // =======================================================================
-
-    /// 鉴权类失败（JWT 无效 / 过期 / session 吊销）→ `4001 auth expired`
-    /// （前端契约：清本地 token 跳登录页，**不要**重连——重连会被 40105 拒）。
     #[test]
     fn reauth_auth_failures_map_to_4001() {
         assert_eq!(
