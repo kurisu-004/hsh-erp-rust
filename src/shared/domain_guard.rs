@@ -4,6 +4,11 @@
 //! admin 都不 import 别域的 service / repo，而是各自在本域 SQL 里聚合），但口头
 //! 约定挡不住回退，故用单测在源码层兜住。
 //!
+//! 已接入的三域：`dashboard`（扫 `src/modules/dashboard`）、`prod::programming`
+//! （扫 `src/modules/prod/programming`）、`prod::inspection`（扫
+//! `src/modules/prod/inspection`）—— 后两域是**嵌套域**，同父兄弟域
+//! （`prod::batch`）同样算跨域，由前缀匹配而非「首段相同即本域」判定。
+//!
 //! ## 探测口径
 //! 在**剥掉注释**的代码区里找「跨域根段 + 双冒号 + 一个域路径」，该路径不是本域即违规。
 //! 域路径按标识符逐段读，**末尾不接双冒号的那个标识符同样算一段**
@@ -64,8 +69,8 @@
 //! 无此写法。
 //!
 //! ## 本域标识符：`::` 拼接的域路径
-//! `own_domain` 是域路径而非单段标识符，`"dashboard"` 与 `"prod::programming"`
-//! 两种形态都合法。判定规则是**前缀匹配**：从根段起逐段与本域路径比，全部相符即
+//! `own_domain` 是域路径而非单段标识符，`"dashboard"` / `"prod::programming"` /
+//! `"prod::inspection"` 三种形态都合法。判定规则是**前缀匹配**：从根段起逐段与本域路径比，全部相符即
 //! 本域引用（含 `crate::<域根>::<本域>::…::repo` 这类子模块下钻）；在第 i 段分叉
 //! 则报出到第 i 段为止的他域路径。
 //!

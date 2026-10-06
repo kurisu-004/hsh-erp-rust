@@ -141,7 +141,7 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 
 - **域外依赖 = 0**（只读 5 表 `t_part` / `t_part_batch` / `t_assembly` / `t_customer` / `t_worker`，只读跨域聚合是本仓既定 pattern，同 `statistics` / `admin`）。
   - **护栏设施**：`src/shared/domain_guard.rs`（`#[cfg(test)]` 项、不进 lib 产物，故**只有 `src/` 内单元测试能用**，`tests/` 集成测试拿不到、要靠它得先改调用方式）的 `assert_no_foreign_domain(本域路径, 本域源码目录, 域专属指引)` —— 在剥掉注释的代码区里找「域根段 + 他域路径」前缀失配；不连网不连库，单测可在无 DB 环境跑。已登记的漏报盲区与精度边界见该文件顶部 doc。
-  - **已接入的两域**：`modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）与 `modules::prod::programming::tests::programming_domain_depends_on_no_other_domain`（扫 `src/modules/prod/programming/**/*.rs`，本域路径 `prod::programming`，**同父兄弟域 `prod::batch` 同样算跨域**）。新增只读跨域聚合域时照此加一行调用即可。
+  - **已接入的三域**：`modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`（扫 `src/modules/dashboard/**/*.rs`）、`modules::prod::programming::tests::programming_domain_depends_on_no_other_domain` 与 `modules::prod::inspection::tests::inspection_domain_depends_on_no_other_domain`（后两者分别扫 `src/modules/prod/programming/**/*.rs` 与 `src/modules/prod/inspection/**/*.rs`，本域路径为嵌套域 `prod::xxx`，**同父兄弟域 `prod::batch` 同样算跨域**）。新增只读跨域聚合域时照此加一行调用即可。
   - **元测试**：`shared::domain_guard::tests::*`（6 条，含「本域标识符非法必须 panic」与 raw string 字符串状态两组）。任一写法漏报、误报或探测器瞎了都会红。
 - `DELIVERY_STATUSES`（6 态，`repo/delivery.rs`）是「未交付」的**唯一**判据，逾期计数 / 面板 / 抽屉 / 柱状图 top+middle 四处共用；柱状图 bottom 层额外含 `DELIVERED`。**它与前端 `LAYERS[].statuses` 是人工同步关系，无编译期保障**，改一侧必须改另一侧。
 - ⚠️ **行单位差异**：逾期 = **工单级**（装配件算 1 条，`t_part` 侧 `assembly_id IS NULL` 排除子件）；面板 / 柱状图 = **件级**（子件各算 1）。两者时间窗口不重叠（`< today` vs `>= today`），故同一条不会重复出现。
