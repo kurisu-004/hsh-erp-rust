@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/index.md)（[index.md](docs/api/index.md) 为总入口，含通用约定 + 跨域错误码速查；按模块拆分为 `iam.md` / `applicants.md` / `customers.md` / `shelves.md` / `websocket.md` / `delivery-groups.md` / `cnc-programs.md` / `files.md` / `outsource-companies.md` / `outsource-quotes.md` / `outsource-shipments.md` / `outsource-sendable.md` / `outsource-pool.md` / `_e2e.md` / `dashboard.md`（2026-10-06 新增，HTTP 首取 + WS 大屏），`parts` 因端点 ≥49 已拆为 `docs/api/parts/` 子目录（`index.md` / `crud.md` / `lifecycle.md` / `inspection.md` / `batch.md` / `print.md`），`assemblies` 拆为 `docs/api/assemblies/`，`production` 拆为 `docs/api/production/`（`index.md` + 子页：work-types / processes / work-type-process-mapping / **shelf-process-mapping（2026-10-02 新增，货架↔工序映射自 shelves 域搬入）** / process-chain / worker-pool / workers / batches / pending-programming / **process-design（2026-10-05 新增，制定工序页零件列表）** / **inspection（2026-10-05 新增，扫码查询：装配件→子件→批次三层树）**），`delivery-notes` 拆为 `docs/api/delivery-notes/`（4 子页）；2026-09-19 IAM 域合并：原 `auth.md` + `users.md` → `iam.md`；2026-09-19 prod 容器聚合：原 `workers.md` → `production/workers.md`，工种/工序/工艺链/工人池/工人 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`）；2026-09-28/29 wx 域：原 7 个小程序 BFF 聚合端点 + 新增 `POST /api/v2/wx/iam/wx-login`（企业微信小程序登录）→ `docs/api/wx.md`，配套 iam 域 3 个 `/iam/users/{id}/wx-bind` 端点见 `docs/api/iam.md`。**后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须立即同步更新对应模块文件**。
+> 📌 **前端对接**：后端 API 参考见 [`docs/api/`](docs/api/index.md)（[index.md](docs/api/index.md) 为总入口，含通用约定 + 跨域错误码速查；按模块拆分为 `iam.md` / `applicants.md` / `customers.md` / `shelves.md` / `websocket.md` / `delivery-groups.md` / `cnc-programs.md` / `files.md` / `outsource-companies.md` / `outsource-quotes.md` / `outsource-shipments.md` / `outsource-sendable.md` / `outsource-pool.md` / `_e2e.md` / `dashboard.md`（**2026-10-07 重构**：3 个只读 HTTP 端点 `/api/v2/dashboard/{snapshot,upcoming-delivery,delivery-orders}` + WS 首帧/增量；口径、`DELIVERY_STATUSES` 三处共用、行单位差异、前端配套清单见该文件），`parts` 因端点 ≥49 已拆为 `docs/api/parts/` 子目录（`index.md` / `crud.md` / `lifecycle.md` / `inspection.md` / `batch.md` / `print.md`），`assemblies` 拆为 `docs/api/assemblies/`，`production` 拆为 `docs/api/production/`（`index.md` + 子页：work-types / processes / work-type-process-mapping / **shelf-process-mapping（2026-10-02 新增，货架↔工序映射自 shelves 域搬入）** / process-chain / worker-pool / workers / batches / pending-programming / **process-design（2026-10-05 新增，制定工序页零件列表）** / **inspection（2026-10-05 新增，扫码查询：装配件→子件→批次三层树）**），`delivery-notes` 拆为 `docs/api/delivery-notes/`（4 子页）；2026-09-19 IAM 域合并：原 `auth.md` + `users.md` → `iam.md`；2026-09-19 prod 容器聚合：原 `workers.md` → `production/workers.md`，工种/工序/工艺链/工人池/工人 5 支撑域聚合为 `src/modules/prod/*`，URL 硬切换 `/api/v2/prod/*`）；2026-09-28/29 wx 域：原 7 个小程序 BFF 聚合端点 + 新增 `POST /api/v2/wx/iam/wx-login`（企业微信小程序登录）→ `docs/api/wx.md`，配套 iam 域 3 个 `/iam/users/{id}/wx-bind` 端点见 `docs/api/iam.md`。**后端代码变更（新增 / 修改 / 删除端点，或修改 DTO 字段 / 错误码）必须立即同步更新对应模块文件**。
 
 ## 常用命令
 
@@ -129,6 +129,21 @@ DRY_RUN=1 ./scripts/restore_from_backup.sh          # 只打印列漂移决策�
 | `prod::inspection` | 1 | `/api/v2/prod/inspection` | `t_assembly` + `t_part` + `t_part_batch`（另 `LEFT JOIN` `t_customer` / `t_process` / `t_shelf` / `t_worker` / `t_outsource_company` 五表：仅 `t_customer` 有软删闸门（客户名退化为 `null`），`t_process` / `t_shelf` / `t_worker` / `t_outsource_company` 四张展示用附表刻意不加） | **2026-10-05 新增**：扫码查询（`GET /scan/{serial_no}`），返回「装配件（可空）→ 全部子件 → 全部批次」三层树。命中口径先查 `t_part.serial_no`、未命中回退 `t_assembly.serial_no`，都未命中返 `20101` / HTTP 404，`serial_no` trim 后为空同样按未命中；软删闸门覆盖 part / assembly / batch 三表；★ **读全部批次不按状态过滤**（含终态，状态闸门在前端）；★ `process_name` 走 `current_process_id` 权威列（migration 004），故 `INSPECTION` / `DELIVERED` 批次**恒 `null`**（出池清该列不变式的正确结果）；`is_scanned` 是唯一内存派生字段（`t_part_batch` 无序列号列）；批次层一条 SQL（`part_id = ANY($1)`）取回整棵树、无 N+1；角色 Manager + Inspector。★ 响应规模 = 子件数 × 每件批次数，**无上限、无分页**（本端点不接受任何 query 参数）。前端待品检页扫码路径 ⏳ **建议**自 part 域 `GET /parts/by-serial/{serial_no}`（+ `/part-batches`）切来（**尚未在前端仓合入**），part 域旧端点保留兼容、一行未改；完整契约见 `docs/api/production/inspection.md` |
 
 > 表内 10 个子模块端点求和 = 7 + 7 + 5 + 3 + 3 + 6 + 28 + 1 + 1 + 1 = **62**（2026-10-05 增 `prod::process_design` 与 `prod::inspection` 各 1 端点）。
+
+### `src/modules/dashboard/` 域（只读大屏聚合，2026-10-07 VO 重构后 3 个端点）
+
+| 端点 | 权限 | 说明 |
+|---|---|---|
+| `GET /api/v2/dashboard/snapshot` | 登录即可 | 大屏首帧：`overdue_count` / `in_inspection_count` / `in_process[]`(7 字段 `WorkerHeldBatch`) / `system_delivery_orders{urgent,partial}`；**无 query 参数** |
+| `GET /api/v2/dashboard/upcoming-delivery` | 登录即可 | 交期柱状图分桶：`today` + `buckets[]`；`days` 缺省 14 clamp 1..60，`basis` 缺省 **system** |
+| `GET /api/v2/dashboard/delivery-orders` | 登录即可 | 柱状图下钻抽屉：`date` + `statuses` 必填（逗号分隔），`basis` 缺省 system，`total` 不受 200 条截断影响 |
+| `GET /ws/dashboard` | JWT + session | 握手首帧 snapshot + `WsEvent::DashboardEvent` 增量 + text 心跳 |
+
+- **域外依赖 = 0**（只读 5 表 `t_part` / `t_part_batch` / `t_assembly` / `t_customer` / `t_worker`，只读跨域聚合是本仓既定 pattern，同 `statistics` / `admin`）。`cargo test --lib` 的 `modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain` 把它变成 CI 强制（扫 `src/modules/dashboard/**/*.rs`，任何 `crate::modules::<他域>` import 即失败）。
+- `DELIVERY_STATUSES`（6 态，`repo/delivery.rs`）是「未交付」的**唯一**判据，逾期计数 / 面板 / 抽屉 / 柱状图 top+middle 四处共用；柱状图 bottom 层额外含 `DELIVERED`。**它与前端 `LAYERS[].statuses` 是人工同步关系，无编译期保障**，改一侧必须改另一侧。
+- ⚠️ **行单位差异**：逾期 = **工单级**（装配件算 1 条，`t_part` 侧 `assembly_id IS NULL` 排除子件）；面板 / 柱状图 = **件级**（子件各算 1）。两者时间窗口不重叠（`< today` vs `>= today`），故同一条不会重复出现。
+- ⚠️ 与 `statistics::repo::sql::count_overdue_undelivered` **有意分叉**（planned 口径 + DELIVERED 事件兜底，服务生产统计页）——不要动它。
+- 完整契约（含每字段 SQL 来源、移除记录、WS 事件集、前端配套改动清单、已知偏差登记）见 [`docs/api/dashboard.md`](docs/api/dashboard.md)。
 
 **2026-10-02 shelf 域拆分**（依据「货架自身包括了账号的部分和工序映射相关的部分，
 应拆分到 iam 域和 prod 域」）：

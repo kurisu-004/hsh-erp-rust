@@ -1,49 +1,45 @@
-//! dashboard WS 集成测试（2026-09-15 takeover-fill + followup-cleanup A4）
+//! dashboard 集成测试（2026-10-07 VO 重构后重排）
 //!
 //! 覆盖：
-//!   service / ws_hub 协作（takeover-fill）：
-//!     1. build_snapshot_with_workers_basic — service 层直接调，验证 JSON shape
-//!     2. build_snapshot_with_workers_returns_full_shape — shape 含 batch_no / batch_id
-//!     3. ws_hub_broadcast_subscription_receives_event — 业务事件订阅通路
-//!     4. ws_hub_broadcast_snapshot_subscription_receives_snapshot — snapshot 订阅通路
+//!   service 层 snapshot 直调：
+//!     1. build_snapshot_basic_shape              — 空库下 4 个字段的形状
+//!     2. build_snapshot_in_process_carries_worker_held_batch_shape
+//!                                                  — in_process 行 7 字段（核心回归）
 //!
-//!   真实 socket E2E（followup-cleanup A4）：
-//!     5. ws_e2e_invalid_token_rejected        — 40101（JWT 验签失败）/ 40100（缺 token）
-//!     6. ws_e2e_valid_token_receives_snapshot — 握手后 ≤ 5s 收首条 snapshot text
-//!     7. ws_e2e_valid_token_receives_heartbeat_text — ≤ 心跳间隔 + 5s 同时收齐
-//!                                                  ① `WsHeartbeatMsg` text 帧（前端 JS
-//!                                                  `onmessage` 感知）② 服务端 protocol-level
-//!                                                  Ping（2026-10-01 B4：服务端判活用，JS 不可见）
-//!                                                  ③ 客户端 Ping 的 Pong 回声
+//!   service 层交期三方法：
+//!     3. snapshot_counters_by_status_returns_per_status_breakdown
+//!     4. overdue_count_* （6 组口径，见下方小节标题）
+//!     5. system_delivery_orders_* （分桶 / 截断 / 窗口边界）
+//!     6. delivery_order_details_* （单日 / 状态 / total 与截断 / 两口径）
 //!
-//!   WS 健壮性加固 E2E（2026-10-01 B1-B4）：
-//!    12. ws_e2e_lagged_client_gets_4003_close  — 慢消费方 Lagged → 4003 lagged Close 帧
-//!    13. ws_e2e_pong_timeout_closes_dead_peer  — 不回任何帧 → 1011 pong timeout Close 帧
-//!    14. ws_e2e_conn_registry_counts           — 连接表 register/unregister 计数
-//!    15. ws_e2e_server_shutdown_sends_1012     — shutdown.cancel() → 1012 server restart
-//!    16. ws_e2e_reauth_failure_sends_4001_close — 2026-10-02 新增（Minor 7）：
-//!         吊销 session → 周期性 re-auth 失败 → 4001 auth expired Close 帧
+//!   ws_hub 协作：
+//!     7. ws_hub_broadcast_subscription_receives_event — 业务事件订阅通路
 //!
-//!   HTTP `GET /api/v2/dashboard/snapshot` 集成测试（2026-09-28 新增 + 2026-09-30 扩 query）：
-//!     8. http_snapshot_unauthenticated_returns_401   — 无 Bearer token 应返 401（中间件）
-//!     9. http_snapshot_happy_path_returns_full_shape  — 登录后 GET 返回 200 + 完整 shape（默认 14 天）
-//!    10. http_snapshot_default_14_days_returns_14_buckets — 缺省 ?upcoming_days → 14 条桶
-//!    11. http_snapshot_custom_7_days_returns_7_buckets   — ?upcoming_days=7 → 7 条桶（向后兼容老契约）
+//!   真实 socket E2E：
+//!     8. ws_e2e_invalid_token_rejected        — 40101（JWT 验签失败）/ 40100（缺 token）
+//!     9. ws_e2e_valid_token_receives_snapshot — 握手后 ≤ 5s 收首条 snapshot text
+//!    10. ws_e2e_valid_token_receives_heartbeat_text — ≤ 心跳间隔 + 5s 同时收齐
+//!                                                  ① `WsHeartbeatMsg` text 帧 ② 服务端 protocol-level
+//!                                                  Ping ③ 客户端 Ping 的 Pong 回声
+//!    11. ws_e2e_lagged_client_gets_4003_close  — 慢消费方 Lagged → 4003 lagged Close 帧
+//!    12. ws_e2e_pong_timeout_closes_dead_peer  — 不回任何帧 → 1011 pong timeout Close 帧
+//!    13. ws_e2e_conn_registry_counts           — 连接表 register/unregister 计数
+//!    14. ws_e2e_server_shutdown_sends_1012     — shutdown.cancel() → 1012 server restart
+//!    15. ws_e2e_reauth_failure_sends_4001_close — 吊销 session → 周期 re-auth 失败 → 4001
 //!
-//!   HTTP `?basis=` query 参数（2026-10-04 新增）：
-//!    17. http_snapshot_basis_switches_delivery_date_column — 同库同数据下
-//!        ?basis=planned 落 today+3 桶、?basis=system 落 today+9 桶（钉死交期列切换）
-//!    18. http_snapshot_basis_invalid_value_returns_400  — ?basis=xxx → 400（Query 反序列化，纯文本体）
+//!   HTTP 端点：
+//!    16. http_snapshot_unauthenticated_returns_401
+//!    17. http_snapshot_happy_path_returns_full_shape
+//!    18-21. `GET /dashboard/upcoming-delivery`：缺省 days=14 / days=7 / basis 切换 /
+//!         basis 非法值 → 400 + today 字段
+//!    22-24. `GET /dashboard/delivery-orders`：date / statuses 的 40001 契约 + 正常返回
 //!
 //! 测试栈：必须建 Redis pool，session 写入才算「已吊销」
 //!
 //! ## Fixture 范本化（2026-09-24 PR13 Phase I）
-//! 本文件原 `#[path = "common/mod.rs"] mod common;` + `use common::{...};` 改走
-//! `use hsh_erp_test_support::*` + `load_dashboard_ws_fixture(&pool)` +
-//! `DashboardWsFixture` + 局部 helper。fixture 提供 1 WS 验签 user baseline；
-//! snapshot 数据（t_customer / t_part / t_part_batch / t_shelf）每个用例现场插，
-//! 避免 fixture 占用 shelf code / customer prefix 字面与测试现场冲突（snapshot
-//! 按 shelf.code 查找）。
+//! 本文件走 `use hsh_erp_test_support::*` + `load_dashboard_ws_fixture(&pool)` +
+//! `DashboardWsFixture` + 局部 helper。fixture 只提供 1 个 WS 验签 user baseline；
+//! 其余业务数据每个用例现场插。
 
 use chrono::NaiveDate;
 use futures_util::{SinkExt, StreamExt};
@@ -51,12 +47,17 @@ use hsh_erp_rust::auth::jwt::encode_access;
 use hsh_erp_rust::infra::clock::now_naive;
 use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
+use hsh_erp_rust::modules::dashboard::dto::DeliveryBasis;
+use hsh_erp_rust::modules::dashboard::repo::{
+    DELIVERY_BUCKET_LIMIT, DELIVERY_DETAIL_LIMIT, DELIVERY_STATUSES,
+};
 use hsh_erp_rust::modules::dashboard::service::DashboardService;
 use hsh_erp_test_support::{
     DashboardWsFixture, json_request, load_dashboard_ws_fixture, send as ts_send, send_raw,
     test_app, test_pool, test_state, test_ws_app,
 };
 use sqlx::PgPool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 // 2026-10-02（review 第 2 轮 Major-A）：`ws_e2e_pong_timeout_closes_dead_peer` 绕开
@@ -72,177 +73,162 @@ async fn setup() -> PgPool {
     pool
 }
 
-#[tokio::test]
-async fn build_snapshot_with_workers_basic() {
-    let pool = setup().await;
-    // 插一个 active 生产区货架
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let now = now_naive();
-    let shelf_id = snowflake.next_id();
+/// 插一条根客户，返回其 id（`t_part.customer_id` 是逻辑外键但 NOT NULL）。
+///
+/// `prefix` 必传且互不相同：`uq_t_customer_root_prefix` 对「未软删 + 根客户」的
+/// `serial_prefix` 建了唯一索引，同一用例里插第二个根客户必须换前缀。
+async fn insert_customer(
+    pool: &PgPool,
+    snowflake: &SnowflakeIdGenerator,
+    name: &str,
+    prefix: &str,
+) -> i64 {
+    let id = snowflake.next_id();
     sqlx::query(
-        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
-         created_at, updated_at) \
-         VALUES ($1, 'S-001', '一号架', 'PRODUCTION', true, 0, 0, $2, $2)",
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, updated_at) VALUES ($1, $2, NULL, $3, 0, $4, $4)",
     )
-    .bind(shelf_id)
-    .bind(now)
-    .execute(&pool)
+    .bind(id)
+    .bind(name)
+    .bind(prefix)
+    .bind(now_naive())
+    .execute(pool)
     .await
-    .expect("insert t_shelf");
+    .expect("insert t_customer");
+    id
+}
 
+/// 插一条工单（`t_part`），返回其 id。
+///
+/// `system_delivery_date` 传 `None` 即 NULL；`planned_delivery_date` 是 NOT NULL 列，
+/// `request_date` 复用同一个值（本文件只关心交期两列）。
+async fn insert_part(
+    pool: &PgPool,
+    snowflake: &SnowflakeIdGenerator,
+    customer_id: i64,
+    status: &str,
+    system_delivery_date: Option<NaiveDate>,
+    planned_delivery_date: NaiveDate,
+) -> i64 {
+    let id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
+         request_date, planned_delivery_date, system_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'p-dash', 'DWG-D', 'tester', $2, $3, $4, $5, $6, 0, $7, NULL, $7, NULL)",
+    )
+    .bind(id)
+    .bind(customer_id)
+    .bind(planned_delivery_date)
+    .bind(planned_delivery_date)
+    .bind(system_delivery_date)
+    .bind(status)
+    .bind(now_naive())
+    .execute(pool)
+    .await
+    .expect("insert t_part");
+    id
+}
+
+#[tokio::test]
+async fn build_snapshot_basic_shape() {
+    // 空业务数据下：4 个字段各自的「空形态」都必须成立（overdue/in_inspection 是数字 0，
+    // in_process 与 system_delivery_orders 两桶是空数组）。
+    let pool = setup().await;
     let mut tx = pool.begin().await.unwrap();
-    // 2026-09-22 Group E 重构：`build_snapshot_with_workers` 改 `<R: DashboardRepoTrait>(&self, mut repo: R)`
-    // by-value；`DashboardService` 是 unit struct，`DashboardService::new()` 构造实例；
-    // handler / 直调方都借 `&mut *tx` 喂给 trait（trait 已直接 `impl for &mut PgConnection`，
-    // `Transaction` deref 到 `PgConnection`）。
-    // 2026-09-30 新增 days 形参（默认 14）：service 层兜底 unwrap_or(14).clamp(1, 60)；
-    // service-level 直调沿用 `None` 走默认 14 天，与 HTTP 端点缺省值对齐。
-    // 2026-10-04 新增 basis 形参（默认 planned）：service 层 unwrap_or_default()；
-    // 本用例直调沿用 `None` → 计划交期口径，断言 shape 不受口径影响。
     let snap = DashboardService::new()
-        .build_snapshot_with_workers(&mut *tx, None, None, None)
+        .build_snapshot(&mut *tx)
         .await
         .expect("snapshot ok");
     drop(tx);
 
-    // 必有 on_production_shelves 包含该架（空 items 也算）
+    assert_eq!(snap.overdue_count, 0, "空库无逾期工单");
+    assert_eq!(snap.in_inspection_count, 0, "空库无待品检批次");
+    assert!(snap.in_process.is_empty(), "空库无在加工批次");
     assert!(
-        snap.on_production_shelves
-            .iter()
-            .any(|g| g.shelf_code == "S-001")
+        snap.system_delivery_orders.urgent.is_empty(),
+        "空库无最紧急工单"
     );
-    // 2026-09-30 修改：原 7 天写死改为 service 默认 14 天（None → 14）
-    assert_eq!(snap.upcoming_delivery.len(), 14, "默认 14 天固定 14 条");
+    assert!(
+        snap.system_delivery_orders.partial.is_empty(),
+        "空库无部分已交工单"
+    );
     assert!(!snap.ts.is_empty());
 }
 
 #[tokio::test]
-async fn build_snapshot_with_workers_returns_full_shape() {
+async fn build_snapshot_in_process_carries_worker_held_batch_shape() {
+    // 核心回归：`in_process` 行的 7 字段按前端实际渲染装配。
+    // `quantity` 取自 t_part_batch 而非 t_part（两者不同值才能钉死取列来源）。
     let pool = setup().await;
-    // 插 L1 + L2 customer + part + 一个 shelf 上的 IN_PROCESS 批次
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
-    let today = NaiveDate::from_ymd_opt(2026, 9, 15).unwrap();
+    let today = now.date();
 
-    let l1_id = snowflake.next_id();
+    let cust_id = insert_customer(&pool, &snowflake, "worker_held_cust", "Z").await;
+    let part_id = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", None, today).await;
+
+    let worker_id = snowflake.next_id();
     sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, updated_at) VALUES ($1, 'l1', NULL, 'F', 0, $2, $2)",
+        "INSERT INTO t_worker (id, badge_code, name, is_active, version, created_at, updated_at) \
+         VALUES ($1, 'B-WH', '王五', true, 0, $2, $2)",
     )
-    .bind(l1_id)
+    .bind(worker_id)
     .bind(now)
     .execute(&pool)
     .await
-    .unwrap();
+    .expect("insert t_worker");
 
-    let l2_id = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, updated_at) VALUES ($1, 'l2', $2, NULL, 0, $3, $3)",
-    )
-    .bind(l2_id)
-    .bind(l1_id)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let part_id = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
-         request_date, planned_delivery_date, status, version, \
-         created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, 'p-dash', 'DWG-D', 'tester', $2, $3, $3, 'IN_PROCESS', 0, $4, NULL, $4, NULL)",
-    )
-    .bind(part_id)
-    .bind(l2_id)
-    .bind(today)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let shelf_id = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
-         created_at, updated_at) \
-         VALUES ($1, 'S-002', '二号架', 'PRODUCTION', true, 0, 0, $2, $2)",
-    )
-    .bind(shelf_id)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // part_batch IN_PROCESS + holder=shelf + location=PRODUCTION_SHELF
-    // 2026-09-16 PR-3 批次 step 化：t_part_batch 删 `placed_at` 列，INSERT 列名/占位符同步移除。
     let batch_id = snowflake.next_id();
     sqlx::query(
         "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
          current_holder_id, version, created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, $2, 1, 5, 'IN_PROCESS', 'PRODUCTION_SHELF', $3, 0, $4, NULL, $4, NULL)",
+         VALUES ($1, $2, 1, 7, 'IN_PROCESS', 'WORKER', $3, 0, $4, NULL, $4, NULL)",
     )
     .bind(batch_id)
     .bind(part_id)
-    .bind(shelf_id)
+    .bind(worker_id)
     .bind(now)
     .execute(&pool)
     .await
-    .unwrap();
+    .expect("insert t_part_batch");
 
     let mut tx = pool.begin().await.unwrap();
-    // 2026-09-22 Group E 重构：`build_snapshot_with_workers` 改 `<R: DashboardRepoTrait>(&self, mut repo: R)`
-    // by-value；handler / 直调方都借 `&mut *tx` 喂给 trait（trait 已直接 `impl for &mut PgConnection`）。
-    // 2026-09-30 新增 days 形参：本用例继续 None 走默认 14 天（保持 JSON shape / by_status
-    // 断言沿用 build_snapshot_with_workers_basic 同形）。
     let snap = DashboardService::new()
-        .build_snapshot_with_workers(&mut *tx, None, None, None)
+        .build_snapshot(&mut *tx)
         .await
         .expect("snapshot ok");
     drop(tx);
 
-    let shelf_group = snap
-        .on_production_shelves
-        .iter()
-        .find(|g| g.shelf_code == "S-002")
-        .expect("S-002 在产线组中");
-    assert_eq!(shelf_group.items.len(), 1);
-    assert_eq!(shelf_group.items[0].id, part_id.to_string());
-    assert_eq!(shelf_group.items[0].quantity, 5);
-    // 2026-09-15 review 修：batch_no 必须从 SQL 传到 DTO（之前硬编 None）
+    assert_eq!(snap.in_process.len(), 1, "应有 1 行在加工批次");
+    let row = &snap.in_process[0];
+    assert_eq!(row.id, part_id.to_string());
     assert_eq!(
-        shelf_group.items[0].batch_no,
-        Some(1),
-        "batch_no 应为 INSERT 时填的 1，不应为 None"
+        row.batch_id.as_deref(),
+        Some(batch_id.to_string()).as_deref()
     );
+    assert_eq!(row.quantity, 7, "quantity 应取 t_part_batch.quantity");
     assert_eq!(
-        shelf_group.items[0].batch_id.as_deref(),
-        Some(batch_id.to_string().as_str())
+        row.current_holder_id.as_deref(),
+        Some(worker_id.to_string()).as_deref()
     );
+    assert_eq!(row.worker_name.as_deref(), Some("王五"));
+    assert!(!row.is_urgent);
 }
 
-// 2026-09-30 新增：dashboard upcoming_delivery 桶按 OrderStatus 细分计数集成测试
-// （覆盖 plan §1.2 SQL `GROUP BY (date, status)` + §1.1 VO `by_status` 字段）。
+// upcoming_delivery 桶按 OrderStatus 细分计数集成测试
+// （覆盖 repo 层 SQL `GROUP BY (date, status)` + VO `by_status` 字段）。
 #[tokio::test]
 async fn snapshot_counters_by_status_returns_per_status_breakdown() {
     let pool = setup().await;
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
     let now = now_naive();
-    // 沿 SQL 内 `CURRENT_DATE`（= Local::now().date_naive()）口径，避免本地日期漂移
-    let today = chrono::Local::now().date_naive();
+    // 沿「今天」的服务端口径（now_naive = Asia/Shanghai），避免本地时区漂移
+    let today = now.date();
     let day_after_2 = today + chrono::Duration::days(2);
 
-    // 1 个 customer（t_part.customer_id NOT NULL 强制；serial_prefix varchar(1) 限 1 字符）
-    let cust_id = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, updated_at) VALUES ($1, 'by_status_cust', NULL, 'B', 0, $2, $2)",
-    )
-    .bind(cust_id)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("insert t_customer");
+    // 1 个 customer（t_part.customer_id NOT NULL 强制）
+    let cust_id = insert_customer(&pool, &snowflake, "by_status_cust", "B").await;
 
     // today：3 PENDING + 2 INSPECTION + 1 DELIVERED（count=6）
     for status in &[
@@ -253,50 +239,41 @@ async fn snapshot_counters_by_status_returns_per_status_breakdown() {
         "INSPECTION",
         "DELIVERED",
     ] {
-        sqlx::query(
-            "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
-             request_date, planned_delivery_date, status, version, \
-             created_at, created_by, updated_at, updated_by) \
-             VALUES ($1, 'p-bs', 'DWG-BS', 'tester', $2, $3, $3, $4, 0, $5, NULL, $5, NULL)",
-        )
-        .bind(snowflake.next_id())
-        .bind(cust_id)
-        .bind(today)
-        .bind(*status)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .expect("insert t_part today");
+        insert_part(&pool, &snowflake, cust_id, status, Some(today), today).await;
     }
 
     // today+2：1 PROGRAMMING（count=1）
-    sqlx::query(
-        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
-         request_date, planned_delivery_date, status, version, \
-         created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, 'p-bs', 'DWG-BS', 'tester', $2, $3, $4, 'PROGRAMMING', 0, $5, NULL, $5, NULL)",
+    insert_part(
+        &pool,
+        &snowflake,
+        cust_id,
+        "PROGRAMMING",
+        Some(day_after_2),
+        today,
     )
-    .bind(snowflake.next_id())
-    .bind(cust_id)
-    .bind(today)
-    .bind(day_after_2)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("insert t_part day+2");
+    .await;
 
     let mut tx = pool.begin().await.unwrap();
-    let snap = DashboardService::new()
-        .build_snapshot_with_workers(&mut *tx, None, None, None)
+    let out = DashboardService::new()
+        .build_upcoming_buckets(&mut *tx, None, None)
         .await
-        .expect("snapshot ok");
+        .expect("buckets ok");
     drop(tx);
 
-    // 必有 14 桶（默认 14 天；2026-09-30 原 7 改 14）
-    assert_eq!(snap.upcoming_delivery.len(), 14);
+    // 必有 14 桶（默认 14 天）
+    assert_eq!(out.buckets.len(), 14);
+    assert_eq!(
+        out.today,
+        today.format("%Y-%m-%d").to_string(),
+        "VO 的 today 应与桶序列起点同源"
+    );
+    assert_eq!(
+        out.buckets[0].date, out.today,
+        "首桶日期必须等于 today（同一次时钟取值）"
+    );
 
     // today 桶：count=6，by_status 三 key
-    let today_bucket = &snap.upcoming_delivery[0];
+    let today_bucket = &out.buckets[0];
     assert_eq!(today_bucket.date, today.format("%Y-%m-%d").to_string());
     assert_eq!(today_bucket.count, 6);
     assert_eq!(today_bucket.by_status.get("PENDING"), Some(&3));
@@ -309,14 +286,14 @@ async fn snapshot_counters_by_status_returns_per_status_breakdown() {
     );
 
     // today+2 桶：count=1，by_status = {"PROGRAMMING": 1}
-    let d2_bucket = &snap.upcoming_delivery[2];
+    let d2_bucket = &out.buckets[2];
     assert_eq!(d2_bucket.date, day_after_2.format("%Y-%m-%d").to_string());
     assert_eq!(d2_bucket.count, 1);
     assert_eq!(d2_bucket.by_status.get("PROGRAMMING"), Some(&1));
     assert_eq!(d2_bucket.by_status.len(), 1);
 
-    // 其它 12 天桶（默认 14 - today/today+2 = 12）：count=0，by_status 空 map
-    for (idx, b) in snap.upcoming_delivery.iter().enumerate() {
+    // 其它 12 天桶（14 - today/today+2 = 12）：count=0，by_status 空 map
+    for (idx, b) in out.buckets.iter().enumerate() {
         if idx == 0 || idx == 2 {
             continue;
         }
@@ -344,27 +321,6 @@ async fn ws_hub_broadcast_subscription_receives_event() {
             assert_eq!(kind, "PART_TO_SHIP");
             assert_eq!(payload["part_id"], "123");
         }
-        other => panic!("期望 DashboardEvent，got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn ws_hub_broadcast_snapshot_subscription_receives_snapshot() {
-    use hsh_erp_rust::infra::ws_hub::WsHub;
-    let hub = WsHub::new();
-    let mut rx = hub.subscribe();
-    hub.broadcast(WsEvent::DashboardSnapshot {
-        data: serde_json::json!({ "on_production_shelves": [] }),
-    });
-    let evt = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-        .await
-        .expect("timeout")
-        .expect("recv ok");
-    match evt {
-        WsEvent::DashboardSnapshot { data } => {
-            assert!(data["on_production_shelves"].is_array());
-        }
-        other => panic!("期望 DashboardSnapshot，got {other:?}"),
     }
 }
 
@@ -562,20 +518,7 @@ async fn ws_e2e_invalid_token_rejected() {
 #[tokio::test]
 async fn ws_e2e_valid_token_receives_snapshot() {
     let (base, state) = spawn_ws_server().await;
-    // 插一个 active 货架，让 snapshot 非空
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let now = now_naive();
-    sqlx::query(
-        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
-         created_at, updated_at) \
-         VALUES ($1, 'S-WS1', 'WS一号架', 'PRODUCTION', true, 0, 0, $2, $2)",
-    )
-    .bind(snowflake.next_id())
-    .bind(now)
-    .execute(&state.pool)
-    .await
-    .expect("insert t_shelf");
-
     let user_id = snowflake.next_id();
     let token = mint_test_token(&state, user_id).await;
     let url = format!("{base}/dashboard?token={token}");
@@ -596,12 +539,23 @@ async fn ws_e2e_valid_token_receives_snapshot() {
     };
     let v: serde_json::Value = serde_json::from_str(&text).expect("snapshot JSON parse");
     assert_eq!(v["type"], "snapshot", "首条 frame 应为 snapshot envelope");
-    assert!(v["data"]["on_production_shelves"].is_array());
+    let data = &v["data"];
     assert!(
-        !v["data"]["upcoming_delivery"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+        data["overdue_count"].is_number(),
+        "overdue_count 应为 number"
+    );
+    assert!(
+        data["in_inspection_count"].is_number(),
+        "in_inspection_count 应为 number"
+    );
+    assert!(data["in_process"].is_array(), "in_process 应为 array");
+    assert!(
+        data["system_delivery_orders"]["urgent"].is_array(),
+        "system_delivery_orders.urgent 应为 array"
+    );
+    assert!(
+        data["system_delivery_orders"]["partial"].is_array(),
+        "system_delivery_orders.partial 应为 array"
     );
 
     // 主动关 socket 避免 graceful_shutdown 死等
@@ -992,20 +946,6 @@ async fn http_snapshot_happy_path_returns_full_shape() {
     //
     // 注意：`test_app` 不挂 `/api/v2` 前缀（main.rs 才挂；测试走 v2_router 原生路径）
     let pool = setup().await;
-    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let now = now_naive();
-
-    // 插一个 active 货架，让 snapshot 含该架组
-    sqlx::query(
-        "INSERT INTO t_shelf (id, code, name, zone, is_active, display_order, version, \
-         created_at, updated_at) \
-         VALUES ($1, 'S-HTTP1', 'HTTP一号架', 'PRODUCTION', true, 0, 0, $2, $2)",
-    )
-    .bind(snowflake.next_id())
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("insert t_shelf");
 
     // 走 dashboard_ws fixture 用户的 snowflake id（fixture 写死），mint 合法 token
     let state = test_state(pool.clone()).await;
@@ -1022,53 +962,59 @@ async fn http_snapshot_happy_path_returns_full_shape() {
     assert_eq!(envelope["code"], 0, "信封 code 应为 0；envelope={envelope}");
     let data = &envelope["data"];
     assert!(
-        data["on_production_shelves"].is_array(),
-        "data.on_production_shelves 应为数组"
+        data["overdue_count"].is_number(),
+        "data.overdue_count 应为 number"
     );
     assert!(
-        data["on_inspection_shelves"].is_array(),
-        "data.on_inspection_shelves 应为数组"
+        data["in_inspection_count"].is_number(),
+        "data.in_inspection_count 应为 number"
     );
     assert!(data["in_process"].is_array(), "data.in_process 应为数组");
     assert!(
-        data["upcoming_delivery"].is_array(),
-        "data.upcoming_delivery 应为数组"
+        data["system_delivery_orders"]["urgent"].is_array(),
+        "data.system_delivery_orders.urgent 应为数组"
     );
-    // 默认 14 天固定 14 条（2026-09-30 新增：原 7 改 14，与 service 默认天数对齐）
-    assert_eq!(
-        data["upcoming_delivery"].as_array().unwrap().len(),
-        14,
-        "默认 14 天固定 14 条"
-    );
-    // S-HTTP1 应在产线组里（即使 items 空也算，因为 fixture 期望该架被 snapshot 选中）
-    let on_prod = data["on_production_shelves"].as_array().unwrap();
     assert!(
-        on_prod.iter().any(|g| g["shelf_code"] == "S-HTTP1"),
-        "S-HTTP1 应在 on_production_shelves 中；got={on_prod:?}"
+        data["system_delivery_orders"]["partial"].is_array(),
+        "data.system_delivery_orders.partial 应为数组"
     );
     assert!(
         !data["ts"].as_str().unwrap_or("").is_empty(),
         "data.ts 应非空"
     );
+    // 快照端点**不再**接受 upcoming_days / basis 两个入参：分桶已拆到独立端点。
+    // 显式传旧参数不应报错（Query 提取器对未知字段宽容），但也不会影响任何字段。
+    let app = test_app(state.clone());
+    let (status, _envelope) = send(
+        app,
+        json_request(
+            "GET",
+            "/dashboard/snapshot?upcoming_days=7&basis=planned",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "旧入参被忽略而不是报错");
 }
 
 // ===========================================================================
-// 2026-09-30 新增：HTTP `GET /api/v2/dashboard/snapshot?upcoming_days=` query 参数
+// HTTP `GET /api/v2/dashboard/upcoming-delivery?days=` / `?basis=` 端点
 // ===========================================================================
 //
 // 覆盖 service 层 DASHBOARD_DEFAULT_DAYS=14 + clamp(1, 60) + handler 层
-// SnapshotQuery.deserialize_i64_opt 解析：
+// UpcomingQuery.deserialize_i64_opt 解析：
 //   - default_14_days_returns_14_buckets — 缺省 query 走 14 天
-//   - custom_7_days_returns_7_buckets   — ?upcoming_days=7 显式 7 天（向后兼容老契约）
+//   - custom_7_days_returns_7_buckets   — ?days=7 显式 7 天
+//   - days_clamps_to_min_and_max        — ?days=0 → 1 / ?days=100 → 60
+//   - basis_switches_delivery_date_column — 同库同数据下两口径落不同桶下标
+//   - basis_invalid_value_returns_400   — ?basis=xxx → 400（纯文本 body，不走信封）
 //
-// 注意：`test_app` 不挂 `/api/v2` 前缀（main.rs 才挂；测试走 v2_router 原生路径）；
-// 走 `mint_test_token` 直接写 Redis session 跳过 `/iam/login` 业务层 20606 角色校验，
-// 与同文件 ws_e2e_* / http_snapshot_* 风格一致。
+// 注意：`test_app` 不挂 `/api/v2` 前缀（main.rs 才挂；测试走 v2_router 原生路径）。
 
 #[tokio::test]
-async fn http_snapshot_default_14_days_returns_14_buckets() {
-    // 缺省 query（无 `?upcoming_days=`）：service 层 DASHBOARD_DEFAULT_DAYS=14 兜底，
-    // 响应 `data.upcoming_delivery` 应含 14 条桶（today + 未来 13 天）。
+async fn http_upcoming_default_14_days_returns_14_buckets() {
+    // 缺省 query（无 `?days=`）：service 层 DASHBOARD_DEFAULT_DAYS=14 兜底。
     let pool = setup().await;
     let state = test_state(pool.clone()).await;
     let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
@@ -1076,30 +1022,29 @@ async fn http_snapshot_default_14_days_returns_14_buckets() {
 
     let (status, envelope) = send(
         app,
-        json_request("GET", "/dashboard/snapshot", None, Some(&token)),
+        json_request("GET", "/dashboard/upcoming-delivery", None, Some(&token)),
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(envelope["code"], 0);
-    let buckets = envelope["data"]["upcoming_delivery"]
+    let buckets = envelope["data"]["buckets"]
         .as_array()
-        .expect("upcoming_delivery 必为 array");
+        .expect("buckets 必为 array");
     assert_eq!(
         buckets.len(),
         14,
         "缺省 query 走 service DASHBOARD_DEFAULT_DAYS=14，应返 14 条桶"
     );
 
-    // 第 0 条 date = today（YYYY-MM-DD，与 Local::now().date_naive() 对齐）
-    let today_str = chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
+    // `today` 由后端下发（2026-10-07 起前端不再用 new Date() 自算），且必须等于
+    // 桶序列的起点。
+    let today_str = now_naive().date().format("%Y-%m-%d").to_string();
     assert_eq!(
-        buckets[0]["date"].as_str(),
+        envelope["data"]["today"].as_str(),
         Some(today_str.as_str()),
-        "首桶日期应为今天"
+        "today 应为服务端口径的今天（Asia/Shanghai）"
     );
+    assert_eq!(buckets[0]["date"].as_str(), Some(today_str.as_str()));
     // 每条都含 by_status 字段（必填；空对象 = 当日 0 件）
     for (idx, b) in buckets.iter().enumerate() {
         assert!(
@@ -1114,9 +1059,8 @@ async fn http_snapshot_default_14_days_returns_14_buckets() {
 }
 
 #[tokio::test]
-async fn http_snapshot_custom_7_days_returns_7_buckets() {
-    // `?upcoming_days=7`：service 层 unwrap_or(14) 路径不触发，clamp(1,60) 命中
-    // 7，响应 `data.upcoming_delivery` 应含 7 条桶（向后兼容原 Python v1 dashboard 契约）。
+async fn http_upcoming_custom_7_days_returns_7_buckets() {
+    // `?days=7`：clamp(1,60) 命中 7。
     let pool = setup().await;
     let state = test_state(pool.clone()).await;
     let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
@@ -1126,7 +1070,7 @@ async fn http_snapshot_custom_7_days_returns_7_buckets() {
         app,
         json_request(
             "GET",
-            "/dashboard/snapshot?upcoming_days=7",
+            "/dashboard/upcoming-delivery?days=7",
             None,
             Some(&token),
         ),
@@ -1134,42 +1078,64 @@ async fn http_snapshot_custom_7_days_returns_7_buckets() {
     .await;
     assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(envelope["code"], 0);
-    let buckets = envelope["data"]["upcoming_delivery"]
+    let buckets = envelope["data"]["buckets"]
         .as_array()
-        .expect("upcoming_delivery 必为 array");
-    assert_eq!(
-        buckets.len(),
-        7,
-        "?upcoming_days=7 显式应返 7 条桶（向后兼容 v1 Python 契约）"
-    );
+        .expect("buckets 必为 array");
+    assert_eq!(buckets.len(), 7, "?days=7 显式应返 7 条桶");
 
-    // 第 6 条 date = today + 6 天（与 SQL 内 CURRENT_DATE + $1 days 对齐）
-    let today = chrono::Local::now().date_naive();
+    let today = now_naive().date();
     let day6_str = (today + chrono::Duration::days(6))
         .format("%Y-%m-%d")
         .to_string();
+    assert_eq!(buckets[6]["date"].as_str(), Some(day6_str.as_str()));
+}
+
+#[tokio::test]
+async fn http_upcoming_days_clamps_to_min_and_max() {
+    // ?days=0 → clamp 到 1；?days=100 → clamp 到 60。
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+
+    let app = test_app(state.clone());
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "GET",
+            "/dashboard/upcoming-delivery?days=0",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
     assert_eq!(
-        buckets[6]["date"].as_str(),
-        Some(day6_str.as_str()),
-        "末桶日期应为 today+6 天"
+        envelope["data"]["buckets"].as_array().unwrap().len(),
+        1,
+        "days=0 应 clamp 到 1"
+    );
+
+    let app = test_app(state.clone());
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "GET",
+            "/dashboard/upcoming-delivery?days=100",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(
+        envelope["data"]["buckets"].as_array().unwrap().len(),
+        60,
+        "days=100 应 clamp 到 60"
     );
 }
 
-// ===========================================================================
-// 2026-10-04 新增：HTTP `GET /api/v2/dashboard/snapshot?basis=` query 参数
-// ===========================================================================
-//
-// 覆盖 handler 层 `SnapshotQuery.basis` 的 `Query` 反序列化 + repo 层两段 SQL 的
-// 交期列切换：
-//   - basis_switches_delivery_date_column  — 同库同数据下 `?basis=planned` 与
-//     `?basis=system` 的桶内容落在不同日期下标，把「交期列换了」钉死
-//   - basis_invalid_value_returns_400      — ?basis=xxx → 400（纯文本 body，不走信封）
-//
-// 非法取值的响应体不是 `R<T>` JSON，故用 `send_raw` 取原始文本（`send` 会在 JSON
-// 解析处 panic）。
-
 #[tokio::test]
-async fn http_snapshot_basis_switches_delivery_date_column() {
+async fn http_upcoming_basis_switches_delivery_date_column() {
     // 鉴别力设计：本库只插 **1 行** t_part，且它的两列交期分处窗口内不同下标
     // （planned = today+3 在 14 天窗口内，system = today+9 也在窗口内）——单看
     // 「桶数 = 14」两口径不可区分，必须断言**同一行落进不同的桶**才说明
@@ -1179,49 +1145,28 @@ async fn http_snapshot_basis_switches_delivery_date_column() {
     let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
     let app = test_app(state.clone());
 
-    // 沿 SQL 内 `CURRENT_DATE`（= Local::now().date_naive()）口径，避免本地日期漂移
-    let today = chrono::Local::now().date_naive();
+    let today = now_naive().date();
     let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
-    let now = now_naive();
+    let cust_id = insert_customer(&pool, &snowflake, "basis_cust", "Z").await;
 
-    // t_part.customer_id 是逻辑外键（无 DB 级 FK 约束），仍随仓内既有写法插一条
-    // t_customer 保证引用自洽（serial_prefix varchar(1) 且须大写字母）。
-    let cust_id = snowflake.next_id();
-    sqlx::query(
-        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
-         created_at, updated_at) VALUES ($1, 'basis_cust', NULL, 'Z', 0, $2, $2)",
+    // 唯一 1 行 part：两列交期**故意错开**——planned 落 today+3、system 落 today+9。
+    // status 取 PENDING（SQL 已排除 COMPLETED / CANCELLED）。
+    insert_part(
+        &pool,
+        &snowflake,
+        cust_id,
+        "PENDING",
+        Some(today + chrono::Duration::days(9)),
+        today + chrono::Duration::days(3),
     )
-    .bind(cust_id)
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("insert t_customer");
-
-    // 唯一 1 行 part：两列交期**故意错开**——planned 落 today+3 桶、system 落
-    // today+9 桶，两者都在 14 天窗口内，故「只插 NULL system 交期」那种数据无法
-    // 区分口径。status 取 PENDING（SQL 已排除 COMPLETED / CANCELLED）。
-    sqlx::query(
-        "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
-         request_date, planned_delivery_date, system_delivery_date, status, version, \
-         created_at, created_by, updated_at, updated_by) \
-         VALUES ($1, 'p-basis', 'DWG-BASIS', 'tester', $2, $3, $4, $5, 'PENDING', 0, $6, NULL, $6, NULL)",
-    )
-    .bind(snowflake.next_id())
-    .bind(cust_id)
-    .bind(today)
-    .bind(today + chrono::Duration::days(3))
-    .bind(today + chrono::Duration::days(9))
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("insert t_part");
+    .await;
 
     // ── ?basis=planned：只认 planned_delivery_date → 落 today+3（idx 3） ──
     let (status, envelope) = send(
         app.clone(),
         json_request(
             "GET",
-            "/dashboard/snapshot?basis=planned",
+            "/dashboard/upcoming-delivery?basis=planned",
             None,
             Some(&token),
         ),
@@ -1233,9 +1178,9 @@ async fn http_snapshot_basis_switches_delivery_date_column() {
         "?basis=planned 应返 200"
     );
     assert_eq!(envelope["code"], 0);
-    let buckets = envelope["data"]["upcoming_delivery"]
+    let buckets = envelope["data"]["buckets"]
         .as_array()
-        .expect("upcoming_delivery 必为 array");
+        .expect("buckets 必为 array");
     assert_eq!(buckets.len(), 14, "缺省 N = 14");
     assert_eq!(
         buckets[3]["count"].as_i64(),
@@ -1249,20 +1194,14 @@ async fn http_snapshot_basis_switches_delivery_date_column() {
         "planned 口径不该认 system 交期，today+9 桶应为 0；got={}",
         buckets[9]
     );
-    assert_eq!(
-        buckets[3]["by_status"]["PENDING"].as_i64(),
-        Some(1),
-        "planned 口径 today+3 桶 by_status 应含 PENDING=1"
-    );
+    assert_eq!(buckets[3]["by_status"]["PENDING"].as_i64(), Some(1));
 
-    // ── ?basis=system：只认 system_delivery_date → 落 today+9（idx 9） ──
-    // 同一行、同一库，只改 query 口径：桶数与日期序列不动（两口径共用装配逻辑），
-    // 变的只是命中哪一桶。
+    // ── ?basis=system（也是缺省口径）：只认 system_delivery_date → 落 today+9 ──
     let (status, envelope) = send(
         app.clone(),
         json_request(
             "GET",
-            "/dashboard/snapshot?basis=system",
+            "/dashboard/upcoming-delivery?basis=system",
             None,
             Some(&token),
         ),
@@ -1270,48 +1209,39 @@ async fn http_snapshot_basis_switches_delivery_date_column() {
     .await;
     assert_eq!(status, axum::http::StatusCode::OK, "?basis=system 应返 200");
     assert_eq!(envelope["code"], 0);
-    let buckets = envelope["data"]["upcoming_delivery"]
+    let buckets = envelope["data"]["buckets"]
         .as_array()
-        .expect("upcoming_delivery 必为 array");
-    assert_eq!(
-        buckets.len(),
-        14,
-        "?basis=system 不改变桶的日期序列，缺省 N 仍为 14"
-    );
-    // 首桶日期仍为 today（口径只换交期列，不换分桶锚点）
-    let today_str = today.format("%Y-%m-%d").to_string();
-    assert_eq!(
-        buckets[0]["date"].as_str(),
-        Some(today_str.as_str()),
-        "system 口径首桶日期仍应为今天"
-    );
-    assert_eq!(
-        buckets[3]["count"].as_i64(),
-        Some(0),
-        "system 口径不该认 planned 交期，today+3 桶应为 0；got={}",
-        buckets[3]
-    );
+        .expect("buckets 必为 array");
+    assert_eq!(buckets.len(), 14);
     assert_eq!(
         buckets[9]["count"].as_i64(),
         Some(1),
         "system 口径应把该行计入 today+9 桶；got={}",
         buckets[9]
     );
+    assert_eq!(buckets[3]["count"].as_i64(), Some(0));
+
+    // ── 缺省（不传 basis）必须与显式 system 完全一致（DeliveryBasis::Default = System）──
+    let app = test_app(state.clone());
+    let (status, envelope) = send(
+        app,
+        json_request("GET", "/dashboard/upcoming-delivery", None, Some(&token)),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    let buckets = envelope["data"]["buckets"]
+        .as_array()
+        .expect("buckets 必为 array");
     assert_eq!(
-        buckets[9]["by_status"]["PENDING"].as_i64(),
+        buckets[9]["count"].as_i64(),
         Some(1),
-        "system 口径 today+9 桶 by_status 应含 PENDING=1"
+        "缺省 basis 应为 system（否则前端默认显示的计划交期是错的）"
     );
-    for (idx, b) in buckets.iter().enumerate() {
-        assert!(
-            b["by_status"].is_object(),
-            "第 {idx} 桶 by_status 应为 object（system 口径同契约）"
-        );
-    }
+    assert_eq!(buckets[3]["count"].as_i64(), Some(0));
 }
 
 #[tokio::test]
-async fn http_snapshot_basis_invalid_value_returns_400() {
+async fn http_upcoming_basis_invalid_value_returns_400() {
     // `?basis=xxx` 不在 `DeliveryBasis` 的 `rename_all = "lowercase"` 变体里，
     // axum `Query` 反序列化直接返 400（纯文本 body，不走 `R<T>` 信封）。
     let pool = setup().await;
@@ -1321,7 +1251,12 @@ async fn http_snapshot_basis_invalid_value_returns_400() {
 
     let (status, body) = send_raw(
         app,
-        json_request("GET", "/dashboard/snapshot?basis=xxx", None, Some(&token)),
+        json_request(
+            "GET",
+            "/dashboard/upcoming-delivery?basis=xxx",
+            None,
+            Some(&token),
+        ),
     )
     .await;
     assert_eq!(
@@ -1329,16 +1264,685 @@ async fn http_snapshot_basis_invalid_value_returns_400() {
         axum::http::StatusCode::BAD_REQUEST,
         "非法 ?basis 取值应返 400；body={body}"
     );
-    // 契约要点：axum 提取器层的 rejection 返纯文本，**不走 `R<T>` 信封**
-    // （`docs/api/dashboard.md` 错误码段有对应说明）。
     assert!(
         serde_json::from_str::<serde_json::Value>(&body).is_err(),
         "400 body 应为纯文本而非 JSON 信封；body={body}"
     );
-    // 光「非 JSON」定不出是哪个 query 参数解析失败的（只传 ?basis=xxx、
-    // upcoming_days 缺省，故此断言同时把失败原因钉在 basis 上）。
     assert!(
         body.contains("basis"),
         "400 应由 basis 参数反序列化失败触发；body={body}"
     );
+}
+
+// ===========================================================================
+// 2026-10-07 新增：`snapshot.overdue_count` 逾期口径（6 组）
+// ===========================================================================
+//
+// 逾期是**工单级**计数：装配件算 1 条，子件不重复计入（`t_part` 侧
+// `assembly_id IS NULL` 排除，`t_assembly` 侧直接查装配件表）。窗口是
+// `system_delivery_date < today`，状态白名单 6 态。
+
+/// 直调 service 取逾期数（少一层 HTTP，便于逐条钉口径）。
+async fn overdue_of(pool: &PgPool) -> i64 {
+    let mut tx = pool.begin().await.unwrap();
+    let n = DashboardService::new()
+        .build_snapshot(&mut *tx)
+        .await
+        .expect("snapshot ok")
+        .overdue_count;
+    drop(tx);
+    n
+}
+
+#[tokio::test]
+async fn overdue_counts_assembly_once_and_skips_children() {
+    // 行单位差异的核心：1 个装配件 + 2 个子件 → 逾期数 = 1（不是 2 也不是 3）。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+    let today = now.date();
+    let overdue_day = today - chrono::Duration::days(3);
+
+    let l1_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, updated_at) VALUES ($1, 'asm_l1', NULL, 'Q', 0, $2, $2)",
+    )
+    .bind(l1_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let l2_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, updated_at) VALUES ($1, 'asm_l2', $2, NULL, 0, $3, $3)",
+    )
+    .bind(l2_id)
+    .bind(l1_id)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 装配件本身
+    let asm_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
+         request_date, planned_delivery_date, system_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, 'DWG-A', '装配件', 'tester', $2, $3, $4, $4, 'IN_PROCESS', 0, $5, NULL, $5, NULL)",
+    )
+    .bind(asm_id)
+    .bind(l2_id)
+    .bind(overdue_day)
+    .bind(overdue_day)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // 2 个子件（assembly_id 非空），同样逾期
+    for _ in 0..2 {
+        let id = snowflake.next_id();
+        sqlx::query(
+            "INSERT INTO t_part (id, name, drawing_no, applicant_name, customer_id, \
+             assembly_id, request_date, planned_delivery_date, system_delivery_date, status, \
+             version, created_at, created_by, updated_at, updated_by) \
+             VALUES ($1, 'child', 'DWG-C', 'tester', $2, $3, $4, $5, $5, 'IN_PROCESS', 0, $6, NULL, $6, NULL)",
+        )
+        .bind(id)
+        .bind(l2_id)
+        .bind(asm_id)
+        .bind(overdue_day)
+        .bind(overdue_day)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        overdue_of(&pool).await,
+        1,
+        "1 个装配件 + 2 个子件 = 逾期 1 条（装配件算 1，子件不重复计入）"
+    );
+}
+
+#[tokio::test]
+async fn overdue_skips_null_system_delivery_date() {
+    // `system_delivery_date IS NULL` 的工单不计入（无论 planned 是哪天）。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let today = now_naive().date();
+    let long_ago = today - chrono::Duration::days(90);
+    let cust_id = insert_customer(&pool, &snowflake, "null_sdd_cust", "N").await;
+    insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", None, long_ago).await;
+
+    assert_eq!(
+        overdue_of(&pool).await,
+        0,
+        "system_delivery_date 为 NULL 的工单不计入逾期"
+    );
+}
+
+#[tokio::test]
+async fn overdue_skips_soft_deleted_parts() {
+    // 软删闸门：part / assembly 两侧都验。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+    let today = now.date();
+    let overdue_day = today - chrono::Duration::days(3);
+    let cust_id = insert_customer(&pool, &snowflake, "softdel_cust", "S").await;
+
+    let part_id = insert_part(
+        &pool,
+        &snowflake,
+        cust_id,
+        "IN_PROCESS",
+        Some(overdue_day),
+        overdue_day,
+    )
+    .await;
+    sqlx::query("UPDATE t_part SET deleted_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(part_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let asm_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_assembly (id, drawing_no, name, applicant_name, customer_id, \
+         request_date, planned_delivery_date, system_delivery_date, status, version, \
+         created_at, created_by, updated_at, updated_by, deleted_at) \
+         VALUES ($1, 'DWG-SD', '已删装配件', 'tester', $2, $3, $4, $4, 'IN_PROCESS', 0, $5, NULL, $5, NULL, $5)",
+    )
+    .bind(asm_id)
+    .bind(cust_id)
+    .bind(overdue_day)
+    .bind(overdue_day)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        overdue_of(&pool).await,
+        0,
+        "软删的 part / assembly 都不计入逾期"
+    );
+}
+
+#[tokio::test]
+async fn overdue_accepts_all_six_delivery_statuses() {
+    // 6 态白名单逐态计入，其中 READY_TO_SHIP 最容易漏（它在 part / assembly 两侧都合法）。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+    let today = now.date();
+    let overdue_day = today - chrono::Duration::days(2);
+    let cust_id = insert_customer(&pool, &snowflake, "six_status_cust", "W").await;
+
+    for status in [
+        "PENDING",
+        "PROGRAMMING",
+        "IN_PROCESS",
+        "OUTSOURCE",
+        "INSPECTION",
+        "READY_TO_SHIP",
+    ] {
+        insert_part(
+            &pool,
+            &snowflake,
+            cust_id,
+            status,
+            Some(overdue_day),
+            overdue_day,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        overdue_of(&pool).await,
+        6,
+        "DELIVERY_STATUSES 的 6 个状态都应计入逾期"
+    );
+    // 常量字面值本身也要钉死：它与前端 `LAYERS[].statuses` / `useDashboardUrgentList`
+    // 是**人工同步**关系（无编译期保障），漂了不会编译失败，只会让三个数字互相矛盾。
+    assert_eq!(
+        DELIVERY_STATUSES,
+        [
+            "PENDING",
+            "PROGRAMMING",
+            "IN_PROCESS",
+            "OUTSOURCE",
+            "INSPECTION",
+            "READY_TO_SHIP"
+        ],
+        "DELIVERY_STATUSES 字面量不得漂移（与前端状态域人工同步）"
+    );
+}
+
+#[tokio::test]
+async fn overdue_excludes_delivered_completed_cancelled() {
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let today = now_naive().date();
+    let overdue_day = today - chrono::Duration::days(2);
+    let cust_id = insert_customer(&pool, &snowflake, "terminal_cust", "T").await;
+
+    for status in ["DELIVERED", "COMPLETED", "CANCELLED"] {
+        insert_part(
+            &pool,
+            &snowflake,
+            cust_id,
+            status,
+            Some(overdue_day),
+            overdue_day,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        overdue_of(&pool).await,
+        0,
+        "DELIVERED / COMPLETED / CANCELLED 三个终态都应排除"
+    );
+}
+
+#[tokio::test]
+async fn overdue_excludes_today_boundary() {
+    // 窗口是严格小于：`system_delivery_date == today` 不算逾期（它归面板/柱状图）。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let today = now_naive().date();
+    let cust_id = insert_customer(&pool, &snowflake, "boundary_cust", "Y").await;
+
+    insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(today), today).await;
+    assert_eq!(
+        overdue_of(&pool).await,
+        0,
+        "system_delivery_date == today 不计入逾期（窗口是 < today）"
+    );
+}
+
+// ===========================================================================
+// 2026-10-07 新增：`snapshot.system_delivery_orders` 两桶
+// ===========================================================================
+
+#[tokio::test]
+async fn system_delivery_orders_split_by_delivered_quantity() {
+    // 分桶判据是 `delivered_quantity`：0 → urgent，> 0 → partial。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let now = now_naive();
+    let today = now.date();
+    let sdd = today + chrono::Duration::days(2);
+    let cust_id = insert_customer(&pool, &snowflake, "bucket_cust", "U").await;
+
+    // urgent：完全没交过
+    let urgent_part = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
+    // partial：已交过一部分（DELIVERED 批次 quantity=4）
+    let partial_part = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
+    sqlx::query(
+        "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, version, \
+         created_at, created_by, updated_at, updated_by) \
+         VALUES ($1, $2, 1, 4, 'DELIVERED', 0, $3, NULL, $3, NULL)",
+    )
+    .bind(snowflake.next_id())
+    .bind(partial_part)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut tx = pool.begin().await.unwrap();
+    let snap = DashboardService::new()
+        .build_snapshot(&mut *tx)
+        .await
+        .expect("snapshot ok");
+    drop(tx);
+
+    let orders = snap.system_delivery_orders;
+    assert_eq!(orders.urgent.len(), 1, "未交过的工单应落在 urgent 桶");
+    assert_eq!(orders.urgent[0].id, urgent_part.to_string());
+    assert_eq!(orders.urgent[0].delivered_quantity, 0);
+    assert_eq!(
+        orders.urgent[0].customer_name.as_deref(),
+        Some("bucket_cust"),
+        "客户名应被批量填上（防 N+1 的可观测结果）"
+    );
+    assert_eq!(orders.partial.len(), 1, "交过一部分的应落在 partial 桶");
+    assert_eq!(orders.partial[0].id, partial_part.to_string());
+    assert_eq!(orders.partial[0].delivered_quantity, 4);
+}
+
+#[tokio::test]
+async fn system_delivery_orders_window_boundary() {
+    // 窗口 `[today, today + 7)`：`== today` 计入，`== today - 1` 不计入，
+    // `== today + 7` 也不计入。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let today = now_naive().date();
+    let cust_id = insert_customer(&pool, &snowflake, "window_cust", "I").await;
+
+    let in_today = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(today), today).await;
+    let yesterday = insert_part(
+        &pool,
+        &snowflake,
+        cust_id,
+        "IN_PROCESS",
+        Some(today - chrono::Duration::days(1)),
+        today,
+    )
+    .await;
+    let day7 = insert_part(
+        &pool,
+        &snowflake,
+        cust_id,
+        "IN_PROCESS",
+        Some(today + chrono::Duration::days(7)),
+        today,
+    )
+    .await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let snap = DashboardService::new()
+        .build_snapshot(&mut *tx)
+        .await
+        .expect("snapshot ok");
+    drop(tx);
+
+    let ids: HashSet<String> = snap
+        .system_delivery_orders
+        .urgent
+        .iter()
+        .map(|o| o.id.clone())
+        .collect();
+    assert!(
+        ids.contains(&in_today.to_string()),
+        "system_delivery_date == today 应计入面板"
+    );
+    assert!(
+        !ids.contains(&yesterday.to_string()),
+        "system_delivery_date == today-1 属逾期窗口，不进面板"
+    );
+    assert!(!ids.contains(&day7.to_string()), "窗口右开：today+7 不计入");
+}
+
+#[tokio::test]
+async fn system_delivery_orders_caps_each_bucket() {
+    // 每桶独立截断到 DELIVERY_BUCKET_LIMIT。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let today = now_naive().date();
+    let sdd = today + chrono::Duration::days(1);
+    let cust_id = insert_customer(&pool, &snowflake, "cap_cust", "O").await;
+
+    let n = DELIVERY_BUCKET_LIMIT + 5;
+    let mut first_id = String::new();
+    for i in 0..n {
+        let id = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(sdd), sdd).await;
+        if i == 0 {
+            first_id = id.to_string();
+        }
+    }
+
+    let mut tx = pool.begin().await.unwrap();
+    let snap = DashboardService::new()
+        .build_snapshot(&mut *tx)
+        .await
+        .expect("snapshot ok");
+    drop(tx);
+
+    let orders = snap.system_delivery_orders;
+    assert_eq!(
+        orders.urgent.len(),
+        DELIVERY_BUCKET_LIMIT,
+        "urgent 桶应被截断到 {DELIVERY_BUCKET_LIMIT}"
+    );
+    assert!(orders.partial.is_empty(), "无已交批次 → partial 为空");
+    // 截断取的是 SQL 排序后的前 N 条（id ASC 作为 tiebreaker，雪花 ID 单调）
+    assert_eq!(orders.urgent[0].id, first_id, "截断应保留最早的一批");
+}
+
+// ===========================================================================
+// 2026-10-07 新增：`GET /api/v2/dashboard/delivery-orders` 抽屉
+// ===========================================================================
+
+#[tokio::test]
+async fn delivery_order_details_filters_by_date_and_statuses() {
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let today = now_naive().date();
+    let l1_id = insert_customer(&pool, &snowflake, "drawer_l1", "D").await;
+    let l2_id = snowflake.next_id();
+    sqlx::query(
+        "INSERT INTO t_customer (id, name, parent_id, serial_prefix, version, \
+         created_at, updated_at) VALUES ($1, 'drawer_l2', $2, NULL, 0, $3, $3)",
+    )
+    .bind(l2_id)
+    .bind(l1_id)
+    .bind(now_naive())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let hit = insert_part(&pool, &snowflake, l2_id, "IN_PROCESS", Some(today), today).await;
+    // 同日但状态不在 filters 里
+    insert_part(&pool, &snowflake, l2_id, "PENDING", Some(today), today).await;
+    // 状态命中但不同日
+    let other_day = today + chrono::Duration::days(1);
+    insert_part(
+        &pool,
+        &snowflake,
+        l2_id,
+        "IN_PROCESS",
+        Some(other_day),
+        other_day,
+    )
+    .await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = DashboardService::new()
+        .build_delivery_order_details(&mut *tx, today, vec!["IN_PROCESS".to_string()], None)
+        .await
+        .expect("details ok");
+    drop(tx);
+
+    assert_eq!(out.date, today.format("%Y-%m-%d").to_string());
+    assert_eq!(out.basis, "system", "缺省口径应为 system");
+    assert_eq!(out.total, 1, "单日 + 单状态只应命中 1 条");
+    assert_eq!(out.items.len(), 1);
+    assert_eq!(out.items[0].id, hit.to_string());
+    assert_eq!(
+        out.items[0].customer_name.as_deref(),
+        Some("drawer_l2"),
+        "叶子客户名"
+    );
+    assert_eq!(
+        out.items[0].l1_customer_name.as_deref(),
+        Some("drawer_l1"),
+        "L1 客户名应走 parent_id 两级批量查"
+    );
+    assert_eq!(
+        out.items[0].planned_delivery_date,
+        today.format("%Y-%m-%d").to_string(),
+        "planned 列恒返回（前端按自己的 basis 选列渲染）"
+    );
+}
+
+#[tokio::test]
+async fn delivery_order_details_total_exceeds_items_when_truncated() {
+    // 造 205 行（> DELIVERY_DETAIL_LIMIT = 200）：`total` 不受截断，`items` 被截。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let today = now_naive().date();
+    let cust_id = insert_customer(&pool, &snowflake, "trunc_cust", "R").await;
+
+    for _ in 0..(DELIVERY_DETAIL_LIMIT + 5) {
+        insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(today), today).await;
+    }
+
+    let mut tx = pool.begin().await.unwrap();
+    let out = DashboardService::new()
+        .build_delivery_order_details(&mut *tx, today, vec!["IN_PROCESS".to_string()], None)
+        .await
+        .expect("details ok");
+    drop(tx);
+
+    assert_eq!(
+        out.items.len(),
+        DELIVERY_DETAIL_LIMIT as usize,
+        "items 应被截断到 {DELIVERY_DETAIL_LIMIT}"
+    );
+    assert_eq!(
+        out.total,
+        DELIVERY_DETAIL_LIMIT + 5,
+        "total 是匹配总数，不受 items 截断影响（前端据此显示「共 N 件」）"
+    );
+}
+
+#[tokio::test]
+async fn delivery_order_details_basis_switches_column() {
+    // 同一行 planned / system 交期分处不同日：两口径必须打不同的列。
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let today = now_naive().date();
+    let planned_day = today;
+    let system_day = today + chrono::Duration::days(4);
+    let cust_id = insert_customer(&pool, &snowflake, "basis2_cust", "E").await;
+    let part_id = insert_part(
+        &pool,
+        &snowflake,
+        cust_id,
+        "IN_PROCESS",
+        Some(system_day),
+        planned_day,
+    )
+    .await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let by_planned = DashboardService::new()
+        .build_delivery_order_details(
+            &mut *tx,
+            planned_day,
+            vec!["IN_PROCESS".to_string()],
+            Some(DeliveryBasis::Planned),
+        )
+        .await
+        .expect("details ok");
+    let by_system = DashboardService::new()
+        .build_delivery_order_details(
+            &mut *tx,
+            system_day,
+            vec!["IN_PROCESS".to_string()],
+            Some(DeliveryBasis::System),
+        )
+        .await
+        .expect("details ok");
+    drop(tx);
+
+    assert_eq!(by_planned.basis, "planned");
+    assert_eq!(by_planned.total, 1);
+    assert_eq!(by_planned.items[0].id, part_id.to_string());
+
+    assert_eq!(by_system.basis, "system");
+    assert_eq!(by_system.total, 1);
+    assert_eq!(by_system.items[0].id, part_id.to_string());
+
+    // 反向：另一天在本口径下不该命中任何行
+    let mut tx = pool.begin().await.unwrap();
+    let miss = DashboardService::new()
+        .build_delivery_order_details(
+            &mut *tx,
+            system_day,
+            vec!["IN_PROCESS".to_string()],
+            Some(DeliveryBasis::Planned),
+        )
+        .await
+        .expect("details ok");
+    drop(tx);
+    assert_eq!(miss.total, 0, "planned 口径下 system_day 不该命中");
+}
+
+#[tokio::test]
+async fn http_delivery_orders_requires_date() {
+    // 缺 date / 非法 date 都走 40001（AppError::validation），且 body 走 R<T> 信封。
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+
+    let app = test_app(state.clone());
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "GET",
+            "/dashboard/delivery-orders?statuses=IN_PROCESS",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert!(status.is_client_error(), "缺 date 应是 4xx；got {status}");
+    assert_eq!(envelope["code"], 40001, "缺 date → 40001");
+
+    let app = test_app(state.clone());
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "GET",
+            "/dashboard/delivery-orders?date=2026-13-99&statuses=IN_PROCESS",
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert!(status.is_client_error(), "非法 date 应是 4xx；got {status}");
+    assert_eq!(envelope["code"], 40001, "非法 date → 40001");
+}
+
+#[tokio::test]
+async fn http_delivery_orders_requires_statuses() {
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+    let today = now_naive().date().format("%Y-%m-%d").to_string();
+
+    // 缺 statuses
+    let app = test_app(state.clone());
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/dashboard/delivery-orders?date={today}"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "缺 statuses 应是 4xx；got {status}"
+    );
+    assert_eq!(envelope["code"], 40001, "缺 statuses → 40001");
+
+    // 空白 statuses（全是逗号 + 空格）
+    let app = test_app(state.clone());
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "GET",
+            &format!("/dashboard/delivery-orders?date={today}&statuses=%20,%20,"),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_client_error(),
+        "空 statuses 应是 4xx；got {status}"
+    );
+    assert_eq!(envelope["code"], 40001, "空 statuses → 40001");
+}
+
+#[tokio::test]
+async fn http_delivery_orders_happy_path() {
+    let pool = setup().await;
+    let state = test_state(pool.clone()).await;
+    let token = mint_test_token(&state, DashboardWsFixture::WS_USER_ID).await;
+    let today = now_naive().date();
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    let cust_id = insert_customer(&pool, &snowflake, "http_cust", "H").await;
+    let part_id = insert_part(&pool, &snowflake, cust_id, "IN_PROCESS", Some(today), today).await;
+
+    let app = test_app(state.clone());
+    let (status, envelope) = send(
+        app,
+        json_request(
+            "GET",
+            &format!(
+                "/dashboard/delivery-orders?date={}&statuses=IN_PROCESS,PENDING",
+                today.format("%Y-%m-%d")
+            ),
+            None,
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK);
+    assert_eq!(envelope["code"], 0);
+    let data = &envelope["data"];
+    assert_eq!(data["date"], today.format("%Y-%m-%d").to_string().as_str());
+    assert_eq!(data["basis"], "system");
+    assert_eq!(data["total"], 1);
+    assert_eq!(data["items"][0]["id"], part_id.to_string());
+    assert!(
+        data["items"][0]["id"].is_string(),
+        "雪花 id 序列化为字符串（防 JS 精度截断）"
+    );
+    assert!(data["total"].is_number(), "total 是裸 number，不字符串化");
+    assert!(!data["ts"].as_str().unwrap_or("").is_empty());
 }
