@@ -5,6 +5,11 @@
 // 没有 handler/service/repo/dto/vo 五段式，详见 analytics/mod.rs 顶部注释。
 pub mod analytics;
 pub mod customer; // 2026-10-07：客户 L1/L2 id 展开（part / com::union_list / prod::batch 三域共用）
+// 2026-10-07 新增 domain_guard：跨域只读聚合域（dashboard / prod::programming …）的
+// 域隔离护栏，把「本域不 import 其它域的 service / repo」从口头约定变成 CI 强制。
+// 只在单测里用（调用方全在各域 `#[cfg(test)] mod tests`），故不进生产 API 面。
+#[cfg(test)]
+pub mod domain_guard;
 pub mod error;
 pub mod pagination;
 pub mod response;
