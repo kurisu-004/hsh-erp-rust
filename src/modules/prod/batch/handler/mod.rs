@@ -2,7 +2,7 @@
 //!
 //! ## 子文件
 //! - `dispatch.rs` —— 「待下发批次下发给车间」：`pending` / `dispatch` /
-//!   `auto-dispatch`（源状态白名单 `PENDING` / `PROGRAMMING`）
+//!   `auto-dispatch`（2026-10-06 订正：源状态白名单 `PENDING` / `PROGRAMMING`）
 //! - `transition.rs` —— to-XXX 流（`to-ship` / `to-inspection` / `to-process`）+ 批量
 //!   流转 + 扫码快捷入口（`scan-inspect` / `scan/deliver` / `worker-scan`）+ 集合读
 //!   （`inspection` / `repair` / `repairing`）
@@ -53,7 +53,7 @@ pub fn router() -> Router<Arc<AppState>> {
         //    同段数。**静态段必须先于 `/{batch_id}/...` 注册**（axum matchit 对
         //    同优先级按注册序；本组与 2 段动态组段数不同，天然无冲突）。
         // ====================================================================
-        // ---- 本域原有：待下发批次下发给车间 ----
+        // ---- 本域原有：待下发批次下发给车间（2026-10-06 订正：白名单 PENDING / PROGRAMMING）----
         .route("/pending", get(dispatch::list_pending))
         // dispatch 统一 bulk-only（单条下发即 targets.length==1）
         .route("/dispatch", post(dispatch::dispatch))

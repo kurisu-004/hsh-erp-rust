@@ -277,7 +277,8 @@ impl BatchService {
     /// 1. 角色守卫：Manager + Clerk
     /// 2. 空 batch_ids → `40001 VALIDATION_ERROR`
     /// 3. 调 `preview_auto_dispatch` 单 SQL 拉待下发白名单
-    ///    （`PENDING` / `PROGRAMMING`）内 batch 的 preview 元数据
+    ///    （`PENDING` / `PROGRAMMING`）内 batch 的 preview 元数据（白名单口径见
+    ///    文件头 2026-10-06 段）
     /// 4. 对每个 preview 行计算 skip_reason：
     ///    - process_chain_id None → `NO_PROCESS_CHAIN`
     ///    - first_process_id None → `NO_PROCESS_STEP`
@@ -329,9 +330,11 @@ impl BatchService {
             })
             .collect();
 
-        // 兜底：不在 preview 结果里的 batch_id（已软删 / 不在待下发白名单 / 不存在）
-        // → 单独补一行 + skip_reason='NOT_FOUND'。该路径无法取到 chain/step/shelf，
+        // 兜底：不在 preview 结果里的 batch_id（批次 / 其工单已软删 / 不在待下发白名单 /
+        // 不存在）→ 单独补一行 + skip_reason='NOT_FOUND'。该路径无法取到 chain/step/shelf，
         // 全部 Option 置 None（→ JSON `null`），对齐上游 OK 路径的 Option 语义。
+        // 落空成因不止软删：preview 的 FROM 是 `t_part_batch JOIN t_part`（INNER），
+        // 故**工单**软删与批次软删同效。
         for batch_id in &batch_ids {
             if !preview_ids.contains(batch_id) {
                 let part_id_opt =

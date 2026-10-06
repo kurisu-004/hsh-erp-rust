@@ -1,6 +1,6 @@
 //! 「待下发批次下发给车间」3 端点（`pending` / `dispatch` / `auto-dispatch`）
-//! 的 HTTP 路由 + 角色守卫 + WS 广播。待下发源状态白名单 = `PENDING` /
-//! `PROGRAMMING`（已废弃的 `PROGRAMMING` 只存量兼容，与 `PENDING` 同链路）。
+//! 的 HTTP 路由 + 角色守卫 + WS 广播。2026-10-06 订正：待下发源状态白名单 =
+//! `PENDING` / `PROGRAMMING`（已废弃的 `PROGRAMMING` 只存量兼容，与 `PENDING` 同链路）。
 //!
 //! - dispatch 统一 bulk-only（单条下发即 `targets.length == 1`）
 //! - auto-dispatch 改为只读查询（不开事务、不发 WS 广播）

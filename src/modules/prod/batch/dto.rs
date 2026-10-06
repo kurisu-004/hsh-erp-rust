@@ -329,8 +329,8 @@ pub struct PlaceOnShelfRequest {
 
 /// `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` 入参。
 ///
-/// `IN_PROCESS` + `location ∈ {PRODUCTION_SHELF, WORKER}` 或 `PROGRAMMING` →
-/// `PENDING`：召回已下发批次（含工人持有中的）回待下发池。
+/// 2026-10-06 订正：`IN_PROCESS` + `location ∈ {PRODUCTION_SHELF, WORKER}` 或
+/// `PROGRAMMING` → `PENDING`：召回已下发批次（含工人持有中的）回待下发池。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RecallToPendingRequest {
     pub version: i32,

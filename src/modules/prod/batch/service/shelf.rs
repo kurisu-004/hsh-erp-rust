@@ -2,9 +2,9 @@
 //!
 //! - `POST /api/v2/prod/batches/{batch_id}/place-on-shelf` —— `PENDING` →
 //!   `IN_PROCESS` + `location='PRODUCTION_SHELF'`
-//! - `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` —— `IN_PROCESS`
-//!   （`location` 限 `PRODUCTION_SHELF` 或 `WORKER`）/ `PROGRAMMING` → `PENDING`
-//!   （召回：把批次退回待下发池，位置 / 持有人 / 工序归属 / step 一并清空）
+//! - `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` —— 2026-10-06 订正：
+//!   `IN_PROCESS`（`location` 限 `PRODUCTION_SHELF` 或 `WORKER`）/ `PROGRAMMING`
+//!   → `PENDING`（召回：把批次退回待下发池，位置 / 持有人 / 工序归属 / step 一并清空）
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::infra::snowflake::SnowflakeIdGenerator;
