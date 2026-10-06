@@ -916,18 +916,20 @@ async fn dispatch_part_without_process_chain_appears_in_pool() {
     );
     assert_eq!(step, None, "无工序链 → step 恒 NULL");
 
-    // 3. 端点层：批次出现在目标工序池（这是用户报告症状的正脸）
+    // 3. 端点层：批次出现在目标工序池（这是用户报告症状的正脸）。
+    //    2026-10-08：`GET /pool/{process_id}` 已删，改打聚合端点
+    //    `GET /prod/queue/processes/{process_id}`。
     let (ps, pool_env) = send(
         app.clone(),
         json_request(
             "GET",
-            &format!("/prod/queue/{process_a}"),
+            &format!("/prod/queue/processes/{process_a}"),
             None,
             Some(&token),
         ),
     )
     .await;
-    assert_eq!(ps, StatusCode::OK, "GET pool/{process_a}: {pool_env}");
+    assert_eq!(ps, StatusCode::OK, "GET queue/processes/{process_a}: {pool_env}");
     let items = pool_env["data"]["items"].as_array().expect("data.items");
     let batch_id_str = batch_id.to_string();
     assert!(
@@ -935,30 +937,31 @@ async fn dispatch_part_without_process_chain_appears_in_pool() {
         "无工序链工单的批次下发后应出现在工序 {process_a} 候选池: {pool_env}"
     );
 
-    // 4. 计数端点同样应计入（前端 tab 徽标）
-    let (cs, counts_env) = send(
+    // 4. 序列板同样应计入（前端 tab 徽标）。`GET /pool/counts` 已删，
+    //    `GET /prod/queue/snapshot` 的 `processes[].pool_count` 取代。
+    let (cs, snap_env) = send(
         app,
-        json_request("GET", "/prod/queue/counts", None, Some(&token)),
+        json_request("GET", "/prod/queue/snapshot", None, Some(&token)),
     )
     .await;
-    assert_eq!(cs, StatusCode::OK, "GET pool/counts: {counts_env}");
-    let counts = counts_env["data"]["counts"]
+    assert_eq!(cs, StatusCode::OK, "GET queue/snapshot: {snap_env}");
+    let processes = snap_env["data"]["processes"]
         .as_array()
-        .expect("data.counts");
+        .expect("data.processes");
     let process_a_str = process_a.to_string();
-    let hit = counts
+    let hit = processes
         .iter()
         .find(|c| c["process_id"] == process_a_str)
         .unwrap_or_else(|| {
             panic!(
-                "counts 应含 process_id={process_a}（否则 tab 徽标为 0，\
-                 与用户报告的症状一致）: {counts_env}"
+                "processes 应含 process_id={process_a}（否则 tab 徽标为 0，\
+                 与用户报告的症状一致）: {snap_env}"
             )
         });
-    let count: i64 = hit["count"].as_i64().expect("count 应为 JSON integer");
+    let count: i64 = hit["pool_count"].as_i64().expect("pool_count 应为 JSON integer");
     assert!(
         count >= 1,
-        "process {process_a} 的候选批次数应 ≥ 1，实际 {count}: {counts_env}"
+        "process {process_a} 的候选批次数应 ≥ 1，实际 {count}: {snap_env}"
     );
 }
 

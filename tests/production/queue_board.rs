@@ -31,7 +31,7 @@
 use axum::http::StatusCode;
 use serde_json::Value;
 
-use hsh_erp_test_support::{json_request, send};
+use hsh_erp_test_support::{json_request, send, send_raw};
 
 use super::queue::{
     bootstrap_as_manager, count_held_by_worker, insert_customer_l2, insert_pool_part, insert_shelf,
@@ -544,7 +544,9 @@ async fn legacy_pool_paths_return_404() {
         ("POST", format!("/prod/batches/{proc}/recall-to-pending")),
     ];
     for (method, uri) in cases {
-        let (s, env) = send(
+        // 用 `send_raw` 而非 `send`：axum 对未匹配路由返 404 + **空 body**，
+        // `send` 会在 JSON 解析处 panic（那是断言工具的假设，不是被测行为）。
+        let (s, body) = send_raw(
             app.clone(),
             json_request(method, &uri, Some(serde_json::json!({})), Some(&token)),
         )
@@ -552,7 +554,7 @@ async fn legacy_pool_paths_return_404() {
         assert_eq!(
             s,
             StatusCode::NOT_FOUND,
-            "旧路径 `{method} {uri}` 应 404（无 alias）: {env}"
+            "旧路径 `{method} {uri}` 应 404（无 alias），body = {body}"
         );
     }
 }
