@@ -82,13 +82,22 @@ use crate::shared::error::AppError;
 pub struct BatchRepo;
 
 impl BatchRepo {
-    /// PENDING 批次列表（JOIN 4 表）。
+    /// 待下发批次列表（JOIN 4 表）。
     ///
     /// 2026-10-02：本方法只服务「下发车间」一条流（`list_pending` / `auto_dispatch`），
     /// 其投影比通用读 `queries::list_batches_with_part_in_customers` 宽：额外
     /// LEFT JOIN `t_part.process_chain_id` 与 `pb.current_process_step_id`（批次
-    /// step 化字段，下发时要定位首道工序），且硬限定 `pb.status = 'PENDING'`。
-    /// 两者投影不同，**不是**同一 SQL 的两份实现，不做合并。
+    /// step 化字段，下发时要定位首道工序）。两者投影不同，**不是**同一 SQL 的两份
+    /// 实现，不做合并。
+    ///
+    /// 2026-10-06：状态闸门由 `pb.status = 'PENDING'` 放宽为
+    /// `pb.status IN ('PENDING', 'PROGRAMMING')`。`PROGRAMMING` 是**已废弃**状态
+    /// （`part::statemachine` 中 `PENDING → PROGRAMMING` 的入口端点已下线，只保留
+    /// 4 条出口），但存量行仍需在「待下发」页被消化掉，故与 `PENDING` **同链路、
+    /// 同待遇**：同样出现在本列表、同样能被 `dispatch_batch` / `auto_dispatch`
+    /// 下发。白名单与 `count_pending_batches` / `preview_auto_dispatch` /
+    /// `update_batch_dispatched` 的 `allowed_from` 必须四处同步，否则「列得出
+    /// 但下发不了」或 `total` 与 `items` 口径不一致。
     ///
     /// 排序：`p.system_delivery_date ASC NULLS LAST, p.is_urgent DESC,
     /// pb.created_at ASC`（计划交期近 + 加急件优先 + 批次入库时间兜底）。
@@ -134,7 +143,7 @@ impl BatchRepo {
               ON pc.id = c.parent_id
             LEFT JOIN t_applicant a
               ON a.name = p.applicant_name AND a.deleted_at IS NULL
-            WHERE pb.status = 'PENDING'
+            WHERE pb.status IN ('PENDING', 'PROGRAMMING')
               AND pb.deleted_at IS NULL
               AND p.deleted_at IS NULL
             ORDER BY
@@ -153,7 +162,10 @@ impl BatchRepo {
         Ok(rows)
     }
 
-    /// PENDING 列表配套 COUNT（与 `list_pending_batches` 同 WHERE 不同 SELECT）。
+    /// 待下发列表配套 COUNT（与 `list_pending_batches` 同 WHERE 不同 SELECT）。
+    ///
+    /// 2026-10-06：状态闸门必须与 `list_pending_batches` 逐字同步
+    /// （`IN ('PENDING', 'PROGRAMMING')`），否则 `total` 与 `items` 对不上。
     pub async fn count_pending_batches(conn: &mut PgConnection) -> Result<i64, sqlx::Error> {
         let n: i64 = sqlx::query_scalar!(
             r#"
@@ -161,7 +173,7 @@ impl BatchRepo {
             FROM t_part_batch pb
             JOIN t_part p
               ON p.id = pb.part_id
-            WHERE pb.status = 'PENDING'
+            WHERE pb.status IN ('PENDING', 'PROGRAMMING')
               AND pb.deleted_at IS NULL
               AND p.deleted_at IS NULL
             "#,
@@ -171,12 +183,12 @@ impl BatchRepo {
         Ok(n)
     }
 
-    /// 标记 PENDING 批次已下发（OCC UPDATE）。
+    /// 标记待下发批次（`PENDING` / `PROGRAMMING`）已下发（OCC UPDATE）。
     ///
-    /// 输入：batch_id, expected_version (PENDING batch 当前 version), shelf_id,
+    /// 输入：batch_id, expected_version (批次当前 version), shelf_id,
     /// updated_by, current_process_id（= target_process_id）。
-    /// 输出：affected rows（0 → 40901 `VERSION_CONFLICT` / status 非 PENDING
-    /// / 已软删，由 service 层映射）。
+    /// 输出：affected rows（0 → 40901 `VERSION_CONFLICT` / status 不在
+    /// `allowed_from` 白名单 / 已软删，由 service 层映射）。
     ///
     /// 副作用：`status='IN_PROCESS'` + `location='PRODUCTION_SHELF'` +
     /// `current_holder_id=shelf_id` + `current_process_id=target_process_id` +
@@ -228,7 +240,11 @@ impl BatchRepo {
                 new_process_step_id: None,
                 is_repairing: None,
                 expected_version: Some(expected_version),
-                allowed_from: &["PENDING"],
+                // 2026-10-06：源状态白名单含已废弃的 `PROGRAMMING`，与
+                // `list_pending_batches` / `preview_auto_dispatch` 的状态闸门同源
+                // —— 此处是 `apply_batch_status_change` 的 SQL 层源状态闸门，漏放行
+                // 会让 service 层放行的 PROGRAMMING 批次在 UPDATE 阶段被拒（40901）。
+                allowed_from: &["PENDING", "PROGRAMMING"],
                 updated_by: updated_by.unwrap_or(0),
                 // 本包装函数的 `None` 一律是「保持原值」，清空语义由同名
                 // clear_* 显式表达。
@@ -238,9 +254,9 @@ impl BatchRepo {
                 // **还原**改造前 SQL 的语义 —— 原语句是
                 // `current_process_step_id = NULL`（直写）。「dispatch 的批次从未写过
                 // step，等价于 NULL」这条等价性依赖一条**没有任何约束保证**的不变式
-                // 「`status='PENDING'` ⇒ step IS NULL」（allowed_from 之外的旁路写点、
-                // 手工 SQL、历史脏数据都能破坏它），故按「faithful translation」原则
-                // 还原为显式清 NULL。
+                // 「`status ∈ {PENDING, PROGRAMMING}` ⇒ step IS NULL」（allowed_from
+                // 之外的旁路写点、手工 SQL、历史脏数据都能破坏它），故按
+                // 「faithful translation」原则还原为显式清 NULL。
                 clear_process_step_id: true,
                 // 目标状态 IN_PROCESS 不是终态 → 终态归档事件分支不可达
                 event_id: None,
@@ -321,7 +337,10 @@ impl BatchRepo {
     /// 不在结果中的 batch_id 走 service 二次补行 + `skip_reason='NOT_FOUND'`。
     ///
     /// 业务口径：
-    /// - 只取 PENDING + 未软删 的 batch（与 pending list 端点一致）
+    /// - 2026-10-06：只取待下发（`IN ('PENDING', 'PROGRAMMING')`）+ 未软删 的 batch，
+    ///   与 pending list 端点同一白名单。漏改会让不在 preview 结果里的 batch_id 被
+    ///   service 兜底成 `skip_reason='NOT_FOUND'`，前端「自动下发」会把 PROGRAMMING
+    ///   批次全判成「批次不存在或状态不可下发」并跳过。
     /// - 不写库，纯只读查询
     /// - 单 SQL 一次扫表，service 主路径不再分 3 步
     ///
@@ -368,7 +387,7 @@ impl BatchRepo {
                 LIMIT 1
             ) sp ON TRUE
             WHERE pb.id = ANY($1)
-              AND pb.status = 'PENDING'
+              AND pb.status IN ('PENDING', 'PROGRAMMING')
               AND pb.deleted_at IS NULL
             "#,
             batch_ids as &[i64],

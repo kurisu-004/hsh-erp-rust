@@ -101,7 +101,11 @@ impl BatchService {
         Ok(crate::modules::part::vo::PartOut::from(fresh))
     }
 
-    /// `POST /prod/batches/{batch_id}/recall-to-pending`：ON_SHELF / PROGRAMMING → PENDING。
+    /// `POST /prod/batches/{batch_id}/recall-to-pending`：召回待下发。
+    ///
+    /// 源状态：`IN_PROCESS`（位置限 `PRODUCTION_SHELF` 或 `WORKER`，见下方守卫）
+    /// 或 `PROGRAMMING` → `PENDING`。副作用是把 `location` / `current_holder_id` /
+    /// `current_process_id` / `current_process_step_id` 四列一起清 NULL。
     pub async fn recall_to_pending<R: PartRepoTrait>(
         mut repo: R,
         snowflake: &SnowflakeIdGenerator,
@@ -125,11 +129,35 @@ impl BatchService {
         let from = PartStatus::from_str(&batch.status)
             .ok_or_else(|| AppError::biz(code::BIZ_INVALID_VALUE, "batch.status 非法"))?;
         ensure_transition(from, PartStatus::PENDING, "recall-to-pending")?;
-        // 额外 service 守：IN_PROCESS 时必须有 location=PRODUCTION_SHELF（与 Python 一致）
-        if from == PartStatus::IN_PROCESS && batch.location.as_deref() != Some("PRODUCTION_SHELF") {
+        // 额外 service 守：IN_PROCESS 时批次必须停在「生产中」的位置 —— 在生产架上
+        // （PRODUCTION_SHELF）或在工人手上（WORKER）。
+        //
+        // 2026-10-06 放宽到 WORKER：运营需要把**已被工人领走**的批次一键召回，
+        // 否则只能等工人手工报工 / 归还。放宽是安全的，因为守卫之后的
+        // `mark_batch_with_status_and_meta(..., "PENDING", None, None, None, None, ...)`
+        // 里 4 个 `None` 触发 status_gate 的 `clear_location` / `clear_holder_id` /
+        // `clear_process_id` / `clear_process_step_id`（三态约定：`None` = 保持原值，
+        // 「清 NULL」由同名 `clear_*` 显式表达）⇒ 一次写入把 location、holder、
+        // 工序归属、step 四列一起清空：
+        // - `current_process_id` 清 NULL ⇒ 批次不再命中任何工序候选池（候选池 SQL 硬限定
+        //   `status='IN_PROCESS' AND location='PRODUCTION_SHELF' AND current_process_id = ANY(...)`）
+        // - `location` + `current_holder_id` 清 NULL ⇒ 不残留在工人持有列表（该列表硬限定
+        //   `location='WORKER' AND current_holder_id = $worker_id`），工位容量是按这两列
+        //   实时 COUNT 出来的，无需额外回收动作
+        // 其余 location（INSPECTION_SHELF / OUTSOURCE_COMPANY / OFFICE / NULL）仍拒绝。
+        if from == PartStatus::IN_PROCESS
+            && !matches!(
+                batch.location.as_deref(),
+                Some("PRODUCTION_SHELF" | "WORKER")
+            )
+        {
             return Err(AppError::biz(
                 code::BIZ_INVALID_TRANSITION,
-                "recall-to-pending: IN_PROCESS 批次必须在 PRODUCTION_SHELF 上",
+                format!(
+                    "recall-to-pending: IN_PROCESS 批次必须在 PRODUCTION_SHELF 上或被工人持有\
+                     （当前 location={}）",
+                    batch.location.as_deref().unwrap_or("NULL")
+                ),
             ));
         }
         // 翻状态

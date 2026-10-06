@@ -7,9 +7,17 @@
 //! - `auto_dispatch` 改为 `auto_dispatch_preview` 只读查询（不开事务）
 //!
 //! ## 3 个公共方法
-//! - [`BatchService::list_pending`] —— 读 PENDING 批次列表（handler `pool.acquire()`）
-//! - [`BatchService::dispatch_batch`] —— bulk-only 下发（事务内）：fetch batch → 校验 status='PENDING' → 解析货架 → UPDATE OCC → 写事件
+//! - [`BatchService::list_pending`] —— 读待下发批次列表（handler `pool.acquire()`）
+//! - [`BatchService::dispatch_batch`] —— bulk-only 下发（事务内）：fetch batch → 校验 status ∈ {PENDING, PROGRAMMING} → 解析货架 → UPDATE OCC → 写事件
 //! - [`BatchService::auto_dispatch_preview`] —— 只读查询，返回每个 batch 的首道工序 + 首货架
+//!
+//! ## 2026-10-06：源状态白名单纳入已废弃的 `PROGRAMMING`
+//! 三个方法的状态闸门统一为 `IN ('PENDING', 'PROGRAMMING')`。`PROGRAMMING` 的入口
+//! 端点已下线（见 `part::statemachine`），但存量行需要在「待下发」页被消化，故与
+//! `PENDING` 同链路：同样可列出、同样可批量下发、同样可自动下发。白名单分布在
+//! `BatchRepo::list_pending_batches` / `count_pending_batches` /
+//! `preview_auto_dispatch` / `update_batch_dispatched` 与本文件 `dispatch_single`，
+//! 五处必须同步。
 //!
 //! ## 事务 + 角色守卫
 //! 角色守卫下沉到 service（与 worker_pool `pool_by_process` 等同形）：handler
@@ -89,7 +97,9 @@ impl BatchService {
     /// handler tx Drop 自动回滚全部 succeeded 写入）：
     /// 1. 角色守卫：Manager + Clerk
     /// 2. fetch batch → `None` → `BIZ_BATCH_NOT_FOUND` 抛错
-    /// 3. 校验 `batch.status == 'PENDING'` → 否则 `BIZ_BATCH_INVALID_STATUS` 抛错
+    /// 3. 校验 `batch.status ∈ {'PENDING', 'PROGRAMMING'}` → 否则
+    ///    `BIZ_BATCH_INVALID_STATUS` 抛错（2026-10-06：纳入已废弃的 `PROGRAMMING`，
+    ///    与待下发列表同一白名单）
     /// 4. `find_first_shelf_for_process(target_process_id)` → `None` → `BIZ_SHELF_PROCESS_NOT_FOUND` 抛错
     ///    （2026-10-04：该方法已带 `t_shelf` 的 `deleted_at` / `is_active` / `zone='PRODUCTION'`
     ///    守卫，故 `None` 含「有映射但货架全不可用」，仍复用 20508 不新造码）
@@ -158,12 +168,14 @@ impl BatchService {
                 )
             })?;
 
-        // 2. 校验 status
-        if batch.status != "PENDING" {
+        // 2. 校验 status（2026-10-06：白名单含已废弃的 PROGRAMMING —— 存量 PROGRAMMING
+        // 批次与 PENDING 同链路下发，判定必须与 repo 层 list/count/preview 的闸门、
+        // 以及 update_batch_dispatched 的 allowed_from 一致）
+        if !matches!(batch.status.as_str(), "PENDING" | "PROGRAMMING") {
             return Err(AppError::biz(
                 code::BIZ_BATCH_INVALID_STATUS,
                 format!(
-                    "batch {} 当前 status='{}'，不允许 dispatch（要求 'PENDING'）",
+                    "batch {} 当前 status='{}'，不允许 dispatch（要求 'PENDING' 或 'PROGRAMMING'）",
                     batch.id, batch.status
                 ),
             ));
@@ -209,7 +221,7 @@ impl BatchService {
             return Err(AppError::biz(
                 code::VERSION_CONFLICT,
                 format!(
-                    "batch {} 版本冲突或状态非 PENDING（version={}，caller 未传 version 由 service 隐式 OCC）",
+                    "batch {} 版本冲突或状态不在可下发白名单（version={}，caller 未传 version 由 service 隐式 OCC）",
                     batch.id, batch.version
                 ),
             ));
@@ -233,7 +245,9 @@ impl BatchService {
                 id: event_id,
                 part_id,
                 event_type: "PLACED_ON_SHELF",
-                from_status: Some("PENDING"),
+                // 2026-10-06：源状态透传实际值（白名单含 PROGRAMMING，写死 'PENDING'
+                // 会让历史批次的流转事件记错起点）
+                from_status: Some(&batch.status),
                 to_status: Some("IN_PROCESS"),
                 batch_id: Some(batch.id),
                 quantity: Some(quantity),
@@ -565,6 +579,14 @@ mod tests {
 
     /// 写一个初始 `t_part_batch` 行（status='PENDING'，location=NULL）。
     async fn insert_part_batch(pool: &sqlx::PgPool, part_id: i64) -> i64 {
+        insert_part_batch_with_status(pool, part_id, "PENDING").await
+    }
+
+    /// 同 [`insert_part_batch`]，但显式指定 `t_part_batch.status`。
+    ///
+    /// 2026-10-06 新增：`PROGRAMMING` 已纳入待下发白名单，需要能造出该状态的批次
+    /// 来锁住「列得出 + 下发得了」。默认 helper 保持 PENDING，存量调用点零改动。
+    async fn insert_part_batch_with_status(pool: &sqlx::PgPool, part_id: i64, status: &str) -> i64 {
         let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
         let id = snowflake.next_id();
         let now = now_naive();
@@ -572,10 +594,11 @@ mod tests {
             "INSERT INTO t_part_batch (id, part_id, batch_no, quantity, status, location, \
              current_holder_id, current_process_step_id, delivery_note_id, parent_batch_id, \
              version, created_at, updated_at) \
-             VALUES ($1, $2, 1, 1, 'PENDING', NULL, NULL, NULL, NULL, NULL, 0, $3, $3)",
+             VALUES ($1, $2, 1, 1, $3, NULL, NULL, NULL, NULL, NULL, 0, $4, $4)",
         )
         .bind(id)
         .bind(part_id)
+        .bind(status)
         .bind(now)
         .execute(pool)
         .await
@@ -764,6 +787,72 @@ mod tests {
         assert_eq!(out.items[0].name, "Pending-Part");
     }
 
+    /// 2026-10-06：`PROGRAMMING`（已废弃状态的存量数据）与 `PENDING` 同链路，
+    /// 必须一并出现在待下发列表里，且 count 与 list 口径一致。
+    #[tokio::test]
+    async fn list_pending_batches_includes_programming_rows() {
+        let pool = test_pool().await;
+        let customer_id = insert_customer_l2(&pool, "ACME").await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+
+        let p_pending = insert_part(
+            &pool,
+            "Pending-Part",
+            "DWG-P",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            None,
+        )
+        .await;
+        let b_pending = insert_part_batch_with_status(&pool, p_pending, "PENDING").await;
+
+        let p_prog = insert_part(
+            &pool,
+            "Programming-Part",
+            "DWG-PROG",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            None,
+        )
+        .await;
+        let b_prog = insert_part_batch_with_status(&pool, p_prog, "PROGRAMMING").await;
+
+        // INSPECTION 应继续被排除（闸门是白名单，不是「非 IN_PROCESS 都放行」）
+        let p_insp = insert_part(
+            &pool,
+            "Inspection-Part",
+            "DWG-INS",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            None,
+        )
+        .await;
+        insert_part_batch_with_status(&pool, p_insp, "INSPECTION").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let out = BatchService::list_pending(&mut conn, &make_current(1, Role::Manager), 200, 0)
+            .await
+            .expect("list_pending OK");
+
+        assert_eq!(
+            out.total, 2,
+            "PENDING + PROGRAMMING 都应计入 total（count 与 list 同一白名单）"
+        );
+        assert_eq!(out.items.len(), 2, "items 与 total 必须同口径");
+        let ids: Vec<i64> = out.items.iter().map(|i| i.batch_id).collect();
+        assert!(ids.contains(&b_pending), "PENDING 批次应列出: {ids:?}");
+        assert!(
+            ids.contains(&b_prog),
+            "PROGRAMMING 批次应与 PENDING 同链路列出: {ids:?}"
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_batch_bulk_success_path() {
         // 2026-09-30 重构：dispatch_batch bulk-only 形态，单条 target 即 1 元素 succeeded
@@ -839,6 +928,81 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// 2026-10-06：已废弃的 `PROGRAMMING` 批次必须能正常下发（service 白名单 +
+    /// repo 层 `allowed_from` 两道闸门都要放行）。
+    ///
+    /// 这条同时锁住「只改 service 不改 `allowed_from`」那种半改法 —— 那样会走到
+    /// `apply_batch_status_change` 的 SQL 层源状态闸门被拒（40901 / 0 行）。
+    #[tokio::test]
+    async fn dispatch_batch_accepts_programming_batch() {
+        let pool = test_pool().await;
+        let user_id = insert_user_with_role(&pool, "manager1", "password", "MANAGER").await;
+        let customer_id = insert_customer_l2(&pool, "ACME").await;
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 29).unwrap();
+
+        let process_id = insert_process(&pool, "P-PROG", "PROGRAMMING 源工序").await;
+        let shelf_id = insert_shelf(&pool, "SH-PROG", "PRODUCTION").await;
+        link_shelf_to_process(&pool, shelf_id, process_id).await;
+
+        let p_id = insert_part(
+            &pool,
+            "P-PROG",
+            "DWG-PROG",
+            customer_id,
+            today,
+            Some(today),
+            false,
+            None,
+        )
+        .await;
+        let b_id = insert_part_batch_with_status(&pool, p_id, "PROGRAMMING").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let snowflake = crate::infra::snowflake::SnowflakeIdGenerator::new(1_577_836_800_000, 7);
+        let r = BatchService::dispatch_batch(
+            &mut conn,
+            vec![(b_id, process_id)],
+            Some("dispatch programming"),
+            &snowflake,
+            &make_current(user_id, Role::Manager),
+        )
+        .await
+        .expect("PROGRAMMING 批次应可下发");
+        assert_eq!(r.succeeded.len(), 1);
+        assert_eq!(r.failed.len(), 0);
+        assert_eq!(r.succeeded[0].batch_id, b_id);
+        assert_eq!(r.succeeded[0].shelf_id, shelf_id);
+        assert_eq!(
+            r.succeeded[0].current_process_id,
+            Some(process_id),
+            "下发后 current_process_id 必须等于 target_process_id（入池依据）"
+        );
+
+        // DB 验证：PROGRAMMING → IN_PROCESS，holder / process 与 PENDING 源同形
+        let row: (String, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT status, current_holder_id, current_process_id FROM t_part_batch WHERE id = $1",
+        )
+        .bind(b_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "IN_PROCESS");
+        assert_eq!(row.1, Some(shelf_id));
+        assert_eq!(row.2, Some(process_id));
+
+        // 事件：from_status 必须记真实起点（写死 'PENDING' 会把历史流转记错）
+        let (from_status, to_status): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT from_status, to_status FROM t_part_event \
+             WHERE batch_id = $1 AND event_type = 'PLACED_ON_SHELF'",
+        )
+        .bind(b_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(from_status.as_deref(), Some("PROGRAMMING"));
+        assert_eq!(to_status.as_deref(), Some("IN_PROCESS"));
     }
 
     #[tokio::test]

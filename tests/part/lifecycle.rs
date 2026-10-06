@@ -2,7 +2,8 @@
 //!
 //! 覆盖：
 //!   - place-on-shelf: PENDING → IN_PROCESS（happy + RBAC + 状态机拒绝 + shelf↔process 校验）
-//!   - recall-to-pending: ON_SHELF/PROGRAMMING → PENDING（happy + 状态机拒绝）
+//!   - recall-to-pending: IN_PROCESS（在生产架 / 工人持有）/ PROGRAMMING → PENDING
+//!     （happy + 出池四列清空 + 非生产位置拒绝）
 //!   - release-from-programming: PROGRAMMING → IN_PROCESS（happy + RBAC）
 //!   - send-to-outsource: PENDING → OUTSOURCE
 //!   - receive-from-outsource: OUTSOURCE → IN_PROCESS
@@ -1359,6 +1360,133 @@ async fn recall_to_pending_clears_location_holder_and_step() {
         step, None,
         "recall 出池后 current_process_step_id 必须清 NULL（review M2）"
     );
+}
+
+// ===========================================================================
+//  2026-10-06：recall-to-pending 放宽到「工人持有中」的批次
+// ===========================================================================
+
+/// 2026-10-06：`IN_PROCESS + location='WORKER' + holder=工人` 的批次可被召回，
+/// 且 `location` / `current_holder_id` / `current_process_id` 三列一并清 NULL。
+///
+/// 断言结构照抄 `recall_to_pending_clears_location_holder_and_step`（先自证召回前
+/// 三列非空，否则「被清空」是空转）。
+#[tokio::test]
+async fn recall_to_pending_allows_worker_held_batch() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let part_id = insert_part_biz(
+        &pool,
+        fx.customer_l2_id,
+        "工人持有召回工单",
+        "D-RECALL-WORKER",
+        false,
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+        None,
+    )
+    .await;
+    let worker_id = insert_worker(&pool, fx.work_type_id, "WT-RECALL").await;
+    let bid = insert_worker_held_batch(&pool, part_id, worker_id).await;
+    // 池内状态还差 current_process_id（helper 只写 location + holder），
+    // 补上以便「清 NULL」这条断言非空转。
+    sqlx::query("UPDATE t_part_batch SET current_process_id = $2 WHERE id = $1")
+        .bind(bid)
+        .bind(fx.process_id)
+        .execute(&pool)
+        .await
+        .expect("seed current_process_id");
+
+    // 自证：召回前这 3 列确实非空
+    let (loc, holder, pid_col): (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT location, current_holder_id, current_process_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(bid)
+    .fetch_one(&pool)
+    .await
+    .expect("read before recall");
+    assert_eq!(loc.as_deref(), Some("WORKER"));
+    assert_eq!(holder, Some(worker_id));
+    assert_eq!(pid_col, Some(fx.process_id));
+
+    let version = batch_version(&pool, bid).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/recall-to-pending"),
+            Some(json!({
+                "version": version,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "工人持有中的 IN_PROCESS 批次应可召回: {env}"
+    );
+    assert_eq!(env["code"], 0);
+    assert_eq!(env["data"]["status"], "PENDING");
+
+    // 事后：3 列全清（工人工位容量按 location+holder 实时 COUNT，无需额外回收）
+    let (loc, holder, pid_col): (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT location, current_holder_id, current_process_id FROM t_part_batch WHERE id = $1",
+    )
+    .bind(bid)
+    .fetch_one(&pool)
+    .await
+    .expect("read after recall");
+    assert_eq!(loc, None, "召回后 location 必须清 NULL");
+    assert_eq!(holder, None, "召回后 current_holder_id 必须清 NULL");
+    assert_eq!(pid_col, None, "召回后 current_process_id 必须清 NULL");
+}
+
+/// 2026-10-06：location 白名单是「生产架 + 工人」，其余 location 仍拒。
+///
+/// 与上面的放行用例成对，证明这条守卫是白名单而非「IN_PROCESS 一律放行」。
+#[tokio::test]
+async fn recall_to_pending_rejects_non_production_location() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
+    // INSPECTION_SHELF（品检架）不在白名单内
+    sqlx::query(
+        "UPDATE t_part_batch SET location = 'INSPECTION_SHELF', current_holder_id = $2 \
+                 WHERE id = $1",
+    )
+    .bind(bid)
+    .bind(fx.inspection_shelf_id)
+    .execute(&pool)
+    .await
+    .expect("seed inspection shelf location");
+    let version = batch_version(&pool, bid).await;
+    let (s, env) = send(
+        app,
+        json_request(
+            "POST",
+            &format!("/prod/batches/{bid}/recall-to-pending"),
+            Some(json!({
+                "version": version,
+            })),
+            Some(&token),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::BAD_REQUEST,
+        "品检架上的 IN_PROCESS 批次不应被召回: {env}"
+    );
+    assert_eq!(env["code"], 20103);
+
+    // 拒绝路径不得改动任何列
+    let (status, loc): (String, Option<String>) =
+        sqlx::query_as("SELECT status, location FROM t_part_batch WHERE id = $1")
+            .bind(bid)
+            .fetch_one(&pool)
+            .await
+            .expect("read after rejected recall");
+    assert_eq!(status, "IN_PROCESS");
+    assert_eq!(loc.as_deref(), Some("INSPECTION_SHELF"));
 }
 
 // ===========================================================================
