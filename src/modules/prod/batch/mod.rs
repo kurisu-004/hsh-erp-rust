@@ -1,9 +1,10 @@
 //! prod::batch 子模块 —— `t_part_batch` 域（生产执行单元 = 批次）
 //!
 //! 2026-10-02 域迁移：`t_part_batch` 的 repo / model / 状态机写入口、**全部以批次
-//! 为对象的服务用例**与 25 条批次路由（URL 锚由 `part_id` 改为 `batch_id`）整体
-//! 从 part 域搬入本模块，25 条路由从 `POST /api/v2/parts/…` 硬切到
-//! `POST /api/v2/prod/batches/…`（**无 alias**，前端配套 PR 锁步迁移）。
+//! 为对象的服务用例**与批次路由（URL 锚由 `part_id` 改为 `batch_id`）整体
+//! 从 part 域搬入本模块，路由从 `POST /api/v2/parts/…` 硬切到
+//! `POST /api/v2/prod/batches/…`（**无 alias**，前端配套 PR 锁步迁移）。现共
+//! **27 条**路由（24 条批次路由 + 本域原有 3 条下发端点），逐条见下方路由表。
 //!
 //! part 域自此只保留「多批次动作 + part 级动作」：`/{part_id}/cancel`（BATCH-N）、
 //! `/{part_id}/force-complete`（BATCH-N）、`/{part_id}/soft-delete`、
@@ -17,14 +18,12 @@
 //! [`service`] 模块 doc。
 //!
 //! ## 模块结构
-//! - `model.rs` —— `TPartBatch` / `RecentBatchRow` / `PartBatchScanRow` /
-//!   `InspectionQueueRow`（待品检窄投影）行结构
+//! - `model.rs` —— `TPartBatch` / `RecentBatchRow` / `PartBatchScanRow` 行结构
+//!   + `current_process_id` / `current_process_step_id` 的**读取方分工**清单
 //! - `status_gate.rs` —— **全仓唯一** `t_part_batch.status` 写入口（写 + batch →
 //!   part → assembly 派生焊在一个函数里）
 //! - `repo/queries.rs` —— ZST `PartBatchRepo` + 通用 SQL 静态方法
 //! - `repo/sql.rs` —— inspection / lifecycle 流转的定位 + 写点
-//! - `repo/list.rs` —— 集合读：3-JOIN 窄投影 + 表头筛选/排序
-//!   （`GET /prod/batches/inspection` 专用，2026-10-03 VO 收口）
 //! - `repo/trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
 //! - `repo/mod.rs` —— ZST `BatchRepo`：「PENDING 批次下发给车间」专用查询
 //! - `service/` —— 全部业务用例（`impl BatchService`，按流拆文件，见该目录 mod doc）
@@ -32,13 +31,20 @@
 //! - `vo.rs` —— 全部出参（`Serialize`）
 //! - `handler/{dispatch,transition,lifecycle}.rs` —— HTTP 路由 + 角色守卫 + WS 广播
 //!
-//! ## 路由表（25 条 + 本域原有 3 条）
+//! ## 2026-10-07 迁出：待品检队列读
+//! `GET /api/v2/prod/batches/inspection`（+ 它的 `dto` / `vo` / `model` 行结构 /
+//! `repo/list.rs` / `service/list.rs`）整体迁往 `prod::inspection`，新路径
+//! `GET /api/v2/prod/inspection/queue`，**无 alias**。理由：该页面的两个数据源
+//! （队列列表 + 扫码树）本就同属一个页面，迁后 `prod::inspection` 零跨域依赖、
+//! 可被域隔离护栏完整覆盖。**本域不再持有任何集合读 SQL**：`/repair` /
+//! `/repairing` 两条集合读在 service 层直接构造 VO。
+//!
+//! ## 路由表（24 条 + 本域原有 3 条）
 //!
 //! 静态 1 段（原 `/api/v2/parts/…`，**无 Path extractor**）：
 //! - `POST   /to-ship`          ← `/api/v2/prod/batches/to-ship`
 //! - `POST   /to-inspection`    ← `/api/v2/prod/batches/to-inspection`
 //! - `POST   /worker-scan`      ← `/api/v2/prod/batches/worker-scan`
-//! - `GET    /inspection`       ← `/api/v2/prod/batches/inspection`
 //! - `GET    /repair`           ← `/api/v2/prod/batches/repair`
 //! - `GET    /repairing`        ← `/api/v2/prod/batches/repairing`
 //! - `GET    /pending` / `POST /dispatch` / `POST /auto-dispatch`（本域原有，不动）
@@ -64,12 +70,12 @@
 //!
 //! ## 事务 / WS 广播
 //! - 写端点：handler `state.pool.begin()` → service → `tx.commit()` → WS 广播
-//! - 读端点（pending / inspection / repair / repairing）：handler `pool.acquire()` 不开事务
+//! - 读端点（pending / repair / repairing）：handler `pool.acquire()` 不开事务
 //! - 只读端点（auto-dispatch）：`pool.acquire()` 不开事务，**不发** WS 广播
 //!
 //! ## 角色守卫
 //! - GET pending: Manager + Clerk + Inspector
-//! - GET inspection / repair / repairing: Manager + Inspector
+//! - GET repair / repairing: Manager + Inspector
 //! - POST dispatch / auto-dispatch: Manager + Clerk
 //! - to-XXX 三流 + 批量两流: Manager + Inspector
 //! - worker-scan: Manager + ShelfAccount

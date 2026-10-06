@@ -50,13 +50,19 @@
 //! → 全部批次」三层树，供前端扫码弹窗一次取全。命中口径是**先查 `t_part.serial_no`、
 //! 未命中再查 `t_assembly.serial_no`**（子件码与父件码值域不同形，两表各自对活跃
 //! 行有唯一索引），都未命中返 20101 / HTTP 404。扫子件与扫父装配件返回的是
-//! **同一棵树**（`hit_kind` 区分）。角色 Manager + Inspector，与
-//! `GET /prod/batches/inspection` 及三个 `to-XXX` 写端点同组。零 schema 变更。
+//! **同一棵树**（`hit_kind` 区分）。角色 Manager + Inspector，与三个 `to-XXX`
+//! 写端点同组。零 schema 变更。
 //! part 域 `GET /parts/by-serial/{serial_no}` **保留兼容、一行未改**。
 //!
+//! 2026-10-07 待品检队列读（`GET /api/v2/prod/inspection/queue`，出参 13 字段
+//! 分页列表）自 `prod::batch` 迁入本域 —— **破坏性路由变更**，旧路径
+//! `GET /api/v2/prod/batches/inspection` 已下线且**无 alias**，请求 / 响应契约逐字
+//! 不变。理由：前端「待品检」页只有这两个数据源，迁后同域收敛成一页一域，且本域
+//! **零跨域依赖**（已被域隔离护栏覆盖，见 `inspection/mod.rs` 的 `mod tests`）。
+//!
 //! `t_part_batch`（批次）是生产执行单元，**归 prod 域**：它的 repo / model /
-//! `status_gate` 状态写入口与 25 条批次路由（`worker-scan` / `pick-up` / `to-*` /
-//! `complete` / `split` / `cancel` / `scan-inspect` / 3 条集合读）整体在本域
+//! `status_gate` 状态写入口与 27 条批次路由（`worker-scan` / `pick-up` / `to-*` /
+//! `complete` / `split` / `cancel` / `scan-inspect` / 2 条集合读）整体在本域
 //! `prod::batch`，URL 挂 `/api/v2/prod/batches/*`。
 //!
 //! part 域只留「多批次动作 + 非批次动作」：`POST /parts/{part_id}/cancel`（翻转该

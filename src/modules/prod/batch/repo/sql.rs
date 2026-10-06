@@ -362,10 +362,10 @@ impl PartBatchRepo {
     /// `chain_id + next_process_id` **重新解析** step_id 写入
     /// （`inspection_core.rs::to_process`），所以上下文不会真的丢。
     ///
-    /// 现在保留 step 的实际价值：它是 `GET /prod/batches/inspection` 的
-    /// `next_process_id` / `next_process_name` 的**唯一数据来源**（step JOIN 派生），
-    /// 供送检期间前端显示批次**首次定位**在工艺链的哪一步。属**显示用信息**，
-    /// 不是状态机依赖。
+    /// 现在保留 step 的实际价值：它是 `GET /prod/batches/repair` / `repairing`
+    /// 两张 VO 的 `next_process_id` / `next_process_name` 的**唯一数据来源**
+    /// （step JOIN 派生）。待品检队列读（`GET /prod/inspection/queue`）自 2026-10-03
+    /// 起**不投影**这两列，与本列无关。属**显示用信息**，不是状态机依赖。
     /// ⚠️ 措辞订正（2026-09-30 review 第 3 轮附带发现）：**不是**「当前走到第
     /// 几步」—— 本列只在首次定位工序时写、之后一律不再推进（worker-scan
     /// RETURNED / INSPECTED 都不写），对多工序链工单永远停在首次定位那一步。

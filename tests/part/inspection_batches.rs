@@ -1,4 +1,10 @@
-//! part 域集成测试 —— `GET /prod/batches/inspection` 端点
+//! 待品检队列端点集成测试 —— `GET /api/v2/prod/inspection/queue`
+//!
+//! 2026-10-07：该端点自 `prod::batch` 迁入 `prod::inspection`（旧路径
+//! `GET /prod/batches/inspection` 已下线、无 alias），测试内的请求路径随之改为
+//! `/prod/inspection/queue`；**断言逐字未改**。文件仍留在 `tests/part/` 下（与同为
+//! `prod::batch` 集合读的 `tests/part/repair.rs` 同处）—— 测试目录按历史来源归档，
+//! 与端点当前的域归属无关。
 //!
 //! 覆盖：
 //!   1. happy path：list 仅返回 INSPECTION 批次，返回的 `batch_id + version`
@@ -9,7 +15,8 @@
 //!      `customer_id`（L1 展开）各自命中预期行。
 //!   4. 服务端排序：`sort_by` 白名单 7 值 + `sort_dir` + 非法值退化。
 //!   5. 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN（**本文件是该守卫的唯一
-//!      覆盖**，守卫在 `service/list.rs::list_inspection_batches` 第一行）。
+//!      覆盖**，守卫在 `prod::inspection::service::InspectionQueueService::list_queue`
+//!      第一行）。
 //!      brief 原话「Worker role」并不存在，本仓库 5 角色中 ShelfAccount 是唯一合法
 //!      登录、但不在 `INSPECTION_LIST_ROLES = [Manager, Inspector]` 内的角色；
 //!      `PartFixture::SHELF_ACCOUNT_USERNAME` + SHELF_ACCOUNT role 提供该登录态。
@@ -318,7 +325,7 @@ fn item_batch_ids(body: &Value) -> Vec<String> {
 /// 步骤：
 ///   1. 插 part A + INSPECTION 批次（qty=5，holder=INSPECTION 货架）
 ///   2. 插 part B + IN_PROCESS 批次（qty=3）—— 必须不出现在 list 中
-///   3. GET /prod/batches/inspection?limit=10（INSPECTOR token）
+///   3. GET /prod/inspection/queue?limit=10（INSPECTOR token）
 ///   4. 断言：
 ///      - status 200
 ///      - data.total >= 1
@@ -379,7 +386,7 @@ async fn inspection_batches_list_returns_only_inpection_status_with_batch_id_and
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?limit=10",
+            "/prod/inspection/queue?limit=10",
             None::<Value>,
             Some(&token),
         ),
@@ -516,7 +523,7 @@ async fn inspection_batches_filters_by_header_columns() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?drawing_no=DWG-A-001",
+            "/prod/inspection/queue?drawing_no=DWG-A-001",
             None::<Value>,
             Some(&token),
         ),
@@ -534,7 +541,7 @@ async fn inspection_batches_filters_by_header_columns() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?name=PARTB",
+            "/prod/inspection/queue?name=PARTB",
             None::<Value>,
             Some(&token),
         ),
@@ -552,7 +559,7 @@ async fn inspection_batches_filters_by_header_columns() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?serial_no=PB001",
+            "/prod/inspection/queue?serial_no=PB001",
             None::<Value>,
             Some(&token),
         ),
@@ -570,7 +577,7 @@ async fn inspection_batches_filters_by_header_columns() {
         app.clone(),
         json_request(
             "GET",
-            &format!("/prod/batches/inspection?customer_id={l1_a}&name=PARTA"),
+            &format!("/prod/inspection/queue?customer_id={l1_a}&name=PARTA"),
             None::<Value>,
             Some(&token),
         ),
@@ -594,7 +601,7 @@ async fn inspection_batches_filters_by_header_columns() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?name=",
+            "/prod/inspection/queue?name=",
             None::<Value>,
             Some(&token),
         ),
@@ -612,7 +619,7 @@ async fn inspection_batches_filters_by_header_columns() {
         app,
         json_request(
             "GET",
-            "/prod/batches/inspection?name=PART%25",
+            "/prod/inspection/queue?name=PART%25",
             None::<Value>,
             Some(&token),
         ),
@@ -667,7 +674,7 @@ async fn inspection_batches_item_keys_exactly_thirteen() {
         app,
         json_request(
             "GET",
-            "/prod/batches/inspection?limit=50",
+            "/prod/inspection/queue?limit=50",
             None::<Value>,
             Some(&token),
         ),
@@ -824,7 +831,7 @@ async fn inspection_batches_sorts_by_whitelisted_columns() {
             app.clone(),
             json_request(
                 "GET",
-                &format!("/prod/batches/inspection?sort_by={sort_by}&sort_dir=ASC&limit=50"),
+                &format!("/prod/inspection/queue?sort_by={sort_by}&sort_dir=ASC&limit=50"),
                 None::<Value>,
                 Some(&token),
             ),
@@ -841,7 +848,7 @@ async fn inspection_batches_sorts_by_whitelisted_columns() {
             app.clone(),
             json_request(
                 "GET",
-                &format!("/prod/batches/inspection?sort_by={sort_by}&sort_dir=DESC&limit=50"),
+                &format!("/prod/inspection/queue?sort_by={sort_by}&sort_dir=DESC&limit=50"),
                 None::<Value>,
                 Some(&token),
             ),
@@ -864,7 +871,7 @@ async fn inspection_batches_sorts_by_whitelisted_columns() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC&limit=50",
+            "/prod/inspection/queue?sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC&limit=50",
             None::<Value>,
             Some(&token),
         ),
@@ -880,7 +887,7 @@ async fn inspection_batches_sorts_by_whitelisted_columns() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?sort_by=SYSTEM_DELIVERY_DATE&sort_dir=DESC&limit=50",
+            "/prod/inspection/queue?sort_by=SYSTEM_DELIVERY_DATE&sort_dir=DESC&limit=50",
             None::<Value>,
             Some(&token),
         ),
@@ -899,7 +906,7 @@ async fn inspection_batches_sorts_by_whitelisted_columns() {
         app,
         json_request(
             "GET",
-            "/prod/batches/inspection\
+            "/prod/inspection/queue\
              ?sort_by=pb.id%3B%20DROP%20TABLE%20t_part_batch&sort_dir=sideways&limit=50",
             None::<Value>,
             Some(&token),
@@ -970,7 +977,7 @@ async fn inspection_batches_filters_by_system_delivery_date_range() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?system_delivery_date_from=2026-06-15\
+            "/prod/inspection/queue?system_delivery_date_from=2026-06-15\
              &system_delivery_date_to=2026-11-20&limit=50",
             None::<Value>,
             Some(&token),
@@ -994,7 +1001,7 @@ async fn inspection_batches_filters_by_system_delivery_date_range() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?system_delivery_date_from=2026-06-15&limit=50",
+            "/prod/inspection/queue?system_delivery_date_from=2026-06-15&limit=50",
             None::<Value>,
             Some(&token),
         ),
@@ -1016,7 +1023,7 @@ async fn inspection_batches_filters_by_system_delivery_date_range() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?system_delivery_date_to=2026-06-15&limit=50",
+            "/prod/inspection/queue?system_delivery_date_to=2026-06-15&limit=50",
             None::<Value>,
             Some(&token),
         ),
@@ -1056,12 +1063,7 @@ async fn inspection_batches_role_guard_rejects_shelf_account() {
 
     let (status, body) = send(
         app,
-        json_request(
-            "GET",
-            "/prod/batches/inspection",
-            None::<Value>,
-            Some(&token),
-        ),
+        json_request("GET", "/prod/inspection/queue", None::<Value>, Some(&token)),
     )
     .await;
     assert_eq!(
@@ -1130,7 +1132,7 @@ async fn inspection_batches_pagination_splits_items_and_total_matches() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?limit=50&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            "/prod/inspection/queue?limit=50&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
             None::<Value>,
             Some(&token),
         ),
@@ -1159,7 +1161,7 @@ async fn inspection_batches_pagination_splits_items_and_total_matches() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?limit=2&offset=0&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            "/prod/inspection/queue?limit=2&offset=0&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
             None::<Value>,
             Some(&token),
         ),
@@ -1194,7 +1196,7 @@ async fn inspection_batches_pagination_splits_items_and_total_matches() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?limit=2&offset=2&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            "/prod/inspection/queue?limit=2&offset=2&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
             None::<Value>,
             Some(&token),
         ),
@@ -1218,7 +1220,7 @@ async fn inspection_batches_pagination_splits_items_and_total_matches() {
         app,
         json_request(
             "GET",
-            "/prod/batches/inspection?limit=2&offset=4&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            "/prod/inspection/queue?limit=2&offset=4&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
             None::<Value>,
             Some(&token),
         ),
@@ -1294,7 +1296,7 @@ async fn inspection_batches_pagination_tiebreak_by_batch_id_is_stable() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?limit=50&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
+            "/prod/inspection/queue?limit=50&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC",
             None::<Value>,
             Some(&token),
         ),
@@ -1320,7 +1322,7 @@ async fn inspection_batches_pagination_tiebreak_by_batch_id_is_stable() {
             json_request(
                 "GET",
                 &format!(
-                    "/prod/batches/inspection?limit=2&offset={offset}&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC"
+                    "/prod/inspection/queue?limit=2&offset={offset}&sort_by=SYSTEM_DELIVERY_DATE&sort_dir=ASC"
                 ),
                 None::<Value>,
                 Some(&token),
@@ -1390,7 +1392,7 @@ async fn inspection_batches_pagination_total_respects_filter_and_sort() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/inspection?name=PAGECLIENT&sort_by=QUANTITY&sort_dir=DESC&limit=1",
+            "/prod/inspection/queue?name=PAGECLIENT&sort_by=QUANTITY&sort_dir=DESC&limit=1",
             None::<Value>,
             Some(&token),
         ),
@@ -1418,7 +1420,7 @@ async fn inspection_batches_pagination_total_respects_filter_and_sort() {
         app,
         json_request(
             "GET",
-            "/prod/batches/inspection?sort_by=QUANTITY&sort_dir=DESC&limit=1",
+            "/prod/inspection/queue?sort_by=QUANTITY&sort_dir=DESC&limit=1",
             None::<Value>,
             Some(&token),
         ),
@@ -1478,7 +1480,7 @@ async fn inspection_batches_customer_filter_expands_l1_to_l2() {
         json_request(
             "GET",
             &format!(
-                "/prod/batches/inspection?customer_id={}&limit=50",
+                "/prod/inspection/queue?customer_id={}&limit=50",
                 fx.customer_l1_id
             ),
             None::<Value>,
@@ -1505,7 +1507,7 @@ async fn inspection_batches_customer_filter_expands_l1_to_l2() {
         json_request(
             "GET",
             &format!(
-                "/prod/batches/inspection?customer_id={}&limit=50",
+                "/prod/inspection/queue?customer_id={}&limit=50",
                 fx.customer_l2_id
             ),
             None::<Value>,

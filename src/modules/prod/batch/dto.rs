@@ -216,8 +216,8 @@ pub struct WorkerScanRequest {
 
 /// `GET /api/v2/prod/batches/repair` / `repairing` 查询参数（2 条共用）。
 ///
-/// **仅这 2 条端点**（2026-10-03 起）：`GET /prod/batches/inspection` 已分化到
-/// [`InspectionQueueQuery`]。
+/// **仅这 2 条端点**：待品检队列读（`GET /api/v2/prod/inspection/queue`）的查询
+/// 参数在 `prod::inspection` 域自己的 dto 模块里，与本结构无关。
 ///
 /// `customer_id` 单值；service 层复用 `expand_customer_id` 展开为 L1+L2 ids
 /// （与 `list_parts` 同逻辑）。`keyword` / `serial_no` ILIKE 匹配。
@@ -234,40 +234,6 @@ pub struct RepairBatchListQuery {
     pub planned_delivery_date_from: Option<chrono::NaiveDate>,
     #[serde(default)]
     pub planned_delivery_date_to: Option<chrono::NaiveDate>,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub limit: Option<i64>,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub offset: Option<i64>,
-}
-
-/// `GET /api/v2/prod/batches/inspection` 查询参数。
-///
-/// 2026-10-03 与 [`RepairBatchListQuery`] 分化：待品检页的筛选收敛到表头 7 列，
-/// 每列一个独立参数（图号 / 名称 / 序列号各一个 ILIKE），不再用跨字段 `keyword`；
-/// 日期区间筛系统交期（页面已不显示计划交期）。
-/// `sort_by` 白名单（SERIAL_NO / DRAWING_NO / NAME / BATCH_NO / QUANTITY /
-/// SYSTEM_DELIVERY_DATE / CUSTOMER_NAME），非法值退化为 SYSTEM_DELIVERY_DATE；
-/// `sort_dir` 非法退化为 ASC。
-/// 3 个文本筛选值含 `%` / `_` / `\` 时在 service 层拒（40001）—— 那是防 `%…%`
-/// 被当通配符放大成全表扫描的**语义**约束，注入面由 repo 的 `push_bind` 保证。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct InspectionQueueQuery {
-    #[serde(default)]
-    pub drawing_no: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub serial_no: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub customer_id: Option<i64>,
-    #[serde(default)]
-    pub system_delivery_date_from: Option<chrono::NaiveDate>,
-    #[serde(default)]
-    pub system_delivery_date_to: Option<chrono::NaiveDate>,
-    #[serde(default)]
-    pub sort_by: Option<String>,
-    #[serde(default)]
-    pub sort_dir: Option<String>,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
     pub limit: Option<i64>,
     #[serde(default, deserialize_with = "deserialize_i64_opt")]

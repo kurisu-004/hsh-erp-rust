@@ -40,9 +40,10 @@
 //! - **展示类列表一律继续从 `current_process_step_id` → step JOIN 派生工序名**，
 //!   唯一**有意例外**是扫码树（第 4 条，已在下方登记）。完整清单（改动前请逐条
 //!   对照，勿凭端点名想当然）：
-//!   1. `prod/batch/repo/list.rs::list_inspection_queue`
-//!      —— `GET /prod/batches/inspection`（2026-10-03 起 3-JOIN 窄投影，
-//!      **不投影** `next_process_*`，故本条已无「派生 vs 直读」之争）
+//!   1. `prod/inspection/repo.rs::InspectionQueueRepo::list_inspection_queue`
+//!      —— `GET /prod/inspection/queue`（2026-10-07 自本域迁入 `prod::inspection`：
+//!      3-JOIN 窄投影，**不投影** `next_process_*`，故本条已无「派生 vs 直读」之争；
+//!      登记保留在此是因为本清单要覆盖**全仓**读点，而本条已是他域 SQL）
 //!   2. `prod/batch/service/repair.rs::list_batches_matching`
 //!      —— `GET /prod/batches/repair`（DELIVERED）+ `GET /prod/batches/repairing`
 //!      （`is_repairing = true`）。
@@ -79,7 +80,7 @@
 //! 5 条池 SQL 全部硬限定 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'`
 //! —— 这是「出池必须置 NULL」这条不变式的兜底，也是为什么残留脏值不会污染候选池。
 
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 
 /// `t_part_batch` 行（Phase P1 投影；2026-09-16 PR-3 适配 step 化；
 /// 2026-09-30 加 `current_process_id`）
@@ -194,36 +195,4 @@ pub struct PartBatchScanRow {
     pub status: String,
     pub holder_name: Option<String>,
     pub version: i32,
-}
-
-// ===== Inspection Queue =====
-
-/// `GET /prod/batches/inspection` 单行中间结构（repo ↔ service 边界类型）。
-///
-/// 2026-10-03 VO 收口新增：待品检页只渲染 7 个数据列（序列号 / 图号 / 名称 /
-/// 批次 / 数量 / 系统交期 / 客户）。同批删掉原 28 字段宽投影
-/// `InspectionBatchListRow` —— 待品检端点是它在 prod 域的最后调用方；返修两条
-/// 端点（`/repair` / `/repairing`）在 service 层直接构造
-/// `vo::InspectionBatchListItemOut`，不经 repo 行结构。
-///
-/// 字段与 `vo::InspectionQueueItemOut` 逐字同形（13 个）：SQL 侧列别名直接取
-/// 语义名（`pb.id AS batch_id` 等），repo 层 1:1 搬运，service 只做形状转换。
-/// `l1_customer_name` 的派生在 repo 层完成（原料列 `c.parent_id` / `pc.name`）。
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct InspectionQueueRow {
-    pub batch_id: i64,
-    pub part_id: i64,
-    pub batch_no: i32,
-    pub quantity: i32,
-    /// OCC 锚 `t_part_batch.version`（不是 `t_part.version`）。
-    pub version: i32,
-    pub serial_no: Option<String>,
-    pub drawing_no: String,
-    pub name: String,
-    /// 系统交期（2026-10-03 新增投影；页面已不显示计划交期，日期筛选改筛本列）。
-    pub system_delivery_date: Option<NaiveDate>,
-    pub is_urgent: bool,
-    pub customer_id: i64,
-    pub customer_name: Option<String>,
-    pub l1_customer_name: Option<String>,
 }

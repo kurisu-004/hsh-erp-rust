@@ -3,28 +3,41 @@
 //! 2026-10-05 新增：与 `prod::batch` / `prod::programming` 同形 VO 模块，仅
 //! `Serialize` 不 `Deserialize`（禁止出现在 axum extractor 反序列化侧）。
 //!
+//! 2026-10-07 新增：待品检队列读出参（`InspectionQueueItemOut` /
+//! `InspectionQueueListOut`）自 `prod::batch::vo` 迁入，**字段集与序列化形态逐字
+//! 未变**（前端 Zod schema 依赖 `items[*]` 恰好 13 个 key、`total` / `limit` /
+//! `offset` 是 JSON string 这三点）。
+//!
 //! i64 一律走 `serialize_i64` → JSON string（雪花 ID > 2^53，JS `Number` 会丢
 //! 精度，参见 `shared::types` 模块 doc）。
 //!
-//! ## 结构形状：一棵三层树 + 命中来源标记
-//! ```text
-//! ScanTreeOut
-//! ├─ hit_kind / scanned_serial_no   命中来源与原始扫码串
-//! ├─ assembly: Option<ScanAssemblyOut>   装配件节点（**没有批次**）
-//! └─ children: Vec<ScanPartOut>          顶层零件节点
-//!    └─ children: Vec<ScanBatchOut>       该零件的全部批次
-//! ```
-//! `children` 恒为**非空语义**的数组（装配件无活跃子件时会是空数组，前端直接
-//! 渲染「该装配件没有子件」），不返回 `null` —— 减少前端一层 `?? []` 判空。
+//! ## 两组出参
+//! - 扫码树（`GET /scan/{serial_no}`）：`ScanTreeOut` / `ScanAssemblyOut` /
+//!   `ScanPartOut` / `ScanBatchOut`，形状是一棵三层树 + 命中来源标记：
+//!   ```text
+//!   ScanTreeOut
+//!   ├─ hit_kind / scanned_serial_no   命中来源与原始扫码串
+//!   ├─ assembly: Option<ScanAssemblyOut>   装配件节点（**没有批次**）
+//!   └─ children: Vec<ScanPartOut>          顶层零件节点
+//!      └─ children: Vec<ScanBatchOut>       该零件的全部批次
+//!   ```
+//!   `children` 恒为**非空语义**的数组（装配件无活跃子件时会是空数组，前端直接
+//!   渲染「该装配件没有子件」），不返回 `null` —— 减少前端一层 `?? []` 判空。
+//!   字段集刻意收窄：不投 `applicant_name` / `note` / 价格三列 /
+//!   `process_chain_id` / `next_process_id` / 送货单号 —— 扫码树只回答「这是谁的件、
+//!   现在在什么状态、每个批次能点什么动作」。
+//! - 队列（`GET /queue`）：`InspectionQueueListOut` / `InspectionQueueItemOut`
+//!   （扁平分页列表，见下方各自 doc）。
 //!
-//! ## 字段集刻意收窄
-//! 不投 `applicant_name` / `note` / 价格三列 / `process_chain_id` /
-//! `next_process_id` / 送货单号：扫码树只回答「这是谁的件、现在在什么状态、
-//! 每个批次能点什么动作」，多余字段会让前端多一层类型适配。
+//! **本文件按层平铺而非 `vo/` 子目录**：本域 VO 是纯类型容器（无逻辑、无互调），
+//! 两组共 7 个结构体，按 `prod::process_design` / `prod::shelf_process` 等平级单文件
+//! 域的形态留在 `vo.rs`；真正需要「按职责拆文件 + 精确 re-export」的是会自己长出
+//! 逻辑的 VO 子目录（`prod::dashboard` / `prod::programming`）。
 
 use chrono::NaiveDate;
 use serde::Serialize;
 
+use crate::modules::prod::inspection::model::InspectionQueueRow;
 use crate::shared::types::serialize_i64;
 
 /// `GET /api/v2/prod/inspection/scan/{serial_no}` 顶层响应（扫码树）。
@@ -128,4 +141,79 @@ pub struct ScanBatchOut {
     /// 比对 `batch.part_id == 命中 part.id` 得出。装配件树里**只有**被扫中的那个
     /// 子件的批次为 `true`；扫装配件条码时无命中零件，故全为 `false`。
     pub is_scanned: bool,
+}
+
+// ===== 待品检队列（`GET /queue`） =====
+
+/// `GET /api/v2/prod/inspection/queue` 出参项。
+///
+/// 2026-10-07 自 `prod::batch::vo` 迁入（域迁移，字段逐字未改）。本 VO 只服务
+/// 待品检队列页，字段严格对齐前端 7 个数据列
+/// （序列号 / 图号 / 名称 / 批次 / 数量 / 系统交期 / 客户）+ 操作列所需的
+/// 锚点（`batch_id` / `version` / `part_id` / `is_urgent` / `customer_id`）。
+/// 返修两条端点（`GET /api/v2/prod/batches/repair` / `repairing`）继续用
+/// `prod::batch::vo::InspectionBatchListItemOut`（28 字段，本 VO 不共用）——
+/// 共用会让那 15 个字段在待品检页成为无用负载。
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionQueueItemOut {
+    /// 三个写端点的路径参数 + 扫码选择行标识。
+    #[serde(serialize_with = "serialize_i64")]
+    pub batch_id: i64,
+    /// 批次列。
+    pub batch_no: i32,
+    /// 数量列 + 部分通过弹窗上限（`POST /prod/batches/{batch_id}/to-ship` 的
+    /// `quantity` 不得超过本值）。
+    pub quantity: i32,
+    /// OCC 锚 `t_part_batch.version`（**不是** `t_part.version`）。
+    pub version: i32,
+    /// 详情页 `/parts/{part_id}`。
+    #[serde(serialize_with = "serialize_i64")]
+    pub part_id: i64,
+    /// 序列号列（`t_part.serial_no` 可空：手工工单可没序列号）。
+    pub serial_no: Option<String>,
+    /// 图号列。
+    pub drawing_no: String,
+    /// 名称列。
+    pub name: String,
+    /// 系统交期列。可空 → JSON `null`。
+    pub system_delivery_date: Option<NaiveDate>,
+    /// 加急红底。
+    pub is_urgent: bool,
+    /// 客户表头筛选的入参回显（caller 选中 L1 / L2 都用它）。
+    #[serde(serialize_with = "serialize_i64")]
+    pub customer_id: i64,
+    pub customer_name: Option<String>,
+    pub l1_customer_name: Option<String>,
+}
+
+impl From<InspectionQueueRow> for InspectionQueueItemOut {
+    fn from(r: InspectionQueueRow) -> Self {
+        Self {
+            batch_id: r.batch_id,
+            batch_no: r.batch_no,
+            quantity: r.quantity,
+            version: r.version,
+            part_id: r.part_id,
+            serial_no: r.serial_no,
+            drawing_no: r.drawing_no,
+            name: r.name,
+            system_delivery_date: r.system_delivery_date,
+            is_urgent: r.is_urgent,
+            customer_id: r.customer_id,
+            customer_name: r.customer_name,
+            l1_customer_name: r.l1_customer_name,
+        }
+    }
+}
+
+/// `GET /api/v2/prod/inspection/queue` 出参（分页）。
+#[derive(Debug, Clone, Serialize)]
+pub struct InspectionQueueListOut {
+    pub items: Vec<InspectionQueueItemOut>,
+    #[serde(serialize_with = "serialize_i64")]
+    pub total: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub limit: i64,
+    #[serde(serialize_with = "serialize_i64")]
+    pub offset: i64,
 }

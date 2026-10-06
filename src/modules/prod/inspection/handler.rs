@@ -2,8 +2,12 @@
 //!
 //! 2026-10-05 新增：单只读端点。
 //!
+//! 2026-10-07 新增：待品检队列读端点（随路由由 `GET /api/v2/prod/batches/inspection`
+//! 迁到本域 `GET /api/v2/prod/inspection/queue`）。
+//!
 //! ## 端点
 //! - `GET /api/v2/prod/inspection/scan/{serial_no}` —— Manager + Inspector
+//! - `GET /api/v2/prod/inspection/queue` —— Manager + Inspector
 //!
 //! ## 事务边界
 //! 读端点：`pool.acquire()` 不开事务，**不发** WS 广播（纯查询，无业务流转）。
@@ -33,15 +37,16 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 
 use crate::auth::rbac::CurrentUser;
 use crate::shared::error::AppError;
 use crate::shared::response::R;
 use crate::state::AppState;
 
-use super::service::InspectionScanService;
-use super::vo::ScanTreeOut;
+use super::dto::InspectionQueueQuery;
+use super::service::{InspectionQueueService, InspectionScanService};
+use super::vo::{InspectionQueueListOut, ScanTreeOut};
 
 /// `GET /api/v2/prod/inspection/scan/{serial_no}`
 ///
@@ -58,5 +63,23 @@ pub async fn scan(
 ) -> Result<Json<R<ScanTreeOut>>, AppError> {
     let mut conn = state.pool.acquire().await?;
     let out = InspectionScanService::scan(&mut conn, &current, &serial_no).await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// `GET /api/v2/prod/inspection/queue`
+///
+/// 待品检队列列表（Manager + Inspector）。只读端点：`pool.acquire()` 不开事务。
+///
+/// 2026-10-07 自 `GET /api/v2/prod/batches/inspection` 迁入本域：出参切到
+/// `InspectionQueueListOut`（13 字段），查询参数是 `InspectionQueueQuery`
+/// （表头 7 列各一个筛选 + 服务端排序），与 `/repair` / `/repairing` 的宽 VO 彻底
+/// 分家。旧路径**无 alias、已下线**（见模块 doc 的「破坏性路由变更」一节）。
+pub async fn queue(
+    State(state): State<Arc<AppState>>,
+    current: CurrentUser,
+    Query(query): Query<InspectionQueueQuery>,
+) -> Result<Json<R<InspectionQueueListOut>>, AppError> {
+    let mut conn = state.pool.acquire().await?;
+    let out = InspectionQueueService::list_queue(&mut conn, &query, &current).await?;
     Ok(Json(R::ok(out)))
 }

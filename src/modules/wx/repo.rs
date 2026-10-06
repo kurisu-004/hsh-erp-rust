@@ -122,7 +122,7 @@ impl PartList {
     ///   校验），传 `REPAIRING` 只会得到空列表而非报错。
     /// - 排序：`is_urgent DESC, planned_delivery_date ASC, id ASC`（紧急 + 交期近
     ///   优先）。注意这是**服务端硬编码**的「紧急件优先」，与 Web 端
-    ///   `GET /prod/batches/inspection` 的表头点列排序（`is_urgent` 不参与排序，
+    ///   `GET /prod/inspection/queue` 的表头点列排序（`is_urgent` 不参与排序，
     ///   由前端自行标红）口径不同。
     /// - JOIN：`t_customer`（取客户名）+ 层级 LEFT JOIN `t_part_batch` / `t_shelf` /
     ///   `t_worker` / `t_outsource_company` 解析当前 holder 标签。

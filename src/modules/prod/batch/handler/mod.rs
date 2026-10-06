@@ -1,11 +1,11 @@
-//! `prod::batch` HTTP handler 汇总 + 25 条批次路由的注册表。
+//! `prod::batch` HTTP handler 汇总 + 24 条批次路由的注册表。
 //!
 //! ## 子文件
 //! - `dispatch.rs` —— 「待下发批次下发给车间」：`pending` / `dispatch` /
 //!   `auto-dispatch`（2026-10-06 订正：源状态白名单 `PENDING` / `PROGRAMMING`）
 //! - `transition.rs` —— to-XXX 流（`to-ship` / `to-inspection` / `to-process`）+ 批量
 //!   流转 + 扫码快捷入口（`scan-inspect` / `scan/deliver` / `worker-scan`）+ 集合读
-//!   （`inspection` / `repair` / `repairing`）
+//!   （`repair` / `repairing`）
 //! - `lifecycle.rs` —— 终态 + 状态机扩展（`deliver` / `complete` / `start-repair` /
 //!   `place-on-shelf` / `recall-to-pending` / `release-from-programming` / outsource 三端点
 //!   / `complete-repair` / `repair-dispatch` / `split` / `cancel` / `pick-up`）
@@ -33,9 +33,8 @@ pub use dispatch::{auto_dispatch, dispatch, list_pending};
 
 // ----- transition.rs -----
 pub use transition::{
-    batch_to_inspection, batch_to_ship, list_inspection_batches, list_repair_batches,
-    list_repairing_batches, scan_deliver_part, scan_inspect, to_inspection, to_process, to_ship,
-    worker_scan,
+    batch_to_inspection, batch_to_ship, list_repair_batches, list_repairing_batches,
+    scan_deliver_part, scan_inspect, to_inspection, to_process, to_ship, worker_scan,
 };
 
 // ----- lifecycle.rs -----
@@ -49,7 +48,7 @@ pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         // ====================================================================
         // ① 1 段静态段（无 Path）—— 与 §2.2 的 3 条批量 / 事件端点、
-        //    §2.3 的 3 条集合读、以及本域原有的 pending / dispatch / auto-dispatch
+        //    §2.3 的 2 条集合读、以及本域原有的 pending / dispatch / auto-dispatch
         //    同段数。**静态段必须先于 `/{batch_id}/...` 注册**（axum matchit 对
         //    同优先级按注册序；本组与 2 段动态组段数不同，天然无冲突）。
         // ====================================================================
@@ -64,8 +63,9 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/to-inspection", post(transition::batch_to_inspection))
         // ---- 工人扫码台主入口（无 Path extractor，主键 serial_no）----
         .route("/worker-scan", post(transition::worker_scan))
-        // ---- 集合读 3 条（只读端点，pool.acquire() 不开事务）----
-        .route("/inspection", get(transition::list_inspection_batches))
+        // ---- 集合读 2 条（只读端点，pool.acquire() 不开事务）----
+        // 待品检队列读 `/inspection` 已于 2026-10-07 迁往 `prod::inspection`
+        // （新路径 `GET /api/v2/prod/inspection/queue`，**无 alias**）
         .route("/repair", get(transition::list_repair_batches))
         .route("/repairing", get(transition::list_repairing_batches))
         // ====================================================================
@@ -80,7 +80,7 @@ pub fn router() -> Router<Arc<AppState>> {
         // 不被 `/{batch_id}` 吞掉）。切勿把 `/scan/deliver` 移到本组之后。
         //
         // ⚠️ 本组**不注册** `GET /{batch_id}`：它与 §③ 的 1 段静态集合读同形状
-        // （`GET /prod/batches/inspection`），加了会让「单批次详情」与「集合读」
+        // （`GET /prod/batches/repair`），加了会让「单批次详情」与「集合读」
         // 在 matchit 里争同一段位。批次详情请走 part 域
         // `GET /api/v2/parts/{part_id}/batches`。
         // ====================================================================

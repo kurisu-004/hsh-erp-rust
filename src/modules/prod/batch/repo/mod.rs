@@ -8,9 +8,8 @@
 //!
 //! ## 两个 ZST 的分工（命名相近，注意区分）
 //! - `PartBatchRepo` —— `t_part_batch` 的**通用** SQL 真源，全仓读写批次表的
-//!   默认入口：18 个通用方法（`queries.rs`）+ 19 个流转写点（`sql.rs`）+
-//!   2 个集合读（`list.rs`：3-JOIN 窄投影 + 表头筛选/排序）。跨域调用方
-//!   一律走它。
+//!   默认入口：18 个通用方法（`queries.rs`）+ 19 个流转写点（`sql.rs`）。
+//!   跨域调用方一律走它。
 //! - `BatchRepo`（本文件）—— **只服务「PENDING 批次下发给车间」一条流**的专用
 //!   查询（7 个方法），唯一调用方是 `service::dispatch.rs`。
 //!   两者都是无状态 ZST + 固有静态方法，职责不重叠。
@@ -22,12 +21,14 @@
 //! - `sql.rs` —— inspection / lifecycle 流转的 19 个定位 + 写点
 //!   （`find_*` / `mark_*` / `split_batch_for_partial_pass` /
 //!   `cancel_all_active_batches_for_part` / `force_complete_all_batches_for_part`）
-//! - `list.rs` —— 集合读 2 条：`list_inspection_queue` / `count_inspection_queue`
-//!   （3-JOIN 窄投影 + 表头筛选/排序，服务 `GET /prod/batches/inspection`；
-//!   list 与 count 共用同一个 WHERE 拼装器，判据只此一份）
 //! - `trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
 //! - `mod.rs`（本文件）—— ZST `BatchRepo`：本域「PENDING 批次下发给车间」
 //!   专用查询（pending 列表 / auto-dispatch 预览 / 首道 step / 兜底反查 part_id）
+//!
+//! 2026-10-07：待品检队列读（`GET /api/v2/prod/inspection/queue`）自本目录
+//! `list.rs` 迁入 `prod::inspection`（该域是该页面的唯一数据源所在域，且迁后保持
+//! 零跨域依赖）—— 本域不再持有任何**集合读** SQL；`/repair` / `/repairing` 两条
+//! 集合读在 service 层直接构造 VO、不查 repo。
 //!
 //! ## 2026-10-02 去重
 //! 本文件原 `BatchRepo::find_batch_by_id`（`WHERE id = $1 AND ($2 OR deleted_at IS NULL)`）
@@ -65,7 +66,6 @@
 //! ## 错误类型
 //! repo 静态方法 → `sqlx::Error`（与项目惯例一致），由 service 层映射 `AppError`。
 
-pub mod list;
 pub mod queries;
 pub mod sql;
 pub mod r#trait;

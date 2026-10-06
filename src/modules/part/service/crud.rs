@@ -5,9 +5,9 @@
 //! `prepare_binding_head_copy`）已迁出到 `service/batch.rs`，避免单文件超 1000 行。
 //!
 //! ## 范围（本文件）
-//! - `create_part` / `list_parts` / `list_inspection_batches` / `get_part` /
-//!   `get_part_by_serial` / `get_part_batches_by_serial` / `update_part` /
-//!   `soft_delete_part` / `upload_part_file` / `upload_drawing` / `upload_3d_model`
+//! - `create_part` / `list_parts` / `get_part` / `get_part_by_serial` /
+//!   `get_part_batches_by_serial` / `update_part` / `soft_delete_part` /
+//!   `upload_part_file` / `upload_drawing` / `upload_3d_model`
 //! - `batch_create_parts` —— 薄包装，转 `service/batch.rs::batch_create_parts_legacy`
 //!
 //! ## helpers（pub(super)，供 batch.rs 复用）

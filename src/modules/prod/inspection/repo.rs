@@ -6,6 +6,13 @@
 //! 无 mock 替身需求（范式同 `prod::programming::ProgrammingRepo`，见
 //! `docs/repo-naming.md` §3.1）。
 //!
+//! 2026-10-07 新增：待品检队列读（`GET /api/v2/prod/inspection/queue`）自
+//! `prod::batch::repo::list` 迁入本文件，与扫码读共用本文件，构成**两个 ZST**
+//! （`InspectionScanRepo` / `InspectionQueueRepo`）——职责不重叠、都是无状态 ZST +
+//! 固有静态方法，形制同 `prod::batch::repo` 的 `PartBatchRepo` + `BatchRepo`。
+//! 两者 SQL 形态也不同：扫码读走 `query_as!` 字面量宏（编译期校验），队列读走
+//! `QueryBuilder`（动态 `ORDER BY` + 可选过滤，宏无法固化，**不进 `.sqlx`**）。
+//!
 //! ## 5 个方法 / 单次请求的 SQL 条数
 //! 一次扫码请求按分支取 2~4 条 SQL，**无 N+1**（子件再多也只有一条批次查询，
 //! 走 `part_id = ANY($1)` 一次捞回全部子件的批次）：
@@ -103,10 +110,42 @@
 //!
 //! ## 错误类型
 //! repo 静态方法 → `sqlx::Error`（与项目惯例一致），由 service 层映射 `AppError`。
+//!
+//! ## 队列读（`GET /queue`）的 WHERE 五段
+//! 判据只此一份（私有 [`push_inspection_queue_where`]，list 与 count 共用，天然
+//! 杜绝「count 与 items 各说各话」的分页 bug），逐段为：
+//!
+//! 1. 状态 + 双软删闸门：`pb.status = 'INSPECTION' AND pb.deleted_at IS NULL
+//!    AND p.deleted_at IS NULL`（本端点不接 statuses 参数）
+//! 2. 客户：空数组 → 命中全部；非空 → `p.customer_id = ANY(展开后的 L1+L2 ids)`
+//! 3. 表头 3 个文本列各一个独立 ILIKE（`$n::text IS NULL` 短路 → 不过滤）
+//! 4. 系统交期区间（两个可空边界，缺界不参与过滤）
+//! 5. list 额外的 `ORDER BY {order_col} {order_dir} NULLS LAST, pb.id ASC LIMIT /
+//!    OFFSET`（count 无此段）
+//!
+//! ⚠️ `ORDER BY` 的 `{order_col}` / `{order_dir}` 是**拼进 SQL 文本**的两个字符串，
+//! 它们由 service 层的 `resolve_order_col` / `resolve_order_dir` 白名单映射产出，
+//! repo 收不到任何外部输入（白名单映射放 service 比放 repo 更安全）。
+//!
+//! ⚠️ 排序必须带 `NULLS LAST`：`p.system_delivery_date` 可空，而 PG 默认
+//! ASC → `NULLS LAST` / DESC → `NULLS FIRST`，不显式指定时按交期倒序会把未填交期的
+//! 行顶到最前。`pb.id ASC` 是兜底键（排序列可重复，无兜底键时翻页会漏行 / 重复行），
+//! 覆盖用例：`tests/part/inspection_batches.rs::inspection_batches_pagination_tiebreak_by_batch_id_is_stable`。
+//!
+//! ### `l1_customer_name` 的派生口径（两处并存，勿统一）
+//! 本查询的口径：`c.parent_id IS NOT NULL` → `pc.name.or(c.name)`（pc 的 LEFT JOIN
+//! 不带 `deleted_at` 过滤，父行在即取父名，父行悬空才回落 `c.name`）；否则
+//! （自身即 L1）→ `c.name`。
+//! ⚠️ 与 `prod::batch::service::repair::list_batches_matching` 的同名派生**口径不同**
+//! （那条不回落 `c.name`：客户自身即 L1、或父客户被软删时为 null）。两处都是有意
+//! 分叉，改任一侧都要同步另一侧的注释。
 
-use sqlx::PgConnection;
+use chrono::NaiveDate;
+use sqlx::{PgConnection, PgExecutor, Postgres, QueryBuilder};
 
-use crate::modules::prod::inspection::model::{ScanAssemblyRow, ScanBatchRow, ScanPartRow};
+use crate::modules::prod::inspection::model::{
+    InspectionQueueRow, ScanAssemblyRow, ScanBatchRow, ScanPartRow,
+};
 
 /// `prod::inspection` ZST 静态方法容器。
 pub struct InspectionScanRepo;
@@ -294,5 +333,218 @@ impl InspectionScanRepo {
         )
         .fetch_all(&mut *conn)
         .await
+    }
+}
+
+// ===========================================================================
+//  待品检队列（`GET /api/v2/prod/inspection/queue`）
+//  2026-10-07 自 `prod::batch::repo::list` 迁入，SQL 与派生口径逐字未改
+// ===========================================================================
+
+/// 待品检队列列表入参。
+///
+/// 排序项收的是**已白名单化的列名 / 方向**（`p.system_delivery_date` / `ASC`
+/// 这类字面量），白名单映射在 service 层完成 —— repo 收不到任何外部输入，
+/// 故拼进 SQL 文本的只有这两个受控字符串。
+///
+/// 刻意**不**派生 `Default`：`Default` 会造出 `order_col = ""` / `order_dir = ""`，
+/// 一旦被 `..Default::default()` 用上就生成 `ORDER BY  NULLS LAST` → 运行期 SQL
+/// 语法错 500。调用方必须逐字段显式填（service 层的 `resolve_order_col` /
+/// `resolve_order_dir` 兜底）。
+#[derive(Debug, Clone)]
+pub struct InspectionQueueFilters<'a> {
+    /// 已 `expand_customer_id` 展开的 L1+L2 ids；空切片 → 不按客户过滤。
+    pub customer_ids: &'a [i64],
+    /// 图号 ILIKE pattern（service 已拼 `%...%` 并拒通配符）；`None` → 不过滤。
+    pub drawing_no_pat: Option<&'a str>,
+    /// 名称 ILIKE pattern；`None` → 不过滤。
+    pub name_pat: Option<&'a str>,
+    /// 序列号 ILIKE pattern；`None` → 不过滤。
+    pub serial_no_pat: Option<&'a str>,
+    /// 系统交期下界（含）；`None` → 不过滤。
+    pub date_from: Option<NaiveDate>,
+    /// 系统交期上界（含）；`None` → 不过滤。
+    pub date_to: Option<NaiveDate>,
+    /// 排序列（service 白名单映射后的列名字面量）。
+    pub order_col: &'a str,
+    /// 排序方向：`"ASC"` / `"DESC"`。
+    pub order_dir: &'a str,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// `GET /api/v2/prod/inspection/queue` 窄投影 SELECT（13 个输出列 + 派生 L1 名的 2 列原料）。
+///
+/// 只 JOIN 3 张表：`t_part`（工单）/ `t_customer`（客户）/ `t_customer` 自连（L1）。
+/// **不** JOIN `t_shelf` / `t_worker` / `t_outsource_company` / `t_process_chain_step`
+/// / `t_process` / `t_delivery_note` —— 待品检页不渲染 holder / 工序 / 送货单。
+///
+/// 列别名直接取语义名（`pb.id AS batch_id` …），行结构侧 `FromRow` 同名承接。
+const INSPECTION_QUEUE_SELECT: &str = "SELECT \
+     pb.id AS batch_id, \
+     pb.part_id AS part_id, \
+     pb.batch_no AS batch_no, \
+     pb.quantity AS quantity, \
+     pb.version AS version, \
+     p.serial_no AS serial_no, \
+     p.drawing_no AS drawing_no, \
+     p.name AS name, \
+     p.system_delivery_date AS system_delivery_date, \
+     p.is_urgent AS is_urgent, \
+     p.customer_id AS customer_id, \
+     c.name AS customer_name, \
+     c.parent_id AS customer_parent_id, \
+     pc.name AS parent_customer_name \
+     FROM t_part_batch pb \
+     JOIN t_part p ON p.id = pb.part_id \
+     JOIN t_customer c ON c.id = p.customer_id \
+     LEFT JOIN t_customer pc ON pc.id = c.parent_id";
+
+/// COUNT 版本的 FROM 子句（与 [`INSPECTION_QUEUE_SELECT`] 同 JOIN，`SELECT COUNT(*)`）。
+const INSPECTION_QUEUE_COUNT_FROM: &str = "SELECT COUNT(*)::bigint AS n \
+     FROM t_part_batch pb \
+     JOIN t_part p ON p.id = pb.part_id \
+     JOIN t_customer c ON c.id = p.customer_id \
+     LEFT JOIN t_customer pc ON pc.id = c.parent_id";
+
+/// list / count 共用的 WHERE 拼装器 —— 判据只此一份，天然杜绝「count 与 items
+/// 各说各话」的分页 bug。
+fn push_inspection_queue_where(qb: &mut QueryBuilder<Postgres>, f: &InspectionQueueFilters<'_>) {
+    // 判据固定为 INSPECTION（本端点不接 statuses 参数）。
+    qb.push(
+        " WHERE pb.status = 'INSPECTION' \
+              AND pb.deleted_at IS NULL \
+              AND p.deleted_at IS NULL",
+    );
+    // customer_id 可选过滤：空数组 → 命中全部客户；非空 → 限定到展开后的 L1+L2 ids。
+    // 同一数组绑两次（cardinality 判空 + ANY 匹配），`&[i64]` 可直接重复 push_bind，
+    // 无需拷贝 —— `f` 的生命周期覆盖整个调用，两个 bind 借的是同一个不可变切片。
+    qb.push(" AND (cardinality(")
+        .push_bind(f.customer_ids)
+        .push("::bigint[]) = 0 OR p.customer_id = ANY(")
+        .push_bind(f.customer_ids)
+        .push("))");
+    // 表头 3 个文本列各一个独立 ILIKE（`$n::text IS NULL` 短路 → 不过滤）。
+    for (col, pat) in [
+        ("p.drawing_no", f.drawing_no_pat),
+        ("p.name", f.name_pat),
+        ("p.serial_no", f.serial_no_pat),
+    ] {
+        qb.push(" AND (")
+            .push_bind(pat)
+            .push("::text IS NULL OR ")
+            .push(col)
+            .push(" ILIKE ")
+            .push_bind(pat)
+            .push(")");
+    }
+    // 系统交期区间（可空列，缺界不参与过滤）。
+    qb.push(" AND (")
+        .push_bind(f.date_from)
+        .push("::date IS NULL OR p.system_delivery_date >= ")
+        .push_bind(f.date_from);
+    qb.push(") AND (")
+        .push_bind(f.date_to)
+        .push("::date IS NULL OR p.system_delivery_date <= ")
+        .push_bind(f.date_to)
+        .push(")");
+}
+
+/// [`list_inspection_queue`](InspectionQueueRepo::list_inspection_queue) 的
+/// `FromRow` 行结构（13 输出列 + `l1_customer_name` 的 2 列原料）。
+///
+/// 手动 `#[derive(FromRow)]` 而非 `query_as!` —— SQL 由 `QueryBuilder` 动态拼装。
+/// 多出的 `customer_parent_id` / `parent_customer_name` 是 `l1_customer_name` 的派生
+/// 原料，不进 VO。
+#[derive(sqlx::FromRow)]
+struct InspectionQueueRawRow {
+    batch_id: i64,
+    part_id: i64,
+    batch_no: i32,
+    quantity: i32,
+    version: i32,
+    serial_no: Option<String>,
+    drawing_no: String,
+    name: String,
+    system_delivery_date: Option<NaiveDate>,
+    is_urgent: bool,
+    customer_id: i64,
+    customer_name: Option<String>,
+    customer_parent_id: Option<i64>,
+    parent_customer_name: Option<String>,
+}
+
+/// 待品检队列读的 SQL 真源（ZST，与 [`InspectionScanRepo`] 同形、无状态）。
+///
+/// 2026-10-07 自 `prod::batch` 迁入；泛型 `E: PgExecutor<'e>` 形参保留（与迁前
+/// 逐字一致），生产调用方传 `&mut PgConnection`。
+pub struct InspectionQueueRepo;
+
+impl InspectionQueueRepo {
+    /// `GET /api/v2/prod/inspection/queue` 列表
+    /// （3-JOIN 窄投影 + 表头筛选 + 服务端排序）。
+    ///
+    /// 排序：`{order_col} {order_dir} NULLS LAST, pb.id ASC`
+    /// （`NULLS LAST` 与 `pb.id ASC` 的理由见本文件模块 doc 的「队列读」小节）。
+    pub async fn list_inspection_queue<'e, E: PgExecutor<'e>>(
+        executor: E,
+        f: &InspectionQueueFilters<'_>,
+    ) -> Result<Vec<InspectionQueueRow>, sqlx::Error> {
+        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(INSPECTION_QUEUE_SELECT);
+        push_inspection_queue_where(&mut qb, f);
+        qb.push(format!(
+            " ORDER BY {} {} NULLS LAST, pb.id ASC LIMIT ",
+            f.order_col, f.order_dir
+        ));
+        qb.push_bind(f.limit);
+        qb.push(" OFFSET ");
+        qb.push_bind(f.offset);
+
+        let rows: Vec<InspectionQueueRawRow> = qb.build_query_as().fetch_all(executor).await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                // l1_customer_name 派生：c.parent_id IS NOT NULL → pc.name.or(c.name)
+                // （pc 的 LEFT JOIN 不带 deleted_at 过滤，父行在即取父名，父行悬空才
+                // 回落 c.name）；否则（自身即 L1）→ c.name。与
+                // `prod::batch::service::repair::list_batches_matching` 的同名派生
+                // **口径不同**（那条不回落 c.name），两处都有登记，勿统一。
+                let l1_customer_name = if r.customer_parent_id.is_some() {
+                    r.parent_customer_name
+                        .clone()
+                        .or_else(|| r.customer_name.clone())
+                } else {
+                    r.customer_name.clone()
+                };
+                InspectionQueueRow {
+                    batch_id: r.batch_id,
+                    part_id: r.part_id,
+                    batch_no: r.batch_no,
+                    quantity: r.quantity,
+                    version: r.version,
+                    serial_no: r.serial_no,
+                    drawing_no: r.drawing_no,
+                    name: r.name,
+                    system_delivery_date: r.system_delivery_date,
+                    is_urgent: r.is_urgent,
+                    customer_id: r.customer_id,
+                    customer_name: r.customer_name,
+                    l1_customer_name,
+                }
+            })
+            .collect())
+    }
+
+    /// `GET /api/v2/prod/inspection/queue` 配套 COUNT（与 `list_inspection_queue`
+    /// 共用同一个 WHERE 拼装器，无 ORDER BY / LIMIT / OFFSET）。
+    pub async fn count_inspection_queue<'e, E: PgExecutor<'e>>(
+        executor: E,
+        f: &InspectionQueueFilters<'_>,
+    ) -> Result<i64, sqlx::Error> {
+        let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(INSPECTION_QUEUE_COUNT_FROM);
+        push_inspection_queue_where(&mut qb, f);
+        let (n,): (i64,) = qb.build_query_as().fetch_one(executor).await?;
+        Ok(n)
     }
 }
