@@ -45,6 +45,19 @@
 //! 18. `update_rejects_inspector` / `update_rejects_empty_items` —— 两个端点的权限
 //!     与入参闸门。
 //!
+//! ## review 第 1 轮新增（2026-10-06）
+//!
+//! 19. `update_invalid_date_text_fails_only_that_row` —— **MAJOR-1**：`system_delivery_date`
+//!     给非日期文本（`2026年8月1日` / `待定`，正是前端 `parseDateOrNull` 原样透传的那类值）
+//!     ⇒ 该行进 `failed[]`（40001）+ **HTTP 仍 200**，其余行照常写库。改动前该文本在
+//!     axum JsonRejection 层就 400（纯文本 body、不是信封）⇒ 整批回填全部作废；
+//! 20. `update_valid_date_with_surrounding_space_still_writes` —— MAJOR-1 的**向后兼容**
+//!     一侧：合法日期（含两端空白）照常解析落库、version +1；
+//! 21. `update_soft_deleted_part_is_not_backfilled` —— **MINOR-4**：软删的 part 不被回填
+//!     （`updated_count = 0` + 40901，且 `deleted_at` / `version` / `order_no` 均未变）；
+//! 22. `update_rejects_items_over_limit` —— **MINOR-5**：超 2000 行 ⇒ 422 + 40001，且
+//!     **不入循环**（入参里那 2001 行的目标行在 DB 上必须原封不动）。
+//!
 //! ## 基建
 //! 沿用 `crud.rs` / `create_serial_price.rs` 的写法（`test_pool` +
 //! `load_part_fixture` + `send` / `json_request` / `login_token`），不新建 helper
@@ -175,13 +188,18 @@ async fn read_order_info(
 }
 
 /// 调 `POST /parts/match-by-excel-items` 并返回 `(HTTP 状态, 信封)`。
+///
+/// `doc_no` 参数：前端 `PartBatchOrderInfoMatchRequest` 的**顶层**也带 `doc_no`
+///（采购订单号），而后端 `MatchByExcelItemsRequest` 只有 `items` —— 顶层未知字段
+/// 被 serde 默认忽略是契约的一部分，故本 helper 把它一起发出去，让每个 match
+/// 用例都覆盖这条（而不是只在专用用例里发一次）。
 async fn call_match(app: axum::Router, token: &str, items: Value) -> (StatusCode, Value) {
     send(
         app,
         json_request(
             "POST",
             "/parts/match-by-excel-items",
-            Some(json!({ "items": items })),
+            Some(json!({ "doc_no": "PO-2026-0001", "items": items })),
             Some(token),
         ),
     )
@@ -685,12 +703,16 @@ async fn match_rejects_items_over_limit() {
     assert_eq!(env["code"], code::VALIDATION_ERROR, "{env}");
 }
 
-/// 场景 10：前端仍在发 `doc_no` / `delivery_date` / `unit_price` / `quantity`，
-/// 后端不声明它们 ⇒ 必须照常 200。
+/// 场景 10：前端仍在发**顶层** `doc_no` + **item 级** `delivery_date` /
+/// `unit_price` / `quantity`，后端都不声明 ⇒ 必须照常 200。
 ///
 /// `delivery_date` 是**非日期文本**（前端 `parseDateOrNull` 对无法识别的日期原样
 /// 透传）。这条用例锁住「后端不许把它声明成 `Option<NaiveDate>`」——一改就会让
 /// 这类请求整个 400。
+///
+/// 2026-10-06 review 第 1 轮 MINOR-6：顶层 `doc_no` 由 `call_match` helper 统一
+/// 带上（前端 `PartBatchOrderInfoMatchRequest` 的顶层确实有这个字段，而后端
+/// `MatchByExcelItemsRequest` 只有 `items`），此前注释声称覆盖但实际没发。
 #[tokio::test]
 async fn match_ignores_unknown_item_fields() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -718,7 +740,11 @@ async fn match_ignores_unknown_item_fields() {
         }]),
     )
     .await;
-    assert_eq!(s, StatusCode::OK, "未知字段应被 serde 忽略: {env}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "顶层 doc_no + item 级未知字段都应被忽略: {env}"
+    );
     assert_eq!(
         part_at(&env["data"], 0, 0)["part_id"].as_str(),
         Some(pid.to_string().as_str())
@@ -1120,4 +1146,222 @@ async fn update_rejects_empty_items() {
         "空 items 应 422: {env}"
     );
     assert_eq!(env["code"], code::VALIDATION_ERROR, "{env}");
+}
+
+// ===========================================================================
+//  19. review 第 1 轮：写端点的非法日期文本降级为「该行进 failed」
+// ===========================================================================
+
+/// review 第 1 轮 MAJOR-1：`system_delivery_date` 给**非日期文本** ⇒ 该行进
+/// `failed[]`（40001）+ **HTTP 仍 200**，其余行照常写库。
+///
+/// 改动前 DTO 是 `Option<Option<NaiveDate>>`，这类文本在 **axum JsonRejection** 层
+/// 就 400 且 body 是**纯文本、不是 `R` 信封** ⇒ 用户已勾选的整批回填全部作废、
+/// 前端连错误码都读不到。真实来源：前端 `parseDateOrNull`
+/// （`purchaseOrderExcelParser.ts:116` 对 dayjs 认不出的文本 `return text` 原样透传）
+/// + `el-date-picker` 不洗 model 值（`use-common-picker.mjs:25-40`）。
+#[tokio::test]
+async fn update_invalid_date_text_fails_only_that_row() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let ok1 = insert_part(&pool, fx.customer_l2_id, "PO-DT1", "好一", None, None, None).await;
+    let bad = insert_part(&pool, fx.customer_l2_id, "PO-DT2", "坏一", None, None, None).await;
+    let bad2 = insert_part(&pool, fx.customer_l2_id, "PO-DT3", "坏二", None, None, None).await;
+    let ok2 = insert_part(&pool, fx.customer_l2_id, "PO-DT4", "好二", None, None, None).await;
+
+    let (s, env) = call_update(
+        app,
+        &token,
+        json!([
+            { "part_id": ok1.to_string(), "version": 0, "order_no": "OK-1",
+              "system_delivery_date": "2026-10-15" },
+            { "part_id": bad.to_string(), "version": 0, "order_no": "BAD-1",
+              "system_delivery_date": "2026年8月1日" },
+            { "part_id": bad2.to_string(), "version": 0, "order_no": "BAD-2",
+              "system_delivery_date": "待定" },
+            { "part_id": ok2.to_string(), "version": 0, "order_no": "OK-2" }
+        ]),
+    )
+    .await;
+    // 关键：整个请求不再 400（改动前这里是 JsonRejection 的纯文本 400）
+    assert_eq!(s, StatusCode::OK, "非法日期不得打掉整请求: {env}");
+    assert_eq!(env["code"], 0, "{env}");
+    assert_eq!(
+        env["data"]["updated_count"], 2,
+        "合法日期 + 缺省两行写成功: {env}"
+    );
+    let failed = env["data"]["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 2, "两条非法日期各进 failed: {env}");
+    assert_eq!(
+        failed[0]["code"],
+        code::VALIDATION_ERROR,
+        "应报 40001: {env}"
+    );
+    assert_eq!(
+        failed[1]["code"],
+        code::VALIDATION_ERROR,
+        "应报 40001: {env}"
+    );
+    assert_eq!(
+        failed[0]["part_id"].as_str(),
+        Some(bad.to_string().as_str())
+    );
+    assert_eq!(
+        failed[1]["part_id"].as_str(),
+        Some(bad2.to_string().as_str())
+    );
+    let msg = failed[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("系统交期") && msg.contains("2026年8月1日"),
+        "message 应说明是系统交期问题并回显原值，实际 {msg:?}"
+    );
+    assert_failure_message_clean(&failed[0], "非法日期行");
+
+    // 坏行不得被写（连 order_no 也不写：解析失败即整行跳过，不做部分写）
+    for (bad_id, order_no) in [(bad, "BAD-1"), (bad2, "BAD-2")] {
+        let (v, o, d) = read_order_info(&pool, bad_id).await;
+        assert_eq!((v, o, d), (0, None, None), "{order_no} 行不得被写: {env}");
+    }
+    // 好行照常写：合法日期落库；缺省日期那一列不动
+    let (v1, o1, d1) = read_order_info(&pool, ok1).await;
+    assert_eq!(
+        (v1, o1.as_deref(), d1),
+        (1, Some("OK-1"), Some(naive_date(2026, 10, 15)))
+    );
+    let (v2, o2, d2) = read_order_info(&pool, ok2).await;
+    assert_eq!(
+        (v2, o2.as_deref(), d2),
+        (1, Some("OK-2"), None),
+        "缺省系统交期那一行: {env}"
+    );
+}
+
+/// review 第 1 轮 MAJOR-1 的**向后兼容**一侧：合法日期文本（含两端空白）的行为与
+/// 改动前**完全一致** —— 照常解析、写库、version +1。
+///
+/// 空白是刻意加的：原 `NaiveDate` 反序列化对 `" 2026-10-15 "` 是整请求 400，
+/// 现在 trim 后照常成功（只降得更温和，不引入新的拒绝）。
+#[tokio::test]
+async fn update_valid_date_with_surrounding_space_still_writes() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let pid = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-DT-OK",
+        "合法",
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let (s, env) = call_update(
+        app,
+        &token,
+        json!([{ "part_id": pid.to_string(), "version": 0,
+                 "system_delivery_date": " 2026-10-15 " }]),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["updated_count"], 1, "{env}");
+    assert!(
+        env["data"]["failed"]
+            .as_array()
+            .is_some_and(|f| f.is_empty()),
+        "合法日期不得进 failed: {env}"
+    );
+    let (v, _, d) = read_order_info(&pool, pid).await;
+    assert_eq!(v, 1, "{env}");
+    assert_eq!(
+        d,
+        Some(naive_date(2026, 10, 15)),
+        "带空白��合法日期应照常落库: {env}"
+    );
+}
+
+// ===========================================================================
+//  20. review 第 1 轮：写路径的软删闸门 / items 上限
+// ===========================================================================
+
+/// review 第 1 轮 MINOR-4：软删的 part 不会被回填。
+///
+/// `update_order_info` 的 WHERE 带 `deleted_at IS NULL`，但此前**零测试**证明它。
+/// 契约明写「OCC / 软删 / 不存在 → 40901」，且软删闸门在所有写路径生效是安全项
+/// （软删件不该再被业务数据「复活」）。
+#[tokio::test]
+async fn update_soft_deleted_part_is_not_backfilled() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let pid = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-SOFT-W",
+        "软删件",
+        None,
+        Some("KEEP"),
+        None,
+    )
+    .await;
+    soft_delete_part(&pool, pid).await;
+    let deleted_at_before: Option<chrono::NaiveDateTime> =
+        sqlx::query_scalar("SELECT deleted_at FROM t_part WHERE id = $1")
+            .bind(pid)
+            .fetch_one(&pool)
+            .await
+            .expect("read deleted_at");
+
+    let (s, env) = call_update(
+        app,
+        &token,
+        json!([{ "part_id": pid.to_string(), "version": 1, "order_no": "SHOULD-NOT-WRITE" }]),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["updated_count"], 0, "软删件不得被回填: {env}");
+    let failed = env["data"]["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{env}");
+    assert_eq!(failed[0]["code"], code::VERSION_CONFLICT, "{env}");
+    assert_failure_message_clean(&failed[0], "软删件");
+    let (v, o, _) = read_order_info(&pool, pid).await;
+    assert_eq!(o.as_deref(), Some("KEEP"), "软删件的行不得被改: {env}");
+    assert_eq!(v, 1, "version 也不得因失败请求而变: {env}");
+    let deleted_at_after: Option<chrono::NaiveDateTime> =
+        sqlx::query_scalar("SELECT deleted_at FROM t_part WHERE id = $1")
+            .bind(pid)
+            .fetch_one(&pool)
+            .await
+            .expect("read deleted_at");
+    assert_eq!(
+        deleted_at_after, deleted_at_before,
+        "deleted_at 不得被改: {env}"
+    );
+}
+
+/// review 第 1 轮 MINOR-5：`items.len() > 2000` ⇒ HTTP 422 + 40001，且**不入循环**
+/// （一条 UPDATE 都不该发 —— 写端点每行一次往返，N 万行会把那条池化连接占死）。
+#[tokio::test]
+async fn update_rejects_items_over_limit() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let pid = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-LIMIT",
+        "限额件",
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let items: Vec<Value> = (0..=2000)
+        .map(|_| json!({ "part_id": pid.to_string(), "version": 0, "order_no": "NOPE" }))
+        .collect();
+    let (s, env) = call_update(app, &token, json!(items)).await;
+    assert_eq!(
+        s,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "超 2000 行应 422: {env}"
+    );
+    assert_eq!(env["code"], code::VALIDATION_ERROR, "{env}");
+    // 整单拒 ⇒ 入参里的 2001 行一条都不能被写（超限检查在循环之前）
+    let (v, o, _) = read_order_info(&pool, pid).await;
+    assert_eq!((v, o), (0, None), "超限时不得有任何一行写库: {env}");
 }

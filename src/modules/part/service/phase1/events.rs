@@ -413,6 +413,16 @@ impl PartService {
     ///   + `PartUpdate`（单层 `Option` 表达不了「显式清空」，改它会波及行内编辑链路）。
     /// - 响应改 `{updated_count, failed, skipped_count}`（`skip = true` 的行不写库）。
     /// - **永远 200 + 信封**，全部失败也不抛业务错误（前端依赖部分成功语义）。
+    ///
+    /// 2026-10-06 review 第 1 轮新增两条闸门（都在**进循环之前**，超限整单拒、
+    /// 不发一条 UPDATE）：
+    /// - `items.len() > BATCH_UPDATE_ORDER_INFO_MAX_ITEMS` → 40001。写端点的每行
+    ///   都要**一条** UPDATE 往返，N 万行会在**一条池化连接**上串行跑 N 次，
+    ///   把那一条连接占满到超时（match 端点是批量读、上限语义相同但不占连接）。
+    /// - `system_delivery_date` 的「给值」这一态允许是**非日期文本**（前端 Excel
+    ///   解析器原样透传 dayjs 认不出的文本，见 `BatchUpdateOrderInfoItem` 的字段
+    ///   doc 与前端根因位置）。逐行解析：失败 ⇒ 该行进 `failed[]`（40001）、
+    ///   **不写库**，其余行照常写 —— 绝不能让它在 extractor 层 400 打掉整批。
     pub async fn batch_update_order_info<R: PartRepoTrait>(
         mut repo: R,
         req: &BatchUpdateOrderInfoRequest,
@@ -421,6 +431,12 @@ impl PartService {
         current.require_any_role(&[Role::Manager, Role::Clerk])?;
         if req.items.is_empty() {
             return Err(AppError::validation("items 不能为空"));
+        }
+        if req.items.len() > BATCH_UPDATE_ORDER_INFO_MAX_ITEMS {
+            return Err(AppError::validation(format!(
+                "items 最多 {BATCH_UPDATE_ORDER_INFO_MAX_ITEMS} 行，当前 {} 行",
+                req.items.len()
+            )));
         }
         let mut updated_count = 0_i64;
         let mut skipped_count = 0_i64;
@@ -432,12 +448,25 @@ impl PartService {
                 skipped_count += 1;
                 continue;
             }
+            // 三态日期的逐行解析（review 第 1 轮 MAJOR-1）：缺省 ⇒ 该列不动；
+            // 显式 null ⇒ 清成 NULL；给值 ⇒ 必须能解析成日期，否则该行失败。
+            let sys_date = match parse_tristate_date(&item.system_delivery_date) {
+                Ok(d) => d,
+                Err(raw) => {
+                    failed.push(BatchUpdateOrderInfoFailure {
+                        part_id: item.part_id,
+                        code: code::VALIDATION_ERROR,
+                        message: format!("系统交期格式非法：{raw}"),
+                    });
+                    continue;
+                }
+            };
             let n = repo
                 .update_order_info(
                     item.part_id,
                     item.version,
                     item.order_no.as_ref().map(|v| v.as_deref()),
-                    item.system_delivery_date,
+                    sys_date,
                     item.note.as_ref().map(|v| v.as_deref()),
                     current.id,
                 )
@@ -473,5 +502,41 @@ impl PartService {
             failed,
             skipped_count,
         })
+    }
+}
+
+/// 2026-10-06 review 第 1 轮新增：单请求 `items` 行数上限（写端点）。
+///
+/// 与 match 端点的 `excel_match::MATCH_MAX_ITEMS` 同为 2000、语义同源，但**各自
+/// 定义**：写端点的理由是「每行一条 UPDATE 往返会长时间独占一条池化连接」，与
+/// match 端点的「一次批量读」不是一回事，耦合过去会让后续任一侧改上限时另一侧的
+/// 理由对不上。两处 doc 互相引用。
+pub const BATCH_UPDATE_ORDER_INFO_MAX_ITEMS: usize = 2000;
+
+/// 三态日期入参 → repo 层要写的值（`None` = 该列不动 / `Some(None)` = 写 NULL /
+/// `Some(Some(d))` = 写日期）。`Err(raw)` = 「给值」这一态给了非法文本。
+///
+/// 2026-10-06 review 第 1 轮新增（见 `batch_update_order_info` 的 doc）。
+///
+/// - **trim 后**再解析：原 `NaiveDate` 反序列化对 `" 2026-10-15 "` 这类带空白
+///   的值是整请求 400；trim 让它照常成功。属「降级得更温和」方向，不引入新拒绝。
+/// - 回错时把**截断后的**原文带回，供 message 展示。截断到 32 字符是因为这是
+///   用户自由输入（Excel 单元格内容），不能让它在 200 响应体里无界增长。
+fn parse_tristate_date(
+    raw: &Option<Option<String>>,
+) -> Result<Option<Option<chrono::NaiveDate>>, String> {
+    match raw {
+        None => Ok(None),
+        Some(None) => Ok(Some(None)),
+        Some(Some(s)) => {
+            let t = s.trim();
+            match chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d") {
+                Ok(d) => Ok(Some(Some(d))),
+                Err(_) => {
+                    let shown: String = t.chars().take(32).collect();
+                    Err(shown)
+                }
+            }
+        }
     }
 }

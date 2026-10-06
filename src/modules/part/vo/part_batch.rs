@@ -1,6 +1,6 @@
 //! part 域 batch 详情 / 列表 / 子域相关出参 VO（2026-09-22 PR4 重构）
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::modules::part::service::crud::TPartScanRow;
 use crate::modules::prod::batch::model::PartBatchScanRow;
@@ -128,29 +128,34 @@ pub struct MatchByExcelItemResult {
 /// Excel 行 → 候选零件的**匹配档位**（闭合 5 值）。
 ///
 /// 2026-10-06 新增。序列化形态是大写字符串，与本仓「无 DB ENUM、Rust enum 校验」
-/// 的约定一致 —— 范本 `vo::part::ChainState`（它只差一步：`ChainState` 的三个变体
-/// 都是单词，`UPPERCASE` 恰好等于线格式；本枚举是双词，`PartCode` 经 `UPPERCASE`
-/// 会得到 `PARTCODE`（少一个下划线），故每个变体另写显式 `rename`。
-/// **不要**删掉显式 rename —— 前端按 `"PART_CODE"` 字面量判定。
-/// 线格式是 `PART_CODE > ASSEMBLY_CODE > PART_NAME > ASSEMBLY_NAME > NONE` 的
-/// 单行单档位、先命中先占：能按图号唯一定位就不该退到名称去冒险匹配。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
+/// 的约定一致 —— 范本 `vo::part::ChainState`。
+///
+/// 2026-10-06 review 第 1 轮：`rename_all` 由 `UPPERCASE` 改为
+/// `SCREAMING_SNAKE_CASE`。`UPPERCASE` 只把字母变大写、**不插下划线**，
+/// `PartCode` 经它是 `PARTCODE`（少一个下划线）；`SCREAMING_SNAKE_CASE` 直接产出
+/// `PART_CODE`，于是**不需要**变体级 `#[serde(rename)]`，线格式只有一个真源。
+/// （前一版是「`rename_all = UPPERCASE` + 5 个显式 rename」：两者并存时显式 rename
+/// 恒胜、`rename_all` 零作用，读者却会以为 `PARTCODE` 是当前行为 —— 误导性残留。）
+/// 5 个变体名都是单词或双词，在这条规则下全部正确产出线格式。
+///
+/// 优先级是 `PART_CODE > ASSEMBLY_CODE > PART_NAME > ASSEMBLY_NAME > NONE`
+/// （单行单档位、先命中先占）：能按图号唯一定位就不该退到名称去冒险匹配。
+///
+/// 只 `Serialize`：本枚举只出现在**响应**侧（`MatchByExcelItemResult`），全仓
+/// 没有它的反序列化入口（前端读 `match_type` 用的是 TS 字面量联合，不是本枚举的
+/// 往返）。派生一个永不使用的 `Deserialize` 会让人误以为存在入参路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExcelMatchType {
     /// 按图号命中 `t_part.drawing_no`（候选是零件本身）。
-    #[serde(rename = "PART_CODE")]
     PartCode,
     /// 按图号命中 `t_assembly.drawing_no`（候选是该装配件的**有效子件**）。
-    #[serde(rename = "ASSEMBLY_CODE")]
     AssemblyCode,
     /// 按名称命中 `t_part.name`（名称兜底，跨客户同名极容易超限）。
-    #[serde(rename = "PART_NAME")]
     PartName,
     /// 按名称命中 `t_assembly.name`（名称兜底，候选是该装配件的有效子件）。
-    #[serde(rename = "ASSEMBLY_NAME")]
     AssemblyName,
     /// 四档判据均不存在或全部落空。
-    #[serde(rename = "NONE")]
     None,
 }
 

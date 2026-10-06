@@ -1293,6 +1293,15 @@ impl PartRepo {
     /// - 空输入短路：不发 SQL（`= ANY('{}')` 恒 false，但空数组的参数类型推断
     ///   在不同 PG 版本上不稳，直接短路更省事也与本文件既有写法一致）。
     ///
+    /// **结果集规模 = Σ(命中行数)，SQL 侧没有 LIMIT / 分页**（2026-10-06 review 第 1 轮
+    /// 登记）：`excel_match::MATCH_CANDIDATE_CAP`（20/档）是**响应侧**截断，发生在
+    /// service 的 `cap_candidates` 里，**不是**查询侧 —— 极端输入下（2000 个同名判据 ×
+    /// 数千同名行）本方法会把全量同名行拉进内存再截 20 条。按 `t_part` 当前规模可接受，
+    /// 故本轮只登记口径不改实现：**不要**擅自加 `LIMIT`，加了会改变分档语义
+    /// （`PART_CODE` 档取 `id DESC` 的前 20 与「先按 id DESC 排完再截 20」在有 LIMIT 时
+    /// 才等价，但 `PART_NAME` 档是 `id ASC`，两种口径在跨档命中时会选出不同的 20 条）。
+    /// 若将来 `t_part` 规模真的到需要分页，那是**先量测再改**的事。
+    ///
     /// 用**非宏** `sqlx::query_as`（`TPart` 已 `derive(FromRow)`）：非宏不进
     /// `.sqlx/` 离线缓存，改本文件不需要重跑 `scripts/sqlx_prepare.sh`。
     pub async fn list_match_parts_by_keys<'e, E: PgExecutor<'e>>(

@@ -224,6 +224,13 @@ t_assembly.status               ← 派生缓存
      - `_e2e` 直调方（测试 fixture 自管 tx）
      - 既有 `tests/iam/{api.rs,middleware.rs}`（2026-09-23 PR13 拆分；原 `tests/iam_api.rs` / `tests/auth_middleware.rs` 已合到 `tests/iam/`）等 HTTP 契约测试（不改测试代码）
      - 读端点（`me` / `list_users` / `get_user` 等）`pool.acquire()` 不开事务，service 借 `&mut PgConnection` 跑查询，连接用完即 drop。
+     - `POST /api/v2/parts/batch-update-order-info`（2026-10-06）：该端点契约是
+       **逐行部分成功**（HTTP 200 + 信封，`failed[]` 逐条列出行级错误）。PG 事务内
+       一条语句报错后整笔进入 aborted 状态 ⇒ 其余行连带失败、末尾 `commit()` 也报错，
+       「部分成功」被整体降级成 500。**不要**改回 `begin()+commit()`，也**不要**上
+       savepoint（savepoint 下末尾 `commit()` 一旦失败会回滚已成功的行却仍返回
+       `updated_count = N`，变成静默数据丢失）。各行写的是互不相干的行、单条 UPDATE
+       自身原子，autocommit 才是这个契约要的语义。
 2. **统一响应信封**：handler 返回 `Result<Json<R<T>>, AppError>`。`R { code: 0, message: "ok", data }`；错误由 `AppError::into_response()` 装入同一信封。不做 middleware 后置包装。
 3. **错误码分段契约**（`src/shared/error.rs::code`，与 Python 前端对齐）：0 成功、4xxxx HTTP 语义、5xxxx 系统、2xxxx 业务域（每域一个段，如 201xx 零件/客户、214xx 送货单，新增域错误码先入对应段）。
 5. **状态机不写 DB**：`statemachine.rs` 只做内存 enum + `can_transition_to` 迁移表；事件日志由 service 在事务内统一插入。
@@ -237,7 +244,7 @@ t_assembly.status               ← 派生缓存
 | 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
 |---|---:|---|
 | `tests/delivery/{main,group,attach_batches,scan,note}.rs` | 5 | `delivery` |
-| `tests/part/{main,helpers,crud,lifecycle,batch,file,list_enrichment,repair,to_ship,to_inspection,to_process,inspection_batches,serial}.rs` | 12 | `part` |
+| `tests/part/{main,crud,lifecycle,batch,file,list_enrichment,repair,to_ship,to_inspection,to_process,inspection_batches,serial,create_serial_price,purchase_order_import}.rs` | 12 → 14 | `part`（★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点）|
 | `tests/assembly/{main,api,files,status_sync}.rs` | 3 | `assembly` |
 | `tests/iam/{main,api,middleware}.rs` | 2 | `iam`（redis-flush group）|
 | `tests/shelf/{main,api,deactivate}.rs` | 2 | `shelf` |

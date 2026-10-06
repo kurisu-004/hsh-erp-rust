@@ -388,8 +388,37 @@ pub struct BatchUpdateOrderInfoItem {
     /// 范本：assembly 域 `AssemblyUpdate`（`Option<Option<_>>` 同约定）。
     #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
     pub order_no: Option<Option<String>>,
+    /// 三态：缺省 = 不改该列；`null` = 清空成 NULL；给值 = 写入。
+    ///
+    /// 2026-10-06 review 第 1 轮：`NaiveDate` 放宽为 `String`，非法文本不再
+    /// **打掉整个请求**，而是降级为「该行进 `failed[]` + HTTP 200 + 信封」。
+    ///
+    /// 根因在写入端（前端）：`parseDateOrNull`（`frontend/src/utils/
+    /// purchaseOrderExcelParser.ts:104-117`）对 dayjs 认不出的文本（`2026年8月1日` /
+    /// `待定` …）**原样透传**（`:116` `return text`），该值被预填进候选行的
+    /// `systemDeliveryDate`（`PurchaseOrderImportDialog.vue:637`）并在提交时原样
+    /// 发出（同文件 `:670`）。而 `el-date-picker` **不会**洗掉 model 值
+    /// （`use-common-picker.mjs:25-40`：`parseDate` 失败只让展示用的 `parsedValue`
+    /// 变空，`props.modelValue` 不被改写）—— 用户眼里看到的是「清空的输入框」，
+    /// 实际发出去的是那句中文。
+    ///
+    /// 声明成 `Option<NaiveDate>` 时这类文本在 **axum JsonRejection** 层就 400，
+    /// 且 body 是**纯文本、不是 `R` 信封** ⇒ 用户已勾选的整批回填全部作废，
+    /// 前端连错误码都读不到。
+    ///
+    /// 同一功能的 match 端点已经用「**不声明** `delivery_date`」规避了这一类风险，
+    /// 写端点原先没有对应处置 —— 契约内部不自洽，本轮补齐。
+    ///
+    /// **向后兼容**：`NaiveDate` 的 serde 格式就是 `%Y-%m-%d`，故对**所有合法日期**
+    /// 「`String` + service 侧逐行 `parse_from_str`」与原 `NaiveDate` 反序列化行为
+    /// **完全一致**，前端无需再对齐。唯一新增的行为是把「非法文本」从整请求 400
+    /// 降级为该行失败（正是「永远 200 + 信封」契约想要的）。service 侧逐行校验见
+    /// `PartService::batch_update_order_info`。
+    ///
+    /// 前端本轮同时在**预填处**过滤（治本），本字段的宽松是治标兜底：前端漏一处、
+    /// 别的调用方漏一处，都不再打掉整批。
     #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
-    pub system_delivery_date: Option<Option<chrono::NaiveDate>>,
+    pub system_delivery_date: Option<Option<String>>,
     #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
     pub note: Option<Option<String>>,
     /// 2026-10-06 新增：`Some(true)` 时本行**不写库**，只计入 `skipped_count`。

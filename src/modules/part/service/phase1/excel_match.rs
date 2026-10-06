@@ -888,26 +888,46 @@ mod tests {
         }
     }
 
-    /// 两行请求 + 一次 match 调用（3 命中行 + 1 空装配件 ⇒ 期望 4 条查询）。
+    /// 4 行请求 + 一次 match 调用 ⇒ **恰好 4 条查询**，逐档位覆盖响应形状。
+    ///
+    /// 4 行分别是：`PO-001`（零件图号命中 → PART_CODE）、`PO-ASM`（装配件图号命中 →
+    /// ASSEMBLY_CODE，候选为子件 id=2）、`PO-NONE`（纯 NONE）、`PO-EMPTY`
+    /// （mock 的 ② 只返 1 个装配件，故这行也是纯 NONE）。
     ///
     /// 顺带钉死两条线格式契约：雪花 id 序列化成 **JSON string**（不是数字）、
     /// 响应数组长度恒等于请求 items 长度。
+    ///
+    /// ## `.times(1)` 是刻意加的，别当风格问题删掉（2026-10-06 review 第 1 轮）
+    ///
+    /// mockall 的 `expect_*` 默认 `times` 是**无限次**：不加 `.times(1)` 时，
+    /// 「同一条查询发了两遍」和「只发了一遍」在测试里长得一模一样。而
+    /// **「查询数与行数无关」正是本次改造最核心、最容易被静默回归的收益**
+    /// —— 旧实现逐行发 SQL（500 行采购订单 = 1000 次往返），一旦有人为了
+    /// 「省事」把某段搬回循环内调用，这个不变式就悄悄退化了，而没有任何东西变红。
+    /// `.times(1)` 把它变成硬断言；配合
+    /// [`match_by_excel_items_query_count_is_independent_of_item_count`]
+    /// （50 行仍只走同样 4 条）覆盖「恰好 1 次」与「与行数无关」两个维度。
+    /// 本仓此前 `rg '\.times\('` 零命中，此后这两处是**首批**刻意使用，不是破例。
     #[tokio::test]
     async fn match_by_excel_items_orchestrates_four_queries_and_keeps_row_shape() {
         let mut mock = MockPartRepoTrait::new();
-        // ① 零件：id=1 图号命中「PO-001」；id=2 是被命中装配件的子件（它自己图号不命中，
+        // ① 零件：id=1 图号命中「PO-001」（id=2 是被命中装配件的子件，它自己图号不命中，
         //    由 ③ 带回来）
         mock.expect_list_match_parts_by_keys()
+            .times(1)
             .returning(|_codes, _names| Ok(vec![sample_part(1, "PO-001", "法兰盘", None)]));
-        // ② 装配件：图号「PO-ASM」命中，子件 id=2
+        // ② 装配件：图号「PO-ASM」命中，其子件 id=2
         mock.expect_list_match_assemblies_by_keys()
+            .times(1)
             .returning(|_codes, _names| Ok(vec![sample_assembly(900, "PO-ASM", "法兰装配体")]));
-        // ③ 子件
+        // ③ 命中装配件的子件
         mock.expect_list_children_by_assemblies()
+            .times(1)
             .withf(|ids, inc| ids.contains(&900) && !*inc)
             .returning(|_ids, _inc| Ok(vec![sample_part(2, "C-1", "子件一", Some(900))]));
         // ④ 候选所属装配件名称
         mock.expect_list_assembly_names_by_ids()
+            .times(1)
             .returning(|_ids| Ok(vec![sample_assembly(900, "PO-ASM", "法兰装配体")]));
 
         let req = MatchByExcelItemsRequest {
@@ -955,6 +975,49 @@ mod tests {
             j[0]["warnings"].is_array(),
             "warnings 无异常时也必须是数组（不是 null）: {j}"
         );
+    }
+
+    /// **性能不变式**：50 行 items 仍只走同样那 4 条查询（每条各 1 次）。
+    ///
+    /// 2026-10-06 review 第 1 轮新增。`mock` 一律返回空 `Vec`，故本例只验
+    /// 「编排不随行数放大」这一件事，不重复响应形状断言（那由上一个用例负责）。
+    /// 行数取 50（> 20 的候选 cap，避免读者把两个数字弄混）；判据刻意重复成
+    /// 同一个图号，因为旧实现的病根正是**逐行**发 SQL —— 判据是否重复与查询数无关，
+    /// 而 50 行已经远超「肉眼扫得过来」的手写规模，`.times(1)` 在这里就是回归网。
+    #[tokio::test]
+    async fn match_by_excel_items_query_count_is_independent_of_item_count() {
+        const ROWS: usize = 50;
+        let mut mock = MockPartRepoTrait::new();
+        mock.expect_list_match_parts_by_keys()
+            .times(1)
+            .returning(|_codes, _names| Ok(Vec::new()));
+        mock.expect_list_match_assemblies_by_keys()
+            .times(1)
+            .returning(|_codes, _names| Ok(Vec::new()));
+        mock.expect_list_children_by_assemblies()
+            .times(1)
+            .returning(|_ids, _inc| Ok(Vec::new()));
+        mock.expect_list_assembly_names_by_ids()
+            .times(1)
+            .returning(|_ids| Ok(Vec::new()));
+
+        let req = MatchByExcelItemsRequest {
+            items: (0..ROWS)
+                .map(|_| item(Some("PO-SAME"), Some("同名件")))
+                .collect(),
+        };
+        assert_eq!(req.items.len(), ROWS);
+        let out = PartService::match_by_excel_items(mock, &req, &current_manager())
+            .await
+            .expect("match 应成功");
+
+        assert_eq!(out.len(), ROWS, "响应长度仍须恒等于请求 items 长度");
+        assert!(
+            out.iter().all(|r| r.match_type == ExcelMatchType::None),
+            "mock 全返空 ⇒ 50 行都应是 NONE（顺带证明没有多余查询混入结果）"
+        );
+        // mock 在函数返回时被 drop，strict mode + times(1) 在此完成校验：
+        // 任一条查询被调用 0 次或 ≥2 次，这里就会 panic。
     }
 
     /// 角色闸门：INSPECTOR 两个端点都拿 40300，且**一条 SQL 都不该发**。

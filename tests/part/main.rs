@@ -36,10 +36,10 @@ mod inspection_batches;
 mod lifecycle;
 mod list_enrichment;
 mod pickable_by_work_type;
-mod repair;
-mod rollup_recompute;
 // 2026-10-06 新增：采购订单 Excel 导入（match-by-excel-items + batch-update-order-info）
 mod purchase_order_import;
+mod repair;
+mod rollup_recompute;
 mod serial;
 mod to_inspection;
 mod to_process;
