@@ -335,7 +335,20 @@ pub struct BatchWithPdfsRequest {
     pub note: Option<String>,
 }
 
-/// `POST /parts/match-by-excel-items` 入参：Excel 行（drawing_no 或 serial_no）→ 现有 part id。
+/// `POST /parts/match-by-excel-items` 入参：采购订单 Excel 明细行 → 候选零件。
+///
+/// 2026-10-06 重做：该端点的契约由前端「解析系统交期和订单号」对话框定义（本结构
+/// 此前对着一份从未实现过的富契约，线上表现为「每一行都判未匹配、候选 0、
+/// 提交按钮永久 disabled」）。要点：
+///
+/// - `row_no: i32` **必填**（`Option` 也不行）——它是响应的关联键，前端按它把
+///   结果挂回 Excel 行。
+/// - **不收** `delivery_date` / `unit_price` / `quantity`：前端 Excel 解析器
+///   `parseDateOrNull` 对无法识别的日期文本**原样透传**，声明 `Option<NaiveDate>`
+///   会让无法识别的文本把**整个请求**打成 400；且这 3 个字段后端完全用不到
+///   （系统交期由前端本地预填进 date-picker）。serde 默认忽略未知字段，
+///   前端继续发也无害。
+/// - **删掉** `serial_no`：前端从不发，采购订单 Excel 也没有该列。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MatchByExcelItemsRequest {
     pub items: Vec<MatchByExcelItem>,
@@ -343,15 +356,29 @@ pub struct MatchByExcelItemsRequest {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MatchByExcelItem {
+    /// Excel 行号（前端 1-based），响应按它回填。缺字段 ⇒ 整请求反序列化失败。
+    pub row_no: i32,
+    /// 订单行号，仅用于错误提示定位，不参与匹配。
+    #[serde(default)]
+    pub line_no: Option<String>,
+    /// Excel 物料代码 → 对 `t_part.drawing_no` / `t_assembly.drawing_no` 做精确匹配。
     #[serde(default)]
     pub drawing_no: Option<String>,
-    #[serde(default)]
-    pub serial_no: Option<String>,
+    /// Excel 订单物料描述 → 对 `t_part.name` / `t_assembly.name` 做精确匹配。
     #[serde(default)]
     pub name: Option<String>,
 }
 
 /// `POST /parts/batch-update-order-info` 入参。
+///
+/// ⚠️ **`items` 数的是候选行，不是 Excel 行**（2026-10-06 review 第 3 轮 R3-6
+/// 登记）：上限是 `service::phase1::events::BATCH_UPDATE_ORDER_INFO_MAX_ITEMS`
+/// = 2000，而 match 端点的上限 `MATCH_MAX_ITEMS` = 2000 数的是 Excel 行、每行最多
+/// 产出 20 个候选 ⇒ 一次合法 match 最多产出 40000 个候选行。因此存在硬崖：match
+/// 端 200 行全命中、且候选多为「空目标」（前端 `isEmptyTarget` 默认勾选）时，提交
+/// 4000+ 候选行会被**整单 422、一行不写**。
+/// 用户可在确认框（已显示「将更新 N 个零件」）里手动取消勾选降到 2000 以下 ——
+/// 谈不上死路，但这条崖此前没写进任何注释。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BatchUpdateOrderInfoRequest {
     pub items: Vec<BatchUpdateOrderInfoItem>,
@@ -361,11 +388,50 @@ pub struct BatchUpdateOrderInfoRequest {
 pub struct BatchUpdateOrderInfoItem {
     #[serde(deserialize_with = "deserialize_i64")]
     pub part_id: i64,
+    /// 乐观锁期望版本（由 match 端点原样回传）。
     pub version: i32,
+    /// 三态：缺省 = 不改该列；`null` = **清空成 NULL**；给值 = 写入。
+    ///
+    /// 2026-10-06 改用 `deserialize_some`：前端 date-picker 可清空，旧语义
+    /// （单层 `Option`，`None` 一律「不改」）下用户清空系统交期会**静默无效**。
+    /// 范本：assembly 域 `AssemblyUpdate`（`Option<Option<_>>` 同约定）。
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+    pub order_no: Option<Option<String>>,
+    /// 三态：缺省 = 不改该列；`null` = 清空成 NULL；给值 = 写入。
+    ///
+    /// 2026-10-06 review 第 1 轮：`NaiveDate` 放宽为 `String`，非法文本不再
+    /// **打掉整个请求**，而是降级为「该行进 `failed[]` + HTTP 200 + 信封」。
+    ///
+    /// 根因在写入端（前端）：`parseDateOrNull`（`frontend/src/utils/
+    /// purchaseOrderExcelParser.ts:104-117`）对 dayjs 认不出的文本（`2026年8月1日` /
+    /// `待定` …）**原样透传**（`:116` `return text`），该值被预填进候选行的
+    /// `systemDeliveryDate`（`PurchaseOrderImportDialog.vue:637`）并在提交时原样
+    /// 发出（同文件 `:670`）。而 `el-date-picker` **不会**洗掉 model 值
+    /// （`use-common-picker.mjs:25-40`：`parseDate` 失败只让展示用的 `parsedValue`
+    /// 变空，`props.modelValue` 不被改写）—— 用户眼里看到的是「清空的输入框」，
+    /// 实际发出去的是那句中文。
+    ///
+    /// 声明成 `Option<NaiveDate>` 时这类文本在 **axum JsonRejection** 层就 400，
+    /// 且 body 是**纯文本、不是 `R` 信封** ⇒ 用户已勾选的整批回填全部作废，
+    /// 前端连错误码都读不到。
+    ///
+    /// 同一功能的 match 端点已经用「**不声明** `delivery_date`」规避了这一类风险，
+    /// 写端点原先没有对应处置 —— 契约内部不自洽，本轮补齐。
+    ///
+    /// **向后兼容**：`NaiveDate` 的 serde 格式就是 `%Y-%m-%d`，故对**所有合法日期**
+    /// 「`String` + service 侧逐行 `parse_from_str`」与原 `NaiveDate` 反序列化行为
+    /// **完全一致**，前端无需再对齐。唯一新增的行为是把「非法文本」从整请求 400
+    /// 降级为该行失败（正是「永远 200 + 信封」契约想要的）。service 侧逐行校验见
+    /// `PartService::batch_update_order_info`。
+    ///
+    /// 前端本轮同时在**预填处**过滤（治本），本字段的宽松是治标兜底：前端漏一处、
+    /// 别的调用方漏一处，都不再打掉整批。
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+    pub system_delivery_date: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::shared::types::deserialize_some")]
+    pub note: Option<Option<String>>,
+    /// 2026-10-06 新增：`Some(true)` 时本行**不写库**，只计入 `skipped_count`。
+    /// 前端对「候选非空但人工判定不该回填」的行用它跳过。
     #[serde(default)]
-    pub order_no: Option<String>,
-    #[serde(default)]
-    pub system_delivery_date: Option<chrono::NaiveDate>,
-    #[serde(default)]
-    pub note: Option<String>,
+    pub skip: Option<bool>,
 }

@@ -5,11 +5,17 @@
 //! **改了 `query!` 宏里的 SQL 文本就必须重跑 `./scripts/sqlx_prepare.sh`**
 //! 并把 `.sqlx/query-*.json` 一起提交（CI / Docker 靠离线元数据构建）。
 //!
-//! ## 承载方法（20 个）
+//! ## 承载方法（24 个）
 //!
 //! ### 只读查询（6）
 //! - `get_by_id` / `list_by_ids` / `get_by_serial` / `list_children`
 //! - `get_part_inspected` / `list_children_by_assemblies`
+//!
+//! ### 采购订单 Excel 匹配（4，2026-10-06 新增）
+//! - `list_match_parts_by_keys` / `list_match_assemblies_by_keys`
+//! - `list_assembly_names_by_ids` —— 三条**非宏**查询，把「逐行发 SQL」改成
+//!   「整请求 ≤ 4 条查询，与行数无关」
+//! - `update_order_info` —— 配套窄写（三态列，见方法 doc）
 //!
 //! ### CRUD（6）
 //! - `get_part_detail` / `create_part` / `update_part` / `soft_delete_part`
@@ -1268,5 +1274,215 @@ impl PartRepo {
         customer_id: i64,
     ) -> Result<char, AppError> {
         crate::shared::serial::prefix_for_customer(executor, customer_id).await
+    }
+
+    // ===== 2026-10-06 新增：采购订单 Excel 匹配 + 订单信息专用窄写 =====
+    // 本节方法的 SQL 见同文件末尾的 `AssemblyMatchRow` 与 `push_tristate_*` 定义。
+
+    /// 采购订单 Excel 匹配：`t_part` 按「图号命中 ∪ 名称命中」一次性捞回。
+    ///
+    /// 2026-10-06 新增。旧实现**逐行**发 SQL（采购订单 500 行 = 1000 次往返），
+    /// 本方法把整个请求的判据收成两条数组，一次往返捞回全部候选，service 侧再
+    /// 按 `drawing_no` / `name` 分桶。
+    ///
+    /// - 软删闸门 `deleted_at IS NULL`（与其它 t_part 查询一致）。
+    /// - `ORDER BY id ASC`：两个判据同序返回，service 侧只需对图号档做一次
+    ///   `id DESC` 的稳定逆序（该口径沿用旧实现「最近建的排前」）。
+    /// - 参数显式标 `::text[]`：`drawing_no` / `name` 列是 `character varying`，
+    ///   显式转型避免「参数类型由操作符上下文反推」的歧义。
+    /// - 空输入短路：不发 SQL（`= ANY('{}')` 恒 false，但空数组的参数类型推断
+    ///   在不同 PG 版本上不稳，直接短路更省事也与本文件既有写法一致）。
+    ///
+    /// **结果集规模 = Σ(命中行数)，SQL 侧没有 LIMIT / 分页**（2026-10-06 review 第 1 轮
+    /// 登记）：`excel_match::MATCH_CANDIDATE_CAP`（20/档）是**响应侧**截断，发生在
+    /// service 的 `cap_candidates` 里，**不是**查询侧 —— 极端输入下（2000 个同名判据 ×
+    /// 数千同名行）本方法会把全量同名行拉进内存再截 20 条。按 `t_part` 当前规模可接受，
+    /// 故本轮只登记口径不改实现：**不要**擅自加 `LIMIT`，加了会改变分档语义
+    /// （`PART_CODE` 档取 `id DESC` 的前 20 与「先按 id DESC 排完再截 20」在有 LIMIT 时
+    /// 才等价，但 `PART_NAME` 档是 `id ASC`，两种口径在跨档命中时会选出不同的 20 条）。
+    /// 若将来 `t_part` 规模真的到需要分页，那是**先量测再改**的事。
+    ///
+    /// 用**非宏** `sqlx::query_as`（`TPart` 已 `derive(FromRow)`）：非宏不进
+    /// `.sqlx/` 离线缓存，改本文件不需要重跑 `scripts/sqlx_prepare.sh`。
+    pub async fn list_match_parts_by_keys<'e, E: PgExecutor<'e>>(
+        executor: E,
+        drawing_nos: &[&str],
+        names: &[&str],
+    ) -> Result<Vec<TPart>, sqlx::Error> {
+        if drawing_nos.is_empty() && names.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<_, TPart>(
+            "SELECT id, serial_no, name, drawing_no, applicant_name, quantity, \
+             request_date, planned_delivery_date, \
+             customer_id, assembly_id, status, is_urgent, \
+             next_process_id, \
+             order_no, system_delivery_date, note, \
+             unit_price, total_price, \
+             version, created_at, created_by, updated_at, updated_by, \
+             deleted_at, process_chain_id \
+             FROM t_part \
+             WHERE deleted_at IS NULL \
+               AND (drawing_no = ANY($1::text[]) OR name = ANY($2::text[])) \
+             ORDER BY id ASC",
+        )
+        .bind(drawing_nos)
+        .bind(names)
+        .fetch_all(executor)
+        .await
+    }
+
+    /// 采购订单 Excel 匹配：`t_assembly` 按「图号命中 ∪ 名称命中」一次性捞回。
+    ///
+    /// 2026-10-06 新增。**装配件本身绝不作为候选返回**（它不在 `t_part`，
+    /// `batch-update-order-info` 打不到它），本方法只负责「哪些装配件被命中」，
+    /// 候选由调用方用 `list_children_by_assemblies` 取其有效子件。
+    /// 软删闸门 `deleted_at IS NULL`；空输入短路。
+    /// 用**非宏** `sqlx::query_as`（理由同 `list_match_parts_by_keys`）。
+    pub async fn list_match_assemblies_by_keys<'e, E: PgExecutor<'e>>(
+        executor: E,
+        drawing_nos: &[&str],
+        names: &[&str],
+    ) -> Result<Vec<AssemblyMatchRow>, sqlx::Error> {
+        if drawing_nos.is_empty() && names.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<_, AssemblyMatchRow>(
+            "SELECT id, drawing_no, name FROM t_assembly \
+             WHERE deleted_at IS NULL \
+               AND (drawing_no = ANY($1::text[]) OR name = ANY($2::text[])) \
+             ORDER BY id ASC",
+        )
+        .bind(drawing_nos)
+        .bind(names)
+        .fetch_all(executor)
+        .await
+    }
+
+    /// 候选零件的「所属装配件」名称映射（`assembly_id` → `name`）。
+    ///
+    /// 2026-10-06 新增。候选可能是「按图号/名称直接命中的零件」，它的
+    /// `assembly_id` 指向的装配件**未必**在被命中的装配件集合里（两者图号名称
+    /// 都可能不同），故需按候选集里的 distinct `assembly_id` 另发一条查询补
+    /// 展示名（前端 `assembly_name` 展示用）。
+    ///
+    /// 用**非宏** `sqlx::query_as`（理由同 `list_match_parts_by_keys`）。
+    pub async fn list_assembly_names_by_ids<'e, E: PgExecutor<'e>>(
+        executor: E,
+        assembly_ids: &[i64],
+    ) -> Result<Vec<AssemblyMatchRow>, sqlx::Error> {
+        if assembly_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as::<_, AssemblyMatchRow>(
+            "SELECT id, drawing_no, name FROM t_assembly \
+             WHERE id = ANY($1) AND deleted_at IS NULL",
+        )
+        .bind(assembly_ids)
+        .fetch_all(executor)
+        .await
+    }
+
+    /// 采购订单 Excel 导入的**专用窄写**：只改 `order_no` /
+    /// `system_delivery_date` / `note` 三列，三个列各自三态。
+    ///
+    /// 2026-10-06 新增。**不复用** `update_part` + `PartUpdate`：`PartUpdate`
+    /// 的字段是单层 `Option`（`None` 一律「不改列」），表达不了「显式清空」；
+    /// 把它改成 `Option<Option<_>>` 会波及 `POST /parts/{id}/update` 那条重度
+    /// 使用的行内编辑链路（另一个 `PartUpdate` 构造点）。故按本仓
+    /// `update_part_rollup` / `mark_batch_*` 的「专用窄写方法」风格另起一个，
+    /// 只服务 `POST /parts/batch-update-order-info`。
+    ///
+    /// 三态语义（入参 `None` = 字段缺省 / `Some(None)` = 写 NULL /
+    /// `Some(Some(v))` = 写 v）：
+    /// - 字段缺省 ⇒ 该列的 SET 子句**整体不出现**（不是写 NULL）
+    /// - 显式 null ⇒ 该列的 SET 子句写 `NULL`
+    ///
+    /// 其余语义与 `update_part` 逐条对齐：`version += 1` + `updated_at = now()`
+    /// 强制写入；`WHERE id = $1 AND version = $2 AND deleted_at IS NULL`；
+    /// **不重算** `total_price`（后端从不重算，只写 caller 传的值）。
+    /// 返回 `rows_affected()`：`1` = 成功，`0` = OCC 冲突 / 已软删 / 不存在
+    /// （三者 SQL 层不可区分，caller 统一报 `VERSION_CONFLICT`）。
+    pub async fn update_order_info<'e, E: PgExecutor<'e>>(
+        executor: E,
+        part_id: i64,
+        expected_version: i32,
+        order_no: Option<Option<&str>>,
+        system_delivery_date: Option<Option<chrono::NaiveDate>>,
+        note: Option<Option<&str>>,
+        updated_by: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "UPDATE t_part SET version = version + 1, updated_at = now(), updated_by = ",
+        );
+        qb.push_bind(updated_by);
+        push_tristate_text(&mut qb, "order_no", order_no);
+        push_tristate_date(&mut qb, "system_delivery_date", system_delivery_date);
+        push_tristate_text(&mut qb, "note", note);
+        qb.push(" WHERE id = ")
+            .push_bind(part_id)
+            .push(" AND version = ")
+            .push_bind(expected_version)
+            .push(" AND deleted_at IS NULL");
+        let r = qb.build().execute(executor).await?;
+        Ok(r.rows_affected())
+    }
+}
+
+/// 采购订单 Excel 匹配用：`t_assembly` 的窄投影（id / 图号 / 名称）。
+///
+/// 2026-10-06 新增。`t_assembly` 是 assembly 域的表，但匹配链路必须同时看
+/// 「零件自己的图号/名称」与「装配件的图号/名称」（装配件命中后返回其子件），
+/// 而 part 域 service 只借得到 `PartRepoTrait` 一个连接 —— 故这两条 SQL 挂在
+/// `PartRepo`（与 `serial_prefix_for_customer` 跨域 helper 同一落点思路）。
+///
+/// 两条查询（按判据键命中 / 按 id 取名称）复用同一个窄投影，`drawing_no` 在
+/// 取名称那侧没被消费但同表同投影，少一个类型换一次往返。
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AssemblyMatchRow {
+    pub id: i64,
+    pub drawing_no: String,
+    pub name: String,
+}
+
+/// 三态文本列的 SET 子句拼装（`PartRepo::update_order_info` 用）。
+///
+/// 2026-10-06 新增。`None` ⇒ 整个子句不出现（字段缺省，不动该列）；
+/// `Some(None)` ⇒ `= NULL`；`Some(Some(v))` ⇒ `= <bind>`。
+/// 范本：assembly 域 `AssemblyRepo::update_partial` 的 `push_opt_opt_str` /
+/// `push_opt_opt_date`（`repo/sql.rs`）。
+fn push_tristate_text(
+    qb: &mut sqlx::QueryBuilder<sqlx::Postgres>,
+    col: &'static str,
+    v: Option<Option<&str>>,
+) {
+    let Some(inner) = v else { return };
+    qb.push(", ").push(col).push(" = ");
+    match inner {
+        Some(val) => {
+            qb.push_bind(val.to_string());
+        }
+        None => {
+            qb.push("NULL");
+        }
+    }
+}
+
+/// 三态日期列的 SET 子句拼装（`PartRepo::update_order_info` 用）。
+/// 语义同 [`push_tristate_text`]。
+fn push_tristate_date(
+    qb: &mut sqlx::QueryBuilder<sqlx::Postgres>,
+    col: &'static str,
+    v: Option<Option<chrono::NaiveDate>>,
+) {
+    let Some(inner) = v else { return };
+    qb.push(", ").push(col).push(" = ");
+    match inner {
+        Some(val) => {
+            qb.push_bind(val);
+        }
+        None => {
+            qb.push("NULL");
+        }
     }
 }
