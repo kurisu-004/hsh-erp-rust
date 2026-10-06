@@ -237,10 +237,17 @@ pub struct PartListItem {
     #[serde(default)]
     pub child_count: Option<i64>,
     /// 2026-09-29 新增：是否已上传 G_CODE（数控程序）。
-    /// - 真相源：`EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id AND kind = 'G_CODE' AND deleted_at IS NULL)`
-    /// - 用途：prod 域 worker_pool 候选池的自动分配优先级（已上传 G_CODE 的批次优先 take）
-    /// - 本 VO 的所有端点（`GET /parts` 等）默认 `false`（service 层不再 enrich；
-    ///   需要该字段的前端走 `GET /prod/programming/pending`）
+    ///
+    /// ⚠️ 本 VO 的所有返回点**恒为 `false`**：全仓 4 处构造（`From<TPart>` +
+    ///   `work_type::into_list_item` + `union_list` 的 2 个 project 函数）全部硬编码
+    ///   `false`，无任何 enrich 写入点。字段保留只为 wire 兼容（无
+    ///   `skip_serializing_if`，恒出现在响应里，删它是破坏性 wire 变更）。
+    ///
+    /// 真要读这个语义，两个口都在别处：编程页走
+    /// `GET /api/v2/prod/programming/pending`（真相源是 `t_part_file kind='G_CODE'`
+    /// 的 EXISTS 子查询）；worker_pool 候选池的「已编程批次优先 take」走它自己的
+    /// `PoolBatchItem.has_cnc_program`（`prod::worker_pool::repo::sql`），与本字段
+    /// 无数据关系。
     #[serde(default)]
     pub has_cnc_program: bool,
     /// 2026-10-03 新增：活跃批次雪花 id（序列化走 `serialize_i64_opt` → JSON string）。
@@ -349,10 +356,9 @@ impl From<TPart> for PartListItem {
             row_type: Some("PART".to_string()),
             has_children: false,
             child_count: None,
-            // 2026-09-29 新增：默认 false；`From<TPart>` 不做 EXISTS enrich
-            // （避免 N+1）；需要该字段的端点在调用 repo 时通过 EXISTS 子查询填充。
-            // part 域本 VO 的所有 list caller 都不填 → 恒 false（前端无影响，
-            // 因为这些 caller 不暴露此字段语义）。
+            // 2026-09-29 新增：恒 false。`From<TPart>` 不做 EXISTS enrich
+            // （避免 N+1），part 域本 VO 的所有 caller 也不填 → 本字段在本 VO 上
+            // 恒为 `false`；真实语义读 `GET /prod/programming/pending`。
             has_cnc_program: false,
             // 2026-10-03 新增：`From<TPart>` 是 part 级投影，不含批次语义
             // （`TPart` 本身不持 batch_id）→ 恒 None。需要批次锚点的端点

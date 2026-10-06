@@ -59,8 +59,8 @@
 //!
 //! ## `has_cnc_program` 真相源
 //! [`G_CODE_EXISTS`] —— `EXISTS (SELECT 1 FROM t_part_file WHERE part_id = p.id
-//! AND kind = 'G_CODE' AND deleted_at IS NULL)`，与 part 域旧端点 / worker_pool
-//! 候选池同源。**同一常量**同时供 list 的 SELECT 列表与 WHERE 过滤复用（见该常量
+//! AND kind = 'G_CODE' AND deleted_at IS NULL)`，与 worker_pool 候选池同源。
+//! **同一常量**同时供 list 的 SELECT 列表与 WHERE 过滤复用（见该常量
 //! doc 的改一同步二约定）。
 //!
 //! ## 批次锚点（2026-10-03 新增）
@@ -71,9 +71,8 @@
 //!
 //! ## list / count 共用谓词
 //! 两个方法共用私有 [`push_where`]（WHERE 骨架 + `has_cnc_program` + keyword +
-//! `serial_no` 四段）与常量 [`FROM_SQL`]。旧端点把同一段谓词手抄两遍（list 一份、
-//! count 一份），改一处漏一处就会让 `total` 与 `items` 对不上；本文件从结构上
-//! 杜绝这种漂移。
+//! `serial_no` 四段）与常量 [`FROM_SQL`]：谓词只写一份，list 与 count 不可能各自
+//! 漂移出「`total` 与 `items` 对不上」的组合。
 //!
 //! ## SQL 拼接策略
 //! 走 `sqlx::QueryBuilder`：固定骨架（FROM / WHERE / 白名单列名）走 `push` / `format!` 嵌入，动态入参走

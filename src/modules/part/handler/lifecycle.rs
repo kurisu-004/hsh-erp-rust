@@ -1,9 +1,11 @@
 //! part 域 lifecycle / 状态机扩展 handler
 //!
 //! 对应 Phase 1（2026-09-13）+ 4 个终态流转 + Phase 2（2026-09-13）pick-up：
-//! - 1.1 上架 / 召回（place-on-shelf / recall-to-pending）
-//! - 1.2 CNC 编程流转（release-from-programming）；2026-10-07 下线：
-//!   `pending-programming` 列表（前端 2026-10-01 已迁至
+//! - 1.1 上架 / 召回（place-on-shelf / recall-to-pending）—— **2026-10-02 已随批次
+//!   用例迁往 `prod::batch`**
+//! - 1.2 CNC 编程流转（release-from-programming）—— 同 1.1，**2026-10-02 已随批次
+//!   用例迁往 `prod::batch`**（`POST /prod/batches/{batch_id}/release-from-programming`）；
+//!   `pending-programming` 列表于 2026-10-07 下线（前端走
 //!   `GET /prod/programming/pending`）；`send-to-programming` /
 //!   `recall-to-programming` 已于 2026-09-29 删除
 //! - 1.3 外协流转（send-to-outsource / receive-from-outsource /

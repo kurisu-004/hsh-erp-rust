@@ -48,7 +48,7 @@ pub struct ProgrammingItemOut {
     /// L1 一级集团名；L2 未挂 parent 时为 None
     pub parent_customer_name: Option<String>,
     /// 是否已上传 G_CODE（真相源 `EXISTS t_part_file kind='G_CODE' AND
-    /// deleted_at IS NULL`，与 part 域旧端点 / worker_pool 候选池同源）。
+    /// deleted_at IS NULL`，与 worker_pool 候选池同源）。
     pub has_cnc_program: bool,
     /// 2026-10-03 新增：该 part 的 **PROGRAMMING 活跃批次** 雪花 id（JSON string）。
     ///
@@ -76,9 +76,8 @@ pub struct ProgrammingItemOut {
 /// ⚠️ `total` / `limit` / `offset` 是**分页计数类 `i64`，故意不走
 /// `serialize_i64`**（2026-10-01 review 第 1 轮 C 项确认）：它们是行数 / 偏移量，
 /// 远小于 `2^53`，不存在 JS 精度截断风险；序列化形态与
-/// `part/vo/part.rs::PartListOut`（以及被替换的 part 域旧端点）**逐字一致**，
-/// 前端从旧端点切到本端点时该层无需改动。只有雪花 ID 字段（`ProgrammingItemOut::id`）
-/// 需要 `serialize_i64` → JSON string。
+/// `part/vo/part.rs::PartListOut` 逐字一致。只有雪花 ID 字段
+/// （`ProgrammingItemOut::id`）需要 `serialize_i64` → JSON string。
 #[derive(Debug, Clone, Serialize)]
 pub struct ProgrammingListOut {
     pub items: Vec<ProgrammingItemOut>,

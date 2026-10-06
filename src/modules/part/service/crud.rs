@@ -332,9 +332,6 @@ impl PartService {
     /// 解析 list 过滤参数为内部变量。供 PART-only 分支复用。
     /// 返回 `(sort_by, sort_dir, customer_ids, statuses, locations, holder_ids)`，
     /// 全部 String / Vec 在 helper 内持有，借给下游 `PartListFilters` 时取 ref。
-    ///
-    /// 2026-09-29 简化后仍保留：内部 caller（`list_parts` 的 PART-only 分支）
-    /// 走 PART-only 路径，复用此 helper。
     async fn parse_list_filters<R: PartRepoTrait>(
         query: &PartListQuery,
         repo: &mut R,

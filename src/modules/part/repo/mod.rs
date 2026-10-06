@@ -3,7 +3,7 @@
 //! ## 结构（2026-09-22 D-6 重构对齐 iam / shelf / customer / part_batch / worker_pool 范本）
 //! - `sql/`（原 `sql.rs`，已按表拆 `part_sql.rs` / `event_sql.rs` /
 //!   `helper_sql.rs` + `mod.rs`）：SQL 全文，
-//!   24 个 pub 固有静态方法（t_part 23 + t_part_event 1）
+//!   25 个 pub 固有静态方法（t_part 24 + t_part_event 1）
 //!   + sqlx `query!` 宏。ZST struct `PartRepo` 收 `impl PgExecutor<'_>` 形参。
 //! - `mod.rs`（本文件）：对外暴露胖 trait `PartRepoTrait`（44 方法合并单 trait，
 //!   口径见下文「方法计数口径」），并直接 `impl PartRepoTrait for &mut PgConnection`
@@ -30,7 +30,7 @@
 //!   `update_order_info`。上 trait 的**唯一动机是可 mock**：旧实现走
 //!   `conn_mut()` 内联 sqlx，匹配分档只能靠集成测试守护。
 //!
-//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（24）：`t_part_batch` 段（17）与跨域 helper
+//! ⚠️ trait 方法数 **不等于** `sql/` 静态方法数（25）：`t_part_batch` 段（17）与跨域 helper
 //! 中的一项转发到 `prod::batch` 域的 ZST 静态方法，`conn_mut` 则无对应 SQL 方法。
 //! 2026-10-06 起 `sql::PartRepo` 的**全部**静态方法都已上 trait（此前
 //! `list_children_by_assemblies` 是唯一漏项，由匹配链路补上）。
@@ -44,7 +44,7 @@
 //! 故 trait 改名 `PartRepoTrait`（与 shelf / customer / part_batch 范本同形）：
 //!
 //! - `part::repo::PartRepo` —— ZST struct（在 `sql/mod.rs` 内，通过 `pub use sql::PartRepo;`
-//!   重新导出至本模块），保留 24 个静态方法签名不变（cross-module 调用方零修改）。
+//!   重新导出至本模块），保留 25 个静态方法签名不变（cross-module 调用方零修改）。
 //! - `part::repo::PartRepoTrait` —— 本文件的胖 trait（44 方法合并单 trait），part 域
 //!   内部 service 用 `<R: PartRepoTrait>` 收。
 //!
@@ -89,11 +89,14 @@
 //! 44 个方法里 34 个返回 `sqlx::Error`、9 个返回 `AppError`
 //! （`t_part_batch.status` 写点 8 个 —— 契约是「没写成 = `VERSION_CONFLICT`」，
 //! 转 `sqlx::Error` 会把 409 降级成 500；`serial_prefix_for_customer` 1 个 ——
-//! 20308 / 20104 / 20102 三个业务码要原样透出）、`conn_mut` 无返回值。34 个
-//! `sqlx::Error` 按委托目标再分两处——**都是零翻译**，但 1:1 的对象不同：
-//! - 24 个 1:1 委托 `sql::PartRepo`（t_part 18 + t_part_event 1
-//!   + 采购订单 Excel 匹配 5，恰好等于 `sql/` 静态方法数）
-//! - 10 个 1:1 委托 `PartBatchRepo`（t_part_batch 段 9 + 跨域 helper 1）
+//! 20308 / 20104 / 20102 三个业务码要原样透出）、`conn_mut` 无返回值。
+//! 按委托目标分三处——**都是零翻译**，但 1:1 的对象不同：
+//! - 25 个 1:1 委托 `sql::PartRepo`（t_part 18 + t_part_event 1 + 跨域 helper 1
+//!   + 采购订单 Excel 匹配 5 = 恰好等于 `sql/` 静态方法数 25；其中 24 个返回
+//!     `sqlx::Error`，只有 `serial_prefix_for_customer` 返回 `AppError`）
+//! - 18 个 1:1 委托 `prod::batch::PartBatchRepo`（t_part_batch 段 17 + 跨域 helper 1
+//!   = 10 个返回 `sqlx::Error` + 8 个 status 写点返回 `AppError`）
+//! - `conn_mut` 1 个不委托任何域，只交出连接
 //!
 //! ## 已知架构债（D-6 阶段过渡）
 //!

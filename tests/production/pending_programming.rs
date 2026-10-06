@@ -473,8 +473,9 @@ async fn rule2_chain_contains_cnc_process_matches() {
 
 /// 场景 3: 规则3 单独命中 —— 无工艺链，但批次 `current_process_id` 指向 CNC 工序。
 ///
-/// 本场景是「工单还没建工艺链，但批次已在 CNC 工序流转」的形态，也是本端点相对
-/// part 域旧端点（走 `current_holder_id → t_shelf_process` 间接链路）的核心增益。
+/// 本场景是「工单还没建工艺链，但批次已在 CNC 工序流转」的形态：规则3 直读
+/// `t_part_batch.current_process_id` 这一权威列，不经 `current_holder_id →
+/// t_shelf_process` 的间接链路，故工艺链尚未建立也能命中。
 #[tokio::test]
 async fn rule3_batch_current_process_is_cnc_matches() {
     let (pool, app, token, _fx, cfx) = bootstrap().await;
@@ -905,8 +906,8 @@ async fn role_guard_manager_cnc_programmer_ok_shelf_account_403() {
 /// （与 `p.deleted_at IS NULL` 同级、在三规则括号之外）让规则2/3 同样受约束。
 /// 起因：`t_part.process_chain_id` 从不清空，规则2（链含 CNC 工序）本身不看 part
 /// 状态 → 历史上挂过 CNC 链的 `COMPLETED` / `DELIVERED` 工单会永久命中本页。
-/// 被替换的 part 域旧端点本来就有这条闸门（`tests/part/lifecycle.rs::
-/// list_pending_programming_excludes_completed_or_cancelled` 锁住），新端点不得更宽。
+/// 该闸门是本页口径底线：闸门一放宽，历史 CNC 链工单就永久回流本页，故改
+/// `WHERE_SKELETON` 的状态集合时必须同步看本用例。
 ///
 /// 断言口径：逐个 `assert!(!ids.contains(..))` 明确「该 id 不在结果里」，
 /// 同时用精确 id 集合 + `total` 兜住「没有多出别的行」。
