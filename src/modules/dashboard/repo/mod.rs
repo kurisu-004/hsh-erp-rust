@@ -18,8 +18,9 @@ pub use sql::{BatchLite, DashboardRepo, PartLite, RecentBatchesData};
 pub trait DashboardRepoTrait: Send {
     /// 未来 N 天交期分桶（柱状图 + 「今日到期」「N 天到期」两个 KPI）。
     ///
-    /// `today` 由 service 取一次时钟传进来：桶序列的起点必须与 VO 的 `today` 字段
-    /// 是同一个值，各自取一次会在跨零点窗口内给出两个不同的「今天」。
+    /// `today` 由 service 取一次时钟传进来，repo **绑进 SQL 的窗口下界**：桶序列起点、
+    /// 响应 VO 的 `today`、SQL 窗口下界必须是同一个值，各自取时钟会在跨零点窗口内
+    /// 给出两个不同的「今天」。
     async fn snapshot_counters(
         &mut self,
         today: NaiveDate,

@@ -14,10 +14,11 @@
 //! 4. 零鉴权：analytics 函数不调 `current.require_role()`
 //!
 //! ## 边界收敛
-//! 本库**只有 statistics 一个消费方**。`cargo test --lib` 的 dashboard 域隔离护栏
-//! （`modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`）把
-//! 「dashboard 不引域外库、也不引本库」钉死，防止第二个消费方再次出现（第二个消费方
-//! 会让任何一方改动都要跨文件确认，纯属负担）。
+//! 本库**当前只有 statistics 一个消费方**。`cargo test --lib` 的 dashboard 域隔离
+//! 护栏（`modules::dashboard::tests::dashboard_domain_depends_on_no_other_domain`）
+//! 挡的是「引其它业务域」这一类依赖——它只扫 `modules::<他域>` 路径，**不覆盖**
+//! `shared::analytics` 本身。所以「analytics 不长第二消费方」是**人工约定**而非
+//! 编译期保证：新增消费方时人得自己判断是否该把函数下沉到消费方自己的域内。
 
 pub mod daily_buckets;
 pub mod worker_contribution;

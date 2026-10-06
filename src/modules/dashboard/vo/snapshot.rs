@@ -9,6 +9,13 @@
 //! - `DashboardSnapshot`      —— 完整快照
 //! - `WorkerHeldBatch`        —— 工人在手加工批次行
 //! - `UpcomingDeliveryBucket` —— 未来 N 天交付分桶（counter）
+//!
+//! ## `ts` 时间戳格式（全域唯一口径）
+//! 三种 message 的 `ts` 一律走 `crate::infra::clock::now_shanghai_iso()`
+//! （= `to_rfc3339()`，固定 `+08:00` 偏移，小数秒位数按纳秒有效位自适应）。
+//! **禁止**用 `chrono::Local::now()`：那会让时间戳跟着**宿主**时区走，而域内其余
+//! 全部锁死 Asia/Shanghai，同一帧里两层 `ts` 于是可能给出两种时区表示。契约登记见
+//! `docs/api/dashboard.md` §7。
 
 use serde::Serialize;
 use std::collections::BTreeMap; // 2026-09-30 新增：upcoming_delivery 桶按状态细分（按 OrderStatus 字面 → 件数；字母序保证 key 顺序确定，前端按 key 精确查）
@@ -26,13 +33,10 @@ pub struct WsSnapshotMsg {
 
 impl WsSnapshotMsg {
     pub fn new(data: DashboardSnapshot) -> Self {
-        let ts = chrono::Local::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-            .to_string();
         Self {
             msg_type: "snapshot",
             data,
-            ts,
+            ts: crate::infra::clock::now_shanghai_iso(),
         }
     }
 }
@@ -48,14 +52,11 @@ pub struct WsEventMsg {
 
 impl WsEventMsg {
     pub fn new(event_type: impl Into<String>, data: serde_json::Value) -> Self {
-        let ts = chrono::Local::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-            .to_string();
         Self {
             msg_type: "event",
             event_type: event_type.into(),
             data,
-            ts,
+            ts: crate::infra::clock::now_shanghai_iso(),
         }
     }
 }
@@ -81,11 +82,11 @@ pub struct DashboardSnapshot {
     /// 工人在手加工批次（替代原 in_process，字段已收窄，见 WorkerHeldBatch）
     pub in_process: Vec<WorkerHeldBatch>,
     /// 最紧急工单 + 部分已交（2026-10-07 新增，从 com/union_list 域外聚合迁入本域）
-    pub system_delivery_orders: crate::modules::dashboard::vo::delivery::SystemDeliveryOrders,
+    pub system_delivery_orders: super::delivery::SystemDeliveryOrders,
     pub ts: String,
 }
 
-/// 工人在手加工批次（2026-10-07 由 19 字段的 `DashboardItem` 收窄到 7）
+/// 工人在手加工批次（7 字段最小集）
 ///
 /// 字段集按前端「在加工」列表实际渲染反推：工单锚点 + 批次锚点 + 展示名 + 数量 +
 /// 加急标记 + 持有工人身份。`batch_id` **必须保留** —— 前端列表以它做 `:key`

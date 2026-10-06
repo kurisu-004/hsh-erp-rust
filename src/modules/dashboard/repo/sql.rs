@@ -74,20 +74,29 @@ fn row_to_part_batch_pair(r: sqlx::postgres::PgRow) -> (BatchLite, PartLite) {
 // WHERE 的两处范围比较对 NULL 恒为 false，故 `system_delivery_date IS NULL` 的
 // 工单在 system 口径下整件不计入——与 union-list 端点「NULL 交期不被命中」的
 // 既有语义一致，无需额外写 `IS NOT NULL`。
+//
+// ## 窗口下界必须来自形参而非 `CURRENT_DATE`（2026-10-07）
+// 窗口下界取 `$2`（绑定 service 传入的 `today`），**不写 `CURRENT_DATE`**：
+// `CURRENT_DATE` 是 DB **会话时区**的今天，与本仓统一的 Asia/Shanghai 口径
+// （`infra::clock::now_naive()`）是两个独立时钟，测试容器会话时区正是 UTC。
+// 两者不一致时（Shanghai 00:00–08:00 共 8 小时）`CURRENT_DATE == today - 1`，
+// 于是 `today - 1` 那天命中的行落进一个**根本不生成**的桶被静默丢弃，
+// 同时末桶恒为 0（SQL 窗口右开，右端随下界一起前移一天）。
+// 形参化之后 SQL 窗口与 Rust 侧桶循环共用同一个 `today`，两个时钟只剩一个。
 const SQL_COUNTERS_PLANNED: &str = "SELECT planned_delivery_date AS d, status AS s, COUNT(*)::bigint AS cnt \
      FROM t_part \
      WHERE deleted_at IS NULL \
        AND status NOT IN ('COMPLETED', 'CANCELLED') \
-       AND planned_delivery_date >= CURRENT_DATE \
-       AND planned_delivery_date < CURRENT_DATE + ($1::bigint || ' days')::interval \
+       AND planned_delivery_date >= $2::date \
+       AND planned_delivery_date < $2::date + ($1::bigint || ' days')::interval \
      GROUP BY planned_delivery_date, status";
 
 const SQL_COUNTERS_SYSTEM: &str = "SELECT system_delivery_date AS d, status AS s, COUNT(*)::bigint AS cnt \
      FROM t_part \
      WHERE deleted_at IS NULL \
        AND status NOT IN ('COMPLETED', 'CANCELLED') \
-       AND system_delivery_date >= CURRENT_DATE \
-       AND system_delivery_date < CURRENT_DATE + ($1::bigint || ' days')::interval \
+       AND system_delivery_date >= $2::date \
+       AND system_delivery_date < $2::date + ($1::bigint || ' days')::interval \
      GROUP BY system_delivery_date, status";
 
 // ---------------------------------------------------------------------------
@@ -110,15 +119,20 @@ impl DashboardRepo {
         // 堆叠底座）。WHERE 排除 COMPLETED / CANCELLED，故 by_status 不会含这两个 key
         // （沿前端 `z.record(z.string(), z.number())` 必填契约）。
         //
-        // 两段完整字面量按 `basis` 二选一。`today` 由 service 传进来而不是本方法自己
-        // 取时钟——桶序列的起点必须与 VO 的 `today` 字段是**同一个值**，各自取一次时钟
-        // 会在跨零点窗口内给出两个不同的「今天」，表现为 `buckets[0].date != today`
-        // （前端一个桶都匹配不上）。
+        // 两段完整字面量按 `basis` 二选一。`today` 由 service 传进来、**绑进 SQL 的
+        // 窗口下界**（`$2`）而不是在 SQL 里取 `CURRENT_DATE`：桶序列的起点、
+        // 响应 VO 的 `today` 字段、SQL 的窗口下界必须是同一个值。跨零点窗口内若 SQL
+        // 另取一次 DB 会话时区的时钟，会与上面两个值差一天，表现为当天行被静默丢弃
+        // 且末桶恒 0（详见两段常量上方的「窗口下界」小节）。
         let sql = match basis {
             DeliveryBasis::Planned => SQL_COUNTERS_PLANNED,
             DeliveryBasis::System => SQL_COUNTERS_SYSTEM,
         };
-        let rows = sqlx::query(sql).bind(days).fetch_all(&mut *conn).await?;
+        let rows = sqlx::query(sql)
+            .bind(days)
+            .bind(today)
+            .fetch_all(&mut *conn)
+            .await?;
         // (date, status) → 件数
         let mut bucket: HashMap<(NaiveDate, String), i64> = HashMap::new();
         for r in rows {

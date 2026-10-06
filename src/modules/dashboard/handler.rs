@@ -27,6 +27,14 @@ use crate::state::AppState;
 const WS_REAUTH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// `statuses` 参数的元素数上限。抽屉按 status 过滤，真实入参就是前端 `LAYERS[]`
+/// 里的几个字面量（≤ 8），16 留了两倍余量；超过即判为误传。
+const STATUSES_MAX_ITEMS: usize = 16;
+
+/// `statuses` 参数的原始串长度上限（字节）。16 个 12 字符的状态字面量 + 分隔符
+/// 约 208 字节，256 够用。防的是「几百 KB 的逗号串」被整份绑进 `text[]`。
+const STATUSES_MAX_RAW_LEN: usize = 256;
+
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
     pub token: Option<String>,
@@ -131,6 +139,32 @@ pub async fn get_delivery_orders(
         .statuses
         .as_deref()
         .ok_or_else(|| AppError::validation("statuses 必填（逗号分隔的 OrderStatus 字面量）"))?;
+    let statuses = parse_status_filter(raw)?;
+
+    let mut tx = state.pool.begin().await?;
+    let out = state
+        .dashboard_service
+        .build_delivery_order_details(&mut *tx, date, statuses, q.basis)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// 解析并限长 `statuses` 查询串（逗号分隔的 OrderStatus 字面量列表）。
+///
+/// 只做**非空 + 限长**校验，**不校验元素是否属 `DELIVERY_STATUSES`**：抽屉按层
+/// 传子集，白名单之外的字面量一律查 0 行（而不是 400），前端因此可以先于后端上线
+/// 新的图层状态而不必等后端放行白名单。
+///
+/// 限长是防误传巨串——`statuses` 会整份绑进 `status = ANY($2::varchar[])`，
+/// 几百 KB 的串就是几百 KB 的绑定参数。
+fn parse_status_filter(raw: &str) -> Result<Vec<String>, AppError> {
+    if raw.len() > STATUSES_MAX_RAW_LEN {
+        return Err(AppError::validation(format!(
+            "statuses 过长（{} 字节，上限 {STATUSES_MAX_RAW_LEN}）",
+            raw.len()
+        )));
+    }
     let statuses: Vec<String> = raw
         .split(',')
         .map(str::trim)
@@ -140,14 +174,13 @@ pub async fn get_delivery_orders(
     if statuses.is_empty() {
         return Err(AppError::validation("statuses 至少需要一个非空状态字面量"));
     }
-
-    let mut tx = state.pool.begin().await?;
-    let out = state
-        .dashboard_service
-        .build_delivery_order_details(&mut *tx, date, statuses, q.basis)
-        .await?;
-    tx.commit().await?;
-    Ok(Json(R::ok(out)))
+    if statuses.len() > STATUSES_MAX_ITEMS {
+        return Err(AppError::validation(format!(
+            "statuses 元素过多（{} 个，上限 {STATUSES_MAX_ITEMS}）",
+            statuses.len()
+        )));
+    }
+    Ok(statuses)
 }
 
 async fn handle_socket(
@@ -603,5 +636,69 @@ mod tests {
     fn reauth_unknown_code_defaults_to_1011() {
         assert_eq!(reauth_close_code(12345), (1011, "re-auth unavailable"));
         assert_eq!(reauth_close_code(0), (1011, "re-auth unavailable"));
+    }
+
+    #[test]
+    fn statuses_filter_trims_blanks_and_dedups_nothing() {
+        assert_eq!(
+            parse_status_filter("PENDING, IN_PROCESS ,").unwrap(),
+            vec!["PENDING".to_string(), "IN_PROCESS".to_string()],
+            "空白元素应被丢弃、首尾空白应被 trim"
+        );
+    }
+
+    #[test]
+    fn statuses_filter_accepts_status_outside_the_whitelist() {
+        // 刻意不校验白名单：抽屉按层传子集，白名单外的字面量查 0 行而非 400
+        assert_eq!(
+            parse_status_filter("PENDING,SOME_FUTURE_STATUS").unwrap(),
+            vec!["PENDING".to_string(), "SOME_FUTURE_STATUS".to_string()]
+        );
+    }
+
+    #[test]
+    fn statuses_filter_rejects_empty_and_blank_only() {
+        for raw in ["", "   ", ",,", " , , "] {
+            let err = parse_status_filter(raw)
+                .err()
+                .unwrap_or_else(|| panic!("{raw:?} 应被判空"));
+            assert_eq!(
+                err.code(),
+                code::VALIDATION_ERROR,
+                "{raw:?} 应走 validation 码"
+            );
+        }
+    }
+
+    #[test]
+    fn statuses_filter_rejects_oversized_raw_and_too_many_items() {
+        // 巨串：1 个超长元素，长度闸门先拦
+        let huge = "X".repeat(STATUSES_MAX_RAW_LEN + 1);
+        assert!(
+            parse_status_filter(&huge).is_err(),
+            "超过 {STATUSES_MAX_RAW_LEN} 字节的串必须被拒"
+        );
+
+        // 元素数超限：每个元素 3 字节 + 分隔符，总长在闸门内、元素数超
+        let many = std::iter::repeat_n("ABC", STATUSES_MAX_ITEMS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            many.len() <= STATUSES_MAX_RAW_LEN,
+            "构造的元素数用例不应先被长度闸门拦下，否则测的不是元素数闸门"
+        );
+        assert!(
+            parse_status_filter(&many).is_err(),
+            "超过 {STATUSES_MAX_ITEMS} 个元素必须被拒"
+        );
+
+        // 恰好在上限内必须放行（边界不误伤）
+        let at_limit = std::iter::repeat_n("ABC", STATUSES_MAX_ITEMS)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_status_filter(&at_limit).unwrap().len(),
+            STATUSES_MAX_ITEMS
+        );
     }
 }

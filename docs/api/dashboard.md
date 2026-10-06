@@ -6,7 +6,7 @@
 
 | # | 方法 | 路径 | 权限 | 入参 | 响应 |
 |---|---|---|---|---|---|
-| 1 | GET | `/api/v2/dashboard/snapshot` | 登录即可（**无角色闸门**，见 §8.8） | 无 | `DashboardSnapshot` |
+| 1 | GET | `/api/v2/dashboard/snapshot` | 登录即可（**无角色闸门**） | 无 | `DashboardSnapshot` |
 | 2 | GET | `/api/v2/dashboard/upcoming-delivery` | 登录即可 | `days?`（string-or-number，缺省 14，clamp 1..60）、`basis?`（`planned` / `system`，缺省 `system`） | `UpcomingDeliveryBuckets` |
 | 3 | GET | `/api/v2/dashboard/delivery-orders` | 登录即可 | `date`（**必填** `YYYY-MM-DD`）、`statuses`（**必填**，逗号分隔）、`basis?`（缺省 `system`） | `DeliveryOrderDetailOut` |
 | 4 | GET | `/ws/dashboard` | `?token=` JWT + Redis session | `token`（必填 query 参数） | WS：首帧 snapshot + 增量事件 + text 心跳 |
@@ -15,6 +15,8 @@
 - 端点 1 **不接受**任何 query 参数（分桶已拆到端点 2）。传旧参数 `upcoming_days` / `basis` 不会报错，但被忽略。
 - 端点 2 / 3 的 `basis` 非法取值（如 `?basis=xxx`）由 axum `Query` 提取器返 **HTTP 400 纯文本**，**不走 `R<T>` 信封**。
 - 端点 3 的 `date` 缺失 / 非法格式、`statuses` 缺失 / 全空白一律走 `AppError::validation`（**40001** / HTTP 422，走 `R<T>` 信封）。
+- 端点 3 的 `statuses` 有**限长闸门**：原始串 ≤ **256 字节**、元素数 ≤ **16**（`STATUSES_MAX_RAW_LEN` / `STATUSES_MAX_ITEMS`），超限同样走 40001。超限是防误传巨串——整份参数会绑进 `status = ANY($2::varchar[])`。
+- 端点 3 的 `statuses` **不校验元素是否属白名单**：不属于 `DELIVERY_STATUSES` 的字面量一律**查 0 行**（不是 400），前端因此可以先于后端上线新图层状态。
 
 ## 2. `DashboardSnapshot` 逐字段
 
@@ -24,7 +26,7 @@
 | `in_inspection_count` | number | `repo/sql.rs::count_inspection_batches`：`t_part_batch` JOIN `t_part`，`status='INSPECTION'` + 双软删闸门 + `current_holder_id IN (品检区 active 货架)` |
 | `in_process[]` | array | `repo/sql.rs::fetch_worker_rows`：`t_part_batch` JOIN `t_part`，`status='IN_PROCESS' AND location='WORKER'` |
 | `system_delivery_orders` | object | `repo/delivery.rs::list_system_delivery_orders`（见 §2.2） |
-| `ts` | string | 服务端时间戳（`infra::clock::now_shanghai_iso()`） |
+| `ts` | string | 服务端时间戳（`infra::clock::now_shanghai_iso()`，格式见 §7） |
 
 ### 2.1 `in_process[]`（`WorkerHeldBatch`，7 字段）
 
@@ -59,9 +61,11 @@
 |---|---|---|
 | `today` | string | **后端**判定的今天（`YYYY-MM-DD`，口径 `infra::clock::now_naive()` = Asia/Shanghai）。与 `buckets[0].date` 是**同一个值** |
 | `buckets[]` | array | 恒为请求的 `days` 条，缺失日期已在 Rust 侧零填充；每条 `{ date, count, by_status }` |
-| `ts` | string | 服务端时间戳 |
+| `ts` | string | 服务端时间戳（格式见 §7） |
 
 `by_status` 是 `OrderStatus → 件数` 的 map（`BTreeMap`，key 字母序确定）。SQL 排除了 `COMPLETED` / `CANCELLED`。
+
+**窗口下界来自传入的 `today`，不是 SQL 的 `CURRENT_DATE`**：SQL 窗口是 `[today, today + days)`，两个端点都用 `$2` 绑定 service 取的那一个 `today`（`infra::clock::now_naive()`，Asia/Shanghai）。`CURRENT_DATE` 是 DB **会话时区**的今天，与前者是两个独立时钟；不一致时（Asia/Shanghai 00:00–08:00 共 8 小时窗口）当天行会落进一个不生成的桶被静默丢弃、末桶恒 0。集成测试 `snapshot_counters_window_anchors_on_passed_today_not_current_date` 钉住这条。
 
 ### 3.2 `DeliveryOrderDetailOut`
 
@@ -71,7 +75,7 @@
 | `basis` | string | 回显请求的口径（`planned` / `system`） |
 | `total` | number | 匹配总数，**不受 `items` 截断影响**（前端据此显示「共 N 件」）。裸 JSON number，不字符串化 |
 | `items[]` | array | 最多 **200** 行（`DELIVERY_DETAIL_LIMIT`） |
-| `ts` | string | 服务端时间戳 |
+| `ts` | string | 服务端时间戳（格式见 §7） |
 
 行字段（`DeliveryOrderDetail`）：`id`（字符串）/ `serial_no` / `drawing_no` / `name` / `l1_customer_name` / `customer_name` / `status` / `planned_delivery_date` / `system_delivery_date`。
 
@@ -79,12 +83,13 @@
 
 ## 4. 口径表
 
-`DELIVERY_STATUSES`（`repo/delivery.rs`，6 态）是「未交付」的**唯一**判据，被三处共用：
+`DELIVERY_STATUSES`（`repo/delivery.rs`，6 态）是「未交付」的**唯一**判据，被四处共用：
 
 | 用途 | SQL 状态条件 |
 |---|---|
 | 逾期计数（端点 1 `overdue_count`） | `status = ANY(DELIVERY_STATUSES)` |
-| 面板 + 抽屉（端点 1 `system_delivery_orders` / 端点 3） | `status = ANY(DELIVERY_STATUSES)`（端点 3 允许前端按层传子集） |
+| 最紧急 + 部分已交面板（端点 1 `system_delivery_orders`） | `status = ANY(DELIVERY_STATUSES)` |
+| 柱状图下钻抽屉（端点 3） | `status = ANY(DELIVERY_STATUSES)`（允许前端按层传子集） |
 | 柱状图分桶（端点 2）`by_status` | top(4) + middle(2) 正是这 6 态；**bottom 层额外含 `DELIVERED`** |
 
 ### 4.1 行单位差异（跨端对数前必读）
@@ -117,16 +122,18 @@
 | 被移除项 | 原因 |
 |---|---|
 | `snapshot.on_production_shelves`（整棵嵌套树） | 前端零渲染（货架轮播区已下线），后端仍在全额计算整棵树 + 5 条附表 SQL |
-| `snapshot.on_inspection_shelves`（每行 12 列） | 前端只取 `.length` 喂「在检」KPI → 改为后端 `COUNT(*)` |
+| `snapshot.on_inspection_shelves`（行类型 `DashboardItem`，19 字段） | 前端只取 `.length` 喂「在检」KPI → 改为后端 `COUNT(*)` |
 | `snapshot.upcoming_delivery` | 分桶数据量与刷新频率都与快照主体不同（`days` / `basis` 可变）→ 拆到端点 2 |
 | `GET /snapshot?upcoming_days=` / `?basis=` | 随分桶一起迁到端点 2（快照本身无口径概念） |
 | `shared::analytics::shelf_grouping` | 唯一调用方是给 `on_production_shelves` 分桶；随该字段下线后成为死码 |
 
-`snapshot.in_process` 由 19 字段收窄到 7 字段（`WorkerHeldBatch`）：14 个字段零消费，其中 5 个各自对应一条额外 SQL（客户路径 / 工序名 / PICKED_UP 时间等）。原「每 holder top-N」限流整体移除（工厂规模用不上，截流只会让在制清单莫名缺行）。
+`snapshot.in_process` 由 19 字段收窄到 7 字段（`WorkerHeldBatch`）：12 个字段零消费，其中 5 个各自对应一条额外 SQL（客户路径 / 工序名 / PICKED_UP 时间等）。原「每 holder top-N」限流整体移除（工厂规模用不上，截流只会让在制清单莫名缺行）。
 
 ## 7. 与 WS 的关系
 
 - **首帧 snapshot 仅作连接就绪信号**：`GET /ws/dashboard` 握手后推一帧 `{type:"snapshot", data:<DashboardSnapshot>, ts}`，前端据此确认连接可用。数据主体请走 HTTP 端点 1（语义是「WS 事件 → invalidate → HTTP 重取」，不是增量 patch）。
+- **`ts` 时间戳格式（全域唯一口径）**：所有 message 的 `ts` 都是 **RFC 3339 / ISO 8601 带固定偏移**字符串，恒为 `YYYY-MM-DDTHH:MM:SS[.小数秒]+08:00`，由 `infra::clock::now_shanghai_iso()` 产生。小数秒位数按纳秒有效位自适应（0 / 3 / 6 / 9 位），**不保证逐字等长**——JS `new Date(...)` 两种都能解析，前端不要按固定小数位数做字符串截取比较。外层 envelope 的 `ts` 与嵌套 `data.ts` 同格式、同为 Asia/Shanghai（宿主时区不影响）。
+  - 唯一例外是心跳帧：`{type:"heartbeat", ts:<unix 秒整数>}`（非字符串，见下）。
 - **`WsEvent::DashboardSnapshot` 已删**（零生产方）。`WsEvent` 现在只有 `DashboardEvent { kind, payload }` 一个变体。
 - **`kind` 事件集**（后端全量 `ws_hub.broadcast` 生产方）：
 

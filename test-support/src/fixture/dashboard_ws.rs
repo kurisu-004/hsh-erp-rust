@@ -1,7 +1,7 @@
 //! 集成测试 fixture（PR13 Phase I 引入，2026-09-24）：dashboard_ws 域预制 fixture
 //!
-//! `tests/dashboard_ws_api.rs`（413 行）单文件使用。覆盖：
-//! - service 层 `DashboardService::build_snapshot_with_workers` JSON shape
+//! `tests/dashboard_ws_api.rs` 单文件使用。覆盖：
+//! - service 层 `DashboardService::build_snapshot` JSON shape
 //! - WsHub 事件 / snapshot 订阅通路
 //! - 真实 socket E2E（WS 握手 / heartbeat / snapshot）
 //!
@@ -11,7 +11,7 @@
 //!
 //! 不预置 `t_customer` / `t_part` / `t_part_batch` / `t_shelf`：每个用例现场插
 //! 数据，避免 fixture 占用 shelf code / customer prefix 与测试现场字面冲突
-//! （snapshot 按 shelf.code 查找）。
+//! （dashboard 域的 SQL 不按 `shelf.code` 分组，shelf 行由用例按需自插）。
 
 use sqlx::PgPool;
 

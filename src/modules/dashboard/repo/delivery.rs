@@ -13,10 +13,10 @@
 //! 同一条工单不会同时出现在两处。
 //!
 //! ⚠️ 本文件全部走运行时 `sqlx::query`（与本域既有风格一致，不进 `.sqlx/` 离线缓存），
-//! **运行时不校验占位符个数**：SQL 少写一个 `$n` 不会编译失败、也不会报错，只是
-//! 那个参数被静默忽略（本域已踩过一次：`LIMIT $3` 漏写导致截断失效，集成测试
-//! `delivery_order_details_total_exceeds_items_when_truncated` 才逮到）。改这些 SQL
-//! 后请重跑该用例。
+//! 而运行时 `query` **不校验占位符个数**：SQL 少写一个 `$n` 不会编译失败、也不报错，
+//! 那个参数被静默忽略。改动本文件的 SQL 后必须重跑集成测试
+//! `delivery_order_details_total_exceeds_items_when_truncated`（`LIMIT $3` 漏写会让
+//! 截断失效，正是该用例的守门目标）。
 
 use chrono::NaiveDate;
 use sqlx::{PgConnection, Row};

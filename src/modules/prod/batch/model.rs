@@ -66,19 +66,15 @@
 //!   直读会让这些端点的 `next_process_id` / `next_process_name` 结构性恒 null
 //!   （用户可见回归）。
 //!
-//! - ⚠️ **dashboard 不在此清单内，且不可一刀切**（2026-09-30 复核修正）：
-//!   `dashboard/repo/sql.rs` 的 3 条查询性质**不同**，勿套用上条：
-//!   - `on_prod_rows`（`status='IN_PROCESS'` + holder 在生产架）与
-//!     `fetch_worker_rows`（`status='IN_PROCESS' AND location='WORKER'`）
-//!     —— 判据是 `current_process_id` **本身**（在池归属），直读**正确且必要**，
-//!     正是本迁移要修的旗舰场景（step 为 NULL 的已下发批次也要能显示工序）。
-//!   - `fetch_zone_rows("INSPECTION", Some("INSPECTION"))`
-//!     —— 品检区批次，cpid 按出池不变式恒 NULL，直读会让 `next_process_id` 为
-//!     null，**与上条 1-3 同形**。⚠️ 疑似 M3 同形漏网项，**尚未甄别修复**，
-//!     留作独立 follow-up（本次未动，避免扩大 scope）。
-//!
-//!   迁移 004 注释里「展示类列表 … / dashboard 继续走 step 派生」的措辞对
-//!   dashboard 这 3 条**不准确**，以本清单为准。
+//! - ⚠️ **dashboard 不在上条清单内，也不需要进清单**（2026-10-07 复核）：它现在只剩
+//!   2 条相关查询，两条都碰不到「派生 vs 直读」这个选择：
+//!   - `dashboard/repo/sql.rs::fetch_worker_rows`
+//!     （`status='IN_PROCESS' AND location='WORKER'`）—— 判据是**位置**
+//!     （压在工人手上），不投影任何工序字段，无从选择；
+//!   - `dashboard/repo/sql.rs::count_inspection_batches`
+//!     （`status='INSPECTION'` + holder 在品检区 active 货架）—— 只 `COUNT(*)`，
+//!     不返回行内容，同样没有工序名可渲染。
+//!     改这两条查询时若新增了工序字段投影，先回到本段重新判断该走 step 派生还是直读。
 //!
 //! 5 条池 SQL 全部硬限定 `status='IN_PROCESS' AND location='PRODUCTION_SHELF'`
 //! —— 这是「出池必须置 NULL」这条不变式的兜底，也是为什么残留脏值不会污染候选池。

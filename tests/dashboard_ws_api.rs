@@ -8,31 +8,38 @@
 //!
 //!   service 层交期三方法：
 //!     3. snapshot_counters_by_status_returns_per_status_breakdown
-//!     4. overdue_count_* （6 组口径，见下方小节标题）
-//!     5. system_delivery_orders_* （分桶 / 截断 / 窗口边界）
-//!     6. delivery_order_details_* （单日 / 状态 / total 与截断 / 两口径）
+//!     4. snapshot_counters_window_anchors_on_passed_today_not_current_date
+//!                                                  — 分桶窗口下界取自传入 `today`
+//!                                                    而非 SQL `CURRENT_DATE`（核心回归）
+//!     5. overdue_count_* （6 组口径，见下方小节标题）
+//!     6. system_delivery_orders_* （分桶 / 截断 / 窗口边界）
+//!     7. delivery_order_details_* （单日 / 状态 / total 与截断 / 两口径）
 //!
 //!   ws_hub 协作：
-//!     7. ws_hub_broadcast_subscription_receives_event — 业务事件订阅通路
+//!     8. ws_hub_broadcast_subscription_receives_event — 业务事件订阅通路
 //!
 //!   真实 socket E2E：
-//!     8. ws_e2e_invalid_token_rejected        — 40101（JWT 验签失败）/ 40100（缺 token）
-//!     9. ws_e2e_valid_token_receives_snapshot — 握手后 ≤ 5s 收首条 snapshot text
-//!    10. ws_e2e_valid_token_receives_heartbeat_text — ≤ 心跳间隔 + 5s 同时收齐
+//!     9. ws_e2e_invalid_token_rejected        — 40101（JWT 验签失败）/ 40100（缺 token）
+//!    10. ws_e2e_valid_token_receives_snapshot — 握手后 ≤ 5s 收首条 snapshot text；
+//!                                                  同时断言外层 / 内层 `ts` 同为 +08:00
+//!    11. ws_e2e_valid_token_receives_heartbeat_text — ≤ 心跳间隔 + 5s 同时收齐
 //!                                                  ① `WsHeartbeatMsg` text 帧 ② 服务端 protocol-level
 //!                                                  Ping ③ 客户端 Ping 的 Pong 回声
-//!    11. ws_e2e_lagged_client_gets_4003_close  — 慢消费方 Lagged → 4003 lagged Close 帧
-//!    12. ws_e2e_pong_timeout_closes_dead_peer  — 不回任何帧 → 1011 pong timeout Close 帧
-//!    13. ws_e2e_conn_registry_counts           — 连接表 register/unregister 计数
-//!    14. ws_e2e_server_shutdown_sends_1012     — shutdown.cancel() → 1012 server restart
-//!    15. ws_e2e_reauth_failure_sends_4001_close — 吊销 session → 周期 re-auth 失败 → 4001
+//!    12. ws_e2e_lagged_client_gets_4003_close  — 慢消费方 Lagged → 4003 lagged Close 帧
+//!    13. ws_e2e_pong_timeout_closes_dead_peer  — 不回任何帧 → 1011 pong timeout Close 帧
+//!    14. ws_e2e_conn_registry_counts           — 连接表 register/unregister 计数
+//!    15. ws_e2e_server_shutdown_sends_1012     — shutdown.cancel() → 1012 server restart
+//!    16. ws_e2e_reauth_failure_sends_4001_close — 吊销 session → 周期 re-auth 失败 → 4001
 //!
 //!   HTTP 端点：
-//!    16. http_snapshot_unauthenticated_returns_401
-//!    17. http_snapshot_happy_path_returns_full_shape
-//!    18-21. `GET /dashboard/upcoming-delivery`：缺省 days=14 / days=7 / basis 切换 /
+//!    17. http_snapshot_unauthenticated_returns_401
+//!    18. http_snapshot_happy_path_returns_full_shape
+//!    19-22. `GET /dashboard/upcoming-delivery`：缺省 days=14 / days=7 / basis 切换 /
 //!         basis 非法值 → 400 + today 字段
-//!    22-24. `GET /dashboard/delivery-orders`：date / statuses 的 40001 契约 + 正常返回
+//!    23-25. `GET /dashboard/delivery-orders`：date / statuses 的 40001 契约 + 正常返回
+//!
+//! （`statuses` 的限长闸门 `STATUSES_MAX_ITEMS` / `STATUSES_MAX_RAW_LEN` 由 lib 单测
+//!   `handler::tests::statuses_filter_*` 覆盖，不进本 binary。）
 //!
 //! 测试栈：必须建 Redis pool，session 写入才算「已吊销」
 //!
@@ -49,14 +56,14 @@ use hsh_erp_rust::infra::snowflake::SnowflakeIdGenerator;
 use hsh_erp_rust::infra::ws_hub::WsEvent;
 use hsh_erp_rust::modules::dashboard::dto::DeliveryBasis;
 use hsh_erp_rust::modules::dashboard::repo::{
-    DELIVERY_BUCKET_LIMIT, DELIVERY_DETAIL_LIMIT, DELIVERY_STATUSES,
+    DELIVERY_BUCKET_LIMIT, DELIVERY_DETAIL_LIMIT, DELIVERY_STATUSES, DashboardRepo,
 };
 use hsh_erp_rust::modules::dashboard::service::DashboardService;
 use hsh_erp_test_support::{
     DashboardWsFixture, json_request, load_dashboard_ws_fixture, send as ts_send, send_raw,
     test_app, test_pool, test_state, test_ws_app,
 };
-use sqlx::PgPool;
+use sqlx::{Acquire, PgPool};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -300,6 +307,107 @@ async fn snapshot_counters_by_status_returns_per_status_breakdown() {
         assert_eq!(b.count, 0, "day idx={idx} count 应为 0");
         assert!(b.by_status.is_empty(), "day idx={idx} by_status 应为空 map");
     }
+}
+
+/// `snapshot_counters` 的窗口下界必须锚在**传入的 `today`** 上，不能是 SQL 里的
+/// `CURRENT_DATE`（2026-10-07 补）。
+///
+/// ## 怎么构造出可证伪的场景
+/// 会话时区显式锁成 UTC（`SET LOCAL TIME ZONE`，与容器默认值、宿主时区都无关），
+/// 然后传入一个**严格早于 DB 今日 3 天**的 `today`。此刻 `CURRENT_DATE` 与传入
+/// `today` 相差 3 天，两种实现给出的分桶完全不同：
+/// - 窗口下界写 `CURRENT_DATE`：锚在 `today` 的行被 WHERE 排除 → 桶 0 恒 0，
+///   DB 今日的行反落进桶 0，末桶恒空；
+/// - `today` 绑进 `$2`：桶 0 拿到锚在 `today` 的行，DB 今日的行落到对应 offset。
+///
+/// 断言里刻意避开「桶日期序列首元素 == today」这种两套实现都能过的弱断言，
+/// 改用**每桶计数**——只有窗口下界真取自 `today` 时才成立。
+#[tokio::test]
+async fn snapshot_counters_window_anchors_on_passed_today_not_current_date() {
+    const DAYS: i64 = 7;
+    let pool = setup().await;
+    let snowflake = SnowflakeIdGenerator::new(1_577_836_800_000, 1);
+    // serial_prefix 是 varchar(1)，根客户前缀按用例取单字符（每个用例独立库，无冲突）
+    let cust_id = insert_customer(&pool, &snowflake, "anchor_cust", "N").await;
+
+    let mut conn = pool.acquire().await.unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    // 锁死会话时区，让 `CURRENT_DATE` 与传入 today 的关系可控、可复现
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let db_today: NaiveDate = sqlx::query_scalar("SELECT CURRENT_DATE")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+    // 传入一个严格早于 DB 今日 3 天的 today（= DB 今日 - 3）
+    let today = db_today - chrono::Duration::days(3);
+
+    // 四行数据，锚点分别落在：桶 0（today）、桶 3（DB 今日 = today+3）、
+    // 末桶（today+DAYS-1 = today+6）、以及窗口右开边界外（today+DAYS）。
+    // 状态取 IN_PROCESS（在 `status NOT IN ('COMPLETED','CANCELLED')` 白名单内）。
+    let anchors = [
+        today,                                    // 桶 0
+        today + chrono::Duration::days(3),        // 桶 3（= DB 今日）
+        today + chrono::Duration::days(DAYS - 1), // 末桶 6
+        today + chrono::Duration::days(DAYS),     // 窗口右开边界外
+    ];
+    for anchor in anchors {
+        insert_part(
+            &pool,
+            &snowflake,
+            cust_id,
+            "IN_PROCESS",
+            Some(anchor),
+            today,
+        )
+        .await;
+    }
+
+    let out = DashboardRepo::snapshot_counters(&mut tx, today, DAYS, DeliveryBasis::System)
+        .await
+        .expect("snapshot_counters ok");
+    drop(tx);
+
+    assert_eq!(out.len(), DAYS as usize, "桶数恒等于传入的 days");
+    assert_eq!(
+        out[0].date,
+        today.format("%Y-%m-%d").to_string(),
+        "桶序列起点必须是传入的 today"
+    );
+
+    // 核心断言：窗口下界取自传入 today。若 SQL 仍用 CURRENT_DATE（= today+3），
+    // 锚在 today 的这行会被排除、这里就变成 0。
+    assert_eq!(
+        out[0].count, 1,
+        "桶 0 必须收到锚在传入 today 上的行（SQL 窗口下界取自 today 而非 CURRENT_DATE）"
+    );
+
+    // DB 今日的行必须落在「today+3」这一桶，而不是像 CURRENT_DATE 实现那样落进桶 0。
+    assert_eq!(
+        out[3].date,
+        (today + chrono::Duration::days(3))
+            .format("%Y-%m-%d")
+            .to_string()
+    );
+    assert_eq!(
+        out[3].count, 1,
+        "锚在 DB 今日的行必须按 today 锚点落到 offset=3 的桶，而不是 CURRENT_DATE 锚点的桶 0"
+    );
+
+    // 末桶非零 ⇒ 窗口右端同样是 `today + DAYS`（若右端跟 CURRENT_DATE 前移，
+    // `today+6` 会在窗口外、末桶恒 0）。
+    assert_eq!(
+        out[(DAYS - 1) as usize].count,
+        1,
+        "末桶必须收到锚在 today+DAYS-1 上的行（窗口右端 = today + days）"
+    );
+
+    // 窗口右开：`today+DAYS` 那一行不在任何桶里（sum 应为 3 而非 4）
+    let sum: i64 = out.iter().map(|b| b.count).sum();
+    assert_eq!(sum, 3, "窗口右开，today+DAYS 那行不应计入任何桶");
 }
 
 #[tokio::test]
@@ -557,6 +665,21 @@ async fn ws_e2e_valid_token_receives_snapshot() {
         data["system_delivery_orders"]["partial"].is_array(),
         "system_delivery_orders.partial 应为 array"
     );
+
+    // 2026-10-07：外层 envelope 的 `ts` 与嵌套 `data.ts` 必须同格式、都锁死
+    // Asia/Shanghai。回归点是外层曾用 `chrono::Local::now()`——它跟**宿主**时区走，
+    // 于是同一帧里两层 `ts` 可能给出两种时区表示（CI 宿主非 +08 时即刻现形）。
+    for (label, ts) in [("外层 ts", &v["ts"]), ("data.ts", &data["ts"])] {
+        let ts = ts.as_str().unwrap_or_else(|| panic!("{label} 应为 string"));
+        assert!(
+            ts.ends_with("+08:00"),
+            "{label} 必须带 Asia/Shanghai 固定偏移 +08:00，实际 {ts}"
+        );
+        assert!(
+            ts.contains('T') && ts.rfind('+') > ts.find('T'),
+            "{label} 应为 RFC3339（date<T>time+offset），实际 {ts}"
+        );
+    }
 
     // 主动关 socket 避免 graceful_shutdown 死等
     let _ = ws.close(None).await;
