@@ -1,4 +1,4 @@
-//! worker_pool 域端到端集成测试（Task 10 / plan §11）
+//! prod::queue 域端到端集成测试（原 worker_pool，2026-10-08 更名）
 //!
 //! 场景清单（回归场景持续追加，清单不承诺与文件内测试函数一一对应；某条
 //! 能力的完整覆盖以函数名为准）：
@@ -76,7 +76,7 @@ use hsh_erp_test_support::{
 // ===========================================================================
 
 /// 插一个 `is_active=true` 的 `t_user` 行（bcrypt 哈希现场生成）。
-async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password: &str) -> i64 {
+pub(crate) async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password: &str) -> i64 {
     use hsh_erp_rust::auth::password;
     use hsh_erp_rust::infra::clock::now_naive;
 
@@ -101,7 +101,7 @@ async fn insert_user_with_password(pool: &PgPool, username: &str, plain_password
 }
 
 /// 插一个 `t_user_role` 行（user_id + role + scope）。
-async fn add_role(
+pub(crate) async fn add_role(
     pool: &PgPool,
     user_id: i64,
     role: &str,
@@ -131,7 +131,7 @@ async fn add_role(
 }
 
 /// 插一个 INHOUSE 类别的 `t_process` 工序。
-async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
+pub(crate) async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
 
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
@@ -153,7 +153,7 @@ async fn seed_process(pool: &PgPool, code: &str, name: &str) -> i64 {
 }
 
 /// 直插一条 **active** 的 `t_work_type_process` 映射（`deleted_at` 留默认 NULL）。
-async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
+pub(crate) async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
@@ -174,7 +174,7 @@ async fn link_work_type_to_process(pool: &PgPool, wt_id: i64, p_id: i64) {
 }
 
 /// 直插一条 **active** 的 `t_shelf_process` 映射（`deleted_at` 留默认 NULL）。
-async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
+pub(crate) async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
     use hsh_erp_rust::infra::clock::now_naive;
 
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
@@ -195,7 +195,7 @@ async fn link_shelf_to_process(pool: &PgPool, s_id: i64, p_id: i64) {
 }
 
 /// 插一个 t_shelf 行（code / name / zone）。
-async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
+pub(crate) async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 {
     insert_shelf_state(pool, code, name, zone, true, false).await
 }
 
@@ -203,7 +203,7 @@ async fn insert_shelf(pool: &PgPool, code: &str, name: &str, zone: &str) -> i64 
 ///
 /// 供 `move_batch` WORKER→POOL 货架守卫的回归用例用（品检区 / 停用 / 软删三种形态）。
 /// `insert_shelf` 改为委托本函数，避免同一目录出现两套货架 fixture 写法。
-async fn insert_shelf_state(
+pub(crate) async fn insert_shelf_state(
     pool: &PgPool,
     code: &str,
     name: &str,
@@ -242,7 +242,7 @@ async fn insert_shelf_state(
 /// 起一份 fresh database + 加载 production fixture + 以 MANAGER 身份登录。
 ///
 /// 返回 `(pool, app, token, fx)`。
-async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProductionFixture) {
+pub(crate) async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProductionFixture) {
     let pool = test_pool().await;
     let fx = load_production_fixture(&pool).await;
     let app = test_app(test_state(pool.clone()).await);
@@ -254,7 +254,7 @@ async fn bootstrap_as_manager() -> (PgPool, axum::Router, String, ProductionFixt
 ///
 /// worker_pool 独享：每个测试需要不同 scope 限定到 production shelves，
 /// fixture 的 fx_part_shelf scope=inspection_shelf 不通用，故保留本地 helper。
-async fn login_shelf_account(
+pub(crate) async fn login_shelf_account(
     pool: PgPool,
     username: &str,
     shelves: &[i64],
@@ -282,7 +282,7 @@ async fn login_shelf_account(
 /// worker_pool 独享：每个测试常需要多次以不同 username 登入触发不同 OCC / 审计
 /// 场景（如 admin3 → admin3b 模拟并发 OCC）。`bootstrap_as_manager` 的 token
 /// 是 fx_part_manager 单 token，不支持多身份切换；保留为本地 helper。
-async fn login_manager_with_username(pool: &PgPool, username: &str) -> (axum::Router, String) {
+pub(crate) async fn login_manager_with_username(pool: &PgPool, username: &str) -> (axum::Router, String) {
     let uid = insert_user_with_password(pool, username, "changeme").await;
     add_role(pool, uid, "MANAGER", None, None).await;
     let state = test_state(pool.clone()).await;
@@ -303,7 +303,7 @@ async fn login_manager_with_username(pool: &PgPool, username: &str) -> (axum::Ro
 //  worker-pool fixture helpers（worker_pool 独享，跨 binary 不迁移）
 // ===========================================================================
 
-async fn insert_work_type(pool: &PgPool, code: &str, name: &str, max_held: Option<i32>) -> i64 {
+pub(crate) async fn insert_work_type(pool: &PgPool, code: &str, name: &str, max_held: Option<i32>) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
@@ -324,7 +324,7 @@ async fn insert_work_type(pool: &PgPool, code: &str, name: &str, max_held: Optio
     id
 }
 
-async fn insert_worker(
+pub(crate) async fn insert_worker(
     pool: &PgPool,
     badge_code: &str,
     name: &str,
@@ -350,7 +350,7 @@ async fn insert_worker(
     id
 }
 
-async fn insert_customer_l2(pool: &PgPool, name: &str) -> i64 {
+pub(crate) async fn insert_customer_l2(pool: &PgPool, name: &str) -> i64 {
     // 2026-09-24 PR13 Phase H：插 L2 叶子客户（parent_id=fx_part_customer_l1_id=10，
     // serial_prefix=NULL），不再插根客户。原版插根客户（parent_id=NULL + serial_prefix='P'
     // 之类），与 part fixture 的 CUSTOMER_L1_ID=10 (prefix='P') 撞
@@ -391,7 +391,7 @@ async fn insert_customer_l2(pool: &PgPool, name: &str) -> i64 {
 /// 2026-09-11 修复：批量插入时多次独立构造 `SnowflakeIdGenerator` 会在同一毫
 /// 秒内产生重复 id（23505 pkey 冲突）。改用进程级共享生成器 `pool_snowflake()`
 /// —— 内部 `next_id()` 自带 sequence 递增，避免重复。
-async fn insert_pool_part(
+pub(crate) async fn insert_pool_part(
     pool: &PgPool,
     customer_id: i64,
     serial_no: &str,
@@ -510,7 +510,7 @@ async fn insert_pool_part(
 /// NULL，而 `worker_scan.rs` 把该列按 `i64` 解码（该列可空 ⇒ `unexpected null` 会把
 /// 整个 RETURNED 打成 500）这件事就恒测不出来。手写工单（无工艺链，工单域常态）
 /// 这条主路径必须有覆盖。回归见 `worker_scan_returned_without_process_chain_succeeds`。
-async fn insert_worker_held_part(
+pub(crate) async fn insert_worker_held_part(
     pool: &PgPool,
     customer_id: i64,
     serial_no: &str,
@@ -596,7 +596,7 @@ async fn insert_worker_held_part(
 }
 
 /// 把 part_id 给定批次标为 worker 持有（针对 pool→worker 流转后的批次）。
-async fn count_held_by_worker(pool: &PgPool, worker_id: i64) -> i64 {
+pub(crate) async fn count_held_by_worker(pool: &PgPool, worker_id: i64) -> i64 {
     sqlx::query_scalar!(
         r#"SELECT COUNT(*) AS "n!"
         FROM t_part_batch
@@ -791,7 +791,7 @@ async fn worker_scan_returned_advances_current_process_id() {
     let (app, mgr) = login_manager_with_username(&pool, "admin_pool2b").await;
     let (sb, eb) = send(
         app.clone(),
-        json_request("GET", &format!("/prod/pool/{proc_b}"), None, Some(&mgr)),
+        json_request("GET", &format!("/prod/queue/processes/{proc_b}"), None, Some(&mgr)),
     )
     .await;
     assert_eq!(sb, StatusCode::OK, "GET pool/{proc_b}: {eb}");
@@ -807,7 +807,7 @@ async fn worker_scan_returned_advances_current_process_id() {
 
     let (sc, ec) = send(
         app,
-        json_request("GET", &format!("/prod/pool/{proc_c}"), None, Some(&mgr)),
+        json_request("GET", &format!("/prod/queue/processes/{proc_c}"), None, Some(&mgr)),
     )
     .await;
     assert_eq!(sc, StatusCode::OK, "GET pool/{proc_c}: {ec}");
@@ -943,7 +943,7 @@ async fn refill_when_pool_empty_returns_empty() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -965,7 +965,7 @@ async fn refill_when_pool_empty_returns_empty() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1003,7 +1003,7 @@ async fn refill_caps_at_max_held_batches() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1055,7 +1055,7 @@ async fn refill_respects_shelf_scope() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": shelf_a.to_string(),
@@ -1138,7 +1138,7 @@ async fn take_updates_t_part_holder() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1203,7 +1203,7 @@ async fn take_does_not_update_placed_at() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1328,7 +1328,7 @@ async fn admin_refill_endpoint_works() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1347,7 +1347,7 @@ async fn admin_refill_endpoint_works() {
 
 /// 场景 13 (2026-09-30 重构): move WORKER → POOL 把持有批次放回候选池。
 ///
-/// 2026-09-30 之前：原 `admin_remove` 端点。重构后走统一 `POST /prod/pool/move`
+/// 2026-09-30 之前：原 `admin_remove` 端点。重构后走统一 `POST /prod/queue/move`
 /// 端点，`from.kind=WORKER, to.kind=POOL` 方向。验证：
 /// - batch 回到 PRODUCTION_SHELF + holder=shelf
 /// - **current_process_step_id 不变**（move 不推进工序链）
@@ -1380,7 +1380,7 @@ async fn move_worker_to_pool_returns_batch_to_pool() {
         app,
         json_request(
             "POST",
-            "/prod/pool/move",
+            "/prod/queue/move",
             Some(json!({
                 "batch_id": held_batch.to_string(),
                 "from": { "kind": "WORKER", "worker_id": worker.to_string() },
@@ -1453,7 +1453,7 @@ async fn move_pool_to_worker_assigns_batch() {
         app,
         json_request(
             "POST",
-            "/prod/pool/move",
+            "/prod/queue/move",
             Some(json!({
                 "batch_id": pool_batch.to_string(),
                 "from": { "kind": "POOL",   "shelf_id": prod_shelf.to_string() },
@@ -1506,7 +1506,7 @@ async fn move_worker_to_worker_transfers_batch() {
         app,
         json_request(
             "POST",
-            "/prod/pool/move",
+            "/prod/queue/move",
             Some(json!({
                 "batch_id": held_batch.to_string(),
                 "from": { "kind": "WORKER", "worker_id": worker_src.to_string() },
@@ -1547,7 +1547,7 @@ async fn move_from_mismatch_returns_location_mismatch_error() {
         app,
         json_request(
             "POST",
-            "/prod/pool/move",
+            "/prod/queue/move",
             Some(json!({
                 "batch_id": pool_batch.to_string(),
                 // from 谎报成 WORKER（实际在 POOL），期望 40904
@@ -1590,7 +1590,7 @@ async fn move_target_worker_capacity_exceeded() {
         app,
         json_request(
             "POST",
-            "/prod/pool/move",
+            "/prod/queue/move",
             Some(json!({
                 "batch_id": held_batch_src.to_string(),
                 "from": { "kind": "WORKER", "worker_id": worker_src.to_string() },
@@ -1628,7 +1628,7 @@ async fn move_same_kind_rejected_with_validation_error() {
         app,
         json_request(
             "POST",
-            "/prod/pool/move",
+            "/prod/queue/move",
             Some(json!({
                 "batch_id": batch.to_string(),
                 "from": { "kind": "POOL", "shelf_id": prod_shelf.to_string() },
@@ -1683,7 +1683,7 @@ async fn max_held_null_returns_error() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1720,7 +1720,7 @@ async fn worker_no_work_type_returns_error() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -1746,7 +1746,7 @@ async fn worker_no_work_type_returns_error() {
 /// 用 `sqlx::query`（runtime）而非 `query!`：避免每加一个 fixture 就跑
 /// `cargo sqlx prepare` 重写 `.sqlx` 元数据（会清掉同 worktree 内其它测试文件
 /// 仍在用的 cache，对其它 worktree 也有干扰）。
-async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
+pub(crate) async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
     let id = snowflake.next_id();
@@ -1766,29 +1766,30 @@ async fn insert_l2_customer(pool: &PgPool, name: &str, l1_id: i64) -> i64 {
     id
 }
 
-/// 场景 H1: happy path —— 返回 process 元数据 + workers + work_types(含 max_held) +
-/// 跨货架候选批次列表。排序：system_delivery_date ASC NULLS LAST → is_urgent DESC → id ASC。
+/// 场景 H1: happy path —— `GET /prod/queue/processes/{process_id}` 返回
+/// `process` 元数据 + `workers[]`（含 max_held / current_held / capacity_remaining）
+/// + `items[]` 候选批次。排序：system_delivery_date ASC NULLS LAST → is_urgent DESC → id ASC。
 #[tokio::test]
-async fn pool_by_process_happy() {
+async fn board_process_detail_happy() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    // L1 + L2 客户（L2.parent_id = L1.id → 触发 "L1 / L2" 路径）
+    // L1 + L2 客户
     let l1 = insert_customer_l2(&pool, "L1-NAME").await;
     let l2 = insert_l2_customer(&pool, "L2-NAME", l1).await;
 
     let proc = seed_process(&pool, "PROC-PBP", "工序PBP").await;
     let wt_a = insert_work_type(&pool, "WT-PBP-A", "工种A", Some(3)).await;
+    // 工种B 未设上限（max_held_batches = NULL）⇒ 该 worker 的 max_held 退化 0
     let wt_b = insert_work_type(&pool, "WT-PBP-B", "工种B", None).await;
     link_work_type_to_process(&pool, wt_a, proc).await;
     link_work_type_to_process(&pool, wt_b, proc).await;
     let prod_shelf = insert_shelf(&pool, "PROD-PBP", "PROD-PBP", "PRODUCTION").await;
 
-    let _w_a = insert_worker(&pool, "BC-PBP-A", "工A", Some(wt_a)).await;
+    let w_a = insert_worker(&pool, "BC-PBP-A", "工A", Some(wt_a)).await;
     let _w_b = insert_worker(&pool, "BC-PBP-B", "工B", Some(wt_b)).await;
 
     // 2 批次：urgent 在前（同 system_delivery_date 时 is_urgent DESC 排序在前）。
     // `insert_pool_part` 把 is_urgent 硬编码为 false —— 加急单用 UPDATE 翻成 true。
-    // 用 `sqlx::query`（runtime）而非 `query!` 避免动 `.sqlx` cache（会清掉
-    // 同 worktree 其它测试文件仍在用的离线 metadata）。
+    // 用 `sqlx::query`（runtime）而非 `query!` 避免动 `.sqlx` cache。
     let (p_urgent, _b_urgent) = insert_pool_part(&pool, l2, "U-001", prod_shelf, proc, 2).await;
     let (_p_normal, _b_normal) = insert_pool_part(&pool, l2, "N-001", prod_shelf, proc, 5).await;
     sqlx::query("UPDATE t_part SET is_urgent = true WHERE id = $1")
@@ -1797,32 +1798,54 @@ async fn pool_by_process_happy() {
         .await
         .expect("mark U-001 urgent");
 
+    // 工A 持有 1 批（验证 held_batches 与容量计算）
+    insert_worker_held_part(&pool, l2, "H-PBP", w_a, proc, 1, true).await;
+
     let (app, token) = login_manager_with_username(&pool, "admin_pbp").await;
-    // 注意：`tests/common::test_app` 用 `v2_router()`（不带 `/api/v2` nest，
-    // 与 main.rs `nest("/api/v2", v2_router())` 不一样），所以测试 URI
-    // 是 `/worker-pool/{id}` 而不是 `/api/v2/worker-pool/{id}`。
-    let uri = format!("/prod/pool/{proc}");
+    // 注意：`test_support::test_app` 用 `v2_router()`（不带 `/api/v2` nest），
+    // 所以测试 URI 是 `/prod/queue/...` 而不是 `/api/v2/prod/queue/...`。
+    let uri = format!("/prod/queue/processes/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
-    assert_eq!(s, StatusCode::OK, "pool_by_process happy: {env}");
+    assert_eq!(s, StatusCode::OK, "board_process_detail happy: {env}");
     assert_eq!(env["code"], 0, "code 应 0: {env}");
 
-    let data = &env["data"];
-    assert_eq!(data["process_id"], proc.to_string());
-    assert_eq!(data["process_code"], "PROC-PBP");
-    assert_eq!(data["process_name"], "工序PBP");
+    // 工序元数据收在 process 子对象里（不再平铺）
+    let proc_meta = &env["data"]["process"];
+    assert_eq!(proc_meta["process_id"], proc.to_string());
+    assert_eq!(proc_meta["process_code"], "PROC-PBP");
+    assert_eq!(proc_meta["process_name"], "工序PBP");
+    // ts 存在且是 RFC3339 带 +08:00
+    assert!(
+        env["data"]["ts"].as_str().unwrap().ends_with("+08:00"),
+        "ts 应带 +08:00 偏移: {env}"
+    );
 
-    let workers = data["workers"].as_array().expect("workers array");
+    let workers = env["data"]["workers"].as_array().expect("workers array");
     assert_eq!(workers.len(), 2, "workers 应 2 个: {env}");
+    // max_held 直接挂到 worker 上（不再有独立的 work_types[] 数组）
+    let wa = workers
+        .iter()
+        .find(|w| w["worker_id"].as_str() == Some(w_a.to_string().as_str()))
+        .expect("工A 应在 workers 里");
+    assert_eq!(wa["max_held"], 3, "工A max_held 应为工种上限 3: {env}");
+    assert_eq!(wa["current_held"], 1, "工A 持有 1 批: {env}");
+    assert_eq!(
+        wa["capacity_remaining"], 2,
+        "capacity_remaining 应为 3-1=2: {env}"
+    );
+    assert_eq!(wa["work_type_code"], "WT-PBP-A");
+    assert_eq!(wa["badge_code"], "BC-PBP-A");
+    assert_eq!(wa["held_batches"].as_array().unwrap().len(), 1, "{env}");
+    // 工种未设 max_held_batches ⇒ 退化为 0（不是 null）
+    let wb = workers
+        .iter()
+        .find(|w| w["work_type_code"] == "WT-PBP-B")
+        .expect("工B 应在 workers 里");
+    assert_eq!(wb["max_held"], 0, "未设上限应退化为 0: {env}");
+    assert_eq!(wb["capacity_remaining"], 0, "capacity 不为负: {env}");
 
-    let work_types = data["work_types"].as_array().expect("work_types array");
-    assert_eq!(work_types.len(), 2, "work_types 应 2 个: {env}");
-    // 找到 max_held_batches = Some(3) 与 None 的两条
-    let has_three = work_types.iter().any(|w| w["max_held_batches"] == 3);
-    let has_null = work_types.iter().any(|w| w["max_held_batches"].is_null());
-    assert!(has_three && has_null, "max_held 应含 Some(3) + None: {env}");
-
-    assert_eq!(data["total"], 2, "total 应 2: {env}");
-    let items = data["items"].as_array().expect("items array");
+    assert_eq!(env["data"]["total"], 2, "total 应 2: {env}");
+    let items = env["data"]["items"].as_array().expect("items array");
     assert_eq!(items.len(), 2, "items 应 2 个: {env}");
     // items[0] 应为加急单
     assert_eq!(
@@ -1836,12 +1859,14 @@ async fn pool_by_process_happy() {
         "items[1] 应 is_urgent=false: {env}"
     );
     assert_eq!(items[1]["serial_no"], "N-001");
-    // customer_path 应为 "L1-NAME / L2-NAME"（2 级：fixture L1 是祖父，不入 path）
-    assert_eq!(
-        items[0]["customer_path"], "L1-NAME / L2-NAME",
-        "customer_path 应拼成 L1-NAME / L2-NAME: {env}"
+    // customer_path 已删（前端自行拼 L1 / L2），客户两级名仍在
+    assert_eq!(items[0]["customer_name"], "L2-NAME", "{env}");
+    assert_eq!(items[0]["parent_customer_name"], "L1-NAME", "{env}");
+    assert!(
+        items[0].get("customer_path").is_none(),
+        "customer_path 应已删除: {env}"
     );
-    // shelf 元数据存在
+    // shelf 元数据存在（POOL→WORKER move 的 from.shelf_id 数据源）
     assert_eq!(items[0]["shelf_id"], prod_shelf.to_string());
     assert_eq!(items[0]["shelf_code"], "PROD-PBP");
     assert_eq!(items[0]["shelf_name"], "PROD-PBP");
@@ -1849,7 +1874,7 @@ async fn pool_by_process_happy() {
 
 /// 场景 H2: 不存在的 process_id → 20801 BIZ_PROCESS_NOT_FOUND + 404
 #[tokio::test]
-async fn pool_by_process_process_not_found() {
+async fn board_process_detail_process_not_found() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-NF", "工序NF").await;
     let _wt = insert_work_type(&pool, "WT-NF", "工种NF", Some(3)).await;
@@ -1858,7 +1883,7 @@ async fn pool_by_process_process_not_found() {
     let nonexistent_id: i64 = 9_999_999_999_999;
 
     let (app, token) = login_manager_with_username(&pool, "admin_nf").await;
-    let uri = format!("/prod/pool/{nonexistent_id}");
+    let uri = format!("/prod/queue/processes/{nonexistent_id}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::NOT_FOUND, "不存在 process 应 404: {env}");
     assert_eq!(env["code"], 20801, "BIZ_PROCESS_NOT_FOUND: {env}");
@@ -1866,7 +1891,7 @@ async fn pool_by_process_process_not_found() {
 
 /// 场景 H3: ShelfAccount 角色 → 40300 FORBIDDEN（service 守卫：Manager/Clerk/Inspector only）
 #[tokio::test]
-async fn pool_by_process_forbidden_for_shelf_account() {
+async fn board_process_detail_forbidden_for_shelf_account() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-FB", "工序FB").await;
     let wt = insert_work_type(&pool, "WT-FB", "工种FB", Some(3)).await;
@@ -1876,7 +1901,7 @@ async fn pool_by_process_forbidden_for_shelf_account() {
     // ShelfAccount 绑一个 shelf（scope 必须给才能登录；调用端点时仍会被 service 拒绝）
     let (app, token, _pool) =
         login_shelf_account(pool.clone(), "shelf_user_fb", &[prod_shelf]).await;
-    let uri = format!("/prod/pool/{proc}");
+    let uri = format!("/prod/queue/processes/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
     assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
@@ -1884,7 +1909,7 @@ async fn pool_by_process_forbidden_for_shelf_account() {
 
 /// 场景 H4: process 存在但无候选批次 → total=0, items=[]，元数据正常返回
 #[tokio::test]
-async fn pool_by_process_no_candidates_when_no_batch() {
+async fn board_process_detail_no_candidates_when_no_batch() {
     let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
     let proc = seed_process(&pool, "PROC-EMPTY", "空工序").await;
     let wt = insert_work_type(&pool, "WT-EMPTY", "空工种", Some(3)).await;
@@ -1892,29 +1917,34 @@ async fn pool_by_process_no_candidates_when_no_batch() {
     let _w = insert_worker(&pool, "BC-EMPTY", "空工人", Some(wt)).await;
 
     let (app, token) = login_manager_with_username(&pool, "admin_empty").await;
-    let uri = format!("/prod/pool/{proc}");
+    let uri = format!("/prod/queue/processes/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "无 batch 应 200: {env}");
     assert_eq!(env["code"], 0, "code 应 0: {env}");
 
     let data = &env["data"];
-    assert_eq!(data["process_id"], proc.to_string());
-    assert_eq!(data["process_code"], "PROC-EMPTY");
-    assert_eq!(data["process_name"], "空工序");
+    assert_eq!(data["process"]["process_id"], proc.to_string());
+    assert_eq!(data["process"]["process_code"], "PROC-EMPTY");
+    assert_eq!(data["process"]["process_name"], "空工序");
     assert_eq!(data["total"], 0, "total 应 0: {env}");
     let items = data["items"].as_array().expect("items array");
     assert_eq!(items.len(), 0, "items 应 []: {env}");
-    // workers / work_types 字段应正常返回
+    // workers 仍返回（该工种有 1 个 active 工人），held_batches 为空
     let workers = data["workers"].as_array().expect("workers array");
     assert_eq!(workers.len(), 1, "workers 应 1 个: {env}");
-    let work_types = data["work_types"].as_array().expect("work_types array");
-    assert_eq!(work_types.len(), 1, "work_types 应 1 个: {env}");
-    assert_eq!(work_types[0]["max_held_batches"], 3);
+    assert_eq!(workers[0]["max_held"], 3, "max_held 直接挂 worker 上: {env}");
+    assert_eq!(workers[0]["current_held"], 0, "{env}");
+    assert_eq!(workers[0]["held_batches"].as_array().unwrap().len(), 0, "{env}");
+    // work_types[] 数组已删（前端零消费，max_held 改由 workers[].max_held 表达）
+    assert!(
+        data.get("work_types").is_none(),
+        "work_types[] 应已删除: {env}"
+    );
 }
 
 // ===========================================================================
 // 2026-09-30 重构：原 `admin/worker-pool/assign` 4 个端点已删除，被
-// `POST /api/v2/prod/pool/move` 取代。覆盖：
+// `POST /api/v2/prod/queue/move` 取代。覆盖：
 //  - move_pool_to_worker_assigns_batch（场景 13b）：assign happy 路径
 //  - move_target_worker_capacity_exceeded（场景 13e）：assign capacity 超限
 //  - move_from_mismatch_returns_location_mismatch_error（场景 13d）：assign batch 不在池
@@ -1934,7 +1964,7 @@ async fn pool_by_process_no_candidates_when_no_batch() {
 // ===========================================================================
 
 /// 为 part 插一个 t_part_file.kind='G_CODE' 行（worker_pool 候选池视图测试）。
-async fn seed_g_code_for_part(pool: &PgPool, part_id: i64) -> i64 {
+pub(crate) async fn seed_g_code_for_part(pool: &PgPool, part_id: i64) -> i64 {
     use hsh_erp_rust::infra::clock::now_naive;
     use hsh_erp_test_support::pool_snowflake;
     let snowflake = pool_snowflake().lock().unwrap_or_else(|p| p.into_inner());
@@ -1991,7 +2021,7 @@ async fn take_one_from_pool_prefers_programmed_batch() {
         app,
         json_request(
             "POST",
-            "/prod/pool/refill",
+            "/prod/queue/refill",
             Some(json!({
                 "worker_id": worker.to_string(),
                 "shelf_id": prod_shelf.to_string(),
@@ -2047,7 +2077,7 @@ async fn list_candidates_includes_has_cnc_program() {
     seed_g_code_for_part(&pool, part_a_id).await;
 
     let (app, token) = login_manager_with_username(&pool, "admin_cnc_list").await;
-    let uri = format!("/prod/pool/{proc}");
+    let uri = format!("/prod/queue/processes/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None::<Value>, Some(&token))).await;
     assert_eq!(s, StatusCode::OK, "pool_by_process: {env}");
     let items = env["data"]["items"].as_array().expect("items array");
@@ -2081,12 +2111,15 @@ async fn list_candidates_includes_has_cnc_program() {
     assert!(found_a && found_b, "应同时找到 A 与 B: {env}");
 }
 
-/// `GET /prod/pool/state` 应在 `held_batches[*].has_cnc_program` 透传实际值。
+/// `GET /prod/queue/processes/{process_id}` 应在
+/// `workers[].held_batches[*].has_cnc_program` 透传实际值。
 ///
-/// 2026-09-29 补漏：前端 `WorkerQueueBoard.vue`「已编程」tag 渲染依赖
-/// `HeldBatchItem.has_cnc_program` 字段。后端 model 与 SQL 必须真实返回 EXISTS(G_CODE) 值，
-/// 否则 Zod strip 模式下前端静默丢字段会触发 schema 校验异常（`has_cnc_program` 必填）。
-/// 场景：worker 持有 2 个 batch（A 有 G_CODE，B 无），断言 `held_batches[*].has_cnc_program`
+/// 2026-10-08：`GET /pool/state` 端点已删（原设计要前端每 worker 发一次请求 = N+1），
+/// 持有批次改由工序板端点一次返回。字段口径不变 —— 前端「已编程」tag 渲染依赖本字段，
+/// 后端必须真实返回 EXISTS(G_CODE) 值，否则 zod strip 模式下前端会因必填字段缺失
+/// 直接抛校验异常。
+///
+/// 场景：worker 持有 2 个 batch（A 有 G_CODE，B 无），断言 `has_cnc_program`
 /// 分别为 true / false。
 #[tokio::test]
 async fn held_batch_includes_has_cnc_program() {
@@ -2110,15 +2143,23 @@ async fn held_batch_includes_has_cnc_program() {
         .expect("lookup part A");
     seed_g_code_for_part(&pool, part_a_id).await;
 
-    // 调 state 端点：worker 当前持有 2 个 batch（无需 manager role，登录任意 user 即可）
     let (app, token) = login_manager_with_username(&pool, "admin_cnc_held").await;
-    let uri = format!("/prod/pool/state?worker_id={worker}&shelf_id={prod_shelf}");
+    let uri = format!("/prod/queue/processes/{proc}");
     let (s, env) = send(app, json_request("GET", &uri, None::<Value>, Some(&token))).await;
-    assert_eq!(s, StatusCode::OK, "state: {env}");
-    let held = env["data"]["held_batches"]
+    assert_eq!(s, StatusCode::OK, "board process detail: {env}");
+    // 该工序只有 1 个 worker（BC-CNC-HELD），其 held_batches 应有 2 条
+    let workers = env["data"]["workers"].as_array().expect("workers array");
+    assert_eq!(workers.len(), 1, "应 1 个 worker: {env}");
+    assert_eq!(workers[0]["current_held"], 2, "current_held 应 2: {env}");
+    let held = workers[0]["held_batches"]
         .as_array()
         .expect("held_batches array");
     assert_eq!(held.len(), 2, "应 2 个 held batch: {env}");
+    // 持有态不该再返回 shelf_code（current_holder_id 是 worker，t_shelf JOIN 恒不命中）
+    assert!(
+        held[0].get("shelf_code").is_none(),
+        "held_batches[].shelf_code 应已删除: {env}"
+    );
     let mut found_a = false;
     let mut found_b = false;
     for it in held {
@@ -2148,291 +2189,8 @@ async fn held_batch_includes_has_cnc_program() {
     assert!(found_a && found_b, "应同时找到 H-CNC-A 与 H-CNC-B: {env}");
 }
 
-/// `GET /prod/pool/state` 缺省 `shelf_id`（2026-10-04 起该参数可选）应仍返回完整
-/// 持有视图，且 `pool_count_by_process` 返空数组。
-///
-/// 该参数在 `compute_state` 内只有一个用途 —— 逐工序算「某货架 × 某工序」候选池
-/// 计数；`held_batches` / `max_held` / `current_held` / `capacity_remaining` 均与
-/// 货架无关。缺省语义：跳过计数查询，`pool_count_by_process = []`。
-///
-/// 场景：worker 有工种（上限 5）+ 工种映射 1 道工序 + 货架映射同工序，持有 2 个
-/// batch，且**该货架该工序的候选池里真实躺着 1 个 batch**。因此：
-/// - 带 `shelf_id` → `pool_count_by_process` 非空（`pool_count = 1`）
-/// - 不带 `shelf_id` → `pool_count_by_process == []`
-/// 成对断言是本用例的关键：只断言「不带时为空」无法区分「参数生效」与「池本来就是空的」。
-#[tokio::test]
-async fn state_without_shelf_id_returns_held_batches_and_empty_pool_count() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let customer = insert_customer_l2(&pool, "POOL-NOSHELF").await;
-    let proc = seed_process(&pool, "PROC-NOSHELF", "工序-NOSHELF").await;
-    let wt = insert_work_type(&pool, "WT-NOSHELF", "工种-NOSHELF", Some(5)).await;
-    link_work_type_to_process(&pool, wt, proc).await;
-    let prod_shelf = insert_shelf(&pool, "PROD-NOSHELF", "PROD-NOSHELF", "PRODUCTION").await;
-    link_shelf_to_process(&pool, prod_shelf, proc).await;
-
-    let worker = insert_worker(&pool, "BC-NOSHELF", "工NOSHELF", Some(wt)).await;
-    // 候选池里放 1 个（shelf + process 均匹配）—— 供带 shelf_id 的对照断言用
-    insert_pool_part(&pool, customer, "P-NOSHELF-POOL", prod_shelf, proc, 1).await;
-    // worker 持有 2 个
-    let (_part_a, _batch_a, _step_a) =
-        insert_worker_held_part(&pool, customer, "H-NOSHELF-A", worker, proc, 1, true).await;
-    let (_part_b, _batch_b, _step_b) =
-        insert_worker_held_part(&pool, customer, "H-NOSHELF-B", worker, proc, 1, true).await;
-
-    let (app, token) = login_manager_with_username(&pool, "admin_noshelf").await;
-
-    // 对照组：带 shelf_id → 候选池计数非空（证明池里确实有货）
-    let uri_with = format!("/prod/pool/state?worker_id={worker}&shelf_id={prod_shelf}");
-    let (s_with, env_with) = send(
-        app.clone(),
-        json_request("GET", &uri_with, None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s_with, StatusCode::OK, "state 带 shelf_id: {env_with}");
-    let counts_with = env_with["data"]["pool_count_by_process"]
-        .as_array()
-        .expect("pool_count_by_process array");
-    assert_eq!(
-        counts_with.len(),
-        1,
-        "带 shelf_id 时应返回 1 道工序的候选池计数: {env_with}"
-    );
-    assert_eq!(counts_with[0]["process_id"], proc.to_string(), "{env_with}");
-    assert_eq!(
-        counts_with[0]["pool_count"], 1,
-        "候选池应有 1 件: {env_with}"
-    );
-
-    // 主体：缺 shelf_id → 200 + 持有视图完整 + 候选池计数空数组
-    let uri_without = format!("/prod/pool/state?worker_id={worker}");
-    let (s, env) = send(
-        app,
-        json_request("GET", &uri_without, None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "state 缺省 shelf_id: {env}");
-    assert_eq!(env["code"], 0, "code 应 0: {env}");
-    assert_eq!(env["data"]["worker_id"], worker.to_string(), "{env}");
-
-    // 与货架无关的四段：一个都不许因缺 shelf_id 而退化
-    assert_eq!(
-        env["data"]["max_held"], 5,
-        "max_held 应仍为工种上限 5: {env}"
-    );
-    assert_eq!(env["data"]["current_held"], 2, "current_held 应为 2: {env}");
-    assert_eq!(
-        env["data"]["capacity_remaining"], 3,
-        "容量余量应 5-2=3: {env}"
-    );
-
-    let held = env["data"]["held_batches"]
-        .as_array()
-        .expect("held_batches array");
-    assert_eq!(
-        held.len(),
-        2,
-        "缺省 shelf_id 仍应返回 2 个 held batch: {env}"
-    );
-    let mut found_a = false;
-    let mut found_b = false;
-    for it in held {
-        let serial = sqlx::query_scalar::<_, String>("SELECT serial_no FROM t_part WHERE id = $1")
-            .bind(it["part_id"].as_str().unwrap().parse::<i64>().unwrap())
-            .fetch_one(&pool)
-            .await
-            .expect("lookup serial");
-        match serial.as_str() {
-            "H-NOSHELF-A" => found_a = true,
-            "H-NOSHELF-B" => found_b = true,
-            _ => {}
-        }
-    }
-    assert!(
-        found_a && found_b,
-        "held_batches 内容应与带 shelf_id 时一致: {env}"
-    );
-
-    // 唯一因缺 shelf_id 而变化的字段
-    let counts = env["data"]["pool_count_by_process"]
-        .as_array()
-        .expect("pool_count_by_process array");
-    assert!(
-        counts.is_empty(),
-        "缺省 shelf_id 时 pool_count_by_process 应为空数组（候选池计数与货架无关则无从算起）: {env}"
-    );
-}
-
 // 2026-09-30 重构：原 `admin_assign_process_id_mismatch` 端点已删除，被 move 端点取代。
 // 通过 from/to 显式校验状态而非 process_id；功能已合并到 move_pool_to_worker_assigns_batch（场景 13b）。
-
-// ===========================================================================
-//  GET /api/v2/prod/pool/counts —— 全工序候选批次聚合计数
-//  （2026-09-30 新增，db78bba4 spec）
-//
-//  覆盖场景：
-//   21. pool_counts_returns_aggregate_by_process   happy path: 3 个 process,
-//       各塞不同数量的 IN_PROCESS+PRODUCTION_SHELF 批次，断言 counts[*].count
-//       总和与 per-process 都对得上，total = sum(counts[].count)
-// ===========================================================================
-
-/// 场景 21: pool_counts 端点 happy path —— 返回全工序聚合。
-///
-/// - 3 个 process：A / B / C 各塞 1 / 2 / 3 批 IN_PROCESS+PRODUCTION_SHELF 批次
-/// - 共 6 批；期望 counts[*].count = {A:1, B:2, C:3}，total = 6
-/// - process_code / process_name 元数据透传
-/// - counts 按 process_id ASC 稳定排序（repo GROUP BY ORDER BY 保证）
-#[tokio::test]
-async fn pool_counts_returns_aggregate_by_process() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let customer = insert_customer_l2(&pool, "POOL-COUNTS").await;
-
-    // 3 个 process（互不映射，专注 process 维度聚合）
-    let proc_a = seed_process(&pool, "PROC-CA", "工序A").await;
-    let proc_b = seed_process(&pool, "PROC-CB", "工序B").await;
-    let proc_c = seed_process(&pool, "PROC-CC", "工序C").await;
-
-    let prod_a = insert_shelf(&pool, "PROD-CA", "PROD-CA", "PRODUCTION").await;
-    let prod_b = insert_shelf(&pool, "PROD-CB", "PROD-CB", "PRODUCTION").await;
-    let prod_c = insert_shelf(&pool, "PROD-CC", "PROD-CC", "PRODUCTION").await;
-
-    // A: 1 件，B: 2 件，C: 3 件（每件用不同 serial_no 避免 pkey 冲突）
-    insert_pool_part(&pool, customer, "PA-001", prod_a, proc_a, 1).await;
-    insert_pool_part(&pool, customer, "PB-001", prod_b, proc_b, 1).await;
-    insert_pool_part(&pool, customer, "PB-002", prod_b, proc_b, 1).await;
-    insert_pool_part(&pool, customer, "PC-001", prod_c, proc_c, 1).await;
-    insert_pool_part(&pool, customer, "PC-002", prod_c, proc_c, 1).await;
-    insert_pool_part(&pool, customer, "PC-003", prod_c, proc_c, 1).await;
-
-    let (app, token) = login_manager_with_username(&pool, "admin_counts").await;
-    let (s, env) = send(
-        app,
-        json_request("GET", "/prod/pool/counts", None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "pool_counts happy: {env}");
-    assert_eq!(env["code"], 0, "code 应 0: {env}");
-
-    let counts = env["data"]["counts"].as_array().expect("counts array");
-    assert_eq!(
-        counts.len(),
-        3,
-        "应 3 个 process（含候选批次的 process）: {env}"
-    );
-    // counts 按 process_id ASC 排序（repo GROUP BY ORDER BY 保证）
-    assert_eq!(
-        counts[0]["process_id"],
-        proc_a.to_string(),
-        "counts[0] 应为 proc_a: {env}"
-    );
-    assert_eq!(counts[0]["process_code"], "PROC-CA");
-    assert_eq!(counts[0]["process_name"], "工序A");
-    assert_eq!(counts[0]["count"], 1, "A 应 1 件: {env}");
-
-    assert_eq!(
-        counts[1]["process_id"],
-        proc_b.to_string(),
-        "counts[1] 应为 proc_b: {env}"
-    );
-    assert_eq!(counts[1]["process_code"], "PROC-CB");
-    assert_eq!(counts[1]["count"], 2, "B 应 2 件: {env}");
-
-    assert_eq!(
-        counts[2]["process_id"],
-        proc_c.to_string(),
-        "counts[2] 应为 proc_c: {env}"
-    );
-    assert_eq!(counts[2]["process_code"], "PROC-CC");
-    assert_eq!(counts[2]["count"], 3, "C 应 3 件: {env}");
-
-    // total = sum(counts[].count) = 1 + 2 + 3 = 6
-    assert_eq!(env["data"]["total"], 6, "total 应 6: {env}");
-}
-
-/// pool_counts：含 0 候选批次的 process 不出现在 counts 中（GROUP BY 不输出 0 行）。
-#[tokio::test]
-async fn pool_counts_excludes_zero_count_processes() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let customer = insert_customer_l2(&pool, "POOL-COUNTS-EMPTY").await;
-
-    // proc_empty：只有 process 定义，无任何 pool 批次
-    let _proc_empty = seed_process(&pool, "PROC-EMPTY", "空工序").await;
-    // proc_one：1 件候选批次
-    let proc_one = seed_process(&pool, "PROC-ONE", "单件工序").await;
-    let prod_one = insert_shelf(&pool, "PROD-ONE", "PROD-ONE", "PRODUCTION").await;
-    insert_pool_part(&pool, customer, "P-ONE-001", prod_one, proc_one, 1).await;
-
-    let (app, token) = login_manager_with_username(&pool, "admin_counts_empty").await;
-    let (s, env) = send(
-        app,
-        json_request("GET", "/prod/pool/counts", None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "pool_counts empty: {env}");
-    let counts = env["data"]["counts"].as_array().expect("counts array");
-    assert_eq!(
-        counts.len(),
-        1,
-        "应仅 1 个 process（含候选批次的 proc_one）: {env}"
-    );
-    assert_eq!(counts[0]["process_id"], proc_one.to_string());
-    assert_eq!(counts[0]["count"], 1);
-    assert_eq!(env["data"]["total"], 1);
-}
-
-/// pool_counts：跨多个货架聚合（同 process 在多个 shelf 上都有候选）。
-#[tokio::test]
-async fn pool_counts_aggregates_across_shelves() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let customer = insert_customer_l2(&pool, "POOL-COUNTS-MULTI").await;
-
-    let proc = seed_process(&pool, "PROC-MULTI", "跨货架工序").await;
-    // 2 个货架各自映射同一 process
-    let shelf_x = insert_shelf(&pool, "PROD-MX", "PROD-MX", "PRODUCTION").await;
-    let shelf_y = insert_shelf(&pool, "PROD-MY", "PROD-MY", "PRODUCTION").await;
-    link_shelf_to_process(&pool, shelf_x, proc).await;
-    link_shelf_to_process(&pool, shelf_y, proc).await;
-
-    // shelf_x: 2 件，shelf_y: 3 件 → 该 process 应聚合为 5 件
-    insert_pool_part(&pool, customer, "MX-001", shelf_x, proc, 1).await;
-    insert_pool_part(&pool, customer, "MX-002", shelf_x, proc, 1).await;
-    insert_pool_part(&pool, customer, "MY-001", shelf_y, proc, 1).await;
-    insert_pool_part(&pool, customer, "MY-002", shelf_y, proc, 1).await;
-    insert_pool_part(&pool, customer, "MY-003", shelf_y, proc, 1).await;
-
-    let (app, token) = login_manager_with_username(&pool, "admin_counts_multi").await;
-    let (s, env) = send(
-        app,
-        json_request("GET", "/prod/pool/counts", None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK, "pool_counts multi: {env}");
-    let counts = env["data"]["counts"].as_array().expect("counts array");
-    assert_eq!(counts.len(), 1);
-    assert_eq!(counts[0]["process_id"], proc.to_string());
-    assert_eq!(counts[0]["count"], 5, "应聚合跨货架 2 + 3 = 5 件: {env}");
-    assert_eq!(env["data"]["total"], 5);
-}
-
-/// pool_counts：ShelfAccount 角色 → 40300 FORBIDDEN（service 守卫：Manager/Clerk/Inspector only）。
-#[tokio::test]
-async fn pool_counts_forbidden_for_shelf_account() {
-    let (pool, _app, _token, _fx) = bootstrap_as_manager().await;
-    let proc = seed_process(&pool, "PROC-FB-C", "工序FB-C").await;
-    let _wt = insert_work_type(&pool, "WT-FB-C", "工种FB-C", Some(3)).await;
-    link_work_type_to_process(&pool, _wt, proc).await;
-    let prod_shelf = insert_shelf(&pool, "PROD-FB-C", "PROD-FB-C", "PRODUCTION").await;
-
-    // ShelfAccount 绑一个 shelf（scope 必须给才能登录；调用端点时仍会被 service 拒绝）
-    let (app, token, _pool) =
-        login_shelf_account(pool.clone(), "shelf_user_counts", &[prod_shelf]).await;
-    let (s, env) = send(
-        app,
-        json_request("GET", "/prod/pool/counts", None::<Value>, Some(&token)),
-    )
-    .await;
-    assert_eq!(s, StatusCode::FORBIDDEN, "ShelfAccount 应 403: {env}");
-    assert_eq!(env["code"], 40300, "FORBIDDEN: {env}");
-}
 
 // ===========================================================================
 //  2026-10-04 `current_holder_id` 写脏守卫：move WORKER → POOL 的目标货架
@@ -2517,7 +2275,7 @@ async fn move_worker_to_pool_rejects_unusable_shelf_in_all_three_shapes() {
             app,
             json_request(
                 "POST",
-                "/prod/pool/move",
+                "/prod/queue/move",
                 Some(json!({
                     "batch_id": held_batch.to_string(),
                     "from": { "kind": "WORKER", "worker_id": worker.to_string() },
@@ -2602,7 +2360,7 @@ async fn move_worker_to_pool_validates_shelf_when_batch_has_no_process() {
         app,
         json_request(
             "POST",
-            "/prod/pool/move",
+            "/prod/queue/move",
             Some(json!({
                 "batch_id": held_batch.to_string(),
                 "from": { "kind": "WORKER", "worker_id": worker.to_string() },

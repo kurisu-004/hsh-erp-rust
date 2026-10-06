@@ -13,7 +13,7 @@
 //!  10. 角色守卫：Inspector 调 dispatch → 40300 FORBIDDEN
 //!  11. GET pending：unauth → 40100
 //!  12. 回归（2026-09-30 review 第 3 轮 L5）：**无工序链工单** dispatch 后出现在
-//!      `GET /prod/pool/{process_id}` + `/prod/pool/counts`（用户报告的原始 bug）
+//!      `GET /prod/queue/{process_id}` + `/prod/queue/counts`（用户报告的原始 bug）
 //!  13. 2026-10-04 `current_holder_id` 写脏守卫：dispatch 的目标货架已软删 / 已停用 /
 //!      是品检区 → 20508 拒收且批次保持 PENDING + holder 仍 NULL
 //!  14. 2026-10-04「跳过」语义：sort_order 最小的候选不可用时继续往后找可用货架，
@@ -229,7 +229,7 @@ async fn dispatch_happy_path() {
         app.clone(),
         json_request(
             "GET",
-            "/prod/batches/pending?limit=200&offset=0",
+            "/prod/queue/pending?limit=200&offset=0",
             None,
             Some(&token),
         ),
@@ -244,7 +244,7 @@ async fn dispatch_happy_path() {
         app,
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [{
                     "batch_id": batch_id.to_string(),
@@ -300,7 +300,7 @@ async fn dispatch_nonexistent_batch_returns_not_found() {
         app,
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [{
                     "batch_id": "9999999999999",
@@ -332,7 +332,7 @@ async fn dispatch_second_call_returns_invalid_status() {
         app.clone(),
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [{
                     "batch_id": batch_id.to_string(),
@@ -351,7 +351,7 @@ async fn dispatch_second_call_returns_invalid_status() {
         app,
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [{
                     "batch_id": batch_id.to_string(),
@@ -382,7 +382,7 @@ async fn dispatch_no_shelf_for_process_returns_not_found() {
         app,
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [{
                     "batch_id": batch_id.to_string(),
@@ -418,7 +418,7 @@ async fn dispatch_empty_targets_returns_validation_error() {
         app,
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({ "targets": [] })),
             Some(&token),
         ),
@@ -458,7 +458,7 @@ async fn dispatch_bulk_full_rollback_on_one_failure() {
         app,
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [
                     { "batch_id": batch_ok.to_string(), "target_process_id": process_a.to_string() },
@@ -500,7 +500,7 @@ async fn auto_dispatch_preview_no_chain_returns_skip_reason() {
         app,
         json_request(
             "POST",
-            "/prod/batches/auto-dispatch",
+            "/prod/queue/auto-dispatch",
             Some(json!({
                 "batch_ids": [batch_id.to_string()],
             })),
@@ -602,7 +602,7 @@ async fn auto_dispatch_preview_with_chain_returns_first_process_and_shelf() {
         app,
         json_request(
             "POST",
-            "/prod/batches/auto-dispatch",
+            "/prod/queue/auto-dispatch",
             Some(json!({
                 "batch_ids": [batch_id.to_string()],
             })),
@@ -637,7 +637,7 @@ async fn auto_dispatch_preview_unknown_batch_returns_not_found() {
         app,
         json_request(
             "POST",
-            "/prod/batches/auto-dispatch",
+            "/prod/queue/auto-dispatch",
             Some(json!({ "batch_ids": ["9999999999999"] })),
             Some(&token),
         ),
@@ -662,7 +662,7 @@ async fn auto_dispatch_preview_empty_batch_ids_returns_validation_error() {
         app,
         json_request(
             "POST",
-            "/prod/batches/auto-dispatch",
+            "/prod/queue/auto-dispatch",
             Some(json!({ "batch_ids": [] })),
             Some(&token),
         ),
@@ -709,7 +709,7 @@ async fn dispatch_after_concurrent_status_change_returns_invalid_status() {
         app,
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [{
                     "batch_id": batch_id.to_string(),
@@ -753,7 +753,7 @@ async fn dispatch_after_external_version_bump_succeeds_with_new_version() {
         app,
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [{
                     "batch_id": batch_id.to_string(),
@@ -787,7 +787,7 @@ async fn dispatch_forbidden_for_inspector() {
         app,
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [{
                     "batch_id": batch_id.to_string(),
@@ -809,7 +809,7 @@ async fn list_pending_unauth_returns_401() {
 
     let (s, env) = send(
         app,
-        json_request("GET", "/prod/batches/pending", None, None),
+        json_request("GET", "/prod/queue/pending", None, None),
     )
     .await;
     assert_eq!(s, StatusCode::UNAUTHORIZED, "未登录应 401: {env}");
@@ -818,7 +818,7 @@ async fn list_pending_unauth_returns_401() {
 
 /// 场景 12（2026-09-30 review 第 3 轮 L5）**旗舰场景端到端回归**：
 /// **无工序链工单**的批次 dispatch 到某工序后，必须出现在该工序的候选池里
-/// （`GET /prod/pool/{process_id}` 的 items + `GET /prod/pool/counts` 的 count）。
+/// （`GET /prod/queue/{process_id}` 的 items + `GET /prod/queue/counts` 的 count）。
 ///
 /// 这就是用户报告的原始 bug（「拖批次下发到工序后，工序池不显示该批次」），
 /// 也是本次改动的核心目标：**让没有工序链的工单，其批次也能正常入池**。
@@ -830,7 +830,7 @@ async fn list_pending_unauth_returns_401() {
 ///
 /// 修复后 dispatch 写 `current_process_id = target_process_id`，池 SQL 改为按该列
 /// 普通过滤。**回退 `update_batch_dispatched` 的 `current_process_id = $5` 即会让本
-/// 测试必红** —— 此前 `prod/batch/service.rs` 只在单测里断言该列、worker_pool 的
+/// 测试必红** —— 此前 `prod/batch/service.rs` 只在单测里断言该列、prod::queue 的
 /// helper 又都建了 chain + step，没有任何端到端测试覆盖这个组合。
 #[tokio::test]
 async fn dispatch_part_without_process_chain_appears_in_pool() {
@@ -860,7 +860,7 @@ async fn dispatch_part_without_process_chain_appears_in_pool() {
         app.clone(),
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({
                 "targets": [{
                     "batch_id": batch_id.to_string(),
@@ -921,7 +921,7 @@ async fn dispatch_part_without_process_chain_appears_in_pool() {
         app.clone(),
         json_request(
             "GET",
-            &format!("/prod/pool/{process_a}"),
+            &format!("/prod/queue/{process_a}"),
             None,
             Some(&token),
         ),
@@ -938,7 +938,7 @@ async fn dispatch_part_without_process_chain_appears_in_pool() {
     // 4. 计数端点同样应计入（前端 tab 徽标）
     let (cs, counts_env) = send(
         app,
-        json_request("GET", "/prod/pool/counts", None, Some(&token)),
+        json_request("GET", "/prod/queue/counts", None, Some(&token)),
     )
     .await;
     assert_eq!(cs, StatusCode::OK, "GET pool/counts: {counts_env}");
@@ -1021,7 +1021,7 @@ async fn dispatch_rejects_unusable_shelf_in_all_three_shapes() {
             app.clone(),
             json_request(
                 "POST",
-                "/prod/batches/dispatch",
+                "/prod/queue/dispatch",
                 Some(json!({ "targets": [
                     { "batch_id": batch_id.to_string(), "target_process_id": process_a.to_string() }
                 ] })),
@@ -1106,7 +1106,7 @@ async fn dispatch_skips_unusable_shelf_and_uses_next_candidate() {
         app.clone(),
         json_request(
             "POST",
-            "/prod/batches/dispatch",
+            "/prod/queue/dispatch",
             Some(json!({ "targets": [
                 { "batch_id": batch_id.to_string(), "target_process_id": process_a.to_string() }
             ] })),

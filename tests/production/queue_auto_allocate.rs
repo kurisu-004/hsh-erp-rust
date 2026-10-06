@@ -1,4 +1,4 @@
-//! worker_pool::auto_allocate 端到端集成测试（part-worker-pool-federated-rocket 2026-09-11）
+//! prod::queue::auto_allocate 端到端集成测试（part-worker-pool-federated-rocket 2026-09-11）
 //!
 //! 覆盖 7 个场景：
 //!   1. COUNT mode happy：fill_ratio=1.0 抢到 max_held_batches 个批次
@@ -16,7 +16,7 @@
 //! ## clippy allow
 //! 2026-09-16 PR-3：fixture helper（`insert_pool_part` / `insert_work_type` /
 //!  `insert_worker` / `insert_l2_customer` 等）走 `pool_snowflake().lock()` 跨 .await
-//! 持锁模式，与 common/ + worker_pool_api.rs 一致；`unused_imports` 是顶层
+//! 持锁模式，与 common/ + prod::queue_api.rs 一致；`unused_imports` 是顶层
 //!  `use SnowflakeIdGenerator` 仅作类型签名引用。
 //! 2026-09-23 PR13 Phase D：`#![allow]` 已在 tests/production/mod.rs 集中豁免，
 //! 本文件移除。
@@ -28,7 +28,7 @@
 //! - `login_manager_with_username`：本 sub-file 独享（每次用不同 username 登入）
 //! - `insert_work_type` / `insert_worker` / `insert_customer_l2` / `insert_pool_part`：
 //!   本 sub-file 独享的 raw SQL 构造（auto_allocate 域 max_held_minutes 字段
-//!   是 worker_pool.rs 的 helper 没覆盖的额外字段，跨 binary 不通用）
+//!   是 prod::queue.rs 的 helper 没覆盖的额外字段，跨 binary 不通用）
 
 use axum::http::StatusCode;
 use serde_json::json;
@@ -325,7 +325,7 @@ async fn insert_pool_part(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .next_id();
-    // 2026-09-16 PR-3 批次 step 化：worker_pool 候选池要求 part 已绑定工艺链
+    // 2026-09-16 PR-3 批次 step 化：prod::queue 候选池要求 part 已绑定工艺链
     // 且 batch 持有 current_process_step_id（worker.match 走 step.process_id）。
     // helper 现在多走两步：建链 → 建 step → INSERT part/batch。
     let chain_id = pool_snowflake()
@@ -383,7 +383,7 @@ async fn insert_pool_part(
         .next_id();
     // 2026-09-16 PR-3 批次 step 化：删 `next_process_id` / `placed_at` 列；
     // 改为 `current_process_step_id`。
-    // 2026-09-30：worker_pool 候选池匹配改回
+    // 2026-09-30：prod::queue 候选池匹配改回
     // `pb.current_process_id = ANY(worker.process_ids)`（不再 JOIN
     // t_process_chain_step），helper 必须补该列否则批次对池隐身。
     sqlx::query!(
@@ -431,7 +431,7 @@ async fn auto_allocate_count_mode_full_fill() {
         app,
         json_request(
             "POST",
-            "/prod/pool/auto-allocate",
+            "/prod/queue/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -477,7 +477,7 @@ async fn auto_allocate_count_mode_zero_fill() {
         app,
         json_request(
             "POST",
-            "/prod/pool/auto-allocate",
+            "/prod/queue/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -518,7 +518,7 @@ async fn auto_allocate_time_mode_target_calc() {
         app,
         json_request(
             "POST",
-            "/prod/pool/auto-allocate",
+            "/prod/queue/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -557,7 +557,7 @@ async fn auto_allocate_time_mode_minutes_not_set() {
         app,
         json_request(
             "POST",
-            "/prod/pool/auto-allocate",
+            "/prod/queue/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -591,7 +591,7 @@ async fn auto_allocate_rejects_ratio_above_one() {
         app,
         json_request(
             "POST",
-            "/prod/pool/auto-allocate",
+            "/prod/queue/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -618,7 +618,7 @@ async fn auto_allocate_rejects_negative_ratio() {
         app,
         json_request(
             "POST",
-            "/prod/pool/auto-allocate",
+            "/prod/queue/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -651,7 +651,7 @@ async fn auto_allocate_pool_empty() {
         app,
         json_request(
             "POST",
-            "/prod/pool/auto-allocate",
+            "/prod/queue/auto-allocate",
             Some(json!({
                 "process_id": proc.to_string(),
                 "shelf_id": shelf.to_string(),
@@ -680,7 +680,7 @@ async fn auto_allocate_process_not_found() {
         app,
         json_request(
             "POST",
-            "/prod/pool/auto-allocate",
+            "/prod/queue/auto-allocate",
             Some(json!({
                 "process_id": nonexistent.to_string(),
                 "shelf_id": shelf.to_string(),
