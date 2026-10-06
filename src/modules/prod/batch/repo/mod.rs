@@ -1,10 +1,9 @@
 //! `t_part_batch` repo 层 —— SQL 真源
 //!
-//! 2026-10-02 域迁移：`t_part_batch` 是生产执行单元，本表的 repo 层整体归
-//! `prod::batch`。原 `part/batch/repo.rs`（单文件 1785 行）拆为
-//! `queries.rs` / `sql.rs` / `list.rs` / `trait.rs` 四文件；原
-//! `part/repo/sql/batch_sql.rs`（`impl PartRepo` 的 19 个流转写点）并入
-//! `sql.rs`，impl 目标由 `PartRepo` 改为本域 ZST `PartBatchRepo`。
+//! `t_part_batch` 是生产执行单元，本表的 repo 层归 `prod::batch`：3 个子文件
+//! （`queries.rs` / `sql.rs` / `trait.rs`）+ 本文件，逐个职责见下方「## 文件分工」。
+//! 流转写点在 `sql.rs`，impl 目标是本域 ZST `PartBatchRepo`（**不是** part 域的
+//! `PartRepo`）。
 //!
 //! ## 两个 ZST 的分工（命名相近，注意区分）
 //! - `PartBatchRepo` —— `t_part_batch` 的**通用** SQL 真源，全仓读写批次表的
@@ -27,8 +26,8 @@
 //!
 //! 2026-10-07：待品检队列读（`GET /api/v2/prod/inspection/queue`）自本目录
 //! `list.rs` 迁入 `prod::inspection`（该域是该页面的唯一数据源所在域，且迁后保持
-//! 零跨域依赖）—— 本域不再持有任何**集合读** SQL；`/repair` / `/repairing` 两条
-//! 集合读在 service 层直接构造 VO、不查 repo。
+//! 零跨域依赖）—— 本目录（repo 层）不再持有任何**集合读** SQL；`/repair` /
+//! `/repairing` 两条集合读在 service 层直接构造 VO、不查 repo。
 //!
 //! ## 2026-10-02 去重
 //! 本文件原 `BatchRepo::find_batch_by_id`（`WHERE id = $1 AND ($2 OR deleted_at IS NULL)`）

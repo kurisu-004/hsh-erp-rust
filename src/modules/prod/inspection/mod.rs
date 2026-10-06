@@ -16,9 +16,18 @@
 //! `items[*]` 恰好 13 个 key、计数 `total` / `limit` / `offset` 是 JSON **string**
 //! 而非 number），前端 Zod schema 无需改动；**入参 query string 亦逐字不变**
 //! （`drawing_no` / `name` / `serial_no` / `customer_id` / `system_delivery_date_from|to`
-//! / `sort_by` / `sort_dir` / `limit` / `offset`）。前端配套改动（改一处 api 层
-//! 的 URL 常量）在**前端仓**（`~/Code/hsh-erp/frontend`）由独立任务负责，本次后端
-//! 提交不含前端改动。
+//! / `sort_by` / `sort_dir` / `limit` / `offset`）。前端配套改动在**前端仓**
+//! （`~/Code/hsh-erp/frontend`）由独立任务负责，共 3 类落点：
+//! - 1 处 URL 字面量：队列读的 api 封装 `listInspectionBatches` 连同整个 api 模块
+//!   从 `src/api/parts/batch.ts` 迁入 `src/api/inspection.ts`，URL 字面量
+//!   `/prod/batches/inspection` → `/prod/inspection/queue`；
+//! - 1 处单测路径断言：`src/api/parts/__tests__/routes.spec.ts` 里那条
+//!   `expect(...).toBe('/prod/batches/inspection')` 迁到新建的
+//!   `src/api/__tests__/inspection.contract.spec.ts`（该断言同时锁住扫码端点 URL）；
+//! - 9 个文件的注释引用旧路径（`src/composables/queries/{keys,schemas}.ts` /
+//!   `src/types/inspection.ts` / `src/views/inspection/**`），纯文案、不影响行为。
+//!
+//! 本次后端提交不含前端改动。
 //!
 //! ## 扫码端点（`GET /scan/{serial_no}`）
 //!
@@ -114,14 +123,14 @@
 //!   `ORDER BY {col} {dir} NULLS LAST, pb.id ASC`（`pb.id` 是翻页稳定性的兜底键）。
 //!
 //! ⚠️ `l1_customer_name` 的派生口径**与返修列表不同**（`c.parent_id IS NOT NULL`
-//! → `pc.name.or(c.name)`，否则 `c.name`；返修那条不回落 `c.name`）—— 两处都是
-//! 有意分叉，改一侧要同步另一侧的注释。
+//! → `pc.name.or(c.name)`，否则 `c.name`；返修那条不回落 `c.name`）—— 两条 SQL 的
+//! 分叉是有意的，但**只有本域侧写了登记**（见 `repo.rs`），返修侧当前没有对应注释。
 //!
 //! ## 模块结构（平级单文件，与 `prod::process_design` / `prod::programming` 平行）
 //! 本域**两个端点共一层文件**（不是「一端点一目录」）：端点之间的耦合只有「共用
 //! 角色白名单 / 共用批次表」这一层，按层切文件比按端点切目录更贴近全仓形态，且
-//! 两个 repo / 两个 service 的方法名自带 `scan` / `inspection_queue` 前缀区分，
-//! 不会混。
+//! 两个 repo / 两个 service 的**类型名**自带 `InspectionScan` / `InspectionQueue`
+//! 前缀区分（方法名则是 `scan` 与 `list_queue`），不会混。
 //! - `dto.rs` —— 入参（仅队列读的 `InspectionQueueQuery`，Query string；
 //!   **扫码端点无入参**，`serial_no` 走 path）
 //! - `model.rs` —— 行结构：`ScanPartRow` / `ScanAssemblyRow` / `ScanBatchRow`
@@ -136,7 +145,6 @@
 //!   内存分组挂树）+ `InspectionQueueService`（角色守卫 + limit/offset clamp +
 //!   **排序白名单映射** + ILIKE 通配符拒绝 + row→vo 投影）
 //! - `handler.rs` —— HTTP 路由 2 条（只做参数提取 + `pool.acquire()` + `R::ok`）
-//!
 //!
 //! ## 事务 / WS 广播 / schema
 //! 两个端点都是纯读：handler `pool.acquire()` 不开事务，**不发** WS 广播（无业务

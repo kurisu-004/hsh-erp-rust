@@ -3,8 +3,7 @@
 //! 2026-10-05 新增：ZST `InspectionScanRepo` + 5 个静态方法，全部走
 //! `sqlx::query_as!` 宏（编译期按 `.env` 的 `DATABASE_URL` 连库校验，改列名 /
 //! 改类型编译即失败）。不引入胖 trait：单 service + 纯读端点，无跨域调用方、
-//! 无 mock 替身需求（范式同 `prod::programming::ProgrammingRepo`，见
-//! `docs/repo-naming.md` §3.1）。
+//! 无 mock 替身需求（范式同 `prod::programming::ProgrammingRepo`）。
 //!
 //! 2026-10-07 新增：待品检队列读（`GET /api/v2/prod/inspection/queue`）自
 //! `prod::batch::repo::list` 迁入本文件，与扫码读共用本文件，构成**两个 ZST**
@@ -13,7 +12,7 @@
 //! 两者 SQL 形态也不同：扫码读走 `query_as!` 字面量宏（编译期校验），队列读走
 //! `QueryBuilder`（动态 `ORDER BY` + 可选过滤，宏无法固化，**不进 `.sqlx`**）。
 //!
-//! ## 5 个方法 / 单次请求的 SQL 条数
+//! ## 扫码读的 5 个方法 / 单次请求的 SQL 条数
 //! 一次扫码请求按分支取 2~4 条 SQL，**无 N+1**（子件再多也只有一条批次查询，
 //! 走 `part_id = ANY($1)` 一次捞回全部子件的批次）：
 //!
@@ -137,8 +136,9 @@
 //! 不带 `deleted_at` 过滤，父行在即取父名，父行悬空才回落 `c.name`）；否则
 //! （自身即 L1）→ `c.name`。
 //! ⚠️ 与 `prod::batch::service::repair::list_batches_matching` 的同名派生**口径不同**
-//! （那条不回落 `c.name`：客户自身即 L1、或父客户被软删时为 null）。两处都是有意
-//! 分叉，改任一侧都要同步另一侧的注释。
+//! （那条不回落 `c.name`：客户自身即 L1、或父客户被软删时为 null）。两条 SQL 的分叉
+//! 是有意的，但**只有本处写了登记** —— 返修侧当前没有对应注释，改这一处前先去看
+//! `repair.rs` 的 SQL 是否仍是分叉。
 
 use chrono::NaiveDate;
 use sqlx::{PgConnection, PgExecutor, Postgres, QueryBuilder};
@@ -509,7 +509,7 @@ impl InspectionQueueRepo {
                 // （pc 的 LEFT JOIN 不带 deleted_at 过滤，父行在即取父名，父行悬空才
                 // 回落 c.name）；否则（自身即 L1）→ c.name。与
                 // `prod::batch::service::repair::list_batches_matching` 的同名派生
-                // **口径不同**（那条不回落 c.name），两处都有登记，勿统一。
+                // **口径不同**（那条不回落 c.name），勿统一；返修侧无对应登记。
                 let l1_customer_name = if r.customer_parent_id.is_some() {
                     r.parent_customer_name
                         .clone()

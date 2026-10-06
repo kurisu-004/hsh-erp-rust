@@ -7,7 +7,7 @@
 //!
 //! ## 角色守卫
 //! 下沉到 service 第一行（沿 `prod::batch` 的 `TO_XXX_ROLES` 范本），
-//! `current.require_any_role(&[Role::Manager, Role::Inspector])`；handler 仅做
+//! `current.require_any_role(READ_ROLES)`；handler 仅做
 //! 参数提取，不重复校验。
 //!
 //! 白名单**只有 2 个角色**（与 `GET /api/v2/prod/inspection/queue` 及
@@ -306,7 +306,7 @@ fn to_ilike_pat(field: &str, raw: Option<&str>) -> Result<Option<String>, AppErr
     Ok(Some(format!("%{v}%")))
 }
 
-/// 队列读默认分页大小（与迁前一致：200，clamp 区间 `[1, 200]`）。
+/// 队列读默认分页大小（200，clamp 区间 `[1, 200]`）。
 const DEFAULT_QUEUE_LIMIT: i64 = 200;
 
 /// `prod::inspection` 待品检队列读的 service（ZST，与本域扫码读范本一致）。

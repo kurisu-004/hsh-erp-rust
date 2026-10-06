@@ -18,7 +18,8 @@
 //!      覆盖**，守卫在 `prod::inspection::service::InspectionQueueService::list_queue`
 //!      第一行）。
 //!      brief 原话「Worker role」并不存在，本仓库 5 角色中 ShelfAccount 是唯一合法
-//!      登录、但不在 `INSPECTION_LIST_ROLES = [Manager, Inspector]` 内的角色；
+//!      登录、但不在队列读白名单（`prod/inspection/service.rs` 的模块私有常量
+//!      `READ_ROLES` = Manager + Inspector）内的角色；
 //!      `PartFixture::SHELF_ACCOUNT_USERNAME` + SHELF_ACCOUNT role 提供该登录态。
 //!   6. 分页：`limit + offset` 切分 items，且 `total` 恒等于**过滤后**的实际条数
 //!      （锁住「list / count 共用同一 WHERE 拼装器」这个核心主张）。
@@ -1044,7 +1045,9 @@ async fn inspection_batches_filters_by_system_delivery_date_range() {
 /// 角色守卫：白名单外的角色 → 403 / 40300 FORBIDDEN。
 ///
 /// brief 原话「Worker role」并不存在（本仓库 5 角色：Manager / Clerk / Inspector /
-/// CncProgrammer / ShelfAccount）。`INSPECTION_LIST_ROLES = [Manager, Inspector]`，
+/// CncProgrammer / ShelfAccount）。队列读白名单 = Manager + Inspector
+/// （`prod/inspection/service.rs` 的模块私有常量 `READ_ROLES`，集成测试拿不到，
+/// 故此处不复述其符号名），
 /// ShelfAccount 是「能登录但在白名单外」的唯一角色，故用它模拟越权。
 /// 守卫在 service 层第一行（`require_any_role`），**本文件是该守卫的唯一覆盖**。
 #[tokio::test]

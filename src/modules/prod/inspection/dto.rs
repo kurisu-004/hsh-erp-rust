@@ -1,13 +1,8 @@
 //! prod::inspection 子模块 DTO —— 入参（Query string 反序列化侧）
 //!
-//! 2026-10-07 新增：待品检队列读从 `prod::batch` 迁入本域时随之落地的
-//! [`InspectionQueueQuery`]，**逐字沿用**迁前形态（字段名 / `serde` 属性 / 白名单
-//! 取值域全未改）—— 前端 query string 契约不因域迁移而变。
-//!
-//! ## 为什么本文件此时才存在
-//! 2026-10-05 建域时本域**刻意没有** `dto.rs`：扫码端点 `GET /scan/{serial_no}`
-//! 无任何入参（`serial_no` 走 path），造一个空 DTO 模块只是噪音。队列读有 Query
-//! string，故新增本文件；它是本域**唯一**的入参 DTO 载体（形态同
+//! 队列读 `GET /api/v2/prod/inspection/queue` 有 Query string 入参，故本域的入参
+//! DTO 载体就是这一个文件；**扫码端点 `GET /scan/{serial_no}` 无任何入参**
+//! （`serial_no` 走 path），故本域**没有**第二个 DTO（形态同
 //! `prod::programming::dto`）。
 //!
 //! i64 反序列化兜底走 `shared::types::deserialize_i64_opt`（前端允许 数字 / 字符串
