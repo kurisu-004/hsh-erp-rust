@@ -59,7 +59,7 @@ use crate::modules::part::dto_crud::{
 ///
 /// 仅本 crate 可见：`get_part_batches_by_serial` 用 `sqlx::query_as!` 接收
 /// `t_part` 的窄字段（id + 8 列），避免读 28 列 `TPart`。由
-/// `PartScanInfoOut::from` 转 DTO，转换实现位于 `src/modules/part/dto.rs`
+/// `PartScanInfoOut::from` 转 DTO，转换实现位于 `src/modules/part/dto_crud.rs`
 /// （与 DTO 同处，便于维护）。
 #[derive(sqlx::FromRow)]
 pub(crate) struct TPartScanRow {

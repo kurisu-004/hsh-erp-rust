@@ -21,9 +21,9 @@
 //!   `l1_customer_name`。
 //!
 //! ## 与 part::service::crud 边界
-//! - 原 `PartService::list_parts` 的 ALL / ASSEMBLY 分支（`list_parts_assembly_only` /
-//!   `list_parts_all_merged` / `project_assembly_to_part_list_item` / `fetch_child_counts` /
-//!   `parse_list_filters_for_assembly`）已下沉到本域（plan §5）。
+//! - ALL / ASSEMBLY 两种 `row_type` 的分支逻辑在本域：过滤解析走 `parse_filters`
+//!   （字段解析 + 客户 id 展开），装配件行的投影与子件计数走
+//!   `project_assembly_to_part_list_item` / `fetch_child_counts`。
 //! - `parse_list_filters` 留在 part 域：本端点复用其等价的内联版本（字段解析 +
 //!   客户 id 展开）。客户 id 展开是跨域通用的客户树 helper，落在
 //!   [`crate::shared::customer`]，本域与 `part` / `prod::batch` 共用同一份实现。
@@ -35,7 +35,7 @@
 //! 四态全部生效。
 //!
 //! ## 2026-09-30 新增：10 字段筛选（4 文本 ILIKE + 4 日期窗口 + 2 IS NULL 三态）
-//! 修零件一览页面（frontend `PartsTable.vue` / `usePartsListQuery.ts::buildParams()`）
+//! 修零件一览页面（frontend `PartsList.vue` / `usePartsListQuery.ts::buildParams()`）
 //! 照常发出的 10 个字段全部被静默丢弃的隐藏 bug：
 //! - 文本：`drawing_no` / `name` / `order_no` / `serial_no`（ILIKE %x%）
 //! - 日期：`request_date_from/to` / `system_delivery_date_from/to`（闭区间）
