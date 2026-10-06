@@ -167,6 +167,15 @@ mod tests {
             resolve_order_col(Some("p.serial_no; DROP TABLE t_part")),
             "p.planned_delivery_date"
         );
+        // 列名只认全大写：与下方 order_dir 的忽略大小写不对称（口径登记在 dto 字段 doc）
+        assert_eq!(
+            resolve_order_col(Some("created_at")),
+            "p.planned_delivery_date"
+        );
+        assert_eq!(
+            resolve_order_col(Some("serial_no")),
+            "p.planned_delivery_date"
+        );
     }
 
     #[test]

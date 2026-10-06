@@ -14,8 +14,8 @@
 //! - `map_create_error` —— sqlx 错误码 → 业务错误码
 //! - `lookup_customer_names` —— 取客户名 + L1 名
 //!
-//! 客户 id 展开（L1+L2）不再本域持有：见 [`crate::shared::customer`]，
-//! `part` / `com::union_list` / `prod::batch` 三域共用那一份实现。
+//! 客户 id 展开（L1+L2）见 [`crate::shared::customer`]：`part` /
+//! `com::union_list` / `prod::batch` 三域共用那一份实现。
 //!
 //! 2026-09-22 D-6 重构：方法签名 `<R: PartRepoTrait>`（by-value；trait 已直接
 //! `impl for &mut PgConnection`）。生产 `R = &mut PgConnection`，handler/service

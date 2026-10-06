@@ -25,9 +25,8 @@
 //!   `list_parts_all_merged` / `project_assembly_to_part_list_item` / `fetch_child_counts` /
 //!   `parse_list_filters_for_assembly`）已下沉到本域（plan §5）。
 //! - `parse_list_filters` 留在 part 域：本端点复用其等价的内联版本（字段解析 +
-//!   客户 id 展开）。客户 id 展开本身是跨域通用的客户树 helper，已上提到
-//!   [`crate::shared::customer`]，本域与 `part` / `prod::batch` 共用同一份实现，
-//!   不再各写一份私有的。
+//!   客户 id 展开）。客户 id 展开是跨域通用的客户树 helper，落在
+//!   [`crate::shared::customer`]，本域与 `part` / `prod::batch` 共用同一份实现。
 //!
 //! ## 2026-09-30 新增：`planned_delivery_date_from/to` 日期窗口过滤
 //! 修前端 dashboard UpcomingDeliveryListDrawer 的隐藏 bug —— 前端已传这俩参数

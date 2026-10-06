@@ -36,8 +36,8 @@
 //! ```
 //! `<白名单列>` / `<ASC|DESC>` 由 service 层的 `resolve_order_col` /
 //! `resolve_order_dir` 映射后经 [`ProgrammingFilters::order_col`] /
-//! [`ProgrammingFilters::order_dir`] 传进来 —— repo 收不到任何外部输入，故拼进
-//! SQL 文本的只有这两个受控字面量。
+//! [`ProgrammingFilters::order_dir`] 传进来 —— repo 收到的字段或已规范化、或以
+//! `push_bind` 传参，拼进 SQL 文本的只有 `order_col` / `order_dir` 两个受控字面量。
 //!
 //! - 规则1：工单状态仍是 PROGRAMMING（兼容旧 `GET /parts/pending-programming` 筛选）
 //! - 规则2：工单绑定的工艺链上有任一 `is_cnc` 工序 step（编程员据此进生产流）
@@ -175,8 +175,9 @@ const WHERE_SKELETON: &str = " WHERE p.deleted_at IS NULL \
 /// 独立 struct，不污染其它域的 Filters 类型。`keyword` / `serial_no` 在 service
 /// 层已 trim 且把空串收敛成 `None`；排序项收的是**已白名单化的列名 / 方向**
 /// （`p.planned_delivery_date` / `ASC` 这类字面量），映射在 service 层的
-/// `resolve_order_col` / `resolve_order_dir` 完成 —— repo 收不到任何外部输入，
-/// 故拼进 SQL 文本的只有这两个受控字符串。
+/// `resolve_order_col` / `resolve_order_dir` 完成 —— repo 收到的字段或已规范化、
+/// 或以 `push_bind` 传参，拼进 SQL 文本的只有 `order_col` / `order_dir` 两个受控
+/// 字面量。
 ///
 /// 刻意**不**派生 `Default`：`Default` 会造出 `order_col = ""` / `order_dir = ""`，
 /// 一旦被 `..Default::default()` 用上就生成 `ORDER BY  NULLS LAST` → 运行期 SQL

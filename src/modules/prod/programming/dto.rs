@@ -34,11 +34,16 @@ pub struct ProgrammingListQuery {
     /// 工单序列号精确匹配（`p.serial_no = $n`）。
     pub serial_no: Option<String>,
     /// 排序列白名单：`CREATED_AT` / `UPDATED_AT` / `PLANNED_DELIVERY_DATE` /
-    /// `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它值退化为
-    /// `PLANNED_DELIVERY_DATE`（**不报错**，见 repo 白名单兜底）。
+    /// `REQUEST_DATE` / `SERIAL_NO` / `DRAWING_NO` / `NAME`；其它值（含缺省）一律
+    /// 退化为 `PLANNED_DELIVERY_DATE`，**不报错**（映射表见 service 层
+    /// `resolve_order_col`）。
+    ///
+    /// 大小写口径（2026-10-07 review 第 1 轮登记）：本字段**只认全大写 token**，
+    /// 传 `created_at` 这类小写写法会静默退化成计划交期；`sort_dir` 则忽略大小写。
+    /// 两者不对称，前端传参一律用全大写枚举。
     #[serde(default)]
     pub sort_by: Option<String>,
-    /// `ASC` / `DESC`（缺省 `ASC`）；非 `DESC` 一律按 `ASC` 处理。
+    /// `ASC` / `DESC`（缺省 `ASC`）；非 `DESC` 一律按 `ASC` 处理（大小写不敏感）。
     #[serde(default)]
     pub sort_dir: Option<String>,
     #[serde(default, deserialize_with = "deserialize_i64_opt_lenient")]

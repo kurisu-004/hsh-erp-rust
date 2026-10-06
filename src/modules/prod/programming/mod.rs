@@ -47,9 +47,10 @@
 //! - **排序白名单映射在 service 层**：`sort_by` / `sort_dir` 是外部字符串，经
 //!   `service.rs::resolve_order_col` / `resolve_order_dir` 映射成列名 / 方向字面量
 //!   才进 `repo.rs` 的 [`repo::ProgrammingFilters::order_col`] / `order_dir`；
-//!   **repo 收不到任何外部输入**，拼进 SQL 文本的只有这两个受控字符串
-//!   （范式同 `prod::batch::service::list`）。非法 `sort_by` 退化为计划交期、
-//!   非法 `sort_dir` 退化为 `ASC`，均**不报错**。
+//!   repo 收到的字段或已规范化（`keyword` / `serial_no`）、或以 `push_bind` 传参
+//!   （`has_cnc_program` / `limit` / `offset`），拼进 SQL 文本的只有 `order_col` /
+//!   `order_dir` 两个受控字面量（范式同 `prod::batch::service::list`）。非法
+//!   `sort_by` 退化为计划交期、非法 `sort_dir` 退化为 `ASC`，均**不报错**。
 //! - **`has_cnc_program` 真相源留 repo**：`repo.rs::G_CODE_EXISTS` 同一常量同时供
 //!   list 的 SELECT 投影与 WHERE 三态过滤复用，**改一必须同步二**（义务登记见该
 //!   常量 doc）。它与上面的排序白名单是两回事：白名单映射的是外部字符串→列名，
