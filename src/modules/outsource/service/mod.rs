@@ -61,7 +61,7 @@ const LIST_MAX_LIMIT: i64 = 200;
 /// `ck_t_customer_no_self_parent` CHECK，`parent_id = id` 不可能。
 ///
 /// 2026-10-03 起 outsource 域全部 VO 的 `customer_path` 都走本函数。范式抄
-/// `prod::worker_pool::repo::sql.rs`（`CandidateRow → PoolBatchItem`）。
+/// `prod::queue::repo::sql.rs`（`CandidateRow → PoolBatchItem`）。
 pub(crate) fn join_customer_path(l1: Option<&str>, l2: Option<&str>) -> Option<String> {
     match (l1, l2) {
         (Some(p), Some(l)) => Some(format!("{p} / {l}")),

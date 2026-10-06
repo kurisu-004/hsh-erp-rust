@@ -1040,12 +1040,12 @@ impl OutsourceQuotableRepo {
 /// ## 判定谓词 = 「批次当前停在某道外协工序上」
 /// 工序来源是 `pb.current_process_id`（`JOIN t_process pr ON pr.id =
 /// pb.current_process_id AND pr.category = 'OUTSOURCE'`）—— 那一列是**工序候选池
-/// 归属的权威依据**（写入不变式见 `prod::batch::service::guard.rs`）。
+/// 归属的权威依据**（写入不变式见 `src/shared/batch/guards.rs`）。
 ///
 /// 2026-10-03 移除的两层 JOIN：原实现要求「该 OUTSOURCE 工序同时出现在零件的
 /// `process_chain_id` 链内」（`JOIN t_process_chain_step pcs`），而生产库里 1874 个
 /// 零件只有 2 个绑了链、`t_process_chain_step` 里 OUTSOURCE 类的 step 有 0 条 ⇒
-/// 交集恒空 ⇒ 端点恒返回空列表。同一类 bug 在 `prod::worker_pool` 的候选池 SQL 上
+/// 交集恒空 ⇒ 端点恒返回空列表。同一类 bug 在 `prod::queue` 的候选池 SQL 上
 /// 已于 2026-09-30 以同样方式修过（全仓已无 INNER JOIN `t_process_chain_step` 残留）。
 /// 业务决策：**兼容没有工序链的旧零件**，`current_process_id` 指外协工序即可发。
 ///
@@ -1089,7 +1089,7 @@ impl OutsourceQuotableRepo {
 ///
 /// ## `pb.status = 'PENDING'` 这一析取项在写侧不可达（不是 bug，别按可达路径核对）
 /// 写入不变式：PENDING ⇔ 出池（`clear_process_id` 把 `current_process_id` 置 NULL，
-/// 见 `prod::batch::service::guard.rs::mark_batch_with_status_and_meta` 的 doc），
+/// 见 `src/shared/batch/guards.rs::mark_batch_with_status_and_meta` 的 doc），
 /// 而本查询要求 `pr.id = pb.current_process_id` ⇒ PENDING 批次恒不满足 ⇒ 正常业务流
 /// 下该析取项永远不命中。它只对 **legacy 导入数据**有意义：Python 旧库恢复脚本
 /// `scripts/restore_from_backup.sh` 的 `RENAME_MAP` 把旧列
@@ -1475,7 +1475,7 @@ impl OutsourcePoolRepo {
     /// （有链时）。
     ///
     /// 2026-10-03 写侧放松了链的必须性（无链零件可发可收，见
-    /// `prod::batch::service::guard.rs::optional_process_chain`），对本查询的影响：
+    /// `src/shared/batch/guards.rs::optional_process_chain`），对本查询的影响：
     ///
     /// - **无链批次**（`p.process_chain_id IS NULL`）落到 `chain_resolvable = false`
     ///   分支：派生值 `COALESCE(..., 0) = 0`，前端据此弹「需手填下一道工序」对话框。

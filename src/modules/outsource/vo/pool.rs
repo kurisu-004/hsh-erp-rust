@@ -19,7 +19,7 @@
 //! - i64 雪花 ID 一律 `serialize_i64` ⇒ JSON **字符串**（避免 JS 精度截断）。
 //! - Decimal 一律 `::text` 取成字符串。
 //! - `receive_next_process_id` 走 **0 兜底**（后端 i64 + `serialize_i64`，NULL
-//!   走 `.unwrap_or(0)`）—— 与 `prod::batch::vo::PendingBatchItem.
+//!   走 `.unwrap_or(0)`）—— 与 `prod::queue::vo::queue::PendingBatchItem.
 //!   current_process_step_id` 同一口径，JSON 里非 nullable，语义为字符串 `"0"`
 //!   = 「工序链缺失或指针漂移，接收时需人工填下一道工序」。
 

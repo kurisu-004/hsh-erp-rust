@@ -238,8 +238,8 @@ pub struct OutsourceHeldBatchRow {
     /// `t_outsource_shipment.unit_price::text`（Decimal 字符串）。
     pub price: Option<String>,
     /// 下一道工序 id；`COALESCE(..., 0)` ⇒ 无下一 step 时为 **0**
-    /// （沿 `prod::batch::vo::PendingBatchItem.current_process_step_id` 的 0 兜底
-    /// 口径：JSON 里非 nullable，语义为字符串 `"0"` = 未设）。
+    /// （沿 `prod::queue::vo::queue::PendingBatchItem.current_process_step_id`
+    /// 的 0 兜底口径：JSON 里非 nullable，语义为字符串 `"0"` = 未设）。
     pub receive_next_process_id: i64,
     pub receive_next_process_name: Option<String>,
 }

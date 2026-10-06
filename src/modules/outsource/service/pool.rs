@@ -148,7 +148,7 @@ impl OutsourceService {
             in_flight_total += in_flight_count;
             // 防御：候选侧 INNER JOIN `t_process` 已排除软删工序；在途侧没有该
             // JOIN，故可能落到「工序已软删」—— 退化为空 code + 显式占位名
-            // （口径同 `prod::worker_pool::pool_counts_all_shelves`）。
+            // （口径同 `prod::queue::pool_counts_all_shelves`）。
             let (process_code, process_name) = meta
                 .get(&pid)
                 .cloned()

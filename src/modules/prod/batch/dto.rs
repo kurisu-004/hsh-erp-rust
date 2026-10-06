@@ -1,99 +1,32 @@
 //! prod::batch 子模块 DTO —— 入参 + 校验
-//! 2026-09-29 新增 + 2026-09-30 重构：
-//! - dispatch 统一 bulk-only：单条下发即 `targets.length == 1`
-//! - auto-dispatch 改为只读查询（见 `super::vo::AutoDispatchItem`）
-//! - bulk-dispatch 端点删除
 //!
-//! 与 worker_pool / process_chain 等同形 DTO 模块，
+//! 2026-10-08：下发流的 5 个入参（`ListPendingQuery` / `DispatchRequest` /
+//! `DispatchTarget` / `AutoDispatchRequest` / `RecallToPendingRequest`）与对应
+//! 出参一起迁往 `prod::queue::dto` —— 它们的唯一消费方是队列页的下发 / 召回动作。
+//!
+//! 与 queue / process_chain 等同形 DTO 模块，
 //! 仅入参（`Serialize` + 反序列化兜底由 axum `Json` extractor 处理）。
 //! 出参结构见 [`super::vo`]。
-//! i64 反序列化兜底走 `deserialize_i64` / `deserialize_i64_opt` /
-//! `deserialize_i64_vec_opt`（与其它域惯例一致，前端允许 数字 / 字符串 两种形态，
-//! 雪花 ID 一律 string 避免 JS `Number.MAX_SAFE_INTEGER` 精度截断）。
-//! 2026-10-02 追加：自 part 域迁入 17 个批次流转入参（见文件末尾小节）。
+//! i64 反序列化兜底走 `deserialize_i64` / `deserialize_i64_opt`（与其它域惯例一致：
+//! 只接受 JSON 字符串形态，雪花 ID 一律 string 以避免 JS `Number.MAX_SAFE_INTEGER`
+//! 精度截断；发数字会在 axum `JsonRejection` 层被拒 —— HTTP 422 纯文本、不进
+//! `R<T>` 信封）。
+//! 2026-10-02 追加：自 part 域迁入批次流转入参（见文件末尾小节）。
 
 use serde::Deserialize;
 
-use crate::modules::prod::worker_pool::dto::WorkerScanEvent;
-use crate::shared::types::{deserialize_i64, deserialize_i64_opt, deserialize_i64_vec_opt};
-
-/// `GET /api/v2/prod/batches/pending` Query 参数。
-///
-/// 默认 `limit=200` / `offset=0`（与其它 list 端点惯例一致）。允许 caller
-/// 显式覆盖。
-#[derive(Debug, Clone, Deserialize)]
-pub struct ListPendingQuery {
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-}
-
-fn default_limit() -> i64 {
-    200
-}
-
-impl Default for ListPendingQuery {
-    fn default() -> Self {
-        Self {
-            limit: default_limit(),
-            offset: 0,
-        }
-    }
-}
-
-/// `POST /api/v2/prod/batches/dispatch` —— bulk-only 下发（2026-09-30 重构）。
-///
-/// 取代原 `DispatchRequest`（单条）+ `BulkDispatchRequest`（批量）两个 DTO。
-/// 单批次下发即 `targets.length == 1`；批量多批按 `targets` 数组顺序执行，
-/// 任一失败 → 全回滚（事务由 handler 层管）。
-///
-/// 不带 shelf_id / version：货架由 service 按 `target_process_id` 在
-/// `t_shelf_process` 自动解析（`LIMIT 1`），版本号走 batch 当前 version
-/// 隐式 OCC（service 内 fetch batch 后 UPDATE WHERE version = current）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DispatchRequest {
-    pub targets: Vec<DispatchTarget>,
-    /// 可选，落到所有 `t_part_event.note`（2026-09-30 新增，bulk 共享 note）。
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /api/v2/prod/batches/dispatch` 单条目标。
-///
-/// 沿用 2026-09-29 原 `BulkDispatchTarget` 字段定义（`batch_id` + `target_process_id`）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct DispatchTarget {
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub batch_id: i64,
-    #[serde(deserialize_with = "deserialize_i64")]
-    pub target_process_id: i64,
-}
-
-/// `POST /api/v2/prod/batches/auto-dispatch` —— 自动下发预览（只读查询）。
-///
-/// 2026-09-30 重构：原 `auto_dispatch`（写入）改为只读 `auto_dispatch_preview`，
-/// 不再真正下发批次，仅返回每个 batch 的「首道工序 + 首货架」+ skip_reason。
-/// 实际下发仍走 `POST /api/v2/prod/batches/dispatch`。
-///
-/// `batch_ids` 用 `deserialize_i64_vec_opt` 反序列化（与本域其它 i64 字段一致）：
-/// 字段缺省 → `None`；JSON 数组 → 元素按字符串逐个解析为 `i64`（前端发 `"123"`
-/// 字符串形态不会触发 422）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct AutoDispatchRequest {
-    #[serde(default, deserialize_with = "deserialize_i64_vec_opt")]
-    pub batch_ids: Option<Vec<i64>>,
-}
+use crate::modules::prod::queue::dto::WorkerScanEvent;
+use crate::shared::types::{deserialize_i64, deserialize_i64_opt};
 
 // 2026-10-02：自 part 域迁入的批次流转 DTO（原 `part/dto.rs` + `part/dto_crud.rs`）
 // ============================================================================
 //
 // 2026-10-02：迁入的根因
 //
-// 这 17 个入参全部是**以批次为操作对象**的端点（OCC 锚 `t_part_batch.version`），
+// 这些入参全部是**以批次为操作对象**的端点（OCC 锚 `t_part_batch.version`），
 // 2026-10-02 起 URL 从 `POST /api/v2/parts/{part_id}/…` 硬切到
 // `POST /api/v2/prod/batches/{batch_id}/…`，故 DTO 随 handler 一并迁入 prod 域。
-// ## 契约变更：子资源 18 条的 `batch_id` 字段**删除**
+// ## 契约变更：子资源的 `batch_id` 字段**删除**
 // `batch_id` 现在是路径参数，再留在请求体里就是二义源。服务端只认 URL 上的那个。
 // 错误码语义随之变化（2026-10-02）：批次 id 全局唯一即锚点，不存在「跨 part
 // 批次」这一场景，20109 `BIZ_PART_BATCH_NOT_FOUND` 退化为「批次不存在 / 已软删 /
@@ -198,7 +131,7 @@ pub struct BatchToShipRequest {
 /// 是**补料用的生产架**，在同事务的 worker-pool refill 里当候选池的
 /// `current_holder_id` 过滤键用（候选池 SQL 限
 /// `location='PRODUCTION_SHELF' AND current_holder_id = $2`，见
-/// `prod/worker_pool/repo/sql.rs`）。传品检架会让 refill 查空池。
+/// `prod/queue/repo/sql.rs`）。传品检架会让 refill 查空池。
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerScanRequest {
     pub serial_no: String,
@@ -289,17 +222,6 @@ pub struct PlaceOnShelfRequest {
     pub shelf_id: i64,
     #[serde(deserialize_with = "deserialize_i64")]
     pub next_process_id: i64,
-    #[serde(default)]
-    pub note: Option<String>,
-}
-
-/// `POST /api/v2/prod/batches/{batch_id}/recall-to-pending` 入参。
-///
-/// 2026-10-06 订正：`IN_PROCESS` + `location ∈ {PRODUCTION_SHELF, WORKER}` 或
-/// `PROGRAMMING` → `PENDING`：召回已下发批次（含工人持有中的）回待下发池。
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct RecallToPendingRequest {
-    pub version: i32,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -481,7 +403,7 @@ pub struct PickUpRequest {
     /// pick-up 路径上 `shelf_id` 只进 `validate_shelf_zone`，而它内部只
     /// `SELECT ... FROM t_shelf WHERE id = $1 AND deleted_at IS NULL`（零写）；
     /// 本路径 `t_part_batch` 的全部 3 个写入点（拆成 4 条 SQL；`pickup.rs` 内联
-    /// SQL、`guard.rs` → `status_gate.rs` 的通用 UPDATE、部分领取的
+    /// SQL、`guards.rs` → `status.rs` 的通用 UPDATE、部分领取的
     /// `split_batch_for_partial_pass` = `_split_batch_inner` 的 INSERT + UPDATE）
     /// 的 SET 与 WHERE 均无货架列或货架条件；
     /// `t_part_event` 无货架列；响应 VO `PartOut` 无 shelf 字段。

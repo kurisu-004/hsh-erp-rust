@@ -13,7 +13,7 @@ use crate::shared::types::{
 ///
 /// 省略 body / 传 `{}` = **全量对账**（`scope = "ALL"`）。三个字段互相独立：
 /// - 只给 `part_ids` → 只重算这些 part 的 batch → part 派生（父装配件由
-///   status_gate 内部自动级联）；
+///   shared::batch::status 内部自动级联）；
 /// - 只给 `assembly_ids` → 只重算这些装配件的 part → assembly 聚合，**part 段
 ///   完全跳过**（不给 `part_ids` 绝不等于「全量重算 part」）；
 /// - 两个都给 → 两段都做（先 part 后 assembly，顺序保证父件读到的是**已修正**的

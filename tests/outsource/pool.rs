@@ -1,6 +1,6 @@
 //! `GET /outsource-pool/*` 看板三件套集成测试（2026-10-03 新增）
 //!
-//! 形态模板：`tests/production/worker_pool.rs`（`/prod/pool/{counts,state,/{process_id}}`）。
+//! 形态模板：`tests/production/queue.rs`（2026-10-08 后为 `/prod/queue/{snapshot,processes/{id}}`）。
 //!
 //! 覆盖（与本轮验收标准逐条对应）：
 //! 1. `pool_counts_returns_200_sorted_and_totals_match`
@@ -1375,7 +1375,7 @@ async fn pool_state_rejects_missing_query_params_with_400() {
     }
 }
 
-/// 工序不存在 → 404（口径同 `/prod/pool/{process_id}`）。
+/// 工序不存在 → 404（口径同 `/prod/queue/processes/{process_id}`）。
 #[tokio::test]
 async fn pool_detail_unknown_process_returns_404() {
     let (_pool, app, token, _fx) = bootstrap_as_manager().await;

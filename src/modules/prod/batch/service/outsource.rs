@@ -39,7 +39,7 @@ use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
-use super::guard::{
+use crate::shared::batch::guards::{
     assert_shelf_maps_process, ensure_transition, mark_batch_with_status_and_meta,
     optional_process_chain, optional_step_id, validate_batch_version, validate_shelf_zone,
 };
@@ -499,7 +499,7 @@ impl BatchService {
         //
         // OCC 锚分两段，别混：源批次的锚是 `req.version`（前端列表行里的那个
         // version），由 `_split_batch_inner` 内部守卫；子批次的 `version` 被它写死
-        // 为 0，所以必须**读回子批次行**取真实 version 再喂给 status_gate ——
+        // 为 0，所以必须**读回子批次行**取真实 version 再喂给 shared::batch::status ——
         // 拿 `req.version` 去撞子批次会恒 409。
         //
         // 调用方要知道的副作用（2026-10-03 补注）：`_split_batch_inner` 对源批次
@@ -546,7 +546,7 @@ impl BatchService {
             "OUTSOURCE",
             Some("OUTSOURCE_COMPANY"),
             Some(req.outsource_company_id),
-            // 2026-10-03：无链时为 None ⇒ status_gate 的 clear 分支写 NULL
+            // 2026-10-03：无链时为 None ⇒ shared::batch::status 的 clear 分支写 NULL
             step_id,
             // 2026-09-30：记录批次所属工序（外协加工的就是这道工序），
             // 收回时按 next_process_id 重新入池即可
@@ -670,9 +670,9 @@ impl BatchService {
         // ---- 2026-10-03 部分接收：拆出子批次，只回收子批次 ----
         //
         // 新子批次继承源批次的 `OUTSOURCE` 状态与 `OUTSOURCE_COMPANY` holder
-        // （`_split_batch_inner` 走 SELECT 继承），随后的 status_gate 写会把
+        // （`_split_batch_inner` 走 SELECT 继承），随后的 shared::batch::status 写会把
         // 它的 location / holder / process / step 全换成生产架 + 新工序 ——
-        // 即「出池清 location + holder」的三态由 status_gate 的 `clear_*` 语义兜住
+        // 即「出池清 location + holder」的三态由 shared::batch::status 的 `clear_*` 语义兜住
         // （本调用点 4 列都传 `Some(..)`，故走的是「写值」而非 clear 分支）。
         // 源批次**不动** status / location / holder：它还在外协厂里。
         //
@@ -717,7 +717,7 @@ impl BatchService {
             "IN_PROCESS",
             Some("PRODUCTION_SHELF"),
             Some(req.shelf_id),
-            // 2026-10-03：无链时为 None ⇒ status_gate 的 clear 分支写 NULL
+            // 2026-10-03：无链时为 None ⇒ shared::batch::status 的 clear 分支写 NULL
             step_id,
             // 2026-09-30：进池 → current_process_id 写目标工序
             Some(req.next_process_id),

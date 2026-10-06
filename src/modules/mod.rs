@@ -35,12 +35,12 @@ pub mod outsource;
 pub mod part;
 // 2026-10-02 域归属定案：原 `part_batch` 域（1866 行 helper，无独立 URL）整体
 // 归入 prod 域的 `prod::batch` 子模块（src/modules/prod/batch/），承载 `t_part_batch`
-// 的 repo / model / status_gate / 全部批次用例与 24 条批次路由（逐条见
+// 的 repo / model / shared::batch::status / 全部批次用例与批次路由（逐条见
 // `prod/batch/mod.rs` 的路由表）。
 // 这里不再 `pub mod part_batch;`，所有引用走 `crate::modules::prod::batch::*`。
 pub mod part_file;
 // 2026-09-19 新增 prod 模块聚合：worker + work_type + process + process_chain +
-// worker_pool 平移至 `prod::*`，URL 硬切换到 `/api/v2/prod/*`（无 alias，前端锁步）。
+// queue 平移至 `prod::*`，URL 硬切换到 `/api/v2/prod/*`（无 alias，前端锁步）。
 // part / assembly 是核心实体未移入；报工端点保留在 part 域。
 pub mod prod;
 pub mod shelf;
@@ -75,7 +75,7 @@ async fn health(State(_state): State<Arc<AppState>>) -> Json<HealthResp> {
 /// nest 路径由 `/customers` + `/applicants` 迁至 `/com/customers` + `/com/applicants`。
 ///
 /// 2026-09-19 prod 模块聚合：worker + work_type + process + process_chain +
-/// worker_pool 5 支撑域平移至 `prod`，URL 硬切换到 `/api/v2/prod/*`。
+/// queue 5 支撑域平移至 `prod`，URL 硬切换到 `/api/v2/prod/*`。
 /// 旧 `/workers` + `/work-types` + `/processes` + `/process-chains` + `/worker-pool` +
 /// `/admin/worker-pool` 6 个 nest 同步下线，无 alias（前端配套 PR 锁步）。
 ///

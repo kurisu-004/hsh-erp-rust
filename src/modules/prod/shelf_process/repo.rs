@@ -17,7 +17,7 @@
 //!   `soft_delete_all_for_shelf` / `bulk_insert`）SQL 与方法签名**零 diff**
 //! - 新增 2 个「收口」方法（`find_first_shelf_for_process` /
 //!   `exists_for_shelf_process`）供 prod 域内部调用方改调，消灭手写 `t_shelf_process`
-//!   SQL（`prod::batch` / `prod::worker_pool` 各 1 处）
+//!   SQL（`prod::batch` / `prod::queue` 各 1 处）
 //!
 //! ## 本仓内保留 inline 的 `t_shelf_process` SQL（2026-10-02 判定，不要硬抽）
 //! - `prod::batch::repo::preview_auto_dispatch` —— `LEFT JOIN LATERAL t_shelf_process`
@@ -185,9 +185,8 @@ impl ShelfProcessRepo {
     /// 当前是 `NOT NULL`，故按 `i64` 解码当前安全；但列一旦变可空，同款写法会以
     /// `error occurred while decoding column 0: unexpected null; try decoding as an Option`
     /// 整笔 500。**该次加固零行为变化**（`NOT NULL` 列 `.flatten()` 恒为 `Some(v)`）。
-    /// 同款修法见 `prod/worker_pool/repo/mod.rs::process_chain_step_get_process_id`
-    /// 与 `prod/batch/service/worker_scan.rs::worker_scan_event`（后者是可空列，
-    /// 已在 2026-10-04 真修过一次 500）。
+    /// 同款反模式另见 `prod/batch/service/worker_scan.rs::worker_scan_event`
+    /// （那里是可空列，已真修过一次 500）。
     pub async fn find_first_shelf_for_process<'e, E: PgExecutor<'e>>(
         executor: E,
         process_id: i64,
@@ -214,7 +213,7 @@ impl ShelfProcessRepo {
 
     /// 存在性检查：该 shelf 是否映射了该 process。
     ///
-    /// 2026-10-02 新增：原为 `prod::worker_pool::service::move_batch` WORKER→POOL
+    /// 2026-10-02 新增：原为 `prod::queue::service::move_batch` WORKER→POOL
     /// 分支里的内联 SQL
     /// `SELECT shelf_id FROM t_shelf_process WHERE shelf_id=$1 AND process_id=$2
     ///  AND deleted_at IS NULL ORDER BY sort_order ASC, id ASC LIMIT 1` +

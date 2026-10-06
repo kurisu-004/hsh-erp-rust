@@ -35,7 +35,7 @@ pub struct ShelfProcessMappingOut {
 
 /// 所有 shelf ↔ process 映射（GET /prod/shelf-processes 的批量查询返回）。
 ///
-/// 用途：part_batch / worker_pool 在创建批次/工人时一次性拿全 active shelf 的
+/// 用途：part_batch / queue 在创建批次/工人时一次性拿全 active shelf 的
 /// 工序映射，避免 N+1。
 ///
 /// 2026-10-02：自 `src/modules/shelf/vo/process_mapping.rs` 整文件平移。

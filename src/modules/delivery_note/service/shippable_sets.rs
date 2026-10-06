@@ -74,7 +74,7 @@
 use std::collections::HashMap;
 
 use crate::modules::part::model::TPart;
-use crate::modules::prod::batch::model::TPartBatch;
+use crate::shared::batch::TPartBatch;
 
 /// 算每个装配件的「本单可出货套数」，key = 装配件 id。
 ///
@@ -133,7 +133,7 @@ mod tests {
     use super::*;
     use crate::modules::assembly::model::TAssembly;
     use crate::modules::part::model::TPart;
-    use crate::modules::prod::batch::model::TPartBatch;
+    use crate::shared::batch::TPartBatch;
     use chrono::NaiveDate;
     use rust_decimal::Decimal;
 

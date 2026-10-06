@@ -34,14 +34,15 @@
 //!
 //! ## 事务 / 错误类型
 //! 2026-10-01 起除 `mark_batch_returned`（只写 holder/location，不改 status）外，
-//! 所有 `t_part_batch.status` 写点都是 `status_gate` 之上的薄包装 —— 全仓唯一的
+//! 所有 `t_part_batch.status` 写点都是 `shared::batch::status` 之上的薄包装 —— 全仓唯一的
 //! 批次状态写入口。
 
 use sqlx::{PgConnection, PgExecutor};
 
 use super::queries::PartBatchRepo;
-use crate::modules::prod::batch::model::TPartBatch;
-use crate::modules::prod::batch::status_gate::{self, StatusChange};
+use crate::shared::batch::TPartBatch;
+use crate::shared::batch::status as batch_status;
+use crate::shared::batch::status::StatusChange;
 use crate::shared::error::AppError;
 
 impl PartBatchRepo {
@@ -288,16 +289,16 @@ impl PartBatchRepo {
         .await
     }
 
-    /// 批量通过（OCC UPDATE）—— **2026-10-01 起为 status_gate 薄包装**。
+    /// 批量通过（OCC UPDATE）—— **2026-10-01 起为 shared::batch::status 薄包装**。
     ///
     /// 签名两处变更（调用方零改动，全部经 `&mut **self` 传连接）：
-    /// - `executor: E` → `conn: &mut PgConnection`：status_gate 的派生步骤
+    /// - `executor: E` → `conn: &mut PgConnection`：shared::batch::status 的派生步骤
     ///   需要可变的 `PgConnection`（D-6 架构：service 不持连接，跨域调用经
     ///   `repo.conn_mut()`），泛型 `PgExecutor` 表达不了。
     /// - `Result<u64, sqlx::Error>` → `Result<RollupOutcome, AppError>`：
-    ///   ① `sqlx::Error` → `AppError`：status_gate 的契约是「没写成 =
+    ///   ① `sqlx::Error` → `AppError`：shared::batch::status 的契约是「没写成 =
     ///   `VERSION_CONFLICT`」，转成 `sqlx::Error` 会把 409 降级成 500；
-    ///   ② `u64` → `RollupOutcome`：**2026-10-01 修正**。status_gate 一函数内
+    ///   ② `u64` → `RollupOutcome`：**2026-10-01 修正**。shared::batch::status 一函数内
     ///   已完成 part 派生 + assembly 反向同步，而调用点（`inspection_core.rs`
     ///   的 3 处）需要 `SyncOutcome` 填响应的 `synced_assembly_id`、并据此发
     ///   `ASSEMBLY_UPDATED` 广播。若这里只回 `u64`、让 service 再调一次
@@ -309,8 +310,8 @@ impl PartBatchRepo {
         batch_id: i64,
         expected_version: i32,
         current_user_id: Option<i64>,
-    ) -> Result<status_gate::RollupOutcome, AppError> {
-        status_gate::apply_batch_status_change_detailed(
+    ) -> Result<batch_status::RollupOutcome, AppError> {
+        batch_status::apply_batch_status_change_detailed(
             conn,
             StatusChange {
                 batch_id,
@@ -375,8 +376,8 @@ impl PartBatchRepo {
         expected_version: i32,
         shelf_id: i64,
         current_user_id: Option<i64>,
-    ) -> Result<status_gate::RollupOutcome, AppError> {
-        status_gate::apply_batch_status_change_detailed(
+    ) -> Result<batch_status::RollupOutcome, AppError> {
+        batch_status::apply_batch_status_change_detailed(
             conn,
             StatusChange {
                 batch_id,
@@ -437,8 +438,8 @@ impl PartBatchRepo {
         current_process_step_id: Option<i64>,
         current_process_id: Option<i64>,
         current_user_id: Option<i64>,
-    ) -> Result<status_gate::RollupOutcome, AppError> {
-        status_gate::apply_batch_status_change_detailed(
+    ) -> Result<batch_status::RollupOutcome, AppError> {
+        batch_status::apply_batch_status_change_detailed(
             conn,
             StatusChange {
                 batch_id,
@@ -531,7 +532,7 @@ impl PartBatchRepo {
     /// | 调用方 | 语义 | `advance_to_process_id` |
     /// |---|---|---|
     /// | `worker_scan.rs::worker_scan` RETURNED | **推进工序**：工人在 P1 完工、扫 RETURNED 传 `next_process_id=P2`，批次应落进 **P2** 池 | `Some(P2)` |
-    /// | `prod/worker_pool/service.rs::move_batch` WORKER→POOL | **池内移动**：工种不变，批次归还货架后仍属原工序候选池 | `None` |
+    /// | `prod/queue/service.rs::move_batch` WORKER→POOL | **池内移动**：工种不变，批次归还货架后仍属原工序候选池 | `None` |
     ///
     /// 修复前 RETURNED 路径不写该列 → 批次带着 `current_process_id=P1` 归还货架
     /// → 落回 **P1** 池而非 P2 池。这正是 migration 004 要确立的「唯一权威依据」
@@ -744,14 +745,14 @@ impl PartBatchRepo {
 
     // ===== Phase PR-CRUD 新增：8 个 lifecycle mark_* =====
 
-    /// 批次 READY_TO_SHIP → DELIVERED —— **2026-10-01 起为 status_gate 薄包装**。
+    /// 批次 READY_TO_SHIP → DELIVERED —— **2026-10-01 起为 shared::batch::status 薄包装**。
     pub async fn mark_batch_delivered(
         conn: &mut PgConnection,
         batch_id: i64,
         expected_version: i32,
         current_user_id: i64,
     ) -> Result<u64, AppError> {
-        status_gate::apply_batch_status_change(
+        batch_status::apply_batch_status_change(
             conn,
             StatusChange {
                 batch_id,
@@ -778,7 +779,7 @@ impl PartBatchRepo {
         .map(|_| 1u64)
     }
 
-    /// 批次 DELIVERED → COMPLETED —— **2026-10-01 起为 status_gate 薄包装**。
+    /// 批次 DELIVERED → COMPLETED —— **2026-10-01 起为 shared::batch::status 薄包装**。
     ///
     /// 本函数是「part 被 rollup 进 COMPLETED → 归档并释放 `serial_no`」这条
     /// 新链路的**最常见触发点**：part 只有在所有非取消批次都 COMPLETED 时才会
@@ -795,7 +796,7 @@ impl PartBatchRepo {
         current_user_id: i64,
         event_id: Option<i64>,
     ) -> Result<u64, AppError> {
-        status_gate::apply_batch_status_change(
+        batch_status::apply_batch_status_change(
             conn,
             StatusChange {
                 batch_id,
@@ -825,9 +826,9 @@ impl PartBatchRepo {
     /// 工单取消（OCC UPDATE t_part）：白名单 5 状态（PENDING / PROGRAMMING /
     /// INSPECTION / READY_TO_SHIP / DELIVERED），清空 `serial_no`。
     ///
-    /// ## 2026-10-01：**本函数刻意不走 status_gate**
+    /// ## 2026-10-01：**本函数刻意不走 shared::batch::status**
     ///
-    /// status_gate 的写入口是 `t_part_batch.status`（**批次**是状态的真源，
+    /// shared::batch::status 的写入口是 `t_part_batch.status`（**批次**是状态的真源，
     /// part / assembly 是派生缓存）。本函数写的是 `t_part.status` —— 它是
     /// 「用户取消工单」这个**主操作**本身，不是派生写：cancel 的合法源状态
     /// 白名单与批次流无关（一个未拆批的工单也要能取消），且必须在**批次级联
@@ -835,10 +836,10 @@ impl PartBatchRepo {
     ///
     /// `serial_no = NULL` 同理是**故意不归档**：cancel 是「作废」，序列号就此
     /// 退役，不是「转交送货单后释放复用」。子件的归档释放只发生在
-    /// COMPLETED（见 `status_gate::release_part_serial_no`）。
+    /// COMPLETED（见 `batch_status::release_part_serial_no`）。
     ///
     /// 级联取消全部活跃批次由 `cancel_all_active_batches_for_part` 走
-    /// status_gate 的 bulk 模式完成（会自动补做 part → assembly 派生）。
+    /// shared::batch::status 的 bulk 模式完成（会自动补做 part → assembly 派生）。
     pub async fn mark_part_cancelled<'e, E: PgExecutor<'e>>(
         executor: E,
         part_id: i64,
@@ -861,7 +862,7 @@ impl PartBatchRepo {
     }
 
     /// 批次取消（OCC UPDATE t_part_batch）：白名单 5 状态
-    /// —— **2026-10-01 起为 status_gate 薄包装**。
+    /// —— **2026-10-01 起为 shared::batch::status 薄包装**。
     ///
     /// `event_id`：本函数能让 part 新进 CANCELLED（它是该 part 最后一条活跃
     /// 批次时），故按 M4 由 caller 透传归档事件雪花 id。
@@ -872,7 +873,7 @@ impl PartBatchRepo {
         current_user_id: i64,
         event_id: Option<i64>,
     ) -> Result<u64, AppError> {
-        status_gate::apply_batch_status_change(
+        batch_status::apply_batch_status_change(
             conn,
             StatusChange {
                 batch_id,
@@ -945,7 +946,7 @@ impl PartBatchRepo {
         expected_version: i32,
         current_user_id: i64,
     ) -> Result<u64, AppError> {
-        status_gate::apply_batch_status_change(
+        batch_status::apply_batch_status_change(
             conn,
             StatusChange {
                 batch_id,
@@ -983,7 +984,7 @@ impl PartBatchRepo {
     /// 之后按序列号 / 送货单回溯全都对不上，且该行不可逆（终态被改写）。此处补
     /// `NOT (status IN ('COMPLETED','CANCELLED'))`。
     ///
-    /// **修正 2 —— 走 status_gate bulk 模式**：改写完自动对受影响的每个 part
+    /// **修正 2 —— 走 shared::batch::status bulk 模式**：改写完自动对受影响的每个 part
     /// 补做**父装配件**派生（改造前 `PartService::cancel` 压根不调任何 sync，
     /// 父装配件的派生状态靠下一次任意 part 流转才追平）。
     ///
@@ -1005,16 +1006,16 @@ impl PartBatchRepo {
         part_id: i64,
         current_user_id: i64,
     ) -> Result<u64, AppError> {
-        let out = status_gate::apply_bulk_batch_status_change_for_part(
+        let out = batch_status::apply_bulk_batch_status_change_for_part(
             conn,
-            status_gate::BulkStatusChange {
+            batch_status::BulkStatusChange {
                 part_id,
                 new_status: "CANCELLED",
                 excluded_statuses: &["COMPLETED", "CANCELLED"],
                 // 终态批次不可能还在返修（review 第 1 轮 m10）
                 is_repairing: Some(false),
                 updated_by: current_user_id,
-                derivation: status_gate::PartDerivation::KeepPartTerminalAsIs,
+                derivation: batch_status::PartDerivation::KeepPartTerminalAsIs,
                 // part 已是终态，派生层不会再写它 → 不需要归档事件 id
                 event_id: None,
             },
@@ -1051,16 +1052,16 @@ impl PartBatchRepo {
         event_id: Option<i64>,
     ) -> Result<u64, AppError> {
         // 终态保护只守 CANCELLED（COMPLETED 幂等重写无副作用，与改造前一致）。
-        let out = status_gate::apply_bulk_batch_status_change_for_part(
+        let out = batch_status::apply_bulk_batch_status_change_for_part(
             conn,
-            status_gate::BulkStatusChange {
+            batch_status::BulkStatusChange {
                 part_id,
                 new_status: "COMPLETED",
                 excluded_statuses: &["CANCELLED"],
                 // 终态批次不可能还在返修（review 第 1 轮 m10）
                 is_repairing: Some(false),
                 updated_by: current_user_id,
-                derivation: status_gate::PartDerivation::Rollup,
+                derivation: batch_status::PartDerivation::Rollup,
                 event_id,
             },
         )

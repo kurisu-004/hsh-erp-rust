@@ -1,6 +1,6 @@
 //! prod::programming 子模块 DTO —— 入参（Query string）
 //!
-//! 2026-10-01 新增：与 `prod::batch` / `worker_pool` 同形 DTO 模块，仅入参
+//! 2026-10-01 新增：与 `prod::batch` / `queue` 同形 DTO 模块，仅入参
 //! （`Deserialize`）。出参结构见 [`super::vo`]。
 //!
 //! ## 反序列化兜底

@@ -17,7 +17,7 @@
 //!   216xx 上传会话（Redis 共享 STS 凭证机制）。
 //!
 //!   错误码段位归属（2026-09-19 prod 聚合后）：
-//!   - `prod::worker` / `prod::worker_pool` → `202xx` 工人段（共享；worker_pool 的 `WORKER_POOL_EMPTY`/`NO_WORK_TYPE` 等复用 `20205`/`20206`）
+//!   - `prod::worker` / `prod::queue` → `202xx` 工人段（共享；queue 的 `WORKER_POOL_EMPTY`/`NO_WORK_TYPE` 等复用 `20205`/`20206`）
 //!   - `prod::process_chain` → `207xx` 工艺链段
 //!   - `prod::process` → `208xx` 工序段
 //!   - `prod::work_type` → `209xx` 工种段

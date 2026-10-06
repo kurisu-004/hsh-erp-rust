@@ -23,7 +23,7 @@
 //! - `vo.rs` —— 出参（`ShelfProcessMappingItem` / `ShelfProcessMappingOut` /
 //!   `AllShelfProcessMappingItem` / `AllShelfProcessMappingOut`）
 //! - `repo.rs` —— `t_shelf_process` SQL 真源（ZST `ShelfProcessRepo` + 6 静态方法：
-//!   平移 4 + 2026-10-02 收口 `prod::batch` / `prod::worker_pool` 各 1 处）+ `NewShelfProcessRow`
+//!   平移 4 + 2026-10-02 收口 `prod::batch` / `prod::queue` 各 1 处）+ `NewShelfProcessRow`
 //! - `service.rs` —— `ShelfProcessService`（3 方法：`set_shelf_processes` /
 //!   `list_all_mappings` / `list_shelf_processes`），事务边界在 handler
 //! - `handler.rs` —— 3 端点 + 路由工厂

@@ -16,12 +16,12 @@ use crate::modules::part::model::{NewPartEvent, TPartInspected};
 use crate::modules::part::repo::PartRepoTrait;
 use crate::modules::part::statemachine::PartStatus;
 use crate::modules::part::vo::PartOut;
-use crate::modules::prod::batch::model::TPartBatch;
 use crate::modules::prod::batch::vo::ToXxxOut;
+use crate::shared::batch::TPartBatch;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
-use super::guard::{optional_process_chain, optional_step_id};
+use crate::shared::batch::guards::{optional_process_chain, optional_step_id};
 
 impl BatchService {
     /// to_ship 共享核心（被单件 / batch 端点共用）。
@@ -122,7 +122,7 @@ impl BatchService {
 
         // 5. UPDATE t_part_batch: INSPECTION → READY_TO_SHIP（OCC + 写 updated_by）
         //
-        // 2026-10-01：写与派生已焊在 `crate::modules::prod::batch::status_gate` 的
+        // 2026-10-01：写与派生已焊在 `crate::shared::batch::status` 的
         // `apply_batch_status_change` 一个函数里，故这里拿到的 `rollup` **就是**
         // batch → part → assembly 的最终结果：0 行由 gate 直接抛 40901
         // `VERSION_CONFLICT`（包装函数恒返回 1，caller 不需要、也不应该自己判断
@@ -148,7 +148,7 @@ impl BatchService {
         })
         .await?;
 
-        // 7. batch → part → assembly rollup：**已在第 5 步的 status_gate 内完成**
+        // 7. batch → part → assembly rollup：**已在第 5 步的 shared::batch::status 内完成**
         //    （min-progress 规则：多条 INSPECTION 批次时 part 维持 INSPECTION，
         //    单条时升 READY_TO_SHIP；part.status 真变了才级联
         //    `AssemblyService::sync_from_part_change`）。
@@ -308,7 +308,7 @@ impl BatchService {
         // 链错误，与其余 6 个端点收口到同一对守卫。
         let chain_id = optional_process_chain(repo.conn_mut(), part_id).await?;
         let step_id = optional_step_id(repo.conn_mut(), chain_id, next_process_id).await?;
-        // 2026-10-01：写与派生已焊在 status_gate 内（0 行由 gate 抛 40901，
+        // 2026-10-01：写与派生已焊在 shared::batch::status 内（0 行由 gate 抛 40901，
         // 原 `if n == 0` 是死代码）；`rollup.sync` 供第 8 步填
         // `synced_assembly_id`。
         let rollup = repo
@@ -340,7 +340,7 @@ impl BatchService {
         })
         .await?;
         // 8. batch → part → assembly rollup：**已在上面那次
-        //    `mark_batch_failed_inspection`（status_gate）内完成**，不再补调
+        //    `mark_batch_failed_inspection`（shared::batch::status）内完成**，不再补调
         //    `PartService::sync_from_batch_change`（2026-10-01：第二次派生必然
         //    `NoChange`，会把 `synced_assembly_id` 恒吞成 null）。
         let synced_assembly_id = match rollup.sync {
@@ -481,7 +481,7 @@ impl BatchService {
         // 隐式多批次 rollup：前置状态守卫（step 3）已限定 from ∈ {PENDING, PROGRAMMING,
         // IN_PROCESS}，该状态下不可能存在 INSPECTION 批次，翻转 `t_part.status` 安全。
         //
-        // 2026-10-01：min-progress 回填与 assembly 级联**已收进** status_gate
+        // 2026-10-01：min-progress 回填与 assembly 级联**已收进** shared::batch::status
         // 一函数内（下方 step 8 直接取 `rollup.sync`，不再二次派生）；
         // 0 行由 gate 抛 40901 `VERSION_CONFLICT`，原 `if n == 0` 是死代码。
         let rollup = repo
@@ -492,7 +492,7 @@ impl BatchService {
                 Some(current.id),
             )
             .await?;
-        // 8. batch → part → assembly rollup 结果：已在 step 7 的 status_gate 内完成
+        // 8. batch → part → assembly rollup 结果：已在 step 7 的 shared::batch::status 内完成
         let synced_assembly_id = match rollup.sync {
             SyncOutcome::Changed(aid) => Some(aid),
             SyncOutcome::NoChange => None,

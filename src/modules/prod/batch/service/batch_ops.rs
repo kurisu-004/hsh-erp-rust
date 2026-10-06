@@ -19,7 +19,7 @@ use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::shared::error::{AppError, code};
 
 use super::BatchService;
-use super::guard::{mark_batch_status_only, validate_batch_version};
+use crate::shared::batch::guards::{mark_batch_status_only, validate_batch_version};
 
 impl BatchService {
     // ===== 1.5 批次拆分 / 取消 =====
@@ -156,14 +156,14 @@ impl BatchService {
         // 才发现批次早没了。终态就该清干净。
         //
         // 2026-10-01 review 第 1 轮 m10：part 级批量取消
-        // （`status_gate::apply_bulk_batch_status_change_for_part`）现在也带
+        // （`batch_status::apply_bulk_batch_status_change_for_part`）现在也带
         // `is_repairing = Some(false)`，故「返修中被连带取消的批次仍留
         // is_repairing = true」这个遗留已消除。
         //
         // `event_id`（M4）：本路径能让 part **新进 CANCELLED**（它是该 part 最后
         // 一条活跃批次时），故传真实雪花 id 供终态序列号归档事件使用。
         //
-        // 2026-10-01 review 第 1 轮 m6：包装函数恒返回 1（0 行已由 status_gate
+        // 2026-10-01 review 第 1 轮 m6：包装函数恒返回 1（0 行已由 shared::batch::status
         // 转成 `VERSION_CONFLICT` 抛出），原 `if n == 0` 是死代码，已删。
         mark_batch_status_only(
             repo.conn_mut(),

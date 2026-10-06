@@ -4,7 +4,7 @@
 //!
 //! ## 与 refill 的原子性
 //! 本文件只承载 `worker_scan_event`（状态翻转 + 写事件日志）；refill 由 handler
-//! 在 commit 之前同事务紧接着调 `WorkerPoolService::refill_for_worker_with_work_type`
+//! 在 commit 之前同事务紧接着调 `QueueService::refill_for_worker_with_work_type`
 //! —— scan 与 refill 共享一个原子事务，否则「扫描放回 → refill 抢批」中间会被
 //! 并发抢走同批。
 //!
@@ -33,9 +33,9 @@ use crate::modules::part::statemachine::PartStatus;
 use crate::modules::prod::batch::dto::WorkerScanRequest;
 use crate::modules::prod::batch::vo::WorkerScanCoreOut;
 use crate::modules::prod::process_chain::repo::ProcessChainRepo;
+use crate::modules::prod::queue::dto::WorkerScanEvent;
 use crate::modules::prod::shelf_process::repo::ShelfProcessRepo;
 use crate::modules::prod::worker::repo::WorkerRepo;
-use crate::modules::prod::worker_pool::dto::WorkerScanEvent;
 use crate::modules::shelf::repo::ShelfRepo;
 use crate::shared::error::{AppError, code};
 
@@ -58,7 +58,7 @@ impl BatchService {
     /// BIZ_PART_BATCH_NOT_HELD_BY_WORKER。
     ///
     /// **本方法不负责 refill**：handler 在 commit 之前紧接着调
-    /// `WorkerPoolService::refill_for_worker`（同事务）。这样 scan 与 refill 共享
+    /// `QueueService::refill_for_worker`（同事务）。这样 scan 与 refill 共享
     /// 一个原子事务（OM-6 决议），避免扫描放回 → refill 抢批中间被并发抢走
     /// 同批的竞争窗口。
     ///
@@ -186,10 +186,9 @@ impl BatchService {
                 // 整笔 500。**真会触发**：手工工单（无工艺链）是常态，工人归还这类件
                 // 必现；且 NULL 在下方 `if let` **之前**就抛，所以 `O` 若不收
                 // `Option`，下面的 else 分支（保留批次旧 step）对手写工单恒不可达。
-                // 回归见 `tests/production/worker_pool.rs::worker_scan_returned_without_process_chain_succeeds`。
+                // 回归见 `tests/production/queue.rs::worker_scan_returned_without_process_chain_succeeds`。
                 // 同款反模式（`Option<i64>` 包当前 `NOT NULL` 的列，列一旦变可空就同样
-                // 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`
-                // 与 `prod/worker_pool/repo/mod.rs::process_chain_step_get_process_id`。
+                // 500）另见 `prod/shelf_process/repo.rs::find_first_shelf_for_process`。
                 //
                 // ⚠️ 2026-09-30 起的**已知缺口**：下面算出的 `step_id_opt`
                 // 传给 `mark_batch_returned` 后**被丢弃** —— 该函数的
@@ -323,7 +322,7 @@ impl BatchService {
                     ));
                 }
                 // 切 holder worker → target_shelf + 状态 IN_PROCESS → INSPECTION（OCC）
-                // 2026-10-01：写 + part 派生 + assembly 级联已在 status_gate 内完成，
+                // 2026-10-01：写 + part 派生 + assembly 级联已在 shared::batch::status 内完成，
                 // 0 行由 gate 抛 40901（原 `if n == 0` 是死代码）。
                 let rollup = repo
                     .mark_batch_inspected(batch.id, batch.version, target_id, Some(current.id))

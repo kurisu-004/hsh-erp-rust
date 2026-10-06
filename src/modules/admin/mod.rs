@@ -12,8 +12,8 @@
 //!
 //! 三层状态是单向派生的（`t_part_batch.status` 是**唯一真源**，`t_part` /
 //! `t_assembly` 是派生缓存），写入口已收口到
-//! `prod::batch::status_gate::apply_batch_status_change`，并由 lib 单测
-//! `status_gate::write_guard_tests::no_outside_file_writes_batch_status` 守住
+//! `shared::batch::status::apply_batch_status_change`，并由 lib 单测
+//! `batch_status::write_guard_tests::no_outside_file_writes_batch_status` 守住
 //! 「除它之外无人能写批次状态」。但**收口只保证今后**，不修复历史、不覆盖人为
 //! 干预：收口之前有 3 个写点漏调 sync，库里已经存在漂移行。因此提供本域作为
 //! 一次性的对账 / 长期的手动收敛入口。

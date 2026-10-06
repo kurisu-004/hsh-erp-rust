@@ -340,7 +340,7 @@ impl WorkerRepo {
     /// 同一 worker 若所属工种映射该 process 出现一次（t_worker.work_type_id 单值）。
     ///
     /// 注：本方法保留 `Result<_, AppError>` 返回类型（与原 `repo.rs` 一致），原因是
-    /// 跨模块静态调用方 `prod::worker_pool::service`（同一 D-2 任务**未覆盖**域，
+    /// 跨模块静态调用方 `prod::queue::service`（同一 D-2 任务**未覆盖**域，
     /// 本次不在修改范围）直接 `WorkerRepo::list_active_by_process_id(&mut *conn, ...)`
     /// 走 ZST 静态方法 + `AppError` 自动 `?`，不能破坏其调用形态。
     /// 胖 trait `WorkerRepoTrait` 也对应返回 `AppError`（见 `repo/mod.rs`）。

@@ -166,7 +166,7 @@ mod classify_5groups_tests {
     use super::super::classify::{
         classify_invalid_state, is_attachable_state, is_inspectable_state,
     };
-    use crate::modules::prod::batch::model::TPartBatch;
+    use crate::shared::batch::TPartBatch;
 
     fn b(status: &str, holder: Option<i64>, location: Option<&str>) -> TPartBatch {
         TPartBatch {
@@ -263,7 +263,7 @@ mod classify_5groups_tests {
     ///   行为变化，理由见 `classify.rs`「返修批次的归类」小节）。
     ///
     /// 本测试**不构造** `'REPAIRING'` 字面量行：migration 006 已把存量洗白、
-    /// status_gate 永不写它，该字面量在 DB 层已不可达。
+    /// shared::batch::status 永不写它，该字面量在 DB 层已不可达。
     #[test]
     fn b_group_repairing_batch_follows_in_process_arm() {
         // 送检架上的返修批次 → B 组（is_repairing 标记不参与判定，只看 status）
@@ -286,7 +286,7 @@ mod classify_5groups_tests {
 #[cfg(test)]
 mod c_group_distribution_tests {
     use super::super::classify::{classify_invalid_state, has_fully_invalid_target};
-    use crate::modules::prod::batch::model::TPartBatch;
+    use crate::shared::batch::TPartBatch;
 
     /// 紧凑 mock：仅暴露本测试关注的字段，其余用 None / 0 / false 占位。
     fn b(id: i64, part_id: i64, status: &str, location: Option<&str>) -> TPartBatch {
@@ -390,7 +390,7 @@ mod attachable_batches_tests {
         AttachableBatchDto, AvailableBatchDto, BatchStatusDto, ScanOutcomeDto, UnresolvedTargetDto,
     };
     use crate::modules::part::model::TPart;
-    use crate::modules::prod::batch::model::TPartBatch;
+    use crate::shared::batch::TPartBatch;
 
     /// 紧凑 mock：仅暴露本测试关注的字段，其余用 None / 0 / false 占位。
     fn b(id: i64, part_id: i64, status: &str, location: Option<&str>, version: i32) -> TPartBatch {

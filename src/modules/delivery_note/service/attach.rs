@@ -76,7 +76,9 @@ impl DeliveryNoteService {
         let mut conflicts: Vec<AttachBatchConflict> = Vec::new();
 
         for item in items {
-            match PartBatchRepo::get_by_id(&mut *repo.conn_mut(), item.batch_id, false).await? {
+            match crate::shared::batch::get_batch_by_id(&mut *repo.conn_mut(), item.batch_id, false)
+                .await?
+            {
                 None => conflicts.push(AttachBatchConflict {
                     batch_id: item.batch_id,
                     reason: "BATCH_NOT_FOUND".to_string(),

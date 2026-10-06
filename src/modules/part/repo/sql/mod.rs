@@ -29,7 +29,7 @@
 //!
 //! ## ZST `PartRepo`
 //! 跨模块调用方（delivery_note / assembly / outsource / part_file / statistics /
-//! shelf 6 域，prod::worker_pool 1 域）继续走 `PartRepo::xxx(&mut *conn, ...)`
+//! shelf 6 域，prod::queue 1 域）继续走 `PartRepo::xxx(&mut *conn, ...)`
 //! 静态方法调用——保持 12 处静态调用零修改，故 ZST struct 提升至本 mod.rs
 //! （统一暴露），各 sql_* 子文件 `impl PartRepo { ... }` 拼装。
 
@@ -37,7 +37,7 @@
 /// `t_part_batch` 的静态方法 2026-10-02 起在 `prod::batch::repo`）。
 ///
 /// 跨模块调用方（delivery_note / assembly / outsource / part_file / statistics /
-/// shelf / prod::worker_pool 共 7 域）继续走 `PartRepo::xxx(&mut *conn, ...)`
+/// shelf / prod::queue 共 7 域）继续走 `PartRepo::xxx(&mut *conn, ...)`
 /// 静态方法调用——本任务**不能**破坏 `part::repo::PartRepo` 作为 ZST 的对外身份。
 pub struct PartRepo;
 

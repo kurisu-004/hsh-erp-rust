@@ -3,8 +3,9 @@
 //! 2026-10-02 域迁移：`t_part_batch` 的 repo / model / 状态机写入口、**全部以批次
 //! 为对象的服务用例**与批次路由（URL 锚由 `part_id` 改为 `batch_id`）整体
 //! 从 part 域搬入本模块，路由从 `POST /api/v2/parts/…` 硬切到
-//! `POST /api/v2/prod/batches/…`（**无 alias**，前端配套 PR 锁步迁移）。现共
-//! **27 条**路由（24 条批次路由 + 本域原有 3 条下发端点），逐条见下方路由表。
+//! `POST /api/v2/prod/batches/…`（**无 alias**，前端配套 PR 锁步迁移）。本域现注册
+//! **23 条**路由（权威清单是 `handler/mod.rs::ROUTES`，`mod tests` 断言它与
+//! `router()` 源码逐条一致；下方路由表是给读的人看的手写摘要）。
 //!
 //! part 域自此只保留「多批次动作 + part 级动作」：`/{part_id}/cancel`（BATCH-N）、
 //! `/{part_id}/force-complete`（BATCH-N）、`/{part_id}/soft-delete`、
@@ -12,24 +13,37 @@
 //!
 //! 依赖方向：prod → part 单向（本模块引用 `PartOut` / `PartRepoTrait` /
 //! `part::statemachine` 等 part 域实体）；但 `prod::batch::service` 的批次方法经
-//! part 域 `PartRepoTrait` 的默认体回调本模块 `PartBatchRepo` + `status_gate`，
-//! **构成反向依赖，尚未单向**。part → prod 方向另有 `status_gate` +
+//! part 域 `PartRepoTrait` 的默认体回调本模块 `PartBatchRepo` + `shared::batch::status`，
+//! **构成反向依赖，尚未单向**。part → prod 方向另有 `shared::batch::status` +
 //! `PartBatchRepo` 两处数据依赖。过渡期成因与收敛步骤见
 //! [`service`] 模块 doc。
 //!
 //! ## 模块结构
-//! - `model.rs` —— `TPartBatch` / `RecentBatchRow` / `PartBatchScanRow` 行结构
-//!   + `current_process_id` / `current_process_step_id` 的**读取方分工**清单
-//! - `status_gate.rs` —— **全仓唯一** `t_part_batch.status` 写入口（写 + batch →
-//!   part → assembly 派生焊在一个函数里）
+//! - `model.rs` —— `RecentBatchRow` / `PartBatchScanRow` 两种窄投影行结构
+//!   （`TPartBatch` 全列行已上移 `shared::batch::model`）
 //! - `repo/queries.rs` —— ZST `PartBatchRepo` + 通用 SQL 静态方法
 //! - `repo/sql.rs` —— inspection / lifecycle 流转的定位 + 写点
 //! - `repo/trait.rs` —— 胖 trait `PartBatchRepoTrait` + `impl for &mut PgConnection`
-//! - `repo/mod.rs` —— ZST `BatchRepo`：「PENDING 批次下发给车间」专用查询
+//! - `repo/mod.rs` —— 3 个子模块的声明与重导出（原 ZST `BatchRepo` 已迁
+//!   `prod::queue::repo::dispatch` 并改名 `QueueDispatchRepo`）
 //! - `service/` —— 全部业务用例（`impl BatchService`，按流拆文件，见该目录 mod doc）
 //! - `dto.rs` —— 全部入参（`Deserialize`）
 //! - `vo.rs` —— 全部出参（`Serialize`）
-//! - `handler/{dispatch,transition,lifecycle}.rs` —— HTTP 路由 + 角色守卫 + WS 广播
+//! - `handler/{transition,lifecycle}.rs` —— HTTP 路由 + 角色守卫 + WS 广播
+//!   （`handler/dispatch.rs` 已迁 `prod::queue`）
+//!
+//! ## 2026-10-08：三处公共设施已上移到 `shared::batch`
+//!
+//! - `status_gate.rs` → `shared::batch::status`：全仓唯一 `t_part_batch.status`
+//!   写入口（写 + batch → part → assembly 派生焊在一个函数里）；
+//! - `service/guard.rs` → `shared::batch::guards`：状态机守卫 / OCC / 货架校验；
+//! - `model.rs` 的 `TPartBatch` → `shared::batch::model`。
+//!
+//! 迁移动机：这三者是**所有碰批次的域都要用**的公共设施，与「批次有哪些业务
+//! 用例」无关。留在本域意味着每剥离一个新域（queue / scan / inspection /
+//! delivery / repair / outsource / cnc）就多一条指向 batch 域的反向依赖。
+//! 上移后依赖方向与派生图方向一致（上层域 → shared）。
+//! 详细边界记档见 `shared::batch` 模块 doc 与 `src/shared/mod.rs`。
 //!
 //! ## 2026-10-07 迁出：待品检队列读
 //! `GET /api/v2/prod/batches/inspection`（+ 它的 `dto` / `vo` / `model` 行结构 /
@@ -39,7 +53,7 @@
 //! 可被域隔离护栏完整覆盖。**返修两条集合读**（`/repair` / `/repairing`）的 SQL 在
 //! service 层自建、不在本域 repo 层。
 //!
-//! ## 路由表（24 条 + 本域原有 3 条）
+//! ## 路由表（摘要，权威清单见 `handler/mod.rs::ROUTES`）
 //!
 //! 静态 1 段（原 `/api/v2/parts/…`，**无 Path extractor**）：
 //! - `POST   /to-ship`          ← `/api/v2/prod/batches/to-ship`
@@ -47,7 +61,6 @@
 //! - `POST   /worker-scan`      ← `/api/v2/prod/batches/worker-scan`
 //! - `GET    /repair`           ← `/api/v2/prod/batches/repair`
 //! - `GET    /repairing`        ← `/api/v2/prod/batches/repairing`
-//! - `GET    /pending` / `POST /dispatch` / `POST /auto-dispatch`（本域原有，不动）
 //!
 //! 静态 2 段：
 //! - `POST   /scan/deliver`     ← `/api/v2/prod/batches/scan/deliver`
@@ -55,14 +68,18 @@
 //! 动态 2 段 `/{batch_id}/…`（原 `/api/v2/parts/{part_id}/…`，锚改批次）：
 //! - `to-inspection` / `to-ship` / `to-process` / `scan-inspect`
 //! - `deliver` / `complete` / `start-repair`
-//! - `place-on-shelf` / `recall-to-pending` / `release-from-programming`
+//! - `place-on-shelf` / `release-from-programming`
 //! - `send-to-outsource` / `receive-from-outsource` /
 //!   `receive-from-outsource-to-inspection`
 //! - `complete-repair` / `repair-dispatch`
 //! - `split` / `cancel` / `pick-up`
 //!
+//! **本域不再有下发流端点**：`pending` / `dispatch` / `auto-dispatch` /
+//! `recall-to-pending` 已于 2026-10-08 迁往 `prod::queue`（见 `handler/mod.rs`
+//! 的 `STRIPPED` 表）。
+//!
 //! ## DTO 契约
-//! 子资源 18 条的 `batch_id` 自**请求体删除**（它是 URL 路径参数），其余字段不变；
+//! 子资源 16 条的 `batch_id` 自**请求体删除**（它是 URL 路径参数），其余字段不变；
 //! 静态 3 条 body 完全不变。错误码语义随之变化：批次 id 全局唯一即锚点，不存在
 //! 「跨 part 批次」，20109 `BIZ_PART_BATCH_NOT_FOUND` 退化为「批次不存在 / 已软删 /
 //! 状态不是流转起点」；20101 `BIZ_PART_NOT_FOUND` 现在只能经由「批次的 part 已软删」
@@ -70,13 +87,10 @@
 //!
 //! ## 事务 / WS 广播
 //! - 写端点：handler `state.pool.begin()` → service → `tx.commit()` → WS 广播
-//! - 读端点（pending / repair / repairing）：handler `pool.acquire()` 不开事务
-//! - 只读端点（auto-dispatch）：`pool.acquire()` 不开事务，**不发** WS 广播
+//! - 读端点（`/repair` / `/repairing`）：handler `pool.acquire()` 不开事务
 //!
 //! ## 角色守卫
-//! - GET pending: Manager + Clerk + Inspector
 //! - GET repair / repairing: Manager + Inspector
-//! - POST dispatch / auto-dispatch: Manager + Clerk
 //! - to-XXX 三流 + 批量两流: Manager + Inspector
 //! - worker-scan: Manager + ShelfAccount
 
@@ -91,13 +105,16 @@ pub mod handler;
 pub mod model;
 pub mod repo;
 pub mod service;
-pub mod status_gate;
 pub mod vo;
 
 // 重导出 model 与 repo 的公开符号，保持外部 callers 用 `prod::batch::*` 一层路径。
-pub use model::{PartBatchScanRow, RecentBatchRow, TPartBatch};
+pub use model::{PartBatchScanRow, RecentBatchRow};
 pub use repo::{NewInitialBatch, PartBatchRepo, PartBatchRepoTrait};
 pub use service::BatchService;
+// 2026-10-08：`TPartBatch` 与批次状态写入口已上移到 `shared::batch`（跨域设施层）。
+// 调用方一律直接 `use crate::shared::batch::…`，本模块**不留转发重导出** ——
+// 转发壳会让「谁在用这层设施」在代码里看不出来，且本仓已删除过同类
+// `PgIamRepo` 转发壳。
 
 pub fn router() -> Router<Arc<AppState>> {
     handler::router()

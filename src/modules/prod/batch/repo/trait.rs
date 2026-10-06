@@ -26,7 +26,8 @@ use chrono::NaiveDateTime;
 use sqlx::PgConnection;
 
 use super::queries::{NewInitialBatch, PartBatchRepo};
-use crate::modules::prod::batch::model::{PartBatchScanRow, RecentBatchRow, TPartBatch};
+use crate::modules::prod::batch::model::{PartBatchScanRow, RecentBatchRow};
+use crate::shared::batch::TPartBatch;
 use crate::shared::error::AppError;
 
 /// 把 `PartBatchRepoTrait` 直接对 `&mut PgConnection` 实现——handler/service 借
@@ -127,7 +128,7 @@ impl PartBatchRepoTrait for &mut PgConnection {
         id: i64,
         include_deleted: bool,
     ) -> Result<Option<TPartBatch>, sqlx::Error> {
-        PartBatchRepo::get_by_id(&mut **self, id, include_deleted).await
+        crate::shared::batch::get_batch_by_id(&mut **self, id, include_deleted).await
     }
 
     async fn list_by_delivery_note(
@@ -203,7 +204,7 @@ impl PartBatchRepoTrait for &mut PgConnection {
         &mut self,
         part_id: i64,
     ) -> Result<Vec<TPartBatch>, sqlx::Error> {
-        PartBatchRepo::list_active_by_part_id(&mut **self, part_id).await
+        crate::shared::batch::list_active_batches_by_part_id(&mut **self, part_id).await
     }
 
     async fn list_active_by_part_id_with_holder(

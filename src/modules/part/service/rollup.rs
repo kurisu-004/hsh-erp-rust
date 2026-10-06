@@ -40,13 +40,13 @@
 //! ============================================================================
 //!
 //! 派生逻辑（步骤 1–5 + 终态序列号归档 / 释放）已下沉到
-//! [`crate::modules::prod::batch::status_gate::rollup_part_derived`]，与
-//! 「写状态」合成同一个函数 `status_gate::apply_batch_status_change`。
+//! [`crate::shared::batch::status::rollup_part_derived`]，与
+//! 「写状态」合成同一个函数 `batch_status::apply_batch_status_change`。
 //! 本方法保留为**纯派生入口**：
 //!
-//! - 新写路径一律经 status_gate（写 + 派生一体，caller 无「要不要调 sync」
+//! - 新写路径一律经 shared::batch::status（写 + 派生一体，caller 无「要不要调 sync」
 //!   这个选项）；本方法只剩历史调用方在用。
-//! - 两条路径共用同一段实现，因此行为**完全一致** —— 经 status_gate 写完
+//! - 两条路径共用同一段实现，因此行为**完全一致** —— 经 shared::batch::status 写完
 //!   状态后再调本方法是安全的冗余（第二次 target == 当前 → NoChange），
 //!   不会出现两次释放序列号。
 //! - 未来（独立一轮）把剩余的「写完再调 sync」调用点删干净后，本方法即可
@@ -63,7 +63,7 @@ use sqlx::PgConnection;
 use crate::auth::rbac::CurrentUser;
 use crate::modules::assembly::service::SyncOutcome;
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::prod::batch::status_gate;
+use crate::shared::batch::status as batch_status;
 use crate::shared::error::AppError;
 
 use super::PartService;
@@ -72,9 +72,9 @@ impl PartService {
     /// batch 集变化 → 回流 part 物化列 + 级联 assembly rollup。
     ///
     /// **2026-10-01 起本方法是纯派生入口**：实现一行委托
-    /// `status_gate::rollup_part_derived`（与 status_gate 的 step 2–5 同一段
+    /// `batch_status::rollup_part_derived`（与 shared::batch::status 的 step 2–5 同一段
     /// 代码）。新写点请直接用
-    /// `status_gate::apply_batch_status_change`（写 + 派生一体）。
+    /// `batch_status::apply_batch_status_change`（写 + 派生一体）。
     ///
     /// 错误码：
     /// - 20101 `BIZ_PART_NOT_FOUND` —— part 不存在或已软删
@@ -86,7 +86,7 @@ impl PartService {
     /// 按需另查（见 `PartService::list_parts` enrichment）。
     ///
     /// 2026-09-30 改直读 `current_process_id`（migration 004）：随实现下沉到
-    /// `status_gate::rollup_part_derived`。
+    /// `batch_status::rollup_part_derived`。
     ///
     /// 签名收 `&mut R: PartRepoTrait`（而非 `R` by-value）——本方法是 service 层
     /// helper（lifecycle / worker_scan 在 mid-method 调用后仍需继续用 repo），不
@@ -102,14 +102,14 @@ impl PartService {
         event_id: Option<i64>,
     ) -> Result<SyncOutcome, AppError> {
         let outcome =
-            status_gate::rollup_part_derived(repo.conn_mut(), part_id, current.id, event_id)
+            batch_status::rollup_part_derived(repo.conn_mut(), part_id, current.id, event_id)
                 .await?;
         Ok(outcome.sync)
     }
 
     /// 跨域 / 旧路径兼容入口（`conn: &mut PgConnection` → `<&mut PgConnection as PartRepoTrait>`）。
     ///
-    /// 由 worker_pool / delivery_note / delivery_group 等**非 part 域** service 调用；
+    /// 由 queue / delivery_note / delivery_group 等**非 part 域** service 调用；
     /// 这些域内部 service 签名仍是 `&mut PgConnection` 直传，没有 `repo: R` 借位。
     /// 通过此薄壳手动指定 `<&mut PgConnection>` 实例化 trait 泛型，避免外部 caller
     /// 写 `&mut &mut *conn` 这种双层 deref。
@@ -118,7 +118,7 @@ impl PartService {
     /// 借 `&mut *tx` 继续使用同一 tx 即可，无需本壳。
     ///
     /// `event_id`：同 [`Self::sync_from_batch_change`]。跨域调用点
-    /// （worker_pool 的换 holder / delivery_note 的 pickup）派生的批次一定还
+    /// （queue 的换 holder / delivery_note 的 pickup）派生的批次一定还
     /// 处在非终态（DELIVERED / IN_PROCESS），min-progress 推不出终态，故一律
     /// 传 `None`，该分支不可达。
     pub async fn sync_from_batch_change_with_conn(
@@ -127,7 +127,8 @@ impl PartService {
         current: &CurrentUser,
         event_id: Option<i64>,
     ) -> Result<SyncOutcome, AppError> {
-        let outcome = status_gate::rollup_part_derived(conn, part_id, current.id, event_id).await?;
+        let outcome =
+            batch_status::rollup_part_derived(conn, part_id, current.id, event_id).await?;
         Ok(outcome.sync)
     }
 }

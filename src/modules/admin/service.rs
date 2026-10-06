@@ -5,18 +5,18 @@
 //! ## 这个域解决什么问题
 //!
 //! `t_part_batch.status` → `t_part.status` → `t_assembly.status` 是三层单向派生，
-//! 写入口已收口到 `prod::batch::status_gate`（单测
-//! `prod::batch::status_gate::write_guard_tests::no_outside_file_writes_batch_status`
+//! 写入口已收口到 `shared::batch::status`（单测
+//! `shared::batch::status::write_guard_tests::no_outside_file_writes_batch_status`
 //! 守住「只有它能写批次状态」）。但派生**缓存**仍可能与真源不一致：
 //!
-//! 1. **历史漂移**：status_gate 收口之前有 3 个写点漏调 sync，线上/备份库里已经存在
+//! 1. **历史漂移**：shared::batch::status 收口之前有 3 个写点漏调 sync，线上/备份库里已经存在
 //!    「批次全完成、part 还停在 IN_PROCESS」这类行。代码再正确也修不了既有数据。
 //! 2. **事后漂移**：极端情况下（进程在 commit 与广播之间被杀、手工 SQL 改过库、
 //!    早期版本的 bug）派生缓存仍可能偏旧。正常路径下次任意 part 流转会自愈，
 //!    但如果那个 part 再也不动了，漂移就永久留着。
 //!
 //! 所以提供 `POST /api/v2/admin/recompute-rollup`：**不新增任何派生逻辑**，
-//! 只是把已有的 rollup 函数（`status_gate::rollup_part_derived` 与
+//! 只是把已有的 rollup 函数（`batch_status::rollup_part_derived` 与
 //! `assembly::service::sync_from_part::sync_assembly_status`）在一个可限域、可限量、
 //! 分块提交的循环里跑一遍。
 //!
@@ -37,7 +37,7 @@ use sqlx::PgConnection;
 
 use crate::modules::assembly::service::sync_from_part::recompute_assembly_status_by_id;
 use crate::modules::part::repo::sql::PartRepo;
-use crate::modules::prod::batch::status_gate;
+use crate::shared::batch::status as batch_status;
 use crate::shared::error::AppError;
 
 use super::dto::StatusChangeEntry;
@@ -156,7 +156,7 @@ fn split_truncated(mut ids: Vec<i64>, limit: i64) -> (Vec<i64>, bool) {
 
 /// 重算单个 part 的派生缓存（`t_part.status` + `next_process_id`）。
 ///
-/// **完全复用** [`status_gate::rollup_part_derived`] —— 本函数只在外面包一层
+/// **完全复用** [`batch_status::rollup_part_derived`] —— 本函数只在外面包一层
 /// before/after 读数，用于生成报告。part 不存在 / 已软删 → `Ok(None)`
 /// （`rollup_part_derived` 自身对「无活跃批次」也是 NoChange，不报错）。
 ///
@@ -180,8 +180,8 @@ pub async fn recompute_part(
     event_id: Option<i64>,
 ) -> Result<PartRecompute, AppError> {
     let before = PartRepo::get_part_rollup_state(&mut *conn, part_id).await?;
-    // 返回值里的 `sync` 是给 status_gate 内部级联装配件用的，对账报告不消费
-    let outcome = status_gate::rollup_part_derived(conn, part_id, updated_by, event_id).await?;
+    // 返回值里的 `sync` 是给 shared::batch::status 内部级联装配件用的，对账报告不消费
+    let outcome = batch_status::rollup_part_derived(conn, part_id, updated_by, event_id).await?;
     let after = PartRepo::get_part_rollup_state(&mut *conn, part_id).await?;
     let Some((before, after)) = before.zip(after) else {
         return Ok(PartRecompute::unchanged());

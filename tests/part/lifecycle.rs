@@ -2,8 +2,11 @@
 //!
 //! 覆盖：
 //!   - place-on-shelf: PENDING → IN_PROCESS（happy + RBAC + 状态机拒绝 + shelf↔process 校验）
-//!   - recall-to-pending: IN_PROCESS（在生产架 / 工人持有）/ PROGRAMMING → PENDING
-//!     （happy + 出池四列清空 + 非生产位置拒绝）
+//!   - recall: IN_PROCESS（在生产架 / 工人持有）/ PROGRAMMING → PENDING
+//!     （happy + 出池四列清空 + 非生产位置拒绝）。2026-10-08 端点自
+//!     `POST /prod/batches/{batch_id}/recall-to-pending` 迁到
+//!     `POST /prod/queue/recall`（`batch_id` 改入 body、出参改 `RecallOut`），
+//!     用例随之改打新路径。
 //!   - release-from-programming: PROGRAMMING → IN_PROCESS（happy + RBAC）
 //!   - send-to-outsource: PENDING → OUTSOURCE
 //!   - receive-from-outsource: OUTSOURCE → IN_PROCESS
@@ -301,29 +304,38 @@ async fn place_on_shelf_shelf_process_not_mapped_rejects() {
 async fn recall_to_pending_happy_path() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
     let (_pid, bid) = insert_part_with_batch(&pool, "P0", fx.customer_l2_id, "IN_PROCESS", 5).await;
-    // 写入 location=PRODUCTION_SHELF（recall-to-pending 要求）
+    // 写入 location=PRODUCTION_SHELF（recall 要求批次停在生产中位置）
     sqlx::query("UPDATE t_part_batch SET location = 'PRODUCTION_SHELF' WHERE id = $1")
         .bind(bid)
         .execute(&pool)
         .await
         .expect("set location");
     let version = batch_version(&pool, bid).await;
+    // 2026-10-08：`batch_id` 由 path 参数改入 body（传字符串形态，与前端一致）
     let body = json!({
+        "batch_id": bid.to_string(),
         "version": version,
     });
     let (s, env) = send(
         app,
-        json_request(
-            "POST",
-            &format!("/prod/batches/{bid}/recall-to-pending"),
-            Some(body),
-            Some(&token),
-        ),
+        json_request("POST", "/prod/queue/recall", Some(body), Some(&token)),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "recall: {env}");
     assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["status"], "PENDING");
+    // 2026-10-08 出参改本域 VO（原返 part 全量投影 PartOut）
+    assert_eq!(env["data"]["batch_id"], bid.to_string(), "{env}");
+    assert_eq!(
+        env["data"]["version"],
+        version + 1,
+        "version 应为写入后的值: {env}"
+    );
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM t_part_batch WHERE id = $1")
+        .bind(bid)
+        .fetch_one(&pool)
+        .await
+        .expect("read status after recall");
+    assert_eq!(status, "PENDING", "批次应已翻到 PENDING");
 }
 
 // ===========================================================================
@@ -968,7 +980,7 @@ async fn cancel_part_is_not_overwritten_by_rollup_completed() {
 //  2026-10-01 review 第 1 轮 M2：出池 / 召回必须真的把「位置」清空
 // ===========================================================================
 
-/// **M2 回归测试**：`recall-to-pending` 必须把 `location` /
+/// **M2 回归测试**：`POST /prod/queue/recall` 必须把 `location` /
 /// `current_holder_id` / `current_process_step_id` 一起清成 NULL。
 ///
 /// 改造前 `mark_batch_with_status_and_meta` 的 SQL 是
@@ -1014,8 +1026,9 @@ async fn recall_to_pending_clears_location_holder_and_step() {
         app,
         json_request(
             "POST",
-            &format!("/prod/batches/{bid}/recall-to-pending"),
+            "/prod/queue/recall",
             Some(json!({
+                "batch_id": bid.to_string(),
                 "version": version,
             })),
             Some(&token),
@@ -1023,7 +1036,7 @@ async fn recall_to_pending_clears_location_holder_and_step() {
     )
     .await;
     assert_eq!(s, StatusCode::OK, "recall: {env}");
-    assert_eq!(env["data"]["status"], "PENDING");
+    assert_eq!(env["data"]["batch_id"], bid.to_string(), "{env}");
 
     let (loc, holder, pid_col, step): (Option<String>, Option<i64>, Option<i64>, Option<i64>) =
         sqlx::query_as(
@@ -1047,7 +1060,7 @@ async fn recall_to_pending_clears_location_holder_and_step() {
 }
 
 // ===========================================================================
-//  2026-10-06：recall-to-pending 放宽到「工人持有中」的批次
+//  2026-10-06：recall 放宽到「工人持有中」的批次
 // ===========================================================================
 
 /// 2026-10-06：`IN_PROCESS + location='WORKER' + holder=工人` 的批次可被召回，
@@ -1096,8 +1109,9 @@ async fn recall_to_pending_allows_worker_held_batch() {
         app,
         json_request(
             "POST",
-            &format!("/prod/batches/{bid}/recall-to-pending"),
+            "/prod/queue/recall",
             Some(json!({
+                "batch_id": bid.to_string(),
                 "version": version,
             })),
             Some(&token),
@@ -1110,7 +1124,7 @@ async fn recall_to_pending_allows_worker_held_batch() {
         "工人持有中的 IN_PROCESS 批次应可召回: {env}"
     );
     assert_eq!(env["code"], 0);
-    assert_eq!(env["data"]["status"], "PENDING");
+    assert_eq!(env["data"]["batch_id"], bid.to_string(), "{env}");
 
     // 事后：3 列全清（工人工位容量按 location+holder 实时 COUNT，无需额外回收）
     let (loc, holder, pid_col): (Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
@@ -1163,8 +1177,9 @@ async fn recall_to_pending_rejects_non_production_location() {
         app,
         json_request(
             "POST",
-            &format!("/prod/batches/{bid}/recall-to-pending"),
+            "/prod/queue/recall",
             Some(json!({
+                "batch_id": bid.to_string(),
                 "version": version,
             })),
             Some(&token),
