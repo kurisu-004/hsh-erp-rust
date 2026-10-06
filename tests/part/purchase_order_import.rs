@@ -58,6 +58,20 @@
 //! 22. `update_rejects_items_over_limit` —— **MINOR-5**：超 2000 行 ⇒ 422 + 40001，且
 //!     **不入循环**（入参里那 2001 行的目标行在 DB 上必须原封不动）。
 //!
+//! ## review 第 3 轮新增（2026-10-06）
+//!
+//! 23. `update_order_no_too_long_fails_only_that_row` —— **R3-1**：`order_no` 超
+//!     `varchar(30)` ⇒ 行级 40001 + 该行 DB 完全未动（`order_no` / `version` 都没变），
+//!     其余行照常写。触发路径现实可达：前端把采购订单「单据编号」原文（无长度校验、
+//!     无截断）作为**每一行**的默认 `orderNo` ⇒ 一张 PO 超 30 字就整批全撞；
+//! 24. `update_note_too_long_fails_only_that_row` —— R3-1：`note` 超 `varchar(500)`
+//!     同样行级 40001（与 `order_no` 同构但列不同，各自锁一次）；
+//! 25. `update_length_gate_counts_chars_not_bytes` —— R3-1 的口径边界：按 **char** 计
+//!     （30 个汉字 = 90 字节必须放行）、按**原长度**判（不 trim：带空白的 36 字也拒，
+//!     防「trim 后计数 / 原串写库」那个会漏成 50001 的洞）；
+//! 26. `update_skip_row_does_not_touch_db` 增补 —— **R3-8**：skip 那行同时踩三道闸门
+//!     （version 错 + 非日期交期 + 超长订单号），`failed` 仍须为空。
+//!
 //! ## 基建
 //! 沿用 `crud.rs` / `create_serial_price.rs` 的写法（`test_pool` +
 //! `load_part_fixture` + `send` / `json_request` / `login_token`），不新建 helper
@@ -285,7 +299,7 @@ async fn bootstrap_as_inspector() -> (PgPool, axum::Router, String, PartFixture)
 }
 
 // ===========================================================================
-//  1. PART_CODE 命中 + 现值逐字段回显
+//  match 端点：PART_CODE 命中（现值逐字段回显）
 // ===========================================================================
 
 /// 场景 1：`t_part` 有一行 `drawing_no='PO-001'` ⇒ PART_CODE，候选 1，
@@ -352,7 +366,7 @@ async fn match_part_code_returns_existing_values() {
 }
 
 // ===========================================================================
-//  2. 同图号多候选（cap 以内全给，顺序可断言）
+//  match 端点：同图号多候选（cap 以内全给，顺序可断言）
 // ===========================================================================
 
 /// 场景 2：两条 `t_part` 同 `drawing_no` ⇒ 2 候选都在，且图号档按 id DESC
@@ -391,7 +405,7 @@ async fn match_part_code_multiple_candidates_keeps_all() {
 }
 
 // ===========================================================================
-//  3. 名称兜底 PART_NAME
+//  match 端点：名称兜底 PART_NAME
 // ===========================================================================
 
 /// 场景 3：图号不存在、`name` 命中 `t_part.name` ⇒ PART_NAME。
@@ -425,7 +439,7 @@ async fn match_part_name_fallback_when_code_missing() {
 }
 
 // ===========================================================================
-//  4. 装配件图号 ASSEMBLY_CODE：候选是子件 + assembly_name
+//  match 端点：装配件图号 ASSEMBLY_CODE（候选是子件 + assembly_name）
 // ===========================================================================
 
 /// 场景 4：装配件图号命中 ⇒ 候选是该装配件的**有效子件**（不是装配件本身），
@@ -512,7 +526,7 @@ async fn match_assembly_code_returns_active_children() {
 }
 
 // ===========================================================================
-//  5. 未匹配行仍出现且 parts 是空数组
+//  match 端点：未匹配行仍出现且 parts 是空数组
 // ===========================================================================
 
 /// 场景 5：完全不存在的物料代码 ⇒ 结果里**仍有这一行**、`match_type = "NONE"`、
@@ -544,7 +558,7 @@ async fn match_none_row_still_present_with_empty_array() {
 }
 
 // ===========================================================================
-//  6. 软删不参与
+//  match 端点：软删不参与
 // ===========================================================================
 
 /// 场景 6：图号命中的零件 / 装配件都已软删 ⇒ 两档都落空 ⇒ NONE。
@@ -606,7 +620,7 @@ async fn match_soft_deleted_rows_excluded() {
 }
 
 // ===========================================================================
-//  7. 数组长度守恒 + row_no 逐个对应
+//  match 端点：数组长度守恒 + row_no 逐个对应
 // ===========================================================================
 
 /// 场景 7：3 行请求（图号命中 / 装配件命中 / 未命中）⇒ 长度恰 3，row_no 逐个对应。
@@ -661,7 +675,7 @@ async fn match_result_length_and_row_no_align_with_items() {
 }
 
 // ===========================================================================
-//  8/9. 权限与入参闸门
+//  match 端点：权限与入参闸门
 // ===========================================================================
 
 /// 场景 8：INSPECTOR 调 match ⇒ HTTP 403 + 40300。
@@ -752,7 +766,7 @@ async fn match_ignores_unknown_item_fields() {
 }
 
 // ===========================================================================
-//  11. update 正常路径 + 回读 DB
+//  write 端点：正常路径 + 回读 DB
 // ===========================================================================
 
 /// 场景 11：2 件成功 ⇒ `updated_count = 2` / `failed` 空 / `skipped_count = 0`，
@@ -811,7 +825,7 @@ fn naive_date(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
 }
 
 // ===========================================================================
-//  12. OCC 冲突 → failed + HTTP 仍 200 + DB 未变
+//  write 端点：OCC 冲突 → failed + HTTP 仍 200 + DB 未变
 // ===========================================================================
 
 /// 场景 12：`version` 故意给错 ⇒ `updated_count = 0`、每条进 `failed`、
@@ -859,7 +873,7 @@ async fn update_version_conflict_lands_in_failed_with_http_200() {
 }
 
 // ===========================================================================
-//  13. 部分成功：不会一错全错
+//  write 端点：部分成功（不会一错全错）
 // ===========================================================================
 
 /// 场景 13：3 条里 1 条版本错 ⇒ `updated_count = 2` / `failed.len() = 1`，
@@ -899,7 +913,7 @@ async fn update_partial_success_isolates_bad_row() {
 }
 
 // ===========================================================================
-//  14. 三态：显式 null 清空
+//  write 端点：三态（显式 null 清空 / 缺省不动）
 // ===========================================================================
 
 /// 场景 14(a)：传 `system_delivery_date: null` / `order_no: null` ⇒ 两列**真的**
@@ -989,7 +1003,7 @@ async fn update_tristate_absent_field_leaves_column_untouched() {
 }
 
 // ===========================================================================
-//  15. skip：人工判定不该回填的行
+//  write 端点：skip（人工判定不该回填的行）
 // ===========================================================================
 
 /// 场景 15：`skip: true` ⇒ 不写库、计入 `skipped_count`、既不进 updated 也不进 failed。
@@ -1017,12 +1031,17 @@ async fn update_skip_row_does_not_touch_db() {
     )
     .await;
 
+    let too_long = "长".repeat(40); // varchar(30)
     let (s, env) = call_update(
         app,
         &token,
         json!([
-            // version 故意写错 + skip=true：若实现先做 OCC 再判 skip，本例会 40901
-            { "part_id": skip_me.to_string(), "version": 99, "order_no": "NOPE", "skip": true },
+            // 2026-10-06 review 第 3 轮 R3-8：这一行同时踩**三道**不该触发的闸门 ——
+            // version 故意写错（若先做 OCC 再判 skip 会 40901）、系统交期是非日期
+            // 文本「待定」、`order_no` 超 varchar(30)。skip 的语义是「这行别碰」，
+            // 所以三道闸门对它一律不生效：`failed` 必须仍为空，只计 skipped_count。
+            { "part_id": skip_me.to_string(), "version": 99, "skip": true,
+              "order_no": too_long, "system_delivery_date": "待定" },
             { "part_id": write_me.to_string(), "version": 0, "order_no": "WRITTEN" }
         ]),
     )
@@ -1047,21 +1066,25 @@ async fn update_skip_row_does_not_touch_db() {
 }
 
 // ===========================================================================
-//  16. failed[].message 不泄 sqlx 内部文本（DB 错误路径）
+//  write 端点：failed[].message 不泄 sqlx 内部文本
 // ===========================================================================
 
-/// 场景 16：让某一行触发**真实 DB 错误** ⇒ 该行进 `failed` 且 `code = 50001`，
-/// 而 `message` **不得**含 sqlx / 表名 / 列名等 internals。
+/// DB 错误行的 `failed[].message` 不得含 sqlx 原始文本（细节走 `tracing::warn!`
+/// 收口，响应体只给统一中文文案）。
 ///
-/// 触发手法：`t_part.order_no` 是 `varchar(30)`，入参给 40 字 → PG 报 22001
-/// value too long ⇒ sqlx `Database(22001)`。service 侧把该错误收进 `failed`
-/// （不抛、其余行照写），细节走 `tracing::warn!`，响应体只给统一中文文案。
+/// 2026-10-06 review 第 1 轮：旧实现 `format!("{e}")` 把 sqlx 错误原文塞进 200
+/// 响应体（表名列名 / 约束名 / 错误码全泄）。
 ///
-/// 2026-10-06：旧实现 `format!("{e}")` 把 sqlx 错误原文塞进 200 响应体。
+/// 2026-10-06 review 第 3 轮 R3-1 换触发手法：本用例原本靠「`order_no` 超
+/// `varchar(30)` ⇒ PG 22001」触发 DB 错误，而 R3-1 给 `order_no` 加了**行级长度
+/// 闸门**（40001），那个输入在进 SQL 之前就被拦下了，触发点失效。
+/// 现改用 **NUL 字符**（`"a\u0000b"`）：PG 对含 NUL 的文本报 `22021
+/// invalid byte sequence`，而长度闸门（1 个 char）放行 ⇒ 确实落到 DB 错误分支。
+/// 这同时说明闸门没把 DB 错误路径整个堵死。
 ///
-/// ⚠️ 不能用「非法日期字符串」触发本场景：`system_delivery_date` 的类型是
-/// `NaiveDate`，chrono 在**反序列化阶段**就拒掉整请求（axum  extractor rejection，
-/// 纯文本 body、不是信封），根本走不到 SQL。用长度超限的 `order_no` 才能落到 DB。
+/// ⚠️ 另一种可用手法是「非法日期字符串」，但那条路走不到 SQL：`system_delivery_date`
+/// 的 `NaiveDate` 在**反序列化阶段**就拒掉整请求（axum extractor rejection，纯文本
+/// body、不是信封）。
 #[tokio::test]
 async fn update_failure_message_has_no_sqlx_internals() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -1085,14 +1108,14 @@ async fn update_failure_message_has_no_sqlx_internals() {
         None,
     )
     .await;
-    let too_long = "长".repeat(40); // varchar(30) ⇒ PG 22001
+    let nul = "a\u{0}b";
 
     let (s, env) = call_update(
         app,
         &token,
         json!([
             { "part_id": good.to_string(), "version": 0, "order_no": "OK" },
-            { "part_id": bad.to_string(), "version": 0, "order_no": too_long }
+            { "part_id": bad.to_string(), "version": 0, "order_no": nul }
         ]),
     )
     .await;
@@ -1118,7 +1141,7 @@ async fn update_failure_message_has_no_sqlx_internals() {
 }
 
 // ===========================================================================
-//  17. batch-update 的权限与入参闸门
+//  write 端点：权限与入参闸门
 // ===========================================================================
 
 /// 场景 17(a)：INSPECTOR 调 batch-update ⇒ HTTP 403 + 40300。
@@ -1149,7 +1172,7 @@ async fn update_rejects_empty_items() {
 }
 
 // ===========================================================================
-//  19. review 第 1 轮：写端点的非法日期文本降级为「该行进 failed」
+//  write 端点：review 第 1 轮 —— 非法日期文本降级为「该行进 failed」
 // ===========================================================================
 
 /// review 第 1 轮 MAJOR-1：`system_delivery_date` 给**非日期文本** ⇒ 该行进
@@ -1235,11 +1258,17 @@ async fn update_invalid_date_text_fails_only_that_row() {
     );
 }
 
-/// review 第 1 轮 MAJOR-1 的**向后兼容**一侧：合法日期文本（含两端空白）的行为与
-/// 改动前**完全一致** —— 照常解析、写库、version +1。
+/// review 第 1 轮 MAJOR-1 的**向后兼容**一侧：合法日期文本的行为与改动前**完全
+/// 一致** —— 照常解析、写库、version +1。
 ///
-/// 空白是刻意加的：原 `NaiveDate` 反序列化对 `" 2026-10-15 "` 是整请求 400，
-/// 现在 trim 后照常成功（只降得更温和，不引入新的拒绝）。
+/// 「两端空白」这个输入是刻意加的（2026-10-06 review 第 3 轮 R3-2 订正上一轮的
+/// 因果误述）：chrono's `FromStr`（= 改动前 `NaiveDate` 的 serde 反序列化内部走的
+/// 同一条路径）在 `Item::Space("")` 处**跳任意量空白**，所以 `" 2026-10-15 "` 在
+/// **改动前就是被接受的**。本轮改成 `String` + service 侧解析后刻意继续走同一个
+/// `FromStr`，trim 只是让「展示用原文」与「解析用串」一致 —— 它**不是**新增的放宽，
+/// 也不是「原先会 400」。（已用 chrono 0.4.45 逐值实测：`FromStr(" 2026-07-08 ")`
+/// = `Ok`，而 `parse_from_str(" 2026-07-08 ", "%Y-%m-%d")` = `Err(TooLong)`。）
+/// 本用例的作用是**守住这个等价性**，别让后人把它换成 `parse_from_str`。
 #[tokio::test]
 async fn update_valid_date_with_surrounding_space_still_writes() {
     let (pool, app, token, fx) = bootstrap_as_manager().await;
@@ -1274,12 +1303,12 @@ async fn update_valid_date_with_surrounding_space_still_writes() {
     assert_eq!(
         d,
         Some(naive_date(2026, 10, 15)),
-        "带空白��合法日期应照常落库: {env}"
+        "带空白的合法日期应照常落库: {env}"
     );
 }
 
 // ===========================================================================
-//  20. review 第 1 轮：写路径的软删闸门 / items 上限
+//  write 端点：review 第 1 轮 —— 软删闸门 / items 上限
 // ===========================================================================
 
 /// review 第 1 轮 MINOR-4：软删的 part 不会被回填。
@@ -1364,4 +1393,239 @@ async fn update_rejects_items_over_limit() {
     // 整单拒 ⇒ 入参里的 2001 行一条都不能被写（超限检查在循环之前）
     let (v, o, _) = read_order_info(&pool, pid).await;
     assert_eq!((v, o), (0, None), "超限时不得有任何一行写库: {env}");
+}
+
+// ===========================================================================
+//  write 端点：review 第 3 轮 —— order_no / note 长度闸门
+// ===========================================================================
+
+/// review 第 3 轮 R3-1：`order_no` 超 `varchar(30)` ⇒ **行级 40001**、该行 DB
+/// 完全未动，其余行照常写。
+///
+/// 上一轮只给 `system_delivery_date` 做了行级闸门，`order_no` 仍走「打 DB ⇒ 50001」，
+/// 两个兄弟列两种语义；而 50001 会把排障方向误导到数据库。
+/// 触发路径在本功能里**不需要用户犯蠢**：前端
+/// `purchaseOrderExcelParser.ts:155` 把采购订单「单据编号」首行原文（无长度校验、
+/// 无截断）读进 `docNo`，`PurchaseOrderImportDialog.vue:636` 把它作为**每一个**
+/// 候选行的默认 `orderNo` ⇒ 一张 PO 的单据编号超 30 字，整批每一行都撞库。
+#[tokio::test]
+async fn update_order_no_too_long_fails_only_that_row() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let ok1 = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-LEN1",
+        "好一",
+        None,
+        None,
+        None,
+    )
+    .await;
+    let bad = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-LEN2",
+        "超长",
+        None,
+        Some("OLD"),
+        None,
+    )
+    .await;
+    let ok2 = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-LEN3",
+        "好二",
+        None,
+        None,
+        None,
+    )
+    .await;
+    let too_long = "长".repeat(40); // varchar(30)
+
+    let (s, env) = call_update(
+        app,
+        &token,
+        json!([
+            { "part_id": ok1.to_string(), "version": 0, "order_no": "OK-1" },
+            { "part_id": bad.to_string(), "version": 0, "order_no": too_long },
+            { "part_id": ok2.to_string(), "version": 0, "order_no": "OK-2" }
+        ]),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "超长不该打掉整批: {env}");
+    assert_eq!(env["data"]["updated_count"], 2, "另两行照常写: {env}");
+    let failed = env["data"]["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{env}");
+    assert_eq!(
+        failed[0]["code"],
+        code::VALIDATION_ERROR,
+        "应报 40001 而非 50001: {env}"
+    );
+    assert_eq!(
+        failed[0]["part_id"].as_str(),
+        Some(bad.to_string().as_str())
+    );
+    let msg = failed[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("订单号") && msg.contains("30"),
+        "message 应说明是订单号超长并给出上限，实际 {msg:?}"
+    );
+    assert_failure_message_clean(&failed[0], "订单号超长行");
+
+    // 该行 DB 完全未动：order_no 保持原值、version 不变（连 OCC 检查都没走到）
+    let (v, o, _) = read_order_info(&pool, bad).await;
+    assert_eq!(
+        (v, o.as_deref()),
+        (0, Some("OLD")),
+        "超长行 DB 不得被改: {env}"
+    );
+    let (_, o1, _) = read_order_info(&pool, ok1).await;
+    assert_eq!(o1.as_deref(), Some("OK-1"));
+    let (_, o2, _) = read_order_info(&pool, ok2).await;
+    assert_eq!(o2.as_deref(), Some("OK-2"));
+}
+
+/// review 第 3 轮 R3-1：`note` 超 `varchar(500)` ⇒ 同样行级 40001。
+///
+/// 单独一条用例：`note` 是三态里最容易被忽略的一列（前端在导入对话框里并不暴露
+/// note 字段），闸门与 `order_no` 同构但列不同，值得各自锁一次。
+#[tokio::test]
+async fn update_note_too_long_fails_only_that_row() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let bad = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-NOTE",
+        "备注超长",
+        None,
+        None,
+        None,
+    )
+    .await;
+    let ok = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-NOTE2",
+        "正常",
+        None,
+        None,
+        None,
+    )
+    .await;
+    let too_long = "备".repeat(600); // varchar(500)
+
+    let (s, env) = call_update(
+        app,
+        &token,
+        json!([
+            { "part_id": bad.to_string(), "version": 0, "note": too_long },
+            { "part_id": ok.to_string(), "version": 0, "note": "短备注" }
+        ]),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(env["data"]["updated_count"], 1, "{env}");
+    let failed = env["data"]["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1, "{env}");
+    assert_eq!(failed[0]["code"], code::VALIDATION_ERROR, "{env}");
+    let msg = failed[0]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("备注") && msg.contains("500"),
+        "message 应说明是备注超长并给出上限，实际 {msg:?}"
+    );
+    let note: Option<String> = sqlx::query_scalar("SELECT note FROM t_part WHERE id = $1")
+        .bind(bad)
+        .fetch_one(&pool)
+        .await
+        .expect("read note");
+    assert_eq!(note, None, "超长行 note 不得被写入: {env}");
+    let note_ok: Option<String> = sqlx::query_scalar("SELECT note FROM t_part WHERE id = $1")
+        .bind(ok)
+        .fetch_one(&pool)
+        .await
+        .expect("read note");
+    assert_eq!(note_ok.as_deref(), Some("短备注"), "正常行照常写: {env}");
+}
+
+/// review 第 3 轮 R3-1 的口径补充：长度按 **char** 计数（不是字节），按**原长度**判
+/// （不 trim）。
+///
+/// 这条用例把三个容易写错的边界钉住：
+/// - 30 个**中文字符**（90 字节）必须放行 —— 按字节判会误杀真实的中文订单号；
+/// - 31 字被拒，且报 **40001** 而不是漏成 50001；
+/// - **两端带空白**的 30 字串（共 36 字）也要被拒：闸门量的是「将要写进
+///   `varchar(30)` 的那串字符」的原长度。若实现 trim 后计数却把原串写库，就会
+///   出现「过闸门 → PG 拒 → 50001」这个洞，正是本闸门要消灭的排障歧路。
+#[tokio::test]
+async fn update_length_gate_counts_chars_not_bytes() {
+    let (pool, app, token, fx) = bootstrap_as_manager().await;
+    let cn30 = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-CN30",
+        "中文 30 字",
+        None,
+        None,
+        None,
+    )
+    .await;
+    let cn31 = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-CN31",
+        "中文 31 字",
+        None,
+        None,
+        None,
+    )
+    .await;
+    let padded = insert_part(
+        &pool,
+        fx.customer_l2_id,
+        "PO-PAD",
+        "带空白",
+        None,
+        None,
+        None,
+    )
+    .await;
+    let cn30_text = "订".repeat(30); // 30 char / 90 byte
+    let cn31_text = "订".repeat(31);
+    let padded_text = format!("   {}   ", "订".repeat(30)); // 36 char
+
+    let (s, env) = call_update(
+        app,
+        &token,
+        json!([
+            { "part_id": cn30.to_string(), "version": 0, "order_no": cn30_text },
+            { "part_id": cn31.to_string(), "version": 0, "order_no": cn31_text },
+            { "part_id": padded.to_string(), "version": 0, "order_no": padded_text }
+        ]),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{env}");
+    assert_eq!(
+        env["data"]["updated_count"], 1,
+        "只有 30 字中文（90 字节）那行放行: {env}"
+    );
+    let failed = env["data"]["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 2, "31 字与带空白的 36 字都应被拒: {env}");
+    for f in failed {
+        assert_eq!(
+            f["code"],
+            code::VALIDATION_ERROR,
+            "长度闸门漏成 50001 就等于没修（trim 后计数 / 原串写库的洞）: {f}"
+        );
+    }
+    let (_, o30, _) = read_order_info(&pool, cn30).await;
+    assert_eq!(
+        o30.as_deref(),
+        Some(cn30_text.as_str()),
+        "30 字中文（90 字节）应落库 —— 按字节判会误杀真实订单号: {env}"
+    );
+    let (_, o31, _) = read_order_info(&pool, cn31).await;
+    assert_eq!(o31, None, "31 字不得被写: {env}");
+    let (_, opad, _) = read_order_info(&pool, padded).await;
+    assert_eq!(opad, None, "带空白的 36 字不得被写: {env}");
 }

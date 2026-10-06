@@ -142,8 +142,9 @@ pub struct MatchByExcelItemResult {
 /// （单行单档位、先命中先占）：能按图号唯一定位就不该退到名称去冒险匹配。
 ///
 /// 只 `Serialize`：本枚举只出现在**响应**侧（`MatchByExcelItemResult`），全仓
-/// 没有它的反序列化入口（前端读 `match_type` 用的是 TS 字面量联合，不是本枚举的
-/// 往返）。派生一个永不使用的 `Deserialize` 会让人误以为存在入参路径。
+/// 没有它的反序列化入口 —— 前端读 `match_type` 用的是 TS 字面量联合，不存在把这个
+/// 枚举序列化后再反序列化回来的路径。派生一个永不使用的 `Deserialize` 会让人误以为
+/// 存在入参路径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExcelMatchType {

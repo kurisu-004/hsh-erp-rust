@@ -244,7 +244,7 @@ t_assembly.status               ← 派生缓存
 | 新结构 | 拆前 binary 数 | 拆后 binary 名（nextest filter） |
 |---|---:|---|
 | `tests/delivery/{main,group,attach_batches,scan,note}.rs` | 5 | `delivery` |
-| `tests/part/{main,crud,lifecycle,batch,file,list_enrichment,repair,to_ship,to_inspection,to_process,inspection_batches,serial,create_serial_price,purchase_order_import}.rs` | 12 → 14 | `part`（★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点）|
+| `tests/part/{main,create_serial_price,batch,crud,file,inspection_batches,lifecycle,list_enrichment,pickable_by_work_type,purchase_order_import,repair,rollup_recompute,serial,to_inspection,to_process,to_ship}.rs` | 12 | `part`（sub-file 穷举，`main.rs` 为 binary 入口。★ `purchase_order_import.rs` 2026-10-06 新增：采购订单 Excel 导入两端点 —— `match-by-excel-items` 分档匹配 + `batch-update-order-info` 三态回填 / skip）|
 | `tests/assembly/{main,api,files,status_sync}.rs` | 3 | `assembly` |
 | `tests/iam/{main,api,middleware}.rs` | 2 | `iam`（redis-flush group）|
 | `tests/shelf/{main,api,deactivate}.rs` | 2 | `shelf` |

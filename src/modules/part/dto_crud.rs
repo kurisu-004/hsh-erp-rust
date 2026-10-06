@@ -370,6 +370,15 @@ pub struct MatchByExcelItem {
 }
 
 /// `POST /parts/batch-update-order-info` 入参。
+///
+/// ⚠️ **`items` 数的是候选行，不是 Excel 行**（2026-10-06 review 第 3 轮 R3-6
+/// 登记）：上限是 `service::phase1::events::BATCH_UPDATE_ORDER_INFO_MAX_ITEMS`
+/// = 2000，而 match 端点的上限 `MATCH_MAX_ITEMS` = 2000 数的是 Excel 行、每行最多
+/// 产出 20 个候选 ⇒ 一次合法 match 最多产出 40000 个候选行。因此存在硬崖：match
+/// 端 200 行全命中、且候选多为「空目标」（前端 `isEmptyTarget` 默认勾选）时，提交
+/// 4000+ 候选行会被**整单 422、一行不写**。
+/// 用户可在确认框（已显示「将更新 N 个零件」）里手动取消勾选降到 2000 以下 ——
+/// 谈不上死路，但这条崖此前没写进任何注释。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BatchUpdateOrderInfoRequest {
     pub items: Vec<BatchUpdateOrderInfoItem>,
