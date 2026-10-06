@@ -7,7 +7,8 @@
 //!
 //! - 权限：Manager + Inspector
 //! - 限流：`limit ∈ [1, 200]`，默认 200；`offset` 默认 0
-//! - `customer_id`：单值 → `expand_customer_id` 展开为 L1+L2 ids（与 `list_parts` 同逻辑）
+//! - `customer_id`：单值 → `shared::customer::expand_customer_id` 展开为 L1+L2 ids
+//!   （与 part 域 `list_parts` 同逻辑，共用同一份实现）
 //! - `drawing_no` / `name` / `serial_no`：表头筛选各一个独立 ILIKE 参数，service 层拼
 //!   `%...%` 加通配符；**拒绝** `%` / `_` / `\` 等通配符（含任一 → VALIDATION_ERROR
 //!   40001）。拒通配符是**语义**约束 —— 防止用户输入的 `%…%` 被 PG 当通配符放大成
@@ -22,11 +23,11 @@
 
 use crate::auth::rbac::{CurrentUser, Role};
 use crate::modules::part::repo::PartRepoTrait;
-use crate::modules::part::service::crud::expand_customer_id;
 use crate::modules::prod::batch::dto::InspectionQueueQuery;
 use crate::modules::prod::batch::repo::PartBatchRepo;
 use crate::modules::prod::batch::repo::list::InspectionQueueFilters;
 use crate::modules::prod::batch::vo::{InspectionQueueItemOut, InspectionQueueListOut};
+use crate::shared::customer::expand_customer_id;
 use crate::shared::error::AppError;
 
 use super::BatchService;
@@ -83,7 +84,8 @@ impl BatchService {
     ///
     /// 权限：Manager + Inspector。
     /// 限流：`limit ∈ [1, 200]`，默认 200；`offset` 默认 0。
-    /// customer_id：单值 → `expand_customer_id` 展开为 L1+L2 ids（与 `list_parts` 同逻辑）。
+    /// customer_id：单值 → `shared::customer::expand_customer_id` 展开为 L1+L2 ids
+    /// （与 part 域 `list_parts` 同逻辑）。
     /// drawing_no / name / serial_no：各一个 ILIKE 独立筛选（`%` / `_` / `\\` → 40001）。
     /// 排序：见文件头 `resolve_order_col` 白名单；非法 `sort_by` 退化为系统交期，
     /// 非法 `sort_dir` 退化为 ASC（不报错，前端表头切列不会拿到 5xx）。

@@ -25,7 +25,9 @@
 //!   `list_parts_all_merged` / `project_assembly_to_part_list_item` / `fetch_child_counts` /
 //!   `parse_list_filters_for_assembly`）已下沉到本域（plan §5）。
 //! - `parse_list_filters` 留在 part 域：本端点复用其等价的内联版本（字段解析 +
-//!   `expand_customer_id`），避免跨域 pub 暴露内部 helper。
+//!   客户 id 展开）。客户 id 展开本身是跨域通用的客户树 helper，已上提到
+//!   [`crate::shared::customer`]，本域与 `part` / `prod::batch` 共用同一份实现，
+//!   不再各写一份私有的。
 //!
 //! ## 2026-09-30 新增：`planned_delivery_date_from/to` 日期窗口过滤
 //! 修前端 dashboard UpcomingDeliveryListDrawer 的隐藏 bug —— 前端已传这俩参数
@@ -63,6 +65,7 @@ use crate::modules::part::service::list_enrichment::{
     enrich_part_list_with_location_and_holder, fetch_delivered_quantities, fetch_delivered_sets,
 };
 use crate::modules::part::vo::{ChainState, PartListItem};
+use crate::shared::customer::expand_customer_id;
 use crate::shared::error::AppError;
 
 use super::super::dto::{RowType, UnionListQuery};
@@ -657,46 +660,6 @@ fn parse_optional_ilike_pattern(raw: Option<&str>) -> Option<String> {
     match raw {
         Some(s) if !s.trim().is_empty() => Some(format!("%{}%", s.trim())),
         _ => None,
-    }
-}
-
-/// 展开 `customer_id` 为 `[id]`（含自身 + 子节点）。
-///
-/// 语义与 `part::service::crud::expand_customer_id` 完全一致（从原 part 域
-/// 服务层下沉到 com 域）：L1 → [自身 + 全部 L2 子节点]；L2 → [自身 + 同 L1
-/// 下所有兄弟 L2 ids]。
-async fn expand_customer_id(conn: &mut PgConnection, cid: i64) -> Result<Vec<i64>, AppError> {
-    use crate::shared::error::code;
-    let row: Option<(i64, Option<i64>)> =
-        sqlx::query_as("SELECT id, parent_id FROM t_customer WHERE id = $1 AND deleted_at IS NULL")
-            .bind(cid)
-            .fetch_optional(&mut *conn)
-            .await?;
-    let (_id, parent_id) = row.ok_or_else(|| {
-        AppError::biz(
-            code::BIZ_CUSTOMER_NOT_FOUND,
-            format!("customer {cid} 不存在"),
-        )
-    })?;
-    if let Some(p) = parent_id {
-        let mut rows: Vec<i64> = sqlx::query_scalar(
-            "SELECT id FROM t_customer WHERE parent_id = $1 AND deleted_at IS NULL",
-        )
-        .bind(p)
-        .fetch_all(&mut *conn)
-        .await?;
-        if !rows.contains(&cid) {
-            rows.push(cid);
-        }
-        Ok(rows)
-    } else {
-        sqlx::query_scalar(
-            "SELECT id FROM t_customer WHERE (parent_id = $1 OR id = $1) AND deleted_at IS NULL",
-        )
-        .bind(cid)
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(Into::into)
     }
 }
 
