@@ -15,26 +15,50 @@ use crate::auth::middleware::verify_session_token;
 use crate::auth::rbac::CurrentUser;
 use crate::infra::ws_hub::WsEvent;
 use crate::modules::dashboard::dto::DeliveryBasis;
-use crate::modules::dashboard::vo::{DashboardSnapshot, WsEventMsg, WsHeartbeatMsg, WsSnapshotMsg};
+use crate::modules::dashboard::vo::{
+    DashboardSnapshot, DeliveryOrderDetailOut, UpcomingDeliveryBuckets, WsEventMsg, WsHeartbeatMsg,
+    WsSnapshotMsg,
+};
 use crate::shared::error::{AppError, code};
 use crate::shared::response::R;
 use crate::shared::types::deserialize_i64_opt;
 use crate::state::AppState;
 
-
 const WS_REAUTH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `statuses` 参数的元素数上限。抽屉按 status 过滤，真实入参就是前端 `LAYERS[]`
+/// 里的几个字面量（≤ 8），16 留了两倍余量；超过即判为误传。
+const STATUSES_MAX_ITEMS: usize = 16;
+
+/// `statuses` 参数的原始串长度上限（字节）。16 个 12 字符的状态字面量 + 分隔符
+/// 约 208 字节，256 够用。防的是「几百 KB 的逗号串」被整份绑进 `text[]`。
+const STATUSES_MAX_RAW_LEN: usize = 256;
 
 #[derive(Debug, Deserialize)]
 pub struct WsQuery {
     pub token: Option<String>,
 }
 
-
+/// `GET /upcoming-delivery` 入参。`days` 走 string-or-number 容错解析。
 #[derive(Debug, Default, Deserialize)]
-pub struct SnapshotQuery {
+pub struct UpcomingQuery {
     #[serde(default, deserialize_with = "deserialize_i64_opt")]
-    pub upcoming_days: Option<i64>,
+    pub days: Option<i64>,
+    #[serde(default)]
+    pub basis: Option<DeliveryBasis>,
+}
+
+/// `GET /delivery-orders` 入参。
+///
+/// `date` / `statuses` 声明成 `Option` 而非必填字段，是为了让「缺参数」也走
+/// `AppError::validation`（40001，统一响应信封）：axum 提取器对缺字段直接返 400
+/// **纯文本** body，不走 `R<T>` 信封，两类错误前端得分别处理。
+#[derive(Debug, Default, Deserialize)]
+pub struct DeliveryOrdersQuery {
+    pub date: Option<String>,
+    /// 逗号分隔的 OrderStatus 字面量列表
+    pub statuses: Option<String>,
     #[serde(default)]
     pub basis: Option<DeliveryBasis>,
 }
@@ -68,18 +92,95 @@ pub async fn ws_dashboard(
     Ok(resp)
 }
 
+/// 大屏首帧全量快照。任何已登录用户可读（无角色闸门）。
 pub async fn get_snapshot(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<SnapshotQuery>,
     _current: CurrentUser,
 ) -> Result<Json<R<DashboardSnapshot>>, AppError> {
     let mut tx = state.pool.begin().await?;
-    let snap = state
-        .dashboard_service
-        .build_snapshot_with_workers(&mut *tx, None, q.upcoming_days, q.basis)
-        .await?;
+    let snap = state.dashboard_service.build_snapshot(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(R::ok(snap)))
+}
+
+/// 交期柱状图分桶（柱状图 + 「今日到期」「N 天到期」两个 KPI 的唯一数据源）。
+pub async fn get_upcoming_delivery(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UpcomingQuery>,
+    _current: CurrentUser,
+) -> Result<Json<R<UpcomingDeliveryBuckets>>, AppError> {
+    let mut tx = state.pool.begin().await?;
+    let out = state
+        .dashboard_service
+        .build_upcoming_buckets(&mut *tx, q.days, q.basis)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// 柱状图某一天的下钻抽屉明细。
+pub async fn get_delivery_orders(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<DeliveryOrdersQuery>,
+    _current: CurrentUser,
+) -> Result<Json<R<DeliveryOrderDetailOut>>, AppError> {
+    let date = q
+        .date
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::validation("date 必填（YYYY-MM-DD）"))
+        .and_then(|s| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|_| AppError::validation(format!("date 格式非法（期望 YYYY-MM-DD）：{s}")))
+        })?;
+
+    let raw = q
+        .statuses
+        .as_deref()
+        .ok_or_else(|| AppError::validation("statuses 必填（逗号分隔的 OrderStatus 字面量）"))?;
+    let statuses = parse_status_filter(raw)?;
+
+    let mut tx = state.pool.begin().await?;
+    let out = state
+        .dashboard_service
+        .build_delivery_order_details(&mut *tx, date, statuses, q.basis)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(R::ok(out)))
+}
+
+/// 解析并限长 `statuses` 查询串（逗号分隔的 OrderStatus 字面量列表）。
+///
+/// 只做**非空 + 限长**校验，**不校验元素是否属 `DELIVERY_STATUSES`**：抽屉按层
+/// 传子集，白名单之外的字面量一律查 0 行（而不是 400），前端因此可以先于后端上线
+/// 新的图层状态而不必等后端放行白名单。
+///
+/// 限长是防误传巨串——`statuses` 会整份绑进 `status = ANY($2::varchar[])`，
+/// 几百 KB 的串就是几百 KB 的绑定参数。
+fn parse_status_filter(raw: &str) -> Result<Vec<String>, AppError> {
+    if raw.len() > STATUSES_MAX_RAW_LEN {
+        return Err(AppError::validation(format!(
+            "statuses 过长（{} 字节，上限 {STATUSES_MAX_RAW_LEN}）",
+            raw.len()
+        )));
+    }
+    let statuses: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if statuses.is_empty() {
+        return Err(AppError::validation("statuses 至少需要一个非空状态字面量"));
+    }
+    if statuses.len() > STATUSES_MAX_ITEMS {
+        return Err(AppError::validation(format!(
+            "statuses 元素过多（{} 个，上限 {STATUSES_MAX_ITEMS}）",
+            statuses.len()
+        )));
+    }
+    Ok(statuses)
 }
 
 async fn handle_socket(
@@ -286,20 +387,6 @@ async fn run_socket(
             // 广播来的业务事件
             broadcast = rx.recv() => {
                 match broadcast {
-                    Ok(WsEvent::DashboardSnapshot { data }) => {
-                        // 由业务侧主动 broadcast 的快照：组装 envelope
-                        let envelope = serde_json::json!({
-                            "type": "snapshot",
-                            "data": data,
-                            "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
-                        });
-                        let text = Utf8Bytes::from(envelope.to_string());
-                        // 同 Minor-3：写失败即 break，不再重复发 Close 帧。
-                        if let Err(e) = sender.send(Message::Text(text)).await {
-                            warn!(user_id = user_id, conn_id = conn_id, error = %e, "ws dashboard: 广播快照写失败，关闭连接（写侧已不可用）");
-                            break;
-                        }
-                    }
                     Ok(WsEvent::DashboardEvent { kind, payload }) => {
                         let envelope = WsEventMsg::new(kind, payload);
                         let text = serde_json::to_string(&envelope).unwrap_or_default();
@@ -453,7 +540,6 @@ async fn run_socket(
     }
 }
 
-
 fn reauth_close_code(err_code: i32) -> (u16, &'static str) {
     match err_code {
         code::UNAUTHORIZED | code::TOKEN_EXPIRED | code::SESSION_REVOKED => (4001, "auth expired"),
@@ -463,12 +549,7 @@ fn reauth_close_code(err_code: i32) -> (u16, &'static str) {
 
 async fn build_snapshot_msg(state: &AppState) -> Result<String, AppError> {
     let mut tx = state.pool.begin().await?;
-    // WS 路径无 query：days / basis 形参均固定传 `None`，由 service `unwrap_or_default()` 兜底。
-    // 形参语义见 `service/snapshot.rs::build_snapshot_with_workers` / `dto.rs::DeliveryBasis`。
-    let snap = state
-        .dashboard_service
-        .build_snapshot_with_workers(&mut *tx, None, None, None)
-        .await?;
+    let snap = state.dashboard_service.build_snapshot(&mut *tx).await?;
     tx.commit().await?;
     let envelope = WsSnapshotMsg::new(snap);
     Ok(serde_json::to_string(&envelope).unwrap_or_default())
@@ -555,5 +636,69 @@ mod tests {
     fn reauth_unknown_code_defaults_to_1011() {
         assert_eq!(reauth_close_code(12345), (1011, "re-auth unavailable"));
         assert_eq!(reauth_close_code(0), (1011, "re-auth unavailable"));
+    }
+
+    #[test]
+    fn statuses_filter_trims_blanks_and_dedups_nothing() {
+        assert_eq!(
+            parse_status_filter("PENDING, IN_PROCESS ,").unwrap(),
+            vec!["PENDING".to_string(), "IN_PROCESS".to_string()],
+            "空白元素应被丢弃、首尾空白应被 trim"
+        );
+    }
+
+    #[test]
+    fn statuses_filter_accepts_status_outside_the_whitelist() {
+        // 刻意不校验白名单：抽屉按层传子集，白名单外的字面量查 0 行而非 400
+        assert_eq!(
+            parse_status_filter("PENDING,SOME_FUTURE_STATUS").unwrap(),
+            vec!["PENDING".to_string(), "SOME_FUTURE_STATUS".to_string()]
+        );
+    }
+
+    #[test]
+    fn statuses_filter_rejects_empty_and_blank_only() {
+        for raw in ["", "   ", ",,", " , , "] {
+            let err = parse_status_filter(raw)
+                .err()
+                .unwrap_or_else(|| panic!("{raw:?} 应被判空"));
+            assert_eq!(
+                err.code(),
+                code::VALIDATION_ERROR,
+                "{raw:?} 应走 validation 码"
+            );
+        }
+    }
+
+    #[test]
+    fn statuses_filter_rejects_oversized_raw_and_too_many_items() {
+        // 巨串：1 个超长元素，长度闸门先拦
+        let huge = "X".repeat(STATUSES_MAX_RAW_LEN + 1);
+        assert!(
+            parse_status_filter(&huge).is_err(),
+            "超过 {STATUSES_MAX_RAW_LEN} 字节的串必须被拒"
+        );
+
+        // 元素数超限：每个元素 3 字节 + 分隔符，总长在闸门内、元素数超
+        let many = std::iter::repeat_n("ABC", STATUSES_MAX_ITEMS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(
+            many.len() <= STATUSES_MAX_RAW_LEN,
+            "构造的元素数用例不应先被长度闸门拦下，否则测的不是元素数闸门"
+        );
+        assert!(
+            parse_status_filter(&many).is_err(),
+            "超过 {STATUSES_MAX_ITEMS} 个元素必须被拒"
+        );
+
+        // 恰好在上限内必须放行（边界不误伤）
+        let at_limit = std::iter::repeat_n("ABC", STATUSES_MAX_ITEMS)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_status_filter(&at_limit).unwrap().len(),
+            STATUSES_MAX_ITEMS
+        );
     }
 }

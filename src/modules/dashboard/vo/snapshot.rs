@@ -5,12 +5,17 @@
 //! - `WsEventMsg`     —— 业务增量
 //! - `WsHeartbeatMsg` —— 心跳
 //!
-//! 大屏 snapshot 数据结构（2026-09-22 Group E 重构从 `service.rs` 平移过来，
-//! service 不再持有数据类，只做装配 + 4 次 trait call）：
-//! - `DashboardSnapshot`        —— 完整快照
-//! - `OnProductionShelfGroup`    —— 单个生产区货架分组
-//! - `DashboardItem`            —— 单个 item 行
-//! - `UpcomingDeliveryBucket`   —— 未来 N 天交付分桶（counter）
+//! 大屏 snapshot 数据结构（service 只做装配 + 5 次 trait call）：
+//! - `DashboardSnapshot`      —— 完整快照
+//! - `WorkerHeldBatch`        —— 工人在手加工批次行
+//! - `UpcomingDeliveryBucket` —— 未来 N 天交付分桶（counter）
+//!
+//! ## `ts` 时间戳格式（全域唯一口径）
+//! 三种 message 的 `ts` 一律走 `crate::infra::clock::now_shanghai_iso()`
+//! （= `to_rfc3339()`，固定 `+08:00` 偏移，小数秒位数按纳秒有效位自适应）。
+//! **禁止**用 `chrono::Local::now()`：那会让时间戳跟着**宿主**时区走，而域内其余
+//! 全部锁死 Asia/Shanghai，同一帧里两层 `ts` 于是可能给出两种时区表示。契约登记见
+//! `docs/api/dashboard.md` §7。
 
 use serde::Serialize;
 use std::collections::BTreeMap; // 2026-09-30 新增：upcoming_delivery 桶按状态细分（按 OrderStatus 字面 → 件数；字母序保证 key 顺序确定，前端按 key 精确查）
@@ -28,13 +33,10 @@ pub struct WsSnapshotMsg {
 
 impl WsSnapshotMsg {
     pub fn new(data: DashboardSnapshot) -> Self {
-        let ts = chrono::Local::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-            .to_string();
         Self {
             msg_type: "snapshot",
             data,
-            ts,
+            ts: crate::infra::clock::now_shanghai_iso(),
         }
     }
 }
@@ -50,14 +52,11 @@ pub struct WsEventMsg {
 
 impl WsEventMsg {
     pub fn new(event_type: impl Into<String>, data: serde_json::Value) -> Self {
-        let ts = chrono::Local::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
-            .to_string();
         Self {
             msg_type: "event",
             event_type: event_type.into(),
             data,
-            ts,
+            ts: crate::infra::clock::now_shanghai_iso(),
         }
     }
 }
@@ -73,49 +72,35 @@ pub struct WsHeartbeatMsg {
 // 大屏 snapshot 数据结构（2026-09-22 Group E 重构从 service.rs 平移过来）
 // =======================================================================
 
-/// 大屏快照结构（与 v1 Python 端 JSON 字段命名一致；前端可平滑切 v2 WS）。
+/// 大屏快照结构
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardSnapshot {
-    pub on_production_shelves: Vec<OnProductionShelfGroup>,
-    pub on_inspection_shelves: Vec<DashboardItem>,
-    pub in_process: Vec<DashboardItem>,
-    pub upcoming_delivery: Vec<UpcomingDeliveryBucket>,
+    /// 逾期未交（2026-10-07 新增；口径见 repo/delivery.rs::count_overdue）
+    pub overdue_count: i64,
+    /// 品检区待品检批次数（替代原 on_inspection_shelves 的 `.length()`）
+    pub in_inspection_count: i64,
+    /// 工人在手加工批次（替代原 in_process，字段已收窄，见 WorkerHeldBatch）
+    pub in_process: Vec<WorkerHeldBatch>,
+    /// 最紧急工单 + 部分已交（2026-10-07 新增，从 com/union_list 域外聚合迁入本域）
+    pub system_delivery_orders: super::delivery::SystemDeliveryOrders,
     pub ts: String,
 }
 
+/// 工人在手加工批次（7 字段最小集）
+///
+/// 字段集按前端「在加工」列表实际渲染反推：工单锚点 + 批次锚点 + 展示名 + 数量 +
+/// 加急标记 + 持有工人身份。`batch_id` **必须保留** —— 前端列表以它做 `:key`
+/// （`t_part` 无唯一约束，同一工单的多个 IN_PROCESS 批次会产生多行，只用 `id`
+/// 会造成重复 key）。
 #[derive(Debug, Clone, Serialize)]
-pub struct OnProductionShelfGroup {
-    pub shelf_id: String,
-    pub shelf_code: String,
-    pub shelf_name: String,
-    pub total_count: usize,
-    pub items: Vec<DashboardItem>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DashboardItem {
+pub struct WorkerHeldBatch {
     pub id: String,
     pub batch_id: Option<String>,
-    pub batch_no: Option<i32>,
     pub serial_no: Option<String>,
-    pub name: String,
-    pub drawing_no: String,
+    /// 批次量，取自 `t_part_batch.quantity`
     pub quantity: i32,
     pub is_urgent: bool,
-    pub planned_delivery_date: Option<String>,
-    pub picked_up_at: Option<String>,
     pub current_holder_id: Option<String>,
-    pub current_holder_kind: Option<String>,
-    pub shelf_code: Option<String>,
-    pub customer_id: Option<String>,
-    pub customer_name: Option<String>,
-    pub customer_path: Option<String>,
-    /// @deprecated 2026-09-27 part 域前后端字段对齐：/parts 响应已对
-    /// `TPart.next_process_id` 加 `#[serde(skip)]` 仅隐藏（DB 列保留、rollup
-    /// 派生链路不变）。本字段在 dashboard 域**行为不变**，前端 dashboard 视图
-    /// 仍在用 `current_process_step_id` 派生此值。仅标记以备后续清理窗口。
-    pub next_process_id: Option<String>,
-    pub next_process_name: Option<String>,
     pub worker_name: Option<String>,
 }
 

@@ -19,6 +19,12 @@
 //! - **新增** 真连接表 `conns: DashMap<u64, WsConnMeta>`（`conn_id` 维度，非 user 维度）
 //!   + 4 个 accessor。私有字段强制走 accessor，避免外部绕过计数维护。
 
+//! ## 2026-10-07 变更：再删一个零生产方的变体
+//! - **删除** `WsEvent::DashboardSnapshot { data }`：全仓无任何生产方
+//!   （只有 dashboard handler 的消费侧匹配，等于永远走不到的死分支）。快照首帧
+//!   直接由 `handle_socket` 建好推给新连接，其余时刻一律走 `DashboardEvent`
+//!   增量（前端语义是「WS 事件 → invalidate → HTTP 重取」）。
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -29,8 +35,6 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum WsEvent {
-    /// 大屏完整快照（首连接 / 定时全量）
-    DashboardSnapshot { data: serde_json::Value },
     /// 大屏增量事件（如 PICKED_UP）
     DashboardEvent {
         kind: String,
