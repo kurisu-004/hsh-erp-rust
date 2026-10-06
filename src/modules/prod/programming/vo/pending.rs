@@ -1,16 +1,12 @@
-//! prod::programming 子模块 VO —— 出参（handler 响应序列化层）
+//! `GET /api/v2/prod/programming/pending` 的出参（行项 + 顶层响应）。
 //!
-//! 2026-10-01 新增：与 `prod::batch` / `worker_pool` 同形 VO 模块，仅 `Serialize`
-//! 不 `Deserialize`（禁止出现在 axum extractor 反序列化侧）。
+//! 域级 VO 契约（仅 Serialize / 禁入 extractor / 与前端 schema 对应 / 子文件划分
+//! 取舍）见 [`super`] 模块 doc；此处只留逐字段口径。
 //!
-//! i64 一律走 `serialize_i64` → JSON string（雪花 ID > 2^53，JS `Number` 会丢
-//! 精度，参见 `shared::types` 模块 doc）。
+//! 2026-10-01 新增：与 `prod::batch` / `worker_pool` 同形 VO，仅 `Serialize`
+//! 不 `Deserialize`。
 //!
-//! 字段集**刻意收窄到 15 个**（工单标识 + 展示 + 交期 + 客户 + CNC 程序标记 +
-//! 批次锚点），不加 `match_reason` 之类诊断字段——本端点只做「筛选 + 列表」，
-//! 命中原因由规则语义（链含 CNC / 批次在 CNC 工序）表达，前端不需要逐行归因。
-//!
-//! 2026-10-03 由 13 扩到 15：加 `batch_id` / `batch_version`。原因是本端点的唯一
+//! 2026-10-03 由 13 字段扩到 15：加 `batch_id` / `batch_version`。原因是本端点的唯一
 //! 写出口 `POST /api/v2/prod/batches/{batch_id}/release-from-programming` **以批次
 //! 为锚**（批次 id 走 URL path，入参 `PlaceOnShelfRequest.version` 又对
 //! `t_part_batch.version` 做 OCC 校验），而列表行原来只给 part 级 id + part 级
