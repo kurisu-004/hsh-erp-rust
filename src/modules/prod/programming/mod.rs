@@ -75,7 +75,7 @@ mod tests {
             &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/modules/prod/programming"),
             "需要别的域的数据时，正确做法是像 statistics / admin 那样在本域 SQL 里只读聚合\
              （待编程口径要读的 t_part / t_process / t_process_chain_step / t_part_batch / \
-             t_part_file 等表，SQL 真源见 [`repo`](repo.rs)），而不是 import 别人的 service / repo。",
+             t_part_file 等表，SQL 真源见 repo.rs），而不是 import 别人的 service / repo。",
         );
     }
 }

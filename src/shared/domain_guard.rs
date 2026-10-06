@@ -13,12 +13,26 @@
 //!   写法同样命中；
 //! - **注释不算代码** —— 为讲解规则而引用的外来路径不会误报。
 //!
+//! 剥注释走字符串状态机：普通字符串与 **raw string**（`r"…"` / `r#"…"#`，终止符是
+//! `"` + `#`×n）内的 `"` 都不闭合状态，只有行尾的 `//` 才算行注释 —— 否则
+//! `"http://…"` 与 `r#"…"//"#` 会把同行后半截（含真实跨域 import）整段吃掉
+//! （raw string 支持 2026-10-07 新增）。
+//!
 //! 边界：只挡「他域」依赖，**不挡** `crate::shared` / `crate::infra` /
 //! `crate::auth` / `crate::state` 等非域路径依赖（那些是刻意允许的公共设施）。
 //!
-//! 另有一条口径边界：匹配的是跨域根段与 `::` **紧邻**的写法，Rust 允许在两者之间
-//! 插空白（`crate::<域根> :: part::…` 同样合法），本探测器不覆盖这种形态。要覆盖
-//! 它得上词法分析，规则本身是讲解材料，不值得为它加成本。
+//! ### 已知漏报盲区（**全部**登记在此 —— 未登记的漏报形态一律视为护栏缺陷）
+//! 1. 根段与 `::` 之间插空白（`crate::<域根> :: part::…` 同样合法）不覆盖。要覆盖它
+//!    得上词法分析，规则本身是讲解材料，不值得为它加成本。
+//! 2. **域根后不接 `::`** 的写法：`use crate::<域根>;` / `use crate::{<域根>};` /
+//!    `use crate::{<域根>} as m;` —— 关键字面量不出现，`m::part::…` 里也没有 ⇒ 漏过。
+//!    这是「需配合改名引用」的组合盲区：`use crate::<域根>;` + 裸 `<域根>::part::…`
+//!    仍会被抓到（裸路径自带根段字面量），但配上 `as m` 就抓不到。
+//!
+//! 另有两条**精度**边界（只会误报、不会漏报，方向上是安全的）：
+//! - 跨行 raw string（`r#"` 起、行内无终止符）的**内容**仍按代码扫；
+//! - 普通字符串字面量的内容同样按代码扫（字符串状态只影响 `//` 算不算注释）。
+//!   两者都只会在「有人把外来域路径写进字符串」时误报，本仓两域无此写法。
 //!
 //! ## 本域标识符：`::` 拼接的域路径
 //! `own_domain` 是域路径而非单段标识符，`"dashboard"` 与 `"prod::programming"`
@@ -52,7 +66,7 @@ use std::path::{Path, PathBuf};
 /// 源码里永远不出现「根段 + 外来域名」的完整字面量。
 const ROOT_SEG: &str = concat!("modu", "les::");
 
-/// 空段 / glob 的展示名（`crate::<域根>::*` 这类写法拿不到域标识符）
+/// 根段后接的不是标识符（`crate::<域根>::*` 这类 glob 写法）时的展示名
 const EMPTY_SEG_LABEL: &str = "<空段/glob>";
 
 /// 域隔离护栏：扫描 `src_dir` 下全部 `.rs`，代码区里出现任何**他域**路径即 panic。
@@ -134,6 +148,8 @@ fn collect_rs(dir: &Path, acc: &mut Vec<PathBuf>) {
 ///
 /// 跳过行注释（`//` / `///` / `//!`，含行尾注释）与块注释（`/* */` / `/** */`）；
 /// 字符串字面量内的 `//` **不**当注释（否则 `"http://…"` 会把整行后半截吃掉）。
+/// raw string 按「`"` + `#`×n」的终止符整体跳过（否则 `r#"…"//"#` 里内嵌的 `"` 提前
+/// 闭合字符串状态，同行后半截的真实跨域 import 会被当行注释吃掉）。
 /// 返回 `(去注释后的行, 该行结束时是否仍处于块注释内)`。
 fn blank_comments(line: &str, mut in_block: bool) -> (String, bool) {
     let chars: Vec<char> = line.chars().collect();
@@ -181,6 +197,16 @@ fn blank_comments(line: &str, mut in_block: bool) -> (String, bool) {
                 in_block = true;
             }
             _ => {
+                // raw string（2026-10-07 新增）：`r"` / `r#"` / `r##"`
+                // 整体跳到终止符，其内的 `"` 不参与字符串状态判定
+                if c == 'r'
+                    && let Some(hashes) = raw_string_hashes(&chars, i)
+                {
+                    let end = raw_string_end(&chars, i + 1 + hashes, hashes);
+                    out.extend(&chars[i..end]);
+                    i = end;
+                    continue;
+                }
                 if c == '"' {
                     in_str = true;
                 }
@@ -190,6 +216,25 @@ fn blank_comments(line: &str, mut in_block: bool) -> (String, bool) {
         }
     }
     (out.into_iter().collect(), in_block)
+}
+
+/// `chars[i..]` 是否是 raw string 起点，是则返回 `"` 之前的 `#` 个数。
+///
+/// `r#foo` 是裸标识符而非 raw string，靠「`#` 之后必须紧跟 `"`」区分开。
+fn raw_string_hashes(chars: &[char], i: usize) -> Option<usize> {
+    let hashes = chars
+        .get(i + 1..)?
+        .iter()
+        .take_while(|c| **c == '#')
+        .count();
+    (chars.get(i + 1 + hashes) == Some(&'"')).then_some(hashes)
+}
+
+/// raw string 终止位置（含终止的 `"` 与 `#`×n）；本行内未闭合则返回行尾。
+fn raw_string_end(chars: &[char], body: usize, hashes: usize) -> usize {
+    (body + 1..chars.len())
+        .find(|&j| chars[j] == '"' && chars[j + 1..].iter().take(hashes).all(|c| *c == '#'))
+        .map_or(chars.len(), |j| j + 1 + hashes)
 }
 
 /// 把 `own_domain` 拆成段序列，并校验每段都是合法标识符。
@@ -212,7 +257,11 @@ fn own_segments(own_domain: &str) -> Vec<String> {
 }
 
 /// 从 `ROOT_SEG` 之后的 `abs` 位置起，吃掉连续的「标识符 :: 标识符 :: …」，
-/// 返回 `(域路径段序列, 匹配长度)`。遇到任何非「标识符 + 双冒号」的内容即停。
+/// 返回 `(域路径段序列, 匹配长度)`；遇到非标识符内容即停。
+///
+/// **末尾那个不接双冒号的标识符也算一段**（`crate::<域根>::prod;` → `["prod"]`）：
+/// 不算的话失败信息只能打「空段/glob」，把「只 import 了域容器模块、后面靠全限定
+/// 路径取兄弟域符号」这种最该拦的写法报成了 glob 引入，看不出真实问题。
 fn take_domain_path(code: &str, abs: usize) -> (Vec<String>, usize) {
     let rest = &code[abs..];
     let mut segs = Vec::new();
@@ -226,11 +275,13 @@ fn take_domain_path(code: &str, abs: usize) -> (Vec<String>, usize) {
             break;
         }
         let after = consumed + ident.len();
-        if !rest[after..].starts_with("::") {
-            break;
+        if rest[after..].starts_with("::") {
+            segs.push(ident);
+            consumed = after + 2;
+        } else {
+            segs.push(ident);
+            return (segs, after);
         }
-        segs.push(ident);
-        consumed = after + 2;
     }
     (segs, consumed)
 }
@@ -309,8 +360,8 @@ mod tests {
     /// 覆盖盲区 ① 嵌套花括号 ② 全限定内联路径 ③ glob ④ `pub use`。
     ///
     /// ⚠️ 带花括号的样例一律用数组 `.concat()` 拼、不用 `format!`：`format!` 里
-    /// 想同时表达「字面花括号」与「具名参数」得写 `{{` / `}}` 转义，再把域名放到
-    /// `{}` 内部就极易读错（曾把域名错放到括号**外**，样例退化成无意义代码）。
+    /// 想同时表达「字面花括号」与「具名参数」得写 `{{` / `}}` 转义，把域名塞进
+    /// `{}` 内部极易读错、样例会退化成无意义代码。
     #[test]
     fn guard_flags_foreign_domain_in_code_any_shape() {
         let own = own_segments(OWN);
@@ -409,6 +460,35 @@ mod tests {
         );
     }
 
+    /// raw string（`r#"…"#`）里的 `"` 不闭合字符串状态 —— 否则内嵌的 `"` 提前闭合后，
+    /// 紧随其后的 `//` 被当行注释，同行真实跨域 import 就漏过了。
+    #[test]
+    fn guard_does_not_mistake_raw_string_end_for_string_end() {
+        let own = own_segments(OWN);
+        let src = format!("let s = r#\"a\"//\"#; use crate::{ROOT_SEG}statistics::repo::R;");
+        assert_eq!(
+            scan_source(&src, &own),
+            vec![(1, 31, "statistics".to_string())],
+            "raw string 里的 `\"` 提前闭合会让同行的真实违规漏过：{src}"
+        );
+
+        let multiline =
+            format!("let s = r#\"行内没终止符\n继续\"#; use crate::{ROOT_SEG}part::repo::R;");
+        assert_eq!(
+            scan_source(&multiline, &own),
+            vec![(2, 18, "part".to_string())],
+            "跨行 raw string 的第二行同样不该漏过：{multiline}"
+        );
+
+        // 裸标识符 `r#foo` 不是 raw string，不能被当成 raw string 起点而吞掉后面的代码
+        let raw_ident = format!("let x = r#fn; use crate::{ROOT_SEG}part::repo::R;");
+        assert_eq!(
+            scan_source(&raw_ident, &own),
+            vec![(1, 26, "part".to_string())],
+            "裸标识符不该被误判成 raw string 起点：{raw_ident}"
+        );
+    }
+
     /// 嵌套域（本域路径 2 段）的前缀匹配：只放行本域路径之下的一切，
     /// **兄弟域（同父不同段）必须报警** —— 这是嵌套域护栏的全部价值所在。
     #[test]
@@ -444,5 +524,51 @@ mod tests {
             vec![(1, 12, "part".to_string())],
             "顶层他域不该放行"
         );
+
+        // 兄弟域裸路径（不套花括号）：分叉段在第 2 段，与上面的花括号写法同一条出口
+        let sibling_bare = format!("use crate::{ROOT_SEG}prod::batch::x;");
+        assert_eq!(
+            scan_source(&sibling_bare, &own),
+            vec![(1, 12, "prod::batch".to_string())],
+            "兄弟域裸路径不该放行：{sibling_bare}"
+        );
+
+        // ⚠️ 「路径在本域路径中途就断」这条出口专治**整个他域被拖进来**的写法：
+        // 只 import 到 `prod` 就停、后面靠 `prod::…` 全限定路径取兄弟域的符号。
+        // 哪天有人把 `segs.len() >= own.len()` 判反，这里会静默漏报而其它元测试全绿，
+        // 故必须留锁。
+        let parent_brace = [
+            "use crate::{",
+            ROOT_SEG,
+            "prod::{batch::service::BatchService}};",
+        ]
+        .concat();
+        assert_eq!(
+            scan_source(&parent_brace, &own),
+            vec![(1, 13, "prod".to_string())],
+            "只 import 到父域 + 花括号会把父域之外的一切拖进来，不该放行：{parent_brace}"
+        );
+
+        let parent_bare = format!("use crate::{ROOT_SEG}prod;");
+        assert_eq!(
+            scan_source(&parent_bare, &own),
+            vec![(1, 12, "prod".to_string())],
+            "只 import 到父域会把父域之外的一切拖进来，不该放行：{parent_bare}"
+        );
+
+        // 本域自身的整体 import 仍放行（本域标识符也是一等的模块路径）
+        let own_bare = format!("use crate::{ROOT_SEG}prod::programming;");
+        assert!(
+            scan_source(&own_bare, &own).is_empty(),
+            "import 本域自身不该被报警：{own_bare}"
+        );
+    }
+
+    /// 本域标识符非法时必须 panic（静默降级会让护栏变成永远全绿的空壳）。
+    /// 传含空格的一类：`"prod ::"` 的第二段是空段，不是合法标识符。
+    #[test]
+    #[should_panic(expected = "非法")]
+    fn guard_rejects_illegal_own_domain() {
+        let _ = own_segments("prod ::");
     }
 }

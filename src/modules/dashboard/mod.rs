@@ -1,3 +1,12 @@
+//! dashboard 域 —— 只读跨域聚合大屏
+//!
+//! 需要别的域的数据时**在本域 SQL 里只读聚合**（只读跨域聚合域是本仓既定 pattern，
+//! 同 `statistics` / `admin`），不 import 他域的 service / repo；该约束由本模块
+//! `tests` 里的域隔离护栏在 CI 强制。
+//!
+//! 两个入口：`http_router()` 挂 `/api/v2/dashboard/*` 三个只读端点（snapshot /
+//! upcoming-delivery / delivery-orders），`router()` 挂 `/ws/dashboard` 推送通道。
+
 pub mod dto;
 pub mod handler;
 pub mod repo;

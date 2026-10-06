@@ -6,6 +6,8 @@
 pub mod analytics;
 // 2026-10-07 新增 domain_guard：跨域只读聚合域（dashboard / prod::programming …）的
 // 域隔离护栏，把「本域不 import 其它域的 service / repo」从口头约定变成 CI 强制。
+// 只在单测里用（调用方全在各域 `#[cfg(test)] mod tests`），故不进生产 API 面。
+#[cfg(test)]
 pub mod domain_guard;
 pub mod error;
 pub mod pagination;
